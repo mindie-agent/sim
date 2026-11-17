@@ -61,55 +61,111 @@ def work_from_op(op) -> Work:
     return Work(matrix, resources)
 
 
-def _work_keys(context):
-    names = dict(context.resource_names)
-    by_category: dict[str, list[str]] = {}
-    seen: set[str] = set()
-    for role, name in names.items():
-        if name in context.work and name not in seen:
-            by_category.setdefault(role, []).append(name)
-            seen.add(name)
-    # Service-mode and physical prefixes use names that are not logical roles.
-    for key in context.work:
-        category = None
-        if key.startswith("memory@"):
-            category = "hbm"
-        elif key.startswith("vector"):
-            category = "vector"
-        elif key.startswith("matrix@"):
-            category = "cube"
-        elif key.startswith("mte2"):
-            category = "mte2"
-        elif key.startswith("mte3"):
-            category = "mte3"
-        elif key.startswith("link"):
-            category = "link"
-        if category is not None and key not in by_category.setdefault(category, []):
-            by_category[category].append(key)
-    return by_category
+#: Canonical phase category for each declared physical resource role.  Both
+#: split MTE2 read pipes belong to one ``mte2`` phase category because they
+#: serve the same operand-fetch phases, but each pipe conserves its own work.
+CATEGORY_BY_ROLE = {
+    "hbm": "hbm",
+    "cube": "cube",
+    "vector": "vector",
+    "mte2": "mte2",
+    "mte2_aic": "mte2",
+    "mte2_aiv": "mte2",
+    "mte3": "mte3",
+    "link": "link",
+    "mte1": "mte1",
+    "mte1_l0a": "mte1",
+    "mte1_l0b": "mte1",
+    "fixpipe": "fixpipe",
+}
+
+
+def _category(role: str) -> str | None:
+    """One canonical phase category per physical resource, or ``None``."""
+    if role in CATEGORY_BY_ROLE:
+        return CATEGORY_BY_ROLE[role]
+    for prefix, category in (("memory@", "hbm"), ("matrix@", "cube"),
+                             ("mte2", "mte2"), ("mte3", "mte3"),
+                             ("vector", "vector"), ("link", "link"),
+                             ("mte1", "mte1"), ("fixpipe", "fixpipe")):
+        if role.startswith(prefix):
+            return category
+    # Topology-owned link resources carry a namespace and endpoint identity
+    # (``<scope>:link:<channel>:<rank>:<endpoint>``); their category is the
+    # link token, not the caller's namespace.
+    tokens = role.split(":")
+    if "link" in tokens:
+        return "link"
+    return None
+
+
+def _unmodeled(context, reason: str, name: str):
+    family = str(getattr(context.op, "family", ""))
+    recipe = str(getattr(context.op, "recipe", ""))
+    raise ModelingError(
+        f"unmodeled_operator_mechanism:{family}:{recipe}:{reason}:{name}")
+
+
+def _resource_categories(context) -> dict[str, str]:
+    """Map every nonzero declared resource to exactly one phase category."""
+    by_name: dict[str, str] = {}
+    for role, name in dict(context.resource_names).items():
+        category = _category(str(role))
+        previous = by_name.get(str(name))
+        if category is None:
+            continue
+        if previous is not None and previous != category:
+            _unmodeled(context, "resource_category_conflict", str(name))
+        by_name[str(name)] = category
+    result: dict[str, str] = {}
+    for name, value in dict(context.work).items():
+        if float(value) <= ZERO_FLOAT:
+            continue
+        key = str(name)
+        if key.startswith("host") or key.startswith("scheduler@"):
+            # Host submission latency is not a device pipe and is owned by the
+            # Engine's submission boundary, not by a device phase.
+            continue
+        category = by_name.get(key) or _category(key)
+        if category is None:
+            _unmodeled(context, "uncategorized_resource", key)
+        result[key] = category
+    return result
 
 
 def _phase_amounts(context, phases: Sequence[Phase]) -> list[dict[str, float]]:
-    """Allocate each physical resource across phases by declared weights."""
-    by_category = _work_keys(context)
-    totals = {category: math.fsum(float(context.work[name]) for name in names)
-              for category, names in by_category.items()}
+    """Allocate each physical resource independently across declared phases.
+
+    ``W[s, r] = W[r] * alpha[s, c(r)] / sum_j alpha[j, c(r)]``.  The per-name
+    loop is deliberately outside the phase loop: two directed links or two
+    split read pipes keep their own work, so congestion and conservation are
+    per physical resource rather than an equal share of a category total.
+    """
+    categories = _resource_categories(context)
     result = [dict() for _phase in phases]
-    for category, names in by_category.items():
+    for name, category in categories.items():
+        total = float(context.work[name])
+        if total <= ZERO_FLOAT:
+            continue
         weights = [max(ZERO_FLOAT, float(phase.weights.get(category, ZERO_FLOAT)))
                    for phase in phases]
         denominator = math.fsum(weights)
         if denominator <= ZERO_FLOAT:
-            continue
+            _unmodeled(context, "resource_without_consuming_phase", name)
+        positive = [index for index, weight in enumerate(weights)
+                    if weight > ZERO_FLOAT]
+        last = positive[-ONE]
         allocated = ZERO_FLOAT
         for index, weight in enumerate(weights):
-            amount = (totals[category] - allocated
-                      if index == len(weights) - ONE
-                      else totals[category] * weight / denominator)
+            if index == last:
+                amount = total - allocated
+            elif weight <= ZERO_FLOAT:
+                amount = ZERO_FLOAT
+            else:
+                amount = total * weight / denominator
             allocated += amount
-            share = amount / float(len(names))
-            for name in names:
-                result[index][name] = result[index].get(name, ZERO_FLOAT) + share
+            if amount > ZERO_FLOAT:
+                result[index][name] = result[index].get(name, ZERO_FLOAT) + amount
     return result
 
 

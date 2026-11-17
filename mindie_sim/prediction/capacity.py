@@ -427,7 +427,10 @@ class Memory:
         shared_expert_dp = bool(dict(case.runtime.metadata).get(
             "enable_shared_expert_dp", False))
         self.slot_plans = None
-        if int(getattr(p, "redundant_experts_per_rank", ZERO) or ZERO) > ZERO:
+        if (int(getattr(p, "redundant_experts_per_rank", ZERO) or ZERO) > ZERO
+                or any(plan.ffn == "moe" and int(plan.num_experts) > ZERO
+                       and int(plan.num_experts) % max(ONE, int(p.ep)) != ZERO
+                       for plan in case.model.layer_plans)):
             from mindie_sim.catalog.expert_slots import expert_slot_plan
             from mindie_sim.schema.runtime_features import split_routing_features
             _logical, slot_routing = split_routing_features(

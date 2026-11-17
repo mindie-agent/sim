@@ -910,7 +910,7 @@ def test_execution_exposes_declared_and_fallback_request_commits():
         hbm_bytes=1000, dtype="bf16")
     commit = OpSpec(
         "commit", "token_commit", "decode", 0, -1, ("r0",), (1,), (1,), (1,),
-        (1,), deps=("work",), vector_ops=1, recipe="token_commit")
+        (1,), deps=("work",), recipe="token_commit")
     step = execution.add(
         IterationWork((work, commit), plan, 1, 2, 2, None, "decode", "test"),
         0, 0)

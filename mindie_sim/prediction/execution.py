@@ -94,6 +94,7 @@ THREE = 3
 FIRST = 0
 SECOND = 1
 HOST_LOOKAHEAD_DEFAULT = 8
+ZERO_FLOAT = 0.0
 
 
 def meta_scan_flags(metadata) -> tuple[bool, bool, bool]:
@@ -1206,6 +1207,27 @@ def _ledger_recorder(method, ledger):
     def record(*args, **kwargs):
         return method(*args, ledger=ledger, **kwargs)
     return record
+
+
+@dataclass(frozen=True)
+class _CollectivePlanBinding:
+    """One selected collective algorithm and its lazily built topology plan.
+
+    ``algorithm`` lets a recipe consume the exact plan execution selected
+    instead of re-deriving it; a prebuilt plan keeps the public ledger on the
+    same physical messages.
+    """
+
+    algorithm: str
+    plan: object | None = None
+    factory: object | None = None
+
+    def __call__(self):
+        if self.plan is not None:
+            return self.plan
+        if self.factory is None:
+            raise ModelingError("collective_plan_factory_missing")
+        return self.factory()
 
 
 class Execution:
@@ -2794,6 +2816,25 @@ class Execution:
         context = replace(template, op=op, native_work=cost.work, compute_peaks=peaks,
             service_identity=sid,
             service_boundary="resource_phase" if declared else "device_kernel")
+        # A topology-declared direct mesh owns the physical plan for this
+        # invocation.  Bind it before the ledger so execution, the isolated
+        # row and the public accounting entry point consume one plan.
+        algorithm = getattr(recipe, "algorithm", "ring")
+        if (algorithm == "ring" and getattr(recipe, "mesh_capable", False)
+                and self.topology.declares_direct_mesh(op, replica)):
+            algorithm = "direct_mesh"
+        if algorithm == "direct_mesh":
+            plan = self.topology.joint_plan(
+                op, {replica: cost.work.get("link", ZERO)},
+                algorithm=algorithm, transport=transport_options)
+            self.topology.bind_direct_mesh(op, replica, plan)
+            plan_binding = _CollectivePlanBinding(algorithm, plan=plan)
+        else:
+            plan_binding = _CollectivePlanBinding(
+                algorithm,
+                factory=lambda: self.topology.joint_plan(
+                    op, {replica: cost.work.get("link", ZERO)},
+                    algorithm=algorithm, transport=transport_options))
         demands, frames, setup = {}, {}, 0.0
         if "peer_traffic" in dict(op.metadata) and not cost.work.get("link", 0):
             # A zero sender still participates and receives; validate its row.
@@ -2823,17 +2864,14 @@ class Execution:
         physical = max((value / self.engine.resources[key].rate for key, value in demands.items()), default=0)
         # Context binding also serves independently constructed source phases;
         # native binding must not require an unrelated source-dispatch registration.
-        algorithm = getattr(recipe, "algorithm", "ring")
         context = replace(
             context, work=demands,
-            minimum_ms=measured if self.legacy_diagnostics else 0.0,
+            minimum_ms=measured if self.legacy_diagnostics else ZERO_FLOAT,
             setup_ms=setup,
             service_identity={**dict(context.service_identity),
                               "transport_options": transport_options},
             transaction_frames=frames,
-            collective_plan=lambda: self.topology.joint_plan(
-                op, {replica: cost.work.get("link", 0)}, algorithm=algorithm,
-                transport=transport_options))
+            collective_plan=plan_binding)
         # A declared service regime is a property of the declared kernel, not
         # of the diagnostic profile: ordinary production consults it too. A
         # case that declares no rule has nothing to resolve, so it is not
@@ -4302,4 +4340,5 @@ class Execution:
                 "joint_collective_stats": dict(self.joint_collective_stats)}
                if (self._joint_collective_trace is not None
                    and self.joint_collective_stats["observations"]) else {}),
+
         }

@@ -126,20 +126,27 @@ def test_real_q6_buckets_scan_all_pools_and_keep_2051_capacity(batch):
     scanned = batch * sum((131201 + i) // 4 for i in range(1, 7))
     scores = ops['index_pool_scores']; meta = dict(scores.metadata)
     assert meta['scanned_pools'] == scanned
-    # M2 charges the linear weighted-query contraction as matrix work; the
-    # coarse pre-M2 score op carried vector work only.
-    assert scores.flops == 2 * scanned * 128
+    # The declared weighted-query contraction is FP32 vector arithmetic; it is
+    # not a BF16 Cube matmul, and the score tile is materialized separately
+    # from the TopK invocation unless one executable plan owns both in UB.
+    assert scores.flops == 0
+    assert scores.matrix_flops == ()
     assert scores.vector_ops == 2 * scanned * 128
-    assert scores.flops == scores.vector_ops
-    assert scores.matrix_flops == (('bf16', 2 * scanned * 128),)
     assert meta['score_mode'] == 'linear_weighted_query'
     assert meta['score_pool_row_bytes'] == 256
-    assert meta['score_unique_pool_rows'] == 4
+    unique = batch * ((131201 + 6) // 4)
+    assert meta['score_unique_pool_rows'] == unique
     assert meta['score_logical_pool_read_bytes'] == scanned * 256
-    assert meta['score_l2_hit_bytes'] == scanned * 256 - 4 * 256
-    assert meta['score_materialization'] == 'fused_ub_topk_no_gm_spill'
-    assert scores.hbm_bytes == scores.mte2_bytes
-    assert scores.mte3_bytes == 0
+    assert meta['score_l2_hit_bytes'] == (scanned - unique) * 256
+    assert meta['score_materialization'] == 'separate_fp32_score_then_topk'
+    weighted_read = scores.mte2_bytes - scanned * 256
+    assert weighted_read > 0
+    assert scores.mte2_bytes == scanned * 256 + weighted_read
+    assert scores.hbm_bytes == unique * 256 + weighted_read + 4 * scanned
+    assert scores.mte3_bytes == 4 * scanned
+    topk = ops['index_pool_topk']
+    assert topk.mte2_bytes == 4 * scanned
+    assert topk.hbm_bytes == 4 * scanned + topk.mte3_bytes
     assert ops['index_pool_topk'].local_shape == (batch * 6, 512)
     assert ops['index_topk'].local_shape == (batch * 6, 2051)
     assert dict(ops['index_topk'].metadata)['selected_token_rows'] == batch * (6 * 2048 + 11)
@@ -188,7 +195,13 @@ def test_declared_per_head_alternative_keeps_pool_scan_and_token_selection():
         'implementation': 'causal_pool_indexer_analytic',
         'options': {'score_mode': 'per_head_relu'}}
     other = {op.recipe: op for op in layer(raw)}
-    assert other['index_pool_scores'].flops == dict(reference['index_pool_scores'].metadata)['scanned_pools'] * 32 * 256
+    scanned = dict(reference['index_pool_scores'].metadata)['scanned_pools']
+    # A declared per-head (non-MMA) score path keeps the pool scan on Vector and
+    # does not fabricate Cube work; the explicit per_head_mma implementation is
+    # the only path allowed to charge the per-head contraction.
+    assert other['index_pool_scores'].flops == 0
+    assert other['index_pool_scores'].matrix_flops == ()
+    assert other['index_pool_scores'].vector_ops == scanned * 32 * 2
     assert reference['index_pool_weighted_query'].vector_ops == 6 * 32 * 128 * 2
     assert 'index_pool_weighted_query' not in other
     assert other['index_topk'].local_shape == reference['index_topk'].local_shape

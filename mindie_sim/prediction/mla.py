@@ -67,10 +67,23 @@ def _store_rows(rows_by_view, views, parallel, block, *, contexts=None):
         rows_by_view, views, parallel, block, contexts=contexts))
 
 
+def _memory_hierarchy(machine):
+    """Declared device hierarchy for traffic planning, or the frontend default."""
+    if machine is not None and getattr(machine, "dies", ()):
+        hierarchy = getattr(machine.dies[ZERO].physical_mechanisms,
+                            "memory_hierarchy", None)
+        if hierarchy is not None and hierarchy.l2_capacity_bytes > ZERO:
+            return hierarchy
+    return default_hierarchy()
+
+
 def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         padded_tokens, cache_ids, topk_ids, index_cache_ids, candidate_ids,
-        stage_of, cp_interleave_size=DEFAULT_INTERLEAVE, runtime=None, policy=None):
+        stage_of, cp_interleave_size=DEFAULT_INTERLEAVE, runtime=None, policy=None,
+        machine=None):
     b = Builder(prefix, plan, stage, views, model, mode)
+    hierarchy = _memory_hierarchy(machine)
+    b.l2_bytes = hierarchy.effective_l2_bytes
     from . import latent_dcp
     from mindie_sim.catalog.paired_sfa import execution
     gathered_dcp = latent_dcp.enabled(model, parallel, views, runtime)
@@ -402,6 +415,7 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             topk = pool_module.selection(
                 b, query=q_index, weights=weights, cache=index_store,
                 views=views, plan=plan, quant=quant, padded_tokens=q,
+                l2_bytes=getattr(b, "l2_bytes", None),
                 **(pool_binding.options if pool_binding else {}))
         else:
             quant_indexer = (select(runtime.kernels.get("lowerings", {}),
@@ -456,7 +470,8 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                 topk = semantic_index_selection(
                     b, deps=selection_deps, views=views, plan=plan, model=model,
                     quant=quant, parallel=parallel, shard=shard, prefix=prefix,
-                    padded_tokens=q, runtime=runtime, score_rows=score_rows)
+                    padded_tokens=q, runtime=runtime, score_rows=score_rows,
+                    l2_bytes=getattr(b, "l2_bytes", None))
         if shard > ONE and not dsa_prefill:
             topk = b.work(
                 "candidate_pack", (topk,), (valid, plan.index_topk),
@@ -562,6 +577,9 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         shared_by_view: list[int] = []
         total_pairs_sum = ZERO_FLOAT
         total_rows_sum = ZERO
+        kv_hbm_total = ZERO_FLOAT
+        kv_mte2_total = ZERO_FLOAT
+        kv_components: dict[str, tuple[float, float]] = {}
         kv_row_b = plan.cache_row_elements * dtype_bytes(quant.kv_dtype)
         for rec in view_records:
             orig_idx = rec["orig_idx"]
@@ -596,7 +614,7 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                     representation=("absorbed_mla" if latent else "gqa"),
                     cache_identity=str(getattr(view, "prefix_key", "") or ""),
                 ),
-                default_hierarchy(),
+                hierarchy,
                 AttentionSchedule(query_tile=query_tile),
             )
             if local_cache_read is None:
@@ -615,7 +633,7 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                         topk=int(plan.index_topk) if topk else ZERO,
                         cache_identity=str(getattr(view, "prefix_key", "") or ""),
                     ),
-                    default_hierarchy(),
+                    hierarchy,
                     AttentionSchedule(query_tile=query_tile),
                 )
                 local_cache_read = traffic.hbm_read_bytes
@@ -625,6 +643,10 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                                       and eff_q == ONE)
                 else local_rows
             )
+            kv_hbm_component = float(local_cache_read)
+            kv_mte2_component = float(traffic.private_refill_bytes)
+            kv_hbm_total += kv_hbm_component
+            kv_mte2_total += kv_mte2_component
             is_generic_decode = (
                 latent and view.phase == "decode" and eff_q == ONE
                 and plan.cache_kind == "dense" and not topk and not plan.indexer
@@ -637,7 +659,8 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                 (eff_q, view.kv_len, attn_heads, qk_dim, latent_dim),
                 flops=TWO * local_pairs * attn_heads * (qk_dim + latent_dim),
                 vector=FIVE * local_pairs * attn_heads,
-                read=local_cache_read + rec["selection_reads"] + q_read,
+                read=kv_mte2_component + rec["selection_reads"] + q_read,
+                hbm_read=kv_hbm_component + rec["selection_reads"] + q_read,
                 write=out_write, family="attention",
                 metadata=(("query_tile", query_tile), ("logical_pairs", pairs),
                           ("kv_sweeps", sweeps),
@@ -668,6 +691,8 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                             if head_contract else ())
                          + ((("sparse_kv_offload", offload_info),) if offload_info else ()),
             )
+            kv_components[b.ops[-ONE].op_id] = (
+                kv_hbm_component, kv_mte2_component)
             b.ops[-ONE] = replace(
                 b.ops[-ONE],
                 local_shape=(eff_q, local_rows, attn_heads, qk_dim, latent_dim),
@@ -734,7 +759,24 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                                       if runtime is not None
                                       and runtime.prefix_cache_mode == "shared"
                                       else ("native_per_sequence" if pinned_attn else "tile")),
-                        allow_recipe_rebind=not pinned_attn)
+                        allow_recipe_rebind=not pinned_attn,
+                        kv_hbm_bytes=kv_hbm_total,
+                        kv_mte2_bytes=kv_mte2_total)
+                else:
+                    record = view_records[grp_outputs.index(op_item.op_id)] \
+                        if op_item.op_id in grp_outputs else None
+                    if record is not None:
+                        component = kv_components.get(op_item.op_id,
+                                                      (ZERO_FLOAT, ZERO_FLOAT))
+                        b.ops[idx_op] = apply_attention_prefix_reads(
+                            op_item, views=(record["view"],),
+                            sweeps_by_view=(sweeps_by_view[grp_outputs.index(op_item.op_id)],),
+                            shared_sweeps_by_view=(shared_by_view[grp_outputs.index(op_item.op_id)],),
+                            row_bytes=float(kv_row_b), layer_index=plan.index,
+                            runtime=runtime, kernel_reuse="native_per_sequence",
+                            allow_recipe_rebind=False,
+                            kv_hbm_bytes=component[ZERO],
+                            kv_mte2_bytes=component[ONE])
         if eff_cp > ONE and grp_outputs:
             out_set = set(grp_outputs)
             for idx_op, op_item in enumerate(b.ops):

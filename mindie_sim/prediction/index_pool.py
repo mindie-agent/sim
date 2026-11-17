@@ -70,6 +70,21 @@ def _geometry(views, plan):
     return tuple(_selection_for(view, plan) for view in views)
 
 
+def _visited_pool_rows(views, plan):
+    """Complete pool IDs actually visited, deduplicating shared prefixes only."""
+    pool = max(ONE, int(plan.index_kpool))
+    groups = {}
+    for position, view in enumerate(views):
+        if int(view.q_len) <= ZERO:
+            continue
+        rows = (int(view.context) + int(view.q_len)) // pool
+        prefix = int(getattr(view, "prefix_tokens", ZERO) or ZERO)
+        key = (str(getattr(view, "prefix_key", "") or ""),) if prefix > ZERO \
+            else (position, str(view.request_id))
+        groups[key] = max(groups.get(key, ZERO), rows)
+    return sum(groups.values())
+
+
 def _causal_token_pairs(views, *, noncausal=False):
     """Visible token pairs. Owned spans use their global start, not q_len at context."""
     total = ZERO
@@ -438,7 +453,7 @@ def producer(b, *, source, views, plan, model, quant, padded_tokens,
 
 def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
               score_mode="linear_weighted_query",
-              score_implementation="declared"):
+              score_implementation="declared", l2_bytes=None):
     """Use source linear scoring; per-head MMA is an explicit alternative."""
     if score_mode not in {"per_head_relu", "linear_weighted_query"}:
         raise ModelingError("index_pool_unknown_score_mode")
@@ -453,8 +468,14 @@ def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
     pool_topk = plan.index_topk // plan.index_kpool
     output_width = plan.index_topk + (plan.index_kpool - 1 if plan.index_kpool_always_select_tail else 0)
     row_bytes = float(index_row_bytes(b.model, width))
-    unique_pool_rows = min(int(plan.index_kpool), int(max(ZERO, scanned)))
+    unique_pool_rows = _visited_pool_rows(views, plan)
     l2_bounded_pool_read = float(unique_pool_rows) * row_bytes
+    if l2_bytes is not None and float(l2_bytes) > ZERO_FLOAT:
+        if l2_bounded_pool_read > float(l2_bytes):
+            spill = max(ZERO_FLOAT, ONE - float(l2_bytes) / l2_bounded_pool_read)
+            l2_bounded_pool_read += (
+                max(ZERO_FLOAT, float(scanned) * row_bytes - l2_bounded_pool_read)
+                * spill)
     common = (("pool_size", plan.index_kpool), ("score_mode", score_mode),
               ("score_implementation", score_implementation),
               ("score_pool_row_bytes", row_bytes),
@@ -486,42 +507,50 @@ def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
             read=tokens * heads * (width + ONE) * FOUR,
             write=tokens * width * FOUR, family="indexer", dtype="fp32", metadata=common)
         members.extend((query_f32, weights_f32, weighted)); entries.extend((query_f32, weights_f32))
-        score_flops = float(TWO * scanned * width)
+        # The declared weighted-query implementation is FP32 vector arithmetic;
+        # it is not a BF16 Cube matmul and the score tile is materialized unless
+        # one executable fused plan owns the tile and the TopK state in UB.
         scores = b.work(
             "index_pool_scores", (weighted, cache), (tokens, width),
-            flops=score_flops,
-            matrix_flops=(("bf16", score_flops),),
+            flops=ZERO_FLOAT,
+            matrix_flops=(),
             vector=TWO * scanned * width,
-            read=l2_bounded_pool_read + tokens * width * FOUR,
-            write=ZERO, family="indexer", dtype="fp32",
-            metadata=common + (("score_materialization", "fused_ub_topk_no_gm_spill"),))
+            read=float(scanned) * row_bytes + tokens * width * FOUR,
+            hbm_read=l2_bounded_pool_read + tokens * width * FOUR,
+            write=FOUR * scanned, family="indexer", dtype="fp32",
+            metadata=common + (("score_materialization",
+                                "separate_fp32_score_then_topk"),))
         entries.append(scores)
     else:
-        score_flops = float(TWO * scanned * heads * width)
-        matrix = ((quant.index_dtype, score_flops),) if (
-            score_implementation == "per_head_mma"
-            or score_mode == "per_head_relu") else ()
+        matrix = ()
+        score_flops = ZERO_FLOAT
+        if score_implementation == "per_head_mma":
+            score_flops = float(TWO * scanned * heads * width)
+            matrix = ((quant.index_dtype, score_flops),)
         scores = b.work(
             "index_pool_scores", (query, weights, cache), (tokens, heads, width),
             flops=score_flops, matrix_flops=matrix,
             vector=scanned * heads * TWO,
-            read=l2_bounded_pool_read
+            read=float(scanned) * row_bytes
                  + tokens * heads * (width + ONE) * dtype_bytes(quant.index_dtype),
-            write=ZERO, family="indexer", dtype=quant.index_dtype,
+            hbm_read=l2_bounded_pool_read
+                 + tokens * heads * (width + ONE) * dtype_bytes(quant.index_dtype),
+            write=FOUR * scanned if not matrix else ZERO_FLOAT,
+            family="indexer", dtype=quant.index_dtype,
             metadata=common + (("score_materialization",
-                                "fused_ub_topk_no_gm_spill"),))
+                                "per_head_mma" if matrix else
+                                "separate_fp32_score_then_topk"),))
         entries.append(scores)
     members.append(scores)
     int32_bytes = dtype_bytes("int32")
     topk = b.work(
         "index_pool_topk", (scores,), (tokens, pool_topk),
         vector=scanned * math.log2(max(TWO, pool_topk)),
-        read=ZERO,
+        read=FOUR * scanned,
         write=tokens * pool_topk * int32_bytes,
         family="topk", dtype="fp32", metadata=common + (
             ("selection_output_dtype", "int32"),
-            ("score_intermediate_hbm_bytes", ZERO),
-            ("score_lifetime", "owned_ub_between_fused_score_and_topk")))
+            ("score_materialization", "separate_fp32_score_then_topk")))
     tail_rows = sum(g.causal_tail_tokens for g in geometry)
     has_output = (selected > 0 or tail_rows > 0) and tokens > 0
     packed = b.work(

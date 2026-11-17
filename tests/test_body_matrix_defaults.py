@@ -44,9 +44,13 @@ def test_body_matrix_default_is_shared_by_predict_graph_operators_and_structure(
     assert graph["execution"]["serviced"] == body["execution"]["serviced"]
     assert all(row["program"] == "SteadyMatmul" for row in isolated["operators"]
                if row["operator"]["family"] in MATRIX_FAMILIES)
-    assert structure["execution"]["software"]["kernels"]["programs"]["matmul"] == {
-        "kind": "steady_matmul", "owner_cohorts": True,
-        "candidates": [[128, 128, 128], [128, 128, 64]]}
+    program = structure["execution"]["software"]["kernels"]["programs"]["matmul"]
+    assert program["kind"] == "steady_matmul"
+    assert program["owner_cohorts"] is True
+    # M2 declares the full ordered candidate grid; the historical coarse pair
+    # remains part of that same default, not a second selection path.
+    assert [128, 128, 128] in program["candidates"]
+    assert [128, 128, 64] in program["candidates"]
     assert structure["execution"]["default_mechanisms"] == body["default_mechanisms"]
     assert body["execution"]["live_tasks"] == body["execution"]["live_programs"] == 0
     assert raw == before

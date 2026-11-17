@@ -158,6 +158,17 @@ class AIVTiledVectorAndGatherRecipe:
                     "mte3": ONE_FLOAT,
                 }, after=("tile_compute",)),
             )
+        if any(float(value) > ZERO_FLOAT for key, value in context.work.items()
+               if "link" in str(key).split(":")):
+            # A declared state/transfer payload still needs its physical link
+            # service even when the value transform runs on AIV.
+            phases = phases + (Phase("link_service", {"link": ONE_FLOAT}),)
+        for pipe in ("mte1", "fixpipe"):
+            if any(float(value) > ZERO_FLOAT and str(key).startswith(pipe)
+                   for key, value in context.work.items()):
+                # A fused/vector op that declares local operand staging keeps
+                # that physical pipe service in its own phase.
+                phases = phases + (Phase(f"{pipe}_service", {pipe: ONE_FLOAT}),)
         return tiled_phased_program(
             context, phases, slots=self.slots, cap=self.tile_cap)
 

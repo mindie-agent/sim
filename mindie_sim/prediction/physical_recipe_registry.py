@@ -43,15 +43,39 @@ class ControlSyncRecipe:
     mechanism: str = "control_sync"
 
     def lower(self, context):
-        # Declared control work (host/event service) is real work: the program
-        # must pay it exactly once.  An empty declaration keeps the pure
-        # arrival/publication ordering pair with no invented duration.
-        work = {str(name): float(value) for name, value in
-                (context.work or {}).items() if float(value) > ZERO_FLOAT}
-        stages = (Stage("arrive", keep_empty=True),
-                  Stage("publish", work=work, after=("arrive",),
-                        keep_empty=not work))
-        return KernelProgram(stages, minimum_ms=context.minimum_ms)
+        # A declared host/event service is the control mechanism itself and is
+        # paid exactly once.  Any *payload* resource (HBM, MTE2/3, vector,
+        # Cube, link) means the family was mis-bound to a control recipe and
+        # must raise instead of executing an empty program.
+        declared = {**dict(context.native_work or {}), **dict(context.work or {})}
+        control = {}
+        payload = {}
+        for name, value in declared.items():
+            amount = float(value)
+            if amount <= ZERO_FLOAT:
+                continue
+            key = str(name)
+            if key.startswith("host") or key.startswith("scheduler@"):
+                control[key] = amount
+            else:
+                payload[key] = amount
+        if payload:
+            family = str(getattr(context.op, "family", ""))
+            recipe = str(getattr(context.op, "recipe", ""))
+            work = sorted((name, value) for name, value in payload.items())
+            raise ModelingError(
+                f"unmodeled_operator_mechanism:{family}:{recipe}:"
+                + ",".join(f"{name}={value:.6g}" for name, value in work))
+        # A declared host resource pays the control's own event latency once.
+        # A caller that declares no host resource keeps the empty program; the
+        # bookkeeping then belongs to that caller's submission boundary.
+        # The same host service can be published under a logical role and its
+        # physical name; the control pays that service once, not per alias.
+        latency = float(max(control.values())) if control else ZERO_FLOAT
+        return KernelProgram((Stage("arrive", keep_empty=True),
+                              Stage("publish", after=("arrive",), latency=latency,
+                                    keep_empty=latency <= ZERO_FLOAT)),
+                             minimum_ms=context.minimum_ms)
 
 
 ATTENTION = TiledFlashAndPagedAttentionRecipe()
@@ -81,11 +105,13 @@ VECTOR_FAMILIES = frozenset({
     "activation", "add", "add_rmsnorm", "add_rmsnorm_quant", "attention_merge", "attention_residual", "cache_store", "cast", "conv1d", "copy", "elementwise",
     "embedding", "engram_apply", "engram_gather", "engram_query", "fill", "geglu", "gdn_gating", "hbm_load", "histogram", "kv_cache_write", "kv_cast",
     "layernorm", "mhc", "multiply", "native_fusion", "pad", "quantize", "relu", "rmsnorm", "rmsnorm_quant", "rotary", "routing", "sigmoid", "silu", "state_gather", "state_transfer", "test",
-    "situ", "softmax", "swiglu", "tensor_copy", "tensor_fill", "tensor_materialization", "tensor_select", "tensor_view", "topk", "vector", "zero_fill",
+    "sampling", "acceptance", "situ", "softmax", "swiglu", "tensor_copy",
+    "tensor_fill", "tensor_materialization", "tensor_select", "tensor_view",
+    "state_scatter", "topk", "vector", "zero_fill",
 })
 CONTROL_FAMILIES = frozenset({
-    "barrier", "event", "hccl_boundary", "token_commit", "sampling", "acceptance",
-    "state_publication", "state_publish", "state_scatter",
+    "barrier", "event", "hccl_boundary", "token_commit",
+    "state_publication", "state_publish",
 })
 TRANSFER_FAMILIES = frozenset({"cache_transfer", "kv_transfer", "offload", "pp_p2p", "transfer"})
 PROJECTION_FAMILIES = frozenset({

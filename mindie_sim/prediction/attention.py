@@ -56,6 +56,16 @@ DEFAULT_IDX_DIM = 64
 FP32_BYTES = 4
 
 
+def _memory_hierarchy(machine):
+    """Declared device hierarchy for traffic planning, or the frontend default."""
+    if machine is not None and getattr(machine, "dies", ()):
+        hierarchy = getattr(machine.dies[ZERO].physical_mechanisms,
+                            "memory_hierarchy", None)
+        if hierarchy is not None and hierarchy.l2_capacity_bytes > ZERO:
+            return hierarchy
+    return default_hierarchy()
+
+
 _QKV_NORM_ROPE_SOURCE = {
     "repository": "vllm-ascend",
     "revision": "175ef4d49c2072f9233619636f0309f4f88b4e2c",
@@ -323,7 +333,7 @@ def _store_cache(ops, *, prefix, deps, rows, width, region, stage, layer,
 def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         padded_tokens, policy=AttentionPolicy(), cp_interleave_size=DEFAULT_CP_INTERLEAVE,
         runtime=None, cache_ids=None, stage_of=None, topk_ids=None,
-        index_cache_ids=None, candidate_ids=None, **_) -> AttentionResult:
+        index_cache_ids=None, candidate_ids=None, machine=None, **_) -> AttentionResult:
     from .implementations import select
 
     selected = select(runtime.kernels.get("lowerings", {}), "gqa_attention") if runtime else None
@@ -350,6 +360,7 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
     else:
         attention_recipe = "flash_attention"
     requests = tuple(view.request_id for view in views)
+    hierarchy = _memory_hierarchy(machine)
     gate_separate = plan.q_gate_separate
     q_width = plan.q_projection_width(heads, width)
     qkv = gemm_op(
@@ -540,17 +551,19 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             max(ONE, int(v.kv_len) // idx_ratio) for v in views)
         l2_bounded_index_read = float(min(scored_rows, unique_idx_rows)) * row_bytes
         shape = (scored_rows, idx_heads, idx_dim)
+        score_bytes = float(scored_rows * FP32_BYTES)
         idx_scores = OpSpec(
             op_id=prefix + ".index_scores", family="indexer", phase=mode, stage=stage,
             layer=plan.index, requests=requests, semantic_shape=shape, local_shape=shape,
             padded_shape=shape, launch_shape=shape,
             flops=float(TWO * scored_rows * idx_heads * idx_dim),
             vector_ops=float(THREE * scored_rows * idx_heads),
-            hbm_bytes=float(l2_bounded_index_read + q_idx_bytes),
+            hbm_bytes=float(l2_bounded_index_read + q_idx_bytes + score_bytes),
             mte2_bytes=float(scored_rows * row_bytes + q_idx_bytes),
-            mte3_bytes=float(ZERO_FLOAT),
+            mte3_bytes=score_bytes,
             deps=(idx_wq.op_id, idx_store.op_id), recipe="index_scores",
-            dtype=quant.index_dtype)
+            dtype=quant.index_dtype,
+            metadata=(("score_materialization", "separate_fp32_score_then_topk"),))
         idx_scores = apply_indexer_prefix_reads(
             idx_scores, views=views, rows_by_view=rows_by_view,
             shared_rows_by_view=shared_idx_by_view, row_bytes=float(row_bytes),
@@ -688,6 +701,8 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         shared_sweeps_by_view: list[int] = []
         total_pairs_sum = ZERO_FLOAT
         total_rows_sum = ZERO
+        kv_hbm_total = ZERO_FLOAT
+        kv_mte2_total = ZERO_FLOAT
         for v_pos, (orig_idx, view) in enumerate(indexed_views):
             pairs, v_pairs = per_view_pairs[v_pos]
             local_pairs = v_pairs[worst_r]
@@ -714,10 +729,13 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                     representation="gqa",
                     cache_identity=str(getattr(view, "prefix_key", "") or ""),
                 ),
-                default_hierarchy(),
+                hierarchy,
                 AttentionSchedule(query_tile=policy.query_tile),
             )
             kv_bytes = traffic.hbm_read_bytes
+            kv_refill_bytes = traffic.private_refill_bytes
+            kv_hbm_total += kv_bytes
+            kv_mte2_total += kv_refill_bytes
             input_bytes = view.q_len * heads * width * dtype_bytes(model.activation_dtype)
             shape = (view.q_len, view.kv_len, heads, width)
             op = OpSpec(
@@ -726,7 +744,7 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                 semantic_shape=shape, local_shape=(view.q_len, local_rows, heads, width),
                 padded_shape=shape, launch_shape=shape, flops=FOUR * local_pairs * heads * width,
                 vector_ops=FIVE * local_pairs * heads, hbm_bytes=kv_bytes + TWO * input_bytes,
-                mte2_bytes=kv_bytes + input_bytes, mte3_bytes=input_bytes,
+                mte2_bytes=kv_refill_bytes + input_bytes, mte3_bytes=input_bytes,
                 deps=attention_deps, recipe=attention_recipe, dtype=model.compute_dtype,
                 metadata=(("query_tile", policy.query_tile), ("causal_pairs", pairs),
                           ("local_pairs", local_pairs), ("kv_streams", streams),
@@ -783,6 +801,8 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                     layer_index=plan.index, runtime=runtime,
                     kernel_reuse="native_per_sequence" if user_pinned_attn else "tile",
                     allow_recipe_rebind=not user_pinned_attn,
+                    kv_hbm_bytes=kv_hbm_total,
+                    kv_mte2_bytes=kv_mte2_total,
                 )
             ops.append(batched)
             grp_attn = [batched.op_id]
@@ -790,12 +810,17 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             if eff_topk > ZERO:
                 batches = [annotate_sparse_prefix_unknown(item, runtime) for item in batches]
             else:
-                batches[ZERO] = apply_attention_prefix_reads(
-                    batches[ZERO], views=grp_views, sweeps_by_view=sweeps_by_view,
-                    shared_sweeps_by_view=shared_sweeps_by_view, row_bytes=float(kv_row_bytes),
-                    layer_index=plan.index, runtime=runtime,
-                    kernel_reuse="native_per_sequence", allow_recipe_rebind=False,
-                )
+                for pos, item in enumerate(batches):
+                    view = indexed_views[pos][ONE]
+                    batches[pos] = apply_attention_prefix_reads(
+                        item, views=(view,), sweeps_by_view=(sweeps_by_view[pos],),
+                        shared_sweeps_by_view=(shared_sweeps_by_view[pos],),
+                        row_bytes=float(kv_row_bytes),
+                        layer_index=plan.index, runtime=runtime,
+                        kernel_reuse="native_per_sequence", allow_recipe_rebind=False,
+                        kv_hbm_bytes=item.hbm_bytes - TWO * item.mte3_bytes,
+                        kv_mte2_bytes=item.mte2_bytes - item.mte3_bytes,
+                    )
             ops.extend(batches)
             grp_attn = [item.op_id for item in batches]
         if eff_cp > ONE and grp_attn:

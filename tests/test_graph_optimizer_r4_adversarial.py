@@ -249,8 +249,10 @@ def test_r01_retained_output_dtype_shape_and_layout_never_change():
                      if item.op_id.startswith("fused:s0.l0.index_norm"))
     assert fused_mla.dtype == "bf16"
     assert fused_mla.local_shape == (48, 128)
-    assert mla.final.hbm_bytes == 375_886_912.0
-    assert mla.baseline.hbm_bytes == 375_985_216.0
+    # The index-key working set is charged once (physical tile union), not once
+    # per scored query pair.
+    assert mla.final.hbm_bytes == 333_831_232.0
+    assert mla.baseline.hbm_bytes - mla.final.hbm_bytes == 98_304.0
 
     # Two different retained primary interfaces cannot be represented by one
     # surviving OpSpec port; the contraction must reject, never coerce.
@@ -473,12 +475,9 @@ def test_r07_additive_and_dedicated_metadata_work_is_conserved():
             assert before == pytest.approx(102_000_000.0, rel=1e-12)
             assert before - after == pytest.approx(16.0)
         else:
-            # Known M2 inconsistency: CostModel.price (cost.py:308-311)
-            # charges mte1_bytes/fixpipe_bytes, but the physical
-            # AIVTiledVectorAndGatherRecipe (vector_pipeline.py) does not
-            # execute those dedicated pipes for an add/vector op.  The fused
-            # recipe preserves the declared work; the baseline does not.
-            assert before == pytest.approx(0.0)
+            # The physical vector recipe executes the dedicated mte1/fixpipe
+            # service, so baseline and fused preserve the declared work.
+            assert before == pytest.approx(100_000_000.0, rel=1e-12)
             assert after == pytest.approx(100_000_000.0, rel=1e-12)
             assert stored == {resource[:-1]: 100_000_000.0}
 

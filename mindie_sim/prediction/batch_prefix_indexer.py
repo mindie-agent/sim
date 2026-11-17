@@ -76,8 +76,10 @@ def apply_indexer_prefix_reads(
     op: Any, *, views: Sequence[Any], rows_by_view: Sequence[int],
     shared_rows_by_view: Sequence[int], row_bytes: float, layer_index: int,
     runtime: Any, kernel_reuse: str = "tile", allow_recipe_rebind: bool = True,
+    hbm_component: float | None = None,
+    mte2_component: float | None = None,
 ) -> Any:
-    """Apply physical prefix index-K read deduplication and bind the batch recipe."""
+    """Replace the precharged index-K components with their physical union."""
     if runtime is None or getattr(runtime, "prefix_cache_mode", "private") != "shared":
         return op
     accesses = [
@@ -102,7 +104,9 @@ def apply_indexer_prefix_reads(
         op, metadata=tuple(sorted(meta.items(), key=lambda pair: pair[FIRST])))
     read_mode = str(getattr(runtime, "prefix_read_mode", "auto") or "auto")
     plan = plan_prefix_reads(accesses, mode=read_mode, kernel_reuse=kernel_reuse)
-    updated = apply_prefix_read_plan(tagged, plan)
+    updated = apply_prefix_read_plan(
+        tagged, plan, hbm_component=hbm_component,
+        mte2_component=mte2_component)
     if allow_recipe_rebind and select(updated, runtime) == RECIPE_NAME:
         updated = replace(updated, recipe=RECIPE_NAME)
     return updated

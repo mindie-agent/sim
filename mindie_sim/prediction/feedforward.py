@@ -161,7 +161,9 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
     runtime_routing = dict(getattr(runtime, "routing", {}) or {})
     has_slots = (
         int(getattr(parallel, "redundant_experts_per_rank", ZERO) or ZERO) > ZERO
-        or "expert_slot_map" in runtime_routing)
+        or "expert_slot_map" in runtime_routing
+        or (int(plan.num_experts) > ZERO and int(parallel.ep) > ZERO
+            and int(plan.num_experts) % int(parallel.ep) != ZERO))
     balanced = (routing_realization is not None
                 and routing_realization.basis in {"forced_balanced_integer_counts",
                                                   "source_force_eplb_masked_integer_counts"})

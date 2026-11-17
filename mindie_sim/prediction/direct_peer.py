@@ -1,8 +1,13 @@
 """Finite direct-peer transport without receive-forward round barriers.
 
 [Role] Schedule explicitly selected independent remote-window peer messages on
-  the existing topology and Engine, including asymmetric cross-DP cohorts.
-[Invariants] Each directed cell is routed and framed once. A sender owns a
+  the existing topology and Engine, including asymmetric cross-DP cohorts and
+  topology-declared full-mesh ReduceScatter/AllGather phases.
+[Invariants] Each directed cell is routed and framed once. A declared mesh
+  phase issues one equal payload to every directed peer concurrently behind a
+  single physical phase startup; AllReduce keeps dependent ReduceScatter then
+  AllGather phases, so its span is two peer services rather than 2*(W-1) ring
+  rounds. A sender owns a
   declared finite number of outstanding slots.  When no finite window is
   declared, the topology-derived maximum is the remote-peer count (one
   destination slot per peer); the actual finite vendor buffer window may be
@@ -27,10 +32,15 @@ from typing import ClassVar
 from mindie_sim.schema.common import ModelingError
 from .engine import Allocation
 from .collectives import (PairwiseCollective, PairwiseGroup,
-                           _ready_by_rank, plan_options as collective_plan_options)
-from .communication import MessageFlow
+                           _joint_complete, _ready_by_rank,
+                           plan_options as collective_plan_options)
+from .communication import CommunicationWork, MessageFlow
 from .topology import (TransportOptions, chunk_count, chunk_size_at,
                        chunk_sizes)
+
+ZERO = 0
+ONE = 1
+ZERO_FLOAT = 0.0
 
 
 def resolve_transport_options(recipe, op):
@@ -388,6 +398,234 @@ class DirectPeerGroup(PairwiseGroup):
     def _payload(self, source, destination, volumes, peer):
         return (peer.payload(source, destination) if peer is not None
                 else volumes[self.ranks[source]] / (len(self.ranks) - 1))
+
+
+@dataclass(frozen=True)
+class DirectMeshPhase:
+    """One full-mesh peer phase: every directed pair carries the same payload.
+
+    All W*(W-1) directed messages of a phase are issued together behind one
+    declared phase startup; each directed peer owns its own capacity, so the
+    phase span is the single-message service plus propagation, not W-1 rounds.
+    """
+
+    ranks: tuple[int, ...]
+    payload_bytes: float
+    topology: object = field(repr=False, compare=False)
+    phase: str = "peer_phase"
+    startup_ms: float = ZERO_FLOAT
+
+    def message_flows(self):
+        if not self.payload_bytes or len(self.ranks) <= ONE:
+            return
+        for source in self.ranks:
+            for destination in self.ranks:
+                if source != destination:
+                    yield MessageFlow(source, destination, self.payload_bytes)
+
+    def routed_messages(self):
+        for flow in self.message_flows():
+            yield self.topology.route_message(flow)
+
+    def start_participants(self, engine, name, ready_by_rank, *, owner=""):
+        initial = _ready_by_rank(self.ranks, ready_by_rank)
+        if not self.payload_bytes or len(self.ranks) <= ONE:
+            return initial
+        # One physical phase startup, paid once by the whole cohort.  Distinct
+        # rank readiness stays a real dependency of that startup gate.
+        gate = engine.submit(
+            f"{name}:startup", after=tuple(dict.fromkeys(initial.values())),
+            latency=float(self.startup_ms), owner=owner,
+            metadata={"transport_schedule": "direct_mesh",
+                      "phase": self.phase,
+                      "directed_peer_phase": True})
+        received = {rank: [] for rank in self.ranks}
+        for route in self.routed_messages():
+            source, destination = route.flow.source, route.flow.destination
+            prefix = f"{name}:rank{source}:peer{destination}"
+            previous = engine.submit(
+                prefix + ":ready", after=(gate,), owner=owner,
+                metadata={"source_rank": source, "destination_rank": destination,
+                          "transport_schedule": "direct_mesh",
+                          "phase": self.phase})
+            for hop_index, hop in enumerate(route.hops):
+                service = engine.submit(
+                    f"{prefix}:hop{hop_index}:service", hop.demand,
+                    after=(previous,), owner=owner, coupled=True)
+                previous = engine.submit(
+                    f"{prefix}:hop{hop_index}:arrival", after=(service,),
+                    latency=hop.latency_ms, owner=owner)
+            received[source].append(previous)
+            received[destination].append(previous)
+        return {
+            rank: (engine.submit(f"{name}:rank{rank}:complete",
+                                 after=tuple(parts), owner=owner)
+                   if parts else initial[rank])
+            for rank, parts in received.items()
+        }
+
+    def start(self, engine, name, ready, *, owner=""):
+        return _joint_complete(
+            engine, name,
+            self.start_participants(
+                engine, name, {rank: ready for rank in self.ranks},
+                owner=owner).values(),
+            ready, owner)
+
+
+@dataclass(frozen=True)
+class DirectMeshGroup:
+    """A topology-declared full mesh with dependent physical phases."""
+
+    ranks: tuple[int, ...]
+    volumes: tuple[tuple[int, float], ...]
+    phases: tuple[DirectMeshPhase, ...]
+    topology: object = field(repr=False, compare=False)
+
+    def phase(self, name: str) -> DirectMeshPhase:
+        for phase in self.phases:
+            if phase.phase == name:
+                return phase
+        raise ModelingError(f"direct_mesh_phase_unknown:{name}")
+
+    def start_participants(self, engine, name, ready_by_rank, *, owner=""):
+        events = _ready_by_rank(self.ranks, ready_by_rank)
+        for index, phase in enumerate(self.phases):
+            # A later phase starts only after every rank's prior phase.  The
+            # phase startup gate is that physical dependency, not an extra
+            # socket round or a ring barrier.
+            events = phase.start_participants(
+                engine, f"{name}:phase{index}", events, owner=owner)
+        return events
+
+    def start(self, engine, name, ready, *, owner=""):
+        return _joint_complete(
+            engine, name,
+            self.start_participants(
+                engine, name, {rank: ready for rank in self.ranks},
+                owner=owner).values(),
+            ready, owner)
+
+
+@dataclass(frozen=True)
+class DirectMeshPlanPhase:
+    """Executable view of one named phase across every declared mesh group."""
+
+    plan: object = field(repr=False, compare=False)
+    phase: str = "peer_phase"
+
+    def start(self, engine, name, ready, *, owner=""):
+        parts = [
+            group.phase(self.phase).start(
+                engine, f"{name}:group{index}", ready, owner=owner)
+            for index, group in enumerate(self.plan.groups)
+            if len(group.ranks) > ONE
+        ]
+        if not parts:
+            return ready
+        return engine.submit(f"{name}:complete", after=tuple(parts),
+                             owner=owner)
+
+
+@dataclass(frozen=True)
+class DirectMeshPlan:
+    """Dependent ReduceScatter/AllGather phases over declared directed pairs."""
+
+    family: str
+    groups: tuple[DirectMeshGroup, ...]
+    #: Marks the plan consumed by the topology collective recipe.
+    mesh_algorithm: ClassVar[str] = "direct_mesh"
+
+    @property
+    def ranks(self):
+        return tuple(sorted({rank for group in self.groups
+                             for rank in group.ranks}))
+
+    @property
+    def phase_names(self):
+        return (tuple(phase.phase for phase in self.groups[ZERO].phases)
+                if self.groups else ())
+
+    def phase_program(self, name: str):
+        for group in self.groups:
+            group.phase(name)
+        return DirectMeshPlanPhase(self, name)
+
+    def start_participants(self, engine, name, ready_by_rank, *, owner=""):
+        _ready_by_rank(self.ranks, ready_by_rank)
+        events = {}
+        for index, group in enumerate(self.groups):
+            part = group.start_participants(
+                engine, f"{name}:group{index}",
+                {rank: ready_by_rank[rank] for rank in group.ranks},
+                owner=owner)
+            overlap = set(events) & set(part)
+            if overlap:
+                raise ModelingError(
+                    "direct_mesh_collective_rank_accounted_twice:"
+                    + ",".join(map(str, sorted(overlap))))
+            events.update(part)
+        if set(events) != set(self.ranks):
+            raise ModelingError("direct_mesh_collective_group_completion_missing")
+        return events
+
+    def start(self, engine, name, ready, *, owner=""):
+        return _joint_complete(
+            engine, name,
+            self.start_participants(
+                engine, name, {rank: ready for rank in self.ranks},
+                owner=owner).values(),
+            ready, owner)
+
+    def accounting(self):
+        """Physical wire of the selected phases, with no aggregate setup term.
+
+        Phase startup and hop propagation are real program events, so the
+        ledger reports ``setup_ms=0`` instead of re-adding a serial estimate.
+        """
+        useful_by_rank, useful, wire = {}, {}, {}
+        transactions, frames = {}, {}
+        messages, routed_useful, physical_wire = ZERO, ZERO_FLOAT, ZERO_FLOAT
+        max_path_latency = ZERO_FLOAT
+        for group in self.groups:
+            for rank, volume in group.volumes:
+                useful_by_rank[rank] = useful_by_rank.get(rank, ZERO_FLOAT) + volume
+            for phase in group.phases:
+                for route in phase.routed_messages():
+                    messages += ONE
+                    path_latency = ZERO_FLOAT
+                    for hop in route.hops:
+                        routed_useful += hop.useful_bytes
+                        physical_wire += hop.wire_bytes
+                        useful[hop.resource] = (
+                            useful.get(hop.resource, ZERO_FLOAT) + hop.useful_bytes)
+                        wire[hop.resource] = (
+                            wire.get(hop.resource, ZERO_FLOAT) + hop.wire_bytes)
+                        transactions[hop.resource] = (
+                            None if hop.transactions is None
+                            else transactions.get(hop.resource, ZERO)
+                            + hop.transactions)
+                        if hop.transaction_frame is not None:
+                            frames[hop.resource] = hop.transaction_frame
+                        path_latency += hop.latency_ms
+                    max_path_latency = max(max_path_latency, path_latency)
+        return CommunicationWork(
+            useful_by_rank, useful, wire, transactions, frames, messages,
+            ZERO_FLOAT, routed_useful, physical_wire, max_path_latency)
+
+    def wire_by_resource(self):
+        return dict(self.accounting().wire_by_resource)
+
+    def validate_path_model(self, path_model):
+        if path_model not in {"direct", None}:
+            raise ModelingError(
+                f"direct_mesh_collective_path_model_unsupported:{path_model}")
+        for group in self.groups:
+            for phase in group.phases:
+                for route in phase.routed_messages():
+                    if len(route.hops) != ONE:
+                        raise ModelingError(
+                            "direct_mesh_collective_requires_one_hop_peer")
 
 
 @dataclass(frozen=True)

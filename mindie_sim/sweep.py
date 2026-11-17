@@ -20,6 +20,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import replace
+import hashlib
 import math
 from typing import Any
 
@@ -29,6 +30,8 @@ from mindie_sim.prediction.efficiency import (
     DEFAULT_SLA_SCENARIOS,
     _lower_and_run_graph,
     _resolve_speculative_tokens,
+    evaluate_fixed_plan,
+    prepare_fixed_plan,
     solve_sla_sizing,
 )
 from mindie_sim.prediction.structure import parse_case
@@ -38,7 +41,13 @@ from mindie_sim.schema.hardware import Hardware
 from mindie_sim.schema.model import ModelSpec
 from mindie_sim.schema.parallel import ParallelSpec
 
+SIXTEEN = 16
+ZERO_FLOAT = 0.0
+MS_PER_S = 1000.0
+PARTS_PER_MILLION = 1000000.0
+
 _PARETO_EPS = 1e-12
+BYTES_PER_GBPS = 1000000.0
 ZERO = 0
 ONE = 1
 FIRST = 0
@@ -51,6 +60,7 @@ DEFAULT_OUTPUT_TOKENS = 1024
 DEFAULT_TTFT_SLA_MS = 3000.0
 DEFAULT_KV_TRANSFER_BW_GBPS = 100.0
 ONE_FLOAT = 1.0
+LOCKED_PROGRAM_ERROR = "fixed_plan_sweep_not_implemented"
 _BASELINE_SCENARIO: tuple[dict[str, Any], ...] = (
     {"id": "baseline", "label": "1x Baseline", "hbm_bw_scale": 1.0, "cube_flops_scale": 1.0, "vector_ops_scale": 1.0, "link_bw_scale": 1.0},
 )
@@ -122,22 +132,12 @@ def _extract_model_geometry(case_or_model: CaseSpec | ModelSpec | Mapping[str, A
         return _extract_model_geometry(case_or_model.model)
     if isinstance(case_or_model, ModelSpec):
         meta = dict(case_or_model.metadata)
-        attention = str(case_or_model.attention).strip().lower()
-        return {
-            "num_heads": int(case_or_model.num_heads),
-            "num_kv_heads": int(case_or_model.num_kv_heads or case_or_model.num_heads),
-            "num_experts": int(case_or_model.num_experts),
-            "attention": attention,
-            "attention_types": _attention_types(case_or_model),
-            "layers": int(case_or_model.layers),
-            "mla_replicate": bool(meta.get("mla_replicate", False)),
-        }
+        return {"num_heads": int(case_or_model.num_heads), "num_kv_heads": int(case_or_model.num_kv_heads or case_or_model.num_heads),
+                "num_experts": int(case_or_model.num_experts), "attention": str(case_or_model.attention).strip().lower(),
+                "attention_types": _attention_types(case_or_model), "layers": int(case_or_model.layers),
+                "mla_replicate": bool(meta.get("mla_replicate", False))}
     if isinstance(case_or_model, Mapping):
-        raw_m = (
-            case_or_model["model"]
-            if ("model" in case_or_model and isinstance(case_or_model["model"], (Mapping, ModelSpec)))
-            else case_or_model
-        )
+        raw_m = (case_or_model["model"] if ("model" in case_or_model and isinstance(case_or_model["model"], (Mapping, ModelSpec))) else case_or_model)
         if isinstance(raw_m, ModelSpec):
             return _extract_model_geometry(raw_m)
         if not isinstance(raw_m, Mapping):
@@ -150,15 +150,11 @@ def _extract_model_geometry(case_or_model: CaseSpec | ModelSpec | Mapping[str, A
             return info
         except (ModelingError, ValueError, TypeError, KeyError):
             canon = ModelSpec.canonical_fields(raw_m)
-            heads = int(canon.get("num_heads", 0) or 0)
-            kv_heads = int(canon.get("num_kv_heads", heads) or 0)
+            heads, kv_heads = int(canon.get("num_heads", ZERO) or ZERO), int(canon.get("num_kv_heads", canon.get("num_heads", ZERO)) or ZERO)
             experts = int(canon.get("num_experts", 0) or 0)
             attn = str(canon.get("attention") or ("mla" if ("mla" in canon or "kv_lora_rank" in canon) else "gqa")).strip().lower()
-            return {
-                "num_heads": heads, "num_kv_heads": kv_heads, "num_experts": experts,
-                "attention": attn, "attention_types": {attn},
-                "layers": int(canon.get("layers", 1) or 1), "mla_replicate": mla_rep,
-            }
+            return {"num_heads": heads, "num_kv_heads": kv_heads, "num_experts": experts, "attention": attn,
+                    "attention_types": {attn}, "layers": int(canon.get("layers", 1) or 1), "mla_replicate": mla_rep}
     raise TypeError(f"unsupported_case_or_model_type:{type(case_or_model).__name__}")
 
 
@@ -172,9 +168,7 @@ def enumerate_parallel_candidates(
     n_dev = _check_pos_int("num_devices", num_devices, minimum=1)
     geom = _extract_model_geometry(case_or_model)
     num_heads, num_kv_heads, num_experts = geom["num_heads"], geom["num_kv_heads"], geom["num_experts"]
-    attention_types = set(geom["attention_types"])
-    layers, mla_replicate = geom["layers"], geom["mla_replicate"]
-
+    attention_types, layers, mla_replicate = set(geom["attention_types"]), geom["layers"], geom["mla_replicate"]
     all_divs = _divisors(n_dev)
     allowed_tps = {_check_pos_int("candidate_tp", t, minimum=1) for t in candidate_tps} if candidate_tps is not None else None
     tps = [tp for tp in all_divs if tp in allowed_tps] if allowed_tps is not None else all_divs
@@ -184,40 +178,28 @@ def enumerate_parallel_candidates(
 
     candidates: list[dict[str, int]] = []
     for tp in tps:
-        if num_heads > 0 and not mla_replicate:
-            if num_heads % tp != 0 or (num_kv_heads > 0 and num_kv_heads % tp != 0 and tp % num_kv_heads != 0):
-                continue
+        if num_heads > ZERO and not mla_replicate and (num_heads % tp != ZERO or (num_kv_heads > ZERO and num_kv_heads % tp != ZERO and tp % num_kv_heads != ZERO)):
+            continue
         rem_tp = n_dev // tp
-        pps = (
-            [p for p in _divisors(rem_tp) if p in allowed_pps and (layers <= 0 or p <= layers)] if allowed_pps is not None
-            else [p for p in _divisors(rem_tp) if p <= max(1, layers)] if allow_pp
-            else [1]
-        )
+        pps = ([p for p in _divisors(rem_tp) if p in allowed_pps and (layers <= 0 or p <= layers)] if allowed_pps is not None
+               else [p for p in _divisors(rem_tp) if p <= max(1, layers)] if allow_pp else [1])
         for pp in pps:
             rem_pp = rem_tp // pp
-            pcps = (
-                [p for p in _divisors(rem_pp) if p in allowed_pcps] if allowed_pcps is not None
-                else _divisors(rem_pp) if allow_pcp
-                else [1]
-            )
+            pcps = ([p for p in _divisors(rem_pp) if p in allowed_pcps] if allowed_pcps is not None
+                    else _divisors(rem_pp) if allow_pcp else [1])
             for pcp in pcps:
                 if pcp > 1 and not attention_types <= _PCP_ATTENTION_TYPES:
                     continue
                 dp = rem_pp // pcp
                 if not allow_dp and dp != 1:
                     continue
-                dcp = 1
-                ep_options = (
-                    [d for d in _divisors(dp * tp * pcp)
-                     if num_experts >= ZERO and _ep_layout_valid(
-                         ParallelSpec(dp=dp, tp=tp, pp=pp, ep=d, cp=dcp, dcp=dcp, pcp=pcp))]
-                    if (num_experts > ZERO and allow_ep) else [ONE]
-                )
+                ep_options = ([d for d in _divisors(dp * tp * pcp) if num_experts >= ZERO and _ep_layout_valid(
+                    ParallelSpec(dp=dp, tp=tp, pp=pp, ep=d, cp=ONE, dcp=ONE, pcp=pcp))]
+                    if (num_experts > ZERO and allow_ep) else [ONE])
                 if allowed_eps is not None:
                     ep_options = [e for e in ep_options if e in allowed_eps]
                 for ep in sorted(ep_options):
                     candidates.append({"dp": dp, "tp": tp, "ep": ep, "pp": pp, "pcp": pcp})
-
     candidates.sort(key=lambda c: (c["tp"], c["dp"], c["ep"], c["pp"], c["pcp"]))
     return candidates
 
@@ -244,54 +226,34 @@ def _materialize_machine_for_devices(
     orig_count = len(parsed.machine.dies)
     if orig_count == num_devices:
         return parsed.machine
-
     base_dev = deepcopy(parsed.machine.dies[0].to_dict())
     for k in ("rank", "node", "package"):
         base_dev.pop(k, None)
-
-    ranks_per_node = _resolve_ranks_per_node(parsed, num_devices)
-    sku = parsed.machine.sku
+    ranks_per_node, sku = _resolve_ranks_per_node(parsed, num_devices), parsed.machine.sku
     from mindie_sim.backends.nvidia import materialize as nvidia_materialize, profiles as nvidia_profiles
-    is_ascend = bool(sku and sku in ascend_profiles())
-    is_nvidia = bool(sku and sku in nvidia_profiles())
+    is_ascend, is_nvidia = bool(sku and sku in ascend_profiles()), bool(sku and sku in nvidia_profiles())
     if is_ascend or is_nvidia:
-        raw_m: dict[str, Any] = {
-            "backend": "ascend" if is_ascend else "nvidia",
-            "name": parsed.machine.name, "hardware_key": parsed.machine.hardware_key,
-            "sku": sku, "num_devices": num_devices, "ranks_per_node": ranks_per_node,
-            "dies_per_package": parsed.machine.dies_per_package, "device": base_dev,
-        }
-        for k, v in getattr(parsed.machine, "topology_options", ()):
-            raw_m[k] = deepcopy(v)
-        ch_patch: dict[str, dict[str, Any]] = {
-            k: dict(v) for k, v in getattr(parsed.machine, "transfer_channels", ())
-            if k not in {"d2d_intra_4p", "d2d_intra_8p", "d2d_inter_pod"}
-        }
+        raw_m: dict[str, Any] = {"backend": "ascend" if is_ascend else "nvidia", "name": parsed.machine.name,
+            "hardware_key": parsed.machine.hardware_key, "sku": sku, "num_devices": num_devices,
+            "ranks_per_node": ranks_per_node, "dies_per_package": parsed.machine.dies_per_package, "device": base_dev}
+        raw_m.update({k: deepcopy(v) for k, v in getattr(parsed.machine, "topology_options", ())})
+        ch_patch: dict[str, dict[str, Any]] = {k: dict(v) for k, v in getattr(parsed.machine, "transfer_channels", ())
+                                               if k not in {"d2d_intra_4p", "d2d_intra_8p", "d2d_inter_pod"}}
         seen_links: set[str] = set()
         for lnk in parsed.machine.links:
             if lnk.channel in {"d2d_intra_package", "d2d_intra_node", "d2d_inter_node"} and lnk.channel not in seen_links:
                 seen_links.add(lnk.channel)
-                rec = dict(ch_patch.get(lnk.channel, {}))
-                util = float(getattr(lnk, "bw_utilization", 1.0) or 1.0)
-                if not math.isclose(util, 1.0):
-                    peak_gbps = float(lnk.effective_peak_capacity_bytes_per_ms) / 1e6
+                rec, util = dict(ch_patch.get(lnk.channel, {})), float(getattr(lnk, "bw_utilization", ONE_FLOAT) or ONE_FLOAT)
+                if not math.isclose(util, ONE_FLOAT):
                     rec.pop("effective_uni_bw_gbps", None)
-                    rec.update(
-                        uni_peak_bw_gbps=peak_gbps,
-                        bw_utilization=util,
-                        latency_us=float(lnk.latency_us),
-                        semantics=str(lnk.semantics),
-                    )
+                    rec.update(uni_peak_bw_gbps=float(lnk.effective_peak_capacity_bytes_per_ms) / BYTES_PER_GBPS, bw_utilization=util,
+                               latency_us=float(lnk.latency_us), semantics=str(lnk.semantics))
                 else:
-                    rec.update(
-                        effective_uni_bw_gbps=float(lnk.capacity_bytes_per_ms) / 1e6,
-                        latency_us=float(lnk.latency_us),
-                        semantics=str(lnk.semantics),
-                    )
+                    rec.update(effective_uni_bw_gbps=float(lnk.capacity_bytes_per_ms) / BYTES_PER_GBPS,
+                               latency_us=float(lnk.latency_us), semantics=str(lnk.semantics))
                 for fn in ("transaction_bytes", "alignment_bytes", "protocol_overhead_bytes", "switch_hops", "switch_hop_latency_us", "switch_capacity_bytes_per_ms"):
-                    val = getattr(lnk, fn, None)
-                    if val is not None:
-                        rec[fn] = val
+                    if getattr(lnk, fn, None) is not None:
+                        rec[fn] = getattr(lnk, fn)
                 ch_patch[lnk.channel] = rec
         if ch_patch:
             raw_m["transfer_channels"] = ch_patch
@@ -299,15 +261,10 @@ def _materialize_machine_for_devices(
             src_m = raw_case["machine"]
             for k in _TRANSFER_OVERRIDE_KEYS:
                 if k in src_m:
-                    if k == "transfer_channels" and isinstance(src_m[k], Mapping):
-                        raw_m[k] = {
-                            ck: deepcopy(cv) for ck, cv in src_m[k].items()
-                            if ck not in {"d2d_intra_4p", "d2d_intra_8p", "d2d_inter_pod"}
-                        }
-                    else:
-                        raw_m[k] = deepcopy(src_m[k])
-        mat_fn = ascend_materialize if is_ascend else nvidia_materialize
-        return Hardware.from_mapping(mat_fn(raw_m))
+                    raw_m[k] = ({ck: deepcopy(cv) for ck, cv in src_m[k].items()
+                                 if ck not in {"d2d_intra_4p", "d2d_intra_8p", "d2d_inter_pod"}}
+                                if k == "transfer_channels" and isinstance(src_m[k], Mapping) else deepcopy(src_m[k]))
+        return Hardware.from_mapping((ascend_materialize if is_ascend else nvidia_materialize)(raw_m))
 
     m_dict = deepcopy(parsed.machine.to_dict())
     m_dict["num_devices"], m_dict["ranks_per_node"] = num_devices, ranks_per_node
@@ -327,32 +284,154 @@ def _materialize_machine_for_devices(
     return Hardware.from_mapping(m_dict)
 
 
+def _pareto_step(row: Mapping[str, Any]) -> float | None:
+    value = row.get("step_ms_at_b1")
+    if value is None:
+        value = row.get("step_ms_at_retained_b")
+    return None if value is None else float(value)
+
+
 def compute_pareto_frontier(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Mark pareto_optimal over feasible rows on (tps_per_die, total_feasible_concurrency, -step_ms_at_b1)."""
-    feasible_rows = [r for r in rows if r.get("feasible")]
+    """Mark pareto_optimal over feasible rows on (tps_per_die, total_feasible_concurrency, -step)."""
+    feasible_rows = [r for r in rows if r.get("feasible") and _pareto_step(r) is not None]
     for row in rows:
-        if not row.get("feasible"):
+        row_step = _pareto_step(row)
+        if not row.get("feasible") or row_step is None:
             row["pareto_optimal"] = False
             continue
         dominated = False
         for other in feasible_rows:
             if other is row:
                 continue
+            other_step = _pareto_step(other)
             ge_all = (
                 float(other["tps_per_die"]) >= float(row["tps_per_die"]) - _PARETO_EPS
                 and int(other["total_feasible_concurrency"]) >= int(row["total_feasible_concurrency"])
-                and float(other["step_ms_at_b1"]) <= float(row["step_ms_at_b1"]) + _PARETO_EPS
+                and other_step <= row_step + _PARETO_EPS
             )
             strict_one = (
                 float(other["tps_per_die"]) > float(row["tps_per_die"]) + _PARETO_EPS
                 or int(other["total_feasible_concurrency"]) > int(row["total_feasible_concurrency"])
-                or float(other["step_ms_at_b1"]) < float(row["step_ms_at_b1"]) - _PARETO_EPS
+                or other_step < row_step - _PARETO_EPS
             )
             if ge_all and strict_one:
                 dominated = True
                 break
         row["pareto_optimal"] = not dominated
     return [r for r in rows if r.get("pareto_optimal")]
+
+
+def _plan_identity(plan: Mapping[str, Any]) -> str:
+    graphs = plan["graphs"]
+    head = (getattr(graphs, "default_selection", None), tuple((str(op.op_id), str(op.recipe), tuple(op.local_shape)) for op in next(iter(graphs.values()))))
+    return hashlib.sha256(repr(head).encode("utf-8")).hexdigest()[:SIXTEEN]
+
+
+def _prepare_locked_plan(parsed: CaseSpec, *, sla_ms: float, context: int, phase: str, scope: str,
+                         tokens_per_seq: int | None, output_budget: int, max_sequences_per_dp: int) -> dict[str, Any]:
+    result = solve_sla_sizing(parsed, sla_ms=sla_ms, context=context, phase=phase, scope=scope, tokens_per_seq=tokens_per_seq,
+                              output_budget=output_budget, max_sequences_per_dp=max_sequences_per_dp, scenarios=_BASELINE_SCENARIO)
+    scen, candidate = result["scenarios"][ZERO], result["scenarios"][ZERO].get("feasible_candidate")
+    if candidate is None:
+        raise ModelingError(f"lock_parallel_baseline_infeasible:{scen.get('feasibility_status')}")
+    b, tokens = int(candidate["b"]), int(result["tokens_per_seq"])
+    plan = prepare_fixed_plan(parsed, phase=phase, tokens=tokens, context=context, sequences=b, scope=scope)
+    return {"parallel": parsed.runtime.parallel, "pp_layer_partition": tuple(parsed.runtime.pp_layer_partition), "b": b,
+            "tokens": tokens, "emitted": float(scen["emitted_tokens_per_seq"]), "plan": plan,
+            "plan_identity": _plan_identity(plan), "baseline_status": scen.get("feasibility_status")}
+
+
+def _validate_locked_arguments(parsed: CaseSpec, *, candidates, fixed_parallel, num_devices,
+                               candidate_tps, ep_candidates, pp_candidates, pcp_candidates) -> None:
+    base = parsed.runtime.parallel
+    for label, value in (("fixed_parallel", fixed_parallel), ("candidates", candidates)):
+        if value is not None:
+            specs = [value] if label == "fixed_parallel" else list(value)
+            if len(specs) != ONE or ParallelSpec.from_mapping(specs[ZERO]) != base:
+                raise ModelingError(f"lock_parallel_{label}_conflicts_with_baseline")
+    if (num_devices if num_devices is not None else len(parsed.machine.dies)) != base.world_size:
+        raise ModelingError(f"lock_parallel_num_devices_conflicts_with_baseline:{num_devices}")
+    checks = (("tp", base.tp, candidate_tps), ("ep", base.ep, ep_candidates),
+              ("pp", base.pp, pp_candidates), ("pcp", base.pcp, pcp_candidates))
+    for name, value, domain in checks:
+        if domain is not None and value not in {int(v) for v in domain}:
+            raise ModelingError(f"lock_parallel_{name}_candidates_conflict_with_baseline:{value}")
+
+
+def _parallel_report(spec: ParallelSpec) -> dict[str, Any]:
+    return {**spec.to_dict(), "dcp": spec.dcp}
+
+
+def _locked_row(cand_case: CaseSpec, locked: Mapping[str, Any], *, sla_ms: float,
+                output_budget: int, devices: int, ranks_per_node: int) -> dict[str, Any]:
+    geometry, p, b = dict(locked["plan"]["geometry"]), locked["parallel"], int(locked["b"])
+    analysis = evaluate_fixed_plan(cand_case, plan=locked["plan"], include_capacity=True, output_budget=output_budget,
+                                   emitted_tokens_per_seq=float(locked["emitted"]))
+    capacity, step = analysis["capacity"], float(analysis["graph_duration_ms"])
+    b_vram, sla_ok = int(capacity["b_vram_max_configured"]), step <= sla_ms
+    feasible = bool(sla_ok and b <= b_vram and capacity["is_vram_feasible"])
+    tps = (b * p.dp * float(locked["emitted"]) * MS_PER_S / step) if feasible and step > ZERO_FLOAT else ZERO_FLOAT
+    probe, mem = max(ONE, int(geometry["context"])), Memory(cand_case, workspace_tokens=ONE)
+    candidate = {"b": b, "step_ms": step, "feasible": feasible, "source": "retained_baseline_plan", "input_boundary": {
+        **geometry, "output_budget": output_budget, "emitted_tokens_per_seq": locked["emitted"]},
+        "plan": {"kind": "prepared_fixed_plan", "identity": locked["plan_identity"], "selection": "baseline_case"}}
+    return {
+        "parallel": _parallel_report(p), "pp_layer_partition": list(locked["pp_layer_partition"]),
+        "status": "feasible" if feasible else "sla_or_vram_exceeded_at_retained_batch", "feasible": feasible,
+        "plan_mode": "fixed_parallel", "evaluation_boundary": "complete_prepared_plan_at_retained_parallel_and_batch",
+        "reason": None if feasible else ("retained_batch_sla_exceeded" if not sla_ok else "retained_batch_vram_exceeded"),
+        "num_devices": devices, "ranks_per_node": ranks_per_node, "weight_bytes_per_die": float(max(mem.weights)),
+        "kv_bytes_per_token_per_die": float(max(mem.cache_bytes(probe, padded=False)) / probe),
+        "b_sla": b if sla_ok else ZERO, "b_sla_lower_bound": b if sla_ok else ZERO, "b_sla_is_proven_max": False,
+        "b_vram_max": b_vram, "b_feasible": b if feasible else ZERO, "b_retained": b, "b_evaluated": b,
+        "batch_geometry": {"b": b, "context": int(geometry["context"]), "tokens": int(geometry["tokens"]),
+                           "scope": geometry["scope"], "selection": "retained_baseline_batch"},
+        "step_ms_at_b1": None, "step_ms_at_retained_b": step, "tps_at_b1": None,
+        "latency_candidate": candidate if sla_ok else None, "feasible_candidate": candidate if feasible else None,
+        "feasibility_status": "feasible_retained_batch" if feasible else "retained_batch_infeasible",
+        "search": {"method": "retained_baseline_batch_no_reselection", "b_sla_is_proven_max": False, "evaluated_candidates": [b]},
+        "total_feasible_concurrency": (b if feasible else ZERO) * p.dp, "step_ms_feasible": step if feasible else None,
+        "tps_feasible": tps, "tps_per_die": tps / float(devices), "network_mbu": analysis.get("network_mbu"),
+        "network_cube_mfu": analysis.get("network_cube_mfu"), "network_vec_mfu": analysis.get("network_vec_mfu"),
+        "network_link_util": analysis.get("network_link_util"), "plan_identity": locked["plan_identity"],
+        "metric_provenance": "one_prepared_baseline_plan_and_batch_geometry_per_hardware_variant",
+    }
+
+
+def _sweep_report(rows: list[dict[str, Any]], *, num_devices: int, sla_ms: float, context: int, phase: str,
+                  scope: str, allow_dp: bool, allow_ep: bool, allow_pp: bool, allow_pcp: bool,
+                  hardware_derivations: int | None = None, locked: Mapping[str, Any] | None = None,
+                  parallel_signature: str = "") -> dict[str, Any]:
+    domain = {"num_devices": num_devices, "allow_dp": allow_dp, "allow_ep": allow_ep, "allow_pp": allow_pp,
+              "allow_pcp": allow_pcp, "candidate_count": len(rows)}
+    if hardware_derivations:
+        domain["hardware_derivations"] = hardware_derivations
+    return {
+        "schema": "mindie-sim.topology-sweep/1", "num_devices": num_devices, "sla_ms": sla_ms, "context": context,
+        "phase": phase, "scope": scope, "search_domain": domain, "candidates": rows,
+        "pareto_frontier": compute_pareto_frontier(rows),
+        "plan_selection": "fixed_parallel" if locked is not None else "reselected_parallel_per_candidate",
+        "program_selection": "fixed" if locked is not None else "reselected",
+        "program_selection_basis": ("retained_baseline_prepared_plan_reused" if locked is not None else "reselected_per_candidate"),
+        "parallel_signature": parallel_signature,
+        "changed_hardware_fields": (), "comparison_boundary": (
+            "each_row_is_one_hardware_variant_with_retained_parallel_batch_and_plan" if locked is not None
+            else "each_row_is_one_complete_candidate_no_cross_candidate_metric_stitching"),
+        "pareto": {"basis": "exact_multi_objective_dominance_on_single_candidate_metrics",
+                   "frontier_is_selected_candidates_not_a_global_optimum_proof": True},
+    }
+
+
+def _finalize_report(report: dict[str, Any], locked: Mapping[str, Any] | None) -> dict[str, Any]:
+    if locked is not None:
+        report["retained_baseline"] = {"parallel": _parallel_report(locked["parallel"]),
+            "pp_layer_partition": list(locked["pp_layer_partition"]), "b": locked["b"], "tokens": locked["tokens"],
+            "emitted_tokens_per_seq": locked["emitted"], "plan_identity": locked["plan_identity"],
+            "plan_geometry": dict(locked["plan"]["geometry"]),
+            "baseline_status": locked["baseline_status"]}
+        report["batch_selection"] = "retained_baseline_batch"
+        report["pareto"]["step_metric"] = "retained_batch_step"
+    return report
 
 
 def sweep_topologies(
@@ -363,12 +442,11 @@ def sweep_topologies(
     allow_dp: bool = True, allow_ep: bool = True, allow_pp: bool = False, allow_pcp: bool = False,
     candidate_tps: Sequence[int] | None = None, ep_candidates: Sequence[int] | None = None,
     pp_candidates: Sequence[int] | None = None, pcp_candidates: Sequence[int] | None = None,
-    hardware_derivations: Sequence[Mapping[str, Any]] | None = None,
-    lock_parallel: bool = False,
-    fixed_parallel: Mapping[str, int] | None = None,
-    lock_program: bool = False,
+    hardware_derivations: Sequence[Mapping[str, Any]] | None = None, lock_parallel: bool = False,
+    fixed_parallel: Mapping[str, int] | None = None, lock_program: bool = False,
+    _locked_plan: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Sweep parallel sharding candidates and identify the axiomatic Pareto frontier."""
+    """Sweep candidates; locked calls retain one baseline parallel/batch/prepared plan."""
     _check_pos_float("sla_ms", sla_ms)
     _check_pos_int("context", context, minimum=0)
     _check_pos_int("output_budget", output_budget, minimum=0)
@@ -377,14 +455,26 @@ def sweep_topologies(
         raise ValueError(f"invalid_phase_or_scope:{phase}:{scope}")
     if tokens_per_seq is not None:
         _check_pos_int("tokens_per_seq", tokens_per_seq, minimum=1)
-
     parsed = parse_case(case)
-    if lock_parallel and fixed_parallel is not None:
-        candidates = (dict(fixed_parallel),)
-    elif lock_parallel and candidates is None:
-        base = parsed.runtime.parallel
-        candidates = ({"dp": base.dp, "tp": base.tp, "ep": base.ep,
-                       "pp": base.pp, "pcp": base.pcp},)
+    if lock_program and not lock_parallel:
+        raise ModelingError(LOCKED_PROGRAM_ERROR)
+    locked = _locked_plan
+    if lock_parallel and locked is None:
+        _validate_locked_arguments(parsed, candidates=candidates, fixed_parallel=fixed_parallel, num_devices=num_devices,
+            candidate_tps=candidate_tps, ep_candidates=ep_candidates, pp_candidates=pp_candidates, pcp_candidates=pcp_candidates)
+        locked_devices = num_devices if num_devices is not None else parsed.runtime.parallel.world_size
+        if locked_devices != len(parsed.machine.dies):
+            parsed = replace(parsed, machine=_materialize_machine_for_devices(parsed, case, locked_devices))
+        locked = _prepare_locked_plan(parsed, sla_ms=sla_ms, context=context, phase=phase, scope=scope,
+            tokens_per_seq=tokens_per_seq, output_budget=output_budget, max_sequences_per_dp=max_sequences_per_dp)
+    if locked is not None:
+        candidates = (locked["parallel"].to_dict(),)
+    common = dict(num_devices=num_devices, sla_ms=sla_ms, context=context, phase=phase, scope=scope,
+        tokens_per_seq=tokens_per_seq, output_budget=output_budget, max_sequences_per_dp=max_sequences_per_dp,
+        allow_dp=allow_dp, allow_ep=allow_ep, allow_pp=allow_pp, allow_pcp=allow_pcp,
+        candidate_tps=candidate_tps, ep_candidates=ep_candidates, pp_candidates=pp_candidates,
+        pcp_candidates=pcp_candidates, lock_parallel=lock_parallel, fixed_parallel=fixed_parallel,
+        lock_program=lock_program, _locked_plan=locked)
     if hardware_derivations:
         from mindie_sim.hardware_derivation import derived_machine
         combined: list[dict[str, Any]] = []
@@ -392,159 +482,100 @@ def sweep_topologies(
             declare = dict(derivation)
             sku = str(declare.pop("sku", parsed.machine.sku or "derived"))
             derived = derived_machine(parsed.machine, {**declare, "sku": sku})
-            sub = sweep_topologies(
-                replace(parsed, machine=derived), candidates=candidates,
-                num_devices=num_devices, sla_ms=sla_ms, context=context,
-                phase=phase, scope=scope, tokens_per_seq=tokens_per_seq,
-                output_budget=output_budget, max_sequences_per_dp=max_sequences_per_dp,
-                allow_dp=allow_dp, allow_ep=allow_ep, allow_pp=allow_pp,
-                allow_pcp=allow_pcp, candidate_tps=candidate_tps,
-                ep_candidates=ep_candidates, pp_candidates=pp_candidates,
-                pcp_candidates=pcp_candidates,
-            )
+            sub = sweep_topologies(replace(parsed, machine=derived), candidates=candidates, **common)
             for row in sub["candidates"]:
                 row["derived_sku"] = sku
-                row["derivation"] = {
-                    "sku": derived.sku,
+                row["derivation"] = {"sku": derived.sku,
                     "aic_count": derived.dies[FIRST].compute_units if derived.dies else None,
-                    "aiv_count": (dict(derived.dies[FIRST].resource_units).get("vector")
-                                  if derived.dies else None),
+                    "aiv_count": dict(derived.dies[FIRST].resource_units).get("vector") if derived.dies else None,
                     "memory_bytes": derived.dies[FIRST].memory_bytes if derived.dies else None,
-                    "assumptions": dict(derived.assumptions),
-                }
+                    "assumptions": dict(derived.assumptions)}
             combined.extend(sub["candidates"])
-        base_devices = (num_devices if num_devices is not None
-                        else len(parsed.machine.dies))
-        return {
-            "schema": "mindie-sim.topology-sweep/1",
-            "num_devices": base_devices,
-            "sla_ms": sla_ms, "context": context, "phase": phase, "scope": scope,
-            "search_domain": {
-                "num_devices": base_devices, "allow_dp": allow_dp,
-                "allow_ep": allow_ep, "allow_pp": allow_pp,
-                "allow_pcp": allow_pcp, "candidate_count": len(combined),
-                "hardware_derivations": len(hardware_derivations),
-            },
-            "candidates": combined,
-            "pareto_frontier": compute_pareto_frontier(combined),
-            "plan_selection": ("fixed_parallel" if lock_parallel
-                               else "reselected_parallel_per_candidate"),
-            "program_selection": "fixed" if lock_program else "reselected",
-            "parallel_signature": str(fixed_parallel or {}),
-            "changed_hardware_fields": (),
-            "comparison_boundary": "each_row_is_one_complete_candidate_no_cross_candidate_metric_stitching",
-            "pareto": {"basis": "exact_multi_objective_dominance_on_single_candidate_metrics",
-                       "frontier_is_selected_candidates_not_a_global_optimum_proof": True},
-        }
+        base_devices = num_devices if num_devices is not None else len(parsed.machine.dies)
+        return _finalize_report(_sweep_report(combined, num_devices=base_devices, sla_ms=sla_ms, context=context,
+            phase=phase, scope=scope, allow_dp=allow_dp, allow_ep=allow_ep, allow_pp=allow_pp, allow_pcp=allow_pcp,
+            hardware_derivations=len(hardware_derivations), locked=locked,
+            parallel_signature=(repr(_parallel_report(locked["parallel"])) if locked is not None else str(fixed_parallel or {}))), locked)
     target_devices = _check_pos_int("num_devices", num_devices, minimum=1) if num_devices is not None else len(parsed.machine.dies)
-    cand_list = (
-        [dict(c) for c in candidates]
-        if candidates is not None
-        else enumerate_parallel_candidates(
-            parsed, num_devices=target_devices, allow_dp=allow_dp, allow_ep=allow_ep,
-            allow_pp=allow_pp, allow_pcp=allow_pcp, candidate_tps=candidate_tps,
-            ep_candidates=ep_candidates, pp_candidates=pp_candidates, pcp_candidates=pcp_candidates,
-        )
-    )
-
+    cand_list = ([dict(c) for c in candidates] if candidates is not None else enumerate_parallel_candidates(
+        parsed, num_devices=target_devices, allow_dp=allow_dp, allow_ep=allow_ep, allow_pp=allow_pp,
+        allow_pcp=allow_pcp, candidate_tps=candidate_tps, ep_candidates=ep_candidates,
+        pp_candidates=pp_candidates, pcp_candidates=pcp_candidates))
     machines_by_count: dict[int, Hardware] = {}
     rows: list[dict[str, Any]] = []
     seq_probe = max(1, int(context))
 
     for raw_cand in cand_list:
         cand_dict = {k: int(raw_cand.get(k, 1)) for k in ("dp", "tp", "ep", "pp", "pcp")}
-        for opt_k in ("cp", "dcp", "cp_plan"):
-            if opt_k in raw_cand:
-                cand_dict[opt_k] = raw_cand[opt_k]
-        cand_devices = (
-            max(1, cand_dict["dp"] * cand_dict["tp"] * cand_dict["pp"] * cand_dict["pcp"])
-            if num_devices is None and candidates is not None
-            else target_devices
-        )
+        cand_dict.update({k: raw_cand[k] for k in ("cp", "dcp", "cp_plan") if k in raw_cand})
+        cand_p = locked["parallel"] if locked is not None else None
+        cand_devices = (cand_p.world_size if cand_p is not None else
+            max(ONE, cand_dict["dp"] * cand_dict["tp"] * cand_dict["pp"] * cand_dict["pcp"])
+            if num_devices is None and candidates is not None else target_devices)
+        if cand_p is not None:
+            cand_dict = cand_p.to_dict()
         try:
-            cand_p = ParallelSpec.from_mapping(cand_dict)
-            if cand_p.world_size != cand_devices:
-                raise ModelingError(f"parallel_world_size_mismatch:{cand_p.world_size}!={cand_devices}")
+            if cand_p is None:
+                cand_p = ParallelSpec.from_mapping(cand_dict)
+                if cand_p.world_size != cand_devices:
+                    raise ModelingError(f"parallel_world_size_mismatch:{cand_p.world_size}!={cand_devices}")
+                part = parsed.runtime.pp_layer_partition if len(parsed.runtime.pp_layer_partition) == cand_p.pp else ()
+            else:
+                part = locked["pp_layer_partition"]
             if cand_devices not in machines_by_count:
                 machines_by_count[cand_devices] = _materialize_machine_for_devices(parsed, case, cand_devices)
-            part = parsed.runtime.pp_layer_partition if len(parsed.runtime.pp_layer_partition) == cand_p.pp else ()
-            cand_case = parse_case(
-                replace(parsed, machine=machines_by_count[cand_devices], runtime=replace(parsed.runtime, parallel=cand_p, pp_layer_partition=part))
-            )
+            cand_case = parse_case(replace(parsed, machine=machines_by_count[cand_devices],
+                runtime=replace(parsed.runtime, parallel=cand_p, pp_layer_partition=part)))
+            if locked is not None:
+                rows.append(_locked_row(cand_case, locked, sla_ms=sla_ms, output_budget=output_budget,
+                    devices=cand_devices, ranks_per_node=machines_by_count[cand_devices].ranks_per_node))
+                continue
             mem = Memory(cand_case, workspace_tokens=1)
             weight_bytes_per_die = float(max(mem.weights))
             kv_bytes_per_token_per_die = float(max(mem.cache_bytes(seq_probe, padded=False)) / seq_probe)
-            sla_res = solve_sla_sizing(
-                cand_case, sla_ms=sla_ms, context=context, phase=phase, scope=scope,
+            scen = solve_sla_sizing(cand_case, sla_ms=sla_ms, context=context, phase=phase, scope=scope,
                 tokens_per_seq=tokens_per_seq, output_budget=output_budget,
-                max_sequences_per_dp=max_sequences_per_dp, scenarios=_BASELINE_SCENARIO,
-            )
-            scen = sla_res["scenarios"][0]
-            candidate = scen.get("feasible_candidate")
-            feasible = candidate is not None
+                max_sequences_per_dp=max_sequences_per_dp, scenarios=_BASELINE_SCENARIO)["scenarios"][ZERO]
+            candidate, feasible = scen.get("feasible_candidate"), scen.get("feasible_candidate") is not None
             b_sla, b_vram_max = int(scen["b_sla"]), int(scen["b_vram_max"])
             b_feasible = int(candidate["b"]) if candidate is not None else 0
             tps_feasible = float(candidate["tps_feasible"]) if candidate is not None and "tps_feasible" in candidate else float(scen["tps_feasible"])
-            row = {
+            rows.append({
                 "parallel": {k: cand_dict[k] for k in ("dp", "tp", "ep", "pp", "pcp")},
-                "status": "feasible" if feasible else "sla_or_vram_exceeded",
-                "feasible": feasible,
-                "plan_mode": "reselected_parallel",
-                "evaluation_boundary": "complete_candidate_graph_and_capacity",
-                "reason": None if feasible else scen.get("feasibility_status"),
-                "num_devices": cand_devices,
+                "status": "feasible" if feasible else "sla_or_vram_exceeded", "feasible": feasible,
+                "plan_mode": "reselected_parallel", "evaluation_boundary": "complete_candidate_graph_and_capacity",
+                "reason": None if feasible else scen.get("feasibility_status"), "num_devices": cand_devices,
                 "ranks_per_node": machines_by_count[cand_devices].ranks_per_node,
-                "weight_bytes_per_die": weight_bytes_per_die,
-                "kv_bytes_per_token_per_die": kv_bytes_per_token_per_die,
+                "weight_bytes_per_die": weight_bytes_per_die, "kv_bytes_per_token_per_die": kv_bytes_per_token_per_die,
                 "b_sla": b_sla, "b_vram_max": b_vram_max, "b_feasible": b_feasible,
-                "latency_candidate": scen.get("latency_candidate"),
-                "feasible_candidate": candidate,
+                "latency_candidate": scen.get("latency_candidate"), "feasible_candidate": candidate,
                 "feasibility_status": scen.get("feasibility_status"), "search": scen.get("search"),
-                "total_feasible_concurrency": b_feasible * cand_p.dp,
-                "step_ms_at_b1": float(scen["step_ms_at_b1"]),
+                "total_feasible_concurrency": b_feasible * cand_p.dp, "step_ms_at_b1": float(scen["step_ms_at_b1"]),
                 "step_ms_feasible": float(candidate["step_ms"]) if candidate is not None else None,
-                "tps_at_b1": float(scen["tps_at_b1"]),
-                "tps_feasible": tps_feasible,
+                "tps_at_b1": float(scen["tps_at_b1"]), "tps_feasible": tps_feasible,
                 "tps_per_die": tps_feasible / float(cand_devices),
                 "network_mbu": float(candidate["network_mbu"]) if candidate is not None else None,
                 "network_cube_mfu": float(candidate["network_cube_mfu"]) if candidate is not None else None,
                 "network_vec_mfu": float(candidate["network_vec_mfu"]) if candidate is not None else None,
                 "network_link_util": float(candidate["network_link_util"]) if candidate is not None else None,
-            }
-            rows.append(row)
-        except (ModelingError, ValueError) as exc:
-            rows.append({
-                "parallel": {k: cand_dict[k] for k in ("dp", "tp", "ep", "pp", "pcp")},
-                "status": "infeasible", "feasible": False, "reason": str(exc),
-                "plan_mode": "reselected_parallel", "evaluation_boundary": "candidate_rejected_before_or_during_complete_evaluation",
-                "feasibility_status": "infeasible_before_evaluation", "search": None,
-                "num_devices": cand_devices, "ranks_per_node": None,
-                "weight_bytes_per_die": None, "kv_bytes_per_token_per_die": None,
-                "b_sla": 0, "b_vram_max": 0, "b_feasible": 0, "total_feasible_concurrency": 0,
-                "latency_candidate": None, "feasible_candidate": None,
-                "step_ms_at_b1": None, "step_ms_feasible": None, "tps_at_b1": 0.0,
-                "tps_feasible": 0.0, "tps_per_die": 0.0, "network_mbu": None,
-                "network_cube_mfu": None, "network_vec_mfu": None, "network_link_util": None,
             })
-
-    pareto_frontier = compute_pareto_frontier(rows)
-    return {
-        "schema": "mindie-sim.topology-sweep/1",
-        "num_devices": target_devices, "sla_ms": sla_ms, "context": context, "phase": phase, "scope": scope,
-        "search_domain": {
-            "num_devices": target_devices, "allow_dp": allow_dp, "allow_ep": allow_ep,
-            "allow_pp": allow_pp, "allow_pcp": allow_pcp, "candidate_count": len(rows),
-        },
-        "candidates": rows, "pareto_frontier": pareto_frontier,
-        "plan_selection": ("fixed_parallel" if lock_parallel
-                           else "reselected_parallel_per_candidate"),
-        "program_selection": "fixed" if lock_program else "reselected",
-        "parallel_signature": str(fixed_parallel or ""),
-        "changed_hardware_fields": (),
-        "comparison_boundary": "each_row_is_one_complete_candidate_no_cross_candidate_metric_stitching",
-        "pareto": {"basis": "exact_multi_objective_dominance_on_single_candidate_metrics",
-                   "frontier_is_selected_candidates_not_a_global_optimum_proof": True},
-    }
+        except (ModelingError, ValueError) as exc:
+            row = {"parallel": (_parallel_report(cand_p) if locked is not None else {k: cand_dict[k] for k in ("dp", "tp", "ep", "pp", "pcp")}),
+                "status": "infeasible", "feasible": False, "reason": str(exc),
+                "plan_mode": "fixed_parallel" if locked is not None else "reselected_parallel",
+                "evaluation_boundary": "candidate_rejected_before_or_during_complete_evaluation",
+                "feasibility_status": "infeasible_before_evaluation", "search": None, "num_devices": cand_devices,
+                "ranks_per_node": None, "weight_bytes_per_die": None, "kv_bytes_per_token_per_die": None,
+                "b_sla": ZERO, "b_vram_max": ZERO, "b_feasible": ZERO, "total_feasible_concurrency": ZERO,
+                "latency_candidate": None, "feasible_candidate": None, "step_ms_at_b1": None,
+                "step_ms_feasible": None, "tps_at_b1": ZERO_FLOAT, "tps_feasible": ZERO_FLOAT, "tps_per_die": ZERO_FLOAT,
+                "network_mbu": None, "network_cube_mfu": None, "network_vec_mfu": None, "network_link_util": None}
+            if locked is not None:
+                row.update({"b_retained": locked["b"], "plan_identity": locked["plan_identity"]})
+            rows.append(row)
+    return _finalize_report(_sweep_report(rows, num_devices=target_devices, sla_ms=sla_ms, context=context,
+        phase=phase, scope=scope, allow_dp=allow_dp, allow_ep=allow_ep, allow_pp=allow_pp, allow_pcp=allow_pcp,
+        locked=locked, parallel_signature=(repr(_parallel_report(locked["parallel"])) if locked is not None else str(fixed_parallel or ""))), locked)
 
 
 def _pool_kv_hbm_ms(parsed_pool: CaseSpec, mem_pool: Memory, tokens: int) -> float:

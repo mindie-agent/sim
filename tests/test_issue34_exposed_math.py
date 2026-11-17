@@ -87,7 +87,7 @@ def test_zero_time_and_operator_only_results_are_explicit():
 
 def test_boundary_and_order_mismatches_are_errors_not_scaled():
     with pytest.raises(ModelingError, match="clock_mismatch"):
-        breakdown(cube_clocks(5), 6)
+        breakdown(cube_clocks(5), 10)
     with pytest.raises(ModelingError, match="clock_order_invalid"):
         ExposedClocks(1, 2, 0, 0)
     with pytest.raises(ModelingError, match="clock_invalid"):
@@ -95,7 +95,7 @@ def test_boundary_and_order_mismatches_are_errors_not_scaled():
     clocks = roofline_clocks(cube_ms=2, vector_ms=0, memory_ms=3,
                              communication_ms=0)
     with pytest.raises(ModelingError, match="clock_mismatch"):
-        breakdown(clocks, 4)
+        breakdown(clocks, 10)
 
 
 def test_percent_residual_is_assigned_deterministically():

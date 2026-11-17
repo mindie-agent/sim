@@ -102,13 +102,16 @@ def test_linear_state_stays_private_and_draft_geometry_is_inherited():
         replica=0, phase="decode", padded=False)
     assert footprint.state_total > 0
     assert footprint.shared_once_total == 0
+    from mindie_sim.catalog.draft_geometry import native_draft_layer_plans
     from mindie_sim.catalog.types import AuxiliarySpec, DraftSpec
     draft = DraftSpec(kind="mtp", layers=1, hidden_size=32, intermediate_size=64,
                       num_heads=4, num_kv_heads=2, head_dim=16, q_width=64,
                       kv_width=32, vocab_size=128, attention_kind="gqa",
                       kv_cache_elements=32, target_shared_embedding=True,
                       target_shared_lm_head=True)
-    model = replace(dense_model(layers=1), auxiliary=AuxiliarySpec(mtp=draft))
+    target = dense_model(layers=1)
+    draft = replace(draft, layer_plans=native_draft_layer_plans(target, draft))
+    model = replace(target, auxiliary=AuxiliarySpec(mtp=draft))
     draft_components = draft_cache_components(
         model, ParallelSpec(tp=1), draft_kind="mtp", sequence_tokens=8)
     assert draft_components["draft_kv"] > 0

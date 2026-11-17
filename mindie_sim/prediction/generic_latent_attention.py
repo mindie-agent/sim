@@ -31,6 +31,7 @@ from .program import KernelProgram, ParallelProgram, Stage
 from .engine import Allocation
 
 KEY_TILE = 128
+INDEX_QUERY_TILE = 128
 DEFAULT_BLOCK_SIZE = 128
 CANDIDATE_BYTES = 8
 FP32_BYTES = 4
@@ -254,9 +255,73 @@ def selected_pairs(parts, ratio, topk, *, noncausal=False, kv_len=None):
     )
 
 
+def index_key_window(parts, *, query_tile=INDEX_QUERY_TILE, noncausal=False,
+                     kv_len=None, cp=ONE, interleave=INDEX_QUERY_TILE):
+    """(unique key rows, tile refill rows) consumed by one view's query tiles.
+
+    Every query tile still issues its own per-query arithmetic; only the
+    external HBM fetch is reduced to the physical union of the tile key sets.
+    ``refills`` is the sum of each tile's consumed set (MTE2 service).
+    """
+    tile = max(ONE, int(query_tile))
+    union_rows = ZERO
+    refill_rows = ZERO
+    for query, context in parts:
+        query = int(query)
+        if query <= ZERO:
+            continue
+        if int(cp) > ONE:
+            # Context-parallel index keys are interleaved by rank; the owner
+            # pays only its own visible key rows for each query token.
+            for offset in range(ONE, query + ONE):
+                horizon = int(context) + offset
+                if kv_len is not None:
+                    horizon = min(horizon, int(kv_len))
+                owned = [owned_positions(ZERO, horizon, int(cp),
+                                         int(interleave), rank)
+                         for rank in range(int(cp))]
+                owner_rows = max(owned) if owned else ZERO
+                union_rows = max(union_rows, owner_rows)
+                refill_rows += owner_rows
+            continue
+        if noncausal:
+            horizon = int(kv_len if kv_len is not None else context + query)
+            tiles = (query + tile - ONE) // tile
+            union_rows = max(union_rows, horizon)
+            refill_rows += tiles * horizon
+            continue
+        start = ZERO
+        while start < query:
+            end = min(query, start + tile)
+            horizon = int(context) + end
+            if kv_len is not None:
+                horizon = min(horizon, int(kv_len))
+            union_rows = max(union_rows, horizon)
+            refill_rows += horizon
+            start = end
+    return union_rows, refill_rows
+
+
+def unique_index_key_rows(views, *, query_tile=INDEX_QUERY_TILE, noncausal=False,
+                          cp=ONE, interleave=INDEX_QUERY_TILE):
+    """Physical union and tile refills, deduplicating only shared prefixes."""
+    groups: dict[object, int] = {}
+    refills = ZERO
+    for position, view in enumerate(views):
+        union_rows, view_refills = index_key_window(
+            visible_parts(view), query_tile=query_tile, noncausal=noncausal,
+            kv_len=view.kv_len, cp=cp, interleave=interleave)
+        refills += view_refills
+        prefix = int(getattr(view, "prefix_tokens", ZERO) or ZERO)
+        key = (str(getattr(view, "prefix_key", "") or ""),) if prefix > ZERO \
+            else (position, str(view.request_id))
+        groups[key] = max(groups.get(key, ZERO), union_rows)
+    return sum(groups.values()), refills
+
+
 def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
                             shard, prefix, padded_tokens, runtime=None,
-                            score_rows=None):
+                            score_rows=None, l2_bytes=None):
     """Declare the indexer score/TopK pair with local sharded row accounting."""
     valid = sum(view.q_len for view in views)
     cand_window = (
@@ -283,10 +348,25 @@ def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
     rows = max(ZERO_FLOAT, float(score_rows)) if local else float(sum(rows_by_view))
     divisor = ONE if local else max(ONE, int(shard))
     row_b = index_row_bytes(model, plan.index_dim)
+    # External HBM is the physical union of the tile key sets (deduplicated
+    # only across a shared prefix); MTE2 keeps each tile's fetch service.
+    cp = int(getattr(parallel, "cp", ONE) or ONE)
+    interleave = int(getattr(runtime, "kv_block_size", INDEX_QUERY_TILE)
+                     or INDEX_QUERY_TILE)
+    union_rows, refill_rows = unique_index_key_rows(
+        views, noncausal=bool(plan.noncausal_attention), cp=cp,
+        interleave=interleave)
+    hbm_rows = float(union_rows)
+    if l2_bytes is not None and float(l2_bytes) > ZERO_FLOAT:
+        working = hbm_rows * row_b
+        if working > float(l2_bytes):
+            spill = max(ZERO_FLOAT, ONE - float(l2_bytes) / working)
+            hbm_rows += max(ZERO_FLOAT, float(refill_rows) - hbm_rows) * spill
     scores = b.work("index_scores", deps, (valid, plan.index_heads, plan.index_dim),
                     flops=TWO * rows * plan.index_heads * plan.index_dim / divisor,
                     vector=rows * plan.index_heads * TWO / divisor,
-                    read=rows * row_b / divisor,
+                    read=float(refill_rows) * row_b / divisor,
+                    hbm_read=hbm_rows * row_b / divisor,
                     write=rows * FP32_BYTES / divisor, family="indexer",
                     dtype=quant.index_dtype)
     if not local and shard == ONE and b.ops:
@@ -298,7 +378,9 @@ def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
             shared_rows_by_view=shared_by_view, row_bytes=float(row_b),
             layer_index=plan.index, runtime=runtime,
             kernel_reuse="native_per_sequence" if pinned else "tile",
-            allow_recipe_rebind=not pinned)
+            allow_recipe_rebind=not pinned,
+            hbm_component=hbm_rows * row_b / divisor,
+            mte2_component=float(refill_rows) * row_b / divisor)
     topk = b.work("index_topk", (scores,), (valid, plan.index_topk),
                  vector=rows * math.log2(max(MIN_LOG_TOPK, plan.index_topk)) / divisor,
                  read=rows * FP32_BYTES / divisor,

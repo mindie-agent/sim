@@ -19,8 +19,8 @@
 from __future__ import annotations
 
 from .api import (
-    simulate_graph, simulate_model, simulate_native_call,
-    simulate_operator, simulate_service,
+    simulate_aclnn_call, simulate_graph, simulate_model,
+    simulate_native_call, simulate_operator, simulate_service,
 )
 from .contracts import (
     CAPABILITIES, CORE_PROVIDER, ENTRY_POINT_GROUP, INTERFACE_VERSION,
@@ -39,6 +39,6 @@ __all__ = [
     "ExecutionEnvironment",
     "Extension", "ExtensionContext", "Provider", "UserProfile",
     "ExtensionError", "CapabilityGap", "load_extensions", "load_user_profile",
-    "simulate_operator", "simulate_native_call",
+    "simulate_operator", "simulate_native_call", "simulate_aclnn_call",
     "simulate_graph", "simulate_model", "simulate_service",
 ]

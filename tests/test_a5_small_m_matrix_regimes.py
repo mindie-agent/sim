@@ -55,7 +55,10 @@ def test_effective_small_matrix_weight_service_tracks_hbm_without_changing_work(
     assert spans[0]>spans[1]>spans[2]
     assert spans[0]==pytest.approx(.054272)
     assert spans[1]==pytest.approx(.027136)
-    assert spans[2]==pytest.approx(.013568)
+    # The factor-2 case overrides only hbm_bw_bytes_per_s; the declared
+    # mte2_aic_dram service mode is unchanged, so the corrected per-owner DRAM
+    # cap (B/s -> B/ms, divided by the owner count) is the binding service.
+    assert spans[2]==pytest.approx(.026163471)
     # Semantic issued work (FLOPs, HBM bytes) is invariant across the sweep;
     # the resource service split may change when the binding supplier changes.
     assert work[0]==work[1]==work[2]

@@ -353,8 +353,12 @@ class _DeadlineExpired(TimeoutError):
 @pytest.mark.parametrize("stage", ("trial", "settled"))
 def test_fix19_canonical_prefetch_timeout_is_immediate(monkeypatch, stage, error_type):
     pending, _, _ = _busy_prefetch_plan()
+    # The predecessor must leave spare HBM bandwidth in the consumer's ready
+    # window; an HBM-exact predecessor makes the real prefetch planner reject
+    # with ``hbm_saturated_no_overlap_gain`` before either evaluation stage.
     plan = pending.rewrite(tuple(
-        replace(op, hbm_bytes=16 * 1024 * 1024) if op.op_id == "mm" else op
+        replace(op, hbm_bytes=16 * 1024 * 1024) if op.op_id == "mm"
+        else replace(op, vector_ops=1e7) if op.op_id == "pre" else op
         for op in pending.ops
         if op.family not in {"prefetch", "release"} and op.op_id != "busy"))
     sentinel = error_type(stage)

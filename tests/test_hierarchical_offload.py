@@ -161,7 +161,9 @@ def test_memory_kvc_ratio_scales_resize_and_capacity_is_bounded() -> None:
     assert no_kvc.to_dict()["status"] == "feasible"
     assert with_kvc.to_dict()["status"] == "feasible"
 
-    context = 327680
+    # A context that still exceeds the grown A5/KVC capacity: the assertion
+    # below establishes the tiering precondition, not a stale capacity pin.
+    context = 2 * 327680
     raw = no_kvc.cache_bytes(context)
     scaled = with_kvc.cache_bytes(context)
     assert scaled == raw
@@ -305,7 +307,9 @@ def test_predict_emits_declared_expert_ddr_transfer():
         "expert_offload_enabled": True, "force_expert_offload": True,
         "expert_ddr_ratio": 0.5, "ddr_bw_gbps": 0.05, "ddr_latency_us": 1000.0,
     }
-    report = predict(offload)
+    # The transfer is a real submitted event; retain a trace window large
+    # enough that the bounded ring does not evict it before observation.
+    report = predict(offload, event_limit=20000)
     events = [event for event in report["events"]
               if event["task"].endswith(":expert_ddr_offload")]
     assert events, "a selected expert offload must transfer on the shared engine"

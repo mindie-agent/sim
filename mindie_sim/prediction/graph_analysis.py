@@ -26,9 +26,11 @@ from .operator_analysis import cohort_operator_costs, operator_costs, physical_i
 from .native_binding import bind_native_call
 from .program import RecipeBook
 from .structure import parse_case
-from .exposed_breakdown import (ExposedClocks, advance_clocks, finish_breakdown,
-                                join_clocks, roofline_clocks,
-                                unavailable_breakdown)
+from .exposed_breakdown import (
+    CLOCK_GAP_ABS_FLOOR_MS, CLOCK_GAP_LIMIT_FRACTION, ExposedClocks,
+    communication_clocks, control_clocks, cube_clocks, finish_breakdown,
+    memory_clocks, unavailable_breakdown, vector_clocks)
+from .resource_attribution import realized_clock_dag
 
 ZERO = 0
 ONE = 1
@@ -40,7 +42,6 @@ ROLE_VECTOR = "vector"
 ROLE_MEMORY = "memory"
 ROLE_COMMUNICATION = "communication"
 ROLE_CONTROL = "control"
-FLOPS_PER_BYTE_NORMALIZER = 8.0
 NON_COMMUNICATION_ROLES = frozenset({
     ROLE_CUBE, ROLE_VECTOR, ROLE_MEMORY, ROLE_CONTROL})
 
@@ -61,12 +62,17 @@ def _dominant_role(op) -> str:
     return ROLE_MEMORY if memory > ZERO else ROLE_CONTROL
 
 
-def _exposed_breakdown(records, duration_ms, input_ready_ms, replica):
-    """Reduce executed occurrence intervals onto the device-step boundary.
+def _exposed_breakdown(records, duration_ms, input_ready_ms, replica,
+                       service_clocks_by_id=None):
+    """Reduce executed occurrence service clocks onto the device-step boundary.
 
     Intervals are the actual ``[ready, complete]`` spans of one replica's
-    executed operators. A missing periodic cross-stage wait cannot be scaled
-    into agreement: the report is explicitly unavailable instead.
+    executed operators.  Each occurrence contributes its executed service
+    interval to its declared dominant physical stage; no byte/FLOP proportion
+    is fabricated and no clock is rescaled to the graph span.  The clocks are
+    propagated through the realized causal DAG (data, stream, state and
+    collective-rendezvous predecessors).  A missing periodic cross-stage wait
+    or an unreconciled boundary makes the report explicitly unavailable.
     """
     intervals = []
     for record in records:
@@ -86,51 +92,80 @@ def _exposed_breakdown(records, duration_ms, input_ready_ms, replica):
         return unavailable_breakdown(
             "unreconciled_execution_boundary", boundary="device_step")
 
-    def local_clocks(record, start, end):
-        op = record["op"]
+    def service_clocks(op, elapsed):
+        role = _dominant_role(op)
+        if role == ROLE_COMMUNICATION:
+            return communication_clocks(elapsed)
+        if role == ROLE_CUBE:
+            return cube_clocks(elapsed)
+        if role == ROLE_VECTOR:
+            return vector_clocks(elapsed)
+        if role == ROLE_MEMORY:
+            return memory_clocks(elapsed)
+        return control_clocks(elapsed)
+
+    def record_id(record, ordinal):
+        return str(record.get("id") or f"record{ordinal}")
+
+    identifiers = [record_id(record, ordinal)
+                   for ordinal, (_start, _end, record) in enumerate(intervals)]
+    if len(set(identifiers)) != len(identifiers):
+        return unavailable_breakdown(
+            "exposed_occurrence_identity_duplicate", boundary="device_step")
+    local = {}
+    dependencies = {}
+    has_dependency_identity = all(
+        "predecessors" in record for _start, _end, record in intervals)
+    for ordinal, (start, end, record) in enumerate(intervals):
         elapsed = max(ZERO_FLOAT, end - start)
-        flops = float(getattr(op, "flops", ZERO_FLOAT) or ZERO_FLOAT)
-        vector = float(getattr(op, "vector_ops", ZERO_FLOAT) or ZERO_FLOAT)
-        memory = math.fsum(float(getattr(op, field, ZERO_FLOAT) or ZERO_FLOAT)
-                           for field in ("hbm_bytes", "mte2_bytes", "mte3_bytes"))
-        link = float(getattr(op, "link_bytes", ZERO_FLOAT) or ZERO_FLOAT)
-        cube_raw = flops / FLOPS_PER_BYTE_NORMALIZER
-        raw_total = cube_raw + vector + memory + link
-        if raw_total <= ZERO_FLOAT or elapsed <= ZERO_FLOAT:
-            return control_clocks_local(elapsed)
-        cube = elapsed * cube_raw / raw_total
-        compute = elapsed * (cube_raw + vector) / raw_total
-        without = (elapsed * (cube_raw + vector + memory) / raw_total
-                   if link > ZERO_FLOAT else elapsed)
-        return ExposedClocks(elapsed, without, compute, cube)
+        supplied = (service_clocks_by_id or {}).get(identifiers[ordinal])
+        local[identifiers[ordinal]] = (
+            supplied if isinstance(supplied, ExposedClocks)
+            else service_clocks(record["op"], elapsed))
+        if has_dependency_identity:
+            dependencies[identifiers[ordinal]] = tuple(record["predecessors"])
+    if not has_dependency_identity:
+        # No declared edges: keep the observed intervals serial in execution
+        # order.  Parallel overlap is not invented.
+        def interval_order(pair):
+            interval, _identifier = pair
+            start, end, _record = interval
+            return start, end
 
-    def control_clocks_local(value):
-        return ExposedClocks(value, value, value, ZERO_FLOAT)
-
-    maxima = [control_clocks_local(ZERO_FLOAT)]
-    for _start, _end, record in intervals:
-        local = local_clocks(record, _start, _end)
-        maxima.append(local)
-    clocks = join_clocks(maxima)
+        ordered = [
+            identifier for _interval, identifier in sorted(
+                zip(intervals, identifiers), key=interval_order)]
+        dependencies = {}
+        previous = None
+        for node_id in ordered:
+            dependencies[node_id] = (
+                () if previous is None else (previous,))
+            previous = node_id
+    _clocks, terminal = realized_clock_dag(
+        local, dependencies, allow_external_predecessors=True)
     expected = float(duration_ms)
-    if clocks.all_ms <= ZERO_FLOAT:
-        clocks = control_clocks_local(expected)
-    else:
-        # The four-clock projection must span the reported device step exactly:
-        # ``join_clocks`` keeps the longest interval, not the ordered span.
-        scale = expected / clocks.all_ms
-        without = min(expected, clocks.without_communication_ms * scale)
-        compute = min(without, clocks.compute_ms * scale)
-        cube = min(compute, clocks.cube_ms * scale)
-        clocks = ExposedClocks(expected, without, compute, cube)
+    if terminal.all_ms <= ZERO_FLOAT:
+        if expected > ZERO_FLOAT:
+            return unavailable_breakdown(
+                "service_clocks_missing", boundary="device_step")
+    gap_limit = max(expected * CLOCK_GAP_LIMIT_FRACTION,
+                    CLOCK_GAP_ABS_FLOOR_MS)
+    if abs(expected - terminal.all_ms) > gap_limit:
+        return unavailable_breakdown(
+            "unreconciled_service_clock_boundary", boundary="device_step")
     result = finish_breakdown(
-        clocks, duration_ms=expected, boundary="device_step",
+        terminal, duration_ms=expected, boundary="device_step",
         control_ms=first_start)
     basis = result["exposed_breakdown_basis"]
     basis["replica"] = int(replica)
     basis["operator_intervals"] = len(intervals)
     basis["host_launch_ms"] = float(first_start)
-    basis["method"] = "four_clock_service_attribution_v1"
+    basis["method"] = "four_clock_service_attribution_v2"
+    basis["service_basis"] = (
+        "executed_interval_assigned_to_declared_dominant_physical_class")
+    basis["declared_edges"] = bool(has_dependency_identity)
+    basis["realized_edges"] = sum(
+        len(predecessors) for predecessors in dependencies.values())
     return result
 
 

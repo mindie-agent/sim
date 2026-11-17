@@ -71,7 +71,9 @@ def test_envelope_exchange_honors_rounds_independently_of_family_label(rounds):
     raw["machine"]["links"][0].update(
         semantics="per_pair", capacity_bytes_per_ms=1000, latency_us=1000)
     results = []
-    for family, extra in (("alltoall", ()), ("transport", (("collective", "alltoall"),))):
+    # Both labels are declared collectives; the explicit ``collective``
+    # metadata, not the op family label, selects the alltoall envelope.
+    for family, extra in (("alltoall", ()), ("alltoallv", (("collective", "alltoall"),))):
         op = exchange(30, family=family, metadata=(("steps", rounds),) + extra)
         result = graph_costs(raw, (op,))
         results.append(result["duration_ms"])

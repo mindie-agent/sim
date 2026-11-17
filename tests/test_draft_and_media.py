@@ -10,8 +10,9 @@ import json
 from pathlib import Path
 
 from mindie_sim import Case, predict
-from mindie_sim.catalog.types import AuxiliarySpec, DraftSpec
+from mindie_sim.catalog.draft_geometry import native_draft_layer_plans
 from mindie_sim.catalog.draft_weights import draft_terms
+from mindie_sim.catalog.types import AuxiliarySpec, DraftSpec
 from mindie_sim.catalog.weight_terms import term_bytes
 from mindie_sim.prediction.frontend import Frontend
 from mindie_sim.prediction.scheduler import DraftPolicy, Progress
@@ -26,6 +27,7 @@ def draft_case():
     draft = DraftSpec(kind="mtp", layers=1, hidden_size=32, intermediate_size=64,
                       num_heads=4, num_kv_heads=2, head_dim=8, q_width=32, kv_width=16,
                       vocab_size=128, target_shared_embedding=True, target_shared_lm_head=True)
+    draft = replace(draft, layer_plans=native_draft_layer_plans(parsed.model, draft))
     return replace(parsed, model=replace(parsed.model, auxiliary=AuxiliarySpec(mtp=draft)),
                    runtime=replace(parsed.runtime, metadata=(
                        ("draft_mode", "mtp"), ("draft_proposal_tokens", 2), ("draft_accept_tokens", 1))))

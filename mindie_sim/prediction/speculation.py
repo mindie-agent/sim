@@ -66,7 +66,7 @@ from mindie_sim.catalog.draft_geometry import (  # noqa: F401
 
 
 def draft_program(frontend, model, runtime, views, ready, *, global_views=None, prefill=False,
-                  replica=ZERO, replay_scope="none"):
+                  replica=ZERO, replay_scope="none", machine=None):
     kind = dict(runtime.metadata).get("draft_mode", "mtp")
     draft = optional_draft_spec(model, kind)
     from mindie_sim.catalog.paired_sfa import independent_draft
@@ -194,6 +194,7 @@ def draft_program(frontend, model, runtime, views, ready, *, global_views=None, 
             ready=body_ready,
             tokens=rows, mode="draft_prefill" if prefill else "draft",
             stages=(stage,) * draft.layers, global_tokens=global_tokens, replica=replica,
+            machine=machine,
         )
         ops.extend(body)
         if prefill:

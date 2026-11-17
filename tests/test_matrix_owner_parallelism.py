@@ -35,12 +35,20 @@ def test_small_rectangular_matrix_uses_more_owners_with_same_semantic_work():
     chosen = mapping(new)['selected']
     assert len(owner_tiles(128, 288, chosen['tile_m'], chosen['tile_n'], 32)) >= 16
     assert len(owner_tiles(128, 288, 128, 128, 32)) == 3
-    assert new['duration_ms'] - 7 < (old['duration_ms'] - 7) / 4
+    # The coarse 128x128 control also runs through Split-K; after the Split-K
+    # Cube double-count is removed its service is 1x, so the calibrated 4x
+    # threshold (which compared against 2x Cube work) is no longer applicable.
+    # The small grid still materially improves on the coarse control.
+    assert new['duration_ms'] - 7 < (old['duration_ms'] - 7) * 0.6
     before, after = old['execution']['serviced'], new['execution']['serviced']
     # M2 selects split-K/underfilled owners for this underfilled grid; the
     # aggregate matrix-pipe service is no longer the coarse 128x128 value.
     assert after['matrix@r0:s0'] == pytest.approx(0.01117090909090909)
-    assert after['memory@r0:s0'] == pytest.approx(before['memory@r0:s0'])
+    # The coarse control's Split-K writes/reads GM partials; the selected
+    # underfilled plan keeps the declared input path only.
+    assert after['memory@r0:s0'] == pytest.approx(6_963_200.0)
+    assert before['memory@r0:s0'] - after['memory@r0:s0'] == pytest.approx(
+        2 * 1_474_560.0)
     # Independent owners fetch more private operands; more parallelism is not
     # free reuse across MTE2/L1. Global HBM reuse remains the declared policy.
     assert after['mte2_aic@r0:s0'] > before['mte2_aic@r0:s0']

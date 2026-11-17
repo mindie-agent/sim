@@ -23,6 +23,8 @@ from mindie_sim.schema.hardware import NATIVE_WORK_UNITS
 from mindie_sim.schema.operators import ProgramFragment
 from .engine import Allocation, Engine, Event
 from .ownership import unit_group
+ZERO = 0
+ZERO_FLOAT = 0.0
 
 
 _EMPTY_MAPPING = MappingProxyType({})
@@ -1384,6 +1386,30 @@ class RecipeContext:
             cache[key] = hit
         return dict(hit)
 
+    def read_pipe(self, *, aiv: bool | None = None) -> str:
+        """Declared operand-read pipe for this op's consumer owner.
+
+        A split MTE2 topology exposes one AIC-owned and one AIV-owned read path.
+        The consumer decides which pipe services an operand fetch: an op with
+        Cube work reads through AIC, a vector-only op through AIV.  An explicit
+        ``read_pipe`` metadata declaration wins so a mixed owner can name the
+        exact physical consumer instead of inferring it from totals.
+        """
+        from .ownership import read_role
+        names = self.resource_names
+        split = {"mte2_aic", "mte2_aiv"}.intersection(names)
+        if not split:
+            return "mte2"
+        declared = str(dict(self.op.metadata or {}).get("read_pipe", "") or "")
+        if declared in {"aic", "aiv"}:
+            return read_role(names, aiv=ZERO if declared == "aiv" else None)
+        if aiv is None:
+            matrix = tuple(getattr(self.op, "matrix_flops", ()) or ())
+            flops = float(getattr(self.op, "flops", ZERO_FLOAT) or ZERO_FLOAT)
+            vector = float(getattr(self.op, "vector_ops", ZERO_FLOAT) or ZERO_FLOAT)
+            aiv = not matrix and flops <= ZERO_FLOAT and vector > ZERO_FLOAT
+        return read_role(names, aiv=ZERO if aiv else None)
+
     def bind(self, work) -> dict[str, float]:
         """Resolve typed stage work onto shared physical resources, in ms units."""
         demand = {}
@@ -1394,6 +1420,8 @@ class RecipeContext:
                 raise ModelingError(f"compute_precision_rate_required:{dtype}")
             name = self.resource_names["cube"]
             demand[name] = demand.get(name, 0) + 1000 * flops / self.compute_peaks[dtype]
+        matrix_consumer = any(float(value) > ZERO_FLOAT
+                              for value in work.matrix.values())
         for role, amount in work.resources.items():
             if not amount:
                 continue
@@ -1405,10 +1433,23 @@ class RecipeContext:
                 # in the base pipe's units so its different instructions contend.
                 amount *= self.rates[name] * 1000 / rate
                 role = resource
-            if role in {"mte2", "mte3"} and role not in self.resource_names:
+            if role == "mte2" and role not in self.resource_names:
+                # The hardware declares separate AIC/AIV read pipes. Route the
+                # typed fetch to its consumer instead of dropping the service.
+                split = {"mte2_aic", "mte2_aiv"}.intersection(self.resource_names)
+                if not split:
+                    # A non-Ascend backend has one global memory path and no
+                    # separate operand-fetch pipe; the HBM component already
+                    # carries those bytes.  Never invent a second charge.
+                    continue
+                role = self.read_pipe(aiv=False if matrix_consumer else None)
+            if role == "mte3" and role not in self.resource_names:
                 continue
             if role not in self.resource_names:
-                raise ModelingError(f"physical_resource_rate_missing:{role}")
+                raise ModelingError(
+                    f"physical_resource_rate_missing:{role}:"
+                    f"{getattr(self.op, 'family', '')}:"
+                    f"{getattr(self.op, 'recipe', '')}")
             name = self.resource_names[role]
             demand[name] = demand.get(name, 0) + amount
         return demand
@@ -2858,4 +2899,5 @@ def split_cohort_kernel(programs):
                             for dep in refs(name, owner)),
                 previous=tuple(dep for name in stage.previous
                                for dep in refs(name, owner))))
+
     return KernelProgram(tuple(rebuilt), first.minimum_ms)

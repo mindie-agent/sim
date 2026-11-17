@@ -134,6 +134,7 @@ def test_serving_single_request_uses_actual_dp_expert_shards():
 
 def test_model_scope_moe_mtp_preserves_replica_rows_and_target_completion():
     from dataclasses import replace
+    from mindie_sim.catalog.draft_geometry import native_draft_layer_plans
     from mindie_sim.catalog.types import AuxiliarySpec, DraftSpec
     from mindie_sim.prediction.structure import parse_case
     parsed = parse_case(cohort_case())
@@ -141,6 +142,7 @@ def test_model_scope_moe_mtp_preserves_replica_rows_and_target_completion():
                       num_heads=4, num_kv_heads=2, head_dim=8, q_width=32, kv_width=16,
                       vocab_size=128, num_experts=48, top_k=6, expert_intermediate_size=64,
                       target_shared_embedding=True, target_shared_lm_head=True)
+    draft = replace(draft, layer_plans=native_draft_layer_plans(parsed.model, draft))
     parsed = replace(parsed, model=replace(parsed.model, auxiliary=AuxiliarySpec(mtp=draft)),
                      runtime=replace(parsed.runtime, metadata=(('draft_mode', 'mtp'),)))
     graphs = target_graphs(parsed, phase='prefill', tokens=1, sequences=[1] + [0] * 7,

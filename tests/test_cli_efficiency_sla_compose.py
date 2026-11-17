@@ -314,8 +314,14 @@ def test_a5_dt_glm53_moe_dispatch_combine_modeling() -> None:
     from mindie_sim.prediction.efficiency import analyze_network_efficiency
 
     for hw, exp_disp_ideal_us, exp_comb_ideal_us, exp_disp_us, exp_comb_us in (
-        ("a5-pod-dt", 0.11286, 0.21888, 94.63277647058824, 94.75750588235295),
-        ("a5-server-dt", 28.44072, 55.15776, 316.0492453125, 317.0349),
+        # Ideal link time uses the declared usable capacity (nameplate peak x
+        # declared utilization), not the raw provider peak.
+        ("a5-pod-dt", 0.1327764705882353, 0.2575058823529412,
+         94.63277647058824, 94.75750588235295),
+        # M2 R1 allocates each directed link/pipe independently; the server
+        # tier's asymmetric per-port resources no longer average into one
+        # category share, so the serialized-hop service is re-anchored.
+        ("a5-server-dt", 31.6008, 61.2864, 346.6008, 376.2864),
     ):
         case = compose_case(
             model="glm5.3", hardware=hw, dp=64, tp=1, ep=64, layers=4,

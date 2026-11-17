@@ -75,10 +75,12 @@ def test_real_matrix_work_output_and_input_readiness(raw, controls, batch, role)
     result = operator_costs(selected(raw), (op,), input_ready_ms=7)['operators'][0]
     m,n,k = op.local_shape; meta = dict(op.metadata)
     assert result['serviced']['fixpipe@r0:s0'] == pytest.approx(2*m*n)
-    # M2 charges only the declared matrix input path on HBM; the fused output
-    # remains a fixpipe result and is not re-counted as an HBM write.
-    assert result['serviced']['memory@r0:s0'] == pytest.approx(
-        op.mte2_bytes + op.mte3_bytes)
+    # The prepared plan declares the fixpipe GM destination as HBM write
+    # traffic in op.hbm_bytes; the Engine must conserve that declared total
+    # exactly, in addition to the fixpipe pipe service.
+    assert result['serviced']['memory@r0:s0'] == pytest.approx(op.hbm_bytes)
+    assert op.hbm_bytes == pytest.approx(
+        op.mte2_bytes + op.mte3_bytes + meta['fixpipe_bytes'])
     assert not any(result['serviced'].get(name+'@r0:s0',0) for name in ('mte3','vector'))
     assert not result['service_before_input'] and not result['live_tasks']
     assert not any(result['remaining_buffers'].values())

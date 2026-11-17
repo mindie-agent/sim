@@ -216,8 +216,17 @@ def plan_prefix_reads(
         "" if applied else NO_REUSE_REASONS["no_savings"])
 
 
-def apply_prefix_read_plan(op: Any, plan: PrefixReadPlan) -> Any:
-    """Apply the plan's key-read delta to one operator record."""
+def apply_prefix_read_plan(op: Any, plan: PrefixReadPlan, *,
+                           hbm_component: float | None = None,
+                           mte2_component: float | None = None) -> Any:
+    """Replace one precharged key-read component with its physical union.
+
+    ``HBM_new = HBM_old - KV_HBM_precharged + KV_HBM_union`` and
+    ``MTE2_new = MTE2_old - KV_MTE2_precharged + KV_core_refills``.  Both
+    components are supplied by the caller that constructed them, so query,
+    output and score traffic outside the key component is never subtracted and
+    no ``max(0, ...)`` repair can erase mandatory work.
+    """
     metadata = dict(getattr(op, "metadata", ()) or ())
     metadata.update({
         "prefix_read_mode": plan.reuse_mechanism,
@@ -227,12 +236,30 @@ def apply_prefix_read_plan(op: Any, plan: PrefixReadPlan) -> Any:
         "prefix_read_l2_core_bytes": float(plan.l2_to_core_bytes),
         "prefix_read_reason": plan.reason,
     })
-    delta = float(plan.unique_hbm_bytes) - float(plan.logical_query_bytes)
-    delta_mte2 = float(plan.l2_to_core_bytes) - float(plan.logical_query_bytes)
+    hbm = float(getattr(op, "hbm_bytes", ZERO))
+    mte2 = float(getattr(op, "mte2_bytes", ZERO))
+    if plan.read_reuse_applied:
+        # A caller that does not name its key component keeps the historical
+        # delta form; the component-aware callers pass the exact precharged
+        # bytes so query/output/score payloads are never touched.
+        hbm_precharged = (float(plan.logical_query_bytes)
+                          if hbm_component is None else float(hbm_component))
+        mte2_precharged = (float(plan.logical_query_bytes)
+                           if mte2_component is None else float(mte2_component))
+        hbm = hbm - hbm_precharged + float(plan.unique_hbm_bytes)
+        mte2 = mte2 - mte2_precharged + float(plan.l2_to_core_bytes)
+        if hbm < -SAVINGS_EPS or mte2 < -SAVINGS_EPS:
+            raise ModelingError(
+                "prefix_read_component_underflow:"
+                f"{hbm_precharged:.3f}>"
+                f"{float(getattr(op, 'hbm_bytes', ZERO)):.3f}:"
+                f"{mte2_precharged:.3f}>"
+                f"{float(getattr(op, 'mte2_bytes', ZERO)):.3f}")
+        hbm, mte2 = max(ZERO_FLOAT, hbm), max(ZERO_FLOAT, mte2)
     return replace(
         op,
-        hbm_bytes=max(ZERO, float(getattr(op, "hbm_bytes", ZERO)) + delta),
-        mte2_bytes=max(ZERO, float(getattr(op, "mte2_bytes", ZERO)) + delta_mte2),
+        hbm_bytes=hbm,
+        mte2_bytes=mte2,
         metadata=tuple(sorted(metadata.items(), key=lambda pair: pair[FIRST])),
         notes=tuple(getattr(op, "notes", ()) or ()) + (
             "prefix_read_plan_applied" if plan.read_reuse_applied

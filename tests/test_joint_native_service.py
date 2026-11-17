@@ -117,4 +117,6 @@ def test_joint_service_cannot_hide_native_multiphase_or_network_program():
         graph_costs(raw, fork(), isolated=False)
     rule["match"] = {"recipe": copy_op(4000).recipe}
     with pytest.raises(ModelingError, match="single_local_kernel"):
-        operator_costs(raw, (replace(copy_op(4000), family="collective"),))
+        # A declared collective family resolves to a real recipe, so the
+        # single-local-kernel guard is what rejects the observed joint service.
+        operator_costs(raw, (replace(copy_op(4000), family="alltoall"),))

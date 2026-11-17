@@ -90,7 +90,8 @@ def target_operators(case, *, phase, tokens, context=ZERO, sequences=ONE, scope=
                      media_tokens_per_sequence=None, resource_fusion=True,
                      draft_prepare=False, apply_body_defaults=True,
                      routing_views=None, physical_rank=None, query_position=None,
-                     selected_replica=None, cohort=None, pure_model=False):
+                     selected_replica=None, cohort=None, pure_model=False,
+                     layer_limit=None):
     from mindie_sim.schema.workload import RequestView
     from .dispatch import cohorts
 
@@ -128,6 +129,7 @@ def target_operators(case, *, phase, tokens, context=ZERO, sequences=ONE, scope=
             apply_body_defaults=False, routing_views=routing_views,
             physical_rank=physical_rank, query_position=query_position,
             selected_replica=selected_replica, cohort=group,
+            layer_limit=layer_limit,
         )
         selected = (int(selected_replica) if selected_replica is not None
                     else group[0])
@@ -139,7 +141,7 @@ def target_operators(case, *, phase, tokens, context=ZERO, sequences=ONE, scope=
     result = tuple(op for op in _target_ops(
         case, views, scope, resource_fusion=resource_fusion,
         routing_views=routing_views, physical_rank=physical,
-        query_position=query_position, replica=replica)
+        query_position=query_position, replica=replica, layer_limit=layer_limit)
                    if op.family != "barrier")
     return (TargetOperators(result, kernels=case.runtime.kernels, selection=selection)
             if scope == "body" else result)
@@ -180,7 +182,7 @@ def _target_ops(case, views, scope, *, global_views=None, resource_fusion=True,
                 cohort_tokens=None, phase=None, replica=ZERO, active_rows=None,
                 source_rows_by_replica=None, routing_global_tokens=None,
                 routing_views=None, physical_rank=None, query_position=None,
-                model_programs=None):
+                model_programs=None, layer_limit=None):
     from mindie_sim.schema.workload import IterationPlan
     from .attention import AttentionPolicy
     from .frontend import Frontend
@@ -236,13 +238,14 @@ def _target_ops(case, views, scope, *, global_views=None, resource_fusion=True,
         if pcp_cohort else global_tokens
     )
     ops, _ = frontend.body(case.model, case.runtime, local, ready="analysis_input",
-                          tokens=local_tokens, mode=views[0].phase if views else phase,
+                          tokens=local_tokens, mode=views[ZERO].phase if views else phase,
                           global_tokens=body_global_tokens, replica=replica,
                           source_rows_by_replica=source_rows_by_replica,
                           routing_global_tokens=routing_global_tokens,
                           routing_views=routing_views,
                           physical_rank=physical_rank,
-                          query_position=query_position)
+                          query_position=query_position,
+                          machine=case.machine, layer_limit=layer_limit)
     # Source lowerings consume the same active/storage distinction as the
     # model path, including MC2's mask over padded graph inputs.
     logical_rows = (sum(v.logical_q_len for v in views) if active_rows is None
@@ -331,7 +334,7 @@ def target_graphs(case, *, phase, tokens, context=ZERO, sequences=ONE, scope="mo
                   draft_prepare=False, apply_body_defaults=True,
                   padded_idle=False, routing_views=None, physical_rank=None,
                   query_position=None, selected_replica=None, cohort=None,
-                  pure_model=False):
+                  pure_model=False, layer_limit=None):
     """One DP cohort; scalar sequences repeat, lists declare every replica.
 
     ``padded_idle`` retains the declared physical capture rows for a replica
@@ -444,7 +447,7 @@ def target_graphs(case, *, phase, tokens, context=ZERO, sequences=ONE, scope="mo
             routing_views=_routing_views_for(routing_views, first_r),
             physical_rank=_physical_rank_for(case, first_r),
             query_position=query_position,
-            model_programs=model_programs,
+            model_programs=model_programs, layer_limit=layer_limit,
         )
         raw_graphs = {first_r: base_ops}
         for r in participants[1:]:
@@ -464,7 +467,8 @@ def target_graphs(case, *, phase, tokens, context=ZERO, sequences=ONE, scope="mo
                            routing_views=_routing_views_for(routing_views, r),
                            physical_rank=_physical_rank_for(case, r),
                            query_position=query_position,
-                           model_programs=model_programs)
+                           model_programs=model_programs,
+                           layer_limit=layer_limit)
             for r, group in views.items()
         }
     from .local_projection_tp import lower_local_projection_tp_cohort
@@ -808,8 +812,20 @@ def operator_costs(case, ops, *, recipes=None, primitives=None, replay_scope=Non
             groups[key] = {"op": op, "count": 0}
         groups[key]["count"] += 1
     rows = []
+    isolated_cache = getattr(ctx, "isolated_results", None)
     for group in groups.values():
         op = group["op"]
+        signature = physical_signature(op)
+        cache_key = (int(replica), str(op.op_id), signature, replay_scope,
+                     float(input_ready_ms))
+        if isolated_cache is not None:
+            cached = isolated_cache.get(cache_key)
+            if cached is not None:
+                rows.append({**dict(cached),
+                             "occurrences": int(group["count"]),
+                             "total_ms": float(cached["duration_ms"])
+                             * int(group["count"])})
+                continue
         from .cost import CostLedger
         execution = Execution(
             case, ctx.cost, recipes=recipes,
@@ -839,7 +855,7 @@ def operator_costs(case, ops, *, recipes=None, primitives=None, replay_scope=Non
         early_service = {key: value for key, value in engine.serviced.items() if value}
         engine.advance(until=(complete,))
         duration = complete.time - input_ready_ms
-        rows.append({
+        row = {
             **_cost_row(
                 execution, op, recipe, context, identity=identity,
                 count=group["count"], duration=duration,
@@ -850,7 +866,10 @@ def operator_costs(case, ops, *, recipes=None, primitives=None, replay_scope=Non
                 transport=execution.transport_options_for(
                     op, replica, replay_scope)), recipe)}
                if context.native_work.get("link") else {}),
-        })
+        }
+        rows.append(row)
+        if isolated_cache is not None:
+            isolated_cache.put(cache_key, row)
     from .exposed_breakdown import unavailable_breakdown
     return {
         "schema": "mindie-sim.operators/1",

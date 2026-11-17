@@ -516,6 +516,88 @@ def simulate_native_call(case: Any, ops: Any, *, extensions: Any = None,
         affected_results=affected, minimal_replay_input=replay)
 
 
+_ACLNN_DECLARATION_KEYS = (
+    "api", "symbol", "aclnn_symbol", "entry", "arguments", "tensors", "attrs",
+)
+_ACLNN_PROTOCOL_KEYS = frozenset({
+    "include_submission", "input_ready_ms", "invocations", "max_operators",
+    "mode", "recipes", "submission", "trace_limit",
+})
+
+
+def _aclnn_definition(value: Any) -> Any:
+    """Return a built aclnn ``CallDefinition``, or ``None`` for OpSpec input."""
+    from mindie_sim.prediction.call_builders import CallDefinition, build_call
+    if isinstance(value, CallDefinition):
+        return value
+    if not isinstance(value, Mapping):
+        return None
+    if "builder" in value:
+        if value.get("builder") != "aclnn":
+            raise ExtensionError("aclnn_call_requires_aclnn_builder")
+        return build_call(value)
+    if any(key in value for key in _ACLNN_DECLARATION_KEYS):
+        return build_call({"builder": "aclnn", "arguments": dict(value)})
+    return None
+
+
+def simulate_aclnn_call(case: Any, call: Any = None, *, ops: Any = None,
+                        declaration: Any = None, api: str | None = None,
+                        arguments: Any = None, tensors: Any = None,
+                        attrs: Any = None, extensions: Any = None,
+                        provider: str | None = None, profile: Any = None,
+                        service_id: str | None = None,
+                        **kwargs: Any) -> dict[str, Any]:
+    """Price one standalone aclnn ABI invocation on the canonical call path.
+
+    ``call`` is an aclnn declaration (``{"builder": "aclnn", "arguments":
+    {...}}`` or a bare declaration carrying ``api``/``aclnn_symbol``), an
+    already built ``CallDefinition``, or an existing ``OpSpec`` sequence.  A
+    declaration lowers through the ordinary ``build_call`` builder and then
+    delegates to :func:`simulate_native_call`; no duration, piecewise replay
+    plan or second engine is introduced here.  The returned report keeps the
+    canonical ``mindie-sim.call-costs/1`` schema, so profile and observed-call
+    comparison hooks consume it through that same path.
+    """
+    if isinstance(call, str):
+        if api is not None:
+            raise ExtensionError("aclnn_call_api_and_symbol_ambiguous")
+        api, call = call, None
+    if ops is not None:
+        if call is not None:
+            raise ExtensionError("aclnn_call_ops_and_call_ambiguous")
+        call = ops
+    if declaration is not None:
+        if call is not None:
+            raise ExtensionError("aclnn_call_declaration_and_call_ambiguous")
+        call = declaration
+    if call is None:
+        if api is None:
+            raise ExtensionError("aclnn_call_requires_api_or_declaration")
+        if not isinstance(arguments, Mapping) and arguments is not None:
+            raise ExtensionError("aclnn_call_arguments_requires_mapping")
+        payload = dict(arguments or {})
+        payload.update({key: kwargs.pop(key) for key in list(kwargs)
+                        if key not in _ACLNN_PROTOCOL_KEYS})
+        payload["api"] = api
+        if tensors is not None:
+            payload["tensors"] = tensors
+        if attrs is not None:
+            payload["attrs"] = attrs
+        definition = _aclnn_definition(payload)
+    else:
+        if api is not None or arguments is not None or tensors is not None \
+                or attrs is not None:
+            raise ExtensionError("aclnn_call_argument_source_ambiguous")
+        definition = _aclnn_definition(call)
+    if definition is not None:
+        call = definition.ops
+        kwargs.setdefault("recipes", definition.recipes)
+    return simulate_native_call(
+        case, call, extensions=extensions, provider=provider, profile=profile,
+        service_id=service_id, **kwargs)
+
+
 def simulate_graph(case: Any, ops: Any, *, extensions: Any = None,
                    provider: str | None = None, profile: Any = None,
                    service_id: str | None = None,
@@ -684,6 +766,6 @@ def simulate_service(case: Any, *, extensions: Any = None,
 
 
 __all__ = [
-    "simulate_operator", "simulate_native_call",
+    "simulate_operator", "simulate_native_call", "simulate_aclnn_call",
     "simulate_graph", "simulate_model", "simulate_service",
 ]
