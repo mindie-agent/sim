@@ -689,7 +689,9 @@ def cohort_operator_costs(case, ops, *, recipes, primitives=None,
            else EvaluationContext.create(case, recipes, primitives))
     execution = Execution(
         case, ctx.cost, recipes=recipes,
-        bindings=ctx.bindings, ledger=CostLedger())
+        bindings=ctx.bindings, ledger=CostLedger(), evaluation=ctx)
+    execution._compact_step = not execution.legacy_diagnostics
+    execution.engine._compact_step = execution._compact_step
     engine, participants, identities, replica_scopes = execution.engine, [], {}, {}
     for replica, original in ops.items():
         identities[replica] = physical_id(original)
@@ -891,7 +893,9 @@ def operator_costs(case, ops, *, recipes=None, primitives=None, replay_scope=Non
             execution = Execution(
                 case, ctx.cost, recipes=recipes,
                 bindings=ctx.bindings, ledger=CostLedger(),
-                isolated_replica=int(replica))
+                isolated_replica=int(replica), evaluation=ctx)
+            execution._compact_step = not execution.legacy_diagnostics
+            execution.engine._compact_step = execution._compact_step
         else:
             execution.reset_engine()
         op, recipe = execution.prepare(op, replica)

@@ -57,6 +57,10 @@ def read_json(path, *, bounded=False):
         return json.load(stream)
 
 
+#: Default latency budget of a multi-SKU comparison (ms).
+DEFAULT_COMPARE_SLA_MS = 50.0
+
+
 def emit(value, output):
     text = json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
     data = text.encode("utf-8")
@@ -258,6 +262,8 @@ def parser():
                  "--num-devices", "--layers", "--mtp-tokens"):
         feature_tracks.add_argument(flag, type=int, default=None)
     feature_tracks.add_argument("--quant", default=None)
+    feature_tracks.add_argument("--jobs", default="auto",
+                                help="worker budget for independent feature levels")
     feature_tracks.add_argument("--no-ablate-prs", dest="ablate_prs",
                                 action="store_false")
     feature_tracks.add_argument("--output", "-o")
@@ -294,6 +300,8 @@ def parser():
     sweep.add_argument("--progress", action="store_true")
     sweep.add_argument("--output", "-o")
     add_runtime_arguments(sweep, command="sweep")
+    sweep.add_argument("--jobs", default="auto",
+                       help="worker budget for independent topology candidates")
     sweep.add_argument("--hardware-derivations", default=None,
                        help="JSON file with named derivation records")
     eff = sub.add_parser("efficiency", help="operator-level MBU/MFU decomposition and roofline target evaluation")
@@ -327,8 +335,47 @@ def parser():
     for flag in ("--hbm-bw-scale", "--cube-flops-scale", "--vector-ops-scale", "--link-bw-scale", "--hbm-capacity-scale"):
         sla.add_argument(flag, type=float)
     sla.add_argument("--scenarios")
+    sla.add_argument("--sensitivity", choices=("baseline", "full"),
+                     default="baseline",
+                     help="baseline = one counterfactual (fast default); "
+                          "full = all documented counterfactuals")
+    sla.add_argument("--jobs", default="auto",
+                     help="worker budget for the flat (sku, scenario) pool")
     sla.add_argument("--output", "-o")
     add_runtime_arguments(sla, command="sla")
+    compare = sub.add_parser(
+        "compare-skus",
+        help="compare two or more hardware SKUs under one model/deployment config")
+    compare.add_argument("--model", required=True)
+    compare.add_argument("--skus", nargs="+", required=True,
+                         help="SKU names (a3, a5, ...) or custom hardware JSON paths")
+    for flag in ("--tp", "--dp", "--ep", "--pp", "--pcp", "--num-devices",
+                 "--layers"):
+        compare.add_argument(flag, type=int, default=None)
+    compare.add_argument("--sla-ms", type=float,
+                         default=DEFAULT_COMPARE_SLA_MS)
+    compare.add_argument("--max-batch", type=int, default=None)
+    compare.add_argument("--sensitivity", choices=("baseline", "full"),
+                         default="baseline")
+    compare.add_argument("--scope", choices=("body", "model"), default="body")
+    compare.add_argument("--phase", choices=("decode", "prefill"), default="decode")
+    compare.add_argument("--context", type=int, default=None)
+    compare.add_argument("--query-tokens", type=int, default=None)
+    compare.add_argument("--quant", default=None,
+                         help="explicit quantization override for every SKU")
+    compare.add_argument("--jobs", default="auto")
+    compare.add_argument("--no-advisory", dest="emit_advisory",
+                         action="store_false")
+    compare.add_argument("--output", "-o")
+    doctor = sub.add_parser(
+        "doctor", help="probe CPU/RAM/C11 readiness and print agent offload guidance")
+    doctor.add_argument("--no-compile", dest="compile_accel",
+                        action="store_false")
+    doctor.add_argument("--output", "-o")
+    guide = sub.add_parser("remote-guide", help="alias of `doctor` for agent offload")
+    guide.add_argument("--no-compile", dest="compile_accel",
+                       action="store_false")
+    guide.add_argument("--output", "-o")
     accel = sub.add_parser("build-accel", help="compile or verify the C11 runtime kernel")
     accel.add_argument("--force", action="store_true", help="recompile even when cached")
     accel.add_argument("--check", action="store_true", help="verify cached artifact without compiling")
@@ -587,15 +634,44 @@ def run(args):
                 },
             ]
         else:
-            scenarios = DEFAULT_SLA_SCENARIOS
-        return solve_sla_sizing(
+            # ``None`` lets the solver apply the requested sensitivity set, so
+            # the out-of-the-box command is a single fast counterfactual.
+            scenarios = None
+        from . import runtime_advisor
+        jobs = runtime_advisor.resolve_jobs(
+            args.jobs, task_count=len(scenarios or DEFAULT_SLA_SCENARIOS))
+        result = solve_sla_sizing(
             case_data, sla_ms=args.sla_ms, context=args.context,
             tokens_per_seq=args.tokens_per_seq, emitted_tokens_per_seq=args.emitted_tokens_per_seq,
             max_sequences_per_dp=args.max_sequences_per_dp, phase=args.phase,
             scope=args.scope, output_budget=args.output_budget, target_mbu=args.target_mbu,
             target_cube_mfu=args.target_cube_mfu, target_vec_mfu=args.target_vec_mfu,
-            scenarios=scenarios,
+            scenarios=scenarios, sensitivity=args.sensitivity, jobs=jobs,
         )
+        result["sensitivity"] = args.sensitivity
+        result["jobs"] = jobs
+        return result
+    if args.command == "compare-skus":
+        from .sku_comparison import compare_skus
+        options = {flag: getattr(args, flag.lstrip("-").replace("-", "_"), None)
+                   for flag in ("tp", "dp", "ep", "pp", "pcp", "num_devices",
+                                "layers")}
+        if args.max_batch is None:
+            from .prediction.efficiency import DEFAULT_MAX_SEQUENCES
+            max_batch = DEFAULT_MAX_SEQUENCES
+        else:
+            max_batch = args.max_batch
+        return compare_skus(
+            args.model, args.skus, sla_ms=args.sla_ms, max_batch=max_batch,
+            sensitivity=args.sensitivity, scope=args.scope, phase=args.phase,
+            context=args.context, query_tokens_per_sequence=args.query_tokens,
+            quant=args.quant, jobs=args.jobs,
+            emit_advisory=bool(args.emit_advisory), **options)
+    if args.command in {"doctor", "remote-guide"}:
+        from .runtime_advisor import doctor_report
+        report = doctor_report(compile_accel=bool(args.compile_accel))
+        report["command"] = args.command
+        return report
     if args.command == "build-accel":
         from .prediction.runtime.accel_build import build_accel
 

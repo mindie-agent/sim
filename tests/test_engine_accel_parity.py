@@ -195,7 +195,7 @@ def test_source_and_counterexamples_execute_clean_under_asan_ubsan(tmp_path):
           else (shutil.which("clang") or accel_build.discover_compiler()[0]))
     binary = tmp_path / ("accel_sanitizer.exe" if os.name == "nt" else "accel_sanitizer")
     san = () if os.name == "nt" else ("-fsanitize=address,undefined", "-fno-sanitize-recover=all")
-    libm = () if os.name == "nt" else ("-lm",)
+    libm = () if os.name == "nt" else ("-lm", "-pthread")
     base_cmd = [cc, "-std=c11", "-O1", "-g", "-ffp-contract=off", "-I", str(RUNTIME),
                 str(source), str(harness), "-o", str(binary), *libm]
     completed = subprocess.run([*base_cmd[:4], *san, *base_cmd[4:]], capture_output=True,
@@ -423,6 +423,7 @@ def test_harness_obeys_the_line_and_encoding_rules():
             "[Side-Effect Policy]")
     paths = sorted((ROOT / "tests").glob("test_engine_accel*.py")) + [ROOT / "tests" / "conftest.py"]
     paths.append(ROOT / "tests" / "accel_sanitizer_harness.c")
+    paths.append(ROOT / "tests" / "accel_sanitizer_wide.h")
     for path in paths:
         data = path.read_bytes()
         assert b"\r" not in data, path.name

@@ -27,11 +27,12 @@ import os
 import weakref
 
 from . import accel_build, accel_cache, accel_loader
+from .accel_sync import resolve_mode  # noqa: F401  (re-exported)
 from .accel_loader import AccelUnavailable, load_library
 from .accel_sync import (
-    adopt_frontier, deliver_slots, drain_output, effective_units, explicit_units,
-    finish_handback, flush_pending, reclaim_arena, solver_capacity_exceeded,
-    sync_back, task_usage,
+    adopt_frontier, can_rearm, deliver_slots, drain_output, effective_units,
+    explicit_units, finish_handback, flush_pending, note_rearm_rejection,
+    reclaim_arena, solver_capacity_exceeded, sync_back, task_usage,
 )
 from .accel_tables import (
     ABI_VERSION, Arena, B_IDLE, B_OUTPUT, E_ARITH, E_STALL, E_STATE, INT32_MAX,
@@ -43,40 +44,35 @@ from .accel_tables import (
 #: ``auto`` keeps smaller Engines on pure Python: zero build and marshalling.
 AUTO_MIN_TASKS = 64
 
+#: Frontier-shaped reasons: recoverable in ``auto`` once the boundary drains.
+#: Explicit ``c`` and capability failures stay disabled for the Engine's life.
+_TRANSIENT_AUTO_REASONS = frozenset({
+    "auto_mixed_frontier", "auto_busy", "periodic_frontier", "mixed_frontier",
+    "start_boundary", "trace_retention", "mixed_priority",
+})
+
 #: Callback-free numeric windows run in C unless MINDIE_SIM_ACCEL_EPOCH=0.
 EPOCH_ENABLED = os.environ.get("MINDIE_SIM_ACCEL_EPOCH", "1") != "0"
 def load_accel_cdll(status: dict | None = None):
     """Build (when needed) and map under one cache lock."""
     return accel_loader.load_accel_cdll(status)
-def resolve_mode(requested: str | None) -> str:
-    value = requested
-    if value is None:
-        value = os.environ.get("MINDIE_SIM_ACCEL")
-    if value is None:
-        value = os.environ.get("MINDIE_SIM_ENGINE_BACKEND")
-    if value is None:
-        value = "auto"
-    value = str(value).strip().lower()
-    if value in {"python", "py", "off", "0"}:
-        return "python"
-    if value in {"c", "c11", "native", "on", "1"}:
-        return "c"
-    if value in {"auto", ""}:
-        return "auto"
-    raise ValueError(f"engine_backend_invalid:{value}")
 class NativeBackend:
     """One Engine's immutable library handle, kernel context and telemetry."""
     __slots__ = (
-        "library", "arena", "status_dict", "backend", "reason", "abi",
-        "native_calls", "native_steps", "native_boundaries", "fallbacks",
-        "mode", "enabled", "res_names", "pending", "deliver", "drops",
-        "external", "max_tasks", "live", "seeded", "disabled_reason", "error",
-        "made_progress", "engine_slots", "dormant", "handing_back", "_finalizer",
-        "deps", "usage", "links", "units", "edges", "storage", "epoch_links",
-        "epoch_units", "epoch_storage", "epoch_tasks", "epoch_edges",
-        "_engine_finalizer", "__weakref__", "applying", "callback_dirty",
-        "coupled_seqs", "pending_handback", "draining", "aborted_publication",
-        "needs_settle", "fair_prio", "has_fair_res",
+        "library", "arena", "status_dict", "backend",
+        "reason", "abi", "native_calls", "native_steps",
+        "native_boundaries", "fallbacks", "mode", "enabled",
+        "res_names", "pending", "deliver", "drops",
+        "external", "max_tasks", "live", "seeded",
+        "disabled_reason", "error", "made_progress", "engine_slots",
+        "dormant", "recoverable", "handing_back", "rearm_after",
+        "rearm_failures", "rearm_rejections", "_finalizer", "deps",
+        "usage", "links", "units", "edges",
+        "storage", "epoch_links", "epoch_units", "epoch_storage",
+        "epoch_tasks", "epoch_edges", "_engine_finalizer", "__weakref__",
+        "applying", "callback_dirty", "coupled_seqs", "pending_handback",
+        "draining", "aborted_publication", "needs_settle", "fair_prio",
+        "has_fair_res",
     )
     def __init__(self, status: dict | None, mode: str = "auto") -> None:
         self.library = None
@@ -104,7 +100,11 @@ class NativeBackend:
         self.made_progress = False
         self.engine_slots: dict[int, int] = {}
         self.dormant = not EPOCH_ENABLED
+        self.recoverable = False
         self.handing_back = False
+        self.rearm_after = 0
+        self.rearm_failures = 0
+        self.rearm_rejections = 0
         self._finalizer = None
         self._engine_finalizer = None
         self.deps: dict[int, tuple] = {}
@@ -214,13 +214,19 @@ class NativeBackend:
             raise AccelUnavailable(reason, self.status_dict)
         return False
     def disable(self, engine, reason: str = "mixed_frontier") -> None:
-        """Return every kernel-owned row to the reference frontier."""
+        """Return rows to Python; ``auto`` keeps a frontier reason recoverable."""
         was_enabled = self.enabled
         self.enabled = False
         self.dormant = True
+        self.recoverable = (self.mode == "auto"
+                            and reason in _TRANSIENT_AUTO_REASONS)
         self.disabled_reason = reason
         self.needs_settle = False
         if was_enabled:
+            # A real hand-back is a legitimate transition: the next pure burst
+            # may adopt immediately, so the failure backoff restarts here.
+            self.rearm_failures = 0
+            self.rearm_after = 0
             self.pending_handback = True
             finish_handback(self, engine)
     def _sync_back(self, engine) -> None:
@@ -230,13 +236,19 @@ class NativeBackend:
     def _adopt(self, engine, skip: int) -> bool:
         """Mirror the unstarted pure frontier when ``auto`` attaches."""
         return adopt_frontier(self, engine, skip)
+    def _rearmable(self, engine) -> bool:
+        return can_rearm(self, engine)
     def eligible(self, engine, task) -> bool:
         if self.handing_back:
             return False
         if self.dormant:
-            return False
+            if not can_rearm(self, engine):
+                return False
         if engine._periodic_runs:
             self.disabled_reason = "periodic_frontier"
+            if not self.enabled:
+                self.dormant = True
+                self.recoverable = self.mode == "auto"
             return False
         if wide_integer(task):
             if self.enabled:
@@ -254,7 +266,11 @@ class NativeBackend:
             if engine._sequence < AUTO_MIN_TASKS:
                 return False
             if engine._active or engine._native_slots:
+                # Transient: the next pure burst may adopt.  Staying dormant
+                # keeps the per-task preflight out of the hot Python path.
                 self.disabled_reason = "auto_busy"
+                self.dormant = self.mode == "auto"
+                self.recoverable = self.mode == "auto"
                 return False
             if not self.try_attach(engine):
                 return False
@@ -264,6 +280,8 @@ class NativeBackend:
                           if self.disabled_reason == "capacity_exceeded"
                           else "auto_mixed_frontier")
                 self.disable(engine, reason)
+                if reason != "capacity_exceeded":
+                    note_rearm_rejection(self, engine)
                 return False
         new_units = effective_units(engine, task)
         new_storage = explicit_units(task)
@@ -659,10 +677,8 @@ class NativeBackend:
         self.enabled = False
 #: Counter keys every backend reports, so ``Engine.accel_status()`` has one
 #: stable shape whether or not a kernel is attached.
-_IDLE_COUNTERS = {
-    "native_calls": 0, "native_steps": 0, "native_boundaries": 0,
-    "fallbacks": 0, "mirrored_live": 0,
-}
+_IDLE_COUNTERS = {"native_calls": 0, "native_steps": 0, "native_boundaries": 0,
+                  "fallbacks": 0, "mirrored_live": 0}
 
 def make_backend(requested: str | None = None):
     """Return ``(backend_or_none, telemetry)`` for one Engine."""

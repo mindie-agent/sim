@@ -42,19 +42,43 @@ enum {
     MSIM_COMP_STRIDE = 3,     /* u64 cells per completion record */
     MSIM_SVC_STRIDE = 3,      /* f64 cells per per-link service record */
     MSIM_MAX_T = 65536,       /* reusable task slots per context */
-    MSIM_MAX_R = 128,
-    MSIM_MAX_U = 64,
+    MSIM_MAX_R = 2048,        /* multi-node EP/DP up to ~256 dies */
+    MSIM_MAX_U = 128,         /* 36-AIC / 72-AIV and wider owner groups */
     MSIM_MAX_L = 262144,      /* live link cells per context */
     MSIM_MAX_F = 65536,       /* one flow per live link at most */
     MSIM_MAX_COEF = 262144,   /* one coefficient per live link at most */
     MSIM_MAX_MROW = 65536,    /* one solver row per live task at most */
-    MSIM_MAX_SLOT = 8192,     /* structurally <= MAX_R * MAX_U + MAX_R */
+    MSIM_MAX_SLOT = 264192,   /* == MAX_R * (MAX_U + 1), the structural bound */
     MSIM_MAX_SENT = 2097152,  /* dynamic ceiling for owner/entry scratch */
-    MSIM_MAX_OWN = 32768,     /* mirrored dependency-edge quota */
+    MSIM_MAX_OWN = 262144,    /* mirrored dependency-edge quota */
     MSIM_MAX_UENT = 2097152   /* dynamic ceiling for effective unit memberships:
                                * every live work link contributes its explicit
                                * ``plen`` or, when unplaced, ``res.units`` */
 };
+
+/* A bounded unit bitset wide enough for every declared owner id.  Two 64-bit
+ * words cover ``MSIM_MAX_U == 128`` without ever shifting by 64 or more, which
+ * would be undefined; a single word is still the fast path for ``<= 64``. */
+#define MSIM_UNIT_WORDS ((MSIM_MAX_U + 63) / 64)
+typedef struct { uint64_t w[MSIM_UNIT_WORDS]; } msim_ubits;
+
+static void msim_ubits_clear(msim_ubits *b)
+{
+    int32_t i;
+    for (i = 0; i < (int32_t)MSIM_UNIT_WORDS; i++) b->w[i] = 0;
+}
+
+static void msim_ubits_set(msim_ubits *b, int32_t u)
+{
+    if (u < 0 || u >= MSIM_MAX_U) return;
+    b->w[u >> 6] |= (uint64_t)1 << (u & 63);
+}
+
+static bool msim_ubits_test(const msim_ubits *b, int32_t u)
+{
+    if (u < 0 || u >= MSIM_MAX_U) return false;
+    return ((b->w[u >> 6] >> (u & 63)) & (uint64_t)1) != 0;
+}
 
 /* ``st[0]`` is a status word: bit 0 is set on failure, bit 1 is set exactly
  * when the failing call also published a trustworthy accepted prefix.  A
@@ -202,6 +226,13 @@ typedef struct msim_ctx {
     msim_flow *flow;
     msim_entry *entry;
     msim_slot *slot;
+    /* Demand-grown slot solver scratch.  Never on the C stack and never a
+     * reuse of the ``MSIM_MAX_U``-sized per-resource accumulators: a bounded
+     * stack worker must be able to run the coupled solver safely. */
+    double *slot_rem;
+    double *slot_slope;
+    double *slot_bounds;
+    int32_t slot_cap;
     msim_row *row;
     int32_t *ohead;
     int32_t *onext;
@@ -327,6 +358,41 @@ static bool msim_own_reserve(msim_ctx *c, int32_t need)
     return true;
 }
 
+/* Demand-grown coupled-solver slots.  ``need`` is the exact slot count of this
+ * arbitration pass; every array is grown before any solver cell is written, so
+ * an allocation failure leaves the previous context untouched and the caller
+ * reports a bounded arithmetic status instead of faulting. */
+static bool msim_slot_reserve(msim_ctx *c, int32_t need)
+{
+    int32_t target;
+    msim_slot *next_slot;
+    double *next_rem, *next_slope, *next_bounds;
+    if (need < 0) return false;
+    if (need <= c->slot_cap) return true;
+    if (need > MSIM_MAX_SLOT) return false;
+    target = c->slot_cap > 0 ? c->slot_cap : 64;
+    while (target < need) {
+        if (target > MSIM_MAX_SLOT / 2) { target = need; break; }
+        target *= 2;
+    }
+    if (target > MSIM_MAX_SLOT) target = MSIM_MAX_SLOT;
+    if (target < need) return false;
+    next_slot = (msim_slot *)realloc(c->slot, (size_t)target * sizeof(msim_slot));
+    if (next_slot == NULL) return false;
+    c->slot = next_slot;
+    next_rem = (double *)realloc(c->slot_rem, (size_t)target * sizeof(double));
+    if (next_rem == NULL) return false;
+    c->slot_rem = next_rem;
+    next_slope = (double *)realloc(c->slot_slope, (size_t)target * sizeof(double));
+    if (next_slope == NULL) return false;
+    c->slot_slope = next_slope;
+    next_bounds = (double *)realloc(c->slot_bounds, (size_t)target * sizeof(double));
+    if (next_bounds == NULL) return false;
+    c->slot_bounds = next_bounds;
+    c->slot_cap = target;
+    return true;
+}
+
 static void msim_ctx_zero(msim_ctx *c)
 {
     memset(c, 0, sizeof *c);
@@ -346,6 +412,7 @@ static void msim_ctx_release(msim_ctx *c)
     free(c->uamt); free(c->over); free(c->remu); free(c->bounds); free(c->slope);
     free(c->active); free(c->active2); free(c->changed);
     free(c->coef); free(c->flow); free(c->entry); free(c->slot); free(c->row);
+    free(c->slot_rem); free(c->slot_slope); free(c->slot_bounds);
     free(c->ohead); free(c->onext); free(c->oslot);
     memset(c, 0, sizeof *c);
     free(c);
@@ -357,7 +424,11 @@ static bool msim_ctx_scratch(msim_ctx *c)
     c->coef = (msim_coef *)msim_zalloc((size_t)MSIM_MAX_COEF, sizeof(msim_coef));
     c->flow = (msim_flow *)msim_zalloc((size_t)MSIM_MAX_F, sizeof(msim_flow));
     c->entry = NULL;
-    c->slot = (msim_slot *)msim_zalloc((size_t)MSIM_MAX_SLOT, sizeof(msim_slot));
+    c->slot = NULL;
+    c->slot_rem = NULL;
+    c->slot_slope = NULL;
+    c->slot_bounds = NULL;
+    c->slot_cap = 0;
     c->row = (msim_row *)msim_zalloc((size_t)MSIM_MAX_MROW, sizeof(msim_row));
     c->ohead = (int32_t *)msim_zalloc((size_t)MSIM_MAX_F, sizeof(int32_t));
     c->onext = NULL;
@@ -381,7 +452,7 @@ static bool msim_ctx_scratch(msim_ctx *c)
     c->changed = (bool *)msim_zalloc((size_t)MSIM_MAX_SLOT, sizeof(bool));
     c->task = (msim_task *)msim_zalloc((size_t)MSIM_MAX_T, sizeof(msim_task));
     c->task_cap = MSIM_MAX_T;
-    return c->coef && c->flow && c->slot && c->row && c->ohead
+    return c->coef && c->flow && c->row && c->ohead
         && c->idx && c->gid && c->rep && c->pend
         && c->surv && c->fifo_first && c->uhead && c->over
         && c->remu && c->bounds && c->slope

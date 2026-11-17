@@ -29,14 +29,17 @@ import pytest
 
 from temp_cleanup import tempdir
 from mindie_sim.prediction.engine import Engine, Resource
-from mindie_sim.prediction.runtime.accel_tables import _is_inert_builtin
+from mindie_sim.prediction.runtime.accel_tables import (
+    MAX_OWN, _is_inert_builtin,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNTIME = ROOT / "mindie_sim" / "prediction" / "runtime"
 BACKENDS = ("python", "c", "auto")
 NATIVE = ("c", "auto")
 COUNTS = (64, 4097)
-CAPACITY_EDGES = 32769
+# Derived from the audited quota: the counterexample is one edge past it.
+CAPACITY_EDGES = MAX_OWN + 1
 PACKAGE_FILES = 490
 TOTAL_ENTRIES = 508
 DIST_INFO = frozenset({

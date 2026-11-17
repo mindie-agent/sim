@@ -260,7 +260,8 @@ def _matrix_wrapper_projection(metadata):
 def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=None,
                 input_ready_ms=ZERO, include_submission=False, replay_scope=None,
                 isolated=True, trace_limit=ZERO, compact=False,
-                audit_allocations=False, evaluation=None):
+                audit_allocations=False, evaluation=None,
+                fast_span_only=False):
     """Run a declared DAG or replica->DAG mapping without a request scheduler.
 
     External input keys are operator dependency names and values are absolute
@@ -342,7 +343,12 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
     cost = ctx.cost
     execution = Execution(case, cost, recipes=book, bindings=ctx.bindings,
                           ledger=CostLedger(), include_submission=include_submission,
-                          on_operator=observe, trace_limit=trace_limit)
+                          on_operator=None if fast_span_only else observe,
+                          trace_limit=trace_limit, evaluation=ctx)
+    # Physical-work coalescing is exact; only an explicit legacy diagnostic run
+    # keeps the uncoalesced per-tile shape.
+    execution._compact_step = not execution.legacy_diagnostics
+    execution.engine._compact_step = execution._compact_step
     engine = execution.engine
     engine.now = input_ready_ms
     inputs = {r: {key: engine.submit(
@@ -365,6 +371,31 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
     engine.advance(until=tuple(step.completion for step in steps.values()), first=False)
     end = max((step.completion.time for step in steps.values()), default=input_ready_ms)
     duration = end - input_ready_ms
+    accel_view = engine.accel_status()
+    if fast_span_only:
+        # Same Engine, same declared work, same virtual timestamps: only the
+        # per-operator timeline and the isolated pricing pass are omitted.
+        summary = execution.summary()
+        return {
+            "schema": "mindie-sim.graph/1", **model_coverage(case.model),
+            "boundary": ("submitted_device_graph" if include_submission
+                         else "device_graph"),
+            "input_ready_ms": input_ready_ms, "complete_ms": end,
+            "duration_ms": duration, "replicas": list(graphs),
+            "replay_scope": replay_scope,
+            "operator_occurrences": 0, "resources": [],
+            "execution": summary,
+            "engine_backend": summary.get("accel_backend"),
+            "accel_status": {
+                "accel_backend": accel_view.get("accel_backend"),
+                "native_steps": int(accel_view.get("native_steps") or 0),
+                "python_steps": int(accel_view.get("python_steps") or 0),
+                "fallback_reason": accel_view.get("fallback_reason"),
+                "mode": accel_view.get("mode"),
+                "enabled": bool(accel_view.get("enabled")),
+            },
+            "fast_span_only": True,
+        }
     # Aggregate recipes retain their rendezvous. Causal transport plans retain
     # rank entry and round dependencies instead of one all-cohort ready gate.
     joins = {}
@@ -613,9 +644,19 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
         "busy_ms": engine.busy_ms[name],
     } for name, amount in engine.serviced.items() if amount]
     resources.sort(key=lambda row: row["capacity_bound_ms"], reverse=True)
+    accel_view = engine.accel_status()
     head = {
         "schema": "mindie-sim.graph/1",
         **model_coverage(case.model),
+        "engine_backend": accel_view.get("accel_backend"),
+        "accel_status": {
+            "accel_backend": accel_view.get("accel_backend"),
+            "native_steps": int(accel_view.get("native_steps") or 0),
+            "python_steps": int(accel_view.get("python_steps") or 0),
+            "fallback_reason": accel_view.get("fallback_reason"),
+            "mode": accel_view.get("mode"),
+            "enabled": bool(accel_view.get("enabled")),
+        },
         "boundary": "submitted_device_graph" if include_submission else "device_graph",
         "input_ready_ms": input_ready_ms, "complete_ms": end, "duration_ms": duration,
         "replicas": list(graphs), "replay_scope": replay_scope,

@@ -277,6 +277,10 @@ class _EngineLifecycleMixin:
                 self._placed_active -= 1
         if self._completable_seen:
             self._completable_seen.discard(key)
+        if self._fifo_live and self.task_uses_fifo(task):
+            self._fifo_live -= 1
+        if self._inline_blocked and self.task_blocks_native(task):
+            self._inline_blocked -= 1
         del self._tasks[key]
         self.completed_count += 1
         t_ml = self._trace_maxlen

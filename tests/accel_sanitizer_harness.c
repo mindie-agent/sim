@@ -706,6 +706,7 @@ static void step_zero_prefix_absent(void)
 }
 
 #include "accel_sanitizer_r7.h"
+#include "accel_sanitizer_wide.h"
 
 int main(void)
 {
@@ -725,6 +726,7 @@ int main(void)
     step_zero_prefix_absent();
     rejected_link_batch_is_atomic();
     r7_probes();
+    wide_probes();
     puts("sanitizer_harness: ok");
     return 0;
 }

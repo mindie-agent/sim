@@ -34,6 +34,7 @@ class _EnginePrepareMixin:
         coupled: bool = False, priority: int = 0, cohort_size: int = 1,
         memory=None, memory_pools: Sequence[str] | None = None,
         memory_bindings: Mapping[str, Mapping] | None = None,
+        native_hook: bool = False,
     ) -> Event:
         if (work is None and latency == 0.0 and caps is None and not acquire
                 and not free and placement is None and not coupled
@@ -49,7 +50,7 @@ class _EnginePrepareMixin:
             prepared, name, after=after, release=release, owner=owner,
             metadata=metadata, on_complete=on_complete, on_start=on_start,
             memory=memory, memory_pools=memory_pools,
-            memory_bindings=memory_bindings,
+            memory_bindings=memory_bindings, native_hook=native_hook,
         )
 
     def _prepare(

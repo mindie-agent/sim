@@ -94,6 +94,12 @@ STATE_ACCESS_KEY = "state_accesses"
 STATE_STAGE_FIELD = "stage"
 STATE_LAYER_FIELD = "layer"
 
+#: Reference mappings store absolute non-negative layer/stage anchors (for
+#: example ``fused_origin_scopes`` as ``("layer", 15)``).  They are made
+#: relative to the owning occurrence so corresponding operators in different
+#: layers compare equal instead of producing one recipe per layer.
+NONNEGATIVE_ANCHOR_FLOOR = 0
+
 _STAGE_GROUP = 1
 _LAYER_GROUP = 2
 _LAYER_REFERENCE_GROUP = 2
@@ -135,13 +141,26 @@ def normalize_reference(value: str, stage: int, layer: int) -> str:
     return _LAYER_REFERENCE.sub(_layer, renamed)
 
 
+def _normalize_mapping_entry(key: Any, item: Any, stage: int,
+                             layer: int) -> tuple[str, Any]:
+    """One mapping leaf: relative anchor for ``stage``/``layer`` integers."""
+    name = str(key)
+    if (name == STATE_STAGE_FIELD and type(item) is int
+            and item >= NONNEGATIVE_ANCHOR_FLOOR):
+        return name, int(item) - int(stage)
+    if (name == STATE_LAYER_FIELD and type(item) is int
+            and item >= NONNEGATIVE_ANCHOR_FLOOR):
+        return name, int(item) - int(layer)
+    return name, normalize_graph_value(item, stage, layer)
+
+
 def normalize_graph_value(value: Any, stage: int, layer: int) -> Any:
     """Recursively normalize declared reference leaves into a hashable value."""
     if isinstance(value, str):
         return normalize_reference(value, stage, layer)
     if isinstance(value, Mapping):
         return tuple(sorted(
-            ((str(key), normalize_graph_value(item, stage, layer))
+            (_normalize_mapping_entry(key, item, stage, layer)
              for key, item in value.items()),
             key=lambda item: item[0]))
     if isinstance(value, (list, tuple)):
