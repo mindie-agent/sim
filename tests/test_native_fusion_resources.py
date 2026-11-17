@@ -257,7 +257,10 @@ def test_resource_projection_preserves_declared_capture_boundaries():
         piecewise_capture_keys=(8,), mixed_mode="mixed"))
     semantic = target_graphs(case, phase="prefill", tokens=8, resource_fusion=False)
     physical = target_graphs(case, phase="prefill", tokens=8)
-    assert physical == {rank: lower_native_fusions(ops, case.runtime)
+    # Model-scope assembly now consumes the resolved declaration, so the
+    # physical projection reads it instead of the raw caller declaration.
+    assert physical == {rank: lower_native_fusions(ops, replace(
+                            case.runtime, kernels=semantic.effective_kernels))
                         for rank, ops in semantic.items()}
     _, members = _group(next(iter(semantic.values())), "hc_pre")
     assert all(dict(op.metadata)["graph_captured"] for op in members)

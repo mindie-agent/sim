@@ -12,6 +12,9 @@ from collections import defaultdict
 from .structure_matrix_contracts import mxfp4_reference_coverage
 from .structure_native_contracts import grouped_situ_contract
 
+# Qwen low-rank hyper-connection kernels own their declared tensor boundary.
+LOW_RANK_HC_NATIVE_KINDS = frozenset({"Qwen4ExpGatedResidualMix", "Qwen4ExpHcCombine"})
+
 
 def metadata(op):
     meta = dict(op.metadata)
@@ -112,12 +115,23 @@ def subgraph_contract(declaration):
             ((rows, 1, view["topk"]), view["selection_output_dtype"], "ND"),
         )
     if role in {"hc_pre", "hc_post"}:
+        # DeepSeek mHC declares one fused "mixed" projection slot. The Qwen
+        # low-rank variant is a different declared kernel with its own native
+        # identity, so it must keep that identity instead of being rebuilt as
+        # the mHC tensor boundary (which has no "mixed" slot at all).
+        native_kind = (declaration.get("implementation") or {}).get("native_kind")
+        if native_kind in LOW_RANK_HC_NATIVE_KINDS or "hc_lowrank" in view:
+            return None
         rows, hidden, hc, dtype = (view[key] for key in ("tokens", "hidden", "hc", "dtype"))
         x, out = ((rows, hc, hidden), dtype, "ND"), ((rows, hidden), dtype, "ND")
         post, comb = ((rows, hc), "fp32", "ND"), ((rows, hc, hc), "fp32", "ND")
         if role == "hc_post":
             return ("hyper_connection_active", "HcPost", (out, x, post, comb), (x,))
-        mixed = view["mixed"]
+        mixed = view.get("mixed")
+        if mixed is None:
+            # The fused mHC projection slot is required; a low-rank variant
+            # without it keeps its own declared boundary.
+            return None
         return (
             "hyper_connection_active", "HcPre",
             (x, ((mixed, hc * hidden), "fp32", "ND"),

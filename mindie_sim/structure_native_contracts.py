@@ -8,6 +8,38 @@
 """
 import math
 
+MQSMLA_RECIPE = "cannbot_mixed_quant_sparse_flash_mla"
+MQSMLA_NATIVE_KIND = "MqsmlaKernel___call__"
+MIXED_QUANT_NATIVE_KIND = "MixedQuantSparseFlashMla"
+SPARSE_FLASH_ATTENTION_NATIVE = "SparseFlashAttention"
+SPARSE_MLA_NATIVE_KIND = "SparseFlashMla"
+SPARSE_SHARED_KV_NATIVE_KIND = "SparseAttnSharedkv"
+GATED_RING_COMPRESSOR = "gated_ring"
+A5_ARCH_FAMILY = "A5"
+FLOATING_CACHE_DTYPES = frozenset({"bf16", "fp16", "bfloat16", "float16"})
+# Packed window (FP8 values + BF16 scale per 32) and compressed
+# (two FP4 per byte + BF16 scale per 16) rows of one 512-wide cache entry.
+MQSMLA_WINDOW_ROW_BYTES = 544
+MQSMLA_COMPRESSED_ROW_BYTES = 320
+MQSMLA_HEAD_WIDTH = 512
+
+
+def shared_kv_native_name(view):
+    """Generation and hardware select the native sparse operator family.
+
+    ``gated_ring`` (V4.1) is always the sparse-flash MLA kernel. On A5 the V4
+    ``weighted_pool`` family also uses sparse flash MLA, taking the mixed-quant
+    variant whenever the cache is not a plain floating representation. The
+    legacy A2/A3 shared-KV operator stays restricted to ``weighted_pool``.
+    """
+    if view.get("compressor_kind") == GATED_RING_COMPRESSOR:
+        return SPARSE_MLA_NATIVE_KIND
+    if view.get("arch_family") == A5_ARCH_FAMILY:
+        return (SPARSE_MLA_NATIVE_KIND
+                if view.get("cache_dtype") in FLOATING_CACHE_DTYPES
+                else MIXED_QUANT_NATIVE_KIND)
+    return SPARSE_SHARED_KV_NATIVE_KIND
+
 
 def grouped_situ_contract(view):
     """Verified MX A8W4 channel domain; routed row values remain independent."""
@@ -271,9 +303,44 @@ def gemma_norm_contract(op):
             (tensor, ((shape[0], 1), "fp32", "ND")))
 
 
+def _mqsmla_attention_contract(op, view):
+    """One packed-cache batch kernel per layer, not a captured binary ABI."""
+    meta = op["metadata"]
+    binding = meta.get("implementation_binding", {})
+    if (not view or view.get("kind") != "mixed_quant_shared_kv"
+            or meta.get("native_kind") != MQSMLA_NATIVE_KIND
+            or binding.get("implementation") != MQSMLA_RECIPE
+            or binding.get("capture_binary_identity") != "not_established"
+            or op.get("source_boundary") != "kernel"
+            or view.get("original_cache_row_bytes") != MQSMLA_WINDOW_ROW_BYTES
+            or view.get("compressed_cache_row_bytes") != MQSMLA_COMPRESSED_ROW_BYTES):
+        return None
+    shape = tuple(view.get("query_shape", ()))
+    output = tuple(view.get("output_shape", ()))
+    if (len(shape) != 3 or output != shape or shape[0] < 1
+            or shape[2] != MQSMLA_HEAD_WIDTH
+            or view.get("query_dtype") != "bf16"
+            or view.get("output_dtype") != "bf16"):
+        return None
+    regions = dict(view.get("cache_representations") or {})
+    window = dict(regions.get("window") or {})
+    compressed = dict(regions.get("compressed_kv") or {})
+    if not window or not compressed:
+        return None
+    query = (shape, "bf16", "ND")
+    return (
+        "sparse_attention_active", MQSMLA_NATIVE_KIND, (query,),
+        (((1, MQSMLA_WINDOW_ROW_BYTES), str(window["dtype"]), "ND"),
+         ((1, MQSMLA_COMPRESSED_ROW_BYTES), str(compressed["dtype"]), "ND")),
+        (output, "bf16", "ND"),
+    )
+
+
 def attention_contract(op):
     """Source-declared dense or paged tensors, not the entire native ABI."""
     view = op["metadata"].get("attention_tensor_view")
+    if op.get("recipe") == MQSMLA_RECIPE:
+        return _mqsmla_attention_contract(op, view)
     if op.get("recipe") == "vllm_ascend_sharedkv_scfa":
         return _scfa_attention_contract(op, view)
     if op.get("recipe") == "ascend_sparse_flash_attention_arch22":
@@ -284,6 +351,12 @@ def attention_contract(op):
         return None
     if view.get("kind") in {"indexed_latent", "shared_kv"}:
         return _sparse_attention_contract(view)
+    if view.get("kind") == "mixed_quant_shared_kv":
+        # A packed ABI selects the mixed-quant producer; a plain floating
+        # override keeps the generation's own sparse-MLA family.
+        floating = view.get("cache_dtype") in FLOATING_CACHE_DTYPES
+        return _sparse_attention_contract(
+            view, native_name=None if floating else MIXED_QUANT_NATIVE_KIND)
     if view.get("kind") == "paged_gqa":
         return _paged_attention_contract(view)
     if (view.get("logical_layout") != "TND"
@@ -398,17 +471,18 @@ def _paged_attention_contract(view):
     )
 
 
-def _sparse_attention_contract(view):
+def _sparse_attention_contract(view, native_name=None):
     query = (tuple(view["query_shape"]), view["query_dtype"], "ND")
     output = (tuple(view["output_shape"]), view["output_dtype"], "ND")
     cache = (tuple(view["cache_head_shape"]), view["cache_dtype"], "ND")
     if view["kind"] == "indexed_latent":
         rope = (tuple(view["query_rope_shape"]), view["query_dtype"], "ND")
         rope_cache = (tuple(view["rope_cache_head_shape"]), view["cache_dtype"], "ND")
-        return ("sparse_attention_active", "SparseFlashAttention",
+        return ("sparse_attention_active",
+                native_name or SPARSE_FLASH_ATTENTION_NATIVE,
                 (query, rope), (cache, cache, rope_cache), output)
     compressed = cache if view["compressed_cache"] else ((), None, None)
-    return ("sparse_attention_active", "SparseAttnSharedkv",
+    return ("sparse_attention_active", native_name or shared_kv_native_name(view),
             (query,), (cache, compressed), output)
 
 

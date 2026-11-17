@@ -93,9 +93,17 @@ def test_model_scope_and_body_optout_retain_detailed_control_and_semantic_work()
     raw = physical_case()
     options = {**GEOMETRY, "scope": "model"}
     model = target_graphs(raw, **options)
-    assert model == target_graphs(raw, apply_body_defaults=False, **options)
+    # Model assembly consumes the same resolved declaration as the body entry:
+    # assembly scope and effective implementation selection are separate.
+    assert model.effective_kernels["programs"]["matmul"]["kind"] == "steady_matmul"
     model_costs = operator_costs(raw, model)
-    assert all(row["program"] == "TiledMatmul" for row in model_costs["operators"]
+    assert all(row["program"] == "SteadyMatmul" for row in model_costs["operators"]
+               if row["operator"]["family"] in MATRIX_FAMILIES)
+    # The explicit opt-out keeps the detailed per-tile control path available.
+    raw_model = target_graphs(raw, apply_body_defaults=False, **options)
+    assert "programs" not in raw_model.effective_kernels
+    raw_costs = operator_costs(raw, raw_model)
+    assert all(row["program"] == "TiledMatmul" for row in raw_costs["operators"]
                if row["operator"]["family"] in MATRIX_FAMILIES)
     generic = target_graphs(raw, apply_body_defaults=False, **GEOMETRY)
     compact = target_graphs(raw, **GEOMETRY)

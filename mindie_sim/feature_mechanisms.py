@@ -144,9 +144,9 @@ def _apply_basic_norm_quant(rt: dict[str, Any], ctx: MechanismContext) -> None:
     if _has_quant_activations(ctx.model):
         _append_passes(rt, "activation_quantization", "norm_quant")
     normalization = dict(ctx.model.catalog_facts).get("normalization") or {}
+    # ``add_rmsnorm`` is the residual boundary and is independent of qk_norm.
     if (ctx.model.activation_dtype == "bf16"
-            and not normalization.get("norm_weight_offset", 0.0)
-            and not any(p.qk_norm for p in ctx.model.layer_plans)):
+            and not normalization.get("norm_weight_offset", 0.0)):
         _append_passes(rt, "residual_norm")
         _set_lowering(rt, "add_rmsnorm", "vllm_ascend_native_norm")
         q = ctx.model.quant

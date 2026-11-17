@@ -145,8 +145,14 @@ def test_explicit_book_does_not_install_structural_caller_and_model_scope_is_unc
     _assert_timeline_close(body["timeline"], direct["timeline"])
     assert not any(row["recipe"] == "ascend_gdn_decode_gating" for row in body["timeline"])
     model = {**GEOMETRY, "scope": "model"}
-    assert target_graphs(raw, **model) == target_graphs(raw, apply_body_defaults=False, **model)
-    assert export_structure(raw, **model)["graph_id"] == export_structure(
+    resolved_model = target_graphs(raw, **model)
+    # Assembly scope is not implementation scope: model assembly consumes the
+    # same shared resolver, and keeps the actual scope on its declaration.
+    assert resolved_model.scope == "model"
+    assert resolved_model.effective_kernels == target_graphs(raw, **GEOMETRY).effective_kernels
+    raw_model = target_graphs(raw, apply_body_defaults=False, **model)
+    assert raw_model.effective_kernels != resolved_model.effective_kernels
+    assert export_structure(raw, **model)["graph_id"] != export_structure(
         raw, apply_body_defaults=False, **model)["graph_id"]
 
 

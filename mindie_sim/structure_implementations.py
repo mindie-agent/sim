@@ -10,6 +10,9 @@
 [Side-Effect Policy] Pure metadata; no profiler, capture or device dependency.
 """
 from mindie_sim.structure_contracts import predicted_contract, typed_values
+from mindie_sim.structure_native_contracts import (
+    MIXED_QUANT_NATIVE_KIND, shared_kv_native_name,
+)
 
 
 _CONTRACT_NATIVE = {
@@ -40,6 +43,16 @@ def native_implementation(op, contract):
         return explicit
     if op.get("source_boundary") == "call" or op["family"] == "barrier":
         return None
+    # A declared source kernel boundary names its own native entry point. The
+    # contract only projects tensors, so reading the name from the contract
+    # would silently relabel the mixed-quant attention kernel as FIA.
+    if op.get("source_boundary") == "kernel" and isinstance(meta.get("native_kind"), str):
+        return {
+            "native_kinds": (meta["native_kind"],),
+            "selection": "declared_source_kernel_boundary",
+            "basis": "implementation_binding",
+            "conditions": {},
+        }
     kinds = ()
     if contract:
         if contract[0] in _CONTRACT_NATIVE:
@@ -62,9 +75,11 @@ def native_implementation(op, contract):
                               key: meta[key] for key in
                               ("activation_format", "weight_format", "output_format")}}
     if not kinds and op["family"] == "attention":
-        kind = meta.get("attention_tensor_view", {}).get("kind")
+        view = meta.get("attention_tensor_view", {})
+        kind = view.get("kind")
         kinds = (("SparseFlashAttention",) if kind == "indexed_latent" else
-                 ("SparseAttnSharedkv",) if kind == "shared_kv" else
+                 (MIXED_QUANT_NATIVE_KIND,) if kind == "mixed_quant_shared_kv" else
+                 (shared_kv_native_name(view),) if kind == "shared_kv" else
                  ("FusedInferAttentionScore",))
         conditions = {"native_layout_dispatch_and_auxiliary_outputs_not_selected": True}
     if not kinds and op["recipe"] == "qk_l2norm":

@@ -237,9 +237,11 @@ def _resolve_va_lowerings(
         except ModelingError:
             pass
     normalization = dict(model_spec.catalog_facts).get("normalization", {})
+    # The residual add+RMSNorm boundary never touches qk_norm; requiring the
+    # absence of qk_norm dropped a native residual norm on every qk-normed GQA
+    # and MoE model. ``norm_weight_offset`` alone decides the weight convention.
     if (model_spec.activation_dtype == "bf16"
-            and not normalization.get("norm_weight_offset", 0.0)
-            and not any(p.qk_norm for p in model_spec.layer_plans)):
+            and not normalization.get("norm_weight_offset", 0.0)):
         lowerings["add_rmsnorm"] = "vllm_ascend_native_norm"
         if "activation_quantization" in lowering_passes and model_spec.quant is not None:
             q = model_spec.quant
@@ -546,6 +548,9 @@ def compose_case(
     required_devices = dp * tp * pp * pcp
     hw_raw = dict(hardware) if isinstance(hardware, Mapping) else {}
     sku, backend, alias_preset = _resolve_hardware(hardware)
+    # ``backend`` is later rebound to the documented all2all backend name; keep
+    # the resolved hardware adapter identity separately for operator defaults.
+    hardware_backend = backend
     preset = str(topology_preset or alias_preset or hw_raw.get("topology_preset") or "")
     if preset and backend != "ascend":
         raise ModelingError(f"hardware_topology_preset_unsupported:{backend}:{preset}")
@@ -967,6 +972,33 @@ def compose_case(
             runtime_meta = dict(runtime_dict.get("metadata") or {})
             runtime_meta["feature_track_report"] = resolved_track
             runtime_dict["metadata"] = runtime_meta
+
+    # Device-adaptor operator defaults. The A5 V4.1 packed cache ABI is selected
+    # by hardware capability plus structural geometry, independently of the
+    # expert weight format; an unsupported automatic geometry keeps analytical
+    # execution and is reported instead of being installed.
+    notes: list[dict[str, Any]] = []
+    if ascend_backend and not raw_eager:
+        from mindie_sim.compose_operator_defaults import (
+            DECLARATION_PHASE, apply_compose_v41_a5_defaults,
+        )
+        from mindie_sim.prediction.implementation_selection import (
+            operator_selection_summary,
+        )
+        kernels = dict(runtime_dict.get("kernels") or {})
+        lowerings = dict(kernels.get("lowerings") or {})
+        notes = apply_compose_v41_a5_defaults(
+            model_dict=model_dict, lowerings=lowerings, backend=hardware_backend,
+            arch=_arch_key(sku), layer_plans=model_spec.layer_plans,
+            activation_dtype=model_spec.activation_dtype, tp=tp, cp=dcp,
+            runtime_metadata=runtime_meta,
+        )
+        if lowerings:
+            kernels["lowerings"] = lowerings
+            runtime_dict["kernels"] = kernels
+        runtime_meta["operator_selection_summary"] = operator_selection_summary(
+            arch_family=_arch_key(sku), phase=DECLARATION_PHASE, notes=notes)
+        runtime_dict["metadata"] = runtime_meta
 
     case_dict: dict[str, Any] = {
         "model": model_dict,

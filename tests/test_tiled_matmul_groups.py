@@ -305,7 +305,9 @@ def test_ordinary_frontend_mla_groups_and_source_bindings():
     raw = mla_case()
     geometry = {"phase": "decode", "tokens": 1, "context": 33,
                 "sequences": 1, "scope": "model"}
-    ops = target_graphs(raw, **geometry)[0]
+    # Raw-declaration control path: the resolved default matrix program is the
+    # separate body/model entry, so this probe keeps the detailed tiling.
+    ops = target_graphs(raw, apply_body_defaults=False, **geometry)[0]
     grouped = {op.op_id.rsplit(".", 1)[-1]: op for op in ops
                if op.op_id.endswith(("q_absorb", "v_expand"))}
     assert {name: dict(op.metadata)["matrix_groups"] for name, op in grouped.items()} == {

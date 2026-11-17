@@ -76,6 +76,233 @@ def cohorts(parallel, machine=None):
 _CALLABLE_BINDING_CACHE: dict[Any, tuple[Any, str | None]] = {}
 
 
+NOT_IN_INVENTORY_REASON = "phase_scoped_default_not_in_serving_recipe_inventory"
+
+
+def _lower_with_binding(lower, plan, model, runtime, machine, context,
+                        binding: BatchBinding, *, fast_step: bool = False):
+    """Pass the microbatch binding only to a producer that declares it.
+
+    A cached template owner asks for this keyword explicitly; an unrelated
+    custom lower keeps its existing callable contract and is never called with
+    an unexpected argument.
+    """
+    from .frontend import Frontend
+    if isinstance(lower, Frontend):
+        return lower(plan, model, runtime, machine, **context,
+                     dispatch_binding=binding, dispatch_fast_step=fast_step)
+    cache_id = id(lower)
+    cached = _CALLABLE_BINDING_CACHE.get(cache_id)
+    if cached is not None and cached[0] is lower:
+        keyword = cached[1]
+    else:
+        try:
+            parameters = inspect.signature(lower).parameters.values()
+        except (TypeError, ValueError):
+            parameters = ()
+        keyword = None
+        variadic = False
+        for parameter in parameters:
+            if parameter.name in {"dispatch_binding", "batch_binding"}:
+                keyword = parameter.name
+                break
+            if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+                variadic = True
+        if keyword is None and variadic:
+            keyword = "dispatch_binding"
+        if len(_CALLABLE_BINDING_CACHE) >= 64:
+            _CALLABLE_BINDING_CACHE.clear()
+        _CALLABLE_BINDING_CACHE[cache_id] = (lower, keyword)
+    if keyword is not None:
+        context = {**context, keyword: binding}
+    return lower(plan, model, runtime, machine, **context)
+
+
+def _record_binding(record, op, binding: BatchBinding, scheduler) -> Mapping:
+    if not isinstance(record, _AbcMapping):
+        return record
+    data = dict(record)
+    op_requests = tuple(
+        str(item) for item in getattr(op, "requests", ()) or ()
+        if not str(item).endswith(":padding"))
+    request = op_requests[0] if len(op_requests) == 1 else str(
+        data.get("request") or "")
+    slot = binding.slot_of(request)
+    if slot is None:
+        return record
+    version = binding.version_of(request)
+    stale = data.get("request_slot") not in (None, slot)
+    data["request_slot"] = slot
+    data["microbatch"] = binding.microbatch
+    data["microbatches"] = binding.microbatches
+    data["replica"] = binding.replica
+    data.setdefault("stage", int(getattr(op, "stage", 0)))
+    data["request"] = request
+    if version is not None:
+        # A template hit carries a previous round's slot/version. Rebind the
+        # current round; an actual producer that already names this slot and
+        # version keeps its own explicit binding.
+        template = (bool(data.get("template"))
+                    or str(data.get("binding") or "") == "template")
+        if template:
+            data["occurrence"] = str(op.op_id)
+            if str(data.get("direction") or "read") == "read":
+                data["reader"] = str(op.op_id)
+            else:
+                data["output"] = str(op.op_id)
+        if template or data.get("state_version") is None or stale:
+            data["state_version"] = version
+        data.setdefault("request_version", version)
+    return data
+
+
+_REBIND_META_KEYS = frozenset({
+    "state_accesses", "memory_accesses", "memory_bindings", "memory_binding",
+})
+_LAST_NO_MB_OPS: list[tuple] = [()]
+_LAST_NO_REV_OPS: list[tuple] = [()]
+
+
+def _rebind_work(work, binding: BatchBinding, scheduler, *,
+                 fast_step: bool = False):
+    """Bind this microbatch's actual occurrences to original slot/version.
+
+    Returns the rebound work plus the exact per-occurrence maps passed through
+    ``Execution.add``/``add_group``. Only producer-declared accesses are
+    rebound; T14 never fabricates a state read/write.
+    """
+    from .execution import inherit_meta_id_key, meta_scan_flags
+    use_fast = fast_step and work.replay_scope == "none" and work.graph_bucket is None
+    if use_fast:
+        prev_nomb = _LAST_NO_MB_OPS[0]
+        if len(prev_nomb) == len(work.ops):
+            all_nomb = True
+            for op, pop in zip(work.ops, prev_nomb):
+                if op is pop:
+                    continue
+                rm = op.metadata
+                if rm and meta_scan_flags(rm)[2]:
+                    all_nomb = False
+                    break
+            if all_nomb:
+                _LAST_NO_MB_OPS[0] = work.ops
+                return work, None, None
+    ops = None
+    state_accesses: dict[str, tuple] = {}
+    memory_rows: list[dict] = []
+    for index, op in enumerate(work.ops):
+        raw_meta = op.metadata
+        if not raw_meta:
+            if ops is not None:
+                ops.append(op)
+            continue
+        flags = meta_scan_flags(raw_meta)
+        if not (flags[2] if use_fast else flags[0]):
+            if ops is not None:
+                ops.append(op)
+            continue
+        metadata = dict(raw_meta)
+        op_changed = False
+        mem_bind_changed = False
+        if not use_fast:
+            for key in ("state_accesses", "memory_accesses"):
+                if key not in metadata:
+                    continue
+                records = tuple(metadata.get(key) or ())
+                rebound = tuple(
+                    _record_binding(record, op, binding, scheduler)
+                    for record in records)
+                metadata[key] = rebound
+                state_accesses[str(op.op_id)] = rebound
+                op_changed = True
+        for key in ("memory_bindings", "memory_binding"):
+            raw = metadata.get(key)
+            if not isinstance(raw, _AbcMapping):
+                continue
+            rebound = {
+                str(name): _record_binding(value, op, binding, scheduler)
+                for name, value in raw.items()
+            }
+            metadata[key] = rebound
+            for name, value in rebound.items():
+                if isinstance(value, _AbcMapping):
+                    memory_rows.append({
+                        "occurrence": str(op.op_id), "allocation": str(name),
+                        **dict(value)})
+            op_changed = True
+            mem_bind_changed = True
+        if op_changed:
+            if ops is None:
+                ops = list(work.ops[:index])
+            rebound_meta = tuple(metadata.items())
+            if not mem_bind_changed:
+                inherit_meta_id_key(raw_meta, rebound_meta)
+            op = replace(op, metadata=rebound_meta)
+        if ops is not None:
+            ops.append(op)
+    if ops is None:
+        if use_fast and work.ops.__class__ is tuple:
+            _LAST_NO_MB_OPS[0] = work.ops
+        return work, None, None
+    return (replace(work, ops=tuple(ops)),
+            (state_accesses or None),
+            (memory_rows or None))
+
+
+def _serving_declaration(case, base, views):
+    """Resolve this iteration's own effective implementation declaration.
+
+    Serving dispatches one scheduled iteration at a time; a decode-only default
+    must never be installed over a prefill iteration, so the selection is made
+    from this call's actual phase, views and padded bucket and handed to the
+    frontend that lowers it. The frontend then resolves every declared policy
+    against this iteration's exact geometry and reports the decisions.
+    """
+    from dataclasses import replace as _replace
+    from .body_defaults import effective_body_declaration
+    from .implementation_selection import combine_summaries, fallback_note
+    views = tuple(views)
+    phase = next((view.phase for view in views), "decode")
+    tokens = max(1, sum(view.q_len for view in views))
+    effective, selection = effective_body_declaration(
+        case, phase, tokens=tokens, scope="body")
+    # The run-wide recipe book is a static inventory. A phase-scoped default
+    # that the inventory does not carry (a decode-only scalar caller) is not
+    # installed for this iteration; it is reported instead of silently used.
+    inventory = dict(base.kernels.get("lowerings") or {})
+    declared = dict(case.runtime.kernels.get("lowerings") or {})
+    allowed, dropped = {}, []
+    for selector, value in dict(effective.runtime.kernels.get("lowerings") or {}).items():
+        if selector in inventory or selector in declared:
+            allowed[selector] = value
+        else:
+            dropped.append(selector)
+    kernels = {**base.kernels, **effective.runtime.kernels, "lowerings": allowed}
+    # Per-iteration state (draft tail) lives on the scheduled runtime; the
+    # declaration only adds keys and overrides its own.
+    metadata = {**dict(base.metadata), **dict(effective.runtime.metadata)}
+    runtime = _replace(base, kernels=kernels, metadata=tuple(metadata.items()))
+    summary = combine_summaries([
+        selection.get("operator_selection_summary"),
+        {"arch_family": str(effective.machine.arch_family), "phase": phase,
+         "degraded_fallbacks": [fallback_note(selector, NOT_IN_INVENTORY_REASON)
+                                for selector in dropped]},
+    ])
+    return runtime, effective.model, effective.machine, summary
+
+
+def _iteration_summary(declaration, work):
+    """Combine the resolved declaration with this call's actual selections."""
+    from .implementation_selection import combine_summaries, records_summary
+    records = tuple(getattr(work, "implementation_selections", ()) or ())
+    arch = str((declaration or {}).get("arch_family") or "")
+    phase = str((declaration or {}).get("phase") or "")
+    return combine_summaries([
+        declaration,
+        records_summary(arch_family=arch, phase=phase, records=records),
+    ])
+
+
 def _lower_with_binding(lower, plan, model, runtime, machine, context,
                         binding: BatchBinding, *, fast_step: bool = False):
     """Pass the microbatch binding only to a producer that declares it.
@@ -247,7 +474,7 @@ def _rebind_work(work, binding: BatchBinding, scheduler, *,
 
 
 def submit_batch(case, schedulers, plans, execution, lower, now, *,
-                 bindings_out=None):
+                 bindings_out=None, selections_out=None):
     from .frontend import Frontend
     count = min(case.runtime.pipeline_microbatches,
                 max((len(plan.requests) for plan in plans.values() if plan),
@@ -380,13 +607,20 @@ def submit_batch(case, schedulers, plans, execution, lower, now, *,
         for replica, plan in local.items():
             binding = batch_bindings[replica]
             call_context = {**context, **route_context}
+            model, machine = case.model, case.machine
+            runtime = schedulers[replica].next_runtime(plan)
+            declaration = None
             if isinstance(lower, Frontend):
                 call_context["replica"] = replica
+                runtime, model, machine, declaration = _serving_declaration(
+                    case, runtime, plan.requests)
             work = _lower_with_binding(
-                lower, plan, case.model, schedulers[replica].next_runtime(plan),
-                case.machine, call_context, binding, fast_step=fast_step)
+                lower, plan, model, runtime, machine, call_context, binding,
+                fast_step=fast_step)
             work, accesses, bindings = _rebind_work(
                 work, binding, schedulers[replica], fast_step=fast_step)
+            if selections_out is not None and declaration is not None:
+                selections_out.append(_iteration_summary(declaration, work))
             works[replica] = work
             if accesses is not None:
                 state_accesses[replica] = accesses

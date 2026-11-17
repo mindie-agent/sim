@@ -37,6 +37,51 @@ BUFFERS = {"l1": 524288, "l0a": 65536, "l0b": 65536, "l0c": 262144,
                  + 2 * (32 * 128 + 8 * 16) * 2
                  + 4 * 16 * 544 + 2 * 32 * 17 * 16 * 2 + 10 * 32 * 4}
 
+# The packaged source shards query heads by TP and replicates the single MQA
+# KV head. ``local_heads = num_heads // tp`` therefore selects the QK cube
+# N-face count; the values below are the declared TP tilings whose M-tile still
+# aligns to the 16-row cube face.
+DEFAULT_MQSMLA_HEADS = 64
+MQSMLA_HEAD_WIDTH = 512
+MQSMLA_ROPE_WIDTH = 64
+CUBE_HEAD_TILE_ALIGN = 16
+VALID_LOCAL_HEAD_COUNTS = frozenset({8, 16, 32, 64})
+# Packed row widths: FP8 values plus one BF16 scale per 32 values, and two FP4
+# values per byte plus one BF16 scale per 16 values.
+ORIGINAL_CACHE_ROW_BYTES = 544
+COMPRESSED_CACHE_ROW_BYTES = 320
+PHYSICAL_KV_TILE_ROWS = 128
+GATHER_SUBTILE_ROWS = 16
+BF16_ELEMENT_BYTES = 2
+FP32_ELEMENT_BYTES = 4
+ORIGINAL_DEQUANT_OPS_PER_ELEM = 6
+COMPRESSED_DEQUANT_OPS_PER_ELEM = 4
+SOFTMAX_PAIR_OPS = 8
+SOFTMAX_ROW_REDUCE_OPS = 26
+ACCUM_NONFIRST_OPS = 3
+# Declared AIC ownership bounds of the source wrapper.
+MAX_MQSMLA_AIC_CORES = 36
+# The retained SELECTIVE_FD_72 wrapper is a distinct split-reduction geometry
+# that this whole-row program does not model.
+SELECTIVE_FD_AIC_CORES = 32
+SELECTIVE_FD_QUERY_ROWS = 72
+SELECTIVE_FD_ORIGINAL_ROWS = 128
+SELECTIVE_FD_COMPRESSED_ROWS = 512
+# Distinct (branch, rows, first, last, addressing, heads) phase payloads.
+TILE_PHASE_CACHE_SIZE = 512
+
+
+def selective_fd_excluded(cores, rows):
+    """True for the retained SELECTIVE_FD_72 wrapper geometry.
+
+    One predicate is shared by the builder and by automatic binding preflight
+    so a policy can never select a geometry the planner would reject.
+    """
+    return (cores == SELECTIVE_FD_AIC_CORES
+            and len(rows) == SELECTIVE_FD_QUERY_ROWS
+            and all(tuple(row) == (SELECTIVE_FD_ORIGINAL_ROWS,
+                                  SELECTIVE_FD_COMPRESSED_ROWS) for row in rows))
+
 
 def query_rows(shape):
     """Global query order preserves each sequence's causal context."""
@@ -98,31 +143,39 @@ def addr_vec_eligible(shape):
     return bool(compressed.get("present", True))
 
 
-@lru_cache(maxsize=512)
-def tile_phases(branch, valid, first, last, addressing="scalar"):
-    """Source phase payloads, not measured durations or utilization factors."""
+@lru_cache(maxsize=TILE_PHASE_CACHE_SIZE)
+def tile_phases(branch, valid, first, last, addressing="scalar",
+                heads=DEFAULT_MQSMLA_HEADS):
+    """Source phase payloads, parameterized by the local query-head count."""
+    sinks_bytes = heads * FP32_ELEMENT_BYTES
+    row_io_bytes = heads * MQSMLA_HEAD_WIDTH * BF16_ELEMENT_BYTES
     if not valid:
         return (
-            ("sinks", Work(resources={"hbm": 256, "mte2_aiv": 256})),
-            ("empty", Work(resources={"vector": 64 * 512})),
-            ("output", Work(resources={"hbm": 64 * 512 * 2, "mte3": 64 * 512 * 2})),
+            ("sinks", Work(resources={"hbm": sinks_bytes, "mte2_aiv": sinks_bytes})),
+            ("empty", Work(resources={"vector": heads * MQSMLA_HEAD_WIDTH})),
+            ("output", Work(resources={"hbm": row_io_bytes, "mte3": row_io_bytes})),
         )
-    physical = 128
-    row_bytes = 544 if branch == "original" else 320
+    physical = PHYSICAL_KV_TILE_ROWS
+    row_bytes = (ORIGINAL_CACHE_ROW_BYTES if branch == "original"
+                 else COMPRESSED_CACHE_ROW_BYTES)
+    # The QK M face keeps at least one aligned head face; wider TP shards round
+    # their local heads up to the same 16-row granularity.
+    cube_heads = max(
+        CUBE_HEAD_TILE_ALIGN,
+        ((heads + CUBE_HEAD_TILE_ALIGN - 1) // CUBE_HEAD_TILE_ALIGN) * CUBE_HEAD_TILE_ALIGN,
+    )
     # Four 16-row subtiles per AIV; duplicate tail indices still issue copies.
-    gather = physical * row_bytes
-    index = physical * 4  # one INT32 key; page-table lookup is a second phase.
-    padded_pv = (valid + 15) // 16 * 16
-    q = 64 * 512 * 2 if first else 0
-    output = 64 * 512 * 2 if last else 0
+    padded_pv = (valid + CUBE_HEAD_TILE_ALIGN - 1) // CUBE_HEAD_TILE_ALIGN * CUBE_HEAD_TILE_ALIGN
+    q = row_io_bytes if first else 0
+    output = row_io_bytes if last else 0
     phases = [
         ("query", Work(resources={"hbm": q, "mte2_aic": q})),
-        ("sinks", Work(resources={"hbm": 256 if first else 0,
-                                  "mte2_aiv": 256 if first else 0})),
+        ("sinks", Work(resources={"hbm": sinks_bytes if first else 0,
+                                  "mte2_aiv": sinks_bytes if first else 0})),
     ]
-    subtile = 16
+    subtile = GATHER_SUBTILE_ROWS
     for part in range(physical // subtile):
-        sub_bytes = subtile * 4
+        sub_bytes = subtile * FP32_ELEMENT_BYTES
         row_bytes_part = subtile * row_bytes
         phases.extend((
             (f"addr_index_{part}", Work(resources={"hbm": sub_bytes})),
@@ -130,20 +183,30 @@ def tile_phases(branch, valid, first, last, addressing="scalar"):
             (f"gather_{part}", Work(resources={"hbm": row_bytes_part,
                                                "mte2_aiv": row_bytes_part})),
         ))
-    gather_names = tuple(f"gather_{part}" for part in range(physical // subtile))
     phases.append(("addr_join", Work()))
+    dequant_ops = (ORIGINAL_DEQUANT_OPS_PER_ELEM if branch == "original"
+                   else COMPRESSED_DEQUANT_OPS_PER_ELEM)
     phases.extend((
-        ("dequant", Work(resources={"vector": physical * 512 * (6 if branch == "original" else 4)})),
-        ("kv_l1", Work(resources={"mte3": physical * 512 * 2})),
-        ("qk_operands", Work(resources={"mte1": (64 + physical) * 512 * 2})),
-        ("qk", Work(matrix={"bf16": 2 * 64 * physical * 512})),
-        ("scores", Work(resources={"fixpipe": 64 * physical * 4})),
-        ("softmax", Work(resources={"vector": 8 * 64 * valid + 26 * 64})),
-        ("probability_l1", Work(resources={"mte3": 64 * physical * 2})),
-        ("pv_operands", Work(resources={"mte1": (64 * physical + physical * 512) * 2})),
-        ("pv", Work(matrix={"bf16": 2 * 64 * padded_pv * 512})),
-        ("values", Work(resources={"fixpipe": 64 * 512 * 4})),
-        ("accumulate", Work(resources={"vector": 64 * 512 * ((1 if first else 3) + (2 if last else 0))})),
+        ("dequant", Work(resources={"vector": physical * MQSMLA_HEAD_WIDTH * dequant_ops})),
+        ("kv_l1", Work(resources={"mte3": physical * MQSMLA_HEAD_WIDTH * BF16_ELEMENT_BYTES})),
+        ("qk_operands", Work(resources={
+            "mte1": (cube_heads + physical) * MQSMLA_HEAD_WIDTH * BF16_ELEMENT_BYTES})),
+        ("qk", Work(matrix={
+            "bf16": BF16_ELEMENT_BYTES * cube_heads * physical * MQSMLA_HEAD_WIDTH})),
+        ("scores", Work(resources={"fixpipe": cube_heads * physical * FP32_ELEMENT_BYTES})),
+        ("softmax", Work(resources={
+            "vector": SOFTMAX_PAIR_OPS * heads * valid + SOFTMAX_ROW_REDUCE_OPS * heads})),
+        ("probability_l1", Work(resources={
+            "mte3": cube_heads * physical * BF16_ELEMENT_BYTES})),
+        ("pv_operands", Work(resources={
+            "mte1": (cube_heads * physical + physical * MQSMLA_HEAD_WIDTH)
+                    * BF16_ELEMENT_BYTES})),
+        ("pv", Work(matrix={
+            "bf16": BF16_ELEMENT_BYTES * cube_heads * padded_pv * MQSMLA_HEAD_WIDTH})),
+        ("values", Work(resources={
+            "fixpipe": cube_heads * MQSMLA_HEAD_WIDTH * FP32_ELEMENT_BYTES})),
+        ("accumulate", Work(resources={"vector": heads * MQSMLA_HEAD_WIDTH * (
+            (1 if first else ACCUM_NONFIRST_OPS) + (BF16_ELEMENT_BYTES if last else 0))})),
         ("output", Work(resources={"hbm": output, "mte3": output})),
     ))
     return tuple(phases)
@@ -181,7 +244,9 @@ class OwnerTiles:
 def build(op, geometry):
     shape = dict(op.metadata)["mqsmla_geometry"]
     requested = str(shape.get("addressing", "scalar"))
-    if shape["heads"] != 64 or shape["width"] != 512 or shape["metadata_support_fd"]:
+    heads = int(shape["heads"])
+    if (heads not in VALID_LOCAL_HEAD_COUNTS or shape["width"] != MQSMLA_HEAD_WIDTH
+            or shape["metadata_support_fd"]):
         raise ModelingError("mqsmla_source_geometry_or_branch_unsupported")
     if requested == "scalar":
         addressing = "scalar"
@@ -194,11 +259,11 @@ def build(op, geometry):
         raise ModelingError("mqsmla_addressing_mode_unsupported")
     rows = tuple(query_rows(shape))
     cores = geometry.compute_units
-    if not rows or not 1 <= cores <= 36:
+    if not rows or not 1 <= cores <= MAX_MQSMLA_AIC_CORES:
         raise ModelingError("mqsmla_requires_positive_rows_and_at_most36_aic")
     # Retained wrapper SELECTIVE_FD_72 supersedes SUPPORT_FD=False for this
     # one geometry; do not silently price its split reduction as whole rows.
-    if cores == 32 and len(rows) == 72 and all(row == (128, 512) for row in rows):
+    if selective_fd_excluded(cores, rows):
         raise ModelingError("mqsmla_selective_72_row_fd_branch_not_modeled")
     ownership = owner_ranges(len(rows), cores)
     streams = tuple((owner, OwnerTiles.create(rows[start:end]))
@@ -217,7 +282,8 @@ def build(op, geometry):
     total = Work()
     for _, stream in streams:
         for index in range(stream.count):
-            for _, work in tile_phases(*stream.key(index), addressing=addressing):
+            for _, work in tile_phases(*stream.key(index), addressing=addressing,
+                                       heads=heads):
                 total += work
 
     def program(context):
@@ -226,7 +292,8 @@ def build(op, geometry):
                 key = stream.key(index)
                 result = []
                 previous = None
-                for name, work in tile_phases(*key, addressing=addressing):
+                for name, work in tile_phases(*key, addressing=addressing,
+                                              heads=heads):
                     if name in {"query", "sinks"}:
                         after = ()
                     elif name.startswith("addr_index_"):
@@ -236,7 +303,8 @@ def build(op, geometry):
                     elif name.startswith("gather_"):
                         after = ("addr_page_" + name.rsplit("_", 1)[-1],)
                     elif name == "addr_join":
-                        after = tuple(f"gather_{part}" for part in range(8))
+                        after = tuple(f"gather_{part}" for part in
+                                      range(PHYSICAL_KV_TILE_ROWS // GATHER_SUBTILE_ROWS))
                     elif name == "qk_operands":
                         after = ("kv_l1", "query")
                     elif name == "softmax":

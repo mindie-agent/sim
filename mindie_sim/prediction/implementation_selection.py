@@ -14,11 +14,142 @@ from mindie_sim.schema.common import ModelingError
 
 
 _GEOMETRY = {"valid_tokens", "padded_tokens", "sequences", "min_query_tokens", "max_query_tokens",
-             "max_context_tokens"}
+             "max_context_tokens", "min_context_tokens"}
 _STATIC_SELECTORS = {"mla_prolog", "mx_matrix"}
 _CATEGORIES = {"phases": {"prefill", "decode"},
                "replay_scopes": {"none", "full", "piecewise"},
                "model_scopes": {"target", "draft"}}
+
+
+AUTOMATIC_LOWERINGS_KEY = "automatic_lowerings"
+
+
+def with_automatic_lowering(metadata, selector):
+    """Declare that a structural default, not the caller, installed ``selector``.
+
+    The distinction is load-bearing: an automatically selected binding keeps
+    analytical execution when a per-call geometry falls outside the source
+    domain, while an explicitly requested binding fails during preflight.
+    """
+    values = dict(metadata or ())
+    names = [str(name) for name in values.get(AUTOMATIC_LOWERINGS_KEY) or ()]
+    if selector not in names:
+        names.append(selector)
+    values[AUTOMATIC_LOWERINGS_KEY] = tuple(names)
+    return values
+
+
+def is_automatic_lowering(metadata, selector):
+    """Accept either a runtime metadata mapping or its parsed pair sequence."""
+    return selector in tuple(dict(metadata or ()).get(AUTOMATIC_LOWERINGS_KEY) or ())
+
+
+EXPLICIT_PRESERVED_REASON = "explicit_implementation_preserved"
+
+
+def selected_note(family, binding, native_kind, reason):
+    """One resolved native selection, as exported by every entry point."""
+    return {"family": str(family), "binding": str(binding),
+            "native_kind": str(native_kind), "reason": str(reason)}
+
+
+def fallback_note(family, reason):
+    """One family that retained analytical execution, with its exact cause."""
+    return {"family": str(family), "fallback": "analytical", "reason": str(reason)}
+
+
+def _record_note(record):
+    family = str(record.get("family") or "unknown")
+    reason = str(record.get("reason") or "")
+    installed = str(record.get("selection") or "") == "default_installed"
+    if installed or reason == EXPLICIT_PRESERVED_REASON:
+        binding = (record.get("binding") or record.get("caller")
+                   or record.get("implementation") or family)
+        return selected_note(family, binding,
+                             record.get("native_kind") or family, reason)
+    return fallback_note(family, reason or "unspecified")
+
+
+def operator_selection_summary(*, arch_family, phase, notes):
+    """Deterministic projection of resolved selections and fallbacks."""
+    selected, degraded = [], []
+    for note in notes or ():
+        if "fallback" in note:
+            degraded.append(dict(note))
+        elif "binding" in note:
+            selected.append(dict(note))
+    return {
+        "arch_family": str(arch_family),
+        "phase": str(phase),
+        "selected_native": selected,
+        "degraded_fallbacks": degraded,
+        "selection_warnings": [
+            f"{note['family']}->{note['fallback']}:{note['reason']}" for note in degraded
+        ],
+    }
+
+
+def records_summary(*, arch_family, phase, records):
+    """Project resolved implementation records onto the shared summary schema."""
+    return operator_selection_summary(
+        arch_family=arch_family, phase=phase,
+        notes=[_record_note(record) for record in records or ()])
+
+
+def combine_summaries(summaries):
+    """Union phase-scoped per-iteration summaries into one deterministic record."""
+    items = [summary for summary in (summaries or ()) if summary]
+    if not items:
+        return {}
+    arch = ""
+    phases = []
+    selected, degraded = [], []
+    seen_selected, seen_degraded = set(), set()
+    for summary in items:
+        arch = arch or str(summary.get("arch_family") or "")
+        phase = str(summary.get("phase") or "")
+        if phase and phase not in phases:
+            phases.append(phase)
+        for note in summary.get("selected_native", ()):
+            key = (note.get("family"), note.get("binding"))
+            if key not in seen_selected:
+                seen_selected.add(key)
+                selected.append(dict(note))
+        for note in summary.get("degraded_fallbacks", ()):
+            key = (note.get("family"), note.get("reason"))
+            if key not in seen_degraded:
+                seen_degraded.add(key)
+                degraded.append(dict(note))
+    return {
+        "arch_family": arch,
+        "phase": "+".join(phases) if phases else "unknown",
+        "selected_native": selected,
+        "degraded_fallbacks": degraded,
+        "selection_warnings": [
+            f"{note['family']}->{note['fallback']}:{note['reason']}" for note in degraded
+        ],
+    }
+
+
+def merge_selection_summaries(base, extra):
+    """Union two phase-scoped summaries without dropping either record."""
+    if not base:
+        return dict(extra)
+    if not extra:
+        return dict(base)
+    merged = dict(extra)
+    seen = {(item.get("family"), item.get("reason"))
+            for item in merged.get("degraded_fallbacks", ())}
+    degraded = list(merged.get("degraded_fallbacks", ()))
+    for item in base.get("degraded_fallbacks", ()):
+        key = (item.get("family"), item.get("reason"))
+        if key not in seen:
+            seen.add(key)
+            degraded.append(dict(item))
+    merged["degraded_fallbacks"] = degraded
+    merged["selection_warnings"] = [
+        f"{item['family']}->{item['fallback']}:{item['reason']}" for item in degraded]
+    return merged
 
 
 def is_policy(raw):
@@ -118,6 +249,10 @@ def resolve(runtime, views, *, padded_tokens, replay_scope, global_views=None,
         "min_query_tokens": min((view.q_len for view in views), default=0),
         "max_query_tokens": max((view.q_len for view in views), default=0),
         "max_context_tokens": max((view.context for view in views), default=0),
+        # Dense paged-MLA source kernels apply their split-core tile only from a
+        # declared page-aligned context; the minimum keeps that a domain match
+        # instead of a planner exception on short contexts.
+        "min_context_tokens": min((view.context for view in views), default=0),
         "replay_scope": replay_scope,
         "model_scope": model_scope,
     }

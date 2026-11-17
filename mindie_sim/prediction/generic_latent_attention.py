@@ -18,7 +18,7 @@ from mindie_sim.catalog.attention_common import (
     _causal_pairs, _long_selected_pairs, active_dcp_degree, min_positive,
 )
 from mindie_sim.catalog.cache import completed_rows, index_row_bytes
-from mindie_sim.catalog.cache_format import cache_format
+from mindie_sim.catalog.cache_format import CacheFormat, cache_format
 from mindie_sim.catalog.context_parallel import (
     dsa_cp_token_ranges, owned_positions, split_causal_pairs, split_pcp_pairs,
 )
@@ -38,6 +38,58 @@ FP32_BYTES = 4
 INT32_BYTES = 4
 MIN_LOG_TOPK = 2
 MIN_BATCH_MEMBERS = 2
+# A packed index row stores two 4-bit elements per byte. Its score reduction
+# consumes a dequantized FP4 payload, so the declared compute identity is the
+# dequantized BF16 path (the same convention ``compute_dtype_for`` applies to
+# MXFP4 weights). No FP4 cube peak is invented, and the row is no longer
+# priced as the INT8 indexer declared by ``quant.index_dtype``.
+PACKED_INDEX_ARITHMETIC_DTYPE = "bf16"
+
+
+def stack_compressor_kind(model, plan):
+    """Compressor variant of the window-compressed cache stack this layer uses.
+
+    V4.1's leading sliding-window-only layers declare no compressor of their
+    own, yet they belong to the same cache/attention family as the compressing
+    layers, so the stack variant is resolved once per model.
+    """
+    if plan.compress_ratio and plan.compressor_kind:
+        return plan.compressor_kind
+    kinds = {other.compressor_kind for other in model.layer_plans
+             if other.attention == "mla" and other.cache_kind == "window_compressed"
+             and other.compress_ratio and other.compressor_kind}
+    return next(iter(kinds)) if len(kinds) == 1 else ""
+
+
+def index_cache_format(model):
+    """Declared index-cache representation, or the declared index precision.
+
+    The index key region has its own representation. When the model does not
+    declare one, the fallback is the declared *indexer* dtype, never the
+    attention KV dtype: those are separate cache regions of the same case.
+    """
+    raw = dict(getattr(model, "metadata", ())).get("cache_representations", {})
+    if "index_k" in raw:
+        return cache_format(model, "index_k")
+    declared = str(getattr(getattr(model, "quant", None), "index_dtype", "") or "int8")
+    return CacheFormat(declared)
+
+
+def index_cache_is_packed(model):
+    """True when one index-cache storage byte holds more than one element."""
+    return index_cache_format(model).packed_elements > 1
+
+
+def index_arithmetic_dtype(model, quant):
+    """Logical indexer arithmetic dtype, distinct from packed row storage."""
+    if index_cache_is_packed(model):
+        return PACKED_INDEX_ARITHMETIC_DTYPE
+    return quant.index_dtype
+
+
+def index_cache_dtype(model):
+    """Resolved index-cache storage dtype of the declared index region."""
+    return index_cache_format(model).dtype
 
 
 def _schedule(op):
@@ -364,7 +416,7 @@ def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
                     read=float(refill_rows) * row_b / divisor,
                     hbm_read=hbm_rows * row_b / divisor,
                     write=rows * FP32_BYTES / divisor, family="indexer",
-                    dtype=quant.index_dtype)
+                    dtype=index_arithmetic_dtype(model, quant))
     if not local and shard == 1 and b.ops:
         cfg_fam = runtime.kernels.get("families", {}) if runtime else {}
         cfg_rec = runtime.kernels.get("recipes", {}) if runtime else {}
@@ -618,7 +670,8 @@ def dsa_cp_prefill_parts(view, tp):
     return best_parts
 
 
-def attention_tensor_view(plan, view, heads, model, quant, parallel, *, eff_cp=None):
+def attention_tensor_view(plan, view, heads, model, quant, parallel, *, eff_cp=None,
+                          machine=None):
     """Declare active latent tensors separately from paged cache allocation."""
     resolved_cp = int(parallel.cp) if eff_cp is None else int(eff_cp)
     dense_paged = (
@@ -657,6 +710,10 @@ def attention_tensor_view(plan, view, heads, model, quant, parallel, *, eff_cp=N
             and plan.head_dim == plan.qk_nope_head_dim + plan.qk_rope_head_dim):
         query = (view.q_len, heads, plan.head_dim)
         regions = dict(model.metadata).get("cache_representations", {})
+        # The compressor variant and the hardware generation, not a model name,
+        # select the native sparse-MLA operator family.
+        family = {"compressor_kind": stack_compressor_kind(model, plan),
+                  "arch_family": str(getattr(machine, "arch_family", "") or "")}
         if regions:
             return (("attention_tensor_view", {
                 "kind": "mixed_quant_shared_kv", "query_shape": query, "output_shape": query,
@@ -665,12 +722,17 @@ def attention_tensor_view(plan, view, heads, model, quant, parallel, *, eff_cp=N
                 "original_cache_row_bytes": cache_format(model, "window").row_bytes(plan.head_dim),
                 "compressed_cache_row_bytes": cache_format(
                     model, "compressed_kv").row_bytes(plan.head_dim),
+                "cache_head_shape": (1, plan.head_dim),
+                "cache_dtype": cache_format(model, "window").dtype,
+                "compressed_cache": plan.compress_ratio > 0,
+                **family,
             }),)
         return (("attention_tensor_view", {
             **common, "kind": "shared_kv",
             "query_shape": query, "output_shape": query,
             "cache_head_shape": (1, plan.head_dim),
             "compressed_cache": plan.compress_ratio > 0,
+            **family,
         }),)
     return ()
 

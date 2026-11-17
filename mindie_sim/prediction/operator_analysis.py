@@ -6,6 +6,7 @@
 [Timeouts & Locks] Bounded by the distinct operators in one active graph.
 [Side-Effect Policy] No measurements, device contexts or external effects.
 """
+from copy import deepcopy
 from dataclasses import replace
 from collections.abc import Mapping
 from hashlib import sha256
@@ -66,6 +67,9 @@ def _group_sequences(sequences, group, parallel):
     raise ValueError("cohort_sequences_require_positive_scalar_or_complete_nonnegative_counts")
 
 
+MODEL_SCOPE = "model"
+
+
 class ModelGraphSet(dict):
     """Replica graph mapping from the same Frontend.program occurrences.
 
@@ -77,8 +81,12 @@ class ModelGraphSet(dict):
         self.programs = dict(programs)
         self.ports = {replica: program.ports
                       for replica, program in self.programs.items()}
+        self.scope = MODEL_SCOPE
+        self.effective_kernels = deepcopy(kernels)
+        self.default_selection = deepcopy(selection)
         super().__init__((replica, TargetOperators._with_declaration(
-            ops, kernels, selection)) for replica, ops in values.items())
+            ops, self.effective_kernels, self.default_selection, MODEL_SCOPE))
+            for replica, ops in values.items())
 
     def program(self, replica=0):
         return self.programs[replica]
@@ -132,7 +140,8 @@ def target_operators(case, *, phase, tokens, context=0, sequences=1, scope="body
         selected = (int(selected_replica) if selected_replica is not None
                     else group[0])
         result = tuple(op for op in graphs[selected] if op.family != "barrier")
-        return (TargetOperators(result, kernels=case.runtime.kernels, selection=selection)
+        return (TargetOperators(result, kernels=case.runtime.kernels,
+                                selection=selection, scope=scope)
                 if scope == "body" else result)
     replica = selected
     physical = _physical_rank_for(case, replica)
@@ -141,7 +150,8 @@ def target_operators(case, *, phase, tokens, context=0, sequences=1, scope="body
         routing_views=routing_views, physical_rank=physical,
         query_position=query_position, replica=replica, layer_limit=layer_limit)
                    if op.family != "barrier")
-    return (TargetOperators(result, kernels=case.runtime.kernels, selection=selection)
+    return (TargetOperators(result, kernels=case.runtime.kernels,
+                            selection=selection, scope=scope)
             if scope == "body" else result)
 
 
@@ -484,7 +494,7 @@ def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
                   for replica in graphs}
     if scope == "body":
         return TargetGraphSet(graphs, kernels=case.runtime.kernels,
-                              selection=selection)
+                              selection=selection, scope=scope)
     return ModelGraphSet(graphs, programs=model_programs,
                          kernels=case.runtime.kernels, selection=selection)
 

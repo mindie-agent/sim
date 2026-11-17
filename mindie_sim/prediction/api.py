@@ -273,6 +273,7 @@ def run_cohort(case, execution, schedulers, memory, lower, *, trace_limit=DEFAUL
     replacement ``output_tokens``. ``selected_allocations`` may wait for a real
     Event owned by this service; permanent refusal happens before any issue.
     """
+    from .implementation_selection import combine_summaries
     engine = _bind_service_context(case, execution, schedulers, memory)
     replicas = set(range(len(schedulers)))
     quota = {str(key): max(0, int(value))
@@ -298,6 +299,7 @@ def run_cohort(case, execution, schedulers, memory, lower, *, trace_limit=DEFAUL
     parallel = case.runtime.parallel
     in_flight: dict[int, ScheduledIteration] = {}
     traces, modes, scopes = [], {}, {}
+    selections: list = []
     iterations = 0
     model_steps = 0
     logical_steps = 0
@@ -403,7 +405,7 @@ def run_cohort(case, execution, schedulers, memory, lower, *, trace_limit=DEFAUL
                     continue
                 steps = submit_batch(
                     case, schedulers, plans, execution, lower, engine.now,
-                    bindings_out=bindings)
+                    bindings_out=bindings, selections_out=selections)
                 # One atomic EP/cohort submission counts once against the global
                 # decode budget; PP microbatch work remains inside it.
                 if any(step.mode != "retire" for step in steps.values()):
@@ -464,6 +466,7 @@ def run_cohort(case, execution, schedulers, memory, lower, *, trace_limit=DEFAUL
         "traces": traces, "serving_end": engine.now, "window_end": window_end,
         "stop_reason": stop_reason, "token_quotas": dict(quota),
         "selected_allocation_attached": bool(selected_attached),
+        "operator_selection_summary": combine_summaries(selections),
     }
 
 
@@ -507,7 +510,8 @@ def predict(
         # select one compact finite-K representation; an explicit caller
         # recipe book still wins.
         from .body_defaults import service_program_defaults
-        case = service_program_defaults(case)
+        from mindie_sim.compose_operator_defaults import serving_recipe_inventory
+        case = serving_recipe_inventory(service_program_defaults(case))
     lower = lower or Frontend(
         attention_policy=AttentionPolicy(**case.runtime.attention_policy),
         resource_fusion=resource_fusion)
@@ -611,6 +615,7 @@ def predict(
         },
         "traces": traces, "events": list(engine.trace),
         "framework_occurrences": occurrences,
+        "operator_selection_summary": run["operator_selection_summary"],
         "plan": {"model": case.model.to_dict(), "runtime": case.runtime.to_dict(),
                  "machine": case.machine.to_dict()},
         "metric_boundary": "device_token_commit",

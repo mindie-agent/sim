@@ -19,6 +19,7 @@ from .batch_prefix_attention import (
     annotate_sparse_prefix_unknown, apply_attention_prefix_reads,
 )
 from .implementations import select
+from .implementation_selection import is_automatic_lowering
 from .lowering import Builder
 from .compression import compressor
 from .indexer_representation import index_representation
@@ -32,6 +33,7 @@ from mindie_sim.catalog.cache_format import cache_format
 from mindie_sim.catalog.ops import compute_dtype_for
 from .generic_latent_attention import (
     attention_tensor_view, attention_view_record, dsa_cp_prefill_parts,
+    index_arithmetic_dtype, index_cache_dtype, index_cache_is_packed,
     kv_sweeps, owned_store_rows, selected_pairs, semantic_index_selection,
     sharded_index_visible_rows, sparse_over_parts, view_causal_pairs,
     visible_parts, window_cache_read,
@@ -58,6 +60,10 @@ RMSNORM_OPS_PER_ELEM = 5
 SOFTMAX_VECTOR_OPS_PER_PAIR = 5
 GATE_APPLY_OPS_PER_ELEMENT = 5
 INT32_BYTES = int(dtype_bytes("int32"))
+FP16_BYTES = int(dtype_bytes("fp16"))
+FP32_BYTES = int(dtype_bytes("fp32"))
+# Declared element width of the A5 mixed-quant indexer head weights.
+INDEX_WEIGHT_DTYPE = "fp32"
 
 
 def _store_rows(rows_by_view, views, parallel, block, *, contexts=None):
@@ -73,6 +79,12 @@ def _memory_hierarchy(machine):
         if hierarchy is not None and hierarchy.l2_capacity_bytes > 0:
             return hierarchy
     return default_hierarchy()
+
+
+def _aic_owners(machine):
+    """Declared AIC owner count of the representative shard, or ``None``."""
+    dies = tuple(getattr(machine, "dies", ()) or ())
+    return min(die.compute_units for die in dies) if dies else None
 
 
 def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
@@ -112,10 +124,21 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                    if runtime and plan.mla_variant == "latent_mqa"
                    and plan.cache_kind == "window_compressed"
                    and any(view.phase == "decode" for view in views) else None)
+    if mixed_quant and not sum(int(view.q_len) for view in views):
+        # ``dsa_v41`` slices to zero actual tokens and skips the attention call
+        # on an idle DP replica; no native binding is claimed without rows.
+        mixed_quant = None
     if mixed_quant:
-        mixed_quant.module.validate(views=views, plan=plan, parallel=parallel,
-                                    model=model, padded_tokens=padded_tokens,
-                                    **mixed_quant.options)
+        reason = mixed_quant.module.unsupported_reason(
+            views=views, plan=plan, parallel=parallel, model=model,
+            padded_tokens=padded_tokens, cores=_aic_owners(machine),
+            topk_present=bool(plan.index_topk), **mixed_quant.options)
+        if reason:
+            # A default-installed policy must never turn a supported graph into
+            # a planner failure; an explicitly requested binding still must.
+            if not is_automatic_lowering(runtime.metadata, "mqsmla_attention"):
+                raise ModelingError(reason)
+            mixed_quant = None
     if selected:
         selected.module.validate(
             views=views, plan=plan, parallel=parallel, model=model, quant=quant,
@@ -370,12 +393,24 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         weights = pool_weights or b.matrix(
             "index_weights", (weights_input,), q, plan.index_heads, h,
             category="indexer.weights")
-        if quant.index_dtype == "int8":
+        if index_cache_is_packed(model):
+            # The A5 packed indexer consumes FP32 head weights
+            # (``mixed_quant_attention.py``: ``weights.float()``). The INT8-path
+            # FP16 conversion describes neither its storage nor its arithmetic.
+            if weights_dtype != INDEX_WEIGHT_DTYPE:
+                weights = b.vector(
+                    "index_weights_fp32", (weights,), q * plan.index_heads, 1,
+                    family="cast", dtype=INDEX_WEIGHT_DTYPE,
+                    shape=(q, plan.index_heads),
+                    read_bytes_override=q * plan.index_heads * dtype_bytes(weights_dtype),
+                    write_bytes_override=q * plan.index_heads * FP32_BYTES,
+                    metadata=(("source_semantics", "packed_indexer_weights_float32"),))
+        elif quant.index_dtype == "int8":
             weights = b.vector(
                 "index_weights_fp16", (weights,), q * plan.index_heads, 1,
                 family="cast", dtype="fp16", shape=(q, plan.index_heads),
                 read_bytes_override=q * plan.index_heads * dtype_bytes(weights_dtype),
-                write_bytes_override=q * plan.index_heads * 2,
+                write_bytes_override=q * plan.index_heads * FP16_BYTES,
                 metadata=(("source_semantics", "quant_indexer_weights_float16"),))
         elif plan.index_kpool > 1:
             if weights_dtype != quant.index_dtype:
@@ -456,7 +491,9 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                     page_size=int(getattr(runtime, "kv_block_size", 0)
                                   or DEFAULT_BLOCK_SIZE),
                     kv_heads=1, query_dtype=model.activation_dtype,
-                    cache_dtype=quant.kv_dtype, weight_dtype="fp32",
+                    # The index cache has its own declared representation; the
+                    # attention KV dtype is a different region of the same case.
+                    cache_dtype=index_cache_dtype(model), weight_dtype="fp32",
                     query_lengths=(view.q_len,), context_lengths=(view.context,),
                     binding_revision=str(getattr(runtime, "vllm_version", "unknown")),
                     runtime_version=str(getattr(runtime, "vllm_version", "unknown")),
@@ -663,7 +700,8 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                           ("attention_traffic_plan", traffic.to_dict()))
                          + rec["selection_metadata"]
                          + attention_tensor_view(plan, view, attn_heads, model, quant,
-                                                 parallel, eff_cp=eff_cp)
+                                                 parallel, eff_cp=eff_cp,
+                                                 machine=machine)
                          + ((("program_kind", "dense_latent_attention_generic"),)
                             if is_generic_decode else ())
                          + ((("latent_attention_schedule", {
@@ -719,7 +757,7 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         if mixed_quant:
             grp_outputs = mixed_quant.module.lower_attention(
                 b.ops, grp_outputs, selection=mixed_quant, views=grp_views, plan=plan,
-                topk_present=bool(topk), prefix=grp_prefix)
+                topk_present=bool(topk), prefix=grp_prefix, parallel=parallel)
         elif not selected:
             from .generic_latent_attention import batch_general_mla_ops, batch_ops
             from .indexed_attention import batch_analytic_ops
