@@ -1941,8 +1941,21 @@ class RecipeBook:
 
 
 class HostStaging:
+    """CPU lookup, host-vector decode and H2D transfer over qualified work keys.
+
+    ``Execution`` binds native roles before constructing ``context.work``, so
+    the binding is read through ``context.resource_names``; the remaining
+    transfer work is preserved for other Engram callers.
+    """
+
     def lower(self, context):
         names, work = context.resource_names, dict(context.work)
+        roles = ("host_memory", "host_vector", "h2d")
+        if any(role not in names for role in roles):
+            raise ModelingError(
+                "host_staging_requires_host_memory_host_vector_h2d_rates")
+        if any(names[role] not in work for role in roles):
+            raise ModelingError("host_staging_requires_bound_host_and_h2d_work")
         memory = {names["host_memory"]: work.pop(names["host_memory"])}
         compute = {names["host_vector"]: work.pop(names["host_vector"])}
         return KernelProgram((

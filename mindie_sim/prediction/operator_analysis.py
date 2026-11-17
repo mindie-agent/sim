@@ -15,9 +15,14 @@ import math
 from mindie_sim.coverage import model_coverage
 
 from .cost import CostModel
+from .analysis_inputs import (
+    FIRST_PARTICIPANT, UNIFORM_COUNT_CARDINALITY,
+    analysis_view, rebind_analysis_requests,
+)
 from .cohort_traffic import bind_cohort_traffic
 from .execution import CollectiveParticipant, Execution
 from .frontend_features import FeatureConfig
+from .local_tp_groups import local_tp_spans_dp
 from .structure import parse_case, parse_model
 from .body_defaults import (TargetGraphSet, TargetOperators, consume_target_declaration,
                             effective_body_declaration)
@@ -98,7 +103,6 @@ def target_operators(case, *, phase, tokens, context=0, sequences=1, scope="body
                      routing_views=None, physical_rank=None, query_position=None,
                      selected_replica=None, cohort=None, pure_model=False,
                      layer_limit=None):
-    from mindie_sim.schema.workload import RequestView
     from .dispatch import cohorts
 
     case = parse_model(case) if pure_model else parse_case(case)
@@ -113,8 +117,8 @@ def target_operators(case, *, phase, tokens, context=0, sequences=1, scope="body
     view_count = (int(sequences) if type(sequences) is int else
                   int(sequences[group.index(selected)]))
     views = tuple(
-        RequestView(
-            f"analysis{index}", tokens, context, scope == "model", phase,
+        analysis_view(
+            case, f"analysis{index}", tokens, context, scope, phase,
             draft_prepare=draft_prepare,
             **_analysis_prefix_fields(case, index, context),
         )
@@ -366,11 +370,12 @@ def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
     views = {}
     for replica in participants:
         count = counts[replica]
-        logical_views[replica] = tuple(RequestView(
-            f"analysis{replica}:{i}", tokens, context, scope == "model",
-            phase, draft_prepare=draft_prepare,
-            **_analysis_prefix_fields(case, i, context),
-        ) for i in range(count))
+        logical_views[replica] = tuple(
+            analysis_view(
+                case, f"analysis{replica}:{i}", tokens, context, scope,
+                phase, draft_prepare=draft_prepare,
+                **_analysis_prefix_fields(case, i, context),
+            ) for i in range(count))
         if count == 0 and pad_idle:
             # A physical graph row is not a logical request.  A zero-length
             # padded view lets GraphPolicy select the declared capture bucket;
@@ -391,7 +396,8 @@ def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
         else:
             views[replica] = logical_views[replica]
     active_rows_by_replica = {
-        replica: sum(v.q_len for v in logical_views[replica])
+        replica: sum(v.q_len + v.draft_proposal_tokens
+                     for v in logical_views[replica])
         for replica in participants
     }
     case = _media_case(case, tuple(v for group in logical_views.values() for v in group),
@@ -420,7 +426,9 @@ def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
         physical_rows = []
         for replica in participants:
             plan = select_sp(
-                case.runtime, case.model, logical_views[replica],
+                case.runtime, case.model,
+                tuple(replace(v, q_len=v.q_len + v.draft_proposal_tokens)
+                      for v in logical_views[replica]),
                 tokens=active_rows_by_replica[replica],
                 global_tokens=total_global)
             if plan is not None:
@@ -433,8 +441,23 @@ def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
             "source_owner", "query_position"))
         for item in (case.runtime.routing.get("realizations") or ()))
     uniform_replicas = (
-        scope != "model"
-        and len(set(counts.values())) <= 1
+        len(set(counts.values())) <= UNIFORM_COUNT_CARDINALITY
+        and (scope != "model" or (
+            case.machine.homogeneous
+            and case.runtime.parallel.rank_table is None
+            and not case.runtime.routing
+            and not case.runtime.kernels.get("force_eplb_source")
+            and not local_tp_spans_dp(case.runtime.parallel)
+            and routing_views is None
+            and query_position is None
+            and all(
+                tuple(replace(v, request_id=base.request_id)
+                      for v, base in zip(
+                          group, views[participants[FIRST_PARTICIPANT]],
+                          strict=True))
+                == views[participants[FIRST_PARTICIPANT]]
+                for group in views.values())
+        ))
         and case.runtime.routing.get("policy") != "balanced"
         and not explicit_routing
         and not any(
@@ -459,11 +482,15 @@ def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
         )
         raw_graphs = {first_r: base_ops}
         for r in participants[1:]:
-            req_ids = tuple(v.request_id for v in views[r])
-            raw_graphs[r] = tuple(
-                replace(op, requests=req_ids) if op.requests else op
-                for op in base_ops
-            )
+            if scope == "model":
+                raw_graphs[r], model_programs[r] = rebind_analysis_requests(
+                    (base_ops, model_programs[first_r]), views[first_r], views[r])
+            else:
+                req_ids = tuple(v.request_id for v in views[r])
+                raw_graphs[r] = tuple(
+                    replace(op, requests=req_ids) if op.requests else op
+                    for op in base_ops
+                )
     else:
         raw_graphs = {
             r: _target_ops(case, group, scope, global_views=global_views,

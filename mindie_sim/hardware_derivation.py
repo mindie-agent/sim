@@ -308,6 +308,14 @@ def derive_hardware_sku(
             assumptions["derivation.mte2_ceiling_bytes_per_s"] = repr(ceiling)
         if "mte2_aic" in rates and "mte2_aiv" in rates:
             rates["mte2"] = min(float(rates["mte2_aic"]), float(rates["mte2_aiv"]))
+        original_hbm = dict(base_hardware.dies[device_index].rates)["hbm"]
+        hbm_scale = float(rates["hbm"]) / float(original_hbm)
+        # A service mode's duration is work / mode_rate.  Scaling only the
+        # underlying HBM resource would leave an explicit mode rate unchanged,
+        # so carry the die's effective bandwidth ratio exactly once.
+        for mode in device.get("service_modes", {}).values():
+            if mode.get("resource") == "hbm" and mode.get("rate") is not None:
+                mode["rate"] = float(mode["rate"]) * hbm_scale
         device["rates"] = rates
         _strip_derived_instruction_rates(device, device_arch, assumptions)
         device["sku"] = sku

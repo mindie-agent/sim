@@ -104,7 +104,8 @@ class HyperConnection:
         )
         project = gemm_op(
             op_id=c["prefix"] + ".hc_project", deps=(values.op_id,), m=tokens, n=mixed, k=hc * h,
-            quant=model.quant, category="mhc", recipe="hc_projection", family="gemm", **common,
+            quant=model.quant, category="mhc", recipe="hc_projection", family="gemm",
+            activation_dtype="fp32", output_dtype="fp32", **common,
         )
         inverse_rms = vector_op(
             op_id=c["prefix"] + ".hc_inv_rms", deps=(values.op_id,),

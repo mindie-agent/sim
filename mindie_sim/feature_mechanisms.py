@@ -41,6 +41,7 @@ PASS_PRIORITY_ORDER: tuple[str, ...] = (
     "residual_norm",
     "mhc_boundary_pr",
     "mhc_boundary_ideal",
+    "indexer_online_topk",
     "qkv_norm_rope",
     "kda_in_kernel_l2norm",
     "gdn_projection_overlap",
@@ -424,6 +425,16 @@ for _item in (
         summary="Fused QKV split + QK RMSNorm + MRoPE single-launch preparation kernel",
         eligible=lambda ctx: any(p.qk_norm for p in ctx.model.layer_plans),
         apply=lambda rt, _ctx: _append_passes(rt, "qkv_norm_rope"),
+    ),
+    OptimizationMechanism(
+        id="indexer_online_ub_topk", category="attention_fusion",
+        phases=("prefill", "decode"),
+        summary="On-chip UB online TopK score reduction eliminating scoreGm HBM round-trip",
+        # Analytical ideal only: a native source binary owns its score
+        # workspace, so this experiment is never installed by a merged/PR
+        # runtime track.
+        eligible=lambda ctx: any(p.index_topk > 0 for p in ctx.model.layer_plans),
+        apply=lambda rt, _ctx: _append_passes(rt, "indexer_online_topk"),
     ),
     OptimizationMechanism(
         id="activation_quant_fusion", category="ffn_fusion", phases=("prefill", "decode"),

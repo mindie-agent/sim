@@ -36,6 +36,7 @@ from .batch_prefix_attention import (
     annotate_sparse_prefix_unknown, apply_attention_prefix_reads,
 )
 from .batch_prefix_indexer import apply_indexer_prefix_reads
+from .generic_latent_attention import index_key_window, visible_parts
 from .sparse_attention import sparse_attention_traffic
 from .structure_groups import declare_group
 
@@ -513,6 +514,7 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         )
         rows_by_view: list[int] = []
         shared_idx_by_view: list[int] = []
+        pairs_by_view: list[int] = []
         for v in views:
             v_ranges = v.query_ranges or ((0, v.q_len),)
             v_scored = int(sum(
@@ -523,10 +525,13 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             ))
             raw_pref = max(0, min(int(getattr(v, "prefix_tokens", 0) or 0), int(v.context)))
             aligned_pref = ((raw_pref // block_size) * block_size) // idx_ratio
-            q_cnt = sum(e_p - s_p for s_p, e_p in v_ranges if e_p > s_p)
-            rows_by_view.append(v_scored)
-            shared_idx_by_view.append(min(v_scored, aligned_pref))
-        scored_rows = sum(rows_by_view)
+            physical_rows, _ = index_key_window(
+                visible_parts(v), noncausal=bool(plan.noncausal_attention),
+                kv_len=v.kv_len, compression=idx_ratio)
+            pairs_by_view.append(v_scored)
+            rows_by_view.append(physical_rows)
+            shared_idx_by_view.append(min(physical_rows, aligned_pref))
+        scored_rows = sum(pairs_by_view)
         idx_wq = gemm_op(
             op_id=prefix + ".index_wq", deps=(deps,), stage=stage, layer=plan.index,
             requests=requests, m=padded_tokens, n=idx_heads * idx_dim, k=model.hidden_size,
@@ -566,8 +571,7 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             pcp_idx_ops = (idx_gather,)
             idx_ready = idx_gather.op_id
         q_idx_bytes = valid * idx_heads * idx_dim * dtype_bytes(quant.index_dtype)
-        unique_idx_rows = sum(
-            max(1, int(v.kv_len) // idx_ratio) for v in views)
+        unique_idx_rows = sum(rows_by_view)
         l2_bounded_index_read = float(min(scored_rows, unique_idx_rows)) * row_bytes
         shape = (scored_rows, idx_heads, idx_dim)
         score_bytes = float(scored_rows * FP32_BYTES)
@@ -586,11 +590,12 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         idx_scores = apply_indexer_prefix_reads(
             idx_scores, views=views, rows_by_view=rows_by_view,
             shared_rows_by_view=shared_idx_by_view, row_bytes=float(row_bytes),
-            layer_index=plan.index, runtime=runtime,
-            kernel_reuse=("batch_tile" if runtime is not None
-                          and runtime.prefix_cache_mode == "shared"
-                          else ("native_per_sequence" if user_pinned_idx else "tile")),
-            allow_recipe_rebind=not user_pinned_idx)
+            layer_index=plan.index, runtime=runtime, compression_ratio=idx_ratio,
+            kernel_reuse=("native_per_sequence"
+                          if user_pinned_idx or plan.candidate_filter else "tile"),
+            allow_recipe_rebind=not user_pinned_idx,
+            hbm_component=l2_bounded_index_read,
+            mte2_component=float(scored_rows) * row_bytes)
         idx_topk = vector_op(
             op_id=prefix + ".index_topk", deps=(idx_scores.op_id,), stage=stage,
             layer=plan.index, requests=requests, elements=scored_rows,

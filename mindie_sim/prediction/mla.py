@@ -457,24 +457,8 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                 topk = quant_indexer.module.declare(
                     b, deps=selection_deps, views=views, plan=plan,
                     quant=quant, parallel=parallel, **quant_indexer.options)
-                if (runtime is not None
-                        and runtime.prefix_cache_mode == "shared"
-                        and b.ops and b.ops[-1].op_id == topk):
-                    from .batch_prefix_indexer import apply_indexer_prefix_reads
-                    ratio = max(1, int(plan.compress_ratio or 1))
-                    row_b = float(index_row_bytes(b.model, plan.index_dim))
-                    logical = tuple(
-                        max(0, int(view.q_len) * min(
-                            max(0, int(view.kv_len) // ratio),
-                            int(plan.index_topk))) for view in views)
-                    shared = tuple(
-                        min(rows, max(0, int(view.context) // ratio))
-                        for rows, view in zip(logical, views))
-                    b.ops[-1] = apply_indexer_prefix_reads(
-                        b.ops[-1], views=views, rows_by_view=logical,
-                        shared_rows_by_view=shared, row_bytes=row_b,
-                        layer_index=plan.index, runtime=runtime,
-                        kernel_reuse="batch_tile", allow_recipe_rebind=False)
+                # This explicit arch22 source owns its per-query key/scale
+                # ledger. Shared capacity does not establish batch read reuse.
             elif (bf16_indexer is not None and len(views) == 1
                   and parallel.cp == 1 and not plan.candidate_filter):
                 from . import family_lightning_indexer as li

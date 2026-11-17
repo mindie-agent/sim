@@ -376,6 +376,11 @@ def _normal_source_metadata(model: Any, runtime: Any = None) -> dict[str, Any]:
 
 def _runtime_metadata(runtime: Any, machine: Any = None, model: Any = None) -> tuple:
     meta = dict(getattr(runtime, "metadata", ()) or ())
+    dspark = getattr(runtime, "dspark", None)
+    if dspark is not None:
+        # A directly supplied block-drafter specification is the declared
+        # speculative width; an explicit metadata entry keeps precedence.
+        meta.setdefault("draft_proposal_tokens", dspark.draft_len)
     meta.update(_identity_metadata(machine, model))
     meta.update(_model_source_metadata(model))
     _normal = _normal_source_metadata(model, runtime)

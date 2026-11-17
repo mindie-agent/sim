@@ -29,6 +29,8 @@ from .implementations import rewire_replacements
 
 MHC_DEFAULT_CUTOFF_ROWS = 72
 NO_PORTS: dict = {}
+COEFFICIENT_FUSION_RECIPE = "hc_coefficients_fused"
+COEFFICIENT_FUSION_DTYPE = "fp32"
 
 
 def users_map(ops):
@@ -69,7 +71,9 @@ def mhc_boundary_fusion_overlap(ops, source_dtype, *, max_rows=0,
        * Coefficient chain ``hc_values_fp32 -> hc_project -> hc_inv_rms ->
          hc_affine -> hc_sinkhorn`` depends on ``R_k`` (not blocking Attention
          or MoE) and executes on ``stream="mhc_aux"`` when graph-captured,
-         joining at the sublayer's ``hc_post_mix``.
+         joining at the sublayer's ``hc_post_mix``.  When ``max_rows == 0`` the
+         closed chain collapses into one resident ``hc_coefficients_fused``
+         call, removing only its internal HBM round-trip and its extra launches.
     2) ``LowRankHyperConnection`` (``hc_lowrank_down_inject -> hc_silu -> hc_up``):
        * ``hc_gate_mix`` consumes gate columns from ``hc_lowrank_down_inject``
          directly so Attention/MoE starts immediately on ``main``, while
@@ -183,6 +187,62 @@ def mhc_boundary_fusion_overlap(ops, source_dtype, *, max_rows=0,
                 replacements[norm_op.op_id] = fused
                 removed.add(op.op_id)
                 aliases[op.op_id] = norm_op.op_id
+
+            if max_rows == 0:
+                coeff_ops = (vals, proj, inv_rms, affine, sinkhorn)
+                vals_users = set(users[vals.op_id])
+                if (vals_users <= {proj.op_id, inv_rms.op_id}
+                        and {proj.op_id, inv_rms.op_id} <= vals_users
+                        and users[proj.op_id] == [affine.op_id]
+                        and users[inv_rms.op_id] == [affine.op_id]
+                        and users[affine.op_id] == [sinkhorn.op_id]
+                        and not any(item.plan_required or item.op_id in removed
+                                    for item in coeff_ops)):
+                    # One resident coefficient region: the only removable
+                    # traffic is the internal 3V + 2P + 2R + 2A round-trip.
+                    proj_weight_bytes = max(
+                        0.0, float(proj.mte2_bytes) - float(vals.mte3_bytes))
+                    affine_param_bytes = max(
+                        0.0, float(affine.mte2_bytes) - float(proj.mte3_bytes)
+                        - float(inv_rms.mte3_bytes))
+                    coeff_read = (float(vals.mte2_bytes) + proj_weight_bytes
+                                  + affine_param_bytes)
+                    coeff_write = float(sinkhorn.mte3_bytes)
+                    fused_coeff = replace(
+                        sinkhorn,
+                        deps=vals.deps,
+                        stream=coeff_stream,
+                        family=proj.family,
+                        recipe=COEFFICIENT_FUSION_RECIPE,
+                        dtype=COEFFICIENT_FUSION_DTYPE,
+                        returns=sinkhorn.returns,
+                        # The resident region keeps the projection's declared
+                        # matrix geometry; only its internal round-trips vanish.
+                        semantic_shape=proj.semantic_shape,
+                        local_shape=proj.local_shape,
+                        padded_shape=proj.padded_shape,
+                        launch_shape=proj.launch_shape,
+                        layout=proj.layout,
+                        flops=sum(float(item.flops) for item in coeff_ops),
+                        matrix_flops=proj.matrix_flops,
+                        vector_ops=sum(float(item.vector_ops)
+                                       for item in coeff_ops),
+                        mte2_bytes=coeff_read,
+                        mte3_bytes=coeff_write,
+                        hbm_bytes=coeff_read + coeff_write,
+                        metadata=merge_meta(*coeff_ops, extra=(
+                            ("fused_from", (
+                                "hc_values_fp32", "hc_projection",
+                                "hc_inverse_rms", "hc_normalize_scale_bias_gate",
+                                "hc_sinkhorn")),
+                            ("mhc_coefficients_resident_region", True),
+                            ("mhc_coeff_stream", coeff_stream or "main"),
+                        )),
+                    )
+                    replacements[sinkhorn.op_id] = fused_coeff
+                    for item in (vals, proj, inv_rms, affine):
+                        removed.add(item.op_id)
+                        aliases[item.op_id] = sinkhorn.op_id
 
         # Branch B: Qwen4Exp LowRankHyperConnection (PR #20824 + boundary norm fusion)
         elif op.recipe == "hc_gate_mix" and len(op.deps) == 2:
