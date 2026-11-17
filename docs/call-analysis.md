@@ -20,7 +20,7 @@ The public `CALL_BUILDERS` registry resolves a structural builder. A new family
 does not require another engine or model-name timing branch. `activation`
 provides five API compositions; `gdn` provides FP32 gating and BF16 native
 convolution prefill. See the detailed
-[activation](operators/historical-activation-calls.md) and
+[activation](archive/operators/historical-activation-calls.md) and
 [GDN](operators/gdn-call-boundaries.md) contracts.
 
 ```python

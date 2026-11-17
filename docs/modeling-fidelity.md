@@ -220,4 +220,4 @@ explicit source/recipe identity is known, so an existing typed or calibrated
 implementation keeps its declared compute identity. Exposed-time attribution is
 a realized-schedule decomposition, not a speedup prediction; `exposed_breakdown`
 does not replace MBU/MFU or isolated operator latency. See
-[`issue34-features.md`](issue34-features.md).
+[`issue34-features.md`](archive/issue34-features.md).
