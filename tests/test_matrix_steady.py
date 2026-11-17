@@ -150,7 +150,11 @@ def test_external_cube_work_slows_only_its_owner_and_preserves_all_traffic():
     stores = []
     for external in (False, True):
         engine, context = _owned_context(2)
-        done = SteadyMatmul(((4, 2, 2),), 2, 2).lower(context).start(
+        # The detailed per-owner path is the explicit subject here: symmetric
+        # owner cohorts (the production default) intentionally share external
+        # contention, so asymmetric slowdown is certified on the unmerged path.
+        done = SteadyMatmul(
+            ((4, 2, 2),), 2, 2, owner_cohorts=False).lower(context).start(
             engine, "matrix", engine.submit("ready"))
         events = [done]
         if external:

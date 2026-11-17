@@ -384,7 +384,10 @@ class ComputeArchSpec:
         if preset_name:
             if preset_name not in CAPABILITY_PRESETS:
                 raise ModelingError(f"compute_arch_preset_unknown:{preset_name}")
-            base = deepcopy(CAPABILITY_PRESETS[preset_name])
+            # The preset is an immutable module constant; the parser only
+            # reads it and builds fresh mappings, so a shallow projection is
+            # enough and avoids copying the whole capability tree per parse.
+            base = CAPABILITY_PRESETS[preset_name]
             effective = {**base, **declared}
             for key in _CAPABILITY_MAP_FIELDS:
                 if key in base and key in declared:

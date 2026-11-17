@@ -7,8 +7,6 @@
 [Timeouts & Locks] Bounded metadata arithmetic; no waits or locks.
 [Side-Effect Policy] Returns new mappings without changing caller inputs.
 """
-from copy import deepcopy
-
 
 _MAP_FIELDS = (
     "compute_peaks", "rates", "buffers", "resource_units", "buffer_units",
@@ -48,7 +46,11 @@ def machine_device_defaults(raw):
 
 
 def _normalize(raw):
-    data = deepcopy(raw)
+    # Only top-level keys are rewritten; nested declarations are read and
+    # replaced by fresh merged mappings below.  A shallow copy therefore keeps
+    # the caller's declaration immutable without deep-copying every nested
+    # capability preset on each placement layer.
+    data = dict(raw)
     # Architecture synonyms are resolved once per declaration layer. The
     # original same-layer priority is architecture > arch_family; the canonical
     # field is arch_family so a later layer can override an earlier identity.

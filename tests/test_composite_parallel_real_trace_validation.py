@@ -41,7 +41,7 @@ from mindie_sim.prediction.efficiency import (
 from mindie_sim.prediction.scheduler import DraftPolicy
 from mindie_sim.prediction.structure import parse_case
 
-REL_TOL = 0.15
+REL_TOL = 0.10
 ROOT = Path(__file__).resolve().parents[1]
 VERIFICATION = ROOT / "data/verification/decode-body-current-20261030.json"
 CASE_ROOT = ROOT / "examples/cases/high-concurrency-20261030"

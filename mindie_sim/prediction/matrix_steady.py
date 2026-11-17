@@ -57,7 +57,7 @@ class SteadyMatmul(MappedMatmul):
     #: demand, completion time and allocation accounting are the per-owner
     #: values; only task count falls.  ``False`` keeps the detailed per-owner
     #: programs, including asymmetric external contention between owners.
-    owner_cohorts: bool = False
+    owner_cohorts: bool = True
 
     def lower(self, context, *, mapping=None, owner_tiles=None, group_rows=None,
               output=None, directional_mte1=False):
@@ -65,13 +65,16 @@ class SteadyMatmul(MappedMatmul):
                                      owner_records)
         owner_tiles = (freeze_owner_tiles(owner_tiles)
                        if owner_tiles is not None else None)
+        include_record = context.record_mapping is not None
         if mapping is None:
-            recipe, record = self.select(context)
+            recipe, record = self.select(context,
+                                         include_record=include_record)
         else:
-            recipe, record = mapping, {
+            recipe = mapping
+            record = ({
                 "basis": "declared_source_owner_mapping", "selected": asdict(mapping),
                 "shape": list(context.op.local_shape[-3:]),
-            }
+            } if include_record else None)
         if owner_tiles is not None:
             sources = [tuple(tiles) for _, tiles in owner_tiles]
             explicit = owner_records(owner_tiles)
@@ -86,29 +89,31 @@ class SteadyMatmul(MappedMatmul):
             explicit = None
         geometry = matrix_geometry(
             context, recipe, owners=explicit, group_rows=group_rows)
-        record.update({
-            "execution_abstraction": "closed_form_k_pipeline",
-            "overlap": "finite_K_micro_recurrence; inter_output_tiles_serial_per_owner",
-            "contention": "dominant_resource_fair_coupled_fluid_progress",
-            "buffer_model": "finite_selected_tile_reservation",
-            "output_tile_execution": ("coupled_owner_run" if self.compact_output_tiles
-                                      else "individual_serial_tiles"),
-            "geometry": geometry.to_dict(),
-        })
+        if include_record:
+            record.update({
+                "execution_abstraction": "closed_form_k_pipeline",
+                "overlap": "finite_K_micro_recurrence; inter_output_tiles_serial_per_owner",
+                "contention": "dominant_resource_fair_coupled_fluid_progress",
+                "buffer_model": "finite_selected_tile_reservation",
+                "output_tile_execution": ("coupled_owner_run" if self.compact_output_tiles
+                                          else "individual_serial_tiles"),
+                "geometry": geometry.to_dict(),
+            })
         if (getattr(recipe, "k_splits", DEFAULT_SPLIT_K) > DEFAULT_SPLIT_K
                 and "mte2_aic_dram" in context.service_modes):
-            record.update({
-                "execution_abstraction": "finite_split_k",
-                "split_k": recipe.k_splits,
-                "partial_policy": "explicit_gm_fp32_partials_then_vector_merge",
-            })
+            if include_record:
+                record.update({
+                    "execution_abstraction": "finite_split_k",
+                    "split_k": recipe.k_splits,
+                    "partial_policy": "explicit_gm_fp32_partials_then_vector_merge",
+                })
             from .matrix_splitk import splitk_program
             program = splitk_program(context, recipe.k_splits, recipe=recipe,
                                      geometry=geometry, record=record)
-            if context.record_mapping is not None:
+            if include_record:
                 context.record_mapping(record)
             return program
-        if context.record_mapping is not None:
+        if include_record:
             context.record_mapping(record)
         op, names = context.op, context.resource_names
         total_m, n, k = geometry.local_shape

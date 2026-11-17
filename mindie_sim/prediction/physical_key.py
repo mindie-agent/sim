@@ -220,8 +220,33 @@ def operator_metadata_key(metadata: Any, stage: int, layer: int) -> tuple:
     return value
 
 
+def _memoized_attribute(op: Any, name: str) -> Any:
+    """Read one instance-local memo, ignoring duck-typed objects that reject it."""
+    try:
+        return getattr(op, name, None)
+    except AttributeError:
+        return None
+
+
+def _store_attribute(op: Any, name: str, value: Any) -> None:
+    """Attach an immutable memo to one frozen occurrence, best effort."""
+    try:
+        object.__setattr__(op, name, value)
+    except (AttributeError, TypeError):
+        pass
+
+
 def physical_key(op: Any) -> tuple:
-    """Typed immutable physical identity of one operator occurrence."""
+    """Typed immutable physical identity of one operator occurrence.
+
+    ``OpSpec`` is frozen: its declared work and implementation cannot change
+    for the lifetime of the instance.  The projection is therefore memoized on
+    the occurrence itself instead of being rebuilt for every reader (graph
+    execution, isolated pricing and post-processing all ask repeatedly).
+    """
+    cached = _memoized_attribute(op, "_cached_physical_key")
+    if cached is not None:
+        return cached
     key = [IDENTITY_VERSION]
     for field in IDENTITY_FIELDS:
         key.append(getattr(op, field, None))
@@ -234,7 +259,9 @@ def physical_key(op: Any) -> tuple:
             for name, value in op.matrix_flops))))
     key.append(operator_metadata_key(
         getattr(op, "metadata", ()), int(op.stage), int(op.layer)))
-    return tuple(key)
+    key = tuple(key)
+    _store_attribute(op, "_cached_physical_key", key)
+    return key
 
 
 def canonical_json(key: Any) -> str:
@@ -247,12 +274,21 @@ _SIGNATURE_MEMO_LIMIT = 4096
 
 
 def physical_signature(op: Any) -> str:
-    """Deterministic serialization of the physical key (identity-guarded memo)."""
+    """Deterministic serialization of the physical key.
+
+    The signature is memoized on the frozen occurrence.  A short process-local
+    identity memo still covers duck-typed declarations that cannot carry an
+    instance attribute; an identity mismatch never serves a stale signature.
+    """
+    cached = _memoized_attribute(op, "_cached_physical_sig")
+    if cached is not None:
+        return cached
     identity = id(op)
     hit = _SIGNATURE_MEMO.get(identity)
     if hit is not None and hit[0] is op:
         return hit[1]
     value = canonical_json(physical_key(op))
+    _store_attribute(op, "_cached_physical_sig", value)
     if len(_SIGNATURE_MEMO) >= _SIGNATURE_MEMO_LIMIT:
         _SIGNATURE_MEMO.clear()
     _SIGNATURE_MEMO[identity] = (op, value)

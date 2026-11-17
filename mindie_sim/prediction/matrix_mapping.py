@@ -598,7 +598,13 @@ class MappedMatmul:
     narrow_candidates: tuple | None = None
     underfilled_candidates: tuple | None = None
 
-    def select(self, context):
+    def select(self, context, *, include_record: bool = True):
+        """Select the declared tile mapping and its explanatory record.
+
+        ``include_record=False`` skips the defensive record copy on the hot
+        steady path (a caller that has no mapping observer).  Selection itself
+        is identical: the same cached recipe object is returned either way.
+        """
         cache_key = (
             _matmul_recipe_key(self), _op_matrix_key(context.op), context.core_count,
             tuple(sorted(context.resource_names.items())),
@@ -610,7 +616,7 @@ class MappedMatmul:
         )
         if cache_key in _SELECT_CACHE:
             recipe, record = _SELECT_CACHE[cache_key]
-            return recipe, deepcopy(record)
+            return recipe, (deepcopy(record) if include_record else None)
         records = []
         selected = None
         selected_geometry = None
@@ -625,10 +631,16 @@ class MappedMatmul:
         a5_l2_supply = (
             float(context.rates.get("mte2_aic", 0)) >= A5_L2_MTE2_RATE
             or float(context.compute_peaks.get("bf16", 0)) >= A5_BF16_PEAK_FLOOR)
-        automatic_subtiles = a5_l2_supply and (
-            self.candidates is None
-            or m < context.core_count * REFILL_M
-            or default_grid < context.core_count)
+        # FP32 has no packed L2 supply path: a single 128x128 tile would leave
+        # 23 of 24 AIC owners idle on a tall projection (e.g. hc_projection
+        # [M, 32, 7168]), so fp32 always screens the declared sub-tiles even
+        # when the A5 L2/bf16 supply heuristic does not fire.
+        fp32_subtiles = self.candidates is None and compute_format == "fp32"
+        automatic_subtiles = fp32_subtiles or (
+            a5_l2_supply and (
+                self.candidates is None
+                or m < context.core_count * REFILL_M
+                or default_grid < context.core_count))
         narrow = (NARROW_CANDIDATES if automatic_subtiles else ()
                   ) if self.narrow_candidates is None else self.narrow_candidates
         narrow = narrow if n <= MIN_NARROW_N else ()
@@ -718,7 +730,7 @@ class MappedMatmul:
         if len(_SELECT_CACHE) >= 1024:
             _SELECT_CACHE.pop(next(iter(_SELECT_CACHE)))
         _SELECT_CACHE[cache_key] = res
-        return res[0], deepcopy(res[1])
+        return res[0], (deepcopy(res[1]) if include_record else None)
 
     def lower(self, context):
         recipe, record = self.select(context)

@@ -572,7 +572,7 @@ def _critical_path_work(graph_report: Mapping[str, Any], operator_rows: Sequence
             "interpretation": "dependency_path_over_work_not_a_wall_clock_saving"}
 
 
-def attribute_program(graph_report: Mapping[str, Any] | None, operator_rows: Sequence[Mapping[str, Any]] | None = None) -> dict[str, Any]:
+def attribute_program(graph_report: Mapping[str, Any] | None, operator_rows: Sequence[Mapping[str, Any]] | None = None, *, occurrence_graph: Any | None = None) -> dict[str, Any]:
     """Separate isolated work, active presence, per-resource busy, span and work path.
 
     Ready-to-complete intervals prove an operator is in flight; they do not prove
@@ -633,7 +633,8 @@ def attribute_program(graph_report: Mapping[str, Any] | None, operator_rows: Seq
             group["max_busy_share_of_span"] = max(group["max_busy_share_of_span"], busy / span)
     resources.sort(key=lambda row: row["capacity_bound_ms"], reverse=True)
     utilization = {role: row["max_busy_share_of_span"] for role, row in sorted(by_role.items())}
-    occurrence_graph = occurrence_work_graph(graph_report, operator_rows)
+    if occurrence_graph is None:
+        occurrence_graph = occurrence_work_graph(graph_report, operator_rows)
     stage_clock = None
     if occurrence_graph is not None:
         stage_clock = dict(attribute_stage_dag(
@@ -984,7 +985,8 @@ def occurrence_work_graph(graph_report: Mapping[str, Any] | None,
 
 
 def occurrence_critical_path(graph_report: Mapping[str, Any] | None,
-                            operator_rows: Sequence[Mapping[str, Any]]
+                            operator_rows: Sequence[Mapping[str, Any]],
+                            *, graph: Any | None = None
                             ) -> dict[str, Any] | None:
     """Critical-path roofline over actual timeline occurrences, never grouped rows.
 
@@ -992,7 +994,8 @@ def occurrence_critical_path(graph_report: Mapping[str, Any] | None,
     realized data/stream/state/rendezvous predecessor edges.  Occurrences are
     never deduplicated: repeated layers keep their full multiplicity.
     """
-    graph = occurrence_work_graph(graph_report, operator_rows)
+    if graph is None:
+        graph = occurrence_work_graph(graph_report, operator_rows)
     if graph is None:
         return None
     roofline = critical_path_roofline(
@@ -1084,8 +1087,11 @@ def analyze_network_efficiency(
         bound_g[x["dominant_bound"]].append(x)
         kind_g[x["operator_kind"]].append(x)
 
-    attribution = attribute_program(graph_report, analyzed_ops)
-    occurrence_roofline = occurrence_critical_path(graph_report, analyzed_ops)
+    occurrence_graph = occurrence_work_graph(graph_report, analyzed_ops)
+    attribution = attribute_program(
+        graph_report, analyzed_ops, occurrence_graph=occurrence_graph)
+    occurrence_roofline = occurrence_critical_path(
+        graph_report, analyzed_ops, graph=occurrence_graph)
     if occurrence_roofline is not None:
         tot_roof_id = max(tot_roof_id,
                           occurrence_roofline["critical_path_ideal_ms"])
