@@ -333,7 +333,7 @@ Node-local dense projection TP, physical expert-slot residency, shared prefix
 pooling/read reuse, pure hardware derivation, indexed recurrent templates,
 proved homogeneous graph reuse and exposed-time attribution extend the same
 schema, Frontend DAG, Engine and Memory ledger. See
-[`issue34-features.md`](issue34-features.md) for canonical fields, units,
+[`issue34-features.md`](archive/issue34-features.md) for canonical fields, units,
 physical assumptions and compatibility rules. Placement roles are structural
 annotations shared by graph and weight geometry; they never branch on vendor,
 model or op-id text.
