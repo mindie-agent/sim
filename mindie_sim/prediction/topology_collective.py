@@ -117,7 +117,11 @@ def _lower_mesh(context, plan):
 
 
 def _with_setup(context, phases):
-    program = phased_program(context, phases)
+    # The setup stage is part of the invocation, so the outer program owns the
+    # inclusive floor. Keep the nested body floor-free: charging it again after
+    # setup would add setup_ms to the declared completion response.
+    program = phased_program(
+        context, phases, minimum_ms=0.0 if context.setup_ms > 0.0 else None)
     if context.setup_ms > 0.0:
         return KernelProgram((
             Stage("setup", latency=context.setup_ms),
