@@ -99,13 +99,16 @@ def test_model_scope_and_body_optout_retain_detailed_control_and_semantic_work()
     model_costs = operator_costs(raw, model)
     assert all(row["program"] == "SteadyMatmul" for row in model_costs["operators"]
                if row["operator"]["family"] in MATRIX_FAMILIES)
-    # The explicit opt-out keeps the detailed per-tile control path available.
-    raw_model = target_graphs(raw, apply_body_defaults=False, **options)
-    assert "programs" not in raw_model.effective_kernels
-    raw_costs = operator_costs(raw, raw_model)
+    # Detailed control is an explicit recipe, independent of default injection.
+    control = deepcopy(raw)
+    control["runtime"]["kernels"] = {
+        "programs": {"matmul": {"kind": "tiled_matmul"}}}
+    raw_model = target_graphs(control, apply_body_defaults=False, **options)
+    assert raw_model.effective_kernels["programs"]["matmul"]["kind"] == "tiled_matmul"
+    raw_costs = operator_costs(control, raw_model)
     assert all(row["program"] == "TiledMatmul" for row in raw_costs["operators"]
                if row["operator"]["family"] in MATRIX_FAMILIES)
-    generic = target_graphs(raw, apply_body_defaults=False, **GEOMETRY)
+    generic = target_graphs(control, apply_body_defaults=False, **GEOMETRY)
     compact = target_graphs(raw, **GEOMETRY)
     assert {r: tuple(op for op in v if op.family in MATRIX_FAMILIES)
             for r, v in compact.items()} == {
@@ -113,7 +116,7 @@ def test_model_scope_and_body_optout_retain_detailed_control_and_semantic_work()
                 for r, v in generic.items()}
     # The choice changes physical scheduling; tensor geometry and logical work
     # remain identical, and the public opt-out continues to execute detailed.
-    graph = graph_costs(raw, generic, isolated=False, external_inputs={"analysis_input": 0})
+    graph = graph_costs(control, generic, isolated=False, external_inputs={"analysis_input": 0})
     assert all(row["program"] == "TiledMatmul" for row in matrix_rows(graph))
 
 

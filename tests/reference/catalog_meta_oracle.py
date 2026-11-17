@@ -371,6 +371,9 @@ def _ffn_entries(out, model, layer) -> None:
     _add(out, "expert_down", expert_out, layer.moe_i, layer.experts)
     if layer.router_copy:
         _add(out, "router_precast", layer.experts, h, owner="runtime")
+    if layer.router_bias:
+        # noaux_tc: one FP32 correction bias per routed expert per MoE layer.
+        _add(out, "router_correction_bias", layer.experts, 1)
     if layer.latent:
         _add(out, "latent_down", layer.latent, h)
         _add(out, "latent_norm", layer.latent, 1)

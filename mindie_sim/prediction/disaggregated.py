@@ -24,6 +24,10 @@ from .pd_connector import PDConnector, PDHandoff, PDTransfer
 from .scheduler import Scheduler
 from .structure import parse_case
 from mindie_sim.schema.common import ModelingError
+
+#: Bounded default diagnostic trace sizes for the direct PD entry.
+DEFAULT_PD_TRACE_LIMIT = 2
+DEFAULT_PD_EVENT_LIMIT = 256
 from mindie_sim.catalog.cache import layer_cache_components
 from mindie_sim.coverage import combine_coverage
 
@@ -481,8 +485,12 @@ def _register_consumer_release(engine, request, releases, device_complete,
 
 
 def predict_pd(raw, *, primitives=None, recipes=None, submission=None, memory_policy=None,
-               lower=None, trace_limit=2, event_limit=256, scope="serving", phase=None,
+               lower=None, trace_limit=DEFAULT_PD_TRACE_LIMIT,
+               event_limit=DEFAULT_PD_EVENT_LIMIT, scope="serving", phase=None,
                tokens=None, context=None, sequences=None, published=None):
+    # The direct PD entry enforces the same structural timing gate as predict.
+    from .unmodeled_gate import assert_timing_supported
+    assert_timing_supported(raw, entry="predict")
     if scope == "body":
         from .api import predict
         return predict(raw, scope=scope, phase=phase, tokens=tokens, context=context,

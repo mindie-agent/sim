@@ -221,8 +221,20 @@ class LayerPlan:
     candidate_topk_blocks: int = 0
     qk_norm: bool = False
     ffn_activation: str = "silu"
+    #: Declared clamp on the gated FFN operands (0 keeps the unclamped form).
+    #: ``swigluoai`` is the sigmoid gate with alpha/beta; plain ``silu`` with a
+    #: positive limit keeps alpha=1, beta=0 rather than becoming OAI.
+    swiglu_limit: float = 0.0
+    swiglu_shared_limit: float = 0.0
+    swiglu_alpha: float = 1.0
+    swiglu_beta: float = 0.0
     activation_situ_beta: float = 1.0
     activation_situ_linear_beta: float | None = None
+    #: Routed-weight scale applied after selection (1.0 keeps the raw weights).
+    routed_scaling_factor: float = 1.0
+    #: DeepSeek-style noaux_tc router: sigmoid scores, an FP32 correction bias,
+    #: group score Top2, group TopK, mask and unbiased weight gather.
+    router_noaux_tc: bool = False
     k_eq_v: bool = False
 
     def __post_init__(self) -> None:

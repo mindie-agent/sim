@@ -245,10 +245,10 @@ class QuantSpec:
         if mx_scale and wf in {"mxfp8", "mx_fp8", "mxfp8_e4m3", "fp8_e4m3", "fp8_e5m2"} and af in {
                 "mxfp8", "mx_fp8", "mxfp8_e4m3", "fp8_e4m3", "fp8_e5m2"}:
             return "mx_fp8"
+        if wf in {"int4", "w4a8", "int4_weight"}:
+            return "w4a8" if af == "int8" else "w4a16"
         if wf in {"int8", "w8a8"} or af in {"int8"}:
             return "w8a8"
-        if wf in {"int4", "w4a8", "int4_weight"}:
-            return "w4a8"
         return "fp8" if wf in {"fp8", "fp8_e4m3", "fp8_e5m2"} else "dense"
 
     def output_format_for(self, category: str, default: str = "", *, prequant: str = "") -> str:

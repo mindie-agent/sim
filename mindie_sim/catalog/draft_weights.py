@@ -139,6 +139,11 @@ def _draft_ffn_terms(
                "dspark_routed_expert", "expert_gate_up", count=draft.num_experts),
             _t("draft_expert_down", h, draft.expert_intermediate_size,
                "dspark_routed_expert", "expert_down", count=draft.num_experts),
+            # The draft MoE router inherits the target noaux_tc correction
+            # bias, one FP32 parameter per expert per draft layer.
+            *([_t("draft_router_correction_bias", draft.num_experts, ONE,
+                  "param_fp32")]
+              if any(plan.router_noaux_tc for plan in model.layer_plans) else []),
         ])
         if draft.num_shared_experts:
             shared_i = draft.expert_intermediate_size * draft.num_shared_experts

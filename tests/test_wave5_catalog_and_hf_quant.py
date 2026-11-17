@@ -45,10 +45,15 @@ def test_wave5_catalog_entries_and_aliases_load_complete_with_positive_weights(k
     spec = load_model(key)
     cov = model_coverage(spec)
     assert not any(f.startswith("unrecognized_config_field:") for f in cov["unmodeled_features"])
-    if key in {
-        "deepseek-v3.2-prune-3l", "deepseek-v3", "deepseek-r1", "deepseek-v3.2",
-        "kimi-k2", "kimi-k2-thinking", "kimi-k2.5", "qwen3-next-80b-a3b", "qwen3.5-397b-a17b",
-    }:
+    # ``noaux_tc`` routing, the routed scale and exact per-layer partial-RoPE
+    # widths are declared mechanisms now; these entries have no remaining gap.
+    complete_after_a4 = {"deepseek-v3.2-prune-3l", "qwen3-next-80b-a3b",
+                         "qwen3.5-397b-a17b"}
+    partial = {
+        "deepseek-v3", "deepseek-r1", "deepseek-v3.2",
+        "kimi-k2", "kimi-k2-thinking", "kimi-k2.5",
+    } - complete_after_a4
+    if key in partial:
         assert cov["model_coverage"] == "partial"
     else:
         assert cov["model_coverage"] == "complete", f"{key} had unmodeled gaps: {cov}"

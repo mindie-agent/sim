@@ -70,7 +70,8 @@ def generic_plans(c):
     sparse = c.get("sparse_attention_config") or {}
     for index, original_kind in enumerate(schedule):
         kind = {"full_attention": "gqa", "mha": "gqa", "mqa": "gqa",
-                "sliding_attention": "gqa"}.get(str(original_kind), str(original_kind))
+                "sliding_attention": "gqa", "dit_full_attention": "gqa"}.get(
+                    str(original_kind), str(original_kind))
         moe = bool(experts and index >= first and index % freq == 0
                    and index not in dense_layers
                    and (moe_layers is None or index in moe_layers))
@@ -92,6 +93,9 @@ def generic_plans(c):
             window=int(c.get("sliding_window") or 0)
             if original_kind == "sliding_attention" or c.get("model_type") == "mistral" else 0,
         )
+        if original_kind == "dit_full_attention":
+            fields.update(noncausal_attention=True, cache_kind="none",
+                          owns_long_kv=False)
         if kind == "mla":
             fields.update(
                 q_lora_rank=int(c.get("q_lora_rank") or 0),

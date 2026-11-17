@@ -15,6 +15,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from mindie_sim.prediction.evaluation import ACTIVE_DEADLINE_MONO
+from mindie_sim.public.errors import UnmodeledCapabilityError
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.parallel import ParallelSpec
 from mindie_sim.sweep_checkpoint import STAGE_FULL, write_checkpoint_row
@@ -163,6 +164,8 @@ def evaluate_finalists(items, *, finalist_top_k, cache, stream, full_row_fn,
             if progress_callback is not None:
                 progress_callback(row)
             yield row
+        except UnmodeledCapabilityError:
+            raise
         except (ModelingError, ValueError) as exc:
             row = static_row(common, reason=str(exc), kind="topology",
                              elapsed_ms=0.0)

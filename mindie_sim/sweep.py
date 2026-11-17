@@ -37,6 +37,7 @@ from mindie_sim.prediction.evaluation import (
 )
 from mindie_sim.prediction.local_tp_groups import local_tp_spans_dp
 from mindie_sim.prediction.structure import parse_case
+from mindie_sim.public.errors import UnmodeledCapabilityError
 from mindie_sim.schema.case import Case as CaseSpec
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.hardware import Hardware
@@ -206,6 +207,8 @@ def sweep_topologies_iter(
         raise ValueError("finalist_top_k_must_be_positive")
     if lock_program and not lock_parallel:
         raise ModelingError(LOCKED_PROGRAM_ERROR)
+    from mindie_sim.prediction.unmodeled_gate import assert_timing_supported
+    assert_timing_supported(case, entry="sweep_topologies")
     owns_finalists = (two_stage and finalist_top_k is not None
                       and _finalist_sink is None)
     finalist_sink = [] if owns_finalists else _finalist_sink
@@ -485,6 +488,10 @@ def _sweep_one_device_count(parsed, cache, *, devices, candidates, sla_ms,
                             emit_tokens=base_emit,
                             output_budget=output_budget,
                             max_sequences_per_dp=max_sequences_per_dp)
+                    except UnmodeledCapabilityError:
+                        # A core hole is a refused capability, never a rejected
+                        # or infeasible topology candidate.
+                        raise
                     except (ModelingError, ValueError) as exc:
                         cache.static_topology_rejections += 1
                         row = static_row(
@@ -583,6 +590,8 @@ def _sweep_one_device_count(parsed, cache, *, devices, candidates, sla_ms,
                 if progress_callback is not None:
                     progress_callback(row)
                 yield row
+            except UnmodeledCapabilityError:
+                raise
             except (ModelingError, ValueError) as exc:
                 row = static_row(
                     common, reason=str(exc), kind="topology",

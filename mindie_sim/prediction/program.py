@@ -1507,7 +1507,6 @@ class RecipeBook:
     def __init__(self, recipes: Mapping[str, Recipe] | None = None,
                  *, families: Mapping[str, Recipe] | None = None, default: Recipe | None = None,
                  programs: Mapping[str, Recipe] | None = None):
-        from .matrix import TiledMatmul
         from .matrix_mapping import MappedMatmul
         from .matrix_steady import SteadyMatmul
         from .state_program import RecurrentVector
@@ -1544,7 +1543,7 @@ class RecipeBook:
             "grouped_gemm": (programs or {}).get("matmul", SteadyMatmul()),
             **(families or {}),
         }
-        self.programs = {"matmul": TiledMatmul(128, 128),
+        self.programs = {"matmul": SteadyMatmul(),
                          "dense_latent_attention": _PlannedRecipe(_generic_latent_build),
                          **(programs or {})}
         self.default = default

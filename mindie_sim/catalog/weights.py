@@ -454,6 +454,10 @@ def _ffn_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
         _t("expert_down", expert_output, plan.moe_intermediate_size,
            "routed_expert", "expert_down", count=plan.num_experts),
     ])
+    if plan.router_noaux_tc:
+        # The noaux_tc correction bias is an FP32 parameter of every MoE layer,
+        # including draft layers; it is read once per routing invocation.
+        terms.append(_t("router_correction_bias", plan.num_experts, ONE, "param_fp32"))
     if plan.router_precast_weight_copy and plan.router_dtype:
         terms.append(replace(
             _t("router_precast", plan.num_experts, plan.router_input_size or h, "router"),

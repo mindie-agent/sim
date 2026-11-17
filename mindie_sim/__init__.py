@@ -11,6 +11,7 @@ from .schema.hardware import Hardware, Device, Link
 from .schema.model import ModelSpec, LayerPlan, RequestSpec, WorkloadSpec, SloSpec
 from .schema.parallel import ParallelSpec
 from .schema.common import ModelingError
+from .public.errors import CapabilityGap, UnmodeledCapabilityError
 from .prediction.api import predict
 from .prediction.disaggregated import predict_pd
 from .prediction.graph_analysis import graph_costs
@@ -98,6 +99,7 @@ from .public import (
 __version__ = "0.9.18"
 __all__ = [
     "observations",
+    "CapabilityGap", "UnmodeledCapabilityError",
     "predict", "predict_pd", "graph_costs", "operator_costs",
     "target_graphs", "target_operators", "parse_case", "study",
     "call_costs", "build_call",

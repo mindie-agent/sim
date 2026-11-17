@@ -38,7 +38,6 @@ from mindie_sim.schema.parallel import ParallelSpec
 _DEFAULT_MT = 128
 _DEFAULT_NT = 128
 _DEFAULT_KV_TILE = 128
-_FALLBACK_AIC_CORES = 24
 _DEFAULT_MC2_CHUNKS = 4
 _SUMMARY_CACHE_LIMIT = 32
 _DEFAULT_MOE_ROWS = 128
@@ -458,12 +457,12 @@ def _runtime_metadata(runtime: Any, machine: Any = None, model: Any = None) -> t
                     meta["native_fusion_profiles"] = tuple(sorted(
                         (str(key), str(value)) for key, value in profiles.items()))
     return tuple(sorted(meta.items()))
-def _machine_aic_cores(machine: Any) -> int:
-    """Declared Cube AIC count of the actual host, else the portable fallback."""
+def _machine_aic_cores(machine: Any) -> int | None:
+    """Declared AIC count; structure-only callers retain an unresolved value."""
     dies = getattr(machine, "dies", ()) if machine is not None else ()
     if dies and getattr(dies[0], "aic_count", 0):
         return int(dies[0].aic_count)
-    return _FALLBACK_AIC_CORES
+    return None
 
 
 @dataclass(frozen=True)
@@ -501,7 +500,7 @@ class FeatureConfig:
     final_norm_scope: str = "all"
     token_tile: int = _DEFAULT_MT
     kv_tile: int = _DEFAULT_KV_TILE
-    cores: int = _FALLBACK_AIC_CORES
+    cores: int | None = None
     moe_row_tile: int = _DEFAULT_MOE_ROWS
     split_target: int = _DEFAULT_SPLIT_TARGET
     max_splits: int = _DEFAULT_MAX_SPLITS
@@ -512,8 +511,8 @@ class FeatureConfig:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ModelingError(f"feature_parallel_invalid:{name}")
-        for name in ("token_tile", "kv_tile", "cores", "moe_row_tile",
-                     "split_target", "max_splits"):
+        tiles = ("token_tile", "kv_tile", "moe_row_tile", "split_target", "max_splits")
+        for name in tiles + (("cores",) if self.cores is not None else ()):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ModelingError(f"feature_tile_invalid:{name}")

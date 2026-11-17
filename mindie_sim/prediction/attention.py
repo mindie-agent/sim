@@ -26,7 +26,7 @@ from .memory_traffic import (AttentionAccessSpec, AttentionSchedule,
 from mindie_sim.catalog.cache import (
     completed_rows, index_row_bytes, index_selection_cost, local_kv_heads,
 )
-from mindie_sim.catalog.cache_format import cache_format
+from mindie_sim.catalog.cache_format import CacheFormat, cache_format
 from mindie_sim.catalog.ops import gemm_op, vector_op, cache_store_op, comm_op, barrier_op
 from mindie_sim.catalog.context_parallel import split_causal_pairs, owned_positions
 from mindie_sim.schema.operators import OpSpec
@@ -40,6 +40,9 @@ from .generic_latent_attention import index_key_window, visible_parts
 from .sparse_attention import sparse_attention_traffic
 from .structure_groups import declare_group
 
+#: One rotate-half pair contributes a sine/cosine vector expression per
+#: rotated element: rotate, multiply, add, plus the sin/cos table lookup.
+ROTARY_OPS_PER_ELEMENT = 6
 GATE_SIGMOID_OPS_PER_ELEMENT = 4
 GATE_APPLY_OPS_PER_ELEMENT = 1
 FLOPS_PER_FMA = 2
@@ -171,11 +174,12 @@ def _gqa_formats(model):
 
 
 def _attention_tensor_view(views, heads, kv_heads, width, model, quant,
-                           parallel, policy, runtime, causal=True):
+                           parallel, policy, runtime, causal=True, cacheless=False):
     """A paged ABI requires an explicit storage declaration, not a query length."""
-    if policy.kv_storage != "paged":
+    if cacheless or policy.kv_storage != "paged":
         return _contiguous_tensor_view(
-            views, heads, kv_heads, width, model, quant, parallel)
+            views, heads, kv_heads, width, model, quant, parallel,
+            cacheless=cacheless)
     if runtime is None or parallel.cp != 1 or parallel.pcp != 1:
         return ()
     query = (sum(view.q_len for view in views), heads, width)
@@ -216,10 +220,11 @@ def _attention_tensor_view(views, heads, kv_heads, width, model, quant,
     }),)
 
 
-def _contiguous_tensor_view(views, heads, kv_heads, width, model, quant, parallel):
+def _contiguous_tensor_view(views, heads, kv_heads, width, model, quant, parallel,
+                            *, cacheless=False):
     """Fresh prefill has explicit TND operands, before any paged-cache reuse."""
     if parallel.cp != 1 or parallel.pcp != 1 or any(
-        view.phase != "prefill" or view.context for view in views
+        (not cacheless and view.phase != "prefill") or view.context for view in views
     ):
         return ()
     query = (sum(view.q_len for view in views), heads, width)
@@ -256,7 +261,7 @@ def _cache_tensor_view(views, kv_heads, width, key_fmt, value_fmt, shared,
 
 def _decode_contract(views, heads, kv_heads, width, model, quant, parallel, plan, mode,
                      *, window=None, cp=None):
-    if mode not in {"decode", "draft"}:
+    if plan.cache_kind == "none" or mode not in {"decode", "draft"}:
         return ()
     requests = tuple((view.q_len, view.context) for view in views)
     queries = {query for query, _ in requests}
@@ -277,7 +282,7 @@ def _decode_contract(views, heads, kv_heads, width, model, quant, parallel, plan
 def _prefill_contract(views, heads, kv_heads, width, model, quant, parallel, plan, mode,
                       *, window=None, cp=None):
     """Declare per-request prefill geometry; the explicit recipe validates it."""
-    if mode not in {"prefill", "draft_prefill"}:
+    if plan.cache_kind != "none" and mode not in {"prefill", "draft_prefill"}:
         return ()
     eff_win = int(plan.window or 0) if window is None else int(window)
     eff_cp = int(parallel.cp) if cp is None else int(cp)
@@ -333,6 +338,11 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         index_cache_ids=None, candidate_ids=None, machine=None, **_) -> AttentionResult:
     from .implementations import select
 
+    cacheless = plan.cache_kind == "none"
+    if cacheless:
+        views = tuple(replace(v, context=0, prefix_tokens=0,
+                              prefix_cache_key="") for v in views)
+        quant = replace(quant, kv_dtype=model.activation_dtype)
     selected = select(runtime.kernels.get("lowerings", {}), "gqa_attention") if runtime else None
     if selected:
         selected.module.validate(views=views, plan=plan, parallel=parallel, policy=policy,
@@ -341,7 +351,10 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
     kv_heads = local_kv_heads(plan.num_kv_heads, parallel.tp)
     width = plan.head_dim
     key_fmt, value_fmt, cache_regions, shared_format = _gqa_formats(model)
-    shared = 0 <= plan.kv_owner_layer_id < plan.index
+    if cacheless:
+        key_fmt = value_fmt = CacheFormat(model.activation_dtype)
+        shared_format = True
+    shared = not cacheless and 0 <= plan.kv_owner_layer_id < plan.index
     # ``k_eq_v`` shares the *projection weight*; it never shares the post-norm /
     # post-RoPE cache tensor.  K and V are distinct planes for store, read and
     # PCP gather, so capacity and execution bytes conserve.
@@ -349,7 +362,11 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
     cache_planes = 2
     projected_kv_heads = 0 if shared else kv_heads
     configured_recipes = runtime.kernels.get("recipes", {}) if runtime else {}
-    if mode in {"decode", "draft"} and "flash_attention_decode" in configured_recipes:
+    if cacheless:
+        attention_recipe = ("flash_attention_prefill"
+                            if "flash_attention_prefill" in configured_recipes
+                            else "flash_attention")
+    elif mode in {"decode", "draft"} and "flash_attention_decode" in configured_recipes:
         attention_recipe = "flash_attention_decode"
     elif (mode in {"prefill", "draft_prefill"}
           and "flash_attention_prefill" in configured_recipes):
@@ -407,11 +424,19 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             if name in split_views and (name != "value" or not shared)
         ]
         ops.extend(split_copies)
+    # A declared partial-RoPE width rotates only that prefix of each head; the
+    # remaining tail is an unchanged view, never a shrunk projection.
+    rotary_width = (plan.qk_rope_head_dim
+                    if plan.qk_rope_head_dim or plan.qk_nope_head_dim else width)
     rope = vector_op(
         op_id=prefix + ".rope", deps=(ready,), stage=stage, layer=plan.index,
-        requests=requests, elements=padded_tokens * (heads + projected_kv_heads) * width,
-        ops_per_element=6, dtype=model.activation_dtype, family="rotary", phase=mode,
-        recipe="rotary", shape=(padded_tokens, heads + projected_kv_heads, width),
+        requests=requests,
+        elements=padded_tokens * (heads + projected_kv_heads) * rotary_width,
+        ops_per_element=ROTARY_OPS_PER_ELEMENT, dtype=model.activation_dtype,
+        family="rotary", phase=mode,
+        recipe="rotary", shape=(padded_tokens, heads + projected_kv_heads, rotary_width),
+        metadata=(("rotary_dim", rotary_width), ("head_dim", width),
+                  ("tail_policy", "unchanged_view")),
     )
     valid = sum(view.q_len for view in views)
     store_ready = rope.op_id
@@ -445,7 +470,9 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         for rank in range(max_dcp))
     store_deps = ((store_ready, value_ready)
                   if value_ready and not pcp_prefill else (store_ready,))
-    if shared:
+    if cacheless:
+        store_ids = store_deps
+    elif shared:
         extra, owner_ready = shared_kv_input(
             prefix=prefix, plan=plan, stage=stage, views=views,
             cache_ids=cache_ids or {}, stage_of=stage_of,
@@ -793,7 +820,8 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                              window=eff_window, cp=eff_cp)
                          + _attention_tensor_view(
                              (view,), heads, kv_heads, width, model, quant, parallel,
-                             policy, runtime, causal=not plan.noncausal_attention),
+                             policy, runtime, causal=not plan.noncausal_attention,
+                             cacheless=cacheless),
             )
             if selected:
                 op = selected.module.lower_op(
@@ -823,11 +851,12 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                              parallel, plan, mode, window=eff_window, cp=eff_cp)
                          + _attention_tensor_view(
                              grp_views, heads, kv_heads, width, model, quant, parallel,
-                             policy, runtime, causal=not plan.noncausal_attention),
+                             policy, runtime, causal=not plan.noncausal_attention,
+                             cacheless=cacheless),
                 **{key: sum(getattr(op, key) for op in batches) for key in fields})
             if eff_topk > 0:
                 batched = annotate_sparse_prefix_unknown(batched, runtime)
-            else:
+            elif not cacheless:
                 batched = apply_attention_prefix_reads(
                     batched, views=grp_views, sweeps_by_view=sweeps_by_view,
                     shared_sweeps_by_view=shared_sweeps_by_view, row_bytes=float(kv_row_bytes),
@@ -842,7 +871,7 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         elif batches:
             if eff_topk > 0:
                 batches = [annotate_sparse_prefix_unknown(item, runtime) for item in batches]
-            else:
+            elif not cacheless:
                 for pos, item in enumerate(batches):
                     view = indexed_views[pos][1]
                     kv_hbm_b, kv_mte2_b = kv_components[pos]
@@ -905,7 +934,8 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
     if plan.qk_norm and not shared and not plan.k_eq_v:
         _declare_qkv_norm_rope(
             ops, qkv, normalized, rope, split_copies, split_views, model.activation_dtype)
-    return AttentionResult(ops=ops, last=last, cache_store_id=store_ids[0],
+    return AttentionResult(ops=ops, last=last,
+                           cache_store_id=None if cacheless else store_ids[0],
                            index_store_id=index_store_id, topk_id=topk_id,
                            candidate_id=candidate_id)
 

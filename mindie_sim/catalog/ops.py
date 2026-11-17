@@ -31,6 +31,12 @@ from mindie_sim.schema.common import ModelingError, align_up, dtype_bytes
 
 ZERO = 0
 ONE = 1
+#: Fused groupwise INT4 kernels unpack two nibbles per stored byte, widen the
+#: integer to the compute dtype, then multiply by one declared group scale.
+W4A16_DEQUANT_OPS_PER_WEIGHT = 3
+#: Packed integer weights whose activation stays floating point dequantize
+#: in-kernel; the op's compute identity is that activation format.
+W4A16_WEIGHT_FORMATS = frozenset({"int4", "w4a8"})
 
 
 def _safe_bytes(dtype: str) -> float:
@@ -50,12 +56,10 @@ def compute_dtype_for(quant: QuantSpec, category: str) -> tuple[str, str]:
     if fmt in {"int8", "w8a8"}:
         return "int8", "int8"
     if fmt in {"int4", "w4a8"}:
-        # W4A8 streams packed int4 weights through the int8 cube (int32
-        # accumulate, bf16 out); the fused kernel dequantizes in-kernel, so the
-        # op's compute identity is int8 and only its weight stream is 0.5 B.
-        # Leaving int4 on the bf16 fallback priced every W4A8 expert GEMM on
-        # the BF16 cube at 2x its real compute rate.
-        return "int8", "int8"
+        # Packed weights do not imply quantized activations or INT8 compute.
+        if quant.activation_format == "int8":
+            return "int8", "int8"
+        return quant.activation_format, quant.activation_format
     if fmt in {"mxfp4", "fp4", "fp4_e2m1"}:
         # Explicit dequant/accumulation path; not an FP4 peak claim.
         return "bf16", quant.activation_format
@@ -153,6 +157,16 @@ def gemm_op(
     hbm = input_bytes + weight_bytes + output_bytes + scale_bytes
     flops = 2.0 * m * n * k
     fmt = packed_weight_format(quant, category)
+    unit_shape = (int(weight_rows or n), int(weight_cols or k))
+    unit_total = float(quant.matrix_bytes(*unit_shape, category))
+    bytes_per_weight = (unit_total / float(unit_shape[ZERO] * unit_shape[ONE])
+                        if unit_total > ZERO else 0.0)
+    # The dequantized operand is the packed byte stream this occurrence really
+    # reads, including a caller-declared active expert bank count.
+    weight_elements = (weight_bytes / bytes_per_weight
+                       if bytes_per_weight > ZERO else 0.0)
+    groupwise_dequant = (fmt in W4A16_WEIGHT_FORMATS and compute != "int8"
+                         and m > ZERO and weight_elements > ZERO)
     recipe = recipe or semantic_family or family
     packed = fmt not in {"bf16", "bfloat16", "fp16", "float16", "fp32", "float32"}
     meta = tuple(metadata) + (
@@ -181,8 +195,7 @@ def gemm_op(
         existing_meta = dict(metadata)
         scale_meta = ()
         if "weight_payload_bytes" not in existing_meta:
-            unit_total = float(quant.matrix_bytes(int(weight_rows or n), int(weight_cols or k), category))
-            unit_payload = float(quant.matrix_payload_bytes(int(weight_rows or n), int(weight_cols or k), category))
+            unit_payload = float(quant.matrix_payload_bytes(*unit_shape, category))
             payload_bytes = weight_bytes * (unit_payload / unit_total) if unit_total > 0 else 0.0
             scale_meta += (("weight_payload_bytes", payload_bytes),)
         if "weight_scale_format" not in existing_meta:
@@ -197,7 +210,21 @@ def gemm_op(
             ("weight_bytes", weight_bytes),
             ("implementation_assumption", "declared_matrix_operand_formats"),
         )
-    vector_ops = 0.0
+    if groupwise_dequant:
+        # The packed operand is unpacked, widened and rescaled on the vector
+        # pipe inside the consumer; the staged tile stays on chip and never
+        # becomes an HBM write-back.
+        meta = meta + (
+            ("dequant", "groupwise_fused"),
+            ("dequant_group_size", max(ONE, int(quant.expert_block))),
+            ("dequant_ops_per_weight", float(W4A16_DEQUANT_OPS_PER_WEIGHT)),
+            ("dequant_weight_elements", float(weight_elements)),
+            ("dequant_bytes_per_element", float(bytes_per_weight)),
+            ("dequant_compute_format", compute),
+            ("dequant_residency", "on_chip_l1_l0_no_hbm_writeback"),
+        )
+    vector_ops = (float(W4A16_DEQUANT_OPS_PER_WEIGHT * weight_elements)
+                  if groupwise_dequant else 0.0)
     if (fmt in {"int8", "w8a8"} and act == "int8" and group >= k
             and out_dtype in {"bf16", "bfloat16", "fp16", "float16", "fp32", "float32"}):
         # Per-row dynamic quantization rescales the completed INT32 reduction.
@@ -259,6 +286,8 @@ def _layout_name(fmt: str, quant: QuantSpec) -> str:
     if fmt in {"mxfp4", "fp4", "fp4_e2m1"}:
         return f"fp4_group{max(1, quant.expert_block)}_packed"
     if fmt in {"int4", "w4a8"}:
+        if int(quant.expert_block) > 1:
+            return f"int4_group{int(quant.expert_block)}_packed"
         # W4A8_DYNAMIC: two int4 values per byte, one fp32 scale per output row.
         return "int4_packed_per_channel"
     if fmt in {"fp8", "fp8_e4m3", "fp8_e5m2"}:
