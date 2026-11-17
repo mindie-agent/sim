@@ -553,6 +553,13 @@ def predict(
         include_submission=include_submission, memory_policy=memory.policy,
         memory=memory,
     )
+    # A bounded summary ring (the default 256 rows) must not silently disable
+    # exact physical-work coalescing.  A caller asking for a wider per-event
+    # trace is a diagnostic request: keep the uncoalesced decomposition so the
+    # published event rows stay one per declared program task.
+    execution._compact_step = (not execution.legacy_diagnostics
+                               and event_limit <= DEFAULT_EVENT_LIMIT)
+    execution.engine._compact_step = execution._compact_step
     execution.serving_io.record_events = event_limit > 0
     engine = execution.engine
     engine.now = min((r.arrival_ms for r in case.workload.requests), default=0)

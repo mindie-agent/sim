@@ -26,6 +26,7 @@ class _EngineSubmitMixin:
         self, prepared, name, *, after=(), release=None, owner="", metadata=None,
         on_complete=None, on_start=None, memory=None, memory_pools=None,
         memory_bindings=None, acquire_override=None, free_override=None,
+        native_hook: bool = False,
     ) -> Event:
         # Dependencies and allocations remain live invocation state. Only static
         # work, supply and placement validation can be shared by repeated tiles.
@@ -144,6 +145,18 @@ class _EngineSubmitMixin:
                     "memory_replica", context.get("replica", 0) if context else 0))
                 memory_stage = int(the_metadata.get(
                     "memory_stage", context.get("stage", 0) if context else 0))
+        acq = prepared.acquire if acquire_override is None else acquire_override
+        fr = prepared.free if free_override is None else free_override
+        alloc_demands = prepared.allocation_demands
+        # Only a task that really participates in memory accounting retains the
+        # ledger and pools.  A pure compute/comm row must stay inert so a
+        # serving Engine that owns one global ``Memory`` ledger does not
+        # disable native execution for the whole decode frontier.
+        # Only the ledger is dropped for a non-accounting row.  The declared
+        # pool set is retained verbatim: callers may hold a reference to it and
+        # an explicit caller pool must keep the row in Python.
+        task_ledger = (ledger if (acq or fr or alloc_demands
+                                  or bindings is not None) else None)
         self._sequence += 1
         event = Event(self._sequence, name)
         waiting_count = (1 if pending_one is not None
@@ -153,14 +166,17 @@ class _EngineSubmitMixin:
             prepared.demand,
             waiting_count, release,
             prepared.latency, prepared.caps,
-            prepared.acquire if acquire_override is None else acquire_override,
-            prepared.free if free_override is None else free_override,
-            owner, the_metadata, prepared.placement, prepared.allocation_demands,
+            acq, fr,
+            owner, the_metadata, prepared.placement, alloc_demands,
             prepared.priority, prepared.coupled, on_complete, on_start,
-            None, {}, False, ledger, memory_replica, memory_stage, pools,
-            bindings, (), prepared.cohort_size, prepared,
+            None, {}, False, task_ledger, memory_replica, memory_stage, pools,
+            bindings, (), prepared.cohort_size, prepared, None, native_hook,
         )
         tasks[event.sequence] = task
+        if self.task_uses_fifo(task):
+            self._fifo_live += 1
+        if self.task_blocks_native(task):
+            self._inline_blocked += 1
         if the_metadata:
             occurrence = the_metadata.get("occurrence")
             if occurrence.__class__ is OccurrenceKey:
@@ -266,6 +282,9 @@ class _EngineSubmitMixin:
         self._promises[seq_obs] = obs
         waiting_count = (1 if pending_one is not None
                          else (0 if pending is None else len(pending)))
+        host_accounting = bool(
+            prepared.acquire or prepared.free
+            or prepared.allocation_demands or bindings is not None)
         task = _Task(
             launch, prepared.demand.copy() if prepared.demand else {},
             prepared.demand,
@@ -275,10 +294,16 @@ class _EngineSubmitMixin:
             owner, _EMPTY_METADATA, prepared.placement,
             prepared.allocation_demands,
             prepared.priority, prepared.coupled, None, None,
-            None, {}, False, ledger, memory_replica, memory_stage, pools,
+            None, {}, False,
+            ledger if host_accounting else None, memory_replica,
+            memory_stage, pools,
             bindings, (), prepared.cohort_size, prepared, obs,
         )
         tasks[seq_launch] = task
+        if self.task_uses_fifo(task):
+            self._fifo_live += 1
+        if self.task_blocks_native(task):
+            self._inline_blocked += 1
         if pending_one is not None:
             pending_one._waiters.append(seq_launch)
         elif pending is not None:

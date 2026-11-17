@@ -75,8 +75,9 @@ static bool rates_partition(msim_ctx *c, const int32_t *idx, int32_t n,
                             const msim_res *res)
 {
     int32_t *gid = c->gid, *rep = c->rep, *members = c->pend;
-    int32_t gcount = 0, i, g, k;
-    uint64_t occ = 0;
+    int32_t gcount = 0, i, g, k, w;
+    uint64_t occ[MSIM_UNIT_WORDS];
+    for (w = 0; w < (int32_t)MSIM_UNIT_WORDS; w++) occ[w] = 0;
     for (i = 0; i < n; i++) {
         const msim_link *l = &c->link[idx[i]];
         int32_t len = unit_len(c, l), found = -1;
@@ -85,14 +86,20 @@ static bool rates_partition(msim_ctx *c, const int32_t *idx, int32_t n,
             if (same_units(c, &c->link[rep[g]], l)) { found = g; break; }
         if (found >= 0) { gid[i] = found; continue; }
         {
-            uint64_t mask = 0;
+            msim_ubits mask, seen_occ;
+            int32_t w;
+            bool overlaps = false;
+            msim_ubits_clear(&mask);
             for (k = 0; k < len; k++) {
                 int32_t u = unit_at(c, l, k);
                 if (u < 0 || u >= res->units) return false;
-                mask |= (uint64_t)1 << u;
+                msim_ubits_set(&mask, u);
             }
-            if ((occ & mask) != 0) return false;
-            occ |= mask;
+            for (w = 0; w < (int32_t)MSIM_UNIT_WORDS; w++) seen_occ.w[w] = occ[w];
+            for (w = 0; w < (int32_t)MSIM_UNIT_WORDS; w++)
+                if ((seen_occ.w[w] & mask.w[w]) != 0) overlaps = true;
+            if (overlaps) return false;
+            for (w = 0; w < (int32_t)MSIM_UNIT_WORDS; w++) occ[w] |= mask.w[w];
         }
         rep[gcount] = idx[i];
         gid[i] = gcount++;
@@ -315,7 +322,9 @@ static int32_t rates_coupled(msim_ctx *c)
             }
             if (nslot >= MSIM_MAX_SLOT) return MSIM_E_ARITH;
             if (!msim_own_reserve(c, nent + rows)) return MSIM_E_ARITH;
+            if (!msim_slot_reserve(c, nslot + 1)) return MSIM_E_ARITH;
             entry = c->entry; onext = c->onext; oslot = c->oslot;
+            slot = c->slot;
             slot[nslot].cap = capacity; slot[nslot].start = nent; slot[nslot].count = rows;
             for (e = 0; e < rows; e++) {
                 if (owner_n >= c->own_cap) return MSIM_E_ARITH;
@@ -331,7 +340,8 @@ static int32_t rates_coupled(msim_ctx *c)
         }
         {
             int32_t distinct = 0;
-            uint64_t seen = 0;
+            msim_ubits seen;
+            msim_ubits_clear(&seen);
             total_u = 0;
             for (i = 0; i < rows; i++) {
                 int32_t len = row[i].plen > 0 ? row[i].plen : c->res[r].units, k2;
@@ -339,8 +349,8 @@ static int32_t rates_coupled(msim_ctx *c)
                 for (k2 = 0; k2 < len; k2++) {
                     int32_t u = row[i].plen > 0
                         ? (int32_t)c->units[row[i].pstart + k2] : k2;
-                    uint64_t bit = (uint64_t)1 << u;
-                    if ((seen & bit) == 0) { seen |= bit; distinct++; }
+                    if (u < 0 || u >= MSIM_MAX_U) return MSIM_E_ARITH;
+                    if (!msim_ubits_test(&seen, u)) { msim_ubits_set(&seen, u); distinct++; }
                 }
             }
             if (distinct == total_u) {
@@ -395,6 +405,8 @@ static int32_t rates_coupled(msim_ctx *c)
                 }
                 if (nslot >= MSIM_MAX_SLOT) return MSIM_E_ARITH;
                 if (!msim_own_reserve(c, nent + count)) return MSIM_E_ARITH;
+                if (!msim_slot_reserve(c, nslot + 1)) return MSIM_E_ARITH;
+                slot = c->slot;
                 slot[nslot].cap = capacity; slot[nslot].start = nent;
                 slot[nslot].count = count;
                 for (k2 = c->uhead[order[i]]; k2 >= 0; k2 = c->unext[k2]) {
@@ -427,8 +439,14 @@ static int32_t rates_coupled(msim_ctx *c)
     {
         bool *active = c->active, *changed = c->changed;
         int32_t *pending = c->pend, *survivors = c->surv;
-        double rem_slot[MSIM_MAX_SLOT], slope[MSIM_MAX_SLOT], bounds[MSIM_MAX_SLOT];
+        /* Per-context heap scratch, grown to this pass's exact slot count before
+         * any solver cell is written.  Three MAX_SLOT arrays on the C stack
+         * would be multi-megabyte and unsafe on a bounded-stack worker. */
+        double *rem_slot, *slope, *bounds;
         int32_t np = 0, ns = 0, guard = 0, o, s;
+        if (!msim_slot_reserve(c, nslot)) return MSIM_E_ARITH;
+        slot = c->slot;
+        rem_slot = c->slot_rem; slope = c->slot_slope; bounds = c->slot_bounds;
         for (i = 0; i < nslot; i++) changed[i] = false;
         for (i = 0; i < nf; i++) {
             flow[i].assigned = 0.0;

@@ -25,6 +25,7 @@ from __future__ import annotations
 import ctypes
 import heapq
 import math
+import os
 
 from .accel_tables import (
     B_OUTPUT, E_STATE, INT32_MAX, KernelFault, MAX_COEF, MAX_F, MAX_L, MAX_MROW,
@@ -185,6 +186,72 @@ def drain_output(backend, engine) -> int:
         backend.draining = False
         finish_handback(backend, engine)
     return extra
+
+
+def resolve_mode(requested: str | None) -> str:
+    """Resolve ``python`` / ``c`` / ``auto`` from the argument or environment."""
+    value = requested
+    for source in ("MINDIE_SIM_ACCEL", "MINDIE_SIM_ENGINE_BACKEND"):
+        if value is not None:
+            break
+        value = os.environ.get(source)
+    text = str(value if value is not None else "auto").strip().lower()
+    if text in {"python", "py", "off", "0"}:
+        return "python"
+    if text in {"c", "c11", "native", "on", "1"}:
+        return "c"
+    if text in {"auto", ""}:
+        return "auto"
+    raise ValueError(f"engine_backend_invalid:{text}")
+
+
+#: Minimum live pure rows an ``auto`` Engine must hold before a re-adoption is
+#: even attempted; mirrors ``accel_bridge.AUTO_MIN_TASKS`` without importing it.
+REARM_MIN_TASKS = 64
+#: A rejected re-adoption scans the live frontier, so repeated failures back off
+#: geometrically (bounded) instead of running once per submitted row.
+REARM_BACKOFF_CAP = 1024
+REARM_BACKOFF_SHIFT = 4
+#: Bounded futile probes before ``auto`` stops retrying a frontier that is
+#: structurally unmirrorable (a pending promise edge or a Python start row).
+REARM_REJECT_LIMIT = 4
+
+
+def rearm_delay(sequence: int, failures: int) -> int:
+    """Next sequence threshold after ``failures`` rejected re-adoptions."""
+    shift = min(int(failures), REARM_BACKOFF_SHIFT)
+    return int(sequence) + min(REARM_BACKOFF_CAP, REARM_MIN_TASKS << shift)
+
+
+def note_rearm_rejection(backend, engine) -> None:
+    """Record one rejected adoption and stop after the bounded probe budget."""
+    backend.rearm_failures += 1
+    backend.rearm_after = rearm_delay(engine._sequence, backend.rearm_failures)
+    backend.rearm_rejections += 1
+    if backend.rearm_rejections >= REARM_REJECT_LIMIT:
+        backend.recoverable = False
+
+
+def can_rearm(backend, engine) -> bool:
+    """Cheap, exact gate for a recoverable ``auto`` hand-back.
+
+    Adoption needs a settled frontier (no live or mirrored native row), a
+    workload that amortizes the call, and a sequence position past the current
+    backoff window.  ``_promises`` are separate completion handles, never
+    pending work, so they are never inspected or subtracted.
+    """
+    if not backend.recoverable or backend.mode != "auto":
+        return False
+    if backend.handing_back or backend.enabled or backend.pending:
+        return False
+    if engine._active or engine._native_slots or engine._native_seqs:
+        return False
+    if engine._inline_blocked:
+        return False
+    if engine._sequence < REARM_MIN_TASKS:
+        return False
+    return (engine._sequence >= backend.rearm_after
+            and len(engine._tasks) >= REARM_MIN_TASKS)
 
 
 def solver_capacity_exceeded(tasks: int, links: int, units: int,

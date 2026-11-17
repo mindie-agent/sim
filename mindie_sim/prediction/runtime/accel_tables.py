@@ -32,16 +32,16 @@ LINK_STRIDE = 6
 COMP_STRIDE = 3
 SVC_STRIDE = 3
 MAX_T = 65536
-MAX_R = 128
-MAX_U = 64
+MAX_R = 2048
+MAX_U = 128
 MAX_L = 262144
 MAX_F = 65536
 MAX_COEF = 262144
 MAX_MROW = 65536
-MAX_SLOT = 8192
+MAX_SLOT = 264192
 MAX_SENT = 2097152
 MAX_UENT = 2097152
-MAX_OWN = 32768
+MAX_OWN = 262144
 INT64_MAX = (1 << 63) - 1
 INT32_MAX = (1 << 31) - 1
 UINT64_MAX = (1 << 64) - 1
@@ -303,8 +303,12 @@ def pure_task(engine, task) -> bool:
     """Kernel-eligible callback-free numeric row (no scheduler hooks)."""
     if engine._periodic_runs:
         return False
-    if (task.start_callback is not None or task.callback is not None
-            or task.acquire or task.free or task.allocation_demands):
+    if (task.start_callback is not None or task.acquire or task.free
+            or task.allocation_demands):
+        return False
+    # An ordinary callback stays Python.  A declared native boundary hook is
+    # marked ``MSIM_F_CALLBACK``, so the kernel halts at that exact instant.
+    if task.callback is not None and not task.native_hook:
         return False
     if not _stable_task_payloads(task, engine):
         return False

@@ -268,7 +268,9 @@ def test_cli_compose_efficiency_and_sla_end_to_end(tmp_path: Path) -> None:
     assert rc_sla_default == 0
     sla_default = json.loads(sla_default_path.read_text(encoding="utf-8"))
     assert sla_default["schema"] == "mindie-sim.hardware-sla/1"
-    assert len(sla_default["scenarios"]) >= 4
+    # The CLI default is one fast counterfactual; full sensitivity is explicit.
+    assert sla_default["sensitivity"] == "baseline"
+    assert len(sla_default["scenarios"]) == 1
     assert sla_default["scenarios"][0].get("scenario_id", sla_default["scenarios"][0].get("id")) == "baseline"
 
     rc_sla_scaled = main([

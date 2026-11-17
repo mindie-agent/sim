@@ -2671,6 +2671,23 @@ def _fold_kernel_stages(stages: tuple[Stage, ...]) -> tuple[Stage, ...]:
     return tuple(cur)
 
 
+def is_pure_static_program(program) -> bool:
+    """True for a callback-free finite DAG of plain kernel stages.
+
+    A nested ``Stage.program`` is a per-tile callback, a pipeline tile factory
+    is a callable, and an allocation-carrying stage needs a Python start
+    boundary: none of them can be admitted without a Python hook, so none is
+    "pure static" for admission purposes.
+    """
+    if isinstance(program, KernelProgram):
+        return not any(stage.program is not None or stage.acquire or stage.free
+                       for stage in program.stages)
+    if isinstance(program, (ParallelProgram, _FloorParallelProgram)):
+        return bool(program.programs) and all(
+            is_pure_static_program(child) for child in program.programs)
+    return False
+
+
 def coalesce_execution_program(program, *, unroll_limit: int = 64):
     """Unwrap single-tile pipelines and coalesce symmetric cohorts for Execution.
 

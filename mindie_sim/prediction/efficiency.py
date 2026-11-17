@@ -41,6 +41,11 @@ DEFAULT_TARGET_CUBE_MFU = 0.75
 DEFAULT_TARGET_VEC_MFU = 0.65
 NON_MONOTONIC_PROBE_CAP = 4
 SLA_HEADROOM_PROBE_STEPS = 3
+#: Counterfactual-set selectors for :func:`solve_sla_sizing`.
+SLA_SENSITIVITY_BASELINE = "baseline"
+SLA_SENSITIVITY_FULL = "full"
+#: A per-sequence marginal step below this is flat (or negative): no secant.
+SECANT_MIN_SLOPE_MS = 1e-9
 
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
@@ -403,7 +408,7 @@ def analyze_operator_row(row: Mapping[str, Any], case: CaseSpec | Mapping[str, A
     }
 
 
-def _lower_and_run_graph(case: CaseSpec, *, phase: str, tokens: int, context: int, sequences: int, scope: str, run_graph: bool = True, lowered_graphs: Any | None = None, include_submission: bool = False, overlap_async_scheduler: bool = False, evaluation_context: Any | None = None) -> tuple[Any, CaseSpec, dict[str, Any] | None]:
+def _lower_and_run_graph(case: CaseSpec, *, phase: str, tokens: int, context: int, sequences: int, scope: str, run_graph: bool = True, lowered_graphs: Any | None = None, include_submission: bool = False, overlap_async_scheduler: bool = False, evaluation_context: Any | None = None, fast_span_only: bool = False) -> tuple[Any, CaseSpec, dict[str, Any] | None]:
     graphs = lowered_graphs if lowered_graphs is not None else target_graphs(case, phase=phase, tokens=tokens, context=context, sequences=sequences, scope=scope)
     eff_case, has_kg = consume_target_declaration(case, graphs), any("device_kernel_group" in dict(op.metadata) for op in graphs[0])
     if not (run_graph or has_kg):
@@ -419,7 +424,8 @@ def _lower_and_run_graph(case: CaseSpec, *, phase: str, tokens: int, context: in
     # ordinary submission path; no duration max() is synthesized here.
     report = graph_costs(eff_case, sg, external_inputs=ext_in,
                          include_submission=include_submission, isolated=False,
-                         evaluation=evaluation_context)
+                         evaluation=evaluation_context,
+                         fast_span_only=fast_span_only)
     return graphs, eff_case, report
 
 
@@ -1101,8 +1107,12 @@ def analyze_network_efficiency(
                "mbu": tot_hbm_id / safe_graph_ms, "link_util": tot_link_id / safe_graph_ms,
                "roofline_efficiency": tot_roof_id / safe_graph_ms,
                "denominator": "graph_span_ms", "semantics": "nominal_peak_relative_work_over_span"}
+    graph_accel = graph_report.get("accel_status") if graph_report is not None else None
     return {
-        "schema": "mindie-sim.efficiency/1", "geometry": {"phase": phase, "tokens": tokens, "context": context, "sequences": sequences, "scope": scope},
+        "schema": "mindie-sim.efficiency/1",
+        "engine_backend": (graph_report or {}).get("engine_backend"),
+        "accel_status": graph_accel,
+        "geometry": {"phase": phase, "tokens": tokens, "context": context, "sequences": sequences, "scope": scope},
         "total_flops": tot_flops, "total_vector_ops": tot_vec_ops, "total_hbm_bytes": tot_hbm_b, "total_link_bytes": tot_link_b,
         "total_cube_ideal_ms": tot_cube_id, "total_vec_ideal_ms": tot_vec_id, "total_hbm_ideal_ms": tot_hbm_id, "total_link_ideal_ms": tot_link_id,
         "total_roofline_ideal_ms": tot_roof_id, "operator_serial_roofline_ideal_ms": serial_roof_id, "operator_sum_ms": operator_sum_ms, "graph_duration_ms": graph_duration_ms,
@@ -1691,6 +1701,33 @@ def select_jointly_feasible_candidate(records: Sequence[Mapping[str, Any]]) -> M
     return max(feasible, key=lambda record: int(record["b"])) if feasible else None
 
 
+def apply_sla_baseline_gains(results: Sequence[dict[str, Any]],
+                            base_r: Mapping[str, Any]) -> None:
+    """Populate baseline-relative throughput gains in place.
+
+    Extracted so a caller that evaluates each counterfactual in its own worker
+    (one flat pool over ``(sku, scenario)``) reproduces exactly the fields a
+    single-call solve publishes.
+    """
+    base_tps = (base_r["tps_at_sla"] if base_r["tps_at_sla"] > 0
+                else base_r["tps_at_b1"])
+    base_feas_tps = (base_r["tps_feasible"] if base_r["tps_feasible"] > 0
+                     else base_r["tps_at_b1"])
+    base_b = max(1, base_r["b_sla"])
+    for row in results:
+        eff_tps = (row["tps_at_sla"] if base_r["tps_at_sla"] > 0
+                   else row["tps_at_b1"])
+        eff_feas = (row["tps_feasible"] if base_r["tps_feasible"] > 0
+                    else row["tps_at_b1"])
+        row["tps_gain_vs_baseline"] = ((eff_tps / base_tps)
+                                       if base_tps > 0 else 1.0)
+        row["tps_feasible_gain_vs_baseline"] = (
+            (eff_feas / base_feas_tps) if base_feas_tps > 0 else 1.0)
+        row["concurrency_gain_vs_baseline"] = (
+            (row["b_sla"] / base_b) if base_r["b_sla"] > 0
+            else (base_r["step_ms_at_b1"] / row["step_ms_at_b1"]))
+
+
 def solve_sla_sizing(
     case: CaseSpec | Mapping[str, Any], *, sla_ms: float = DEFAULT_SLA_MS,
     context: int = DEFAULT_SLA_CONTEXT, tokens_per_seq: int | None = None,
@@ -1703,6 +1740,10 @@ def solve_sla_sizing(
     scenarios: Sequence[Mapping[str, Any]] | None = None, b1_analysis: Mapping[str, Any] | None = None,
     evaluation_context: Any | None = None,
     deadline_monotonic: float | None = None,
+    sensitivity: str = SLA_SENSITIVITY_FULL,
+    jobs: int | str = 1,
+    fast_span_probes: bool = True,
+    base_b_hint: int = 1,
 ) -> dict[str, Any]:
     """Solve SLA-constrained maximum concurrency B*_SLA and throughput across hardware scenarios."""
     from .evaluation import check_active_deadline
@@ -1730,7 +1771,16 @@ def solve_sla_sizing(
     b_max, dp = min(int(max_sequences_per_dp), max(1, rt_max_b)), parsed.runtime.parallel.dp
 
     t_defaults = {"target_mbu": target_mbu, "target_cube_mfu": target_cube_mfu, "target_vec_mfu": target_vec_mfu}
-    scenario_list = [({**s, **t_defaults} if (s.get("id") == "target_0.8x_mbu" and scenarios is None) else ({**t_defaults, **s} if s.get("id") == "target_0.8x_mbu" else dict(s))) for s in (scenarios or DEFAULT_SLA_SCENARIOS)]
+    # ``sensitivity`` only selects the counterfactual *set*; an explicit
+    # ``scenarios`` list stays authoritative.  One scenario per call keeps the
+    # caller's flat worker pool the only pool (no nested pools).
+    if scenarios is not None:
+        scenario_source = list(scenarios)
+    elif str(sensitivity).strip().lower() == SLA_SENSITIVITY_BASELINE:
+        scenario_source = [DEFAULT_SLA_SCENARIOS[0]]
+    else:
+        scenario_source = list(DEFAULT_SLA_SCENARIOS)
+    scenario_list = [({**s, **t_defaults} if (s.get("id") == "target_0.8x_mbu" and scenarios is None) else ({**t_defaults, **s} if s.get("id") == "target_0.8x_mbu" else dict(s))) for s in scenario_source]
     for s in scenario_list:
         for k in _SCALE_KEYS:
             _check_pos_float(f"scenario_scale_{k}", s.get(k, 1.0))
@@ -1740,7 +1790,8 @@ def solve_sla_sizing(
     scaled_cases: dict[tuple[float, ...], CaseSpec] = {}
     graphs_by_b: dict[int, Any] = {}
     vram_by_cap: dict[float, tuple[int, int, int]] = {}
-    graph_cache: dict[tuple[tuple[float, ...], int], tuple[Any, CaseSpec, dict[str, Any]]] = {}
+    graph_cache: dict[tuple[tuple[float, ...], int, bool], tuple[Any, CaseSpec, dict[str, Any]]] = {}
+    fast_spans = bool(fast_span_probes)
     analysis_cache: dict[tuple[tuple[float, ...], int], dict[str, Any]] = {}
 
     def get_scaled(s_key: tuple[float, ...]) -> CaseSpec:
@@ -1750,19 +1801,21 @@ def solve_sla_sizing(
 
     baseline_scales = tuple(1.0 for _ in _SCALE_KEYS)
 
-    def get_bundle(s_key: tuple[float, ...], b: int) -> tuple[Any, CaseSpec, dict[str, Any]]:
+    def get_bundle(s_key: tuple[float, ...], b: int, *,
+                   fast: bool = False) -> tuple[Any, CaseSpec, dict[str, Any]]:
         check_active_deadline()
-        if (s_key, b) not in graph_cache:
+        if (s_key, b, fast) not in graph_cache:
             if b not in graphs_by_b:
                 graphs_by_b[b] = target_graphs(parsed, phase=phase, tokens=q_tokens, context=context, sequences=b, scope=scope)
             context_reuse = evaluation_context if s_key == baseline_scales else None
             g, ec, gr = _lower_and_run_graph(
                 get_scaled(s_key), phase=phase, tokens=q_tokens, context=context,
                 sequences=b, scope=scope, run_graph=True,
-                lowered_graphs=graphs_by_b[b], evaluation_context=context_reuse)
+                lowered_graphs=graphs_by_b[b], evaluation_context=context_reuse,
+                fast_span_only=bool(fast))
             assert gr is not None
-            graph_cache[s_key, b] = (g, ec, gr)
-        return graph_cache[s_key, b]
+            graph_cache[s_key, b, fast] = (g, ec, gr)
+        return graph_cache[s_key, b, fast]
 
     def get_analysis(s_key: tuple[float, ...], b: int) -> dict[str, Any]:
         check_active_deadline()
@@ -1774,14 +1827,15 @@ def solve_sla_sizing(
             analysis_cache[s_key, b] = analyze_network_efficiency(
                 get_scaled(s_key), phase=phase, tokens=q_tokens, context=context,
                 sequences=b, scope=scope, run_graph=True,
-                _precomputed_graph=get_bundle(s_key, b),
+                _precomputed_graph=get_bundle(s_key, b, fast=False),
                 evaluation_context=(evaluation_context
                                     if s_key == baseline_scales else None))
         return analysis_cache[s_key, b]
 
     def eval_at(scen: Mapping[str, Any], s_key: tuple[float, ...], b: int, *, full: bool = False) -> dict[str, Any]:
         if not full and scen.get("target_mbu") is None:
-            return {"step_ms": float(get_bundle(s_key, b)[2]["duration_ms"])}
+            return {"step_ms": float(
+                get_bundle(s_key, b, fast=fast_spans)[2]["duration_ms"])}
         ans = get_analysis(s_key, b)
         shares = {k: ans["breakdown_by_bound"][k]["share_of_operator_sum"] for k in _BOUNDS}
         if scen.get("target_mbu") is not None:
@@ -1794,7 +1848,8 @@ def solve_sla_sizing(
             return {"step_ms": step, "step_basis": "target_pipe_work_lower_bound", "step_is_lower_bound": True, "operator_sum_ms": float(ev["target_operator_sum_ms"]), "target_pipe_totals_ms": dict(ev.get("target_pipe_totals_ms") or {}), "network_mbu": float(ev["target_network_mbu"]), "network_cube_mfu": float(ev["target_network_cube_mfu"]), "network_vec_mfu": float(ev["target_network_vec_mfu"]), "network_link_util": ans["total_link_ideal_ms"] / max(step, 1e-12), "network_roofline_efficiency": float(ev["target_network_roofline_efficiency"]), "bottleneck_shares": shares}
         return {"step_ms": float(ans["graph_duration_ms"]), "step_basis": "graph_evaluation", "step_is_lower_bound": False, "operator_sum_ms": float(ans["operator_sum_ms"]), "network_mbu": float(ans["network_mbu"]), "network_cube_mfu": float(ans["network_cube_mfu"]), "network_vec_mfu": float(ans["network_vec_mfu"]), "network_link_util": float(ans["network_link_util"]), "network_roofline_efficiency": float(ans["network_roofline_efficiency"]), "bottleneck_shares": shares}
 
-    base_b_hint, domain_cap, domain_reason = 1, b_max, None
+    base_b_hint = max(1, int(base_b_hint))
+    domain_cap, domain_reason = b_max, None
 
     def try_step_ok(scen: Mapping[str, Any], s_key: tuple[float, ...], b: int, *, seen: set[int] | None = None,
                     checks: dict[int, dict[str, Any]] | None = None, capacity_max: int | None = None) -> bool:
@@ -1882,7 +1937,7 @@ def solve_sla_sizing(
             window_cache[b] = (current_window, lifecycle_window)
             return current_window, lifecycle_window
 
-        b1_ms = float(get_bundle(s_key, 1)[2]["duration_ms"])
+        b1_ms = float(get_bundle(s_key, 1, fast=False)[2]["duration_ms"])
         candidate_checks: dict[int, dict[str, Any]] = {
             1: {"b": 1, "step_ms": b1_ms,
                 "sla": {"limit_ms": float(sla_ms), "pass": b1_ms <= sla_ms},
@@ -1995,6 +2050,23 @@ def solve_sla_sizing(
             }
 
         bounded_probes = []
+        secant_estimate = None
+        # Roofline secant warm-up (Finding 15).  The estimate only *chooses one
+        # additional probe* whose result warms the per-call graph cache; it never
+        # replaces the existing bucket/non-monotonic, headroom, capacity or
+        # lifecycle checks, and ``b_sla_is_proven_max`` stays False.  An
+        # infeasible b == 1, ``eff_max < 2`` or a flat/negative initial slope
+        # skips it.
+        if (0 < base_b_hint <= eff_max and eff_max >= 2 and b1_ms <= sla_ms):
+            b2_ms = float(eval_at(scen, s_key, 2, full=False)["step_ms"])
+            marginal = b2_ms - b1_ms
+            if math.isfinite(marginal) and marginal > SECANT_MIN_SLOPE_MS:
+                estimate = 1 + int((sla_ms - b1_ms) / marginal)
+                estimate = max(2, min(int(estimate), int(eff_max)))
+                if estimate not in evaluated_b:
+                    try_step_ok(scen, s_key, estimate, seen=evaluated_b,
+                                capacity_max=b_joint)
+                    secant_estimate = estimate
         if b1_ms > sla_ms:
             probe_ceiling = min(eff_max, NON_MONOTONIC_PROBE_CAP)
             probe_results = {probe: try_step_ok(scen, s_key, probe, seen=evaluated_b, checks=candidate_checks, capacity_max=b_joint) for probe in range(2, probe_ceiling + 1)}
@@ -2122,6 +2194,7 @@ def solve_sla_sizing(
             "b_sla_lower_bound": b_sla, "b_sla_is_proven_max": False,
             "latency_candidate": latency_candidate, "feasible_candidate": feasible_candidate,
             "search": {"method": "exponential_probe_plus_binary_under_monotone_assumption",
+                       "secant_warmup_probe": secant_estimate,
                        "monotonicity_assumed": True, "non_monotonic_dispatch_detected": bool(
                            latency_candidate is not None and latency_candidate["capacity"]["pass"] is False and b1_ms > sla_ms),
                        "non_monotonic_dispatch_check": "bounded_bucket_probe" if bucket_keys else "not_applicable_no_capture_buckets",
@@ -2152,10 +2225,7 @@ def solve_sla_sizing(
 
     results = [solve_one(scen) for scen in scenario_list]
     base_r = next((r for r in results if r["scenario_id"] == "baseline"), next((r for r in results if tuple(r["scales"].values()) == (1.0, 1.0, 1.0, 1.0, 1.0) and r["scenario_id"] != "target_0.8x_mbu"), None)) or solve_one(DEFAULT_SLA_SCENARIOS[0])
-    base_tps, base_feas_tps, base_b = (base_r["tps_at_sla"] if base_r["tps_at_sla"] > 0 else base_r["tps_at_b1"]), (base_r["tps_feasible"] if base_r["tps_feasible"] > 0 else base_r["tps_at_b1"]), max(1, base_r["b_sla"])
-    for row in results:
-        eff_tps, eff_feas = (row["tps_at_sla"] if base_r["tps_at_sla"] > 0 else row["tps_at_b1"]), (row["tps_feasible"] if base_r["tps_feasible"] > 0 else row["tps_at_b1"])
-        row["tps_gain_vs_baseline"], row["tps_feasible_gain_vs_baseline"], row["concurrency_gain_vs_baseline"] = ((eff_tps / base_tps) if base_tps > 0 else 1.0), ((eff_feas / base_feas_tps) if base_feas_tps > 0 else 1.0), ((row["b_sla"] / base_b) if base_r["b_sla"] > 0 else (base_r["step_ms_at_b1"] / row["step_ms_at_b1"]))
+    apply_sla_baseline_gains(results, base_r)
     mem_async_b1 = Memory(replace(parsed, runtime=replace(parsed.runtime, async_scheduling=True)), workspace_tokens=q_tokens)
     prefill = phase == "prefill"
     lifecycle_query = decode_q_tokens if prefill else q_tokens
