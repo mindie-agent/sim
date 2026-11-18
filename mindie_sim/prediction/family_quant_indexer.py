@@ -206,15 +206,44 @@ def _check_arch35_domain(plan, quant, parallel, keys):
         raise ModelingError("quant_lightning_indexer_v2_arch35_domain_mismatch")
 
 
-def _candidate_keys(views, ratio):
-    """Compressed keys the arch35 scan walks: the populated request cache.
+def _view_completed_keys(view, ratio):
+    """Compressed keys one request's populated cache holds.
 
-    A request whose cache is empty falls back to its own query extent, so the
-    declared scan is never zero and never invents keys the cache cannot hold.
+    ``compress_ratio <= 1`` is the dense non-compressed indexer: every context
+    token is a completed key, so no division by zero is introduced.
     """
-    return max((max(1, -(-int(view.context) // ratio)) if int(view.context) > 0
-                else max(1, -(-int(view.q_len) // ratio)) for view in views),
-               default=1)
+    context = max(0, int(getattr(view, "context", 0) or 0))
+    if ratio <= 1:
+        return context if context > 0 else max(1, int(view.q_len))
+    return -(-context // ratio) if context > 0 else max(1, -(-int(view.q_len) // ratio))
+
+
+def _candidate_keys(views, ratio):
+    """Completed keys of the arch35 scan and of its physical cache payload.
+
+    The scan walks the largest populated cache in one owner wave; the payload
+    is every distinct cache row. Each private request owns its own rows, so
+    two requests with 1,024 keys each fetch 2,048 rows, not the larger of the
+    two. Requests naming the same shared prefix key read one physical union.
+    """
+    shared: dict[str, int] = {}
+    private = 0
+    largest = 0
+    for view in views:
+        keys = _view_completed_keys(view, ratio)
+        largest = max(largest, keys)
+        context = max(0, int(getattr(view, "context", 0) or 0))
+        prefix = max(0, min(int(getattr(view, "prefix_tokens", 0) or 0), context))
+        token = str(getattr(view, "prefix_cache_key", "") or "")
+        if prefix and token:
+            shared_keys = min(keys, prefix if ratio <= 1 else -(-prefix // ratio))
+            shared[token] = max(shared.get(token, 0), shared_keys)
+            private += max(0, keys - shared_keys)
+        else:
+            private += keys
+    payload = sum(shared.values()) + private
+    scan = max(largest, max(shared.values(), default=0), 1)
+    return scan, max(1, payload)
 
 
 def declare_arch35(builder, *, deps, views, plan, quant, parallel,
@@ -228,7 +257,7 @@ def declare_arch35(builder, *, deps, views, plan, quant, parallel,
     """
     del block_size
     ratio = plan.compress_ratio
-    keys = _candidate_keys(views, ratio)
+    keys, payload_keys = _candidate_keys(views, ratio)
     _check_arch35_domain(plan, quant, parallel, keys)
     tokens = sum(view.q_len for view in views)
     heads, width = plan.index_heads, plan.index_dim
@@ -239,6 +268,7 @@ def declare_arch35(builder, *, deps, views, plan, quant, parallel,
         "query_rows": int(tokens), "wave_rows": INDEXER_WAVE_ROWS,
         "waves": indexer_waves(tokens), "blocks": blocks,
         "heads": heads, "width": width, "keys": blocks * 1024,
+        "completed_keys": keys, "payload_keys": payload_keys,
         "key_row_bytes": key_row_bytes,
         "output_bytes": float(tokens) * plan.index_topk * INT32_BYTES,
     }
@@ -254,7 +284,7 @@ def declare_arch35(builder, *, deps, views, plan, quant, parallel,
                       "cache_head_shape": (1, width), "scale_dtype": ARCH35_SCALE_DTYPE,
                       "output_shape": (tokens, 1, plan.index_topk), "output_dtype": "int32",
                       "layout": "ND", "quant_mode": 1, "compression_ratio": ratio,
-                      "visible_keys": ledger["keys"]}),
+                      "visible_keys": keys}),
                   ("native_implementation", {
                       "native_kind": ARCH35_IMPLEMENTATION,
                       "selection": ARCH35_IMPLEMENTATION,

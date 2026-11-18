@@ -516,7 +516,7 @@ def build(op, geometry):
 
 
 def quant_external_fill(shape, quant_mode):
-    """Cold external KV bytes: SWA rings per request, TopK shared union once."""
+    """Cold external KV bytes: resident window ring plus compressed rows."""
     rows = tuple(query_rows(shape))
     if not rows:
         return 0, 0
@@ -524,31 +524,41 @@ def quant_external_fill(shape, quant_mode):
     sequences = tuple(shape.get("sequences", ())) or ((len(rows), 0),)
     requests = len(sequences)
     window = int(shape.get("window", 0) or 0)
-    # One request walks a sliding ring of ``window + q_len`` distinct rows.
     queries = sum(int(query) for query, _context in sequences)
-    original = requests * window + queries if window else 0
+    # The window ring keeps the last ``window`` distinct rows of the appended
+    # sequence; a short context holds ``context + q_len`` rows, never a tile.
+    original = (sum(min(window, int(context) + int(query))
+                    for query, context in sequences) if window else 0)
+    ratio = int(shape.get("ratio", 0) or 0)
     topk = int(shape.get("topk", 0) or 0)
+    # One compressed row completes per ``ratio`` raw tokens; the TopK list
+    # keeps at most ``topk`` of the completed rows. Without a compressor every
+    # context token is a candidate row.
+    completed = [(int(context) + int(query)) // ratio if ratio
+                 else (int(context) + int(query))
+                 for query, context in sequences]
+    capacity = [min(topk, value) if topk else value for value in completed]
     compressed = 0
     shared_rows = 0
-    if topk:
-        context = max(context for _query, context in shape.get("sequences", ()))
-        prefix = shape.get("prefix_tokens", 0) or 0
-        prefix = max(prefix) if isinstance(prefix, tuple) else int(prefix)
-        if str(shape.get("prefix_cache_mode", "private")) != "shared" or prefix <= 0:
-            compressed = requests * topk
-        else:
-            # The compressed list selects one row per ``ratio`` raw tokens.
-            ratio = max(1, int(shape.get("ratio", 0) or 1))
-            fill = sparse_prefix_fill(rows=queries, requests=requests, selected=topk,
-                                      prefix_tokens=prefix // ratio,
-                                      context=max(1, context // ratio))
-            compressed, shared_rows = fill.external_rows, fill.shared_unique
+    prefix = shape.get("prefix_tokens", 0) or 0
+    prefix = max(prefix) if isinstance(prefix, tuple) else int(prefix)
+    shared = (str(shape.get("prefix_cache_mode", "private")) == "shared"
+              and prefix > 0)
+    if topk and shared:
+        # The compressed prefix union is one cold fill; the private suffixes
+        # of each request are separate rows.
+        fill = sparse_prefix_fill(
+            rows=queries, requests=requests, selected=min(topk, max(completed)),
+            prefix_tokens=prefix // max(1, ratio),
+            context=max(1, max(completed)))
+        compressed, shared_rows = fill.external_rows, fill.shared_unique
+    elif topk or ratio:
+        compressed = max(capacity) if shared else sum(capacity)
     return (original + compressed) * row_bytes, shared_rows
 
 
 def _quant_plan(shape, streams, quant_mode, addressing):
     """Arch35 ``aclnnMixedQuantSparseFlashMla``: overlapped 128-key tile DAG."""
-    heads = int(shape["heads"])
     row_bytes = quant_row_bytes(quant_mode)
     counts = Counter(_phase_key(stream, head_counts, index)
                      for _, stream, head_counts in streams
@@ -562,8 +572,11 @@ def _quant_plan(shape, streams, quant_mode, addressing):
             total += work.scaled(count)
     external, shared_rows = quant_external_fill(shape, quant_mode)
     fill = Work(resources={"hbm": external} if external else {})
-    heads_width = heads * MQSMLA_HEAD_WIDTH * BF16_ELEMENT_BYTES
-    streamed = sum(len(stream.rows) for _owner, stream, _heads in streams) * heads_width
+    # Each head-group stream reads only its own query-head slice. Summing the
+    # per-stream head counts charges the single query tensor once, not once
+    # per head group.
+    streamed = sum(sum(head_counts) for _owner, _stream, head_counts in streams) \
+        * MQSMLA_HEAD_WIDTH * BF16_ELEMENT_BYTES
     stream_work = Work(resources={"hbm": 2 * streamed, "mte2_aic": streamed,
                                   "mte3": streamed})
 
@@ -591,8 +604,7 @@ def _quant_plan(shape, streams, quant_mode, addressing):
                 f"mqsmla{owner}_{pool}", pool, amount,
                 (2 * owner, 2 * owner + 1) if pool == "ub" else (owner,))
                 for pool, amount in BUFFERS.items())
-            rows = len(stream.rows)
-            query_bytes = rows * heads * MQSMLA_HEAD_WIDTH * BF16_ELEMENT_BYTES
+            query_bytes = sum(head_counts) * MQSMLA_HEAD_WIDTH * BF16_ELEMENT_BYTES
             pipeline = KernelProgram((Stage(
                 "tiles", program=PipelineProgram(
                     stream.count, QUANT_TILE_SLOTS,

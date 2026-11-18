@@ -14,7 +14,9 @@ arch35 quantized lightning indexer and the causal-conv UPDATE ABI.
 """
 from copy import deepcopy
 from dataclasses import replace
+import json
 import math
+from pathlib import Path
 
 import pytest
 
@@ -27,6 +29,8 @@ from mindie_sim.prediction import index_pool
 from mindie_sim.prediction import index_pool_native as ipn
 from mindie_sim.prediction import sparse_indexer_pipeline as sp
 from mindie_sim.prediction.cost import CostModel
+from mindie_sim.prediction.operator_analysis import target_operators
+from mindie_sim.prediction.structure import parse_case
 from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.lowering import Builder
 from mindie_sim.prediction.mechanism import Geometry, PlannedRecipe
@@ -505,6 +509,9 @@ def test_arch35_and_arch22_recipes_coexist_and_route_by_representation():
     assert ledger == {"query_rows": 960, "wave_rows": sp.INDEXER_WAVE_ROWS,
                       "waves": 30, "blocks": 32, "heads": INDEX_HEADS,
                       "width": INDEX_WIDTH, "keys": 32768,
+                      "completed_keys": 32768,
+                      # Every private request owns its own compressed cache.
+                      "payload_keys": 160 * 32768,
                       "key_row_bytes": INDEX_ROW_BYTES,
                       "output_bytes": float(960 * INDEX_TOPK * 4)}
     assert dict(op.matrix_flops) == {
@@ -577,3 +584,159 @@ def test_conv_update_has_no_fabricated_prefill_sync_barrier():
     assert len(streams) == AIV_OWNERS
     assert plan.work.resources["hbm"] == pytest.approx(
         sum(2 * (STEPS + 3) * 24576 * 2 for _ in range(BATCH)))
+
+
+# --- Final-gate rows 6-8 and 13-14: indexer dispatch, arch35 conservation,
+# KeyPool row shard and the MLA prolog operand contracts.
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _arch35_op_for(ratio, views, *, topk=INDEX_TOPK, heads=INDEX_HEADS):
+    plan, model = _case_model(pool=1, index_dtype="fp8_e4m3",
+                              compress_ratio=ratio, topk=topk)
+    plan = replace(plan, index_heads=heads)
+    builder = Builder("s0.l0", plan, 0, views, model, "decode")
+    fq.declare(builder, deps=("q", "w", "cache"), views=views, plan=plan,
+               quant=builder.quant, parallel=_ArchParallel())
+    return builder.ops[-1]
+
+
+def test_bf16_and_fp16_index_operands_never_select_the_quantized_fusion():
+    from mindie_sim.compose import compose_case
+    for qmode in ("bf16", "fp16"):
+        dsv32 = parse_case(compose_case(
+            "deepseek-v3.2", "a2", quant=qmode, tp=8, dp=2, ep=16, concurrency=2))
+        dsv32_ops = target_operators(dsv32, phase="decode", tokens=1, context=2048)
+        assert not any(dict(op.metadata).get("native_kind")
+                       == "aclnnQuantLightningIndexerV2" for op in dsv32_ops)
+    raw = json.loads((ROOT / "examples/cases/glm53-a3-w4a8.json").read_text())
+    raw["model"]["quantization"] = "bf16"
+    bf16 = parse_case(raw)
+    assert bf16.model.quant.index_dtype == "bf16"
+    assert bf16.model.quant.activation_format == "bf16"
+    fp16 = replace(bf16, model=replace(
+        bf16.model, quant=replace(bf16.model.quant, index_dtype="fp16")))
+    for case in (bf16, fp16):
+        recipes = {op.recipe for op in target_operators(
+            case, phase="decode", tokens=1, context=4096)}
+        assert "quant_lightning_indexer" not in recipes
+        assert {"index_scores", "index_topk"} <= recipes
+    # W4A8 keeps a quantized activation, so the fused CANN kernel stays.
+    fused = target_operators(parse_case(json.loads(
+        (ROOT / "examples/cases/glm53-a3-w4a8.json").read_text())),
+        phase="decode", tokens=1, context=4096)
+    assert any(dict(op.metadata).get("native_kind")
+               == "aclnnQuantLightningIndexerV2" for op in fused)
+
+
+def test_arch35_zero_compression_and_completed_key_flops():
+    # A dense non-compressed indexer must not divide by compress_ratio == 0.
+    dense = _arch35_op_for(0, (RequestView("r", 1, 1, False, "decode"),))
+    assert dict(dense.metadata)[sp.QUANT_LEDGER]["completed_keys"] == 1
+    assert dense.flops == 2 * 1 * INDEX_HEADS * 1 * INDEX_WIDTH == 8192
+    # Ratio 4 / context 4 completes one key, not the padded 1,024-key tile.
+    sparse = _arch35_op_for(4, (RequestView("r", 1, 4, False, "decode"),))
+    ledger = dict(sparse.metadata)[sp.QUANT_LEDGER]
+    assert ledger["completed_keys"] == 1
+    assert ledger["keys"] == sp.POOL_KEY_BLOCK
+    assert sparse.flops == 8192
+    assert dict(sparse.metadata)["native_tensor_view"]["visible_keys"] == 1
+
+
+def test_arch35_private_cache_payload_is_charged_once_on_hbm_and_mte2():
+    views = (RequestView("a", 1, 1024, False, "decode"),
+             RequestView("b", 1, 1024, False, "decode"))
+    op = _arch35_op_for(1, views)
+    ledger = dict(op.metadata)[sp.QUANT_LEDGER]
+    assert ledger["completed_keys"] == 1024
+    assert ledger["payload_keys"] == 2048
+    payload = 2 * 1024 * INDEX_ROW_BYTES
+    assert payload >= 262144
+    assert op.hbm_bytes >= payload
+    assert op.mte2_bytes >= payload
+    assert op.mte2_bytes > 0
+    partial = (RequestView("a", 1, 2048, False, "decode", prefix_tokens=1024,
+                           prefix_cache_key="shared_a"),
+               RequestView("b", 1, 2048, False, "decode", prefix_tokens=1024,
+                           prefix_cache_key="shared_a"))
+    partial_ledger = dict(_arch35_op_for(1, partial).metadata)[sp.QUANT_LEDGER]
+    assert partial_ledger["payload_keys"] == 1024 + 2 * 1024 == 3072
+
+
+def test_keypool_row_shard_has_no_negative_dummy_rows():
+    plan, model = _case_model(pool=16)
+    model = replace(model, quant=replace(model.quant, index_scale_dtype="fp32"))
+    views = _views(1)
+    builder = Builder("s0.l0", plan, 0, views, model, "decode")
+    ipn.selection(builder, query="q", weights="w", cache="cache", views=views,
+                  plan=plan, quant=builder.quant, padded_tokens=STEPS,
+                  runtime=_Runtime(o_proj_tp=LOCAL_TP))
+    meta = dict(next(op for op in builder.ops
+                     if op.recipe == ipn.POOL_KEY_RECIPE).metadata)
+    assert (meta["valid_query_rows"], meta["padded_query_rows"],
+            meta["native_query_rows"]) == (6, 6, 7)
+    assert meta["dummy_request_queries"] == 1
+
+
+def test_keypool_gathered_selection_keeps_each_request_row_count():
+    from mindie_sim.prediction.mla_cann_epilogs import _selection_reference
+    plan, model = _case_model(pool=4)
+    plan = replace(plan, index_kpool_always_select_tail=True)
+    model = replace(model, quant=replace(model.quant, index_scale_dtype="fp32"))
+    views = (RequestView("a", 1, 4, False, "decode"),
+             RequestView("b", 1, 100, False, "decode"))
+    builder = Builder("s0.l0", plan, 0, views, model, "decode")
+    ipn.selection(builder, query="q", weights="w", cache="cache", views=views,
+                  plan=plan, quant=builder.quant, padded_tokens=2,
+                  runtime=_Runtime(o_proj_tp=LOCAL_TP))
+    packed = next(op for op in builder.ops if op.recipe == "index_topk")
+    meta = dict(packed.metadata)
+    assert meta["selected_request_ids"] == ("a", "b")
+    assert meta["selected_tokens_by_request"] == (5, 101)
+    assert meta["selected_token_rows"] == 106
+    reference = _selection_reference(builder, packed.op_id)
+    assert reference.rows_for("a") == 5
+    assert reference.rows_for("b") == 101
+    # A partial one-entry map must never broadcast request 0's rows; only a
+    # producer that owns the complete selection may be replayed.
+    from mindie_sim.prediction.mla_cann_epilogs import SharedSelectionRef
+    partial = SharedSelectionRef("partial", selected_token_rows=106,
+                                 selected_by_request={"a": 5})
+    assert partial.rows_for("b") is None
+    single = SharedSelectionRef("single", selected_token_rows=5,
+                                selected_by_request={"a": 5})
+    assert single.rows_for("b") == 5
+
+
+def test_mla_prolog_v4_scales_are_group32_e8m0_and_v3_rejects_fp8_weights():
+    from mindie_sim.schema.common import ModelingError
+    from test_wave3a_cann921_mla_keypool_prolog import (
+        HIDDEN, HEAD_WIDTH, KV_RANK, LAYOUT, PROLOG_QUERY_LORA_RANK,
+        ParallelSpec, _declaration, _op, _prolog_case,
+    )
+    from mindie_sim.prediction import family_mla_prolog as prolog
+    plan, model = _prolog_case()
+    ops = [
+        _op("s0.l0.q_a", "gemm", (8, PROLOG_QUERY_LORA_RANK, HIDDEN)),
+        _op("s0.l0.q_norm", "rmsnorm", (8, PROLOG_QUERY_LORA_RANK)),
+        _op("s0.l0.q_b", "gemm", (8, 8 * HEAD_WIDTH, KV_RANK)),
+        _op("s0.l0.kv_a", "gemm", (8, HEAD_WIDTH, HIDDEN)),
+        _op("s0.l0.kv_norm", "rmsnorm", (8, KV_RANK)),
+        _op("s0.l0.q_absorb", "gemm", (64, KV_RANK, KV_RANK)),
+    ]
+    prolog.declare(
+        ops, prefix="s0.l0", plan=plan, model=model,
+        parallel=ParallelSpec(tp=8, cp=8, pcp=1), quant=model.quant, tokens=8,
+        members=tuple(op.op_id for op in ops), q_a="s0.l0.q_a",
+        q_b="s0.l0.q_b", kv_a="s0.l0.kv_a", q_absorb="s0.l0.q_absorb",
+        cache_layout=LAYOUT)
+    view = _declaration(ops, "s0.l0.q_absorb")["tensor_view"]
+    assert view["query_norm_scale_dtype"] == "fp8_e8m0"
+    assert view["query_norm_scale_shape"] == (8, PROLOG_QUERY_LORA_RANK // 32)
+    assert 8 * PROLOG_QUERY_LORA_RANK // 32 == 384
+    # FP8 projection weights without the V4 packed contract are V3-illegal.
+    fp8_quant = replace(model.quant, kv_dtype="bf16")
+    with pytest.raises(ModelingError, match="mla_prolog_v3_rejects_fp8"):
+        prolog.validate(plan=plan, parallel=ParallelSpec(tp=8, cp=8, pcp=1),
+                        model=model, quant=fp8_quant,
+                        lowering_passes=("activation_quantization",))

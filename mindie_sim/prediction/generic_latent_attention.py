@@ -48,6 +48,24 @@ MIN_INDEX_FACTOR = 1
 # MXFP4 weights). No FP4 cube peak is invented, and the row is no longer
 # priced as the INT8 indexer declared by ``quant.index_dtype``.
 PACKED_INDEX_ARITHMETIC_DTYPE = "bf16"
+#: Unquantized floating formats; alone they never select the fused quantized kernel.
+UNQUANTIZED_INDEX_DTYPES = frozenset({"bf16", "fp16", "fp32"})
+BF16_OPERAND_FORMAT = "bf16"
+
+
+def index_operands_quantized(quant):
+    """True when the fused indexer has a quantized operand to consume.
+
+    A quantized index dtype is one. An unquantized index dtype still pairs
+    with a quantized activation or KV cache (W8A8/W4A8), so those cases keep
+    the fused kernel; a pure BF16/FP16 chain has no quantized operand at all.
+    """
+    if str(getattr(quant, "index_dtype", "") or "") not in UNQUANTIZED_INDEX_DTYPES:
+        return True
+    return (str(getattr(quant, "activation_format", BF16_OPERAND_FORMAT)
+                or BF16_OPERAND_FORMAT) not in UNQUANTIZED_INDEX_DTYPES
+            or str(getattr(quant, "kv_dtype", BF16_OPERAND_FORMAT)
+                   or BF16_OPERAND_FORMAT) not in UNQUANTIZED_INDEX_DTYPES)
 
 
 def stack_compressor_kind(model, plan):
@@ -426,6 +444,7 @@ def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
                         and "lightning_indexer" in (native_sel.options.get("roles") or ()))
         native_fused = (native_fusion_active(runtime)
                         and not claimed_role
+                        and index_operands_quantized(quant)
                         and select(lowerings, "lightning_indexer") is None
                         and select(lowerings, "quant_lightning_indexer") is None)
     # Query and head-weight operands are real reads in both lowerings.

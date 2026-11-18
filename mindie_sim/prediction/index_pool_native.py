@@ -354,14 +354,22 @@ def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
     pool_row_bytes = _pooled_row_bytes(quant, width)
     divisor, owned_views = _row_shard(
         views, plan, quant, options=options, runtime=runtime)
-    local_tokens = max(1, -(-int(tokens) // divisor)) if views else 0
+    valid_rows = sum(v.q_len for v in owned_views)
+    local_tokens = max(valid_rows, -(-int(tokens) // divisor)) if views else 0
     # The captured graph appends one sentinel request, so the native call owns
     # one dummy query row beyond the padded partition.
     native_rows = local_tokens + 1
-    valid_rows = sum(v.q_len for v in owned_views)
     visited_pools = _candidate_pools(owned_views, plan)
     geometry, ledger = _pool_ledger(owned_views, plan, quant, native_rows,
                                     output_width, pool_row_bytes, visited_pools)
+    # The row-shard gather assembles the complete selection plane, so its
+    # declared per-request rows cover every request, not only the local badge.
+    global_geometry = (geometry if divisor == 1 else tuple(
+        pool_selection(v.q_len, v.context, plan.index_topk, plan.index_kpool,
+                       always_select_tail=plan.index_kpool_always_select_tail)
+        for v in views))
+    selection_ids = tuple(v.request_id for v in views)
+    selection_rows = tuple(g.selected_tokens for g in global_geometry)
     scanned = sum(g.scanned_pools for g in geometry)
     selected = sum(g.selected_pools for g in geometry)
     common = _common(valid_query_rows=valid_rows,
@@ -369,7 +377,10 @@ def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
         pool_size=pool, query_lengths=tuple(v.q_len for v in owned_views),
         context_lengths=tuple(v.context for v in owned_views),
         active_requests=len(owned_views), native_requests=len(owned_views) + 1,
-        sentinel_rows=1, dummy_request_queries=native_rows - valid_rows,
+        sentinel_rows=1,
+        # Padding and the sentinel row never consume a valid query row, so a
+        # narrow local shard cannot report a negative dummy count.
+        dummy_request_queries=max(0, native_rows - valid_rows),
         local_tp_shard=divisor,
         scanned_pools=scanned, selected_pools=selected,
         safe_reference_scanned_pools=scanned,
@@ -454,6 +465,11 @@ def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
             ("selection_layout", "native_token_indices_then_causal_tail; padded_rows_minus_one"),
             ("pool_id_expansion_in_adapter", False),
             ("assembled_index_plane", divisor > 1),
+            # The assembled selection keeps every request's own row count; a
+            # single request's rows never name another request's selection.
+            ("selected_token_rows", float(sum(selection_rows))),
+            ("selected_request_ids", selection_ids),
+            ("selected_tokens_by_request", selection_rows),
             ("causal_tail_rows", sum(g.causal_tail_tokens for g in geometry))))
     # The producer group is re-appended after `start` while restoring enqueue
     # order, so this group names its own members instead of slicing the list.

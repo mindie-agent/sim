@@ -84,14 +84,20 @@ C8_HEAD_ALIGN = 16
 C8_UB_PER_OWNER = 4 * 128 * C8_FP32_BYTES + 2 * C8_HEAD_ALIGN * 512 * C8_FP32_BYTES
 
 
+def packed_row_bytes(rope):
+    """One packed C8 row: INT8 payload, FP32 group scales and BF16 rotary."""
+    return C8_PAYLOAD_BYTES + C8_SCALE_BYTES + int(rope) * C8_BF16_BYTES
+
+
 def packed_cache_declaration(rope):
     """Declared packed row layout shared by both reviewed schedules."""
+    row_bytes = packed_row_bytes(rope)
     return {
         "payload_bytes": C8_PAYLOAD_BYTES, "scale_bytes": C8_SCALE_BYTES,
         "scale_dtype": "fp32", "group_size": C8_SCALE_GROUP,
-        "rotary_bytes": rope * 2, "rotary_dtype": "bf16",
-        "row_bytes": C8_PACKED_ROW_BYTES,
-        "local_padded_row_bytes": -(-C8_PACKED_ROW_BYTES // ROW_ALIGNMENT_BYTES)
+        "rotary_bytes": int(rope) * C8_BF16_BYTES, "rotary_dtype": "bf16",
+        "row_bytes": row_bytes,
+        "local_padded_row_bytes": -(-row_bytes // ROW_ALIGNMENT_BYTES)
         * ROW_ALIGNMENT_BYTES,
         "key_value_alias": True,
     }
@@ -181,7 +187,7 @@ def build(op, geometry, *, scratch_policy, compact=True, operand_modes=True,
         source_items=tuple(SOURCE.items()), paired_vector_stages=("dequantize",),
         vector_buffer_bytes=VECTOR_BUFFER_BYTES,
         phase_unit_weights=phase_unit_weights_rope64 if shape["rope"] else phase_unit_weights)
-    row_bytes = 512 + 16 + shape["rope"] * 2
+    row_bytes = packed_row_bytes(shape["rope"])
     return replace(plan, metadata={
         "kind": "indexed_attention_packed_int8",
         "coverage": "source_phases_declared_dispatch" if shape["rope"] else "analytic_adaptation",
@@ -204,7 +210,7 @@ def build(op, geometry, *, scratch_policy, compact=True, operand_modes=True,
 def arch35_tile_phases(keys, heads, latent, rope, *, first, last, private_hbm=0):
     """One ``arch35`` C8 key tile: address, gather/dequant, QK, PV, accumulate.
 
-    The ``2-AIV`` ``index/page lookup -> 656 B gather -> C8 dequant + NZ
+    The ``2-AIV`` ``index/page lookup -> packed-row gather -> C8 dequant + NZ
     publish`` block is one source subtile loop over a double-buffered UB slot,
     so its steady service is the busiest of the copy, vector and publish pipes.
     The AIC ``QK -> Fixpipe -> online softmax -> PV`` chain stays explicit
@@ -212,6 +218,7 @@ def arch35_tile_phases(keys, heads, latent, rope, *, first, last, private_hbm=0)
     """
     padded_h = _align(heads, C8_HEAD_ALIGN)
     width = latent + rope
+    row_bytes = packed_row_bytes(rope)
     first_size = heads * width * C8_BF16_BYTES if first else 0
     output_bytes = heads * latent * C8_BF16_BYTES if last else 0
     # QK and PV are each one matrix-pipeline unit: MTE1 operand loads, the cube
@@ -225,8 +232,9 @@ def arch35_tile_phases(keys, heads, latent, rope, *, first, last, private_hbm=0)
         "fixpipe": padded_h * latent * C8_FP32_BYTES})
     return (
         ("kv_stage", Work(resources={
-            "mte2_aiv": keys * C8_ADDRESS_LOOKUPS * C8_ADDRESS_ENTRY_BYTES
-                        + keys * C8_PACKED_ROW_BYTES * C8_ALIAS_READS,
+            # One aliased KV row plus the two dependent INT32 scalar lookups.
+            "mte2_aiv": keys * (row_bytes
+                                + C8_ADDRESS_LOOKUPS * C8_ADDRESS_ENTRY_BYTES),
             "vector": keys * _dequant_lane_ops(latent),
             "mte3": keys * width * C8_BF16_BYTES * C8_ALIAS_READS,
             "hbm": private_hbm}), ()),
@@ -260,25 +268,62 @@ def tile_stream(sequences, topk, compute_units, tile_size, pool_size, pool_tail)
         for owner in range(owners))
 
 
+def _prefix_groups(shape, sequences):
+    """Partition requests by the physical shared prefix they can reuse.
+
+    Only requests naming the same non-empty ``prefix_cache_key`` share one
+    immutable region; two distinct keys are two cold fills even when their
+    extents are equal.
+    """
+    raw = shape.get("prefix_tokens", 0) or 0
+    extents = tuple(raw) if isinstance(raw, tuple) else (int(raw),) * len(sequences)
+    keys = tuple(shape.get("prefix_cache_keys") or ())
+    declared_keys = bool(keys)
+    groups: dict[str, list] = {}
+    private = []
+    for index, (query, context) in enumerate(sequences):
+        prefix = max(0, min(int(extents[index]), int(context)))
+        key = str(keys[index]) if index < len(keys) else ""
+        if prefix > 0 and (key or not declared_keys):
+            # An undeclared key keeps the legacy single shared region; a
+            # declared key names the region requests may reuse.
+            groups.setdefault(key, []).append((int(query), int(context), prefix))
+        else:
+            private.append((int(query), int(context), prefix))
+    return groups, private
+
+
 def prefix_partition(shape, sequences, topk):
     """Split one selection into its physical shared union and private rows.
 
-    A shared prefix key names one immutable region, so the batch fetches that
-    union once before its query-owner waves; each request's private selected
+    A shared prefix key names one immutable region, so requests naming that
+    key fetch its union once before the query-owner waves; a request with a
+    different key fetches its own cold region. Each request's private selected
     rows are read by that request's own tiles and are not part of the cold fill.
     """
     rows = sum(query for query, _ in sequences)
     if not rows or not topk:
         return 0, 0, topk
-    prefix = shape.get("prefix_tokens", 0) or 0
-    prefix = max(prefix) if isinstance(prefix, tuple) else int(prefix)
-    if str(shape.get("prefix_cache_mode", "private")) != "shared" or prefix <= 0:
+    if str(shape.get("prefix_cache_mode", "private")) != "shared" or not (
+            shape.get("prefix_tokens") or 0):
         # No shared pool: every row is that request's own cold read.
         return 0, rows * topk, 0
-    fill = sparse_prefix_fill(rows=rows, requests=len(sequences), selected=topk,
-                              prefix_tokens=prefix,
-                              context=max(context for _query, context in sequences))
-    return fill.shared_unique, fill.private_rows, fill.shared_selected
+    groups, private_requests = _prefix_groups(shape, sequences)
+    shared_rows = 0
+    private_rows = sum(query * topk for query, _context, _prefix in private_requests)
+    shared_selected = 0
+    for members in groups.values():
+        fill = sparse_prefix_fill(
+            rows=sum(query for query, _context, _prefix in members),
+            requests=len(members), selected=topk,
+            prefix_tokens=max(prefix for _query, _context, prefix in members),
+            context=max(context for _query, context, _prefix in members))
+        shared_rows += fill.shared_unique
+        private_rows += fill.private_rows
+        shared_selected = max(shared_selected, fill.shared_selected)
+    if not groups:
+        return 0, rows * topk, 0
+    return shared_rows, private_rows, shared_selected
 
 
 def arch35_plan(shape, geometry, *, tile_size=None, slots=None):
@@ -304,7 +349,8 @@ def arch35_plan(shape, geometry, *, tile_size=None, slots=None):
         raise ModelingError("arch35_c8_requires_two_kv_and_accumulator_slots_per_owner")
     shared_rows, private_rows, shared_selected = prefix_partition(
         shape, sequences, topk)
-    external = shared_rows * C8_PACKED_ROW_BYTES
+    row_bytes = packed_row_bytes(rope)
+    external = shared_rows * row_bytes
     private_keys = topk - shared_selected
     counts = {}
     for parts in streams:
@@ -329,7 +375,7 @@ def arch35_plan(shape, geometry, *, tile_size=None, slots=None):
 def _tile_phases(key, heads, latent, rope, private_keys, topk):
     """Private selected rows are charged to the tile that reads them."""
     fraction = private_keys / topk if topk else 0
-    private_hbm = int(round(key[0] * C8_PACKED_ROW_BYTES * fraction))
+    private_hbm = int(round(key[0] * packed_row_bytes(rope) * fraction))
     return cached_tile(key[0], heads, latent, rope, key[1], key[2], private_hbm)
 
 
