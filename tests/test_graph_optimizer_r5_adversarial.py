@@ -166,7 +166,7 @@ def test_w1_distinct_retained_ports_and_qwen_residual_identity():
     assert residual_port != gate_port
     assert final.graph.values[residual_port].shape == (16, 5120)
     assert final.graph.values[gate_port].shape == (16, 5120)
-    assert report.final.hbm_bytes == 209_851_392.0
+    assert report.final.hbm_bytes == 209_661_952.0
 
 
 def linked_outputs(graph: TypedGraph, op_id: str) -> tuple[str, ...]:

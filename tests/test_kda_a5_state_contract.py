@@ -215,9 +215,14 @@ def test_speculative_conv_prices_all_candidates_and_rejects_later_versions():
         "state_history_slots": 3}.items()))
     nonspec_work = _conv_plan(nonspec, parsed).work
     # All query rows execute in both plans; speculation adds two history
-    # descriptors per candidate (2+q reads and 2+q writes in the source).
-    assert (spec_work.resources["hbm"] - nonspec_work.resources["hbm"]
-            == (2 + 4) * width * 2 + (2 + 4 - 3) * width * 2)
+    # descriptors per candidate (2+q reads on the AIV read pipe) without adding
+    # an off-chip descriptor, because the restore window re-reads the retained
+    # positions and the current inputs from UB (#62 Item 6b).
+    assert spec_work.resources["hbm"] == nonspec_work.resources["hbm"]
+    descriptor_roles = set(spec_work.resources) - {"hbm", "mte3", "vector"}
+    assert descriptor_roles
+    assert all(spec_work.resources[role] - nonspec_work.resources.get(role, 0)
+               == (2 + 4) * width * 2 for role in descriptor_roles)
     assert spec_work.resources["vector"] == nonspec_work.resources["vector"]
 
 

@@ -63,7 +63,11 @@ def test_complete_frontend_binds_one_active_stateful_kernel_per_kda_layer(batch)
     assert all(value == 0 for value in result['remaining_buffers'].values())
     actual = result['operator']
     assert actual['mte3_bytes'] == batch * 4 * 4608 * 2  # output + W-1 state
-    assert actual['hbm_bytes'] == batch * 12 * 4608 * 2  # 8 reads + 4 writes
+    # Wave 4B (#62 Item 6b): the off-chip envelope is the streamed token and
+    # history rows only (q input + kernel_width-1 history, read and written),
+    # matching the paired-SKU `causal_conv1d_update` HBM counter. The four
+    # weight taps per sequence stay L2-resident.
+    assert actual['hbm_bytes'] == batch * 8 * 4608 * 2  # 4 reads + 4 writes
 
 
 @pytest.mark.parametrize('batch', [1, 4])

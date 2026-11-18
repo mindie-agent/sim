@@ -42,8 +42,51 @@ SOURCE = {
 }
 
 
+ROW_SHARD_OPTION = "keypool_row_shard_tp"
+
+
 def recipes():
     return {}
+
+
+def row_shard_tp(*, options=None, runtime=None):
+    """Local-TP width that owns `AscendIndexerKPoolRowShard`, or `1`.
+
+    The caller option wins; otherwise the declared local dense-projection width
+    of this rank's `o_proj` / `linear_proj` owns the shard. A width of one keeps
+    the replicated query plane, so both modes stay selectable.
+    """
+    explicit = (options or {}).get(ROW_SHARD_OPTION)
+    if explicit is not None:
+        if isinstance(explicit, bool) or not isinstance(explicit, int) or explicit < 1:
+            raise ModelingError("index_pool_row_shard_tp_invalid")
+        return explicit
+    metadata = dict(getattr(runtime, "metadata", ()) or ())
+    declared = metadata.get(ROW_SHARD_OPTION)
+    if declared is not None:
+        if isinstance(declared, bool) or not isinstance(declared, int) or declared < 1:
+            raise ModelingError("index_pool_row_shard_tp_invalid")
+        return declared
+    parallel = getattr(runtime, "parallel", None)
+    if parallel is None:
+        return 1
+    return max(1, int(parallel.o_proj_tp), int(parallel.linear_proj_tp))
+
+
+def row_shard_partition(views, divisor):
+    """Contiguous request range owned by the representative local-TP rank.
+
+    Query rows and per-request sequence metadata move together, so the local
+    rank scores `ceil(tokens / divisor)` rows and `ceil(batch / divisor)`
+    sequences. `divisor == 1` is the replicated caller and changes nothing.
+    """
+    views = tuple(views)
+    if isinstance(divisor, bool) or not isinstance(divisor, int) or divisor < 1:
+        raise ModelingError("index_pool_row_shard_divisor_invalid")
+    if divisor == 1 or not views:
+        return views
+    owned = max(1, -(-len(views) // divisor))
+    return views[:owned]
 
 
 def _selection_for(view, plan):

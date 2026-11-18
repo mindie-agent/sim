@@ -80,12 +80,15 @@ def test_shared_bandwidth_conserves_every_addressed_payload_under_compaction(len
     for plan, engine, duration, record in (detailed, compact):
         reads = sum(9 + 2 * q for q in lengths) * dim * 2
         writes = sum(2 + 2 * q for q in lengths) * dim * 2
-        assert engine.serviced["hbm"] == pytest.approx(reads + writes + contender)
+        # Wave 4B (#62 Item 6b): the off-chip envelope is the streamed token and
+        # history rows (q input + kernel_width-1 history, read and written).
+        streamed = sum(2 * (q + 4 - 1) for q in lengths) * dim * 2  # kernel_width 4
+        assert engine.serviced["hbm"] == pytest.approx(streamed + contender)
         assert engine.serviced["mte2_aiv"] == pytest.approx(reads)
         assert engine.serviced["mte3"] == pytest.approx(writes)
         assert engine.serviced["vector"] == pytest.approx(sum(5 + 17 * q for q in lengths) * dim)
-        assert duration >= (reads + writes) / 1e6 - 1e-10
-        assert plan.work.resources["hbm"] == reads + writes
+        assert duration >= streamed / 1e6 - 1e-10
+        assert plan.work.resources["hbm"] == streamed
     assert compact[1].serviced == pytest.approx(detailed[1].serviced, rel=1e-11)
     # This symmetric case has the same repetition count on every owner: the
     # complete resource schedule scales uniformly, so duration is exact too.
