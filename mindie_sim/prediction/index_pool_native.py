@@ -372,6 +372,8 @@ def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
     selection_rows = tuple(g.selected_tokens for g in global_geometry)
     scanned = sum(g.scanned_pools for g in geometry)
     selected = sum(g.selected_pools for g in geometry)
+    assembled_selected = sum(g.selected_pools for g in global_geometry)
+    assembled_tail = sum(g.causal_tail_tokens for g in global_geometry)
     common = _common(valid_query_rows=valid_rows,
         padded_query_rows=local_tokens, native_query_rows=native_rows,
         pool_size=pool, query_lengths=tuple(v.q_len for v in owned_views),
@@ -458,7 +460,7 @@ def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
                 "gather_position": "before_sfa_consumes_index_topk",
             }.items()))))
     packed = b.work("index_topk", (gathered,), (tokens, output_width),
-        read=selected * pool * INT32_BYTES + tokens * INT64_BYTES,
+        read=assembled_selected * pool * INT32_BYTES + tokens * INT64_BYTES,
         write=tokens * output_width * INT32_BYTES, vector=tokens * output_width,
         family="topk", dtype="int32", metadata=common + (
             ("selection_capacity", output_width), ("selection_output_dtype", "int32"),
@@ -470,7 +472,7 @@ def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
             ("selected_token_rows", float(sum(selection_rows))),
             ("selected_request_ids", selection_ids),
             ("selected_tokens_by_request", selection_rows),
-            ("causal_tail_rows", sum(g.causal_tail_tokens for g in geometry))))
+            ("causal_tail_rows", assembled_tail)))
     # The producer group is re-appended after `start` while restoring enqueue
     # order, so this group names its own members instead of slicing the list.
     declare_group(b.ops, key=b.prefix + ".pool_key_indexer", role="pool_key_indexer",

@@ -601,7 +601,12 @@ def submit_batch(case, schedulers, plans, execution, lower, now, *,
         cohort_views = tuple(
             view for replica in logical_local for view in logical_local[replica].requests)
         cohort_views_by_replica = tuple(
-            tuple(logical_local[replica].requests) for replica in logical_local)
+            Frontend.partition_views(
+                logical_local[replica].requests, case.runtime,
+                sum(view.q_len + view.draft_proposal_tokens
+                    for view in logical_local[replica].requests),
+                model=case.model)[0]
+            for replica in logical_local)
         route_context = ({"routing_views": cohort_views,
                           "cohort_views_by_replica": cohort_views_by_replica}
                          if isinstance(lower, Frontend) and len(plans) > 1

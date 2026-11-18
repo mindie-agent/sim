@@ -260,32 +260,61 @@ class PoolKeyIndexerRecipe:
         ))
 
 
+def _wave_row_keys(ledger, wave_index):
+    """Completed keys of every query row in one 32-AIC wave."""
+    rows = _wave_rows(int(ledger["query_rows"]), wave_index,
+                      int(ledger["wave_rows"]))
+    runs = ledger.get("row_completed_keys")
+    if not runs:
+        return (int(ledger.get("completed_keys", ledger["keys"])),) * rows
+    begin = wave_index * int(ledger["wave_rows"])
+    end = begin + rows
+    if isinstance(runs[0], int):
+        return tuple(int(value) for value in runs[begin:end])
+    values, position = [], 0
+    for count, value in runs:
+        count = int(count)
+        lo, hi = max(begin, position), min(end, position + count)
+        if hi > lo:
+            values.extend([int(value)] * (hi - lo))
+        position += count
+        if position >= end:
+            break
+    return tuple(values)
+
+
 def _quant_tile_work(ledger, index):
     """Declared per-(wave, key block) service, in physical units."""
-    rows = _wave_rows(int(ledger["query_rows"]),
-                      index // int(ledger["blocks"]), int(ledger["wave_rows"]))
+    wave = index // int(ledger["blocks"])
+    rows = _wave_rows(int(ledger["query_rows"]), wave,
+                      int(ledger["wave_rows"]))
     heads, width = int(ledger["heads"]), int(ledger["width"])
     block = index % int(ledger["blocks"])
-    # The scan walks completed cache keys, not the padded 1,024-key tile.
-    completed = int(ledger.get("completed_keys", ledger["keys"]))
-    valid = min(POOL_KEY_BLOCK, completed - block * POOL_KEY_BLOCK)
-    query_bytes = (float(rows) * heads * width
-                   + float(rows) * heads * FP32_ELEMENT_BYTES)
+    # Each query row scans its own completed keys; one wave advances together.
+    row_valids = [
+        max(0, min(POOL_KEY_BLOCK, key - block * POOL_KEY_BLOCK))
+        for key in _wave_row_keys(ledger, wave)]
+    active_rows = sum(1 for value in row_valids if value > 0)
+    valid = max(row_valids, default=0)
+    tile_pairs = sum(row_valids)
+    query_bytes = float(active_rows) * heads * (
+        width + FP32_ELEMENT_BYTES)
     operand_bytes = (query_bytes
-                     + float(valid) * int(ledger["key_row_bytes"])
-                     + float(valid) * FP32_ELEMENT_BYTES)
+                     + float(valid) * (int(ledger["key_row_bytes"])
+                                       + FP32_ELEMENT_BYTES)
+                     if active_rows > 0 else 0.0)
     return {
         "rows": rows,
         "valid_keys": valid,
         "cube": {
-            "fp8_e4m3": float(rows) * 2.0 * heads * valid * width,
+            "fp8_e4m3": float(tile_pairs) * 2.0 * heads * width,
             # The cold cache rows are filled once; a wave rescans them from L2.
             "hbm": query_bytes,
             # The operand fetch includes this block's key rows and scales.
             "mte2": operand_bytes,
         },
         "reduce": {
-            "vector": float(rows) * valid * TOPK_MERGE_OPS,
+            "vector": float(tile_pairs) * TOPK_MERGE_OPS,
         },
     }
 
@@ -347,6 +376,16 @@ class Arch35QuantIndexerRecipe:
         payload = int(ledger.get("payload_keys",
                                  ledger.get("completed_keys", ledger["keys"])))
         fill = float(payload) * int(ledger["key_row_bytes"])
+        if tiles == 0:
+            # No completed key owns a block: only the INT32 index store runs.
+            stages = []
+            if fill > 0.0:
+                stages.append(Stage("cache_fill", context.bind(Work({}, {
+                    "hbm": fill, "mte2": fill}))))
+            stages.append(Stage("indices", context.bind(Work({}, {
+                "mte3": float(ledger["output_bytes"]),
+                "hbm": float(ledger["output_bytes"])})), latency=floor))
+            return KernelProgram(tuple(stages))
 
         def tile(index):
             parts = _quant_tile_work(ledger, index)

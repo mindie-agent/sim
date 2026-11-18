@@ -13,7 +13,6 @@ from dataclasses import dataclass
 from functools import lru_cache
 
 from mindie_sim.schema.common import ModelingError
-from .batch_prefix_attention import sparse_prefix_fill
 from .mechanism import OperatorPlan, Work
 from .program import KernelProgram, ParallelProgram, PipelineProgram, Stage
 from .instructions import PrimitiveInventory
@@ -572,22 +571,25 @@ def quant_external_fill(shape, quant_mode):
                 member_completed = [
                     (context + query) // ratio if ratio else context + query
                     for query, context, _prefix in members]
+                member_prefix = [
+                    prefix // max(1, ratio) for _q, _c, prefix in members]
+                selection = [min(topk, value) for value in member_completed]
+                shared_sel = [
+                    min(sel, p, (sel * p + comp // 2) // comp)
+                    if comp and p else 0
+                    for sel, comp, p in zip(
+                        selection, member_completed, member_prefix)]
+                member_priv = [sel - shared for sel, shared
+                               in zip(selection, shared_sel)]
                 group_shared = (len(members) > 1
                                 or (not declared and len(sequences) > 1))
-                p_comp = max(prefix for _q, _c, prefix in members) \
-                    // max(1, ratio)
-                if group_shared and p_comp > 0:
-                    fill = sparse_prefix_fill(
-                        rows=sum(query for query, _c, _p in members),
-                        requests=len(members),
-                        selected=min(topk, max(member_completed)),
-                        prefix_tokens=p_comp,
-                        context=max(1, max(member_completed)))
-                    compressed += fill.external_rows
-                    shared_rows += fill.shared_unique
+                if group_shared and any(p > 0 for p in member_prefix):
+                    group_shared_unique = min(
+                        max(member_prefix, default=0), sum(shared_sel))
+                    compressed += group_shared_unique + sum(member_priv)
+                    shared_rows += group_shared_unique
                 else:
-                    compressed += sum(
-                        min(topk, value) for value in member_completed)
+                    compressed += sum(selection)
             for query, context, _prefix in private:
                 compressed += min(
                     topk, (context + query) // ratio if ratio else context + query)

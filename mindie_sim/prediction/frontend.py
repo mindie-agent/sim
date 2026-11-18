@@ -377,8 +377,19 @@ class Frontend:
                                   if peer_region.index == region.index
                                   for view in peer_region.views)
                             for peer_plan in peer_regions)
-                        partition_source_rows = tuple(
+                        # A caller may still pass logical, unsharded cohort
+                        # views while this replica lowered PCP-sharded rows.
+                        # Scale each peer microbatch to the physical ledger.
+                        pcp = max(ONE, int(getattr(
+                            runtime.parallel, "pcp", ONE) or ONE))
+                        sharded = pcp > ONE and any(
+                            getattr(view, "query_ranges", ()) for view in views)
+                        scaled = (pcp if sharded and sum(
                             _cohort_source_rows(part) for part in parts)
+                            == pcp * sum(region_rows) else ONE)
+                        partition_source_rows = tuple(
+                            _cohort_source_rows(part) // scaled
+                            for part in parts)
                         partition_routing = tuple(
                             view for part in parts for view in part) or None
                         partition_global = sum(partition_source_rows)
@@ -390,6 +401,13 @@ class Frontend:
                             else (cohort_rows[peer] + count - ONE - region.index) // count
                             for peer in range(len(cohort_rows)))
                         partition_global = sum(partition_source_rows)
+                    if not ep_cohort:
+                        # A non-EP replica's expert bank processes only its
+                        # own local microbatch rows; a DP peer or an unsharded
+                        # cohort view never widens the routed ledger.
+                        partition_global = (region_rows_value
+                                            if shared_global is not None
+                                            else None)
                     part_ops, part_last = self.body(
                         model, runtime, region.views,
                         prefix=f"{prefix}dbo{region.index}.",

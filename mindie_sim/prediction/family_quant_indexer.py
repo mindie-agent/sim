@@ -190,7 +190,7 @@ def _build_arch35(op, geometry):
     return OperatorPlan(plan.work, plan.program, metadata=metadata)
 
 
-def _check_arch35_domain(plan, quant, parallel, keys):
+def _check_arch35_domain(plan, quant, parallel, keys, tokens=1):
     if (parallel.cp != 1 or parallel.pcp < 1 or plan.candidate_filter
             or plan.index_kpool != 1
             or quant.index_dtype != ARCH35_INDEX_DTYPE
@@ -202,25 +202,37 @@ def _check_arch35_domain(plan, quant, parallel, keys):
             or plan.compress_ratio > ARCH35_COMPRESSION_MAX
             or (plan.compress_ratio & (plan.compress_ratio - 1))):
         raise ModelingError("quant_lightning_indexer_v2_arch35_domain_mismatch")
-    if keys < 1:
+    if keys < 0 or tokens < 1:
         raise ModelingError("quant_lightning_indexer_v2_arch35_domain_mismatch")
 
 
+def _view_owned_ranges(view):
+    """Owned query offsets; empty ``query_ranges`` is the whole local query."""
+    ranges = tuple((int(start), int(end))
+                   for start, end in (getattr(view, "query_ranges", ()) or ())
+                   if int(end) > int(start))
+    return ranges or ((0, max(0, int(getattr(view, "q_len", 0) or 0))),)
+
+
+def _view_row_keys(view, ratio, noncausal=False):
+    """Completed compressed keys visible to every owned query row."""
+    context = max(0, int(getattr(view, "context", 0) or 0))
+    rows = []
+    for start, end in _view_owned_ranges(view):
+        for offset in range(start, end):
+            visible = (max(0, int(getattr(view, "kv_len", 0) or 0))
+                       if noncausal else context + offset + 1)
+            rows.append(max(0, visible) if ratio <= 1
+                        else max(0, visible) // ratio)
+    return tuple(rows)
+
+
 def _view_completed_keys(view, ratio):
-    """Compressed keys one request's populated cache holds.
-
-    Causal completion counts the appended query tokens, and a compressed key
-    exists only after a whole ``ratio`` group completes. ``ratio <= 1`` is the
-    dense non-compressed indexer: every context and query token is a key.
-    """
-    total = (max(0, int(getattr(view, "context", 0) or 0))
-             + max(0, int(getattr(view, "q_len", 0) or 0)))
-    if ratio <= 1:
-        return total
-    return total // ratio
+    """Largest completed key count any owned query row of this view sees."""
+    return max(_view_row_keys(view, ratio), default=0)
 
 
-def _candidate_keys(views, ratio):
+def _candidate_keys(views, ratio, maxima=None):
     """Completed keys of the arch35 scan and of its physical cache payload.
 
     The scan walks the largest populated cache in one owner wave; the payload
@@ -231,8 +243,9 @@ def _candidate_keys(views, ratio):
     shared: dict[str, int] = {}
     private = 0
     largest = 0
-    for view in views:
-        keys = _view_completed_keys(view, ratio)
+    for index, view in enumerate(views):
+        keys = (int(maxima[index]) if maxima is not None
+                else _view_completed_keys(view, ratio))
         largest = max(largest, keys)
         context = max(0, int(getattr(view, "context", 0) or 0))
         prefix = max(0, min(int(getattr(view, "prefix_tokens", 0) or 0), context))
@@ -245,7 +258,7 @@ def _candidate_keys(views, ratio):
             private += keys
     payload = sum(shared.values()) + private
     scan = max(largest, max(shared.values(), default=0))
-    return scan, max(1, payload)
+    return scan, payload
 
 
 def declare_arch35(builder, *, deps, views, plan, quant, parallel,
@@ -259,18 +272,34 @@ def declare_arch35(builder, *, deps, views, plan, quant, parallel,
     """
     del block_size
     ratio = plan.compress_ratio
-    keys, payload_keys = _candidate_keys(views, ratio)
-    _check_arch35_domain(plan, quant, parallel, keys)
-    tokens = sum(view.q_len for view in views)
+    noncausal = bool(getattr(plan, "noncausal_attention", False))
+    row_completed = tuple(
+        key for view in views
+        for key in _view_row_keys(view, ratio, noncausal))
+    view_max = tuple(
+        max(_view_row_keys(view, ratio, noncausal), default=0)
+        for view in views)
+    keys, payload_keys = _candidate_keys(views, ratio, view_max)
+    tokens = len(row_completed)
+    _check_arch35_domain(plan, quant, parallel, keys, tokens)
     heads, width = plan.index_heads, plan.index_dim
     width = width if isinstance(width, int) and width > 0 else NATIVE_HEAD_DIM
     key_row_bytes = int(index_row_bytes_from(builder.model, width, quant))
-    blocks = key_blocks(keys)
+    blocks = key_blocks(keys) if keys > 0 else 0
+    keys_padded = blocks * 1024
+    runs = []
+    for value in row_completed:
+        if runs and runs[-1][1] == value:
+            runs[-1] = (runs[-1][0] + 1, value)
+        else:
+            runs.append((1, value))
     ledger = {
         "query_rows": int(tokens), "wave_rows": INDEXER_WAVE_ROWS,
         "waves": indexer_waves(tokens), "blocks": blocks,
-        "heads": heads, "width": width, "keys": blocks * 1024,
+        "heads": heads, "width": width, "keys": keys_padded,
+        "keys_padded": keys_padded,
         "completed_keys": keys, "payload_keys": payload_keys,
+        "row_completed_keys": tuple(runs),
         "key_row_bytes": key_row_bytes,
         "output_bytes": float(tokens) * plan.index_topk * INT32_BYTES,
     }

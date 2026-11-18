@@ -12,7 +12,6 @@ from dataclasses import replace
 from functools import lru_cache, partial
 
 from mindie_sim.schema.common import ModelingError
-from .batch_prefix_attention import sparse_prefix_fill
 from .indexed_attention import (
     _align, bind_sustained_dram, build_pipeline, owner_row_tiles, _phases,
 )
@@ -325,16 +324,33 @@ def prefix_partition(shape, sequences, topk, *, sequence_keys=False):
                        for _sequence, query, _context, _prefix in private_requests)
     shared_selected = 0
     for members in groups.values():
-        fill = sparse_prefix_fill(
-            rows=sum(query for _sequence, query, _context, _prefix in members),
-            requests=len(members), selected=topk,
-            prefix_tokens=max(prefix for _s, _q, _c, prefix in members),
-            context=max(context for _s, _q, context, _p in members))
-        shared_rows += fill.shared_unique
-        private_rows += fill.private_rows
-        shared_selected = max(shared_selected, fill.shared_selected)
-        for sequence, _query, _context, _prefix in members:
-            private_keys_by_seq[sequence] = topk - fill.shared_selected
+        member_shared = []
+        member_private = []
+        member_extent = []
+        for sequence, query, context, prefix in members:
+            visible = max(0, int(context) + int(query))
+            # A short context counts the appended query row; a context that
+            # already covers TopK keeps its declared extent.
+            effective = (visible if int(context) < topk
+                         else max(1, int(context)))
+            sel = min(topk, visible)
+            shared_ext = min(int(prefix), visible)
+            shared_sel = (min(sel, shared_ext,
+                              (sel * shared_ext + effective // 2) // effective)
+                          if effective > 0 else 0)
+            member_shared.append(shared_sel)
+            member_private.append(sel - shared_sel)
+            member_extent.append(shared_ext)
+            private_keys_by_seq[sequence] = sel - shared_sel
+        if any(member_extent):
+            shared_rows += min(
+                max(member_extent),
+                sum(query * shared for (_s, query, _c, _p), shared
+                    in zip(members, member_shared)))
+            private_rows += sum(
+                query * private for (_s, query, _c, _p), private
+                in zip(members, member_private))
+            shared_selected = max(shared_selected, max(member_shared))
     if not groups:
         result = (0, rows * topk, 0)
     else:

@@ -76,7 +76,7 @@ def sparse_prefix_fill(*, rows: int, requests: int, selected: int,
         raise ModelingError("sparse_prefix_fill_requests_exceed_query_rows")
     shared = min(prefix_tokens, context)
     shared_selected = (selected * shared + context // 2) // context
-    shared_selected = min(shared_selected, selected)
+    shared_selected = min(shared_selected, selected, shared)
     shared_unique = min(shared, requests * shared_selected)
     private_rows = requests * (selected - shared_selected)
     return SparsePrefixFill(shared_selected, shared_unique, private_rows,

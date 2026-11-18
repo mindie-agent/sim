@@ -79,6 +79,7 @@ def packed_sfa_geometry(meta, heads, plan, views, cp, *, cache_dtype="",
         return None
     if cache_fmt is not None and not (
             cache_fmt.dtype == "int8"
+            and cache_fmt.packed_elements == ONE
             and cache_fmt.group_size == PACKED_C8_GROUP_SIZE
             and cache_fmt.scale_dtype == "fp32"
             and cache_fmt.suffix_elements == int(plan.qk_rope_head_dim)
@@ -180,9 +181,11 @@ def attention_batch(b, outputs, views, *, plan, heads, local_heads, cp, rows):
         semantic_shape=shape, local_shape=shape, padded_shape=shape, launch_shape=shape,
         deps=tuple(dict.fromkeys(dep for op in members for dep in op.deps)),
         flops=sum(op.flops for op in members), vector_ops=sum(op.vector_ops for op in members),
-        hbm_bytes=sum(op.hbm_bytes for op in members) + (statistics if native_packed else ZERO),
+        hbm_bytes=sum(op.hbm_bytes for op in members) + (
+            statistics if (native_packed or cp > ONE) else ZERO),
         mte2_bytes=sum(op.mte2_bytes for op in members),
-        mte3_bytes=sum(op.mte3_bytes for op in members) + (statistics if native_packed else ZERO),
+        mte3_bytes=sum(op.mte3_bytes for op in members) + (
+            statistics if (native_packed or cp > ONE) else ZERO),
         metadata=tuple(meta.items()))
     b.ops[:] = [op for op in b.ops if op.op_id not in ids]
     b.ops.append(batch)

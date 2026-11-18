@@ -485,7 +485,12 @@ def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
     # DP-scoped and the lowering keeps its declared uniform peer policy.
     source_rows_by_replica = tuple(
         active_rows_by_replica[p] for p in participants)
-    cohort_views_by_replica = tuple(logical_views[p] for p in participants)
+    from .frontend import Frontend
+    cohort_views_by_replica = tuple(
+        Frontend.partition_views(
+            logical_views[p], case.runtime, active_rows_by_replica[p],
+            model=case.model)[0]
+        for p in participants)
     routing_global_tokens = (
         padded_cohort if padded_cohort is not None
         else (sum(active_rows_by_replica.values())

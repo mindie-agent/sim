@@ -127,7 +127,9 @@ def _prefix_fields(views):
         str(getattr(v, "prefix_cache_key", "") or "") for v in views if v.prefix_tokens)
     if not shared:
         return {"prefix_cache_mode": "private"}
-    return {"prefix_cache_mode": "shared", "prefix_tokens": extents}
+    return {"prefix_cache_mode": "shared", "prefix_tokens": extents,
+            "prefix_cache_keys": tuple(
+                str(getattr(v, "prefix_cache_key", "") or "") for v in views)}
 
 
 def unsupported_reason(*, views, plan, parallel, model, padded_tokens,

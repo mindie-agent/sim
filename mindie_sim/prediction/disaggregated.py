@@ -431,6 +431,7 @@ def _pd_handoff_binding(request, tokens, placement, cases, memory, execution,
                 if windowed:
                     dest_tokens = (max(window_start, dest_tokens[0]),
                                    min(tokens, dest_tokens[1]))
+                d_lo, d_hi = dest_tokens
                 dst_storage = f"pd:kv:{request}:decode:r{decode_rep}:rank{dest_rank}"
                 if offload and component == "mla_kv" and layer.index in offload_layers:
                     if not host_done:
@@ -472,6 +473,41 @@ def _pd_handoff_binding(request, tokens, placement, cases, memory, execution,
                              destination_storage=dst_storage)
                     continue
                 if need <= 0.0:
+                    continue
+                if component in {"mla_kv", "window"} and d_hi > d_lo:
+                    # A dense non-GQA cache row is owned by the token axis.
+                    # Intersect each source shard with the destination's own
+                    # rows; TP replicas holding the same interval deduplicate.
+                    per_token = need / float(d_hi - d_lo)
+                    covered_tokens: list[tuple[int, int]] = []
+                    for _src_index, src_rank, _src_values, src_tokens in src_views:
+                        s_lo, s_hi = src_tokens
+                        if windowed:
+                            s_lo, s_hi = (max(window_start, s_lo),
+                                          min(tokens, s_hi))
+                        lo, hi = max(s_lo, d_lo), min(s_hi, d_hi)
+                        if hi <= lo:
+                            continue
+                        for piece_lo, piece_hi in _uncovered_intervals(
+                                covered_tokens, lo, hi):
+                            emit(src_rank, dest_rank, component,
+                                 per_token * (piece_hi - piece_lo),
+                                 source_stage=source_stage,
+                                 destination_stage=destination_stage,
+                                 layer=layer.index,
+                                 source_span=(0, num_heads),
+                                 destination_span=(0, num_heads),
+                                 source_tokens=(piece_lo, piece_hi),
+                                 destination_tokens=(piece_lo, piece_hi),
+                                 source_storage=f"pd:kv:{request}:prefill:r{prefill_rep}:rank{src_rank}",
+                                 destination_storage=dst_storage)
+                            covered_tokens.append((piece_lo, piece_hi))
+                    covered_rows = sum(piece_hi - piece_lo
+                                       for piece_lo, piece_hi in covered_tokens)
+                    if covered_rows < d_hi - d_lo:
+                        raise ModelingError(
+                            "pd_handoff_token_range_uncovered:"
+                            f"{request}:{layer.index}:{component}:{dest_rank}")
                     continue
                 remaining = need
                 for src_index, src_rank, src_values, src_tokens in src_views:

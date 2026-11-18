@@ -509,13 +509,17 @@ def test_arch35_and_arch22_recipes_coexist_and_route_by_representation():
     assert ledger == {"query_rows": 960, "wave_rows": sp.INDEXER_WAVE_ROWS,
                       "waves": 30, "blocks": 33, "heads": INDEX_HEADS,
                       "width": INDEX_WIDTH, "keys": 33792,
+                      "keys_padded": 33792,
                       "completed_keys": 32769,
                       # Every private request owns its own compressed cache.
                       "payload_keys": 160 * 32769,
+                      # Offsets 0..2 complete 32,768 keys, 3..5 complete
+                      # 32,769; one two-run period per six-row request.
+                      "row_completed_keys": ((3, 32768), (3, 32769)) * 160,
                       "key_row_bytes": INDEX_ROW_BYTES,
                       "output_bytes": float(960 * INDEX_TOPK * 4)}
     assert dict(op.matrix_flops) == {
-        "fp8_e4m3": 2.0 * 960 * INDEX_HEADS * 32769 * INDEX_WIDTH}
+        "fp8_e4m3": 2.0 * 480 * INDEX_HEADS * (32768 + 32769) * INDEX_WIDTH}
     view = dict(op.metadata)["native_tensor_view"]
     assert view["quant_mode"] == 1
     assert view["kind"] == "aclnn_quant_lightning_indexer_v2_arch35"

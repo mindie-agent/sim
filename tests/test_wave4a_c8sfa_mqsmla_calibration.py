@@ -260,10 +260,11 @@ def test_c8_private_mode_exposes_every_selected_row():
     private = {"sequences": sequences, "topk": 256, "prefix_cache_mode": "private"}
     shared_unique, private_rows, shared_selected = prefix_partition(
         shared, sequences, 256)
-    # One physical shared union, plus each request's own few selected rows.
+    # One physical shared union, plus each of the six query rows' own few
+    # selected rows (the private extent is per query row, not per request).
     assert shared_unique == 15564
     assert shared_selected == 243
-    assert private_rows == 96 * 13
+    assert private_rows == 96 * 6 * 13
     # Without a shared pool nothing is cold-filled: every row is its own read.
     assert prefix_partition(private, sequences, 256) == (0, 96 * 6 * 256, 0)
 
