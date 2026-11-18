@@ -979,22 +979,32 @@ def occurrence_work_graph(graph_report: Mapping[str, Any] | None,
     if not timeline:
         return None
     service: dict[str, dict[str, float]] = {}
+    relative: dict[str, dict[str, float]] = {}
     for row in operator_rows:
         op = row.get("operator") if isinstance(row.get("operator"), Mapping) else row
         op_id = str(op.get("op_id") or row.get("op_id") or "")
         if not op_id:
             continue
-        service[op_id] = {
+        metrics = {
             "cube_ms": float(row.get("t_cube_ideal_ms", ZERO_FLOAT) or ZERO_FLOAT),
             "vector_ms": float(row.get("t_vec_ideal_ms", ZERO_FLOAT) or ZERO_FLOAT),
             "hbm_ms": float(row.get("t_hbm_ideal_ms", ZERO_FLOAT) or ZERO_FLOAT),
             "link_ms": float(row.get("t_link_ideal_ms", ZERO_FLOAT) or ZERO_FLOAT),
             "fixed_ms": float(row.get("fixed_ms", ZERO_FLOAT) or ZERO_FLOAT),
         }
+        service[op_id] = metrics
+        relative.setdefault(normalize_reference(
+            op_id, int(row.get("stage", ZERO)), int(row.get("layer", ZERO))), metrics)
     rows = []
     for item in timeline:
         op_id = str(item.get("op_id") or "")
-        rows.append({**item, **service.get(op_id, {})})
+        matched = service.get(op_id)
+        if matched is None and op_id:
+            match = _OCCURRENCE_IDENTITY.search(op_id)
+            if match is not None:
+                matched = relative.get(normalize_reference(
+                    op_id, int(match.group(ONE)), int(match.group(ONE + ONE))))
+        rows.append({**item, **(matched or {})})
     return graph_from_occurrences(rows)
 
 
@@ -1192,6 +1202,7 @@ def _evaluate_target_efficiency_legacy(
         evaluated_ops.append({
             **op, "actual_mbu": op["mbu"], "actual_cube_mfu": op["cube_mfu"], "actual_vec_mfu": op["vec_mfu"],
             "current_duration_ms": op["duration_ms"], "raw_target_duration_ms": raw_t, "target_duration_ms": eval_ms,
+            "target_fixed_ms": t_fixed,
             "current_total_ms": cur_tot, "target_total_ms": tgt_tot, "gap_ms": cur_tot - tgt_tot, "target_pipe_requirement_ms": pipe_req,
             "target_mbu": (op["t_hbm_ideal_ms"] / safe_eval) if op["hbm_bytes"] > 0 else None, "service_only_target_mbu": (op["t_hbm_ideal_ms"] / safe_svc) if op["hbm_bytes"] > 0 else None,
             "target_cube_mfu": (op["t_cube_ideal_ms"] / safe_eval) if op["flops"] > 0 else None, "target_vec_mfu": (op["t_vec_ideal_ms"] / safe_eval) if op["vector_ops"] > 0 else None,
@@ -1254,8 +1265,7 @@ def _target_occurrence_nodes(graph, operators):
             vector_ms=float(requirements["vec"]),
             hbm_ms=float(requirements["hbm"]),
             link_ms=float(requirements["link"]),
-            launch_ms=float(row.get("raw_target_duration_ms")
-                            or node.launch_ms),
+            fixed_ms=float(row.get("target_fixed_ms", node.fixed_ms)),
         ))
     return tuple(nodes)
 
@@ -1295,15 +1305,22 @@ def evaluate_target_efficiency(
         launch_ms=float(row.get("fixed_ms") or ZERO_FLOAT),
         occurrences=max(ONE, int(row.get("occurrences", ONE) or ONE)),
     ) for index, row in enumerate(operators))
-    ideal = critical_path_roofline(PhysicalWorkGraph(nodes), RooflineTargets())
     if mode == "exact_target" and occurrence_graph is not None:
         # Reuse the realized occurrence DAG: predecessors and physical
         # resource identities must survive the target-weight substitution.
         target_nodes = _target_occurrence_nodes(occurrence_graph, operators)
+        ideal_nodes = tuple(
+            replace(node, fixed_ms=min(node.fixed_ms, target.fixed_ms))
+            for node, target in zip(occurrence_graph.nodes, target_nodes)
+        )
+        ideal = critical_path_roofline(
+            PhysicalWorkGraph(ideal_nodes, occurrence_graph.edges),
+            RooflineTargets())
         roofline = critical_path_roofline(
             PhysicalWorkGraph(target_nodes, occurrence_graph.edges),
             RooflineTargets())
     else:
+        ideal = critical_path_roofline(PhysicalWorkGraph(nodes), RooflineTargets())
         target_nodes = tuple(PhysicalWorkNode(
             node_id=node.node_id,
             cube_ms=float(row["target_pipe_requirement_ms"]["cube"]),
@@ -1720,11 +1737,16 @@ def _vram_max_sequences_per_dp(
     rt_cap = min(int(scaled.runtime.max_num_seqs), max(1, int(scaled.runtime.max_num_batched_tokens) // q_tokens))
 
     def fits(b: int) -> bool:
+        batch_memory = (
+            memory if memory is not None
+            and int(getattr(memory, "workspace_tokens", ZERO) or ZERO) == max(ONE, b * q_tokens)
+            else None
+        )
         return capacity_window(
             scaled, phase=phase, context=context, tokens_per_seq=q_tokens,
             sequences=b, output_budget=output_budget,
             emitted_tokens_per_seq=emitted_tokens_per_seq,
-            async_scheduling=None, memory=memory,
+            async_scheduling=None, memory=batch_memory,
         )["fits"]
 
     if not fits(1):
