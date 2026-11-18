@@ -67,7 +67,8 @@ def lower(ops, bindings):
             if source.layer != op.layer:
                 continue
             sm = dict(source.metadata)
-            if source.recipe == "route_pack" and sm.get("num_experts"):
+            if (source.recipe in {"route_pack", "moe_init_routing_v3"}
+                    and sm.get("num_experts")):
                 producers.append(source)
             else:
                 pending.extend(source.deps)

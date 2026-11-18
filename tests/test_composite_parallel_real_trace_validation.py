@@ -68,18 +68,23 @@ HELDOUT_CASES = (
 # ``reference_ms`` is the current physical-model body step, retained only as a
 # regression pin for the roofline/conservation decomposition. It is not an NPU
 # capture, not a calibration target, and not evidence of measured accuracy.
+# Re-pinned for Wave 3C from intentional CANN 9.2.1 fusions only:
+#   * every MoE row (``a2-*``, ``a3-9362-*``, ``a5-*`` qwen/glm) moves by the
+#     declared ``aclnnMoeGatingTopK`` overlay replacing the eager router chain;
+#   * ``a5-v41-fp8-prefill`` additionally moves by the A5 fused compressor and
+#     quantized-index caching; no tolerance or calibration value changed.
 CAPTURES = (
-    ("a2-qwen35-w8a8-ep4-sn", "qwen3.5-35b-a3b", "a2", "w8a8", "Ascend910B4", 2, 2, 4, None, 2, 8, "decode", 1, 128, 1, 0.3242015909642013),
-    ("a3-9362-qwen35-w8a8-ep8-sn", "qwen3.5-35b-a3b", "Ascend910_9362", "w8a8", "Ascend910_9362", 4, 2, 8, None, 2, 8, "decode", 1, 256, 1, 0.3845899378478667),
-    ("a3-9392-glm53-w4a8-ep2-sn", "glm-5.3", "Ascend910_9392", "w4a8", "Ascend910_9392", 2, 1, 2, None, 4, 8, "decode", 1, 128, 1, 1.0733827380739711),
-    ("a5-9582-qwen35-fp8-prefill", "qwen3.5-35b-a3b", "Ascend950DT_9582", "fp8", "Ascend950DT_9582", 2, 1, 2, None, 2, 8, "prefill", 128, 0, 1, 0.4304460917971684),
-    ("a5-9582-qwen397-w4a8", "qwen3.5-397b-a17b", "Ascend950DT_9582", "w4a8", "Ascend950DT_9582", 2, 1, 2, None, 2, 8, "decode", 1, 128, 1, 0.39319430108335846),
-    ("a2-dsv32-w8a8-ep4", "deepseek-v3.2", "a2", "w8a8", "Ascend910B4", 2, 2, 4, None, 4, 8, "decode", 1, 128, 1, 2.6301291810333716),
-    ("a5-v41-fp8-prefill", "deepseek-v4.1", "Ascend950DT_9582", "fp8", "Ascend950DT_9582", 2, 1, 2, None, 4, 8, "prefill", 128, 0, 1, 1.6155179620575466),
-    ("a3-9362-ep16-sn", "qwen3.5-35b-a3b", "Ascend910_9362", "w8a8", "Ascend910_9362", 4, 4, 16, 16, 2, 16, "decode", 1, 64, 1, 0.464605621521336),
-    ("a2-ep16-mn", "qwen3.5-35b-a3b", "a2", "w8a8", "Ascend910B4", 4, 4, 16, 8, 2, 16, "decode", 1, 64, 1, 0.6189950452539841),
-    ("a5-9582-ep32-mn-fp8", "qwen3.5-397b-a17b", "Ascend950DT_9582", "fp8", "Ascend950DT_9582", 4, 8, 32, 8, 2, 32, "decode", 1, 64, 1, 1.8260753361439215),
-    ("a5-9582-ep64-mn", "qwen3.5-35b-a3b", "Ascend950DT_9582", "w8a8", "Ascend950DT_9582", 8, 8, 64, 8, 2, 64, "prefill", 128, 0, 1, 3.333980662939374),
+    ("a2-qwen35-w8a8-ep4-sn", "qwen3.5-35b-a3b", "a2", "w8a8", "Ascend910B4", 2, 2, 4, None, 2, 8, "decode", 1, 128, 1, 0.31420159096420136),
+    ("a3-9362-qwen35-w8a8-ep8-sn", "qwen3.5-35b-a3b", "Ascend910_9362", "w8a8", "Ascend910_9362", 4, 2, 8, None, 2, 8, "decode", 1, 256, 1, 0.37458993784786665),
+    ("a3-9392-glm53-w4a8-ep2-sn", "glm-5.3", "Ascend910_9392", "w4a8", "Ascend910_9392", 2, 1, 2, None, 4, 8, "decode", 1, 128, 1, 1.0433827380739717),
+    ("a5-9582-qwen35-fp8-prefill", "qwen3.5-35b-a3b", "Ascend950DT_9582", "fp8", "Ascend950DT_9582", 2, 1, 2, None, 2, 8, "prefill", 128, 0, 1, 0.42693809179716835),
+    ("a5-9582-qwen397-w4a8", "qwen3.5-397b-a17b", "Ascend950DT_9582", "w4a8", "Ascend950DT_9582", 2, 1, 2, None, 2, 8, "decode", 1, 128, 1, 0.38968630108335833),
+    ("a2-dsv32-w8a8-ep4", "deepseek-v3.2", "a2", "w8a8", "Ascend910B4", 2, 2, 4, None, 4, 8, "decode", 1, 128, 1, 2.577629181033372),
+    ("a5-v41-fp8-prefill", "deepseek-v4.1", "Ascend950DT_9582", "fp8", "Ascend950DT_9582", 2, 1, 2, None, 4, 8, "prefill", 128, 0, 1, 1.537811582362521),
+    ("a3-9362-ep16-sn", "qwen3.5-35b-a3b", "Ascend910_9362", "w8a8", "Ascend910_9362", 4, 4, 16, 16, 2, 16, "decode", 1, 64, 1, 0.454605621521336),
+    ("a2-ep16-mn", "qwen3.5-35b-a3b", "a2", "w8a8", "Ascend910B4", 4, 4, 16, 8, 2, 16, "decode", 1, 64, 1, 0.608995045253984),
+    ("a5-9582-ep32-mn-fp8", "qwen3.5-397b-a17b", "Ascend950DT_9582", "fp8", "Ascend950DT_9582", 4, 8, 32, 8, 2, 32, "decode", 1, 64, 1, 1.8225673361439214),
+    ("a5-9582-ep64-mn", "qwen3.5-35b-a3b", "Ascend950DT_9582", "w8a8", "Ascend950DT_9582", 8, 8, 64, 8, 2, 64, "prefill", 128, 0, 1, 3.330472662939374),
 )
 
 PIPELINE = (("kimi-k3", 2), ("glm-5.3", 4), ("deepseek-v4-pro", 4), ("qwen3.5-397b-a17b", 2))

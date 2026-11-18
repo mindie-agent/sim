@@ -61,6 +61,7 @@ INDEX_WIDTH = 128
 INDEX_HEADS = 32
 KV_RANK = 512
 ROPE_WIDTH = 64
+PROLOG_QUERY_LORA_RANK = 1536
 
 
 def _mla_plan(**overrides):
@@ -189,13 +190,19 @@ def test_fused_compressor_conserves_member_work_and_reads_hidden_once():
                              + 6 * 2 * ROPE_WIDTH)
     weight_bytes = builder.quant.matrix_bytes(HEAD_WIDTH, HIDDEN,
                                               compression.COMPRESSION_RECIPE)
-    state = (8 + 8) * HEAD_WIDTH * int(dtype_bytes("fp32"))
-    ape = pool_rows * int(dtype_bytes("fp32"))
+    # The rolling state is read and written once per bounded state row, not
+    # once per projected token; the APE table is one ratio-wide FP32 plane.
+    state_rows = min(8, plan.compressor_state_rows)
+    state = state_rows * HEAD_WIDTH * int(dtype_bytes("fp32"))
+    ape = plan.compress_ratio * HEAD_WIDTH * int(dtype_bytes("fp32"))
+    norm_weight = HEAD_WIDTH * dtype_bytes(plan.compressor_norm_dtype)
+    rope_table = 2 * ROPE_WIDTH * int(dtype_bytes("fp32")) * 2
     assert op.mte2_bytes == (8 * HIDDEN * dtype_bytes("bf16")
-                             + 2 * weight_bytes + state + ape)
-    # Rotated cache row plus the materialized pre-RoPE latent; hidden is read
-    # once and no intermediate values/gates/pooled/normalized round trip.
-    assert op.mte3_bytes == 2 * 2 * HEAD_WIDTH * dtype_bytes("bf16")
+                             + 2 * weight_bytes + state + ape
+                             + norm_weight + rope_table)
+    # Rotated cache row plus the materialized pre-RoPE latent and the rolling
+    # state write; hidden is read once and no intermediate round trip exists.
+    assert op.mte3_bytes == (2 * 2 * HEAD_WIDTH * dtype_bytes("bf16") + state)
     assert op.returns == ("latent",)
     assert dict(op.metadata)["latent_shape"] == (2, HEAD_WIDTH)
 
@@ -318,7 +325,8 @@ def _kimi_quant():
 def _prolog_case():
     plan = _mla_plan(indexer=True, indexer_type="full", index_heads=INDEX_HEADS,
                      index_dim=INDEX_WIDTH, index_topk=512, owns_index_k=True,
-                     owns_topk=True, cache_kind="dense", compress_ratio=0)
+                     owns_topk=True, cache_kind="dense", compress_ratio=0,
+                     q_lora_rank=PROLOG_QUERY_LORA_RANK)
     model = _model(plan, quant=_kimi_quant())
     return plan, model
 
@@ -330,8 +338,8 @@ def test_prolog_v4_admits_dcp8_mxfp8_and_c8_cache():
         quant=model.quant, lowering_passes=("activation_quantization",),
         cache_layout=LAYOUT)
     ops = [
-        _op("s0.l0.q_a", "gemm", (8, KV_RANK, HIDDEN)),
-        _op("s0.l0.q_norm", "rmsnorm", (8, KV_RANK)),
+        _op("s0.l0.q_a", "gemm", (8, PROLOG_QUERY_LORA_RANK, HIDDEN)),
+        _op("s0.l0.q_norm", "rmsnorm", (8, PROLOG_QUERY_LORA_RANK)),
         _op("s0.l0.q_b", "gemm", (8, 8 * HEAD_WIDTH, KV_RANK)),
         _op("s0.l0.kv_a", "gemm", (8, HEAD_WIDTH, HIDDEN)),
         _op("s0.l0.kv_norm", "rmsnorm", (8, KV_RANK)),
@@ -359,8 +367,8 @@ def test_prolog_v3_keeps_bf16_dspark_without_a_rotary_member():
         plan=plan, parallel=ParallelSpec(tp=8, cp=2, pcp=1), model=model,
         quant=model.quant, lowering_passes=())
     ops = [
-        _op("s0.l0.q_a", "gemm", (8, KV_RANK, HIDDEN)),
-        _op("s0.l0.q_norm", "rmsnorm", (8, KV_RANK)),
+        _op("s0.l0.q_a", "gemm", (8, PROLOG_QUERY_LORA_RANK, HIDDEN)),
+        _op("s0.l0.q_norm", "rmsnorm", (8, PROLOG_QUERY_LORA_RANK)),
         _op("s0.l0.q_b", "gemm", (8, 8 * HEAD_WIDTH, KV_RANK)),
         _op("s0.l0.kv_a", "gemm", (8, HEAD_WIDTH, HIDDEN)),
         _op("s0.l0.kv_norm", "rmsnorm", (8, KV_RANK)),
@@ -402,8 +410,10 @@ def test_official_mqsmla_recipe_replaces_the_cannbot_prototype():
     assert MQSMLA_RECIPE == "aclnn_mixed_quant_sparse_flash_mla"
     assert MQSMLA_LEGACY_RECIPE == "cannbot_mixed_quant_sparse_flash_mla"
     assert MQSMLA_RECIPE in IMPLEMENTATIONS and MQSMLA_LEGACY_RECIPE in IMPLEMENTATIONS
-    from mindie_sim.prediction.family_mqsmla import recipes
-    assert set(recipes()) == {MQSMLA_RECIPE, MQSMLA_LEGACY_RECIPE}
+    from mindie_sim.prediction.family_mqsmla import SOURCE_RECIPE, recipes
+    assert SOURCE_RECIPE == "mixed_quant_sparse_flash_mla"
+    assert set(recipes()) == {MQSMLA_RECIPE, SOURCE_RECIPE,
+                              MQSMLA_LEGACY_RECIPE}
     rows = tuple(query_rows({"sequences": ((1, 2048),) * 72, "window": 128,
                              "ratio": 4, "topk": 2048}))
     assert rows == ((128, 512),) * 72

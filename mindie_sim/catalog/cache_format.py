@@ -93,12 +93,28 @@ class CacheFormat:
         return self.transaction_count(width, rows, granule) * granule
 
 
+def _nope_mla_layers(model):
+    """True when every MLA layer declares a zero-width rotary head."""
+    layers = [plan for plan in getattr(model, "layer_plans", ())
+              if getattr(plan, "attention", "") == "mla"]
+    return bool(layers) and all(
+        int(getattr(plan, "qk_rope_head_dim", 0) or 0) == 0 for plan in layers)
+
+
 def cache_format(model, region):
     """Metadata declarations are explicit physical contracts, not calibration."""
     raw = dict(getattr(model, "metadata", ())).get("cache_representations", {}).get(region)
     if raw is None:
         quant = getattr(model, "quant", None)
-        return CacheFormat(getattr(quant, "kv_dtype", "") or getattr(model, "kv_dtype", "bf16"))
+        resolved = (getattr(quant, "kv_dtype", "")
+                    or getattr(model, "kv_dtype", "bf16"))
+        # A NoPE MLA layer keeps no rotary tail, so an FP8 KV checkpoint has
+        # exactly the declared 128-element block row: 512 B payload + four
+        # FP16 scales.  This is a format resolution, not a precision change.
+        if (region == "mla_kv" and str(resolved) in {"fp8", "fp8_e4m3"}
+                and _nope_mla_layers(model)):
+            return block_quantized_mla_format()
+        return CacheFormat(resolved)
     if set(raw) - {"dtype", "group_size", "scale_dtype", "suffix_elements",
                    "suffix_dtype", "packed_elements"}:
         raise ModelingError("cache_representation_fields_unknown:" + region)

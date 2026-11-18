@@ -68,6 +68,8 @@ NOMINAL_H2D_BPS = 32_000_000_000.0
 BYTES_PER_GB = 1_000_000_000.0
 NEXTN_DEFAULT_HEAD_DIM = 192
 PP_CAP_DEFAULT = (1, 2, 4, 8, 16)
+#: Native KDA recurrent source: decode-only batches up to q8.
+KDA_DECODE_MAX_QUERY_TOKENS = 8
 
 HARDWARE_ALIASES: dict[str, str] = {
     "a2": "Ascend910B4", "910b": "Ascend910B4", "910b4": "Ascend910B4",
@@ -76,6 +78,7 @@ HARDWARE_ALIASES: dict[str, str] = {
     "910_9382": "Ascend910_9382",
     "a5": "Ascend950DT_9582", "950": "Ascend950DT_9582",
     "a5-pod": "Ascend950DT_9581", "atlas-950-superpod": "Ascend950DT_9581",
+    "950pr_958b": "Ascend950PR_958b", "ascend950pr_958b": "Ascend950PR_958b",
     "h20": "NVIDIA_H20", "h800": "NVIDIA_H800", "h200": "NVIDIA_H200",
     "b300": "NVIDIA_B300",
     "800i-a2": "Ascend910B4", "800i-a3": "Ascend910_9392",
@@ -213,17 +216,29 @@ def _resolve_va_lowerings(
         cp=int(parallel.get("cp", parallel.get("dcp", 1))), pcp=int(parallel.get("pcp", 1)),
     )
     lowerings: dict[str, Any] = {}
-    if (any(p.attention == "kda" for p in model_spec.layer_plans)
+    kda_layers = [p for p in model_spec.layer_plans if p.attention == "kda"]
+    if (kda_layers
             and p_cfg.pcp >= DEFAULT_PARALLEL
             and (p_cfg.cp == DEFAULT_PARALLEL
                  or execution(model_spec).get("recurrent_context_sharded") is False)):
         # This source kernel owns complete decode batches with q1-q8. Prefill,
         # mixed batches and longer queries retain explicit semantic work.
+        kda_binding = ("vllm_ascend_recurrent_kda_arch35" if is_a5
+                       else "vllm_ascend_recurrent_kda_arch22")
+        kda_options = {}
+        if is_a5:
+            from mindie_sim.prediction.kda_source import resolve as resolve_kda_source
+            bounds = {getattr(p, "kda_gate_lower_bound", None) for p in kda_layers}
+            if len(bounds) == 1:
+                kda_options = resolve_kda_source(
+                    kda_layers[0], arch="A5", phase="decode", kernels={},
+                    activation_dtype=model_spec.activation_dtype) or {}
         lowerings["kda"] = {
             "cases": [{
-                "domain": {"phases": ["decode"], "max_query_tokens": {"min": 1, "max": 8}},
-                "binding": ("vllm_ascend_recurrent_kda_arch35" if is_a5
-                            else "vllm_ascend_recurrent_kda_arch22"),
+                "domain": {"phases": ["decode"],
+                           "max_query_tokens": {"min": 1,
+                                                "max": KDA_DECODE_MAX_QUERY_TOKENS}},
+                "binding": {"implementation": kda_binding, "options": kda_options},
             }],
             "otherwise": "analytical",
         }
@@ -252,11 +267,22 @@ def _resolve_va_lowerings(
                   and p.mla_variant != "latent_mqa"]
     if mla_layers:
         from mindie_sim.prediction.family_mla_prolog import validate as validate_mla_prolog
+        prolog_options: dict[str, Any] = {}
+        quant = model_spec.quant
+        if (is_a5 and quant is not None and quant.kv_dtype == "int8"):
+            # The int8 KV row is the packed 656 B C8 layout on A5; the source
+            # prolog writes payload, BF16 rotary and FP32 scales in one row.
+            from mindie_sim.prediction.mla_prolog_packed import LAYOUT
+            prolog_options["cache_layout"] = LAYOUT
         try:
             for plan in mla_layers:
                 validate_mla_prolog(plan=plan, parallel=p_cfg, model=model_spec,
-                                    quant=model_spec.quant, lowering_passes=lowering_passes)
-            lowerings["mla_prolog"] = "vllm_ascend_mla_prolog_v3"
+                                    quant=quant, lowering_passes=lowering_passes,
+                                    **prolog_options)
+            lowerings["mla_prolog"] = (
+                {"implementation": "vllm_ascend_mla_prolog_v3",
+                 "options": prolog_options}
+                if prolog_options else "vllm_ascend_mla_prolog_v3")
         except ModelingError as exc:
             from mindie_sim.prediction.implementation_selection import fallback_note
             notes.append(fallback_note("mla_prolog", str(exc)))
@@ -280,7 +306,46 @@ def _resolve_va_lowerings(
             elif is_mx_fp8:
                 lowerings["add_rmsnorm_quant"] = "vllm_ascend_native_norm"
                 lowerings["rmsnorm_quant"] = "vllm_ascend_native_norm"
+    # CANN 9.2.1 native compressor and KeyPool caller.  A layer declaration
+    # selects the source; ``raw_eager`` never reaches this resolver.
+    if any(int(getattr(plan, "compress_ratio", 0) or 0) > 0
+           for plan in model_spec.layer_plans):
+        lowerings.setdefault("compressor", "vllm_ascend_cann_compressor")
+    if any(int(getattr(plan, "index_kpool", 1) or 1) > 1
+           for plan in model_spec.layer_plans):
+        lowerings.setdefault("pool_key_indexer", "vllm_ascend_cann_keypool_caller")
     return lowerings
+
+
+def _tier4_router_spec(model_spec: ModelSpec, sku: str, *, raw_eager: bool) -> ModelSpec:
+    """A5 production executes the router in Tier-4 form.
+
+    ``DS-V4-Pro`` stores an FP32 router and pre-casts its weight copy.  On A5
+    the source kernel consumes the checkpoint weight directly and requests an
+    FP32 output, so no ``router_input_cast`` launch remains.  A standalone
+    ``load_model`` keeps the checkpoint declaration untouched.
+    """
+    if raw_eager or _arch_key(sku) != "a5":
+        return model_spec
+
+    def rewrite(plans):
+        return tuple(
+            replace(plan, router_dtype="", router_output_dtype="fp32",
+                    router_precast_weight_copy=False)
+            if plan.router_dtype == "fp32" else plan
+            for plan in plans)
+
+    aux = model_spec.auxiliary
+    changes = {}
+    if aux is not None:
+        for name in ("mtp", "dspark"):
+            spec = getattr(aux, name)
+            if spec is not None and tuple(getattr(spec, "layer_plans", ())):
+                changes[name] = replace(spec, layer_plans=rewrite(spec.layer_plans))
+    if changes:
+        aux = replace(aux, **changes)
+    return replace(model_spec, layer_plans=rewrite(model_spec.layer_plans),
+                   auxiliary=aux)
 
 
 def _to_jsonable(value: Any) -> Any:
@@ -875,6 +940,9 @@ def compose_case(
     else:
         resolved_max_model_len = max(32768, required_len)
 
+    # A5 production router form is a compose-scoped rewrite; a standalone
+    # ``load_model`` keeps the checkpoint declaration.
+    model_spec = _tier4_router_spec(model_spec, sku, raw_eager=raw_eager)
     model_dict = _to_jsonable(model_spec)
     model_dict["n_routed_experts"] = int(model_spec.num_experts)
     model_dict["num_experts_per_tok"] = int(model_spec.top_k)
@@ -902,6 +970,10 @@ def compose_case(
         **({"raw_eager": True} if raw_eager else {}),
         "execution_policy": dict(execution_policy),
     }
+    if ascend_backend:
+        # Declared silicon family for native-fusion activation.  A raw-eager
+        # execution keeps the same provenance but no optional fusion.
+        runtime_meta.setdefault("arch_family", _arch_key(sku).upper())
     if resolved_engram_offload:
         h2d_ch = dict((machine.get("transfer_channels") or {}).get("h2d") or {})
         h2d_bps = (float(h2d_ch.get("effective_uni_bw_gbps") or 0.0)
@@ -1025,6 +1097,7 @@ def compose_case(
     # unmerged-PR / architectural-ideal mechanism set on top of the documented
     # profile base.  ``va_recommended=False`` with the default ``merged`` track
     # keeps zero automatic stack fusions, preserving the caller's bare case.
+    mechanism_track_active = False
     if ascend_backend and not raw_eager:
         from mindie_sim.feature_mechanisms import MechanismContext
         from mindie_sim.stack_tracks import (
@@ -1035,6 +1108,7 @@ def compose_case(
         canonical_track = normalize_feature_track(feature_track)
         if (va_recommended is not False or bool(optimizations)
                 or bool(exclude_optimizations) or canonical_track != "merged"):
+            mechanism_track_active = True
             stack_profile = resolve_runtime_stack(runtime_stack)
             stack_model_key = str(
                 (va_profile or {}).get("canonical_model") or model_spec.name)
@@ -1085,6 +1159,33 @@ def compose_case(
         runtime_meta["operator_selection_summary"] = operator_selection_summary(
             arch_family=_arch_key(sku), phase=DECLARATION_PHASE, notes=notes)
         runtime_dict["metadata"] = runtime_meta
+
+    # CANN 9.2.1 stack declarations shared by the documented profile and the
+    # merged mechanism track.  ``va_recommended=False`` without a selected
+    # mechanism keeps the caller's bare case.
+    if (ascend_backend and not raw_eager
+            and (va_recommended is not False or mechanism_track_active)):
+        from mindie_sim.feature_mechanisms import ensure_norm_quant_domain
+        kernels = dict(runtime_dict.get("kernels") or {})
+        lowerings = dict(kernels.get("lowerings") or {})
+        if any(plan.ffn == "moe" for plan in model_spec.layer_plans):
+            kernels.setdefault("moe_gating",
+                               {"implementation": "vllm_ascend_cann_gating"})
+        if any(int(getattr(plan, "compress_ratio", 0) or 0) > 0
+               for plan in model_spec.layer_plans):
+            lowerings.setdefault("compressor", "vllm_ascend_cann_compressor")
+        pooled = any(int(getattr(plan, "index_kpool", 1) or 1) > 1
+                     for plan in model_spec.layer_plans)
+        if pooled:
+            lowerings.setdefault("pool_key_indexer",
+                                 "vllm_ascend_cann_keypool_caller")
+            model_dict.setdefault("metadata", {})["native_keypool_caller"] = True
+        if "norm_quant" in tuple(runtime_dict.get("lowering_passes") or ()):
+            kernels = ensure_norm_quant_domain(kernels)
+        if lowerings:
+            kernels["lowerings"] = lowerings
+        if kernels:
+            runtime_dict["kernels"] = kernels
 
     case_dict: dict[str, Any] = {
         "model": model_dict,

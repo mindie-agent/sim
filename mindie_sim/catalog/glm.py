@@ -36,6 +36,9 @@ from mindie_sim.schema.model import LayerPlan
 from mindie_sim.schema.common import ModelingError
 
 
+DEFAULT_QK_HEAD_DIM = 256
+MTP_PP_CAPABILITY = (1, 2, 4, 8, 16)
+
 def _index_pool(c):
     size = int(c.get("index_kpool") or 1)
     compress = bool(c.get("index_kpool_compress", False))
@@ -277,6 +280,10 @@ def _glm_hybrid_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
                 owns_topk=True,
                 index_source_layer_id=index,
                 index_source_status="exact_native_full_schedule",
+                # MTP proposal steps share one TopK selection while each step
+                # still produces its own KPool cache row.
+                index_share_for_mtp_iteration=bool(
+                    c.get("index_share_for_mtp_iteration", True)),
                 **_index_pool(c),
                 **ffn_fields,
             ))
@@ -303,9 +310,9 @@ def _aux_glm(c: Mapping[str, Any]) -> AuxiliarySpec:
         kind="mtp", layers=nextn, hidden_size=h, intermediate_size=moe_i,
         num_heads=int(c["num_attention_heads"]),
         num_kv_heads=int(c.get("num_key_value_heads", 1) or 1),
-        head_dim=int(c.get("qk_head_dim", 256) or 256),
-        q_width=int(c["num_attention_heads"]) * int(c.get("qk_head_dim", 256) or 256),
-        kv_width=int(c.get("qk_head_dim", 256) or 256), attention_kind="mla",
+        head_dim=int(c.get("qk_head_dim", DEFAULT_QK_HEAD_DIM) or DEFAULT_QK_HEAD_DIM),
+        q_width=int(c["num_attention_heads"]) * int(c.get("qk_head_dim", DEFAULT_QK_HEAD_DIM) or DEFAULT_QK_HEAD_DIM),
+        kv_width=int(c.get("qk_head_dim", DEFAULT_QK_HEAD_DIM) or DEFAULT_QK_HEAD_DIM), attention_kind="mla",
         kv_cache_elements=kv_rank + rope_dim,
         weight_category="mtp",
         q_lora_rank=int(c["q_lora_rank"]), kv_lora_rank=kv_rank,
@@ -313,10 +320,10 @@ def _aux_glm(c: Mapping[str, Any]) -> AuxiliarySpec:
         qk_rope_head_dim=rope_dim,
         v_head_dim=int(c["v_head_dim"]), num_experts=experts, top_k=top_k,
         expert_intermediate_size=moe_i, num_shared_experts=shared,
-        index_share_for_mtp_iteration=bool(c.get("index_share_for_mtp_iteration", False)),
+        index_share_for_mtp_iteration=bool(c.get("index_share_for_mtp_iteration", True)),
         block_size=1, markov_rank=0, confidence_enabled=False,
         target_shared_embedding=True, target_shared_lm_head=True,
-        base_logits=True, pp_capability=(1, 2, 4, 8, 16),
+        base_logits=True, pp_capability=MTP_PP_CAPABILITY,
         vocab_size=int(c["vocab_size"]),
         mhc_mult=_int(c, "hc_mult") if hyper else 0,
         mhc_sinkhorn_iters=_int(c, "hc_sinkhorn_iters") if hyper else 0,

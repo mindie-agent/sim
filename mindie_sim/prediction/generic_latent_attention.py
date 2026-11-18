@@ -406,6 +406,53 @@ def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
         if working > float(l2_bytes):
             spill = max(0.0, 1 - float(l2_bytes) / working)
             hbm_rows += max(0.0, float(refill_rows) - hbm_rows) * spill
+    native_fused = False
+    if runtime is not None:
+        # Imported lazily: the epilog module imports this builder for the
+        # shared index representation, so a module-level edge would cycle.
+        from .implementations import select
+        from .mla_cann_epilogs import native_fusion_active
+        lowerings = dict(getattr(runtime, "kernels", {}).get("lowerings", {}) or {})
+        native_fused = (native_fusion_active(runtime)
+                        and select(lowerings, "lightning_indexer") is None
+                        and select(lowerings, "quant_lightning_indexer") is None)
+    if native_fused:
+        # One CANN 9.2.1 kernel consumes Q, head weights and the candidate
+        # cache rows and writes only the token indices. The FP32 score plane
+        # is never materialized, so its write+read disappears.
+        by_id = {op.op_id: op for op in b.ops}
+        operand_bytes = sum(float(by_id[dep].mte3_bytes)
+                            for dep in deps[:2] if dep in by_id)
+        fused = b.work(
+            "index_quant_lightning", deps, (valid, plan.index_heads, plan.index_dim),
+            flops=2 * rows * plan.index_heads * plan.index_dim / divisor,
+            vector=(rows * plan.index_heads * 2 / divisor
+                    + rows * math.log2(max(MIN_LOG_TOPK, plan.index_topk)) / divisor),
+            read=operand_bytes + hbm_rows * row_b / divisor,
+            write=valid * plan.index_topk * INT32_BYTES,
+            family="indexer", dtype=index_arithmetic_dtype(model, quant),
+            recipe="quant_lightning_indexer",
+            metadata=(("native_kind", "aclnnQuantLightningIndexerV2"),
+                      ("fused_members", ("index_scores", "index_topk")),
+                      ("intermediate_score_bytes", 0),
+                      ("selection_output_dtype", "int32"),
+                      ("index_score_shards", max(MIN_INDEX_FACTOR, int(shard))),
+                      ("index_context_partitions", cp),
+                      ("index_candidate_filter", bool(plan.candidate_filter)),
+                      ("index_head_reduction", "complete_local")))
+        if shared_reads and union_rows < private_rows:
+            fused_op = b.ops[-1]
+            b.ops[-1] = replace(fused_op, metadata=fused_op.metadata + (
+                ("prefix_read_reuse_applied", True),
+                ("prefix_read_mode", "tile"),
+                ("prefix_read_logical_bytes", private_rows * row_b / divisor),
+                ("prefix_read_hbm_bytes", hbm_rows * row_b / divisor),
+                ("prefix_read_l2_core_bytes", refill_rows * row_b / divisor),
+            ))
+        declare_indexer(b.ops, prefix=prefix, plan=plan, parallel=parallel,
+                        model=model, quant=quant, views=views,
+                        padded_tokens=padded_tokens, scores=fused, topk=fused)
+        return fused
     scores = b.work("index_scores", deps, (valid, plan.index_heads, plan.index_dim),
                     flops=2 * rows * plan.index_heads * plan.index_dim / divisor,
                     vector=rows * plan.index_heads * 2 / divisor,

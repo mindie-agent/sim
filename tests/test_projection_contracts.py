@@ -149,10 +149,10 @@ def test_fp32_index_weight_contract_shares_joint_projection_and_prepared_capacit
     assert matrix.local_shape == (24, 160, 4096) and matrix.dtype == "fp32"
     assert matrix.deps == (cast.op_id,)
     assert cast.mte2_bytes == 24 * 4096 * 2 and cast.mte3_bytes == 24 * 4096 * 4
-    weights = by_recipe["index_weights_cast"]
-    assert weights.deps == (matrix.op_id,)
-    assert dict(weights.metadata)["input_column_slice"] == (128, 160)
-    assert weights.mte2_bytes == 24 * 32 * 4
+    # The native indexer consumes the joint projection's weight column slice
+    # directly: no eager cast/slice producer is launched.
+    assert "index_weights_cast" not in by_recipe
+    assert "index_weights_scale" not in by_recipe
     terms = {term.name: term for term in layer_weight_terms(c.model.layer_plans[3], c.model)}
     assert term_bytes(terms["indexer_weights"], c.model.quant, c.runtime.parallel) == 32 * 4096 * 2
     assert sum(term_bytes(terms[name], c.model.quant, c.runtime.parallel)
@@ -169,7 +169,7 @@ def test_explicit_index_weight_precision_splits_joint_pool_projection():
     assert weights.dtype == "bf16" and weights.local_shape == (24, 32, 4096)
     assert key.deps == (by_recipe["index_pool_hidden_fp32"].op_id,)
     assert weights.deps != key.deps
-    assert by_recipe["index_weights_scale"].deps == (weights.op_id,)
+    assert "index_weights_scale" not in by_recipe
     terms = {term.name: term for term in layer_weight_terms(c.model.layer_plans[3], c.model)}
     assert "indexer_weights_prepared_fp32" not in terms
     assert term_bytes(terms["indexer_weights"], c.model.quant, c.runtime.parallel) == dict(weights.metadata)["packed_weight_bytes"]

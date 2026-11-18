@@ -123,7 +123,12 @@ def test_c8_sparse_batch_reuses_external_bytes_preserving_gathers():
     assert a.hbm_bytes < b.hbm_bytes
     meta = dict(a.metadata)
     assert meta["indexed_attention_geometry"]["sequences"] == ((6, 4096),) * 8
-    assert meta["prefix_read_hbm_bytes"] == (4096 + 8 * 6) * 512
+    # NoPE C8 resolves an FP8 MLA checkpoint to the 128-element block row:
+    # 512 B payload + four FP16 scales per 512-element latent row.
+    from mindie_sim.catalog.cache_format import block_quantized_row_bytes
+    row_bytes = block_quantized_row_bytes(512)
+    assert row_bytes == 520
+    assert meta["prefix_read_hbm_bytes"] == (4096 + 8 * 6) * row_bytes
     assert meta["attention_tensor_view"]["query_shape"] == (48, 64, 512)
     assert meta["attention_traffic_plan"]["hbm_read_bytes"] == meta["prefix_read_hbm_bytes"]
     assert meta["attention_traffic_plan"]["private_refill_bytes"] == meta["prefix_read_l2_core_bytes"]

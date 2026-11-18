@@ -85,6 +85,9 @@ IMPLEMENTATIONS = {
     "aclnn_mixed_quant_sparse_flash_mla": Implementation(
         "mindie_sim.prediction.family_mqsmla", blocks=("mqsmla_attention",),
         options=("metadata_support_fd", "addressing", "return_softmax_lse")),
+    "mixed_quant_sparse_flash_mla": Implementation(
+        "mindie_sim.prediction.family_mqsmla", blocks=("mqsmla_attention",),
+        options=("metadata_support_fd", "addressing", "return_softmax_lse")),
     "cannbot_mixed_quant_sparse_flash_mla": Implementation(
         "mindie_sim.prediction.family_mqsmla", blocks=("mqsmla_attention",),
         options=("metadata_support_fd", "addressing", "return_softmax_lse")),

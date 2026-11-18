@@ -409,7 +409,7 @@ from mindie_sim.prediction.engine import Engine, Resource
 extract = Path(sys.argv[1]).resolve()
 package = Path(mindie_sim.__file__).resolve()
 assert package.is_relative_to(extract), (package, extract)
-assert len(ascend_profiles()) == 15
+assert len(ascend_profiles()) == 16
 assert len(nvidia_profiles()) == 4
 assert type(load_model("qwen3-32b")).__name__ == "ModelSpec"
 report = {{"package": str(package)}}

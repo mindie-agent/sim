@@ -116,7 +116,10 @@ def test_pcp_dcp_prefill_stores_all_rank_owned_rows_without_raw_division():
 
 def test_kimi_index_store_and_qsfa_publish_owned_rows_and_statistics():
     graph = _kimi_graph()
-    store = next(op for op in graph if op.recipe == "index_store")
+    # The native indexer fuses the key quantization and cache scatter into one
+    # ``aclnnIndexerQuantCache`` epilog; no standalone producer/store pair.
+    store = next(op for op in graph if op.family == "indexer_quant_cache")
+    assert dict(store.metadata)["native_kind"] == "aclnnIndexerQuantCache"
     assert store.local_shape[0] == 1
     qsfa = next(op for op in graph if op.recipe == "paired_fp8_qsfa_analytic")
     meta = dict(qsfa.metadata)

@@ -29,6 +29,10 @@ INDEXER_QUANT_CACHE = "aclnnIndexerQuantCache"
 INDEXER_TOP_K_KIND = "aclnnQuantLightningIndexerV2"
 KV_COMPRESS_EPILOG = "aclnnKvCompressEpilog"
 KV_SCATTER_EPILOG = "aclnnScatterPaKvCache"
+# Production-worker families: a fused epilog is not an eager decomposition, so
+# it must never appear as the generic ``cache_store`` boundary.
+KV_COMPRESS_EPILOG_FAMILY = "kv_compress_epilog"
+INDEXER_QUANT_CACHE_FAMILY = "indexer_quant_cache"
 BLOCK_QUANT_KIND = "aclnnDynamicBlockQuant"
 BLOCK_QUANT_TILE = 128
 INDEXER_QUANT_CACHE_RECIPE = "indexer_quant_cache"
@@ -71,13 +75,22 @@ def raw_eager_requested(runtime):
     return _policy(runtime)[2]
 
 
-def native_indexer_active(runtime):
-    """True when a CANN indexer implementation owns this graph."""
+def native_indexer_active(runtime, machine=None):
+    """True when a CANN indexer implementation owns this graph.
+
+    Explicit native lowerings own the boundary first.  On a declared Ascend
+    family the CANN 9.2.1 graph also owns non-KPool indexers; a caller that
+    explicitly requested the legacy PyTorch BF16 path keeps it.
+    """
     if runtime is None:
         return False
     lowerings = dict(getattr(runtime, "kernels", {}).get("lowerings", {}) or {})
-    return (select(lowerings, "pool_key_indexer") is not None
-            or select(lowerings, "quant_lightning_indexer") is not None)
+    if (select(lowerings, "pool_key_indexer") is not None
+            or select(lowerings, "quant_lightning_indexer") is not None):
+        return True
+    if select(lowerings, "lightning_indexer") is not None:
+        return False
+    return native_fusion_active(runtime, machine)
 
 
 def kv_cache_epilog(op, fmt, region, *, native):
@@ -90,7 +103,7 @@ def kv_cache_epilog(op, fmt, region, *, native):
         return op
     kind = KV_COMPRESS_EPILOG if fmt.dtype != op.dtype else KV_SCATTER_EPILOG
     width = int(op.local_shape[1]) if len(op.local_shape) > 1 else 0
-    return replace(op, metadata=op.metadata + (
+    return replace(op, family=KV_COMPRESS_EPILOG_FAMILY, metadata=op.metadata + (
         ("native_kind", kind),
         ("cache_epilog", {
             "kind": kind, "region": region,
@@ -109,7 +122,7 @@ def block_quant_epilog(op, fmt, region, *, native, width):
     if not native or fmt.dtype != "fp8_e4m3" or fmt.group_size != BLOCK_QUANT_TILE:
         return op
     row_bytes = fmt.row_bytes(width)
-    return replace(op, metadata=op.metadata + (
+    return replace(op, family=KV_COMPRESS_EPILOG_FAMILY, metadata=op.metadata + (
         ("native_kind", BLOCK_QUANT_KIND),
         ("cache_epilog", {
             "kind": BLOCK_QUANT_KIND, "scatter": KV_SCATTER_EPILOG,
@@ -120,6 +133,19 @@ def block_quant_epilog(op, fmt, region, *, native, width):
         }),
         ("cache_row_bytes", row_bytes),
     ))
+
+
+def native_cache_store(op, *, native):
+    """Name an unfused-but-native cache store with its production family.
+
+    The packed prolog writer and a plain latent row are already single native
+    stores; on a CANN graph they must not remain the generic eager
+    ``cache_store`` boundary.  Grouped writers keep their more specific epilog.
+    """
+    if not native or op.family != "cache_store":
+        return op
+    return replace(op, family=KV_COMPRESS_EPILOG_FAMILY,
+                   metadata=op.metadata + (("native_cache_store", True),))
 
 
 def index_row_quantization(builder, store_id, quantize_id, *, width, native):
@@ -145,6 +171,7 @@ def index_row_quantization(builder, store_id, quantize_id, *, width, native):
     metadata = dict(quantize.metadata)
     fused = replace(
         store, deps=tuple(dict.fromkeys((*inputs, *extra))),
+        family=INDEXER_QUANT_CACHE_FAMILY,
         mte2_bytes=quantize.mte2_bytes, mte3_bytes=store.mte3_bytes,
         hbm_bytes=quantize.mte2_bytes + store.mte3_bytes,
         vector_ops=quantize.vector_ops, dtype=quantize.dtype,
@@ -264,9 +291,18 @@ def lower_index_path(builder, *, plan, model, quant, parallel, views, deps, runt
 
     if plan.owns_index_k and plan.index_kpool > 1:
         from . import index_pool
-        pool_module = pool_binding.module if pool_binding else index_pool
-        producer_options = (pool_binding.options if pool_binding and
-                            pool_binding.name == "vllm_ascend_cann_keypool_caller" else {})
+        native_pool = bool(
+            pool_binding
+            and pool_binding.name == "vllm_ascend_cann_keypool_caller")
+        if native_pool:
+            from .index_pool_native import supported as native_pool_supported
+            # The 6-stage caller declares decode/draft rows only.  Prefill
+            # keeps the analytic KeyPool decomposition; its group records the
+            # explicit ``native_dispatch_and_fusion_not_selected`` condition.
+            native_pool = native_pool_supported(
+                views=views, plan=plan, model=model, quant=quant)
+        pool_module = pool_binding.module if native_pool else index_pool
+        producer_options = (pool_binding.options if native_pool else {})
         index_store, pool_weights = pool_module.producer(
             b, source=deps, views=views, plan=plan, model=model, quant=quant,
             padded_tokens=q, **producer_options)
@@ -382,18 +418,28 @@ def lower_index_path(builder, *, plan, model, quant, parallel, views, deps, runt
         )
         if plan.index_kpool > 1:
             from . import index_pool
-            if pool_binding and pool_binding.name == NATIVE_KEYPOOL_IMPLEMENTATION:
+            native_binding = bool(
+                pool_binding
+                and pool_binding.name == NATIVE_KEYPOOL_IMPLEMENTATION)
+            native_pool = native_binding
+            if native_pool:
+                from .index_pool_native import supported as native_pool_supported
+                native_pool = native_pool_supported(
+                    views=views, plan=plan, model=model, quant=quant)
+            if native_pool:
                 topk = pool_binding.module.selection(
                     b, query=q_index, weights=weights, cache=index_store,
                     views=views, plan=plan, quant=quant, padded_tokens=q,
                     l2_bytes=getattr(b, "l2_bytes", None), runtime=runtime,
                     hierarchy=hierarchy, **pool_binding.options)
             else:
+                analytic_options = ({} if native_binding else
+                                    (pool_binding.options if pool_binding else {}))
                 topk = index_pool.selection(
                     b, query=q_index, weights=weights, cache=index_store,
                     views=views, plan=plan, quant=quant, padded_tokens=q,
                     l2_bytes=getattr(b, "l2_bytes", None), runtime=runtime,
-                    **(pool_binding.options if pool_binding else {}))
+                    **analytic_options)
         else:
             lowerings = (runtime.kernels.get("lowerings", {}) if runtime else {})
             quant_indexer = (select(lowerings, "quant_lightning_indexer")

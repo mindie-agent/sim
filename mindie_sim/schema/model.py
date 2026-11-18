@@ -162,6 +162,9 @@ class LayerPlan:
     #: Declared NoPE MLA layer.  ``qk_rope_head_dim`` may stay positive as a
     #: learned positional tail; it never selects a rotary operator then.
     mla_use_nope: bool = False
+    #: Autoregressive MTP proposal steps reuse one TopK selection across the
+    #: block while every step still writes its own KPool cache row.
+    index_share_for_mtp_iteration: bool = False
     #: Declared Q output-gate shape.  ``None`` means the legacy boolean was
     #: supplied; ``__post_init__`` resolves it to a canonical kind.
     q_output_gate: bool = False

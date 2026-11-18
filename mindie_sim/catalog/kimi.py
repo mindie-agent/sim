@@ -144,6 +144,9 @@ def _kimi_plans(config: Mapping[str, Any]) -> list[LayerPlan]:
                 q_lora_rank=q_rank, kv_lora_rank=kv_rank,
                 qk_nope_head_dim=qk_nope, qk_rope_head_dim=rope, v_head_dim=v_dim,
                 mla_variant="latent_mla", mla_output_gate=bool(c.get("mla_use_output_gate", True)),
+                # K3 keeps a 64-element learned positional tail in the cache
+                # row but executes no rotary operator on it.
+                mla_use_nope=bool(c.get("mla_use_nope", True)),
                 mla_qkv_a_gate_fused=True,
                 kv_cache_elements=kv_rank + rope,
                 intermediate_size=dense_i if ffn == "dense" else 0,

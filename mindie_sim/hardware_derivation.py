@@ -58,6 +58,9 @@ AIV_RATE_KEYS = frozenset({
     "reg_shuffle_lanes", "reg_special_lanes", "reg_ub_accesses",
     "reg_ub_stores", "scalar_store_issue", "ub_read_bytes", "ub_write_bytes",
 })
+#: Service modes whose declared rate is one HBM read stream.  They scale with
+#: ``hbm_peak_bytes_per_s`` even though their resource name is not ``hbm``.
+DRAM_BOUND_MODES = frozenset({"mte2_aic_dram", "mte2_aiv_dram"})
 AIC_BUFFER_UNITS = frozenset({"l1", "l0a", "l0b", "l0c"})
 AIV_BUFFER_UNITS = frozenset({"ub"})
 A5_FAMILY = "A5"
@@ -313,8 +316,9 @@ def derive_hardware_sku(
         # A service mode's duration is work / mode_rate.  Scaling only the
         # underlying HBM resource would leave an explicit mode rate unchanged,
         # so carry the die's effective bandwidth ratio exactly once.
-        for mode in device.get("service_modes", {}).values():
-            if mode.get("resource") == "hbm" and mode.get("rate") is not None:
+        for name, mode in device.get("service_modes", {}).items():
+            if ((mode.get("resource") == "hbm" or name in DRAM_BOUND_MODES)
+                    and mode.get("rate") is not None):
                 mode["rate"] = float(mode["rate"]) * hbm_scale
         device["rates"] = rates
         _strip_derived_instruction_rates(device, device_arch, assumptions)

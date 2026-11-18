@@ -228,8 +228,9 @@ def test_explicit_generic_router_recipe_disables_the_fused_call():
     kernels["recipes"] = {**dict(kernels.get("recipes") or {}), "router_topk": "declared"}
     runtime = replace(case.runtime, kernels=kernels)
     assert cann_native_active(runtime) is False
-    # An undeclared runtime keeps the per-operator decomposition.
-    assert cann_native_active(case.runtime) is False
+    # The composed CANN 9.2.1 stack declares the gating overlay; an explicit
+    # generic router recipe above still keeps the per-operator decomposition.
+    assert cann_native_active(case.runtime) is True
 
 
 def test_ep_dispatch_quantizer_is_absorbed_into_init_routing_once():

@@ -177,7 +177,8 @@ def _normalize_parsed_case(case: Case) -> Case:
     from .implementations import select
     from .implementation_selection import prepared_selection
 
-    pool = select(case.runtime.kernels.get("lowerings", {}), "pool_key_indexer")
+    pool = prepared_selection(case.runtime.kernels.get("lowerings", {}),
+                              "pool_key_indexer")
     if pool and pool.name == "vllm_ascend_cann_keypool_caller":
         model = pool.module.prepare_model(model, case.runtime, pool)
     elif "native_keypool_caller" in dict(model.metadata):

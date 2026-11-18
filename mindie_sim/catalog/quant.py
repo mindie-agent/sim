@@ -67,6 +67,11 @@ def projection_quant(quant: QuantSpec, plan) -> QuantSpec:
     return replace(quant, category_overrides=merged) if merged else quant
 
 
+#: Routed MXFP4 experts keep the 32-element group regardless of the plain
+#: linear weight block (128 for V4, 32 for V4.1).
+MX_EXPERT_BLOCK = 32
+
+
 def _quant_deepseek(c: Mapping[str, Any], *, v41: bool) -> QuantSpec:
     q = c.get("quantization_config")
     q = q if isinstance(q, Mapping) else {}
@@ -78,15 +83,18 @@ def _quant_deepseek(c: Mapping[str, Any], *, v41: bool) -> QuantSpec:
         name="fp8_dynamic+mxfp4_experts" if v41 else "fp8_dynamic+mxfp4_experts",
         weight_format="fp8_e4m3", activation_format="fp8_e4m3",
         expert_weight_format="mxfp4",
-        weight_block=block, expert_block=32,
+        weight_block=block, expert_block=MX_EXPERT_BLOCK,
         scale_format="fp8_e8m0" if scale_bytes == 1 else "fp32",
         scale_bytes=scale_bytes, kv_dtype="bf16",
         activation_group_size=block[1],
         activation_scale_format="fp8_e8m0" if scale_bytes == 1 else "fp32",
         activation_scale_pack=2 if scale_bytes == 1 else 1,
         index_dtype="int8", index_scale_dtype="fp16",
-        exclusions=("router", "lm_head", "embedding", "norm", "mhc",
-                    "compressor", "vision", "projector", "engram_gate"),
+        # V4.1 executes the Engram gate as an MXFP8 (32, 32) projection; the
+        # earlier V4 checkpoint keeps it in the BF16 exclusion set.
+        exclusions=(("router", "lm_head", "embedding", "norm", "mhc",
+                     "compressor", "vision", "projector")
+                    + (() if v41 else ("engram_gate",))),
         source=merge_source({"quant_method": q.get("quant_method", "fp8"),
                              "weight_block_size": str(block),
                              "scale_fmt": scale_fmt,

@@ -389,7 +389,11 @@ def test_va_recommended_compose_and_apply_helper() -> None:
     assert kimi_case["runtime"]["metadata"]["sp"] is True
     assert "sequence_parallel" in kimi_case["runtime"]["kernels"]
     kimi_low = kimi_case["runtime"]["kernels"]["lowerings"]
-    assert kimi_low["kda"]["cases"][0]["binding"] == "vllm_ascend_recurrent_kda_arch35"
+    kda_binding = kimi_low["kda"]["cases"][0]["binding"]
+    assert kda_binding["implementation"] == "vllm_ascend_recurrent_kda_arch35"
+    # In-kernel SIGMOID_BETA keeps the raw gate and beta in the activation dtype.
+    assert kda_binding["options"]["use_beta_sigmoid"] is True
+    assert kda_binding["options"]["beta_dtype"] == "bf16"
     assert kimi_low.get("attention_residual") == "vllm_ascend_attn_res_prefix"
     assert target_graphs(kimi_case, phase="decode", tokens=1, context=1024, sequences=4)[0]
 
@@ -548,12 +552,18 @@ def test_feature_superposition_pp_pcp_mc2_dspark_mtp_sp() -> None:
     tp53 = parallel53["tp"]
     sp_norm = [op for op in ops_sp if op.layer == 0 and op.recipe == "rmsnorm"
                and "norm1" in op.op_id][0]
-    no_norm = [op for op in ops_no if op.layer == 0 and op.recipe == "rmsnorm"
-               and "norm1" in op.op_id][0]
+    sp_norm_quant = [op for op in ops_sp if op.layer == 0
+                     and op.recipe == "dynamic_quantize"
+                     and "q_a.quantize" in op.op_id][0]
+    # The non-SP plan fuses norm1 with the q_a activation quantization into
+    # one ``rmsnorm_quant``; SP keeps them separate on TP-sharded rows.
+    no_norm = [op for op in ops_no if op.layer == 0
+               and op.recipe == "rmsnorm_quantize"][0]
     sp_residual = [op for op in ops_sp if op.recipe == "residual_add"][0]
     no_residual = [op for op in ops_no if op.recipe == "residual_add"][0]
     assert sp_norm.local_shape[0] * tp53 == no_norm.local_shape[0]
-    assert sp_norm.vector_ops * tp53 == pytest.approx(no_norm.vector_ops, rel=1e-12)
+    assert (sp_norm.vector_ops * tp53 + sp_norm_quant.vector_ops
+            == pytest.approx(no_norm.vector_ops, rel=1e-12))
     assert sp_residual.vector_ops * tp53 == pytest.approx(no_residual.vector_ops,
                                                           rel=1e-12)
     for layer in range(4):

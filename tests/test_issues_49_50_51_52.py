@@ -723,6 +723,35 @@ def test_hbm_service_modes_scale_with_the_derived_bandwidth():
                 mode_rate * factor)
 
 
+def test_dram_bound_service_modes_scale_with_each_derived_hbm_rate():
+    """ACLNN DRAM streams follow the declared HBM bandwidth, not a fixed rate.
+
+    ``mte2_aic_dram`` / ``mte2_aiv_dram`` declare an HBM-serviced read stream
+    while retaining their MTE2 resource name.  Re-deriving from the scaled
+    profile must not apply the ratio a second time.
+    """
+    from mindie_sim.hardware_derivation import derive_hardware_sku
+    from mindie_sim.schema.hardware import Hardware
+
+    base = Hardware.from_mapping({"backend": "ascend", "sku": "Ascend950DT_9582"})
+    original_hbm = float(dict(base.dies[0].rates)["hbm"])
+    original = {name: float(dict(base.dies[0].service_modes)[name][1])
+                for name in ("mte2_aic_dram", "mte2_aiv_dram")}
+    for peak in (1.4e12, 1.2e12):
+        factor = peak / original_hbm
+        derived = derive_hardware_sku(
+            base, sku="derived-dram", hbm_peak_bytes_per_s=peak)
+        die = derived.dies[0]
+        assert float(dict(die.rates)["hbm"]) == pytest.approx(peak)
+        for name, rate in original.items():
+            assert float(dict(die.service_modes)[name][1]) == pytest.approx(
+                rate * factor)
+        rederived = derive_hardware_sku(derived, sku="derived-dram")
+        for name, rate in original.items():
+            assert float(dict(rederived.dies[0].service_modes)[name][1]
+                         ) == pytest.approx(rate * factor)
+
+
 def _hardware_mapping():
     machine = compose_case("qwen3-32b", hardware="a3", tp=1, ep=1,
                           num_devices=1, layers=1)["machine"]

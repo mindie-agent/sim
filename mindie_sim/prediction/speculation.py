@@ -96,8 +96,11 @@ def draft_program(frontend, model, runtime, views, ready, *, global_views=None, 
     # ``index_share_for_mtp_iteration`` reuses one TopK selection across the
     # autoregressive proposal steps while every step still updates its own
     # KPool cache row.  ``mtp_topks`` carries step 0's op ids into later steps.
-    share_selection = bool(draft.index_share_for_mtp_iteration and serial
-                           and draft.attention_kind == "mla")
+    share_selection = bool(
+        (draft.index_share_for_mtp_iteration
+         or any(getattr(plan, "index_share_for_mtp_iteration", False)
+                for plan in plans))
+        and serial and draft.attention_kind == "mla")
     mtp_topks: dict[int, str] = {}
     # Feature projection shards its output; the draft body consumes a complete
     # hidden vector, so TP must gather before entering the first layer.

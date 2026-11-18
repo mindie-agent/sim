@@ -106,6 +106,11 @@ def test_compressor_precision_override_preserves_source_bytes_and_valid_row_work
 
 def test_indexer_layernorm_and_quantized_external_producers_keep_distinct_semantics():
     glm = _case("glm53-a3-w4a8")
+    # This test pins the retained eager FP32 LayerNorm decomposition.  Declare
+    # that no optional CANN 9.2.1 fusion owns the boundary.
+    metadata = dict(glm.runtime.metadata)
+    metadata["execution_policy"] = {"automatic_optional_fusions": False}
+    glm = replace(glm, runtime=replace(glm.runtime, metadata=tuple(metadata.items())))
     ops = target_operators(glm, phase="prefill", tokens=32)
     normalizations = [op for op in ops if op.recipe == "index_norm"]
     assert normalizations
@@ -133,7 +138,8 @@ def test_indexer_layernorm_and_quantized_external_producers_keep_distinct_semant
     assert query["operator"]["metadata"]["output_format"] == "int8"
     assert query["operator"]["metadata"]["scale_format"] == "fp16"
     assert query["node_id"] not in group["node_ids"]
-    assert {nodes[key]["family"] for key in group["node_ids"]} == {"indexer", "topk"}
+    # The fused native indexer is one node for score and TopK.
+    assert {nodes[key]["family"] for key in group["node_ids"]} == {"indexer"}
 
 
 def test_hyper_pre_includes_source_normalization_work():

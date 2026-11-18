@@ -53,6 +53,7 @@ _SOFTWARE_FIELDS = (
 _FAMILY_BLOCKS = {
     "qkv_projection": "attention", "attention": "attention",
     "rotary": "attention", "cache_store": "attention",
+    "kv_compress_epilog": "attention", "indexer_quant_cache": "attention",
     "gate_up_projection": "ffn", "down_projection": "ffn", "swiglu": "ffn",
     "grouped_gemm": "ffn", "embedding": "embedding", "logits": "logits",
 }

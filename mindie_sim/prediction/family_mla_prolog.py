@@ -18,6 +18,8 @@ IMPLEMENTATION = "vllm_ascend_mla_prolog_v3"
 ABSORBED_CATEGORY = "mla_absorb"
 CACHE_GROUP_SIZE = 128
 BF16_CACHE_DTYPES = frozenset({"bf16", "fp8_e4m3"})
+#: Declared V3 prolog Q-LoRA ranks; any other rank is a different caller.
+MLA_PROLOG_QUERY_LORA_RANKS = frozenset({1536, 2048})
 MXFP8_FORMAT = "fp8_e4m3"
 MXFP8_QUERY_QUANT_MODE = 3
 E8M0_GROUP_SIZE = 32
@@ -50,7 +52,9 @@ def prepare_model(model, runtime):
                      lowering_passes=runtime.lowering_passes, **options)
     if options.get("cache_layout"):
         from mindie_sim.catalog.cache_format import with_packed_mla_cache
-        model = with_packed_mla_cache(model, 64)
+        rope = max((int(plan.qk_rope_head_dim) for plan in model.layer_plans
+                    if plan.attention == "mla"), default=0)
+        model = with_packed_mla_cache(model, rope)
     # The source asserts an unquantized kv_b checkpoint. The same category
     # governs UK/UV execution and weight capacity, including source bytes.
     quant = replace(model.quant, exclusions=tuple(dict.fromkeys(
@@ -79,6 +83,13 @@ def validate(*, plan, parallel, model, quant, lowering_passes,
             or (quant.kv_dtype not in BF16_CACHE_DTYPES and not packed)
             or quant.format_for("mla") not in {"bf16", "int8", "fp8_e4m3"}):
         raise ModelingError("mla_prolog_v3_declared_operand_domain_unsupported")
+    # The V3 prolog owns one fused Q-A reduction; its source kernel is
+    # admitted only for the two declared LoRA ranks.
+    if (plan.q_lora_rank
+            and plan.q_lora_rank not in MLA_PROLOG_QUERY_LORA_RANKS):
+        # A direct-Q plan has no Q-LoRA prolog at all; its own builder raises
+        # the direct-Q boundary instead of this rank guard.
+        raise ModelingError("mla_prolog_v3_query_lora_rank_unsupported")
     projection_activation = compute_dtype_for(quant, "mla")[1]
     if projection_activation != model.activation_dtype:
         if "activation_quantization" not in lowering_passes:

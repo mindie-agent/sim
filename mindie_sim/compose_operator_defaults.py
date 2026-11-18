@@ -26,6 +26,7 @@ from mindie_sim.prediction.implementation_selection import (
 )
 from mindie_sim.prediction.family_mqsmla import (
     FORMATS as MQSMLA_CACHE_FORMATS,
+    NATIVE_KIND as MQSMLA_NATIVE,
     RECIPE as MQSMLA_RECIPE,
     UNIT_CONTEXT_PARALLEL,
     supported_heads as mqsmla_supported_heads,
@@ -61,7 +62,6 @@ V41_ROTARY_SELECTOR = "v41_rotary"
 V41_ROTARY_IMPLEMENTATION = "v41_partial_rotary"
 V41_ROTARY_NATIVE = "InplacePartialRotaryMul"
 MQSMLA_SELECTOR = "mqsmla_attention"
-MQSMLA_NATIVE = "MqsmlaKernel___call__"
 PACKED_CACHE_FAMILY = "v41_packed_cache_abi"
 MQSMLA_FAMILY = "mqsmla_decode"
 SELECTED_REASON = "a5_mixed_quant_packed_cache_contract"

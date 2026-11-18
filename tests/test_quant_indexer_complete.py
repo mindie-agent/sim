@@ -88,7 +88,11 @@ def test_split_read_pipes_and_native_contract_are_enforced():
 
 def test_explicit_selection_preserves_ordinary_semantic_path_and_late_inputs():
     ordinary = target_operators(raw_case(False), phase="decode", tokens=2, context=4096)
-    assert {"index_scores", "index_topk"} <= {op.recipe for op in ordinary}
+    # Without an explicit QLI binding the CANN 9.2.1 fused indexer owns the
+    # score and TopK boundary; no eager pair is emitted.
+    recipes = {op.recipe for op in ordinary}
+    assert "quant_lightning_indexer" in recipes
+    assert not {"index_scores", "index_topk"} & recipes
     raw = raw_case()
     ops = target_operators(raw, phase="decode", tokens=2, context=4096)
     qli = next(op for op in ops if op.recipe == "quant_lightning_indexer_v2")

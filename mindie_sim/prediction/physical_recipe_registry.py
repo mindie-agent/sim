@@ -100,7 +100,7 @@ COLLECTIVE_FAMILIES = frozenset({
 })
 VECTOR_FAMILIES = frozenset({
     "activation", "add", "add_rmsnorm", "add_rmsnorm_quant", "attention_merge", "attention_residual", "cache_store", "cast", "conv1d", "copy", "elementwise",
-    "embedding", "engram_apply", "engram_gather", "engram_query", "fill", "geglu", "gdn_gating", "hbm_load", "histogram", "kv_cache_write", "kv_cast",
+    "embedding", "engram_apply", "engram_gather", "engram_query", "fill", "geglu", "gdn_gating", "hbm_load", "histogram", "indexer_quant_cache", "kv_cache_write", "kv_cast", "kv_compress_epilog",
     "layernorm", "mhc", "multiply", "native_fusion", "pad", "quantize", "relu", "rmsnorm", "rmsnorm_quant", "rotary", "routing", "sigmoid", "silu", "state_gather", "state_transfer", "test",
     "sampling", "acceptance", "situ", "softmax", "swiglu", "tensor_copy",
     "tensor_fill", "tensor_materialization", "tensor_select", "tensor_view",

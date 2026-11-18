@@ -24,7 +24,8 @@ from .implementation_selection import is_automatic_lowering
 from .lowering import Builder
 from .compression import compressor
 from .mla_cann_epilogs import (
-    block_quant_epilog, kv_cache_epilog, native_fusion_active, lower_index_path,
+    block_quant_epilog, kv_cache_epilog, native_cache_store, native_fusion_active,
+    lower_index_path,
 )
 from .mla_native import batched_matrix_metadata
 from .memory_traffic import (AttentionAccessSpec, AttentionSchedule,
@@ -244,6 +245,15 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             b.ops[position] = written
             store = written.op_id
             break
+    # The packed prolog writer and a plain latent row bypass the grouped
+    # epilog wrapper above; on a CANN graph they are still native stores.
+    if store is not None and native_cache_epilogs:
+        for position, item in enumerate(b.ops):
+            if item.op_id != store:
+                continue
+            b.ops[position] = native_cache_store(item, native=True)
+            store = b.ops[position].op_id
+            break
     # This lowering writes the local KV row. Shared long-KV consumers still do.
     produced, owns_kv = store, store is not None
     if pcp_prefill and owns_kv:
@@ -313,9 +323,11 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                 compressed_fmt = cache_format(model, "compressed_kv")
                 for position, item in enumerate(b.ops):
                     if item.op_id == long_store:
-                        b.ops[position] = kv_cache_epilog(
+                        written = kv_cache_epilog(
                             item, compressed_fmt, "compressed_kv",
                             native=native_cache_epilogs)
+                        b.ops[position] = native_cache_store(
+                            written, native=native_cache_epilogs)
                         long_store = b.ops[position].op_id
                         break
             if pcp_prefill:

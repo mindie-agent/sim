@@ -183,9 +183,13 @@ def test_generic_indexer_precharge_is_not_deduplicated_twice():
             b, deps=("input",), views=views, plan=plan, model=model, quant=model.quant,
             parallel=parallel, shard=1, prefix="s0.l1", padded_tokens=12, runtime=runtime)
         scores = next(op for op in b.ops if op.family == "indexer")
+        # One fused native score+TopK call: no separate score materialization,
+        # and the external key union is charged exactly once.
         assert scores.flops == 2 * score_rows * plan.index_heads * plan.index_dim
-        assert scores.mte2_bytes == 130 * row
-        assert scores.hbm_bytes == key_rows * row + score_rows * 4
+        assert scores.mte2_bytes == key_rows * row
+        assert scores.hbm_bytes == scores.mte2_bytes + scores.mte3_bytes
+        assert not any(op.recipe in {"index_scores", "index_topk"} for op in b.ops)
+        assert scores.mte3_bytes == 12 * plan.index_topk * 4
 
 
 def test_draft_cache_uses_bf16_rows_and_context_block_ownership():

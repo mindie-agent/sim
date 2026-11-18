@@ -115,6 +115,11 @@ def _draft_layer_plan(model, draft, index: int, plan_fields: dict) -> LayerPlan:
     # the draft's own short declaration.
     packed_input = bool(ref.packed_input_projection) if ref else False
     mla_use_nope = bool(ref.mla_use_nope) if ref else False
+    # A body layer may declare the selection sharing; the draft spec keeps its
+    # own explicit override so an external draft can opt out.
+    index_share = bool(
+        getattr(draft, "index_share_for_mtp_iteration", False)
+        or (getattr(ref, "index_share_for_mtp_iteration", False) if ref else False))
 
     swa_only = (
         explicit_ratio == ZERO
@@ -137,6 +142,7 @@ def _draft_layer_plan(model, draft, index: int, plan_fields: dict) -> LayerPlan:
             noncausal_attention=draft.noncausal_query_block,
             mla_variant=draft.mla_variant, mla_output_gate=mla_gate,
             mla_use_nope=mla_use_nope, packed_input_projection=packed_input,
+            index_share_for_mtp_iteration=index_share,
             kv_cache_elements=kv_elems, qk_norm=qk_norm, q_output_gate=q_gate,
             cache_kind=cache_kind, window=window, kv_owner_layer_id=LAST, owns_long_kv=False,
             compress_ratio=ZERO, compressor_kind="none", compressor_width=ONE, compressor_state_rows=ZERO,
@@ -163,6 +169,7 @@ def _draft_layer_plan(model, draft, index: int, plan_fields: dict) -> LayerPlan:
             noncausal_attention=draft.noncausal_query_block,
             mla_variant=draft.mla_variant, kv_cache_elements=kv_elems,
             mla_use_nope=mla_use_nope, packed_input_projection=packed_input,
+            index_share_for_mtp_iteration=index_share,
             qk_norm=qk_norm, q_output_gate=q_gate,
             cache_kind=standalone_ck, window=standalone_win,
             compress_ratio=standalone_comp,
@@ -172,7 +179,7 @@ def _draft_layer_plan(model, draft, index: int, plan_fields: dict) -> LayerPlan:
         )
 
     has_indexer = bool((ref.indexer or ref.owns_topk) and ref.index_topk > ZERO)
-    share_index_k = bool(has_indexer and draft.index_share_for_mtp_iteration and draft.attention_kind == "mla")
+    share_index_k = bool(has_indexer and index_share and draft.attention_kind == "mla")
     indexer_type = (
         "shared" if share_index_k
         else (ref.indexer_type if ref.indexer_type in {"full", "c4"} else "full")
@@ -188,6 +195,7 @@ def _draft_layer_plan(model, draft, index: int, plan_fields: dict) -> LayerPlan:
         noncausal_attention=draft.noncausal_query_block,
         mla_variant=draft.mla_variant, mla_output_gate=mla_gate,
         mla_use_nope=mla_use_nope, packed_input_projection=packed_input,
+        index_share_for_mtp_iteration=index_share,
         kv_cache_elements=kv_elems, qk_norm=qk_norm, q_output_gate=q_gate,
         cache_kind=ref.cache_kind, window=window,
         kv_owner_layer_id=index if owns_long else LAST, owns_long_kv=owns_long,

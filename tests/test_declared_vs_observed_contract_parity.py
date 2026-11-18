@@ -92,6 +92,11 @@ def _declared_contracts(key: str) -> frozenset[str]:
         prompt_tokens=record["tokens"] if record["phase"] == "prefill" else 8,
         output_tokens=4, layers=record["layers"],
     )
+    # The retained descriptor captures predate the CANN 9.2.1 optional
+    # fusions.  Declare that explicitly so the independent capture still
+    # projects onto the same semantic/native boundary; no tolerance is relaxed.
+    case["runtime"].setdefault("metadata", {})["execution_policy"] = {
+        "automatic_optional_fusions": False}
     report = export_structure(
         case, phase=record["phase"], tokens=record["tokens"],
         context=record["context"], sequences=1, scope="body",

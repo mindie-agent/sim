@@ -30,6 +30,8 @@ from .mqsmla import (
     query_rows,
     selective_fd_excluded,
 )
+#: The CANN 9.2.1 source-symbol spelling retained as an explicit alias.
+SOURCE_RECIPE = "mixed_quant_sparse_flash_mla"
 FP8_WINDOW_GROUP_SIZE = 32
 FP4_COMPRESSED_GROUP_SIZE = 16
 SINGLE_KV_HEAD = 1
@@ -47,8 +49,9 @@ FORMATS = {
 
 
 def recipes():
-    """The official CANN recipe plus its explicit legacy prototype alias."""
-    return {RECIPE: PlannedRecipe(build), LEGACY_RECIPE: PlannedRecipe(build)}
+    """The official CANN recipe, its source-name alias and the legacy prototype."""
+    return {RECIPE: PlannedRecipe(build), SOURCE_RECIPE: PlannedRecipe(build),
+            LEGACY_RECIPE: PlannedRecipe(build)}
 
 
 def query_shape(views, plan, *, topk_present=False):

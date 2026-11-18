@@ -93,17 +93,25 @@ def test_index_history_is_sharded_but_recurrent_heads_are_not():
     assert all(dict(op.metadata)["gathered_q_heads"] == 96 for op in qsfa)
     assert len([op for op in graph if op.recipe == "dcp_output_alltoall"]) == 24
     assert not any(op.family == "dcp_allgather" for op in graph)
-    scan = next(op for op in graph if op.recipe == "index_scores")
+    scan = next(op for op in graph if op.recipe == "quant_lightning_indexer")
+    assert not any(op.recipe in {"index_scores", "index_topk"} for op in graph)
+    assert dict(scan.metadata)["native_kind"] == "aclnnQuantLightningIndexerV2"
+    assert dict(scan.metadata)["selection_output_dtype"] == "int32"
     # Exact rank-owned visible rows, not a balanced total/CP approximation.
     from mindie_sim.catalog.context_parallel import owned_positions
     owned = [sum(owned_positions(0, 131072 + offset, 8, 1536, rank)
                  for _ in range(2) for offset in range(1, 5))
              for rank in range(8)]
-    # Score arithmetic is per token; the four queries occupy one tile.
+    # Score arithmetic is per token; the four queries occupy one tile.  The
+    # one fused call reads Q and the head weights once and materializes no
+    # FP32 score plane.
     assert scan.flops == 2 * max(owned) * 32 * 128
     tile_rows = [2 * owned_positions(0, 131072 + 4 - 1, 8, 1536, rank)
                  for rank in range(8)]
-    assert scan.mte2_bytes == max(tile_rows) * 130
+    by_id = {op.op_id: op for op in graph}
+    operand_bytes = sum(by_id[dep].mte3_bytes for dep in scan.deps[:2])
+    assert scan.mte2_bytes == operand_bytes + max(tile_rows) * 130
+    assert scan.mte3_bytes == 4 * 2 * 2048 * 4  # int32 indices, 4 query rows, 2 seq
     candidate = next(op for op in graph if op.recipe == "candidate_gather")
     assert candidate.link_bytes == 8 * 2048 * 8 * 7
     kda = [op for op in graph if op.family in {"recurrent_vector", "recurrent_scan"}]

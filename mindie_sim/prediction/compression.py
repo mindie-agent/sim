@@ -79,26 +79,35 @@ def recipes():
     return {RECIPE: PlannedRecipe(build)}
 
 
-def _native_compiler(b, *, name, source, tokens, valid_rows, width, plan, model,
+def _native_compiler(b, *, name, source, tokens, padded_tokens, valid_rows, width, plan, model,
                      return_latent, do_rope):
-    """One fused operator whose bytes and arithmetic are the member totals."""
+    """One fused operator whose bytes and arithmetic are the member totals.
+
+    The projection covers the padded launch rows exactly as the unfused
+    ``b.matrix`` does, while the pooled/normalized output covers valid rows.
+    """
     expansion, hidden = plan.compressor_width, model.hidden_size
     activation = model.activation_dtype
     activation_bytes = dtype_bytes(activation)
     gated = plan.compress_ratio > 1
-    projected_rows = tokens * expansion * width
+    projected_rows = padded_tokens * expansion * width
     flops = 2 * projected_rows * hidden * (2 if gated else 1)
-    vector = (POOL_VECTOR_OPS_PER_ELEMENT * projected_rows if gated else 0)
+    vector = (POOL_VECTOR_OPS_PER_ELEMENT * tokens * expansion * width if gated else 0)
     vector += NORM_VECTOR_OPS_PER_ELEMENT * valid_rows * width
     if do_rope:
         vector += ROTARY_VECTOR_OPS_PER_ELEMENT * valid_rows * plan.qk_rope_head_dim
     state_rows = min(tokens, plan.compressor_state_rows)
-    hidden_read = tokens * hidden * activation_bytes
+    hidden_read = padded_tokens * hidden * activation_bytes
     weight_read = b.quant.matrix_bytes(expansion * width, hidden, COMPRESSION_RECIPE)
     if gated:
         weight_read *= 2
-    state_read = (tokens + state_rows) * expansion * width * FP32_BYTES
-    ape_read = (projected_rows * FP32_BYTES if gated else 0)
+    # The rolling state and APE tables exist only on the gated (C>=4) path.
+    state_read = state_rows * expansion * width * FP32_BYTES if gated else 0
+    state_write = state_rows * expansion * width * FP32_BYTES if gated else 0
+    ape_read = plan.compress_ratio * expansion * width * FP32_BYTES if gated else 0
+    norm_weight_read = width * dtype_bytes(plan.compressor_norm_dtype)
+    rope_table_read = (valid_rows * plan.qk_rope_head_dim * FP32_BYTES * 2
+                       if do_rope else 0)
     latent_write = valid_rows * width * activation_bytes
     rotated_write = latent_write
     # ``return_latent`` keeps the pre-RoPE normalized latent visible to the
@@ -108,8 +117,9 @@ def _native_compiler(b, *, name, source, tokens, valid_rows, width, plan, model,
     b.work(
         name + "_compress", (source,), (valid_rows, width), family="compressed_attention",
         dtype=activation, recipe=RECIPE, flops=flops, vector=vector,
-        read=hidden_read + weight_read + state_read + ape_read,
-        write=written,
+        read=hidden_read + weight_read + state_read + ape_read
+             + norm_weight_read + rope_table_read,
+        write=written + state_write,
         metadata=(("native_kind", NATIVE_KIND),
                   ("native_source", SOURCE),
                   ("fused_members", 2 if gated else 1),
@@ -162,7 +172,7 @@ def compressor(b, *, name, source, tokens, padded_tokens, valid_rows, width, pla
     do_rope = plan.mla_do_rope
     if fused:
         return _native_compiler(
-            b, name=name, source=source, tokens=padded_tokens,
+            b, name=name, source=source, tokens=tokens, padded_tokens=padded_tokens,
             valid_rows=valid_rows, width=width, plan=plan, model=model,
             return_latent=return_latent, do_rope=do_rope)
     projection = b.matrix(

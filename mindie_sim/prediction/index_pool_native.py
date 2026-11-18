@@ -74,14 +74,30 @@ def prepare_model(model, runtime, binding):
     return replace(model, metadata=tuple(sorted(metadata.items())))
 
 
+def _supported(views, plan, model, quant):
+    """Source domain of the 6-stage caller; prefill keeps the analytic path."""
+    from mindie_sim.catalog.quant import projection_quant
+    # The builder's per-layer prepared quant is the operand contract; a
+    # caller-supplied model-level preset may still be W8A8.
+    resolved = projection_quant(quant, plan)
+    weights = compute_dtype_for(resolved, "indexer.weights")[:2]
+    return bool(
+        plan.index_kpool_compress and plan.index_kpool > 1
+        and plan.index_input == "hidden" and not plan.compress_ratio
+        and not plan.qk_rope_head_dim
+        and model.activation_dtype == "bf16"
+        and resolved.index_dtype in SUPPORTED_INDEX_DTYPES
+        and all(v.phase in SUPPORTED_PHASES and v.q_len >= 1 for v in views)
+        and weights in SUPPORTED_HEAD_WEIGHTS)
+
+
+def supported(*, views, plan, model, quant):
+    """Public preflight for the native caller's declared call domain."""
+    return _supported(views, plan, model, quant)
+
+
 def _contract(b, views, plan, quant):
-    weights = compute_dtype_for(b.quant, "indexer.weights")[:2]
-    if (not plan.index_kpool_compress or plan.index_kpool <= 1
-            or plan.index_input != "hidden" or plan.compress_ratio or plan.qk_rope_head_dim
-            or b.model.activation_dtype != "bf16"
-            or quant.index_dtype not in SUPPORTED_INDEX_DTYPES
-            or any(v.phase not in SUPPORTED_PHASES or v.q_len < 1 for v in views)
-            or weights not in SUPPORTED_HEAD_WEIGHTS):
+    if not _supported(views, plan, b.model, b.quant):
         raise ModelingError("native_keypool_caller_requires_bf16_nope_decode_and_declared_head_weights")
     return dict(b.model.metadata)["native_keypool_caller"]
 
@@ -269,10 +285,16 @@ def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
     if hierarchy is not None and runtime is not None:
         by_id = {op.op_id: op for op in b.ops}
         scored = by_id[indices]
+        # ``views`` carry token-level request lengths, so the pool candidate
+        # plane is charged per token row (pool_row_bytes / pool) rather than
+        # per pool; the scanned-pool KV bytes stay the authoritative bound so
+        # L2 deduplication never subtracts query/weight/output traffic.
+        kv_bytes = float(safe_scans * pool_row_bytes)
         b.ops[b.ops.index(scored)] = apply_sparse_prefix_reads(
-            scored, views=views, row_bytes=float(pool_row_bytes), runtime=runtime,
-            hierarchy=hierarchy, kv_hbm_bytes=scored.hbm_bytes,
-            kv_mte2_bytes=scored.mte2_bytes)
+            scored, views=views,
+            row_bytes=float(pool_row_bytes) / float(max(1, pool)), runtime=runtime,
+            hierarchy=hierarchy, kv_hbm_bytes=kv_bytes,
+            kv_mte2_bytes=kv_bytes)
     packed = b.work("index_topk", (indices,), (tokens, output_width),
         read=selected * pool * INT32_BYTES + valid * INT64_BYTES
              + tokens * INT64_BYTES,

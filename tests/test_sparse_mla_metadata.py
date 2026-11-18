@@ -108,7 +108,9 @@ def test_captured_layer_ordered_metadata_stays_after_selection_before_attention(
     node = next(op for op in graph if op.recipe == IMPLEMENTATION)
     positions = {op.op_id: i for i, op in enumerate(graph)}
     selector = next(op for op in graph if op.op_id == node.deps[0])
-    assert selector.family == 'topk'
+    # One fused CANN indexer owns both score and selection on this boundary.
+    assert selector.family == 'indexer'
+    assert selector.recipe == 'quant_lightning_indexer'
     attention = next(op for op in graph if op.family == 'attention')
     assert positions[selector.op_id] < positions[node.op_id] < positions[attention.op_id]
     assert dict(node.metadata)['metadata_schedule'] == 'layer_ordered'

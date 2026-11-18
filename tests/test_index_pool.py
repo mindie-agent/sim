@@ -199,7 +199,9 @@ def test_bf16_head_weights_keep_the_checkpoint_projection_boundary():
     assert ops['index_norm'].mte2_bytes == (6 + 2) * 128 * 4
     assert 'index_norm_input_fp32' not in ops
     assert 'index_weights_input_cast' not in ops and 'index_weights_cast' not in ops
-    assert ops['index_weights_scale'].deps == (weights.op_id,)
+    # The native indexer consumes the BF16 checkpoint head weights directly;
+    # no FP16/FP32 scale producer remains on this boundary.
+    assert 'index_weights_scale' not in ops
     assert ops['index_pool_weighted_query'].deps == (
         ops['index_pool_query_fp32'].op_id, ops['index_pool_weights_fp32'].op_id)
 
@@ -226,7 +228,7 @@ def test_graph_padding_preserves_projection_capacity_without_fake_pool_writes():
     ops = {op.recipe: op for op in layer(case(), batch=3)}
     # The retained graph buckets pad 18 valid target queries to 24 rows.
     for name in ('index_pool_hidden_fp32', 'index_k', 'index_pool_gate',
-                 'index_norm', 'index_weights', 'index_weights_scale',
+                 'index_norm', 'index_weights',
                  'index_pool_query_fp32', 'index_pool_weighted_query',
                  'index_topk'):
         assert ops[name].local_shape[0] == 24

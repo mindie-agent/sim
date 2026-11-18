@@ -146,6 +146,9 @@
           "sha256": "7c2470dc39b3912c585164576efed05458dd63ee204d2fbcc39f594963db10fc",
           "size_bytes": 2362336
         }
+      },
+      "execution_policy": {
+        "automatic_optional_fusions": false
       }
     },
     "kernels": {
