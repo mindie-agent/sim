@@ -325,7 +325,11 @@ def operator_costs(case, ops, *, recipes=None, primitives=None, replay_scope=Non
     ctx = (context_for(case, evaluation, recipes) if evaluation is not None
            else EvaluationContext.create(case, recipes, primitives))
     recipes = recipes or RecipeBook.from_mapping(case.runtime.kernels)
+    from .unmodeled_gate import assert_timing_supported
     if isinstance(ops, Mapping):
+        for items in ops.values():
+            assert_timing_supported(case, tuple(recipes.expand(tuple(items))),
+                                    entry="operator_costs")
         from .exposed_breakdown import unavailable_breakdown
         result = _cohort_costs(
             case, ops, recipes, primitives, replay_scope, input_ready_ms,
@@ -334,6 +338,9 @@ def operator_costs(case, ops, *, recipes=None, primitives=None, replay_scope=Non
             "operator_only", boundary="operator_sum"))
         return result
     ops = tuple(recipes.expand(ops))
+    # Refuse to fabricate an isolated operator duration for a core hole. This
+    # precedes the barrier-family skip below.
+    assert_timing_supported(case, ops, entry="operator_costs")
     unbound_inverse = any(dict(op.metadata).get("reverse_of_collective")
                           and "peer_traffic" not in dict(op.metadata) for op in ops)
     if unbound_inverse and case.runtime.parallel.ep_spans_dp:

@@ -214,6 +214,32 @@ _DRAFT_PLAN_FIELDS = (
 )
 
 
+_INHERITED_ROUTER_FIELDS = (
+    "router_mode", "router_dtype", "router_norm_topk", "router_groups",
+    "router_group_topk", "router_noaux_tc", "routed_scaling_factor",
+    "ffn_activation", "swiglu_limit", "swiglu_shared_limit",
+    "swiglu_alpha", "swiglu_beta",
+)
+
+
+def _inherited_router_fields(model, draft) -> dict:
+    """Draft MoE layers execute the target body's declared router.
+
+    A draft block is not a second router architecture: it reuses the body's
+    routing mode, correction bias and FFN activation scalars.  The correction
+    bias parameter is counted per draft MoE layer by ``draft_weights``.
+    """
+    if int(getattr(draft, "num_experts", ZERO) or ZERO) <= ZERO:
+        return {}
+    donor = next((plan for plan in model.layer_plans if plan.ffn == "moe"), None)
+    if donor is None:
+        return {}
+    fields = {name: getattr(donor, name) for name in _INHERITED_ROUTER_FIELDS}
+    fields["router_input_size"] = int(getattr(draft, "hidden_size", ZERO)
+                                      or donor.router_input_size)
+    return fields
+
+
 def native_draft_layer_plans(model, draft) -> tuple:
     """Native explicit auxiliary plans for one declared draft spec.
 
@@ -222,6 +248,7 @@ def native_draft_layer_plans(model, draft) -> tuple:
     donor at use time.
     """
     plan_fields = {key: getattr(draft, key) for key in _DRAFT_PLAN_FIELDS}
+    plan_fields.update(_inherited_router_fields(model, draft))
     return tuple(_draft_layer_plan(model, draft, index, plan_fields)
                  for index in range(int(draft.layers)))
 

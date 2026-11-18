@@ -36,6 +36,10 @@ NORM_WEIGHT_OFFSET = 1.0
 STEP5_NEXTN_BLOCKS = 3
 STEP5_PP_CAPABILITY = (1, 2, 4, 8, 16)
 DEFAULT_NORM_EPS = 1e-06
+#: vLLM's ``swigluoai`` expression uses alpha=1.702, beta=1 unless the
+#: checkpoint declares its own scalars (MiniMax M3 declares neither).
+SWIGLU_OAI_ALPHA = 1.702
+SWIGLU_OAI_BETA = 1.0
 _STEP5_NEXTN_BLOCKS = STEP5_NEXTN_BLOCKS
 
 FLEET_CATALOG_ENTRIES: dict[str, str] = {
@@ -338,6 +342,18 @@ def _minimax_m3(key: str, config: Mapping[str, Any]) -> ModelSpec:
     index_heads = _int(sparse, "sparse_num_index_heads"); index_dim = _int(sparse, "sparse_index_dim")
     qk_norm = bool(c.get("use_qk_norm", True))
     gate = bool(c.get("attention_output_gate", False))
+    from mindie_sim.catalog.hf_config import declared_partial_rotary, rotary_dimensions
+    rope_dim, nope_dim = rotary_dimensions(head_dim, declared_partial_rotary(c))
+    activation = str(c.get("hidden_act", "silu"))
+    if activation == "swigluoai":
+        oai_limit = float(c.get("swiglu_limit") or ZERO)
+        if oai_limit <= ZERO:
+            raise ModelingError("model_config_minimax_swigluoai_limit_missing")
+        oai_alpha = float(c.get("swiglu_alpha") or SWIGLU_OAI_ALPHA)
+        oai_beta = float(c.get("swiglu_beta") or SWIGLU_OAI_BETA)
+    else:
+        oai_limit = oai_alpha = oai_beta = ZERO
+    shared_limit = float(c.get("swiglu_limits_shared") or oai_limit)
     plans = []
     for index in range(layers):
         moe = moe_flags[index]
@@ -357,7 +373,11 @@ def _minimax_m3(key: str, config: Mapping[str, Any]) -> ModelSpec:
             shared_intermediate_size=shared_i if moe else ZERO,
             router_input_size=hidden if moe else ZERO,
             router_mode=str(c.get("scoring_func", "softmax")),
-            qk_norm=qk_norm, q_output_gate=gate, ffn_activation="silu",
+            qk_norm=qk_norm, q_output_gate=gate,
+            qk_rope_head_dim=rope_dim, qk_nope_head_dim=nope_dim,
+            ffn_activation=activation,
+            swiglu_limit=oai_limit, swiglu_shared_limit=shared_limit,
+            swiglu_alpha=oai_alpha, swiglu_beta=oai_beta,
             indexer=active, indexer_type="full" if active else "none",
             owns_index_k=active,
             index_k_owner_layer_id=index if active else (-1),
@@ -430,14 +450,29 @@ def _step5(key: str, config: Mapping[str, Any]) -> ModelSpec:
     if sparse_on and min(idx_heads, idx_dim, topk_regions) <= 0:
         raise ModelingError("model_config_step5_sparse_dims_missing")
     gate = bool(c.get("use_head_wise_attn_gate", False)); plans = []
+    from mindie_sim.catalog.hf_config import declared_partial_rotary, rotary_dimensions
+
+    def step5_activation(index: int) -> tuple[int, int, float, float, float]:
+        """Exact rotated width and clamped-SiLU scalars for body/draft layer."""
+        factor = declared_partial_rotary(c, index)
+        rope_dim, nope_dim = rotary_dimensions(head_dim, factor)
+        limits = view.get("swiglu_limits")
+        limit = float(limits[index]) if isinstance(limits, (list, tuple)) else 0.0
+        shared_limits = view.get("swiglu_limits_shared")
+        shared_limit = (float(shared_limits[index])
+                        if isinstance(shared_limits, (list, tuple)) else limit)
+        return rope_dim, nope_dim, limit, shared_limit, factor
+
     for index, kind in enumerate(kinds):
         full = kind == "full_attention"; moe = index in moe_set
         sparse_layer = bool(sparse_on and kind in apply_types)
+        rope_dim, nope_dim, limit, shared_limit, factor = step5_activation(index)
         plans.append(LayerPlan(
             index=index, attention="gqa", architecture="gqa",
             ffn="moe" if moe else "dense",
             window=ZERO if full else window,
             num_heads=heads, num_kv_heads=kv_heads, head_dim=head_dim,
+            qk_rope_head_dim=rope_dim, qk_nope_head_dim=nope_dim,
             intermediate_size=ZERO if moe else intermediate,
             num_experts=experts if moe else ZERO,
             top_k=top_k if moe else ZERO,
@@ -449,6 +484,7 @@ def _step5(key: str, config: Mapping[str, Any]) -> ModelSpec:
             q_output_gate_kind="headwise" if gate else "none",
             q_gate_projection="separate" if gate else "packed_q",
             ffn_activation="silu",
+            swiglu_limit=limit, swiglu_shared_limit=shared_limit,
             indexer=sparse_layer,
             indexer_type="full" if sparse_layer else "none",
             owns_index_k=sparse_layer,
@@ -466,7 +502,7 @@ def _step5(key: str, config: Mapping[str, Any]) -> ModelSpec:
             kv_owner_layer_id=index, owns_long_kv=True,
             native_layer_id=index, scope="body",
         ))
-    gaps = ["native_partial_rotary_dimensions_unresolved:retained_plan_proxy"]
+    gaps = []
     if sparse_on:
         gaps.append("csa_block_compress_ssmax_approximated_by_pooled_indexer")
     if vision_raw:
@@ -482,6 +518,21 @@ def _step5(key: str, config: Mapping[str, Any]) -> ModelSpec:
         top_k=top_k, moe_i=moe_i, shared=1, gaps=tuple(gaps), facts=None,
         auxiliary=auxiliary,
     )
+
+
+def _step5_rotary_width(c, position: int, head_dim: int) -> int:
+    """Exact rotated prefix of one body/NextN layer from its declared factor."""
+    from mindie_sim.catalog.hf_config import declared_partial_rotary, rotary_dimensions
+    return rotary_dimensions(head_dim, declared_partial_rotary(c, position))[0]
+
+
+def _step5_draft_scalar(c, name: str, base: int, index: int) -> float:
+    """Per-layer NextN scalar from the untruncated body+draft schedule."""
+    values = c.get(name)
+    position = int(base) + int(index)
+    if isinstance(values, (list, tuple)) and position < len(values):
+        return float(values[position])
+    return 0.0
 
 
 def _step5_auxiliary(c, plans, *, hidden: int, heads: int, kv_heads: int,
@@ -512,7 +563,14 @@ def _step5_auxiliary(c, plans, *, hidden: int, heads: int, kv_heads: int,
             intermediate_size=intermediate,
             q_output_gate_kind="headwise" if gate else "none",
             q_gate_projection="separate" if gate else "packed_q",
-            ffn_activation="silu", scope="draft",
+            ffn_activation="silu",
+            qk_rope_head_dim=_step5_rotary_width(c, native_base + index, head_dim),
+            qk_nope_head_dim=head_dim - _step5_rotary_width(
+                c, native_base + index, head_dim),
+            swiglu_limit=_step5_draft_scalar(c, "swiglu_limits", native_base, index),
+            swiglu_shared_limit=_step5_draft_scalar(
+                c, "swiglu_limits_shared", native_base, index),
+            scope="draft",
             kv_cache_elements=KV_CACHE_PLANES * kv_heads * head_dim,
             kv_owner_layer_id=index, owns_long_kv=True,
         )

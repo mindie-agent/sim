@@ -72,6 +72,34 @@ def test_model_verify_acceptance_precedes_all_recover_commits():
     ordinary = target_graphs(raw, scope="model", phase="decode", tokens=1,
                              context=128, sequences=2)[0]
     assert not any(op.recipe == "recover_ssm_commit" for op in ordinary)
+    # A probe below the declared verification width keeps the ordinary target
+    # rows (2 per sequence) instead of inheriting the MTP proposal rows.
+    probe = target_graphs(raw, scope="model", phase="decode", tokens=2,
+                          context=128, sequences=2)[0]
+    assert not any(op.recipe == "recover_ssm_commit" for op in probe)
+    assert not any(op.family == "acceptance" for op in probe)
+    rows = {dict(op.metadata)["graph_active_query_rows"] for op in probe
+            if "graph_active_query_rows" in dict(op.metadata)}
+    assert rows == {4}
+
+
+def test_model_program_speculative_cohort_routes_all_verification_rows():
+    from mindie_sim.prediction.operator_analysis import model_program
+
+    raw = compose_case(
+        "qwen3.5-35b-a3b", hardware="a5-pod-dt", quant="w8a8",
+        tp=1, dp=2, ep=2, layers=2, prompt_tokens=64, output_tokens=8,
+        concurrency=1, graph_capture_mode="none", mtp_proposal_tokens=3,
+        mtp_acceptance_length=2.0,
+    )
+    program = model_program(parse_case(raw), phase="decode", tokens=4,
+                            context=128, sequences=1, selected_replica=0)
+    ops = program.work.ops
+    dispatch = next(op for op in ops if op.recipe == "expert_dispatch")
+    gate = next(op for op in ops if op.recipe == "grouped_gate_up")
+    verification_rows = 2 * (1 + 3)
+    assert dispatch.local_shape[0] == verification_rows
+    assert gate.local_shape[0] == verification_rows
 
 
 def test_c8_sparse_batch_reuses_external_bytes_preserving_gathers():

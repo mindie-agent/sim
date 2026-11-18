@@ -485,6 +485,11 @@ def predict(
     memory_replica: int = ZERO, memory_stage: int = ZERO,
     token_quotas: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
+    # A declared attention core without a physical model may be inspected
+    # structurally, but no latency/throughput entry may fabricate its work.
+    # The gate precedes every early body/PD return.
+    from .unmodeled_gate import assert_timing_supported
+    assert_timing_supported(case, entry="predict")
     if scope == "body":
         if lower is not None:
             raise ModelingError("body_scope_uses_target_frontend_not_custom_serving_lowerer")

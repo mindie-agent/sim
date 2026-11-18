@@ -7,6 +7,7 @@
 [Side-Effect Policy] Pure in-memory transformations.
 """
 from dataclasses import fields, is_dataclass, replace
+import math
 import re
 
 from mindie_sim.schema.workload import RequestView
@@ -17,7 +18,8 @@ FIRST_PARTICIPANT = 0
 UNIFORM_COUNT_CARDINALITY = 1
 
 
-def analysis_view(case, request_id, tokens, context, scope, phase, **fields):
+def analysis_view(case, request_id, tokens, context, scope, phase, *,
+                  index=0, samples=None, **fields):
     """One analysis view whose target rows match the declared speculative width.
 
     The frontend performs the single ``q_len + draft_proposal_tokens``
@@ -26,16 +28,27 @@ def analysis_view(case, request_id, tokens, context, scope, phase, **fields):
     width remains an ordinary non-speculative row count.
     """
     proposal = NO_PROPOSALS
+    advanced = NO_PROPOSALS
+    accepted = NO_PROPOSALS
     if scope == "model" and phase == "decode" and tokens > DECODE_BASE_ROWS:
         from .efficiency import _resolve_speculative_tokens
-        configured, _ = _resolve_speculative_tokens(
+        configured, policy_mean = _resolve_speculative_tokens(
             case, output_budget=DECODE_BASE_ROWS, tokens_per_seq=None,
             emitted_tokens_per_seq=None)
         if configured > DECODE_BASE_ROWS and tokens == configured:
             proposal = configured - DECODE_BASE_ROWS
+            mean = min(float(tokens),
+                       max(float(DECODE_BASE_ROWS), float(policy_mean)))
+            advanced = (math.floor((index + DECODE_BASE_ROWS) * mean)
+                        - math.floor(index * mean))
+            accepted = advanced - DECODE_BASE_ROWS
     return RequestView(
-        request_id, tokens - proposal, context, scope == "model", phase,
-        draft_proposal_tokens=proposal, **fields)
+        request_id, tokens - proposal, context,
+        (scope == "model") if samples is None else bool(samples), phase,
+        draft_proposal_tokens=fields.pop("draft_proposal_tokens", proposal),
+        draft_advanced_tokens=fields.pop("draft_advanced_tokens", advanced),
+        draft_accepted_tokens=fields.pop("draft_accepted_tokens", accepted),
+        **fields)
 
 
 def rebind_analysis_requests(value, source_views, target_views):

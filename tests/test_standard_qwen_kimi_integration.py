@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pytest
 
+from mindie_sim.structure import export_structure
+from mindie_sim.public.errors import UnmodeledCapabilityError
 from mindie_sim import graph_costs, predict, target_graphs
 from mindie_sim.prediction.structure import parse_case
 from test_prediction_system import case
@@ -102,10 +104,16 @@ def test_custom_attention_retains_known_work_without_claiming_a_gqa_cache():
     assert any(op.recipe == "dense_gate_up" for op in unknown)
     assert any(op.recipe == "unmodeled_attention_core" for op in unknown)
     assert not any(op.recipe in {"kv_store", "flash_attention"} for op in unknown)
-    report = graph_costs(raw, graphs)
-    assert report["model_coverage"] == "partial"
-    assert "unsupported_attention_layer:1:custom_attention" in report["unmodeled_features"]
-    assert report["execution"]["live_tasks"] == report["execution"]["live_programs"] == 0
+    # Structure keeps the known projections/FFN and the explicit core hole;
+    # timing refuses to fabricate the missing attention core.
+    structure = export_structure(raw, phase="prefill", tokens=3)
+    assert structure["nodes"]
+    hints = structure["unmodeled_structure_onboarding_hints"]
+    assert hints and hints[0]["schema"] == "mindie-unmodeled-structure-hint/1"
+    with pytest.raises(UnmodeledCapabilityError) as raised:
+        graph_costs(raw, graphs)
+    assert raised.value.onboarding_hint["ssot_owner_repo"] == "mindie-sim"
+    assert raised.value.result_available is False
 
 
 @pytest.mark.parametrize("name", ("qwen2-57b-a14b", "qwen3-30b-a3b",

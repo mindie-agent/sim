@@ -106,15 +106,76 @@ def test_deepseek_standard_schedule_cache_and_weight_arithmetic(name):
         assert moe_terms["q_a_norm"].rows == rank
 
 
-def test_deepseek_gaps_keep_noaux_tc_and_mtp_explicit():
-    v3 = _standard_deepseek_gaps(config("deepseek-v3"))
-    assert "router_noaux_tc_correction_bias_not_in_layer_plan" in v3
-    assert "router_routed_scaling_factor_not_in_layer_plan" in v3
+def test_deepseek_noaux_tc_router_is_declared_and_bias_is_a_real_parameter():
+    cfg = config("deepseek-v3")
+    v3 = _standard_deepseek_gaps(cfg)
+    # The noaux_tc chain and its routed scale are declared per MoE plan now.
+    assert not any("noaux_tc" in gap for gap in v3)
+    assert not any("routed_scaling" in gap for gap in v3)
     assert "optional_mtp_not_modeled" in v3
-    assert _aux_standard_deepseek(config("deepseek-v3")) is None
+    assert _aux_standard_deepseek(cfg) is None
+    plans = _standard_deepseek_plans(cfg)
+    moe = next(plan for plan in plans if plan.ffn == "moe")
+    assert moe.router_noaux_tc is True
+    assert moe.router_groups == cfg["n_group"]
+    assert moe.router_group_topk == cfg["topk_group"]
+    assert moe.routed_scaling_factor == cfg["routed_scaling_factor"]
+    spec = _model("deepseek-v3", plans, cfg["intermediate_size"])
+    bias = _terms(moe, spec)["router_correction_bias"]
+    assert (bias.rows, bias.cols) == (cfg["n_routed_experts"], 1)
+    assert bias.rows * bias.cols * 4 == cfg["n_routed_experts"] * 4
     lite = _standard_deepseek_gaps(config("deepseek-v2-lite"))
     assert lite == ()
     assert _aux_standard_deepseek(config("deepseek-v2-lite")) is not None
+
+
+def test_deepseek_noaux_tc_routing_chain_charges_physical_vector_work():
+    plan = LayerPlan(
+        index=0, attention="mla", architecture="mla_standard", ffn="moe",
+        num_heads=4, num_kv_heads=1, head_dim=24, kv_lora_rank=32,
+        qk_nope_head_dim=16, qk_rope_head_dim=8, v_head_dim=16,
+        mla_variant="latent_mla", kv_cache_elements=40,
+        kv_owner_layer_id=0, owns_long_kv=True,
+        num_experts=8, top_k=2, moe_intermediate_size=16,
+        router_input_size=32, router_mode="sigmoid", router_dtype="fp32",
+        router_norm_topk=True, router_groups=4, router_group_topk=2,
+        router_noaux_tc=True, routed_scaling_factor=2.5,
+        native_layer_id=0, scope="body",
+    )
+    raw = case(prompt=3, output=1)
+    raw["model"] = {
+        "name": "direct-noaux", "layers": 1, "hidden_size": 32, "num_heads": 4,
+        "num_kv_heads": 1, "head_dim": 24, "intermediate_size": 16,
+        "vocab_size": 128, "attention": "mla", "ffn": "moe",
+        "layer_plans": [plan.to_dict()],
+    }
+    tokens = 3
+    ops = {op.op_id: op for op in target_operators(
+        raw, phase="prefill", tokens=tokens)}
+    scores = ops["s0.l0.router_scores"]
+    biased = ops["s0.l0.router_bias"]
+    group_score = ops["s0.l0.router_group_score"]
+    group_topk = ops["s0.l0.router_group_topk"]
+    mask = ops["s0.l0.router_group_mask"]
+    topk = ops["s0.l0.router_expert_topk"]
+    gather = ops["s0.l0.router_weight_gather"]
+    scale = ops["s0.l0.route_scale"]
+    experts = plan.num_experts
+    assert scores.vector_ops == 4 * tokens * experts
+    assert biased.vector_ops == tokens * experts
+    assert (dict(biased.metadata)["correction_bias_bytes"] == experts * 4)
+    assert group_score.vector_ops == 3 * tokens * plan.router_groups
+    assert group_topk.vector_ops == 2 * tokens * plan.router_groups
+    assert mask.vector_ops == tokens * experts
+    assert topk.vector_ops > 0
+    # Biased scores never become weights: the gather reads the raw sigmoid.
+    assert gather.deps[1] == scores.op_id
+    assert dict(gather.metadata)["weight_source"] == "unbiased_sigmoid_scores"
+    assert dict(scale.metadata)["routed_scaling_factor"] == 2.5
+    assert ops["s0.l0.route_normalize"].deps == (gather.op_id,)
+    assert dict(ops["s0.l0.pack"].metadata)["topk_ids_producer"] == topk.op_id
+    # The collapsed 2*T*E group placeholder is gone.
+    assert "s0.l0.group_select" not in ops
 
 
 def test_deepseek_moe_schedule_uses_native_modulo_not_first_dense_offset():

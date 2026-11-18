@@ -104,12 +104,14 @@ def test_actual_frontend_keeps_bf16_router_compute_and_fp32_topk_payload():
     raw['model']['layers'] = 4
     graph = target_graphs(raw, phase='decode', tokens=1, sequences=32, context=4096)[0]
     by_id = {op.op_id: op for op in graph}
-    router, topk = by_id['s0.l3.router'], by_id['s0.l3.topk']
+    # noaux_tc consumes the FP32 logits in its sigmoid score stage; the router
+    # GEMM itself keeps BF16 compute and an FP32 output payload.
+    router, scores = by_id['s0.l3.router'], by_id['s0.l3.router_scores']
     meta = dict(router.metadata)
     assert router.local_shape == (4, 16, 7168)
     assert meta['weight_format'] == meta['activation_format'] == meta['compute_format'] == 'bf16'
     assert router.dtype == 'bf16' and meta['output_format'] == 'fp32'
-    assert router.mte3_bytes == topk.mte2_bytes == 4 * 16 * 4
+    assert router.mte3_bytes == scores.mte2_bytes == 4 * 16 * 4
     assert by_id['s0.l3.output'].local_shape == (32, 7168, 1536)
     assert by_id['s0.l3.output_gate'].local_shape == (32, 1536, 7168)
     assert by_id['s0.l3.q_b'].local_shape == (32, 3072, 1536)
@@ -118,7 +120,7 @@ def test_actual_frontend_keeps_bf16_router_compute_and_fp32_topk_payload():
     other = {op.op_id: op for op in target_graphs(plain, phase='decode', tokens=1, sequences=32, context=4096)[0]}
     assert other['s0.l3.router'].flops == router.flops
     assert other['s0.l3.router'].mte3_bytes * 2 == router.mte3_bytes
-    assert other['s0.l3.topk'].mte2_bytes * 2 == topk.mte2_bytes
+    assert other['s0.l3.router_scores'].mte2_bytes * 2 == scores.mte2_bytes
 
 
 def test_real_engine_respects_input_readiness_and_releases_all_resources():

@@ -31,6 +31,102 @@ ZERO = 0
 ONE = 1
 TWO = 2
 ZERO_FLOAT = 0.0
+#: ``noaux_tc`` routing expression work, per the reference chain:
+#: sigmoid scores -> correction bias -> per-group Top2 sum -> group TopK ->
+#: mask -> expert TopK -> unbiased weight gather -> routed scale.
+NOAUX_SIGMOID_OPS_PER_ELEMENT = 4
+NOAUX_BIAS_ADD_OPS_PER_ELEMENT = 1
+NOAUX_GROUP_TOP2_OPS_PER_GROUP = 3
+NOAUX_GROUP_TOPK_OPS_PER_GROUP = 2
+NOAUX_GROUP_MASK_OPS_PER_ELEMENT = 1
+NOAUX_WEIGHT_GATHER_OPS_PER_SELECTED = 1
+NOAUX_ROUTED_SCALE_OPS_PER_SELECTED = 1
+NOAUX_BIAS_BYTES = 4
+
+
+def _noaux_tc_chain(*, prefix, logits_input, weight_dtype, weight_bytes, stage,
+                    layer, requests, plan, tokens, mode):
+    """Exact DeepSeek ``noaux_tc`` routing chain.
+
+    Biased scores select experts; the emitted weights are gathered from the
+    *unbiased* sigmoid scores.  The FP32 correction bias is one resident
+    parameter per MoE layer, loaded once per invocation.
+    """
+    experts = int(plan.num_experts)
+    groups = max(ONE, int(plan.router_groups))
+    group_topk = max(ONE, int(plan.router_group_topk))
+    selected = int(plan.top_k)
+    scores = vector_op(
+        op_id=prefix + ".router_scores", deps=(logits_input,), stage=stage,
+        layer=layer, requests=requests, elements=tokens * experts,
+        ops_per_element=NOAUX_SIGMOID_OPS_PER_ELEMENT, dtype="fp32",
+        family="sigmoid", phase=mode, recipe="router_sigmoid_scores",
+        shape=(tokens, experts),
+        read_bytes_override=tokens * experts * weight_bytes,
+        write_bytes_override=tokens * experts * NOAUX_BIAS_BYTES,
+        metadata=(("input_format", weight_dtype), ("output_format", "fp32"),
+                  ("score_function", "sigmoid")),
+    )
+    biased = vector_op(
+        op_id=prefix + ".router_bias", deps=(scores.op_id,), stage=stage,
+        layer=layer, requests=requests, elements=tokens * experts,
+        ops_per_element=NOAUX_BIAS_ADD_OPS_PER_ELEMENT, dtype="fp32",
+        family="elementwise", phase=mode, recipe="router_correction_bias",
+        shape=(tokens, experts),
+        read_bytes_override=tokens * experts * NOAUX_BIAS_BYTES,
+        write_bytes_override=tokens * experts * NOAUX_BIAS_BYTES,
+        metadata=(("input_format", "fp32"), ("output_format", "fp32"),
+                  ("correction_bias_elements", experts),
+                  ("correction_bias_bytes", experts * NOAUX_BIAS_BYTES),
+                  ("correction_bias_residency", "ukernel_argument_once_per_layer")),
+    )
+    group_scores = vector_op(
+        op_id=prefix + ".router_group_score", deps=(biased.op_id,), stage=stage,
+        layer=layer, requests=requests, elements=tokens * groups,
+        ops_per_element=NOAUX_GROUP_TOP2_OPS_PER_GROUP, dtype="fp32",
+        family="topk", phase=mode, recipe="router_group_score_top2",
+        shape=(tokens, groups),
+    )
+    group_select = vector_op(
+        op_id=prefix + ".router_group_topk", deps=(group_scores.op_id,),
+        stage=stage, layer=layer, requests=requests, elements=tokens * groups,
+        ops_per_element=NOAUX_GROUP_TOPK_OPS_PER_GROUP, dtype="fp32",
+        family="topk", phase=mode, recipe="router_group_topk",
+        shape=(tokens, group_topk),
+        metadata=(("group_topk", group_topk), ("groups", groups)),
+    )
+    mask = vector_op(
+        op_id=prefix + ".router_group_mask", deps=(group_select.op_id, biased.op_id),
+        stage=stage, layer=layer, requests=requests, elements=tokens * experts,
+        ops_per_element=NOAUX_GROUP_MASK_OPS_PER_ELEMENT, dtype="fp32",
+        family="elementwise", phase=mode, recipe="router_group_mask",
+        shape=(tokens, experts),
+    )
+    expert_topk = vector_op(
+        op_id=prefix + ".router_expert_topk", deps=(mask.op_id,), stage=stage,
+        layer=layer, requests=requests, elements=tokens * experts,
+        ops_per_element=max(1.0, math.log2(max(1, selected))), dtype="fp32",
+        family="topk", phase=mode, recipe="router_expert_topk",
+        shape=(tokens, selected),
+        write_bytes_override=tokens * selected * NOAUX_BIAS_BYTES,
+        metadata=(("topk_ids_dtype", "int32"), ("top_k", selected),
+                  ("selection_scores", "corrected_sigmoid")),
+    )
+    weights = vector_op(
+        op_id=prefix + ".router_weight_gather", deps=(expert_topk.op_id, scores.op_id),
+        stage=stage, layer=layer, requests=requests, elements=tokens * selected,
+        ops_per_element=NOAUX_WEIGHT_GATHER_OPS_PER_SELECTED, dtype="fp32",
+        family="routing", phase=mode, recipe="router_weight_gather",
+        shape=(tokens, selected),
+        read_bytes_override=tokens * selected * NOAUX_BIAS_BYTES,
+        write_bytes_override=tokens * selected * NOAUX_BIAS_BYTES,
+        returns=("weights", "ids"),
+        metadata=(("input_format", "fp32"), ("output_format", "fp32"),
+                  ("weight_source", "unbiased_sigmoid_scores"),
+                  ("topk_ids_producer", expert_topk.op_id),
+                  ("router_weight_dtype", weight_dtype)),
+    )
+    return (scores, biased, group_scores, group_select, mask, expert_topk, weights)
 
 
 def _latent_norm(prefix, source, stage, plan, requests, tokens, latent, model, mode):
@@ -242,26 +338,39 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
     payload_tokens = issued_source_rows
     hash_table = plan.router_mode == "hash"
     hash_native = plan.router_mode in {"hash", "sqrtsoftplus"}
-    select = vector_op(
-        op_id=prefix + ".topk", deps=(logits_input,), stage=stage, layer=plan.index,
-        requests=requests, elements=tokens * plan.num_experts,
-        ops_per_element=5 + (plan.top_k / plan.num_experts if hash_table
-                             else math.log2(max(1, plan.top_k))),
-        dtype="fp32", family="topk", phase=mode,
-        recipe="hash_routing" if hash_table else "router_topk",
-        shape=(tokens, plan.num_experts),
-        read_bytes_override=tokens * plan.num_experts * weight_bytes
-                            + (tokens * (8 + plan.top_k * 4) if hash_table else 0),
-        write_bytes_override=tokens * plan.top_k * (weight_bytes + 4),
-        returns=("weights", "ids"),
-        metadata=(("input_format", weight_dtype), ("output_format", weight_dtype),
-                  ("topk_ids_dtype", "int32"), ("router_weight_dtype", weight_dtype),
-                  ("score_function", plan.router_mode),
-                  ("hash_table_active_rows", tokens if hash_table else 0)),
-    )
-    ops = [*router_prefix, router, *partition_views, select] if tokens else []
-    selection_members = [select.op_id]
-    if tokens and plan.router_groups > 1 and not hash_table:
+    # ``noaux_tc`` replaces the collapsed score/topk placeholder with the real
+    # sigmoid + correction-bias + group-Top2 + group-TopK + mask + expert TopK
+    # + unbiased gather chain.
+    noaux_tc = bool(plan.router_noaux_tc) and not hash_table
+    if tokens and noaux_tc:
+        chain = _noaux_tc_chain(
+            prefix=prefix, logits_input=logits_input, weight_dtype=weight_dtype,
+            weight_bytes=weight_bytes, stage=stage, layer=plan.index,
+            requests=requests, plan=plan, tokens=tokens, mode=mode)
+        select = chain[-1]
+        ops = [*router_prefix, router, *partition_views, *chain]
+        selection_members = [op.op_id for op in chain]
+    else:
+        select = vector_op(
+            op_id=prefix + ".topk", deps=(logits_input,), stage=stage, layer=plan.index,
+            requests=requests, elements=tokens * plan.num_experts,
+            ops_per_element=5 + (plan.top_k / plan.num_experts if hash_table
+                                 else math.log2(max(1, plan.top_k))),
+            dtype="fp32", family="topk", phase=mode,
+            recipe="hash_routing" if hash_table else "router_topk",
+            shape=(tokens, plan.num_experts),
+            read_bytes_override=tokens * plan.num_experts * weight_bytes
+                                + (tokens * (8 + plan.top_k * 4) if hash_table else 0),
+            write_bytes_override=tokens * plan.top_k * (weight_bytes + 4),
+            returns=("weights", "ids"),
+            metadata=(("input_format", weight_dtype), ("output_format", weight_dtype),
+                      ("topk_ids_dtype", "int32"), ("router_weight_dtype", weight_dtype),
+                      ("score_function", plan.router_mode),
+                      ("hash_table_active_rows", tokens if hash_table else 0)),
+        )
+        ops = [*router_prefix, router, *partition_views, select] if tokens else []
+        selection_members = [select.op_id]
+    if tokens and plan.router_groups > 1 and not hash_table and not noaux_tc:
         group_select = vector_op(
             op_id=prefix + ".group_select", deps=(logits_input,), stage=stage, layer=plan.index,
             requests=requests, elements=tokens * plan.num_experts, ops_per_element=2,
@@ -270,7 +379,10 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
         select = replace(select, deps=(group_select.op_id,))
         ops = [*router_prefix, router, *partition_views, group_select, select]
         selection_members.insert(0, group_select.op_id)
-    ids_producer = select.op_id
+    # The noaux gather restates the expert-TopK producer it gathers against;
+    # ids never come from a re-selection of the gathered weights.
+    ids_producer = (dict(select.metadata).get("topk_ids_producer") or select.op_id
+                    if tokens else select.op_id)
     weights_producer = select.op_id if tokens else None
     if tokens and plan.router_norm_topk:
         normalized = vector_op(
@@ -285,6 +397,23 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
         weights_producer = normalized.op_id
         if not hash_native:
             selection_members.append(normalized.op_id)
+    if tokens and not hash_native and float(plan.routed_scaling_factor) != 1.0:
+        # The declared routed scale multiplies the selected weights *after*
+        # the optional renorm; biased scores never leave the selection path.
+        scaled = vector_op(
+            op_id=prefix + ".route_scale", deps=(select.op_id,), stage=stage,
+            layer=plan.index, requests=requests, elements=tokens * plan.top_k,
+            ops_per_element=NOAUX_ROUTED_SCALE_OPS_PER_SELECTED, dtype="fp32",
+            family="elementwise", phase=mode, recipe="router_routed_scale",
+            read_bytes_override=tokens * plan.top_k * weight_bytes,
+            write_bytes_override=tokens * plan.top_k * weight_bytes,
+            metadata=(("input_format", weight_dtype), ("output_format", weight_dtype),
+                      ("routed_scaling_factor", float(plan.routed_scaling_factor))),
+        )
+        ops.append(scaled)
+        select = scaled
+        weights_producer = scaled.op_id
+        selection_members.append(scaled.op_id)
     if tokens:
         # The native selection call consumes logits. Its scope excludes their
         # GEMM, and Hash's unsupported renorm remains a separate consumer.
@@ -300,6 +429,8 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
                   "score_function": plan.router_mode,
                   "renorm": bool(plan.router_norm_topk and not hash_native),
                   "external_renorm": bool(plan.router_norm_topk and hash_native),
+                  "noaux_tc": noaux_tc,
+                  "routed_scaling_factor": float(plan.routed_scaling_factor),
                   "groups": plan.router_groups, "group_topk": plan.router_group_topk},
             implementation={"native_kind": native_kind,
                             "kind": "declared_native_correspondence",
@@ -307,7 +438,10 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
                                 "score_function": plan.router_mode,
                                 "renorm": bool(plan.router_norm_topk and not hash_native),
                                 "external_renorm": bool(plan.router_norm_topk and hash_native),
-                                "groups": plan.router_groups, "group_topk": plan.router_group_topk}},
+                                "noaux_tc": noaux_tc,
+                                "routed_scaling_factor": float(plan.routed_scaling_factor),
+                                "groups": plan.router_groups,
+                                "group_topk": plan.router_group_topk}},
             source={
                 "repository": "vllm-ascend",
                 "base_revision": "175ef4d49c2072f9233619636f0309f4f88b4e2c",
@@ -811,8 +945,13 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
             shared_prefix.append(gathered)
             shared_input, shared_tokens = gathered.op_id, sequence_plan.tokens_global
         shared, shared_last = dense(
-            prefix=prefix + ".shared", plan=replace(plan, intermediate_size=(
-                plan.shared_intermediate_size or plan.num_shared_experts * plan.moe_intermediate_size)),
+            prefix=prefix + ".shared", plan=replace(
+                plan,
+                intermediate_size=(plan.shared_intermediate_size
+                                   or plan.num_shared_experts * plan.moe_intermediate_size),
+                # The shared expert declares its own clamp scalar; an absent
+                # shared limit inherits the routed-expert declaration.
+                swiglu_limit=(plan.swiglu_shared_limit or plan.swiglu_limit)),
             deps=shared_input, stage=stage, requests=requests, tokens=tokens if shared_dp else shared_tokens, model=model,
             parallel=replace(parallel, tp=1) if shared_dp else parallel, mode=mode, category="shared_expert",
             runtime=runtime, reduce_output=not reduce_after_join and sequence_plan is None,

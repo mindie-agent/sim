@@ -22,6 +22,14 @@ SITU_SOURCE = {
     "symbol": "SituAndMul.forward_native",
     "scope": "independent_source_semantics; not_capture_binary_identity",
 }
+#: A clamped gated activation adds ``min(gate, limit)`` and the two-sided
+#: ``clamp(up, -limit, limit)`` before the gate product.  ``swigluoai`` adds the
+#: declared ``alpha * g`` scaling and ``(u + beta)`` offset on top of that.
+SWIGLU_CLAMP_OPS_PER_ELEMENT = 3
+SWIGLU_ALPHA_SCALE_OPS_PER_ELEMENT = 1
+SWIGLU_BETA_OFFSET_OPS_PER_ELEMENT = 1
+SWIGLU_GATE_SIGMOID_OPS_PER_ELEMENT = 4
+SWIGLU_PRODUCT_OPS_PER_ELEMENT = 2
 SITU_QUANT_SOURCE = {
     "repository": "vllm-ascend",
     "base_revision": "175ef4d49c2072f9233619636f0309f4f88b4e2c",
@@ -34,11 +42,47 @@ SITU_QUANT_SOURCE = {
 }
 
 
+def _clamped_activation_ops(alpha: float, beta: float) -> int:
+    """Exact scalar expression count of the declared clamped gate product."""
+    return (SWIGLU_CLAMP_OPS_PER_ELEMENT
+            + (SWIGLU_ALPHA_SCALE_OPS_PER_ELEMENT if alpha != 1.0 else 0)
+            + SWIGLU_GATE_SIGMOID_OPS_PER_ELEMENT
+            + (SWIGLU_BETA_OFFSET_OPS_PER_ELEMENT if beta else 0)
+            + SWIGLU_PRODUCT_OPS_PER_ELEMENT)
+
+
 def gated_activation(*, plan, op_id, deps, rows, width, dtype, stage, requests,
                      phase, recipe):
     activation = plan.ffn_activation
     metadata = (("activation_kind", activation),)
-    if activation == "silu":
+    if activation == "swigluoai" or (activation == "silu" and plan.swiglu_limit > 0):
+        # Clamped gate: min(gate, limit), clamp(up, -limit, limit) and the
+        # sigmoid gate.  Plain SiLU keeps alpha=1/beta=0; only ``swigluoai``
+        # declares the OAI alpha/beta scalars.
+        # The physical family stays the gated SwiGLU vector pipeline; the
+        # recipe and metadata carry the exact OAI/clamped expression.
+        family = "swiglu"
+        alpha = float(plan.swiglu_alpha)
+        beta = float(plan.swiglu_beta)
+        limit = float(plan.swiglu_limit)
+        if limit <= 0:
+            raise ModelingError("clamped_ffn_activation_requires_positive_limit")
+        if activation == "swigluoai" and not 0.0 < alpha:
+            raise ModelingError("swigluoai_requires_positive_alpha")
+        per_element = _clamped_activation_ops(alpha, beta)
+        recipe = (recipe.replace("swiglu", "swigluoai")
+                  if activation == "swigluoai" else recipe)
+        metadata += (
+            ("activation_limit", limit),
+            ("activation_alpha", alpha),
+            ("activation_beta", beta),
+            ("activation_expression",
+             "min(gate,limit)*sigmoid(alpha*min(gate,limit))"
+             "*(clamp(up,-limit,limit)+beta)"),
+            ("vector_count_basis",
+             "scalar_expression_ops; clamp_and_sigmoid_counted_once"),
+        )
+    elif activation == "silu":
         family, per_element = "swiglu", 4
     elif activation in {"gelu", "geglu", "gelu_tanh", "gelu_pytorch_tanh"}:
         # Tanh-approximated GeGLU: cubic + scale + add + tanh + +1 + 0.5*gate

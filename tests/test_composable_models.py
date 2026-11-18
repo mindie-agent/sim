@@ -7,10 +7,12 @@ from pathlib import Path
 import pytest
 
 from mindie_sim import graph_costs, operator_costs, predict, target_graphs, target_operators
+from mindie_sim.structure import export_structure
 from mindie_sim.catalog.cache import layer_cache_components
 from mindie_sim.catalog.weights import layer_weight_terms
 from mindie_sim.model_catalog import ARCHITECTURE_PRESET_CATALOG, load_model
 from mindie_sim.prediction.structure import parse_case
+from mindie_sim.public.errors import UnmodeledCapabilityError
 from mindie_sim.schema.model import ModelSpec
 from mindie_sim.schema.parallel import ParallelSpec
 from test_prediction_system import case
@@ -63,8 +65,24 @@ def test_partial_attention_keeps_projections_ffn_and_marks_core_hole():
     projection = next(op for op in first if op.op_id.endswith("known_qkv"))
     assert projection.flops == 2 * 3 * (4 + 2 * 2) * 8 * 32
     assert any(op.family == "swiglu" for op in first)
-    graph = graph_costs(raw, target_graphs(raw, phase="prefill", tokens=3))
-    assert graph["duration_ms"] > 0 and graph["execution"]["live_tasks"] == 0
+    # Structure stays inspectable; timing refuses the zero-work core hole.
+    structure = export_structure(raw, phase="prefill", tokens=3)
+    assert structure["duration_ms" if "duration_ms" in structure else "nodes"]
+    hints = structure["unmodeled_structure_onboarding_hints"]
+    assert hints and all(h["schema"] == "mindie-unmodeled-structure-hint/1"
+                        for h in hints)
+    for entry in (
+        lambda: graph_costs(raw, target_graphs(raw, phase="prefill", tokens=3)),
+        lambda: operator_costs(raw, target_operators(raw, phase="prefill", tokens=3)),
+        lambda: predict(raw),
+    ):
+        with pytest.raises(UnmodeledCapabilityError) as raised:
+            entry()
+        error = raised.value
+        assert error.result_available is False
+        assert error.onboarding_hint["schema"] == "mindie-unmodeled-structure-hint/1"
+        assert error.onboarding_hint["ssot_owner_repo"] == "mindie-sim"
+        assert error.unmodeled_structure_onboarding_hints
 
 
 @pytest.mark.parametrize("pp", [1, 2])
@@ -206,12 +224,31 @@ def test_external_custom_models_run_known_backbone_with_same_partial_serving_sco
         text.update(moe_layers_enum="1", moe_num_experts=4, moe_top_k=2,
                     share_expert_dim=16, share_q_dim=16)
     raw = run_case(raw_config)
-    result = predict(raw)
-    graph = graph_costs(raw, target_graphs(raw, phase="prefill", tokens=3), isolated=False)
-    assert result["status"] == "modeled"
-    assert result["unmodeled_features"] == graph["unmodeled_features"]
-    assert result["model_coverage"] == "partial"
-    assert graph["execution"]["live_tasks"] == graph["execution"]["live_programs"] == 0
+    model = parse_case(raw).model
+    holes = [plan for plan in model.layer_plans
+             if plan.attention in {"unmodeled", "projection_only"}]
+    assert holes, "the custom branch must keep an explicit core hole"
+    # Structure export preserves the known projections/FFN and the hole.
+    structure = export_structure(raw, phase="prefill", tokens=3)
+    nodes = structure["nodes"]
+    assert any(node.get("family") == "barrier" for node in nodes)
+    assert any(node.get("family") in {"swiglu", "down_projection"} for node in nodes)
+    if any(plan.attention == "projection_only" for plan in holes):
+        # Known projections around a KDA/Lightning hole stay inspectable.
+        assert any(node.get("family") == "qkv_projection" for node in nodes)
+    hints = structure["unmodeled_structure_onboarding_hints"]
+    abi = [item["observed_abi_summary"] for item in hints]
+    assert len(hints) == len({(item["layer_index"], item["architecture"]) for item in abi})
+    assert all(hint["schema"] == "mindie-unmodeled-structure-hint/1" for hint in hints)
+    # Timing refuses: no plausible-but-hollow serving latency is published.
+    for entry in (
+        lambda: predict(raw),
+        lambda: graph_costs(raw, target_graphs(raw, phase="prefill", tokens=3), isolated=False),
+    ):
+        with pytest.raises(UnmodeledCapabilityError) as raised:
+            entry()
+        assert raised.value.result_available is False
+        assert raised.value.onboarding_hint["ssot_owner_repo"] == "mindie-sim"
 
 
 @pytest.mark.parametrize("key", list(ARCHITECTURE_PRESET_CATALOG))

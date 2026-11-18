@@ -172,7 +172,8 @@ def va_recommended_config(model: str, hardware: str = "a3") -> dict[str, Any]:
 
 
 def _supports_sequence_parallel(model_spec, profile: Mapping[str, Any], *,
-                                 tp: int, ep: int, pp: int, pcp: int) -> bool:
+                                 tp: int, ep: int, pp: int, pcp: int,
+                                 notes: list[dict[str, Any]]) -> bool:
     """Structural sequence-parallel applicability, never a model-name whitelist."""
     if profile.get("sp") is False:
         return False
@@ -183,7 +184,9 @@ def _supports_sequence_parallel(model_spec, profile: Mapping[str, Any], *,
     from mindie_sim.prediction.sequence_parallel import _validate_model
     try:
         _validate_model(model_spec, padding="right_to_tp")
-    except ModelingError:
+    except ModelingError as exc:
+        from mindie_sim.prediction.implementation_selection import fallback_note
+        notes.append(fallback_note("sequence_parallel", str(exc)))
         return False
     return True
 
@@ -199,6 +202,7 @@ def _execution_policy(case: Mapping[str, Any]) -> dict[str, Any]:
 
 def _resolve_va_lowerings(
     model_spec: ModelSpec, parallel: Mapping[str, int], sku: str, lowering_passes: tuple[str, ...],
+    *, notes: list[dict[str, Any]],
 ) -> dict[str, Any]:
     from mindie_sim.schema.parallel import ParallelSpec
     from mindie_sim.catalog.paired_sfa import execution
@@ -241,7 +245,11 @@ def _resolve_va_lowerings(
             ],
             "otherwise": "analytical",
         }
-    mla_layers = [p for p in model_spec.layer_plans if p.attention == "mla" and p.q_lora_rank > 0]
+    # V3 ``MlaPrologV3`` only owns the LoRA-MLA prolog; V4/V4.1 latent-MQA
+    # projections are a different ABI and are not validated against it.
+    mla_layers = [p for p in model_spec.layer_plans
+                  if p.attention == "mla" and p.q_lora_rank > 0
+                  and p.mla_variant != "latent_mqa"]
     if mla_layers:
         from mindie_sim.prediction.family_mla_prolog import validate as validate_mla_prolog
         try:
@@ -249,8 +257,9 @@ def _resolve_va_lowerings(
                 validate_mla_prolog(plan=plan, parallel=p_cfg, model=model_spec,
                                     quant=model_spec.quant, lowering_passes=lowering_passes)
             lowerings["mla_prolog"] = "vllm_ascend_mla_prolog_v3"
-        except ModelingError:
-            pass
+        except ModelingError as exc:
+            from mindie_sim.prediction.implementation_selection import fallback_note
+            notes.append(fallback_note("mla_prolog", str(exc)))
     normalization = dict(model_spec.catalog_facts).get("normalization", {})
     # The residual add+RMSNorm boundary never touches qk_norm; requiring the
     # absence of qk_norm dropped a native residual norm on every qk-normed GQA
@@ -763,6 +772,7 @@ def compose_case(
     # These are caller opt-ins: the profile exposes the documented capability
     # as provenance, but enabling an overlap/offload path changes the pinned
     # physical decomposition and must be an explicit composition choice.
+    notes: list[dict[str, Any]] = []
     resolved_mso = bool(multistream_overlap_shared_expert)
     resolved_engram_offload = bool(engram_cpu_offload)
     sp_source = (
@@ -775,7 +785,8 @@ def compose_case(
     elif sp is None:
         sp = bool(production and va_profile is not None
                   and _supports_sequence_parallel(model_spec, va_profile,
-                                                  tp=tp, ep=ep, pp=pp, pcp=pcp))
+                                                  tp=tp, ep=ep, pp=pp, pcp=pcp,
+                                                  notes=notes))
     documented_capture = (va_profile or {}).get("graph_capture_mode")
     capture_source = (
         "raw_eager" if raw_eager else
@@ -999,7 +1010,7 @@ def compose_case(
             passes = ("activation_quantization", "norm_quant")
             runtime_dict["lowering_passes"] = list(passes)
         lowerings = _resolve_va_lowerings(
-            model_spec, runtime_dict["parallel"], sku, passes,
+            model_spec, runtime_dict["parallel"], sku, passes, notes=notes,
         )
         if "add_rmsnorm" in lowerings and "residual_norm" not in passes:
             passes = (*passes, "residual_norm")
@@ -1053,7 +1064,6 @@ def compose_case(
     # by hardware capability plus structural geometry, independently of the
     # expert weight format; an unsupported automatic geometry keeps analytical
     # execution and is reported instead of being installed.
-    notes: list[dict[str, Any]] = []
     if ascend_backend and not raw_eager:
         from mindie_sim.compose_operator_defaults import (
             DECLARATION_PHASE, apply_compose_v41_a5_defaults,
@@ -1063,12 +1073,12 @@ def compose_case(
         )
         kernels = dict(runtime_dict.get("kernels") or {})
         lowerings = dict(kernels.get("lowerings") or {})
-        notes = apply_compose_v41_a5_defaults(
+        notes.extend(apply_compose_v41_a5_defaults(
             model_dict=model_dict, lowerings=lowerings, backend=hardware_backend,
             arch=_arch_key(sku), layer_plans=model_spec.layer_plans,
             activation_dtype=model_spec.activation_dtype, tp=tp, cp=dcp,
             runtime_metadata=runtime_meta,
-        )
+        ))
         if lowerings:
             kernels["lowerings"] = lowerings
             runtime_dict["kernels"] = kernels
@@ -1673,6 +1683,7 @@ def apply_va_recommended(case: Mapping[str, Any]) -> dict[str, Any]:
     meta["va_profile"] = deepcopy(va_profile)
     meta["va_env"] = dict(va_profile["env"])
     meta.setdefault("moe_dispatch_quantization", "routed_expert")
+    notes: list[dict[str, Any]] = []
     kernels = dict(rt.get("kernels", {}))
     tp, ep, pp, pcp = int(par.get("tp", 1)), int(par.get("ep", 1)), int(par.get("pp", 1)), int(par.get("pcp", 1))
     if (va_profile.get("sp", True) and "sequence_parallel" not in kernels
@@ -1682,13 +1693,14 @@ def apply_va_recommended(case: Mapping[str, Any]) -> dict[str, Any]:
             _validate_model(parsed.model, padding="right_to_tp")
             kernels["sequence_parallel"] = dict(DECLARATION, padding="right_to_tp")
             meta["sp"] = True
-        except ModelingError:
-            pass
+        except ModelingError as exc:
+            from mindie_sim.prediction.implementation_selection import fallback_note
+            notes.append(fallback_note("sequence_parallel", str(exc)))
     passes = tuple(rt.get("lowering_passes", ()))
     if not passes and str(parsed.model.quant.activation_format) != str(parsed.model.activation_dtype):
         passes = ("activation_quantization", "norm_quant")
         rt["lowering_passes"] = list(passes)
-    lowerings = _resolve_va_lowerings(parsed.model, par, sku, passes)
+    lowerings = _resolve_va_lowerings(parsed.model, par, sku, passes, notes=notes)
     if "add_rmsnorm" in lowerings and "residual_norm" not in passes:
         passes = (*passes, "residual_norm")
         rt["lowering_passes"] = list(passes)
@@ -1697,6 +1709,14 @@ def apply_va_recommended(case: Mapping[str, Any]) -> dict[str, Any]:
         kernels["lowerings"] = {**lowerings, **existing_low}
     if kernels:
         rt["kernels"] = kernels
+    from mindie_sim.prediction.implementation_selection import (
+        merge_selection_summaries, operator_selection_summary,
+    )
+    from mindie_sim.compose_operator_defaults import DECLARATION_PHASE
+    meta["operator_selection_summary"] = merge_selection_summaries(
+        meta.get("operator_selection_summary"),
+        operator_selection_summary(arch_family=_arch_key(sku),
+                                   phase=DECLARATION_PHASE, notes=notes))
     rt["metadata"] = meta
     out["runtime"] = rt
     parse_case(out)

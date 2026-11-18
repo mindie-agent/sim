@@ -467,6 +467,14 @@ def export_op_structure(ops, *, model, execution, kernels=None, source=None,
     # digest so a verifier re-hashes exactly these fields. It reuses this graph;
     # no causal Engine and no second export runs here.
     attach_subgraph_math(payload)
+    # Onboarding hints for genuine core holes travel *inside* the hashed
+    # payload: a verifier that re-hashes this report must see them, so the
+    # graph identity stays self-verifying. Structure export itself succeeds.
+    from .prediction.unmodeled_gate import HINT_KEYS, structure_hints
+    all_ops = tuple(op for operators in graphs.values() for op in operators)
+    hints = structure_hints(all_ops, {"model": model})
+    if hints:
+        payload[HINT_KEYS] = [dict(hint) for hint in hints]
     encoded_payload = json.dumps(
         payload, sort_keys=True, separators=(",", ":"), allow_nan=False
     ).encode("utf-8")

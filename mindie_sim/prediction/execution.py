@@ -2894,6 +2894,9 @@ class Execution:
         return body
 
     def prepare(self, op, replica=ZERO):
+        # Directly submitted blocking work must not reach the Engine either.
+        from .unmodeled_gate import assert_timing_supported
+        assert_timing_supported(None, (op,), entry="execution_prepare")
         geom = self.stage_geometry[replica, op.stage]
         startup_mode = self.case.runtime.collective_startup_mode
         prep_key = (

@@ -128,7 +128,9 @@ def test_catalog_matrix_roles_share_only_an_unbound_selected_program():
         metadata=tuple({**dict(first.metadata), "semantic_family": "gate_up_projection",
                         "quant_category": "shared_expert", "catalog_category": "shared_expert"}.items()))
     assert node_physical(first) == node_physical(second)
-    explicit = {"families": {"gate_up_projection": {"kind": "steady_matmul"}}}
+    # The default matrix program is now SteadyMatmul; an explicit family
+    # binding (here the detailed tiled control) is what distinguishes roles.
+    explicit = {"families": {"gate_up_projection": {"kind": "tiled_matmul"}}}
     book = RecipeBook.from_mapping(explicit)
     assert type(book.select(first)) is not type(book.select(second))
     assert node_physical(first, recipe_bindings=explicit) != node_physical(

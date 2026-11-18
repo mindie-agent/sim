@@ -76,3 +76,53 @@ class CapabilityGap(ExtensionError):
     def __repr__(self) -> str:
         return ("CapabilityGap(capability=%r, kind=%r, code=%r)"
                 % (self.capability, self.kind, self.code))
+
+
+class UnmodeledCapabilityError(CapabilityGap):
+    """A timing entry refused to fabricate work for an unmodeled core.
+
+    The exception remains a ``ModelingError`` (through ``CapabilityGap``), so
+    callers that already handle modeling gaps keep working, but it carries the
+    structured ``mindie-unmodeled-structure-hint/1`` payload an agent needs to
+    implement the missing physical model. ``result_available`` is always false:
+    no latency, throughput or efficiency number was produced.
+    """
+
+    KIND = "unmodeled_capability"
+    RESULT_AVAILABLE = False
+    FALLBACK = "timing_rejected"
+
+    def __init__(self, *, capability: str, entry: str, code: str, message: str,
+                 blockers: Any = (), hints: Any = (),
+                 affected_results: Any = (), minimal_replay_input: Any = None,
+                 cause: BaseException | None = None) -> None:
+        hint_list = tuple(dict(hint) for hint in hints)
+        super().__init__(
+            capability=capability, entry=entry, kind=self.KIND, code=code,
+            message=message, affected_results=affected_results,
+            minimal_replay_input=minimal_replay_input,
+            fallback=self.FALLBACK, cause=cause)
+        self.blockers = tuple(dict(item) for item in blockers)
+        self.result_available = self.RESULT_AVAILABLE
+        self.onboarding_hint = (dict(hint_list[0]) if hint_list else {})
+        self.unmodeled_structure_onboarding_hints = hint_list
+        self.gap.update({
+            "result_available": self.result_available,
+            "onboarding_hint": self.onboarding_hint,
+            "unmodeled_structure_onboarding_hints": list(hint_list),
+            "blockers": list(self.blockers),
+        })
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = dict(self.gap)
+        payload["unmodeled_structure_onboarding_hints"] = [
+            dict(hint) for hint in self.unmodeled_structure_onboarding_hints]
+        return payload
+
+    def __repr__(self) -> str:
+        return ("UnmodeledCapabilityError(capability=%r, entry=%r, code=%r)"
+                % (self.capability, self.entry, self.code))
+
+
+__all__ = ["CapabilityGap", "ExtensionError", "GAP_KINDS", "GAP_SCHEMA",
+           "UnmodeledCapabilityError"]

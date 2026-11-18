@@ -307,9 +307,19 @@ def _standard_deepseek_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
             router_norm_topk=bool(c.get("norm_topk_prob", False)),
             router_groups=_int(c, "n_group"),
             router_group_topk=_int(c, "topk_group"),
+            router_noaux_tc=str(c.get("topk_method", "")) == "noaux_tc",
+            routed_scaling_factor=_routed_scaling_factor(c),
             native_layer_id=index, scope="body",
         ))
     return plans
+
+
+def _routed_scaling_factor(c: Mapping[str, Any]) -> float:
+    """Declared post-selection weight scale (1.0 keeps raw scores)."""
+    factor = c.get("routed_scaling_factor")
+    if factor is None:
+        return 1.0
+    return float(factor)
 
 
 def _aux_standard_deepseek(c: Mapping[str, Any]) -> AuxiliarySpec | None:
@@ -323,12 +333,8 @@ def _standard_deepseek_gaps(c: Mapping[str, Any]) -> tuple[str, ...]:
     gaps: list[str] = []
     if bool(c.get("attention_bias", False)):
         gaps.append("attention_bias_not_in_layer_plan")
-    if str(c.get("topk_method", "")) == "noaux_tc":
-        gaps.append("router_noaux_tc_correction_bias_not_in_layer_plan")
-        gaps.append("router_noaux_tc_group_score_top2_not_in_layer_plan")
-    factor = c.get("routed_scaling_factor")
-    if factor is not None and float(factor) != 1.0:
-        gaps.append("router_routed_scaling_factor_not_in_layer_plan")
+    # ``noaux_tc`` and its routed scaling factor are declared on every MoE
+    # LayerPlan (and its draft layers); no separate coverage gap remains.
     if _int(c, "num_nextn_predict_layers") > 0:
         gaps.append("optional_mtp_not_modeled")
     return tuple(gaps)

@@ -278,6 +278,10 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
     replay_scope = next(iter(set(scopes.values()))) if len(set(scopes.values())) == 1 else "mixed"
     if any(r not in range(case.runtime.parallel.dp) for r in graphs):
         raise ValueError("graph_replica_outside_declared_placement")
+    # Effective lowered operators: no timing may price an unmodeled core.
+    from .unmodeled_gate import assert_timing_supported
+    for items in graphs.values():
+        assert_timing_supported(case, items, entry="graph_costs")
     for items in graphs.values():
         _validate_graph(items, external)
     groups = cohorts(case.runtime.parallel, case.machine)

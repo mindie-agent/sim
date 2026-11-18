@@ -56,6 +56,7 @@ import math
 from typing import Any
 
 from mindie_sim.schema.case import Case as CaseSpec
+from mindie_sim.public.errors import UnmodeledCapabilityError
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.hardware import Device, Hardware
 from mindie_sim.schema.model import RequestSpec
@@ -1029,6 +1030,11 @@ def analyze_network_efficiency(
     """Compute whole-network 4D MFU/MBU/CV efficiency and bottleneck breakdowns."""
     _validate_geometry(phase, tokens, context, sequences, scope)
     parsed = parse_case(case)
+    # A supplied report is not an escape hatch: its rows must be modeled too.
+    from .unmodeled_gate import assert_report_supported, assert_timing_supported
+    assert_timing_supported(parsed, entry="analyze_network_efficiency")
+    assert_report_supported(operator_report, entry="analyze_network_efficiency")
+    assert_report_supported(graph_report, entry="analyze_network_efficiency")
     evaluation = None
     if operator_report is None:
         from .evaluation import EvaluationContext
@@ -1214,6 +1220,9 @@ def evaluate_target_efficiency(
     baseline_analysis: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Target roofline with DAG critical-path and resource conservation."""
+    from .unmodeled_gate import assert_report_supported, assert_timing_supported
+    assert_timing_supported(case, entry="evaluate_target_efficiency")
+    assert_report_supported(baseline_analysis, entry="evaluate_target_efficiency")
     result = _evaluate_target_efficiency_legacy(
         case, phase=phase, tokens=tokens, context=context,
         sequences=sequences, scope=scope, target_mbu=target_mbu,
@@ -1747,6 +1756,8 @@ def solve_sla_sizing(
 ) -> dict[str, Any]:
     """Solve SLA-constrained maximum concurrency B*_SLA and throughput across hardware scenarios."""
     from .evaluation import check_active_deadline
+    from .unmodeled_gate import assert_timing_supported
+    assert_timing_supported(case, entry="solve_sla_sizing")
     check_active_deadline()
     _check_pos_float("sla_ms", sla_ms)
     if isinstance(max_sequences_per_dp, bool) or not isinstance(max_sequences_per_dp, int) or max_sequences_per_dp < 1:
@@ -1868,6 +1879,9 @@ def solve_sla_sizing(
             if checks is not None:
                 checks[int(b)] = record
             return bool(record["sla"]["pass"])
+        except UnmodeledCapabilityError:
+            # An unmodeled core is not an infeasible candidate.
+            raise
         except ModelingError as exc:
             if b <= 1:
                 raise
