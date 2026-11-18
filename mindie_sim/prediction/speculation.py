@@ -20,6 +20,11 @@ from .implementation_selection import resolve, LoweringRegion
 
 
 PROPOSAL_ID_BYTES = 8
+#: Unpacked BF16 MLA prolog shared with ``draft_context``'s V3 context rows.
+PROLOG_IMPLEMENTATION = "vllm_ascend_mla_prolog_v3"
+PROLOG_ROLE = "mla_prolog"
+FUSION_OPTION_ROLES = "roles"
+FUSION_OPTION_PROFILES = ("program_profiles", "program_options")
 
 
 def compute_speculative_accept_step(accept_rate, draft_tokens) -> float:
@@ -63,18 +68,39 @@ from mindie_sim.catalog.draft_geometry import (  # noqa: F401
 
 
 def _independent_draft_runtime(runtime):
-    """Strip target packed-cache lowerings from an independent BF16 draft.
+    """Rebind the target's packed-cache prolog to the draft's BF16 operands.
 
     The target's C8 ``mla_prolog`` contract names int8 operands and a packed
     cache layout.  A DSpark draft owns its own BF16 operands and cache, so that
-    binding cannot be revalidated against the draft; the draft uses the
-    declared analytical prolog instead of crashing on the target ABI.
+    binding cannot be revalidated against the draft.  Deleting the binding is
+    not a substitute: it leaves the draft body without any prolog, while the
+    context phase still prepares five BF16 context rows.  The independent draft
+    therefore installs the same unpacked ``MlaPrologV3`` source for its own
+    body layers, exactly as ``draft_context`` does for the context rows.
     """
     kernels = dict(getattr(runtime, "kernels", {}) or ())
-    lowerings = dict(kernels.get("lowerings", {}) or {})
+    lowerings = dict(kernels.get("lowerings", {}) or ())
     if "mla_prolog" not in lowerings:
         return runtime
-    lowerings.pop("mla_prolog")
+    lowerings["mla_prolog"] = PROLOG_IMPLEMENTATION
+    fusion = lowerings.get("native_fusion")
+    if isinstance(fusion, dict):
+        # The target's fusion inventory can name grouped/hyper groups that a
+        # dense DSpark block does not contain.  Keep only the prolog role so
+        # the draft never claims a group it cannot materialize; its recipe is
+        # already registered by the case's declaration.
+        options = dict(fusion.get("options") or {})
+        options[FUSION_OPTION_ROLES] = (PROLOG_ROLE,)
+        for key in FUSION_OPTION_PROFILES:
+            value = options.get(key)
+            if isinstance(value, dict):
+                options[key] = {name: item for name, item in value.items()
+                                if name == PROLOG_ROLE}
+        traffic = options.get("traffic_profile")
+        if isinstance(traffic, dict):
+            options["traffic_profile"] = {
+                name: item for name, item in traffic.items() if name == PROLOG_ROLE}
+        lowerings["native_fusion"] = {**fusion, "options": options}
     kernels["lowerings"] = lowerings
     return replace(runtime, kernels=kernels)
 

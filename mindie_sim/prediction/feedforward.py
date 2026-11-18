@@ -34,6 +34,7 @@ ZERO = 0
 ONE = 1
 TWO = 2
 ZERO_FLOAT = 0.0
+INVERSE_INDEX_DTYPE = "int32"
 
 
 def _latent_norm(prefix, source, stage, plan, requests, tokens, latent, model, mode):
@@ -180,7 +181,7 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
     receive_rows = (
         max((destination_rows[rank] for rank in represented_ranks
              if 0 <= rank < len(destination_rows)), default=ZERO)
-        if destination_rows is not None else int(tokens) * int(plan.top_k))
+        if destination_rows is not None else int(math.ceil(local_rows)))
     runtime_routing = dict(getattr(runtime, "routing", {}) or {})
     has_slots = (
         int(getattr(parallel, "redundant_experts_per_rank", ZERO) or ZERO) > ZERO
@@ -335,15 +336,21 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
     absorbed_routing_meta = None
     if pack_quant is not None:
         absorbed_pack, retired = (
-            absorb_init_routing(
-                pack=packing, quantizer=pack_quant, ep=parallel.ep,
+            absorb_init_routing(pack=packing, quantizer=pack_quant, ep=parallel.ep,
                 dispatch_owns_quant=dispatch_quantizes_internally(runtime))
             if cann_native_active(runtime) else (packing, None))
         if retired is not None:
-            # ``aclnnMoeInitRoutingV3`` owns the permutation and the dynamic
-            # quantization; the retired quantizer's work is billed exactly
-            # once on the pack and its payload is the expert input.
-            packing = absorbed_pack
+            # ``aclnnMoeInitRoutingV3`` also writes one INT32 inverse token-slot
+            # index per routed assignment, which the combine must read back.
+            inverse_index_bytes = payload_tokens * plan.top_k * dtype_bytes(INVERSE_INDEX_DTYPE)
+            packing_metadata = dict(absorbed_pack.metadata)
+            routing_meta = dict(packing_metadata.get("moe_init_routing") or ())
+            routing_meta["write_bytes"] = float(routing_meta.get("write_bytes", ZERO_FLOAT)) + inverse_index_bytes
+            packing_metadata.update(moe_init_routing=routing_meta, inverse_index_dtype=INVERSE_INDEX_DTYPE,
+                                    inverse_index_bytes=float(inverse_index_bytes))
+            packing = replace(absorbed_pack, metadata=tuple(packing_metadata.items()),
+                              mte3_bytes=float(absorbed_pack.mte3_bytes) + inverse_index_bytes,
+                              hbm_bytes=float(absorbed_pack.hbm_bytes) + inverse_index_bytes)
             ops[-1] = packing
             last = packing.op_id
             absorbed_routing = packing
@@ -562,6 +569,12 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
         unpack_metadata.append(("input_rows", int(local_rows)))
     act_bytes = dtype_bytes(model.activation_dtype)
     unpack_read = tokens * plan.top_k * (latent * act_bytes + dtype_bytes("fp32"))
+    if absorbed_routing is not None:
+        # The native pack wrote one INT32 inverse slot per assignment.
+        inverse_index_bytes = tokens * plan.top_k * dtype_bytes(INVERSE_INDEX_DTYPE)
+        unpack_read += inverse_index_bytes
+        unpack_metadata.extend((("inverse_index_dtype", INVERSE_INDEX_DTYPE),
+                                ("inverse_index_bytes", float(inverse_index_bytes))))
     unpack_write = tokens * latent * act_bytes
     unpack_ops = unpack_extra = None
     if caller is not None:

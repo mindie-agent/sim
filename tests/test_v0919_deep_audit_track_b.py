@@ -607,3 +607,275 @@ def test_unmodeled_gate_resolves_layer_override_and_flat_timeline():
                            "recipe": "unmodeled_attention_core",
                            "layer": 0}]},
             entry="analyze_network_efficiency")
+
+
+# --------------------------------------------------------------------------- #
+# 5. Shard-1 final gate: DSpark prologs, bare KDA, MoE indices/dispatch,
+#    DBO conservation, packed views, P/D GQA ownership and exact target DAG.
+# --------------------------------------------------------------------------- #
+def _dspark_case():
+    quant = quant_preset("w8a8_mxfp8").to_dict() | {"kv_dtype": "int8"}
+    raw = compose_case(
+        "kimi-k3.1", hardware="a5", tp=8, dp=1, ep=8, dcp=8, num_devices=8,
+        layers=4, quant=quant, mtp_proposal_tokens=5,
+        prompt_tokens=8, output_tokens=2)
+    # The MXFP8/C8 target case declares the native fusion role set this stack
+    # ships; the independent DSpark draft inherits that source inventory.
+    raw["runtime"].setdefault("kernels", {}).setdefault("lowerings", {})[
+        "native_fusion"] = {
+            "implementation": "declared_native_fusion",
+            "options": {"roles": ["mla_prolog"]},
+        }
+    return raw
+
+
+def test_dspark_body_and_context_emit_five_native_v3_prologs():
+    parsed = parse_case(_dspark_case())
+    target_prolog = parsed.runtime.kernels["lowerings"]["mla_prolog"]
+    assert target_prolog["options"]["cache_layout"]
+
+    graph = target_graphs(
+        parsed, phase="decode", tokens=6, context=4, sequences=1, scope="model")[0]
+    body = [op for op in graph if op.phase == "draft"
+            and dict(op.metadata).get("fusion_role") == "mla_prolog"]
+    context = _by_recipe(graph, "draft_context_mla_prolog_v3")
+
+    assert len(body) == len(context) == 5
+    assert not [op for op in graph if op.phase == "draft"
+                and op.recipe in {"q_a", "kv_a"}]
+    assert {dict(op.metadata)["native_kind"] for op in context} == {
+        "aclnnMlaPrologV3WeightNz"}
+    for op in body:
+        native = dict(op.metadata)["fusion_boundary"]["native"]
+        assert native["native_kind"] == "aclnnMlaPrologV3WeightNz"
+        assert native["selection"] == "vllm_ascend_mla_prolog_v3"
+        # The draft owns BF16 operands and cache; the target's packed C8 ABI
+        # must not leak into the independent body prolog.
+        assert native["conditions"]["quantized_kv_cache"] is False
+        assert dict(op.metadata)["fusion_tensor_view"]["cache_dtype"] == "bf16"
+
+
+def _bare_kda_graph(**options):
+    raw = compose_case(
+        "glm-5.3-flash", hardware="a5", tp=8, dp=1, ep=8, num_devices=8,
+        layers=4, **options)
+    return target_graphs(
+        parse_case(raw), phase="decode", tokens=1, context=0,
+        sequences=1, scope="model")[0]
+
+
+def test_bare_track_and_excluded_native_kda_run_the_analytical_source():
+    for options in ({"va_recommended": False},
+                    {"exclude_optimizations": (
+                        "recurrent_decode_native_kernels",)}):
+        graph = _bare_kda_graph(**options)
+        native = [op for op in graph
+                  if op.recipe == "vllm_ascend_recurrent_kda_arch35"]
+        analytical = [op for op in graph if op.family == "recurrent_scan"]
+        assert native == []
+        assert len(analytical) == 3
+
+    recommended = _bare_kda_graph(va_recommended=True)
+    assert sum(op.recipe == "vllm_ascend_recurrent_kda_arch35"
+               for op in recommended) == 3
+
+
+def _moe_inverse_index_graph():
+    raw = compose_case(
+        "glm-5.3-flash", hardware="a5", tp=8, dp=1, ep=8, num_devices=8,
+        layers=4, prompt_tokens=64, output_tokens=2,
+        max_num_batched_tokens=256)
+    return target_graphs(
+        parse_case(raw), phase="decode", tokens=64, context=0,
+        sequences=1, scope="body")[0]
+
+
+def test_native_moe_inverse_indices_are_charged_once_on_pack_and_unpack():
+    graph = _moe_inverse_index_graph()
+    pack = next(op for op in graph if op.recipe == "moe_init_routing_v3")
+    unpack = next(op for op in graph if op.recipe == "route_unpack")
+    assignments = int(pack.local_shape[0]) * int(pack.local_shape[1])
+    index_bytes = assignments * 4
+
+    assert assignments == 64
+    assert index_bytes == 256
+    assert dict(pack.metadata)["inverse_index_bytes"] == index_bytes
+    assert dict(pack.metadata)["moe_init_routing"]["write_bytes"] == (
+        pytest.approx(pack.mte3_bytes))
+    assert pack.mte3_bytes == pytest.approx(270336 + index_bytes)
+    assert pack.hbm_bytes == pytest.approx(pack.mte2_bytes + pack.mte3_bytes)
+    assert dict(unpack.metadata)["inverse_index_bytes"] == index_bytes
+    assert unpack.mte2_bytes == pytest.approx(524544 + index_bytes)
+
+
+def test_alltoallv_receive_buffers_follow_incoming_uniform_assignments():
+    raw = compose_case(
+        "qwen3-30b-a3b", hardware="a5", tp=1, dp=2, ep=2, num_devices=2,
+        layers=1, prompt_tokens=8, output_tokens=2, max_num_seqs=4)
+    graphs = target_graphs(
+        parse_case(raw), phase="decode", tokens=1, context=32,
+        sequences=[2, 3], scope="body")
+
+    for replica, outgoing in ((0, 16), (1, 24)):
+        dispatch = next(op for op in graphs[replica]
+                        if op.recipe == "expert_dispatch")
+        metadata = dict(dispatch.metadata)
+        assert dispatch.local_shape[0] == outgoing
+        # Uniform routing sends the outgoing split but receives the same
+        # 20 assignments on both EP ranks; the receive allocation follows it.
+        assert metadata["output_shape"] == (20, 2048)
+        assert metadata["capacity_rows"] == 20
+        assert metadata["payload_rows"] == 20
+        assert metadata["capacity_rows"] * metadata["payload_row_bytes"] == (
+            pytest.approx(81920.0))
+        experts = [op for op in graphs[replica]
+                   if op.recipe in {"grouped_gate_up", "grouped_down"}]
+        assert [op.local_shape[0] for op in experts] == [20, 20]
+
+
+def _dbo_gate_rows(sequences):
+    raw = compose_case(
+        "qwen3-30b-a3b", hardware="a5", tp=1, dp=2, ep=2, num_devices=2,
+        layers=1, prompt_tokens=8, output_tokens=2, max_num_seqs=4,
+        enable_dbo=True)
+    graphs = target_graphs(
+        parse_case(raw), phase="decode", tokens=1, context=32,
+        sequences=sequences, scope="body")
+    return graphs
+
+
+def test_dbo_microbatches_conserve_assignments_and_split_the_ep_cohort():
+    graphs = _dbo_gate_rows([2, 3])
+    per_rank = []
+    for replica in (0, 1):
+        gates = [op for op in graphs[replica] if op.recipe == "grouped_gate_up"]
+        assert len(gates) == 2
+        assert all("dbo_microbatch" in dict(op.metadata) for op in gates)
+        per_rank.append(sum(op.local_shape[0] for op in gates))
+    assert per_rank == [20, 20]
+    assert sum(per_rank) == 40
+
+    # A peer with one active row cannot split its single view.  DBO must stay
+    # off for the whole collective cohort instead of raising a rendezvous
+    # mismatch between one split rank and one unsplit rank.
+    graphs = _dbo_gate_rows([2, 1])
+    for replica in (0, 1):
+        dispatches = [op for op in graphs[replica]
+                      if op.recipe == "expert_dispatch"]
+        assert len(dispatches) == 1
+        assert not [op for op in graphs[replica]
+                    if op.op_id.startswith("dbo")]
+        gates = [op for op in graphs[replica] if op.recipe == "grouped_gate_up"]
+        assert sum(op.local_shape[0] for op in gates) == 12
+
+
+def test_local_tp_packed_views_use_the_parent_row_stride():
+    raw = compose_case(
+        "glm-5.3-flash", hardware="a5", tp=1, dp=8, ep=8, num_devices=8,
+        layers=4, o_proj_tp=8, linear_proj_tp=8, lm_head_tp=8,
+        quant="w8a8_mxfp8", prompt_tokens=8, output_tokens=2)
+    graph = target_graphs(
+        parse_case(raw), phase="decode", tokens=6, context=0,
+        sequences=1, scope="body")[0]
+    packed = next(op for op in graph
+                  if op.op_id.endswith(".linear_qkvbfg_a:local_tp:gemm"))
+    slices = {item["role"]: item
+              for item in dict(packed.metadata)["packed_projection_slices"]}
+
+    assert packed.local_shape[1] == 3336
+    q, k = slices["q"], slices["k"]
+    assert q["shape"][1] == 1024
+    assert q["strides"] == (3336, 1)
+    assert k["offset_elements"] == 1024
+    # Row one of the Q view advances by the parent buffer width; using the
+    # slice width would alias K[0, 0] at offset 1024.
+    assert q["offset_elements"] + q["strides"][0] == 3336
+
+
+def _pd_model_case(tokens, num_kv_heads):
+    raw = pd_case([{"id": "r", "prompt_tokens": tokens, "output_tokens": 3}])
+    raw["model"].update(
+        layers=1, hidden_size=64, num_heads=4, num_kv_heads=num_kv_heads,
+        head_dim=16, intermediate_size=64, vocab_size=128)
+    raw["connector"] = {
+        "link": {"name": "handoff", "capacity_bytes_per_ms": 64,
+                 "latency_us": 0, "semantics": "per_pair"},
+        "chunk_bytes": 64}
+    return raw
+
+
+def _bind_pd_pool(raw, pool, ranks, tp, cp):
+    machine = raw["pools"][pool]["machine"]
+    machine["num_devices"] = len(ranks)
+    machine["devices"] = [{"rank": rank} for rank in ranks]
+    machine["links"][0]["members"] = list(ranks)
+    raw["pools"][pool]["runtime"].update(
+        tp=tp, pp=1, cp=cp, dcp=cp, cp_plan="dcp" if cp > 1 else "none")
+
+
+def test_pd_handoff_pairs_replicated_heads_with_every_token_shard():
+    from mindie_sim import predict_pd
+
+    raw = _pd_model_case(4, 2)
+    _bind_pd_pool(raw, "prefill", (0, 1, 2, 3), tp=4, cp=2)
+    _bind_pd_pool(raw, "decode", (4,), tp=1, cp=1)
+    result = predict_pd(raw, lower=linear_work, event_limit=100000)
+    transfers = result["execution"]["pd_handoffs"][0]["transfers"]
+
+    # TP4 > 2 KV heads replicates each head; the DCP2 axis must pair each
+    # replica with a different token shard so the union covers every
+    # (token, head) pair exactly once.
+    assert len(transfers) == 4
+    assert sum(row["payload_bytes"] for row in transfers) == pytest.approx(512.0)
+    assert all(row["payload_bytes"] == pytest.approx(128.0)
+               for row in transfers)
+    assert {(row["source_rank"], tuple(row["source_token_span"]))
+            for row in transfers} == {
+        (0, (0, 2)), (1, (0, 2)), (2, (2, 4)), (3, (2, 4))}
+    assert {(row["source_rank"], tuple(row["source_heads"]))
+            for row in transfers} == {
+        (0, (0, 1)), (1, (1, 2)), (2, (0, 1)), (3, (1, 2))}
+
+
+def test_pd_handoff_weights_destination_shards_by_exact_token_rows():
+    from mindie_sim import predict_pd
+
+    raw = _pd_model_case(5, 1)
+    _bind_pd_pool(raw, "prefill", (0,), tp=1, cp=1)
+    _bind_pd_pool(raw, "decode", (1, 2), tp=2, cp=2)
+    result = predict_pd(raw, lower=linear_work, event_limit=100000)
+    transfers = result["execution"]["pd_handoffs"][0]["transfers"]
+
+    assert {(row["destination_rank"], tuple(row["destination_token_span"]),
+             row["payload_bytes"]) for row in transfers} == {
+        (1, (0, 2), 128.0), (2, (2, 5), 192.0)}
+    assert sum(row["payload_bytes"] for row in transfers) == pytest.approx(320.0)
+
+
+def test_public_baseline_round_trips_the_occurrence_dag():
+    import json
+
+    raw = plain_case(prompt=4, output=2)
+    raw["model"]["layers"] = 1
+    options = dict(
+        phase="decode", tokens=1, context=32, sequences=1, scope="model",
+        mode="exact_target", target_mbu=1.0, target_cube_mfu=1.0,
+        target_vec_mfu=1.0, target_link_util=1.0, fixed_launch_us=10)
+    direct = evaluate_target_efficiency(raw, **options)
+    baseline = analyze_network_efficiency(
+        raw, phase="decode", tokens=1, context=32, sequences=1, scope="model")
+    assert "occurrence_dag" in baseline
+
+    public = json.loads(json.dumps(baseline))
+    repeated = evaluate_target_efficiency(
+        raw, **options, baseline_analysis=public)
+
+    assert len(direct["critical_path_nodes"]) == 15
+    assert repeated["critical_path_nodes"] == direct["critical_path_nodes"]
+    assert repeated["target_step_duration_ms"] == pytest.approx(
+        direct["target_step_duration_ms"])
+    assert repeated["target_step_duration_ms"] == pytest.approx(0.183888)
+    assert repeated["physical_ideal_ms"] == pytest.approx(0.033888)
+    assert repeated["target_network_roofline_efficiency"] == pytest.approx(
+        direct["target_network_roofline_efficiency"])
+    assert repeated["target_network_roofline_efficiency"] <= 1.0

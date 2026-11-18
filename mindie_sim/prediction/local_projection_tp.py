@@ -132,12 +132,16 @@ def _localize_packed_slices(metadata: dict[str, Any], width: int, quant: Any = N
     slices = metadata.get("packed_projection_slices")
     if not slices:
         return
+    # Every slice is a column view into the one localized packed output, so a
+    # row advances by the parent buffer's full local width, not by the slice's
+    # own width.  Using the slice width makes ``Q[1, 0]`` alias ``K[0, 0]``.
+    local_sizes = [_slice_local(item, width, quant) for item in slices]
+    packed_width = sum(local_sizes)
     offset, local_slices = ZERO, []
-    for item in slices:
+    for item, local_size in zip(slices, local_sizes):
         shape = tuple(item.get("shape", ()))
-        local_size = _slice_local(item, width, quant)
         local_slices.append({**dict(item), "shape": (int(shape[ZERO]) if shape else ZERO, local_size),
-                             "strides": (local_size, ONE), "offset_elements": offset})
+                             "strides": (packed_width, ONE), "offset_elements": offset})
         offset += local_size
     metadata["packed_projection_slices"] = tuple(local_slices)
 
