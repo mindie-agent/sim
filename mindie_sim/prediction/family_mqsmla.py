@@ -15,6 +15,10 @@ from mindie_sim.schema.common import ModelingError
 from .mechanism import PlannedRecipe
 from .mqsmla import (
     COMPRESSED_CACHE_ROW_BYTES,
+    KV_QUANT_BF16,
+    KV_QUANT_FP8,
+    KV_QUANT_MXFP8,
+    KV_QUANT_ROW_BYTES,
     LEGACY_NATIVE_KIND,
     LEGACY_RECIPE,
     LEGACY_SOURCE,
@@ -40,12 +44,61 @@ MIN_ACTIVE_ROWS = 1
 QUERY_ORIGIN = 0
 NO_COMPRESSED_ROWS = 0
 VALID_ADDRESSING = frozenset({"scalar", "auto", "vector"})
+#: Declared ``(dtype, scale group, scale dtype)`` pair of every packed mode.
+QUANT_MODE_SIGNATURES = {
+    (("bf16", 0, "none"), ("bf16", 0, "none")): KV_QUANT_BF16,
+    (("fp8_e4m3", 32, "bf16"), ("fp8_e4m3", 32, "bf16")): KV_QUANT_FP8,
+    (("fp8_e4m3", 32, "uint8"), ("fp8_e4m3", 32, "uint8")): KV_QUANT_MXFP8,
+}
 FORMATS = {
     "window": {"dtype": "fp8_e4m3", "group_size": FP8_WINDOW_GROUP_SIZE,
                "scale_dtype": "bf16"},
     "compressed_kv": {"dtype": "fp4_e2m1", "group_size": FP4_COMPRESSED_GROUP_SIZE,
                       "scale_dtype": "bf16"},
 }
+
+
+def quant_mode_of(model, head_dim):
+    """Declared packed-KV mode of the arch35 mixed-quant kernel, or ``None``.
+
+    The declared cache representations decide the mode: BF16 rows, the FP8 row
+    with one BF16 scale per 32 values, and the MXFP8 row whose packed UE8M0
+    exponent plane is unpacked and broadcast.  A mixed FP8/FP4 declaration
+    keeps the retained legacy ``aclnn`` row widths.
+    """
+    del head_dim
+    return _declared_mode(cache_format(model, "window"),
+                          cache_format(model, "compressed_kv"))
+
+
+def _declared_mode(window, compressed):
+    signature = ((window.dtype, window.group_size, window.scale_dtype),
+                 (compressed.dtype, compressed.group_size, compressed.scale_dtype))
+    return QUANT_MODE_SIGNATURES.get(signature)
+
+
+def _region_format(raw):
+    if not isinstance(raw, dict):
+        return None
+    allowed = {"dtype", "group_size", "scale_dtype", "suffix_elements",
+               "suffix_dtype", "packed_elements"}
+    if set(raw) - allowed:
+        return None
+    return CacheFormat(**raw)
+
+
+def declared_quant_mode(op):
+    """Read one analytic attention op's declared cache representation pair."""
+    view = dict(getattr(op, "metadata", ()) or ()).get("attention_tensor_view") or {}
+    regions = view.get("cache_representations") or {}
+    window, compressed = (_region_format(regions.get("window")),
+                          _region_format(regions.get("compressed_kv")))
+    if window is None or compressed is None:
+        return None
+    mode = _declared_mode(window, compressed)
+    if mode is None:
+        return None
+    return mode
 
 
 def recipes():
@@ -64,6 +117,17 @@ def query_shape(views, plan, *, topk_present=False):
         "ratio": effective_ratio,
         "topk": plan.index_topk if topk_present else NO_COMPRESSED_ROWS,
     }
+
+
+def _prefix_fields(views):
+    """Declared shared-pool extent of every request's immutable prefix."""
+    extents = tuple(max(0, min(int(getattr(v, "prefix_tokens", 0) or 0),
+                               int(getattr(v, "context", 0) or 0))) for v in views)
+    shared = any(extents) and all(
+        str(getattr(v, "prefix_cache_key", "") or "") for v in views if v.prefix_tokens)
+    if not shared:
+        return {"prefix_cache_mode": "private"}
+    return {"prefix_cache_mode": "shared", "prefix_tokens": extents}
 
 
 def unsupported_reason(*, views, plan, parallel, model, padded_tokens,
@@ -107,6 +171,11 @@ def unsupported_reason(*, views, plan, parallel, model, padded_tokens,
         rows = tuple(query_rows(query_shape(views, plan, topk_present=topk_present)))
         if selective_fd_excluded(cores, rows):
             return "mqsmla_selective_72_row_fd_branch_not_modeled"
+    if quant_mode_of(model, plan.head_dim) in {KV_QUANT_FP8, KV_QUANT_MXFP8}:
+        # A declared packed-quantized representation is itself the contract.  A
+        # BF16 cache keeps the plain attention path: the packed native kernel is
+        # a quantized-cache binding, never a relabel of a BF16 declaration.
+        return None
     for region, declaration in FORMATS.items():
         if cache_format(model, region) != CacheFormat(**declaration):
             return "mqsmla_cache_representation_contract_required:" + region
@@ -128,7 +197,7 @@ def validate(*, views, plan, parallel, model, padded_tokens,
 
 
 def lower_attention(ops, outputs, *, selection, views, plan, topk_present, prefix,
-                    parallel=None):
+                    parallel=None, runtime=None):
     ids = set(outputs)
     members = [op for op in ops if op.op_id in ids]
     tp_degree = max(int(getattr(parallel, "tp", SINGLE_KV_HEAD) or SINGLE_KV_HEAD),
@@ -139,12 +208,17 @@ def lower_attention(ops, outputs, *, selection, views, plan, topk_present, prefi
     effective_ratio = (plan.compress_ratio if topk_present or plan.owns_long_kv
                        else NO_COMPRESSED_ROWS)
     implementation = str(getattr(selection, "name", RECIPE))
+    quant_mode = declared_quant_mode(members[0])
     shape = {"sequences": rows, "window": plan.window, "ratio": effective_ratio,
              "topk": plan.index_topk if topk_present else 0, "heads": heads,
              "width": MQSMLA_HEAD_WIDTH, "metadata_support_fd": False,
              "implementation": implementation,
              "addressing": str(dict(getattr(selection, "options", {}) or {}).get(
                  "addressing", "scalar"))}
+    if quant_mode is not None:
+        shape["kv_quant_mode"] = quant_mode
+        shape["packed_row_bytes"] = KV_QUANT_ROW_BYTES[quant_mode]
+        shape.update(_prefix_fields(views))
     query = (active_q, heads, MQSMLA_HEAD_WIDTH)
     legacy = implementation == LEGACY_RECIPE
     meta = {**dict(members[0].metadata), "mqsmla_geometry": shape,
@@ -161,8 +235,11 @@ def lower_attention(ops, outputs, *, selection, views, plan, topk_present, prefi
                 "kind": "mixed_quant_shared_kv", "query_shape": query,
                 "output_shape": query,
                 "query_dtype": "bf16", "output_dtype": "bf16",
-                "original_cache_row_bytes": ORIGINAL_CACHE_ROW_BYTES,
-                "compressed_cache_row_bytes": COMPRESSED_CACHE_ROW_BYTES,
+                "original_cache_row_bytes": KV_QUANT_ROW_BYTES[quant_mode]
+                if quant_mode is not None else ORIGINAL_CACHE_ROW_BYTES,
+                "compressed_cache_row_bytes": KV_QUANT_ROW_BYTES[quant_mode]
+                if quant_mode is not None else COMPRESSED_CACHE_ROW_BYTES,
+                "kv_quant_mode": quant_mode,
                 "compressed_cache": effective_ratio > 0},
             "native_kind": LEGACY_NATIVE_KIND if legacy else NATIVE_KIND}
     result = replace(members[0], op_id=prefix + ".mqsmla",

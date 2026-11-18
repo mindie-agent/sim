@@ -42,6 +42,47 @@ STORE_ROLES = ("mte3",)
 VECTOR_ROLES = ("vector",)
 
 
+@dataclass(frozen=True)
+class SparsePrefixFill:
+    """Cold external fill bytes of a declared sparse shared-prefix selection.
+
+    ``selected`` is one query row's selected key count.  A shared prefix key
+    denotes one immutable physical region, so every request's shared selection
+    collapses onto the union bounded by the region itself, while each request
+    keeps its own private selected rows.  The result is the external HBM volume;
+    the remaining gathers are L2 hits and stay on the core copy pipes.
+    """
+
+    shared_selected: int
+    shared_unique: int
+    private_rows: int
+    external_rows: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "shared_selected_per_row": self.shared_selected,
+            "shared_unique_rows": self.shared_unique,
+            "private_rows": self.private_rows,
+            "external_rows": self.external_rows,
+        }
+
+
+def sparse_prefix_fill(*, rows: int, requests: int, selected: int,
+                       prefix_tokens: int, context: int) -> SparsePrefixFill:
+    """Bound the first-touch external rows of a sparse shared-prefix batch."""
+    if min(rows, requests, selected) < 0 or context <= 0 or prefix_tokens < 0:
+        raise ModelingError("sparse_prefix_fill_requires_declared_geometry")
+    if requests > rows:
+        raise ModelingError("sparse_prefix_fill_requests_exceed_query_rows")
+    shared = min(prefix_tokens, context)
+    shared_selected = (selected * shared + context // 2) // context
+    shared_selected = min(shared_selected, selected)
+    shared_unique = min(shared, requests * shared_selected)
+    private_rows = requests * (selected - shared_selected)
+    return SparsePrefixFill(shared_selected, shared_unique, private_rows,
+                            shared_unique + private_rows)
+
+
 def _matches_role(key: str, roles: tuple[str, ...], mapped: set[str]) -> bool:
     return key in mapped or any(key == role or key.startswith(role + "@") for role in roles)
 

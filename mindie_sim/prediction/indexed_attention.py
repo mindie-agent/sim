@@ -27,6 +27,8 @@ SOURCE = {
     "scope": "BF16, single latent KV head, per-query indices, no dense window",
 }
 IMPLEMENTATION = "ascend_sparse_flash_attention_arch22"
+#: Seconds per millisecond; the Engine's declared rates are work per millisecond.
+MS_PER_SECOND = 1000.0
 
 
 def recipe(*, scratch_policy, key_tile=512, slots=3, compact=True,
@@ -121,7 +123,8 @@ def batch_analytic_ops(ops, outputs, *, runtime, views, prefix):
         view["batch_count"] = len(sequences)
         meta["attention_tensor_view"] = view
     meta.update({
-        "indexed_attention_geometry": {**common[0], "sequences": sequences},
+        "indexed_attention_geometry": {**common[0], "sequences": sequences,
+                                       **_prefix_declaration(views, runtime)},
         "indexed_batch_boundary": "analytic_single_kernel_shared_query_owner_grid",
         "indexed_batch_members": tuple(op.recipe for op in members),
         "indexed_sequence_requests": tuple(view.request_id for view in views),
@@ -143,6 +146,18 @@ def batch_analytic_ops(ops, outputs, *, runtime, views, prefix):
     ops[:] = [op for op in ops if op.op_id not in ids]
     ops.insert(first, batched)
     return [batched.op_id]
+
+
+def _prefix_declaration(views, runtime):
+    """Declared shared-prefix extent per request for analytic deduplication."""
+    shared = str(getattr(runtime, "prefix_cache_mode", "private") or "private")
+    extents = tuple(
+        max(0, min(int(getattr(view, "prefix_tokens", 0) or 0),
+                   int(getattr(view, "context", 0) or 0)))
+        for view in views)
+    if shared != "shared" or not any(extents):
+        return {"prefix_cache_mode": shared}
+    return {"prefix_cache_mode": shared, "prefix_tokens": extents}
 
 
 def _align(value, size):
@@ -306,6 +321,46 @@ def sequence_query_positions(owner, sequences, compute_units):
         sequence = bisect_right(ends, position)
         start = ends[sequence - 1] if sequence else 0
         yield sequence, position - start
+
+
+def owner_row_tiles(owner, sequences, compute_units, topk, tile_size, *,
+                    pool_size=1, pool_tail=False):
+    """Yield one AIC owner's contiguous query rows and their key tiles.
+
+    The arch35 sparse kernel assigns every query row to one ``1c2v`` group and
+    walks that row's selected keys in ``tile_size`` tiles. Ownership is the
+    contiguous ceil(query/AIC) interval of the source parameter pass, so a
+    caller sums exactly the tiles the engine will submit.
+    """
+    if tile_size < 1:
+        raise ModelingError("indexed_attention_requires_positive_key_tile")
+    for sequence, position in sequence_query_positions(owner, sequences, compute_units):
+        context = sequences[sequence][1]
+        count = selected_tokens(context + position + 1, topk, pool_size, pool_tail)
+        tiles = []
+        for start in range(0, count, tile_size):
+            keys = min(tile_size, count - start)
+            tiles.append((keys, start == 0, start + keys == count))
+        yield sequence, tuple(tiles)
+
+
+def bind_sustained_dram(context):
+    """Price external DRAM at the declared sustained ceiling, not the raw peak.
+
+    The profile publishes the sustainable DRAM service rate on the private
+    MTE2 paths (``mte2_*_dram``).  External bytes still contend on the shared
+    HBM bus, so the bus keeps its physical identity and only its declared
+    service rate changes.
+    """
+    mode = context.service_modes.get("mte2_aiv_dram")
+    if mode is None:
+        return context
+    name = context.resource_names.get("hbm")
+    if name is None:
+        return context
+    ceiling = min(float(mode[1]), float(context.rates[name]) * MS_PER_SECOND)
+    return replace(context, service_modes={
+        **context.service_modes, "hbm": ("hbm", ceiling)})
 
 
 @lru_cache(maxsize=4)

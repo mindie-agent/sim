@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 
 from mindie_sim.schema.common import ModelingError
+from .batch_prefix_attention import sparse_prefix_fill
 from .mechanism import OperatorPlan, Work
 from .program import KernelProgram, ParallelProgram, PipelineProgram, Stage
 from .instructions import PrimitiveInventory
@@ -90,6 +91,33 @@ SELECTIVE_FD_AIC_CORES = 32
 SELECTIVE_FD_QUERY_ROWS = 72
 SELECTIVE_FD_ORIGINAL_ROWS = 128
 SELECTIVE_FD_COMPRESSED_ROWS = 512
+#: ``aclnnMixedQuantSparseFlashMla`` packed-KV modes of the arch35 kernel.
+KV_QUANT_BF16 = 0
+KV_QUANT_FP8 = 1
+KV_QUANT_MXFP8 = 2
+KV_QUANT_MODES = frozenset({KV_QUANT_BF16, KV_QUANT_FP8, KV_QUANT_MXFP8})
+#: Packed row widths of one 512-wide latent slot plus its 64 rotary lanes.
+KV_QUANT_BF16_ROW_BYTES = 512 * BF16_ELEMENT_BYTES
+KV_QUANT_FP8_ROW_BYTES = 576 + 16 * BF16_ELEMENT_BYTES
+KV_QUANT_MXFP8_ROW_BYTES = 576 + 8
+KV_QUANT_ROW_BYTES = {
+    KV_QUANT_BF16: KV_QUANT_BF16_ROW_BYTES,
+    KV_QUANT_FP8: KV_QUANT_FP8_ROW_BYTES,
+    KV_QUANT_MXFP8: KV_QUANT_MXFP8_ROW_BYTES,
+}
+#: Declared vector pass inventory of the dequantized operand publish.
+#: ``qm=1`` keeps the source's FP8 cast + per-32 scale multiply + NZ move.
+#: ``qm=2`` adds the UE8M0 group unpack, exponent shift and broadcast multiply.
+KV_QUANT_DEQUANT_OPS = {
+    KV_QUANT_BF16: 0,
+    KV_QUANT_FP8: 5,
+    KV_QUANT_MXFP8: 10,
+}
+#: Live KV/P/alpha slots of the double-buffered inter-tile pipeline.
+QUANT_TILE_SLOTS = 2
+#: Source AICPU metadata program plus kernel launch/drain before the tile loop
+#: (paired-silicon intercept; the tile pipeline is fitted separately).
+METADATA_PROGRAM_MS = 0.020
 # Distinct (branch, rows, first, last, addressing, heads) phase payloads.
 TILE_PHASE_CACHE_SIZE = 512
 OWNER_STAGE_CACHE_SIZE = 16
@@ -275,6 +303,73 @@ class OwnerTiles:
         return self.ends[-1]
 
 
+def quant_row_bytes(quant_mode):
+    if quant_mode not in KV_QUANT_MODES:
+        raise ModelingError("mqsmla_kv_quant_mode_unsupported")
+    return {KV_QUANT_BF16: KV_QUANT_BF16_ROW_BYTES,
+            KV_QUANT_FP8: KV_QUANT_FP8_ROW_BYTES,
+            KV_QUANT_MXFP8: KV_QUANT_MXFP8_ROW_BYTES}[quant_mode]
+
+
+def quant_tile_phases(valid, first, last, *, heads, quant_mode, window_bytes=0):
+    """One 128-key tile of the arch35 double-buffered inter-tile pipeline.
+
+    Address/gather/dequant/publish of tile ``i+1`` overlap the AIC ``QK ->
+    Fixpipe -> online softmax -> PV`` chain of tile ``i``; the copy, vector and
+    publish pipes of the ``2-AIV`` block are separate stages so the engine can
+    interleave them across the live slots.  ``window_bytes`` is the private SWA
+    ring a query token re-reads; the shared TopK union is a cold fill instead.
+    """
+    row_bytes = quant_row_bytes(quant_mode)
+    dequant_ops = KV_QUANT_DEQUANT_OPS[quant_mode]
+    sinks_bytes = heads * FP32_ELEMENT_BYTES
+    cube_heads = max(CUBE_HEAD_TILE_ALIGN,
+                     -(-heads // CUBE_HEAD_TILE_ALIGN) * CUBE_HEAD_TILE_ALIGN)
+    if not valid:
+        return (
+            ("sinks", Work(resources={"hbm": sinks_bytes if first else 0,
+                                      "mte2_aiv": sinks_bytes if first else 0}), ()),
+            ("empty", Work(resources={"vector": heads * MQSMLA_HEAD_WIDTH}), ()),
+        )
+    return (
+        ("sinks", Work(resources={"hbm": sinks_bytes if first else 0,
+                                  "mte2_aiv": sinks_bytes if first else 0}), ()),
+        ("address", Work(resources={
+            "mte2_aiv": valid * ADDRESS_SCALAR_READS * FP32_ELEMENT_BYTES}), ()),
+        ("gather", Work(resources={
+            "mte2_aiv": valid * row_bytes + window_bytes}), ("address",)),
+        ("dequant", Work(resources={
+            "vector": valid * MQSMLA_HEAD_WIDTH * dequant_ops}), ("gather",)),
+        ("publish", Work(resources={
+            "mte3": valid * MQSMLA_HEAD_WIDTH * BF16_ELEMENT_BYTES}), ("dequant",)),
+        ("qk", Work(matrix={
+            "bf16": BF16_ELEMENT_BYTES * cube_heads * valid * MQSMLA_HEAD_WIDTH},
+            resources={"mte1": (cube_heads + valid) * MQSMLA_HEAD_WIDTH
+                              * BF16_ELEMENT_BYTES,
+                       "fixpipe": cube_heads * valid * FP32_ELEMENT_BYTES}),
+         ("publish",)),
+        ("softmax", Work(resources={
+            "vector": SOFTMAX_PAIR_OPS * heads * valid
+                      + SOFTMAX_ROW_REDUCE_OPS * heads}), ("qk", "sinks")),
+        ("pv", Work(matrix={
+            "bf16": BF16_ELEMENT_BYTES * cube_heads * valid * MQSMLA_HEAD_WIDTH},
+            resources={"mte1": (cube_heads + MQSMLA_HEAD_WIDTH) * valid
+                              * BF16_ELEMENT_BYTES,
+                       "fixpipe": cube_heads * MQSMLA_HEAD_WIDTH * FP32_ELEMENT_BYTES}),
+         ("softmax",)),
+        ("accumulate", Work(resources={"vector": heads * MQSMLA_HEAD_WIDTH * (
+            (1 if first else ACCUM_NONFIRST_OPS)
+            + (BF16_ELEMENT_BYTES if last else 0))}), ("pv",)),
+    )
+
+
+@lru_cache(maxsize=TILE_PHASE_CACHE_SIZE)
+def quant_tile_phases_cached(valid, first, last, heads, quant_mode, window_bytes=0):
+    """Bounded cache of the pure quant-mode tile payloads."""
+    return quant_tile_phases(valid, first, last, heads=heads,
+                             quant_mode=quant_mode, window_bytes=window_bytes)
+
+
 def build(op, geometry):
     shape = dict(op.metadata)["mqsmla_geometry"]
     requested = str(shape.get("addressing", "scalar"))
@@ -308,6 +403,11 @@ def build(op, geometry):
     ownership = owner_ranges(len(rows), cores)
     streams = tuple((owner, OwnerTiles.create(rows[start:end]), row_heads[start:end])
                     for owner, start, end in ownership)
+    quant_mode = shape.get("kv_quant_mode")
+    if quant_mode is not None:
+        if quant_mode not in KV_QUANT_MODES:
+            raise ModelingError("mqsmla_kv_quant_mode_unsupported")
+        return _quant_plan(shape, streams, int(quant_mode), addressing)
     for pool, amount in BUFFERS.items():
         units = geometry.resource_units.get("vector", cores) if pool == "ub" else cores
         if (geometry.buffers.get(pool, 0) < amount
@@ -411,5 +511,131 @@ def build(op, geometry):
                                       "flash_decode_partial_reduction",
                                       "third_KV_slot_prefetch_overlap",
                                       "cross_query_sinks_prefetch_overlap",
+                                      "source_compiler_instruction_scheduling"],
+    })
+
+
+def quant_external_fill(shape, quant_mode):
+    """Cold external KV bytes: SWA rings per request, TopK shared union once."""
+    rows = tuple(query_rows(shape))
+    if not rows:
+        return 0, 0
+    row_bytes = quant_row_bytes(quant_mode)
+    sequences = tuple(shape.get("sequences", ())) or ((len(rows), 0),)
+    requests = len(sequences)
+    window = int(shape.get("window", 0) or 0)
+    # One request walks a sliding ring of ``window + q_len`` distinct rows.
+    queries = sum(int(query) for query, _context in sequences)
+    original = requests * window + queries if window else 0
+    topk = int(shape.get("topk", 0) or 0)
+    compressed = 0
+    shared_rows = 0
+    if topk:
+        context = max(context for _query, context in shape.get("sequences", ()))
+        prefix = shape.get("prefix_tokens", 0) or 0
+        prefix = max(prefix) if isinstance(prefix, tuple) else int(prefix)
+        if str(shape.get("prefix_cache_mode", "private")) != "shared" or prefix <= 0:
+            compressed = requests * topk
+        else:
+            # The compressed list selects one row per ``ratio`` raw tokens.
+            ratio = max(1, int(shape.get("ratio", 0) or 1))
+            fill = sparse_prefix_fill(rows=queries, requests=requests, selected=topk,
+                                      prefix_tokens=prefix // ratio,
+                                      context=max(1, context // ratio))
+            compressed, shared_rows = fill.external_rows, fill.shared_unique
+    return (original + compressed) * row_bytes, shared_rows
+
+
+def _quant_plan(shape, streams, quant_mode, addressing):
+    """Arch35 ``aclnnMixedQuantSparseFlashMla``: overlapped 128-key tile DAG."""
+    heads = int(shape["heads"])
+    row_bytes = quant_row_bytes(quant_mode)
+    counts = Counter(_phase_key(stream, head_counts, index)
+                     for _, stream, head_counts in streams
+                     for index in range(stream.count))
+    total = Work()
+    window_bytes = row_bytes * int(shape.get("window", 0) or 0)
+    for key, count in counts.items():
+        for _name, work, _after in quant_tile_phases_cached(
+                key[1], key[2], key[3], key[-1], quant_mode,
+                window_bytes if key[0] == "original" else 0):
+            total += work.scaled(count)
+    external, shared_rows = quant_external_fill(shape, quant_mode)
+    fill = Work(resources={"hbm": external} if external else {})
+    heads_width = heads * MQSMLA_HEAD_WIDTH * BF16_ELEMENT_BYTES
+    streamed = sum(len(stream.rows) for _owner, stream, _heads in streams) * heads_width
+    stream_work = Work(resources={"hbm": 2 * streamed, "mte2_aic": streamed,
+                                  "mte3": streamed})
+
+    def program(context):
+        from .indexed_attention import bind_sustained_dram
+        context = bind_sustained_dram(context)
+
+        def one(owner, stream, head_counts):
+            @lru_cache(maxsize=OWNER_STAGE_CACHE_SIZE)
+            def stages(key):
+                result = []
+                for name, work, after in quant_tile_phases_cached(
+                        key[1], key[2], key[3], key[-1], quant_mode,
+                        window_bytes if key[0] == "original" else 0):
+                    roles = set(work.resources) - {"hbm"}
+                    if work.matrix:
+                        roles |= {"cube"}
+                    result.append(Stage(
+                        name, context.bind(work), after=tuple(after),
+                        previous=("accumulate",) if name == "accumulate" and not key[2] else (),
+                        placement=context.owned(owner, context.core_count, roles)))
+                return tuple(result)
+
+            allocations = tuple(context.allocate(
+                f"mqsmla{owner}_{pool}", pool, amount,
+                (2 * owner, 2 * owner + 1) if pool == "ub" else (owner,))
+                for pool, amount in BUFFERS.items())
+            rows = len(stream.rows)
+            query_bytes = rows * heads * MQSMLA_HEAD_WIDTH * BF16_ELEMENT_BYTES
+            pipeline = KernelProgram((Stage(
+                "tiles", program=PipelineProgram(
+                    stream.count, QUANT_TILE_SLOTS,
+                    lambda index: stages(_phase_key(stream, head_counts, index)))),))
+            # The query read and output write are one double-buffered DMA stream
+            # per owner: they contend on the shared bus and never lengthen the
+            # tile chain, exactly as the source prefetches the next row's Q.
+            stream_io = KernelProgram((Stage("qo_stream", context.bind(Work(
+                resources={"hbm": 2 * query_bytes, "mte2_aic": query_bytes,
+                           "mte3": query_bytes}))),))
+            return KernelProgram((
+                Stage("reserve", acquire=allocations),
+                Stage("work", after=("reserve",),
+                      program=ParallelProgram((pipeline, stream_io))),
+                Stage("release", after=("work",), free=allocations)))
+
+        owners = ParallelProgram(tuple(one(owner, stream, head_counts)
+                                       for owner, stream, head_counts in streams))
+        return KernelProgram((
+            Stage("metadata", latency=METADATA_PROGRAM_MS),
+            Stage("prefix_fill", after=("metadata",), work=context.bind(fill)),
+            Stage("owners", after=("prefix_fill",), program=owners)))
+
+    return OperatorPlan(total + fill + stream_work, program, {
+        "source_execution_domain": "mixed",
+        "source_program": SOURCE,
+        "native_kind": NATIVE_KIND,
+        "mqsmla_owner_ranges": tuple((owner, stream.rows) for owner, stream, _h in streams),
+        "mqsmla_buffers_per_owner": BUFFERS,
+        "mqsmla_schedule": "arch35_overlapped_tile_dag;two_live_kv_and_accumulator_slots",
+        "mqsmla_approximation": "coarse_source_phase_DAG;register_operations_not_instruction_latency",
+        "mqsmla_addressing": addressing,
+        "mqsmla_kv_quant_mode": quant_mode,
+        "mqsmla_packed_row_bytes": row_bytes,
+        "mqsmla_dequant_ops_per_element": KV_QUANT_DEQUANT_OPS[quant_mode],
+        "mqsmla_metadata_program_ms": METADATA_PROGRAM_MS,
+        "mqsmla_prefix_partition": {
+            "external_kv_bytes": external,
+            "shared_unique_rows": shared_rows,
+            "prefix_cache_mode": shape.get("prefix_cache_mode", "private"),
+        },
+        "unmodeled_source_features": ["aicpu_metadata_program",
+                                      "scalar_page_lookup_response",
+                                      "flash_decode_partial_reduction",
                                       "source_compiler_instruction_scheduling"],
     })

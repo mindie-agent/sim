@@ -22,6 +22,11 @@ MERGE_OPS = 3
 MAX_HEADS = 128
 PACK_LSE_OPS = 4
 FP8_FORMATS = frozenset({"fp8", "fp8_e4m3", "fp8_e5m2"})
+#: Packed INT8 latent rows carry the C8 tile-128 sparse kernel.
+PACKED_CACHE_DTYPES = frozenset({"int8"})
+#: Declared native call split of one gathered-head DCP decode: two sequential
+#: ``H/2`` calls over the same packed cache plus the peer exchange below.
+PAIRED_SFA_CALLS = 2
 IMPLEMENTATION = "paired_fp8_qsfa_analytic"
 
 
@@ -45,6 +50,43 @@ def enabled(model, parallel, views, runtime=None):
                 or "attention" in kernels.get("families", {})):
             raise ModelingError("gathered_head_attention_conflicts_with_explicit_implementation")
     return selected and effective_cp >= ONE
+
+
+def paired_sfa_calls(heads):
+    """Declared sequential native calls of one gathered-head C8 SFA decode."""
+    if heads < PAIRED_SFA_CALLS or heads % PAIRED_SFA_CALLS:
+        raise ModelingError("paired_sfa_requires_even_gathered_heads")
+    return (heads // PAIRED_SFA_CALLS,) * PAIRED_SFA_CALLS
+
+
+def packed_sfa_geometry(meta, heads, plan, views, cp):
+    """Packed-C8 geometry of the declared paired calls, or ``None``.
+
+    Each call keeps the same selected rows and cache; only the gathered head
+    half changes, so the pair costs two sequential tile walks over one cache.
+    """
+    view = dict(meta.get("attention_tensor_view") or {})
+    if (view.get("kind") != "mixed_quant_shared_kv"
+            or str(view.get("cache_dtype", "")) not in PACKED_CACHE_DTYPES):
+        return None
+    if heads % PAIRED_SFA_CALLS or plan.cache_row_elements <= 0:
+        return None
+    extents = tuple(max(0, min(int(v.prefix_tokens or 0), int(v.context)))
+                    for v in views)
+    shared = any(extents) and all(str(v.prefix_cache_key or "") for v in views
+                                  if v.prefix_tokens)
+    return {
+        "sequences": tuple((int(v.q_len), int(v.context)) for v in views),
+        "topk": int(plan.index_topk),
+        "compression_ratio": 1, "window": 0, "cp": 1,
+        "heads": heads // PAIRED_SFA_CALLS,
+        "latent": int(plan.kv_lora_rank), "rope": int(plan.qk_rope_head_dim),
+        "query_dtype": "bf16", "cache_dtype": "int8",
+        **({"prefix_cache_mode": "shared", "prefix_tokens": extents} if shared
+           else {"prefix_cache_mode": "private"}),
+        "paired_calls": PAIRED_SFA_CALLS,
+        "dcp_peer_exchange": int(cp),
+    }
 
 
 def query_gather(b, query, rope, rows, heads, width, cp):
@@ -80,11 +122,20 @@ def attention_batch(b, outputs, views, *, plan, heads, local_heads, cp, rows):
         "request_sequences": tuple((view.q_len, view.context) for view in views),
     })
     meta.pop("indexed_attention_geometry", None)
+    packed = packed_sfa_geometry(meta, heads, plan, views, cp) if fp8 else None
+    if packed is not None:
+        meta.update({"program_kind": "indexed_attention",
+                     "indexed_attention_geometry": packed,
+                     "paired_sfa": {
+                         "calls": PAIRED_SFA_CALLS,
+                         "call_heads": packed["heads"],
+                         "peer_exchange": packed["dcp_peer_exchange"]}})
     shape = (sum(view.q_len for view in views), heads, plan.kv_lora_rank)
     out_bytes = dtype_bytes(b.model.activation_dtype)
     statistics = rows * heads * TWO * FP32_BYTES
     meta.update({
-        "qsfa_output_bytes": rows * heads * (plan.kv_lora_rank * out_bytes + TWO * FP32_BYTES),
+        "qsfa_output_bytes": rows * (packed["heads"] if packed else heads)
+        * (plan.kv_lora_rank * out_bytes + TWO * FP32_BYTES),
         "qsfa_statistics_bytes": statistics,
         "qsfa_output_dtype": b.model.activation_dtype,
     })
