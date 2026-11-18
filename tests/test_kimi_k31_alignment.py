@@ -144,10 +144,15 @@ def test_external_draft_context_rows_are_distinct_from_query_rows():
     assert all(dict(op.metadata)["native_kind"] == "aclnnMlaPrologV3WeightNz"
                for op in context)
     stores = [op for op in ops if op.recipe == "draft_context_kv_scatter"]
+    from mindie_sim.catalog.context_parallel import owned_positions
     cp = max(1, c.runtime.parallel.cp)
+    block = max(1, c.runtime.kv_block_size)
+    start = 131072
+    owned = max(owned_positions(start, start + 3, cp, block, rank)
+                for rank in range(cp))
     assert len(stores) == 5
-    assert all(op.local_shape[0] == -(-4 // cp) for op in stores)
-    assert all(op.mte3_bytes == -(-4 // cp) * 1152 for op in stores)
+    assert all(op.local_shape[0] == owned for op in stores)
+    assert all(op.mte3_bytes == owned * 1152 for op in stores)
     assert all(dict(op.metadata)["native_kind"] == "aclnnScatterPaKvCache"
                for op in stores)
     embedding = next(op for op in ops if op.recipe == "draft_query_embedding")

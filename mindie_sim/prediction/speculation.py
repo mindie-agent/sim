@@ -19,6 +19,7 @@ from .structure import stage_map
 from .implementation_selection import resolve, LoweringRegion
 
 
+PROPOSAL_ID_BYTES = 8
 
 
 def compute_speculative_accept_step(accept_rate, draft_tokens) -> float:
@@ -59,6 +60,29 @@ def _tag_draft_ops(ops, rows_by_request, *, step=0):
 from mindie_sim.catalog.draft_geometry import (  # noqa: F401
     _draft_layer_plan, _reference_attention_plan, draft_layer_plans,
 )
+
+
+def _independent_draft_runtime(runtime):
+    """Strip target packed-cache lowerings from an independent BF16 draft.
+
+    The target's C8 ``mla_prolog`` contract names int8 operands and a packed
+    cache layout.  A DSpark draft owns its own BF16 operands and cache, so that
+    binding cannot be revalidated against the draft; the draft uses the
+    declared analytical prolog instead of crashing on the target ABI.
+    """
+    kernels = dict(getattr(runtime, "kernels", {}) or ())
+    lowerings = dict(kernels.get("lowerings", {}) or {})
+    if "mla_prolog" not in lowerings:
+        return runtime
+    lowerings.pop("mla_prolog")
+    kernels["lowerings"] = lowerings
+    return replace(runtime, kernels=kernels)
+
+
+def _cyclic_draft_model(model, plans, step):
+    """One declared NextN block for the proposal step it owns."""
+    plan = plans[step % len(plans)]
+    return replace(model, layers=1, layer_plans=(plan,))
 
 
 def draft_program(frontend, model, runtime, views, ready, *, global_views=None, prefill=False,
@@ -105,6 +129,7 @@ def draft_program(frontend, model, runtime, views, ready, *, global_views=None, 
     # Feature projection shards its output; the draft body consumes a complete
     # hidden vector, so TP must gather before entering the first layer.
     tp = runtime.parallel.tp
+    last_active = None
     for step in range(steps):
         ops = []
         selected = tuple(view for view in active if not serial or view.draft_proposal_tokens > step)
@@ -125,6 +150,10 @@ def draft_program(frontend, model, runtime, views, ready, *, global_views=None, 
         selected_runtime, selections = resolve(
             runtime, proposal_views, padded_tokens=rows, replay_scope=replay_scope,
             global_views=global_proposals, model_scope="draft")
+        from .frontend import mark_analytical_runtime
+        selected_runtime = mark_analytical_runtime(selected_runtime, selections)
+        if external_context:
+            selected_runtime = _independent_draft_runtime(selected_runtime)
         # Sequence-parallel lowering is body-scoped; draft_program manages TP
         # feature gather explicitly before entering the draft body.
         if "sequence_parallel" in selected_runtime.kernels:
@@ -132,6 +161,19 @@ def draft_program(frontend, model, runtime, views, ready, *, global_views=None, 
                 selected_runtime,
                 kernels={k: v for k, v in selected_runtime.kernels.items()
                          if k != "sequence_parallel"})
+        cyclic = bool(serial and draft.execution_mode == "cyclic_nextn"
+                      and len(plans) > 1)
+        step_model = (_cyclic_draft_model(draft_model, plans, step)
+                      if cyclic else draft_model)
+        pcp_prefill = bool(prefill and selected_runtime.parallel.pcp > 1)
+        if pcp_prefill:
+            # The target partitions each PCP rank's prefilling query rows.  The
+            # draft must own the same shard while every cache access keeps the
+            # declared global length (``global_q_len``) for its gather.
+            proposal_views, rows, _ = frontend.partition_views(
+                proposal_views, selected_runtime, rows, model=step_model)
+            feature_rows = (sum(view.q_len for view in proposal_views)
+                            if external_context else rows)
         requests = tuple(view.request_id for view in proposal_views)
         prefix = "draft_prefill." if prefill else f"draft{step}."
         feature_deps = [previous]
@@ -152,7 +194,8 @@ def draft_program(frontend, model, runtime, views, ready, *, global_views=None, 
                 feature_deps.append(transfer.op_id)
         projection = gemm_op(
             op_id=prefix + "features", deps=tuple(feature_deps), stage=stage, layer=-1, requests=requests,
-            m=feature_rows, n=(draft.hidden_size + tp - 1) // tp, k=draft.input_width, quant=draft_model.quant,
+            m=feature_rows, n=(step_model.hidden_size + tp - 1) // tp,
+            k=draft.input_width, quant=step_model.quant,
             category=draft.input_projection_category, phase="draft", family="gemm",
             recipe="draft_features",
         )
@@ -191,18 +234,29 @@ def draft_program(frontend, model, runtime, views, ready, *, global_views=None, 
                 projection = gathered
         global_tokens = sum(view.q_len if prefill else 1 if serial else view.draft_proposal_tokens
                             for view in all_active if not serial or view.draft_proposal_tokens > step)
+        if pcp_prefill:
+            global_total = sum(view.q_len for view in global_proposals)
+            global_tokens = frontend.pcp_cohort_tokens(
+                global_proposals, proposal_views, rows, selected_runtime,
+                global_tokens=global_total, global_views=global_proposals)
         body_ready = projection.op_id if rows else previous
         if external_context and rows:
             from .draft_context import prepare
             body_ready = prepare(
                 ops, projection=projection, model=draft_model, draft=draft,
                 rows=feature_rows, query_rows=rows, prefix=prefix,
-                stage=stage, requests=requests, parallel=runtime.parallel)
+                stage=stage, requests=requests, parallel=runtime.parallel,
+                rows_by_view=[view.q_len + (0 if prefill else 1)
+                              for view in proposal_views],
+                views=proposal_views,
+                contexts=[view.context for view in proposal_views],
+                block=int(getattr(runtime, "kv_block_size", 1) or 1))
         body, previous = frontend.body(
-            draft_model, selected_runtime, proposal_views, prefix=prefix,
+            step_model, selected_runtime, proposal_views, prefix=prefix,
             ready=body_ready,
             tokens=rows, mode="draft_prefill" if prefill else "draft",
-            stages=(stage,) * draft.layers, global_tokens=global_tokens, replica=replica,
+            stages=(stage,) * step_model.layers, global_tokens=global_tokens,
+            replica=replica,
             machine=machine,
             topk_scope=mtp_topks if (share_selection and not prefill) else None,
             reuse_index_selection=bool(share_selection and not prefill and step > 0),
@@ -214,7 +268,7 @@ def draft_program(frontend, model, runtime, views, ready, *, global_views=None, 
                 _tag_draft_ops(ops, rows_by_request),
                 selected_runtime, draft_model.activation_dtype, rows, selections))
             continue
-        heads, previous = frontend.logits(draft_model, selected_runtime, proposal_views, previous,
+        heads, previous = frontend.logits(step_model, selected_runtime, proposal_views, previous,
                                          prefix=prefix, mode="draft", stage=stage, sample=False)
         ops.extend(heads)
         if draft.markov_rank and rows:
@@ -252,40 +306,49 @@ def draft_program(frontend, model, runtime, views, ready, *, global_views=None, 
                 recipe="draft_sample")
             ops.append(sample)
             previous = sample.op_id
-        rows_by_request = {
-            view.request_id: (view.q_len if prefill else 1 if serial else view.draft_proposal_tokens)
-            for view in selected
-        }
+        rows_by_request = (
+            {view.request_id: view.q_len for view in proposal_views}
+            if prefill else {
+                view.request_id: (1 if serial else view.draft_proposal_tokens)
+                for view in selected
+            })
         regions.append(LoweringRegion(
             _tag_draft_ops(ops, rows_by_request, step=step),
             selected_runtime, draft_model.activation_dtype, rows, selections))
-    # Draft runs on the last pipeline stage. Send accepted proposal ids back
-    # to stage 0 so the target schedule can consume them.
-    if not prefill and runtime.parallel.pp > 1 and regions and rows > 0:
-        stage = runtime.parallel.pp - 1
-        active = [v for v in views if v.draft_proposal_tokens > 0] or list(views)
+        if rows:
+            last_active = (len(regions) - 1, previous)
+    # Draft runs on the last pipeline stage. Send every accepted proposal id
+    # back to stage 0 from the last locally active proposal step so a shorter
+    # replica still declares its own transfer.
+    proposal_views_local = tuple(view for view in views
+                                 if view.draft_proposal_tokens > 0)
+    if (not prefill and runtime.parallel.pp > 1 and last_active is not None
+            and proposal_views_local):
+        region_index, dependency = last_active
+        total_proposals = sum(view.draft_proposal_tokens
+                              for view in proposal_views_local)
         xfer = comm_op(
             op_id="draft_proposal_transfer",
-            deps=(previous,),
-            stage=0,
+            deps=(dependency,),
+            stage=runtime.parallel.pp - 1,
             layer=-1,
-            requests=tuple(v.request_id for v in active),
-            family="p2p",
+            requests=tuple(view.request_id for view in proposal_views_local),
+            family="pp_p2p",
             phase="draft",
-            recipe="draft_proposal_transfer",
-            link_bytes=len(active) * max(
-                1, max((v.draft_proposal_tokens for v in active), default=1)) * 8,
-            shape=(len(active),),
+            recipe="pp_p2p",
+            link_bytes=total_proposals * PROPOSAL_ID_BYTES,
+            shape=(total_proposals,),
             metadata=(
                 ("group_axis", "pp"),
-                ("source_stage", stage),
+                ("source_stage", runtime.parallel.pp - 1),
                 ("destination_stage", 0),
             ),
         )
         xfer = _tag_draft_ops((xfer,), {
-            view.request_id: view.draft_proposal_tokens for view in active
+            view.request_id: view.draft_proposal_tokens
+            for view in proposal_views_local
         })[0]
-        last = regions[-1]
-        regions[-1] = replace(last, ops=last.ops + (xfer,))
+        region = regions[region_index]
+        regions[region_index] = replace(region, ops=region.ops + (xfer,))
         previous = xfer.op_id
     return regions, previous

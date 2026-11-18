@@ -98,8 +98,23 @@ def owned_rows(rows, parallel):
     return int(ceil(int(rows) / cp))
 
 
+def owned_scatter_rows(rows, rows_by_view, views, contexts, parallel, block):
+    """Worst-rank rows one draft layer stores under block ownership.
+
+    A position block is owned atomically by one context rank, so the writer
+    charges every row in that block to its owner.  ``ceil(rows / cp)`` would
+    split one block across ranks and undercount the owner's write.
+    """
+    if rows_by_view and views and contexts:
+        from .generic_latent_attention import owned_store_rows
+        return int(owned_store_rows(rows_by_view, views, parallel, block,
+                                    contexts=contexts))
+    return owned_rows(rows, parallel)
+
+
 def prepare(ops, *, projection, model, draft, rows, query_rows,
-            prefix, stage, requests, parallel=None):
+            prefix, stage, requests, parallel=None, rows_by_view=None,
+            views=None, contexts=None, block=UNIT_CONTEXT_PARALLEL):
     common = dict(stage=stage, layer=-1, requests=requests, phase="draft")
     norm = vector_op(
         op_id=prefix + "context_norm", deps=(projection.op_id,),
@@ -108,7 +123,8 @@ def prepare(ops, *, projection, model, draft, rows, query_rows,
     ops.append(norm)
     kv_width = draft.kv_lora_rank + draft.qk_rope_head_dim
     row_bytes = kv_width * KV_ROW_BYTES_PER_ELEMENT
-    rank_rows = owned_rows(rows, parallel)
+    rank_rows = owned_scatter_rows(
+        rows, rows_by_view, views, contexts, parallel, block)
     activation_bytes = dtype_bytes(draft.activation_dtype)
     stores = []
     for layer in range(draft.layers):

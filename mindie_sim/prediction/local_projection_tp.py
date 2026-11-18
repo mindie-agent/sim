@@ -221,7 +221,12 @@ def _rewrite_matrix(op: OpSpec, *, gemm_id: str, rows: int, cols: int, reduced: 
     in_b, out_b = float(m * k) * dtype_bytes(act), float(m * n) * dtype_bytes(out)
     orig_m = max(ONE, int(op.local_shape[ZERO]))
     ratio = float(m) / float(orig_m) if scale_ratio is None else float(scale_ratio)
-    scale_b = float(metadata.get("activation_scale_bytes", ZERO_FLOAT) or ZERO_FLOAT) * ratio
+    scale_shape, geometry_bytes = _local_scale_geometry(metadata, m, k)
+    scale_b = (geometry_bytes if scale_shape else
+               float(metadata.get("activation_scale_bytes", ZERO_FLOAT) or ZERO_FLOAT)
+               * ratio)
+    if scale_shape:
+        metadata["activation_scale_shape"] = scale_shape
     metadata.update({
         "packed_weight_bytes": local_weight, "weight_bytes": local_weight,
         "activation_scale_bytes": scale_b, "placement_role": role,

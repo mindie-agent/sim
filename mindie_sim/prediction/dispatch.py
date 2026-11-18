@@ -572,14 +572,27 @@ def submit_batch(case, schedulers, plans, execution, lower, now, *,
             context["routing_global_tokens"] = valid_global
             if len(local) > 1 and "sequence_parallel" in case.runtime.kernels:
                 from .sequence_parallel import select as select_sp
+                from .graph import GraphPolicy
                 physical_rows = []
                 for replica, plan in local.items():
-                    rows = sum(view.q_len + view.draft_proposal_tokens
-                               for view in logical_local[replica].requests)
+                    # Serving consumes the same proposal-expanded views and
+                    # capture bucket the target graph lowers.  Passing the
+                    # unexpanded request rows would keep only one of every
+                    # (1 + draft) speculative row in the SP plan.
+                    expanded = tuple(
+                        replace(view, q_len=view.q_len + view.draft_proposal_tokens)
+                        for view in logical_local[replica].requests)
+                    rows = sum(view.q_len for view in expanded)
+                    declared = dict(case.runtime.kernels.get(
+                        "sequence_parallel") or {})
+                    padded = rows
+                    if declared.get("padding") == "right_to_tp" and expanded:
+                        bucket, _ = GraphPolicy().select(expanded, case.runtime)
+                        padded = max(rows, int(bucket or 0))
                     runtime = schedulers[replica].next_runtime(plan)
                     sp = select_sp(
-                        runtime, case.model, logical_local[replica].requests,
-                        tokens=rows, global_tokens=valid_global)
+                        runtime, case.model, expanded,
+                        tokens=padded, global_tokens=valid_global)
                     if sp is not None:
                         physical_rows.extend(sp.valid_per_tp)
                 if physical_rows:

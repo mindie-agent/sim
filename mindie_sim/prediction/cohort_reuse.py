@@ -186,6 +186,40 @@ def prove_homogeneous_cohort(
     )
 
 
+def _request_binding_pattern(binding: Mapping[str, str]) -> re.Pattern | None:
+    """One whole-request matcher for nested metadata string leaves."""
+    if not binding:
+        return None
+    choices = sorted((str(key) for key in binding if str(key)),
+                     key=len, reverse=True)
+    if not choices:
+        return None
+    return re.compile(r"(?<![\w@])(?:" + "|".join(
+        re.escape(key) for key in choices) + r")(?![\w@])")
+
+
+def _rebind_nested_requests(value: Any, pattern: re.Pattern | None,
+                            binding: Mapping[str, str]) -> Any:
+    """Rename request identities nested in metadata without touching types."""
+    if pattern is None:
+        return value
+    if isinstance(value, str):
+        return pattern.sub(lambda match: binding[match.group()], value)
+    if isinstance(value, Mapping):
+        return type(value)((key, _rebind_nested_requests(item, pattern, binding))
+                           for key, item in value.items())
+    if isinstance(value, tuple):
+        return tuple(_rebind_nested_requests(item, pattern, binding)
+                     for item in value)
+    if isinstance(value, list):
+        return [_rebind_nested_requests(item, pattern, binding)
+                for item in value]
+    if isinstance(value, (set, frozenset)):
+        return type(value)(_rebind_nested_requests(item, pattern, binding)
+                           for item in value)
+    return value
+
+
 def _rank_map(case: Any, replica: int) -> dict[int, int]:
     from .topology import Topology
 
@@ -210,7 +244,9 @@ def rebind_replica_graph(
     """Rebind rank/request/state identities of one semantic template."""
     rank_map = {int(key): int(value) for key, value in dict(placement or {}).items()}
     fallback = int(replica if physical_rank is None else physical_rank)
-    requests = dict(request_binding or {})
+    requests = {str(key): str(value)
+                for key, value in dict(request_binding or {}).items()}
+    request_pattern = _request_binding_pattern(requests)
     states = dict(state_bindings or {})
     topology = None
     rebound = []
@@ -250,6 +286,9 @@ def rebind_replica_graph(
                 metadata[key] = states[str(metadata[key])]
         if "replica" in metadata:
             metadata["replica"] = int(replica)
+        if request_pattern is not None:
+            metadata = dict(_rebind_nested_requests(
+                metadata, request_pattern, requests))
         deps = tuple(
             RANK_TOKEN.sub(
                 lambda match: f"@r{rank_map.get(int(match.group(RANK_GROUP)), fallback)}",

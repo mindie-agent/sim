@@ -52,17 +52,31 @@ def _model_of(case_like):
 
 def _iter_plans(model):
     plans = getattr(model, "layer_plans", None)
+    overrides = {}
     if plans is None and isinstance(model, Mapping):
         plans = model.get("layer_plans")
+        raw_overrides = model.get("layer_overrides")
+        if isinstance(raw_overrides, Mapping):
+            overrides = {str(key): dict(value) for key, value in raw_overrides.items()
+                         if isinstance(value, Mapping)}
+    if plans is None and overrides:
+        count = int(model.get("layers", len(overrides)) or len(overrides))
+        plans = tuple({"index": index} for index in range(max(1, count)))
     for plan in plans or ():
         if isinstance(plan, Mapping):
             index = plan.get("index")
-            yield (-1 if index is None else int(index),
-                   str(plan.get("attention", "")),
-                   str(plan.get("architecture", "")))
+            index = -1 if index is None else int(index)
+            override = overrides.get(str(index), {})
+            yield (index,
+                   str(override.get("attention", plan.get("attention", ""))),
+                   str(override.get("architecture", plan.get("architecture", ""))))
         else:
-            yield (int(getattr(plan, "index", -1)), str(getattr(plan, "attention", "")),
-                   str(getattr(plan, "architecture", "")))
+            index = int(getattr(plan, "index", -1))
+            override = overrides.get(str(index), {})
+            yield (index,
+                   str(override.get("attention", getattr(plan, "attention", ""))),
+                   str(override.get("architecture",
+                                    getattr(plan, "architecture", ""))))
 
 
 def _metadata(op):
@@ -205,8 +219,15 @@ def assert_report_supported(report, *, entry: str) -> None:
     rows = list(report.get("operators") or ()) + list(report.get("timeline") or ())
     ops = []
     for row in rows:
-        if isinstance(row, Mapping) and isinstance(row.get("operator"), Mapping):
-            ops.append(row["operator"])
+        if not isinstance(row, Mapping):
+            continue
+        nested = row.get("operator")
+        if isinstance(nested, Mapping):
+            ops.append(nested)
+        elif "recipe" in row or "family" in row:
+            # A flat execution-timeline row carries the executed recipe
+            # directly; it is the same occurrence contract as a nested row.
+            ops.append(row)
     assert_timing_supported(None, tuple(ops), entry=entry)
 
 

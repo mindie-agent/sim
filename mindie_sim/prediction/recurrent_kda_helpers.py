@@ -22,6 +22,15 @@ def serving_source(runtime, model, views, plan):
     from .kda_source import resolve
     if runtime is None:
         return None
+    metadata = dict(getattr(runtime, "metadata", ()) or ())
+    execution = dict(metadata.get("execution_policy") or {})
+    if metadata.get("raw_eager") or execution.get("raw_eager"):
+        # A raw-eager serving step has no optional fused lowering inventory.
+        return None
+    if "kda" in tuple(metadata.get("analytical_implementations", ()) or ()):
+        # A declared policy already chose its analytical fallback; an absent
+        # native binding is that decision, not permission to install one.
+        return None
     parallel = getattr(runtime, "parallel", None)
     from mindie_sim.catalog.paired_sfa import execution
     if (int(getattr(parallel, "cp", 1) or 1) > 1
