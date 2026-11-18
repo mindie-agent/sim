@@ -163,8 +163,11 @@ def test_deepseek_noaux_tc_routing_chain_charges_physical_vector_work():
     experts = plan.num_experts
     assert scores.vector_ops == 4 * tokens * experts
     assert biased.vector_ops == tokens * experts
+    assert biased.mte2_bytes == (tokens + 1) * experts * 4
     assert (dict(biased.metadata)["correction_bias_bytes"] == experts * 4)
-    assert group_score.vector_ops == 3 * tokens * plan.router_groups
+    assert group_score.mte2_bytes == tokens * experts * 4
+    assert group_score.mte3_bytes == tokens * plan.router_groups * 4
+    assert group_score.vector_ops == 3 * tokens * (experts - plan.router_groups)
     assert group_topk.vector_ops == 2 * tokens * plan.router_groups
     assert mask.vector_ops == tokens * experts
     assert topk.vector_ops > 0
@@ -176,6 +179,23 @@ def test_deepseek_noaux_tc_routing_chain_charges_physical_vector_work():
     assert dict(ops["s0.l0.pack"].metadata)["topk_ids_producer"] == topk.op_id
     # The collapsed 2*T*E group placeholder is gone.
     assert "s0.l0.group_select" not in ops
+    # A full deepseek-v3 sparse invocation reads all 256 expert scores once.
+    v3_cfg = config("deepseek-v3")
+    v3_plan = next(p for p in _standard_deepseek_plans(v3_cfg) if p.ffn == "moe")
+    assert (v3_plan.num_experts, v3_plan.router_groups) == (256, 8)
+    v3_raw = case(prompt=1, output=1)
+    v3_layer = {**v3_plan.to_dict(), "index": 0, "kv_owner_layer_id": 0}
+    v3_raw["model"] = {
+        "name": "deepseek-v3", "layers": 1, "hidden_size": v3_cfg["hidden_size"],
+        "num_heads": v3_plan.num_heads, "num_kv_heads": 1, "head_dim": v3_plan.head_dim,
+        "intermediate_size": v3_cfg["intermediate_size"],
+        "vocab_size": v3_cfg["vocab_size"], "attention": "mla", "ffn": "moe",
+        "layer_plans": [v3_layer],
+    }
+    v3_ops = {op.op_id: op for op in target_operators(
+        v3_raw, phase="prefill", tokens=1)}
+    assert v3_ops["s0.l0.router_group_score"].mte2_bytes == 1024
+    assert v3_ops["s0.l0.router_bias"].mte2_bytes == 2048
 
 
 def test_deepseek_moe_schedule_uses_native_modulo_not_first_dense_offset():

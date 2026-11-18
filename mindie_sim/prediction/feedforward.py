@@ -36,7 +36,7 @@ ZERO_FLOAT = 0.0
 #: mask -> expert TopK -> unbiased weight gather -> routed scale.
 NOAUX_SIGMOID_OPS_PER_ELEMENT = 4
 NOAUX_BIAS_ADD_OPS_PER_ELEMENT = 1
-NOAUX_GROUP_TOP2_OPS_PER_GROUP = 3
+NOAUX_GROUP_TOP2_SCAN_OPS = 3
 NOAUX_GROUP_TOPK_OPS_PER_GROUP = 2
 NOAUX_GROUP_MASK_OPS_PER_ELEMENT = 1
 NOAUX_WEIGHT_GATHER_OPS_PER_SELECTED = 1
@@ -73,7 +73,7 @@ def _noaux_tc_chain(*, prefix, logits_input, weight_dtype, weight_bytes, stage,
         ops_per_element=NOAUX_BIAS_ADD_OPS_PER_ELEMENT, dtype="fp32",
         family="elementwise", phase=mode, recipe="router_correction_bias",
         shape=(tokens, experts),
-        read_bytes_override=tokens * experts * NOAUX_BIAS_BYTES,
+        read_bytes_override=(tokens + ONE) * experts * NOAUX_BIAS_BYTES,
         write_bytes_override=tokens * experts * NOAUX_BIAS_BYTES,
         metadata=(("input_format", "fp32"), ("output_format", "fp32"),
                   ("correction_bias_elements", experts),
@@ -82,10 +82,12 @@ def _noaux_tc_chain(*, prefix, logits_input, weight_dtype, weight_bytes, stage,
     )
     group_scores = vector_op(
         op_id=prefix + ".router_group_score", deps=(biased.op_id,), stage=stage,
-        layer=layer, requests=requests, elements=tokens * groups,
-        ops_per_element=NOAUX_GROUP_TOP2_OPS_PER_GROUP, dtype="fp32",
+        layer=layer, requests=requests, elements=tokens * experts,
+        ops_per_element=NOAUX_GROUP_TOP2_SCAN_OPS, dtype="fp32",
         family="topk", phase=mode, recipe="router_group_score_top2",
         shape=(tokens, groups),
+        vector_ops_override=NOAUX_GROUP_TOP2_SCAN_OPS * tokens * max(ZERO, experts - groups),
+        write_bytes_override=tokens * groups * NOAUX_BIAS_BYTES,
     )
     group_select = vector_op(
         op_id=prefix + ".router_group_topk", deps=(group_scores.op_id,),
