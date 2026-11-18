@@ -207,6 +207,18 @@ static bool rates_overlap(msim_ctx *c, const int32_t *idx, int32_t n,
     return true;
 }
 
+/* Python ``_tier_flows`` normalizes a coupled span by the participating
+ * units' share ``(rate / units) * len(placement)``; using the full aggregate
+ * rate makes pinned and unpinned peers advance on different clocks. */
+static double coupled_scale(const msim_ctx *c, const msim_link *l)
+{
+    const msim_res *res = &c->res[l->res];
+    int32_t len = unit_len(c, l);
+    double denom = (res->rate / (double)res->units) * (double)len;
+    if (denom <= 0.0) return INFINITY;
+    return l->rem / denom;
+}
+
 /* -- coupled / pinned joint arbitration (coupled.py order) -------------- */
 static int32_t rates_coupled(msim_ctx *c)
 {
@@ -257,11 +269,11 @@ static int32_t rates_coupled(msim_ctx *c)
             f->task = ti; f->coeff_start = nc; f->coeff_count = cnt;
             f->limit = INFINITY; f->assigned = 0.0; ohead[nf] = -1;
             if (cnt == 1) {
-                scale = L[act[gi]].rem / c->res[L[act[gi]].res].rate;
+                scale = coupled_scale(c, &L[act[gi]]);
             } else {
                 scale = -INFINITY;
                 for (k = 0; k < cnt; k++) {
-                    double sm = L[act[k]].rem / c->res[L[act[k]].res].rate;
+                    double sm = coupled_scale(c, &L[act[k]]);
                     if (sm > scale) scale = sm;
                 }
             }

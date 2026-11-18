@@ -202,8 +202,21 @@ class PoolKeyIndexerRecipe:
 
     def build(self, op, geometry):
         del geometry
-        ledger = dict(dict(op.metadata).get(POOL_LEDGER, {}))
-        return OperatorPlan(pool_key_indexer_work(ledger), self.lower, metadata={
+        metadata = dict(op.metadata)
+        ledger = dict(metadata.get(POOL_LEDGER, {}))
+        work = pool_key_indexer_work(ledger)
+        # A shared-prefix plan replaces only the KV cache component of the HBM
+        # fill with its physical union; the per-wave MTE2 refill service stays
+        # complete.  The prepared plan must carry both components unchanged.
+        prefix_hbm = metadata.get("prefix_read_hbm_bytes")
+        if prefix_hbm is not None:
+            kv_component = (float(ledger.get("waves", 0))
+                            * float(ledger.get("wave_cache_bytes", 0.0)))
+            resources = dict(work.resources)
+            resources["hbm"] = (float(work.resources.get("hbm", 0.0))
+                                - kv_component + float(prefix_hbm))
+            work = Work(work.matrix, resources)
+        return OperatorPlan(work, self.lower, metadata={
             "schedule": "pool_key_indexer_aic_waves",
             "native_dispatch_reconstructed": False,
             "wave_rows": ledger.get("wave_rows"),
@@ -212,15 +225,25 @@ class PoolKeyIndexerRecipe:
         })
 
     def lower(self, context):
-        ledger = dict(dict(context.op.metadata).get(POOL_LEDGER, {}))
+        metadata = dict(context.op.metadata)
+        ledger = dict(metadata.get(POOL_LEDGER, {}))
         waves = int(ledger["waves"])
+        prefix_hbm = metadata.get("prefix_read_hbm_bytes")
+        wave_hbm_cache = (
+            float(prefix_hbm) / float(max(1, waves))
+            if prefix_hbm is not None
+            else float(ledger["wave_cache_bytes"])
+        )
         floor = INDEXER_FLOOR_US + int(ledger["blocks"]) * POOL_SCAN_BLOCK_US
         floor /= MS_PER_SECOND
 
         def wave(index):
             parts = _pool_wave_work(ledger, index)
+            stream = dict(parts["stream"])
+            stream["hbm"] = (stream["hbm"] - float(ledger["wave_cache_bytes"])
+                             + wave_hbm_cache)
             return (
-                Stage("stream", context.bind(Work({}, dict(parts["stream"])))),
+                Stage("stream", context.bind(Work({}, stream))),
                 Stage("tiles", context.bind(Work(
                     {parts["dtype"]: parts["tiles"][parts["dtype"]]},
                     _matrix_free(parts["tiles"], parts["dtype"]))),

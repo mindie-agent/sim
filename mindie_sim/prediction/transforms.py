@@ -44,11 +44,66 @@ from .passes_mhc_recurrent import (
 # A selected source subgraph owns its own kernel boundaries.  A generic rewrite
 # of the same operators is refused instead of being applied before that source.
 PROTECTED_PASS_ROLES = {
-    "mhc_boundary_ideal": frozenset({"hc_pre"}),
-    "mhc_boundary_pr": frozenset({"hc_pre"}),
     "indexer_online_topk": frozenset({"lightning_indexer",
                                       "quant_lightning_indexer"}),
 }
+#: Generic passes whose fusion domain overlaps an explicitly selected native
+#: group.  Members of those groups are excluded from the generic rewrite; other
+#: independent groups in the same graph remain eligible.
+NATIVE_EXCLUSION_ROLES = {
+    "activation_quant": frozenset({
+        "situ_quant", "grouped_gate_up_situ_quant",
+        "grouped_gate_up_activation_quant"}),
+    "gmm_swiglu_quant": frozenset({
+        "situ_quant", "grouped_gate_up_situ_quant",
+        "grouped_gate_up_activation_quant"}),
+    "mhc_boundary_pr": frozenset({"hc_pre", "hc_post"}),
+    "mhc_boundary_ideal": frozenset({"hc_pre", "hc_post"}),
+}
+
+
+def _native_group_members(ops, roles):
+    """Members of declared native groups whose role is explicitly selected."""
+    if not roles:
+        return frozenset()
+    from .native_fusion import _groups
+    members = set()
+    for declaration, group in _groups(ops):
+        if declaration.get("role") in roles:
+            members.update(op.op_id for op in group)
+    return frozenset(members)
+
+
+def _rewrite_outside_native_groups(fn, ops, source_dtype, excluded):
+    """Run one generic pass with selected native-group members left intact."""
+    kept = [op for op in ops if op.op_id not in excluded]
+    transformed = list(fn(kept, source_dtype))
+    transformed_by_id = {op.op_id: op for op in transformed}
+    replacement_of = {}
+    for op in transformed:
+        for origin in dict(op.metadata).get("fused_origin_scopes", ()):
+            source = origin.get("op_id") if isinstance(origin, dict) else None
+            if source and source not in transformed_by_id:
+                replacement_of.setdefault(source, op.op_id)
+    rebuilt = []
+    for op in ops:
+        if op.op_id in transformed_by_id:
+            rebuilt.append(transformed_by_id[op.op_id])
+        elif op.op_id in excluded:
+            rebuilt.append(op)
+    seen = {op.op_id for op in rebuilt}
+    rebuilt.extend(op for op in transformed if op.op_id not in seen)
+    aliased = []
+    for op in rebuilt:
+        deps = tuple(dict.fromkeys(
+            replacement_of.get(dep, dep) for dep in op.deps))
+        aliased.append(replace(op, deps=deps) if deps != op.deps else op)
+    # If a reader still names a rewritten-away member and the pass declared no
+    # replacement for it, keep the original declared graph.
+    removed = {op.op_id for op in kept} - set(transformed_by_id)
+    if any(dep in removed for op in aliased for dep in op.deps):
+        return list(ops)
+    return aliased
 
 
 def _value_map(ops):
@@ -826,15 +881,17 @@ def lower_implementations(ops, runtime, source_dtype, *, passes=None, resource_f
         norm_quant, consumers=consumers, external_output=external_output),
         **(passes or {})}
     activation_quantized = bool(preactivated)
+    native = select(bindings, "native_fusion")
+    native_roles = set(native.options.get("roles", ())) if native else set()
     for name in runtime.lowering_passes:
         if name in skip_passes:
             continue
         protected = PROTECTED_PASS_ROLES.get(name)
-        if protected:
-            native = select(bindings, "native_fusion")
-            if native and protected.intersection(
-                    native.options.get("roles", ())):
-                continue
+        if protected and protected.intersection(native_roles):
+            continue
+        excluded_roles = NATIVE_EXCLUSION_ROLES.get(name)
+        excluded = (_native_group_members(ops, excluded_roles & native_roles)
+                    if excluded_roles else frozenset())
         activation_quantized |= name == "activation_quantization"
         if name == "norm_quant":
             state = (capture_state if capture_state is not None
@@ -846,6 +903,9 @@ def lower_implementations(ops, runtime, source_dtype, *, passes=None, resource_f
             state = (capture_state if capture_state is not None
                      else capture_partition(ops, runtime, replay_scope))
             transformed = residual_norm(ops, source_dtype, capture_state=state)
+        elif excluded:
+            transformed = _rewrite_outside_native_groups(
+                registry[name], ops, source_dtype, excluded)
         else:
             transformed = registry[name](ops, source_dtype)
         ops = lower_operators(transformed, bindings,

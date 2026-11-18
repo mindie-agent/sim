@@ -232,6 +232,8 @@ def apply_attention_prefix_reads(
     kv_hbm_bytes: float | None = None,
     kv_mte2_bytes: float | None = None,
     unique_prefix_rows_by_view: Sequence[int] | None = None,
+    unique_rows_by_view: Sequence[int] | None = None,
+    shared_intervals_by_view: Sequence[tuple[tuple[int, int], ...]] | None = None,
 ) -> Any:
     """Replace the precharged KV components with their physical union."""
     if runtime is None or getattr(runtime, "prefix_cache_mode", "private") != "shared":
@@ -239,6 +241,15 @@ def apply_attention_prefix_reads(
     prefix_caps = (
         tuple(int(value) for value in unique_prefix_rows_by_view)
         if unique_prefix_rows_by_view is not None else None
+    )
+    unique_caps = (
+        tuple(int(value) for value in unique_rows_by_view)
+        if unique_rows_by_view is not None else None
+    )
+    interval_caps = (
+        tuple(tuple((int(lo), int(hi)) for lo, hi in item)
+              for item in shared_intervals_by_view)
+        if shared_intervals_by_view is not None else None
     )
     accesses = []
     for idx, (view, sweeps, shared) in enumerate(
@@ -269,6 +280,8 @@ def apply_attention_prefix_reads(
             layer=int(layer_index),
             component="kv",
             logical_rows=int(sweeps),
+            unique_rows=0 if unique_caps is None else max(0, unique_caps[idx]),
+            shared_intervals=() if interval_caps is None else interval_caps[idx],
         ))
     read_mode = str(getattr(runtime, "prefix_read_mode", "auto") or "auto")
     plan = plan_prefix_reads(accesses, mode=read_mode, kernel_reuse=kernel_reuse)

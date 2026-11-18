@@ -18,10 +18,10 @@ from mindie_sim.catalog.ops import compute_dtype_for
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 
 from .generic_latent_attention import (
-    index_cache_dtype, index_cache_is_packed, owned_store_rows,
-    sharded_index_visible_rows, semantic_index_selection,
+    index_cache_dtype, index_cache_is_packed, owned_completed_rows,
+    owned_store_rows, sharded_index_visible_rows, semantic_index_selection,
 )
-from .implementations import select
+from .implementations import produced_values, select, set_input_ports
 from .indexer_representation import index_representation
 from .mla_native import index_layer_norm
 
@@ -43,6 +43,47 @@ INT32_BYTES = int(dtype_bytes("int32"))
 ROPE_OPS = 6
 CANDIDATE_BYTES = 8
 MIN_LOG_TOPK = 2
+
+
+class SharedSelectionRef(str):
+    """TopK occurrence id plus its produced per-request selected-token rows.
+
+    Later MTP proposal steps reuse one TopK id.  They must consume the
+    producer's selection geometry, not the wider proposal batch that merely
+    names the same identifier.
+    """
+
+    __slots__ = ("selected_token_rows", "selected_by_request")
+
+    def __new__(cls, op_id, *, selected_token_rows, selected_by_request):
+        value = super().__new__(cls, str(op_id))
+        value.selected_token_rows = float(selected_token_rows)
+        value.selected_by_request = dict(selected_by_request)
+        return value
+
+    def rows_for(self, request_id):
+        """Producer-selected rows owned by one request, or ``None``."""
+        if request_id in self.selected_by_request:
+            return self.selected_by_request[request_id]
+        if len(self.selected_by_request) == 1:
+            return next(iter(self.selected_by_request.values()))
+        return None
+
+
+def _selection_reference(builder, op_id):
+    """Wrap one TopK occurrence with the selection geometry it produced."""
+    op = next((item for item in reversed(builder.ops) if item.op_id == op_id), None)
+    if op is None:
+        return op_id
+    metadata = dict(op.metadata)
+    total = metadata.get("selected_token_rows")
+    if total is None:
+        return op_id
+    request_ids = tuple(metadata.get("selected_request_ids") or ())
+    rows = tuple(metadata.get("selected_tokens_by_request") or ())
+    by_request = dict(zip(request_ids, rows)) if len(request_ids) == len(rows) else {}
+    return SharedSelectionRef(op_id, selected_token_rows=total,
+                              selected_by_request=by_request)
 CANDIDATE_BLOCK_OPS = 2
 DEFAULT_BLOCK_SIZE = 128
 ASCEND_ARCH_FAMILIES = frozenset({"A2", "A3", "A5"})
@@ -313,11 +354,7 @@ def lower_index_path(builder, *, plan, model, quant, parallel, views, deps, runt
             if compressed_latent is None:
                 raise ModelingError("packed_compressed_indexer_requires_pre_rope_latent_producer")
             index_source = compressed_latent
-        index_rows_by_view = [
-            completed_rows(view.context + view.q_len, ratio)
-            - completed_rows(view.context, ratio)
-            for view in views
-        ]
+        index_rows_by_view = [owned_completed_rows(view, ratio) for view in views]
         index_rows = sum(index_rows_by_view)
         input_rows = index_rows if plan.index_input == "compressed" else valid
         input_width = plan.head_dim if plan.index_input == "compressed" else model.hidden_size
@@ -330,6 +367,18 @@ def lower_index_path(builder, *, plan, model, quant, parallel, views, deps, runt
         else:
             projected = b.matrix("index_k", (index_source,), input_rows, plan.index_dim,
                                  input_width, category="indexer_fp8")
+            if plan.index_input == "compressed":
+                producer = next((op for op in reversed(b.ops)
+                                 if op.op_id == index_source), None)
+                if producer is not None and any(
+                        value["output"] == "latent"
+                        for value in produced_values(producer)):
+                    # The packed compressor writes the rotated cache value and
+                    # the pre-RoPE latent; the indexer consumes the latent port
+                    # before any activation quantizer is inserted.
+                    b.ops[-1] = set_input_ports(b.ops[-1], ({
+                        "op": index_source, "output": "latent",
+                        "source_op": index_source},))
             normalized = index_layer_norm(
                 b, source=projected, rows=index_rows, width=plan.index_dim,
                 native=native_indexer)
@@ -500,4 +549,4 @@ def lower_index_path(builder, *, plan, model, quant, parallel, views, deps, runt
     elif plan.topk_owner_layer_id >= 0:
         topk = owner(topk_ids, plan.topk_owner_layer_id, "topk",
                      valid * plan.index_topk * INT32_BYTES)
-    return index_store, topk, candidate, pool_weights
+    return (index_store, _selection_reference(b, topk), candidate, pool_weights)

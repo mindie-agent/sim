@@ -24,8 +24,8 @@ from .implementation_selection import is_automatic_lowering
 from .lowering import Builder
 from .compression import compressor
 from .mla_cann_epilogs import (
-    block_quant_epilog, kv_cache_epilog, native_cache_store, native_fusion_active,
-    lower_index_path,
+    SharedSelectionRef, block_quant_epilog, kv_cache_epilog, native_cache_store,
+    native_fusion_active, lower_index_path,
 )
 from .mla_native import batched_matrix_metadata
 from .memory_traffic import (AttentionAccessSpec, AttentionSchedule,
@@ -36,8 +36,9 @@ from .cache_representation import store as representation_store
 from mindie_sim.catalog.cache_format import cache_format
 from .generic_latent_attention import (
     attention_tensor_view, attention_view_record, dsa_cp_prefill_parts,
-    kv_sweeps, owned_store_rows, selected_pairs, semantic_index_selection,
-    sparse_over_parts, view_causal_pairs, visible_parts, window_cache_read,
+    kv_sweeps, owned_completed_rows, owned_store_rows, selected_pairs,
+    semantic_index_selection, sparse_over_parts, view_causal_pairs,
+    visible_parts, window_cache_read,
 )
 
 # Historical private names remain importable for source-geometry probes.
@@ -261,10 +262,11 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         if packed_store is not None:
             from .mla_prolog_packed import view as packed_kv_view
             kv_row = packed_kv_view(plan.kv_lora_rank, plan.qk_rope_head_dim)["row_bytes"]
-        elif plan.cache_kind == "window_compressed":
-            kv_row = cache_format(model, "window").row_bytes(plan.cache_row_elements)
         else:
-            kv_row = plan.cache_row_elements * dtype_bytes(quant.kv_dtype)
+            # The gather moves stored rows, including their declared scale or
+            # packed suffix, not a bare activation-dtype payload.
+            kv_row = cache_format(model, cache_region).row_bytes(
+                plan.cache_row_elements)
         store = b.communicate(
             "pcp_kv_gather", (produced,),
             rows * kv_row * (parallel.pcp - 1) / parallel.pcp,
@@ -303,10 +305,7 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
 
     ratio = max(1, plan.compress_ratio)
     if plan.cache_kind == "window_compressed" and plan.compress_ratio:
-        compressed_rows = [
-            completed_rows(view.context + view.q_len, ratio)
-            - completed_rows(view.context, ratio) for view in views
-        ]
+        compressed_rows = [owned_completed_rows(view, ratio) for view in views]
         if plan.owns_long_kv:
             new_rows = sum(compressed_rows)
             compressed_latent, rotated = compressor(
@@ -431,7 +430,10 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                 view, plan=plan, model=model, quant=quant, query_tile=query_tile,
                 eff_cp=eff_cp, block=block_size, interleave=cp_interleave_size,
                 tp=parallel.tp, dsa=grp_dsa, topk_present=bool(topk),
-                heads=heads, latent_dim=latent_dim)
+                heads=heads, latent_dim=latent_dim,
+                shared_selection=(topk if (reuse_index_selection
+                                           and isinstance(topk, SharedSelectionRef))
+                                  else None))
             for rank in range(eff_cp):
                 rank_pairs[rank] += rec["v_pairs"][rank]
                 rank_sweeps[rank] += rec["v_sweeps"][rank]

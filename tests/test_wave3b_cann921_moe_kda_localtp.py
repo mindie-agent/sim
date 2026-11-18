@@ -249,7 +249,12 @@ def test_ep_dispatch_quantizer_is_absorbed_into_init_routing_once():
     assert "activation_scales" in pack.returns
     # The quantization Vector Ops are billed on the routing pack, once.
     assert pack.vector_ops >= routing["vector_ops"] > 0.0
-    assert pack.mte3_bytes == pytest.approx(routing["write_bytes"])
+    # The quantized payload replaces the BF16 payload; the INT32 inverse
+    # permutation remains an auxiliary output of the same pack.
+    routed_slots = pack.local_shape[0] * pack.local_shape[1]
+    assert routing["inverse_index_bytes"] == pytest.approx(routed_slots * 4)
+    assert pack.mte3_bytes == pytest.approx(
+        routing["write_bytes"] + routing["inverse_index_bytes"])
     gate = next(op for op in ops if op.family == "grouped_gemm")
     gate_metadata = dict(gate.metadata)
     # The pack publishes the quantized payload plus scales; the dispatch that
@@ -298,7 +303,9 @@ def test_absorb_requires_a_portable_payload_and_ep_greater_than_one():
     absorbed, retired = absorb_init_routing(pack=pack, quantizer=quantizer, ep=8)
     assert retired == quantizer.op_id
     assert absorbed.vector_ops == 60.0
-    assert absorbed.mte2_bytes == 100.0 and absorbed.mte3_bytes == 1040.0
+    assert absorbed.mte2_bytes == 100.0
+    # Six routed slots keep their INT32 inverse-permutation write.
+    assert absorbed.mte3_bytes == 1040.0 + 6 * 4
     assert dict(absorbed.metadata)["moe_init_routing"]["quant_mode"] == 1
     coarse = replace(quantizer, metadata=tuple(
         (key, 128 if key == "activation_group_size" else value)
