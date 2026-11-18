@@ -26,6 +26,16 @@ FLOATING_CACHE_DTYPES = frozenset({"bf16", "fp16", "bfloat16", "float16"})
 # (two FP4 per byte + BF16 scale per 16) rows of one 512-wide cache entry.
 MQSMLA_WINDOW_ROW_BYTES = 544
 MQSMLA_COMPRESSED_ROW_BYTES = 320
+MQSMLA_FP8_ROW_BYTES = 608
+MQSMLA_MXFP8_ROW_BYTES = 584
+MQSMLA_ORIGINAL_ROW_WIDTHS = frozenset({
+    MQSMLA_WINDOW_ROW_BYTES, MQSMLA_FP8_ROW_BYTES, MQSMLA_MXFP8_ROW_BYTES,
+})
+MQSMLA_ROW_WIDTH_PAIRS = frozenset({
+    (MQSMLA_WINDOW_ROW_BYTES, MQSMLA_COMPRESSED_ROW_BYTES),
+    (MQSMLA_FP8_ROW_BYTES, MQSMLA_FP8_ROW_BYTES),
+    (MQSMLA_MXFP8_ROW_BYTES, MQSMLA_MXFP8_ROW_BYTES),
+})
 MQSMLA_HEAD_WIDTH = 512
 MQSMLA_QUERY_RANK = 3
 MQSMLA_CACHE_DTYPE = "uint8"
@@ -323,24 +333,28 @@ def _mqsmla_attention_contract(op, view):
             or op.get("source_boundary") != "kernel"):
         return None
     shape = tuple(view.get("query_shape", ()))
+    orig_bytes = view.get("original_cache_row_bytes")
     if (len(shape) != MQSMLA_QUERY_RANK
             or any(type(dim) is not int or dim <= 0 for dim in shape)
             or shape[-1] != MQSMLA_HEAD_WIDTH
             or tuple(view.get("output_shape", ())) != shape
             or view.get("query_dtype") != "bf16"
             or view.get("output_dtype") != "bf16"
-            or view.get("original_cache_row_bytes") != MQSMLA_WINDOW_ROW_BYTES
+            or type(orig_bytes) is not int
+            or orig_bytes not in MQSMLA_ORIGINAL_ROW_WIDTHS
             or type(view.get("compressed_cache")) is not bool):
         return None
     compressed = ((), None, None)
     if view["compressed_cache"]:
-        if view.get("compressed_cache_row_bytes") != MQSMLA_COMPRESSED_ROW_BYTES:
+        comp_bytes = view.get("compressed_cache_row_bytes")
+        if (type(comp_bytes) is not int
+                or (orig_bytes, comp_bytes) not in MQSMLA_ROW_WIDTH_PAIRS):
             return None
-        compressed = (((1, MQSMLA_COMPRESSED_ROW_BYTES), MQSMLA_CACHE_DTYPE, "ND"))
+        compressed = (((1, comp_bytes), MQSMLA_CACHE_DTYPE, "ND"))
     query = (shape, "bf16", "ND")
     return (
         "sparse_attention_active", native_kind, (query,),
-        (((1, MQSMLA_WINDOW_ROW_BYTES), MQSMLA_CACHE_DTYPE, "ND"), compressed),
+        (((1, orig_bytes), MQSMLA_CACHE_DTYPE, "ND"), compressed),
         query,
     )
 

@@ -48,6 +48,16 @@ MQSMLA_CACHE_RANK = 4
 MQSMLA_QUERY_WIDTH = 512
 MQSMLA_ORIGINAL_ROW_BYTES = 544
 MQSMLA_COMPRESSED_ROW_BYTES = 320
+MQSMLA_FP8_ROW_BYTES = 608
+MQSMLA_MXFP8_ROW_BYTES = 584
+MQSMLA_ORIGINAL_ROW_WIDTHS = frozenset({
+    MQSMLA_ORIGINAL_ROW_BYTES, MQSMLA_FP8_ROW_BYTES, MQSMLA_MXFP8_ROW_BYTES,
+})
+MQSMLA_ROW_WIDTH_PAIRS = frozenset({
+    (MQSMLA_ORIGINAL_ROW_BYTES, MQSMLA_COMPRESSED_ROW_BYTES),
+    (MQSMLA_FP8_ROW_BYTES, MQSMLA_FP8_ROW_BYTES),
+    (MQSMLA_MXFP8_ROW_BYTES, MQSMLA_MXFP8_ROW_BYTES),
+})
 MQSMLA_COMPRESSED_INPUT_COUNT = 10
 LEGACY_MQSMLA_CANONICAL_KIND = "MqsmlaKernel___call__"
 LEGACY_MQSMLA_KINDS = frozenset({LEGACY_MQSMLA_CANONICAL_KIND, "MqsmlaKernel"})
@@ -295,14 +305,16 @@ def _mqsmla_attention(kind, inputs, outputs):
     if (not _nd_tensor(query, MQSMLA_QUERY_RANK, {"bf16"})
             or query[0][-1] != MQSMLA_QUERY_WIDTH or output != query
             or not _nd_tensor(original, MQSMLA_CACHE_RANK, {"uint8"})
-            or original[0][2:] != (1, MQSMLA_ORIGINAL_ROW_BYTES)
+            or original[0][2] != 1
+            or original[0][3] not in MQSMLA_ORIGINAL_ROW_WIDTHS
             or not _nd_tensor(inputs[3], 2, {"int32"})):
         return None
     compressed_head = ((), None, None)
     if len(inputs) >= MQSMLA_COMPRESSED_INPUT_COUNT:
         compressed = inputs[7]
         if (not _nd_tensor(compressed, MQSMLA_CACHE_RANK, {"uint8"})
-                or compressed[0][2:] != (1, MQSMLA_COMPRESSED_ROW_BYTES)
+                or compressed[0][2] != 1
+                or (original[0][3], compressed[0][3]) not in MQSMLA_ROW_WIDTH_PAIRS
                 or not _nd_tensor(inputs[8], 2, {"int32"})):
             return None
         compressed_head = (compressed[0][2:], "uint8", "ND")

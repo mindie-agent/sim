@@ -42,6 +42,19 @@ from mindie_sim.schema.model import WorkloadSpec
 from mindie_sim.catalog.cache_format import cache_format
 
 
+MQSMLA_PACKED_WIDTH = 512
+MQSMLA_SCALE_GROUP = 32
+MQSMLA_ROTARY_PAYLOAD_BYTES = 576.0
+MQSMLA_FP8_SCALE_BYTES = 32.0
+MQSMLA_MXFP8_SCALE_BYTES = 8.0
+MQSMLA_MODE_SCALES = {
+    (("fp8_e4m3", MQSMLA_SCALE_GROUP, "bf16"),
+     ("fp8_e4m3", MQSMLA_SCALE_GROUP, "bf16")): MQSMLA_FP8_SCALE_BYTES,
+    (("fp8_e4m3", MQSMLA_SCALE_GROUP, "uint8"),
+     ("fp8_e4m3", MQSMLA_SCALE_GROUP, "uint8")): MQSMLA_MXFP8_SCALE_BYTES,
+}
+
+
 def completed_rows(sequence_tokens: int, ratio: int) -> int:
     if ratio <= 0:
         return 0
@@ -235,14 +248,33 @@ def index_row_bytes(model: Any, index_dim: int) -> float:
     return float(index_dim) * index_element_bytes(model) + index_scale_bytes(model)
 
 
+def _mqsmla_mode_row_split(model: Any, region: str, width: int) -> tuple[float, float] | None:
+    if region not in {"window", "compressed_kv"} or int(width) != MQSMLA_PACKED_WIDTH:
+        return None
+    window = cache_format(model, "window")
+    compressed = cache_format(model, "compressed_kv")
+    if window.suffix_elements or compressed.suffix_elements:
+        return None
+    scale = MQSMLA_MODE_SCALES.get((
+        (window.dtype, window.group_size, window.scale_dtype),
+        (compressed.dtype, compressed.group_size, compressed.scale_dtype),
+    ))
+    if scale is None:
+        return None
+    return MQSMLA_ROTARY_PAYLOAD_BYTES, float(scale)
+
+
 def cache_row_split(model: Any, region: str, width: int) -> tuple[float, float]:
     """Split one declared cache row into payload and quant scale bytes.
 
     Suffix elements are materialized data, not quantization metadata, so they
-    stay in the payload component.  The sum is exactly ``CacheFormat.row_bytes``
-    for the same declaration; no additional row or page rounding is applied
-    here (the caller's row count already carries allocator geometry).
+    stay in the payload component.  The sum is the declared row width; no
+    additional row or page rounding is applied here (the caller's row count
+    already carries allocator geometry).
     """
+    packed = _mqsmla_mode_row_split(model, region, width)
+    if packed is not None:
+        return packed
     fmt = cache_format(model, region)
     quantized = int(width) - int(fmt.suffix_elements)
     if quantized < 0:
@@ -257,6 +289,14 @@ def cache_row_split(model: Any, region: str, width: int) -> tuple[float, float]:
     if payload < 0.0:
         raise ModelingError("cache_row_split_negative_payload")
     return payload, float(scale)
+
+
+def packed_region_row_bytes(model: Any, region: str, width: int) -> int:
+    """Physical row width for ``region``, honoring arch35 MQSMLA Mode-1/2."""
+    packed = _mqsmla_mode_row_split(model, region, width)
+    if packed is not None:
+        return int(round(packed[0] + packed[1]))
+    return int(cache_format(model, region).row_bytes(int(width)))
 
 
 def cache_component_split(
@@ -516,12 +556,12 @@ def layer_cache_components(model, plan, parallel, sequence_tokens, *, capacity_p
         result["mla_kv"] = local_rows(rows) * cache_format(model, "mla_kv").row_bytes(plan.cache_row_elements)
     else:
         if plan.window:
-            result["window"] = local_rows(min(seq, plan.window)) * cache_format(
-                model, "window").row_bytes(plan.cache_row_elements)
+            result["window"] = local_rows(min(seq, plan.window)) * packed_region_row_bytes(
+                model, "window", plan.cache_row_elements)
         if plan.owns_long_kv:
             result["compressed_kv"] = local_rows(
                 completed_rows(seq, plan.compress_ratio), max(ONE, interleave // max(ONE, plan.compress_ratio))) \
-                * cache_format(model, "compressed_kv").row_bytes(plan.cache_row_elements)
+                * packed_region_row_bytes(model, "compressed_kv", plan.cache_row_elements)
             if plan.compressor_state_rows and seq:
                 rows = plan.compressor_state_rows if capacity_padded else min(seq, plan.compressor_state_rows)
                 result["compressor_state"] = rows * TWO * plan.compressor_width * plan.head_dim * FOUR
@@ -583,6 +623,18 @@ def layer_stage_map(model: Any, parallel: ParallelSpec, runtime=None) -> tuple[i
                  for index in range(layers))
 
 
+def uses_inherited_draft_cache(model: Any, draft_kind: str | None) -> bool:
+    """True when MTP draft KV/index/pool storage follows declared LayerPlans."""
+    if draft_kind != "mtp" or getattr(model, "auxiliary", None) is None:
+        return False
+    if dict(getattr(model, "metadata", ()) or ()).get("cache_allocator") == "paired_sfa":
+        return False
+    return any(
+        layer.window > ZERO or layer.compress_ratio > ZERO or layer.owns_index_k
+        for layer in getattr(model, "layer_plans", ())
+    )
+
+
 def stage_cache_components(
     model: Any, parallel: ParallelSpec, sequence_tokens: int,
     *, capacity_padded: bool = True, draft_kind: str | None = None,
@@ -600,16 +652,29 @@ def stage_cache_components(
         ).items():
             stages[stage][key] = stages[stage].get(key, 0.0) + value
     if draft_kind and getattr(model, "auxiliary", None) is not None:
-        from mindie_sim.catalog.draft import optional_draft_spec
-        draft = optional_draft_spec(model, draft_kind)
-        from mindie_sim.catalog.paired_sfa import draft_row
-        row_bytes = draft_row(model, draft, tp=parallel.tp)
-        seq = max(ZERO, int(sequence_tokens))
-        seq = (_context_shard_blocks(seq, interleave, parallel.cp) if capacity_padded
-               else seq / parallel.cp)
-        stages[-ONE]["draft_kv"] = stages[-ONE].get("draft_kv", ZERO) + float(
-            seq * row_bytes * draft.layers
-        )
+        if uses_inherited_draft_cache(model, draft_kind):
+            from mindie_sim.catalog.cache_ownership import draft_cache_components
+            draft_values = draft_cache_components(
+                model, parallel, draft_kind=draft_kind,
+                sequence_tokens=sequence_tokens, capacity_padded=capacity_padded,
+                runtime=runtime, query_tokens=query_tokens, phase=phase,
+            )
+            stages[-ONE]["draft_kv"] = stages[-ONE].get("draft_kv", 0.0) + float(
+                draft_values["draft_kv"])
+            if draft_values.get("draft_state", 0.0) > 0.0:
+                stages[-ONE]["draft_state"] = stages[-ONE].get(
+                    "draft_state", 0.0) + float(draft_values["draft_state"])
+        else:
+            from mindie_sim.catalog.draft import optional_draft_spec
+            draft = optional_draft_spec(model, draft_kind)
+            from mindie_sim.catalog.paired_sfa import draft_row
+            row_bytes = draft_row(model, draft, tp=parallel.tp)
+            seq = max(ZERO, int(sequence_tokens))
+            seq = (_context_shard_blocks(seq, interleave, parallel.cp) if capacity_padded
+                   else seq / parallel.cp)
+            stages[-ONE]["draft_kv"] = stages[-ONE].get("draft_kv", ZERO) + float(
+                seq * row_bytes * draft.layers
+            )
     return stages
 
 

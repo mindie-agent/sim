@@ -1318,10 +1318,9 @@ class Memory:
 
     def _uses_inherited_draft_cache(self, model) -> bool:
         """True when draft KV/state follows the declared draft LayerPlans."""
-        return (self.draft_kind == "mtp" and model.auxiliary is not None
-                and not self.paired_sfa
-                and any(layer.window > ZERO or layer.compress_ratio > ZERO
-                        for layer in model.layer_plans))
+        from mindie_sim.catalog.cache import uses_inherited_draft_cache
+        return (not self.paired_sfa
+                and uses_inherited_draft_cache(model, self.draft_kind))
 
     def _inherited_draft_cache_bytes(
         self, model, tokens: int, *, padded: bool, rank: int | None = None,

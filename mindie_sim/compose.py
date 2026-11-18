@@ -1520,7 +1520,9 @@ def assemble(case, *, scope="service", iterations=None, phase=None, tokens=None,
                    else int(iterations))
     if model_draft_policies:
         decode_tokens = 1
-        total_steps = int(model_token_quota)
+        total_steps = sum(
+            min(spec.output_tokens, int(model_token_quota)) for spec in specs
+        )
     for step_index in range(total_steps):
         views = []
         model_budget = (int(parsed.runtime.max_num_batched_tokens)

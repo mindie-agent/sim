@@ -342,17 +342,28 @@ def semantic_subgraph_ledger(
 
     unfused_hbm = sum(
         float(nodes[member]["physical_work"]["hbm_bytes"]) for member in members)
-    eliminated_internal = 0.0
-    for member in members:
-        if member in ext_out or not internal_consumers[member]:
+    internal_producers = {
+        member for member in members
+        if member not in ext_out and internal_consumers[member]
+    }
+    eliminated_writes = sum(
+        float(nodes[member]["physical_work"]["mte3_bytes"])
+        for member in internal_producers
+    )
+    eliminated_reads = 0.0
+    for consumer in members:
+        producers = [dep for dep in nodes[consumer]["deps"]
+                     if dep in internal_producers]
+        if not producers:
             continue
-        work = nodes[member]["physical_work"]
-        write_bytes = float(work["mte3_bytes"])
-        consumer_cap = sum(
-            float(nodes[consumer]["physical_work"]["mte2_bytes"])
-            for consumer in internal_consumers[member])
-        read_bytes = min(len(internal_consumers[member]) * write_bytes, consumer_cap)
-        eliminated_internal += write_bytes + read_bytes
+        consumer_mte2 = float(nodes[consumer]["physical_work"]["mte2_bytes"])
+        edge_bound = sum(
+            min(float(nodes[producer]["physical_work"]["mte3_bytes"]),
+                consumer_mte2)
+            for producer in producers
+        )
+        eliminated_reads += min(consumer_mte2, edge_bound)
+    eliminated_internal = eliminated_writes + eliminated_reads
 
     boundary_hbm = max(0.0, unfused_hbm - eliminated_internal)
     if realized_hbm_bytes is not None:
