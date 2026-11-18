@@ -289,42 +289,45 @@ def test_residual_norm_is_not_gated_by_qk_norm():
     assert lowerings.get("add_rmsnorm") == "vllm_ascend_native_norm"
 
 
-def test_all_catalog_models_compose_and_lower_on_every_sku():
+@pytest.mark.parametrize("hardware", SKUS)
+def test_all_catalog_models_compose_and_lower_on_every_sku(hardware: str):
     """Every catalog entry composes and lowers; drafts attach to a target."""
     from mindie_sim.catalog.draft import optional_draft_spec
 
     checked = 0
+    drafts = 0
     for key in CATALOG_MODELS:
-        for hardware in SKUS:
-            raw = None
-            for experts in (8, 1):
-                try:
-                    raw = compose_case(
-                        key, hardware, tp=8, dp=1, ep=experts, concurrency=1,
-                        max_model_len=DEFAULT_MAX_MODEL_LEN)
-                    break
-                except Exception as exc:  # dense models reject ep > 1
-                    if experts == 1:
-                        raise AssertionError(f"{key}/{hardware}: {exc}") from exc
-            parsed = parse_case(raw)
-            if parsed.model.is_standalone_draft:
-                # A standalone draft entry is a real declaration, but serving
-                # validity requires its supported target (checked below).
-                auxiliary = parsed.model.auxiliary
-                assert auxiliary.dspark is not None or auxiliary.mtp is not None
-                kind = "dspark" if auxiliary.dspark is not None else "mtp"
-                assert optional_draft_spec(parsed.model, kind) is not None
-                continue
-            graphs = target_graphs(
-                parsed, phase="decode", tokens=1, context=DEFAULT_CONTEXT,
-                sequences=1, scope="body")
-            assert graphs, (key, hardware)
-            report = export_structure(
-                parsed, phase="decode", tokens=1, context=DEFAULT_CONTEXT,
-                scope="body")
-            assert report["nodes"], (key, hardware)
-            checked += 1
-    assert checked >= len(CATALOG_MODELS) * len(SKUS) - len(CATALOG_MODELS)
+        raw = None
+        for experts in (8, 1):
+            try:
+                raw = compose_case(
+                    key, hardware, tp=8, dp=1, ep=experts, concurrency=1,
+                    max_model_len=DEFAULT_MAX_MODEL_LEN)
+                break
+            except Exception as exc:  # dense models reject ep > 1
+                if experts == 1:
+                    raise AssertionError(f"{key}/{hardware}: {exc}") from exc
+        parsed = parse_case(raw)
+        if parsed.model.is_standalone_draft:
+            # A standalone draft entry is a real declaration, but serving
+            # validity requires its supported target (checked below).
+            auxiliary = parsed.model.auxiliary
+            assert auxiliary.dspark is not None or auxiliary.mtp is not None
+            kind = "dspark" if auxiliary.dspark is not None else "mtp"
+            assert optional_draft_spec(parsed.model, kind) is not None
+            drafts += 1
+            continue
+        graphs = target_graphs(
+            parsed, phase="decode", tokens=1, context=DEFAULT_CONTEXT,
+            sequences=1, scope="body")
+        assert graphs, (key, hardware)
+        report = export_structure(
+            parsed, phase="decode", tokens=1, context=DEFAULT_CONTEXT,
+            scope="body")
+        assert report["nodes"], (key, hardware)
+        checked += 1
+    assert checked + drafts == len(CATALOG_MODELS)
+    assert checked > 0
 
 
 def test_entry_points_agree_on_the_selected_operator_stack():
