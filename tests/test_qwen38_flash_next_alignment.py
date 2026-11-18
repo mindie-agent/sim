@@ -134,7 +134,9 @@ def test_qwen4_kv_pool_sparse_gqa_index_cache_gemma_keqv_and_kimi_k31():
     gemma = load_model("gemma-4-26b-a4b")
     row_map = dict(cache_row_bytes_by_layer(gemma))
     keqv_layer = next(p for p in gemma.layer_plans if p.k_eq_v)
-    assert row_map[keqv_layer.index] == keqv_layer.num_kv_heads * keqv_layer.head_dim * 2
+    # Shared K/V projection weights still store two separate cache planes.
+    assert row_map[keqv_layer.index] == (
+        2 * keqv_layer.num_kv_heads * keqv_layer.head_dim * 2)
 
     k31 = parse_case(compose_case(
         "kimi-k3.1", hardware="a5", tp=8, dp=4, ep=32, dcp=8,

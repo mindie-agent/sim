@@ -74,6 +74,8 @@ ARCH_REASON = "mqsmla_requires_a5_packed_cache_capability"
 ACTIVATION_REASON = "mqsmla_requires_bf16_activation"
 GEOMETRY_REASON = "mqsmla_requires_d512_rope64_single_kv_head"
 CACHE_REASON_PREFIX = "mqsmla_cache_representation_contract_required:"
+INT8_KV_DTYPE = "int8"
+PACKED_MLA_ROPE_WIDTHS = frozenset({0, V41_ROPE_DIM})
 
 # --- BF16 LightningIndexerV2 default and serving inventory --------------------
 LIGHTNING_INDEXER_SELECTOR = "lightning_indexer"
@@ -115,7 +117,8 @@ def structural_v41_latent_mqa(layer_plans) -> bool:
     return any(plan.compressor_kind == V41_COMPRESSOR for plan in plans)
 
 
-def is_a5_v41_packed_cache_stack(*, backend, arch, layer_plans, activation_dtype) -> bool:
+def is_a5_v41_packed_cache_stack(*, backend, arch, layer_plans, activation_dtype,
+                                 structural_override=None) -> bool:
     """A5 capability plus the structural V4.1 contract.
 
     Weight quantization is deliberately absent: ``vllm_ascend/models/
@@ -125,7 +128,44 @@ def is_a5_v41_packed_cache_stack(*, backend, arch, layer_plans, activation_dtype
     """
     if backend != ASCEND_BACKEND or arch != A5_ARCH or activation_dtype != BF16_ACTIVATION:
         return False
+    if structural_override is not None:
+        return bool(structural_override)
     return structural_v41_latent_mqa(layer_plans)
+
+
+def packed_indexed_mla_cache_rope(model) -> int | None:
+    """Resolve the persistent INT8 packed MLA row width, independent of phase.
+
+    The native indexed decode kernel writes a 128-element group-scaled row, so
+    a phase-only selection would let prefill and capacity use a different
+    layout.  This structural resolver is the single model-preparation owner of
+    that persistent format.
+    """
+    quant = getattr(model, "quant", None)
+    if quant is None or str(getattr(quant, "kv_dtype", "")) != INT8_KV_DTYPE:
+        return None
+    if str(getattr(model, "activation_dtype", "")) != BF16_ACTIVATION:
+        return None
+    layers = [plan for plan in getattr(model, "layer_plans", ())
+              if plan.attention == "mla" and int(plan.index_topk) > 0]
+    if not layers:
+        return None
+    if any(plan.cache_kind != "dense" or plan.window or plan.noncausal_attention
+           or int(plan.kv_lora_rank) != V41_HEAD_DIM
+           or int(plan.qk_rope_head_dim) not in PACKED_MLA_ROPE_WIDTHS
+           for plan in layers):
+        return None
+    widths = {int(plan.qk_rope_head_dim) for plan in layers}
+    return next(iter(widths)) if len(widths) == 1 else None
+
+
+def resolve_packed_indexed_mla_cache(model):
+    """Install one persistent packed ``mla_kv`` representation on the model."""
+    rope = packed_indexed_mla_cache_rope(model)
+    if rope is None:
+        return model
+    from mindie_sim.catalog.cache_format import with_packed_mla_cache
+    return with_packed_mla_cache(model, rope)
 
 
 def local_heads_supported(layer_plans, tp) -> bool:
@@ -189,7 +229,7 @@ def static_mqsmla_reason(*, arch, cp, tp, layer_plans, model) -> str | None:
 
 def apply_compose_v41_a5_defaults(*, model_dict, lowerings, backend, arch,
                                  layer_plans, activation_dtype, tp, cp,
-                                 runtime_metadata=None):
+                                 runtime_metadata=None, structural_v41=None):
     """Attach A5 V4.1 packed cache regions and decode bindings in place.
 
     Returns the selection notes. A caller-declared ``cache_representations``
@@ -199,7 +239,7 @@ def apply_compose_v41_a5_defaults(*, model_dict, lowerings, backend, arch,
     notes: list[dict] = []
     if not is_a5_v41_packed_cache_stack(
         backend=backend, arch=arch, layer_plans=layer_plans,
-        activation_dtype=activation_dtype,
+        activation_dtype=activation_dtype, structural_override=structural_v41,
     ):
         return notes
     metadata = model_dict.setdefault("metadata", {})
@@ -429,6 +469,8 @@ __all__ = [
     "apply_compose_v41_a5_defaults", "automatic_metadata", "automatic_mqsmla_reason",
     "installed_automatically", "is_a5_v41_packed_cache_stack", "lightning_indexer_default",
     "local_heads_supported", "mqsmla_decode_policy", "mqsmla_default", "normalize_regions",
-    "output_groups_supported", "packed_cache_reason", "serving_recipe_inventory",
-    "static_mqsmla_reason", "structural_v41_latent_mqa",
+    "output_groups_supported", "packed_cache_reason",
+    "packed_indexed_mla_cache_rope", "resolve_packed_indexed_mla_cache",
+    "serving_recipe_inventory", "static_mqsmla_reason",
+    "structural_v41_latent_mqa",
 ]

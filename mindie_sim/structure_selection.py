@@ -57,10 +57,39 @@ def _merge_math_rollup(total, part):
     return total
 
 
+def _merge_blockers(found, records):
+    """Merge onboarding blockers with the full export's key/union rules."""
+    for blocker in records:
+        key = (int(blocker["layer_index"]), blocker["architecture"])
+        if key not in found and key[0] < 0:
+            same_core = next(
+                (item for item in found if item[1] == key[1]), None)
+            if same_core is not None:
+                key = same_core
+        record = found.get(key)
+        if record is None:
+            found[key] = {
+                **blocker,
+                "recipes": tuple(blocker["recipes"]),
+                "op_ids": tuple(blocker["op_ids"]),
+            }
+            continue
+        record["recipes"] = tuple(sorted(
+            set(record["recipes"]) | set(blocker["recipes"])))
+        record["op_ids"] = tuple(sorted(
+            set(record["op_ids"]) | set(blocker["op_ids"])))
+
+
 def _scan_structure(case, consume, **geometry):
     """Hash the complete export while visiting one replica's records at a time."""
+    from .prediction.unmodeled_gate import (
+        HINT_KEYS, _hint_for, collect_blockers,
+    )
+
     graphs, options = _structure_inputs(case, **geometry)
     external, all_ids = set(), set()
+    blockers: dict[tuple[int, str], dict] = {}
+    _merge_blockers(blockers, collect_blockers({"model": options['model']}))
     encoder = json.JSONEncoder(sort_keys=True, separators=(',', ':'), allow_nan=False)
     execution = _json_value({**options['execution'], 'expand_calls': options['expand_calls'],
                              'replicas': sorted(graphs), 'kernel_bindings': options['kernels']})
@@ -72,6 +101,10 @@ def _scan_structure(case, consume, **geometry):
                    for key in ARRAYS}
         counts = dict.fromkeys(ARRAYS, 0)
         for replica, operators in sorted(graphs.items()):
+            # Executed core holes are part of the hashed identity just like a
+            # declared layer hole; collect them from this replica's operators
+            # before serialization drops occurrence metadata.
+            _merge_blockers(blockers, collect_blockers(None, operators))
             part = export_op_structure({replica: operators}, **{
                 **options, 'resource_graphs': {replica: options['resource_graphs'][replica]}})
             if 'subgraph_math_by_family' in part:
@@ -93,6 +126,9 @@ def _scan_structure(case, consume, **geometry):
         scalar['external_inputs'] = sorted(external - all_ids)
         if math_rollup is not None:
             scalar['subgraph_math_by_family'] = math_rollup
+        if blockers:
+            scalar[HINT_KEYS] = [
+                _hint_for(blockers[key]) for key in sorted(blockers)]
         digest = sha256()
         digest.update(b'{')
         for index, key in enumerate(sorted((*scalar, *ARRAYS))):

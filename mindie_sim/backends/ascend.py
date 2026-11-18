@@ -242,10 +242,6 @@ def _merge_channels(raw, profile):
                        or declaration.get("channel_semantics"))
         declaration["semantics"] = ("per_pair" if profile_sem == "per_pair"
                                     else "per_port")
-    if (raw.get("topology_preset")
-            and int(raw.get("ranks_per_node", DIRECT_MESH_RANKS)) > DIRECT_MESH_RANKS):
-        channels["d2d_intra_node"].update(
-            channel_semantics="per_port", semantics="per_port")
     for name, patch in patches:
         channels[name] = _merge_mapping(channels[name], patch)
         if "semantics" in patch or "channel_semantics" in patch:
@@ -266,6 +262,17 @@ def _merge_channels(raw, profile):
                 value = _number(f"{name}:{provenance}", value)
             channels[name]["effective_uni_bw_gbps"] = value
             channels[name]["bandwidth_provenance"] = provenance
+    # A node wider than the K8 direct mesh has no complete pairwise fabric:
+    # treating it as per-pair would multiply one port by the peer count.  The
+    # node width selects per-port service unless the caller explicitly declared
+    # the channel's semantics (a preset is only a default, not an override).
+    node_ranks = int(raw.get("ranks_per_node", DIRECT_MESH_RANKS)
+                     or DIRECT_MESH_RANKS)
+    if node_ranks > DIRECT_MESH_RANKS:
+        declared_semantics = declared.get("d2d_intra_node", set())
+        if not ({"semantics", "channel_semantics"} & declared_semantics):
+            channels["d2d_intra_node"].update(
+                channel_semantics="per_port", semantics="per_port")
     return channels, explicit, declared
 
 

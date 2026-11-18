@@ -184,6 +184,14 @@ def effective_body_declaration(case, phase, *, tokens=ONE, scope=DEFAULT_SCOPE,
     if not enabled:
         return case, {"profile": "explicit_declaration_preserved",
                       "scope": str(scope), "reason": "body_defaults_disabled"}
+    if str(getattr(case.machine, "arch_family", "")) == "A5":
+        # The INT8 packed MLA row is resolved before phase-scoped operator
+        # selection so prefill, decode and the serving inventory agree.
+        from mindie_sim.compose_operator_defaults import (
+            resolve_packed_indexed_mla_cache,
+        )
+        case = replace(
+            case, model=resolve_packed_indexed_mla_cache(case.model))
     case = _collective_defaults(case)
     policy = execution_policy(case)
     declared_lowerings = frozenset(dict(case.runtime.kernels.get("lowerings", {}) or {}))

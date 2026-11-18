@@ -117,7 +117,11 @@ HARDWARE_TOPOLOGY_ALIASES: dict[str, tuple[str, str]] = {
 }
 
 _EXTRA_QUANT_SPECS: dict[str, QuantSpec] = {
-    "fp16": QuantSpec("fp16", "fp16", "fp16", "fp16", "fp16", "fp16", "fp16"),
+    "fp16": QuantSpec(
+        name="fp16", weight_format="fp16", activation_format="fp16",
+        expert_weight_format="fp16", kv_dtype="fp16", index_dtype="fp16",
+        index_scale_dtype="none", native_format="fp16",
+    ),
     "mxfp4": QuantSpec(
         name="MXFP4", weight_format="mxfp4", activation_format="fp8_e4m3",
         expert_weight_format="mxfp4", weight_block=(1, 32), expert_block=32,
@@ -807,6 +811,11 @@ def compose_case(
         if quant is None:
             quant = va_profile["quant"]
     model_spec = _apply_quant_override(model_spec, quant, machine)
+    from mindie_sim.compose_operator_defaults import structural_v41_latent_mqa
+    # Layer slicing must not erase the full-model cache contract: the first
+    # sliced layers may all be window-only, while a later layer supplies the
+    # gated-ring compressor that identifies the packed V4.1 stack.
+    v41_structural = structural_v41_latent_mqa(model_spec.layer_plans)
     model_spec = _apply_structural_overrides(
         model_spec,
         layers=layers,
@@ -943,6 +952,13 @@ def compose_case(
     # A5 production router form is a compose-scoped rewrite; a standalone
     # ``load_model`` keeps the checkpoint declaration.
     model_spec = _tier4_router_spec(model_spec, sku, raw_eager=raw_eager)
+    if ascend_backend and _arch_key(sku) == "a5":
+        # A persistent INT8 packed MLA row is a model-preparation fact, not a
+        # phase-scoped operator choice: capacity and both phases must see it.
+        from mindie_sim.compose_operator_defaults import (
+            resolve_packed_indexed_mla_cache,
+        )
+        model_spec = resolve_packed_indexed_mla_cache(model_spec)
     model_dict = _to_jsonable(model_spec)
     model_dict["n_routed_experts"] = int(model_spec.num_experts)
     model_dict["num_experts_per_tok"] = int(model_spec.top_k)
@@ -1058,6 +1074,12 @@ def compose_case(
         runtime_dict["kernels"] = {
             "sequence_parallel": dict(DECLARATION, padding="right_to_tp")
         }
+    excluded_selectors: frozenset[str] = frozenset()
+    excluded_passes: frozenset[str] = frozenset()
+    if ascend_backend and not raw_eager:
+        from mindie_sim.stack_tracks import excluded_lowering_bindings
+        excluded_selectors, excluded_passes = excluded_lowering_bindings(
+            exclude_optimizations)
     if va_profile is not None:
         runtime_meta["va_recommended"] = True
         runtime_meta["va_profile"] = deepcopy(va_profile)
@@ -1084,6 +1106,17 @@ def compose_case(
         lowerings = _resolve_va_lowerings(
             model_spec, runtime_dict["parallel"], sku, passes, notes=notes,
         )
+        # ``exclude_optimizations`` owns the profile-installed selectors too;
+        # removing only the feature-track entry would retain the fused kernel.
+        lowerings = {name: value for name, value in lowerings.items()
+                     if name not in excluded_selectors}
+        if excluded_passes:
+            passes = tuple(name for name in passes
+                           if name not in excluded_passes)
+            if passes:
+                runtime_dict["lowering_passes"] = list(passes)
+            else:
+                runtime_dict.pop("lowering_passes", None)
         if "add_rmsnorm" in lowerings and "residual_norm" not in passes:
             passes = (*passes, "residual_norm")
             runtime_dict["lowering_passes"] = list(passes)
@@ -1106,8 +1139,12 @@ def compose_case(
         )
 
         canonical_track = normalize_feature_track(feature_track)
+        # An exclusion removes mechanisms; it never activates a non-empty
+        # track.  ``va_recommended=False`` with only exclusions therefore keeps
+        # the caller's bare case instead of enabling graph capture and MoE
+        # gating as a side effect.
         if (va_recommended is not False or bool(optimizations)
-                or bool(exclude_optimizations) or canonical_track != "merged"):
+                or canonical_track != "merged"):
             mechanism_track_active = True
             stack_profile = resolve_runtime_stack(runtime_stack)
             stack_model_key = str(
@@ -1151,8 +1188,11 @@ def compose_case(
             model_dict=model_dict, lowerings=lowerings, backend=hardware_backend,
             arch=_arch_key(sku), layer_plans=model_spec.layer_plans,
             activation_dtype=model_spec.activation_dtype, tp=tp, cp=dcp,
-            runtime_metadata=runtime_meta,
+            runtime_metadata=runtime_meta, structural_v41=v41_structural,
         ))
+        if excluded_selectors:
+            lowerings = {name: value for name, value in lowerings.items()
+                         if name not in excluded_selectors}
         if lowerings:
             kernels["lowerings"] = lowerings
             runtime_dict["kernels"] = kernels
@@ -1453,19 +1493,34 @@ def assemble(case, *, scope="service", iterations=None, phase=None, tokens=None,
     rows, program_count, first_program = [], 0, None
     service_counts = {family: 0 for family in SERVICE_FAMILIES}
     serving = execution.serving_io
+    model_draft_policies = {}
+    if scope == "model" and phase == "decode":
+        from mindie_sim.prediction.scheduler import DraftPolicy
+        for spec in specs:
+            policy = DraftPolicy.for_request(parsed, spec)
+            if policy.mode:
+                model_draft_policies[spec.request_id] = policy
     # A non-draft decode step advances one token. ``tokens`` is the requested
     # token budget per outer iteration and expands into real microsteps, each
     # with its own forward/commit/state dependency; it is never one batched
-    # multi-token commit or a sleep for the rest of the budget.
+    # multi-token commit or a sleep for the rest of the budget.  A speculative
+    # model step is already one proposal block plus a multi-row verification,
+    # so it is not expanded again into independent one-row forwards.
     decode_tokens = int(tokens) if phase == "decode" else 1
     total_steps = (int(iterations) * decode_tokens if phase == "decode"
                    else int(iterations))
+    if model_draft_policies:
+        decode_tokens = 1
+        total_steps = int(iterations)
     for step_index in range(total_steps):
         views = []
+        model_budget = (int(parsed.runtime.max_num_batched_tokens)
+                        if model_draft_policies else DEFAULT_ZERO)
         for spec in specs:
             remaining = spec.output_tokens - generated[spec.request_id]
             if remaining <= 0:
                 continue
+            proposal = DEFAULT_ZERO
             if phase == "prefill" and step_index == 0:
                 q_len, view_phase = spec.prompt_tokens, "prefill"
                 count = 1
@@ -1473,6 +1528,15 @@ def assemble(case, *, scope="service", iterations=None, phase=None, tokens=None,
                 q_len = 1
                 view_phase = "decode"
                 count = 1
+                if model_draft_policies:
+                    if model_budget <= DEFAULT_ZERO:
+                        continue
+                    policy = model_draft_policies.get(spec.request_id)
+                    if policy is not None:
+                        proposal = min(
+                            policy.proposal, max(DEFAULT_ZERO, remaining - 1),
+                            max(DEFAULT_ZERO, model_budget - 1))
+                    model_budget -= 1 + proposal
             if view_phase == "prefill":
                 view_context = 0
             elif scope == "framework":
@@ -1484,8 +1548,11 @@ def assemble(case, *, scope="service", iterations=None, phase=None, tokens=None,
                 view_context = computed_kv[spec.request_id]
             views.append(RequestView(
                 spec.request_id, q_len, view_context, True, view_phase,
-                draft_verify=False, draft_prepare=False,
-                draft_advanced_tokens=count, prompt_tokens=spec.prompt_tokens,
+                draft_verify=bool(proposal),
+                draft_proposal_tokens=proposal,
+                draft_prepare=False,
+                draft_advanced_tokens=(DEFAULT_ZERO if proposal else count),
+                prompt_tokens=spec.prompt_tokens,
             ))
         if not views:
             break
@@ -1575,6 +1642,11 @@ def assemble(case, *, scope="service", iterations=None, phase=None, tokens=None,
                 continue
             if view.phase == "prefill":
                 computed_kv[view.request_id] = view.prompt_tokens
+            elif view.request_id in model_draft_policies:
+                # One speculative iteration reserves the proposal block plus
+                # its verification row; acceptance is a service boundary.
+                computed_kv[view.request_id] += (
+                    view.q_len + view.draft_proposal_tokens)
             else:
                 computed_kv[view.request_id] += view.q_len
         row = {

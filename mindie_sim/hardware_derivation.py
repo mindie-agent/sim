@@ -61,6 +61,8 @@ AIV_RATE_KEYS = frozenset({
 #: Service modes whose declared rate is one HBM read stream.  They scale with
 #: ``hbm_peak_bytes_per_s`` even though their resource name is not ``hbm``.
 DRAM_BOUND_MODES = frozenset({"mte2_aic_dram", "mte2_aiv_dram"})
+HBM_CACHELINE_SERVICE = "gm_hbm_cacheline_128b"
+HBM_CACHELINE_BYTES = 128
 AIC_BUFFER_UNITS = frozenset({"l1", "l0a", "l0b", "l0c"})
 AIV_BUFFER_UNITS = frozenset({"ub"})
 A5_FAMILY = "A5"
@@ -315,11 +317,28 @@ def derive_hardware_sku(
         hbm_scale = float(rates["hbm"]) / float(original_hbm)
         # A service mode's duration is work / mode_rate.  Scaling only the
         # underlying HBM resource would leave an explicit mode rate unchanged,
-        # so carry the die's effective bandwidth ratio exactly once.
+        # so carry the die's effective bandwidth ratio exactly once.  On-core
+        # aggregate modes follow their physical owner count instead.
         for name, mode in device.get("service_modes", {}).items():
-            if ((mode.get("resource") == "hbm" or name in DRAM_BOUND_MODES)
-                    and mode.get("rate") is not None):
+            resource = mode.get("resource")
+            if mode.get("rate") is None:
+                continue
+            if resource == "hbm" or name in DRAM_BOUND_MODES:
                 mode["rate"] = float(mode["rate"]) * hbm_scale
+            elif resource in AIC_RATE_KEYS:
+                mode["rate"] = float(mode["rate"]) * s_c
+            elif resource in AIV_RATE_KEYS:
+                mode["rate"] = float(mode["rate"]) * s_v
+        # A scalar HBM line is one 128-byte transaction over the die's whole
+        # AIV population.  Recompute the per-owner share from the effective
+        # bandwidth and the derived owner count rather than copying a larger
+        # SKU's peak.
+        services = (device.get("compute_arch") or {}).get("instruction_services") or {}
+        cacheline = services.get(HBM_CACHELINE_SERVICE)
+        if isinstance(cacheline, dict) and cacheline.get("clock_hz") is None:
+            owners = max(ONE, int(units.get("vector", new_aiv)))
+            cacheline["per_owner_rate"] = (
+                float(rates["hbm"]) / (HBM_CACHELINE_BYTES * owners))
         device["rates"] = rates
         _strip_derived_instruction_rates(device, device_arch, assumptions)
         device["sku"] = sku

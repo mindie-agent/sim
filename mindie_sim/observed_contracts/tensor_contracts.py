@@ -33,17 +33,22 @@ from .matrix_contracts import (
 GDN_NATIVE_TYPES = {"ChunkGatedDeltaRuleFwdPrepare", "ChunkFwdH", "ChunkFwdO"}
 MATRIX_TYPES = {"MatMulV2", "MatMulV3"}
 SWIGLU_TYPES = {"Swiglu", "SwiGLU", "SwiGlu"}
+MOE_INIT_NATIVE_TYPES = {"MoeInitRoutingV3", "aclnnMoeInitRoutingV3"}
 NATIVE_BODY_TYPES = (FUSION_TYPES | FUSED_TYPES | ATTENTION_CACHE_TYPES
                      | LAYOUT_BODY_TYPES | ROUTER_TYPES | MATRIX_BODY_TYPES)
-SUPPORTED_TYPES = GDN_NATIVE_TYPES | MATRIX_TYPES | SWIGLU_TYPES | NATIVE_BODY_TYPES | {
+SUPPORTED_TYPES = (GDN_NATIVE_TYPES | MATRIX_TYPES | SWIGLU_TYPES
+                   | MOE_INIT_NATIVE_TYPES | NATIVE_BODY_TYPES | {
     "CausalConv1d", "DynamicMxQuant", "AddRmsNormDynamicMxQuant",
     "fused_gdn_gating_kernel", "Slice",
     "RmsNorm", "AddRmsNorm", "Relu",
-}
+})
 _ABSENT = {"", "N/A", "NULL", "DT_UNDEFINED"}
 
 MX_SCALE_BLOCK_ELEMENTS = 64
 MX_SCALE_BLOCK_ROUNDING_OFFSET = 63
+MOE_INIT_SCALE_GROUP = 32
+MOE_INIT_INPUT_SLOTS = 2
+MOE_INIT_OUTPUT_SLOTS = 4
 
 
 def _mx_quant_contract(row):
@@ -80,7 +85,41 @@ def _mx_quant_contract(row):
     return row.kind, shape, dtype, outputs[0][1], outputs[scale_index][0], "fp8_e8m0"
 
 
+def _moe_init_routing_contract(row):
+    """Verified BF16/INT32-to-E4M3/E8M0 local-expert routing signature."""
+    native = native_tensor_contract(row)
+    if native is None:
+        return None
+    inputs, outputs = native[2:]
+    if len(inputs) != MOE_INIT_INPUT_SLOTS or len(outputs) != MOE_INIT_OUTPUT_SLOTS:
+        return None
+    query, ids = inputs
+    if (len(query[0]) != 2 or query[1] != "bf16" or query[2] != "ND"
+            or len(ids[0]) != 2 or ids[1] != "int32" or ids[2] != "ND"):
+        return None
+    tokens, width = query[0]
+    topk = ids[0][1]
+    if (tokens <= 0 or width <= 0 or width % MOE_INIT_SCALE_GROUP
+            or ids[0][0] != tokens or topk <= 0):
+        return None
+    rows = tokens * topk
+    experts = outputs[2][0]
+    if (outputs[0] != ((rows, width), "fp8_e4m3", "ND")
+            or outputs[1] != ((rows,), "int32", "ND")
+            or len(experts) != 1 or experts[0] <= 0
+            or outputs[2][1:] != ("int64", "ND")
+            or outputs[3] != ((rows, width // MOE_INIT_SCALE_GROUP),
+                              "fp8_e8m0", "ND")):
+        return None
+    return (
+        "moe_init_routing_mxfp8_active", "MoeInitRoutingV3",
+        (query, ids), outputs,
+    )
+
+
 def observed_contract(row):
+    if row.kind in MOE_INIT_NATIVE_TYPES:
+        return _moe_init_routing_contract(row)
     if row.kind in MATRIX_BODY_TYPES:
         return observed_matrix_contract(row)
     if row.kind in ROUTER_TYPES:
@@ -265,6 +304,20 @@ def observed_contract_scope(row):
         return fused_contract_scope(row)
     if row.kind in ATTENTION_CACHE_TYPES:
         return attention_contract_scope(row)
+    if row.kind in MOE_INIT_NATIVE_TYPES:
+        return {
+            "comparison_scope": "active_mxfp8_local_expert_routing",
+            "basis": "captured_tensor_descriptors",
+            "compared": [
+                "bf16_query_shape", "int32_expert_ids_shape",
+                "mxfp8_output_shape_dtype", "row_index_shape_dtype",
+                "expert_id_shape_dtype", "e8m0_scale_shape_dtype",
+            ],
+            "not_compared": [
+                "expert_id_values", "sort_order", "quant_mode",
+                "scalar_parameters", "binary_dispatch", "occurrence_identity",
+            ],
+        }
     return {
         "comparison_scope": "captured_tensor_contract",
         "basis": "captured_tensor_descriptors",

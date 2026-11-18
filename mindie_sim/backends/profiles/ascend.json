@@ -8512,14 +8512,14 @@
           "gm_hbm_cacheline_128b": {
             "unit": "cachelines",
             "owner_axis": "vector",
-            "per_owner_rate": 488281250.0,
+            "per_owner_rate": 170898437.5,
             "provenance": {
               "kind": "ascend_a5_hbm_128b_cacheline_transaction",
               "architecture": "A5/arch3510",
-              "source": "npu_arch_3510.md:28 external128B granularity/128KiB SIMT DCache; device.rates.hbm=4000000000000B/s; scalar-dma constraints state no isolated GetValue/atomic latency",
+              "source": "npu_arch_3510.md:28 external128B granularity/128KiB SIMT DCache; device.rates.hbm=1400000000000B/s over 64 AIV; scalar-dma constraints state no isolated GetValue/atomic latency",
               "sha256": "b5b8c28b0bec5b8f462b7e0dc58769c577abb264207e3265eb01487e93d0fbca",
               "revision": "Ascend950DT_9581/9582 arch3510 profile + retained scalar-dma review 20261112",
-              "mode": "peak HBM 128B line throughput, equal per-AIV share; not scalar issue or response latency",
+              "mode": "peak HBM 128B line throughput, per-AIV share of 1.4 TB/s; not scalar issue or response latency",
               "scope": "only an independently supplied count of unique HBM 128-byte line transactions; atomic RMW counts read+write lines=2; no fabricated hit/miss; no dependent pointer latency or queue-depth claim",
               "excludes": [
                 "scalar_gm_access call price",

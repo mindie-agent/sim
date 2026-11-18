@@ -49,7 +49,12 @@ MQSMLA_QUERY_WIDTH = 512
 MQSMLA_ORIGINAL_ROW_BYTES = 544
 MQSMLA_COMPRESSED_ROW_BYTES = 320
 MQSMLA_COMPRESSED_INPUT_COUNT = 10
-MQSMLA_KINDS = frozenset({"MqsmlaKernel___call__", "MqsmlaKernel"})
+MQSMLA_KINDS = frozenset({
+    "MqsmlaKernel___call__", "MqsmlaKernel",
+    "aclnnMixedQuantSparseFlashMla", "MixedQuantSparseFlashMla",
+})
+MLA_PROLOG_INPUT_SLOTS = 21
+MLA_PROLOG_OUTPUT_SLOTS = 7
 
 
 # Arity variants come from retained original A3/A5 rows, including explicit
@@ -69,7 +74,9 @@ _ARITIES = {
     "SparseFlashMla": ({18}, {2}),
     "KvQuantSparseFlashAttentionVllm": ({9}, {3}),
     "KvQuantSparseFlashAttention": ({9}, {1}),
-    "MlaPrologV3": ({21}, {7}),
+    "MlaPrologV3": (MLA_PROLOG_INPUT_SLOTS, MLA_PROLOG_OUTPUT_SLOTS),
+    "aclnnMlaPrologV4WeightNz": (MLA_PROLOG_INPUT_SLOTS, MLA_PROLOG_OUTPUT_SLOTS),
+    "MlaPrologV4WeightNz": (MLA_PROLOG_INPUT_SLOTS, MLA_PROLOG_OUTPUT_SLOTS),
     "ChunkGatedDeltaRuleFwd": ({9, 10}, {4}),
     "RecurrentGatedDeltaRule": ({9, 10}, {2}),
 }
@@ -277,7 +284,7 @@ def _sparse_attention(kind, inputs, outputs):
     return ("sparse_attention_active", kind, (query,), (original_head, compressed_head), output)
 
 
-def _mqsmla_attention(inputs, outputs):
+def _mqsmla_attention(kind, inputs, outputs):
     if len(inputs) not in MQSMLA_INPUT_COUNTS or len(outputs) not in MQSMLA_OUTPUT_COUNTS:
         return None
     query, original, output = inputs[0], inputs[2], outputs[0]
@@ -296,7 +303,7 @@ def _mqsmla_attention(inputs, outputs):
             return None
         compressed_head = (compressed[0][2:], "uint8", "ND")
     return (
-        "sparse_attention_active", "MqsmlaKernel___call__",
+        "sparse_attention_active", kind,
         (query,),
         ((original[0][2:], "uint8", "ND"), compressed_head),
         output,
@@ -311,7 +318,7 @@ def observed_attention_contract(row):
         return subgraph_contract(native)[0]
     inputs, outputs = native[2:]
     if row.kind in MQSMLA_KINDS:
-        return _mqsmla_attention(inputs, outputs)
+        return _mqsmla_attention(row.kind, inputs, outputs)
     if row.kind == "FusedInferAttentionScore":
         return (_dense_fia(inputs, outputs) or _paged_fia(inputs, outputs)
                 or _paged_mla_fia(inputs, outputs) or native)
