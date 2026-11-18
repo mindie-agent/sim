@@ -6,7 +6,12 @@
 [Invariants]
   * Column projections gather rows, compute an output-feature shard and exchange
     slices; row projections exchange input shards and reduce-scatter partial rows;
-    MLA grouped output pairs shard whole groups.
+    MLA grouped output pairs shard whole groups.  A replicated packed slice (the
+    low-rank ``f_a``/``g_a`` factors) keeps its full width; ``f_b``/``g_b`` carry
+    local width one and never enter a collective.
+  * A row projection that already owns a pre-GEMM activation quantizer is
+    rebuilt as BF16 exchange -> received-row quantize -> GEMM -> reduce-scatter;
+    the pre-exchange quantizer is retired instead of quantizing the full axis.
   * Per-rank matrix FLOPs remain ``2*m*n*k``; internal GEMMs carry unique IDs
     while the final restore collective preserves the original public ``op_id``.
   * Transport collectives carry clean transport-only metadata and model uniform
@@ -60,7 +65,10 @@ def register_retarget_adapter(implementation: str, adapter: Any) -> None:
 def _width(runtime: Any, role: str) -> int:
     if role == "attention_output":
         return int(runtime.parallel.o_proj_tp)
-    if role in {"linear_input", "linear_gate", "linear_output"}:
+    if role == "linear_gate":
+        # ``f_b_proj`` / ``g_b_proj`` run on the token-owning rank: no collective.
+        return ONE
+    if role in {"linear_input", "linear_output"}:
         return int(runtime.parallel.linear_proj_tp)
     return int(runtime.parallel.lm_head_tp) if role in {"logits", "draft_logits"} else ONE
 
@@ -84,19 +92,40 @@ def _quant_for_op(model: Any, metadata: Mapping[str, Any]) -> Any:
 def _local_dimension(size: int, width: int, quant: Any = None) -> int:
     if width <= ONE:
         return int(size)
-    # The placement ledger pads the local hint to the weight-scale granule
-    # (for example 512/TP8 with a 128-column block becomes 128, not 64).
+    # A row-parallel split cuts the input axis, so the local hint is padded to
+    # the weight-scale granule (512/TP8 with a 128-column block becomes 128).
     term = SimpleNamespace(quant=quant)
     return max(ONE, int(_padded_local(int(size), int(width), term)))
+
+
+def _local_output_width(size: int, width: int) -> int:
+    """Exact per-rank output features of one packed column split."""
+    if width <= ONE:
+        return int(size)
+    return max(ONE, (int(size) + int(width) - ONE) // int(width))
+
+
+def _slice_local(item: Mapping[str, Any], width: int, quant: Any = None) -> int:
+    """Local output extent of one packed slice; replicated slices stay whole."""
+    shape = tuple(item.get("shape", ()))
+    size = int(shape[-ONE]) if shape else ZERO
+    if item.get("replicated"):
+        return size
+    return _local_output_width(size, width)
+
+
+def _replicated_local_width(metadata: Mapping[str, Any], width: int) -> int:
+    """Local output columns every owner already holds without a collective."""
+    slices = metadata.get("packed_projection_slices") or ()
+    return sum(int(tuple(item.get("shape", (0, 0)))[-ONE])
+               for item in slices if item.get("replicated"))
 
 
 def _packed_local_width(metadata: Mapping[str, Any], width: int, total: int, quant: Any = None) -> int:
     slices = metadata.get("packed_projection_slices")
     if not slices:
         return _local_dimension(total, width, quant)
-    return max(ONE, sum(
-        _local_dimension(int(tuple(s.get("shape", ()))[-ONE]) if s.get("shape") else ZERO, width, quant)
-        for s in slices))
+    return max(ONE, sum(_slice_local(s, width, quant) for s in slices))
 
 
 def _localize_packed_slices(metadata: dict[str, Any], width: int, quant: Any = None) -> None:
@@ -106,7 +135,7 @@ def _localize_packed_slices(metadata: dict[str, Any], width: int, quant: Any = N
     offset, local_slices = ZERO, []
     for item in slices:
         shape = tuple(item.get("shape", ()))
-        local_size = _local_dimension(int(shape[-ONE]) if shape else ZERO, width, quant)
+        local_size = _slice_local(item, width, quant)
         local_slices.append({**dict(item), "shape": (int(shape[ZERO]) if shape else ZERO, local_size),
                              "strides": (local_size, ONE), "offset_elements": offset})
         offset += local_size
@@ -176,7 +205,8 @@ def _collective(op: OpSpec, *, suffix: str, family: str, recipe: str, payload: f
 def _rewrite_matrix(op: OpSpec, *, gemm_id: str, rows: int, cols: int, reduced: int,
                     role: str, width: int, dep_ids: tuple[str, ...],
                     weight_ratio: float, quant: Any, groups: int = ONE,
-                    extra_metadata: Mapping[str, Any] | None = None) -> OpSpec:
+                    extra_metadata: Mapping[str, Any] | None = None,
+                    scale_ratio: float | None = None) -> OpSpec:
     metadata = {**dict(op.metadata), **dict(extra_metadata or ())}
     original_weight = float(metadata.get("packed_weight_bytes", ZERO_FLOAT) or ZERO_FLOAT)
     cat = str(metadata.get("quant_category", metadata.get("catalog_category", "")) or "")
@@ -190,7 +220,8 @@ def _rewrite_matrix(op: OpSpec, *, gemm_id: str, rows: int, cols: int, reduced: 
     m, n, k = int(rows), int(cols), int(reduced)
     in_b, out_b = float(m * k) * dtype_bytes(act), float(m * n) * dtype_bytes(out)
     orig_m = max(ONE, int(op.local_shape[ZERO]))
-    scale_b = float(metadata.get("activation_scale_bytes", ZERO_FLOAT) or ZERO_FLOAT) * (float(m) / float(orig_m))
+    ratio = float(m) / float(orig_m) if scale_ratio is None else float(scale_ratio)
+    scale_b = float(metadata.get("activation_scale_bytes", ZERO_FLOAT) or ZERO_FLOAT) * ratio
     metadata.update({
         "packed_weight_bytes": local_weight, "weight_bytes": local_weight,
         "activation_scale_bytes": scale_b, "placement_role": role,
@@ -225,6 +256,86 @@ def _empty_passthrough(op: OpSpec, metadata: Mapping[str, Any], width: int) -> O
                    metadata=tuple(sorted(meta.items(), key=lambda pair: pair[FIRST])))
 
 
+def _local_scale_geometry(
+    metadata: Mapping[str, Any], rows: int, local_k: int,
+) -> tuple[tuple[int, ...], float]:
+    """Received-row scale shape and bytes after the input axis is sharded."""
+    shape = tuple(metadata.get("activation_scale_shape") or ())
+    total = float(metadata.get("activation_scale_bytes", ZERO_FLOAT) or ZERO_FLOAT)
+    group = int(metadata.get("activation_group_size") or ZERO)
+    if not shape or total <= ZERO_FLOAT or group <= ZERO:
+        return (), ZERO_FLOAT
+    per_row = total / float(max(ONE, int(shape[ZERO])))
+    old_tail = tuple(int(extent) for extent in shape[ONE:])
+    if not old_tail:
+        # One per-row scale: the received row count is the only change.
+        return (int(rows),), per_row * float(rows)
+    old_elements = ONE
+    for extent in old_tail:
+        old_elements *= extent
+    if len(old_tail) == TWO:
+        pack = max(ONE, old_tail[ONE])
+        groups = (int(local_k) + group - ONE) // group
+        new_tail = ((groups + pack - ONE) // pack, pack)
+    else:
+        new_tail = ((int(local_k) + group - ONE) // group,)
+    elements = ONE
+    for extent in new_tail:
+        elements *= extent
+    per_scale = per_row / float(max(ONE, old_elements))
+    return (int(rows), *new_tail), per_scale * float(elements) * float(rows)
+
+
+def _received_quantizer(op: OpSpec, *, rows: int, local_k: int, full_k: int,
+                        exchange_id: str, width: int) -> OpSpec:
+    """Move one pre-exchange activation quantizer onto the received local rows."""
+    meta = dict(op.metadata)
+    in_dtype = _dtype(meta, "input_format", FALLBACK_ACTIVATION)
+    out_dtype = _dtype(meta, "output_format", op.dtype or in_dtype)
+    old_rows = max(ONE, int(op.local_shape[ZERO]))
+    old_k = max(ONE, int(op.local_shape[ONE]) if len(op.local_shape) > ONE else full_k)
+    ratio = float(rows) * float(local_k) / (float(old_rows) * float(old_k))
+    scale_shape, scale_bytes = _local_scale_geometry(meta, rows, local_k)
+    read = float(rows * local_k) * dtype_bytes(in_dtype)
+    write = float(rows * local_k) * dtype_bytes(out_dtype) + scale_bytes
+    meta.update({
+        "local_tp_applied": True, "local_tp_width": int(width),
+        "local_tp_quantization_scope": "received_expert_input_rows",
+        "local_tp_pre_exchange_dtype": in_dtype,
+        "source_rows": int(rows),
+    })
+    if scale_shape:
+        meta["activation_scale_shape"] = scale_shape
+        meta["activation_scale_bytes"] = scale_bytes
+    pad_rows = align_up(rows, ALIGN_ELEMENT)
+    return replace(
+        op, deps=(exchange_id,),
+        local_shape=(int(rows), int(local_k)), launch_shape=(int(rows), int(local_k)),
+        padded_shape=(pad_rows, align_up(int(local_k), ALIGN_ELEMENT)),
+        semantic_shape=(int(rows), int(local_k)),
+        vector_ops=float(op.vector_ops) * ratio,
+        mte2_bytes=read, mte3_bytes=write, hbm_bytes=read + write, flops=ZERO_FLOAT,
+        metadata=tuple(sorted(meta.items(), key=lambda pair: pair[FIRST])),
+    )
+
+
+def _row_pre_quantizer(op: OpSpec, by_id: Mapping[str, OpSpec],
+                       users: Mapping[str, list[str]]) -> OpSpec | None:
+    """The single pre-GEMM activation quantizer this row matrix consumes."""
+    if len(op.deps) != ONE:
+        return None
+    producer = by_id.get(op.deps[ZERO])
+    if producer is None or producer.plan_required:
+        return None
+    if producer.family not in {"quantize", "rmsnorm_quant"} or len(producer.deps) != ONE:
+        return None
+    if users.get(producer.op_id) != [op.op_id]:
+        return None
+    if str(dict(producer.metadata).get("quantization_scope", "")) == "moe_dispatch_expert_input":
+        return None
+    return producer
+
+
 def lower_local_projection_tp(
     ops: Sequence[OpSpec], *, model: Any, runtime: Any, machine: Any,
     replica: int, cohort_views: Mapping[int, Sequence[Any]], scope: str,
@@ -237,8 +348,30 @@ def lower_local_projection_tp(
     from mindie_sim.prediction.local_tp_groups import validate_local_projection_tp
 
     validate_local_projection_tp(SimpleNamespace(runtime=runtime, machine=machine))
+    by_id = {op.op_id: op for op in ops}
+    users: dict[str, list[str]] = {}
+    for consumer in ops:
+        for dependency in consumer.deps:
+            users.setdefault(dependency, []).append(consumer.op_id)
+    # A row projection that owns a pre-GEMM quantizer is rebuilt as
+    # exchange -> local quantize; the full-axis quantizer is retired before the
+    # walk so its original position never publishes a second payload.
+    retire: set[str] = set()
+    for candidate in ops:
+        candidate_meta = dict(candidate.metadata)
+        candidate_role = _role(candidate_meta)
+        if (not candidate_role
+                or _width(runtime, candidate_role) <= ONE
+                or candidate_meta.get("local_tp_applied")
+                or _partition_kind(candidate_role, candidate_meta) != ROLE_ROW):
+            continue
+        pre = _row_pre_quantizer(candidate, by_id, users)
+        if pre is not None:
+            retire.add(pre.op_id)
     rewritten: list[OpSpec] = []
     for op in ops:
+        if op.op_id in retire:
+            continue
         metadata = dict(op.metadata)
         role, width = _role(metadata), _width(runtime, _role(metadata))
         if not role or width <= ONE or metadata.get("local_tp_applied"):
@@ -291,6 +424,7 @@ def lower_local_projection_tp(
             rewritten.extend((gemm, restore))
         elif partition == ROLE_COLUMN:
             local_n = _packed_local_width(metadata, width, n, quant)
+            replicated_n = _replicated_local_width(metadata, width)
             _localize_packed_slices(metadata, width, quant)
             gather = _collective(op, suffix="gather", family="allgather", recipe="ring_allgather",
                                  payload=float((width - ONE) * pad_tok * k) * dtype_bytes(act), shape=(total_tok, k),
@@ -298,25 +432,54 @@ def lower_local_projection_tp(
             gemm = _rewrite_matrix(op, gemm_id=gemm_id, rows=total_tok, cols=local_n, reduced=k,
                                    role=role, width=width, dep_ids=(gather.op_id,),
                                    weight_ratio=float(local_n) / float(max(ONE, n)), quant=quant, extra_metadata=metadata)
+            # Replicated slices already exist on every owner rank, so the
+            # exchange carries only the column-sharded output features.
+            exchanged_n = max(ZERO, local_n - replicated_n)
             restore = _collective(op, suffix="exchange", family="alltoall", recipe="alltoall",
-                                  payload=float((width - ONE) * pad_tok * local_n) * dtype_bytes(out), shape=(m, n),
+                                  payload=float((width - ONE) * pad_tok * exchanged_n)
+                                          * dtype_bytes(out), shape=(m, n),
                                   role=role, group=group, width=width, deps=(gemm.op_id,), scope=op_scope,
                                   dtype=out, public_id=op.op_id)
             rewritten.extend((gather, gemm, restore))
         else:
+            # ``OProjRowParallelOp``: exchange BF16 shards first, then quantize
+            # the received ``[width*M, K/width]`` locally.  The pre-exchange
+            # quantizer produced on the full input axis is rebuilt, never kept
+            # beside the new local one.
             local_k = _local_dimension(k, width, quant)
+            source = op.deps
+            pre = _row_pre_quantizer(op, by_id, users)
+            exchange_dtype = act
+            if pre is not None:
+                exchange_dtype = _dtype(dict(pre.metadata), "input_format", act)
+                source = pre.deps
             ex = _collective(op, suffix="exchange", family="alltoall", recipe="alltoall",
-                             payload=float((width - ONE) * pad_tok * local_k) * dtype_bytes(act),
+                             payload=float((width - ONE) * pad_tok * local_k)
+                                     * dtype_bytes(exchange_dtype),
                              shape=(total_tok, local_k), role=role, group=group, width=width,
-                             deps=op.deps, scope=op_scope, dtype=act)
+                             deps=source, scope=op_scope, dtype=exchange_dtype)
+            gemm_dep, scale_ratio = ex.op_id, None
+            if pre is not None:
+                requantized = _received_quantizer(
+                    pre, rows=total_tok, local_k=local_k, full_k=k,
+                    exchange_id=ex.op_id, width=width)
+                rewritten.append(ex)
+                rewritten.append(requantized)
+                gemm_dep = requantized.op_id
+                scale_ratio = (float(total_tok) / float(max(ONE, m))
+                               * float(local_k) / float(max(ONE, k)))
             gemm = _rewrite_matrix(op, gemm_id=gemm_id, rows=total_tok, cols=n, reduced=local_k,
-                                   role=role, width=width, dep_ids=(ex.op_id,),
-                                   weight_ratio=float(local_k) / float(max(ONE, k)), quant=quant, extra_metadata=metadata)
+                                   role=role, width=width, dep_ids=(gemm_dep,),
+                                   weight_ratio=float(local_k) / float(max(ONE, k)),
+                                   quant=quant, extra_metadata=metadata,
+                                   scale_ratio=scale_ratio)
             restore = _collective(op, suffix="reduce_scatter", family="reduce_scatter", recipe="ring_reduce_scatter",
                                   payload=float((width - ONE) * pad_tok * n) * dtype_bytes(out), shape=(m, n),
                                   role=role, group=group, width=width, deps=(gemm.op_id,), scope=op_scope,
                                   dtype=out, public_id=op.op_id)
-            rewritten.extend((ex, gemm, restore))
+            if pre is None:
+                rewritten.append(ex)
+            rewritten.extend((gemm, restore))
     return tuple(rewritten)
 
 

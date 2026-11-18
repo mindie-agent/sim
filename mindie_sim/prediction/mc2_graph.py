@@ -28,6 +28,17 @@ EXPLICIT_ROUTING_LOWERINGS = frozenset(
     {"route_pack", "route_unpack", "moe_init_routing"})
 
 
+def _absorbed_quant_mode(routing):
+    """Dispatch payload mode declared by one absorbed init-routing pack."""
+    payload = str(routing.get("payload_format") or "")
+    scale_format = str(routing.get("scale_format") or "")
+    if payload in {"fp8_e4m3", "fp8_e5m2"} and scale_format in {"fp8_e8m0", "e8m0"}:
+        return "mx"
+    if payload == "int8":
+        return "per_token_int8"
+    raise ModelingError("mc2_init_routing_absorption_requires_mx_or_per_token_int8_payload")
+
+
 def _received_quantizer(pack_quant, gate, dispatch_id, rows, width):
     """Keep receiver conversion when native dispatch publishes float rows."""
     from mindie_sim.catalog.ops import vector_op
@@ -218,6 +229,18 @@ def lower(ops, *, runtime, prefix, tokens, top_k, width, experts, ep,
                                    if valid_tokens is not None else tokens)
     send = valid_source_tokens * top_k
     quant = selected.get("dispatch_quant", "none")
+    # ``aclnnMoeInitRoutingV3`` may own the dispatch-input quantization
+    # (``quant_mode=1``) instead of a separate ``pack.quantize`` node.  The
+    # sender then publishes quantized rows and the receiver scales come from
+    # that pack, so no received quantizer is synthesized here.
+    absorbed = dict(pack.metadata).get("moe_init_routing")
+    if absorbed is not None:
+        if pack_quant is not None:
+            raise ModelingError("mc2_init_routing_absorption_conflicts_with_pack_quantizer")
+        absorbed_quant = _absorbed_quant_mode(absorbed)
+        if quant not in {"none", absorbed_quant}:
+            raise ModelingError("mc2_init_routing_absorption_conflicts_with_dispatch_quant")
+        quant = absorbed_quant
     received_quant = None
     if pack_quant is not None and quant == "none" and received_assignments:
         gate = by_id.get(prefix + ".expert_up")
@@ -256,6 +279,8 @@ def lower(ops, *, runtime, prefix, tokens, top_k, width, experts, ep,
             if (not direct or not matched
                     or meta.get("activation_scale_bytes") != received_assignments * layouts[0].scale_bytes):
                 raise ModelingError(f"mc2_{quant}_expert_input_requires_{requirement}_producer")
+            # The fused dispatch owns the absorbed init-routing quantization,
+            # so it publishes both the quantized payload and its scales.
             meta.update(activation_producer="explicit_transport_quantization",
                         activation_payload_producer=dispatch.op_id,
                         activation_scale_producer=dispatch.op_id,
@@ -392,7 +417,8 @@ def lower(ops, *, runtime, prefix, tokens, top_k, width, experts, ep,
             "activation_scale_bytes": received_assignments * layouts[0].scale_bytes,
             "activation_expected_rows": received_assignments,
         }
-        dispatch_returns = tuple(dict.fromkeys((*dispatch_returns, "activation_scales")))
+        if absorbed is None:
+            dispatch_returns = tuple(dict.fromkeys((*dispatch_returns, "activation_scales")))
 
     def native_metadata(kind, raw, kernel, group):
         implementation = (
@@ -432,6 +458,13 @@ def lower(ops, *, runtime, prefix, tokens, top_k, width, experts, ep,
         }
         if kind == "combine":
             metadata["transpose_of_source_assignments"] = True
+        if kind == "dispatch" and absorbed is not None:
+            # ``MoeDistributeDispatchV3`` owns the permutation *and* the
+            # ``aclnnMoeInitRoutingV3`` dynamic quantization (``quant_mode=1``)
+            # in one native call: no separate pack quantizer remains.
+            metadata["moe_init_routing"] = dict(absorbed)
+            metadata["fused_native_kinds"] = ("MoeDistributeDispatchV3",
+                                              absorbed["native_kind"])
         return tuple(metadata.items())
 
     dispatch_op = Work().apply(replace(

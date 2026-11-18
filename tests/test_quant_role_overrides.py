@@ -87,17 +87,29 @@ def test_checkpoint_roles_use_the_same_representation_in_ops_and_weight_terms():
     for op in ops:
         meta = dict(op.metadata)
         category = meta.get("quant_category")
-        if category not in expected:
+        slices = meta.get("packed_projection_slices") or ()
+        categories = ([str(row["category"]) for row in slices] if slices else [category])
+        if not set(categories) & set(expected):
             continue
         term_name, fmt = expected[category]
         terms = layer_weight_terms(case.model.layer_plans[op.layer], case.model)
-        weight = next(term for term in terms if term.name == term_name)
+        by_category = {term.category: term for term in terms}
         assert meta["weight_format"] == fmt
-        assert meta["packed_weight_bytes"] == term_bytes(
-            weight, case.model.quant, case.runtime.parallel)
+        if slices:
+            # One declared shared matrix carries several semantic slices; the
+            # graph bytes must equal the sum of their placed term bytes.
+            frame = sum(term_bytes(by_category[str(row["category"])],
+                                   case.model.quant, case.runtime.parallel)
+                        for row in slices)
+            for row in slices:
+                assert expected[str(row["category"])][1] == meta["activation_format"]
+        else:
+            frame = term_bytes(next(term for term in terms if term.name == term_name),
+                               case.model.quant, case.runtime.parallel)
+        assert meta["packed_weight_bytes"] == frame
         if fmt == "fp8_e4m3":
             assert meta["activation_producer"] == "explicit_quantization"
-        seen.add(category)
+        seen.update(categories)
     assert seen == expected.keys()
     matrices = [op for op in ops if dict(op.metadata).get("quant_category") == "shared_expert"]
     assert matrices

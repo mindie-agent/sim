@@ -31,7 +31,11 @@ def test_complete_source_graph_slices_attention_and_preserves_padded_ffn(batch):
         prefix = f's0.l{layer}'
         ops = [op for op in graph if op.layer == layer]
         is_mla = any(op.recipe == 'q_a' for op in ops)
-        first = by_id[prefix + ('.q_a' if is_mla else '.linear_q')]
+        # The K3 KDA input projections are packed into one declared matrix, so
+        # the shared producer replaces the separate Q projection.
+        name = ('.q_a' if is_mla else
+                '.linear_q' if prefix + '.linear_q' in by_id else '.linear_qkvbfg_a')
+        first = by_id[prefix + name]
         assert first.local_shape[0] == batch
         if not is_mla:
             conv = by_id[prefix + '.short_convolution']
@@ -80,7 +84,8 @@ def test_graph_bucket_rows_are_preserved_but_sp_rows_do_not_reach_attention():
     graph, _ = Frontend().body(parsed.model, parsed.runtime, views, ready='input',
                                tokens=4, mode='decode', global_tokens=8)
     by_id = {op.op_id: op for op in graph}
-    assert by_id['s0.l0.linear_q'].local_shape[0] == 4
+    packed = by_id.get('s0.l0.linear_q') or by_id['s0.l0.linear_qkvbfg_a']
+    assert packed.local_shape[0] == 4
     assert by_id['s0.l3.q_a'].local_shape[0] == 4
     assert by_id['s0.l0.attention.sp_input_view'].local_shape == (4, 7168)
     pad = by_id['s0.l0.linear_reduce.reduce_scatter.pad']

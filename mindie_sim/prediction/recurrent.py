@@ -20,6 +20,7 @@ from .structure_groups import declare_group, source_reference
 from .implementations import select
 from .projections import kda_projections, require_packed_slice
 from .recover_ssm_work import emit_commit_op, record_head_bytes, recover_ssm_enabled
+from .recurrent_kda_helpers import serial_context_parallel, serving_source
 
 POWER_QUADRATIC = 2
 PRODUCT_VECTOR_BYTES = 256
@@ -36,36 +37,6 @@ def _sum_valid_powers(tokens: int, chunk: int, power: int) -> int:
     """Closed form of sum(min(chunk, tokens - i*chunk)**power)."""
     full, remainder = divmod(int(tokens), int(chunk))
     return int(full) * int(chunk) ** int(power) + int(remainder) ** int(power)
-
-
-def _serving_kda_source(runtime, model, views, plan):
-    """Shared A5 KDA source selection for ordinary serving."""
-    from .kda_source import resolve
-    if runtime is None:
-        return None
-    parallel = getattr(runtime, "parallel", None)
-    from mindie_sim.catalog.paired_sfa import execution
-    if (int(getattr(parallel, "cp", ONE) or ONE) > ONE
-            and execution(model).get("recurrent_context_sharded") is not False):
-        return None
-    opts = resolve(plan, arch=dict(runtime.metadata).get("arch_family"),
-                   phase=(views[0].phase if views else ""), kernels=runtime.kernels,
-                   activation_dtype=model.activation_dtype, views=views)
-    if opts is None:
-        return None
-    return select({"kda": {"implementation": "vllm_ascend_recurrent_kda_arch35",
-                           "options": opts}}, "kda")
-
-
-def serial_context_parallel(parallel):
-    """Collapse context parallelism while preserving a declared PCP plan.
-
-    KDA state is head-local, so a serial recurrence is valid under PCP. The
-    parallel spec still requires the matching plan; passing ``cp_plan="none"``
-    with ``pcp > 1`` is an invalid declaration, not a supported fallback.
-    """
-    next_plan = "pcp" if parallel.pcp > ONE else "none"
-    return replace(parallel, cp=ONE, dcp=ONE, cp_plan=next_plan)
 
 
 def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
@@ -103,7 +74,8 @@ def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
     use_recover_ssm = recover_ssm_enabled(runtime)
     rec_bytes = heads * record_head_bytes(dk, dv, model.activation_dtype)
     kda_source = (select(runtime.kernels.get("lowerings", {}), "kda")
-                  if runtime and plan.attention == "kda" else None) or _serving_kda_source(runtime, model, views, plan)
+                  if runtime and plan.attention == "kda" else None
+                  ) or serving_source(runtime, model, views, plan)
     kda_caps = frozenset(getattr(kda_source.module, "CAPABILITIES", ()) if kda_source else ())
     prefill_source = kda_source if kda_caps & {"prefill", "prefill_fwd_h"} else None
     decode_source = kda_source if "decode" in kda_caps else None
@@ -539,7 +511,11 @@ def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         # normalization and gate evaluation, so their old nodes are removed.
         internal_beta = options.get("use_beta_sigmoid", False)
         if projection_group and internal_beta:
-            raise ModelingError("kda_mixed_projection_supplies_preprocessed_beta")
+            # The mixed input-projection caller materializes the FP32 beta
+            # activation itself; the recurrent kernel consumes that producer
+            # instead of applying a second in-kernel sigmoid.
+            internal_beta = False
+            options = {**options, "use_beta_sigmoid": False, "beta_dtype": "fp32"}
         supplied_beta = raw_beta if internal_beta else beta
         beta_dtype = model.activation_dtype if internal_beta else "fp32"
         if options.get("beta_dtype", beta_dtype) != beta_dtype:

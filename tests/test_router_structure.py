@@ -31,7 +31,10 @@ def router_case(mode):
 
 
 @pytest.mark.parametrize("mode,native", [
-    ("hash", "MoeGatingTopKHash"), ("sqrtsoftplus", "MoeGatingTopKHash"),
+    # Only a declared hash table executes the hash gating kernel.  Every
+    # score-based function (sigmoid / softmax / sqrtsoftplus) executes the
+    # score gating kernel and may own its renormalization in-kernel.
+    ("hash", "MoeGatingTopKHash"), ("sqrtsoftplus", "MoeGatingTopK"),
     ("sigmoid", "MoeGatingTopK"),
 ])
 def test_selection_boundary_retains_logits_gemm_and_source_normalization(mode, native):
@@ -61,13 +64,17 @@ def test_selection_boundary_retains_logits_gemm_and_source_normalization(mode, n
     assert cast.mte3_bytes == 4 * 32 * 4
 
 
-@pytest.mark.parametrize("name,retains_copy", [
-    ("v4f-a3-w8a8-tp8", True), ("glm53-a3-w4a8", False),
+@pytest.mark.parametrize("name,dtype,multiplier", [
+    # A retained explicit FP32 declaration keeps its declared operand copy.
+    ("v4f-a3-w8a8-tp8", "fp32", 3),
+    # ``AscendGateLinear`` Tier 4: BF16-resident weights, FP32 accumulation
+    # output, zero precast copy and zero input cast.
+    ("glm53-a3-w4a8", "", 1),
 ])
-def test_router_runtime_precision_preserves_checkpoint_storage(name, retains_copy):
+def test_router_runtime_precision_preserves_checkpoint_storage(name, dtype, multiplier):
     case = catalog(name)
     plan = next(plan for plan in case.model.layer_plans if plan.ffn == "moe")
-    assert plan.router_dtype == "fp32"
+    assert plan.router_dtype == dtype
     baseline = replace(plan, router_dtype="", router_precast_weight_copy=False)
     old = {term.name: term for term in layer_weight_terms(baseline, case.model)}
     new = {term.name: term for term in layer_weight_terms(plan, case.model)}
@@ -76,9 +83,14 @@ def test_router_runtime_precision_preserves_checkpoint_storage(name, retains_cop
     assert source == term_bytes(old["router"], quant, parallel, source=True)
     actual = sum(term_bytes(term, quant, parallel) for key, term in new.items()
                  if key in {"router", "router_precast"})
-    assert actual == source * (3 if retains_copy else 2)
-    if retains_copy:
+    assert actual == source * multiplier
+    if dtype == "fp32":
+        assert plan.router_precast_weight_copy is True
         assert term_bytes(new["router_precast"], quant, parallel, source=True) == 0
+    else:
+        assert plan.router_output_dtype == "fp32"
+        assert plan.router_precast_weight_copy is False
+        assert "router_precast" not in new
 
 
 @pytest.mark.parametrize("name,capture,kind,tokens", [
@@ -103,7 +115,12 @@ def test_real_selection_candidates_preserve_repeated_layers(name, capture, kind,
         pytest.skip(f"retained fusion fixture unavailable: {path}")
     rows = [row for row in kernel_rows(path, rank_id="rank_0", rank_index=0)
             if row.kind == kind and row.input_shapes[0][0] == tokens]
-    groups = [group for group in graph["subgraphs"] if group["role"] == "router_selection"]
+    # A capture only contains the declared kind's rows; a sqrtsoftplus layer
+    # executes score TopK rather than the hash kernel, so select the matching
+    # declared groups instead of requiring every layer to share one kind.
+    groups = [group for group in graph["subgraphs"]
+              if group["role"] == "router_selection"
+              and group["contract"][1] == kind]
     contracts = [json.loads(json.dumps(observed_contract(row))) for row in rows]
     assert groups and rows and all(group["contract"] in contracts for group in groups)
     events = [row.event for row in rows]
@@ -115,8 +132,18 @@ def test_real_selection_candidates_preserve_repeated_layers(name, capture, kind,
         "rank_0", 0, Window(min(e.start_ns for e in events), max(e.end_ns for e in events)),
         None, events, source, QueryStats("rank_0", "router_retained_rows"))
     result = map_structure([observation], graph)
-    assert result["status_counts"] == {"ambiguous": len(events)}
+    # A captured row maps only when the declared boundary shares its kind and
+    # selection mode.  A hash-kind row whose table inputs were not captured is
+    # reported unmapped instead of being attributed to a score-based layer.
+    declared = {(group["contract"][1], group["contract"][2]) for group in groups}
+    unmapped = sum(1 for contract in contracts
+                   if (contract[1], contract[2]) not in declared)
+    expected = ({"ambiguous": len(events)} if not unmapped else
+                {"ambiguous": len(events) - unmapped, "unmapped": unmapped})
+    assert result["status_counts"] == expected
     for row in result["event_mappings"]:
+        if row.get("status") == "unmapped":
+            continue
         assert row["candidate_subgraph_ids"] and not row["subgraph_ids"]
         assert row["structural_classification"]["common"]["role"] == "router_selection"
     assert result["windows"][0]["bound_busy_union_ns"] == 0

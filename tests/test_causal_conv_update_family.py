@@ -43,7 +43,15 @@ def test_complete_frontend_binds_one_active_stateful_kernel_per_kda_layer(batch)
         assert meta['state_write_bytes'] == batch * 3 * 4608 * 2
         assert (meta['state_dtype'], meta['bias'], meta['speculative']) == ('bf16', False, False)
         assert conv.source_boundary == 'kernel'
-        assert conv.deps == (f's0.l{conv.layer}.convolution_input_pack',)
+        # The K3 KDA projections are packed, so the declared Q/K/V slice is the
+        # convolution input; a multi-row strided view materializes exactly that
+        # payload once instead of the old rowwise Q/K/V pack.
+        assert not any(op.recipe == 'convolution_input_pack' for op in ops)
+        incoming = next(op for op in ops if op.op_id == conv.deps[0])
+        projection = f's0.l{conv.layer}.linear_qkvbfg_a'
+        assert incoming.op_id == projection or (
+            incoming.recipe == 'convolution_input_contiguous'
+            and incoming.deps == (projection,))
         core = next(op for op in ops if op.layer == conv.layer and op.recipe == 'vllm_ascend_recurrent_kda_arch35')
         assert conv.op_id in core.deps
         assert dict(core.metadata)['state_dtype'] == 'fp32'
@@ -102,7 +110,7 @@ def test_prepared_weights_are_resident_not_source_checkpoint_or_per_call_cast():
 def test_source_state_write_and_row_pack_conserve_engine_service_after_late_input():
     raw = case(4)
     ops = graph(raw, 4)
-    wanted = [op for op in ops if op.layer == 0 and op.recipe in ('convolution_input_pack', CONV)]
+    wanted = [op for op in ops if op.layer == 0 and op.recipe == CONV]
     external = {dep: 11 for op in wanted for dep in op.deps
                 if dep not in {item.op_id for item in wanted}}
     result = graph_costs(raw, wanted, external_inputs=external)
@@ -112,8 +120,8 @@ def test_source_state_write_and_row_pack_conserve_engine_service_after_late_inpu
     conv = next(op for op in wanted if op.recipe == CONV)
     geometry = Geometry.from_devices(parse_case(raw).machine.dies)
     native = conv_plan(conv, geometry).work.resources
-    expected = native['hbm'] + 2 * 4 * 4608 * 2
-    assert result['execution']['work']['hbm_bytes'] == expected
+    # The packed Q/K/V slice feeds the kernel directly: no extra pack copy.
+    assert result['execution']['work']['hbm_bytes'] == native['hbm']
 
 
 def test_unselected_and_prefill_callers_keep_existing_semantic_convolution():

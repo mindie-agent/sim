@@ -292,9 +292,12 @@ def test_custom_config_root_uses_the_same_native_resolution(tmp_path):
 def test_router_output_and_category_scales_use_the_effective_plan():
     glm = load_model("glm-5.3")
     router = model_value_formats(glm)["matrix_roles"]["router"]
+    # ``moe_router_dtype=float32`` selects ``AscendGateLinear`` Tier 4: BF16
+    # resident weights and a BF16 Cube GEMM accumulate into FP32 logits, so no
+    # FP32 weight copy or input cast exists.
     assert (router["weight_storage"], router["activation"],
             router["compute"], router["output"]) == (
-        "fp32", "fp32", "fp32", "fp32")
+        "bf16", "bf16", "bf16", "fp32")
     moe_layers = tuple(p.index for p in glm.layer_plans if p.ffn == "moe")
     assert router["layers"] == moe_layers
 

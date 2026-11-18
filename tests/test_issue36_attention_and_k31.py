@@ -57,16 +57,19 @@ def _kimi_graph():
     return cached
 
 
-def test_local_projection_pads_to_the_weight_scale_block():
+def test_local_projection_pads_the_split_axis_to_the_weight_scale_block():
     quant = QuantSpec(name="block128", weight_format="fp8_e4m3",
                       activation_format="fp8_e4m3", weight_block=(128, 128))
+    # A row-parallel split cuts the input axis, so its local hint pads to the
+    # weight-scale block; a packed column split keeps exact output features
+    # because the block scale lives on the (never split) input axis.
     assert _local_dimension(512, 8, quant) == 128
     packed = {"packed_projection_slices": ({"shape": (2, 512)},)}
-    assert _packed_local_width(packed, 8, 512, quant) == 128
+    assert _packed_local_width(packed, 8, 512, quant) == 64
     parallel = ParallelSpec(linear_proj_tp=8)
     term = WeightTerm("kda_q", 512, 256, "kda.q", "out_tp", quant=quant,
                       placement_role="linear_input")
-    assert term_bytes(term, quant, parallel) == quant.matrix_bytes(128, 256, "kda.q")
+    assert term_bytes(term, quant, parallel) == quant.matrix_bytes(64, 256, "kda.q")
 
 
 def test_dense_noncausal_topk_keeps_the_smaller_window_cap():

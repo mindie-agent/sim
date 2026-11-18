@@ -182,7 +182,22 @@ def test_kda_decode_source_is_explicit(in_kernel_gates, profiler_api):
         baseline = _report(case, phase="decode", tokens=1, context=32768)
         baseline_groups = [g for g in baseline["subgraphs"] if g["role"] == "kda_recurrent"]
         baseline_nodes = {node["node_id"]: node for node in baseline["nodes"]}
-        assert observed and baseline_groups and all(g["contract"] in observed for g in baseline_groups)
+        # The retained capture predates the in-kernel ``SIGMOID_BETA`` boundary:
+        # its beta operand is the FP32 output of the external sigmoid, while the
+        # A5 source now declares the raw activation-dtype beta.  Compare the
+        # remaining active descriptors and keep the captured boundary explicit.
+        assert all(contract[2][1][1] == "fp32" for contract in observed)
+
+        def with_beta(contract, dtype):
+            active = contract[2]
+            return (contract[0], contract[1],
+                    (active[0], (active[1][0], dtype, active[1][2]), *active[2:]),
+                    *contract[3:])
+
+        observed_kinds = {json.dumps(with_beta(contract, "bf16")) for contract in observed}
+        assert observed and baseline_groups and all(
+            json.dumps(with_beta(g["contract"], "bf16")) in observed_kinds
+            for g in baseline_groups)
         for group in baseline_groups:
             members = [baseline_nodes[key] for key in group["node_ids"]]
             assert all(node["recipe"] not in {"qk_l2norm", "delta_gates"} for node in members)

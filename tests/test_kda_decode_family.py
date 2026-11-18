@@ -38,6 +38,14 @@ def caller(lengths=(1, 4), *, padded=None, dv=128, options=None, phase="decode")
                    machine=replace(case.machine, dies=(die,))), ops
 
 
+def packed_roles(ops):
+    """Packed input producer and its declared role slices."""
+    packed = next(op for op in ops if op.recipe == "linear_qkvbfg_a")
+    slices = {row["role"]: row["shape"]
+              for row in dict(packed.metadata)["packed_projection_slices"]}
+    return packed, slices
+
+
 @pytest.mark.parametrize("dv", (128, 256))
 @pytest.mark.parametrize("internal_beta", (False, True))
 def test_source_replaces_fused_members_once_and_keeps_actual_producers(dv, internal_beta):
@@ -46,13 +54,17 @@ def test_source_replaces_fused_members_once_and_keeps_actual_producers(dv, inter
     kernel = by_recipe[IMPLEMENTATION]
     assert not ({"qk_l2norm", "delta_gates"} & by_recipe.keys())
     assert sum(op.family == "recurrent_scan" for op in ops) == 1
+    # The K3 KDA caller packs its input projections, so the beta operand is
+    # the declared ``b`` slice of the shared matrix; an external activation
+    # adds exactly one sigmoid consumer.
+    packed, slices = packed_roles(ops)
     assert ("linear_beta_sigmoid" in by_recipe) is not internal_beta
-    beta = by_recipe["linear_beta" if internal_beta else "linear_beta_sigmoid"]
+    beta = packed if internal_beta else by_recipe["linear_beta_sigmoid"]
     assert kernel.deps == (by_recipe["short_convolution"].op_id,
                            by_recipe["linear_decay_b"].op_id, beta.op_id)
     # Key-channel gates do not grow when only the value/state width changes.
     assert by_recipe["linear_decay_b"].local_shape == (5, 256, 128)
-    assert by_recipe["linear_gate"].local_shape == (5, 2*dv, 512)
+    assert slices["g"] == (5, 2*dv)
     params = dict(kernel.metadata)["kda_recurrent_params"]
     assert params["lengths"] == (1, 4)
     assert params["beta_dtype"] == ("bf16" if internal_beta else "fp32")
@@ -69,7 +81,9 @@ def test_source_replaces_fused_members_once_and_keeps_actual_producers(dv, inter
 def test_physical_projection_padding_does_not_invent_recurrent_state_updates():
     _, ops = caller((1, 4), padded=16)
     by_recipe = {op.recipe: op for op in ops}
-    assert by_recipe["linear_q"].local_shape[0] == 16
+    packed, slices = packed_roles(ops)
+    assert packed.local_shape[0] == 16
+    assert all(shape[0] == 16 for shape in slices.values())
     assert by_recipe["linear_output"].local_shape[0] == 16
     native = by_recipe[IMPLEMENTATION]
     assert native.local_shape == (5, 2, 128, 128)

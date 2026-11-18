@@ -1,0 +1,299 @@
+"""CANN 9.2.1 fused MoE router selection and init-routing coordination.
+
+[Role]
+  Overlay the declared router selection boundary with the single CANN 9.2.1
+  gating call when an Ascend runtime owns the graph, and fold an EP dispatch
+  quantizer into ``aclnnMoeInitRoutingV3``.  The raw per-operator chain stays in
+  ``passes_ffn_fusion`` and is still emitted for ``raw_eager`` or a direct
+  ``LayerPlan`` declaration.
+
+[Invariants]
+  * The fused call conserves every declared Vector Op of the raw chain and
+    reads the ``[tokens, experts]`` logits exactly once (plus the FP32
+    ``noaux_tc`` correction bias) and writes only ``[tokens, top_k]`` ids and
+    weights; no score, mask or gather round-trip survives.
+  * The structure contract keeps the observed torch operator kind
+    (``MoeGatingTopK`` / ``MoeGatingTopKHash``); the aclnn symbol is declared as
+    the operator's ``native_kind`` and on ``implementation``.
+  * An absorbed init-routing quantizer is billed once on the pack, writes the
+    quantized payload with its scales and leaves no separate quantize node.
+
+[Timeouts & Locks]
+  Pure bounded arithmetic over one layer; no I/O, locks or device work.
+
+[Side-Effect Policy]
+  Emits immutable operator records only.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, replace
+
+from mindie_sim.catalog.ops import vector_op
+from mindie_sim.schema.common import ModelingError
+
+from .passes_ffn_fusion import (
+    CONTRACT_HASH, CONTRACT_SCORE, HASH_ROW_ID_BYTES, HASH_SELECTION_MODE,
+    NOAUX_BIAS_BYTES, ROUTED_SCALE_RECIPE, ROUTE_NORMALIZE_RECIPE,
+    SCORE_SELECTION_MODE,
+    SELECTED_ID_BYTES, declare_router_selection, raw_selection,
+)
+
+HASH_NATIVE_KIND = "aclnnMoeGatingTopKHash"
+SOFTMAX_NATIVE_KIND = "aclnnMoeGatingTopKSoftmaxV2"
+INIT_ROUTING_NATIVE_KIND = "aclnnMoeInitRoutingV3"
+#: One FP32 selected weight per routed slot beside its INT32 id.
+SELECTED_WEIGHT_BYTES = 4
+#: ``quant_mode=1`` carries MXFP8 (group-32 E8M0) or dynamic per-token INT8
+#: (one FP32 row scale); a coarser block-scale FP8 row keeps its own quantizer.
+MX_SCALE_GROUP = 32
+_MX_PAYLOADS = frozenset({"fp8_e4m3", "fp8_e5m2"})
+_E8M0_SCALES = frozenset({"fp8_e8m0", "e8m0"})
+_PER_ROW_SCALES = frozenset({"fp32", "float32"})
+_ROUTING_RECIPES = frozenset({
+    "router_topk", "router_group_topk", "route_normalize", "route_pack",
+    "hash_routing", "router_sigmoid_scores", "router_group_score_top2",
+    "router_group_mask", "router_expert_topk", "router_weight_gather",
+    "router_routed_scale", "router_correction_bias", "moe_gating_topk",
+    INIT_ROUTING_NATIVE_KIND,
+})
+_ROUTING_FAMILIES = frozenset({"topk", "routing", "moe_gating"})
+#: The declared runtime kernel entry that installs the CANN gating overlay.  A
+#: documented production profile binds it; an undeclared runtime keeps the
+#: per-operator decomposition so an unverified launch reduction is never
+#: fabricated.  It is a plain kernel declaration (like ``native_moe_protocol``),
+#: not a lowering binding that would need a registered implementation.
+GATING_SELECTOR = "moe_gating"
+GATING_IMPLEMENTATION = "vllm_ascend_cann_gating"
+_GATING_FIELDS = frozenset({"implementation", "enabled", "native_kind", "source"})
+
+
+@dataclass(frozen=True)
+class Selection:
+    """Declared router selection boundary for one MoE layer."""
+
+    ops: tuple
+    select: object
+    ids_producer: str
+    weights_producer: str | None
+    fused: bool
+    contract_kind: str
+    cann_kind: str
+
+
+def _names(value) -> set:
+    if isinstance(value, dict):
+        return set(value)
+    return set(value or ())
+
+
+def declared_gating(kernels) -> dict | None:
+    """The declared CANN gating overlay entry, or ``None`` when absent."""
+    raw = (kernels or {}).get(GATING_SELECTOR)
+    if raw is None or raw is False:
+        return None
+    if isinstance(raw, str):
+        raw = {"implementation": raw}
+    if not isinstance(raw, dict):
+        raise ModelingError("moe_gating_declaration_requires_mapping_or_name")
+    if set(raw) - _GATING_FIELDS:
+        raise ModelingError("moe_gating_declaration_fields_unknown")
+    name = str(raw.get("implementation") or GATING_IMPLEMENTATION)
+    if name != GATING_IMPLEMENTATION:
+        raise ModelingError(f"moe_gating_declaration_unsupported:{name}")
+    if not bool(raw.get("enabled", True)):
+        return None
+    return dict(raw, implementation=name)
+
+
+def cann_native_active(runtime) -> bool:
+    """True when the Ascend CANN 9.2.1 MoE gating fusion owns this graph.
+
+    The overlay is a *declared* lowering: the runtime must bind
+    ``lowerings["moe_gating"]`` (a documented production profile does) and must
+    not be a raw-eager decomposition or an explicit generic router recipe.
+    """
+    if runtime is None:
+        return False
+    metadata = dict(getattr(runtime, "metadata", ()) or ())
+    policy = dict(metadata.get("execution_policy") or {})
+    if metadata.get("raw_eager") or policy.get("raw_eager"):
+        return False
+    backend = str(policy.get("backend") or metadata.get("backend") or "").lower()
+    if backend and backend != "ascend":
+        return False
+    kernels = getattr(runtime, "kernels", None) or {}
+    if declared_gating(kernels) is None:
+        return False
+    if _names(kernels.get("recipes")) & _ROUTING_RECIPES:
+        return False
+    return not _names(kernels.get("families")) & _ROUTING_FAMILIES
+
+
+def _fused_gating(*, prefix, plan, logits_input, members, stage, requests,
+                  tokens, mode, weight_dtype, weight_bytes, hash_table, noaux_tc):
+    """One ``moe_gating_topk`` call conserving the whole member expression."""
+    experts, selected = int(plan.num_experts), int(plan.top_k)
+    vector = sum(float(member.vector_ops) for member in members)
+    read = float(tokens * experts) * float(weight_bytes)
+    if noaux_tc:
+        read += float(experts * NOAUX_BIAS_BYTES)
+    if hash_table:
+        read += float(tokens) * float(HASH_ROW_ID_BYTES + plan.top_k * SELECTED_ID_BYTES)
+    write = float(tokens * selected) * float(SELECTED_ID_BYTES + SELECTED_WEIGHT_BYTES)
+    return vector_op(
+        op_id=prefix + ".moe_gating_topk", deps=(logits_input,), stage=stage,
+        layer=plan.index, requests=requests, elements=tokens * experts,
+        ops_per_element=0.0, vector_ops_override=vector, dtype="fp32",
+        family="topk", phase=mode, recipe="moe_gating_topk",
+        shape=(tokens, selected),
+        read_bytes_override=read, write_bytes_override=write,
+        returns=("weights", "ids"),
+        metadata=(("native_kind", HASH_NATIVE_KIND if hash_table else SOFTMAX_NATIVE_KIND),
+                  ("input_format", weight_dtype), ("output_format", "fp32"),
+                  ("topk_ids_dtype", "int32"), ("router_weight_dtype", "fp32"),
+                  ("score_function", plan.router_mode),
+                  ("selection_mode", HASH_SELECTION_MODE if hash_table
+                   else SCORE_SELECTION_MODE),
+                  ("fused_from", tuple(member.recipe for member in members)),
+                  ("fused_member_count", len(members)),
+                  ("renorm", bool(plan.router_norm_topk and not hash_table)),
+                  ("noaux_tc", noaux_tc),
+                  ("routed_scaling_factor", float(plan.routed_scaling_factor)),
+                  ("groups", int(plan.router_groups)),
+                  ("group_topk", int(plan.router_group_topk)),
+                  ("top_k", selected), ("num_experts", experts),
+                  *((("correction_bias_elements", experts),
+                     ("correction_bias_bytes", experts * NOAUX_BIAS_BYTES))
+                    if noaux_tc else ()),
+                  ("hash_table_active_rows", tokens if hash_table else 0)),
+    )
+
+
+def _fused_boundary(ops, *, hash_table, noaux_tc):
+    """Index where the one fused gating call ends and external consumers start.
+
+    A hash call has no in-kernel renormalization, so its declared top-k
+    normalization stays an external consumer.  The ``noaux_tc`` chain owns its
+    normalization *and* routed scale in-kernel; every other score gating call
+    owns the renorm and keeps the declared post-selection scale external.
+    """
+    if hash_table:
+        return next((index for index, op in enumerate(ops)
+                     if op.recipe == ROUTE_NORMALIZE_RECIPE), len(ops))
+    if noaux_tc:
+        return len(ops)
+    return len(ops) - int(str(ops[-1].recipe) == ROUTED_SCALE_RECIPE)
+
+
+def build_selection(*, prefix, plan, logits_input, weight_dtype, weight_bytes,
+                    stage, requests, tokens, mode, runtime):
+    """Build the declared selection boundary, fused when Ascend owns the graph."""
+    ops, select, ids_producer, weights_producer = raw_selection(
+        prefix=prefix, plan=plan, logits_input=logits_input,
+        weight_dtype=weight_dtype, weight_bytes=weight_bytes, stage=stage,
+        requests=requests, tokens=tokens, mode=mode)
+    if not ops:
+        return Selection((), select, "", None, False, CONTRACT_SCORE, "")
+    hash_table = plan.router_mode == "hash"
+    noaux_tc = bool(plan.router_noaux_tc) and not hash_table
+    contract = CONTRACT_HASH if hash_table else CONTRACT_SCORE
+    cann_kind = HASH_NATIVE_KIND if hash_table else SOFTMAX_NATIVE_KIND
+    fused = cann_native_active(runtime)
+    if fused:
+        split = _fused_boundary(ops, hash_table=hash_table, noaux_tc=noaux_tc)
+        gating = _fused_gating(
+            prefix=prefix, plan=plan, logits_input=logits_input,
+            members=tuple(ops[:split]), stage=stage, requests=requests,
+            tokens=tokens, mode=mode, weight_dtype=weight_dtype,
+            weight_bytes=weight_bytes, hash_table=hash_table, noaux_tc=noaux_tc)
+        replaced = {op.op_id for op in ops[:split]}
+        tail = [replace(op, deps=tuple(
+            gating.op_id if dependency in replaced else dependency
+            for dependency in op.deps)) for op in ops[split:]]
+        ops = [gating, *tail]
+        select = ops[-1]
+        ids_producer, weights_producer = gating.op_id, select.op_id
+    # A hash call owns no renormalization: its declared top-k normalization is
+    # an external consumer, so it stays outside the kernel boundary.
+    boundary = len(ops)
+    if hash_table:
+        boundary = next((index for index, op in enumerate(ops)
+                         if op.recipe == ROUTE_NORMALIZE_RECIPE), len(ops))
+    declare_router_selection(
+        ops=ops, key=prefix + ".router_selection", plan=plan, tokens=tokens,
+        weight_dtype=weight_dtype, contract_kind=contract, cann_kind=cann_kind,
+        fused=fused, members=tuple(op.op_id for op in ops[:boundary]),
+        entries=(ops[0].op_id,), anchor=ops[boundary - 1].op_id,
+        selection_mode=HASH_SELECTION_MODE if hash_table else SCORE_SELECTION_MODE,
+        noaux_tc=noaux_tc)
+    return Selection(tuple(ops), select, ids_producer, weights_producer, fused,
+                     contract, cann_kind)
+
+
+def dispatch_quantizes_internally(runtime) -> bool:
+    """True when the selected native dispatch owns its own row quantization."""
+    protocol = dict((getattr(runtime, "kernels", None) or {}).get(
+        "native_moe_protocol") or {})
+    if str(protocol.get("kind") or "") != "arch22_v2_caller":
+        return False
+    return str(protocol.get("dispatch_quant") or "none") != "none"
+
+
+def _routing_quantizable(meta) -> bool:
+    """True for the MXFP8 / dynamic INT8 payloads ``quant_mode=1`` publishes."""
+    payload = str(meta.get("output_format") or "")
+    scale = str(meta.get("activation_scale_format") or "")
+    group = int(meta.get("activation_group_size") or 0)
+    if payload in _MX_PAYLOADS:
+        return group == MX_SCALE_GROUP and scale in _E8M0_SCALES
+    if payload == "int8":
+        return scale in _PER_ROW_SCALES
+    return False
+
+
+def absorb_init_routing(*, pack, quantizer, ep, dispatch_owns_quant=False):
+    """Fold one EP dispatch quantizer into ``aclnnMoeInitRoutingV3``.
+
+    The init-routing kernel owns the permutation and the dynamic quantization
+    (``quant_mode=1``): that work and the quantized payload write are billed
+    once on the pack and the separate node is retired.  A dispatch that
+    quantizes received rows itself keeps its declared separate quantizer.
+    """
+    if ep <= 1 or quantizer is None or pack is None or dispatch_owns_quant:
+        return pack, None
+    meta = dict(quantizer.metadata)
+    if str(meta.get("quantization_scope", "")) != "moe_dispatch_expert_input":
+        return pack, None
+    if not _routing_quantizable(meta):
+        return pack, None
+    routing = {
+        "native_kind": INIT_ROUTING_NATIVE_KIND,
+        "quant_mode": 1,
+        "input_format": meta.get("input_format"),
+        "payload_format": meta.get("output_format"),
+        "scale_format": meta.get("activation_scale_format"),
+        "scale_shape": tuple(meta.get("activation_scale_shape") or ()),
+        "scale_bytes": float(meta.get("activation_scale_bytes") or 0.0),
+        "source_rows": float(meta.get("source_rows") or 0.0),
+        "quantizer_op": quantizer.op_id,
+        "vector_ops": float(quantizer.vector_ops),
+        "write_bytes": float(quantizer.mte3_bytes),
+    }
+    read = float(pack.mte2_bytes)
+    write = float(quantizer.mte3_bytes)
+    pack_meta = dict(pack.metadata)
+    pack_meta.update({
+        "native_kind": INIT_ROUTING_NATIVE_KIND,
+        "moe_init_routing": routing,
+        "activation_payload_format": routing["payload_format"],
+        "activation_scale_format": routing["scale_format"],
+        "activation_scale_shape": routing["scale_shape"],
+        "activation_scale_bytes": routing["scale_bytes"],
+        "activation_quantization_scope": "absorbed_dispatch_expert_input",
+    })
+    return replace(
+        pack, recipe="moe_init_routing_v3", family="routing",
+        vector_ops=float(pack.vector_ops) + float(quantizer.vector_ops),
+        mte2_bytes=read, mte3_bytes=write, hbm_bytes=read + write,
+        returns=tuple(dict.fromkeys((*pack.returns, "activation_scales"))),
+        metadata=tuple(pack_meta.items())), quantizer.op_id

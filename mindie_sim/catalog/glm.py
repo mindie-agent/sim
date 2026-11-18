@@ -47,6 +47,21 @@ def _index_pool(c):
                 index_kpool_always_select_tail=tail)
 
 
+#: The checkpoint may declare an FP32 gate matrix.  ``vllm-ascend``'s
+#: ``AscendGateLinear`` Tier 4 keeps the weights BF16 and accumulates the
+#: router GEMM in FP32 (`torch.mm(x, w.t(), out_dtype=torch.float32)`), so the
+#: declaration costs zero input casts and no FP32 weight copy.
+_FP32_ROUTER_DECLARATIONS = frozenset({"float32", "fp32"})
+
+
+def _router_tier4(c: Mapping[str, Any]) -> dict[str, Any]:
+    """Declared router operands for the checkpoint's declared gate precision."""
+    if str(c.get("moe_router_dtype", "")).strip().lower() in _FP32_ROUTER_DECLARATIONS:
+        return {"router_dtype": "", "router_output_dtype": "fp32",
+                "router_precast_weight_copy": False}
+    return {}
+
+
 def _glm_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
     if c.get("layer_types") or c.get("linear_attn_config"):
         return _glm_hybrid_plans(c)
@@ -104,7 +119,6 @@ def _glm_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
             moe_intermediate_size=moe_i if ffn == "moe" else 0,
             num_shared_experts=shared if ffn == "moe" else 0,
             router_input_size=h, router_mode="sigmoid",
-            router_dtype="fp32" if c.get("moe_router_dtype") == "float32" else "",
             router_norm_topk=bool(c.get("norm_topk_prob", False)),
             router_groups=_int(c, "n_group"),
             router_group_topk=_int(c, "topk_group"),
@@ -121,6 +135,7 @@ def _glm_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
             kv_owner_layer_id=index,
             native_layer_id=index, scope="body",
             **_index_pool(c),
+            **_router_tier4(c),
         ))
     return plans
 
@@ -180,7 +195,6 @@ def _glm_hybrid_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
         "num_shared_experts": shared,
         "router_input_size": h,
         "router_mode": "sigmoid",
-        "router_dtype": "fp32" if c.get("moe_router_dtype") == "float32" else "",
         "router_norm_topk": bool(c.get("norm_topk_prob", False)),
         "router_groups": _int(c, "n_group"),
         "router_group_topk": _int(c, "topk_group"),
@@ -189,6 +203,7 @@ def _glm_hybrid_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
         "hc_sinkhorn_iters": hc_iters,
         "native_layer_id": 0,
         "scope": "body",
+        **_router_tier4(c),
     }
     plans: list[LayerPlan] = []
     for index, kind in enumerate(layer_types):
