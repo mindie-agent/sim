@@ -149,11 +149,15 @@ def kv_cache_epilog(op, fmt, region, *, native):
         return op
     kind = KV_COMPRESS_EPILOG if fmt.dtype != op.dtype else KV_SCATTER_EPILOG
     width = int(op.local_shape[1]) if len(op.local_shape) > 1 else 0
+    metadata = dict(op.metadata)
+    row_bytes = (metadata.get("cache_row_bytes")
+                 or dict(metadata.get("cache_representation") or {}).get("row_bytes")
+                 or fmt.row_bytes(width)) if width else 0
     return replace(op, family=KV_COMPRESS_EPILOG_FAMILY, metadata=op.metadata + (
         ("native_kind", kind),
         ("cache_epilog", {
             "kind": kind, "region": region,
-            "row_bytes": fmt.row_bytes(width) if width else 0,
+            "row_bytes": row_bytes,
             "quantized_payload_dtype": fmt.dtype,
             "scale_dtype": fmt.scale_dtype,
             "group_size": fmt.group_size,

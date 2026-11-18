@@ -66,6 +66,11 @@ class Geometry:
     buffers: Mapping[str, int] = field(default_factory=dict)
     buffer_units: Mapping[str, int] = field(default_factory=dict)
     physical_mechanisms: object = None
+    #: Declared per-second pipe rates and precision peaks.  A planner that must
+    #: screen the same mapping the executor will select needs the same declared
+    #: physical supply; these are source hardware facts, not observations.
+    rates: Mapping[str, float] = field(default_factory=dict)
+    compute_peaks: Mapping[str, float] = field(default_factory=dict)
 
     @classmethod
     def from_devices(cls, devices):
@@ -81,6 +86,8 @@ class Geometry:
             {pool: min(dict(device.buffers)[pool] for device in devices) for pool in pools},
             {pool: first.pool_units(pool) for pool in pools},
             first.physical_mechanisms,
+            dict(first.rates),
+            dict(first.compute_peaks),
         )
 
 

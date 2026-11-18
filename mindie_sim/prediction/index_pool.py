@@ -83,19 +83,38 @@ def row_shard_tp(*, options=None, runtime=None):
 
 
 def row_shard_partition(views, divisor):
-    """Contiguous request range owned by the representative local-TP rank.
+    """Contiguous query-row range owned by the representative local-TP rank.
 
     Query rows and per-request sequence metadata move together, so the local
-    rank scores `ceil(tokens / divisor)` rows and `ceil(batch / divisor)`
-    sequences. `divisor == 1` is the replicated caller and changes nothing.
+    rank scores `ceil(tokens / divisor)` rows. `divisor == 1` is the replicated
+    caller and changes nothing.  A single multi-row request is split at the row
+    boundary instead of handing the whole request to one rank.
     """
     views = tuple(views)
     if isinstance(divisor, bool) or not isinstance(divisor, int) or divisor < 1:
         raise ModelingError("index_pool_row_shard_divisor_invalid")
     if divisor == 1 or not views:
         return views
-    owned = max(1, -(-len(views) // divisor))
-    return views[:owned]
+    total_rows = sum(max(0, int(view.q_len)) for view in views)
+    if total_rows <= 0:
+        owned = max(1, -(-len(views) // divisor))
+        return views[:owned]
+    target_rows = max(1, -(-total_rows // divisor))
+    owned, remaining = [], target_rows
+    for view in views:
+        take = min(max(0, int(view.q_len)), remaining)
+        if take <= 0:
+            continue
+        if take < int(view.q_len):
+            ranges = getattr(view, "query_ranges", None)
+            view = (replace(view, q_len=take, query_ranges=tuple(
+                (lo, min(hi, take)) for lo, hi in ranges if lo < take))
+                if ranges else replace(view, q_len=take))
+        owned.append(view)
+        remaining -= take
+        if remaining <= 0:
+            break
+    return tuple(owned)
 
 
 def _selection_for(view, plan):

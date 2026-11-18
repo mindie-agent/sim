@@ -82,6 +82,11 @@ def _partition_global_tokens(shared_global, region_rows):
     return tuple(partitions)
 
 
+def _cohort_source_rows(views):
+    """Routed source rows a view set owns on one physical EP replica."""
+    return sum(int(view.q_len) + int(view.draft_proposal_tokens) for view in views)
+
+
 def _scope(ops, block, role="body"):
     """The composing builder owns scope; operator names do not identify it."""
     return [replace(op, metadata=tuple({
@@ -306,6 +311,7 @@ class Frontend:
              mode="prefill", global_tokens=None, stages=None, replica=ZERO,
              features=None, source_rows_by_replica=None,
              routing_global_tokens=None, routing_views=None,
+             cohort_views_by_replica=None,
              physical_rank=None, query_position=None,
              include_recover_commits: bool = False, machine=None,
              dbo_partition: int | None = None, layer_limit: int | None = None,
@@ -351,6 +357,12 @@ class Frontend:
                         for view in region.views) for region in regions)
                 partition_globals = _partition_global_tokens(
                     shared_global, region_rows)
+                peer_regions = (
+                    tuple(tuple(build_microbatch_regions(
+                        peer_views, policy=MicrobatchPolicy(
+                            count=MIN_DBO_MICROBATCHES)))
+                          for peer_views in cohort_views_by_replica)
+                    if cohort_views_by_replica is not None else None)
                 for region, region_rows_value, partition_global in zip(
                         regions, region_rows, partition_globals):
                     region_ids = {view.request_id for view in region.views}
@@ -358,6 +370,26 @@ class Frontend:
                         tuple(view for view in routing_views
                               if view.request_id in region_ids) or None
                         if routing_views is not None else None)
+                    partition_source_rows = source_rows_by_replica
+                    if peer_regions is not None:
+                        parts = tuple(
+                            tuple(view for peer_region in peer_plan
+                                  if peer_region.index == region.index
+                                  for view in peer_region.views)
+                            for peer_plan in peer_regions)
+                        partition_source_rows = tuple(
+                            _cohort_source_rows(part) for part in parts)
+                        partition_routing = tuple(
+                            view for part in parts for view in part) or None
+                        partition_global = sum(partition_source_rows)
+                    elif cohort_rows:
+                        count = len(regions)
+                        partition_source_rows = tuple(
+                            region_rows_value
+                            if peer == replica and sum(region_rows) == cohort_rows[peer]
+                            else (cohort_rows[peer] + count - ONE - region.index) // count
+                            for peer in range(len(cohort_rows)))
+                        partition_global = sum(partition_source_rows)
                     part_ops, part_last = self.body(
                         model, runtime, region.views,
                         prefix=f"{prefix}dbo{region.index}.",
@@ -369,7 +401,7 @@ class Frontend:
                                        else global_tokens),
                         stages=stages,
                         replica=replica, features=features,
-                        source_rows_by_replica=source_rows_by_replica,
+                        source_rows_by_replica=partition_source_rows,
                         routing_global_tokens=partition_global,
                         routing_views=partition_routing,
                         physical_rank=physical_rank,
@@ -846,6 +878,7 @@ class Frontend:
     def __call__(self, plan, model, runtime, machine, *, global_tokens=None, global_views=None,
                  resource_fusion=None, replica=ZERO, source_rows_by_replica=None,
                  routing_global_tokens=None, routing_views=None,
+                 cohort_views_by_replica=None,
                  physical_rank=None, query_position=None, assembly="service",
                  dispatch_binding=None, dispatch_fast_step: bool = False):
         # ``dispatch_binding`` is the T14 PP/EP microbatch envelope (original
@@ -1000,6 +1033,7 @@ class Frontend:
                                    source_rows_by_replica=source_rows_by_replica,
                                    routing_global_tokens=routing_global_tokens,
                                    routing_views=eff_routing_views,
+                                   cohort_views_by_replica=cohort_views_by_replica,
                                    physical_rank=physical_rank,
                                    query_position=eff_query_pos,
                                    include_recover_commits=(assembly == "service" or any(

@@ -273,7 +273,8 @@ def _prefix_groups(shape, sequences):
 
     Only requests naming the same non-empty ``prefix_cache_key`` share one
     immutable region; two distinct keys are two cold fills even when their
-    extents are equal.
+    extents are equal.  A declared key with no peer in this batch owns no
+    shared row, so it is a private request like any other.
     """
     raw = shape.get("prefix_tokens", 0) or 0
     extents = tuple(raw) if isinstance(raw, tuple) else (int(raw),) * len(sequences)
@@ -287,13 +288,18 @@ def _prefix_groups(shape, sequences):
         if prefix > 0 and (key or not declared_keys):
             # An undeclared key keeps the legacy single shared region; a
             # declared key names the region requests may reuse.
-            groups.setdefault(key, []).append((int(query), int(context), prefix))
+            groups.setdefault(key, []).append(
+                (index, int(query), int(context), prefix))
         else:
-            private.append((int(query), int(context), prefix))
+            private.append((index, int(query), int(context), prefix))
+    if declared_keys:
+        for key in tuple(groups):
+            if len(groups[key]) == 1:
+                private.extend(groups.pop(key))
     return groups, private
 
 
-def prefix_partition(shape, sequences, topk):
+def prefix_partition(shape, sequences, topk, *, sequence_keys=False):
     """Split one selection into its physical shared union and private rows.
 
     A shared prefix key names one immutable region, so requests naming that
@@ -303,27 +309,38 @@ def prefix_partition(shape, sequences, topk):
     """
     rows = sum(query for query, _ in sequences)
     if not rows or not topk:
-        return 0, 0, topk
+        result = (0, 0, topk)
+        return (result + (tuple(topk for _ in sequences),)
+                if sequence_keys else result)
     if str(shape.get("prefix_cache_mode", "private")) != "shared" or not (
             shape.get("prefix_tokens") or 0):
         # No shared pool: every row is that request's own cold read.
-        return 0, rows * topk, 0
+        result = (0, rows * topk, 0)
+        return (result + (tuple(topk for _ in sequences),)
+                if sequence_keys else result)
     groups, private_requests = _prefix_groups(shape, sequences)
+    private_keys_by_seq = [topk for _ in sequences]
     shared_rows = 0
-    private_rows = sum(query * topk for query, _context, _prefix in private_requests)
+    private_rows = sum(query * topk
+                       for _sequence, query, _context, _prefix in private_requests)
     shared_selected = 0
     for members in groups.values():
         fill = sparse_prefix_fill(
-            rows=sum(query for query, _context, _prefix in members),
+            rows=sum(query for _sequence, query, _context, _prefix in members),
             requests=len(members), selected=topk,
-            prefix_tokens=max(prefix for _query, _context, prefix in members),
-            context=max(context for _query, context, _prefix in members))
+            prefix_tokens=max(prefix for _s, _q, _c, prefix in members),
+            context=max(context for _s, _q, context, _p in members))
         shared_rows += fill.shared_unique
         private_rows += fill.private_rows
         shared_selected = max(shared_selected, fill.shared_selected)
+        for sequence, _query, _context, _prefix in members:
+            private_keys_by_seq[sequence] = topk - fill.shared_selected
     if not groups:
-        return 0, rows * topk, 0
-    return shared_rows, private_rows, shared_selected
+        result = (0, rows * topk, 0)
+    else:
+        result = (shared_rows, private_rows, shared_selected)
+    return (result + (tuple(private_keys_by_seq),)
+            if sequence_keys else result)
 
 
 def arch35_plan(shape, geometry, *, tile_size=None, slots=None):
@@ -347,27 +364,30 @@ def arch35_plan(shape, geometry, *, tile_size=None, slots=None):
             or C8_TILE_SLOTS * kv_slot_bytes > geometry.buffers.get("l1", 0)
             or C8_TILE_SLOTS * accumulator_bytes > geometry.buffers.get("l0c", 0)):
         raise ModelingError("arch35_c8_requires_two_kv_and_accumulator_slots_per_owner")
-    shared_rows, private_rows, shared_selected = prefix_partition(
-        shape, sequences, topk)
+    shared_rows, private_rows, _shared_selected, private_keys_by_seq = (
+        prefix_partition(shape, sequences, topk, sequence_keys=True))
     row_bytes = packed_row_bytes(rope)
     external = shared_rows * row_bytes
-    private_keys = topk - shared_selected
     counts = {}
     for parts in streams:
-        for _sequence, tiles in parts:
+        for sequence, tiles in parts:
             for key in tiles:
-                counts[key] = counts.get(key, 0) + 1
+                counts[(sequence, key)] = counts.get((sequence, key), 0) + 1
     call_work = Work()
-    for key, count in counts.items():
-        for _name, work, _after in _tile_phases(key, heads, latent, rope,
-                                                private_keys, topk):
+    for (sequence, key), count in counts.items():
+        for _name, work, _after in _tile_phases(
+                key, heads, latent, rope, private_keys_by_seq[sequence], topk):
             call_work += work.scaled(count)
     fill = Work(resources={"hbm": external} if external else {})
+    stats_bytes = int(shape.get("statistics_bytes", 0) or 0)
+    stats_work = (Work(resources={"hbm": stats_bytes, "mte3": stats_bytes})
+                  if stats_bytes > 0 else Work())
     shape = {**shape, "waves": -(-sum(q for q, _ in sequences) // compute_units)}
     return OperatorPlan(
-        call_work.scaled(paired) + fill,
+        call_work.scaled(paired) + fill + stats_work,
         _arch35_program(streams, heads, latent, rope, kv_slot_bytes,
-                        accumulator_bytes, fill, paired, private_keys, topk),
+                        accumulator_bytes, fill, paired,
+                        private_keys_by_seq, topk, stats_work),
         _arch35_metadata(shape, external, private_rows, sequences, tile_size,
                          slots, paired))
 
@@ -380,13 +400,14 @@ def _tile_phases(key, heads, latent, rope, private_keys, topk):
 
 
 def _arch35_program(streams, heads, latent, rope, kv_slot_bytes, accumulator_bytes,
-                    fill, paired, private_keys, topk):
+                    fill, paired, private_keys_by_seq, topk, stats_work):
     """Cold prefix fill once, then the declared paired query-owner programs."""
     def program(context):
         context = bind_sustained_dram(context)
 
         def one(owner, parts):
-            flat = tuple(tile for _sequence, tiles in parts for tile in tiles)
+            flat = tuple((sequence, tile) for sequence, tiles in parts
+                         for tile in tiles)
             allocations = tuple(
                 [context.allocate(f"c8kv{owner}_{index}", "l1", kv_slot_bytes, (owner,))
                  for index in range(C8_TILE_SLOTS)]
@@ -395,8 +416,9 @@ def _arch35_program(streams, heads, latent, rope, kv_slot_bytes, accumulator_byt
                    for index in range(C8_TILE_SLOTS)])
 
             @lru_cache(maxsize=OWNER_TILE_CACHE_SIZE)
-            def stages(key):
+            def stages(sequence, key):
                 result = []
+                private_keys = private_keys_by_seq[sequence]
                 for name, work, after in _tile_phases(
                         key, heads, latent, rope, private_keys, topk):
                     roles = set(work.resources) | ({"cube"} if work.matrix else set())
@@ -414,7 +436,7 @@ def _arch35_program(streams, heads, latent, rope, kv_slot_bytes, accumulator_byt
             return KernelProgram((
                 Stage("reserve", acquire=allocations),
                 Stage("tiles", after=("reserve",), program=PipelineProgram(
-                    len(flat), C8_TILE_SLOTS, lambda index: stages(flat[index]))),
+                    len(flat), C8_TILE_SLOTS, lambda index: stages(*flat[index]))),
                 Stage("release", after=("tiles",), free=allocations)))
 
         call = ParallelProgram(tuple(one(owner, parts)
@@ -422,7 +444,12 @@ def _arch35_program(streams, heads, latent, rope, kv_slot_bytes, accumulator_byt
         calls = tuple(Stage(f"call{index}", after=(
             ("prefix_fill",) if index == 0 else (f"call{index - 1}",)), program=call)
             for index in range(paired))
-        return KernelProgram((Stage("prefix_fill", work=context.bind(fill)), *calls))
+        stages = (Stage("prefix_fill", work=context.bind(fill)), *calls)
+        if stats_work.resources:
+            stages = (*stages, Stage(
+                "lse_statistics", work=context.bind(stats_work),
+                after=(f"call{paired - 1}",)))
+        return KernelProgram(stages)
 
     return program
 

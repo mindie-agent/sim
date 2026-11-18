@@ -446,6 +446,7 @@ def absorb_init_routing(*, pack, quantizer, ep, dispatch_owns_quant=False):
     routing["inverse_index_bytes"] = inverse_bytes
     read = float(pack.mte2_bytes)
     write = float(quantizer.mte3_bytes) + inverse_bytes
+    routing["write_bytes"] = write
     pack_meta = dict(pack.metadata)
     pack_meta.update({
         "native_kind": INIT_ROUTING_NATIVE_KIND,

@@ -209,13 +209,15 @@ def _check_arch35_domain(plan, quant, parallel, keys):
 def _view_completed_keys(view, ratio):
     """Compressed keys one request's populated cache holds.
 
-    ``compress_ratio <= 1`` is the dense non-compressed indexer: every context
-    token is a completed key, so no division by zero is introduced.
+    Causal completion counts the appended query tokens, and a compressed key
+    exists only after a whole ``ratio`` group completes. ``ratio <= 1`` is the
+    dense non-compressed indexer: every context and query token is a key.
     """
-    context = max(0, int(getattr(view, "context", 0) or 0))
+    total = (max(0, int(getattr(view, "context", 0) or 0))
+             + max(0, int(getattr(view, "q_len", 0) or 0)))
     if ratio <= 1:
-        return context if context > 0 else max(1, int(view.q_len))
-    return -(-context // ratio) if context > 0 else max(1, -(-int(view.q_len) // ratio))
+        return total
+    return total // ratio
 
 
 def _candidate_keys(views, ratio):
@@ -236,13 +238,13 @@ def _candidate_keys(views, ratio):
         prefix = max(0, min(int(getattr(view, "prefix_tokens", 0) or 0), context))
         token = str(getattr(view, "prefix_cache_key", "") or "")
         if prefix and token:
-            shared_keys = min(keys, prefix if ratio <= 1 else -(-prefix // ratio))
+            shared_keys = min(keys, prefix if ratio <= 1 else (prefix // ratio))
             shared[token] = max(shared.get(token, 0), shared_keys)
             private += max(0, keys - shared_keys)
         else:
             private += keys
     payload = sum(shared.values()) + private
-    scan = max(largest, max(shared.values(), default=0), 1)
+    scan = max(largest, max(shared.values(), default=0))
     return scan, max(1, payload)
 
 

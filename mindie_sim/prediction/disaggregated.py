@@ -347,11 +347,17 @@ def _pd_handoff_binding(request, tokens, placement, cases, memory, execution,
                     and _published_for(published, "prefill", request,
                                        layer.index, "gqa_v") is not None)
         for component in sorted(components):
+            window = int(getattr(layer, "window", 0) or 0)
+            windowed = component == "window" or (
+                component in {"gqa_kv", "mla_kv"} and window > 0)
+            window_start = max(0, tokens - window) if windowed else 0
             if component in gqa_components:
                 for dest_index, dest_rank, dest_values, dest_tokens in dst_views:
                     need = float(dest_values.get(component, 0.0))
                     dspan = target_spans[dest_index % max(1, len(target_spans))]
                     d_lo, d_hi = dest_tokens
+                    if windowed:
+                        d_lo, d_hi = max(window_start, d_lo), min(tokens, d_hi)
                     if (need <= 0.0 or dspan[1] <= dspan[0]
                             or d_hi <= d_lo):
                         continue
@@ -368,6 +374,9 @@ def _pd_handoff_binding(request, tokens, placement, cases, memory, execution,
                         if not common:
                             continue
                         s_lo, s_hi = src_tokens
+                        if windowed:
+                            s_lo, s_hi = (max(window_start, s_lo),
+                                          min(tokens, s_hi))
                         lo, hi = max(s_lo, d_lo), min(s_hi, d_hi)
                         if hi <= lo:
                             continue
@@ -419,10 +428,16 @@ def _pd_handoff_binding(request, tokens, placement, cases, memory, execution,
             host_done = False
             for dest_index, dest_rank, dest_values, dest_tokens in dst_views:
                 need = float(dest_values.get(component, 0.0))
+                if windowed:
+                    dest_tokens = (max(window_start, dest_tokens[0]),
+                                   min(tokens, dest_tokens[1]))
                 dst_storage = f"pd:kv:{request}:decode:r{decode_rep}:rank{dest_rank}"
                 if offload and component == "mla_kv" and layer.index in offload_layers:
                     if not host_done:
                         src_index, src_rank, src_values, src_tokens = src_views[0]
+                        if windowed:
+                            src_tokens = (max(window_start, src_tokens[0]),
+                                          min(tokens, src_tokens[1]))
                         host_payload = float(src_values.get("mla_kv", 0.0))
                         if host_payload > 0.0:
                             host_storage = (f"pd:host:{request}:decode:"
@@ -442,6 +457,9 @@ def _pd_handoff_binding(request, tokens, placement, cases, memory, execution,
                     hot = need * hot_ratio
                     if hot > 0.0:
                         src_index, src_rank, src_values, src_tokens = src_views[0]
+                        if windowed:
+                            src_tokens = (max(window_start, src_tokens[0]),
+                                          min(tokens, src_tokens[1]))
                         emit(src_rank, dest_rank, component, hot,
                              source_stage=source_stage,
                              destination_stage=destination_stage,
@@ -459,6 +477,9 @@ def _pd_handoff_binding(request, tokens, placement, cases, memory, execution,
                 for src_index, src_rank, src_values, src_tokens in src_views:
                     if remaining <= 1e-9:
                         break
+                    if windowed:
+                        src_tokens = (max(window_start, src_tokens[0]),
+                                      min(tokens, src_tokens[1]))
                     available = float(src_values.get(component, 0.0))
                     take = min(available, remaining)
                     if take <= 0.0:

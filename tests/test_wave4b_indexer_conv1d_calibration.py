@@ -507,15 +507,15 @@ def test_arch35_and_arch22_recipes_coexist_and_route_by_representation():
     ledger = dict(op.metadata)[sp.QUANT_LEDGER]
     assert op.recipe == fq.ARCH35_RECIPE
     assert ledger == {"query_rows": 960, "wave_rows": sp.INDEXER_WAVE_ROWS,
-                      "waves": 30, "blocks": 32, "heads": INDEX_HEADS,
-                      "width": INDEX_WIDTH, "keys": 32768,
-                      "completed_keys": 32768,
+                      "waves": 30, "blocks": 33, "heads": INDEX_HEADS,
+                      "width": INDEX_WIDTH, "keys": 33792,
+                      "completed_keys": 32769,
                       # Every private request owns its own compressed cache.
-                      "payload_keys": 160 * 32768,
+                      "payload_keys": 160 * 32769,
                       "key_row_bytes": INDEX_ROW_BYTES,
                       "output_bytes": float(960 * INDEX_TOPK * 4)}
     assert dict(op.matrix_flops) == {
-        "fp8_e4m3": 2.0 * 960 * INDEX_HEADS * 32768 * INDEX_WIDTH}
+        "fp8_e4m3": 2.0 * 960 * INDEX_HEADS * 32769 * INDEX_WIDTH}
     view = dict(op.metadata)["native_tensor_view"]
     assert view["quant_mode"] == 1
     assert view["kind"] == "aclnn_quant_lightning_indexer_v2_arch35"
@@ -632,9 +632,10 @@ def test_bf16_and_fp16_index_operands_never_select_the_quantized_fusion():
 def test_arch35_zero_compression_and_completed_key_flops():
     # A dense non-compressed indexer must not divide by compress_ratio == 0.
     dense = _arch35_op_for(0, (RequestView("r", 1, 1, False, "decode"),))
-    assert dict(dense.metadata)[sp.QUANT_LEDGER]["completed_keys"] == 1
-    assert dense.flops == 2 * 1 * INDEX_HEADS * 1 * INDEX_WIDTH == 8192
-    # Ratio 4 / context 4 completes one key, not the padded 1,024-key tile.
+    assert dict(dense.metadata)[sp.QUANT_LEDGER]["completed_keys"] == 2
+    assert dense.flops == 2 * 2 * INDEX_HEADS * 1 * INDEX_WIDTH == 16384
+    # Ratio 4 / context 4 plus the query row completes one key, not the padded
+    # 1,024-key tile.
     sparse = _arch35_op_for(4, (RequestView("r", 1, 4, False, "decode"),))
     ledger = dict(sparse.metadata)[sp.QUANT_LEDGER]
     assert ledger["completed_keys"] == 1
@@ -648,9 +649,9 @@ def test_arch35_private_cache_payload_is_charged_once_on_hbm_and_mte2():
              RequestView("b", 1, 1024, False, "decode"))
     op = _arch35_op_for(1, views)
     ledger = dict(op.metadata)[sp.QUANT_LEDGER]
-    assert ledger["completed_keys"] == 1024
-    assert ledger["payload_keys"] == 2048
-    payload = 2 * 1024 * INDEX_ROW_BYTES
+    assert ledger["completed_keys"] == 1025
+    assert ledger["payload_keys"] == 2050
+    payload = 2 * 1025 * INDEX_ROW_BYTES
     assert payload >= 262144
     assert op.hbm_bytes >= payload
     assert op.mte2_bytes >= payload
@@ -660,7 +661,7 @@ def test_arch35_private_cache_payload_is_charged_once_on_hbm_and_mte2():
                RequestView("b", 1, 2048, False, "decode", prefix_tokens=1024,
                            prefix_cache_key="shared_a"))
     partial_ledger = dict(_arch35_op_for(1, partial).metadata)[sp.QUANT_LEDGER]
-    assert partial_ledger["payload_keys"] == 1024 + 2 * 1024 == 3072
+    assert partial_ledger["payload_keys"] == 1024 + 2 * 1025 == 3074
 
 
 def test_keypool_row_shard_has_no_negative_dummy_rows():
@@ -673,8 +674,9 @@ def test_keypool_row_shard_has_no_negative_dummy_rows():
                   runtime=_Runtime(o_proj_tp=LOCAL_TP))
     meta = dict(next(op for op in builder.ops
                      if op.recipe == ipn.POOL_KEY_RECIPE).metadata)
+    # Six query rows shard to one row per local-TP rank.
     assert (meta["valid_query_rows"], meta["padded_query_rows"],
-            meta["native_query_rows"]) == (6, 6, 7)
+            meta["native_query_rows"]) == (1, 1, 2)
     assert meta["dummy_request_queries"] == 1
 
 

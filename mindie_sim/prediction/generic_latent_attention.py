@@ -17,7 +17,9 @@ import math
 from mindie_sim.catalog.attention_common import (
     _causal_pairs, _long_selected_pairs, active_dcp_degree, min_positive,
 )
-from mindie_sim.catalog.cache import completed_rows, index_row_bytes
+from mindie_sim.catalog.cache import (
+    completed_rows, index_row_bytes, packed_region_row_bytes,
+)
 from mindie_sim.catalog.cache_format import CacheFormat, cache_format
 from mindie_sim.catalog.context_parallel import (
     dsa_cp_token_ranges, owned_positions, split_causal_pairs, split_pcp_pairs,
@@ -784,9 +786,9 @@ def window_cache_read(plan, view, parts, sweeps, eff_cp, query_tile, elements, m
         for start in range(0, q_part, query_tile)
     ) if plan.window else 0
     full = (
-        original_rows * cache_format(model, "window").row_bytes(elements)
-        + (sweeps - original_rows) * cache_format(
-            model, "compressed_kv").row_bytes(elements))
+        original_rows * packed_region_row_bytes(model, "window", elements)
+        + (sweeps - original_rows) * packed_region_row_bytes(
+            model, "compressed_kv", elements))
     return full / eff_cp
 
 
@@ -856,9 +858,10 @@ def attention_tensor_view(plan, view, heads, model, quant, parallel, *, eff_cp=N
                 "kind": "mixed_quant_shared_kv", "query_shape": query, "output_shape": query,
                 "query_dtype": model.activation_dtype, "output_dtype": model.activation_dtype,
                 "cache_representations": regions,
-                "original_cache_row_bytes": cache_format(model, "window").row_bytes(plan.head_dim),
-                "compressed_cache_row_bytes": cache_format(
-                    model, "compressed_kv").row_bytes(plan.head_dim),
+                "original_cache_row_bytes": packed_region_row_bytes(
+                    model, "window", plan.head_dim),
+                "compressed_cache_row_bytes": packed_region_row_bytes(
+                    model, "compressed_kv", plan.head_dim),
                 "cache_head_shape": (1, plan.head_dim),
                 "cache_dtype": cache_format(model, "window").dtype,
                 "compressed_cache": plan.compress_ratio > 0,

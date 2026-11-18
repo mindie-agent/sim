@@ -234,7 +234,8 @@ def _check_draft_preparation(case, phase, scope, enabled):
 def _target_ops(case, views, scope, *, global_views=None, resource_fusion=True,
                 cohort_tokens=None, phase=None, replica=0, active_rows=None,
                 source_rows_by_replica=None, routing_global_tokens=None,
-                routing_views=None, physical_rank=None, query_position=None,
+                routing_views=None, cohort_views_by_replica=None,
+                physical_rank=None, query_position=None,
                 model_programs=None, layer_limit=None):
     from mindie_sim.schema.workload import IterationPlan
     from .attention import AttentionPolicy
@@ -257,7 +258,9 @@ def _target_ops(case, views, scope, *, global_views=None, resource_fusion=True,
             global_views=global_views, resource_fusion=resource_fusion,
             replica=replica, source_rows_by_replica=source_rows_by_replica,
             routing_global_tokens=routing_global_tokens,
-            routing_views=routing_views, physical_rank=physical_rank,
+            routing_views=routing_views,
+            cohort_views_by_replica=cohort_views_by_replica,
+            physical_rank=physical_rank,
             query_position=query_position)
         if model_programs is not None:
             model_programs[replica] = program
@@ -298,6 +301,7 @@ def _target_ops(case, views, scope, *, global_views=None, resource_fusion=True,
                           source_rows_by_replica=source_rows_by_replica,
                           routing_global_tokens=routing_global_tokens,
                           routing_views=routing_views,
+                          cohort_views_by_replica=cohort_views_by_replica,
                           physical_rank=physical_rank,
                           query_position=query_position,
                           machine=case.machine, layer_limit=layer_limit)
@@ -481,6 +485,7 @@ def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
     # DP-scoped and the lowering keeps its declared uniform peer policy.
     source_rows_by_replica = tuple(
         active_rows_by_replica[p] for p in participants)
+    cohort_views_by_replica = tuple(logical_views[p] for p in participants)
     routing_global_tokens = (
         padded_cohort if padded_cohort is not None
         else (sum(active_rows_by_replica.values())
@@ -558,6 +563,7 @@ def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
             source_rows_by_replica=source_rows_by_replica,
             routing_global_tokens=routing_global_tokens,
             routing_views=_routing_views_for(routing_views, first_r),
+            cohort_views_by_replica=cohort_views_by_replica,
             physical_rank=_physical_rank_for(case, first_r, cohort_topology),
             query_position=query_position,
             model_programs=model_programs, layer_limit=layer_limit,
@@ -590,6 +596,7 @@ def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
                            source_rows_by_replica=source_rows_by_replica,
                            routing_global_tokens=routing_global_tokens,
                            routing_views=_routing_views_for(routing_views, r),
+                           cohort_views_by_replica=cohort_views_by_replica,
                            physical_rank=_physical_rank_for(case, r, cohort_topology),
                            query_position=query_position,
                            model_programs=model_programs,

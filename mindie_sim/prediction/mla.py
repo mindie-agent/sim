@@ -13,7 +13,7 @@ from dataclasses import replace
 from mindie_sim.catalog.attention_common import (
     AttentionResult, _group_plan, active_dcp_degree, dcp_partial_merge_ops,
 )
-from mindie_sim.catalog.cache import completed_rows
+from mindie_sim.catalog.cache import completed_rows, packed_region_row_bytes
 from mindie_sim.schema.common import dtype_bytes, ModelingError
 from .batch_prefix_attention import (
     annotate_sparse_prefix_unknown, apply_attention_prefix_reads,
@@ -265,8 +265,8 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         else:
             # The gather moves stored rows, including their declared scale or
             # packed suffix, not a bare activation-dtype payload.
-            kv_row = cache_format(model, cache_region).row_bytes(
-                plan.cache_row_elements)
+            kv_row = packed_region_row_bytes(
+                model, cache_region, plan.cache_row_elements)
         store = b.communicate(
             "pcp_kv_gather", (produced,),
             rows * kv_row * (parallel.pcp - 1) / parallel.pcp,
@@ -335,8 +335,8 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                     - completed_rows(view.context, ratio)
                     for view in views if view.phase == "prefill")
                 if global_comp_rows > 0:
-                    comp_row_bytes = cache_format(
-                        model, "compressed_kv").row_bytes(plan.cache_row_elements)
+                    comp_row_bytes = packed_region_row_bytes(
+                        model, "compressed_kv", plan.cache_row_elements)
                     long_store = b.communicate(
                         "pcp_compressed_kv_gather", (long_store,),
                         global_comp_rows * comp_row_bytes
@@ -345,8 +345,8 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         else:
             rows = sum(completed_rows(view.kv_len, ratio) for view in views)
             long_store = owner(cache_ids, plan.kv_owner_layer_id, "compressed_cache",
-                               rows * cache_format(model, "compressed_kv").row_bytes(
-                                   plan.cache_row_elements) / max(1, cp))
+                               rows * packed_region_row_bytes(
+                                   model, "compressed_kv", plan.cache_row_elements) / max(1, cp))
 
     pool_binding = (select(runtime.kernels.get("lowerings", {}), "pool_key_indexer")
                     if runtime and plan.index_kpool > 1 else None)

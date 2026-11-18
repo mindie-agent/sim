@@ -253,8 +253,8 @@ def test_ep_dispatch_quantizer_is_absorbed_into_init_routing_once():
     # permutation remains an auxiliary output of the same pack.
     routed_slots = pack.local_shape[0] * pack.local_shape[1]
     assert routing["inverse_index_bytes"] == pytest.approx(routed_slots * 4)
-    assert pack.mte3_bytes == pytest.approx(
-        routing["write_bytes"] + routing["inverse_index_bytes"])
+    # ``write_bytes`` names the complete pack store, including the inverse map.
+    assert pack.mte3_bytes == pytest.approx(routing["write_bytes"])
     gate = next(op for op in ops if op.family == "grouped_gemm")
     gate_metadata = dict(gate.metadata)
     # The pack publishes the quantized payload plus scales; the dispatch that

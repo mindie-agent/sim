@@ -515,6 +515,24 @@ def build(op, geometry):
     })
 
 
+def _external_prefix_groups(shape, sequences):
+    """Physical shared-prefix groups, matching indexed_quant_attention."""
+    raw = shape.get("prefix_tokens", 0) or 0
+    extents = tuple(raw) if isinstance(raw, tuple) else (int(raw),) * len(sequences)
+    keys = tuple(shape.get("prefix_cache_keys") or ())
+    declared = bool(keys)
+    groups: dict[str, list] = {}
+    private = []
+    for index, (query, context) in enumerate(sequences):
+        prefix = max(0, min(int(extents[index]), int(context)))
+        key = str(keys[index]) if index < len(keys) else ""
+        if prefix > 0 and (key or not declared):
+            groups.setdefault(key, []).append((int(query), int(context), prefix))
+        else:
+            private.append((int(query), int(context), prefix))
+    return groups, private, declared
+
+
 def quant_external_fill(shape, quant_mode):
     """Cold external KV bytes: resident window ring plus compressed rows."""
     rows = tuple(query_rows(shape))
@@ -522,13 +540,13 @@ def quant_external_fill(shape, quant_mode):
         return 0, 0
     row_bytes = quant_row_bytes(quant_mode)
     sequences = tuple(shape.get("sequences", ())) or ((len(rows), 0),)
-    requests = len(sequences)
     window = int(shape.get("window", 0) or 0)
-    queries = sum(int(query) for query, _context in sequences)
     # The window ring keeps the last ``window`` distinct rows of the appended
     # sequence; a short context holds ``context + q_len`` rows, never a tile.
-    original = (sum(min(window, int(context) + int(query))
-                    for query, context in sequences) if window else 0)
+    original = (sum(min(int(context) + int(query),
+                        window + max(0, int(query) - 1))
+                    for query, context in sequences if int(query) > 0)
+                if window else 0)
     ratio = int(shape.get("ratio", 0) or 0)
     topk = int(shape.get("topk", 0) or 0)
     # One compressed row completes per ``ratio`` raw tokens; the TopK list
@@ -540,20 +558,62 @@ def quant_external_fill(shape, quant_mode):
     capacity = [min(topk, value) if topk else value for value in completed]
     compressed = 0
     shared_rows = 0
-    prefix = shape.get("prefix_tokens", 0) or 0
-    prefix = max(prefix) if isinstance(prefix, tuple) else int(prefix)
+    raw_prefix = shape.get("prefix_tokens", 0) or 0
+    prefix = max(raw_prefix) if isinstance(raw_prefix, tuple) else int(raw_prefix)
     shared = (str(shape.get("prefix_cache_mode", "private")) == "shared"
               and prefix > 0)
-    if topk and shared:
-        # The compressed prefix union is one cold fill; the private suffixes
-        # of each request are separate rows.
-        fill = sparse_prefix_fill(
-            rows=queries, requests=requests, selected=min(topk, max(completed)),
-            prefix_tokens=prefix // max(1, ratio),
-            context=max(1, max(completed)))
-        compressed, shared_rows = fill.external_rows, fill.shared_unique
+    if shared and (topk or ratio):
+        groups, private, declared = _external_prefix_groups(shape, sequences)
+        if topk:
+            # The compressed prefix union is one cold fill; the private
+            # suffixes of each request are separate rows.  A completed prefix
+            # shorter than one compression group shares no compressed row.
+            for members in groups.values():
+                member_completed = [
+                    (context + query) // ratio if ratio else context + query
+                    for query, context, _prefix in members]
+                group_shared = (len(members) > 1
+                                or (not declared and len(sequences) > 1))
+                p_comp = max(prefix for _q, _c, prefix in members) \
+                    // max(1, ratio)
+                if group_shared and p_comp > 0:
+                    fill = sparse_prefix_fill(
+                        rows=sum(query for query, _c, _p in members),
+                        requests=len(members),
+                        selected=min(topk, max(member_completed)),
+                        prefix_tokens=p_comp,
+                        context=max(1, max(member_completed)))
+                    compressed += fill.external_rows
+                    shared_rows += fill.shared_unique
+                else:
+                    compressed += sum(
+                        min(topk, value) for value in member_completed)
+            for query, context, _prefix in private:
+                compressed += min(
+                    topk, (context + query) // ratio if ratio else context + query)
+        else:
+            # Dense HCA: a shared group reads its completed prefix rows once
+            # and each member keeps the rows beyond that prefix.
+            for members in groups.values():
+                member_completed = [
+                    (context + query) // ratio
+                    for query, context, _prefix in members]
+                group_shared = (len(members) > 1
+                                or (not declared and len(sequences) > 1))
+                if group_shared:
+                    prefix_rows = [
+                        min(value, prefix // max(1, ratio))
+                        for value, (_q, _c, prefix) in zip(
+                            member_completed, members)]
+                    compressed += max(prefix_rows) + sum(
+                        value - shared_value for value, shared_value
+                        in zip(member_completed, prefix_rows))
+                else:
+                    compressed += sum(member_completed)
+            for query, context, _prefix in private:
+                compressed += (context + query) // ratio
     elif topk or ratio:
-        compressed = max(capacity) if shared else sum(capacity)
+        compressed = sum(capacity)
     return (original + compressed) * row_bytes, shared_rows
 
 

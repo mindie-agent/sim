@@ -17,6 +17,7 @@ from math import ceil
 from collections import deque
 import json
 
+from mindie_sim.catalog.cache import cache_row_split, packed_region_row_bytes
 from mindie_sim.catalog.cache_format import cache_format
 from mindie_sim.catalog.ops import cache_store_op
 from mindie_sim.prediction.cache_execution import (
@@ -137,10 +138,27 @@ def _access_metadata(result, resolution, fmt, row_bytes, geometry, region, *,
     return tuple(metadata)
 
 
+def _packed_row_layout(model, region, width, fmt):
+    """Physical row width and source-side rotary tail bytes for one region.
+
+    The arch35 MQSMLA Mode-1/2 row stores a BF16 rotary tail beyond the
+    logical FP8 width.  The extra elements are read from the producer as well,
+    so the source row grows by that tail while the packed write keeps the
+    declared physical width.
+    """
+    row_bytes = packed_region_row_bytes(model, region, width)
+    tail_bytes = 0
+    format_bytes = fmt.row_bytes(width)
+    if row_bytes > format_bytes:
+        payload, _scale = cache_row_split(model, region, width)
+        tail_bytes = max(0, int(payload) - int(width))
+    return row_bytes, tail_bytes
+
+
 def _legacy_store(builder, name, deps, rows, width, region, fmt):
     """Preserve the pre-cache-level byte semantics of an undeclared call."""
     common = builder.common
-    row_bytes = fmt.row_bytes(width)
+    row_bytes, tail_bytes = _packed_row_layout(builder.model, region, width, fmt)
     stored = rows * row_bytes
     legacy = (
         ("cache_resolution", "legacy_no_cache_declaration"),
@@ -164,7 +182,8 @@ def _legacy_store(builder, name, deps, rows, width, region, fmt):
         )
         builder.add(op)
         return op.op_id
-    source = rows * width * dtype_bytes(builder.model.activation_dtype)
+    source = rows * (width * dtype_bytes(builder.model.activation_dtype)
+                     + tail_bytes)
     groups = ceil(width / fmt.group_size)
     op = OpSpec(
         op_id=builder.prefix + "." + name, family="cache_store",
@@ -193,9 +212,10 @@ def _legacy_store(builder, name, deps, rows, width, region, fmt):
 def _store_cache_aware(builder, name, deps, rows, width, region, fmt, *,
                        state, geometry, identity, policy, source_residency):
     common = builder.common
-    row_bytes = fmt.row_bytes(width)
+    row_bytes, tail_bytes = _packed_row_layout(builder.model, region, width, fmt)
     stored = rows * row_bytes
-    source = rows * width * dtype_bytes(builder.model.activation_dtype)
+    source = rows * (width * dtype_bytes(builder.model.activation_dtype)
+                     + tail_bytes)
     groups = ceil(width / fmt.group_size) if fmt.group_size else 0
     resolved_state, resolution = _resolve_state(builder, state, geometry)
     access_identity, cold = _identity(identity, region)
@@ -260,7 +280,8 @@ def _store_cache_aware(builder, name, deps, rows, width, region, fmt, *,
 def _load_cache_aware(builder, name, deps, rows, width, region, fmt, *,
                       state, geometry, identity, policy):
     common = builder.common
-    row_bytes = fmt.row_bytes(width)
+    row_bytes, _tail_bytes = _packed_row_layout(
+        builder.model, region, width, fmt)
     stored = rows * row_bytes
     resolved_state, resolution = _resolve_state(builder, state, geometry)
     access_identity, cold = _identity(identity, region)
@@ -514,7 +535,8 @@ class CacheLowering:
               offset_bytes=0, stride_bytes=None, page_bytes=0, packing=1,
               partial_line="masked", source_port=""):
         fmt = cache_format(self.builder.model, region)
-        row_bytes = fmt.row_bytes(width)
+        row_bytes, _tail_bytes = _packed_row_layout(
+            self.builder.model, region, width, fmt)
         static = CacheState(self.state.geometry)
         store(self.builder, name, deps, rows, width, region, state=static,
               identity=identity, write_policy="write_through",
@@ -555,7 +577,8 @@ class CacheLowering:
              offset_bytes=0, stride_bytes=None, page_bytes=0, packing=1,
              partial_line="masked", source_port=""):
         fmt = cache_format(self.builder.model, region)
-        row_bytes = fmt.row_bytes(width)
+        row_bytes, _tail_bytes = _packed_row_layout(
+            self.builder.model, region, width, fmt)
         static = CacheState(self.state.geometry)
         load(self.builder, name, deps, rows, width, region, state=static,
              identity=identity, bypass=bypass, ready_ms=ready_ms)

@@ -132,8 +132,9 @@ def declare(ops, *, prefix, plan, model, parallel, quant, tokens, members,
     # one FP32 scale per row (or no scale at all without an index consumer).
     query_norm_scale_dtype = "fp8_e8m0" if mxfp8_query else "fp32"
     query_norm_scale_shape = (
-        (tokens, plan.q_lora_rank // E8M0_GROUP_SIZE) if mxfp8_query
-        else ((tokens, 1) if query_norm_output else ()))
+        () if not query_norm_output
+        else (tokens, plan.q_lora_rank // E8M0_GROUP_SIZE) if mxfp8_query
+        else (tokens, 1))
     source = SOURCE
     if mxfp8_query:
         source = SOURCE_V4

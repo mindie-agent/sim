@@ -455,12 +455,14 @@ def owned_block_rows(rows: int, block: int, cp: int, rank: int) -> int:
     return int(owned)
 
 
-def owned_token_rows(rows: int, owner_spans, rank: int) -> int | None:
+def owned_token_rows(rows: int, owner_spans, rank: int, *,
+                     start: int = 0) -> int | None:
     """Rows owned by ``rank`` from an explicit half-open token partition.
 
     ``owner_spans`` is the T05 placement fact: one ``(start, end)`` token row
     interval per physical rank.  The result is the intersection with the
-    component's valid row span, not ``rows / cp``.
+    component's valid row span, not ``rows / cp``.  ``start`` moves the valid
+    span to a live sliding-window tail instead of always beginning at zero.
     """
     if owner_spans is None:
         return None
@@ -469,9 +471,11 @@ def owned_token_rows(rows: int, owner_spans, rank: int) -> int | None:
     if not 0 <= rank < len(spans):
         raise ModelingError(f"cache_owner_rank_out_of_range:{rank}")
     rows = max(0, int(rows))
-    covered = sum(max(0, min(rows, hi) - min(rows, lo)) for lo, hi in spans)
+    begin = max(0, int(start))
+    end = begin + rows
+    covered = sum(max(0, min(end, hi) - max(begin, lo)) for lo, hi in spans)
     lo, hi = spans[rank]
-    owned = int(max(0, min(rows, hi) - min(rows, lo)))
+    owned = int(max(0, min(end, hi) - max(begin, lo)))
     if rows > covered and rank == len(spans) - 1:
         # A declared partition that does not cover the requested span still
         # has to account for the extra rows.  Charge them to the last owner
@@ -517,9 +521,9 @@ def layer_cache_components(model, plan, parallel, sequence_tokens, *, capacity_p
     seq = max(0, int(sequence_tokens))
     tp, cp = parallel.tp, parallel.cp
     result = {}
-    def local_rows(rows, block=interleave):
+    def local_rows(rows, block=interleave, *, start=0):
         if rank is not None:
-            owned = owned_token_rows(rows, owner_spans, rank)
+            owned = owned_token_rows(rows, owner_spans, rank, start=start)
             if owned is not None:
                 return owned
             if capacity_padded:
@@ -546,17 +550,21 @@ def layer_cache_components(model, plan, parallel, sequence_tokens, *, capacity_p
     if plan.attention in {"gqa", "projection_only"}:
         if not ZERO <= plan.kv_owner_layer_id < plan.index:
             rows = min(seq, plan.window) if plan.window else seq
+            start = max(ZERO, seq - rows) if plan.window else ZERO
             width = TWO * local_kv_heads(plan.num_kv_heads, tp) * plan.head_dim
-            result["gqa_kv"] = local_rows(rows) * cache_format(
+            result["gqa_kv"] = local_rows(rows, start=start) * cache_format(
                 model, "gqa_kv").row_bytes(width)
     elif plan.attention != "mla":
         raise ModelingError(f"cache_attention_unknown:{plan.attention}")
     elif plan.cache_kind == "dense":
         rows = min(seq, plan.window) if plan.window else seq
-        result["mla_kv"] = local_rows(rows) * cache_format(model, "mla_kv").row_bytes(plan.cache_row_elements)
+        start = max(ZERO, seq - rows) if plan.window else ZERO
+        result["mla_kv"] = local_rows(rows, start=start) * cache_format(model, "mla_kv").row_bytes(plan.cache_row_elements)
     else:
         if plan.window:
-            result["window"] = local_rows(min(seq, plan.window)) * packed_region_row_bytes(
+            rows = min(seq, plan.window)
+            result["window"] = local_rows(
+                rows, start=max(ZERO, seq - rows)) * packed_region_row_bytes(
                 model, "window", plan.cache_row_elements)
         if plan.owns_long_kv:
             result["compressed_kv"] = local_rows(
@@ -577,10 +585,14 @@ def layer_cache_components(model, plan, parallel, sequence_tokens, *, capacity_p
             rows = local_rows(rows, max(ONE, interleave // index_ratio))
         elif parallel.cp_plan == "dsa_cp":
             if rank is not None:
+                cp_rank = (int(rank) % max(ONE, int(cp))
+                           if owner_spans is not None else int(rank))
+                if not ZERO <= cp_rank < cp:
+                    raise ModelingError(f"cache_owner_rank_out_of_range:{rank}")
                 rows = (
-                    index_k_owned_block_rows(rows, cp, index_ratio)[int(rank)]
+                    index_k_owned_block_rows(rows, cp, index_ratio)[cp_rank]
                     if capacity_padded else
-                    index_k_ownership_rows(rows, cp, index_ratio)[int(rank)]
+                    index_k_ownership_rows(rows, cp, index_ratio)[cp_rank]
                 )
             else:
                 rows = index_k_capacity_rows(rows, cp, index_ratio) if capacity_padded else rows / cp

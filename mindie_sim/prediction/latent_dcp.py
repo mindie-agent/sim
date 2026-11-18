@@ -24,7 +24,8 @@ PACK_LSE_OPS = 4
 FP8_FORMATS = frozenset({"fp8", "fp8_e4m3", "fp8_e5m2"})
 #: Packed INT8 latent rows carry the C8 tile-128 sparse kernel.
 PACKED_CACHE_DTYPES = frozenset({"int8"})
-#: C8 kernel domain: 512 latent values and a 0/64-element BF16 rotary tail.
+#: C8 kernel domain: 512 latent values, one FP32 scale per 128, BF16 rope tail.
+PACKED_C8_GROUP_SIZE = 128
 PACKED_C8_LATENT = 512
 PACKED_C8_ROPE = frozenset({0, 64})
 #: Declared native call split of one gathered-head DCP decode: two sequential
@@ -63,15 +64,25 @@ def paired_sfa_calls(heads):
     return (heads // PAIRED_SFA_CALLS,) * PAIRED_SFA_CALLS
 
 
-def packed_sfa_geometry(meta, heads, plan, views, cp, *, cache_dtype=""):
+def packed_sfa_geometry(meta, heads, plan, views, cp, *, cache_dtype="",
+                        cache_fmt=None):
     """Packed-C8 geometry of the declared paired calls, or ``None``.
 
     Each call keeps the same selected rows and cache; only the gathered head
     half changes, so the pair costs two sequential tile walks over one cache.
+    A plain INT8 MLA row is not the C8 tile-128 representation and must not
+    select the packed kernel.
     """
     view = dict(meta.get("attention_tensor_view") or {})
     dtype = str(view.get("cache_dtype") or cache_dtype or "")
     if dtype not in PACKED_CACHE_DTYPES:
+        return None
+    if cache_fmt is not None and not (
+            cache_fmt.dtype == "int8"
+            and cache_fmt.group_size == PACKED_C8_GROUP_SIZE
+            and cache_fmt.scale_dtype == "fp32"
+            and cache_fmt.suffix_elements == int(plan.qk_rope_head_dim)
+            and cache_fmt.suffix_dtype == "bf16"):
         return None
     if (heads % PAIRED_SFA_CALLS or plan.cache_row_elements <= 0
             or int(plan.kv_lora_rank) != PACKED_C8_LATENT
@@ -125,7 +136,7 @@ def attention_batch(b, outputs, views, *, plan, heads, local_heads, cp, rows):
     resolved = cache_format(b.model, "mla_kv")
     fp8 = resolved.dtype in FP8_FORMATS and plan.indexer
     packed = (packed_sfa_geometry(meta, heads, plan, views, cp,
-                                  cache_dtype=resolved.dtype)
+                                  cache_dtype=resolved.dtype, cache_fmt=resolved)
               if plan.indexer else None)
     native_packed = fp8 or packed is not None
     if native_packed and (b.model.activation_dtype != "bf16"
@@ -152,6 +163,10 @@ def attention_batch(b, outputs, views, *, plan, heads, local_heads, cp, rows):
     shape = (sum(view.q_len for view in views), heads, plan.kv_lora_rank)
     out_bytes = dtype_bytes(b.model.activation_dtype)
     statistics = rows * heads * TWO * FP32_BYTES
+    if packed is not None:
+        # The paired C8 calls also write the FP32 LSE statistics the output
+        # pack reads.  Carry the exact declared volume into the arch35 plan.
+        packed["statistics_bytes"] = statistics
     meta.update({
         "qsfa_output_bytes": rows * (packed["heads"] if packed else heads)
         * (plan.kv_lora_rank * out_bytes + TWO * FP32_BYTES),

@@ -311,14 +311,15 @@ def test_mqsmla_swa_window_is_private_and_shared_topk_union_is_cold_fill():
     swa = {"sequences": ((6, 131072),) * 160, "window": 128, "ratio": 0, "topk": 0}
     external, shared_rows = quant_external_fill(swa, KV_QUANT_FP8)
     assert shared_rows == 0
-    # The window ring holds only the last 128 distinct rows, not window + q_len.
-    assert external == 160 * 128 * 608
+    # The causal window advances across the six query rows: the distinct ring
+    # is ``window + q_len - 1`` rows, not a frozen window-sized tile.
+    assert external == 160 * 133 * 608
     csa = {"sequences": ((6, 131072),) * 160, "window": 128, "ratio": 2,
            "topk": 512, "prefix_cache_mode": "shared",
            "prefix_tokens": tuple([124518] * 160)}
     external, shared_rows = quant_external_fill(csa, KV_QUANT_FP8)
     assert shared_rows == 124518 // 2
-    assert external == (160 * 128 + 124518 // 2 + 160 * 26) * 608
+    assert external == (160 * 133 + 124518 // 2 + 160 * 26) * 608
     assert quant_external_fill(dict(csa, prefix_cache_mode="private"),
                                KV_QUANT_FP8)[0] > external
 
@@ -400,9 +401,11 @@ def test_c8_shared_prefix_identity_decides_cold_fill_deduplication():
     same = {**base, "prefix_cache_mode": "shared",
             "prefix_tokens": (128, 128), "prefix_cache_keys": ("A", "A")}
     distinct = {**same, "prefix_cache_keys": ("A", "B")}
-    # One physical region for (A, A); two cold regions for (A, B).
+    # One physical region for (A, A); (A, B) has two private cold regions.
     assert prefix_partition(same, sequences, 128) == (128, 0, 128)
-    assert prefix_partition(distinct, sequences, 128) == (256, 0, 128)
+    assert prefix_partition(distinct, sequences, 128) == (0, 256, 0)
+    assert prefix_partition(distinct, sequences, 128,
+                            sequence_keys=True) == (0, 256, 0, (128, 128))
     geometry = Geometry.from_devices(parse_case(_c8_case(SKUS[0][1])).machine.dies)
     shared = build_packed(replace(op, metadata=(
         ("indexed_attention_geometry", same),)), geometry,
@@ -411,7 +414,10 @@ def test_c8_shared_prefix_identity_decides_cold_fill_deduplication():
         ("indexed_attention_geometry", distinct),)), geometry,
         scratch_policy="offchip", schedule=SCHEDULE_ARCH35)
     assert shared.metadata["c8_schedule"]["external_fill_bytes"] == 128 * 656
-    assert cold.metadata["c8_schedule"]["external_fill_bytes"] == 2 * 128 * 656
+    # A distinct-key request shares no physical row, so its cold volume is
+    # charged by its own tiles rather than by the shared prefix fill.
+    assert cold.metadata["c8_schedule"]["external_fill_bytes"] == 0
+    assert cold.metadata["c8_schedule"]["private_rows"] == 256
 
 
 def test_mqsmla_cold_kv_is_capped_by_resident_window_and_completed_rows():

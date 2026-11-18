@@ -33,7 +33,6 @@ from . import deepep, moe_transport, moe_token_partition
 ZERO = 0
 ONE = 1
 TWO = 2
-ZERO_FLOAT = 0.0
 INVERSE_INDEX_DTYPE = "int32"
 
 
@@ -340,17 +339,7 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
                 dispatch_owns_quant=dispatch_quantizes_internally(runtime))
             if cann_native_active(runtime) else (packing, None))
         if retired is not None:
-            # ``aclnnMoeInitRoutingV3`` also writes one INT32 inverse token-slot
-            # index per routed assignment, which the combine must read back.
-            inverse_index_bytes = payload_tokens * plan.top_k * dtype_bytes(INVERSE_INDEX_DTYPE)
-            packing_metadata = dict(absorbed_pack.metadata)
-            routing_meta = dict(packing_metadata.get("moe_init_routing") or ())
-            routing_meta["write_bytes"] = float(routing_meta.get("write_bytes", ZERO_FLOAT)) + inverse_index_bytes
-            packing_metadata.update(moe_init_routing=routing_meta, inverse_index_dtype=INVERSE_INDEX_DTYPE,
-                                    inverse_index_bytes=float(inverse_index_bytes))
-            packing = replace(absorbed_pack, metadata=tuple(packing_metadata.items()),
-                              mte3_bytes=float(absorbed_pack.mte3_bytes) + inverse_index_bytes,
-                              hbm_bytes=float(absorbed_pack.hbm_bytes) + inverse_index_bytes)
+            packing = absorbed_pack
             ops[-1] = packing
             last = packing.op_id
             absorbed_routing = packing
