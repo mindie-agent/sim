@@ -1037,6 +1037,59 @@ def occurrence_critical_path(graph_report: Mapping[str, Any] | None,
     }
 
 
+OCCURRENCE_DAG_SCHEMA = "mindie-sim.occurrence-dag/1"
+
+
+def _export_occurrence_dag(graph):
+    """Serialize the realized occurrence DAG as public node/edge rows.
+
+    The object graph stays available through ``_retain_graph`` for internal
+    callers; this immutable form lets a returned public baseline be passed
+    back to :func:`evaluate_target_efficiency` without losing predecessors or
+    physical resource identities.  Each row is a positional tuple so the
+    exported report stays compact.
+    """
+    if graph is None:
+        return None
+    return {
+        "schema": OCCURRENCE_DAG_SCHEMA,
+        "nodes": tuple((
+            str(node.node_id),
+            float(node.cube_ms), float(node.vector_ms),
+            float(node.hbm_ms), float(node.link_ms),
+            float(node.launch_ms), float(node.fixed_ms),
+            tuple(str(before) for before in node.predecessors),
+            int(node.occurrences),
+            tuple((str(resource), str(identity))
+                  for resource, identity in node.resource_ids),
+        ) for node in graph.nodes),
+        "edges": tuple((str(before), str(after))
+                       for before, after in graph.edges),
+    }
+
+
+def _occurrence_dag_graph(payload):
+    """Rebuild the realized occurrence DAG from its public node/edge form."""
+    if not isinstance(payload, Mapping):
+        return None
+    if payload.get("schema") != OCCURRENCE_DAG_SCHEMA:
+        return None
+    nodes = tuple(PhysicalWorkNode(
+        node_id=str(row[0]),
+        cube_ms=float(row[1]), vector_ms=float(row[2]),
+        hbm_ms=float(row[3]), link_ms=float(row[4]),
+        launch_ms=float(row[5]), fixed_ms=float(row[6]),
+        predecessors=tuple(str(before) for before in row[7]),
+        occurrences=int(row[8]),
+        resource_ids=tuple((str(resource), str(identity))
+                           for resource, identity in row[9]),
+    ) for row in payload.get("nodes", ()))
+    return PhysicalWorkGraph(
+        nodes,
+        tuple((str(before), str(after))
+              for before, after in payload.get("edges", ())))
+
+
 def analyze_network_efficiency(
     case: CaseSpec | Mapping[str, Any], *, phase: str = "decode", tokens: int = DEFAULT_TOKENS, context: int = DEFAULT_CONTEXT, sequences: int = DEFAULT_SEQUENCES, scope: str = "body",
     operator_report: Mapping[str, Any] | None = None, graph_report: Mapping[str, Any] | None = None,
@@ -1159,6 +1212,13 @@ def analyze_network_efficiency(
         "operator_serial_roofline_efficiency": serial_roof_id / max(operator_sum_ms, EPSILON), "network_cv_overlap": network_cv_overlap,
         "breakdown_by_family": sorted([{"family": f, "recipe": r, **_agg(items)} for (f, r), items in fam_g.items()], key=lambda r: -r["total_ms"]),
         "breakdown_by_bound": {b: _agg(bound_g.get(b, ())) for b in _BOUNDS}, "breakdown_by_kind": {k: _agg(kind_g.get(k, ())) for k in _KINDS}, "operators": analyzed_ops,
+        # Target re-evaluation consumes this public DAG; keeping it out of the
+        # returned baseline would force a caller (or a serialized report) to
+        # rebuild a flattened graph without the realized dependency edges.
+        # The retained object graph already serves the internal `_retain_graph`
+        # path, so its public copy is only needed in the ordinary result.
+        **({"occurrence_dag": _export_occurrence_dag(occurrence_graph)}
+           if occurrence_graph is not None and not _retain_graph else {}),
         **({"_occurrence_graph": occurrence_graph} if _retain_graph else {}),
     }
 
@@ -1182,6 +1242,14 @@ def _evaluate_target_efficiency_legacy(
             analyze_network_efficiency(
                 case, phase=phase, tokens=tokens, context=context,
                 sequences=sequences, scope=scope, _retain_graph=True))
+    if base.get("_occurrence_graph") is None:
+        # A public baseline carries the same realized occurrence DAG in an
+        # explicit node/edge form.  Reconstruct it before target weights are
+        # applied; the aggregated operator rows alone have no edges and would
+        # collapse the critical path to one node.
+        reconstructed = _occurrence_dag_graph(base.get("occurrence_dag"))
+        if reconstructed is not None:
+            base["_occurrence_graph"] = reconstructed
     fam_ovr, evaluated_ops = dict(family_targets or {}), []
     for op in base["operators"]:
         ovr = fam_ovr.get(f"{op['family']}:{op['recipe']}") or fam_ovr.get(op["recipe"]) or fam_ovr.get(op["family"]) or {}

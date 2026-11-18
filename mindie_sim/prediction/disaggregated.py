@@ -113,6 +113,24 @@ def _token_span(memory, index, tokens):
     return (0, tokens)
 
 
+def _head_token_span(index, tokens, head_spans, cp):
+    """Token rows paired with one rank's replicated head span.
+
+    When TP exceeds the KV-head count several ranks hold the same head, while
+    the CP/DCP axis splits tokens.  The rank grid must pair every head with
+    every token shard: head replicas advance the head span, and the next rank
+    slot inside that replica group advances the token shard.  Enumerating both
+    axes from the same linear index leaves half of the ``(token, head)`` pairs
+    uncovered.
+    """
+    tokens = max(0, int(tokens))
+    cp = max(1, int(cp))
+    distinct = len({(int(lo), int(hi)) for lo, hi in head_spans})
+    slots = distinct or 1
+    axis = (int(index) // slots) % cp
+    return (tokens * axis // cp, tokens * (axis + 1) // cp)
+
+
 def _uncovered_intervals(covered, lo, hi):
     """Remaining half-open subranges of ``[lo, hi)`` after prior transfers."""
     pieces = [(int(lo), int(hi))]
@@ -291,22 +309,34 @@ def _pd_handoff_binding(request, tokens, placement, cases, memory, execution,
         source_owners = getattr(prefill_mem, "rank_token_owners", None)
         target_owners = getattr(decode_mem, "rank_token_owners", None)
 
-        def views(case, parallel, ranks, ledger, owners):
+        def views(case, parallel, ranks, ledger, owners, head_spans):
+            if owners is not None:
+                # A T05 owner partition is the exact physical fact.
+                spans = tuple(
+                    _token_span(ledger, index, tokens)
+                    for index in range(len(ranks)))
+                component_owners = owners
+            else:
+                spans = tuple(
+                    _head_token_span(index, tokens, head_spans, parallel.cp)
+                    for index in range(len(ranks)))
+                # Feed the same exact partition to the cache ledger: an even
+                # ``rows / cp`` split would bill 160/160 B for the [0,2) and
+                # [2,5) shards instead of the exact 128/192 B they own.
+                component_owners = spans
             result = []
             for index, rank in enumerate(ranks):
                 components = layer_cache_components(
                     case.model, layer, parallel, tokens, capacity_padded=False,
                     interleave=case.runtime.kv_block_size,
-                    rank=(index if owners is not None else None),
-                    owner_spans=owners)
-                result.append((index, rank, components,
-                               _token_span(ledger, index, tokens)))
+                    rank=index, owner_spans=component_owners)
+                result.append((index, rank, components, spans[index]))
             return result
 
         src_views = views(prefill_case, prefill_p, source, prefill_mem,
-                          source_owners)
+                          source_owners, source_spans)
         dst_views = views(decode_case, decode_p, destination, decode_mem,
-                          target_owners)
+                          target_owners, target_spans)
         components = {name for _, _, values, _ in src_views for name in values}
         components |= {name for _, _, values, _ in dst_views for name in values}
         gqa_components = {name for name in components

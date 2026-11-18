@@ -44,6 +44,7 @@ from .implementation_selection import (
 )
 from .recover_ssm_commit import bind_recover_ssm_commits, is_recover_ssm_intent
 from .recover_ssm_work import recover_ssm_enabled
+from .recurrent_kda_helpers import strip_excluded_native_kda
 
 
 ZERO = 0
@@ -56,6 +57,29 @@ _ENV_FEATURES = 4
 ZERO_FLOAT = 0.0
 FINAL_LAYER = -1
 MIN_DBO_MICROBATCHES = 2
+
+
+def _partition_global_tokens(shared_global, region_rows):
+    """Apportion one cohort's routed rows across microbatches without loss.
+
+    A per-region ``round`` loses a row whenever every partition is below one
+    half (``[1, 1]`` of five rows rounds to ``[2, 2]``).  The physical routing
+    ledger is conserved, so the integer quotas are the floor of the exact
+    proportions and the remainder goes to the largest fractional parts.
+    """
+    rows = tuple(max(ZERO, int(value)) for value in region_rows)
+    if shared_global is None or not rows or sum(rows) <= ZERO:
+        return tuple(None for _ in rows)
+    total = float(sum(rows))
+    target = int(round(float(shared_global)))
+    quotas = [target * float(value) / total for value in rows]
+    partitions = [int(math.floor(quota)) for quota in quotas]
+    remainder = max(ZERO, target - sum(partitions))
+    order = sorted(range(len(rows)),
+                   key=lambda index: (-(quotas[index] - partitions[index]), index))
+    for index in order[:remainder]:
+        partitions[index] += ONE
+    return tuple(partitions)
 
 
 def _scope(ops, block, role="body"):
@@ -291,7 +315,23 @@ class Frontend:
             limit = max(ONE, int(layer_limit))
             model = replace(model, layer_plans=tuple(model.layer_plans[:limit]))
         features = self.features if features is None else features
-        if (runtime.enable_dbo and dbo_partition is None and len(views) > ONE):
+        # An explicit mechanism exclusion owns every selector it can install,
+        # including the structural body default resolved before this call.
+        runtime = strip_excluded_native_kda(runtime)
+        # DBO splits the same EP collective into microbatches, so every EP
+        # peer must meet the split threshold.  Letting only the peers with two
+        # views split changes the collective cohort and breaks the inverse
+        # traffic rendezvous for an otherwise valid batch.
+        cohort_rows = tuple(max(ZERO, int(value))
+                            for value in (source_rows_by_replica or ()))
+        # Only an EP collective needs one split decision across peers.  A pure
+        # DP replica set has no cross-replica rendezvous, so DBO may split an
+        # active replica on its own.
+        ep_cohort = int(getattr(runtime.parallel, "ep", ONE) or ONE) > ONE
+        dbo_cohort_ready = (not ep_cohort or not cohort_rows
+                            or min(cohort_rows) >= MIN_DBO_MICROBATCHES)
+        if (runtime.enable_dbo and dbo_partition is None and len(views) > ONE
+                and dbo_cohort_ready):
             from .overlap_plan import MicrobatchPolicy, build_microbatch_regions
             from .physical_recipe_registry import COLLECTIVE_FAMILIES
             regions = build_microbatch_regions(
@@ -302,19 +342,17 @@ class Frontend:
                 raise ModelingError("mtp_shared_index_selection_requires_single_microbatch")
             if len(regions) > ONE:
                 merged, previous_partition_attention, sinks = [], None, []
-                total_rows = sum(int(view.q_len) + int(view.draft_proposal_tokens)
-                                 for view in views)
                 partition_requests = tuple(view.request_id for view in views)
-                for region in regions:
-                    region_rows = sum(int(view.q_len)
-                                      + int(view.draft_proposal_tokens)
-                                      for view in region.views)
-                    shared_global = (routing_global_tokens
-                                     if routing_global_tokens is not None
-                                     else global_tokens)
-                    partition_global = (
-                        int(round(float(shared_global) * region_rows / total_rows))
-                        if shared_global is not None and total_rows > ZERO else None)
+                shared_global = (routing_global_tokens
+                                 if routing_global_tokens is not None
+                                 else global_tokens)
+                region_rows = tuple(
+                    sum(int(view.q_len) + int(view.draft_proposal_tokens)
+                        for view in region.views) for region in regions)
+                partition_globals = _partition_global_tokens(
+                    shared_global, region_rows)
+                for region, region_rows_value, partition_global in zip(
+                        regions, region_rows, partition_globals):
                     region_ids = {view.request_id for view in region.views}
                     partition_routing = (
                         tuple(view for view in routing_views
@@ -324,7 +362,7 @@ class Frontend:
                         model, runtime, region.views,
                         prefix=f"{prefix}dbo{region.index}.",
                         ready=ready,
-                        tokens=region_rows,
+                        tokens=region_rows_value,
                         mode=mode,
                         global_tokens=(partition_global
                                        if partition_global is not None
