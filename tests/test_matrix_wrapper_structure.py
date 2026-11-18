@@ -147,15 +147,20 @@ def test_routed_mxfp4_bank_cannot_become_a_single_dense_wrapper():
     assert predicted_contract(down.to_dict()) == original
 
 
-def test_separate_kda_qkv_projections_cannot_invent_three_source_wrapper_calls():
+def test_packed_kda_input_projection_cannot_invent_three_source_wrapper_calls():
     case, ops = declared()
-    qkv = tuple(op for op in ops if op.recipe in {"linear_q", "linear_k", "linear_v"})
-    assert {op.recipe for op in qkv} == {"linear_q", "linear_k", "linear_v"}
+    packed = next(op for op in ops
+                  if str(op.recipe).startswith("linear_qkvbfg_a"))
+    slices = {row["role"]: row["shape"][-1]
+              for row in dict(packed.metadata)["packed_projection_slices"]}
+    assert {"q", "k", "v"} <= set(slices)
+    # One declared shared input matrix replaces the three separate Q/K/V
+    # projections; the source caller cannot claim three wrapper calls for it.
     with pytest.raises(ModelingError, match="source_caller_unsupported"):
         matrix_wrappers.apply_matrix_wrapper(
-            qkv, selected("linear_q", "linear_k", "linear_v"),
+            (packed,), selected("linear_qkvbfg_a"),
             replace(case.runtime, graph_mode="eager"))
-    assert all(predicted_contract(op.to_dict())[0] == "matrix" for op in qkv)
+    assert predicted_contract(packed.to_dict())[0] == "matrix"
 
 
 @pytest.mark.parametrize("extra,reason", [

@@ -243,10 +243,16 @@ def test_real_kimi_decode_matrix_crosses_semantic_recipes_without_choosing_a_rep
     group = mapping["windows"][0]["cohorts"][0]
     assert mapping["status_counts"] == {"ambiguous": 2}
     assert group["declared_candidate_instance_count"] == group["declared_instance_count"] * 4
-    recipes = {node["recipe"] for node in export_structure(
-        case, phase="decode", tokens=1, context=32768, scope="body")["nodes"]
-        if node["node_id"] in group["target_ids"]}
-    assert {"linear_q", "output_gate", "dense_gate_up"} <= recipes
+    graph = export_structure(case, phase="decode", tokens=1, context=32768,
+                             scope="body")
+    recipes = {node["recipe"] for node in graph["nodes"]
+               if node["node_id"] in group["target_ids"]}
+    # The K3 KDA input is one declared packed matrix, so the selected cohort
+    # crosses the grouped dense gate and the output gate instead of separate
+    # Q/K/V matrices while still never choosing a replica.
+    assert {"output_gate", "dense_gate_up"} <= recipes
+    assert any(str(node["recipe"]).startswith("linear_qkvbfg_a")
+               for node in graph["nodes"])
     result = compare_cohorts(case, mapping)
     row = result["windows"][0]["cohorts"][0]
     assert row["status"] == "compared"

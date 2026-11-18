@@ -22,7 +22,9 @@
   * Layer-indexed state references (``kda.layer[L]`` / ``gdn.layer[L]``) and the
     integer ``stage``/``layer`` leaves of ``state_accesses`` and
     ``fused_origin_scopes`` are relative to the
-    operator that owns them, for the same injective reason.
+    operator that owns them, for the same injective reason.  ``context_kv<L>``
+    alias planes use their own declared rule instead of widening the
+    occurrence pattern's capture groups.
   * Unknown metadata is retained unchanged.  An unrecognized identity-bearing
     field can only prevent deduplication; it can never cause a false merge.
   * No regular expression is applied to a serialized JSON document; the rewrite
@@ -60,15 +62,19 @@ REFERENCE_KEYS = frozenset({
     "activation_payload_producer",
     "activation_residual_inputs",
     "activation_residual_outputs",
+    "audit_trail",
     "binding_name",
     "collective_id",
     "device_kernel_group",
     "fused_origin_scopes",
+    "fusion_boundary",
+    "fusion_external_outputs",
     "fusion_group_key",
     "fusion_semantic_ids",
     "gdn_state_contract",
     "gdn_state_effects",
     "input_conversion_subgraphs",
+    "input_ports",
     "inverse_index_producer",
     "kda_recurrent_params",
     "recover_ssm_geometry",
@@ -82,6 +88,7 @@ REFERENCE_KEYS = frozenset({
     "reverse_of_collective",
     "storage",
     "synchronization_boundary",
+    "typed_outputs",
 })
 
 #: Prefix families that describe occurrence ownership or state effects.
@@ -108,9 +115,16 @@ _STAGE_GROUP = 2
 _LAYER_GROUP = 3
 _LAYER_REFERENCE_GROUP = 2
 _STATE_FAMILY_GROUP = 1
+_CONTEXT_KV_GROUP = 2
 _OCCURRENCE = re.compile(
     r"(?<![\w.])(?P<draft>draft(?:\d+|_prefill)\.)?s(\d+)\.l(\d+)(?=\.|$)")
 _LAYER_REFERENCE = re.compile(r"(?<![\w.])(kda|gdn)\.layer\[(\d+)\]")
+#: Draft/shared context-KV plane names carry the layer whose cache they alias.
+#: They are occurrence-relative like ``s<stage>.l<layer>`` but their ordinal is
+#: a bare ``context_kv<layer>`` token, so they need their own rewriting rule
+#: (``_OCCURRENCE``'s capture groups stay untouched).
+_CONTEXT_KV_OCCURRENCE = re.compile(
+    r"(?<![\w])(?P<draft>draft(?:\d+|_prefill)\.)?context_kv(\d+)(?=\.|$)")
 
 #: Identity field order.  A stable declaration, not a per-call inspection.
 IDENTITY_FIELDS = (
@@ -143,8 +157,13 @@ def normalize_reference(value: str, stage: int, layer: int) -> str:
         return (f"{family}.layer["
                 f"{int(match.group(_LAYER_REFERENCE_GROUP)) - int(layer)}]")
 
+    def _context_kv(match: "re.Match[str]") -> str:
+        return (f"{match.group('draft') or ''}context_kv"
+                f"{int(match.group(_CONTEXT_KV_GROUP)) - int(layer)}")
+
     renamed = _OCCURRENCE.sub(_rename, value)
-    return _LAYER_REFERENCE.sub(_layer, renamed)
+    renamed = _LAYER_REFERENCE.sub(_layer, renamed)
+    return _CONTEXT_KV_OCCURRENCE.sub(_context_kv, renamed)
 
 
 def _normalize_mapping_entry(key: Any, item: Any, stage: int,

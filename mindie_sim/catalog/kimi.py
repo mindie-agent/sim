@@ -121,6 +121,9 @@ def _kimi_plans(config: Mapping[str, Any]) -> list[LayerPlan]:
                 linear_heads=kda_heads, linear_head_dim=kda_dim,
                 linear_key_heads=kda_heads, linear_key_head_dim=kda_dim,
                 linear_value_heads=kda_heads,
+                # The K3 KDA caller packs its input projections so one GEMM
+                # serves each identical operand representation.
+                packed_input_projection=True,
                 conv_kernel=conv_k, conv_width=conv_width,
                 recurrent_state_elements=kda_heads * kda_dim * kda_dim,
                 recurrent_state_dtype="fp32",

@@ -97,9 +97,12 @@ def check_structure(case, graphs, rows, *, phase="prefill"):
                 gather = by_id[prefix + ".attention.sp_gather"]
                 assert gather.deps == (prefix + ".attention.attn_res_fwd",)
                 assert gather.local_shape == (rows[replica], width)
+                # The packed K3 KDA input matrix replaces the separate Q
+                # projection; both carry the same local attention rows.
                 projections = [op for op in ops if op.layer == layer.index
                                and dict(op.metadata).get("structure_block") == "attention"
-                               and op.recipe in {"linear_q", "q_a"}]
+                               and (op.recipe in {"linear_q", "q_a"}
+                                    or str(op.recipe).startswith("linear_qkvbfg_a"))]
                 assert projections
                 assert all(op.local_shape[0] == rows[replica] for op in projections)
                 residual = by_id[prefix + ".ffn.attn_res_fwd"]

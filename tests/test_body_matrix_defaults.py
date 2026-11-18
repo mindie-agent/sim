@@ -141,7 +141,7 @@ def test_serving_default_remains_the_explicit_tiled_control():
     assert control["execution"]["allocation_events"] > automatic["execution"]["allocation_events"]
 
 
-def test_default_keeps_fp32_router_owner_grid_and_grouped_mapping_domain():
+def test_default_keeps_tier4_router_owner_grid_and_grouped_mapping_domain():
     path = Path(__file__).resolve().parents[1] / "examples/cases/glm53-a3-w4a8.json"
     raw = json.loads(path.read_text())
     raw["model"]["layers"] = 4  # First MoE layer; preserve every physical width.
@@ -150,9 +150,12 @@ def test_default_keeps_fp32_router_owner_grid_and_grouped_mapping_domain():
     router = operator_costs(raw, graph[router_index:router_index + 1])["operators"][0]
     mapping = next(row for row in router["basis"]["matrix_mappings"] if "selected" in row)
     assert router["operator"]["local_shape"] == [1, 256, 6144]
-    assert router["operator"]["dtype"] == "fp32"
+    # ``moe_router_dtype=float32`` runs on AscendGateLinear Tier 4: BF16 Cube
+    # operands accumulate into FP32 logits, so the matrix dtype is BF16.
+    assert router["operator"]["dtype"] == "bf16"
+    # BF16 Cube operands use the full 128-deep K tile; the FP32 grid split it.
     assert (mapping["selected"]["tile_m"], mapping["selected"]["tile_n"],
-            mapping["selected"]["tile_k"]) == (128, 128, 64)
+            mapping["selected"]["tile_k"]) == (128, 128, 128)
     assert mapping["default_128_grid_tiles"] == 2
     assert router["peak_buffers"]["l0b@r0:s0"] <= 65536
     explicit = deepcopy(raw)
