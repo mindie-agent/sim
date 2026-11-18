@@ -159,7 +159,13 @@ def declare(ops, *, prefix, plan, model, parallel, quant, tokens, members,
                                  else BF16_QUERY_QUANT_MODE),
         },
         implementation={
-            "native_kind": native_kind, "selection": IMPLEMENTATION,
+            "native_kind": native_kind,
+            "native_kinds": (
+                (native_kind, "MlaPrologV4WeightNz", "MlaPrologV4")
+                if native_kind.endswith("V4WeightNz")
+                else (native_kind, "MlaPrologV3")
+            ),
+            "selection": IMPLEMENTATION,
             "conditions": {
                 "cache_mode": "PA_BSND", "quantized_kv_cache": packed,
                 **({"packed_cache": cache} if packed else {}),
