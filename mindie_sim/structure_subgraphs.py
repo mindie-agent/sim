@@ -15,6 +15,11 @@ from .structure_native_contracts import grouped_situ_contract
 # Qwen low-rank hyper-connection kernels own their declared tensor boundary.
 QWEN4_HC_KINDS = frozenset({"Qwen4ExpGatedResidualMix", "Qwen4ExpHcCombine"})
 LOW_RANK_HC_NATIVE_KINDS = QWEN4_HC_KINDS
+MLA_PROLOG_V3_CONTRACT = "MlaPrologV3"
+MLA_PROLOG_V4_CONTRACT = "aclnnMlaPrologV4WeightNz"
+MLA_PROLOG_V4_KINDS = frozenset({
+    MLA_PROLOG_V4_CONTRACT, "MlaPrologV4WeightNz", "MlaPrologV4",
+})
 
 
 def metadata(op):
@@ -98,8 +103,12 @@ def subgraph_contract(declaration):
         if "packed_cache" in view:
             cache_contract = (((1, view["packed_cache"]["row_bytes"]), "int8", "ND"),
                               ((), None, None))
+        implementation = (declaration.get("implementation") or {})
+        prolog_kind = (MLA_PROLOG_V4_CONTRACT
+                       if implementation.get("native_kind") in MLA_PROLOG_V4_KINDS
+                       else MLA_PROLOG_V3_CONTRACT)
         return (
-            "mla_prolog_active", "MlaPrologV3",
+            "mla_prolog_active", prolog_kind,
             ((rows, hidden), view["token_dtype"], "ND"),
             (((hidden, qr), dq), ((qr, heads * (nope + rope)), uq),
              ((heads, nope, latent), view["absorbed_weight_dtype"]),
@@ -147,12 +156,18 @@ def subgraph_contract(declaration):
         rows, hidden, width, expansion = (
             view[key] for key in ("tokens", "hidden", "width", "coff"))
         slot = lambda shape, dtype: (shape, dtype, "ND")
+        # A C1 compressor (ratio 1) has no gated pooling: it owns only the
+        # projection and norm, not a gate matrix or its APE table.
+        weights = [slot((expansion * width, hidden), view["weight_dtype"])]
+        if int(view.get("ratio", 0)) > 1:
+            weights.extend([
+                slot((expansion * width, hidden), view["weight_dtype"]),
+                slot((view["ratio"], expansion * width), view["ape_dtype"]),
+            ])
+        weights.append(slot((width,), view["norm_dtype"]))
         return (
             "compressor_active", "Compressor", slot((rows, hidden), view["dtype"]),
-            (slot((expansion * width, hidden), view["weight_dtype"]),
-             slot((expansion * width, hidden), view["weight_dtype"]),
-             slot((view["ratio"], expansion * width), view["ape_dtype"]),
-             slot((width,), view["norm_dtype"])),
+            tuple(weights),
             slot((2 * expansion * width,), view["state_dtype"]),
             (slot((view["rope_width"],), view["rope_dtype"]),) * 2,
             slot((width,), view["dtype"]),

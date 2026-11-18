@@ -559,6 +559,30 @@ def layer_cache_components(model, plan, parallel, sequence_tokens, *, capacity_p
     return result
 
 
+def layer_stage_map(model: Any, parallel: ParallelSpec, runtime=None) -> tuple[int, ...]:
+    """Resolved physical PP stage for every declared layer.
+
+    The runtime's explicit ``pp_layer_partition`` is the execution authority.
+    The balanced contiguous default matches ``Memory`` when no partition was
+    declared, so catalog rows and capacity assign bytes to the same stage.
+    """
+    pp = max(ONE, int(parallel.pp))
+    layers = max(ONE, int(getattr(model, "layers", ZERO) or len(
+        getattr(model, "layer_plans", ()))))
+    partition = tuple(
+        int(value) for value in (getattr(runtime, "pp_layer_partition", ()) or ()))
+    if partition:
+        if len(partition) != pp or sum(partition) != layers:
+            raise ModelingError(
+                f"pp_partition_layers:{sum(partition)}!={layers}")
+        return tuple(
+            stage for stage, count in enumerate(partition) for _ in range(count))
+    if pp == ONE:
+        return (ZERO,) * layers
+    return tuple(min(pp - ONE, index * pp // layers)
+                 for index in range(layers))
+
+
 def stage_cache_components(
     model: Any, parallel: ParallelSpec, sequence_tokens: int,
     *, capacity_padded: bool = True, draft_kind: str | None = None,
@@ -566,9 +590,9 @@ def stage_cache_components(
 ) -> list[dict[str, float]]:
     pp = max(1, parallel.pp)
     stages = [dict() for _ in range(pp)]
-    per = max(1, model.layers // pp)
+    stage_map = layer_stage_map(model, parallel, runtime)
     for plan in model.layer_plans:
-        stage = min(pp - 1, plan.index // per) if pp > 1 else 0
+        stage = stage_map[plan.index] if plan.index < len(stage_map) else pp - 1
         for key, value in layer_cache_components(
             model, plan, parallel, sequence_tokens,
             capacity_padded=capacity_padded, interleave=interleave,
@@ -683,7 +707,7 @@ __all__ = [
     "local_kv_heads",
     "index_selection_cost", "attention_rows", "cache_row_split",
     "cache_component_split", "layer_cache_components",
-    "layer_cache_decomposition", "stage_cache_components",
+    "layer_cache_decomposition", "layer_stage_map", "stage_cache_components",
     "request_cache_breakdown",
     "state_bytes_per_request_per_rank", "cache_bytes_per_token_estimate",
     "peak_live_tokens", "live_request_cache_peak",

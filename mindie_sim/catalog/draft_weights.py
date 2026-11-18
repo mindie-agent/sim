@@ -172,6 +172,30 @@ def _draft_ffn_terms(
     return terms
 
 
+def _draft_plan_terms(plan, draft: DraftSpec, model: ModelSpec) -> list[WeightTerm]:
+    """Resident matrices owned by one declared draft ``LayerPlan``.
+
+    Draft attention/FFN geometry is declared once by ``DraftSpec``, but an
+    inherited indexer and a runtime router precast belong to the per-layer
+    plan.  They are counted here rather than synthesized from a donor layer.
+    """
+    terms: list[WeightTerm] = []
+    if (plan.owns_index_k or plan.owns_topk or plan.indexer
+            or plan.index_query_per_layer):
+        from mindie_sim.catalog.weights import _indexer_terms
+        draft_model = replace(
+            model, hidden_size=int(draft.hidden_size),
+            quant=draft_quant(model, draft))
+        terms.extend(_indexer_terms(plan, draft_model))
+    if (plan.ffn == "moe" and plan.router_precast_weight_copy
+            and plan.router_dtype):
+        terms.append(replace(
+            _t("draft_router_precast", plan.num_experts,
+               plan.router_input_size or draft.hidden_size, "router"),
+            source_owned=False, runtime_dtype=plan.router_dtype))
+    return terms
+
+
 def draft_terms(
     draft: DraftSpec, model: ModelSpec, *, standalone_heads_only: bool = False,
     ep: int = ONE,
@@ -221,9 +245,12 @@ def draft_terms(
                 "draft_embedding", draft.vocab_size, h, "embedding",
                 "embedding", int(draft.embedding_count), 0, 0, 0,
                 False, True))
-        for _ in range(max(ZERO, draft.layers)):
+        plans = tuple(getattr(draft, "layer_plans", ()) or ())
+        for index in range(max(ZERO, draft.layers)):
             terms.extend(_draft_attention_terms(draft, model.quant or QuantSpec("bf16")))
             terms.extend(_draft_ffn_terms(draft, model, ep=ep))
+            if index < len(plans):
+                terms.extend(_draft_plan_terms(plans[index], draft, model))
             if draft.output_head_owned:
                 terms.append(_t("draft_output_norm", h, ONE, "norm"))
                 if int(draft.output_head_count) > ZERO:

@@ -30,7 +30,7 @@ import math
 from typing import Any
 
 from mindie_sim.catalog.cache import (
-    _LINEAR_ATTENTION_KINDS, layer_cache_components,
+    _LINEAR_ATTENTION_KINDS, layer_cache_components, layer_stage_map,
 )
 from mindie_sim.schema.common import ModelingError
 
@@ -117,13 +117,11 @@ class BatchCacheFootprint:
         }
 
 
-def _layer_stages(model: Any, parallel: Any) -> dict[int, int]:
-    pp = max(ONE, int(parallel.pp))
-    layers = max(ONE, int(getattr(model, "layers", ONE)))
-    result = {}
-    for plan in model.layer_plans:
-        result[int(plan.index)] = min(pp - ONE, int(plan.index) * pp // layers)
-    return result
+def _layer_stages(model: Any, parallel: Any, runtime: Any = None) -> dict[int, int]:
+    stage_map = layer_stage_map(model, parallel, runtime)
+    return {int(plan.index): stage_map[int(plan.index)]
+            for plan in model.layer_plans
+            if 0 <= int(plan.index) < len(stage_map)}
 
 
 def _block_tokens(tokens: int, interleave: int) -> int:
@@ -273,20 +271,20 @@ def batch_cache_footprint(
     del replica
     model, parallel = case.model, case.runtime.parallel
     stages = max(ONE, int(parallel.pp))
-    layer_stages = _layer_stages(model, parallel)
+    runtime = case.runtime
+    layer_stages = _layer_stages(model, parallel, runtime)
     shared: dict[tuple[int, str, str, int], list[tuple[int, int, float]]] = {}
     private = [ZERO_FLOAT] * stages
     state = [ZERO_FLOAT] * stages
     draft = [ZERO_FLOAT] * stages
     boundary = [ZERO_FLOAT] * stages
-    runtime = case.runtime
     shared_mode = getattr(runtime, "prefix_cache_mode", "private") == "shared"
     if dict(model.metadata).get("cache_allocator") == "paired_sfa":
         from mindie_sim.catalog.paired_sfa import page_groups
         from mindie_sim.schema.runtime_features import canonical_prefix_cache_key
         query_tokens = max((max(ONE, int(getattr(v, "q_len", ONE) or ONE)) for v in requests), default=ONE)
         groups = page_groups(case, layer_stages, query_tokens)
-        shared_once, seen = [ZERO_FLOAT] * stages, set()
+        shared_once, shared_pages = [ZERO_FLOAT] * stages, {}
         for view in requests:
             length = max(ZERO, int(getattr(view, "kv_len", ZERO) or ZERO))
             declared = max(ZERO, min(int(getattr(view, "prefix_tokens", ZERO) or ZERO), length))
@@ -297,9 +295,13 @@ def batch_cache_footprint(
                 page_bytes = float(group["bytes_per_group_page"])
                 prefix_pages = declared // tokens_per_page if shared_mode else ZERO
                 history_pages = (length + tokens_per_page - ONE) // tokens_per_page
-                if prefix_pages > ZERO and (key, stage) not in seen:
-                    shared_once[stage] += prefix_pages * page_bytes
-                    seen.add((key, stage))
+                # A shared prefix is one physical page set per key and stage.
+                # Charge only the growth of the longest declared prefix so the
+                # total is invariant under request ordering.
+                previous_pages = int(shared_pages.get((key, stage), ZERO))
+                if prefix_pages > previous_pages:
+                    shared_once[stage] += (prefix_pages - previous_pages) * page_bytes
+                    shared_pages[(key, stage)] = prefix_pages
                 state_pages = int(group["recycling_pages"])
                 private[stage] += (history_pages - prefix_pages + state_pages) * page_bytes
                 state[stage] += state_pages * page_bytes

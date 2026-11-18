@@ -28,7 +28,8 @@ _PRODUCER_REFERENCES = {
     "topk_ids_producer", "topk_weights_producer", "payload_producer", "inverse_index_producer",
     "activation_payload_producer", "activation_scale_producer",
 }
-_OCCURRENCE_PREFIX = re.compile(r"(?:^|(?<=[:/]))s\d+\.l\d+\.")
+_OCCURRENCE_PREFIX = re.compile(
+    r"(?<![\w.])(?:draft(?:\d+|_prefill)\.)?s\d+\.l\d+(?=\.|$)")
 
 
 def _signature(value):
@@ -39,7 +40,8 @@ def _signature(value):
 def _scrub_occurrence(value, occurrences):
     if isinstance(value, str):
         return _OCCURRENCE_PREFIX.sub(
-            lambda m: occurrences.setdefault(m.group(0), f"occ{len(occurrences)}."),
+            lambda m: occurrences.setdefault(
+                m.group(0), f"occ{len(occurrences)}"),
             value,
         )
     if isinstance(value, (list, tuple)):

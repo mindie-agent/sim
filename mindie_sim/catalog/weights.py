@@ -37,6 +37,9 @@ ONE = 1
 TWO = 2
 THREE = 3
 FOUR = 4
+TARGET_ALIAS_CATEGORIES = frozenset({
+    "target_alias_embedding", "target_alias_lm_head",
+})
 
 from mindie_sim.catalog.types import DraftSpec, QuantSpec, VisionSpec
 from mindie_sim.catalog.quant import projection_quant
@@ -740,9 +743,12 @@ def stage_weight_terms(
                     (model.auxiliary.mtp, model.auxiliary.dspark))
         for draft in selected:
             if draft is not None:
+                # A target alias is not an extra draft copy.  Runtime-owned
+                # prepared matrices (FP32 router precast, indexer copies) are
+                # resident and belong in the ledger.
                 stages[pp - 1].extend(
                     term for term in draft_terms(draft, model)
-                    if term.source_owned
+                    if term.category not in TARGET_ALIAS_CATEGORIES
                 )
     return stages
 
@@ -791,20 +797,23 @@ def sharded_weight_bytes(
 
 
 def cache_row_bytes_by_layer(model: ModelSpec) -> tuple[tuple[int, int], ...]:
-    """Per-layer cache row width using the declared KV dtype.
+    """Per-layer cache row width using the declared cache representation.
 
-    The row width is a declaration, not a fixed BF16 constant: a KV dtype
-    swap must move the catalog facts as well as the runtime cache model.
+    The row width is a declaration, not a fixed BF16 or K-only constant: a KV
+    representation swap must move the catalog facts as well as the runtime
+    cache model, and shared K/V projection weights still store two cache
+    planes.
     """
-    quant = model.quant or QuantSpec("bf16")
-    kv_bytes = dtype_bytes(quant.kv_dtype)
+    from mindie_sim.catalog.cache_format import cache_format
+    mla = cache_format(model, "mla_kv")
+    gqa = cache_format(model, "gqa_kv")
     rows = []
     for plan in model.layer_plans:
         if (plan.attention in {"gqa", "projection_only"} and plan.cache_kind == "dense"
                 and not ZERO <= plan.kv_owner_layer_id < plan.index):
-            row = (ONE if plan.k_eq_v else TWO) * plan.num_kv_heads * plan.head_dim * kv_bytes
+            row = gqa.row_bytes(plan.cache_row_elements)
         elif plan.attention == "mla":
-            row = plan.cache_row_elements * kv_bytes
+            row = mla.row_bytes(plan.cache_row_elements)
         else:
             row = 0
         rows.append((plan.index, int(row)))

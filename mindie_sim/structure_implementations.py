@@ -53,6 +53,23 @@ def native_implementation(op, contract):
             "basis": "implementation_binding",
             "conditions": {},
         }
+    # A cache epilog's explicit native identity is a correspondence candidate,
+    # not a selected software plan.  Without this, a fused epilog exports an
+    # empty implementation and an exact observed kernel finds no candidate.
+    native_kinds = meta.get("native_kinds")
+    if isinstance(native_kinds, str):
+        native_kinds = (native_kinds,)
+    if not native_kinds and isinstance(meta.get("native_kind"), str):
+        native_kinds = (meta["native_kind"],)
+    if native_kinds:
+        kinds = tuple(str(kind) for kind in native_kinds if str(kind).strip())
+        if kinds:
+            return {
+                "native_kinds": kinds,
+                "selection": "compatible_semantic_boundary; runtime_selection_not_implied",
+                "basis": "explicit_native_identity",
+                "conditions": {"native_identity_not_selected": True},
+            }
     kinds = ()
     if contract:
         if contract[0] in _CONTRACT_NATIVE:

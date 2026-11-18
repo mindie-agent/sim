@@ -47,9 +47,17 @@ CHUNK_GDN_STATE_RANK = 4
 CHUNK_GDN_CHUNK_SIZES = frozenset({64, 128})
 
 
-SUBGRAPH_TYPES = {
-    "MlaPrologV3", "LightningIndexer", "ChunkGatedDeltaRuleFwd", "RecurrentGatedDeltaRule",
-}
+MLA_PROLOG_V3_KIND = "MlaPrologV3"
+MLA_PROLOG_V4_CANONICAL_KIND = "aclnnMlaPrologV4WeightNz"
+MLA_PROLOG_V4_KINDS = frozenset({
+    MLA_PROLOG_V4_CANONICAL_KIND, "MlaPrologV4WeightNz", "MlaPrologV4",
+})
+MLA_PROLOG_KINDS = frozenset({MLA_PROLOG_V3_KIND}) | MLA_PROLOG_V4_KINDS
+
+SUBGRAPH_TYPES = (
+    MLA_PROLOG_KINDS
+    | {"LightningIndexer", "ChunkGatedDeltaRuleFwd", "RecurrentGatedDeltaRule"}
+)
 _FLOAT = {"bf16", "fp16"}
 _ACTIVATION = _FLOAT | {"int8", "fp8_e4m3"}
 _EMPTY = ((), None, None)
@@ -95,8 +103,11 @@ def _lightning(inputs, outputs):
     return ("lightning_indexer_active", kind, (query, weights), cache_head, indices), None
 
 
-def _mla(inputs, outputs):
-    kind = "MlaPrologV3"
+def _mla(raw_kind, inputs, outputs):
+    is_v4 = raw_kind in MLA_PROLOG_V4_KINDS
+    canonical_kind = (MLA_PROLOG_V4_CANONICAL_KIND if is_v4
+                      else MLA_PROLOG_V3_KIND)
+    expected_packed_dtype = "fp8_e4m3" if is_v4 else "int8"
     # The source's tile-128 packed cache stores 512 INT8 latent bytes, 64
     # BF16 rotary values and four FP32 scales in one 656-byte row. Its second
     # cache descriptor is explicitly empty, not missing floating cache data.
@@ -109,7 +120,7 @@ def _mla(inputs, outputs):
         required += [("input[10].shape", inputs[10]), ("output[3].shape", outputs[3])]
     missing = [name for name, slot in required if not slot[0]]
     if missing:
-        return None, _issue(kind, "missing_active_tensor_shapes",
+        return None, _issue(raw_kind, "missing_active_tensor_shapes",
                             "MLA token, parameters, cache and primary Q outputs are required.", missing)
     token = inputs[0]
     dq, uq, uk, dkv, gamma_q, gamma_kv = inputs[1:7]
@@ -126,7 +137,7 @@ def _mla(inputs, outputs):
             or not _tensor(query, len(token[0]) + 1, _FLOAT)
             or not _tensor(rope, len(token[0]) + 1, _FLOAT)):
         return None, _issue(
-            kind, "unsupported_mla_active_geometry",
+            raw_kind, "unsupported_mla_active_geometry",
             "The verified MLA projection requires logical NZ matrix descriptors, "
             "ND parameters, floating or packed INT8 paged caches and complete token/Q axes.")
     leading = token[0][:-1]
@@ -142,43 +153,45 @@ def _mla(inputs, outputs):
             or outputs[2:4] != (cache, rope_cache)
             or len({slot[1] for slot in (uk, gamma_q, gamma_kv, query, rope)}) != 1):
         return None, _issue(
-            kind, "inconsistent_mla_active_parameters",
+            raw_kind, "inconsistent_mla_active_parameters",
             "MLA projection, RMS, absorption, output and cache dimensions do not agree.")
     if packed:
         if (latent != MLA_PACKED_LATENT_WIDTH or rope_width != MLA_PACKED_ROPE_WIDTH
                 or cache[0][2:] != (1, MLA_PACKED_CACHE_ROW_WIDTH)
-                or rope_cache != ((), "bf16", "ND")
-                or any(slot[1] != "int8" for slot in (token, dq, uq, dkv))
+                or rope_cache not in {((), "bf16", "ND"), _EMPTY}
+                or any(slot[1] != expected_packed_dtype
+                       for slot in (token, dq, uq, dkv))
                 or query[1] != "bf16"):
-            return None, _issue(kind, "unsupported_mla_packed_cache",
+            return None, _issue(raw_kind, "unsupported_mla_packed_cache",
                                 "The retained packed ABI requires 512 INT8 latent bytes, "
                                 "64 BF16 rotary values, four FP32 scales and an empty second cache.")
         cache_heads = (((1, MLA_PACKED_CACHE_ROW_WIDTH), "int8", "ND"), _EMPTY)
     else:
-        if (cache[0][2:] != (1, latent) or rope_cache[0][2:] != (1, rope_width)
+        if (is_v4 or cache[0][2:] != (1, latent) or rope_cache[0][2:] != (1, rope_width)
                 or cache[1] != rope_cache[1] or cache[1] != query[1]):
-            return None, _issue(kind, "inconsistent_mla_active_parameters",
+            return None, _issue(raw_kind, "inconsistent_mla_active_parameters",
                                 "Floating cache dimensions and precision must match their query outputs.")
         cache_heads = tuple((slot[0][2:], slot[1], slot[2]) for slot in (cache, rope_cache))
     query_norm = outputs[5]
     if query_norm[0]:
         if (query_norm[0] not in {(tokens, gamma_q[0][0]), (*leading, gamma_q[0][0])}
-                or not _tensor(query_norm, len(query_norm[0]), {"int8"} if packed else _ACTIVATION)):
-            return None, _issue(kind, "unsupported_mla_query_norm",
+                or not _tensor(query_norm, len(query_norm[0]),
+                               {expected_packed_dtype} if packed else _ACTIVATION)):
+            return None, _issue(raw_kind, "unsupported_mla_query_norm",
                                 "The recorded optional query-norm output must retain its row/rank axes.")
         query_norm = ((tokens, gamma_q[0][0]), query_norm[1], query_norm[2])
     else:
         # Both optional outputs are empty in the source's query_norm_flag=false
         # path. A scale with no corresponding data is incomplete capture evidence.
         if outputs[6][0]:
-            return None, _issue(kind, "missing_active_tensor_shapes",
+            return None, _issue(raw_kind, "missing_active_tensor_shapes",
                                 "Query-norm scale is present but its data shape is absent.",
                                 ("output[5].shape",))
         query_norm = _EMPTY
     parameters = tuple((slot[0], slot[1]) for slot in inputs[1:7])
     output_slots = (((tokens, heads, latent), query[1], query[2]),
                     ((tokens, heads, rope_width), rope[1], rope[2]), query_norm)
-    return ("mla_prolog_active", kind, ((tokens, hidden), token[1], token[2]),
+    return ("mla_prolog_active", canonical_kind, ((tokens, hidden), token[1], token[2]),
             parameters, cache_heads, output_slots), None
 
 
@@ -253,7 +266,9 @@ def subgraph_contract(native):
         return _recurrent_gdn(inputs, outputs)
     if kind == "ChunkGatedDeltaRuleFwd":
         return _chunk_gdn(native)
-    return _mla(inputs, outputs) if kind == "MlaPrologV3" else _lightning(inputs, outputs)
+    if kind in MLA_PROLOG_KINDS:
+        return _mla(kind, inputs, outputs)
+    return _lightning(inputs, outputs)
 
 
 def subgraph_contract_scope(row):
