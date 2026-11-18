@@ -54,13 +54,23 @@ def normalize_formats(model):
         return model
     metadata = dict(model.metadata)
     regions = dict(metadata.get("cache_representations", {}))
-    sparse = next(plan for plan in model.layer_plans if plan.indexer)
+    latent = next((plan for plan in model.layer_plans if plan.attention == "mla"), None)
+    sparse = next((plan for plan in model.layer_plans if plan.indexer), None)
+    if latent is None:
+        # A truncated slice (for example Kimi-K3.1 ``layers=2``) may contain
+        # only KDA layers: the paired MLA/indexer regions do not exist, so the
+        # ordinary per-component allocator owns this model.
+        metadata["declared_cache_allocator"] = metadata["cache_allocator"]
+        metadata["cache_allocator"] = "component"
+        metadata["cache_allocator_selection"] = (
+            "selected_layers_have_no_paired_mla_regions")
+        return replace(model, metadata=tuple(metadata.items()))
     if dtype_bytes(model.quant.kv_dtype) == ONE:
         regions.setdefault("mla_kv", {
             "dtype": model.quant.kv_dtype, "group_size": QUANT_GROUP,
-            "scale_dtype": "fp32", "suffix_elements": sparse.qk_rope_head_dim,
+            "scale_dtype": "fp32", "suffix_elements": latent.qk_rope_head_dim,
             "suffix_dtype": "bf16"})
-    if dtype_bytes(model.quant.index_dtype) == ONE:
+    if sparse is not None and dtype_bytes(model.quant.index_dtype) == ONE:
         regions.setdefault("index_k", {
             "dtype": model.quant.index_dtype, "group_size": sparse.index_dim,
             "scale_dtype": model.quant.index_scale_dtype
@@ -73,12 +83,12 @@ def independent_draft(draft):
     return dict(draft.source).get("kind") == "external_kimi_k3_dspark"
 
 
-def draft_row(model, draft):
+def draft_row(model, draft, *, tp=ONE):
     from .draft import draft_quant
     from .cache import local_kv_heads
     width = (draft.kv_cache_elements or draft.kv_lora_rank + draft.qk_rope_head_dim
              if draft.attention_kind == "mla" else
-             TWO * local_kv_heads(draft.num_kv_heads, ONE) * draft.head_dim)
+             TWO * local_kv_heads(draft.num_kv_heads, tp) * draft.head_dim)
     return width * dtype_bytes(draft_quant(model, draft).kv_dtype)
 
 
@@ -87,10 +97,8 @@ def page_groups(case, layer_stage, query_tokens):
     model, runtime = case.model, case.runtime
     if dict(model.metadata).get("cache_allocator") != "paired_sfa":
         return ()
-    if runtime.recover_ssm:
-        raise ModelingError("paired_sfa_recover_ssm_layout_not_declared")
     from .draft import optional_draft_spec
-    from .cache import index_row_bytes
+    from .cache import index_row_bytes, layer_cache_components
     p, block = runtime.parallel, runtime.kv_block_size
     metadata = dict(runtime.metadata)
     mode = metadata.get("mamba_cache_mode", "align")
@@ -105,7 +113,8 @@ def page_groups(case, layer_stage, query_tokens):
     extra = int(metadata.get("num_prefill_checkpoint_blocks", ZERO))
     if min(proposals, extra) < ZERO:
         raise ModelingError("paired_sfa_negative_state_slots")
-    slots = (TWO + proposals + extra if mode == "align" else ONE + proposals)
+    spec_slots = ZERO if runtime.recover_ssm else proposals
+    slots = (TWO + spec_slots + extra if mode == "align" else ONE + spec_slots)
     draft_kind = metadata.get("draft_mode") or ("dspark" if runtime.dspark else "")
     draft = optional_draft_spec(model, draft_kind) if draft_kind else None
     result = []
@@ -135,8 +144,19 @@ def page_groups(case, layer_stage, query_tokens):
         draft_bytes = (block * draft_row(model, draft) * draft.layers
                        if draft is not None and stage == p.pp - ONE
                        and (proposals > ZERO or bool(runtime.dspark)) else ZERO)
+        membership = {"layers": [plan.index for plan in plans]}
+        if runtime.recover_ssm:
+            # Replay records are separate allocations, not recurrent pool IDs.
+            membership = {"members": [
+                {"layer": plan.index, "component": component}
+                for plan in plans
+                for component in layer_cache_components(
+                    model, plan, p, runtime.max_model_len, runtime=runtime,
+                    query_tokens=query_tokens, capacity_padded=False)
+                if component not in {"replay_records", "state_transient"}
+            ]}
         result.append({
-            "layers": [plan.index for plan in plans],
+            **membership,
             "tokens_per_page": block * p.cp,
             "bytes_per_group_page": int(main_slots * main_page + block * index + draft_bytes),
             "recycling_pages": state_groups * slots,

@@ -26,7 +26,7 @@ from .memory_traffic import (AttentionAccessSpec, AttentionSchedule,
 from mindie_sim.catalog.cache import (
     completed_rows, index_row_bytes, index_selection_cost, local_kv_heads,
 )
-from mindie_sim.catalog.cache_format import cache_format
+from mindie_sim.catalog.cache_format import CacheFormat, cache_format
 from mindie_sim.catalog.ops import gemm_op, vector_op, cache_store_op, comm_op, barrier_op
 from mindie_sim.catalog.context_parallel import split_causal_pairs, owned_positions
 from mindie_sim.schema.operators import OpSpec
@@ -36,20 +36,25 @@ from .batch_prefix_attention import (
     annotate_sparse_prefix_unknown, apply_attention_prefix_reads,
 )
 from .batch_prefix_indexer import apply_indexer_prefix_reads
+from .generic_latent_attention import index_key_window, visible_parts
+from .prefix_reads import _merged_interval_rows, owned_window_intervals
 from .sparse_attention import sparse_attention_traffic
 from .structure_groups import declare_group
 
+#: One rotate-half pair contributes a sine/cosine vector expression per
+#: rotated element: rotate, multiply, add, plus the sin/cos table lookup.
+ROTARY_OPS_PER_ELEMENT = 6
 GATE_SIGMOID_OPS_PER_ELEMENT = 4
 GATE_APPLY_OPS_PER_ELEMENT = 1
 FLOPS_PER_FMA = 2
 SOFTMAX_VECTOR_OPS_PER_PAIR = 5
 INDEX_SCORE_VECTOR_OPS_PER_ROW = 3
 TOPK_OPS_PER_ELEMENT = 4
-READ_WRITE_ONE = 1.0
 DEFAULT_BLOCK_SIZE = 128
 DEFAULT_CP_INTERLEAVE = 128
 DEFAULT_IDX_DIM = 64
 FP32_BYTES = 4
+INT32_BYTES = 4
 
 
 def _memory_hierarchy(machine):
@@ -170,11 +175,12 @@ def _gqa_formats(model):
 
 
 def _attention_tensor_view(views, heads, kv_heads, width, model, quant,
-                           parallel, policy, runtime, causal=True):
+                           parallel, policy, runtime, causal=True, cacheless=False):
     """A paged ABI requires an explicit storage declaration, not a query length."""
-    if policy.kv_storage != "paged":
+    if cacheless or policy.kv_storage != "paged":
         return _contiguous_tensor_view(
-            views, heads, kv_heads, width, model, quant, parallel)
+            views, heads, kv_heads, width, model, quant, parallel,
+            cacheless=cacheless)
     if runtime is None or parallel.cp != 1 or parallel.pcp != 1:
         return ()
     query = (sum(view.q_len for view in views), heads, width)
@@ -215,10 +221,11 @@ def _attention_tensor_view(views, heads, kv_heads, width, model, quant,
     }),)
 
 
-def _contiguous_tensor_view(views, heads, kv_heads, width, model, quant, parallel):
+def _contiguous_tensor_view(views, heads, kv_heads, width, model, quant, parallel,
+                            *, cacheless=False):
     """Fresh prefill has explicit TND operands, before any paged-cache reuse."""
     if parallel.cp != 1 or parallel.pcp != 1 or any(
-        view.phase != "prefill" or view.context for view in views
+        (not cacheless and view.phase != "prefill") or view.context for view in views
     ):
         return ()
     query = (sum(view.q_len for view in views), heads, width)
@@ -255,7 +262,7 @@ def _cache_tensor_view(views, kv_heads, width, key_fmt, value_fmt, shared,
 
 def _decode_contract(views, heads, kv_heads, width, model, quant, parallel, plan, mode,
                      *, window=None, cp=None):
-    if mode not in {"decode", "draft"}:
+    if plan.cache_kind == "none" or mode not in {"decode", "draft"}:
         return ()
     requests = tuple((view.q_len, view.context) for view in views)
     queries = {query for query, _ in requests}
@@ -276,7 +283,7 @@ def _decode_contract(views, heads, kv_heads, width, model, quant, parallel, plan
 def _prefill_contract(views, heads, kv_heads, width, model, quant, parallel, plan, mode,
                       *, window=None, cp=None):
     """Declare per-request prefill geometry; the explicit recipe validates it."""
-    if mode not in {"prefill", "draft_prefill"}:
+    if plan.cache_kind != "none" and mode not in {"prefill", "draft_prefill"}:
         return ()
     eff_win = int(plan.window or 0) if window is None else int(window)
     eff_cp = int(parallel.cp) if cp is None else int(cp)
@@ -330,8 +337,13 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         padded_tokens, policy=AttentionPolicy(), cp_interleave_size=DEFAULT_CP_INTERLEAVE,
         runtime=None, cache_ids=None, stage_of=None, topk_ids=None,
         index_cache_ids=None, candidate_ids=None, machine=None, **_) -> AttentionResult:
-    from .implementations import select
+    from .implementations import add_input_ports, select
 
+    cacheless = plan.cache_kind == "none"
+    if cacheless:
+        views = tuple(replace(v, context=0, prefix_tokens=0,
+                              prefix_cache_key="") for v in views)
+        quant = replace(quant, kv_dtype=model.activation_dtype)
     selected = select(runtime.kernels.get("lowerings", {}), "gqa_attention") if runtime else None
     if selected:
         selected.module.validate(views=views, plan=plan, parallel=parallel, policy=policy,
@@ -340,7 +352,10 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
     kv_heads = local_kv_heads(plan.num_kv_heads, parallel.tp)
     width = plan.head_dim
     key_fmt, value_fmt, cache_regions, shared_format = _gqa_formats(model)
-    shared = 0 <= plan.kv_owner_layer_id < plan.index
+    if cacheless:
+        key_fmt = value_fmt = CacheFormat(model.activation_dtype)
+        shared_format = True
+    shared = not cacheless and 0 <= plan.kv_owner_layer_id < plan.index
     # ``k_eq_v`` shares the *projection weight*; it never shares the post-norm /
     # post-RoPE cache tensor.  K and V are distinct planes for store, read and
     # PCP gather, so capacity and execution bytes conserve.
@@ -348,7 +363,11 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
     cache_planes = 2
     projected_kv_heads = 0 if shared else kv_heads
     configured_recipes = runtime.kernels.get("recipes", {}) if runtime else {}
-    if mode in {"decode", "draft"} and "flash_attention_decode" in configured_recipes:
+    if cacheless:
+        attention_recipe = ("flash_attention_prefill"
+                            if "flash_attention_prefill" in configured_recipes
+                            else "flash_attention")
+    elif mode in {"decode", "draft"} and "flash_attention_decode" in configured_recipes:
         attention_recipe = "flash_attention_decode"
     elif (mode in {"prefill", "draft_prefill"}
           and "flash_attention_prefill" in configured_recipes):
@@ -406,11 +425,19 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             if name in split_views and (name != "value" or not shared)
         ]
         ops.extend(split_copies)
+    # A declared partial-RoPE width rotates only that prefix of each head; the
+    # remaining tail is an unchanged view, never a shrunk projection.
+    rotary_width = (plan.qk_rope_head_dim
+                    if plan.qk_rope_head_dim or plan.qk_nope_head_dim else width)
     rope = vector_op(
         op_id=prefix + ".rope", deps=(ready,), stage=stage, layer=plan.index,
-        requests=requests, elements=padded_tokens * (heads + projected_kv_heads) * width,
-        ops_per_element=6, dtype=model.activation_dtype, family="rotary", phase=mode,
-        recipe="rotary", shape=(padded_tokens, heads + projected_kv_heads, width),
+        requests=requests,
+        elements=padded_tokens * (heads + projected_kv_heads) * rotary_width,
+        ops_per_element=ROTARY_OPS_PER_ELEMENT, dtype=model.activation_dtype,
+        family="rotary", phase=mode,
+        recipe="rotary", shape=(padded_tokens, heads + projected_kv_heads, rotary_width),
+        metadata=(("rotary_dim", rotary_width), ("head_dim", width),
+                  ("tail_policy", "unchanged_view")),
     )
     valid = sum(view.q_len for view in views)
     store_ready = rope.op_id
@@ -444,7 +471,9 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         for rank in range(max_dcp))
     store_deps = ((store_ready, value_ready)
                   if value_ready and not pcp_prefill else (store_ready,))
-    if shared:
+    if cacheless:
+        store_ids = store_deps
+    elif shared:
         extra, owner_ready = shared_kv_input(
             prefix=prefix, plan=plan, stage=stage, views=views,
             cache_ids=cache_ids or {}, stage_of=stage_of,
@@ -488,6 +517,8 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
     eff_topk = int(plan.index_topk) if has_indexer else 0
     index_store_id = candidate_id = None
     topk_id = (topk_ids or {}).get(sel_owner) if sel_owner >= 0 else None
+    idx_ratio = max(1, int(plan.compress_ratio or 1), int(plan.index_kpool or 1))
+    sel_topk = max(1, eff_topk // idx_ratio) if idx_ratio > 1 else eff_topk
     block_size = max(
         1, int(getattr(runtime, "kv_block_size", DEFAULT_BLOCK_SIZE) or DEFAULT_BLOCK_SIZE))
     configured_families = runtime.kernels.get("families", {}) if runtime else {}
@@ -499,8 +530,6 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         row_bytes = cost.index_row_bytes or index_row_bytes(model, plan.index_dim)
         idx_heads = max(1, int(plan.index_heads or 1))
         idx_dim = max(1, int(plan.index_dim or DEFAULT_IDX_DIM))
-        idx_ratio = max(1, int(plan.compress_ratio or 1), int(plan.index_kpool or 1))
-        sel_topk = max(1, eff_topk // idx_ratio) if idx_ratio > 1 else eff_topk
         cand_cap = (plan.candidate_topk_blocks * plan.candidate_block_size
                     if plan.candidate_filter else 0)
         new_idx_rows = (
@@ -513,6 +542,7 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         )
         rows_by_view: list[int] = []
         shared_idx_by_view: list[int] = []
+        pairs_by_view: list[int] = []
         for v in views:
             v_ranges = v.query_ranges or ((0, v.q_len),)
             v_scored = int(sum(
@@ -523,10 +553,13 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             ))
             raw_pref = max(0, min(int(getattr(v, "prefix_tokens", 0) or 0), int(v.context)))
             aligned_pref = ((raw_pref // block_size) * block_size) // idx_ratio
-            q_cnt = sum(e_p - s_p for s_p, e_p in v_ranges if e_p > s_p)
-            rows_by_view.append(v_scored)
-            shared_idx_by_view.append(min(v_scored, aligned_pref))
-        scored_rows = sum(rows_by_view)
+            physical_rows, _ = index_key_window(
+                visible_parts(v), noncausal=bool(plan.noncausal_attention),
+                kv_len=v.kv_len, compression=idx_ratio)
+            pairs_by_view.append(v_scored)
+            rows_by_view.append(physical_rows)
+            shared_idx_by_view.append(min(physical_rows, aligned_pref))
+        scored_rows = sum(pairs_by_view)
         idx_wq = gemm_op(
             op_id=prefix + ".index_wq", deps=(deps,), stage=stage, layer=plan.index,
             requests=requests, m=padded_tokens, n=idx_heads * idx_dim, k=model.hidden_size,
@@ -566,8 +599,7 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             pcp_idx_ops = (idx_gather,)
             idx_ready = idx_gather.op_id
         q_idx_bytes = valid * idx_heads * idx_dim * dtype_bytes(quant.index_dtype)
-        unique_idx_rows = sum(
-            max(1, int(v.kv_len) // idx_ratio) for v in views)
+        unique_idx_rows = sum(rows_by_view)
         l2_bounded_index_read = float(min(scored_rows, unique_idx_rows)) * row_bytes
         shape = (scored_rows, idx_heads, idx_dim)
         score_bytes = float(scored_rows * FP32_BYTES)
@@ -586,16 +618,20 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         idx_scores = apply_indexer_prefix_reads(
             idx_scores, views=views, rows_by_view=rows_by_view,
             shared_rows_by_view=shared_idx_by_view, row_bytes=float(row_bytes),
-            layer_index=plan.index, runtime=runtime,
-            kernel_reuse=("batch_tile" if runtime is not None
-                          and runtime.prefix_cache_mode == "shared"
-                          else ("native_per_sequence" if user_pinned_idx else "tile")),
-            allow_recipe_rebind=not user_pinned_idx)
+            layer_index=plan.index, runtime=runtime, compression_ratio=idx_ratio,
+            kernel_reuse=("native_per_sequence"
+                          if user_pinned_idx or plan.candidate_filter else "tile"),
+            allow_recipe_rebind=not user_pinned_idx,
+            hbm_component=l2_bounded_index_read,
+            mte2_component=float(scored_rows) * row_bytes)
         idx_topk = vector_op(
             op_id=prefix + ".index_topk", deps=(idx_scores.op_id,), stage=stage,
             layer=plan.index, requests=requests, elements=scored_rows,
             ops_per_element=TOPK_OPS_PER_ELEMENT, dtype="fp32", family="topk", phase=mode,
-            recipe="index_topk", shape=(valid, sel_topk), read_write=READ_WRITE_ONE,
+            recipe="index_topk", shape=(valid, sel_topk),
+            # The reducer reads FP32 scores but publishes INT32 ids.
+            read_bytes_override=float(scored_rows * FP32_BYTES),
+            write_bytes_override=float(valid * sel_topk * INT32_BYTES),
             metadata=(("selection_output_dtype", "int32"),))
         ops.extend((idx_wq, idx_wk, idx_store, *pcp_idx_ops,
                     idx_scores, idx_topk))
@@ -604,7 +640,12 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         index_store_id = (index_cache_ids or {}).get(idx_owner)
     eff_window = min_positive(plan.window, eff_topk)
     dense_win = int(plan.window or 0)
-    attention_deps = (*store_ids, topk_id) if topk_id else store_ids
+    # The fused query producer supplies the attention query operand; retain an
+    # explicit consumer edge and port so a partial-RoPE query never becomes an
+    # unbound output (the cache edge alone carries only key/value).
+    query_producer = rope.op_id
+    attention_deps = ((*store_ids, topk_id, query_producer) if topk_id
+                      else (*store_ids, query_producer))
     streams = kv_heads if policy.reuse_kv_across_query_heads else heads
     kv_row_bytes = (
         key_fmt.row_bytes(cache_planes * streams * width)
@@ -638,10 +679,13 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         per_view_sweeps: list[list[int]] = []
         per_view_shared: list[list[int]] = []
         per_view_rows: list[list[int]] = []
+        per_view_spans: list[tuple[list[tuple[int, int]], list[tuple[int, int]]]] = []
         for _, view in indexed_views:
             q, context = view.q_len, view.context
             ranges = view.query_ranges or ((0, q),)
             selected_q = sum(end - start for start, end in ranges if end > start)
+            win_spans: list[tuple[int, int]] = []
+            sh_spans: list[tuple[int, int]] = []
             if eff_topk > 0:
                 pairs = sum(
                     _long_selected_pairs(
@@ -694,6 +738,10 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                             hi = context + min(end, start + policy.query_tile)
                             lo = max(0, context + start + 1 - dense_win) if dense_win > 0 else 0
                         shared_hi = min(hi, aligned_prefix)
+                        if hi > lo:
+                            win_spans.append((lo, hi))
+                        if shared_hi > lo:
+                            sh_spans.append((lo, shared_hi))
                         for rank in range(eff_cp):
                             v_sweeps[rank] += owned_positions(
                                 lo, hi - 1, eff_cp, cp_interleave_size, rank)
@@ -713,12 +761,15 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             per_view_sweeps.append(v_sweeps)
             per_view_shared.append(v_shared)
             per_view_rows.append(v_rows)
+            per_view_spans.append((win_spans, sh_spans))
         worst_r = max(range(eff_cp), key=lambda r: (rank_pairs[r], rank_sweeps[r]))
         worst_sweeps_r = max(
             range(eff_cp), key=lambda r: (rank_sweeps[r], rank_pairs[r]))
         batches: list[OpSpec] = []
         sweeps_by_view: list[int] = []
         shared_sweeps_by_view: list[int] = []
+        unique_win_by_view: list[int] = []
+        shared_iv_by_view: list[tuple[tuple[int, int], ...]] = []
         total_pairs_sum = 0.0
         total_rows_sum = 0
         kv_hbm_total = 0.0
@@ -729,8 +780,15 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             local_pairs = v_pairs[worst_r]
             view_sweeps = per_view_sweeps[v_pos][worst_sweeps_r]
             local_rows = per_view_rows[v_pos][worst_r]
+            win_spans, sh_spans = per_view_spans[v_pos]
+            owned_win = owned_window_intervals(
+                win_spans, eff_cp, cp_interleave_size, worst_sweeps_r)
+            owned_sh = owned_window_intervals(
+                sh_spans, eff_cp, cp_interleave_size, worst_sweeps_r)
             sweeps_by_view.append(view_sweeps)
             shared_sweeps_by_view.append(min(view_sweeps, per_view_shared[v_pos][worst_sweeps_r]))
+            unique_win_by_view.append(_merged_interval_rows(owned_win))
+            shared_iv_by_view.append(owned_sh)
             total_pairs_sum += pairs
             total_rows_sum += view.kv_len
             traffic = plan_attention_traffic(
@@ -763,6 +821,9 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             element_bytes = dtype_bytes(model.activation_dtype)
             query_bytes = view.q_len * heads * qk_width * element_bytes
             output_bytes = view.q_len * heads * v_width * element_bytes
+            # A selected-ID consumer reads the INT32 TopK map its producer wrote.
+            selection_bytes = (float(view.q_len * sel_topk * INT32_BYTES)
+                               if topk_id and eff_topk > 0 else 0.0)
             shape = (view.q_len, view.kv_len, heads, qk_width)
             op = OpSpec(
                 op_id=f"{prefix}.attention.{orig_idx}", family="attention", phase=mode,
@@ -771,8 +832,9 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                 padded_shape=shape, launch_shape=shape,
                 flops=FLOPS_PER_FMA * local_pairs * heads * (qk_width + v_width),
                 vector_ops=SOFTMAX_VECTOR_OPS_PER_PAIR * local_pairs * heads,
-                hbm_bytes=kv_bytes + query_bytes + output_bytes,
-                mte2_bytes=kv_refill_bytes + query_bytes, mte3_bytes=output_bytes,
+                hbm_bytes=kv_bytes + query_bytes + output_bytes + selection_bytes,
+                mte2_bytes=(kv_refill_bytes + query_bytes + selection_bytes),
+                mte3_bytes=output_bytes,
                 deps=attention_deps, recipe=attention_recipe, dtype=model.compute_dtype,
                 metadata=(("query_tile", policy.query_tile), ("causal_pairs", pairs),
                           ("local_pairs", local_pairs), ("kv_streams", streams),
@@ -788,12 +850,15 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                              window=eff_window, cp=eff_cp)
                          + _attention_tensor_view(
                              (view,), heads, kv_heads, width, model, quant, parallel,
-                             policy, runtime, causal=not plan.noncausal_attention),
+                             policy, runtime, causal=not plan.noncausal_attention,
+                             cacheless=cacheless),
             )
             if selected:
                 op = selected.module.lower_op(
                     op, view=view, plan=plan, key_heads=kv_heads, model=model,
                     runtime=runtime, **selected.options)
+            op = add_input_ports(
+                op, ({"op": query_producer, "output": "query"},))
             batches.append(op)
         grp_attn: list[str] = []
         if policy.fused_batch and not selected and batches:
@@ -818,11 +883,12 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                              parallel, plan, mode, window=eff_window, cp=eff_cp)
                          + _attention_tensor_view(
                              grp_views, heads, kv_heads, width, model, quant, parallel,
-                             policy, runtime, causal=not plan.noncausal_attention),
+                             policy, runtime, causal=not plan.noncausal_attention,
+                             cacheless=cacheless),
                 **{key: sum(getattr(op, key) for op in batches) for key in fields})
             if eff_topk > 0:
                 batched = annotate_sparse_prefix_unknown(batched, runtime)
-            else:
+            elif not cacheless:
                 batched = apply_attention_prefix_reads(
                     batched, views=grp_views, sweeps_by_view=sweeps_by_view,
                     shared_sweeps_by_view=shared_sweeps_by_view, row_bytes=float(kv_row_bytes),
@@ -831,13 +897,15 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                     allow_recipe_rebind=not user_pinned_attn,
                     kv_hbm_bytes=kv_hbm_total,
                     kv_mte2_bytes=kv_mte2_total,
+                    unique_rows_by_view=unique_win_by_view,
+                    shared_intervals_by_view=shared_iv_by_view,
                 )
             ops.append(batched)
             grp_attn = [batched.op_id]
         elif batches:
             if eff_topk > 0:
                 batches = [annotate_sparse_prefix_unknown(item, runtime) for item in batches]
-            else:
+            elif not cacheless:
                 for pos, item in enumerate(batches):
                     view = indexed_views[pos][1]
                     kv_hbm_b, kv_mte2_b = kv_components[pos]
@@ -849,6 +917,8 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                         kernel_reuse="native_per_sequence", allow_recipe_rebind=False,
                         kv_hbm_bytes=kv_hbm_b,
                         kv_mte2_bytes=kv_mte2_b,
+                        unique_rows_by_view=(unique_win_by_view[pos],),
+                        shared_intervals_by_view=(shared_iv_by_view[pos],),
                     )
             ops.extend(batches)
             grp_attn = [item.op_id for item in batches]
@@ -900,7 +970,8 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
     if plan.qk_norm and not shared and not plan.k_eq_v:
         _declare_qkv_norm_rope(
             ops, qkv, normalized, rope, split_copies, split_views, model.activation_dtype)
-    return AttentionResult(ops=ops, last=last, cache_store_id=store_ids[0],
+    return AttentionResult(ops=ops, last=last,
+                           cache_store_id=None if cacheless else store_ids[0],
                            index_store_id=index_store_id, topk_id=topk_id,
                            candidate_id=candidate_id)
 

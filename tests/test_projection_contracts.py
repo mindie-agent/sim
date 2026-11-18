@@ -97,18 +97,24 @@ def test_key_value_widths_and_direct_gate_remain_independent():
     assert terms["kda_g"].cols == 4096 and "kda_g_a" not in terms
 
 
-def test_explicit_parent_then_child_precision_wins_and_incompatible_pack_splits():
+def test_explicit_parent_then_child_precision_wins_and_incompatible_pack_groups():
     c = case({"kda": INT8, "kda.q": BF16})
     plan, ops, _ = kda_ops(c)
     by_recipe = {op.recipe: op for op in ops}
     assert "linear_qkvbfg_a" not in by_recipe
     assert by_recipe["linear_q"].dtype == "bf16"
-    assert by_recipe["linear_k"].dtype == by_recipe["linear_gate_b"].dtype == "int8"
-    assert dict(by_recipe["linear_q"].metadata)["projection_packing"] == "separate_explicit_operand_formats"
+    int8 = next(op for op in ops if op.dtype == "int8")
+    assert by_recipe["linear_gate_b"].dtype == "int8"
+    slices = dict(int8.metadata)["packed_projection_slices"]
+    assert [row["role"] for row in slices] == ["k", "v", "b", "f_a", "g_a"]
+    assert dict(int8.metadata)["projection_packing"] == \
+        "compatible_group_shared_input_output_slices"
     terms = {term.name: term for term in layer_weight_terms(plan, c.model)}
-    for op, term in ((by_recipe["linear_q"], terms["kda_q"]),
-                     (by_recipe["linear_k"], terms["kda_k"])):
-        assert dict(op.metadata)["packed_weight_bytes"] == term_bytes(term, c.model.quant, c.runtime.parallel)
+    assert dict(by_recipe["linear_q"].metadata)["packed_weight_bytes"] == term_bytes(
+        terms["kda_q"], c.model.quant, c.runtime.parallel)
+    assert dict(int8.metadata)["packed_weight_bytes"] == sum(
+        term_bytes(terms[name], c.model.quant, c.runtime.parallel)
+        for name in ("kda_k", "kda_v", "kda_b", "kda_f_a", "kda_g_a"))
     # Native child defaults cannot defeat an explicit parent declaration.
     c2 = case({"indexer": INT8, "indexer.weights": FP32})
     q = projection_quant(c2.model.quant, c2.model.layer_plans[3])
@@ -143,10 +149,10 @@ def test_fp32_index_weight_contract_shares_joint_projection_and_prepared_capacit
     assert matrix.local_shape == (24, 160, 4096) and matrix.dtype == "fp32"
     assert matrix.deps == (cast.op_id,)
     assert cast.mte2_bytes == 24 * 4096 * 2 and cast.mte3_bytes == 24 * 4096 * 4
-    weights = by_recipe["index_weights_cast"]
-    assert weights.deps == (matrix.op_id,)
-    assert dict(weights.metadata)["input_column_slice"] == (128, 160)
-    assert weights.mte2_bytes == 24 * 32 * 4
+    # The native indexer consumes the joint projection's weight column slice
+    # directly: no eager cast/slice producer is launched.
+    assert "index_weights_cast" not in by_recipe
+    assert "index_weights_scale" not in by_recipe
     terms = {term.name: term for term in layer_weight_terms(c.model.layer_plans[3], c.model)}
     assert term_bytes(terms["indexer_weights"], c.model.quant, c.runtime.parallel) == 32 * 4096 * 2
     assert sum(term_bytes(terms[name], c.model.quant, c.runtime.parallel)
@@ -163,7 +169,7 @@ def test_explicit_index_weight_precision_splits_joint_pool_projection():
     assert weights.dtype == "bf16" and weights.local_shape == (24, 32, 4096)
     assert key.deps == (by_recipe["index_pool_hidden_fp32"].op_id,)
     assert weights.deps != key.deps
-    assert by_recipe["index_weights_scale"].deps == (weights.op_id,)
+    assert "index_weights_scale" not in by_recipe
     terms = {term.name: term for term in layer_weight_terms(c.model.layer_plans[3], c.model)}
     assert "indexer_weights_prepared_fp32" not in terms
     assert term_bytes(terms["indexer_weights"], c.model.quant, c.runtime.parallel) == dict(weights.metadata)["packed_weight_bytes"]
@@ -213,12 +219,18 @@ def test_packed_kda_consumer_copies_have_source_offsets_and_real_dependencies():
     assert min(row['ready_ms'] for row in report['timeline']) >= 7
 
 
-def test_strided_consumers_keep_views_and_separate_projections_do_not_gain_fake_slices():
+def test_strided_consumers_keep_views_and_single_slice_groups_do_not_copy():
     c = case()
     old = target_graphs(c, phase='decode', tokens=4, sequences=4, context=2048, scope='body')[0]
     assert not any(op.recipe in {'kda_beta_contiguous', 'convolution_input_contiguous'} for op in old)
     c = case({'kda': INT8, 'kda.q': BF16})
     c = replace(c, runtime=replace(c.runtime, tensor_layouts={
         'short_convolution': {'input': 'contiguous'}, 'kda_recurrent': {'beta': 'contiguous'}}))
-    separate = target_graphs(c, phase='decode', tokens=4, sequences=4, context=2048, scope='body')[0]
-    assert not any(op.recipe in {'kda_beta_contiguous', 'convolution_input_contiguous'} for op in separate)
+    grouped = target_graphs(c, phase='decode', tokens=4, sequences=4, context=2048, scope='body')[0]
+    by_recipe = {op.recipe: op for op in grouped}
+    # Only the packed BF16 ``q`` slice stays an independent matrix; the INT8
+    # group's ``b`` slice is strided, so its declared contiguous consumer
+    # materializes exactly that payload.  Q/K/V keep ordinary views.
+    assert by_recipe['kda_beta_contiguous'].local_shape == (16, 4)
+    assert by_recipe['kda_beta_contiguous'].mte2_bytes == 16 * 4 * 2
+    assert 'convolution_input_contiguous' not in by_recipe

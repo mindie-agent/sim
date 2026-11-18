@@ -42,8 +42,111 @@ SOURCE = {
 }
 
 
+ROW_SHARD_OPTION = "keypool_row_shard_tp"
+#: Accepted alias used by callers that already spell the axis generically.
+ROW_SHARD_ALIAS = "row_shard_tp"
+
+
 def recipes():
     return {}
+
+
+def _row_shard_value(source):
+    if source is None:
+        return None
+    value = source.get(ROW_SHARD_OPTION)
+    return source.get(ROW_SHARD_ALIAS) if value is None else value
+
+
+def row_shard_tp(*, options=None, runtime=None):
+    """Local-TP width that owns `AscendIndexerKPoolRowShard`, or `1`.
+
+    The caller option wins; otherwise the declared local dense-projection width
+    of this rank's `o_proj` / `linear_proj` owns the shard. A width of one keeps
+    the replicated query plane, so both modes stay selectable.
+    """
+    explicit = _row_shard_value(options)
+    if explicit is not None:
+        if isinstance(explicit, bool) or not isinstance(explicit, int) or explicit < 1:
+            raise ModelingError("index_pool_row_shard_tp_invalid")
+        return explicit
+    metadata = dict(getattr(runtime, "metadata", ()) or ())
+    declared = _row_shard_value(metadata)
+    if declared is not None:
+        if isinstance(declared, bool) or not isinstance(declared, int) or declared < 1:
+            raise ModelingError("index_pool_row_shard_tp_invalid")
+        return declared
+    parallel = getattr(runtime, "parallel", None)
+    if parallel is None:
+        return 1
+    return max(1, int(parallel.o_proj_tp), int(parallel.linear_proj_tp))
+
+
+def row_slice(views, start, stop):
+    """Slice flattened rows and retain each cut row's original causal position."""
+    result, pos = [], 0
+    for view in views:
+        end = pos + view.q_len
+        lo, hi = max(pos, start), min(end, stop)
+        if hi > lo:
+            if lo == pos and hi == end:
+                result.append(view)
+            elif view.query_ranges:
+                ranges, offset = [], pos
+                for left, right in view.query_ranges:
+                    size = right - left
+                    a, b = max(lo, offset), min(hi, offset + size)
+                    if b > a:
+                        ranges.append((left + a - offset, left + b - offset))
+                    offset += size
+                result.append(replace(view, q_len=hi-lo, query_ranges=tuple(ranges),
+                                      global_q_len=view.global_q_len or view.q_len))
+            else:
+                result.append(replace(view, q_len=hi-lo, context=view.context + lo-pos,
+                                      global_q_len=0))
+        pos = end
+    return tuple(result)
+
+
+def row_shard_partition(views, divisor):
+    if isinstance(divisor, bool) or not isinstance(divisor, int) or divisor < 1:
+        raise ModelingError("index_pool_row_shard_divisor_invalid")
+    if divisor == 1:
+        return tuple(views)
+    rows = sum(v.q_len for v in views)
+    return row_slice(views, 0, -(-rows // divisor))
+
+
+MIN_SHARD_ROWS_PER_RANK = 1024
+MIN_SHARD_SCORE_PAIRS = 16_777_216
+
+
+def native_shard_sizes(views, pool, width):
+    """Use the native zero-based searchsorted convention on cumulative row cost."""
+    from bisect import bisect_left
+    from mindie_sim.catalog.index_pool import completed_prefix
+    rows = sum(v.q_len for v in views)
+    if width < 2 or rows < width * MIN_SHARD_ROWS_PER_RANK:
+        return (rows,)
+    ends, costs = [0], [0]
+    for v in views:
+        ends.append(ends[-1] + v.q_len)
+        costs.append(costs[-1] + completed_prefix(v.context + v.q_len, pool)
+                     - completed_prefix(v.context, pool))
+    if costs[-1] < MIN_SHARD_SCORE_PAIRS:
+        return (rows,)
+
+    def cumulative(index):
+        j = bisect_left(ends, index + 1) - 1
+        ctx = views[j].context
+        return costs[j] + completed_prefix(ctx + index + 1 - ends[j], pool) - completed_prefix(ctx, pool)
+
+    cuts = [0]
+    for rank in range(1, width):
+        cut = bisect_left(range(rows), rank * costs[-1] // width, key=cumulative)
+        cuts.append(min(rows - (width-rank), max(cuts[-1] + 1, cut)))
+    cuts.append(rows)
+    return tuple(b-a for a, b in zip(cuts, cuts[1:]))
 
 
 def _selection_for(view, plan):
@@ -502,6 +605,9 @@ def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
               ("causal_token_pairs", _causal_token_pairs(views, noncausal=bool(plan.noncausal_attention))),
               ("scanned_pools", scanned), ("selected_pools", selected),
               ("selected_token_rows", valid_indices),
+              ("selected_request_ids", tuple(v.request_id for v in views)),
+              ("selected_tokens_by_request",
+               tuple(g.selected_tokens for g in geometry)),
               ("native_owner_schedule", "not_selected"),
               ("implementation_basis", "analytic_resource_phases"), ("native_source", SOURCE))
     query_dtype = _op_dtype(b, query, quant.index_dtype)
@@ -511,6 +617,9 @@ def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
     score_dtype = "fp32"
     score_elem_b = dtype_bytes(score_dtype)
     members, entries = [], []
+    runtime_meta = dict(getattr(runtime, "metadata", ()) or ())
+    raw_eager = bool(runtime_meta.get("raw_eager")
+                     or runtime_meta.get("execution_policy", {}).get("raw_eager"))
     materialized_scores = False
     if score_mode == "linear_weighted_query":
         query_f32 = b.vector(
@@ -530,10 +639,9 @@ def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
             write=tokens * width * FP32_BYTES, family="indexer", dtype="fp32",
             metadata=common)
         members.extend((query_f32, weights_f32, weighted)); entries.extend((query_f32, weights_f32))
-        # The declared weighted-query implementation is FP32 vector arithmetic;
-        # it is not a BF16 Cube matmul and the score tile is materialized unless
-        # one executable fused plan owns the tile and the TopK state in UB.
-        materialized_scores = True
+        # Non-eager scoring and online TopK retain their tile in UB.
+        # Raw eager execution materializes the FP32 scores between calls.
+        materialized_scores = raw_eager
         scores = b.work(
             "index_pool_scores", (weighted, cache), (tokens, width),
             flops=0.0,
@@ -541,9 +649,11 @@ def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
             vector=FLOPS_PER_FMA * scanned * width,
             read=float(scanned) * row_bytes + tokens * width * FP32_BYTES,
             hbm_read=l2_bounded_pool_read + tokens * width * FP32_BYTES,
-            write=scanned * score_elem_b, family="indexer", dtype=score_dtype,
+            write=scanned * score_elem_b if materialized_scores else 0.0,
+            family="indexer", dtype=score_dtype,
             metadata=common + (("score_materialization",
-                                "separate_fp32_score_then_topk"),))
+                                "separate_fp32_score_then_topk" if materialized_scores
+                                else "ub_online_topk"),))
         entries.append(scores)
     else:
         matrix = ()
@@ -571,18 +681,19 @@ def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
         "index_pool_topk", (scores,), (tokens, pool_topk),
         vector=scanned * math.log2(max(2, pool_topk)),
         read=topk_score_read,
-        write=tokens * pool_topk * INT32_BYTES,
+        write=tokens * pool_topk * INT32_BYTES if raw_eager else 0.0,
         family="topk", dtype=score_dtype, metadata=common + (
             ("selection_output_dtype", "int32"),
             ("score_materialization",
              "separate_fp32_score_then_topk" if materialized_scores
-             else "per_head_mma")))
+             else ("ub_online_topk" if score_mode == "linear_weighted_query"
+                   else "per_head_mma"))))
     tail_rows = sum(g.causal_tail_tokens for g in geometry)
     has_output = (selected > 0 or tail_rows > 0) and tokens > 0
     packed = b.work(
         "index_topk", (topk,), (tokens, output_width),
         vector=selected * plan.index_kpool * 2 + (tokens * output_width if has_output else 0),
-        read=tokens * pool_topk * INT32_BYTES if (selected > 0 and tokens > 0) else 0,
+        read=tokens * pool_topk * INT32_BYTES if (raw_eager and selected > 0 and tokens > 0) else 0,
         write=tokens * output_width * INT32_BYTES if has_output else 0,
         family="topk", dtype="int32", metadata=common + (
             ("selection_output_dtype", "int32"), ("selection_capacity", output_width),

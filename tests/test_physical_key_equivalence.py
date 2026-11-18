@@ -34,10 +34,9 @@ def test_corresponding_layers_share_one_physical_identity():
     for group in repeated:
         corresponding = [op for op in group if op.layer > 0]
         assert len(corresponding) > 1
-        signatures = {physical_signature(op) for op in corresponding}
-        assert len(signatures) == 1
-        assert len({physical_id(op) for op in corresponding}) == 1
+        assert len({physical_signature(op) for op in corresponding}) == 1
         assert len({physical_key(op) for op in corresponding}) == 1
+        assert len({physical_id(op) for op in corresponding}) == 1
 
 
 def test_shape_dtype_bytes_state_and_local_tp_change_identity():
@@ -59,7 +58,9 @@ def _rotate(value, stage, layer, target_layer):
     if isinstance(value, str):
         return value.replace(f"s{stage}.l{layer}.", f"s{stage}.l{target_layer}.")
     if isinstance(value, dict):
-        return {key: _rotate(item, stage, layer, target_layer)
+        return {key: item + target_layer - layer
+                if key in {"layer", "layer_index"} and type(item) is int
+                else _rotate(item, stage, layer, target_layer)
                 for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return tuple(_rotate(item, stage, layer, target_layer) for item in value)

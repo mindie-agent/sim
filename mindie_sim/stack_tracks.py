@@ -49,6 +49,50 @@ TRACK_ALIASES: dict[str, str] = {
     "ideal": "expected_ideal",
 }
 
+#: Runtime lowerings installed by a documented profile or mechanism.  An
+#: explicit ``exclude_optimizations`` entry owns every selector its mechanism
+#: can install, so the profile path cannot silently retain the excluded fusion.
+_MECHANISM_LOWERING_SELECTORS: dict[str, tuple[str, ...]] = {
+    "add_rmsnorm_quant_fusion": (
+        "add_rmsnorm", "add_rmsnorm_quant", "rmsnorm_quant"),
+    "mla_prolog_fusion": ("mla_prolog",),
+    "attn_res_prefix_fusion": ("attention_residual",),
+    "recurrent_decode_native_kernels": ("kda", "gdn_decode"),
+    "gdn_chunk64_prefill": ("gdn_prefill",),
+}
+#: Mechanism passes installed by the same profile/mechanism path.
+_MECHANISM_LOWERING_PASSES: dict[str, tuple[str, ...]] = {
+    "add_rmsnorm_quant_fusion": ("residual_norm",),
+    "mhc_boundary_fusion_overlap": ("mhc_boundary_pr", "mhc_boundary_ideal"),
+    "gdn_projection_multistream_overlap": ("gdn_projection_overlap",),
+    "kda_in_kernel_l2norm": ("kda_in_kernel_l2norm",),
+    "qkv_norm_rope_fusion": ("qkv_norm_rope",),
+    "indexer_online_ub_topk": ("indexer_online_topk",),
+    "activation_quant_fusion": ("activation_quant",),
+    "gmm_swiglu_quant_fusion": ("gmm_swiglu_quant",),
+    "moe_tail_residual_fusion": ("moe_tail_residual",),
+}
+
+
+def excluded_lowering_bindings(
+    exclude_optimizations: Sequence[str] = (),
+) -> tuple[frozenset[str], frozenset[str]]:
+    """Resolve excluded mechanism IDs into installed selectors and passes."""
+    excluded = frozenset(
+        str(value).strip() for value in exclude_optimizations
+        if str(value).strip())
+    for mechanism_id in excluded:
+        if mechanism_id not in MECHANISM_CATALOG:
+            raise ModelingError(
+                f"unknown_optimization_mechanism:{mechanism_id}")
+    selectors = frozenset(
+        selector for mechanism_id in excluded
+        for selector in _MECHANISM_LOWERING_SELECTORS.get(mechanism_id, ()))
+    passes = frozenset(
+        name for mechanism_id in excluded
+        for name in _MECHANISM_LOWERING_PASSES.get(mechanism_id, ()))
+    return selectors, passes
+
 
 @dataclass(frozen=True)
 class StackMechanismBinding:

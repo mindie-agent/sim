@@ -122,8 +122,11 @@ def test_graph_carrier_keeps_current_hardware_and_explicit_book_or_recipe_overri
     assert slow_service["mte1@r0:s0"] == pytest.approx(76576)
     assert slow_service["mte2_aic@r0:s0"] == pytest.approx(72448)
     for key in set(fast_service) | set(slow_service):
-        if key not in {"mte1@r0:s0", "mte2_aic@r0:s0"}:
+        if key not in {"mte1@r0:s0", "mte2_aic@r0:s0", "memory@r0:s0"}:
             assert slow_service.get(key) == pytest.approx(fast_service.get(key))
+    # DRAM service modes normalize byte service to the raw HBM bus rate;
+    # changing that bus rate changes service units, never native byte work.
+    assert fast_service["memory@r0:s0"] > slow_service["memory@r0:s0"]
     assert slowed["execution"]["work"] == automatic["execution"]["work"]
     explicit = RecipeBook(families={"attention": TiledFlashAndPagedAttentionRecipe()})
     override = _graph(raw, graphs, recipes=explicit)
@@ -145,8 +148,14 @@ def test_explicit_book_does_not_install_structural_caller_and_model_scope_is_unc
     _assert_timeline_close(body["timeline"], direct["timeline"])
     assert not any(row["recipe"] == "ascend_gdn_decode_gating" for row in body["timeline"])
     model = {**GEOMETRY, "scope": "model"}
-    assert target_graphs(raw, **model) == target_graphs(raw, apply_body_defaults=False, **model)
-    assert export_structure(raw, **model)["graph_id"] == export_structure(
+    resolved_model = target_graphs(raw, **model)
+    # Assembly scope is not implementation scope: model assembly consumes the
+    # same shared resolver, and keeps the actual scope on its declaration.
+    assert resolved_model.scope == "model"
+    assert resolved_model.effective_kernels == target_graphs(raw, **GEOMETRY).effective_kernels
+    raw_model = target_graphs(raw, apply_body_defaults=False, **model)
+    assert raw_model.effective_kernels != resolved_model.effective_kernels
+    assert export_structure(raw, **model)["graph_id"] != export_structure(
         raw, apply_body_defaults=False, **model)["graph_id"]
 
 

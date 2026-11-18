@@ -29,6 +29,9 @@ from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.runtime_features import canonical_prefix_cache_key
 
 
+EMPTY_INDEX_ROWS = 0
+MIN_COMPRESSION_RATIO = 1
+
 RECIPE_NAME = "batch_prefix_indexer"
 SUPPORTED_AXES = frozenset({"index_k", "key", "kv"})
 
@@ -75,10 +78,15 @@ def apply_indexer_prefix_reads(
     runtime: Any, kernel_reuse: str = "tile", allow_recipe_rebind: bool = True,
     hbm_component: float | None = None,
     mte2_component: float | None = None,
+    compression_ratio: int = MIN_COMPRESSION_RATIO,
 ) -> Any:
     """Replace the precharged index-K components with their physical union."""
     if runtime is None or getattr(runtime, "prefix_cache_mode", "private") != "shared":
         return op
+    if compression_ratio < MIN_COMPRESSION_RATIO:
+        raise ModelingError("index_prefix_compression_must_be_positive")
+    if not len(views) == len(rows_by_view) == len(shared_rows_by_view):
+        raise ModelingError("index_prefix_access_lengths_disagree")
     accesses = []
     for view, rows, shared in zip(views, rows_by_view, shared_rows_by_view):
         if int(rows) <= 0:
@@ -97,7 +105,9 @@ def apply_indexer_prefix_reads(
         )
         physical_prefix = min(int(shared), int(rows))
         if getattr(view, "prefix_tokens", None) is not None:
-            physical_prefix = min(physical_prefix, max(0, int(view.prefix_tokens)))
+            physical_prefix = min(
+                physical_prefix,
+                max(EMPTY_INDEX_ROWS, int(view.prefix_tokens)) // compression_ratio)
         accesses.append(CacheAccess(
             request_id=str(view.request_id),
             context_tokens=context_tokens,
@@ -116,6 +126,9 @@ def apply_indexer_prefix_reads(
         op, metadata=tuple(sorted(meta.items(), key=lambda pair: pair[0])))
     read_mode = str(getattr(runtime, "prefix_read_mode", "auto") or "auto")
     plan = plan_prefix_reads(accesses, mode=read_mode, kernel_reuse=kernel_reuse)
+    if mte2_component is not None:
+        # A shared HBM fill does not eliminate independent owner refills.
+        plan = replace(plan, l2_to_core_bytes=float(mte2_component))
     updated = apply_prefix_read_plan(
         tagged, plan, hbm_component=hbm_component,
         mte2_component=mte2_component)

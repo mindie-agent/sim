@@ -21,6 +21,7 @@ _ANNOTATIONS = {
     "fusion_group_key", "fusion_semantic_ids", "fusion_external_outputs",
     "graph_segment",
     "gathered_slice",  # Equal-sized rank slices differ in address, not copy work.
+    "ep_rank",  # Rank placement label; uneven slot/work counts stay hashed.
     "norm_gamma_role",  # Role label (attn_norm/ffn_norm); format and bytes stay hashed.
 }
 _IDENTITY = {"op_id", "deps", "layer", "stage", "requests", "notes"}
@@ -28,7 +29,8 @@ _PRODUCER_REFERENCES = {
     "topk_ids_producer", "topk_weights_producer", "payload_producer", "inverse_index_producer",
     "activation_payload_producer", "activation_scale_producer",
 }
-_OCCURRENCE_PREFIX = re.compile(r"(?:^|(?<=[:/]))s\d+\.l\d+\.")
+_OCCURRENCE_PREFIX = re.compile(
+    r"(?<![\w.])(?:draft(?:\d+|_prefill)\.)?s\d+\.l\d+(?=\.|$)")
 
 
 def _signature(value):
@@ -39,7 +41,8 @@ def _signature(value):
 def _scrub_occurrence(value, occurrences):
     if isinstance(value, str):
         return _OCCURRENCE_PREFIX.sub(
-            lambda m: occurrences.setdefault(m.group(0), f"occ{len(occurrences)}."),
+            lambda m: occurrences.setdefault(
+                m.group(0), f"occ{len(occurrences)}"),
             value,
         )
     if isinstance(value, (list, tuple)):
@@ -78,6 +81,9 @@ def _metadata(value, references=None, occurrences=None):
             item = references.setdefault(item, f"producer:{len(references)}")
         elif isinstance(item, dict):
             item = _metadata(item, references, occurrences)
+        elif isinstance(item, (list, tuple)):
+            item = [_metadata(elem, references, occurrences)
+                    if isinstance(elem, dict) else elem for elem in item]
         result[key] = _scrub_occurrence(item, occurrences)
     return result
 

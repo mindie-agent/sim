@@ -59,7 +59,7 @@ def test_runtime_declaration_reaches_real_model_and_shared_execution():
     assert metadata["semantic_pairs"] == 4 * (1 + 2 + 3 + 4)
     assert attention.flops > 4 * 8 * metadata["semantic_pairs"]
     assert metadata["source_params"]["page_block_size"] == parsed.runtime.kv_block_size
-    assert attention.deps == ("s0.l0.cache",)
+    assert attention.deps == ("s0.l0.cache", "s0.l0.rope")
     assert {op.family for op in source} == {"attention", "rmsnorm"}
     isolated = operator_costs(parsed, work.ops, input_ready_ms=3)
     execution = Execution(parsed, CostModel(parsed))

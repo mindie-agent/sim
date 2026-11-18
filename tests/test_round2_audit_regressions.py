@@ -251,7 +251,9 @@ def test_candidate_id_separates_memory_budget_and_runtime_bindings():
     rebatched = deepcopy(case)
     rebatched["runtime"]["kv_block_size"] = 64
     rebound = deepcopy(case)
-    rebound["runtime"]["kernels"] = {"lowerings": {"add_rmsnorm": "vllm_ascend_native_norm"}}
+    # A binding the structural defaults never install, so the identity
+    # difference is the declaration and not an already-selected default.
+    rebound["runtime"]["kernels"] = {"lowerings": {"mla_head_padding": "vllm_ascend_mla_head_padding"}}
     assert len({baseline, _candidate_id(tiny), _candidate_id(rebatched),
                 _candidate_id(rebound)}) == 4
     assert _candidate_id(case) == baseline

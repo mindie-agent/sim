@@ -61,7 +61,7 @@ def _draft_attention_terms(draft: DraftSpec, quant: QuantSpec) -> list[WeightTer
                    "mla", "out_tp"),
                 _t("draft_wkv", wkv_rows, h, "mla"),
                 _t("draft_kv_b", draft.num_heads * (draft.qk_nope_head_dim + draft.v_head_dim),
-                   draft.kv_lora_rank, "mla", "out_tp"),
+                   draft.kv_lora_rank, "mla_absorb", "out_tp"),
             ])
             if draft.o_groups:
                 group_width = draft.num_heads * draft.head_dim // draft.o_groups
@@ -139,6 +139,11 @@ def _draft_ffn_terms(
                "dspark_routed_expert", "expert_gate_up", count=draft.num_experts),
             _t("draft_expert_down", h, draft.expert_intermediate_size,
                "dspark_routed_expert", "expert_down", count=draft.num_experts),
+            # The draft MoE router inherits the target noaux_tc correction
+            # bias, one FP32 parameter per expert per draft layer.
+            *([_t("draft_router_correction_bias", draft.num_experts, ONE,
+                  "param_fp32")]
+              if any(plan.router_noaux_tc for plan in model.layer_plans) else []),
         ])
         if draft.num_shared_experts:
             shared_i = draft.expert_intermediate_size * draft.num_shared_experts
@@ -164,6 +169,30 @@ def _draft_ffn_terms(
             terms.append(_t(f"draft_hc_{part}_fn", mix, hc_dim, "mhc"))
             terms.append(_t(f"draft_hc_{part}_base", mix, 1, "param_fp32"))
             terms.append(_t(f"draft_hc_{part}_scale", 3, 1, "param_fp32"))
+    return terms
+
+
+def _draft_plan_terms(plan, draft: DraftSpec, model: ModelSpec) -> list[WeightTerm]:
+    """Resident matrices owned by one declared draft ``LayerPlan``.
+
+    Draft attention/FFN geometry is declared once by ``DraftSpec``, but an
+    inherited indexer and a runtime router precast belong to the per-layer
+    plan.  They are counted here rather than synthesized from a donor layer.
+    """
+    terms: list[WeightTerm] = []
+    if (plan.owns_index_k or plan.owns_topk or plan.indexer
+            or plan.index_query_per_layer):
+        from mindie_sim.catalog.weights import _indexer_terms
+        draft_model = replace(
+            model, hidden_size=int(draft.hidden_size),
+            quant=draft_quant(model, draft))
+        terms.extend(_indexer_terms(plan, draft_model))
+    if (plan.ffn == "moe" and plan.router_precast_weight_copy
+            and plan.router_dtype):
+        terms.append(replace(
+            _t("draft_router_precast", plan.num_experts,
+               plan.router_input_size or draft.hidden_size, "router"),
+            source_owned=False, runtime_dtype=plan.router_dtype))
     return terms
 
 
@@ -216,9 +245,12 @@ def draft_terms(
                 "draft_embedding", draft.vocab_size, h, "embedding",
                 "embedding", int(draft.embedding_count), 0, 0, 0,
                 False, True))
-        for _ in range(max(ZERO, draft.layers)):
+        plans = tuple(getattr(draft, "layer_plans", ()) or ())
+        for index in range(max(ZERO, draft.layers)):
             terms.extend(_draft_attention_terms(draft, model.quant or QuantSpec("bf16")))
             terms.extend(_draft_ffn_terms(draft, model, ep=ep))
+            if index < len(plans):
+                terms.extend(_draft_plan_terms(plans[index], draft, model))
             if draft.output_head_owned:
                 terms.append(_t("draft_output_norm", h, ONE, "norm"))
                 if int(draft.output_head_count) > ZERO:

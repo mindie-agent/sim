@@ -23,6 +23,64 @@ from .operators.mc2_mx_quant import mx32_work
 from .moe_comm_selection import MC2, MoeCommConfig
 
 NETWORK = "arch35_fullmesh_peer_channel"
+NO_ASSIGNMENTS = 0
+EXPLICIT_ROUTING_LOWERINGS = frozenset(
+    {"route_pack", "route_unpack", "moe_init_routing"})
+
+
+def _absorbed_quant_mode(routing):
+    """Dispatch payload mode declared by one absorbed init-routing pack."""
+    payload = str(routing.get("payload_format") or "")
+    scale_format = str(routing.get("scale_format") or "")
+    if payload in {"fp8_e4m3", "fp8_e5m2"} and scale_format in {"fp8_e8m0", "e8m0"}:
+        return "mx"
+    if payload == "int8":
+        return "per_token_int8"
+    raise ModelingError("mc2_init_routing_absorption_requires_mx_or_per_token_int8_payload")
+
+
+def _received_quantizer(pack_quant, gate, dispatch_id, rows, width):
+    """Keep receiver conversion when native dispatch publishes float rows."""
+    from mindie_sim.catalog.ops import vector_op
+
+    meta = dict(pack_quant.metadata)
+    source_rows = float(meta.get("source_rows") or NO_ASSIGNMENTS)
+    if source_rows <= NO_ASSIGNMENTS:
+        raise ModelingError("mc2_pack_quantizer_requires_source_rows")
+    scale = float(rows) / source_rows
+    scale_shape = tuple(meta["activation_scale_shape"])
+    _, *scale_tail = scale_shape
+    meta.update(
+        source_rows=rows,
+        activation_scale_shape=(math.ceil(rows), *scale_tail),
+        activation_scale_bytes=float(meta["activation_scale_bytes"]) * scale,
+        quantization_scope="moe_received_expert_input",
+    )
+    quantizer = vector_op(
+        op_id=dispatch_id + ".received_quantize", deps=(dispatch_id,),
+        stage=pack_quant.stage, layer=pack_quant.layer,
+        requests=pack_quant.requests, phase=pack_quant.phase,
+        family=pack_quant.family, recipe=pack_quant.recipe,
+        dtype=pack_quant.dtype,
+        elements=math.ceil(rows) * width, ops_per_element=NO_ASSIGNMENTS,
+        vector_ops_override=pack_quant.vector_ops * scale,
+        read_bytes_override=pack_quant.mte2_bytes * scale,
+        write_bytes_override=pack_quant.mte3_bytes * scale,
+        shape=(math.ceil(rows), width), returns=pack_quant.returns,
+        metadata=tuple(meta.items()),
+    )
+    gate_meta = dict(gate.metadata)
+    if gate_meta.get("activation_format") != meta["output_format"]:
+        raise ModelingError("mc2_received_quantizer_format_mismatch")
+    gate_meta.update(
+        activation_producer="explicit_routing_quantization",
+        activation_payload_producer=quantizer.op_id,
+        activation_scale_producer=quantizer.op_id,
+    )
+    return quantizer, replace(
+        gate, deps=tuple(quantizer.op_id if dep == dispatch_id else dep
+                         for dep in gate.deps),
+        metadata=tuple(gate_meta.items()))
 
 
 def select(kernels):
@@ -94,6 +152,10 @@ def select_common(runtime, features=None, *, tokens, top_k, experts, ep):
     explicit = select(kernels)
     if explicit is not None:
         return explicit
+    if EXPLICIT_ROUTING_LOWERINGS & set(kernels.get("lowerings") or {}):
+        # An explicitly lowered routing/init kernel owns the expert input
+        # representation; automatic MC2 selection must not replace it.
+        return None
     rmeta = dict(getattr(runtime, "metadata", ()) or ())
     radditional = rmeta.get("additional_config")
     radditional = dict(radditional) if isinstance(radditional, dict) else {}
@@ -123,8 +185,14 @@ def lower(ops, *, runtime, prefix, tokens, top_k, width, experts, ep,
           source_partitions, received_assignments, dtype, source_routing=None,
           valid_tokens=None, features=None, source_rows_by_replica=None,
           destination_rows_by_rank=None):
+    # ``dynamic`` selects one method for the whole EP group.  The largest
+    # per-rank row requirement decides whether the shared MC2 reservation can
+    # hold every member; the per-replica payload still uses this call's tokens.
+    selection_tokens = (max(int(value) for value in source_rows_by_replica)
+                        if source_rows_by_replica else int(tokens))
     selected = select_common(
-        runtime, features, tokens=tokens, top_k=top_k, experts=experts, ep=ep)
+        runtime, features, tokens=selection_tokens, top_k=top_k,
+        experts=experts, ep=ep)
     if selected is None:
         return ops
     if selected["kind"] == "arch22_v2_caller":
@@ -142,6 +210,15 @@ def lower(ops, *, runtime, prefix, tokens, top_k, width, experts, ep,
     by_id = {op.op_id: op for op in ops}
     pack, dispatch, combine, unpack = (by_id[prefix + suffix]
                                       for suffix in (".pack", ".dispatch", ".combine", ".unpack"))
+    pack_quant = by_id.get(prefix + ".pack.quantize")
+    if pack_quant is not None and (
+            pack_quant.plan_required
+            or pack_quant.deps != (pack.op_id,)
+            or dict(pack_quant.metadata).get("quantization_scope")
+            != "moe_dispatch_expert_input"
+            or any(pack_quant.op_id in item.deps and item.op_id != dispatch.op_id
+                   for item in ops)):
+        raise ModelingError("mc2_cannot_absorb_external_pack_quantizer")
     source_metadata = source_routing.to_dict() if source_routing is not None else None
     # TPxDP without an explicit slice still publishes one source rank's rows.
     if source_routing is not None:
@@ -158,6 +235,25 @@ def lower(ops, *, runtime, prefix, tokens, top_k, width, experts, ep,
                                    if valid_tokens is not None else tokens)
     send = valid_source_tokens * top_k
     quant = selected.get("dispatch_quant", "none")
+    # ``aclnnMoeInitRoutingV3`` may own the dispatch-input quantization
+    # (``quant_mode=1``) instead of a separate ``pack.quantize`` node.  The
+    # sender then publishes quantized rows and the receiver scales come from
+    # that pack, so no received quantizer is synthesized here.
+    absorbed = dict(pack.metadata).get("moe_init_routing")
+    if absorbed is not None:
+        if pack_quant is not None:
+            raise ModelingError("mc2_init_routing_absorption_conflicts_with_pack_quantizer")
+        absorbed_quant = _absorbed_quant_mode(absorbed)
+        if quant not in {"none", absorbed_quant}:
+            raise ModelingError("mc2_init_routing_absorption_conflicts_with_dispatch_quant")
+        quant = absorbed_quant
+    received_quant = None
+    if pack_quant is not None and quant == "none" and received_assignments:
+        gate = by_id.get(prefix + ".expert_up")
+        if gate is None or gate.deps != (dispatch.op_id,):
+            raise ModelingError("mc2_received_quantizer_requires_direct_expert")
+        received_quant, by_id[gate.op_id] = _received_quantizer(
+            pack_quant, gate, dispatch.op_id, received_assignments, width)
     payload_dtype = {"mx": "fp8_e4m3", "per_token_int8": "int8"}.get(quant, dtype)
     quant_mode = "per_token" if quant == "per_token_int8" else quant
     layouts = (dispatch_layout(width, input_dtype=dtype, payload_dtype=payload_dtype,
@@ -189,6 +285,8 @@ def lower(ops, *, runtime, prefix, tokens, top_k, width, experts, ep,
             if (not direct or not matched
                     or meta.get("activation_scale_bytes") != received_assignments * layouts[0].scale_bytes):
                 raise ModelingError(f"mc2_{quant}_expert_input_requires_{requirement}_producer")
+            # The fused dispatch owns the absorbed init-routing quantization,
+            # so it publishes both the quantized payload and its scales.
             meta.update(activation_producer="explicit_transport_quantization",
                         activation_payload_producer=dispatch.op_id,
                         activation_scale_producer=dispatch.op_id,
@@ -325,7 +423,8 @@ def lower(ops, *, runtime, prefix, tokens, top_k, width, experts, ep,
             "activation_scale_bytes": received_assignments * layouts[0].scale_bytes,
             "activation_expected_rows": received_assignments,
         }
-        dispatch_returns = tuple(dict.fromkeys((*dispatch_returns, "activation_scales")))
+        if absorbed is None:
+            dispatch_returns = tuple(dict.fromkeys((*dispatch_returns, "activation_scales")))
 
     def native_metadata(kind, raw, kernel, group):
         implementation = (
@@ -365,6 +464,13 @@ def lower(ops, *, runtime, prefix, tokens, top_k, width, experts, ep,
         }
         if kind == "combine":
             metadata["transpose_of_source_assignments"] = True
+        if kind == "dispatch" and absorbed is not None:
+            # ``MoeDistributeDispatchV3`` owns the permutation *and* the
+            # ``aclnnMoeInitRoutingV3`` dynamic quantization (``quant_mode=1``)
+            # in one native call: no separate pack quantizer remains.
+            metadata["moe_init_routing"] = dict(absorbed)
+            metadata["fused_native_kinds"] = ("MoeDistributeDispatchV3",
+                                              absorbed["native_kind"])
         return tuple(metadata.items())
 
     dispatch_op = Work().apply(replace(
@@ -394,11 +500,14 @@ def lower(ops, *, runtime, prefix, tokens, top_k, width, experts, ep,
     for op in ops:
         if op.op_id == pack.op_id:
             result.append(dispatch_op)
+            if received_quant is not None:
+                result.append(received_quant)
             continue
         if op.op_id == unpack.op_id:
             result.append(combine_op)
             continue
-        if op.op_id in {dispatch.op_id, combine.op_id}:
+        if (op.op_id in {dispatch.op_id, combine.op_id}
+                or (pack_quant is not None and op.op_id == pack_quant.op_id)):
             continue
         current = by_id[op.op_id]
         deps = tuple(redirect.get(dependency, dependency)

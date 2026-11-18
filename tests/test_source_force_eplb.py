@@ -83,8 +83,9 @@ def test_ordinary_sp_caller_keeps_allocated_router_but_filters_actual_expert_wor
         assert routing['valid_global_tokens'] == batch
         assert routing['allocated_global_tokens'] == 8 * max(1, (batch + 7) // 8)
     # Padding belongs to allocated router/top-k tensors; masks do not compact
-    # their shapes or silently change the original balanced scenario.
-    for name in ('router', 'topk'):
+    # their shapes or silently change the original balanced scenario. The
+    # noaux_tc chain restates the selected payload at router_weight_gather.
+    for name in ('router', 'router_weight_gather'):
         before, after = plain[f's0.l1.{name}'], ops[f's0.l1.{name}']
         assert (before.local_shape, before.flops, before.vector_ops) == (after.local_shape, after.flops, after.vector_ops)
     if batch <= 8:

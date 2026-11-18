@@ -33,6 +33,7 @@ MX_SCALE_GROUP_SIZE = 32
 MX_SCALE_PACK_FACTOR = 2
 GDN_DEFAULT_CHUNK_SIZE = 64
 MAX_RECURRENT_DECODE_QUERY = 8
+SERIAL_CONTEXT_DEGREE = 1
 
 PASS_PRIORITY_ORDER: tuple[str, ...] = (
     "activation_quantization",
@@ -41,6 +42,7 @@ PASS_PRIORITY_ORDER: tuple[str, ...] = (
     "residual_norm",
     "mhc_boundary_pr",
     "mhc_boundary_ideal",
+    "indexer_online_topk",
     "qkv_norm_rope",
     "kda_in_kernel_l2norm",
     "gdn_projection_overlap",
@@ -144,9 +146,9 @@ def _apply_basic_norm_quant(rt: dict[str, Any], ctx: MechanismContext) -> None:
     if _has_quant_activations(ctx.model):
         _append_passes(rt, "activation_quantization", "norm_quant")
     normalization = dict(ctx.model.catalog_facts).get("normalization") or {}
+    # ``add_rmsnorm`` is the residual boundary and is independent of qk_norm.
     if (ctx.model.activation_dtype == "bf16"
-            and not normalization.get("norm_weight_offset", 0.0)
-            and not any(p.qk_norm for p in ctx.model.layer_plans)):
+            and not normalization.get("norm_weight_offset", 0.0)):
         _append_passes(rt, "residual_norm")
         _set_lowering(rt, "add_rmsnorm", "vllm_ascend_native_norm")
         q = ctx.model.quant
@@ -167,24 +169,34 @@ def _apply_unit_offset_norm(rt: dict[str, Any], ctx: MechanismContext) -> None:
     _append_passes(rt, "residual_norm")
 
 
+NORM_QUANT_CONSUMER_FAMILIES = (
+    "gemm", "qkv_projection", "gate_up_projection", "projection",
+    "latent_projection", "router", "index_projection", "logits",
+)
+
+
+def norm_quant_domain() -> dict[str, Any]:
+    """One declared norm+quant fusion domain with a materialized BF16 output."""
+    return {
+        "consumers": [{"family": fam} for fam in NORM_QUANT_CONSUMER_FAMILIES],
+        "external_outputs": "materialize",
+    }
+
+
+def ensure_norm_quant_domain(kernels: dict[str, Any]) -> dict[str, Any]:
+    """Install the shared norm+quant domain when its pass is declared."""
+    domains = dict(kernels.get("fusion_domains") or {})
+    domains.setdefault("norm_quant", norm_quant_domain())
+    kernels["fusion_domains"] = domains
+    return kernels
+
+
 def _apply_norm_quant_materialize_all(rt: dict[str, Any], ctx: MechanismContext) -> None:
     if not _has_quant_activations(ctx.model):
         return
     _append_passes(rt, "activation_quantization", "norm_quant", "residual_norm")
-    kernels = dict(rt.get("kernels") or {})
-    domains = dict(kernels.get("fusion_domains") or {})
-    if "norm_quant" not in domains:
-        domains["norm_quant"] = {
-            "consumers": [
-                {"family": fam} for fam in (
-                    "gemm", "qkv_projection", "gate_up_projection", "projection",
-                    "latent_projection", "router", "index_projection", "logits",
-                )
-            ],
-            "external_outputs": "materialize",
-        }
-        kernels["fusion_domains"] = domains
-        rt["kernels"] = kernels
+    kernels = ensure_norm_quant_domain(dict(rt.get("kernels") or {}))
+    rt["kernels"] = kernels
 
 
 def _apply_mla_prolog(rt: dict[str, Any], ctx: MechanismContext) -> None:
@@ -200,11 +212,18 @@ def _apply_mla_prolog(rt: dict[str, Any], ctx: MechanismContext) -> None:
         pcp=int(ctx.parallel.get("pcp", 1)),
     )
     passes = tuple(rt.get("lowering_passes") or ())
+    options: dict[str, Any] = {}
+    quant = ctx.model.quant
+    if ctx.arch == "a5" and quant is not None and quant.kv_dtype == "int8":
+        from mindie_sim.prediction.mla_prolog_packed import LAYOUT
+        options["cache_layout"] = LAYOUT
     try:
         for plan in mla_layers:
             validate_mla_prolog(plan=plan, parallel=p_cfg, model=ctx.model,
-                                quant=ctx.model.quant, lowering_passes=passes)
-        _set_lowering(rt, "mla_prolog", "vllm_ascend_mla_prolog_v3")
+                                quant=quant, lowering_passes=passes, **options)
+        _set_lowering(rt, "mla_prolog", (
+            {"implementation": "vllm_ascend_mla_prolog_v3", "options": options}
+            if options else "vllm_ascend_mla_prolog_v3"))
     except ModelingError:
         return
 
@@ -217,15 +236,31 @@ def _apply_recurrent_decode(rt: dict[str, Any], ctx: MechanismContext) -> None:
     is_a5 = ctx.arch == "a5"
     cp = int(ctx.parallel.get("cp", ctx.parallel.get("dcp", 1)))
     pcp = int(ctx.parallel.get("pcp", 1))
-    if any(p.attention == "kda" for p in ctx.model.layer_plans) and pcp >= 1 and cp == 1:
+    from mindie_sim.catalog.paired_sfa import execution
+    kda_layers = [p for p in ctx.model.layer_plans if p.attention == "kda"]
+    if (kda_layers
+            and pcp >= SERIAL_CONTEXT_DEGREE
+            and (cp == SERIAL_CONTEXT_DEGREE
+                 or execution(ctx.model).get("recurrent_context_sharded") is False)):
+        kda_options = {}
+        if is_a5:
+            from mindie_sim.prediction.kda_source import resolve as resolve_kda_source
+            bounds = {getattr(p, "kda_gate_lower_bound", None) for p in kda_layers}
+            if len(bounds) == 1:
+                kda_options = resolve_kda_source(
+                    kda_layers[0], arch="A5", phase="decode", kernels={},
+                    activation_dtype=ctx.model.activation_dtype) or {}
         _set_lowering(rt, "kda", {
             "cases": [{
                 "domain": {
                     "phases": ["decode"],
                     "max_query_tokens": {"min": 1, "max": MAX_RECURRENT_DECODE_QUERY},
                 },
-                "binding": ("vllm_ascend_recurrent_kda_arch35" if is_a5
-                            else "vllm_ascend_recurrent_kda_arch22"),
+                "binding": {
+                    "implementation": ("vllm_ascend_recurrent_kda_arch35" if is_a5
+                                       else "vllm_ascend_recurrent_kda_arch22"),
+                    "options": kda_options,
+                },
             }],
             "otherwise": "analytical",
         })
@@ -280,9 +315,6 @@ def _apply_gdn_chunk64(rt: dict[str, Any], ctx: MechanismContext) -> None:
 
 def _apply_recover_ssm(rt: dict[str, Any], ctx: MechanismContext) -> None:
     if "recover_ssm" in ctx.caller_explicit:
-        return
-    if dict(ctx.model.metadata).get("cache_allocator") == "paired_sfa":
-        # paired_sfa_recover_ssm_layout_not_declared guard in paired_sfa.py
         return
     meta = dict(rt.get("metadata") or {})
     if int(meta.get("draft_proposal_tokens", 0) or 0) > 0:
@@ -424,6 +456,16 @@ for _item in (
         summary="Fused QKV split + QK RMSNorm + MRoPE single-launch preparation kernel",
         eligible=lambda ctx: any(p.qk_norm for p in ctx.model.layer_plans),
         apply=lambda rt, _ctx: _append_passes(rt, "qkv_norm_rope"),
+    ),
+    OptimizationMechanism(
+        id="indexer_online_ub_topk", category="attention_fusion",
+        phases=("prefill", "decode"),
+        summary="On-chip UB online TopK score reduction eliminating scoreGm HBM round-trip",
+        # Analytical ideal only: a native source binary owns its score
+        # workspace, so this experiment is never installed by a merged/PR
+        # runtime track.
+        eligible=lambda ctx: any(p.index_topk > 0 for p in ctx.model.layer_plans),
+        apply=lambda rt, _ctx: _append_passes(rt, "indexer_online_topk"),
     ),
     OptimizationMechanism(
         id="activation_quant_fusion", category="ffn_fusion", phases=("prefill", "decode"),

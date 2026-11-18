@@ -130,6 +130,12 @@ def validate_declared_view(view):
             or not isinstance(view.get("query_norm_output"), bool)):
         raise ModelingError(
             "mla_prolog_arch22_requires_int8_token_projection_and_bf16_uk_norm_cache")
+    if (not bool(view.get("do_rope", True))
+            or int(view.get("parallel_cp", 1)) > 1):
+        # The source program always emits the rotary tail and writes the whole
+        # cache row; NoPE and rank-owned DCP slices need another domain.
+        raise ModelingError(
+            "mla_prolog_arch22_requires_rope_and_unsharded_cache_ownership")
     hidden = int(view.get("hidden", 0))
     heads = int(view.get("heads", 0))
     query_rank = int(view.get("query_rank", 0))

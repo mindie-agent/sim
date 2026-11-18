@@ -263,11 +263,20 @@ def compare_cohorts(case, mapping_report):
     geometry = {key: execution[key] for key in required}
     if "apply_body_defaults" in execution:
         geometry["apply_body_defaults"] = execution["apply_body_defaults"]
+    manifest_geometry = dict(geometry)
+    projection = execution.get("replica_projection") or {}
+    selected_replicas = projection.get("selected")
+    if selected_replicas:
+        # The exported graph identity is the projected serialization.  Regenerate
+        # that same projection for the digest, even though pricing later binds
+        # the complete cohort.
+        manifest_geometry["replicas"] = selected_replicas
     from .structure_selection import select_structure_targets
     wanted = {key for window in report.get("windows", ())
               for cohort in window.get("cohorts", ()) for key in cohort.get("target_ids", ())}
     manifest = select_structure_targets(
-        case, wanted, **geometry, expand_calls=execution.get("expand_calls", True))
+        case, wanted, **manifest_geometry,
+        expand_calls=execution.get("expand_calls", True))
     if manifest["graph_id"] != report.get("graph_id"):
         raise ValueError("cohort_case_graph_id_mismatch:regenerate_mapping_for_this_case")
     if report.get("observed_phase") not in (None, geometry["phase"]):

@@ -13,6 +13,9 @@ from __future__ import annotations
 
 import pytest
 
+#: A5 sustainable DRAM service is declared at 0.8316 of the raw HBM peak.
+A5_DRAM_SERVICE_SCALE = 1 / 0.8316
+
 from mindie_sim.backends.ascend import materialize
 from mindie_sim.public.api import (
     simulate_graph,
@@ -45,7 +48,7 @@ def test_public_operator_report_uses_the_submission_boundaries():
     assert result["schema"] == "mindie-sim.operators/1"
     assert row["ready_ms"] == 0.0
     assert row["complete_ms"] == pytest.approx(row["duration_ms"])
-    assert row["serviced"]["memory@r0:s0"] == pytest.approx(64.0)
+    assert row["serviced"]["memory@r0:s0"] == pytest.approx(64.0 * A5_DRAM_SERVICE_SCALE)
     assert row["serviced"]["vector@r0:s0"] == pytest.approx(64.0)
     assert set(row["serviced"]) == {"memory@r0:s0", "vector@r0:s0"}
     assert result["timeline"][0]["complete_ms"] == pytest.approx(
@@ -78,7 +81,7 @@ def test_public_graph_serializes_a_real_dependency_and_conserves_work():
         result["charge_ready_ms"] + result["duration_ms"])
     by_id = {row["physical_id"]: row for row in result["timeline"]}
     assert by_id["a"]["complete_ms"] <= by_id["b"]["ready_ms"]
-    assert result["execution"]["serviced"]["memory@r0:s0"] == pytest.approx(128.0)
+    assert result["execution"]["serviced"]["memory@r0:s0"] == pytest.approx(128.0 * A5_DRAM_SERVICE_SCALE)
     assert result["execution"]["serviced"]["vector@r0:s0"] == pytest.approx(128.0)
 
 
@@ -104,5 +107,5 @@ def test_public_native_call_charges_each_invocation_once():
     assert twice["duration_ms"] == pytest.approx(
         2 * single["duration_ms"])
     assert len(twice["timeline"]) == 2
-    assert twice["execution"]["serviced"]["memory@r0:s0"] == pytest.approx(128.0)
+    assert twice["execution"]["serviced"]["memory@r0:s0"] == pytest.approx(128.0 * A5_DRAM_SERVICE_SCALE)
     assert twice["execution"]["serviced"]["vector@r0:s0"] == pytest.approx(128.0)

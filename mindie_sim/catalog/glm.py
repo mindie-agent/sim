@@ -36,6 +36,11 @@ from mindie_sim.schema.model import LayerPlan
 from mindie_sim.schema.common import ModelingError
 
 
+DEFAULT_QK_HEAD_DIM = 256
+MTP_PP_CAPABILITY = (1, 2, 4, 8, 16)
+GLM_KDA_GATE_LOWER_BOUND = -5.0
+FP32_STATE_BYTES = 4
+
 def _index_pool(c):
     size = int(c.get("index_kpool") or 1)
     compress = bool(c.get("index_kpool_compress", False))
@@ -45,6 +50,21 @@ def _index_pool(c):
         raise ModelingError("model_config_index_pool_requires_compression_and_integral_topk_pools")
     return dict(index_kpool=size, index_kpool_compress=compress,
                 index_kpool_always_select_tail=tail)
+
+
+#: The checkpoint may declare an FP32 gate matrix.  ``vllm-ascend``'s
+#: ``AscendGateLinear`` Tier 4 keeps the weights BF16 and accumulates the
+#: router GEMM in FP32 (`torch.mm(x, w.t(), out_dtype=torch.float32)`), so the
+#: declaration costs zero input casts and no FP32 weight copy.
+_FP32_ROUTER_DECLARATIONS = frozenset({"float32", "fp32"})
+
+
+def _router_tier4(c: Mapping[str, Any]) -> dict[str, Any]:
+    """Declared router operands for the checkpoint's declared gate precision."""
+    if str(c.get("moe_router_dtype", "")).strip().lower() in _FP32_ROUTER_DECLARATIONS:
+        return {"router_dtype": "", "router_output_dtype": "fp32",
+                "router_precast_weight_copy": False}
+    return {}
 
 
 def _glm_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
@@ -104,7 +124,6 @@ def _glm_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
             moe_intermediate_size=moe_i if ffn == "moe" else 0,
             num_shared_experts=shared if ffn == "moe" else 0,
             router_input_size=h, router_mode="sigmoid",
-            router_dtype="fp32" if c.get("moe_router_dtype") == "float32" else "",
             router_norm_topk=bool(c.get("norm_topk_prob", False)),
             router_groups=_int(c, "n_group"),
             router_group_topk=_int(c, "topk_group"),
@@ -121,6 +140,7 @@ def _glm_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
             kv_owner_layer_id=index,
             native_layer_id=index, scope="body",
             **_index_pool(c),
+            **_router_tier4(c),
         ))
     return plans
 
@@ -180,7 +200,6 @@ def _glm_hybrid_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
         "num_shared_experts": shared,
         "router_input_size": h,
         "router_mode": "sigmoid",
-        "router_dtype": "fp32" if c.get("moe_router_dtype") == "float32" else "",
         "router_norm_topk": bool(c.get("norm_topk_prob", False)),
         "router_groups": _int(c, "n_group"),
         "router_group_topk": _int(c, "topk_group"),
@@ -189,6 +208,7 @@ def _glm_hybrid_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
         "hc_sinkhorn_iters": hc_iters,
         "native_layer_id": 0,
         "scope": "body",
+        **_router_tier4(c),
     }
     plans: list[LayerPlan] = []
     for index, kind in enumerate(layer_types):
@@ -227,9 +247,10 @@ def _glm_hybrid_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
                 recurrent_state_dtype="fp32",
                 conv_state_elements=conv_width * (conv_k - 1),
                 conv_state_dtype="bf16",
-                kda_gate_lower_bound=-5.0,
+                kda_gate_lower_bound=GLM_KDA_GATE_LOWER_BOUND,
+                kda_batch_chunk_norm=True,
                 state_bytes=float(
-                    kda_heads * kda_dim * kda_dim * 4
+                    kda_heads * kda_dim * kda_dim * FP32_STATE_BYTES
                     + conv_width * (conv_k - 1) * 2
                 ),
                 kv_owner_layer_id=index,
@@ -262,6 +283,10 @@ def _glm_hybrid_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
                 owns_topk=True,
                 index_source_layer_id=index,
                 index_source_status="exact_native_full_schedule",
+                # MTP proposal steps share one TopK selection while each step
+                # still produces its own KPool cache row.
+                index_share_for_mtp_iteration=bool(
+                    c.get("index_share_for_mtp_iteration", True)),
                 **_index_pool(c),
                 **ffn_fields,
             ))
@@ -288,9 +313,9 @@ def _aux_glm(c: Mapping[str, Any]) -> AuxiliarySpec:
         kind="mtp", layers=nextn, hidden_size=h, intermediate_size=moe_i,
         num_heads=int(c["num_attention_heads"]),
         num_kv_heads=int(c.get("num_key_value_heads", 1) or 1),
-        head_dim=int(c.get("qk_head_dim", 256) or 256),
-        q_width=int(c["num_attention_heads"]) * int(c.get("qk_head_dim", 256) or 256),
-        kv_width=int(c.get("qk_head_dim", 256) or 256), attention_kind="mla",
+        head_dim=int(c.get("qk_head_dim", DEFAULT_QK_HEAD_DIM) or DEFAULT_QK_HEAD_DIM),
+        q_width=int(c["num_attention_heads"]) * int(c.get("qk_head_dim", DEFAULT_QK_HEAD_DIM) or DEFAULT_QK_HEAD_DIM),
+        kv_width=int(c.get("qk_head_dim", DEFAULT_QK_HEAD_DIM) or DEFAULT_QK_HEAD_DIM), attention_kind="mla",
         kv_cache_elements=kv_rank + rope_dim,
         weight_category="mtp",
         q_lora_rank=int(c["q_lora_rank"]), kv_lora_rank=kv_rank,
@@ -298,10 +323,10 @@ def _aux_glm(c: Mapping[str, Any]) -> AuxiliarySpec:
         qk_rope_head_dim=rope_dim,
         v_head_dim=int(c["v_head_dim"]), num_experts=experts, top_k=top_k,
         expert_intermediate_size=moe_i, num_shared_experts=shared,
-        index_share_for_mtp_iteration=bool(c.get("index_share_for_mtp_iteration", False)),
+        index_share_for_mtp_iteration=bool(c.get("index_share_for_mtp_iteration", True)),
         block_size=1, markov_rank=0, confidence_enabled=False,
         target_shared_embedding=True, target_shared_lm_head=True,
-        base_logits=True, pp_capability=(1, 2, 4, 8, 16),
+        base_logits=True, pp_capability=MTP_PP_CAPABILITY,
         vocab_size=int(c["vocab_size"]),
         mhc_mult=_int(c, "hc_mult") if hyper else 0,
         mhc_sinkhorn_iters=_int(c, "hc_sinkhorn_iters") if hyper else 0,

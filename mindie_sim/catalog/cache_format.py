@@ -13,6 +13,23 @@ from math import ceil
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 
 
+#: NoPE C8 block-quantized MLA cache: one FP8 row split into 128-element
+#: scale groups.  A 512-element latent therefore stores ``512 B`` of payload
+#: plus four FP16 scales (``8 B``) = ``520 B`` per row.
+NOPE_BLOCK_QUANT_TILE = 128
+NOPE_BLOCK_PAYLOAD_DTYPE = "fp8_e4m3"
+NOPE_BLOCK_SCALE_DTYPE = "fp16"
+
+
+def block_quantized_mla_format(tile=NOPE_BLOCK_QUANT_TILE):
+    """Declared C8 NoPE row format shared by capacity, store and attention."""
+    return CacheFormat(NOPE_BLOCK_PAYLOAD_DTYPE, tile, NOPE_BLOCK_SCALE_DTYPE)
+
+
+def block_quantized_row_bytes(width, tile=NOPE_BLOCK_QUANT_TILE):
+    return block_quantized_mla_format(tile).row_bytes(width)
+
+
 def payload_bytes(dtype):
     # Packed cache storage does not imply a native FP4 matrix compute peak.
     return 0.5 if dtype == "fp4_e2m1" else dtype_bytes(dtype)
@@ -76,12 +93,28 @@ class CacheFormat:
         return self.transaction_count(width, rows, granule) * granule
 
 
+def _nope_mla_layers(model):
+    """True when every MLA layer declares a zero-width rotary head."""
+    layers = [plan for plan in getattr(model, "layer_plans", ())
+              if getattr(plan, "attention", "") == "mla"]
+    return bool(layers) and all(
+        int(getattr(plan, "qk_rope_head_dim", 0) or 0) == 0 for plan in layers)
+
+
 def cache_format(model, region):
     """Metadata declarations are explicit physical contracts, not calibration."""
     raw = dict(getattr(model, "metadata", ())).get("cache_representations", {}).get(region)
     if raw is None:
         quant = getattr(model, "quant", None)
-        return CacheFormat(getattr(quant, "kv_dtype", "") or getattr(model, "kv_dtype", "bf16"))
+        resolved = (getattr(quant, "kv_dtype", "")
+                    or getattr(model, "kv_dtype", "bf16"))
+        # A NoPE MLA layer keeps no rotary tail, so an FP8 KV checkpoint has
+        # exactly the declared 128-element block row: 512 B payload + four
+        # FP16 scales.  This is a format resolution, not a precision change.
+        if (region == "mla_kv" and str(resolved) in {"fp8", "fp8_e4m3"}
+                and _nope_mla_layers(model)):
+            return block_quantized_mla_format()
+        return CacheFormat(resolved)
     if set(raw) - {"dtype", "group_size", "scale_dtype", "suffix_elements",
                    "suffix_dtype", "packed_elements"}:
         raise ModelingError("cache_representation_fields_unknown:" + region)

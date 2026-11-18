@@ -93,11 +93,22 @@ def test_model_scope_and_body_optout_retain_detailed_control_and_semantic_work()
     raw = physical_case()
     options = {**GEOMETRY, "scope": "model"}
     model = target_graphs(raw, **options)
-    assert model == target_graphs(raw, apply_body_defaults=False, **options)
+    # Model assembly consumes the same resolved declaration as the body entry:
+    # assembly scope and effective implementation selection are separate.
+    assert model.effective_kernels["programs"]["matmul"]["kind"] == "steady_matmul"
     model_costs = operator_costs(raw, model)
-    assert all(row["program"] == "TiledMatmul" for row in model_costs["operators"]
+    assert all(row["program"] == "SteadyMatmul" for row in model_costs["operators"]
                if row["operator"]["family"] in MATRIX_FAMILIES)
-    generic = target_graphs(raw, apply_body_defaults=False, **GEOMETRY)
+    # Detailed control is an explicit recipe, independent of default injection.
+    control = deepcopy(raw)
+    control["runtime"]["kernels"] = {
+        "programs": {"matmul": {"kind": "tiled_matmul"}}}
+    raw_model = target_graphs(control, apply_body_defaults=False, **options)
+    assert raw_model.effective_kernels["programs"]["matmul"]["kind"] == "tiled_matmul"
+    raw_costs = operator_costs(control, raw_model)
+    assert all(row["program"] == "TiledMatmul" for row in raw_costs["operators"]
+               if row["operator"]["family"] in MATRIX_FAMILIES)
+    generic = target_graphs(control, apply_body_defaults=False, **GEOMETRY)
     compact = target_graphs(raw, **GEOMETRY)
     assert {r: tuple(op for op in v if op.family in MATRIX_FAMILIES)
             for r, v in compact.items()} == {
@@ -105,7 +116,7 @@ def test_model_scope_and_body_optout_retain_detailed_control_and_semantic_work()
                 for r, v in generic.items()}
     # The choice changes physical scheduling; tensor geometry and logical work
     # remain identical, and the public opt-out continues to execute detailed.
-    graph = graph_costs(raw, generic, isolated=False, external_inputs={"analysis_input": 0})
+    graph = graph_costs(control, generic, isolated=False, external_inputs={"analysis_input": 0})
     assert all(row["program"] == "TiledMatmul" for row in matrix_rows(graph))
 
 
@@ -130,7 +141,7 @@ def test_serving_default_remains_the_explicit_tiled_control():
     assert control["execution"]["allocation_events"] > automatic["execution"]["allocation_events"]
 
 
-def test_default_keeps_fp32_router_owner_grid_and_grouped_mapping_domain():
+def test_default_keeps_tier4_router_owner_grid_and_grouped_mapping_domain():
     path = Path(__file__).resolve().parents[1] / "examples/cases/glm53-a3-w4a8.json"
     raw = json.loads(path.read_text())
     raw["model"]["layers"] = 4  # First MoE layer; preserve every physical width.
@@ -139,9 +150,12 @@ def test_default_keeps_fp32_router_owner_grid_and_grouped_mapping_domain():
     router = operator_costs(raw, graph[router_index:router_index + 1])["operators"][0]
     mapping = next(row for row in router["basis"]["matrix_mappings"] if "selected" in row)
     assert router["operator"]["local_shape"] == [1, 256, 6144]
-    assert router["operator"]["dtype"] == "fp32"
+    # ``moe_router_dtype=float32`` runs on AscendGateLinear Tier 4: BF16 Cube
+    # operands accumulate into FP32 logits, so the matrix dtype is BF16.
+    assert router["operator"]["dtype"] == "bf16"
+    # BF16 Cube operands use the full 128-deep K tile; the FP32 grid split it.
     assert (mapping["selected"]["tile_m"], mapping["selected"]["tile_n"],
-            mapping["selected"]["tile_k"]) == (128, 128, 64)
+            mapping["selected"]["tile_k"]) == (128, 128, 128)
     assert mapping["default_128_grid_tiles"] == 2
     assert router["peak_buffers"]["l0b@r0:s0"] <= 65536
     explicit = deepcopy(raw)

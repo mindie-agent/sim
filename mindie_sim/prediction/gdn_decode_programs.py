@@ -19,6 +19,19 @@ from .transactions import QueuedStore
 
 GATING = "ascend_gdn_decode_gating"
 CONV = "ascend_causal_conv1d_update"
+#: One AIV resolves `conv_state_indices[b]`, latches the two rolling descriptors
+#: and drains the previous task's MTE3 before `RunSeq` may start.
+CONV_STATE_RESOLVE_US = 2.65
+#: Multi-core launch, `InitSharedBuffersAndEvents` and the final MTE3 drain.
+CONV_CALL_SETUP_US = 6.0
+#: A rolling state ring is single-buffered: token i+1 reads what token i wrote.
+CONV_TOKEN_SLOTS = 1
+#: Per-token vector expression: three window taps, the Silu/bias fixed term and
+#: the optional two-op bias add, each over the owned channel width.
+CONV_TOKEN_TAP_OPS = 3
+CONV_TOKEN_FIXED_OPS = 5
+CONV_TOKEN_BIAS_OPS = 2
+MS_PER_SECOND = 1000
 CONV_SOURCE = {
     "path": "data/observations/sources/native-causal-conv-a4a7958",
     "revision": "a4a795857868729fbdbb0118c1e06c8655a7b31b",
@@ -168,40 +181,80 @@ def conv_plan(op, geometry, *, compact=True):
                for q, own in zip(lengths, has_state) if q > 0 and own]
     reads = sum(amount for amount, _ in traffic) * dim * 2
     writes = sum(amount for _, amount in traffic) * dim * 2
+    # Externally observed envelope of `causal_conv1d_update` on the paired
+    # `#62` SKUs: `q` current tokens plus `kernel_width - 1` history rows are
+    # streamed in, and the same two windows are written back. The `width`
+    # weight taps stay L2-resident across the per-sequence repetitions, and the
+    # speculative reload window re-reads the retained positions and the current
+    # inputs from UB, so neither adds an off-chip descriptor.
+    external = sum(2 * (q + width - 1) * dim * 2
+                   for q, own in zip(lengths, has_state) if q > 0 and own)
     vector = sum((width + 1 + q * (3 * width + 5 + 2 * int(bias))) * dim
                  for q, own in zip(lengths, has_state) if q > 0 and own)
-    work = Work(resources={"hbm": reads + writes, read: reads, "mte3": writes, "vector": vector})
+    work = Work(resources={"hbm": external, read: reads, "mte3": writes, "vector": vector})
 
     def program(context):
         def task(q, n, repeat, owns_state, owner):
             owned = context.owned(owner, units, ("vector", read, "mte3"))
             def memory(amount, role):
-                return context.bind(Work(resources={"hbm": amount, role: amount}).scaled(repeat))
+                return context.bind(Work(resources={role: amount}).scaled(repeat))
             def token(index):
-                return (
+                stages = [
                     Stage("input", memory(n * 2, read), placement=owned),
                     Stage("convolution", context.bind(Work(resources={
-                        "vector": n * (3 * width + 5 + 2 * int(bias))}).scaled(repeat)),
+                        "vector": n * (CONV_TOKEN_TAP_OPS * width
+                                       + CONV_TOKEN_FIXED_OPS
+                                       + CONV_TOKEN_BIAS_OPS * int(bias))}).scaled(repeat)),
                           after=("input",), previous=("convolution",), placement=owned),
-                    Stage("output", memory(n * 2, "mte3"), after=("convolution",), placement=owned),
-                )
+                    Stage("output", memory(n * 2, "mte3"),
+                          after=("convolution",), placement=owned),
+                ]
+                if speculative and owns_state:
+                    stages.append(Stage("state_write",
+                                        memory(n * 2, "mte3"),
+                                        after=("input",), placement=owned))
+                elif state_write and index == q - 1:
+                    # ``causal_conv1d.h`` writes the last ``W-1`` history rows
+                    # from the ring updated by the final token input, so the
+                    # write follows that input load; it still overlaps the last
+                    # token's convolution/output instead of extending the task.
+                    stages.append(Stage("state_write",
+                                        memory(state_write * n * 2, "mte3"),
+                                        after=("input",), placement=owned))
+                return tuple(stages)
             history = width - 1 if owns_state else 0
+            state_write = (2 + q) if (speculative and owns_state) else history
             stages = [
-                Stage("weights_history", memory((width + int(bias) + history) * n * 2, read),
-                      placement=owned),
+                # `ResolveSeqCacheIndex` + `ResolveSeqTaskWindow` run once per
+                # task on this owner before any tap is issued, so the resolve
+                # latency repeats with every equal-geometry compaction step.
+                Stage("state_resolve", placement=owned,
+                      latency=CONV_STATE_RESOLVE_US * repeat / MS_PER_SECOND),
+                Stage("weights_history",
+                      memory((width + int(bias) + history) * n * 2, read),
+                      after=("state_resolve",), placement=owned),
                 Stage("weights_cast", context.bind(Work(resources={"vector": (width + 1) * n}).scaled(repeat)),
                       after=("weights_history",), placement=owned),
-                Stage("tokens", after=("weights_cast",), program=PipelineProgram(q, 2, token)),
+                Stage("tokens", after=("weights_cast",),
+                      program=PipelineProgram(q, CONV_TOKEN_SLOTS, token)),
             ]
+            # The streamed token/history rows leave the core through the
+            # shared HBM bus as one address stream, double-buffered against the
+            # token convolution rather than extending the token-critical path.
+            if owns_state:
+                stream_rows = 2 * (q + width - 1)
+                stages.append(Stage("external_stream", context.bind(Work(
+                    resources={"hbm": stream_rows * n * 2}).scaled(repeat)),
+                    after=("weights_cast",), placement=owned))
+            # The retained-history reload is a prefetch for the speculative
+            # restore; it may double-buffer against the token convolution.
             if speculative and owns_state:
-                # Source rereads the retained two history positions and all
-                # current input tokens for speculative state restoration.
-                stages.append(Stage("state_reload", memory((2 + q) * n * 2, read),
-                                    after=("tokens",), placement=owned))
-            state_write = (2 + q) if (speculative and owns_state) else history
-            if state_write:
-                stages.append(Stage("state_write", memory(state_write * n * 2, "mte3"),
-                                    after=(stages[-1].name,), placement=owned))
+                stages.append(Stage("state_reload",
+                                    memory((2 + q) * n * 2, read),
+                                    after=("weights_cast",), placement=owned))
+                stages.append(Stage("state_retained_write",
+                                    memory(2 * n * 2, "mte3"),
+                                    after=("weights_cast",), placement=owned))
             return (Stage("sequence", program=KernelProgram(tuple(stages))),)
         def owner_program(owner):
             # Source drains MTE3 between tasks. Equal cycles on one owner are a
@@ -223,8 +276,13 @@ def conv_plan(op, geometry, *, compact=True):
                                   Stage("tasks", after=("buffers",), program=tiles),
                                   Stage("release", after=("tasks",), free=allocation)))
         # One program per physical AIV owner, as the convolution contract
-        # requires: each demand-carrying task keeps its own single unit.
-        return ParallelProgram(tuple(owner_program(owner) for owner in range(blocks)))
+        # requires: each demand-carrying task keeps its own single unit. The
+        # launch-level setup is finite and precedes every owner's first task.
+        return KernelProgram((
+            Stage("descriptor_setup", latency=CONV_CALL_SETUP_US / MS_PER_SECOND),
+            Stage("owners", after=("descriptor_setup",), program=ParallelProgram(
+                tuple(owner_program(owner) for owner in range(blocks)))),
+        ))
     plan_meta = {
         "padding_slots": padding_slots,
         "state_slots": tuple(slot for slot, own in enumerate(has_state) if own),

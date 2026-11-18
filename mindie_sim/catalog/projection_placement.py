@@ -11,8 +11,12 @@
     weights, norms, gates, embeddings, FFN weights and ordinary attention Q/K/V
     projections remain replicated.
   * Column roles shard output features, row roles shard input features and a
-    grouped output pair shards whole groups.  The sharded dimension is padded to
-    the local width and the declared quant granule.
+    grouped output pair shards whole groups.  Row roles pad the sharded
+    dimension to the local width and the declared weight block; a packed
+    column projection splits its output features exactly because its block
+    scale lives on the input axis, and a replicated term keeps every feature.
+  * ``ROLE_LINEAR_GATE`` is a declared role with local width one: the low-rank
+    decay/gate matrices run on the token-owning rank without a collective.
   * ``weight_terms`` list the exact semantic terms represented by a placement;
     packed slices preserve semantic boundaries, byte offsets and quant groups.
   * A width of one reproduces every historical shape and byte count.
@@ -46,9 +50,15 @@ PARTITION_COLUMN = "column"
 PARTITION_ROW = "row"
 PARTITION_GROUP_PAIR = "group_pair"
 ATTENTION_ROLES = frozenset({ROLE_ATTENTION_OUTPUT})
-LINEAR_ROLES = frozenset({ROLE_LINEAR_INPUT, ROLE_LINEAR_GATE, ROLE_LINEAR_OUTPUT})
+LINEAR_ROLES = frozenset({ROLE_LINEAR_INPUT, ROLE_LINEAR_OUTPUT})
+#: ``ROLE_LINEAR_GATE`` is a declared role but never a sharded one: the
+#: low-rank decay/gate matrices (``f_b_proj`` / ``g_b_proj``) execute locally
+#: on the rank that already owns the tokens, so they carry no collective.
+LOCAL_LINEAR_ROLES = frozenset({ROLE_LINEAR_GATE})
 LOGIT_ROLES = frozenset({ROLE_LOGITS, ROLE_DRAFT_LOGITS})
-SHARDED_ROLES = ATTENTION_ROLES | LINEAR_ROLES | LOGIT_ROLES
+SHARDED_ROLES = ATTENTION_ROLES | LINEAR_ROLES | LOCAL_LINEAR_ROLES | LOGIT_ROLES
+#: Declared catalog shard kinds that keep every output feature on each owner.
+REPLICATED_SHARD = "replicated"
 _GROUP_PAIR_TERMS = frozenset({"wo_a", "wo_b", "draft_wo_a", "draft_wo_b"})
 _ATTENTION_OUTPUT_TERMS = frozenset({"o_proj", "output", "draft_o"})
 _LINEAR_INPUT_TERMS = frozenset({
@@ -77,6 +87,9 @@ class ProjectionSlice:
     quant_category: str
     quant_group_boundaries: tuple[int, ...] = ()
     name: str = ""
+    #: Replicated slices keep their full logical extent on every owner rank;
+    #: no local split and no collective exchange carries their columns.
+    replicated: bool = False
 
 
 @dataclass(frozen=True)
@@ -152,6 +165,9 @@ def role_width(role: str, parallel: Any) -> int:
     """Resolve the local width that owns ``role``."""
     if role in ATTENTION_ROLES:
         return int(parallel.o_proj_tp)
+    if role == ROLE_LINEAR_GATE:
+        # The low-rank decay/gate matrices are local to the token-owning rank.
+        return ONE
     if role in LINEAR_ROLES:
         return int(parallel.linear_proj_tp)
     if role in LOGIT_ROLES:
@@ -176,6 +192,25 @@ def _padded_local(logical: int, width: int, term: Any) -> int:
     return int(align_up(local, _padding_granule(width, term)))
 
 
+def _output_local(logical: int, width: int) -> int:
+    """Exact per-rank output-feature extent of one column-sharded matrix.
+
+    A packed input projection splits its declared output features, and the
+    weight block scale lives on the (never split) input axis, so the local
+    extent is the exact ceiling division - no block-granule padding.
+    """
+    if width <= ONE:
+        return int(logical)
+    return (int(logical) + int(width) - ONE) // int(width)
+
+
+def _term_local_output(term: Any, width: int) -> int:
+    """Per-rank output features one packed term contributes on each owner."""
+    if str(getattr(term, "shard", "")) == REPLICATED_SHARD:
+        return int(term.rows)
+    return _output_local(int(term.rows), width)
+
+
 def _term_role(term: Any) -> str:
     declared = str(getattr(term, "placement_role", "") or "")
     if declared:
@@ -194,6 +229,9 @@ def placed_weight_shape(
     resident = getattr(term, "resident_count", None)
     if resident is not None:
         count = int(resident)
+    if role == ROLE_LINEAR_GATE:
+        # Unsharded local execution: every owner keeps the whole matrix.
+        return rows, cols, count
     if width <= ONE:
         return _legacy_shape(term, parallel, count)
     if role == ROLE_ATTENTION_OUTPUT and (term.name in {"wo_a", "wo_b", "draft_wo_a", "draft_wo_b"}):
@@ -205,6 +243,8 @@ def placed_weight_shape(
         return rows, cols // width, count
     if role in {ROLE_ATTENTION_OUTPUT, ROLE_LINEAR_OUTPUT}:
         return rows, _padded_local(cols, width, term), count
+    if role == ROLE_LINEAR_INPUT:
+        return _term_local_output(term, width), cols, count
     return _padded_local(rows, width, term), cols, count
 
 
@@ -255,7 +295,12 @@ def _placement_for_terms(
         raise ModelingError("local_tp_packed_input_dimension_mismatch")
     logical_rows = sum(int(term.rows) for term in terms)
     cols = columns.pop()
-    physical_rows = _padded_local(logical_rows, width, terms[ZERO])
+    if role == ROLE_LINEAR_INPUT:
+        # Packed input projections split output features exactly; replicated
+        # low-rank factors keep their full width on every owner rank.
+        physical_rows = sum(_term_local_output(term, width) for term in terms)
+    else:
+        physical_rows = _padded_local(logical_rows, width, terms[ZERO])
     return ProjectionPlacement(
         role, width, PARTITION_COLUMN, logical_rows, cols, physical_rows,
         cols, sum(max(ZERO, int(term.groups)) for term in terms),
@@ -309,18 +354,19 @@ def projection_slices(
     width = max(ONE, placement.width)
     for term in terms:
         logical = int(term.rows)
-        local = (logical + width - ONE) // width if width > ONE else logical
-        padded = _padded_local(logical, width, term)
+        replicated = str(getattr(term, "shard", "")) == REPLICATED_SHARD
+        local = _term_local_output(term, width)
         boundaries = tuple(range(granule, local + ONE, granule)) if granule > ONE else ()
         bytes_per_row = float(quant.matrix_payload_bytes(ONE, int(term.cols), term.category))
         slices.append(ProjectionSlice(
             semantic_role=role_from_category(str(term.category)) or placement.role,
             byte_offset=int(byte_offset),
             logical_extent=logical,
-            physical_extent=padded,
+            physical_extent=local,
             quant_category=str(term.category),
             quant_group_boundaries=boundaries,
             name=str(term.name),
+            replicated=replicated,
         ))
         byte_offset += int(round(bytes_per_row * local))
         extent_offset += local

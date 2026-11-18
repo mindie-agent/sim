@@ -26,6 +26,8 @@ from .ownership import unit_group
 
 
 _EMPTY_MAPPING = MappingProxyType({})
+#: Default live-stage bound for coalescing a repeated finite pipeline window.
+PIPELINE_UNROLL_LIMIT = 64
 
 
 def scope_allocations(name: str, items) -> tuple[Allocation, ...]:
@@ -806,26 +808,26 @@ class PipelineProgram:
         if self.count == 1 and not self.setup_ms and not self.minimum_ms:
             def submit_tile0(trigger: Event) -> tuple[Event, ...]:
                 local: dict[str, Event] = {}
-                stage_tail: dict[str, Event] = {}
+                # Tile zero has no preceding tile: a ``previous`` edge must not
+                # bind to a stage already issued inside this same tile.
+                previous: dict[str, Event] = {}
                 stages = tuple(self.tile(0))
                 consumed: set[str] = set()
                 for stage in stages:
                     if stage.after:
                         consumed.update(stage.after)
                     deps = [local[key] for key in stage.after]
-                    deps.extend(stage_tail[key] for key in stage.previous
-                                if key in stage_tail)
-                    if stage.name in stage_tail:
-                        deps.append(stage_tail[stage.name])
+                    deps.extend(previous[key] for key in stage.previous
+                                if key in previous)
                     if (stage.program is None and not stage.acquire
                             and not stage.free and _declares_no_work(stage)):
                         ev = _zero_work_alias(deps, trigger)
                         if ev is not None:
-                            local[stage.name] = stage_tail[stage.name] = ev
+                            local[stage.name] = ev
                             continue
                     ev = stage.submit(engine, f"{name}:tile0:{stage.name}",
                                       tuple(deps) or (trigger,), scoped, owner)
-                    local[stage.name] = stage_tail[stage.name] = ev
+                    local[stage.name] = ev
                 sinks = tuple(dict.fromkeys(
                     local[stage.name] for stage in stages
                     if stage.name not in consumed))
@@ -1507,7 +1509,6 @@ class RecipeBook:
     def __init__(self, recipes: Mapping[str, Recipe] | None = None,
                  *, families: Mapping[str, Recipe] | None = None, default: Recipe | None = None,
                  programs: Mapping[str, Recipe] | None = None):
-        from .matrix import TiledMatmul
         from .matrix_mapping import MappedMatmul
         from .matrix_steady import SteadyMatmul
         from .state_program import RecurrentVector
@@ -1544,7 +1545,7 @@ class RecipeBook:
             "grouped_gemm": (programs or {}).get("matmul", SteadyMatmul()),
             **(families or {}),
         }
-        self.programs = {"matmul": TiledMatmul(128, 128),
+        self.programs = {"matmul": SteadyMatmul(),
                          "dense_latent_attention": _PlannedRecipe(_generic_latent_build),
                          **(programs or {})}
         self.default = default
@@ -1941,8 +1942,21 @@ class RecipeBook:
 
 
 class HostStaging:
+    """CPU lookup, host-vector decode and H2D transfer over qualified work keys.
+
+    ``Execution`` binds native roles before constructing ``context.work``, so
+    the binding is read through ``context.resource_names``; the remaining
+    transfer work is preserved for other Engram callers.
+    """
+
     def lower(self, context):
         names, work = context.resource_names, dict(context.work)
+        roles = ("host_memory", "host_vector", "h2d")
+        if any(role not in names for role in roles):
+            raise ModelingError(
+                "host_staging_requires_host_memory_host_vector_h2d_rates")
+        if any(names[role] not in work for role in roles):
+            raise ModelingError("host_staging_requires_bound_host_and_h2d_work")
         memory = {names["host_memory"]: work.pop(names["host_memory"])}
         compute = {names["host_vector"]: work.pop(names["host_vector"])}
         return KernelProgram((
@@ -2658,7 +2672,24 @@ def _fold_kernel_stages(stages: tuple[Stage, ...]) -> tuple[Stage, ...]:
     return tuple(cur)
 
 
-def coalesce_execution_program(program, *, unroll_limit: int = 64):
+def is_pure_static_program(program) -> bool:
+    """True for a callback-free finite DAG of plain kernel stages.
+
+    A nested ``Stage.program`` is a per-tile callback, a pipeline tile factory
+    is a callable, and an allocation-carrying stage needs a Python start
+    boundary: none of them can be admitted without a Python hook, so none is
+    "pure static" for admission purposes.
+    """
+    if isinstance(program, KernelProgram):
+        return not any(stage.program is not None or stage.acquire or stage.free
+                       for stage in program.stages)
+    if isinstance(program, (ParallelProgram, _FloorParallelProgram)):
+        return bool(program.programs) and all(
+            is_pure_static_program(child) for child in program.programs)
+    return False
+
+
+def coalesce_execution_program(program, *, unroll_limit: int = PIPELINE_UNROLL_LIMIT):
     """Unwrap single-tile pipelines and coalesce symmetric cohorts for Execution.
 
     Used only when ``Engine.trace`` is disabled (or a bounded summary ring on a
@@ -2744,11 +2775,10 @@ def coalesce_execution_program(program, *, unroll_limit: int = 64):
                 if stage.name in seen:
                     valid = False
                     break
-                extra = tuple(p for p in stage.previous
-                              if p in seen and p not in stage.after)
                 seen.add(stage.name)
-                flat.append(unwrap_stage(
-                    replace(stage, after=stage.after + extra, previous=())))
+                # A single-tile pipeline has no preceding tile, so a
+                # ``previous`` reference cannot become an intra-tile edge.
+                flat.append(unwrap_stage(replace(stage, previous=())))
             if valid:
                 return KernelProgram(_fold_kernel_stages(_inline_wrapper_stages(flat)))
         if 1 < program.count <= PIPELINE_COHORT_WINDOW:

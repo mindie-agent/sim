@@ -169,6 +169,9 @@ class StageSpec:
     caps: tuple[CapTerm, ...] = ()
     coupled: bool = False
     priority: int = 0
+    #: Symmetric owner multiplicity of a merged coupled cohort; the Engine
+    #: normalizes joint progress by this count, exactly like ``Stage``.
+    cohort_size: int = 1
     placement: tuple[PlacementSpec, ...] = ()
     acquire: tuple[AllocationSpec, ...] = ()
     release: tuple[ReleaseSpec, ...] = ()

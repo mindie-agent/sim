@@ -149,6 +149,11 @@ class _Task:
     cohort_size: int = 1
     prepared: _PreparedTask | None = None
     start_observer: Event | None = None
+    #: The completion hook is a pure, bounded frontier expansion: the kernel may
+    #: mirror this row and stops at its completion instant (``F_CALLBACK``)
+    #: before Python admits the pre-prepared successors.  Only rows whose hook
+    #: is virtual-time independent set this.
+    native_hook: bool = False
 
 
 @dataclass(frozen=True, slots=True)

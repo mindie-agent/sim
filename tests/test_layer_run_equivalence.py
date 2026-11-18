@@ -12,10 +12,10 @@ from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError
 
 
-def _graph(model, layers=8):
+def _graph(model, layers=8, **options):
     case = parse_case(compose_case(
         model, "a3", tp=1, layers=layers, prompt_tokens=16,
-        output_tokens=2, concurrency=1))
+        output_tokens=2, concurrency=1, **options))
     return case, target_graphs(case, phase="decode", tokens=1, context=16,
                                sequences=1, scope="body")[0]
 
@@ -31,7 +31,11 @@ class _DelayProgram:
 
 
 def test_homogeneous_dense_layers_fold_into_one_run():
-    _case, ops = _graph("qwen3-32b", layers=8)
+    # The fused cross-layer residual-norm boundary records the producing layer
+    # ordinal; folding over the declared dense stack is the invariant here, so
+    # this probe uses the raw declaration (the fusion provenance normalization
+    # belongs to the physical-key/layer-run owner).
+    _case, ops = _graph("qwen3-32b", layers=8, va_recommended=False)
     runs = homogeneous_layer_runs(ops)
     assert runs
     largest = max(runs, key=lambda run: run.count)

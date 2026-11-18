@@ -243,10 +243,16 @@ def test_real_kimi_decode_matrix_crosses_semantic_recipes_without_choosing_a_rep
     group = mapping["windows"][0]["cohorts"][0]
     assert mapping["status_counts"] == {"ambiguous": 2}
     assert group["declared_candidate_instance_count"] == group["declared_instance_count"] * 4
-    recipes = {node["recipe"] for node in export_structure(
-        case, phase="decode", tokens=1, context=32768, scope="body")["nodes"]
-        if node["node_id"] in group["target_ids"]}
-    assert {"linear_q", "output_gate", "dense_gate_up"} <= recipes
+    graph = export_structure(case, phase="decode", tokens=1, context=32768,
+                             scope="body")
+    recipes = {node["recipe"] for node in graph["nodes"]
+               if node["node_id"] in group["target_ids"]}
+    # The K3 KDA input is one declared packed matrix, so the selected cohort
+    # crosses the grouped dense gate and the output gate instead of separate
+    # Q/K/V matrices while still never choosing a replica.
+    assert {"output_gate", "dense_gate_up"} <= recipes
+    assert any(str(node["recipe"]).startswith("linear_qkvbfg_a")
+               for node in graph["nodes"])
     result = compare_cohorts(case, mapping)
     row = result["windows"][0]["cohorts"][0]
     assert row["status"] == "compared"
@@ -412,11 +418,14 @@ def test_equal_tensor_work_with_different_explicit_recipes_is_not_a_cohort(profi
     original = next(op for op in target_graphs(
         case, phase="decode", tokens=1, scope="body")[0] if op.family == "rmsnorm")
     operators = [
-        replace(original, op_id="norm_a", deps=(), layer=0, recipe="envelope_norm"),
+        replace(original, op_id="norm_a", deps=(), layer=0, recipe="row_tiled_norm"),
         replace(original, op_id="norm_b", deps=(), layer=1, recipe="tiled_norm"),
     ]
     kernels = {"recipes": {
-        "envelope_norm": {"kind": "envelope"},
+        "row_tiled_norm": {"kind": "tiled_pointwise", "input_bytes_per_element": 2,
+                           "outputs": [{"bytes_per_element": 2}],
+                           "parameter_bytes_per_col": 2, "tile_rows": 6144,
+                           "tile_cols": 1},
         "tiled_norm": {"kind": "tiled_pointwise", "input_bytes_per_element": 2,
                        "outputs": [{"bytes_per_element": 2}], "parameter_bytes_per_col": 2,
                        "tile_rows": 1, "tile_cols": 6144},
@@ -442,7 +451,10 @@ def test_same_recipe_name_with_different_binding_changes_identity_and_rejects_ol
     profiler_api,
 ):
     envelope = _norm_case()
-    envelope["runtime"]["kernels"] = {"recipes": {"rmsnorm": {"kind": "envelope"}}}
+    envelope["runtime"]["kernels"] = {"recipes": {"rmsnorm": {
+        "kind": "tiled_pointwise", "input_bytes_per_element": 2,
+        "outputs": [{"bytes_per_element": 2}], "parameter_bytes_per_col": 2,
+        "tile_rows": 6144, "tile_cols": 1}}}
     tiled = deepcopy(envelope)
     tiled["runtime"]["kernels"]["recipes"]["rmsnorm"] = {
         "kind": "tiled_pointwise", "input_bytes_per_element": 2,

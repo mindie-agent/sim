@@ -13,11 +13,15 @@ from pathlib import Path
 
 import pytest
 
+#: A5 sustainable DRAM service is declared at 0.8316 of the raw HBM peak.
+A5_DRAM_SERVICE_SCALE = 1 / 0.8316
+
 from mindie_sim import graph_costs, operator_costs, target_graphs
 from mindie_sim.prediction.matrix_epilogue import (
     MatrixEpilogue, plan_matrix_epilogue, reconcile_native_scale_storage,
     reconcile_scale_storage,
 )
+from mindie_sim.prediction.matrix import TiledMatmul
 from mindie_sim.prediction.matrix_steady import SteadyMatmul
 from mindie_sim.prediction.native_binding import bind_native_call, declare_native_call
 from mindie_sim.prediction.program import RecipeBook
@@ -122,7 +126,11 @@ def test_reconciled_typed_abi_matches_capture_and_operator_native_work():
     # Idempotent reconciliation; no target duration is read or stored.
     assert reconcile_native_scale_storage(fixed) == fixed
 
-    tiled = operator_costs(raw, (fixed,), input_ready_ms=0)["operators"][0]
+    # Both programs are explicit recipes; the global default is SteadyMatmul.
+    tiled = operator_costs(
+        raw, (fixed,),
+        recipes=RecipeBook(recipes={"dense_down": TiledMatmul(128, 128, 128)}),
+        input_ready_ms=0)["operators"][0]
     steady = operator_costs(
         raw, (fixed,),
         recipes=RecipeBook(recipes={"dense_down": SteadyMatmul()}),
@@ -262,8 +270,10 @@ def test_real_quantize_producer_feeds_the_corrected_matrix_plan():
         f"r0:{producer.op_id}"]
     assert timeline[matrix.op_id]["ready_ms"] == pytest.approx(
         timeline[producer.op_id]["complete_ms"])
+    # The matrix payload stays byte-exact; the vector quantize producer is
+    # normalized by the declared sustainable DRAM service ceiling.
     assert joint["execution"]["serviced"]["memory@r0:s0"] == pytest.approx(
-        matrix.hbm_bytes + producer.hbm_bytes, rel=1e-12)
+        matrix.hbm_bytes + producer.hbm_bytes * A5_DRAM_SERVICE_SCALE, rel=1e-12)
     assert matrix.hbm_bytes == CAPTURED_INPUT_BYTES
 
 
@@ -359,13 +369,16 @@ def test_graph_helper_normalizes_same_object_and_detects_producer_conflict():
     assert inputs == normalized.mte2_bytes - metadata["packed_weight_bytes"] - 16
     # The normalized object, not a manual scalar/plan, enters the public
     # graph preparation and the same Tiled program.
-    joint = graph_costs(raw, (producer, normalized), input_ready_ms=0,
-                        external_inputs={producer.deps[0]: 0})
+    joint = graph_costs(
+        raw, (producer, normalized), input_ready_ms=0,
+        recipes=RecipeBook(recipes={normalized.recipe: TiledMatmul(128, 128, 128)}),
+        external_inputs={producer.deps[0]: 0})
     timeline = {row["op_id"]: row for row in joint["timeline"]}
     assert timeline[normalized.op_id]["program"] == "TiledMatmul"
     assert timeline[normalized.op_id]["predecessors"] == [f"r0:{producer.op_id}"]
     assert joint["execution"]["serviced"]["memory@r0:s0"] == pytest.approx(
-        normalized.hbm_bytes + producer.hbm_bytes, rel=1e-12)
+        normalized.hbm_bytes + producer.hbm_bytes * A5_DRAM_SERVICE_SCALE,
+        rel=1e-12)
     bad_metadata = dict(producer.metadata)
     bad_metadata.update({"activation_scale_bytes": 8,
                          "activation_scale_format": "bf16"})

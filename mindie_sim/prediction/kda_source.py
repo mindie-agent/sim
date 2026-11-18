@@ -61,10 +61,14 @@ def options(plan, *, activation_dtype, views=None):
     result = {
         # Null/absent is the caller's false; zero is a valid non-None bound.
         "safe_gate": bound is not None,
-        "use_beta_sigmoid": False,
+        # A5 arch35 fuses ``SIGMOID_BETA`` (``tl.sigmoid(raw_beta)``) into the
+        # KDA kernel, including the RecoverSSM verify call, so no standalone
+        # FP32 ``linear_beta_sigmoid`` launch remains.  The beta operand keeps
+        # the activation dtype for that in-kernel expression.
+        "use_beta_sigmoid": True,
         "allow_neg_eigval": False,
         "gate_dtype": activation_dtype,
-        "beta_dtype": "fp32",
+        "beta_dtype": activation_dtype,
         "has_a_log": True,
         "has_dt_bias": True,
     }

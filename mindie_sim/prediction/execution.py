@@ -1330,6 +1330,12 @@ class _CollectivePlanBinding:
         return self.factory()
 
 
+#: Bounded live-frontier ceiling above which eager admission defers to the
+#: lazily expanded ``:begin`` boundary.
+INLINE_FRONTIER_TASK_CAP = 49152
+#: Per-Execution lowered-program cache bound (occurrence-keyed, not results).
+PROGRAM_CACHE_ENTRY_LIMIT = 768
+
 class Execution:
     # Identical private schedules replay across ranks and later layers.
     # Experimental: off in the shipped default. Opt-in only; no shape or input auto-enable.
@@ -1347,10 +1353,17 @@ class Execution:
         fragment_state=None, memory=None,
         lazy_frontier: bool = True, host_lookahead: int = HOST_LOOKAHEAD_DEFAULT,
         bindings=None, ledger=None, isolated_replica: int | None = None,
+        evaluation=None, accel_eager_attach: bool = False,
     ):
         from .cost import CostLedger
         self.case, self.cost = case, cost
         self.bindings = bindings
+        # An explicitly passed evaluation context owns the bounded prepared
+        # program cache shared by graph, cohort and operator pricing.  It is
+        # never a module-global and never outlives one public evaluation.
+        self.evaluation = evaluation
+        self._shared_eval_cache = (
+            None if evaluation is None else evaluation.prepared_programs)
         # Mutable diagnostic records belong to this execution, not to the
         # shared immutable pricing model.
         self.ledger = ledger if ledger is not None else CostLedger()
@@ -1377,6 +1390,7 @@ class Execution:
         self.on_operator = on_operator
         self.lazy_frontier = bool(lazy_frontier)
         self.host_lookahead = max(1, int(host_lookahead))
+        self.accel_eager_attach = bool(accel_eager_attach)
         self.recipes = recipes or RecipeBook.from_mapping(case.runtime.kernels)
         from .invocation_binding import InvocationPolicy
         self.invocations = InvocationPolicy(case.runtime.kernels.get("invocations", ()))
@@ -1461,7 +1475,8 @@ class Execution:
         if engine is not None:
             engine.extend(resources, pools, pool_units)
         self.engine = engine if engine is not None else Engine(
-            resources, pools=pools, pool_units=pool_units, trace_limit=trace_limit)
+            resources, pools=pools, pool_units=pool_units, trace_limit=trace_limit,
+            accel_eager_attach=self.accel_eager_attach)
         if self.memory is not None:
             if not self.engine.bind_memory(self.memory, pools=("hbm",)):
                 raise ModelingError("execution_memory_ledger_conflict")
@@ -1560,7 +1575,8 @@ class Execution:
             list(self._engine_resource_templates),
             pools=dict(self._engine_pool_templates),
             pool_units=dict(self._engine_pool_unit_templates),
-            trace_limit=self._engine_trace_limit)
+            trace_limit=self._engine_trace_limit,
+            accel_eager_attach=self.accel_eager_attach)
         if self.memory is not None:
             if not self.engine.bind_memory(self.memory, pools=("hbm",)):
                 raise ModelingError("execution_memory_ledger_conflict")
@@ -2580,6 +2596,104 @@ class Execution:
             "partial": (),
         }
 
+    def _program_inputs(self, context, recipe, engine, replica, op, owner):
+        """Virtual-time-free lowering inputs of one operator occurrence."""
+        transport = (
+            self.native_transport(op, replica)
+            if replica is not None and getattr(recipe, "native", False)
+            else None)
+        live_rates = tuple(
+            (role, context.rates.get(res_name))
+            for role, res_name in sorted(context.resource_names.items())
+            if res_name in context.rates
+        )
+        inv_t = context.invocation_timing
+        do_compact = not self.legacy_diagnostics and (
+            not engine.trace.maxlen or self._compact_step
+        )
+        prog_key = (
+            owner, do_compact, _freeze_key(recipe), op.family, op.recipe, op.phase, op.stage,
+            op.dtype, op.layout, op.semantic_shape, op.local_shape, op.padded_shape,
+            op.launch_shape, op.flops, op.matrix_flops, op.mte2_bytes,
+            op.mte3_bytes, op.vector_ops, op.hbm_bytes, op.link_bytes,
+            op.link_scope, op.source_boundary, op.returns,
+            self._op_key(op), context.setup_ms, context.minimum_ms,
+            (inv_t.startup_ms, inv_t.minimum_ms) if inv_t is not None else None,
+            _freeze_key(context.joint_native_service),
+            tuple(sorted(context.work.items())),
+            live_rates,
+            context.group_buffers,
+            getattr(context.physical_mechanisms, "signature", None),
+        )
+        token = _rank_token(context)
+        replayable = (
+            Execution.schedule_replay and token is not None
+            and not op.link_bytes and not getattr(recipe, "algorithm", None)
+            and dict(op.metadata).get("group_axis") not in {"ep", "local_tp"}
+        )
+        return transport, prog_key, do_compact, replayable
+
+    def _lower_operator_program(self, context, recipe, engine, replica, name,
+                                prog_key, do_compact):
+        """Return ``((program, mapped, services), from_cache)`` for one operator.
+
+        The lowered program is a pure function of the operator declaration and
+        its frozen execution options, so it is cached per Engine and, when an
+        explicit evaluation context exists, per evaluation.  Mapped records are
+        replayed on every use; the program itself is never mutated.
+        """
+        hit = self._program_cache.get(prog_key)
+        if hit is None and self._shared_eval_cache is not None:
+            hit = self._shared_eval_cache.get(prog_key)
+            if hit is not None:
+                self._program_cache[prog_key] = hit
+        if hit is not None:
+            return hit, True
+        mapped_list = []
+        svc_list = []
+        orig_rec = context.record_mapping
+        orig_svc = context.record_service
+
+        def cap_map(rec):
+            mapped_list.append(deepcopy(rec))
+            if orig_rec is not None:
+                orig_rec(rec)
+
+        def cap_svc(*args, **kwargs):
+            svc_list.append((deepcopy(args), deepcopy(kwargs)))
+            if orig_svc is not None:
+                orig_svc(*args, **kwargs)
+
+        run_ctx = replace(
+            context,
+            record_mapping=cap_map if orig_rec is not None else None,
+            record_service=cap_svc if orig_svc is not None else None,
+        )
+        program = self.lower_program(run_ctx, recipe)
+        program = self._apply_resource_service_program(context, program)
+        if do_compact:
+            from .program import coalesce_execution_program
+            program = coalesce_execution_program(program)
+        entry = (program, tuple(mapped_list), tuple(svc_list))
+        if len(self._program_cache) >= PROGRAM_CACHE_ENTRY_LIMIT:
+            self._program_cache.pop(next(iter(self._program_cache)))
+        self._program_cache[prog_key] = entry
+        if self._shared_eval_cache is not None:
+            self._shared_eval_cache.put(prog_key, entry)
+        return entry, False
+
+    def _program_uses_fifo(self, context, engine) -> bool:
+        """True when FIFO arbitration could order this program by sequence."""
+        names = engine.fifo_resource_names()
+        if not names:
+            return False
+        if engine._fifo_live > 0:
+            return True
+        for resource in context.resource_names.values():
+            if resource in names:
+                return True
+        return False
+
     def _start_program(self, context, recipe, name, ready, *, owner,
                        local_ready=None, peer_ready=None, rank_index=None,
                        launch=None, source_send=None,
@@ -2588,47 +2702,62 @@ class Execution:
                        memory_bindings=None, on_resolve=None, begin_after=None):
         """Keep per-core programs resident only while their operator can run."""
         engine = self.engine
-        complete = engine.future(name + ":program_complete")
-        #: ``begin_after`` submits the single ready/begin boundary itself; the
-        #: lazily expanded program then starts at that boundary's instant.
         entry = {"ready": ready}
+        inherited = local_ready if local_ready is not None else ready
+        stage = int(context.op.stage)
+
+        # Eager template preparation and cache lookup.  A pure static program is
+        # admitted here without a ``:begin`` row or a Python completion callback,
+        # but only while no live row can be ordered by a FIFO resource: eager
+        # submission otherwise changes task sequence numbers and therefore FIFO
+        # admission order (a demonstrated behavioural divergence).
+        if (begin_after is None and on_resolve is None and memory_ledger is None
+                and not memory_bindings and not Execution.schedule_replay
+                and len(engine._tasks) < INLINE_FRONTIER_TASK_CAP
+                and not self._program_uses_fifo(context, engine)):
+            op = context.op
+            transport, prog_key, do_compact, replayable = self._program_inputs(
+                context, recipe, engine, replica, op, owner)
+            if not replayable:
+                (program, mapped_recs, svc_calls), _from_cache = (
+                    self._lower_operator_program(
+                        context, recipe, engine, replica, name, prog_key,
+                        do_compact))
+                from .program import is_pure_static_program
+                if is_pure_static_program(program):
+                    if mapped_recs and context.record_mapping is not None:
+                        for mrec in mapped_recs:
+                            context.record_mapping(mrec)
+                    if svc_calls and context.record_service is not None:
+                        for sargs, skwargs in svc_calls:
+                            context.record_service(*sargs, **skwargs)
+                    native_resources = self._native_resource_names(context, program)
+                    self._record_single_native(
+                        context, program, replica, name, transport=transport)
+                    with engine.memory_scope(
+                            memory_ledger,
+                            replica=(0 if replica is None else replica),
+                            stage=stage,
+                            pools=(memory_pools if memory_pools is not None
+                                   else ("hbm",)),
+                            bindings=memory_bindings):
+                        return self._start_engine_program(
+                            program, engine, name, inherited, owner,
+                            local_ready=local_ready, peer_ready=peer_ready,
+                            rank_index=rank_index, launch=launch,
+                            source_send=source_send,
+                            send_placeholders=send_placeholders,
+                            resource_names=native_resources,
+                            transport=transport)
+
+        complete = engine.future(name + ":program_complete")
 
         def begin(_):
             op = context.op
             ready = entry["ready"]
-            transport = (
-                self.native_transport(op, replica)
-                if replica is not None and getattr(recipe, "native", False)
-                else None)
-            live_rates = tuple(
-                (role, context.rates.get(res_name))
-                for role, res_name in sorted(context.resource_names.items())
-                if res_name in context.rates
-            )
-            inv_t = context.invocation_timing
-            do_compact = not self.legacy_diagnostics and (
-                not engine.trace.maxlen or self._compact_step
-            )
-            prog_key = (
-                owner, do_compact, _freeze_key(recipe), op.family, op.recipe, op.phase, op.stage,
-                op.dtype, op.layout, op.semantic_shape, op.local_shape, op.padded_shape,
-                op.launch_shape, op.flops, op.matrix_flops, op.mte2_bytes,
-                op.mte3_bytes, op.vector_ops, op.hbm_bytes, op.link_bytes,
-                op.link_scope, op.source_boundary, op.returns,
-                self._op_key(op), context.setup_ms, context.minimum_ms,
-                (inv_t.startup_ms, inv_t.minimum_ms) if inv_t is not None else None,
-                _freeze_key(context.joint_native_service),
-                tuple(sorted(context.work.items())),
-                live_rates,
-                context.group_buffers,
-                getattr(context.physical_mechanisms, "signature", None),
-            )
+            transport, prog_key, do_compact, replayable = self._program_inputs(
+                context, recipe, engine, replica, op, owner)
             token = _rank_token(context)
-            replayable = (
-                Execution.schedule_replay and token is not None
-                and not op.link_bytes and not getattr(recipe, "algorithm", None)
-                and dict(op.metadata).get("group_axis") not in {"ep", "local_tp"}
-            )
             if replayable:
                 script_key = _isolated_script_key(prog_key, context, token)
                 # Later layers run one rank for real so latency fill is recomputed
@@ -2660,57 +2789,17 @@ class Execution:
                 if on_resolve is not None:
                     on_resolve()
 
-            cached_prog = self._program_cache.get(prog_key)
-            if cached_prog is not None:
-                program, mapped_recs, svc_calls = cached_prog
-                native_resources = self._native_resource_names(context, program)
-                if mapped_recs and context.record_mapping is not None:
-                    for mrec in mapped_recs:
-                        context.record_mapping(mrec)
-                if svc_calls and context.record_service is not None:
-                    for sargs, skwargs in svc_calls:
-                        context.record_service(*sargs, **skwargs)
-                self._record_single_native(
-                    context, program, replica, name, transport=transport)
-                finish = self._start_engine_program(
-                    program, engine, name, ready, owner,
-                    local_ready=local_ready, peer_ready=peer_ready,
-                    rank_index=rank_index, launch=launch,
-                    source_send=source_send,
-                    send_placeholders=send_placeholders,
-                    resource_names=native_resources, transport=transport)
-                engine.on_complete(finish, finished)
-                return
-
-            mapped_list = []
-            svc_list = []
-            orig_rec = context.record_mapping
-            orig_svc = context.record_service
-
-            def cap_map(rec):
-                mapped_list.append(deepcopy(rec))
-                if orig_rec is not None:
-                    orig_rec(rec)
-
-            def cap_svc(*args, **kwargs):
-                svc_list.append((deepcopy(args), deepcopy(kwargs)))
-                if orig_svc is not None:
-                    orig_svc(*args, **kwargs)
-
-            run_ctx = replace(
-                context,
-                record_mapping=cap_map if orig_rec is not None else None,
-                record_service=cap_svc if orig_svc is not None else None,
-            )
-            program = self.lower_program(run_ctx, recipe)
-            program = self._apply_resource_service_program(context, program)
-            if do_compact:
-                from .program import coalesce_execution_program
-                program = coalesce_execution_program(program)
+            (program, mapped_recs, svc_calls), _from_cache = (
+                self._lower_operator_program(
+                    context, recipe, engine, replica, name, prog_key,
+                    do_compact))
+            if mapped_recs and context.record_mapping is not None:
+                for mrec in mapped_recs:
+                    context.record_mapping(mrec)
+            if svc_calls and context.record_service is not None:
+                for sargs, skwargs in svc_calls:
+                    context.record_service(*sargs, **skwargs)
             native_resources = self._native_resource_names(context, program)
-            if len(self._program_cache) >= 768:
-                self._program_cache.pop(next(iter(self._program_cache)))
-            self._program_cache[prog_key] = (program, tuple(mapped_list), tuple(svc_list))
             self._record_single_native(
                 context, program, replica, name, transport=transport)
             finish = self._start_engine_program(
@@ -2725,8 +2814,6 @@ class Execution:
         # Host submission and graph dependencies are already declared. Expanding
         # every future layer's per-core pipelines here multiplies inactive state
         # by the device's core count without changing any physical work.
-        inherited = local_ready if local_ready is not None else ready
-        stage = int(context.op.stage)
 
         def begin_with_binding(event):
             with engine.memory_scope(
@@ -2739,14 +2826,14 @@ class Execution:
 
         if begin_after is None:
             engine.submit(name + ":begin", after=(inherited,), owner=owner,
-                          on_complete=begin_with_binding)
+                          on_complete=begin_with_binding, native_hook=True)
         else:
             # One dependency-satisfied boundary owns both the graph readiness
             # and the expansion trigger, so a caller without an operator
             # observer never pays for a separate zero-work ready task.
             boundary = engine.submit(
                 name + ":begin", after=tuple(begin_after), owner=owner,
-                on_complete=begin_with_binding)
+                on_complete=begin_with_binding, native_hook=True)
             entry["ready"] = boundary
         return complete
 
@@ -2807,6 +2894,9 @@ class Execution:
         return body
 
     def prepare(self, op, replica=ZERO):
+        # Directly submitted blocking work must not reach the Engine either.
+        from .unmodeled_gate import assert_timing_supported
+        assert_timing_supported(None, (op,), entry="execution_prepare")
         geom = self.stage_geometry[replica, op.stage]
         startup_mode = self.case.runtime.collective_startup_mode
         prep_key = (
@@ -2832,12 +2922,8 @@ class Execution:
                 metadata=meta,
             ), recipe
         res_op, recipe = self.recipes.prepare(op, geom)
-        from .collective_waves import RECIPE as STARTUP_WAVES, startup_waves_selected
-        if (not getattr(recipe, "source_bound", False)
-                and not getattr(recipe, "native", False)
-                and not getattr(recipe, "algorithm", None)
-                and startup_waves_selected(res_op, startup_mode)):
-            recipe = STARTUP_WAVES
+        from .collective_waves import startup_waves_recipe
+        recipe = startup_waves_recipe(res_op, recipe, startup_mode)
         stage_dies = self.stage_dies.get((replica, res_op.stage))
         if stage_dies:
             from .matrix_precision import resolve_matrix_precision
@@ -2916,10 +3002,9 @@ class Execution:
         from .services import service_identity
         from .kernel_groups import declaration
         from .matrix_precision import execution_compute_peaks, resolve_matrix_precision
-        from .collective_waves import RECIPE as STARTUP_WAVES
-        from .collective_waves import startup_waves_selected
-        if startup_waves_selected(op, self.case.runtime.collective_startup_mode):
-            recipe = STARTUP_WAVES
+        from .collective_waves import startup_waves_recipe
+        recipe = startup_waves_recipe(
+            op, recipe, self.case.runtime.collective_startup_mode)
         dies = self.stage_dies[replica, op.stage]
         op = resolve_matrix_precision(
             op, devices=dies,
@@ -2964,6 +3049,9 @@ class Execution:
         context = replace(template, op=op, native_work=cost.work, compute_peaks=peaks,
             service_identity=sid,
             service_boundary="resource_phase" if declared else "device_kernel")
+        bind_context = getattr(recipe, "bind_context", None)
+        if bind_context is not None:
+            context = bind_context(context)
         # A topology-declared direct mesh owns the physical plan for this
         # invocation.  Bind it before the ledger so execution, the isolated
         # row and the public accounting entry point consume one plan.
@@ -3933,9 +4021,11 @@ class Execution:
                 prefix + ":step_ready", after=(completion, host_complete),
                 owner=owner)
         from .offload import release_offload_access
+        # Zero-work bookkeeping rows: their completion hook is virtual-time
+        # independent, so the kernel may mirror them as an exact boundary.
         offload_release = engine.submit(
             prefix + ":offload_release", after=(device_complete,),
-            owner=owner,
+            owner=owner, native_hook=True,
             on_complete=lambda _event: release_offload_access(self, work))
         step = ScheduledIteration(
             replica, work.plan.iteration, completion, release_ms,
@@ -3956,7 +4046,7 @@ class Execution:
             self.step_summary.record(step)
 
         engine.submit(prefix + ":step_metrics", after=(completion,),
-                      on_complete=_record_step)
+                      on_complete=_record_step, native_hook=True)
         return step
 
     def _lower_local_tp_work(self, work: IterationWork, replica: int) -> IterationWork:
@@ -4354,7 +4444,7 @@ class Execution:
         offload_release = engine.submit(
             prefix + ":offload_release",
             after=(device_complete, *offload_tails),
-            owner=f"replica:{replica}",
+            owner=f"replica:{replica}", native_hook=True,
             on_complete=lambda _event: release_offload_access(self, work))
         completion = engine.submit(prefix + ":complete", after=(device_complete,),
                                    latency=self.submission.completion_ms if self.include_submission else 0,
@@ -4381,7 +4471,8 @@ class Execution:
                                   dict(fallback_commits),
                                   offload_release)
         engine.submit(prefix + ":step_metrics", after=(completion,),
-                      on_complete=lambda _: self.step_summary.record(step))
+                      on_complete=lambda _: self.step_summary.record(step),
+                      native_hook=True)
         return step
 
     def prepare_next(self, replica):

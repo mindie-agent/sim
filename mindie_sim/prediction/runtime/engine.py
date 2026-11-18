@@ -71,6 +71,9 @@ def _stop_window(now: float, horizon: float, releases, latency_active, tasks) ->
 
 DEADLINE_POLL_MASK = 255
 
+#: Default no-progress guard of one Engine advance (structural, not physics).
+DEFAULT_ZERO_PROGRESS_LIMIT = 100_000
+
 
 class Engine(
     _EnginePrepareMixin, _EngineSubmitMixin, _EngineLifecycleMixin,
@@ -83,7 +86,8 @@ class Engine(
         self, resources: Sequence[Resource], *,
         pools: Mapping[str, float] | None = None, trace_limit: int = 0,
         pool_units: Mapping[str, int] | None = None,
-        zero_progress_limit: int = 100_000, backend: str | None = None,
+        zero_progress_limit: int = DEFAULT_ZERO_PROGRESS_LIMIT,
+        backend: str | None = None, accel_eager_attach: bool = False,
     ):
         if not isinstance(zero_progress_limit, int) or isinstance(
                 zero_progress_limit, bool) or zero_progress_limit < 1:
@@ -107,7 +111,12 @@ class Engine(
         self._empty_task: _PreparedTask = _EMPTY_TASK
         self.memory_ledger_error: str | None = None
         from .accel_bridge import make_backend
-        self._accel, self._accel_telemetry = make_backend(backend)
+        self._accel, self._accel_telemetry = make_backend(
+            backend, eager_attach=bool(accel_eager_attach))
+        self._fifo_live = 0
+        self._inline_blocked = 0
+        self._fifo_names: frozenset[str] = frozenset()
+        self._fifo_resource_count = -1
         self._native_slots: dict[int, int] = {}
         self._native_seqs: set[int] = set()
         self._native_active = 0
@@ -134,6 +143,13 @@ class Engine(
         status["accel_backend"] = self.accel_backend
         status["backend_reason"] = self.accel_reason
         status["fallback_reason"] = status.get("fallback_reason", self.accel_reason)
+        # ``advance_steps`` counts every integration step of this Engine; the
+        # kernel reports how many of them it performed.  Their difference is the
+        # honest Python step count, never a build-availability guess.
+        native = int(status.get("native_steps") or 0)
+        status["native_steps"] = native
+        status["python_steps"] = max(0, int(self.advance_steps) - native)
+        status.setdefault("requested", self._accel_telemetry.get("requested"))
         return status
 
     def _frontier_next_release(self) -> float:
@@ -145,6 +161,45 @@ class Engine(
 
     def _complete_native(self, task: _Task, moment: float) -> None:
         self._complete(task, moment=moment, native=True)
+
+    def fifo_resource_names(self) -> frozenset[str]:
+        """Declared ``fifo`` resource names, memoized on the resource count."""
+        if len(self.resources) != self._fifo_resource_count:
+            self._fifo_names = frozenset(
+                name for name, resource in self.resources.items()
+                if resource.policy == "fifo")
+            self._fifo_resource_count = len(self.resources)
+        return self._fifo_names
+
+    def task_blocks_native(self, task: _Task) -> bool:
+        """True when one live row can never be mirrored by the kernel.
+
+        A cheap, exact-at-submission predicate: allocation bookkeeping needs a
+        Python start boundary, an ordinary completion callback needs a Python
+        completion, and an occurrence row owns Python metrics.  A zero count is
+        the necessary condition for adopting a frontier, so a positive one lets
+        every later re-adoption attempt return in constant time instead of
+        auditing thousands of rows.
+        """
+        if (task.acquire or task.free or task.allocation_demands
+                or task.start_callback is not None):
+            return True
+        if task.callback is not None and not task.native_hook:
+            return True
+        return bool(task.metadata) and "occurrence" in task.metadata
+
+    def task_uses_fifo(self, task: _Task) -> bool:
+        """True when this row can be ordered by a FIFO resource."""
+        names = self.fifo_resource_names()
+        if not names:
+            return False
+        demand = task.demand
+        if not demand:
+            return False
+        for name in demand:
+            if name in names:
+                return True
+        return False
 
     def extend(self, resources=(), pools=None, pool_units=None):
         """Add a disjoint physical pool to the same virtual clock.
@@ -602,6 +657,8 @@ class Engine(
             "peak_live_tasks": self.peak_tasks,
             "blocked_tasks": len(self._ready_heap),
             "advance_calls": self.advance_calls, "advance_steps": self.advance_steps,
+            "python_steps": max(0, int(self.advance_steps) - int(
+                (self.accel_status().get("native_steps") or 0))),
             "allocation_events": self.allocation_event_count,
             "retained_allocation_events": len(self.allocation_trace),
             "retained_trace_events": len(self.trace), "trace_dropped": self.trace_dropped,

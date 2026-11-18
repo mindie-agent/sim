@@ -177,13 +177,14 @@ def _normalize_parsed_case(case: Case) -> Case:
     from .implementations import select
     from .implementation_selection import prepared_selection
 
-    pool = select(case.runtime.kernels.get("lowerings", {}), "pool_key_indexer")
+    pool = prepared_selection(case.runtime.kernels.get("lowerings", {}),
+                              "pool_key_indexer")
     if pool and pool.name == "vllm_ascend_cann_keypool_caller":
         model = pool.module.prepare_model(model, case.runtime, pool)
     elif "native_keypool_caller" in dict(model.metadata):
         model = replace(model, metadata=tuple((key, value) for key, value in model.metadata
                                              if key != "native_keypool_caller"))
-    prolog = select(case.runtime.kernels.get("lowerings", {}), "mla_prolog")
+    prolog = prepared_selection(case.runtime.kernels.get("lowerings", {}), "mla_prolog")
     if prolog:
         model = prolog.module.prepare_model(model, case.runtime)
     head_padding = prepared_selection(case.runtime.kernels.get("lowerings", {}), "mla_head_padding")
@@ -206,7 +207,7 @@ def _normalize_parsed_case(case: Case) -> Case:
     elif "kda_input_projection" in dict(model.metadata):
         model = replace(model, metadata=tuple((key, value) for key, value in model.metadata
                                              if key != "kda_input_projection"))
-    mx_matrix = select(case.runtime.kernels.get("lowerings", {}), "mx_matrix")
+    mx_matrix = prepared_selection(case.runtime.kernels.get("lowerings", {}), "mx_matrix")
     if mx_matrix:
         model = mx_matrix.module.prepare_model(model, case.runtime, mx_matrix)
     elif "prepared_mx32_matrix" in dict(model.metadata):

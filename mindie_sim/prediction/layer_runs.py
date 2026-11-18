@@ -66,6 +66,8 @@ OWNERSHIP_FIELDS = (
 ABSENT = ("absent",)
 LAYER_DELTA = "layer_delta"
 NATIVE_LAYER_DELTA = "native_layer_delta"
+SEGMENT_DELTA = "seg_delta"
+SEGMENT_TAG = "seg_tag"
 
 
 def _relative(value: Any, index: int) -> tuple:
@@ -95,7 +97,40 @@ def _plan_template(plan: Any) -> tuple:
     return template + ownership + (native_relative,)
 
 
-def _op_run_key(op: Any, plan: Any) -> tuple:
+def _segment_signature(op: Any, base_segment: int | None) -> tuple:
+    """Intra-layer capture-segment offset, never the absolute capture ordinal.
+
+    Piecewise ACLGraph numbers capture segments over the whole unrolled graph,
+    so two structurally identical layers hold different absolute ordinals while
+    their intra-layer capture split is the same.  The relative delta is the
+    physical identity; a non-numeric tag is preserved verbatim.
+    """
+    raw = _metadata(op).get("graph_segment")
+    if raw is None or raw == "":
+        return (ABSENT,)
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        anchor = raw if base_segment is None else base_segment
+        return (SEGMENT_DELTA, int(raw) - int(anchor))
+    text = str(raw)
+    if text.isdigit():
+        value = int(text)
+        anchor = value if base_segment is None else base_segment
+        return (SEGMENT_DELTA, value - int(anchor))
+    return (SEGMENT_TAG, text)
+
+
+def _first_layer_segment(ops: Sequence[Any]) -> int | None:
+    """The first numeric capture ordinal declared inside one layer."""
+    for op in ops:
+        raw = _metadata(op).get("graph_segment")
+        if isinstance(raw, int) and not isinstance(raw, bool):
+            return int(raw)
+        if isinstance(raw, str) and raw.isdigit():
+            return int(raw)
+    return None
+
+
+def _op_run_key(op: Any, plan: Any, base_segment: int | None = None) -> tuple:
     from .physical_key import physical_key
     # physical_key already normalizes occurrence references relative to this
     # operator, so identical layers produce the same ordered key sequence.
@@ -105,10 +140,11 @@ def _op_run_key(op: Any, plan: Any) -> tuple:
         str(getattr(op, "dtype", "") or ""),
         _plan_template(plan),
         bool(_metadata(op).get("graph_captured")),
-        str(_metadata(op).get("graph_segment", "")),
+        _segment_signature(op, base_segment),
         tuple(sorted((str(key), repr(value)) for key, value in _metadata(op).items()
                      if key in {"group_axis", "collective", "local_tp_width",
-                                "capture_bucket", "recipe", "kernel"})),
+                                "capture_bucket", "recipe", "kernel",
+                                "valid_blocks", "residual_block_id"})),
         physical_key(op),
     )
 
@@ -129,7 +165,8 @@ def layer_templates(ops: Sequence[Any],
     plans = tuple(plans or ())
     plan_for = {int(getattr(plan, "index", index)): plan
                 for index, plan in enumerate(plans)}
-    return tuple(tuple(_op_run_key(op, plan_for.get(layer))
+    return tuple(tuple(_op_run_key(op, plan_for.get(layer),
+                                   _first_layer_segment(by_layer[layer]))
                        for op in by_layer[layer]) for layer in order)
 
 

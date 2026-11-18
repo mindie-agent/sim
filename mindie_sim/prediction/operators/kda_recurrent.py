@@ -46,6 +46,7 @@ SOURCE = {
 }
 _BYTES = {"bf16": 2, "fp16": 2, "fp32": 4}
 ZERO_WORK = 0.0
+STATE_POOL_DIMS = 4
 A5_AIC_UNITS = 32
 A5_AIV_UNITS = 64
 A5_UB_BYTES = 253952
@@ -710,35 +711,32 @@ def state_accesses(op):
         sequence = targets.index(target) if target in targets else 0
         request = request_ids[sequence] if sequence < len(request_ids) else str(sequence)
         version, shape = binding["state_version"], tuple(binding["layout"]["shape"])
-        heads, head_axis = (shape[1], 1) if (len(shape) == 4 and shape[0] == 1) else (shape[0], 0)
+        heads = shape[1] if len(shape) == STATE_POOL_DIMS and shape[0] == 1 else shape[0]
         slot, commit = binding.get("slot"), version in committed
         decision_event = _decision_name(contract, target, version)
         base_span = _binding_span(binding)
         is_spec = use_recover and int(binding.get("window") or 1) > 1
         out_bytes = float(rec_head if is_spec else dk * dv * state_byte)
         out_repr = "recover_ssm_record" if is_spec else binding.get("representation", "state")
-        for head in range(heads):
-            span = list(base_span)
-            span[head_axis] = (head, head + 1)
-            result.append({
-                "occurrence": f"{op.op_id}:write:{write_index}:{head}",
-                "producer": binding["producer"], "request": request,
-                "stage": op.stage, "layer": op.layer, "direction": "write", "position": "state",
-                "output": target, "storage": binding["storage"],
-                "owner": binding.get("owner", f"kda.layer[{op.layer}]"),
-                "representation": out_repr, "persistent": True, "temporary": False,
-                "state_version": version, "span": tuple(span), "bytes": out_bytes,
-                "source": binding["producer"], "reader": "", "grant": binding.get("grant") or "",
-                "decision": "token_commit" if commit else "candidate_hold",
-                "last_use": "next_decode_read" if commit else "last_reader",
-                "rank": None, "scope": "target", "generation": version, "slot": slot,
-                "window": binding.get("window"), "offset": binding.get("offset"),
-                "physical_key": f"{binding['storage']}:head:{head}", "request_slot": slot,
-                "rows": 1, "row_stride": dk * dv, "tier": binding.get("tier", "hbm"),
-                "source_ready": binding.get("ready"), "grant_ready": binding.get("grant"),
-                "decision_event": decision_event,
-                "last_use_event": "next_decode_read" if commit else "last_reader",
-            })
+        result.append({
+            "occurrence": f"{op.op_id}:write:{write_index}",
+            "producer": binding["producer"], "request": request,
+            "stage": op.stage, "layer": op.layer, "direction": "write", "position": "state",
+            "output": target, "storage": binding["storage"],
+            "owner": binding.get("owner", f"kda.layer[{op.layer}]"),
+            "representation": out_repr, "persistent": True, "temporary": False,
+            "state_version": version, "span": base_span, "bytes": float(heads * out_bytes),
+            "source": binding["producer"], "reader": "", "grant": binding.get("grant") or "",
+            "decision": "token_commit" if commit else "candidate_hold",
+            "last_use": "next_decode_read" if commit else "last_reader",
+            "rank": None, "scope": "target", "generation": version, "slot": slot,
+            "window": binding.get("window"), "offset": binding.get("offset"),
+            "physical_key": binding["storage"], "request_slot": slot,
+            "rows": 1, "row_stride": dk * dv, "tier": binding.get("tier", "hbm"),
+            "source_ready": binding.get("ready"), "grant_ready": binding.get("grant"),
+            "decision_event": decision_event,
+            "last_use_event": "next_decode_read" if commit else "last_reader",
+        })
     return tuple(result)
 def _value_versions(values, targets, count):
     if values is None:

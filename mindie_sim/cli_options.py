@@ -187,7 +187,7 @@ def compose_case_kwargs(namespace: argparse.Namespace) -> dict[str, Any]:
         "linear_proj_tp": _linear_tp(namespace),
         "lm_head_tp": value("lm_head_tp", CLI_ONE),
         "redundant_experts_per_rank": value("redundant_experts_per_rank", CLI_ZERO),
-        "collective_startup_mode": namespace.collective_startup_mode or "legacy",
+        "collective_startup_mode": namespace.collective_startup_mode,
         "matrix_compute_policy": namespace.matrix_compute_policy or "auto",
         "recover_ssm": bool(namespace.recover_ssm),
         "prefix_cache_mode": namespace.prefix_cache_mode or "private",

@@ -27,6 +27,11 @@ from mindie_sim.catalog.types import AuxiliarySpec, DraftSpec, merge_source
 from mindie_sim.schema.model import LayerPlan
 from mindie_sim.schema.common import ModelingError
 
+#: Declared KDA state representations: one FP32 recurrent state element and
+#: one BF16 short-convolution element.
+KDA_STATE_DTYPE_BYTES = 4
+CONV_STATE_DTYPE_BYTES = 2
+
 
 def _kimi_plans(config: Mapping[str, Any]) -> list[LayerPlan]:
     c, _, _ = flatten_config(config)
@@ -87,6 +92,10 @@ def _kimi_plans(config: Mapping[str, Any]) -> list[LayerPlan]:
     router_norm_topk = bool(c.get("moe_renormalize", c.get("norm_topk_prob", False)))
     router_groups = _int(c, "num_expert_group", _int(c, "n_group"))
     router_group_topk = _int(c, "topk_group")
+    # Kimi K3 keeps the DeepSeek noaux_tc selection chain (sigmoid scores,
+    # FP32 correction bias, group Top2/TopK, unbiased gather and routed scale).
+    noaux_tc = str(c.get("topk_method", "")) == "noaux_tc"
+    scaling = float(c.get("routed_scaling_factor") or 1.0)
     plans: list[LayerPlan] = []
     for index in range(layers):
         ffn = "dense" if index < dense_first else "moe"
@@ -107,16 +116,22 @@ def _kimi_plans(config: Mapping[str, Any]) -> list[LayerPlan]:
                 router_norm_topk=router_norm_topk,
                 router_groups=router_groups if ffn == "moe" else 0,
                 router_group_topk=router_group_topk if ffn == "moe" else 0,
+                router_noaux_tc=noaux_tc and ffn == "moe",
+                routed_scaling_factor=scaling,
                 linear_heads=kda_heads, linear_head_dim=kda_dim,
                 linear_key_heads=kda_heads, linear_key_head_dim=kda_dim,
                 linear_value_heads=kda_heads,
+                # The K3 KDA caller packs its input projections so one GEMM
+                # serves each identical operand representation.
+                packed_input_projection=True,
                 conv_kernel=conv_k, conv_width=conv_width,
                 recurrent_state_elements=kda_heads * kda_dim * kda_dim,
                 recurrent_state_dtype="fp32",
                 kda_gate_lower_bound=gate_lower_bound,
                 conv_state_elements=conv_width * (conv_k - 1),
                 conv_state_dtype="bf16",
-                state_bytes=float(kda_heads * kda_dim * kda_dim * 4 + conv_width * (conv_k - 1) * 2),
+                state_bytes=float(kda_heads * kda_dim * kda_dim * KDA_STATE_DTYPE_BYTES
+                                  + conv_width * (conv_k - 1) * CONV_STATE_DTYPE_BYTES),
                 residual_block_size=_int(c, "attn_res_block_size"),
                 native_layer_id=index + 1, scope="body",
                 kv_owner_layer_id=index, **activation,
@@ -129,6 +144,9 @@ def _kimi_plans(config: Mapping[str, Any]) -> list[LayerPlan]:
                 q_lora_rank=q_rank, kv_lora_rank=kv_rank,
                 qk_nope_head_dim=qk_nope, qk_rope_head_dim=rope, v_head_dim=v_dim,
                 mla_variant="latent_mla", mla_output_gate=bool(c.get("mla_use_output_gate", True)),
+                # K3 keeps a 64-element learned positional tail in the cache
+                # row but executes no rotary operator on it.
+                mla_use_nope=bool(c.get("mla_use_nope", True)),
                 mla_qkv_a_gate_fused=True,
                 kv_cache_elements=kv_rank + rope,
                 intermediate_size=dense_i if ffn == "dense" else 0,
@@ -144,6 +162,8 @@ def _kimi_plans(config: Mapping[str, Any]) -> list[LayerPlan]:
                 router_norm_topk=router_norm_topk,
                 router_groups=router_groups if ffn == "moe" else 0,
                 router_group_topk=router_group_topk if ffn == "moe" else 0,
+                router_noaux_tc=noaux_tc and ffn == "moe",
+                routed_scaling_factor=scaling,
                 residual_block_size=_int(c, "attn_res_block_size"),
                 native_layer_id=index + 1, scope="body",
                 kv_owner_layer_id=index, **activation,

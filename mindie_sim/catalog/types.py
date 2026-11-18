@@ -44,12 +44,11 @@ _FP32_CATEGORIES = {
 }
 _BF16_CATEGORIES = {
     "norm", "router", "router_bias", "lm_head", "embedding", "vision",
-    "projector", "vision_pos", "image_token", "engram_gate", "dspark_input",
+    "projector", "vision_pos", "image_token", "dspark_input",
     "compressor_bf16_runtime",
     "target_alias_embedding", "target_alias_lm_head",
 }
 _RUNTIME_OVERRIDE = {
-    "engram_gate": "bf16",
     "dspark_input": "bf16",
     "engram_table": "fp8_e4m3",
 }
@@ -97,7 +96,7 @@ def norm_role(name: str) -> str:
         return "ffn_norm"
     return "norm"
 _FP8_CATEGORIES = {
-    "attn", "mla", "gdn", "kda", "dense_mlp", "compressor", "indexer",
+    "attn", "mla", "gdn", "kda", "dense_mlp", "compressor", "engram_gate", "indexer",
     "indexer_fp8", "shared_expert",
     # MTP/draft-head linears: a quantized family like any other projection, but
     # its own category so a recipe can keep the draft head at BF16 (the Qwen3.8
@@ -245,10 +244,10 @@ class QuantSpec:
         if mx_scale and wf in {"mxfp8", "mx_fp8", "mxfp8_e4m3", "fp8_e4m3", "fp8_e5m2"} and af in {
                 "mxfp8", "mx_fp8", "mxfp8_e4m3", "fp8_e4m3", "fp8_e5m2"}:
             return "mx_fp8"
+        if wf in {"int4", "w4a8", "int4_weight"}:
+            return "w4a8" if af == "int8" else "w4a16"
         if wf in {"int8", "w8a8"} or af in {"int8"}:
             return "w8a8"
-        if wf in {"int4", "w4a8", "int4_weight"}:
-            return "w4a8"
         return "fp8" if wf in {"fp8", "fp8_e4m3", "fp8_e5m2"} else "dense"
 
     def output_format_for(self, category: str, default: str = "", *, prequant: str = "") -> str:
@@ -303,7 +302,7 @@ class QuantSpec:
             return "bf16"
         if cat == "engram_table":
             return "fp8_e4m3" if self.weight_format != "bf16" else "bf16"
-        if cat in {"engram_gate", "dspark_input"}:
+        if cat == "dspark_input":
             return self.weight_format if self.weight_format != "bf16" else "bf16"
         return self.format_for(cat, source=True)
 

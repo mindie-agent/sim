@@ -104,13 +104,103 @@ def panel_sizes(m, n):
     return kb, ka, micro
 
 
+DEFAULT_CORES = 32
+GEOMETRY_CACHE_SIZE = 128
+M_TILE_ROWS = 256
+MX_SCALE_GROUP = 32
+MX_SCALE_PUBLISH_K = 4096
+#: Declared arch3510 L2 efficiency used only when a caller supplies no typed
+#: physical declaration; it is the same profile default as the mechanism spec.
+L2_EFFECTIVE_FRACTION = 0.75
+
+
+def effective_l2_bytes(geometry):
+    """Typed effective L2 capacity, or the declared profile fallback."""
+    mechanisms = getattr(geometry, "physical_mechanisms", None)
+    hierarchy = getattr(mechanisms, "memory_hierarchy", None)
+    if hierarchy is not None:
+        return float(hierarchy.effective_l2_bytes)
+    buffers = getattr(geometry, "buffers", {}) or {}
+    return L2_EFFECTIVE_FRACTION * float(buffers.get("l2", 0))
+
+
+def activation_bank_bytes(config):
+    """One ``[rows, K]`` activation slice across every active expert bank."""
+    return float(sum(config.rows) * config.k)
+
+
+def m_tile_repeats(config):
+    """Second-and-later M-tile passes over one bank, and all M-tile passes."""
+    passes = sum(ceildiv(rows, M_TILE_ROWS) for rows in config.rows if rows)
+    repeats = sum(max(0, ceildiv(rows, M_TILE_ROWS) - 1)
+                  for rows in config.rows if rows)
+    return repeats, passes
+
+
+def owner_panel_bytes(config, cores=DEFAULT_CORES):
+    """Concurrent 32-owner 256-column B panel set, including MX scale pairs."""
+    width = max((width for _, width in columns(config, cores)), default=config.n)
+    payload = config.k * width // 2
+    scales = config.k * width // MX_SCALE_GROUP
+    return float(cores * (payload + scales))
+
+
+def resplit_columns(config, cores=DEFAULT_CORES):
+    """True when ``CalcResplitTiling`` narrows the declared 256-column tiling."""
+    if config.n <= cores * (M_TILE_ROWS // 2):
+        return False
+    return any(width < M_TILE_ROWS for _, width in columns(config, cores))
+
+
+def weight_l2_fraction(config, cores=DEFAULT_CORES, l2_bytes=0):
+    """Share of a repeated 256-column B panel served by resident L2.
+
+    The declared working set is the concurrent 32-owner panel set plus one
+    activation slice.  When that set fits in effective L2, a second M-tile pass
+    re-reads its B panel on chip; the fraction is the repeated-pass share
+    scaled by how much of the concurrent set the die can retain.
+    """
+    if l2_bytes <= 0:
+        return 0.0
+    repeats, passes = m_tile_repeats(config)
+    if not passes:
+        return 0.0
+    working = owner_panel_bytes(config, cores) + activation_bank_bytes(config)
+    retention = min(1.0, float(l2_bytes) / working) if working else 0.0
+    return retention * repeats / passes
+
+
+def activation_l2_fraction(config, cores=DEFAULT_CORES, l2_bytes=0):
+    """Share of a column pass whose activation slice is served by resident L2.
+
+    ``CalcResplitTiling`` reads one ``[m_e, K]`` slice per output column tile;
+    the first pass fills L2 and the remaining passes hit it while the full
+    slice fits the declared effective capacity.
+    """
+    if l2_bytes <= 0:
+        return 0.0
+    slice_bytes = activation_bank_bytes(config)
+    retention = min(1.0, float(l2_bytes) / slice_bytes) if slice_bytes else 0.0
+    # The producer writes the slice through L2 with declared write allocation,
+    # so a resident slice serves the first consumer pass as well.
+    return retention
+
+
+def activation_scale_bytes(config, m, offset):
+    """One panel's FP8 activation-scale payload (not a weight read)."""
+    scale_k = (min(MX_SCALE_PUBLISH_K, config.k - offset)
+               if offset % MX_SCALE_PUBLISH_K == 0 else 0)
+    return m * scale_k // MX_SCALE_GROUP
+
+
 def panel_work(config, m, n, offset):
     """Source payload and fixed scale-publish geometry for one K panel."""
     kb, ka, micro = panel_sizes(m, n)
     depth = min(kb, config.k - offset)
-    scale_k = min(4096, config.k - offset) if offset % 4096 == 0 else 0
+    scale_k = (min(MX_SCALE_PUBLISH_K, config.k - offset)
+               if offset % MX_SCALE_PUBLISH_K == 0 else 0)
     a = m * min(ka, config.k - offset) if offset % ka == 0 else 0
-    a_scale = m * scale_k // 32
+    a_scale = activation_scale_bytes(config, m, offset)
     vectors = []
     n0 = align(n // 2, 16) if n > 16 else n
     for sub in (0, 1):
@@ -144,13 +234,24 @@ def panel_work(config, m, n, offset):
     return a + a_scale, vectors, micros
 
 
-def tile_work(config, m, n, *, directional_mte1=False):
+def tile_work(config, m, n, *, cores=DEFAULT_CORES, directional_mte1=False,
+              activation_l2=0.0, weight_l2=0.0):
     total = Work()
+    share = float(activation_l2)
+    wshare = float(weight_l2)
     for offset in range(0, config.k, panel_sizes(m, n)[0]):
         a, vectors, micros = panel_work(config, m, n, offset)
         packed = sum(v["weight"] + v["scale"] for v in vectors)
+        weight = sum(v["weight"] for v in vectors)
+        # The separate A-scale transfer keeps its own stream; only the A
+        # payload and the repeated B panel can be served from resident L2.
+        payload = a - activation_scale_bytes(config, m, offset)
         total += Work({"fp8_e4m3": sum(f for _, _, f in micros)}, {
-            "hbm": a + packed, "mte2_aic": a, "mte2_aiv": packed,
+            "hbm": payload * (1.0 - share) + (a - payload) + packed
+                   - weight * wshare,
+            "mte2_aic": a, "mte2_aiv": packed,
+            **({"l2": payload * share + weight * wshare}
+               if share > 0 or wshare > 0 else {}),
             "mte3": sum(v["expanded"] + v["scale_publish"] for v in vectors),
             **({"mte1_l0a": sum(a for a, _, _ in micros), "mte1_l0b": sum(b for _, b, _ in micros)}
                if directional_mte1 else {"mte1": sum(a + b for a, b, _ in micros)}),
@@ -179,9 +280,9 @@ class GeometryLedger:
     runs: tuple[int, ...]
 
 
-@lru_cache(maxsize=128)
+@lru_cache(maxsize=GEOMETRY_CACHE_SIZE)
 def geometry_ledger(config: Config, cores: int, compact: bool = True,
-                    directional_mte1: bool = False) -> GeometryLedger:
+                    directional_mte1: bool = False, l2_bytes: int = 0) -> GeometryLedger:
     """Reuse exact source work for repeated layer geometry, independent of rates.
 
     The source has two AIVs per AIC. InitMx reads its 256-byte permutation on
@@ -195,11 +296,16 @@ def geometry_ledger(config: Config, cores: int, compact: bool = True,
     work = Work(resources={"hbm": 256 * aivs, "mte2_aiv": 256 * aivs})
     inventory = InstructionInventory({})
     counts, runs = [], []
+    activation_l2 = activation_l2_fraction(config, cores, l2_bytes)
+    weight_l2 = weight_l2_fraction(config, cores, l2_bytes)
     for owner in range(cores):
         count = sum(1 for _ in owner_tiles(config, owner, cores))
         run_count = 0
         for m, n, repeat in tile_runs(config, owner, cores, compact):
-            work += tile_work(config, m, n, directional_mte1=directional_mte1).scaled(repeat)
+            work += tile_work(config, m, n, cores=cores,
+                              directional_mte1=directional_mte1,
+                              activation_l2=activation_l2,
+                              weight_l2=weight_l2).scaled(repeat)
             inventory += tile_inventory(config, m, n).scaled(repeat)
             run_count += 1
         counts.append(count)

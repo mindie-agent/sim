@@ -273,6 +273,7 @@ def run_cohort(case, execution, schedulers, memory, lower, *, trace_limit=DEFAUL
     replacement ``output_tokens``. ``selected_allocations`` may wait for a real
     Event owned by this service; permanent refusal happens before any issue.
     """
+    from .implementation_selection import combine_summaries
     engine = _bind_service_context(case, execution, schedulers, memory)
     replicas = set(range(len(schedulers)))
     quota = {str(key): max(0, int(value))
@@ -298,6 +299,7 @@ def run_cohort(case, execution, schedulers, memory, lower, *, trace_limit=DEFAUL
     parallel = case.runtime.parallel
     in_flight: dict[int, ScheduledIteration] = {}
     traces, modes, scopes = [], {}, {}
+    selections: list = []
     iterations = 0
     model_steps = 0
     logical_steps = 0
@@ -403,7 +405,7 @@ def run_cohort(case, execution, schedulers, memory, lower, *, trace_limit=DEFAUL
                     continue
                 steps = submit_batch(
                     case, schedulers, plans, execution, lower, engine.now,
-                    bindings_out=bindings)
+                    bindings_out=bindings, selections_out=selections)
                 # One atomic EP/cohort submission counts once against the global
                 # decode budget; PP microbatch work remains inside it.
                 if any(step.mode != "retire" for step in steps.values()):
@@ -464,6 +466,7 @@ def run_cohort(case, execution, schedulers, memory, lower, *, trace_limit=DEFAUL
         "traces": traces, "serving_end": engine.now, "window_end": window_end,
         "stop_reason": stop_reason, "token_quotas": dict(quota),
         "selected_allocation_attached": bool(selected_attached),
+        "operator_selection_summary": combine_summaries(selections),
     }
 
 
@@ -482,6 +485,22 @@ def predict(
     memory_replica: int = ZERO, memory_stage: int = ZERO,
     token_quotas: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
+    # A declared attention core without a physical model may be inspected
+    # structurally, but no latency/throughput entry may fabricate its work.
+    # The gate precedes every early body/PD return.
+    from .unmodeled_gate import assert_timing_supported
+    gate_case = case
+    if isinstance(case, _AbcMapping) and "pools" not in case:
+        # Layer overrides are resolved during parse_case.  Gate the resolved
+        # ModelSpec, not only the raw override dictionary, before a caller's
+        # custom lowerer or a baseline can produce a timing number.
+        try:
+            gate_case = parse_case(case)
+        except (ModelingError, ValueError, TypeError, KeyError):
+            gate_case = case
+    assert_timing_supported(case, entry="predict")
+    if gate_case is not case:
+        assert_timing_supported(gate_case, entry="predict")
     if scope == "body":
         if lower is not None:
             raise ModelingError("body_scope_uses_target_frontend_not_custom_serving_lowerer")
@@ -507,7 +526,8 @@ def predict(
         # select one compact finite-K representation; an explicit caller
         # recipe book still wins.
         from .body_defaults import service_program_defaults
-        case = service_program_defaults(case)
+        from mindie_sim.compose_operator_defaults import serving_recipe_inventory
+        case = serving_recipe_inventory(service_program_defaults(case))
     lower = lower or Frontend(
         attention_policy=AttentionPolicy(**case.runtime.attention_policy),
         resource_fusion=resource_fusion)
@@ -549,6 +569,13 @@ def predict(
         include_submission=include_submission, memory_policy=memory.policy,
         memory=memory,
     )
+    # A bounded summary ring (the default 256 rows) must not silently disable
+    # exact physical-work coalescing.  A caller asking for a wider per-event
+    # trace is a diagnostic request: keep the uncoalesced decomposition so the
+    # published event rows stay one per declared program task.
+    execution._compact_step = (not execution.legacy_diagnostics
+                               and event_limit <= DEFAULT_EVENT_LIMIT)
+    execution.engine._compact_step = execution._compact_step
     execution.serving_io.record_events = event_limit > 0
     engine = execution.engine
     engine.now = min((r.arrival_ms for r in case.workload.requests), default=0)
@@ -611,6 +638,7 @@ def predict(
         },
         "traces": traces, "events": list(engine.trace),
         "framework_occurrences": occurrences,
+        "operator_selection_summary": run["operator_selection_summary"],
         "plan": {"model": case.model.to_dict(), "runtime": case.runtime.to_dict(),
                  "machine": case.machine.to_dict()},
         "metric_boundary": "device_token_commit",

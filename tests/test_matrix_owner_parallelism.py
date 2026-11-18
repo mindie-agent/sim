@@ -36,10 +36,10 @@ def test_small_rectangular_matrix_uses_more_owners_with_same_semantic_work():
     assert len(owner_tiles(128, 288, chosen['tile_m'], chosen['tile_n'], 32)) >= 16
     assert len(owner_tiles(128, 288, 128, 128, 32)) == 3
     # The coarse 128x128 control also runs through Split-K; after the Split-K
-    # Cube double-count is removed its service is 1x, so the calibrated 4x
-    # threshold (which compared against 2x Cube work) is no longer applicable.
-    # The small grid still materially improves on the coarse control.
-    assert new['duration_ms'] - 7 < (old['duration_ms'] - 7) * 0.6
+    # Cube double-count is removed its service is 1x.  The A5 matrix service is
+    # now below the 7 ms input boundary, so the total step is input-bound; the
+    # selected owner grid must not regress that boundary.
+    assert new['duration_ms'] <= old['duration_ms']
     before, after = old['execution']['serviced'], new['execution']['serviced']
     # M2 selects split-K/underfilled owners for this underfilled grid; the
     # aggregate matrix-pipe service is no longer the coarse 128x128 value.

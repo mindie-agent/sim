@@ -748,7 +748,7 @@ def dispatch(*, prefix, plan, stage, requests, quantized, transport, rows, width
     if ep <= 1:
         return ops, None, None
     routing = _routing_peer_counts(quantized)
-    common = (("group_axis", "ep"), ("steps", ep - 1),
+    common = (("group_axis", "ep"),
               ("source_assignment_partitions", partitions),
               ("remote_fraction", (ep - 1) / ep),
               ("traffic_model", "uniform_peer_payload"),
@@ -868,7 +868,7 @@ def combine(*, prefix, plan, stage, requests, deps, transport, rows, width, ep,
         recipe="expert_combine",
         link_bytes=link_bytes,
         shape=(_ceil_rows(rows), width),
-        metadata=(("group_axis", "ep"), ("steps", ep - 1),
+        metadata=(("group_axis", "ep"),
                   ("source_assignment_partitions", partitions),
                   ("traffic_model", "transpose_dispatch_peer_rows"),
                   ("collective_id", prefix + ".expert_combine"),

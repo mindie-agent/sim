@@ -757,7 +757,8 @@ def lower_native_fusions(ops, runtime, *, local_tokens=None, public_outputs=()):
         metadata["fusion_boundary"] = boundary
         fused = total.apply(replace(
             anchor, op_id=op_id, family="native_fusion", recipe=RECIPE,
-            deps=inputs, metadata=tuple(metadata.items()), matrix_flops=(),
+            deps=inputs, metadata=tuple(metadata.items()),
+            matrix_flops=tuple(sorted(total.matrix.items())),
             source_boundary="kernel", coverage="declared_native_resource_phases",
             returns=external["returns"]))
         origin_ports = tuple(
@@ -791,8 +792,9 @@ def lower_native_fusions(ops, runtime, *, local_tokens=None, public_outputs=()):
             or dict(op.metadata).get("structure_model_scope") == "draft"
             or op.op_id.startswith("draft.")
             for op in original):
-        if not any(d["role"] in {"hc_pre", "hc_post"} for d, _ in groups):
-            required_roles = required_roles - {"hc_pre", "hc_post"}
+        absent = {role for role in ("hc_pre", "hc_post", "mla_prolog")
+                  if not any(d["role"] == role for d, _ in groups)}
+        required_roles = required_roles - absent
     realized_rows = None
     for op in original:
         if not any(k in {"routing_realization", "source_token_mask"} for k, _ in op.metadata):

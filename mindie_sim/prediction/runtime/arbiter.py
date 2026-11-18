@@ -104,6 +104,49 @@ def _needs_unit_tier_solver(resources, tasks, active) -> bool:
 
 
 _ZERO_COUNT = 0
+_MULTI_RESOURCE_CUTOFF = 1
+
+
+def _has_overlapping_subunit_coupled(resources, tasks, active) -> bool:
+    """True when a coupled task shares a strict sub-unit owner with any peer.
+
+    C11 solves every active coupled cohort jointly.  An unpinned coupled peer
+    must therefore not take the closed-form two-task path while an uncoupled
+    peer owns only part of one of its resources: the shared owner unit meters
+    both flows, and only the per-unit residual solver preserves that capacity.
+    An unplaced participant spans every declared unit, so any strict sub-unit
+    placement on the resource overlaps it.
+    """
+    for key in active:
+        task = tasks[key]
+        rem = task.remaining
+        pl = task.placement
+        if not (task.coupled and len(rem) > _MULTI_RESOURCE_CUTOFF):
+            continue
+        for rname, amt in rem.items():
+            if amt <= 0.0:
+                continue
+            res = resources[rname]
+            units = pl.get(rname) if pl else None
+            unit_set = set(units) if units is not None else None
+            own_subunit = units is not None and len(units) < res.units
+            for peer_key in active:
+                if peer_key == key:
+                    continue
+                peer = tasks[peer_key]
+                if peer.remaining.get(rname, 0.0) <= 0.0:
+                    continue
+                peer_units = (peer.placement.get(rname)
+                              if peer.placement else None)
+                peer_subunit = (peer_units is not None
+                                and len(peer_units) < res.units)
+                if not (own_subunit or peer_subunit):
+                    continue
+                if unit_set is None or peer_units is None:
+                    return True
+                if not unit_set.isdisjoint(peer_units):
+                    return True
+    return False
 
 
 def component_rates(resources, tasks, active, *, coupled_solver=None,
@@ -152,6 +195,9 @@ def component_rates(resources, tasks, active, *, coupled_solver=None,
                 return {name: {key: components[proxy]}
                         for name, components in rates.items()
                         if proxy in components}
+        elif ((placed_active is None or placed_active != _ZERO_COUNT)
+              and _has_overlapping_subunit_coupled(resources, tasks, active)):
+            return _tiered_coupled(resources, tasks, active, coupled_solver)
         elif n_active == 2:
             it = iter(active)
             k0, k1 = next(it), next(it)

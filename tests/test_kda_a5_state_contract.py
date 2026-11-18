@@ -215,9 +215,14 @@ def test_speculative_conv_prices_all_candidates_and_rejects_later_versions():
         "state_history_slots": 3}.items()))
     nonspec_work = _conv_plan(nonspec, parsed).work
     # All query rows execute in both plans; speculation adds two history
-    # descriptors per candidate (2+q reads and 2+q writes in the source).
-    assert (spec_work.resources["hbm"] - nonspec_work.resources["hbm"]
-            == (2 + 4) * width * 2 + (2 + 4 - 3) * width * 2)
+    # descriptors per candidate (2+q reads on the AIV read pipe) without adding
+    # an off-chip descriptor, because the restore window re-reads the retained
+    # positions and the current inputs from UB (#62 Item 6b).
+    assert spec_work.resources["hbm"] == nonspec_work.resources["hbm"]
+    descriptor_roles = set(spec_work.resources) - {"hbm", "mte3", "vector"}
+    assert descriptor_roles
+    assert all(spec_work.resources[role] - nonspec_work.resources.get(role, 0)
+               == (2 + 4) * width * 2 for role in descriptor_roles)
     assert spec_work.resources["vector"] == nonspec_work.resources["vector"]
 
 
@@ -906,8 +911,9 @@ def test_kda_state_accesses_bind_targets_versions_and_public_span():
     for item in writes:
         by_version.setdefault(item["state_version"], []).append(item)
     assert {version: len(items) for version, items in by_version.items()} == {
-        4097: 4, 4098: 4, 4099: 4, 4100: 4}
-    assert all(item["bytes"] == 128 * 128 * 4 for item in writes)
+        4097: 1, 4098: 1, 4099: 1, 4100: 1}
+    assert all(item["bytes"] == 4 * 128 * 128 * 4 for item in writes)
+    assert all(item["span"] == ((0, 4), (0, 128), (0, 128)) for item in writes)
     assert by_version[4098][0]["decision"] == "token_commit"
     assert by_version[4099][0]["last_use"] == "last_reader"
 
@@ -1069,8 +1075,9 @@ def test_decode_actual_pool_slots_all_heads_and_same_chain():
     writes_4098 = [item for item in accesses
                    if item["direction"] == "write"
                    and item["state_version"] == 4098]
-    assert len(writes_4098) == 4
-    assert all(item["bytes"] == 128 * 128 * 4 for item in writes_4098)
+    assert len(writes_4098) == 1
+    assert writes_4098[0]["bytes"] == 4 * 128 * 128 * 4
+    assert writes_4098[0]["span"] == ((9, 10), (0, 4), (0, 128), (0, 128))
     assert all(item["decision"] == "token_commit" for item in writes_4098)
     rejected = [item for item in accesses
                 if item["direction"] == "write" and item["state_version"] > 4098]

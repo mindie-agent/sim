@@ -60,6 +60,24 @@ def _deepseek_dims(c: Mapping[str, Any], *, v41: bool) -> dict[str, int]:
     }
 
 
+#: ``moe_router_dtype == "float32"`` is a checkpoint declaration of an FP32
+#: gate matrix.  ``AscendGateLinear`` Tier 4 keeps BF16 weights and accumulates
+#: the Cube GEMM in FP32, so the declaration costs no input cast and no FP32
+#: weight copy.  A V4/V4.1 checkpoint that does not declare it keeps the
+#: retained per-family operand precision.
+_FP32_ROUTER_DECLARATIONS = frozenset({"float32", "fp32"})
+
+
+def _router_operands(c: Mapping[str, Any], *, v41: bool) -> dict[str, Any]:
+    """Declared router operand precision for one DeepSeek family config."""
+    if str(c.get("moe_router_dtype", "")).strip().lower() in _FP32_ROUTER_DECLARATIONS:
+        return {"router_dtype": "", "router_output_dtype": "fp32",
+                "router_precast_weight_copy": False}
+    if v41:
+        return {"router_dtype": "", "router_precast_weight_copy": False}
+    return {"router_dtype": "fp32", "router_precast_weight_copy": True}
+
+
 def _deepseek_plans(c: Mapping[str, Any], *, v41: bool) -> list[LayerPlan]:
     d = _deepseek_dims(c, v41=v41)
     layers = int(_require(c, "num_hidden_layers"))
@@ -158,9 +176,8 @@ def _deepseek_plans(c: Mapping[str, Any], *, v41: bool) -> list[LayerPlan]:
             moe_intermediate_size=moe_i, num_shared_experts=shared,
             router_input_size=d["h"], router_mode=(
                 "hash" if not v41 and index < hash_layers else str(c.get("scoring_func", "softmax"))),
-            router_dtype="fp32" if not v41 else "",
-            router_precast_weight_copy=not v41,
             router_norm_topk=bool(c.get("norm_topk_prob", False)),
+            **_router_operands(c, v41=v41),
             expert_latent_size=0,
             hyper_connections=True, hc_mult=hc_mult, hc_sinkhorn_iters=hc_iters,
             native_layer_id=index, scope="body",
@@ -307,9 +324,19 @@ def _standard_deepseek_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
             router_norm_topk=bool(c.get("norm_topk_prob", False)),
             router_groups=_int(c, "n_group"),
             router_group_topk=_int(c, "topk_group"),
+            router_noaux_tc=str(c.get("topk_method", "")) == "noaux_tc",
+            routed_scaling_factor=_routed_scaling_factor(c),
             native_layer_id=index, scope="body",
         ))
     return plans
+
+
+def _routed_scaling_factor(c: Mapping[str, Any]) -> float:
+    """Declared post-selection weight scale (1.0 keeps raw scores)."""
+    factor = c.get("routed_scaling_factor")
+    if factor is None:
+        return 1.0
+    return float(factor)
 
 
 def _aux_standard_deepseek(c: Mapping[str, Any]) -> AuxiliarySpec | None:
@@ -323,12 +350,8 @@ def _standard_deepseek_gaps(c: Mapping[str, Any]) -> tuple[str, ...]:
     gaps: list[str] = []
     if bool(c.get("attention_bias", False)):
         gaps.append("attention_bias_not_in_layer_plan")
-    if str(c.get("topk_method", "")) == "noaux_tc":
-        gaps.append("router_noaux_tc_correction_bias_not_in_layer_plan")
-        gaps.append("router_noaux_tc_group_score_top2_not_in_layer_plan")
-    factor = c.get("routed_scaling_factor")
-    if factor is not None and float(factor) != 1.0:
-        gaps.append("router_routed_scaling_factor_not_in_layer_plan")
+    # ``noaux_tc`` and its routed scaling factor are declared on every MoE
+    # LayerPlan (and its draft layers); no separate coverage gap remains.
     if _int(c, "num_nextn_predict_layers") > 0:
         gaps.append("optional_mtp_not_modeled")
     return tuple(gaps)

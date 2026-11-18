@@ -45,8 +45,11 @@ def test_one_boundary_replaces_score_and_topk_but_preserves_real_producers():
     assert not {"index_scores", "index_topk"} & {item.recipe for item in ops}
     assert len(op.deps) == 3
     by_id = {item.op_id: item for item in ops}
+    # The native indexer consumes the BF16 head-weight projection directly
+    # (no ``index_weights_fp16`` launch), and dynamic quantization plus cache
+    # scatter is one ``indexer_quant_cache`` epilog (no standalone store).
     assert {by_id[dep].recipe for dep in op.deps} == {
-        "index_query_quantize", "index_weights_fp16", "index_store"}
+        "index_query_quantize", "index_weights", "indexer_quant_cache"}
     assert any(item.recipe == "index_query_hadamard" for item in ops)
     assert any(item.recipe == "index_query_rotary" for item in ops)
     ledger = dict(op.metadata)["quant_indexer_work"]
@@ -85,7 +88,11 @@ def test_split_read_pipes_and_native_contract_are_enforced():
 
 def test_explicit_selection_preserves_ordinary_semantic_path_and_late_inputs():
     ordinary = target_operators(raw_case(False), phase="decode", tokens=2, context=4096)
-    assert {"index_scores", "index_topk"} <= {op.recipe for op in ordinary}
+    # Without an explicit QLI binding the CANN 9.2.1 fused indexer owns the
+    # score and TopK boundary; no eager pair is emitted.
+    recipes = {op.recipe for op in ordinary}
+    assert "quant_lightning_indexer" in recipes
+    assert not {"index_scores", "index_topk"} & recipes
     raw = raw_case()
     ops = target_operators(raw, phase="decode", tokens=2, context=4096)
     qli = next(op for op in ops if op.recipe == "quant_lightning_indexer_v2")

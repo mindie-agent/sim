@@ -34,6 +34,7 @@ from .structure_implementations import (
     native_implementation, operator_structure, region_structure,
 )
 from .structure_physical import node_physical, subgraph_physical
+from .subgraph_math import attach_subgraph_math
 from .structure_subgraphs import (
     export_subgraphs, layer_structure, metadata, subgraph_comparison_scope,
 )
@@ -52,6 +53,7 @@ _SOFTWARE_FIELDS = (
 _FAMILY_BLOCKS = {
     "qkv_projection": "attention", "attention": "attention",
     "rotary": "attention", "cache_store": "attention",
+    "kv_compress_epilog": "attention", "indexer_quant_cache": "attention",
     "gate_up_projection": "ffn", "down_projection": "ffn", "swiglu": "ffn",
     "grouped_gemm": "ffn", "embedding": "embedding", "logits": "logits",
 }
@@ -283,7 +285,7 @@ def export_op_structure(ops, *, model, execution, kernels=None, source=None,
     for replica, operators in sorted(graphs.items()):
         outputs_by_id, metadata_by_id = {}, {}
         for op in operators:
-            if op.phase != phase:
+            if op.phase != phase and not (phase == "decode" and op.phase == "draft"):
                 raise ValueError(f"structure_phase_mismatch:{op.op_id}:{op.phase}:{phase}")
             expanded = book.expand((op,)) if expand_calls else (op,)
             meta = metadata(op)
@@ -462,6 +464,18 @@ def export_op_structure(ops, *, model, execution, kernels=None, source=None,
         "resource_operators": resource_operators,
         "external_inputs": sorted(external),
     }
+    # Structural math belongs to the structural record: attach it before the
+    # digest so a verifier re-hashes exactly these fields. It reuses this graph;
+    # no causal Engine and no second export runs here.
+    attach_subgraph_math(payload)
+    # Onboarding hints for genuine core holes travel *inside* the hashed
+    # payload: a verifier that re-hashes this report must see them, so the
+    # graph identity stays self-verifying. Structure export itself succeeds.
+    from .prediction.unmodeled_gate import HINT_KEYS, structure_hints
+    all_ops = tuple(op for operators in graphs.values() for op in operators)
+    hints = structure_hints(all_ops, {"model": model})
+    if hints:
+        payload[HINT_KEYS] = [dict(hint) for hint in hints]
     encoded_payload = json.dumps(
         payload, sort_keys=True, separators=(",", ":"), allow_nan=False
     ).encode("utf-8")
@@ -558,8 +572,12 @@ def _structure_inputs(case, *, phase, tokens, context=0, sequences=1,
             "replica_axis": "data_parallel",
             "shard_scope": "representative_tp_pcp_shard",
             "stage_scope": "all_pipeline_stages",
-            **({"resource_geometry": {f"replica:{replica}/stage:{stage}": asdict(value)
-                                      for (replica, stage), value in geometries.items()}}
+            **({"resource_geometry": {
+                f"replica:{replica}/stage:{stage}": {
+                    key: field for key, field in asdict(value).items()
+                    if key not in {"rates", "compute_peaks"}
+                }
+                for (replica, stage), value in geometries.items()}}
                if geometries else {}),
         },
     )

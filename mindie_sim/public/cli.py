@@ -29,7 +29,9 @@ from .environment import ExecutionEnvironment
 from .errors import ExtensionError
 from .profiles import load_user_profile
 
-PUBLIC_COMMANDS = frozenset({"extensions", "extension", "ext", "profile"})
+PUBLIC_COMMANDS = frozenset({
+    "extensions", "extension", "ext", "profile", "structure", "compare-cohorts",
+})
 
 
 def _emit(payload: dict[str, Any], output: str | None) -> int:
@@ -124,4 +126,10 @@ def public_main(argv: Sequence[str] | None = None, *,
     command, rest = args[0], args[1:]
     if command == "profile":
         return profile_main(rest, prog=prog + " profile")
+    if command == "structure":
+        from ..structure import main as structure_main
+        return structure_main(rest)
+    if command == "compare-cohorts":
+        from ..cohort_comparison import main as cohorts_main
+        return cohorts_main(rest)
     return extensions_main(rest, prog=prog + " extensions")

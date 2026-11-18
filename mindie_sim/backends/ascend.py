@@ -25,6 +25,8 @@ from mindie_sim.schema.device_input import machine_device_defaults, merge_device
 from .instruction_presets import expand_instruction_presets
 
 
+DIRECT_MESH_RANKS = 8
+
 _LINK_FIELDS = ("transaction_bytes", "alignment_bytes", "protocol_overhead_bytes",
                 "latency_us", "semantics", "switch_hops", "switch_hop_latency_us",
                 "switch_capacity_bytes_per_ms")
@@ -117,6 +119,7 @@ ASCEND_TOPOLOGY_PRESETS: dict[str, dict[str, object]] = {
         "inter_pod_latency_us": 10.0,
     },
     "a5_pod": {
+        "collective_protocols": {"alltoall": "concurrent", "alltoallv": "concurrent"},
         "ranks_per_node": 64, "dies_per_package": 1, "superpod_size": 8192,
         "intra_node_bw_gbps": 800.0, "intra_node_bw_util": 0.85,
         "superpod_bw_gbps": 800.0, "inter_pod_bw_gbps": 100.0,
@@ -259,6 +262,17 @@ def _merge_channels(raw, profile):
                 value = _number(f"{name}:{provenance}", value)
             channels[name]["effective_uni_bw_gbps"] = value
             channels[name]["bandwidth_provenance"] = provenance
+    # A node wider than the K8 direct mesh has no complete pairwise fabric:
+    # treating it as per-pair would multiply one port by the peer count.  The
+    # node width selects per-port service unless the caller explicitly declared
+    # the channel's semantics (a preset is only a default, not an override).
+    node_ranks = int(raw.get("ranks_per_node", DIRECT_MESH_RANKS)
+                     or DIRECT_MESH_RANKS)
+    if node_ranks > DIRECT_MESH_RANKS:
+        declared_semantics = declared.get("d2d_intra_node", set())
+        if not ({"semantics", "channel_semantics"} & declared_semantics):
+            channels["d2d_intra_node"].update(
+                channel_semantics="per_port", semantics="per_port")
     return channels, explicit, declared
 
 
@@ -546,6 +560,14 @@ def materialize(raw):
     per_node = int(merged.get("ranks_per_node", count))
     per_package = int(merged.get("dies_per_package", profile["dies_per_package"]))
     data.update(ranks_per_node=per_node, dies_per_package=per_package)
+    if "collective_protocols" not in raw:
+        domain = int(merged.get("superpod_size", DIRECT_MESH_RANKS))
+        if "links" in raw or count > domain:
+            data.pop("collective_protocols", None)
+        elif (raw["sku"].startswith("Ascend950") and not preset
+              and per_node <= DIRECT_MESH_RANKS and count <= per_node):
+            data["collective_protocols"] = {
+                "alltoall": "concurrent", "alltoallv": "concurrent"}
     if "links" not in raw:
         data["links"] = _generated_links(merged, channels, count, per_package, per_node)
     data["assumptions"] = {**profile["assumptions"],

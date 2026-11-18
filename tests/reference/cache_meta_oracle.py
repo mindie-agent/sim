@@ -118,6 +118,8 @@ class RefLayer:
     ssm_dtype: str = "fp32"; gate_rank: int = 0; gemma4: bool = False
     engram: bool = False; cache_row: int = 0; router_copy: bool = False
     index_cp_shard: bool = False
+    #: DeepSeek ``noaux_tc`` stores one FP32 correction bias per routed expert.
+    router_bias: bool = False
 
 
 # --------------------------------------------------------------------------
@@ -153,6 +155,7 @@ def _deepseek_standard(c: Mapping[str, Any]) -> list[RefLayer]:
             index_dim=idx[2] if has_indexer else 0,
             index_topk=idx[0] if has_indexer else 0,
             cache_row=kv_rank + rope,
+            router_bias=bool(moe and str(c.get("topk_method", "")) == "noaux_tc"),
         ))
     return out
 
@@ -241,6 +244,8 @@ def _kimi(c: Mapping[str, Any]) -> list[RefLayer]:
             shared=shared if ffn == "moe" else 0,
             shared_i=shared * moe_i if ffn == "moe" else 0,
             latent=latent if ffn == "moe" else 0,
+            router_bias=bool(ffn == "moe"
+                             and str(c.get("topk_method", "")) == "noaux_tc"),
         )
         if index in kda:
             out.append(RefLayer(

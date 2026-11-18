@@ -336,8 +336,10 @@ def _indexer_entries(out, model, layer) -> None:
         _add(out, "indexer_wq", layer.index_heads * layer.index_dim, layer.q_lora or h)
         _add(out, "indexer_weights", layer.index_heads, h)
     if layer.index_kpool > 1:
+        # Head weights keep the checkpoint's BF16 representation: no fabricated
+        # FP32 runtime copy exists for ``indexer.weights``.  The retained
+        # analytic K/gate joint projection still prepares its own FP32 copies.
         width = layer.head_dim if layer.index_input == "compressed" else h
-        _add(out, "indexer_weights_prepared_fp32", layer.index_heads, h, owner="runtime")
         if layer.owns_index_k:
             _add(out, "indexer_wk_prepared_fp32", layer.index_dim, width, owner="runtime")
             _add(out, "indexer_pool_gate_prepared_fp32", layer.index_dim, width,
@@ -349,8 +351,10 @@ def _compressor_entries(out, model, layer) -> None:
         return
     d = layer.head_dim * layer.compressor_width
     _add(out, "compressor_wkv", d, model.hidden)
-    _add(out, "compressor_gate", d, model.hidden)
-    _add(out, "compressor_ape", layer.compress_ratio, d)
+    if layer.compress_ratio > 1:
+        # A C1 layer has no gated pooling: neither ``wgate`` nor APE exists.
+        _add(out, "compressor_gate", d, model.hidden)
+        _add(out, "compressor_ape", layer.compress_ratio, d)
     _add(out, "compressor_norm", layer.head_dim, 1)
 
 
@@ -371,6 +375,9 @@ def _ffn_entries(out, model, layer) -> None:
     _add(out, "expert_down", expert_out, layer.moe_i, layer.experts)
     if layer.router_copy:
         _add(out, "router_precast", layer.experts, h, owner="runtime")
+    if layer.router_bias:
+        # noaux_tc: one FP32 correction bias per routed expert per MoE layer.
+        _add(out, "router_correction_bias", layer.experts, 1)
     if layer.latent:
         _add(out, "latent_down", layer.latent, h)
         _add(out, "latent_norm", layer.latent, 1)

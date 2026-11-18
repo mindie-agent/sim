@@ -104,11 +104,14 @@ def test_speculative_convolution_keeps_history_reread_and_every_query_row():
     # width 4, prior history 3, two preserved positions and q current inputs.
     read = ((4 + 3 + 4 + 2 + 4) + (4 + 3 + 3 + 2 + 3)) * 1280 * 2
     write = ((4 + 2 + 4) + (3 + 2 + 3)) * 1280 * 2
+    # Wave 4B (#62 Item 6b): only the streamed token and history rows reach
+    # off-chip memory; the speculative restore re-reads UB.
+    streamed = (2 * (4 + 3) + 2 * (3 + 3)) * 1280 * 2
     engine, _ = execute_one(parsed, views, op)
     assert engine.serviced["mte2_aiv@r0:s0"] == pytest.approx(read)
     assert engine.serviced["mte3@r0:s0"] == pytest.approx(write)
-    assert engine.serviced["memory@r0:s0"] == pytest.approx(read + write)
-    assert prepared.hbm_bytes == read + write
+    assert engine.serviced["memory@r0:s0"] == pytest.approx(streamed)
+    assert prepared.hbm_bytes == streamed
     assert engine.serviced["vector@r0:s0"] == pytest.approx(((5 + 4 * 17) + (5 + 3 * 17)) * 1280)
     assert engine.serviced["mte2@r0:s0"] == engine.serviced["mte2_aic@r0:s0"] == 0
     assert all(event["start_ms"] >= 2 for event in engine.trace if event["demand"])

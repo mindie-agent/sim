@@ -37,6 +37,9 @@ ONE = 1
 TWO = 2
 THREE = 3
 FOUR = 4
+TARGET_ALIAS_CATEGORIES = frozenset({
+    "target_alias_embedding", "target_alias_lm_head",
+})
 
 from mindie_sim.catalog.types import DraftSpec, QuantSpec, VisionSpec
 from mindie_sim.catalog.quant import projection_quant
@@ -268,11 +271,16 @@ def _compressor_terms(plan, model):
     if not plan.owns_long_kv or not plan.compress_ratio:
         return []
     d = plan.head_dim * plan.compressor_width
-    return [_t("compressor_wkv", d, model.hidden_size, "compressor_bf16_runtime"),
-            _t("compressor_gate", d, model.hidden_size, "compressor_bf16_runtime"),
-            _t("compressor_ape", plan.compress_ratio, d, "ape"),
-            _t("compressor_norm", plan.head_dim, 1,
-               "compressor_fp32_runtime" if plan.compressor_norm_dtype == "fp32" else "norm")]
+    terms = [_t("compressor_wkv", d, model.hidden_size, "compressor_bf16_runtime")]
+    if plan.compress_ratio > ONE:
+        # A C1 layer has no gated pooling: ``wgate`` and its APE parameters do
+        # not exist in the checkpoint and must not be priced.
+        terms.extend([_t("compressor_gate", d, model.hidden_size,
+                         "compressor_bf16_runtime"),
+                      _t("compressor_ape", plan.compress_ratio, d, "ape")])
+    terms.append(_t("compressor_norm", plan.head_dim, 1,
+                    "compressor_fp32_runtime" if plan.compressor_norm_dtype == "fp32" else "norm"))
+    return terms
 
 
 def _attention_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
@@ -454,6 +462,10 @@ def _ffn_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
         _t("expert_down", expert_output, plan.moe_intermediate_size,
            "routed_expert", "expert_down", count=plan.num_experts),
     ])
+    if plan.router_noaux_tc:
+        # The noaux_tc correction bias is an FP32 parameter of every MoE layer,
+        # including draft layers; it is read once per routing invocation.
+        terms.append(_t("router_correction_bias", plan.num_experts, ONE, "param_fp32"))
     if plan.router_precast_weight_copy and plan.router_dtype:
         terms.append(replace(
             _t("router_precast", plan.num_experts, plan.router_input_size or h, "router"),
@@ -731,9 +743,12 @@ def stage_weight_terms(
                     (model.auxiliary.mtp, model.auxiliary.dspark))
         for draft in selected:
             if draft is not None:
+                # A target alias is not an extra draft copy.  Runtime-owned
+                # prepared matrices (FP32 router precast, indexer copies) are
+                # resident and belong in the ledger.
                 stages[pp - 1].extend(
                     term for term in draft_terms(draft, model)
-                    if term.source_owned
+                    if term.category not in TARGET_ALIAS_CATEGORIES
                 )
     return stages
 
@@ -782,20 +797,32 @@ def sharded_weight_bytes(
 
 
 def cache_row_bytes_by_layer(model: ModelSpec) -> tuple[tuple[int, int], ...]:
-    """Per-layer cache row width using the declared KV dtype.
+    """Per-layer cache row width using the declared cache representation.
 
-    The row width is a declaration, not a fixed BF16 constant: a KV dtype
-    swap must move the catalog facts as well as the runtime cache model.
+    The row width is a declaration, not a fixed BF16 or K-only constant: a KV
+    representation swap must move the catalog facts as well as the runtime
+    cache model, and shared K/V projection weights still store two cache
+    planes.
     """
-    quant = model.quant or QuantSpec("bf16")
-    kv_bytes = dtype_bytes(quant.kv_dtype)
+    from mindie_sim.catalog.cache import packed_region_row_bytes
+    from mindie_sim.catalog.cache_format import cache_format
+    mla = cache_format(model, "mla_kv")
+    gqa = cache_format(model, "gqa_kv")
     rows = []
     for plan in model.layer_plans:
         if (plan.attention in {"gqa", "projection_only"} and plan.cache_kind == "dense"
                 and not ZERO <= plan.kv_owner_layer_id < plan.index):
-            row = (ONE if plan.k_eq_v else TWO) * plan.num_kv_heads * plan.head_dim * kv_bytes
+            row = gqa.row_bytes(plan.cache_row_elements)
         elif plan.attention == "mla":
-            row = plan.cache_row_elements * kv_bytes
+            if plan.cache_kind == "dense":
+                row = mla.row_bytes(plan.cache_row_elements)
+            elif plan.window > ZERO:
+                row = packed_region_row_bytes(model, "window", plan.cache_row_elements)
+            elif plan.owns_long_kv:
+                row = packed_region_row_bytes(
+                    model, "compressed_kv", plan.cache_row_elements)
+            else:
+                row = ZERO
         else:
             row = 0
         rows.append((plan.index, int(row)))

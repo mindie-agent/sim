@@ -100,7 +100,7 @@ COLLECTIVE_FAMILIES = frozenset({
 })
 VECTOR_FAMILIES = frozenset({
     "activation", "add", "add_rmsnorm", "add_rmsnorm_quant", "attention_merge", "attention_residual", "cache_store", "cast", "conv1d", "copy", "elementwise",
-    "embedding", "engram_apply", "engram_gather", "engram_query", "fill", "geglu", "gdn_gating", "hbm_load", "histogram", "kv_cache_write", "kv_cast",
+    "embedding", "engram_apply", "engram_gather", "engram_query", "fill", "geglu", "gdn_gating", "hbm_load", "histogram", "indexer_quant_cache", "kv_cache_write", "kv_cast", "kv_compress_epilog",
     "layernorm", "mhc", "multiply", "native_fusion", "pad", "quantize", "relu", "rmsnorm", "rmsnorm_quant", "rotary", "routing", "sigmoid", "silu", "state_gather", "state_transfer", "test",
     "sampling", "acceptance", "situ", "softmax", "swiglu", "tensor_copy",
     "tensor_fill", "tensor_materialization", "tensor_select", "tensor_view",
@@ -177,5 +177,24 @@ def physical_family_bindings() -> dict[str, object]:
 
 
 def physical_recipe_bindings() -> dict[str, object]:
-    """Default exact recipes for topk/indexer names that are family-ambiguous."""
-    return {recipe: INDEXER for recipe in INDEXER_TOPK_RECIPES}
+    """Default exact recipes for topk/indexer names that are family-ambiguous.
+
+    The three source-planned kernels below resolve a declared recipe to a
+    ``PlannedRecipe`` builder.  Each builder is capability-scoped inside its own
+    module: A2/A3 or a non-matching operand form returns the previously
+    registered physical mechanism unchanged, so this registry never adds a
+    hardware branch to the execution loop.
+    """
+    from .matrix_splitk import (ScopedRouterRecipe, build_router_splitk)
+    from .moe_cann_fusion import ScopedGatingRecipe, build_moe_gating_topk
+    from .mxfp8_grouped import ScopedSwigluRecipe, build_swiglu_mx_quant
+    bindings = {recipe: INDEXER for recipe in INDEXER_TOPK_RECIPES}
+    bindings.update({
+        "moe_gating_topk": ScopedGatingRecipe(build_moe_gating_topk),
+        "router": ScopedRouterRecipe(build_router_splitk),
+    })
+    bindings.update({
+        f"{family}_quantize": ScopedSwigluRecipe(build_swiglu_mx_quant)
+        for family in ("swiglu", "situ", "geglu")
+    })
+    return bindings

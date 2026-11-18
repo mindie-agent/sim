@@ -52,6 +52,13 @@ from mindie_sim.catalog.weights import (
 
 CONFIG_DIR = Path(__file__).with_name("model_configs")
 
+# Raw serving spellings that are not already declared by the fleet registry.
+# Kept here so both ``sim`` and ``profiler`` resolve them through one catalog.
+MODEL_ALIASES.update({
+    "qwen3-30b": "qwen3-30b-a3b",
+    "qwen3.8-2.4t": "qwen3.8-2.4t-a95b",
+})
+
 _RECURRENT_KINDS = {"gdn", "kda", "mamba"}
 _TOKEN_KV_KINDS = {"gqa", "mla", "gqa_sparse_indexer"}
 _DIT_ACTIVE_CACHE_METHODS = {"teacache", "fbcache", "taylorseer"}
@@ -116,6 +123,7 @@ def customize_model_spec(
     layers: int | None = None,
     n_routed_experts: int | None = None,
     num_experts_per_tok: int | None = None,
+    promote_dense_to_moe: bool = False,
 ) -> ModelSpec:
     """Deterministically scale body layer count and MoE expert geometry."""
     from dataclasses import replace
@@ -152,6 +160,29 @@ def customize_model_spec(
 
     e = int(n_routed_experts) if n_routed_experts is not None else int(base.num_experts)
     k = int(num_experts_per_tok) if num_experts_per_tok is not None else int(base.top_k)
+    # A runtime MoE override on a dense preset promotes the FFN layers once.
+    # An already-MoE model is never re-promoted from its dense prefix.
+    promoted = bool(
+        promote_dense_to_moe
+        and n_routed_experts is not None
+        and num_experts_per_tok is not None
+        and e > 1 and k > 0
+        and not any(p.ffn == "moe" for p in plans)
+    )
+    if promoted:
+        if k > e:
+            raise ModelingError(f"customize_model_spec_moe_invalid:E={e}:K={k}")
+        plans = [
+            replace(
+                p, ffn="moe", num_experts=e, top_k=k,
+                moe_intermediate_size=(
+                    p.moe_intermediate_size
+                    or base.moe_intermediate_size
+                    or p.intermediate_size
+                ),
+            )
+            for p in plans
+        ]
     if n_routed_experts is not None or num_experts_per_tok is not None:
         if e <= 0 or k <= 0 or k > e:
             raise ModelingError(f"customize_model_spec_moe_invalid:E={e}:K={k}")
@@ -187,6 +218,11 @@ def customize_model_spec(
     has_moe = any(p.ffn == "moe" for p in plans)
     spec = replace(
         base, layers=n_l, body_layers=n_l, layer_plans=tuple(plans),
+        ffn="moe" if promoted else base.ffn,
+        moe_intermediate_size=(
+            plans[0].moe_intermediate_size
+            if promoted else base.moe_intermediate_size
+        ),
         num_experts=e if has_moe else 0, top_k=k if has_moe else 0,
         expert_routing=base.expert_routing if keep_routing else (),
         expert_routing_source=base.expert_routing_source if keep_routing else "uniform",

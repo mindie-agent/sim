@@ -252,8 +252,17 @@ def run_probe(spec):
     selected_balanced = {name: overrides.pop(name, None) for name in BALANCED_RECIPES}
     if not overrides:
         without_mapping["runtime"]["kernels"].pop("recipes", None)
+    from mindie_sim.prediction.body_defaults import consume_target_declaration
     graphs = target_graphs(case, **spec["geometry"])
-    recipes = RecipeBook.from_mapping(case.runtime.kernels)
+    # The resolved declaration carries plan-bound implementions and their
+    # recipes; the probe owns its own matrix programs/families.
+    declared = consume_target_declaration(case, graphs).runtime.kernels
+    kernels = dict(case.runtime.kernels)
+    for key in ("lowerings", "recipes"):
+        merged = dict(declared.get(key) or {})
+        if merged:
+            kernels[key] = merged
+    recipes = RecipeBook.from_mapping(kernels)
     expanded = sum(len(recipes.expand(ops)) for ops in graphs.values())
     if expanded > spec["max_operators"]:
         raise ValueError(f"expanded_operator_budget_exceeded:{expanded}>{spec['max_operators']}")

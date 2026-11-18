@@ -70,6 +70,8 @@ class CacheAccess:
     component: str = "index_k"
     selected_tokens: tuple[tuple[int, int], ...] = ()
     logical_rows: int = ZERO
+    unique_rows: int = ZERO
+    shared_intervals: tuple[tuple[int, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -119,6 +121,45 @@ def _logical_rows(access: CacheAccess) -> float:
     for index in range(q):
         total += min(context + index + ONE, context + q)
     return float(max(ONE, total))
+
+
+def _merged_intervals(intervals) -> tuple[tuple[int, int], ...]:
+    """Canonical disjoint half-open intervals sorted by start."""
+    ordered = sorted((int(start), int(end)) for start, end in intervals
+                     if int(end) > int(start))
+    merged: list[tuple[int, int]] = []
+    for first, last in ordered:
+        if not merged or first > merged[-1][1]:
+            merged.append((first, last))
+        elif last > merged[-1][1]:
+            merged[-1] = (merged[-1][0], last)
+    return tuple(merged)
+
+
+def _merged_interval_rows(intervals) -> int:
+    """Union length of absolute half-open row intervals."""
+    return sum(end - start for start, end in _merged_intervals(intervals))
+
+
+def owned_window_intervals(
+    intervals, cp: int, interleave: int, rank: int,
+) -> tuple[tuple[int, int], ...]:
+    """Rank-owned sub-intervals under interleaved DCP token ownership."""
+    merged = _merged_intervals(intervals)
+    if cp <= ONE or not merged:
+        return merged
+    step = max(ONE, int(interleave))
+    owned: list[tuple[int, int]] = []
+    for lo, hi in merged:
+        first_block = lo // step
+        block = first_block + ((int(rank) - (first_block % cp)) % cp)
+        while block * step < hi:
+            seg_lo = max(lo, block * step)
+            seg_hi = min(hi, (block + ONE) * step)
+            if seg_hi > seg_lo:
+                owned.append((seg_lo, seg_hi))
+            block += cp
+    return _merged_intervals(owned)
 
 
 def _materialized_prefix(access: CacheAccess, cache_state: Mapping[str, Any] | None) -> int:
@@ -184,31 +225,46 @@ def plan_prefix_reads(
     core = ZERO
     logical_rows = math.fsum(_logical_rows(access) for access in accesses)
     unique_rows = ZERO
-    groups: dict[tuple[int, str], tuple[int, float]] = {}
+    groups: dict[tuple[int, str, str, float], list[tuple[int, int]]] = {}
     for access in accesses:
         context = max(ZERO, int(access.context_tokens))
+        q_len = max(ONE, int(access.q_len))
         rows = _logical_rows(access)
         limit = int(access.logical_rows) if int(access.logical_rows) > ZERO else context
         prefix = min(_materialized_prefix(access, cache_state), limit)
-        private = max(ZERO, rows - float(prefix))
-        unique += private * float(access.row_bytes)
-        core += private * float(access.row_bytes)
-        unique_rows += private
-        if prefix > ZERO:
-            key = (int(access.layer), str(access.prefix_key))
-            previous = groups.get(key)
-            if previous is None or prefix > previous[ZERO]:
-                groups[key] = (prefix, float(access.row_bytes))
-    for prefix, row in groups.values():
-        unique += float(prefix) * row
-        core += float(prefix) * row
-        unique_rows += float(prefix)
+        # One access reads one absolute window; a windowed sequence owns only
+        # its latest ``logical_rows`` rows, while a dense scan starts at zero.
+        end = context + q_len
+        start = ZERO if rows >= end else max(ZERO, end - int(rows))
+        span = (int(access.unique_rows)
+                if int(access.unique_rows) > ZERO
+                else max(ZERO, end - start))
+        if access.shared_intervals:
+            shared = min(_merged_interval_rows(access.shared_intervals), span)
+            private = max(ZERO, span - shared)
+            intervals = access.shared_intervals
+        else:
+            shared = min(max(ZERO, int(prefix)), span)
+            private = max(ZERO, span - shared)
+            intervals = ((start, start + shared),) if shared > ZERO else ()
+        unique += float(private) * float(access.row_bytes)
+        unique_rows += float(private)
+        # MTE2 stays the per-tile refill service of each access.
+        core += rows * float(access.row_bytes)
+        if shared > ZERO and intervals:
+            key = (int(access.layer), str(access.component),
+                   str(access.prefix_key), float(access.row_bytes))
+            groups.setdefault(key, []).extend(intervals)
+    for key, intervals in groups.items():
+        shared_rows = _merged_interval_rows(intervals)
+        unique += float(shared_rows) * float(key[3])
+        unique_rows += float(shared_rows)
     if logical_rows > ZERO:
         unique_scale = scale_total * unique_rows / logical_rows
     else:
         unique_scale = scale_total
     unique += unique_scale
-    core += unique_scale
+    core += scale_total
     applied = bool((logical - unique) > SAVINGS_EPS)
     return PrefixReadPlan(
         logical, unique, core, query_reads, scale_total, ZERO, ZERO,
@@ -246,6 +302,11 @@ def apply_prefix_read_plan(op: Any, plan: PrefixReadPlan, *,
                           if hbm_component is None else float(hbm_component))
         mte2_precharged = (float(plan.logical_query_bytes)
                            if mte2_component is None else float(mte2_component))
+        if ((hbm_component is not None and
+             not ZERO_FLOAT <= hbm_precharged <= hbm + SAVINGS_EPS)
+                or (mte2_component is not None and
+                    not ZERO_FLOAT <= mte2_precharged <= mte2 + SAVINGS_EPS)):
+            raise ModelingError("prefix_read_component_exceeds_declared_work")
         hbm = hbm - hbm_precharged + float(plan.unique_hbm_bytes)
         mte2 = mte2 - mte2_precharged + float(plan.l2_to_core_bytes)
         if hbm < -SAVINGS_EPS or mte2 < -SAVINGS_EPS:

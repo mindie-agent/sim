@@ -75,7 +75,10 @@ def test_full_93_layer_graph_keeps_sp_padding_outside_recurrent_query_loop(full_
             assert metadata['valid_global'] == q
             assert metadata['physical_global'] == 8
             assert metadata['valid_per_tp'] == (1,) * q + (0,) * (8 - q)
-            assert by_id['s0.l0.linear_q'].local_shape[0] == q
+            packed = by_id.get('s0.l0.linear_q') or next(
+                op for op in ops
+                if str(op.recipe).startswith('linear_qkvbfg_a'))
+            assert packed.local_shape[0] == q
             assert by_id['s0.l0.recurrent_scan0'].local_shape[0] == q
             assert by_id['s0.l0.norm1'].local_shape[0] == 1
             gather = by_id['s0.l0.attention.sp_gather']

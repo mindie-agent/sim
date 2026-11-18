@@ -17,6 +17,8 @@ from math import ceil
 from collections import deque
 import json
 
+from mindie_sim.catalog.cache import cache_row_split, packed_region_row_bytes
+from mindie_sim.catalog.mqsmla_layout import packed_row_parts
 from mindie_sim.catalog.cache_format import cache_format
 from mindie_sim.catalog.ops import cache_store_op
 from mindie_sim.prediction.cache_execution import (
@@ -140,7 +142,7 @@ def _access_metadata(result, resolution, fmt, row_bytes, geometry, region, *,
 def _legacy_store(builder, name, deps, rows, width, region, fmt):
     """Preserve the pre-cache-level byte semantics of an undeclared call."""
     common = builder.common
-    row_bytes = fmt.row_bytes(width)
+    row_bytes = packed_region_row_bytes(builder.model, region, width)
     stored = rows * row_bytes
     legacy = (
         ("cache_resolution", "legacy_no_cache_declaration"),
@@ -193,7 +195,7 @@ def _legacy_store(builder, name, deps, rows, width, region, fmt):
 def _store_cache_aware(builder, name, deps, rows, width, region, fmt, *,
                        state, geometry, identity, policy, source_residency):
     common = builder.common
-    row_bytes = fmt.row_bytes(width)
+    row_bytes = packed_region_row_bytes(builder.model, region, width)
     stored = rows * row_bytes
     source = rows * width * dtype_bytes(builder.model.activation_dtype)
     groups = ceil(width / fmt.group_size) if fmt.group_size else 0
@@ -260,7 +262,7 @@ def _store_cache_aware(builder, name, deps, rows, width, region, fmt, *,
 def _load_cache_aware(builder, name, deps, rows, width, region, fmt, *,
                       state, geometry, identity, policy):
     common = builder.common
-    row_bytes = fmt.row_bytes(width)
+    row_bytes = packed_region_row_bytes(builder.model, region, width)
     stored = rows * row_bytes
     resolved_state, resolution = _resolve_state(builder, state, geometry)
     access_identity, cold = _identity(identity, region)
@@ -382,7 +384,7 @@ def _op_output(op):
     return first if isinstance(first, str) else str(first)
 
 
-def _typed_view(op, fmt, rows, width, row_bytes, region, identity, deps=()):
+def _typed_view(model, op, fmt, rows, width, row_bytes, region, identity, deps=()):
     """Actual producer/output/view of one declared cache row operation.
 
     OpSpec currently has no output namespace. The producer output name is kept
@@ -390,14 +392,12 @@ def _typed_view(op, fmt, rows, width, row_bytes, region, identity, deps=()):
     registered as an actual dependency port unless the producer really exposes
     that output.
     """
-    stored = rows * row_bytes
-    if fmt.group_size:
-        quantized = max(0, width - fmt.suffix_elements)
-        groups = ceil(quantized / fmt.group_size)
-        scale_bytes = int(rows * groups * dtype_bytes(fmt.scale_dtype))
-    else:
-        scale_bytes = 0
-    stored = int(stored)
+    parts = packed_row_parts(model, region, width)
+    if parts is None:
+        data, scales = cache_row_split(model, region, width)
+        parts = data, scales, 0
+    payload_bytes, scale_bytes, padding_bytes = (
+        int(round(rows * amount)) for amount in parts)
     packed = fmt.packed_elements != 1 or bool(fmt.group_size)
     outputs = tuple(getattr(op, "outputs", None) or ())
     registered = bool(outputs)
@@ -406,8 +406,8 @@ def _typed_view(op, fmt, rows, width, row_bytes, region, identity, deps=()):
         producer=op.op_id, output=output, dtype=fmt.dtype,
         layout="packed_row" if packed else "contiguous",
         shape=(rows, width), storage=region, owner=identity,
-        inputs=tuple(deps), payload_bytes=stored - scale_bytes,
-        scale_bytes=scale_bytes,
+        inputs=tuple(deps), payload_bytes=payload_bytes,
+        scale_bytes=scale_bytes, padding_bytes=padding_bytes,
         packed_elements=fmt.packed_elements, group_size=fmt.group_size,
         output_registered=registered)
 
@@ -514,7 +514,7 @@ class CacheLowering:
               offset_bytes=0, stride_bytes=None, page_bytes=0, packing=1,
               partial_line="masked", source_port=""):
         fmt = cache_format(self.builder.model, region)
-        row_bytes = fmt.row_bytes(width)
+        row_bytes = packed_region_row_bytes(self.builder.model, region, width)
         static = CacheState(self.state.geometry)
         store(self.builder, name, deps, rows, width, region, state=static,
               identity=identity, write_policy="write_through",
@@ -525,8 +525,8 @@ class CacheLowering:
             stride_bytes=row_bytes if stride_bytes is None else stride_bytes,
             page_bytes=page_bytes, packing=packing, partial_line=partial_line)
         op = self.builder.ops[-1]
-        view = _typed_view(op, fmt, rows, width, row_bytes, region, identity,
-                           deps=deps)
+        view = _typed_view(self.builder.model, op, fmt, rows, width, row_bytes,
+                           region, identity, deps=deps)
         # The declared source view is activation-width bytes recorded by the
         # cache-aware store. It is not the packed output row width, so a plain
         # cache_store op's mte2 byte count cannot stand in for it.
@@ -555,7 +555,7 @@ class CacheLowering:
              offset_bytes=0, stride_bytes=None, page_bytes=0, packing=1,
              partial_line="masked", source_port=""):
         fmt = cache_format(self.builder.model, region)
-        row_bytes = fmt.row_bytes(width)
+        row_bytes = packed_region_row_bytes(self.builder.model, region, width)
         static = CacheState(self.state.geometry)
         load(self.builder, name, deps, rows, width, region, state=static,
              identity=identity, bypass=bypass, ready_ms=ready_ms)
@@ -564,8 +564,8 @@ class CacheLowering:
             stride_bytes=row_bytes if stride_bytes is None else stride_bytes,
             page_bytes=page_bytes, packing=packing, partial_line=partial_line)
         op = self.builder.ops[-1]
-        view = _typed_view(op, fmt, rows, width, row_bytes, region, identity,
-                           deps=deps)
+        view = _typed_view(self.builder.model, op, fmt, rows, width, row_bytes,
+                           region, identity, deps=deps)
         request = CacheAccessRequest(
             identity, geometry, write=False,
             policy=CachePolicy(bypass=bypass, ready_ms=ready_ms),

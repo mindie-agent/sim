@@ -306,6 +306,46 @@ def json_sequences(value: Any) -> Any:
     return value
 
 
+def declared_partial_rotary(c: Mapping[str, Any], index: int | None = None) -> float:
+    """Declared rotation fraction for one layer; per-layer arrays win.
+
+    A conforming checkpoint declares either one ``partial_rotary_factor`` or a
+    ``partial_rotary_factors`` array covering body and draft layers.  Returning
+    the factor is not a proxy: callers turn it into an exact rotated width.
+    """
+    factors = c.get("partial_rotary_factors")
+    if isinstance(factors, (list, tuple)) or (
+            isinstance(factors, str) and factors.strip()):
+        values = (list(factors) if not isinstance(factors, str)
+                  else [v for v in factors.replace("[", "").replace("]", "").split(",") if v.strip()])
+        position = 0 if index is None else int(index)
+        if position >= len(values):
+            raise ModelingError(f"partial_rotary_factors_length_mismatch:{position}")
+        value = float(values[position])
+    else:
+        rope = c.get("rope_parameters")
+        rope = rope if isinstance(rope, Mapping) else {}
+        raw = c.get("partial_rotary_factor", rope.get("partial_rotary_factor"))
+        value = float(raw) if raw is not None else 1.0
+    if not 0.0 < value <= 1.0:
+        raise ModelingError(f"partial_rotary_factor_out_of_range:{value}")
+    return value
+
+
+def rotary_dimensions(head_dim: int, factor: float) -> tuple[int, int]:
+    """Exact (rotated, unchanged) prefix widths of one full head dimension."""
+    width = int(head_dim)
+    if width <= 0:
+        # A plan without declared projection geometry rotates nothing.
+        return 0, 0
+    if factor >= 1.0:
+        return width, 0
+    rotated = int(round(width * factor))
+    if rotated <= 0 or rotated > width:
+        raise ModelingError(f"partial_rotary_width_invalid:{rotated}/{width}")
+    return rotated, width - rotated
+
+
 def declared_rope(config: Mapping[str, Any]) -> dict[str, Any]:
     """Return only RoPE attributes that the source actually declares.
 
@@ -677,8 +717,13 @@ def native_coverage(config, gaps, *, plans, quant):
                 "expert_dtype")
     activation = c.get("hidden_act", "silu")
     represented = {plan.ffn_activation for plan in plans}
-    if ((activation not in {"silu", "swiglu", "situ"})
-            or (activation == "situ" and represented != {"situ"})):
+    if activation == "swigluoai":
+        # The OAI gate is executed when every layer declares it.
+        represented_ok = represented == {"swigluoai"}
+    else:
+        represented_ok = not ((activation not in {"silu", "swiglu", "situ"})
+                              or (activation == "situ" and represented != {"situ"}))
+    if not represented_ok:
         omitted(f"native_ffn_activation:{activation}:retained_plan_proxy", "hidden_act")
     for key in ("attention_bias", "mlp_bias", "qkv_bias"):
         if c.get(key):
@@ -686,8 +731,24 @@ def native_coverage(config, gaps, *, plans, quant):
     rope = declared_rope(config)
     partial_rotary = rope.get("partial_rotary_factor")
     if float(partial_rotary if partial_rotary is not None else 1.0) != 1.0:
-        omitted("native_partial_rotary_dimensions_unresolved:retained_plan_proxy",
-                "partial_rotary_factor", "rope_parameters")
+        # Exact per-layer rotated widths replace the former full-width proxy.
+        rotary_unresolved = False
+        for plan in plans:
+            if str(getattr(plan, "attention", "")) not in {"gqa", "projection_only"}:
+                continue
+            head_dim = int(getattr(plan, "head_dim", 0) or 0)
+            try:
+                expected, _ = rotary_dimensions(
+                    head_dim, declared_partial_rotary(c, plan.index))
+            except ModelingError:
+                rotary_unresolved = True
+                break
+            if int(getattr(plan, "qk_rope_head_dim", 0) or 0) != expected:
+                rotary_unresolved = True
+                break
+        if rotary_unresolved:
+            omitted("native_partial_rotary_dimensions_unresolved:retained_plan_proxy",
+                    "partial_rotary_factor", "rope_parameters")
     if c.get("rope_scaling"):
         omitted("rope_scaling_variant", "rope_scaling")
     if c.get("sliding_window") and not any(plan.window for plan in plans):
@@ -766,6 +827,11 @@ def resolve_quant(c):
     weight = {"bfloat16": "bf16", "float16": "fp16", "float32": "fp32"}.get(weight, weight)
     if not raw and weight == native:
         return base, gaps
+    if method == "compressed-tensors":
+        from .compressed_int4 import resolve_compressed_int4
+        resolved = resolve_compressed_int4(raw, base)
+        if resolved is not None:
+            return resolved, gaps
     if method == "fp8":
         if raw.get("fmt", "e4m3") not in {"e4m3", "e4m3fn"} or raw.get(
                 "activation_scheme", "dynamic") != "dynamic":

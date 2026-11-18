@@ -19,6 +19,10 @@ from .structure_native_contracts import (
 
 GDN_KINDS = {"gdn_prepare": "ChunkGatedDeltaRuleFwdPrepare",
              "gdn_state": "ChunkFwdH", "gdn_output": "ChunkFwdO"}
+#: Fused native cache epilogs keep the active cache-store tensor boundary.
+CACHE_STORE_FAMILIES = frozenset({
+    "cache_store", "kv_compress_epilog", "indexer_quant_cache",
+})
 
 
 def quant_contract(op):
@@ -213,7 +217,7 @@ def comparison_scope(op):
         return ("active_qkv_and_primary_output_descriptors; "
                 "mask_auxiliary_tensors_sequence_values_layout_scalar_and_dispatch_not_compared; "
                 "no_kernel_implementation_or_occurrence_proof")
-    if family == "cache_store":
+    if family in CACHE_STORE_FAMILIES:
         return ("active_key_value_element_counts_dtypes_and_slot_count; "
                 "native_storage_layout_cache_capacity_slot_dtype_values_and_scalar_flags_not_compared; "
                 "no_kernel_implementation_or_occurrence_proof")
@@ -290,7 +294,7 @@ def predicted_contract(op):
         return gated_norm_contract(op)
     if family == "attention":
         return attention_contract(op)
-    if family == "cache_store":
+    if family in CACHE_STORE_FAMILIES:
         return cache_contract(op)
     if op["family"] in GDN_KINDS:
         return gdn_contract(op)

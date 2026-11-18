@@ -68,6 +68,9 @@ NOMINAL_H2D_BPS = 32_000_000_000.0
 BYTES_PER_GB = 1_000_000_000.0
 NEXTN_DEFAULT_HEAD_DIM = 192
 PP_CAP_DEFAULT = (1, 2, 4, 8, 16)
+#: Native KDA recurrent source: decode-only batches up to q8.
+KDA_DECODE_MAX_QUERY_TOKENS = 8
+DRAFT_PREPARE_MIN_REMAINING = 2
 
 HARDWARE_ALIASES: dict[str, str] = {
     "a2": "Ascend910B4", "910b": "Ascend910B4", "910b4": "Ascend910B4",
@@ -76,6 +79,7 @@ HARDWARE_ALIASES: dict[str, str] = {
     "910_9382": "Ascend910_9382",
     "a5": "Ascend950DT_9582", "950": "Ascend950DT_9582",
     "a5-pod": "Ascend950DT_9581", "atlas-950-superpod": "Ascend950DT_9581",
+    "950pr_958b": "Ascend950PR_958b", "ascend950pr_958b": "Ascend950PR_958b",
     "h20": "NVIDIA_H20", "h800": "NVIDIA_H800", "h200": "NVIDIA_H200",
     "b300": "NVIDIA_B300",
     "800i-a2": "Ascend910B4", "800i-a3": "Ascend910_9392",
@@ -85,6 +89,18 @@ HARDWARE_ALIASES: dict[str, str] = {
     "a5-server-dt": "Ascend950DT_9581", "a5-server-pr": "Ascend950PR_9579",
     "a5-server-pr-pcie-16p": "Ascend950PR_9579",
 }
+
+# Raw Ascend runtime / plog chip tokens resolve to the same two A5 packages as
+# the documented product aliases. Adding a chip token here never adds a SKU.
+HARDWARE_ALIASES.update(dict.fromkeys(
+    ("950pr", "ascend950pr", "950pr_a5", "ascend950pr_a5"),
+    HARDWARE_ALIASES["a5-server-pr"],
+))
+HARDWARE_ALIASES.update(dict.fromkeys(
+    ("950dt", "950dt_a5", "ascend950dt_a5",
+     "910_9599", "ascend910_9599"),
+    HARDWARE_ALIASES["a5"],
+))
 
 HARDWARE_TOPOLOGY_ALIASES: dict[str, tuple[str, str]] = {
     "800i-a2": ("Ascend910B4", "a2_standard"),
@@ -102,7 +118,11 @@ HARDWARE_TOPOLOGY_ALIASES: dict[str, tuple[str, str]] = {
 }
 
 _EXTRA_QUANT_SPECS: dict[str, QuantSpec] = {
-    "fp16": QuantSpec("fp16", "fp16", "fp16", "fp16", "fp16", "fp16", "fp16"),
+    "fp16": QuantSpec(
+        name="fp16", weight_format="fp16", activation_format="fp16",
+        expert_weight_format="fp16", kv_dtype="fp16", index_dtype="fp16",
+        index_scale_dtype="none", native_format="fp16",
+    ),
     "mxfp4": QuantSpec(
         name="MXFP4", weight_format="mxfp4", activation_format="fp8_e4m3",
         expert_weight_format="mxfp4", weight_block=(1, 32), expert_block=32,
@@ -160,7 +180,8 @@ def va_recommended_config(model: str, hardware: str = "a3") -> dict[str, Any]:
 
 
 def _supports_sequence_parallel(model_spec, profile: Mapping[str, Any], *,
-                                 tp: int, ep: int, pp: int, pcp: int) -> bool:
+                                 tp: int, ep: int, pp: int, pcp: int,
+                                 notes: list[dict[str, Any]]) -> bool:
     """Structural sequence-parallel applicability, never a model-name whitelist."""
     if profile.get("sp") is False:
         return False
@@ -171,7 +192,9 @@ def _supports_sequence_parallel(model_spec, profile: Mapping[str, Any], *,
     from mindie_sim.prediction.sequence_parallel import _validate_model
     try:
         _validate_model(model_spec, padding="right_to_tp")
-    except ModelingError:
+    except ModelingError as exc:
+        from mindie_sim.prediction.implementation_selection import fallback_note
+        notes.append(fallback_note("sequence_parallel", str(exc)))
         return False
     return True
 
@@ -187,8 +210,10 @@ def _execution_policy(case: Mapping[str, Any]) -> dict[str, Any]:
 
 def _resolve_va_lowerings(
     model_spec: ModelSpec, parallel: Mapping[str, int], sku: str, lowering_passes: tuple[str, ...],
+    *, notes: list[dict[str, Any]],
 ) -> dict[str, Any]:
     from mindie_sim.schema.parallel import ParallelSpec
+    from mindie_sim.catalog.paired_sfa import execution
     is_a5 = _arch_key(sku) == "a5"
     p_cfg = ParallelSpec(
         dp=int(parallel.get("dp", 1)), tp=int(parallel.get("tp", 1)),
@@ -196,15 +221,29 @@ def _resolve_va_lowerings(
         cp=int(parallel.get("cp", parallel.get("dcp", 1))), pcp=int(parallel.get("pcp", 1)),
     )
     lowerings: dict[str, Any] = {}
-    if (any(p.attention == "kda" for p in model_spec.layer_plans)
-            and p_cfg.pcp >= 1 and p_cfg.cp == 1):
+    kda_layers = [p for p in model_spec.layer_plans if p.attention == "kda"]
+    if (kda_layers
+            and p_cfg.pcp >= DEFAULT_PARALLEL
+            and (p_cfg.cp == DEFAULT_PARALLEL
+                 or execution(model_spec).get("recurrent_context_sharded") is False)):
         # This source kernel owns complete decode batches with q1-q8. Prefill,
         # mixed batches and longer queries retain explicit semantic work.
+        kda_binding = ("vllm_ascend_recurrent_kda_arch35" if is_a5
+                       else "vllm_ascend_recurrent_kda_arch22")
+        kda_options = {}
+        if is_a5:
+            from mindie_sim.prediction.kda_source import resolve as resolve_kda_source
+            bounds = {getattr(p, "kda_gate_lower_bound", None) for p in kda_layers}
+            if len(bounds) == 1:
+                kda_options = resolve_kda_source(
+                    kda_layers[0], arch="A5", phase="decode", kernels={},
+                    activation_dtype=model_spec.activation_dtype) or {}
         lowerings["kda"] = {
             "cases": [{
-                "domain": {"phases": ["decode"], "max_query_tokens": {"min": 1, "max": 8}},
-                "binding": ("vllm_ascend_recurrent_kda_arch35" if is_a5
-                            else "vllm_ascend_recurrent_kda_arch22"),
+                "domain": {"phases": ["decode"],
+                           "max_query_tokens": {"min": 1,
+                                                "max": KDA_DECODE_MAX_QUERY_TOKENS}},
+                "binding": {"implementation": kda_binding, "options": kda_options},
             }],
             "otherwise": "analytical",
         }
@@ -226,20 +265,38 @@ def _resolve_va_lowerings(
             ],
             "otherwise": "analytical",
         }
-    mla_layers = [p for p in model_spec.layer_plans if p.attention == "mla" and p.q_lora_rank > 0]
+    # V3 ``MlaPrologV3`` only owns the LoRA-MLA prolog; V4/V4.1 latent-MQA
+    # projections are a different ABI and are not validated against it.
+    mla_layers = [p for p in model_spec.layer_plans
+                  if p.attention == "mla" and p.q_lora_rank > 0
+                  and p.mla_variant != "latent_mqa"]
     if mla_layers:
         from mindie_sim.prediction.family_mla_prolog import validate as validate_mla_prolog
+        prolog_options: dict[str, Any] = {}
+        quant = model_spec.quant
+        if (is_a5 and quant is not None and quant.kv_dtype == "int8"):
+            # The int8 KV row is the packed 656 B C8 layout on A5; the source
+            # prolog writes payload, BF16 rotary and FP32 scales in one row.
+            from mindie_sim.prediction.mla_prolog_packed import LAYOUT
+            prolog_options["cache_layout"] = LAYOUT
         try:
             for plan in mla_layers:
                 validate_mla_prolog(plan=plan, parallel=p_cfg, model=model_spec,
-                                    quant=model_spec.quant, lowering_passes=lowering_passes)
-            lowerings["mla_prolog"] = "vllm_ascend_mla_prolog_v3"
-        except ModelingError:
-            pass
+                                    quant=quant, lowering_passes=lowering_passes,
+                                    **prolog_options)
+            lowerings["mla_prolog"] = (
+                {"implementation": "vllm_ascend_mla_prolog_v3",
+                 "options": prolog_options}
+                if prolog_options else "vllm_ascend_mla_prolog_v3")
+        except ModelingError as exc:
+            from mindie_sim.prediction.implementation_selection import fallback_note
+            notes.append(fallback_note("mla_prolog", str(exc)))
     normalization = dict(model_spec.catalog_facts).get("normalization", {})
+    # The residual add+RMSNorm boundary never touches qk_norm; requiring the
+    # absence of qk_norm dropped a native residual norm on every qk-normed GQA
+    # and MoE model. ``norm_weight_offset`` alone decides the weight convention.
     if (model_spec.activation_dtype == "bf16"
-            and not normalization.get("norm_weight_offset", 0.0)
-            and not any(p.qk_norm for p in model_spec.layer_plans)):
+            and not normalization.get("norm_weight_offset", 0.0)):
         lowerings["add_rmsnorm"] = "vllm_ascend_native_norm"
         if "activation_quantization" in lowering_passes and model_spec.quant is not None:
             q = model_spec.quant
@@ -254,7 +311,46 @@ def _resolve_va_lowerings(
             elif is_mx_fp8:
                 lowerings["add_rmsnorm_quant"] = "vllm_ascend_native_norm"
                 lowerings["rmsnorm_quant"] = "vllm_ascend_native_norm"
+    # CANN 9.2.1 native compressor and KeyPool caller.  A layer declaration
+    # selects the source; ``raw_eager`` never reaches this resolver.
+    if any(int(getattr(plan, "compress_ratio", 0) or 0) > 0
+           for plan in model_spec.layer_plans):
+        lowerings.setdefault("compressor", "vllm_ascend_cann_compressor")
+    if any(int(getattr(plan, "index_kpool", 1) or 1) > 1
+           for plan in model_spec.layer_plans):
+        lowerings.setdefault("pool_key_indexer", "vllm_ascend_cann_keypool_caller")
     return lowerings
+
+
+def _tier4_router_spec(model_spec: ModelSpec, sku: str, *, raw_eager: bool) -> ModelSpec:
+    """A5 production executes the router in Tier-4 form.
+
+    ``DS-V4-Pro`` stores an FP32 router and pre-casts its weight copy.  On A5
+    the source kernel consumes the checkpoint weight directly and requests an
+    FP32 output, so no ``router_input_cast`` launch remains.  A standalone
+    ``load_model`` keeps the checkpoint declaration untouched.
+    """
+    if raw_eager or _arch_key(sku) != "a5":
+        return model_spec
+
+    def rewrite(plans):
+        return tuple(
+            replace(plan, router_dtype="", router_output_dtype="fp32",
+                    router_precast_weight_copy=False)
+            if plan.router_dtype == "fp32" else plan
+            for plan in plans)
+
+    aux = model_spec.auxiliary
+    changes = {}
+    if aux is not None:
+        for name in ("mtp", "dspark"):
+            spec = getattr(aux, name)
+            if spec is not None and tuple(getattr(spec, "layer_plans", ())):
+                changes[name] = replace(spec, layer_plans=rewrite(spec.layer_plans))
+    if changes:
+        aux = replace(aux, **changes)
+    return replace(model_spec, layer_plans=rewrite(model_spec.layer_plans),
+                   auxiliary=aux)
 
 
 def _to_jsonable(value: Any) -> Any:
@@ -438,12 +534,58 @@ def _resolve_max_position_embeddings(
 
 
 def _apply_structural_overrides(
-    model_spec: ModelSpec, *, layers: int | None, n_routed_experts: int | None, num_experts_per_tok: int | None,
+    model_spec: ModelSpec, *, layers: int | None, n_routed_experts: int | None,
+    num_experts_per_tok: int | None, promote_dense_to_moe: bool = False,
 ) -> ModelSpec:
-    if layers is None and n_routed_experts is None and num_experts_per_tok is None:
+    if (layers is None and n_routed_experts is None and num_experts_per_tok is None
+            and not promote_dense_to_moe):
         return model_spec
     return customize_model_spec(
-        model_spec, layers=layers, n_routed_experts=n_routed_experts, num_experts_per_tok=num_experts_per_tok,
+        model_spec, layers=layers, n_routed_experts=n_routed_experts,
+        num_experts_per_tok=num_experts_per_tok,
+        promote_dense_to_moe=promote_dense_to_moe,
+    )
+
+
+def prepare_speculation(model: ModelSpec, proposals: int, *,
+                        allow_synthetic_gqa: bool = False) -> ModelSpec:
+    """Declare a native draft only when the model already owns one.
+
+    A synthetic one-layer GQA MTP is available exclusively behind an explicit
+    ``allow_synthetic_gqa`` opt-in so a plain composition never fabricates an
+    auxiliary branch. Native MLA synthesis stays in ``compose_case`` where the
+    target geometry and context validation already live.
+    """
+    if proposals <= 0:
+        return model
+
+    aux = model.auxiliary
+    if aux is not None and aux.standalone_draft:
+        raise ModelingError("standalone_draft_requires_target_model")
+    if aux is not None and (aux.mtp is not None or aux.dspark is not None):
+        return model
+    if model.attention == "mla":
+        return model
+    if not allow_synthetic_gqa or model.attention != "gqa":
+        raise ModelingError("draft_structure_required_for_mtp_proposal_tokens")
+
+    from mindie_sim.catalog.draft import declare_native_auxiliary_plans
+
+    draft = DraftSpec(
+        kind="mtp", layers=1,
+        hidden_size=model.hidden_size,
+        intermediate_size=model.intermediate_size,
+        num_heads=model.num_heads,
+        num_kv_heads=model.num_kv_heads,
+        head_dim=model.head_dim,
+        q_width=model.num_heads * model.head_dim,
+        kv_width=2 * model.num_kv_heads * model.head_dim,
+        target_layer_ids=(model.layers - 1,),
+        activation_dtype=model.activation_dtype,
+        source=(("kind", "explicit_synthetic_gqa_mtp"),),
+    )
+    return declare_native_auxiliary_plans(
+        replace(model, auxiliary=replace(aux or AuxiliarySpec(), mtp=draft))
     )
 
 
@@ -463,6 +605,8 @@ def compose_case(
     layers: int | None = None,
     n_routed_experts: int | None = None,
     num_experts_per_tok: int | None = None,
+    promote_dense_to_moe: bool = False,
+    allow_synthetic_gqa_draft: bool = False,
     prompt_tokens: int = DEFAULT_PROMPT_TOKENS,
     output_tokens: int = DEFAULT_OUTPUT_TOKENS,
     concurrency: int = DEFAULT_CONCURRENCY,
@@ -507,7 +651,7 @@ def compose_case(
     linear_proj_tp: int = DEFAULT_LOCAL_WIDTH,
     lm_head_tp: int = DEFAULT_LOCAL_WIDTH,
     redundant_experts_per_rank: int = DEFAULT_REDUNDANT_EXPERTS,
-    collective_startup_mode: str = "legacy",
+    collective_startup_mode: str | None = None,
     matrix_compute_policy: str = "auto",
     recover_ssm: bool = False,
     prefix_cache_mode: str = "private",
@@ -546,6 +690,9 @@ def compose_case(
     required_devices = dp * tp * pp * pcp
     hw_raw = dict(hardware) if isinstance(hardware, Mapping) else {}
     sku, backend, alias_preset = _resolve_hardware(hardware)
+    # ``backend`` is later rebound to the documented all2all backend name; keep
+    # the resolved hardware adapter identity separately for operator defaults.
+    hardware_backend = backend
     preset = str(topology_preset or alias_preset or hw_raw.get("topology_preset") or "")
     if preset and backend != "ascend":
         raise ModelingError(f"hardware_topology_preset_unsupported:{backend}:{preset}")
@@ -665,11 +812,23 @@ def compose_case(
         if quant is None:
             quant = va_profile["quant"]
     model_spec = _apply_quant_override(model_spec, quant, machine)
+    from mindie_sim.compose_operator_defaults import structural_v41_latent_mqa
+    # Layer slicing must not erase the full-model cache contract: the first
+    # sliced layers may all be window-only, while a later layer supplies the
+    # gated-ring compressor that identifies the packed V4.1 stack.
+    v41_structural = structural_v41_latent_mqa(model_spec.layer_plans)
     model_spec = _apply_structural_overrides(
         model_spec,
         layers=layers,
         n_routed_experts=n_routed_experts,
         num_experts_per_tok=num_experts_per_tok,
+        promote_dense_to_moe=promote_dense_to_moe,
+    )
+    # An explicit opt-in may declare one synthetic GQA draft; an undeclared
+    # auxiliary structure otherwise fails here instead of being fabricated.
+    model_spec = prepare_speculation(
+        model_spec, int(mtp_proposal_tokens),
+        allow_synthetic_gqa=allow_synthetic_gqa_draft,
     )
     # ``block_size=None`` resolves the documented page size and, for
     # ``paired_sfa`` caches, the recurrent-state minimum; an explicit caller
@@ -688,6 +847,7 @@ def compose_case(
     # These are caller opt-ins: the profile exposes the documented capability
     # as provenance, but enabling an overlap/offload path changes the pinned
     # physical decomposition and must be an explicit composition choice.
+    notes: list[dict[str, Any]] = []
     resolved_mso = bool(multistream_overlap_shared_expert)
     resolved_engram_offload = bool(engram_cpu_offload)
     sp_source = (
@@ -700,7 +860,8 @@ def compose_case(
     elif sp is None:
         sp = bool(production and va_profile is not None
                   and _supports_sequence_parallel(model_spec, va_profile,
-                                                  tp=tp, ep=ep, pp=pp, pcp=pcp))
+                                                  tp=tp, ep=ep, pp=pp, pcp=pcp,
+                                                  notes=notes))
     documented_capture = (va_profile or {}).get("graph_capture_mode")
     capture_source = (
         "raw_eager" if raw_eager else
@@ -728,7 +889,9 @@ def compose_case(
                      "structural fusion defaults"),
     }
 
-    if int(mtp_proposal_tokens) > DEFAULT_ZERO and model_spec.auxiliary is None:
+    aux = model_spec.auxiliary
+    needs_draft = aux is None or (aux.mtp is None and aux.dspark is None)
+    if int(mtp_proposal_tokens) > DEFAULT_ZERO and needs_draft:
         from mindie_sim.catalog.draft import declare_native_auxiliary_plans
         facts = dict(model_spec.catalog_facts)
         nextn = int(facts.get("num_nextn_predict_layers", 0) or 0)
@@ -774,17 +937,29 @@ def compose_case(
             raise ModelingError("invalid_mtp_acceptance_length")
 
     required_len = int(prompt_tokens) + int(output_tokens) + max(0, int(mtp_proposal_tokens))
+    # The catalog context limit is checked before an explicit max_model_len, so
+    # supplying one cannot bypass the model's own maximum position embeddings.
+    if model_limit > 0 and required_len > model_limit:
+        raise ModelingError(
+            f"workload_exceeds_model_max_position_embeddings:{required_len}>{model_limit}"
+        )
     if max_model_len is not None:
         if int(max_model_len) < required_len:
             raise ModelingError(f"max_model_len_smaller_than_workload:{max_model_len}<{required_len}")
         resolved_max_model_len = int(max_model_len)
     else:
-        if model_limit > 0 and required_len > model_limit:
-            raise ModelingError(
-                f"workload_exceeds_model_max_position_embeddings:{required_len}>{model_limit}"
-            )
         resolved_max_model_len = max(32768, required_len)
 
+    # A5 production router form is a compose-scoped rewrite; a standalone
+    # ``load_model`` keeps the checkpoint declaration.
+    model_spec = _tier4_router_spec(model_spec, sku, raw_eager=raw_eager)
+    if ascend_backend and _arch_key(sku) == "a5":
+        # A persistent INT8 packed MLA row is a model-preparation fact, not a
+        # phase-scoped operator choice: capacity and both phases must see it.
+        from mindie_sim.compose_operator_defaults import (
+            resolve_packed_indexed_mla_cache,
+        )
+        model_spec = resolve_packed_indexed_mla_cache(model_spec)
     model_dict = _to_jsonable(model_spec)
     model_dict["n_routed_experts"] = int(model_spec.num_experts)
     model_dict["num_experts_per_tok"] = int(model_spec.top_k)
@@ -812,6 +987,10 @@ def compose_case(
         **({"raw_eager": True} if raw_eager else {}),
         "execution_policy": dict(execution_policy),
     }
+    if ascend_backend:
+        # Declared silicon family for native-fusion activation.  A raw-eager
+        # execution keeps the same provenance but no optional fusion.
+        runtime_meta.setdefault("arch_family", _arch_key(sku).upper())
     if resolved_engram_offload:
         h2d_ch = dict((machine.get("transfer_channels") or {}).get("h2d") or {})
         h2d_bps = (float(h2d_ch.get("effective_uni_bw_gbps") or 0.0)
@@ -836,8 +1015,18 @@ def compose_case(
     runtime_dict: dict[str, Any] = {
         "parallel": {
             "dp": dp, "tp": tp, "pp": pp, "ep": ep, "cp": dcp, "dcp": dcp, "pcp": pcp,
-            **({"rank_table": [list(range(g * int(ep), (g + DEFAULT_PARALLEL) * int(ep)))
-                               for g in range((int(dp) * int(tp) * int(pcp)) // int(ep))]}
+            **({"rank_table": [
+                stage_ranks[offset:offset + int(ep)]
+                for stage in range(int(pp))
+                for stage_ranks in ([[
+                    int(machine["dies"][idx]["rank"]) if machine.get("dies") else idx
+                    for d in range(int(dp))
+                    for c in range(int(pcp))
+                    for t in range(int(tp))
+                    for idx in (((d * int(pp) + stage) * int(pcp) + c) * int(tp) + t,)
+                ]][DEFAULT_ZERO],)
+                for offset in range(DEFAULT_ZERO, len(stage_ranks), int(ep))
+            ]}
                if int(pcp) > DEFAULT_PARALLEL and int(ep) > int(dp) * int(tp)
                and (int(dp) * int(tp) * int(pcp)) % int(ep) == DEFAULT_ZERO else {}),
             "o_proj_tp": int(o_proj_tp),
@@ -845,7 +1034,9 @@ def compose_case(
             "lm_head_tp": int(lm_head_tp),
             "redundant_experts_per_rank": int(redundant_experts_per_rank),
         },
-        "collective_startup_mode": str(collective_startup_mode),
+        "collective_startup_mode": (
+            str(collective_startup_mode) if collective_startup_mode is not None
+            else "topology" if machine.get("collective_protocols") else "legacy"),
         "matrix_compute_policy": str(matrix_compute_policy),
         "recover_ssm": bool(recover_ssm),
         "prefix_cache_mode": str(prefix_cache_mode),
@@ -894,6 +1085,12 @@ def compose_case(
         runtime_dict["kernels"] = {
             "sequence_parallel": dict(DECLARATION, padding="right_to_tp")
         }
+    excluded_selectors: frozenset[str] = frozenset()
+    excluded_passes: frozenset[str] = frozenset()
+    if ascend_backend and not raw_eager:
+        from mindie_sim.stack_tracks import excluded_lowering_bindings
+        excluded_selectors, excluded_passes = excluded_lowering_bindings(
+            exclude_optimizations)
     if va_profile is not None:
         runtime_meta["va_recommended"] = True
         runtime_meta["va_profile"] = deepcopy(va_profile)
@@ -918,8 +1115,19 @@ def compose_case(
             passes = ("activation_quantization", "norm_quant")
             runtime_dict["lowering_passes"] = list(passes)
         lowerings = _resolve_va_lowerings(
-            model_spec, runtime_dict["parallel"], sku, passes,
+            model_spec, runtime_dict["parallel"], sku, passes, notes=notes,
         )
+        # ``exclude_optimizations`` owns the profile-installed selectors too;
+        # removing only the feature-track entry would retain the fused kernel.
+        lowerings = {name: value for name, value in lowerings.items()
+                     if name not in excluded_selectors}
+        if excluded_passes:
+            passes = tuple(name for name in passes
+                           if name not in excluded_passes)
+            if passes:
+                runtime_dict["lowering_passes"] = list(passes)
+            else:
+                runtime_dict.pop("lowering_passes", None)
         if "add_rmsnorm" in lowerings and "residual_norm" not in passes:
             passes = (*passes, "residual_norm")
             runtime_dict["lowering_passes"] = list(passes)
@@ -933,6 +1141,7 @@ def compose_case(
     # unmerged-PR / architectural-ideal mechanism set on top of the documented
     # profile base.  ``va_recommended=False`` with the default ``merged`` track
     # keeps zero automatic stack fusions, preserving the caller's bare case.
+    mechanism_track_active = False
     if ascend_backend and not raw_eager:
         from mindie_sim.feature_mechanisms import MechanismContext
         from mindie_sim.stack_tracks import (
@@ -941,8 +1150,13 @@ def compose_case(
         )
 
         canonical_track = normalize_feature_track(feature_track)
+        # An exclusion removes mechanisms; it never activates a non-empty
+        # track.  ``va_recommended=False`` with only exclusions therefore keeps
+        # the caller's bare case instead of enabling graph capture and MoE
+        # gating as a side effect.
         if (va_recommended is not False or bool(optimizations)
-                or bool(exclude_optimizations) or canonical_track != "merged"):
+                or canonical_track != "merged"):
+            mechanism_track_active = True
             stack_profile = resolve_runtime_stack(runtime_stack)
             stack_model_key = str(
                 (va_profile or {}).get("canonical_model") or model_spec.name)
@@ -967,6 +1181,62 @@ def compose_case(
             runtime_meta = dict(runtime_dict.get("metadata") or {})
             runtime_meta["feature_track_report"] = resolved_track
             runtime_dict["metadata"] = runtime_meta
+
+    # Device-adaptor operator defaults. The A5 V4.1 packed cache ABI is selected
+    # by hardware capability plus structural geometry, independently of the
+    # expert weight format; an unsupported automatic geometry keeps analytical
+    # execution and is reported instead of being installed.
+    if ascend_backend and not raw_eager:
+        from mindie_sim.compose_operator_defaults import (
+            DECLARATION_PHASE, apply_compose_v41_a5_defaults,
+        )
+        from mindie_sim.prediction.implementation_selection import (
+            operator_selection_summary,
+        )
+        kernels = dict(runtime_dict.get("kernels") or {})
+        lowerings = dict(kernels.get("lowerings") or {})
+        notes.extend(apply_compose_v41_a5_defaults(
+            model_dict=model_dict, lowerings=lowerings, backend=hardware_backend,
+            arch=_arch_key(sku), layer_plans=model_spec.layer_plans,
+            activation_dtype=model_spec.activation_dtype, tp=tp, cp=dcp,
+            runtime_metadata=runtime_meta, structural_v41=v41_structural,
+        ))
+        if excluded_selectors:
+            lowerings = {name: value for name, value in lowerings.items()
+                         if name not in excluded_selectors}
+        if lowerings:
+            kernels["lowerings"] = lowerings
+            runtime_dict["kernels"] = kernels
+        runtime_meta["operator_selection_summary"] = operator_selection_summary(
+            arch_family=_arch_key(sku), phase=DECLARATION_PHASE, notes=notes)
+        runtime_dict["metadata"] = runtime_meta
+
+    # CANN 9.2.1 stack declarations shared by the documented profile and the
+    # merged mechanism track.  ``va_recommended=False`` without a selected
+    # mechanism keeps the caller's bare case.
+    if (ascend_backend and not raw_eager
+            and (va_recommended is not False or mechanism_track_active)):
+        from mindie_sim.feature_mechanisms import ensure_norm_quant_domain
+        kernels = dict(runtime_dict.get("kernels") or {})
+        lowerings = dict(kernels.get("lowerings") or {})
+        if any(plan.ffn == "moe" for plan in model_spec.layer_plans):
+            kernels.setdefault("moe_gating",
+                               {"implementation": "vllm_ascend_cann_gating"})
+        if any(int(getattr(plan, "compress_ratio", 0) or 0) > 0
+               for plan in model_spec.layer_plans):
+            lowerings.setdefault("compressor", "vllm_ascend_cann_compressor")
+        pooled = any(int(getattr(plan, "index_kpool", 1) or 1) > 1
+                     for plan in model_spec.layer_plans)
+        if pooled:
+            lowerings.setdefault("pool_key_indexer",
+                                 "vllm_ascend_cann_keypool_caller")
+            model_dict.setdefault("metadata", {})["native_keypool_caller"] = True
+        if "norm_quant" in tuple(runtime_dict.get("lowering_passes") or ()):
+            kernels = ensure_norm_quant_domain(kernels)
+        if lowerings:
+            kernels["lowerings"] = lowerings
+        if kernels:
+            runtime_dict["kernels"] = kernels
 
     case_dict: dict[str, Any] = {
         "model": model_dict,
@@ -1234,19 +1504,49 @@ def assemble(case, *, scope="service", iterations=None, phase=None, tokens=None,
     rows, program_count, first_program = [], 0, None
     service_counts = {family: 0 for family in SERVICE_FAMILIES}
     serving = execution.serving_io
+    model_draft_policies = {}
+    model_draft_states = {}
+    model_token_quota = None
+    if scope == "model" and phase == "decode":
+        from mindie_sim.prediction.scheduler import DraftPolicy, Progress
+        for spec in specs:
+            policy = DraftPolicy.for_request(parsed, spec)
+            if policy.mode:
+                model_draft_policies[spec.request_id] = policy
+        if model_draft_policies:
+            model_token_quota = int(iterations) * int(tokens)
+            for spec in specs:
+                state = Progress(spec)
+                state.computed = computed_kv[spec.request_id]
+                state.started = True
+                model_draft_states[spec.request_id] = state
     # A non-draft decode step advances one token. ``tokens`` is the requested
     # token budget per outer iteration and expands into real microsteps, each
     # with its own forward/commit/state dependency; it is never one batched
-    # multi-token commit or a sleep for the rest of the budget.
+    # multi-token commit or a sleep for the rest of the budget.  A speculative
+    # model step follows the same acceptance-credit plan as service scope.
     decode_tokens = int(tokens) if phase == "decode" else 1
     total_steps = (int(iterations) * decode_tokens if phase == "decode"
                    else int(iterations))
+    if model_draft_policies:
+        decode_tokens = 1
+        total_steps = sum(
+            min(spec.output_tokens, int(model_token_quota)) for spec in specs
+        )
     for step_index in range(total_steps):
         views = []
+        model_budget = (int(parsed.runtime.max_num_batched_tokens)
+                        if model_draft_policies else DEFAULT_ZERO)
         for spec in specs:
-            remaining = spec.output_tokens - generated[spec.request_id]
+            target_tokens = (min(spec.output_tokens, model_token_quota)
+                             if model_token_quota is not None
+                             else spec.output_tokens)
+            remaining = target_tokens - generated[spec.request_id]
             if remaining <= 0:
                 continue
+            proposal = DEFAULT_ZERO
+            prepare = False
+            advance = 1
             if phase == "prefill" and step_index == 0:
                 q_len, view_phase = spec.prompt_tokens, "prefill"
                 count = 1
@@ -1254,6 +1554,21 @@ def assemble(case, *, scope="service", iterations=None, phase=None, tokens=None,
                 q_len = 1
                 view_phase = "decode"
                 count = 1
+                if model_draft_policies:
+                    if model_budget <= DEFAULT_ZERO:
+                        continue
+                    state = model_draft_states[spec.request_id]
+                    policy = model_draft_policies.get(spec.request_id)
+                    if policy is not None:
+                        proposal = min(
+                            policy.proposal, max(DEFAULT_ZERO, remaining - 1),
+                            max(DEFAULT_ZERO, model_budget - 1))
+                        advance = min(
+                            remaining,
+                            policy.committed(state, proposal) if proposal else 1)
+                        prepare = (bool(policy.mode)
+                                   and remaining > DRAFT_PREPARE_MIN_REMAINING)
+                    model_budget -= 1 + proposal
             if view_phase == "prefill":
                 view_context = 0
             elif scope == "framework":
@@ -1265,8 +1580,14 @@ def assemble(case, *, scope="service", iterations=None, phase=None, tokens=None,
                 view_context = computed_kv[spec.request_id]
             views.append(RequestView(
                 spec.request_id, q_len, view_context, True, view_phase,
-                draft_verify=False, draft_prepare=False,
-                draft_advanced_tokens=count, prompt_tokens=spec.prompt_tokens,
+                draft_verify=bool(proposal),
+                draft_proposal_tokens=proposal,
+                draft_prepare=prepare,
+                draft_advanced_tokens=(advance if model_draft_policies else count),
+                draft_accepted_tokens=(
+                    max(DEFAULT_ZERO, advance - 1)
+                    if model_draft_policies else DEFAULT_ZERO),
+                prompt_tokens=spec.prompt_tokens,
             ))
         if not views:
             break
@@ -1351,11 +1672,18 @@ def assemble(case, *, scope="service", iterations=None, phase=None, tokens=None,
         delivery_times = ({request: event.time for request, event in
                            step.client_deliveries.items() if event.time is not None}
                           if serving.enabled else {})
+        commit_at_ms = (step.completion.time if step.completion.time is not None
+                        else release_ms)
         for view in views:
             if scope == "framework":
                 continue
             if view.phase == "prefill":
                 computed_kv[view.request_id] = view.prompt_tokens
+            elif view.request_id in model_draft_states:
+                state = model_draft_states[view.request_id]
+                state.commit(view, commit_at_ms)
+                computed_kv[view.request_id] = state.computed
+                generated[view.request_id] = state.generated
             else:
                 computed_kv[view.request_id] += view.q_len
         row = {
@@ -1565,6 +1893,7 @@ def apply_va_recommended(case: Mapping[str, Any]) -> dict[str, Any]:
     meta["va_profile"] = deepcopy(va_profile)
     meta["va_env"] = dict(va_profile["env"])
     meta.setdefault("moe_dispatch_quantization", "routed_expert")
+    notes: list[dict[str, Any]] = []
     kernels = dict(rt.get("kernels", {}))
     tp, ep, pp, pcp = int(par.get("tp", 1)), int(par.get("ep", 1)), int(par.get("pp", 1)), int(par.get("pcp", 1))
     if (va_profile.get("sp", True) and "sequence_parallel" not in kernels
@@ -1574,13 +1903,14 @@ def apply_va_recommended(case: Mapping[str, Any]) -> dict[str, Any]:
             _validate_model(parsed.model, padding="right_to_tp")
             kernels["sequence_parallel"] = dict(DECLARATION, padding="right_to_tp")
             meta["sp"] = True
-        except ModelingError:
-            pass
+        except ModelingError as exc:
+            from mindie_sim.prediction.implementation_selection import fallback_note
+            notes.append(fallback_note("sequence_parallel", str(exc)))
     passes = tuple(rt.get("lowering_passes", ()))
     if not passes and str(parsed.model.quant.activation_format) != str(parsed.model.activation_dtype):
         passes = ("activation_quantization", "norm_quant")
         rt["lowering_passes"] = list(passes)
-    lowerings = _resolve_va_lowerings(parsed.model, par, sku, passes)
+    lowerings = _resolve_va_lowerings(parsed.model, par, sku, passes, notes=notes)
     if "add_rmsnorm" in lowerings and "residual_norm" not in passes:
         passes = (*passes, "residual_norm")
         rt["lowering_passes"] = list(passes)
@@ -1589,6 +1919,14 @@ def apply_va_recommended(case: Mapping[str, Any]) -> dict[str, Any]:
         kernels["lowerings"] = {**lowerings, **existing_low}
     if kernels:
         rt["kernels"] = kernels
+    from mindie_sim.prediction.implementation_selection import (
+        merge_selection_summaries, operator_selection_summary,
+    )
+    from mindie_sim.compose_operator_defaults import DECLARATION_PHASE
+    meta["operator_selection_summary"] = merge_selection_summaries(
+        meta.get("operator_selection_summary"),
+        operator_selection_summary(arch_family=_arch_key(sku),
+                                   phase=DECLARATION_PHASE, notes=notes))
     rt["metadata"] = meta
     out["runtime"] = rt
     parse_case(out)

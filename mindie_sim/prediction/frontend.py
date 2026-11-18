@@ -44,6 +44,7 @@ from .implementation_selection import (
 )
 from .recover_ssm_commit import bind_recover_ssm_commits, is_recover_ssm_intent
 from .recover_ssm_work import recover_ssm_enabled
+from .recurrent_kda_helpers import strip_excluded_native_kda
 
 
 ZERO = 0
@@ -56,6 +57,7 @@ _ENV_FEATURES = 4
 ZERO_FLOAT = 0.0
 FINAL_LAYER = -1
 MIN_DBO_MICROBATCHES = 2
+
 
 
 def _scope(ops, block, role="body"):
@@ -90,7 +92,7 @@ def _without_service_fragments(regions):
         for op in region.ops:
             deps = tuple(dict.fromkeys(
                 parent for dep in op.deps for parent in aliases.get(dep, (dep,))))
-            if op.family in SERVICE_FAMILIES:
+            if op.family in SERVICE_FAMILIES and op.family != "acceptance":
                 aliases[op.op_id] = deps
                 continue
             kept.append(replace(op, deps=deps))
@@ -193,6 +195,38 @@ def _ports_for_work(work):
     )
 
 
+ANALYTICAL_SELECTIONS = "analytical_implementations"
+
+
+def mark_analytical_runtime(runtime, selections):
+    """Retain policy-resolved analytical decisions on the immutable runtime.
+
+    A policy may remove a selector after choosing its analytical fallback.
+    Downstream source-default resolvers must see that decision instead of
+    treating the absent binding as permission to install a native source.
+    """
+    names = {str(record.get("selector"))
+             for record in (selections or ())
+             if record.get("implementation") == "analytical"}
+    names.discard("")
+    if not names:
+        return runtime
+    metadata = dict(getattr(runtime, "metadata", ()) or ())
+    previous = tuple(metadata.get(ANALYTICAL_SELECTIONS, ()) or ())
+    metadata[ANALYTICAL_SELECTIONS] = tuple(sorted(set(previous) | names))
+    return replace(runtime, metadata=tuple(metadata.items()))
+
+
+def program_attached_to(program, ops):
+    """Reattach one program to its final cohort-bound operator occurrences."""
+    work = replace(program.work, ops=tuple(ops))
+    counts = Counter(op.family for op in work.ops)
+    triggers = tuple((family, counts[family], _TRIGGERS[family])
+                     for family in sorted(SERVICE_FAMILIES) if counts[family])
+    return replace(program, work=work, ports=_ports_for_work(work),
+                   triggers=triggers)
+
+
 @dataclass(frozen=True)
 class ModelProgram:
     """Executable model work plus its typed ports and occurrence triggers.
@@ -250,32 +284,51 @@ class Frontend:
              mode="prefill", global_tokens=None, stages=None, replica=ZERO,
              features=None, source_rows_by_replica=None,
              routing_global_tokens=None, routing_views=None,
+             cohort_views_by_replica=None,
              physical_rank=None, query_position=None,
              include_recover_commits: bool = False, machine=None,
-             dbo_partition: int | None = None, layer_limit: int | None = None):
+             dbo_partition: int | None = None, layer_limit: int | None = None,
+             topk_scope=None, reuse_index_selection: bool = False, rank_ledger=None):
         p = runtime.parallel
         if layer_limit is not None:
             limit = max(ONE, int(layer_limit))
             model = replace(model, layer_plans=tuple(model.layer_plans[:limit]))
         features = self.features if features is None else features
-        if (runtime.enable_dbo and dbo_partition is None and len(views) > ONE):
-            from .overlap_plan import MicrobatchPolicy, build_microbatch_regions
+        # An explicit mechanism exclusion owns every selector it can install,
+        # including the structural body default resolved before this call.
+        runtime = strip_excluded_native_kda(runtime)
+        if runtime.enable_dbo and dbo_partition is None and len(views) > ONE:
+            from .dbo_ledger import plan as dbo_plan
             from .physical_recipe_registry import COLLECTIVE_FAMILIES
-            regions = build_microbatch_regions(
-                views, policy=MicrobatchPolicy(count=MIN_DBO_MICROBATCHES))
-            if len(regions) > ONE:
-                merged, previous_partition_attention = [], None
-                for region in regions:
-                    part_ops, _ = self.body(
-                        model, runtime, region.views,
+            partitions = dbo_plan(self, model, runtime, views, tokens,
+                                  cohort_views_by_replica, replica, machine, physical_rank,
+                                  MIN_DBO_MICROBATCHES, routing_views)
+            if partitions and reuse_index_selection:
+                # A shared TopK selection is one per proposal step; splitting
+                # that step into independent microbatches has no single owner.
+                raise ModelingError("mtp_shared_index_selection_requires_single_microbatch")
+            if partitions:
+                merged, previous_partition_attention, sinks = [], None, []
+                partition_requests = tuple(view.request_id for view in views)
+                for part in partitions:
+                    region, region_rows_value = part.region, part.capacity
+                    partition_global = part.physical
+                    partition_source_rows = (part.valid if runtime.kernels.get(
+                        "force_eplb_source") else part.allocated)
+                    partition_routing = part.routing
+                    from .dbo_ledger import partition_runtime
+                    part_ops, part_last = self.body(
+                        model, partition_runtime(runtime, part), region.views,
                         prefix=f"{prefix}dbo{region.index}.",
                         ready=ready,
-                        tokens=sum(int(view.q_len) for view in region.views),
-                        mode=mode, global_tokens=global_tokens, stages=stages,
+                        tokens=region_rows_value,
+                        mode=mode,
+                        global_tokens=partition_global,
+                        stages=stages,
                         replica=replica, features=features,
-                        source_rows_by_replica=source_rows_by_replica,
-                        routing_global_tokens=routing_global_tokens,
-                        routing_views=routing_views,
+                        source_rows_by_replica=partition_source_rows, rank_ledger=part,
+                        routing_global_tokens=part.physical,
+                        routing_views=partition_routing,
                         physical_rank=physical_rank,
                         query_position=query_position,
                         include_recover_commits=include_recover_commits,
@@ -283,13 +336,20 @@ class Frontend:
                     first_attention = None
                     for op in part_ops:
                         collective = op.family in COLLECTIVE_FAMILIES
-                        stream = region.comm_stream if collective else region.stream
+                        auxiliary = (op.stream
+                                     if op.stream and op.stream != region.stream
+                                     else "")
+                        stream = (f"dbo{region.index}:{auxiliary}" if auxiliary
+                                  else region.comm_stream if collective
+                                  else region.stream)
                         metadata = dict(op.metadata)
                         metadata.update({
                             "dbo_microbatch": region.index,
-                            "dbo_microbatch_count": len(regions),
+                            "dbo_microbatch_count": len(partitions),
                             "dbo_compute_stream": region.stream,
                         })
+                        if auxiliary:
+                            metadata["dbo_auxiliary_stream"] = auxiliary
                         if collective:
                             metadata["collective_rendezvous"] = (
                                 f"dbo{region.index}:{op.op_id}")
@@ -309,14 +369,35 @@ class Frontend:
                                  previous_partition_attention))))
                     previous_partition_attention = (
                         first_attention or previous_partition_attention)
-                    previous = merged[-ONE].op_id
-                return merged, previous
+                    sinks.append(part_last)
+                # Every partition's residual/FFN sink must finish before the
+                # shared final norm, logits and token commit.  Returning only
+                # the last partition's tail lets the commit overtake partition
+                # zero and understates the DBO step.
+                joined = barrier_op(
+                    op_id=prefix + "dbo.join", deps=tuple(dict.fromkeys(sinks)),
+                    stage=stages[ZERO] if stages else ZERO, layer=-1,
+                    requests=partition_requests, phase=mode,
+                    recipe="dbo_partition_join", shape=(len(partition_requests),))
+                merged.append(joined)
+                return merged, joined.op_id
+        if (rank_ledger is None and cohort_views_by_replica is not None and views
+                and (runtime.enable_dbo or runtime.parallel.rank_table is not None
+                     or runtime.parallel.pcp > ONE or runtime.kernels.get("force_eplb_source"))):
+            from .dbo_ledger import plan as dbo_plan
+            parent = dbo_plan(self, model, runtime, views, tokens, cohort_views_by_replica,
+                              replica, machine, physical_rank, ONE, routing_views)
+            if parent:
+                rank_ledger = parent[ZERO]
+                global_tokens = routing_global_tokens = rank_ledger.physical
+                source_rows_by_replica = (rank_ledger.valid if runtime.kernels.get(
+                    "force_eplb_source") else rank_ledger.allocated)
         requests = tuple(view.request_id for view in views)
         tokens = sum(view.q_len for view in views) if tokens is None else tokens
         stages = stages or stage_map(model, runtime)
         ops, previous = [], ready
         sp = sequence_parallel.select(runtime, model, views, tokens=tokens,
-                                      global_tokens=global_tokens)
+                                      global_tokens=global_tokens, rank_ledger=rank_ledger)
         if sp:
             if runtime.moe_recipe != "alltoall":
                 raise ValueError("sequence_parallel_requires_unchunked_alltoall")
@@ -329,6 +410,9 @@ class Frontend:
                 ops.append(shard)
                 previous = shard.op_id
         caches, indices, topks, candidates = {}, {}, {}, {}
+        if topk_scope is not None:
+            # Reuse a TopK selection produced by an earlier proposal step.
+            topks = topk_scope
         residual_sources = []
         attnres = (family_attnres.selection(
             runtime, model=model, phase=mode)
@@ -392,6 +476,9 @@ class Frontend:
                             dtype=model.activation_dtype)
                         ops.extend(_scope((sliced,), "attention"))
                         attention_ready = sliced.op_id
+                selection_kwargs = (
+                    {"reuse_index_selection": True, "shared_topk": topks}
+                    if reuse_index_selection and layer.attention == "mla" else {})
                 attention = self.attention[layer.attention](
                     prefix=name, plan=layer, views=views, stage=stage, deps=attention_ready,
                     model=model, parallel=p, quant=model.quant, mode=mode,
@@ -400,6 +487,7 @@ class Frontend:
                     candidate_ids=candidates, stage_of=lambda layer: stages[layer],
                     cp_interleave_size=runtime.kv_block_size, runtime=runtime,
                     policy=self.attention_policy, machine=machine,
+                    **selection_kwargs,
                 )
                 if sp:
                     attention_ops, attention_last = sequence_parallel.close_output(
@@ -456,15 +544,14 @@ class Frontend:
                 realization_views = routing_views if routing_views is not None else views
                 realization = (select_realization(
                     runtime, layer, phase=mode, tokens=tokens,
-                    valid_tokens=(sp.valid_per_tp[0] if sp else
-                                  sum(view.logical_q_len for view in views)),
+                    valid_tokens=(rank_ledger.valid[rank_ledger.owner] if rank_ledger and sp else
+                                  sp.valid_per_tp[ZERO] if sp else sum(view.logical_q_len for view in views)),
                     global_tokens=routing_tokens,
-                    token_shards=(p.tp if sp and (routing_tokens is None
-                                                  or routing_tokens >= tokens * p.tp)
-                                  else 1),
+                    token_shards=(p.tp if sp and (rank_ledger is not None or routing_tokens is None
+                                                  or routing_tokens >= tokens * p.tp) else ONE),
                     valid_source_tokens=sp.valid_global if sp else None, replica=replica,
-                    views=realization_views,
-                    physical_rank=physical_rank,
+                    views=realization_views, source_geometry=rank_ledger,
+                    physical_rank=(rank_ledger.owner if rank_ledger is not None else physical_rank),
                     query_position=query_position)
                     if layer.ffn == "moe" else None)
                 ffn_tokens = tokens
@@ -482,6 +569,9 @@ class Frontend:
                     moe_recipe=runtime.moe_recipe, mc2_chunks=runtime.mc2_chunks,
                     overlap_shared=bool(runtime.multistream_overlap_shared_expert),
                     runtime=runtime, sequence_plan=sp,
+                    ep_owner=(rank_ledger.owner if rank_ledger is not None else
+                              int(physical_rank) % p.ep if physical_rank is not None else None),
+                    price_owner=(rank_ledger.owner if rank_ledger is not None else None),
                 )
                 if sp and layer.ffn == "dense":
                     ffn_ops, previous = sequence_parallel.close_output(
@@ -648,7 +738,7 @@ class Frontend:
             metadata=(("selection", "all_verify_rows_or_last_prefill_row"),))
 
     @staticmethod
-    def partition_views(views, runtime, padded, *, model=None):
+    def partition_views(views, runtime, padded, *, model=None, lane=None):
         degree = runtime.parallel.pcp
         if degree == ONE or not any(v.phase == "prefill" for v in views):
             return views, padded, False
@@ -668,12 +758,14 @@ class Frontend:
             if view.phase == "prefill":
                 split = split_pcp_pairs(view.q_len, view.context, degree, window=rep_win)
                 costs = [old + current for old, current in zip(costs, split.per_rank)]
-        rank = max(range(degree), key=costs.__getitem__)
+        rank = max(range(degree), key=costs.__getitem__) if lane is None else lane
         ranges = [pcp_rank_chunk_ranges(view.q_len, degree, rank) for view in views]
         local = tuple(replace(view, q_len=sum(end - start for start, end in parts),
                               global_q_len=view.q_len, query_ranges=parts)
                       if view.phase == "prefill" else view for view, parts in zip(views, ranges))
-        return local, sum(view.q_len for view in local), True
+        extra = max(ZERO, padded - sum(view.q_len for view in views))
+        padding = sum(hi - lo for lo, hi in pcp_rank_chunk_ranges(extra, degree, rank))
+        return local, sum(view.q_len for view in local) + padding, True
 
     @staticmethod
     def pcp_cohort_tokens(views, local_views, local_tokens, runtime, global_tokens=None, global_views=None):
@@ -723,12 +815,14 @@ class Frontend:
     def __call__(self, plan, model, runtime, machine, *, global_tokens=None, global_views=None,
                  resource_fusion=None, replica=ZERO, source_rows_by_replica=None,
                  routing_global_tokens=None, routing_views=None,
+                 cohort_views_by_replica=None,
                  physical_rank=None, query_position=None, assembly="service",
                  dispatch_binding=None, dispatch_fast_step: bool = False):
         # ``dispatch_binding`` is the T14 PP/EP microbatch envelope (original
         # slot/version/replica). The ordinary producer keeps using the views in
         # ``plan``; a cached template owner can read this envelope without
         # inferring a slot from local list positions.
+        requested_rank = physical_rank
         if assembly not in {"model", "service"}:
             raise ModelingError(f"assembly_scope_unknown:{assembly}")
         if resource_fusion is None:
@@ -765,6 +859,16 @@ class Frontend:
         # phase belongs to the active cohort, not a fictitious "idle" kernel.
         mode = selected_mode(plan if plan.requests else replace(
             plan, requests=tuple(global_views or ())))
+        if assembly == "model":
+            from math import floor
+            mean = float(runtime.mtp_acceptance_length)
+            plan = replace(plan, requests=tuple(
+                replace(view,
+                        draft_advanced_tokens=min(
+                            view.q_len + view.draft_proposal_tokens,
+                            max(ONE, floor((index + ONE) * mean) - floor(index * mean))))
+                if view.draft_proposal_tokens and not view.draft_advanced_tokens
+                else view for index, view in enumerate(plan.requests)))
         views = tuple(replace(view, q_len=view.q_len + view.draft_proposal_tokens)
                       for view in plan.requests)
         valid = sum(view.logical_q_len for view in views)
@@ -775,6 +879,7 @@ class Frontend:
         runtime, selections = resolve_implementations(
             runtime, views, padded_tokens=padded, replay_scope=scope,
             global_views=global_views)
+        runtime = mark_analytical_runtime(runtime, selections)
         # A speculative decode leaves state publication to the service
         # acceptance boundary. The homogeneous fast path splices one layer
         # template across copies, which would lose those deferred intents.
@@ -809,8 +914,10 @@ class Frontend:
                                deps=tuple(rename[dep] for dep in op.deps) or (previous,))
                        for op in media.ops)
             previous = rename[media.last]
+        from .dbo_ledger import selected_lane
         local_views, local_tokens, pcp_prefill = self.partition_views(
-            views, runtime, padded, model=model)
+            views, runtime, padded, model=model,
+            lane=selected_lane(runtime.parallel, machine, replica, requested_rank))
         if valid:
             embedding = vector_op(
                 op_id="embedding", deps=(previous,), stage=0, layer=-1, requests=requests,
@@ -866,9 +973,11 @@ class Frontend:
                                    source_rows_by_replica=source_rows_by_replica,
                                    routing_global_tokens=routing_global_tokens,
                                    routing_views=eff_routing_views,
+                                   cohort_views_by_replica=cohort_views_by_replica,
                                    physical_rank=physical_rank,
                                    query_position=eff_query_pos,
-                                   include_recover_commits=(assembly == "service"),
+                                   include_recover_commits=(assembly == "service" or any(
+                                       view.draft_proposal_tokens for view in plan.requests)),
                                    machine=machine)
         ops.extend(body)
         if pcp_prefill:
@@ -910,7 +1019,7 @@ class Frontend:
         ops.append(replace(committed, family="token_commit"))
         if deferred_commits:
             intents = tuple(op for op in ops if is_recover_ssm_intent(op))
-            if intents and assembly == "model":
+            if intents and assembly == "model" and not proposal_count:
                 ops = list(_strip_recover_intents(ops))
             elif intents:
                 spec_views = tuple(
@@ -1396,6 +1505,9 @@ class Frontend:
                 moe_recipe=runtime.moe_recipe, mc2_chunks=runtime.mc2_chunks,
                 overlap_shared=bool(runtime.multistream_overlap_shared_expert),
                 runtime=runtime, sequence_plan=None,
+                ep_owner=(int(physical_rank) % int(p.ep)
+                          if physical_rank is not None and int(p.ep) > ZERO
+                          else None),
             )
             red_ops.extend(_scope(ffn_ops, "ffn"))
             post_f, cur_prev = residual.after(

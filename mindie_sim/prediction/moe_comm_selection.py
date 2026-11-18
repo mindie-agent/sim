@@ -46,6 +46,8 @@ CAPACITY_AND_WORLD_SIZE = "capacity_and_world_size"
 _MEGA_MOE_TOKENS_PER_RANK_LIMIT = 16384
 _DISPATCH_FFN_COMBINE_TOKENS_PER_RANK_LIMIT = 512
 _MC2_TOKENS_PER_RANK_LIMIT = 512
+NO_DRAFT_TOKENS = 0
+BASE_DECODE_QUERY_LEN = 1
 
 _ARCH_POLICY = {
     "A2": CAPACITY_AND_EXPERT_DENSITY,
@@ -281,7 +283,10 @@ class MoeCommConfig:
             policy = _ARCH_POLICY.get(arch, "")
         capture_sizes = _capture_sizes(getattr(features, "graph_buckets", ()))
         max_num_reqs = _positive_int(meta.get("max_num_seqs"), 0)
-        uniform = _positive_int(meta.get("uniform_decode_query_len"), 1) or 1
+        draft = _positive_int(meta.get("draft_proposal_tokens"), NO_DRAFT_TOKENS)
+        uniform = _positive_int(
+            meta.get("uniform_decode_query_len"),
+            BASE_DECODE_QUERY_LEN + draft) or BASE_DECODE_QUERY_LEN
         max_batched = _positive_int(meta.get("max_num_batched_tokens"), 0)
         enable_prefill = bool(int(additional.get("enable_prefill_mc2", 0) or 0))
         tp = max(1, int(getattr(features, "tp", 1) or 1))

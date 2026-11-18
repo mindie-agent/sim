@@ -109,6 +109,17 @@ def load_library(status: dict) -> ctypes.CDLL:
             return library
 
 
+def cached_library_ready() -> bool:
+    """True when the current kernel generation is already built on disk."""
+    try:
+        status = accel_build.build_accel(check_only=True)
+    except TimeoutError:
+        raise
+    except (OSError, RuntimeError):
+        return False
+    return bool(status.get("library_ready"))
+
+
 def load_accel_cdll(status: dict | None = None) -> tuple[dict, ctypes.CDLL]:
     """Build (unless supplied) and map under one cache lock.
 

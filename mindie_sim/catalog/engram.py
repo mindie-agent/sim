@@ -27,7 +27,7 @@ from __future__ import annotations
 from typing import Any, Sequence
 from dataclasses import replace
 
-from mindie_sim.catalog.ops import comm_op, gemm_op, vector_op
+from mindie_sim.catalog.ops import comm_op, compute_dtype_for, gemm_op, vector_op
 from mindie_sim.catalog.types import EngramSpec, QuantSpec
 from mindie_sim.schema.model import ModelSpec
 from mindie_sim.schema.operators import OpSpec
@@ -160,8 +160,9 @@ def lower_engram(
             n=(hc_mult + 1) * h, k=engram.columns_per_table * engram.width,
             quant=quant, category="engram_gate", phase=mode, family="gemm",
             semantic_family="engram_gate_projection",
-            metadata=(("table_id", table.table_id), ("runtime_dtype", "bf16"),
-                      ("source_dtype", "fp8_e4m3")),
+            metadata=(("table_id", table.table_id),
+                      ("runtime_dtype", compute_dtype_for(quant, "engram_gate")[0]),
+                      ("source_dtype", quant.source_format_for("engram_gate"))),
         )
         ops.append(gate)
         gate_ids.append(gate.op_id)

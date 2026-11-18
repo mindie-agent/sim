@@ -47,9 +47,12 @@ def projection_quant(quant: QuantSpec, plan) -> QuantSpec:
         if plan.attention == "mla":
             defaults["indexer_fp8"] = fields
     if plan.index_kpool > ONE and plan.attention != "gqa":
-        # KPool caches FP32 copies and casts hidden once before both F.linear
-        # calls. Query projection still uses its independent native format.
-        for category in ("indexer.weights", "indexer.pool_projection", "indexer.pool_gate"):
+        # The retained analytic fallback casts hidden once and keeps its own
+        # FP32 K/gate copies.  ``indexer.weights`` is deliberately *not* in
+        # this set: the checkpoint stores BF16 head weights and both the native
+        # CANN callers and the generic projection consume them directly, so a
+        # synthesised ``_prepared_fp32`` copy would be a fabricated parameter.
+        for category in ("indexer.pool_projection", "indexer.pool_gate"):
             defaults[category] = {"weight_format": "fp32", "activation_format": "fp32"}
     explicit = {key: dict(value) for key, value in quant.category_overrides}
     # Apply explicit ancestors after *all* source defaults: an explicit
@@ -64,6 +67,11 @@ def projection_quant(quant: QuantSpec, plan) -> QuantSpec:
     return replace(quant, category_overrides=merged) if merged else quant
 
 
+#: Routed MXFP4 experts keep the 32-element group regardless of the plain
+#: linear weight block (128 for V4, 32 for V4.1).
+MX_EXPERT_BLOCK = 32
+
+
 def _quant_deepseek(c: Mapping[str, Any], *, v41: bool) -> QuantSpec:
     q = c.get("quantization_config")
     q = q if isinstance(q, Mapping) else {}
@@ -75,15 +83,18 @@ def _quant_deepseek(c: Mapping[str, Any], *, v41: bool) -> QuantSpec:
         name="fp8_dynamic+mxfp4_experts" if v41 else "fp8_dynamic+mxfp4_experts",
         weight_format="fp8_e4m3", activation_format="fp8_e4m3",
         expert_weight_format="mxfp4",
-        weight_block=block, expert_block=32,
+        weight_block=block, expert_block=MX_EXPERT_BLOCK,
         scale_format="fp8_e8m0" if scale_bytes == 1 else "fp32",
         scale_bytes=scale_bytes, kv_dtype="bf16",
         activation_group_size=block[1],
         activation_scale_format="fp8_e8m0" if scale_bytes == 1 else "fp32",
         activation_scale_pack=2 if scale_bytes == 1 else 1,
         index_dtype="int8", index_scale_dtype="fp16",
-        exclusions=("router", "lm_head", "embedding", "norm", "mhc",
-                    "compressor", "vision", "projector", "engram_gate"),
+        # V4.1 executes the Engram gate as an MXFP8 (32, 32) projection; the
+        # earlier V4 checkpoint keeps it in the BF16 exclusion set.
+        exclusions=(("router", "lm_head", "embedding", "norm", "mhc",
+                     "compressor", "vision", "projector")
+                    + (() if v41 else ("engram_gate",))),
         source=merge_source({"quant_method": q.get("quant_method", "fp8"),
                              "weight_block_size": str(block),
                              "scale_fmt": scale_fmt,
@@ -303,13 +314,33 @@ QUANTIZATION_PRESETS: dict[str, Any] = {
 }
 
 
-def quant_preset(name: str) -> QuantSpec:
+def quant_preset(name: str, *, model=None) -> QuantSpec:
     """Resolve a case-declared quantization preset; unknown names are refused."""
     key = str(name or "").strip().lower()
     builder = QUANTIZATION_PRESETS.get(key)
     if builder is None:
         raise ValueError(f"quantization_preset_unknown:{name}")
-    return builder()
+    quant = builder()
+    if (builder is _quant_qwen_mxfp8 and model is not None
+            and dict(model.metadata).get("source_model_type") == "glm5_next_text"):
+        native = {"weight_format": "bf16", "activation_format": "bf16"}
+        quant = replace(
+            quant,
+            exclusions=("norm", "lm_head", "embedding", "vision", "projector",
+                        "router", "conv_weight_f32", "conv_weight_bf16"),
+            category_overrides={
+                "kda": native, "mla_absorb": native, "indexer": native,
+                "indexer_fp8": native, "dspark_input": native,
+                "mla": {"weight_format": "fp8_e4m3", "activation_format": "fp8_e4m3"},
+            },
+            source=merge_source({
+                "quant_method": "mxfp8",
+                "checkpoint": "Eco-Tech/GLM-5.3-Flash-w8a8-mxfp8",
+                "weight_block_size": "1x32", "scale_fmt": "ue8m0",
+            }),
+            notes=("MLA projections and body/MTP experts use MXFP8; "
+                   "KDA, absorbed MLA, indexer and MTP input stay FLOAT",))
+    return quant
 
 
 def _quant_bf16(c: Mapping[str, Any], *, name: str) -> QuantSpec:

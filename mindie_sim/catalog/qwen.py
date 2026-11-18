@@ -23,6 +23,7 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 from mindie_sim.catalog.config import _int, _require, flatten_config
+from mindie_sim.catalog.hf_config import declared_partial_rotary, rotary_dimensions
 from mindie_sim.catalog.types import AuxiliarySpec, DraftSpec, merge_source
 from mindie_sim.schema.model import LayerPlan
 from mindie_sim.schema.common import ModelingError, dtype_bytes
@@ -112,6 +113,8 @@ def _qwen_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
     # and normalize the selected expert weights, including omitted HF defaults.
     router_mode = str(c.get("scoring_func", "softmax"))
     router_norm_topk = bool(c.get("norm_topk_prob", True))
+    partial = declared_partial_rotary(c)
+    rope_dim, nope_dim = rotary_dimensions(head_dim, partial)
     plans: list[LayerPlan] = []
     for index, kind in enumerate(layer_types):
         if kind == "linear_attention":
@@ -158,6 +161,7 @@ def _qwen_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
                 # Qwen3NextAttention normalizes Q and K per head before RoPE;
                 # Qwen3.5 reuses this attention class for its full-attention layers.
                 qk_norm=True,
+                qk_rope_head_dim=rope_dim, qk_nope_head_dim=nope_dim,
                 q_output_gate=gate,
                 hyper_connections=hc_count > ZERO, hc_mult=hc_count, hc_lowrank=hc_lowrank,
                 indexer=indexer, indexer_type="full" if indexer else "none",
@@ -493,6 +497,8 @@ def _standard_qwen_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
     kinds, windows, _ = _standard_qwen_window(c, layers)
     qk_norm = family in {"qwen3", "qwen3_moe"}
     activation = str(c.get("hidden_act", "silu"))
+    partial = declared_partial_rotary(c)
+    rope_dim, nope_dim = rotary_dimensions(head_dim, partial)
     plans: list[LayerPlan] = []
     for index in range(layers):
         moe = _standard_qwen_layer_moe(index, ffn)
@@ -538,6 +544,7 @@ def _standard_qwen_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
                 num_kv_heads=kv_heads if projections_known else 0,
                 head_dim=head_dim if projections_known else 0,
                 qk_norm=False, window=0, cache_kind="none",
+                qk_rope_head_dim=rope_dim, qk_nope_head_dim=nope_dim,
                 ffn_activation=activation,
                 native_layer_id=index, scope="body", **ffn_fields,
             ))
@@ -548,6 +555,7 @@ def _standard_qwen_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
         plans.append(LayerPlan(
             index=index, attention="gqa", architecture="gqa",
             num_heads=heads, num_kv_heads=kv_heads, head_dim=head_dim,
+            qk_rope_head_dim=rope_dim, qk_nope_head_dim=nope_dim,
             qk_norm=qk_norm, window=windows[index],
             kv_cache_elements=2 * kv_heads * head_dim,
             kv_owner_layer_id=index, ffn_activation=activation,

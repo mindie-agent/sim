@@ -26,7 +26,9 @@ def test_dense_batch_union_matches_the_independent_oracle():
     assert plan.logical_query_bytes == pytest.approx(2 * (1000 * 128 + 16))
     scale = 2 * 16 * rows / (2 * 1000)
     assert plan.unique_hbm_bytes == pytest.approx(rows * 128 + scale)
-    assert plan.l2_to_core_bytes == pytest.approx(rows * 128 + scale)
+    # MTE2 remains each access's per-tile refill service; only the external
+    # HBM fill deduplicates the shared prefix.
+    assert plan.l2_to_core_bytes == pytest.approx(2 * (1000 * 128 + 16))
     assert plan.query_read_bytes == pytest.approx(2 * 128)
     assert plan.read_reuse_applied is True
     assert plan.unique_hbm_bytes < plan.logical_query_bytes

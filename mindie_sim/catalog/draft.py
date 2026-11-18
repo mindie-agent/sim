@@ -10,6 +10,8 @@ from mindie_sim.schema.model import ModelSpec
 from mindie_sim.catalog.types import DraftSpec
 from dataclasses import replace
 
+ZERO_EXPERTS = 0
+
 
 def draft_quant(model, draft):
     """Use the draft's declared representation in both work and residency."""
@@ -22,7 +24,8 @@ def draft_quant(model, draft):
     if not draft.weight_category:
         return quant
     fmt = quant.format_for(draft.weight_category)
-    return replace(quant, weight_format=fmt, expert_weight_format=fmt,
+    expert_fmt = quant.expert_weight_format if draft.num_experts > ZERO_EXPERTS else fmt
+    return replace(quant, weight_format=fmt, expert_weight_format=expert_fmt,
                    activation_format="bf16" if fmt == "bf16" else quant.activation_format)
 
 
@@ -33,7 +36,7 @@ def optional_draft_spec(model: ModelSpec, kind: str) -> DraftSpec:
     dspark_mode = kind in {"dspark", "verify", "draft_verify"}
     draft = aux.dspark if dspark_mode else aux.mtp
     if draft is None:
-        if dspark_mode and aux.mtp is not None and aux.mtp.kind == "mtp_dspark":
+        if dspark_mode and aux.mtp is not None and aux.mtp.kind in {"mtp_dspark", "dspark"}:
             draft = aux.mtp
         elif not dspark_mode and aux.dspark is not None:
             raise ModelingError("catalog_draft_mode_unavailable:mtp")

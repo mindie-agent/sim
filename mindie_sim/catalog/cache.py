@@ -42,6 +42,9 @@ from mindie_sim.schema.model import WorkloadSpec
 from mindie_sim.catalog.cache_format import cache_format
 
 
+from .mqsmla_layout import packed_row_parts
+
+
 def completed_rows(sequence_tokens: int, ratio: int) -> int:
     if ratio <= 0:
         return 0
@@ -235,14 +238,23 @@ def index_row_bytes(model: Any, index_dim: int) -> float:
     return float(index_dim) * index_element_bytes(model) + index_scale_bytes(model)
 
 
-def cache_row_split(model: Any, region: str, width: int) -> tuple[float, float]:
-    """Split one declared cache row into payload and quant scale bytes.
+def _mqsmla_mode_row_split(model, region, width):
+    parts = packed_row_parts(model, region, width)
+    if parts is not None:
+        data, scales, padding = parts
+        return float(data), float(scales + padding)
+    return None
 
-    Suffix elements are materialized data, not quantization metadata, so they
-    stay in the payload component.  The sum is exactly ``CacheFormat.row_bytes``
-    for the same declaration; no additional row or page rounding is applied
-    here (the caller's row count already carries allocator geometry).
+
+def cache_row_split(model: Any, region: str, width: int) -> tuple[float, float]:
+    """Return materialized data and allocated scale-plane bytes (including pad).
+
+    These two allocation columns exhaust the physical row. Typed operator
+    views obtain the numerical scales and alignment bytes from packed_row_parts.
     """
+    packed = _mqsmla_mode_row_split(model, region, width)
+    if packed is not None:
+        return packed
     fmt = cache_format(model, region)
     quantized = int(width) - int(fmt.suffix_elements)
     if quantized < 0:
@@ -257,6 +269,14 @@ def cache_row_split(model: Any, region: str, width: int) -> tuple[float, float]:
     if payload < 0.0:
         raise ModelingError("cache_row_split_negative_payload")
     return payload, float(scale)
+
+
+def packed_region_row_bytes(model: Any, region: str, width: int) -> int:
+    """Physical row width for ``region``, honoring arch35 MQSMLA Mode-1/2."""
+    packed = _mqsmla_mode_row_split(model, region, width)
+    if packed is not None:
+        return int(round(packed[0] + packed[1]))
+    return int(cache_format(model, region).row_bytes(int(width)))
 
 
 def cache_component_split(
@@ -415,12 +435,14 @@ def owned_block_rows(rows: int, block: int, cp: int, rank: int) -> int:
     return int(owned)
 
 
-def owned_token_rows(rows: int, owner_spans, rank: int) -> int | None:
+def owned_token_rows(rows: int, owner_spans, rank: int, *,
+                     start: int = 0) -> int | None:
     """Rows owned by ``rank`` from an explicit half-open token partition.
 
     ``owner_spans`` is the T05 placement fact: one ``(start, end)`` token row
     interval per physical rank.  The result is the intersection with the
-    component's valid row span, not ``rows / cp``.
+    component's valid row span, not ``rows / cp``.  ``start`` moves the valid
+    span to a live sliding-window tail instead of always beginning at zero.
     """
     if owner_spans is None:
         return None
@@ -429,9 +451,11 @@ def owned_token_rows(rows: int, owner_spans, rank: int) -> int | None:
     if not 0 <= rank < len(spans):
         raise ModelingError(f"cache_owner_rank_out_of_range:{rank}")
     rows = max(0, int(rows))
-    covered = sum(max(0, min(rows, hi) - min(rows, lo)) for lo, hi in spans)
+    begin = max(0, int(start))
+    end = begin + rows
+    covered = sum(max(0, min(end, hi) - max(begin, lo)) for lo, hi in spans)
     lo, hi = spans[rank]
-    owned = int(max(0, min(rows, hi) - min(rows, lo)))
+    owned = int(max(0, min(end, hi) - max(begin, lo)))
     if rows > covered and rank == len(spans) - 1:
         # A declared partition that does not cover the requested span still
         # has to account for the extra rows.  Charge them to the last owner
@@ -477,9 +501,11 @@ def layer_cache_components(model, plan, parallel, sequence_tokens, *, capacity_p
     seq = max(0, int(sequence_tokens))
     tp, cp = parallel.tp, parallel.cp
     result = {}
-    def local_rows(rows, block=interleave):
+    def local_rows(rows, block=interleave, *, start=0, ratio=ONE):
         if rank is not None:
-            owned = owned_token_rows(rows, owner_spans, rank)
+            spans = (tuple((lo // ratio, hi // ratio) for lo, hi in owner_spans)
+                     if owner_spans is not None and ratio > ONE else owner_spans)
+            owned = owned_token_rows(rows, spans, rank, start=start)
             if owned is not None:
                 return owned
             if capacity_padded:
@@ -506,22 +532,28 @@ def layer_cache_components(model, plan, parallel, sequence_tokens, *, capacity_p
     if plan.attention in {"gqa", "projection_only"}:
         if not ZERO <= plan.kv_owner_layer_id < plan.index:
             rows = min(seq, plan.window) if plan.window else seq
+            start = max(ZERO, seq - rows) if plan.window else ZERO
             width = TWO * local_kv_heads(plan.num_kv_heads, tp) * plan.head_dim
-            result["gqa_kv"] = local_rows(rows) * cache_format(
+            result["gqa_kv"] = local_rows(rows, start=start) * cache_format(
                 model, "gqa_kv").row_bytes(width)
     elif plan.attention != "mla":
         raise ModelingError(f"cache_attention_unknown:{plan.attention}")
     elif plan.cache_kind == "dense":
         rows = min(seq, plan.window) if plan.window else seq
-        result["mla_kv"] = local_rows(rows) * cache_format(model, "mla_kv").row_bytes(plan.cache_row_elements)
+        start = max(ZERO, seq - rows) if plan.window else ZERO
+        result["mla_kv"] = local_rows(rows, start=start) * cache_format(model, "mla_kv").row_bytes(plan.cache_row_elements)
     else:
         if plan.window:
-            result["window"] = local_rows(min(seq, plan.window)) * cache_format(
-                model, "window").row_bytes(plan.cache_row_elements)
+            rows = min(seq, plan.window)
+            result["window"] = local_rows(
+                rows, start=max(ZERO, seq - rows)) * packed_region_row_bytes(
+                model, "window", plan.cache_row_elements)
         if plan.owns_long_kv:
-            result["compressed_kv"] = local_rows(
-                completed_rows(seq, plan.compress_ratio), max(ONE, interleave // max(ONE, plan.compress_ratio))) \
-                * cache_format(model, "compressed_kv").row_bytes(plan.cache_row_elements)
+            ratio = max(ONE, plan.compress_ratio)
+            compressed = local_rows(completed_rows(seq, plan.compress_ratio),
+                                    max(ONE, interleave // ratio), ratio=ratio)
+            result["compressed_kv"] = compressed * packed_region_row_bytes(
+                model, "compressed_kv", plan.cache_row_elements)
             if plan.compressor_state_rows and seq:
                 rows = plan.compressor_state_rows if capacity_padded else min(seq, plan.compressor_state_rows)
                 result["compressor_state"] = rows * TWO * plan.compressor_width * plan.head_dim * FOUR
@@ -534,13 +566,17 @@ def layer_cache_components(model, plan, parallel, sequence_tokens, *, capacity_p
         rows = completed_rows(seq, index_ratio)
         from .paired_sfa import execution
         if execution(model).get("dcp_indexer_sharded") and cp > ONE:
-            rows = local_rows(rows, max(ONE, interleave // index_ratio))
+            rows = local_rows(rows, max(ONE, interleave // index_ratio), ratio=index_ratio)
         elif parallel.cp_plan == "dsa_cp":
             if rank is not None:
+                cp_rank = (int(rank) % max(ONE, int(cp))
+                           if owner_spans is not None else int(rank))
+                if not ZERO <= cp_rank < cp:
+                    raise ModelingError(f"cache_owner_rank_out_of_range:{rank}")
                 rows = (
-                    index_k_owned_block_rows(rows, cp, index_ratio)[int(rank)]
+                    index_k_owned_block_rows(rows, cp, index_ratio)[cp_rank]
                     if capacity_padded else
-                    index_k_ownership_rows(rows, cp, index_ratio)[int(rank)]
+                    index_k_ownership_rows(rows, cp, index_ratio)[cp_rank]
                 )
             else:
                 rows = index_k_capacity_rows(rows, cp, index_ratio) if capacity_padded else rows / cp
@@ -559,6 +595,42 @@ def layer_cache_components(model, plan, parallel, sequence_tokens, *, capacity_p
     return result
 
 
+def layer_stage_map(model: Any, parallel: ParallelSpec, runtime=None) -> tuple[int, ...]:
+    """Resolved physical PP stage for every declared layer.
+
+    The runtime's explicit ``pp_layer_partition`` is the execution authority.
+    The balanced contiguous default matches ``Memory`` when no partition was
+    declared, so catalog rows and capacity assign bytes to the same stage.
+    """
+    pp = max(ONE, int(parallel.pp))
+    layers = max(ONE, int(getattr(model, "layers", ZERO) or len(
+        getattr(model, "layer_plans", ()))))
+    partition = tuple(
+        int(value) for value in (getattr(runtime, "pp_layer_partition", ()) or ()))
+    if partition:
+        if len(partition) != pp or sum(partition) != layers:
+            raise ModelingError(
+                f"pp_partition_layers:{sum(partition)}!={layers}")
+        return tuple(
+            stage for stage, count in enumerate(partition) for _ in range(count))
+    if pp == ONE:
+        return (ZERO,) * layers
+    return tuple(min(pp - ONE, index * pp // layers)
+                 for index in range(layers))
+
+
+def uses_inherited_draft_cache(model: Any, draft_kind: str | None) -> bool:
+    """True when MTP draft KV/index/pool storage follows declared LayerPlans."""
+    if draft_kind != "mtp" or getattr(model, "auxiliary", None) is None:
+        return False
+    if dict(getattr(model, "metadata", ()) or ()).get("cache_allocator") == "paired_sfa":
+        return False
+    return any(
+        layer.window > ZERO or layer.compress_ratio > ZERO or layer.owns_index_k
+        for layer in getattr(model, "layer_plans", ())
+    )
+
+
 def stage_cache_components(
     model: Any, parallel: ParallelSpec, sequence_tokens: int,
     *, capacity_padded: bool = True, draft_kind: str | None = None,
@@ -566,9 +638,9 @@ def stage_cache_components(
 ) -> list[dict[str, float]]:
     pp = max(1, parallel.pp)
     stages = [dict() for _ in range(pp)]
-    per = max(1, model.layers // pp)
+    stage_map = layer_stage_map(model, parallel, runtime)
     for plan in model.layer_plans:
-        stage = min(pp - 1, plan.index // per) if pp > 1 else 0
+        stage = stage_map[plan.index] if plan.index < len(stage_map) else pp - 1
         for key, value in layer_cache_components(
             model, plan, parallel, sequence_tokens,
             capacity_padded=capacity_padded, interleave=interleave,
@@ -576,15 +648,29 @@ def stage_cache_components(
         ).items():
             stages[stage][key] = stages[stage].get(key, 0.0) + value
     if draft_kind and getattr(model, "auxiliary", None) is not None:
-        from mindie_sim.catalog.draft import optional_draft_spec
-        draft = optional_draft_spec(model, draft_kind)
-        row = ((draft.kv_cache_elements or draft.kv_lora_rank + draft.qk_rope_head_dim)
-               if draft.attention_kind == "mla"
-               else 2 * local_kv_heads(draft.num_kv_heads, parallel.tp) * draft.head_dim)
-        seq = block_round(max(0, int(sequence_tokens)), interleave) if capacity_padded else max(0, int(sequence_tokens))
-        stages[-1]["draft_kv"] = stages[-1].get("draft_kv", 0.0) + float(
-            seq * row * kv_element_bytes(model) * draft.layers
-        )
+        if uses_inherited_draft_cache(model, draft_kind):
+            from mindie_sim.catalog.cache_ownership import draft_cache_components
+            draft_values = draft_cache_components(
+                model, parallel, draft_kind=draft_kind,
+                sequence_tokens=sequence_tokens, capacity_padded=capacity_padded,
+                runtime=runtime, query_tokens=query_tokens, phase=phase,
+            )
+            stages[-ONE]["draft_kv"] = stages[-ONE].get("draft_kv", 0.0) + float(
+                draft_values["draft_kv"])
+            if draft_values.get("draft_state", 0.0) > 0.0:
+                stages[-ONE]["draft_state"] = stages[-ONE].get(
+                    "draft_state", 0.0) + float(draft_values["draft_state"])
+        else:
+            from mindie_sim.catalog.draft import optional_draft_spec
+            draft = optional_draft_spec(model, draft_kind)
+            from mindie_sim.catalog.paired_sfa import draft_row
+            row_bytes = draft_row(model, draft, tp=parallel.tp)
+            seq = max(ZERO, int(sequence_tokens))
+            seq = (_context_shard_blocks(seq, interleave, parallel.cp) if capacity_padded
+                   else seq / parallel.cp)
+            stages[-ONE]["draft_kv"] = stages[-ONE].get("draft_kv", ZERO) + float(
+                seq * row_bytes * draft.layers
+            )
     return stages
 
 
@@ -682,7 +768,7 @@ __all__ = [
     "local_kv_heads",
     "index_selection_cost", "attention_rows", "cache_row_split",
     "cache_component_split", "layer_cache_components",
-    "layer_cache_decomposition", "stage_cache_components",
+    "layer_cache_decomposition", "layer_stage_map", "stage_cache_components",
     "request_cache_breakdown",
     "state_bytes_per_request_per_rank", "cache_bytes_per_token_estimate",
     "peak_live_tokens", "live_request_cache_peak",

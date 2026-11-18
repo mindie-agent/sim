@@ -106,6 +106,11 @@ def test_compressor_precision_override_preserves_source_bytes_and_valid_row_work
 
 def test_indexer_layernorm_and_quantized_external_producers_keep_distinct_semantics():
     glm = _case("glm53-a3-w4a8")
+    # This test pins the retained eager FP32 LayerNorm decomposition.  Declare
+    # that no optional CANN 9.2.1 fusion owns the boundary.
+    metadata = dict(glm.runtime.metadata)
+    metadata["execution_policy"] = {"automatic_optional_fusions": False}
+    glm = replace(glm, runtime=replace(glm.runtime, metadata=tuple(metadata.items())))
     ops = target_operators(glm, phase="prefill", tokens=32)
     normalizations = [op for op in ops if op.recipe == "index_norm"]
     assert normalizations
@@ -133,7 +138,8 @@ def test_indexer_layernorm_and_quantized_external_producers_keep_distinct_semant
     assert query["operator"]["metadata"]["output_format"] == "int8"
     assert query["operator"]["metadata"]["scale_format"] == "fp16"
     assert query["node_id"] not in group["node_ids"]
-    assert {nodes[key]["family"] for key in group["node_ids"]} == {"indexer", "topk"}
+    # The fused native indexer is one node for score and TopK.
+    assert {nodes[key]["family"] for key in group["node_ids"]} == {"indexer"}
 
 
 def test_hyper_pre_includes_source_normalization_work():
@@ -182,7 +188,22 @@ def test_kda_decode_source_is_explicit(in_kernel_gates, profiler_api):
         baseline = _report(case, phase="decode", tokens=1, context=32768)
         baseline_groups = [g for g in baseline["subgraphs"] if g["role"] == "kda_recurrent"]
         baseline_nodes = {node["node_id"]: node for node in baseline["nodes"]}
-        assert observed and baseline_groups and all(g["contract"] in observed for g in baseline_groups)
+        # The retained capture predates the in-kernel ``SIGMOID_BETA`` boundary:
+        # its beta operand is the FP32 output of the external sigmoid, while the
+        # A5 source now declares the raw activation-dtype beta.  Compare the
+        # remaining active descriptors and keep the captured boundary explicit.
+        assert all(contract[2][1][1] == "fp32" for contract in observed)
+
+        def with_beta(contract, dtype):
+            active = contract[2]
+            return (contract[0], contract[1],
+                    (active[0], (active[1][0], dtype, active[1][2]), *active[2:]),
+                    *contract[3:])
+
+        observed_kinds = {json.dumps(with_beta(contract, "bf16")) for contract in observed}
+        assert observed and baseline_groups and all(
+            json.dumps(with_beta(g["contract"], "bf16")) in observed_kinds
+            for g in baseline_groups)
         for group in baseline_groups:
             members = [baseline_nodes[key] for key in group["node_ids"]]
             assert all(node["recipe"] not in {"qk_l2norm", "delta_gates"} for node in members)

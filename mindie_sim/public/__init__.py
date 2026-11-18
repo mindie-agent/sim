@@ -31,6 +31,10 @@ from .errors import GAP_SCHEMA, CapabilityGap, ExtensionError
 from .profiles import (
     PROFILE_SCHEMA, USER_PROFILE_SCHEMA, UserProfile, load_user_profile,
 )
+from mindie_sim.subgraph_math import (
+    SubgraphEfficiencyReport, SubgraphMathSummary, compute_subgraph_math_summaries,
+    evaluate_subgraph_efficiency,
+)
 
 __all__ = [
     "CAPABILITIES", "CORE_PROVIDER", "ENTRY_POINT_GROUP", "INTERFACE_VERSION",
@@ -41,4 +45,6 @@ __all__ = [
     "ExtensionError", "CapabilityGap", "load_extensions", "load_user_profile",
     "simulate_operator", "simulate_native_call", "simulate_aclnn_call",
     "simulate_graph", "simulate_model", "simulate_service",
+    "SubgraphEfficiencyReport", "SubgraphMathSummary",
+    "compute_subgraph_math_summaries", "evaluate_subgraph_efficiency",
 ]

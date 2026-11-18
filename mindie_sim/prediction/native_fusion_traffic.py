@@ -192,18 +192,25 @@ def apply_traffic_profile(ops, declaration, profile, *, external_outputs=()):
         ])
         return tuple(phases), ledger
     if role == "mla_prolog":
-        norm, rotary, store = recipe("kv_norm"), recipe("rotary"), recipe("kv_store")
+        norm, store = recipe("kv_norm"), recipe("kv_store")
+        rotary = next((op for op in phases if op.recipe == "rotary"), None)
         latent, rope = view["latent_rank"], view["rope_width"]
         latent_bytes = store.mte2_bytes * latent / (latent + rope)
         rope_bytes = store.mte2_bytes - latent_bytes
         remove(norm, store, latent_bytes)
-        remove(rotary, store, rope_bytes)
+        if rotary is not None:
+            remove(rotary, store, rope_bytes)
         ledger["source"] = _MLA_SOURCE
         ledger["limitations"].extend([
             "source_arch35_selection_does_not_identify_capture_implementation",
             "query_projection_norm_and_quantization_workspaces_retained",
             "cache_writes_and_external_query_rope_outputs_retained",
         ])
+        if rotary is None:
+            # A declared NoPE layer has no rotary member; the learned tail is
+            # read directly from the fused projection output.
+            ledger["limitations"].append(
+                "no_rope_declaration_reads_projection_tail_without_rotary_member")
     elif role == "hc_pre":
         affine, sinkhorn, mix = (
             recipe(name) for name in ("hc_normalize_scale_bias_gate", "hc_sinkhorn", "hc_pre_mix"))

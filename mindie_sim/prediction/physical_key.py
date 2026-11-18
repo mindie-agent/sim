@@ -20,8 +20,11 @@
     inequality of references, aliasing and ownership relationships therefore
     survive the normalization.
   * Layer-indexed state references (``kda.layer[L]`` / ``gdn.layer[L]``) and the
-    integer ``stage``/``layer`` leaves of ``state_accesses`` are relative to the
-    operator that owns them, for the same injective reason.
+    integer ``stage``/``layer`` leaves of ``state_accesses`` and
+    ``fused_origin_scopes`` are relative to the
+    operator that owns them, for the same injective reason.  ``context_kv<L>``
+    alias planes use their own declared rule instead of widening the
+    occurrence pattern's capture groups.
   * Unknown metadata is retained unchanged.  An unrecognized identity-bearing
     field can only prevent deduplication; it can never cause a false merge.
   * No regular expression is applied to a serialized JSON document; the rewrite
@@ -46,7 +49,7 @@ from typing import Any
 
 
 #: Version tag of the physical identity projection.
-IDENTITY_VERSION = "physical-key/3"
+IDENTITY_VERSION = "physical-key/4"
 
 #: Fields excluded from physical identity.  They name one occurrence, not work.
 OCCURRENCE_FIELDS = frozenset({
@@ -59,25 +62,36 @@ REFERENCE_KEYS = frozenset({
     "activation_payload_producer",
     "activation_residual_inputs",
     "activation_residual_outputs",
+    "audit_trail",
     "binding_name",
     "collective_id",
     "device_kernel_group",
+    "fused_members",
     "fused_origin_scopes",
+    "fusion_boundary",
+    "fusion_external_outputs",
     "fusion_group_key",
     "fusion_semantic_ids",
     "gdn_state_contract",
     "gdn_state_effects",
     "input_conversion_subgraphs",
+    "input_ports",
     "inverse_index_producer",
+    "kda_recurrent_params",
+    "recover_ssm_geometry",
+    "prefix_cache_reads",
     "kda_state_contract",
     "kda_state_effects",
     "memory_accesses",
+    "moe_init_routing",
     "packed_parent",
     "payload_producer",
+    "quantizer_op",
     "receive_allocation",
     "reverse_of_collective",
     "storage",
     "synchronization_boundary",
+    "typed_outputs",
 })
 
 #: Prefix families that describe occurrence ownership or state effects.
@@ -94,11 +108,26 @@ STATE_ACCESS_KEY = "state_accesses"
 STATE_STAGE_FIELD = "stage"
 STATE_LAYER_FIELD = "layer"
 
-_STAGE_GROUP = 1
-_LAYER_GROUP = 2
+#: Reference mappings store absolute non-negative layer/stage anchors (for
+#: example ``fused_origin_scopes`` as ``("layer", 15)``).  They are made
+#: relative to the owning occurrence so corresponding operators in different
+#: layers compare equal instead of producing one recipe per layer.
+NONNEGATIVE_ANCHOR_FLOOR = 0
+
+_STAGE_GROUP = 2
+_LAYER_GROUP = 3
 _LAYER_REFERENCE_GROUP = 2
-_OCCURRENCE = re.compile(r"(?<![\w.])s(\d+)\.l(\d+)\.")
+_STATE_FAMILY_GROUP = 1
+_CONTEXT_KV_GROUP = 2
+_OCCURRENCE = re.compile(
+    r"(?<![\w.])(?P<draft>draft(?:\d+|_prefill)\.)?s(\d+)\.l(\d+)(?=\.|$)")
 _LAYER_REFERENCE = re.compile(r"(?<![\w.])(kda|gdn)\.layer\[(\d+)\]")
+#: Draft/shared context-KV plane names carry the layer whose cache they alias.
+#: They are occurrence-relative like ``s<stage>.l<layer>`` but their ordinal is
+#: a bare ``context_kv<layer>`` token, so they need their own rewriting rule
+#: (``_OCCURRENCE``'s capture groups stay untouched).
+_CONTEXT_KV_OCCURRENCE = re.compile(
+    r"(?<![\w])(?P<draft>draft(?:\d+|_prefill)\.)?context_kv(\d+)(?=\.|$)")
 
 #: Identity field order.  A stable declaration, not a per-call inspection.
 IDENTITY_FIELDS = (
@@ -123,16 +152,33 @@ def is_reference_key(key: str) -> bool:
 def normalize_reference(value: str, stage: int, layer: int) -> str:
     """Rename occurrence prefixes relative to one anchor, preserving offsets."""
     def _rename(match: "re.Match[str]") -> str:
-        return (f"s{int(match.group(_STAGE_GROUP)) - int(stage)}"
-                f".l{int(match.group(_LAYER_GROUP)) - int(layer)}.")
+        return (f"{match.group('draft') or ''}s{int(match.group(_STAGE_GROUP)) - int(stage)}"
+                f".l{int(match.group(_LAYER_GROUP)) - int(layer)}")
 
     def _layer(match: "re.Match[str]") -> str:
-        family = match.group(_STAGE_GROUP)
+        family = match.group(_STATE_FAMILY_GROUP)
         return (f"{family}.layer["
                 f"{int(match.group(_LAYER_REFERENCE_GROUP)) - int(layer)}]")
 
+    def _context_kv(match: "re.Match[str]") -> str:
+        return (f"{match.group('draft') or ''}context_kv"
+                f"{int(match.group(_CONTEXT_KV_GROUP)) - int(layer)}")
+
     renamed = _OCCURRENCE.sub(_rename, value)
-    return _LAYER_REFERENCE.sub(_layer, renamed)
+    renamed = _LAYER_REFERENCE.sub(_layer, renamed)
+    return _CONTEXT_KV_OCCURRENCE.sub(_context_kv, renamed)
+
+
+def _normalize_mapping_entry(key: Any, item: Any, stage: int,
+                             layer: int) -> tuple[str, Any]:
+    """One mapping leaf: relative anchor for stage/layer ordinals."""
+    name = str(key)
+    if type(item) is int and item >= NONNEGATIVE_ANCHOR_FLOOR:
+        if name == STATE_STAGE_FIELD:
+            return name, int(item) - int(stage)
+        if name in {STATE_LAYER_FIELD, "layer_index"}:
+            return name, int(item) - int(layer)
+    return name, normalize_graph_value(item, stage, layer)
 
 
 def normalize_graph_value(value: Any, stage: int, layer: int) -> Any:
@@ -141,7 +187,7 @@ def normalize_graph_value(value: Any, stage: int, layer: int) -> Any:
         return normalize_reference(value, stage, layer)
     if isinstance(value, Mapping):
         return tuple(sorted(
-            ((str(key), normalize_graph_value(item, stage, layer))
+            (_normalize_mapping_entry(key, item, stage, layer)
              for key, item in value.items()),
             key=lambda item: item[0]))
     if isinstance(value, (list, tuple)):
@@ -181,7 +227,7 @@ def _normalized_metadata(metadata: Any, stage: int, layer: int) -> tuple:
         name = str(key)
         if name in PAIRING_ONLY_KEYS:
             continue
-        if name == STATE_ACCESS_KEY:
+        if name in {STATE_ACCESS_KEY, "fused_origin_scopes"}:
             normalized.append((name, _relative_state_accesses(value, stage, layer)))
         elif is_reference_key(name):
             normalized.append((name, normalize_graph_value(value, stage, layer)))

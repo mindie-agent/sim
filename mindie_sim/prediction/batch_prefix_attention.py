@@ -42,6 +42,80 @@ STORE_ROLES = ("mte3",)
 VECTOR_ROLES = ("vector",)
 
 
+@dataclass(frozen=True)
+class SparsePrefixFill:
+    """Cold external fill bytes of a declared sparse shared-prefix selection.
+
+    ``selected`` is one query row's selected key count.  A shared prefix key
+    denotes one immutable physical region, so every request's shared selection
+    collapses onto the union bounded by the region itself, while each request
+    keeps its own private selected rows.  The result is the external HBM volume;
+    the remaining gathers are L2 hits and stay on the core copy pipes.
+    """
+
+    shared_selected: int
+    shared_unique: int
+    private_rows: int
+    external_rows: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "shared_selected_per_row": self.shared_selected,
+            "shared_unique_rows": self.shared_unique,
+            "private_rows": self.private_rows,
+            "external_rows": self.external_rows,
+        }
+
+
+def nested_prefix_union(extent_counts):
+    """Largest distinct subset of nested [0, extent) pools with given draws."""
+    used = 0
+    for extent, count in sorted(extent_counts):
+        used = min(extent, used + count)
+    return used
+
+
+def selected_prefix_count(selected, extent, visible, population):
+    if not selected or not extent:
+        return 0
+    if selected == visible:
+        return extent
+    estimated = (selected * extent + population // 2) // max(1, population)
+    return max(selected - (visible - extent), min(estimated, selected, extent))
+
+
+def prefix_members(shape, sequences):
+    """Named immutable prefixes shared by at least two live requests."""
+    from collections import Counter
+    raw = shape.get("prefix_tokens") or 0
+    extents = raw if isinstance(raw, (list, tuple)) else (raw,) * len(sequences)
+    names = shape.get("prefix_cache_keys")
+    shared = shape.get("prefix_cache_mode") == "shared"
+    members = []
+    for i, (query, context) in enumerate(sequences):
+        extent = min(context, max(0, int(extents[i]))) if query and shared else 0
+        key = (str(names[i] or "") if names and i < len(names) else
+               "" if names else "__implicit__")
+        members.append((key, extent))
+    counts = Counter(key for key, extent in members if key and extent)
+    return tuple((key, extent if counts[key] > 1 else 0) for key, extent in members)
+
+
+def sparse_prefix_fill(*, rows: int, requests: int, selected: int,
+                       prefix_tokens: int, context: int) -> SparsePrefixFill:
+    """Bound the first-touch external rows of a sparse shared-prefix batch."""
+    if min(rows, requests, selected) < 0 or context <= 0 or prefix_tokens < 0:
+        raise ModelingError("sparse_prefix_fill_requires_declared_geometry")
+    if requests > rows:
+        raise ModelingError("sparse_prefix_fill_requests_exceed_query_rows")
+    shared = min(prefix_tokens, context)
+    shared_selected = selected_prefix_count(selected, shared, context, context)
+    shared_unique = nested_prefix_union(((shared, requests * shared_selected),))
+    private_rows = requests * (selected - shared_selected)
+    return SparsePrefixFill(shared_selected, shared_unique, private_rows,
+                            shared_unique + private_rows)
+
+
 def _matches_role(key: str, roles: tuple[str, ...], mapped: set[str]) -> bool:
     return key in mapped or any(key == role or key.startswith(role + "@") for role in roles)
 
@@ -191,6 +265,8 @@ def apply_attention_prefix_reads(
     kv_hbm_bytes: float | None = None,
     kv_mte2_bytes: float | None = None,
     unique_prefix_rows_by_view: Sequence[int] | None = None,
+    unique_rows_by_view: Sequence[int] | None = None,
+    shared_intervals_by_view: Sequence[tuple[tuple[int, int], ...]] | None = None,
 ) -> Any:
     """Replace the precharged KV components with their physical union."""
     if runtime is None or getattr(runtime, "prefix_cache_mode", "private") != "shared":
@@ -198,6 +274,15 @@ def apply_attention_prefix_reads(
     prefix_caps = (
         tuple(int(value) for value in unique_prefix_rows_by_view)
         if unique_prefix_rows_by_view is not None else None
+    )
+    unique_caps = (
+        tuple(int(value) for value in unique_rows_by_view)
+        if unique_rows_by_view is not None else None
+    )
+    interval_caps = (
+        tuple(tuple((int(lo), int(hi)) for lo, hi in item)
+              for item in shared_intervals_by_view)
+        if shared_intervals_by_view is not None else None
     )
     accesses = []
     for idx, (view, sweeps, shared) in enumerate(
@@ -228,6 +313,8 @@ def apply_attention_prefix_reads(
             layer=int(layer_index),
             component="kv",
             logical_rows=int(sweeps),
+            unique_rows=0 if unique_caps is None else max(0, unique_caps[idx]),
+            shared_intervals=() if interval_caps is None else interval_caps[idx],
         ))
     read_mode = str(getattr(runtime, "prefix_read_mode", "auto") or "auto")
     plan = plan_prefix_reads(accesses, mode=read_mode, kernel_reuse=kernel_reuse)
@@ -250,3 +337,51 @@ def annotate_sparse_prefix_unknown(op: Any, runtime: Any) -> Any:
     })
     return replace(
         op, metadata=tuple(sorted(metadata.items(), key=lambda pair: pair[0])))
+
+
+def apply_sparse_prefix_reads(op, *, views, row_bytes, runtime, hierarchy,
+                              kv_hbm_bytes, kv_mte2_bytes):
+    """Bound unknown selections by their physical shared/private KV union."""
+    runtime_meta = dict(getattr(runtime, "metadata", ()) or ())
+    raw_eager = bool(runtime_meta.get("raw_eager")
+                     or runtime_meta.get("execution_policy", {}).get("raw_eager"))
+    if (getattr(runtime, "prefix_cache_mode", "private") != "shared"
+            or getattr(runtime, "prefix_read_mode", "auto") == "per_sequence"
+            or raw_eager):
+        return annotate_sparse_prefix_unknown(op, runtime)
+    shared, private = {}, 0
+    for view in views:
+        if view.q_len <= 0 or view.padding:
+            continue
+        prefix = min(max(0, int(view.prefix_tokens)), int(view.context))
+        key = canonical_prefix_cache_key("shared", view.prefix_cache_key)
+        shared[key] = max(shared.get(key, 0), prefix)
+        private += max(0, int(view.kv_len) - prefix)
+    # With no row IDs the complete candidate plane is a conservative union
+    # bound. Never assume each query selects the same TopK rows.
+    working_set = min(float(kv_mte2_bytes),
+                      (sum(shared.values()) + private) * row_bytes)
+    retained = min(working_set, float(hierarchy.effective_l2_bytes))
+    spill = (max(0.0, 1.0 - retained / working_set)
+             if working_set else 0.0)
+    external = min(float(kv_hbm_bytes), working_set
+                   + max(0.0, kv_mte2_bytes - working_set) * spill)
+    metadata = dict(op.metadata)
+    metadata.update(
+        sparse_selection_unknown=True,
+        prefix_read_reuse_applied=external < kv_hbm_bytes,
+        prefix_read_reason="shared_sparse_candidate_working_set_with_l2_spill",
+        prefix_read_hbm_bytes=external,
+        prefix_read_l2_core_bytes=float(kv_mte2_bytes),
+        prefix_cache_reads={"working_set_bytes": working_set,
+                            "l2_capacity_bytes": float(hierarchy.effective_l2_bytes),
+                            "spill_fraction": spill})
+    traffic = dict(metadata.get("attention_traffic_plan", {}))
+    if traffic:
+        traffic.update(hbm_read_bytes=external,
+                       l2_hit_bytes=max(0.0, kv_mte2_bytes - external),
+                       working_set_bytes=working_set,
+                       residency_basis=metadata["prefix_read_reason"])
+        metadata["attention_traffic_plan"] = traffic
+    return replace(op, hbm_bytes=op.hbm_bytes - kv_hbm_bytes + external,
+                   metadata=tuple(metadata.items()))

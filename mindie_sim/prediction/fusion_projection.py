@@ -46,8 +46,9 @@ _WEIGHT_FAMILIES = frozenset({"gemm", "gate_up_projection", "down_projection",
                               "shared_expert", "grouped_gemm", "attention",
                               "native_fusion"})
 _STATE_FAMILIES = frozenset({"recurrent_vector", "short_convolution",
-                             "cache_store", "state_update", "kda_recurrent",
-                             "gdn_decode", "recurrent_scan"})
+                             "cache_store", "kv_compress_epilog",
+                             "indexer_quant_cache", "state_update",
+                             "kda_recurrent", "gdn_decode", "recurrent_scan"})
 
 
 def _metadata(op: OpSpec) -> dict:

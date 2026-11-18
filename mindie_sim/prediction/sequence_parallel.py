@@ -295,7 +295,7 @@ def kimi_sequence_parallel(metadata: Mapping | None, tp: int) -> bool:
             and int(tp) > 1)
 
 
-def select(runtime, model, views, *, tokens, global_tokens=None):
+def select(runtime, model, views, *, tokens, global_tokens=None, rank_ledger=None):
     """Return the immutable plan, or ``None`` when no declaration is present.
 
     ``none`` retains the divisible-input contract. ``right_to_tp`` pads the
@@ -336,7 +336,9 @@ def select(runtime, model, views, *, tokens, global_tokens=None):
         raise ModelingError(
             f"sequence_parallel_requires_tokens_divisible_by_tp:{tokens}%{tp}")
     local = tokens // tp
-    if ep > tp:
+    if rank_ledger is not None:
+        cohort = rank_ledger.physical
+    elif ep > tp:
         if global_tokens is None:
             if padding == "right_to_tp" and dp == 1:
                 pcp_in_ep = min(pcp, max(1, ep // tp)) if getattr(parallel, "ep_spans_pcp", False) else 1

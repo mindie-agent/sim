@@ -55,8 +55,10 @@ def test_resolve_hardware_sku_aliases_and_errors() -> None:
     assert resolve_hardware_sku("a5-pod-pr") == "Ascend950PR_9579"
     assert resolve_hardware_sku("Ascend950DT_9582") == "Ascend950DT_9582"
     assert set(HARDWARE_ALIASES).issuperset({"a2", "a3", "a5", "910b4", "910_9392"})
-    with pytest.raises(ModelingError, match="unknown_hardware_sku"):
-        resolve_hardware_sku("910_9599")
+    # Raw runtime/plog chip tokens resolve to the same A5 package (P1-03).
+    assert resolve_hardware_sku("910_9599") == "Ascend950DT_9582"
+    assert resolve_hardware_sku("950pr_a5") == "Ascend950PR_9579"
+    assert resolve_hardware_sku("910_9599") in {"Ascend950DT_9582"}
 
     with pytest.raises(ModelingError, match="unknown_hardware_sku"):
         resolve_hardware_sku("unknown_gpu_999")
@@ -266,7 +268,9 @@ def test_cli_compose_efficiency_and_sla_end_to_end(tmp_path: Path) -> None:
     assert rc_sla_default == 0
     sla_default = json.loads(sla_default_path.read_text(encoding="utf-8"))
     assert sla_default["schema"] == "mindie-sim.hardware-sla/1"
-    assert len(sla_default["scenarios"]) >= 4
+    # The CLI default is one fast counterfactual; full sensitivity is explicit.
+    assert sla_default["sensitivity"] == "baseline"
+    assert len(sla_default["scenarios"]) == 1
     assert sla_default["scenarios"][0].get("scenario_id", sla_default["scenarios"][0].get("id")) == "baseline"
 
     rc_sla_scaled = main([
@@ -316,8 +320,8 @@ def test_a5_dt_glm53_moe_dispatch_combine_modeling() -> None:
     for hw, exp_disp_ideal_us, exp_comb_ideal_us, exp_disp_us, exp_comb_us in (
         # Ideal link time uses the declared usable capacity (nameplate peak x
         # declared utilization), not the raw provider peak.
-        ("a5-pod-dt", 0.1327764705882353, 0.2575058823529412,
-         94.63277647058824, 94.75750588235295),
+        ("a5-pod-dt", 8.364917647058823, 16.222870588235295,
+         9.864917647058826, 17.7228705882353),
         # M2 R1 allocates each directed link/pipe independently; the server
         # tier's asymmetric per-port resources no longer average into one
         # category share, so the serialized-hop service is re-anchored.
@@ -385,7 +389,11 @@ def test_va_recommended_compose_and_apply_helper() -> None:
     assert kimi_case["runtime"]["metadata"]["sp"] is True
     assert "sequence_parallel" in kimi_case["runtime"]["kernels"]
     kimi_low = kimi_case["runtime"]["kernels"]["lowerings"]
-    assert kimi_low["kda"]["cases"][0]["binding"] == "vllm_ascend_recurrent_kda_arch35"
+    kda_binding = kimi_low["kda"]["cases"][0]["binding"]
+    assert kda_binding["implementation"] == "vllm_ascend_recurrent_kda_arch35"
+    # In-kernel SIGMOID_BETA keeps the raw gate and beta in the activation dtype.
+    assert kda_binding["options"]["use_beta_sigmoid"] is True
+    assert kda_binding["options"]["beta_dtype"] == "bf16"
     assert kimi_low.get("attention_residual") == "vllm_ascend_attn_res_prefix"
     assert target_graphs(kimi_case, phase="decode", tokens=1, context=1024, sequences=4)[0]
 
@@ -419,7 +427,9 @@ def _assert_expert_exchange_links(ops, ep):
     assert exchanges
     for op in exchanges:
         metadata = dict(op.metadata)
-        assert metadata["steps"] == ep - 1
+        # Collective rounds are owned by the startup-wave plan, not a per-op
+        # ``steps`` multiplier on the payload.
+        assert "steps" not in metadata
         expected = (op.local_shape[0] * (ep - 1) / ep * metadata["row_bytes"]
                     / metadata["source_assignment_partitions"])
         assert op.link_bytes == pytest.approx(expected, rel=1e-12)
@@ -542,12 +552,18 @@ def test_feature_superposition_pp_pcp_mc2_dspark_mtp_sp() -> None:
     tp53 = parallel53["tp"]
     sp_norm = [op for op in ops_sp if op.layer == 0 and op.recipe == "rmsnorm"
                and "norm1" in op.op_id][0]
-    no_norm = [op for op in ops_no if op.layer == 0 and op.recipe == "rmsnorm"
-               and "norm1" in op.op_id][0]
+    sp_norm_quant = [op for op in ops_sp if op.layer == 0
+                     and op.recipe == "dynamic_quantize"
+                     and "q_a.quantize" in op.op_id][0]
+    # The non-SP plan fuses norm1 with the q_a activation quantization into
+    # one ``rmsnorm_quant``; SP keeps them separate on TP-sharded rows.
+    no_norm = [op for op in ops_no if op.layer == 0
+               and op.recipe == "rmsnorm_quantize"][0]
     sp_residual = [op for op in ops_sp if op.recipe == "residual_add"][0]
     no_residual = [op for op in ops_no if op.recipe == "residual_add"][0]
     assert sp_norm.local_shape[0] * tp53 == no_norm.local_shape[0]
-    assert sp_norm.vector_ops * tp53 == pytest.approx(no_norm.vector_ops, rel=1e-12)
+    assert (sp_norm.vector_ops * tp53 + sp_norm_quant.vector_ops
+            == pytest.approx(no_norm.vector_ops, rel=1e-12))
     assert sp_residual.vector_ops * tp53 == pytest.approx(no_residual.vector_ops,
                                                           rel=1e-12)
     for layer in range(4):

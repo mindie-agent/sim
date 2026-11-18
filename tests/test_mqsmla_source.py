@@ -12,7 +12,8 @@ from mindie_sim.prediction.family_mqsmla import FORMATS, RECIPE
 from mindie_sim.prediction.capacity import Memory
 from mindie_sim.prediction.mechanism import Geometry
 from mindie_sim.prediction.mqsmla import (
-    BUFFERS, OwnerTiles, build, owner_ranges, query_rows, tile_phases,
+    BUFFERS, LEGACY_RECIPE, OwnerTiles, build, owner_ranges, query_rows,
+    tile_phases,
 )
 from mindie_sim.prediction.operator_analysis import operator_costs, target_graphs
 from mindie_sim.prediction.structure import parse_case
@@ -143,10 +144,17 @@ def test_source_capacity_does_not_resize_hardware(ordinary):
     geometry = Geometry.from_devices(model.machine.dies)
     with pytest.raises(ModelingError, match="source_buffer_capacity_or_ownership:ub"):
         build(op, replace(geometry, buffers={**geometry.buffers, "ub": BUFFERS["ub"] - 1}))
-    shape = {**dict(op.metadata)["mqsmla_geometry"], "sequences": ((1, 2048),) * 72}
-    special = replace(op, metadata=tuple({**dict(op.metadata), "mqsmla_geometry": shape}.items()))
+    # 72 rows no longer select a split-reduction geometry: ``SELECTIVE_FD_72``
+    # belongs to the retired ``cannbot-dsl`` wrapper, so the official CANN
+    # program accepts the same rows while the explicit legacy alias refuses.
+    shape = {**dict(op.metadata)["mqsmla_geometry"], "sequences": ((1, 2048),) * 72,
+             "implementation": LEGACY_RECIPE}
+    old = replace(op, metadata=tuple({**dict(op.metadata), "mqsmla_geometry": shape}.items()))
     with pytest.raises(ModelingError, match="selective_72_row_fd_branch"):
-        build(special, geometry)
+        build(old, geometry)
+    official = replace(op, metadata=tuple({**dict(op.metadata), "mqsmla_geometry":
+                                          {**shape, "implementation": RECIPE}}.items()))
+    assert build(official, geometry) is not None
 
 
 def test_graph_has_one_final_write_and_waits_for_all_external_inputs(ordinary):

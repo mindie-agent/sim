@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v0.9.18-blue" alt="Release v0.9.18">
+  <img src="https://img.shields.io/badge/Release-v0.9.19-blue" alt="Release v0.9.19">
   <img src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/Interface-CLI%20%7C%20Python%20API%20%7C%20PrimitiveStore-00ADD8" alt="CLI | Python API | PrimitiveStore">
   <img src="https://img.shields.io/badge/Target-Ascend%20NPU%20(A2%20%7C%20A3%20%7C%20A5)-FF6B00" alt="Ascend NPU A2/A3/A5">
@@ -55,13 +55,13 @@ flowchart TB
 <details>
 <summary>🤖 <b>AI Agent 自动安装与使用协议（Instructions for AI Agents）</b></summary>
 
-如果你是收到上述指令的 AI Agent，请按以下步骤完成 `mindie-sim`（`v0.9.18`）的安装与功能验证：
+如果你是收到上述指令的 AI Agent，请按以下步骤完成 `mindie-sim`（`v0.9.19`）的安装与功能验证：
 
 1. **检查基础环境**：确认 Python `>= 3.11` 可用（`mindie-sim` 导入时不依赖 `torch` 或 `torch_npu`，在 macOS、Linux 或 Windows 上均可直接运行）。
 2. **安装命令行与 Python 包**：
    - 使用固定版本 Release Wheel 安装（推荐生产环境）：
      ```bash
-     uv pip install https://github.com/mindie-agent/sim/releases/download/v0.9.18/mindie_sim-0.9.18-py3-none-any.whl
+     uv pip install https://github.com/mindie-agent/sim/releases/download/v0.9.19/mindie_sim-0.9.19-py3-none-any.whl
      ```
    - 或从源码主分支安装最新开发版：
      ```bash
@@ -84,7 +84,7 @@ flowchart TB
 
 `v0.9.17` 系统性对齐 `Qwen3.8-Flash-Next`（`Qwen4Exp`）与 `vllm` / `vllm-ascend` 的低秩门控 `HyperConnection`（`hc_lowrank=320`）、16 质数分表 `102.4 GB` `PLE`（含 `ETP/TP` 切分、INT8/MXFP8 表量化、主机 UVA 卸载与膨胀短卷积）、无权重 `4:1` `QSA` 稀疏注意力及 12 槽共享 `Qwen4KVCacheLayout`，并同步修复 `MiniMax-M3` / `Step-5` 稀疏 `GQA` Decode 调度与 `index_k` 容量、`Gemma-4` `K=V` 缓存行宽及内置 `kimi-k3.1` 目录注册。以下为 `v0.9.16` 延续的完整能力基线。
 
-`mindie-sim v0.9.18`（配套 `mindie-profiler v0.5.16+`）在统一因果资源引擎之上，提供完整的**跨平台 Windows `CP936` UTF-8 / Unix `LF` 确定性 I/O 与 `TimeoutError` 严格透传、标准化原生调用结构绑定与覆盖率核算契约（`native_binding` / `native_coverage`）、独立原语规范评估接口（`evaluate_primitive_spec`）、多机集群扩展模型离线目录（新增 `minimax-m3`、`minimax-m3.1-flash`、`gemma-4-26b-a4b`、`gemma-4-31b`、`qwen3.6-35b-a3b`、`qwen3.8-flash-next`、`step-5-preview`、`kimi-k3.1` 及 `GeGLU` / 稀疏 `GQA` / Gemma `K=V` 建模）、第一性原理正交多维并行与特性叠加定量守恒与实测回放验证（`TP × DP × EP × PP × PCP × DCP`、`SP`、`MC2`、`AllToAll`、`MTP/DSpark`、`MLA/GQA/KDA/GDN`、`KeyPool/DSA`、`AttnRes`、`W4A8/W8A8/MXFP8`、`enable_shared_expert_dp`、`EPLB` 无人工框架排期拦截）、单一因果执行引擎上的算子—模型—服务连续物理求解、全量 `7,337 / 7,337` 跨代际无历史缓存实时重算算子与 Step 级物理建模、15 款昇腾 SKU 官方 CANN Vector/Cube 硬件管线规格、四维效率分析、反事实多管线 Roofline 目标拟合、硬件缩放 SLA 吞吐求解器、A5 多级拓扑与 MoE 量化通信建模、分层卸载策略与容量反馈**（详见 [`docs/releases/sim-0.9.17.md`](./docs/releases/sim-0.9.17.md)、[`docs/releases/sim-0.9.16.md`](./docs/releases/sim-0.9.16.md)、[`docs/releases/sim-0.9.15.md`](./docs/releases/sim-0.9.15.md)、[`docs/releases/sim-0.9.12.md`](./docs/releases/sim-0.9.12.md)、[`docs/releases/sim-0.9.11.md`](./docs/releases/sim-0.9.11.md) 与 [`docs/releases/sim-0.9.5.md`](./docs/releases/sim-0.9.5.md)）。
+`mindie-sim v0.9.19`（配套 `mindie-profiler v0.5.17+`）在统一因果资源引擎之上，提供完整的**跨平台 Windows `CP936` UTF-8 / Unix `LF` 确定性 I/O 与 `TimeoutError` 严格透传、标准化原生调用结构绑定与覆盖率核算契约（`native_binding` / `native_coverage`）、独立原语规范评估接口（`evaluate_primitive_spec`）、多机集群扩展模型离线目录（新增 `minimax-m3`、`minimax-m3.1-flash`、`gemma-4-26b-a4b`、`gemma-4-31b`、`qwen3.6-35b-a3b`、`qwen3.8-flash-next`、`step-5-preview`、`kimi-k3.1` 及 `GeGLU` / 稀疏 `GQA` / Gemma `K=V` 建模）、第一性原理正交多维并行与特性叠加定量守恒与实测回放验证（`TP × DP × EP × PP × PCP × DCP`、`SP`、`MC2`、`AllToAll`、`MTP/DSpark`、`MLA/GQA/KDA/GDN`、`KeyPool/DSA`、`AttnRes`、`W4A8/W8A8/MXFP8`、`enable_shared_expert_dp`、`EPLB` 无人工框架排期拦截）、单一因果执行引擎上的算子—模型—服务连续物理求解、全量 `7,337 / 7,337` 跨代际无历史缓存实时重算算子与 Step 级物理建模、15 款昇腾 SKU 官方 CANN Vector/Cube 硬件管线规格、四维效率分析、反事实多管线 Roofline 目标拟合、硬件缩放 SLA 吞吐求解器、A5 多级拓扑与 MoE 量化通信建模、分层卸载策略与容量反馈**（详见 [`docs/releases/sim-0.9.19.md`](./docs/releases/sim-0.9.19.md)、[`docs/releases/sim-0.9.17.md`](./docs/releases/sim-0.9.17.md)、[`docs/releases/sim-0.9.16.md`](./docs/releases/sim-0.9.16.md)、[`docs/releases/sim-0.9.15.md`](./docs/releases/sim-0.9.15.md)、[`docs/releases/sim-0.9.12.md`](./docs/releases/sim-0.9.12.md)、[`docs/releases/sim-0.9.11.md`](./docs/releases/sim-0.9.11.md) 与 [`docs/releases/sim-0.9.5.md`](./docs/releases/sim-0.9.5.md)）。
 
 ### 1. 四维效率分解与主导瓶颈归因（`analyze_operator_row` / `analyze_network_efficiency`）
 
@@ -321,7 +321,7 @@ sim/
 
 | 主题 | 文档链接 |
 | --- | --- |
-| **`v0.9.17` / `v0.9.16` / `v0.9.15` / `v0.9.12` / `v0.9.11` / `v0.9.5` 版本发布说明** | [`docs/releases/sim-0.9.17.md`](./docs/releases/sim-0.9.17.md) · [`docs/releases/sim-0.9.16.md`](./docs/releases/sim-0.9.16.md) · [`docs/releases/sim-0.9.15.md`](./docs/releases/sim-0.9.15.md) · [`docs/releases/sim-0.9.12.md`](./docs/releases/sim-0.9.12.md) · [`docs/releases/sim-0.9.11.md`](./docs/releases/sim-0.9.11.md) · [`docs/releases/sim-0.9.5.md`](./docs/releases/sim-0.9.5.md) |
+| **`v0.9.19` / `v0.9.17` / `v0.9.16` / `v0.9.15` / `v0.9.12` / `v0.9.11` / `v0.9.5` 版本发布说明** | [`docs/releases/sim-0.9.19.md`](./docs/releases/sim-0.9.19.md) · [`docs/releases/sim-0.9.17.md`](./docs/releases/sim-0.9.17.md) · [`docs/releases/sim-0.9.16.md`](./docs/releases/sim-0.9.16.md) · [`docs/releases/sim-0.9.15.md`](./docs/releases/sim-0.9.15.md) · [`docs/releases/sim-0.9.12.md`](./docs/releases/sim-0.9.12.md) · [`docs/releases/sim-0.9.11.md`](./docs/releases/sim-0.9.11.md) · [`docs/releases/sim-0.9.5.md`](./docs/releases/sim-0.9.5.md) |
 | **统一因果建模架构与资源时间语义** | [`docs/architecture.md`](./docs/architecture.md) |
 | **建模保真度、边界与设计原则** | [`docs/modeling-fidelity.md`](./docs/modeling-fidelity.md) |
 | **输入 Case 契约与硬件/并行配置说明** | [`docs/inputs.md`](./docs/inputs.md) |

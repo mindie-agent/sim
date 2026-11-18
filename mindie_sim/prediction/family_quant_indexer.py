@@ -16,10 +16,24 @@ from mindie_sim.schema.common import ModelingError
 from .mechanism import OperatorPlan, PlannedRecipe, Work
 from .operators.mixed_core import split_reads
 from .program import KernelProgram, Stage
+from .sparse_indexer_pipeline import (
+    INDEXER_WAVE_ROWS, QUANT_LEDGER, Arch35QuantIndexerRecipe,
+    arch35_indexer_work, indexer_waves, key_blocks,
+)
 
 
 IMPLEMENTATION = "cann_quant_lightning_indexer_v2_complete"
 RECIPE = "quant_lightning_indexer_v2"
+#: CANN 9.2.1 arch35 FP8 `quant_mode=1` lowering of the same operator family.
+ARCH35_IMPLEMENTATION = "aclnn_quant_lightning_indexer_v2_arch35"
+ARCH35_RECIPE = "aclnn_quant_lightning_indexer_v2_arch35"
+ARCH35_INDEX_DTYPE = "fp8_e4m3"
+ARCH35_SCALE_DTYPE = "fp32"
+ARCH35_HEAD_COUNTS = (32, 64)
+ARCH35_TOPK_MAX = 2048
+ARCH35_COMPRESSION_MAX = 128
+FP32_BYTES = 4
+INT32_BYTES = 4
 SOURCE = {
     "repository": "ops-transformer",
     "revision": "a3925fd49cd256ad478d2faf983bf2961b8ae2c8",
@@ -48,7 +62,8 @@ SOURCE = {
 
 
 def recipes():
-    return {RECIPE: PlannedRecipe(_build)}
+    return {RECIPE: PlannedRecipe(_build),
+            ARCH35_RECIPE: PlannedRecipe(_build_arch35)}
 
 
 def _build(op, geometry):
@@ -160,7 +175,196 @@ def generic_work(*, spans, heads, dim, topk, ratio):
     }
 
 
-def declare(builder, *, deps, views, plan, quant, parallel, block_size=None):
+def _build_arch35(op, geometry):
+    """arch35 FP8 (`quant_mode=1`) block pipeline over the 32 AIC owners."""
+    ledger = dict(dict(op.metadata)[QUANT_LEDGER])
+    plan = Arch35QuantIndexerRecipe().build(op, geometry)
+    metadata = {
+        "execution_abstraction": "owner_wave_block_pipeline",
+        "native_dispatch_reconstructed": False,
+        "cross_owner_topk_traffic": "per_token_rolling_merge_declared",
+        "waves": ledger["waves"],
+        "key_blocks": ledger["blocks"],
+    }
+    return OperatorPlan(plan.work, plan.program, metadata=metadata)
+
+
+def _check_arch35_domain(plan, quant, parallel, keys, tokens=1):
+    if (parallel.cp != 1 or parallel.pcp < 1 or plan.candidate_filter
+            or plan.index_kpool != 1
+            or quant.index_dtype != ARCH35_INDEX_DTYPE
+            or quant.index_scale_dtype != ARCH35_SCALE_DTYPE):
+        raise ModelingError("quant_lightning_indexer_v2_arch35_domain_mismatch")
+    if (plan.index_heads not in ARCH35_HEAD_COUNTS
+            or plan.index_dim != NATIVE_HEAD_DIM
+            or plan.index_topk > ARCH35_TOPK_MAX
+            or plan.compress_ratio > ARCH35_COMPRESSION_MAX
+            or (plan.compress_ratio & (plan.compress_ratio - 1))):
+        raise ModelingError("quant_lightning_indexer_v2_arch35_domain_mismatch")
+    if keys < 0 or tokens < 1:
+        raise ModelingError("quant_lightning_indexer_v2_arch35_domain_mismatch")
+
+
+def _view_owned_ranges(view):
+    """Owned query offsets; empty ``query_ranges`` is the whole local query."""
+    ranges = tuple((int(start), int(end))
+                   for start, end in (getattr(view, "query_ranges", ()) or ())
+                   if int(end) > int(start))
+    return ranges or ((0, max(0, int(getattr(view, "q_len", 0) or 0))),)
+
+
+def _view_row_keys(view, ratio, noncausal=False):
+    """Completed compressed keys visible to every owned query row."""
+    context = max(0, int(getattr(view, "context", 0) or 0))
+    rows = []
+    for start, end in _view_owned_ranges(view):
+        for offset in range(start, end):
+            visible = (max(0, int(getattr(view, "kv_len", 0) or 0))
+                       if noncausal else context + offset + 1)
+            rows.append(max(0, visible) if ratio <= 1
+                        else max(0, visible) // ratio)
+    return tuple(rows)
+
+
+def _view_completed_keys(view, ratio):
+    """Largest completed key count any owned query row of this view sees."""
+    return max(_view_row_keys(view, ratio), default=0)
+
+
+def _candidate_keys(views, ratio, maxima=None):
+    """Completed keys of the arch35 scan and of its physical cache payload.
+
+    The scan walks the largest populated cache in one owner wave; the payload
+    is every distinct cache row. Each private request owns its own rows, so
+    two requests with 1,024 keys each fetch 2,048 rows, not the larger of the
+    two. Requests naming the same shared prefix key read one physical union.
+    """
+    shared: dict[str, int] = {}
+    private = 0
+    largest = 0
+    for index, view in enumerate(views):
+        keys = (int(maxima[index]) if maxima is not None
+                else _view_completed_keys(view, ratio))
+        largest = max(largest, keys)
+        context = max(0, int(getattr(view, "context", 0) or 0))
+        prefix = max(0, min(int(getattr(view, "prefix_tokens", 0) or 0), context))
+        token = str(getattr(view, "prefix_cache_key", "") or "")
+        if prefix and token:
+            shared_keys = min(keys, prefix if ratio <= 1 else (prefix // ratio))
+            shared[token] = max(shared.get(token, 0), shared_keys)
+            private += max(0, keys - shared_keys)
+        else:
+            private += keys
+    payload = sum(shared.values()) + private
+    scan = max(largest, max(shared.values(), default=0))
+    return scan, payload
+
+
+def _wave_key_ranges(row_sets, views, ratio, shared):
+    """Distinct interval fragments in each wave, in logical key coordinates."""
+    waves, batch, prefixes, private = [], 0, {}, {}
+
+    def flush():
+        waves.append(tuple((0, n) for n in prefixes.values()) + tuple(private.values()))
+        prefixes.clear()
+        private.clear()
+
+    for request, (values, view) in enumerate(zip(row_sets, views)):
+        key = view.prefix_cache_key if shared else ""
+        extent = min(view.prefix_tokens, view.context) // max(1, ratio) if key else 0
+        for n in values:
+            p = min(n, extent)
+            if p:
+                prefixes[key] = max(prefixes.get(key, 0), p)
+            if n > p:
+                private[request] = (extent, max(n, private.get(request, (0, 0))[1]))
+            batch += 1
+            if batch % INDEXER_WAVE_ROWS == 0:
+                flush()
+    if batch % INDEXER_WAVE_ROWS:
+        flush()
+    return tuple(waves)
+
+
+def declare_arch35(builder, *, deps, views, plan, quant, parallel,
+                   block_size=None, prefix_cache_mode="private"):
+    """Declare the CANN 9.2.1 arch35 FP8 (`quant_mode=1`) indexer planner.
+
+    `W_T = ceil(T / C_AIC)` owners each walk `ceil(K / 1024)` valid key blocks:
+    one FP8 Cube dot of `2 * H * 128 * valid_keys`, then the `H`-independent
+    rolling per-token AIV TopK merge of that block. Only the final INT32 token
+    indices reach GM; the score plane stays on chip.
+    """
+    del block_size
+    ratio = plan.compress_ratio
+    noncausal = bool(getattr(plan, "noncausal_attention", False))
+    row_sets = tuple(_view_row_keys(v, ratio, noncausal) for v in views)
+    row_completed = tuple(n for values in row_sets for n in values)
+    view_max = tuple(max(values, default=0) for values in row_sets)
+    shared = prefix_cache_mode == "shared"
+    keys = max(view_max, default=0)
+    payload_keys = _candidate_keys(views, ratio, view_max)[1] if shared else sum(view_max)
+    wave_ranges = _wave_key_ranges(row_sets, views, ratio, shared)
+    tokens = len(row_completed)
+    _check_arch35_domain(plan, quant, parallel, keys, tokens)
+    heads, width = plan.index_heads, plan.index_dim
+    width = width if isinstance(width, int) and width > 0 else NATIVE_HEAD_DIM
+    from mindie_sim.catalog.cache_format import CacheFormat, cache_format
+    declared = dict(builder.model.metadata).get("cache_representations", {})
+    if "index_k" in declared and cache_format(builder.model, "index_k") != CacheFormat(
+            ARCH35_INDEX_DTYPE, width, ARCH35_SCALE_DTYPE):
+        raise ModelingError("quant_lightning_indexer_v2_arch35_domain_mismatch")
+    key_row_bytes = width + FP32_BYTES
+    blocks = key_blocks(keys) if keys > 0 else 0
+    keys_padded = blocks * 1024
+    runs = []
+    for value in row_completed:
+        if runs and runs[-1][1] == value:
+            runs[-1] = (runs[-1][0] + 1, value)
+        else:
+            runs.append((1, value))
+    ledger = {
+        "query_rows": int(tokens), "wave_rows": INDEXER_WAVE_ROWS,
+        "waves": indexer_waves(tokens), "blocks": blocks,
+        "heads": heads, "width": width, "keys": keys_padded,
+        "keys_padded": keys_padded,
+        "completed_keys": keys, "payload_keys": payload_keys,
+        "row_completed_keys": tuple(runs),
+        "key_row_bytes": key_row_bytes, "wave_key_ranges": wave_ranges,
+        "output_bytes": float(tokens) * plan.index_topk * INT32_BYTES,
+    }
+    work = arch35_indexer_work(ledger)
+    result = builder.work(ARCH35_RECIPE, deps, (tokens, heads, width),
+        family="indexer", dtype=ARCH35_INDEX_DTYPE,
+        metadata=((QUANT_LEDGER, ledger),
+                  ("native_source", {
+                      "repository": "ops-transformer", "revision": "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+                      "relative_path": ("attention/quant_lightning_indexer_v2/op_kernel/arch35/"
+                                        "quant_lightning_indexer_v2_kernel_arch35.h"),
+                      "source_sha256": "37b78aab1ddb5eb0139e8a8c710610bbbccdc32359c4352ec302057153ed8945"}),
+                  ("native_tensor_view", {
+                      "kind": "aclnn_quant_lightning_indexer_v2_arch35",
+                      "query_shape": (tokens, heads, width), "query_dtype": ARCH35_INDEX_DTYPE,
+                      "cache_dtype": ARCH35_INDEX_DTYPE,
+                      "cache_head_shape": (1, width), "scale_dtype": ARCH35_SCALE_DTYPE,
+                      "output_shape": (tokens, 1, plan.index_topk), "output_dtype": "int32",
+                      "layout": "ND", "quant_mode": 1, "compression_ratio": ratio,
+                      "visible_keys": keys}),
+                  ("native_implementation", {
+                      "native_kind": ARCH35_IMPLEMENTATION,
+                      "selection": ARCH35_IMPLEMENTATION,
+                      "conditions": {"submitted_kernels": 1, "quant_mode": 1,
+                                     "wave_rows": INDEXER_WAVE_ROWS,
+                                     "key_blocks": blocks,
+                                     "topk_merge_heads_independent": True}})))
+    builder.ops[-1] = replace(work.apply(builder.ops[-1]),
+                              source_boundary="kernel",
+                              coverage="arch35_fp8_wave_block_indexer_program")
+    return result
+
+
+def declare(builder, *, deps, views, plan, quant, parallel, block_size=None,
+            prefix_cache_mode="private"):
     """Declare the supported complete boundary without inferring native owners.
 
     ``block_size`` is the actual KV/index key block size from the runtime. The
@@ -169,6 +373,10 @@ def declare(builder, *, deps, views, plan, quant, parallel, block_size=None):
     silently assumed: the ledger records that the runtime parameter was not
     supplied.
     """
+    if quant.index_dtype == ARCH35_INDEX_DTYPE:
+        return declare_arch35(builder, deps=deps, views=views, plan=plan,
+                              quant=quant, parallel=parallel,
+                              block_size=block_size, prefix_cache_mode=prefix_cache_mode)
     _check_domain(plan, quant, parallel, block_size)
     tokens = sum(view.q_len for view in views)
     # Causal compressed-key counts follow each owned span. PCP chunks pass

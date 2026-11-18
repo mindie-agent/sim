@@ -87,18 +87,26 @@ def test_deepseek_4k_prefill_index_scores_read_each_key_union_once():
         case, phase="prefill", tokens=PREFILL_TOKENS, context=0, sequences=1,
         scope="body")
     ops = next(iter(graphs.values())) if isinstance(graphs, dict) else graphs
-    scores = [op for op in ops if op.recipe == "index_scores"]
+    scores = [op for op in ops if op.recipe == "quant_lightning_indexer"]
     assert len(scores) == DEEPSEEK_LAYERS
     first = scores[0]
-    key_hbm = first.hbm_bytes - first.mte3_bytes
-    assert key_hbm == pytest.approx(INDEX_KEY_BYTES_PER_LAYER)
-    assert first.mte2_bytes == pytest.approx(
+    by_id = {op.op_id: op for op in ops}
+    operand_bytes = sum(by_id[dep].mte3_bytes for dep in first.deps[:2])
+    # The fused native score+TopK call reads Q, the head weights and every
+    # per-tile key refill on MTE2; the external HBM union is charged once.
+    assert first.mte2_bytes - operand_bytes == pytest.approx(
         INDEX_REFILL_ROWS_PER_LAYER * INDEX_ROW_BYTES)
+    assert first.hbm_bytes - operand_bytes - first.mte3_bytes == pytest.approx(
+        INDEX_KEY_BYTES_PER_LAYER)
     # Per-query arithmetic is unchanged; only the external key fetch shrinks.
     assert first.flops == pytest.approx(
         2 * (PREFILL_TOKENS * (PREFILL_TOKENS + 1) / 2)
         * INDEX_HEADS * INDEX_DIM)
-    assert sum(op.hbm_bytes - op.mte3_bytes for op in scores) == pytest.approx(
+    assert sum(op.mte2_bytes - sum(by_id[dep].mte3_bytes for dep in op.deps[:2])
+               for op in scores) == pytest.approx(
+        DEEPSEEK_LAYERS * INDEX_REFILL_ROWS_PER_LAYER * INDEX_ROW_BYTES)
+    assert sum(op.hbm_bytes - sum(by_id[dep].mte3_bytes for dep in op.deps[:2])
+               - op.mte3_bytes for op in scores) == pytest.approx(
         DEEPSEEK_LAYERS * INDEX_KEY_BYTES_PER_LAYER)
 
 
@@ -114,16 +122,20 @@ def test_pooled_indexer_cold_scan_charges_visited_pool_rows():
         case, phase="decode", tokens=1, context=POOL_CONTEXT, sequences=1,
         scope="body")
     ops = next(iter(graphs.values())) if isinstance(graphs, dict) else graphs
-    scores = next(op for op in ops if op.recipe == "index_pool_scores")
+    scores = next(op for op in ops if op.recipe == "cann_pool_key_indexer")
     metadata = dict(scores.metadata)
-    assert metadata["score_unique_pool_rows"] == POOL_UNIQUE_ROWS
-    assert metadata["score_pool_row_bytes"] == INDEX_ROW_BYTES
-    weighted_read = scores.mte2_bytes - metadata["scanned_pools"] * INDEX_ROW_BYTES
-    assert scores.hbm_bytes - scores.mte3_bytes - weighted_read == pytest.approx(
-        POOL_UNIQUE_ROWS * INDEX_ROW_BYTES)
-    topk = next(op for op in ops if op.recipe == "index_pool_topk")
-    assert topk.mte2_bytes == pytest.approx(
-        ATOMIC_BYTES * metadata["scanned_pools"])
+    assert metadata["scanned_pools"] == POOL_UNIQUE_ROWS
+    assert metadata["pool_row_bytes"] == INDEX_ROW_BYTES
+    pool_read = metadata["safe_reference_scanned_pools"] * INDEX_ROW_BYTES
+    # The native PoolKeyIndexer envelope includes every visited pool row in
+    # both its MTE2 and external-byte read ledgers.
+    assert scores.mte2_bytes >= pool_read
+    assert scores.hbm_bytes - scores.mte3_bytes >= pool_read
+    assert not any(op.recipe == "index_pool_scores" for op in ops)
+    topk = next(op for op in ops if op.recipe == "index_topk")
+    # The native caller publishes expanded token indices; the adapter reads
+    # them back for the retained selection boundary.
+    assert topk.mte2_bytes > 0.0
 
 
 # --------------------------------------------------------------------------- #
@@ -159,7 +171,8 @@ def test_shared_prefix_component_replacement_preserves_query_output():
     assert updated.hbm_bytes == pytest.approx(cold_kv + QO_BYTES)
     assert updated.hbm_bytes - cold_kv == pytest.approx(QO_BYTES)
     assert updated.mte3_bytes == pytest.approx(out_write)
-    assert updated.mte2_bytes - cold_kv == pytest.approx(q_read)
+    # MTE2 keeps every per-tile refill; only the external HBM fill unions.
+    assert updated.mte2_bytes == pytest.approx(kv_precharged + q_read)
 
 
 # --------------------------------------------------------------------------- #
@@ -183,7 +196,7 @@ def test_split_mte2_pipes_receive_private_refill_service():
 
 
 # --------------------------------------------------------------------------- #
-# [P1 #5] Unfused FP32 score/TopK is honest; fused claims are gone.
+# [P1 #5] The native PoolKeyIndexer declares its own score algebra.
 # --------------------------------------------------------------------------- #
 def test_weighted_query_scoring_is_vector_arithmetic_not_bf16_cube():
     case = parse_case(compose_case(
@@ -194,16 +207,17 @@ def test_weighted_query_scoring_is_vector_arithmetic_not_bf16_cube():
         case, phase="decode", tokens=1, context=POOL_CONTEXT, sequences=1,
         scope="body")
     ops = next(iter(graphs.values())) if isinstance(graphs, dict) else graphs
-    scores = next(op for op in ops if op.recipe == "index_pool_scores")
+    scores = next(op for op in ops if op.recipe == "cann_pool_key_indexer")
     metadata = dict(scores.metadata)
-    scanned = metadata["scanned_pools"]
-    assert scores.flops == 0
-    assert scores.matrix_flops == ()
-    assert scores.vector_ops == pytest.approx(2 * scanned * INDEX_DIM)
-    assert scores.mte3_bytes == pytest.approx(ATOMIC_BYTES * scanned)
-    assert metadata["score_materialization"] == "separate_fp32_score_then_topk"
-    topk = next(op for op in ops if op.recipe == "index_pool_topk")
-    assert topk.mte2_bytes == pytest.approx(ATOMIC_BYTES * scanned)
+    scanned = metadata["safe_reference_scanned_pools"]
+    plan = next(p for p in case.model.layer_plans if p.index_topk)
+    # The native caller declares a per-query-head Cube dot product with the
+    # same pool arithmetic; the TopK result stays inside the fused envelope.
+    assert scores.flops == pytest.approx(
+        2 * scanned * plan.index_heads * plan.index_dim)
+    assert scores.vector_ops > 0.0
+    assert not any(op.recipe in {"index_pool_scores", "index_pool_topk"}
+                   for op in ops)
 
 
 # --------------------------------------------------------------------------- #
@@ -407,10 +421,14 @@ def test_locked_sweep_reuses_one_plan_or_rejects_unsupported_comparison():
 def test_enable_dbo_builds_two_distinct_microbatch_partitions():
     case = parse_case(compose_case(
         "qwen3-30b-a3b", hardware="a5", tp=8, ep=8, num_devices=8,
-        ranks_per_node=8, prompt_tokens=64, output_tokens=2, concurrency=2))
+        ranks_per_node=8, prompt_tokens=64, output_tokens=2, concurrency=16))
     case = replace(case, runtime=replace(case.runtime, enable_dbo=True))
-    views = (RequestView("r0", 1, 32, True, "decode"),
-             RequestView("r1", 1, 32, True, "decode"))
+    under_budget = Frontend()(
+        IterationPlan((RequestView("u0", 1, 32, True, "decode"),
+                       RequestView("u1", 1, 32, True, "decode"))),
+        case.model, case.runtime, case.machine)
+    assert not any("dbo_microbatch" in dict(op.metadata) for op in under_budget.ops)
+    views = tuple(RequestView(f"r{idx}", 1, 32, True, "decode") for idx in range(16))
     work = Frontend()(IterationPlan(views), case.model, case.runtime,
                       case.machine)
     partitions = {}

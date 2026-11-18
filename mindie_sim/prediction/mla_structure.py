@@ -18,9 +18,13 @@ def declare_indexer(ops, *, prefix, plan, parallel, model, quant, views,
     role = "quant_lightning_indexer" if quantized else "lightning_indexer"
     partition = tuple({"query": view.q_len, "context": view.context,
                        "kv_length": view.kv_len} for view in views)
+    # A fused native indexer is one operator for both score and TopK.
+    fused = scores == topk
+    members = (topk,) if fused else (scores, topk)
+    entries = (topk,) if fused else (scores,)
     declare_group(
         ops, key=prefix + "." + role, role=role,
-        family="dsa", members=(scores, topk), entries=(scores,), anchor=topk,
+        family="dsa", members=members, entries=entries, anchor=topk,
         view={
             "tokens": sum(view.q_len for view in views), "physical_tokens": padded_tokens,
             "sequence_partition": partition, "compression_ratio": max(1, plan.compress_ratio),
@@ -32,11 +36,15 @@ def declare_indexer(ops, *, prefix, plan, parallel, model, quant, views,
             "scale_dtype": quant.index_scale_dtype,
         },
         implementation={
-            "native_kind": "VllmAscendQuantLightningIndexerV2" if quantized else "LightningIndexer",
+            "native_kind": (dict(selection.metadata).get("native_kind")
+                            if fused else
+                            "VllmAscendQuantLightningIndexerV2" if quantized
+                            else "LightningIndexer"),
             "conditions": {
                 "cp": 1, "pcp": parallel.pcp, "candidate_filter": False,
                 "source_selection": "semantic_score_and_topk_projection",
-                "timing_boundary": "separate_declared_operators",
+                "timing_boundary": ("single_fused_quantized_indexer" if fused
+                                    else "separate_declared_operators"),
             },
         },
         source={"kind": "semantic_builder", "module": "mindie_sim.prediction.mla"},

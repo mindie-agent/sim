@@ -272,6 +272,10 @@ def canonical_mlapo():
     from mindie_sim import compose_case, target_graphs
     raw = compose_case("deepseek-v3.2", hardware="a3", tp=4, layers=1,
                        va_recommended=True)
+    # Retain the pre-CANN index-norm Cast pair this fixture publishes; the
+    # optimizer's relaxed vector fusion is defined over that eager boundary.
+    raw["runtime"].setdefault("metadata", {})["execution_policy"] = {
+        "automatic_optional_fusions": False}
     raw["runtime"]["kernels"]["lowerings"] = {
         "mla_prolog": {"implementation": "vllm_ascend_mla_prolog_v3"},
         "native_fusion": {"implementation": "declared_native_fusion",

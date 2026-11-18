@@ -102,13 +102,13 @@ def _explicit_topk_ids(value, *, tokens, top_k, experts, rows):
 
 def select_realization(runtime, layer, *, phase, tokens, valid_tokens, global_tokens=None,
                        token_shards=1, valid_source_tokens=None, replica=0, views=None,
-                       physical_rank=None, query_position=None):
+                       physical_rank=None, query_position=None, source_geometry=None):
     raw = runtime.routing
     from .source_force_eplb import select as source_realization
     selected = source_realization(
         runtime, layer, tokens=tokens, valid_tokens=valid_tokens,
         global_tokens=global_tokens, token_shards=token_shards,
-        valid_source_tokens=valid_source_tokens, replica=replica)
+        valid_source_tokens=valid_source_tokens, replica=replica, source_geometry=source_geometry)
     if selected is not None:
         return selected
     if raw.get("policy") == "balanced" and set(raw) == {"policy"}:
@@ -116,7 +116,8 @@ def select_realization(runtime, layer, *, phase, tokens, valid_tokens, global_to
         return balanced_realization(runtime, layer, tokens=tokens,
                                     valid_tokens=valid_tokens, global_tokens=global_tokens,
                                     token_shards=token_shards,
-                                    valid_source_tokens=valid_source_tokens, replica=replica)
+                                    valid_source_tokens=valid_source_tokens, replica=replica,
+                                    owner=source_geometry.owner if source_geometry else None)
     if set(raw) - {"realizations"}:
         raise ModelingError("routing_configuration_requires_explicit_realizations")
     declarations = raw.get("realizations", ())

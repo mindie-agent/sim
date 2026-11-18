@@ -15,13 +15,15 @@ from math import lcm
 from types import MappingProxyType
 
 from .mechanism import Work
-from .mxfp4_geometry import Config, panel_sizes, panel_work
+from .mxfp4_geometry import (Config, activation_scale_bytes, panel_sizes,
+                              panel_work)
 from .mxfp4_registers import CLASSES, widen, transpose
 from .program import KernelProgram, RecipeContext, Stage
 from .refill_steady import compact_refill
 from .mxfp4_pipeline import Slots
 
 REGISTER_ROLES = ('reg_data_writes', 'reg_ub_accesses', 'reg_ub_stores', 'reg_shuffle_lanes')
+TEMPLATE_CACHE_SIZE = 128
 
 
 @dataclass(frozen=True)
@@ -50,28 +52,45 @@ class _Binding:
 
 
 def panel_parts(context, *, k, m, n, repeat, index, owner, cores, aivs, directional,
-                ownership=None):
+                ownership=None, activation_l2=0.0, weight_l2=0.0):
     """The existing source producer and micro-consumer DAG for one K panel.
 
     This helper is also available to the uncompressed caller; it does not
-    choose a timing model or retain invocation/allocation state.
+    choose a timing model or retain invocation/allocation state.  ``activation_l2``
+    is the declared share of this column pass's activation panel whose lines are
+    already resident from the first pass over the same rows; that share is served
+    by the die's L2 rather than the off-chip stream.  ``weight_l2`` is the share
+    of a B column panel re-issued from the owner's on-chip panel after the first
+    M tile.
     """
     config = Config(k, n, (m,))
     ac, *vec = ownership if ownership is not None else _ownership(context, owner, cores, aivs)
-    a, vectors, micros = panel_work(config, m, n, index * panel_sizes(m, n)[0])
-    loads = [Stage('activation', context.bind(Work(resources={
-        'hbm': a * repeat, 'mte2_aic': a * repeat})), placement=ac)]
+    offset = index * panel_sizes(m, n)[0]
+    a, vectors, micros = panel_work(config, m, n, offset)
+    payload = a - activation_scale_bytes(config, m, offset)
+    share = float(activation_l2)
+    wshare = float(weight_l2)
+    l2 = context.resource_names.get('l2')
+    if (share > 0 or wshare > 0) and l2 is None:
+        share = wshare = 0.0
+    activation = {'hbm': (payload * (1.0 - share) + (a - payload)) * repeat,
+                  'mte2_aic': a * repeat}
+    if share > 0:
+        activation['l2'] = payload * repeat * share
+    loads = [Stage('activation', context.bind(Work(resources=activation)), placement=ac)]
     for sub, work in enumerate(vectors):
         def vstage(name, resources, after=()):
             return Stage(f'{name}{sub}', context.bind(Work(resources=resources).scaled(repeat)),
                          after=after, placement=vec[sub])
+        packed = {'hbm': work['weight'] * (1.0 - wshare), 'mte2_aiv': work['weight']}
+        if wshare > 0:
+            packed['l2'] = work['weight'] * wshare
         loads.extend((
             vstage('scale_read', {'hbm': work['scale'], 'mte2_aiv': work['scale']}),
             vstage('scale_transpose', transpose(work['gather_b16_lanes']).capacity_work(CLASSES).resources,
                    (f'scale_read{sub}',)),
             vstage('scale_publish', {'mte3': work['scale_publish']}, (f'scale_transpose{sub}',)),
-            vstage('packed_read', {'hbm': work['weight'], 'mte2_aiv': work['weight']},
-                   (f'scale_read{sub}',)),
+            vstage('packed_read', packed, (f'scale_read{sub}',)),
             vstage('widen', widen(work['expanded']).capacity_work(CLASSES).resources,
                    (f'packed_read{sub}', f'scale_transpose{sub}')),
             vstage('publish', {'mte3': work['expanded']}, (f'widen{sub}', f'scale_publish{sub}')),
@@ -135,9 +154,9 @@ def _rebind(program, names, units):
     ) for stage in program.stages), minimum_ms=program.minimum_ms)
 
 
-@lru_cache(maxsize=128)
+@lru_cache(maxsize=TEMPLATE_CACHE_SIZE)
 def _template(binding, k, m, n, repeat, cores, aivs, directional, ownership, shared_clients,
-              producer_mode, producer_slots):
+              producer_mode, producer_slots, activation_l2, weight_l2):
     context = binding.context()
     kb, ka, _ = panel_sizes(m, n)
     panels = (k + kb - 1) // kb
@@ -155,7 +174,8 @@ def _template(binding, k, m, n, repeat, cores, aivs, directional, ownership, sha
             factory = panel_parts
         return factory(context, k=k, m=m, n=n, repeat=repeat, index=index,
                            owner=0, cores=cores, aivs=aivs, directional=directional,
-                           ownership=ownership)
+                           ownership=ownership, activation_l2=activation_l2,
+                           weight_l2=weight_l2)
 
     factory, options = compact_refill, {}
     if producer_mode == "dynamic_buffer4":
@@ -171,11 +191,11 @@ def _template(binding, k, m, n, repeat, cores, aivs, directional, ownership, sha
 
 @lru_cache(maxsize=1024)
 def _compile(binding, k, m, n, repeat, owner, cores, aivs, directional, shared_clients,
-             producer_mode, producer_slots):
+             producer_mode, producer_slots, activation_l2, weight_l2):
     normalized, ownership, clients, names, units = _normalize(
         binding, owner, cores, aivs, shared_clients)
     template = _template(normalized, k, m, n, repeat, cores, aivs, directional, ownership, clients,
-                         producer_mode, producer_slots)
+                         producer_mode, producer_slots, activation_l2, weight_l2)
     return _rebind(template, names, units)
 
 
@@ -186,7 +206,7 @@ def _clear():
 
 def compiled_panels(context, *, k, m, n, repeat, owner, cores, aivs,
                     directional=False, shared_clients=None, producer_mode="serial",
-                    producer_slots=Slots()):
+                    producer_slots=Slots(), activation_l2=0.0, weight_l2=0.0):
     """Return reusable, event-free IR; only scalar physical bindings are retained.
 
     The outer cache distinguishes physical ranks; its inner templates preserve
@@ -198,7 +218,8 @@ def compiled_panels(context, *, k, m, n, repeat, owner, cores, aivs,
         raise ValueError("mxa8w4_unknown_producer_mode")
     return _compile(_Binding.from_context(context), k, m, n, repeat, owner, cores,
                     aivs, directional, tuple(sorted((shared_clients or {}).items())),
-                    producer_mode, producer_slots)
+                    producer_mode, producer_slots, float(activation_l2),
+                    float(weight_l2))
 
 
 compiled_panels.cache_info = _compile.cache_info

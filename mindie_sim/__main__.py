@@ -14,6 +14,7 @@ from pathlib import Path
 import sys
 
 from . import predict
+from .cli_sku import SKU_COMMANDS, add_sku_commands, run_sku_command
 from .prediction.structure import parse_case
 from .prediction.primitives import PrimitiveKey, PrimitiveStore
 
@@ -94,6 +95,25 @@ def _case_with_supply(args):
     return raw
 
 
+def _export_structure(args, case, *, phase, tokens, context, sequences):
+    """Write the same geometry's structure export and describe the artifact.
+
+    The structure record is the one exported by ``mindie_sim.structure``; the
+    graph command only selects the geometry so both entries agree on the
+    resolved operator stack.
+    """
+    from .structure import export_structure
+    report = export_structure(
+        case, phase=phase, tokens=tokens, context=context, sequences=sequences,
+        scope=args.scope, apply_body_defaults=args.apply_body_defaults)
+    path = Path(args.export_structure)
+    data = (json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False)
+            + "\n").encode("utf-8")
+    path.write_bytes(data)
+    return {"structure_export": {"path": str(path), "nodes": len(report["nodes"]),
+                                 "graph_scope": report.get("graph_scope")}}
+
+
 def parser():
     root = argparse.ArgumentParser(prog="mindie-sim")
     sub = root.add_subparsers(dest="command", required=True)
@@ -142,8 +162,19 @@ def parser():
     graph.add_argument("--primitives")
     graph.add_argument("--event-limit", type=int, default=0)
     graph.add_argument("--no-body-defaults", dest="apply_body_defaults", action="store_false")
+    graph.add_argument("--export-structure",
+                       help="also write the same geometry's structure export JSON here")
     _add_supply_arguments(graph)
     graph.add_argument("--output", "-o")
+    # Delegated commands keep their own parser and help text.
+    structure = sub.add_parser(
+        "structure", help="export declared operator structure without timing",
+        add_help=False)
+    structure.add_argument("arguments", nargs=argparse.REMAINDER)
+    cohorts = sub.add_parser(
+        "compare-cohorts", help="compare declared cohort variants of one case",
+        add_help=False)
+    cohorts.add_argument("arguments", nargs=argparse.REMAINDER)
     catalog = sub.add_parser("catalog")
     catalog.add_argument("name", nargs="?")
     catalog.add_argument("--output", "-o")
@@ -258,6 +289,8 @@ def parser():
                  "--num-devices", "--layers", "--mtp-tokens"):
         feature_tracks.add_argument(flag, type=int, default=None)
     feature_tracks.add_argument("--quant", default=None)
+    feature_tracks.add_argument("--jobs", default="auto",
+                                help="worker budget for independent feature levels")
     feature_tracks.add_argument("--no-ablate-prs", dest="ablate_prs",
                                 action="store_false")
     feature_tracks.add_argument("--output", "-o")
@@ -288,12 +321,17 @@ def parser():
     sweep.add_argument("--candidates", default=None,
                        help="JSON list of explicit candidate mappings")
     sweep.add_argument("--two-stage", action="store_true")
+    sweep.add_argument("--finalist-top-k", type=int, default=None)
     sweep.add_argument("--candidate-timeout-s", type=float, default=None)
     sweep.add_argument("--output-jsonl", default=None)
+    sweep.add_argument("--checkpoint-jsonl", default=None)
+    sweep.add_argument("--isolate-workers", action="store_true")
     sweep.add_argument("--resume", action="store_true")
     sweep.add_argument("--progress", action="store_true")
     sweep.add_argument("--output", "-o")
     add_runtime_arguments(sweep, command="sweep")
+    sweep.add_argument("--jobs", default="auto",
+                       help="worker budget for independent topology candidates")
     sweep.add_argument("--hardware-derivations", default=None,
                        help="JSON file with named derivation records")
     eff = sub.add_parser("efficiency", help="operator-level MBU/MFU decomposition and roofline target evaluation")
@@ -327,8 +365,15 @@ def parser():
     for flag in ("--hbm-bw-scale", "--cube-flops-scale", "--vector-ops-scale", "--link-bw-scale", "--hbm-capacity-scale"):
         sla.add_argument(flag, type=float)
     sla.add_argument("--scenarios")
+    sla.add_argument("--sensitivity", choices=("baseline", "full"),
+                     default="baseline",
+                     help="baseline = one counterfactual (fast default); "
+                          "full = all documented counterfactuals")
+    sla.add_argument("--jobs", default="auto",
+                     help="worker budget for the flat (sku, scenario) pool")
     sla.add_argument("--output", "-o")
     add_runtime_arguments(sla, command="sla")
+    add_sku_commands(sub)
     accel = sub.add_parser("build-accel", help="compile or verify the C11 runtime kernel")
     accel.add_argument("--force", action="store_true", help="recompile even when cached")
     accel.add_argument("--check", action="store_true", help="verify cached artifact without compiling")
@@ -379,6 +424,11 @@ def run(args):
                                draft_prepare=args.draft_prepare,
                                apply_body_defaults=args.apply_body_defaults)
         inputs = {"analysis_input": args.input_ready_ms} if args.scope == "body" else None
+        exported = {}
+        if args.export_structure:
+            exported = _export_structure(
+                args, case, phase=args.phase, tokens=args.tokens,
+                context=args.context, sequences=args.sequences)
         with PrimitiveStore(args.primitives) if args.primitives else nullcontext(None) as store:
             return {
                 **graph_costs(case, graphs, primitives=store, external_inputs=inputs,
@@ -391,6 +441,7 @@ def run(args):
                 "media_tokens_per_sequence": args.media_tokens_per_sequence,
                 "draft_prepare": args.draft_prepare,
                 "deployment_scope": "first_independent_dp_cohort",
+                **exported,
             }
     if args.command == "operators":
         from .prediction.operator_analysis import operator_costs, target_graphs
@@ -412,18 +463,7 @@ def run(args):
                            scope=args.scope, phase=args.phase, tokens=args.tokens,
                            context=args.context, sequences=args.sequences)
     if args.command == "inspect":
-        case = parse_case(read_json(args.case))
-        from .prediction.capacity import Memory
-        from .prediction.scheduler import Scheduler
-        from .prediction.frontend import Frontend
-        from .prediction.attention import AttentionPolicy
-        memory = Memory(case)
-        scheduler = Scheduler(case, list(case.workload.requests), memory)
-        plan = scheduler.schedule(min(r.arrival_ms for r in case.workload.requests))
-        work = Frontend(attention_policy=AttentionPolicy(**case.runtime.attention_policy))(
-            plan, case.model, scheduler.next_runtime(plan), case.machine) if plan else None
-        return {"case": case.to_dict(), "memory": memory.to_dict(),
-                "operators": [op.to_dict() for op in work.ops] if work else []}
+        return _inspect(read_json(args.case))
     if args.command == "catalog":
         from .model_catalog import load_model, list_models
         return load_model(args.name).to_dict() if args.name else list_models()
@@ -500,8 +540,9 @@ def run(args):
                 ttft_sla_ms=args.ttft_sla_ms, tpot_sla_ms=args.tpot_sla_ms,
             )
         from .cli_options import load_hardware_derivations
-        if args.resume and not args.output_jsonl:
-            raise CliUsageError("--resume requires --output-jsonl")
+        if args.resume and not (args.output_jsonl or args.checkpoint_jsonl):
+            raise CliUsageError(
+                "--resume requires --checkpoint-jsonl or --output-jsonl")
         grids = ([int(item) for item in str(args.num_devices_grid).split(",")
                   if item.strip()]
                  if args.num_devices_grid else None)
@@ -533,8 +574,12 @@ def run(args):
             allow_dcp=args.allow_dcp, dcp_candidates=dcp_candidates,
             hardware_derivations=derivations,
             two_stage=args.two_stage,
+            finalist_top_k=args.finalist_top_k,
             candidate_timeout_s=args.candidate_timeout_s,
-            output_jsonl=args.output_jsonl, resume=args.resume,
+            output_jsonl=args.output_jsonl,
+            checkpoint_jsonl=args.checkpoint_jsonl,
+            isolate_workers=args.isolate_workers,
+            resume=args.resume,
             progress_callback=progress,
         )
     if args.command == "efficiency":
@@ -587,15 +632,25 @@ def run(args):
                 },
             ]
         else:
-            scenarios = DEFAULT_SLA_SCENARIOS
-        return solve_sla_sizing(
+            # ``None`` lets the solver apply the requested sensitivity set, so
+            # the out-of-the-box command is a single fast counterfactual.
+            scenarios = None
+        from . import runtime_advisor
+        jobs = runtime_advisor.resolve_jobs(
+            args.jobs, task_count=len(scenarios or DEFAULT_SLA_SCENARIOS))
+        result = solve_sla_sizing(
             case_data, sla_ms=args.sla_ms, context=args.context,
             tokens_per_seq=args.tokens_per_seq, emitted_tokens_per_seq=args.emitted_tokens_per_seq,
             max_sequences_per_dp=args.max_sequences_per_dp, phase=args.phase,
             scope=args.scope, output_budget=args.output_budget, target_mbu=args.target_mbu,
             target_cube_mfu=args.target_cube_mfu, target_vec_mfu=args.target_vec_mfu,
-            scenarios=scenarios,
+            scenarios=scenarios, sensitivity=args.sensitivity, jobs=jobs,
         )
+        result["sensitivity"] = args.sensitivity
+        result["jobs"] = jobs
+        return result
+    if args.command in SKU_COMMANDS:
+        return run_sku_command(args)
     if args.command == "build-accel":
         from .prediction.runtime.accel_build import build_accel
 
@@ -604,8 +659,76 @@ def run(args):
 
 
 
+def _inspect(raw_case):
+    """Inspect the first real scheduled iteration under its effective declaration.
+
+    Selection happens on the iteration's own views, padded bucket and replay
+    scope, and the resolved declaration is handed to the same ``Frontend`` that
+    execution uses, so a decode-only default is never installed over a prefill
+    iteration.
+    """
+    from .prediction.attention import AttentionPolicy
+    from .prediction.body_defaults import effective_body_declaration
+    from .prediction.capacity import Memory
+    from .prediction.frontend import Frontend
+    from .prediction.graph import GraphPolicy
+    from .prediction.implementation_selection import (
+        combine_summaries, records_summary, resolve,
+    )
+    from .prediction.scheduler import Scheduler
+
+    case = parse_case(raw_case)
+    memory = Memory(case)
+    scheduler = Scheduler(case, list(case.workload.requests), memory)
+    plan = scheduler.schedule(min(r.arrival_ms for r in case.workload.requests))
+    if plan is None:
+        return {"case": case.to_dict(), "memory": memory.to_dict(), "operators": [],
+                "operator_selection_summary": {}}
+    views = tuple(plan.requests)
+    phase = next((view.phase for view in views), "decode")
+    effective, selection = effective_body_declaration(
+        case, phase, tokens=max(1, sum(view.q_len for view in views)), scope="body")
+    runtime = scheduler.next_runtime(plan)
+    bucket, replay_scope = GraphPolicy().select(views, runtime)
+    padded = max(sum(view.q_len for view in views), bucket or 0)
+    runtime, records = resolve(runtime, views, padded_tokens=padded,
+                               replay_scope=replay_scope)
+    frontend = Frontend(attention_policy=AttentionPolicy(**runtime.attention_policy))
+    work = frontend(plan, effective.model, runtime, effective.machine)
+    summary = combine_summaries([
+        selection.get("operator_selection_summary"),
+        records_summary(arch_family=effective.machine.arch_family,
+                        phase=phase, records=records),
+    ])
+    return {"case": case.to_dict(), "memory": memory.to_dict(),
+            "operators": [op.to_dict() for op in work.ops],
+            "operator_selection_summary": summary}
+
+
+def _delegate(raw):
+    """Run a registered sub-command's own parser, or return ``None``.
+
+    The outer parser lists these commands but the delegate owns its complete
+    argument surface, help text and exit codes.
+    """
+    if not raw:
+        return None
+    command, rest = raw[0], raw[1:]
+    if command == "structure":
+        from .structure import main as structure_main
+        return structure_main(rest)
+    if command == "compare-cohorts":
+        from .cohort_comparison import main as cohorts_main
+        return cohorts_main(rest)
+    return None
+
+
 def main(argv=None):
-    args = parser().parse_args(argv)
+    raw = list(sys.argv[1:] if argv is None else argv)
+    delegated = _delegate(raw)
+    if delegated is not None:
+        return delegated
+    args = parser().parse_args(raw)
     try:
         result = run(args)
         emit(result, args.output)

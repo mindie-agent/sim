@@ -9,20 +9,202 @@
   adds are explicit issued work; declared operand/epilogue/final-store work is
   conserved across the same task grid. A declared service mode is bytes/second,
   so its per-owner Stage cap is ``rate/1000`` divided by the active owner count.
-  A cap only tightens an existing bound.
+  A cap only tightens an existing bound.  The A5 narrow-N router adds an
+  explicit FP32 workspace (one partial per K slice) plus its vector merge on
+  top of the unchanged steady matrix pipeline; non-Split-K routers keep that
+  pipeline alone.
 [Timeouts & Locks] O(output_tiles * K_slices) bounded tasks; no I/O or locks.
 [Side-Effect Policy] Submits only to the caller's virtual Engine.
 """
 from __future__ import annotations
 
-from mindie_sim.schema.common import ModelingError
+from dataclasses import dataclass, replace
+
+from mindie_sim.schema.common import ModelingError, dtype_bytes
 from .matrix_mapping import matrix_geometry
-from .program import KernelProgram, ParallelProgram, Stage
+from .mechanism import PlannedRecipe
+from .program import KernelProgram, ParallelProgram, RecipeContext, Stage
 
 FP32_BYTES = 4
 MS_PER_SECOND = 1000
 DRAM_SERVICE_MODE = "mte2_aic_dram"
 LOCAL_SHAPE_DIMS = 3
+#: Narrow-N A5 BF16 gate projected onto the 32-AIC grid.  ``AscendGateLinear``
+#: issues one 128x256 output tile per AIC wave; the free AIC budget splits K.
+ROUTER_TILE_M = 128
+ROUTER_TILE_N = 256
+#: Split-K slices are nonempty integer K elements; a split grid may never price
+#: more partials than the K extent can populate.
+ROUTER_K_GRANULE = 1
+ROUTER_PROLOGUE_DRAIN_CYCLES = 8250
+ROUTER_NOMINAL_CLOCK_HZ = 1.65e9
+A5_AIC_UNITS = 32
+
+
+def _allocate(total: float, weights: list[float]) -> list[float]:
+    """Allocate ``total`` by normalized weight, closing rounding last."""
+    if not weights:
+        return []
+    scale = sum(weights)
+    if scale <= 0:
+        return [0.0 for _ in weights]
+    normalized = [weight / scale for weight in weights]
+    shares = [float(total) * weight for weight in normalized[:-1]]
+    shares.append(float(total) - sum(shares))
+    return shares
+
+
+def _a5_aic_grid(geometry) -> bool:
+    units = getattr(geometry, "resource_units", {}) or {}
+    return (int(units.get("mte2_aic", 0)) >= A5_AIC_UNITS
+            and int(getattr(geometry, "compute_units", 0) or 0) >= A5_AIC_UNITS)
+
+
+def _router_split(op, geometry) -> bool:
+    meta = dict(op.metadata)
+    return (bool(meta.get("split_k_required"))
+            and meta.get("weight_format") == "bf16"
+            and meta.get("output_format") == "fp32"
+            and _a5_aic_grid(geometry))
+
+
+def router_output_tiles(m: int, n: int) -> int:
+    """Declared 128x256 router tile grid; zero extents own no tile."""
+    if m <= 0 or n <= 0:
+        return 0
+    return (-(-m // ROUTER_TILE_M)) * (-(-n // ROUTER_TILE_N))
+
+
+def router_split_count(tiles: int, aics: int = A5_AIC_UNITS) -> int:
+    """Split K only across the AIC budget left by the output tile grid."""
+    if tiles <= 0:
+        return 1
+    return max(1, min(int(aics), -(-int(aics) // int(tiles))))
+
+
+def _router_recipe(op, geometry):
+    """Select the exact router mapping the executor will lower."""
+    from .matrix_steady import SteadyMatmul
+    units = dict(getattr(geometry, "resource_units", {}) or ())
+    names = {role: f"{role}@router:0" for role in units}
+    names["cube"] = "cube@router:0"
+    declared_rates = dict(getattr(geometry, "rates", {}) or ())
+    if not declared_rates:
+        raise ModelingError("router_mapping_requires_declared_pipe_rates")
+    rates = {names[role]: float(rate) / MS_PER_SECOND
+             for role, rate in declared_rates.items() if role in names}
+    peaks = dict(getattr(geometry, "compute_peaks", {}) or ())
+    compute = str(dict(op.metadata).get("compute_format", op.dtype or "bf16"))
+    cube = (MS_PER_SECOND * float(op.flops) / float(peaks[compute])
+            if compute in peaks else 0.0)
+    context = RecipeContext(
+        op, {names["cube"]: cube} if cube else {}, names, rates,
+        int(getattr(geometry, "compute_units", A5_AIC_UNITS)),
+        resource_units=units, compute_peaks=peaks,
+        pool_capacities=dict(getattr(geometry, "buffers", {}) or ()),
+        physical_mechanisms=getattr(geometry, "physical_mechanisms", None))
+    recipe, _record = SteadyMatmul().select(context, include_record=False)
+    return recipe
+
+
+def router_matrix_operand_bytes(op, geometry, *, recipe=None) -> float:
+    """Executed routed BF16 operand fetch for the selected matrix mapping.
+
+    Each output row tile re-reads its A row block and each output column tile
+    re-reads its B column block, so the operand pipe services
+    ``input_bytes * ceil(N / tile_n) + weight_bytes * ceil(M / tile_m)`` bytes.
+    The declared ``op.mte2_bytes`` carries the distinct operand bytes only.
+    """
+    m, n, k = (int(value) for value in op.local_shape[-LOCAL_SHAPE_DIMS:])
+    meta = dict(op.metadata)
+    input_bytes = float(m * k * dtype_bytes(
+        meta.get("input_format", op.dtype or "bf16")))
+    weight_bytes = float(n * k * dtype_bytes(
+        meta.get("weight_format", op.dtype or "bf16")))
+    recipe = _router_recipe(op, geometry) if recipe is None else recipe
+    return (input_bytes * -(-n // recipe.tile_n)
+            + weight_bytes * -(-m // recipe.tile_m))
+
+
+def build_router_splitk(op, geometry):
+    """A5 narrow-N BF16 router: generic tile grid plus Split-K workspace.
+
+    The matrix wave keeps the declared operand/epilogue pipeline; every free
+    AIC receives a disjoint K slice and one FP32 partial.  The workspace write,
+    its vector merge and the last-tile drain are explicit stages whose bytes
+    and merge ops are added to the plan work.  A non-Split-K router keeps the
+    existing steady matrix recipe unchanged.
+    """
+    from .matrix_steady import SteadyMatmul
+    from .mechanism import OperatorPlan, Work
+    from .physical_recipe_base import build_plan, work_from_op
+    from .program import KernelProgram, Stage
+    if not _router_split(op, geometry):
+        return build_plan(SteadyMatmul(), op, geometry)
+    base = work_from_op(op)
+    declared_mte2 = float(op.mte2_bytes)
+    declared_mte3 = float(op.mte3_bytes)
+    declared_vector = float(op.vector_ops)
+    recipe = _router_recipe(op, geometry)
+    matrix_mte2 = router_matrix_operand_bytes(op, geometry, recipe=recipe)
+    resources = dict(base.resources)
+    resources["mte2"] = matrix_mte2
+    base = Work(matrix=base.matrix, resources=resources) + Work(
+        matrix={"bf16": float(op.flops)})
+    m, n, k = (int(value) for value in op.local_shape[-LOCAL_SHAPE_DIMS:])
+    tiles = router_output_tiles(m, n)
+    cores = int(getattr(geometry, "compute_units", A5_AIC_UNITS))
+    splits = min(router_split_count(tiles, cores),
+                 max(1, -(-k // ROUTER_K_GRANULE)))
+    partial = float(FP32_BYTES) * float(splits) * float(m) * float(n)
+    merge = float(splits - 1) * float(m) * float(n)
+    extra = Work(resources={"hbm": 2 * partial, "vector": merge})
+    plan_work = base + extra
+    clock_ms = ROUTER_NOMINAL_CLOCK_HZ / MS_PER_SECOND
+
+    def program(context):
+        extra_demand = context.bind(extra)
+        matrix_demand = {key: value - extra_demand.get(key, 0)
+                         for key, value in context.work.items()}
+        matrix_demand = {key: value for key, value in matrix_demand.items()
+                         if value > 0}
+        matrix_op = replace(
+            context.op, mte2_bytes=declared_mte2,
+            hbm_bytes=declared_mte2 + declared_mte3,
+            vector_ops=declared_vector)
+        matrix = SteadyMatmul().lower(
+            replace(context, op=matrix_op, work=matrix_demand),
+            mapping=recipe)
+        workspace = splitk_program(replace(context, work={}), splits)
+        return KernelProgram((
+            Stage("router_prologue_drain",
+                  latency=ROUTER_PROLOGUE_DRAIN_CYCLES / clock_ms),
+            Stage("narrow_matrix", after=("router_prologue_drain",),
+                  program=matrix),
+            Stage("splitk_workspace", after=("narrow_matrix",),
+                  program=workspace),
+        ))
+
+    return OperatorPlan(plan_work, program, {
+        "execution_abstraction": "finite_split_k_workspace",
+        "split_k": splits,
+        "output_tiles": tiles,
+        "router_tile": (ROUTER_TILE_M, ROUTER_TILE_N),
+        "matrix_operand_bytes": matrix_mte2,
+        "partial_write_bytes": partial,
+        "merge_vector_ops": merge,
+    })
+
+
+@dataclass(frozen=True)
+class ScopedRouterRecipe(PlannedRecipe):
+    """Register A5 narrow-N Split-K without rebinding ordinary router plans."""
+
+    def prepare(self, op, geometry):
+        if not _router_split(op, geometry):
+            from .matrix_steady import SteadyMatmul
+            return op, SteadyMatmul()
+        return super().prepare(op, geometry)
 
 
 def _split_keys(context, hbm, vector, mte3, cube) -> dict[str, float]:
@@ -65,15 +247,6 @@ def _k_slices(k: float, count: int) -> tuple[int, ...]:
     slices = tuple(base + (1 if index < extra else 0)
                    for index in range(parts))
     return tuple(value for value in slices if value > 0)
-
-
-def _allocate(total: float, weights: list[float]) -> list[float]:
-    """Allocate ``total`` by weight with the final share closing any rounding."""
-    if not weights:
-        return []
-    shares = [float(total) * weight for weight in weights[:-1]]
-    shares.append(float(total) - sum(shares))
-    return shares
 
 
 def _per_owner_cap(context, owners: int) -> dict[str, float]:

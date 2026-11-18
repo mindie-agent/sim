@@ -1304,14 +1304,9 @@ class Memory:
         if self.paired_sfa and mode and not padded:
             result[-ONE] += self._paired_draft_bytes(tokens)
         elif mode and model.auxiliary is not None and not self.paired_sfa:
-            if mode == "mtp" and any(
-                    layer.window > ZERO or layer.compress_ratio > ZERO
-                    for layer in model.layer_plans):
-                from mindie_sim.catalog.cache_ownership import draft_cache_components
-                result[-ONE] += float(draft_cache_components(
-                    model, p, draft_kind=mode, sequence_tokens=tokens,
-                    capacity_padded=padded, runtime=case.runtime,
-                    query_tokens=q_tok)["draft_kv"])
+            if self._uses_inherited_draft_cache(model):
+                result[-ONE] += self._inherited_draft_cache_bytes(
+                    model, tokens, padded=padded, query_tokens=q_tok)
             else:
                 draft = optional_draft_spec(model, mode)
                 row = ((draft.kv_cache_elements or draft.kv_lora_rank + draft.qk_rope_head_dim) if draft.attention_kind == "mla"
@@ -1320,6 +1315,29 @@ class Memory:
                                 if padded else tokens)
                 result[-1] += draft_tokens * row * dtype_bytes(model.kv_dtype) * draft.layers
         return tuple(result)
+
+    def _uses_inherited_draft_cache(self, model) -> bool:
+        """True when draft KV/state follows the declared draft LayerPlans."""
+        from mindie_sim.catalog.cache import uses_inherited_draft_cache
+        return (not self.paired_sfa
+                and uses_inherited_draft_cache(model, self.draft_kind))
+
+    def _inherited_draft_cache_bytes(
+        self, model, tokens: int, *, padded: bool, rank: int | None = None,
+        query_tokens: int | None = None,
+    ) -> float:
+        """Draft cache payload from the inherited plans, with T05 ownership."""
+        from mindie_sim.catalog.cache_ownership import draft_cache_components
+
+        values = draft_cache_components(
+            model, self.case.runtime.parallel, draft_kind=self.draft_kind,
+            sequence_tokens=tokens, capacity_padded=padded,
+            runtime=self.case.runtime, rank=rank,
+            owner_spans=self.rank_token_owners if rank is not None else None,
+            query_tokens=(self.query_tokens if query_tokens is None
+                          else query_tokens),
+        )
+        return float(values["draft_kv"])
 
     def _group_cache_parts(self, tokens: int, rank: int | None = None) -> list[dict]:
         """Known physical and valid components inside declared page groups.
@@ -1486,16 +1504,20 @@ class Memory:
         from mindie_sim.catalog.draft import optional_draft_spec
         mode = self.draft_kind
         if mode and model.auxiliary is not None and not self.paired_sfa:
-            draft = optional_draft_spec(model, mode)
-            row = ((draft.kv_cache_elements or draft.kv_lora_rank + draft.qk_rope_head_dim)
-                   if draft.attention_kind == "mla" else
-                   2 * local_kv_heads(draft.num_kv_heads, p.tp) * draft.head_dim)
-            draft_tokens = (math.ceil(tokens / case.runtime.kv_block_size)
-                            * case.runtime.kv_block_size if padded else tokens)
-            if rank is not None and self.rank_token_owners is not None:
-                draft_tokens = owned_token_rows(
-                    draft_tokens, self.rank_token_owners, rank)
-            value = draft_tokens * row * dtype_bytes(model.kv_dtype) * draft.layers
+            if self._uses_inherited_draft_cache(model):
+                value = self._inherited_draft_cache_bytes(
+                    model, tokens, padded=padded, rank=rank)
+            else:
+                draft = optional_draft_spec(model, mode)
+                row = ((draft.kv_cache_elements or draft.kv_lora_rank + draft.qk_rope_head_dim)
+                       if draft.attention_kind == "mla" else
+                       2 * local_kv_heads(draft.num_kv_heads, p.tp) * draft.head_dim)
+                draft_tokens = (math.ceil(tokens / case.runtime.kv_block_size)
+                                * case.runtime.kv_block_size if padded else tokens)
+                if rank is not None and self.rank_token_owners is not None:
+                    draft_tokens = owned_token_rows(
+                        draft_tokens, self.rank_token_owners, rank)
+                value = draft_tokens * row * dtype_bytes(model.kv_dtype) * draft.layers
             stage = stages[-ONE]
             stage["payload"] += float(value)
             stage["total"] += float(value)
@@ -1532,14 +1554,18 @@ class Memory:
         from mindie_sim.catalog.draft import optional_draft_spec
         mode = self.draft_kind
         if mode and model.auxiliary is not None:
-            draft = optional_draft_spec(model, mode)
-            row = ((draft.kv_cache_elements or draft.kv_lora_rank + draft.qk_rope_head_dim)
-                   if draft.attention_kind == "mla"
-                   else 2 * local_kv_heads(draft.num_kv_heads, p.tp) * draft.head_dim)
-            draft_tokens = (math.ceil(tokens / case.runtime.kv_block_size)
-                            * case.runtime.kv_block_size if padded else tokens)
-            rows = owned_token_rows(draft_tokens, self.rank_token_owners, int(rank))
-            result[-1] += rows * row * dtype_bytes(model.kv_dtype) * draft.layers
+            if self._uses_inherited_draft_cache(model):
+                result[-1] += self._inherited_draft_cache_bytes(
+                    model, tokens, padded=padded, rank=int(rank))
+            else:
+                draft = optional_draft_spec(model, mode)
+                row = ((draft.kv_cache_elements or draft.kv_lora_rank + draft.qk_rope_head_dim)
+                       if draft.attention_kind == "mla"
+                       else 2 * local_kv_heads(draft.num_kv_heads, p.tp) * draft.head_dim)
+                draft_tokens = (math.ceil(tokens / case.runtime.kv_block_size)
+                                * case.runtime.kv_block_size if padded else tokens)
+                rows = owned_token_rows(draft_tokens, self.rank_token_owners, int(rank))
+                result[-1] += rows * row * dtype_bytes(model.kv_dtype) * draft.layers
         return result
 
     def _rank_max_layer_cache_bytes(self, tokens: int, rank: int) -> tuple[float, ...]:
@@ -1765,9 +1791,10 @@ class Memory:
             st = self.layer_stage[layer.index]
             for name, val in components.items():
                 if name == "mla_kv" and layer.index in offload_set:
-                    rd2h_bytes += val
-                    if hot_tokens > 0 and tokens > 0:
-                        stage_hbm[st] += val * (hot_tokens / tokens)
+                    rd2h_bytes += val * p.cp
+                    live = min(tokens, layer.window) if layer.window else tokens
+                    if hot_tokens and live:
+                        stage_hbm[st] += val * min(hot_tokens, live) / live
                 else:
                     stage_hbm[st] += val
         wire_volume = sum(stage_hbm) * p.tp * p.pcp + rd2h_bytes

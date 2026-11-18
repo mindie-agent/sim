@@ -12,13 +12,33 @@ from collections.abc import Mapping
 from dataclasses import replace
 from math import ceil
 
-from mindie_sim.schema.common import dtype_bytes
+from mindie_sim.schema.common import ModelingError, dtype_bytes
 
 
 _GDN_CALLER = "vllm_ascend_gdn_decode"
 
 
 ONE = 1
+# Dense paged-MLA source domains. A5 keeps source split-core v2 for every
+# integral local head count; A2/A3 use the page-tile kernel.
+MAX_PAGED_MLA_HEADS = 64
+PAGED_MLA_A5_PAGE_TILE = 128
+ARCH22_PAGED_MLA_PAGE_TILE = 512
+# The arch22 split-core tile rounds local heads to these power-of-two ceilings.
+ARCH22_PAGED_MLA_HEAD_CEILINGS = frozenset({8, 16})
+# Declared absorbed-MLA cache head geometry (latent, rope) of both families.
+PAGED_MLA_HEAD_GEOMETRY = (512, 64)
+PAGED_MLA_ARCH_FAMILIES = frozenset({"A2", "A3", "A5"})
+# Declared domain of the KDA recurrent source: decode-only, at most this many
+# query rows per call, and this much UB for its resident state tiles.
+KDA_SOURCE_MAX_QUERY_TOKENS = 8
+KDA_SOURCE_MIN_UB_BYTES = 65536
+MQSMLA_FAMILY = "mqsmla_decode"
+MQSMLA_NATIVE_KIND = "aclnnMixedQuantSparseFlashMla"
+LIGHTNING_INDEXER_FAMILY = "lightning_indexer"
+LIGHTNING_INDEXER_IMPLEMENTATION = "cann_bf16_lightning_indexer_v2_complete"
+BF16_INDEX_CACHE_DTYPES = frozenset({"bf16", "bfloat16"})
+INDEX_PROBE_ROWS = 1
 
 
 def _gdn_source_options(binding):
@@ -80,41 +100,58 @@ def _gdn_store_default(case, kernels):
     return None
 
 
+def _collective_defaults(case):
+    """Consume adapter-declared protocols without overriding caller recipes."""
+    protocols = dict(case.machine.collective_protocols)
+    mode = case.runtime.collective_startup_mode
+    kernels = deepcopy(case.runtime.kernels)
+    families = kernels.setdefault("families", {})
+    for family in ("alltoall", "alltoallv"):
+        if protocols.get(family) == "concurrent" and mode in {"topology", "concurrent"}:
+            families.setdefault(family, {"kind": "direct_peer_collective"})
+    return replace(case, runtime=replace(case.runtime, kernels=kernels))
+
+
+DEFAULT_SCOPE = "body"
+
+
 class TargetGraphSet(dict):
     """A graph mapping plus one shared effective software declaration."""
 
-    def __init__(self, values, *, kernels, selection):
-        self.scope = "body"
+    def __init__(self, values, *, kernels, selection, scope=DEFAULT_SCOPE):
+        self.scope = str(scope)
         self.effective_kernels = deepcopy(kernels)
         self.default_selection = deepcopy(selection)
         super().__init__((rank, TargetOperators._with_declaration(
-            ops, self.effective_kernels, self.default_selection))
+            ops, self.effective_kernels, self.default_selection, self.scope))
             for rank, ops in values.items())
 
 
 class TargetOperators(tuple):
     """Tuple-compatible operator sequence with the same declaration carrier."""
 
-    def __new__(cls, values, *, kernels, selection):
-        return cls._with_declaration(values, deepcopy(kernels), deepcopy(selection))
+    def __new__(cls, values, *, kernels, selection, scope=DEFAULT_SCOPE):
+        return cls._with_declaration(values, deepcopy(kernels), deepcopy(selection), scope)
 
     @classmethod
-    def _with_declaration(cls, values, kernels, selection):
+    def _with_declaration(cls, values, kernels, selection, scope=DEFAULT_SCOPE):
         """Rank extraction shares the parent declaration without per-rank copies."""
         result = super().__new__(cls, values)
-        result.scope = "body"
+        result.scope = str(scope)
         result.effective_kernels = kernels
         result.default_selection = selection
         return result
 
     def __getitem__(self, key):
         result = super().__getitem__(key)
-        return (self._with_declaration(result, self.effective_kernels, self.default_selection)
+        return (self._with_declaration(result, self.effective_kernels,
+                                      self.default_selection, self.scope)
                 if isinstance(key, slice) else result)
 
     def __getnewargs_ex__(self):
         return (tuple(self),), {"kernels": self.effective_kernels,
-                               "selection": self.default_selection}
+                               "selection": self.default_selection,
+                               "scope": self.scope}
 
 
 def execution_policy(case) -> dict:
@@ -135,11 +172,27 @@ def _strip_automatic_lowerings(case, declared):
     return replace(case, runtime=replace(case.runtime, kernels=kernels))
 
 
-def effective_body_declaration(case, phase, *, tokens=ONE, scope="body", enabled=True):
-    """Resolve one body declaration before either structure or timing lowers it."""
-    if scope != "body" or not enabled:
+def effective_body_declaration(case, phase, *, tokens=ONE, scope=DEFAULT_SCOPE,
+                              enabled=True):
+    """Resolve one effective declaration before either structure or timing lowers it.
+
+    Assembly selection (``scope``) and effective implementation selection are
+    separate concerns: both body assembly and model assembly consume the same
+    resolved service-program and attention defaults. The resolved scope is
+    carried on the returned graph set instead of being re-labelled ``body``.
+    """
+    if not enabled:
         return case, {"profile": "explicit_declaration_preserved",
-                      "reason": "model_scope" if scope != "body" else "body_defaults_disabled"}
+                      "scope": str(scope), "reason": "body_defaults_disabled"}
+    if str(getattr(case.machine, "arch_family", "")) == "A5":
+        # The INT8 packed MLA row is resolved before phase-scoped operator
+        # selection so prefill, decode and the serving inventory agree.
+        from mindie_sim.compose_operator_defaults import (
+            resolve_packed_indexed_mla_cache,
+        )
+        case = replace(
+            case, model=resolve_packed_indexed_mla_cache(case.model))
+    case = _collective_defaults(case)
     policy = execution_policy(case)
     declared_lowerings = frozenset(dict(case.runtime.kernels.get("lowerings", {}) or {}))
     case, selection = attention_defaults(case, phase, tokens=tokens)
@@ -230,6 +283,7 @@ def service_program_defaults(case):
     preserved verbatim.  The case is returned unchanged (a new runtime dict is
     built) when an install is required, so the caller's input is not mutated.
     """
+    case = _collective_defaults(case)
     kernels = case.runtime.kernels
     if "matmul" in (kernels.get("programs") or {}):
         return case
@@ -435,14 +489,20 @@ def _kda_default(case, phase, tokens, kernels):
                      & recipes.keys()) or per_request_scan or
                 "recurrent_vector" in kernels.get("programs", {}) or
                 bool(case.runtime.tensor_layouts) or raw_bf16_generic)
+    from mindie_sim.catalog.paired_sfa import execution
+    recurrent_sharded = execution(case.model).get("recurrent_context_sharded") is not False
     pipes = {"hbm", "vector", "mte2_aiv", "mte3"}
     reason = ("explicit_implementation_preserved" if explicit else
+              # The source recurrence is a decode-only, single-context domain.
+              "kda_source_requires_decode_only_pcp1" if (
+                  parallel.pcp != ONE or parallel.cp != ONE and recurrent_sharded) else
               "partitioned_kda_caller_domain" if phase != "decode" and parallel.pcp != 1 else
-              "decode_profile_only" if phase != "decode" or not 1 <= tokens <= 8 else
+              "decode_profile_only" if phase != "decode" or not 1 <= tokens <= KDA_SOURCE_MAX_QUERY_TOKENS else
               "kda_requires_bf16_inputs_and_state" if case.model.activation_dtype != "bf16"
               or any(p.recurrent_state_dtype not in {"bf16", "fp32"} for p in layers) else
               "kda_independent_copy_pipes_not_declared" if any(
-                  not pipes <= dict(d.rates).keys() or dict(d.buffers).get("ub", 0) < 65536
+                  not pipes <= dict(d.rates).keys()
+                  or dict(d.buffers).get("ub", 0) < KDA_SOURCE_MIN_UB_BYTES
                   for d in case.machine.dies) else "")
     if not reason:
         for plan in layers:
@@ -548,6 +608,9 @@ def attention_defaults(case, phase, *, tokens=ONE):
                   and case.model.quant.kv_dtype not in quantized_kv):
                 reason = "gqa_kv_storage_outside_fattention_domain"
             elif any(p.window or p.index_topk or p.noncausal_attention for p in layers):
+                # The declared staged decode source rejects any non-zero
+                # window, as well as indexed and non-causal attention, so those
+                # layers keep analytical execution with this explicit reason.
                 reason = "windowed_noncausal_gqa_domain"
             else:
                 tiles = _gqa_tiles(case, layers, tokens)
@@ -589,10 +652,15 @@ def attention_defaults(case, phase, *, tokens=ONE):
         from . import paged_mla, paged_mla_arch22
         explicit = ("attention" in kernels.get("families", {}) or "mla_attention" in recipes
                     or any(k in lowerings for k in ("paged_mla_attention", "mla_decode")))
-        is_a5 = case.machine.arch_family == "A5"
-        valid_heads = ((lambda h: h > 0 and (1 << (h - 1).bit_length()) in {16, 32, 64})
-                       if is_a5 else (lambda h: h > 0 and (1 << (h - 1).bit_length()) in {8, 16}))
-        page_tile = 128 if is_a5 else 512
+        arch_family = case.machine.arch_family
+        is_a5 = arch_family == "A5"
+        # A5 keeps the source split-core v2 kernel for every integral local head
+        # count. A2/A3 use the page-tile kernel whose split-core domain is the
+        # power-of-two ceiling {8, 16}.
+        valid_heads = ((lambda h: 1 <= h <= MAX_PAGED_MLA_HEADS)
+                       if is_a5 else (lambda h: h > 0 and (1 << (h - 1).bit_length())
+                                      in ARCH22_PAGED_MLA_HEAD_CEILINGS))
+        page_tile = PAGED_MLA_A5_PAGE_TILE if is_a5 else ARCH22_PAGED_MLA_PAGE_TILE
         req_buffers = paged_mla.BUFFERS if is_a5 else paged_mla_arch22.BUFFERS
         paired_pipes = all(
             all(dict(d.buffers).get(pool, 0) >= needed for pool, needed in req_buffers.items())
@@ -607,22 +675,29 @@ def attention_defaults(case, phase, *, tokens=ONE):
                   "independent_copy_pipes_not_declared" if not (pipes and paired_pipes) else
                   "partitioned_attention_domain" if parallel.cp != 1 else
                   "paged_mla_source_geometry_outside_reviewed_domain" if (
-                      not is_a5 or tokens != 1 or case.model.activation_dtype != "bf16"
+                      arch_family not in PAGED_MLA_ARCH_FAMILIES
+                      or tokens != 1 or case.model.activation_dtype != "bf16"
                       or case.model.quant.kv_dtype != "bf16"
                       or case.runtime.kv_block_size < 1 or page_tile % case.runtime.kv_block_size != 0
                       or any(p.window or p.noncausal_attention
-                             or (p.kv_lora_rank, p.qk_rope_head_dim) != (512, 64)
+                             or (p.kv_lora_rank, p.qk_rope_head_dim) != PAGED_MLA_HEAD_GEOMETRY
                              or not valid_heads(p.num_heads // max(parallel.tp, 1))
                              for p in dense_mla)) else "")
         if not reason:
+            domain = {"phases": ["decode"],
+                      "max_query_tokens": {"min": 1, "max": 1},
+                      "sequences": {"min": 1}}
+            if is_a5:
+                binding = {"implementation": "ascend_paged_mla_decode_arch35",
+                           "options": {"dispatch": "source_split_core_v2"}}
+            else:
+                # The arch22 split-core tile needs a declared page-aligned
+                # context; a shorter context stays analytical instead of
+                # becoming a planner exception.
+                domain["min_context_tokens"] = {"min": ARCH22_PAGED_MLA_PAGE_TILE}
+                binding = {"implementation": "ascend_paged_mla_decode_arch22"}
             lowerings["paged_mla_attention"] = {
-                "cases": [{
-                    "domain": {"phases": ["decode"], "max_query_tokens": {"min": 1, "max": 1},
-                               "sequences": {"min": 1, "max": 1},
-                               "max_context_tokens": {"max": 32768}},
-                    "binding": {"implementation": "ascend_paged_mla_decode_arch35",
-                                "options": {"dispatch": "source_split_core_v2"}},
-                }],
+                "cases": [{"domain": domain, "binding": binding}],
                 "otherwise": "analytical",
             }
         records.append({"family": "paged_mla_decode",
@@ -637,13 +712,27 @@ def attention_defaults(case, phase, *, tokens=ONE):
     attnres = _attnres_default(case, phase, kernels)
     if attnres is not None:
         records.append(attnres)
+    from mindie_sim.compose_operator_defaults import (
+        lightning_indexer_default, mqsmla_default,
+    )
+    mixed_quant = mqsmla_default(case, kernels)
+    if mixed_quant is not None:
+        records.append(mixed_quant)
+    lightning = lightning_indexer_default(case, kernels)
+    if lightning is not None:
+        records.append(lightning)
     model = case.model
     if programs.get("indexed_attention", {}).get("kind") == "indexed_attention_packed_int8":
         from mindie_sim.catalog.cache_format import with_packed_mla_cache
         widths = {p.qk_rope_head_dim for p in indexed}
         if len(widths) == 1:
             model = with_packed_mla_cache(model, next(iter(widths)))
-    return replace(case, model=model, runtime=replace(case.runtime, kernels=kernels)), {
+    from .implementation_selection import records_summary, with_automatic_lowering
+    metadata = dict(case.runtime.metadata)
+    if mixed_quant is not None and mixed_quant.get("installed"):
+        metadata = with_automatic_lowering(metadata, "mqsmla_attention")
+    return replace(case, model=model, runtime=replace(
+        case.runtime, kernels=kernels, metadata=tuple(metadata.items()))), {
         "profile": "decode_resource_pipelines", "selections": records,
         "basis": "analytic resource programs; no measured dispatch or latency fit",
         "gqa_kv_splits": "default 1; explicit flash_attention_decode recipe may override",
@@ -652,4 +741,6 @@ def attention_defaults(case, phase, *, tokens=ONE):
         "indexed_scratch": "offchip; no inferred cache hit rate",
         "indexed_operand_service": "directional_mte1" if directional else "generic_mte1",
         "sharedkv": "SCFA source currently requires explicit prefill declarations",
+        "operator_selection_summary": records_summary(
+            arch_family=case.machine.arch_family, phase=phase, records=records),
     }

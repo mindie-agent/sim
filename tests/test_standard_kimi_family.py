@@ -82,6 +82,9 @@ def test_kimi_text_schedule_mla_geometry_and_no_k3_mechanisms(name):
         assert plan.router_norm_topk == bool(merged.get("norm_topk_prob", False))
         assert plan.router_groups == merged.get("n_group", 0)
         assert plan.router_group_topk == merged.get("topk_group", 0)
+        assert plan.router_noaux_tc is (merged.get("topk_method") == "noaux_tc")
+        assert plan.routed_scaling_factor == float(
+            merged.get("routed_scaling_factor") or 1.0)
         # Standard K2/VL text bodies must not inherit the K3 hybrid mechanisms.
         assert plan.attention != "kda" and plan.attention != "gdn"
         assert plan.linear_heads == plan.linear_head_dim == 0
@@ -162,6 +165,13 @@ def test_kimi_weight_terms_preserve_mla_and_shared_widths(name):
     assert "shared_router" not in sparse_layer
     assert "latent_down" not in sparse_layer and "latent_up" not in sparse_layer
     assert "kda_q" not in sparse_layer and "gdn_qkvz" not in sparse_layer
+    # noaux_tc owns one FP32 correction bias per routed expert per MoE layer.
+    bias = sparse_layer["router_correction_bias"]
+    assert (bias.rows, bias.cols) == (merged["n_routed_experts"], 1)
+    assert bias.category == "param_fp32"
+    assert (bias.rows * bias.cols * 4
+            == merged["n_routed_experts"] * 4)
+    assert "router_correction_bias" not in dense_layer
 
 
 @pytest.mark.parametrize("name", KIMI)
@@ -178,10 +188,11 @@ def test_kimi_standard_gaps_are_visible_and_vision_is_explicit(name):
     cfg = config(name)
     merged = flat(cfg)
     gaps = _standard_kimi_gaps(cfg)
-    # Both fixtures declare noaux_tc and a routed scaling factor.
-    assert "router_noaux_tc_correction_bias_not_in_layer_plan" in gaps
-    assert "router_noaux_tc_group_score_top2_not_in_layer_plan" in gaps
-    assert "router_routed_scaling_factor_not_in_layer_plan" in gaps
+    # Both fixtures declare noaux_tc and a routed scaling factor: the router is
+    # now a declared per-layer plan and a real FP32 bias parameter, so no
+    # router coverage gap may remain.
+    assert not any("noaux_tc" in gap for gap in gaps)
+    assert not any("routed_scaling" in gap for gap in gaps)
     assert not any("fp8" in gap.lower() or "quant" in gap.lower() for gap in gaps)
     if name == VL:
         assert "vision_tower_unmodeled" in gaps

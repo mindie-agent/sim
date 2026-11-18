@@ -12,6 +12,15 @@ from collections import defaultdict
 from .structure_matrix_contracts import mxfp4_reference_coverage
 from .structure_native_contracts import grouped_situ_contract
 
+# Qwen low-rank hyper-connection kernels own their declared tensor boundary.
+QWEN4_HC_KINDS = frozenset({"Qwen4ExpGatedResidualMix", "Qwen4ExpHcCombine"})
+LOW_RANK_HC_NATIVE_KINDS = QWEN4_HC_KINDS
+MLA_PROLOG_V3_CONTRACT = "MlaPrologV3"
+MLA_PROLOG_V4_CONTRACT = "aclnnMlaPrologV4WeightNz"
+MLA_PROLOG_V4_KINDS = frozenset({
+    MLA_PROLOG_V4_CONTRACT, "MlaPrologV4WeightNz", "MlaPrologV4",
+})
+
 
 def metadata(op):
     meta = dict(op.metadata)
@@ -41,6 +50,10 @@ def layer_structure(model, layer):
 
 
 def subgraph_contract(declaration):
+    # The Qwen4 low-rank HC boundary has no verified active ABI projection yet;
+    # its native correspondence is retained without a fabricated tensor view.
+    if (declaration.get("implementation") or {}).get("native_kind") in QWEN4_HC_KINDS:
+        return None
     if declaration.get("coverage", {}).get("kind") == "multi_launch_stage_unknown":
         return None
     view, role = declaration["tensor_view"], declaration["role"]
@@ -90,8 +103,12 @@ def subgraph_contract(declaration):
         if "packed_cache" in view:
             cache_contract = (((1, view["packed_cache"]["row_bytes"]), "int8", "ND"),
                               ((), None, None))
+        implementation = (declaration.get("implementation") or {})
+        prolog_kind = (MLA_PROLOG_V4_CONTRACT
+                       if implementation.get("native_kind") in MLA_PROLOG_V4_KINDS
+                       else MLA_PROLOG_V3_CONTRACT)
         return (
-            "mla_prolog_active", "MlaPrologV3",
+            "mla_prolog_active", prolog_kind,
             ((rows, hidden), view["token_dtype"], "ND"),
             (((hidden, qr), dq), ((qr, heads * (nope + rope)), uq),
              ((heads, nope, latent), view["absorbed_weight_dtype"]),
@@ -112,12 +129,23 @@ def subgraph_contract(declaration):
             ((rows, 1, view["topk"]), view["selection_output_dtype"], "ND"),
         )
     if role in {"hc_pre", "hc_post"}:
+        # DeepSeek mHC declares one fused "mixed" projection slot. The Qwen
+        # low-rank variant is a different declared kernel with its own native
+        # identity, so it must keep that identity instead of being rebuilt as
+        # the mHC tensor boundary (which has no "mixed" slot at all).
+        native_kind = (declaration.get("implementation") or {}).get("native_kind")
+        if native_kind in LOW_RANK_HC_NATIVE_KINDS or "hc_lowrank" in view:
+            return None
         rows, hidden, hc, dtype = (view[key] for key in ("tokens", "hidden", "hc", "dtype"))
         x, out = ((rows, hc, hidden), dtype, "ND"), ((rows, hidden), dtype, "ND")
         post, comb = ((rows, hc), "fp32", "ND"), ((rows, hc, hc), "fp32", "ND")
         if role == "hc_post":
             return ("hyper_connection_active", "HcPost", (out, x, post, comb), (x,))
-        mixed = view["mixed"]
+        mixed = view.get("mixed")
+        if mixed is None:
+            # The fused mHC projection slot is required; a low-rank variant
+            # without it keeps its own declared boundary.
+            return None
         return (
             "hyper_connection_active", "HcPre",
             (x, ((mixed, hc * hidden), "fp32", "ND"),
@@ -128,12 +156,18 @@ def subgraph_contract(declaration):
         rows, hidden, width, expansion = (
             view[key] for key in ("tokens", "hidden", "width", "coff"))
         slot = lambda shape, dtype: (shape, dtype, "ND")
+        # A C1 compressor (ratio 1) has no gated pooling: it owns only the
+        # projection and norm, not a gate matrix or its APE table.
+        weights = [slot((expansion * width, hidden), view["weight_dtype"])]
+        if int(view.get("ratio", 0)) > 1:
+            weights.extend([
+                slot((expansion * width, hidden), view["weight_dtype"]),
+                slot((view["ratio"], expansion * width), view["ape_dtype"]),
+            ])
+        weights.append(slot((width,), view["norm_dtype"]))
         return (
             "compressor_active", "Compressor", slot((rows, hidden), view["dtype"]),
-            (slot((expansion * width, hidden), view["weight_dtype"]),
-             slot((expansion * width, hidden), view["weight_dtype"]),
-             slot((view["ratio"], expansion * width), view["ape_dtype"]),
-             slot((width,), view["norm_dtype"])),
+            tuple(weights),
             slot((2 * expansion * width,), view["state_dtype"]),
             (slot((view["rope_width"],), view["rope_dtype"]),) * 2,
             slot((width,), view["dtype"]),
@@ -277,8 +311,9 @@ def export_subgraphs(nodes, declarations, memberships, entry_dependencies):
                     pending.append(dependency)
         ordered = [by_id[node_id] for node_id in sorted(members, key=position.__getitem__)]
         first = ordered[0]
-        if any((node["replica"], node["stage"], node["phase"]) !=
-               (first["replica"], first["stage"], first["phase"])
+        if any((node["replica"], node["stage"]) != (first["replica"], first["stage"])
+               or (node["phase"] != first["phase"]
+                   and not {node["phase"], first["phase"]} <= {"decode", "draft"})
                for node in ordered):
             raise ValueError(f"structure_subgraph_crosses_placement:{local_id}")
         owners = set()

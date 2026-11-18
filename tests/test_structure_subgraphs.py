@@ -90,17 +90,25 @@ def test_indexer_execution_and_shared_attention_dependency_follow_catalog_owners
         prefix = f"s0.l{plan.index}"
         attention = ops[prefix + ".latent_attention0"]
         if plan.indexer:
-            assert prefix + ".index_topk" in attention.deps
+            # One CANN 9.2.1 fused call owns score and TopK; the KPool path
+            # keeps its explicit producer/selection pair.
+            visible = (prefix + ".index_quant_lightning" if plan.index_kpool <= 1
+                       else prefix + ".index_topk")
+            assert visible in attention.deps
             group = indexers[plan.index]
             expected = (["index_pool_query_fp32", "index_pool_weights_fp32", "index_pool_weighted_query",
                          "index_pool_scores", "index_pool_topk", "index_topk"]
-                        if plan.index_kpool > 1 else ["index_scores", "index_topk"])
+                        if plan.index_kpool > 1 else ["index_quant_lightning"])
             assert group["node_ids"] == [f"rank:0/{prefix}.{name}" for name in expected]
-            topk = ops[prefix + ".index_topk"]
-            assert topk.dtype == ("int32" if plan.index_kpool > 1 else "fp32")
-            assert dict(topk.metadata)["selection_output_dtype"] == "int32"
+            if plan.index_kpool <= 1:
+                fused = ops[prefix + ".index_quant_lightning"]
+                assert dict(fused.metadata)["selection_output_dtype"] == "int32"
+                assert dict(fused.metadata)["native_kind"] == "aclnnQuantLightningIndexerV2"
         elif plan.topk_owner_layer_id >= 0:
-            owner = f"s0.l{plan.topk_owner_layer_id}.index_topk"
+            owner_plan = case.model.layer_plans[plan.topk_owner_layer_id]
+            owner_op = ("index_quant_lightning" if owner_plan.index_kpool <= 1
+                        else "index_topk")
+            owner = f"s0.l{plan.topk_owner_layer_id}.{owner_op}"
             assert owner in attention.deps and owner in ops
             assert prefix + ".index_q" not in ops
             assert plan.index not in indexers
@@ -260,7 +268,8 @@ def test_group_expands_real_source_call_members_without_duplicating_work_or_drop
     changed = export_op_structure(changed_work, **declaration)["subgraphs"]
     without_work = lambda groups: [
         {key: value for key, value in group.items()
-         if key not in {"physical_signature", "physical_work"}} for group in groups]
+         if key not in {"physical_signature", "physical_work", "math_summary"}}
+        for group in groups]
     assert without_work(changed) == without_work(report["subgraphs"])
     assert changed[0]["physical_signature"] != group["physical_signature"]
     assert changed[0]["physical_work"]["flops"] > group["physical_work"]["flops"]

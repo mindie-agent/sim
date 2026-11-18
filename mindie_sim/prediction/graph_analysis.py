@@ -22,9 +22,15 @@ from .cost import CostModel
 from .cohort_traffic import bind_cohort_traffic
 from .dispatch import cohorts
 from .execution import Execution
+from .graph_projection import (
+    accel_status, bounded_event_profile, matrix_wrapper_projection,
+)
 from .operator_analysis import cohort_operator_costs, operator_costs, physical_id, _replay_scope
 from .native_binding import bind_native_call
 from .program import RecipeBook
+
+#: A multi-layer graph that amortizes eager callback-free native adoption.
+EAGER_GRAPH_MIN_OPS = 512
 from .structure import parse_case
 from .exposed_breakdown import (
     CLOCK_GAP_ABS_FLOOR_MS, CLOCK_GAP_LIMIT_FRACTION, ExposedClocks,
@@ -221,46 +227,11 @@ def _precedence_bound(rows, external, start):
     }
 
 
-def _bounded_event_profile(engine):
-    """Separate completed physical events from optional debug-trace retention."""
-    retained = len(engine.trace)
-    return {
-        "completed_physical_events": engine.completed_count,
-        "completed_tasks": engine.completed_count,
-        "trace_retained": retained,
-        "trace_dropped": engine.trace_dropped,
-        "trace_events": retained + engine.trace_dropped,
-    }
-
-
-def _matrix_wrapper_projection(metadata):
-    """Publish only the selected wrapper's semantic kind/source role.
-
-    The nested metadata is the explicit source-selection result; absent it the
-    ordinary matrix row keeps no kind. This is attribution, not a second op.
-    """
-    wrapper = metadata.get("matrix_wrapper")
-    if not isinstance(wrapper, Mapping):
-        return {}
-    native = wrapper.get("native_kind")
-    if not isinstance(native, str) or not native:
-        return {}
-    result = {"native_kind": native}
-    role = wrapper.get("source_role")
-    if isinstance(role, str) and role:
-        result["source_role"] = role
-    source = wrapper.get("source")
-    basis = (wrapper.get("source_basis")
-             or (source.get("basis") if isinstance(source, Mapping) else None))
-    if isinstance(basis, str) and basis:
-        result["source_basis"] = basis
-    return result
-
-
 def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=None,
                 input_ready_ms=ZERO, include_submission=False, replay_scope=None,
                 isolated=True, trace_limit=ZERO, compact=False,
-                audit_allocations=False, evaluation=None):
+                audit_allocations=False, evaluation=None,
+                fast_span_only=False):
     """Run a declared DAG or replica->DAG mapping without a request scheduler.
 
     External input keys are operator dependency names and values are absolute
@@ -307,6 +278,10 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
     replay_scope = next(iter(set(scopes.values()))) if len(set(scopes.values())) == 1 else "mixed"
     if any(r not in range(case.runtime.parallel.dp) for r in graphs):
         raise ValueError("graph_replica_outside_declared_placement")
+    # Effective lowered operators: no timing may price an unmodeled core.
+    from .unmodeled_gate import assert_timing_supported
+    for items in graphs.values():
+        assert_timing_supported(case, items, entry="graph_costs")
     for items in graphs.values():
         _validate_graph(items, external)
     groups = cohorts(case.runtime.parallel, case.machine)
@@ -340,9 +315,17 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
 
     from .cost import CostLedger
     cost = ctx.cost
+    op_count = (sum(len(group) for group in ops.values())
+                if isinstance(ops, Mapping) else len(ops))
     execution = Execution(case, cost, recipes=book, bindings=ctx.bindings,
                           ledger=CostLedger(), include_submission=include_submission,
-                          on_operator=observe, trace_limit=trace_limit)
+                          on_operator=None if fast_span_only else observe,
+                          trace_limit=trace_limit, evaluation=ctx,
+                          accel_eager_attach=op_count >= EAGER_GRAPH_MIN_OPS)
+    # Physical-work coalescing is exact; only an explicit legacy diagnostic run
+    # keeps the uncoalesced per-tile shape.
+    execution._compact_step = not execution.legacy_diagnostics
+    execution.engine._compact_step = execution._compact_step
     engine = execution.engine
     engine.now = input_ready_ms
     inputs = {r: {key: engine.submit(
@@ -365,6 +348,23 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
     engine.advance(until=tuple(step.completion for step in steps.values()), first=False)
     end = max((step.completion.time for step in steps.values()), default=input_ready_ms)
     duration = end - input_ready_ms
+    if fast_span_only:
+        # Same Engine, same declared work, same virtual timestamps: only the
+        # per-operator timeline and the isolated pricing pass are omitted.
+        summary = execution.summary()
+        return {
+            "schema": "mindie-sim.graph/1", **model_coverage(case.model),
+            "boundary": ("submitted_device_graph" if include_submission
+                         else "device_graph"),
+            "input_ready_ms": input_ready_ms, "complete_ms": end,
+            "duration_ms": duration, "replicas": list(graphs),
+            "replay_scope": replay_scope,
+            "operator_occurrences": 0, "resources": [],
+            "execution": summary,
+            "engine_backend": summary.get("accel_backend"),
+            "accel_status": accel_status(engine.accel_status()),
+            "fast_span_only": True,
+        }
     # Aggregate recipes retain their rendezvous. Causal transport plans retain
     # rank entry and round dependencies instead of one all-cohort ready gate.
     joins = {}
@@ -509,7 +509,7 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
             for key in ("fusion_role", "fusion_group_key", "native_kind"):
                 if key in metadata:
                     rank[key] = metadata[key]
-            rank.update(_matrix_wrapper_projection(metadata))
+            rank.update(matrix_wrapper_projection(metadata))
             if boundary:
                 rank["native_implementation"] = boundary.get("native")
                 rank["physical_source_program"] = (
@@ -559,7 +559,7 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
         for key in ("fusion_role", "fusion_group_key", "native_kind"):
             if key in metadata:
                 row[key] = metadata[key]
-        row.update(_matrix_wrapper_projection(metadata))
+        row.update(matrix_wrapper_projection(metadata))
         if native_payload is not None:
             row["native_call"] = native_payload
         if boundary:
@@ -613,9 +613,13 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
         "busy_ms": engine.busy_ms[name],
     } for name, amount in engine.serviced.items() if amount]
     resources.sort(key=lambda row: row["capacity_bound_ms"], reverse=True)
+    accel_view = engine.accel_status()
+    accel_view = engine.accel_status()
     head = {
         "schema": "mindie-sim.graph/1",
         **model_coverage(case.model),
+        "engine_backend": accel_view.get("accel_backend"),
+        "accel_status": accel_status(accel_view),
         "boundary": "submitted_device_graph" if include_submission else "device_graph",
         "input_ready_ms": input_ready_ms, "complete_ms": end, "duration_ms": duration,
         "replicas": list(graphs), "replay_scope": replay_scope,
@@ -720,7 +724,7 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
             }
         result.update(
             result_mode="compact", profile=profile,
-            event_profile=_bounded_event_profile(engine),
+            event_profile=bounded_event_profile(engine),
             timeline_omitted=True, events_omitted=True,
         )
     else:

@@ -17,11 +17,13 @@ from .refill_steady import _duration, producer_duration
 
 
 def source_panel(context, *, k, m, n, repeat, index, owner, cores, aivs, directional,
-                 ownership=None):
+                 ownership=None, activation_l2=0.0, weight_l2=0.0):
     from .mxfp4_panels import panel_parts
     loads, micros = panel_parts(context, k=k, m=m, n=n, repeat=repeat, index=index,
                                owner=owner, cores=cores, aivs=aivs,
-                               directional=directional, ownership=ownership)
+                               directional=directional, ownership=ownership,
+                               activation_l2=activation_l2,
+                               weight_l2=weight_l2)
     kb, ka, _ = panel_sizes(m, n)
     offset = index * kb
     a = m * min(ka, k-offset) if offset % ka == 0 else 0
@@ -30,7 +32,17 @@ def source_panel(context, *, k, m, n, repeat, index, owner, cores, aivs, directi
     def transfer(name, amount):
         return Stage(name, context.bind(Work(resources={'hbm': amount*repeat,
                      'mte2_aic': amount*repeat})), placement=loads[0].placement) if amount else None
-    return Panel(transfer('activation',a), transfer('activation_scale',scale),
+    shared = min(1.0, max(0.0, float(activation_l2)))
+    resident = context.resource_names.get('l2')
+    if not a or resident is None:
+        shared = 0.0
+    activation_work = {'hbm': a * repeat * (1.0 - shared),
+                       'mte2_aic': a * repeat}
+    if shared > 0:
+        activation_work['l2'] = a * repeat * shared
+    activation = (Stage('activation', context.bind(Work(resources=activation_work)),
+                        placement=loads[0].placement) if a else None)
+    return Panel(activation, transfer('activation_scale',scale),
                  (loads[1:7],loads[7:13]), tuple(v['scale'] > 0 for v in vectors), micros)
 
 

@@ -137,20 +137,22 @@ class RoutingPolicy:
                           if 0 < inclusion < 1 else float(tokens > 0 and inclusion > 0))
         return tuple(rows), tuple(active)
 
-    def local(self, model, layer, parallel, tokens: int) -> tuple[float, float]:
+    def local(self, model, layer, parallel, tokens: int, *, owner=None) -> tuple[float, float]:
         rows, active = self.expert_moments(model, layer, tokens)
         if parallel.ep > len(rows) and len(rows) > 0:
-            replicas = parallel.ep // len(rows)
-            rank_rows = [rows[index % len(rows)] / replicas for index in range(parallel.ep)]
-            slowest = max(range(parallel.ep), key=rank_rows.__getitem__)
+            def copies(expert):
+                return 1 + (parallel.ep - 1 - expert) // len(rows)
+            rank_rows = [rows[r % len(rows)] / copies(r % len(rows)) for r in range(parallel.ep)]
+            slowest = max(range(parallel.ep), key=rank_rows.__getitem__) if owner is None else owner
             expert_idx = slowest % len(rows)
+            replicas = copies(expert_idx)
             inclusion = (rows[expert_idx] / tokens) if tokens > 0 else 0.0
             rep_tokens = tokens / replicas
             act_val = (-math.expm1(rep_tokens * math.log1p(-inclusion))
                        if 0 < inclusion < 1 else float(rep_tokens > 0 and inclusion > 0))
             return rank_rows[slowest], act_val
         rank_rows = [math.fsum(rows[index::parallel.ep]) for index in range(parallel.ep)]
-        slowest = max(range(parallel.ep), key=rank_rows.__getitem__)
+        slowest = max(range(parallel.ep), key=rank_rows.__getitem__) if owner is None else owner
         return rank_rows[slowest], math.fsum(active[slowest::parallel.ep])
 
 

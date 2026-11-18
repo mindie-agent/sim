@@ -45,7 +45,10 @@ def test_native_binding_preserves_tensor_contract_and_real_input_dependencies(
     raw = source_case()
     baseline = deepcopy(raw)
     baseline["runtime"].pop("kernels")
-    before = target_operators(baseline, phase=phase, tokens=query, context=context)
+    # Raw-declaration control: the resolved default indexed program is the
+    # unified entry, so the contrast uses the explicit opt-out.
+    before = target_operators(baseline, phase=phase, tokens=query, context=context,
+                              apply_body_defaults=False)
     after = target_operators(raw, phase=phase, tokens=query, context=context)
     source = []
     for old, new in zip(before, after, strict=True):

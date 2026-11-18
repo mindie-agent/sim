@@ -175,7 +175,7 @@ def apply_model_overrides(model, raw):
 
         try:
             quant = (_quant_bf16({}, name="bf16") if str(declared).lower() in {"none", "bf16", "bf16_qwen"}
-                     else quant_preset(str(declared)))
+                     else quant_preset(str(declared), model=model))
         except ValueError as exc:
             raise ModelingError(str(exc)) from exc
         # A weight preset does not erase the catalog model's declared
@@ -211,4 +211,14 @@ def apply_model_overrides(model, raw):
     if "quant" in raw:
         result = replace(result, quantization=result.quant.name,
                          weight_dtype=result.quant.weight_format)
+    # The quant override is the single representation authority.  An Engram
+    # table mode declared there must move the table's storage ledger too, or
+    # the graph retains BF16 tables while capacity charges INT8 rows.
+    declared_quant = raw.get("quant")
+    if (isinstance(declared_quant, Mapping)
+            and "engram_table_mode" in declared_quant
+            and result.engram is not None and result.quant is not None):
+        result = replace(result, engram=replace(
+            result.engram,
+            storage_mode=str(result.quant.engram_table_mode)))
     return result
