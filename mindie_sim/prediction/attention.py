@@ -37,6 +37,7 @@ from .batch_prefix_attention import (
 )
 from .batch_prefix_indexer import apply_indexer_prefix_reads
 from .generic_latent_attention import index_key_window, visible_parts
+from .prefix_reads import _merged_interval_rows, owned_window_intervals
 from .sparse_attention import sparse_attention_traffic
 from .structure_groups import declare_group
 
@@ -673,10 +674,13 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         per_view_sweeps: list[list[int]] = []
         per_view_shared: list[list[int]] = []
         per_view_rows: list[list[int]] = []
+        per_view_spans: list[tuple[list[tuple[int, int]], list[tuple[int, int]]]] = []
         for _, view in indexed_views:
             q, context = view.q_len, view.context
             ranges = view.query_ranges or ((0, q),)
             selected_q = sum(end - start for start, end in ranges if end > start)
+            win_spans: list[tuple[int, int]] = []
+            sh_spans: list[tuple[int, int]] = []
             if eff_topk > 0:
                 pairs = sum(
                     _long_selected_pairs(
@@ -729,6 +733,10 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                             hi = context + min(end, start + policy.query_tile)
                             lo = max(0, context + start + 1 - dense_win) if dense_win > 0 else 0
                         shared_hi = min(hi, aligned_prefix)
+                        if hi > lo:
+                            win_spans.append((lo, hi))
+                        if shared_hi > lo:
+                            sh_spans.append((lo, shared_hi))
                         for rank in range(eff_cp):
                             v_sweeps[rank] += owned_positions(
                                 lo, hi - 1, eff_cp, cp_interleave_size, rank)
@@ -748,12 +756,15 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             per_view_sweeps.append(v_sweeps)
             per_view_shared.append(v_shared)
             per_view_rows.append(v_rows)
+            per_view_spans.append((win_spans, sh_spans))
         worst_r = max(range(eff_cp), key=lambda r: (rank_pairs[r], rank_sweeps[r]))
         worst_sweeps_r = max(
             range(eff_cp), key=lambda r: (rank_sweeps[r], rank_pairs[r]))
         batches: list[OpSpec] = []
         sweeps_by_view: list[int] = []
         shared_sweeps_by_view: list[int] = []
+        unique_win_by_view: list[int] = []
+        shared_iv_by_view: list[tuple[tuple[int, int], ...]] = []
         total_pairs_sum = 0.0
         total_rows_sum = 0
         kv_hbm_total = 0.0
@@ -764,8 +775,15 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             local_pairs = v_pairs[worst_r]
             view_sweeps = per_view_sweeps[v_pos][worst_sweeps_r]
             local_rows = per_view_rows[v_pos][worst_r]
+            win_spans, sh_spans = per_view_spans[v_pos]
+            owned_win = owned_window_intervals(
+                win_spans, eff_cp, cp_interleave_size, worst_sweeps_r)
+            owned_sh = owned_window_intervals(
+                sh_spans, eff_cp, cp_interleave_size, worst_sweeps_r)
             sweeps_by_view.append(view_sweeps)
             shared_sweeps_by_view.append(min(view_sweeps, per_view_shared[v_pos][worst_sweeps_r]))
+            unique_win_by_view.append(_merged_interval_rows(owned_win))
+            shared_iv_by_view.append(owned_sh)
             total_pairs_sum += pairs
             total_rows_sum += view.kv_len
             traffic = plan_attention_traffic(
@@ -872,6 +890,8 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                     allow_recipe_rebind=not user_pinned_attn,
                     kv_hbm_bytes=kv_hbm_total,
                     kv_mte2_bytes=kv_mte2_total,
+                    unique_rows_by_view=unique_win_by_view,
+                    shared_intervals_by_view=shared_iv_by_view,
                 )
             ops.append(batched)
             grp_attn = [batched.op_id]
@@ -890,6 +910,8 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                         kernel_reuse="native_per_sequence", allow_recipe_rebind=False,
                         kv_hbm_bytes=kv_hbm_b,
                         kv_mte2_bytes=kv_mte2_b,
+                        unique_rows_by_view=(unique_win_by_view[pos],),
+                        shared_intervals_by_view=(shared_iv_by_view[pos],),
                     )
             ops.extend(batches)
             grp_attn = [item.op_id for item in batches]

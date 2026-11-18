@@ -421,7 +421,11 @@ def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
         from .implementations import select
         from .mla_cann_epilogs import native_fusion_active
         lowerings = dict(getattr(runtime, "kernels", {}).get("lowerings", {}) or {})
+        native_sel = select(lowerings, "native_fusion")
+        claimed_role = (native_sel is not None
+                        and "lightning_indexer" in (native_sel.options.get("roles") or ()))
         native_fused = (native_fusion_active(runtime)
+                        and not claimed_role
                         and select(lowerings, "lightning_indexer") is None
                         and select(lowerings, "quant_lightning_indexer") is None)
     # Query and head-weight operands are real reads in both lowerings.

@@ -104,7 +104,7 @@ def _native_engine(tmp_path, resources):
 # Fix 1: core DES / C11 parity, tile-zero ordering and catalog cohort
 
 
-def _placed_fixture(backend, tmp_path=None):
+def _placed_fixture(backend, tmp_path=None, peer_count=8):
     resources = [Resource("cube", 4.0, units=4), Resource("hbm", 4.0, units=4)]
     engine = (_native_engine(tmp_path, resources) if backend == "c"
               else Engine(resources, backend="python"))
@@ -112,7 +112,7 @@ def _placed_fixture(backend, tmp_path=None):
         "pinned", {"cube": 4.0, "hbm": 4.0}, coupled=True,
         placement={"cube": (0,), "hbm": (0,)})
     peers = [engine.submit(f"peer{i}", {"cube": 4.0, "hbm": 4.0},
-                           coupled=True) for i in range(8)]
+                           coupled=True) for i in range(peer_count)]
     timer = engine.submit("timer", {}, after=(peers[0],), latency=10.0)
     for _ in range(100):
         if all(task.done for task in (*peers, pinned)) and timer.done:
@@ -122,15 +122,20 @@ def _placed_fixture(backend, tmp_path=None):
 
 
 def test_c11_and_python_normalize_mixed_placements_identically(tmp_path):
-    python = _placed_fixture("python")
-    native = _placed_fixture("c", tmp_path)
-    assert native[0].accel_status()["native_steps"] > 0
-    for left, right in zip((python[1], *python[2]), (native[1], *native[2])):
-        assert left.time == pytest.approx(right.time, abs=1e-9)
-    assert python[3].time == pytest.approx(19.0)
-    assert native[3].time == pytest.approx(19.0)
-    # The pinned cohort advances on its own one-unit share, not the aggregate.
-    assert python[1].time == pytest.approx(12.0)
+    for peer_count, expected_timer, expected_pinned in (
+        (8, 19.0, 12.0),
+        (3, 14.0, 7.0),
+    ):
+        python = _placed_fixture("python", peer_count=peer_count)
+        native = _placed_fixture(
+            "c", tmp_path / f"peers-{peer_count}", peer_count=peer_count)
+        assert native[0].accel_status()["native_steps"] > 0
+        for left, right in zip((python[1], *python[2]), (native[1], *native[2])):
+            assert left.time == pytest.approx(right.time, abs=1e-9)
+        assert python[3].time == pytest.approx(expected_timer)
+        assert native[3].time == pytest.approx(expected_timer)
+        # The pinned cohort advances on its own one-unit share, not the aggregate.
+        assert python[1].time == pytest.approx(expected_pinned)
 
 
 def _one_tile(minimum=0.0):
@@ -210,24 +215,29 @@ def _mhc_layer(pass_name):
     return _with_passes(case, pass_name)
 
 
-def test_mhc_norm_waits_for_its_sinkhorn_coefficients():
-    for pass_name in ("mhc_boundary_pr", "mhc_boundary_ideal"):
-        case = _mhc_layer(pass_name)
-        ops = _ops(case, phase="decode", tokens=1, context=2048,
-                   sequences=2)
-        by_id = {op.op_id: op for op in ops}
-        norm1 = by_id["s0.l0.norm1"]
-        sinkhorn = by_id["s0.l0.attention.hc_sinkhorn"]
-        assert sinkhorn.op_id in norm1.deps
-        # The preceding hc_post produces the residual the next coefficients
-        # consume, so it cannot be folded into the norm node.
-        assert by_id["s0.l0.ffn.hc_post"].recipe == "hc_post_mix"
-        norm2 = by_id["s0.l0.norm2"]
-        assert "s0.l0.attention.hc_post" in norm2.deps
-        assert by_id["s0.l0.ffn.hc_sinkhorn"].op_id in norm2.deps
+def test_mhc_norm_waits_for_its_pre_gate_producer_and_preserves_sinkhorn_overlap():
+    pr_ops = _ops(_mhc_layer("mhc_boundary_pr"), phase="decode", tokens=1,
+                  context=2048, sequences=2)
+    pr_by_id = {op.op_id: op for op in pr_ops}
+    norm1 = pr_by_id["s0.l0.norm1"]
+    assert pr_by_id["s0.l0.attention.hc_affine"].op_id in norm1.deps
+    assert pr_by_id["s0.l0.attention.hc_sinkhorn"].op_id not in norm1.deps
+    assert pr_by_id["s0.l0.ffn.hc_post"].recipe == "hc_post_mix"
+    norm2 = pr_by_id["s0.l0.norm2"]
+    assert "s0.l0.attention.hc_post" in norm2.deps
+    assert pr_by_id["s0.l0.ffn.hc_affine"].op_id in norm2.deps
+    assert pr_by_id["s0.l0.ffn.hc_sinkhorn"].op_id not in norm2.deps
+
+    ideal_ops = _ops(_mhc_layer("mhc_boundary_ideal"), phase="decode", tokens=1,
+                     context=2048, sequences=2)
+    ideal_by_id = {op.op_id: op for op in ideal_ops}
+    assert (ideal_by_id["s0.l0.attention.hc_sinkhorn"].op_id
+            in ideal_by_id["s0.l0.norm1"].deps)
+    assert (ideal_by_id["s0.l0.ffn.hc_sinkhorn"].op_id
+            in ideal_by_id["s0.l0.norm2"].deps)
 
 
-def test_lowrank_mhc_keeps_the_injection_read_on_the_combine():
+def test_lowrank_mhc_preserves_declared_injection_and_gate_slice_reads():
     case = _with_passes(_case("qwen3.8-flash-next", layers=1, quant="w8a8"),
                         "mhc_boundary_pr")
     ops = _ops(case, phase="decode", tokens=1, context=2048)
@@ -236,12 +246,12 @@ def test_lowrank_mhc_keeps_the_injection_read_on_the_combine():
     combine = by_id["s0.l0.attention.hc_post"]
     up = by_id["s0.l0.attention.hc_up"]
     down = by_id["s0.l0.attention.hc_down_inject"]
-    assert down.op_id in gate.deps and up.op_id not in gate.deps
-    # Gate-slice read stays declared on the mix; the injection read moves to
-    # the combine instead of disappearing.
+    # Declared edges stay conserved: hc_up -> hc_gate_mix (40,960 B) and
+    # hc_down_inject -> hc_post (25,608 B), totaling 66,568 B with zero leak.
+    assert up.op_id in gate.deps and down.op_id not in gate.deps
     assert gate.mte2_bytes == pytest.approx(40960.0)
-    assert combine.mte2_bytes == pytest.approx(25608.0 + up.mte3_bytes)
-    assert up.op_id in combine.deps and down.op_id in combine.deps
+    assert down.op_id in combine.deps and up.op_id not in combine.deps
+    assert combine.mte2_bytes == pytest.approx(25608.0)
 
 
 def test_qkv_norm_rope_writes_every_declared_output_and_names_ports():
@@ -268,6 +278,11 @@ def test_qkv_norm_rope_writes_every_declared_output_and_names_ports():
 
 
 def test_kda_l2norm_is_retained_for_a_second_sequence_or_phase():
+    from mindie_sim.prediction.attention import AttentionPolicy
+    from mindie_sim.prediction.recurrent import linear
+    from mindie_sim.prediction.transforms import lower_implementations
+    from mindie_sim.schema.workload import RequestView
+
     case = _case("kimi-k3", layers=1, tp=1, ep=1, num_devices=1)
     case = _with_passes(case, "kda_in_kernel_l2norm")
     single = _ops(case, phase="prefill", tokens=64, context=0, sequences=1)
@@ -276,6 +291,27 @@ def test_kda_l2norm_is_retained_for_a_second_sequence_or_phase():
     two = _ops(case, phase="prefill", tokens=64, context=0, sequences=2)
     assert [op for op in two if op.recipe == "qk_l2norm"]
     assert not [op for op in two if dict(op.metadata).get("in_kernel_qk_l2norm")]
+
+    # Mixed prefill+decode batches share op.phase == "prefill" in recurrent.py
+    # and emit two scan consumers (chunkwise + recurrent_scan1); retain qk_l2norm.
+    from mindie_sim.prediction.implementation_selection import resolve
+    plan = case.model.layer_plans[0]
+    views = (RequestView("p", 64, 0, True, "prefill"),
+             RequestView("d", 1, 128, True, "decode"))
+    resolved_rt, _ = resolve(
+        case.runtime, views, padded_tokens=65, replay_scope="none")
+    res = linear(
+        prefix="s0.l0", plan=plan, views=views, stage=0, deps="in",
+        model=case.model, parallel=resolved_rt.parallel,
+        quant=case.model.quant, mode="prefill",
+        policy=AttentionPolicy(recurrent_chunk=64), runtime=resolved_rt,
+        padded_tokens=65)
+    mixed = lower_implementations(
+        res.ops, resolved_rt, case.model.activation_dtype)
+    norm_ops = [op for op in mixed if op.recipe == "qk_l2norm"]
+    assert len(norm_ops) == 1
+    decode_scan = next(op for op in mixed if op.op_id.endswith("recurrent_scan1"))
+    assert norm_ops[0].op_id in decode_scan.deps
 
 
 def _kimi_situ_case():
@@ -434,26 +470,33 @@ def test_shared_prefix_keypool_plan_matches_the_published_op_bytes():
     from mindie_sim.prediction.mechanism import Geometry
     from mindie_sim.prediction.program import RecipeBook
     raw = compose_case("glm-5.3-flash", hardware="a3", tp=8, ep=8,
-                       num_devices=8, layers=4)
-    raw["runtime"]["prefix_cache_mode"] = "shared"
-    raw["runtime"]["prefix_read_mode"] = "batch_shared"
+                       num_devices=8, layers=4, concurrency=4,
+                       prompt_tokens=131201, prefix_tokens=131072,
+                       prefix_cache_mode="shared",
+                       prefix_read_mode="batch_shared",
+                       prefix_cache_key="shared_doc")
     raw["runtime"].setdefault("kernels", {}).setdefault(
         "lowerings", {})["pool_key_indexer"] = {
             "implementation": "vllm_ascend_cann_keypool_caller",
-            "options": {"tail_capacity": 9, "block_table_columns": 8195}}
+            "options": {"tail_capacity": 25, "block_table_columns": 8195}}
     case = parse_case(raw)
-    ops = _ops(case, phase="decode", tokens=6, context=131201, sequences=4)
+    ops = _ops(case, phase="decode", tokens=20, context=131201, sequences=4)
     scored = next(op for op in ops if op.recipe == "cann_pool_key_indexer")
     metadata = dict(scored.metadata)
     ledger = dict(metadata["pool_key_indexer_work"])
-    assert scored.hbm_bytes >= 0.0
-    assert metadata["prefix_read_hbm_bytes"] <= (
+    assert scored.hbm_bytes > 0.0
+    assert metadata["prefix_read_reuse_applied"] is True
+    assert metadata["prefix_read_hbm_bytes"] < (
         ledger["waves"] * ledger["wave_cache_bytes"])
+    book = RecipeBook.from_mapping(case.runtime.kernels)
     geometry = Geometry.from_devices(case.machine.dies[:8])
-    prepared = RecipeBook.from_mapping(
-        case.runtime.kernels).prepare(scored, geometry)[0]
+    prepared, plan = book.prepare(scored, geometry)
     assert scored.hbm_bytes == pytest.approx(prepared.hbm_bytes)
+    assert scored.hbm_bytes == pytest.approx(plan.work.resources["hbm"])
     assert scored.mte2_bytes == pytest.approx(prepared.mte2_bytes)
+    from mindie_sim.prediction.operator_analysis import operator_costs
+    row = operator_costs(case, (scored,))["operators"][0]
+    assert row["serviced"]["memory@r0:s0"] == pytest.approx(prepared.hbm_bytes)
     # MTE2 keeps the complete per-wave refill plus query-row stream.
     assert prepared.mte2_bytes == pytest.approx(
         ledger["waves"] * ledger["wave_cache_bytes"]
@@ -561,7 +604,10 @@ def test_arch22_prolog_rejects_nope_and_sharded_cache_ownership():
 
 
 def test_shared_prefix_union_merges_absolute_disjoint_swa_intervals():
+    from mindie_sim.prediction.attention import AttentionPolicy, _memory_hierarchy, gqa
     from mindie_sim.prediction.prefix_reads import CacheAccess, plan_prefix_reads
+    from mindie_sim.schema.workload import RequestView
+
     accesses = (
         CacheAccess("a", 1024, q_len=1, prefix_tokens=1023,
                     prefix_key="doc", row_bytes=2048.0, logical_rows=1024),
@@ -573,6 +619,31 @@ def test_shared_prefix_union_merges_absolute_disjoint_swa_intervals():
     assert plan.unique_hbm_bytes == pytest.approx(4 * 1024 * 1024)
     # Per-tile refills stay private MTE2 service.
     assert plan.l2_to_core_bytes == pytest.approx(2 * 1024 * 2048.0)
+
+    # SWA prefill (window=1024, context=2048, q_len=256): each request touches
+    # prefix [1025, 2048) = 1,023 shared rows plus 256 private rows -> 1,535
+    # unique rows across two requests (not 2 * 1,279 = 2,558).
+    raw = compose_case("gemma-4-31b", hardware="a3", tp=8, ep=1,
+                       num_devices=8, layers=1,
+                       prefix_cache_mode="shared",
+                       prefix_read_mode="batch_shared")
+    case = parse_case(raw)
+    swa_plan = case.model.layer_plans[0]
+    views = tuple(
+        RequestView(f"r{i}", 256, 2048, True, "prefill",
+                    prefix_tokens=2048, prefix_cache_key="doc")
+        for i in range(2)
+    )
+    hier = _memory_hierarchy(case.machine)
+    res = gqa(prefix="s0.l0", plan=swa_plan, views=views, stage=0, deps="in",
+              model=case.model, parallel=case.runtime.parallel,
+              quant=case.model.quant, mode="prefill",
+              policy=AttentionPolicy(), runtime=case.runtime,
+              hierarchy=hier, padded_tokens=512)
+    attn = next(op for op in res.ops if op.family == "attention")
+    meta = dict(attn.metadata)
+    assert meta["prefix_read_hbm_bytes"] == pytest.approx(3143680.0)
+    assert meta["prefix_read_logical_bytes"] == pytest.approx(9428992.0)
 
 
 def test_causal_window_tile_span_covers_every_query_in_the_tile():
@@ -612,7 +683,10 @@ def test_lightning_indexer_charges_query_and_head_weight_operands():
     from mindie_sim.schema.parallel import ParallelSpec
     from mindie_sim.schema.workload import RequestView
 
-    model = load_model("deepseek-v3.2")
+    base_model = load_model("deepseek-v3.2")
+    quant = replace(base_model.quant, index_dtype="fp8_e4m3",
+                    index_scale_dtype="fp32")
+    model = replace(base_model, quant=quant)
     plan = next(p for p in model.layer_plans if p.indexer)
     views = tuple(RequestView(str(i), 2, 128, False, "prefill")
                   for i in range(2))
@@ -622,10 +696,10 @@ def test_lightning_indexer_charges_query_and_head_weight_operands():
         views, share_prefix=False, noncausal=False, cp=1,
         interleave=128, compression=max(1, plan.compress_ratio))
 
-    def build(raw_eager):
+    def build(raw_eager, kernels=None, arch="A5"):
         runtime = type("Runtime", (), {
-            "kernels": {},
-            "metadata": {"arch_family": "A5", "raw_eager": raw_eager},
+            "kernels": dict(kernels or {}),
+            "metadata": {"arch_family": arch, "raw_eager": raw_eager},
             "prefix_cache_mode": "private", "prefix_read_mode": "auto",
             "parallel": parallel})()
         builder = Builder("s0", plan, 0, views, model, "prefill")
@@ -633,14 +707,15 @@ def test_lightning_indexer_charges_query_and_head_weight_operands():
         weights = builder.work("w_operand", (), (128, 128), read=8, write=512)
         semantic_index_selection(
             builder, deps=(query, weights), views=views, plan=plan,
-            model=model, quant=model.quant, parallel=parallel, shard=1,
-            prefix="s0", padded_tokens=4, runtime=runtime)
+            model=model, quant=model.quant, parallel=parallel,
+            shard=1, prefix="s0", padded_tokens=4, runtime=runtime)
         operand = sum(op.mte3_bytes for op in builder.ops
                       if op.op_id in (query, weights))
         return builder, operand
 
     native_builder, native_operands = build(False)
-    native = next(op for op in native_builder.ops if op.family == "indexer")
+    native = next(op for op in native_builder.ops
+                  if op.recipe == "quant_lightning_indexer")
     # Native: per-tile refill service plus the real Q/head-weight operands.
     assert native.mte2_bytes == pytest.approx(
         native_operands + refill_rows * row)
@@ -653,6 +728,23 @@ def test_lightning_indexer_charges_query_and_head_weight_operands():
         eager_operands + refill_rows * row)
     assert scores.hbm_bytes == pytest.approx(
         eager_operands + hbm_rows * row + scores.mte3_bytes)
+
+    # When declared_native_fusion explicitly claims role "lightning_indexer"
+    # (e.g. A2 native observations), semantic_index_selection must keep the
+    # 2-member (index_scores, index_topk) pair intact instead of pre-fusing it.
+    claimed_kernels = {
+        "lowerings": {
+            "native_fusion": {
+                "implementation": "declared_native_fusion",
+                "options": {"roles": ["lightning_indexer"]},
+            }
+        }
+    }
+    for arch in ("A2", "A5"):
+        claimed_builder, _ = build(False, kernels=claimed_kernels, arch=arch)
+        recipes = {op.recipe for op in claimed_builder.ops}
+        assert "quant_lightning_indexer" not in recipes
+        assert {"index_scores", "index_topk"} <= recipes
 
 
 def test_sparse_gqa_topk_writes_int32_ids_and_attention_reads_them():

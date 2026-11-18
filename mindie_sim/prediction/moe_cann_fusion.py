@@ -427,9 +427,9 @@ def absorb_init_routing(*, pack, quantizer, ep, dispatch_owns_quant=False):
     # ``route_unpack`` still consumes the pack's inverse token-slot map after
     # the BF16 payload is replaced by the quantized payload.  That INT32
     # auxiliary write is four bytes per routed slot and must survive.
-    routed_slots = 1
+    routed_slots = 1 if pack.local_shape else 0
     for extent in pack.local_shape:
-        routed_slots *= max(1, int(extent))
+        routed_slots *= max(0, int(extent))
     inverse_bytes = float(routed_slots) * float(SELECTED_ID_BYTES)
     routing["inverse_index_bytes"] = inverse_bytes
     read = float(pack.mte2_bytes)

@@ -145,7 +145,12 @@ def mhc_boundary_fusion_overlap(ops, source_dtype, *, max_rows=0,
                 fused_read = float(op.mte2_bytes) + gamma_bytes
                 fused_write = float(norm_op.mte3_bytes)
                 fused_vec = float(op.vector_ops) + float(norm_op.vector_ops)
-                fused_deps = tuple(dict.fromkeys((ready_id, sinkhorn.op_id)))
+                # Only the post/comb Sinkhorn iterations overlap the sublayer;
+                # the pre-gate producer (``affine``) must finish before the
+                # fused norm reads its mixing gates.  When ``max_rows == 0``
+                # collapses the closed chain into ``sinkhorn``, ``aliases``
+                # rewires ``affine`` to that resident region automatically.
+                fused_deps = tuple(dict.fromkeys((ready_id, affine.op_id)))
                 fused = replace(
                     norm_op,
                     deps=fused_deps,
@@ -233,38 +238,17 @@ def mhc_boundary_fusion_overlap(ops, source_dtype, *, max_rows=0,
             aux_stream = "mhc_aux" if captured else (op.stream or "")
             stream_rewrites[hc_silu.op_id] = aux_stream
             stream_rewrites[hc_up.op_id] = aux_stream
-            # Gate mix reads the gate slice of ``hc_down`` so Attention starts
-            # immediately, while ``hc_up`` joins at ``hc_combine``.  The
-            # declared mix read already covers the gate columns; the injection
-            # read moves to the combine instead of disappearing.
+            # Preserve the declared ``hc_up -> hc_gate_mix`` (injection) and
+            # ``hc_down -> hc_combine`` (gate-slice) data edges and byte reads
+            # when placing the low-rank injection branch onto ``mhc_aux``.
             replacements[op.op_id] = replace(
                 op,
-                deps=(norm_id, hc_down.op_id),
+                deps=(norm_id, hc_up.op_id),
                 metadata=merge_meta(op, extra=(
                     ("mhc_lowrank_injection_stream", aux_stream or "main"),
-                    ("mhc_gate_slice_producer", hc_down.op_id),
+                    ("mhc_lowrank_injection_producer", hc_up.op_id),
                 )),
             )
-            # Rewire downstream hc_combine (hc_post) to wait for hc_up injection
-            # completion while retaining the gate-slice dependency on hc_down.
-            for combine_id in users.get(hc_down.op_id, ()):
-                comb_op = by_id.get(combine_id)
-                if comb_op is not None and comb_op.recipe == "hc_combine":
-                    new_deps = tuple(hc_up.op_id if d == hc_down.op_id else d
-                                     for d in comb_op.deps)
-                    new_deps = tuple(dict.fromkeys((*new_deps, hc_down.op_id)))
-                    injection_read = float(hc_up.mte3_bytes)
-                    replacements[comb_op.op_id] = replace(
-                        comb_op,
-                        deps=new_deps,
-                        mte2_bytes=float(comb_op.mte2_bytes) + injection_read,
-                        hbm_bytes=float(comb_op.hbm_bytes) + injection_read,
-                        metadata=merge_meta(comb_op, extra=(
-                            ("mhc_lowrank_injection_read_bytes", injection_read),
-                            ("mhc_lowrank_injection_producer", hc_up.op_id),
-                            ("mhc_gate_slice_producer", hc_down.op_id),
-                        )),
-                    )
             # In expected_ideal (max_rows == 0), fuse preceding hc_combine + grouped_gemma_rmsnorm
             prev_comb = by_id.get(hc_norm.deps[0]) if len(hc_norm.deps) == 1 else None
             if (max_rows == 0 and prev_comb is not None and prev_comb.recipe == "hc_combine"
@@ -463,15 +447,33 @@ def kda_in_kernel_l2norm(ops, source_dtype):
         if op.recipe != "qk_l2norm":
             continue
         consumers = [by_id[u] for u in users.get(op.op_id, ()) if u in by_id]
+        recurrent_families = {"recurrent_local", "recurrent_scan", "recurrent_output"}
+        if not consumers or not all(c.family in recurrent_families for c in consumers):
+            continue
         products = [c for c in consumers
                     if str(c.recipe).startswith("chunk_products")]
         # A second prefill sequence owns another ``chunk_products`` occurrence,
-        # and a mixed decode scan reads the normalized Q/K directly.  Either
-        # consumer keeps the standalone normalization in the graph.
+        # and a mixed decode scan reads the normalized Q/K directly (sharing
+        # ``op.phase == "prefill"`` on the mixed builder while owning distinct
+        # requests / row counts).  Either consumer retains ``qk_l2norm``.
         if len(products) != 1:
             continue
         first_prod = products[0]
-        if any(consumer.phase != first_prod.phase for consumer in consumers):
+        seq_suffix = str(first_prod.recipe)[len("chunk_products"):]
+        allowed_exact = {
+            f"chunk_products{seq_suffix}",
+            f"recurrent_scan{seq_suffix}",
+            f"recurrent_output{seq_suffix}",
+            f"pcp_remote_initial_state{seq_suffix}",
+        }
+        seg_prefix = f"recurrent_scan{seq_suffix}_seg"
+        if any(
+            (str(consumer.recipe) not in allowed_exact
+             and not str(consumer.recipe).startswith(seg_prefix))
+            or consumer.phase != first_prod.phase
+            or consumer.requests != first_prod.requests
+            for consumer in consumers
+        ):
             continue
         # Fold L2Norm vector ops into chunk_products0; Q and K are already read there!
         replacements[first_prod.op_id] = replace(

@@ -225,15 +225,25 @@ class PoolKeyIndexerRecipe:
         })
 
     def lower(self, context):
-        ledger = dict(dict(context.op.metadata).get(POOL_LEDGER, {}))
+        metadata = dict(context.op.metadata)
+        ledger = dict(metadata.get(POOL_LEDGER, {}))
         waves = int(ledger["waves"])
+        prefix_hbm = metadata.get("prefix_read_hbm_bytes")
+        wave_hbm_cache = (
+            float(prefix_hbm) / float(max(1, waves))
+            if prefix_hbm is not None
+            else float(ledger["wave_cache_bytes"])
+        )
         floor = INDEXER_FLOOR_US + int(ledger["blocks"]) * POOL_SCAN_BLOCK_US
         floor /= MS_PER_SECOND
 
         def wave(index):
             parts = _pool_wave_work(ledger, index)
+            stream = dict(parts["stream"])
+            stream["hbm"] = (stream["hbm"] - float(ledger["wave_cache_bytes"])
+                             + wave_hbm_cache)
             return (
-                Stage("stream", context.bind(Work({}, dict(parts["stream"])))),
+                Stage("stream", context.bind(Work({}, stream))),
                 Stage("tiles", context.bind(Work(
                     {parts["dtype"]: parts["tiles"][parts["dtype"]]},
                     _matrix_free(parts["tiles"], parts["dtype"]))),
