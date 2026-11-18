@@ -507,3 +507,159 @@ def test_moe_init_routing_v3_projects_the_mxfp8_routing_contract():
         (inputs[0], inputs[1]), tuple(outputs))
     assert observed_contract_diagnostic(row)["reason"] == (
         "observed_tensor_contract_available")
+
+
+def test_shard1_windowed_mtp_request_cache_breakdown_conserves_bytes():
+    case = _case("deepseek-v4.1-flash", tp=4, ep=4, layers=4,
+                 mtp_proposal_tokens=3, mtp_acceptance_length=4)
+    memory = Memory(case)
+    breakdown = request_cache_breakdown(
+        case.model, case.runtime.parallel, 8192, draft_kind="mtp",
+        runtime=case.runtime)
+    batch = batch_cache_bytes(
+        case, sequences=1, context=8191, tokens_per_seq=1, phase="decode",
+        padded=True)
+    assert breakdown["by_component"]["draft_kv"] == pytest.approx(208_896.0)
+    assert breakdown["total_bytes"] == pytest.approx(2_207_744.0)
+    assert memory.cache_bytes(8192) == pytest.approx((2_207_744.0,))
+    assert tuple(batch.total_bytes) == pytest.approx((2_207_744.0,))
+
+
+def test_shard1_dense_mtp_index_cache_aligns_memory_and_batch_ledgers():
+    case = _case("glm-5.3-flash", tp=4, ep=4, layers=4,
+                 mtp_proposal_tokens=3, mtp_acceptance_length=4)
+    memory = Memory(case)
+    report = memory.allocation_report(8192)
+    breakdown = request_cache_breakdown(
+        case.model, case.runtime.parallel, 8192, draft_kind="mtp",
+        runtime=case.runtime)
+    batch = batch_cache_bytes(
+        case, sequences=1, context=8188, tokens_per_seq=4, phase="decode",
+        padded=True)
+    assert memory.cache_bytes(8192) == pytest.approx((30_610_432.0,))
+    assert report["cache"]["allocated"]["total_bytes_per_stage_rank"] == pytest.approx(
+        [30_610_432.0])
+    assert breakdown["total_bytes"] == pytest.approx(30_610_432.0)
+    assert tuple(batch.total_bytes) == pytest.approx((30_610_432.0,))
+
+
+def test_shard1_v41_window_layers_report_packed_window_row_bytes():
+    case = _case("deepseek-v4.1-flash", tp=4, ep=4, layers=4)
+    rows = dict(cache_row_bytes_by_layer(case.model))
+    assert rows[0] == 544
+    assert rows[1] == 544
+
+
+@pytest.mark.parametrize(("scale_dtype", "expected_row_bytes"), [
+    ("bf16", 608),
+    ("uint8", 584),
+])
+def test_shard1_mqsmla_mode1_and_mode2_align_capacity_structure_and_observed(
+    scale_dtype, expected_row_bytes,
+):
+    raw = compose_case(
+        "deepseek-v4.1-flash", hardware="Ascend950PR_958b", tp=4, dp=1, ep=4,
+        layers=4, prompt_tokens=128, output_tokens=2, graph_capture_mode="none",
+    )
+    region = {"dtype": "fp8_e4m3", "group_size": 32, "scale_dtype": scale_dtype}
+    meta = raw["model"].setdefault("metadata", {})
+    reps = dict(meta.get("cache_representations", {}))
+    reps["window"] = dict(region)
+    reps["compressed_kv"] = dict(region)
+    meta["cache_representations"] = reps
+    case = parse_case(raw)
+
+    assert dict(cache_row_bytes_by_layer(case.model))[0] == expected_row_bytes
+    layer0 = layer_cache_components(
+        case.model, case.model.layer_plans[0], case.runtime.parallel, 128,
+        runtime=case.runtime)
+    assert layer0["window"] == pytest.approx(128 * expected_row_bytes)
+    Memory(case).allocation_report(512)
+
+    exported = export_structure(
+        case, phase="decode", tokens=1, context=512, scope="model")
+    mqsmla_nodes = [node for node in exported["nodes"]
+                    if node.get("recipe") == "aclnn_mixed_quant_sparse_flash_mla"]
+    assert len(mqsmla_nodes) == 4
+    assert mqsmla_nodes[2]["contract"][3] == [
+        [[1, expected_row_bytes], "uint8", "ND"],
+        [[1, expected_row_bytes], "uint8", "ND"],
+    ]
+
+    query = ((1, 16, 512), "bf16", "ND")
+    empty = ((), None, None)
+    obs_inputs = [
+        query, empty, ((16, 1, 1, expected_row_bytes), "uint8", "ND"),
+        ((1, 16), "int32", "ND"), empty, empty, empty,
+        ((16, 1, 1, expected_row_bytes), "uint8", "ND"),
+        ((1, 16), "int32", "ND"), empty,
+    ]
+    obs = observed_attention_contract(
+        _observed_row("aclnnMixedQuantSparseFlashMla", obs_inputs, [query, empty]))
+    assert obs is not None
+    assert obs[3] == (
+        ((1, expected_row_bytes), "uint8", "ND"),
+        ((1, expected_row_bytes), "uint8", "ND"),
+    )
+    bad_inputs = [*obs_inputs[:7], ((16, 1, 1, 320), "uint8", "ND"), *obs_inputs[8:]]
+    assert observed_attention_contract(
+        _observed_row("aclnnMixedQuantSparseFlashMla", bad_inputs, [query, empty])
+    ) is None
+
+
+def test_shard1_multi_request_speculative_assemble_matches_service_steps():
+    case = _case(
+        "glm-5.3-flash", tp=1, dp=1, ep=1, layers=4,
+        mtp_proposal_tokens=2, mtp_acceptance_length=1.5,
+        max_num_batched_tokens=2,
+        prompt_tokens=4, output_tokens=3, raw_eager=True,
+    )
+    requests = [
+        {"request_id": "r0", "prompt_tokens": 4, "output_tokens": 3},
+        {"request_id": "r1", "prompt_tokens": 4, "output_tokens": 3},
+    ]
+    service = assemble(
+        case, scope="service", phase="decode", iterations=3, tokens=1,
+        context=4, requests=requests)
+    model = assemble(
+        case, scope="model", phase="decode", iterations=3, tokens=1,
+        context=4, requests=requests)
+    assert ([step["valid_tokens"] for step in model["steps"]]
+            == [step["valid_tokens"] for step in service["steps"]]
+            == [2, 2, 2, 2, 1])
+
+
+def test_shard1_subgraph_boundary_algebra_respects_producer_and_consumer_caps():
+    case = _case("deepseek-v3.2", tp=8, ep=8, layers=4, quant="w8a8")
+    exported = export_structure(
+        case, phase="prefill", tokens=128, context=0, scope="model")
+    prolog = next(
+        group for group in exported["subgraphs"]
+        if group["subgraph_id"].endswith("l0.mla_prolog"))
+    nodes = {node["node_id"]: node for node in exported["nodes"]}
+    members = tuple(prolog["node_ids"])
+    ext_out = set(prolog["external_outputs"])
+    internal_producers = {
+        m for m in members
+        if m not in ext_out
+        and any(m in nodes[c]["deps"] for c in members)
+    }
+    writes = sum(float(nodes[m]["physical_work"]["mte3_bytes"])
+                 for m in internal_producers)
+    max_reads = sum(
+        min(
+            float(nodes[c]["physical_work"]["mte2_bytes"]),
+            sum(
+                min(float(nodes[p]["physical_work"]["mte3_bytes"]),
+                    float(nodes[c]["physical_work"]["mte2_bytes"]))
+                for p in nodes[c]["deps"] if p in internal_producers
+            ),
+        )
+        for c in members
+    )
+    breakdown = prolog["math_summary"]["boundary_breakdown_bytes"]
+    assert max_reads == pytest.approx(1_983_488.0)
+    assert breakdown["eliminated_internal_roundtrip_bytes"] == pytest.approx(
+        writes + max_reads)
+    assert breakdown["minimal_boundary_hbm_bytes"] == pytest.approx(
+        breakdown["unfused_member_hbm_bytes"] - writes - max_reads)

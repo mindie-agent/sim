@@ -804,6 +804,7 @@ def cache_row_bytes_by_layer(model: ModelSpec) -> tuple[tuple[int, int], ...]:
     cache model, and shared K/V projection weights still store two cache
     planes.
     """
+    from mindie_sim.catalog.cache import packed_region_row_bytes
     from mindie_sim.catalog.cache_format import cache_format
     mla = cache_format(model, "mla_kv")
     gqa = cache_format(model, "gqa_kv")
@@ -813,7 +814,15 @@ def cache_row_bytes_by_layer(model: ModelSpec) -> tuple[tuple[int, int], ...]:
                 and not ZERO <= plan.kv_owner_layer_id < plan.index):
             row = gqa.row_bytes(plan.cache_row_elements)
         elif plan.attention == "mla":
-            row = mla.row_bytes(plan.cache_row_elements)
+            if plan.cache_kind == "dense":
+                row = mla.row_bytes(plan.cache_row_elements)
+            elif plan.window > ZERO:
+                row = packed_region_row_bytes(model, "window", plan.cache_row_elements)
+            elif plan.owns_long_kv:
+                row = packed_region_row_bytes(
+                    model, "compressed_kv", plan.cache_row_elements)
+            else:
+                row = ZERO
         else:
             row = 0
         rows.append((plan.index, int(row)))
