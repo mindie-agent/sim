@@ -12,8 +12,9 @@ from collections import Counter
 
 from mindie_sim.schema.common import ModelingError
 from .mechanism import OperatorPlan, PlannedRecipe, Work
-from .mxfp4_geometry import (Config, align, columns, panel_sizes, tile_runs,
-                              geometry_ledger)
+from .mxfp4_geometry import (Config, activation_l2_fraction, align, columns,
+                              effective_l2_bytes, geometry_ledger, panel_sizes,
+                              resplit_columns, tile_runs, weight_l2_fraction)
 from .mxfp4_registers import CLASSES, TABLES
 from .program import KernelProgram, ParallelProgram, PipelineProgram, Stage
 from .refill import RefillPipeline
@@ -21,6 +22,12 @@ from .mxfp4_panels import compiled_panels, panel_parts
 
 KIND = "ascend_mxa8w4_nznk"
 UB_BYTES = (80 + 128 + 1 + 32) * 1024
+L0A_FRACTAL_M = 16
+B8_VF_OWNERS = 64
+B8_NATIVE_I8_PER_CYCLE_PER_VF = 256
+B8_PROLOGUE_MASK = 2
+B8_PROLOGUE_DUPLICATE = 3
+NOMINAL_CLOCK_HZ = 1.65e9
 SOURCE = {
     "repository": "https://gitcode.com/cann/ops-transformer",
     "revision": "a3925fd49cd256ad478d2faf983bf2961b8ae2c8",
@@ -113,9 +120,23 @@ def build(op, geometry, *, compact=True, compact_panels=True, mte1_mode="base", 
         raise ModelingError("mxa8w4_nznk_source_static_buffers_exceed_device_capacity")
     # InitMx loads the 256-byte transpose permutation on every AIV, even when
     # that owner receives no expert tile. Scalar group-list caches are unknown.
-    ledger = geometry_ledger(config, cores, compact, directional)
+    l2_bytes = int(effective_l2_bytes(geometry))
+    # ``N_FIRST_TAIL_RESPLIT`` narrows the 256-column tiling into a 32-owner
+    # 128/160-column traversal and keeps the source DYNAMIC_BUFFER4 producer
+    # with its finite per-tile window.  Wide 256-column runs retain the compact
+    # equal-tile repetition; both schedules declare the same physical work.
+    resplit = resplit_columns(config, cores)
+    tile_compact = compact and not resplit
+    panel_compact = compact_panels and not resplit
+    producer = "dynamic_buffer4" if resplit else producer_mode
+    ledger = geometry_ledger(config, cores, tile_compact, directional, l2_bytes)
     total, inventory, counts, runs = ledger.work, ledger.inventory, ledger.counts, ledger.runs
-    owner_signatures = [tuple(tile_runs(config, owner, cores, compact)) for owner in range(cores)]
+    # Repeated column passes over one expert's activation rows hit the die's
+    # resident L2; only the first pass streams from off-chip memory.
+    activation_l2 = activation_l2_fraction(config, cores, l2_bytes)
+    weight_l2 = weight_l2_fraction(config, cores, l2_bytes)
+    owner_signatures = [tuple(tile_runs(config, owner, cores, tile_compact))
+                        for owner in range(cores)]
     synchronous_owners = Counter(owner_signatures)
 
     def owner_program(context, owner):
@@ -126,19 +147,20 @@ def build(op, geometry, *, compact=True, compact_panels=True, mte1_mode="base", 
                             for pool, size in pools.items() if pool != "ub") if counts[owner] else ()
         allocations += tuple(context.allocate(f"ub{owner}_{sub}", "ub", UB_BYTES,
                                                (2 * owner + sub,)) for sub in (0, 1))
-        schedule = tuple(tile_runs(config, owner, cores, compact))
+        schedule = tuple(tile_runs(config, owner, cores, tile_compact))
 
         def tile(index):
             m, n, repeat = schedule[index]
             arguments = dict(k=config.k, m=m, n=n, repeat=repeat,
-                             owner=owner, cores=cores, aivs=aivs, directional=directional)
-            if compact_panels:
+                             owner=owner, cores=cores, aivs=aivs, directional=directional,
+                             activation_l2=activation_l2, weight_l2=weight_l2)
+            if panel_compact:
                 # Only immutable physical IR is shared. Engine events, output
                 # stores and pool ownership belong to this particular call.
-                body = compiled_panels(context, **arguments, producer_mode=producer_mode,
+                body = compiled_panels(context, **arguments, producer_mode=producer,
                     shared_clients={context.resource_names["hbm"]:
                                     synchronous_owners[owner_signatures[owner]]})
-            elif producer_mode == "dynamic_buffer4":
+            elif producer == "dynamic_buffer4":
                 from .mxfp4_pipeline import SourcePipeline
                 from .mxfp4_source_refill import source_panel
                 kb, ka, _ = panel_sizes(m, n)
@@ -182,6 +204,9 @@ def build(op, geometry, *, compact=True, compact_panels=True, mte1_mode="base", 
             "active_banks": sum(m > 0 for m in config.rows),
             "declared_banks": len(config.rows), "columns": tuple(columns(config, cores)),
             "owner_tiles": counts, "owner_runs": runs,
+            "effective_l2_bytes": l2_bytes,
+            "activation_l2_fraction": activation_l2,
+            "weight_l2_fraction": weight_l2,
             "logical_flops": 2 * sum(config.rows) * config.n * config.k,
             # Source-facing matrix issue distinction: MMAD/FixPipe parameter m
             # is the valid row count, L0A is a full 16-row fractal transfer.
@@ -189,7 +214,7 @@ def build(op, geometry, *, compact=True, compact_panels=True, mte1_mode="base", 
                                                for m, _n, _r in tile_runs(config, owner, cores, compact)})),
             "fixpipe_m": tuple(sorted({m for owner in range(cores)
                                         for m, _n, _r in tile_runs(config, owner, cores, compact)})),
-            "l0a_issue_fractal_m": tuple(sorted({align(m, 16) for owner in range(cores)
+            "l0a_issue_fractal_m": tuple(sorted({align(m, L0A_FRACTAL_M) for owner in range(cores)
                                                   for m, _n, _r in tile_runs(config, owner, cores, compact)})),
             "matrix_issue_basis": "normal arch3510 FP8 Mmad 16x16x32; physical "
                                   "Cube M=16*ceil(m_arg/16); source API/FIX m=valid; "
@@ -203,11 +228,11 @@ def build(op, geometry, *, compact=True, compact_panels=True, mte1_mode="base", 
                     count.active_lanes for op, count in inventory.counts.items()
                     if op in {"ShiftRightB8", "ShiftLeftB8", "SelectB8", "AndB8"}),
                 "per_opcode": b8,
-                "native_i8_per_cycle_per_vf": 256,
-                "vf_owners": 64,
-                "nominal_clock_hz": 1.65e9,
-                "prologue": {"CreateMask": 2, "DuplicateB8": 3,
-                             "width_elements": 256, "once_per_invocation": True},
+                "native_i8_per_cycle_per_vf": B8_NATIVE_I8_PER_CYCLE_PER_VF,
+                "vf_owners": B8_VF_OWNERS,
+                "nominal_clock_hz": NOMINAL_CLOCK_HZ,
+                "prologue": {"CreateMask": B8_PROLOGUE_MASK, "DuplicateB8": B8_PROLOGUE_DUPLICATE,
+                             "width_elements": B8_NATIVE_I8_PER_CYCLE_PER_VF, "once_per_invocation": True},
                 "single_port_charge": False,
                 "source": "basic_block_vf_mx.h:386-403; 1 DIST_US_B8 read128B, "
                           "2 ShiftRight.I8, 1 ShiftLeft.I8, 1 Select, 1 And, 1 Store256B",
@@ -216,7 +241,8 @@ def build(op, geometry, *, compact=True, compact_panels=True, mte1_mode="base", 
             })({
                 op: {"raw_lanes": count.active_lanes,
                      "bound_us": (count.active_lanes
-                                  / (256 * 64 * 1.65e9) * 1e6)}
+                                  / (B8_NATIVE_I8_PER_CYCLE_PER_VF
+                                     * B8_VF_OWNERS * NOMINAL_CLOCK_HZ) * 1e6)}
                 for op, count in inventory.counts.items()
                 if op in {"ShiftRightB8", "ShiftLeftB8", "SelectB8", "AndB8"}}),
             "mte1_mode": mte1_mode,
@@ -227,11 +253,12 @@ def build(op, geometry, *, compact=True, compact_panels=True, mte1_mode="base", 
             "weight_layout": "explicit_selected_source_FRACTAL_NZ_NK",
             "output": "Fixpipe_FP32_to_BF16_GM; no_SiTU_or_Swiglu",
             "schedule": ("source_four_input_four_widen_two_scale_slots_and_two_L1_L0"
-                         if producer_mode == "dynamic_buffer4" else
+                         if producer == "dynamic_buffer4" else
                          "two_L1_refills_two_L0_consumers; serial_panel_supply_and_tile_drain"),
-            "producer_mode": producer_mode,
-            "compression": "consecutive_equal_owner_tiles_scaled_work_fluid" if compact else "detailed_tiles",
-            "k_panel_execution": "finite_nominal_cycle_coupled_interior" if compact_panels else "detailed_panels",
+            "producer_mode": producer,
+            "resplit_schedule": resplit,
+            "compression": "consecutive_equal_owner_tiles_scaled_work_fluid" if tile_compact else "detailed_tiles",
+            "k_panel_execution": "finite_nominal_cycle_coupled_interior" if panel_compact else "detailed_panels",
             "source_control": {
                 "get_split_value_and_branch_calls": len(config.rows) * cores,
                 "positive_bank_owner_tiles": sum(m > 0 for m in config.rows) * cores,
@@ -250,7 +277,7 @@ def build(op, geometry, *, compact=True, compact_panels=True, mte1_mode="base", 
                           "hardware_cache_hits",
                           "cross_output_tile_overlap", *(
                               ["AIV_producer_phase_overlap_between_panels"]
-                              if producer_mode == "serial" else [])],
+                              if producer == "serial" else [])],
         },
     })
 

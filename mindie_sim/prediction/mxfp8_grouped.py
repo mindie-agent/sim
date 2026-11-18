@@ -1,6 +1,7 @@
 """Explicit AIC-only MXFP8 NZ grouped matrix source program.
 
-[Role] Model CGMCT's rolling bank scheduler, MX copies and direct GM Fixpipe.
+[Role] Model CGMCT's rolling bank scheduler, MX copies and direct GM Fixpipe,
+  and the A5 ``npu_swiglu_mx_quant`` 64-AIV group-32 activation row program.
 [Invariants] Integer rows define work, not tensor capacity. M/N remain actual
   MMAD dimensions; LoadData uses aligned operands and paired E8M0 scales.
   Source tiling is geometry/declared input, never inferred from observed time.
@@ -35,6 +36,101 @@ SOURCE = {
 
 def align(value, granule):
     return ceil(value / granule) * granule
+
+
+NZ_N_GRANULE = 32
+NZ_K_GRANULE = 16
+MX_SCALE_GROUP = 32
+MX_SCALE_GROUP_PAIR = 64
+MX_SCALE_PAIR_BYTES = 2
+M_TILE_ROWS = 256
+#: Declared arch3510 L2 efficiency used only when no typed mechanism record is
+#: supplied; it is the same profile default as the mechanism specification.
+L2_EFFECTIVE_FRACTION = 0.75
+
+
+def effective_l2_bytes(geometry):
+    """Typed effective L2 capacity, or the declared profile fallback."""
+    mechanisms = getattr(geometry, "physical_mechanisms", None)
+    hierarchy = getattr(mechanisms, "memory_hierarchy", None)
+    if hierarchy is not None:
+        return float(hierarchy.effective_l2_bytes)
+    buffers = getattr(geometry, "buffers", {}) or {}
+    return L2_EFFECTIVE_FRACTION * float(buffers.get("l2", 0))
+
+
+def weight_bank_bytes(rows, n, k):
+    """Aligned NZ weight payload plus MX scale pairs over every expert bank."""
+    payload = sum(align(n, NZ_N_GRANULE) * align(k, NZ_K_GRANULE) for _ in rows)
+    scales = sum((m + n) * MX_SCALE_PAIR_BYTES
+                 * ceil(k / MX_SCALE_GROUP_PAIR) for m in rows)
+    return float(payload + scales)
+
+
+def activation_bank_bytes(rows, k):
+    return float(sum(rows) * k)
+
+
+def m_tile_second_pass(rows):
+    """Share of a bank's B-panel reads that belong to its second M-tile pass."""
+    tiles = max(1, ceil(max(rows) / M_TILE_ROWS)) if rows else 1
+    return (tiles - 1) / tiles
+
+
+def l2_residency(bytes_required, l2_bytes):
+    if bytes_required <= 0 or l2_bytes <= 0:
+        return 0.0
+    return min(1.0, float(l2_bytes) / float(bytes_required))
+
+
+def l2_fractions(rows, n, k, column_tiles, l2_bytes):
+    """Declared resident shares of the activation slice and repeated B panel.
+
+    ``activation`` is the share of a column pass whose ``[m_e, K]`` slice is
+    already resident from the first pass. ``weight`` is the second-M-tile share
+    of a 256-column B panel that stays on chip; the concurrent working set
+    includes the slice re-read by every column pass of the rolling ASWT window.
+    """
+    activation = activation_bank_bytes(rows, k)
+    weight = weight_bank_bytes(rows, n, k)
+    slice_share = l2_residency(activation, l2_bytes)
+    working = weight + activation * max(1, int(column_tiles))
+    panel_share = l2_residency(working, l2_bytes) * m_tile_second_pass(rows)
+    return (slice_share * (max(1, int(column_tiles)) - 1) / max(1, int(column_tiles)),
+            panel_share)
+
+
+def panel_work(m, n, kd, bk, *, activation_l2=0.0, weight_l2=0.0):
+    """Physical NZ reads, MX scale-pair reads, and aligned L1-to-L0 service.
+
+    ``activation_l2`` is the declared share of the activation slice already
+    resident from an earlier output-column pass over the same rows; that share
+    is served by the die's L2 while the weight columns keep streaming.
+    ``weight_l2`` is the declared share of a B column panel re-issued from the
+    owner's on-chip panel after the first M tile.
+    """
+    # ND A reads only valid elements; NZ B has physical N32/K16 padding.
+    scale = MX_SCALE_PAIR_BYTES * ceil(kd / MX_SCALE_GROUP_PAIR)
+    activation = m * kd
+    weight = align(n, NZ_N_GRANULE) * align(kd, NZ_K_GRANULE)
+    reads = activation + weight + (m + n) * scale
+    share = min(1.0, max(0.0, float(activation_l2)))
+    wshare = min(1.0, max(0.0, float(weight_l2)))
+    load = {'hbm': reads - activation * share - weight * wshare,
+            'mte2_aic': reads}
+    if share > 0 or wshare > 0:
+        load['l2'] = activation * share + weight * wshare
+    load = Work(resources=load)
+    steps = []
+    for kk in range(0, kd, bk):
+        # MX MMAD K and operand representation are padded to 64, unlike M/N.
+        mk = align(min(bk, kd - kk), 64)
+        # B uses transposed 2D loads: N32 payload, while the MX side
+        # scale path uses N16. Odd N16 tails issue several data-only loads.
+        operand = (align(m, 16) + align(n, 32)) * mk
+        operand += (align(m, 16) + align(n, 16)) * 2 * ceil(mk / 64)
+        steps.append((Work(resources={'mte1': operand}), Work({'fp8_e4m3': 2 * m * n * mk})))
+    return load, tuple(steps)
 
 
 @dataclass(frozen=True)
@@ -132,22 +228,106 @@ def owner_tiles(rows, n, tile, cores):
     return tuple(tuple(items) for items in owners)
 
 
-def panel_work(m, n, kd, bk):
-    """Physical NZ reads, MX scale-pair reads, and aligned L1-to-L0 service."""
-    # ND A reads only valid elements; NZ B has physical N32/K16 padding.
-    scale = 2 * ceil(kd / 64)
-    reads = m * kd + align(n, 32) * align(kd, 16) + (m + n) * scale
-    load = Work(resources={'hbm': reads, 'mte2_aic': reads})
-    steps = []
-    for kk in range(0, kd, bk):
-        # MX MMAD K and operand representation are padded to 64, unlike M/N.
-        mk = align(min(bk, kd - kk), 64)
-        # B uses transposed 2D loads: N32 payload, while the MX side
-        # scale path uses N16. Odd N16 tails issue several data-only loads.
-        operand = (align(m, 16) + align(n, 32)) * mk
-        operand += (align(m, 16) + align(n, 16)) * 2 * ceil(mk / 64)
-        steps.append((Work(resources={'mte1': operand}), Work({'fp8_e4m3': 2 * m * n * mk})))
-    return load, tuple(steps)
+#: ``npu_swiglu_mx_quant``: one 64-AIV wave over 64 contiguous rows, a serial
+#: SwiGLU + group-32 E8M0 row reduction and its payload/scale drain.  The
+#: declared cycles are the source UB recurrences; no measured multiplier.
+SWIGLU_MX_AIV_UNITS = 64
+SWIGLU_MX_GROUP = 32
+SWIGLU_MX_PROLOGUE_DRAIN_CYCLES = 4538
+SWIGLU_MX_NOMINAL_CLOCK_HZ = 1.65e9
+SWIGLU_MS_PER_SECOND = 1000
+SWIGLU_MX_STAGES = ("load_gate_up", "swiglu_amax_ue8m0",
+                    "store_payload_scale")
+
+
+def _a5_row_wave(geometry) -> bool:
+    """The 64-AIV arch35 row domain, read from device ownership only."""
+    units = getattr(geometry, "resource_units", {}) or {}
+    return int(units.get("vector", 0)) >= SWIGLU_MX_AIV_UNITS
+
+
+def _mx_group32(op) -> bool:
+    meta = dict(op.metadata)
+    group = int(meta.get("activation_group_size", 0) or 0)
+    scale = str(meta.get("scale_format")
+                or meta.get("activation_scale_format") or "")
+    return group == SWIGLU_MX_GROUP and scale in {"fp8_e8m0", "e8m0"}
+
+
+def build_swiglu_mx_quant(op, geometry):
+    """A5 group-32 row program; otherwise the registered Class D quantize plan."""
+    from dataclasses import replace as _replace
+    from .mechanism import OperatorPlan, Work
+    from .physical_recipe_base import build_plan, work_from_op
+    from .program import KernelProgram, PipelineProgram, Stage
+    from .vector_pipeline import AIVTiledVectorAndGatherRecipe
+    if not (_a5_row_wave(geometry) and _mx_group32(op)):
+        return build_plan(AIVTiledVectorAndGatherRecipe(), op, geometry)
+    base = work_from_op(op)
+    rows = int(op.local_shape[0])
+    read = float(op.mte2_bytes)
+    write = float(op.mte3_bytes)
+    vector = float(op.vector_ops)
+    waves = max(1, -(-rows // SWIGLU_MX_AIV_UNITS))
+    clock_ms = SWIGLU_MX_NOMINAL_CLOCK_HZ / SWIGLU_MS_PER_SECOND
+
+    def program(context):
+        # The AIV read path is a declared DRAM service; HBM still owns the
+        # physical bus bytes and the store stream.
+        mode = context.service_modes.get("mte2_aiv_dram")
+        if mode is not None:
+            context = _replace(context, service_modes={
+                **context.service_modes, "mte2": mode})
+        placement = context.owned(0, 1, ("mte2_aiv", "vector", "mte3"))
+
+        def tile(index):
+            start = index * SWIGLU_MX_AIV_UNITS
+            covered = min(SWIGLU_MX_AIV_UNITS, rows - start)
+            scale = covered / rows
+            load = read * scale
+            store = write * scale
+            compute = vector * scale
+            return (
+                # A row buffer is consumed by the same wave's store before the
+                # next load may address it; the two declared slots bound the
+                # producer but never invert the finite row order.
+                Stage("load_gate_up", context.bind(Work(
+                    resources={"hbm": load, "mte2": load})),
+                    placement=placement, previous=("store_payload_scale",)),
+                Stage("swiglu_amax_ue8m0", context.bind(Work(
+                    resources={"vector": compute})),
+                    after=("load_gate_up",), placement=placement),
+                Stage("store_payload_scale", context.bind(Work(
+                    resources={"hbm": store, "mte3": store})),
+                    after=("swiglu_amax_ue8m0",), placement=placement),
+            )
+
+        return KernelProgram((
+            Stage("kernel_prologue_drain",
+                  latency=SWIGLU_MX_PROLOGUE_DRAIN_CYCLES / clock_ms),
+            Stage("row_tiles", after=("kernel_prologue_drain",),
+                  program=PipelineProgram(waves, 2, tile)),
+        ))
+
+    return OperatorPlan(base, program, {
+        "fused_kernel": "npu_swiglu_mx_quant",
+        "row_tiles": waves,
+        "row_program": {"aiv_units": SWIGLU_MX_AIV_UNITS,
+                        "group_size": SWIGLU_MX_GROUP,
+                        "stages": SWIGLU_MX_STAGES,
+                        "prologue_drain_cycles": SWIGLU_MX_PROLOGUE_DRAIN_CYCLES},
+    })
+
+
+@dataclass(frozen=True)
+class ScopedSwigluRecipe(PlannedRecipe):
+    """Register the A5 group-32 row planner without rebinding other quantize ops."""
+
+    def prepare(self, op, geometry):
+        if not (_a5_row_wave(geometry) and _mx_group32(op)):
+            from .physical_recipe_registry import VECTOR
+            return op, VECTOR
+        return super().prepare(op, geometry)
 
 
 def build(op, geometry, *, l1_k=None, compact=True, compact_outputs=True):
@@ -173,13 +353,25 @@ def build(op, geometry, *, l1_k=None, compact=True, compact_outputs=True):
         if geometry.buffer_units.get(pool) != cores:
             raise ModelingError('mxfp8_grouped_requires_aic_buffers:' + pool)
     owners = owner_tiles(rows, n, tile, cores)
+    # The rolling ASWT window re-reads one [m, K] slice per output column tile
+    # and re-issues each bank's 256-column B panel for its second M tile.  The
+    # resident shares follow the declared effective-L2 capacity and this
+    # schedule's working set, never a measured rate or model label.
+    l2_bytes = int(effective_l2_bytes(geometry))
+    column_tiles = ceil(n / tile.n)
+    activation_l2, weight_l2 = l2_fractions(rows, n, k, column_tiles, l2_bytes)
+
+    def load_panel(m, width, kd):
+        return panel_work(m, width, kd, tile.k,
+                          activation_l2=activation_l2, weight_l2=weight_l2)
+
     scalar = Work(resources={'hbm': len(rows) * 8})
     total_work = scalar.scaled(cores)
     shapes = Counter((m, width) for items in owners for _, m, width, _, _ in items)
     for (m, width), occurrences in shapes.items():
         work = Work(resources={'hbm': 2 * m * width, 'fixpipe': 2 * m * width})
         for start in range(0, k, tile.l1_k):
-            load, steps = panel_work(m, width, min(tile.l1_k, k - start), tile.k)
+            load, steps = load_panel(m, width, min(tile.l1_k, k - start))
             work += load
             for a, b in steps:
                 work += a + b
@@ -208,7 +400,7 @@ def build(op, geometry, *, l1_k=None, compact=True, compact_outputs=True):
                 (m, width), repeat = runs[index]
                 count, tail = divmod(k, tile.l1_k)
                 def parts(kd):
-                    load, steps = panel_work(m, width, kd, tile.k)
+                    load, steps = load_panel(m, width, kd)
                     return stage('load', load), tuple((stage('operand', a),
                         stage('matrix', b, after=('operand',))) for a, b in steps)
                 full, end = parts(tile.l1_k) if count else None, parts(tail) if tail else None
@@ -247,7 +439,7 @@ def build(op, geometry, *, l1_k=None, compact=True, compact_outputs=True):
                 count, tail = divmod(k, tile.l1_k)
 
                 def parts(kd):
-                    load, steps = panel_work(m, width, kd, tile.k)
+                    load, steps = load_panel(m, width, kd)
                     return stage('load', load), tuple((stage('operand', a),
                         stage('matrix', b, after=('operand',))) for a, b in steps)
 
@@ -298,7 +490,10 @@ def build(op, geometry, *, l1_k=None, compact=True, compact_outputs=True):
         'source_mapping': {'base_m': tile.m, 'base_n': tile.n, 'base_k': tile.k,
             'equal_refill_k': tile.l1_k, 'scale_refill_k': tile.scale_k, 'l1_refill_basis': 'declared' if l1_k else 'host_full_k_le_256',
             'output_tiles_by_owner': tuple(len(v) for v in owners), 'group_rows': rows,
-            'buffers_per_owner': tile.buffers},
+            'buffers_per_owner': tile.buffers,
+            'effective_l2_bytes': l2_bytes, 'column_tiles': column_tiles,
+            'activation_l2_fraction': activation_l2,
+            'weight_l2_fraction': weight_l2},
         'execution_abstraction': ('source_same_owner_tile_runs_compact' if compact_outputs else
                                   'source_K_compact') if compact else 'source_K_detailed',
         'source_boundary': 'conditional_kernel',
