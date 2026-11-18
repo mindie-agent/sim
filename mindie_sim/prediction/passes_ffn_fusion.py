@@ -39,6 +39,8 @@ from .gated_activation import SITU_SOURCE
 from .implementations import (
     append_audit, attach_quantized_ports, rewire_replacements,
 )
+from .mxfp8_grouped import (SWIGLU_MX_AIV_UNITS, SWIGLU_MX_GROUP,
+                            SWIGLU_MX_STAGES)
 from .passes_mhc_recurrent import merge_meta, users_map
 from .structure_groups import declare_group, source_reference
 
@@ -68,6 +70,9 @@ ROUTER_SCORE_AND_TOPK_OPS = 5
 #: A hash layer reads one token id plus its ``top_k`` table entries per row.
 HASH_ROW_ID_BYTES = 8
 SELECTED_ID_BYTES = 4
+#: Narrow expert grids whose output tile count leaves fewer than one AIC wave
+#: declare Split-K across the free AICs; the registered planner owns the split.
+ROUTER_SPLITK_MAX_N = 1024
 ROUTED_SCALE_RECIPE = "router_routed_scale"
 ROUTE_NORMALIZE_RECIPE = "route_normalize"
 CONTRACT_HASH = "MoeGatingTopKHash"
@@ -85,9 +90,17 @@ ROUTER_TORCH_SOURCE = {
 
 
 def router_gemm(*, prefix, plan, deps, stage, requests, tokens, model, hidden, mode):
-    """Emit the router cast (only for an explicit FP32 plan) and router GEMM."""
+    """Emit the ``AscendGateLinear`` router: BF16 Cube operands, FP32 logits.
+
+    The narrow-N Tier-4 form consumes the checkpoint's BF16 gate matrix and
+    requests an FP32 accumulator/store, so it keeps BF16 Cube operands even
+    when the surrounding projection is MXFP8/FP8.  A narrow expert grid that
+    leaves fewer output tiles than AICs declares Split-K.  An explicit FP32
+    plan (``router_dtype == "fp32"``) keeps its declared cast unchanged.
+    """
     cast = None
     router_input, router_quant, router_category = deps, model.quant, "router"
+    output_dtype = plan.router_output_dtype or None
     if plan.router_dtype:
         if plan.router_dtype not in {"fp32", "bf16", "fp16"}:
             raise ModelingError(f"unsupported_router_compute_dtype:{plan.router_dtype}")
@@ -108,12 +121,20 @@ def router_gemm(*, prefix, plan, deps, stage, requests, tokens, model, hidden, m
                           ("output_format", plan.router_dtype)),
             )
             router_input = cast.op_id
+    elif output_dtype == "fp32":
+        router_quant = QuantSpec(name="declared_router_bf16", weight_format="bf16",
+                                 activation_format="bf16")
+        router_category = "router_runtime"
+    split_k = (not plan.router_dtype and output_dtype == "fp32"
+               and int(plan.num_experts) <= ROUTER_SPLITK_MAX_N)
     router = gemm_op(
         op_id=prefix + ".router", deps=(router_input,), stage=stage,
         layer=plan.index, requests=requests, m=tokens, n=plan.num_experts,
         k=plan.router_input_size or hidden, quant=router_quant,
         category=router_category, phase=mode, family="router", recipe="router",
-        output_dtype=plan.router_output_dtype or None,
+        output_dtype=output_dtype,
+        metadata=((("router_operand_form", "bf16_cube_fp32_output"),
+                   ("split_k_required", True)) if split_k else ()),
     )
     weight_dtype = dict(router.metadata)["output_format"]
     return ([] if cast is None else [cast]), router, weight_dtype, dtype_bytes(weight_dtype)
@@ -468,6 +489,10 @@ def activation_quant_fusion(ops, source_dtype):
         meta = dict(merge_meta(act, quant, extra=(
             ("fused_from", (act.family, "quantize")),
             ("primary_output", "payload"),
+            ("fused_kernel", "npu_swiglu_mx_quant"),
+            ("row_program", {"aiv_units": SWIGLU_MX_AIV_UNITS,
+                             "group_size": SWIGLU_MX_GROUP,
+                             "stages": SWIGLU_MX_STAGES}),
         )))
         append_audit(
             meta, kind="transform_boundary", op_id=quant.op_id,

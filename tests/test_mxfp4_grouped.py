@@ -7,7 +7,12 @@ from pathlib import Path
 import pytest
 
 from mindie_sim import operator_costs, target_graphs
-from mindie_sim.prediction.mxfp4_geometry import Config, columns, owner_tiles, tile_work
+from mindie_sim.prediction.mxfp4_geometry import (
+    Config, activation_l2_fraction, columns, effective_l2_bytes, owner_tiles,
+    tile_work, weight_l2_fraction,
+)
+from mindie_sim.prediction.mechanism import Geometry
+from mindie_sim.prediction.structure import parse_case
 from mindie_sim.prediction.matrix import TiledMatmul
 from mindie_sim.prediction.mxfp4_grouped import UB_BYTES, recipe
 from mindie_sim.prediction.program import RecipeBook
@@ -82,11 +87,16 @@ def test_ordinary_v41_frontend_selects_source_and_preserves_valid_rows(source_ca
                                          ((17,), 4608, 5120), ((1, 1), 5120, 2304)])
 def test_tail_work_is_conserved_on_real_resources(source_case, gate, rows, n, k):
     config = Config(k, n, rows)
+    geometry = Geometry.from_devices(parse_case(source_case).machine.dies)
+    l2_bytes = int(effective_l2_bytes(geometry))
+    activation_l2 = activation_l2_fraction(config, 32, l2_bytes)
+    weight_l2 = weight_l2_fraction(config, 32, l2_bytes)
     expected = {}
     flops = 0
     for owner in range(32):
         for *_, m, nt in owner_tiles(config, owner, 32):
-            work = tile_work(config, m, nt)
+            work = tile_work(config, m, nt, activation_l2=activation_l2,
+                             weight_l2=weight_l2)
             flops += work.matrix["fp8_e4m3"]
             for role, amount in work.resources.items():
                 expected[role] = expected.get(role, 0) + amount

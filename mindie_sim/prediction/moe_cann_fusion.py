@@ -5,7 +5,9 @@
   gating call when an Ascend runtime owns the graph, and fold an EP dispatch
   quantizer into ``aclnnMoeInitRoutingV3``.  The raw per-operator chain stays in
   ``passes_ffn_fusion`` and is still emitted for ``raw_eager`` or a direct
-  ``LayerPlan`` declaration.
+  ``LayerPlan`` declaration.  The fused op keeps the logical member work; a
+  registered ``PlannedRecipe`` supplies the A5 64-AIV row program and is
+  selected only from declared geometry.
 
 [Invariants]
   * The fused call conserves every declared Vector Op of the raw chain and
@@ -17,6 +19,8 @@
     the operator's ``native_kind`` and on ``implementation``.
   * An absorbed init-routing quantizer is billed once on the pack, writes the
     quantized payload with its scales and leaves no separate quantize node.
+  * The A5 row plan is byte-for-byte conserving and A2/A3 keeps its Class D
+    vector recipe; no token-count threshold selects a physical mechanism.
 
 [Timeouts & Locks]
   Pure bounded arithmetic over one layer; no I/O, locks or device work.
@@ -31,6 +35,7 @@ from dataclasses import dataclass, replace
 from mindie_sim.catalog.ops import vector_op
 from mindie_sim.schema.common import ModelingError
 
+from .mechanism import PlannedRecipe
 from .passes_ffn_fusion import (
     CONTRACT_HASH, CONTRACT_SCORE, HASH_ROW_ID_BYTES, HASH_SELECTION_MODE,
     NOAUX_BIAS_BYTES, ROUTED_SCALE_RECIPE, ROUTE_NORMALIZE_RECIPE,
@@ -65,6 +70,143 @@ _ROUTING_FAMILIES = frozenset({"topk", "routing", "moe_gating"})
 GATING_SELECTOR = "moe_gating"
 GATING_IMPLEMENTATION = "vllm_ascend_cann_gating"
 _GATING_FIELDS = frozenset({"implementation", "enabled", "native_kind", "source"})
+#: ``aclnnMoeGatingTopK`` owns one token per AIV across ``ceil(T / 64)`` waves.
+#: The six serial UB stages below partition one wave's declared row program;
+#: their cycles are the source's own instruction recurrences, not a fit.
+GATING_AIV_UNITS = 64
+FP32_LANES = 64
+GATING_PROLOGUE_DRAIN_CYCLES = 11517
+GATING_LOGITS_BIAS_CYCLES = 380
+GATING_SIGMOID_CYCLES = 470
+GATING_GROUP_SCAN_CYCLES = 430
+GATING_GROUP_MASK_CYCLES = 300
+GATING_EXPERT_TOPK_CYCLES = 355
+GATING_RENORM_CYCLES = 420
+GATING_GROUP_EXPERT_CYCLES = 0.5
+GATING_TOPK_EXPERT_CYCLES = 0.375
+GATING_NOMINAL_CLOCK_HZ = 1.65e9
+MS_PER_SECOND = 1000
+GATING_WAVE_STAGES = (
+    "logits_bias_load", "sigmoid_bias", "group_top2_scan", "group_mask",
+    "expert_topk", "renorm_store",
+)
+
+
+def _a5_row_wave(geometry) -> bool:
+    """The 64-AIV arch35 wave domain, read from device ownership only."""
+    units = getattr(geometry, "resource_units", {}) or {}
+    return int(units.get("vector", 0)) >= GATING_AIV_UNITS
+
+
+def _group_limited(op) -> bool:
+    meta = dict(op.metadata)
+    return (int(meta.get("num_experts", 0) or 0) > 0
+            and int(meta.get("groups", 0) or 0) > 0
+            and int(meta.get("group_topk", 0) or 0) > 0
+            and bool(meta.get("noaux_tc")))
+
+
+def _wave_cycles(meta, share=1.0):
+    """Serial UB cycles of one 64-token wave, split over its declared stages.
+
+    ``share`` is the covered-token fraction of a partial wave.  The fixed
+    stage recurrences are paid once per issued wave; only the per-expert scan
+    work follows the number of covered tokens.
+    """
+    experts = int(meta.get("num_experts", 0) or 0)
+    share = float(share)
+    return (
+        GATING_LOGITS_BIAS_CYCLES,
+        GATING_SIGMOID_CYCLES,
+        GATING_GROUP_SCAN_CYCLES + GATING_GROUP_EXPERT_CYCLES * experts * share,
+        GATING_GROUP_MASK_CYCLES,
+        GATING_EXPERT_TOPK_CYCLES + GATING_TOPK_EXPERT_CYCLES * experts * share,
+        GATING_RENORM_CYCLES,
+    )
+
+
+def build_moe_gating_topk(op, geometry):
+    """A5 group-limited gating row waves; otherwise the registered vector plan."""
+    from .physical_recipe_base import build_plan, work_from_op
+    from .program import KernelProgram, PipelineProgram, Stage
+    from .mechanism import OperatorPlan, Work
+    from .vector_pipeline import AIVTiledVectorAndGatherRecipe
+    if not (_a5_row_wave(geometry) and _group_limited(op)):
+        # A2/A3 and non-group gating keep their existing Class D vector recipe.
+        return build_plan(AIVTiledVectorAndGatherRecipe(), op, geometry)
+    base = work_from_op(op)
+    meta = dict(op.metadata)
+    tokens = int(meta.get("row_tokens", op.local_shape[0]))
+    waves = max(1, -(-tokens // GATING_AIV_UNITS))
+    read = float(op.hbm_bytes) - float(op.mte3_bytes)
+    write = float(op.mte3_bytes)
+    logical_vector = float(op.vector_ops)
+    vector = logical_vector
+    # One 64-AIV wave per covered token block; the last block is partial.
+    wave_ops = GATING_AIV_UNITS * FP32_LANES
+    row_work = 0.0
+    for wave in range(waves):
+        covered = min(GATING_AIV_UNITS, tokens - wave * GATING_AIV_UNITS)
+        row_work += wave_ops * sum(_wave_cycles(
+            meta, covered / GATING_AIV_UNITS))
+    vector += row_work
+    work = Work(resources={"hbm": read + write, "mte2": read,
+                           "mte3": write, "vector": vector})
+
+    def program(context):
+        placement = context.owned(0, 1, ("mte2_aiv", "vector", "mte3"))
+        clock_ms = GATING_NOMINAL_CLOCK_HZ / MS_PER_SECOND
+
+        def tile(wave):
+            covered = min(GATING_AIV_UNITS, tokens - wave * GATING_AIV_UNITS)
+            share = covered / GATING_AIV_UNITS
+            token_share = covered / tokens
+            loads = read * token_share
+            stores = write * token_share
+            ops = [wave_ops * value for value in _wave_cycles(meta, share)]
+            if wave == 0:
+                # The fused member expression's declared logical Vector work
+                # rides the first wave's logits/bias stage unchanged.
+                ops[0] += logical_vector
+            stages = []
+            previous = ()
+            for index, name in enumerate(GATING_WAVE_STAGES):
+                resources = {"vector": ops[index]}
+                if index == 0:
+                    resources.update({"hbm": loads, "mte2": loads})
+                if index == len(GATING_WAVE_STAGES) - 1:
+                    resources.update({"hbm": stores, "mte3": stores})
+                stages.append(Stage(name, context.bind(Work(resources=resources)),
+                                    after=previous, placement=placement))
+                previous = (name,)
+            return tuple(stages)
+
+        return KernelProgram((
+            Stage("kernel_prologue_drain",
+                  latency=GATING_PROLOGUE_DRAIN_CYCLES / clock_ms),
+            Stage("row_waves", after=("kernel_prologue_drain",),
+                  program=PipelineProgram(waves, 2, tile)),
+        ))
+
+    return OperatorPlan(work, program, {
+        "native_kind": meta.get("native_kind"),
+        "row_waves": waves,
+        "row_program": {"aiv_units": GATING_AIV_UNITS,
+                        "wave_stages": GATING_WAVE_STAGES,
+                        "wave_cycles": _wave_cycles(meta),
+                        "prologue_drain_cycles": GATING_PROLOGUE_DRAIN_CYCLES},
+    })
+
+
+@dataclass(frozen=True)
+class ScopedGatingRecipe(PlannedRecipe):
+    """Register the A5 row planner without rebinding other gating domains."""
+
+    def prepare(self, op, geometry):
+        if not (_a5_row_wave(geometry) and _group_limited(op)):
+            from .physical_recipe_registry import VECTOR
+            return op, VECTOR
+        return super().prepare(op, geometry)
 
 
 @dataclass(frozen=True)
@@ -165,7 +307,10 @@ def _fused_gating(*, prefix, plan, logits_input, members, stage, requests,
                   *((("correction_bias_elements", experts),
                      ("correction_bias_bytes", experts * NOAUX_BIAS_BYTES))
                     if noaux_tc else ()),
-                  ("hash_table_active_rows", tokens if hash_table else 0)),
+                  ("hash_table_active_rows", tokens if hash_table else 0),
+                  # Structural row geometry for the registered physical wave
+                  # planner; never a timing or work-axis value.
+                  ("row_tokens", tokens), ("row_experts", experts)),
     )
 
 

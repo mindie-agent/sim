@@ -177,5 +177,24 @@ def physical_family_bindings() -> dict[str, object]:
 
 
 def physical_recipe_bindings() -> dict[str, object]:
-    """Default exact recipes for topk/indexer names that are family-ambiguous."""
-    return {recipe: INDEXER for recipe in INDEXER_TOPK_RECIPES}
+    """Default exact recipes for topk/indexer names that are family-ambiguous.
+
+    The three source-planned kernels below resolve a declared recipe to a
+    ``PlannedRecipe`` builder.  Each builder is capability-scoped inside its own
+    module: A2/A3 or a non-matching operand form returns the previously
+    registered physical mechanism unchanged, so this registry never adds a
+    hardware branch to the execution loop.
+    """
+    from .matrix_splitk import (ScopedRouterRecipe, build_router_splitk)
+    from .moe_cann_fusion import ScopedGatingRecipe, build_moe_gating_topk
+    from .mxfp8_grouped import ScopedSwigluRecipe, build_swiglu_mx_quant
+    bindings = {recipe: INDEXER for recipe in INDEXER_TOPK_RECIPES}
+    bindings.update({
+        "moe_gating_topk": ScopedGatingRecipe(build_moe_gating_topk),
+        "router": ScopedRouterRecipe(build_router_splitk),
+    })
+    bindings.update({
+        f"{family}_quantize": ScopedSwigluRecipe(build_swiglu_mx_quant)
+        for family in ("swiglu", "situ", "geglu")
+    })
+    return bindings
