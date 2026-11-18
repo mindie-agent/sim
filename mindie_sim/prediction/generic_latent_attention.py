@@ -381,6 +381,14 @@ def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
             parts, ratio, cand_window,
             noncausal=bool(plan.noncausal_attention), kv_len=view.kv_len))
         pairs_by_view.append(v_rows)
+    # The TopK publisher's selected rows are the rows its consumers attend,
+    # not the full per-query score plane that feeds the reducer.
+    selected_by_view = [
+        sparse_over_parts(
+            visible_parts(view), plan, INDEX_QUERY_TILE,
+            dense=plan.cache_kind == "dense", kv_len=view.kv_len,
+            topk=plan.index_topk).gather_rows
+        for view in views]
     local = score_rows is not None
     rows = max(float(EMPTY_INDEX_ROWS), float(score_rows)) if local \
         else float(sum(pairs_by_view))
@@ -416,19 +424,21 @@ def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
         native_fused = (native_fusion_active(runtime)
                         and select(lowerings, "lightning_indexer") is None
                         and select(lowerings, "quant_lightning_indexer") is None)
+    # Query and head-weight operands are real reads in both lowerings.
+    by_id = {op.op_id: op for op in b.ops}
+    operand_bytes = sum(float(by_id[dep].mte3_bytes)
+                        for dep in deps[:2] if dep in by_id)
     if native_fused:
         # One CANN 9.2.1 kernel consumes Q, head weights and the candidate
         # cache rows and writes only the token indices. The FP32 score plane
         # is never materialized, so its write+read disappears.
-        by_id = {op.op_id: op for op in b.ops}
-        operand_bytes = sum(float(by_id[dep].mte3_bytes)
-                            for dep in deps[:2] if dep in by_id)
         fused = b.work(
             "index_quant_lightning", deps, (valid, plan.index_heads, plan.index_dim),
             flops=2 * rows * plan.index_heads * plan.index_dim / divisor,
             vector=(rows * plan.index_heads * 2 / divisor
                     + rows * math.log2(max(MIN_LOG_TOPK, plan.index_topk)) / divisor),
-            read=operand_bytes + hbm_rows * row_b / divisor,
+            read=operand_bytes + refill_rows * row_b / divisor,
+            hbm_read=operand_bytes + hbm_rows * row_b / divisor,
             write=valid * plan.index_topk * INT32_BYTES,
             family="indexer", dtype=index_arithmetic_dtype(model, quant),
             recipe="quant_lightning_indexer",
@@ -436,6 +446,10 @@ def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
                       ("fused_members", ("index_scores", "index_topk")),
                       ("intermediate_score_bytes", 0),
                       ("selection_output_dtype", "int32"),
+                      ("selected_token_rows", float(sum(selected_by_view))),
+                      ("selected_request_ids",
+                       tuple(view.request_id for view in views)),
+                      ("selected_tokens_by_request", tuple(selected_by_view)),
                       ("index_score_shards", max(MIN_INDEX_FACTOR, int(shard))),
                       ("index_context_partitions", cp),
                       ("index_candidate_filter", bool(plan.candidate_filter)),
@@ -456,8 +470,8 @@ def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
     scores = b.work("index_scores", deps, (valid, plan.index_heads, plan.index_dim),
                     flops=2 * rows * plan.index_heads * plan.index_dim / divisor,
                     vector=rows * plan.index_heads * 2 / divisor,
-                    read=float(refill_rows) * row_b / divisor,
-                    hbm_read=hbm_rows * row_b / divisor,
+                    read=operand_bytes + float(refill_rows) * row_b / divisor,
+                    hbm_read=operand_bytes + hbm_rows * row_b / divisor,
                     write=rows * FP32_BYTES / divisor, family="indexer",
                     dtype=index_arithmetic_dtype(model, quant),
                     metadata=(("index_score_shards", max(MIN_INDEX_FACTOR, int(shard))),
@@ -480,11 +494,27 @@ def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
                  read=rows * FP32_BYTES / divisor,
                  write=valid * plan.index_topk * INT32_BYTES,
                  family="topk", dtype="fp32",
-                 metadata=(("selection_output_dtype", "int32"),))
+                 metadata=(("selection_output_dtype", "int32"),
+                           ("selected_token_rows", float(sum(selected_by_view))),
+                           ("selected_request_ids",
+                            tuple(view.request_id for view in views)),
+                           ("selected_tokens_by_request", tuple(selected_by_view))))
     declare_indexer(b.ops, prefix=prefix, plan=plan, parallel=parallel, model=model,
                     quant=quant, views=views, padded_tokens=padded_tokens,
                     scores=scores, topk=topk)
     return topk
+
+
+def owned_completed_rows(view, ratio):
+    """Compression groups completed inside the rank's owned query intervals."""
+    context = max(0, int(getattr(view, "context", 0) or 0))
+    ranges = tuple(getattr(view, "query_ranges", ()) or ())
+    if not ranges:
+        return (completed_rows(context + int(view.q_len), ratio)
+                - completed_rows(context, ratio))
+    return sum(
+        completed_rows(context + end, ratio) - completed_rows(context + start, ratio)
+        for start, end in ranges if int(end) > int(start))
 
 
 def view_causal_pairs(view, query, context, window):
@@ -505,6 +535,23 @@ def view_causal_pairs(view, query, context, window):
     return counted
 
 
+def window_tile_rows(plan, context, query, start, query_tile, kv_len):
+    """Distinct KV rows one causal tile reads from the first query's window.
+
+    A tile can contain several queries; their sliding windows overlap, so the
+    span runs from the first query's window start through the last query's end
+    rather than charging only ``min(horizon, window)`` rows.
+    """
+    hi = int(kv_len) if plan.noncausal_attention else context + min(
+        query, start + query_tile)
+    if plan.window <= 0:
+        return hi
+    if plan.noncausal_attention:
+        return min(hi, plan.window)
+    low = max(0, context + start + 1 - plan.window)
+    return max(0, hi - low)
+
+
 def kv_sweeps(parts, plan, view, query_tile, *, dense, topk):
     """Tile sweeps. Each span's horizon is ``context_before_span + tile_end``."""
     sweeps = 0
@@ -515,9 +562,17 @@ def kv_sweeps(parts, plan, view, query_tile, *, dense, topk):
             horizon = (view.kv_len if plan.noncausal_attention
                        else context + min(query, start + query_tile))
             if dense:
-                sweeps += min(horizon, dense_cap) if dense_cap > 0 else horizon
+                if dense_cap <= 0:
+                    sweeps += horizon
+                elif plan.window > 0 and dense_cap == plan.window:
+                    sweeps += window_tile_rows(
+                        plan, context, query, start, query_tile, view.kv_len)
+                else:
+                    sweeps += min(horizon, dense_cap)
             else:
-                window_rows = min(horizon, plan.window) if plan.window else 0
+                window_rows = (window_tile_rows(
+                    plan, context, query, start, query_tile, view.kv_len)
+                    if plan.window else 0)
                 sweeps += window_rows + min(
                     completed_rows(horizon, plan.compress_ratio), long_cap)
     return sweeps
@@ -544,12 +599,15 @@ def sparse_over_parts(parts, plan, query_tile, *, dense, kv_len=None, topk=None)
 
 
 def attention_view_record(view, *, plan, model, quant, query_tile, eff_cp, block,
-                          interleave, tp, dsa, topk_present, heads, latent_dim):
+                          interleave, tp, dsa, topk_present, heads, latent_dim,
+                          shared_selection=None):
     """Per-view logical pairs, owned sweeps and batch row vectors."""
     context, query = view.context, view.q_len
     parts = dsa_cp_prefill_parts(view, tp) if dsa else visible_parts(view)
     eff_q = (sum(q_part for q_part, _ in parts)
              if dsa and view.phase == "prefill" else query)
+    selected_rows = (shared_selection.rows_for(view.request_id)
+                     if shared_selection is not None else None)
     dense_cap = min_positive(plan.window, plan.index_topk if topk_present else 0)
     if plan.cache_kind == "dense":
         if topk_present:
@@ -592,6 +650,17 @@ def attention_view_record(view, *, plan, model, quant, query_tile, eff_cp, block
             parts, plan, query_tile, dense=plan.cache_kind == "dense",
             kv_len=view.kv_len,
             topk=dense_cap if plan.cache_kind == "dense" else plan.index_topk)
+        if selected_rows is not None:
+            # A shared MTP selection belongs to its producer: every later
+            # proposal step reads the same INT32 rows and attends the same
+            # selected tokens, regardless of its wider verification batch.
+            gathered = traffic.gather_rows
+            fixed = max(0, int(selected_rows))
+            traffic = replace(
+                traffic, gather_rows=fixed,
+                index_read_bytes=int(fixed * INT32_BYTES))
+            if plan.index_kpool <= 1:
+                pairs = float(pairs) + float(fixed - gathered)
         if plan.index_kpool > 1:
             pairs = float(traffic.total_cache_rows)
         sweeps = traffic.total_cache_rows
@@ -687,8 +756,7 @@ def window_cache_read(plan, view, parts, sweeps, eff_cp, query_tile, elements, m
     if plan.cache_kind != "window_compressed":
         return None
     original_rows = sum(
-        min(view.kv_len if plan.noncausal_attention
-            else c_part + min(q_part, start + query_tile), plan.window)
+        window_tile_rows(plan, c_part, q_part, start, query_tile, view.kv_len)
         for q_part, c_part in parts
         for start in range(0, q_part, query_tile)
     ) if plan.window else 0

@@ -279,6 +279,7 @@ class _EngineCatalogMixin:
             placement=placement or None,
             coupled=bool(getattr(stage, "coupled", False)),
             priority=int(getattr(stage, "priority", 0)),
+            cohort_size=int(getattr(stage, "cohort_size", 1)),
             after=tuple(deps), owner=owner, on_complete=on_complete,
             metadata={"occurrence": frame.occurrence,
                       "catalog_stage": stage.label})
@@ -465,21 +466,29 @@ class _EngineCatalogMixin:
             frame = self._unit_binding(binding, index, finite)
             roots = list(setup) or [device_root]
             acquired = dict(invocation_acquired)
+            # A previous-iteration edge must resolve against the snapshot taken
+            # before this tile is issued; same-tile ``after`` edges resolve
+            # against the nodes already published by this tile.
+            previous = dict(cursor["previous"])
             tails = []
             for stage in stages:
                 local = int(getattr(stage, "local_id", len(nodes)))
                 deps = list(roots)
                 for edge in getattr(stage, "relative_after", ()):
                     if edge.source_node is not None:
-                        dep = cursor["previous"].get(int(edge.source_node))
+                        source = int(edge.source_node)
+                        if int(getattr(edge, "iteration_delta", 0)) < 0:
+                            dep = previous.get(source)
+                        else:
+                            dep = nodes.get(source)
                         if dep is not None:
                             deps.append(dep)
                     elif edge.external_port:
                         external = frame.values.get(edge.external_port)
                         if external is not None:
                             deps.append(external.ready)
-                if local in cursor["previous"]:
-                    deps.append(cursor["previous"][local])
+                if local in previous:
+                    deps.append(previous[local])
                 nested = getattr(stage, "nested_catalog", None)
                 if nested is not None:
                     sub = self.submit_catalog(

@@ -424,8 +424,16 @@ def absorb_init_routing(*, pack, quantizer, ep, dispatch_owns_quant=False):
         "vector_ops": float(quantizer.vector_ops),
         "write_bytes": float(quantizer.mte3_bytes),
     }
+    # ``route_unpack`` still consumes the pack's inverse token-slot map after
+    # the BF16 payload is replaced by the quantized payload.  That INT32
+    # auxiliary write is four bytes per routed slot and must survive.
+    routed_slots = 1
+    for extent in pack.local_shape:
+        routed_slots *= max(1, int(extent))
+    inverse_bytes = float(routed_slots) * float(SELECTED_ID_BYTES)
+    routing["inverse_index_bytes"] = inverse_bytes
     read = float(pack.mte2_bytes)
-    write = float(quantizer.mte3_bytes)
+    write = float(quantizer.mte3_bytes) + inverse_bytes
     pack_meta = dict(pack.metadata)
     pack_meta.update({
         "native_kind": INIT_ROUTING_NATIVE_KIND,
@@ -435,10 +443,13 @@ def absorb_init_routing(*, pack, quantizer, ep, dispatch_owns_quant=False):
         "activation_scale_shape": routing["scale_shape"],
         "activation_scale_bytes": routing["scale_bytes"],
         "activation_quantization_scope": "absorbed_dispatch_expert_input",
+        "inverse_index_bytes": inverse_bytes,
+        "inverse_index_dtype": "int32",
     })
     return replace(
         pack, recipe="moe_init_routing_v3", family="routing",
         vector_ops=float(pack.vector_ops) + float(quantizer.vector_ops),
         mte2_bytes=read, mte3_bytes=write, hbm_bytes=read + write,
-        returns=tuple(dict.fromkeys((*pack.returns, "activation_scales"))),
+        returns=tuple(dict.fromkeys((
+            *pack.returns, "activation_scales", "inverse_indices"))),
         metadata=tuple(pack_meta.items())), quantizer.op_id

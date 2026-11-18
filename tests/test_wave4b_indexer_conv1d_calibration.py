@@ -351,6 +351,9 @@ def _views(count):
 
 def _selection_ops(*, o_proj_tp, metadata=(), pool=16):
     plan, model = _case_model(pool=pool)
+    # The native caller declares the FP32 pool scale layout (132 B rows).
+    model = replace(model, quant=replace(model.quant,
+                                         index_scale_dtype="fp32"))
     views = _views(BATCH)
     builder = Builder("s0.l0", plan, 0, views, model, "decode")
     ready = ipn.selection(

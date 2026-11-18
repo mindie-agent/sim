@@ -121,6 +121,25 @@ def _logical_rows(access: CacheAccess) -> float:
     return float(max(ONE, total))
 
 
+def _merged_interval_rows(intervals) -> int:
+    """Union length of absolute half-open row intervals."""
+    ordered = sorted((int(start), int(end)) for start, end in intervals
+                     if int(end) > int(start))
+    total = ZERO
+    start = end = None
+    for first, last in ordered:
+        if start is None:
+            start, end = first, last
+        elif first <= end:
+            end = max(end, last)
+        else:
+            total += end - start
+            start, end = first, last
+    if start is not None:
+        total += end - start
+    return total
+
+
 def _materialized_prefix(access: CacheAccess, cache_state: Mapping[str, Any] | None) -> int:
     declared = max(ZERO, int(access.prefix_tokens))
     if not cache_state:
@@ -184,32 +203,38 @@ def plan_prefix_reads(
     core = ZERO
     logical_rows = math.fsum(_logical_rows(access) for access in accesses)
     unique_rows = ZERO
-    groups: dict[tuple[int, str, str, float], tuple[int, float]] = {}
+    groups: dict[tuple[int, str, str, float], list[tuple[int, int]]] = {}
     for access in accesses:
         context = max(ZERO, int(access.context_tokens))
+        q_len = max(ONE, int(access.q_len))
         rows = _logical_rows(access)
         limit = int(access.logical_rows) if int(access.logical_rows) > ZERO else context
         prefix = min(_materialized_prefix(access, cache_state), limit)
-        private = max(ZERO, rows - float(prefix))
-        unique += private * float(access.row_bytes)
-        core += private * float(access.row_bytes)
-        unique_rows += private
-        if prefix > ZERO:
+        # One access reads one absolute window; a windowed sequence owns only
+        # its latest ``logical_rows`` rows, while a dense scan starts at zero.
+        end = context + q_len
+        start = ZERO if rows >= end else max(ZERO, end - int(rows))
+        span = max(ZERO, end - start)
+        shared = min(max(ZERO, int(prefix)), span)
+        private = max(ZERO, span - shared)
+        unique += float(private) * float(access.row_bytes)
+        unique_rows += float(private)
+        # MTE2 stays the per-tile refill service of each access.
+        core += rows * float(access.row_bytes)
+        if shared > ZERO:
             key = (int(access.layer), str(access.component),
                    str(access.prefix_key), float(access.row_bytes))
-            previous = groups.get(key)
-            if previous is None or prefix > previous[ZERO]:
-                groups[key] = (prefix, float(access.row_bytes))
-    for prefix, row in groups.values():
-        unique += float(prefix) * row
-        core += float(prefix) * row
-        unique_rows += float(prefix)
+            groups.setdefault(key, []).append((start, start + shared))
+    for key, intervals in groups.items():
+        shared_rows = _merged_interval_rows(intervals)
+        unique += float(shared_rows) * float(key[3])
+        unique_rows += float(shared_rows)
     if logical_rows > ZERO:
         unique_scale = scale_total * unique_rows / logical_rows
     else:
         unique_scale = scale_total
     unique += unique_scale
-    core += unique_scale
+    core += scale_total
     applied = bool((logical - unique) > SAVINGS_EPS)
     return PrefixReadPlan(
         logical, unique, core, query_reads, scale_total, ZERO, ZERO,

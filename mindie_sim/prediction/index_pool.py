@@ -43,10 +43,19 @@ SOURCE = {
 
 
 ROW_SHARD_OPTION = "keypool_row_shard_tp"
+#: Accepted alias used by callers that already spell the axis generically.
+ROW_SHARD_ALIAS = "row_shard_tp"
 
 
 def recipes():
     return {}
+
+
+def _row_shard_value(source):
+    if source is None:
+        return None
+    value = source.get(ROW_SHARD_OPTION)
+    return source.get(ROW_SHARD_ALIAS) if value is None else value
 
 
 def row_shard_tp(*, options=None, runtime=None):
@@ -56,13 +65,13 @@ def row_shard_tp(*, options=None, runtime=None):
     of this rank's `o_proj` / `linear_proj` owns the shard. A width of one keeps
     the replicated query plane, so both modes stay selectable.
     """
-    explicit = (options or {}).get(ROW_SHARD_OPTION)
+    explicit = _row_shard_value(options)
     if explicit is not None:
         if isinstance(explicit, bool) or not isinstance(explicit, int) or explicit < 1:
             raise ModelingError("index_pool_row_shard_tp_invalid")
         return explicit
     metadata = dict(getattr(runtime, "metadata", ()) or ())
-    declared = metadata.get(ROW_SHARD_OPTION)
+    declared = _row_shard_value(metadata)
     if declared is not None:
         if isinstance(declared, bool) or not isinstance(declared, int) or declared < 1:
             raise ModelingError("index_pool_row_shard_tp_invalid")
@@ -545,6 +554,9 @@ def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
               ("causal_token_pairs", _causal_token_pairs(views, noncausal=bool(plan.noncausal_attention))),
               ("scanned_pools", scanned), ("selected_pools", selected),
               ("selected_token_rows", valid_indices),
+              ("selected_request_ids", tuple(v.request_id for v in views)),
+              ("selected_tokens_by_request",
+               tuple(g.selected_tokens for g in geometry)),
               ("native_owner_schedule", "not_selected"),
               ("implementation_basis", "analytic_resource_phases"), ("native_source", SOURCE))
     query_dtype = _op_dtype(b, query, quant.index_dtype)

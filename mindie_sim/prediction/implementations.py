@@ -1534,20 +1534,29 @@ def semantic_attrs(ops, keys):
 
 
 def attach_quantized_ports(ops, replacements):
-    """Name payload and scale ports for consumers of a fused quantizer.
+    """Name payload and scale ports for matrix consumers of a fused quantizer.
 
-    A matrix consumer reads both the low-precision payload and its scale; an
-    unrelated norm/residual consumer is left to its already named port.
+    A matrix consumer reads both the low-precision payload and its scale.  A
+    producer of scales (``add_rmsnorm_quant``) is not a consumer of them, and a
+    reader that already owns a named ``residual`` port keeps that edge.
     """
     result = list(ops)
     for index, op in enumerate(result):
         metadata = dict(op.metadata)
+        if metadata.get("program_kind") != "matmul":
+            continue
         if not (metadata.get("activation_scale_bytes")
                 or metadata.get("activation_scale_in_mte2")):
             continue
+        existing = {entry.get("op"): entry.get("output")
+                    for entry in input_ports(op)}
         entries = []
         for dep in op.deps:
-            if dep not in replacements:
+            fused = replacements.get(dep)
+            if fused is None or existing.get(dep) == "residual":
+                continue
+            if not any(value["output"] == "payload"
+                       for value in produced_values(fused)):
                 continue
             entries.extend((
                 {"op": dep, "output": "payload", "source_op": dep},

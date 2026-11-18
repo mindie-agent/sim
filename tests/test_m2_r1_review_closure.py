@@ -92,9 +92,11 @@ def test_deepseek_4k_prefill_index_scores_read_each_key_union_once():
     first = scores[0]
     by_id = {op.op_id: op for op in ops}
     operand_bytes = sum(by_id[dep].mte3_bytes for dep in first.deps[:2])
-    # The fused native score+TopK call reads Q, the head weights and the key
-    # union once; no FP32 score plane is materialized.
+    # The fused native score+TopK call reads Q, the head weights and every
+    # per-tile key refill on MTE2; the external HBM union is charged once.
     assert first.mte2_bytes - operand_bytes == pytest.approx(
+        INDEX_REFILL_ROWS_PER_LAYER * INDEX_ROW_BYTES)
+    assert first.hbm_bytes - operand_bytes - first.mte3_bytes == pytest.approx(
         INDEX_KEY_BYTES_PER_LAYER)
     # Per-query arithmetic is unchanged; only the external key fetch shrinks.
     assert first.flops == pytest.approx(
@@ -102,6 +104,9 @@ def test_deepseek_4k_prefill_index_scores_read_each_key_union_once():
         * INDEX_HEADS * INDEX_DIM)
     assert sum(op.mte2_bytes - sum(by_id[dep].mte3_bytes for dep in op.deps[:2])
                for op in scores) == pytest.approx(
+        DEEPSEEK_LAYERS * INDEX_REFILL_ROWS_PER_LAYER * INDEX_ROW_BYTES)
+    assert sum(op.hbm_bytes - sum(by_id[dep].mte3_bytes for dep in op.deps[:2])
+               - op.mte3_bytes for op in scores) == pytest.approx(
         DEEPSEEK_LAYERS * INDEX_KEY_BYTES_PER_LAYER)
 
 
@@ -166,7 +171,8 @@ def test_shared_prefix_component_replacement_preserves_query_output():
     assert updated.hbm_bytes == pytest.approx(cold_kv + QO_BYTES)
     assert updated.hbm_bytes - cold_kv == pytest.approx(QO_BYTES)
     assert updated.mte3_bytes == pytest.approx(out_write)
-    assert updated.mte2_bytes - cold_kv == pytest.approx(q_read)
+    # MTE2 keeps every per-tile refill; only the external HBM fill unions.
+    assert updated.mte2_bytes == pytest.approx(kv_precharged + q_read)
 
 
 # --------------------------------------------------------------------------- #

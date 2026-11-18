@@ -36,6 +36,10 @@ INT32_BYTES = int(dtype_bytes("int32"))
 INT64_BYTES = int(dtype_bytes("int64"))
 INDEX_POOL_SCALES = 1
 SUPPORTED_INDEX_DTYPES = frozenset({"bf16", FP8_INDEX_DTYPE})
+#: The native caller consumes FP32 scales (or none) for an FP8 pool row.
+SUPPORTED_INDEX_SCALES = frozenset({"fp32", "none"})
+#: Checkpoint categories whose native caller keeps BF16 wk/wgate projections.
+POOL_PROJECTION_CATEGORIES = ("indexer.pool_projection", "indexer.pool_gate")
 SUPPORTED_HEAD_WEIGHTS = frozenset({("bf16", "bf16"), ("fp32", "fp32")})
 SUPPORTED_PHASES = frozenset({"decode", "draft"})
 POOL_KEY_RECIPE = "cann_pool_key_indexer"
@@ -97,7 +101,27 @@ def prepare_model(model, runtime, binding):
         "block_table_columns_explicit": "block_table_columns" in options,
         "row_shard_tp": row_shard_tp(options=options, runtime=runtime),
         "source": SOURCE}}
-    return replace(model, metadata=tuple(sorted(metadata.items())))
+    # The analytic prefill fallback executes the checkpoint's BF16 wk/wgate
+    # projections.  Bind those two categories to the resident native format so
+    # prefill and the native decode caller read the same checkpoint weights;
+    # an explicit caller override (including a parent role) still wins.
+    native_format = str(model.quant.native_format or "bf16")
+    explicit = dict(model.quant.category_overrides)
+
+    def declared(category):
+        names = category.split(".")
+        return any(".".join(names[:index + 1]) in explicit
+                   for index in range(len(names)))
+
+    additions = tuple(
+        (category, (("weight_format", native_format),
+                    ("activation_format", native_format)))
+        for category in POOL_PROJECTION_CATEGORIES
+        if not declared(category))
+    quant = (replace(model.quant, category_overrides=(
+        *model.quant.category_overrides, *additions))
+        if additions else model.quant)
+    return replace(model, quant=quant, metadata=tuple(sorted(metadata.items())))
 
 
 def _supported(views, plan, model, quant):
@@ -113,6 +137,8 @@ def _supported(views, plan, model, quant):
         and not plan.qk_rope_head_dim
         and model.activation_dtype == "bf16"
         and resolved.index_dtype in SUPPORTED_INDEX_DTYPES
+        and (resolved.index_dtype != FP8_INDEX_DTYPE
+             or resolved.index_scale_dtype in SUPPORTED_INDEX_SCALES)
         and all(v.phase in SUPPORTED_PHASES and v.q_len >= 1 for v in views)
         and weights in SUPPORTED_HEAD_WEIGHTS)
 
@@ -128,10 +154,19 @@ def _contract(b, views, plan, quant):
     return dict(b.model.metadata)["native_keypool_caller"]
 
 
+def _pooled_scale_bytes(quant):
+    """Declared scale bytes of one FP8 pool row (FP32 or none)."""
+    if quant.index_dtype != FP8_INDEX_DTYPE:
+        return 0
+    if str(quant.index_scale_dtype) in {"", "none"}:
+        return 0
+    return INDEX_POOL_SCALES * FP32_BYTES
+
+
 def _pooled_row_bytes(quant, width):
     """One quantized pool row: payload plus its declared group scale."""
     if quant.index_dtype == FP8_INDEX_DTYPE:
-        return width * FP8_BYTES + INDEX_POOL_SCALES * FP32_BYTES
+        return width * FP8_BYTES + _pooled_scale_bytes(quant)
     return width * int(dtype_bytes(quant.index_dtype))
 
 
@@ -246,9 +281,8 @@ def producer(b, *, source, views, plan, model, quant, padded_tokens, **options):
             ("tail_dtype", "fp32"), ("cache_visible", True),
             ("pooled_row_bytes", pooled_row),
             ("pooled_payload_bytes", width * int(dtype_bytes(quant.index_dtype))),
-            ("pooled_scale_bytes", INDEX_POOL_SCALES * FP32_BYTES
-             if quant.index_dtype == FP8_INDEX_DTYPE else 0),
-            ("pooled_scale_dtype", "fp32" if quant.index_dtype == FP8_INDEX_DTYPE else "none"),
+            ("pooled_scale_bytes", _pooled_scale_bytes(quant)),
+            ("pooled_scale_dtype", "fp32" if _pooled_scale_bytes(quant) else "none"),
             ("cache_dtype", quant.index_dtype)))
     declare_group(b.ops, key=b.prefix + ".key_pool", role="key_pool", family="pooled_indexer",
         members=tuple(op.op_id for op in b.ops[start:]), entries=(gather,), anchor=stored,
@@ -340,6 +374,8 @@ def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
         scanned_pools=scanned, selected_pools=selected,
         safe_reference_scanned_pools=scanned,
         selected_token_rows=sum(g.selected_tokens for g in geometry),
+        selected_request_ids=tuple(v.request_id for v in owned_views),
+        selected_tokens_by_request=tuple(g.selected_tokens for g in geometry),
         blocks=ledger["blocks"], waves=ledger["waves"],
         score_mode=score_mode, score_algebra_basis="declared_analytical_reference; native_CANN_algebra_unbound")
     start = len(b.ops)
@@ -369,7 +405,10 @@ def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
     if hierarchy is not None and runtime is not None:
         by_id = {op.op_id: op for op in b.ops}
         scored = by_id[indices]
-        kv_bytes = float(scanned * pool_row_bytes)
+        # The physical candidate plane is the wave-deduplicated cache the
+        # recipe already priced; a raw scanned-pool row total can exceed the
+        # operator's own HBM bytes and drive the shared-prefix delta negative.
+        kv_bytes = float(ledger["waves"] * ledger["wave_cache_bytes"])
         b.ops[b.ops.index(scored)] = apply_sparse_prefix_reads(
             scored, views=owned_views,
             row_bytes=float(pool_row_bytes) / float(max(1, pool)),

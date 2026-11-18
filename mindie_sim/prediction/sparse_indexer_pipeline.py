@@ -202,8 +202,21 @@ class PoolKeyIndexerRecipe:
 
     def build(self, op, geometry):
         del geometry
-        ledger = dict(dict(op.metadata).get(POOL_LEDGER, {}))
-        return OperatorPlan(pool_key_indexer_work(ledger), self.lower, metadata={
+        metadata = dict(op.metadata)
+        ledger = dict(metadata.get(POOL_LEDGER, {}))
+        work = pool_key_indexer_work(ledger)
+        # A shared-prefix plan replaces only the KV cache component of the HBM
+        # fill with its physical union; the per-wave MTE2 refill service stays
+        # complete.  The prepared plan must carry both components unchanged.
+        prefix_hbm = metadata.get("prefix_read_hbm_bytes")
+        if prefix_hbm is not None:
+            kv_component = (float(ledger.get("waves", 0))
+                            * float(ledger.get("wave_cache_bytes", 0.0)))
+            resources = dict(work.resources)
+            resources["hbm"] = (float(work.resources.get("hbm", 0.0))
+                                - kv_component + float(prefix_hbm))
+            work = Work(work.matrix, resources)
+        return OperatorPlan(work, self.lower, metadata={
             "schedule": "pool_key_indexer_aic_waves",
             "native_dispatch_reconstructed": False,
             "wave_rows": ledger.get("wave_rows"),

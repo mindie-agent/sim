@@ -533,20 +533,32 @@ def _packed_index_cache():
                         "scale_dtype": "fp16"}}
 
 
-def test_keypool_fp8_cache_write_is_one_hundred_thirty_two_bytes_per_pool():
-    raw = _glm_raw(keypool=True, cache=_packed_index_cache(),
-                   quant={"name": "bf16_fp8_index", "weight_format": "bf16",
-                          "activation_format": "bf16", "native_format": "bf16",
-                          "expert_weight_format": "bf16", "kv_dtype": "int8",
-                          "index_dtype": "fp8_e4m3", "index_scale_dtype": "fp16"})
-    ops = _by_recipe(target_graphs(raw, scope="body", phase="decode", tokens=6,
-                                   context=131201, sequences=4)[0])
-    write = ops["cann_keypool_cache_write"]
+def test_keypool_fp8_cache_scale_layout_selects_the_native_caller():
+    base = {"name": "bf16_fp8_index", "weight_format": "bf16",
+            "activation_format": "bf16", "native_format": "bf16",
+            "expert_weight_format": "bf16", "kv_dtype": "int8",
+            "index_dtype": "fp8_e4m3"}
+
+    def ops(scale):
+        raw = _glm_raw(keypool=True, cache=_packed_index_cache(),
+                       quant={**base, "index_scale_dtype": scale})
+        return _by_recipe(target_graphs(raw, scope="body", phase="decode",
+                                        tokens=6, context=131201, sequences=4)[0])
+
+    # An FP16 scale row is 130 B in prefill; the native caller's hardcoded FP32
+    # scale must never select and silently write 132 B instead.
+    fp16 = ops("fp16")
+    assert "cann_keypool_cache_write" not in fp16
+    assert "index_pool_compress" in fp16
+
+    # The caller's declared FP32 scale layout keeps the native row at 132 B.
+    native = ops("fp32")
+    write = native["cann_keypool_cache_write"]
     meta = dict(write.metadata)
     assert meta["pooled_row_bytes"] == 132
     assert meta["pooled_scale_dtype"] == "fp32"
     assert meta["cache_dtype"] == "fp8_e4m3"
-    indexer = ops["cann_pool_key_indexer"]
+    indexer = native["cann_pool_key_indexer"]
     indexer_meta = dict(indexer.metadata)
     assert indexer.dtype == "fp8_e4m3"
     assert indexer.flops == 2 * indexer_meta["safe_reference_scanned_pools"] * 32 * INDEX_WIDTH

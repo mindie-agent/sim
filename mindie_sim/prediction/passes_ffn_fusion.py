@@ -462,8 +462,14 @@ def routed_expert_work(op, *, n, k, weights, weight_kind, local_rows,
         padded_shape = (capacity, *op.padded_shape[1:])
     else:
         padded_shape = op.padded_shape
+    # Packed-weight dequantization follows the active weight bytes already
+    # selected for this occurrence; only row-dependent vector work scales with
+    # the activated row fraction.
+    weight_dequant_ops = (float(metadata.get("dequant_ops_per_weight", 0.0))
+                          * float(metadata.get("dequant_weight_elements", 0.0)))
+    row_ops = max(0.0, float(op.vector_ops) - weight_dequant_ops)
     return replace(op, flops=2 * local_rows * n * k, hbm_bytes=read + write,
-                   vector_ops=op.vector_ops * fraction,
+                   vector_ops=row_ops * fraction + weight_dequant_ops,
                    mte2_bytes=read, mte3_bytes=write,
                    padded_shape=padded_shape,
                    recipe=("balanced_" + op.recipe) if balanced else op.recipe,

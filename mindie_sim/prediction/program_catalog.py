@@ -186,21 +186,15 @@ def _compile_stages(stages: Sequence[Stage], *, class_id: int,
             if source not in previous_seen:
                 edges.append(EdgeSpec(source_node=source, iteration_delta=-1))
                 previous_seen.add(source)
-        work = tuple(
-            WorkTerm(
-                physical_resource_role=str(role),
-                issued=float(amount),
-                useful=float(amount),
-                unit="ms",
-                service_conversion=1.0,
-            )
+        work = tuple(WorkTerm(
+            physical_resource_role=str(role), issued=float(amount),
+            useful=float(amount), unit="ms", service_conversion=1.0)
             for role, amount in stage.work.items() if float(amount) != 0.0)
-        caps = tuple(
-            CapTerm(physical_resource_role=str(role), rate=float(rate))
-            for role, rate in stage.caps.items())
-        placement = tuple(
-            PlacementSpec(physical_resource_role=str(role),
-                          units=tuple(int(unit) for unit in units))
+        caps = tuple(CapTerm(physical_resource_role=str(role), rate=float(rate))
+                     for role, rate in stage.caps.items())
+        placement = tuple(PlacementSpec(
+            physical_resource_role=str(role),
+            units=tuple(int(unit) for unit in units))
             for role, units in stage.placement.items())
         acquire: list[AllocationSpec] = []
         release: list[ReleaseSpec] = []
@@ -227,6 +221,7 @@ def _compile_stages(stages: Sequence[Stage], *, class_id: int,
             caps=caps,
             coupled=bool(stage.coupled),
             priority=int(stage.priority),
+            cohort_size=int(stage.cohort_size),
             placement=placement,
             acquire=tuple(acquire),
             release=tuple(release),

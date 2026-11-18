@@ -49,11 +49,11 @@ FLOPS_PER_FMA = 2
 SOFTMAX_VECTOR_OPS_PER_PAIR = 5
 INDEX_SCORE_VECTOR_OPS_PER_ROW = 3
 TOPK_OPS_PER_ELEMENT = 4
-READ_WRITE_ONE = 1.0
 DEFAULT_BLOCK_SIZE = 128
 DEFAULT_CP_INTERLEAVE = 128
 DEFAULT_IDX_DIM = 64
 FP32_BYTES = 4
+INT32_BYTES = 4
 
 
 def _memory_hierarchy(machine):
@@ -516,6 +516,8 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
     eff_topk = int(plan.index_topk) if has_indexer else 0
     index_store_id = candidate_id = None
     topk_id = (topk_ids or {}).get(sel_owner) if sel_owner >= 0 else None
+    idx_ratio = max(1, int(plan.compress_ratio or 1), int(plan.index_kpool or 1))
+    sel_topk = max(1, eff_topk // idx_ratio) if idx_ratio > 1 else eff_topk
     block_size = max(
         1, int(getattr(runtime, "kv_block_size", DEFAULT_BLOCK_SIZE) or DEFAULT_BLOCK_SIZE))
     configured_families = runtime.kernels.get("families", {}) if runtime else {}
@@ -527,8 +529,6 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         row_bytes = cost.index_row_bytes or index_row_bytes(model, plan.index_dim)
         idx_heads = max(1, int(plan.index_heads or 1))
         idx_dim = max(1, int(plan.index_dim or DEFAULT_IDX_DIM))
-        idx_ratio = max(1, int(plan.compress_ratio or 1), int(plan.index_kpool or 1))
-        sel_topk = max(1, eff_topk // idx_ratio) if idx_ratio > 1 else eff_topk
         cand_cap = (plan.candidate_topk_blocks * plan.candidate_block_size
                     if plan.candidate_filter else 0)
         new_idx_rows = (
@@ -627,7 +627,10 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             op_id=prefix + ".index_topk", deps=(idx_scores.op_id,), stage=stage,
             layer=plan.index, requests=requests, elements=scored_rows,
             ops_per_element=TOPK_OPS_PER_ELEMENT, dtype="fp32", family="topk", phase=mode,
-            recipe="index_topk", shape=(valid, sel_topk), read_write=READ_WRITE_ONE,
+            recipe="index_topk", shape=(valid, sel_topk),
+            # The reducer reads FP32 scores but publishes INT32 ids.
+            read_bytes_override=float(scored_rows * FP32_BYTES),
+            write_bytes_override=float(valid * sel_topk * INT32_BYTES),
             metadata=(("selection_output_dtype", "int32"),))
         ops.extend((idx_wq, idx_wk, idx_store, *pcp_idx_ops,
                     idx_scores, idx_topk))
@@ -795,6 +798,9 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             element_bytes = dtype_bytes(model.activation_dtype)
             query_bytes = view.q_len * heads * qk_width * element_bytes
             output_bytes = view.q_len * heads * v_width * element_bytes
+            # A selected-ID consumer reads the INT32 TopK map its producer wrote.
+            selection_bytes = (float(view.q_len * sel_topk * INT32_BYTES)
+                               if topk_id and eff_topk > 0 else 0.0)
             shape = (view.q_len, view.kv_len, heads, qk_width)
             op = OpSpec(
                 op_id=f"{prefix}.attention.{orig_idx}", family="attention", phase=mode,
@@ -803,8 +809,9 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                 padded_shape=shape, launch_shape=shape,
                 flops=FLOPS_PER_FMA * local_pairs * heads * (qk_width + v_width),
                 vector_ops=SOFTMAX_VECTOR_OPS_PER_PAIR * local_pairs * heads,
-                hbm_bytes=kv_bytes + query_bytes + output_bytes,
-                mte2_bytes=kv_refill_bytes + query_bytes, mte3_bytes=output_bytes,
+                hbm_bytes=kv_bytes + query_bytes + output_bytes + selection_bytes,
+                mte2_bytes=(kv_refill_bytes + query_bytes + selection_bytes),
+                mte3_bytes=output_bytes,
                 deps=attention_deps, recipe=attention_recipe, dtype=model.compute_dtype,
                 metadata=(("query_tile", policy.query_tile), ("causal_pairs", pairs),
                           ("local_pairs", local_pairs), ("kv_streams", streams),
