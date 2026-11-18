@@ -97,7 +97,8 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
         global_tokens=None, routing=RoutingPolicy(), routing_realization=None,
         overlap_shared=False, runtime=None, reduce_after_join=False, sequence_plan=None,
         caller=None, sp_tokens=None, features=None,
-        source_rows_by_replica=None, destination_rows_by_rank=None, **_):
+        source_rows_by_replica=None, destination_rows_by_rank=None,
+        ep_owner=None, **_):
     pre_sp_tokens = tokens
     if sp_tokens is not None:
         tokens = sp_tokens
@@ -161,6 +162,25 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
     # slots are a property of that owner, not of the logical expert ledger.
     local_ep_rank = int(
         getattr(routing_realization, "representative_rank", ZERO) or ZERO)
+    if routing_realization is None and ep_owner is not None:
+        # Probability routing has no explicit representative rank.  The
+        # physical EP owner still decides which redundant slot bank this graph
+        # represents; pricing every replica as owner zero is not a copy.
+        local_ep_rank = int(ep_owner) % max(ONE, int(parallel.ep))
+    destination_rows = (
+        tuple(int(value) for value in routing_realization.rank_assignment_rows)
+        if routing_realization is not None
+        and getattr(routing_realization, "rank_assignment_rows", None) is not None
+        else None)
+    represented_ranks = (
+        tuple(int(value) for value in
+              (getattr(routing_realization, "represented_ep_ranks", None)
+               or (local_ep_rank,)))
+        if destination_rows is not None else ())
+    receive_rows = (
+        max((destination_rows[rank] for rank in represented_ranks
+             if 0 <= rank < len(destination_rows)), default=ZERO)
+        if destination_rows is not None else int(tokens) * int(plan.top_k))
     runtime_routing = dict(getattr(runtime, "routing", {}) or {})
     has_slots = (
         int(getattr(parallel, "redundant_experts_per_rank", ZERO) or ZERO) > ZERO
@@ -358,8 +378,10 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
         dispatch = comm_op(
             op_id=prefix + ".dispatch", deps=(last,), stage=stage, layer=plan.index,
             requests=requests, family="alltoall", phase=mode, recipe="expert_dispatch",
-            link_bytes=dispatch_exchange_bytes, shape=(tokens * plan.top_k, latent),
-            metadata=collective_meta + (("collective_id", prefix + ".dispatch"),) + dispatch_quant_meta,
+            link_bytes=dispatch_exchange_bytes,
+            shape=(int(tokens) * int(plan.top_k), latent),
+            metadata=collective_meta + (("collective_id", prefix + ".dispatch"),)
+            + dispatch_quant_meta,
         )
         dispatch = masked_collective(dispatch)
         dispatch = scale_exchange_operator(
@@ -371,7 +393,7 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
             "activation_payload_format") or model.activation_dtype
         dispatch = deepep.declare_received_value(
             dispatch, dtype=str(received_dtype),
-            shape=(int(dispatch.local_shape[0]), latent),
+            shape=(receive_rows, latent),
             row_bytes=latent * dtype_bytes(str(received_dtype)),
             storage=f"moe.rx:{prefix}.dispatch",
             binding="static", binding_name=f"{prefix}.dispatch.rx")
@@ -661,11 +683,6 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
     if overlap_shared:
         ops = reorder_overlapped_shared(ops)
     from .mc2_graph import lower as lower_native_mc2
-    destination_rows = (
-        tuple(int(value) for value in routing_realization.rank_assignment_rows)
-        if routing_realization is not None
-        and getattr(routing_realization, "rank_assignment_rows", None) is not None
-        else None)
     ops = lower_native_mc2(
         ops, runtime=runtime, prefix=prefix, tokens=routed_tokens, top_k=plan.top_k,
         width=latent, experts=plan.num_experts, ep=parallel.ep,

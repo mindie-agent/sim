@@ -489,7 +489,18 @@ def predict(
     # structurally, but no latency/throughput entry may fabricate its work.
     # The gate precedes every early body/PD return.
     from .unmodeled_gate import assert_timing_supported
+    gate_case = case
+    if isinstance(case, _AbcMapping) and "pools" not in case:
+        # Layer overrides are resolved during parse_case.  Gate the resolved
+        # ModelSpec, not only the raw override dictionary, before a caller's
+        # custom lowerer or a baseline can produce a timing number.
+        try:
+            gate_case = parse_case(case)
+        except (ModelingError, ValueError, TypeError, KeyError):
+            gate_case = case
     assert_timing_supported(case, entry="predict")
+    if gate_case is not case:
+        assert_timing_supported(gate_case, entry="predict")
     if scope == "body":
         if lower is not None:
             raise ModelingError("body_scope_uses_target_frontend_not_custom_serving_lowerer")

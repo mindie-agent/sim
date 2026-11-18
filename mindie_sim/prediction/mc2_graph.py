@@ -185,8 +185,14 @@ def lower(ops, *, runtime, prefix, tokens, top_k, width, experts, ep,
           source_partitions, received_assignments, dtype, source_routing=None,
           valid_tokens=None, features=None, source_rows_by_replica=None,
           destination_rows_by_rank=None):
+    # ``dynamic`` selects one method for the whole EP group.  The largest
+    # per-rank row requirement decides whether the shared MC2 reservation can
+    # hold every member; the per-replica payload still uses this call's tokens.
+    selection_tokens = (max(int(value) for value in source_rows_by_replica)
+                        if source_rows_by_replica else int(tokens))
     selected = select_common(
-        runtime, features, tokens=tokens, top_k=top_k, experts=experts, ep=ep)
+        runtime, features, tokens=selection_tokens, top_k=top_k,
+        experts=experts, ep=ep)
     if selected is None:
         return ops
     if selected["kind"] == "arch22_v2_caller":

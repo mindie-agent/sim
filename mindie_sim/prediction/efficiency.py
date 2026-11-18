@@ -15,6 +15,8 @@
 """
 from __future__ import annotations
 
+import re
+
 ZERO = 0
 ONE = 1
 KIB = 1024
@@ -24,6 +26,7 @@ DEFAULT_CONTEXT = 4096
 DEFAULT_SEQUENCES = 1
 FIRST = 0
 ZERO_FLOAT = 0.0
+_OCCURRENCE_IDENTITY = re.compile(r"(?<![\w.])s(\d+)\.l(\d+)")
 ONE_FLOAT = 1.0
 MS_PER_S = 1000.0
 FULL_PERCENT = 100.0
@@ -41,6 +44,7 @@ DEFAULT_TARGET_CUBE_MFU = 0.75
 DEFAULT_TARGET_VEC_MFU = 0.65
 NON_MONOTONIC_PROBE_CAP = 4
 SLA_HEADROOM_PROBE_STEPS = 3
+SLA_HEADROOM_MULTIPLIER = 3.0
 #: Counterfactual-set selectors for :func:`solve_sla_sizing`.
 SLA_SENSITIVITY_BASELINE = "baseline"
 SLA_SENSITIVITY_FULL = "full"
@@ -66,6 +70,7 @@ from .capacity import Memory
 from .graph_analysis import graph_costs
 from .resource_attribution import attribute_stage_dag
 from .operator_analysis import operator_costs, target_graphs
+from .physical_key import normalize_reference
 from .roofline_graph import (PhysicalWorkGraph, PhysicalWorkNode,
                              RooflineTargets, critical_path_roofline,
                              graph_from_occurrences)
@@ -412,7 +417,9 @@ def analyze_operator_row(row: Mapping[str, Any], case: CaseSpec | Mapping[str, A
 def _lower_and_run_graph(case: CaseSpec, *, phase: str, tokens: int, context: int, sequences: int, scope: str, run_graph: bool = True, lowered_graphs: Any | None = None, include_submission: bool = False, overlap_async_scheduler: bool = False, evaluation_context: Any | None = None, fast_span_only: bool = False) -> tuple[Any, CaseSpec, dict[str, Any] | None]:
     graphs = lowered_graphs if lowered_graphs is not None else target_graphs(case, phase=phase, tokens=tokens, context=context, sequences=sequences, scope=scope)
     eff_case, has_kg = consume_target_declaration(case, graphs), any("device_kernel_group" in dict(op.metadata) for op in graphs[0])
-    if not (run_graph or has_kg):
+    if not run_graph:
+        # An explicit run_graph=False is a caller control: a selected MC2 or
+        # Local-TP kernel group must not turn it into a full cohort DES run.
         return graphs, eff_case, None
     ext_in = {"analysis_input": 0} if scope == "body" else None
     from .local_tp_groups import rank_zero_graph_reuse
@@ -1025,7 +1032,7 @@ def analyze_network_efficiency(
     operator_report: Mapping[str, Any] | None = None, graph_report: Mapping[str, Any] | None = None,
     observed_durations_ms: Mapping[str, float] | None = None, pmu_by_op: Mapping[str, Mapping[str, float]] | None = None,
     run_graph: bool = True, _precomputed_graph: tuple[Any, CaseSpec, dict[str, Any]] | None = None,
-    evaluation_context: Any | None = None,
+    evaluation_context: Any | None = None, _retain_graph: bool = False,
 ) -> dict[str, Any]:
     """Compute whole-network 4D MFU/MBU/CV efficiency and bottleneck breakdowns."""
     _validate_geometry(phase, tokens, context, sequences, scope)
@@ -1142,6 +1149,7 @@ def analyze_network_efficiency(
         "operator_serial_roofline_efficiency": serial_roof_id / max(operator_sum_ms, EPSILON), "network_cv_overlap": network_cv_overlap,
         "breakdown_by_family": sorted([{"family": f, "recipe": r, **_agg(items)} for (f, r), items in fam_g.items()], key=lambda r: -r["total_ms"]),
         "breakdown_by_bound": {b: _agg(bound_g.get(b, ())) for b in _BOUNDS}, "breakdown_by_kind": {k: _agg(kind_g.get(k, ())) for k in _KINDS}, "operators": analyzed_ops,
+        **({"_occurrence_graph": occurrence_graph} if _retain_graph else {}),
     }
 
 
@@ -1160,7 +1168,10 @@ def _evaluate_target_efficiency_legacy(
     if fixed_launch_us is not None and (isinstance(fixed_launch_us, bool) or not isinstance(fixed_launch_us, (int, float)) or not math.isfinite(fixed_launch_us) or float(fixed_launch_us) < 0.0):
         raise ValueError(f"fixed_launch_us_must_be_nonnegative_finite:{fixed_launch_us}")
 
-    base = dict(baseline_analysis) if baseline_analysis is not None else analyze_network_efficiency(case, phase=phase, tokens=tokens, context=context, sequences=sequences, scope=scope)
+    base = (dict(baseline_analysis) if baseline_analysis is not None else
+            analyze_network_efficiency(
+                case, phase=phase, tokens=tokens, context=context,
+                sequences=sequences, scope=scope, _retain_graph=True))
     fam_ovr, evaluated_ops = dict(family_targets or {}), []
     for op in base["operators"]:
         ovr = fam_ovr.get(f"{op['family']}:{op['recipe']}") or fam_ovr.get(op["recipe"]) or fam_ovr.get(op["family"]) or {}
@@ -1203,7 +1214,50 @@ def _evaluate_target_efficiency_legacy(
         "current_network_vec_mfu": base["network_vec_mfu"], "target_network_vec_mfu": base["total_vec_ideal_ms"] / safe_tgt,
         "current_network_roofline_efficiency": base["network_roofline_efficiency"], "target_network_roofline_efficiency": base["total_roofline_ideal_ms"] / safe_tgt,
         "top_bottlenecks": sorted(evaluated_ops, key=lambda r: -r["gap_ms"])[:15], "operators": evaluated_ops,
+        "_occurrence_graph": base.get("_occurrence_graph"),
     }
+
+
+def _target_occurrence_nodes(graph, operators):
+    """Apply target weights to the realized DAG without flattening it."""
+    rows, relative = {}, {}
+    for row in operators:
+        op = row.get("operator") if isinstance(row.get("operator"), Mapping) else row
+        op_id = str(op.get("op_id") or "")
+        for key in (row.get("physical_id"), row.get("op_id"), op_id):
+            if key:
+                rows.setdefault(str(key), row)
+        if op_id:
+            relative.setdefault(normalize_reference(
+                op_id, int(row.get("stage", ZERO)), int(row.get("layer", ZERO))), row)
+    nodes = []
+    for node in graph.nodes:
+        node_id = str(node.node_id)
+        candidates = (node_id, node_id.split("#", ONE)[ZERO],
+                      node_id.split(":", ONE)[ONE] if ":" in node_id else node_id)
+        row = next((rows[key] for key in candidates if key in rows), None)
+        if row is None:
+            match = _OCCURRENCE_IDENTITY.search(node_id)
+            if match is not None:
+                identity = (node_id.split(":", ONE)[ONE]
+                            if ":" in node_id else node_id)
+                row = relative.get(normalize_reference(
+                    identity, int(match.group(ONE)), int(match.group(ONE + 1))))
+        requirements = (row.get("target_pipe_requirement_ms")
+                        if row is not None else None)
+        if not requirements:
+            nodes.append(node)
+            continue
+        nodes.append(replace(
+            node,
+            cube_ms=float(requirements["cube"]),
+            vector_ms=float(requirements["vec"]),
+            hbm_ms=float(requirements["hbm"]),
+            link_ms=float(requirements["link"]),
+            launch_ms=float(row.get("raw_target_duration_ms")
+                            or node.launch_ms),
+        ))
+    return tuple(nodes)
 
 
 def evaluate_target_efficiency(
@@ -1231,6 +1285,7 @@ def evaluate_target_efficiency(
         family_targets=family_targets, mode=mode,
         baseline_analysis=baseline_analysis)
     operators = result["operators"]
+    occurrence_graph = result.pop("_occurrence_graph", None)
     nodes = tuple(PhysicalWorkNode(
         node_id=str(row.get("physical_id") or row.get("op_id") or index),
         cube_ms=float(row.get("t_cube_ideal_ms") or ZERO_FLOAT),
@@ -1241,17 +1296,25 @@ def evaluate_target_efficiency(
         occurrences=max(ONE, int(row.get("occurrences", ONE) or ONE)),
     ) for index, row in enumerate(operators))
     ideal = critical_path_roofline(PhysicalWorkGraph(nodes), RooflineTargets())
-    target_nodes = tuple(PhysicalWorkNode(
-        node_id=node.node_id,
-        cube_ms=float(row["target_pipe_requirement_ms"]["cube"]),
-        vector_ms=float(row["target_pipe_requirement_ms"]["vec"]),
-        hbm_ms=float(row["target_pipe_requirement_ms"]["hbm"]),
-        link_ms=float(row["target_pipe_requirement_ms"]["link"]),
-        launch_ms=float(row["raw_target_duration_ms"]),
-        occurrences=node.occurrences,
-    ) for node, row in zip(nodes, operators))
-    roofline = critical_path_roofline(
-        PhysicalWorkGraph(target_nodes), RooflineTargets())
+    if mode == "exact_target" and occurrence_graph is not None:
+        # Reuse the realized occurrence DAG: predecessors and physical
+        # resource identities must survive the target-weight substitution.
+        target_nodes = _target_occurrence_nodes(occurrence_graph, operators)
+        roofline = critical_path_roofline(
+            PhysicalWorkGraph(target_nodes, occurrence_graph.edges),
+            RooflineTargets())
+    else:
+        target_nodes = tuple(PhysicalWorkNode(
+            node_id=node.node_id,
+            cube_ms=float(row["target_pipe_requirement_ms"]["cube"]),
+            vector_ms=float(row["target_pipe_requirement_ms"]["vec"]),
+            hbm_ms=float(row["target_pipe_requirement_ms"]["hbm"]),
+            link_ms=float(row["target_pipe_requirement_ms"]["link"]),
+            launch_ms=float(row["raw_target_duration_ms"]),
+            occurrences=node.occurrences,
+        ) for node, row in zip(nodes, operators))
+        roofline = critical_path_roofline(
+            PhysicalWorkGraph(target_nodes), RooflineTargets())
     cur_step = float(result["current_step_duration_ms"])
     physical_ideal = max(ideal.physical_ideal_ms, ZERO_FLOAT)
     raw_target = max(roofline.target_duration_ms, physical_ideal)
@@ -1734,7 +1797,8 @@ def apply_sla_baseline_gains(results: Sequence[dict[str, Any]],
             (eff_feas / base_feas_tps) if base_feas_tps > 0 else 1.0)
         row["concurrency_gain_vs_baseline"] = (
             (row["b_sla"] / base_b) if base_r["b_sla"] > 0
-            else (base_r["step_ms_at_b1"] / row["step_ms_at_b1"]))
+            else ((base_r["step_ms_at_b1"] / row["step_ms_at_b1"])
+                  if row["step_ms_at_b1"] > 0.0 else 0.0))
 
 
 def solve_sla_sizing(
@@ -1776,10 +1840,18 @@ def solve_sla_sizing(
         parsed, output_budget=output_budget, tokens_per_seq=None,
         emitted_tokens_per_seq=None)
     _validate_geometry(phase, q_tokens, context, 1, scope)
-    rt_max_b = min(int(parsed.runtime.max_num_seqs), max(1, int(parsed.runtime.max_num_batched_tokens) // q_tokens))
+    batch_budget = int(parsed.runtime.max_num_batched_tokens)
+    unchunkable = (not parsed.runtime.enable_chunked_prefill
+                   and q_tokens > batch_budget)
+    rt_max_b = min(int(parsed.runtime.max_num_seqs), batch_budget // q_tokens)
+    if parsed.runtime.enable_chunked_prefill:
+        # A chunked prompt may exceed the per-step budget and still admit one
+        # sequence; only the unchunked declaration preserves the zero.
+        rt_max_b = max(1, rt_max_b)
     if phase == "decode" and parsed.runtime.graph_capture_mode == "full" and parsed.runtime.graph_capture_keys and dict(parsed.runtime.metadata).get("captured_execution_mode") == "FULL_DECODE_ONLY":
-        rt_max_b = min(rt_max_b, max(1, max(parsed.runtime.graph_capture_keys) // q_tokens))
-    b_max, dp = min(int(max_sequences_per_dp), max(1, rt_max_b)), parsed.runtime.parallel.dp
+        rt_max_b = min(rt_max_b,
+                       max(1, max(parsed.runtime.graph_capture_keys) // q_tokens))
+    b_max, dp = min(int(max_sequences_per_dp), rt_max_b), parsed.runtime.parallel.dp
 
     t_defaults = {"target_mbu": target_mbu, "target_cube_mfu": target_cube_mfu, "target_vec_mfu": target_vec_mfu}
     # ``sensitivity`` only selects the counterfactual *set*; an explicit
@@ -1844,6 +1916,14 @@ def solve_sla_sizing(
         return analysis_cache[s_key, b]
 
     def eval_at(scen: Mapping[str, Any], s_key: tuple[float, ...], b: int, *, full: bool = False) -> dict[str, Any]:
+        if unchunkable:
+            return {"step_ms": 0.0, "step_basis": "geometry_rejected",
+                    "step_is_lower_bound": False, "operator_sum_ms": 0.0,
+                    "target_pipe_totals_ms": {}, "network_mbu": None,
+                    "network_cube_mfu": None, "network_vec_mfu": None,
+                    "network_link_util": None,
+                    "network_roofline_efficiency": None,
+                    "bottleneck_shares": {}}
         if not full and scen.get("target_mbu") is None:
             return {"step_ms": float(
                 get_bundle(s_key, b, fast=fast_spans)[2]["duration_ms"])}
@@ -1860,7 +1940,11 @@ def solve_sla_sizing(
         return {"step_ms": float(ans["graph_duration_ms"]), "step_basis": "graph_evaluation", "step_is_lower_bound": False, "operator_sum_ms": float(ans["operator_sum_ms"]), "network_mbu": float(ans["network_mbu"]), "network_cube_mfu": float(ans["network_cube_mfu"]), "network_vec_mfu": float(ans["network_vec_mfu"]), "network_link_util": float(ans["network_link_util"]), "network_roofline_efficiency": float(ans["network_roofline_efficiency"]), "bottleneck_shares": shares}
 
     base_b_hint = max(1, int(base_b_hint))
-    domain_cap, domain_reason = b_max, None
+    domain_cap = b_max
+    domain_reason = ("prompt_exceeds_batch_budget_without_chunking"
+                     if unchunkable else None)
+
+    window_provider: dict[str, Any] = {"fn": None}
 
     def try_step_ok(scen: Mapping[str, Any], s_key: tuple[float, ...], b: int, *, seen: set[int] | None = None,
                     checks: dict[int, dict[str, Any]] | None = None, capacity_max: int | None = None) -> bool:
@@ -1871,14 +1955,24 @@ def solve_sla_sizing(
             return False
         try:
             step = float(eval_at(scen, s_key, b, full=False)["step_ms"])
-            capacity_pass = bool(capacity_max is None or b <= capacity_max)
-            record = {"b": int(b), "step_ms": step,
-                      "sla": {"limit_ms": float(sla_ms), "pass": step <= sla_ms},
-                      "capacity": {"b_vram_max": int(capacity_max or 0), "pass": capacity_pass},
-                      "feasible": bool(step <= sla_ms and capacity_pass)}
+            capacity_pass = True
             if checks is not None:
-                checks[int(b)] = record
-            return bool(record["sla"]["pass"])
+                window_for = window_provider["fn"]
+                if window_for is None:
+                    raise ModelingError("sla_capacity_window_provider_not_bound")
+                current_window, lifecycle_window = window_for(int(b))
+                capacity_pass = bool(
+                    (capacity_max is None or b <= capacity_max)
+                    and current_window["fits"] and lifecycle_window["fits"])
+                checks[int(b)] = {
+                    "b": int(b), "step_ms": step,
+                    "sla": {"limit_ms": float(sla_ms), "pass": step <= sla_ms},
+                    "capacity": {"b_vram_max": int(capacity_max or 0),
+                                 "current_fits": bool(current_window["fits"]),
+                                 "lifecycle_fits": bool(lifecycle_window["fits"]),
+                                 "pass": capacity_pass},
+                    "feasible": bool(step <= sla_ms and capacity_pass)}
+            return bool(step <= sla_ms)
         except UnmodeledCapabilityError:
             # An unmodeled core is not an infeasible candidate.
             raise
@@ -1905,6 +1999,8 @@ def solve_sla_sizing(
         nonlocal base_b_hint
         check_active_deadline()
         s_key = tuple(float(scen.get(k, 1.0)) for k in _SCALE_KEYS)
+        if s_key[4] not in vram_by_cap and unchunkable:
+            vram_by_cap[s_key[4]] = (0, 0, 0)
         if s_key[4] not in vram_by_cap:
             b_sync = _vram_max_sequences_per_dp(parsed, context=context, tokens_per_seq=q_tokens, output_budget=output_budget, hbm_capacity_scale=s_key[4], emitted_tokens_per_seq=emit_tokens, async_scheduling=False, phase=phase, memory=memory_for(q_tokens, False, s_key[4]))
             b_async = _vram_max_sequences_per_dp(parsed, context=context, tokens_per_seq=q_tokens, output_budget=output_budget, hbm_capacity_scale=s_key[4], emitted_tokens_per_seq=emit_tokens, async_scheduling=True, phase=phase, memory=memory_for(q_tokens, True, s_key[4]))
@@ -1933,8 +2029,19 @@ def solve_sla_sizing(
 
         window_cache: dict[int, tuple[dict[str, Any], dict[str, Any]]] = {}
 
+        def rejected_window():
+            empty = {
+                "supply_bytes": 0.0, "active_kv_bytes": 0.0,
+                "retiring_kv_bytes": 0.0, "workspace_bytes": 0.0,
+                "peak_bytes": 0.0, "headroom_bytes": 0.0, "fits": False,
+            }
+            return empty
+
         def candidate_windows(b: int) -> tuple[dict[str, Any], dict[str, Any]]:
             if b in window_cache:
+                return window_cache[b]
+            if unchunkable:
+                window_cache[b] = (rejected_window(), rejected_window())
                 return window_cache[b]
             current_window = capacity_window(
                 parsed, phase=phase, context=context, tokens_per_seq=q_tokens,
@@ -1951,12 +2058,23 @@ def solve_sla_sizing(
             window_cache[b] = (current_window, lifecycle_window)
             return current_window, lifecycle_window
 
-        b1_ms = float(get_bundle(s_key, 1, fast=False)[2]["duration_ms"])
+        window_provider["fn"] = candidate_windows
+        b1_ms = (0.0 if unchunkable else
+                 float(get_bundle(s_key, 1, fast=False)[2]["duration_ms"]))
+        current_one, lifecycle_one = candidate_windows(1)
+        b1_capacity = bool(b_joint >= 1 and current_one["fits"]
+                           and lifecycle_one["fits"] and not unchunkable)
         candidate_checks: dict[int, dict[str, Any]] = {
             1: {"b": 1, "step_ms": b1_ms,
-                "sla": {"limit_ms": float(sla_ms), "pass": b1_ms <= sla_ms},
-                "capacity": {"b_vram_max": int(b_joint), "pass": b_joint >= 1},
-                "feasible": bool(b1_ms <= sla_ms and b_joint >= 1)}}
+                "step_basis": ("geometry_rejected" if unchunkable
+                               else "graph_evaluation"),
+                "sla": {"limit_ms": float(sla_ms),
+                        "pass": bool(b1_ms <= sla_ms and not unchunkable)},
+                "capacity": {"b_vram_max": int(b_joint),
+                             "current_fits": bool(current_one["fits"]),
+                             "lifecycle_fits": bool(lifecycle_one["fits"]),
+                             "pass": b1_capacity},
+                "feasible": bool(b1_ms <= sla_ms and b1_capacity)}}
         evaluated_b: set[int] = set(candidate_checks)
         eff_max = min(b_max, domain_cap)
         bucket_keys = sorted({int(key) for key in (getattr(parsed.runtime, "graph_capture_keys", ()) or ())}
@@ -1964,8 +2082,10 @@ def solve_sla_sizing(
 
         def candidate_record(b: int, evaluation: Mapping[str, Any]) -> dict[str, Any]:
             sla_pass = float(evaluation["step_ms"]) <= sla_ms
-            capacity_pass = b <= b_joint
             current_window, lifecycle_window = candidate_windows(int(b))
+            capacity_pass = bool(
+                b <= b_joint and current_window["fits"]
+                and lifecycle_window["fits"] and not unchunkable)
             return {
                 "b": int(b), "step_ms": float(evaluation["step_ms"]),
                 "step_basis": evaluation.get("step_basis", "graph_evaluation"),
@@ -2091,12 +2211,12 @@ def solve_sla_sizing(
                 eval_sla = eval_at(scen, s_key, b_sla, full=True)
             else:
                 b_sla, eval_sla = 0, eval_at(scen, s_key, 1, full=True)
-        elif eff_max > 1 and (b1_ms * 3.0 <= sla_ms or base_b_hint == eff_max) and try_step_ok(scen, s_key, eff_max, seen=evaluated_b, checks=candidate_checks, capacity_max=b_joint):
+        elif eff_max > 1 and (b1_ms * SLA_HEADROOM_MULTIPLIER <= sla_ms or base_b_hint == eff_max) and try_step_ok(scen, s_key, eff_max, seen=evaluated_b, checks=candidate_checks, capacity_max=b_joint):
             b_sla, eval_sla = eff_max, eval_at(scen, s_key, eff_max, full=True)
         else:
             eff_max = min(b_max, domain_cap)
             start_b = max(2, min(eff_max, base_b_hint)) if (base_b_hint > 1 and all(x >= 1.0 for x in s_key[:4])) else 2
-            low, high, probe = 1, eff_max, min(eff_max, start_b)
+            low, high, probe = 1, eff_max, max(1, min(eff_max, start_b))
             if probe > 2 and not try_step_ok(scen, s_key, probe, seen=evaluated_b, checks=candidate_checks, capacity_max=b_joint):
                 high, probe = min(high, domain_cap, probe - 1), 2
             while probe <= high:
@@ -2125,6 +2245,19 @@ def solve_sla_sizing(
             if feasible_above:
                 b_sla = max(feasible_above)
                 eval_sla = eval_at(scen, s_key, b_sla, full=True)
+        # A latency-feasible batch still has to pass both capacity windows.
+        # Bound the exact window first (memory-only) and price only its
+        # capacity-feasible ceiling, so a near-limit answer does not force one
+        # graph evaluation per candidate.
+        if b_sla > 0 and b_joint > 0:
+            ceiling = min(int(b_sla), int(b_joint), int(b_max), int(domain_cap))
+            for probe in range(ceiling, 0, -1):
+                current_window, lifecycle_window = candidate_windows(probe)
+                if current_window["fits"] and lifecycle_window["fits"]:
+                    if try_step_ok(scen, s_key, probe, seen=evaluated_b,
+                                   checks=candidate_checks,
+                                   capacity_max=b_joint):
+                        break
         if b_sla > 0:
             evaluated_b.add(b_sla)
         if scen.get("id") == "baseline" and b_sla > 0:
@@ -2218,7 +2351,9 @@ def solve_sla_sizing(
                        "lower_bound_can_prove_feasibility": False},
             "total_concurrency": b_sla * dp, "total_feasible_concurrency": b_feas * dp,
             "step_basis": step_basis, "step_is_lower_bound": False,
-            "step_ms_at_b1": b1_ms, "tps_at_b1": (dp * emit_tokens * 1000.0) / b1_ms,
+            "step_ms_at_b1": b1_ms,
+            "tps_at_b1": ((dp * emit_tokens * 1000.0) / b1_ms
+                          if b1_ms > 0.0 else 0.0),
             "step_ms_at_sla": eval_sla["step_ms"], "tps_at_sla": tps_sla,
             "target_step_tps_at_sla": (b_sla * dp * q_tokens * 1000.0) / eval_sla["step_ms"] if b_sla > 0 else 0.0,
             "step_ms_feasible": feasible_candidate["step_ms"] if jointly_feasible and feasible_candidate is not None else None,

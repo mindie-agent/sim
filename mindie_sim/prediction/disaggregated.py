@@ -113,6 +113,24 @@ def _token_span(memory, index, tokens):
     return (0, tokens)
 
 
+def _uncovered_intervals(covered, lo, hi):
+    """Remaining half-open subranges of ``[lo, hi)`` after prior transfers."""
+    pieces = [(int(lo), int(hi))]
+    for held_lo, held_hi in covered:
+        following = []
+        for piece_lo, piece_hi in pieces:
+            if held_hi <= piece_lo or held_lo >= piece_hi:
+                following.append((piece_lo, piece_hi))
+                continue
+            if piece_lo < held_lo:
+                following.append((piece_lo, min(piece_hi, held_lo)))
+            if held_hi < piece_hi:
+                following.append((max(piece_lo, held_hi), piece_hi))
+        pieces = following
+    return tuple((piece_lo, piece_hi) for piece_lo, piece_hi in pieces
+                 if piece_hi > piece_lo)
+
+
 def _published_for(published, pool, request, layer, component):
     """Read one truly named producer/output record supplied by T04/F-STATE."""
     if not published:
@@ -303,52 +321,70 @@ def _pd_handoff_binding(request, tokens, placement, cases, memory, execution,
                 for dest_index, dest_rank, dest_values, dest_tokens in dst_views:
                     need = float(dest_values.get(component, 0.0))
                     dspan = target_spans[dest_index % max(1, len(target_spans))]
-                    if need <= 0.0 or dspan[1] <= dspan[0]:
+                    d_lo, d_hi = dest_tokens
+                    if (need <= 0.0 or dspan[1] <= dspan[0]
+                            or d_hi <= d_lo):
                         continue
-                    per_head = need / float(dspan[1] - dspan[0])
-                    remaining = list(range(dspan[0], dspan[1]))
+                    # A destination row needs a per-head payload only for the
+                    # token rows a source rank actually owns.  The head and
+                    # token axes are independent intersections.
+                    per_head_token = (need / float(dspan[1] - dspan[0])
+                                      / float(d_hi - d_lo))
+                    covered: dict[int, list[tuple[int, int]]] = {}
                     for src_index, src_rank, src_values, src_tokens in src_views:
-                        if not remaining:
-                            break
                         sspan = source_spans[src_index % max(1, len(source_spans))]
-                        common = [head for head in remaining
+                        common = [head for head in range(dspan[0], dspan[1])
                                   if sspan[0] <= head < sspan[1]]
                         if not common:
                             continue
-                        payload = per_head * len(common)
-                        span = (min(common), max(common) + 1)
+                        s_lo, s_hi = src_tokens
+                        lo, hi = max(s_lo, d_lo), min(s_hi, d_hi)
+                        if hi <= lo:
+                            continue
                         src_storage = f"pd:kv:{request}:prefill:r{prefill_rep}:rank{src_rank}"
                         dst_storage = f"pd:kv:{request}:decode:r{decode_rep}:rank{dest_rank}"
-                        if split_kv:
-                            for suffix in ("k", "v"):
-                                emit(src_rank, dest_rank, f"gqa_{suffix}",
-                                     payload * 0.5,
+                        grouped: dict[tuple[int, int], list[int]] = {}
+                        for head in common:
+                            for piece_lo, piece_hi in _uncovered_intervals(
+                                    covered.get(head, ()), lo, hi):
+                                grouped.setdefault(
+                                    (piece_lo, piece_hi), []).append(head)
+                                covered.setdefault(head, []).append(
+                                    (piece_lo, piece_hi))
+                        for (piece_lo, piece_hi), heads in grouped.items():
+                            payload = (per_head_token * (piece_hi - piece_lo)
+                                       * len(heads))
+                            if split_kv:
+                                for suffix in ("k", "v"):
+                                    emit(src_rank, dest_rank, f"gqa_{suffix}",
+                                         payload * 0.5,
+                                         source_stage=source_stage,
+                                         destination_stage=destination_stage,
+                                         layer=layer.index, source_span=sspan,
+                                         destination_span=dspan,
+                                         source_tokens=(piece_lo, piece_hi),
+                                         destination_tokens=(piece_lo, piece_hi),
+                                         source_storage=src_storage,
+                                         destination_storage=dst_storage,
+                                         source_component=f"gqa_{suffix}",
+                                         destination_component=f"gqa_{suffix}")
+                            else:
+                                emit(src_rank, dest_rank, component, payload,
                                      source_stage=source_stage,
                                      destination_stage=destination_stage,
                                      layer=layer.index, source_span=sspan,
                                      destination_span=dspan,
-                                     source_tokens=src_tokens,
-                                     destination_tokens=dest_tokens,
+                                     source_tokens=(piece_lo, piece_hi),
+                                     destination_tokens=(piece_lo, piece_hi),
                                      source_storage=src_storage,
-                                     destination_storage=dst_storage,
-                                     source_component=f"gqa_{suffix}",
-                                     destination_component=f"gqa_{suffix}")
-                        else:
-                            emit(src_rank, dest_rank, component, payload,
-                                 source_stage=source_stage,
-                                 destination_stage=destination_stage,
-                                 layer=layer.index, source_span=sspan,
-                                 destination_span=dspan,
-                                 source_tokens=src_tokens,
-                                 destination_tokens=dest_tokens,
-                                 source_storage=src_storage,
-                                 destination_storage=dst_storage)
-                        remaining = [head for head in remaining
-                                     if head not in common]
-                    if remaining:
+                                     destination_storage=dst_storage)
+                    missing = [head for head in range(dspan[0], dspan[1])
+                               if sum(piece_hi - piece_lo for piece_lo, piece_hi
+                                      in covered.get(head, ())) < d_hi - d_lo]
+                    if missing:
                         raise ModelingError(
                             "pd_handoff_source_head_uncovered:"
-                            f"{request}:{layer.index}:{dest_rank}:{remaining}")
+                            f"{request}:{layer.index}:{dest_rank}:{missing}")
                 continue
             host_done = False
             for dest_index, dest_rank, dest_values, dest_tokens in dst_views:

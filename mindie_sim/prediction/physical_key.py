@@ -66,6 +66,7 @@ REFERENCE_KEYS = frozenset({
     "binding_name",
     "collective_id",
     "device_kernel_group",
+    "fused_members",
     "fused_origin_scopes",
     "fusion_boundary",
     "fusion_external_outputs",

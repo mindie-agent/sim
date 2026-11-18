@@ -73,17 +73,51 @@ def _group_sequences(sequences, group, parallel):
 MODEL_SCOPE = "model"
 
 
+class _LazyPrograms(Mapping):
+    """Replica programs rebuilt on first access, never during lowering."""
+
+    def __init__(self, seeds, bindings=None, owners=None):
+        self._seeds = dict(seeds)
+        self._bindings = dict(bindings or {})
+        self._owners = dict(owners or {})
+        self._cache = {}
+
+    def __getitem__(self, replica):
+        key = int(replica)
+        if key in self._cache:
+            return self._cache[key]
+        program = self._seeds[key]
+        binding = self._bindings.get(key)
+        if binding is not None:
+            program = rebind_analysis_requests(program, *binding)
+        if key in self._owners:
+            work = replace(program.work,
+                           ops=_rebind_ep_owner(program.work.ops,
+                                                self._owners[key]))
+            program = replace(program, work=work)
+        self._cache[key] = program
+        return program
+
+    def __iter__(self):
+        return iter(self._seeds)
+
+    def __len__(self):
+        return len(self._seeds)
+
+
 class ModelGraphSet(dict):
     """Replica graph mapping from the same Frontend.program occurrences.
 
-    The mapping keeps the existing ``TargetOperators`` tuple contract; the
-    attached programs are the authoritative work/ports for model consumers.
+    The mapping keeps the existing ``TargetOperators`` tuple contract.  The
+    attached executable is materialized lazily from the final cohort-bound
+    replica graph so Local-TP rewrites and collective traffic are visible in
+    ``work.ops`` without rebinding every replica during lowering.
     """
 
-    def __init__(self, values, *, programs, kernels, selection):
-        self.programs = dict(programs)
-        self.ports = {replica: program.ports
-                      for replica, program in self.programs.items()}
+    def __init__(self, values, *, programs, bindings=None, owners=None,
+                 kernels, selection):
+        self.programs = _LazyPrograms(programs, bindings, owners)
+        self._attached = {}
         self.scope = MODEL_SCOPE
         self.effective_kernels = deepcopy(kernels)
         self.default_selection = deepcopy(selection)
@@ -91,8 +125,17 @@ class ModelGraphSet(dict):
             ops, self.effective_kernels, self.default_selection, MODEL_SCOPE))
             for replica, ops in values.items())
 
+    @property
+    def ports(self):
+        return {replica: self.program(replica).ports for replica in self}
+
     def program(self, replica=0):
-        return self.programs[replica]
+        key = int(replica)
+        if key not in self._attached:
+            from .frontend import program_attached_to
+            self._attached[key] = program_attached_to(
+                self.programs[key], tuple(self[key]))
+        return self._attached[key]
 
 
 def target_operators(case, *, phase, tokens, context=0, sequences=1, scope="body",
@@ -237,6 +280,8 @@ def _target_ops(case, views, scope, *, global_views=None, resource_fusion=True,
     padded_tokens = max(sum(v.q_len for v in views), bucket or 0)
     runtime, selections = resolve(case.runtime, views, padded_tokens=padded_tokens,
                                   replay_scope=replay_scope, global_views=global_views)
+    from .frontend import mark_analytical_runtime
+    runtime = mark_analytical_runtime(runtime, selections)
     case = replace(case, runtime=runtime)
     local, local_tokens, pcp_prefill = frontend.partition_views(
         views, case.runtime, padded_tokens)
@@ -321,6 +366,18 @@ def graph_padded_idle(case, phase: str, counts) -> bool:
     keys = ((runtime.graph_capture_keys or runtime.graph_buckets)
             if full else runtime.piecewise_capture_keys)
     return bool(keys)
+
+
+def _rebind_ep_owner(ops, owner):
+    """Rebind the physical EP owner of a cloned probability-routed graph."""
+    result = []
+    for op in ops:
+        metadata = dict(op.metadata)
+        if "ep_rank" in metadata:
+            metadata["ep_rank"] = int(owner)
+            op = replace(op, metadata=tuple(sorted(metadata.items())))
+        result.append(op)
+    return tuple(result)
 
 
 def _physical_rank_for(case, replica):
@@ -457,6 +514,12 @@ def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
                 for group in views.values())
         ))
         and case.runtime.routing.get("policy") != "balanced"
+        and int(getattr(case.runtime.parallel, "redundant_experts_per_rank", 0) or 0) <= 0
+        and "expert_slot_map" not in case.runtime.routing
+        and (int(case.model.num_experts) <= 0
+             or int(getattr(case.runtime.parallel, "ep", 1) or 1) <= 0
+             or int(case.model.num_experts)
+             % max(1, int(case.runtime.parallel.ep)) == 0)
         and not explicit_routing
         and not any(
             isinstance(item, Mapping) and "replica" in item
@@ -464,6 +527,8 @@ def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
         )
     )
     model_programs = {}
+    program_bindings = {}
+    program_owners = {}
     if uniform_replicas and participants:
         first_r = participants[0]
         base_ops = _target_ops(
@@ -481,14 +546,24 @@ def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
         raw_graphs = {first_r: base_ops}
         for r in participants[1:]:
             if scope == "model":
-                raw_graphs[r], model_programs[r] = rebind_analysis_requests(
-                    (base_ops, model_programs[first_r]), views[first_r], views[r])
+                # Only the graph is rebound here.  The attached program is
+                # materialized from this replica's final cohort-bound graph on
+                # first ``program(r)`` access.
+                raw_graphs[r] = _rebind_ep_owner(
+                    rebind_analysis_requests(base_ops, views[first_r], views[r]),
+                    int(_physical_rank_for(case, r) or r)
+                    % max(1, int(case.runtime.parallel.ep)))
+                program_bindings[r] = (views[first_r], views[r])
+                program_owners[r] = (
+                    int(_physical_rank_for(case, r) or r)
+                    % max(1, int(case.runtime.parallel.ep)))
             else:
                 req_ids = tuple(v.request_id for v in views[r])
-                raw_graphs[r] = tuple(
-                    replace(op, requests=req_ids) if op.requests else op
-                    for op in base_ops
-                )
+                raw_graphs[r] = _rebind_ep_owner(
+                    tuple(replace(op, requests=req_ids) if op.requests else op
+                          for op in base_ops),
+                    int(_physical_rank_for(case, r) or r)
+                    % max(1, int(case.runtime.parallel.ep)))
     else:
         raw_graphs = {
             r: _target_ops(case, group, scope, global_views=global_views,
@@ -520,7 +595,13 @@ def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
     if scope == "body":
         return TargetGraphSet(graphs, kernels=case.runtime.kernels,
                               selection=selection, scope=scope)
-    return ModelGraphSet(graphs, programs=model_programs,
+    if uniform_replicas and participants:
+        base_program = model_programs[participants[0]]
+        program_seeds = {replica: base_program for replica in participants}
+    else:
+        program_seeds = dict(model_programs)
+    return ModelGraphSet(graphs, programs=program_seeds,
+                         bindings=program_bindings, owners=program_owners,
                          kernels=case.runtime.kernels, selection=selection)
 
 
