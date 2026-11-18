@@ -73,17 +73,21 @@ HELDOUT_CASES = (
 #     declared ``aclnnMoeGatingTopK`` overlay replacing the eager router chain;
 #   * ``a5-v41-fp8-prefill`` additionally moves by the A5 fused compressor and
 #     quantized-index caching; no tolerance or calibration value changed.
+# Re-pinned for Wave 4B (#62 Item 6b): the Qwen 3.5 GDN rows move by the
+# declared `causal_conv1d_update` UPDATE program (per-task state resolve +
+# launch setup, and the streamed token/history off-chip envelope). No tolerance
+# or calibration value changed.
 CAPTURES = (
-    ("a2-qwen35-w8a8-ep4-sn", "qwen3.5-35b-a3b", "a2", "w8a8", "Ascend910B4", 2, 2, 4, None, 2, 8, "decode", 1, 128, 1, 0.31420159096420136),
-    ("a3-9362-qwen35-w8a8-ep8-sn", "qwen3.5-35b-a3b", "Ascend910_9362", "w8a8", "Ascend910_9362", 4, 2, 8, None, 2, 8, "decode", 1, 256, 1, 0.37458993784786665),
+    ("a2-qwen35-w8a8-ep4-sn", "qwen3.5-35b-a3b", "a2", "w8a8", "Ascend910B4", 2, 2, 4, None, 2, 8, "decode", 1, 128, 1, 0.32733359096420134),
+    ("a3-9362-qwen35-w8a8-ep8-sn", "qwen3.5-35b-a3b", "Ascend910_9362", "w8a8", "Ascend910_9362", 4, 2, 8, None, 2, 8, "decode", 1, 256, 1, 0.38764630148423035),
     ("a3-9392-glm53-w4a8-ep2-sn", "glm-5.3", "Ascend910_9392", "w4a8", "Ascend910_9392", 2, 1, 2, None, 4, 8, "decode", 1, 128, 1, 1.0433827380739717),
     ("a5-9582-qwen35-fp8-prefill", "qwen3.5-35b-a3b", "Ascend950DT_9582", "fp8", "Ascend950DT_9582", 2, 1, 2, None, 2, 8, "prefill", 128, 0, 1, 0.42693809179716835),
-    ("a5-9582-qwen397-w4a8", "qwen3.5-397b-a17b", "Ascend950DT_9582", "w4a8", "Ascend950DT_9582", 2, 1, 2, None, 2, 8, "decode", 1, 128, 1, 0.38968630108335833),
+    ("a5-9582-qwen397-w4a8", "qwen3.5-397b-a17b", "Ascend950DT_9582", "w4a8", "Ascend950DT_9582", 2, 1, 2, None, 2, 8, "decode", 1, 128, 1, 0.4053741192651771),
     ("a2-dsv32-w8a8-ep4", "deepseek-v3.2", "a2", "w8a8", "Ascend910B4", 2, 2, 4, None, 4, 8, "decode", 1, 128, 1, 2.577629181033372),
     ("a5-v41-fp8-prefill", "deepseek-v4.1", "Ascend950DT_9582", "fp8", "Ascend950DT_9582", 2, 1, 2, None, 4, 8, "prefill", 128, 0, 1, 1.537811582362521),
-    ("a3-9362-ep16-sn", "qwen3.5-35b-a3b", "Ascend910_9362", "w8a8", "Ascend910_9362", 4, 4, 16, 16, 2, 16, "decode", 1, 64, 1, 0.454605621521336),
-    ("a2-ep16-mn", "qwen3.5-35b-a3b", "a2", "w8a8", "Ascend910B4", 4, 4, 16, 8, 2, 16, "decode", 1, 64, 1, 0.608995045253984),
-    ("a5-9582-ep32-mn-fp8", "qwen3.5-397b-a17b", "Ascend950DT_9582", "fp8", "Ascend950DT_9582", 4, 8, 32, 8, 2, 32, "decode", 1, 64, 1, 1.8225673361439214),
+    ("a3-9362-ep16-sn", "qwen3.5-35b-a3b", "Ascend910_9362", "w8a8", "Ascend910_9362", 4, 4, 16, 16, 2, 16, "decode", 1, 64, 1, 0.4676619851576997),
+    ("a2-ep16-mn", "qwen3.5-35b-a3b", "a2", "w8a8", "Ascend910B4", 4, 4, 16, 8, 2, 16, "decode", 1, 64, 1, 0.622127045253984),
+    ("a5-9582-ep32-mn-fp8", "qwen3.5-397b-a17b", "Ascend950DT_9582", "fp8", "Ascend950DT_9582", 4, 8, 32, 8, 2, 32, "decode", 1, 64, 1, 1.8382551543257395),
     ("a5-9582-ep64-mn", "qwen3.5-35b-a3b", "Ascend950DT_9582", "w8a8", "Ascend950DT_9582", 8, 8, 64, 8, 2, 64, "prefill", 128, 0, 1, 3.330472662939374),
 )
 

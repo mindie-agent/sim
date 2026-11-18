@@ -12,14 +12,29 @@ from dataclasses import replace
 import math
 
 from mindie_sim.catalog.attention_common import _floor_sum
+from mindie_sim.catalog.cache import index_row_bytes
 from mindie_sim.schema.common import ModelingError
 from .mechanism import OperatorPlan, PlannedRecipe, Work
 from .operators.mixed_core import split_reads
 from .program import KernelProgram, Stage
+from .sparse_indexer_pipeline import (
+    INDEXER_WAVE_ROWS, QUANT_LEDGER, Arch35QuantIndexerRecipe,
+    arch35_indexer_work, indexer_waves, key_blocks,
+)
 
 
 IMPLEMENTATION = "cann_quant_lightning_indexer_v2_complete"
 RECIPE = "quant_lightning_indexer_v2"
+#: CANN 9.2.1 arch35 FP8 `quant_mode=1` lowering of the same operator family.
+ARCH35_IMPLEMENTATION = "aclnn_quant_lightning_indexer_v2_arch35"
+ARCH35_RECIPE = "aclnn_quant_lightning_indexer_v2_arch35"
+ARCH35_INDEX_DTYPE = "fp8_e4m3"
+ARCH35_SCALE_DTYPE = "fp16"
+ARCH35_HEAD_COUNTS = (32, 64)
+ARCH35_TOPK_MAX = 2048
+ARCH35_COMPRESSION_MAX = 128
+FP32_BYTES = 4
+INT32_BYTES = 4
 SOURCE = {
     "repository": "ops-transformer",
     "revision": "a3925fd49cd256ad478d2faf983bf2961b8ae2c8",
@@ -48,7 +63,8 @@ SOURCE = {
 
 
 def recipes():
-    return {RECIPE: PlannedRecipe(_build)}
+    return {RECIPE: PlannedRecipe(_build),
+            ARCH35_RECIPE: PlannedRecipe(_build_arch35)}
 
 
 def _build(op, geometry):
@@ -160,6 +176,107 @@ def generic_work(*, spans, heads, dim, topk, ratio):
     }
 
 
+def _build_arch35(op, geometry):
+    """arch35 FP8 (`quant_mode=1`) block pipeline over the 32 AIC owners."""
+    ledger = dict(dict(op.metadata)[QUANT_LEDGER])
+    plan = Arch35QuantIndexerRecipe().build(op, geometry)
+    metadata = {
+        "execution_abstraction": "owner_wave_block_pipeline",
+        "native_dispatch_reconstructed": False,
+        "cross_owner_topk_traffic": "per_token_rolling_merge_declared",
+        "waves": ledger["waves"],
+        "key_blocks": ledger["blocks"],
+    }
+    return OperatorPlan(plan.work, plan.program, metadata=metadata)
+
+
+def _check_arch35_domain(plan, quant, parallel, keys):
+    if (parallel.cp != 1 or parallel.pcp < 1 or plan.candidate_filter
+            or plan.index_kpool != 1
+            or quant.index_dtype != ARCH35_INDEX_DTYPE
+            or quant.index_scale_dtype != ARCH35_SCALE_DTYPE):
+        raise ModelingError("quant_lightning_indexer_v2_arch35_domain_mismatch")
+    if (plan.index_heads not in ARCH35_HEAD_COUNTS
+            or plan.index_dim != NATIVE_HEAD_DIM
+            or plan.index_topk > ARCH35_TOPK_MAX
+            or plan.compress_ratio > ARCH35_COMPRESSION_MAX
+            or (plan.compress_ratio & (plan.compress_ratio - 1))):
+        raise ModelingError("quant_lightning_indexer_v2_arch35_domain_mismatch")
+    if keys < 1:
+        raise ModelingError("quant_lightning_indexer_v2_arch35_domain_mismatch")
+
+
+def _candidate_keys(views, ratio):
+    """Compressed keys the arch35 scan walks: the populated request cache.
+
+    A request whose cache is empty falls back to its own query extent, so the
+    declared scan is never zero and never invents keys the cache cannot hold.
+    """
+    return max((max(1, -(-int(view.context) // ratio)) if int(view.context) > 0
+                else max(1, -(-int(view.q_len) // ratio)) for view in views),
+               default=1)
+
+
+def declare_arch35(builder, *, deps, views, plan, quant, parallel,
+                   block_size=None):
+    """Declare the CANN 9.2.1 arch35 FP8 (`quant_mode=1`) indexer planner.
+
+    `W_T = ceil(T / C_AIC)` owners each walk `ceil(K / 1024)` valid key blocks:
+    one FP8 Cube dot of `2 * H * 128 * valid_keys`, then the `H`-independent
+    rolling per-token AIV TopK merge of that block. Only the final INT32 token
+    indices reach GM; the score plane stays on chip.
+    """
+    del block_size
+    ratio = plan.compress_ratio
+    keys = _candidate_keys(views, ratio)
+    _check_arch35_domain(plan, quant, parallel, keys)
+    tokens = sum(view.q_len for view in views)
+    heads, width = plan.index_heads, plan.index_dim
+    width = width if isinstance(width, int) and width > 0 else NATIVE_HEAD_DIM
+    key_row_bytes = int(index_row_bytes_from(builder.model, width, quant))
+    blocks = key_blocks(keys)
+    ledger = {
+        "query_rows": int(tokens), "wave_rows": INDEXER_WAVE_ROWS,
+        "waves": indexer_waves(tokens), "blocks": blocks,
+        "heads": heads, "width": width, "keys": blocks * 1024,
+        "key_row_bytes": key_row_bytes,
+        "output_bytes": float(tokens) * plan.index_topk * INT32_BYTES,
+    }
+    work = arch35_indexer_work(ledger)
+    result = builder.work(ARCH35_RECIPE, deps, (tokens, heads, width),
+        family="indexer", dtype=ARCH35_INDEX_DTYPE,
+        metadata=((QUANT_LEDGER, ledger),
+                  ("native_source", {**SOURCE, "arch": "arch35", "lines": [1, 1]}),
+                  ("native_tensor_view", {
+                      "kind": "aclnn_quant_lightning_indexer_v2_arch35",
+                      "query_shape": (tokens, heads, width), "query_dtype": ARCH35_INDEX_DTYPE,
+                      "cache_dtype": ARCH35_INDEX_DTYPE,
+                      "cache_head_shape": (1, width), "scale_dtype": ARCH35_SCALE_DTYPE,
+                      "output_shape": (tokens, 1, plan.index_topk), "output_dtype": "int32",
+                      "layout": "ND", "quant_mode": 1, "compression_ratio": ratio,
+                      "visible_keys": ledger["keys"]}),
+                  ("native_implementation", {
+                      "native_kind": ARCH35_IMPLEMENTATION,
+                      "selection": ARCH35_IMPLEMENTATION,
+                      "conditions": {"submitted_kernels": 1, "quant_mode": 1,
+                                     "wave_rows": INDEXER_WAVE_ROWS,
+                                     "key_blocks": blocks,
+                                     "topk_merge_heads_independent": True}})))
+    builder.ops[-1] = replace(work.apply(builder.ops[-1]),
+                              source_boundary="kernel",
+                              coverage="arch35_fp8_wave_block_indexer_program")
+    return result
+
+
+def index_row_bytes_from(model, width, quant):
+    """Declared index cache row width for the resolved index representation."""
+    declared = int(round(index_row_bytes(model, width)))
+    if declared < width:
+        from mindie_sim.schema.common import dtype_bytes
+        declared = int(width * dtype_bytes(quant.index_dtype))
+    return declared
+
+
 def declare(builder, *, deps, views, plan, quant, parallel, block_size=None):
     """Declare the supported complete boundary without inferring native owners.
 
@@ -169,6 +286,10 @@ def declare(builder, *, deps, views, plan, quant, parallel, block_size=None):
     silently assumed: the ledger records that the runtime parameter was not
     supplied.
     """
+    if quant.index_dtype == ARCH35_INDEX_DTYPE:
+        return declare_arch35(builder, deps=deps, views=views, plan=plan,
+                              quant=quant, parallel=parallel,
+                              block_size=block_size)
     _check_domain(plan, quant, parallel, block_size)
     tokens = sum(view.q_len for view in views)
     # Causal compressed-key counts follow each owned span. PCP chunks pass
