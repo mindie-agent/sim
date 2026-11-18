@@ -84,6 +84,8 @@ def test_derived_aic_count_scales_cacheline_and_service_modes():
     rates, units, modes = dict(device.rates), dict(device.resource_units), dict(
         device.service_modes)
     assert units["vector"] == 56
+    assert units["gm_hbm_cacheline_128b"] == 56
+    assert rates["gm_hbm_cacheline_128b"] == pytest.approx(rates["hbm"] / 128)
     assert modes["mte1_l0a"][1] == pytest.approx(13.5168e12 * 28 / 32)
     assert modes["ub_copy"][1] == pytest.approx(27.0336e12 * 56 / 64)
     cacheline = next(
@@ -101,6 +103,9 @@ def test_derived_aic_count_scales_cacheline_and_service_modes():
         service for service in scaled_device.compute_arch.instruction_services
         if service.name == "gm_hbm_cacheline_128b")
     assert scaled_rates["hbm"] == pytest.approx(1.6e12)
+    assert scaled_units["gm_hbm_cacheline_128b"] == 56
+    assert scaled_rates["gm_hbm_cacheline_128b"] == pytest.approx(
+        scaled_rates["hbm"] / 128)
     assert scaled_cacheline.per_owner_rate * scaled_units["vector"] == pytest.approx(
         scaled_rates["hbm"] / 128)
     assert dict(scaled_device.service_modes)["mte1_l0a"][1] == pytest.approx(
@@ -289,6 +294,21 @@ def test_model_scope_uses_the_service_speculative_iteration_plan():
     assert service["steps"][0]["valid_tokens"] == 6
     assert model["steps"][0]["program_assembly"] == "model"
 
+    partial = _case("glm-5.3-flash", tp=1, dp=1, ep=1, layers=4,
+                    mtp_proposal_tokens=5, mtp_acceptance_length=3.5,
+                    prompt_tokens=4, output_tokens=8, raw_eager=True)
+    partial_model = assemble(
+        partial, scope="model", phase="decode", iterations=2, tokens=4, context=4)
+    partial_service = assemble(
+        partial, scope="service", phase="decode", iterations=2, tokens=4, context=4)
+    assert ([step["valid_tokens"] for step in partial_model["steps"]]
+            == [step["valid_tokens"] for step in partial_service["steps"]]
+            == [6, 5, 2])
+    assert [step["context_tokens"]["req-0"]
+            for step in partial_model["steps"]] == [4, 7, 10]
+    assert all(step["d2h_bytes"] == 0.0 and not step["emitted_tokens"]
+               for step in partial_model["steps"])
+
 
 def test_observed_mqsmla_spellings_share_the_active_contract():
     query = ((1, 64, 512), "bf16", "ND")
@@ -298,13 +318,25 @@ def test_observed_mqsmla_spellings_share_the_active_contract():
         ((1, 16), "int32", "ND"), empty, empty, empty,
     ]
     outputs = [query, empty]
-    for kind in ("MqsmlaKernel___call__", "aclnnMixedQuantSparseFlashMla",
-                 "MixedQuantSparseFlashMla"):
+    v41 = _case("deepseek-v4.1-flash", tp=1, dp=1, ep=1, layers=2)
+    exported = export_structure(
+        v41, phase="decode", tokens=1, context=2048, scope="model")
+    declared = [tuple(node["contract"]) for node in exported["nodes"]
+                if node.get("recipe") == "aclnn_mixed_quant_sparse_flash_mla"]
+    assert len(declared) == 2
+    for kind, expected in (
+        ("MqsmlaKernel___call__", "MqsmlaKernel___call__"),
+        ("MqsmlaKernel", "MqsmlaKernel___call__"),
+        ("aclnnMixedQuantSparseFlashMla", "aclnnMixedQuantSparseFlashMla"),
+        ("MixedQuantSparseFlashMla", "aclnnMixedQuantSparseFlashMla"),
+    ):
         contract = observed_attention_contract(_observed_row(kind, inputs, outputs))
         assert contract is not None
         assert contract[0] == "sparse_attention_active"
-        assert contract[1] == kind
+        assert contract[1] == expected
         assert contract[2][0][0] == query[0]
+        if expected == "aclnnMixedQuantSparseFlashMla":
+            assert list(contract[:2]) == list(declared[0][:2])
 
 
 def test_compressor_contract_omits_gate_and_ape_for_c1():
@@ -326,22 +358,69 @@ def test_compressor_contract_omits_gate_and_ape_for_c1():
     assert len(gated[3]) == 4
 
 
-def test_v4_prolog_exports_the_v4_native_identity():
+def test_v4_prolog_exports_and_decodes_the_v4_native_identity():
     view = {
-        "tokens": 2, "hidden": 4096, "heads": 64, "query_rank": 1536,
-        "latent_rank": 512, "nope_width": 256, "rope_width": 64,
-        "projection_weight_dtypes": ("bf16", "bf16", "bf16"),
-        "norm_dtype": "bf16", "cache_dtype": "uint8",
-        "query_norm_output": True, "query_norm_dtype": "bf16",
-        "token_dtype": "bf16", "absorbed_weight_dtype": "bf16",
+        "tokens": 2, "hidden": 7168, "heads": 16, "query_rank": 1536,
+        "latent_rank": 512, "nope_width": 128, "rope_width": 64,
+        "projection_weight_dtypes": ("fp8_e4m3", "fp8_e4m3", "fp8_e4m3"),
+        "norm_dtype": "bf16", "cache_dtype": "int8",
+        "query_norm_output": True, "query_norm_dtype": "fp8_e4m3",
+        "token_dtype": "fp8_e4m3", "absorbed_weight_dtype": "bf16",
         "packed_cache": {"row_bytes": 656},
     }
-    contract = subgraph_contract({
-        "implementation": {"native_kind": "aclnnMlaPrologV4WeightNz"},
-        "coverage": {}, "tensor_view": view, "role": "mla_prolog",
-    })
-    assert contract[0] == "mla_prolog_active"
-    assert contract[1] == "aclnnMlaPrologV4WeightNz"
+    for declared_kind in ("aclnnMlaPrologV4WeightNz", "MlaPrologV4WeightNz",
+                          "MlaPrologV4"):
+        declared = subgraph_contract({
+            "implementation": {"native_kind": declared_kind},
+            "coverage": {}, "tensor_view": view, "role": "mla_prolog",
+        })
+        assert declared[0] == "mla_prolog_active"
+        assert declared[1] == "aclnnMlaPrologV4WeightNz"
+
+    empty_bf16 = ((), "bf16", "ND")
+    empty_none = ((), None, None)
+    v4_inputs = [
+        ((2, 7168), "fp8_e4m3", "ND"),
+        ((7168, 1536), "fp8_e4m3", "FRACTAL_NZ"),
+        ((1536, 3072), "fp8_e4m3", "FRACTAL_NZ"),
+        ((16, 128, 512), "bf16", "ND"),
+        ((7168, 576), "fp8_e4m3", "FRACTAL_NZ"),
+        ((1536,), "bf16", "ND"),
+        ((512,), "bf16", "ND"),
+        empty_none, empty_none,
+        ((16, 128, 1, 656), "int8", "ND"),
+        empty_bf16,
+    ] + [empty_none] * 10
+    v4_outputs = [
+        ((2, 16, 512), "bf16", "ND"),
+        ((2, 16, 64), "bf16", "ND"),
+        ((16, 128, 1, 656), "int8", "ND"),
+        empty_bf16, empty_none,
+        ((2, 1536), "fp8_e4m3", "ND"),
+        ((2, 1), "fp32", "ND"),
+    ]
+    for observed_kind in ("aclnnMlaPrologV4WeightNz", "MlaPrologV4WeightNz"):
+        row = _observed_row(observed_kind, v4_inputs, v4_outputs)
+        assert observed_contract(row) == declared
+        assert observed_contract_diagnostic(row)["reason"] == (
+            "observed_tensor_contract_available")
+    assert observed_contract(_observed_row("MlaPrologV3", v4_inputs, v4_outputs)) is None
+
+    v3_inputs = [
+        ((2, 7168), "int8", "ND"),
+        ((7168, 1536), "int8", "FRACTAL_NZ"),
+        ((1536, 3072), "int8", "FRACTAL_NZ"),
+        *v4_inputs[3:4],
+        ((7168, 576), "int8", "FRACTAL_NZ"),
+        *v4_inputs[5:],
+    ]
+    v3_outputs = [*v4_outputs[:5], ((2, 1536), "int8", "ND"), v4_outputs[6]]
+    v3_row = _observed_row("MlaPrologV3", v3_inputs, v3_outputs)
+    v3_contract = observed_contract(v3_row)
+    assert v3_contract is not None and v3_contract[:2] == (
+        "mla_prolog_active", "MlaPrologV3")
+    assert observed_contract(
+        _observed_row("aclnnMlaPrologV4WeightNz", v3_inputs, v3_outputs)) is None
 
 
 def test_explicit_cache_epilog_native_kind_is_a_candidate():

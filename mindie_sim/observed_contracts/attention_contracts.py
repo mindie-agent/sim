@@ -49,12 +49,15 @@ MQSMLA_QUERY_WIDTH = 512
 MQSMLA_ORIGINAL_ROW_BYTES = 544
 MQSMLA_COMPRESSED_ROW_BYTES = 320
 MQSMLA_COMPRESSED_INPUT_COUNT = 10
-MQSMLA_KINDS = frozenset({
-    "MqsmlaKernel___call__", "MqsmlaKernel",
-    "aclnnMixedQuantSparseFlashMla", "MixedQuantSparseFlashMla",
+LEGACY_MQSMLA_CANONICAL_KIND = "MqsmlaKernel___call__"
+LEGACY_MQSMLA_KINDS = frozenset({LEGACY_MQSMLA_CANONICAL_KIND, "MqsmlaKernel"})
+ACLNN_MQSMLA_CANONICAL_KIND = "aclnnMixedQuantSparseFlashMla"
+ACLNN_MQSMLA_KINDS = frozenset({
+    ACLNN_MQSMLA_CANONICAL_KIND, "MixedQuantSparseFlashMla",
 })
-MLA_PROLOG_INPUT_SLOTS = 21
-MLA_PROLOG_OUTPUT_SLOTS = 7
+MQSMLA_KINDS = LEGACY_MQSMLA_KINDS | ACLNN_MQSMLA_KINDS
+MLA_PROLOG_INPUT_ARITIES = frozenset({21})
+MLA_PROLOG_OUTPUT_ARITIES = frozenset({7})
 
 
 # Arity variants come from retained original A3/A5 rows, including explicit
@@ -74,9 +77,10 @@ _ARITIES = {
     "SparseFlashMla": ({18}, {2}),
     "KvQuantSparseFlashAttentionVllm": ({9}, {3}),
     "KvQuantSparseFlashAttention": ({9}, {1}),
-    "MlaPrologV3": (MLA_PROLOG_INPUT_SLOTS, MLA_PROLOG_OUTPUT_SLOTS),
-    "aclnnMlaPrologV4WeightNz": (MLA_PROLOG_INPUT_SLOTS, MLA_PROLOG_OUTPUT_SLOTS),
-    "MlaPrologV4WeightNz": (MLA_PROLOG_INPUT_SLOTS, MLA_PROLOG_OUTPUT_SLOTS),
+    "MlaPrologV3": (MLA_PROLOG_INPUT_ARITIES, MLA_PROLOG_OUTPUT_ARITIES),
+    "aclnnMlaPrologV4WeightNz": (MLA_PROLOG_INPUT_ARITIES, MLA_PROLOG_OUTPUT_ARITIES),
+    "MlaPrologV4WeightNz": (MLA_PROLOG_INPUT_ARITIES, MLA_PROLOG_OUTPUT_ARITIES),
+    "MlaPrologV4": (MLA_PROLOG_INPUT_ARITIES, MLA_PROLOG_OUTPUT_ARITIES),
     "ChunkGatedDeltaRuleFwd": ({9, 10}, {4}),
     "RecurrentGatedDeltaRule": ({9, 10}, {2}),
 }
@@ -302,8 +306,12 @@ def _mqsmla_attention(kind, inputs, outputs):
                 or not _nd_tensor(inputs[8], 2, {"int32"})):
             return None
         compressed_head = (compressed[0][2:], "uint8", "ND")
+    canonical_kind = (
+        ACLNN_MQSMLA_CANONICAL_KIND if kind in ACLNN_MQSMLA_KINDS
+        else LEGACY_MQSMLA_CANONICAL_KIND
+    )
     return (
-        "sparse_attention_active", kind,
+        "sparse_attention_active", canonical_kind,
         (query,),
         ((original[0][2:], "uint8", "ND"), compressed_head),
         output,

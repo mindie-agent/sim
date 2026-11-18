@@ -16,8 +16,9 @@ from .structure_native_contracts import grouped_situ_contract
 QWEN4_HC_KINDS = frozenset({"Qwen4ExpGatedResidualMix", "Qwen4ExpHcCombine"})
 LOW_RANK_HC_NATIVE_KINDS = QWEN4_HC_KINDS
 MLA_PROLOG_V3_CONTRACT = "MlaPrologV3"
+MLA_PROLOG_V4_CONTRACT = "aclnnMlaPrologV4WeightNz"
 MLA_PROLOG_V4_KINDS = frozenset({
-    "aclnnMlaPrologV4WeightNz", "MlaPrologV4WeightNz", "MlaPrologV4",
+    MLA_PROLOG_V4_CONTRACT, "MlaPrologV4WeightNz", "MlaPrologV4",
 })
 
 
@@ -103,7 +104,7 @@ def subgraph_contract(declaration):
             cache_contract = (((1, view["packed_cache"]["row_bytes"]), "int8", "ND"),
                               ((), None, None))
         implementation = (declaration.get("implementation") or {})
-        prolog_kind = (str(implementation.get("native_kind"))
+        prolog_kind = (MLA_PROLOG_V4_CONTRACT
                        if implementation.get("native_kind") in MLA_PROLOG_V4_KINDS
                        else MLA_PROLOG_V3_CONTRACT)
         return (

@@ -44,12 +44,15 @@ ONE: float = 1.0
 FIRST = 0
 DEFAULT_DEVICE_COUNT = 1
 TOLERANCE: float = 1e-9
+HBM_CACHELINE_SERVICE = "gm_hbm_cacheline_128b"
+HBM_CACHELINE_BYTES = 128
 AIC_OWNER_UNITS = frozenset({"mte1", "mte2_aic", "fixpipe"})
 AIV_OWNER_UNITS = frozenset({
     "vector", "mte2_aiv", "mte3", "pipe_s_issue", "pipe_v_issue",
     "pipe_v_lanes", "reg_alu_lanes", "reg_data_writes", "reg_reduce_lanes",
     "reg_shuffle_lanes", "reg_special_lanes", "reg_ub_accesses",
     "reg_ub_stores", "scalar_store_issue", "ub_read_bytes", "ub_write_bytes",
+    HBM_CACHELINE_SERVICE,
 })
 AIC_RATE_KEYS = frozenset({"mte1", "mte2_aic", "fixpipe"})
 AIV_RATE_KEYS = frozenset({
@@ -61,8 +64,6 @@ AIV_RATE_KEYS = frozenset({
 #: Service modes whose declared rate is one HBM read stream.  They scale with
 #: ``hbm_peak_bytes_per_s`` even though their resource name is not ``hbm``.
 DRAM_BOUND_MODES = frozenset({"mte2_aic_dram", "mte2_aiv_dram"})
-HBM_CACHELINE_SERVICE = "gm_hbm_cacheline_128b"
-HBM_CACHELINE_BYTES = 128
 AIC_BUFFER_UNITS = frozenset({"l1", "l0a", "l0b", "l0c"})
 AIV_BUFFER_UNITS = frozenset({"ub"})
 A5_FAMILY = "A5"
@@ -331,14 +332,30 @@ def derive_hardware_sku(
                 mode["rate"] = float(mode["rate"]) * s_v
         # A scalar HBM line is one 128-byte transaction over the die's whole
         # AIV population.  Recompute the per-owner share from the effective
-        # bandwidth and the derived owner count rather than copying a larger
-        # SKU's peak.
+        # bandwidth and the derived owner count, and drop round-tripped rate/
+        # unit entries unless the base explicitly overrode them.
+        base_die = base_hardware.dies[device_index]
         services = (device.get("compute_arch") or {}).get("instruction_services") or {}
         cacheline = services.get(HBM_CACHELINE_SERVICE)
         if isinstance(cacheline, dict) and cacheline.get("clock_hz") is None:
-            owners = max(ONE, int(units.get("vector", new_aiv)))
+            if HBM_CACHELINE_SERVICE not in base_die.instruction_unit_overrides:
+                units.pop(HBM_CACHELINE_SERVICE, None)
+            owners = max(
+                ONE,
+                int(units.get(HBM_CACHELINE_SERVICE, units.get("vector", new_aiv))),
+            )
             cacheline["per_owner_rate"] = (
                 float(rates["hbm"]) / (HBM_CACHELINE_BYTES * owners))
+            if HBM_CACHELINE_SERVICE not in base_die.linked_rate_overrides:
+                rates.pop(HBM_CACHELINE_SERVICE, None)
+                assumptions[f"derivation.recomputed_service.{HBM_CACHELINE_SERVICE}"] = (
+                    "from_owner_supply"
+                )
+            cacheline_mode = (device.get("service_modes") or {}).get(HBM_CACHELINE_SERVICE)
+            if (isinstance(cacheline_mode, dict)
+                    and HBM_CACHELINE_SERVICE not in base_die.instruction_mode_overrides):
+                cacheline_mode.pop("rate", None)
+        device["resource_units"] = units
         device["rates"] = rates
         _strip_derived_instruction_rates(device, device_arch, assumptions)
         device["sku"] = sku

@@ -70,6 +70,7 @@ NEXTN_DEFAULT_HEAD_DIM = 192
 PP_CAP_DEFAULT = (1, 2, 4, 8, 16)
 #: Native KDA recurrent source: decode-only batches up to q8.
 KDA_DECODE_MAX_QUERY_TOKENS = 8
+DRAFT_PREPARE_MIN_REMAINING = 2
 
 HARDWARE_ALIASES: dict[str, str] = {
     "a2": "Ascend910B4", "910b": "Ascend910B4", "910b4": "Ascend910B4",
@@ -1494,33 +1495,46 @@ def assemble(case, *, scope="service", iterations=None, phase=None, tokens=None,
     service_counts = {family: 0 for family in SERVICE_FAMILIES}
     serving = execution.serving_io
     model_draft_policies = {}
+    model_draft_states = {}
+    model_token_quota = None
     if scope == "model" and phase == "decode":
-        from mindie_sim.prediction.scheduler import DraftPolicy
+        from mindie_sim.prediction.scheduler import DraftPolicy, Progress
         for spec in specs:
             policy = DraftPolicy.for_request(parsed, spec)
             if policy.mode:
                 model_draft_policies[spec.request_id] = policy
+        if model_draft_policies:
+            model_token_quota = int(iterations) * int(tokens)
+            for spec in specs:
+                state = Progress(spec)
+                state.computed = computed_kv[spec.request_id]
+                state.started = True
+                model_draft_states[spec.request_id] = state
     # A non-draft decode step advances one token. ``tokens`` is the requested
     # token budget per outer iteration and expands into real microsteps, each
     # with its own forward/commit/state dependency; it is never one batched
     # multi-token commit or a sleep for the rest of the budget.  A speculative
-    # model step is already one proposal block plus a multi-row verification,
-    # so it is not expanded again into independent one-row forwards.
+    # model step follows the same acceptance-credit plan as service scope.
     decode_tokens = int(tokens) if phase == "decode" else 1
     total_steps = (int(iterations) * decode_tokens if phase == "decode"
                    else int(iterations))
     if model_draft_policies:
         decode_tokens = 1
-        total_steps = int(iterations)
+        total_steps = int(model_token_quota)
     for step_index in range(total_steps):
         views = []
         model_budget = (int(parsed.runtime.max_num_batched_tokens)
                         if model_draft_policies else DEFAULT_ZERO)
         for spec in specs:
-            remaining = spec.output_tokens - generated[spec.request_id]
+            target_tokens = (min(spec.output_tokens, model_token_quota)
+                             if model_token_quota is not None
+                             else spec.output_tokens)
+            remaining = target_tokens - generated[spec.request_id]
             if remaining <= 0:
                 continue
             proposal = DEFAULT_ZERO
+            prepare = False
+            advance = 1
             if phase == "prefill" and step_index == 0:
                 q_len, view_phase = spec.prompt_tokens, "prefill"
                 count = 1
@@ -1531,11 +1545,17 @@ def assemble(case, *, scope="service", iterations=None, phase=None, tokens=None,
                 if model_draft_policies:
                     if model_budget <= DEFAULT_ZERO:
                         continue
+                    state = model_draft_states[spec.request_id]
                     policy = model_draft_policies.get(spec.request_id)
                     if policy is not None:
                         proposal = min(
                             policy.proposal, max(DEFAULT_ZERO, remaining - 1),
                             max(DEFAULT_ZERO, model_budget - 1))
+                        advance = min(
+                            remaining,
+                            policy.committed(state, proposal) if proposal else 1)
+                        prepare = (bool(policy.mode)
+                                   and remaining > DRAFT_PREPARE_MIN_REMAINING)
                     model_budget -= 1 + proposal
             if view_phase == "prefill":
                 view_context = 0
@@ -1550,8 +1570,11 @@ def assemble(case, *, scope="service", iterations=None, phase=None, tokens=None,
                 spec.request_id, q_len, view_context, True, view_phase,
                 draft_verify=bool(proposal),
                 draft_proposal_tokens=proposal,
-                draft_prepare=False,
-                draft_advanced_tokens=(DEFAULT_ZERO if proposal else count),
+                draft_prepare=prepare,
+                draft_advanced_tokens=(advance if model_draft_policies else count),
+                draft_accepted_tokens=(
+                    max(DEFAULT_ZERO, advance - 1)
+                    if model_draft_policies else DEFAULT_ZERO),
                 prompt_tokens=spec.prompt_tokens,
             ))
         if not views:
@@ -1637,16 +1660,18 @@ def assemble(case, *, scope="service", iterations=None, phase=None, tokens=None,
         delivery_times = ({request: event.time for request, event in
                            step.client_deliveries.items() if event.time is not None}
                           if serving.enabled else {})
+        commit_at_ms = (step.completion.time if step.completion.time is not None
+                        else release_ms)
         for view in views:
             if scope == "framework":
                 continue
             if view.phase == "prefill":
                 computed_kv[view.request_id] = view.prompt_tokens
-            elif view.request_id in model_draft_policies:
-                # One speculative iteration reserves the proposal block plus
-                # its verification row; acceptance is a service boundary.
-                computed_kv[view.request_id] += (
-                    view.q_len + view.draft_proposal_tokens)
+            elif view.request_id in model_draft_states:
+                state = model_draft_states[view.request_id]
+                state.commit(view, commit_at_ms)
+                computed_kv[view.request_id] = state.computed
+                generated[view.request_id] = state.generated
             else:
                 computed_kv[view.request_id] += view.q_len
         row = {
