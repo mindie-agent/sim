@@ -31,6 +31,8 @@ TWO_THIRDS = 2.0 / 3.0
 
 
 ONE = 1
+QK_INPUT_COUNT = 2
+L2_NORM_OPS = 5
 
 
 def _sum_valid_powers(tokens: int, chunk: int, power: int) -> int:
@@ -219,7 +221,9 @@ def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             * (2 * parallel.pcp - 1) / parallel.pcp,
             "allgather", "pcp")
     norm_rows = sum(view.q_len for view in views) if conv_source else tokens
-    normalized = b.vector("qk_l2norm", (conv,), norm_rows * 2 * key_width, 5)
+    normalized = b.vector("qk_l2norm", (conv,), norm_rows * QK_INPUT_COUNT * key_width, L2_NORM_OPS,
+                          metadata=(("batch_chunk_norm", plan.kda_batch_chunk_norm
+                                     and any(v.phase == "prefill" for v in views)),))
     if plan.attention == "gdn":
         # g and beta are scalars per value head, not per value channel. The
         # independent z projection gates the output after the recurrent core.

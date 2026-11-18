@@ -438,8 +438,12 @@ class ParallelSpec:
     def ep_domain(self) -> int:
         # Homogeneous EP is confined to the lane plane.  The legacy PCP-spanning
         # reading survives only for an explicitly tabulated placement.
-        return len({rank for group in self.rank_table for rank in group}) \
-            if self.rank_table is not None else self.lane_plane
+        if self.rank_table is None:
+            return self.lane_plane
+        total = len({rank for group in self.rank_table for rank in group})
+        if self.pp > ONE and total % self.pp == ZERO and total // self.pp >= self.ep:
+            return total // self.pp
+        return total
 
     @property
     def active_pcp_lanes(self) -> int:

@@ -38,6 +38,8 @@ from mindie_sim.schema.common import ModelingError
 
 DEFAULT_QK_HEAD_DIM = 256
 MTP_PP_CAPABILITY = (1, 2, 4, 8, 16)
+GLM_KDA_GATE_LOWER_BOUND = -5.0
+FP32_STATE_BYTES = 4
 
 def _index_pool(c):
     size = int(c.get("index_kpool") or 1)
@@ -245,9 +247,10 @@ def _glm_hybrid_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
                 recurrent_state_dtype="fp32",
                 conv_state_elements=conv_width * (conv_k - 1),
                 conv_state_dtype="bf16",
-                kda_gate_lower_bound=-5.0,
+                kda_gate_lower_bound=GLM_KDA_GATE_LOWER_BOUND,
+                kda_batch_chunk_norm=True,
                 state_bytes=float(
-                    kda_heads * kda_dim * kda_dim * 4
+                    kda_heads * kda_dim * kda_dim * FP32_STATE_BYTES
                     + conv_width * (conv_k - 1) * 2
                 ),
                 kv_owner_layer_id=index,

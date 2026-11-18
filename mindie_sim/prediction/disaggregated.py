@@ -29,6 +29,7 @@ from mindie_sim.schema.common import ModelingError
 DEFAULT_PD_TRACE_LIMIT = 2
 DEFAULT_PD_EVENT_LIMIT = 256
 from mindie_sim.catalog.cache import layer_cache_components
+from .pd_ranges import address, owned_runs, transfers_for_runs
 from mindie_sim.coverage import combine_coverage
 
 
@@ -216,21 +217,20 @@ def _pd_handoff_binding(request, tokens, placement, cases, memory, execution,
     topk_buffer = int(sparse.get("topk_buffer_size", 0)) if offload else 0
     hot_tokens = (min(int(tokens), topk_buffer)
                   if use_copy_sfa and topk_buffer > 0 else 0)
-    hot_ratio = (float(hot_tokens) / float(tokens)
-                 if tokens > 0 and hot_tokens > 0 else 0.0)
     transfers = []
     destination_bytes = _defaultdict(float)
     host_bytes = _defaultdict(float)
     source_ranks = set()
     destination_ranks = set()
-    source_offsets = _defaultdict(float)
-    destination_offsets = _defaultdict(float)
+    plane_bases, source_extents = {}, _defaultdict(float)
+    destination_planes, destination_offsets = {}, _defaultdict(float)
 
     def emit(source_rank, destination_rank, component, payload, *,
              source_stage, destination_stage, layer, source_span,
              destination_span, source_tokens, destination_tokens,
              tier="hbm", source_storage, destination_storage,
-             source_component=None, destination_component=None):
+             source_component=None, destination_component=None,
+             source_size, source_displacement=0, destination_size, destination_displacement=0):
         payload = float(payload)
         if payload <= 0.0:
             return
@@ -260,12 +260,14 @@ def _pd_handoff_binding(request, tokens, placement, cases, memory, execution,
             dst_storage = str(dst_rec["storage"])
         else:
             dst_storage = destination_storage
-        src_key = (source_rank, src_storage)
-        dst_key = (destination_rank, dst_storage, tier)
-        src_offset = source_offsets[src_key]
-        dst_offset = destination_offsets[dst_key]
-        source_offsets[src_key] += payload
-        destination_offsets[dst_key] += payload
+        src_offset = address(plane_bases, source_extents,
+                             (source_rank, src_storage, src_version),
+                             (layer, source_component), source_size,
+                             source_displacement, payload)
+        dst_key = (destination_rank, dst_storage, dst_version, tier)
+        dst_offset = address(destination_planes, destination_offsets, dst_key,
+                             (layer, destination_component), destination_size,
+                             destination_displacement, payload)
         transfers.append(PDTransfer(
             source_rank, destination_rank, payload,
             source_stage=source_stage,
@@ -304,6 +306,7 @@ def _pd_handoff_binding(request, tokens, placement, cases, memory, execution,
         if not source or not destination:
             raise ModelingError("pd_handoff_missing_stage_ranks:" + request)
         num_heads = int(getattr(layer, "num_kv_heads", 0) or 0)
+        has_head_axis = layer.attention in {"gqa", "projection_only"}
         source_spans = _local_head_spans(num_heads, prefill_p.tp)
         target_spans = _local_head_spans(num_heads, decode_p.tp)
         source_owners = getattr(prefill_mem, "rank_token_owners", None)
@@ -318,7 +321,7 @@ def _pd_handoff_binding(request, tokens, placement, cases, memory, execution,
                 component_owners = owners
             else:
                 spans = tuple(
-                    _head_token_span(index, tokens, head_spans, parallel.cp)
+                    _head_token_span(index, tokens, head_spans if has_head_axis else (), parallel.cp)
                     for index in range(len(ranks)))
                 # Feed the same exact partition to the cache ledger: an even
                 # ``rows / cp`` split would bill 160/160 B for the [0,2) and
@@ -339,8 +342,8 @@ def _pd_handoff_binding(request, tokens, placement, cases, memory, execution,
                           target_owners, target_spans)
         components = {name for _, _, values, _ in src_views for name in values}
         components |= {name for _, _, values, _ in dst_views for name in values}
-        gqa_components = {name for name in components
-                          if name in HEAD_COMPONENTS and num_heads > 0}
+        gqa_components = {name for name in HEAD_COMPONENTS
+                          if has_head_axis and num_heads > 0}
         split_kv = (num_heads > 0
                     and _published_for(published, "prefill", request,
                                        layer.index, "gqa_k") is not None
@@ -391,12 +394,19 @@ def _pd_handoff_binding(request, tokens, placement, cases, memory, execution,
                                 covered.setdefault(head, []).append(
                                     (piece_lo, piece_hi))
                         for (piece_lo, piece_hi), heads in grouped.items():
-                            payload = (per_head_token * (piece_hi - piece_lo)
-                                       * len(heads))
-                            if split_kv:
-                                for suffix in ("k", "v"):
-                                    emit(src_rank, dest_rank, f"gqa_{suffix}",
-                                         payload * 0.5,
+                            spans_all_rows = (piece_lo, piece_hi) == (s_lo, s_hi)
+                            spans_all_rows &= (piece_lo, piece_hi) == (d_lo, d_hi)
+                            consecutive = heads[-1] - heads[0] + 1 == len(heads)
+                            groups = ([heads] if spans_all_rows and consecutive
+                                      else ([head] for head in heads))
+                            planes = ("gqa_k", "gqa_v") if split_kv else (component,)
+                            for group in groups:
+                                first = (group[0] - sspan[0]) * (s_hi - s_lo)
+                                offset = first + piece_lo - s_lo
+                                for plane in planes:
+                                    unit = per_head_token / len(planes)
+                                    emit(src_rank, dest_rank, plane,
+                                         unit * (piece_hi - piece_lo) * len(group),
                                          source_stage=source_stage,
                                          destination_stage=destination_stage,
                                          layer=layer.index, source_span=sspan,
@@ -405,18 +415,12 @@ def _pd_handoff_binding(request, tokens, placement, cases, memory, execution,
                                          destination_tokens=(piece_lo, piece_hi),
                                          source_storage=src_storage,
                                          destination_storage=dst_storage,
-                                         source_component=f"gqa_{suffix}",
-                                         destination_component=f"gqa_{suffix}")
-                            else:
-                                emit(src_rank, dest_rank, component, payload,
-                                     source_stage=source_stage,
-                                     destination_stage=destination_stage,
-                                     layer=layer.index, source_span=sspan,
-                                     destination_span=dspan,
-                                     source_tokens=(piece_lo, piece_hi),
-                                     destination_tokens=(piece_lo, piece_hi),
-                                     source_storage=src_storage,
-                                     destination_storage=dst_storage)
+                                         source_size=src_values[component] / len(planes),
+                                         source_displacement=unit * offset,
+                                         destination_size=need / len(planes),
+                                         destination_displacement=unit * (
+                                             (group[0] - dspan[0]) * (d_hi - d_lo)
+                                             + piece_lo - d_lo))
                     missing = [head for head in range(dspan[0], dspan[1])
                                if sum(piece_hi - piece_lo for piece_lo, piece_hi
                                       in covered.get(head, ())) < d_hi - d_lo]
@@ -425,90 +429,51 @@ def _pd_handoff_binding(request, tokens, placement, cases, memory, execution,
                             "pd_handoff_source_head_uncovered:"
                             f"{request}:{layer.index}:{dest_rank}:{missing}")
                 continue
-            host_done = False
-            for dest_index, dest_rank, dest_values, dest_tokens in dst_views:
-                need = float(dest_values.get(component, 0.0))
-                if windowed:
-                    dest_tokens = (max(window_start, dest_tokens[0]),
-                                   min(tokens, dest_tokens[1]))
-                d_lo, d_hi = dest_tokens
-                dst_storage = f"pd:kv:{request}:decode:r{decode_rep}:rank{dest_rank}"
-                if offload and component == "mla_kv" and layer.index in offload_layers:
-                    if not host_done:
-                        src_index, src_rank, src_values, src_tokens = src_views[0]
-                        if windowed:
-                            src_tokens = (max(window_start, src_tokens[0]),
-                                          min(tokens, src_tokens[1]))
-                        host_payload = float(src_values.get("mla_kv", 0.0))
-                        if host_payload > 0.0:
-                            host_storage = (f"pd:host:{request}:decode:"
-                                            f"r{decode_rep}")
-                            emit(src_rank, dest_rank, component, host_payload,
-                                 source_stage=source_stage,
-                                 destination_stage=destination_stage,
-                                 layer=layer.index,
-                                 source_span=(0, num_heads),
-                                 destination_span=(0, num_heads),
-                                 source_tokens=src_tokens,
-                                 destination_tokens=dest_tokens,
-                                 tier="host",
-                                 source_storage=f"pd:kv:{request}:prefill:r{prefill_rep}:rank{src_rank}",
-                                 destination_storage=host_storage)
-                        host_done = True
-                    hot = need * hot_ratio
-                    if hot > 0.0:
-                        src_index, src_rank, src_values, src_tokens = src_views[0]
-                        if windowed:
-                            src_tokens = (max(window_start, src_tokens[0]),
-                                          min(tokens, src_tokens[1]))
-                        emit(src_rank, dest_rank, component, hot,
-                             source_stage=source_stage,
-                             destination_stage=destination_stage,
-                             layer=layer.index,
-                             source_span=(0, num_heads),
-                             destination_span=(0, num_heads),
-                             source_tokens=src_tokens,
-                             destination_tokens=dest_tokens,
+            row_component = component in {"mla_kv", "window", "compressed_kv", "index_k"}
+            if row_component:
+                def manifest(case, parallel, entries):
+                    return [(rank, owned_runs(component, layer, case.model, parallel,
+                                              index, span, tokens, window_start),
+                             values.get(component, 0))
+                            for index, rank, values, span in entries]
+
+                sources = manifest(prefill_case, prefill_p, src_views)
+                destinations = manifest(decode_case, decode_p, dst_views)
+                sparse_layer = offload and component == "mla_kv" and layer.index in offload_layers
+                receivers = []
+                if sparse_layer:
+                    receivers.append((destination[0], ((window_start, tokens),),
+                                      "host", f"pd:host:{request}:decode:r{decode_rep}"))
+                for rank, runs, need in destinations:
+                    if need <= 0:
+                        continue
+                    if sparse_layer:
+                        runs = tuple((max(lo, tokens - hot_tokens), hi) for lo, hi in runs
+                                     if hi > max(lo, tokens - hot_tokens))
+                    storage = f"pd:kv:{request}:decode:r{decode_rep}:rank{rank}"
+                    receivers.append((rank, runs, "hbm", storage))
+                ratio = (max(1, layer.compress_ratio, layer.index_kpool)
+                         if component == "index_k" else max(1, layer.compress_ratio)
+                         if component == "compressed_kv" else 1)
+                for dst_rank, runs, tier, storage in receivers:
+                    target_rows = sum(hi - lo for lo, hi in runs)
+                    received = 0
+                    for src_rank, lo, hi, size, offset, unit in transfers_for_runs(sources, runs):
+                        token_span = (lo * ratio, hi * ratio)
+                        emit(src_rank, dst_rank, component, (hi - lo) * unit,
+                             source_stage=source_stage, destination_stage=destination_stage,
+                             layer=layer.index, source_span=(0, num_heads),
+                             destination_span=(0, num_heads), source_tokens=token_span,
+                             destination_tokens=token_span, tier=tier,
                              source_storage=f"pd:kv:{request}:prefill:r{prefill_rep}:rank{src_rank}",
-                             destination_storage=dst_storage)
-                    continue
-                if need <= 0.0:
-                    continue
-                if component in {"mla_kv", "window"} and d_hi > d_lo:
-                    # A dense non-GQA cache row is owned by the token axis.
-                    # Intersect each source shard with the destination's own
-                    # rows; TP replicas holding the same interval deduplicate.
-                    per_token = need / float(d_hi - d_lo)
-                    covered_tokens: list[tuple[int, int]] = []
-                    for _src_index, src_rank, _src_values, src_tokens in src_views:
-                        s_lo, s_hi = src_tokens
-                        if windowed:
-                            s_lo, s_hi = (max(window_start, s_lo),
-                                          min(tokens, s_hi))
-                        lo, hi = max(s_lo, d_lo), min(s_hi, d_hi)
-                        if hi <= lo:
-                            continue
-                        for piece_lo, piece_hi in _uncovered_intervals(
-                                covered_tokens, lo, hi):
-                            emit(src_rank, dest_rank, component,
-                                 per_token * (piece_hi - piece_lo),
-                                 source_stage=source_stage,
-                                 destination_stage=destination_stage,
-                                 layer=layer.index,
-                                 source_span=(0, num_heads),
-                                 destination_span=(0, num_heads),
-                                 source_tokens=(piece_lo, piece_hi),
-                                 destination_tokens=(piece_lo, piece_hi),
-                                 source_storage=f"pd:kv:{request}:prefill:r{prefill_rep}:rank{src_rank}",
-                                 destination_storage=dst_storage)
-                            covered_tokens.append((piece_lo, piece_hi))
-                    covered_rows = sum(piece_hi - piece_lo
-                                       for piece_lo, piece_hi in covered_tokens)
-                    if covered_rows < d_hi - d_lo:
-                        raise ModelingError(
-                            "pd_handoff_token_range_uncovered:"
-                            f"{request}:{layer.index}:{component}:{dest_rank}")
-                    continue
+                             destination_storage=storage, source_size=size,
+                             source_displacement=offset, destination_size=target_rows * unit,
+                             destination_displacement=received * unit)
+                        received += hi - lo
+                continue
+            for dest_index, dest_rank, dest_values, dest_tokens in dst_views:
+                need = float(dest_values.get(component, 0))
+                dst_storage = f"pd:kv:{request}:decode:r{decode_rep}:rank{dest_rank}"
                 remaining = need
                 for src_index, src_rank, src_values, src_tokens in src_views:
                     if remaining <= 1e-9:
@@ -529,7 +494,8 @@ def _pd_handoff_binding(request, tokens, placement, cases, memory, execution,
                          source_tokens=src_tokens,
                          destination_tokens=dest_tokens,
                          source_storage=f"pd:kv:{request}:prefill:r{prefill_rep}:rank{src_rank}",
-                         destination_storage=dst_storage)
+                         destination_storage=dst_storage, source_size=available,
+                         destination_size=need, destination_displacement=need - remaining)
                     remaining -= take
                 if remaining > max(1e-9, need * 1e-12):
                     raise ModelingError(

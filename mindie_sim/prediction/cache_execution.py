@@ -47,6 +47,7 @@ class CacheTypedView:
     #: True only when the producer's real output namespace registered this
     #: name. A view without one is a declaration, not an actual port.
     output_registered: bool = False
+    padding_bytes: int = 0
 
     def __post_init__(self):
         for name in ("producer", "output", "dtype", "layout", "storage", "owner"):
@@ -61,6 +62,8 @@ class CacheTypedView:
             raise ModelingError("cache_typed_view_payload_bytes_invalid")
         if type(self.scale_bytes) is not int or self.scale_bytes < 0:
             raise ModelingError("cache_typed_view_scale_bytes_invalid")
+        if type(self.padding_bytes) is not int or self.padding_bytes < 0:
+            raise ModelingError("cache_typed_view_padding_bytes_invalid")
         if type(self.packed_elements) is not int or self.packed_elements < 1:
             raise ModelingError("cache_typed_view_packed_elements_invalid")
         if type(self.group_size) is not int or self.group_size < 0:
@@ -79,6 +82,7 @@ class CacheTypedView:
             "owner": self.owner, "inputs": list(self.inputs),
             "payload_bytes": self.payload_bytes,
             "scale_bytes": self.scale_bytes,
+            "padding_bytes": self.padding_bytes,
             "packed_elements": self.packed_elements,
             "group_size": self.group_size,
             "output_registered": self.output_registered,
@@ -198,6 +202,7 @@ class CacheAccessBinding:
     #: Exact request object token; a same-identity but different request is
     #: not allowed to dereference this receipt.
     request_token: int = 0
+    padding_bytes: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -215,6 +220,7 @@ class CacheAccessBinding:
             "completed": self.completed, "last_use": self.last_use,
             "payload_bytes": self.payload_bytes,
             "scale_bytes": self.scale_bytes,
+            "padding_bytes": self.padding_bytes,
             "line_segments": [item.to_tuple() for item in self.line_segments],
             "byte_segments": [item.to_tuple() for item in self.byte_segments],
             "coverage_bytes": self.coverage_bytes,
@@ -567,6 +573,7 @@ class CacheAccessOperation:
             last_use=last_use,
             payload_bytes=view.payload_bytes if view else summary.logical_bytes,
             scale_bytes=view.scale_bytes if view else 0,
+            padding_bytes=view.padding_bytes if view else 0,
             line_segments=summary.line_segments,
             byte_segments=summary.byte_segments,
             coverage_bytes=summary.coverage_bytes,
@@ -888,6 +895,8 @@ class CacheExecution:
                                     else summary.logical_bytes)),
             "scale_bytes": (binding.scale_bytes if binding
                             else (view.scale_bytes if view else 0)),
+            "padding_bytes": (binding.padding_bytes if binding
+                              else (view.padding_bytes if view else 0)),
             "rank": rank, "scope": scope,
             "bytes": summary.logical_bytes,
             "source": source_value, "source_actual": bool(

@@ -82,39 +82,71 @@ def row_shard_tp(*, options=None, runtime=None):
     return max(1, int(parallel.o_proj_tp), int(parallel.linear_proj_tp))
 
 
-def row_shard_partition(views, divisor):
-    """Contiguous query-row range owned by the representative local-TP rank.
+def row_slice(views, start, stop):
+    """Slice flattened rows and retain each cut row's original causal position."""
+    result, pos = [], 0
+    for view in views:
+        end = pos + view.q_len
+        lo, hi = max(pos, start), min(end, stop)
+        if hi > lo:
+            if lo == pos and hi == end:
+                result.append(view)
+            elif view.query_ranges:
+                ranges, offset = [], pos
+                for left, right in view.query_ranges:
+                    size = right - left
+                    a, b = max(lo, offset), min(hi, offset + size)
+                    if b > a:
+                        ranges.append((left + a - offset, left + b - offset))
+                    offset += size
+                result.append(replace(view, q_len=hi-lo, query_ranges=tuple(ranges),
+                                      global_q_len=view.global_q_len or view.q_len))
+            else:
+                result.append(replace(view, q_len=hi-lo, context=view.context + lo-pos,
+                                      global_q_len=0))
+        pos = end
+    return tuple(result)
 
-    Query rows and per-request sequence metadata move together, so the local
-    rank scores `ceil(tokens / divisor)` rows. `divisor == 1` is the replicated
-    caller and changes nothing.  A single multi-row request is split at the row
-    boundary instead of handing the whole request to one rank.
-    """
-    views = tuple(views)
+
+def row_shard_partition(views, divisor):
     if isinstance(divisor, bool) or not isinstance(divisor, int) or divisor < 1:
         raise ModelingError("index_pool_row_shard_divisor_invalid")
-    if divisor == 1 or not views:
-        return views
-    total_rows = sum(max(0, int(view.q_len)) for view in views)
-    if total_rows <= 0:
-        owned = max(1, -(-len(views) // divisor))
-        return views[:owned]
-    target_rows = max(1, -(-total_rows // divisor))
-    owned, remaining = [], target_rows
-    for view in views:
-        take = min(max(0, int(view.q_len)), remaining)
-        if take <= 0:
-            continue
-        if take < int(view.q_len):
-            ranges = getattr(view, "query_ranges", None)
-            view = (replace(view, q_len=take, query_ranges=tuple(
-                (lo, min(hi, take)) for lo, hi in ranges if lo < take))
-                if ranges else replace(view, q_len=take))
-        owned.append(view)
-        remaining -= take
-        if remaining <= 0:
-            break
-    return tuple(owned)
+    if divisor == 1:
+        return tuple(views)
+    rows = sum(v.q_len for v in views)
+    return row_slice(views, 0, -(-rows // divisor))
+
+
+MIN_SHARD_ROWS_PER_RANK = 1024
+MIN_SHARD_SCORE_PAIRS = 16_777_216
+
+
+def native_shard_sizes(views, pool, width):
+    """Use the native zero-based searchsorted convention on cumulative row cost."""
+    from bisect import bisect_left
+    from mindie_sim.catalog.index_pool import completed_prefix
+    rows = sum(v.q_len for v in views)
+    if width < 2 or rows < width * MIN_SHARD_ROWS_PER_RANK:
+        return (rows,)
+    ends, costs = [0], [0]
+    for v in views:
+        ends.append(ends[-1] + v.q_len)
+        costs.append(costs[-1] + completed_prefix(v.context + v.q_len, pool)
+                     - completed_prefix(v.context, pool))
+    if costs[-1] < MIN_SHARD_SCORE_PAIRS:
+        return (rows,)
+
+    def cumulative(index):
+        j = bisect_left(ends, index + 1) - 1
+        ctx = views[j].context
+        return costs[j] + completed_prefix(ctx + index + 1 - ends[j], pool) - completed_prefix(ctx, pool)
+
+    cuts = [0]
+    for rank in range(1, width):
+        cut = bisect_left(range(rows), rank * costs[-1] // width, key=cumulative)
+        cuts.append(min(rows - (width-rank), max(cuts[-1] + 1, cut)))
+    cuts.append(rows)
+    return tuple(b-a for a, b in zip(cuts, cuts[1:]))
 
 
 def _selection_for(view, plan):

@@ -453,14 +453,20 @@ def test_native_keypool_binds_bf16_pool_projections_and_requires_fp32_scales():
     for category in POOL_PROJECTION_CATEGORIES:
         assert dict(overrides[category])["weight_format"] == "bf16"
     ops = _ops(case, phase="prefill", tokens=8, context=0)
-    gate = next(op for op in ops
-                if op.layer == 3 and op.recipe == "index_pool_gate")
-    assert dict(gate.metadata)["weight_format"] == "bf16"
+    pooled = next(op for op in ops if op.layer == 3 and op.recipe == "cann_key_pool")
+    rows, width, hidden = pooled.local_shape
+    meta = dict(pooled.metadata)
+    assert meta["projection_formats"]["gate"] == "bf16"
+    assert meta["cann_key_pool_work"]["weight_bytes"] == 2 * width * hidden * 2
+    assert dict(pooled.matrix_flops)["bf16"] == 4 * rows * width * hidden
 
     plan = case.model.layer_plans[0]
     # The native caller's hardcoded FP32 scale must not be selected for FP16.
     fp16 = _native_pool_case("fp16")
     views = ()
+    fallback = _ops(fp16, phase="prefill", tokens=8, context=0)
+    gate = next(op for op in fallback if op.layer == 3 and op.recipe == "index_pool_gate")
+    assert dict(gate.metadata)["weight_format"] == "bf16"
     assert not supported(views=views, plan=plan, model=fp16.model,
                          quant=fp16.model.quant)
 

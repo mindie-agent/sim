@@ -42,17 +42,7 @@ from mindie_sim.schema.model import WorkloadSpec
 from mindie_sim.catalog.cache_format import cache_format
 
 
-MQSMLA_PACKED_WIDTH = 512
-MQSMLA_SCALE_GROUP = 32
-MQSMLA_ROTARY_PAYLOAD_BYTES = 576.0
-MQSMLA_FP8_SCALE_BYTES = 32.0
-MQSMLA_MXFP8_SCALE_BYTES = 8.0
-MQSMLA_MODE_SCALES = {
-    (("fp8_e4m3", MQSMLA_SCALE_GROUP, "bf16"),
-     ("fp8_e4m3", MQSMLA_SCALE_GROUP, "bf16")): MQSMLA_FP8_SCALE_BYTES,
-    (("fp8_e4m3", MQSMLA_SCALE_GROUP, "uint8"),
-     ("fp8_e4m3", MQSMLA_SCALE_GROUP, "uint8")): MQSMLA_MXFP8_SCALE_BYTES,
-}
+from .mqsmla_layout import packed_row_parts
 
 
 def completed_rows(sequence_tokens: int, ratio: int) -> int:
@@ -248,29 +238,19 @@ def index_row_bytes(model: Any, index_dim: int) -> float:
     return float(index_dim) * index_element_bytes(model) + index_scale_bytes(model)
 
 
-def _mqsmla_mode_row_split(model: Any, region: str, width: int) -> tuple[float, float] | None:
-    if region not in {"window", "compressed_kv"} or int(width) != MQSMLA_PACKED_WIDTH:
-        return None
-    window = cache_format(model, "window")
-    compressed = cache_format(model, "compressed_kv")
-    if window.suffix_elements or compressed.suffix_elements:
-        return None
-    scale = MQSMLA_MODE_SCALES.get((
-        (window.dtype, window.group_size, window.scale_dtype),
-        (compressed.dtype, compressed.group_size, compressed.scale_dtype),
-    ))
-    if scale is None:
-        return None
-    return MQSMLA_ROTARY_PAYLOAD_BYTES, float(scale)
+def _mqsmla_mode_row_split(model, region, width):
+    parts = packed_row_parts(model, region, width)
+    if parts is not None:
+        data, scales, padding = parts
+        return float(data), float(scales + padding)
+    return None
 
 
 def cache_row_split(model: Any, region: str, width: int) -> tuple[float, float]:
-    """Split one declared cache row into payload and quant scale bytes.
+    """Return materialized data and allocated scale-plane bytes (including pad).
 
-    Suffix elements are materialized data, not quantization metadata, so they
-    stay in the payload component.  The sum is the declared row width; no
-    additional row or page rounding is applied here (the caller's row count
-    already carries allocator geometry).
+    These two allocation columns exhaust the physical row. Typed operator
+    views obtain the numerical scales and alignment bytes from packed_row_parts.
     """
     packed = _mqsmla_mode_row_split(model, region, width)
     if packed is not None:
@@ -521,9 +501,11 @@ def layer_cache_components(model, plan, parallel, sequence_tokens, *, capacity_p
     seq = max(0, int(sequence_tokens))
     tp, cp = parallel.tp, parallel.cp
     result = {}
-    def local_rows(rows, block=interleave, *, start=0):
+    def local_rows(rows, block=interleave, *, start=0, ratio=ONE):
         if rank is not None:
-            owned = owned_token_rows(rows, owner_spans, rank, start=start)
+            spans = (tuple((lo // ratio, hi // ratio) for lo, hi in owner_spans)
+                     if owner_spans is not None and ratio > ONE else owner_spans)
+            owned = owned_token_rows(rows, spans, rank, start=start)
             if owned is not None:
                 return owned
             if capacity_padded:
@@ -567,9 +549,11 @@ def layer_cache_components(model, plan, parallel, sequence_tokens, *, capacity_p
                 rows, start=max(ZERO, seq - rows)) * packed_region_row_bytes(
                 model, "window", plan.cache_row_elements)
         if plan.owns_long_kv:
-            result["compressed_kv"] = local_rows(
-                completed_rows(seq, plan.compress_ratio), max(ONE, interleave // max(ONE, plan.compress_ratio))) \
-                * packed_region_row_bytes(model, "compressed_kv", plan.cache_row_elements)
+            ratio = max(ONE, plan.compress_ratio)
+            compressed = local_rows(completed_rows(seq, plan.compress_ratio),
+                                    max(ONE, interleave // ratio), ratio=ratio)
+            result["compressed_kv"] = compressed * packed_region_row_bytes(
+                model, "compressed_kv", plan.cache_row_elements)
             if plan.compressor_state_rows and seq:
                 rows = plan.compressor_state_rows if capacity_padded else min(seq, plan.compressor_state_rows)
                 result["compressor_state"] = rows * TWO * plan.compressor_width * plan.head_dim * FOUR
@@ -582,7 +566,7 @@ def layer_cache_components(model, plan, parallel, sequence_tokens, *, capacity_p
         rows = completed_rows(seq, index_ratio)
         from .paired_sfa import execution
         if execution(model).get("dcp_indexer_sharded") and cp > ONE:
-            rows = local_rows(rows, max(ONE, interleave // index_ratio))
+            rows = local_rows(rows, max(ONE, interleave // index_ratio), ratio=index_ratio)
         elif parallel.cp_plan == "dsa_cp":
             if rank is not None:
                 cp_rank = (int(rank) % max(ONE, int(cp))

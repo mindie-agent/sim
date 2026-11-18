@@ -297,12 +297,15 @@ def _quant_tile_work(ledger, index):
     active_rows = sum(1 for value in row_valids if value > 0)
     valid = max(row_valids, default=0)
     tile_pairs = sum(row_valids)
-    query_bytes = float(active_rows) * heads * (
-        width + FP32_ELEMENT_BYTES)
-    operand_bytes = (query_bytes
-                     + float(valid) * (int(ledger["key_row_bytes"])
-                                       + FP32_ELEMENT_BYTES)
-                     if active_rows > 0 else 0.0)
+    query_bytes = active_rows * heads * (width + 2 * FP32_ELEMENT_BYTES) if block == 0 else 0
+    start = block * POOL_KEY_BLOCK
+    stop = start + POOL_KEY_BLOCK
+    ranges = ledger.get("wave_key_ranges")
+    fragments = ranges[wave] if ranges is not None else ((0, start + valid),)
+    unique = sum(max(0, min(hi, stop) - max(lo, start)) for lo, hi in fragments)
+    query_heads = active_rows * heads if block == 0 else 0
+    cube_input = (query_heads + unique) * width
+    vector_input = (2 * query_heads + unique) * FP32_ELEMENT_BYTES
     return {
         "rows": rows,
         "valid_keys": valid,
@@ -311,7 +314,8 @@ def _quant_tile_work(ledger, index):
             # The cold cache rows are filled once; a wave rescans them from L2.
             "hbm": query_bytes,
             # The operand fetch includes this block's key rows and scales.
-            "mte2": operand_bytes,
+            "mte2_aic": cube_input,
+            "mte2_aiv": vector_input,
         },
         "reduce": {
             "vector": float(tile_pairs) * TOPK_MERGE_OPS,
@@ -332,9 +336,6 @@ def arch35_indexer_work(ledger):
     total = total + Work({}, {
         "mte3": float(ledger["output_bytes"]),
         "hbm": float(ledger["output_bytes"]) + fill,
-        # Every distinct cache row reaches the kernel through the read pipe,
-        # even when one owner wave rescans only the largest private cache.
-        "mte2": fill,
     })
     return total
 
@@ -381,7 +382,7 @@ class Arch35QuantIndexerRecipe:
             stages = []
             if fill > 0.0:
                 stages.append(Stage("cache_fill", context.bind(Work({}, {
-                    "hbm": fill, "mte2": fill}))))
+                    "hbm": fill}))))
             stages.append(Stage("indices", context.bind(Work({}, {
                 "mte3": float(ledger["output_bytes"]),
                 "hbm": float(ledger["output_bytes"])})), latency=floor))
@@ -402,7 +403,7 @@ class Arch35QuantIndexerRecipe:
             # One cold fill of every distinct request cache row. Later waves
             # rescan the resident rows through their operand fetch.
             Stage("cache_fill", context.bind(Work({}, {
-                "hbm": fill, "mte2": fill}))),
+                "hbm": fill}))),
             Stage("blocks", after=("cache_fill",),
                   program=PipelineProgram(tiles, SERIAL_SLOTS, tile)),
             Stage("indices", context.bind(Work({}, {

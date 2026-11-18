@@ -1791,9 +1791,10 @@ class Memory:
             st = self.layer_stage[layer.index]
             for name, val in components.items():
                 if name == "mla_kv" and layer.index in offload_set:
-                    rd2h_bytes += val
-                    if hot_tokens > 0 and tokens > 0:
-                        stage_hbm[st] += val * (hot_tokens / tokens)
+                    rd2h_bytes += val * p.cp
+                    live = min(tokens, layer.window) if layer.window else tokens
+                    if hot_tokens and live:
+                        stage_hbm[st] += val * min(hot_tokens, live) / live
                 else:
                     stage_hbm[st] += val
         wire_volume = sum(stage_hbm) * p.tp * p.pcp + rd2h_bytes

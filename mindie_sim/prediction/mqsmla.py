@@ -370,10 +370,19 @@ def quant_tile_phases_cached(valid, first, last, heads, quant_mode, window_bytes
 
 
 def build(op, geometry):
-    shape = dict(op.metadata)["mqsmla_geometry"]
+    meta = dict(op.metadata)
+    shape = meta["mqsmla_geometry"]
     requested = str(shape.get("addressing", "scalar"))
-    implementation = str(shape.get("implementation", RECIPE))
-    legacy = implementation == LEGACY_RECIPE
+    implementation = str(shape.get("implementation", op.recipe or RECIPE))
+    legacy = (implementation == LEGACY_RECIPE
+              or op.recipe == LEGACY_RECIPE
+              or meta.get("native_kind") == LEGACY_NATIVE_KIND)
+    view = dict(meta.get("attention_tensor_view") or {})
+    if legacy and (
+            shape.get("packed_row_bytes") is not None
+            or view.get("original_cache_row_bytes", ORIGINAL_CACHE_ROW_BYTES) != ORIGINAL_CACHE_ROW_BYTES
+            or view.get("compressed_cache_row_bytes", COMPRESSED_CACHE_ROW_BYTES) != COMPRESSED_CACHE_ROW_BYTES):
+        raise ModelingError("mqsmla_legacy_dsl_requires_mixed_fp8_fp4_cache")
     heads = int(shape["heads"])
     if (not supported_heads(heads) or shape["width"] != MQSMLA_HEAD_WIDTH
             or shape["metadata_support_fd"]):
@@ -404,7 +413,7 @@ def build(op, geometry):
                     for owner, start, end in ownership)
     quant_mode = shape.get("kv_quant_mode")
     if quant_mode is not None:
-        if quant_mode not in KV_QUANT_MODES:
+        if legacy or quant_mode not in KV_QUANT_MODES:
             raise ModelingError("mqsmla_kv_quant_mode_unsupported")
         return _quant_plan(shape, streams, int(quant_mode), addressing)
     for pool, amount in BUFFERS.items():
@@ -514,109 +523,31 @@ def build(op, geometry):
     })
 
 
-def _external_prefix_groups(shape, sequences):
-    """Physical shared-prefix groups, matching indexed_quant_attention."""
-    raw = shape.get("prefix_tokens", 0) or 0
-    extents = tuple(raw) if isinstance(raw, tuple) else (int(raw),) * len(sequences)
-    keys = tuple(shape.get("prefix_cache_keys") or ())
-    declared = bool(keys)
-    groups: dict[str, list] = {}
-    private = []
-    for index, (query, context) in enumerate(sequences):
-        prefix = max(0, min(int(extents[index]), int(context)))
-        key = str(keys[index]) if index < len(keys) else ""
-        if prefix > 0 and (key or not declared):
-            groups.setdefault(key, []).append((int(query), int(context), prefix))
-        else:
-            private.append((int(query), int(context), prefix))
-    return groups, private, declared
-
-
 def quant_external_fill(shape, quant_mode):
-    """Cold external KV bytes: resident window ring plus compressed rows."""
-    rows = tuple(query_rows(shape))
-    if not rows:
-        return 0, 0
-    row_bytes = quant_row_bytes(quant_mode)
-    sequences = tuple(shape.get("sequences", ())) or ((len(rows), 0),)
-    window = int(shape.get("window", 0) or 0)
-    # The window ring keeps the last ``window`` distinct rows of the appended
-    # sequence; a short context holds ``context + q_len`` rows, never a tile.
-    original = (sum(min(int(context) + int(query),
-                        window + max(0, int(query) - 1))
-                    for query, context in sequences if int(query) > 0)
-                if window else 0)
-    ratio = int(shape.get("ratio", 0) or 0)
-    topk = int(shape.get("topk", 0) or 0)
-    # One compressed row completes per ``ratio`` raw tokens; the TopK list
-    # keeps at most ``topk`` of the completed rows. Without a compressor every
-    # context token is a candidate row.
-    completed = [(int(context) + int(query)) // ratio if ratio
-                 else (int(context) + int(query))
-                 for query, context in sequences]
-    capacity = [min(topk, value) if topk else value for value in completed]
-    compressed = 0
-    shared_rows = 0
-    raw_prefix = shape.get("prefix_tokens", 0) or 0
-    prefix = max(raw_prefix) if isinstance(raw_prefix, tuple) else int(raw_prefix)
-    shared = (str(shape.get("prefix_cache_mode", "private")) == "shared"
-              and prefix > 0)
-    if shared and (topk or ratio):
-        groups, private, declared = _external_prefix_groups(shape, sequences)
-        if topk:
-            # The compressed prefix union is one cold fill; the private
-            # suffixes of each request are separate rows.  A completed prefix
-            # shorter than one compression group shares no compressed row.
-            for members in groups.values():
-                member_completed = [
-                    (context + query) // ratio if ratio else context + query
-                    for query, context, _prefix in members]
-                member_prefix = [
-                    prefix // max(1, ratio) for _q, _c, prefix in members]
-                selection = [min(topk, value) for value in member_completed]
-                shared_sel = [
-                    min(sel, p, (sel * p + comp // 2) // comp)
-                    if comp and p else 0
-                    for sel, comp, p in zip(
-                        selection, member_completed, member_prefix)]
-                member_priv = [sel - shared for sel, shared
-                               in zip(selection, shared_sel)]
-                group_shared = (len(members) > 1
-                                or (not declared and len(sequences) > 1))
-                if group_shared and any(p > 0 for p in member_prefix):
-                    group_shared_unique = min(
-                        max(member_prefix, default=0), sum(shared_sel))
-                    compressed += group_shared_unique + sum(member_priv)
-                    shared_rows += group_shared_unique
-                else:
-                    compressed += sum(selection)
-            for query, context, _prefix in private:
-                compressed += min(
-                    topk, (context + query) // ratio if ratio else context + query)
-        else:
-            # Dense HCA: a shared group reads its completed prefix rows once
-            # and each member keeps the rows beyond that prefix.
-            for members in groups.values():
-                member_completed = [
-                    (context + query) // ratio
-                    for query, context, _prefix in members]
-                group_shared = (len(members) > 1
-                                or (not declared and len(sequences) > 1))
-                if group_shared:
-                    prefix_rows = [
-                        min(value, prefix // max(1, ratio))
-                        for value, (_q, _c, prefix) in zip(
-                            member_completed, members)]
-                    compressed += max(prefix_rows) + sum(
-                        value - shared_value for value, shared_value
-                        in zip(member_completed, prefix_rows))
-                else:
-                    compressed += sum(member_completed)
-            for query, context, _prefix in private:
-                compressed += (context + query) // ratio
-    elif topk or ratio:
-        compressed = sum(capacity)
-    return (original + compressed) * row_bytes, shared_rows
+    """One cold compressed selection per request and a private sliding window."""
+    from .batch_prefix_attention import (
+        nested_prefix_union, prefix_members, selected_prefix_count,
+    )
+    sequences = tuple(shape["sequences"])
+    window, ratio, topk = (int(shape.get(k) or 0) for k in ("window", "ratio", "topk"))
+    groups = {}
+    private = 0
+    for (query, context), (key, prefix) in zip(sequences, prefix_members(shape, sequences)):
+        if not query:
+            continue
+        if window:
+            private += min(context + query, window + query - 1)
+        if not ratio:
+            continue
+        completed = (context + query) // ratio
+        selected = min(topk, completed) if topk else completed
+        extent = prefix // ratio
+        shared = selected_prefix_count(selected, extent, completed, completed)
+        private += selected - shared
+        if shared:
+            groups.setdefault(key, []).append((extent, shared))
+    union = sum(nested_prefix_union(group) for group in groups.values())
+    return (private + union) * quant_row_bytes(quant_mode), union
 
 
 def _quant_plan(shape, streams, quant_mode, addressing):

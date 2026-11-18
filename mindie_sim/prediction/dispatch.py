@@ -58,8 +58,9 @@ def cohorts(parallel, machine=None):
     if machine is not None:
         from .local_tp_groups import local_tp_replica_cohorts, local_tp_spans_dp
         if local_tp_spans_dp(parallel):
-            return list(local_tp_replica_cohorts(machine, parallel))
-    width = parallel.ep_dp_width
+            from .dbo_ledger import replica_cohorts
+            return replica_cohorts(machine, parallel, list(local_tp_replica_cohorts(machine, parallel)))
+    width = ONE if parallel.rank_table is not None else parallel.ep_dp_width
     if int(parallel.tp) == ONE:
         for candidate in (
             int(parallel.o_proj_tp),
@@ -70,7 +71,9 @@ def cohorts(parallel, machine=None):
                 combined = math.lcm(width, candidate)
                 if int(parallel.dp) % combined == ZERO:
                     width = combined
-    return [tuple(range(first, first + width)) for first in range(ZERO, parallel.dp, width)]
+    from .dbo_ledger import replica_cohorts
+    groups = [tuple(range(first, first + width)) for first in range(ZERO, parallel.dp, width)]
+    return replica_cohorts(machine, parallel, groups)
 
 
 _CALLABLE_BINDING_CACHE: dict[Any, tuple[Any, str | None]] = {}
@@ -570,7 +573,8 @@ def submit_batch(case, schedulers, plans, execution, lower, now, *,
             # routing/F3 projection.
             valid_global = sum(source_rows_by_replica)
             context["routing_global_tokens"] = valid_global
-            if len(local) > 1 and "sequence_parallel" in case.runtime.kernels:
+            if (len(local) > ONE and "sequence_parallel" in case.runtime.kernels
+                    and case.runtime.parallel.rank_table is None):
                 from .sequence_parallel import select as select_sp
                 from .graph import GraphPolicy
                 physical_rows = []
@@ -600,17 +604,10 @@ def submit_batch(case, schedulers, plans, execution, lower, now, *,
             context["source_rows_by_replica"] = source_rows_by_replica
         cohort_views = tuple(
             view for replica in logical_local for view in logical_local[replica].requests)
-        cohort_views_by_replica = tuple(
-            Frontend.partition_views(
-                logical_local[replica].requests, case.runtime,
-                sum(view.q_len + view.draft_proposal_tokens
-                    for view in logical_local[replica].requests),
-                model=case.model)[0]
-            for replica in logical_local)
         route_context = ({"routing_views": cohort_views,
-                          "cohort_views_by_replica": cohort_views_by_replica}
-                         if isinstance(lower, Frontend) and len(plans) > 1
-                         else {})
+                          "cohort_views_by_replica": {
+                              r: plan.requests for r, plan in logical_local.items()}}
+                         if isinstance(lower, Frontend) else {})
         works = {}
         state_accesses = {}
         memory_bindings = {}

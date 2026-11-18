@@ -67,6 +67,40 @@ class SparsePrefixFill:
         }
 
 
+def nested_prefix_union(extent_counts):
+    """Largest distinct subset of nested [0, extent) pools with given draws."""
+    used = 0
+    for extent, count in sorted(extent_counts):
+        used = min(extent, used + count)
+    return used
+
+
+def selected_prefix_count(selected, extent, visible, population):
+    if not selected or not extent:
+        return 0
+    if selected == visible:
+        return extent
+    estimated = (selected * extent + population // 2) // max(1, population)
+    return max(selected - (visible - extent), min(estimated, selected, extent))
+
+
+def prefix_members(shape, sequences):
+    """Named immutable prefixes shared by at least two live requests."""
+    from collections import Counter
+    raw = shape.get("prefix_tokens") or 0
+    extents = raw if isinstance(raw, (list, tuple)) else (raw,) * len(sequences)
+    names = shape.get("prefix_cache_keys")
+    shared = shape.get("prefix_cache_mode") == "shared"
+    members = []
+    for i, (query, context) in enumerate(sequences):
+        extent = min(context, max(0, int(extents[i]))) if query and shared else 0
+        key = (str(names[i] or "") if names and i < len(names) else
+               "" if names else "__implicit__")
+        members.append((key, extent))
+    counts = Counter(key for key, extent in members if key and extent)
+    return tuple((key, extent if counts[key] > 1 else 0) for key, extent in members)
+
+
 def sparse_prefix_fill(*, rows: int, requests: int, selected: int,
                        prefix_tokens: int, context: int) -> SparsePrefixFill:
     """Bound the first-touch external rows of a sparse shared-prefix batch."""
@@ -75,9 +109,8 @@ def sparse_prefix_fill(*, rows: int, requests: int, selected: int,
     if requests > rows:
         raise ModelingError("sparse_prefix_fill_requests_exceed_query_rows")
     shared = min(prefix_tokens, context)
-    shared_selected = (selected * shared + context // 2) // context
-    shared_selected = min(shared_selected, selected, shared)
-    shared_unique = min(shared, requests * shared_selected)
+    shared_selected = selected_prefix_count(selected, shared, context, context)
+    shared_unique = nested_prefix_union(((shared, requests * shared_selected),))
     private_rows = requests * (selected - shared_selected)
     return SparsePrefixFill(shared_selected, shared_unique, private_rows,
                             shared_unique + private_rows)

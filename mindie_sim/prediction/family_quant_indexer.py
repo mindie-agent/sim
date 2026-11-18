@@ -12,7 +12,6 @@ from dataclasses import replace
 import math
 
 from mindie_sim.catalog.attention_common import _floor_sum
-from mindie_sim.catalog.cache import index_row_bytes
 from mindie_sim.schema.common import ModelingError
 from .mechanism import OperatorPlan, PlannedRecipe, Work
 from .operators.mixed_core import split_reads
@@ -29,7 +28,7 @@ RECIPE = "quant_lightning_indexer_v2"
 ARCH35_IMPLEMENTATION = "aclnn_quant_lightning_indexer_v2_arch35"
 ARCH35_RECIPE = "aclnn_quant_lightning_indexer_v2_arch35"
 ARCH35_INDEX_DTYPE = "fp8_e4m3"
-ARCH35_SCALE_DTYPE = "fp16"
+ARCH35_SCALE_DTYPE = "fp32"
 ARCH35_HEAD_COUNTS = (32, 64)
 ARCH35_TOPK_MAX = 2048
 ARCH35_COMPRESSION_MAX = 128
@@ -261,8 +260,34 @@ def _candidate_keys(views, ratio, maxima=None):
     return scan, payload
 
 
+def _wave_key_ranges(row_sets, views, ratio, shared):
+    """Distinct interval fragments in each wave, in logical key coordinates."""
+    waves, batch, prefixes, private = [], 0, {}, {}
+
+    def flush():
+        waves.append(tuple((0, n) for n in prefixes.values()) + tuple(private.values()))
+        prefixes.clear()
+        private.clear()
+
+    for request, (values, view) in enumerate(zip(row_sets, views)):
+        key = view.prefix_cache_key if shared else ""
+        extent = min(view.prefix_tokens, view.context) // max(1, ratio) if key else 0
+        for n in values:
+            p = min(n, extent)
+            if p:
+                prefixes[key] = max(prefixes.get(key, 0), p)
+            if n > p:
+                private[request] = (extent, max(n, private.get(request, (0, 0))[1]))
+            batch += 1
+            if batch % INDEXER_WAVE_ROWS == 0:
+                flush()
+    if batch % INDEXER_WAVE_ROWS:
+        flush()
+    return tuple(waves)
+
+
 def declare_arch35(builder, *, deps, views, plan, quant, parallel,
-                   block_size=None):
+                   block_size=None, prefix_cache_mode="private"):
     """Declare the CANN 9.2.1 arch35 FP8 (`quant_mode=1`) indexer planner.
 
     `W_T = ceil(T / C_AIC)` owners each walk `ceil(K / 1024)` valid key blocks:
@@ -273,18 +298,23 @@ def declare_arch35(builder, *, deps, views, plan, quant, parallel,
     del block_size
     ratio = plan.compress_ratio
     noncausal = bool(getattr(plan, "noncausal_attention", False))
-    row_completed = tuple(
-        key for view in views
-        for key in _view_row_keys(view, ratio, noncausal))
-    view_max = tuple(
-        max(_view_row_keys(view, ratio, noncausal), default=0)
-        for view in views)
-    keys, payload_keys = _candidate_keys(views, ratio, view_max)
+    row_sets = tuple(_view_row_keys(v, ratio, noncausal) for v in views)
+    row_completed = tuple(n for values in row_sets for n in values)
+    view_max = tuple(max(values, default=0) for values in row_sets)
+    shared = prefix_cache_mode == "shared"
+    keys = max(view_max, default=0)
+    payload_keys = _candidate_keys(views, ratio, view_max)[1] if shared else sum(view_max)
+    wave_ranges = _wave_key_ranges(row_sets, views, ratio, shared)
     tokens = len(row_completed)
     _check_arch35_domain(plan, quant, parallel, keys, tokens)
     heads, width = plan.index_heads, plan.index_dim
     width = width if isinstance(width, int) and width > 0 else NATIVE_HEAD_DIM
-    key_row_bytes = int(index_row_bytes_from(builder.model, width, quant))
+    from mindie_sim.catalog.cache_format import CacheFormat, cache_format
+    declared = dict(builder.model.metadata).get("cache_representations", {})
+    if "index_k" in declared and cache_format(builder.model, "index_k") != CacheFormat(
+            ARCH35_INDEX_DTYPE, width, ARCH35_SCALE_DTYPE):
+        raise ModelingError("quant_lightning_indexer_v2_arch35_domain_mismatch")
+    key_row_bytes = width + FP32_BYTES
     blocks = key_blocks(keys) if keys > 0 else 0
     keys_padded = blocks * 1024
     runs = []
@@ -300,14 +330,18 @@ def declare_arch35(builder, *, deps, views, plan, quant, parallel,
         "keys_padded": keys_padded,
         "completed_keys": keys, "payload_keys": payload_keys,
         "row_completed_keys": tuple(runs),
-        "key_row_bytes": key_row_bytes,
+        "key_row_bytes": key_row_bytes, "wave_key_ranges": wave_ranges,
         "output_bytes": float(tokens) * plan.index_topk * INT32_BYTES,
     }
     work = arch35_indexer_work(ledger)
     result = builder.work(ARCH35_RECIPE, deps, (tokens, heads, width),
         family="indexer", dtype=ARCH35_INDEX_DTYPE,
         metadata=((QUANT_LEDGER, ledger),
-                  ("native_source", {**SOURCE, "arch": "arch35", "lines": [1, 1]}),
+                  ("native_source", {
+                      "repository": "ops-transformer", "revision": "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+                      "relative_path": ("attention/quant_lightning_indexer_v2/op_kernel/arch35/"
+                                        "quant_lightning_indexer_v2_kernel_arch35.h"),
+                      "source_sha256": "37b78aab1ddb5eb0139e8a8c710610bbbccdc32359c4352ec302057153ed8945"}),
                   ("native_tensor_view", {
                       "kind": "aclnn_quant_lightning_indexer_v2_arch35",
                       "query_shape": (tokens, heads, width), "query_dtype": ARCH35_INDEX_DTYPE,
@@ -329,16 +363,8 @@ def declare_arch35(builder, *, deps, views, plan, quant, parallel,
     return result
 
 
-def index_row_bytes_from(model, width, quant):
-    """Declared index cache row width for the resolved index representation."""
-    declared = int(round(index_row_bytes(model, width)))
-    if declared < width:
-        from mindie_sim.schema.common import dtype_bytes
-        declared = int(width * dtype_bytes(quant.index_dtype))
-    return declared
-
-
-def declare(builder, *, deps, views, plan, quant, parallel, block_size=None):
+def declare(builder, *, deps, views, plan, quant, parallel, block_size=None,
+            prefix_cache_mode="private"):
     """Declare the supported complete boundary without inferring native owners.
 
     ``block_size`` is the actual KV/index key block size from the runtime. The
@@ -350,7 +376,7 @@ def declare(builder, *, deps, views, plan, quant, parallel, block_size=None):
     if quant.index_dtype == ARCH35_INDEX_DTYPE:
         return declare_arch35(builder, deps=deps, views=views, plan=plan,
                               quant=quant, parallel=parallel,
-                              block_size=block_size)
+                              block_size=block_size, prefix_cache_mode=prefix_cache_mode)
     _check_domain(plan, quant, parallel, block_size)
     tokens = sum(view.q_len for view in views)
     # Causal compressed-key counts follow each owned span. PCP chunks pass

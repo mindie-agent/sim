@@ -629,7 +629,7 @@ def _dspark_case():
     return raw
 
 
-def test_dspark_body_and_context_emit_five_native_v3_prologs():
+def test_dspark_body_does_not_inherit_target_cache_writer():
     parsed = parse_case(_dspark_case())
     target_prolog = parsed.runtime.kernels["lowerings"]["mla_prolog"]
     assert target_prolog["options"]["cache_layout"]
@@ -640,19 +640,11 @@ def test_dspark_body_and_context_emit_five_native_v3_prologs():
             and dict(op.metadata).get("fusion_role") == "mla_prolog"]
     context = _by_recipe(graph, "draft_context_mla_prolog_v3")
 
-    assert len(body) == len(context) == 5
-    assert not [op for op in graph if op.phase == "draft"
+    assert not body and len(context) == 5
+    assert [op for op in graph if op.phase == "draft"
                 and op.recipe in {"q_a", "kv_a"}]
     assert {dict(op.metadata)["native_kind"] for op in context} == {
         "aclnnMlaPrologV3WeightNz"}
-    for op in body:
-        native = dict(op.metadata)["fusion_boundary"]["native"]
-        assert native["native_kind"] == "aclnnMlaPrologV3WeightNz"
-        assert native["selection"] == "vllm_ascend_mla_prolog_v3"
-        # The draft owns BF16 operands and cache; the target's packed C8 ABI
-        # must not leak into the independent body prolog.
-        assert native["conditions"]["quantized_kv_cache"] is False
-        assert dict(op.metadata)["fusion_tensor_view"]["cache_dtype"] == "bf16"
 
 
 def _bare_kda_graph(**options):

@@ -333,15 +333,12 @@ def test_c8_distinct_prefix_keys_keep_private_rows_on_their_tiles():
     assert private_keys == (128, 128)
 
     _owners, streams = c8.tile_stream(sequences, 128, 32, 128, 1, False)
-    kv_hbm = 0
-    for parts in streams:
-        for sequence, tiles in parts:
-            for key in tiles:
-                for name, work, _after in c8._tile_phases(
-                        key, shape["heads"], shape["latent"], shape["rope"],
-                        private_keys[sequence], 128):
-                    if name == "kv_stage":
-                        kv_hbm += work.resources["hbm"]
+    _, private, _ = c8._row_partition(shape, sequences, 128)
+    priced = c8._priced_streams(streams, sequences, 32, private)
+    kv_hbm = sum(work.resources["hbm"] for parts in priced for key in parts
+                 for name, work, _ in c8._tile_phases(
+                     key, shape["heads"], shape["latent"], shape["rope"])
+                 if name == "kv_stage")
     assert kv_hbm == 256 * 656 == 167936
 
 
@@ -429,7 +426,7 @@ def test_keypool_row_shard_splits_one_multi_row_request():
     native.selection(
         builder, query="q", weights="w", cache="cache", views=single_long,
         plan=plan, quant=builder.quant, padded_tokens=8,
-        runtime=wave4b._Runtime(o_proj_tp=8))
+        runtime=wave4b._Runtime(o_proj_tp=8), row_shard_tp=8)
     gather = next(op for op in builder.ops
                   if op.recipe == native.ROW_SHARD_GATHER)
     meta = dict(gather.metadata)
@@ -597,8 +594,8 @@ def test_mqsmla_mode2_lowering_splits_the_declared_payload_and_scales():
     view = lowering.requests[-1][1].view
     payload, scale = cache_row_split(model, "compressed_kv", 512)
     assert (payload, scale) == (576.0, 8.0)
-    assert (view.payload_bytes, view.scale_bytes) == (576, 8)
-    assert view.payload_bytes + view.scale_bytes == MODE2_ROW_BYTES
+    assert (view.payload_bytes, view.scale_bytes, view.padding_bytes) == (576, 7, 1)
+    assert sum((view.payload_bytes, view.scale_bytes, view.padding_bytes)) == MODE2_ROW_BYTES
 
 
 # ---------------------------------------------------------------------------
@@ -611,7 +608,7 @@ def test_mqsmla_hca_keeps_distinct_prefix_cache_keys():
         RequestView("b", 1, 383, False, "decode", prefix_tokens=128,
                     prefix_cache_key="k1"),
     )
-    fields = family_mqsmla._prefix_fields(views)
+    fields = family_mqsmla._prefix_fields(views, SimpleNamespace(prefix_cache_mode="shared"))
     assert fields["prefix_tokens"] == (128, 128)
     assert fields["prefix_cache_keys"] == ("k0", "k1")
     shape = {"sequences": ((1, 383), (1, 383)), "window": 128, "ratio": 128,
@@ -759,7 +756,7 @@ def test_kimi_dcp8_plain_int8_excludes_packed_sfa_and_writes_statistics():
 # ---------------------------------------------------------------------------
 # Round 2. KeyPool TopK reads the assembled selection, not the local shard.
 # ---------------------------------------------------------------------------
-def test_keypool_topk_reads_the_assembled_selection_plane():
+def test_keypool_pack_reads_local_indices_positions_and_cumulative_tail():
     plan, model = wave4b._case_model(pool=16)
     model = replace(model, quant=replace(model.quant,
                                          index_scale_dtype="fp32"))
@@ -769,11 +766,11 @@ def test_keypool_topk_reads_the_assembled_selection_plane():
     native.selection(
         builder, query="q", weights="w", cache="cache", views=views,
         plan=plan, quant=builder.quant, padded_tokens=8,
-        runtime=wave4b._Runtime(o_proj_tp=8))
+        runtime=wave4b._Runtime(o_proj_tp=8), row_shard_tp=8)
     gather = next(op for op in builder.ops
                   if op.recipe == native.ROW_SHARD_GATHER)
     packed = next(op for op in builder.ops if op.recipe == "index_topk")
     # 1,024 assembled pools x 16 INT32 ids + eight INT64 causal tails.
     assert dict(gather.metadata)["assembled_bytes"] == 65536
-    assert packed.mte2_bytes == pytest.approx(65600.0)
-    assert packed.mte3_bytes == pytest.approx(65536.0)
+    assert packed.mte2_bytes == 8192 + 8 + 8
+    assert packed.mte3_bytes == 8192

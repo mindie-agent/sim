@@ -18,7 +18,9 @@ from mindie_sim.catalog.index_pool import pool_selection
 from mindie_sim.catalog.ops import comm_op, compute_dtype_for
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 from .batch_prefix_attention import apply_sparse_prefix_reads
-from .index_pool import row_shard_partition, row_shard_tp
+from .index_pool import (
+    _row_shard_value, _selection_for, native_shard_sizes, row_shard_tp, row_slice,
+)
 from .mla_native import index_layer_norm
 from .mechanism import PlannedRecipe
 from .sparse_indexer_pipeline import (
@@ -41,7 +43,7 @@ SUPPORTED_INDEX_SCALES = frozenset({"fp32", "none"})
 #: Checkpoint categories whose native caller keeps BF16 wk/wgate projections.
 POOL_PROJECTION_CATEGORIES = ("indexer.pool_projection", "indexer.pool_gate")
 SUPPORTED_HEAD_WEIGHTS = frozenset({("bf16", "bf16"), ("fp32", "fp32")})
-SUPPORTED_PHASES = frozenset({"decode", "draft"})
+SUPPORTED_PHASES = frozenset({"prefill", "decode", "draft"})
 POOL_KEY_RECIPE = "cann_pool_key_indexer"
 KEY_POOL_RECIPE = "cann_key_pool"
 ROW_SHARD_GATHER = "ring_allgather"
@@ -53,19 +55,18 @@ POOL_PROJECTION_FLOPS = 4
 #: Declared copy-tile element count for the non-empty input preparation grid.
 COPY_TILE_ELEMENTS = 8192
 SOURCE = {
-    "revision": "c9aebf229e999f54bedf5b0f13f8e3ffd9989e61",
+    "repository": "vllm-project/vllm-ascend",
+    "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
     "path": "vllm_ascend/attention/indexer_kpool.py",
-    "sha256": "7b185038d89cd46d245b4e2a8d768bea51e3d8c82bbe999305d97621a105d498",
-    "lines": "624-629,648-705,727-861",
+    "sha256": "c7268fa24836f3ef33f9fb626ece9430c6c752a596e3bc07d230de5e9fb99e9b",
+    "lines": "44-106,168-200,315-367,935-950,1112-1150",
     "adapters": {
-        "cann_keypool.py": "57348e3889486d75015a7cb67d3dde3cdd50f003156749887dd86d800d362ba6",
-        "glm5_next_cann_keypool.py": "39ab2a610de3db8259b44a1196ae91c3c9eb83103254de8eafab89366d394595",
+        "cann_keypool.py": "5deb787e94c4b31f5246747778b2bbe3a9c69447b2ca9701c90b500c0da94696",
+        "glm5_next_cann_keypool.py": "b02108fc0ac4e5ec77828abd2f69811511ee226ee90894500943d2175c2b4dd6",
         "prepare_nonempty_keypool_inputs.py": "1864a2affc64dee1f033aeae7ce92d9159948ee3b6bb80b6fa81c739b9745184",
     },
-    "row_shard": {
-        "path": "vllm_ascend/attention/indexer_kpool_row_shard.py",
-        "scope": "declared_AscendIndexerKPoolRowShard_lowering; capture_binary_unverified",
-    },
+    "row_shard": {"path": "vllm_ascend/attention/indexer_kpool.py",
+                  "scope": "configured_caller_and_cost_balanced_TP_exchange"},
     "scope": "native_caller_contract; installed_binary_and_core_schedule_unbound",
 }
 
@@ -99,7 +100,7 @@ def prepare_model(model, runtime, binding):
         "implementation": IMPLEMENTATION, "tail_capacity": capacity,
         "block_table_columns": columns,
         "block_table_columns_explicit": "block_table_columns" in options,
-        "row_shard_tp": row_shard_tp(options=options, runtime=runtime),
+        "row_shard_tp": _explicit_width(options, runtime),
         "source": SOURCE}}
     # The analytic prefill fallback executes the checkpoint's BF16 wk/wgate
     # projections.  Bind those two categories to the resident native format so
@@ -125,7 +126,7 @@ def prepare_model(model, runtime, binding):
 
 
 def _supported(views, plan, model, quant):
-    """Source domain of the 6-stage caller; prefill keeps the analytic path."""
+    """Native causal TND scorer with BF16 projections and the declared cache dtype."""
     from mindie_sim.catalog.quant import projection_quant
     # The builder's per-layer prepared quant is the operand contract; a
     # caller-supplied model-level preset may still be W8A8.
@@ -305,17 +306,37 @@ def _candidate_pools(views, plan):
                 for view in views), default=1)
 
 
-def _row_shard(views, plan, quant, *, options, runtime):
-    """Declared local-TP shard width, query rows and sequence metadata."""
-    divisor = row_shard_tp(options=options, runtime=runtime)
-    return divisor, row_shard_partition(views, divisor)
+def _explicit_width(options, runtime):
+    width = _row_shard_value(options)
+    metadata = dict(getattr(runtime, "metadata", ()) or ())
+    return width if width is not None else _row_shard_value(metadata)
+
+
+def _row_shard(views, plan, *, options, runtime):
+    valid = tuple(v for v in views if not v.padding)
+    rows = sum(v.q_len for v in valid)
+    explicit = _explicit_width(options, runtime)
+    if explicit is not None:
+        width = row_shard_tp(options=options, runtime=runtime)
+        q, r = divmod(rows, width)
+        return tuple(q + (i < r) for i in range(width))
+    parallel = getattr(runtime, "parallel", None)
+    if (getattr(parallel, "pcp", 1) != 1 or getattr(parallel, "dcp", 1) != 1
+            or (getattr(runtime, "graph_mode", "none") not in {"none", "off", "disabled", "eager"}
+                and (runtime.graph_capture_mode == "full" or
+                     _captured(views, runtime)))):
+        return (rows,)
+    return native_shard_sizes(valid, plan.index_kpool, getattr(parallel, "tp", 1))
+
+
+def _captured(views, runtime):
+    from .graph import GraphPolicy
+    return GraphPolicy().select(views, runtime)[1] != "none"
 
 
 def _pool_ledger(views, plan, quant, local_tokens, output_width, pool_row_bytes,
                  visited_pools):
-    geometry = tuple(pool_selection(
-        v.q_len, v.context, plan.index_topk, plan.index_kpool,
-        always_select_tail=plan.index_kpool_always_select_tail) for v in views)
+    geometry = tuple(_selection_for(v, plan) for v in views)
     heads, width, pool = plan.index_heads, plan.index_dim, plan.index_kpool
     blocks = key_blocks(visited_pools)
     return geometry, {
@@ -339,23 +360,35 @@ def _pool_ledger(views, plan, quant, local_tokens, output_width, pool_row_bytes,
 
 def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
               score_mode="linear_weighted_query", hierarchy=None, runtime=None,
-              **options):
+              shard_sizes=None, **options):
     declaration = _contract(b, views, plan, quant)
     if score_mode not in {"linear_weighted_query", "per_head_relu"}:
         raise ModelingError("native_keypool_reference_score_mode_unknown")
     tokens, batch, heads, width, pool = padded_tokens, len(views), plan.index_heads, plan.index_dim, plan.index_kpool
     pool_topk = plan.index_topk // pool
+    forced = _explicit_width(options, runtime) is not None
+    if not forced:
+        plan = replace(plan, index_kpool_always_select_tail=True)
     output_width = plan.index_topk + (pool - 1 if plan.index_kpool_always_select_tail else 0)
+    output_columns = options.get("output_buffer_columns", output_width)
+    if type(output_columns) is not int or output_columns < output_width:
+        raise ModelingError("native_keypool_output_buffer_too_narrow")
     live_context = max((v.context + v.q_len for v in views), default=0)
     columns = (declaration["block_table_columns"]
                if declaration.get("block_table_columns_explicit", True)
                else max(declaration["block_table_columns"],
                         math.ceil(live_context / BLOCK_TABLE_ROW)))
     pool_row_bytes = _pooled_row_bytes(quant, width)
-    divisor, owned_views = _row_shard(
-        views, plan, quant, options=options, runtime=runtime)
-    valid_rows = sum(v.q_len for v in owned_views)
-    local_tokens = max(valid_rows, -(-int(tokens) // divisor)) if views else 0
+    sizes = shard_sizes or _row_shard(views, plan, options=options, runtime=runtime)
+    divisor = len(sizes)
+    rank = options.get("row_shard_rank", 0)
+    if type(rank) is not int or not 0 <= rank < divisor:
+        raise ModelingError("index_pool_row_shard_rank_out_of_range")
+    valid_views = tuple(v for v in views if not v.padding)
+    begin = sum(sizes[:rank])
+    owned_views = row_slice(valid_views, begin, begin + sizes[rank])
+    valid_rows = sizes[rank]
+    local_tokens = valid_rows if divisor > 1 else tokens
     # The captured graph appends one sentinel request, so the native call owns
     # one dummy query row beyond the padded partition.
     native_rows = local_tokens + 1
@@ -364,16 +397,11 @@ def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
                                     output_width, pool_row_bytes, visited_pools)
     # The row-shard gather assembles the complete selection plane, so its
     # declared per-request rows cover every request, not only the local badge.
-    global_geometry = (geometry if divisor == 1 else tuple(
-        pool_selection(v.q_len, v.context, plan.index_topk, plan.index_kpool,
-                       always_select_tail=plan.index_kpool_always_select_tail)
-        for v in views))
-    selection_ids = tuple(v.request_id for v in views)
+    global_geometry = tuple(_selection_for(v, plan) for v in valid_views)
+    selection_ids = tuple(v.request_id for v in valid_views)
     selection_rows = tuple(g.selected_tokens for g in global_geometry)
     scanned = sum(g.scanned_pools for g in geometry)
     selected = sum(g.selected_pools for g in geometry)
-    assembled_selected = sum(g.selected_pools for g in global_geometry)
-    assembled_tail = sum(g.causal_tail_tokens for g in global_geometry)
     common = _common(valid_query_rows=valid_rows,
         padded_query_rows=local_tokens, native_query_rows=native_rows,
         pool_size=pool, query_lengths=tuple(v.q_len for v in owned_views),
@@ -438,47 +466,51 @@ def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
     b.ops.extend(replace(op, deps=tuple(dict.fromkeys((*op.deps, query, weights))))
                  if op.recipe == "cann_keypool_state_gather" else op
                  for op in producer_ops)
-    gathered = indices
-    if divisor > 1:
-        local_payload = float(local_tokens) * output_width * INT32_BYTES
-        gathered = b.add(comm_op(
-            op_id=b.prefix + ".index_kpool_row_shard_gather",
-            deps=(indices,), family="allgather", phase=b.common["phase"],
-            recipe=ROW_SHARD_GATHER, stage=b.common["stage"], layer=b.common["layer"],
-            requests=b.common["requests"],
-            link_bytes=local_payload * (divisor - 1),
-            shape=(tokens, output_width),
-            metadata=tuple(sorted({
-                "group_axis": "local_tp", "steps": divisor - 1,
-                "local_tp_width": divisor, "row_shard_tp": divisor,
-                "local_rows": local_tokens,
-                "local_payload_bytes": local_payload,
-                "peer_shard_bytes": local_payload * (divisor - 1),
-                "assembled_bytes": local_payload * divisor,
-                "assembled_shape": (tokens, output_width),
-                "output_dtype": "int32",
-                "gather_position": "before_sfa_consumes_index_topk",
-            }.items()))))
-    packed = b.work("index_topk", (gathered,), (tokens, output_width),
-        read=assembled_selected * pool * INT32_BYTES + tokens * INT64_BYTES,
-        write=tokens * output_width * INT32_BYTES, vector=tokens * output_width,
+    packed = b.work("index_topk", (indices,), (local_tokens, output_width),
+        read=selected * pool * INT32_BYTES + (valid_rows + local_tokens) * INT64_BYTES,
+        write=local_tokens * output_columns * INT32_BYTES, vector=local_tokens * output_columns,
         family="topk", dtype="int32", metadata=common + (
             ("selection_capacity", output_width), ("selection_output_dtype", "int32"),
             ("selection_layout", "native_token_indices_then_causal_tail; padded_rows_minus_one"),
             ("pool_id_expansion_in_adapter", False),
-            ("assembled_index_plane", divisor > 1),
-            # The assembled selection keeps every request's own row count; a
-            # single request's rows never name another request's selection.
-            ("selected_token_rows", float(sum(selection_rows))),
-            ("selected_request_ids", selection_ids),
-            ("selected_tokens_by_request", selection_rows),
-            ("causal_tail_rows", assembled_tail)))
+            ("causal_tail_rows", sum(g.causal_tail_tokens for g in geometry))))
+    gathered = packed
+    if divisor > 1:
+        row_bytes = output_width * INT32_BYTES
+        packet = max(sizes) * row_bytes
+        assembled = sum(sizes) * row_bytes
+        scratch = b.work("index_exchange_stage", (packed,), (max(sizes), output_width),
+                         read=valid_rows * row_bytes, write=packet, family="copy")
+        wire = b.add(comm_op(
+            op_id=b.prefix + ".index_kpool_row_shard_gather", deps=(scratch,),
+            family="allgather", phase=b.common["phase"], recipe=ROW_SHARD_GATHER,
+            stage=b.common["stage"], layer=b.common["layer"], requests=b.common["requests"],
+            link_bytes=packet * (divisor - 1), shape=(divisor * max(sizes), output_width),
+            metadata=tuple(sorted({
+                "group_axis": "local_tp" if forced else "tp", "steps": divisor - 1,
+                "local_tp_width": divisor, "row_shard_tp": divisor,
+                "local_rows": valid_rows, "shard_sizes": sizes,
+                "local_payload_bytes": valid_rows * row_bytes,
+                "peer_shard_bytes": packet * (divisor - 1),
+                "assembled_bytes": assembled, "assembled_shape": (sum(sizes), output_width),
+                "padded_exchange_bytes": packet * divisor, "output_dtype": "int32",
+                "gather_position": "before_sfa_consumes_index_topk",
+            }.items()))))
+        gathered = b.work("index_exchange_restore", (wire,), (sum(sizes), output_width),
+                          read=assembled, write=assembled, family="copy",
+                          dtype="int32", metadata=(
+                              ("selected_request_ids", selection_ids),
+                              ("selected_tokens_by_request", selection_rows),
+                              ("selected_token_rows", sum(selection_rows))))
+    group_ops = (prepared, indices, packed)
+    if divisor > 1:
+        group_ops += (scratch, wire, gathered)
     # The producer group is re-appended after `start` while restoring enqueue
     # order, so this group names its own members instead of slicing the list.
     declare_group(b.ops, key=b.prefix + ".pool_key_indexer", role="pool_key_indexer",
         family="pooled_indexer",
-        members=tuple(dict.fromkeys((prepared, indices, gathered, packed))),
-        entries=(prepared,), anchor=packed,
+        members=group_ops,
+        entries=(prepared,), anchor=gathered,
         view={"tokens": local_tokens, "valid_tokens": valid_rows,
               "native_tokens": native_rows,
               "global_tokens": tokens, "heads": heads, "width": width, "pool_size": pool,
@@ -492,4 +524,4 @@ def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
             "row_shard": ("ascend_indexer_kpool_row_shard" if divisor > 1
                           else "replicated_query_plane")}},
         source=SOURCE, coverage={"kind": "native_caller_declared_wave_program"})
-    return packed
+    return gathered

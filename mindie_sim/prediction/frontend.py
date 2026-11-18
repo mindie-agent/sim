@@ -59,33 +59,6 @@ FINAL_LAYER = -1
 MIN_DBO_MICROBATCHES = 2
 
 
-def _partition_global_tokens(shared_global, region_rows):
-    """Apportion one cohort's routed rows across microbatches without loss.
-
-    A per-region ``round`` loses a row whenever every partition is below one
-    half (``[1, 1]`` of five rows rounds to ``[2, 2]``).  The physical routing
-    ledger is conserved, so the integer quotas are the floor of the exact
-    proportions and the remainder goes to the largest fractional parts.
-    """
-    rows = tuple(max(ZERO, int(value)) for value in region_rows)
-    if shared_global is None or not rows or sum(rows) <= ZERO:
-        return tuple(None for _ in rows)
-    total = float(sum(rows))
-    target = int(round(float(shared_global)))
-    quotas = [target * float(value) / total for value in rows]
-    partitions = [int(math.floor(quota)) for quota in quotas]
-    remainder = max(ZERO, target - sum(partitions))
-    order = sorted(range(len(rows)),
-                   key=lambda index: (-(quotas[index] - partitions[index]), index))
-    for index in order[:remainder]:
-        partitions[index] += ONE
-    return tuple(partitions)
-
-
-def _cohort_source_rows(views):
-    """Routed source rows a view set owns on one physical EP replica."""
-    return sum(int(view.q_len) + int(view.draft_proposal_tokens) for view in views)
-
 
 def _scope(ops, block, role="body"):
     """The composing builder owns scope; operator names do not identify it."""
@@ -315,7 +288,7 @@ class Frontend:
              physical_rank=None, query_position=None,
              include_recover_commits: bool = False, machine=None,
              dbo_partition: int | None = None, layer_limit: int | None = None,
-             topk_scope=None, reuse_index_selection: bool = False):
+             topk_scope=None, reuse_index_selection: bool = False, rank_ledger=None):
         p = runtime.parallel
         if layer_limit is not None:
             limit = max(ONE, int(layer_limit))
@@ -324,103 +297,37 @@ class Frontend:
         # An explicit mechanism exclusion owns every selector it can install,
         # including the structural body default resolved before this call.
         runtime = strip_excluded_native_kda(runtime)
-        # DBO splits the same EP collective into microbatches, so every EP
-        # peer must meet the split threshold.  Letting only the peers with two
-        # views split changes the collective cohort and breaks the inverse
-        # traffic rendezvous for an otherwise valid batch.
-        cohort_rows = tuple(max(ZERO, int(value))
-                            for value in (source_rows_by_replica or ()))
-        # Only an EP collective needs one split decision across peers.  A pure
-        # DP replica set has no cross-replica rendezvous, so DBO may split an
-        # active replica on its own.
-        ep_cohort = int(getattr(runtime.parallel, "ep", ONE) or ONE) > ONE
-        dbo_cohort_ready = (not ep_cohort or not cohort_rows
-                            or min(cohort_rows) >= MIN_DBO_MICROBATCHES)
-        if (runtime.enable_dbo and dbo_partition is None and len(views) > ONE
-                and dbo_cohort_ready):
-            from .overlap_plan import MicrobatchPolicy, build_microbatch_regions
+        if runtime.enable_dbo and dbo_partition is None and len(views) > ONE:
+            from .dbo_ledger import plan as dbo_plan
             from .physical_recipe_registry import COLLECTIVE_FAMILIES
-            regions = build_microbatch_regions(
-                views, policy=MicrobatchPolicy(count=MIN_DBO_MICROBATCHES))
-            if len(regions) > ONE and reuse_index_selection:
+            partitions = dbo_plan(self, model, runtime, views, tokens,
+                                  cohort_views_by_replica, replica, machine, physical_rank,
+                                  MIN_DBO_MICROBATCHES, routing_views)
+            if partitions and reuse_index_selection:
                 # A shared TopK selection is one per proposal step; splitting
                 # that step into independent microbatches has no single owner.
                 raise ModelingError("mtp_shared_index_selection_requires_single_microbatch")
-            if len(regions) > ONE:
+            if partitions:
                 merged, previous_partition_attention, sinks = [], None, []
                 partition_requests = tuple(view.request_id for view in views)
-                shared_global = (routing_global_tokens
-                                 if routing_global_tokens is not None
-                                 else global_tokens)
-                region_rows = tuple(
-                    sum(int(view.q_len) + int(view.draft_proposal_tokens)
-                        for view in region.views) for region in regions)
-                partition_globals = _partition_global_tokens(
-                    shared_global, region_rows)
-                peer_regions = (
-                    tuple(tuple(build_microbatch_regions(
-                        peer_views, policy=MicrobatchPolicy(
-                            count=MIN_DBO_MICROBATCHES)))
-                          for peer_views in cohort_views_by_replica)
-                    if cohort_views_by_replica is not None else None)
-                for region, region_rows_value, partition_global in zip(
-                        regions, region_rows, partition_globals):
-                    region_ids = {view.request_id for view in region.views}
-                    partition_routing = (
-                        tuple(view for view in routing_views
-                              if view.request_id in region_ids) or None
-                        if routing_views is not None else None)
-                    partition_source_rows = source_rows_by_replica
-                    if peer_regions is not None:
-                        parts = tuple(
-                            tuple(view for peer_region in peer_plan
-                                  if peer_region.index == region.index
-                                  for view in peer_region.views)
-                            for peer_plan in peer_regions)
-                        # A caller may still pass logical, unsharded cohort
-                        # views while this replica lowered PCP-sharded rows.
-                        # Scale each peer microbatch to the physical ledger.
-                        pcp = max(ONE, int(getattr(
-                            runtime.parallel, "pcp", ONE) or ONE))
-                        sharded = pcp > ONE and any(
-                            getattr(view, "query_ranges", ()) for view in views)
-                        scaled = (pcp if sharded and sum(
-                            _cohort_source_rows(part) for part in parts)
-                            == pcp * sum(region_rows) else ONE)
-                        partition_source_rows = tuple(
-                            _cohort_source_rows(part) // scaled
-                            for part in parts)
-                        partition_routing = tuple(
-                            view for part in parts for view in part) or None
-                        partition_global = sum(partition_source_rows)
-                    elif cohort_rows:
-                        count = len(regions)
-                        partition_source_rows = tuple(
-                            region_rows_value
-                            if peer == replica and sum(region_rows) == cohort_rows[peer]
-                            else (cohort_rows[peer] + count - ONE - region.index) // count
-                            for peer in range(len(cohort_rows)))
-                        partition_global = sum(partition_source_rows)
-                    if not ep_cohort:
-                        # A non-EP replica's expert bank processes only its
-                        # own local microbatch rows; a DP peer or an unsharded
-                        # cohort view never widens the routed ledger.
-                        partition_global = (region_rows_value
-                                            if shared_global is not None
-                                            else None)
+                for part in partitions:
+                    region, region_rows_value = part.region, part.capacity
+                    partition_global = part.physical
+                    partition_source_rows = (part.valid if runtime.kernels.get(
+                        "force_eplb_source") else part.allocated)
+                    partition_routing = part.routing
+                    from .dbo_ledger import partition_runtime
                     part_ops, part_last = self.body(
-                        model, runtime, region.views,
+                        model, partition_runtime(runtime, part), region.views,
                         prefix=f"{prefix}dbo{region.index}.",
                         ready=ready,
                         tokens=region_rows_value,
                         mode=mode,
-                        global_tokens=(partition_global
-                                       if partition_global is not None
-                                       else global_tokens),
+                        global_tokens=partition_global,
                         stages=stages,
                         replica=replica, features=features,
-                        source_rows_by_replica=partition_source_rows,
-                        routing_global_tokens=partition_global,
+                        source_rows_by_replica=partition_source_rows, rank_ledger=part,
+                        routing_global_tokens=part.physical,
                         routing_views=partition_routing,
                         physical_rank=physical_rank,
                         query_position=query_position,
@@ -438,7 +345,7 @@ class Frontend:
                         metadata = dict(op.metadata)
                         metadata.update({
                             "dbo_microbatch": region.index,
-                            "dbo_microbatch_count": len(regions),
+                            "dbo_microbatch_count": len(partitions),
                             "dbo_compute_stream": region.stream,
                         })
                         if auxiliary:
@@ -474,12 +381,23 @@ class Frontend:
                     recipe="dbo_partition_join", shape=(len(partition_requests),))
                 merged.append(joined)
                 return merged, joined.op_id
+        if (rank_ledger is None and cohort_views_by_replica is not None and views
+                and (runtime.enable_dbo or runtime.parallel.rank_table is not None
+                     or runtime.parallel.pcp > ONE or runtime.kernels.get("force_eplb_source"))):
+            from .dbo_ledger import plan as dbo_plan
+            parent = dbo_plan(self, model, runtime, views, tokens, cohort_views_by_replica,
+                              replica, machine, physical_rank, ONE, routing_views)
+            if parent:
+                rank_ledger = parent[ZERO]
+                global_tokens = routing_global_tokens = rank_ledger.physical
+                source_rows_by_replica = (rank_ledger.valid if runtime.kernels.get(
+                    "force_eplb_source") else rank_ledger.allocated)
         requests = tuple(view.request_id for view in views)
         tokens = sum(view.q_len for view in views) if tokens is None else tokens
         stages = stages or stage_map(model, runtime)
         ops, previous = [], ready
         sp = sequence_parallel.select(runtime, model, views, tokens=tokens,
-                                      global_tokens=global_tokens)
+                                      global_tokens=global_tokens, rank_ledger=rank_ledger)
         if sp:
             if runtime.moe_recipe != "alltoall":
                 raise ValueError("sequence_parallel_requires_unchunked_alltoall")
@@ -626,15 +544,14 @@ class Frontend:
                 realization_views = routing_views if routing_views is not None else views
                 realization = (select_realization(
                     runtime, layer, phase=mode, tokens=tokens,
-                    valid_tokens=(sp.valid_per_tp[0] if sp else
-                                  sum(view.logical_q_len for view in views)),
+                    valid_tokens=(rank_ledger.valid[rank_ledger.owner] if rank_ledger and sp else
+                                  sp.valid_per_tp[ZERO] if sp else sum(view.logical_q_len for view in views)),
                     global_tokens=routing_tokens,
-                    token_shards=(p.tp if sp and (routing_tokens is None
-                                                  or routing_tokens >= tokens * p.tp)
-                                  else 1),
+                    token_shards=(p.tp if sp and (rank_ledger is not None or routing_tokens is None
+                                                  or routing_tokens >= tokens * p.tp) else ONE),
                     valid_source_tokens=sp.valid_global if sp else None, replica=replica,
-                    views=realization_views,
-                    physical_rank=physical_rank,
+                    views=realization_views, source_geometry=rank_ledger,
+                    physical_rank=(rank_ledger.owner if rank_ledger is not None else physical_rank),
                     query_position=query_position)
                     if layer.ffn == "moe" else None)
                 ffn_tokens = tokens
@@ -652,9 +569,9 @@ class Frontend:
                     moe_recipe=runtime.moe_recipe, mc2_chunks=runtime.mc2_chunks,
                     overlap_shared=bool(runtime.multistream_overlap_shared_expert),
                     runtime=runtime, sequence_plan=sp,
-                    ep_owner=(int(physical_rank) % int(p.ep)
-                              if physical_rank is not None and int(p.ep) > ZERO
-                              else None),
+                    ep_owner=(rank_ledger.owner if rank_ledger is not None else
+                              int(physical_rank) % p.ep if physical_rank is not None else None),
+                    price_owner=(rank_ledger.owner if rank_ledger is not None else None),
                 )
                 if sp and layer.ffn == "dense":
                     ffn_ops, previous = sequence_parallel.close_output(
@@ -821,7 +738,7 @@ class Frontend:
             metadata=(("selection", "all_verify_rows_or_last_prefill_row"),))
 
     @staticmethod
-    def partition_views(views, runtime, padded, *, model=None):
+    def partition_views(views, runtime, padded, *, model=None, lane=None):
         degree = runtime.parallel.pcp
         if degree == ONE or not any(v.phase == "prefill" for v in views):
             return views, padded, False
@@ -841,12 +758,14 @@ class Frontend:
             if view.phase == "prefill":
                 split = split_pcp_pairs(view.q_len, view.context, degree, window=rep_win)
                 costs = [old + current for old, current in zip(costs, split.per_rank)]
-        rank = max(range(degree), key=costs.__getitem__)
+        rank = max(range(degree), key=costs.__getitem__) if lane is None else lane
         ranges = [pcp_rank_chunk_ranges(view.q_len, degree, rank) for view in views]
         local = tuple(replace(view, q_len=sum(end - start for start, end in parts),
                               global_q_len=view.q_len, query_ranges=parts)
                       if view.phase == "prefill" else view for view, parts in zip(views, ranges))
-        return local, sum(view.q_len for view in local), True
+        extra = max(ZERO, padded - sum(view.q_len for view in views))
+        padding = sum(hi - lo for lo, hi in pcp_rank_chunk_ranges(extra, degree, rank))
+        return local, sum(view.q_len for view in local) + padding, True
 
     @staticmethod
     def pcp_cohort_tokens(views, local_views, local_tokens, runtime, global_tokens=None, global_views=None):
@@ -903,6 +822,7 @@ class Frontend:
         # slot/version/replica). The ordinary producer keeps using the views in
         # ``plan``; a cached template owner can read this envelope without
         # inferring a slot from local list positions.
+        requested_rank = physical_rank
         if assembly not in {"model", "service"}:
             raise ModelingError(f"assembly_scope_unknown:{assembly}")
         if resource_fusion is None:
@@ -994,8 +914,10 @@ class Frontend:
                                deps=tuple(rename[dep] for dep in op.deps) or (previous,))
                        for op in media.ops)
             previous = rename[media.last]
+        from .dbo_ledger import selected_lane
         local_views, local_tokens, pcp_prefill = self.partition_views(
-            views, runtime, padded, model=model)
+            views, runtime, padded, model=model,
+            lane=selected_lane(runtime.parallel, machine, replica, requested_rank))
         if valid:
             embedding = vector_op(
                 op_id="embedding", deps=(previous,), stage=0, layer=-1, requests=requests,

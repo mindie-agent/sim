@@ -1015,8 +1015,18 @@ def compose_case(
     runtime_dict: dict[str, Any] = {
         "parallel": {
             "dp": dp, "tp": tp, "pp": pp, "ep": ep, "cp": dcp, "dcp": dcp, "pcp": pcp,
-            **({"rank_table": [list(range(g * int(ep), (g + DEFAULT_PARALLEL) * int(ep)))
-                               for g in range((int(dp) * int(tp) * int(pcp)) // int(ep))]}
+            **({"rank_table": [
+                stage_ranks[offset:offset + int(ep)]
+                for stage in range(int(pp))
+                for stage_ranks in ([[
+                    int(machine["dies"][idx]["rank"]) if machine.get("dies") else idx
+                    for d in range(int(dp))
+                    for c in range(int(pcp))
+                    for t in range(int(tp))
+                    for idx in (((d * int(pp) + stage) * int(pcp) + c) * int(tp) + t,)
+                ]][DEFAULT_ZERO],)
+                for offset in range(DEFAULT_ZERO, len(stage_ranks), int(ep))
+            ]}
                if int(pcp) > DEFAULT_PARALLEL and int(ep) > int(dp) * int(tp)
                and (int(dp) * int(tp) * int(pcp)) % int(ep) == DEFAULT_ZERO else {}),
             "o_proj_tp": int(o_proj_tp),

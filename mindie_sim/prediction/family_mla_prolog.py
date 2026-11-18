@@ -44,8 +44,8 @@ def recipes():
 
 
 def prepare_model(model, runtime):
-    from .implementations import select
-    options = select(runtime.kernels.get("lowerings", {}), "mla_prolog").options
+    from .implementation_selection import prepared_selection
+    options = prepared_selection(runtime.kernels.get("lowerings", {}), "mla_prolog").options
     for plan in model.layer_plans:
         if plan.attention == "mla":
             validate(plan=plan, parallel=runtime.parallel, model=model, quant=model.quant,

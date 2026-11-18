@@ -307,6 +307,8 @@ def _mqsmla_attention(kind, inputs, outputs):
             or not _nd_tensor(original, MQSMLA_CACHE_RANK, {"uint8"})
             or original[0][2] != 1
             or original[0][3] not in MQSMLA_ORIGINAL_ROW_WIDTHS
+            or (kind in LEGACY_MQSMLA_KINDS
+                and original[0][3] != MQSMLA_ORIGINAL_ROW_BYTES)
             or not _nd_tensor(inputs[3], 2, {"int32"})):
         return None
     compressed_head = ((), None, None)

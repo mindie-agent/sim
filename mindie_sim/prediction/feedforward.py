@@ -98,7 +98,7 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
         overlap_shared=False, runtime=None, reduce_after_join=False, sequence_plan=None,
         caller=None, sp_tokens=None, features=None,
         source_rows_by_replica=None, destination_rows_by_rank=None,
-        ep_owner=None, **_):
+        ep_owner=None, price_owner=None, **_):
     pre_sp_tokens = tokens
     if sp_tokens is not None:
         tokens = sp_tokens
@@ -147,7 +147,9 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
                 # changes from implicit replicated assignment division to TP views.
                 routing_realization = replace(routing_realization, source_partitions=1)
         local_rows, active = (
-            routing.local(model, plan, parallel, group_tokens)
+            routing.local(model, plan, parallel, group_tokens, owner=price_owner)
+            if routing_realization is None and price_owner is not None and type(routing) is RoutingPolicy
+            else routing.local(model, plan, parallel, group_tokens)
             if routing_realization is None
             else (routing_realization.rows, routing_realization.active))
         routing_metadata = (

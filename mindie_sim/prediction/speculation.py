@@ -20,8 +20,6 @@ from .implementation_selection import resolve, LoweringRegion
 
 
 PROPOSAL_ID_BYTES = 8
-#: Unpacked BF16 MLA prolog shared with ``draft_context``'s V3 context rows.
-PROLOG_IMPLEMENTATION = "vllm_ascend_mla_prolog_v3"
 PROLOG_ROLE = "mla_prolog"
 FUSION_OPTION_ROLES = "roles"
 FUSION_OPTION_PROFILES = ("program_profiles", "program_options")
@@ -67,22 +65,19 @@ from mindie_sim.catalog.draft_geometry import (  # noqa: F401
 )
 
 
-def _independent_draft_runtime(runtime):
-    """Rebind the target's packed-cache prolog to the draft's BF16 operands.
-
-    The target's C8 ``mla_prolog`` contract names int8 operands and a packed
-    cache layout.  A DSpark draft owns its own BF16 operands and cache, so that
-    binding cannot be revalidated against the draft.  Deleting the binding is
-    not a substitute: it leaves the draft body without any prolog, while the
-    context phase still prepares five BF16 context rows.  The independent draft
-    therefore installs the same unpacked ``MlaPrologV3`` source for its own
-    body layers, exactly as ``draft_context`` does for the context rows.
-    """
+def _independent_draft_runtime(runtime, selections=()):
+    """Use the independent draft's declared writer for its body prolog."""
     kernels = dict(getattr(runtime, "kernels", {}) or ())
     lowerings = dict(kernels.get("lowerings", {}) or ())
     if "mla_prolog" not in lowerings:
         return runtime
-    lowerings["mla_prolog"] = PROLOG_IMPLEMENTATION
+    draft_binding = any(
+        choice["selector"] == PROLOG_ROLE
+        and choice["implementation"] != "analytical"
+        for choice in selections)
+    if not draft_binding:
+        lowerings.pop(PROLOG_ROLE)
+        return replace(runtime, kernels={**kernels, "lowerings": lowerings})
     fusion = lowerings.get("native_fusion")
     if isinstance(fusion, dict):
         # The target's fusion inventory can name grouped/hyper groups that a
@@ -134,7 +129,11 @@ def draft_program(frontend, model, runtime, views, ready, *, global_views=None, 
         quant=draft_quant(model, draft), activation_dtype=draft.activation_dtype,
         compute_dtype=draft.activation_dtype,
     )
+    context_prolog_v3 = True
     if external_context:
+        from .draft_context import draft_cache_requires_prolog_v3
+        context_prolog_v3 = draft_cache_requires_prolog_v3(
+            model, runtime=runtime, machine=machine)
         metadata = dict(draft_model.metadata)
         metadata.pop("cache_allocator", None)
         metadata["cache_representations"] = {"mla_kv": {"dtype": "bf16"}}
@@ -179,7 +178,7 @@ def draft_program(frontend, model, runtime, views, ready, *, global_views=None, 
         from .frontend import mark_analytical_runtime
         selected_runtime = mark_analytical_runtime(selected_runtime, selections)
         if external_context:
-            selected_runtime = _independent_draft_runtime(selected_runtime)
+            selected_runtime = _independent_draft_runtime(selected_runtime, selections)
         # Sequence-parallel lowering is body-scoped; draft_program manages TP
         # feature gather explicitly before entering the draft body.
         if "sequence_parallel" in selected_runtime.kernels:
@@ -276,7 +275,8 @@ def draft_program(frontend, model, runtime, views, ready, *, global_views=None, 
                               for view in proposal_views],
                 views=proposal_views,
                 contexts=[view.context for view in proposal_views],
-                block=int(getattr(runtime, "kv_block_size", 1) or 1))
+                block=int(getattr(runtime, "kv_block_size", 1) or 1),
+                use_prolog_v3=context_prolog_v3)
         body, previous = frontend.body(
             step_model, selected_runtime, proposal_views, prefix=prefix,
             ready=body_ready,

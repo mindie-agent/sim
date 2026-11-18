@@ -342,6 +342,8 @@ def _mqsmla_attention_contract(op, view):
             or view.get("output_dtype") != "bf16"
             or type(orig_bytes) is not int
             or orig_bytes not in MQSMLA_ORIGINAL_ROW_WIDTHS
+            or (native_kind == LEGACY_MQSMLA_NATIVE_KIND
+                and orig_bytes != MQSMLA_WINDOW_ROW_BYTES)
             or type(view.get("compressed_cache")) is not bool):
         return None
     compressed = ((), None, None)

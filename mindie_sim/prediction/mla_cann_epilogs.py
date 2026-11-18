@@ -266,12 +266,13 @@ def index_head_weights(builder, *, plan, model, quant, deps, pool_weights, token
     weights = pool_weights or builder.matrix(
         "index_weights", (weights_input,), tokens, plan.index_heads, model.hidden_size,
         category="indexer.weights")
-    if native:
+    mode1 = native and plan.index_kpool == 1 and quant.index_dtype == "fp8_e4m3"
+    if native and not mode1:
         # ``aclnnQuantLightningIndexerV2`` / ``aclnnPoolKeyIndexer`` consume the
         # checkpoint head-weight projection directly.  Any external cast would
         # be a launch the production graph does not execute.
         return weights
-    if index_cache_is_packed(model):
+    if mode1 or index_cache_is_packed(model):
         if weights_dtype != FP32_WEIGHT_DTYPE:
             return builder.vector(
                 "index_weights_fp32", (weights,), tokens * plan.index_heads, 1,
@@ -346,9 +347,7 @@ def lower_index_path(builder, *, plan, model, quant, parallel, views, deps, runt
             and pool_binding.name == "vllm_ascend_cann_keypool_caller")
         if native_pool:
             from .index_pool_native import supported as native_pool_supported
-            # The 6-stage caller declares decode/draft rows only.  Prefill
-            # keeps the analytic KeyPool decomposition; its group records the
-            # explicit ``native_dispatch_and_fusion_not_selected`` condition.
+            # Both native cache production and analytical fallback retain the full K/V batch.
             native_pool = native_pool_supported(
                 views=views, plan=plan, model=model, quant=quant)
         pool_module = pool_binding.module if native_pool else index_pool
@@ -388,9 +387,16 @@ def lower_index_path(builder, *, plan, model, quant, parallel, views, deps, runt
                     b.ops[-1] = set_input_ports(b.ops[-1], ({
                         "op": index_source, "output": "latent",
                         "source_op": index_source},))
+            explicit_quant_indexer = (
+                runtime is not None
+                and select(dict(getattr(runtime, "kernels", {}).get("lowerings", {}) or {}),
+                           "quant_lightning_indexer") is not None
+            )
             normalized = index_layer_norm(
                 b, source=projected, rows=index_rows, width=plan.index_dim,
-                native=native_indexer)
+                native=native_indexer and (
+                    explicit_quant_indexer
+                    or quant.index_dtype not in {"bf16", "fp16", "fp32"}))
             if index_rope:
                 normalized = b.vector(
                     "index_rotary", (normalized,), index_rows * index_rope, ROPE_OPS,
@@ -445,7 +451,16 @@ def lower_index_path(builder, *, plan, model, quant, parallel, views, deps, runt
                     index_cache_ids, plan.index_k_owner_layer_id, "index_cache",
                     sum(index_selection_cost(model, plan, view.kv_len).index_read_bytes
                         for view in views))
-        q_index = b.matrix("index_q", (q_norm,), q,
+        shard_sizes, score_q = None, q
+        if (plan.index_kpool > 1 and pool_binding
+                and pool_binding.name == NATIVE_KEYPOOL_IMPLEMENTATION):
+            from .index_pool_native import _row_shard, supported
+            if supported(views=views, plan=plan, model=model, quant=quant):
+                opts = pool_binding.options
+                shard_sizes = _row_shard(views, plan, options=opts, runtime=runtime)
+                if len(shard_sizes) > 1:
+                    score_q = shard_sizes[opts.get("row_shard_rank", 0)]
+        q_index = b.matrix("index_q", (q_norm,), score_q,
                            plan.index_heads * plan.index_dim,
                            plan.q_lora_rank, category="indexer_fp8")
         if plan.index_kpool == 1 and index_rope:
@@ -455,11 +470,11 @@ def lower_index_path(builder, *, plan, model, quant, parallel, views, deps, runt
                 family="rotary", shape=(valid, plan.index_heads, plan.index_dim))
         q_index = index_representation(
             b, "index_query", q_index,
-            (q if plan.index_kpool > 1 else valid) * plan.index_heads, plan.index_dim,
+            (score_q if plan.index_kpool > 1 else valid) * plan.index_heads, plan.index_dim,
             quant=quant, model=model, rotate_basis=plan.compress_ratio > 1)
         weights = index_head_weights(
             b, plan=plan, model=model, quant=quant, deps=deps,
-            pool_weights=pool_weights, tokens=q, native=native_indexer)
+            pool_weights=pool_weights, tokens=score_q, native=native_indexer)
         selection_deps = [q_index, weights, index_store]
         if plan.candidate_filter:
             if plan.scope == "draft" and plan.candidate_source_layer_id < 0:
@@ -489,7 +504,7 @@ def lower_index_path(builder, *, plan, model, quant, parallel, views, deps, runt
                     b, query=q_index, weights=weights, cache=index_store,
                     views=views, plan=plan, quant=quant, padded_tokens=q,
                     l2_bytes=getattr(b, "l2_bytes", None), runtime=runtime,
-                    hierarchy=hierarchy, **pool_binding.options)
+                    hierarchy=hierarchy, shard_sizes=shard_sizes, **pool_binding.options)
             else:
                 analytic_options = ({} if native_binding else
                                     (pool_binding.options if pool_binding else {}))
@@ -507,7 +522,8 @@ def lower_index_path(builder, *, plan, model, quant, parallel, views, deps, runt
             if quant_indexer:
                 topk = quant_indexer.module.declare(
                     b, deps=selection_deps, views=views, plan=plan,
-                    quant=quant, parallel=parallel, **quant_indexer.options)
+                    quant=quant, parallel=parallel, prefix_cache_mode=runtime.prefix_cache_mode,
+                    **quant_indexer.options)
                 # This explicit arch22 source owns its per-query key/scale
                 # ledger. Shared capacity does not establish batch read reuse.
             elif (bf16_indexer is not None and len(views) == 1

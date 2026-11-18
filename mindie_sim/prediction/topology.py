@@ -1213,6 +1213,10 @@ class Topology:
         if axis == "pcp":
             return tuple(sources[i::p.tp] for i in range(p.tp))
         if axis == "ep":
+            if p.rank_table is not None:
+                members = set(sources)
+                return tuple(tuple(group) for group in p.rank_table
+                             if members.intersection(group))
             if p.ep_spans_dp:
                 if p.ep_spans_pcp:
                     count = p.ep_dp_width

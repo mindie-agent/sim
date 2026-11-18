@@ -38,6 +38,7 @@ class SourceForceEplb:
     valid_global_tokens: int
     representative_rank: int = 0
     source_partitions: int = 1
+    allocated_by_rank: tuple[int, ...] = ()
 
     @property
     def local_expert_rows(self):
@@ -82,7 +83,8 @@ class SourceForceEplb:
             "matrix_groups": self.active,
             "row_classes": tuple(sorted(Counter(self.local_expert_rows).items())),
             "valid_global_tokens": self.valid_global_tokens,
-            "allocated_global_tokens": self.allocated_tokens_per_rank * self.ep,
+            "allocated_global_tokens": (sum(self.allocated_by_rank) if self.allocated_by_rank
+                                        else self.allocated_tokens_per_rank * self.ep),
             "valid_local_tokens": self.valid_local_tokens,
             "source_local_rows": self.allocated_tokens_per_rank,
             "valid_tokens_per_rank": self.valid_tokens_per_rank,
@@ -107,9 +109,10 @@ class SourceForceEplb:
         for source, count in enumerate(self.valid_tokens_per_rank):
             for token in range(count):
                 ids = []
+                width = (self.allocated_by_rank[source] if self.allocated_by_rank
+                         else self.allocated_tokens_per_rank)
                 for slot in range(self.top_k):
-                    cursor = ((self.allocated_tokens_per_rank * self.top_k + 1)
-                              * source + token * self.top_k + slot)
+                    cursor = (width * self.top_k + 1) * source + token * self.top_k + slot
                     destination = cursor % self.ep
                     bank = (cursor // self.ep) % banks
                     ids.append(destination * banks + bank)
@@ -154,20 +157,31 @@ class SourceForceEplb:
         }
 
 
-@lru_cache(maxsize=128)
-def ledger(experts, ep, top_k, allocated_local_tokens, valid_global_tokens, tp=0):
+FORCE_LEDGER_CACHE_SIZE = 128
+
+
+@lru_cache(maxsize=FORCE_LEDGER_CACHE_SIZE)
+def ledger(experts, ep, top_k, allocated_local_tokens, valid_global_tokens, tp=0,
+           valid_by_rank=(), allocated_by_rank=(), owner=0):
     """Count source cursor residues without expanding token/expert assignments."""
     if (ep < 2 or experts % ep or not 0 < top_k <= experts
-            or allocated_local_tokens < 1
-            or not 0 < valid_global_tokens <= allocated_local_tokens * ep):
+            or allocated_local_tokens < 0
+            or not 0 <= valid_global_tokens <= (sum(allocated_by_rank) if allocated_by_rank
+                                                else allocated_local_tokens * ep)):
         raise ModelingError("source_force_eplb_requires_divisible_banks_and_bounded_valid_prefix")
     banks = experts // ep
-    if 0 < tp < ep and ep % tp == 0:
+    if valid_by_rank:
+        valid = valid_by_rank
+        if (len(valid) != ep or len(allocated_by_rank) != ep
+                or sum(valid) != valid_global_tokens
+                or any(not 0 <= n <= w for n, w in zip(valid, allocated_by_rank))):
+            raise ModelingError("source_force_eplb_invalid_rank_ownership")
+    elif 0 < tp < ep and ep % tp == 0:
         groups = ep // tp
-        valid_per_group = valid_global_tokens // groups
-        per_tp = tuple(max(0, min(allocated_local_tokens,
-                                  valid_per_group - src * allocated_local_tokens)) for src in range(tp))
-        valid = per_tp * groups
+        base, extra = divmod(valid_global_tokens, groups)
+        valid = tuple(max(0, min(allocated_local_tokens, base + (d < extra)
+                                 - t * allocated_local_tokens))
+                      for d in range(groups) for t in range(tp))
     else:
         valid = tuple(max(0, min(allocated_local_tokens,
                                 valid_global_tokens - src * allocated_local_tokens)) for src in range(ep))
@@ -175,7 +189,8 @@ def ledger(experts, ep, top_k, allocated_local_tokens, valid_global_tokens, tp=0
     traffic = [[0] * ep for _ in range(ep)]
     for src, rows in enumerate(valid):
         rounds, tail = divmod(rows * top_k, experts)
-        start = ((allocated_local_tokens * top_k + 1) * src) % experts
+        width = allocated_by_rank[src] if allocated_by_rank else allocated_local_tokens
+        start = ((width * top_k + 1) * src) % experts
         for residue in range(experts):
             count = rounds + ((residue - start) % experts < tail)
             dest, bank = residue % ep, residue // ep
@@ -184,11 +199,12 @@ def ledger(experts, ep, top_k, allocated_local_tokens, valid_global_tokens, tp=0
     return SourceForceEplb(tuple(expert_counts),
                           tuple(tuple(expert_counts[r*banks:(r+1)*banks]) for r in range(ep)),
                           tuple(map(tuple, traffic)), valid, allocated_local_tokens,
-                          top_k, ep, sum(valid))
+                          top_k, ep, sum(valid), representative_rank=owner,
+                          allocated_by_rank=allocated_by_rank)
 
 
 def select(runtime, layer, *, tokens, valid_tokens, global_tokens,
-           token_shards, valid_source_tokens, replica):
+           token_shards, valid_source_tokens, replica, source_geometry=None):
     raw = runtime.kernels.get("force_eplb_source")
     if raw is None:
         return None
@@ -202,6 +218,10 @@ def select(runtime, layer, *, tokens, valid_tokens, global_tokens,
                 or not wrapper or wrapper.get("kind") != "vllm_ascend_mc2_tp_slice"
                 or runtime.kernels.get("sequence_parallel")):
             raise ModelingError("source_force_eplb_requires_explicit_mc2_tp_caller")
+        if source_geometry is not None:
+            g = source_geometry
+            return ledger(layer.num_experts, p.ep, layer.top_k, g.allocated[g.owner],
+                          sum(g.valid), p.tp, g.valid, g.allocated, g.owner)
         if (global_tokens not in (None, tokens, tokens * (p.ep // p.tp))
                 or not 0 < valid_tokens <= tokens):
             raise ModelingError("source_force_eplb_requires_declared_caller_valid_prefix")
@@ -216,6 +236,10 @@ def select(runtime, layer, *, tokens, valid_tokens, global_tokens,
             or wrapper
             or runtime.kernels.get("native_moe_protocol", {}).get("kind") != "arch35_fullmesh"):
         raise ModelingError("source_force_eplb_requires_sp_dp1_ep_tp_mc2_alltoall")
+    if source_geometry is not None:
+        g = source_geometry
+        return ledger(layer.num_experts, p.ep, layer.top_k, g.allocated[g.owner],
+                      sum(g.valid), p.tp, g.valid, g.allocated, g.owner)
     if (valid_source_tokens is None
             or global_tokens not in (None, tokens * p.tp, tokens * p.ep)
             or valid_tokens != min(tokens, valid_source_tokens)):

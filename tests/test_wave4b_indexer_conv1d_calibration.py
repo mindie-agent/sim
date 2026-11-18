@@ -53,7 +53,7 @@ INDEX_HEADS = 32
 INDEX_WIDTH = 128
 INDEX_TOPK = 2048
 POOL_ROW_BYTES = 132
-INDEX_ROW_BYTES = 136
+INDEX_ROW_BYTES = INDEX_WIDTH + 4
 LOCAL_TP = 8
 BATCH = 88
 KIMI_BATCH = 96
@@ -314,10 +314,11 @@ def _case_model(*, pool=16, index_dtype="fp8_e4m3", topk=INDEX_TOPK,
     quant = QuantSpec("bf16_fp8_index", weight_format="bf16",
                       activation_format="bf16", native_format="bf16",
                       expert_weight_format="bf16", kv_dtype="int8",
-                      index_dtype=index_dtype, index_scale_dtype="fp16")
+                      index_dtype=index_dtype, index_scale_dtype=(
+                          "fp32" if pool == 1 and index_dtype == "fp8_e4m3" else "fp16"))
     representations = {} if index_dtype == "int8" else {
-        "index_k": {"dtype": index_dtype, "group_size": 32,
-                    "scale_dtype": "fp16"}}
+        "index_k": {"dtype": index_dtype, "group_size": INDEX_WIDTH if pool == 1 else 32,
+                    "scale_dtype": quant.index_scale_dtype}}
     model = ModelSpec(
         name="wave4b", layers=1, hidden_size=HIDDEN, num_heads=8,
         head_dim=576, intermediate_size=1024, vocab_size=1024,
@@ -359,6 +360,8 @@ def _selection_ops(*, o_proj_tp, metadata=(), pool=16):
     model = replace(model, quant=replace(model.quant,
                                          index_scale_dtype="fp32"))
     views = _views(BATCH)
+    if not metadata:
+        metadata = ((index_pool.ROW_SHARD_OPTION, o_proj_tp),)
     builder = Builder("s0.l0", plan, 0, views, model, "decode")
     ready = ipn.selection(
         builder, query="q", weights="w", cache="cache", views=views, plan=plan,
@@ -402,10 +405,12 @@ def test_row_shard_lowering_emits_the_declared_index_allgather():
     assert meta["gather_position"] == "before_sfa_consumes_index_topk"
     assert gather.local_shape == (QUERY_ROWS, INDEX_TOPK)
     topk = ops["index_topk"]
-    assert topk.local_shape == (QUERY_ROWS, INDEX_TOPK)
-    assert gather.op_id in topk.deps
-    assert ready == topk.op_id
-    declaration = dict(topk.metadata)["structure_subgraphs"][-1]
+    assert topk.local_shape == (LOCAL_QUERY_ROWS, INDEX_TOPK)
+    stage, restore = ops["index_exchange_stage"], ops["index_exchange_restore"]
+    assert topk.deps == (indexer.op_id,) and stage.deps == (topk.op_id,)
+    assert gather.deps == (stage.op_id,) and restore.deps == (gather.op_id,)
+    assert ready == restore.op_id
+    declaration = dict(restore.metadata)["structure_subgraphs"][-1]
     assert declaration["implementation"]["conditions"]["row_shard"] == (
         "ascend_indexer_kpool_row_shard")
     assert declaration["tensor_view"]["row_shard_tp"] == LOCAL_TP
@@ -506,7 +511,11 @@ def test_arch35_and_arch22_recipes_coexist_and_route_by_representation():
     op = builder.ops[-1]
     ledger = dict(op.metadata)[sp.QUANT_LEDGER]
     assert op.recipe == fq.ARCH35_RECIPE
-    assert ledger == {"query_rows": 960, "wave_rows": sp.INDEXER_WAVE_ROWS,
+    wave_ranges = ledger["wave_key_ranges"]
+    assert len(wave_ranges) == ledger["waves"]
+    assert sum(hi - lo for lo, hi in wave_ranges[0]) == 5 * 32769 + 32768
+    assert {k: v for k, v in ledger.items() if k != "wave_key_ranges"} == {
+                      "query_rows": 960, "wave_rows": sp.INDEXER_WAVE_ROWS,
                       "waves": 30, "blocks": 33, "heads": INDEX_HEADS,
                       "width": INDEX_WIDTH, "keys": 33792,
                       "keys_padded": 33792,
@@ -595,13 +604,14 @@ def test_conv_update_has_no_fabricated_prefill_sync_barrier():
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def _arch35_op_for(ratio, views, *, topk=INDEX_TOPK, heads=INDEX_HEADS):
+def _arch35_op_for(ratio, views, *, topk=INDEX_TOPK, heads=INDEX_HEADS,
+                   prefix_cache_mode="private"):
     plan, model = _case_model(pool=1, index_dtype="fp8_e4m3",
                               compress_ratio=ratio, topk=topk)
     plan = replace(plan, index_heads=heads)
     builder = Builder("s0.l0", plan, 0, views, model, "decode")
     fq.declare(builder, deps=("q", "w", "cache"), views=views, plan=plan,
-               quant=builder.quant, parallel=_ArchParallel())
+               quant=builder.quant, parallel=_ArchParallel(), prefix_cache_mode=prefix_cache_mode)
     return builder.ops[-1]
 
 
@@ -658,13 +668,14 @@ def test_arch35_private_cache_payload_is_charged_once_on_hbm_and_mte2():
     payload = 2 * 1025 * INDEX_ROW_BYTES
     assert payload >= 262144
     assert op.hbm_bytes >= payload
-    assert op.mte2_bytes >= payload
-    assert op.mte2_bytes > 0
+    reads = dict(op.metadata)["resource_work"]
+    assert reads["mte2_aic"] + reads["mte2_aiv"] >= payload
+    assert reads["mte2_aic"] > 0 and reads["mte2_aiv"] > 0
     partial = (RequestView("a", 1, 2048, False, "decode", prefix_tokens=1024,
                            prefix_cache_key="shared_a"),
                RequestView("b", 1, 2048, False, "decode", prefix_tokens=1024,
                            prefix_cache_key="shared_a"))
-    partial_ledger = dict(_arch35_op_for(1, partial).metadata)[sp.QUANT_LEDGER]
+    partial_ledger = dict(_arch35_op_for(1, partial, prefix_cache_mode="shared").metadata)[sp.QUANT_LEDGER]
     assert partial_ledger["payload_keys"] == 1024 + 2 * 1025 == 3074
 
 
@@ -675,7 +686,7 @@ def test_keypool_row_shard_has_no_negative_dummy_rows():
     builder = Builder("s0.l0", plan, 0, views, model, "decode")
     ipn.selection(builder, query="q", weights="w", cache="cache", views=views,
                   plan=plan, quant=builder.quant, padded_tokens=STEPS,
-                  runtime=_Runtime(o_proj_tp=LOCAL_TP))
+                  runtime=_Runtime(o_proj_tp=LOCAL_TP), row_shard_tp=LOCAL_TP)
     meta = dict(next(op for op in builder.ops
                      if op.recipe == ipn.POOL_KEY_RECIPE).metadata)
     # Six query rows shard to one row per local-TP rank.

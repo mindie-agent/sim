@@ -65,7 +65,7 @@ def paired_sfa_calls(heads):
 
 
 def packed_sfa_geometry(meta, heads, plan, views, cp, *, cache_dtype="",
-                        cache_fmt=None):
+                        cache_fmt=None, runtime=None):
     """Packed-C8 geometry of the declared paired calls, or ``None``.
 
     Each call keeps the same selected rows and cache; only the gathered head
@@ -97,8 +97,7 @@ def packed_sfa_geometry(meta, heads, plan, views, cp, *, cache_dtype="",
     extents = tuple(
         max(ZERO, -(-min(int(v.prefix_tokens or ZERO), int(v.context)) // degree))
         for v in views)
-    shared = any(extents) and all(str(v.prefix_cache_key or "") for v in views
-                                  if v.prefix_tokens)
+    shared = getattr(runtime, "prefix_cache_mode", "private") == "shared" and any(extents)
     keys = tuple(str(v.prefix_cache_key or "") for v in views)
     return {
         "sequences": sequences,
@@ -126,7 +125,7 @@ def query_gather(b, query, rope, rows, heads, width, cp):
     return gathered, gathered
 
 
-def attention_batch(b, outputs, views, *, plan, heads, local_heads, cp, rows):
+def attention_batch(b, outputs, views, *, plan, heads, local_heads, cp, rows, runtime=None):
     ids = set(outputs)
     members = [op for op in b.ops if op.op_id in ids]
     if not members:
@@ -137,7 +136,8 @@ def attention_batch(b, outputs, views, *, plan, heads, local_heads, cp, rows):
     resolved = cache_format(b.model, "mla_kv")
     fp8 = resolved.dtype in FP8_FORMATS and plan.indexer
     packed = (packed_sfa_geometry(meta, heads, plan, views, cp,
-                                  cache_dtype=resolved.dtype, cache_fmt=resolved)
+                                  cache_dtype=resolved.dtype, cache_fmt=resolved,
+                                  runtime=runtime)
               if plan.indexer else None)
     native_packed = fp8 or packed is not None
     if native_packed and (b.model.activation_dtype != "bf16"
@@ -163,11 +163,15 @@ def attention_batch(b, outputs, views, *, plan, heads, local_heads, cp, rows):
                          "peer_exchange": packed["dcp_peer_exchange"]}})
     shape = (sum(view.q_len for view in views), heads, plan.kv_lora_rank)
     out_bytes = dtype_bytes(b.model.activation_dtype)
-    statistics = rows * heads * TWO * FP32_BYTES
+    physical_shape = (rows, heads, plan.kv_lora_rank)
+    padding_output = (rows - shape[0]) * heads * plan.kv_lora_rank * out_bytes
+    statistics = rows * heads * TWO * FP32_BYTES if native_packed or cp > ONE else ZERO
+    extra_output = statistics + padding_output
     if packed is not None:
         # The paired C8 calls also write the FP32 LSE statistics the output
         # pack reads.  Carry the exact declared volume into the arch35 plan.
         packed["statistics_bytes"] = statistics
+        packed["padding_output_bytes"] = padding_output
     meta.update({
         "qsfa_output_bytes": rows * (packed["heads"] if packed else heads)
         * (plan.kv_lora_rank * out_bytes + TWO * FP32_BYTES),
@@ -178,14 +182,13 @@ def attention_batch(b, outputs, views, *, plan, heads, local_heads, cp, rows):
         members[ZERO], op_id=b.prefix + ".latent_attention_batch",
         recipe=IMPLEMENTATION if native_packed else "paired_mla_attention_analytic",
         source_boundary="kernel" if native_packed else "",
-        semantic_shape=shape, local_shape=shape, padded_shape=shape, launch_shape=shape,
+        semantic_shape=shape, local_shape=shape, padded_shape=physical_shape,
+        launch_shape=physical_shape,
         deps=tuple(dict.fromkeys(dep for op in members for dep in op.deps)),
         flops=sum(op.flops for op in members), vector_ops=sum(op.vector_ops for op in members),
-        hbm_bytes=sum(op.hbm_bytes for op in members) + (
-            statistics if (native_packed or cp > ONE) else ZERO),
+        hbm_bytes=sum(op.hbm_bytes for op in members) + extra_output,
         mte2_bytes=sum(op.mte2_bytes for op in members),
-        mte3_bytes=sum(op.mte3_bytes for op in members) + (
-            statistics if (native_packed or cp > ONE) else ZERO),
+        mte3_bytes=sum(op.mte3_bytes for op in members) + extra_output,
         metadata=tuple(meta.items()))
     b.ops[:] = [op for op in b.ops if op.op_id not in ids]
     b.ops.append(batch)

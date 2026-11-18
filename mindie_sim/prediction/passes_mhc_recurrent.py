@@ -455,10 +455,27 @@ def kda_in_kernel_l2norm(ops, source_dtype):
             continue
         products = [c for c in consumers
                     if str(c.recipe).startswith("chunk_products")]
-        # A second prefill sequence owns another ``chunk_products`` occurrence,
-        # and a mixed decode scan reads the normalized Q/K directly (sharing
-        # ``op.phase == "prefill"`` on the mixed builder while owning distinct
-        # requests / row counts).  Either consumer retains ``qk_l2norm``.
+        if products and dict(op.metadata).get("batch_chunk_norm"):
+            product_indices = {
+                str(product.recipe)[len("chunk_products"):] for product in products
+            }
+            decode_scans = [
+                c for c in consumers
+                if str(c.recipe).startswith("recurrent_scan")
+                and "_seg" not in str(c.recipe)
+                and str(c.recipe)[len("recurrent_scan"):] not in product_indices
+            ]
+            targets = [*products, *decode_scans]
+            rows = sum(target.local_shape[0] for target in targets)
+            if rows:
+                for target in targets:
+                    share = op.vector_ops * target.local_shape[0] / rows
+                    replacements[target.op_id] = replace(
+                        target, vector_ops=target.vector_ops + share,
+                        metadata=merge_meta(op, target, extra=(("in_kernel_qk_l2norm", True),)))
+                removed.add(op.op_id)
+                aliases[op.op_id] = op.deps[0]
+            continue
         if len(products) != 1:
             continue
         first_prod = products[0]

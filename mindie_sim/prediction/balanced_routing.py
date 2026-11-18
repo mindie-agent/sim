@@ -29,8 +29,8 @@ def _rank_rows(counts, ep, rank):
     width = len(counts)
     if ep <= width:
         return counts[rank::ep]
-    replicas = ep // width
     expert = rank % width
+    replicas = 1 + (ep - 1 - expert) // width
     rep = rank // width
     return (counts[expert] // replicas + int(rep < counts[expert] % replicas),)
 
@@ -101,7 +101,7 @@ class BalancedRouting:
 
 
 def balanced_realization(runtime, layer, *, tokens, valid_tokens, global_tokens,
-                         token_shards=1, valid_source_tokens=None, replica=0):
+                         token_shards=1, valid_source_tokens=None, replica=0, owner=None):
     p = runtime.parallel
     if runtime.moe_recipe not in {"alltoall", "tp_join_reduce", "local_expert_reduce"}:
         raise ModelingError("balanced_routing_requires_pcp1_unchunked_alltoall")
@@ -110,7 +110,7 @@ def balanced_realization(runtime, layer, *, tokens, valid_tokens, global_tokens,
         raise ModelingError("balanced_routing_requires_complete_dp_cohort:use_target_graphs")
     total = tokens * token_shards if global_tokens is None else global_tokens
     if token_shards != 1 and (
-            token_shards != p.tp or total < tokens * token_shards):
+            token_shards != p.tp or (owner is None and total < tokens * token_shards)):
         raise ModelingError("balanced_routing_sequence_shards_require_complete_cohort")
     assignments = total * layer.top_k
     q, r = divmod(assignments, layer.num_experts)
@@ -118,6 +118,8 @@ def balanced_realization(runtime, layer, *, tokens, valid_tokens, global_tokens,
     local_ep = min(p.tp * p.pcp, p.ep) if p.ep_spans_pcp else min(p.tp, p.ep)
     first = (replica % width) * local_ep if p.ep_spans_dp else 0
     ranks = tuple(range(first, first + local_ep))
+    if owner is not None:
+        ranks = (owner,)
     representative = max(ranks, key=lambda rank: sum(_rank_rows(counts, p.ep, rank)))
     local_rows = _rank_rows(counts, p.ep, representative)
     # PCP prefill tokens are already split across PCP ranks. Dividing by the

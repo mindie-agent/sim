@@ -572,8 +572,12 @@ def _structure_inputs(case, *, phase, tokens, context=0, sequences=1,
             "replica_axis": "data_parallel",
             "shard_scope": "representative_tp_pcp_shard",
             "stage_scope": "all_pipeline_stages",
-            **({"resource_geometry": {f"replica:{replica}/stage:{stage}": asdict(value)
-                                      for (replica, stage), value in geometries.items()}}
+            **({"resource_geometry": {
+                f"replica:{replica}/stage:{stage}": {
+                    key: field for key, field in asdict(value).items()
+                    if key not in {"rates", "compute_peaks"}
+                }
+                for (replica, stage), value in geometries.items()}}
                if geometries else {}),
         },
     )

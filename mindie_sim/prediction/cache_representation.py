@@ -18,6 +18,7 @@ from collections import deque
 import json
 
 from mindie_sim.catalog.cache import cache_row_split, packed_region_row_bytes
+from mindie_sim.catalog.mqsmla_layout import packed_row_parts
 from mindie_sim.catalog.cache_format import cache_format
 from mindie_sim.catalog.ops import cache_store_op
 from mindie_sim.prediction.cache_execution import (
@@ -391,10 +392,12 @@ def _typed_view(model, op, fmt, rows, width, row_bytes, region, identity, deps=(
     registered as an actual dependency port unless the producer really exposes
     that output.
     """
-    stored = int(rows * row_bytes)
-    _payload_one, scale_one = cache_row_split(model, region, width)
-    scale_bytes = int(round(rows * scale_one))
-    payload_bytes = stored - scale_bytes
+    parts = packed_row_parts(model, region, width)
+    if parts is None:
+        data, scales = cache_row_split(model, region, width)
+        parts = data, scales, 0
+    payload_bytes, scale_bytes, padding_bytes = (
+        int(round(rows * amount)) for amount in parts)
     packed = fmt.packed_elements != 1 or bool(fmt.group_size)
     outputs = tuple(getattr(op, "outputs", None) or ())
     registered = bool(outputs)
@@ -404,7 +407,7 @@ def _typed_view(model, op, fmt, rows, width, row_bytes, region, identity, deps=(
         layout="packed_row" if packed else "contiguous",
         shape=(rows, width), storage=region, owner=identity,
         inputs=tuple(deps), payload_bytes=payload_bytes,
-        scale_bytes=scale_bytes,
+        scale_bytes=scale_bytes, padding_bytes=padding_bytes,
         packed_elements=fmt.packed_elements, group_size=fmt.group_size,
         output_registered=registered)
 

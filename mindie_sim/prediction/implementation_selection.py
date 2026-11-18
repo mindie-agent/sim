@@ -161,7 +161,9 @@ def alternatives(raw, selector):
     if not is_policy(raw):
         yield raw
         return
-    if selector in _STATIC_SELECTORS:
+    if selector in _STATIC_SELECTORS and not all(
+            isinstance(case, dict) and set(case.get("domain") or ()) == {"model_scopes"}
+            for case in (raw.get("cases") or ())):
         raise ModelingError(f"implementation_policy_requires_static_model_preparation:{selector}")
     if set(raw) - {"cases", "otherwise"} or not raw["cases"]:
         raise ModelingError(f"implementation_policy_requires_cases:{selector}")
@@ -205,6 +207,15 @@ def prepared_selection(bindings, selector):
     raw = bindings.get(selector)
     if not is_policy(raw):
         return select(bindings, selector)
+    if all(isinstance(case, dict) and set(case.get("domain") or ()) == {"model_scopes"}
+           for case in (raw.get("cases") or ())):
+        for case in raw["cases"]:
+            if "target" in (case["domain"].get("model_scopes") or ()):
+                binding = case["binding"]
+                return None if binding == "analytical" else select({selector: binding}, selector)
+        otherwise = raw.get("otherwise", "analytical")
+        return (None if otherwise == "analytical" or otherwise == "error"
+                else select({selector: otherwise}, selector))
     choices = [select({selector: binding}, selector)
                for binding in alternatives(raw, selector) if binding != "analytical"]
     if choices and any((choice.name, choice.options) != (choices[0].name, choices[0].options)

@@ -168,7 +168,7 @@ def target_operators(case, *, phase, tokens, context=0, sequences=1, scope="body
     case = _media_case(case, views, scope, media_tokens_per_sequence)
     from .local_tp_groups import local_tp_spans_dp
     if (len(group) > 1
-            and (case.runtime.kernels.get("sequence_parallel")
+            and (case.runtime.enable_dbo or case.runtime.kernels.get("sequence_parallel")
                  or local_tp_spans_dp(case.runtime.parallel))):
         # A single rank cannot resolve cross-DP SP without the complete
         # cohort's query totals. Delegate only the cohort graph binding.
@@ -189,7 +189,7 @@ def target_operators(case, *, phase, tokens, context=0, sequences=1, scope="body
                                 selection=selection, scope=scope)
                 if scope == "body" else result)
     replica = selected
-    physical = _physical_rank_for(case, replica)
+    physical = physical_rank if physical_rank is not None else _physical_rank_for(case, replica)
     result = tuple(op for op in _target_ops(
         case, views, scope, resource_fusion=resource_fusion,
         routing_views=routing_views, physical_rank=physical,
@@ -286,8 +286,10 @@ def _target_ops(case, views, scope, *, global_views=None, resource_fusion=True,
     from .frontend import mark_analytical_runtime
     runtime = mark_analytical_runtime(runtime, selections)
     case = replace(case, runtime=runtime)
+    from .dbo_ledger import selected_lane
     local, local_tokens, pcp_prefill = frontend.partition_views(
-        views, case.runtime, padded_tokens)
+        views, case.runtime, padded_tokens, model=case.model,
+        lane=selected_lane(case.runtime.parallel, case.machine, replica, physical_rank))
     pcp_cohort = case.runtime.parallel.pcp > 1 and any(
         v.phase == "prefill" for v in (global_views or views))
     body_global_tokens = (
@@ -485,17 +487,13 @@ def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
     # DP-scoped and the lowering keeps its declared uniform peer policy.
     source_rows_by_replica = tuple(
         active_rows_by_replica[p] for p in participants)
-    from .frontend import Frontend
-    cohort_views_by_replica = tuple(
-        Frontend.partition_views(
-            logical_views[p], case.runtime, active_rows_by_replica[p],
-            model=case.model)[0]
-        for p in participants)
+    cohort_views_by_replica = logical_views
     routing_global_tokens = (
         padded_cohort if padded_cohort is not None
         else (sum(active_rows_by_replica.values())
               if global_views is not None else None))
-    if len(participants) > UNIFORM_COUNT_CARDINALITY and "sequence_parallel" in case.runtime.kernels:
+    if (len(participants) > UNIFORM_COUNT_CARDINALITY and "sequence_parallel" in case.runtime.kernels
+            and case.runtime.parallel.rank_table is None):
         from .graph import GraphPolicy
         from .sequence_parallel import select as select_sp
         total_global = (padded_cohort if padded_cohort is not None
@@ -523,7 +521,8 @@ def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
             "source_owner", "query_position"))
         for item in (case.runtime.routing.get("realizations") or ()))
     uniform_replicas = (
-        len(set(counts.values())) <= UNIFORM_COUNT_CARDINALITY
+        not case.runtime.enable_dbo and case.runtime.parallel.rank_table is None
+        and len(set(counts.values())) <= UNIFORM_COUNT_CARDINALITY
         and (scope != "model" or (
             case.machine.homogeneous
             and case.runtime.parallel.rank_table is None
@@ -602,7 +601,9 @@ def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
                            routing_global_tokens=routing_global_tokens,
                            routing_views=_routing_views_for(routing_views, r),
                            cohort_views_by_replica=cohort_views_by_replica,
-                           physical_rank=_physical_rank_for(case, r, cohort_topology),
+                            physical_rank=(physical_rank if r == (participants[0] if selected_replica is None else selected_replica) and
+                                           physical_rank is not None else
+                                           _physical_rank_for(case, r, cohort_topology)),
                            query_position=query_position,
                            model_programs=model_programs,
                            layer_limit=layer_limit)

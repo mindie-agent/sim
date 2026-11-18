@@ -421,10 +421,14 @@ def test_locked_sweep_reuses_one_plan_or_rejects_unsupported_comparison():
 def test_enable_dbo_builds_two_distinct_microbatch_partitions():
     case = parse_case(compose_case(
         "qwen3-30b-a3b", hardware="a5", tp=8, ep=8, num_devices=8,
-        ranks_per_node=8, prompt_tokens=64, output_tokens=2, concurrency=2))
+        ranks_per_node=8, prompt_tokens=64, output_tokens=2, concurrency=16))
     case = replace(case, runtime=replace(case.runtime, enable_dbo=True))
-    views = (RequestView("r0", 1, 32, True, "decode"),
-             RequestView("r1", 1, 32, True, "decode"))
+    under_budget = Frontend()(
+        IterationPlan((RequestView("u0", 1, 32, True, "decode"),
+                       RequestView("u1", 1, 32, True, "decode"))),
+        case.model, case.runtime, case.machine)
+    assert not any("dbo_microbatch" in dict(op.metadata) for op in under_budget.ops)
+    views = tuple(RequestView(f"r{idx}", 1, 32, True, "decode") for idx in range(16))
     work = Frontend()(IterationPlan(views), case.model, case.runtime,
                       case.machine)
     partitions = {}

@@ -246,6 +246,7 @@ class LayerPlan:
     #: group score Top2, group TopK, mask and unbiased weight gather.
     router_noaux_tc: bool = False
     k_eq_v: bool = False
+    kda_batch_chunk_norm: bool = False
 
     def __post_init__(self) -> None:
         # Normalise the declared indexer role once, so every downstream reader

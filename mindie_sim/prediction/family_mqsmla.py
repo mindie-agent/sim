@@ -44,12 +44,6 @@ MIN_ACTIVE_ROWS = 1
 QUERY_ORIGIN = 0
 NO_COMPRESSED_ROWS = 0
 VALID_ADDRESSING = frozenset({"scalar", "auto", "vector"})
-#: Declared ``(dtype, scale group, scale dtype)`` pair of every packed mode.
-QUANT_MODE_SIGNATURES = {
-    (("bf16", 0, "none"), ("bf16", 0, "none")): KV_QUANT_BF16,
-    (("fp8_e4m3", 32, "bf16"), ("fp8_e4m3", 32, "bf16")): KV_QUANT_FP8,
-    (("fp8_e4m3", 32, "uint8"), ("fp8_e4m3", 32, "uint8")): KV_QUANT_MXFP8,
-}
 FORMATS = {
     "window": {"dtype": "fp8_e4m3", "group_size": FP8_WINDOW_GROUP_SIZE,
                "scale_dtype": "bf16"},
@@ -61,10 +55,8 @@ FORMATS = {
 def quant_mode_of(model, head_dim):
     """Declared packed-KV mode of the arch35 mixed-quant kernel, or ``None``.
 
-    The declared cache representations decide the mode: BF16 rows, the FP8 row
-    with one BF16 scale per 32 values, and the MXFP8 row whose packed UE8M0
-    exponent plane is unpacked and broadcast.  A mixed FP8/FP4 declaration
-    keeps the retained legacy ``aclnn`` row widths.
+    Packed FP8 rows use seven native scale groups over the 448 NoPE lanes.
+    The mixed FP8/FP4 declaration selects the retained DSL layout.
     """
     del head_dim
     return _declared_mode(cache_format(model, "window"),
@@ -72,9 +64,13 @@ def quant_mode_of(model, head_dim):
 
 
 def _declared_mode(window, compressed):
-    signature = ((window.dtype, window.group_size, window.scale_dtype),
-                 (compressed.dtype, compressed.group_size, compressed.scale_dtype))
-    return QUANT_MODE_SIGNATURES.get(signature)
+    from mindie_sim.catalog.mqsmla_layout import packed_scale_type
+    kind = packed_scale_type(window, compressed)
+    if kind is not None:
+        return KV_QUANT_FP8 if kind == "bf16" else KV_QUANT_MXFP8
+    if window == compressed == CacheFormat("bf16"):
+        return KV_QUANT_BF16
+    return None
 
 
 def _region_format(raw):
@@ -119,17 +115,9 @@ def query_shape(views, plan, *, topk_present=False):
     }
 
 
-def _prefix_fields(views):
-    """Declared shared-pool extent of every request's immutable prefix."""
-    extents = tuple(max(0, min(int(getattr(v, "prefix_tokens", 0) or 0),
-                               int(getattr(v, "context", 0) or 0))) for v in views)
-    shared = any(extents) and all(
-        str(getattr(v, "prefix_cache_key", "") or "") for v in views if v.prefix_tokens)
-    if not shared:
-        return {"prefix_cache_mode": "private"}
-    return {"prefix_cache_mode": "shared", "prefix_tokens": extents,
-            "prefix_cache_keys": tuple(
-                str(getattr(v, "prefix_cache_key", "") or "") for v in views)}
+def _prefix_fields(views, runtime):
+    from .indexed_attention import _prefix_declaration
+    return _prefix_declaration(views, runtime)
 
 
 def unsupported_reason(*, views, plan, parallel, model, padded_tokens,
@@ -173,7 +161,8 @@ def unsupported_reason(*, views, plan, parallel, model, padded_tokens,
         rows = tuple(query_rows(query_shape(views, plan, topk_present=topk_present)))
         if selective_fd_excluded(cores, rows):
             return "mqsmla_selective_72_row_fd_branch_not_modeled"
-    if quant_mode_of(model, plan.head_dim) in {KV_QUANT_FP8, KV_QUANT_MXFP8}:
+    if (implementation != LEGACY_RECIPE
+            and quant_mode_of(model, plan.head_dim) in {KV_QUANT_FP8, KV_QUANT_MXFP8}):
         # A declared packed-quantized representation is itself the contract.  A
         # BF16 cache keeps the plain attention path: the packed native kernel is
         # a quantized-cache binding, never a relabel of a BF16 declaration.
@@ -210,7 +199,10 @@ def lower_attention(ops, outputs, *, selection, views, plan, topk_present, prefi
     effective_ratio = (plan.compress_ratio if topk_present or plan.owns_long_kv
                        else NO_COMPRESSED_ROWS)
     implementation = str(getattr(selection, "name", RECIPE))
+    legacy = implementation == LEGACY_RECIPE
     quant_mode = declared_quant_mode(members[0])
+    if legacy and quant_mode is not None:
+        raise ModelingError("mqsmla_legacy_dsl_requires_mixed_fp8_fp4_cache")
     shape = {"sequences": rows, "window": plan.window, "ratio": effective_ratio,
              "topk": plan.index_topk if topk_present else 0, "heads": heads,
              "width": MQSMLA_HEAD_WIDTH, "metadata_support_fd": False,
@@ -220,9 +212,8 @@ def lower_attention(ops, outputs, *, selection, views, plan, topk_present, prefi
     if quant_mode is not None:
         shape["kv_quant_mode"] = quant_mode
         shape["packed_row_bytes"] = KV_QUANT_ROW_BYTES[quant_mode]
-        shape.update(_prefix_fields(views))
+        shape.update(_prefix_fields(views, runtime))
     query = (active_q, heads, MQSMLA_HEAD_WIDTH)
-    legacy = implementation == LEGACY_RECIPE
     meta = {**dict(members[0].metadata), "mqsmla_geometry": shape,
             "logical_pairs": sum(dict(op.metadata).get("logical_pairs", 0) for op in members),
             "kv_sweeps": sum(dict(op.metadata).get("kv_sweeps", 0) for op in members),

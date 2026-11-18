@@ -595,7 +595,8 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         if mixed_quant:
             grp_outputs = mixed_quant.module.lower_attention(
                 b.ops, grp_outputs, selection=mixed_quant, views=grp_views, plan=plan,
-                topk_present=bool(topk), prefix=grp_prefix, parallel=parallel)
+                topk_present=bool(topk), prefix=grp_prefix, parallel=parallel,
+                runtime=runtime)
         elif not selected:
             from .generic_latent_attention import batch_general_mla_ops, batch_ops
             from .indexed_attention import batch_analytic_ops
@@ -619,7 +620,7 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             if gathered_dcp:
                 grp_outputs = latent_dcp.attention_batch(
                     b, grp_outputs, grp_views, plan=plan, heads=heads,
-                    local_heads=logical_heads, cp=eff_cp, rows=q)
+                    local_heads=logical_heads, cp=eff_cp, rows=q, runtime=runtime)
             out_set = ({prefix + ".latent_attention_batch"} if gathered_dcp
                        else set(grp_outputs))
             for idx_op, op_item in enumerate(b.ops):
