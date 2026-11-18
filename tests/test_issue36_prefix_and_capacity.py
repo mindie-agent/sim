@@ -131,9 +131,12 @@ def test_draft_context_attributes_every_layer_op():
     prepare(ops, projection=projection, model=model, draft=draft, rows=4,
             query_rows=3, prefix="d:", stage=0, requests=())
     attributed = {op.op_id: op.layer for op in ops}
+    # One fused V3 prolog plus one paged scatter per draft layer; the five
+    # fragmented eager producers are gone.
     for layer in range(draft.layers):
-        for suffix in ("qkv_a", "kv_copy", "norm", "rope", "store"):
+        for suffix in ("mla_prolog_v3", "kv_scatter"):
             assert attributed[f"d:context_kv{layer}.{suffix}"] == layer
+    assert not any("qkv_a" in op_id or "kv_copy" in op_id for op_id in attributed)
     assert attributed["d:context_norm"] == -1
 
 

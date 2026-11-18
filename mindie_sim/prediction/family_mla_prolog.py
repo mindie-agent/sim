@@ -17,6 +17,11 @@ from .structure_groups import declare_group
 IMPLEMENTATION = "vllm_ascend_mla_prolog_v3"
 ABSORBED_CATEGORY = "mla_absorb"
 CACHE_GROUP_SIZE = 128
+BF16_CACHE_DTYPES = frozenset({"bf16", "fp8_e4m3"})
+MXFP8_FORMAT = "fp8_e4m3"
+MXFP8_QUERY_QUANT_MODE = 3
+E8M0_GROUP_SIZE = 32
+BF16_QUERY_QUANT_MODE = 0
 SOURCE = {
     "repository": "vllm-ascend",
     "revision": "175ef4d49c2072f9233619636f0309f4f88b4e2c",
@@ -55,17 +60,23 @@ def prepare_model(model, runtime):
 
 def validate(*, plan, parallel, model, quant, lowering_passes,
              cache_layout=None, cache_group_size=CACHE_GROUP_SIZE):
-    from .mla_prolog_packed import LAYOUT, view
+    from .mla_prolog_packed import (
+        SUPPORTED_QUERY_FORMATS, LAYOUT, view,
+    )
     packed = cache_layout == LAYOUT
     if cache_layout not in (None, LAYOUT) or (packed and quant.kv_dtype != "int8"):
         raise ModelingError("mla_prolog_v3_cache_layout_dtype_mismatch")
     if packed:
+        # DCP keeps one rank-owned row slice; it does not change the C8 row ABI.
         view(plan.kv_lora_rank, plan.qk_rope_head_dim, cache_group_size)
-        if compute_dtype_for(quant, "mla")[1] != "int8" or quant.format_for("mla") != "int8":
-            raise ModelingError("mla_prolog_packed_requires_int8_projection_operands")
+        if quant.format_for("mla") not in SUPPORTED_QUERY_FORMATS:
+            raise ModelingError("mla_prolog_packed_requires_declared_projection_operands")
+        if compute_dtype_for(quant, "mla")[1] != quant.format_for("mla"):
+            raise ModelingError("mla_prolog_packed_requires_declared_projection_operands")
     if (plan.mla_variant != "latent_mla" or plan.cache_kind != "dense"
-            or parallel.cp != 1 or parallel.pcp < 1
-            or model.activation_dtype != "bf16" or (quant.kv_dtype not in {"bf16", "fp8_e4m3"} and not packed)
+            or parallel.cp < 1 or parallel.pcp < 1
+            or model.activation_dtype != "bf16"
+            or (quant.kv_dtype not in BF16_CACHE_DTYPES and not packed)
             or quant.format_for("mla") not in {"bf16", "int8", "fp8_e4m3"}):
         raise ModelingError("mla_prolog_v3_declared_operand_domain_unsupported")
     projection_activation = compute_dtype_for(quant, "mla")[1]
@@ -80,13 +91,30 @@ def validate(*, plan, parallel, model, quant, lowering_passes,
             raise ModelingError("mla_prolog_v3_query_norm_indexer_activation_mismatch")
 
 
+def _native_kind(packed, quant):
+    from .mla_prolog_packed import NATIVE_KIND_V3, NATIVE_KIND_V4, MXFP8_QUERY_FORMAT
+    if packed and quant.format_for("mla") == MXFP8_QUERY_FORMAT:
+        return NATIVE_KIND_V4
+    return NATIVE_KIND_V3
+
+
 def declare(ops, *, prefix, plan, model, parallel, quant, tokens, members,
             q_a, q_b, kv_a, q_absorb, cache_layout=None, cache_group_size=CACHE_GROUP_SIZE):
-    from .mla_prolog_packed import LAYOUT, SOURCE as PACKED_SOURCE, view as packed_view
+    from .mla_prolog_packed import (
+        LAYOUT, MXFP8_QUERY_FORMAT, SOURCE as PACKED_SOURCE, SOURCE_V4,
+        view as packed_view,
+    )
     packed = cache_layout == LAYOUT
     cache = packed_view(plan.kv_lora_rank, plan.qk_rope_head_dim, cache_group_size) if packed else None
     by_id = {op.op_id: op for op in ops}
     qa, qb, kva, absorb = (dict(by_id[key].metadata) for key in (q_a, q_b, kv_a, q_absorb))
+    do_rope = bool(plan.mla_do_rope)
+    native_kind = _native_kind(packed, quant)
+    source = SOURCE
+    if native_kind.endswith("V4WeightNz"):
+        source = SOURCE_V4
+    elif packed:
+        source = PACKED_SOURCE
     declare_group(
         ops, key=prefix + ".mla_prolog", role="mla_prolog", family="mla",
         members=members, entries=(q_a, kv_a), anchor=q_absorb,
@@ -113,23 +141,39 @@ def declare(ops, *, prefix, plan, model, parallel, quant, tokens, members,
                 } if packed else {}),
             "query_norm_dtype": qb["activation_format"],
             "query_norm_output": bool(plan.indexer or plan.owns_topk or plan.index_query_per_layer),
+            "do_rope": do_rope,
+            "parallel_cp": int(parallel.cp),
+            "query_quant_mode": (MXFP8_QUERY_QUANT_MODE
+                                 if quant.format_for("mla") == MXFP8_QUERY_FORMAT
+                                 else BF16_QUERY_QUANT_MODE),
         },
         implementation={
-            "native_kind": "MlaPrologV3", "selection": IMPLEMENTATION,
+            "native_kind": native_kind, "selection": IMPLEMENTATION,
             "conditions": {
                 "cache_mode": "PA_BSND", "quantized_kv_cache": packed,
                 **({"packed_cache": cache} if packed else {}),
+                **({"mxfp8_query": True, "e8m0_group": E8M0_GROUP_SIZE}
+                   if native_kind.endswith("V4WeightNz") else {}),
+                "do_rope": do_rope,
+                "query_rope_member": do_rope,
+                "data_parallel_context": int(parallel.cp),
                 "checkpoint_absorbed_weight_dtype": "bf16",
                 "query_norm_output": bool(plan.indexer or plan.owns_topk or plan.index_query_per_layer),
                 "timing_boundary": "expanded_semantic_operators; no_fused_timing_claim",
             },
         },
-        source=PACKED_SOURCE if packed else SOURCE,
+        source=source,
     )
 
 
 def cache_store(builder, *, deps, rows, plan, cache_layout=None, cache_group_size=CACHE_GROUP_SIZE):
     from .mla_prolog_packed import LAYOUT, store
     if cache_layout == LAYOUT:
-        return store(builder, "kv_store", deps, rows, plan)
+        return store(builder, "kv_store", deps, rows, plan,
+                     query_format=quant_format(builder.quant, "mla"))
     return None
+
+
+def quant_format(quant, category):
+    from mindie_sim.catalog.ops import compute_dtype_for
+    return compute_dtype_for(quant, category)[1]

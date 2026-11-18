@@ -15,17 +15,21 @@ from mindie_sim.schema.common import ModelingError
 from .mechanism import PlannedRecipe
 from .mqsmla import (
     COMPRESSED_CACHE_ROW_BYTES,
+    LEGACY_NATIVE_KIND,
+    LEGACY_RECIPE,
+    LEGACY_SOURCE,
     MQSMLA_HEAD_WIDTH,
     MQSMLA_ROPE_WIDTH,
+    NATIVE_KIND,
     ORIGINAL_CACHE_ROW_BYTES,
+    RECIPE,
     SOURCE,
+    SUPPORTED_PHASES,
     supported_heads,
     build,
     query_rows,
     selective_fd_excluded,
 )
-
-RECIPE = "cannbot_mixed_quant_sparse_flash_mla"
 FP8_WINDOW_GROUP_SIZE = 32
 FP4_COMPRESSED_GROUP_SIZE = 16
 SINGLE_KV_HEAD = 1
@@ -43,7 +47,8 @@ FORMATS = {
 
 
 def recipes():
-    return {RECIPE: PlannedRecipe(build)}
+    """The official CANN recipe plus its explicit legacy prototype alias."""
+    return {RECIPE: PlannedRecipe(build), LEGACY_RECIPE: PlannedRecipe(build)}
 
 
 def query_shape(views, plan, *, topk_present=False):
@@ -60,7 +65,8 @@ def query_shape(views, plan, *, topk_present=False):
 
 def unsupported_reason(*, views, plan, parallel, model, padded_tokens,
                        addressing="scalar", metadata_support_fd=False,
-                       return_softmax_lse=False, cores=None, topk_present=False):
+                       return_softmax_lse=False, cores=None, topk_present=False,
+                       implementation=RECIPE):
     """Return the first failed source-domain predicate, or ``None``.
 
     ``cores`` is the declared AIC owner count; when supplied, the retained
@@ -87,11 +93,14 @@ def unsupported_reason(*, views, plan, parallel, model, padded_tokens,
     valid_rows = sum(int(v.q_len) for v in views)
     if valid_rows < MIN_ACTIVE_ROWS or padded_tokens < valid_rows:
         return "mqsmla_binding_requires_positive_padded_rows"
-    if any(v.phase != "decode" or v.padding
+    if any(v.phase not in SUPPORTED_PHASES or v.padding
            or (v.query_ranges and v.query_ranges != ((QUERY_ORIGIN, v.q_len),))
            for v in views):
-        return "mqsmla_binding_requires_contiguous_unpadded_decode_rows"
-    if cores is not None:
+        return "mqsmla_binding_requires_contiguous_unpadded_decode_or_draft_rows"
+    if cores is not None and implementation == LEGACY_RECIPE:
+        # ``SELECTIVE_FD_72`` is a retired ``cannbot-dsl`` geometry. The
+        # official CANN program accepts the same rows, so the refusal follows
+        # the explicitly selected implementation, never the row count alone.
         rows = tuple(query_rows(query_shape(views, plan, topk_present=topk_present)))
         if selective_fd_excluded(cores, rows):
             return "mqsmla_selective_72_row_fd_branch_not_modeled"
@@ -103,13 +112,13 @@ def unsupported_reason(*, views, plan, parallel, model, padded_tokens,
 
 def validate(*, views, plan, parallel, model, padded_tokens,
              metadata_support_fd=False, addressing="scalar", return_softmax_lse=False,
-             cores=None, topk_present=False):
+             cores=None, topk_present=False, implementation=RECIPE):
     reason = unsupported_reason(
         views=views, plan=plan, parallel=parallel, model=model,
         padded_tokens=padded_tokens, addressing=addressing,
         metadata_support_fd=metadata_support_fd,
         return_softmax_lse=return_softmax_lse, cores=cores,
-        topk_present=topk_present,
+        topk_present=topk_present, implementation=implementation,
     )
     if reason:
         raise ModelingError(reason)
@@ -126,18 +135,22 @@ def lower_attention(ops, outputs, *, selection, views, plan, topk_present, prefi
     active_q = sum(q for q, _ in rows)
     effective_ratio = (plan.compress_ratio if topk_present or plan.owns_long_kv
                        else NO_COMPRESSED_ROWS)
+    implementation = str(getattr(selection, "name", RECIPE))
     shape = {"sequences": rows, "window": plan.window, "ratio": effective_ratio,
              "topk": plan.index_topk if topk_present else 0, "heads": heads,
              "width": MQSMLA_HEAD_WIDTH, "metadata_support_fd": False,
+             "implementation": implementation,
              "addressing": str(dict(getattr(selection, "options", {}) or {}).get(
                  "addressing", "scalar"))}
     query = (active_q, heads, MQSMLA_HEAD_WIDTH)
+    legacy = implementation == LEGACY_RECIPE
     meta = {**dict(members[0].metadata), "mqsmla_geometry": shape,
             "logical_pairs": sum(dict(op.metadata).get("logical_pairs", 0) for op in members),
             "kv_sweeps": sum(dict(op.metadata).get("kv_sweeps", 0) for op in members),
             "implementation_binding": {
-                "selector": "mqsmla_attention", "implementation": selection.name,
-                "capture_binary_identity": "not_established", "source": SOURCE,
+                "selector": "mqsmla_attention", "implementation": implementation,
+                "capture_binary_identity": "not_established",
+                "source": LEGACY_SOURCE if legacy else SOURCE,
                 "coverage": "conditional_source_program",
                 "caller_unmodeled": ["separate_aicpu_metadata_generation",
                                       "original_window_index_generation"]},
@@ -148,8 +161,9 @@ def lower_attention(ops, outputs, *, selection, views, plan, topk_present, prefi
                 "original_cache_row_bytes": ORIGINAL_CACHE_ROW_BYTES,
                 "compressed_cache_row_bytes": COMPRESSED_CACHE_ROW_BYTES,
                 "compressed_cache": effective_ratio > 0},
-            "native_kind": "MqsmlaKernel___call__"}
-    result = replace(members[0], op_id=prefix + ".mqsmla", recipe=RECIPE,
+            "native_kind": LEGACY_NATIVE_KIND if legacy else NATIVE_KIND}
+    result = replace(members[0], op_id=prefix + ".mqsmla",
+                     recipe=LEGACY_RECIPE if legacy else RECIPE,
                      deps=tuple(dict.fromkeys(dep for op in members for dep in op.deps)),
                      semantic_shape=query,
                      local_shape=query,

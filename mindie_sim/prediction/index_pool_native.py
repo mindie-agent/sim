@@ -12,13 +12,23 @@ import math
 
 from mindie_sim.catalog.index_pool import pool_selection
 from mindie_sim.catalog.ops import compute_dtype_for
-from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.common import ModelingError, dtype_bytes
+from .batch_prefix_attention import apply_sparse_prefix_reads
 from .mla_native import index_layer_norm
 from .mechanism import OperatorPlan, PlannedRecipe, Work
 from .sparse_indexer_pipeline import TiledSparseIndexerRecipe
 from .structure_groups import declare_group
 
 IMPLEMENTATION = "vllm_ascend_cann_keypool_caller"
+FP8_INDEX_DTYPE = "fp8_e4m3"
+FP32_BYTES = int(dtype_bytes("fp32"))
+FP8_BYTES = int(dtype_bytes("fp8_e4m3"))
+INT32_BYTES = int(dtype_bytes("int32"))
+INT64_BYTES = int(dtype_bytes("int64"))
+INDEX_POOL_SCALES = 1
+SUPPORTED_INDEX_DTYPES = frozenset({"bf16", FP8_INDEX_DTYPE})
+SUPPORTED_HEAD_WEIGHTS = frozenset({("bf16", "bf16"), ("fp32", "fp32")})
+SUPPORTED_PHASES = frozenset({"decode", "draft"})
 SOURCE = {
     "revision": "c9aebf229e999f54bedf5b0f13f8e3ffd9989e61",
     "path": "vllm_ascend/attention/indexer_kpool.py",
@@ -65,13 +75,22 @@ def prepare_model(model, runtime, binding):
 
 
 def _contract(b, views, plan, quant):
+    weights = compute_dtype_for(b.quant, "indexer.weights")[:2]
     if (not plan.index_kpool_compress or plan.index_kpool <= 1
             or plan.index_input != "hidden" or plan.compress_ratio or plan.qk_rope_head_dim
-            or b.model.activation_dtype != "bf16" or quant.index_dtype != "bf16"
-            or any(v.phase != "decode" or v.q_len < 1 for v in views)
-            or compute_dtype_for(b.quant, "indexer.weights")[:2] != ("fp32", "fp32")):
-        raise ModelingError("native_keypool_caller_requires_bf16_nope_decode_and_fp32_head_weights")
+            or b.model.activation_dtype != "bf16"
+            or quant.index_dtype not in SUPPORTED_INDEX_DTYPES
+            or any(v.phase not in SUPPORTED_PHASES or v.q_len < 1 for v in views)
+            or weights not in SUPPORTED_HEAD_WEIGHTS):
+        raise ModelingError("native_keypool_caller_requires_bf16_nope_decode_and_declared_head_weights")
     return dict(b.model.metadata)["native_keypool_caller"]
+
+
+def _pooled_row_bytes(quant, width):
+    """One quantized pool row: payload plus its declared group scale."""
+    if quant.index_dtype == FP8_INDEX_DTYPE:
+        return width * FP8_BYTES + INDEX_POOL_SCALES * FP32_BYTES
+    return width * int(dtype_bytes(quant.index_dtype))
 
 
 def _common(**facts):
@@ -131,13 +150,17 @@ def producer(b, *, source, views, plan, model, quant, padded_tokens, **options):
                 flops=2 * rows * width * model.hidden_size,
                 read=(rows * model.hidden_size + width * model.hidden_size) * 2,
                 write=rows * width * 2, family="gemm", dtype="bf16", metadata=common)
-            outputs.append(b.vector("cann_keypool_rollback_" + name + "_fp32", (projected,), rows * width, 1,
-                family="cast", dtype="fp32", shape=(rows, width),
-                read_bytes_override=rows * width * 2, write_bytes_override=rows * width * 4,
-                metadata=common))
             if name == "key":
-                outputs[-1] = index_layer_norm(b, source=outputs[-1], rows=rows, width=width,
-                                               input_dtype="fp32", output_dtype="fp32")
+                # ``aclnnLayerNorm`` consumes the BF16 projected key directly
+                # and keeps FP32 accumulation in UB; no external Cast pair.
+                outputs.append(index_layer_norm(
+                    b, source=projected, rows=rows, width=width, native=True))
+            else:
+                outputs.append(b.vector(
+                    "cann_keypool_rollback_" + name + "_fp32", (projected,),
+                    rows * width, 1, family="cast", dtype="fp32",
+                    shape=(rows, width), read_bytes_override=rows * width * 2,
+                    write_bytes_override=rows * width * 4, metadata=common))
         tail_key = outputs[0]
         tail_gate = outputs[1]
         valid_tail_rows = sum(min(v.q_len, retained_width) for v in views)
@@ -147,18 +170,28 @@ def producer(b, *, source, views, plan, model, quant, padded_tokens, **options):
         valid_tail_rows = sum((v.context + v.q_len) % pool for v in views)
         tail_mode = "cann_state_tail"
     deps = (pooled, tail_key, tail_gate) if tail_key else (pooled,)
+    pooled_row = _pooled_row_bytes(quant, width)
+    tail_row_bytes = 2 * width * FP32_BYTES
     stored = b.work("cann_keypool_cache_write", deps, (rows + capacity, width),
-        read=valid_tail_rows * width * 8 + completed * width * 2 + (rows + capacity) * 8,
-        write=valid_tail_rows * width * 8 + completed * width * 2,
-        family="cache_store", dtype="bf16", metadata=common + (
+        read=valid_tail_rows * tail_row_bytes + completed * width * 2
+             + (rows + capacity) * INT64_BYTES,
+        write=valid_tail_rows * tail_row_bytes + completed * pooled_row,
+        family="cache_store", dtype=quant.index_dtype, metadata=common + (
             ("tail_mode", tail_mode), ("tail_launch_rows", rows), ("valid_tail_rows", valid_tail_rows),
             ("pooled_launch_rows", capacity), ("masked_pooled_rows", capacity - completed),
-            ("tail_dtype", "fp32"), ("cache_visible", True)))
+            ("tail_dtype", "fp32"), ("cache_visible", True),
+            ("pooled_row_bytes", pooled_row),
+            ("pooled_payload_bytes", width * int(dtype_bytes(quant.index_dtype))),
+            ("pooled_scale_bytes", INDEX_POOL_SCALES * FP32_BYTES
+             if quant.index_dtype == FP8_INDEX_DTYPE else 0),
+            ("pooled_scale_dtype", "fp32" if quant.index_dtype == FP8_INDEX_DTYPE else "none"),
+            ("cache_dtype", quant.index_dtype)))
     declare_group(b.ops, key=b.prefix + ".key_pool", role="key_pool", family="pooled_indexer",
         members=tuple(op.op_id for op in b.ops[start:]), entries=(gather,), anchor=stored,
         view={"tokens": count, "valid_tokens": sum(v.q_len for v in views), "width": width,
               "pool_size": pool, "completed_pools": completed, "pooled_capacity": capacity,
-              "tail_capacity": declaration["tail_capacity"], "cache_dtype": "bf16", "state_dtype": "fp32"},
+              "tail_capacity": declaration["tail_capacity"],
+              "cache_dtype": quant.index_dtype, "state_dtype": "fp32"},
         implementation={"native_kind": "KeyPool", "conditions": {
             "caller": IMPLEMENTATION, "native_core_schedule": "not_reconstructed"}},
         source=SOURCE, coverage={"kind": "native_caller_analytical_envelopes"})
@@ -166,7 +199,8 @@ def producer(b, *, source, views, plan, model, quant, padded_tokens, **options):
 
 
 def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
-              score_mode="linear_weighted_query", **options):
+              score_mode="linear_weighted_query", hierarchy=None, runtime=None,
+              **options):
     declaration = _contract(b, views, plan, quant)
     if score_mode not in {"linear_weighted_query", "per_head_relu"}:
         raise ModelingError("native_keypool_reference_score_mode_unknown")
@@ -215,20 +249,34 @@ def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
             ("block_table_shape", (batch + 1, columns)), ("key_lengths", "max(original,1); dummy=1"),
             ("copy_grid", max(math.ceil(max((tokens + 1) * heads * width,
                      (batch + 1) * columns) / 8192), math.ceil((batch + 1) / 16)))))
-    flops = 2 * safe_scans * heads * width if score_mode == "per_head_relu" else 0
-    vector = (2 * safe_scans * heads if flops else
-              2 * (tokens + 1) * heads * width + 2 * safe_scans * width)
+    # The KPool score is a real ``[M, width] x [N_pools, width]^T`` matrix
+    # product on the declared cache precision, not vector arithmetic.
+    flops = 2 * safe_scans * heads * width
+    vector = (2 * (tokens + 1) * heads * width + 2 * safe_scans * width)
     vector += safe_scans * math.log2(max(2, plan.index_topk // pool)) + selected * pool * 2
+    pool_row_bytes = _pooled_row_bytes(quant, width)
     indices = _native(b, "cann_pool_key_indexer", (prepared, cache), (tokens + 1, heads, width),
-        kernel="PoolKeyIndexer", family="indexer", dtype="bf16", flops=flops, vector=vector,
-        read=safe_scans * width * 2 + padded_bytes,
-        write=(tokens + 1) * output_width * 4, metadata=common + (
+        kernel="PoolKeyIndexer", family="indexer", dtype=quant.index_dtype,
+        flops=flops, vector=vector,
+        read=safe_scans * pool_row_bytes + padded_bytes,
+        write=(tokens + 1) * output_width * INT32_BYTES, metadata=common + (
             ("output_shape", (tokens + 1, output_width)),
             ("topk_tokens", plan.index_topk), ("native_output", "expanded_token_indices"),
-            ("internal_traffic", "not_reconstructed"), ("cache_reuse", "none_in_reference_envelope")))
+            ("pool_row_bytes", pool_row_bytes), ("score_dtype", quant.index_dtype),
+            ("score_arithmetic", "cube_dot_product_per_query_head"),
+            ("internal_traffic", "not_reconstructed"),
+            ("cache_reuse", "batch_shared_prefix_l2_deduplicated")))
+    if hierarchy is not None and runtime is not None:
+        by_id = {op.op_id: op for op in b.ops}
+        scored = by_id[indices]
+        b.ops[b.ops.index(scored)] = apply_sparse_prefix_reads(
+            scored, views=views, row_bytes=float(pool_row_bytes), runtime=runtime,
+            hierarchy=hierarchy, kv_hbm_bytes=scored.hbm_bytes,
+            kv_mte2_bytes=scored.mte2_bytes)
     packed = b.work("index_topk", (indices,), (tokens, output_width),
-        read=selected * pool * 4 + valid * 8 + tokens * 8,
-        write=tokens * output_width * 4, vector=tokens * output_width,
+        read=selected * pool * INT32_BYTES + valid * INT64_BYTES
+             + tokens * INT64_BYTES,
+        write=tokens * output_width * INT32_BYTES, vector=tokens * output_width,
         family="topk", dtype="int32", metadata=common + (
             ("selection_capacity", output_width), ("selection_output_dtype", "int32"),
             ("selection_layout", "native_token_indices_then_causal_tail; padded_rows_minus_one"),
@@ -237,7 +285,9 @@ def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
         members=tuple(op.op_id for op in b.ops[start:]), entries=(prepared,), anchor=packed,
         view={"tokens": tokens, "valid_tokens": valid, "native_tokens": tokens + 1,
               "heads": heads, "width": width, "pool_size": pool, "output_width": output_width,
-              "query_dtype": "bf16", "cache_dtype": "bf16", "score_mode": score_mode},
+              "query_dtype": "bf16", "cache_dtype": quant.index_dtype,
+              "score_mode": score_mode, "score_dtype": quant.index_dtype,
+              "pool_row_bytes": pool_row_bytes},
         implementation={"native_kind": "PoolKeyIndexer", "conditions": {
             "caller": IMPLEMENTATION, "native_core_schedule": "not_reconstructed"}},
         source=SOURCE, coverage={"kind": "native_caller_analytical_envelopes"})

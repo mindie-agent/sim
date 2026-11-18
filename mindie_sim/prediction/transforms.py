@@ -361,6 +361,17 @@ def activation_quantization(ops, source_dtype):
     return result
 
 
+#: Declared native groups that already own their norm/quantization boundary.
+_OWNED_FUSION_ROLES = ("mla_prolog", "compressor")
+
+
+def _declared_fusion_owns(op):
+    """True when a native group declaration owns this node's boundary."""
+    memberships = dict(op.metadata).get("structure_subgraph_memberships", ())
+    return any(str(key).rsplit(".", 1)[-1] in _OWNED_FUSION_ROLES
+               for key in memberships or ())
+
+
 def _norm_quant_domain(kernels):
     domains = kernels.get("fusion_domains", {})
     if not isinstance(domains, Mapping) or set(domains) - {"norm_quant"}:
@@ -421,6 +432,11 @@ def norm_quant(ops, _, *, consumers=None, external_output="eliminate",
         if (norm is None or norm.plan_required or norm.family != "rmsnorm"
                 or norm.local_shape != op.local_shape or norm.stage != op.stage
                 or norm.stream != op.stream):
+            continue
+        if _declared_fusion_owns(norm) or _declared_fusion_owns(op):
+            # A selected native prolog/compressor plan owns the complete
+            # normalization and quantization boundary; a second generic fusion
+            # would split that boundary and double-charge its intermediate.
             continue
         if op.op_id not in users[norm.op_id]:
             continue

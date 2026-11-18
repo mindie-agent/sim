@@ -251,7 +251,10 @@ def test_r01_retained_output_dtype_shape_and_layout_never_change():
     assert fused_mla.local_shape == (48, 128)
     # The index-key working set is charged once (physical tile union), not once
     # per scored query pair.
-    assert mla.final.hbm_bytes == 332_913_728.0
+    # The 2D q/kv norm producers also read their FP32 gamma/beta parameters;
+    # 26 layers * (512 + 512) elements * 2 B = 53 248 B more than the
+    # 1-D producers that charged no parameter read.
+    assert mla.final.hbm_bytes == 332_966_976.0
     assert mla.baseline.hbm_bytes - mla.final.hbm_bytes == 98_304.0
 
     # Two different retained primary interfaces cannot be represented by one

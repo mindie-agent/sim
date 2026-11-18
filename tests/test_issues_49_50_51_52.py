@@ -679,12 +679,12 @@ def test_mqsmla_rejects_padded_views_and_keeps_padded_tokens():
     padded = (RequestView("r", 4, 128, False, "decode", padding=True),)
     assert unsupported_reason(
         views=padded, plan=plan, parallel=parallel, model=case.model,
-        padded_tokens=4) == "mqsmla_binding_requires_contiguous_unpadded_decode_rows"
+        padded_tokens=4) == "mqsmla_binding_requires_contiguous_unpadded_decode_or_draft_rows"
     split = (RequestView("r", 4, 128, False, "decode",
                          query_ranges=((0, 2), (2, 4))),)
     assert unsupported_reason(
         views=split, plan=plan, parallel=parallel, model=case.model,
-        padded_tokens=4) == "mqsmla_binding_requires_contiguous_unpadded_decode_rows"
+        padded_tokens=4) == "mqsmla_binding_requires_contiguous_unpadded_decode_or_draft_rows"
     # A wider physical capture bucket is admitted; a narrower one is not.
     contiguous = (RequestView("r", 4, 128, True, "decode"),)
     assert unsupported_reason(

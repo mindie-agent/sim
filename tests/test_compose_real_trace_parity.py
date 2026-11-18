@@ -26,7 +26,9 @@ from mindie_sim.prediction.structure import parse_case
 from mindie_sim.structure import export_structure
 
 SKUS = ("a2", "a3", "a5")
-MQSMLA_NATIVE = "MqsmlaKernel___call__"
+#: CANN 9.2.1 official mixed-quant sparse MLA native kind.
+MQSMLA_NATIVE = "aclnnMixedQuantSparseFlashMla"
+LEGACY_MQSMLA_NATIVE = "MqsmlaKernel___call__"
 SHARED_KV_NATIVE = "SparseAttnSharedkv"
 SPARSE_MLA_NATIVE = "SparseFlashMla"
 MIXED_QUANT_NATIVE = "MixedQuantSparseFlashMla"

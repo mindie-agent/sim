@@ -93,6 +93,12 @@ def draft_program(frontend, model, runtime, views, ready, *, global_views=None, 
         draft_model = replace(draft_model, kv_dtype="bf16", metadata=tuple(metadata.items()))
     regions, previous = [], ready
     stage = runtime.parallel.pp - 1
+    # ``index_share_for_mtp_iteration`` reuses one TopK selection across the
+    # autoregressive proposal steps while every step still updates its own
+    # KPool cache row.  ``mtp_topks`` carries step 0's op ids into later steps.
+    share_selection = bool(draft.index_share_for_mtp_iteration and serial
+                           and draft.attention_kind == "mla")
+    mtp_topks: dict[int, str] = {}
     # Feature projection shards its output; the draft body consumes a complete
     # hidden vector, so TP must gather before entering the first layer.
     tp = runtime.parallel.tp
@@ -188,13 +194,15 @@ def draft_program(frontend, model, runtime, views, ready, *, global_views=None, 
             body_ready = prepare(
                 ops, projection=projection, model=draft_model, draft=draft,
                 rows=feature_rows, query_rows=rows, prefix=prefix,
-                stage=stage, requests=requests)
+                stage=stage, requests=requests, parallel=runtime.parallel)
         body, previous = frontend.body(
             draft_model, selected_runtime, proposal_views, prefix=prefix,
             ready=body_ready,
             tokens=rows, mode="draft_prefill" if prefill else "draft",
             stages=(stage,) * draft.layers, global_tokens=global_tokens, replica=replica,
             machine=machine,
+            topk_scope=mtp_topks if (share_selection and not prefill) else None,
+            reuse_index_selection=bool(share_selection and not prefill and step > 0),
         )
         ops.extend(body)
         if prefill:

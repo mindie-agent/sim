@@ -17,7 +17,17 @@ from .mechanism import OperatorPlan, Work
 from .program import KernelProgram, ParallelProgram, PipelineProgram, Stage
 from .instructions import PrimitiveInventory
 
+#: CANN 9.2.1 official source (`aclnnMixedQuantSparseFlashMla`).
 SOURCE = {
+    "repository": "vllm-ascend",
+    "base_revision": "nightly-ci-main-a5-openeuler-cann9.2.1-20261111",
+    "source_state": "committed",
+    "path": "vllm_ascend/attention/mixed_quant_sparse_flash_mla.py",
+    "symbol": "mixed_quant_sparse_flash_mla",
+    "scope": "independent_source_semantics; not_capture_binary_identity",
+}
+#: Retained prototype alias; explicit selection keeps its own guard rails.
+LEGACY_SOURCE = {
     "repository": "cannbot-dsl",
     "revision": "4519e5372a8b9306f7d823688c0cb8141ee34fb1",
     "kernel": {
@@ -30,6 +40,11 @@ SOURCE = {
     },
     "capture_binary_identity": "not_established",
 }
+RECIPE = "aclnn_mixed_quant_sparse_flash_mla"
+LEGACY_RECIPE = "cannbot_mixed_quant_sparse_flash_mla"
+NATIVE_KIND = "aclnnMixedQuantSparseFlashMla"
+LEGACY_NATIVE_KIND = "MqsmlaKernel___call__"
+SUPPORTED_PHASES = frozenset({"decode", "draft"})
 
 # Source Channel depths. BF16 output aliases the FP32 accumulator. The P NZ
 # buffers include one 16-element pad per N1 face; all scalar state is FP32.
@@ -46,6 +61,12 @@ DEFAULT_MQSMLA_HEADS = 64
 MQSMLA_HEAD_WIDTH = 512
 MQSMLA_ROPE_WIDTH = 64
 CUBE_HEAD_TILE_ALIGN = 16
+#: Source scalar address prepass: eight 16-row subtiles, one 512-element row
+#: pair of GM reads, and four scalar-ALU issues per address row.
+ADDRESS_SUBTILES_PER_TILE = 8
+ADDRESS_ROWS_PER_SUBTILE = 16
+ADDRESS_SCALAR_READS = 2
+ADDRESS_SCALAR_ALU_ISSUES = 4
 MIN_PADDED_LOCAL_HEADS = 8
 HEAD_GROUP_START = 0
 # Packed row widths: FP8 values plus one BF16 scale per 32 values, and two FP4
@@ -257,6 +278,8 @@ class OwnerTiles:
 def build(op, geometry):
     shape = dict(op.metadata)["mqsmla_geometry"]
     requested = str(shape.get("addressing", "scalar"))
+    implementation = str(shape.get("implementation", RECIPE))
+    legacy = implementation == LEGACY_RECIPE
     heads = int(shape["heads"])
     if (not supported_heads(heads) or shape["width"] != MQSMLA_HEAD_WIDTH
             or shape["metadata_support_fd"]):
@@ -274,9 +297,9 @@ def build(op, geometry):
     cores = geometry.compute_units
     if not rows or not 1 <= cores <= MAX_MQSMLA_AIC_CORES:
         raise ModelingError("mqsmla_requires_positive_rows_and_at_most36_aic")
-    # Retained wrapper SELECTIVE_FD_72 supersedes SUPPORT_FD=False for this
-    # one geometry; do not silently price its split reduction as whole rows.
-    if selective_fd_excluded(cores, rows):
+    # The retired ``cannbot-dsl`` wrapper's SELECTIVE_FD_72 split reduction is
+    # not the official CANN program. Keep the guard only for its explicit alias.
+    if legacy and selective_fd_excluded(cores, rows):
         raise ModelingError("mqsmla_selective_72_row_fd_branch_not_modeled")
     head_groups = tuple(min(DEFAULT_MQSMLA_HEADS, heads - start)
                         for start in range(HEAD_GROUP_START, heads, DEFAULT_MQSMLA_HEADS))
@@ -365,17 +388,21 @@ def build(op, geometry):
                                      for owner, stream, head_counts in streams))
 
     return OperatorPlan(total, program, {
-        "source_execution_domain": "mixed", "source_program": SOURCE,
+        "source_execution_domain": "mixed",
+        "source_program": LEGACY_SOURCE if legacy else SOURCE,
+        "native_kind": LEGACY_NATIVE_KIND if legacy else NATIVE_KIND,
         "mqsmla_owner_ranges": ownership, "mqsmla_buffers_per_owner": BUFFERS,
         "mqsmla_schedule": "whole_query_rows;metadata_SUPPORT_FD_false;two_live_phase_tiles",
         "mqsmla_approximation": "coarse_source_phase_DAG;register_operations_not_instruction_latency",
         "mqsmla_addressing": addressing,
         "address_schedule": {
-            "subtiles_per_tile": 8, "rows_per_subtile": 16,
-            "scalar_reads_bytes": 2 * 512,
+            "subtiles_per_tile": ADDRESS_SUBTILES_PER_TILE,
+            "rows_per_subtile": ADDRESS_ROWS_PER_SUBTILE,
+            "scalar_reads_bytes": ADDRESS_SCALAR_READS * MQSMLA_HEAD_WIDTH,
             "primitives": PrimitiveInventory({
-                "scalar_gm_access": 2 * 128,
-                "scalar_alu_issue": 4 * 128,
+                "scalar_gm_access": ADDRESS_SCALAR_READS * PHYSICAL_KV_TILE_ROWS,
+                "scalar_alu_issue": (ADDRESS_SCALAR_ALU_ISSUES
+                                     * PHYSICAL_KV_TILE_ROWS),
             }).to_dict(("hbm", "mte2_aiv", "vector", "mte3")),
         },
         "unmodeled_source_features": ["aicpu_metadata_program",

@@ -130,12 +130,18 @@ def test_external_draft_context_rows_are_distinct_from_query_rows():
     ops = [op for region in regions for op in region.ops]
     features = next(op for op in ops if op.recipe == "draft_features")
     assert features.local_shape[0] == 4
-    context = [op for op in ops if op.recipe == "draft_context_qkv_a"]
+    context = [op for op in ops if op.recipe == "draft_context_mla_prolog_v3"]
     assert len(context) == 5
-    assert all(op.local_shape == (4, 1536 + 576, 7168) for op in context)
-    stores = [op for op in ops if op.recipe == "draft_context_store"]
+    assert all(op.local_shape == (4, 1536 + 576) for op in context)
+    assert all(dict(op.metadata)["native_kind"] == "aclnnMlaPrologV3WeightNz"
+               for op in context)
+    stores = [op for op in ops if op.recipe == "draft_context_kv_scatter"]
+    cp = max(1, c.runtime.parallel.cp)
     assert len(stores) == 5
-    assert all(op.mte3_bytes == 4 * 1152 for op in stores)
+    assert all(op.local_shape[0] == -(-4 // cp) for op in stores)
+    assert all(op.mte3_bytes == -(-4 // cp) * 1152 for op in stores)
+    assert all(dict(op.metadata)["native_kind"] == "aclnnScatterPaKvCache"
+               for op in stores)
     embedding = next(op for op in ops if op.recipe == "draft_query_embedding")
     assert embedding.mte3_bytes == 3 * 7168 * 2
     assert not any(op.family == "indexer" for op in ops)

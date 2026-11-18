@@ -8,8 +8,13 @@
 """
 import math
 
-MQSMLA_RECIPE = "cannbot_mixed_quant_sparse_flash_mla"
-MQSMLA_NATIVE_KIND = "MqsmlaKernel___call__"
+#: CANN 9.2.1 official mixed-quant sparse MLA plus its retained prototype alias.
+MQSMLA_RECIPE = "aclnn_mixed_quant_sparse_flash_mla"
+MQSMLA_NATIVE_KIND = "aclnnMixedQuantSparseFlashMla"
+LEGACY_MQSMLA_RECIPE = "cannbot_mixed_quant_sparse_flash_mla"
+LEGACY_MQSMLA_NATIVE_KIND = "MqsmlaKernel___call__"
+MQSMLA_RECIPES = frozenset({MQSMLA_RECIPE, LEGACY_MQSMLA_RECIPE})
+MQSMLA_NATIVE_KINDS = frozenset({MQSMLA_NATIVE_KIND, LEGACY_MQSMLA_NATIVE_KIND})
 MIXED_QUANT_NATIVE_KIND = "MixedQuantSparseFlashMla"
 SPARSE_FLASH_ATTENTION_NATIVE = "SparseFlashAttention"
 SPARSE_MLA_NATIVE_KIND = "SparseFlashMla"
@@ -311,8 +316,9 @@ def _mqsmla_attention_contract(op, view):
         return None
     meta = op["metadata"]
     binding = meta.get("implementation_binding", {})
-    if (meta.get("native_kind") != MQSMLA_NATIVE_KIND
-            or binding.get("implementation") != MQSMLA_RECIPE
+    native_kind = meta.get("native_kind")
+    if (native_kind not in MQSMLA_NATIVE_KINDS
+            or binding.get("implementation") not in MQSMLA_RECIPES
             or binding.get("capture_binary_identity") != "not_established"
             or op.get("source_boundary") != "kernel"):
         return None
@@ -333,7 +339,7 @@ def _mqsmla_attention_contract(op, view):
         compressed = (((1, MQSMLA_COMPRESSED_ROW_BYTES), MQSMLA_CACHE_DTYPE, "ND"))
     query = (shape, "bf16", "ND")
     return (
-        "sparse_attention_active", MQSMLA_NATIVE_KIND, (query,),
+        "sparse_attention_active", native_kind, (query,),
         (((1, MQSMLA_WINDOW_ROW_BYTES), MQSMLA_CACHE_DTYPE, "ND"), compressed),
         query,
     )
@@ -342,7 +348,7 @@ def _mqsmla_attention_contract(op, view):
 def attention_contract(op):
     """Source-declared dense or paged tensors, not the entire native ABI."""
     view = op["metadata"].get("attention_tensor_view")
-    if op.get("recipe") == MQSMLA_RECIPE:
+    if op.get("recipe") in MQSMLA_RECIPES:
         return _mqsmla_attention_contract(op, view)
     if op.get("recipe") == "vllm_ascend_sharedkv_scfa":
         return _scfa_attention_contract(op, view)

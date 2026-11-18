@@ -113,11 +113,16 @@ def test_catalog_pool_cache_keeps_full_token_kv_and_real_gate_parameters():
     assert terms['indexer_pool_gate'].rows == 128
     assert terms['indexer_pool_gate'].cols == parsed.model.hidden_size
     assert terms['indexer_pool_ape'].rows == 4
-    for name, width in (('indexer_wk', 128), ('indexer_weights', 32), ('indexer_pool_gate', 128)):
+    # Head weights keep the checkpoint's BF16 representation; only the retained
+    # analytic K/gate joint projection prepares FP32 runtime copies.
+    for name, width in (('indexer_wk', 128), ('indexer_pool_gate', 128)):
         original, prepared = terms[name], terms[name + '_prepared_fp32']
         assert term_bytes(original, parsed.model.quant, parsed.runtime.parallel) == width * 4096 * 2
         assert term_bytes(prepared, parsed.model.quant, parsed.runtime.parallel) == width * 4096 * 4
         assert term_bytes(prepared, parsed.model.quant, parsed.runtime.parallel, source=True) == 0
+    assert 'indexer_weights_prepared_fp32' not in terms
+    assert term_bytes(terms['indexer_weights'], parsed.model.quant,
+                      parsed.runtime.parallel) == 32 * 4096 * 2
 
 
 @pytest.mark.parametrize('raw_eager', [False, True])
@@ -177,22 +182,24 @@ def test_4k_to_131201_changes_scan_work_but_not_the_2048_token_history_budget():
     assert hi['index_pool_scores'].vector_ops > 31 * lo['index_pool_scores'].vector_ops
 
 
-def test_source_fp32_projections_share_hidden_cast_and_fused_key_weight_output():
+def test_bf16_head_weights_keep_the_checkpoint_projection_boundary():
     ops = {op.recipe: op for op in layer(case())}
-    projected = ops['index_k_weights']; gate = ops['index_pool_gate']
-    assert projected.local_shape == (6, 160, 4096)
-    assert projected.dtype == gate.dtype == 'fp32'
-    assert projected.deps == gate.deps == (ops['index_pool_hidden_fp32'].op_id,)
-    assert dict(projected.metadata)['packed_weight_bytes'] == 160 * 4096 * 4
-    assert ops['index_norm'].deps == (projected.op_id,)
+    # ``indexer.weights`` stays BF16: the analytic fallback no longer fabricates
+    # an FP32 head-weight copy, so the joint K/weights projection splits.
+    assert 'index_k_weights' not in ops
+    key, gate, weights = ops['index_k'], ops['index_pool_gate'], ops['index_weights']
+    assert key.local_shape == (6, 128, 4096) and key.dtype == 'fp32'
+    assert gate.local_shape == (6, 128, 4096) and gate.dtype == 'fp32'
+    assert weights.local_shape == (6, 32, 4096) and weights.dtype == 'bf16'
+    assert key.deps == gate.deps == (ops['index_pool_hidden_fp32'].op_id,)
+    # Only the FP32 K/gate operands consume the shared hidden cast.
+    assert weights.deps[0] != key.deps[0]
+    assert dict(key.metadata)['packed_weight_bytes'] == 128 * 4096 * 4
+    assert ops['index_norm'].deps == (key.op_id,)
     assert ops['index_norm'].mte2_bytes == (6 + 2) * 128 * 4
     assert 'index_norm_input_fp32' not in ops
-    assert 'index_weights_input_cast' not in ops
-    assert 'index_weights' not in ops
-    weights = ops['index_weights_cast']
-    assert weights.deps == (projected.op_id,)
-    assert weights.mte2_bytes == 6 * 32 * 4
-    assert dict(weights.metadata)['input_column_slice'] == (128, 160)
+    assert 'index_weights_input_cast' not in ops and 'index_weights_cast' not in ops
+    assert ops['index_weights_scale'].deps == (weights.op_id,)
     assert ops['index_pool_weighted_query'].deps == (
         ops['index_pool_query_fp32'].op_id, ops['index_pool_weights_fp32'].op_id)
 
@@ -218,9 +225,10 @@ def test_declared_per_head_alternative_keeps_pool_scan_and_token_selection():
 def test_graph_padding_preserves_projection_capacity_without_fake_pool_writes():
     ops = {op.recipe: op for op in layer(case(), batch=3)}
     # The retained graph buckets pad 18 valid target queries to 24 rows.
-    for name in ('index_pool_hidden_fp32', 'index_k_weights', 'index_pool_gate',
-                 'index_norm', 'index_weights_cast', 'index_pool_query_fp32',
-                 'index_pool_weighted_query', 'index_topk'):
+    for name in ('index_pool_hidden_fp32', 'index_k', 'index_pool_gate',
+                 'index_norm', 'index_weights', 'index_weights_scale',
+                 'index_pool_query_fp32', 'index_pool_weighted_query',
+                 'index_topk'):
         assert ops[name].local_shape[0] == 24
     metadata = dict(ops['index_pool_scores'].metadata)
     assert metadata['valid_query_rows'] == 18

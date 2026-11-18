@@ -252,7 +252,8 @@ class Frontend:
              routing_global_tokens=None, routing_views=None,
              physical_rank=None, query_position=None,
              include_recover_commits: bool = False, machine=None,
-             dbo_partition: int | None = None, layer_limit: int | None = None):
+             dbo_partition: int | None = None, layer_limit: int | None = None,
+             topk_scope=None, reuse_index_selection: bool = False):
         p = runtime.parallel
         if layer_limit is not None:
             limit = max(ONE, int(layer_limit))
@@ -263,6 +264,10 @@ class Frontend:
             from .physical_recipe_registry import COLLECTIVE_FAMILIES
             regions = build_microbatch_regions(
                 views, policy=MicrobatchPolicy(count=MIN_DBO_MICROBATCHES))
+            if len(regions) > ONE and reuse_index_selection:
+                # A shared TopK selection is one per proposal step; splitting
+                # that step into independent microbatches has no single owner.
+                raise ModelingError("mtp_shared_index_selection_requires_single_microbatch")
             if len(regions) > ONE:
                 merged, previous_partition_attention = [], None
                 for region in regions:
@@ -329,6 +334,9 @@ class Frontend:
                 ops.append(shard)
                 previous = shard.op_id
         caches, indices, topks, candidates = {}, {}, {}, {}
+        if topk_scope is not None:
+            # Reuse a TopK selection produced by an earlier proposal step.
+            topks = topk_scope
         residual_sources = []
         attnres = (family_attnres.selection(
             runtime, model=model, phase=mode)
@@ -392,6 +400,9 @@ class Frontend:
                             dtype=model.activation_dtype)
                         ops.extend(_scope((sliced,), "attention"))
                         attention_ready = sliced.op_id
+                selection_kwargs = (
+                    {"reuse_index_selection": True, "shared_topk": topks}
+                    if reuse_index_selection and layer.attention == "mla" else {})
                 attention = self.attention[layer.attention](
                     prefix=name, plan=layer, views=views, stage=stage, deps=attention_ready,
                     model=model, parallel=p, quant=model.quant, mode=mode,
@@ -400,6 +411,7 @@ class Frontend:
                     candidate_ids=candidates, stage_of=lambda layer: stages[layer],
                     cp_interleave_size=runtime.kv_block_size, runtime=runtime,
                     policy=self.attention_policy, machine=machine,
+                    **selection_kwargs,
                 )
                 if sp:
                     attention_ops, attention_last = sequence_parallel.close_output(

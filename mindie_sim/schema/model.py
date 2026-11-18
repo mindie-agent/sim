@@ -53,6 +53,9 @@ class MlaSpec:
     index_n_heads: int = 0
     compress_ratio: int = 0
     sliding_window: int = 0
+    #: Declared NoPE geometry: ``qk_rope_head_dim`` is a learned positional
+    #: tail that stays inside the KV cache row while no rotary operator runs.
+    mla_use_nope: bool = False
 
     @classmethod
     def from_mapping(cls, value: Any) -> "MlaSpec":
@@ -60,7 +63,7 @@ class MlaSpec:
         allowed = {"q_lora_rank", "kv_lora_rank", "qk_nope_head_dim", "qk_rope_head_dim", "v_head_dim",
                    "qk_head_dim",
                    "o_lora_rank", "o_groups", "index_topk", "index_head_dim", "index_n_heads",
-                   "compress_ratio", "sliding_window"}
+                   "compress_ratio", "sliding_window", "mla_use_nope"}
         _unknown(raw, allowed, "model.mla")
         result = cls(
             q_lora_rank=_int(raw.get("q_lora_rank") or 0, "model.mla.q_lora_rank_invalid", minimum=0),
@@ -75,6 +78,7 @@ class MlaSpec:
             index_n_heads=_int(raw.get("index_n_heads", 0), "model.mla.index_n_heads_invalid", minimum=0),
             compress_ratio=_int(raw.get("compress_ratio", 0), "model.mla.compress_ratio_invalid", minimum=0),
             sliding_window=_int(raw.get("sliding_window", 0), "model.mla.sliding_window_invalid", minimum=0),
+            mla_use_nope=bool(raw.get("mla_use_nope", False)),
         )
         # ``to_dict`` emits the derived QK width for readers that consume the
         # exported representation.  It is not an independent input: if a
@@ -155,6 +159,9 @@ class LayerPlan:
     mla_variant: str = "none"           # none | latent_mqa | latent_mla
     mla_output_gate: bool = False
     mla_qkv_a_gate_fused: bool = False
+    #: Declared NoPE MLA layer.  ``qk_rope_head_dim`` may stay positive as a
+    #: learned positional tail; it never selects a rotary operator then.
+    mla_use_nope: bool = False
     #: Declared Q output-gate shape.  ``None`` means the legacy boolean was
     #: supplied; ``__post_init__`` resolves it to a canonical kind.
     q_output_gate: bool = False
@@ -279,6 +286,15 @@ class LayerPlan:
     @property
     def indexer_executes(self) -> bool:
         return bool(self.indexer)
+
+    @property
+    def mla_do_rope(self) -> bool:
+        """One predicate for a declared rotary tail.
+
+        A zero rope width has nothing to rotate; a declared NoPE checkpoint
+        keeps its learned tail in the cache row but executes no rotary kernel.
+        """
+        return bool(self.qk_rope_head_dim > 0 and not self.mla_use_nope)
 
     @property
     def cache_row_elements(self) -> int:

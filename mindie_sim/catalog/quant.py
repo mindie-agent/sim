@@ -47,9 +47,12 @@ def projection_quant(quant: QuantSpec, plan) -> QuantSpec:
         if plan.attention == "mla":
             defaults["indexer_fp8"] = fields
     if plan.index_kpool > ONE and plan.attention != "gqa":
-        # KPool caches FP32 copies and casts hidden once before both F.linear
-        # calls. Query projection still uses its independent native format.
-        for category in ("indexer.weights", "indexer.pool_projection", "indexer.pool_gate"):
+        # The retained analytic fallback casts hidden once and keeps its own
+        # FP32 K/gate copies.  ``indexer.weights`` is deliberately *not* in
+        # this set: the checkpoint stores BF16 head weights and both the native
+        # CANN callers and the generic projection consume them directly, so a
+        # synthesised ``_prepared_fp32`` copy would be a fabricated parameter.
+        for category in ("indexer.pool_projection", "indexer.pool_gate"):
             defaults[category] = {"weight_format": "fp32", "activation_format": "fp32"}
     explicit = {key: dict(value) for key, value in quant.category_overrides}
     # Apply explicit ancestors after *all* source defaults: an explicit

@@ -268,11 +268,16 @@ def _compressor_terms(plan, model):
     if not plan.owns_long_kv or not plan.compress_ratio:
         return []
     d = plan.head_dim * plan.compressor_width
-    return [_t("compressor_wkv", d, model.hidden_size, "compressor_bf16_runtime"),
-            _t("compressor_gate", d, model.hidden_size, "compressor_bf16_runtime"),
-            _t("compressor_ape", plan.compress_ratio, d, "ape"),
-            _t("compressor_norm", plan.head_dim, 1,
-               "compressor_fp32_runtime" if plan.compressor_norm_dtype == "fp32" else "norm")]
+    terms = [_t("compressor_wkv", d, model.hidden_size, "compressor_bf16_runtime")]
+    if plan.compress_ratio > ONE:
+        # A C1 layer has no gated pooling: ``wgate`` and its APE parameters do
+        # not exist in the checkpoint and must not be priced.
+        terms.extend([_t("compressor_gate", d, model.hidden_size,
+                         "compressor_bf16_runtime"),
+                      _t("compressor_ape", plan.compress_ratio, d, "ape")])
+    terms.append(_t("compressor_norm", plan.head_dim, 1,
+                    "compressor_fp32_runtime" if plan.compressor_norm_dtype == "fp32" else "norm"))
+    return terms
 
 
 def _attention_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:

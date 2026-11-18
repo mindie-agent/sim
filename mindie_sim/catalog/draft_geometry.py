@@ -110,6 +110,11 @@ def _draft_layer_plan(model, draft, index: int, plan_fields: dict) -> LayerPlan:
     qk_norm = bool(draft.qk_norm or (ref.qk_norm if ref else False))
     q_gate = bool(draft.q_output_gate or (ref.q_output_gate if ref else False))
     mla_gate = bool(ref.mla_output_gate) if ref else False
+    # A draft block executes the target's MLA subgraph.  Its fused QKV-A
+    # projection and NoPE declaration are properties of that subgraph, not of
+    # the draft's own short declaration.
+    packed_input = bool(ref.packed_input_projection) if ref else False
+    mla_use_nope = bool(ref.mla_use_nope) if ref else False
 
     swa_only = (
         explicit_ratio == ZERO
@@ -131,6 +136,7 @@ def _draft_layer_plan(model, draft, index: int, plan_fields: dict) -> LayerPlan:
             moe_intermediate_size=draft.expert_intermediate_size, scope="draft",
             noncausal_attention=draft.noncausal_query_block,
             mla_variant=draft.mla_variant, mla_output_gate=mla_gate,
+            mla_use_nope=mla_use_nope, packed_input_projection=packed_input,
             kv_cache_elements=kv_elems, qk_norm=qk_norm, q_output_gate=q_gate,
             cache_kind=cache_kind, window=window, kv_owner_layer_id=LAST, owns_long_kv=False,
             compress_ratio=ZERO, compressor_kind="none", compressor_width=ONE, compressor_state_rows=ZERO,
@@ -156,6 +162,7 @@ def _draft_layer_plan(model, draft, index: int, plan_fields: dict) -> LayerPlan:
             moe_intermediate_size=draft.expert_intermediate_size, scope="draft",
             noncausal_attention=draft.noncausal_query_block,
             mla_variant=draft.mla_variant, kv_cache_elements=kv_elems,
+            mla_use_nope=mla_use_nope, packed_input_projection=packed_input,
             qk_norm=qk_norm, q_output_gate=q_gate,
             cache_kind=standalone_ck, window=standalone_win,
             compress_ratio=standalone_comp,
@@ -180,14 +187,19 @@ def _draft_layer_plan(model, draft, index: int, plan_fields: dict) -> LayerPlan:
         moe_intermediate_size=draft.expert_intermediate_size, scope="draft",
         noncausal_attention=draft.noncausal_query_block,
         mla_variant=draft.mla_variant, mla_output_gate=mla_gate,
+        mla_use_nope=mla_use_nope, packed_input_projection=packed_input,
         kv_cache_elements=kv_elems, qk_norm=qk_norm, q_output_gate=q_gate,
         cache_kind=ref.cache_kind, window=window,
         kv_owner_layer_id=index if owns_long else LAST, owns_long_kv=owns_long,
         compress_ratio=ref.compress_ratio, compressor_kind=ref.compressor_kind,
         compressor_width=ref.compressor_width, compressor_state_rows=ref.compressor_state_rows,
         indexer=has_indexer, indexer_type=indexer_type,
-        owns_index_k=bool(has_indexer and not share_index_k),
-        index_k_owner_layer_id=(index if (has_indexer and not share_index_k) else LAST),
+        # ``index_share_for_mtp_iteration`` reuses one TopK selection across
+        # autoregressive proposal steps.  Every step still updates its own
+        # KPool cache row, so the producer stays owned by each draft plan; the
+        # selection reuse is a per-step execution decision in ``speculation``.
+        owns_index_k=bool(has_indexer),
+        index_k_owner_layer_id=(index if has_indexer else LAST),
         owns_topk=has_indexer, topk_owner_layer_id=(index if has_indexer else LAST),
         index_query_per_layer=bool(ref.index_query_per_layer) if has_indexer else False,
         index_heads=ref.index_heads if has_indexer else ZERO,
@@ -215,8 +227,9 @@ _DRAFT_PLAN_FIELDS = (
 
 
 _INHERITED_ROUTER_FIELDS = (
-    "router_mode", "router_dtype", "router_norm_topk", "router_groups",
-    "router_group_topk", "router_noaux_tc", "routed_scaling_factor",
+    "router_mode", "router_dtype", "router_output_dtype", "router_norm_topk",
+    "router_groups", "router_group_topk", "router_noaux_tc",
+    "router_precast_weight_copy", "routed_scaling_factor",
     "ffn_activation", "swiglu_limit", "swiglu_shared_limit",
     "swiglu_alpha", "swiglu_beta",
 )

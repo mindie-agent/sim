@@ -13,6 +13,23 @@ from math import ceil
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 
 
+#: NoPE C8 block-quantized MLA cache: one FP8 row split into 128-element
+#: scale groups.  A 512-element latent therefore stores ``512 B`` of payload
+#: plus four FP16 scales (``8 B``) = ``520 B`` per row.
+NOPE_BLOCK_QUANT_TILE = 128
+NOPE_BLOCK_PAYLOAD_DTYPE = "fp8_e4m3"
+NOPE_BLOCK_SCALE_DTYPE = "fp16"
+
+
+def block_quantized_mla_format(tile=NOPE_BLOCK_QUANT_TILE):
+    """Declared C8 NoPE row format shared by capacity, store and attention."""
+    return CacheFormat(NOPE_BLOCK_PAYLOAD_DTYPE, tile, NOPE_BLOCK_SCALE_DTYPE)
+
+
+def block_quantized_row_bytes(width, tile=NOPE_BLOCK_QUANT_TILE):
+    return block_quantized_mla_format(tile).row_bytes(width)
+
+
 def payload_bytes(dtype):
     # Packed cache storage does not imply a native FP4 matrix compute peak.
     return 0.5 if dtype == "fp4_e2m1" else dtype_bytes(dtype)

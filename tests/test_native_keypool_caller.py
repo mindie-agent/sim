@@ -37,11 +37,14 @@ def test_native_q6_call_shapes_capacity_and_separate_projection_formats(batch):
     assert i['output_shape'] == (batch * 6 + 1, 2051)
     assert dict(ops['cann_keypool_nonempty_inputs'].metadata)['block_table_shape'] == (batch + 1, 8195)
     assert ops['index_weights'].local_shape == (batch * 6, 32, 4096)
-    assert ops['index_weights'].dtype == 'fp32'
-    assert ops['index_weights'].deps == (ops['index_weights_input_cast'].op_id,)
-    assert ops['index_weights_cast'].mte2_bytes == batch * 6 * 32 * 4
-    assert ops['index_weights_scale'].op_id in ops['cann_keypool_state_gather'].deps
-    assert list(ops).index('index_weights_scale') < list(ops).index('cann_key_pool')
+    # The checkpoint head weights stay BF16: no eager input/payload Cast and no
+    # synthesised FP32 runtime copy feeds ``aclnnPoolKeyIndexer``.
+    assert ops['index_weights'].dtype == 'bf16'
+    assert not {'index_weights_input_cast', 'index_weights_cast',
+                'index_weights_scale', 'index_weights_fp32',
+                'index_weights_fp16'} & set(ops)
+    assert ops['index_weights'].op_id in ops['cann_keypool_state_gather'].deps
+    assert list(ops).index('index_weights') < list(ops).index('cann_key_pool')
     assert dict(ops['index_topk'].metadata)['selected_token_rows'] == batch * (6 * 2048 + 11)
     assert not dict(ops['index_topk'].metadata)['pool_id_expansion_in_adapter']
     attention = next(op for op in ops.values() if op.family == 'attention')
@@ -68,8 +71,15 @@ def test_lookahead_reprojection_preserves_retained_window_and_cache_residency():
     assert write['masked_pooled_rows'] == 10 - 4
     assert rollback['cann_keypool_rollback_key'].local_shape == (24, 128, 4096)
     assert rollback['cann_keypool_rollback_gate'].local_shape == (24, 128, 4096)
-    assert rollback['cann_keypool_rollback_key_fp32'].mte2_bytes == 24 * 128 * 2
-    assert rollback['index_norm'].deps == (rollback['cann_keypool_rollback_key_fp32'].op_id,)
+    # ``aclnnLayerNorm`` reads the BF16 projected key and FP32 gamma/beta in
+    # one kernel; no ``index_norm_input_fp32``/``index_norm_output_cast`` pair.
+    assert 'cann_keypool_rollback_key_fp32' not in rollback
+    assert 'index_norm_input_fp32' not in rollback
+    assert 'index_norm_output_cast' not in rollback
+    assert rollback['index_norm'].deps == (rollback['cann_keypool_rollback_key'].op_id,)
+    assert rollback['index_norm'].dtype == 'bf16'
+    assert rollback['index_norm'].mte2_bytes == 24 * 128 * 2 + 2 * 128 * 4
+    assert dict(rollback['index_norm'].metadata)['native_kind'] == 'aclnnLayerNorm'
     assert dict(ordinary['cann_keypool_cache_write'].metadata)['tail_mode'] == 'cann_state_tail'
     assert dict(ordinary['cann_keypool_cache_write'].metadata)['valid_tail_rows'] == 4 * 3
     parsed = parse_case(native_case())
@@ -77,9 +87,10 @@ def test_lookahead_reprojection_preserves_retained_window_and_cache_residency():
     cache = layer_cache_components(parsed.model, plan, parsed.runtime.parallel, 131201)
     assert cache['index_pool_tail'] == 9 * 2 * 128 * 4
     terms = {t.name: t for t in layer_weight_terms(plan, parsed.model)}
-    assert term_bytes(terms['indexer_weights_prepared_fp32'], parsed.model.quant,
-                      parsed.runtime.parallel) == 32 * 4096 * 4
-    assert not any(name.startswith(('indexer_wk_prepared_', 'indexer_pool_gate_prepared_')) for name in terms)
+    # Native CANN keeps every declared BF16 checkpoint parameter in place.
+    assert not any(name.endswith('_prepared_fp32') for name in terms)
+    assert term_bytes(terms['indexer_weights'], parsed.model.quant,
+                      parsed.runtime.parallel) == 32 * 4096 * 2
 
 
 def test_native_boundaries_accept_explicit_joint_service_without_fitting_body_or_adapters():
@@ -115,7 +126,7 @@ def test_complete_native_caller_executes_after_inputs_and_keeps_cache_to_selecti
     report = graph_costs(raw, ops, isolated=False, input_ready_ms=7,
                          external_inputs={dep: 7 for op in ops for dep in op.deps if dep not in ids})
     rows = {row['op_id'].rsplit('.', 1)[-1]: row for row in report['timeline']}
-    assert rows['cann_key_pool']['ready_ms'] >= rows['index_weights_scale']['complete_ms']
+    assert rows['cann_key_pool']['ready_ms'] >= rows['index_weights']['complete_ms']
     assert rows['cann_pool_key_indexer']['ready_ms'] >= rows['cann_keypool_cache_write']['complete_ms']
     assert rows['index_topk']['ready_ms'] >= rows['cann_pool_key_indexer']['complete_ms']
     assert report['execution']['live_tasks'] == report['execution']['live_programs'] == 0
