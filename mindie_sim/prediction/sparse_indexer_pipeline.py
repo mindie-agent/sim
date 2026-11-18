@@ -266,17 +266,23 @@ def _quant_tile_work(ledger, index):
                       index // int(ledger["blocks"]), int(ledger["wave_rows"]))
     heads, width = int(ledger["heads"]), int(ledger["width"])
     block = index % int(ledger["blocks"])
-    valid = min(POOL_KEY_BLOCK,
-                int(ledger["keys"]) - block * POOL_KEY_BLOCK)
+    # The scan walks completed cache keys, not the padded 1,024-key tile.
+    completed = int(ledger.get("completed_keys", ledger["keys"]))
+    valid = min(POOL_KEY_BLOCK, completed - block * POOL_KEY_BLOCK)
+    query_bytes = (float(rows) * heads * width
+                   + float(rows) * heads * FP32_ELEMENT_BYTES)
+    operand_bytes = (query_bytes
+                     + float(valid) * int(ledger["key_row_bytes"])
+                     + float(valid) * FP32_ELEMENT_BYTES)
     return {
         "rows": rows,
         "valid_keys": valid,
         "cube": {
             "fp8_e4m3": float(rows) * 2.0 * heads * valid * width,
-            "hbm": (float(rows) * heads * width
-                    + float(valid) * int(ledger["key_row_bytes"])
-                    + float(rows) * heads * FP32_ELEMENT_BYTES
-                    + float(valid) * FP32_ELEMENT_BYTES),
+            # The cold cache rows are filled once; a wave rescans them from L2.
+            "hbm": query_bytes,
+            # The operand fetch includes this block's key rows and scales.
+            "mte2": operand_bytes,
         },
         "reduce": {
             "vector": float(rows) * valid * TOPK_MERGE_OPS,
@@ -292,9 +298,14 @@ def arch35_indexer_work(ledger):
         parts = _quant_tile_work(ledger, index)
         total = total + Work({"fp8_e4m3": parts["cube"]["fp8_e4m3"]},
                              {**_matrix_free(parts["cube"], "fp8_e4m3"), **parts["reduce"]})
+    payload = int(ledger.get("payload_keys", ledger.get("completed_keys", ledger["keys"])))
+    fill = float(payload) * int(ledger["key_row_bytes"])
     total = total + Work({}, {
         "mte3": float(ledger["output_bytes"]),
-        "hbm": float(ledger["output_bytes"]),
+        "hbm": float(ledger["output_bytes"]) + fill,
+        # Every distinct cache row reaches the kernel through the read pipe,
+        # even when one owner wave rescans only the largest private cache.
+        "mte2": fill,
     })
     return total
 
@@ -333,6 +344,9 @@ class Arch35QuantIndexerRecipe:
         ledger = dict(dict(context.op.metadata).get(QUANT_LEDGER, {}))
         tiles = int(ledger["waves"]) * int(ledger["blocks"])
         floor = INDEXER_FLOOR_US / MS_PER_SECOND
+        payload = int(ledger.get("payload_keys",
+                                 ledger.get("completed_keys", ledger["keys"])))
+        fill = float(payload) * int(ledger["key_row_bytes"])
 
         def tile(index):
             parts = _quant_tile_work(ledger, index)
@@ -346,7 +360,12 @@ class Arch35QuantIndexerRecipe:
             )
 
         return KernelProgram((
-            Stage("blocks", program=PipelineProgram(tiles, SERIAL_SLOTS, tile)),
+            # One cold fill of every distinct request cache row. Later waves
+            # rescan the resident rows through their operand fetch.
+            Stage("cache_fill", context.bind(Work({}, {
+                "hbm": fill, "mte2": fill}))),
+            Stage("blocks", after=("cache_fill",),
+                  program=PipelineProgram(tiles, SERIAL_SLOTS, tile)),
             Stage("indices", context.bind(Work({}, {
                 "mte3": float(ledger["output_bytes"]),
                 "hbm": float(ledger["output_bytes"])})),

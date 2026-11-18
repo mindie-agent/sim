@@ -10,6 +10,7 @@
 [Side-Effect Policy] Read-only over catalog cases and builder-local records.
 """
 from copy import deepcopy
+from dataclasses import replace
 import json
 from pathlib import Path
 
@@ -28,7 +29,7 @@ from mindie_sim.prediction.latent_dcp import PAIRED_SFA_CALLS, paired_sfa_calls
 from mindie_sim.prediction.mechanism import Geometry
 from mindie_sim.prediction.mqsmla import (
     KV_QUANT_BF16, KV_QUANT_FP8, KV_QUANT_MXFP8, KV_QUANT_ROW_BYTES,
-    METADATA_PROGRAM_MS, quant_external_fill,
+    METADATA_PROGRAM_MS, build as mqsmla_build, quant_external_fill,
 )
 from mindie_sim.prediction.operator_analysis import operator_costs
 from mindie_sim.prediction.structure import parse_case
@@ -242,8 +243,13 @@ def test_c8_legacy_key512_three_slot_schedule_is_untouched():
                           operand_modes=True, schedule=SCHEDULE_ARCH35,
                           tile_size=128, slots=2)
     assert arch35.metadata["kernel_schedule"] == SCHEDULE_ARCH35
-    # The arch35 planner bills both aliased reads of every packed row.
-    assert arch35.work.resources["mte2_aiv"] > legacy.work.resources["mte2_aiv"]
+    # The arch35 planner issues one aliased packed-row gather plus the two
+    # dependent INT32 index lookups per selected row; the arch22 schedule keeps
+    # its own two-consumer transfer.
+    tiles = 6 * (2048 // C8_KEY_TILE)
+    assert arch35.work.resources["mte2_aiv"] == (
+        tiles * C8_KEY_TILE * (C8_PACKED_ROW_BYTES + 8))
+    assert arch35.work.resources["mte2_aiv"] < legacy.work.resources["mte2_aiv"]
     assert arch35.work.matrix["bf16"] == pytest.approx(legacy.work.matrix["bf16"])
 
 
@@ -305,13 +311,14 @@ def test_mqsmla_swa_window_is_private_and_shared_topk_union_is_cold_fill():
     swa = {"sequences": ((6, 131072),) * 160, "window": 128, "ratio": 0, "topk": 0}
     external, shared_rows = quant_external_fill(swa, KV_QUANT_FP8)
     assert shared_rows == 0
-    assert external == (160 * 128 + 160 * 6) * 608
+    # The window ring holds only the last 128 distinct rows, not window + q_len.
+    assert external == 160 * 128 * 608
     csa = {"sequences": ((6, 131072),) * 160, "window": 128, "ratio": 2,
            "topk": 512, "prefix_cache_mode": "shared",
            "prefix_tokens": tuple([124518] * 160)}
     external, shared_rows = quant_external_fill(csa, KV_QUANT_FP8)
     assert shared_rows == 124518 // 2
-    assert external == (160 * 128 + 160 * 6 + 124518 // 2 + 160 * 26) * 608
+    assert external == (160 * 128 + 124518 // 2 + 160 * 26) * 608
     assert quant_external_fill(dict(csa, prefix_cache_mode="private"),
                                KV_QUANT_FP8)[0] > external
 
@@ -354,3 +361,107 @@ def test_c8_unknown_schedule_is_rejected_instead_of_silently_reinterpreted():
     with pytest.raises(ModelingError, match="tile128_and_two_slots"):
         build_packed(op, geometry, scratch_policy="offchip",
                      schedule=SCHEDULE_ARCH35, tile_size=512, slots=3)
+
+
+# --- Final-gate rows 9-12: DCP C8 dispatch, packed gathers, prefix identity
+# and the MQSMLA cold-KV/query conservation.
+def _mqsmla_op(shape, *, heads=64):
+    rows = sum(query for query, _context in shape["sequences"])
+    return OpSpec(
+        op_id="s0.l2.mqsmla", family="attention", phase="decode", stage=0,
+        layer=2, requests=("r",), semantic_shape=(rows, heads, 512),
+        local_shape=(rows, heads, 512), padded_shape=(rows, heads, 512),
+        launch_shape=(rows, heads, 512), flops=0.0, vector_ops=0.0,
+        hbm_bytes=0.0, mte2_bytes=0.0, mte3_bytes=0.0, deps=(),
+        recipe=MQSMLA_RECIPE, metadata=(("mqsmla_geometry", shape),))
+
+
+def _mqsmla_plan(shape):
+    raw = _mqsmla_case(SKUS[0][1], shape["kv_quant_mode"], 0, shape["sequences"])
+    geometry = Geometry.from_devices(parse_case(raw).machine.dies)
+    return mqsmla_build(_mqsmla_op(shape, heads=shape["heads"]), geometry)
+
+
+def test_c8_gather_is_one_alias_plus_two_index_lookups_at_the_actual_row_width():
+    from mindie_sim.prediction.indexed_quant_attention import (
+        arch35_tile_phases, packed_cache_declaration,
+    )
+    for rope, row_bytes in ((64, 656), (0, 528)):
+        phases = {name: work for name, work, _after in arch35_tile_phases(
+            128, 64, 512, rope, first=True, last=True)}
+        assert packed_cache_declaration(rope)["row_bytes"] == row_bytes
+        assert phases["kv_stage"].resources["mte2_aiv"] == 128 * (row_bytes + 8)
+
+
+def test_c8_shared_prefix_identity_decides_cold_fill_deduplication():
+    sequences = ((1, 128), (1, 128))
+    op = _c8_op(sequences, 128, 64, 0)
+    base = dict(op.metadata)["indexed_attention_geometry"]
+    same = {**base, "prefix_cache_mode": "shared",
+            "prefix_tokens": (128, 128), "prefix_cache_keys": ("A", "A")}
+    distinct = {**same, "prefix_cache_keys": ("A", "B")}
+    # One physical region for (A, A); two cold regions for (A, B).
+    assert prefix_partition(same, sequences, 128) == (128, 0, 128)
+    assert prefix_partition(distinct, sequences, 128) == (256, 0, 128)
+    geometry = Geometry.from_devices(parse_case(_c8_case(SKUS[0][1])).machine.dies)
+    shared = build_packed(replace(op, metadata=(
+        ("indexed_attention_geometry", same),)), geometry,
+        scratch_policy="offchip", schedule=SCHEDULE_ARCH35)
+    cold = build_packed(replace(op, metadata=(
+        ("indexed_attention_geometry", distinct),)), geometry,
+        scratch_policy="offchip", schedule=SCHEDULE_ARCH35)
+    assert shared.metadata["c8_schedule"]["external_fill_bytes"] == 128 * 656
+    assert cold.metadata["c8_schedule"]["external_fill_bytes"] == 2 * 128 * 656
+
+
+def test_mqsmla_cold_kv_is_capped_by_resident_window_and_completed_rows():
+    one = {"sequences": ((1, 1),), "window": 128, "ratio": 2, "topk": 512}
+    external, _shared = quant_external_fill(one, KV_QUANT_FP8)
+    # Two resident window rows plus one completed compressed row.
+    assert external == 3 * KV_QUANT_ROW_BYTES[KV_QUANT_FP8] == 1824
+    hca = {"sequences": ((1, 4096),), "window": 128, "ratio": 128, "topk": 0}
+    external, _shared = quant_external_fill(hca, KV_QUANT_FP8)
+    # All 128 window rows plus 4,097 // 128 == 32 compressed rows.
+    assert external == 160 * KV_QUANT_ROW_BYTES[KV_QUANT_FP8] == 97280
+
+
+def test_mqsmla_128_head_query_is_charged_once_not_once_per_head_group():
+    shape = {**_mqsmla_geometry(((1, 4096),), KV_QUANT_FP8, 0, 128, 128, 0),
+             "heads": 128, "topk": 0}
+    plan = _mqsmla_plan(shape)
+    query_bytes = 128 * 512 * 2
+    # Read once on AIC, written once on MTE3; the two 64-head owner streams
+    # share the same 128-head tensor.
+    assert plan.work.resources["mte2_aic"] == query_bytes == 131072
+    assert plan.work.resources["mte3"] >= query_bytes
+
+
+def test_kimi_dcp8_int8_c8_cache_routes_to_two_48_head_calls():
+    import test_kimi_k31_alignment as kimi
+    from dataclasses import replace as dc_replace
+    from mindie_sim.catalog.cache_format import cache_format
+    case = kimi.case(cp=8)
+    metadata = dict(case.model.metadata)
+    metadata["cache_representations"] = {"mla_kv": {
+        "dtype": "int8", "group_size": 128, "scale_dtype": "fp32",
+        "suffix_elements": 64, "suffix_dtype": "bf16"}}
+    case = dc_replace(case, model=dc_replace(
+        case.model, metadata=tuple(metadata.items())))
+    assert cache_format(case.model, "mla_kv").row_bytes(576) == 656
+    graph = target_graphs(case, phase="decode", tokens=4, context=131072,
+                          sequences=2, scope="body", resource_fusion=False)[0]
+    attention = [op for op in graph if op.family == "attention"]
+    assert len(attention) == 24
+    assert all(dict(op.metadata)["native_kernel"]
+               == "npu_kv_quant_sparse_flash_attention_vllm" for op in attention)
+    assert all(dict(op.metadata)["program_kind"] == "indexed_attention"
+               for op in attention)
+    paired = [dict(op.metadata)["paired_sfa"] for op in attention]
+    assert all(item["calls"] == 2 and item["call_heads"] == 48 for item in paired)
+    geom = dict(attention[0].metadata)["indexed_attention_geometry"]
+    assert geom["topk"] == 256
+    assert geom["sequences"][0] == (4, 16384)
+    row = operator_costs(case, (attention[0],), input_ready_ms=0)["operators"][0]
+    schedule = _plan(row)["c8_schedule"]
+    assert schedule["paired_calls"] == 2
+    assert schedule["head_tile"] == 48

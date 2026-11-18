@@ -83,6 +83,10 @@ def validate(*, plan, parallel, model, quant, lowering_passes,
             or (quant.kv_dtype not in BF16_CACHE_DTYPES and not packed)
             or quant.format_for("mla") not in {"bf16", "int8", "fp8_e4m3"}):
         raise ModelingError("mla_prolog_v3_declared_operand_domain_unsupported")
+    if not packed and quant.format_for("mla") == MXFP8_FORMAT:
+        # V3 admits BF16 and legacy INT8 projection weights. FP8/MXFP8
+        # projection operands are the A5 V4 contract.
+        raise ModelingError("mla_prolog_v3_rejects_fp8_projection_weights")
     # The V3 prolog owns one fused Q-A reduction; its source kernel is
     # admitted only for the two declared LoRA ranks.
     if (plan.q_lora_rank
@@ -121,8 +125,17 @@ def declare(ops, *, prefix, plan, model, parallel, quant, tokens, members,
     qa, qb, kva, absorb = (dict(by_id[key].metadata) for key in (q_a, q_b, kv_a, q_absorb))
     do_rope = bool(plan.mla_do_rope)
     native_kind = _native_kind(packed, quant)
+    mxfp8_query = native_kind.endswith("V4WeightNz")
+    query_norm_output = bool(
+        plan.indexer or plan.owns_topk or plan.index_query_per_layer)
+    # V4 quantizes the normalized query with group-32 E8M0 scales; V3 keeps
+    # one FP32 scale per row (or no scale at all without an index consumer).
+    query_norm_scale_dtype = "fp8_e8m0" if mxfp8_query else "fp32"
+    query_norm_scale_shape = (
+        (tokens, plan.q_lora_rank // E8M0_GROUP_SIZE) if mxfp8_query
+        else ((tokens, 1) if query_norm_output else ()))
     source = SOURCE
-    if native_kind.endswith("V4WeightNz"):
+    if mxfp8_query:
         source = SOURCE_V4
     elif packed:
         source = PACKED_SOURCE
@@ -145,13 +158,12 @@ def declare(ops, *, prefix, plan, model, parallel, quant, tokens, members,
                 "projection_scale_shapes": ((1, plan.q_lora_rank),
                     (1, plan.num_heads // parallel.tp * (plan.qk_nope_head_dim + plan.qk_rope_head_dim)),
                     (1, plan.kv_lora_rank + plan.qk_rope_head_dim)),
-                "query_norm_scale_dtype": "fp32",
-                "query_norm_scale_shape": ((tokens, 1) if
-                    (plan.indexer or plan.owns_topk or plan.index_query_per_layer) else ()),
+                "query_norm_scale_dtype": query_norm_scale_dtype,
+                "query_norm_scale_shape": query_norm_scale_shape,
                 "query_nope_scale_shape": (), "rope_cache_output_shape": (),
                 } if packed else {}),
             "query_norm_dtype": qb["activation_format"],
-            "query_norm_output": bool(plan.indexer or plan.owns_topk or plan.index_query_per_layer),
+            "query_norm_output": query_norm_output,
             "do_rope": do_rope,
             "parallel_cp": int(parallel.cp),
             "query_quant_mode": (MXFP8_QUERY_QUANT_MODE

@@ -65,7 +65,12 @@ class SharedSelectionRef(str):
         """Producer-selected rows owned by one request, or ``None``."""
         if request_id in self.selected_by_request:
             return self.selected_by_request[request_id]
-        if len(self.selected_by_request) == 1:
+        # A one-request producer may be replayed by a wider proposal batch
+        # only when that request owns the complete declared selection. A
+        # partial map must not copy request 0's rows onto every request.
+        if (len(self.selected_by_request) == 1
+                and self.selected_token_rows
+                == next(iter(self.selected_by_request.values()))):
             return next(iter(self.selected_by_request.values()))
         return None
 

@@ -149,7 +149,7 @@ def batch_analytic_ops(ops, outputs, *, runtime, views, prefix):
 
 
 def _prefix_declaration(views, runtime):
-    """Declared shared-prefix extent per request for analytic deduplication."""
+    """Declared shared-prefix extent and identity per request for deduplication."""
     shared = str(getattr(runtime, "prefix_cache_mode", "private") or "private")
     extents = tuple(
         max(0, min(int(getattr(view, "prefix_tokens", 0) or 0),
@@ -157,7 +157,10 @@ def _prefix_declaration(views, runtime):
         for view in views)
     if shared != "shared" or not any(extents):
         return {"prefix_cache_mode": shared}
-    return {"prefix_cache_mode": shared, "prefix_tokens": extents}
+    keys = tuple(
+        str(getattr(view, "prefix_cache_key", "") or "") for view in views)
+    return {"prefix_cache_mode": shared, "prefix_tokens": extents,
+            "prefix_cache_keys": keys}
 
 
 def _align(value, size):
