@@ -337,7 +337,7 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         padded_tokens, policy=AttentionPolicy(), cp_interleave_size=DEFAULT_CP_INTERLEAVE,
         runtime=None, cache_ids=None, stage_of=None, topk_ids=None,
         index_cache_ids=None, candidate_ids=None, machine=None, **_) -> AttentionResult:
-    from .implementations import select
+    from .implementations import add_input_ports, select
 
     cacheless = plan.cache_kind == "none"
     if cacheless:
@@ -640,7 +640,12 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         index_store_id = (index_cache_ids or {}).get(idx_owner)
     eff_window = min_positive(plan.window, eff_topk)
     dense_win = int(plan.window or 0)
-    attention_deps = (*store_ids, topk_id) if topk_id else store_ids
+    # The fused query producer supplies the attention query operand; retain an
+    # explicit consumer edge and port so a partial-RoPE query never becomes an
+    # unbound output (the cache edge alone carries only key/value).
+    query_producer = rope.op_id
+    attention_deps = ((*store_ids, topk_id, query_producer) if topk_id
+                      else (*store_ids, query_producer))
     streams = kv_heads if policy.reuse_kv_across_query_heads else heads
     kv_row_bytes = (
         key_fmt.row_bytes(cache_planes * streams * width)
@@ -852,6 +857,8 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                 op = selected.module.lower_op(
                     op, view=view, plan=plan, key_heads=kv_heads, model=model,
                     runtime=runtime, **selected.options)
+            op = add_input_ports(
+                op, ({"op": query_producer, "output": "query"},))
             batches.append(op)
         grp_attn: list[str] = []
         if policy.fused_batch and not selected and batches:

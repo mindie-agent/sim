@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
-from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.common import ModelingError, dtype_bytes
 from .matrix_mapping import matrix_geometry
 from .mechanism import PlannedRecipe
 from .program import KernelProgram, ParallelProgram, Stage
@@ -33,6 +33,13 @@ LOCAL_SHAPE_DIMS = 3
 #: issues one 128x256 output tile per AIC wave; the free AIC budget splits K.
 ROUTER_TILE_M = 128
 ROUTER_TILE_N = 256
+#: The underfilled A5 BF16 matrix mapping (``UNDERFILLED_CANDIDATES``) issues
+#: 64x64x128 output tiles, so every output row/column tile re-reads its operand
+#: block.  This is the executed routed operand fetch, not the distinct bytes.
+ROUTER_MATRIX_TILE = 64
+#: Split-K slices are nonempty integer K elements; a split grid may never price
+#: more partials than the K extent can populate.
+ROUTER_K_GRANULE = 1
 ROUTER_PROLOGUE_DRAIN_CYCLES = 8250
 ROUTER_NOMINAL_CLOCK_HZ = 1.65e9
 A5_AIC_UNITS = 32
@@ -79,6 +86,24 @@ def router_split_count(tiles: int, aics: int = A5_AIC_UNITS) -> int:
     return max(1, min(int(aics), -(-int(aics) // int(tiles))))
 
 
+def router_matrix_operand_bytes(op) -> float:
+    """Executed routed BF16 operand fetch for the underfilled matrix mapping.
+
+    Each 64-row output tile re-reads its A row block and each 64-column tile
+    re-reads its B column block, so the operand pipe services
+    ``input_bytes * ceil(N / 64) + weight_bytes * ceil(M / 64)`` bytes.  The
+    declared ``op.mte2_bytes`` carries the distinct operand bytes only.
+    """
+    m, n, k = (int(value) for value in op.local_shape[-LOCAL_SHAPE_DIMS:])
+    meta = dict(op.metadata)
+    input_bytes = float(m * k * dtype_bytes(
+        meta.get("input_format", op.dtype or "bf16")))
+    weight_bytes = float(n * k * dtype_bytes(
+        meta.get("weight_format", op.dtype or "bf16")))
+    return (input_bytes * -(-n // ROUTER_MATRIX_TILE)
+            + weight_bytes * -(-m // ROUTER_MATRIX_TILE))
+
+
 def build_router_splitk(op, geometry):
     """A5 narrow-N BF16 router: generic tile grid plus Split-K workspace.
 
@@ -94,11 +119,20 @@ def build_router_splitk(op, geometry):
     from .program import KernelProgram, Stage
     if not _router_split(op, geometry):
         return build_plan(SteadyMatmul(), op, geometry)
-    base = work_from_op(op) + Work(matrix={"bf16": float(op.flops)})
-    m, n, _k = (int(value) for value in op.local_shape[-LOCAL_SHAPE_DIMS:])
+    base = work_from_op(op)
+    declared_mte2 = float(op.mte2_bytes)
+    declared_mte3 = float(op.mte3_bytes)
+    declared_vector = float(op.vector_ops)
+    matrix_mte2 = router_matrix_operand_bytes(op)
+    resources = dict(base.resources)
+    resources["mte2"] = matrix_mte2
+    base = Work(matrix=base.matrix, resources=resources) + Work(
+        matrix={"bf16": float(op.flops)})
+    m, n, k = (int(value) for value in op.local_shape[-LOCAL_SHAPE_DIMS:])
     tiles = router_output_tiles(m, n)
     cores = int(getattr(geometry, "compute_units", A5_AIC_UNITS))
-    splits = router_split_count(tiles, cores)
+    splits = min(router_split_count(tiles, cores),
+                 max(1, -(-k // ROUTER_K_GRANULE)))
     partial = float(FP32_BYTES) * float(splits) * float(m) * float(n)
     merge = float(splits - 1) * float(m) * float(n)
     extra = Work(resources={"hbm": 2 * partial, "vector": merge})
@@ -111,8 +145,12 @@ def build_router_splitk(op, geometry):
                          for key, value in context.work.items()}
         matrix_demand = {key: value for key, value in matrix_demand.items()
                          if value > 0}
+        matrix_op = replace(
+            context.op, mte2_bytes=declared_mte2,
+            hbm_bytes=declared_mte2 + declared_mte3,
+            vector_ops=declared_vector)
         matrix = SteadyMatmul().lower(
-            replace(context, work=matrix_demand))
+            replace(context, op=matrix_op, work=matrix_demand))
         workspace = splitk_program(replace(context, work={}), splits)
         return KernelProgram((
             Stage("router_prologue_drain",
@@ -128,6 +166,7 @@ def build_router_splitk(op, geometry):
         "split_k": splits,
         "output_tiles": tiles,
         "router_tile": (ROUTER_TILE_M, ROUTER_TILE_N),
+        "matrix_operand_bytes": matrix_mte2,
         "partial_write_bytes": partial,
         "merge_vector_ops": merge,
     })

@@ -8,14 +8,16 @@ and non-MX quantize recipes keep their existing physical mechanisms untouched.
 """
 import json
 from dataclasses import replace
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from mindie_sim import operator_costs, target_graphs
+from mindie_sim import compose_case, operator_costs, target_graphs
 from mindie_sim.catalog.ops import vector_op
 from mindie_sim.catalog.types import QuantSpec
+from mindie_sim.prediction import gdn_decode_programs as gdn
 from mindie_sim.prediction.matrix_splitk import (_allocate, _per_owner_cap,
                                                  build_router_splitk,
                                                  router_output_tiles,
@@ -29,14 +31,22 @@ from mindie_sim.prediction.mxfp4_geometry import (
 )
 from mindie_sim.prediction.mxfp4_grouped import build as build_mxfp4
 from mindie_sim.prediction.mxfp4_grouped import recipe as mxfp4_recipe
-from mindie_sim.prediction.mxfp8_grouped import recipe as mxfp8_recipe
-from mindie_sim.prediction.mxfp8_grouped import build_swiglu_mx_quant
+from mindie_sim.prediction.mxfp8_grouped import (
+    M_TILE_ROWS, NZ_K_GRANULE, NZ_N_GRANULE, align as mxfp8_align,
+    build as build_mxfp8, build_swiglu_mx_quant,
+    mapping as mxfp8_mapping, owner_tiles as mxfp8_owner_tiles,
+    panel_work as mxfp8_panel_work, recipe as mxfp8_recipe,
+)
+from mindie_sim.prediction.operator_analysis import target_operators
 from mindie_sim.prediction.passes_ffn_fusion import (activation_quant_fusion,
                                                      router_gemm)
 from mindie_sim.prediction.program import (KernelProgram, ParallelProgram,
                                            PipelineProgram, RecipeBook,
                                            RecipeContext)
+from mindie_sim.prediction.runtime import accel_bridge, accel_build
+from mindie_sim.prediction.runtime.engine import Engine, Resource
 from mindie_sim.prediction.structure import parse_case
+from mindie_sim.schema.operators import OpSpec
 
 ROOT = Path(__file__).resolve().parents[1]
 V41 = ROOT / "examples/cases/v41-a5-dp4-body-current.json"
@@ -46,6 +56,7 @@ A3_GLM = (ROOT / "examples/cases/high-concurrency-20261030/glm78/"
           "a3_glm53_w4a8_tp16_tpot88_c8.json")
 DT = "Ascend950DT_9582"
 PR = "Ascend950PR_958b"
+MS_PER_SECOND = 1000
 TOLERANCE = 0.12
 #: Registered Split-K router workspace and the narrow resplit's per-pass small
 #: column tiles use the declared small-kernel bound.
@@ -85,6 +96,42 @@ def _context(raw, op):
         compute_peaks=dict(device.compute_peaks),
         pool_names={pool: f"{pool}@r0:s0" for pool, _ in device.buffers},
         pool_units={pool: device.pool_units(pool) for pool, _ in device.buffers})
+
+
+def _gating_context(raw, op):
+    """Production-like service modes for the row-program issue-slot binding."""
+    device = parse_case(raw).machine.dies[0]
+    return replace(
+        _context(raw, op),
+        service_modes={mode: (role, rate)
+                       for mode, (role, rate) in device.service_modes})
+
+
+def _splitk_context(raw, op):
+    """Per-ms rates and declared mechanisms, matching the priced context."""
+    device = parse_case(raw).machine.dies[0]
+    rates = {role: rate / MS_PER_SECOND
+             for role, rate in dict(device.rates).items()}
+    names = {role: f"{role}@r0:s0" for role in rates}
+    names["cube"] = "cube@r0:s0"
+    units = {role: device.units(role) for role in rates}
+    units["cube"] = device.compute_units
+    return RecipeContext(
+        op, {}, names, {names[role]: rates[role] for role in rates},
+        device.compute_units,
+        resource_units=units,
+        compute_peaks=dict(device.compute_peaks),
+        service_modes={mode: (role, rate)
+                       for mode, (role, rate) in device.service_modes},
+        pool_names={pool: f"{pool}@r0:s0" for pool, _ in device.buffers},
+        pool_units={pool: device.pool_units(pool) for pool, _ in device.buffers},
+        pool_capacities=dict(device.buffers),
+        physical_mechanisms=device.physical_mechanisms)
+
+
+def _bound_context(raw, plan, op):
+    context = _splitk_context(raw, plan.work.apply(op))
+    return replace(context, work=context.bind(plan.work))
 
 
 def _stages(program):
@@ -272,17 +319,18 @@ def test_split_k_allocation_normalizes_padded_macro_areas():
     assert shares == pytest.approx([428.5714285714, 428.5714285714, 142.8571428571])
 
 
-def _gating_op(tokens, experts, top_k):
+def _gating_op(tokens, experts, top_k, *, groups=8, group_topk=4,
+               noaux_tc=True, vector_ops=(1.0, 1.0)):
     plan = SimpleNamespace(num_experts=experts, top_k=top_k,
                            router_mode="sigmoid", router_norm_topk=True,
-                           router_groups=8, router_group_topk=4,
+                           router_groups=groups, router_group_topk=group_topk,
                            routed_scaling_factor=2.5, index=0)
-    members = (SimpleNamespace(vector_ops=1.0, recipe="a"),
-               SimpleNamespace(vector_ops=1.0, recipe="b"))
+    members = tuple(SimpleNamespace(vector_ops=value, recipe=recipe)
+                    for value, recipe in zip(vector_ops, ("a", "b")))
     return _fused_gating(prefix="p", plan=plan, logits_input="logits",
                          members=members, stage=0, requests=(), tokens=tokens,
                          mode="decode", weight_dtype="fp32", weight_bytes=4,
-                         hash_table=False, noaux_tc=True)
+                         hash_table=False, noaux_tc=noaux_tc)
 
 
 @pytest.mark.parametrize("tokens,experts", [
@@ -319,7 +367,7 @@ def test_gating_row_wave_program_is_finite_and_conserving():
     raw = _case(V41, DT)
     op = _gating_op(960, 384, 6)
     plan = build_moe_gating_topk(op, _geometry(raw))
-    program = plan.program(_context(raw, plan.work.apply(op)))
+    program = plan.program(_gating_context(raw, plan.work.apply(op)))
     names = [stage.name for stage in _stages(program)]
     for required in ("kernel_prologue_drain", "logits_bias_load", "sigmoid_bias",
                      "group_top2_scan", "group_mask", "expert_topk",
@@ -327,7 +375,7 @@ def test_gating_row_wave_program_is_finite_and_conserving():
         assert required in names
     assert names.count("logits_bias_load") == 15
     issued = _stage_work(program)
-    expected = _context(raw, plan.work.apply(op)).bind(plan.work)
+    expected = _gating_context(raw, plan.work.apply(op)).bind(plan.work)
     for name, amount in expected.items():
         assert issued.get(name, 0.0) == pytest.approx(amount, rel=1e-9)
     # A2/A3 keeps the registered Class D vector plan byte-for-byte.
@@ -450,3 +498,278 @@ def _base_gmm():
     ops = target_graphs(source, phase="decode", tokens=1, context=8, scope="body",
                         resource_fusion=False)[0]
     return next(op for op in ops if op.family == "grouped_gemm")
+
+
+# ---------------------------------------------------------------------------
+# Mixed-placement runtime parity (v0.9.19 shard-2 Row 5)
+# ---------------------------------------------------------------------------
+def _native_engine(tmp_path, resources):
+    previous = os.environ.get("MINDIE_CACHE_HOME")
+    os.environ["MINDIE_CACHE_HOME"] = str(tmp_path / "accel-cache")
+    try:
+        accel_build.reset_build_memo()
+        status = accel_build.build_accel()
+        if not status["ok"]:
+            pytest.skip("native accelerator unavailable: "
+                        + str(status.get("reason") or status.get("detail")))
+        accel_bridge.load_library(status)
+        return Engine(resources, backend="c")
+    finally:
+        if previous is None:
+            os.environ.pop("MINDIE_CACHE_HOME", None)
+        else:
+            os.environ["MINDIE_CACHE_HOME"] = previous
+        accel_build.reset_build_memo()
+
+
+def _mixed_unit_fixture(backend, tmp_path=None, peer_count=1):
+    resources = [Resource("cube", 4.0, units=4), Resource("hbm", 4.0, units=4)]
+    engine = (_native_engine(tmp_path, resources) if backend == "c"
+              else Engine(resources, backend="python"))
+    pinned = engine.submit("pinned", {"cube": 4.0},
+                           placement={"cube": (0,)})
+    peers = [engine.submit(f"peer{i}", {"cube": 4.0, "hbm": 4.0},
+                           coupled=True) for i in range(peer_count)]
+    timer = engine.submit("timer", {}, after=(peers[0],), latency=10.0)
+    for _ in range(1000):
+        if pinned.done and all(task.done for task in peers) and timer.done:
+            break
+        engine.advance(until=(timer,), max_steps=5000)
+    return engine, pinned, peers, timer
+
+
+def test_unpinned_coupled_peer_matches_c11_shared_unit_capacity(tmp_path):
+    python = _mixed_unit_fixture("python")
+    native = _mixed_unit_fixture("c", tmp_path / "mixed-peer")
+    assert native[0].accel_status()["native_steps"] > 0
+    for left, right in zip((python[1], *python[2]),
+                           (native[1], *native[2])):
+        assert left.time == pytest.approx(right.time, abs=1e-9)
+    # The pinned Cube owner keeps 0.5 of unit 0 while the coupled peer owns
+    # unit 0's other 0.5 plus units 1-3, so the peer completes in 2 ms even
+    # though the pinned task still runs until 5 ms.
+    assert python[2][0].time == pytest.approx(2.0)
+    assert python[1].time == pytest.approx(5.0)
+    assert python[3].time == pytest.approx(12.0)
+
+
+@pytest.mark.parametrize("peer_count", (1, 2, 3, 4, 5, 6, 7, 8))
+def test_mixed_unit_cohorts_match_c11_for_every_peer_count(peer_count, tmp_path):
+    python = _mixed_unit_fixture("python", peer_count=peer_count)
+    native = _mixed_unit_fixture(
+        "c", tmp_path / f"cohort-{peer_count}", peer_count=peer_count)
+    assert native[0].accel_status()["native_steps"] > 0
+    for left, right in zip((python[1], *python[2]),
+                           (native[1], *native[2])):
+        assert left.time == pytest.approx(right.time, abs=1e-9)
+    assert native[3].time == pytest.approx(11.0 + peer_count)
+
+
+# ---------------------------------------------------------------------------
+# MXFP8 per-expert cold-weight floor (Row 15)
+# ---------------------------------------------------------------------------
+def test_mxfp8_first_m_tile_of_every_expert_is_cold(mxfp8_base):
+    rows, n, k = (512, 1), 256, 256
+    op = _gmm(mxfp8_base, rows, n, k)
+    raw = _case(GLM, DT)
+    geometry = _geometry(raw)
+    plan = build_mxfp8(op, geometry, l1_k=256)
+    mapping = plan.metadata["source_mapping"]
+    assert mapping["weight_l2_by_bank"] == pytest.approx((0.5, 0.0))
+    assert mapping["weight_l2_fraction"] == pytest.approx(0.5)
+    assert -(-rows[0] // M_TILE_ROWS) == 2
+    assert -(-rows[1] // M_TILE_ROWS) == 1
+    payloads = [mxfp8_align(n, NZ_N_GRANULE) * mxfp8_align(k, NZ_K_GRANULE)
+                for _ in rows]
+    distinct = sum(payloads)
+    assert distinct == pytest.approx(131072.0)
+    tile = mxfp8_mapping(sum(rows), n, k, geometry, 256)
+    owners = mxfp8_owner_tiles(rows, n, tile, geometry.compute_units)
+    shapes = {}
+    for items in owners:
+        for bank, m, width, _, _ in items:
+            key = (bank, m, width)
+            shapes[key] = shapes.get(key, 0) + 1
+    cold = 0.0
+    for (bank, m, width), occurrences in shapes.items():
+        load, _ = mxfp8_panel_work(
+            m, width, k, k, activation_l2=0.0,
+            weight_l2=mapping["weight_l2_by_bank"][bank])
+        cold += (load.resources["hbm"] - m * k) * occurrences
+    assert cold >= distinct
+
+
+# ---------------------------------------------------------------------------
+# Split-K nonempty slices and routed operand conservation (Row 16)
+# ---------------------------------------------------------------------------
+def test_router_split_k_prices_only_nonempty_k_slices():
+    raw = _case(V41, DT)
+    op = _router(1, 16, 8)
+    plan = build_router_splitk(op, _geometry(raw))
+    assert plan.metadata["split_k"] == 8
+    assert plan.metadata["partial_write_bytes"] == pytest.approx(512.0)
+    assert plan.work.resources["hbm"] == pytest.approx(1360.0)
+    context = _bound_context(raw, plan, op)
+    expected = context.bind(plan.work)
+    issued = _stage_work(plan.program(context))
+    for name, amount in expected.items():
+        assert issued.get(name, 0.0) == pytest.approx(amount, rel=1e-9)
+
+
+def test_router_split_k_conserves_routed_matrix_operand_service():
+    raw = _case(V41, DT)
+    op = _router(528, 288, 4096)
+    plan = build_router_splitk(op, _geometry(raw))
+    assert plan.work.resources["mte2"] == pytest.approx(42860544.0)
+    context = _bound_context(raw, plan, op)
+    expected = context.bind(plan.work)
+    assert expected[context.resource_names["mte2_aic"]] == pytest.approx(
+        42860544.0)
+    issued = _stage_work(plan.program(context))
+    for name, amount in expected.items():
+        assert issued.get(name, 0.0) == pytest.approx(amount, rel=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# Gating Vector Op conservation, AIV owners and n_group <= 1 (Row 17)
+# ---------------------------------------------------------------------------
+def _bound_gating_context(raw, plan, op):
+    context = _gating_context(raw, plan.work.apply(op))
+    return replace(context, work=context.bind(plan.work))
+
+
+def test_gating_plan_conserves_declared_vector_ops_on_one_aiv():
+    raw = _case(V41, DT)
+    op = _gating_op(1, 256, 6, vector_ops=(1552.0, 1552.0))
+    assert op.vector_ops == pytest.approx(3104.0)
+    plan = build_moe_gating_topk(op, _geometry(raw))
+    assert plan.work.resources["vector"] == pytest.approx(3104.0)
+    assert plan.metadata["row_program"]["aiv_units"] == 1
+    context = _bound_gating_context(raw, plan, op)
+    program = plan.program(context)
+    expected = context.bind(plan.work)
+    assert expected[context.resource_names["vector"]] == pytest.approx(3104.0)
+    issued = _stage_work(program)
+    for name, amount in expected.items():
+        assert issued.get(name, 0.0) == pytest.approx(amount, rel=1e-9)
+    for stage_name in ("logits_bias_load", "sigmoid_bias"):
+        stage = next(s for s in _stages(program) if s.name == stage_name)
+        assert stage.placement[context.resource_names["vector"]] == (0,)
+        assert stage.work[context.resource_names["vector"]] > 0.0
+
+    # End-to-end DeepSeek-V3.2 1-token gating keeps serviced vector == 3,104.
+    dsv32 = parse_case(compose_case(
+        "deepseek-v3.2", hardware=DT, tp=1, dp=8, ep=8, num_devices=8,
+        layers=4, concurrency=1))
+    dsv32_ops = target_operators(
+        dsv32, phase="decode", tokens=1, context=128, sequences=1, scope="body")
+    real_gating = next(o for o in dsv32_ops if o.recipe == "moe_gating_topk")
+    assert real_gating.vector_ops == pytest.approx(3104.0)
+    row = operator_costs(dsv32, (real_gating,))["operators"][0]
+    assert row["serviced"]["vector@r0:s0"] == pytest.approx(3104.0)
+
+
+@pytest.mark.parametrize("groups,group_topk", ((0, 0), (1, 0), (1, 1)))
+def test_gating_row_program_supports_zero_or_one_group(groups, group_topk):
+    raw = _case(V41, DT)
+    op = _gating_op(1, 384, 6, groups=groups, group_topk=group_topk)
+    plan = build_moe_gating_topk(op, _geometry(raw))
+    assert plan.metadata["row_program"]["effective_groups"] == 1
+    assert plan.work.resources["vector"] == pytest.approx(op.vector_ops)
+    context = _bound_gating_context(raw, plan, op)
+    expected = context.bind(plan.work)
+    issued = _stage_work(plan.program(context))
+    for name, amount in expected.items():
+        assert issued.get(name, 0.0) == pytest.approx(amount, rel=1e-9)
+
+
+FULL_MODEL_GATING = (
+    ("deepseek-v4.1-flash", 960, 0, 31.39, 31.70),
+    ("glm-5.3-flash", 528, 1, 21.20, 20.6),
+    ("deepseek-v4-pro", 240, 0, 14.46, 13.5),
+    ("kimi-k3", 72, 1, 11.06, 10.0),
+)
+
+
+def _full_model_gating_case(model, groups, sku):
+    raw = compose_case(model, hardware="a5", tp=1, dp=8, ep=8, layers=4,
+                       concurrency=16)
+    raw["machine"]["sku"] = sku
+    raw["machine"]["hardware_key"] = sku
+    case = parse_case(raw)
+    plans = tuple(
+        replace(plan, router_mode="sigmoid", router_noaux_tc=True,
+                router_groups=groups, router_group_topk=max(1, groups))
+        if getattr(plan, "ffn", "") == "moe" and getattr(plan, "num_experts", 0)
+        else plan for plan in case.model.layer_plans)
+    kernels = {**dict(case.runtime.kernels),
+               "moe_gating": {"implementation": "vllm_ascend_cann_gating"}}
+    return replace(case, model=replace(case.model, layer_plans=plans),
+                   runtime=replace(case.runtime, kernels=kernels))
+
+
+@pytest.mark.parametrize(
+    "model,tokens,groups,dt_measured,pr_measured", FULL_MODEL_GATING)
+def test_full_model_grouped_gating_row_waves_match_paired_silicon(
+        model, tokens, groups, dt_measured, pr_measured):
+    for sku, measured in ((DT, dt_measured), (PR, pr_measured)):
+        case = _full_model_gating_case(model, groups, sku)
+        ops = target_operators(case, phase="decode", tokens=tokens,
+                               context=128, sequences=1, scope="body")
+        gating = next(op for op in ops if op.recipe == "moe_gating_topk")
+        metadata = dict(gating.metadata)
+        assert metadata["groups"] == groups
+        assert metadata["noaux_tc"] is True
+        plan = build_moe_gating_topk(
+            gating, Geometry.from_devices(case.machine.dies))
+        assert plan.metadata["row_program"]["effective_groups"] == max(1, groups)
+        assert plan.work.resources["vector"] == pytest.approx(
+            float(gating.vector_ops))
+        duration = operator_costs(
+            case, (gating,))["operators"][0]["duration_ms"] * 1000
+        assert duration == pytest.approx(measured, rel=TOLERANCE), (sku, model)
+
+
+# ---------------------------------------------------------------------------
+# CausalConv1d UPDATE state-ring ordering (Row 18)
+# ---------------------------------------------------------------------------
+def test_causal_conv_state_write_follows_the_final_token_input():
+    case = parse_case(compose_case("kimi-k3", hardware="a5", tp=1, dp=1,
+                                   ep=1, layers=1))
+    device = case.machine.dies[0]
+    geometry = Geometry.from_devices(case.machine.dies)
+    rates = dict(device.rates)
+    names = {role: f"{role}@r0:s0" for role in rates}
+    names["cube"] = "cube@r0:s0"
+    units = {role: device.units(role) for role in rates}
+    units["cube"] = device.compute_units
+    context = RecipeContext(
+        None, {}, names, {names[role]: rates[role] for role in rates},
+        device.compute_units, resource_units=units,
+        compute_peaks=dict(device.compute_peaks))
+    shape = (6, 1024)
+    op = OpSpec(
+        op_id="conv", family="short_convolution", phase="decode", stage=0,
+        layer=0, requests=(), semantic_shape=shape, local_shape=shape,
+        padded_shape=shape, launch_shape=shape, dtype="bf16", recipe=gdn.CONV,
+        metadata=(("sequence_tokens", (6,)),
+                  ("physical_sequence_tokens", (6,)),
+                  ("kernel_width", 4), ("speculative", False),
+                  ("bias", False), ("state_history_slots", 3),
+                  ("padding_slots", ())))
+    plan = gdn.conv_plan(op, geometry)
+    engine = Engine([Resource(names[role], rates[role], units=units[role])
+                     for role in rates], trace_limit=10000)
+    context = replace(context, op=plan.work.apply(op))
+    done = plan.program(context).start(engine, "conv", engine.submit("ready"))
+    engine.advance(until=(done,), max_steps=100000)
+    assert plan.metadata["state_write_bytes"] == pytest.approx(6144.0)
+    inputs = [event for event in engine.trace
+              if event["demand"] and event["task"].endswith(":input")]
+    writes = [event for event in engine.trace
+              if event["demand"] and event["task"].endswith(":state_write")]
+    assert inputs and writes
+    final_input = max(inputs, key=lambda event: event["start_ms"])
+    final_input_end = max(event["end_ms"] for event in inputs)
+    assert all(write["start_ms"] >= final_input["start_ms"] for write in writes)
+    assert all(write["start_ms"] >= final_input_end for write in writes)
