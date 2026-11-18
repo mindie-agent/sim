@@ -72,8 +72,10 @@ def activation_bank_bytes(rows, k):
 
 
 def m_tile_second_pass(rows):
-    """Share of a bank's B-panel reads that belong to its second M-tile pass."""
-    tiles = max(1, ceil(max(rows) / M_TILE_ROWS)) if rows else 1
+    """Share of one expert bank's B-panel reads after its first M tile."""
+    if isinstance(rows, (tuple, list)):
+        rows = max(rows, default=0)
+    tiles = max(1, ceil(max(0, int(rows)) / M_TILE_ROWS))
     return (tiles - 1) / tiles
 
 
@@ -87,15 +89,17 @@ def l2_fractions(rows, n, k, column_tiles, l2_bytes):
     """Declared resident shares of the activation slice and repeated B panel.
 
     ``activation`` is the share of a column pass whose ``[m_e, K]`` slice is
-    already resident from the first pass. ``weight`` is the second-M-tile share
-    of a 256-column B panel that stays on chip; the concurrent working set
-    includes the slice re-read by every column pass of the rolling ASWT window.
+    already resident from the first pass. ``weight`` is the retention share of
+    a repeated 256-column B panel; the frequency of those repeats is per expert
+    (``m_tile_second_pass``), never inferred from the largest bank.  The
+    concurrent working set includes the slice re-read by every column pass of
+    the rolling ASWT window.
     """
     activation = activation_bank_bytes(rows, k)
     weight = weight_bank_bytes(rows, n, k)
     slice_share = l2_residency(activation, l2_bytes)
     working = weight + activation * max(1, int(column_tiles))
-    panel_share = l2_residency(working, l2_bytes) * m_tile_second_pass(rows)
+    panel_share = l2_residency(working, l2_bytes)
     return (slice_share * (max(1, int(column_tiles)) - 1) / max(1, int(column_tiles)),
             panel_share)
 
@@ -359,19 +363,29 @@ def build(op, geometry, *, l1_k=None, compact=True, compact_outputs=True):
     # schedule's working set, never a measured rate or model label.
     l2_bytes = int(effective_l2_bytes(geometry))
     column_tiles = ceil(n / tile.n)
-    activation_l2, weight_l2 = l2_fractions(rows, n, k, column_tiles, l2_bytes)
+    activation_l2, panel_retention = l2_fractions(
+        rows, n, k, column_tiles, l2_bytes)
+    # Only a bank that actually has a second 256-row M tile can re-read its B
+    # panel from L2.  Every active bank's first tile is cold HBM, so the
+    # retention share is applied per bank instead of to the aggregate weight
+    # sum with the largest bank's repeat fraction.
+    weight_l2_by_bank = tuple(
+        panel_retention * m_tile_second_pass(m) for m in rows)
 
-    def load_panel(m, width, kd):
+    def load_panel(bank, m, width, kd):
         return panel_work(m, width, kd, tile.k,
-                          activation_l2=activation_l2, weight_l2=weight_l2)
+                          activation_l2=activation_l2,
+                          weight_l2=weight_l2_by_bank[bank])
 
     scalar = Work(resources={'hbm': len(rows) * 8})
     total_work = scalar.scaled(cores)
-    shapes = Counter((m, width) for items in owners for _, m, width, _, _ in items)
-    for (m, width), occurrences in shapes.items():
+    shapes = Counter((bank, m, width) for items in owners
+                     for bank, m, width, _, _ in items)
+    for (bank, m, width), occurrences in shapes.items():
         work = Work(resources={'hbm': 2 * m * width, 'fixpipe': 2 * m * width})
         for start in range(0, k, tile.l1_k):
-            load, steps = load_panel(m, width, min(tile.l1_k, k - start))
+            load, steps = load_panel(
+                bank, m, width, min(tile.l1_k, k - start))
             work += load
             for a, b in steps:
                 work += a + b
@@ -392,15 +406,16 @@ def build(op, geometry, *, l1_k=None, compact=True, compact_outputs=True):
                     for key, v in s.work.items()), default=0)
 
             runs = tuple((key, sum(1 for _ in group))
-                         for key, group in groupby(items, key=lambda value: (value[1], value[2])))
+                         for key, group in groupby(
+                             items, key=lambda value: (value[0], value[1], value[2])))
 
             def repeated_output(index):
                 # Same-owner source output tiles are serial in this abstraction.
                 # Collapse only a consecutive run with identical physical work.
-                (m, width), repeat = runs[index]
+                (bank, m, width), repeat = runs[index]
                 count, tail = divmod(k, tile.l1_k)
                 def parts(kd):
-                    load, steps = load_panel(m, width, kd)
+                    load, steps = load_panel(bank, m, width, kd)
                     return stage('load', load), tuple((stage('operand', a),
                         stage('matrix', b, after=('operand',))) for a, b in steps)
                 full, end = parts(tile.l1_k) if count else None, parts(tail) if tail else None
@@ -435,11 +450,11 @@ def build(op, geometry, *, l1_k=None, compact=True, compact_outputs=True):
                     Stage('store', write.work, after=('steady',), placement=write.placement))
 
             def output(index):
-                _, m, width, _, _ = items[index]
+                bank, m, width, _, _ = items[index]
                 count, tail = divmod(k, tile.l1_k)
 
                 def parts(kd):
-                    load, steps = load_panel(m, width, kd)
+                    load, steps = load_panel(bank, m, width, kd)
                     return stage('load', load), tuple((stage('operand', a),
                         stage('matrix', b, after=('operand',))) for a, b in steps)
 
@@ -493,7 +508,9 @@ def build(op, geometry, *, l1_k=None, compact=True, compact_outputs=True):
             'buffers_per_owner': tile.buffers,
             'effective_l2_bytes': l2_bytes, 'column_tiles': column_tiles,
             'activation_l2_fraction': activation_l2,
-            'weight_l2_fraction': weight_l2},
+            'weight_l2_retention': panel_retention,
+            'weight_l2_fraction': max(weight_l2_by_bank, default=0.0),
+            'weight_l2_by_bank': weight_l2_by_bank},
         'execution_abstraction': ('source_same_owner_tile_runs_compact' if compact_outputs else
                                   'source_K_compact') if compact else 'source_K_detailed',
         'source_boundary': 'conditional_kernel',

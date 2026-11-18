@@ -26,6 +26,11 @@ CONV_STATE_RESOLVE_US = 2.65
 CONV_CALL_SETUP_US = 6.0
 #: A rolling state ring is single-buffered: token i+1 reads what token i wrote.
 CONV_TOKEN_SLOTS = 1
+#: Per-token vector expression: three window taps, the Silu/bias fixed term and
+#: the optional two-op bias add, each over the owned channel width.
+CONV_TOKEN_TAP_OPS = 3
+CONV_TOKEN_FIXED_OPS = 5
+CONV_TOKEN_BIAS_OPS = 2
 MS_PER_SECOND = 1000
 CONV_SOURCE = {
     "path": "data/observations/sources/native-causal-conv-a4a7958",
@@ -194,14 +199,29 @@ def conv_plan(op, geometry, *, compact=True):
             def memory(amount, role):
                 return context.bind(Work(resources={role: amount}).scaled(repeat))
             def token(index):
-                return (
+                stages = [
                     Stage("input", memory(n * 2, read), placement=owned),
                     Stage("convolution", context.bind(Work(resources={
-                        "vector": n * (3 * width + 5 + 2 * int(bias))}).scaled(repeat)),
+                        "vector": n * (CONV_TOKEN_TAP_OPS * width
+                                       + CONV_TOKEN_FIXED_OPS
+                                       + CONV_TOKEN_BIAS_OPS * int(bias))}).scaled(repeat)),
                           after=("input",), previous=("convolution",), placement=owned),
                     Stage("output", memory(n * 2, "mte3"),
                           after=("convolution",), placement=owned),
-                )
+                ]
+                if speculative and owns_state:
+                    stages.append(Stage("state_write",
+                                        memory(n * 2, "mte3"),
+                                        after=("input",), placement=owned))
+                elif state_write and index == q - 1:
+                    # ``causal_conv1d.h`` writes the last ``W-1`` history rows
+                    # from the ring updated by the final token input, so the
+                    # write follows that input load; it still overlaps the last
+                    # token's convolution/output instead of extending the task.
+                    stages.append(Stage("state_write",
+                                        memory(state_write * n * 2, "mte3"),
+                                        after=("input",), placement=owned))
+                return tuple(stages)
             history = width - 1 if owns_state else 0
             state_write = (2 + q) if (speculative and owns_state) else history
             stages = [
@@ -227,16 +247,13 @@ def conv_plan(op, geometry, *, compact=True):
                     resources={"hbm": stream_rows * n * 2}).scaled(repeat)),
                     after=("weights_cast",), placement=owned))
             # The retained-history reload is a prefetch for the speculative
-            # restore, and the ring write-back is a write-behind stream: both
-            # double-buffer against the token convolution instead of extending
-            # the token-critical path.
+            # restore; it may double-buffer against the token convolution.
             if speculative and owns_state:
                 stages.append(Stage("state_reload",
                                     memory((2 + q) * n * 2, read),
                                     after=("weights_cast",), placement=owned))
-            if state_write:
-                stages.append(Stage("state_write",
-                                    memory(state_write * n * 2, "mte3"),
+                stages.append(Stage("state_retained_write",
+                                    memory(2 * n * 2, "mte3"),
                                     after=("weights_cast",), placement=owned))
             return (Stage("sequence", program=KernelProgram(tuple(stages))),)
         def owner_program(owner):

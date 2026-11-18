@@ -275,6 +275,20 @@ def test_qkv_norm_rope_writes_every_declared_output_and_names_ports():
     gate_ports = [entry for entry in input_ports(by_id["s0.l3.output_gate"])
                   if entry.get("output") == "gate"]
     assert gate_ports
+    # The fused query producer feeds attention directly; the cache edge alone
+    # carries key/value and would leave the query output unbound.
+    attention = by_id["s0.l3.attention"]
+    assert fused.op_id in attention.deps
+    assert any(entry.get("op") == fused.op_id
+               and entry.get("output") == "query"
+               for entry in input_ports(attention))
+    from mindie_sim.prediction.implementations import consumer_index
+    _, consumers = consumer_index(ops)
+    assert any(consumer.op_id == attention.op_id
+               and any(entry.get("op") == fused.op_id
+                       and entry.get("output") == "query"
+                       for entry in input_ports(consumer))
+               for _, consumer in consumers.get(fused.op_id, ()))
 
 
 def test_kda_l2norm_is_retained_for_a_second_sequence_or_phase():

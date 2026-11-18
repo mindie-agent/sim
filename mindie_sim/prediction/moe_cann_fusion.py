@@ -74,7 +74,8 @@ _GATING_FIELDS = frozenset({"implementation", "enabled", "native_kind", "source"
 #: The six serial UB stages below partition one wave's declared row program;
 #: their cycles are the source's own instruction recurrences, not a fit.
 GATING_AIV_UNITS = 64
-FP32_LANES = 64
+GATING_MIN_GROUPS = 1
+GATING_PIPELINE_SLOTS = 1
 GATING_PROLOGUE_DRAIN_CYCLES = 11517
 GATING_LOGITS_BIAS_CYCLES = 380
 GATING_SIGMOID_CYCLES = 470
@@ -98,11 +99,17 @@ def _a5_row_wave(geometry) -> bool:
     return int(units.get("vector", 0)) >= GATING_AIV_UNITS
 
 
+def _effective_groups(meta) -> int:
+    """Declared router groups, with an ungrouped router treated as one group."""
+    return max(GATING_MIN_GROUPS, int(meta.get("groups", 0) or 0))
+
+
 def _group_limited(op) -> bool:
     meta = dict(op.metadata)
+    groups = _effective_groups(meta)
     return (int(meta.get("num_experts", 0) or 0) > 0
-            and int(meta.get("groups", 0) or 0) > 0
-            and int(meta.get("group_topk", 0) or 0) > 0
+            and (groups <= GATING_MIN_GROUPS
+                 or int(meta.get("group_topk", 0) or 0) > 0)
             and bool(meta.get("noaux_tc")))
 
 
@@ -141,21 +148,25 @@ def build_moe_gating_topk(op, geometry):
     read = float(op.hbm_bytes) - float(op.mte3_bytes)
     write = float(op.mte3_bytes)
     logical_vector = float(op.vector_ops)
-    vector = logical_vector
-    # One 64-AIV wave per covered token block; the last block is partial.
-    wave_ops = GATING_AIV_UNITS * FP32_LANES
-    row_work = 0.0
-    for wave in range(waves):
-        covered = min(GATING_AIV_UNITS, tokens - wave * GATING_AIV_UNITS)
-        row_work += wave_ops * sum(_wave_cycles(
-            meta, covered / GATING_AIV_UNITS))
-    vector += row_work
+    # One serial UB pipeline is issued per covered token on its own AIV; each
+    # stage's instruction recurrence is modeled as serial stage latency while
+    # conserving ``op.vector_ops`` across plan, bound context and Engine trace.
     work = Work(resources={"hbm": read + write, "mte2": read,
-                           "mte3": write, "vector": vector})
+                           "mte3": write, "vector": logical_vector})
 
     def program(context):
-        placement = context.owned(0, 1, ("mte2_aiv", "vector", "mte3"))
         clock_ms = GATING_NOMINAL_CLOCK_HZ / MS_PER_SECOND
+        read_name = context.physical_role("mte2_aiv")
+        read_name = (read_name if read_name in context.resource_names
+                     else context.read_pipe(aiv=0))
+        stage_roles = tuple(role for role in (read_name, "vector", "mte3")
+                            if role in context.resource_names)
+        stage_count = len(GATING_WAVE_STAGES)
+
+        def placement(active):
+            units = tuple(range(active))
+            return {context.resource_names[role]: units
+                    for role in stage_roles}
 
         def tile(wave):
             covered = min(GATING_AIV_UNITS, tokens - wave * GATING_AIV_UNITS)
@@ -163,21 +174,21 @@ def build_moe_gating_topk(op, geometry):
             token_share = covered / tokens
             loads = read * token_share
             stores = write * token_share
-            ops = [wave_ops * value for value in _wave_cycles(meta, share)]
-            if wave == 0:
-                # The fused member expression's declared logical Vector work
-                # rides the first wave's logits/bias stage unchanged.
-                ops[0] += logical_vector
+            cycles = _wave_cycles(meta, share)
+            stage_vector = (logical_vector * token_share) / stage_count
+            owned = placement(covered)
             stages = []
             previous = ()
             for index, name in enumerate(GATING_WAVE_STAGES):
-                resources = {"vector": ops[index]}
+                resources = {"vector": stage_vector}
                 if index == 0:
                     resources.update({"hbm": loads, "mte2": loads})
-                if index == len(GATING_WAVE_STAGES) - 1:
+                if index == stage_count - 1:
                     resources.update({"hbm": stores, "mte3": stores})
-                stages.append(Stage(name, context.bind(Work(resources=resources)),
-                                    after=previous, placement=placement))
+                stages.append(Stage(
+                    name, context.bind(Work(resources=resources)),
+                    latency=cycles[index] / clock_ms,
+                    after=previous, placement=owned))
                 previous = (name,)
             return tuple(stages)
 
@@ -185,15 +196,16 @@ def build_moe_gating_topk(op, geometry):
             Stage("kernel_prologue_drain",
                   latency=GATING_PROLOGUE_DRAIN_CYCLES / clock_ms),
             Stage("row_waves", after=("kernel_prologue_drain",),
-                  program=PipelineProgram(waves, 2, tile)),
+                  program=PipelineProgram(waves, GATING_PIPELINE_SLOTS, tile)),
         ))
 
     return OperatorPlan(work, program, {
         "native_kind": meta.get("native_kind"),
         "row_waves": waves,
-        "row_program": {"aiv_units": GATING_AIV_UNITS,
+        "row_program": {"aiv_units": min(tokens, GATING_AIV_UNITS),
                         "wave_stages": GATING_WAVE_STAGES,
                         "wave_cycles": _wave_cycles(meta),
+                        "effective_groups": _effective_groups(meta),
                         "prologue_drain_cycles": GATING_PROLOGUE_DRAIN_CYCLES},
     })
 

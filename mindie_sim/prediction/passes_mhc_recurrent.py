@@ -318,10 +318,13 @@ def _qkv_source_map(ops, member_ids):
 
 
 def _qkv_port_for(op, source, member_ports):
-    if source in member_ports:
-        return member_ports[source]
+    # Attention consumes the query plane; the cache store consumes key/value.
+    # The fused anchor's member port is the key plane, so resolving members
+    # first would mis-bind the query output to a key consumer edge.
     if op.family == "attention":
         return "query"
+    if source in member_ports:
+        return member_ports[source]
     return "key"
 
 
