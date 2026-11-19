@@ -486,6 +486,7 @@ def activation_quant_fusion(ops, source_dtype):
             continue
         act = by_id.get(quant.deps[0])
         if (act is None or act.plan_required or act.family not in {"swiglu", "situ", "geglu"}
+                or float(dict(act.metadata).get("activation_limit", 0.0) or 0.0) > 0.0
                 or act.stage != quant.stage or act.stream != quant.stream):
             continue
         if users[act.op_id] != [quant.op_id]:

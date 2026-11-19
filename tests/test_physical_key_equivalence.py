@@ -42,7 +42,8 @@ def test_corresponding_layers_share_one_physical_identity():
 def test_shape_dtype_bytes_state_and_local_tp_change_identity():
     _case, ops = _graph()
     op = next(item for item in ops
-              if item.recipe == "rmsnorm" and len(item.local_shape) >= 2)
+              if item.family in {"rmsnorm", "rmsnorm_quant", "add_rmsnorm"}
+              and len(item.local_shape) >= 2)
     baseline = physical_signature(op)
     for changed in (
         replace(op, local_shape=(int(op.local_shape[0]) + 1, *op.local_shape[1:])),

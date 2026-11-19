@@ -315,6 +315,7 @@ def apply_attention_prefix_reads(
             component="kv",
             logical_rows=int(sweeps),
             unique_rows=0 if unique_caps is None else max(0, unique_caps[idx]),
+            window_tokens=0,
             shared_intervals=() if interval_caps is None else interval_caps[idx],
         ))
     read_mode = str(getattr(runtime, "prefix_read_mode", "auto") or "auto")

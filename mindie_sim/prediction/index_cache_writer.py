@@ -83,164 +83,120 @@ STEP5_SUMMARY_SOURCE["source_sha256"] = (
 )
 
 
-def _resolve_mode(mode: str, *, cache_dtype: str, compress_ratio: int) -> str:
+def _resolve_mode(mode: str, *, cache_dtype: str, compress_ratio: int, step5_summary: bool = False) -> str:
     tag = str(mode or "auto").strip().lower()
     if tag != "auto":
         return tag
+    if step5_summary:
+        return "step5_summary_update"
     if compress_ratio > 1:
         return "qsa_dual_pages"
-    if cache_dtype in {"bf16", "fp16", "bfloat16", "float16"}:
-        return "scatter_pa_kv_cache"
-    return "c8_indexer_quant_cache"
+    return "scatter_pa_kv_cache" if cache_dtype in {"bf16", "fp16", "bfloat16", "float16"} else "c8_indexer_quant_cache"
 
 
 def emit_index_cache_write(
-    *,
-    mode: str = "auto",
-    op_id: str,
-    deps: tuple[str, ...] = (),
-    stage: int = 0,
-    layer: int = 0,
-    requests: tuple[str, ...] = (),
-    phase: str = "decode",
-    rows: int,
-    dim: int,
-    heads: int = 1,
-    input_dtype: str = "bf16",
-    cache_dtype: str = "fp8_e4m3",
-    scale_dtype: str = "fp32",
-    group_size: int = DEFAULT_SCALE_GROUP_WIDTH,
-    compress_ratio: int = 1,
-    block_size: int = DEFAULT_STEP5_REGION_BLOCK,
-    owns_index_k: bool = True,
-    row_bytes: int | None = None,
-    metadata: tuple[tuple[str, Any], ...] = (),
+    *, mode: str = "auto", op_id: str = "", prefix: str = "", deps: tuple[str, ...] = (),
+    stage: int = 0, layer: int = 0, requests: tuple[str, ...] = (), phase: str = "decode",
+    rows: int, completed_rows: int | None = None, dim: int = 0, index_dim: int | None = None,
+    heads: int = 1, input_dtype: str | None = None, cache_dtype: str | None = None,
+    scale_dtype: str | None = None, group_size: int = DEFAULT_SCALE_GROUP_WIDTH,
+    compress_ratio: int | None = None, block_size: int | None = None,
+    owns_index_k: bool | None = None, row_bytes: int | float | None = None,
+    plan: Any = None, model: Any = None, quant: Any = None, runtime: Any = None,
+    machine: Any = None, metadata: tuple[tuple[str, Any], ...] = (),
 ) -> list[OpSpec]:
     """Emit the single native paged index/summary cache write op for a layer."""
-    if not owns_index_k or int(rows) <= 0 or int(dim) <= 0:
-        return []
-    total_rows = int(rows)
-    width = int(dim)
-    head_count = max(1, int(heads))
-    in_bytes = float(dtype_bytes(input_dtype))
-    selected = _resolve_mode(
-        mode, cache_dtype=cache_dtype, compress_ratio=int(compress_ratio),
+    del runtime, machine
+    resolved_owns = owns_index_k if owns_index_k is not None else (
+        bool(getattr(plan, "owns_index_k", False) or getattr(plan, "indexer", False)) if plan is not None else True
     )
+    width = int(index_dim if index_dim is not None else dim)
+    if not resolved_owns or width <= 0:
+        return []
+    resolved_op_id = str(op_id or (f"{prefix}.index_store" if prefix else "index_store"))
+    total_rows, head_count = max(0, int(rows)), max(1, int(heads))
+    resolved_in_dtype = str(input_dtype or (getattr(model, "activation_dtype", None) if model is not None else None) or "bf16")
+    resolved_cache_dtype = str(cache_dtype or (getattr(quant, "index_dtype", None) if quant is not None else None) or "fp8_e4m3")
+    default_scale = "none" if resolved_cache_dtype in {"bf16", "fp16", "bfloat16", "float16"} else "fp32"
+    resolved_scale_dtype = str(scale_dtype or (getattr(quant, "index_scale_dtype", None) if quant is not None else None) or default_scale)
+    plan_kpool = int(getattr(plan, "index_kpool", 1) or 1) if plan is not None else 1
+    plan_compress = int(getattr(plan, "compress_ratio", 1) or 1) if plan is not None else 1
+    resolved_ratio = int(compress_ratio) if compress_ratio is not None else max(
+        1, plan_kpool if getattr(plan, "index_kpool_compress", False) else 1, plan_compress
+    )
+    step5_summary = bool(plan is not None and getattr(plan, "index_kpool_compress", False) and getattr(plan, "q_output_gate_kind", "none") == "headwise")
+    resolved_block = int(block_size) if block_size is not None else (plan_kpool if step5_summary and plan_kpool > 1 else DEFAULT_STEP5_REGION_BLOCK)
+    in_bytes, out_elem = float(dtype_bytes(resolved_in_dtype)), float(dtype_bytes(resolved_cache_dtype))
+    scale_bytes = float(dtype_bytes(resolved_scale_dtype)) if resolved_scale_dtype != "none" else 0.0
+    selected = _resolve_mode(mode, cache_dtype=resolved_cache_dtype, compress_ratio=resolved_ratio, step5_summary=step5_summary)
 
     if selected in {"scatter_pa_kv_cache", "bf16_scatter_pa"}:
-        out_elem = float(dtype_bytes(cache_dtype))
-        payload = float(total_rows * head_count * width)
-        slot_bytes = float(total_rows * SLOT_INDEX_BYTES)
-        write_bytes = (
-            float(total_rows * int(row_bytes))
-            if row_bytes is not None else payload * out_elem
-        )
-        op = vector_op(
-            op_id=op_id, deps=deps, stage=stage, layer=layer, requests=requests,
-            phase=phase, family=KV_CACHE_WRITE_FAMILY, recipe=SCATTER_PA_KV_RECIPE,
-            dtype=cache_dtype, elements=int(payload), ops_per_element=0.0,
-            read_bytes_override=payload * in_bytes + slot_bytes,
-            write_bytes_override=write_bytes,
-            shape=(total_rows, head_count, width),
+        payload, slot_bytes = float(total_rows * head_count * width), float(total_rows * SLOT_INDEX_BYTES)
+        write_bytes = float(total_rows) * float(row_bytes) if row_bytes is not None else payload * out_elem
+        return [vector_op(
+            op_id=resolved_op_id, deps=deps, stage=stage, layer=layer, requests=requests, phase=phase,
+            family=KV_CACHE_WRITE_FAMILY, recipe=SCATTER_PA_KV_RECIPE, dtype=resolved_cache_dtype,
+            elements=int(payload), ops_per_element=0.0, read_bytes_override=payload * in_bytes + slot_bytes,
+            write_bytes_override=write_bytes, shape=(total_rows, head_count, width),
             metadata=metadata + (
-                ("native_kind", "aclnnScatterPaKvCache"),
-                ("read_pipe", "aiv"),
-                ("slot_table_bytes", slot_bytes),
-                ("zero_external_casts", True),
-                ("native_source", SCATTER_PA_KV_SOURCE),
+                ("native_kind", "aclnnScatterPaKvCache"), ("read_pipe", "aiv"),
+                ("slot_table_bytes", slot_bytes), ("zero_external_casts", True), ("native_source", SCATTER_PA_KV_SOURCE),
             ),
-        )
-        return [op]
+        )]
 
     if selected == "qsa_dual_pages":
-        ratio = max(1, int(compress_ratio or DEFAULT_QSA_COMPRESS_RATIO))
-        compressed_rows = max(1, math.ceil(total_rows / ratio))
+        ratio = max(1, int(resolved_ratio or DEFAULT_QSA_COMPRESS_RATIO))
+        comp_rows = max(0, int(completed_rows)) if completed_rows is not None else (math.ceil(total_rows / ratio) if total_rows > 0 else 0)
         raw_tail_rows = min(total_rows, 2 * ratio)
-        out_elem = float(dtype_bytes(cache_dtype))
         read_bytes = float(total_rows * width * in_bytes + total_rows * SLOT_INDEX_BYTES)
-        raw_write = float(raw_tail_rows * width * in_bytes)
-        comp_write = float(compressed_rows * width * out_elem)
-        op = vector_op(
-            op_id=op_id, deps=deps, stage=stage, layer=layer, requests=requests,
-            phase=phase, family=KV_CACHE_WRITE_FAMILY, recipe=QSA_DUAL_CACHE_RECIPE,
-            dtype=cache_dtype, elements=total_rows * width,
-            ops_per_element=float(POOL_REDUCE_OPS_PER_ELEMENT),
-            read_bytes_override=read_bytes,
-            write_bytes_override=raw_write + comp_write,
-            shape=(compressed_rows, width),
+        write_bytes = float(raw_tail_rows * width * in_bytes + comp_rows * width * out_elem)
+        return [vector_op(
+            op_id=resolved_op_id, deps=deps, stage=stage, layer=layer, requests=requests, phase=phase,
+            family=KV_CACHE_WRITE_FAMILY, recipe=QSA_DUAL_CACHE_RECIPE, dtype=resolved_cache_dtype,
+            elements=total_rows * width, ops_per_element=float(POOL_REDUCE_OPS_PER_ELEMENT),
+            read_bytes_override=read_bytes, write_bytes_override=write_bytes,
+            shape=(max(total_rows, comp_rows), width),
             metadata=metadata + (
-                ("native_kind", "qsa_dual_page_cache_write"),
-                ("read_pipe", "aiv"),
-                ("compress_ratio", ratio),
-                ("raw_circular_rows", raw_tail_rows),
-                ("compressed_rows", compressed_rows),
-                ("native_source", QSA_CACHE_SOURCE),
+                ("native_kind", "qsa_dual_page_cache_write"), ("read_pipe", "aiv"), ("compress_ratio", ratio),
+                ("raw_circular_rows", raw_tail_rows), ("compressed_rows", comp_rows), ("native_source", QSA_CACHE_SOURCE),
             ),
-        )
-        return [op]
+        )]
 
     if selected == "step5_summary_update":
-        region = max(1, int(block_size or DEFAULT_STEP5_REGION_BLOCK))
-        summary_rows = max(1, math.ceil(total_rows / region))
-        scale_bytes = float(dtype_bytes(scale_dtype)) if scale_dtype != "none" else 0.0
-        out_elem = float(dtype_bytes(cache_dtype))
+        region = max(1, int(resolved_block or DEFAULT_STEP5_REGION_BLOCK))
+        summary_rows = max(0, int(completed_rows)) if completed_rows is not None else (math.ceil(total_rows / region) if total_rows > 0 else 0)
         tail_rows = min(total_rows, region)
-        read_bytes = float(
-            total_rows * head_count * width * in_bytes + summary_rows * SLOT_INDEX_BYTES
-        )
-        summary_write = float(summary_rows * head_count * (width * out_elem + scale_bytes))
-        tail_write = float(tail_rows * head_count * width * in_bytes)
-        op = vector_op(
-            op_id=op_id, deps=deps, stage=stage, layer=layer, requests=requests,
-            phase=phase, family=INDEXER_QUANT_CACHE_FAMILY, recipe=STEP5_SUMMARY_RECIPE,
-            dtype=cache_dtype, elements=total_rows * head_count * width,
-            ops_per_element=float(SSMAX_OPS_PER_ELEMENT),
-            read_bytes_override=read_bytes,
-            write_bytes_override=summary_write + tail_write,
-            shape=(summary_rows, head_count, width),
+        read_bytes = float(total_rows * head_count * width * in_bytes + summary_rows * SLOT_INDEX_BYTES)
+        write_bytes = float(summary_rows * head_count * (width * out_elem + scale_bytes) + tail_rows * head_count * width * in_bytes)
+        return [vector_op(
+            op_id=resolved_op_id, deps=deps, stage=stage, layer=layer, requests=requests, phase=phase,
+            family=INDEXER_QUANT_CACHE_FAMILY, recipe=STEP5_SUMMARY_RECIPE, dtype=resolved_cache_dtype,
+            elements=total_rows * head_count * width, ops_per_element=float(SSMAX_OPS_PER_ELEMENT),
+            read_bytes_override=read_bytes, write_bytes_override=write_bytes,
+            shape=(max(total_rows, summary_rows), head_count, width),
             metadata=metadata + (
-                ("native_kind", "step5_csa_summary_update"),
-                ("read_pipe", "aiv"),
-                ("region_block_size", region),
-                ("summary_rows", summary_rows),
-                ("summary_reduction", "ssmax"),
-                ("native_source", STEP5_SUMMARY_SOURCE),
+                ("native_kind", "step5_csa_summary_update"), ("read_pipe", "aiv"), ("region_block_size", region),
+                ("summary_rows", summary_rows), ("summary_reduction", "ssmax"), ("native_source", STEP5_SUMMARY_SOURCE),
             ),
-        )
-        return [op]
+        )]
 
     if selected in {"c8_indexer_quant_cache", "indexer_quant_cache"}:
         group = max(1, int(group_size or width))
         groups = max(1, math.ceil(width / group))
-        scale_bytes = float(dtype_bytes(scale_dtype)) if scale_dtype != "none" else 0.0
-        out_elem = float(dtype_bytes(cache_dtype))
-        per_row = (
-            float(row_bytes)
-            if row_bytes is not None
-            else head_count * (width * out_elem + groups * scale_bytes)
-        )
-        slot_bytes = float(total_rows * SLOT_INDEX_BYTES)
-        payload = total_rows * head_count * width
-        op = vector_op(
-            op_id=op_id, deps=deps, stage=stage, layer=layer, requests=requests,
-            phase=phase, family=INDEXER_QUANT_CACHE_FAMILY,
-            recipe=C8_INDEXER_CACHE_RECIPE,
-            dtype=cache_dtype, elements=payload,
-            ops_per_element=float(QUANT_OPS_PER_ELEMENT),
+        per_row = float(row_bytes) if row_bytes is not None else head_count * (width * out_elem + groups * scale_bytes)
+        slot_bytes, payload = float(total_rows * SLOT_INDEX_BYTES), total_rows * head_count * width
+        return [vector_op(
+            op_id=resolved_op_id, deps=deps, stage=stage, layer=layer, requests=requests, phase=phase,
+            family=INDEXER_QUANT_CACHE_FAMILY, recipe=C8_INDEXER_CACHE_RECIPE, dtype=resolved_cache_dtype,
+            elements=payload, ops_per_element=float(QUANT_OPS_PER_ELEMENT),
             read_bytes_override=float(payload) * in_bytes + slot_bytes,
-            write_bytes_override=float(total_rows) * per_row,
-            shape=(total_rows, head_count, width),
+            write_bytes_override=float(total_rows) * per_row, shape=(total_rows, head_count, width),
             metadata=metadata + (
-                ("native_kind", "aclnnIndexerQuantCache"),
-                ("read_pipe", "aiv"),
-                ("payload_dtype", cache_dtype),
-                ("scale_dtype", scale_dtype),
-                ("group_size", group),
-                ("single_read_single_write", True),
-                ("native_source", SFA_INDEXER_CACHE_SOURCE),
+                ("native_kind", "aclnnIndexerQuantCache"), ("read_pipe", "aiv"),
+                ("payload_dtype", resolved_cache_dtype), ("scale_dtype", resolved_scale_dtype),
+                ("group_size", group), ("single_read_single_write", True), ("native_source", SFA_INDEXER_CACHE_SOURCE),
             ),
-        )
-        return [op]
+        )]
 
     raise ModelingError(f"unsupported_index_cache_write_mode:{mode}")
 
@@ -269,6 +225,19 @@ def build_index_cache_writer(op: OpSpec, geometry: Geometry) -> OperatorPlan:
     read_bytes = float(op.mte2_bytes)
     write_bytes = float(op.mte3_bytes)
     vec_ops = float(op.vector_ops)
+    meta = dict(op.metadata)
+    source = meta.get("native_source") or SFA_INDEXER_CACHE_SOURCE
+    if read_bytes <= 0.0 and write_bytes <= 0.0 and vec_ops <= 0.0:
+        return OperatorPlan(
+            Work(),
+            lambda _ctx: KernelProgram((Stage("empty_cache_write", keep_empty=True),)),
+            {
+                "execution_class": "vector",
+                "active_aiv_owners": 0,
+                "l2_slot_table_bytes": 0.0,
+                "source_program": source,
+            },
+        )
 
     has_l2 = bool((geometry.rates or {}).get("l2", 0.0)
                   or (geometry.resource_units or {}).get("l2", 0))

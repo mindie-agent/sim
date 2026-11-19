@@ -37,6 +37,7 @@ from .implementations import (
 )
 
 _OWNED_FUSION_ROLES = ("mla_prolog", "compressor")
+_BINARY_RESIDUAL_INPUTS = 2
 _NORM_QUANT_SEMANTIC_KEYS = (
     "reduction_width", "norm_eps", "epsilon",
     "activation_group_size", "activation_scale_shape", "activation_scale_format",
@@ -292,6 +293,7 @@ def residual_norm(ops, _, *, capture_state=None):
             continue
         residual = by_id.get(norm.deps[0])
         if (residual is None or residual.plan_required or residual.recipe != "residual_add"
+                or len(residual.deps) != _BINARY_RESIDUAL_INPUTS
                 or residual.op_id in removed or norm.stage != residual.stage
                 or norm.stream != residual.stream
                 or math.prod(norm.local_shape) != math.prod(residual.local_shape)

@@ -36,6 +36,7 @@ ALLOWED_CONTEXT_PROJECTION_MODES: frozenset[str] = frozenset({
     "fused_kv_bank",
     "per_layer_qkv",
     "mla_prolog",
+    "shared_compressed_kv",
 })
 
 
@@ -191,6 +192,8 @@ class DraftSpec:
             )
         if not isinstance(self.independent_context, bool):
             raise ModelingError("catalog_draft_independent_context_invalid")
+        if self.context_projection_mode == "shared_compressed_kv" and self.independent_context:
+            raise ModelingError("catalog_draft_shared_compressed_kv_requires_target_context")
         if not isinstance(self.dcp_sharded, bool):
             raise ModelingError("catalog_draft_dcp_sharded_invalid")
         if self.confidence_enabled:

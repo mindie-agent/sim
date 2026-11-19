@@ -328,6 +328,8 @@ def build_swiglu_mx_quant(op, geometry):
 class ScopedSwigluRecipe(PlannedRecipe):
     """Register the A5 group-32 row planner without rebinding other quantize ops."""
 
+    traffic_rewrite_capable: bool = True
+
     def prepare(self, op, geometry):
         if not (_a5_row_wave(geometry) and _mx_group32(op)):
             from .physical_recipe_registry import VECTOR

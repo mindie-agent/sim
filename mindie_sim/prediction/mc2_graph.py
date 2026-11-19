@@ -156,9 +156,10 @@ def select_common(runtime, features=None, *, tokens, top_k, experts, ep):
     explicit = select(kernels)
     if explicit is not None:
         return explicit
-    if EXPLICIT_ROUTING_LOWERINGS & set(kernels.get("lowerings") or {}):
-        # An explicitly lowered routing/init kernel owns the expert input
-        # representation; automatic MC2 selection must not replace it.
+    if (EXPLICIT_ROUTING_LOWERINGS & set(kernels.get("lowerings") or {})
+            or bool(getattr(runtime, "enable_dbo", False))):
+        # An explicitly lowered routing/init kernel or DBO microbatch split owns
+        # the expert input representation; automatic MC2 selection must not replace it.
         return None
     rmeta = dict(getattr(runtime, "metadata", ()) or ())
     radditional = rmeta.get("additional_config")
@@ -280,14 +281,23 @@ def lower(ops, *, runtime, prefix, tokens, top_k, width, experts, ep,
                   and pmeta.get("activation_scale_format") == "fp32"
                   and gmeta.get("activation_format") == "int8"):
                 quant = "per_token_int8"
-    if selected.get("selected_method") == FUSED_MC2 and received_assignments:
+    parallel_cfg = getattr(runtime, "parallel", None)
+    has_redundant_slots = int(getattr(parallel_cfg, "redundant_experts_per_rank", 0) or 0) > 0
+    if (selected.get("selected_method") == FUSED_MC2
+            and received_assignments
+            and not has_redundant_slots
+            and not bool(getattr(runtime, "enable_dbo", False))):
         e_up = by_id.get(prefix + ".expert_up")
         e_act = by_id.get(prefix + ".expert_act")
         e_down = by_id.get(prefix + ".expert_down")
         up_meta = dict(e_up.metadata) if e_up is not None else {}
         e_comp = str(up_meta.get("compute_format") or "").lower()
         e_wfmt = str(up_meta.get("weight_format") or "").lower()
-        mxfp_eligible = (
+        mx_act = (
+            up_meta.get("activation_group_size") == MX_DISPATCH_GROUP
+            and up_meta.get("activation_scale_format") in {"fp8_e8m0", "e8m0"}
+        )
+        mxfp_eligible = mx_act and (
             e_comp in {"fp8_e4m3", "mxfp4", "fp4_e2m1"}
             or e_wfmt in {"mxfp8", "mxfp4", "fp8_e4m3", "fp4_e2m1"}
         )
@@ -360,6 +370,14 @@ def lower(ops, *, runtime, prefix, tokens, top_k, width, experts, ep,
                         combine_link_bytes=float(combine.link_bytes),
                         shared_inter=sh_inter, shared_w13_bytes=sh_w13,
                         shared_w2_bytes=sh_w2,
+                        extra_metadata=(
+                            ("device_kernel_group", {
+                                "id": prefix + ".megamoe",
+                                "entry": True,
+                                "exit": True,
+                                "kernel": megamoe_arch35.NATIVE_KIND,
+                            }),
+                        ),
                     )
                     rebuilt = []
                     inserted = False

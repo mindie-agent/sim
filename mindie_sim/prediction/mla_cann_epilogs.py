@@ -121,6 +121,17 @@ def raw_eager_requested(runtime):
     return _policy(runtime)[2]
 
 
+def _is_a5_runtime(runtime) -> bool:
+    if runtime is None:
+        return False
+    meta = dict(getattr(runtime, "metadata", ()) or ())
+    fam = str(meta.get("arch_family") or "").upper()
+    if fam:
+        return fam == "A5"
+    hw = str(getattr(runtime, "hardware", "") or "").lower()
+    return hw.startswith(("a5", "ascend950"))
+
+
 NATIVE_LIGHTNING_INDEXER_IMPLEMENTATIONS = frozenset({
     "cann_bf16_lightning_indexer_v2_complete",
     "cann_c8_lightning_indexer",
@@ -394,9 +405,17 @@ def lower_index_path(builder, *, plan, model, quant, parallel, views, deps, runt
                     b.ops[-1] = set_input_ports(b.ops[-1], ({
                         "op": index_source, "output": "latent",
                         "source_op": index_source},))
+            explicit_quant_indexer = (
+                runtime is not None
+                and select(dict(getattr(runtime, "kernels", {}).get("lowerings", {}) or {}),
+                           "quant_lightning_indexer") is not None
+            )
             normalized = index_layer_norm(
                 b, source=projected, rows=index_rows, width=plan.index_dim,
-                native=native_indexer)
+                native=native_indexer and (
+                    _is_a5_runtime(runtime)
+                    or explicit_quant_indexer
+                    or quant.index_dtype not in {"bf16", "fp16", "fp32"}))
             if index_rope:
                 normalized = b.vector(
                     "index_rotary", (normalized,), index_rows * index_rope, ROPE_OPS,

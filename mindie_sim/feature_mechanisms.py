@@ -37,9 +37,9 @@ SERIAL_CONTEXT_DEGREE = 1
 
 PASS_PRIORITY_ORDER: tuple[str, ...] = (
     "activation_quantization",
-    "moe_tail_residual",
     "norm_quant",
     "residual_norm",
+    "moe_tail_residual",
     "mhc_boundary_pr",
     "mhc_boundary_ideal",
     "indexer_online_topk",

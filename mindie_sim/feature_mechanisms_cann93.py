@@ -46,6 +46,8 @@ from mindie_sim.prediction.gdn_domain import (
 MSA_MIN_BLOCK_SIZE = 64
 FUSED_MC2_ROUTED_MODE = 2
 FUSED_MC2_SHARED_MODE = 3
+QSA_MROPE_DECODE_MAX_ROWS = 64
+TEXT_GATED_RESIDUAL_MIN_ROWS = 257
 
 
 MXFP_EXPERT_WEIGHT_FORMATS = frozenset({"mxfp4", "mxfp8", "fp4_e2m1"})
@@ -112,10 +114,18 @@ def _apply_gdn_chunk32(rt: dict[str, Any], ctx: MechanismContext) -> None:
     _set_lowering(rt, "gdn_prefill", "gdn_prefill_arch35")
 
 
+def _ep_within_ub_domain(ctx: MechanismContext) -> bool:
+    ep = int(ctx.parallel.get("ep", 1))
+    rpn = int((ctx.options or {}).get("ranks_per_node", 0) or 0)
+    return ep > 1 and (rpn <= 0 or ep <= rpn)
+
+
 def _apply_cann_megamoe(rt: dict[str, Any], ctx: MechanismContext) -> None:
     if "moe_comm_mode" in ctx.caller_explicit:
         return
-    if int(ctx.parallel.get("ep", 1)) <= 1:
+    if not _ep_within_ub_domain(ctx):
+        return
+    if bool(rt.get("enable_dbo", False)) or int(ctx.parallel.get("redundant_experts_per_rank", 0) or 0) > 0:
         return
     has_latent_or_situ = any(
         p.ffn == "moe" and (p.expert_latent_size > 0 or p.ffn_activation == "situ")
@@ -132,16 +142,21 @@ def _apply_cann_megamoe(rt: dict[str, Any], ctx: MechanismContext) -> None:
     _update_additional(rt, enable_mega_moe=1, enable_fused_mc2=level)
 
 
-def _apply_qsa_gbsa_fusion(rt: dict[str, Any], _ctx: MechanismContext) -> None:
-    _append_passes(rt, "qkv_norm_rope", "indexer_online_topk")
+def _apply_qsa_gbsa_fusion(rt: dict[str, Any], ctx: MechanismContext) -> None:
+    phase = str((ctx.options or {}).get("phase") or "decode")
+    if phase == "decode":
+        _append_passes(rt, "qkv_norm_rope")
+    _append_passes(rt, "indexer_online_topk")
     _set_layout_strided(rt, "gdn_gating", "beta", "alpha")
     _set_layout_strided(rt, "short_convolution", "input")
-    _update_meta(rt, qsa_gbsa_fused=True)
+    _update_meta(rt, qsa_gbsa_fused=True, qsa_mrope_decode_max_rows=QSA_MROPE_DECODE_MAX_ROWS)
 
 
 def _apply_text_gated_residual(rt: dict[str, Any], ctx: MechanismContext) -> None:
     _apply_mhc_fusion_overlap(rt, ctx)
-    _update_meta(rt, text_gated_residual=True)
+    phase = str((ctx.options or {}).get("phase") or "")
+    if phase != "decode":
+        _update_meta(rt, text_gated_residual=True, text_gated_residual_min_rows=TEXT_GATED_RESIDUAL_MIN_ROWS)
 
 
 def _apply_msa_score_v2(rt: dict[str, Any], _ctx: MechanismContext) -> None:
@@ -190,7 +205,7 @@ def register_cann93_mechanisms() -> None:
         ),
         OptimizationMechanism(
             id="gdn_chunk32_prefill", category="recurrent", phases=("prefill",),
-            summary="Arch35 fla-npu Chunk32 GDN prefill composite admitting arbitrary integral Hv/Hk ratios",
+            summary="Arch35 fla-npu Chunk32 GDN prefill composite for Hv/Hk in {1,2,3,4}",
             eligible=lambda ctx: (
                 ctx.arch == "a5"
                 and model_supports_gdn_chunk32(ctx.model, int(ctx.parallel.get("tp", 1)))
@@ -202,7 +217,8 @@ def register_cann93_mechanisms() -> None:
             summary="CANN 9.3 MegaMoE composite Dispatch+GMM1+ActMxQuant+GMM2+[SharedExpert]+Combine",
             eligible=lambda ctx: (
                 ctx.arch == "a5"
-                and int(ctx.parallel.get("ep", 1)) > 1
+                and _ep_within_ub_domain(ctx)
+                and int(ctx.parallel.get("redundant_experts_per_rank", 0) or 0) == 0
                 and any(p.ffn == "moe" for p in ctx.model.layer_plans)
                 and _is_mxfp_moe(ctx)
             ),
@@ -242,8 +258,8 @@ def register_cann93_mechanisms() -> None:
         ),
         OptimizationMechanism(
             id="text_gated_residual_fusion", category="mhc_overlap",
-            phases=("prefill", "decode"),
-            summary="CANN 9.3 native text_gated_residual replacing 5-op Triton Low-Rank HC chain",
+            phases=("prefill",),
+            summary="CANN 9.3 native text_gated_residual (M > 256) replacing 5-op Triton Low-Rank HC chain",
             eligible=lambda ctx: (
                 ctx.arch == "a5"
                 and any(getattr(p, "hc_lowrank", 0) > 0 for p in ctx.model.layer_plans)

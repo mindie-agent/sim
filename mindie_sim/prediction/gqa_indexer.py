@@ -54,6 +54,7 @@ def _emit_index_store(
     requests: tuple[str, ...],
     phase: str,
     rows: int,
+    completed_rows: int | None = None,
     row_bytes: float,
     idx_dim: int,
     plan,
@@ -69,6 +70,7 @@ def _emit_index_store(
     )
     if emit_index_cache_write is not None and not raw_eager:
         emitted = emit_index_cache_write(
+            op_id=prefix + ".index_store",
             prefix=prefix,
             deps=deps,
             stage=stage,
@@ -76,8 +78,10 @@ def _emit_index_store(
             requests=requests,
             phase=phase,
             rows=rows,
-            row_bytes=row_bytes,
+            completed_rows=completed_rows,
+            dim=idx_dim,
             index_dim=idx_dim,
+            row_bytes=row_bytes,
             plan=plan,
             model=model,
             quant=quant,
@@ -88,6 +92,7 @@ def _emit_index_store(
             return (emitted,)
         if emitted:
             return tuple(emitted)
+    fallback_rows = rows if completed_rows is None else completed_rows
     fallback = cache_store_op(
         op_id=prefix + ".index_store",
         deps=deps,
@@ -96,7 +101,7 @@ def _emit_index_store(
         requests=requests,
         phase=phase,
         recipe="index_store",
-        rows=rows,
+        rows=fallback_rows,
         row_bytes=max(1, int(round(row_bytes))),
         dtype=quant.index_dtype,
         kind="index",
@@ -250,7 +255,8 @@ def lower_gqa_indexer(
             layer=plan.index,
             requests=requests,
             phase=mode,
-            rows=new_idx_rows,
+            rows=valid,
+            completed_rows=new_idx_rows,
             row_bytes=row_bytes,
             idx_dim=idx_dim,
             plan=plan,

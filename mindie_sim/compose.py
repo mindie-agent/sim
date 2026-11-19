@@ -614,7 +614,11 @@ def compose_case(
                     ("moe_comm_mode", moe_comm_mode is not None),
                     ("recover_ssm", recover_ssm is True),
                 ) if explicit)
-            ctx_opts = {"phase": _stack_phase} if _stack_phase else {}
+            ctx_opts: dict[str, Any] = {
+                "ranks_per_node": int(machine.get("ranks_per_node", 0) or 0),
+            }
+            if _stack_phase:
+                ctx_opts["phase"] = _stack_phase
             mechanism_ctx = MechanismContext(
                 model=model_spec, sku=sku, arch=_arch_key(sku),
                 parallel=dict(runtime_dict["parallel"]),

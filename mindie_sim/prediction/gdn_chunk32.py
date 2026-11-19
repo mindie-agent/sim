@@ -3,8 +3,8 @@
 [Role]
   Model the ``fla-npu`` ``chunk_gated_delta_rule_fwd`` ``BT=32`` path (``PR #22147``,
   ``use_exp2=False``, ``use_beta_sigmoid_in_kernel=True``) across all three
-  mixed AIC+2AIV kernels (Prepare/WY, ChunkFwdH, ChunkFwdO), admitting arbitrary
-  integral GQA head ratios ``Hv % Hk == 0`` (including ``Hv/Hk = 8``).
+  mixed AIC+2AIV kernels (Prepare/WY, ChunkFwdH, ChunkFwdO) for supported GQA
+  head ratios ``Hv/Hk in {1, 2, 3, 4}``.
 
 [Invariants]
   * ``BT=32`` fits the ``32x32`` unit-triangular WY inverse in a single UB VCS
@@ -128,14 +128,18 @@ def _build_mixed_plan(
 
             def tile(idx: int):
                 aiv_w, aic_w = work_fn(items[idx])
+                half = aiv_w.scaled(0.5)
                 if aiv_first:
+                    l0, l1 = f"{first_label}_0", f"{first_label}_1"
                     return (
-                        phases(first_label, aiv_w, context, core, aiv=idx % 2),
-                        phases(second_label, aic_w, context, core, aiv=None, after=(first_label,)),
+                        phases(l0, half, context, core, aiv=0),
+                        phases(l1, half, context, core, aiv=1),
+                        phases(second_label, aic_w, context, core, aiv=None, after=(l0, l1)),
                     )
                 return (
                     phases(first_label, aic_w, context, core, aiv=None),
-                    phases(second_label, aiv_w, context, core, aiv=idx % 2, after=(first_label,)),
+                    phases(f"{second_label}_0", half, context, core, aiv=0, after=(first_label,)),
+                    phases(f"{second_label}_1", half, context, core, aiv=1, after=(first_label,)),
                 )
 
             body = KernelProgram((Stage("tiles", program=PipelineProgram(
@@ -169,6 +173,11 @@ def make_prepare_op(params: Mapping[str, Any]) -> OpSpec:
         "gate_dtype": gate_dtype, "beta_dtype": beta_dtype,
         "use_qk_l2norm_in_kernel": True, "use_beta_sigmoid_in_kernel": use_beta_sig,
         "use_exp2": False, "output_a": output_a,
+        "dispatch": {
+            "implementation": PREPARE_RECIPE, "chunk": GDN_CHUNK32_TOKENS,
+            "gate_dtype": gate_dtype, "beta_dtype": beta_dtype,
+            "use_exp2": False, "use_beta_sigmoid_in_kernel": use_beta_sig,
+        },
         "native_source": FLA_GDN_CHUNK_SOURCE, "pr_source": PR22147_SOURCE,
     }
     return OpSpec(
@@ -232,15 +241,22 @@ def build_prepare(op: OpSpec, geometry: Geometry) -> OperatorPlan:
 def make_state_op(params: Mapping[str, Any]) -> OpSpec:
     lengths, heads, keys, dk, dv = _validate_chunk32_params(params)
     chunks = PackedChunks.from_lengths(lengths, GDN_CHUNK32_TOKENS)
+    gate_dtype = str(params.get("gate_dtype", "fp32")).lower()
     use_init = bool(params.get("use_initial_state", True))
     out_final = bool(params.get("output_final_state", True))
     state_v_first = bool(params.get("state_v_first", True))
     shape = (len(lengths), heads, dv, dk) if state_v_first else (len(lengths), heads, dk, dv)
     meta = {
         "implementation": STATE_RECIPE, "lengths": lengths, "heads": heads,
-        "key_heads": keys, "dk": dk, "dv": dv, "chunk": GDN_CHUNK32_TOKENS,
+        "key_heads": keys, "dk": dk, "dv": dv, "head_dim_k": dk, "head_dim_v": dv,
+        "chunk": GDN_CHUNK32_TOKENS, "dtype": "bf16", "gate_dtype": gate_dtype,
         "use_initial_state": use_init, "output_final_state": out_final,
         "state_v_first": state_v_first, "use_exp2": False,
+        "dispatch": {
+            "implementation": STATE_RECIPE, "state_v_first": state_v_first,
+            "use_exp2": False, "gate_dtype": gate_dtype,
+            "use_initial_state": use_init, "output_final_state": out_final,
+        },
         "native_source": FLA_GDN_CHUNK_SOURCE,
     }
     return OpSpec(
@@ -255,47 +271,54 @@ def make_state_op(params: Mapping[str, Any]) -> OpSpec:
 def build_state(op: OpSpec, geometry: Geometry) -> OperatorPlan:
     meta = dict(op.metadata)
     lengths = tuple(int(v) for v in meta["lengths"])
-    heads, dk, dv = int(meta["heads"]), int(meta["dk"]), int(meta["dv"])
-    bt = GDN_CHUNK32_TOKENS
-    use_init = bool(meta.get("use_initial_state", True))
-    out_final = bool(meta.get("output_final_state", True))
+    heads, keys, dk, dv = int(meta["heads"]), int(meta["key_heads"]), int(meta["dk"]), int(meta["dv"])
+    bt, use_init, out_final = GDN_CHUNK32_TOKENS, bool(meta.get("use_initial_state", True)), bool(meta.get("output_final_state", True))
+    group = min(MAX_TASK_GROUP_HEADS, heads // keys)
+    groups_per_key = (heads // keys + group - 1) // group
+    chunks = PackedChunks.from_lengths(lengths, bt)
+    state_fp32, state_bf16 = float(dk * dv * FP32_BYTES), float(dk * dv * BF16_BYTES)
 
-    def task_work(seq_idx: int) -> tuple[Work, Work]:
-        seq_len = lengths[seq_idx]
-        n_chunks = (seq_len + bt - 1) // bt
-        state_fp32 = float(dk * dv * FP32_BYTES)
-        state_bf16 = float(dk * dv * BF16_BYTES)
-        aiv_read = (state_fp32 if use_init else 0.0) + float(seq_len * (dv * BF16_BYTES + FP32_BYTES))
-        aiv_write = (state_fp32 if out_final else 0.0) + n_chunks * state_bf16 + float(seq_len * dv * BF16_BYTES)
-        aiv_vec = float((n_chunks * dk * dv + seq_len * dv) * STATE_DECAY_OPS_PER_ELEM)
-        aiv = Work(resources={
-            "hbm": aiv_read + aiv_write, "mte2": aiv_read,
-            "vector": aiv_vec, "mte3": aiv_write,
-        })
-        aic_read = float(seq_len * (2 * dk + dv) * BF16_BYTES + n_chunks * state_bf16)
-        l0_bytes = float(n_chunks * 2 * (bt * dk + dk * dv + bt * dv) * BF16_BYTES)
-        flops = float(n_chunks * 2 * (2 * bt * dv * dk))
-        aic = Work(matrix={"bf16": flops},
-                   resources={"hbm": aic_read, "mte2": aic_read, "mte1": l0_bytes})
-        return aiv, aic
+    def group_work(gid: int) -> tuple[Work, Work]:
+        chunk_idx = gid // (keys * groups_per_key)
+        sub_idx = (gid % (keys * groups_per_key)) % groups_per_key
+        active_h = min(group, heads // keys - sub_idx * group)
+        seq_idx, chunk_local, _, rows = chunks.range(chunk_idx)
+        first_chunk, last_chunk = chunk_local == 0, chunk_local == (lengths[seq_idx] + bt - 1) // bt - 1
+        init_read = active_h * state_fp32 if (first_chunk and use_init) else 0.0
+        final_write = active_h * state_fp32 if (last_chunk and out_final) else 0.0
+        snap_count = (1 if (first_chunk and use_init) else 0) + (1 if not last_chunk else 0)
+        aiv_read = init_read + float(active_h * rows * (dv * BF16_BYTES + FP32_BYTES))
+        aiv_write = final_write + snap_count * active_h * state_bf16 + float(active_h * rows * dv * BF16_BYTES)
+        aiv_vec = float(active_h * (dk * dv + rows * dv) * STATE_DECAY_OPS_PER_ELEM)
+        aiv = Work(resources={"hbm": aiv_read + aiv_write, "mte2": aiv_read, "vector": aiv_vec, "mte3": aiv_write})
+        aic_read = float((rows * dk + active_h * rows * (dk + dv)) * BF16_BYTES + (1 if (use_init or not first_chunk) else 0) * active_h * state_bf16)
+        l0_bytes, flops = float(active_h * 2 * (bt * dk + dk * dv + bt * dv) * BF16_BYTES), float(active_h * 2 * (2 * bt * dv * dk))
+        return aiv, Work(matrix={"bf16": flops}, resources={"hbm": aic_read, "mte2": aic_read, "mte1": l0_bytes})
 
-    tasks = tuple(seq_idx for seq_idx in range(len(lengths)) for _ in range(heads))
     return _build_mixed_plan(
-        geometry, tasks, task_work,
-        aiv_first=False, slots=1,
-        first_label="state_aic", second_label="state_aiv", extra_meta={},
+        geometry, tuple(range(chunks.total * keys * groups_per_key)), group_work,
+        aiv_first=False, slots=PIPELINE_WINDOW_SLOTS,
+        first_label="state_aic", second_label="state_aiv", extra_meta={"task_group_size": group},
     )
 
 
 def make_output_op(params: Mapping[str, Any]) -> OpSpec:
     lengths, heads, keys, dk, dv = _validate_chunk32_params(params)
+    gate_dtype = str(params.get("gate_dtype", "fp32")).lower()
+    state_v_first = bool(params.get("state_v_first", True))
     group = min(MAX_TASK_GROUP_HEADS, heads // keys)
     shape = (1, sum(lengths), heads, dv)
     meta = {
         "implementation": OUTPUT_RECIPE, "lengths": lengths, "heads": heads,
-        "key_heads": keys, "dk": dk, "dv": dv, "chunk": GDN_CHUNK32_TOKENS,
+        "key_heads": keys, "dk": dk, "dv": dv, "head_dim_k": dk, "head_dim_v": dv,
+        "chunk": GDN_CHUNK32_TOKENS, "dtype": "bf16", "gate_dtype": gate_dtype,
         "task_group_size": group, "use_exp2": False,
-        "state_v_first": bool(params.get("state_v_first", True)),
+        "state_v_first": state_v_first,
+        "dispatch": {
+            "implementation": OUTPUT_RECIPE, "output_token_first": True,
+            "use_exp2": False, "state_v_first": state_v_first,
+            "gate_dtype": gate_dtype, "task_group_size": group,
+        },
         "native_source": FLA_GDN_CHUNK_SOURCE,
     }
     return OpSpec(

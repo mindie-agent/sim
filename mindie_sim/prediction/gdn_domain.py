@@ -2,17 +2,17 @@
 
 [Role]
   Centralize structural admission checks for Ascend Arch35 ``fla-npu`` GDN
-  prefill chunk kernels: ``Chunk64`` (``Rung 1: merged``, ``Hv/Hk in {1,2,3,4}``)
-  and ``Chunk32`` (``PR #22147``, ``Rung 2: unmerged_pr``, arbitrary integral
-  ``Hv % Hk == 0`` with ``K=V=128``).
+  prefill chunk kernels: ``Chunk64`` (``Rung 1: merged``) and ``Chunk32``
+  (``PR #22147``, ``Rung 2: unmerged_pr``, ``Hv/Hk in {1,2,3,4}`` with ``K=V=128``).
 
 [Invariants]
   * Domain checks inspect ``LayerPlan`` / local TP head counts and precision only;
     zero model-name strings or runtime observations participate.
   * ``can_run_gdn_chunk64`` matches ``chunk_gated_delta_rule_fwd_prepare_tiling.cpp``
     (``Hv % Hk == 0`` and ``Hv // Hk in {1, 2, 3, 4}``).
-  * ``can_run_gdn_chunk32`` matches ``chunk_gated_delta_rule_fwd_chunk32_tiling.cpp``
-    (``Hv % Hk == 0``, ``Hv >= Hk``, and ``dk == dv == 128``), admitting GQA=8.
+  * ``can_run_gdn_chunk32`` matches ``fla-npu`` ``26.10.0+feature`` silicon admission
+    (``Hv % Hk == 0``, ``Hv // Hk in {1, 2, 3, 4}``, and ``dk == dv == 128``;
+    ``Hv // Hk > 4`` rejects with ``161002`` and falls back to Triton ``ChunkGdn``).
 
 [Timeouts & Locks]
   O(layers) pure integer predicates; no I/O or locks.
@@ -85,7 +85,9 @@ def can_run_gdn_chunk32(
     state_dtype: str = "fp32",
 ) -> bool:
     """True when local head geometry satisfies the Arch35 ``Chunk32`` (PR #22147) domain."""
-    if local_hk <= 0 or local_hv <= 0 or local_hv < local_hk or local_hv % local_hk != 0:
+    if local_hk <= 0 or local_hv <= 0 or local_hv % local_hk != 0:
+        return False
+    if (local_hv // local_hk) not in GDN_CHUNK64_GQA_RATIOS:
         return False
     if int(k_dim) != GDN_HEAD_DIM_K or int(v_dim) != GDN_CHUNK32_HEAD_DIM_V:
         return False

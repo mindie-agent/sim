@@ -4729,7 +4729,11 @@
       }
     },
     "minimax-m3": {
-      "auxiliary_modes": {},
+      "auxiliary_modes": {
+        "kind": "mtp",
+        "layers": 7,
+        "standalone": false
+      },
       "builder": "minimax_m3",
       "cache_layout": {
         "attention_types": {
@@ -4955,7 +4959,11 @@
       }
     },
     "minimax-m3.1-flash": {
-      "auxiliary_modes": {},
+      "auxiliary_modes": {
+        "kind": "mtp",
+        "layers": 7,
+        "standalone": false
+      },
       "builder": "minimax_m3",
       "cache_layout": {
         "attention_types": {
@@ -5099,7 +5107,7 @@
         "window": 0
       },
       "config": "mindie_sim/catalog/configs/minimax-m3.1-flash.json",
-      "config_sha256": "4e8b7d4a0c7d12224528ac0eb770400d6ecc2d6591918e1de501acf27b6287d0",
+      "config_sha256": "b013b928b8d4127a3ad0ae90caa74b3ec0069fc32e8b97e09b061a3b7a5bea1a",
       "family": "minimax_m3",
       "parameter_scope": "text_backbone",
       "quantization": {
@@ -5934,7 +5942,11 @@
       }
     },
     "qwen3-next-80b-a3b": {
-      "auxiliary_modes": {},
+      "auxiliary_modes": {
+        "kind": "mtp",
+        "layers": 1,
+        "standalone": false
+      },
       "builder": "qwen",
       "cache_layout": {
         "attention_types": {
@@ -6054,7 +6066,7 @@
         "window": 0
       },
       "config": "mindie_sim/model_configs/qwen3-next-80b-a3b.json",
-      "config_sha256": "3d33d5712097e592aba4a7edb30f1a10c2a2ee64d9e018e336351e885ddb68b6",
+      "config_sha256": "d2dc75cdf5ef3fcaf32c24c80b8ead4adc96edeb23deac6d15b3c8bdb90cab03",
       "family": "qwen",
       "parameter_scope": "text_backbone",
       "quantization": {

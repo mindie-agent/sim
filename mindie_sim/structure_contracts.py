@@ -19,9 +19,14 @@ from .structure_native_contracts import (
 
 GDN_KINDS = {"gdn_prepare": "ChunkGatedDeltaRuleFwdPrepare",
              "gdn_state": "ChunkFwdH", "gdn_output": "ChunkFwdO"}
+DEFAULT_GDN_CHUNK_TOKENS = 64
+GDN_QKV_OPERAND_COUNT = 3
+GDN_PREPARE_BF16_OUTPUTS = 5
+GDN_PREPARE_FP32_OUTPUTS = 3
+GDN_OUTPUT_BF16_INPUTS = 4
 #: Fused native cache epilogs keep the active cache-store tensor boundary.
 CACHE_STORE_FAMILIES = frozenset({
-    "cache_store", "kv_compress_epilog", "indexer_quant_cache",
+    "cache_store", "kv_compress_epilog", "indexer_quant_cache", "kv_cache_write",
 })
 
 
@@ -69,29 +74,32 @@ def gdn_contract(op):
     lengths, heads, keys = meta["lengths"], meta["heads"], meta["key_heads"]
     tokens = sum(lengths)
     dk, dv = meta.get("head_dim_k", meta.get("dk", 128)), meta.get("head_dim_v", meta.get("dv", 128))
-    chunks = sum(math.ceil(length / 64) for length in lengths)
+    chunk = int(meta.get("chunk", DEFAULT_GDN_CHUNK_TOKENS) or DEFAULT_GDN_CHUNK_TOKENS)
+    chunks = sum(math.ceil(length / chunk) for length in lengths)
     qk, v = (1, keys, tokens, dk), (1, heads, tokens, dv)
     g, cu, ci = (1, heads, tokens), (len(lengths) + 1,), (chunks * 2,)
     h = (1, heads, chunks, dk, dv)
+    gate_dtype = meta["gate_dtype"]
+    beta_dtype = meta.get("beta_dtype", gate_dtype)
     family = op["family"]
     if family == "gdn_prepare":
         inputs = (qk, qk, v, g, g, cu, ci)
-        outputs = (g, (1, heads, tokens, dk), v, (1, heads, tokens, 64),
+        outputs = (g, (1, heads, tokens, dk), v, (1, heads, tokens, chunk),
                    qk, qk, (1, keys, tokens), (1, keys, tokens), g)
-        ins = ("bf16",) * 3 + (meta["gate_dtype"],) * 2 + ("int64",) * 2
-        outs = ("fp32",) + ("bf16",) * 5 + ("fp32",) * 3
+        ins = ("bf16",) * GDN_QKV_OPERAND_COUNT + (gate_dtype, beta_dtype) + ("int64",) * 2
+        outs = ("fp32",) + ("bf16",) * GDN_PREPARE_BF16_OUTPUTS + ("fp32",) * GDN_PREPARE_FP32_OUTPUTS
     elif family == "gdn_state":
         initial = ((len(lengths), heads, dv, dk) if meta["state_v_first"]
                    else (len(lengths), heads, dk, dv))
         inputs = (qk, (1, heads, tokens, dk), v, g, initial, cu, ci)
         outputs = (h, v, (len(lengths) * heads * dk * dv,))
-        ins = ("bf16",) * 3 + (meta["gate_dtype"], "fp32") + ("int64",) * 2
+        ins = ("bf16",) * GDN_QKV_OPERAND_COUNT + (gate_dtype, "fp32") + ("int64",) * 2
         outs = ("bf16", "bf16", "fp32")
         if not meta["use_initial_state"] or not meta["output_final_state"]:
             return None
     else:
         inputs, outputs = (qk, qk, v, h, g, cu, ci), ((tokens * heads * dv,),)
-        ins = ("bf16",) * 4 + (meta["gate_dtype"],) + ("int64",) * 2
+        ins = ("bf16",) * GDN_OUTPUT_BF16_INPUTS + (gate_dtype,) + ("int64",) * 2
         outs = ("bf16",)
     return GDN_KINDS[family], inputs, outputs, ins, outs
 

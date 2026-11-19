@@ -84,6 +84,7 @@ DEFAULT_HC_STREAMS = 4
 DEFAULT_LOWRANK = 16
 DEFAULT_HC_HIDDEN = 5120
 PR22142_ROW_CUTOFF = 72
+TEXT_GATED_EZ1008_FLOOR_ROWS = 256
 HC_WIDTH_ALIGNMENT = 128
 SINKHORN_ITERS = 4
 SINKHORN_OPS_PER_ELEM = 8
@@ -117,6 +118,8 @@ def make_hc_op(
     kind = str(variant).strip().lower()
     if kind == "mhc_post_collapse" and not unbounded_rows and tok > PR22142_ROW_CUTOFF:
         raise ModelingError(f"mhc_post_collapse_row_cutoff_exceeded:{tok}")
+    if kind == "text_gated_residual" and not unbounded_rows and tok <= TEXT_GATED_EZ1008_FLOOR_ROWS:
+        raise ModelingError(f"text_gated_residual_row_floor_not_met:{tok}")
 
     recipe_map = {
         "hc_pre_v3": (HC_PRE_V3_RECIPE, "npu_hc_pre_v3", HC_PRE_TILING_SOURCE),

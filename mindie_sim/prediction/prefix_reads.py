@@ -73,6 +73,7 @@ class CacheAccess:
     selected_tokens: tuple[tuple[int, int], ...] = ()
     logical_rows: int = ZERO
     unique_rows: int = ZERO
+    window_tokens: int | None = None
     shared_intervals: tuple[tuple[int, int], ...] = ()
 
 
@@ -261,10 +262,17 @@ def plan_prefix_reads(
         rows = _logical_rows(access)
         prefix_limit = _materialized_prefix(access, cache_state)
         end = context + q_len
-        start = ZERO if rows >= end else max(ZERO, end - int(rows))
+        if access.window_tokens is not None:
+            win = max(ZERO, int(access.window_tokens))
+            windowed = win > ZERO
+            start = max(ZERO, end - win) if windowed else ZERO
+        else:
+            windowed = rows < end and int(prefix_limit) < int(rows)
+            start = max(ZERO, end - int(rows)) if windowed else ZERO
         span = (int(access.unique_rows)
                 if int(access.unique_rows) > ZERO
-                else max(ZERO, end - start))
+                else (int(rows) if not windowed and int(access.logical_rows) > ZERO
+                      else max(ZERO, end - start)))
         if access.shared_intervals:
             shared = min(_merged_interval_rows(access.shared_intervals), span)
             private = max(ZERO, span - shared)
@@ -276,13 +284,19 @@ def plan_prefix_reads(
             shared = _merged_interval_rows(shared_iv)
             private = _merged_interval_rows(priv_iv)
             intervals = shared_iv
-        else:
+        elif windowed:
             shared_lo = start
             shared_hi = min(end, max(ZERO, int(prefix_limit)))
             raw_shared = max(ZERO, shared_hi - shared_lo)
             shared = min(raw_shared, span)
             private = max(ZERO, span - shared)
             intervals = ((shared_lo, shared_lo + shared),) if shared > ZERO else ()
+        else:
+            limit = int(access.logical_rows) if int(access.logical_rows) > ZERO else context
+            prefix = min(max(ZERO, int(prefix_limit)), limit)
+            shared = min(prefix, span)
+            private = max(ZERO, span - shared)
+            intervals = ((ZERO, shared),) if shared > ZERO else ()
         unique += float(private) * float(access.row_bytes)
         unique_rows += float(private)
         logical_shared_bytes += float(shared) * float(access.row_bytes)

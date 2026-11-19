@@ -179,7 +179,7 @@
       "state": "unmerged_pr",
       "ref": "vllm-project/vllm-ascend#22147",
       "archs": ["a5"],
-      "notes": "Switch A5 GDN prefill to fla-npu Chunk32 (admits Hv/Hk=8, -51.6% prefill kernel latency)",
+      "notes": "Switch A5 GDN prefill to fla-npu Chunk32 (Hv/Hk in {1,2,3,4}, -51.6% prefill kernel latency; Hv/Hk=8 falls back to Triton ChunkGdn)",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
         "revision": "57de212f6a",

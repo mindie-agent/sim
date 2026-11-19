@@ -202,8 +202,11 @@ def physical_recipe_bindings() -> dict[str, object]:
         "router": ScopedRouterRecipe(build_router_splitk),
     })
     bindings.update({
-        f"{family}_quantize": ScopedSwigluRecipe(build_swiglu_mx_quant)
-        for family in ("swiglu", "situ", "geglu")
+        "dynamic_quantize": ScopedSwigluRecipe(build_swiglu_mx_quant),
+        **{
+            f"{family}_quantize": ScopedSwigluRecipe(build_swiglu_mx_quant)
+            for family in ("swiglu", "situ", "geglu")
+        },
     })
     for group in (
         cache_writer_recipes(),

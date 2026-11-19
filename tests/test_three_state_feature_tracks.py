@@ -273,3 +273,66 @@ def test_audit_stack_prs_offline_fixture(tmp_path: Path):
     assert any(row["pr_number"] == 21999 for row in out["ready_to_promote_to_merged"])
     assert any(row["pr_number"] == 99999
                for row in out["uncataloged_performance_candidates"])
+
+
+def test_a5_cann93_megamoe_mhc_text_gated_residual_and_chunk32_tracks():
+    # 1. MegaMoE(enable_fused_mc2=3) promoted to merged on A5 MXFP MoE.
+    megamoe_case = compose_case(
+        "qwen3.5-397b-a17b", hardware="a5", feature_track="merged",
+        tp=8, ep=8, num_devices=8, layers=4,
+    )
+    merged_mechs = {
+        row["id"]
+        for row in megamoe_case["runtime"]["metadata"]["feature_track_report"]["active_mechanisms"]
+    }
+    assert "cann_megamoe_fusion" in merged_mechs
+    assert megamoe_case["runtime"]["metadata"]["additional_config"]["enable_fused_mc2"] == 3
+
+    # 2. #22142 (DeepSeek-V4.1-Flash mhc_boundary_fusion_overlap + A5 mHC) on A5.
+    dsv41 = compare_feature_tracks(
+        "deepseek-v4.1-flash", hardware="a5",
+        tp=8, ep=8, num_devices=8, layers=2,
+        phase="decode", tokens=1, context=2048, sequences=2, ablate_prs=True,
+    )
+    assert dsv41["monotonic_verified"] is True
+    assert any(
+        row["ref"] == "vllm-project/vllm-ascend#22142" and row["delta_vs_merged_ms"] < 0.0
+        for row in dsv41["waterfall"]["current_unmerged_pr"]["single_pr_ablation"]
+    )
+
+    # 3. #21794 (Qwen4Exp text_gated_residual_fusion on A5 prefill M > 256, guarded on decode).
+    qsa_prefill = compose_case(
+        "qwen3.8-flash-next", hardware="a5", feature_track="unmerged_pr",
+        _stack_phase="prefill", tp=8, ep=8, num_devices=8, layers=2,
+    )
+    qsa_decode = compose_case(
+        "qwen3.8-flash-next", hardware="a5", feature_track="unmerged_pr",
+        _stack_phase="decode", tp=8, ep=8, num_devices=8, layers=2,
+    )
+    assert qsa_prefill["runtime"]["metadata"].get("text_gated_residual") is True
+    assert qsa_decode["runtime"]["metadata"].get("text_gated_residual") is not True
+
+    # 4. #22147 (Chunk32 in unmerged_pr vs Chunk64 in merged on Hv/Hk<=4; Hv/Hk=8 falls back).
+    qwen_gdn = compare_feature_tracks(
+        "qwen3.8-27b", hardware="a5",
+        tp=8, ep=1, num_devices=8, layers=2,
+        phase="prefill", tokens=128, context=0, sequences=4, ablate_prs=False,
+    )
+    assert qwen_gdn["monotonic_verified"] is True
+    merged_gdn = compose_case(
+        "qwen3.8-27b", hardware="a5", feature_track="merged",
+        _stack_phase="prefill", tp=8, ep=1, num_devices=8, layers=2,
+    )
+    pr_gdn = compose_case(
+        "qwen3.8-27b", hardware="a5", feature_track="unmerged_pr",
+        _stack_phase="prefill", tp=8, ep=1, num_devices=8, layers=2,
+    )
+    assert merged_gdn["runtime"]["attention_policy"]["recurrent_chunk"] == 64
+    assert pr_gdn["runtime"]["attention_policy"]["recurrent_chunk"] == 32
+    assert qwen_gdn["waterfall"]["current_unmerged_pr"]["step_ms"] < qwen_gdn["waterfall"]["current_merged"]["step_ms"]
+
+    gqa8_pr = compose_case(
+        "qwen3.8-2.4t-a95b", hardware="a5", feature_track="unmerged_pr",
+        _stack_phase="prefill", tp=8, ep=8, num_devices=8, layers=2,
+    )
+    assert "gdn_prefill" not in (gqa8_pr["runtime"].get("kernels", {}).get("lowerings") or {})
