@@ -1,5 +1,7 @@
 # `mindie-sim` 外部贡献者与外部 AI Agent 增量校准及研发总指南
 
+**中文** · [English](CONTRIBUTING.en.md) · [返回项目主页](README.md)
+
 > [!IMPORTANT]
 > 本指南是 `mindie-sim`（及配套 `mindie-profiler`）的**硬件无关主干贡献规范（Master Guide）**，统一适用于 **Ascend A2 / A3 / A5 全系芯片**的硅实测校准、增量算子物理配方（`PhysicalRecipe`，含自定义 Attention 内核）开发与新模型目录接入，面向人类工程师与外部 AI 编码 Agent（Claude Code、Codex、DSH、Cursor 等）。芯片代际专属的微架构不变量、拓扑语义与 `ascend.json` 补丁模板请参阅下方对应的硬件子页面。
 
@@ -91,6 +93,7 @@ flowchart LR
    - Eager 模式下 Python `OpApi` 下发开销（约 `15–45 µs`）会掩盖微秒级硬件真实执行时间。对于耗时 `< 50 µs` 的小算子和 `4 KiB` HCCL 集合通信，必须同时记录 **Eager 无阻塞模式** 与 **RTS 流饱和模式（Stream-Saturated）**：在目标流上预先入队一个耗时约 **`2.5 ms` 的阻塞算子（`StreamBlocker`）**，趁设备执行阻塞算子期间将后续 `20` 组被测算子及起止 `Event` 全部压入硬件 RTS 队列，从而精确分离出纯设备侧包容性完成下界（Inclusive Completion Minimum）：
 
 ```python
+import math
 import statistics
 import torch
 import torch_npu
@@ -124,8 +127,13 @@ def calibrate_stream_blocker(a: torch.Tensor, b: torch.Tensor) -> int:
     _ = torch.matmul(a, b)
     end_ev.record()
     torch.npu.synchronize()
-    single_ms = max(start_ev.elapsed_time(end_ev), MIN_SINGLE_GEMM_MS)
-    return max(MIN_BLOCKER_REPS, int(round(BLOCKER_TARGET_MS / single_ms)))
+    elapsed_ms = float(start_ev.elapsed_time(end_ev))
+    single_ms = (
+        elapsed_ms
+        if math.isfinite(elapsed_ms) and elapsed_ms > MIN_SINGLE_GEMM_MS
+        else MIN_SINGLE_GEMM_MS
+    )
+    return max(MIN_BLOCKER_REPS, math.ceil(BLOCKER_TARGET_MS / single_ms))
 
 
 def measure_rts_stream_saturated_us(fn, blocker_pair: tuple[torch.Tensor, torch.Tensor], blocker_reps: int) -> float:
@@ -180,7 +188,7 @@ def measure_rts_stream_saturated_us(fn, blocker_pair: tuple[torch.Tensor, torch.
 ### 2.3 参数拟合、单算子复现与盲测验证 CLI 工作流
 
 1. **拟合单通道资源速率或原语响应曲线（严格隔离 `train` 与 `heldout`）**
-   构造符合 [`mindie_sim/observations/service_fitting.py`](mindie_sim/observations/service_fitting.py) 契约的样本包 `hbm_read_samples.json`（至少包含 `2` 个不同工作量大小，`boundary` 仅限 `"resource_phase"` 或 `"device_kernel"`，源路径统一使用 `capture://` URI 脱敏）：
+   构造同时兼容 [`mindie_sim/observations/service_fitting.py`](mindie_sim/observations/service_fitting.py)（`fit-service` 读取 `work`）与 [`mindie_sim/observations/validation.py`](mindie_sim/observations/validation.py)（`fit-rate` 读取 `work_bytes`）契约的样本包 `hbm_read_samples.json`（`train` 至少包含 `2` 个不同工作量端点，`heldout` 样本落在训练工作量区间内以执行内插评估，`boundary` 仅限 `"resource_phase"` 或 `"device_kernel"`，源路径统一使用 `capture://` URI 脱敏）：
    ```json
    {
      "resource": "hbm",
@@ -193,18 +201,18 @@ def measure_rts_stream_saturated_us(fn, blocker_pair: tuple[torch.Tensor, torch.
        "window": "resource_phase"
      },
      "samples": [
-       {"work": 16777216, "duration_ms": 0.0132, "run_id": "trial-1", "repeat_index": 0, "source": "capture://ascend-microbench-202611/domain5_vector.json", "split": "train"},
-       {"work": 67108864, "duration_ms": 0.0498, "run_id": "trial-1", "repeat_index": 0, "source": "capture://ascend-microbench-202611/domain5_vector.json", "split": "train"},
-       {"work": 134217728, "duration_ms": 0.0985, "run_id": "trial-2", "repeat_index": 0, "source": "capture://ascend-microbench-202611/domain5_vector.json", "split": "heldout"}
+       {"work": 16777216, "work_bytes": 16777216, "duration_ms": 0.0132, "run_id": "trial-1", "repeat_index": 0, "source": "capture://ascend-microbench-202611/domain5_vector.json", "split": "train"},
+       {"work": 134217728, "work_bytes": 134217728, "duration_ms": 0.0985, "run_id": "trial-1", "repeat_index": 0, "source": "capture://ascend-microbench-202611/domain5_vector.json", "split": "train"},
+       {"work": 67108864, "work_bytes": 67108864, "duration_ms": 0.0498, "run_id": "trial-2", "repeat_index": 0, "source": "capture://ascend-microbench-202611/domain5_vector.json", "split": "heldout"}
      ]
    }
    ```
    执行拟合与原语入库命令：
    ```bash
-   # 拟合非负仿射曲线 (startup_ms + units_per_ms) 并在 heldout 样本上自动评估相对误差
+   # 拟合非负仿射曲线 (startup_ms + units_per_ms) 并在训练域内的 heldout 样本上自动评估内插相对误差
    python3 -m mindie_sim fit-service hbm_read_samples.json -o state/calibration/hbm_service_fit.json
 
-   # 拟合纯资源速率与启动项
+   # 拟合纯资源字节速率与固定启动项 (读取 samples[*].work_bytes)
    python3 -m mindie_sim fit-rate hbm_read_samples.json -o state/calibration/hbm_rate_fit.json
 
    # 将显式 PrimitiveKey 样本流式写入 SQLite 原语库
@@ -213,8 +221,8 @@ def measure_rts_stream_saturated_us(fn, blocker_pair: tuple[torch.Tensor, torch.
 
 2. **对接 `mindie-profiler` 单算子 ABI 检查、脱敏复现生成与 C7 实测供给绑定**
    ```bash
-   # 1. 查询已锁定的算子 C-ABI 签名、槽位与 Padding 语义
-   python3 -m mindie_profiler inspect-op-abi aclnnFusedInferAttentionScoreV2 --version 8.0.RC3
+   # 1. 查询已锁定的算子 C-ABI 签名、槽位与 Padding 语义（使用目录支持的 CANN 版本如 8.0）
+   python3 -m mindie_profiler inspect-op-abi aclnnFusedInferAttentionScoreV2 --version 8.0
 
    # 2. 从脱敏后的 capture.json 生成自包含单算子复现脚本（按目标 Die L2 容量设置 --flush-mb >= 3x L2 与 --l2-bytes）
    python3 -m mindie_profiler repro-op \
@@ -449,9 +457,6 @@ DEFAULT_BQ = 16
 DEFAULT_BK = 128
 DEFAULT_HEAD_DIM = 128
 DEFAULT_L2_FRACTION = 0.75
-A2_A3_FALLBACK_L1_BYTES = 524288
-A2_A3_FALLBACK_L0C_BYTES = 131072
-A2_A3_FALLBACK_UB_BYTES = 196608
 AIV_ROLES = frozenset({"vector", "mte2_aiv", "mte3"})
 
 
@@ -473,7 +478,7 @@ def build(op, geometry: Geometry) -> OperatorPlan:
     kv_elem_b = dtype_bytes(kv_dtype)
     acc_elem_b = dtype_bytes(ACCUM_DTYPE)
 
-    # 1. Enforce per-owner SRAM limits declared on the target SKU Geometry.
+    # 1. Enforce explicit per-owner SRAM limits declared on the target SKU Geometry.
     q_l1_bytes = int(b_q * qk_dim * q_elem_b)
     kv_slot_bytes = int(b_k * (qk_dim + v_dim) * kv_elem_b)
     needed_l1 = q_l1_bytes + PINGPONG_SLOTS * kv_slot_bytes
@@ -483,9 +488,11 @@ def build(op, geometry: Geometry) -> OperatorPlan:
     needed_l0c = max(score_bytes, pv_acc_bytes)
     needed_ub = pv_acc_bytes + score_bytes + prob_bytes
 
-    l1_cap = int(geometry.buffers.get("l1", A2_A3_FALLBACK_L1_BYTES))
-    l0c_cap = int(geometry.buffers.get("l0c", A2_A3_FALLBACK_L0C_BYTES))
-    ub_cap = int(geometry.buffers.get("ub", A2_A3_FALLBACK_UB_BYTES))
+    l1_cap = int(geometry.buffers.get("l1", 0))
+    l0c_cap = int(geometry.buffers.get("l0c", 0))
+    ub_cap = int(geometry.buffers.get("ub", 0))
+    if min(l1_cap, l0c_cap, ub_cap) <= 0:
+        raise ModelingError("custom_attn_requires_explicit_sram_buffers")
     if l1_cap < needed_l1 or l0c_cap < needed_l0c or ub_cap < needed_ub:
         raise ModelingError(
             f"custom_attn_sram_overflow:l1={needed_l1}:l0c={needed_l0c}:ub={needed_ub}"
@@ -831,7 +838,7 @@ With either field non-empty, `resolve_stack_track(...)` raises `model_not_suppor
 
 ## 附：扁平同级 Worktree 工作流与 PR 设计原则门禁（`device-tool`）
 
-英文摘要请参阅 [CONTRIBUTING.en.md](CONTRIBUTING.en.md)。
+完整英文版请参阅 [CONTRIBUTING.en.md](CONTRIBUTING.en.md)。
 
 1. **扁平同级 + 独立链接 Worktree 开发流**：保持主检出目录停留在干净 `main`，在 `../.worktrees/` 下创建独立工作树开发：
    ```bash
