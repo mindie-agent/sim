@@ -189,6 +189,24 @@ DSPARK_KIND = "dspark"
 DSPARK_INPUT_MODE = "projected_concat"
 DSPARK_SOURCE_KIND = "native_dspark_declared_separately"
 DSPARK_BLOCK_THRESHOLD = 1
+DSPARK_PP_CAPABILITY = (1, 2, 4, 8, 16)
+DSV41_DSPARK_SOURCE: dict[str, str] = {
+    "repository": "vllm-project/vllm-ascend",
+    "revision": "405617bae227fe5b097ff163efaa60bb7f22c698",
+    "relative_path": "vllm_ascend/models/deepseek_v41/dspark.py",
+    "source_sha256": "2439810997a297b404d814fcf934a367f3daa3a937f594aa808c9204b3165379",
+}
+DSV4_DSPARK_SOURCE: dict[str, str] = {
+    "repository": "vllm-project/vllm-ascend",
+    "revision": "405617bae227fe5b097ff163efaa60bb7f22c698",
+    "relative_path": "vllm_ascend/models/deepseek_v4/model.py",
+    "source_sha256": "4327e0360c38b63898f107cdb70569ff2aa2bd10099bf324183ca57a3da31f0d",
+}
+
+
+def _draft_compat_kwargs(**candidates: Any) -> dict[str, Any]:
+    declared = DraftSpec.__dataclass_fields__
+    return {key: value for key, value in candidates.items() if key in declared}
 
 
 def _aux_deepseek(c: Mapping[str, Any], *, v41: bool, d: Mapping[str, Any]) -> AuxiliarySpec:
@@ -220,6 +238,7 @@ def _aux_deepseek(c: Mapping[str, Any], *, v41: bool, d: Mapping[str, Any]) -> A
     # declared DSpark mode selected explicitly through ``draft_kind`` and stays
     # distinct from an ordinary NextN module.
     dspark_mode = bool(block > DSPARK_BLOCK_THRESHOLD or markov)
+    dspark_source = DSV41_DSPARK_SOURCE if v41 else DSV4_DSPARK_SOURCE
     draft = DraftSpec(
         kind="mtp_dspark", layers=layers, hidden_size=h,
         intermediate_size=moe_i, num_heads=d["heads"], num_kv_heads=1,
@@ -242,12 +261,23 @@ def _aux_deepseek(c: Mapping[str, Any], *, v41: bool, d: Mapping[str, Any]) -> A
         mla_variant=d["variant"], kv_cache_elements=d["kv_cache_elements"],
         input_mode="dual_normalized" if _int(c, "hc_mult") else "concat",
         base_logits=True, markov_replicated=True,
-        noncausal_query_block=True, pp_capability=(1, 2, 4, 8, 16),
+        noncausal_query_block=True, pp_capability=DSPARK_PP_CAPABILITY,
         vocab_size=_int(c, "vocab_size"),
         mhc_mult=_int(c, "hc_mult"), mhc_sinkhorn_iters=_int(c, "hc_sinkhorn_iters"),
         input_projection_category="dspark_input",
-        source=merge_source({"kind": "native_mtp_dspark_selected"}),
+        source=merge_source(
+            dspark_source,
+            {
+                "kind": "native_mtp_dspark_selected",
+                "independent_context": "false",
+                "context_projection_mode": "shared_compressed_kv",
+            },
+        ),
         notes=("native se-tools MTP uses dspark expert geometry; one selected mode",),
+        **_draft_compat_kwargs(
+            independent_context=False,
+            context_projection_mode="shared_compressed_kv",
+        ),
     )
     if dspark_mode:
         # The declared auxiliary for a multi-token block IS the native DSpark
@@ -255,7 +285,14 @@ def _aux_deepseek(c: Mapping[str, Any], *, v41: bool, d: Mapping[str, Any]) -> A
         # NextN projections.  It is selected explicitly through ``draft_kind``.
         draft = replace(
             draft, kind=DSPARK_KIND, input_mode=DSPARK_INPUT_MODE,
-            source=merge_source({"kind": DSPARK_SOURCE_KIND}))
+            source=merge_source(
+                dspark_source,
+                {
+                    "kind": DSPARK_SOURCE_KIND,
+                    "independent_context": "false",
+                    "context_projection_mode": "shared_compressed_kv",
+                },
+            ))
     return AuxiliarySpec(
         mtp=draft, dspark=None,
         notes=("mtp_and_dspark_names_do_not_prove_two_modes",),

@@ -18,6 +18,13 @@ from bisect import bisect_right
 from dataclasses import dataclass, replace
 from typing import Iterable, Mapping
 
+from mindie_sim.prediction.gdn_domain import (
+    GDN_CHUNK64_GQA_RATIOS,
+    GDN_CHUNK64_TOKENS,
+    GDN_CHUNK64_VALUE_DIMS,
+    GDN_HEAD_DIM_K,
+    can_run_gdn_chunk64,
+)
 from mindie_sim.prediction.mechanism import Geometry, OperatorPlan, Work
 from mindie_sim.prediction.program import (
     KernelProgram,
@@ -34,10 +41,10 @@ __all__ = ["make_op", "build", "PackedChunks"]
 # Source identity of the modeled implementation.  The planner is bound through
 # the caller's RecipeBook; this string is not auto-discovered.
 _IMPLEMENTATION = "gdn_prepare_arch35_mix_aic_aiv_1_2"
-_CHUNK = 64
-_HEAD_DIM_K = 128
-_VALUE_DIMS = (128, 256)
-_GQA_RATIOS = (1, 2, 3, 4)
+_CHUNK = GDN_CHUNK64_TOKENS
+_HEAD_DIM_K = GDN_HEAD_DIM_K
+_VALUE_DIMS = tuple(sorted(GDN_CHUNK64_VALUE_DIMS))
+_GQA_RATIOS = tuple(sorted(GDN_CHUNK64_GQA_RATIOS))
 
 # FP32 as stored by the kernel and BF16 as the q/k/v operand format.
 _FP32 = 4
@@ -224,6 +231,11 @@ def make_op(params: dict) -> OpSpec:
     dtype = _normalize_dtype(params.get("dtype", "bf16"))
     if dtype != "bf16":
         raise ValueError("q/k/v currently only support bfloat16.")
+    if not can_run_gdn_chunk64(
+        key_heads, heads, head_dim_k, head_dim_v,
+        activation_dtype=dtype, state_dtype="fp32",
+    ):
+        raise ValueError("Hv must be divisible by Hk and Hv/Hk must be in {1,2,3,4}.")
     gate_dtype = _normalize_dtype(params.get("gate_dtype", dtype))
     mm_mode = params.get("fp32_mmad_mode", "fp32")
     if mm_mode not in {"fp32", "hf32"}:

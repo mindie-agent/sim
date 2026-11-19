@@ -94,6 +94,8 @@
       1
     ],
     "qk_norm_type": "per_head",
+    "num_mtp_modules": 7,
+    "num_nextn_predict_layers": 1,
     "swiglu_alpha": 1.702,
     "swiglu_limit": 7.0,
     "routed_scaling_factor": 2.0,

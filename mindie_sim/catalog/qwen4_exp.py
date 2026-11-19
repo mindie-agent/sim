@@ -48,6 +48,12 @@ DEFAULT_PLE_DIVISOR = 128
 PLE_GATE_OPS_PER_ELEM = 6.0
 PLE_LOOKUP_OPS_PER_ELEM = 2.0
 DRAFT_HC_HEAD_TERMS = 3
+QWEN4_EXP_PLE_SOURCE: dict[str, str] = {
+    "repository": "vllm-project/vllm-ascend",
+    "revision": "405617bae227fe5b097ff163efaa60bb7f22c698",
+    "relative_path": "vllm_ascend/models/qwen4_exp/ple.py",
+    "source_sha256": "1327d2f777c8d262696865f0d5ffad1b061826e6f54b8d711a3af14e30f38033",
+}
 _SMALL_PRIMES = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
 _MILLER_RABIN_BASES = (2, 325, 9375, 28178, 450775, 9780504, 1795265022)
 
@@ -126,10 +132,13 @@ def build_ple_spec(c: Mapping[str, Any]) -> EngramSpec:
         tables=tuple(tables), max_ngram=max_ngram, heads=heads, width=width,
         pad_token_id=_int(c, "engram_pad_token_id", ZERO),
         host_response_bytes=width * BF16_BYTES,
-        source=merge_source({
-            "kind": "qwen4_exp_ple", "ple_layers": str(len(tables)),
-            "ple_conv_kernel_size": str(conv_k), "ple_embed_dim": str(embed),
-        }),
+        source=merge_source(
+            QWEN4_EXP_PLE_SOURCE,
+            {
+                "kind": "qwen4_exp_ple", "ple_layers": str(len(tables)),
+                "ple_conv_kernel_size": str(conv_k), "ple_embed_dim": str(embed),
+            },
+        ),
     )
 
 
@@ -307,6 +316,8 @@ def lowrank_hc_head_terms(model: ModelSpec) -> list[WeightTerm]:
 
 
 def lowrank_hc_draft_terms(draft: DraftSpec) -> list[WeightTerm]:
+    if draft.mhc_mult <= ZERO or draft.mhc_lowrank <= ZERO:
+        return []
     hc_dim = draft.mhc_mult * draft.hidden_size
     terms: list[WeightTerm] = []
     for part in ("attn", "ffn"):
@@ -320,6 +331,8 @@ def lowrank_hc_draft_terms(draft: DraftSpec) -> list[WeightTerm]:
 
 
 def lowrank_hc_draft_head_terms(draft: DraftSpec) -> list[WeightTerm]:
+    if draft.mhc_mult <= ZERO or draft.mhc_lowrank <= ZERO:
+        return []
     hc_dim = draft.mhc_mult * draft.hidden_size
     return [
         _t("draft_hc_head_norm", hc_dim, ONE, "norm"),
@@ -329,6 +342,8 @@ def lowrank_hc_draft_head_terms(draft: DraftSpec) -> list[WeightTerm]:
 
 
 def qsa_indexer_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
+    if not getattr(plan, "indexer", False) or plan.index_heads <= ZERO or plan.index_dim <= ZERO:
+        return []
     return [_t("index_qk_proj", (plan.index_heads + ONE) * plan.index_dim,
                model.hidden_size, "indexer"),
             _t("indexer_q_norm", plan.index_dim, ONE, "norm"),

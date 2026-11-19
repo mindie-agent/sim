@@ -16,15 +16,27 @@ from mindie_sim.schema.common import dtype_bytes
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.schema.tensors import TensorLayout, TensorValue
 from .mechanism import PlannedRecipe
-from . import gdn_recurrent
+from . import gdn_chunk32, gdn_recurrent
+from .gdn_domain import (
+    GDN_CHUNK32_HEAD_DIM_V,
+    GDN_CHUNK32_TOKENS,
+    GDN_CHUNK64_TOKENS,
+    GDN_HEAD_DIM_K,
+)
 from .operators import gdn_output, gdn_prepare, gdn_state
 
 
 def recipes():
-    """Recipes for the three native kernels; callers add their own extras."""
-    params = {"lengths": (1,), "heads": 1, "key_heads": 1, "dk": 128, "dv": 128, "chunk": 64}
-    return {module.make_op(params).recipe: PlannedRecipe(module.build)
+    """Recipes for native Chunk64 and Chunk32 GDN prefill kernels."""
+    params = {
+        "lengths": (1,), "heads": 1, "key_heads": 1,
+        "dk": GDN_HEAD_DIM_K, "dv": GDN_CHUNK32_HEAD_DIM_V,
+        "chunk": GDN_CHUNK64_TOKENS,
+    }
+    base = {module.make_op(params).recipe: PlannedRecipe(module.build)
             for module in (gdn_prepare, gdn_state, gdn_output)}
+    base.update(gdn_chunk32.recipes())
+    return base
 
 
 @dataclass(frozen=True)
@@ -123,27 +135,35 @@ def prefill(*, builder, tensors, q, k, v, gate, beta, lengths, heads,
     lengths = tuple(lengths)
     tokens = sum(lengths)
     dtype = b.model.activation_dtype
-    if dtype != "bf16" or (chunk, dk, dv) != (64, 128, 128):
-        raise ValueError("gdn_prefill_arch35_requires_bf16_chunk64_k128_v128")
+    is_chunk32 = int(chunk) == GDN_CHUNK32_TOKENS
+    if (dtype != "bf16"
+            or (dk, dv) != (GDN_HEAD_DIM_K, GDN_CHUNK32_HEAD_DIM_V)
+            or int(chunk) not in {GDN_CHUNK32_TOKENS, GDN_CHUNK64_TOKENS}):
+        raise ValueError("gdn_prefill_arch35_requires_bf16_chunk32_or_64_k128_v128")
+    prepare_mod = gdn_chunk32.PREPARE if is_chunk32 else gdn_prepare
+    state_mod = gdn_chunk32.STATE if is_chunk32 else gdn_state
+    output_mod = gdn_chunk32.OUTPUT if is_chunk32 else gdn_output
     params = {"lengths": lengths, "heads": heads, "key_heads": key_heads,
-              "dk": dk, "dv": dv, "chunk": chunk, "dtype": dtype,
-              "gate_dtype": "fp32", "use_exp2": True}
+              "dk": dk, "dv": dv, "chunk": int(chunk), "dtype": dtype,
+              "gate_dtype": "fp32", "use_exp2": not is_chunk32}
 
     # Keep the caller's actual token-range views before any compacting
     # materialization.  The typed offset is the evidence for [32,33) / [33,97)
     # (or another caller range); the materialized value is a separate op.
     source_inputs = (q, k, v, gate, beta)
-    # beta is a BF16 producer value in the historical callback; the native
-    # wrapper promotes it to FP32 before the BSN->BNS caller conversion.
-    beta = _materialize(
-        b, tensors, beta, "beta_fp32", reason="fla_common_gate_precision",
-        dtype="fp32", source=external.get("beta"))
+    if not is_chunk32:
+        # Chunk64 wrapper promotes BF16 beta to FP32 before BSN->BNS conversion;
+        # Chunk32 folds beta handling directly inside Prepare.
+        beta = _materialize(
+            b, tensors, beta, "beta_fp32", reason="fla_common_gate_precision",
+            dtype="fp32", source=external.get("beta"))
     gate = _materialize(
         b, tensors, gate.permute((0, 2, 1)), "g_head_first",
         reason="fla_BSN_to_BNS", source=external.get("g"))
     beta = _materialize(
         b, tensors, beta.permute((0, 2, 1)), "beta_head_first",
-        reason="fla_BSN_to_BNS")
+        reason="fla_BSN_to_BNS",
+        source=external.get("beta") if is_chunk32 else None)
     inputs = [
         _materialize(b, tensors, value.permute((0, 2, 1, 3)),
                      name + "_head_first", reason="fla_BSND_to_BNSD",
@@ -204,12 +224,13 @@ def prefill(*, builder, tensors, q, k, v, gate, beta, lengths, heads,
             source_views = source_inputs
         prepare_name = "gdn_prepare" if not segmented else f"gdn_prepare{index}"
         prepare = bind(
-            gdn_prepare, prepare_name,
+            prepare_mod, prepare_name,
             (*[value.producer for value in (q_i, k_i, v_i)],
              gate_i.producer, beta_i.producer),
             {"use_qk_l2norm_in_kernel": True, "use_gate_in_kernel": False,
-             "use_beta_sigmoid_in_kernel": False, "output_a": True,
-             "output_beta": False},
+             "use_beta_sigmoid_in_kernel": is_chunk32, "output_a": True,
+             "output_beta": False,
+             **({"beta_dtype": beta_i.dtype} if is_chunk32 else {})},
             lengths=lengths_i)
         prepare_meta = {
             "gdn_prepare_inputs": tuple(
@@ -256,7 +277,7 @@ def prefill(*, builder, tensors, q, k, v, gate, beta, lengths, heads,
         segment_effects = tuple(segment.get("effects", ()))
         state_name = "gdn_state" if not segmented else f"gdn_state{index}"
         deps = ((prepare, dependency) if dependency else (prepare,))
-        state = bind(gdn_state, state_name, deps,
+        state = bind(state_mod, state_name, deps,
                      {"use_initial_state": True, "output_final_state": True,
                       "state_v_first": True},
                      lengths=lengths_i)
@@ -317,7 +338,7 @@ def prefill(*, builder, tensors, q, k, v, gate, beta, lengths, heads,
     for index, segment in enumerate(segments):
         lengths_i = segment_lengths[index]
         name = "gdn_output" if not segmented else f"gdn_output{index}"
-        output_op = bind(gdn_output, name, (prepares[index], states[index]),
+        output_op = bind(output_mod, name, (prepares[index], states[index]),
                          {"state_v_first": True}, lengths=lengths_i)
         if segmented:
             b.ops[-1] = replace(b.ops[-1], metadata=tuple(sorted({
