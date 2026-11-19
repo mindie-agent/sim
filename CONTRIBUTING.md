@@ -13,7 +13,7 @@
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **Ascend A2** | `DAV_2201`<br/>(`npu_arch_2201`) | `Ascend910B1`、`B2`、`B2C`、`B3`、`B4`、`B4-1`（6 款） | `a2`、`910b`、`910b1..b4`、`800i-a2` | 单封装单 Die（`20/24 AIC`），`L0C = 128 KiB`，`UB = 192 KiB`，`L2 = 192 / 96 MiB`，原生 BF16/INT8/INT4（**无原生 FP8**），AIC<->AIV 经 GM/L2 通信，8P HCCS / 16P 桥接 | [**Ascend A2 校准与开发指南**](docs/contributing/ascend-a2.md) |
 | **Ascend A3** | `DAV_2201` 双 Die<br/>(`npu_arch_2201`) | `Ascend910_9391`、`9392`、`9381`、`9382`、`9372`、`9362`（6 款） | `a3`、`910c`、`800i-a3-8p`、`800i-a3-16p`、`a3-pod` | **单封装双 Die（`dies_per_package = 2`，每 Die 独立 Rank `Phy-ID 0..15`）**，片内 `SIO`（`448 GB/s`）+ 机内 `HCCS_SW` + **CloudMatrix 384** 超节点，`L2 = 192 / 168 MiB` | [**Ascend A3 校准与开发指南**](docs/contributing/ascend-a3.md) |
-| **Ascend A5** | `DAV_3510`<br/>(`npu_arch_3510`) | `Ascend950DT_9581`、`9582`、`Ascend950PR_9579`（3 款） | `a5`、`950`、`a5-pod`、`a5-server-dt`、`a5-pod-pr` | 单封装单 Die（`32 AIC / 64 AIV`），**`L0C = 256 KiB`**，`UB = 248 KiB`，`L2 = 128 MiB`，**原生 FP8/INT8/BF16**，新增片上 `l0c->ub` 直连，`K_8` `per_pair` UB 直连网与 **Atlas 950 SuperPoD** | [**Ascend A5 校准与开发指南**](docs/contributing/ascend-a5.md) |
+| **Ascend A5** | `DAV_3510`<br/>(`npu_arch_3510`) | `Ascend950DT_9581`、`9582`、`Ascend950PR_9579`、`Ascend950PR_958b`（4 款） | `a5`、`950`、`950pr_958b`、`a5-pod`、`a5-server-dt`、`a5-pod-pr` | 单封装单 Die（`32 AIC / 64 AIV`），**`L0C = 256 KiB`**，`UB = 248 KiB`，`L2 = 128 MiB`（DT `4.0 TB/s` / PR `1.6` & `1.4 TB/s`），**原生 FP8/INT8/BF16**，新增片上 `l0c->ub` 直连，`K_8` `per_pair` UB 直连网与 **Atlas 950 SuperPoD** | [**Ascend A5 校准与开发指南**](docs/contributing/ascend-a5.md) |
 
 ---
 
@@ -50,12 +50,22 @@ flowchart LR
 | 编号 | 绝对红线 | 代码级拦截机制与精确报错 |
 | :--- | :--- | :--- |
 | **红线 1** | **零旁路计算器与第二套 IR**<br/>严禁新建或恢复独立于 `runtime.Engine` 的公式估算器、私有子图 IR、独立通信耗时计算器或效率侧 `max(...)` 补丁。 | [`scripts/verify_m1.py`](scripts/verify_m1.py) 的 `hygiene` 门禁自动扫描并阻断 `opflow`、`op_formulas`、`prediction.piecewise`、`prediction.subgraphs` 等旁路模块及导入。 |
-| **红线 2** | **严禁 `ResourceEnvelope` `1.0x` 峰值除法兜底**<br/>严禁使用 `ResourceEnvelope`，也严禁把整个算子的 `context.work` 塞入单个未分相的聚合 `Stage` 变相伪装包络；未知算子机制必须显式报错，绝不静默放行零工作量（仅显式声明的控制同步族 `CONTROL_FAMILIES` 允许空载荷）。 | [`mindie_sim/prediction/program.py`](mindie_sim/prediction/program.py) 中 `ResourceEnvelope.lower()` 直接抛出 `ModelingError("resource_envelope_banned")`；未注册算子抛出 `ModelingError("unmodeled_operator_mechanism:<family>:<recipe>")`。 |
-| **红线 3** | **严禁整算子查表（LUT）或整网残差乘子**<br/>严禁按 `(model_name, M, N, K)` 硬编码耗时查表，严禁在模型/步长窗口反向拟合单算子参数，严禁虚构“Zipf 惩罚乘子”或全局 `0.80x` / `0.52x` 经验折损因子。 | [`mindie_sim/observations/service_fitting.py`](mindie_sim/observations/service_fitting.py) 硬性拒绝 `step` / `body` / `serving` / `e2e` 窗口及 `target_ms` / `residual_ms` 字段；[`scripts/verify_m2.py`](scripts/verify_m2.py) 审计全量 37 模型零包络命中。 |
+| **红线 2** | **零静默回退与严禁 `ResourceEnvelope` `1.0x` 峰值除法兜底**<br/>默认矩阵路径统一采用 `SteadyMatmul`；严禁使用 `ResourceEnvelope`，也严禁把整个算子的 `context.work` 塞入单个未分相的聚合 `Stage` 变相伪装包络；未知算子或未建模结构必须显式报错，绝不静默放行零工作量（仅显式声明的控制同步族 `CONTROL_FAMILIES` 允许空载荷）。 | [`mindie_sim/prediction/program.py`](mindie_sim/prediction/program.py) 中 `ResourceEnvelope.lower()` 直接抛出 `ModelingError("resource_envelope_banned")`；所有公开计时入口通过 [`unmodeled_gate.py`](mindie_sim/prediction/unmodeled_gate.py) 统一抛出携带 `mindie-unmodeled-structure-hint/1` 的 `UnmodeledCapabilityError`。 |
+| **红线 3** | **100% 结构与张量属性泛化（零 `model_id` 绑定、零 LUT 与零残差乘子）**<br/>算子选择（`implementation_selection`）、融合 pass 与 `PhysicalRecipe` **严禁按 `model_id` / 模型名分支绑定**（`model_scopes` 仅允许区分 `target` / `draft` 子图作用域），必须仅依据层结构类型、缓存连续性、量化精度与硬件 `Geometry` 泛化触发，确保同构新模型零代码继承校准结果；严禁按 `(model_name, M, N, K)` 硬编码耗时查表、反向拟合 `step/body/e2e` 窗口或虚构经验折损乘子。 | [`mindie_sim/observations/service_fitting.py`](mindie_sim/observations/service_fitting.py) 硬性拒绝 `step` / `body` / `serving` / `e2e` 窗口及 `target_ms` / `residual_ms` 字段；[`scripts/verify_m2.py`](scripts/verify_m2.py) 审计全量目录模型零包络命中。 |
 | **红线 4** | **严禁容器镜像 SHA 分发与私有开发机/内网路径泄漏**<br/>源码与配置中严禁出现宿主机个人家目录绝对路径（如 macOS/Linux `$HOME/...` 本地绝对路径）、实验室内网 IP 或按容器镜像 Digest（`docker.io/`、`swr.cn-`、`@sha256:`）做分支路由。 | [`scripts/verify_m1.py`](scripts/verify_m1.py) 自动扫描阻断；源码溯源统一使用 `{repository, revision, relative_path, source_sha256}`，抓包引用统一使用 `capture://<capture-id>/<member>`。 |
 | **红线 5** | **`buffer_units.l2 = 1` 共享 L2 容量归属不变量**<br/>只要在 `device.buffers` 中声明了 `"l2"` 容量，`device.buffer_units.l2` **必须且只能等于 `1`**（每颗物理 Die 共享唯一 L2 池，绝不能按 AIC/AIV 核数倍乘）。 | [`mindie_sim/schema/hardware.py`](mindie_sim/schema/hardware.py) 在解析硬件声明时强校验：若 `buffer_units.l2 != 1` 直接抛出 `ModelingError("shared_l2_buffer_requires_one_die_owner")`。 |
-| **红线 6** | **增量魔法数字门禁（Differential Numeric-Literal Gate）**<br/>在 `mindie_sim/**/*.py` 中修改或新增的任何语句不得直接出现裸数字字面量（含 `0`、`1`、`0.0`、单位换算及函数默认参数）：代数常数必须提取为模块顶层 `UPPER_SNAKE_CASE` 常量，硬件常数必须写入 `ascend.json`。 | [`scripts/check_no_magic_numbers.py`](scripts/check_no_magic_numbers.py) 通过 AST 结构掩码比对 `--base` 提交，任何新增裸数字字面量立即返回退出码 `1`。 |
+| **红线 6** | **增量数字与假常量门禁（Differential Numeric-Literal Gate）**<br/>自然数学与结构索引（`0`、`1`、`2`、`0.5`、`100`、`1000`、`1024`、`1e-6..1e-12`、下标/切片/`len` 比较）直接写字面量，**严禁定义 `ZERO = 0`、`ONE = 1`、`SIXTY_FOUR = 64`、`THREE_FLOAT = 3.0` 等同义数字英文假常量**；非平凡协议/代数常数提取为含真实领域名词的模块/类级 `UPPER_SNAKE_CASE` 常量，硬件常数写入 `ascend.json`。 | [`scripts/check_no_magic_numbers.py`](scripts/check_no_magic_numbers.py) 通过 AST 结构掩码比对 `--base` 提交，拦截未命名的非自然数字字面量及一切数字英文同义词假常量（退出码 `1`）。 |
 | **红线 7** | **Agent-Native 模块边界与 Unix `LF` 行尾**<br/>核心 Python 模块必须保持 `< 800` 行，文件前 30 行内必须包含 `[Role]`、`[Invariants]`、`[Timeouts & Locks]`、`[Side-Effect Policy]` 四段式契约文档头；全仓非二进制文件强制使用 Unix `LF`（`\n`）。 | [`.github/scripts/check_lf_eol.py`](.github/scripts/check_lf_eol.py) 扫描 `.gitattributes`、`.editorconfig` 及工作区全量文件，发现任何 `\r\n` 直接阻断。 |
+
+---
+
+### 1.3 上游三仓源码真源核对与跨仓 SSOT 契约纪律
+
+1. **三仓最新源码真源核对（防“对着旧源码把正确逻辑改错”）**：
+   - 昇腾推理算子图与融合边界分布在 **`vllm-ascend`**、**`cann/ops-transformer`** 与 **`cannbot-dsl`** 三个高频演进仓中。凡涉及算子图对齐、融合 pass（如 `mla_prolog` 连续/跨步缓存选择、混合 Prefill+Decode `qk_l2norm` 折叠、量化路由融合）或内核 ABI 约束（如历史 `cannbot_mixed_quant_sparse_flash_mla` 与 CANN 9.2.1 官方 `aclnnMixedQuantSparseFlashMla` 的维度支持边界），动工前**必须先同步并记录对应上游仓最新 `HEAD` revision**。
+   - **冲突裁决铁律**：当历史 Issue 描述、旧文档假设（例如上游早已默认下库的特性开关）与最新上游源码或真机 `msprof` 抓包冲突时，**一律以最新真实源码 + 实测抓包为唯一真源**，并在 PR Evidence 中写明上游演进差异，严禁盲从过时描述强改。
+2. **`mindie-sim <-> mindie-profiler` 跨仓 SSOT 单源契约**：
+   - `mindie_sim.observed_contracts`、`mindie_sim.subgraph_math` 与 `mindie_sim.structure*` 是 `mindie-profiler` 的单一事实源（例如 `structure.py` 中 `execution.resource_geometry` 仅保留拓扑结构键而不混入可变硬件峰值速率，确保 `compare_cohorts` 跨标定态的 `graph_id` 稳定；`structure_physical.py` 在 `fusion_phases` 列表内递归剥离 `ep_rank`）。修改上述模块或算子 `source_boundary` 时，必须挂载同级 `../profiler` 联合运行跨仓测试套件。
 
 ---
 
@@ -680,7 +690,16 @@ python3 scripts/verify_m2.py --output state/m2/audit.json
 PYTHONDONTWRITEBYTECODE=1 python3 -B -m pytest \
   -q -n auto --dist worksteal -p no:cacheprovider \
   -m "not live_npu"
+
+# （涉及 observed_contracts / subgraph_math / structure* / source_boundary 时必跑）挂载同级 profiler 解锁跨仓抓包契约并验证双仓套件：
+PYTHONPATH=".:../profiler" PYTHONDONTWRITEBYTECODE=1 python3 -B -m pytest \
+  -q -n auto --dist worksteal -p no:cacheprovider -m "not live_npu"
+PYTHONPATH=".:../profiler" PYTHONDONTWRITEBYTECODE=1 python3 -B -m pytest \
+  -q -n auto --dist worksteal -p no:cacheprovider -m "not live_npu" ../profiler/tests
 ```
+
+> [!NOTE]
+> **全目录测试分片与共享双核 CI Runner 预算规范**：GitHub Actions 标准 `ubuntu/macos/windows-latest` Runner 仅有 2 物理核（4 线程 xdist 并发），墙钟耗时约为独占服务器的 `1.5x–2.2x`。编写遍历全目录模型或多 SKU 的测试时，**必须按 `@pytest.mark.parametrize("hardware", SKUS)` 分片**供 `worksteal` 均衡调度，严禁写成单函数双层大循环造成单 worker `10+` 分钟拖尾超时；性能门禁的墙钟上限须预留共享 4-worker 并发裕度。
 
 **（可选）Tier-2 真机非破坏性集成验证**（仅在持有空闲 A2 / A3 / A5 测试卡时执行，强制隔离宿主目录防止环境污染）：
 ```bash
@@ -724,7 +743,9 @@ You are contributing incremental Ascend hardware calibration (`A2` / `A3` / `A5`
    - NEVER recreate or import sidecar calculators (`opflow`, `op_formulas`, `prediction.piecewise`, `prediction.subgraphs`, `sol`, `afd`, `skew_analysis`, `topology_tiers`).
    - NEVER use `ResourceEnvelope` (raises `ModelingError("resource_envelope_banned")`) and NEVER wrap total operator work into a single unphased `Stage(context.work)`. Unknown mechanisms must raise `ModelingError(f"unmodeled_operator_mechanism:{op.family}:{op.recipe}")`.
 
-2. **Zero LUTs, Zero Residual Multipliers, Zero Host/IP Leakage**:
+2. **Zero `model_id` Binding, Zero LUTs, Zero Residual Multipliers, Zero Host/IP Leakage**:
+   - NEVER branch on `model_id` / model names in `implementation_selection`, fusion passes, or `PhysicalRecipe`s (`model_scopes` may distinguish `target` vs `draft` subgraphs only); trigger mechanisms strictly from layer structure, cache contiguity, quantization dtypes, and hardware `Geometry`.
+   - Before aligning operator graphs or kernel ABIs, verify the latest `HEAD` revisions of `vllm-ascend`, `cann/ops-transformer`, and `cannbot-dsl`; when an issue assumption conflicts with fresh upstream code or real captures, follow real upstream code + captures and document the delta.
    - NEVER hardcode per-shape/per-model latency lookup tables, Zipf penalty multipliers, or whole-step/whole-body residual multipliers (`0.8x`, `0.52x`, etc.).
    - NEVER commit local host home paths (`$HOME/...`, macOS/Linux user directories), internal lab IPs, or container-image SHA routing (`docker.io/`, `swr.cn-`, `@sha256:`). Use `{repository, revision, relative_path, source_sha256}` for source provenance and `capture://<capture-id>/<member>` for benchmark/profiler captures.
 
@@ -732,7 +753,7 @@ You are contributing incremental Ascend hardware calibration (`A2` / `A3` / `A5`
    - Shared L2 rule (all chips): Whenever `buffers.l2` is set, `buffer_units.l2` MUST be `1` per Die (`shared_l2_buffer_requires_one_die_owner`).
    - **Ascend A2 (`DAV_2201`, `Ascend910B1..B4-1`)**: Single-Die (`20/24 AIC`), `L0C = 128 KiB` (`256x256` FP32 accumulators DO NOT FIT), `UB = 192 KiB`, `L2 = 192 MiB` (`B1..B3`) or `96 MiB` (`B4/B4-1`), native `bf16/fp16/fp32/hf32/int8/int4`, **NO native FP8 Cube**, AIC<->AIV via GM/L2, 8P HCCS (`per_port`) or 16P bridged.
    - **Ascend A3 (`DAV_2201` Dual-Die, `Ascend910_9362..9392`)**: `dies_per_package = 2` (1 rank = 1 physical Die `Phy-ID 0..15`, NEVER double per-Die HBM/AIC/L2 into package totals!), `L2 = 192 MiB` (`9372..9392`) or `168 MiB` (`9362`), separate intra-package `SIO` (`448 GB/s`, `0.8 us`) vs intra-node `HCCS_SW` vs CloudMatrix 384 `a3_superpod`.
-   - **Ascend A5 (`DAV_3510`, `Ascend950DT_9581/9582`, `Ascend950PR_9579`)**: Single-Die (`32 AIC / 64 AIV`), `L0C = 256 KiB`, `UB = 248 KiB`, `L2 = 128 MiB`, native `fp8_e4m3/fp8_e5m2/int8/bf16`, direct `l0c->ub` Fixpipe path, `K_8` `per_pair` UB direct mesh (`(W-1)*47.5 GB/s`) & Atlas 950 SuperPoD (`a5_pod`).
+   - **Ascend A5 (`DAV_3510`, `Ascend950DT_9581/9582`, `Ascend950PR_9579/958b`)**: Single-Die (`32 AIC / 64 AIV`), `L0C = 256 KiB`, `UB = 248 KiB`, `L2 = 128 MiB` (`4.0 TB/s` DT / `1.6 TB/s` `9579` / `1.4 TB/s` `958b`), native `fp8_e4m3/fp8_e5m2/int8/bf16`, direct `l0c->ub` Fixpipe path, `K_8` `per_pair` UB direct mesh (`(W-1)*47.5 GB/s`) & Atlas 950 SuperPoD (`a5_pod`).
    - Silicon microbenchmarks on all chips require: 30x `4096^2` BF16 GEMM clock warmup, `>= 3x L2_per_die` rotating cold-HBM ring paired with L2-hot, `2.5 ms` `StreamBlocker` separating RTS inclusive completion minima (`startup_ms = 0.0`) from Python host dispatch, exact integer `group_list` histograms on grouped GEMM, and unique `512+64` `c_kv` storage on absorbed MLA.
 
 4. **PhysicalRecipe, Custom Attention (Tiers 1–3) & Model Catalog Conservation**:
@@ -813,5 +834,5 @@ With either field non-empty, `resolve_stack_track(...)` raises `model_not_suppor
 2. **PR 设计原则门禁（`--profile device-tool`）**：所有 PR 须填写 [`.github/pull_request_template.md`](.github/pull_request_template.md) 并通过 `python3 .github/scripts/check_pr_checklist.py --profile device-tool`，逐项给出实证记录（纯文档变更可填写 `not-applicable: docs-only`）：
    - `DEV-ZERO-CTX`：仿真、合成与目录解析路径绝不加载权重、动态导入 `torch_npu` 或初始化 NPU 上下文（`0 MiB` HBM 增量）。
    - `DEV-READONLY-PATH`：分析与预测 CLI/API 不篡改输入产物、不泄漏宿主机 `$HOME`/内网 IP/镜像 SHA，并在捕获 `OSError` 前显式重抛 `TimeoutError`。
-   - `DEV-TOPOLOGY`：严格维护每 Die 唯一共享 `L2`（`buffer_units.l2 == 1`）、A2/A3 双 Die/A5 互联拓扑及核归属阶段工作量守恒（禁用 `ResourceEnvelope` 兜底）。
-   - `DEV-BOUNDED-MEM`：流式读取大抓包（`<= 512 MiB` 内存峰值）、核心模块 `< 800` 行且带四段式契约头、通过 `check_no_magic_numbers.py` 且全仓使用 Unix `LF`。
+   - `DEV-TOPOLOGY`：严格维护每 Die 唯一共享 `L2`（`buffer_units.l2 == 1`）、A2/A3 双 Die/A5（`DT` + `PR_9579/958b`）互联拓扑与阶段工作量守恒（禁用 `ResourceEnvelope`、未建模结构抛 `UnmodeledCapabilityError`）；零 `model_id` 算子硬编码，对齐 `vllm-ascend` / `ops-transformer` / `cannbot-dsl` 最新源码真源并保持 `mindie-profiler` SSOT 契约兼容。
+   - `DEV-BOUNDED-MEM`：流式读取大抓包（`<= 512 MiB` 内存峰值）、核心模块 `< 800` 行且带四段式契约头、通过 `check_no_magic_numbers.py`（禁假常量）、多 SKU 全目录测试按 `parametrize` 分片并留足共享双核 4-worker xdist 墙钟裕度，全仓使用 Unix `LF`。

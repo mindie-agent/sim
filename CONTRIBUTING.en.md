@@ -19,12 +19,12 @@ When launching a sandboxed coding CLI (e.g., Codex CLI or Claude Code), grant ac
 ## 2. Seven Clean-Core Architecture Rules
 
 1. **Single Causal Spine**: All single-op, subgraph, pure-model, 4D efficiency, SLA scaling, and PD/topology sweeps lower onto the single discrete-event `runtime.Engine` (`scripts/verify_m1.py hygiene`).
-2. **No `ResourceEnvelope` Peak-Division Fallbacks**: Unmodeled operator mechanisms fail explicitly (`ModelingError`); every computation/communication stage declares phased work.
-3. **Train / Held-Out Separation & No Body-Window LUTs**: Never fit single-operator parameters against whole-step/body/e2e latency or add model-specific multipliers.
+2. **Zero Silent Fallbacks & No `ResourceEnvelope` Peak-Division**: Default matrix lowering uses `SteadyMatmul`; unmodeled operator mechanisms or core structures fail explicitly (`UnmodeledCapabilityError` with `mindie-unmodeled-structure-hint/1` on public timing entry points); every computation/communication stage declares phased work.
+3. **100% Structural Generalization, Fresh Upstream Truth & No LUTs**: Never branch on `model_id` / model names in `implementation_selection`, fusion passes, or `PhysicalRecipe`s (`model_scopes` distinguishes `target` vs `draft` subgraphs only), and never fit single-operator parameters against whole-step/body/e2e latency. Verify the latest `HEAD` revisions of `vllm-ascend`, `cann/ops-transformer`, and `cannbot-dsl` before changing operator graphs or ABIs; when stale issue descriptions conflict with fresh upstream code + real captures, follow real upstream code + captures and document the delta.
 4. **Sanitized Provenance Only**: Never commit host `$HOME` paths, private lab IPs, or container image SHA dispatch branches; use `{repository, revision, relative_path, source_sha256}` and `capture://` URIs.
 5. **Die-Shared L2 Invariant**: Whenever `device.buffers.l2` is declared, `device.buffer_units.l2` must equal `1`.
-6. **Differential Numeric-Literal Gate**: Modified statements in `mindie_sim/**/*.py` must extract constants to named `UPPER_SNAKE_CASE` module symbols or `ascend.json` (`scripts/check_no_magic_numbers.py`).
-7. **Agent-Native Module Hygiene & Unix `LF`**: Keep core Python modules `< 800` lines with `[Role]` / `[Invariants]` / `[Timeouts & Locks]` / `[Side-Effect Policy]` in the top 30 lines, `<= 512 MiB` peak RAM, and Unix `LF` (`\n`) line endings.
+6. **Differential Numeric-Literal Gate**: Write natural mathematical and indexing literals (`0`, `1`, `2`, `0.5`, `100`, `1000`, `1024`, `1e-6..1e-12`, subscripts/slices) directly and **never** define tautological digit-word constants (`ZERO = 0`, `ONE = 1`, `SIXTY_FOUR = 64`); extract non-trivial domain invariants to `UPPER_SNAKE_CASE` module symbols carrying a real domain noun or `ascend.json` (`scripts/check_no_magic_numbers.py`).
+7. **Agent-Native Module Hygiene, Cross-Repo SSOT & Unix `LF`**: Keep core Python modules `< 800` lines with `[Role]` / `[Invariants]` / `[Timeouts & Locks]` / `[Side-Effect Policy]` in the top 30 lines, `<= 512 MiB` peak RAM, `@pytest.mark.parametrize` SKU sharding for full-catalog sweeps on 2-core / 4-worker CI runners, `mindie-profiler` SSOT compatibility (`PYTHONPATH=.:../profiler`), and Unix `LF` (`\n`) line endings.
 
 ## 3. Local Verification & Installed-Wheel Smoke Test
 
