@@ -7,15 +7,11 @@
 
 [Invariants]
   * Hardware SKUs resolve against registered public Ascend and NVIDIA profiles;
-    topology aliases only add an explicit multi-tier preset. Unknown SKUs raise
-    ``ModelingError("unknown_hardware_sku:...")``.
-  * Parallelism dimensions and structural overrides are validated explicitly;
-    invalid dimensions raise ``ModelingError`` or ``ValueError`` without silent
-    fallback.
+    topology aliases only add an explicit multi-tier preset.
+  * Parallelism dimensions, structural overrides, and orthogonal compilation
+    flags (``graph_capture_mode`` vs ``enable_torch_compile``/``enable_npugraph_ex``)
+    are validated explicitly without silent fallback.
   * Every synthesized dictionary is verified via ``parse_case`` before return.
-  * ``assemble`` submits model and no-layer framework fragments into one
-    execution context; pure-model scope is an explicit selection, never a
-    fabricated layer or an independent ``simulate_model`` timing splice.
 
 [Timeouts & Locks]
   Bounded local JSON config reads (< 50 MiB); no network, NPU, subprocess, or
@@ -28,110 +24,65 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
-from dataclasses import replace
-import json
 from pathlib import Path
 from typing import Any
 
 from mindie_sim.backends.ascend import (
     ASCEND_TOPOLOGY_PRESETS,
     materialize as materialize_ascend,
-    profiles as ascend_profiles,
 )
-from mindie_sim.backends.nvidia import (
-    materialize as materialize_nvidia,
-    profiles as nvidia_profiles,
+from mindie_sim.backends.nvidia import materialize as materialize_nvidia
+from mindie_sim.compose_assembly import (
+    _assembly_emit_counts,
+    _assembly_metric_rows,
+    _assembly_request_specs,
+    assemble,
 )
-from mindie_sim.catalog.specs import build_model_spec
-from mindie_sim.catalog.types import AuxiliarySpec, DraftSpec, QuantSpec, merge_source
-from mindie_sim.model_catalog import (
-    ARCHITECTURE_PRESET_ALIASES,
-    ARCHITECTURE_PRESET_CATALOG,
-    CATALOG,
-    CONFIG_DIR,
-    MODEL_ALIASES,
-    customize_model_spec,
-    load_model,
+from mindie_sim.compose_inputs import (
+    HARDWARE_ALIASES,
+    HARDWARE_TOPOLOGY_ALIASES,
+    _EXTRA_QUANT_SPECS,
+    _apply_quant_override,
+    _apply_structural_overrides,
+    _arch_key,
+    _ensure_registered_profiles,
+    _hardware_backend,
+    _read_config_json,
+    _resolve_hardware,
+    _resolve_max_position_embeddings,
+    _resolve_model_spec,
+    _tier4_router_spec,
+    _to_jsonable,
+    ensure_native_mla_draft,
+    prepare_speculation,
+    resolve_hardware_sku,
+)
+from mindie_sim.compose_runtime import (
+    PIECEWISE_CAPTURE_BASE_KEYS,
+    _execution_policy,
+    _resolve_va_lowerings,
+    _supports_sequence_parallel,
+    apply_va_recommended,
+    capture_keys,
+    finalize_compilation_spine,
+    snapshot_kernel_keys,
+    stamp_stack_profile_origins,
+    va_recommended_config,
 )
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError
-from mindie_sim.schema.model import ModelSpec
-from mindie_sim.schema.serialization import apply_model_overrides
-from mindie_sim.va_profiles import VA_RECOMMENDED_PROFILES, simulation_config
+from mindie_sim.va_profiles import VA_RECOMMENDED_PROFILES
 
-
-MX_GROUP_SIZE = 32
-MX_SCALE_PACK = 2
 NOMINAL_HOST_MEM_BPS = 64_000_000_000.0
 NOMINAL_HOST_VEC_OPS = 50_000_000_000.0
 NOMINAL_H2D_BPS = 32_000_000_000.0
 BYTES_PER_GB = 1_000_000_000.0
-NEXTN_DEFAULT_HEAD_DIM = 192
-PP_CAP_DEFAULT = (1, 2, 4, 8, 16)
-#: Native KDA recurrent source: decode-only batches up to q8.
-KDA_DECODE_MAX_QUERY_TOKENS = 8
-DRAFT_PREPARE_MIN_REMAINING = 2
-
-HARDWARE_ALIASES: dict[str, str] = {
-    "a2": "Ascend910B4", "910b": "Ascend910B4", "910b4": "Ascend910B4",
-    "910b1": "Ascend910B1", "910b2": "Ascend910B2", "910b3": "Ascend910B3",
-    "a3": "Ascend910_9392", "910c": "Ascend910_9392", "910_9392": "Ascend910_9392",
-    "910_9382": "Ascend910_9382",
-    "a5": "Ascend950DT_9582", "950": "Ascend950DT_9582",
-    "a5-pod": "Ascend950DT_9581", "atlas-950-superpod": "Ascend950DT_9581",
-    "950pr_958b": "Ascend950PR_958b", "ascend950pr_958b": "Ascend950PR_958b",
-    "h20": "NVIDIA_H20", "h800": "NVIDIA_H800", "h200": "NVIDIA_H200",
-    "b300": "NVIDIA_B300",
-    "800i-a2": "Ascend910B4", "800i-a3": "Ascend910_9392",
-    "800i-a3-8p": "Ascend910_9392", "800i-a3-16p": "Ascend910_9392",
-    "a3-pod": "Ascend910_9392",
-    "a5-pod-dt": "Ascend950DT_9581", "a5-pod-pr": "Ascend950PR_9579",
-    "a5-server-dt": "Ascend950DT_9581", "a5-server-pr": "Ascend950PR_9579",
-    "a5-server-pr-pcie-16p": "Ascend950PR_9579",
-}
-
-# Raw Ascend runtime / plog chip tokens resolve to the same two A5 packages as
-# the documented product aliases. Adding a chip token here never adds a SKU.
-HARDWARE_ALIASES.update(dict.fromkeys(
-    ("950pr", "ascend950pr", "950pr_a5", "ascend950pr_a5"),
-    HARDWARE_ALIASES["a5-server-pr"],
-))
-HARDWARE_ALIASES.update(dict.fromkeys(
-    ("950dt", "950dt_a5", "ascend950dt_a5",
-     "910_9599", "ascend910_9599"),
-    HARDWARE_ALIASES["a5"],
-))
-
-HARDWARE_TOPOLOGY_ALIASES: dict[str, tuple[str, str]] = {
-    "800i-a2": ("Ascend910B4", "a2_standard"),
-    "800i-a3": ("Ascend910_9392", "a3_16p"),
-    "800i-a3-8p": ("Ascend910_9392", "a3_8p"),
-    "800i-a3-16p": ("Ascend910_9392", "a3_16p"),
-    "a3-pod": ("Ascend910_9392", "a3_superpod"),
-    "a5-pod": ("Ascend950DT_9581", "a5_pod"),
-    "atlas-950-superpod": ("Ascend950DT_9581", "a5_pod"),
-    "a5-pod-dt": ("Ascend950DT_9581", "a5_pod"),
-    "a5-pod-pr": ("Ascend950PR_9579", "a5_pod"),
-    "a5-server-dt": ("Ascend950DT_9581", "a5_server"),
-    "a5-server-pr": ("Ascend950PR_9579", "a5_server"),
-    "a5-server-pr-pcie-16p": ("Ascend950PR_9579", "a5_pcie_16p"),
-}
-
-_EXTRA_QUANT_SPECS: dict[str, QuantSpec] = {
-    "fp16": QuantSpec(
-        name="fp16", weight_format="fp16", activation_format="fp16",
-        expert_weight_format="fp16", kv_dtype="fp16", index_dtype="fp16",
-        index_scale_dtype="none", native_format="fp16",
-    ),
-    "mxfp4": QuantSpec(
-        name="MXFP4", weight_format="mxfp4", activation_format="fp8_e4m3",
-        expert_weight_format="mxfp4", weight_block=(1, 32), expert_block=32,
-        scale_format="fp8_e8m0", scale_bytes=1.0, kv_dtype="bf16",
-    ),
-}
-
+A3_DEFAULT_RANKS_PER_NODE = 16
+DEFAULT_RANKS_PER_NODE = 8
+DEFAULT_MAX_MODEL_LEN = 32768
+MIN_DEFAULT_MAX_SEQS = 16
+MIN_DEFAULT_MAX_BATCHED_TOKENS = 8192
 DEFAULT_PARALLEL = 1
-DEFAULT_ZERO = 0
 DEFAULT_PROMPT_TOKENS = 4096
 DEFAULT_OUTPUT_TOKENS = 128
 DEFAULT_PREFIX_TOKENS = 0
@@ -146,447 +97,99 @@ DEFAULT_LOCAL_WIDTH = 1
 DEFAULT_REDUNDANT_EXPERTS = 0
 
 
-CAPTURE_BASE_KEYS = (1, 2, 4, 8, 16, 32, 64, 128, 256)
-CAPTURE_MIN_SEQUENCES = 1
-CAPTURE_MIN_STRIDE = 1
-CAPTURE_DEFAULT_MTP = 0
-
-
-def capture_keys(max_num_seqs: int,
-                 mtp_proposal_tokens: int = CAPTURE_DEFAULT_MTP) -> list[int]:
-    """Capture buckets up to ``max_num_seqs * (1 + mtp)`` including strides."""
-    sequences = max(CAPTURE_MIN_SEQUENCES, int(max_num_seqs))
-    stride = max(CAPTURE_MIN_STRIDE,
-                 CAPTURE_MIN_STRIDE + int(mtp_proposal_tokens))
-    keys = set(CAPTURE_BASE_KEYS)
-    keys.update(stride * step for step in range(CAPTURE_MIN_SEQUENCES,
-                                                sequences + CAPTURE_MIN_SEQUENCES))
-    keys.add(sequences * stride)
-    return sorted(keys)
-
-
-def _arch_key(sku: str) -> str:
-    if sku.startswith(("Ascend950", "Ascend910_95")):
-        return "a5"
-    return "a3" if sku.startswith("Ascend910_93") else ("a2" if sku.startswith("Ascend910B") else "other")
-
-
-def va_recommended_config(model: str, hardware: str = "a3") -> dict[str, Any]:
-    """Return a source-scoped simulation subset, not a complete vLLM launch file."""
-    key = str(model).strip()
-    canonical = MODEL_ALIASES.get(key, ARCHITECTURE_PRESET_ALIASES.get(key, key))
-    sku, _, _ = _resolve_hardware(hardware)
-    return simulation_config(canonical, sku, _arch_key(sku))
-
-
-def _supports_sequence_parallel(model_spec, profile: Mapping[str, Any], *,
-                                 tp: int, ep: int, pp: int, pcp: int,
-                                 notes: list[dict[str, Any]]) -> bool:
-    """Structural sequence-parallel applicability, never a model-name whitelist."""
-    if profile.get("sp") is False:
-        return False
-    if not (pcp >= DEFAULT_PARALLEL and pp >= DEFAULT_PARALLEL
-            and tp > DEFAULT_PARALLEL and ep >= tp
-            and ep % tp == DEFAULT_ZERO):
-        return False
-    from mindie_sim.prediction.sequence_parallel import _validate_model
-    try:
-        _validate_model(model_spec, padding="right_to_tp")
-    except ModelingError as exc:
-        from mindie_sim.prediction.implementation_selection import fallback_note
-        notes.append(fallback_note("sequence_parallel", str(exc)))
-        return False
-    return True
-
-
-def _execution_policy(case: Mapping[str, Any]) -> dict[str, Any]:
-    """Resolved execution policy stored by ``compose_case`` on the declaration."""
-    runtime = case.get("runtime") if isinstance(case, Mapping) else None
-    if not isinstance(runtime, Mapping):
-        return {}
-    policy = dict(runtime.get("metadata") or {}).get("execution_policy")
-    return dict(policy) if isinstance(policy, Mapping) else {}
-
-
-def _resolve_va_lowerings(
-    model_spec: ModelSpec, parallel: Mapping[str, int], sku: str, lowering_passes: tuple[str, ...],
-    *, notes: list[dict[str, Any]],
-) -> dict[str, Any]:
-    from mindie_sim.schema.parallel import ParallelSpec
-    from mindie_sim.catalog.paired_sfa import execution
-    is_a5 = _arch_key(sku) == "a5"
-    p_cfg = ParallelSpec(
-        dp=int(parallel.get("dp", 1)), tp=int(parallel.get("tp", 1)),
-        pp=int(parallel.get("pp", 1)), ep=int(parallel.get("ep", 1)),
-        cp=int(parallel.get("cp", parallel.get("dcp", 1))), pcp=int(parallel.get("pcp", 1)),
+def _materialize_machine(
+    hardware: str | Mapping[str, Any], *, required_devices: int,
+    num_devices: int | None, ranks_per_node: int | None,
+    topology_preset: str | None, inter_node_bw_gbps: float | None,
+    intra_node_bw_gbps: float | None, intra_package_bw_gbps: float | None,
+    inter_node_bw_util: float | None, intra_node_bw_util: float | None,
+    intra_package_bw_util: float | None, inter_node_latency_us: float | None,
+    intra_node_latency_us: float | None, intra_package_latency_us: float | None,
+    superpod_size: int | None, superpod_bw_gbps: float | None,
+    inter_pod_bw_gbps: float | None, intra_bw_4p_gbps: float | None,
+    intra_bw_8p_gbps: float | None,
+) -> tuple[str, str, dict[str, Any]]:
+    hw_raw = dict(hardware) if isinstance(hardware, Mapping) else {}
+    sku, backend, alias_preset = _resolve_hardware(hardware)
+    preset = str(topology_preset or alias_preset or hw_raw.get("topology_preset") or "")
+    if preset and backend != "ascend":
+        raise ModelingError(f"hardware_topology_preset_unsupported:{backend}:{preset}")
+    if preset and preset not in ASCEND_TOPOLOGY_PRESETS:
+        raise ModelingError(f"ascend_topology_preset_unknown:{preset}")
+    preset_defaults = ASCEND_TOPOLOGY_PRESETS.get(preset, {})
+    resolved_devices = int(
+        num_devices if num_devices is not None else hw_raw.get("num_devices", required_devices)
     )
-    lowerings: dict[str, Any] = {}
-    kda_layers = [p for p in model_spec.layer_plans if p.attention == "kda"]
-    if (kda_layers
-            and p_cfg.pcp >= DEFAULT_PARALLEL
-            and (p_cfg.cp == DEFAULT_PARALLEL
-                 or execution(model_spec).get("recurrent_context_sharded") is False)):
-        # This source kernel owns complete decode batches with q1-q8. Prefill,
-        # mixed batches and longer queries retain explicit semantic work.
-        kda_binding = ("vllm_ascend_recurrent_kda_arch35" if is_a5
-                       else "vllm_ascend_recurrent_kda_arch22")
-        kda_options = {}
-        if is_a5:
-            from mindie_sim.prediction.kda_source import resolve as resolve_kda_source
-            bounds = {getattr(p, "kda_gate_lower_bound", None) for p in kda_layers}
-            if len(bounds) == 1:
-                kda_options = resolve_kda_source(
-                    kda_layers[0], arch="A5", phase="decode", kernels={},
-                    activation_dtype=model_spec.activation_dtype) or {}
-        lowerings["kda"] = {
-            "cases": [{
-                "domain": {"phases": ["decode"],
-                           "max_query_tokens": {"min": 1,
-                                                "max": KDA_DECODE_MAX_QUERY_TOKENS}},
-                "binding": {"implementation": kda_binding, "options": kda_options},
-            }],
-            "otherwise": "analytical",
-        }
-    if any(p.residual_block_size > 0 for p in model_spec.layer_plans) and p_cfg.pp >= 1:
-        lowerings["attention_residual"] = "vllm_ascend_attn_res_prefix"
-    if any(p.attention == "gdn" for p in model_spec.layer_plans) and p_cfg.pcp >= 1:
-        opts = {"recurrent_implementation": "arch35_fp32"} if is_a5 else {}
-        binding = {"implementation": "vllm_ascend_gdn_decode", "options": opts}
-        # The source caller has separate ordinary and speculative paths. A
-        # heterogeneous q1/q>1 batch must retain the semantic implementation.
-        lowerings["gdn_decode"] = {
-            "cases": [
-                {"domain": {"phases": ["decode"], "min_query_tokens": {"min": 1},
-                            "max_query_tokens": {"max": 1}},
-                 "binding": binding},
-                {"domain": {"phases": ["decode"], "min_query_tokens": {"min": 2},
-                            **({"max_query_tokens": {"max": 8}} if is_a5 else {})},
-                 "binding": binding},
-            ],
-            "otherwise": "analytical",
-        }
-    # V3 ``MlaPrologV3`` only owns the LoRA-MLA prolog; V4/V4.1 latent-MQA
-    # projections are a different ABI and are not validated against it.
-    mla_layers = [p for p in model_spec.layer_plans
-                  if p.attention == "mla" and p.q_lora_rank > 0
-                  and p.mla_variant != "latent_mqa"]
-    if mla_layers:
-        from mindie_sim.prediction.family_mla_prolog import validate as validate_mla_prolog
-        prolog_options: dict[str, Any] = {}
-        quant = model_spec.quant
-        if (is_a5 and quant is not None and quant.kv_dtype == "int8"):
-            # The int8 KV row is the packed 656 B C8 layout on A5; the source
-            # prolog writes payload, BF16 rotary and FP32 scales in one row.
-            from mindie_sim.prediction.mla_prolog_packed import LAYOUT
-            prolog_options["cache_layout"] = LAYOUT
-        try:
-            for plan in mla_layers:
-                validate_mla_prolog(plan=plan, parallel=p_cfg, model=model_spec,
-                                    quant=quant, lowering_passes=lowering_passes,
-                                    **prolog_options)
-            lowerings["mla_prolog"] = (
-                {"implementation": "vllm_ascend_mla_prolog_v3",
-                 "options": prolog_options}
-                if prolog_options else "vllm_ascend_mla_prolog_v3")
-        except ModelingError as exc:
-            from mindie_sim.prediction.implementation_selection import fallback_note
-            notes.append(fallback_note("mla_prolog", str(exc)))
-    normalization = dict(model_spec.catalog_facts).get("normalization", {})
-    # The residual add+RMSNorm boundary never touches qk_norm; requiring the
-    # absence of qk_norm dropped a native residual norm on every qk-normed GQA
-    # and MoE model. ``norm_weight_offset`` alone decides the weight convention.
-    if (model_spec.activation_dtype == "bf16"
-            and not normalization.get("norm_weight_offset", 0.0)):
-        lowerings["add_rmsnorm"] = "vllm_ascend_native_norm"
-        if "activation_quantization" in lowering_passes and model_spec.quant is not None:
-            q = model_spec.quant
-            is_mx_fp8 = (
-                q.activation_format == "fp8_e4m3"
-                and q.activation_group_size == MX_GROUP_SIZE
-                and q.activation_scale_format == "fp8_e8m0"
-                and q.activation_scale_pack == MX_SCALE_PACK
-            )
-            if q.activation_format == "int8":
-                lowerings["add_rmsnorm_quant"] = "vllm_ascend_native_norm"
-            elif is_mx_fp8:
-                lowerings["add_rmsnorm_quant"] = "vllm_ascend_native_norm"
-                lowerings["rmsnorm_quant"] = "vllm_ascend_native_norm"
-    # CANN 9.2.1 native compressor and KeyPool caller.  A layer declaration
-    # selects the source; ``raw_eager`` never reaches this resolver.
-    if any(int(getattr(plan, "compress_ratio", 0) or 0) > 0
-           for plan in model_spec.layer_plans):
-        lowerings.setdefault("compressor", "vllm_ascend_cann_compressor")
-    if any(int(getattr(plan, "index_kpool", 1) or 1) > 1
-           for plan in model_spec.layer_plans):
-        lowerings.setdefault("pool_key_indexer", "vllm_ascend_cann_keypool_caller")
-    return lowerings
-
-
-def _tier4_router_spec(model_spec: ModelSpec, sku: str, *, raw_eager: bool) -> ModelSpec:
-    """A5 production executes the router in Tier-4 form.
-
-    ``DS-V4-Pro`` stores an FP32 router and pre-casts its weight copy.  On A5
-    the source kernel consumes the checkpoint weight directly and requests an
-    FP32 output, so no ``router_input_cast`` launch remains.  A standalone
-    ``load_model`` keeps the checkpoint declaration untouched.
-    """
-    if raw_eager or _arch_key(sku) != "a5":
-        return model_spec
-
-    def rewrite(plans):
-        return tuple(
-            replace(plan, router_dtype="", router_output_dtype="fp32",
-                    router_precast_weight_copy=False)
-            if plan.router_dtype == "fp32" else plan
-            for plan in plans)
-
-    aux = model_spec.auxiliary
-    changes = {}
-    if aux is not None:
-        for name in ("mtp", "dspark"):
-            spec = getattr(aux, name)
-            if spec is not None and tuple(getattr(spec, "layer_plans", ())):
-                changes[name] = replace(spec, layer_plans=rewrite(spec.layer_plans))
-    if changes:
-        aux = replace(aux, **changes)
-    return replace(model_spec, layer_plans=rewrite(model_spec.layer_plans),
-                   auxiliary=aux)
-
-
-def _to_jsonable(value: Any) -> Any:
-    if hasattr(value, "to_dict"):
-        return _to_jsonable(value.to_dict())
-    if isinstance(value, Mapping):
-        return {str(k): _to_jsonable(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_to_jsonable(v) for v in value]
-    return value
-
-
-def _ensure_registered_profiles() -> dict[str, Any]:
-    return ascend_profiles()
-
-
-def resolve_hardware_sku(hardware: str) -> str:
-    """Resolve a hardware alias or exact SKU name against registered profiles."""
-    if not isinstance(hardware, str) or not hardware.strip():
-        raise ModelingError(f"unknown_hardware_sku:{hardware}")
-    reg = {**_ensure_registered_profiles(), **nvidia_profiles()}
-    raw = hardware.strip()
-    lower = raw.lower()
-    if lower in HARDWARE_ALIASES:
-        sku = HARDWARE_ALIASES[lower]
-        if sku in reg:
-            return sku
-    if raw in reg:
-        return raw
-    for registered_sku in reg:
-        if registered_sku.lower() == lower:
-            return registered_sku
-    from mindie_sim.custom_hardware import resolve_custom_hardware_sku
-    custom = resolve_custom_hardware_sku(raw)
-    if custom is not None:
-        return str(custom["sku"])
-    raise ModelingError(f"unknown_hardware_sku:{hardware}")
-
-
-def _hardware_backend(sku: str) -> str:
-    if sku in nvidia_profiles():
-        return "nvidia"
-    if sku in _ensure_registered_profiles():
-        return "ascend"
-    from mindie_sim.custom_hardware import resolve_custom_hardware_sku
-    if resolve_custom_hardware_sku(sku) is not None:
-        return "custom"
-    raise ModelingError(f"unknown_hardware_sku:{sku}")
-
-
-def _resolve_hardware(hardware: str | Mapping[str, Any]) -> tuple[str, str, str]:
-    """Return the canonical SKU, vendor adapter and any alias topology preset."""
-    if isinstance(hardware, Mapping):
-        raw = dict(hardware)
-        requested = raw.get("sku", "a3")
-        preset = str(raw.get("topology_preset")) if raw.get("topology_preset") else ""
-        lower_req = str(requested).strip().lower()
-        if lower_req in HARDWARE_TOPOLOGY_ALIASES:
-            sku, alias_preset = HARDWARE_TOPOLOGY_ALIASES[lower_req]
-            return sku, _hardware_backend(sku), (preset or alias_preset)
-        try:
-            sku = resolve_hardware_sku(str(requested))
-            return sku, _hardware_backend(sku), preset
-        except ModelingError:
-            if any(k in raw for k in ("archetype", "hbm_gb", "hbm_bw_gbps", "cube_fp16_tflops")):
-                return str(requested).strip() or "CUSTOM_INLINE_SKU", "custom", preset
-            raise
-    lower = str(hardware).strip().lower()
-    if lower in HARDWARE_TOPOLOGY_ALIASES:
-        sku, preset = HARDWARE_TOPOLOGY_ALIASES[lower]
-        return sku, _hardware_backend(sku), preset
-    sku = resolve_hardware_sku(str(hardware))
-    return sku, _hardware_backend(sku), ""
-
-
-def _read_config_json(path: Path) -> dict[str, Any]:
-    target = path / "config.json" if path.is_dir() else path
-    if not target.is_file():
-        raise ModelingError(f"model_config_not_found:{path}")
-    if target.stat().st_size > 50 * 1024**2:
-        raise ValueError("metadata_input_exceeds_50_MiB")
-    with target.open(encoding="utf-8") as stream:
-        data = json.load(stream)
-    if not isinstance(data, Mapping):
-        raise ModelingError(f"model_config_invalid_mapping:{path}")
-    return dict(data)
-
-
-def _resolve_model_spec(model: str | Path | Mapping[str, Any]) -> ModelSpec:
-    if isinstance(model, Mapping):
-        raw = dict(model)
-        if "layers" in raw and "hidden_size" in raw and "model_type" not in raw:
-            return ModelSpec.from_mapping(raw)
-        name = str(raw.get("name") or raw.get("model_type") or "inline-model")
-        return build_model_spec(name, raw)
-
-    if isinstance(model, Path):
-        raw = _read_config_json(model)
-        name = str(raw.get("name") or (model.name if model.is_dir() else model.stem))
-        if "layers" in raw and "hidden_size" in raw and "model_type" not in raw:
-            return ModelSpec.from_mapping(raw)
-        return build_model_spec(name, raw)
-
-    if not isinstance(model, str) or not model.strip():
-        raise ModelingError(f"invalid_model_identifier:{model}")
-
-    key = model.strip()
-    canonical = MODEL_ALIASES.get(key, ARCHITECTURE_PRESET_ALIASES.get(key, key))
-    if canonical in CATALOG or canonical in ARCHITECTURE_PRESET_CATALOG:
-        return load_model(canonical)
-
-    candidate = Path(key)
-    if candidate.exists():
-        return _resolve_model_spec(candidate)
-
-    cfg_candidate = CONFIG_DIR / (key if key.endswith(".json") else f"{key}.json")
-    if cfg_candidate.is_file():
-        return _resolve_model_spec(cfg_candidate)
-
-    return load_model(key)
-
-
-def _apply_quant_override(
-    model_spec: ModelSpec,
-    quant: str | Mapping[str, Any] | None,
-    machine: Mapping[str, Any],
-) -> ModelSpec:
-    if quant is None:
-        peaks = machine.get("device", {}).get("compute_peaks", {})
-        has_fp8 = any(k in peaks for k in ("fp8", "fp8_e4m3", "mxfp4"))
-        if not has_fp8 and model_spec.quant is not None:
-            wf = str(model_spec.quant.weight_format)
-            ewf = str(model_spec.quant.expert_weight_format)
-            if "fp8" in wf or "fp8" in ewf or "mxfp4" in ewf:
-                return apply_model_overrides(model_spec, {"quantization": "w8a8"})
-        return model_spec
-
-    if isinstance(quant, str):
-        qkey = quant.strip().lower()
-        if qkey in _EXTRA_QUANT_SPECS:
-            qspec = _EXTRA_QUANT_SPECS[qkey]
-            return apply_model_overrides(
-                model_spec, {"quant": qspec.to_dict(), "kv_dtype": qspec.kv_dtype},
-            )
-        return apply_model_overrides(model_spec, {"quantization": qkey})
-    if isinstance(quant, Mapping):
-        qdict = dict(quant)
-        return apply_model_overrides(
-            model_spec,
-            {"quant": qdict, "kv_dtype": str(qdict.get("kv_dtype", model_spec.kv_dtype))},
-        )
-    raise ModelingError(f"invalid_quant_override:{quant}")
-
-
-def _resolve_max_position_embeddings(
-    model: str | Path | Mapping[str, Any], model_spec: ModelSpec,
-) -> int:
-    for src in (
-        getattr(model_spec, "max_position_embeddings", 0),
-        dict(model_spec.catalog_facts).get("max_position_embeddings", 0),
-        dict(model_spec.metadata).get("max_position_embeddings", 0),
+    if resolved_devices < required_devices:
+        raise ModelingError(f"insufficient_num_devices:{resolved_devices}:required:{required_devices}")
+    base_rpn = A3_DEFAULT_RANKS_PER_NODE if sku.startswith("Ascend910_93") else DEFAULT_RANKS_PER_NODE
+    default_rpn = min(resolved_devices, base_rpn)
+    if preset_defaults:
+        default_rpn = int(preset_defaults.get("ranks_per_node", default_rpn))
+    resolved_rpn = int(
+        ranks_per_node if ranks_per_node is not None else hw_raw.get("ranks_per_node", default_rpn)
+    )
+    network: dict[str, Any] = {}
+    for kind, value in (
+        ("inter_node", inter_node_bw_gbps),
+        ("intra_node", intra_node_bw_gbps),
+        ("intra_package", intra_package_bw_gbps),
     ):
-        if src:
-            return int(src)
-    raw: Mapping[str, Any] | None = model if isinstance(model, Mapping) else None
-    if isinstance(model, Path):
-        raw = _read_config_json(model)
-    elif isinstance(model, str):
-        key = model.strip()
-        canonical = MODEL_ALIASES.get(key, ARCHITECTURE_PRESET_ALIASES.get(key, key))
-        entries = {**CATALOG, **ARCHITECTURE_PRESET_CATALOG}
-        cfg_path = (CONFIG_DIR / entries[canonical]) if canonical in entries else Path(key)
-        if cfg_path.exists():
-            raw = _read_config_json(cfg_path)
-    if isinstance(raw, Mapping):
-        tc = raw.get("text_config") if isinstance(raw.get("text_config"), Mapping) else {}
-        val = raw.get("max_position_embeddings") or tc.get("max_position_embeddings")
-        if val:
-            return int(val)
-    return 0
-
-
-def _apply_structural_overrides(
-    model_spec: ModelSpec, *, layers: int | None, n_routed_experts: int | None,
-    num_experts_per_tok: int | None, promote_dense_to_moe: bool = False,
-) -> ModelSpec:
-    if (layers is None and n_routed_experts is None and num_experts_per_tok is None
-            and not promote_dense_to_moe):
-        return model_spec
-    return customize_model_spec(
-        model_spec, layers=layers, n_routed_experts=n_routed_experts,
-        num_experts_per_tok=num_experts_per_tok,
-        promote_dense_to_moe=promote_dense_to_moe,
-    )
-
-
-def prepare_speculation(model: ModelSpec, proposals: int, *,
-                        allow_synthetic_gqa: bool = False) -> ModelSpec:
-    """Declare a native draft only when the model already owns one.
-
-    A synthetic one-layer GQA MTP is available exclusively behind an explicit
-    ``allow_synthetic_gqa`` opt-in so a plain composition never fabricates an
-    auxiliary branch. Native MLA synthesis stays in ``compose_case`` where the
-    target geometry and context validation already live.
-    """
-    if proposals <= 0:
-        return model
-
-    aux = model.auxiliary
-    if aux is not None and aux.standalone_draft:
-        raise ModelingError("standalone_draft_requires_target_model")
-    if aux is not None and (aux.mtp is not None or aux.dspark is not None):
-        return model
-    if model.attention == "mla":
-        return model
-    if not allow_synthetic_gqa or model.attention != "gqa":
-        raise ModelingError("draft_structure_required_for_mtp_proposal_tokens")
-
-    from mindie_sim.catalog.draft import declare_native_auxiliary_plans
-
-    draft = DraftSpec(
-        kind="mtp", layers=1,
-        hidden_size=model.hidden_size,
-        intermediate_size=model.intermediate_size,
-        num_heads=model.num_heads,
-        num_kv_heads=model.num_kv_heads,
-        head_dim=model.head_dim,
-        q_width=model.num_heads * model.head_dim,
-        kv_width=2 * model.num_kv_heads * model.head_dim,
-        target_layer_ids=(model.layers - 1,),
-        activation_dtype=model.activation_dtype,
-        source=(("kind", "explicit_synthetic_gqa_mtp"),),
-    )
-    return declare_native_auxiliary_plans(
-        replace(model, auxiliary=replace(aux or AuxiliarySpec(), mtp=draft))
-    )
+        if value is not None:
+            network[f"{kind}_bw_bytes_per_s"] = float(value) * BYTES_PER_GB
+    for name, value in (
+        ("inter_node_bw_util", inter_node_bw_util), ("intra_node_bw_util", intra_node_bw_util),
+        ("intra_package_bw_util", intra_package_bw_util), ("inter_node_latency_us", inter_node_latency_us),
+        ("intra_node_latency_us", intra_node_latency_us), ("intra_package_latency_us", intra_package_latency_us),
+        ("superpod_size", superpod_size), ("superpod_bw_gbps", superpod_bw_gbps),
+        ("inter_pod_bw_gbps", inter_pod_bw_gbps), ("intra_bw_4p_gbps", intra_bw_4p_gbps),
+        ("intra_bw_8p_gbps", intra_bw_8p_gbps),
+    ):
+        if value is not None:
+            network[name] = value
+    machine_input = {
+        **hw_raw, **network, "sku": sku,
+        "num_devices": resolved_devices, "ranks_per_node": resolved_rpn,
+    }
+    if preset:
+        machine_input["topology_preset"] = preset
+    if "device" in machine_input and "links" in machine_input:
+        from mindie_sim.schema.hardware import Link, apply_network_overrides
+        parsed_links = tuple(
+            Link.from_mapping(l, default_members=range(resolved_devices))
+            for l in machine_input["links"]
+        )
+        parsed_links = apply_network_overrides(parsed_links, network)
+        machine = {**machine_input, "links": [l.to_dict() for l in parsed_links]}
+    elif backend == "custom":
+        from mindie_sim.custom_hardware import (
+            build_custom_hardware_machine, resolve_custom_hardware_sku,
+        )
+        custom_spec = resolve_custom_hardware_sku(sku) or {}
+        custom_overrides = {
+            k: v for k, v in (
+                ("ranks_per_node", ranks_per_node), ("inter_node_bw_gbps", inter_node_bw_gbps),
+                ("intra_node_bw_gbps", intra_node_bw_gbps), ("intra_package_bw_gbps", intra_package_bw_gbps),
+                ("inter_node_bw_util", inter_node_bw_util), ("intra_node_bw_util", intra_node_bw_util),
+                ("intra_package_bw_util", intra_package_bw_util), ("inter_node_latency_us", inter_node_latency_us),
+                ("intra_node_latency_us", intra_node_latency_us), ("intra_package_latency_us", intra_package_latency_us),
+                ("superpod_size", superpod_size), ("superpod_bw_gbps", superpod_bw_gbps),
+                ("inter_pod_bw_gbps", inter_pod_bw_gbps), ("intra_bw_4p_gbps", intra_bw_4p_gbps),
+                ("intra_bw_8p_gbps", intra_bw_8p_gbps),
+            ) if v is not None
+        }
+        merged_spec = {**custom_spec, **hw_raw, "sku": sku}
+        merged_spec.pop("num_devices", None)
+        machine = build_custom_hardware_machine(
+            merged_spec, num_devices=resolved_devices, **custom_overrides,
+        )
+    elif backend == "nvidia":
+        machine = materialize_nvidia(machine_input)
+    else:
+        machine = materialize_ascend(machine_input)
+    if preset:
+        machine = {**machine, "topology_preset": preset}
+    return sku, backend, machine
 
 
 def compose_case(
@@ -643,6 +246,10 @@ def compose_case(
     pp_layer_partition: Sequence[int] | None = None,
     enable_shared_expert_dp: bool = False,
     *,
+    enable_torch_compile: bool | None = None,
+    enable_npugraph_ex: bool | None = None,
+    enable_static_kernel: bool | None = None,
+    enable_super_kernel: bool | None = None,
     multistream_overlap_shared_expert: bool | None = None,
     engram_cpu_offload: bool | None = None,
     enable_dbo: bool = False,
@@ -670,6 +277,7 @@ def compose_case(
     feature_track: str = "merged",
     optimizations: Sequence[str] = (),
     exclude_optimizations: Sequence[str] = (),
+    _stack_phase: str | None = None,
 ) -> dict[str, Any]:
     """Synthesize and validate a complete simulation Case dictionary."""
     for name, val in (("tp", tp), ("dp", dp), ("ep", ep), ("pp", pp), ("pcp", pcp), ("dcp", dcp)):
@@ -687,113 +295,27 @@ def compose_case(
     if int(mtp_proposal_tokens) < 0:
         raise ModelingError(f"invalid_mtp_proposal_tokens:{mtp_proposal_tokens}")
 
-    required_devices = dp * tp * pp * pcp
-    hw_raw = dict(hardware) if isinstance(hardware, Mapping) else {}
-    sku, backend, alias_preset = _resolve_hardware(hardware)
-    # ``backend`` is later rebound to the documented all2all backend name; keep
-    # the resolved hardware adapter identity separately for operator defaults.
-    hardware_backend = backend
-    preset = str(topology_preset or alias_preset or hw_raw.get("topology_preset") or "")
-    if preset and backend != "ascend":
-        raise ModelingError(f"hardware_topology_preset_unsupported:{backend}:{preset}")
-    if preset and preset not in ASCEND_TOPOLOGY_PRESETS:
-        raise ModelingError(f"ascend_topology_preset_unknown:{preset}")
-    preset_defaults = ASCEND_TOPOLOGY_PRESETS.get(preset, {})
-    resolved_devices = int(
-        num_devices if num_devices is not None else hw_raw.get("num_devices", required_devices)
+    sku, hardware_backend, machine = _materialize_machine(
+        hardware, required_devices=dp * tp * pp * pcp, num_devices=num_devices,
+        ranks_per_node=ranks_per_node, topology_preset=topology_preset,
+        inter_node_bw_gbps=inter_node_bw_gbps, intra_node_bw_gbps=intra_node_bw_gbps,
+        intra_package_bw_gbps=intra_package_bw_gbps, inter_node_bw_util=inter_node_bw_util,
+        intra_node_bw_util=intra_node_bw_util, intra_package_bw_util=intra_package_bw_util,
+        inter_node_latency_us=inter_node_latency_us, intra_node_latency_us=intra_node_latency_us,
+        intra_package_latency_us=intra_package_latency_us, superpod_size=superpod_size,
+        superpod_bw_gbps=superpod_bw_gbps, inter_pod_bw_gbps=inter_pod_bw_gbps,
+        intra_bw_4p_gbps=intra_bw_4p_gbps, intra_bw_8p_gbps=intra_bw_8p_gbps,
     )
-    if resolved_devices < required_devices:
-        raise ModelingError(f"insufficient_num_devices:{resolved_devices}:required:{required_devices}")
-    default_rpn = min(resolved_devices, 16 if sku.startswith("Ascend910_93") else 8)
-    if preset_defaults:
-        # A preset owns its topology geometry even when fewer ranks are placed;
-        # placement then stays on the first declared node.
-        default_rpn = int(preset_defaults.get("ranks_per_node", default_rpn))
-    resolved_rpn = int(
-        ranks_per_node if ranks_per_node is not None else hw_raw.get("ranks_per_node", default_rpn)
-    )
-    network: dict[str, Any] = {}
-    for kind, value in (
-        ("inter_node", inter_node_bw_gbps),
-        ("intra_node", intra_node_bw_gbps),
-        ("intra_package", intra_package_bw_gbps),
-    ):
-        if value is not None:
-            # compose_case declares GB/s; the adapter's convenience alias uses
-            # bytes/s to retain that unit independently of its legacy Gb/s path.
-            network[f"{kind}_bw_bytes_per_s"] = float(value) * 1e9
-    for name, value in (
-        ("inter_node_bw_util", inter_node_bw_util),
-        ("intra_node_bw_util", intra_node_bw_util),
-        ("intra_package_bw_util", intra_package_bw_util),
-        ("inter_node_latency_us", inter_node_latency_us),
-        ("intra_node_latency_us", intra_node_latency_us),
-        ("intra_package_latency_us", intra_package_latency_us),
-        ("superpod_size", superpod_size),
-        ("superpod_bw_gbps", superpod_bw_gbps),
-        ("inter_pod_bw_gbps", inter_pod_bw_gbps),
-        ("intra_bw_4p_gbps", intra_bw_4p_gbps),
-        ("intra_bw_8p_gbps", intra_bw_8p_gbps),
-    ):
-        if value is not None:
-            network[name] = value
-    machine_input = {**hw_raw, **network, "sku": sku,
-                     "num_devices": resolved_devices, "ranks_per_node": resolved_rpn}
-    if preset:
-        machine_input["topology_preset"] = preset
-    if "device" in machine_input and "links" in machine_input:
-        from mindie_sim.schema.hardware import Link, apply_network_overrides
-        parsed_links = tuple(
-            Link.from_mapping(l, default_members=range(resolved_devices))
-            for l in machine_input["links"]
-        )
-        parsed_links = apply_network_overrides(parsed_links, network)
-        machine = {**machine_input, "links": [l.to_dict() for l in parsed_links]}
-    elif backend == "custom":
-        from mindie_sim.custom_hardware import (
-            build_custom_hardware_machine,
-            resolve_custom_hardware_sku,
-        )
-        custom_spec = resolve_custom_hardware_sku(sku) or {}
-        custom_overrides = {
-            k: v for k, v in (
-                ("ranks_per_node", ranks_per_node),
-                ("inter_node_bw_gbps", inter_node_bw_gbps),
-                ("intra_node_bw_gbps", intra_node_bw_gbps),
-                ("intra_package_bw_gbps", intra_package_bw_gbps),
-                ("inter_node_bw_util", inter_node_bw_util),
-                ("intra_node_bw_util", intra_node_bw_util),
-                ("intra_package_bw_util", intra_package_bw_util),
-                ("inter_node_latency_us", inter_node_latency_us),
-                ("intra_node_latency_us", intra_node_latency_us),
-                ("intra_package_latency_us", intra_package_latency_us),
-                ("superpod_size", superpod_size),
-                ("superpod_bw_gbps", superpod_bw_gbps),
-                ("inter_pod_bw_gbps", inter_pod_bw_gbps),
-                ("intra_bw_4p_gbps", intra_bw_4p_gbps),
-                ("intra_bw_8p_gbps", intra_bw_8p_gbps),
-            ) if v is not None
-        }
-        merged_spec = {**custom_spec, **hw_raw, "sku": sku}
-        merged_spec.pop("num_devices", None)
-        machine = build_custom_hardware_machine(
-            merged_spec, num_devices=resolved_devices, **custom_overrides,
-        )
-    elif backend == "nvidia":
-        machine = materialize_nvidia(machine_input)
-    else:
-        machine = materialize_ascend(machine_input)
-    if preset:
-        machine = {**machine, "topology_preset": preset}
-
-    # ``va_recommended=None`` is the production default on Ascend: documented
-    # vLLM-Ascend profiles are a *default*, never an override of an explicit
-    # caller choice.  ``raw_eager`` disables every optional fused lowering.
-    production = (backend == "ascend" and va_recommended is not False
-                  and not raw_eager)
+    ascend_backend = hardware_backend == "ascend"
+    from mindie_sim.stack_tracks import normalize_feature_track
+    canonical_track = normalize_feature_track(feature_track) if ascend_backend else "merged"
+    track_raw_eager = canonical_track == "raw_eager"
+    if track_raw_eager:
+        raw_eager = True
     if raw_eager and va_recommended:
         raise ModelingError("raw_eager_conflicts_with_explicit_fusion")
-    ascend_backend = backend == "ascend"
+    production = ascend_backend and va_recommended is not False and not raw_eager
+
     explicit_graph_capture = graph_capture_mode is not None
     explicit_sp = sp is not None
     model_spec = _resolve_model_spec(model)
@@ -806,47 +328,29 @@ def compose_case(
             "explicit_quant_preserved" if quant is not None else
             "documented_alternative_applied" if va_profile["quant"] is not None else
             "no_profile_override")
-        # ``simulation_config`` no longer fabricates a full capture policy for
-        # undocumented models; only a profile that declares one is forwarded.
         va_profile.setdefault("graph_capture_mode", None)
         if quant is None:
             quant = va_profile["quant"]
     model_spec = _apply_quant_override(model_spec, quant, machine)
     from mindie_sim.compose_operator_defaults import structural_v41_latent_mqa
-    # Layer slicing must not erase the full-model cache contract: the first
-    # sliced layers may all be window-only, while a later layer supplies the
-    # gated-ring compressor that identifies the packed V4.1 stack.
     v41_structural = structural_v41_latent_mqa(model_spec.layer_plans)
     model_spec = _apply_structural_overrides(
-        model_spec,
-        layers=layers,
-        n_routed_experts=n_routed_experts,
-        num_experts_per_tok=num_experts_per_tok,
-        promote_dense_to_moe=promote_dense_to_moe,
+        model_spec, layers=layers, n_routed_experts=n_routed_experts,
+        num_experts_per_tok=num_experts_per_tok, promote_dense_to_moe=promote_dense_to_moe,
     )
-    # An explicit opt-in may declare one synthetic GQA draft; an undeclared
-    # auxiliary structure otherwise fails here instead of being fabricated.
     model_spec = prepare_speculation(
-        model_spec, int(mtp_proposal_tokens),
-        allow_synthetic_gqa=allow_synthetic_gqa_draft,
+        model_spec, int(mtp_proposal_tokens), allow_synthetic_gqa=allow_synthetic_gqa_draft,
     )
-    # ``block_size=None`` resolves the documented page size and, for
-    # ``paired_sfa`` caches, the recurrent-state minimum; an explicit caller
-    # value is preserved verbatim so an invalid page still fails honestly.
     if block_size is not None:
         resolved_block_size = int(block_size)
     else:
-        resolved_block_size = int(
-            (va_profile or {}).get("kv_block_size") or DEFAULT_BLOCK_SIZE)
+        resolved_block_size = int((va_profile or {}).get("kv_block_size") or DEFAULT_BLOCK_SIZE)
         if dict(model_spec.metadata).get("cache_allocator") == "paired_sfa":
             from mindie_sim.catalog.paired_sfa import minimum_block_size
             resolved_block_size = max(
                 resolved_block_size,
-                minimum_block_size(model_spec, tp=tp,
-                                  proposals=int(mtp_proposal_tokens)))
-    # These are caller opt-ins: the profile exposes the documented capability
-    # as provenance, but enabling an overlap/offload path changes the pinned
-    # physical decomposition and must be an explicit composition choice.
+                minimum_block_size(model_spec, tp=tp, proposals=int(mtp_proposal_tokens)))
+
     notes: list[dict[str, Any]] = []
     resolved_mso = bool(multistream_overlap_shared_expert)
     resolved_engram_offload = bool(engram_cpu_offload)
@@ -860,115 +364,69 @@ def compose_case(
     elif sp is None:
         sp = bool(production and va_profile is not None
                   and _supports_sequence_parallel(model_spec, va_profile,
-                                                  tp=tp, ep=ep, pp=pp, pcp=pcp,
-                                                  notes=notes))
+                                                  tp=tp, ep=ep, pp=pp, pcp=pcp, notes=notes))
     documented_capture = (va_profile or {}).get("graph_capture_mode")
     capture_source = (
         "raw_eager" if raw_eager else
-        "explicit" if graph_capture_mode is not None
-        else "profile" if (production and documented_capture in
-                           {"full", "piecewise", "none"})
-        else "none")
+        "explicit" if graph_capture_mode is not None else
+        "profile" if (production and documented_capture in {"full", "piecewise", "none"}) else
+        "none")
     if raw_eager:
         graph_capture_mode = "none"
     elif graph_capture_mode is None:
-        documented = (va_profile or {}).get("graph_capture_mode")
-        graph_capture_mode = (str(documented)
-                              if documented in {"full", "piecewise", "none"} else "none")
+        graph_capture_mode = (str(documented_capture)
+                              if documented_capture in {"full", "piecewise", "none"} else "none")
+
+    supports_compile = bool(dict(model_spec.catalog_facts).get("supports_torch_compile", True))
+    initial_compile = (
+        False if raw_eager else
+        bool(enable_torch_compile) if enable_torch_compile is not None else
+        supports_compile
+    )
     execution_policy = {
-        "backend": backend,
-        "production": bool(production),
-        "va_recommended": va_recommended,
-        "raw_eager": bool(raw_eager),
+        "backend": hardware_backend, "production": bool(production),
+        "va_recommended": va_recommended, "raw_eager": bool(raw_eager),
         "automatic_optional_fusions": bool(not raw_eager and va_recommended is not False),
         "sp": bool(sp), "sp_source": sp_source,
-        "graph_capture_mode": str(graph_capture_mode),
-        "capture_source": capture_source,
-        "profile": (str((va_profile or {}).get("model", "")) if va_profile else ""),
-        "priority": ("raw_eager > explicit caller > documented profile > "
-                     "structural fusion defaults"),
+        "graph_capture_mode": str(graph_capture_mode), "capture_source": capture_source,
+        "enable_torch_compile": initial_compile,
+        "profile": str((va_profile or {}).get("model", "")) if va_profile else "",
+        "priority": "raw_eager > explicit caller > documented profile > structural fusion defaults",
     }
 
-    aux = model_spec.auxiliary
-    needs_draft = aux is None or (aux.mtp is None and aux.dspark is None)
-    if int(mtp_proposal_tokens) > DEFAULT_ZERO and needs_draft:
-        from mindie_sim.catalog.draft import declare_native_auxiliary_plans
-        facts = dict(model_spec.catalog_facts)
-        nextn = int(facts.get("num_nextn_predict_layers", 0) or 0)
-        moe_ref = next((p for p in model_spec.layer_plans if p.ffn == "moe"), None)
-        if (nextn <= 0 and moe_ref is not None and moe_ref.attention == "mla"
-                and moe_ref.q_lora_rank > 0):
-            nextn = 1
-        if nextn > 0 and moe_ref is not None and moe_ref.attention == "mla":
-            qk_dim = moe_ref.qk_nope_head_dim + moe_ref.qk_rope_head_dim
-            draft = DraftSpec(
-                kind="mtp", layers=nextn, hidden_size=model_spec.hidden_size,
-                intermediate_size=moe_ref.moe_intermediate_size,
-                num_heads=moe_ref.num_heads, num_kv_heads=DEFAULT_PARALLEL,
-                head_dim=qk_dim or NEXTN_DEFAULT_HEAD_DIM,
-                q_width=moe_ref.num_heads * qk_dim, kv_width=qk_dim,
-                attention_kind="mla", kv_cache_elements=moe_ref.kv_cache_elements,
-                weight_category="mtp", q_lora_rank=moe_ref.q_lora_rank,
-                kv_lora_rank=moe_ref.kv_lora_rank,
-                qk_nope_head_dim=moe_ref.qk_nope_head_dim,
-                qk_rope_head_dim=moe_ref.qk_rope_head_dim,
-                v_head_dim=moe_ref.v_head_dim, num_experts=moe_ref.num_experts,
-                top_k=moe_ref.top_k,
-                expert_intermediate_size=moe_ref.moe_intermediate_size,
-                num_shared_experts=moe_ref.num_shared_experts,
-                target_shared_embedding=True, target_shared_lm_head=True,
-                base_logits=True, pp_capability=PP_CAP_DEFAULT,
-                vocab_size=model_spec.vocab_size,
-                source=merge_source({"kind": "standard_deepseek_nextn_mtp"}),
-            )
-            model_spec = declare_native_auxiliary_plans(
-                replace(model_spec, auxiliary=AuxiliarySpec(mtp=draft)))
-
-    if int(mtp_proposal_tokens) > DEFAULT_ZERO:
-        # Auxiliary structure is declared natively by the model adapter at load
-        # time.  No last-layer synthesis: an undeclared draft structure is an
-        # explicit, actionable error instead of a fabricated one-layer module.
+    model_spec = ensure_native_mla_draft(model_spec, int(mtp_proposal_tokens))
+    if int(mtp_proposal_tokens) > 0:
         aux = model_spec.auxiliary
-        has_mtp = getattr(aux, "mtp", None) is not None
-        has_dspark = getattr(aux, "dspark", None) is not None
-        if not (has_mtp or has_dspark):
+        if getattr(aux, "mtp", None) is None and getattr(aux, "dspark", None) is None:
             raise ModelingError("draft_structure_required_for_mtp_proposal_tokens")
         if not (1.0 <= float(mtp_acceptance_length) <= float(1 + int(mtp_proposal_tokens))):
             raise ModelingError("invalid_mtp_acceptance_length")
 
     required_len = int(prompt_tokens) + int(output_tokens) + max(0, int(mtp_proposal_tokens))
-    # The catalog context limit is checked before an explicit max_model_len, so
-    # supplying one cannot bypass the model's own maximum position embeddings.
     if model_limit > 0 and required_len > model_limit:
         raise ModelingError(
-            f"workload_exceeds_model_max_position_embeddings:{required_len}>{model_limit}"
-        )
+            f"workload_exceeds_model_max_position_embeddings:{required_len}>{model_limit}")
     if max_model_len is not None:
         if int(max_model_len) < required_len:
             raise ModelingError(f"max_model_len_smaller_than_workload:{max_model_len}<{required_len}")
         resolved_max_model_len = int(max_model_len)
     else:
-        resolved_max_model_len = max(32768, required_len)
+        resolved_max_model_len = max(DEFAULT_MAX_MODEL_LEN, required_len)
 
-    # A5 production router form is a compose-scoped rewrite; a standalone
-    # ``load_model`` keeps the checkpoint declaration.
     model_spec = _tier4_router_spec(model_spec, sku, raw_eager=raw_eager)
     if ascend_backend and _arch_key(sku) == "a5":
-        # A persistent INT8 packed MLA row is a model-preparation fact, not a
-        # phase-scoped operator choice: capacity and both phases must see it.
-        from mindie_sim.compose_operator_defaults import (
-            resolve_packed_indexed_mla_cache,
-        )
+        from mindie_sim.compose_operator_defaults import resolve_packed_indexed_mla_cache
         model_spec = resolve_packed_indexed_mla_cache(model_spec)
     model_dict = _to_jsonable(model_spec)
     model_dict["n_routed_experts"] = int(model_spec.num_experts)
     model_dict["num_experts_per_tok"] = int(model_spec.top_k)
 
-    resolved_max_seqs = int(max_num_seqs) if max_num_seqs is not None else max(int(concurrency), 16)
+    resolved_max_seqs = (
+        int(max_num_seqs) if max_num_seqs is not None else max(int(concurrency), MIN_DEFAULT_MAX_SEQS)
+    )
     resolved_max_batched = (
-        int(max_num_batched_tokens)
-        if max_num_batched_tokens is not None
-        else max(int(prompt_tokens) * int(concurrency), 8192)
+        int(max_num_batched_tokens) if max_num_batched_tokens is not None
+        else max(int(prompt_tokens) * int(concurrency), MIN_DEFAULT_MAX_BATCHED_TOKENS)
     )
     requests = [
         {
@@ -988,13 +446,10 @@ def compose_case(
         "execution_policy": dict(execution_policy),
     }
     if ascend_backend:
-        # Declared silicon family for native-fusion activation.  A raw-eager
-        # execution keeps the same provenance but no optional fusion.
         runtime_meta.setdefault("arch_family", _arch_key(sku).upper())
     if resolved_engram_offload:
         h2d_ch = dict((machine.get("transfer_channels") or {}).get("h2d") or {})
-        h2d_bps = (float(h2d_ch.get("effective_uni_bw_gbps") or 0.0)
-                   * BYTES_PER_GB)
+        h2d_bps = float(h2d_ch.get("effective_uni_bw_gbps") or 0.0) * BYTES_PER_GB
         dev = dict(machine.get("device") or {})
         rates = dict(dev.get("rates") or {})
         rates.setdefault("host_memory", NOMINAL_HOST_MEM_BPS)
@@ -1006,8 +461,10 @@ def compose_case(
         runtime_meta["multistream_overlap_shared_expert"] = True
     if moe_comm_mode is not None:
         runtime_meta["moe_comm_mode"] = str(moe_comm_mode)
-    if int(mtp_proposal_tokens) > DEFAULT_ZERO:
-        runtime_meta["draft_mode"] = "mtp" if getattr(model_spec.auxiliary, "mtp", None) is not None else "dspark"
+    if int(mtp_proposal_tokens) > 0:
+        runtime_meta["draft_mode"] = (
+            "mtp" if getattr(model_spec.auxiliary, "mtp", None) is not None else "dspark"
+        )
         runtime_meta["draft_proposal_tokens"] = int(mtp_proposal_tokens)
     if enable_shared_expert_dp:
         runtime_meta["enable_shared_expert_dp"] = True
@@ -1024,11 +481,11 @@ def compose_case(
                     for c in range(int(pcp))
                     for t in range(int(tp))
                     for idx in (((d * int(pp) + stage) * int(pcp) + c) * int(tp) + t,)
-                ]][DEFAULT_ZERO],)
-                for offset in range(DEFAULT_ZERO, len(stage_ranks), int(ep))
+                ]][0],)
+                for offset in range(0, len(stage_ranks), int(ep))
             ]}
-               if int(pcp) > DEFAULT_PARALLEL and int(ep) > int(dp) * int(tp)
-               and (int(dp) * int(tp) * int(pcp)) % int(ep) == DEFAULT_ZERO else {}),
+               if int(pcp) > 1 and int(ep) > int(dp) * int(tp)
+               and (int(dp) * int(tp) * int(pcp)) % int(ep) == 0 else {}),
             "o_proj_tp": int(o_proj_tp),
             "linear_proj_tp": int(linear_proj_tp),
             "lm_head_tp": int(lm_head_tp),
@@ -1050,9 +507,17 @@ def compose_case(
         "async_scheduling": bool(async_scheduling),
         "graph_mode": str(graph_capture_mode),
         "graph_capture_mode": str(graph_capture_mode),
+        "enable_torch_compile": initial_compile,
         "mtp_acceptance_length": float(mtp_acceptance_length),
         "metadata": runtime_meta,
     }
+    for flag_name, flag_val in (
+        ("enable_npugraph_ex", enable_npugraph_ex),
+        ("enable_static_kernel", enable_static_kernel),
+        ("enable_super_kernel", enable_super_kernel),
+    ):
+        if flag_val is not None:
+            runtime_dict[flag_name] = bool(flag_val)
     if resolved_mso:
         runtime_dict["multistream_overlap_shared_expert"] = True
     if resolved_engram_offload:
@@ -1060,11 +525,10 @@ def compose_case(
     if enable_dbo:
         runtime_dict["enable_dbo"] = True
     if graph_capture_mode == "full":
-        runtime_dict["graph_capture_keys"] = capture_keys(
-            resolved_max_seqs, mtp_proposal_tokens)
+        runtime_dict["graph_capture_keys"] = capture_keys(resolved_max_seqs, mtp_proposal_tokens)
     elif graph_capture_mode == "piecewise":
         runtime_dict["piecewise_capture_keys"] = sorted(
-            {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, resolved_max_batched}
+            {*PIECEWISE_CAPTURE_BASE_KEYS, resolved_max_batched}
         )
     if pp_layer_partition is not None:
         runtime_dict["pp_layer_partition"] = [int(x) for x in pp_layer_partition]
@@ -1074,56 +538,46 @@ def compose_case(
             runtime_dict["pp_layer_partition"] = [hi] * (pp - 1) + [model_spec.layers - hi * (pp - 1)]
         else:
             runtime_dict["pp_layer_partition"] = [
-                model_spec.layers // pp + (1 if i < model_spec.layers % pp else 0) for i in range(pp)]
+                model_spec.layers // pp + (1 if i < model_spec.layers % pp else 0)
+                for i in range(pp)
+            ]
     if sp:
         from mindie_sim.prediction.sequence_parallel import DECLARATION, _validate_model
         if pcp < 1 or pp < 1 or tp <= 1 or ep < tp or (ep % tp != 0):
-            raise ModelingError(
-                f"sequence_parallel_invalid_topology:tp={tp},ep={ep},pp={pp},pcp={pcp}"
-            )
+            raise ModelingError(f"sequence_parallel_invalid_topology:tp={tp},ep={ep},pp={pp},pcp={pcp}")
         _validate_model(model_spec, padding="right_to_tp")
-        runtime_dict["kernels"] = {
-            "sequence_parallel": dict(DECLARATION, padding="right_to_tp")
-        }
+        runtime_dict["kernels"] = {"sequence_parallel": dict(DECLARATION, padding="right_to_tp")}
+
+    prior_kernels = snapshot_kernel_keys(runtime_dict.get("kernels"))
     excluded_selectors: frozenset[str] = frozenset()
     excluded_passes: frozenset[str] = frozenset()
     if ascend_backend and not raw_eager:
         from mindie_sim.stack_tracks import excluded_lowering_bindings
-        excluded_selectors, excluded_passes = excluded_lowering_bindings(
-            exclude_optimizations)
+        excluded_selectors, excluded_passes = excluded_lowering_bindings(exclude_optimizations)
     if va_profile is not None:
         runtime_meta["va_recommended"] = True
         runtime_meta["va_profile"] = deepcopy(va_profile)
-        # A documented vLLM ``compilation_config`` is forwarded only when it
-        # agrees with the resolved graph mode; an explicit caller choice is
-        # never silently overridden.
         compilation = va_profile.get("compilation_config")
         if (isinstance(compilation, dict)
-                and str(compilation.get("cudagraph_mode") or "").upper()
-                in {"FULL", "FULL_DECODE_ONLY"}
+                and str(compilation.get("cudagraph_mode") or "").upper() in {"FULL", "FULL_DECODE_ONLY"}
                 and str(graph_capture_mode) == "full"):
             runtime_dict["compilation_config"] = deepcopy(compilation)
-        backend = va_profile.get("all2all_backend")
-        if isinstance(backend, str) and backend:
-            runtime_dict["all2all_backend"] = backend
+        all2all = va_profile.get("all2all_backend")
+        if isinstance(all2all, str) and all2all:
+            runtime_dict["all2all_backend"] = all2all
         runtime_meta["va_env"] = dict(va_profile["env"])
         runtime_meta["va_recommended_mtp_proposal_tokens"] = int(va_profile["mtp_proposal_tokens"])
         passes: tuple[str, ...] = ()
         if (model_spec.quant is not None
-                and str(model_spec.quant.activation_format)
-                != str(model_spec.activation_dtype)):
+                and str(model_spec.quant.activation_format) != str(model_spec.activation_dtype)):
             passes = ("activation_quantization", "norm_quant")
             runtime_dict["lowering_passes"] = list(passes)
         lowerings = _resolve_va_lowerings(
             model_spec, runtime_dict["parallel"], sku, passes, notes=notes,
         )
-        # ``exclude_optimizations`` owns the profile-installed selectors too;
-        # removing only the feature-track entry would retain the fused kernel.
-        lowerings = {name: value for name, value in lowerings.items()
-                     if name not in excluded_selectors}
+        lowerings = {k: v for k, v in lowerings.items() if k not in excluded_selectors}
         if excluded_passes:
-            passes = tuple(name for name in passes
-                           if name not in excluded_passes)
+            passes = tuple(name for name in passes if name not in excluded_passes)
             if passes:
                 runtime_dict["lowering_passes"] = list(passes)
             else:
@@ -1137,62 +591,50 @@ def compose_case(
             kernels_dict["lowerings"] = {**lowerings, **existing_low}
             runtime_dict["kernels"] = kernels_dict
 
-    # Two-layer feature tracks: resolve the selected runtime stack's merged /
-    # unmerged-PR / architectural-ideal mechanism set on top of the documented
-    # profile base.  ``va_recommended=False`` with the default ``merged`` track
-    # keeps zero automatic stack fusions, preserving the caller's bare case.
     mechanism_track_active = False
-    if ascend_backend and not raw_eager:
+    if ascend_backend and (not raw_eager or track_raw_eager):
         from mindie_sim.feature_mechanisms import MechanismContext
         from mindie_sim.stack_tracks import (
-            apply_resolved_mechanisms, normalize_feature_track,
-            resolve_runtime_stack, resolve_stack_track,
+            apply_resolved_mechanisms, resolve_runtime_stack, resolve_stack_track,
         )
-
-        canonical_track = normalize_feature_track(feature_track)
-        # An exclusion removes mechanisms; it never activates a non-empty
-        # track.  ``va_recommended=False`` with only exclusions therefore keeps
-        # the caller's bare case instead of enabling graph capture and MoE
-        # gating as a side effect.
-        if (va_recommended is not False or bool(optimizations)
-                or canonical_track != "merged"):
-            mechanism_track_active = True
+        if (track_raw_eager or va_recommended is not False
+                or bool(optimizations) or canonical_track != "merged"):
+            mechanism_track_active = not raw_eager
             stack_profile = resolve_runtime_stack(runtime_stack)
-            stack_model_key = str(
-                (va_profile or {}).get("canonical_model") or model_spec.name)
+            stack_model_key = str((va_profile or {}).get("canonical_model") or model_spec.name)
             caller_explicit = frozenset(
                 name for name, explicit in (
                     ("graph_capture_mode", explicit_graph_capture),
                     ("sp", explicit_sp),
-                    ("multistream_overlap_shared_expert",
-                     multistream_overlap_shared_expert is not None),
+                    ("enable_torch_compile", enable_torch_compile is not None),
+                    ("enable_npugraph_ex", enable_npugraph_ex is not None),
+                    ("enable_static_kernel", enable_static_kernel is not None),
+                    ("enable_super_kernel", enable_super_kernel is not None),
+                    ("multistream_overlap_shared_expert", multistream_overlap_shared_expert is not None),
                     ("moe_comm_mode", moe_comm_mode is not None),
                     ("recover_ssm", recover_ssm is True),
                 ) if explicit)
+            ctx_opts = {"phase": _stack_phase} if _stack_phase else {}
             mechanism_ctx = MechanismContext(
                 model=model_spec, sku=sku, arch=_arch_key(sku),
                 parallel=dict(runtime_dict["parallel"]),
-                caller_explicit=caller_explicit, options={})
+                caller_explicit=caller_explicit, options=ctx_opts)
             resolved_track = resolve_stack_track(
                 stack_profile, track=canonical_track, model_key=stack_model_key,
                 ctx=mechanism_ctx, optimizations=optimizations,
                 exclude_optimizations=exclude_optimizations)
-            apply_resolved_mechanisms(runtime_dict, resolved_track, mechanism_ctx)
+            if not raw_eager or optimizations:
+                apply_resolved_mechanisms(runtime_dict, resolved_track, mechanism_ctx)
             runtime_meta = dict(runtime_dict.get("metadata") or {})
             runtime_meta["feature_track_report"] = resolved_track
             runtime_dict["metadata"] = runtime_meta
 
-    # Device-adaptor operator defaults. The A5 V4.1 packed cache ABI is selected
-    # by hardware capability plus structural geometry, independently of the
-    # expert weight format; an unsupported automatic geometry keeps analytical
-    # execution and is reported instead of being installed.
     if ascend_backend and not raw_eager:
         from mindie_sim.compose_operator_defaults import (
             DECLARATION_PHASE, apply_compose_v41_a5_defaults,
         )
-        from mindie_sim.prediction.implementation_selection import (
-            operator_selection_summary,
-        )
+        from mindie_sim.prediction.implementation_selection import operator_selection_summary
+        runtime_meta = dict(runtime_dict.get("metadata") or {})
         kernels = dict(runtime_dict.get("kernels") or {})
         lowerings = dict(kernels.get("lowerings") or {})
         notes.extend(apply_compose_v41_a5_defaults(
@@ -1202,8 +644,7 @@ def compose_case(
             runtime_metadata=runtime_meta, structural_v41=v41_structural,
         ))
         if excluded_selectors:
-            lowerings = {name: value for name, value in lowerings.items()
-                         if name not in excluded_selectors}
+            lowerings = {k: v for k, v in lowerings.items() if k not in excluded_selectors}
         if lowerings:
             kernels["lowerings"] = lowerings
             runtime_dict["kernels"] = kernels
@@ -1211,25 +652,16 @@ def compose_case(
             arch_family=_arch_key(sku), phase=DECLARATION_PHASE, notes=notes)
         runtime_dict["metadata"] = runtime_meta
 
-    # CANN 9.2.1 stack declarations shared by the documented profile and the
-    # merged mechanism track.  ``va_recommended=False`` without a selected
-    # mechanism keeps the caller's bare case.
-    if (ascend_backend and not raw_eager
-            and (va_recommended is not False or mechanism_track_active)):
+    if ascend_backend and not raw_eager and (va_recommended is not False or mechanism_track_active):
         from mindie_sim.feature_mechanisms import ensure_norm_quant_domain
         kernels = dict(runtime_dict.get("kernels") or {})
         lowerings = dict(kernels.get("lowerings") or {})
         if any(plan.ffn == "moe" for plan in model_spec.layer_plans):
-            kernels.setdefault("moe_gating",
-                               {"implementation": "vllm_ascend_cann_gating"})
-        if any(int(getattr(plan, "compress_ratio", 0) or 0) > 0
-               for plan in model_spec.layer_plans):
+            kernels.setdefault("moe_gating", {"implementation": "vllm_ascend_cann_gating"})
+        if any(int(getattr(plan, "compress_ratio", 0) or 0) > 0 for plan in model_spec.layer_plans):
             lowerings.setdefault("compressor", "vllm_ascend_cann_compressor")
-        pooled = any(int(getattr(plan, "index_kpool", 1) or 1) > 1
-                     for plan in model_spec.layer_plans)
-        if pooled:
-            lowerings.setdefault("pool_key_indexer",
-                                 "vllm_ascend_cann_keypool_caller")
+        if any(int(getattr(plan, "index_kpool", 1) or 1) > 1 for plan in model_spec.layer_plans):
+            lowerings.setdefault("pool_key_indexer", "vllm_ascend_cann_keypool_caller")
             model_dict.setdefault("metadata", {})["native_keypool_caller"] = True
         if "norm_quant" in tuple(runtime_dict.get("lowering_passes") or ()):
             kernels = ensure_norm_quant_domain(kernels)
@@ -1237,6 +669,9 @@ def compose_case(
             kernels["lowerings"] = lowerings
         if kernels:
             runtime_dict["kernels"] = kernels
+
+    finalize_compilation_spine(runtime_dict, raw_eager=raw_eager)
+    stamp_stack_profile_origins(runtime_dict, prior_keys=prior_kernels)
 
     case_dict: dict[str, Any] = {
         "model": model_dict,
@@ -1249,8 +684,7 @@ def compose_case(
     derivation = dict(hardware_derivation or {})
     for key, value in (
         ("aic_count", aic_count), ("aiv_count", aiv_count),
-        ("memory_bytes", memory_bytes),
-        ("hbm_peak_bytes_per_s", hbm_peak_bytes_per_s),
+        ("memory_bytes", memory_bytes), ("hbm_peak_bytes_per_s", hbm_peak_bytes_per_s),
         ("hbm_efficiency", hbm_efficiency),
         ("mte2_ceiling_bytes_per_s", mte2_ceiling_bytes_per_s),
         ("mte2_efficiency", mte2_efficiency),
@@ -1269,670 +703,15 @@ def compose_case(
     return case_dict
 
 
-def _assembly_request_specs(case, requests):
-    from mindie_sim.schema.model import RequestSpec
-    if requests is None:
-        return tuple(case.workload.requests)
-    result = []
-    for index, item in enumerate(requests):
-        result.append(item if isinstance(item, RequestSpec)
-                      else RequestSpec.from_mapping(item, index))
-    return tuple(result)
-
-
-def _assembly_emit_counts(specs, generated, override):
-    """One ordinary model step emits at most one token per active request.
-
-    A speculative step can emit more; this entry has no draft contract and
-    therefore never batches several undecoded tokens into one forward/commit.
-    """
-    if override is not None:
-        return {str(key): int(value) for key, value in override.items() if int(value) > 0}
-    return {spec.request_id: 1 for spec in specs
-            if spec.output_tokens - generated[spec.request_id] > 0}
-
-
-def _assembly_metric_rows(specs, rows):
-    records = {
-        spec.request_id: {
-            "request_id": spec.request_id,
-            "arrival_ms": spec.arrival_ms,
-            "output_tokens": spec.output_tokens,
-            "generated_tokens": 0,
-            "commits": [],
-            "host_results": [],
-            "deliveries": [],
-        }
-        for spec in specs
-    }
-    for row in rows:
-        for request, count in row["emitted_tokens"].items():
-            record = records[request]
-            record["generated_tokens"] += count
-            commit = row["commit_ms"].get(request)
-            if commit is not None:
-                record["commits"].append((commit, count))
-        for request, at_ms in row["host_result_ms"].items():
-            records[request]["host_results"].append(at_ms)
-        for request, at_ms in row["delivery_ms"].items():
-            records[request]["deliveries"].append(at_ms)
-    result = []
-    for spec in specs:
-        record = records[spec.request_id]
-        commits = sorted(record["commits"])
-        host = sorted(record["host_results"])
-        delivered = sorted(record["deliveries"])
-        first_commit = commits[0][0] if commits else None
-        last_commit = commits[-1][0] if commits else None
-        generated = record["generated_tokens"]
-        intervals = max(0, generated - 1)
-        tpot = ((last_commit - first_commit) / intervals
-                if intervals and first_commit is not None else None)
-        window = (last_commit - spec.arrival_ms
-                  if last_commit is not None else None)
-        result.append({
-            "request_id": spec.request_id,
-            "arrival_ms": spec.arrival_ms,
-            "generated_tokens": generated,
-            "first_commit_ms": first_commit,
-            "last_commit_ms": last_commit,
-            "ttft_ms": (first_commit - spec.arrival_ms
-                        if first_commit is not None else None),
-            "tpot_ms": tpot,
-            "e2e_ms": window,
-            "output_tps": (generated * 1000.0 / window
-                           if window and window > 0 else None),
-            "first_host_result_ms": host[0] if host else None,
-            "last_host_result_ms": host[-1] if host else None,
-            "first_delivery_ms": delivered[0] if delivered else None,
-            "last_delivery_ms": delivered[-1] if delivered else None,
-            "delivery_e2e_ms": (delivered[-1] - spec.arrival_ms
-                               if delivered else None),
-        })
-    return result
-
-
-def assemble(case, *, scope="service", iterations=None, phase=None, tokens=None,
-             context=None, requests=None, emitted_tokens=None,
-             include_submission=None, trace_limit=0, resource_fusion=True,
-             primitives=None, recipes=None, full_service=False,
-             diagnostic_window=False, lower=None):
-    """Submit model and framework fragments into one execution context.
-
-    ``scope="model"`` selects the pure forward program and excludes
-    sampling/acceptance/token commit. ``scope="service"`` keeps those service
-    fragments and attaches the declared serving I/O. ``scope="framework"``
-    executes only no-layer host/transfer/delivery work; it has no model layer
-    and no fabricated placeholder operator.
-
-    Iterations are serialized by actual completion/delivery events, not by an
-    externally injected latency. Every iteration uses the same ``Execution``
-    and its resource/service state. For decode, one ordinary model step emits
-    one token per active request; ``tokens`` is a per-outer-iteration budget
-    expanded into that many real microsteps. There is no batched multi-token
-    decode step and no fabricated sleep.
-
-    ``submitted_ms`` is bound only to actual engine host-launch events observed
-    in this run (currently the last launch per stage). It is never the
-    scheduler event; framework-only work with no launch reports no submit.
-    """
-    from mindie_sim.prediction.attention import AttentionPolicy
-    from mindie_sim.prediction.cost import CostModel
-    from mindie_sim.prediction.execution import Execution
-    from mindie_sim.prediction.frontend import Frontend, SERVICE_FAMILIES
-    from mindie_sim.schema.operators import IterationWork
-    from mindie_sim.schema.workload import IterationPlan, RequestView, selected_mode
-
-    if scope not in {"model", "service", "framework"}:
-        raise ModelingError(f"assembly_scope_unknown:{scope}")
-    explicit_window = iterations is not None or tokens is not None
-    if phase is None:
-        # A full service run starts from the real prefill. A bounded decode
-        # window retains the historical decode default.
-        phase = ("prefill" if scope == "service" and not explicit_window
-                 else "decode")
-    if phase not in {"decode", "prefill"}:
-        raise ModelingError(f"assembly_phase_unknown:{phase}")
-    if iterations is not None and int(iterations) < 1:
-        raise ModelingError("assembly_requires_positive_iterations")
-    if tokens is not None and int(tokens) < 1:
-        raise ModelingError("assembly_requires_positive_tokens")
-    if context is not None and int(context) < 0:
-        raise ModelingError("assembly_context_requires_nonnegative_tokens")
-    if phase == "decode" and tokens is not None and int(tokens) < 1:
-        raise ModelingError("assembly_decode_requires_positive_token_budget")
-    parsed = parse_case(case)
-    specs = _assembly_request_specs(parsed, requests)
-    if scope == "service" and not diagnostic_window:
-        # Ordinary service assembly is the same production cohort driver used
-        # by predict/simulate_service. The former hand loop below is retained
-        # only as an explicit diagnostic window.
-        from mindie_sim.prediction.api import simulate_service
-        scheduler_specs = tuple(specs)
-        quota = None
-        quotas = None
-        if explicit_window and phase == "decode":
-            # The quota is an observation/emission boundary for the driver.
-            # The request keeps its original output_tokens, KV and closed-loop
-            # successor; a short window never retires it as complete.
-            quota = int(iterations or 1) * int(tokens or 1)
-            quotas = {spec.request_id: quota for spec in specs}
-        window_case = replace(parsed, workload=replace(
-            parsed.workload, requests=scheduler_specs))
-        window = None
-        if phase == "decode":
-            window = {
-                spec.request_id: {
-                    "computed": (int(context) if context is not None
-                                 else spec.prompt_tokens),
-                    "generated": 0,
-                }
-                for spec in specs
-            }
-        steps = (None if full_service or not explicit_window
-                 or phase == "decode" else int(iterations or 1))
-        observed_steps = []
-        observed_total = [0]
-        def observe(step):
-            observed_total[0] += 1
-            if len(observed_steps) < 256:
-                observed_steps.append(step.to_dict())
-        result = simulate_service(
-            window_case, primitives=primitives, recipes=recipes,
-            trace_limit=trace_limit, max_model_steps=steps, window=window,
-            token_quotas=quotas,
-            include_submission=(scope != "model" if include_submission is None
-                                else bool(include_submission)),
-            resource_fusion=resource_fusion, lower=lower,
-            observer=observe,
-        )
-        result["steps"] = observed_steps
-        result["steps_total"] = observed_total[0]
-        result["assemble_backend"] = "cohort_driver"
-        result["assembly_scope"] = scope
-        result["assembly"] = result.get("execution", {}).get("assembly")
-        original_outputs = {spec.request_id: spec.output_tokens for spec in specs}
-        unfinished = [request_id for request_id, output in original_outputs.items()
-                      if next((row["generated_tokens"] for row in result["requests"]
-                               if row["request_id"] == request_id), 0) < output]
-        result["window"] = {
-            "iterations": (int(iterations) if iterations is not None else None),
-            "tokens": (int(tokens) if tokens is not None else None),
-            "phase": phase, "context": context,
-            "request_ids": [spec.request_id for spec in specs],
-            "original_output_tokens": original_outputs,
-            "per_request_token_quota": quota,
-            "token_quota_by_request": dict(quotas or {}),
-            "unfinished_request_ids": unfinished,
-            "max_model_steps": steps,
-            "cohort_stop": result.get("execution", {}).get("cohort_stop"),
-        }
-        if unfinished:
-            result["status"] = "incomplete"
-            result["execution_status"] = "incomplete"
-        return result
-    iterations = 1 if iterations is None else int(iterations)
-    tokens = 1 if tokens is None else int(tokens)
-    if parsed.runtime.parallel.dp != 1:
-        raise ModelingError(
-            "diagnostic_assembly_window_requires_one_data_replica")
-    if not specs:
-        raise ModelingError("assembly_requires_at_least_one_request")
-    include_submission = (scope != "model" if include_submission is None
-                          else bool(include_submission))
-    execution = Execution(
-        parsed, CostModel(parsed, primitives), recipes=recipes,
-        include_submission=include_submission, trace_limit=trace_limit,
-        include_serving_io=scope != "model",
-    )
-    frontend = Frontend(attention_policy=AttentionPolicy(
-        **parsed.runtime.attention_policy))
-    if scope == "framework" and not execution.serving_io.enabled:
-        raise ModelingError("framework_assembly_requires_declared_serving_io")
-    execution.serving_io.record_events = True
-    generated = {spec.request_id: 0 for spec in specs}
-    # Actual KV positions already computed/visible before this assembly window.
-    # This is deliberately separate from emitted-token counts: a prefill of
-    # prompt_tokens positions computes that KV, while its sampled output token
-    # has not yet been written as KV.
-    computed_kv = {
-        spec.request_id: (int(context) if context is not None
-                          else spec.prompt_tokens)
-        for spec in specs
-    }
-    release_ms = max(spec.arrival_ms for spec in specs)
-    rows, program_count, first_program = [], 0, None
-    service_counts = {family: 0 for family in SERVICE_FAMILIES}
-    serving = execution.serving_io
-    model_draft_policies = {}
-    model_draft_states = {}
-    model_token_quota = None
-    if scope == "model" and phase == "decode":
-        from mindie_sim.prediction.scheduler import DraftPolicy, Progress
-        for spec in specs:
-            policy = DraftPolicy.for_request(parsed, spec)
-            if policy.mode:
-                model_draft_policies[spec.request_id] = policy
-        if model_draft_policies:
-            model_token_quota = int(iterations) * int(tokens)
-            for spec in specs:
-                state = Progress(spec)
-                state.computed = computed_kv[spec.request_id]
-                state.started = True
-                model_draft_states[spec.request_id] = state
-    # A non-draft decode step advances one token. ``tokens`` is the requested
-    # token budget per outer iteration and expands into real microsteps, each
-    # with its own forward/commit/state dependency; it is never one batched
-    # multi-token commit or a sleep for the rest of the budget.  A speculative
-    # model step follows the same acceptance-credit plan as service scope.
-    decode_tokens = int(tokens) if phase == "decode" else 1
-    total_steps = (int(iterations) * decode_tokens if phase == "decode"
-                   else int(iterations))
-    if model_draft_policies:
-        decode_tokens = 1
-        total_steps = sum(
-            min(spec.output_tokens, int(model_token_quota)) for spec in specs
-        )
-    for step_index in range(total_steps):
-        views = []
-        model_budget = (int(parsed.runtime.max_num_batched_tokens)
-                        if model_draft_policies else DEFAULT_ZERO)
-        for spec in specs:
-            target_tokens = (min(spec.output_tokens, model_token_quota)
-                             if model_token_quota is not None
-                             else spec.output_tokens)
-            remaining = target_tokens - generated[spec.request_id]
-            if remaining <= 0:
-                continue
-            proposal = DEFAULT_ZERO
-            prepare = False
-            advance = 1
-            if phase == "prefill" and step_index == 0:
-                q_len, view_phase = spec.prompt_tokens, "prefill"
-                count = 1
-            else:
-                q_len = 1
-                view_phase = "decode"
-                count = 1
-                if model_draft_policies:
-                    if model_budget <= DEFAULT_ZERO:
-                        continue
-                    state = model_draft_states[spec.request_id]
-                    policy = model_draft_policies.get(spec.request_id)
-                    if policy is not None:
-                        proposal = min(
-                            policy.proposal, max(DEFAULT_ZERO, remaining - 1),
-                            max(DEFAULT_ZERO, model_budget - 1))
-                        advance = min(
-                            remaining,
-                            policy.committed(state, proposal) if proposal else 1)
-                        prepare = (bool(policy.mode)
-                                   and remaining > DRAFT_PREPARE_MIN_REMAINING)
-                    model_budget -= 1 + proposal
-            if view_phase == "prefill":
-                view_context = 0
-            elif scope == "framework":
-                # Framework-only has no model KV write; its view context tracks
-                # declared external request progress, not claimed model KV.
-                view_context = (int(context) if context is not None
-                                else spec.prompt_tokens + generated[spec.request_id])
-            else:
-                view_context = computed_kv[spec.request_id]
-            views.append(RequestView(
-                spec.request_id, q_len, view_context, True, view_phase,
-                draft_verify=bool(proposal),
-                draft_proposal_tokens=proposal,
-                draft_prepare=prepare,
-                draft_advanced_tokens=(advance if model_draft_policies else count),
-                draft_accepted_tokens=(
-                    max(DEFAULT_ZERO, advance - 1)
-                    if model_draft_policies else DEFAULT_ZERO),
-                prompt_tokens=spec.prompt_tokens,
-            ))
-        if not views:
-            break
-        plan = IterationPlan(
-            tuple(views), iteration=step_index,
-            output_tokens=tuple((spec.request_id, spec.output_tokens) for spec in specs),
-        )
-        if scope == "framework":
-            work = IterationWork(
-                (), plan, parsed.runtime.parallel.pp,
-                sum(view.logical_q_len for view in views),
-                sum(view.logical_q_len for view in views),
-                None, selected_mode(plan), "framework_only", replay_scope="none",
-            )
-            program = None
-        else:
-            program = frontend.program(
-                plan, parsed.model, parsed.runtime, parsed.machine,
-                assembly=("model" if scope == "model" else "service"),
-                resource_fusion=resource_fusion,
-            )
-            work = program.work
-            program_count += 1
-            if first_program is None:
-                first_program = program
-            for family in SERVICE_FAMILIES:
-                service_counts[family] += sum(
-                    op.family == family for op in work.ops)
-        override = (emitted_tokens if scope == "framework" else None)
-        if scope == "framework" and override is None:
-            override = {}
-        before_submission = dict(execution.submission_counts)
-        emit = (_assembly_emit_counts(specs, generated, override)
-                if scope != "model" else None)
-        active_requests = {view.request_id for view in views}
-        if emit is not None:
-            emit = {request: count for request, count in emit.items()
-                    if request in generated and request in active_requests}
-        step = execution.add(work, 0, release_ms, emitted_tokens=emit)
-        events = (step.completion, *step.client_deliveries.values())
-        execution.engine.advance(until=tuple(events), first=False)
-        prefix = f"{execution.namespace}r0:i{plan.iteration}"
-        io = serving.pop_batch_events(prefix) or {}
-        # T04 exposes the actual host-submit start events created by this step.
-        # Keep only the chosen first/last event and a count; an eager step can
-        # create thousands of launches, so the report must stay bounded.
-        host_launches = [(replica, stage, event) for replica, stage, event
-                         in step.host_submits if event.time is not None]
-        host_submit_times = [event.time for _, _, event in host_launches]
-        submitted_ms = min(host_submit_times) if host_submit_times else None
-        submitted_last_ms = max(host_submit_times) if host_submit_times else None
-
-        def host_event(item):
-            replica, stage, event = item
-            return {"replica": replica, "stage": stage, "event": event.name,
-                    "sequence": event.sequence, "submit_ms": event.time}
-
-        host_first = min(host_launches,
-                         key=lambda item: (item[2].time, item[2].sequence),
-                         default=None)
-        host_last = max(host_launches,
-                        key=lambda item: (item[2].time, item[2].sequence),
-                        default=None)
-        submitted_basis = (
-            "actual_step_host_submissions" if host_submit_times else
-            ("submission_not_included" if not include_submission
-             else "no_engine_launch"))
-        # Execution.add owns the per-request split; consume both maps directly.
-        # The merged ``commits`` map is retained only as a compatibility view.
-        declared_times = {
-            request: event.time for request, event in step.declared_commits.items()
-            if event.time is not None}
-        fallback_times = {
-            request: event.time for request, event in step.fallback_commits.items()
-            if event.time is not None}
-        merged_times = {
-            request: event.time for request, event in step.commits.items()
-            if event.time is not None}
-        commit_times = declared_times
-        host_times = ({request: event.time for request, event in step.host_results.items()
-                       if event.time is not None} if serving.enabled else {})
-        delivery_times = ({request: event.time for request, event in
-                           step.client_deliveries.items() if event.time is not None}
-                          if serving.enabled else {})
-        commit_at_ms = (step.completion.time if step.completion.time is not None
-                        else release_ms)
-        for view in views:
-            if scope == "framework":
-                continue
-            if view.phase == "prefill":
-                computed_kv[view.request_id] = view.prompt_tokens
-            elif view.request_id in model_draft_states:
-                state = model_draft_states[view.request_id]
-                state.commit(view, commit_at_ms)
-                computed_kv[view.request_id] = state.computed
-                generated[view.request_id] = state.generated
-            else:
-                computed_kv[view.request_id] += view.q_len
-        row = {
-            "iteration": step_index,
-            "outer_iteration": (step_index // decode_tokens
-                                if phase == "decode" else step_index),
-            "decode_step_in_iteration": (step_index % decode_tokens
-                                         if phase == "decode" else 0),
-            "mode": step.mode,
-            "valid_tokens": step.valid_tokens,
-            "padded_tokens": step.padded_tokens,
-            "graph_bucket": step.graph_bucket,
-            "replay_scope": step.replay_scope,
-            "release_ms": release_ms,
-            "submitted_ms": submitted_ms,
-            "submitted_first_ms": submitted_ms,
-            "submitted_last_ms": submitted_last_ms,
-            "submitted_basis": submitted_basis,
-            "submitted_scope": ("actual_step_host_submissions"
-                                if host_submit_times else "none"),
-            "host_submit_first": host_event(host_first) if host_first else None,
-            "host_submit_last": host_event(host_last) if host_last else None,
-            "host_submit_event_count": len(host_launches),
-            "input_ready_ms": (io.get("input_ready").time
-                               if io.get("input_ready") is not None
-                               and io["input_ready"].time is not None else None),
-            "host_prepare_done_ms": (io.get("host_prepare").time
-                                     if io.get("host_prepare") is not None
-                                     and io["host_prepare"].time is not None else None),
-            "device_done_ms": step.device_complete.time,
-            "step_ready_ms": step.completion.time,
-            "commit_ms": commit_times,
-            "declared_commit_ms": declared_times,
-            "fallback_commit_ms": fallback_times,
-            "merged_commit_ms": merged_times,
-            "host_result_ms": host_times,
-            "host_complete_ms": (io.get("host_result").time
-                                 if io.get("host_result") is not None
-                                 and io["host_result"].time is not None else None),
-            "client_propagation_ms": (io.get("client_propagation").time
-                                      if io.get("client_propagation") is not None
-                                      and io["client_propagation"].time is not None
-                                      else None),
-            "delivery_ms": delivery_times,
-            "emitted_tokens": dict(emit or {}),
-            "active_requests": sorted(active_requests),
-            "context_tokens": {view.request_id: view.context for view in views},
-            "computed_kv_tokens_after": (
-                {view.request_id: computed_kv[view.request_id] for view in views}
-                if scope != "framework" else None),
-            "output_ready_ms": (io.get("output_ready").time
-                                if io.get("output_ready") is not None
-                                and io["output_ready"].time is not None else None),
-            "input_bytes": io.get("input_bytes", 0.0),
-            "d2h_bytes": io.get("d2h_bytes", 0.0),
-            "declared_commit": bool(step.declared_commits),
-            "program_assembly": (program.assembly if program is not None else "framework"),
-            "graph_replay_submissions": (
-                execution.submission_counts["graph_replays"]
-                - before_submission["graph_replays"]),
-            "eager_submissions": (
-                execution.submission_counts["eager_invocations"]
-                - before_submission["eager_invocations"]),
-        }
-        rows.append(row)
-        for request, count in (emit or {}).items():
-            if request in generated:
-                generated[request] += count
-        # The next invocation starts from an actual completion/delivery edge.
-        edges = [step.completion.time, *delivery_times.values()]
-        release_ms = max(edge for edge in edges if edge is not None)
-    execution.engine.advance()
-    metrics = _assembly_metric_rows(specs, rows)
-    fragments = serving.fragments(
-        h2d_hbm=execution.stage_names.get((0, 0), {}).get("hbm"),
-        d2h_hbm=execution.stage_names.get(
-            (0, parsed.runtime.parallel.pp - 1), {}).get("hbm"),
-    )
-    has_h2d = serving.transfers.get("h2d") is not None
-    has_d2h = serving.transfers.get("d2h") is not None
-    occurrence = {
-        "host_prepare": sum(row["host_prepare_done_ms"] is not None for row in rows),
-        "input_transfer": (len(rows) if has_h2d else 0),
-        "output_ready": sum(row["output_ready_ms"] is not None for row in rows),
-        "output_transfer": (sum(bool(row["emitted_tokens"]) for row in rows)
-                            if has_d2h else 0),
-        "host_result": sum(row["host_complete_ms"] is not None for row in rows),
-        "client_delivery": sum(row["client_propagation_ms"] is not None
-                               for row in rows),
-        "client_order": sum(len(row["delivery_ms"]) for row in rows),
-    }
-    framework = [
-        {**fragment.to_dict(), "occurrences": occurrence.get(fragment.name, 0)}
-        for fragment in fragments
-    ]
-    model_fragment = None
-    if first_program is not None:
-        model_fragment = {
-            **first_program.to_dict(include_ops=False),
-            "op_count": len(first_program.work.ops),
-            "families": sorted({op.family for op in first_program.work.ops}),
-            "service_families_present": sorted({
-                op.family for op in first_program.work.ops} & SERVICE_FAMILIES),
-            "iterations": program_count,
-        }
-    total_tokens = sum(row["generated_tokens"]
-                       for row in metrics if row["generated_tokens"])
-    declared_commit_events = sum(len(row["declared_commit_ms"]) for row in rows)
-    fallback_commit_events = sum(len(row["fallback_commit_ms"]) for row in rows)
-    merged_commit_events = sum(len(row["merged_commit_ms"]) for row in rows)
-    return {
-        "schema": "mindie-sim.assembly/1",
-        "scope": scope,
-        "phase": phase,
-        "same_context": True,
-        "independent_model_invocations": 0,
-        "submission_included": include_submission,
-        "iterations_requested": int(iterations),
-        "decode_tokens_per_iteration": decode_tokens,
-        "steps_requested": total_steps,
-        "iterations_executed": len(rows),
-        "steps_executed": len(rows),
-        "model_fragment": model_fragment,
-        "framework_fragments": framework,
-        "framework_occurrences": occurrence,
-        "triggers": {
-            "model_invocation": len(rows) if scope != "framework" else 0,
-            "batch_prepare": occurrence["host_prepare"],
-            "input_transfer": occurrence["input_transfer"],
-            "output_ready": occurrence["output_ready"],
-            "output_transfer": occurrence["output_transfer"],
-            "host_result": occurrence["host_result"],
-            "client_delivery_batches": occurrence["client_delivery"],
-            "client_order_events": occurrence["client_order"],
-            "request_commit_callbacks": declared_commit_events,
-            "fallback_completion_callbacks": fallback_commit_events,
-            "merged_commit_callbacks": merged_commit_events,
-            "sampling": service_counts["sampling"],
-            "acceptance": service_counts["acceptance"],
-            "token_commit_nodes": service_counts["token_commit"],
-            "graph_replay_submissions": sum(
-                row["graph_replay_submissions"] for row in rows),
-            "eager_submissions": sum(row["eager_submissions"] for row in rows),
-        },
-        "state_contract": {
-            "decode_step": "one_token_per_active_request",
-            "release": "previous_step_commit_and_delivery_event",
-            "context": "actual_computed_kv_positions_before_each_forward; "
-                       "prefill writes prompt_tokens, decode adds its query rows",
-            "commit": "declared_token_commit_event_per_step",
-        },
-        "steps": rows,
-        "requests": metrics,
-        "metrics": {
-            "boundary": "declared commit and delivery events in this context",
-            "output_tokens": total_tokens,
-            "window_end_ms": max((row["last_commit_ms"] for row in metrics
-                                  if row["last_commit_ms"] is not None), default=None),
-            "delivery_window_end_ms": max(
-                (row["last_delivery_ms"] for row in metrics
-                 if row["last_delivery_ms"] is not None), default=None),
-            "commit_events": declared_commit_events,
-            "fallback_completion_events": fallback_commit_events,
-            "merged_commit_events": merged_commit_events,
-            "client_propagation_events": sum(
-                row["client_propagation_ms"] is not None for row in rows),
-            "delivery_events": sum(len(row["delivery_ms"]) for row in rows),
-            "model_elapsed_ms": (sum(row["step_ready_ms"] - row["release_ms"]
-                                     for row in rows)),
-            "host_submit_events": sum(row["host_submit_event_count"]
-                                      for row in rows),
-        },
-        "event_boundaries": {
-            "ready": "input value/state producer completion",
-            "submit": ("actual engine host-launch event when observed; "
-                       "scheduler completion is not a submit boundary"),
-            "done": "all declared device work complete",
-            "commit": "declared token_commit event, else step completion fallback",
-            "delivery": "client-visible completion after host result",
-        },
-        "execution": execution.summary(),
-    }
-
-
-def apply_va_recommended(case: Mapping[str, Any]) -> dict[str, Any]:
-    """Apply the supported execution subset while preserving supplied model quantization."""
-    out = deepcopy(dict(case))
-    parsed = parse_case(out)
-    sku = str(out.get("machine", {}).get("sku", "Ascend910_9392"))
-    va_profile = va_recommended_config(str(parsed.model.name), sku)
-    va_profile["quantization_action"] = "existing_case_preserved"
-    rt = dict(out.get("runtime", {}))
-    par = dict(rt.get("parallel", {
-        "dp": parsed.runtime.parallel.dp, "tp": parsed.runtime.parallel.tp,
-        "pp": parsed.runtime.parallel.pp, "ep": parsed.runtime.parallel.ep,
-        "cp": parsed.runtime.parallel.cp, "dcp": parsed.runtime.parallel.dcp,
-        "pcp": parsed.runtime.parallel.pcp,
-    }))
-    if rt.get("graph_capture_mode", "none") == "none":
-        rt["graph_mode"] = "full"
-        rt["graph_capture_mode"] = "full"
-        max_seqs = int(rt.get("max_num_seqs", 16))
-        rt["graph_capture_keys"] = capture_keys(
-            max_seqs, int(rt.get("mtp_proposal_tokens", DEFAULT_ZERO) or DEFAULT_ZERO))
-    meta = dict(rt.get("metadata", {}))
-    meta["va_recommended"] = True
-    meta["va_profile"] = deepcopy(va_profile)
-    meta["va_env"] = dict(va_profile["env"])
-    meta.setdefault("moe_dispatch_quantization", "routed_expert")
-    notes: list[dict[str, Any]] = []
-    kernels = dict(rt.get("kernels", {}))
-    tp, ep, pp, pcp = int(par.get("tp", 1)), int(par.get("ep", 1)), int(par.get("pp", 1)), int(par.get("pcp", 1))
-    if (va_profile.get("sp", True) and "sequence_parallel" not in kernels
-            and pcp >= 1 and pp >= 1 and tp > 1 and ep >= tp and (ep % tp == 0)):
-        from mindie_sim.prediction.sequence_parallel import DECLARATION, _validate_model
-        try:
-            _validate_model(parsed.model, padding="right_to_tp")
-            kernels["sequence_parallel"] = dict(DECLARATION, padding="right_to_tp")
-            meta["sp"] = True
-        except ModelingError as exc:
-            from mindie_sim.prediction.implementation_selection import fallback_note
-            notes.append(fallback_note("sequence_parallel", str(exc)))
-    passes = tuple(rt.get("lowering_passes", ()))
-    if not passes and str(parsed.model.quant.activation_format) != str(parsed.model.activation_dtype):
-        passes = ("activation_quantization", "norm_quant")
-        rt["lowering_passes"] = list(passes)
-    lowerings = _resolve_va_lowerings(parsed.model, par, sku, passes, notes=notes)
-    if "add_rmsnorm" in lowerings and "residual_norm" not in passes:
-        passes = (*passes, "residual_norm")
-        rt["lowering_passes"] = list(passes)
-    if lowerings:
-        existing_low = dict(kernels.get("lowerings", {}))
-        kernels["lowerings"] = {**lowerings, **existing_low}
-    if kernels:
-        rt["kernels"] = kernels
-    from mindie_sim.prediction.implementation_selection import (
-        merge_selection_summaries, operator_selection_summary,
-    )
-    from mindie_sim.compose_operator_defaults import DECLARATION_PHASE
-    meta["operator_selection_summary"] = merge_selection_summaries(
-        meta.get("operator_selection_summary"),
-        operator_selection_summary(arch_family=_arch_key(sku),
-                                   phase=DECLARATION_PHASE, notes=notes))
-    rt["metadata"] = meta
-    out["runtime"] = rt
-    parse_case(out)
-    return out
-
-
-__all__ = ["HARDWARE_ALIASES", "HARDWARE_TOPOLOGY_ALIASES", "VA_RECOMMENDED_PROFILES",
-           "apply_va_recommended", "assemble", "compose_case", "resolve_hardware_sku",
-           "va_recommended_config"]
+__all__ = [
+    "HARDWARE_ALIASES",
+    "HARDWARE_TOPOLOGY_ALIASES",
+    "VA_RECOMMENDED_PROFILES",
+    "apply_va_recommended",
+    "assemble",
+    "capture_keys",
+    "compose_case",
+    "prepare_speculation",
+    "resolve_hardware_sku",
+    "va_recommended_config",
+]

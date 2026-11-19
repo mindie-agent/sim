@@ -28,6 +28,7 @@ import math
 
 from mindie_sim.schema.common import dtype_bytes
 
+from .fusion_regions import fold_region_metadata
 from .implementations import (
     input_ports, rewire_replacements, set_input_ports,
 )
@@ -48,22 +49,13 @@ def users_map(ops):
     return users
 
 
-def merge_meta(*ops, extra=()):
-    merged = {}
-    origins = []
-    for op in ops:
-        meta = dict(op.metadata)
-        merged.update(meta)
-        for prev in meta.get("fused_origin_scopes", ()):
-            if prev not in origins:
-                origins.append(prev)
-        origins.append({
-            "op_id": op.op_id, "layer": op.layer, "stage": op.stage,
-            "block": meta.get("structure_block"), "role": meta.get("structure_role"),
-        })
-    merged["fused_origin_scopes"] = tuple(origins)
-    merged.update(dict(extra))
-    return tuple(merged.items())
+def merge_meta(*ops, primary_anchor_id=None, output_port_aliases=None, extra=()):
+    return fold_region_metadata(
+        ops,
+        primary_anchor_id=primary_anchor_id,
+        output_port_aliases=output_port_aliases,
+        extra=extra,
+    )
 
 
 def mhc_boundary_fusion_overlap(ops, source_dtype, *, max_rows=0,
@@ -389,7 +381,15 @@ def qkv_norm_rope_fusion(ops, source_dtype):
                           for shape in shapes.values())
         total_vec = sum(float(m.vector_ops) for m in members)
         primary = shapes.get("query") or next(iter(shapes.values()))
-        extra = [("fusion_group_key", key), ("primary_output", "query"),
+        member_ports = {anchor.op_id: "key"}
+        for m in members:
+            source_output = str(dict(m.metadata).get("source_output") or "")
+            if source_output in QKV_PORTS and m.op_id != anchor.op_id:
+                member_ports[m.op_id] = source_output
+            if m.op_id != anchor.op_id:
+                removed.add(m.op_id)
+                aliases[m.op_id] = anchor.op_id
+        extra = [("folded_subgraph_key", key), ("primary_output", "query"),
                  ("output_shape", primary),
                  ("qkv_output_shapes", tuple(shapes.items()))]
         extra.extend((f"{name}_shape", shape) for name, shape in shapes.items())
@@ -408,16 +408,13 @@ def qkv_norm_rope_fusion(ops, source_dtype):
             mte3_bytes=total_write,
             hbm_bytes=total_read + total_write,
             returns=tuple(name for name in shapes if name != "query"),
-            metadata=merge_meta(*members, extra=extra),
+            metadata=fold_region_metadata(
+                members,
+                primary_anchor_id=anchor.op_id,
+                output_port_aliases=member_ports,
+                extra=extra,
+            ),
         )
-        member_ports = {anchor.op_id: "key"}
-        for m in members:
-            source_output = str(dict(m.metadata).get("source_output") or "")
-            if source_output in QKV_PORTS and m.op_id != anchor.op_id:
-                member_ports[m.op_id] = source_output
-            if m.op_id != anchor.op_id:
-                removed.add(m.op_id)
-                aliases[m.op_id] = anchor.op_id
         ports[anchor.op_id] = {"output": "key"}
         for old, name in member_ports.items():
             if old != anchor.op_id:

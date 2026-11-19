@@ -570,6 +570,11 @@ def _attnres_default(case, phase, kernels):
 
 
 def attention_defaults(case, phase, *, tokens=ONE):
+    prior_kernels = case.runtime.kernels or {}
+    prior_keys = {
+        section: set((prior_kernels.get(section) or {}).keys())
+        for section in ("recipes", "families", "programs", "lowerings")
+    }
     kernels = deepcopy(case.runtime.kernels)
     records = []
     required = {"mte1", "mte2_aic", "mte2_aiv", "mte3", "fixpipe", "vector", "hbm"}
@@ -727,8 +732,16 @@ def attention_defaults(case, phase, *, tokens=ONE):
         widths = {p.qk_rope_head_dim for p in indexed}
         if len(widths) == 1:
             model = with_packed_mla_cache(model, next(iter(widths)))
-    from .implementation_selection import records_summary, with_automatic_lowering
+    from .implementation_selection import (
+        record_binding_origin,
+        records_summary,
+        with_automatic_lowering,
+    )
     metadata = dict(case.runtime.metadata)
+    for section, existing_names in prior_keys.items():
+        current_names = set((kernels.get(section) or {}).keys())
+        for added in sorted(current_names - existing_names):
+            metadata = record_binding_origin(metadata, section, added, "body_default")
     if mixed_quant is not None and mixed_quant.get("installed"):
         metadata = with_automatic_lowering(metadata, "mqsmla_attention")
     return replace(case, model=model, runtime=replace(

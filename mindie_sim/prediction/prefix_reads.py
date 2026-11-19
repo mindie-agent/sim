@@ -43,9 +43,11 @@ MODE_PER_SEQUENCE = "per_sequence"
 MODE_BATCH_SHARED = "batch_shared"
 MODES = frozenset({MODE_AUTO, MODE_PER_SEQUENCE, MODE_BATCH_SHARED})
 REUSE_TILE = "tile"
+REUSE_PAGED_L2 = "paged_l2"
 REUSE_NONE = "none"
 REUSE_PER_SEQUENCE = "per_sequence"
-SUPPORTED_REUSE = frozenset({REUSE_TILE, "batch_tile"})
+SUPPORTED_BATCH_SHARED_REUSE = frozenset({REUSE_TILE, "batch_tile"})
+SUPPORTED_AUTO_REUSE = frozenset({REUSE_TILE, "batch_tile", REUSE_PAGED_L2})
 NO_REUSE_REASONS = {
     "mode_not_shared": "prefix_read_mode_not_batch_shared",
     "single_access": "prefix_read_single_access",
@@ -183,12 +185,38 @@ def _materialized_prefix(access: CacheAccess, cache_state: Mapping[str, Any] | N
     return declared
 
 
+def _intersect_intervals(
+    intervals: Sequence[tuple[int, int]], lo: int, hi: int
+) -> tuple[tuple[int, int], ...]:
+    if hi <= lo:
+        return ()
+    clipped = [
+        (max(lo, int(start)), min(hi, int(end)))
+        for start, end in intervals
+        if min(hi, int(end)) > max(lo, int(start))
+    ]
+    return _merged_intervals(clipped)
+
+
+def _l2_capacity_bytes(geometry: Any) -> float | None:
+    if geometry is None:
+        return None
+    if isinstance(geometry, Mapping):
+        raw = geometry.get("effective_l2_bytes", geometry.get("l2_capacity_bytes"))
+    else:
+        raw = getattr(
+            geometry, "effective_l2_bytes", getattr(geometry, "l2_capacity_bytes", None)
+        )
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool) and float(raw) > 0.0:
+        return float(raw)
+    return None
+
+
 def plan_prefix_reads(
     accesses: Sequence[CacheAccess], *, mode: str, kernel_reuse: str,
     geometry: Any = None, cache_state: Mapping[str, Any] | None = None,
 ) -> PrefixReadPlan:
     """Project logical key reads onto unique physical ranges."""
-    del geometry
     if mode not in MODES:
         raise ModelingError(f"prefix_read_mode_unsupported:{mode}")
     accesses = tuple(accesses)
@@ -206,18 +234,18 @@ def plan_prefix_reads(
         return PrefixReadPlan(
             logical, logical, logical, query_reads, scale_total, ZERO, ZERO,
             REUSE_PER_SEQUENCE, False, NO_REUSE_REASONS["mode_not_shared"])
-    shared = [access for access in accesses if int(access.prefix_tokens) > ZERO]
+    shared_candidates = [access for access in accesses if int(access.prefix_tokens) > ZERO]
     if len(accesses) <= ONE:
         return PrefixReadPlan(
             logical, logical, logical, query_reads, scale_total, ZERO, ZERO,
             REUSE_PER_SEQUENCE, False, NO_REUSE_REASONS["single_access"])
-    if mode == MODE_BATCH_SHARED and kernel_reuse not in SUPPORTED_REUSE:
+    if mode == MODE_BATCH_SHARED and kernel_reuse not in SUPPORTED_BATCH_SHARED_REUSE:
         raise ModelingError("shared_prefix_kernel_reuse_unsupported")
-    if mode == MODE_AUTO and kernel_reuse not in SUPPORTED_REUSE:
+    if mode == MODE_AUTO and kernel_reuse not in SUPPORTED_AUTO_REUSE:
         return PrefixReadPlan(
             logical, logical, logical, query_reads, scale_total, ZERO, ZERO,
             REUSE_PER_SEQUENCE, False, NO_REUSE_REASONS["unsupported_kernel"])
-    if not shared:
+    if not shared_candidates:
         return PrefixReadPlan(
             logical, logical, logical, query_reads, scale_total, ZERO, ZERO,
             REUSE_PER_SEQUENCE, False, NO_REUSE_REASONS["empty_prefix"])
@@ -225,15 +253,13 @@ def plan_prefix_reads(
     core = ZERO
     logical_rows = math.fsum(_logical_rows(access) for access in accesses)
     unique_rows = ZERO
+    logical_shared_bytes = ZERO_FLOAT
     groups: dict[tuple[int, str, str, float], list[tuple[int, int]]] = {}
     for access in accesses:
         context = max(ZERO, int(access.context_tokens))
         q_len = max(ONE, int(access.q_len))
         rows = _logical_rows(access)
-        limit = int(access.logical_rows) if int(access.logical_rows) > ZERO else context
-        prefix = min(_materialized_prefix(access, cache_state), limit)
-        # One access reads one absolute window; a windowed sequence owns only
-        # its latest ``logical_rows`` rows, while a dense scan starts at zero.
+        prefix_limit = _materialized_prefix(access, cache_state)
         end = context + q_len
         start = ZERO if rows >= end else max(ZERO, end - int(rows))
         span = (int(access.unique_rows)
@@ -243,27 +269,46 @@ def plan_prefix_reads(
             shared = min(_merged_interval_rows(access.shared_intervals), span)
             private = max(ZERO, span - shared)
             intervals = access.shared_intervals
+        elif access.selected_tokens:
+            visible_sel = _intersect_intervals(access.selected_tokens, start, end)
+            shared_iv = _intersect_intervals(visible_sel, ZERO, max(ZERO, int(prefix_limit)))
+            priv_iv = _intersect_intervals(visible_sel, max(start, int(prefix_limit)), end)
+            shared = _merged_interval_rows(shared_iv)
+            private = _merged_interval_rows(priv_iv)
+            intervals = shared_iv
         else:
-            shared = min(max(ZERO, int(prefix)), span)
+            shared_lo = start
+            shared_hi = min(end, max(ZERO, int(prefix_limit)))
+            raw_shared = max(ZERO, shared_hi - shared_lo)
+            shared = min(raw_shared, span)
             private = max(ZERO, span - shared)
-            intervals = ((start, start + shared),) if shared > ZERO else ()
+            intervals = ((shared_lo, shared_lo + shared),) if shared > ZERO else ()
         unique += float(private) * float(access.row_bytes)
         unique_rows += float(private)
-        # MTE2 stays the per-tile refill service of each access.
+        logical_shared_bytes += float(shared) * float(access.row_bytes)
         core += rows * float(access.row_bytes)
         if shared > ZERO and intervals:
             key = (int(access.layer), str(access.component),
                    str(access.prefix_key), float(access.row_bytes))
             groups.setdefault(key, []).extend(intervals)
+    unique_shared_bytes = ZERO_FLOAT
     for key, intervals in groups.items():
         shared_rows = _merged_interval_rows(intervals)
-        unique += float(shared_rows) * float(key[3])
+        shared_b = float(shared_rows) * float(key[3])
+        unique += shared_b
+        unique_shared_bytes += shared_b
         unique_rows += float(shared_rows)
+    l2_cap = _l2_capacity_bytes(geometry)
+    if kernel_reuse == REUSE_PAGED_L2 and l2_cap is not None and unique_shared_bytes > ZERO_FLOAT:
+        retained = min(unique_shared_bytes, l2_cap)
+        spill_ratio = max(ZERO_FLOAT, ONE_FLOAT - retained / unique_shared_bytes)
+        refill_shared = max(ZERO_FLOAT, logical_shared_bytes - unique_shared_bytes) * spill_ratio
+        unique += refill_shared
     if logical_rows > ZERO:
         unique_scale = scale_total * unique_rows / logical_rows
     else:
         unique_scale = scale_total
-    unique += unique_scale
+    unique = min(logical, unique + unique_scale)
     core += scale_total
     applied = bool((logical - unique) > SAVINGS_EPS)
     return PrefixReadPlan(

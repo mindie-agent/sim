@@ -49,9 +49,18 @@ class StructureTargets:
                 member not in nodes for member in members
             ):
                 raise ProfilerUsageError(f"subgraph has invalid semantic members: {key}")
-            for field in ("replica", "stage", "phase"):
+            for field in ("replica", "stage"):
                 if any(nodes[member].get(field) != record.get(field) for member in members):
                     raise ProfilerUsageError(f"subgraph crosses declared {field}: {key}")
+            rec_phase = record.get("phase")
+            for member in members:
+                mem_phase = nodes[member].get("phase")
+                if (
+                    mem_phase != rec_phase
+                    and not {mem_phase, rec_phase} <= {"decode", "draft"}
+                    and not {mem_phase, rec_phase} <= {"prefill", "draft", "draft_prefill"}
+                ):
+                    raise ProfilerUsageError(f"subgraph crosses declared phase: {key}")
             if record.get("layer") is not None and any(
                 nodes[member].get("layer") != record["layer"] for member in members
             ):

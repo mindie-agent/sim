@@ -80,7 +80,7 @@ def normalize_formats(model):
 
 
 def independent_draft(draft):
-    return dict(draft.source).get("kind") == "external_kimi_k3_dspark"
+    return bool(getattr(draft, "independent_context", False))
 
 
 def draft_row(model, draft, *, tp=ONE):

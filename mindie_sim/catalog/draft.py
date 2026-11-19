@@ -17,7 +17,7 @@ def draft_quant(model, draft):
     """Use the draft's declared representation in both work and residency."""
     quant = model.quant
     from .paired_sfa import independent_draft
-    if independent_draft(draft):
+    if independent_draft(draft) and not draft.weight_category:
         return replace(quant, weight_format="bf16", expert_weight_format="bf16",
                        activation_format="bf16", kv_dtype="bf16",
                        category_overrides=())
@@ -25,8 +25,11 @@ def draft_quant(model, draft):
         return quant
     fmt = quant.format_for(draft.weight_category)
     expert_fmt = quant.expert_weight_format if draft.num_experts > ZERO_EXPERTS else fmt
-    return replace(quant, weight_format=fmt, expert_weight_format=expert_fmt,
-                   activation_format="bf16" if fmt == "bf16" else quant.activation_format)
+    result = replace(quant, weight_format=fmt, expert_weight_format=expert_fmt,
+                     activation_format="bf16" if fmt == "bf16" else quant.activation_format)
+    if independent_draft(draft) and getattr(draft, "context_projection_mode", "") == "fused_kv_bank":
+        result = replace(result, kv_dtype="bf16")
+    return result
 
 
 def optional_draft_spec(model: ModelSpec, kind: str) -> DraftSpec:

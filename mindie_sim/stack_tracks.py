@@ -3,21 +3,18 @@
 [Role]
   Map audited inference serving frameworks (built-in ``vllm-ascend`` and
   ``raw_eager``, plus user-supplied JSON manifests) onto universal Layer-1
-  ``OptimizationMechanism`` IDs across three explicit states:
-  ``merged`` -> ``unmerged_pr`` -> ``expected_ideal``.
+  ``OptimizationMechanism`` IDs across four explicit states:
+  ``raw_eager`` -> ``merged`` -> ``unmerged_pr`` -> ``expected_ideal``.
 
 [Invariants]
   * Built-in stacks are limited to audited ``vllm-ascend`` and framework-neutral
     ``raw_eager``; third-party stacks are never shipped as placeholder profiles.
+  * ``raw_eager`` activates zero stack fusions and is never model-gated.
   * ``merged`` activates only mechanisms merged on the stack's main branch.
-  * ``unmerged_pr`` activates ``merged`` plus open PRs registered on that stack.
-  * ``expected_ideal`` is stack-neutral: it activates every structurally
-    eligible ``OptimizationMechanism`` for ``(model, hardware, parallel)`` and is
-    never gated by a stack's ``supported_models`` declaration.
-  * A non-empty ``supported_models`` / ``unmerged_pr_models`` declaration is an
-    explicit model-support contract enforced for real stack tracks.
-  * Explicit ``optimizations`` / ``exclude_optimizations`` overrides compose
-    cleanly on top of any track for single-PR What-If A/B evaluation.
+  * ``unmerged_pr`` activates ``merged`` plus open PRs registered on that stack,
+    preserving multi-PR variants without dictionary-key overwrite.
+  * ``expected_ideal`` is stack-neutral and activates every structurally
+    eligible ``OptimizationMechanism`` for ``(model, hardware, parallel)``.
 
 [Timeouts & Locks]
   Bounded JSON manifest reads (< 50 MiB); pure in-memory resolution, no locks.
@@ -27,6 +24,7 @@
 """
 from __future__ import annotations
 
+from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 import json
@@ -41,6 +39,8 @@ STACK_MANIFEST_SCHEMA = "mindie-sim.stack-manifest/1"
 MAX_MANIFEST_BYTES = 50 * 1024 * 1024
 
 TRACK_ALIASES: dict[str, str] = {
+    "raw_eager": "raw_eager",
+    "eager": "raw_eager",
     "merged": "merged",
     "current_merged": "merged",
     "unmerged_pr": "unmerged_pr",
@@ -49,9 +49,6 @@ TRACK_ALIASES: dict[str, str] = {
     "ideal": "expected_ideal",
 }
 
-#: Runtime lowerings installed by a documented profile or mechanism.  An
-#: explicit ``exclude_optimizations`` entry owns every selector its mechanism
-#: can install, so the profile path cannot silently retain the excluded fusion.
 _MECHANISM_LOWERING_SELECTORS: dict[str, tuple[str, ...]] = {
     "add_rmsnorm_quant_fusion": (
         "add_rmsnorm", "add_rmsnorm_quant", "rmsnorm_quant"),
@@ -60,7 +57,6 @@ _MECHANISM_LOWERING_SELECTORS: dict[str, tuple[str, ...]] = {
     "recurrent_decode_native_kernels": ("kda", "gdn_decode"),
     "gdn_chunk64_prefill": ("gdn_prefill",),
 }
-#: Mechanism passes installed by the same profile/mechanism path.
 _MECHANISM_LOWERING_PASSES: dict[str, tuple[str, ...]] = {
     "add_rmsnorm_quant_fusion": ("residual_norm",),
     "mhc_boundary_fusion_overlap": ("mhc_boundary_pr", "mhc_boundary_ideal"),
@@ -79,18 +75,19 @@ def excluded_lowering_bindings(
 ) -> tuple[frozenset[str], frozenset[str]]:
     """Resolve excluded mechanism IDs into installed selectors and passes."""
     excluded = frozenset(
-        str(value).strip() for value in exclude_optimizations
-        if str(value).strip())
+        str(value).strip() for value in exclude_optimizations if str(value).strip()
+    )
     for mechanism_id in excluded:
         if mechanism_id not in MECHANISM_CATALOG:
-            raise ModelingError(
-                f"unknown_optimization_mechanism:{mechanism_id}")
+            raise ModelingError(f"unknown_optimization_mechanism:{mechanism_id}")
     selectors = frozenset(
         selector for mechanism_id in excluded
-        for selector in _MECHANISM_LOWERING_SELECTORS.get(mechanism_id, ()))
+        for selector in _MECHANISM_LOWERING_SELECTORS.get(mechanism_id, ())
+    )
     passes = frozenset(
         name for mechanism_id in excluded
-        for name in _MECHANISM_LOWERING_PASSES.get(mechanism_id, ()))
+        for name in _MECHANISM_LOWERING_PASSES.get(mechanism_id, ())
+    )
     return selectors, passes
 
 
@@ -113,10 +110,12 @@ class StackMechanismBinding:
         if self.state not in {"merged", "unmerged_pr"}:
             raise ModelingError(f"invalid_stack_binding_state:{self.state}")
 
-    def matches(self, model_key: str, arch: str) -> bool:
+    def matches(self, model_key: str, arch: str, phase: str | None = None) -> bool:
         if self.models and model_key not in self.models:
             return False
         if self.archs and arch not in self.archs:
+            return False
+        if phase and self.phases and phase.lower() not in self.phases:
             return False
         return True
 
@@ -142,11 +141,7 @@ class RuntimeStackProfile:
     description: str = ""
     model_defaults: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     bindings: tuple[StackMechanismBinding, ...] = ()
-    # Models supported by the stack's merged main branch. An empty tuple means
-    # unrestricted / structural-only (e.g. raw_eager or a vllm-ascend catalog
-    # fallback). A non-empty declaration is enforced as a real support contract.
     supported_models: tuple[str, ...] = ()
-    # Models whose architecture onboarding is only in an open upstream PR.
     unmerged_pr_models: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
@@ -215,10 +210,8 @@ def load_runtime_stack_manifest(source: str | Path | Mapping[str, Any]) -> Runti
         description=str(raw.get("description") or ""),
         model_defaults=dict(raw.get("model_defaults") or {}),
         bindings=bindings,
-        supported_models=tuple(
-            str(m).strip() for m in (raw.get("supported_models") or ())),
-        unmerged_pr_models=tuple(
-            str(m).strip() for m in (raw.get("unmerged_pr_models") or ())),
+        supported_models=tuple(str(m).strip() for m in (raw.get("supported_models") or ())),
+        unmerged_pr_models=tuple(str(m).strip() for m in (raw.get("unmerged_pr_models") or ())),
     )
 
 
@@ -239,6 +232,31 @@ def resolve_runtime_stack(
     raise ModelingError(f"unknown_runtime_stack:{stack}")
 
 
+def _collapse_binding_group(
+    mid: str, state: str, group: Sequence[StackMechanismBinding],
+) -> dict[str, Any]:
+    merged_options: dict[str, Any] = {}
+    refs: list[str] = []
+    notes: list[str] = []
+    for item in group:
+        merged_options.update(dict(item.options))
+        if item.ref and item.ref not in refs:
+            refs.append(item.ref)
+        if item.notes and item.notes not in notes:
+            notes.append(item.notes)
+    primary_ref = refs[0] if len(refs) == 1 else (", ".join(refs) if refs else None)
+    entry: dict[str, Any] = {
+        "id": mid,
+        "state": state,
+        "ref": primary_ref,
+        "options": merged_options,
+        "notes": "; ".join(notes),
+    }
+    if len(refs) > 1:
+        entry["refs"] = refs
+    return entry
+
+
 def resolve_stack_track(
     stack_profile: RuntimeStackProfile,
     *,
@@ -253,16 +271,13 @@ def resolve_stack_track(
     if stack_profile.supported_models or stack_profile.unmerged_pr_models:
         if canonical_track == "merged" and model_key not in stack_profile.supported_models:
             raise ModelingError(
-                "model_not_supported_by_runtime_stack:"
-                f"{stack_profile.name}:{model_key}:merged")
+                f"model_not_supported_by_runtime_stack:{stack_profile.name}:{model_key}:merged")
         if (canonical_track == "unmerged_pr"
                 and model_key not in stack_profile.supported_models
                 and model_key not in stack_profile.unmerged_pr_models):
             raise ModelingError(
-                "model_not_supported_by_runtime_stack:"
-                f"{stack_profile.name}:{model_key}:unmerged_pr")
-        # ``expected_ideal`` is first-principles, stack-neutral modeling and is
-        # intentionally never blocked by an upstream stack's model support.
+                f"model_not_supported_by_runtime_stack:{stack_profile.name}:{model_key}:unmerged_pr")
+
     include_ids = tuple(str(x).strip() for x in optimizations if str(x).strip())
     exclude_ids = frozenset(str(x).strip() for x in exclude_optimizations if str(x).strip())
     for mid in (*include_ids, *exclude_ids):
@@ -270,61 +285,73 @@ def resolve_stack_track(
             raise ModelingError(f"unknown_optimization_mechanism:{mid}")
     overlap_conflict = set(include_ids) & exclude_ids
     if overlap_conflict:
-        raise ModelingError("optimization_include_exclude_conflict:" + ",".join(sorted(overlap_conflict)))
+        raise ModelingError(
+            "optimization_include_exclude_conflict:" + ",".join(sorted(overlap_conflict)))
 
     model_cfg = dict(stack_profile.model_defaults.get(model_key) or {})
+    ctx_phase = str((ctx.options or {}).get("phase") or "").strip().lower() or None
     eligible_ids = [
-        mech.id for mech in MECHANISM_CATALOG.values() if mech.eligible(ctx)
+        mech.id for mech in MECHANISM_CATALOG.values()
+        if mech.eligible(ctx) and (not ctx_phase or not mech.phases or ctx_phase in mech.phases)
     ]
-    merged_map: dict[str, StackMechanismBinding] = {}
-    pr_map: dict[str, StackMechanismBinding] = {}
+    eligible_set = set(eligible_ids)
+    merged_list: list[StackMechanismBinding] = []
+    pr_list: list[StackMechanismBinding] = []
+    merged_by_id: dict[str, list[StackMechanismBinding]] = defaultdict(list)
+    pr_by_id: dict[str, list[StackMechanismBinding]] = defaultdict(list)
     for binding in stack_profile.bindings:
-        if not binding.matches(model_key, ctx.arch):
+        if not binding.matches(model_key, ctx.arch, phase=ctx_phase):
             continue
-        if binding.mechanism_id not in eligible_ids:
+        if binding.mechanism_id not in eligible_set:
             continue
-        # Respect model-level profile opt-outs on merged defaults (e.g. sp=False).
         if binding.state == "merged":
             if binding.mechanism_id == "sequence_parallel" and model_cfg.get("sp") is False:
                 continue
-            merged_map[binding.mechanism_id] = binding
+            merged_list.append(binding)
+            merged_by_id[binding.mechanism_id].append(binding)
         else:
-            pr_map[binding.mechanism_id] = binding
+            pr_list.append(binding)
+            pr_by_id[binding.mechanism_id].append(binding)
 
     active: dict[str, dict[str, Any]] = {}
     if canonical_track in {"merged", "unmerged_pr", "expected_ideal"}:
-        for mid, b in merged_map.items():
-            active[mid] = {"id": mid, "state": "merged", "ref": b.ref,
-                           "options": dict(b.options), "notes": b.notes}
+        for mid, group in merged_by_id.items():
+            active[mid] = _collapse_binding_group(mid, "merged", group)
     if canonical_track in {"unmerged_pr", "expected_ideal"}:
-        for mid, b in pr_map.items():
-            active[mid] = {"id": mid, "state": "unmerged_pr", "ref": b.ref,
-                           "options": dict(b.options), "notes": b.notes}
+        for mid, group in pr_by_id.items():
+            prev_opts = dict(active[mid]["options"]) if mid in active else {}
+            collapsed = _collapse_binding_group(mid, "unmerged_pr", group)
+            collapsed["options"] = {**prev_opts, **collapsed["options"]}
+            active[mid] = collapsed
     if canonical_track == "expected_ideal":
         for mid in eligible_ids:
             prev = active.get(mid)
             opts = {"unbounded_rows": True} if mid == "mhc_boundary_fusion_overlap" else {}
             if prev is None:
-                active[mid] = {"id": mid, "state": "expected_ideal", "ref": None,
-                               "options": opts, "notes": "architectural_ideal"}
+                active[mid] = {
+                    "id": mid, "state": "expected_ideal", "ref": None,
+                    "options": opts, "notes": "architectural_ideal",
+                }
             elif opts:
                 active[mid] = {**prev, "options": {**prev["options"], **opts}}
 
     for mid in include_ids:
-        b = pr_map.get(mid) or merged_map.get(mid)
-        active[mid] = {
-            "id": mid,
-            "state": b.state if b else "explicit_override",
-            "ref": b.ref if b else None,
-            "options": dict(b.options) if b else {},
-            "notes": "caller_enabled",
-        }
+        group = pr_by_id.get(mid) or merged_by_id.get(mid)
+        if group:
+            collapsed = _collapse_binding_group(mid, group[0].state, group)
+            collapsed["notes"] = "caller_enabled"
+            active[mid] = collapsed
+        else:
+            active[mid] = {
+                "id": mid, "state": "explicit_override", "ref": None,
+                "options": {}, "notes": "caller_enabled",
+            }
     for mid in exclude_ids:
         active.pop(mid, None)
 
     unimplemented_gaps = [
         mid for mid in eligible_ids
-        if mid not in merged_map and mid not in pr_map
+        if mid not in merged_by_id and mid not in pr_by_id
     ]
     return {
         "stack": stack_profile.name,
@@ -332,8 +359,8 @@ def resolve_stack_track(
         "feature_track": canonical_track,
         "eligible_mechanisms": eligible_ids,
         "active_mechanisms": [active[key] for key in MECHANISM_CATALOG if key in active],
-        "merged_mechanisms": [merged_map[m].to_dict() for m in merged_map],
-        "unmerged_pr_mechanisms": [pr_map[m].to_dict() for m in pr_map],
+        "merged_mechanisms": [b.to_dict() for b in merged_list],
+        "unmerged_pr_mechanisms": [b.to_dict() for b in pr_list],
         "unimplemented_gaps": unimplemented_gaps,
         "explicit_included": list(include_ids),
         "explicit_excluded": sorted(exclude_ids),
@@ -357,13 +384,28 @@ def apply_resolved_mechanisms(
             arch=base_ctx.arch,
             parallel=base_ctx.parallel,
             caller_explicit=base_ctx.caller_explicit,
-            options=dict(entry.get("options") or {}),
+            options={**dict(base_ctx.options or {}), **dict(entry.get("options") or {})},
         )
         if mech.eligible(ctx):
             mech.apply(runtime_dict, ctx)
 
 
 # --- Built-in Stack Profiles ------------------------------------------------
+
+import importlib
+
+try:
+    importlib.import_module("mindie_sim.feature_mechanisms_cann93")
+except ModuleNotFoundError as _cann93_mech_exc:
+    if _cann93_mech_exc.name != "mindie_sim.feature_mechanisms_cann93":
+        raise
+
+try:
+    _va_ext = importlib.import_module("mindie_sim.va_stack_bindings")
+except ModuleNotFoundError as _va_bind_exc:
+    if _va_bind_exc.name != "mindie_sim.va_stack_bindings":
+        raise
+    _va_ext = None
 
 _VA_REPO = "vllm-project/vllm-ascend"
 _VA_DOCUMENTED_MODELS = tuple(sorted(VA_RECOMMENDED_PROFILES))
@@ -379,83 +421,88 @@ _VA_MODEL_DEFAULTS = {
     for k, v in VA_RECOMMENDED_PROFILES.items()
 }
 
+_FALLBACK_VA_BINDINGS: tuple[StackMechanismBinding, ...] = (
+    StackMechanismBinding("aclgraph_decode_capture", "merged", f"{_VA_REPO}@main",
+                          models=_VA_DOCUMENTED_MODELS),
+    StackMechanismBinding("sequence_parallel", "merged", f"{_VA_REPO}@main",
+                          models=_VA_DOCUMENTED_MODELS),
+    StackMechanismBinding("add_rmsnorm_quant_fusion", "merged", f"{_VA_REPO}@main"),
+    StackMechanismBinding("mla_prolog_fusion", "merged", f"{_VA_REPO}@main"),
+    StackMechanismBinding("attn_res_prefix_fusion", "merged", f"{_VA_REPO}@main"),
+    StackMechanismBinding("recurrent_decode_native_kernels", "merged", f"{_VA_REPO}@main"),
+    StackMechanismBinding(
+        "mhc_boundary_fusion_overlap", "unmerged_pr", f"{_VA_REPO}#22142",
+        models=("deepseek-v4.1-flash", "deepseek-v4-flash-0731"),
+        notes="Fuse DeepSeek V4.1 HcPost+HcPreMix+RMSNorm and overlap HcPreCoefficients (<=72 rows)",
+    ),
+    StackMechanismBinding(
+        "mhc_boundary_fusion_overlap", "unmerged_pr", f"{_VA_REPO}#20824",
+        models=("qwen3.8-flash-next",),
+        notes="Overlap Qwen4Exp low-rank HC injection on auxiliary stream with Attention/MoE",
+    ),
+    StackMechanismBinding(
+        "gdn_chunk64_prefill", "unmerged_pr", f"{_VA_REPO}#22147",
+        archs=("a5",),
+        notes="Arch35 FLA Chunk64 GDN prefill composite (+ PR #21693 Qwen3.8-Flash-Next PCP)",
+    ),
+    StackMechanismBinding(
+        "gdn_strided_gate_zero_copy", "unmerged_pr", f"{_VA_REPO}#21466",
+        notes="Direct strided BA inputs in GDN gating + head-first QKV storage reuse (#22010, #21467, #21820)",
+    ),
+    StackMechanismBinding(
+        "gdn_projection_multistream_overlap", "unmerged_pr", f"{_VA_REPO}#21037",
+        notes="Overlap Qwen GDN BA projection on auxiliary NPU stream during ACLGraph decode",
+    ),
+    StackMechanismBinding(
+        "kda_in_kernel_l2norm", "unmerged_pr", f"{_VA_REPO}#22048",
+        models=("glm-5.3-flash", "kimi-k3", "kimi-k3.1"),
+        notes="In-kernel Q/K L2 normalization for chunk KDA (+ #21510/#21017 TPxPCP KDA sharding)",
+    ),
+    StackMechanismBinding(
+        "fused_recover_ssm", "unmerged_pr", f"{_VA_REPO}#22045",
+        models=("qwen3.8-27b", "qwen3.6-35b-a3b", "qwen3.8-flash-next", "glm-5.3-flash"),
+        notes="Triton RecoverSSM compact speculative state records + colocated PCP (#22045, #22146)",
+    ),
+    StackMechanismBinding(
+        "qkv_norm_rope_fusion", "unmerged_pr", f"{_VA_REPO}#22086",
+        models=("qwen3.8-flash-next", "qwen3.8-27b"),
+        notes="Fuse QSA/GQA QKV RMSNorm + MRoPE head preparation (#22086, #22101)",
+    ),
+    StackMechanismBinding(
+        "unit_offset_rmsnorm_fusion", "unmerged_pr", f"{_VA_REPO}#21449",
+        models=("qwen3.8-27b", "gemma-4-31b", "gemma-4-26b-a4b"),
+        notes="Pre-fold Gemma/Qwen (1+w) RMSNorm unit-offset weights enabling fused AddRmsNorm",
+    ),
+    StackMechanismBinding(
+        "activation_quant_fusion", "unmerged_pr", f"{_VA_REPO}#21543",
+        notes="FX SwiGLU/SiTU graph fusion + dynamic quant fusion (#21543)",
+    ),
+    StackMechanismBinding(
+        "moe_tail_residual_fusion", "unmerged_pr", f"{_VA_REPO}#21999",
+        notes="Plain tensor add / fused residual combine for MoE shared+routed tail (#21999)",
+    ),
+    StackMechanismBinding(
+        "shared_expert_multistream_overlap", "unmerged_pr", f"{_VA_REPO}#22128",
+        models=("deepseek-v4.1-flash", "deepseek-v4-10t", "glm-5.3-flash",
+                "qwen3.8-flash-next", "kimi-k3.1"),
+        notes="Multi-stream / MegaMoE shared-expert overlap (#22128, #21095, #21624)",
+    ),
+)
+
+_VA_ACTIVE_BINDINGS = (
+    tuple(_va_ext.VLLM_ASCEND_CANN93_BINDINGS)
+    if _va_ext is not None and hasattr(_va_ext, "VLLM_ASCEND_CANN93_BINDINGS")
+    else _FALLBACK_VA_BINDINGS
+)
+
 register_runtime_stack(RuntimeStackProfile(
     name="vllm-ascend",
-    repository=_VA_REPO,
+    repository=str(getattr(_va_ext, "VLLM_ASCEND_REPOSITORY", _VA_REPO)),
     description="vLLM-Ascend main baseline and audited open performance PRs",
     model_defaults=_VA_MODEL_DEFAULTS,
-    bindings=(
-        # --- MERGED ON vllm-ascend main (documented model profiles only) ---
-        # Graph capture and TP sequence parallel are documented per-model
-        # choices on main, so the merged track binds them only for models whose
-        # profile declares them.
-        StackMechanismBinding("aclgraph_decode_capture", "merged", f"{_VA_REPO}@main",
-                              models=_VA_DOCUMENTED_MODELS),
-        StackMechanismBinding("sequence_parallel", "merged", f"{_VA_REPO}@main",
-                              models=_VA_DOCUMENTED_MODELS),
-        StackMechanismBinding("add_rmsnorm_quant_fusion", "merged", f"{_VA_REPO}@main"),
-        StackMechanismBinding("mla_prolog_fusion", "merged", f"{_VA_REPO}@main"),
-        StackMechanismBinding("attn_res_prefix_fusion", "merged", f"{_VA_REPO}@main"),
-        StackMechanismBinding("recurrent_decode_native_kernels", "merged", f"{_VA_REPO}@main"),
-        # --- IN-FLIGHT OPEN PRs ON vllm-ascend ---
-        StackMechanismBinding(
-            "mhc_boundary_fusion_overlap", "unmerged_pr", f"{_VA_REPO}#22142",
-            models=("deepseek-v4.1-flash", "deepseek-v4-flash-0731"),
-            notes="Fuse DeepSeek V4.1 HcPost+HcPreMix+RMSNorm and overlap HcPreCoefficients (<=72 rows)",
-        ),
-        StackMechanismBinding(
-            "mhc_boundary_fusion_overlap", "unmerged_pr", f"{_VA_REPO}#20824",
-            models=("qwen3.8-flash-next",),
-            notes="Overlap Qwen4Exp low-rank HC injection on auxiliary stream with Attention/MoE",
-        ),
-        StackMechanismBinding(
-            "gdn_chunk64_prefill", "unmerged_pr", f"{_VA_REPO}#22147",
-            archs=("a5",),
-            notes="Arch35 FLA Chunk64 GDN prefill composite (+ PR #21693 Qwen3.8-Flash-Next PCP)",
-        ),
-        StackMechanismBinding(
-            "gdn_strided_gate_zero_copy", "unmerged_pr", f"{_VA_REPO}#21466",
-            notes="Direct strided BA inputs in GDN gating + head-first QKV storage reuse (#22010, #21467, #21820)",
-        ),
-        StackMechanismBinding(
-            "gdn_projection_multistream_overlap", "unmerged_pr", f"{_VA_REPO}#21037",
-            notes="Overlap Qwen GDN BA projection on auxiliary NPU stream during ACLGraph decode",
-        ),
-        StackMechanismBinding(
-            "kda_in_kernel_l2norm", "unmerged_pr", f"{_VA_REPO}#22048",
-            models=("glm-5.3-flash", "kimi-k3", "kimi-k3.1"),
-            notes="In-kernel Q/K L2 normalization for chunk KDA (+ #21510/#21017 TPxPCP KDA sharding)",
-        ),
-        StackMechanismBinding(
-            "fused_recover_ssm", "unmerged_pr", f"{_VA_REPO}#22045",
-            models=("qwen3.8-27b", "qwen3.6-35b-a3b", "qwen3.8-flash-next", "glm-5.3-flash"),
-            notes="Triton RecoverSSM compact speculative state records + colocated PCP (#22045, #22146)",
-        ),
-        StackMechanismBinding(
-            "qkv_norm_rope_fusion", "unmerged_pr", f"{_VA_REPO}#22086",
-            models=("qwen3.8-flash-next", "qwen3.8-27b"),
-            notes="Fuse QSA/GQA QKV RMSNorm + MRoPE head preparation (#22086, #22101)",
-        ),
-        StackMechanismBinding(
-            "unit_offset_rmsnorm_fusion", "unmerged_pr", f"{_VA_REPO}#21449",
-            models=("qwen3.8-27b", "gemma-4-31b", "gemma-4-26b-a4b"),
-            notes="Pre-fold Gemma/Qwen (1+w) RMSNorm unit-offset weights enabling fused AddRmsNorm",
-        ),
-        StackMechanismBinding(
-            "activation_quant_fusion", "unmerged_pr", f"{_VA_REPO}#21543",
-            notes="FX SwiGLU/SiTU graph fusion + dynamic quant fusion (#21543)",
-        ),
-        StackMechanismBinding(
-            "moe_tail_residual_fusion", "unmerged_pr", f"{_VA_REPO}#21999",
-            notes="Plain tensor add / fused residual combine for MoE shared+routed tail (#21999)",
-        ),
-        StackMechanismBinding(
-            "shared_expert_multistream_overlap", "unmerged_pr", f"{_VA_REPO}#22128",
-            models=("deepseek-v4.1-flash", "deepseek-v4-10t", "glm-5.3-flash",
-                    "qwen3.8-flash-next", "kimi-k3.1"),
-            notes="Multi-stream / MegaMoE shared-expert overlap (#22128, #21095, #21624)",
-        ),
-    ),
+    bindings=_VA_ACTIVE_BINDINGS,
+    supported_models=tuple(getattr(_va_ext, "VLLM_ASCEND_SUPPORTED_MODELS", ())),
+    unmerged_pr_models=tuple(getattr(_va_ext, "VLLM_ASCEND_UNMERGED_PR_MODELS", ())),
 ))
 
 register_runtime_stack(RuntimeStackProfile(

@@ -106,7 +106,13 @@ def _draft_layer_plan(model, draft, index: int, plan_fields: dict) -> LayerPlan:
     mhc = int(draft.mhc_mult or (ref.hc_mult if ref and ref.hyper_connections else ZERO))
     mhc_lr = int(draft.mhc_lowrank or (ref.hc_lowrank if ref and ref.hyper_connections else ZERO))
     mhc_iters = int(draft.mhc_sinkhorn_iters or (ref.hc_sinkhorn_iters if ref and ref.hyper_connections else ZERO))
-    kv_elems = int(draft.kv_cache_elements or (ref.kv_cache_elements if ref else ZERO))
+    kv_elems = int(
+        draft.kv_cache_elements
+        or (ref.kv_cache_elements if ref else 0)
+        or (2 * int(draft.num_kv_heads) * int(draft.head_dim)
+            if draft.attention_kind == "gqa" and int(draft.num_kv_heads) > 0
+            else 0)
+    )
     qk_norm = bool(draft.qk_norm or (ref.qk_norm if ref else False))
     q_gate = bool(draft.q_output_gate or (ref.q_output_gate if ref else False))
     mla_gate = bool(ref.mla_output_gate) if ref else False

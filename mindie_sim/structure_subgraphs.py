@@ -27,8 +27,49 @@ def metadata(op):
     return {**meta.get("semantic_metadata", {}), **meta}
 
 
-def layer_structure(model, layer):
-    plans = model.get("layer_plans", ())
+def _is_draft_scope_op(op) -> bool:
+    meta = metadata(op)
+    return bool(
+        meta.get("layer_scope") == "draft"
+        or meta.get("structure_model_scope") == "draft"
+        or op.phase in {"draft", "draft_prefill"}
+        or str(op.op_id).startswith(("draft", "draft_prefill."))
+    )
+
+
+def _is_draft_node(node) -> bool:
+    meta = (node.get("operator") or {}).get("metadata") or {}
+    return bool(
+        meta.get("layer_scope") == "draft"
+        or meta.get("structure_model_scope") == "draft"
+        or node.get("phase") in {"draft", "draft_prefill"}
+        or str(node.get("op_id") or "").startswith(("draft", "draft_prefill."))
+    )
+
+
+def _draft_plans_from_model(model, execution=None):
+    aux = model.get("auxiliary")
+    if not isinstance(aux, dict):
+        return ()
+    software = (execution or {}).get("software") if isinstance(execution, dict) else None
+    mode = ""
+    if isinstance(software, dict):
+        meta = software.get("metadata")
+        if isinstance(meta, dict):
+            mode = str(meta.get("draft_mode") or "")
+    candidates = ("dspark", "mtp") if mode in {"dspark", "verify", "draft_verify"} else ("mtp", "dspark")
+    for name in candidates:
+        spec = aux.get(name)
+        if isinstance(spec, dict) and spec.get("layer_plans"):
+            return spec["layer_plans"]
+    return ()
+
+
+def layer_structure(model, layer, *, op=None, execution=None):
+    if op is not None and _is_draft_scope_op(op):
+        plans = _draft_plans_from_model(model, execution)
+    else:
+        plans = model.get("layer_plans", ())
     if layer < 0 or layer >= len(plans):
         return {}
     plan = plans[layer]
@@ -290,7 +331,9 @@ def export_subgraphs(nodes, declarations, memberships, entry_dependencies):
     by_id = {node["node_id"]: node for node in nodes}
     position = {node["node_id"]: index for index, node in enumerate(nodes)}
     layer_structures = {
-        (node["replica"], node["stage"], node["layer"]): node["structure"] for node in nodes}
+        (node["replica"], node["stage"], _is_draft_node(node), node["layer"]): node["structure"]
+        for node in nodes
+    }
     users = defaultdict(set)
     for node in nodes:
         for dependency in node["deps"]:
@@ -313,14 +356,19 @@ def export_subgraphs(nodes, declarations, memberships, entry_dependencies):
         first = ordered[0]
         if any((node["replica"], node["stage"]) != (first["replica"], first["stage"])
                or (node["phase"] != first["phase"]
-                   and not {node["phase"], first["phase"]} <= {"decode", "draft"})
+                   and not {node["phase"], first["phase"]} <= {"decode", "draft"}
+                   and not {node["phase"], first["phase"]} <= {"prefill", "draft", "draft_prefill"})
                for node in ordered):
             raise ValueError(f"structure_subgraph_crosses_placement:{local_id}")
         owners = set()
+        owner_struct_keys = set()
         for node in ordered:
+            is_draft = _is_draft_node(node)
             owners.add((replica, node["stage"], node["layer"], node["block"]))
+            owner_struct_keys.add((replica, node["stage"], is_draft, node["layer"]))
             for origin in node["operator"]["metadata"].get("fused_origin_scopes", ()):
                 owners.add((replica, origin["stage"], origin["layer"], origin["block"]))
+                owner_struct_keys.add((replica, origin["stage"], is_draft, origin["layer"]))
         scopes = [{"replica": r, "stage": s, "layer": layer, "block": block}
                   for r, s, layer, block in sorted(
                       owners, key=lambda value: (value[0], value[1], value[2], value[3] or ""))]
@@ -328,7 +376,7 @@ def export_subgraphs(nodes, declarations, memberships, entry_dependencies):
         blocks = {scope["block"] for scope in scopes}
         common_structure = {
             key: value for key, value in first["structure"].items()
-            if all(layer_structures.get(owner[:3], {}).get(key) == value for owner in owners)
+            if all(layer_structures.get(skey, {}).get(key) == value for skey in owner_struct_keys)
         }
         inputs = sorted({dep for node in ordered for dep in node["deps"] if dep not in members})
         outputs = [node["node_id"] for node in ordered

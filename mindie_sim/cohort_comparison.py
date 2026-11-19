@@ -118,16 +118,27 @@ def _check_cohort(cohort, window, structure, targets):
                 or target.get("contract") is None
                 or _canonical(target["contract"]) != _canonical(cohort.get("contract"))):
             raise ValueError("cohort_physical_or_tensor_contract_mismatch")
-        if isinstance(target.get("coverage"), Mapping) and target["coverage"].get("kind") not in {
-            "complete_subgraph", "complete_semantic_subgraph",
+        coverage = target.get("coverage")
+        is_composite_shared = isinstance(coverage, Mapping) and bool(
+            coverage.get("composite_shared") or coverage.get("kind") == "composite_shared"
+        )
+        if isinstance(coverage, Mapping) and coverage.get("kind") not in {
+            "complete_subgraph", "complete_semantic_subgraph", "composite_shared",
         }:
             raise ValueError("cohort_incomplete_native_boundary")
         members = set(_member_ids(target, kind))
-        if members & seen:
+        if members & seen and not is_composite_shared:
             raise ValueError("cohort_candidate_boundaries_overlap")
         seen.update(members)
+    expected_phase = structure["execution"]["phase"]
+    draft_prepare = bool(structure["execution"].get("draft_prepare", False))
+    valid_phases = {expected_phase}
+    if expected_phase == "decode":
+        valid_phases.add("draft")
+    elif expected_phase == "prefill" and draft_prepare:
+        valid_phases.update({"draft", "draft_prefill"})
     if (replica_count == 1 and placement[0] is None
-            or placement[1] is None or placement[2] != structure["execution"]["phase"]):
+            or placement[1] is None or placement[2] not in valid_phases):
         raise ValueError("cohort_placement_or_phase_unspecified")
     count, complete, clipped = (cohort.get(key) for key in (
         "event_count", "complete_event_count", "clipped_event_count"))
@@ -169,7 +180,8 @@ def _program_ids(target, kind):
 
 
 def _predict(case, target, kind, by_id, book):
-    identifiers, selected_boundary = _program_ids(target, kind)
+    raw_identifiers, selected_boundary = _program_ids(target, kind)
+    identifiers = list(dict.fromkeys(raw_identifiers))
     if any(key not in by_id for key in identifiers):
         raise ValueError("cohort_target_physical_program_unavailable")
     ops = tuple(by_id[key] for key in identifiers)
@@ -263,6 +275,8 @@ def compare_cohorts(case, mapping_report):
     geometry = {key: execution[key] for key in required}
     if "apply_body_defaults" in execution:
         geometry["apply_body_defaults"] = execution["apply_body_defaults"]
+    if execution.get("draft_prepare"):
+        geometry["draft_prepare"] = True
     manifest_geometry = dict(geometry)
     projection = execution.get("replica_projection") or {}
     selected_replicas = projection.get("selected")

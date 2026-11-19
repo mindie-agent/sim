@@ -105,7 +105,8 @@ def _export_structure(args, case, *, phase, tokens, context, sequences):
     from .structure import export_structure
     report = export_structure(
         case, phase=phase, tokens=tokens, context=context, sequences=sequences,
-        scope=args.scope, apply_body_defaults=args.apply_body_defaults)
+        scope=args.scope, apply_body_defaults=args.apply_body_defaults,
+        draft_prepare=bool(getattr(args, "draft_prepare", False)))
     path = Path(args.export_structure)
     data = (json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False)
             + "\n").encode("utf-8")
@@ -258,7 +259,7 @@ def parser():
     compose.add_argument("--stack-manifest", default=None,
                          help="explicit JSON stack manifest path")
     compose.add_argument("--feature-track", default="merged",
-                         choices=("merged", "unmerged_pr", "expected_ideal"))
+                         choices=("raw_eager", "merged", "unmerged_pr", "expected_ideal"))
     compose.add_argument("--enable-opt", action="append", default=[],
                          help="enable individual OptimizationMechanism ID (repeatable)")
     compose.add_argument("--disable-opt", action="append", default=[],

@@ -161,6 +161,26 @@ def prepare(ops, *, projection, model, draft, rows, query_rows,
             prefix, stage, requests, parallel=None, rows_by_view=None,
             views=None, contexts=None, block=UNIT_CONTEXT_PARALLEL,
             use_prolog_v3=True):
+    proj_mode = str(getattr(draft, "context_projection_mode", "") or "none").strip()
+    if draft.attention_kind == "gqa" or proj_mode in {"fused_kv_bank", "per_layer_qkv"}:
+        from .draft_context_gqa import prepare_gqa_context
+        return prepare_gqa_context(
+            ops,
+            projection=projection,
+            model=model,
+            draft=draft,
+            rows=rows,
+            query_rows=query_rows,
+            prefix=prefix,
+            stage=stage,
+            requests=requests,
+            parallel=parallel,
+            owned_scatter_rows_fn=owned_scatter_rows,
+            rows_by_view=rows_by_view,
+            views=views,
+            contexts=contexts,
+            block=block,
+        )
     common = dict(stage=stage, layer=-1, requests=requests, phase="draft")
     norm = vector_op(
         op_id=prefix + "context_norm", deps=(projection.op_id,),

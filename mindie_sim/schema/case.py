@@ -70,6 +70,8 @@ def _compilation_fields(raw: Mapping[str, Any], declared: Mapping[str, Any]
     unknown = set(config) - {
         "cudagraph_mode", "cudagraph_capture_sizes", "splitting_ops",
         "level", "use_cudagraph", "cudagraph_num_of_warmups",
+        "npugraph_ex_config", "enable_npugraph_ex",
+        "enable_static_kernel", "enable_super_kernel",
     }
     if unknown:
         raise ModelingError(
@@ -100,6 +102,27 @@ def _compilation_fields(raw: Mapping[str, Any], declared: Mapping[str, Any]
                         "runtime_compilation_conflict:piecewise_capture_keys")
                 fields["piecewise_capture_keys"] = sizes
         fields["metadata"] = (("captured_execution_mode", mode_raw),)
+    npu_cfg = config.get("npugraph_ex_config")
+    if npu_cfg is not None:
+        if not isinstance(npu_cfg, Mapping):
+            raise ModelingError("runtime_compilation_config_invalid")
+        for src_key, dst_key in (
+            ("enable", "enable_npugraph_ex"),
+            ("enable_npugraph_ex", "enable_npugraph_ex"),
+            ("enable_static_kernel", "enable_static_kernel"),
+            ("enable_super_kernel", "enable_super_kernel"),
+        ):
+            if src_key in npu_cfg and npu_cfg[src_key] is not None:
+                val = npu_cfg[src_key]
+                if not isinstance(val, bool):
+                    raise ModelingError(f"runtime_feature_invalid:{dst_key}:{val!r}")
+                fields[dst_key] = val
+    for flag_key in ("enable_npugraph_ex", "enable_static_kernel", "enable_super_kernel"):
+        if flag_key in config and config[flag_key] is not None:
+            val = config[flag_key]
+            if not isinstance(val, bool):
+                raise ModelingError(f"runtime_feature_invalid:{flag_key}:{val!r}")
+            fields[flag_key] = val
     ops = config.get("splitting_ops")
     if ops is not None:
         if not isinstance(ops, (list, tuple)) or not all(
@@ -127,6 +150,10 @@ class Software:
     async_scheduling: bool = False
     graph_mode: str = "auto"
     graph_capture_mode: str = "full"
+    enable_torch_compile: bool = True
+    enable_npugraph_ex: bool = True
+    enable_static_kernel: bool = False
+    enable_super_kernel: bool = False
     graph_buckets: tuple[int, ...] = ()
     graph_capture_keys: tuple[int, ...] = ()
     piecewise_capture_keys: tuple[int, ...] = ()
@@ -170,6 +197,24 @@ class Software:
     prefix_read_mode: str = "auto"
     #: Homogeneous cohort semantic-graph reuse: off, auto or require.
     homogeneous_graph_reuse: str = "off"
+
+    def __post_init__(self) -> None:
+        for flag in (
+            "enable_torch_compile",
+            "enable_npugraph_ex",
+            "enable_static_kernel",
+            "enable_super_kernel",
+        ):
+            val = getattr(self, flag)
+            if not isinstance(val, bool):
+                raise ModelingError(f"runtime_feature_invalid:{flag}:{val!r}")
+        if not self.enable_torch_compile or self.graph_capture_mode != "full":
+            object.__setattr__(self, "enable_npugraph_ex", False)
+            object.__setattr__(self, "enable_static_kernel", False)
+            object.__setattr__(self, "enable_super_kernel", False)
+        elif not self.enable_npugraph_ex:
+            object.__setattr__(self, "enable_static_kernel", False)
+            object.__setattr__(self, "enable_super_kernel", False)
 
     @staticmethod
     def parallel_mapping(raw):
