@@ -40,6 +40,17 @@ DEFAULT_QK_HEAD_DIM = 256
 MTP_PP_CAPABILITY = (1, 2, 4, 8, 16)
 GLM_KDA_GATE_LOWER_BOUND = -5.0
 FP32_STATE_BYTES = 4
+GLM_MTP_SOURCE: dict[str, str] = {
+    "repository": "vllm-project/vllm-ascend",
+    "revision": "405617bae227fe5b097ff163efaa60bb7f22c698",
+    "relative_path": "vllm_ascend/models/glm5next/model.py",
+    "source_sha256": "0af1c43f5827441974c9f7691acd1868c924250bbb041fb390987732731b46cd",
+}
+
+
+def _draft_compat_kwargs(**candidates: Any) -> dict[str, Any]:
+    declared = DraftSpec.__dataclass_fields__
+    return {key: value for key, value in candidates.items() if key in declared}
 
 def _index_pool(c):
     size = int(c.get("index_kpool") or 1)
@@ -330,8 +341,19 @@ def _aux_glm(c: Mapping[str, Any]) -> AuxiliarySpec:
         vocab_size=int(c["vocab_size"]),
         mhc_mult=_int(c, "hc_mult") if hyper else 0,
         mhc_sinkhorn_iters=_int(c, "hc_sinkhorn_iters") if hyper else 0,
-        source=merge_source({"kind": "glm_mtp"}),
+        source=merge_source(
+            GLM_MTP_SOURCE,
+            {
+                "kind": "glm_mtp",
+                "independent_context": "false",
+                "dcp_sharded": "true",
+            },
+        ),
         notes=("GLM body is 78 layers; MTP is one optional layer",),
+        **_draft_compat_kwargs(
+            independent_context=False,
+            dcp_sharded=True,
+        ),
     )
     return AuxiliarySpec(mtp=mtp, notes=("body78_mtp1_distinct",))
 

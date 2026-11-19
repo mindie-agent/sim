@@ -31,6 +31,39 @@ from mindie_sim.schema.common import ModelingError
 #: one BF16 short-convolution element.
 KDA_STATE_DTYPE_BYTES = 4
 CONV_STATE_DTYPE_BYTES = 2
+KIMI_DSPARK_LAYERS = 5
+KIMI_DSPARK_INTERMEDIATE = 14336
+KIMI_DSPARK_MLA_HEADS = 64
+KIMI_DSPARK_MLA_HEAD_DIM = 192
+KIMI_DSPARK_Q_LORA_RANK = 1536
+KIMI_DSPARK_KV_LORA_RANK = 512
+KIMI_DSPARK_QK_NOPE_DIM = 128
+KIMI_DSPARK_QK_ROPE_DIM = 64
+KIMI_DSPARK_V_HEAD_DIM = 128
+KIMI_DSPARK_MLA_KV_ELEMENTS = 576
+KIMI_DSPARK_KV_PLANES = 2
+KIMI_DSPARK_GQA_HEADS = 64
+KIMI_DSPARK_GQA_KV_HEADS = 16
+KIMI_DSPARK_GQA_HEAD_DIM = 64
+KIMI_DSPARK_PP_CAPABILITY = (1, 2, 4, 8, 16)
+KIMI_DEFAULT_VOCAB_SIZE = 163840
+KIMI_DSPARK_MLA_SOURCE: dict[str, str] = {
+    "repository": "vllm-project/vllm-ascend",
+    "revision": "405617bae227fe5b097ff163efaa60bb7f22c698",
+    "relative_path": "vllm_ascend/models/kimi_k3/kimi_k3_dspark.py",
+    "source_sha256": "6af8077aab72054aca0df8d3dd97e1ece568acd4c32976015e30b9f61f0a63d6",
+}
+KIMI_DSPARK_GQA_SOURCE: dict[str, str] = {
+    "repository": "vllm-project/vllm-ascend",
+    "revision": "405617bae227fe5b097ff163efaa60bb7f22c698",
+    "relative_path": "vllm_ascend/models/qwen3_dspark.py",
+    "source_sha256": "62d27df987013fc808b3d03a0730056e1a37f941790ad8299c090f2e3ef48d38",
+}
+
+
+def _draft_compat_kwargs(**candidates: Any) -> dict[str, Any]:
+    declared = DraftSpec.__dataclass_fields__
+    return {key: value for key, value in candidates.items() if key in declared}
 
 
 def _kimi_plans(config: Mapping[str, Any]) -> list[LayerPlan]:
@@ -181,42 +214,78 @@ def _aux_kimi(c: Mapping[str, Any], config: Mapping[str, Any]) -> AuxiliarySpec:
             c.get("dspark_target_layer_ids") or (2, 23, 47, 71, 89)))
         block = _int(c, "dspark_block_size", 5)
         dspark = DraftSpec(
-            kind="dspark", layers=5, hidden_size=h, intermediate_size=14336,
-            num_heads=64, num_kv_heads=1, head_dim=192,
-            q_lora_rank=1536, kv_lora_rank=512,
-            qk_nope_head_dim=128, qk_rope_head_dim=64, v_head_dim=128,
-            kv_cache_elements=576, q_width=64 * 192, kv_width=576,
+            kind="dspark", layers=KIMI_DSPARK_LAYERS, hidden_size=h,
+            intermediate_size=KIMI_DSPARK_INTERMEDIATE,
+            num_heads=KIMI_DSPARK_MLA_HEADS, num_kv_heads=1,
+            head_dim=KIMI_DSPARK_MLA_HEAD_DIM,
+            q_lora_rank=KIMI_DSPARK_Q_LORA_RANK, kv_lora_rank=KIMI_DSPARK_KV_LORA_RANK,
+            qk_nope_head_dim=KIMI_DSPARK_QK_NOPE_DIM,
+            qk_rope_head_dim=KIMI_DSPARK_QK_ROPE_DIM,
+            v_head_dim=KIMI_DSPARK_V_HEAD_DIM,
+            kv_cache_elements=KIMI_DSPARK_MLA_KV_ELEMENTS,
+            q_width=KIMI_DSPARK_MLA_HEADS * KIMI_DSPARK_MLA_HEAD_DIM,
+            kv_width=KIMI_DSPARK_MLA_KV_ELEMENTS,
             attention_kind="mla", mla_variant="latent_mla",
             target_layer_ids=target_ids, block_size=block, markov_rank=markov,
             confidence_enabled=True, confidence_executes=False,
             confidence_input_width=h + markov,
             target_shared_embedding=True, target_shared_lm_head=True,
             base_logits=True, markov_replicated=True,
-            noncausal_query_block=True, pp_capability=(1, 2, 4, 8, 16),
-            vocab_size=int(c.get("vocab_size", 163840)), num_experts=0, top_k=0,
-            source=merge_source({"kind": "external_kimi_k3_dspark"}),
+            noncausal_query_block=True, pp_capability=KIMI_DSPARK_PP_CAPABILITY,
+            vocab_size=int(c.get("vocab_size", KIMI_DEFAULT_VOCAB_SIZE)),
+            num_experts=0, top_k=0,
+            source=merge_source(
+                KIMI_DSPARK_MLA_SOURCE,
+                {
+                    "kind": "external_kimi_k3_dspark",
+                    "independent_context": "true",
+                    "context_projection_mode": "mla_prolog",
+                },
+            ),
             notes=("external five-layer MLA dense draft; selected via explicit draft mode",),
+            **_draft_compat_kwargs(
+                independent_context=True,
+                context_projection_mode="mla_prolog",
+            ),
         )
         return AuxiliarySpec(
-            dspark=dspark, external_draft_key="kimi-k3-dspark",
+            dspark=dspark, external_draft_key="kimi-k3-dspark-block5",
             notes=("native K3 num_nextn_predict_layers=0 does not remove selected external DSpark",),
         )
     target_ids = (7, 23, 51, 67, 83)
     block = 7
     markov = 256
     dspark = DraftSpec(
-        kind="dspark", layers=5, hidden_size=h, intermediate_size=14336,
-        num_heads=64, num_kv_heads=16, head_dim=64,
-        q_width=64 * 64, kv_width=16 * 64, attention_kind="gqa",
+        kind="dspark", layers=KIMI_DSPARK_LAYERS, hidden_size=h,
+        intermediate_size=KIMI_DSPARK_INTERMEDIATE,
+        num_heads=KIMI_DSPARK_GQA_HEADS, num_kv_heads=KIMI_DSPARK_GQA_KV_HEADS, head_dim=KIMI_DSPARK_GQA_HEAD_DIM,
+        kv_cache_elements=KIMI_DSPARK_KV_PLANES * KIMI_DSPARK_GQA_KV_HEADS * KIMI_DSPARK_GQA_HEAD_DIM,
+        q_width=KIMI_DSPARK_GQA_HEADS * KIMI_DSPARK_GQA_HEAD_DIM,
+        kv_width=KIMI_DSPARK_GQA_KV_HEADS * KIMI_DSPARK_GQA_HEAD_DIM,
+        attention_kind="gqa",
         target_layer_ids=target_ids, block_size=block, markov_rank=markov,
         confidence_enabled=True, confidence_executes=False,
         confidence_input_width=h + markov,
         target_shared_embedding=True, target_shared_lm_head=True,
         base_logits=True, markov_replicated=True,
-        noncausal_query_block=True, pp_capability=(1, 2, 4, 8, 16),
-        vocab_size=int(c.get("vocab_size", 163840)), num_experts=0, top_k=0,
-        source=merge_source({"kind": "external_kimi_k3_dspark"}),
+        noncausal_query_block=True, pp_capability=KIMI_DSPARK_PP_CAPABILITY,
+        vocab_size=int(c.get("vocab_size", KIMI_DEFAULT_VOCAB_SIZE)),
+        num_experts=0, top_k=0,
+        source=merge_source(
+            KIMI_DSPARK_GQA_SOURCE,
+            {
+                "kind": "external_kimi_k3_dspark",
+                "independent_context": "true",
+                "context_projection_mode": "fused_kv_bank",
+                "dcp_sharded": "false",
+            },
+        ),
         notes=("external five-layer dense draft; selected via explicit draft mode",),
+        **_draft_compat_kwargs(
+            independent_context=True,
+            context_projection_mode="fused_kv_bank",
+            dcp_sharded=False,
+        ),
     )
     return AuxiliarySpec(
         dspark=dspark, external_draft_key="kimi-k3-dspark",

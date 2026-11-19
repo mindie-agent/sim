@@ -268,13 +268,8 @@ class MoeCommConfig:
         if not mode and declared_mode in {DYNAMIC, ALWAYS_MC2}:
             mode = declared_mode
         if not mode:
-            # The A5 source selector chooses ordinary MC2 at either fused flag
-            # when the token count is under the same capacity crossover.  The
-            # presence of the deployment's fused declaration (not its value)
-            # is the evidence that this A5 policy/EP path is loaded.  Unknown
-            # deployments without that declaration keep their static recipe.
-            if (arch == "A5" and int(ep) > 1 and not mega
-                    and (declared_fused or provenance)):
+            if (arch == "A5" and int(ep) > 1
+                    and (declared_fused or mega or provenance)):
                 mode = DYNAMIC
         if not mode:
             return None
@@ -289,6 +284,11 @@ class MoeCommConfig:
             BASE_DECODE_QUERY_LEN + draft) or BASE_DECODE_QUERY_LEN
         max_batched = _positive_int(meta.get("max_num_batched_tokens"), 0)
         enable_prefill = bool(int(additional.get("enable_prefill_mc2", 0) or 0))
+        if mega and not enable_prefill and max_batched < 1:
+            max_batched = (
+                max(capture_sizes) if capture_sizes
+                else max(1, max_num_reqs * uniform)
+            )
         tp = max(1, int(getattr(features, "tp", 1) or 1))
         world = max(1, int(ep))
         capacity = source_mc2_tokens_capacity(

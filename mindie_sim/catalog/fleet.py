@@ -32,7 +32,10 @@ from mindie_sim.schema.common import ModelingError
 
 ZERO = 0
 KV_CACHE_PLANES = 2
+STANDARD_RMSNORM_OFFSET = 0.0
 NORM_WEIGHT_OFFSET = 1.0
+GEMMA4_DENSE_LAYER_NORMS = 4
+GEMMA4_MOE_LAYER_NORMS = 7
 STEP5_NEXTN_BLOCKS = 3
 STEP5_PP_CAPABILITY = (1, 2, 4, 8, 16)
 DEFAULT_NORM_EPS = 1e-06
@@ -270,12 +273,19 @@ def _gemma4(key: str, config: Mapping[str, Any]) -> ModelSpec:
     moe_i = _int(c, "moe_intermediate_size") if moe else 0
     shared = (_int(c, "n_shared_experts") or _int(c, "num_shared_experts") or 1) if moe else 0
     shared_i = (_int(c, "shared_expert_intermediate_size") or intermediate) if moe else 0
+    kv_shared = max(ZERO, _int(c, "num_kv_shared_layers"))
+    first_shared = max(ZERO, layers - kv_shared)
+    donor_by_kind: dict[str, int] = {}
+    for donor_idx in range(first_shared):
+        donor_by_kind[kinds[donor_idx]] = donor_idx
     plans = []
     for index, kind in enumerate(kinds):
         full = kind == "full_attention"
         layer_kv = global_kv_heads if full else kv_heads
         layer_hd = global_head_dim if full else head_dim
-        # Two cache planes are retained even when the projection is shared.
+        shares_kv = index >= first_shared and kind in donor_by_kind
+        kv_owner = donor_by_kind[kind] if shares_kv else index
+        # Two cache planes are retained on KV-owning layers even when V=v_norm(K).
         factor = KV_CACHE_PLANES
         plans.append(LayerPlan(
             index=index, attention="gqa", architecture="gemma4",
@@ -288,10 +298,12 @@ def _gemma4(key: str, config: Mapping[str, Any]) -> ModelSpec:
             num_shared_experts=shared,
             shared_intermediate_size=shared_i, qk_norm=True,
             ffn_activation="gelu",
-            kv_cache_elements=factor * layer_kv * layer_hd,
-            kv_owner_layer_id=index, owns_long_kv=True, k_eq_v=bool(full and k_eq_v),
+            kv_cache_elements=ZERO if shares_kv else factor * layer_kv * layer_hd,
+            kv_owner_layer_id=kv_owner, owns_long_kv=not shares_kv,
+            k_eq_v=bool(full and k_eq_v),
             native_layer_id=index, scope="body",
         ))
+    norms_per_layer = GEMMA4_MOE_LAYER_NORMS if moe else GEMMA4_DENSE_LAYER_NORMS
     gemma_facts = {
         "gemma4": 1, "gemma4_ple": int(ple), "gemma4_ple_layers": (),
         "gemma4_ple_width": ple_width, "gemma4_ple_tables": 1,
@@ -299,7 +311,17 @@ def _gemma4(key: str, config: Mapping[str, Any]) -> ModelSpec:
         "gemma4_ple_vocab": _int(c, "vocab_size_per_layer_input") or vocab,
         "gemma4_k_eq_v_all": ZERO,
         "gemma4_k_eq_v_layers": k_layers,
-        "norm_weight_offset": NORM_WEIGHT_OFFSET,
+        "gemma4_v_norm": 1,
+        "gemma4_layer_scalar": 1,
+        "gemma4_norms_per_layer": norms_per_layer,
+        "gemma4_num_kv_shared_layers": kv_shared,
+        "norm_weight_offset": STANDARD_RMSNORM_OFFSET,
+        "normalization": {
+            "norm_weight_offset": STANDARD_RMSNORM_OFFSET,
+            "v_norm": True,
+            "layer_scalar": True,
+            "norms_per_layer": norms_per_layer,
+        },
         "attention_schedule": schedule,
     }
     gaps = ("vision_encoder_and_projector:language_backbone_only",) if vision_raw else ()
@@ -393,12 +415,27 @@ def _minimax_m3(key: str, config: Mapping[str, Any]) -> ModelSpec:
             kv_owner_layer_id=index, owns_long_kv=True,
             native_layer_id=index, scope="body",
         ))
+    from mindie_sim.catalog.minimax_draft import build_minimax_auxiliary
+    gemma_norm = bool(c.get("use_gemma_norm", False))
+    offset = NORM_WEIGHT_OFFSET if gemma_norm else STANDARD_RMSNORM_OFFSET
+    minimax_extra: dict[str, Any] = {
+        "norm_weight_offset": offset,
+        "num_mtp_modules": _int(c, "num_mtp_modules"),
+    }
+    if gemma_norm:
+        minimax_extra["normalization"] = {
+            "norm_weight_offset": NORM_WEIGHT_OFFSET,
+            "norm_multiply_before_output_cast": True,
+        }
+    facts = _facts("minimax_m3", config, c, plans, **minimax_extra)
+    auxiliary = build_minimax_auxiliary(c, body_layers=layers)
     gaps = ("vision_encoder_and_projector:language_backbone_only",) if vision_raw else ()
     return _model(
         key, "minimax_m3", config, c, plans, attention="gqa", ffn="moe",
         heads=heads, kv_heads=kv_heads, head_dim=head_dim, hidden=hidden,
         intermediate=dense_i, vocab=vocab, experts=experts, top_k=top_k,
-        moe_i=moe_i, shared=shared, gaps=gaps,
+        moe_i=moe_i, shared=shared, facts=facts, gaps=gaps,
+        auxiliary=auxiliary,
     )
 
 
@@ -503,10 +540,19 @@ def _step5(key: str, config: Mapping[str, Any]) -> ModelSpec:
             native_layer_id=index, scope="body",
         ))
     gaps = []
-    if sparse_on:
-        gaps.append("csa_block_compress_ssmax_approximated_by_pooled_indexer")
     if vision_raw:
         gaps.append("vision_encoder_and_projector:language_backbone_only")
+    fp32_residual = bool(c.get("fp32_residual_connection", True))
+    step5_facts = _facts(
+        "step5", config, c, plans,
+        supports_torch_compile=False,
+        norm_weight_offset=NORM_WEIGHT_OFFSET,
+        normalization={
+            "norm_weight_offset": NORM_WEIGHT_OFFSET,
+            "norm_multiply_before_output_cast": True,
+            "fp32_residual": fp32_residual,
+        },
+    )
     auxiliary = _step5_auxiliary(
         c, plans, hidden=hidden, heads=heads, kv_heads=kv_heads,
         head_dim=head_dim, intermediate=intermediate, vocab=vocab,
@@ -515,7 +561,7 @@ def _step5(key: str, config: Mapping[str, Any]) -> ModelSpec:
         key, "step5", config, c, plans, attention="gqa", ffn="moe",
         heads=heads, kv_heads=kv_heads, head_dim=head_dim, hidden=hidden,
         intermediate=intermediate, vocab=vocab, experts=experts,
-        top_k=top_k, moe_i=moe_i, shared=1, gaps=tuple(gaps), facts=None,
+        top_k=top_k, moe_i=moe_i, shared=1, gaps=tuple(gaps), facts=step5_facts,
         auxiliary=auxiliary,
     )
 

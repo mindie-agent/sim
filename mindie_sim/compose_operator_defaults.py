@@ -291,6 +291,10 @@ def mqsmla_default(case, kernels):
     layers = v41_cached_layers(case)
     if not layers or not any(p.compressor_kind == "gated_ring" for p in layers):
         return None
+    from mindie_sim.prediction.mla_cann_epilogs import raw_eager_requested
+    if raw_eager_requested(case.runtime):
+        return {"family": MQSMLA_FAMILY, "selection": "preserved",
+                "reason": "raw_eager_requested", "degraded": True, "installed": False}
     lowerings = kernels.setdefault("lowerings", {})
     automatic = installed_automatically(case.runtime.metadata, MQSMLA_SELECTOR)
     parallel = case.runtime.parallel
@@ -394,6 +398,10 @@ def lightning_indexer_default(case, kernels):
     layers = [p for p in case.model.layer_plans if p.indexer and p.index_kpool == 1]
     if not layers:
         return None
+    from mindie_sim.prediction.mla_cann_epilogs import raw_eager_requested
+    if raw_eager_requested(case.runtime):
+        return {"family": LIGHTNING_INDEXER_FAMILY, "selection": "preserved",
+                "reason": "raw_eager_requested", "degraded": True}
     lowerings = kernels.setdefault("lowerings", {})
     if indexer_boundary_declared(lowerings):
         return {"family": LIGHTNING_INDEXER_FAMILY, "selection": "preserved",

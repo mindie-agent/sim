@@ -15,7 +15,15 @@ from mindie_sim.schema.parallel import ParallelSpec
 
 ZERO = 0
 ONE = 1
+MULTI_TARGET_CONCAT_MIN = 2
 #: ``WeightTerm.groups``/``units``/``unit_width`` for a term with no grouping.
+
+
+def _resolved_input_width(draft: DraftSpec) -> int:
+    targets = tuple(getattr(draft, "target_layer_ids", ()) or ())
+    if len(targets) >= MULTI_TARGET_CONCAT_MIN:
+        return int(len(targets) * draft.hidden_size)
+    return int(draft.input_width)
 
 def _local_draft_experts(num_experts: int, ep: int) -> int:
     """Experts held on one EP rank.
@@ -226,7 +234,7 @@ def draft_terms(
             # ``main_norm[H]``.  The 3H-wide projection is a different operator
             # from two independent H x H projections, so it must not be modelled
             # as ``dual_normalized``.
-            terms.append(_t("draft_main_proj", h, draft.input_width,
+            terms.append(_t("draft_main_proj", h, _resolved_input_width(draft),
                             draft.input_projection_category, "out_tp"))
             terms.append(_t("draft_main_norm", h, ONE, "norm"))
         elif draft.input_mode == "dual_normalized":

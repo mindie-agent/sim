@@ -35,6 +35,7 @@ TWO = 2
 FOUR = 4
 EIGHT = 8
 SIXTEEN = 16
+DEFAULT_MLA_DSPARK_BLOCK = 5
 
 
 def _qwen_normalization(c: Mapping[str, Any]) -> dict[str, Any]:
@@ -181,8 +182,13 @@ def _qwen_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
     return plans
 
 
+def _draft_compat_kwargs(**candidates: Any) -> dict[str, Any]:
+    declared = DraftSpec.__dataclass_fields__
+    return {key: value for key, value in candidates.items() if key in declared}
+
+
 def _aux_qwen(c: Mapping[str, Any]) -> AuxiliarySpec:
-    nextn = _int(c, "mtp_num_hidden_layers")
+    nextn = _int(c, "mtp_num_hidden_layers") or _int(c, "num_nextn_predict_layers")
     if nextn <= 0:
         return AuxiliarySpec()
     h = int(c["hidden_size"])
@@ -291,28 +297,39 @@ def _aux_dspark(c: Mapping[str, Any]) -> AuxiliarySpec:
             kv_cache_elements=kv_lora + rope,
             q_width=heads * head_dim, kv_width=kv_lora + rope,
             attention_kind="mla", mla_variant="latent_mla",
-            target_layer_ids=targets, block_size=_int(c, "block_size", 5),
+            target_layer_ids=targets, block_size=_int(c, "block_size", DEFAULT_MLA_DSPARK_BLOCK),
             markov_rank=markov,
             confidence_enabled=bool(c.get("enable_confidence_head", False)),
             confidence_executes=False, confidence_input_width=h + markov,
             target_shared_embedding=True, target_shared_lm_head=True,
             base_logits=True, markov_replicated=True,
-            noncausal_query_block=not causal, pp_capability=(1, 2, 4, 8, 16),
+            noncausal_query_block=not causal, pp_capability=(ONE, TWO, FOUR, EIGHT, SIXTEEN),
             vocab_size=int(c["vocab_size"]),
-            source=merge_source({"kind": "standalone_dspark_draft"}),
+            source=merge_source({
+                "kind": "standalone_dspark_draft",
+                "independent_context": "true",
+                "context_projection_mode": "mla_prolog",
+            }),
             notes=("DSpark MLA draft model is its own body; target features are model inputs",),
+            **_draft_compat_kwargs(
+                independent_context=True,
+                context_projection_mode="mla_prolog",
+            ),
         )
         return AuxiliarySpec(dspark=spec, standalone_draft=True)
     targets = tuple(int(v) for v in (c.get("dflash_config", {}) or {}).get("target_layer_ids", ()) or ())
     block = _int(c, "block_size", 7)
+    kv_heads = int(c["num_key_value_heads"])
+    head_dim = int(c["head_dim"])
     spec = DraftSpec(
         kind="standalone_draft", layers=int(c["num_hidden_layers"]),
         hidden_size=h, intermediate_size=int(c["intermediate_size"]),
         num_heads=int(c["num_attention_heads"]),
-        num_kv_heads=int(c["num_key_value_heads"]),
-        head_dim=int(c["head_dim"]),
-        q_width=int(c["num_attention_heads"]) * int(c["head_dim"]),
-        kv_width=int(c["num_key_value_heads"]) * int(c["head_dim"]),
+        num_kv_heads=kv_heads,
+        head_dim=head_dim,
+        kv_cache_elements=TWO * kv_heads * head_dim,
+        q_width=int(c["num_attention_heads"]) * head_dim,
+        kv_width=kv_heads * head_dim,
         attention_kind="gqa", target_layer_ids=targets, block_size=block,
         markov_rank=markov,
         confidence_enabled=bool(c.get("enable_confidence_head", False)),
@@ -320,10 +337,20 @@ def _aux_dspark(c: Mapping[str, Any]) -> AuxiliarySpec:
         confidence_input_width=h + markov,
         target_shared_embedding=True, target_shared_lm_head=True,
         base_logits=True, markov_replicated=True,
-        noncausal_query_block=True, pp_capability=(1, 2, 4, 8, 16),
+        noncausal_query_block=True, pp_capability=(ONE, TWO, FOUR, EIGHT, SIXTEEN),
         vocab_size=int(c["vocab_size"]),
-        source=merge_source({"kind": "standalone_dspark_draft"}),
+        source=merge_source({
+            "kind": "standalone_dspark_draft",
+            "independent_context": "true",
+            "context_projection_mode": "fused_kv_bank",
+            "dcp_sharded": "false",
+        }),
         notes=("DSpark draft model is its own body; target features are model inputs",),
+        **_draft_compat_kwargs(
+            independent_context=True,
+            context_projection_mode="fused_kv_bank",
+            dcp_sharded=False,
+        ),
     )
     return AuxiliarySpec(dspark=spec, standalone_draft=True)
 
