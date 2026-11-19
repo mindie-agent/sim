@@ -6,16 +6,16 @@
 
 - [ ] **DEV-ZERO-CTX** — Simulation, compose, and catalog paths never load weights, dynamically import `torch_npu`, or initialize NPU contexts (`0 MiB` HBM delta).
 - [ ] **DEV-READONLY-PATH** — Analytical CLI/API paths remain read-only on inputs, emit zero host `$HOME`/intranet-IP/image-SHA leaks, and propagate `TimeoutError` before `OSError`.
-- [ ] **DEV-TOPOLOGY** — Physical Die/interconnect topology (`buffer_units.l2 == 1`, A2/A3 dual-Die `SIO`/`HCCS_SW`, A5 `DAV_3510` `l0c->ub` & `K_8` UB mesh) and per-owner `PhysicalRecipe` stage conservation hold without `ResourceEnvelope` fallbacks.
-- [ ] **DEV-BOUNDED-MEM** — Streaming capture reads (`<= 512 MiB` RAM), `< 800`-line modules with 4-section headers, `check_no_magic_numbers.py`, and Unix `LF` line endings all pass.
+- [ ] **DEV-TOPOLOGY** — Physical Die/interconnect topology (`buffer_units.l2 == 1`, A2/A3 dual-Die `SIO`/`HCCS_SW`, A5 `DAV_3510` `DT` + `PR_9579/958b` `l0c->ub` & `K_8` UB mesh), per-owner `PhysicalRecipe` conservation (`0` `ResourceEnvelope` / `UnmodeledCapabilityError` on unmodeled structures), **100% structural generalization (`0` `model_id` kernel branches)**, fresh owning upstream repo `HEAD` verification (`vllm-ascend` / `cann-recipes-infer` / `MindIE-SD` / `ops-transformer` / `ops-nn` / `fla-npu` / `flash-attn-npu` / `cannbot-dsl`, etc.), and `mindie-profiler` SSOT contract compatibility all hold.
+- [ ] **DEV-BOUNDED-MEM** — Streaming capture reads (`<= 512 MiB` RAM), `< 800`-line modules with 4-section headers, `check_no_magic_numbers.py` (no tautological digit-word aliases), `@pytest.mark.parametrize` SKU sharding + shared 4-worker xdist wall-clock headroom, and Unix `LF` line endings all pass.
 
 ## 证据记录 (Evidence)
 
 - **DEV-ZERO-CTX**: `<command / test and measured output, or not-applicable: docs-only>`
 - **DEV-READONLY-PATH**: `<command / hygiene check output, or not-applicable: docs-only>`
-- **DEV-TOPOLOGY**: `<verify_m1.py / recipe conservation / accuracy test output, or not-applicable: docs-only>`
-- **DEV-BOUNDED-MEM**: `<check_no_magic_numbers.py / memory & LF check output, or not-applicable: docs-only>`
+- **DEV-TOPOLOGY**: `<upstream repo@revision checked, 0-model_id generalization, verify_m1/m2 & cross-repo profiler contract output, or not-applicable: docs-only>`
+- **DEV-BOUNDED-MEM**: `<check_no_magic_numbers.py, parametrized test runtime & LF check output, or not-applicable: docs-only>`
 
 ## 验证结果 (Verification)
 
-- Executed test suites (`pytest`, `verify_m1.py`, `check_no_magic_numbers.py`), wheel smoke test, LF check, and any unexecuted live-hardware scope.
+- Executed test suites (`pytest`, cross-repo `PYTHONPATH=.:../profiler` when touching SSOT/contracts, `verify_m1.py`, `verify_m2.py`, `check_no_magic_numbers.py`), wheel smoke test, LF check, and any unexecuted live-hardware scope.
