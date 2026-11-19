@@ -59,11 +59,18 @@ flowchart LR
 
 ---
 
-### 1.3 上游三仓源码真源核对与跨仓 SSOT 契约纪律
+### 1.3 全栈上游源码真源路由与跨仓 SSOT 契约纪律
 
-1. **三仓最新源码真源核对（防“对着旧源码把正确逻辑改错”）**：
-   - 昇腾推理算子图与融合边界分布在 **`vllm-ascend`**、**`cann/ops-transformer`** 与 **`cannbot-dsl`** 三个高频演进仓中。凡涉及算子图对齐、融合 pass（如 `mla_prolog` 连续/跨步缓存选择、混合 Prefill+Decode `qk_l2norm` 折叠、量化路由融合）或内核 ABI 约束（如历史 `cannbot_mixed_quant_sparse_flash_mla` 与 CANN 9.2.1 官方 `aclnnMixedQuantSparseFlashMla` 的维度支持边界），动工前**必须先同步并记录对应上游仓最新 `HEAD` revision**。
-   - **冲突裁决铁律**：当历史 Issue 描述、旧文档假设（例如上游早已默认下库的特性开关）与最新上游源码或真机 `msprof` 抓包冲突时，**一律以最新真实源码 + 实测抓包为唯一真源**，并在 PR Evidence 中写明上游演进差异，严禁盲从过时描述强改。
+1. **全栈上游源码真源路由与最新 `HEAD` 核对（防“找错仓”或“对着旧源码把正确逻辑改错”）**：
+   - 昇腾模型图、算子 Tiling 与内核实现分布在多层上游仓库中；若某个算子不在 `vllm-ascend` 或 `ops-transformer`，**必须按职责边界挂载并核对对应的真实上游代码仓（并先 `git fetch` 同步最新 `HEAD` revision）**，严禁靠猜测补写或对着旧快照修改：
+
+     | 上游层级 | 代表代码仓 | 典型归属范围（找不到算子时按此表挂载） |
+     | :--- | :--- | :--- |
+     | **推理框架与模型配方层** | `vllm-ascend`（含上游 `vllm`）、`cann-recipes-infer`、`MindIE-SD`、`xllm` | 模型前向拼装、特性默认开关（如 DBO 下库状态）、`cann-recipes-infer` 模型级参考融合配方、`MindIE-SD` 投机/多模态/扩散加速路径 |
+     | **CANN 官方算子库层** | `cann/ops-transformer`、`cann/ops-nn`、`torch-npu` | `ops-transformer`（MLA Prolog、MQSMLA、MC2、MoE Routing/GMM Tiling 与核函数）；`ops-nn`（RMSNorm、LayerNorm、动态量化、SwiGLU、基础 Matmul）；`torch-npu`（PTA `OpApi` 绑定与派发） |
+     | **专项注意力与 DSL 内核仓** | `fla-npu`、`flash-attn-npu`、`cannbot-dsl`、`xllm-ops` | `fla-npu`（KDA / GDN 分块与递归线性注意力内核）；`flash-attn-npu`（FlashAttention / 稀疏与混合窗口注意力内核）；`cannbot-dsl` / `xllm-ops`（DSL / Triton / AscendC 定制融合内核） |
+
+   - **冲突裁决铁律**：动工前必须记录实际核对的 `{repository, revision}`；当历史 Issue 描述、旧文档假设与最新上游源码或真机 `msprof` 抓包冲突时，**一律以最新真实源码 + 实测抓包为唯一真源**，并在 PR Evidence 中写明上游演进差异（例如默认开关下库、新旧内核维度约束差异），严禁盲从过时描述把正确实现改错。
 2. **`mindie-sim <-> mindie-profiler` 跨仓 SSOT 单源契约**：
    - `mindie_sim.observed_contracts`、`mindie_sim.subgraph_math` 与 `mindie_sim.structure*` 是 `mindie-profiler` 的单一事实源（例如 `structure.py` 中 `execution.resource_geometry` 仅保留拓扑结构键而不混入可变硬件峰值速率，确保 `compare_cohorts` 跨标定态的 `graph_id` 稳定；`structure_physical.py` 在 `fusion_phases` 列表内递归剥离 `ep_rank`）。修改上述模块或算子 `source_boundary` 时，必须挂载同级 `../profiler` 联合运行跨仓测试套件。
 
@@ -745,7 +752,7 @@ You are contributing incremental Ascend hardware calibration (`A2` / `A3` / `A5`
 
 2. **Zero `model_id` Binding, Zero LUTs, Zero Residual Multipliers, Zero Host/IP Leakage**:
    - NEVER branch on `model_id` / model names in `implementation_selection`, fusion passes, or `PhysicalRecipe`s (`model_scopes` may distinguish `target` vs `draft` subgraphs only); trigger mechanisms strictly from layer structure, cache contiguity, quantization dtypes, and hardware `Geometry`.
-   - Before aligning operator graphs or kernel ABIs, verify the latest `HEAD` revisions of `vllm-ascend`, `cann/ops-transformer`, and `cannbot-dsl`; when an issue assumption conflicts with fresh upstream code or real captures, follow real upstream code + captures and document the delta.
+   - Before aligning operator graphs or kernel ABIs, mount and sync the latest `HEAD` revision of the owning upstream repository across the full Ascend stack (`vllm-ascend`, `cann-recipes-infer`, `MindIE-SD`, `cann/ops-transformer`, `cann/ops-nn`, `fla-npu`, `flash-attn-npu`, `cannbot-dsl`, `xllm` / `xllm-ops`, `torch-npu`); when an issue assumption conflicts with fresh upstream code or real captures, follow real upstream code + captures and document the delta.
    - NEVER hardcode per-shape/per-model latency lookup tables, Zipf penalty multipliers, or whole-step/whole-body residual multipliers (`0.8x`, `0.52x`, etc.).
    - NEVER commit local host home paths (`$HOME/...`, macOS/Linux user directories), internal lab IPs, or container-image SHA routing (`docker.io/`, `swr.cn-`, `@sha256:`). Use `{repository, revision, relative_path, source_sha256}` for source provenance and `capture://<capture-id>/<member>` for benchmark/profiler captures.
 
@@ -834,5 +841,5 @@ With either field non-empty, `resolve_stack_track(...)` raises `model_not_suppor
 2. **PR 设计原则门禁（`--profile device-tool`）**：所有 PR 须填写 [`.github/pull_request_template.md`](.github/pull_request_template.md) 并通过 `python3 .github/scripts/check_pr_checklist.py --profile device-tool`，逐项给出实证记录（纯文档变更可填写 `not-applicable: docs-only`）：
    - `DEV-ZERO-CTX`：仿真、合成与目录解析路径绝不加载权重、动态导入 `torch_npu` 或初始化 NPU 上下文（`0 MiB` HBM 增量）。
    - `DEV-READONLY-PATH`：分析与预测 CLI/API 不篡改输入产物、不泄漏宿主机 `$HOME`/内网 IP/镜像 SHA，并在捕获 `OSError` 前显式重抛 `TimeoutError`。
-   - `DEV-TOPOLOGY`：严格维护每 Die 唯一共享 `L2`（`buffer_units.l2 == 1`）、A2/A3 双 Die/A5（`DT` + `PR_9579/958b`）互联拓扑与阶段工作量守恒（禁用 `ResourceEnvelope`、未建模结构抛 `UnmodeledCapabilityError`）；零 `model_id` 算子硬编码，对齐 `vllm-ascend` / `ops-transformer` / `cannbot-dsl` 最新源码真源并保持 `mindie-profiler` SSOT 契约兼容。
+   - `DEV-TOPOLOGY`：严格维护每 Die 唯一共享 `L2`（`buffer_units.l2 == 1`）、A2/A3 双 Die/A5（`DT` + `PR_9579/958b`）互联拓扑与阶段工作量守恒（禁用 `ResourceEnvelope`、未建模结构抛 `UnmodeledCapabilityError`）；零 `model_id` 算子硬编码，对齐所属全栈上游仓（`vllm-ascend` / `cann-recipes-infer` / `MindIE-SD` / `ops-transformer` / `ops-nn` / `fla-npu` / `flash-attn-npu` / `cannbot-dsl` 等）最新源码真源并保持 `mindie-profiler` SSOT 契约兼容。
    - `DEV-BOUNDED-MEM`：流式读取大抓包（`<= 512 MiB` 内存峰值）、核心模块 `< 800` 行且带四段式契约头、通过 `check_no_magic_numbers.py`（禁假常量）、多 SKU 全目录测试按 `parametrize` 分片并留足共享双核 4-worker xdist 墙钟裕度，全仓使用 Unix `LF`。

@@ -53,7 +53,7 @@
 `Ascend950DT`（`4.0 TB/s`）与 `Ascend950PR_958b`（`1.4 TB/s`）已合入五域硅实测基线与 CANN 9.2.1 生产算子图成对标定（覆盖 C8 SFA 稀疏 gather、`aclnnMixedQuantSparseFlashMla`、`KeyPool` RowShard、`arch35` QLI V2、`CausalConv1d UPDATE`、L2 容量推导 `MXFP4/MXFP8` GMM、`npu_swiglu_mx_quant`、窄 `N` Split-K BF16 Router、`aclnnMoeGatingTopK` 与单调 NZ Block-32 Prologue，100% 按结构与张量属性泛化，零 `model_id` 绑定）。后续外部贡献与增量精化的重点包括：
 1. `Ascend950PR_9579`（`1.6 TB/s` HBM 及 PCIe 16P 桥接机型）多机通信与端到端实测验证；
 2. 跨 `128 MiB` L2 边界的超大 Batch / 超长上下文多流并发工作集扫描，持续核验 `l2_effective_fraction` 与 L2 源 `mte2_aic_l2` / `mte2_aiv_l2` 供给；
-3. 上游 `vllm-ascend`、`cann/ops-transformer`、`cannbot-dsl` 新合入算子（如新型融合线性注意力与自定义稀疏 Attention Tiers 1–3）的最新 `HEAD` 源码对齐与双硅基成对复核。
+3. 全栈上游代码仓（`vllm-ascend`、`cann-recipes-infer`、`MindIE-SD`、`cann/ops-transformer`、`cann/ops-nn`、`fla-npu`、`flash-attn-npu`、`cannbot-dsl` 等）新合入算子与融合配方的最新 `HEAD` 源码对齐及双硅基成对复核。
 
 以下为 `Ascend950DT_9582` 的标准校准字段参考模板：
 
