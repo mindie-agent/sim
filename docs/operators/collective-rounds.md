@@ -85,19 +85,9 @@ transport recipe.
 
 ## Source absorption
 
-The previous topology module is retained at revision
-`d141b68616015aff8bbac59e0073417b65b5ebd5`:
-
-- `mindie_sim/a3_comm_topology.py`, SHA-256
-  `940a69d452e94f7c88217e20e69b5467365f2e40f635f1cc586c20187e652e36`.
-- `mindie_sim/a3_transfer_mechanism.py`, SHA-256
-  `d89ed9ac0422fb6aea7a5669c629ba894b2d5008b63516ead19a3f488c364f08`.
-
-Its useful/wire distinction, placement and dependent-transfer concerns now have
-separate generic mechanisms. This round schedule extends the earlier
-message-level absorption documented in `historical-communication.md`; it does
-not import empirical timing multipliers or claim all old protocol state is
-represented.
+Useful-versus-wire framing, rank placement, and dependent round scheduling live
+in `mindie_sim/prediction/topology.py` and
+`mindie_sim/prediction/collectives.py` without empirical timing multipliers.
 
 The receive-forward dependency was checked against official NVIDIA NCCL source
 at fixed tag `v2.26.6-1`, not an asserted latest release:

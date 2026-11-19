@@ -71,7 +71,8 @@ the recipe consumes the resulting physical frames without rounding them again.
 An explicit recipe granule must agree with the link payload granule. Unframed
 paths use the recipe granule, or one byte when it is omitted. Paths are
 independent; collective round and multi-hop forwarding dependencies are not
-inferred. See `operators/historical-communication.md`.
+inferred. See `docs/operators/collective-rounds.md` and
+`docs/archive/operators/historical-communication.md`.
 
 `TiledMatmul.reuse_inputs/reuse_weights` describes ideal shared-cache HBM reuse.
 It does not eliminate the operand copies required by each tile's private
