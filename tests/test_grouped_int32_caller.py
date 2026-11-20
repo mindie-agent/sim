@@ -91,7 +91,7 @@ def test_exclusive_chain_keeps_extra_consumer_visible_instead_of_erasing_it():
 
 
 def test_consumer_owner_work_is_conserved_and_obeys_input_and_bandwidth():
-    from test_gdn_decode_family import execute_one
+    from _support.linear_cases import execute_one
     raw, ops = graph(3)
     consumer = replace(next(o for o in ops if o.recipe == RECIPE),deps=())
     case = parse_case(raw)

@@ -91,11 +91,11 @@ def load_manifest(tests: Path) -> dict:
     if data.get("schema_version") != 1:
         raise ManifestError(f"{path}: schema_version must be 1, got {data.get('schema_version')!r}")
     max_lines = _pos_int(data.get("max_lines", 600), "max_lines")
-    max_modules = _pos_int(data.get("max_modules", 80), "max_modules")
+    max_modules = _pos_int(data.get("max_modules", 96), "max_modules")
     if max_lines >= HARD_MAX_LINES:
         raise ManifestError(f"max_lines ({max_lines}) must be < {HARD_MAX_LINES}")
-    if max_modules > 80:
-        raise ManifestError(f"max_modules ({max_modules}) must be <= 80")
+    if max_modules > 96:
+        raise ManifestError(f"max_modules ({max_modules}) must be <= 96")
     modules = {}
     for entry in data.get("module", []):
         if not isinstance(entry, dict):

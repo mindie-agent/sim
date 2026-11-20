@@ -1,0 +1,606 @@
+"""Executable Tier K2 CATLASS schedules.
+
+[Role] Lower tiled matrix, split-K, epilogue and SIMT specializations.
+[Invariants] K slices partition the product. GM, on-chip and engine work
+  retain distinct boundaries and actual tile tails.
+[Timeouts & Locks] Finite declared tile/ring schedules. No I/O or locks.
+[Side-Effect Policy] Uses the shared CPU runtime and optional admission view.
+"""
+from __future__ import annotations
+
+from collections import defaultdict
+from dataclasses import dataclass, replace
+from math import prod
+
+from mindie_sim.prediction.program.stages import Stage
+from mindie_sim.prediction.runtime.memory_physics import AddressRun
+from mindie_sim.prediction.runtime.ring_buffer import RingBuffer, lower_generation
+from mindie_sim.prediction.runtime.tile_solver import (
+    DEFAULT_INST_BLOCK_DIM, LiveBufferSpec, TileCandidate, TileShape,
+)
+from mindie_sim.schema.common import ModelingError
+
+from .catlass_catalog import (
+    MX_SCALE_GROUP, STREAMK_PARTIAL_SLOTS_PER_CORE, _workspace_bytes, dtype_name, grouped_start_cores,
+    matrix_problem, mx_scale_bytes, packed_bytes, should_elide_l1_reload,
+    streamk_partition, swizzle_block_coord, validate_catlass_spec,
+)
+from .contracts import SemanticWorkItem, ceil_div, evg_order
+from .fuse_region import Lowering, solve_template_tile
+
+_NOMINAL_BUFFER_ALIGNMENT = 32
+A8W4_PROLOGUE_SUBBLOCK_ALIGNMENT = 32
+A8W4_PROLOGUE_UB_SLOT_BYTES = 2 * 32 * 1024
+_SFU_NODES = {"exp": 1, "sqrt": 1, "rsqrt_fast": 1, "silu": 1}
+_ALU_NODES = {"relu": 1, "leaky_relu": 2, "silu": 2, "cast": 1, "mul": 1, "muls": 1, "add": 1}
+
+
+def _paired_aiv(spec, datapath, owner):
+    candidates = tuple(aiv for aiv in dict(datapath.aic_aiv_pairs).get(owner, ()) if aiv < spec.aiv_budget)
+    if not candidates:
+        raise ModelingError(f"catlass_epilogue_owner_unpaired:{owner}")
+    return candidates[0]
+
+
+def _is_simt_matrix(spec):
+    return spec.simt_thread_block_dim is not None and spec.dispatch_policy != "GroupedMxMatmulFinalizeRoutingTla"
+
+
+def _scale(spec, elements, *, l1=False):
+    if not spec.mx_scale_group:
+        return 0
+    if l1:
+        return mx_scale_bytes(1, elements, spec.l1_scale_factor_k)
+    return ceil_div(elements, MX_SCALE_GROUP)
+
+
+def _compute_b(spec):
+    return dtype_name(spec.dtype_a) if spec.prologue_b == "DecompressFp4ToFp8" else dtype_name(spec.dtype_b)
+
+
+def _cube_dtype(spec):
+    return dtype_name(spec.dtype_a)
+
+
+def _visitor_buffers(spec, tm, tn):
+    nodes = evg_order(spec.evg_tree)
+    alias = {node.node_id: "accumulator" if node.kind == "acc_load" else node.node_id for node in nodes}
+    ends = defaultdict(int)
+    for index, node in enumerate(nodes, 1):
+        for source in node.inputs:
+            ends[alias[source]] = max(ends[alias[source]], index + 1)
+    final = len(nodes) + 1
+    elements = tm * tn
+    buffers = [LiveBufferSpec(
+        "visitor:accumulator", "ub", packed_bytes(elements, spec.dtype_acc), 0,
+        ends.get("accumulator", final), owner_kind="aiv", slots=2,
+        alignment_bytes=_NOMINAL_BUFFER_ALIGNMENT,
+    )]
+    for index, node in enumerate(nodes, 1):
+        if node.kind in {"acc_load", "aux_store"}:
+            continue
+        count = tn if node.kind == "row_broadcast" else tm if node.kind == "col_broadcast" else elements
+        buffers.append(LiveBufferSpec(
+            f"visitor:{node.node_id}", "ub", packed_bytes(count, node.dtype), index,
+            ends.get(node.node_id, final), owner_kind="aiv", slots=2,
+            alignment_bytes=_NOMINAL_BUFFER_ALIGNMENT,
+        ))
+    return tuple(buffers)
+
+
+def solve_catlass_tile(spec, problem, datapath, *, memory_view=None, die=0):
+    p = matrix_problem(problem)
+    validate_catlass_spec(spec, p, datapath)
+    tm, tn, tk = spec.l1_tile_shape
+    lm, ln, lk = spec.l0_tile_shape
+    g_m = sum(ceil_div(rows, tm) for rows in p.groups) if p.groups else ceil_div(p.m, tm)
+    g_n = ceil_div(p.n, tn)
+    simt = _is_simt_matrix(spec)
+    slots = spec.stages
+    sizes = (
+        ("l1a", "l1", tm * tk, spec.dtype_a, slots[0]),
+        ("l1b", "l1", tn * tk, _compute_b(spec), slots[1]),
+        ("l0a", "l0a", lm * lk, spec.dtype_a, slots[2]),
+        ("l0b", "l0b", ln * lk, _compute_b(spec), slots[-2]),
+        ("l0c", "l0c", lm * ln, spec.dtype_acc, slots[-1]),
+    )
+    buffers = tuple(
+        LiveBufferSpec(name, pool, packed_bytes(elements, dtype), 0, 1, owner_kind="aic", slots=depth,
+                       scale_bytes=_scale(spec, elements, l1=pool == "l1") if pool != "l0c" else 0)
+        for name, pool, elements, dtype, depth in sizes
+    ) if not simt else ()
+    total_elements = tm * tn
+    if spec.has_bias and not simt:
+        buffers += (LiveBufferSpec("bias", "l1", packed_bytes(tn, spec.dtype_acc), 0, 1, owner_kind="aic"),)
+    if spec.evg_tree:
+        buffers += _visitor_buffers(spec, tm, tn)
+    if spec.prologue_b == "DecompressFp4ToFp8":
+        buffers += (LiveBufferSpec(
+            "packed_and_decompressed_b", "ub", A8W4_PROLOGUE_UB_SLOT_BYTES, 0, 1,
+            owner_kind="aiv", slots=slots[1],
+        ),)
+        for aic in range(min(spec.aic_budget, g_m * g_n)):
+            lanes = tuple(v for v in dict(datapath.aic_aiv_pairs).get(aic, ()) if v < spec.aiv_budget)
+            if len(lanes) != 2:
+                raise ModelingError(f"catlass_a8w4_requires_two_subblocks:{aic}")
+            for lane in lanes:
+                datapath.route("ub", "l1", _compute_b(spec), (lane, aic))
+    if spec.epilogue_kind == "grouped_swiglu_mx_quant":
+        peak = 2 * packed_bytes(total_elements, spec.dtype_acc) + packed_bytes(total_elements, spec.dtype_c)
+        buffers += (LiveBufferSpec("gate_up", "ub", peak, 0, 1, owner_kind="aiv", slots=2),)
+    if simt:
+        threads = prod(spec.simt_thread_block_dim)
+        ub_bytes = packed_bytes(threads, spec.dtype_acc)
+        buffers += (LiveBufferSpec("simt_accumulator", "ub", ub_bytes, 0, 1, owner_kind="aiv"),)
+    if spec.epilogue_kind in {"evg_ub", "grouped_swiglu_mx_quant"}:
+        owners = min(spec.aic_budget, g_m * (g_n // 2 if spec.epilogue_kind == "grouped_swiglu_mx_quant" else g_n))
+        for aic in range(owners):
+            datapath.route("l0c", "ub", dtype_name(spec.dtype_acc),
+                           (aic, _paired_aiv(spec, datapath, aic)), (tm, tn))
+    candidate = TileCandidate(
+        "resident_1pass", TileShape(lm, ln, lk), max(slots), (spec.aic_budget, spec.aiv_budget),
+        g_m * g_n * spec.splitk_factor, ceil_div(g_m * g_n, spec.aic_budget),
+        buffers, logical_flops=2 * p.m * p.n * p.k, uses_simt=spec.simt_thread_block_dim is not None,
+        native_mode=_cube_dtype(spec), owner_axis="aiv" if simt else "aic",
+    )
+    return solve_template_tile(datapath, spec.template_id, candidate, state=memory_view, die=die)
+
+
+@dataclass(frozen=True, slots=True)
+class _ProductTile:
+    group: int
+    row: int
+    group_row: int
+    col: int
+    m: int
+    n: int
+    owner: int
+    group_rows: int
+
+
+class _MatrixLowerer:
+    def __init__(self, plan, spec, problem):
+        self.plan = plan
+        self.spec = spec
+        self.p = problem
+        self.tm, self.tn, self.tk = spec.l1_tile_shape
+        self.micro_k = spec.l0_tile_shape[-1]
+        self.gk = ceil_div(problem.k, self.tk)
+        self.resident = {}
+        self.l1_generations = defaultdict(int)
+        self._tile_index = 0
+
+    def tile(self, index, *, group=0, group_start=0, rows=None, start_core=0, n_cols=None):
+        rows = self.p.m if rows is None else rows
+        n_cols = self.p.n if n_cols is None else n_cols
+        mi, ni = swizzle_block_coord(
+            index, ceil_div(rows, self.tm), ceil_div(n_cols, self.tn),
+            self.spec.swizzle_direction, self.spec.swizzle_offset,
+        )
+        row, col = mi * self.tm, ni * self.tn
+        return _ProductTile(group, group_start + row, row, col,
+                            min(self.tm, rows - row), min(self.tn, n_cols - col),
+                            (index + start_core) % self.spec.aic_budget, rows)
+
+    def _rect(self, tensor, dtype, row, col, rows, cols, full_row, **kwargs):
+        layout = self.spec.layout_a if tensor == self.p.a_id else self.spec.layout_b
+        if layout == "ColumnMajor":
+            row, col, rows, cols = col, row, cols, rows
+            full_row = self.p.m if tensor == self.p.a_id else self.p.k
+        elif layout != "RowMajor":
+            raise ModelingError(f"catlass_address_layout_unsupported:{layout}")
+        # Each packed row starts at its own independently aligned bit offset.
+        stride = packed_bytes(full_row, dtype)
+        width = packed_bytes(col + cols, dtype) - packed_bytes(col, dtype)
+        if width != packed_bytes(cols, dtype):
+            raise ModelingError("catlass_packed_tile_unaligned")
+        run = AddressRun(row * stride + packed_bytes(col, dtype), rows, width, stride, layout)
+        return self.plan.access(kwargs.pop("name"), kwargs.pop("allocation", tensor), width * rows, runs=(run,), **kwargs)
+
+    def _fill(self, name, tile, k_start, k_len, operand, after, ring, generation):
+        p, s, core = self.p, self.spec, tile.owner
+        a = operand == "a"
+        tensor, dtype, row, col, rows, cols, width = (
+            (p.a_id, s.dtype_a, tile.row, k_start, tile.m, k_len, p.k) if a else
+            (p.b_id, s.dtype_b, k_start, tile.col, k_len, tile.n, p.n)
+        )
+        allocation = tensor if a or not p.groups else f"{tensor}:expert:{tile.group}"
+        cache_bypass = not a and (s.l2_cache_hint_b == "disable" or (
+            s.scheduler == "grouped_slice_m" and ceil_div(tile.group_rows, self.tm) == 1
+        ))
+        location = (allocation, row, col, rows, cols)
+        lane = (core, operand)
+        slot = self.l1_generations[lane] % ring.depth
+        self.l1_generations[lane] += 1
+        previous = self.resident.get((*lane, slot))
+        credit = _ring_credit(ring, generation)
+        deps = (*after, credit)
+        elide = previous is not None and should_elide_l1_reload(
+            previous[0], previous[1:], location[0], location[1:], s.enable_l1_resident,
+        )
+        if elide:
+            return deps
+        self.resident[*lane, slot] = location
+        if not a and s.prologue_b == "DecompressFp4ToFp8":
+            deps = self._expand_b(name, tile, row, rows, allocation, deps, cache_bypass)
+        else:
+            read = self._rect(
+                tensor, dtype, row, col, rows, cols, width, name=f"{name}:gm_{operand}",
+                allocation=allocation, owner=core, pipe="mte2_aic", after=deps, bypass=cache_bypass,
+            )
+            deps = (read,)
+        if s.mx_scale_group:
+            per_row = ceil_div(width, MX_SCALE_GROUP) if a else ceil_div(p.k, MX_SCALE_GROUP)
+            scale_rows, scale_cols = (rows, ceil_div(cols, MX_SCALE_GROUP)) if a else (cols, ceil_div(rows, MX_SCALE_GROUP))
+            scale_offset = row * per_row + col // MX_SCALE_GROUP if a else col * per_row + row // MX_SCALE_GROUP
+            scale = self.plan.access(
+                f"{name}:scale_{operand}", allocation + ":scale", scale_rows * scale_cols,
+                runs=(AddressRun(scale_offset, scale_rows, scale_cols, per_row),), owner=core,
+                pipe="mte2_aic", after=deps, bypass=cache_bypass,
+            )
+            deps = (scale,)
+        return deps
+
+    def _expand_b(self, name, tile, row, rows, allocation, after, bypass):
+        plan, spec = self.plan, self.spec
+        granule = A8W4_PROLOGUE_SUBBLOCK_ALIGNMENT
+        first = min(rows, ceil_div(rows // 2, granule) * granule) if row + rows == self.p.k else rows // 2
+        lanes = tuple(v for v in dict(plan.datapath.aic_aiv_pairs).get(tile.owner, ()) if v < spec.aiv_budget)
+        outputs = []
+        for lane, offset, count in zip(lanes, (0, first), (first, rows - first)):
+            if count <= 0:
+                continue
+            tag = f"{name}:b:{lane}"
+            source = self._rect(
+                self.p.b_id, spec.dtype_b, row + offset, tile.col, count, tile.n, self.p.n,
+                name=tag + ":gm", allocation=allocation, owner=lane, pipe="mte2_aiv", after=after, bypass=bypass,
+            )
+            convert = plan.work(tag + ":decompress_b", "vec_alu", count * tile.n,
+                                owner=lane, after=(source,), metadata={"prologue": spec.prologue_b})
+            outputs.append(plan.work(tag + ":ub_to_l1", "mte3", packed_bytes(count * tile.n, _compute_b(spec)),
+                                     owner=lane, after=(convert,)))
+        return tuple(outputs)
+
+    def product(self, tile, panels, after):
+        p, s, plan = self.p, self.spec, self.plan
+        name = f"tile:{self._tile_index}"
+        self._tile_index += 1
+        core = tile.owner
+        l1m, l1n, l1k = s.l1_tile_shape
+        l0m, l0n, l0k = s.l0_tile_shape
+        rings = tuple(
+            RingBuffer(
+                die=plan.die, owner=core, pool=pool, allocation=f"{name}:{tag}", depth=depth,
+                slot_bytes=packed_bytes(elements, dtype)
+                + (_scale(s, elements, l1=pool == "l1") if pool != "l0c" else 0)
+                if plan.context is not None else 0,
+            )
+            for (tag, pool, elements, dtype), depth in zip((
+                ("l1a", "l1", l1m * l1k, s.dtype_a), ("l1b", "l1", l1n * l1k, _compute_b(s)),
+                ("l0a", "l0a", l0m * l0k, s.dtype_a), ("l0b", "l0b", l0n * l0k, _compute_b(s)),
+                ("l0c", "l0c", l0m * l0n, s.dtype_acc),
+            ), s.stages)
+        )
+        l1a, l1b, l0a, l0b, accum = rings
+        acc_credit = _ring_credit(accum, 0)
+        previous = (*after, acc_credit)
+        if s.has_bias:
+            previous = (plan.access(
+                f"{name}:bias", p.c_id + ":bias", packed_bytes(tile.n, s.dtype_acc),
+                owner=core, pipe="mte2_aic", offset=packed_bytes(tile.col, s.dtype_acc), after=previous,
+            ),)
+        g = 0
+        for outer, panel in enumerate(panels):
+            k_start = panel * self.tk
+            k_len = min(self.tk, p.k - k_start)
+            last_load = f"{name}:micro:{g + ceil_div(k_len, self.micro_k) - 1}:loaded"
+            r1 = []
+            for operand, ring in (("a", l1a), ("b", l1b)):
+                deps = self._fill(f"{name}:k{panel}", tile, k_start, k_len, operand, after, ring, outer)
+                r1.append(lower_generation(
+                    ring, outer, "mte2", ("mte1",), producer_extra_after=deps,
+                    consumer_extra_after={"mte1": (last_load,)},
+                ).publish)
+            for start in range(0, k_len, self.micro_k):
+                micro = min(k_len - start, self.micro_k)
+                mma = f"{name}:micro:{g}:mma"
+                r0 = []
+                for rows, dtype, ring, prior in (
+                    (tile.m, s.dtype_a, l0a, r1[0]), (tile.n, _compute_b(s), l0b, r1[1]),
+                ):
+                    moved = packed_bytes(rows * micro, dtype) + _scale(s, rows * micro)
+                    load = plan.work(f"{ring.allocation}:g{g}:load", "mte1", moved, owner=core,
+                                     after=(prior, _ring_credit(ring, g)))
+                    r0.append(lower_generation(
+                        ring, g, "mte1", ("mma",), producer_extra_after=(load,),
+                        consumer_extra_after={"mma": (mma,)},
+                    ).publish)
+                loaded = plan.add(Stage(f"{name}:micro:{g}:loaded", after=tuple(r0)))
+                issued = _issued_ops(tile.m, tile.n, micro, s, plan.datapath)
+                previous = (plan.work(mma, "cube", issued, after=(*previous, loaded), owner=core,
+                                      dtype=_cube_dtype(s), metadata={"logical_flops": 2 * tile.m * tile.n * micro}),)
+                g += 1
+        event = lower_generation(
+            accum, 0, "mma", ("fixpipe",), producer_extra_after=previous,
+            consumer_extra_after={"fixpipe": (f"{name}:accumulator_consumed",)},
+        )
+        for ring in rings:
+            plan.add_ring(ring, after=after)
+        return name, event.publish
+
+    def _consume(self, name, dependency):
+        return self.plan.add(Stage(f"{name}:accumulator_consumed", after=(dependency,)))
+
+    def _write_output(self, name, tile, after, *, pipe="fixpipe", owner=None, width=None):
+        dtype = self.spec.dtype_c
+        full_n = self.p.n if width is None else width
+        if self.spec.layout_c == "RowMajor":
+            stride = packed_bytes(full_n, dtype)
+            row_bytes = packed_bytes(tile.n, dtype)
+            runs = (AddressRun(tile.row * stride + packed_bytes(tile.col, dtype), tile.m, row_bytes, stride),)
+            amount = row_bytes * tile.m
+        elif self.spec.layout_c == "ColumnMajor":
+            stride = packed_bytes(self.p.m, dtype)
+            col_bytes = packed_bytes(tile.m, dtype)
+            runs = (AddressRun(tile.col * stride + packed_bytes(tile.row, dtype), tile.n, col_bytes, stride),)
+            amount = col_bytes * tile.n
+        else:
+            raise ModelingError(f"catlass_address_layout_unsupported:{self.spec.layout_c}")
+        return self.plan.access(name, self.p.c_id, amount, runs=runs, direction="write",
+                                pipe=pipe, owner=tile.owner if owner is None else owner, after=after)
+
+    def _aiv(self, tile, direct=False):
+        return _paired_aiv(self.spec, self.plan.datapath, tile.owner) if direct else tile.owner % self.spec.aiv_budget
+
+    def finish(self, tile, name, ready):
+        s, p, plan = self.spec, self.p, self.plan
+        epilogue = s.epilogue_kind
+        if epilogue == "none":
+            out = self._write_output(name + ":fixpipe", tile, (ready,))
+            self._consume(name, out)
+            return out
+        if epilogue == "finalize_routing":
+            aiv = self._aiv(tile)
+            amount = packed_bytes(tile.m * tile.n, s.dtype_c)
+            tensor = p.c_id + ":routing"
+            write = plan.access(name + ":routing_write", tensor, amount, private=True, direction="write",
+                                pipe="fixpipe", owner=tile.owner, after=(ready,), working_set=s.workspace_bytes,
+                                offset=tile.owner * packed_bytes(self.tm * self.tn, s.dtype_c))
+            self._consume(name, write)
+            read = plan.access(name + ":routing_read", tensor, amount, private=True, owner=aiv, after=(write,),
+                               working_set=s.workspace_bytes,
+                               offset=tile.owner * packed_bytes(self.tm * self.tn, s.dtype_c))
+            route = plan.work(name + ":finalize_routing", "aiv_simt", tile.m * tile.n, owner=aiv, after=(read,))
+            return self._write_output(name + ":output", tile, (route,), pipe="mte3", owner=aiv)
+        aiv = self._aiv(tile, epilogue == "evg_ub")
+        size = packed_bytes(tile.m * tile.n, s.dtype_acc)
+        if epilogue == "evg_ub":
+            transfer = plan.work(name + ":fixpipe_ub", "fixpipe", size, owner=tile.owner, after=(ready,),
+                                 metadata={"saved_logical_bytes": 2 * size})
+            self._consume(name, transfer)
+        else:
+            tensor = p.c_id + ":evg"
+            stride = packed_bytes(p.n, s.dtype_acc)
+            run = AddressRun(tile.row * stride + packed_bytes(tile.col, s.dtype_acc), tile.m,
+                             packed_bytes(tile.n, s.dtype_acc), stride)
+            write = plan.access(name + ":fixpipe_gm", tensor, size, direction="write", pipe="fixpipe",
+                                owner=tile.owner, after=(ready,), private=True, runs=(run,), working_set=s.workspace_bytes)
+            self._consume(name, write)
+            transfer = plan.access(name + ":evg_reload", tensor, size, after=(write,), owner=aiv,
+                                   private=True, runs=(run,), working_set=s.workspace_bytes)
+        events = {}
+        for node in evg_order(s.evg_tree):
+            node_name = f"{name}:evg:{node.node_id}"
+            after = tuple(events[parent] for parent in node.inputs) or (transfer,)
+            elements = tile.m * tile.n
+            if node.kind in {"aux_load", "row_broadcast", "col_broadcast"}:
+                elems = tile.n if node.kind == "row_broadcast" else tile.m if node.kind == "col_broadcast" else elements
+                self_input = node.kind == "aux_load"
+                full = packed_bytes(p.n, node.dtype)
+                offset = packed_bytes(tile.col if node.kind == "row_broadcast" else tile.row, node.dtype)
+                runs = (AddressRun(tile.row * full + packed_bytes(tile.col, node.dtype), tile.m,
+                                   packed_bytes(tile.n, node.dtype), full),) if self_input else None
+                dep = plan.access(node_name, node.aux_tensor_id, packed_bytes(elems, node.dtype),
+                                  after=after, owner=aiv, offset=offset, runs=runs)
+            elif node.kind == "aux_store":
+                offset = packed_bytes(tile.row * p.n + tile.col, node.dtype)
+                stride = packed_bytes(p.n, node.dtype)
+                runs = (AddressRun(offset, tile.m, packed_bytes(tile.n, node.dtype), stride),)
+                dep = plan.access(node_name, node.aux_tensor_id, packed_bytes(elements, node.dtype),
+                                  after=after, owner=aiv, direction="write", pipe="mte3", runs=runs)
+            elif node.kind == "acc_load":
+                dep = transfer
+            else:
+                dep = plan.work(node_name + ":alu", "vec_alu", elements * _ALU_NODES.get(node.kind, 0),
+                                owner=aiv, after=after)
+                if node.kind in _SFU_NODES:
+                    dep = plan.work(node_name + ":sfu", "vec_sfu", elements * _SFU_NODES[node.kind],
+                                    owner=aiv, after=(dep,))
+            events[node.node_id] = dep
+        terminals = tuple(events.values())
+        if not any(node.kind == "aux_store" and node.aux_tensor_id == p.c_id for node in s.evg_tree):
+            return self._write_output(name + ":output", tile, terminals, pipe="mte3", owner=aiv)
+        return plan.add(Stage(name + ":evg_complete", after=terminals))
+
+    def grouped_fused(self, tile, after):
+        plan, spec = self.plan, self.spec
+        aiv = self._aiv(tile, direct=True)
+        gate, ready = self.product(tile, range(self.gk), after)
+        size = packed_bytes(tile.m * tile.n, spec.dtype_acc)
+        gate_ub = plan.work(gate + ":fixpipe_ub", "fixpipe", size, owner=tile.owner, after=(ready,))
+        self._consume(gate, gate_ub)
+        up, ready = self.product(replace(tile, col=tile.col + self.p.n // 2), range(self.gk), (gate_ub,))
+        up_ub = plan.work(up + ":fixpipe_ub", "fixpipe", size, owner=tile.owner, after=(ready,))
+        self._consume(up, up_ub)
+        elems = tile.m * tile.n
+        silu = plan.work(gate + ":silu", "vec_sfu", elems, owner=aiv, after=(gate_ub, up_ub))
+        quant = plan.work(gate + ":swiglu_mx_quant", "vec_alu", 2 * elems, owner=aiv, after=(silu,),
+                          metadata={"saved_logical_bytes": 2 * (size + size)})
+        store = self._write_output(gate + ":output", tile, (quant,), pipe="mte3", owner=aiv, width=self.p.n // 2)
+        stride = ceil_div(self.p.n // 2, MX_SCALE_GROUP)
+        width = ceil_div(tile.n, MX_SCALE_GROUP)
+        return plan.access(gate + ":scale", self.p.c_id + ":scale", tile.m * width, owner=aiv, after=(store,),
+                           pipe="mte3", direction="write",
+                           runs=(AddressRun(tile.row * stride + tile.col // MX_SCALE_GROUP, tile.m, width, stride),))
+
+    def ordinary(self, tile, after):
+        if self.spec.epilogue_kind == "grouped_swiglu_mx_quant":
+            return self.grouped_fused(tile, after)
+        if _is_simt_matrix(self.spec):
+            return self.simt_product(tile, after)
+        return self.finish(tile, *self.product(tile, range(self.gk), after))
+
+    def simt_product(self, tile, after):
+        plan, p, s = self.plan, self.p, self.spec
+        name = f"simt:{self._tile_index}"
+        self._tile_index += 1
+        owner = tile.owner % s.aiv_budget
+        a = self._rect(p.a_id, s.dtype_a, tile.row, 0, tile.m, p.k, p.k, name=name + ":gather",
+                       pipe="mte2_aiv", owner=owner, after=after)
+        b = self._rect(p.b_id, s.dtype_b, 0, tile.col, p.k, tile.n, p.n, name=name + ":weights",
+                       pipe="mte2_aiv", owner=owner, after=after)
+        simt = plan.work(name + ":simt_mac", "aiv_simt", 2 * tile.m * tile.n * p.k,
+                         owner=owner, after=(a, b), metadata={"thread_block_dim": s.simt_thread_block_dim})
+        return self._write_output(name + ":scatter", tile, (simt,), pipe="mte3", owner=owner)
+
+
+def _ring_credit(ring, index):
+    return ring.initial_credit(ring.slot(index)) if index < ring.depth else ring.last_use(index - ring.depth)
+
+
+def _issued_ops(m, n, k, spec, datapath):
+    native = next((wave for wave in datapath.subtile_wave if wave.native_mode == _cube_dtype(spec)), None)
+    blocks = (native.independently_issuable_m, native.tile_n, native.tile_k) if native else (
+        DEFAULT_INST_BLOCK_DIM, DEFAULT_INST_BLOCK_DIM, DEFAULT_INST_BLOCK_DIM
+    )
+    return 2 * prod(ceil_div(dim, block) * block for dim, block in zip((m, n, k), blocks))
+
+
+def _reduce_partials(lowerer, part_tiles, signal):
+    plan, spec = lowerer.plan, lowerer.spec
+    for block, items in part_tiles.items():
+        tile = items[0][0]
+        owner = block % spec.aiv_budget
+        scratch = lowerer.p.c_id + ":splitk"
+        loads = []
+        for index, (_, _, size, run) in enumerate(items):
+            loads.append(plan.access(
+                f"reduce:{block}:partial:{index}", scratch, size, owner=owner,
+                runs=(run,), after=(signal,), private=True,
+            ))
+        add = plan.work(f"reduce:{block}:add", "vec_reduce", (len(loads) - 1) * tile.m * tile.n,
+                        owner=owner, after=tuple(loads))
+        lowerer._write_output(f"reduce:{block}:output", tile, (add,), pipe="mte3", owner=owner)
+
+
+def _partial(lowerer, parts, block, tile, panels, after, offset, row_stride):
+    plan, spec = lowerer.plan, lowerer.spec
+    name, ready = lowerer.product(tile, panels, after)
+    row_bytes = packed_bytes(tile.n, spec.dtype_acc)
+    run = AddressRun(offset, tile.m, row_bytes, row_stride)
+    if offset + (tile.m - 1) * row_stride + row_bytes > spec.workspace_bytes:
+        raise ModelingError("catlass_partial_exceeds_workspace")
+    size = tile.m * row_bytes
+    partial = plan.access(
+        name + ":partial", lowerer.p.c_id + ":splitk", size, runs=(run,), owner=tile.owner,
+        after=(ready,), direction="write", private=True, pipe="fixpipe",
+    )
+    lowerer._consume(name, partial)
+    parts[block].append((tile, partial, size, run))
+
+
+def _normal_waves(lowerer, start, stop, after):
+    cores = lowerer.spec.aic_budget
+    for first in range(start, stop, cores):
+        after = tuple(lowerer.ordinary(lowerer.tile(i), after) for i in range(first, min(first + cores, stop)))
+    return after
+
+
+def _split_schedule(lowerer, launch, blocks):
+    spec, plan = lowerer.spec, lowerer.plan
+    parts = defaultdict(list)
+    if spec.scheduler == "streamk":
+        partition = streamk_partition(blocks, lowerer.gk, spec.aic_budget)
+        if not partition.b_sk:
+            _normal_waves(lowerer, 0, blocks, (launch,))
+            return
+        final = max(0, partition.b_norm - spec.aic_budget)
+        pre = _normal_waves(lowerer, 0, final, (launch,))
+        stride = packed_bytes(lowerer.tn, spec.dtype_acc)
+        tile_bytes = lowerer.tm * stride
+        for core, (start, end) in enumerate(partition.intervals):
+            after = pre
+            for part in range(partition.partial_counts[core]):
+                block, panel = divmod(start, lowerer.gk)
+                stop = min(end, (block + 1) * lowerer.gk)
+                tile = replace(lowerer.tile(partition.b_norm + block), owner=core)
+                offset = (core * STREAMK_PARTIAL_SLOTS_PER_CORE + part) * tile_bytes
+                _partial(lowerer, parts, block, tile, range(panel, panel + stop - start), after, offset, stride)
+                after = (parts[block][-1][1],)
+                start = stop
+        signal = plan.add(Stage("cross_core_set_flag", after=tuple(row[1] for group in parts.values() for row in group),
+                                metadata={"streamk_partial_count": partition.partial_count}))
+        _normal_waves(lowerer, final, partition.b_norm, (signal,))
+    else:
+        base, rem = divmod(lowerer.gk, spec.splitk_factor)
+        owner_done = {}
+        stride = packed_bytes(lowerer.p.n, spec.dtype_acc)
+        matrix_bytes = lowerer.p.m * stride
+        for block in range(blocks):
+            start = 0
+            for split in range(spec.splitk_factor):
+                owner = (block * spec.splitk_factor + split) % spec.aic_budget
+                stop = start + base + (split < rem)
+                tile = replace(lowerer.tile(block), owner=owner)
+                offset = split * matrix_bytes + tile.row * stride + packed_bytes(tile.col, spec.dtype_acc)
+                _partial(lowerer, parts, block, tile, range(start, stop),
+                         (owner_done.get(owner, launch),), offset, stride)
+                owner_done[owner] = parts[block][-1][1]
+                start = stop
+        signal = plan.add(Stage("cross_core_set_flag", after=tuple(owner_done.values())))
+    _reduce_partials(lowerer, parts, signal)
+
+
+def lower_catlass_spec(
+    spec, problem, datapath, *, context=None, memory_view=None, die=0, live_admission=False, region_id=None,
+):
+    """Lower a concrete specialization and return its executable audit record."""
+    p = matrix_problem(problem)
+    solution = solve_catlass_tile(spec, p, datapath, memory_view=memory_view, die=die)
+    expected = _workspace_bytes(spec.template_id, p, spec.l1_tile_shape, spec.aic_budget,
+                                spec.splitk_factor, spec.dispatch_policy, spec.epilogue_kind)
+    if spec.workspace_bytes != expected:
+        raise ModelingError(f"catlass_workspace_mismatch:{spec.workspace_bytes}:{expected}")
+    plan = Lowering(datapath, context=context, memory_view=memory_view, die=die, live_admission=live_admission)
+    lowerer = _MatrixLowerer(plan, spec, p)
+    launch = plan.launch()
+    blocks = ceil_div(p.m, lowerer.tm) * ceil_div(p.n, lowerer.tn)
+    if spec.scheduler == "grouped_slice_m":
+        n_cols = p.n // 2 if spec.epilogue_kind == "grouped_swiglu_mx_quant" else p.n
+        row_start, owner_done = 0, {}
+        schedules = iter(grouped_start_cores(p.groups, n_cols, lowerer.tm, lowerer.tn, spec.aic_budget))
+        for rows in p.groups:
+            if not rows:
+                continue
+            index, start, loops = next(schedules)
+            for task in range(loops):
+                tile = lowerer.tile(task, group=index, group_start=row_start, rows=rows, start_core=start, n_cols=n_cols)
+                owner_done[tile.owner] = lowerer.ordinary(tile, (owner_done.get(tile.owner, launch),))
+            row_start += rows
+    elif spec.scheduler in {"streamk", "multi_core_splitk"}:
+        _split_schedule(lowerer, launch, blocks)
+    else:
+        _normal_waves(lowerer, 0, blocks, (launch,))
+    rid = region_id or spec.template_id
+    semantic = [SemanticWorkItem(
+        rid + ":matrix", "matrix_mac", _cube_dtype(spec), 2 * p.m * p.n * p.k,
+        ("aiv_simt",) if _is_simt_matrix(spec) else ("cube",), (spec.scheduler,),
+    )]
+    kinds = {"vec_alu": "vector_alu", "vec_sfu": "vector_sfu", "vec_reduce": "vector_reduce",
+             "aiv_simt": "vector_alu"}
+    semantic.extend(
+        SemanticWorkItem(rid + ":" + pipe, kinds[pipe], dtype_name(spec.dtype_acc), int(ops),
+                         ("aiv_simt",) if pipe == "aiv_simt" else ("aiv_simd",), (spec.scheduler,))
+        for pipe, ops in plan.vector.items() if ops and not (pipe == "aiv_simt" and _is_simt_matrix(spec))
+    )
+    return plan.result("K2", rid, (rid,), spec, semantic, solution)
