@@ -102,6 +102,7 @@ class OperatorFamilySpec:
     resolve: FamilyResolver
     rewrite_rules: tuple[Any, ...] = ()
     traffic_rewrite_capable: bool = False
+    delegated_legacy_recipe_ids: frozenset[str] = frozenset()
 
 
 __all__ = [

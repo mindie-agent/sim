@@ -164,6 +164,9 @@ def cohort_operator_costs(case, ops, *, recipes, primitives=None,
     from .evaluation import EvaluationContext, context_for
     ctx = (context_for(case, evaluation, recipes) if evaluation is not None
            else EvaluationContext.create(case, recipes, primitives))
+    if stream_plans:
+        from .streams import validate_stream_plan_ranks
+        stream_plans = validate_stream_plan_ranks(stream_plans, {int(r) for r in ops})
     execution = Execution(
         case, ctx.cost, recipes=recipes,
         bindings=ctx.bindings, ledger=CostLedger(), evaluation=ctx,
@@ -183,7 +186,8 @@ def cohort_operator_costs(case, ops, *, recipes, primitives=None,
             engine.future(f"r{replica}:complete")))
     rank_events = execution._start_joint_collective("isolated", participants)
     engine.advance(horizon=input_ready_ms)
-    early_service = {key: value for key, value in engine.serviced.items() if value}
+    early_service = {key: value for key, value in engine.serviced.items()
+                     if value and "stream_quota@" not in key}
     engine.advance(until=tuple(item.completion for item in participants), first=False)
     rows, attributed = [], {}
     duration = max(item.completion.time for item in participants) - input_ready_ms
@@ -209,7 +213,8 @@ def cohort_operator_costs(case, ops, *, recipes, primitives=None,
             "cohort_replicas": list(ops), "cohort_duration_ms": duration,
             "service_attribution": "physical_source_ranks",
         })
-    actual = {key: value for key, value in engine.serviced.items() if value}
+    actual = {key: value for key, value in engine.serviced.items()
+              if value and "stream_quota@" not in key}
     if any(not math.isclose(attributed.get(key, 0), actual.get(key, 0),
                             rel_tol=1e-12, abs_tol=1e-9)
            for key in attributed.keys() | actual.keys()):
@@ -227,6 +232,9 @@ def _cohort_costs(case, graphs, recipes, primitives, replay_scope, input_ready_m
     """Isolate joint transports once, retaining each replica's local programs."""
     from .dispatch import cohorts
 
+    if stream_plans:
+        from .streams import validate_stream_plan_ranks
+        stream_plans = validate_stream_plan_ranks(stream_plans, {int(r) for r in graphs})
     group_for = {rank: group for group in cohorts(case.runtime.parallel) for rank in group}
     expanded = {rank: tuple(recipes.expand(items)) for rank, items in graphs.items()}
     expanded = bind_cohort_traffic(case, expanded)
@@ -277,10 +285,14 @@ def _cohort_costs(case, graphs, recipes, primitives, replay_scope, input_ready_m
 
     for rank, items in expanded.items():
         local = tuple(op for op in items if (rank, op.op_id) not in joint_nodes)
+        rank_plans = (
+            tuple(p for p in stream_plans if int(p.rank) == int(rank))
+            if stream_plans else None
+        )
         result = operator_costs(
             case, local, recipes=recipes, primitives=primitives,
             replay_scope=scopes[rank], input_ready_ms=input_ready_ms, replica=rank,
-            evaluation=evaluation, stream_plans=stream_plans)
+            evaluation=evaluation, stream_plans=rank_plans or None)
         rows.extend({"replica": rank, **row} for row in result["operators"])
     isolation_modes = {item[-1] for item in isolation}
     return {
@@ -364,15 +376,10 @@ def operator_costs(case, ops, *, recipes=None, primitives=None, replay_scope=Non
     execution = None
     stream_owners_lookup = {}
     if stream_plans:
-        from .streams import bind_stream_owners
-        plans_seq = (
-            tuple(stream_plans.values())
-            if isinstance(stream_plans, Mapping)
-            else tuple(stream_plans)
-        )
+        from .streams import bind_stream_owners, validate_stream_plan_ranks
+        plans_seq = validate_stream_plan_ranks(stream_plans, {int(replica)})
+        stream_plans = plans_seq
         for plan in plans_seq:
-            if int(plan.rank) != int(replica):
-                continue
             for profile in ctx.bindings.stage_profiles:
                 if profile.replica == int(replica):
                     bound = bind_stream_owners(plan, profile.datapath)
@@ -426,14 +433,17 @@ def operator_costs(case, ops, *, recipes=None, primitives=None, replay_scope=Non
         else:
             complete = program.start(engine, "operator", ready)
         engine.advance(horizon=input_ready_ms)
-        early_service = {key: value for key, value in engine.serviced.items() if value}
+        early_service = {key: value for key, value in engine.serviced.items()
+                         if value and "stream_quota@" not in key}
         engine.advance(until=(complete,))
         duration = complete.time - input_ready_ms
+        hw_serviced = {key: value for key, value in engine.serviced.items()
+                       if "stream_quota@" not in key}
         row = {
             **_cost_row(
                 execution, op, recipe, context, identity=identity,
                 count=group["count"], duration=duration,
-                input_ready_ms=input_ready_ms, serviced=engine.serviced,
+                input_ready_ms=input_ready_ms, serviced=hw_serviced,
                 early_service=early_service),
             **({"communication": _communication_description(execution.topology.accounting(
                 op, replica, volume=context.native_work["link"],

@@ -192,6 +192,7 @@ def _dispatch_sdk(args: argparse.Namespace) -> object | None:
                     args.draft_prepare
                     or args.media_tokens_per_sequence is not None
                     or store is not None
+                    or bool(getattr(args, "include_submission", False))
                 ):
                     case = parse_case(raw)
                     ops = target_graphs(
@@ -200,10 +201,16 @@ def _dispatch_sdk(args: argparse.Namespace) -> object | None:
                         media_tokens_per_sequence=args.media_tokens_per_sequence,
                         draft_prepare=bool(args.draft_prepare),
                     )
+                    ext_inputs = (
+                        {"analysis_input": 0.0}
+                        if any("analysis_input" in op.deps for g in ops.values() for op in g)
+                        else None
+                    )
                     ctx = EvaluationContext.create(case, None, store)
                     op_report = operator_costs(case, ops, primitives=store, evaluation=ctx)
                     gr_report = graph_costs(
                         case, ops, primitives=store,
+                        external_inputs=ext_inputs,
                         include_submission=bool(args.include_submission),
                         isolated=False, evaluation=ctx,
                     )

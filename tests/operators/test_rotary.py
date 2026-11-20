@@ -203,11 +203,18 @@ def test_rotary_bsnd_4d_abi_domain_picklability_and_hbm_split():
     with pytest.raises(ModelingError, match="rotary_abi_unsupported"):
         resolve_rotary_plan(bsnd_op, ctx_dual)
 
-    # Misspelled explicit recipe ID must not be hijacked by FamilyRegistry.
+    # Misspelled explicit recipe ID must not be hijacked by FamilyRegistry or run at 0 ms.
+    from mindie_sim.prediction.graph_analysis import graph_costs
+
     typo_op = replace(bsnd_op, recipe="rotary_misspelled")
     assert registry.match(typo_op) is None
     with pytest.raises(ModelingError, match="unregistered_operator_family"):
         registry.lookup(typo_op)
+    book = RecipeBook.from_mapping(case.runtime.kernels, family_registry=registry)
+    with pytest.raises(ModelingError, match="unregistered_operator_recipe:rotary:rotary_misspelled"):
+        book.select(typo_op)
+    with pytest.raises(ModelingError, match="unregistered_operator_recipe:rotary:rotary_misspelled"):
+        graph_costs(case, (typo_op,), recipes=book)
 
     # OperatorPlan and StepEvaluation must pickle cleanly under multiprocessing spawn.
     plan_roundtrip = pickle.loads(pickle.dumps(resolved.recipe))

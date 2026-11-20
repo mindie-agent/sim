@@ -115,13 +115,21 @@ def test_cli_entrypoint_parity_disambiguation_and_timeout_propagation(tmp_path, 
     assert tiers_payload["should_achieve"]["span_ms"] > 0.0
     assert tiers_payload["aligned_table"]["graph_id"] == tiers_payload["mainline"]["graph_id"]
 
-    # predict step --view operators and --view efficiency thread draft_prepare cleanly.
+    # predict step --view operators and --view efficiency (including --primitives :memory: & --include-submission).
     out_ops = tmp_path / "ops_view.json"
     assert cli_mod.main([
         "predict", "step", str(case_path), "--view", "operators",
         "--phase", "decode", "--tokens", "1", "--context", "64", "--output", str(out_ops),
     ]) == 0
     assert json.loads(out_ops.read_text(encoding="utf-8"))["operator_sum_ms"] > 0.0
+
+    out_eff = tmp_path / "eff_view.json"
+    assert cli_mod.main([
+        "predict", "step", str(case_path), "--view", "efficiency",
+        "--phase", "decode", "--tokens", "1", "--context", "64",
+        "--primitives", ":memory:", "--include-submission", "--output", str(out_eff),
+    ]) == 0
+    assert json.loads(out_eff.read_text(encoding="utf-8"))["graph_duration_ms"] > 0.0
 
     # TimeoutError must propagate directly in both cli.py and public/cli.py.
     def _raise_timeout(*_args, **_kwargs):
@@ -230,14 +238,16 @@ def test_typed_sdk_service_sla_sweep_and_production_capture_resolution():
     assert len(pd_res.frontier) >= 1
     assert all(pt.throughput_tokens_s > 0.0 and pt.span_ms > 0.0 for pt in pd_res.frontier)
 
-    # production_capture=True resolves MTP tokens without AttributeError even on raw_eager stack.
+    # production_capture=True resolves JSON speculative SpeculativeSpec matching scheduler.py.
+    from mindie_sim.compose_runtime import capture_keys
+
     eager_case = replace(
         case,
         runtime=replace(
             case.runtime,
             graph_capture_mode="none",
             graph_capture_keys=(),
-            metadata=(("draft_proposal_tokens", 2),),
+            metadata=(("speculative", json.dumps({"draft_len": 2, "acceptance": [0.8, 0.6]})),),
         ),
     )
     resolved = default_stack_registry().resolve_base(
@@ -250,4 +260,20 @@ def test_typed_sdk_service_sla_sweep_and_production_capture_resolution():
         ),
     )
     assert resolved.case.runtime.graph_capture_mode == "full"
-    assert len(resolved.case.runtime.graph_capture_keys) > 0
+    assert resolved.case.runtime.graph_capture_keys == tuple(capture_keys(max(16, int(case.runtime.max_num_seqs or 16)), 2))
+
+    # In-graph predecessor occurrences preserve producer physical rank (not None), and endpoint_rates never inflate.
+    step_ev = sdk_api.evaluate_step(case, StepRequest(phase="decode", tokens=1, context=64, sequences=1))
+    with_preds = [row for row in step_ev.operators if row.predecessors and row.predecessors[0].op_id != "analysis_input"]
+    assert with_preds and all(pred.rank == 0 for pred in with_preds[0].predecessors)
+
+    from mindie_sim.prediction.spine import _scale_case_efficiency
+    from mindie_sim.schema.hardware import Link
+
+    ep_link = Link(
+        name="ep_test:0", capacity_bytes_per_ms=40.0, peak_capacity_bytes_per_ms=50.0,
+        bw_utilization=0.80, members=(0, 1), endpoint_rates=((0, 45.0), (1, 45.0)),
+    )
+    ep_case = replace(case, machine=replace(case.machine, links=(ep_link,)))
+    ep_scaled = _scale_case_efficiency(ep_case, 1.0)
+    assert dict(ep_scaled.machine.links[0].endpoint_rates)[0] <= 45.0

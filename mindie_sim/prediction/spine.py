@@ -113,9 +113,8 @@ def _scale_case_efficiency(case: Case, efficiency: float) -> Case:
         util = float(link.bw_utilization)
         if link.peak_capacity_bytes_per_ms is None and 0.0 < util < 1.0:
             base_cap = float(link.capacity_bytes_per_ms) / util
-        util_div = util if 0.0 < util < 1.0 else 1.0
         endpoints = tuple(
-            (rank, (float(rate) / util_div) * efficiency)
+            (rank, min(float(rate), base_cap) * efficiency)
             for rank, rate in link.endpoint_rates
         )
         scaled_links.append(replace(
@@ -451,7 +450,9 @@ class PredictionSpine:
         p = case.runtime.parallel
         width = p.tp * p.pcp
         timeline = report.get("timeline") or report.get("operators") or ()
-        for ordinal, row in enumerate(timeline):
+        occ_by_node: dict[str, OpOccurrence] = {}
+        row_occs: list[OpOccurrence] = []
+        for row in timeline:
             replica = int(row.get("replica", 0))
             op_id = str(row.get("op_id", ""))
             spec = op_index.get((replica, op_id))
@@ -465,8 +466,19 @@ class PredictionSpine:
                       if 0 <= rank_idx < len(case.machine.dies) else None)
             )
             occ = OpOccurrence(replica=replica, stage=stage, rank=physical_rank, op_id=op_id)
+            row_occs.append(occ)
+            occ_by_node[f"r{replica}:{op_id}"] = occ
+            if row.get("id"):
+                occ_by_node[str(row["id"])] = occ
+        for ordinal, (row, occ) in enumerate(zip(timeline, row_occs)):
+            replica = occ.replica
+            op_id = occ.op_id
+            stage = occ.stage
+            spec = op_index.get((replica, op_id))
+            res = resolved_by_occ.get((replica, op_id))
             preds = tuple(
-                _parse_occurrence(str(dep), replica, stage)
+                occ_by_node.get(str(dep))
+                or _parse_occurrence(str(dep), replica, stage)
                 for dep in row.get("predecessors", ())
             )
             impl = (

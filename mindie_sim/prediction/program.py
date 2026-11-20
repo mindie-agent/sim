@@ -1749,6 +1749,16 @@ class RecipeBook:
             if governed is not None:
                 recipe = self._governed_recipe(governed)
             else:
+                fam_spec = self._family_registry.spec_for_family(family_name)
+                if (
+                    recipe_name
+                    and fam_spec is not None
+                    and recipe_name not in self.recipes
+                    and recipe_name not in fam_spec.delegated_legacy_recipe_ids
+                ):
+                    raise ModelingError(
+                        f"unregistered_operator_recipe:{family_name}:{recipe_name}"
+                    )
                 recipe = self.recipes.get(recipe_name, self.families.get(
                     op.family, self.programs.get(kind)))
         if recipe is None:

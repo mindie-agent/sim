@@ -1492,7 +1492,7 @@ class Execution:
                     resources.extend(qres)
                     for (sid, phys), qname in qmap.items():
                         self.stream_quota_by_res[(phys, sid)] = qname
-                if not matched and selected_replica is None:
+                if not matched:
                     raise ModelingError(f"stream_plan_unmatched_rank:{plan.rank}")
         self.topology = (
             bindings.topology
@@ -2674,6 +2674,7 @@ class Execution:
             live_rates,
             context.group_buffers,
             getattr(context.physical_mechanisms, "signature", None),
+            op.stream or "main",
             context.stream_owners,
         )
         token = _rank_token(context)
@@ -3577,6 +3578,7 @@ class Execution:
                             op.flops, op.matrix_flops, op.mte2_bytes, op.mte3_bytes,
                             op.vector_ops, op.hbm_bytes, op.link_bytes, op.link_scope,
                             op.source_boundary, op.returns, self._op_key(op),
+                            op.stream or "main",
                             self.stream_owners.get((replica, op.stage, op.stream or "main")),
                         )
                         entry = lazy_cache.get(lazy_key)
@@ -4671,8 +4673,21 @@ class Execution:
 
     def summary(self) -> dict:
         native_groups = self.native_group_summary()
+        eng_summary = self.engine.summary()
+        if self.stream_quota_by_res:
+            eng_summary = {
+                **eng_summary,
+                "serviced": {
+                    k: v for k, v in eng_summary["serviced"].items()
+                    if "stream_quota@" not in k
+                },
+                "resource_busy_ms": {
+                    k: v for k, v in eng_summary["resource_busy_ms"].items()
+                    if "stream_quota@" not in k
+                },
+            }
         return {
-            **self.engine.summary(), "work": dict(self.work),
+            **eng_summary, "work": dict(self.work),
             **({"work_basis": "logical_and_analytical_reference; executed_service_is_in_serviced"}
                if self.cost.joint_native else {}),
             "recipes": dict(self.recipes_used),

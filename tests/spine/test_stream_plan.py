@@ -551,3 +551,151 @@ def test_stream_pipeline_template_shared_quota_narrow_tile_and_pp_fifo():
     dbo_case = replace(case22, runtime=replace(case22.runtime, enable_dbo=True))
     with pytest.raises(UnmodeledCapabilityError, match="unmodeled_in_op_dbo_pending_stage3"):
         sdk_api.evaluate_step(dbo_case, StepRequest(phase="decode", tokens=1, context=64, sequences=1))
+
+
+def test_stream_equal_budget_parallelism_nondividing_matrix_quota_and_validation():
+    from mindie_sim.prediction.engine import Allocation
+    from mindie_sim.prediction.graph_analysis import graph_costs
+    from mindie_sim.prediction.matrix import TiledMatmul
+    from mindie_sim.prediction.operator_replay import operator_costs
+    from mindie_sim.prediction.streams import (
+        apply_stream_owners_to_program,
+        stream_quota_resources,
+    )
+
+    build = build_accel()
+    assert build["ok"] is True and build["backend"] == "c_native"
+
+    case22 = _case_for("Ascend910B2", layers=1)
+    dp22 = datapath_for_die(case22.machine.dies[0])
+
+    # 1. Two equal-budget shared_cap lanes (24/48 AIV each) must NOT collide on main's quota.
+    op_a = replace(
+        _rotary_op("rope_a"),
+        hbm_bytes=0.0, mte2_bytes=0.0, mte3_bytes=0.0, vector_ops=4e10, stream=MAIN_STREAM,
+    )
+    op_b = replace(op_a, op_id="rope_b", stream="aux")
+    eq_plan = StreamPlan(
+        rank=0,
+        lanes=(
+            StreamLane(MAIN_STREAM, StreamCoreBudget(aic=12, aiv=24, isolation="shared_cap")),
+            StreamLane("aux", StreamCoreBudget(aic=12, aiv=24, isolation="shared_cap")),
+        ),
+        assignments=(("rope_a", MAIN_STREAM), ("rope_b", "aux")),
+    )
+    single_rep = graph_costs(case22, (op_a,), stream_plans=(eq_plan,), isolated=True)
+    pair_rep = graph_costs(case22, (op_a, op_b), stream_plans=(eq_plan,), isolated=True)
+    assert pair_rep["duration_ms"] == pytest.approx(single_rep["duration_ms"], rel=0.05)
+    # No synthetic stream_quota@ keys may leak into execution/isolated hardware accounting.
+    assert not any("stream_quota@" in k for k in pair_rep["execution"]["serviced"])
+    assert not any("stream_quota@" in k for k in pair_rep["execution"]["resource_busy_ms"])
+    iso_rep = operator_costs(case22, (op_a,), stream_plans=(eq_plan,))
+    assert not any("stream_quota@" in k for k in iso_rep["operators"][0]["serviced"])
+    assert not any("stream_quota@" in k for k in iso_rep["operators"][0]["service_delta"])
+
+    # 2. Non-dividing AIC lane budget (5 of 24 AICs) lowers TiledMatmul without crashing.
+    plan_5 = StreamPlan(
+        rank=0,
+        lanes=(
+            StreamLane(MAIN_STREAM, StreamCoreBudget(aic=5, aiv=10, isolation="disjoint")),
+            StreamLane("rest", StreamCoreBudget(aic=19, aiv=38, isolation="disjoint")),
+        ),
+    )
+    owners_5 = bind_stream_owners(plan_5, dp22)
+    cube_op = _canonical_cube_op(case22, "cube_5aic")
+    ctx_5 = RecipeContext(
+        op=cube_op,
+        work={"cube@0": 1.0},
+        resource_names={"cube": "cube@0", "hbm": "hbm@0", "mte2": "mte2@0", "mte3": "mte3@0", "vector": "vector@0"},
+        rates={"cube@0": 24.0, "hbm@0": 100.0, "mte2@0": 100.0, "mte3@0": 100.0, "vector@0": 48.0},
+        core_count=24,
+        resource_units={"cube": 24, "vector": 48, "mte2": 24, "mte3": 48},
+        datapath=dp22,
+        stream_owners=owners_5[MAIN_STREAM],
+    )
+    lowered_5 = TiledMatmul().lower(ctx_5)
+    assert lowered_5 is not None
+
+    # 3. Pure shared_cap narrow 1-core tile preserves 1-core rate (12 ms, not 1 ms) on C11.
+    shared_12 = StreamPlan(
+        rank=0,
+        lanes=(
+            StreamLane(MAIN_STREAM, StreamCoreBudget(aic=12, aiv=24, isolation="shared_cap")),
+            StreamLane("aux", StreamCoreBudget(aic=12, aiv=24, isolation="shared_cap")),
+        ),
+    )
+    sh_owners = bind_stream_owners(shared_12, dp22)
+    q_res, q_map = stream_quota_resources(
+        sh_owners, dp22,
+        resource_names={"cube": "cube@0", "vector": "vector@0"},
+        rates={"cube@0": 24.0, "vector@0": 48.0},
+    )
+    q_main = {phys: qn for (sid, phys), qn in q_map.items() if sid == MAIN_STREAM}
+    narrow_1core = Stage("tile_1c", work={"cube@0": 12.0}, placement={"cube@0": (0,)})
+    bound_1core = bind_stage_to_stream(
+        narrow_1core, sh_owners[MAIN_STREAM], dp22,
+        resource_names={"cube": "cube@0", "vector": "vector@0"},
+        resource_units={"cube": 24, "vector": 48},
+        rates={"cube@0": 24.0, "vector@0": 48.0},
+        stream_id=MAIN_STREAM, quota_resources=q_main,
+    )
+    eng_n = Engine([Resource("cube@0", 24.0, "ms", "fair", units=24), *q_res], backend="c")
+    n0 = eng_n.submit("start")
+    n1 = KernelProgram((bound_1core,)).start(eng_n, "narrow_sh", n0)
+    eng_n.advance(until=(n1,))
+    assert n1.time == pytest.approx(12.0)
+    assert eng_n.accel_status()["native_steps"] > 0
+
+    # 4. Split-stage ordering runs stage.work BEFORE stage.program, and mixed shared/disjoint remaps buffers & non-quota work.
+    mixed_plan = StreamPlan(
+        rank=0,
+        lanes=(
+            StreamLane("disj", StreamCoreBudget(aic=8, aiv=24, isolation="disjoint")),
+            StreamLane(MAIN_STREAM, StreamCoreBudget(aic=8, aiv=24, isolation="shared_cap")),
+        ),
+    )
+    mix_owners = bind_stream_owners(mixed_plan, dp22)
+    mq_res, mq_map = stream_quota_resources(
+        mix_owners, dp22,
+        resource_names={"cube": "cube@0", "vector": "vector@0"},
+        rates={"cube@0": 24.0, "vector@0": 48.0},
+    )
+    mq_main = {phys: qn for (sid, phys), qn in mq_map.items() if sid == MAIN_STREAM}
+    nested_stage = Stage(
+        "split_seq",
+        work={"cube@0": 8.0, "vector@0": 24.0},
+        acquire=(Allocation("k_l1", "l1@0", 512, units=(0,)),),
+        free=(Allocation("k_l1", "l1@0", 512, units=(0,)),),
+        program=KernelProgram((Stage("inner", latency=3.0),)),
+    )
+    bound_mix = bind_stage_to_stream(
+        nested_stage, mix_owners[MAIN_STREAM], dp22,
+        resource_names={"cube": "cube@0", "vector": "vector@0"},
+        resource_units={"cube": 24, "vector": 48},
+        rates={"cube@0": 24.0, "vector@0": 48.0},
+        stream_id=MAIN_STREAM, quota_resources=mq_main,
+        pool_names={"l1": "l1@0"}, pool_units={"l1": 24},
+    )
+    assert set(bound_mix.acquire[0].units).issubset(set(mix_owners[MAIN_STREAM].pool_aic))
+    assert isinstance(bound_mix.program, KernelProgram)
+    assert len(bound_mix.program.stages) == 2
+    # Work takes 1.0 ms (8/8 cube, 24/24 vector), then nested latency 3.0 ms -> total 4.0 ms (sequential!).
+    eng_m = Engine(
+        [Resource("cube@0", 24.0, "ms", "fair", units=24), Resource("vector@0", 48.0, "ms", "fair", units=48), *mq_res],
+        pools={"l1@0": 4096}, pool_units={"l1@0": 24},
+    )
+    m0 = eng_m.submit("start")
+    m1 = KernelProgram((bound_mix,)).start(eng_m, "mix_seq", m0)
+    eng_m.advance(until=(m1,))
+    assert m1.time == pytest.approx(4.0)
+
+    # 5. Standalone operator_costs & partial-replica graph_costs reject unmatched StreamPlan.rank.
+    bad_plan = StreamPlan(rank=1, lanes=(StreamLane(MAIN_STREAM),))
+    with pytest.raises(ModelingError, match="stream_plan_unmatched_rank:1"):
+        operator_costs(case22, (op_a,), replica=0, stream_plans=(bad_plan,))
+    dp2_case = sdk_api.compose_case(
+        "qwen3-32b", hardware="Ascend910B2",
+        options={"dp": 2, "tp": 1, "pp": 1, "num_devices": 2, "layers": 1},
+    )
+    with pytest.raises(ModelingError, match="stream_plan_unmatched_rank:1"):
+        graph_costs(dp2_case, {0: (op_a,)}, stream_plans=(bad_plan,))

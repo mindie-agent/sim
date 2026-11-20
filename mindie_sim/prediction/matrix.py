@@ -204,6 +204,7 @@ class _TiledGeometry:
             raise ModelingError(
                 f"stream_zero_aic_budget:{op.stream or 'main'}:{op.op_id}"
             )
+        self.physical_cores = int(context.core_count)
         self.cores = max(1, effective_cores)
         self.epilogue = MatrixEpilogue.from_op(op)
         self.input_bytes, self.weight = self.epilogue.operands(op)
@@ -376,12 +377,12 @@ class _TiledGeometry:
                        acc_size, owner_units),))
         stages = [
             Stage("load", load, acquire=operand,
-                  placement=context.owned(owner, self.cores,
+                  placement=context.owned(owner, self.physical_cores,
                                           (self.operand_read,))
                   if recipe.distributed_transfers else {}),
             Stage("compute", compute, after=("load",),
                   caps=context.mac_caps,
-                  placement=context.owned(owner, self.cores,
+                  placement=context.owned(owner, self.physical_cores,
                                           ("cube", "vector")),
                   acquire=accumulator if first else (), free=operand),
         ]
@@ -398,18 +399,18 @@ class _TiledGeometry:
                     scale_work.get(names[read], 0) + scale_copy)
             stages.extend((
                 Stage("scales", scale_work, after=("compute",),
-                      placement=context.owned(owner, self.cores, (read,))),
+                      placement=context.owned(owner, self.physical_cores, (read,))),
                 Stage("epilogue", {
                     names["vector"]:
                         self.epilogue.operations_per_output * a * b},
                     after=("scales",),
-                    placement=context.owned(owner, self.cores,
+                    placement=context.owned(owner, self.physical_cores,
                                             ("vector",))),
             ))
             predecessor = "epilogue"
         stages.append(Stage(
             "store", store, after=(predecessor,),
-            placement=context.owned(owner, self.cores, ("mte3",))
+            placement=context.owned(owner, self.physical_cores, ("mte3",))
             if recipe.distributed_transfers else {},
             free=accumulator if last else ()))
         proto_stages = tuple(stages)

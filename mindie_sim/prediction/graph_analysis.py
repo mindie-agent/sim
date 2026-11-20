@@ -313,6 +313,9 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
             "collective_algorithm": getattr(book.select(op), "algorithm", None),
         })
 
+    if stream_plans:
+        from .streams import validate_stream_plan_ranks
+        stream_plans = validate_stream_plan_ranks(stream_plans, set(graphs))
     from .cost import CostLedger
     cost = ctx.cost
     op_count = (sum(len(group) for group in ops.values())

@@ -362,11 +362,37 @@ def _remap_units(existing: tuple[int, ...] | None, pool: tuple[int, ...]) -> tup
     return tuple(seen)
 
 
+def validate_stream_plan_ranks(
+    stream_plans: Mapping[int, StreamPlan] | tuple[StreamPlan, ...] | list[StreamPlan] | None,
+    active_replicas: set[int] | frozenset[int],
+) -> tuple[StreamPlan, ...]:
+    """Normalize and validate that every ``StreamPlan.rank`` matches an active replica."""
+    if not stream_plans:
+        return ()
+    plans = tuple(stream_plans.values()) if isinstance(stream_plans, Mapping) else tuple(stream_plans)
+    seen: set[int] = set()
+    unmatched: list[int] = []
+    for plan in plans:
+        rank = int(plan.rank)
+        if rank in seen:
+            raise ModelingError("stream_duplicate_rank_plan")
+        seen.add(rank)
+        if rank not in active_replicas:
+            unmatched.append(rank)
+    if unmatched:
+        raise ModelingError(
+            "stream_plan_unmatched_rank:" + ",".join(str(r) for r in sorted(unmatched))
+        )
+    return plans
+
+
 def _remap_allocations(
     allocs: tuple[Any, ...], owners: StreamOwners, datapath: DatapathCapabilitySpec,
     pool_names: Mapping[str, str] | None, pool_units: Mapping[str, int] | None,
 ) -> tuple[Any, ...]:
-    if not allocs or owners.isolation != "disjoint" or not pool_names:
+    aic_pool = owners.aic if owners.isolation == "disjoint" else owners.pool_aic
+    aiv_pool = owners.aiv if owners.isolation == "disjoint" else owners.pool_aiv
+    if not allocs or not pool_names or not (aic_pool or aiv_pool):
         return allocs
     logical_by_phys = {phys: name for name, phys in pool_names.items()}
     punits = pool_units or {}
@@ -374,10 +400,10 @@ def _remap_allocations(
     for alloc in allocs:
         logical = logical_by_phys.get(alloc.pool, alloc.pool)
         target_pool: tuple[int, ...] | None = None
-        if logical in AIC_BUFFER_POOLS and owners.aic and int(punits.get(logical, datapath.aic_count)) == datapath.aic_count:
-            target_pool = owners.aic
-        elif logical in AIV_BUFFER_POOLS and owners.aiv and int(punits.get(logical, datapath.aiv_count)) == datapath.aiv_count:
-            target_pool = owners.aiv
+        if logical in AIC_BUFFER_POOLS and aic_pool and int(punits.get(logical, datapath.aic_count)) == datapath.aic_count:
+            target_pool = aic_pool
+        elif logical in AIV_BUFFER_POOLS and aiv_pool and int(punits.get(logical, datapath.aiv_count)) == datapath.aiv_count:
+            target_pool = aiv_pool
         if target_pool is not None and alloc.units:
             new_units = _remap_units(alloc.units, target_pool)
             if new_units != alloc.units:
@@ -476,53 +502,72 @@ def bind_stage_to_stream(
                         placement[res] = mapped
     else:
         qmap = quota_resources or {}
-        if not coupled and len(stage.work) > 1 and any(
-            res in qmap for res in (*aic_res, *aiv_res)
-        ):
+        if not coupled and len(stage.work) > 1 and any(res in qmap for res in (*aic_res, *aiv_res)):
             branches = []
             for idx, (res, amt) in enumerate(stage.work.items()):
                 sub_work = {res: amt}
                 sub_pl = {res: placement[res]} if res in placement else {}
                 sub_caps = {res: caps[res]} if res in caps else {}
                 sub_coupled = False
-                if res in qmap:
-                    sub_work[qmap[res]] = amt
-                    sub_coupled = True
-                    pool = owners.pool_aic if res in aic_res else owners.pool_aiv
-                    if pool:
-                        sub_pl[res] = _remap_units(sub_pl.get(res), pool)
+                is_aic, is_aiv = res in aic_res, res in aiv_res
+                if is_aic or is_aiv:
+                    limit = owners.aic_limit if is_aic else owners.aiv_limit
+                    total = datapath.aic_count if is_aic else datapath.aiv_count
+                    pool = owners.pool_aic if is_aic else owners.pool_aiv
+                    orig = sub_pl.get(res)
+                    if res in qmap:
+                        sub_work[qmap[res]] = amt
+                        sub_coupled = True
+                        if orig is not None and len(orig) < total:
+                            _cap_rate(sub_caps, res, rates, min(len(orig), limit), total)
+                        if pool:
+                            sub_pl[res] = _remap_units(orig, pool)
+                        else:
+                            sub_pl.pop(res, None)
+                    else:
+                        if pool:
+                            sub_pl[res] = _remap_units(orig, pool)
+                        _cap_rate(sub_caps, res, rates, min(len(orig), limit) if orig else limit, total)
                 branches.append(KernelProgram((Stage(
                     f"{stage.name}:b{idx}", sub_work, caps=sub_caps,
                     placement=sub_pl, coupled=sub_coupled, priority=stage.priority,
                 ),)))
+            work_prog = ParallelProgram(tuple(branches))
             nested_inner = (
                 apply_stream_owners_to_program(stage.program, owners, datapath, **bind_kw)
                 if stage.program is not None else None
             )
-            if nested_inner is not None:
-                branches.append(nested_inner)
-            return replace(
-                stage, work={}, placement={}, caps={},
-                program=ParallelProgram(tuple(branches)),
+            final_prog = (
+                KernelProgram((
+                    Stage(f"{stage.name}:work", program=work_prog),
+                    Stage(f"{stage.name}:body", after=(f"{stage.name}:work",), program=nested_inner),
+                ))
+                if nested_inner is not None else work_prog
             )
+            acq = _remap_allocations(stage.acquire, owners, datapath, pool_names, pool_units)
+            rel = _remap_allocations(stage.free, owners, datapath, pool_names, pool_units)
+            return replace(stage, work={}, placement={}, caps={}, acquire=acq, free=rel, program=final_prog)
 
         for res_list, limit, total, pool in (
             (aic_res, owners.aic_limit, datapath.aic_count, owners.pool_aic),
             (aiv_res, owners.aiv_limit, datapath.aiv_count, owners.pool_aiv),
         ):
             for res in res_list:
+                orig = placement.get(res)
                 if res in qmap:
                     work[qmap[res]] = float(stage.work[res])
                     coupled = True
+                    if orig is not None and len(orig) < total:
+                        _cap_rate(caps, res, rates, min(len(orig), limit), total)
                     if pool and not coupled_has_unit_res:
-                        placement[res] = _remap_units(placement.get(res), pool)
-                    elif coupled_has_unit_res:
+                        placement[res] = _remap_units(orig, pool)
+                    else:
                         placement.pop(res, None)
                 else:
-                    eff_lim = min(len(placement[res]), limit) if res in placement else limit
+                    eff_lim = min(len(orig), limit) if orig else limit
                     _cap_rate(caps, res, rates, eff_lim, total)
                     if pool and not coupled_has_unit_res:
-                        placement[res] = _remap_units(placement.get(res), pool)
+                        placement[res] = _remap_units(orig, pool)
                     elif coupled_has_unit_res:
                         placement.pop(res, None)
         if coupled and aic_res and aiv_res and owners.pool_aic and owners.pool_aiv and not coupled_has_unit_res:
@@ -564,49 +609,30 @@ def _bind_pipeline_phase(phase: Any, owners: StreamOwners, datapath: DatapathCap
 
 
 def apply_stream_owners_to_program(
-    program: Any,
-    owners: StreamOwners,
-    datapath: DatapathCapabilitySpec,
-    *,
-    resource_names: Mapping[str, str],
-    resource_units: Mapping[str, int],
-    rates: Mapping[str, float],
-    stream_id: StreamId = MAIN_STREAM,
+    program: Any, owners: StreamOwners, datapath: DatapathCapabilitySpec, *,
+    resource_names: Mapping[str, str], resource_units: Mapping[str, int],
+    rates: Mapping[str, float], stream_id: StreamId = MAIN_STREAM,
     quota_resources: Mapping[str, str] | None = None,
-    pool_names: Mapping[str, str] | None = None,
-    pool_units: Mapping[str, int] | None = None,
+    pool_names: Mapping[str, str] | None = None, pool_units: Mapping[str, int] | None = None,
 ) -> Any:
     """Recursively bind all stages of ``program`` and its wrappers to ``owners``."""
     from .program import (
-        KernelProgram,
-        NativeProgram,
-        ParallelProgram,
-        PipelineProgram,
-        PipelineTemplateProgram,
+        KernelProgram, NativeProgram, ParallelProgram,
+        PipelineProgram, PipelineTemplateProgram,
     )
 
-    kwargs = {
-        "resource_names": resource_names,
-        "resource_units": resource_units,
-        "rates": rates,
-        "stream_id": stream_id,
-        "quota_resources": quota_resources,
-        "pool_names": pool_names,
-        "pool_units": pool_units,
-    }
+    kwargs = dict(
+        resource_names=resource_names, resource_units=resource_units, rates=rates,
+        stream_id=stream_id, quota_resources=quota_resources,
+        pool_names=pool_names, pool_units=pool_units,
+    )
     if isinstance(program, KernelProgram):
-        bound = tuple(bind_stage_to_stream(s, owners, datapath, **kwargs) for s in program.stages)
-        return replace(program, stages=bound)
+        return replace(program, stages=tuple(bind_stage_to_stream(s, owners, datapath, **kwargs) for s in program.stages))
     if isinstance(program, ParallelProgram):
-        members = tuple(apply_stream_owners_to_program(m, owners, datapath, **kwargs) for m in program.programs)
-        return replace(program, programs=members)
+        return replace(program, programs=tuple(apply_stream_owners_to_program(m, owners, datapath, **kwargs) for m in program.programs))
     if isinstance(program, PipelineProgram):
         orig_tile = program.tile
-
-        def bound_tile(index: int):
-            return tuple(bind_stage_to_stream(s, owners, datapath, **kwargs) for s in orig_tile(index))
-
-        return replace(program, tile=bound_tile)
+        return replace(program, tile=lambda idx: tuple(bind_stage_to_stream(s, owners, datapath, **kwargs) for s in orig_tile(idx)))
     if isinstance(program, PipelineTemplateProgram):
         tmpl = program.template
         bound_tmpl = replace(
@@ -620,12 +646,11 @@ def apply_stream_owners_to_program(
     if isinstance(program, NativeProgram):
         inner = apply_stream_owners_to_program(program.program, owners, datapath, **kwargs)
         return program if inner is program.program else replace(program, program=inner)
-    if hasattr(program, "body") and getattr(program, "body", None) is not None:
-        inner = apply_stream_owners_to_program(program.body, owners, datapath, **kwargs)
-        return program if inner is program.body else replace(program, body=inner)
-    if hasattr(program, "program") and getattr(program, "program", None) is not None:
-        inner = apply_stream_owners_to_program(program.program, owners, datapath, **kwargs)
-        return program if inner is program.program else replace(program, program=inner)
+    for attr in ("body", "program"):
+        child = getattr(program, attr, None)
+        if child is not None:
+            inner = apply_stream_owners_to_program(child, owners, datapath, **kwargs)
+            return program if inner is child else replace(program, **{attr: inner})
     return program
 
 
@@ -764,4 +789,5 @@ __all__ = [
     "apply_stream_owners_to_program", "bind_stage_to_stream", "bind_stream_owners",
     "check_work_against_stream_budget", "lower_stream_edges",
     "proportional_coupled_placement", "stream_quota_resources", "validate_stream_id",
+    "validate_stream_plan_ranks",
 ]

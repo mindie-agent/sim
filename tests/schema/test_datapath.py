@@ -141,3 +141,25 @@ def test_ub_peer_edges_derived_from_a5_ub_mesh_links():
         options={"dp": 1, "tp": 8, "pp": 1, "num_devices": 8, "layers": 1},
     )
     assert ExecutionBindings.create(b2_tp8).datapath_for_rank(0).ub_peer_edges == ()
+
+    # Non-UB per_pair link with empty transfer_channels must NOT be misclassified as UB.
+    from mindie_sim.schema.datapath import datapath_for_devices, ub_peer_edges_for_rank
+    from mindie_sim.schema.hardware import Link
+
+    non_ub_link = Link(
+        name="hccs_pair:0",
+        capacity_bytes_per_ms=40e6,
+        members=(0, 1),
+        channel="d2d_intra_node",
+        semantics="per_pair",
+    )
+    assert ub_peer_edges_for_rank(0, (non_ub_link,), ()) == ()
+
+    # Asymmetric UB peer connectivity across stage dies must fail homogeneity validation.
+    asym_links = (
+        Link(name="ub_pair:0", capacity_bytes_per_ms=40e6, members=(0, 1, 2), channel="ub_mesh", semantics="per_pair"),
+        Link(name="ub_pair:1", capacity_bytes_per_ms=40e6, members=(0, 3), channel="ub_mesh", semantics="per_pair"),
+    )
+    dies2 = a5_tp8.machine.dies[:2]
+    with pytest.raises(ModelingError, match="stage_devices_heterogeneous_datapath"):
+        datapath_for_devices(dies2, links=asym_links)

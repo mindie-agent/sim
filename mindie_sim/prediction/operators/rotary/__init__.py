@@ -54,6 +54,17 @@ def register_family() -> OperatorFamilySpec:
         owned_recipe_ids=frozenset({"rotary", "rotary_position_embedding"}),
         resolve=resolve_operator_plan,
         traffic_rewrite_capable=True,
+        delegated_legacy_recipe_ids=frozenset({
+            "compress_rotary",
+            "draft_context_k_rope",
+            "draft_context_kv_rope",
+            "index_compress_rotary",
+            "index_query_rotary",
+            "index_rotary",
+            "kv_rotary",
+            "q_rotary",
+            "split_qkv_rmsnorm_mrope_fused",
+        }),
     )
 
 

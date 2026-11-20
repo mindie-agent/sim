@@ -65,6 +65,10 @@ class FamilyRegistry:
         self._by_family = by_family
         self._rewrite_rules = tuple(rules)
 
+    def spec_for_family(self, family: str, /) -> OperatorFamilySpec | None:
+        """Return the governed family spec registered for ``family``, if any."""
+        return self._by_family.get(str(family or ""))
+
     def match(self, op: OpSpec, /) -> OperatorFamilySpec | None:
         """Return the governed family owning ``op``, or ``None`` if not governed."""
         recipe_id = str(getattr(op, "recipe", "") or "")

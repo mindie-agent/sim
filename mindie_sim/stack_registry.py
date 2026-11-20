@@ -20,6 +20,7 @@ from collections.abc import Iterable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from functools import lru_cache
+import json
 from typing import Literal
 
 from mindie_sim.compose_runtime import capture_keys, finalize_compilation_spine
@@ -28,6 +29,7 @@ from mindie_sim.schema.case import Case
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.operators import OpSpec
+from mindie_sim.schema.speculative import SpeculativeSpec
 from mindie_sim.schema.workload import IterationPlan
 from mindie_sim.stack_tracks import (
     RUNTIME_STACKS,
@@ -128,17 +130,18 @@ def _mtp_proposal_tokens(case: Case) -> int:
         if getattr(step_spec, "draft_len", 0):
             return int(step_spec.draft_len)
     meta = dict(case.runtime.metadata)
-    spec = meta.get("speculative")
-    if isinstance(spec, Mapping):
-        for key in ("draft_tokens", "proposal_tokens", "num_speculative_tokens", "draft_len"):
-            val = spec.get(key)
-            if val:
-                return int(val)
-    elif spec is not None:
-        for attr in ("draft_tokens", "proposal_tokens", "num_speculative_tokens", "draft_len"):
-            val = getattr(spec, attr, 0)
-            if val:
-                return int(val)
+    raw_spec = meta.get("speculative")
+    if raw_spec:
+        if isinstance(raw_spec, SpeculativeSpec):
+            spec_obj = raw_spec
+        else:
+            parsed = json.loads(raw_spec) if isinstance(raw_spec, str) else raw_spec
+            if isinstance(parsed, Mapping):
+                spec_obj = SpeculativeSpec.from_mapping(parsed)
+            else:
+                spec_obj = None
+        if spec_obj is not None and spec_obj.draft_len:
+            return int(spec_obj.draft_len)
     if meta.get("draft_proposal_tokens"):
         return int(meta["draft_proposal_tokens"])
     aux = getattr(case.model, "auxiliary", None)

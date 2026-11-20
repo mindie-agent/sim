@@ -223,15 +223,18 @@ def ub_peer_edges_for_rank(
     if not links:
         return ()
     target = int(rank)
-    ub_channels, has_channels = _ub_channel_names(transfer_channels)
+    ub_channels, _has_channels = _ub_channel_names(transfer_channels)
     edges: set[tuple[int, int]] = set()
     for link in links:
         if target not in link.members:
             continue
+        chan_low = str(link.channel).lower()
+        name_low = str(link.name).lower()
         is_ub = (
             link.channel in ub_channels
-            or str(link.channel).lower().startswith("ub_")
-            or (not has_channels and link.semantics == "per_pair")
+            or chan_low == "ub"
+            or chan_low.startswith("ub_")
+            or name_low.startswith("ub_")
         )
         if not is_ub:
             continue
@@ -260,7 +263,22 @@ def _arch_capability_key(spec: ComputeArchSpec) -> tuple:
     )
 
 
-def _homogeneity_key(spec: DatapathCapabilitySpec) -> tuple:
+def _ub_relative_connectivity(
+    rank: int,
+    edges: tuple[tuple[int, int], ...],
+    stage_ranks: frozenset[int],
+) -> tuple[int, int]:
+    """Return ``(in_stage_peer_count, out_of_stage_peer_count)`` for homogeneity check."""
+    in_stage = sum(1 for src, dst in edges if src == rank and dst in stage_ranks)
+    out_stage = sum(1 for src, dst in edges if src == rank and dst not in stage_ranks)
+    return (in_stage, out_stage)
+
+
+def _homogeneity_key(
+    spec: DatapathCapabilitySpec,
+    rank: int,
+    stage_ranks: frozenset[int],
+) -> tuple:
     return (
         spec.compute_arch.arch_id,
         spec.aic_count,
@@ -269,7 +287,7 @@ def _homogeneity_key(spec: DatapathCapabilitySpec) -> tuple:
         tuple((p.name, p.source, p.target, p.unit, p.executor, p.sync)
               for p in spec.usable_paths),
         tuple(sorted(spec.matrix_output_paths)),
-        len(spec.ub_peer_edges),
+        _ub_relative_connectivity(rank, spec.ub_peer_edges, stage_ranks),
         (None if spec.stars is None else (
             spec.stars.resource, spec.stars.slots_per_die,
             spec.stars.descriptor_path.name)),
@@ -287,11 +305,12 @@ def datapath_for_devices(
     dies = tuple(devices)
     if not dies:
         raise ModelingError("stage_devices_empty")
+    stage_ranks = frozenset(int(d.rank) for d in dies)
     first_arch = dies[0].compute_arch
     first_key = _arch_capability_key(first_arch)
     first_edges = ub_peer_edges_for_rank(dies[0].rank, links, transfer_channels)
     first_datapath = datapath_for_die(dies[0], ub_peer_edges=first_edges)
-    first_dp_key = _homogeneity_key(first_datapath)
+    first_dp_key = _homogeneity_key(first_datapath, int(dies[0].rank), stage_ranks)
     for die in dies[1:]:
         if _arch_capability_key(die.compute_arch) != first_key:
             raise ModelingError(
@@ -300,7 +319,7 @@ def datapath_for_devices(
             )
         other_edges = ub_peer_edges_for_rank(die.rank, links, transfer_channels)
         other_datapath = datapath_for_die(die, ub_peer_edges=other_edges)
-        if _homogeneity_key(other_datapath) != first_dp_key:
+        if _homogeneity_key(other_datapath, int(die.rank), stage_ranks) != first_dp_key:
             raise ModelingError(
                 "stage_devices_heterogeneous_datapath:"
                 f"{first_datapath.arch_id}:{other_datapath.arch_id}"
