@@ -537,4 +537,3 @@ class _CollectivePlanBinding:
         if self.factory is None:
             raise ModelingError("collective_plan_factory_missing")
         return self.factory()
-

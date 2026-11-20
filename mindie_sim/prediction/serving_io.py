@@ -161,10 +161,27 @@ class ServingIO:
         plan = self.transfer_plan(direction, replica, stage_hbm=stage_hbm,
                                   tokens=tokens, requests=requests)
         volume = policy.volume(tokens, requests)
+        demand = {basis.resource: basis.volume(tokens, requests) for basis in plan}
+        coupled = False
+        dies = execution.stage_dies.get((replica, stage), ())
+        machine = getattr(execution.case, "machine", None)
+        if (volume > 0.0 and dies and machine is not None
+                and hasattr(machine, "host_root_complex_ceiling_gbps")
+                and machine.host_root_complex_ceiling_gbps(direction)):
+            from .collectives.ports import RootComplexKey
+            die0 = dies[0]
+            rc_name = RootComplexKey(
+                node=int(getattr(die0, "node", 0)),
+                root_complex_id=str(getattr(die0, "root_complex_id", "") or "rc0"),
+                direction=direction,
+            ).resource_name(execution.namespace)
+            if rc_name in execution.engine.resources:
+                demand[rc_name] = float(volume)
+                coupled = True
         copied = execution.engine.submit(
             prefix + ":" + direction + ":payload",
-            {basis.resource: basis.volume(tokens, requests) for basis in plan},
-            after=(ready,), owner=f"replica:{replica}")
+            demand,
+            after=(ready,), owner=f"replica:{replica}", coupled=coupled)
         if not policy.latency_us:
             return copied
         return execution.engine.submit(prefix + ":" + direction + ":complete", after=(copied,),

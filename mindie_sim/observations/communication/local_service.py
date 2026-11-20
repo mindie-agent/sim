@@ -17,10 +17,16 @@ from __future__ import annotations
 from functools import lru_cache
 import hashlib
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from statistics import median
 from typing import Mapping
 
+from mindie_sim.schema.common import ModelingError
+from ..multilevel_stream import (
+    CAPTURE_URI_SCHEME,
+    STREAM_CHUNK_BYTES,
+    validate_provenance_text,
+)
 from ..resource_services import normalize_resource_service
 from ..service_fitting import fit_resource_service
 from .calibration import _measurement_boundary, fit_a5_service_curves
@@ -53,6 +59,8 @@ DEFAULT_NATIVE_GROUPS = (2, 4, 8)
 _COLLECT_NATIVE_CACHE_SIZE = 4
 _FIT_NATIVE_CACHE_SIZE = 8
 _WEAK_IDENTIFICATION_REL_ERROR = 0.20
+_PUBLIC_SHA_PREFIX_LEN = 12
+_PUBLIC_DEFAULT_REPO = "mindie-agent/sim"
 
 __all__ = [
     "A5_COMM_LOCAL_SERVICE_SCHEMA",
@@ -73,20 +81,53 @@ __all__ = [
 
 
 def _file_sha256(path):
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        while chunk := handle.read(STREAM_CHUNK_BYTES):
+            digest.update(chunk)
+    return digest.hexdigest().lower()
+
+
+def _public_relpath(path: Path, anchor: Path) -> str:
+    try:
+        rel = path.relative_to(anchor).as_posix()
+    except ValueError:
+        rel = path.name
+    cleaned = PurePosixPath(rel.lstrip("/")).as_posix()
+    return path.name if (".." in PurePosixPath(cleaned).parts or cleaned in {"", "."}) else cleaned
+
+
+def _public_safe_text(value, *, default: str | None = "") -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return default
+    try:
+        validate_provenance_text(text, field_name="native_source")
+    except ModelingError:
+        return default
+    return text
+
+
+def _public_capture_uri(summary, scope: str, summary_sha: str, rel_summary: str) -> str:
+    raw_uri = _public_safe_text(summary.get("capture_uri"), default="") or ""
+    if raw_uri.startswith(CAPTURE_URI_SCHEME):
+        return raw_uri
+    scope_tag = (_public_safe_text(scope, default="native") or "native").replace("/", "_")
+    return f"{CAPTURE_URI_SCHEME}a5-native-comm/{scope_tag}/{summary_sha[:_PUBLIC_SHA_PREFIX_LEN]}/{rel_summary}"
 
 
 def _native_source_identity(path, *, stack, cann, execution_core, placement,
                             deployment_image_id):
-    """Validate the native wave's actual source/environment and return it.
+    """Validate the native wave's actual source/environment and return public provenance.
 
-    The identity is the environment that produced the observations: manifest
-    revision, software packages, host/image and intrahost UB topology.  A
-    caller may not respecify any of these and then reuse the fitted supply.
+    The environment (manifest revision, software packages, host/image and
+    intrahost UB topology) is strictly verified against the disk artifacts,
+    while the emitted provenance strips local absolute paths, hostnames, and
+    container/deployment image IDs to public capture URI + repo/rev/relpath/digest.
     """
     path = Path(path)
     summary = json.loads(path.read_text(encoding="utf-8"))
-    source_id = str(summary.get("manifest_sha256") or "")
+    source_id = str(summary.get("manifest_sha256") or "").strip().lower()
     manifest = path.parents[2] / "manifest" / "native-manifest.json"
     if not source_id or not manifest.is_file() or _file_sha256(manifest) != source_id:
         raise ValueError("native_service_manifest_identity_mismatch")
@@ -131,23 +172,31 @@ def _native_source_identity(path, *, stack, cann, execution_core, placement,
             return None
         return "unknown" if text.lower().startswith("unknown") else text
 
+    summary_sha = _file_sha256(path)
+    rel_summary = _public_relpath(path, path.parents[2])
+    scope = str(summary.get("scope") or "")
+    capture_uri = _public_capture_uri(summary, scope, summary_sha, rel_summary)
     identity = {
-        "path": str(path), "summary_sha256": _file_sha256(path),
-        "manifest_path": str(manifest), "manifest_sha256": source_id,
-        "versions_path": str(versions), "versions_sha256": _file_sha256(versions),
-        "environment_path": str(environment),
+        "capture_uri": capture_uri,
+        "source_ref": {
+            "repository": _public_safe_text(summary.get("repository"), default=_PUBLIC_DEFAULT_REPO),
+            "revision": _public_safe_text(summary.get("revision"), default=source_id),
+            "relative_path": rel_summary,
+            "source_sha256": summary_sha,
+        },
+        "summary_sha256": summary_sha,
+        "manifest_sha256": source_id,
+        "versions_sha256": _file_sha256(versions),
         "environment_sha256": _file_sha256(environment),
-        "environment_image_id": env_image, "host": host,
-        "topology_path": str(topology),
         "topology_sha256": _file_sha256(topology) if topology.is_file() else None,
-        "topology_interpretation": str(version.get("topology_interpretation") or ""),
-        "scope": str(summary.get("scope") or ""),
+        "topology_interpretation": _public_safe_text(version.get("topology_interpretation"), default=""),
+        "scope": _public_safe_text(scope, default=""),
         "python_packages": {key: packages.get(key)
                             for key in ("torch", "torch_npu", "cann")
                             if packages.get(key)},
         "hccl_algorithm": _declared(version.get("hccl_algorithm")),
         "hccl_protocol": _declared(version.get("hccl_protocol")),
-        "hccl_communicator_name": version.get("hccl_communicator_name"),
+        "hccl_communicator_name": _public_safe_text(version.get("hccl_communicator_name"), default=None),
     }
     return summary, identity
 
@@ -282,18 +331,19 @@ def _collect_native_service_cached(source: str, groups: tuple, stack: str,
     """
     del mtime_ns, size
     path = Path(source)
-    summary, _identity = _native_source_identity(
+    summary, identity = _native_source_identity(
         path, stack=stack, cann=cann, execution_core=execution_core,
         placement=placement, deployment_image_id=deployment_image_id)
-    conditions, heldout = _native_service_conditions(summary, path, groups)
+    source_uri = identity["capture_uri"]
+    conditions, heldout = _native_service_conditions(summary, source_uri, groups)
     campaign = {
-        "label": f"native-service:{str(summary.get('manifest_sha256'))[:12]}",
+        "label": f"native-service:{identity['manifest_sha256'][:_PUBLIC_SHA_PREFIX_LEN]}",
         "kind": "a5_collective_calibration", "status": "completed",
         "canary": "all_ranks_matched", "canary_ok": True,
         "hardware_key": A5_HARDWARE_KEY, "arch_family": A5_ARCH_FAMILY,
         "stack": str(stack), "cann": str(cann), "dtype": "bf16",
         "placement": placement, "observed_expansion_mode": execution_core,
-        "requested_expansion_mode": "unspecified", "source": str(path),
+        "requested_expansion_mode": "unspecified", "source": source_uri,
         "conditions": conditions,
     }
     ingested = _ingest_a5_campaign_data(campaign)
@@ -324,15 +374,17 @@ def _fit_native_local_service_cached(source: str, collective: str, group_size: i
     summary, source_identity = _native_source_identity(
         path, stack=stack, cann=cann, execution_core=execution_core,
         placement=placement, deployment_image_id=deployment_image_id)
+    source_uri = source_identity["capture_uri"]
     conditions, heldout = _native_service_conditions(
-        summary, path, (int(group_size),))
+        summary, source_uri, (int(group_size),))
     rows = [row for row in conditions if row["collective"] == collective]
     if not rows:
         raise ValueError(f"native_local_service_collective_missing:{collective}")
     direction = _NATIVE_LOCAL_DIRECTION[collective]
     domain, domain_key, applicability_key, lineage_key = _native_local_domain(
-        source_identity, group_size=int(group_size),
+        {**source_identity, "host": str(stack)}, group_size=int(group_size),
         stack=stack, cann=cann, direction=direction, dtype=dtype)
+    domain = {**domain, "source": source_identity}
     gaps = _local_service_evidence_gaps(collective, int(group_size))
     samples, source_records = [], []
     for row in rows:
@@ -343,14 +395,14 @@ def _fit_native_local_service_cached(source: str, collective: str, group_size: i
                 "duration_us": float(row["per_op_ms"]) * 1000.0,
                 "run_id": str(row["run_id"]), "repeat_index": 0,
                 "split": str(row["split"]),
-                "source": str(row.get("source") or path),
+                "source": str(row.get("source") or source_uri),
             })
             source_records.append({
                 "native_id": row["native_id"], "rank": None,
                 "repeat_index": None, "marker": None,
                 "status": "aggregate_only", "used_in_fit": True,
                 "work": int(row["payload_bytes"]), "split": str(row["split"]),
-                "source": str(row.get("source") or path),
+                "source": str(row.get("source") or source_uri),
             })
             continue
         for call in calls:
@@ -362,7 +414,7 @@ def _fit_native_local_service_cached(source: str, collective: str, group_size: i
                 "range_marker": call.get("range_marker"),
                 "status": call.get("status"), "used_in_fit": ok,
                 "work": int(row["payload_bytes"]), "split": str(row["split"]),
-                "source": str(row.get("source") or path),
+                "source": str(row.get("source") or source_uri),
             })
             if not ok:
                 continue
@@ -372,7 +424,7 @@ def _fit_native_local_service_cached(source: str, collective: str, group_size: i
                 "run_id": f"{row['native_id']}:rank{call['rank']}",
                 "repeat_index": int(call["repeat_index"]),
                 "split": str(row["split"]),
-                "source": (f"{path}:{row['native_id']}:rank{call['rank']}:"
+                "source": (f"{source_uri}#{row['native_id']}:rank{call['rank']}:"
                            f"rep{call['repeat_index']}:{call.get('marker')}"),
             })
     if not samples:
@@ -394,7 +446,7 @@ def _fit_native_local_service_cached(source: str, collective: str, group_size: i
             "concurrency_scope": "isolated_invocation",
         },
         "provenance": {
-            "source": str(path), "sources": [str(path)],
+            "source": source_uri, "sources": [source_uri],
             "window": "single_target_call",
             "observation_kind": "native_ai_cpu_child",
             "boundary_kind": "resource_phase", "scope": "independent",
@@ -504,8 +556,9 @@ def native_child_stage_evidence(source: str = NATIVE_A5_SERVICE_SOURCE, *,
     summary, source_identity = _native_source_identity(
         path, stack=stack, cann=cann, execution_core=execution_core,
         placement=placement, deployment_image_id=deployment_image_id)
+    source_uri = source_identity["capture_uri"]
     conditions, _heldout = _native_service_conditions(
-        summary, path, (int(group_size),))
+        summary, source_uri, (int(group_size),))
     service_record = fit_a5_native_local_service(
         source, collective=name, stack=stack, cann=cann,
         deployment_image_id=deployment_image_id, group_size=group_size,
@@ -567,7 +620,7 @@ def native_child_stage_evidence(source: str = NATIVE_A5_SERVICE_SOURCE, *,
                     and abs(combined - communication) < 1e-9),
                 "predicted_us": predicted_us,
                 "relative_error": predicted_us / child - 1,
-                "source": str(path),
+                "source": source_uri,
             })
     if not records:
         raise ValueError("native_child_evidence_no_records")

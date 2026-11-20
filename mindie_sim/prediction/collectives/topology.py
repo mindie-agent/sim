@@ -45,8 +45,11 @@ from .plans import (
 from .ports import (
     PairKey,
     PortKey,
+    SwitchKey,
     build_shared_port_resources,
+    build_shared_switch_resources,
     find_shared_port_keys,
+    find_shared_switch_keys,
     link_pair_key,
     link_port_key,
 )
@@ -206,6 +209,12 @@ class Topology(_TopologyPlansMixin):
             self.links.values(),
             self._node_of,
             port_semantics=_PORT_SEMANTICS,
+            channel_decls=self._channel_decls,
+        )
+        self._shared_switch_rates, self._link_shared_switches = find_shared_switch_keys(
+            self.links.values(),
+            self._node_of,
+            channel_decls=self._channel_decls,
         )
         self._resource_cache = None
         self._resource_rates = None
@@ -231,31 +240,31 @@ class Topology(_TopologyPlansMixin):
         link = self.links[link_name]
         if link.protocol_bands:
             return link.protocol_bands
-        return self._channel_bands.get(link.channel, ())
+        ch_bands = self._channel_bands.get(link.channel, ())
+        if not ch_bands:
+            return ()
+        ch_decl = self._channel_decls.get(link.channel)
+        if ch_decl is not None:
+            raw_alpha = ch_decl.get("latency_us", ch_decl.get("alpha_us"))
+            if raw_alpha is not None and not math.isclose(
+                float(link.latency_us), float(raw_alpha), rel_tol=1e-6, abs_tol=1e-9
+            ):
+                return ()
+        return ch_bands
 
     def port_key(self, link, rank: int, direction: str) -> PortKey:
         """Canonical physical ``PortKey`` for ``(link, rank, direction)``."""
-        key = link_port_key(link, int(rank), self._node_of(rank), direction)
-        if key.rail == 0 and link.channel in self._channel_rail:
-            return PortKey(
-                node=key.node,
-                physical_endpoint=key.physical_endpoint,
-                rail=self._channel_rail[link.channel],
-                direction=key.direction,
-            )
-        return key
+        return link_port_key(
+            link, int(rank), self._node_of(rank), direction,
+            channel_decl=self._channel_decls.get(link.channel),
+        )
 
     def pair_key(self, link, source: int, destination: int) -> PairKey:
         """Canonical physical ``PairKey`` for ``(link, source, destination)``."""
-        key = link_pair_key(link, int(source), int(destination))
-        if key.rail == 0 and link.channel in self._channel_rail:
-            return PairKey(
-                fabric=key.fabric,
-                physical_src=key.physical_src,
-                physical_dst=key.physical_dst,
-                rail=self._channel_rail[link.channel],
-            )
-        return key
+        return link_pair_key(
+            link, int(source), int(destination),
+            channel_decl=self._channel_decls.get(link.channel),
+        )
 
     def scope_for_group(self, ranks) -> str:
         """Return tightest physical scope spanning all ranks in ``ranks``."""
@@ -387,6 +396,7 @@ class Topology(_TopologyPlansMixin):
     def _build_resources(self, active: frozenset[int] | None = None):
         result = []
         included_shared_ports: dict[PortKey, float] = {}
+        included_shared_switches: dict[SwitchKey, float] = {}
         for link in self.links.values():
             endpoint_ranks = sorted({int(rank) for rank, _ in link.endpoint_rates})
             if active is not None and not (set(link.members) & active):
@@ -423,12 +433,22 @@ class Topology(_TopologyPlansMixin):
                               for rank in endpoint_ranks
                               for direction in ("tx", "rx"))
             if link.switch_capacity_bytes_per_ms is not None:
-                result.append(Resource(f"{self.namespace}link:{link.name}:switch_plane",
-                                       link.switch_capacity_bytes_per_ms, "bytes"))
+                sw_key = self._link_shared_switches.get(link.name)
+                if sw_key is not None:
+                    included_shared_switches[sw_key] = self._shared_switch_rates[sw_key]
+                else:
+                    result.append(Resource(f"{self.namespace}link:{link.name}:switch_plane",
+                                           link.switch_capacity_bytes_per_ms, "bytes"))
         if included_shared_ports:
             result.extend(
                 build_shared_port_resources(
                     included_shared_ports, namespace=self.namespace
+                )
+            )
+        if included_shared_switches:
+            result.extend(
+                build_shared_switch_resources(
+                    included_shared_switches, namespace=self.namespace
                 )
             )
         return tuple(result)
@@ -533,10 +553,12 @@ class Topology(_TopologyPlansMixin):
                 for idx in range(len(sources))
             )
         if axis == "etp":
-            if p.ep_spans_dp:
+            etp = max(1, int(p.etp))
+            if p.ep_spans_dp or etp <= 1:
                 return tuple((rank,) for rank in sources)
-            return tuple(sources[base + i:base + p.tp:p.ep]
-                         for base in range(0, len(sources), p.tp) for i in range(p.ep))
+            stride = max(1, p.tp // etp)
+            return tuple(sources[base + i:base + p.tp:stride]
+                         for base in range(0, len(sources), p.tp) for i in range(stride))
         if axis == "pcp":
             return tuple(sources[i::p.tp] for i in range(p.tp))
         if axis == "ep":
@@ -660,7 +682,11 @@ class Topology(_TopologyPlansMixin):
             if self._has_endpoint_rate(link, destination):
                 names.append(f"{self.namespace}link:{link.name}:rx:port{destination}")
         if link.switch_capacity_bytes_per_ms is not None:
-            names.append(f"{self.namespace}link:{link.name}:switch_plane")
+            sw_key = self._link_shared_switches.get(link.name)
+            if sw_key is not None:
+                names.append(sw_key.resource_name(self.namespace))
+            else:
+                names.append(f"{self.namespace}link:{link.name}:switch_plane")
         return tuple(names)
 
     def route_message(self, flow):

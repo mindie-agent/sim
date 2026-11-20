@@ -442,6 +442,79 @@ def _subgroup_tier(channels, raw, preset, declared, explicit, name, key,
     return peak, node_util, peak * node_util, latency
 
 
+OPTICAL_SMALL_FRAME_BYTES = 4096
+OPTICAL_MID_FRAME_BYTES = 65536
+OPTICAL_LARGE_FRAME_BYTES = 262144
+OPTICAL_SMALL_MAX_EXCLUSIVE = 65537
+OPTICAL_MID_MAX_EXCLUSIVE = 2097152
+OPTICAL_MID_CREDIT_BYTES = 524288
+OPTICAL_LARGE_CREDIT_BYTES = 2097152
+OPTICAL_MIN_GROUP = 2
+OPTICAL_SUPERPOD_EVIDENCE_ID = (
+    "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#a3_superpod_optical_hccs"
+)
+
+
+def _a3_superpod_optical_bands(superpod_size: int, latency_us: float) -> list[dict]:
+    max_group = max(OPTICAL_MIN_GROUP, int(superpod_size))
+    return [
+        {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": OPTICAL_MIN_GROUP,
+            "group_max": max_group,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 0,
+            "payload_max_exclusive": OPTICAL_SMALL_MAX_EXCLUSIVE,
+            "algorithm": "ring",
+            "protocol": "hccs_optical_small",
+            "startup_scope": "hop",
+            "startup_us": float(latency_us),
+            "payload_bytes_per_frame": OPTICAL_SMALL_FRAME_BYTES,
+            "wire_bytes_per_frame": OPTICAL_SMALL_FRAME_BYTES,
+            "credit_bytes": OPTICAL_MID_FRAME_BYTES,
+            "evidence_id": OPTICAL_SUPERPOD_EVIDENCE_ID,
+        },
+        {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": OPTICAL_MIN_GROUP,
+            "group_max": max_group,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": OPTICAL_SMALL_MAX_EXCLUSIVE,
+            "payload_max_exclusive": OPTICAL_MID_MAX_EXCLUSIVE,
+            "algorithm": "ring",
+            "protocol": "hccs_optical_mid",
+            "startup_scope": "hop",
+            "startup_us": float(latency_us),
+            "payload_bytes_per_frame": OPTICAL_MID_FRAME_BYTES,
+            "wire_bytes_per_frame": OPTICAL_MID_FRAME_BYTES,
+            "credit_bytes": OPTICAL_MID_CREDIT_BYTES,
+            "evidence_id": OPTICAL_SUPERPOD_EVIDENCE_ID,
+        },
+        {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": OPTICAL_MIN_GROUP,
+            "group_max": max_group,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": OPTICAL_MID_MAX_EXCLUSIVE,
+            "payload_max_exclusive": None,
+            "algorithm": "ring",
+            "protocol": "hccs_optical_large",
+            "startup_scope": "hop",
+            "startup_us": float(latency_us),
+            "payload_bytes_per_frame": OPTICAL_LARGE_FRAME_BYTES,
+            "wire_bytes_per_frame": OPTICAL_LARGE_FRAME_BYTES,
+            "credit_bytes": OPTICAL_LARGE_CREDIT_BYTES,
+            "evidence_id": OPTICAL_SUPERPOD_EVIDENCE_ID,
+        },
+    ]
+
+
 def _generated_links(combined, raw, preset, channels, count, per_package,
                      per_node, explicit, bw_caller, declared):
     placements = resolve_device_placements(
@@ -507,6 +580,10 @@ def _generated_links(combined, raw, preset, channels, count, per_package,
             raise ModelingError("ascend_superpod_size_smaller_than_node")
     inter_tier = (_tier_bandwidth(channels, "d2d_inter_node")
                   if "d2d_inter_node" in channels else None)
+    orig_inter_decl = (
+        deepcopy(channels["d2d_inter_node"])
+        if "d2d_inter_node" in channels else None
+    )
     if superpod_size is not None and inter_tier is not None:
         same_peak, same_util, same_capacity, same_latency = resolve_same_pod_tier(
             combined, raw, preset, declared, "d2d_inter_node" in explicit,
@@ -517,9 +594,23 @@ def _generated_links(combined, raw, preset, channels, count, per_package,
             effective_uni_bw_gbps=same_capacity,
             peak_capacity_bytes_per_ms=same_peak * GBPS_TO_BYTES_PER_MS,
             latency_us=same_latency)
+        is_a3_superpod = (
+            raw.get("topology_preset") == "a3_superpod"
+            or str(combined.get("sku", "")).startswith("Ascend910_93")
+        )
+        if is_a3_superpod and "d2d_inter_node" not in explicit:
+            channels["d2d_inter_node"].update(
+                protocol="HCCS_OPTICAL_SUPERPOD",
+                transport_mode="optical_hccs",
+                rail_id="hccs_optical_r0",
+                switch_id="superpod_sw0",
+                scope="cross_node",
+                alpha_us=same_latency,
+                protocol_bands=_a3_superpod_optical_bands(superpod_size, same_latency),
+            )
     if per_node > 0 and count > per_node and inter_tier is not None:
         inter_peak, inter_util, inter_effective = inter_tier
-        inter_decl = channels["d2d_inter_node"]
+        inter_decl = orig_inter_decl or channels["d2d_inter_node"]
         inter_latency = _declaration_latency(inter_decl)
         if superpod_size is not None:
             links.extend(_group_links(

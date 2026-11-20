@@ -16,6 +16,7 @@
 """
 from __future__ import annotations
 
+from .communication import MessageFlow
 from .collectives.topology import (
     _PORT_SEMANTICS,
     _SCOPE_PRIORITY,
@@ -49,6 +50,7 @@ __all__ = [
     "DIRECT_MESH_MAX_PEERS",
     "DIRECT_MESH_PHASES",
     "FlowPath",
+    "MessageFlow",
     "Topology",
     "TopologyCommunicationWork",
     "TransportOptions",

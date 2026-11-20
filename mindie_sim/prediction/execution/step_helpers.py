@@ -30,27 +30,110 @@ from .streams import (
     _declaration_of,
     _metadata_dict,
 )
-from .submission import ScheduledIteration, StarsDescriptorQueue
+from .submission import (
+    DEFAULT_SPLIT_DTYPE_BYTES,
+    EagerSplitBarrier,
+    ScheduledIteration,
+    SplitBarrierSpec,
+    StarsDescriptorQueue,
+)
 
 LAZY_SAFE_CACHE_LIMIT = 16384
+DEFAULT_FAST_LAZY_STARS_DEPTH = 64
+EAGER_MOE_DISPATCH_RECIPES = frozenset({
+    "expert_dispatch", "expert_quantized_dispatch",
+})
+
+
+def _stars_controller_id(spec, replica: int, stage: int, die) -> str:
+    scope = str(getattr(spec, "queue_scope", "die") or "die")
+    if scope == "die":
+        return f"die{int(die.rank)}"
+    if scope == "package":
+        return f"n{int(getattr(die, 'node', 0))}:pkg{int(getattr(die, 'package', 0))}"
+    if scope == "node":
+        return f"n{int(getattr(die, 'node', 0))}"
+    if scope == "replica":
+        return f"r{int(replica)}"
+    return f"r{int(replica)}:s{int(stage)}"
+
+
+def _stars_is_noop_placeholder(spec) -> bool:
+    """True only for the uncalibrated default profile placeholder."""
+    return (
+        float(spec.issue_interval_us) == 0.0
+        and float(spec.first_issue_us) == 0.0
+        and str(spec.release_policy) == "descriptor_ready"
+        and int(spec.queue_depth) >= DEFAULT_FAST_LAZY_STARS_DEPTH
+        and str(getattr(spec, "evidence_id", "")) == "pending_raw_dispatch_trace"
+    )
 
 
 def build_stars_queues(
     stage_profiles, namespace: str
-) -> dict[tuple[int, int], StarsDescriptorQueue]:
-    """Build device-boundary STARS queues for stages declaring non-zero issue."""
-    queues: dict[tuple[int, int], StarsDescriptorQueue] = {}
+) -> dict[tuple[int, int], tuple[tuple[int, StarsDescriptorQueue], ...]]:
+    """Build representative-shard STARS queues for every active ``StarsSpec``.
+
+    Instantiates active queues even when ``issue_interval_us == 0`` (e.g.
+    explicit finite ``queue_depth`` or non-placeholder evidence) so credit
+    depth and ``release_policy`` govern concurrency, sharing controllers across
+    replicas/stages that map to the same ``queue_scope``.
+    """
+    by_controller: dict[str, StarsDescriptorQueue] = {}
+    stage_queues: dict[tuple[int, int], tuple[tuple[int, StarsDescriptorQueue], ...]] = {}
     for key, profile in stage_profiles.items():
         datapath = getattr(profile, "datapath", None)
         spec = getattr(datapath, "stars_spec", None)
-        if spec is None:
+        if spec is None or _stars_is_noop_placeholder(spec):
             continue
-        if spec.issue_interval_us > 0.0 or spec.first_issue_us > 0.0:
-            die_id = int(profile.dies[0].rank) if profile.dies else int(key[0])
-            queues[key] = StarsDescriptorQueue(
-                spec, die_id=die_id, namespace=namespace
+        replica, stage = key
+        dies = profile.dies or ()
+        rep_die = (
+            dies[0] if dies
+            else type("_D", (), {"rank": replica, "node": 0, "package": 0})()
+        )
+        die_rank = int(rep_die.rank)
+        ctrl = _stars_controller_id(spec, replica, stage, rep_die)
+        queue = by_controller.get(ctrl)
+        if queue is None:
+            queue = StarsDescriptorQueue(
+                spec, die_id=die_rank, namespace=namespace, controller_id=ctrl
             )
-    return queues
+            by_controller[ctrl] = queue
+        stage_queues[key] = ((die_rank, queue),)
+    return stage_queues
+
+
+def attach_stars_queues(execution) -> None:
+    """Build and register STARS queues/pools on ``execution.engine``."""
+    execution.stars_queues = build_stars_queues(
+        execution.stage_profiles, execution.namespace
+    )
+    seen: set[int] = set()
+    for entries in execution.stars_queues.values():
+        for _die_rank, queue in entries:
+            if id(queue) not in seen:
+                seen.add(id(queue))
+                queue.ensure_engine_resources(execution.engine)
+    execution._stars_replay_seq = {}
+    execution._stars_occ_seq = 0
+    execution.eager_split_barriers = []
+
+
+def build_stars_summary(execution) -> dict[str, Any]:
+    """Assemble per-stage and per-die STARS descriptor summaries."""
+    out: dict[str, Any] = {}
+    for (replica, stage), entries in sorted(execution.stars_queues.items()):
+        dies_out = {
+            f"d{die_rank}": q.summary()
+            for die_rank, q in entries if q.descriptor_count > 0
+        }
+        if dies_out:
+            primary = next(iter(dies_out.values()))
+            out[f"r{replica}:s{stage}"] = {
+                **primary, "die_count": len(dies_out), "dies": dies_out,
+            }
+    return out
 
 
 def bind_stream_plans(stream_plans, stage_profiles, namespace: str):
@@ -94,6 +177,34 @@ def bind_stream_plans(stream_plans, stage_profiles, namespace: str):
     return stream_owners, stream_quota_by_res, extra_resources
 
 
+def _stars_allows_lazy_fastpath(execution, physical_ops) -> bool:
+    if not execution.stars_queues:
+        return True
+    for entries in execution.stars_queues.values():
+        for _die_rank, queue in entries:
+            spec = queue.spec
+            if (spec.issue_interval_us > 0.0
+                    or spec.first_issue_us > 0.0
+                    or spec.release_policy != "descriptor_ready"
+                    or int(spec.queue_depth) < DEFAULT_FAST_LAZY_STARS_DEPTH):
+                return False
+    streams = {op.stream or "main" for op in physical_ops}
+    return len(streams) <= 1
+
+
+def _has_eager_moe_split_barrier(execution, physical_ops) -> bool:
+    if not execution.include_submission or int(execution.case.runtime.parallel.ep) <= 1:
+        return False
+    machine = execution.case.machine
+    if not (hasattr(machine, "host_solo_bw_gbps") and machine.host_solo_bw_gbps("d2h")):
+        return False
+    return any(
+        op.recipe in EAGER_MOE_DISPATCH_RECIPES
+        and str(getattr(op, "phase", "")).strip().lower() == "prefill"
+        for op in physical_ops
+    )
+
+
 def try_lazy_add(execution, work, replica, release_ms, *, scope, schedule,
                  prepared, input_ready, physical_ops, prefix, external,
                  emitted_tokens, memory_bindings, state_accesses):
@@ -102,7 +213,8 @@ def try_lazy_add(execution, work, replica, release_ms, *, scope, schedule,
             and scope == "none" and execution._collectives is None
             and execution.offload_policy is None
             and not execution.readiness_report
-            and not execution.stars_queues):
+            and _stars_allows_lazy_fastpath(execution, physical_ops)
+            and not _has_eager_moe_split_barrier(execution, physical_ops)):
         return None
     safe_cache = execution._lazy_safe_id_cache
 
@@ -382,6 +494,80 @@ def build_submission_summary(execution) -> dict[str, Any]:
     }
 
 
+def schedule_eager_moe_split_barrier(
+    execution, op, replica: int, scope: str, name: str, deps: list, ids: dict,
+):
+    """Wire ``EagerSplitBarrier`` into host+device Prefill Eager MoE dispatch."""
+    if (not execution.include_submission
+            or scope != "none"
+            or op.recipe not in EAGER_MOE_DISPATCH_RECIPES
+            or str(getattr(op, "phase", "")).strip().lower() != "prefill"):
+        return None
+    meta = _metadata_dict(op)
+    ep_size = int(meta.get("moe_ep_size") or execution.case.runtime.parallel.ep or 1)
+    if ep_size <= 1:
+        return None
+    machine = execution.case.machine
+    if not (hasattr(machine, "host_solo_bw_gbps") and machine.host_solo_bw_gbps("d2h")):
+        return None
+    stage_dies = execution.stage_dies.get((replica, op.stage), ())
+    if not stage_dies:
+        return None
+    num_experts = int(
+        meta.get("moe_num_experts")
+        or getattr(execution.case.model, "num_experts", 0)
+        or ep_size
+    )
+    num_local_experts = max(1, num_experts // ep_size)
+    dtype_bytes = int(meta.get("split_dtype_bytes") or DEFAULT_SPLIT_DTYPE_BYTES)
+    spec = SplitBarrierSpec(
+        ep_size=ep_size,
+        num_local_experts=num_local_experts,
+        split_dtype_bytes=dtype_bytes,
+        pinned=bool(meta.get("split_pinned", True)),
+        non_blocking=bool(meta.get("split_non_blocking", True)),
+    )
+    engine = execution.engine
+    owner = f"replica:{replica}"
+    barrier_entry = engine.submit(
+        f"{name}:eager_split:entry", after=tuple(deps), owner=owner
+    )
+    ag_event = next(
+        (ev for op_id, ev in ids.items() if op_id.endswith(".moe_histogram_gather")),
+        None,
+    )
+    indep_events = (
+        tuple(ev for op_id, ev in ids.items() if op_id not in op.deps)
+        if spec.requires_explicit_device_sync
+        else ()
+    )
+    result = EagerSplitBarrier.submit(
+        engine,
+        machine,
+        stage_dies[0],
+        spec,
+        barrier_entry,
+        name=f"{name}:eager_split",
+        namespace=execution.namespace,
+        allgather_event=ag_event,
+        independent_device_events=indep_events,
+        owner=owner,
+    )
+    deps.append(result.dispatch_ready)
+    execution.eager_split_barriers.append({
+        "op_id": op.op_id,
+        "replica": replica,
+        "stage": op.stage,
+        "ep_size": ep_size,
+        "num_local_experts": num_local_experts,
+        "input_splits_bytes": result.input_splits_bytes,
+        "output_splits_bytes": result.output_splits_bytes,
+        "explicit_device_sync": result.explicit_device_sync is not None,
+        "d2h_resources": list(result.d2h_resources),
+    })
+    return barrier_entry
+
+
 def build_execution_summary(execution) -> dict[str, Any]:
     """Assemble the complete Execution summary dict."""
     native_groups = execution.native_group_summary()
@@ -390,11 +576,13 @@ def build_execution_summary(execution) -> dict[str, Any]:
         k: v for k, v in eng_summary["serviced"].items()
         if (not execution.stream_quota_by_res or "stream_quota@" not in k)
         and not ("host_rc:" in k and v == 0)
+        and not ("stars:" in k and v == 0)
     }
     busy_ms = {
         k: v for k, v in eng_summary["resource_busy_ms"].items()
         if (not execution.stream_quota_by_res or "stream_quota@" not in k)
         and not ("host_rc:" in k and v == 0)
+        and not ("stars:" in k and v == 0)
     }
     if (len(serviced) != len(eng_summary["serviced"])
             or len(busy_ms) != len(eng_summary["resource_busy_ms"])):
@@ -411,6 +599,8 @@ def build_execution_summary(execution) -> dict[str, Any]:
         "recipes": dict(execution.recipes_used),
         "submission": execution.submission_summary(),
         **({"stars": stars} if stars else {}),
+        **({"eager_split_barriers": list(execution.eager_split_barriers)}
+           if execution.eager_split_barriers else {}),
         "serving_io": execution.serving_io.summary(),
         "step_summary": execution.step_summary.to_dict(),
         "rank_model": "representative_local_shard_per_stage",

@@ -378,8 +378,11 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
             requests=requests, family="alltoall", phase=mode, recipe="expert_dispatch",
             link_bytes=dispatch_exchange_bytes,
             shape=(int(tokens) * int(plan.top_k), latent),
-            metadata=collective_meta + (("collective_id", prefix + ".dispatch"),)
-            + dispatch_quant_meta,
+            metadata=collective_meta + (
+                ("collective_id", prefix + ".dispatch"),
+                ("moe_num_experts", int(plan.num_experts)),
+                ("moe_ep_size", int(parallel.ep)),
+            ) + dispatch_quant_meta,
         )
         dispatch = masked_collective(dispatch)
         dispatch = scale_exchange_operator(

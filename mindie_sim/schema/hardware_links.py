@@ -207,6 +207,15 @@ def validate_protocol_bands(bands: Sequence[CollectiveBandSpec]) -> tuple[Collec
     return parsed
 
 
+def normalize_link_scope(scope: Any, name: str = "") -> str:
+    """Validate and normalize a declared link/channel scope."""
+    normalized = str(scope).strip().lower()
+    if normalized not in VALID_LINK_SCOPES:
+        prefix = f"{name}:" if name else ""
+        raise ModelingError(f"link_scope_unknown:{prefix}{scope}")
+    return normalized
+
+
 def parse_collective_bands(raw: Sequence[Any] | None) -> tuple[CollectiveBandSpec, ...]:
     """Parse and validate a sequence of ``CollectiveBandSpec`` records."""
     if not raw:
@@ -268,10 +277,7 @@ class Link:
                     or not math.isfinite(float(peak)) or float(peak) <= 0):
                 raise ModelingError(f"link_peak_capacity_invalid:{self.name}")
         if self.scope is not None:
-            normalized_scope = str(self.scope).strip().lower()
-            if normalized_scope not in VALID_LINK_SCOPES:
-                raise ModelingError(f"link_scope_unknown:{self.name}:{self.scope}")
-            object.__setattr__(self, "scope", normalized_scope)
+            object.__setattr__(self, "scope", normalize_link_scope(self.scope, self.name))
         if isinstance(self.rail_id, bool):
             raise ModelingError(f"link_rail_id_invalid:{self.name}:{self.rail_id}")
         if isinstance(self.rail_id, int):
@@ -518,6 +524,8 @@ def _transfer_channel(channel: Mapping, name: str = "transfer") -> Link:
     """Build one link from a transfer-channel declaration."""
     if not isinstance(channel, Mapping):
         raise ModelingError(f"transfer_channel_record_invalid:{name}")
+    if "scope" in channel and channel["scope"] is not None:
+        normalize_link_scope(channel["scope"])
     allowed = {
         "channel", "channel_name", "gbps", "capacity_bytes_per_ms",
         "capacity_gbps", "members", "latency_us", "channel_semantics",
@@ -529,7 +537,8 @@ def _transfer_channel(channel: Mapping, name: str = "transfer") -> Link:
         "uni_peak_bw_gbps", "bi_peak_bw_gbps", "calibrated_uni_bw_gbps",
         "calibrated_bi_bw_gbps", "derived_uni_bw_gbps", "derived_bi_bw_gbps",
         "effective_bi_bw_gbps", "pageable_uni_bw_gbps", "node_peak_bw_gbps",
-        "solo_effective_uni_bw_gbps", "alpha_us", "protocol", "transport_mode",
+        "solo_uni_bw_gbps", "solo_effective_uni_bw_gbps", "fabric",
+        "alpha_us", "protocol", "transport_mode",
         "notes", "bandwidth_provenance", "scope", "rail_id", "switch_id",
         "root_complex_id", "endpoint_ids", "protocol_bands",
     }
@@ -622,7 +631,9 @@ def _neutral_transfer_channel_links(raw: Mapping) -> list[dict]:
             continue
         try:
             link = _transfer_channel(channel, str(name))
-        except ModelingError:
+        except ModelingError as exc:
+            if str(exc).startswith("link_scope_unknown"):
+                raise
             continue
         record = link.to_dict()
         record["name"] = str(name)

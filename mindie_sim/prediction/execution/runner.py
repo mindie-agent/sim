@@ -49,12 +49,14 @@ from .context import (
 )
 from .lazy_submit import _LazySubmitMixin
 from .step_helpers import (
+    attach_stars_queues,
     bind_stream_plans,
     build_execution_summary,
-    build_stars_queues,
+    build_stars_summary,
     build_submission_summary,
     finalize_step,
     observe_collective_readiness,
+    schedule_eager_moe_split_barrier,
     schedule_op_offload_reads,
     schedule_op_offload_writes,
     schedule_step_offload_tails,
@@ -219,11 +221,7 @@ class Execution(_ContextMixin, _CohortMixin, _LazySubmitMixin):
             if not self.engine.bind_memory(self.memory, pools=("hbm",)):
                 raise ModelingError("execution_memory_ledger_conflict")
 
-        self.stars_queues = build_stars_queues(self.stage_profiles, self.namespace)
-        for queue in self.stars_queues.values():
-            queue.ensure_engine_resources(self.engine)
-        self._stars_replay_seq: dict[tuple[int, int], int] = {}
-        self._stars_occ_seq: int = 0
+        attach_stars_queues(self)
 
         self.resource_rates = ResourceRates(self.engine.resources)
         self.stage_geometry = {
@@ -301,11 +299,7 @@ class Execution(_ContextMixin, _CohortMixin, _LazySubmitMixin):
             if not self.engine.bind_memory(self.memory, pools=("hbm",)):
                 raise ModelingError("execution_memory_ledger_conflict")
         self.engine.ensure_state_ledger(None)
-        self.stars_queues = build_stars_queues(self.stage_profiles, self.namespace)
-        for queue in self.stars_queues.values():
-            queue.ensure_engine_resources(self.engine)
-        self._stars_replay_seq = {}
-        self._stars_occ_seq = 0
+        attach_stars_queues(self)
         self.resource_rates = ResourceRates(self.engine.resources)
         self.stage_contexts = {key: self._stage_context(key, dies)
                                for key, dies in self.stage_dies.items()}
@@ -642,22 +636,31 @@ class Execution(_ContextMixin, _CohortMixin, _LazySubmitMixin):
                     host_submits.append((replica, op.stage, start))
                 deps.append(host_launch)
 
-            stars_queue = self.stars_queues.get(stage_key)
-            stars_record = stars_alloc = None
-            if stars_queue is not None and submit and not is_zero_kernel_view(op):
-                if stage_key not in step_replay_ids:
+            stage_stars = self.stars_queues.get(stage_key, ())
+            stars_issued: list[tuple[Any, Any, Any]] = []
+            if stage_stars and submit and not is_zero_kernel_view(op):
+                replay_slot = (
+                    (stage_key, "graph", capture_key)
+                    if captured else (stage_key, "eager", op.op_id)
+                )
+                if replay_slot not in step_replay_ids:
                     rep_id = self._stars_replay_seq.get(stage_key, 0)
                     self._stars_replay_seq[stage_key] = rep_id + 1
-                    step_replay_ids[stage_key] = rep_id
+                    step_replay_ids[replay_slot] = rep_id
                 self._stars_occ_seq += 1
                 desc_ready = host_launch if host_launch is not None else prepared
-                stars_record, stars_alloc = stars_queue.issue_descriptor(
-                    engine, replay=step_replay_ids[stage_key],
-                    stream=op.stream or "main",
-                    kernel_occurrence=self._stars_occ_seq,
-                    descriptor_ready=desc_ready, owner=owner)
-                deps.append(stars_record.issue_done_event)
+                for die_rank, s_queue in stage_stars:
+                    s_rec, s_alloc = s_queue.issue_descriptor(
+                        engine, replay=step_replay_ids[replay_slot],
+                        stream=op.stream or "main",
+                        kernel_occurrence=self._stars_occ_seq,
+                        descriptor_ready=desc_ready, owner=owner, die=die_rank)
+                    stars_issued.append((s_queue, s_rec, s_alloc))
+                    deps.append(s_rec.issue_done_event)
 
+            barrier_entry = schedule_eager_moe_split_barrier(
+                self, op, replica, scope, name, deps, ids
+            )
             ready = engine.submit(name + ":ready", after=tuple(deps) or (schedule,), owner=owner)
             if (self.readiness_report
                     and op.family in {"collective", "allgather", "reduce_scatter",
@@ -690,18 +693,22 @@ class Execution(_ContextMixin, _CohortMixin, _LazySubmitMixin):
                     memory_ledger=self.memory, memory_pools=(physical_hbm,),
                     memory_bindings=memory_bindings_for(op, memory_bindings))
             complete = kernel_groups.finish(op, context, recipe, complete, stream_key)
-            if stars_queue is not None and stars_record is not None:
-                stars_queue.bind_kernel_execution(
-                    engine, stars_record, stars_alloc,
-                    kernel_start=ready, kernel_done=complete, owner=owner)
+            if stars_issued:
+                group = kernel_groups.group(op)
+                physical_done = group.completion if group is not None else complete
+                for s_queue, s_rec, s_alloc in stars_issued:
+                    s_queue.bind_kernel_execution(
+                        engine, s_rec, s_alloc,
+                        kernel_start=ready, kernel_done=physical_done, owner=owner)
             ids[op.op_id] = complete
             schedule_op_offload_writes(
                 self, op, work, replica, prefix, complete, bound_accesses,
                 last_expert_done, last_kv_done, kv_writeback_events,
                 owned_offload, last_draft_done, pending_draft)
             if self.on_operator is not None:
+                op_start = barrier_entry if barrier_entry is not None else ready
                 self.on_operator(original, replica, "JointNativeService" if context.joint_native_service
-                                 is not None else type(recipe).__name__, ready, complete)
+                                 is not None else type(recipe).__name__, op_start, complete)
             if op.family == "token_commit":
                 declared_commits.update((request, complete) for request in op.requests)
             for key in self.work:
@@ -730,12 +737,8 @@ class Execution(_ContextMixin, _CohortMixin, _LazySubmitMixin):
         return build_submission_summary(self)
 
     def stars_summary(self) -> dict[str, Any]:
-        """Return STARS descriptor/uncovered summaries for stages with records."""
-        return {
-            f"r{replica}:s{stage}": queue.summary()
-            for (replica, stage), queue in sorted(self.stars_queues.items())
-            if queue.records
-        }
+        """Return STARS descriptor/uncovered summaries per stage and die."""
+        return build_stars_summary(self)
 
     def summary(self) -> dict:
         return build_execution_summary(self)

@@ -345,11 +345,27 @@ class _TopologyPlansMixin:
                 volume = next(iter(volumes.values()), 0.0)
                 payload = volume / rounds if rounds else 0.0
                 startup_ms = self.mesh_phase_startup_ms(links)
+                phase_startups = [startup_ms] * len(names)
+                from .band_plan import api_bytes_from_link_volume
+                from .protocol import (
+                    MS_PER_S as _MS_PER_S,
+                    _candidate_bands,
+                    _infer_group_scope,
+                    select_band,
+                )
+                if _candidate_bands(ranks, self, _infer_group_scope(ranks, self)):
+                    api_b = api_bytes_from_link_volume(family, len(ranks), volume, metadata)
+                    band = select_band(family, ranks, self, api_b)
+                    band_ms = float(band.startup_us) / _MS_PER_S
+                    if band.startup_scope == "collective":
+                        phase_startups = [band_ms] + [0.0] * max(0, len(names) - 1)
+                    else:
+                        phase_startups = [band_ms] * len(names)
                 groups.append(DirectMeshGroup(
                     ranks, tuple((rank, volumes[rank]) for rank in ranks),
                     tuple(DirectMeshPhase(
-                        ranks, payload, self, phase=name, startup_ms=startup_ms)
-                        for name in names), self))
+                        ranks, payload, self, phase=name, startup_ms=p_ms)
+                        for name, p_ms in zip(names, phase_startups)), self))
             return DirectMeshPlan(family, tuple(groups))
         if algorithm == "ring":
             if "peer_traffic" in metadata:
@@ -540,6 +556,95 @@ class _TopologyPlansMixin:
             useful_by_rank, useful, wire, transactions, transaction_frames, count, latency,
             routed_useful, physical_wire, max_path_latency,
         ))
+
+    def band_collective_plan(
+        self, op, participants, *, algorithm="ring", transport=None,
+        expansion_mode=None, stack="default",
+    ):
+        """Build one unified ``BandCollectivePlan`` when protocol bands apply.
+
+        Returns ``None`` when no traversed links/channels declare
+        ``protocol_bands``, when explicit non-band ``transport`` options or
+        non-band algorithms are requested, or when group size ``<= 1``.
+        """
+        if algorithm not in {"ring", "pairwise"}:
+            return None
+        if transport is not None:
+            opts = (
+                TransportOptions.from_mapping(transport)
+                if isinstance(transport, Mapping)
+                else transport
+            )
+            if (opts.chunk_bytes is not None
+                    or float(opts.hop_startup_us or 0.0) > 0.0
+                    or opts.receive_capacity_bytes_per_peer is not None
+                    or opts.receive_buffer_id is not None):
+                return None
+        from .band_plan import build_band_collective_plan
+        from .protocol import SUPPORTED_COLLECTIVES, _candidate_bands, _infer_group_scope
+
+        raw_meta = dict(op.metadata)
+        raw_family = str(raw_meta.get("collective", op.family)).strip().lower()
+        aliases = {"all_reduce": "allreduce", "all_gather": "allgather",
+                   "all_to_all": "alltoall", "all_to_all_v": "alltoallv"}
+        norm_family = aliases.get(raw_family, raw_family)
+        if norm_family not in SUPPORTED_COLLECTIVES:
+            return None
+        raw_axis = raw_meta.get("group_axis", op.link_scope)
+        if raw_axis == "pp":
+            return None
+
+        family, unique_groups, volume_by_rank, metadata = self._joint_groups(
+            op, participants
+        )
+        norm_family = aliases.get(str(family).strip().lower(), str(family).strip().lower())
+        if norm_family not in SUPPORTED_COLLECTIVES:
+            return None
+        if not unique_groups or all(len(ranks) <= 1 for ranks in unique_groups):
+            return None
+        if any(
+            not _candidate_bands(ranks, self, _infer_group_scope(ranks, self))
+            for ranks in unique_groups
+            if len(ranks) > 1
+        ):
+            return None
+        if algorithm == "ring":
+            if "peer_traffic" in metadata:
+                return None
+            phases = {"allreduce": 2, "reduce_scatter": 1, "allgather": 1}
+            if norm_family not in phases:
+                return None
+            for ranks in unique_groups:
+                rounds = max(phases[norm_family] * (len(ranks) - 1), 0)
+                if metadata.get("steps", rounds) != rounds:
+                    return None
+        peer = None
+        if "peer_traffic" in metadata:
+            if norm_family not in {"alltoall", "alltoallv"}:
+                return None
+            sizes = {len(ranks) for ranks in unique_groups}
+            if len(sizes) != 1:
+                return None
+            peer = _declared_peer_traffic(metadata, next(iter(sizes)))
+            for ranks in unique_groups:
+                for index, rank in enumerate(ranks):
+                    declared = volume_by_rank[rank]
+                    if not _peer_totals_match(
+                            _peer_declared_volume(peer, metadata, index), declared):
+                        return None
+        elif norm_family == "alltoallv":
+            return None
+        exp = expansion_mode or metadata.get("expansion_mode")
+        stack_id = str(metadata.get("stack_id") or stack or "default")
+        try:
+            return build_band_collective_plan(
+                self, norm_family, unique_groups, volume_by_rank, metadata,
+                peer=peer, stack=stack_id, expansion_mode=exp,
+            )
+        except ModelingError as exc:
+            if str(exc).startswith("collective_band_missing"):
+                return None
+            raise
 
     def demand(self, op, replica, *, volume=None, transport=None, recipe=None):
         work = self.accounting(

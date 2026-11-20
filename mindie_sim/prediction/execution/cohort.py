@@ -228,9 +228,20 @@ class _CohortMixin(_CohortNativeMixin):
                 raise ModelingError(f"joint_collective_declarations_differ:{key}")
             if any(value for role, value in item.context.native_work.items() if role != "link"):
                 raise ModelingError(f"{algorithm}_collective_requires_transport_only_work")
-        plan = self.topology.joint_plan(
-            op, {item.replica: item.context.native_work.get("link", 0)
-                 for item in participants}, algorithm=algorithm, **plan_options)
+        participants_vol = {
+            item.replica: item.context.native_work.get("link", 0)
+            for item in participants
+        }
+        plan = (
+            self.topology.band_collective_plan(
+                op, participants_vol, algorithm=algorithm,
+            )
+            if (algorithm in {"ring", "pairwise"} and not plan_options)
+            else None
+        )
+        if plan is None:
+            plan = self.topology.joint_plan(
+                op, participants_vol, algorithm=algorithm, **plan_options)
         plan.validate_path_model(path_model)
         source_stage = int(dict(op.metadata).get("source_stage", op.stage))
         ready_by_rank = {}
@@ -524,4 +535,3 @@ class _CohortMixin(_CohortNativeMixin):
             "partial": tuple(result["partial"]),
         }
         return True
-

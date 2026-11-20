@@ -2,28 +2,32 @@
 
 [Role]
   Implement ``select_band`` over declared ``CollectiveBandSpec`` intervals
-  (``[0, 65537)``, ``[65537, 2097152)``, ``[2097152, None)``), exact protocol
-  framing, zero-payload rendezvous preservation, Ring AllReduce ``2(P-1)B/P``
-  and AllToAllV integer peer-matrix verification, and shared-port Engine
-  submission for multi-coset contention.
+  with explicit ``expansion_mode`` disambiguation, exact API-convention byte
+  lowering (AllReduce, ReduceScatter, AllGather, AllToAll, AllToAllV), declared
+  ``band.algorithm`` dispatch, per-hop sequential pipelining with finite
+  ``credit_bytes`` backpressure, and Engine submission.
 
 [Invariants]
   * Payload intervals under a fixed selector are disjoint; missing coverage or
     ambiguous matches raise explicit ``ModelingError``.
-  * Zero-payload calls preserve caller rendezvous without emitting wire work.
-  * Ring AllReduce lowers into dependent ``reduce_scatter`` then ``all_gather``
-    phases with verified per-rank payload ``2 * (P - 1) * B / P``.
-  * AllToAllV validates non-negative integer peer matrices, separates diagonal
-    self-copy bytes from wire flows, and verifies row/column sums.
-  * Startup latency is charged strictly once per ``band.startup_scope``
-    (``collective``, ``phase``, or ``hop``); ``busbw`` is never reused as
-    directed link bandwidth.
+  * Collective API byte conventions are exact:
+    - AllReduce(P, B): ``2*(P-1)*B/P`` sent per rank.
+    - ReduceScatter(P, B): ``(P-1)*B/P`` sent per rank.
+    - AllGather(P, B): input ``B``/rank -> ``(P-1)*B`` sent per rank.
+    - AllToAll(P, B): total send buffer ``B`` -> ``B/P`` self-copy +
+      ``(P-1)*B/P`` external wire per rank.
+    - AllToAllV(P, B, matrix, send_splits, recv_splits): validates exact per-rank
+      row/col splits and consistency with ``B`` BEFORE band selection; isolates
+      diagonal self-copies from external wire flows.
+  * Multi-hop transfers execute hop-by-hop in physical path order, charging
+    ``hop`` startup per traversed hop and honoring ``band.credit_bytes`` receive
+    credits via chunked Engine pool acquire/free.
 
 [Timeouts & Locks]
-  Bounded group-size loop and in-memory band lookup; no I/O or locks.
+  Bounded group/chunk loops and in-memory band lookup; no I/O or locks.
 
 [Side-Effect Policy]
-  Pure planning helpers plus Engine task submission on caller-owned Engines.
+  Pure planning helpers plus Engine task/pool submission on caller Engines.
 """
 from __future__ import annotations
 
@@ -33,15 +37,35 @@ import math
 
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.hardware_links import CollectiveBandSpec
-from ..communication import MessageFlow
+from ..engine import Allocation
 from .ports import PairKey, PortKey, link_pair_key, link_port_key
+from .transport import DEFAULT_MAX_PHYSICAL_CHUNKS, chunk_sizes
 
 MS_PER_S = 1000.0
 SMALL_BAND_UPPER_EXCLUSIVE = 65537
 MID_BAND_UPPER_EXCLUSIVE = 2097152
+TWO_RANKS = 2
 SUPPORTED_COLLECTIVES = frozenset({
     "allreduce", "reduce_scatter", "allgather", "alltoall", "alltoallv",
 })
+SUPPORTED_BAND_ALGORITHMS = frozenset({
+    "ring", "direct", "direct_mesh", "pairwise",
+    "halving_doubling", "recursive_halving_doubling", "tree",
+})
+
+
+@dataclass(frozen=True, slots=True)
+class LoweredHop:
+    """One physical hop within a lowered directed transfer."""
+
+    link_name: str
+    source: int
+    destination: int
+    pair_key: PairKey
+    tx_port: PortKey
+    rx_port: PortKey
+    resources: tuple[str, ...]
+    propagation_ms: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,15 +79,37 @@ class LoweredTransfer:
     payload_bytes: float
     frames: int
     wire_bytes: float
-    pair_keys: tuple[PairKey, ...]
-    port_keys: tuple[PortKey, ...]
-    resources: tuple[str, ...]
-    propagation_ms: float
+    hops: tuple[LoweredHop, ...]
+
+    @property
+    def pair_keys(self) -> tuple[PairKey, ...]:
+        return tuple(hop.pair_key for hop in self.hops)
+
+    @property
+    def port_keys(self) -> tuple[PortKey, ...]:
+        keys: list[PortKey] = []
+        for hop in self.hops:
+            keys.append(hop.tx_port)
+            keys.append(hop.rx_port)
+        return tuple(keys)
+
+    @property
+    def resources(self) -> tuple[str, ...]:
+        seen: list[str] = []
+        for hop in self.hops:
+            for res in hop.resources:
+                if res not in seen:
+                    seen.append(res)
+        return tuple(seen)
+
+    @property
+    def propagation_ms(self) -> float:
+        return sum(hop.propagation_ms for hop in self.hops)
 
 
 @dataclass(frozen=True, slots=True)
 class LoweredPhase:
-    """One causal phase (e.g. ``reduce_scatter`` or ``all_gather``)."""
+    """One causal phase (e.g. ``reduce_scatter``, ``all_gather``, ``direct``)."""
 
     name: str
     rounds: int
@@ -73,7 +119,7 @@ class LoweredPhase:
 
 @dataclass(frozen=True, slots=True)
 class LoweredCollective:
-    """Complete physical collective lowering with framing and port keys."""
+    """Complete physical collective lowering with framing, hops, and port keys."""
 
     collective: str
     group: tuple[int, ...]
@@ -86,7 +132,7 @@ class LoweredCollective:
     total_payload_bytes: float
     total_wire_bytes: float
     per_rank_payload_bytes: tuple[tuple[int, float], ...]
-    self_copy_bytes_by_rank: tuple[tuple[int, int], ...]
+    self_copy_bytes_by_rank: tuple[tuple[int, float], ...]
     collective_startup_us: float
 
     @property
@@ -144,7 +190,7 @@ def _link_bands(topology, link) -> tuple[CollectiveBandSpec, ...]:
 def _candidate_bands(group: tuple[int, ...], topology, scope: str) -> tuple[CollectiveBandSpec, ...]:
     collected: list[CollectiveBandSpec] = []
     seen_ids: set[int] = set()
-    if len(group) >= 2:
+    if len(group) >= TWO_RANKS:
         for index in range(len(group)):
             src = group[index]
             dst = group[(index + 1) % len(group)]
@@ -179,6 +225,8 @@ def select_band(
     topology,
     api_bytes_per_rank: int | float,
     stack: str = "default",
+    *,
+    expansion_mode: str | None = None,
 ) -> CollectiveBandSpec:
     """Select the unique matching ``CollectiveBandSpec`` for a collective call."""
     collective = _normalize_collective_name(call)
@@ -190,16 +238,20 @@ def select_band(
         raise ModelingError(f"collective_api_bytes_invalid:{api_bytes_per_rank}")
     payload = float(api_bytes_per_rank)
     stack_key = str(stack or "default").strip() or "default"
+    exp_key = (None if expansion_mode is None
+               else str(expansion_mode).strip().lower() or None)
     scope = _infer_group_scope(group, topology)
     candidates = _candidate_bands(group, topology, scope)
 
-    matches: list[tuple[tuple[int, int, int], CollectiveBandSpec]] = []
+    matches: list[tuple[tuple[int, int, int, int], CollectiveBandSpec]] = []
     for band in candidates:
         if band.collective not in (collective, "all"):
             continue
         if band.stack_id not in (stack_key, "default"):
             continue
         if band.topology_scope not in (scope, "any"):
+            continue
+        if exp_key is not None and band.expansion_mode != exp_key:
             continue
         if not (band.group_min <= len(group) <= band.group_max):
             continue
@@ -209,6 +261,7 @@ def select_band(
             1 if band.collective == collective else 0,
             1 if band.stack_id == stack_key else 0,
             1 if band.topology_scope == scope else 0,
+            1 if (exp_key is not None and band.expansion_mode == exp_key) else 0,
         )
         matches.append((specificity, band))
 
@@ -216,6 +269,7 @@ def select_band(
         raise ModelingError(
             f"collective_band_missing:{collective}:scope={scope}:"
             f"group={len(group)}:bytes={int(payload)}:stack={stack_key}"
+            + (f":expansion={exp_key}" if exp_key else "")
         )
     best_rank = max(score for score, _ in matches)
     winners = [band for score, band in matches if score == best_rank]
@@ -231,75 +285,216 @@ def select_band(
 def frame_wire_bytes(
     payload_bytes: int | float, band: CollectiveBandSpec
 ) -> tuple[int, float]:
-    """Compute ``(frame_count, wire_bytes)`` under ``band`` framing."""
+    """Compute ``(frame_count, wire_bytes)`` under ``band`` MTU + header framing."""
     payload = float(payload_bytes)
     if payload <= 0.0:
         return 0, 0.0
     frames = max(1, math.ceil(payload / float(band.payload_bytes_per_frame) - 1e-12))
-    return frames, float(frames * band.wire_bytes_per_frame)
+    header_per_frame = max(
+        0, int(band.wire_bytes_per_frame) - int(band.payload_bytes_per_frame)
+    )
+    return frames, float(payload + frames * header_per_frame)
 
 
-def _validate_peer_matrix(
-    peer_matrix: Sequence[Sequence[int]], size: int
+def _validate_nonneg_int_seq(seq: Sequence[int], size: int, label: str) -> tuple[int, ...]:
+    if len(seq) != size:
+        raise ModelingError(f"alltoallv_{label}_length_invalid:{len(seq)}!={size}")
+    parsed: list[int] = []
+    for val in seq:
+        if isinstance(val, bool) or not isinstance(val, int) or val < 0:
+            raise ModelingError(f"alltoallv_{label}_entry_invalid:{val}")
+        parsed.append(val)
+    return tuple(parsed)
+
+
+def _validate_alltoallv_inputs(
+    peer_matrix: Sequence[Sequence[int]] | None,
+    size: int,
+    api_bytes: float,
+    send_splits: Sequence[int] | None,
+    recv_splits: Sequence[int] | None,
 ) -> tuple[tuple[int, ...], ...]:
+    if peer_matrix is None:
+        raise ModelingError("alltoallv_requires_explicit_integer_peer_matrix")
     if len(peer_matrix) != size:
-        raise ModelingError(
-            f"alltoallv_peer_matrix_shape_invalid:{len(peer_matrix)}!={size}"
-        )
+        raise ModelingError(f"alltoallv_peer_matrix_shape_invalid:{len(peer_matrix)}!={size}")
     rows: list[tuple[int, ...]] = []
     for row_index, row in enumerate(peer_matrix):
         if len(row) != size:
-            raise ModelingError(
-                f"alltoallv_peer_matrix_row_invalid:{row_index}:{len(row)}!={size}"
-            )
+            raise ModelingError(f"alltoallv_peer_matrix_row_invalid:{row_index}:{len(row)}!={size}")
         parsed_row: list[int] = []
         for value in row:
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ModelingError(f"alltoallv_peer_matrix_entry_invalid:{value}")
             parsed_row.append(value)
         rows.append(tuple(parsed_row))
-    return tuple(rows)
+    matrix = tuple(rows)
+    row_sums = tuple(sum(row) for row in matrix)
+    col_sums = tuple(sum(matrix[r][c] for r in range(size)) for c in range(size))
+    if send_splits is not None:
+        declared_send = _validate_nonneg_int_seq(send_splits, size, "send_splits")
+        if row_sums != declared_send:
+            raise ModelingError(f"alltoallv_send_splits_mismatch:{row_sums}!={declared_send}")
+    if recv_splits is not None:
+        declared_recv = _validate_nonneg_int_seq(recv_splits, size, "recv_splits")
+        if col_sums != declared_recv:
+            raise ModelingError(f"alltoallv_recv_splits_mismatch:{col_sums}!={declared_recv}")
+    total_matrix = sum(row_sums)
+    if api_bytes == 0.0 and total_matrix > 0:
+        raise ModelingError(f"alltoallv_api_bytes_zero_with_nonzero_matrix:{total_matrix}")
+    if api_bytes > 0.0 and total_matrix == 0:
+        raise ModelingError(f"alltoallv_api_bytes_nonzero_with_zero_matrix:{api_bytes}")
+    if total_matrix > 0 and send_splits is not None:
+        mean_send = total_matrix / float(size)
+        valid_api = (
+            math.isclose(api_bytes, float(max(row_sums)), rel_tol=1e-9, abs_tol=1e-6)
+            or math.isclose(api_bytes, mean_send, rel_tol=1e-9, abs_tol=1e-6)
+            or math.isclose(api_bytes, float(total_matrix), rel_tol=1e-9, abs_tol=1e-6)
+        )
+        if not valid_api:
+            raise ModelingError(f"alltoallv_api_bytes_splits_mismatch:{api_bytes}")
+    return matrix
 
 
 def _build_transfer(
-    phase_name: str,
-    round_index: int,
-    source: int,
-    destination: int,
-    payload_bytes: float,
-    band: CollectiveBandSpec,
-    topology,
+    phase_name: str, round_index: int, source: int, destination: int,
+    payload_bytes: float, band: CollectiveBandSpec, topology,
 ) -> LoweredTransfer:
     frames, wire_bytes = frame_wire_bytes(payload_bytes, band)
     path = topology.route(source, destination)
-    pair_keys: list[PairKey] = []
-    port_keys: list[PortKey] = []
-    resources: list[str] = []
-    propagation_ms = 0.0
+    hops: list[LoweredHop] = []
     for link_name, hop_src, hop_dst in path:
         link = topology.links[link_name]
-        pair_keys.append(link_pair_key(link, hop_src, hop_dst))
-        src_node = topology.location(hop_src)["node"]
-        dst_node = topology.location(hop_dst)["node"]
-        port_keys.append(link_port_key(link, hop_src, src_node, "tx"))
-        port_keys.append(link_port_key(link, hop_dst, dst_node, "rx"))
-        for res_name in topology.capacity_resources(link, hop_src, hop_dst):
-            if res_name not in resources:
-                resources.append(res_name)
-        propagation_ms += link.propagation_us / MS_PER_S
+        if hasattr(topology, "pair_key"):
+            pkey = topology.pair_key(link, hop_src, hop_dst)
+            tx_key = topology.port_key(link, hop_src, "tx")
+            rx_key = topology.port_key(link, hop_dst, "rx")
+        else:
+            pkey = link_pair_key(link, hop_src, hop_dst)
+            tx_key = link_port_key(link, hop_src, topology.location(hop_src)["node"], "tx")
+            rx_key = link_port_key(link, hop_dst, topology.location(hop_dst)["node"], "rx")
+        hop_res = tuple(dict.fromkeys(topology.capacity_resources(link, hop_src, hop_dst)))
+        hops.append(LoweredHop(
+            link_name=link_name,
+            source=int(hop_src),
+            destination=int(hop_dst),
+            pair_key=pkey,
+            tx_port=tx_key,
+            rx_port=rx_key,
+            resources=hop_res,
+            propagation_ms=link.propagation_us / MS_PER_S,
+        ))
     return LoweredTransfer(
-        phase_name=phase_name,
-        round_index=round_index,
-        source=source,
-        destination=destination,
-        payload_bytes=float(payload_bytes),
-        frames=frames,
-        wire_bytes=wire_bytes,
-        pair_keys=tuple(pair_keys),
-        port_keys=tuple(port_keys),
-        resources=tuple(resources),
-        propagation_ms=propagation_ms,
+        phase_name=phase_name, round_index=round_index,
+        source=int(source), destination=int(destination),
+        payload_bytes=float(payload_bytes), frames=frames,
+        wire_bytes=wire_bytes, hops=tuple(hops),
     )
+
+
+def _lower_ring_or_alg(
+    collective: str, group: tuple[int, ...], api_bytes: float,
+    band: CollectiveBandSpec, topology, phase_startup: float,
+    per_rank_payload: dict[int, float],
+) -> tuple[LoweredPhase, ...]:
+    count = len(group)
+    alg = str(band.algorithm).strip().lower()
+    if alg not in SUPPORTED_BAND_ALGORITHMS:
+        raise ModelingError(f"collective_band_algorithm_unsupported:{band.algorithm}")
+    if alg == "direct":
+        if collective == "allreduce" and count == TWO_RANKS:
+            transfers = []
+            for idx, src in enumerate(group):
+                dst = group[1 - idx]
+                per_rank_payload[src] += api_bytes
+                transfers.append(_build_transfer("direct", 0, src, dst, api_bytes, band, topology))
+            return (LoweredPhase("direct", 1, tuple(transfers), phase_startup),)
+        phase_names = (("reduce_scatter", "all_gather")
+                       if collective == "allreduce" else (collective,))
+        per_peer = api_bytes if collective == "allgather" else api_bytes / float(count)
+        phases: list[LoweredPhase] = []
+        for pname in phase_names:
+            transfers = []
+            for src in group:
+                for dst in group:
+                    if src == dst:
+                        continue
+                    per_rank_payload[src] += per_peer
+                    transfers.append(_build_transfer(pname, 0, src, dst, per_peer, band, topology))
+            phases.append(LoweredPhase(pname, 1, tuple(transfers), phase_startup))
+        return tuple(phases)
+    if alg in {"direct_mesh", "pairwise"}:
+        phase_names = (("reduce_scatter", "all_gather")
+                       if collective == "allreduce" else (collective,))
+        per_peer = api_bytes if collective == "allgather" else api_bytes / float(count)
+        phases = []
+        for pname in phase_names:
+            transfers = []
+            for src in group:
+                for dst in group:
+                    if src == dst:
+                        continue
+                    per_rank_payload[src] += per_peer
+                    transfers.append(_build_transfer(pname, 0, src, dst, per_peer, band, topology))
+            phases.append(LoweredPhase(pname, 1, tuple(transfers), phase_startup))
+        return tuple(phases)
+    if alg in {"halving_doubling", "recursive_halving_doubling"}:
+        rounds = max(1, math.ceil(math.log2(count)))
+        phase_names = (("reduce_scatter", "all_gather")
+                       if collective == "allreduce" else (collective,))
+        phases = []
+        for pname in phase_names:
+            transfers = []
+            for r_idx in range(rounds):
+                stride = 1 << r_idx
+                if collective == "allgather":
+                    chunk = api_bytes * float(stride)
+                else:
+                    denom = float(1 << (r_idx + 1)) if pname == "reduce_scatter" else float(1 << (rounds - r_idx))
+                    chunk = api_bytes / denom
+                for idx, src in enumerate(group):
+                    peer_idx = idx ^ stride
+                    if peer_idx >= count:
+                        peer_idx = (idx + stride) % count
+                    dst = group[peer_idx]
+                    per_rank_payload[src] += chunk
+                    transfers.append(_build_transfer(pname, r_idx, src, dst, chunk, band, topology))
+            phases.append(LoweredPhase(pname, rounds, tuple(transfers), phase_startup))
+        return tuple(phases)
+    if alg == "tree":
+        rounds = max(1, math.ceil(math.log2(count)))
+        phase_names = (("reduce_up", "broadcast_down")
+                       if collective == "allreduce" else (collective,))
+        chunk = api_bytes if collective in {"allreduce", "allgather"} else api_bytes / float(count)
+        phases = []
+        for pname in phase_names:
+            transfers = []
+            for r_idx in range(rounds):
+                stride = 1 << r_idx
+                for idx in range(0, count, stride * TWO_RANKS):
+                    partner = idx + stride
+                    if partner >= count:
+                        continue
+                    src, dst = (group[partner], group[idx]) if pname != "broadcast_down" else (group[idx], group[partner])
+                    per_rank_payload[src] += chunk
+                    transfers.append(_build_transfer(pname, r_idx, src, dst, chunk, band, topology))
+            phases.append(LoweredPhase(pname, rounds, tuple(transfers), phase_startup))
+        return tuple(phases)
+    # Default: ring
+    phase_names = (("reduce_scatter", "all_gather")
+                   if collective == "allreduce" else (collective,))
+    rounds = count - 1
+    chunk_payload = api_bytes if collective == "allgather" else api_bytes / float(count)
+    phases = []
+    for pname in phase_names:
+        transfers = []
+        for r_idx in range(rounds):
+            for idx, src in enumerate(group):
+                dst = group[(idx + 1) % count]
+                per_rank_payload[src] += chunk_payload
+                transfers.append(_build_transfer(pname, r_idx, src, dst, chunk_payload, band, topology))
+        phases.append(LoweredPhase(pname, rounds, tuple(transfers), phase_startup))
+    return tuple(phases)
 
 
 def lower_collective(
@@ -309,106 +504,84 @@ def lower_collective(
     api_bytes_per_rank: int | float,
     *,
     stack: str = "default",
+    expansion_mode: str | None = None,
     peer_matrix: Sequence[Sequence[int]] | None = None,
+    send_splits: Sequence[int] | None = None,
+    recv_splits: Sequence[int] | None = None,
     communicator_id: str = "",
     coset_id: str = "",
 ) -> LoweredCollective:
-    """Lower a collective call into framed physical phases and port keys."""
+    """Lower a collective call into framed physical phases, hops, and port keys."""
     collective = _normalize_collective_name(call)
     group = _normalize_group(actual_group)
-    band = select_band(collective, group, topology, api_bytes_per_rank, stack=stack)
     count = len(group)
+    if (isinstance(api_bytes_per_rank, bool)
+            or not isinstance(api_bytes_per_rank, (int, float))
+            or not math.isfinite(float(api_bytes_per_rank))
+            or float(api_bytes_per_rank) < 0):
+        raise ModelingError(f"collective_api_bytes_invalid:{api_bytes_per_rank}")
     api_bytes = float(api_bytes_per_rank)
+
+    matrix: tuple[tuple[int, ...], ...] | None = None
+    if collective == "alltoallv":
+        matrix = _validate_alltoallv_inputs(
+            peer_matrix, count, api_bytes, send_splits, recv_splits
+        )
+
+    band = select_band(
+        collective, group, topology, api_bytes,
+        stack=stack, expansion_mode=expansion_mode,
+    )
     collective_startup = band.startup_us if band.startup_scope == "collective" else 0.0
     phase_startup = band.startup_us if band.startup_scope == "phase" else 0.0
-
-    self_copies: dict[int, int] = {rank: 0 for rank in group}
+    self_copies: dict[int, float] = {rank: 0.0 for rank in group}
     per_rank_payload: dict[int, float] = {rank: 0.0 for rank in group}
 
     if collective == "alltoallv":
-        if peer_matrix is None:
-            raise ModelingError("alltoallv_requires_explicit_integer_peer_matrix")
-        matrix = _validate_peer_matrix(peer_matrix, count)
-        row_sums = [sum(row) for row in matrix]
-        col_sums = [sum(matrix[r][c] for r in range(count)) for c in range(count)]
-        if sum(row_sums) != sum(col_sums):
-            raise ModelingError("alltoallv_peer_matrix_conservation_violation")
+        assert matrix is not None
         transfers: list[LoweredTransfer] = []
         for s_idx, src in enumerate(group):
-            self_copies[src] = matrix[s_idx][s_idx]
+            self_copies[src] = float(matrix[s_idx][s_idx])
             for d_idx, dst in enumerate(group):
-                if s_idx == d_idx:
+                if s_idx == d_idx or matrix[s_idx][d_idx] == 0:
                     continue
-                amount = matrix[s_idx][d_idx]
-                if amount == 0:
-                    continue
-                per_rank_payload[src] += float(amount)
-                transfers.append(_build_transfer(
-                    "alltoallv", 0, src, dst, float(amount), band, topology
-                ))
-        phases = (
-            (LoweredPhase("alltoallv", 1, tuple(transfers), phase_startup),)
-            if transfers else ()
-        )
+                amount = float(matrix[s_idx][d_idx])
+                per_rank_payload[src] += amount
+                transfers.append(_build_transfer("alltoallv", 0, src, dst, amount, band, topology))
+        phases = (LoweredPhase("alltoallv", 1, tuple(transfers), phase_startup),) if transfers else ()
     elif api_bytes == 0.0 or count <= 1:
         phases = ()
     elif collective in {"allreduce", "reduce_scatter", "allgather"}:
-        phase_names = (
-            ("reduce_scatter", "all_gather")
-            if collective == "allreduce"
-            else (collective,)
+        phases = _lower_ring_or_alg(
+            collective, group, api_bytes, band, topology, phase_startup, per_rank_payload
         )
-        rounds = count - 1
-        chunk_payload = api_bytes / float(count)
-        built_phases: list[LoweredPhase] = []
-        for phase_name in phase_names:
-            transfers = []
-            for round_index in range(rounds):
-                for idx, src in enumerate(group):
-                    dst = group[(idx + 1) % count]
-                    per_rank_payload[src] += chunk_payload
-                    transfers.append(_build_transfer(
-                        phase_name, round_index, src, dst,
-                        chunk_payload, band, topology,
-                    ))
-            built_phases.append(
-                LoweredPhase(phase_name, rounds, tuple(transfers), phase_startup)
-            )
-        if collective == "allreduce":
-            expected_per_rank = 2.0 * (count - 1) * api_bytes / float(count)
+        if collective == "allreduce" and band.algorithm in {"ring", "direct", "direct_mesh", "pairwise"}:
+            expected = 2.0 * (count - 1) * api_bytes / float(count)
             for rank in group:
-                if not math.isclose(per_rank_payload[rank], expected_per_rank,
-                                    rel_tol=1e-12, abs_tol=1e-9):
-                    raise ModelingError(
-                        f"ring_allreduce_payload_conservation_failed:{rank}"
-                    )
-        phases = tuple(built_phases)
+                if not math.isclose(per_rank_payload[rank], expected, rel_tol=1e-12, abs_tol=1e-9):
+                    raise ModelingError(f"ring_allreduce_payload_conservation_failed:{rank}")
     else:
-        # Balanced alltoall
-        per_peer = api_bytes / float(count - 1)
+        # Balanced AllToAll: total send buffer B splits B/P per peer (including self)
+        per_peer = api_bytes / float(count)
         transfers = []
+        concurrent = band.algorithm in {"direct", "direct_mesh", "pairwise"}
         for s_idx, src in enumerate(group):
+            self_copies[src] = per_peer
             for step in range(count - 1):
                 dst = group[(s_idx + step + 1) % count]
                 per_rank_payload[src] += per_peer
-                transfers.append(_build_transfer(
-                    "alltoall", step, src, dst, per_peer, band, topology
-                ))
-        phases = (LoweredPhase("alltoall", count - 1, tuple(transfers), phase_startup),)
+                r_idx = 0 if concurrent else step
+                transfers.append(_build_transfer("alltoall", r_idx, src, dst, per_peer, band, topology))
+        rounds = 1 if concurrent else (count - 1)
+        phases = (LoweredPhase("alltoall", rounds, tuple(transfers), phase_startup),)
 
     total_payload = sum(per_rank_payload.values())
     total_wire = sum(t.wire_bytes for phase in phases for t in phase.transfers)
     return LoweredCollective(
-        collective=collective,
-        group=group,
-        band=band,
-        communicator_id=str(communicator_id),
-        coset_id=str(coset_id),
-        api_bytes_per_rank=api_bytes,
-        rendezvous_required=True,
-        phases=phases,
-        total_payload_bytes=total_payload,
-        total_wire_bytes=total_wire,
+        collective=collective, group=group, band=band,
+        communicator_id=str(communicator_id), coset_id=str(coset_id),
+        api_bytes_per_rank=api_bytes, rendezvous_required=True,
+        phases=phases, total_payload_bytes=total_payload, total_wire_bytes=total_wire,
         per_rank_payload_bytes=tuple((r, per_rank_payload[r]) for r in group),
         self_copy_bytes_by_rank=tuple((r, self_copies[r]) for r in group),
         collective_startup_us=collective_startup,
@@ -423,7 +596,7 @@ def submit_lowered_collective(
     *,
     owner: str = "",
 ):
-    """Submit a ``LoweredCollective`` onto ``engine`` honoring causal phases."""
+    """Submit a ``LoweredCollective`` onto ``engine`` with per-hop & credit physics."""
     required = set(lowered.group)
     if set(ready_by_rank) != required:
         raise ModelingError("lowered_collective_ready_coverage_mismatch")
@@ -441,6 +614,18 @@ def submit_lowered_collective(
         if lowered.band.startup_scope == "hop"
         else 0.0
     )
+    credit_cap = float(lowered.band.credit_bytes or 0)
+    credit_pools: dict[int, str] = {}
+    if credit_cap > 0.0:
+        new_pools: dict[str, float] = {}
+        for rank in lowered.group:
+            pool_name = f"{name}:credit:r{rank}"
+            credit_pools[rank] = pool_name
+            if pool_name not in engine.pools:
+                new_pools[pool_name] = credit_cap
+        if new_pools:
+            engine.extend((), pools=new_pools)
+
     cursor = rendezvous
     for p_idx, phase in enumerate(lowered.phases):
         phase_gate = (
@@ -460,21 +645,49 @@ def submit_lowered_collective(
         for round_index in sorted(by_round):
             round_done = []
             for t_idx, transfer in enumerate(by_round[round_index]):
-                demand = {res: transfer.wire_bytes for res in transfer.resources}
-                service = engine.submit(
-                    f"{name}:p{p_idx}:r{round_index}:t{t_idx}:svc",
-                    demand,
-                    after=(round_gate,),
-                    owner=owner,
-                    coupled=True,
-                )
-                arrival = engine.submit(
-                    f"{name}:p{p_idx}:r{round_index}:t{t_idx}:arr",
-                    after=(service,),
-                    latency=transfer.propagation_ms + hop_startup_ms,
-                    owner=owner,
-                )
-                round_done.append(arrival)
+                if credit_cap > 0.0 and transfer.wire_bytes > credit_cap:
+                    chunks = chunk_sizes(
+                        transfer.wire_bytes, credit_cap, DEFAULT_MAX_PHYSICAL_CHUNKS
+                    )
+                else:
+                    chunks = (transfer.wire_bytes,)
+                pool_name = credit_pools.get(transfer.destination)
+                for c_idx, chunk_wire in enumerate(chunks):
+                    alloc = (
+                        Allocation(
+                            f"{name}:p{p_idx}:r{round_index}:t{t_idx}:c{c_idx}:cr",
+                            pool_name,
+                            min(chunk_wire, credit_cap),
+                            (0,),
+                        )
+                        if pool_name is not None and chunk_wire > 0.0
+                        else None
+                    )
+                    hop_cursor = round_gate
+                    for h_idx, hop in enumerate(transfer.hops):
+                        demand = {res: chunk_wire for res in hop.resources}
+                        svc = engine.submit(
+                            f"{name}:p{p_idx}:r{round_index}:t{t_idx}:c{c_idx}:h{h_idx}:svc",
+                            demand,
+                            after=(hop_cursor,),
+                            acquire=(alloc,) if (h_idx == 0 and alloc is not None) else (),
+                            owner=owner,
+                            coupled=len(demand) > 1,
+                        )
+                        is_last = h_idx == len(transfer.hops) - 1
+                        hop_lat_ms = (
+                            hop_startup_ms
+                            if lowered.band.startup_us > 0.0
+                            else hop.propagation_ms
+                        )
+                        hop_cursor = engine.submit(
+                            f"{name}:p{p_idx}:r{round_index}:t{t_idx}:c{c_idx}:h{h_idx}:arr",
+                            after=(svc,),
+                            latency=hop_lat_ms,
+                            free=(alloc,) if (is_last and alloc is not None) else (),
+                            owner=owner,
+                        )
+                    round_done.append(hop_cursor)
             round_gate = engine.submit(
                 f"{name}:p{p_idx}:r{round_index}:done",
                 after=tuple(round_done),

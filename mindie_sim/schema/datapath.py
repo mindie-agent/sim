@@ -36,6 +36,10 @@ DieSpec = Device
 
 GENERIC_ARCH_ID = ArchId("generic")
 L0C_TO_UB_OUTPUT_PATH = "l0c_to_ub"
+BITS_PER_BYTE = 8
+DEFAULT_ELEMENT_BITS = 16
+PAIR_ARITY = 2
+TILE_3D_ARITY = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,35 +134,133 @@ class DatapathCapabilitySpec:
     def has_ub_to_l1(self) -> bool:
         return self.has_path("ub", "l1")
 
+    def _route_err(self, code: str, message: str):
+        from mindie_sim.public.errors import UnmodeledCapabilityError
+        return UnmodeledCapabilityError(
+            capability="datapath_route", entry="DatapathCapabilitySpec.route",
+            code=code, message=message,
+        )
+
+    def _validate_route_owner(self, path: DataPath, src: str, dst: str, owner_group: Any) -> None:
+        aic_to_aivs = {int(aic): frozenset(int(a) for a in aivs) for aic, aivs in self.aic_aiv_pairs}
+        if isinstance(owner_group, Mapping):
+            aic_val = owner_group.get("aic", owner_group.get("src") if src != "ub" else owner_group.get("dst"))
+            aiv_val = owner_group.get("aiv", owner_group.get("dst") if src != "ub" else owner_group.get("src"))
+            pair = (aic_val, aiv_val)
+        elif isinstance(owner_group, (tuple, list)):
+            pair = tuple(owner_group)
+        elif isinstance(owner_group, int) and not isinstance(owner_group, bool):
+            limit = self.aic_count if path.executor == "aic" else self.aiv_count
+            if not (0 <= owner_group < limit):
+                raise self._route_err(
+                    f"datapath_route_owner_unreachable:{src}->{dst}:{owner_group}",
+                    f"owner {owner_group} outside [0, {limit}) for {path.executor}",
+                )
+            return
+        else:
+            raise self._route_err(f"datapath_route_owner_invalid:{src}->{dst}", f"invalid owner_group {owner_group!r}")
+        if set(path.reach) == {"aic", "aiv"}:
+            if len(pair) != PAIR_ARITY or any(isinstance(v, bool) or not isinstance(v, int) for v in pair):
+                raise self._route_err(
+                    f"datapath_route_owner_invalid:{src}->{dst}",
+                    f"cross-core path {src}->{dst} requires (src_core, dst_core) ints",
+                )
+            aic_id, aiv_id = (pair[1], pair[0]) if src == "ub" else (pair[0], pair[1])
+            if not (0 <= aic_id < self.aic_count and aiv_id in aic_to_aivs.get(aic_id, frozenset())):
+                raise self._route_err(
+                    f"datapath_route_owner_unreachable:{src}->{dst}:{aic_id}->{aiv_id}",
+                    f"arch {self.arch_id} AIC {aic_id} cannot reach AIV {aiv_id}",
+                )
+            return
+        limit = self.aic_count if path.executor == "aic" else self.aiv_count
+        if not pair or any(isinstance(v, bool) or not isinstance(v, int) or not (0 <= v < limit) for v in pair):
+            raise self._route_err(
+                f"datapath_route_owner_unreachable:{src}->{dst}",
+                f"owner_group {pair!r} outside [0, {limit}) for {path.executor}",
+            )
+
+    def _validate_route_tile(
+        self, path: DataPath, src: str, dst: str, rep: str, elem_bits: int, tile: Any
+    ) -> None:
+        align = max(1, int(path.alignment_bytes or 1))
+        if isinstance(tile, int) and not isinstance(tile, bool):
+            if tile <= 0 or tile % align != 0:
+                raise self._route_err(
+                    f"datapath_route_tile_invalid:{src}->{dst}:{tile}",
+                    f"tile bytes {tile} must be positive multiple of {align}",
+                )
+            tile_bytes = tile
+        elif isinstance(tile, (tuple, list)) and tile:
+            if any(isinstance(d, bool) or not isinstance(d, int) or d <= 0 for d in tile):
+                raise self._route_err(
+                    f"datapath_route_tile_invalid:{src}->{dst}",
+                    f"tile dimensions {tile!r} must be positive integers",
+                )
+            if (src == "l0c" or dst == "l0c") and self.subtile_wave:
+                wave = next((w for w in self.subtile_wave if w.native_mode == rep), self.subtile_wave[0])
+                if (len(tile) < PAIR_ARITY
+                        or tile[0] % wave.independently_issuable_m != 0
+                        or tile[1] % wave.tile_n != 0
+                        or (len(tile) >= TILE_3D_ARITY and tile[PAIR_ARITY] % wave.tile_k != 0)):
+                    raise self._route_err(
+                        f"datapath_route_tile_invalid:{src}->{dst}:{tuple(tile)}",
+                        f"tile {tuple(tile)} violates subtile alignment ({wave.independently_issuable_m},{wave.tile_n})",
+                    )
+            elems = 1
+            for dim in tile:
+                elems *= dim
+            total_bits = elems * elem_bits
+            if total_bits % BITS_PER_BYTE != 0 or (total_bits // BITS_PER_BYTE) % align != 0:
+                raise self._route_err(
+                    f"datapath_route_tile_invalid:{src}->{dst}:{tuple(tile)}",
+                    f"tile {tuple(tile)} ({total_bits} bits) violates {align}B alignment",
+                )
+            tile_bytes = total_bits // BITS_PER_BYTE
+        else:
+            raise self._route_err(f"datapath_route_tile_invalid:{src}->{dst}", f"unsupported tile {tile!r}")
+        if dst in dict(self.buffers) and tile_bytes > self.usable_bytes(dst):
+            raise self._route_err(
+                f"datapath_route_tile_exceeds_buffer:{dst}:{tile_bytes}",
+                f"tile {tile_bytes}B exceeds usable {dst} capacity",
+            )
+
     def route(
-        self,
-        src: str,
-        dst: str,
-        representation: str = "",
-        owner_group: Any = None,
-        tile: Any = None,
+        self, src: str, dst: str, representation: str = "",
+        owner_group: Any = None, tile: Any = None,
     ) -> RoutePlan:
         """Resolve a physical directed path or raise ``UnmodeledCapabilityError``."""
         rep = str(representation or "").strip().lower()
-        candidates = [
-            path for path in self.usable_paths
-            if path.source == src and path.target == dst
-        ]
+        declared_arch = self.compute_arch.declared
+        registry = ({item.name: item for item in declared_arch.representations}
+                    if declared_arch is not None else {})
+        elem_bits = DEFAULT_ELEMENT_BITS
+        if rep:
+            if registry and rep not in registry:
+                try:
+                    rep = declared_arch.representation(rep).name
+                except ModelingError:
+                    raise self._route_err(
+                        f"datapath_route_representation_unknown:{rep}",
+                        f"arch {self.arch_id} does not declare representation {rep!r}",
+                    ) from None
+            if rep in registry:
+                elem_bits = int(registry[rep].bits)
+        candidates = [p for p in self.usable_paths if p.source == src and p.target == dst]
         for path in candidates:
-            if not rep or not path.representations or rep in path.representations:
-                return RoutePlan(
-                    source=src, destination=dst, path=path,
-                    representation=rep, owner_group=owner_group, tile=tile,
-                )
-        from mindie_sim.public.errors import UnmodeledCapabilityError
-        raise UnmodeledCapabilityError(
-            capability="datapath_route",
-            entry="DatapathCapabilitySpec.route",
-            code=f"datapath_route_unsupported:{src}->{dst}",
-            message=(
-                f"arch {self.arch_id} does not declare directed route "
-                f"{src}->{dst} (representation={rep or 'any'})"
-            ),
+            if rep and ((registry and not path.supports(rep, registry))
+                        or (not registry and path.representations and rep not in path.representations)):
+                continue
+            if owner_group is not None:
+                self._validate_route_owner(path, src, dst, owner_group)
+            if tile is not None:
+                self._validate_route_tile(path, src, dst, rep, elem_bits, tile)
+            return RoutePlan(
+                source=src, destination=dst, path=path,
+                representation=rep, owner_group=owner_group, tile=tile,
+            )
+        raise self._route_err(
+            f"datapath_route_unsupported:{src}->{dst}",
+            f"arch {self.arch_id} does not declare directed route {src}->{dst} (representation={rep or 'any'})",
         )
 
     def usable_bytes(

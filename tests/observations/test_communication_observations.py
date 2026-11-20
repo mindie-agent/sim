@@ -485,6 +485,11 @@ def test_native_local_service_fit_applicability_lineage_and_supply_change(native
     assert rec["overlap_with_communication"] is True and rec["child_is_complete_collective"] is False
     assert svc["scope"] == "independent_resource" and svc["boundary"] == "resource_phase" and svc["rate_scope"] == "per_owner"
     assert svc["active_units"] == 2 and rec["lineage_key"]["source.manifest_sha256"] == manifest_sha
+    src, dumped = rec["source"], json.dumps(rec)
+    assert src["capture_uri"].startswith("capture://") and src["source_ref"]["source_sha256"] == src["summary_sha256"]
+    assert set(src["source_ref"]) == {"repository", "revision", "relative_path", "source_sha256"}
+    assert not (set(src) & {"path", "manifest_path", "versions_path", "environment_path", "topology_path", "host", "environment_image_id"})
+    assert all(tok not in dumped for tok in (str(path), str(path.parent), "rack08os2", image_id))
     pred = comm.a5_local_service_prediction(rec, 200_000_000, work_unit="bytes")
     assert pred["extrapolated"] is True and pred["duration_us"] == pytest.approx(svc["fixed_us"] + 200_000_000 * 1e6 / svc["effective_rate"])
     _raises(ValueError, "a5_local_service_work_unit_mismatch", lambda: comm.a5_local_service_prediction(rec, 1024, work_unit="rows"))
@@ -531,6 +536,8 @@ def test_native_child_binding_stage_evidence_and_envelope_provenance(native_wave
         deployment_image_id=image_id, group_size=2, split="heldout", used_for_tuning=("native.all_gather.g2.786432.heldout",))
     assert (ev["schema"], ev["summary"]["used_for_tuning_count"], ev["summary"]["all_child_within_communication"],
             ev["summary"]["fixed_term_exceeds_some_child_calls"]) == (comm.A5_NATIVE_CHILD_EVIDENCE_SCHEMA, 6, True, True)
+    ev_dump = json.dumps(ev)
+    assert ev["source"]["capture_uri"].startswith("capture://") and all(tok not in ev_dump for tok in (str(path), "rack08os2", image_id))
     assert all((c.provenance["link_transit_identified"], c.provenance["hop_scaling"],
                 c.provenance["measurement_boundary"]["complete_collective_call"]) == (
         False, "not_derived", k[0] != "p2p_send_recv") for k, c in embedded[1].curves.items())

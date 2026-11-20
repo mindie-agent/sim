@@ -428,25 +428,43 @@ class _ContextMixin:
         if (algorithm == "ring" and getattr(recipe, "mesh_capable", False)
                 and self.topology.declares_direct_mesh(op, replica)):
             algorithm = "direct_mesh"
+        band_plan = None
+        link_vol = cost.work.get("link", 0)
         if algorithm == "direct_mesh":
             plan = self.topology.joint_plan(
-                op, {replica: cost.work.get("link", 0)},
+                op, {replica: link_vol},
                 algorithm=algorithm, transport=transport_options)
             self.topology.bind_direct_mesh(op, replica, plan)
             plan_binding = _CollectivePlanBinding(algorithm, plan=plan)
         else:
-            plan_binding = _CollectivePlanBinding(
-                algorithm,
-                factory=lambda: self.topology.joint_plan(
-                    op, {replica: cost.work.get("link", 0)},
-                    algorithm=algorithm, transport=transport_options))
+            if link_vol and algorithm in {"ring", "pairwise"}:
+                try:
+                    band_plan = self.topology.band_collective_plan(
+                        op, {replica: link_vol}, algorithm=algorithm,
+                        transport=transport_options,
+                    )
+                except ModelingError as exc:
+                    if not str(exc).startswith("joint_collective_group_membership"):
+                        raise
+            if band_plan is not None:
+                plan_binding = _CollectivePlanBinding(algorithm, plan=band_plan)
+            else:
+                plan_binding = _CollectivePlanBinding(
+                    algorithm,
+                    factory=lambda: self.topology.joint_plan(
+                        op, {replica: link_vol},
+                        algorithm=algorithm, transport=transport_options))
         demands, frames, setup = {}, {}, 0.0
-        if "peer_traffic" in dict(op.metadata) and not cost.work.get("link", 0):
-            self.topology.accounting(op, replica, volume=cost.work.get("link", 0))
+        if "peer_traffic" in dict(op.metadata) and not link_vol:
+            self.topology.accounting(op, replica, volume=link_vol)
         for resource, amount in cost.work.items():
             if resource == "link":
-                routed = self.topology.accounting(
-                    op, replica, volume=amount, transport=transport_options)
+                routed = (
+                    band_plan.accounting()
+                    if band_plan is not None
+                    else self.topology.accounting(
+                        op, replica, volume=amount, transport=transport_options)
+                )
                 demands.update(routed.wire_by_resource)
                 frames.update(routed.transaction_frames)
                 setup = routed.setup_ms

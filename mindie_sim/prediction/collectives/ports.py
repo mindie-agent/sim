@@ -102,14 +102,53 @@ class RootComplexKey:
         )
 
 
-def link_port_key(link, rank: int, node: int, direction: str) -> PortKey:
-    """Resolve the canonical ``PortKey`` for one ``(link, rank, direction)``."""
-    endpoint = (
-        link.physical_endpoint_id(rank)
-        if hasattr(link, "physical_endpoint_id")
-        else f"rank{int(rank)}"
-    )
+@dataclass(frozen=True, slots=True)
+class SwitchKey:
+    """Shared physical switch-plane key: ``(node_or_none, switch_id)``."""
+
+    node: int | None
+    switch_id: str
+
+    def __post_init__(self):
+        if not self.switch_id:
+            raise ModelingError("switch_key_id_empty")
+
+    def resource_name(self, namespace: str = "") -> str:
+        prefix = f"n{self.node}:" if self.node is not None else "global:"
+        return f"{namespace}switch:{prefix}{self.switch_id}"
+
+
+def _resolved_endpoint_id(link, rank: int, channel_decl=None) -> tuple[str, bool]:
+    ep_map = dict(getattr(link, "endpoint_ids", ()) or ())
+    if int(rank) in ep_map:
+        return str(ep_map[int(rank)]), True
+    if channel_decl is not None:
+        raw_eps = channel_decl.get("endpoint_ids") or ()
+        ch_map = (
+            {int(k): str(v) for k, v in raw_eps.items()}
+            if isinstance(raw_eps, dict)
+            else {int(k): str(v) for k, v in raw_eps}
+        )
+        if int(rank) in ch_map:
+            return ch_map[int(rank)], True
+    return f"rank{int(rank)}", False
+
+
+def _resolved_rail_id(link, channel_decl=None) -> int | str:
     rail = getattr(link, "rail_id", 0)
+    if rail not in (0, "", None):
+        return rail
+    if channel_decl is not None:
+        ch_rail = channel_decl.get("rail_id", 0)
+        if ch_rail not in (0, "", None):
+            return ch_rail
+    return 0
+
+
+def link_port_key(link, rank: int, node: int, direction: str, *, channel_decl=None) -> PortKey:
+    """Resolve the canonical ``PortKey`` for one ``(link, rank, direction)``."""
+    endpoint, _ = _resolved_endpoint_id(link, int(rank), channel_decl)
+    rail = _resolved_rail_id(link, channel_decl)
     return PortKey(
         node=int(node),
         physical_endpoint=str(endpoint),
@@ -118,10 +157,10 @@ def link_port_key(link, rank: int, node: int, direction: str) -> PortKey:
     )
 
 
-def link_pair_key(link, src: int, dst: int) -> PairKey:
+def link_pair_key(link, src: int, dst: int, *, channel_decl=None) -> PairKey:
     """Resolve the canonical ``PairKey`` for one directed hop."""
     fabric = str(getattr(link, "channel", "") or getattr(link, "name", "fabric"))
-    rail = getattr(link, "rail_id", 0)
+    rail = _resolved_rail_id(link, channel_decl)
     return PairKey(
         fabric=fabric,
         physical_src=int(src),
@@ -130,34 +169,37 @@ def link_pair_key(link, src: int, dst: int) -> PairKey:
     )
 
 
-def find_shared_port_keys(links, rank_node_lookup, *, port_semantics: set[str]):
-    """Identify physical ``PortKey``s shared across two or more port links.
+def find_shared_port_keys(
+    links, rank_node_lookup, *, port_semantics: set[str], channel_decls=None
+):
+    """Identify physical ``PortKey``s shared by 2+ ``(link, rank)`` endpoints.
 
-    Returns ``(shared_rates, link_port_map)`` where ``shared_rates`` maps each
-    multi-link ``PortKey`` to its physical port capacity (bytes/ms), and
-    ``link_port_map`` maps ``(link.name, rank, direction)`` to that shared
-    ``PortKey``.
+    Catches BOTH two ranks on ONE link sharing the same physical endpoint/rail
+    AND two distinct links/communicators touching the same physical port.
     """
-    port_links: dict[PortKey, list[tuple[object, int]]] = defaultdict(list)
+    decls = channel_decls or {}
+    port_entries: dict[PortKey, list[tuple[object, int]]] = defaultdict(list)
     for link in links:
         if link.semantics not in port_semantics:
             continue
-        explicit_port_identity = bool(getattr(link, "endpoint_ids", ())) or (
-            getattr(link, "rail_id", 0) not in (0, "")
+        ch_decl = decls.get(getattr(link, "channel", ""))
+        rail = _resolved_rail_id(link, ch_decl)
+        has_ep_map = bool(getattr(link, "endpoint_ids", ())) or bool(
+            ch_decl and ch_decl.get("endpoint_ids")
         )
+        explicit_port_identity = has_ep_map or (rail not in (0, ""))
         if not explicit_port_identity:
             continue
         for rank in link.members:
             node = int(rank_node_lookup(rank))
             for direction in ("tx", "rx"):
-                key = link_port_key(link, rank, node, direction)
-                port_links[key].append((link, int(rank)))
+                key = link_port_key(link, rank, node, direction, channel_decl=ch_decl)
+                port_entries[key].append((link, int(rank)))
 
     shared_rates: dict[PortKey, float] = {}
     link_port_map: dict[tuple[str, int, str], PortKey] = {}
-    for key, entries in port_links.items():
-        unique_links = {link.name for link, _ in entries}
-        if len(unique_links) < 2:
+    for key, entries in port_entries.items():
+        if len(entries) < 2:
             continue
         rates = [
             float(link.capacity_at(rank) if hasattr(link, "capacity_at")
@@ -170,10 +212,49 @@ def find_shared_port_keys(links, rank_node_lookup, *, port_semantics: set[str]):
     return shared_rates, link_port_map
 
 
+def find_shared_switch_keys(links, rank_node_lookup, *, channel_decls=None):
+    """Identify physical ``SwitchKey``s shared across links declaring switch capacity."""
+    decls = channel_decls or {}
+    sw_entries: dict[SwitchKey, list[object]] = defaultdict(list)
+    for link in links:
+        cap = getattr(link, "switch_capacity_bytes_per_ms", None)
+        if cap is None:
+            continue
+        ch_decl = decls.get(getattr(link, "channel", ""))
+        sw_id = str(getattr(link, "switch_id", "") or (ch_decl.get("switch_id") if ch_decl else "") or "")
+        if not sw_id:
+            continue
+        nodes = {int(rank_node_lookup(r)) for r in link.members} if link.members else set()
+        scope_node = next(iter(nodes)) if len(nodes) == 1 else None
+        sw_entries[SwitchKey(scope_node, sw_id)].append(link)
+
+    shared_rates: dict[SwitchKey, float] = {}
+    link_switch_map: dict[str, SwitchKey] = {}
+    for key, entries in sw_entries.items():
+        if len(entries) < 2:
+            continue
+        shared_rates[key] = min(float(link.switch_capacity_bytes_per_ms) for link in entries)
+        for link in entries:
+            link_switch_map[link.name] = key
+    return shared_rates, link_switch_map
+
+
 def build_shared_port_resources(
     shared_rates: dict[PortKey, float], *, namespace: str = ""
 ) -> tuple[Resource, ...]:
     """Emit one Engine ``Resource`` per shared physical ``PortKey``."""
+    return tuple(
+        Resource(key.resource_name(namespace), rate, "bytes")
+        for key, rate in sorted(
+            shared_rates.items(), key=lambda item: item[0].resource_name(namespace)
+        )
+    )
+
+
+def build_shared_switch_resources(
+    shared_rates: dict[SwitchKey, float], *, namespace: str = ""
+) -> tuple[Resource, ...]:
+    """Emit one Engine ``Resource`` per shared physical ``SwitchKey``."""
     return tuple(
         Resource(key.resource_name(namespace), rate, "bytes")
         for key, rate in sorted(

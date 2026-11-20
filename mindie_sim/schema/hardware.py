@@ -480,6 +480,9 @@ class Hardware:
                 if field_name in channel and channel[field_name] not in allowed_semantics:
                     raise ModelingError(
                         f"transfer_channel_semantics_unsupported:{name}:{channel[field_name]}")
+            if "scope" in channel and channel["scope"] is not None:
+                from .hardware_links import normalize_link_scope
+                normalize_link_scope(channel["scope"])
         count = int(raw.get("num_devices", len(raw.get("devices", raw.get("dies", ()))) or 1))
         ranks_per_node = int(raw.get("ranks_per_node", count))
         package = int(raw.get("dies_per_package", 1))

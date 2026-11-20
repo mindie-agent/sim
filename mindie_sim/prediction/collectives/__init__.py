@@ -18,6 +18,12 @@
 """
 from __future__ import annotations
 
+from .band_plan import (
+    BandCollectiveGroup,
+    BandCollectivePlan,
+    api_bytes_from_link_volume,
+    build_band_collective_plan,
+)
 from .plans import (
     DIRECT_MESH_FAMILIES,
     DIRECT_MESH_MAX_PEERS,
@@ -30,8 +36,11 @@ from .ports import (
     PairKey,
     PortKey,
     RootComplexKey,
+    SwitchKey,
     build_shared_port_resources,
+    build_shared_switch_resources,
     find_shared_port_keys,
+    find_shared_switch_keys,
     host_transfer_demand,
     link_pair_key,
     link_port_key,
@@ -41,6 +50,7 @@ from .protocol import (
     MID_BAND_UPPER_EXCLUSIVE,
     SMALL_BAND_UPPER_EXCLUSIVE,
     LoweredCollective,
+    LoweredHop,
     LoweredPhase,
     LoweredTransfer,
     frame_wire_bytes,
@@ -82,6 +92,8 @@ from .transport import (
 )
 
 __all__ = [
+    "BandCollectiveGroup",
+    "BandCollectivePlan",
     "ChunkSequence",
     "DEFAULT_MAX_PHYSICAL_CHUNKS",
     "DIRECT_MESH_FAMILIES",
@@ -89,6 +101,7 @@ __all__ = [
     "DIRECT_MESH_PHASES",
     "FlowPath",
     "LoweredCollective",
+    "LoweredHop",
     "LoweredPhase",
     "LoweredTransfer",
     "MID_BAND_UPPER_EXCLUSIVE",
@@ -102,6 +115,7 @@ __all__ = [
     "RingPlan",
     "RootComplexKey",
     "SMALL_BAND_UPPER_EXCLUSIVE",
+    "SwitchKey",
     "Topology",
     "TopologyCommunicationWork",
     "TransportOptions",
@@ -118,11 +132,15 @@ __all__ = [
     "_peer_totals_match",
     "_ready_by_rank",
     "_transport_ready",
+    "api_bytes_from_link_volume",
+    "build_band_collective_plan",
     "build_shared_port_resources",
+    "build_shared_switch_resources",
     "chunk_count",
     "chunk_size_at",
     "chunk_sizes",
     "find_shared_port_keys",
+    "find_shared_switch_keys",
     "frame_wire_bytes",
     "host_transfer_demand",
     "link_pair_key",
