@@ -10,14 +10,15 @@
   * ``BT=32`` fits the ``32x32`` unit-triangular WY inverse in a single UB VCS
     tile, eliminating the ``Chunk64`` ``4x 64^3`` FP32 Cube block products and
     ``y_dump``/``y_reload`` GM workspace round-trip.
+  * ``ChunkFwdH`` groups chunks contiguously per ``(seq, key_head, sub_group)``
+    recurrence chain with ``slots=1`` serial state dependency and compacts long
+    chunk chains via ``compact_periodic_pipeline``.
   * Every ``OperatorPlan`` strictly conserves ``Work`` across ``hbm``,
     ``mte2_aic``, ``mte2_aiv``, ``mte1``, ``cube``, ``vector``, ``fixpipe``, and
     ``mte3`` via ``mixed_core`` ownership and dynamic ``geometry.buffers`` checks.
-  * Zero model-name branches or ``ResourceEnvelope`` fallbacks participate.
 
 [Timeouts & Locks]
-  O(sequences + cores) plan construction and bounded per-core pipelines; no I/O
-  or locks.
+  O(sequences + cores) plan construction and O(1) periodic compaction; no I/O.
 
 [Side-Effect Policy]
   Pure immutable ``OpSpec`` and ``OperatorPlan`` construction.
@@ -40,6 +41,7 @@ from .mechanism import Geometry, OperatorPlan, PlannedRecipe, Work
 from .operators.gdn_prepare import PackedChunks
 from .operators.mixed_core import phases, require_pair, resident, split_reads
 from .program import KernelProgram, ParallelProgram, PipelineProgram, Stage
+from .refill_steady import compact_periodic_pipeline
 
 PREPARE_RECIPE = "gdn_prepare_arch35_chunk32"
 STATE_RECIPE = "gdn_state_arch35_chunk32"
@@ -56,6 +58,11 @@ BF16_BYTES = 2
 FP32_BYTES = 4
 MAX_TASK_GROUP_HEADS = 4
 PIPELINE_WINDOW_SLOTS = 2
+RECURRENCE_SERIAL_SLOTS = 1
+COMPACT_CHUNK_THRESHOLD = 16
+COMPACT_TAIL_CHUNKS = 2
+KERNEL_LAUNCH_SETUP_MS = 0.0022
+RECURRENCE_SYNC_MS = 0.00095
 L2NORM_OPS_PER_ELEM = 5
 SIGMOID_SCALE_OPS_PER_ELEM = 6
 GATE_CUMSUM_OPS_PER_ROW = 4
@@ -98,22 +105,18 @@ def _validate_chunk32_params(
 
 def _build_mixed_plan(
     geometry: Geometry,
-    tasks: tuple[Any, ...],
+    owners: tuple[tuple[Any, ...], ...],
     work_fn: Callable[[Any], tuple[Work, Work]],
     *,
     aiv_first: bool,
     slots: int,
+    step_sync_ms: float = 0.0,
     first_label: str,
     second_label: str,
     extra_meta: Mapping[str, Any],
 ) -> OperatorPlan:
     require_pair(geometry)
     buf_sizes = _check_buffers(geometry)
-    cores = max(1, int(geometry.compute_units))
-    owners: list[list[Any]] = [[] for _ in range(cores)]
-    for idx, item in enumerate(tasks):
-        owners[idx % cores].append(item)
-
     total_work = Work()
     for items in owners:
         for item in items:
@@ -122,7 +125,11 @@ def _build_mixed_plan(
             total_work += split_reads(aic_w, aic_w.resources["mte2"], geometry.resource_units)
 
     def program(context):
-        def per_core(core: int, items: list[Any]):
+        is_a5 = "mte2_aic_dram" in context.service_modes
+        setup_ms = KERNEL_LAUNCH_SETUP_MS if is_a5 else 0.0
+        sync_ms = step_sync_ms if is_a5 else 0.0
+
+        def per_core(core: int, items: tuple[Any, ...]):
             if not items:
                 return KernelProgram(())
 
@@ -131,20 +138,58 @@ def _build_mixed_plan(
                 half = aiv_w.scaled(0.5)
                 if aiv_first:
                     l0, l1 = f"{first_label}_0", f"{first_label}_1"
-                    return (
+                    base = (
                         phases(l0, half, context, core, aiv=0),
                         phases(l1, half, context, core, aiv=1),
                         phases(second_label, aic_w, context, core, aiv=None, after=(l0, l1)),
                     )
-                return (
-                    phases(first_label, aic_w, context, core, aiv=None),
-                    phases(f"{second_label}_0", half, context, core, aiv=0, after=(first_label,)),
-                    phases(f"{second_label}_1", half, context, core, aiv=1, after=(first_label,)),
-                )
+                    tail_after = (second_label,)
+                else:
+                    s0, s1 = f"{second_label}_0", f"{second_label}_1"
+                    base = (
+                        phases(first_label, aic_w, context, core, aiv=None),
+                        phases(s0, half, context, core, aiv=0, after=(first_label,)),
+                        phases(s1, half, context, core, aiv=1, after=(first_label,)),
+                    )
+                    tail_after = (s0, s1)
+                if sync_ms > 0.0:
+                    return (*base, Stage("recurrence_sync", after=tail_after, latency=sync_ms))
+                return base
 
-            body = KernelProgram((Stage("tiles", program=PipelineProgram(
-                len(items), slots, tile)),))
-            return resident(context, core, buf_sizes, body)
+            pipe = (
+                compact_periodic_pipeline(
+                    context, len(items), slots, tile,
+                    head=1, tail=COMPACT_TAIL_CHUNKS, threshold=COMPACT_CHUNK_THRESHOLD,
+                )
+                if sync_ms <= 0.0 and len(items) > COMPACT_CHUNK_THRESHOLD
+                else PipelineProgram(len(items), slots, tile)
+            )
+            stages = [
+                Stage("setup", latency=setup_ms, keep_empty=setup_ms <= 0.0),
+                Stage("tiles", after=("setup",), program=pipe),
+            ]
+            if sync_ms > 0.0 and len(items) > COMPACT_CHUNK_THRESHOLD:
+                # Fold serial recurrence steps without instantiating 12,800 sync stages:
+                # run pure work via compact_periodic_pipeline + exact serial barrier span.
+                def pure_tile(idx: int):
+                    aiv_w, aic_w = work_fn(items[idx])
+                    half = aiv_w.scaled(0.5)
+                    s0, s1 = f"{second_label}_0", f"{second_label}_1"
+                    return (
+                        phases(first_label, aic_w, context, core, aiv=None),
+                        phases(s0, half, context, core, aiv=0, after=(first_label,)),
+                        phases(s1, half, context, core, aiv=1, after=(first_label,)),
+                    )
+                compact_pipe = compact_periodic_pipeline(
+                    context, len(items), slots, pure_tile,
+                    head=1, tail=COMPACT_TAIL_CHUNKS, threshold=COMPACT_CHUNK_THRESHOLD,
+                )
+                stages = [
+                    Stage("setup", latency=setup_ms, keep_empty=setup_ms <= 0.0),
+                    Stage("tiles", after=("setup",), program=compact_pipe),
+                    Stage("recurrence_barriers", after=("tiles",), latency=sync_ms * float(len(items))),
+                ]
+            return resident(context, core, buf_sizes, KernelProgram(tuple(stages)))
 
         return ParallelProgram(tuple(per_core(c, items) for c, items in enumerate(owners)))
 
@@ -154,6 +199,13 @@ def _build_mixed_plan(
         "source_program": FLA_GDN_CHUNK_SOURCE,
         **dict(extra_meta),
     })
+
+
+def _round_robin_owners(cores: int, count: int) -> tuple[tuple[int, ...], ...]:
+    buckets: list[list[int]] = [[] for _ in range(cores)]
+    for idx in range(count):
+        buckets[idx % cores].append(idx)
+    return tuple(tuple(b) for b in buckets)
 
 
 def make_prepare_op(params: Mapping[str, Any]) -> OpSpec:
@@ -200,6 +252,7 @@ def build_prepare(op: OpSpec, geometry: Geometry) -> OperatorPlan:
     gate_bytes = FP32_BYTES if meta.get("gate_dtype", "fp32") == "fp32" else BF16_BYTES
     beta_bytes = FP32_BYTES if meta.get("beta_dtype", "bf16") == "fp32" else BF16_BYTES
     output_a = bool(meta.get("output_a", True))
+    cores = max(1, int(geometry.compute_units))
 
     def group_work(group_id: int) -> tuple[Work, Work]:
         _, _, _, rows = chunks.range(group_id // keys)
@@ -231,7 +284,7 @@ def build_prepare(op: OpSpec, geometry: Geometry) -> OperatorPlan:
         return aiv, aic
 
     return _build_mixed_plan(
-        geometry, tuple(range(chunks.total * keys)), group_work,
+        geometry, _round_robin_owners(cores, chunks.total * keys), group_work,
         aiv_first=True, slots=PIPELINE_WINDOW_SLOTS,
         first_label="aiv_vcs32", second_label="aic_wy32",
         extra_meta={"gqa_ratio": gqa},
@@ -273,14 +326,14 @@ def build_state(op: OpSpec, geometry: Geometry) -> OperatorPlan:
     lengths = tuple(int(v) for v in meta["lengths"])
     heads, keys, dk, dv = int(meta["heads"]), int(meta["key_heads"]), int(meta["dk"]), int(meta["dv"])
     bt, use_init, out_final = GDN_CHUNK32_TOKENS, bool(meta.get("use_initial_state", True)), bool(meta.get("output_final_state", True))
-    group = min(MAX_TASK_GROUP_HEADS, heads // keys)
+    cores = max(1, int(geometry.compute_units))
+    group = max(1, min(MAX_TASK_GROUP_HEADS, heads // keys, (len(lengths) * heads + cores - 1) // cores))
     groups_per_key = (heads // keys + group - 1) // group
     chunks = PackedChunks.from_lengths(lengths, bt)
     state_fp32, state_bf16 = float(dk * dv * FP32_BYTES), float(dk * dv * BF16_BYTES)
 
-    def group_work(gid: int) -> tuple[Work, Work]:
-        chunk_idx = gid // (keys * groups_per_key)
-        sub_idx = (gid % (keys * groups_per_key)) % groups_per_key
+    def group_work(item: tuple[int, int]) -> tuple[Work, Work]:
+        chunk_idx, sub_idx = item
         active_h = min(group, heads // keys - sub_idx * group)
         seq_idx, chunk_local, _, rows = chunks.range(chunk_idx)
         first_chunk, last_chunk = chunk_local == 0, chunk_local == (lengths[seq_idx] + bt - 1) // bt - 1
@@ -295,9 +348,22 @@ def build_state(op: OpSpec, geometry: Geometry) -> OperatorPlan:
         l0_bytes, flops = float(active_h * 2 * (bt * dk + dk * dv + bt * dv) * BF16_BYTES), float(active_h * 2 * (2 * bt * dv * dk))
         return aiv, Work(matrix={"bf16": flops}, resources={"hbm": aic_read, "mte2": aic_read, "mte1": l0_bytes})
 
+    buckets: list[list[tuple[int, int]]] = [[] for _ in range(cores)]
+    chunk_cursor = 0
+    for seq_idx, seq_len in enumerate(lengths):
+        seq_chunks = (seq_len + bt - 1) // bt
+        for key_idx in range(keys):
+            for sub_idx in range(groups_per_key):
+                chain_id = (seq_idx * keys + key_idx) * groups_per_key + sub_idx
+                owner = buckets[chain_id % cores]
+                for local_c in range(seq_chunks):
+                    owner.append((chunk_cursor + local_c, sub_idx))
+        chunk_cursor += seq_chunks
+
     return _build_mixed_plan(
-        geometry, tuple(range(chunks.total * keys * groups_per_key)), group_work,
-        aiv_first=False, slots=PIPELINE_WINDOW_SLOTS,
+        geometry, tuple(tuple(b) for b in buckets), group_work,
+        aiv_first=False, slots=RECURRENCE_SERIAL_SLOTS,
+        step_sync_ms=RECURRENCE_SYNC_MS,
         first_label="state_aic", second_label="state_aiv", extra_meta={"task_group_size": group},
     )
 
@@ -339,6 +405,7 @@ def build_output(op: OpSpec, geometry: Geometry) -> OperatorPlan:
     chunks = PackedChunks.from_lengths(lengths, bt)
     groups_per_key = (heads // keys + group - 1) // group
     total_groups = chunks.total * keys * groups_per_key
+    cores = max(1, int(geometry.compute_units))
 
     def group_work(gid: int) -> tuple[Work, Work]:
         chunk_idx = gid // (keys * groups_per_key)
@@ -362,7 +429,7 @@ def build_output(op: OpSpec, geometry: Geometry) -> OperatorPlan:
         return aiv, aic
 
     return _build_mixed_plan(
-        geometry, tuple(range(total_groups)), group_work,
+        geometry, _round_robin_owners(cores, total_groups), group_work,
         aiv_first=False, slots=PIPELINE_WINDOW_SLOTS,
         first_label="out_aic", second_label="out_aiv",
         extra_meta={"task_group_size": group},

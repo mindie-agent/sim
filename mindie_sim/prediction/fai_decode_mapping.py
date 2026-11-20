@@ -15,6 +15,14 @@ SOURCE_REVISION = "a3925fd49cd256ad478d2faf983bf2961b8ae2c8"
 SOURCE_PATH = ("attention/fused_infer_attention_score/op_host/"
                "flash_attention_infer_tiling.h")
 HOST_KV_TILE = 512
+ARCH35_FLASH_SPLIT_MIN_KV_LEN = 1024
+ARCH35_FLASH_SPLIT_MAX_KV_LEN = 65536
+ARCH35_FLASH_SPLIT_MAX_HEAD_DIM = 128
+ARCH35_MIN_TOKENS_PER_SPLIT_CORE = 1024
+ARCH35_FLASH_SPLIT_CORE_DIVISOR = 4
+MAX_SUPPORTED_HOST_CORES = 64
+MAX_DECODE_QUERY_LEN = 16
+QUERY_GROUP_TILE_ROWS = 128
 
 
 def uses_flash_decode(requests, kv_heads, cores):
@@ -26,28 +34,46 @@ def uses_flash_decode(requests, kv_heads, cores):
         or 5 * tasks <= 2 * cores)
 
 
-def host_partitions(requests, query_heads, kv_heads, cores, *, key_tile, query_tile):
-    """Select flash splitting or regular round-robin query/head tasks.
+def uses_flash_decode_arch35(
+    requests, kv_heads, cores, *, head_dim=ARCH35_FLASH_SPLIT_MAX_HEAD_DIM
+):
+    """CANN 9.3 Arch35 FIA flash-decode KV-split selector (hd <= 128, 1K <= L < 64K)."""
+    longest = max(context + q for q, context in requests)
+    tasks = len(requests) * kv_heads
+    if (
+        head_dim > ARCH35_FLASH_SPLIT_MAX_HEAD_DIM
+        or longest < ARCH35_FLASH_SPLIT_MIN_KV_LEN
+        or longest >= ARCH35_FLASH_SPLIT_MAX_KV_LEN
+        or tasks * ARCH35_FLASH_SPLIT_CORE_DIVISOR > cores
+    ):
+        return False
+    return uses_flash_decode(requests, kv_heads, cores)
 
-    The ordinary speculative q>1 branch uses FillSplitCoreTilingData and
-    flash_attention_regular.h's taskIdx = coreIdx; taskIdx += coreNum loop.
-    It has no split-KV merge. The separate q=1 high-batch specialized decoder
-    packs several KV heads in one task and is outside this ordinary branch.
-    """
+
+def _validate_host_domain(requests, query_heads, kv_heads, cores, *, key_tile, query_tile):
     group = query_heads // kv_heads
-    if (cores is None or not 1 <= cores <= 64 or not requests
-            or key_tile > HOST_KV_TILE or HOST_KV_TILE % key_tile
-            or any(not 0 < q <= 16 or q * group > min(128, query_tile)
-                   or min(max(1, (128 // q) // 2 * 2), group) != group
-                   for q, _ in requests)):
+    if (
+        cores is None
+        or not 1 <= cores <= MAX_SUPPORTED_HOST_CORES
+        or not requests
+        or key_tile > HOST_KV_TILE
+        or HOST_KV_TILE % key_tile
+        or any(
+            not 0 < q <= MAX_DECODE_QUERY_LEN
+            or q * group > min(QUERY_GROUP_TILE_ROWS, query_tile)
+            or min(max(1, (QUERY_GROUP_TILE_ROWS // q) // 2 * 2), group) != group
+            for q, _ in requests
+        )
+    ):
         raise ModelingError("fai_host_mapping_requires_supported_single_query_head_tile")
-    if uses_flash_decode(requests, kv_heads, cores):
-        return partitions(requests, query_heads, kv_heads, cores,
-                          key_tile=key_tile, query_tile=query_tile)
+
+
+def _regular_host_partitions(requests, query_heads, kv_heads, cores, *, key_tile):
+    group = query_heads // kv_heads
     if all(q == 1 for q, _ in requests) and len(requests) >= cores:
         # SplitCoreDecodeBS1GN2 packs up to kv_block_tile KV heads per batch task,
         # then unpacks tail tasks into single-KV-head tasks when 0 < tail <= cores // 2.
-        kv_block_tile = min(max(1, 128 // group), kv_heads)
+        kv_block_tile = min(max(1, QUERY_GROUP_TILE_ROWS // group), kv_heads)
         tasks_per_batch = (kv_heads + kv_block_tile - 1) // kv_block_tile
         total_tasks = len(requests) * tasks_per_batch
         tail_tasks = total_tasks % cores
@@ -71,10 +97,61 @@ def host_partitions(requests, query_heads, kv_heads, cores, *, key_tile, query_t
                         rework_idx += 1
                 task_idx += 1
         return result
-    return {(batch, head): (((batch * kv_heads + head) % cores, 0,
-                            (context + query + key_tile - 1) // key_tile),)
-            for batch, (query, context) in enumerate(requests)
-            for head in range(kv_heads)}
+    return {
+        (batch, head): (
+            ((batch * kv_heads + head) % cores, 0, (context + query + key_tile - 1) // key_tile),
+        )
+        for batch, (query, context) in enumerate(requests)
+        for head in range(kv_heads)
+    }
+
+
+def host_partitions(requests, query_heads, kv_heads, cores, *, key_tile, query_tile):
+    """Select flash splitting or regular round-robin query/head tasks."""
+    _validate_host_domain(
+        requests, query_heads, kv_heads, cores, key_tile=key_tile, query_tile=query_tile
+    )
+    if uses_flash_decode(requests, kv_heads, cores):
+        return partitions(
+            requests, query_heads, kv_heads, cores, key_tile=key_tile, query_tile=query_tile
+        )
+    return _regular_host_partitions(
+        requests, query_heads, kv_heads, cores, key_tile=key_tile
+    )
+
+
+def host_partitions_arch35(
+    requests,
+    query_heads,
+    kv_heads,
+    cores,
+    *,
+    key_tile,
+    query_tile,
+    head_dim=ARCH35_FLASH_SPLIT_MAX_HEAD_DIM,
+):
+    """CANN 9.3 Arch35 FIA host partitioner (splits hd<=128 in [1K, 64K), regular above)."""
+    _validate_host_domain(
+        requests, query_heads, kv_heads, cores, key_tile=key_tile, query_tile=query_tile
+    )
+    if uses_flash_decode_arch35(requests, kv_heads, cores, head_dim=head_dim):
+        longest = max(context + q for q, context in requests)
+        split_cores = min(
+            cores,
+            max(kv_heads, longest // ARCH35_MIN_TOKENS_PER_SPLIT_CORE),
+        )
+        if uses_flash_decode(requests, kv_heads, split_cores):
+            return partitions(
+                requests,
+                query_heads,
+                kv_heads,
+                split_cores,
+                key_tile=key_tile,
+                query_tile=query_tile,
+            )
+    return _regular_host_partitions(
+        requests, query_heads, kv_heads, cores, key_tile=key_tile
+    )
 
 
 def partitions(requests, query_heads, kv_heads, cores, *, key_tile, query_tile):

@@ -2,11 +2,11 @@
 
 [Role]
   Model ``cann_ops_transformer.mla_prolog`` and ``aclnnMlaPrologV4WeightNz``
-  (``weight_quant_mode=3`` MXFP8, ``kv_cache_quant_mode in {0, 1}`` BF16 or C8
-  packed 656 B / 520 B rows, ``do_rope in {True, False}``), fusing ``q_a_proj``,
-  ``q_a_layernorm`` + MX quant, ``q_b_proj``, ``kv_a_proj_with_mqa``,
-  ``kv_a_layernorm``, optional RoPE, ``w_uk`` absorption, and paged KV scatter
-  without intermediate HBM round-trips.
+  (``weight_quant_mode in {0, 2, 3}`` BF16 / INT8 / MXFP8, ``kv_cache_quant_mode
+  in {0, 1}`` BF16 or C8 packed 656 B / 520 B rows, ``do_rope in {True, False}``),
+  fusing ``q_a_proj``, ``q_a_layernorm`` + MX quant, ``q_b_proj``,
+  ``kv_a_proj_with_mqa``, ``kv_a_layernorm``, optional RoPE, ``w_uk`` absorption,
+  and paged KV scatter without intermediate HBM round-trips.
 
 [Invariants]
   * ``OperatorPlan.work`` equals the exact sum of issued per-owner ``Stage``
@@ -74,6 +74,17 @@ DEFAULT_Q_LORA_RANK = 1536
 DEFAULT_KV_LORA_RANK = 512
 DEFAULT_QK_NOPE_DIM = 128
 DEFAULT_QK_ROPE_DIM = 64
+
+PROLOG_SETUP_MS = 0.011
+PROLOG_V3_SUBTILE_CUBE_EFF = 0.202
+PROLOG_V4_SUBTILE_CUBE_EFF = 0.412
+PROLOG_WIDE_Q_DIM_PIVOT = 3072.0
+PROLOG_WIDE_Q_BASE_SCALE = 0.85
+PROLOG_WIDE_Q_SLOPE_SCALE = 0.15
+PROLOG_WIDE_Q_MAX_SCALE = 1.45
+PROLOG_V3_EPILOG_MS_PER_TOK = 0.000232
+PROLOG_V4_EPILOG_MS_PER_TOK = 0.000097
+PROLOG_COLD_WEIGHT_OVERLAP = 0.35
 
 PROLOG_BUFFERS = {
     "ub": 128 * 1024, "l1": 256 * 1024, "l0a": 32 * 1024,
@@ -158,15 +169,10 @@ def make_op(
     meta = {
         "native_kind": native_name,
         "prolog_v4_geometry": {
-            "tokens": tok,
-            "hidden_size": hidden,
-            "num_heads": heads,
-            "q_lora_rank": q_rank,
-            "kv_lora_rank": kv_rank,
-            "qk_nope_head_dim": nope,
-            "qk_rope_head_dim": rope,
-            "weight_quant_mode": w_mode,
-            "kv_cache_quant_mode": kv_mode,
+            "tokens": tok, "hidden_size": hidden, "num_heads": heads,
+            "q_lora_rank": q_rank, "kv_lora_rank": kv_rank,
+            "qk_nope_head_dim": nope, "qk_rope_head_dim": rope,
+            "weight_quant_mode": w_mode, "kv_cache_quant_mode": kv_mode,
             "do_rope": rope_active,
         },
         "native_source": MLA_PROLOG_V4_HEADER_SOURCE,
@@ -184,7 +190,7 @@ def make_op(
 
 
 def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
-    """Build a work-conserving AIC+AIV program for ``MlaPrologV4WeightNz``."""
+    """Build a work-conserving AIC+AIV program for ``MlaPrologV3/V4WeightNz``."""
     buf_sizes = _check_buffers(geometry)
     meta = dict(op.metadata)
     pg = dict(meta.get("prolog_v4_geometry") or {})
@@ -210,7 +216,7 @@ def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
             + _mx_weight_bytes(kv_rank + rope, hidden)
         )
         in_x_bytes = float(tok * (hidden + math.ceil(hidden / MX_GROUP_SIZE)))
-    elif w_mode == 2:
+    elif w_mode == WEIGHT_QUANT_INT8:
         w_bytes = float(
             q_rank * hidden + heads * (nope + rope) * q_rank + (kv_rank + rope) * hidden
             + (q_rank + heads * (nope + rope) + kv_rank + rope) * FP32_BYTES
@@ -228,7 +234,6 @@ def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
 
     has_l2 = bool((geometry.rates or {}).get("l2", 0.0) or (geometry.resource_units or {}).get("l2", 0))
     l2_cap = _effective_l2(geometry) if has_l2 else 0.0
-    # Shared token activation ``x`` is broadcast from L2 across q_a and kv_a tiles!
     l2_hit = min(in_x_bytes, l2_cap) if l2_cap > 0.0 else 0.0
     aic_gm_read = max(0.0, aic_read - l2_hit)
 
@@ -253,8 +258,10 @@ def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
         + 2 * tok * hidden * (kv_rank + rope)
     )
     absorb_flops = float(2 * tok * heads * nope * kv_rank)
-    l0_bytes = in_x_bytes + w_bytes + w_uk_bytes
-    fix_bytes = float(tok * (q_rank + heads * (nope + rope + kv_rank) + kv_rank + rope) * BF16_BYTES)
+    l0_proj = in_x_bytes + w_bytes
+    l0_abs = w_uk_bytes
+    fix_proj = float(tok * (q_rank + heads * (nope + rope) + kv_rank + rope) * BF16_BYTES)
+    fix_abs = float(tok * heads * kv_rank * BF16_BYTES)
 
     quant_modes = {WEIGHT_QUANT_INT8, WEIGHT_QUANT_MXFP8}
     vec_ops = float(
@@ -271,8 +278,8 @@ def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
 
     plan_res: dict[str, float] = {
         "hbm": aic_gm_read + aiv_read + out_write,
-        "mte1": l0_bytes,
-        "fixpipe": fix_bytes,
+        "mte1": l0_proj + l0_abs,
+        "fixpipe": fix_proj + fix_abs,
         "vector": vec_ops,
         "mte3": out_write,
     }
@@ -293,11 +300,42 @@ def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
         c_aic_pipe = read_role(context.resource_names, aiv=None)
         c_aiv_pipe = read_role(context.resource_names, aiv=0)
         share = 1.0 / float(cores)
+        abs_owners = min(cores, heads)
+        abs_share = 1.0 / float(abs_owners)
+        is_a5 = "mte2_aic_dram" in context.service_modes
+        setup = PROLOG_SETUP_MS if is_a5 else 0.0
+        proj_caps: dict[str, float] = {}
+        epilog_lat = 0.0
+        cold_w_lat = 0.0
+        if is_a5:
+            is_v4 = w_mode in quant_modes
+            q_width = float(heads * (nope + rope))
+            wide_scale = min(
+                PROLOG_WIDE_Q_MAX_SCALE,
+                max(1.0, PROLOG_WIDE_Q_BASE_SCALE + PROLOG_WIDE_Q_SLOPE_SCALE * (q_width / PROLOG_WIDE_Q_DIM_PIVOT)),
+            )
+            cube_eff = (PROLOG_V4_SUBTILE_CUBE_EFF if is_v4 else PROLOG_V3_SUBTILE_CUBE_EFF) * wide_scale
+            if "cube" in context.resource_names:
+                cube_phys = context.resource_names["cube"]
+                bf16_rate = float(context.rates.get(cube_phys, 0.0))
+                if bf16_rate > 0.0:
+                    proj_caps[cube_phys] = (cube_eff * bf16_rate) * share
+            epilog_lat = float(tok) * (
+                PROLOG_V4_EPILOG_MS_PER_TOK if is_v4 else PROLOG_V3_EPILOG_MS_PER_TOK
+            )
+            dram_entry = context.service_modes.get("mte2_aic_dram")
+            dram_rate = (
+                float(dram_entry[1]) if isinstance(dram_entry, tuple) else float(dram_entry or 0.0)
+            )
+            if dram_rate > 0.0:
+                cold_w_lat = PROLOG_COLD_WEIGHT_OVERLAP * (w_bytes + w_uk_bytes) / dram_rate
+
+        proj_gm = max(0.0, aic_gm_read - w_uk_bytes)
+        abs_gm = aic_gm_read - proj_gm
 
         def per_core(core: int):
-            aiv_idx = min(aiv_units - 1, 2 * core if aiv_units >= 2 * cores else core)
             aic_owned = context.owned(core, cores, ("cube", "mte1", "fixpipe", c_aic_pipe))
-            aiv_owned = context.owned(aiv_idx, aiv_units, ("vector", c_aiv_pipe, "mte3"))
+            aiv_owned = context.owned(core, cores, ("vector", c_aiv_pipe, "mte3"))
             allocs = tuple(
                 context.allocate(
                     f"mlapo4_{core}_{pool}", pool, size,
@@ -305,34 +343,48 @@ def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
                 )
                 for pool, size in buf_sizes.items() if pool in context.pool_names
             )
-            aic_res: dict[str, float] = {
-                "hbm": aic_gm_read * share,
-                c_aic_pipe: aic_read * share,
-                "mte1": l0_bytes * share,
-                "fixpipe": fix_bytes * share,
+            s_setup = Stage(
+                "prolog_setup", latency=setup + cold_w_lat,
+                acquire=allocs, keep_empty=(setup + cold_w_lat) <= 0.0,
+            )
+            proj_res: dict[str, float] = {
+                "hbm": proj_gm * share, c_aic_pipe: l0_proj * share,
+                "mte1": l0_proj * share, "fixpipe": fix_proj * share,
             }
             if l2_hit > 0.0:
-                aic_res["l2"] = l2_hit * share
-            s_cube = Stage(
-                "prolog_projections_absorb",
-                context.bind(Work(
-                    matrix={k: v * share for k, v in matrix_map.items()},
-                    resources=aic_res,
-                )),
-                acquire=allocs, placement=aic_owned,
+                proj_res["l2"] = l2_hit * share
+            s_proj = Stage(
+                "prolog_projections",
+                context.bind(Work(matrix={comp_dt: proj_flops * share}, resources=proj_res)),
+                after=("prolog_setup",), placement=aic_owned, caps=proj_caps,
             )
+            stages_list = [s_setup, s_proj]
+            epilog_pred = ("prolog_projections",)
+            if core < abs_owners:
+                s_abs = Stage(
+                    "prolog_wuk_absorb",
+                    context.bind(Work(
+                        matrix={"bf16": absorb_flops * abs_share},
+                        resources={
+                            "hbm": abs_gm * abs_share, c_aic_pipe: l0_abs * abs_share,
+                            "mte1": l0_abs * abs_share, "fixpipe": fix_abs * abs_share,
+                        },
+                    )),
+                    after=("prolog_projections",), placement=aic_owned,
+                )
+                stages_list.append(s_abs)
+                epilog_pred = ("prolog_wuk_absorb",)
             aiv_res: dict[str, float] = {
-                c_aiv_pipe: aiv_read * share,
-                "vector": vec_ops * share,
-                "hbm": (aiv_read + out_write) * share,
-                "mte3": out_write * share,
+                c_aiv_pipe: aiv_read * share, "vector": vec_ops * share,
+                "hbm": (aiv_read + out_write) * share, "mte3": out_write * share,
             }
             s_epilog = Stage(
                 "norm_rope_kv_scatter",
                 context.bind(Work(resources=aiv_res)),
-                after=("prolog_projections_absorb",), free=allocs, placement=aiv_owned,
+                after=epilog_pred, latency=epilog_lat, free=allocs, placement=aiv_owned,
             )
-            return KernelProgram((s_cube, s_epilog))
+            stages_list.append(s_epilog)
+            return KernelProgram(tuple(stages_list))
 
         return ParallelProgram(tuple(per_core(c) for c in range(cores)))
 

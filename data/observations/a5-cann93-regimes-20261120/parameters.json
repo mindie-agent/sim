@@ -1,0 +1,170 @@
+{
+  "schema": "mindie-sim.a5-cann93-regime-parameters/1",
+  "campaign": "a5-cann93-regimes-20261120",
+  "leakage_policy": "strict_train_only_fit_zero_heldout_inspection",
+  "regimes": [
+    {
+      "id": "fia_v1_arch35_decode_split_occupancy",
+      "module": "mindie_sim/prediction/attention_decode.py",
+      "parameters": {
+        "A5_FIA_SETUP_MS": 0.0055,
+        "A5_OWNER_KV_PORT_BYTES_PER_MS": 158000000.0,
+        "A5_NOC_FABRIC_BYTES_PER_MS": 12500000000.0,
+        "A5_HBM_BANK_CONFLICT_FACTOR": 2.4,
+        "A5_MTP_OVERLAP_DECAY": 0.115,
+        "A5_KEY64_SINGLE_SLOT_TURNAROUND_MS": 0.000425
+      },
+      "provenance": {
+        "capture_uri": "capture://cann93-a5-seq512-400k/20261119/cann93_seq512_to_400k_measurements.json#shard0_fia_decode",
+        "split_used": "train",
+        "source": {
+          "repository": "cann-toolkit",
+          "revision": "9.3.0-20261112_192141454",
+          "relative_path": "ops/built-in/op_proto/inc/nn_calculation_ops.h",
+          "source_sha256": "88b59a2b2a19cf487b0c13038b2ffc8a410760ae381424797447b00c08838f3a"
+        }
+      }
+    },
+    {
+      "id": "gbsa_and_c8_kv_quant_sfa_arch35",
+      "module": "mindie_sim/prediction/operators/block_sparse_attention_arch35.py",
+      "parameters": {
+        "SFA_C8_SETUP_MS": 0.0175,
+        "SFA_GATHER_MS_PER_TOKEN": 0.0000182,
+        "SFA_SCATTER_DRAM_EFF": 0.56,
+        "GBSA_SETUP_MS": 0.0078,
+        "GBSA_SEL_MS_PER_TOKEN": 0.0000033,
+        "GBSA_DESC_SQRT_MS": 0.00064,
+        "GBSA_PEAK_DRAM_EFF": 0.68,
+        "GBSA_SCATTER_PIVOT_BYTES": 9216.0,
+        "GBSA_FLASH_TASK_NUMERATOR": 10,
+        "GBSA_FLASH_CORE_FACTOR": 3,
+        "GBSA_FLASH_COMBINE_BASE_MS": 0.0082,
+        "GBSA_FLASH_COMBINE_PER_QUERY_MS": 0.00105
+      },
+      "provenance": {
+        "capture_uri": "capture://cann93-a5-microbench/20261119/cann93_single_op_measurements.json#domain4_gbsa,probe1_c8_sfa",
+        "split_used": "train",
+        "source": {
+          "repository": "cann_ops_transformer",
+          "revision": "1.0.0",
+          "relative_path": "cann_ops_transformer/ops/attention/generic_block_sparse_attention/generic_block_sparse_attention.py",
+          "source_sha256": "2f8a14651d6c0b2a0ea1dbae7bfae3be6b078e32e79f8640e1d019b800a5568c"
+        }
+      }
+    },
+    {
+      "id": "mla_prolog_v3_v4_arch35",
+      "module": "mindie_sim/prediction/operators/mla_prolog_v4_arch35.py",
+      "parameters": {
+        "PROLOG_SETUP_BF16_MS": 0.025,
+        "PROLOG_SETUP_MXFP8_MS": 0.032,
+        "PROLOG_TAIL_CUBE_MS_BF16": 0.022,
+        "PROLOG_TAIL_CUBE_MS_MXFP8": 0.014,
+        "PROLOG_AIC_EFF_BF16": 0.72,
+        "PROLOG_AIC_EFF_MXFP8": 0.61,
+        "PROLOG_HBM_EFF": 0.74
+      },
+      "provenance": {
+        "capture_uri": "capture://cann93-a5-seq512-400k/20261119/cann93_seq512_to_400k_measurements.json#shard3_mla_prolog_v3,shard3_mla_prolog_v4",
+        "split_used": "train",
+        "source": {
+          "repository": "cann-toolkit",
+          "revision": "9.3.0-20261112_192141454",
+          "relative_path": "include/aclnnop/aclnn_mla_prolog_v4.h",
+          "source_sha256": "a4c1d88bc6ef5bd177a6e6ef651910939f9a5b6fd0f889e3c681294dc84db92a"
+        }
+      }
+    },
+    {
+      "id": "mhc_text_gated_and_lowrank_hc_arch35",
+      "module": "mindie_sim/prediction/operators/hc_gated_residual_arch35.py",
+      "parameters": {
+        "TEXT_GATED_EZ1008_FLOOR_ROWS": 512,
+        "HC_POST_SETUP_MS": 0.0033,
+        "HC_PRE_SETUP_MS": 0.0115,
+        "HC_PRE_STAGE_HBM_EFF": 0.305,
+        "TEXT_GATED_SETUP_MS": 0.175,
+        "TEXT_GATED_LOWRANK_CUBE_EFF": 0.088,
+        "LOWRANK_HC_SETUP_MS": 0.053,
+        "LOWRANK_HC_STRIDED_HBM_EFF": 0.14
+      },
+      "provenance": {
+        "capture_uri": "capture://cann93-a5-microbench/20261119/cann93_single_op_measurements.json#probe2_mhc_arch35",
+        "split_used": "train",
+        "source": {
+          "repository": "vllm-project/vllm-ascend",
+          "revision": "405617bae227fe5b097ff163efaa60bb7f22c698",
+          "relative_path": "csrc/moe/hc_pre/op_host/hc_pre_tiling_arch35.h",
+          "source_sha256": "9ffce3d0faf8c1f0c54a64fdb6e11d2f0476e7a99703a418e1a112f07196c8b0"
+        }
+      }
+    },
+    {
+      "id": "sparse_index_scorers_arch35",
+      "module": "mindie_sim/prediction/operators/sparse_index_scorers_arch35.py",
+      "parameters": {
+        "MSA_CHOICE0_SETUP_MS": 0.0074,
+        "MSA_CHOICE1_SETUP_MS": 0.029,
+        "STEP5_SETUP_MS": 0.036,
+        "STEP5_TOPK_MS_PER_QUERY": 0.0046,
+        "MSA_CHOICE0_DRAM_EFF": 0.78,
+        "MSA_CHOICE1_DRAM_EFF": 0.72,
+        "STEP5_DRAM_EFF": 0.67
+      },
+      "provenance": {
+        "capture_uri": "capture://cann93-a5-seq512-400k/20261119/cann93_seq512_to_400k_measurements.json#shard2_minimax_msa,shard2_step5_region_score",
+        "split_used": "train",
+        "source": {
+          "repository": "cann_ops_transformer",
+          "revision": "1.0.0",
+          "relative_path": "cann_ops_transformer/ops/attention/msa_index_score/msa_index_score.py",
+          "source_sha256": "e3199e7724cb0e4c804ce821f64882ef28d226e8114086f6b6476d947875d721"
+        }
+      }
+    },
+    {
+      "id": "gdn_chunk32_arch35",
+      "module": "mindie_sim/prediction/gdn_chunk32.py",
+      "parameters": {
+        "KERNEL_LAUNCH_SETUP_MS": 0.0022,
+        "RECURRENCE_SYNC_MS": 0.00095,
+        "MAX_TASK_GROUP_HEADS": 4
+      },
+      "provenance": {
+        "capture_uri": "capture://cann93-a5-seq512-400k/20261119/cann93_seq512_to_400k_measurements.json#shard3_gdn_chunk32",
+        "split_used": "train",
+        "source": {
+          "repository": "vllm-project/vllm-ascend",
+          "revision": "2fb3507bc6",
+          "relative_path": "vllm_ascend/ops/fla/chunk.py",
+          "source_sha256": "4b887a0cf8a22f3c42a655e5948fa02d5cf806d8819e5a6764df6fb2cb1a2b17"
+        }
+      }
+    },
+    {
+      "id": "host_runner_submission_and_piecewise_sync",
+      "module": "mindie_sim/prediction/execution.py",
+      "parameters": {
+        "kernel_launch_ms": 0.062,
+        "graph_replay_ms": 0.30,
+        "piecewise_sync_base_ms": 0.54,
+        "piecewise_sync_per_token_ms": 0.00017,
+        "decode_scheduler_ms": 1.35,
+        "decode_completion_ms": 0.70,
+        "prefill_scheduler_ms": 0.70,
+        "prefill_completion_ms": 0.35
+      },
+      "provenance": {
+        "capture_uri": "capture://cann93-a5-vllm-subgraphs/20261119/cann93_model_subgraphs_and_perf.json",
+        "split_used": "train",
+        "source": {
+          "repository": "vllm-project/vllm-ascend",
+          "revision": "405617bae227fe5b097ff163efaa60bb7f22c698",
+          "relative_path": "vllm_ascend/compilation/acl_graph.py",
+          "source_sha256": "08d9903e01c5206fb34bf57ba5ef9c704752cbfd290f0cf59840a4ea8d17aa29"
+        }
+      }
+    }
+  ]
+}

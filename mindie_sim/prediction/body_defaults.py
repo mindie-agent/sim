@@ -39,6 +39,16 @@ LIGHTNING_INDEXER_FAMILY = "lightning_indexer"
 LIGHTNING_INDEXER_IMPLEMENTATION = "cann_bf16_lightning_indexer_v2_complete"
 BF16_INDEX_CACHE_DTYPES = frozenset({"bf16", "bfloat16"})
 INDEX_PROBE_ROWS = 1
+ARCH22_FAI_TARGET_CORES = 20
+ARCH35_FAI_TARGET_CORES = 32
+FAI_MAX_HOST_CORES = 64
+FAI_MAX_QUERY_TOKENS = 16
+FAI_HOST_KV_TILE = 512
+FAI_MAX_QUERY_GROUP_ROWS = 128
+GQA_QUERY_TILE_CANDIDATES = (64, 32, 16, 8, 4, 2, 1)
+GQA_KEY_TILE_CANDIDATES = (128, 64, 32, 16, 8, 4, 2, 1)
+GQA_SCORE_ACCUM_BYTES = 4
+GQA_ONLINE_STATS_BYTES = 8
 
 
 def _gdn_source_options(binding):
@@ -349,9 +359,12 @@ def _gqa_tiles(case, layers, tokens=1):
     qb, kb = dtype_bytes(case.model.activation_dtype), dtype_bytes(case.model.quant.kv_dtype)
     tp = max(case.runtime.parallel.tp, 1)
     cores = min((d.compute_units for d in case.machine.dies), default=0)
-    target_cores = min(cores, 20)
-    for query in (64, 32, 16, 8, 4, 2, 1):
-        for key in (128, 64, 32, 16, 8, 4, 2, 1):
+    is_a5 = case.machine.arch_family == "A5"
+    target_cores = min(
+        cores, ARCH35_FAI_TARGET_CORES if is_a5 else ARCH22_FAI_TARGET_CORES
+    )
+    for query in GQA_QUERY_TILE_CANDIDATES:
+        for key in GQA_KEY_TILE_CANDIDATES:
             fits = True
             for layer in layers:
                 dim = layer.head_dim
@@ -359,8 +372,11 @@ def _gqa_tiles(case, layers, tokens=1):
                     "l1": query * dim * qb + 2 * key * dim * kb,
                     "l0a": query * dim * qb + 2 * query * key * qb,
                     "l0b": 2 * key * dim * kb,
-                    "l0c": 2 * query * max(key, dim) * 4,
-                    "ub": query * (dim * 4 + 8) + 2 * query * key * 4,
+                    "l0c": 2 * query * max(key, dim) * GQA_SCORE_ACCUM_BYTES,
+                    "ub": (
+                        query * (dim * GQA_SCORE_ACCUM_BYTES + GQA_ONLINE_STATS_BYTES)
+                        + 2 * query * key * GQA_SCORE_ACCUM_BYTES
+                    ),
                 }
                 for die in case.machine.dies:
                     capacities = dict(die.buffers)
@@ -375,15 +391,16 @@ def _gqa_tiles(case, layers, tokens=1):
                 result = {"kind": "staged_gqa_decode", "query_tile": query,
                           "key_tile": key, "slots": 2}
                 fai_valid = (
-                    case.machine.arch_family in {"A2", "A3"}
-                    and 1 <= target_cores <= 64
-                    and 0 < tokens <= 16
-                    and key <= 512 and 512 % key == 0
+                    case.machine.arch_family in {"A2", "A3", "A5"}
+                    and 1 <= target_cores <= FAI_MAX_HOST_CORES
+                    and 0 < tokens <= FAI_MAX_QUERY_TOKENS
+                    and key <= FAI_HOST_KV_TILE and FAI_HOST_KV_TILE % key == 0
                     and all(
                         layer.num_kv_heads >= tp
                         and (layer.num_heads // tp) % (layer.num_kv_heads // tp) == 0
-                        and tokens * ((layer.num_heads // tp) // (layer.num_kv_heads // tp)) <= min(128, query)
-                        and min(max(1, (128 // tokens) // 2 * 2),
+                        and tokens * ((layer.num_heads // tp) // (layer.num_kv_heads // tp))
+                            <= min(FAI_MAX_QUERY_GROUP_ROWS, query)
+                        and min(max(1, (FAI_MAX_QUERY_GROUP_ROWS // tokens) // 2 * 2),
                                 (layer.num_heads // tp) // (layer.num_kv_heads // tp))
                             == (layer.num_heads // tp) // (layer.num_kv_heads // tp)
                         for layer in layers
@@ -391,7 +408,7 @@ def _gqa_tiles(case, layers, tokens=1):
                 )
                 if fai_valid:
                     result["target_cores"] = target_cores
-                    result["kv_mapping"] = "fai_host"
+                    result["kv_mapping"] = "fai_host_arch35" if is_a5 else "fai_host"
                 return result
     return None
 

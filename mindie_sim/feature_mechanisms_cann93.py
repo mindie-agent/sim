@@ -47,7 +47,7 @@ MSA_MIN_BLOCK_SIZE = 64
 FUSED_MC2_ROUTED_MODE = 2
 FUSED_MC2_SHARED_MODE = 3
 QSA_MROPE_DECODE_MAX_ROWS = 64
-TEXT_GATED_RESIDUAL_MIN_ROWS = 257
+TEXT_GATED_RESIDUAL_MIN_ROWS = 513
 
 
 MXFP_EXPERT_WEIGHT_FORMATS = frozenset({"mxfp4", "mxfp8", "fp4_e2m1"})
@@ -259,7 +259,7 @@ def register_cann93_mechanisms() -> None:
         OptimizationMechanism(
             id="text_gated_residual_fusion", category="mhc_overlap",
             phases=("prefill",),
-            summary="CANN 9.3 native text_gated_residual (M > 256) replacing 5-op Triton Low-Rank HC chain",
+            summary="CANN 9.3 native text_gated_residual (M > 512) replacing 5-op Triton Low-Rank HC chain",
             eligible=lambda ctx: (
                 ctx.arch == "a5"
                 and any(getattr(p, "hc_lowrank", 0) > 0 for p in ctx.model.layer_plans)

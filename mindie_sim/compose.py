@@ -39,6 +39,7 @@ from mindie_sim.compose_assembly import (
     assemble,
 )
 from mindie_sim.compose_inputs import (
+    DERIVED_ASCEND_SKUS,
     HARDWARE_ALIASES,
     HARDWARE_TOPOLOGY_ALIASES,
     _EXTRA_QUANT_SPECS,
@@ -185,6 +186,22 @@ def _materialize_machine(
         )
     elif backend == "nvidia":
         machine = materialize_nvidia(machine_input)
+    elif sku in DERIVED_ASCEND_SKUS:
+        from mindie_sim.hardware_derivation import derive_hardware_sku
+        spec = DERIVED_ASCEND_SKUS[sku]
+        base_machine = materialize_ascend({**machine_input, "sku": spec["base"]})
+        derived_dict = derive_hardware_sku(
+            base_machine,
+            sku=sku,
+            aic_count=spec["aic_count"],
+            memory_bytes=spec["memory_bytes"],
+        ).to_dict()
+        machine = {
+            **base_machine,
+            **derived_dict,
+            "sku": sku,
+            "device": deepcopy(derived_dict["devices"][0]),
+        }
     else:
         machine = materialize_ascend(machine_input)
     if preset:

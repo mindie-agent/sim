@@ -54,6 +54,8 @@ def primitive_key(case: CaseSpec, op: OpSpec, replay_scope: str, *, hardware=Non
     }
     if "peer_traffic" in metadata:
         implementation["peer_traffic"] = metadata["peer_traffic"]
+    if metadata.get("pr_source"):
+        implementation["pr_source"] = metadata["pr_source"]
     return PrimitiveKey.from_mapping({
         "hardware": hardware or {
             "identity": case.machine.hardware_key or case.machine.sku,

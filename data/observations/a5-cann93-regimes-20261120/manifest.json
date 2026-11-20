@@ -1,0 +1,105 @@
+{
+  "schema": "mindie-sim.a5-cann93-observation-manifest/1",
+  "campaign": "a5-cann93-regimes-20261120",
+  "stack": {
+    "cann_toolkit": "9.3.0-20261112_192141454",
+    "cann_ops_transformer": "1.0.0",
+    "vllm_ascend": {
+      "repository": "vllm-project/vllm-ascend",
+      "revision": "405617bae227fe5b097ff163efaa60bb7f22c698"
+    }
+  },
+  "devices": [
+    {
+      "sku": "Ascend950DT_9582",
+      "aic_units": 32,
+      "aiv_units": 64,
+      "sustained_clock_mhz": 1650.0,
+      "hbm_peak_bw_gbps": 4000.0,
+      "l2_bytes": 134217728,
+      "l2_buffer_units": 1,
+      "ub_mesh_per_pair_uni_bw_gbps": 47.5
+    },
+    {
+      "sku": "Ascend950PR_958b",
+      "aic_units": 36,
+      "aiv_units": 72,
+      "sustained_clock_mhz": 1650.0,
+      "hbm_peak_bw_gbps": 1400.0,
+      "l2_bytes": 134217728,
+      "l2_buffer_units": 1,
+      "ub_mesh_per_pair_uni_bw_gbps": 47.5
+    }
+  ],
+  "captures": [
+    {
+      "id": "cann93_single_op_measurements",
+      "uri": "capture://cann93-a5-microbench/20261119/cann93_single_op_measurements.json",
+      "source_sha256": "9d35a6cd303cd4ed5f496a44287fd66563223e8cdba408c16ffd24bb42ccfe0b",
+      "size_bytes": 723577,
+      "records": 593,
+      "split_policy": "explicit_per_row_train_heldout_label",
+      "counts": {
+        "Ascend950PR_958b_train": 159,
+        "Ascend950PR_958b_heldout": 81,
+        "Ascend950DT_9582_train": 175,
+        "Ascend950DT_9582_heldout": 65,
+        "ub_mesh_collectives_train": 87,
+        "ub_mesh_collectives_heldout": 26
+      }
+    },
+    {
+      "id": "cann93_seq512_to_400k_measurements",
+      "uri": "capture://cann93-a5-seq512-400k/20261119/cann93_seq512_to_400k_measurements.json",
+      "source_sha256": "ed6c7fe021cdea84604d94a15ff8d1935752fbf4f46c1cac931580b0add2f021",
+      "size_bytes": 2427918,
+      "records": 1936,
+      "split_policy": "disjoint_sequence_grid",
+      "train_sequences": [512, 1024, 4096, 32768, 65536, 409600],
+      "heldout_sequences": [2048, 8192, 16384, 131072, 262144]
+    },
+    {
+      "id": "cann93_model_subgraphs_and_perf",
+      "uri": "capture://cann93-a5-vllm-subgraphs/20261119/cann93_model_subgraphs_and_perf.json",
+      "source_sha256": "08d9903e01c5206fb34bf57ba5ef9c704752cbfd290f0cf59840a4ea8d17aa29",
+      "size_bytes": 3079488,
+      "records": 50,
+      "split_policy": "disjoint_model_rung_topology_holdout",
+      "train_runs": 15,
+      "heldout_runs": 11,
+      "boundary_failure_receipts": 24
+    },
+    {
+      "id": "task1_kimi_k31_silicon_hotspots",
+      "uri": "capture://cann93-a5-kimi-k31-hotspots/20261119/task1_kimi_k31_silicon_hotspots.json",
+      "source_sha256": "c641f5822a13a85a86dc3b67c60c97b5270bfb3b255b6f1cd4bbcc0af39d3885",
+      "size_bytes": 2379247,
+      "records": 2109,
+      "split_policy": "modulo_3_index_2_heldout"
+    }
+  ],
+  "verified_boundaries": [
+    {
+      "operator": "cann_ops_transformer.text_gated_residual",
+      "condition": "M <= 512 at H=2560",
+      "behavior": "raises EZ1008; linear scaling holds strictly for M > 512",
+      "source": {
+        "repository": "cann_ops_transformer",
+        "revision": "1.0.0",
+        "relative_path": "cann_ops_transformer/ops/mhc/text_gated_residual/text_gated_residual.py",
+        "source_sha256": "8c3fde722b28617b1eebd12411ee19358cf2c1bb529e9e58741043f39318c9ca"
+      }
+    },
+    {
+      "operator": "fla_npu.ops.fla.chunk.chunk_gated_delta_rule",
+      "condition": "Hv // Hk > 4",
+      "behavior": "both chunk64 and PR #22147 chunk32 enforce Hv // Hk <= 4 and fall back to Triton when Hv // Hk == 8",
+      "source": {
+        "repository": "vllm-project/vllm-ascend",
+        "revision": "405617bae227fe5b097ff163efaa60bb7f22c698",
+        "relative_path": "vllm_ascend/ops/linear_attn.py",
+        "source_sha256": "3623e6858268b10b724eb645df83e54ef18c42676f3d0b5b67c8a1f5b821df41"
+      }
+    }
+  ]
+}

@@ -44,9 +44,38 @@ from mindie_sim.schema.serialization import apply_model_overrides
 
 MAX_METADATA_MIB = 50
 BYTES_PER_KIB = 1024
+BYTES_PER_GIB = BYTES_PER_KIB * BYTES_PER_KIB * BYTES_PER_KIB
 MX_EXPERT_BLOCK_GROUP = 32
 NEXTN_DEFAULT_HEAD_DIM = 192
 PP_CAP_DEFAULT = (1, 2, 4, 8, 16)
+A5_DT_425_AIC_CORES = 28
+A5_DT_486_AIC_CORES = 32
+A5_DT_547_AIC_CORES = 36
+A5_DT_96_GIB = 96
+A5_DT_144_GIB = 144
+
+DERIVED_ASCEND_SKUS: dict[str, dict[str, Any]] = {
+    "Ascend950DT_425_96": {
+        "base": "Ascend950DT_9582",
+        "aic_count": A5_DT_425_AIC_CORES,
+        "memory_bytes": A5_DT_96_GIB * BYTES_PER_GIB,
+    },
+    "Ascend950DT_486_96": {
+        "base": "Ascend950DT_9582",
+        "aic_count": A5_DT_486_AIC_CORES,
+        "memory_bytes": A5_DT_96_GIB * BYTES_PER_GIB,
+    },
+    "Ascend950DT_547_96": {
+        "base": "Ascend950DT_9582",
+        "aic_count": A5_DT_547_AIC_CORES,
+        "memory_bytes": A5_DT_96_GIB * BYTES_PER_GIB,
+    },
+    "Ascend950DT_547_144": {
+        "base": "Ascend950DT_9582",
+        "aic_count": A5_DT_547_AIC_CORES,
+        "memory_bytes": A5_DT_144_GIB * BYTES_PER_GIB,
+    },
+}
 
 HARDWARE_ALIASES: dict[str, str] = {
     "a2": "Ascend910B4", "910b": "Ascend910B4", "910b4": "Ascend910B4",
@@ -73,6 +102,24 @@ HARDWARE_ALIASES.update(dict.fromkeys(
     ("950dt", "950dt_a5", "ascend950dt_a5", "910_9599", "ascend910_9599"),
     HARDWARE_ALIASES["a5"],
 ))
+for _canon_dt, _short_dt in (
+    ("Ascend950DT_425_96", "425-96"),
+    ("Ascend950DT_486_96", "486-96"),
+    ("Ascend950DT_547_96", "547-96"),
+    ("Ascend950DT_547_144", "547-144"),
+):
+    _underscored = _short_dt.replace("-", "_")
+    HARDWARE_ALIASES.update(dict.fromkeys(
+        (
+            _short_dt,
+            _underscored,
+            f"950dt_{_underscored}",
+            f"950dt-{_short_dt}",
+            f"ascend950dt_{_underscored}",
+            f"ascend950dt-{_short_dt}",
+        ),
+        _canon_dt,
+    ))
 
 HARDWARE_TOPOLOGY_ALIASES: dict[str, tuple[str, str]] = {
     "800i-a2": ("Ascend910B4", "a2_standard"),
@@ -121,7 +168,7 @@ def resolve_hardware_sku(hardware: str) -> str:
     """Resolve a hardware alias or exact SKU name against registered profiles."""
     if not isinstance(hardware, str) or not hardware.strip():
         raise ModelingError(f"unknown_hardware_sku:{hardware}")
-    reg = {**_ensure_registered_profiles(), **nvidia_profiles()}
+    reg = {**_ensure_registered_profiles(), **DERIVED_ASCEND_SKUS, **nvidia_profiles()}
     raw = hardware.strip()
     lower = raw.lower()
     if lower in HARDWARE_ALIASES:
@@ -143,7 +190,7 @@ def resolve_hardware_sku(hardware: str) -> str:
 def _hardware_backend(sku: str) -> str:
     if sku in nvidia_profiles():
         return "nvidia"
-    if sku in _ensure_registered_profiles():
+    if sku in _ensure_registered_profiles() or sku in DERIVED_ASCEND_SKUS:
         return "ascend"
     from mindie_sim.custom_hardware import resolve_custom_hardware_sku
     if resolve_custom_hardware_sku(sku) is not None:

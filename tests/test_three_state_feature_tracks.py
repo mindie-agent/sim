@@ -300,7 +300,7 @@ def test_a5_cann93_megamoe_mhc_text_gated_residual_and_chunk32_tracks():
         for row in dsv41["waterfall"]["current_unmerged_pr"]["single_pr_ablation"]
     )
 
-    # 3. #21794 (Qwen4Exp text_gated_residual_fusion on A5 prefill M > 256, guarded on decode).
+    # 3. #21794 (Qwen4Exp text_gated_residual_fusion on A5 prefill M > 512, guarded on decode).
     qsa_prefill = compose_case(
         "qwen3.8-flash-next", hardware="a5", feature_track="unmerged_pr",
         _stack_phase="prefill", tp=8, ep=8, num_devices=8, layers=2,
@@ -310,6 +310,7 @@ def test_a5_cann93_megamoe_mhc_text_gated_residual_and_chunk32_tracks():
         _stack_phase="decode", tp=8, ep=8, num_devices=8, layers=2,
     )
     assert qsa_prefill["runtime"]["metadata"].get("text_gated_residual") is True
+    assert qsa_prefill["runtime"]["metadata"].get("text_gated_residual_min_rows") == 513
     assert qsa_decode["runtime"]["metadata"].get("text_gated_residual") is not True
 
     # 4. #22147 (Chunk32 in unmerged_pr vs Chunk64 in merged on Hv/Hk<=4; Hv/Hk=8 falls back).

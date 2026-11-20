@@ -78,6 +78,17 @@ TOPK_SORT_FACTOR = 3
 MASK3_OPS_PER_REGION = 4
 L2_EFFECTIVE_SHARE = 0.75
 
+SCORER_SETUP_MS = 0.0055
+SCORER_BATCH_TOPK_MS = 0.0085
+SCORER_LARGE_SCAN_ROWS = 16384
+STEP5_TOPK_SORT_MIN_ITEMS = 128
+STEP5_TOPK_SORT_BASE_MS = 0.0031
+SCORER_SINGLE_QUERY_DRAM_EFF = 0.48
+SCORER_MULTI_QUERY_DRAM_EFF = 0.66
+STEP5_REGION_REDUCE_MS_PER_ITEM = 0.000000145
+STEP5_SINGLE_QUERY_FLOOR_MS = 0.00000048
+SCORER_KV_TILE_ROWS = 128
+
 SCORER_BUFFERS = {
     "ub": 96 * 1024, "l1": 128 * 1024, "l0a": 16 * 1024,
     "l0b": 16 * 1024, "l0c": 32 * 1024,
@@ -132,6 +143,8 @@ def _make_scorer_op(
     cache_dtype: str,
     has_weights: bool,
     has_mask3: bool,
+    batch_size: int,
+    shared_prefix: bool,
 ) -> OpSpec:
     _, comp_dt = _cache_row_bytes(cache_dtype, dim)
     flops = float(2 * q_tok * heads * scanned * dim)
@@ -145,6 +158,7 @@ def _make_scorer_op(
             "topk_items": tk_items, "fused_topk": fused_topk,
             "cache_dtype": cache_dtype, "has_head_weights": has_weights,
             "has_mask3_sort": has_mask3,
+            "batch_size": batch_size, "shared_prefix": shared_prefix,
         },
         "native_source": src,
     }
@@ -164,9 +178,12 @@ def make_msa_index_score_op(
     context_tokens: int, index_heads: int = DEFAULT_MSA_HEADS,
     index_dim: int = DEFAULT_INDEX_DIM, block_size: int = DEFAULT_MSA_BLOCK,
     topk_blocks: int = DEFAULT_MSA_TOPK_BLOCKS, return_choice: int = 1,
-    cache_dtype: str = "bf16",
+    cache_dtype: str = "bf16", batch_size: int | None = None,
+    shared_prefix: bool = False,
 ) -> OpSpec:
     """Construct ``MsaIndexScore`` (v1) or ``MsaIndexScoreV2`` (``return_choice=1``)."""
+    q_tok = max(1, int(query_tokens))
+    batch = max(1, int(batch_size)) if batch_size is not None else max(1, len(requests) or q_tok)
     fused = int(return_choice) == 1
     return _make_scorer_op(
         recipe=MSA_INDEX_SCORE_V2_RECIPE if fused else MSA_INDEX_SCORE_RECIPE,
@@ -174,11 +191,12 @@ def make_msa_index_score_op(
         variant="msa_v2" if fused else "msa_v1",
         src=MSA_SCORE_V2_SOURCE if fused else MSA_SCORE_SOURCE,
         op_id=op_id, deps=deps, stage=stage, layer=layer, requests=requests,
-        phase=phase, q_tok=max(1, int(query_tokens)),
+        phase=phase, q_tok=q_tok,
         scanned=max(1, int(context_tokens)), heads=max(1, int(index_heads)),
         dim=max(1, int(index_dim)), blk=max(1, int(block_size)),
         tk_items=max(1, int(topk_blocks)), fused_topk=fused,
         cache_dtype=cache_dtype, has_weights=False, has_mask3=False,
+        batch_size=batch, shared_prefix=bool(shared_prefix),
     )
 
 
@@ -187,19 +205,23 @@ def make_step5_region_score_op(
     requests: tuple[str, ...] = (), phase: str = "decode", query_tokens: int,
     context_tokens: int, index_heads: int = DEFAULT_STEP5_HEADS,
     index_dim: int = DEFAULT_INDEX_DIM, region_block_size: int = DEFAULT_STEP5_BLOCK,
-    topk_regions: int = DEFAULT_STEP5_TOPK_REGIONS,
+    topk_regions: int = DEFAULT_STEP5_TOPK_REGIONS, batch_size: int | None = None,
+    shared_prefix: bool = False,
 ) -> OpSpec:
     """Construct Step-5 ``_C_ascend.npu_indexer_region_score`` op."""
+    q_tok = max(1, int(query_tokens))
+    batch = max(1, int(batch_size)) if batch_size is not None else max(1, len(requests) or q_tok)
     blk = max(1, int(region_block_size))
     regions = max(1, math.ceil(max(1, int(context_tokens)) / blk))
     return _make_scorer_op(
         recipe=STEP5_REGION_SCORE_RECIPE, native_kind="npu_indexer_region_score",
         variant="step5_region_score", src=STEP5_REGION_SOURCE,
         op_id=op_id, deps=deps, stage=stage, layer=layer, requests=requests,
-        phase=phase, q_tok=max(1, int(query_tokens)), scanned=regions,
+        phase=phase, q_tok=q_tok, scanned=regions,
         heads=max(1, int(index_heads)), dim=max(1, int(index_dim)), blk=1,
         tk_items=max(1, int(topk_regions)), fused_topk=True,
         cache_dtype="fp8_e4m3", has_weights=True, has_mask3=True,
+        batch_size=batch, shared_prefix=bool(shared_prefix),
     )
 
 
@@ -209,18 +231,22 @@ def make_lightning_indexer_qsa_op(
     context_tokens: int, index_heads: int = DEFAULT_QSA_HEADS,
     index_dim: int = DEFAULT_INDEX_DIM, compress_ratio: int = DEFAULT_QSA_RATIO,
     block_topk: int = DEFAULT_QSA_BLOCK_TOPK, cache_dtype: str = "bf16",
+    batch_size: int | None = None, shared_prefix: bool = False,
 ) -> OpSpec:
     """Construct weight-free ``LightningIndexerQSA`` (#21771 / #22365) op."""
+    q_tok = max(1, int(query_tokens))
+    batch = max(1, int(batch_size)) if batch_size is not None else max(1, len(requests) or q_tok)
     ratio = max(1, int(compress_ratio))
     scanned = max(1, math.ceil(max(1, int(context_tokens)) / ratio))
     return _make_scorer_op(
         recipe=LIGHTNING_INDEXER_QSA_RECIPE, native_kind="aclnnLightningIndexerQSA",
         variant="qsa_lightning_indexer", src=LIGHTNING_QSA_SOURCE,
         op_id=op_id, deps=deps, stage=stage, layer=layer, requests=requests,
-        phase=phase, q_tok=max(1, int(query_tokens)), scanned=scanned,
+        phase=phase, q_tok=q_tok, scanned=scanned,
         heads=max(1, int(index_heads)), dim=max(1, int(index_dim)), blk=1,
         tk_items=max(1, int(block_topk)), fused_topk=True,
         cache_dtype=cache_dtype, has_weights=False, has_mask3=False,
+        batch_size=batch, shared_prefix=bool(shared_prefix),
     )
 
 
@@ -239,11 +265,14 @@ def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
     cache_dt = str(sc.get("cache_dtype", "bf16"))
     has_weights = bool(sc.get("has_head_weights", False))
     has_mask3 = bool(sc.get("has_mask3_sort", False))
+    batch = max(1, int(sc.get("batch_size", q_tok)))
+    shared = bool(sc.get("shared_prefix", False))
 
     row_bytes, comp_dt = _cache_row_bytes(cache_dt, dim)
     q_bytes = float(q_tok * heads * dim * (1 if comp_dt == "fp8_e4m3" else BF16_BYTES))
     k_total = float(q_tok * scanned * row_bytes)
-    unique_k = float(scanned * row_bytes)
+    unique_streams = 1 if shared else min(batch, q_tok)
+    unique_k = float(unique_streams * scanned * row_bytes)
     aic_read = q_bytes + k_total
 
     has_l2 = bool((geometry.rates or {}).get("l2", 0.0) or (geometry.resource_units or {}).get("l2", 0))
@@ -289,15 +318,40 @@ def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
         plan_res["l2"] = l2_hit
     total_work = Work(matrix={comp_dt: flops}, resources={k: v for k, v in plan_res.items() if v > 0.0})
 
+    total_tiles = max(1, q_tok * max(1, math.ceil(scanned / SCORER_KV_TILE_ROWS)))
+    active_cores = min(cores, total_tiles)
+
     def program(context):
         c_aic = read_role(context.resource_names, aiv=None)
         c_aiv = read_role(context.resource_names, aiv=0)
-        share = 1.0 / float(cores)
+        share = 1.0 / float(active_cores)
+        is_a5 = "mte2_aic_dram" in context.service_modes
+        setup = SCORER_SETUP_MS if is_a5 else 0.0
+        topk_lat = 0.0
+        caps: dict[str, float] = {}
+        if is_a5:
+            dram_eff = SCORER_SINGLE_QUERY_DRAM_EFF if q_tok == 1 else SCORER_MULTI_QUERY_DRAM_EFF
+            if "hbm" in context.resource_names:
+                hbm_phys = context.resource_names["hbm"]
+                hbm_rate = float(context.rates.get(hbm_phys, 0.0))
+                if hbm_rate > 0.0:
+                    caps[hbm_phys] = (dram_eff * hbm_rate) * share
+            if has_mask3:
+                per_item = STEP5_SINGLE_QUERY_FLOOR_MS if q_tok == 1 else STEP5_REGION_REDUCE_MS_PER_ITEM
+                sort_base = (
+                    STEP5_TOPK_SORT_BASE_MS
+                    if (num_blocks > tk_items and tk_items >= STEP5_TOPK_SORT_MIN_ITEMS)
+                    else 0.0
+                )
+                topk_lat = sort_base + float(q_tok * scanned) * per_item
+            elif q_tok > 1 and scanned >= SCORER_LARGE_SCAN_ROWS:
+                topk_lat = SCORER_BATCH_TOPK_MS
 
         def per_core(core: int):
-            aiv_idx = min(aiv_units - 1, 2 * core if aiv_units >= 2 * cores else core)
+            if core >= active_cores:
+                return KernelProgram(())
             aic_owned = context.owned(core, cores, ("cube", "mte1", "fixpipe", c_aic))
-            aiv_owned = context.owned(aiv_idx, aiv_units, ("vector", c_aiv, "mte3"))
+            aiv_owned = context.owned(core, cores, ("vector", c_aiv, "mte3"))
             allocs = tuple(
                 context.allocate(
                     f"scorer_{core}_{pool}", pool, size,
@@ -305,6 +359,7 @@ def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
                 )
                 for pool, size in buf_sizes.items() if pool in context.pool_names
             )
+            s_setup = Stage("scorer_setup", latency=setup, acquire=allocs, keep_empty=setup <= 0.0)
             aic_res: dict[str, float] = {
                 "hbm": aic_gm_read * share, c_aic: aic_read * share,
                 "mte1": l0_bytes * share, "fixpipe": fix_bytes * share,
@@ -313,7 +368,7 @@ def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
                 aic_res["l2"] = l2_hit * share
             s_score = Stage("index_qk_score", context.bind(Work(
                 matrix={comp_dt: flops * share}, resources=aic_res)),
-                acquire=allocs, placement=aic_owned)
+                after=("scorer_setup",), placement=aic_owned, caps=caps)
             aiv_res: dict[str, float] = {
                 "vector": vec_ops * share,
                 "hbm": (aiv_read + out_write) * share,
@@ -322,8 +377,8 @@ def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
             if aiv_read > 0.0:
                 aiv_res[c_aiv] = aiv_read * share
             s_topk = Stage("reduce_topk_store", context.bind(Work(resources=aiv_res)),
-                           after=("index_qk_score",), free=allocs, placement=aiv_owned)
-            return KernelProgram((s_score, s_topk))
+                           after=("index_qk_score",), latency=topk_lat, free=allocs, placement=aiv_owned)
+            return KernelProgram((s_setup, s_score, s_topk))
 
         return ParallelProgram(tuple(per_core(c) for c in range(cores)))
 
