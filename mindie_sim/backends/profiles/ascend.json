@@ -194,23 +194,6 @@
                 16,
                 32
               ]
-            ],
-            "fp8": [
-              [
-                128,
-                128,
-                128
-              ],
-              [
-                64,
-                64,
-                128
-              ],
-              [
-                16,
-                16,
-                32
-              ]
             ]
           },
           "input_slots": 2,
@@ -259,6 +242,55 @@
         "collective": {
           "alpha_us": 0.0
         }
+      },
+      "root_complex_id": "rc0",
+      "simt_ub_carveout_bytes": 0,
+      "subtile_wave": [
+        {
+          "native_mode": "bf16",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 16,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        },
+        {
+          "native_mode": "fp16",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 16,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        },
+        {
+          "native_mode": "int8",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 32,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        }
+      ],
+      "dispatch_sync": {
+        "stars": {
+          "queue_scope": "die",
+          "queue_depth": 64,
+          "lanes": 1,
+          "issue_interval_us": 0.0,
+          "first_issue_us": 0.0,
+          "release_policy": "descriptor_ready",
+          "evidence_id": "pending_raw_dispatch_trace"
+        },
+        "host_submit_service": "host",
+        "d2h_channel": "d2h",
+        "split_host_service": "host"
+      },
+      "hbm_rw_alpha": 0.0,
+      "hbm_read_bytes_per_s": 1800000000000.0,
+      "hbm_write_bytes_per_s": 1800000000000.0,
+      "memory_access": {
+        "sector_bytes": 32,
+        "burst_turn_penalty": []
       }
     },
     "architecture": "A2",
@@ -286,7 +318,8 @@
         "alpha_us": 0.0,
         "transport_mode": "unavailable_single_die",
         "channel_semantics": "none",
-        "notes": null
+        "notes": null,
+        "scope": "package"
       },
       "d2d_intra_node": {
         "channel": "d2d_intra_node",
@@ -304,7 +337,65 @@
         "alpha_us": 2.5,
         "transport_mode": "direct_fabric",
         "channel_semantics": "mesh",
-        "notes": null
+        "notes": null,
+        "scope": "node",
+        "rail_id": "hccs_r0",
+        "protocol_bands": [
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": 2,
+            "group_max": 8,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 0,
+            "payload_max_exclusive": 65537,
+            "algorithm": "ring",
+            "protocol": "hccs_k8_small",
+            "startup_scope": "hop",
+            "startup_us": 2.5,
+            "payload_bytes_per_frame": 4096,
+            "wire_bytes_per_frame": 4096,
+            "credit_bytes": 65536,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#a2_k8"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": 2,
+            "group_max": 8,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 65537,
+            "payload_max_exclusive": 2097152,
+            "algorithm": "ring",
+            "protocol": "hccs_k8_mid",
+            "startup_scope": "hop",
+            "startup_us": 2.5,
+            "payload_bytes_per_frame": 65536,
+            "wire_bytes_per_frame": 65536,
+            "credit_bytes": 524288,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#a2_k8"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": 2,
+            "group_max": 8,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 2097152,
+            "payload_max_exclusive": null,
+            "algorithm": "ring",
+            "protocol": "hccs_k8_large",
+            "startup_scope": "hop",
+            "startup_us": 2.5,
+            "payload_bytes_per_frame": 262144,
+            "wire_bytes_per_frame": 262144,
+            "credit_bytes": 2097152,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#a2_k8"
+          }
+        ]
       },
       "d2d_inter_node": {
         "channel": "d2d_inter_node",
@@ -322,7 +413,66 @@
         "alpha_us": 5.0,
         "transport_mode": "roce_rdma",
         "channel_semantics": "switched",
-        "notes": null
+        "notes": null,
+        "scope": "cross_node",
+        "rail_id": "roce_r0",
+        "switch_id": "tor_sw0",
+        "protocol_bands": [
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": 2,
+            "group_max": 8192,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 0,
+            "payload_max_exclusive": 65537,
+            "algorithm": "ring",
+            "protocol": "roce_small",
+            "startup_scope": "hop",
+            "startup_us": 5.0,
+            "payload_bytes_per_frame": 4096,
+            "wire_bytes_per_frame": 4096,
+            "credit_bytes": 65536,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#roce"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": 2,
+            "group_max": 8192,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 65537,
+            "payload_max_exclusive": 2097152,
+            "algorithm": "ring",
+            "protocol": "roce_mid",
+            "startup_scope": "hop",
+            "startup_us": 5.0,
+            "payload_bytes_per_frame": 65536,
+            "wire_bytes_per_frame": 65536,
+            "credit_bytes": 524288,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#roce"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": 2,
+            "group_max": 8192,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 2097152,
+            "payload_max_exclusive": null,
+            "algorithm": "ring",
+            "protocol": "roce_large",
+            "startup_scope": "hop",
+            "startup_us": 5.0,
+            "payload_bytes_per_frame": 262144,
+            "wire_bytes_per_frame": 262144,
+            "credit_bytes": 2097152,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#roce"
+          }
+        ]
       },
       "h2d": {
         "channel": "h2d",
@@ -340,7 +490,11 @@
         "alpha_us": 2.0,
         "transport_mode": "pcie_dma",
         "channel_semantics": "direct",
-        "notes": null
+        "notes": null,
+        "scope": "host",
+        "root_complex_id": "rc0",
+        "node_peak_bw_gbps": 200.0,
+        "solo_effective_uni_bw_gbps": 25.5
       },
       "d2h": {
         "channel": "d2h",
@@ -358,7 +512,11 @@
         "alpha_us": 2.0,
         "transport_mode": "pcie_dma",
         "channel_semantics": "direct",
-        "notes": null
+        "notes": null,
+        "scope": "host",
+        "root_complex_id": "rc0",
+        "node_peak_bw_gbps": 225.0,
+        "solo_effective_uni_bw_gbps": 28.7
       },
       "rh2d": {
         "channel": "rh2d",
@@ -376,7 +534,8 @@
         "alpha_us": 6.5,
         "transport_mode": "auto",
         "channel_semantics": "switched",
-        "notes": "Supports direct_rdma (RNIC->RoCE->NPU) or host_staged (Network->LocalHost->PCIe H2D)"
+        "notes": "Supports direct_rdma (RNIC->RoCE->NPU) or host_staged (Network->LocalHost->PCIe H2D)",
+        "scope": "cross_node"
       },
       "rd2h": {
         "channel": "rd2h",
@@ -394,7 +553,8 @@
         "alpha_us": 6.5,
         "transport_mode": "auto",
         "channel_semantics": "switched",
-        "notes": "Supports direct_rdma (NPU->RoCE->RNIC) or host_staged (PCIe D2H->LocalHost->Network)"
+        "notes": "Supports direct_rdma (NPU->RoCE->RNIC) or host_staged (PCIe D2H->LocalHost->Network)",
+        "scope": "cross_node"
       }
     },
     "source": {
@@ -702,23 +862,6 @@
                 16,
                 32
               ]
-            ],
-            "fp8": [
-              [
-                128,
-                128,
-                128
-              ],
-              [
-                64,
-                64,
-                128
-              ],
-              [
-                16,
-                16,
-                32
-              ]
             ]
           },
           "input_slots": 2,
@@ -767,6 +910,55 @@
         "collective": {
           "alpha_us": 0.0
         }
+      },
+      "root_complex_id": "rc0",
+      "simt_ub_carveout_bytes": 0,
+      "subtile_wave": [
+        {
+          "native_mode": "bf16",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 16,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        },
+        {
+          "native_mode": "fp16",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 16,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        },
+        {
+          "native_mode": "int8",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 32,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        }
+      ],
+      "dispatch_sync": {
+        "stars": {
+          "queue_scope": "die",
+          "queue_depth": 64,
+          "lanes": 1,
+          "issue_interval_us": 0.0,
+          "first_issue_us": 0.0,
+          "release_policy": "descriptor_ready",
+          "evidence_id": "pending_raw_dispatch_trace"
+        },
+        "host_submit_service": "host",
+        "d2h_channel": "d2h",
+        "split_host_service": "host"
+      },
+      "hbm_rw_alpha": 0.0,
+      "hbm_read_bytes_per_s": 1800000000000.0,
+      "hbm_write_bytes_per_s": 1800000000000.0,
+      "memory_access": {
+        "sector_bytes": 32,
+        "burst_turn_penalty": []
       }
     },
     "architecture": "A2",
@@ -794,7 +986,8 @@
         "alpha_us": 0.0,
         "transport_mode": "unavailable_single_die",
         "channel_semantics": "none",
-        "notes": null
+        "notes": null,
+        "scope": "package"
       },
       "d2d_intra_node": {
         "channel": "d2d_intra_node",
@@ -812,7 +1005,65 @@
         "alpha_us": 2.5,
         "transport_mode": "direct_fabric",
         "channel_semantics": "mesh",
-        "notes": null
+        "notes": null,
+        "scope": "node",
+        "rail_id": "hccs_r0",
+        "protocol_bands": [
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": 2,
+            "group_max": 8,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 0,
+            "payload_max_exclusive": 65537,
+            "algorithm": "ring",
+            "protocol": "hccs_k8_small",
+            "startup_scope": "hop",
+            "startup_us": 2.5,
+            "payload_bytes_per_frame": 4096,
+            "wire_bytes_per_frame": 4096,
+            "credit_bytes": 65536,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#a2_k8"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": 2,
+            "group_max": 8,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 65537,
+            "payload_max_exclusive": 2097152,
+            "algorithm": "ring",
+            "protocol": "hccs_k8_mid",
+            "startup_scope": "hop",
+            "startup_us": 2.5,
+            "payload_bytes_per_frame": 65536,
+            "wire_bytes_per_frame": 65536,
+            "credit_bytes": 524288,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#a2_k8"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": 2,
+            "group_max": 8,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 2097152,
+            "payload_max_exclusive": null,
+            "algorithm": "ring",
+            "protocol": "hccs_k8_large",
+            "startup_scope": "hop",
+            "startup_us": 2.5,
+            "payload_bytes_per_frame": 262144,
+            "wire_bytes_per_frame": 262144,
+            "credit_bytes": 2097152,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#a2_k8"
+          }
+        ]
       },
       "d2d_inter_node": {
         "channel": "d2d_inter_node",
@@ -830,7 +1081,66 @@
         "alpha_us": 5.0,
         "transport_mode": "roce_rdma",
         "channel_semantics": "switched",
-        "notes": null
+        "notes": null,
+        "scope": "cross_node",
+        "rail_id": "roce_r0",
+        "switch_id": "tor_sw0",
+        "protocol_bands": [
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": 2,
+            "group_max": 8192,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 0,
+            "payload_max_exclusive": 65537,
+            "algorithm": "ring",
+            "protocol": "roce_small",
+            "startup_scope": "hop",
+            "startup_us": 5.0,
+            "payload_bytes_per_frame": 4096,
+            "wire_bytes_per_frame": 4096,
+            "credit_bytes": 65536,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#roce"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": 2,
+            "group_max": 8192,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 65537,
+            "payload_max_exclusive": 2097152,
+            "algorithm": "ring",
+            "protocol": "roce_mid",
+            "startup_scope": "hop",
+            "startup_us": 5.0,
+            "payload_bytes_per_frame": 65536,
+            "wire_bytes_per_frame": 65536,
+            "credit_bytes": 524288,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#roce"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": 2,
+            "group_max": 8192,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 2097152,
+            "payload_max_exclusive": null,
+            "algorithm": "ring",
+            "protocol": "roce_large",
+            "startup_scope": "hop",
+            "startup_us": 5.0,
+            "payload_bytes_per_frame": 262144,
+            "wire_bytes_per_frame": 262144,
+            "credit_bytes": 2097152,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#roce"
+          }
+        ]
       },
       "h2d": {
         "channel": "h2d",
@@ -848,7 +1158,11 @@
         "alpha_us": 2.0,
         "transport_mode": "pcie_dma",
         "channel_semantics": "direct",
-        "notes": null
+        "notes": null,
+        "scope": "host",
+        "root_complex_id": "rc0",
+        "node_peak_bw_gbps": 200.0,
+        "solo_effective_uni_bw_gbps": 25.5
       },
       "d2h": {
         "channel": "d2h",
@@ -866,7 +1180,11 @@
         "alpha_us": 2.0,
         "transport_mode": "pcie_dma",
         "channel_semantics": "direct",
-        "notes": null
+        "notes": null,
+        "scope": "host",
+        "root_complex_id": "rc0",
+        "node_peak_bw_gbps": 225.0,
+        "solo_effective_uni_bw_gbps": 28.7
       },
       "rh2d": {
         "channel": "rh2d",
@@ -884,7 +1202,8 @@
         "alpha_us": 6.5,
         "transport_mode": "auto",
         "channel_semantics": "switched",
-        "notes": "Supports direct_rdma (RNIC->RoCE->NPU) or host_staged (Network->LocalHost->PCIe H2D)"
+        "notes": "Supports direct_rdma (RNIC->RoCE->NPU) or host_staged (Network->LocalHost->PCIe H2D)",
+        "scope": "cross_node"
       },
       "rd2h": {
         "channel": "rd2h",
@@ -902,7 +1221,8 @@
         "alpha_us": 6.5,
         "transport_mode": "auto",
         "channel_semantics": "switched",
-        "notes": "Supports direct_rdma (NPU->RoCE->RNIC) or host_staged (PCIe D2H->LocalHost->Network)"
+        "notes": "Supports direct_rdma (NPU->RoCE->RNIC) or host_staged (PCIe D2H->LocalHost->Network)",
+        "scope": "cross_node"
       }
     },
     "source": {
@@ -1210,23 +1530,6 @@
                 16,
                 32
               ]
-            ],
-            "fp8": [
-              [
-                128,
-                128,
-                128
-              ],
-              [
-                64,
-                64,
-                128
-              ],
-              [
-                16,
-                16,
-                32
-              ]
             ]
           },
           "input_slots": 2,
@@ -1275,6 +1578,55 @@
         "collective": {
           "alpha_us": 0.0
         }
+      },
+      "root_complex_id": "rc0",
+      "simt_ub_carveout_bytes": 0,
+      "subtile_wave": [
+        {
+          "native_mode": "bf16",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 16,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        },
+        {
+          "native_mode": "fp16",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 16,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        },
+        {
+          "native_mode": "int8",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 32,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        }
+      ],
+      "dispatch_sync": {
+        "stars": {
+          "queue_scope": "die",
+          "queue_depth": 64,
+          "lanes": 1,
+          "issue_interval_us": 0.0,
+          "first_issue_us": 0.0,
+          "release_policy": "descriptor_ready",
+          "evidence_id": "pending_raw_dispatch_trace"
+        },
+        "host_submit_service": "host",
+        "d2h_channel": "d2h",
+        "split_host_service": "host"
+      },
+      "hbm_rw_alpha": 0.0,
+      "hbm_read_bytes_per_s": 1800000000000.0,
+      "hbm_write_bytes_per_s": 1800000000000.0,
+      "memory_access": {
+        "sector_bytes": 32,
+        "burst_turn_penalty": []
       }
     },
     "architecture": "A2",
@@ -1302,7 +1654,8 @@
         "alpha_us": 0.0,
         "transport_mode": "unavailable_single_die",
         "channel_semantics": "none",
-        "notes": null
+        "notes": null,
+        "scope": "package"
       },
       "d2d_intra_node": {
         "channel": "d2d_intra_node",
@@ -1320,7 +1673,65 @@
         "alpha_us": 2.5,
         "transport_mode": "direct_fabric",
         "channel_semantics": "mesh",
-        "notes": null
+        "notes": null,
+        "scope": "node",
+        "rail_id": "hccs_r0",
+        "protocol_bands": [
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": 2,
+            "group_max": 8,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 0,
+            "payload_max_exclusive": 65537,
+            "algorithm": "ring",
+            "protocol": "hccs_k8_small",
+            "startup_scope": "hop",
+            "startup_us": 2.5,
+            "payload_bytes_per_frame": 4096,
+            "wire_bytes_per_frame": 4096,
+            "credit_bytes": 65536,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#a2_k8"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": 2,
+            "group_max": 8,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 65537,
+            "payload_max_exclusive": 2097152,
+            "algorithm": "ring",
+            "protocol": "hccs_k8_mid",
+            "startup_scope": "hop",
+            "startup_us": 2.5,
+            "payload_bytes_per_frame": 65536,
+            "wire_bytes_per_frame": 65536,
+            "credit_bytes": 524288,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#a2_k8"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": 2,
+            "group_max": 8,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 2097152,
+            "payload_max_exclusive": null,
+            "algorithm": "ring",
+            "protocol": "hccs_k8_large",
+            "startup_scope": "hop",
+            "startup_us": 2.5,
+            "payload_bytes_per_frame": 262144,
+            "wire_bytes_per_frame": 262144,
+            "credit_bytes": 2097152,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#a2_k8"
+          }
+        ]
       },
       "d2d_inter_node": {
         "channel": "d2d_inter_node",
@@ -1338,7 +1749,66 @@
         "alpha_us": 5.0,
         "transport_mode": "roce_rdma",
         "channel_semantics": "switched",
-        "notes": null
+        "notes": null,
+        "scope": "cross_node",
+        "rail_id": "roce_r0",
+        "switch_id": "tor_sw0",
+        "protocol_bands": [
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": 2,
+            "group_max": 8192,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 0,
+            "payload_max_exclusive": 65537,
+            "algorithm": "ring",
+            "protocol": "roce_small",
+            "startup_scope": "hop",
+            "startup_us": 5.0,
+            "payload_bytes_per_frame": 4096,
+            "wire_bytes_per_frame": 4096,
+            "credit_bytes": 65536,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#roce"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": 2,
+            "group_max": 8192,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 65537,
+            "payload_max_exclusive": 2097152,
+            "algorithm": "ring",
+            "protocol": "roce_mid",
+            "startup_scope": "hop",
+            "startup_us": 5.0,
+            "payload_bytes_per_frame": 65536,
+            "wire_bytes_per_frame": 65536,
+            "credit_bytes": 524288,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#roce"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": 2,
+            "group_max": 8192,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 2097152,
+            "payload_max_exclusive": null,
+            "algorithm": "ring",
+            "protocol": "roce_large",
+            "startup_scope": "hop",
+            "startup_us": 5.0,
+            "payload_bytes_per_frame": 262144,
+            "wire_bytes_per_frame": 262144,
+            "credit_bytes": 2097152,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#roce"
+          }
+        ]
       },
       "h2d": {
         "channel": "h2d",
@@ -1356,7 +1826,11 @@
         "alpha_us": 2.0,
         "transport_mode": "pcie_dma",
         "channel_semantics": "direct",
-        "notes": null
+        "notes": null,
+        "scope": "host",
+        "root_complex_id": "rc0",
+        "node_peak_bw_gbps": 200.0,
+        "solo_effective_uni_bw_gbps": 25.5
       },
       "d2h": {
         "channel": "d2h",
@@ -1374,7 +1848,11 @@
         "alpha_us": 2.0,
         "transport_mode": "pcie_dma",
         "channel_semantics": "direct",
-        "notes": null
+        "notes": null,
+        "scope": "host",
+        "root_complex_id": "rc0",
+        "node_peak_bw_gbps": 225.0,
+        "solo_effective_uni_bw_gbps": 28.7
       },
       "rh2d": {
         "channel": "rh2d",
@@ -1392,7 +1870,8 @@
         "alpha_us": 6.5,
         "transport_mode": "auto",
         "channel_semantics": "switched",
-        "notes": "Supports direct_rdma (RNIC->RoCE->NPU) or host_staged (Network->LocalHost->PCIe H2D)"
+        "notes": "Supports direct_rdma (RNIC->RoCE->NPU) or host_staged (Network->LocalHost->PCIe H2D)",
+        "scope": "cross_node"
       },
       "rd2h": {
         "channel": "rd2h",
@@ -1410,7 +1889,8 @@
         "alpha_us": 6.5,
         "transport_mode": "auto",
         "channel_semantics": "switched",
-        "notes": "Supports direct_rdma (NPU->RoCE->RNIC) or host_staged (PCIe D2H->LocalHost->Network)"
+        "notes": "Supports direct_rdma (NPU->RoCE->RNIC) or host_staged (PCIe D2H->LocalHost->Network)",
+        "scope": "cross_node"
       }
     },
     "source": {
@@ -1718,23 +2198,6 @@
                 16,
                 32
               ]
-            ],
-            "fp8": [
-              [
-                128,
-                128,
-                128
-              ],
-              [
-                64,
-                64,
-                128
-              ],
-              [
-                16,
-                16,
-                32
-              ]
             ]
           },
           "input_slots": 2,
@@ -1783,6 +2246,55 @@
         "collective": {
           "alpha_us": 0.0
         }
+      },
+      "root_complex_id": "rc0",
+      "simt_ub_carveout_bytes": 0,
+      "subtile_wave": [
+        {
+          "native_mode": "bf16",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 16,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        },
+        {
+          "native_mode": "fp16",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 16,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        },
+        {
+          "native_mode": "int8",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 32,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        }
+      ],
+      "dispatch_sync": {
+        "stars": {
+          "queue_scope": "die",
+          "queue_depth": 64,
+          "lanes": 1,
+          "issue_interval_us": 0.0,
+          "first_issue_us": 0.0,
+          "release_policy": "descriptor_ready",
+          "evidence_id": "pending_raw_dispatch_trace"
+        },
+        "host_submit_service": "host",
+        "d2h_channel": "d2h",
+        "split_host_service": "host"
+      },
+      "hbm_rw_alpha": 0.0,
+      "hbm_read_bytes_per_s": 1600000000000.0,
+      "hbm_write_bytes_per_s": 1600000000000.0,
+      "memory_access": {
+        "sector_bytes": 32,
+        "burst_turn_penalty": []
       }
     },
     "architecture": "A2",
@@ -1810,7 +2322,8 @@
         "alpha_us": 0.0,
         "transport_mode": "unavailable_single_die",
         "channel_semantics": "none",
-        "notes": null
+        "notes": null,
+        "scope": "package"
       },
       "d2d_intra_node": {
         "channel": "d2d_intra_node",
@@ -1828,7 +2341,65 @@
         "alpha_us": 2.5,
         "transport_mode": "direct_fabric",
         "channel_semantics": "mesh",
-        "notes": null
+        "notes": null,
+        "scope": "node",
+        "rail_id": "hccs_r0",
+        "protocol_bands": [
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": 2,
+            "group_max": 8,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 0,
+            "payload_max_exclusive": 65537,
+            "algorithm": "ring",
+            "protocol": "hccs_k8_small",
+            "startup_scope": "hop",
+            "startup_us": 2.5,
+            "payload_bytes_per_frame": 4096,
+            "wire_bytes_per_frame": 4096,
+            "credit_bytes": 65536,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#a2_k8"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": 2,
+            "group_max": 8,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 65537,
+            "payload_max_exclusive": 2097152,
+            "algorithm": "ring",
+            "protocol": "hccs_k8_mid",
+            "startup_scope": "hop",
+            "startup_us": 2.5,
+            "payload_bytes_per_frame": 65536,
+            "wire_bytes_per_frame": 65536,
+            "credit_bytes": 524288,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#a2_k8"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": 2,
+            "group_max": 8,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 2097152,
+            "payload_max_exclusive": null,
+            "algorithm": "ring",
+            "protocol": "hccs_k8_large",
+            "startup_scope": "hop",
+            "startup_us": 2.5,
+            "payload_bytes_per_frame": 262144,
+            "wire_bytes_per_frame": 262144,
+            "credit_bytes": 2097152,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#a2_k8"
+          }
+        ]
       },
       "d2d_inter_node": {
         "channel": "d2d_inter_node",
@@ -1846,7 +2417,66 @@
         "alpha_us": 5.0,
         "transport_mode": "roce_rdma",
         "channel_semantics": "switched",
-        "notes": null
+        "notes": null,
+        "scope": "cross_node",
+        "rail_id": "roce_r0",
+        "switch_id": "tor_sw0",
+        "protocol_bands": [
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": 2,
+            "group_max": 8192,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 0,
+            "payload_max_exclusive": 65537,
+            "algorithm": "ring",
+            "protocol": "roce_small",
+            "startup_scope": "hop",
+            "startup_us": 5.0,
+            "payload_bytes_per_frame": 4096,
+            "wire_bytes_per_frame": 4096,
+            "credit_bytes": 65536,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#roce"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": 2,
+            "group_max": 8192,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 65537,
+            "payload_max_exclusive": 2097152,
+            "algorithm": "ring",
+            "protocol": "roce_mid",
+            "startup_scope": "hop",
+            "startup_us": 5.0,
+            "payload_bytes_per_frame": 65536,
+            "wire_bytes_per_frame": 65536,
+            "credit_bytes": 524288,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#roce"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": 2,
+            "group_max": 8192,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 2097152,
+            "payload_max_exclusive": null,
+            "algorithm": "ring",
+            "protocol": "roce_large",
+            "startup_scope": "hop",
+            "startup_us": 5.0,
+            "payload_bytes_per_frame": 262144,
+            "wire_bytes_per_frame": 262144,
+            "credit_bytes": 2097152,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#roce"
+          }
+        ]
       },
       "h2d": {
         "channel": "h2d",
@@ -1864,7 +2494,11 @@
         "alpha_us": 2.0,
         "transport_mode": "pcie_dma",
         "channel_semantics": "direct",
-        "notes": null
+        "notes": null,
+        "scope": "host",
+        "root_complex_id": "rc0",
+        "node_peak_bw_gbps": 200.0,
+        "solo_effective_uni_bw_gbps": 25.5
       },
       "d2h": {
         "channel": "d2h",
@@ -1882,7 +2516,11 @@
         "alpha_us": 2.0,
         "transport_mode": "pcie_dma",
         "channel_semantics": "direct",
-        "notes": null
+        "notes": null,
+        "scope": "host",
+        "root_complex_id": "rc0",
+        "node_peak_bw_gbps": 225.0,
+        "solo_effective_uni_bw_gbps": 28.7
       },
       "rh2d": {
         "channel": "rh2d",
@@ -1900,7 +2538,8 @@
         "alpha_us": 6.5,
         "transport_mode": "auto",
         "channel_semantics": "switched",
-        "notes": "Supports direct_rdma (RNIC->RoCE->NPU) or host_staged (Network->LocalHost->PCIe H2D)"
+        "notes": "Supports direct_rdma (RNIC->RoCE->NPU) or host_staged (Network->LocalHost->PCIe H2D)",
+        "scope": "cross_node"
       },
       "rd2h": {
         "channel": "rd2h",
@@ -1918,7 +2557,8 @@
         "alpha_us": 6.5,
         "transport_mode": "auto",
         "channel_semantics": "switched",
-        "notes": "Supports direct_rdma (NPU->RoCE->RNIC) or host_staged (PCIe D2H->LocalHost->Network)"
+        "notes": "Supports direct_rdma (NPU->RoCE->RNIC) or host_staged (PCIe D2H->LocalHost->Network)",
+        "scope": "cross_node"
       }
     },
     "source": {
@@ -2226,23 +2866,6 @@
                 16,
                 32
               ]
-            ],
-            "fp8": [
-              [
-                128,
-                128,
-                128
-              ],
-              [
-                64,
-                64,
-                128
-              ],
-              [
-                16,
-                16,
-                32
-              ]
             ]
           },
           "input_slots": 2,
@@ -2291,6 +2914,55 @@
         "collective": {
           "alpha_us": 0.0
         }
+      },
+      "root_complex_id": "rc0",
+      "simt_ub_carveout_bytes": 0,
+      "subtile_wave": [
+        {
+          "native_mode": "bf16",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 16,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        },
+        {
+          "native_mode": "fp16",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 16,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        },
+        {
+          "native_mode": "int8",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 32,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        }
+      ],
+      "dispatch_sync": {
+        "stars": {
+          "queue_scope": "die",
+          "queue_depth": 64,
+          "lanes": 1,
+          "issue_interval_us": 0.0,
+          "first_issue_us": 0.0,
+          "release_policy": "descriptor_ready",
+          "evidence_id": "pending_raw_dispatch_trace"
+        },
+        "host_submit_service": "host",
+        "d2h_channel": "d2h",
+        "split_host_service": "host"
+      },
+      "hbm_rw_alpha": 0.0,
+      "hbm_read_bytes_per_s": 800000000000.0,
+      "hbm_write_bytes_per_s": 800000000000.0,
+      "memory_access": {
+        "sector_bytes": 32,
+        "burst_turn_penalty": []
       }
     },
     "architecture": "A2",
@@ -2318,25 +2990,85 @@
         "alpha_us": 0.0,
         "transport_mode": "unavailable_single_die",
         "channel_semantics": "none",
-        "notes": null
+        "notes": null,
+        "scope": "package"
       },
       "d2d_intra_node": {
         "channel": "d2d_intra_node",
-        "protocol": "HCCS",
-        "uni_peak_bw_gbps": 168.0,
-        "bi_peak_bw_gbps": 310.8,
-        "calibrated_uni_bw_gbps": null,
-        "calibrated_bi_bw_gbps": null,
+        "protocol": "HCCS_DIRECT_K8_MESH",
+        "uni_peak_bw_gbps": 24.0,
+        "bi_peak_bw_gbps": 44.4,
+        "calibrated_uni_bw_gbps": 18.2,
+        "calibrated_bi_bw_gbps": 36.4,
         "derived_uni_bw_gbps": null,
         "derived_bi_bw_gbps": null,
-        "bandwidth_provenance": "declared_peak",
-        "effective_uni_bw_gbps": 168.0,
-        "effective_bi_bw_gbps": 310.8,
+        "bandwidth_provenance": "silicon_calibrated_per_pair",
+        "effective_uni_bw_gbps": 18.2,
+        "effective_bi_bw_gbps": 36.4,
         "pageable_uni_bw_gbps": null,
-        "alpha_us": 2.5,
+        "alpha_us": 16.0,
         "transport_mode": "direct_fabric",
-        "channel_semantics": "mesh",
-        "notes": null
+        "channel_semantics": "per_pair",
+        "notes": "8-NPU K_8 direct HCCS mesh: 7 dedicated peer links/card (24.0 GB/s peak, 18.2 GB/s calibrated per pair)",
+        "scope": "node",
+        "rail_id": "hccs_r0",
+        "protocol_bands": [
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": 2,
+            "group_max": 8,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 0,
+            "payload_max_exclusive": 65537,
+            "algorithm": "ring",
+            "protocol": "hccs_k8_small",
+            "startup_scope": "hop",
+            "startup_us": 16.0,
+            "payload_bytes_per_frame": 4096,
+            "wire_bytes_per_frame": 4096,
+            "credit_bytes": 65536,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#a2_k8"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": 2,
+            "group_max": 8,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 65537,
+            "payload_max_exclusive": 2097152,
+            "algorithm": "ring",
+            "protocol": "hccs_k8_mid",
+            "startup_scope": "hop",
+            "startup_us": 16.0,
+            "payload_bytes_per_frame": 65536,
+            "wire_bytes_per_frame": 65536,
+            "credit_bytes": 524288,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#a2_k8"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": 2,
+            "group_max": 8,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 2097152,
+            "payload_max_exclusive": null,
+            "algorithm": "ring",
+            "protocol": "hccs_k8_large",
+            "startup_scope": "hop",
+            "startup_us": 16.0,
+            "payload_bytes_per_frame": 262144,
+            "wire_bytes_per_frame": 262144,
+            "credit_bytes": 2097152,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#a2_k8"
+          }
+        ],
+        "bw_utilization": 0.7583333333333333
       },
       "d2d_inter_node": {
         "channel": "d2d_inter_node",
@@ -2354,43 +3086,110 @@
         "alpha_us": 5.0,
         "transport_mode": "roce_rdma",
         "channel_semantics": "switched",
-        "notes": null
+        "notes": null,
+        "scope": "cross_node",
+        "rail_id": "roce_r0",
+        "switch_id": "tor_sw0",
+        "protocol_bands": [
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": 2,
+            "group_max": 8192,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 0,
+            "payload_max_exclusive": 65537,
+            "algorithm": "ring",
+            "protocol": "roce_small",
+            "startup_scope": "hop",
+            "startup_us": 5.0,
+            "payload_bytes_per_frame": 4096,
+            "wire_bytes_per_frame": 4096,
+            "credit_bytes": 65536,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#roce"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": 2,
+            "group_max": 8192,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 65537,
+            "payload_max_exclusive": 2097152,
+            "algorithm": "ring",
+            "protocol": "roce_mid",
+            "startup_scope": "hop",
+            "startup_us": 5.0,
+            "payload_bytes_per_frame": 65536,
+            "wire_bytes_per_frame": 65536,
+            "credit_bytes": 524288,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#roce"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": 2,
+            "group_max": 8192,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 2097152,
+            "payload_max_exclusive": null,
+            "algorithm": "ring",
+            "protocol": "roce_large",
+            "startup_scope": "hop",
+            "startup_us": 5.0,
+            "payload_bytes_per_frame": 262144,
+            "wire_bytes_per_frame": 262144,
+            "credit_bytes": 2097152,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#roce"
+          }
+        ]
       },
       "h2d": {
         "channel": "h2d",
-        "protocol": "PCIe",
-        "uni_peak_bw_gbps": 50.0,
-        "bi_peak_bw_gbps": 87.5,
-        "calibrated_uni_bw_gbps": null,
-        "calibrated_bi_bw_gbps": null,
+        "protocol": "PCIe_Gen4x16",
+        "uni_peak_bw_gbps": 31.5,
+        "bi_peak_bw_gbps": 35.8,
+        "calibrated_uni_bw_gbps": 25.5,
+        "calibrated_bi_bw_gbps": 35.8,
         "derived_uni_bw_gbps": null,
         "derived_bi_bw_gbps": null,
-        "bandwidth_provenance": "declared_peak",
-        "effective_uni_bw_gbps": 50.0,
-        "effective_bi_bw_gbps": 87.5,
-        "pageable_uni_bw_gbps": 14.0,
-        "alpha_us": 2.0,
+        "bandwidth_provenance": "calibrated",
+        "effective_uni_bw_gbps": 25.5,
+        "effective_bi_bw_gbps": 35.8,
+        "pageable_uni_bw_gbps": 21.2,
+        "alpha_us": 9.2,
         "transport_mode": "pcie_dma",
         "channel_semantics": "direct",
-        "notes": null
+        "notes": null,
+        "scope": "host",
+        "root_complex_id": "rc0",
+        "node_peak_bw_gbps": 200.0,
+        "solo_effective_uni_bw_gbps": 25.5
       },
       "d2h": {
         "channel": "d2h",
-        "protocol": "PCIe",
-        "uni_peak_bw_gbps": 50.0,
-        "bi_peak_bw_gbps": 87.5,
-        "calibrated_uni_bw_gbps": null,
-        "calibrated_bi_bw_gbps": null,
+        "protocol": "PCIe_Gen4x16",
+        "uni_peak_bw_gbps": 31.5,
+        "bi_peak_bw_gbps": 35.8,
+        "calibrated_uni_bw_gbps": 28.7,
+        "calibrated_bi_bw_gbps": 35.8,
         "derived_uni_bw_gbps": null,
         "derived_bi_bw_gbps": null,
-        "bandwidth_provenance": "declared_peak",
-        "effective_uni_bw_gbps": 50.0,
-        "effective_bi_bw_gbps": 87.5,
-        "pageable_uni_bw_gbps": 14.0,
-        "alpha_us": 2.0,
+        "bandwidth_provenance": "calibrated",
+        "effective_uni_bw_gbps": 28.7,
+        "effective_bi_bw_gbps": 35.8,
+        "pageable_uni_bw_gbps": 23.4,
+        "alpha_us": 8.1,
         "transport_mode": "pcie_dma",
         "channel_semantics": "direct",
-        "notes": null
+        "notes": null,
+        "scope": "host",
+        "root_complex_id": "rc0",
+        "node_peak_bw_gbps": 225.0,
+        "solo_effective_uni_bw_gbps": 28.7
       },
       "rh2d": {
         "channel": "rh2d",
@@ -2408,7 +3207,8 @@
         "alpha_us": 6.5,
         "transport_mode": "auto",
         "channel_semantics": "switched",
-        "notes": "Supports direct_rdma (RNIC->RoCE->NPU) or host_staged (Network->LocalHost->PCIe H2D)"
+        "notes": "Supports direct_rdma (RNIC->RoCE->NPU) or host_staged (Network->LocalHost->PCIe H2D)",
+        "scope": "cross_node"
       },
       "rd2h": {
         "channel": "rd2h",
@@ -2426,7 +3226,8 @@
         "alpha_us": 6.5,
         "transport_mode": "auto",
         "channel_semantics": "switched",
-        "notes": "Supports direct_rdma (NPU->RoCE->RNIC) or host_staged (PCIe D2H->LocalHost->Network)"
+        "notes": "Supports direct_rdma (NPU->RoCE->RNIC) or host_staged (PCIe D2H->LocalHost->Network)",
+        "scope": "cross_node"
       }
     },
     "source": {
@@ -2735,23 +3536,6 @@
                 16,
                 32
               ]
-            ],
-            "fp8": [
-              [
-                128,
-                128,
-                128
-              ],
-              [
-                64,
-                64,
-                128
-              ],
-              [
-                16,
-                16,
-                32
-              ]
             ]
           },
           "input_slots": 2,
@@ -2800,6 +3584,55 @@
         "collective": {
           "alpha_us": 0.0
         }
+      },
+      "root_complex_id": "rc0",
+      "simt_ub_carveout_bytes": 0,
+      "subtile_wave": [
+        {
+          "native_mode": "bf16",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 16,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        },
+        {
+          "native_mode": "fp16",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 16,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        },
+        {
+          "native_mode": "int8",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 32,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        }
+      ],
+      "dispatch_sync": {
+        "stars": {
+          "queue_scope": "die",
+          "queue_depth": 64,
+          "lanes": 1,
+          "issue_interval_us": 0.0,
+          "first_issue_us": 0.0,
+          "release_policy": "descriptor_ready",
+          "evidence_id": "pending_raw_dispatch_trace"
+        },
+        "host_submit_service": "host",
+        "d2h_channel": "d2h",
+        "split_host_service": "host"
+      },
+      "hbm_rw_alpha": 0.0,
+      "hbm_read_bytes_per_s": 1200000000000.0,
+      "hbm_write_bytes_per_s": 1200000000000.0,
+      "memory_access": {
+        "sector_bytes": 32,
+        "burst_turn_penalty": []
       }
     },
     "architecture": "A2",
@@ -2827,7 +3660,8 @@
         "alpha_us": 0.0,
         "transport_mode": "unavailable_single_die",
         "channel_semantics": "none",
-        "notes": null
+        "notes": null,
+        "scope": "package"
       },
       "d2d_intra_node": {
         "channel": "d2d_intra_node",
@@ -2845,7 +3679,65 @@
         "alpha_us": 2.5,
         "transport_mode": "direct_fabric",
         "channel_semantics": "mesh",
-        "notes": null
+        "notes": null,
+        "scope": "node",
+        "rail_id": "hccs_r0",
+        "protocol_bands": [
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": 2,
+            "group_max": 8,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 0,
+            "payload_max_exclusive": 65537,
+            "algorithm": "ring",
+            "protocol": "hccs_k8_small",
+            "startup_scope": "hop",
+            "startup_us": 2.5,
+            "payload_bytes_per_frame": 4096,
+            "wire_bytes_per_frame": 4096,
+            "credit_bytes": 65536,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#a2_k8"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": 2,
+            "group_max": 8,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 65537,
+            "payload_max_exclusive": 2097152,
+            "algorithm": "ring",
+            "protocol": "hccs_k8_mid",
+            "startup_scope": "hop",
+            "startup_us": 2.5,
+            "payload_bytes_per_frame": 65536,
+            "wire_bytes_per_frame": 65536,
+            "credit_bytes": 524288,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#a2_k8"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": 2,
+            "group_max": 8,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 2097152,
+            "payload_max_exclusive": null,
+            "algorithm": "ring",
+            "protocol": "hccs_k8_large",
+            "startup_scope": "hop",
+            "startup_us": 2.5,
+            "payload_bytes_per_frame": 262144,
+            "wire_bytes_per_frame": 262144,
+            "credit_bytes": 2097152,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#a2_k8"
+          }
+        ]
       },
       "d2d_inter_node": {
         "channel": "d2d_inter_node",
@@ -2863,7 +3755,66 @@
         "alpha_us": 5.0,
         "transport_mode": "roce_rdma",
         "channel_semantics": "switched",
-        "notes": null
+        "notes": null,
+        "scope": "cross_node",
+        "rail_id": "roce_r0",
+        "switch_id": "tor_sw0",
+        "protocol_bands": [
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": 2,
+            "group_max": 8192,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 0,
+            "payload_max_exclusive": 65537,
+            "algorithm": "ring",
+            "protocol": "roce_small",
+            "startup_scope": "hop",
+            "startup_us": 5.0,
+            "payload_bytes_per_frame": 4096,
+            "wire_bytes_per_frame": 4096,
+            "credit_bytes": 65536,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#roce"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": 2,
+            "group_max": 8192,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 65537,
+            "payload_max_exclusive": 2097152,
+            "algorithm": "ring",
+            "protocol": "roce_mid",
+            "startup_scope": "hop",
+            "startup_us": 5.0,
+            "payload_bytes_per_frame": 65536,
+            "wire_bytes_per_frame": 65536,
+            "credit_bytes": 524288,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#roce"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": 2,
+            "group_max": 8192,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 2097152,
+            "payload_max_exclusive": null,
+            "algorithm": "ring",
+            "protocol": "roce_large",
+            "startup_scope": "hop",
+            "startup_us": 5.0,
+            "payload_bytes_per_frame": 262144,
+            "wire_bytes_per_frame": 262144,
+            "credit_bytes": 2097152,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#roce"
+          }
+        ]
       },
       "h2d": {
         "channel": "h2d",
@@ -2881,7 +3832,11 @@
         "alpha_us": 2.0,
         "transport_mode": "pcie_dma",
         "channel_semantics": "direct",
-        "notes": null
+        "notes": null,
+        "scope": "host",
+        "root_complex_id": "rc0",
+        "node_peak_bw_gbps": 200.0,
+        "solo_effective_uni_bw_gbps": 25.5
       },
       "d2h": {
         "channel": "d2h",
@@ -2899,7 +3854,11 @@
         "alpha_us": 2.0,
         "transport_mode": "pcie_dma",
         "channel_semantics": "direct",
-        "notes": null
+        "notes": null,
+        "scope": "host",
+        "root_complex_id": "rc0",
+        "node_peak_bw_gbps": 225.0,
+        "solo_effective_uni_bw_gbps": 28.7
       },
       "rh2d": {
         "channel": "rh2d",
@@ -2917,7 +3876,8 @@
         "alpha_us": 6.5,
         "transport_mode": "auto",
         "channel_semantics": "switched",
-        "notes": "Supports direct_rdma (RNIC->RoCE->NPU) or host_staged (Network->LocalHost->PCIe H2D)"
+        "notes": "Supports direct_rdma (RNIC->RoCE->NPU) or host_staged (Network->LocalHost->PCIe H2D)",
+        "scope": "cross_node"
       },
       "rd2h": {
         "channel": "rd2h",
@@ -2935,7 +3895,8 @@
         "alpha_us": 6.5,
         "transport_mode": "auto",
         "channel_semantics": "switched",
-        "notes": "Supports direct_rdma (NPU->RoCE->RNIC) or host_staged (PCIe D2H->LocalHost->Network)"
+        "notes": "Supports direct_rdma (NPU->RoCE->RNIC) or host_staged (PCIe D2H->LocalHost->Network)",
+        "scope": "cross_node"
       }
     },
     "source": {
@@ -3243,23 +4204,6 @@
                 16,
                 32
               ]
-            ],
-            "fp8": [
-              [
-                128,
-                128,
-                128
-              ],
-              [
-                64,
-                64,
-                128
-              ],
-              [
-                16,
-                16,
-                32
-              ]
             ]
           },
           "input_slots": 2,
@@ -3308,6 +4252,55 @@
         "collective": {
           "alpha_us": 0.0
         }
+      },
+      "root_complex_id": "rc0",
+      "simt_ub_carveout_bytes": 0,
+      "subtile_wave": [
+        {
+          "native_mode": "bf16",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 16,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        },
+        {
+          "native_mode": "fp16",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 16,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        },
+        {
+          "native_mode": "int8",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 32,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        }
+      ],
+      "dispatch_sync": {
+        "stars": {
+          "queue_scope": "die",
+          "queue_depth": 64,
+          "lanes": 1,
+          "issue_interval_us": 0.0,
+          "first_issue_us": 0.0,
+          "release_policy": "descriptor_ready",
+          "evidence_id": "pending_raw_dispatch_trace"
+        },
+        "host_submit_service": "host",
+        "d2h_channel": "d2h",
+        "split_host_service": "host"
+      },
+      "hbm_rw_alpha": 0.0,
+      "hbm_read_bytes_per_s": 1600000000000.0,
+      "hbm_write_bytes_per_s": 1600000000000.0,
+      "memory_access": {
+        "sector_bytes": 32,
+        "burst_turn_penalty": []
       }
     },
     "architecture": "A3",
@@ -3343,7 +4336,65 @@
         "alpha_us": 0.8,
         "transport_mode": "sio_die_to_die",
         "channel_semantics": "direct",
-        "notes": null
+        "notes": null,
+        "scope": "package",
+        "rail_id": "sio_r0",
+        "protocol_bands": [
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "package",
+            "group_min": 2,
+            "group_max": 2,
+            "expansion_mode": "direct",
+            "payload_min_inclusive": 0,
+            "payload_max_exclusive": 65537,
+            "algorithm": "direct",
+            "protocol": "sio_small",
+            "startup_scope": "hop",
+            "startup_us": 0.8,
+            "payload_bytes_per_frame": 4096,
+            "wire_bytes_per_frame": 4096,
+            "credit_bytes": 65536,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#sio"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "package",
+            "group_min": 2,
+            "group_max": 2,
+            "expansion_mode": "direct",
+            "payload_min_inclusive": 65537,
+            "payload_max_exclusive": 2097152,
+            "algorithm": "halving_doubling",
+            "protocol": "sio_mid",
+            "startup_scope": "hop",
+            "startup_us": 0.8,
+            "payload_bytes_per_frame": 65536,
+            "wire_bytes_per_frame": 65536,
+            "credit_bytes": 524288,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#sio"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "package",
+            "group_min": 2,
+            "group_max": 2,
+            "expansion_mode": "direct",
+            "payload_min_inclusive": 2097152,
+            "payload_max_exclusive": null,
+            "algorithm": "halving_doubling",
+            "protocol": "sio_large",
+            "startup_scope": "hop",
+            "startup_us": 0.8,
+            "payload_bytes_per_frame": 262144,
+            "wire_bytes_per_frame": 262144,
+            "credit_bytes": 2097152,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#sio"
+          }
+        ]
       },
       "d2d_intra_node": {
         "channel": "d2d_intra_node",
@@ -3361,7 +4412,66 @@
         "alpha_us": 2.5,
         "transport_mode": "direct_fabric",
         "channel_semantics": "switched",
-        "notes": null
+        "notes": null,
+        "scope": "node",
+        "rail_id": "hccs_sw_r0",
+        "switch_id": "hccs_sw0",
+        "protocol_bands": [
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": 2,
+            "group_max": 16,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 0,
+            "payload_max_exclusive": 65537,
+            "algorithm": "ring",
+            "protocol": "hccs_sw_small",
+            "startup_scope": "hop",
+            "startup_us": 2.5,
+            "payload_bytes_per_frame": 4096,
+            "wire_bytes_per_frame": 4096,
+            "credit_bytes": 65536,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#hccs_sw"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": 2,
+            "group_max": 16,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 65537,
+            "payload_max_exclusive": 2097152,
+            "algorithm": "ring",
+            "protocol": "hccs_sw_mid",
+            "startup_scope": "hop",
+            "startup_us": 2.5,
+            "payload_bytes_per_frame": 65536,
+            "wire_bytes_per_frame": 65536,
+            "credit_bytes": 524288,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#hccs_sw"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": 2,
+            "group_max": 16,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 2097152,
+            "payload_max_exclusive": null,
+            "algorithm": "ring",
+            "protocol": "hccs_sw_large",
+            "startup_scope": "hop",
+            "startup_us": 2.5,
+            "payload_bytes_per_frame": 262144,
+            "wire_bytes_per_frame": 262144,
+            "credit_bytes": 2097152,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#hccs_sw"
+          }
+        ]
       },
       "d2d_inter_node": {
         "channel": "d2d_inter_node",
@@ -3379,43 +4489,110 @@
         "alpha_us": 5.0,
         "transport_mode": "roce_rdma",
         "channel_semantics": "switched",
-        "notes": null
+        "notes": null,
+        "scope": "cross_node",
+        "rail_id": "roce_r0",
+        "switch_id": "tor_sw0",
+        "protocol_bands": [
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": 2,
+            "group_max": 8192,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 0,
+            "payload_max_exclusive": 65537,
+            "algorithm": "ring",
+            "protocol": "roce_small",
+            "startup_scope": "hop",
+            "startup_us": 5.0,
+            "payload_bytes_per_frame": 4096,
+            "wire_bytes_per_frame": 4096,
+            "credit_bytes": 65536,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#roce"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": 2,
+            "group_max": 8192,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 65537,
+            "payload_max_exclusive": 2097152,
+            "algorithm": "ring",
+            "protocol": "roce_mid",
+            "startup_scope": "hop",
+            "startup_us": 5.0,
+            "payload_bytes_per_frame": 65536,
+            "wire_bytes_per_frame": 65536,
+            "credit_bytes": 524288,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#roce"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": 2,
+            "group_max": 8192,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 2097152,
+            "payload_max_exclusive": null,
+            "algorithm": "ring",
+            "protocol": "roce_large",
+            "startup_scope": "hop",
+            "startup_us": 5.0,
+            "payload_bytes_per_frame": 262144,
+            "wire_bytes_per_frame": 262144,
+            "credit_bytes": 2097152,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#roce"
+          }
+        ]
       },
       "h2d": {
         "channel": "h2d",
-        "protocol": "PCIe",
-        "uni_peak_bw_gbps": 50.0,
-        "bi_peak_bw_gbps": 87.5,
-        "calibrated_uni_bw_gbps": null,
-        "calibrated_bi_bw_gbps": null,
+        "protocol": "HCCS",
+        "uni_peak_bw_gbps": 64.0,
+        "bi_peak_bw_gbps": 53.7,
+        "calibrated_uni_bw_gbps": 59.5,
+        "calibrated_bi_bw_gbps": 53.7,
         "derived_uni_bw_gbps": null,
         "derived_bi_bw_gbps": null,
-        "bandwidth_provenance": "declared_peak",
-        "effective_uni_bw_gbps": 50.0,
-        "effective_bi_bw_gbps": 87.5,
-        "pageable_uni_bw_gbps": 14.0,
-        "alpha_us": 2.0,
-        "transport_mode": "pcie_dma",
+        "bandwidth_provenance": "calibrated",
+        "effective_uni_bw_gbps": 59.5,
+        "effective_bi_bw_gbps": 53.7,
+        "pageable_uni_bw_gbps": 14.3,
+        "alpha_us": 4.5,
+        "transport_mode": "hccs_dma",
         "channel_semantics": "direct",
-        "notes": null
+        "notes": "Kunpeng-Ascend Host-Device HCCS DMA (independent per-Die port, 238.8 GB/s node root-complex ceiling)",
+        "scope": "host",
+        "root_complex_id": "rc0",
+        "node_peak_bw_gbps": 238.8,
+        "solo_effective_uni_bw_gbps": 59.5
       },
       "d2h": {
         "channel": "d2h",
-        "protocol": "PCIe",
-        "uni_peak_bw_gbps": 50.0,
-        "bi_peak_bw_gbps": 87.5,
-        "calibrated_uni_bw_gbps": null,
-        "calibrated_bi_bw_gbps": null,
+        "protocol": "HCCS",
+        "uni_peak_bw_gbps": 48.0,
+        "bi_peak_bw_gbps": 53.7,
+        "calibrated_uni_bw_gbps": 41.5,
+        "calibrated_bi_bw_gbps": 53.7,
         "derived_uni_bw_gbps": null,
         "derived_bi_bw_gbps": null,
-        "bandwidth_provenance": "declared_peak",
-        "effective_uni_bw_gbps": 50.0,
-        "effective_bi_bw_gbps": 87.5,
-        "pageable_uni_bw_gbps": 14.0,
-        "alpha_us": 2.0,
-        "transport_mode": "pcie_dma",
+        "bandwidth_provenance": "calibrated",
+        "effective_uni_bw_gbps": 41.5,
+        "effective_bi_bw_gbps": 53.7,
+        "pageable_uni_bw_gbps": 17.7,
+        "alpha_us": 4.9,
+        "transport_mode": "hccs_dma",
         "channel_semantics": "direct",
-        "notes": null
+        "notes": "Kunpeng-Ascend Host-Device HCCS DMA (independent per-Die port, 160.0 GB/s node root-complex ceiling)",
+        "scope": "host",
+        "root_complex_id": "rc0",
+        "node_peak_bw_gbps": 160.0,
+        "solo_effective_uni_bw_gbps": 41.5
       },
       "rh2d": {
         "channel": "rh2d",
@@ -3433,7 +4610,8 @@
         "alpha_us": 6.5,
         "transport_mode": "auto",
         "channel_semantics": "switched",
-        "notes": "Supports direct_rdma (RNIC->RoCE->NPU) or host_staged (Network->LocalHost->PCIe H2D)"
+        "notes": "Supports direct_rdma (RNIC->RoCE->NPU) or host_staged (Network->LocalHost->PCIe H2D)",
+        "scope": "cross_node"
       },
       "rd2h": {
         "channel": "rd2h",
@@ -3451,7 +4629,8 @@
         "alpha_us": 6.5,
         "transport_mode": "auto",
         "channel_semantics": "switched",
-        "notes": "Supports direct_rdma (NPU->RoCE->RNIC) or host_staged (PCIe D2H->LocalHost->Network)"
+        "notes": "Supports direct_rdma (NPU->RoCE->RNIC) or host_staged (PCIe D2H->LocalHost->Network)",
+        "scope": "cross_node"
       }
     },
     "source": {
@@ -3760,23 +4939,6 @@
                 16,
                 32
               ]
-            ],
-            "fp8": [
-              [
-                128,
-                128,
-                128
-              ],
-              [
-                64,
-                64,
-                128
-              ],
-              [
-                16,
-                16,
-                32
-              ]
             ]
           },
           "input_slots": 2,
@@ -3825,6 +4987,55 @@
         "collective": {
           "alpha_us": 0.0
         }
+      },
+      "root_complex_id": "rc0",
+      "simt_ub_carveout_bytes": 0,
+      "subtile_wave": [
+        {
+          "native_mode": "bf16",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 16,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        },
+        {
+          "native_mode": "fp16",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 16,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        },
+        {
+          "native_mode": "int8",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 32,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        }
+      ],
+      "dispatch_sync": {
+        "stars": {
+          "queue_scope": "die",
+          "queue_depth": 64,
+          "lanes": 1,
+          "issue_interval_us": 0.0,
+          "first_issue_us": 0.0,
+          "release_policy": "descriptor_ready",
+          "evidence_id": "pending_raw_dispatch_trace"
+        },
+        "host_submit_service": "host",
+        "d2h_channel": "d2h",
+        "split_host_service": "host"
+      },
+      "hbm_rw_alpha": 0.0,
+      "hbm_read_bytes_per_s": 1600000000000.0,
+      "hbm_write_bytes_per_s": 1600000000000.0,
+      "memory_access": {
+        "sector_bytes": 32,
+        "burst_turn_penalty": []
       }
     },
     "architecture": "A3",
@@ -3860,7 +5071,65 @@
         "alpha_us": 0.8,
         "transport_mode": "sio_die_to_die",
         "channel_semantics": "direct",
-        "notes": null
+        "notes": null,
+        "scope": "package",
+        "rail_id": "sio_r0",
+        "protocol_bands": [
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "package",
+            "group_min": 2,
+            "group_max": 2,
+            "expansion_mode": "direct",
+            "payload_min_inclusive": 0,
+            "payload_max_exclusive": 65537,
+            "algorithm": "direct",
+            "protocol": "sio_small",
+            "startup_scope": "hop",
+            "startup_us": 0.8,
+            "payload_bytes_per_frame": 4096,
+            "wire_bytes_per_frame": 4096,
+            "credit_bytes": 65536,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#sio"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "package",
+            "group_min": 2,
+            "group_max": 2,
+            "expansion_mode": "direct",
+            "payload_min_inclusive": 65537,
+            "payload_max_exclusive": 2097152,
+            "algorithm": "halving_doubling",
+            "protocol": "sio_mid",
+            "startup_scope": "hop",
+            "startup_us": 0.8,
+            "payload_bytes_per_frame": 65536,
+            "wire_bytes_per_frame": 65536,
+            "credit_bytes": 524288,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#sio"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "package",
+            "group_min": 2,
+            "group_max": 2,
+            "expansion_mode": "direct",
+            "payload_min_inclusive": 2097152,
+            "payload_max_exclusive": null,
+            "algorithm": "halving_doubling",
+            "protocol": "sio_large",
+            "startup_scope": "hop",
+            "startup_us": 0.8,
+            "payload_bytes_per_frame": 262144,
+            "wire_bytes_per_frame": 262144,
+            "credit_bytes": 2097152,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#sio"
+          }
+        ]
       },
       "d2d_intra_node": {
         "channel": "d2d_intra_node",
@@ -3878,7 +5147,66 @@
         "alpha_us": 2.5,
         "transport_mode": "direct_fabric",
         "channel_semantics": "switched",
-        "notes": null
+        "notes": null,
+        "scope": "node",
+        "rail_id": "hccs_sw_r0",
+        "switch_id": "hccs_sw0",
+        "protocol_bands": [
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": 2,
+            "group_max": 16,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 0,
+            "payload_max_exclusive": 65537,
+            "algorithm": "ring",
+            "protocol": "hccs_sw_small",
+            "startup_scope": "hop",
+            "startup_us": 2.5,
+            "payload_bytes_per_frame": 4096,
+            "wire_bytes_per_frame": 4096,
+            "credit_bytes": 65536,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#hccs_sw"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": 2,
+            "group_max": 16,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 65537,
+            "payload_max_exclusive": 2097152,
+            "algorithm": "ring",
+            "protocol": "hccs_sw_mid",
+            "startup_scope": "hop",
+            "startup_us": 2.5,
+            "payload_bytes_per_frame": 65536,
+            "wire_bytes_per_frame": 65536,
+            "credit_bytes": 524288,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#hccs_sw"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": 2,
+            "group_max": 16,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 2097152,
+            "payload_max_exclusive": null,
+            "algorithm": "ring",
+            "protocol": "hccs_sw_large",
+            "startup_scope": "hop",
+            "startup_us": 2.5,
+            "payload_bytes_per_frame": 262144,
+            "wire_bytes_per_frame": 262144,
+            "credit_bytes": 2097152,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#hccs_sw"
+          }
+        ]
       },
       "d2d_inter_node": {
         "channel": "d2d_inter_node",
@@ -3896,43 +5224,110 @@
         "alpha_us": 5.0,
         "transport_mode": "roce_rdma",
         "channel_semantics": "switched",
-        "notes": null
+        "notes": null,
+        "scope": "cross_node",
+        "rail_id": "roce_r0",
+        "switch_id": "tor_sw0",
+        "protocol_bands": [
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": 2,
+            "group_max": 8192,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 0,
+            "payload_max_exclusive": 65537,
+            "algorithm": "ring",
+            "protocol": "roce_small",
+            "startup_scope": "hop",
+            "startup_us": 5.0,
+            "payload_bytes_per_frame": 4096,
+            "wire_bytes_per_frame": 4096,
+            "credit_bytes": 65536,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#roce"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": 2,
+            "group_max": 8192,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 65537,
+            "payload_max_exclusive": 2097152,
+            "algorithm": "ring",
+            "protocol": "roce_mid",
+            "startup_scope": "hop",
+            "startup_us": 5.0,
+            "payload_bytes_per_frame": 65536,
+            "wire_bytes_per_frame": 65536,
+            "credit_bytes": 524288,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#roce"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": 2,
+            "group_max": 8192,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 2097152,
+            "payload_max_exclusive": null,
+            "algorithm": "ring",
+            "protocol": "roce_large",
+            "startup_scope": "hop",
+            "startup_us": 5.0,
+            "payload_bytes_per_frame": 262144,
+            "wire_bytes_per_frame": 262144,
+            "credit_bytes": 2097152,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#roce"
+          }
+        ]
       },
       "h2d": {
         "channel": "h2d",
-        "protocol": "PCIe",
-        "uni_peak_bw_gbps": 50.0,
-        "bi_peak_bw_gbps": 87.5,
-        "calibrated_uni_bw_gbps": null,
-        "calibrated_bi_bw_gbps": null,
+        "protocol": "HCCS",
+        "uni_peak_bw_gbps": 64.0,
+        "bi_peak_bw_gbps": 53.7,
+        "calibrated_uni_bw_gbps": 59.5,
+        "calibrated_bi_bw_gbps": 53.7,
         "derived_uni_bw_gbps": null,
         "derived_bi_bw_gbps": null,
-        "bandwidth_provenance": "declared_peak",
-        "effective_uni_bw_gbps": 50.0,
-        "effective_bi_bw_gbps": 87.5,
-        "pageable_uni_bw_gbps": 14.0,
-        "alpha_us": 2.0,
-        "transport_mode": "pcie_dma",
+        "bandwidth_provenance": "calibrated",
+        "effective_uni_bw_gbps": 59.5,
+        "effective_bi_bw_gbps": 53.7,
+        "pageable_uni_bw_gbps": 14.3,
+        "alpha_us": 4.5,
+        "transport_mode": "hccs_dma",
         "channel_semantics": "direct",
-        "notes": null
+        "notes": "Kunpeng-Ascend Host-Device HCCS DMA (independent per-Die port, 238.8 GB/s node root-complex ceiling)",
+        "scope": "host",
+        "root_complex_id": "rc0",
+        "node_peak_bw_gbps": 238.8,
+        "solo_effective_uni_bw_gbps": 59.5
       },
       "d2h": {
         "channel": "d2h",
-        "protocol": "PCIe",
-        "uni_peak_bw_gbps": 50.0,
-        "bi_peak_bw_gbps": 87.5,
-        "calibrated_uni_bw_gbps": null,
-        "calibrated_bi_bw_gbps": null,
+        "protocol": "HCCS",
+        "uni_peak_bw_gbps": 48.0,
+        "bi_peak_bw_gbps": 53.7,
+        "calibrated_uni_bw_gbps": 41.5,
+        "calibrated_bi_bw_gbps": 53.7,
         "derived_uni_bw_gbps": null,
         "derived_bi_bw_gbps": null,
-        "bandwidth_provenance": "declared_peak",
-        "effective_uni_bw_gbps": 50.0,
-        "effective_bi_bw_gbps": 87.5,
-        "pageable_uni_bw_gbps": 14.0,
-        "alpha_us": 2.0,
-        "transport_mode": "pcie_dma",
+        "bandwidth_provenance": "calibrated",
+        "effective_uni_bw_gbps": 41.5,
+        "effective_bi_bw_gbps": 53.7,
+        "pageable_uni_bw_gbps": 17.7,
+        "alpha_us": 4.9,
+        "transport_mode": "hccs_dma",
         "channel_semantics": "direct",
-        "notes": null
+        "notes": "Kunpeng-Ascend Host-Device HCCS DMA (independent per-Die port, 160.0 GB/s node root-complex ceiling)",
+        "scope": "host",
+        "root_complex_id": "rc0",
+        "node_peak_bw_gbps": 160.0,
+        "solo_effective_uni_bw_gbps": 41.5
       },
       "rh2d": {
         "channel": "rh2d",
@@ -3950,7 +5345,8 @@
         "alpha_us": 6.5,
         "transport_mode": "auto",
         "channel_semantics": "switched",
-        "notes": "Supports direct_rdma (RNIC->RoCE->NPU) or host_staged (Network->LocalHost->PCIe H2D)"
+        "notes": "Supports direct_rdma (RNIC->RoCE->NPU) or host_staged (Network->LocalHost->PCIe H2D)",
+        "scope": "cross_node"
       },
       "rd2h": {
         "channel": "rd2h",
@@ -3968,7 +5364,8 @@
         "alpha_us": 6.5,
         "transport_mode": "auto",
         "channel_semantics": "switched",
-        "notes": "Supports direct_rdma (NPU->RoCE->RNIC) or host_staged (PCIe D2H->LocalHost->Network)"
+        "notes": "Supports direct_rdma (NPU->RoCE->RNIC) or host_staged (PCIe D2H->LocalHost->Network)",
+        "scope": "cross_node"
       }
     },
     "source": {
@@ -4277,23 +5674,6 @@
                 16,
                 32
               ]
-            ],
-            "fp8": [
-              [
-                128,
-                128,
-                128
-              ],
-              [
-                64,
-                64,
-                128
-              ],
-              [
-                16,
-                16,
-                32
-              ]
             ]
           },
           "input_slots": 2,
@@ -4342,6 +5722,55 @@
         "collective": {
           "alpha_us": 0.0
         }
+      },
+      "root_complex_id": "rc0",
+      "simt_ub_carveout_bytes": 0,
+      "subtile_wave": [
+        {
+          "native_mode": "bf16",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 16,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        },
+        {
+          "native_mode": "fp16",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 16,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        },
+        {
+          "native_mode": "int8",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 32,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        }
+      ],
+      "dispatch_sync": {
+        "stars": {
+          "queue_scope": "die",
+          "queue_depth": 64,
+          "lanes": 1,
+          "issue_interval_us": 0.0,
+          "first_issue_us": 0.0,
+          "release_policy": "descriptor_ready",
+          "evidence_id": "pending_raw_dispatch_trace"
+        },
+        "host_submit_service": "host",
+        "d2h_channel": "d2h",
+        "split_host_service": "host"
+      },
+      "hbm_rw_alpha": 0.0,
+      "hbm_read_bytes_per_s": 1600000000000.0,
+      "hbm_write_bytes_per_s": 1600000000000.0,
+      "memory_access": {
+        "sector_bytes": 32,
+        "burst_turn_penalty": []
       }
     },
     "architecture": "A3",
@@ -4377,7 +5806,65 @@
         "alpha_us": 0.8,
         "transport_mode": "sio_die_to_die",
         "channel_semantics": "direct",
-        "notes": null
+        "notes": null,
+        "scope": "package",
+        "rail_id": "sio_r0",
+        "protocol_bands": [
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "package",
+            "group_min": 2,
+            "group_max": 2,
+            "expansion_mode": "direct",
+            "payload_min_inclusive": 0,
+            "payload_max_exclusive": 65537,
+            "algorithm": "direct",
+            "protocol": "sio_small",
+            "startup_scope": "hop",
+            "startup_us": 0.8,
+            "payload_bytes_per_frame": 4096,
+            "wire_bytes_per_frame": 4096,
+            "credit_bytes": 65536,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#sio"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "package",
+            "group_min": 2,
+            "group_max": 2,
+            "expansion_mode": "direct",
+            "payload_min_inclusive": 65537,
+            "payload_max_exclusive": 2097152,
+            "algorithm": "halving_doubling",
+            "protocol": "sio_mid",
+            "startup_scope": "hop",
+            "startup_us": 0.8,
+            "payload_bytes_per_frame": 65536,
+            "wire_bytes_per_frame": 65536,
+            "credit_bytes": 524288,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#sio"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "package",
+            "group_min": 2,
+            "group_max": 2,
+            "expansion_mode": "direct",
+            "payload_min_inclusive": 2097152,
+            "payload_max_exclusive": null,
+            "algorithm": "halving_doubling",
+            "protocol": "sio_large",
+            "startup_scope": "hop",
+            "startup_us": 0.8,
+            "payload_bytes_per_frame": 262144,
+            "wire_bytes_per_frame": 262144,
+            "credit_bytes": 2097152,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#sio"
+          }
+        ]
       },
       "d2d_intra_node": {
         "channel": "d2d_intra_node",
@@ -4395,7 +5882,66 @@
         "alpha_us": 2.5,
         "transport_mode": "direct_fabric",
         "channel_semantics": "switched",
-        "notes": null
+        "notes": null,
+        "scope": "node",
+        "rail_id": "hccs_sw_r0",
+        "switch_id": "hccs_sw0",
+        "protocol_bands": [
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": 2,
+            "group_max": 16,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 0,
+            "payload_max_exclusive": 65537,
+            "algorithm": "ring",
+            "protocol": "hccs_sw_small",
+            "startup_scope": "hop",
+            "startup_us": 2.5,
+            "payload_bytes_per_frame": 4096,
+            "wire_bytes_per_frame": 4096,
+            "credit_bytes": 65536,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#hccs_sw"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": 2,
+            "group_max": 16,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 65537,
+            "payload_max_exclusive": 2097152,
+            "algorithm": "ring",
+            "protocol": "hccs_sw_mid",
+            "startup_scope": "hop",
+            "startup_us": 2.5,
+            "payload_bytes_per_frame": 65536,
+            "wire_bytes_per_frame": 65536,
+            "credit_bytes": 524288,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#hccs_sw"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": 2,
+            "group_max": 16,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 2097152,
+            "payload_max_exclusive": null,
+            "algorithm": "ring",
+            "protocol": "hccs_sw_large",
+            "startup_scope": "hop",
+            "startup_us": 2.5,
+            "payload_bytes_per_frame": 262144,
+            "wire_bytes_per_frame": 262144,
+            "credit_bytes": 2097152,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#hccs_sw"
+          }
+        ]
       },
       "d2d_inter_node": {
         "channel": "d2d_inter_node",
@@ -4413,43 +5959,110 @@
         "alpha_us": 5.0,
         "transport_mode": "roce_rdma",
         "channel_semantics": "switched",
-        "notes": null
+        "notes": null,
+        "scope": "cross_node",
+        "rail_id": "roce_r0",
+        "switch_id": "tor_sw0",
+        "protocol_bands": [
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": 2,
+            "group_max": 8192,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 0,
+            "payload_max_exclusive": 65537,
+            "algorithm": "ring",
+            "protocol": "roce_small",
+            "startup_scope": "hop",
+            "startup_us": 5.0,
+            "payload_bytes_per_frame": 4096,
+            "wire_bytes_per_frame": 4096,
+            "credit_bytes": 65536,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#roce"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": 2,
+            "group_max": 8192,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 65537,
+            "payload_max_exclusive": 2097152,
+            "algorithm": "ring",
+            "protocol": "roce_mid",
+            "startup_scope": "hop",
+            "startup_us": 5.0,
+            "payload_bytes_per_frame": 65536,
+            "wire_bytes_per_frame": 65536,
+            "credit_bytes": 524288,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#roce"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": 2,
+            "group_max": 8192,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 2097152,
+            "payload_max_exclusive": null,
+            "algorithm": "ring",
+            "protocol": "roce_large",
+            "startup_scope": "hop",
+            "startup_us": 5.0,
+            "payload_bytes_per_frame": 262144,
+            "wire_bytes_per_frame": 262144,
+            "credit_bytes": 2097152,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#roce"
+          }
+        ]
       },
       "h2d": {
         "channel": "h2d",
-        "protocol": "PCIe",
-        "uni_peak_bw_gbps": 50.0,
-        "bi_peak_bw_gbps": 87.5,
-        "calibrated_uni_bw_gbps": null,
-        "calibrated_bi_bw_gbps": null,
+        "protocol": "HCCS",
+        "uni_peak_bw_gbps": 64.0,
+        "bi_peak_bw_gbps": 53.7,
+        "calibrated_uni_bw_gbps": 59.5,
+        "calibrated_bi_bw_gbps": 53.7,
         "derived_uni_bw_gbps": null,
         "derived_bi_bw_gbps": null,
-        "bandwidth_provenance": "declared_peak",
-        "effective_uni_bw_gbps": 50.0,
-        "effective_bi_bw_gbps": 87.5,
-        "pageable_uni_bw_gbps": 14.0,
-        "alpha_us": 2.0,
-        "transport_mode": "pcie_dma",
+        "bandwidth_provenance": "calibrated",
+        "effective_uni_bw_gbps": 59.5,
+        "effective_bi_bw_gbps": 53.7,
+        "pageable_uni_bw_gbps": 14.3,
+        "alpha_us": 4.5,
+        "transport_mode": "hccs_dma",
         "channel_semantics": "direct",
-        "notes": null
+        "notes": "Kunpeng-Ascend Host-Device HCCS DMA (independent per-Die port, 238.8 GB/s node root-complex ceiling)",
+        "scope": "host",
+        "root_complex_id": "rc0",
+        "node_peak_bw_gbps": 238.8,
+        "solo_effective_uni_bw_gbps": 59.5
       },
       "d2h": {
         "channel": "d2h",
-        "protocol": "PCIe",
-        "uni_peak_bw_gbps": 50.0,
-        "bi_peak_bw_gbps": 87.5,
-        "calibrated_uni_bw_gbps": null,
-        "calibrated_bi_bw_gbps": null,
+        "protocol": "HCCS",
+        "uni_peak_bw_gbps": 48.0,
+        "bi_peak_bw_gbps": 53.7,
+        "calibrated_uni_bw_gbps": 41.5,
+        "calibrated_bi_bw_gbps": 53.7,
         "derived_uni_bw_gbps": null,
         "derived_bi_bw_gbps": null,
-        "bandwidth_provenance": "declared_peak",
-        "effective_uni_bw_gbps": 50.0,
-        "effective_bi_bw_gbps": 87.5,
-        "pageable_uni_bw_gbps": 14.0,
-        "alpha_us": 2.0,
-        "transport_mode": "pcie_dma",
+        "bandwidth_provenance": "calibrated",
+        "effective_uni_bw_gbps": 41.5,
+        "effective_bi_bw_gbps": 53.7,
+        "pageable_uni_bw_gbps": 17.7,
+        "alpha_us": 4.9,
+        "transport_mode": "hccs_dma",
         "channel_semantics": "direct",
-        "notes": null
+        "notes": "Kunpeng-Ascend Host-Device HCCS DMA (independent per-Die port, 160.0 GB/s node root-complex ceiling)",
+        "scope": "host",
+        "root_complex_id": "rc0",
+        "node_peak_bw_gbps": 160.0,
+        "solo_effective_uni_bw_gbps": 41.5
       },
       "rh2d": {
         "channel": "rh2d",
@@ -4467,7 +6080,8 @@
         "alpha_us": 6.5,
         "transport_mode": "auto",
         "channel_semantics": "switched",
-        "notes": "Supports direct_rdma (RNIC->RoCE->NPU) or host_staged (Network->LocalHost->PCIe H2D)"
+        "notes": "Supports direct_rdma (RNIC->RoCE->NPU) or host_staged (Network->LocalHost->PCIe H2D)",
+        "scope": "cross_node"
       },
       "rd2h": {
         "channel": "rd2h",
@@ -4485,7 +6099,8 @@
         "alpha_us": 6.5,
         "transport_mode": "auto",
         "channel_semantics": "switched",
-        "notes": "Supports direct_rdma (NPU->RoCE->RNIC) or host_staged (PCIe D2H->LocalHost->Network)"
+        "notes": "Supports direct_rdma (NPU->RoCE->RNIC) or host_staged (PCIe D2H->LocalHost->Network)",
+        "scope": "cross_node"
       }
     },
     "source": {
@@ -4794,23 +6409,6 @@
                 16,
                 32
               ]
-            ],
-            "fp8": [
-              [
-                128,
-                128,
-                128
-              ],
-              [
-                64,
-                64,
-                128
-              ],
-              [
-                16,
-                16,
-                32
-              ]
             ]
           },
           "input_slots": 2,
@@ -4859,6 +6457,55 @@
         "collective": {
           "alpha_us": 0.0
         }
+      },
+      "root_complex_id": "rc0",
+      "simt_ub_carveout_bytes": 0,
+      "subtile_wave": [
+        {
+          "native_mode": "bf16",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 16,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        },
+        {
+          "native_mode": "fp16",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 16,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        },
+        {
+          "native_mode": "int8",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 32,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        }
+      ],
+      "dispatch_sync": {
+        "stars": {
+          "queue_scope": "die",
+          "queue_depth": 64,
+          "lanes": 1,
+          "issue_interval_us": 0.0,
+          "first_issue_us": 0.0,
+          "release_policy": "descriptor_ready",
+          "evidence_id": "pending_raw_dispatch_trace"
+        },
+        "host_submit_service": "host",
+        "d2h_channel": "d2h",
+        "split_host_service": "host"
+      },
+      "hbm_rw_alpha": 0.0,
+      "hbm_read_bytes_per_s": 1600000000000.0,
+      "hbm_write_bytes_per_s": 1600000000000.0,
+      "memory_access": {
+        "sector_bytes": 32,
+        "burst_turn_penalty": []
       }
     },
     "architecture": "A3",
@@ -4894,7 +6541,65 @@
         "alpha_us": 0.8,
         "transport_mode": "sio_die_to_die",
         "channel_semantics": "direct",
-        "notes": null
+        "notes": null,
+        "scope": "package",
+        "rail_id": "sio_r0",
+        "protocol_bands": [
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "package",
+            "group_min": 2,
+            "group_max": 2,
+            "expansion_mode": "direct",
+            "payload_min_inclusive": 0,
+            "payload_max_exclusive": 65537,
+            "algorithm": "direct",
+            "protocol": "sio_small",
+            "startup_scope": "hop",
+            "startup_us": 0.8,
+            "payload_bytes_per_frame": 4096,
+            "wire_bytes_per_frame": 4096,
+            "credit_bytes": 65536,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#sio"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "package",
+            "group_min": 2,
+            "group_max": 2,
+            "expansion_mode": "direct",
+            "payload_min_inclusive": 65537,
+            "payload_max_exclusive": 2097152,
+            "algorithm": "halving_doubling",
+            "protocol": "sio_mid",
+            "startup_scope": "hop",
+            "startup_us": 0.8,
+            "payload_bytes_per_frame": 65536,
+            "wire_bytes_per_frame": 65536,
+            "credit_bytes": 524288,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#sio"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "package",
+            "group_min": 2,
+            "group_max": 2,
+            "expansion_mode": "direct",
+            "payload_min_inclusive": 2097152,
+            "payload_max_exclusive": null,
+            "algorithm": "halving_doubling",
+            "protocol": "sio_large",
+            "startup_scope": "hop",
+            "startup_us": 0.8,
+            "payload_bytes_per_frame": 262144,
+            "wire_bytes_per_frame": 262144,
+            "credit_bytes": 2097152,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#sio"
+          }
+        ]
       },
       "d2d_intra_node": {
         "channel": "d2d_intra_node",
@@ -4912,7 +6617,66 @@
         "alpha_us": 2.5,
         "transport_mode": "direct_fabric",
         "channel_semantics": "switched",
-        "notes": null
+        "notes": null,
+        "scope": "node",
+        "rail_id": "hccs_sw_r0",
+        "switch_id": "hccs_sw0",
+        "protocol_bands": [
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": 2,
+            "group_max": 16,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 0,
+            "payload_max_exclusive": 65537,
+            "algorithm": "ring",
+            "protocol": "hccs_sw_small",
+            "startup_scope": "hop",
+            "startup_us": 2.5,
+            "payload_bytes_per_frame": 4096,
+            "wire_bytes_per_frame": 4096,
+            "credit_bytes": 65536,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#hccs_sw"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": 2,
+            "group_max": 16,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 65537,
+            "payload_max_exclusive": 2097152,
+            "algorithm": "ring",
+            "protocol": "hccs_sw_mid",
+            "startup_scope": "hop",
+            "startup_us": 2.5,
+            "payload_bytes_per_frame": 65536,
+            "wire_bytes_per_frame": 65536,
+            "credit_bytes": 524288,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#hccs_sw"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": 2,
+            "group_max": 16,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 2097152,
+            "payload_max_exclusive": null,
+            "algorithm": "ring",
+            "protocol": "hccs_sw_large",
+            "startup_scope": "hop",
+            "startup_us": 2.5,
+            "payload_bytes_per_frame": 262144,
+            "wire_bytes_per_frame": 262144,
+            "credit_bytes": 2097152,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#hccs_sw"
+          }
+        ]
       },
       "d2d_inter_node": {
         "channel": "d2d_inter_node",
@@ -4930,43 +6694,110 @@
         "alpha_us": 5.0,
         "transport_mode": "roce_rdma",
         "channel_semantics": "switched",
-        "notes": null
+        "notes": null,
+        "scope": "cross_node",
+        "rail_id": "roce_r0",
+        "switch_id": "tor_sw0",
+        "protocol_bands": [
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": 2,
+            "group_max": 8192,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 0,
+            "payload_max_exclusive": 65537,
+            "algorithm": "ring",
+            "protocol": "roce_small",
+            "startup_scope": "hop",
+            "startup_us": 5.0,
+            "payload_bytes_per_frame": 4096,
+            "wire_bytes_per_frame": 4096,
+            "credit_bytes": 65536,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#roce"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": 2,
+            "group_max": 8192,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 65537,
+            "payload_max_exclusive": 2097152,
+            "algorithm": "ring",
+            "protocol": "roce_mid",
+            "startup_scope": "hop",
+            "startup_us": 5.0,
+            "payload_bytes_per_frame": 65536,
+            "wire_bytes_per_frame": 65536,
+            "credit_bytes": 524288,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#roce"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": 2,
+            "group_max": 8192,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 2097152,
+            "payload_max_exclusive": null,
+            "algorithm": "ring",
+            "protocol": "roce_large",
+            "startup_scope": "hop",
+            "startup_us": 5.0,
+            "payload_bytes_per_frame": 262144,
+            "wire_bytes_per_frame": 262144,
+            "credit_bytes": 2097152,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#roce"
+          }
+        ]
       },
       "h2d": {
         "channel": "h2d",
-        "protocol": "PCIe",
-        "uni_peak_bw_gbps": 50.0,
-        "bi_peak_bw_gbps": 87.5,
-        "calibrated_uni_bw_gbps": null,
-        "calibrated_bi_bw_gbps": null,
+        "protocol": "HCCS",
+        "uni_peak_bw_gbps": 64.0,
+        "bi_peak_bw_gbps": 53.7,
+        "calibrated_uni_bw_gbps": 59.5,
+        "calibrated_bi_bw_gbps": 53.7,
         "derived_uni_bw_gbps": null,
         "derived_bi_bw_gbps": null,
-        "bandwidth_provenance": "declared_peak",
-        "effective_uni_bw_gbps": 50.0,
-        "effective_bi_bw_gbps": 87.5,
-        "pageable_uni_bw_gbps": 14.0,
-        "alpha_us": 2.0,
-        "transport_mode": "pcie_dma",
+        "bandwidth_provenance": "calibrated",
+        "effective_uni_bw_gbps": 59.5,
+        "effective_bi_bw_gbps": 53.7,
+        "pageable_uni_bw_gbps": 14.3,
+        "alpha_us": 4.5,
+        "transport_mode": "hccs_dma",
         "channel_semantics": "direct",
-        "notes": null
+        "notes": "Kunpeng-Ascend Host-Device HCCS DMA (independent per-Die port, 238.8 GB/s node root-complex ceiling)",
+        "scope": "host",
+        "root_complex_id": "rc0",
+        "node_peak_bw_gbps": 238.8,
+        "solo_effective_uni_bw_gbps": 59.5
       },
       "d2h": {
         "channel": "d2h",
-        "protocol": "PCIe",
-        "uni_peak_bw_gbps": 50.0,
-        "bi_peak_bw_gbps": 87.5,
-        "calibrated_uni_bw_gbps": null,
-        "calibrated_bi_bw_gbps": null,
+        "protocol": "HCCS",
+        "uni_peak_bw_gbps": 48.0,
+        "bi_peak_bw_gbps": 53.7,
+        "calibrated_uni_bw_gbps": 41.5,
+        "calibrated_bi_bw_gbps": 53.7,
         "derived_uni_bw_gbps": null,
         "derived_bi_bw_gbps": null,
-        "bandwidth_provenance": "declared_peak",
-        "effective_uni_bw_gbps": 50.0,
-        "effective_bi_bw_gbps": 87.5,
-        "pageable_uni_bw_gbps": 14.0,
-        "alpha_us": 2.0,
-        "transport_mode": "pcie_dma",
+        "bandwidth_provenance": "calibrated",
+        "effective_uni_bw_gbps": 41.5,
+        "effective_bi_bw_gbps": 53.7,
+        "pageable_uni_bw_gbps": 17.7,
+        "alpha_us": 4.9,
+        "transport_mode": "hccs_dma",
         "channel_semantics": "direct",
-        "notes": null
+        "notes": "Kunpeng-Ascend Host-Device HCCS DMA (independent per-Die port, 160.0 GB/s node root-complex ceiling)",
+        "scope": "host",
+        "root_complex_id": "rc0",
+        "node_peak_bw_gbps": 160.0,
+        "solo_effective_uni_bw_gbps": 41.5
       },
       "rh2d": {
         "channel": "rh2d",
@@ -4984,7 +6815,8 @@
         "alpha_us": 6.5,
         "transport_mode": "auto",
         "channel_semantics": "switched",
-        "notes": "Supports direct_rdma (RNIC->RoCE->NPU) or host_staged (Network->LocalHost->PCIe H2D)"
+        "notes": "Supports direct_rdma (RNIC->RoCE->NPU) or host_staged (Network->LocalHost->PCIe H2D)",
+        "scope": "cross_node"
       },
       "rd2h": {
         "channel": "rd2h",
@@ -5002,7 +6834,8 @@
         "alpha_us": 6.5,
         "transport_mode": "auto",
         "channel_semantics": "switched",
-        "notes": "Supports direct_rdma (NPU->RoCE->RNIC) or host_staged (PCIe D2H->LocalHost->Network)"
+        "notes": "Supports direct_rdma (NPU->RoCE->RNIC) or host_staged (PCIe D2H->LocalHost->Network)",
+        "scope": "cross_node"
       }
     },
     "source": {
@@ -5311,23 +7144,6 @@
                 16,
                 32
               ]
-            ],
-            "fp8": [
-              [
-                128,
-                128,
-                128
-              ],
-              [
-                64,
-                64,
-                128
-              ],
-              [
-                16,
-                16,
-                32
-              ]
             ]
           },
           "input_slots": 2,
@@ -5376,6 +7192,55 @@
         "collective": {
           "alpha_us": 0.0
         }
+      },
+      "root_complex_id": "rc0",
+      "simt_ub_carveout_bytes": 0,
+      "subtile_wave": [
+        {
+          "native_mode": "bf16",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 16,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        },
+        {
+          "native_mode": "fp16",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 16,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        },
+        {
+          "native_mode": "int8",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 32,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        }
+      ],
+      "dispatch_sync": {
+        "stars": {
+          "queue_scope": "die",
+          "queue_depth": 64,
+          "lanes": 1,
+          "issue_interval_us": 0.0,
+          "first_issue_us": 0.0,
+          "release_policy": "descriptor_ready",
+          "evidence_id": "pending_raw_dispatch_trace"
+        },
+        "host_submit_service": "host",
+        "d2h_channel": "d2h",
+        "split_host_service": "host"
+      },
+      "hbm_rw_alpha": 0.0,
+      "hbm_read_bytes_per_s": 1400000000000.0,
+      "hbm_write_bytes_per_s": 1400000000000.0,
+      "memory_access": {
+        "sector_bytes": 32,
+        "burst_turn_penalty": []
       }
     },
     "architecture": "A3",
@@ -5411,7 +7276,65 @@
         "alpha_us": 0.8,
         "transport_mode": "sio_die_to_die",
         "channel_semantics": "direct",
-        "notes": null
+        "notes": null,
+        "scope": "package",
+        "rail_id": "sio_r0",
+        "protocol_bands": [
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "package",
+            "group_min": 2,
+            "group_max": 2,
+            "expansion_mode": "direct",
+            "payload_min_inclusive": 0,
+            "payload_max_exclusive": 65537,
+            "algorithm": "direct",
+            "protocol": "sio_small",
+            "startup_scope": "hop",
+            "startup_us": 0.8,
+            "payload_bytes_per_frame": 4096,
+            "wire_bytes_per_frame": 4096,
+            "credit_bytes": 65536,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#sio"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "package",
+            "group_min": 2,
+            "group_max": 2,
+            "expansion_mode": "direct",
+            "payload_min_inclusive": 65537,
+            "payload_max_exclusive": 2097152,
+            "algorithm": "halving_doubling",
+            "protocol": "sio_mid",
+            "startup_scope": "hop",
+            "startup_us": 0.8,
+            "payload_bytes_per_frame": 65536,
+            "wire_bytes_per_frame": 65536,
+            "credit_bytes": 524288,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#sio"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "package",
+            "group_min": 2,
+            "group_max": 2,
+            "expansion_mode": "direct",
+            "payload_min_inclusive": 2097152,
+            "payload_max_exclusive": null,
+            "algorithm": "halving_doubling",
+            "protocol": "sio_large",
+            "startup_scope": "hop",
+            "startup_us": 0.8,
+            "payload_bytes_per_frame": 262144,
+            "wire_bytes_per_frame": 262144,
+            "credit_bytes": 2097152,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#sio"
+          }
+        ]
       },
       "d2d_intra_node": {
         "channel": "d2d_intra_node",
@@ -5429,7 +7352,66 @@
         "alpha_us": 2.5,
         "transport_mode": "direct_fabric",
         "channel_semantics": "switched",
-        "notes": null
+        "notes": null,
+        "scope": "node",
+        "rail_id": "hccs_sw_r0",
+        "switch_id": "hccs_sw0",
+        "protocol_bands": [
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": 2,
+            "group_max": 16,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 0,
+            "payload_max_exclusive": 65537,
+            "algorithm": "ring",
+            "protocol": "hccs_sw_small",
+            "startup_scope": "hop",
+            "startup_us": 2.5,
+            "payload_bytes_per_frame": 4096,
+            "wire_bytes_per_frame": 4096,
+            "credit_bytes": 65536,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#hccs_sw"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": 2,
+            "group_max": 16,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 65537,
+            "payload_max_exclusive": 2097152,
+            "algorithm": "ring",
+            "protocol": "hccs_sw_mid",
+            "startup_scope": "hop",
+            "startup_us": 2.5,
+            "payload_bytes_per_frame": 65536,
+            "wire_bytes_per_frame": 65536,
+            "credit_bytes": 524288,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#hccs_sw"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": 2,
+            "group_max": 16,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 2097152,
+            "payload_max_exclusive": null,
+            "algorithm": "ring",
+            "protocol": "hccs_sw_large",
+            "startup_scope": "hop",
+            "startup_us": 2.5,
+            "payload_bytes_per_frame": 262144,
+            "wire_bytes_per_frame": 262144,
+            "credit_bytes": 2097152,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#hccs_sw"
+          }
+        ]
       },
       "d2d_inter_node": {
         "channel": "d2d_inter_node",
@@ -5447,43 +7429,110 @@
         "alpha_us": 5.0,
         "transport_mode": "roce_rdma",
         "channel_semantics": "switched",
-        "notes": null
+        "notes": null,
+        "scope": "cross_node",
+        "rail_id": "roce_r0",
+        "switch_id": "tor_sw0",
+        "protocol_bands": [
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": 2,
+            "group_max": 8192,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 0,
+            "payload_max_exclusive": 65537,
+            "algorithm": "ring",
+            "protocol": "roce_small",
+            "startup_scope": "hop",
+            "startup_us": 5.0,
+            "payload_bytes_per_frame": 4096,
+            "wire_bytes_per_frame": 4096,
+            "credit_bytes": 65536,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#roce"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": 2,
+            "group_max": 8192,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 65537,
+            "payload_max_exclusive": 2097152,
+            "algorithm": "ring",
+            "protocol": "roce_mid",
+            "startup_scope": "hop",
+            "startup_us": 5.0,
+            "payload_bytes_per_frame": 65536,
+            "wire_bytes_per_frame": 65536,
+            "credit_bytes": 524288,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#roce"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": 2,
+            "group_max": 8192,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 2097152,
+            "payload_max_exclusive": null,
+            "algorithm": "ring",
+            "protocol": "roce_large",
+            "startup_scope": "hop",
+            "startup_us": 5.0,
+            "payload_bytes_per_frame": 262144,
+            "wire_bytes_per_frame": 262144,
+            "credit_bytes": 2097152,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#roce"
+          }
+        ]
       },
       "h2d": {
         "channel": "h2d",
-        "protocol": "PCIe",
-        "uni_peak_bw_gbps": 50.0,
-        "bi_peak_bw_gbps": 87.5,
-        "calibrated_uni_bw_gbps": null,
-        "calibrated_bi_bw_gbps": null,
+        "protocol": "HCCS",
+        "uni_peak_bw_gbps": 64.0,
+        "bi_peak_bw_gbps": 53.7,
+        "calibrated_uni_bw_gbps": 58.4,
+        "calibrated_bi_bw_gbps": 53.7,
         "derived_uni_bw_gbps": null,
         "derived_bi_bw_gbps": null,
-        "bandwidth_provenance": "declared_peak",
-        "effective_uni_bw_gbps": 50.0,
-        "effective_bi_bw_gbps": 87.5,
-        "pageable_uni_bw_gbps": 14.0,
-        "alpha_us": 2.0,
-        "transport_mode": "pcie_dma",
+        "bandwidth_provenance": "calibrated",
+        "effective_uni_bw_gbps": 58.4,
+        "effective_bi_bw_gbps": 53.7,
+        "pageable_uni_bw_gbps": 14.3,
+        "alpha_us": 6.11,
+        "transport_mode": "hccs_dma",
         "channel_semantics": "direct",
-        "notes": null
+        "notes": "Kunpeng-Ascend Host-Device HCCS DMA (independent per-Die port, 238.8 GB/s node root-complex ceiling)",
+        "scope": "host",
+        "root_complex_id": "rc0",
+        "node_peak_bw_gbps": 238.8,
+        "solo_effective_uni_bw_gbps": 58.4
       },
       "d2h": {
         "channel": "d2h",
-        "protocol": "PCIe",
-        "uni_peak_bw_gbps": 50.0,
-        "bi_peak_bw_gbps": 87.5,
-        "calibrated_uni_bw_gbps": null,
-        "calibrated_bi_bw_gbps": null,
+        "protocol": "HCCS",
+        "uni_peak_bw_gbps": 48.0,
+        "bi_peak_bw_gbps": 53.7,
+        "calibrated_uni_bw_gbps": 42.7,
+        "calibrated_bi_bw_gbps": 53.7,
         "derived_uni_bw_gbps": null,
         "derived_bi_bw_gbps": null,
-        "bandwidth_provenance": "declared_peak",
-        "effective_uni_bw_gbps": 50.0,
-        "effective_bi_bw_gbps": 87.5,
-        "pageable_uni_bw_gbps": 14.0,
-        "alpha_us": 2.0,
-        "transport_mode": "pcie_dma",
+        "bandwidth_provenance": "calibrated",
+        "effective_uni_bw_gbps": 42.7,
+        "effective_bi_bw_gbps": 53.7,
+        "pageable_uni_bw_gbps": 17.7,
+        "alpha_us": 5.4,
+        "transport_mode": "hccs_dma",
         "channel_semantics": "direct",
-        "notes": null
+        "notes": "Kunpeng-Ascend Host-Device HCCS DMA (independent per-Die port, 160.0 GB/s node root-complex ceiling)",
+        "scope": "host",
+        "root_complex_id": "rc0",
+        "node_peak_bw_gbps": 160.0,
+        "solo_effective_uni_bw_gbps": 42.7
       },
       "rh2d": {
         "channel": "rh2d",
@@ -5501,7 +7550,8 @@
         "alpha_us": 6.5,
         "transport_mode": "auto",
         "channel_semantics": "switched",
-        "notes": "Supports direct_rdma (RNIC->RoCE->NPU) or host_staged (Network->LocalHost->PCIe H2D)"
+        "notes": "Supports direct_rdma (RNIC->RoCE->NPU) or host_staged (Network->LocalHost->PCIe H2D)",
+        "scope": "cross_node"
       },
       "rd2h": {
         "channel": "rd2h",
@@ -5519,7 +7569,8 @@
         "alpha_us": 6.5,
         "transport_mode": "auto",
         "channel_semantics": "switched",
-        "notes": "Supports direct_rdma (NPU->RoCE->RNIC) or host_staged (PCIe D2H->LocalHost->Network)"
+        "notes": "Supports direct_rdma (NPU->RoCE->RNIC) or host_staged (PCIe D2H->LocalHost->Network)",
+        "scope": "cross_node"
       }
     },
     "source": {
@@ -5828,23 +7879,6 @@
                 16,
                 32
               ]
-            ],
-            "fp8": [
-              [
-                128,
-                128,
-                128
-              ],
-              [
-                64,
-                64,
-                128
-              ],
-              [
-                16,
-                16,
-                32
-              ]
             ]
           },
           "input_slots": 2,
@@ -5893,6 +7927,55 @@
         "collective": {
           "alpha_us": 0.0
         }
+      },
+      "root_complex_id": "rc0",
+      "simt_ub_carveout_bytes": 0,
+      "subtile_wave": [
+        {
+          "native_mode": "bf16",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 16,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        },
+        {
+          "native_mode": "fp16",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 16,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        },
+        {
+          "native_mode": "int8",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 32,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        }
+      ],
+      "dispatch_sync": {
+        "stars": {
+          "queue_scope": "die",
+          "queue_depth": 64,
+          "lanes": 1,
+          "issue_interval_us": 0.0,
+          "first_issue_us": 0.0,
+          "release_policy": "descriptor_ready",
+          "evidence_id": "pending_raw_dispatch_trace"
+        },
+        "host_submit_service": "host",
+        "d2h_channel": "d2h",
+        "split_host_service": "host"
+      },
+      "hbm_rw_alpha": 0.0,
+      "hbm_read_bytes_per_s": 1200000000000.0,
+      "hbm_write_bytes_per_s": 1200000000000.0,
+      "memory_access": {
+        "sector_bytes": 32,
+        "burst_turn_penalty": []
       }
     },
     "architecture": "A3",
@@ -5930,7 +8013,65 @@
         "alpha_us": 0.8,
         "transport_mode": "sio_die_to_die",
         "channel_semantics": "direct",
-        "notes": null
+        "notes": null,
+        "scope": "package",
+        "rail_id": "sio_r0",
+        "protocol_bands": [
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "package",
+            "group_min": 2,
+            "group_max": 2,
+            "expansion_mode": "direct",
+            "payload_min_inclusive": 0,
+            "payload_max_exclusive": 65537,
+            "algorithm": "direct",
+            "protocol": "sio_small",
+            "startup_scope": "hop",
+            "startup_us": 0.8,
+            "payload_bytes_per_frame": 4096,
+            "wire_bytes_per_frame": 4096,
+            "credit_bytes": 65536,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#sio"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "package",
+            "group_min": 2,
+            "group_max": 2,
+            "expansion_mode": "direct",
+            "payload_min_inclusive": 65537,
+            "payload_max_exclusive": 2097152,
+            "algorithm": "halving_doubling",
+            "protocol": "sio_mid",
+            "startup_scope": "hop",
+            "startup_us": 0.8,
+            "payload_bytes_per_frame": 65536,
+            "wire_bytes_per_frame": 65536,
+            "credit_bytes": 524288,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#sio"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "package",
+            "group_min": 2,
+            "group_max": 2,
+            "expansion_mode": "direct",
+            "payload_min_inclusive": 2097152,
+            "payload_max_exclusive": null,
+            "algorithm": "halving_doubling",
+            "protocol": "sio_large",
+            "startup_scope": "hop",
+            "startup_us": 0.8,
+            "payload_bytes_per_frame": 262144,
+            "wire_bytes_per_frame": 262144,
+            "credit_bytes": 2097152,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#sio"
+          }
+        ]
       },
       "d2d_intra_node": {
         "channel": "d2d_intra_node",
@@ -5948,7 +8089,66 @@
         "alpha_us": 2.5,
         "transport_mode": "direct_fabric",
         "channel_semantics": "switched",
-        "notes": null
+        "notes": null,
+        "scope": "node",
+        "rail_id": "hccs_sw_r0",
+        "switch_id": "hccs_sw0",
+        "protocol_bands": [
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": 2,
+            "group_max": 16,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 0,
+            "payload_max_exclusive": 65537,
+            "algorithm": "ring",
+            "protocol": "hccs_sw_small",
+            "startup_scope": "hop",
+            "startup_us": 2.5,
+            "payload_bytes_per_frame": 4096,
+            "wire_bytes_per_frame": 4096,
+            "credit_bytes": 65536,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#hccs_sw"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": 2,
+            "group_max": 16,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 65537,
+            "payload_max_exclusive": 2097152,
+            "algorithm": "ring",
+            "protocol": "hccs_sw_mid",
+            "startup_scope": "hop",
+            "startup_us": 2.5,
+            "payload_bytes_per_frame": 65536,
+            "wire_bytes_per_frame": 65536,
+            "credit_bytes": 524288,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#hccs_sw"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": 2,
+            "group_max": 16,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 2097152,
+            "payload_max_exclusive": null,
+            "algorithm": "ring",
+            "protocol": "hccs_sw_large",
+            "startup_scope": "hop",
+            "startup_us": 2.5,
+            "payload_bytes_per_frame": 262144,
+            "wire_bytes_per_frame": 262144,
+            "credit_bytes": 2097152,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#hccs_sw"
+          }
+        ]
       },
       "d2d_inter_node": {
         "channel": "d2d_inter_node",
@@ -5966,43 +8166,110 @@
         "alpha_us": 5.0,
         "transport_mode": "roce_rdma",
         "channel_semantics": "switched",
-        "notes": null
+        "notes": null,
+        "scope": "cross_node",
+        "rail_id": "roce_r0",
+        "switch_id": "tor_sw0",
+        "protocol_bands": [
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": 2,
+            "group_max": 8192,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 0,
+            "payload_max_exclusive": 65537,
+            "algorithm": "ring",
+            "protocol": "roce_small",
+            "startup_scope": "hop",
+            "startup_us": 5.0,
+            "payload_bytes_per_frame": 4096,
+            "wire_bytes_per_frame": 4096,
+            "credit_bytes": 65536,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#roce"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": 2,
+            "group_max": 8192,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 65537,
+            "payload_max_exclusive": 2097152,
+            "algorithm": "ring",
+            "protocol": "roce_mid",
+            "startup_scope": "hop",
+            "startup_us": 5.0,
+            "payload_bytes_per_frame": 65536,
+            "wire_bytes_per_frame": 65536,
+            "credit_bytes": 524288,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#roce"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": 2,
+            "group_max": 8192,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 2097152,
+            "payload_max_exclusive": null,
+            "algorithm": "ring",
+            "protocol": "roce_large",
+            "startup_scope": "hop",
+            "startup_us": 5.0,
+            "payload_bytes_per_frame": 262144,
+            "wire_bytes_per_frame": 262144,
+            "credit_bytes": 2097152,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#roce"
+          }
+        ]
       },
       "h2d": {
         "channel": "h2d",
-        "protocol": "PCIe",
-        "uni_peak_bw_gbps": 50.0,
-        "bi_peak_bw_gbps": 87.5,
-        "calibrated_uni_bw_gbps": null,
-        "calibrated_bi_bw_gbps": null,
+        "protocol": "HCCS",
+        "uni_peak_bw_gbps": 64.0,
+        "bi_peak_bw_gbps": 53.7,
+        "calibrated_uni_bw_gbps": 58.4,
+        "calibrated_bi_bw_gbps": 53.7,
         "derived_uni_bw_gbps": null,
         "derived_bi_bw_gbps": null,
-        "bandwidth_provenance": "declared_peak",
-        "effective_uni_bw_gbps": 50.0,
-        "effective_bi_bw_gbps": 87.5,
-        "pageable_uni_bw_gbps": 14.0,
-        "alpha_us": 2.0,
-        "transport_mode": "pcie_dma",
+        "bandwidth_provenance": "calibrated",
+        "effective_uni_bw_gbps": 58.4,
+        "effective_bi_bw_gbps": 53.7,
+        "pageable_uni_bw_gbps": 14.3,
+        "alpha_us": 6.11,
+        "transport_mode": "hccs_dma",
         "channel_semantics": "direct",
-        "notes": null
+        "notes": "Kunpeng-Ascend Host-Device HCCS DMA (independent per-Die port, 238.8 GB/s node root-complex ceiling)",
+        "scope": "host",
+        "root_complex_id": "rc0",
+        "node_peak_bw_gbps": 238.8,
+        "solo_effective_uni_bw_gbps": 58.4
       },
       "d2h": {
         "channel": "d2h",
-        "protocol": "PCIe",
-        "uni_peak_bw_gbps": 50.0,
-        "bi_peak_bw_gbps": 87.5,
-        "calibrated_uni_bw_gbps": null,
-        "calibrated_bi_bw_gbps": null,
+        "protocol": "HCCS",
+        "uni_peak_bw_gbps": 48.0,
+        "bi_peak_bw_gbps": 53.7,
+        "calibrated_uni_bw_gbps": 42.7,
+        "calibrated_bi_bw_gbps": 53.7,
         "derived_uni_bw_gbps": null,
         "derived_bi_bw_gbps": null,
-        "bandwidth_provenance": "declared_peak",
-        "effective_uni_bw_gbps": 50.0,
-        "effective_bi_bw_gbps": 87.5,
-        "pageable_uni_bw_gbps": 14.0,
-        "alpha_us": 2.0,
-        "transport_mode": "pcie_dma",
+        "bandwidth_provenance": "calibrated",
+        "effective_uni_bw_gbps": 42.7,
+        "effective_bi_bw_gbps": 53.7,
+        "pageable_uni_bw_gbps": 17.7,
+        "alpha_us": 5.4,
+        "transport_mode": "hccs_dma",
         "channel_semantics": "direct",
-        "notes": null
+        "notes": "Kunpeng-Ascend Host-Device HCCS DMA (independent per-Die port, 160.0 GB/s node root-complex ceiling)",
+        "scope": "host",
+        "root_complex_id": "rc0",
+        "node_peak_bw_gbps": 160.0,
+        "solo_effective_uni_bw_gbps": 42.7
       },
       "rh2d": {
         "channel": "rh2d",
@@ -6020,7 +8287,8 @@
         "alpha_us": 6.5,
         "transport_mode": "auto",
         "channel_semantics": "switched",
-        "notes": "Supports direct_rdma (RNIC->RoCE->NPU) or host_staged (Network->LocalHost->PCIe H2D)"
+        "notes": "Supports direct_rdma (RNIC->RoCE->NPU) or host_staged (Network->LocalHost->PCIe H2D)",
+        "scope": "cross_node"
       },
       "rd2h": {
         "channel": "rd2h",
@@ -6038,7 +8306,8 @@
         "alpha_us": 6.5,
         "transport_mode": "auto",
         "channel_semantics": "switched",
-        "notes": "Supports direct_rdma (NPU->RoCE->RNIC) or host_staged (PCIe D2H->LocalHost->Network)"
+        "notes": "Supports direct_rdma (NPU->RoCE->RNIC) or host_staged (PCIe D2H->LocalHost->Network)",
+        "scope": "cross_node"
       }
     },
     "source": {
@@ -6679,6 +8948,63 @@
           "hierarchical_inter_node_bytes_per_s": 50000000000.0,
           "hierarchical_inter_node_alpha_us": 5.0
         }
+      },
+      "root_complex_id": "rc0",
+      "simt_ub_carveout_bytes": 16384,
+      "subtile_wave": [
+        {
+          "native_mode": "bf16",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 16,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        },
+        {
+          "native_mode": "fp16",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 16,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        },
+        {
+          "native_mode": "fp8",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 32,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        },
+        {
+          "native_mode": "int8",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 32,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        }
+      ],
+      "dispatch_sync": {
+        "stars": {
+          "queue_scope": "die",
+          "queue_depth": 64,
+          "lanes": 1,
+          "issue_interval_us": 0.0,
+          "first_issue_us": 0.0,
+          "release_policy": "descriptor_ready",
+          "evidence_id": "pending_raw_dispatch_trace"
+        },
+        "host_submit_service": "host",
+        "d2h_channel": "d2h",
+        "split_host_service": "host"
+      },
+      "hbm_rw_alpha": 0.0,
+      "hbm_read_bytes_per_s": 4000000000000.0,
+      "hbm_write_bytes_per_s": 4000000000000.0,
+      "memory_access": {
+        "sector_bytes": 32,
+        "burst_turn_penalty": []
       }
     },
     "architecture": "A5",
@@ -6709,7 +9035,8 @@
         "alpha_us": 0.0,
         "transport_mode": "unavailable_single_die",
         "channel_semantics": "none",
-        "notes": null
+        "notes": null,
+        "scope": "package"
       },
       "d2d_intra_node": {
         "channel": "d2d_intra_node",
@@ -6728,7 +9055,65 @@
         "transport_mode": "direct_fabric",
         "channel_semantics": "per_pair",
         "notes": "8-NPU K_8 direct UB mesh: 7 dedicated peer links/NPU; per-rank aggregate active busbw = (W - 1) * 47.5 GB/s (56.0 GB/s raw/pair)",
-        "bw_utilization": 0.8482142857142857
+        "bw_utilization": 0.8482142857142857,
+        "scope": "node",
+        "rail_id": "ub_r0",
+        "protocol_bands": [
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": 2,
+            "group_max": 64,
+            "expansion_mode": "concurrent",
+            "payload_min_inclusive": 0,
+            "payload_max_exclusive": 65537,
+            "algorithm": "ring",
+            "protocol": "ub_mesh_small",
+            "startup_scope": "hop",
+            "startup_us": 12.0,
+            "payload_bytes_per_frame": 4096,
+            "wire_bytes_per_frame": 4096,
+            "credit_bytes": 65536,
+            "evidence_id": "a5-cann93/ub_mesh_k8"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": 2,
+            "group_max": 64,
+            "expansion_mode": "concurrent",
+            "payload_min_inclusive": 65537,
+            "payload_max_exclusive": 2097152,
+            "algorithm": "ring",
+            "protocol": "ub_mesh_mid",
+            "startup_scope": "hop",
+            "startup_us": 12.0,
+            "payload_bytes_per_frame": 65536,
+            "wire_bytes_per_frame": 65536,
+            "credit_bytes": 524288,
+            "evidence_id": "a5-cann93/ub_mesh_k8"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": 2,
+            "group_max": 64,
+            "expansion_mode": "concurrent",
+            "payload_min_inclusive": 2097152,
+            "payload_max_exclusive": null,
+            "algorithm": "ring",
+            "protocol": "ub_mesh_large",
+            "startup_scope": "hop",
+            "startup_us": 12.0,
+            "payload_bytes_per_frame": 262144,
+            "wire_bytes_per_frame": 262144,
+            "credit_bytes": 2097152,
+            "evidence_id": "a5-cann93/ub_mesh_k8"
+          }
+        ]
       },
       "d2d_inter_node": {
         "channel": "d2d_inter_node",
@@ -6746,7 +9131,66 @@
         "alpha_us": 5.0,
         "transport_mode": "roce_rdma",
         "channel_semantics": "switched",
-        "notes": null
+        "notes": null,
+        "scope": "cross_node",
+        "rail_id": "roce_r0",
+        "switch_id": "tor_sw0",
+        "protocol_bands": [
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": 2,
+            "group_max": 8192,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 0,
+            "payload_max_exclusive": 65537,
+            "algorithm": "ring",
+            "protocol": "roce_small",
+            "startup_scope": "hop",
+            "startup_us": 5.0,
+            "payload_bytes_per_frame": 4096,
+            "wire_bytes_per_frame": 4096,
+            "credit_bytes": 65536,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#roce"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": 2,
+            "group_max": 8192,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 65537,
+            "payload_max_exclusive": 2097152,
+            "algorithm": "ring",
+            "protocol": "roce_mid",
+            "startup_scope": "hop",
+            "startup_us": 5.0,
+            "payload_bytes_per_frame": 65536,
+            "wire_bytes_per_frame": 65536,
+            "credit_bytes": 524288,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#roce"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": 2,
+            "group_max": 8192,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 2097152,
+            "payload_max_exclusive": null,
+            "algorithm": "ring",
+            "protocol": "roce_large",
+            "startup_scope": "hop",
+            "startup_us": 5.0,
+            "payload_bytes_per_frame": 262144,
+            "wire_bytes_per_frame": 262144,
+            "credit_bytes": 2097152,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#roce"
+          }
+        ]
       },
       "h2d": {
         "channel": "h2d",
@@ -6764,7 +9208,11 @@
         "alpha_us": 2.0,
         "transport_mode": "pcie_dma",
         "channel_semantics": "direct",
-        "notes": null
+        "notes": null,
+        "scope": "host",
+        "root_complex_id": "rc0",
+        "node_peak_bw_gbps": 400.0,
+        "solo_effective_uni_bw_gbps": 100.01
       },
       "d2h": {
         "channel": "d2h",
@@ -6782,7 +9230,11 @@
         "alpha_us": 2.0,
         "transport_mode": "pcie_dma",
         "channel_semantics": "direct",
-        "notes": null
+        "notes": null,
+        "scope": "host",
+        "root_complex_id": "rc0",
+        "node_peak_bw_gbps": 400.0,
+        "solo_effective_uni_bw_gbps": 100.15
       },
       "rh2d": {
         "channel": "rh2d",
@@ -6800,7 +9252,8 @@
         "alpha_us": 6.5,
         "transport_mode": "auto",
         "channel_semantics": "switched",
-        "notes": "Supports direct_rdma (RNIC->RoCE->NPU) or host_staged (Network->LocalHost->PCIe H2D)"
+        "notes": "Supports direct_rdma (RNIC->RoCE->NPU) or host_staged (Network->LocalHost->PCIe H2D)",
+        "scope": "cross_node"
       },
       "rd2h": {
         "channel": "rd2h",
@@ -6818,7 +9271,8 @@
         "alpha_us": 6.5,
         "transport_mode": "auto",
         "channel_semantics": "switched",
-        "notes": "Supports direct_rdma (NPU->RoCE->RNIC) or host_staged (PCIe D2H->LocalHost->Network)"
+        "notes": "Supports direct_rdma (NPU->RoCE->RNIC) or host_staged (PCIe D2H->LocalHost->Network)",
+        "scope": "cross_node"
       }
     },
     "source": {
@@ -7384,6 +9838,63 @@
           "hierarchical_inter_node_bytes_per_s": 50000000000.0,
           "hierarchical_inter_node_alpha_us": 5.0
         }
+      },
+      "root_complex_id": "rc0",
+      "simt_ub_carveout_bytes": 16384,
+      "subtile_wave": [
+        {
+          "native_mode": "bf16",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 16,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        },
+        {
+          "native_mode": "fp16",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 16,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        },
+        {
+          "native_mode": "fp8",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 32,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        },
+        {
+          "native_mode": "int8",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 32,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        }
+      ],
+      "dispatch_sync": {
+        "stars": {
+          "queue_scope": "die",
+          "queue_depth": 64,
+          "lanes": 1,
+          "issue_interval_us": 0.0,
+          "first_issue_us": 0.0,
+          "release_policy": "descriptor_ready",
+          "evidence_id": "pending_raw_dispatch_trace"
+        },
+        "host_submit_service": "host",
+        "d2h_channel": "d2h",
+        "split_host_service": "host"
+      },
+      "hbm_rw_alpha": 0.0,
+      "hbm_read_bytes_per_s": 4000000000000.0,
+      "hbm_write_bytes_per_s": 4000000000000.0,
+      "memory_access": {
+        "sector_bytes": 32,
+        "burst_turn_penalty": []
       }
     },
     "architecture": "A5",
@@ -7416,7 +9927,8 @@
         "alpha_us": 0.0,
         "transport_mode": "unavailable_single_die",
         "channel_semantics": "none",
-        "notes": null
+        "notes": null,
+        "scope": "package"
       },
       "d2d_intra_node": {
         "channel": "d2d_intra_node",
@@ -7435,7 +9947,65 @@
         "transport_mode": "direct_fabric",
         "channel_semantics": "per_pair",
         "notes": "8-NPU K_8 direct UB mesh: 7 dedicated peer links/NPU; per-rank aggregate active busbw = (W - 1) * 47.5 GB/s (56.0 GB/s raw/pair)",
-        "bw_utilization": 0.8482142857142857
+        "bw_utilization": 0.8482142857142857,
+        "scope": "node",
+        "rail_id": "ub_r0",
+        "protocol_bands": [
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": 2,
+            "group_max": 64,
+            "expansion_mode": "concurrent",
+            "payload_min_inclusive": 0,
+            "payload_max_exclusive": 65537,
+            "algorithm": "ring",
+            "protocol": "ub_mesh_small",
+            "startup_scope": "hop",
+            "startup_us": 12.0,
+            "payload_bytes_per_frame": 4096,
+            "wire_bytes_per_frame": 4096,
+            "credit_bytes": 65536,
+            "evidence_id": "a5-cann93/ub_mesh_k8"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": 2,
+            "group_max": 64,
+            "expansion_mode": "concurrent",
+            "payload_min_inclusive": 65537,
+            "payload_max_exclusive": 2097152,
+            "algorithm": "ring",
+            "protocol": "ub_mesh_mid",
+            "startup_scope": "hop",
+            "startup_us": 12.0,
+            "payload_bytes_per_frame": 65536,
+            "wire_bytes_per_frame": 65536,
+            "credit_bytes": 524288,
+            "evidence_id": "a5-cann93/ub_mesh_k8"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": 2,
+            "group_max": 64,
+            "expansion_mode": "concurrent",
+            "payload_min_inclusive": 2097152,
+            "payload_max_exclusive": null,
+            "algorithm": "ring",
+            "protocol": "ub_mesh_large",
+            "startup_scope": "hop",
+            "startup_us": 12.0,
+            "payload_bytes_per_frame": 262144,
+            "wire_bytes_per_frame": 262144,
+            "credit_bytes": 2097152,
+            "evidence_id": "a5-cann93/ub_mesh_k8"
+          }
+        ]
       },
       "d2d_inter_node": {
         "channel": "d2d_inter_node",
@@ -7453,7 +10023,66 @@
         "alpha_us": 5.0,
         "transport_mode": "roce_rdma",
         "channel_semantics": "switched",
-        "notes": null
+        "notes": null,
+        "scope": "cross_node",
+        "rail_id": "roce_r0",
+        "switch_id": "tor_sw0",
+        "protocol_bands": [
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": 2,
+            "group_max": 8192,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 0,
+            "payload_max_exclusive": 65537,
+            "algorithm": "ring",
+            "protocol": "roce_small",
+            "startup_scope": "hop",
+            "startup_us": 5.0,
+            "payload_bytes_per_frame": 4096,
+            "wire_bytes_per_frame": 4096,
+            "credit_bytes": 65536,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#roce"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": 2,
+            "group_max": 8192,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 65537,
+            "payload_max_exclusive": 2097152,
+            "algorithm": "ring",
+            "protocol": "roce_mid",
+            "startup_scope": "hop",
+            "startup_us": 5.0,
+            "payload_bytes_per_frame": 65536,
+            "wire_bytes_per_frame": 65536,
+            "credit_bytes": 524288,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#roce"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": 2,
+            "group_max": 8192,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 2097152,
+            "payload_max_exclusive": null,
+            "algorithm": "ring",
+            "protocol": "roce_large",
+            "startup_scope": "hop",
+            "startup_us": 5.0,
+            "payload_bytes_per_frame": 262144,
+            "wire_bytes_per_frame": 262144,
+            "credit_bytes": 2097152,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#roce"
+          }
+        ]
       },
       "h2d": {
         "channel": "h2d",
@@ -7471,7 +10100,11 @@
         "alpha_us": 20.6,
         "transport_mode": "pcie_dma",
         "channel_semantics": "direct",
-        "notes": "Calibrated on Ascend950DT_9582 (A5): pinned aclrtMemcpyAsync 100.01 GB/s (marginal 102.5 GB/s, floor 23.4 us); memfabric_hybrid 1.3.0 GVA sparse_copy H2D marginal 95.1 GB/s (floor 20.6 us), kv_exchange 2-AIV H2D marginal 87.9 GB/s (floor 20.5 us)"
+        "notes": "Calibrated on Ascend950DT_9582 (A5): pinned aclrtMemcpyAsync 100.01 GB/s (marginal 102.5 GB/s, floor 23.4 us); memfabric_hybrid 1.3.0 GVA sparse_copy H2D marginal 95.1 GB/s (floor 20.6 us), kv_exchange 2-AIV H2D marginal 87.9 GB/s (floor 20.5 us)",
+        "scope": "host",
+        "root_complex_id": "rc0",
+        "node_peak_bw_gbps": 400.0,
+        "solo_effective_uni_bw_gbps": 100.01
       },
       "d2h": {
         "channel": "d2h",
@@ -7489,7 +10122,11 @@
         "alpha_us": 20.8,
         "transport_mode": "pcie_dma",
         "channel_semantics": "direct",
-        "notes": "Calibrated on Ascend950DT_9582 (A5): pinned aclrtMemcpyAsync 100.15 GB/s (marginal 102.5 GB/s, floor 22.9 us); memfabric_hybrid 1.3.0 GVA sparse_copy D2H marginal 108.9 GB/s (floor 20.8 us), kv_exchange 2-AIV D2H marginal 99.6 GB/s (floor 20.5 us)"
+        "notes": "Calibrated on Ascend950DT_9582 (A5): pinned aclrtMemcpyAsync 100.15 GB/s (marginal 102.5 GB/s, floor 22.9 us); memfabric_hybrid 1.3.0 GVA sparse_copy D2H marginal 108.9 GB/s (floor 20.8 us), kv_exchange 2-AIV D2H marginal 99.6 GB/s (floor 20.5 us)",
+        "scope": "host",
+        "root_complex_id": "rc0",
+        "node_peak_bw_gbps": 400.0,
+        "solo_effective_uni_bw_gbps": 100.15
       },
       "rh2d": {
         "channel": "rh2d",
@@ -7507,7 +10144,8 @@
         "alpha_us": 6.5,
         "transport_mode": "auto",
         "channel_semantics": "switched",
-        "notes": "Supports direct_rdma (RNIC->RoCE->NPU) or host_staged (Network->LocalHost->PCIe H2D)"
+        "notes": "Supports direct_rdma (RNIC->RoCE->NPU) or host_staged (Network->LocalHost->PCIe H2D)",
+        "scope": "cross_node"
       },
       "rd2h": {
         "channel": "rd2h",
@@ -7525,7 +10163,8 @@
         "alpha_us": 6.5,
         "transport_mode": "auto",
         "channel_semantics": "switched",
-        "notes": "Supports direct_rdma (NPU->RoCE->RNIC) or host_staged (PCIe D2H->LocalHost->Network)"
+        "notes": "Supports direct_rdma (NPU->RoCE->RNIC) or host_staged (PCIe D2H->LocalHost->Network)",
+        "scope": "cross_node"
       }
     },
     "source": {
@@ -8090,6 +10729,63 @@
           "hierarchical_inter_node_bytes_per_s": 50000000000.0,
           "hierarchical_inter_node_alpha_us": 5.0
         }
+      },
+      "root_complex_id": "rc0",
+      "simt_ub_carveout_bytes": 16384,
+      "subtile_wave": [
+        {
+          "native_mode": "bf16",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 16,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        },
+        {
+          "native_mode": "fp16",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 16,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        },
+        {
+          "native_mode": "fp8",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 32,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        },
+        {
+          "native_mode": "int8",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 32,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        }
+      ],
+      "dispatch_sync": {
+        "stars": {
+          "queue_scope": "die",
+          "queue_depth": 64,
+          "lanes": 1,
+          "issue_interval_us": 0.0,
+          "first_issue_us": 0.0,
+          "release_policy": "descriptor_ready",
+          "evidence_id": "pending_raw_dispatch_trace"
+        },
+        "host_submit_service": "host",
+        "d2h_channel": "d2h",
+        "split_host_service": "host"
+      },
+      "hbm_rw_alpha": 0.0,
+      "hbm_read_bytes_per_s": 1600000000000.0,
+      "hbm_write_bytes_per_s": 1600000000000.0,
+      "memory_access": {
+        "sector_bytes": 32,
+        "burst_turn_penalty": []
       }
     },
     "architecture": "A5",
@@ -8120,7 +10816,8 @@
         "alpha_us": 0.0,
         "transport_mode": "unavailable_single_die",
         "channel_semantics": "none",
-        "notes": null
+        "notes": null,
+        "scope": "package"
       },
       "d2d_intra_node": {
         "channel": "d2d_intra_node",
@@ -8139,7 +10836,65 @@
         "transport_mode": "direct_fabric",
         "channel_semantics": "per_pair",
         "notes": "8-NPU K_8 direct UB mesh: 7 dedicated peer links/NPU; per-rank aggregate active busbw = (W - 1) * 47.5 GB/s (56.0 GB/s raw/pair)",
-        "bw_utilization": 0.8482142857142857
+        "bw_utilization": 0.8482142857142857,
+        "scope": "node",
+        "rail_id": "ub_r0",
+        "protocol_bands": [
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": 2,
+            "group_max": 64,
+            "expansion_mode": "concurrent",
+            "payload_min_inclusive": 0,
+            "payload_max_exclusive": 65537,
+            "algorithm": "ring",
+            "protocol": "ub_mesh_small",
+            "startup_scope": "hop",
+            "startup_us": 12.0,
+            "payload_bytes_per_frame": 4096,
+            "wire_bytes_per_frame": 4096,
+            "credit_bytes": 65536,
+            "evidence_id": "a5-cann93/ub_mesh_k8"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": 2,
+            "group_max": 64,
+            "expansion_mode": "concurrent",
+            "payload_min_inclusive": 65537,
+            "payload_max_exclusive": 2097152,
+            "algorithm": "ring",
+            "protocol": "ub_mesh_mid",
+            "startup_scope": "hop",
+            "startup_us": 12.0,
+            "payload_bytes_per_frame": 65536,
+            "wire_bytes_per_frame": 65536,
+            "credit_bytes": 524288,
+            "evidence_id": "a5-cann93/ub_mesh_k8"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": 2,
+            "group_max": 64,
+            "expansion_mode": "concurrent",
+            "payload_min_inclusive": 2097152,
+            "payload_max_exclusive": null,
+            "algorithm": "ring",
+            "protocol": "ub_mesh_large",
+            "startup_scope": "hop",
+            "startup_us": 12.0,
+            "payload_bytes_per_frame": 262144,
+            "wire_bytes_per_frame": 262144,
+            "credit_bytes": 2097152,
+            "evidence_id": "a5-cann93/ub_mesh_k8"
+          }
+        ]
       },
       "d2d_inter_node": {
         "channel": "d2d_inter_node",
@@ -8157,7 +10912,66 @@
         "alpha_us": 5.0,
         "transport_mode": "roce_rdma",
         "channel_semantics": "switched",
-        "notes": null
+        "notes": null,
+        "scope": "cross_node",
+        "rail_id": "roce_r0",
+        "switch_id": "tor_sw0",
+        "protocol_bands": [
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": 2,
+            "group_max": 8192,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 0,
+            "payload_max_exclusive": 65537,
+            "algorithm": "ring",
+            "protocol": "roce_small",
+            "startup_scope": "hop",
+            "startup_us": 5.0,
+            "payload_bytes_per_frame": 4096,
+            "wire_bytes_per_frame": 4096,
+            "credit_bytes": 65536,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#roce"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": 2,
+            "group_max": 8192,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 65537,
+            "payload_max_exclusive": 2097152,
+            "algorithm": "ring",
+            "protocol": "roce_mid",
+            "startup_scope": "hop",
+            "startup_us": 5.0,
+            "payload_bytes_per_frame": 65536,
+            "wire_bytes_per_frame": 65536,
+            "credit_bytes": 524288,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#roce"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": 2,
+            "group_max": 8192,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 2097152,
+            "payload_max_exclusive": null,
+            "algorithm": "ring",
+            "protocol": "roce_large",
+            "startup_scope": "hop",
+            "startup_us": 5.0,
+            "payload_bytes_per_frame": 262144,
+            "wire_bytes_per_frame": 262144,
+            "credit_bytes": 2097152,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#roce"
+          }
+        ]
       },
       "h2d": {
         "channel": "h2d",
@@ -8175,7 +10989,11 @@
         "alpha_us": 2.0,
         "transport_mode": "pcie_dma",
         "channel_semantics": "direct",
-        "notes": null
+        "notes": null,
+        "scope": "host",
+        "root_complex_id": "rc0",
+        "node_peak_bw_gbps": 400.0,
+        "solo_effective_uni_bw_gbps": 100.01
       },
       "d2h": {
         "channel": "d2h",
@@ -8193,7 +11011,11 @@
         "alpha_us": 2.0,
         "transport_mode": "pcie_dma",
         "channel_semantics": "direct",
-        "notes": null
+        "notes": null,
+        "scope": "host",
+        "root_complex_id": "rc0",
+        "node_peak_bw_gbps": 400.0,
+        "solo_effective_uni_bw_gbps": 100.15
       },
       "rh2d": {
         "channel": "rh2d",
@@ -8211,7 +11033,8 @@
         "alpha_us": 6.5,
         "transport_mode": "auto",
         "channel_semantics": "switched",
-        "notes": "Supports direct_rdma (RNIC->RoCE->NPU) or host_staged (Network->LocalHost->PCIe H2D)"
+        "notes": "Supports direct_rdma (RNIC->RoCE->NPU) or host_staged (Network->LocalHost->PCIe H2D)",
+        "scope": "cross_node"
       },
       "rd2h": {
         "channel": "rd2h",
@@ -8229,7 +11052,8 @@
         "alpha_us": 6.5,
         "transport_mode": "auto",
         "channel_semantics": "switched",
-        "notes": "Supports direct_rdma (NPU->RoCE->RNIC) or host_staged (PCIe D2H->LocalHost->Network)"
+        "notes": "Supports direct_rdma (NPU->RoCE->RNIC) or host_staged (PCIe D2H->LocalHost->Network)",
+        "scope": "cross_node"
       }
     },
     "source": {
@@ -8795,6 +11619,63 @@
           "hierarchical_inter_node_bytes_per_s": 50000000000.0,
           "hierarchical_inter_node_alpha_us": 5.0
         }
+      },
+      "root_complex_id": "rc0",
+      "simt_ub_carveout_bytes": 16384,
+      "subtile_wave": [
+        {
+          "native_mode": "bf16",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 16,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        },
+        {
+          "native_mode": "fp16",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 16,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        },
+        {
+          "native_mode": "fp8",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 32,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        },
+        {
+          "native_mode": "int8",
+          "tile_m": 16,
+          "tile_n": 16,
+          "tile_k": 32,
+          "independently_issuable_m": 16,
+          "owner_groups": 1
+        }
+      ],
+      "dispatch_sync": {
+        "stars": {
+          "queue_scope": "die",
+          "queue_depth": 64,
+          "lanes": 1,
+          "issue_interval_us": 0.0,
+          "first_issue_us": 0.0,
+          "release_policy": "descriptor_ready",
+          "evidence_id": "pending_raw_dispatch_trace"
+        },
+        "host_submit_service": "host",
+        "d2h_channel": "d2h",
+        "split_host_service": "host"
+      },
+      "hbm_rw_alpha": 0.0,
+      "hbm_read_bytes_per_s": 1400000000000.0,
+      "hbm_write_bytes_per_s": 1400000000000.0,
+      "memory_access": {
+        "sector_bytes": 32,
+        "burst_turn_penalty": []
       }
     },
     "architecture": "A5",
@@ -8827,7 +11708,8 @@
         "alpha_us": 0.0,
         "transport_mode": "unavailable_single_die",
         "channel_semantics": "none",
-        "notes": null
+        "notes": null,
+        "scope": "package"
       },
       "d2d_intra_node": {
         "channel": "d2d_intra_node",
@@ -8846,7 +11728,65 @@
         "transport_mode": "direct_fabric",
         "channel_semantics": "per_pair",
         "notes": "8-NPU K_8 direct UB mesh: 7 dedicated peer links/NPU; per-rank aggregate active busbw = (W - 1) * 47.5 GB/s (56.0 GB/s raw/pair)",
-        "bw_utilization": 0.8482142857142857
+        "bw_utilization": 0.8482142857142857,
+        "scope": "node",
+        "rail_id": "ub_r0",
+        "protocol_bands": [
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": 2,
+            "group_max": 64,
+            "expansion_mode": "concurrent",
+            "payload_min_inclusive": 0,
+            "payload_max_exclusive": 65537,
+            "algorithm": "ring",
+            "protocol": "ub_mesh_small",
+            "startup_scope": "hop",
+            "startup_us": 12.0,
+            "payload_bytes_per_frame": 4096,
+            "wire_bytes_per_frame": 4096,
+            "credit_bytes": 65536,
+            "evidence_id": "a5-cann93/ub_mesh_k8"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": 2,
+            "group_max": 64,
+            "expansion_mode": "concurrent",
+            "payload_min_inclusive": 65537,
+            "payload_max_exclusive": 2097152,
+            "algorithm": "ring",
+            "protocol": "ub_mesh_mid",
+            "startup_scope": "hop",
+            "startup_us": 12.0,
+            "payload_bytes_per_frame": 65536,
+            "wire_bytes_per_frame": 65536,
+            "credit_bytes": 524288,
+            "evidence_id": "a5-cann93/ub_mesh_k8"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "node",
+            "group_min": 2,
+            "group_max": 64,
+            "expansion_mode": "concurrent",
+            "payload_min_inclusive": 2097152,
+            "payload_max_exclusive": null,
+            "algorithm": "ring",
+            "protocol": "ub_mesh_large",
+            "startup_scope": "hop",
+            "startup_us": 12.0,
+            "payload_bytes_per_frame": 262144,
+            "wire_bytes_per_frame": 262144,
+            "credit_bytes": 2097152,
+            "evidence_id": "a5-cann93/ub_mesh_k8"
+          }
+        ]
       },
       "d2d_inter_node": {
         "channel": "d2d_inter_node",
@@ -8864,7 +11804,66 @@
         "alpha_us": 5.0,
         "transport_mode": "roce_rdma",
         "channel_semantics": "switched",
-        "notes": null
+        "notes": null,
+        "scope": "cross_node",
+        "rail_id": "roce_r0",
+        "switch_id": "tor_sw0",
+        "protocol_bands": [
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": 2,
+            "group_max": 8192,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 0,
+            "payload_max_exclusive": 65537,
+            "algorithm": "ring",
+            "protocol": "roce_small",
+            "startup_scope": "hop",
+            "startup_us": 5.0,
+            "payload_bytes_per_frame": 4096,
+            "wire_bytes_per_frame": 4096,
+            "credit_bytes": 65536,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#roce"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": 2,
+            "group_max": 8192,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 65537,
+            "payload_max_exclusive": 2097152,
+            "algorithm": "ring",
+            "protocol": "roce_mid",
+            "startup_scope": "hop",
+            "startup_us": 5.0,
+            "payload_bytes_per_frame": 65536,
+            "wire_bytes_per_frame": 65536,
+            "credit_bytes": 524288,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#roce"
+          },
+          {
+            "collective": "all",
+            "stack_id": "default",
+            "topology_scope": "cross_node",
+            "group_min": 2,
+            "group_max": 8192,
+            "expansion_mode": "ring",
+            "payload_min_inclusive": 2097152,
+            "payload_max_exclusive": null,
+            "algorithm": "ring",
+            "protocol": "roce_large",
+            "startup_scope": "hop",
+            "startup_us": 5.0,
+            "payload_bytes_per_frame": 262144,
+            "wire_bytes_per_frame": 262144,
+            "credit_bytes": 2097152,
+            "evidence_id": "campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json#roce"
+          }
+        ]
       },
       "h2d": {
         "channel": "h2d",
@@ -8882,7 +11881,11 @@
         "alpha_us": 20.6,
         "transport_mode": "pcie_dma",
         "channel_semantics": "direct",
-        "notes": "Calibrated on Ascend950DT_9582 (A5): pinned aclrtMemcpyAsync 100.01 GB/s (marginal 102.5 GB/s, floor 23.4 us); memfabric_hybrid 1.3.0 GVA sparse_copy H2D marginal 95.1 GB/s (floor 20.6 us), kv_exchange 2-AIV H2D marginal 87.9 GB/s (floor 20.5 us)"
+        "notes": "Calibrated on Ascend950DT_9582 (A5): pinned aclrtMemcpyAsync 100.01 GB/s (marginal 102.5 GB/s, floor 23.4 us); memfabric_hybrid 1.3.0 GVA sparse_copy H2D marginal 95.1 GB/s (floor 20.6 us), kv_exchange 2-AIV H2D marginal 87.9 GB/s (floor 20.5 us)",
+        "scope": "host",
+        "root_complex_id": "rc0",
+        "node_peak_bw_gbps": 400.0,
+        "solo_effective_uni_bw_gbps": 100.01
       },
       "d2h": {
         "channel": "d2h",
@@ -8900,7 +11903,11 @@
         "alpha_us": 20.8,
         "transport_mode": "pcie_dma",
         "channel_semantics": "direct",
-        "notes": "Calibrated on Ascend950DT_9582 (A5): pinned aclrtMemcpyAsync 100.15 GB/s (marginal 102.5 GB/s, floor 22.9 us); memfabric_hybrid 1.3.0 GVA sparse_copy D2H marginal 108.9 GB/s (floor 20.8 us), kv_exchange 2-AIV D2H marginal 99.6 GB/s (floor 20.5 us)"
+        "notes": "Calibrated on Ascend950DT_9582 (A5): pinned aclrtMemcpyAsync 100.15 GB/s (marginal 102.5 GB/s, floor 22.9 us); memfabric_hybrid 1.3.0 GVA sparse_copy D2H marginal 108.9 GB/s (floor 20.8 us), kv_exchange 2-AIV D2H marginal 99.6 GB/s (floor 20.5 us)",
+        "scope": "host",
+        "root_complex_id": "rc0",
+        "node_peak_bw_gbps": 400.0,
+        "solo_effective_uni_bw_gbps": 100.15
       },
       "rh2d": {
         "channel": "rh2d",
@@ -8918,7 +11925,8 @@
         "alpha_us": 6.5,
         "transport_mode": "auto",
         "channel_semantics": "switched",
-        "notes": "Supports direct_rdma (RNIC->RoCE->NPU) or host_staged (Network->LocalHost->PCIe H2D)"
+        "notes": "Supports direct_rdma (RNIC->RoCE->NPU) or host_staged (Network->LocalHost->PCIe H2D)",
+        "scope": "cross_node"
       },
       "rd2h": {
         "channel": "rd2h",
@@ -8936,7 +11944,8 @@
         "alpha_us": 6.5,
         "transport_mode": "auto",
         "channel_semantics": "switched",
-        "notes": "Supports direct_rdma (NPU->RoCE->RNIC) or host_staged (PCIe D2H->LocalHost->Network)"
+        "notes": "Supports direct_rdma (NPU->RoCE->RNIC) or host_staged (PCIe D2H->LocalHost->Network)",
+        "scope": "cross_node"
       }
     },
     "source": {

@@ -46,8 +46,8 @@ _A5_REEXPORTS = frozenset({
 
 def __getattr__(name: str):
     if name in _A5_REEXPORTS:
-        from . import a5_comm_calibration as _a5
-        return getattr(_a5, name)
+        from . import communication as _comm
+        return getattr(_comm, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 PROFILER_SUPPLY_SCHEMA = "mindie-profiler-measured-supply/1"
@@ -910,7 +910,7 @@ def bind_a5_local_service(record, *, domain, op=None, resource_role=None,
     authority.  This wrapper only turns the already-normalized service and its
     measured domain into the fields T04/T09/PW-FAMILIES/T15 consume.
     """
-    from mindie_sim.observations.a5_comm_calibration import (
+    from mindie_sim.observations.communication import (
         a5_local_service_applicability_key, a5_local_service_lineage_key,
         require_a5_local_service_applicability,
         require_a5_local_service_domain,

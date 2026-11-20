@@ -12,10 +12,9 @@ import pytest
 
 from pathlib import Path
 
-from mindie_sim.observations.a5_comm_calibration import (
-    fit_a5_native_local_service,
+from mindie_sim.observations.communication import (
+    A5_NATIVE_GROUP2, fit_a5_native_local_service,
 )
-from mindie_sim.observations.a5_comm_golden import A5_NATIVE_GROUP2
 from mindie_sim.compose import compose_case
 from mindie_sim.observations.calibration import (
     apply_profiler_supply, apply_resource_profile, bind_a5_local_service,
