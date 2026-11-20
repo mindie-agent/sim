@@ -63,8 +63,6 @@ _CP_CONTEXT_FAMILIES = {
 CP_UNMODELED_SCHEDULES = ("compact_kv_gather",)
 DEFAULT_CP_INTERLEAVE = 128
 _FP32_BYTES = 4.0
-ZERO = 0
-ONE = 1
 
 
 def strategy_for_plan(plan: str) -> str:
@@ -190,9 +188,9 @@ def split_causal_pairs(
     elif noncausal:
         rows = context + q_len
         win = int(window)
-        lo = max(ZERO, rows - win) if win > ZERO else ZERO
-        visible = max(ZERO, rows - lo)
-        per = tuple(float(q_len * owned_positions(lo, rows - ONE, cp, interleave, r))
+        lo = max(0, rows - win) if win > 0 else 0
+        visible = max(0, rows - lo)
+        per = tuple(float(q_len * owned_positions(lo, rows - 1, cp, interleave, r))
                     for r in range(cp))
         total = float(q_len * visible)
     elif int(window) <= 0:
@@ -217,7 +215,7 @@ def _pair_total(
     if noncausal:
         rows = context + q_len
         win = int(window)
-        visible = min(rows, win) if win > ZERO else rows
+        visible = min(rows, win) if win > 0 else rows
         return float(q_len * visible)
     if window <= 0:
         return float(q_len * context + q_len * (q_len + 1) // 2)
@@ -502,28 +500,27 @@ def cp_plan_kind(parallel: ParallelSpec) -> str:
 
 
 def validate_cp_geometry(parallel: ParallelSpec) -> None:
-    """Structural CP guards: DCP subdivides the TP group, it never exceeds it."""
+    """Structural CP guards across TP (when PCP=1) or TPxPCP (when PCP>1)."""
     cp = int(getattr(parallel, "cp", 1) or 1)
     if cp <= 1:
         return
     tp = int(parallel.tp)
-    if tp <= 1:
-        raise ModelingError("cp_requires_tp_group")
-    if cp > tp:
-        raise ModelingError(f"cp_exceeds_tp:{cp}>{tp}")
-    if tp % cp != 0:
-        raise ModelingError(f"tp_not_divisible_by_cp:{tp}%{cp}")
+    pcp = int(getattr(parallel, "pcp", 1) or 1)
+    if pcp <= 1:
+        if tp <= 1:
+            raise ModelingError("cp_requires_tp_group")
+        if cp > tp:
+            raise ModelingError(f"cp_exceeds_tp:{cp}>{tp}")
+        if tp % cp != 0:
+            raise ModelingError(f"tp_not_divisible_by_cp:{tp}%{cp}")
+        return
+    if cp not in {pcp, tp * pcp}:
+        raise ModelingError(f"dcp_pcp_domain_invalid:dcp={cp},pcp={pcp},tp={tp}")
 
 
 def validate_pcp_geometry(parallel: ParallelSpec) -> None:
-    """PCP adds a rank axis and owns a prefill-only schedule.
-
-    CP reuses the TP group, so ``cp > 1`` is allowed beside PCP when
-    ``tp % cp == 0``. PP and DP compose through placement. Recurrent PCP
-    carries its own inter-chunk state transfer.
-    """
-    pcp = int(getattr(parallel, "pcp", 1) or 1)
-    if pcp <= 1:
+    """PCP adds a rank axis and owns a prefill-only schedule."""
+    if int(getattr(parallel, "pcp", 1) or 1) <= 1:
         return
     if int(getattr(parallel, "cp", 1) or 1) > 1:
         validate_cp_geometry(parallel)
@@ -556,14 +553,15 @@ def verify_cp_model(model: ModelSpec, parallel: ParallelSpec) -> None:
     cp = int(getattr(parallel, "cp", 1) or 1)
     if cp <= 1:
         return
+    pcp = int(getattr(parallel, "pcp", 1) or 1)
     kinds = _attention_families(model)
     if not kinds & _CP_CONTEXT_FAMILIES:
         raise ModelingError(f"cp_requires_context_attention:{'+'.join(sorted(kinds))}")
     for plan in getattr(model, "layer_plans", ()) or ():
         if plan.attention == "gqa":
-            _verify_gqa_kv_domain(int(plan.num_kv_heads), int(parallel.tp), cp)
+            _verify_gqa_kv_domain(int(plan.num_kv_heads), int(parallel.tp), cp, pcp=pcp)
     if not getattr(model, "layer_plans", ()) and model.attention == "gqa":
-        _verify_gqa_kv_domain(int(model.num_kv_heads), int(parallel.tp), cp)
+        _verify_gqa_kv_domain(int(model.num_kv_heads), int(parallel.tp), cp, pcp=pcp)
 
 
 def _attention_kinds(model: ModelSpec) -> set[str]:
@@ -604,15 +602,20 @@ def _attention_families(model: ModelSpec) -> set[str]:
     return {_cp_attention_family(model)}
 
 
-def _verify_gqa_kv_domain(num_kv_heads: int, tp: int, cp: int) -> None:
-    # DCP for GQA requires (tp // num_kv_heads) >= cp and an integral divisor;
-    # a rank below the KV-head count replicates heads and cannot own a context
-    # shard (vLLM: ``tp // num_kv_heads % dcp == 0``).
-    domain = tp // max(1, num_kv_heads)
+def _verify_gqa_kv_domain(
+    num_kv_heads: int, tp: int, cp: int, *, pcp: int = 1,
+) -> None:
+    if pcp > 1 and cp > 1 and cp != pcp:
+        raise ModelingError(f"gqa_pcp_dcp_requires_equal_degrees:pcp={pcp},dcp={cp}")
+    kv_heads = max(1, num_kv_heads)
+    if pcp <= 1:
+        domain = tp // kv_heads
+    elif tp >= kv_heads:
+        domain = (tp // kv_heads) * pcp
+    else:
+        domain = pcp if kv_heads % max(1, tp) == 0 else 0
     if domain < cp or cp <= 0 or domain % cp != 0:
-        raise ModelingError(
-            f"cp_exceeds_gqa_decode_domain:cp={cp},tp//kv_heads={domain}"
-        )
+        raise ModelingError(f"cp_exceeds_gqa_decode_domain:cp={cp},tp//kv_heads={domain}")
 
 
 def verify_pcp_model(model: ModelSpec, parallel: ParallelSpec) -> None:

@@ -50,7 +50,7 @@ from mindie_sim.structure import export_structure
 from test_prediction_system import case
 
 ROOT = Path(__file__).parents[1]
-EXPECTED_CATALOG_COUNT = 37
+EXPECTED_CATALOG_COUNT = 39
 
 
 def test_catalog_key_config_alias_inventory_is_preserved():

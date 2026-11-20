@@ -7,9 +7,8 @@
 [Side-Effect Policy] Returns immutable format metadata only.
 """
 from dataclasses import dataclass
-from fractions import Fraction
-from math import ceil
 
+from mindie_sim.catalog.cache_pools import _ceil_div, exact_element_bytes
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 
 
@@ -63,17 +62,25 @@ class CacheFormat:
             raise ModelingError("cache_packed_elements_requires_byte_container")
 
     def row_bytes(self, width):
-        quantized = width - self.suffix_elements
+        quantized = int(width) - int(self.suffix_elements)
         if quantized < 0:
             raise ModelingError("cache_suffix_exceeds_row_width")
-        # One ceiling for the whole payload. Ceiling per element would turn an
-        # odd sub-byte row into a fractional byte and lose packed-row padding.
-        payload = ceil(Fraction(quantized) * Fraction(payload_bytes(self.dtype))
-                       / self.packed_elements)
-        suffix = self.suffix_elements * dtype_bytes(self.suffix_dtype)
-        scales = (ceil(quantized / self.group_size) * dtype_bytes(self.scale_dtype)
-                  if self.group_size else 0)
-        return int(payload + suffix + scales)
+        # Pure integer ceilings for packed payload, MX group exponents, suffix,
+        # and explicit scale planes (zero float precision loss at 2**53 + 1).
+        payload = (
+            _ceil_div(quantized, self.packed_elements)
+            if self.packed_elements > 1
+            else exact_element_bytes(quantized, self.dtype)
+        )
+        suffix = (
+            exact_element_bytes(self.suffix_elements, self.suffix_dtype)
+            if self.suffix_elements else 0
+        )
+        scales = (
+            exact_element_bytes(_ceil_div(quantized, self.group_size), self.scale_dtype)
+            if self.group_size else 0
+        )
+        return payload + suffix + scales
 
     def stored_bytes(self, width, rows=1):
         """Exact bytes of ``rows`` complete rows, including suffix and scales."""

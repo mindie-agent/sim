@@ -1,4 +1,4 @@
-"""Independent 37-model catalog conservation against constructor-shape oracles.
+"""Independent 39-model catalog conservation against constructor-shape oracles.
 
 [Role]
   Consume the declared reference manifest, rebuild every parameter shape and KV
@@ -45,9 +45,9 @@ MODELS = (
     "deepseek-v3", "deepseek-r1", "deepseek-v3.2", "glm-5.3",
     "glm-5.3-flash", "glm-5.1", "glm-5.2", "kimi-k3", "kimi-k3.1",
     "kimi-k3-dspark", "kimi-k3-dspark-block5", "kimi-k2", "kimi-k2-thinking",
-    "kimi-k2.5", "qwen3-30b-a3b", "qwen3-32b", "qwen3-235b-a22b",
+    "kimi-k2.5", "kimi-k2.6", "qwen3-30b-a3b", "qwen3-32b", "qwen3-235b-a22b",
     "qwen3-next-80b-a3b", "qwen3.5-27b", "qwen3.5-35b-a3b",
-    "qwen3.5-397b-a17b", "qwen3.6-27b", "qwen3.8-2.4t-a95b", "qwen3.8-27b",
+    "qwen3.5-122b-a10b", "qwen3.5-397b-a17b", "qwen3.6-27b", "qwen3.8-2.4t-a95b", "qwen3.8-27b",
     "minimax-m3", "minimax-m3.1-flash", "gemma-4-26b-a4b", "gemma-4-31b",
     "qwen3.6-35b-a3b", "qwen3.8-flash-next", "step-5-preview",
 )
@@ -106,7 +106,7 @@ def _sim_auxiliary(model) -> dict:
 
 def test_manifest_covers_exact_catalog_set():
     models = manifest_models(_manifest())
-    assert len(models) == len(MODELS) == 37
+    assert len(models) == len(MODELS) == 39
     assert set(models) == set(MODELS)
     for key, entry in models.items():
         assert entry["parameter_scope"] == "text_backbone"
@@ -120,7 +120,7 @@ def test_manifest_covers_exact_catalog_set():
 
 def test_manifest_spans_both_catalog_config_directories():
     paths = [entry["config"] for entry in manifest_models(_manifest()).values()]
-    assert sum(path.startswith("mindie_sim/model_configs/") for path in paths) == 30
+    assert sum(path.startswith("mindie_sim/model_configs/") for path in paths) == 32
     assert sum(path.startswith("mindie_sim/catalog/configs/") for path in paths) == 7
 
 
