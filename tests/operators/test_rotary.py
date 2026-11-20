@@ -31,6 +31,8 @@ from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.stack_registry import LoweringRequest, RankOps
 
+pytestmark = pytest.mark.tier0
+
 SKU_ARCH_CASES = (
     ("a2", "Ascend910B2", "npu_arch_2201"),
     ("a3", "Ascend910_9382", "npu_arch_2201"),

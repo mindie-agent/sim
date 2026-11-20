@@ -12,7 +12,7 @@ from mindie_sim.catalog.cache_ownership import (
 )
 from mindie_sim.schema.case import Software
 from mindie_sim.schema.parallel import ParallelSpec
-from issue34_helpers import dense_case, dense_model, linear_model, view
+from _support.builders import dense_case, dense_model, linear_model, view
 
 
 def shared_case(*, dp=1):

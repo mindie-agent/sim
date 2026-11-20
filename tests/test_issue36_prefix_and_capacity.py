@@ -28,7 +28,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from issue34_helpers import (
+from _support.builders import (
     dense_case, dense_layer, dense_model, linear_layer, linear_model, view,
 )
 from mindie_sim.catalog.cache import layer_cache_components

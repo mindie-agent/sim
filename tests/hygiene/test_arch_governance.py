@@ -14,7 +14,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 import scripts.check_arch_governance as arch_gov
+
+pytestmark = pytest.mark.tier0
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 

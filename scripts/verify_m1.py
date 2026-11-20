@@ -201,7 +201,7 @@ def _oracle_modules():
     tests_dir = SIM_ROOT / "tests"
     if str(tests_dir) not in sys.path:
         sys.path.insert(0, str(tests_dir))
-    from reference import cache_meta_oracle, catalog_meta_oracle
+    from _oracles import cache_meta_oracle, catalog_meta_oracle
     return catalog_meta_oracle, cache_meta_oracle
 
 

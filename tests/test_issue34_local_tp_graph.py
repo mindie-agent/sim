@@ -8,7 +8,7 @@ from mindie_sim.prediction.local_projection_tp import lower_local_projection_tp
 from mindie_sim.schema.case import Software
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.parallel import ParallelSpec
-from issue34_helpers import hardware, quant, view
+from _support.builders import hardware, quant, view
 
 
 def software(width=4, *, dp=4):

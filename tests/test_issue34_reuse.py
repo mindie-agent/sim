@@ -11,7 +11,7 @@ from mindie_sim.prediction.cohort_reuse import (
 from mindie_sim.prediction.graph_cache import SemanticGraphCache, semantic_graph_key
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import OpSpec
-from issue34_helpers import dense_case
+from _support.builders import dense_case
 
 
 def op(op_id="layer@r0", flops=100.0, *, deps=()):

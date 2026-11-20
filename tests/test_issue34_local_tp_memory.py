@@ -9,7 +9,7 @@ from mindie_sim.catalog.projection_placement import (
 from mindie_sim.catalog.weight_terms import WeightTerm, term_bytes
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.parallel import ParallelSpec
-from issue34_helpers import dense_layer, dense_model, linear_model, quant
+from _support.builders import dense_layer, dense_model, linear_model, quant
 
 
 def parallel(**overrides):

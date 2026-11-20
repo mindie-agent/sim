@@ -1,0 +1,423 @@
+# Product-orthogonal test taxonomy (Vol 6 §2). Consumed by scripts/check_test_orthogonality.py.
+# Every tests/<domain>/test_*.py must be listed here; `reserved = true` marks modules planned for a
+# later shard (may be absent until `--strict`). max_modules is a hard ceiling (74 required + overflow).
+schema_version = 1
+domains = ["schema", "runtime", "collectives", "operators", "spine", "serving", "observations", "product", "hygiene"]
+support_dirs = ["_support", "_oracles", "fixtures", "runtime/native"]
+max_lines = 600
+max_modules = 80
+
+# ---------------------------------------------------------------- schema (hardware, datapath, catalog)
+[[module]]
+path = "schema/test_datapath.py"
+tier = "tier0"
+owns = ["mindie_sim/schema/datapath.py", "mindie_sim/schema/compute_arch.py"]
+
+[[module]]
+path = "schema/test_hardware_and_custom_skus.py"
+tier = "tier0"
+owns = ["mindie_sim/backends/ascend.py", "mindie_sim/schema/hardware.py", "mindie_sim/custom_hardware.py"]
+
+[[module]]
+path = "schema/test_catalog_and_parallel_axes.py"
+tier = "tier0"
+owns = ["mindie_sim/catalog", "mindie_sim/schema/parallel.py"]
+
+[[module]]
+path = "schema/test_hf_config_adapters.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "schema/test_kv_cache_geometry.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "schema/test_quantization_contracts.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "schema/test_deployment_and_workload.py"
+tier = "tier0"
+reserved = true
+
+# ---------------------------------------------------------------- runtime (Engine, C11, memory physics)
+[[module]]
+path = "runtime/test_engine_core.py"
+tier = "tier0"
+owns = ["mindie_sim/prediction/engine.py", "mindie_sim/prediction/ownership.py"]
+
+[[module]]
+path = "runtime/test_engine_accel_parity_and_abi.py"
+tier = "tier0"
+owns = ["mindie_sim/prediction/runtime/accel_tables.py", "mindie_sim/prediction/runtime/_engine_accel.c"]
+
+[[module]]
+path = "runtime/test_engine_accel_lifecycle.py"
+tier = "tier1"
+owns = ["mindie_sim/prediction/runtime/accel_build.py", "mindie_sim/prediction/runtime/accel_cache.py", "mindie_sim/prediction/runtime/accel_loader.py"]
+
+[[module]]
+path = "runtime/test_engine_accel_handback.py"
+tier = "tier0"
+owns = ["mindie_sim/prediction/runtime/accel_bridge.py", "mindie_sim/prediction/runtime/accel_sync.py"]
+
+[[module]]
+path = "runtime/test_coupled_and_periodic.py"
+tier = "tier0"
+owns = ["mindie_sim/prediction/coupled.py", "mindie_sim/prediction/primitives.py"]
+
+[[module]]
+path = "runtime/test_periodic_cycle_detector.py"
+tier = "tier0"
+owns = ["mindie_sim/prediction/engine_periodic.py"]
+
+[[module]]
+path = "runtime/test_engine_memory_and_pipeline.py"
+tier = "tier0"
+# three byte ledgers, hbm_bus alpha_rw, L2 knee, RingBuffer, TileSolver, WaveRecorder (s2-engine)
+
+[[module]]
+path = "runtime/test_indexed_pipeline_templates.py"
+tier = "tier0"
+owns = ["mindie_sim/prediction/matrix.py", "mindie_sim/prediction/scheduling.py"]
+# TiledMatmul finite indexed catalog; R7 remainder (kernel groups, transfers, fragment executor)
+# folds into test_engine_memory_and_pipeline / test_invocation_boundary in S2d.
+
+[[module]]
+path = "runtime/test_memory_ledger_and_capacity.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "runtime/test_kv_cache_datapath.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "runtime/test_offload_tiers.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "runtime/test_invocation_boundary.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "runtime/test_formal_lean_locks.py"
+tier = "tier0"
+# six Lean 4 correspondence locks (s2-catalog)
+
+# ---------------------------------------------------------------- collectives
+[[module]]
+path = "collectives/test_topology_and_ports.py"
+tier = "tier0"
+# SIO / HCCS / HCCS_SW / RoCE / Host-HCCS, port cosets (s2-exec)
+
+[[module]]
+path = "collectives/test_collective_startup_and_bands.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "collectives/test_hccl_algorithms.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "collectives/test_collective_volume_conservation.py"
+tier = "tier0"
+reserved = true
+
+# ---------------------------------------------------------------- operators (1-to-1 with operators/<family>/)
+[[module]]
+path = "operators/test_rotary.py"
+tier = "tier0"
+owns = ["mindie_sim/prediction/operators/rotary"]
+
+[[module]]
+path = "operators/test_family_registry_and_dispatch.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "operators/test_mla_prolog.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "operators/test_paged_mla.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "operators/test_paged_mla_native_wrapper.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "operators/test_attention_prefill.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "operators/test_attention_decode.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "operators/test_attention_sparse.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "operators/test_sparse_indexer.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "operators/test_grouped_moe_routing.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "operators/test_grouped_moe_gemm.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "operators/test_grouped_moe_combine.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "operators/test_grouped_moe_dbo.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "operators/test_linear_attention_prepare.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "operators/test_linear_attention_state.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "operators/test_linear_attention_recurrent.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "operators/test_causal_conv.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "operators/test_hyper_connections.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "operators/test_mc2_dispatch_combine.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "operators/test_mc2_quant_and_padding.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "operators/test_matrix_tiling_and_traffic.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "operators/test_matrix_epilogue_and_output.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "operators/test_matrix_low_precision.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "operators/test_vector_norm_quant.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "operators/test_custom_op_libraries.py"
+tier = "tier0"
+reserved = true
+
+# ---------------------------------------------------------------- spine (PredictionSpine)
+[[module]]
+path = "spine/test_stream_plan.py"
+tier = "tier0"
+max_lines = 720   # Stage-1 debt: split or trim to <=600 before the Stage-3 --strict exit
+owns = ["mindie_sim/prediction/streams.py"]
+
+[[module]]
+path = "spine/test_stars_and_eager_d2h.py"
+tier = "tier0"
+# ACLGraph + STARS queue, SQ/CQ, Eager D2H split barrier (s2-exec)
+
+[[module]]
+path = "spine/test_prediction_spine.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "spine/test_frontend_lowering.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "spine/test_implementation_selection.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "spine/test_structure_graph.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "spine/test_sequence_and_context_parallel.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "spine/test_native_fusion_boundaries.py"
+tier = "tier0"
+reserved = true
+
+# ---------------------------------------------------------------- serving
+[[module]]
+path = "serving/test_service_core.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "serving/test_service_regimes.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "serving/test_sla_pd_and_sweep_solvers.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "serving/test_sku_and_candidate_studies.py"
+tier = "tier0"
+reserved = true
+
+# ---------------------------------------------------------------- observations
+[[module]]
+path = "observations/test_multilevel_gate.py"
+tier = "tier0"
+# independent L1/L2/L3 gate (s2-exec)
+
+[[module]]
+path = "observations/test_capture_ingestion.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "observations/test_communication_observations.py"
+tier = "tier0"
+owns = ["mindie_sim/observations/communication"]
+# ex test_a5_comm_* (s2-exec)
+
+[[module]]
+path = "observations/test_resource_phase_calibration.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "observations/test_scoreboards_and_cohorts.py"
+tier = "tier0"
+reserved = true
+
+# ---------------------------------------------------------------- product
+[[module]]
+path = "product/test_sdk_and_cli.py"
+tier = "tier1"   # spawns the installed CLI entry point
+owns = ["mindie_sim/api.py", "mindie_sim/cli.py", "mindie_sim/cli_parser.py", "mindie_sim/cli_commands.py"]
+
+[[module]]
+path = "product/test_profiler_ssot.py"
+tier = "tier1"
+allow_field_enumeration = true
+reserved = true
+
+[[module]]
+path = "product/test_three_tier_replay.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "product/test_accuracy_gates.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "product/test_rewrite_apply.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "product/test_rewrite_verify_and_oracle.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "product/test_wheel_and_extension_sdk.py"
+tier = "tier1"
+reserved = true
+
+[[module]]
+path = "product/test_workbench_exports.py"
+tier = "tier0"
+reserved = true
+
+# ---------------------------------------------------------------- hygiene
+[[module]]
+path = "hygiene/test_arch_governance.py"
+tier = "tier0"
+owns = ["scripts/check_arch_governance.py"]
+
+[[module]]
+path = "hygiene/test_repo_hygiene.py"
+tier = "tier1"   # temporary git repositories for ci_scope + ratchet self-tests
+owns = ["scripts/check_test_orthogonality.py", ".github/scripts/ci_scope.py", "tests/_support/tempdirs.py"]
+
+# ---------------------------------------------------------------- pre-declared overflow splits (Vol 6 §2.6)
+[[module]]
+path = "operators/test_linear_attention_state_versions.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "operators/test_grouped_moe_align.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "operators/test_sparse_indexer_topk.py"
+tier = "tier0"
+reserved = true
+
+[[module]]
+path = "product/test_rewrite_oracle.py"
+tier = "tier0"
+reserved = true
