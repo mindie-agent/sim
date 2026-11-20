@@ -71,13 +71,7 @@ DIRECT_MESH_SKU = "Ascend950DT_9582"
 TINY_MODEL_ID = "qwen3-32b"
 
 
-def _make_machine(
-    sku: str,
-    *,
-    num_devices: int,
-    ranks_per_node: int | None = None,
-    topology_preset: str | None = None,
-) -> Hardware:
+def _make_machine(sku: str, *, num_devices: int, ranks_per_node: int | None = None, topology_preset: str | None = None) -> Hardware:
     raw: dict = {"sku": sku, "num_devices": num_devices}
     if ranks_per_node is not None:
         raw["ranks_per_node"] = ranks_per_node
@@ -86,13 +80,7 @@ def _make_machine(
     return Hardware.from_mapping(ascend(raw))
 
 
-def _make_custom_machine(
-    base_sku: str,
-    *,
-    num_devices: int,
-    ranks_per_node: int,
-    links: list[dict],
-) -> Hardware:
+def _make_custom_machine(base_sku: str, *, num_devices: int, ranks_per_node: int, links: list[dict]) -> Hardware:
     raw = ascend({"sku": base_sku, "num_devices": num_devices, "ranks_per_node": ranks_per_node})
     raw["links"] = links
     return Hardware.from_mapping(raw)
@@ -176,6 +164,10 @@ def test_calibrated_mesh_optical_superpod_and_host_hccs_profiles():
     assert sp_ch["transport_mode"] == "optical_hccs"
     sp_band = select_band("allreduce", (0, 16), sp_topo, 65536)
     assert "optical" in sp_band.evidence_id and "roce" not in sp_band.evidence_id
+    # Shipped 9382 SIO preserves expansion_mode="direct" across small & mid bands (#2)
+    sio_s = select_band("allreduce", (0, 1), sp_topo, 4096, expansion_mode="direct")
+    sio_m = select_band("allreduce", (0, 1), sp_topo, 196608, expansion_mode="direct")
+    assert sio_s.algorithm == "direct" and sio_s.expansion_mode == "direct" and sio_m.expansion_mode == "direct"
 
     # Dual-die Host-HCCS preserves peak >= solo and HCCS DMA protocol
     h2d = dict(dict(sp_machine.transfer_channels)["h2d"])
@@ -273,25 +265,24 @@ def test_shared_port_single_link_and_switch_serialize_while_distinct_rails_overl
     cap = 1000.0  # 1000 B/ms -> 1000 B = 1.0 ms solo, 2.0 ms when serialized
     payload = 1000.0
 
-    # 1) Two ranks on ONE link sharing the same physical endpoint ("nic0")
-    single_link_shared = [{
-        "name": "one_link", "members": [0, 1, 2], "capacity_bytes_per_ms": cap,
-        "semantics": "per_port", "scope": "node", "rail_id": "rail_s",
-        "endpoint_ids": {"0": "nic0", "1": "nic0", "2": "nic2"},
-    }]
-    topo_1 = Topology(
-        _make_custom_machine(SINGLE_DIE_SKU, num_devices=3, ranks_per_node=3, links=single_link_shared),
-        ParallelSpec(tp=3),
-    )
-    r02 = topo_1.capacity_resources(topo_1.links["one_link"], 0, 2)
-    r12 = topo_1.capacity_resources(topo_1.links["one_link"], 1, 2)
-    assert PortKey(0, "nic0", "rail_s", "tx").resource_name() in r02
-    assert PortKey(0, "nic0", "rail_s", "tx").resource_name() in r12
-    eng1 = Engine(topo_1.resources())
-    e0 = eng1.submit("s0", {r: payload for r in r02}, coupled=True)
-    e1 = eng1.submit("s1", {r: payload for r in r12}, coupled=True)
-    eng1.advance()
-    assert math.isclose(max(e0.time, e1.time), 2.0, rel_tol=1e-9)
+    # 1) Shared physical endpoint ("nic0") serializes on BOTH per_port AND per_pair (#4)
+    for sem, extra in (("per_port", {}), ("per_pair", {"endpoint_rates": {"0": cap, "1": cap, "2": cap}})):
+        links_1 = [{
+            "name": "one_link", "members": [0, 1, 2], "capacity_bytes_per_ms": cap * 10.0,
+            "semantics": sem, "scope": "node", "rail_id": "rail_s",
+            "endpoint_ids": {"0": "nic0", "1": "nic0", "2": "nic2"}, **extra,
+        }]
+        if sem == "per_port":
+            links_1[0]["capacity_bytes_per_ms"] = cap
+        t1 = Topology(_make_custom_machine(SINGLE_DIE_SKU, num_devices=3, ranks_per_node=3, links=links_1), ParallelSpec(tp=3))
+        r02 = t1.capacity_resources(t1.links["one_link"], 0, 2)
+        r12 = t1.capacity_resources(t1.links["one_link"], 1, 2)
+        assert PortKey(0, "nic0", "rail_s", "tx").resource_name() in r02
+        assert PortKey(0, "nic0", "rail_s", "tx").resource_name() in r12
+        e1 = Engine(t1.resources())
+        ev0, ev1 = e1.submit("s0", {r: payload for r in r02}, coupled=True), e1.submit("s1", {r: payload for r in r12}, coupled=True)
+        e1.advance()
+        assert math.isclose(max(ev0.time, ev1.time), 2.0, rel_tol=1e-9)
 
     # 2) Two links sharing a physical switch_id plane
     sw_links = [
@@ -432,6 +423,12 @@ def test_collective_byte_conventions_zero_payload_and_alltoallv_validation():
         lower_collective("alltoallv", group, topo, 7168, peer_matrix=peer_matrix, send_splits=(1, 1, 1, 1))
     with pytest.raises(ModelingError, match="alltoallv_peer_matrix_entry_invalid"):
         lower_collective("alltoallv", (0, 2), topo, 1024, peer_matrix=((0, -1), (1024, 0)))
+    # AllToAllV with omitted splits derives band from validated matrix totals, not api_bytes=1 (#3)
+    big_a2av = lower_collective(
+        "alltoallv", group, topo, 1,
+        peer_matrix=((0, 0, 0, 100_000), (0, 0, 0, 0), (0, 0, 0, 0), (0, 0, 0, 0)),
+    )
+    assert big_a2av.band.payload_min_inclusive == 65537 and "mid" in big_a2av.band.protocol
 
 
 def test_band_algorithm_expansion_multihop_credits_and_production_execution():
@@ -464,64 +461,69 @@ def test_band_algorithm_expansion_multihop_credits_and_production_execution():
     assert select_band("allreduce", (0, 1), topo_exp, 4096, expansion_mode="direct") == b_direct
     low_dir = lower_collective("allreduce", (0, 1), topo_exp, 4096, expansion_mode="direct")
     assert tuple(p.name for p in low_dir.phases) == ("direct",)
+    # 1b) 4-rank tree AllGather delivers full gathered buffer to ALL 4 ranks incl. 1 & 3 (#2)
+    b_tree = CollectiveBandSpec(
+        collective="allgather", stack_id="default", topology_scope="node",
+        group_min=2, group_max=8, expansion_mode="tree", payload_min_inclusive=0,
+        payload_max_exclusive=None, algorithm="tree", protocol="simple",
+        startup_scope="collective", startup_us=1.0, payload_bytes_per_frame=4096,
+        wire_bytes_per_frame=4096, credit_bytes=0, evidence_id="ev_tree",
+    )
+    topo_tr = Topology(_make_custom_machine(SINGLE_DIE_SKU, num_devices=4, ranks_per_node=4, links=[{
+        "name": "tr_link", "members": [0, 1, 2, 3], "capacity_bytes_per_ms": 100_000_000.0,
+        "semantics": "per_port", "scope": "node", "protocol_bands": [b_tree.to_dict()],
+    }]), ParallelSpec(tp=4))
+    low_tr = lower_collective("allgather", (0, 1, 2, 3), topo_tr, 1024)
+    assert tuple(p.name for p in low_tr.phases) == ("gather_up", "broadcast_down")
+    bcast_dsts = {tr.destination: tr.payload_bytes for tr in low_tr.phases[1].transfers}
+    assert bcast_dsts == {1: 4096.0, 2: 4096.0, 3: 4096.0}
 
-    # 2) Multi-hop pipelining (0->1->2) charges hop startup per hop & honors credit_bytes
-    b_hop = CollectiveBandSpec(
-        collective="alltoallv", stack_id="default", topology_scope="node",
-        group_min=2, group_max=4, expansion_mode="direct",
-        payload_min_inclusive=0, payload_max_exclusive=None,
-        algorithm="direct", protocol="simple", startup_scope="hop",
-        startup_us=100.0, payload_bytes_per_frame=4096, wire_bytes_per_frame=4096,
-        credit_bytes=4096, evidence_id="ev_hop",
-    )
-    topo_mh = Topology(
-        _make_custom_machine(SINGLE_DIE_SKU, num_devices=3, ranks_per_node=3, links=[
-            {"name": "hop_01", "members": [0, 1], "capacity_bytes_per_ms": 1_000_000.0,
-             "latency_us": 0.0, "semantics": "per_port", "scope": "node",
-             "protocol_bands": [b_hop.to_dict()]},
-            {"name": "hop_12", "members": [1, 2], "capacity_bytes_per_ms": 1_000_000.0,
-             "latency_us": 0.0, "semantics": "per_port", "scope": "node",
-             "protocol_bands": [b_hop.to_dict()]},
-        ]),
-        ParallelSpec(tp=3),
-    )
-    low_mh = lower_collective(
-        "alltoallv", (0, 1, 2), topo_mh, 16384,
-        peer_matrix=((0, 0, 16384), (0, 0, 0), (0, 0, 0)),
-    )
-    assert len(low_mh.phases[0].transfers[0].hops) == 2
-    eng_mh = Engine(topo_mh.resources())
-    done_mh = submit_lowered_collective(
-        eng_mh, "mh_a2av", low_mh, {r: eng_mh.submit(f"r{r}") for r in (0, 1, 2)}
-    )
-    eng_mh.advance()
-    # 2 hops x 0.1 ms hop startup + pipelined 4x4KiB credit chunks > 0.21 ms
-    assert done_mh[2].time > 0.21
+    # 2) Multi-hop pipelining + credit_bytes + switch propagation preserved on startup > 0 (#3)
+    def _run_mh(startup_us: float, sw_lat_us: float = 0.0) -> float:
+        bh = CollectiveBandSpec(
+            collective="alltoallv", stack_id="default", topology_scope="node",
+            group_min=2, group_max=4, expansion_mode="direct", payload_min_inclusive=0,
+            payload_max_exclusive=None, algorithm="direct", protocol="simple",
+            startup_scope="hop", startup_us=startup_us, payload_bytes_per_frame=4096,
+            wire_bytes_per_frame=4096, credit_bytes=4096 if sw_lat_us == 0.0 else 0, evidence_id="ev_hop",
+        )
+        tmh = Topology(_make_custom_machine(SINGLE_DIE_SKU, num_devices=3, ranks_per_node=3, links=[
+            {"name": f"hop_{a}{b}", "members": [a, b], "capacity_bytes_per_ms": 1_000_000.0 if sw_lat_us == 0.0 else 1e12,
+             "latency_us": 0.0, "switch_hops": 1 if sw_lat_us else 0, "switch_hop_latency_us": sw_lat_us,
+             "semantics": "per_port", "scope": "node", "protocol_bands": [bh.to_dict()]}
+            for a, b in ((0, 1), (1, 2))
+        ]), ParallelSpec(tp=3))
+        lmh = lower_collective("alltoallv", (0, 1, 2), tmh, 16384, peer_matrix=((0, 0, 16384), (0, 0, 0), (0, 0, 0)))
+        assert len(lmh.phases[0].transfers[0].hops) == 2
+        emh = Engine(tmh.resources())
+        dmh = submit_lowered_collective(emh, "mh", lmh, {r: emh.submit(f"r{r}") for r in (0, 1, 2)})
+        emh.advance()
+        return float(dmh[2].time)
 
-    # 3) Production Execution HCCL path consumes selected band startup_us (mesh & ring)
-    def _run_prod_allreduce(sku: str, startup_us: float) -> float:
+    assert _run_mh(100.0, 0.0) > 0.21
+    assert math.isclose(_run_mh(0.0, 1000.0), 2.0, abs_tol=1e-4)
+    assert math.isclose(_run_mh(1.0, 1000.0), 2.002, abs_tol=1e-4)
+
+    # 3) Production Execution consumes band startup_us & credit_bytes window (#1)
+    def _run_prod_allreduce(sku: str, startup_us: float, *, credit_bytes: int = 0, scope_m: str = "collective") -> float:
         raw_hw = ascend({"sku": sku, "num_devices": 4, "ranks_per_node": 4})
         band = CollectiveBandSpec(
             collective="allreduce", stack_id="default", topology_scope="any",
             group_min=2, group_max=8, expansion_mode="ring",
             payload_min_inclusive=0, payload_max_exclusive=None,
-            algorithm="ring", protocol="simple", startup_scope="collective",
+            algorithm="ring", protocol="simple", startup_scope=scope_m,
             startup_us=startup_us, payload_bytes_per_frame=4096, wire_bytes_per_frame=4096,
-            credit_bytes=0, evidence_id=f"prod_ar_{int(startup_us)}",
+            credit_bytes=credit_bytes, evidence_id=f"prod_ar_{int(startup_us)}_{credit_bytes}",
         )
         for ch_key in ("d2d_intra_node", "d2d_intra_package"):
             if ch_key in raw_hw["transfer_channels"]:
                 raw_hw["transfer_channels"][ch_key]["protocol_bands"] = [band.to_dict()]
-        case = sdk_api.compose_case(
-            TINY_MODEL_ID, hardware=raw_hw, options={"dp": 1, "tp": 4, "pp": 1, "layers": 1},
-        )
+        case = sdk_api.compose_case(TINY_MODEL_ID, hardware=raw_hw, options={"dp": 1, "tp": 4, "pp": 1, "layers": 1})
         ex = Execution(case, CostModel(case), include_submission=False)
-        shape = (1, 1, 32768)
         op = OpSpec(
-            op_id="ar_0", family="allreduce", recipe="all_reduce",
-            phase="decode", stage=0, layer=0, stream="main", dtype="bf16",
-            link_bytes=65536, link_scope="tp", requests=("req0",),
-            semantic_shape=shape, local_shape=shape, padded_shape=shape, launch_shape=shape,
+            op_id="ar_0", family="allreduce", recipe="all_reduce", phase="decode", stage=0, layer=0,
+            stream="main", dtype="bf16", link_bytes=65536, link_scope="tp", requests=("req0",),
+            semantic_shape=(1, 1, 32768), local_shape=(1, 1, 32768), padded_shape=(1, 1, 32768), launch_shape=(1, 1, 32768),
         )
         work = IterationWork(
             plan=IterationPlan(iteration=0, requests=(RequestView("req0", q_len=1, context=16, samples=True, phase="decode"),)),
@@ -535,6 +537,10 @@ def test_band_algorithm_expansion_multihop_credits_and_production_execution():
     for sku in (SINGLE_DIE_SKU, DUAL_DIE_SMALL_SKU):
         t_fast, t_slow = _run_prod_allreduce(sku, 2.5), _run_prod_allreduce(sku, 5000.0)
         assert t_fast < 0.5 and t_slow >= 5.0 and (t_slow - t_fast) >= 4.99
+    # Credit window in production Execution matches lowered BandCollectivePlan (no bypass)
+    t_nocred = _run_prod_allreduce(DUAL_DIE_SMALL_SKU, 1000.0, credit_bytes=0, scope_m="hop")
+    t_cred = _run_prod_allreduce(DUAL_DIE_SMALL_SKU, 1000.0, credit_bytes=4096, scope_m="hop")
+    assert t_cred > t_nocred * 2.5
 
 
 def test_startup_scope_and_key_validation_and_catalog_invariants():

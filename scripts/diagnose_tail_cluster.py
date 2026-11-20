@@ -212,13 +212,44 @@ def _receipt_compatible(key: tuple[str, str, str], cand: Mapping[str, Any]) -> b
     )
 
 
+def _acq_identity(row: Mapping[str, Any]) -> str:
+    for key in ("acquisition_root", "acquisition_uid", "raw_sha256", "run_uid"):
+        val = str(row.get(key) or "").strip().lower()
+        if val:
+            return val
+    return ""
+
+
+def _repeat_compatible(res: Mapping[str, Any], cand: Mapping[str, Any]) -> bool:
+    """Require distinct acquisition roots plus matching boundary and regime."""
+    res_acq, ref_acq = _acq_identity(res), _acq_identity(cand)
+    if not res_acq or not ref_acq or res_acq == ref_acq:
+        return False
+    for id_key in ("run_uid", "raw_sha256"):
+        rv, cv = str(res.get(id_key) or "").strip().lower(), str(cand.get(id_key) or "").strip().lower()
+        if rv and cv and rv == cv:
+            return False
+    res_lvl, ref_lvl = str(res.get("level") or "").strip(), str(cand.get("level") or "").strip()
+    if res_lvl and ref_lvl and res_lvl != ref_lvl:
+        return False
+    res_c, ref_c = _cohort_dict(res), _cohort_dict(cand)
+    for dim in ("sku", "phase", "mode", "parallel_topology"):
+        rv, cv = res_c.get(dim, "unknown"), ref_c.get(dim, "unknown")
+        if rv not in ("", "unknown") and cv not in ("", "unknown") and rv != cv:
+            return False
+    res_link, ref_link = _repeat_link_id(res), _repeat_link_id(cand)
+    if (res_link or ref_link) and res_link != ref_link:
+        return False
+    return True
+
+
 def pair_records(
     residuals: Iterable[Mapping[str, Any]],
     lineage: Iterable[Mapping[str, Any]] = (),
     engine_receipts: Iterable[Mapping[str, Any]] = (),
     reference_run: Iterable[Mapping[str, Any]] = (),
 ) -> list[dict[str, Any]]:
-    """Pair residuals with lineage, Engine receipts, and verified repeat runs."""
+    """Pair residuals with lineage, Engine receipts, and verified independent repeat runs."""
     lineage_map = {_pair_key(r): dict(r) for r in lineage}
     receipt_map: dict[tuple[str, str, str], dict[str, Any]] = {}
     receipt_by_id: dict[str, dict[str, Any]] = {}
@@ -228,17 +259,13 @@ def pair_records(
         if rec.get("engine_receipt"):
             receipt_by_id[str(rec["engine_receipt"])] = rec
 
-    ref_by_triple: dict[tuple[str, str, str], dict[str, Any]] = {}
-    ref_by_verified_boundary: dict[tuple[str, str, str], dict[str, Any]] = {}
+    ref_by_boundary: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
     for r in reference_run:
         rec = dict(r)
         if rec.get("status", "ok") != "ok":
             continue
-        triple = _pair_key(rec)
-        if triple[0] and triple[2]:
-            ref_by_triple[triple] = rec
         if (bkey := _repeat_match_key(rec)) is not None:
-            ref_by_verified_boundary[bkey] = rec
+            ref_by_boundary.setdefault(bkey, []).append(rec)
 
     paired: list[dict[str, Any]] = []
     for res in residuals:
@@ -249,13 +276,11 @@ def pair_records(
             receipt = cand
         lin = lineage_map.get(key) or {}
         ref: dict[str, Any] = {}
-        res_link = _repeat_link_id(res)
-        if (exact_ref := ref_by_triple.get(key)) is not None:
-            ref_link = _repeat_link_id(exact_ref)
-            if not (res_link or ref_link) or res_link == ref_link:
-                ref = exact_ref
-        elif (bkey := _repeat_match_key(res)) is not None and (b_ref := ref_by_verified_boundary.get(bkey)) is not None:
-            ref = b_ref
+        if (bkey := _repeat_match_key(res)) is not None:
+            for cand_ref in ref_by_boundary.get(bkey, ()):
+                if _repeat_compatible(res, cand_ref):
+                    ref = cand_ref
+                    break
         paired.append({
             "pair_key": key,
             "residual": dict(res),

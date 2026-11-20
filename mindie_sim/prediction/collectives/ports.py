@@ -180,14 +180,17 @@ def find_shared_port_keys(
     decls = channel_decls or {}
     port_entries: dict[PortKey, list[tuple[object, int]]] = defaultdict(list)
     for link in links:
-        if link.semantics not in port_semantics:
+        is_port_sem = link.semantics in port_semantics
+        is_pair_sem = link.semantics == "per_pair"
+        if not (is_port_sem or is_pair_sem):
             continue
         ch_decl = decls.get(getattr(link, "channel", ""))
         rail = _resolved_rail_id(link, ch_decl)
         has_ep_map = bool(getattr(link, "endpoint_ids", ())) or bool(
             ch_decl and ch_decl.get("endpoint_ids")
         )
-        explicit_port_identity = has_ep_map or (rail not in (0, ""))
+        has_ep_rates = bool(getattr(link, "endpoint_rates", ()))
+        explicit_port_identity = has_ep_map or (rail not in (0, "")) or (is_pair_sem and has_ep_rates)
         if not explicit_port_identity:
             continue
         for rank in link.members:
@@ -201,11 +204,14 @@ def find_shared_port_keys(
     for key, entries in port_entries.items():
         if len(entries) < 2:
             continue
-        rates = [
-            float(link.capacity_at(rank) if hasattr(link, "capacity_at")
-                  else link.capacity_bytes_per_ms)
-            for link, rank in entries
-        ]
+        rates = []
+        for link, rank in entries:
+            ep_cap = (
+                link.endpoint_capacity_bytes_per_ms(rank)
+                if hasattr(link, "endpoint_capacity_bytes_per_ms")
+                else None
+            )
+            rates.append(float(ep_cap if ep_cap is not None else link.capacity_bytes_per_ms))
         shared_rates[key] = min(rates)
         for link, rank in entries:
             link_port_map[(link.name, rank, key.direction)] = key

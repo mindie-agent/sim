@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import codecs
+from collections import OrderedDict
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 import hashlib
@@ -540,21 +541,38 @@ def verify_capture_file_consistency(case_id: str, boundary: Any, path: Path, *, 
     if cap_ranks is not None and cap_ranks != set(boundary.device_ranks):
         raise ModelingError(f"capture_rank_mismatch:{case_id}:expected={sorted(boundary.device_ranks)}:actual={sorted(cap_ranks)}")
     cap_events, has_events = set(), False
+    matched_start = False
+    matched_end = False
     for container in (meta, meta.get("boundary"), meta.get("metadata")):
         if not isinstance(container, Mapping):
             continue
         if (cap_clock := container.get("clock_domain")) is not None and str(cap_clock).strip() != str(boundary.clock_domain).strip():
             raise ModelingError(f"capture_clock_domain_mismatch:{case_id}:expected={boundary.clock_domain}:actual={cap_clock}")
-        if (cap_start := container.get("start_event")) is not None and str(cap_start).strip() != str(boundary.start_event).strip():
-            raise ModelingError(f"capture_event_mismatch:{case_id}:start_event")
-        if (cap_end := container.get("end_event")) is not None and str(cap_end).strip() != str(boundary.end_event).strip():
-            raise ModelingError(f"capture_event_mismatch:{case_id}:end_event")
+        if (cap_start := container.get("start_event")) is not None:
+            if str(cap_start).strip() != str(boundary.start_event).strip():
+                raise ModelingError(f"capture_event_mismatch:{case_id}:start_event")
+            matched_start = True
+        if (cap_end := container.get("end_event")) is not None:
+            if str(cap_end).strip() != str(boundary.end_event).strip():
+                raise ModelingError(f"capture_event_mismatch:{case_id}:end_event")
+            matched_end = True
         for key in ("event_ids", "events"):
             if key in container and container[key] is not None:
                 has_events = True
                 cap_events |= _collect_event_names(container[key])
-    if has_events and boundary.event_ids:
-        if missing := [ev for ev in boundary.event_ids if ev.strip() not in cap_events]:
+    start_name = str(boundary.start_event).strip()
+    end_name = str(boundary.end_event).strip()
+    if not matched_start and start_name not in cap_events:
+        raise ModelingError(f"capture_event_mismatch:{case_id}:start_event_absent:{start_name}")
+    if not matched_end and end_name not in cap_events:
+        raise ModelingError(f"capture_event_mismatch:{case_id}:end_event_absent:{end_name}")
+    if boundary.event_ids:
+        known_events = set(cap_events)
+        if matched_start:
+            known_events.add(start_name)
+        if matched_end:
+            known_events.add(end_name)
+        if missing := [ev for ev in boundary.event_ids if ev.strip() not in known_events]:
             raise ModelingError(f"capture_event_mismatch:{case_id}:missing={','.join(missing)}")
 
 
@@ -617,6 +635,32 @@ def _sign_receipt(
     return hmac.new(_RECEIPT_HMAC_KEY, payload, "sha256").hexdigest()
 
 
+_EVENT_OWNER_MAX_ENTRIES = 2048
+_EVENT_OWNER_REGISTRY: OrderedDict[int, tuple[Any, str]] = OrderedDict()
+
+
+def _trace_owns_event(engine: Any, event: Any) -> bool:
+    """Verify ``engine`` actually recorded a settled task/boundary matching ``event``."""
+    trace_maxlen = int(getattr(engine, "_trace_maxlen", 0) or 0)
+    if trace_maxlen <= 0:
+        return False
+    ev_name = str(event.name)
+    ev_time = float(event.time)
+    ev_started = getattr(event, "started", None)
+    for row in engine.trace:
+        task_name = str(row.get("task", ""))
+        end_ms = row.get("end_ms")
+        start_ms = row.get("start_ms")
+        if task_name == ev_name and end_ms is not None and abs(float(end_ms) - ev_time) <= _CLOCK_EPS_MS:
+            if ev_started is None or start_ms is None or abs(float(start_ms) - float(ev_started)) <= _CLOCK_EPS_MS:
+                return True
+        if (ev_name.endswith(":start") or ev_name == f"{task_name}:start") and start_ms is not None:
+            base = ev_name[:-6] if ev_name.endswith(":start") else ev_name
+            if task_name == base and abs(float(start_ms) - ev_time) <= _CLOCK_EPS_MS:
+                return True
+    return False
+
+
 def _validate_live_engine_events(case: Any, engine: Any, start_event: Any, end_event: Any) -> tuple[str, int, int, int]:
     from mindie_sim.prediction.runtime.engine import Engine, Event
 
@@ -633,10 +677,24 @@ def _validate_live_engine_events(case: Any, engine: Any, start_event: Any, end_e
         raise ModelingError(f"engine_event_name_mismatch:{case.case_id}:{start_event.name}:{end_event.name}")
     if start_event.time < -_CLOCK_EPS_MS or end_event.time > engine.now + _CLOCK_EPS_MS or end_event.time < start_event.time:
         raise ModelingError(f"engine_event_clock_bounds_invalid:{case.case_id}")
+    uid = _req_str(getattr(engine, "uid", ""), f"engine_uid_missing:{case.case_id}")
+    if int(getattr(engine, "_trace_maxlen", 0) or 0) <= 0:
+        raise ModelingError(f"engine_event_not_owned_by_engine:{case.case_id}:trace_required")
+    if not (_trace_owns_event(engine, start_event) and _trace_owns_event(engine, end_event)):
+        raise ModelingError(f"engine_event_not_owned_by_engine:{case.case_id}")
+    for ev in (start_event, end_event):
+        entry = _EVENT_OWNER_REGISTRY.get(id(ev))
+        if entry is not None and entry[0] is ev and entry[1] != uid:
+            raise ModelingError(f"engine_event_not_owned_by_engine:{case.case_id}:cross_engine_handle")
+    for ev in (start_event, end_event):
+        _EVENT_OWNER_REGISTRY[id(ev)] = (ev, uid)
+        _EVENT_OWNER_REGISTRY.move_to_end(id(ev))
+        while len(_EVENT_OWNER_REGISTRY) > _EVENT_OWNER_MAX_ENTRIES:
+            _EVENT_OWNER_REGISTRY.popitem(last=False)
     start_ns, end_ns = int(round(start_event.time * MS_TO_NS)), int(round(end_event.time * MS_TO_NS))
     if (pred_ns := end_ns - start_ns) <= 0:
         raise ModelingError(f"interval_span_or_duration_invalid:{case.case_id}")
-    return _req_str(getattr(engine, "uid", ""), f"engine_uid_missing:{case.case_id}"), start_ns, end_ns, pred_ns
+    return uid, start_ns, end_ns, pred_ns
 
 
 def bind_engine_interval(

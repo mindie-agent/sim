@@ -66,6 +66,7 @@ class LoweredHop:
     rx_port: PortKey
     resources: tuple[str, ...]
     propagation_ms: float
+    switch_propagation_ms: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -374,6 +375,10 @@ def _build_transfer(
             tx_key = link_port_key(link, hop_src, topology.location(hop_src)["node"], "tx")
             rx_key = link_port_key(link, hop_dst, topology.location(hop_dst)["node"], "rx")
         hop_res = tuple(dict.fromkeys(topology.capacity_resources(link, hop_src, hop_dst)))
+        switch_prop_ms = (
+            float(getattr(link, "switch_hops", 0) or 0)
+            * float(getattr(link, "switch_hop_latency_us", 0.0) or 0.0)
+        ) / MS_PER_S
         hops.append(LoweredHop(
             link_name=link_name,
             source=int(hop_src),
@@ -383,6 +388,7 @@ def _build_transfer(
             rx_port=rx_key,
             resources=hop_res,
             propagation_ms=link.propagation_us / MS_PER_S,
+            switch_propagation_ms=switch_prop_ms,
         ))
     return LoweredTransfer(
         phase_name=phase_name, round_index=round_index,
@@ -463,19 +469,34 @@ def _lower_ring_or_alg(
         return tuple(phases)
     if alg == "tree":
         rounds = max(1, math.ceil(math.log2(count)))
-        phase_names = (("reduce_up", "broadcast_down")
-                       if collective == "allreduce" else (collective,))
-        chunk = api_bytes if collective in {"allreduce", "allgather"} else api_bytes / float(count)
+        if collective == "allreduce":
+            phase_names = ("reduce_up", "broadcast_down")
+        elif collective == "allgather":
+            phase_names = ("gather_up", "broadcast_down")
+        elif collective == "reduce_scatter":
+            phase_names = ("reduce_up", "scatter_down")
+        else:
+            raise ModelingError(f"collective_band_algorithm_unsupported:tree:{collective}")
         phases = []
         for pname in phase_names:
             transfers = []
+            top_down = pname in {"broadcast_down", "scatter_down"}
             for r_idx in range(rounds):
-                stride = 1 << r_idx
+                stride = 1 << (rounds - 1 - r_idx) if top_down else (1 << r_idx)
                 for idx in range(0, count, stride * TWO_RANKS):
                     partner = idx + stride
                     if partner >= count:
                         continue
-                    src, dst = (group[partner], group[idx]) if pname != "broadcast_down" else (group[idx], group[partner])
+                    src, dst = (group[idx], group[partner]) if top_down else (group[partner], group[idx])
+                    subtree = min(stride, count - partner)
+                    if collective == "allgather":
+                        chunk = (float(count) * api_bytes if top_down
+                                 else float(subtree) * api_bytes)
+                    elif collective == "reduce_scatter":
+                        chunk = (float(subtree) * (api_bytes / float(count)) if top_down
+                                 else api_bytes)
+                    else:
+                        chunk = api_bytes
                     per_rank_payload[src] += chunk
                     transfers.append(_build_transfer(pname, r_idx, src, dst, chunk, band, topology))
             phases.append(LoweredPhase(pname, rounds, tuple(transfers), phase_startup))
@@ -523,13 +544,16 @@ def lower_collective(
     api_bytes = float(api_bytes_per_rank)
 
     matrix: tuple[tuple[int, ...], ...] | None = None
+    band_payload = api_bytes
     if collective == "alltoallv":
         matrix = _validate_alltoallv_inputs(
             peer_matrix, count, api_bytes, send_splits, recv_splits
         )
+        row_sums = tuple(sum(row) for row in matrix)
+        band_payload = float(max(row_sums)) if sum(row_sums) > 0 else 0.0
 
     band = select_band(
-        collective, group, topology, api_bytes,
+        collective, group, topology, band_payload,
         stack=stack, expansion_mode=expansion_mode,
     )
     collective_startup = band.startup_us if band.startup_scope == "collective" else 0.0
@@ -676,7 +700,7 @@ def submit_lowered_collective(
                         )
                         is_last = h_idx == len(transfer.hops) - 1
                         hop_lat_ms = (
-                            hop_startup_ms
+                            (hop_startup_ms + hop.switch_propagation_ms)
                             if lowered.band.startup_us > 0.0
                             else hop.propagation_ms
                         )

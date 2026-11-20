@@ -412,6 +412,15 @@ class Topology(_TopologyPlansMixin):
                               for rank in endpoint_ranks
                               if active is None or rank in active
                               for direction in ("tx", "rx"))
+                for rank in link.members:
+                    for direction in ("tx", "rx"):
+                        shared_key = self._link_shared_ports.get(
+                            (link.name, int(rank), direction)
+                        )
+                        if shared_key is not None:
+                            included_shared_ports[shared_key] = (
+                                self._shared_port_rates[shared_key]
+                            )
             elif link.semantics in _PORT_SEMANTICS:
                 result.extend(self._endpoint_resource(link, direction, rank)
                               for rank in link.members
@@ -670,17 +679,17 @@ class Topology(_TopologyPlansMixin):
         names = [self.resource(link, source, destination)]
         if link.semantics in _PORT_SEMANTICS:
             names.append(f"{self.namespace}link:{link.name}:rx:port{destination}")
-            tx_shared = self._link_shared_ports.get((link.name, int(source), "tx"))
-            if tx_shared is not None:
-                names.append(tx_shared.resource_name(self.namespace))
-            rx_shared = self._link_shared_ports.get((link.name, int(destination), "rx"))
-            if rx_shared is not None:
-                names.append(rx_shared.resource_name(self.namespace))
         else:
             if self._has_endpoint_rate(link, source):
                 names.append(f"{self.namespace}link:{link.name}:tx:port{source}")
             if self._has_endpoint_rate(link, destination):
                 names.append(f"{self.namespace}link:{link.name}:rx:port{destination}")
+        tx_shared = self._link_shared_ports.get((link.name, int(source), "tx"))
+        if tx_shared is not None:
+            names.append(tx_shared.resource_name(self.namespace))
+        rx_shared = self._link_shared_ports.get((link.name, int(destination), "rx"))
+        if rx_shared is not None:
+            names.append(rx_shared.resource_name(self.namespace))
         if link.switch_capacity_bytes_per_ms is not None:
             sw_key = self._link_shared_switches.get(link.name)
             if sw_key is not None:

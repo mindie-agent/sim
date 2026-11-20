@@ -72,12 +72,12 @@ def _stars_is_noop_placeholder(spec) -> bool:
 def build_stars_queues(
     stage_profiles, namespace: str
 ) -> dict[tuple[int, int], tuple[tuple[int, StarsDescriptorQueue], ...]]:
-    """Build representative-shard STARS queues for every active ``StarsSpec``.
+    """Build per-die STARS queues for every active ``StarsSpec``.
 
-    Instantiates active queues even when ``issue_interval_us == 0`` (e.g.
-    explicit finite ``queue_depth`` or non-placeholder evidence) so credit
-    depth and ``release_policy`` govern concurrency, sharing controllers across
-    replicas/stages that map to the same ``queue_scope``.
+    Instantiates active queues across every participating die even when
+    ``issue_interval_us == 0`` (e.g. finite ``queue_depth`` or calibrated
+    evidence), sharing controllers strictly across dies in the same
+    ``queue_scope``.
     """
     by_controller: dict[str, StarsDescriptorQueue] = {}
     stage_queues: dict[tuple[int, int], tuple[tuple[int, StarsDescriptorQueue], ...]] = {}
@@ -88,19 +88,26 @@ def build_stars_queues(
             continue
         replica, stage = key
         dies = profile.dies or ()
-        rep_die = (
-            dies[0] if dies
-            else type("_D", (), {"rank": replica, "node": 0, "package": 0})()
-        )
-        die_rank = int(rep_die.rank)
-        ctrl = _stars_controller_id(spec, replica, stage, rep_die)
-        queue = by_controller.get(ctrl)
-        if queue is None:
-            queue = StarsDescriptorQueue(
-                spec, die_id=die_rank, namespace=namespace, controller_id=ctrl
+        entries: list[tuple[int, StarsDescriptorQueue]] = []
+        if not dies:
+            stub = type("_D", (), {"rank": replica, "node": 0, "package": 0})()
+            ctrl = _stars_controller_id(spec, replica, stage, stub)
+            queue = by_controller.setdefault(
+                ctrl, StarsDescriptorQueue(spec, die_id=int(replica), namespace=namespace, controller_id=ctrl)
             )
-            by_controller[ctrl] = queue
-        stage_queues[key] = ((die_rank, queue),)
+            entries.append((int(replica), queue))
+        else:
+            for die in dies:
+                die_rank = int(die.rank)
+                ctrl = _stars_controller_id(spec, replica, stage, die)
+                queue = by_controller.get(ctrl)
+                if queue is None:
+                    queue = StarsDescriptorQueue(
+                        spec, die_id=die_rank, namespace=namespace, controller_id=ctrl
+                    )
+                    by_controller[ctrl] = queue
+                entries.append((die_rank, queue))
+        stage_queues[key] = tuple(entries)
     return stage_queues
 
 
@@ -129,9 +136,17 @@ def build_stars_summary(execution) -> dict[str, Any]:
             for die_rank, q in entries if q.descriptor_count > 0
         }
         if dies_out:
-            primary = next(iter(dies_out.values()))
+            seen_q: dict[int, dict[str, Any]] = {}
+            for _die_rank, q in entries:
+                if q.descriptor_count > 0 and id(q) not in seen_q:
+                    seen_q[id(q)] = q.summary()
+            primary = next(iter(seen_q.values()))
             out[f"r{replica}:s{stage}"] = {
-                **primary, "die_count": len(dies_out), "dies": dies_out,
+                **primary,
+                "descriptor_count": sum(s["descriptor_count"] for s in seen_q.values()),
+                "total_descriptor_ns": sum(s["descriptor_union_ns"] for s in seen_q.values()),
+                "die_count": len(dies_out),
+                "dies": dies_out,
             }
     return out
 
@@ -494,6 +509,50 @@ def build_submission_summary(execution) -> dict[str, Any]:
     }
 
 
+def _submit_eager_counts_allgather(
+    execution, op, replica: int, stage_dies, *, ep_size: int, dtype_bytes: int,
+    name: str, barrier_entry, ids: dict, owner: str,
+) -> tuple[dict[int, Any], str]:
+    """Resolve current-dispatch counts AllGather op or lower it on the EP group."""
+    layer_prefix = op.op_id.rsplit(".", 1)[0] if "." in str(op.op_id) else ""
+    expected_hist = f"{layer_prefix}.moe_histogram_gather" if layer_prefix else ""
+    if expected_hist and expected_hist in ids:
+        ev = ids[expected_hist]
+        return {int(d.rank): ev for d in stage_dies}, "op"
+    from ..collectives.protocol import lower_collective, submit_lowered_collective
+    topo = execution.topology
+    stage_ranks = tuple(int(d.rank) for d in stage_dies)
+    ep_groups = topo.groups("ep", replica, op.stage, metadata=_metadata_dict(op))
+    ep_ranks = next(
+        (grp for grp in ep_groups if set(stage_ranks).intersection(grp)),
+        stage_ranks,
+    )
+    if len(ep_ranks) <= 1:
+        return {}, "none"
+    try:
+        lowered = lower_collective(
+            "allgather", ep_ranks, topo, float(ep_size * dtype_bytes),
+            communicator_id=f"{name}:counts_ag",
+        )
+    except ModelingError:
+        return {}, "fallback"
+    engine = execution.engine
+    missing_res = [
+        res for res in topo.resources()
+        if res.name not in engine.resources and any(
+            res.name in tr.resources
+            for ph in lowered.phases for tr in ph.transfers
+        )
+    ]
+    if missing_res:
+        engine.extend(missing_res)
+    ready_map = {rank: barrier_entry for rank in ep_ranks}
+    done_map = submit_lowered_collective(
+        engine, f"{name}:eager_split:counts_ag", lowered, ready_map, owner=owner
+    )
+    return {int(d.rank): done_map[int(d.rank)] for d in stage_dies if int(d.rank) in done_map}, "lowered_collective"
+
+
 def schedule_eager_moe_split_barrier(
     execution, op, replica: int, scope: str, name: str, deps: list, ids: dict,
 ):
@@ -532,38 +591,57 @@ def schedule_eager_moe_split_barrier(
     barrier_entry = engine.submit(
         f"{name}:eager_split:entry", after=tuple(deps), owner=owner
     )
-    ag_event = next(
-        (ev for op_id, ev in ids.items() if op_id.endswith(".moe_histogram_gather")),
-        None,
+    hist_entry = engine.submit(
+        f"{name}:eager_split:histogram_prep", after=(barrier_entry,), owner=owner
+    )
+    ag_by_rank, ag_mode = _submit_eager_counts_allgather(
+        execution, op, replica, stage_dies,
+        ep_size=ep_size, dtype_bytes=dtype_bytes,
+        name=name, barrier_entry=hist_entry, ids=ids, owner=owner,
     )
     indep_events = (
         tuple(ev for op_id, ev in ids.items() if op_id not in op.deps)
         if spec.requires_explicit_device_sync
         else ()
     )
-    result = EagerSplitBarrier.submit(
-        engine,
-        machine,
-        stage_dies[0],
-        spec,
-        barrier_entry,
-        name=f"{name}:eager_split",
-        namespace=execution.namespace,
-        allgather_event=ag_event,
-        independent_device_events=indep_events,
-        owner=owner,
-    )
-    deps.append(result.dispatch_ready)
+    results = []
+    all_d2h_resources: list[str] = []
+    for die in stage_dies:
+        die_rank = int(die.rank)
+        res = EagerSplitBarrier.submit(
+            engine,
+            machine,
+            die,
+            spec,
+            barrier_entry,
+            name=f"{name}:eager_split:d{die_rank}",
+            namespace=execution.namespace,
+            allgather_event=ag_by_rank.get(die_rank),
+            independent_device_events=indep_events,
+            owner=owner,
+        )
+        results.append(res)
+        deps.append(res.dispatch_ready)
+        for rname in res.d2h_resources:
+            if rname not in all_d2h_resources:
+                all_d2h_resources.append(rname)
+    total_in = sum(r.input_splits_bytes for r in results)
+    total_out = sum(r.output_splits_bytes for r in results)
     execution.eager_split_barriers.append({
         "op_id": op.op_id,
         "replica": replica,
         "stage": op.stage,
         "ep_size": ep_size,
         "num_local_experts": num_local_experts,
-        "input_splits_bytes": result.input_splits_bytes,
-        "output_splits_bytes": result.output_splits_bytes,
-        "explicit_device_sync": result.explicit_device_sync is not None,
-        "d2h_resources": list(result.d2h_resources),
+        "participating_ranks": [int(d.rank) for d in stage_dies],
+        "input_splits_bytes": results[0].input_splits_bytes,
+        "output_splits_bytes": results[0].output_splits_bytes,
+        "total_input_splits_bytes": total_in,
+        "total_output_splits_bytes": total_out,
+        "total_d2h_bytes": total_in + total_out,
+        "counts_allgather_mode": ag_mode,
+        "explicit_device_sync": any(r.explicit_device_sync is not None for r in results),
+        "d2h_resources": all_d2h_resources,
     })
     return barrier_entry
 

@@ -293,10 +293,15 @@ class StarsDescriptorQueue:
         self._ordinal = 0
         self._descriptor_count = 0
         self._replay_first_charged: set[tuple[int, int]] = set()
+        self._replay_active_counts: dict[tuple[int, int], int] = {}
+        self._latest_replay_by_die: dict[int, int] = {}
         self._stream_last_kernel_done: dict[tuple[int, str], Event] = {}
         self._active_records: dict[int, StarsDescriptorRecord] = {}
         self._retired_desc_ns: list[tuple[int, int]] = []
         self._retired_comp_ns: list[tuple[int, int]] = []
+        self._folded_desc_ns: int = 0
+        self._folded_comp_ns: int = 0
+        self._folded_uncovered_ns: int = 0
 
     @property
     def active(self) -> bool:
@@ -353,11 +358,32 @@ class StarsDescriptorQueue:
         lane_index = ordinal % len(self.lane_names)
         lane_name = self.lane_names[lane_index]
         duration_ms = float(self.spec.issue_interval_us) / MS_PER_S
-        replay_key = (int(replay), die_num)
+        replay_int = int(replay)
+        replay_key = (replay_int, die_num)
+        prev_latest = self._latest_replay_by_die.get(die_num, -1)
+        if replay_int > prev_latest:
+            self._latest_replay_by_die[die_num] = replay_int
+            for old_key in [
+                k for k in self._replay_first_charged
+                if k[1] == die_num and k[0] < replay_int
+                and k not in self._replay_active_counts
+            ]:
+                self._replay_first_charged.discard(old_key)
+        # Evict retired replay keys for this die when a new replay begins (O(active) state)
+        if replay_key not in self._replay_first_charged:
+            stale = [
+                k for k in self._replay_first_charged
+                if k[1] == die_num and self._replay_active_counts.get(k, 0) <= 0
+            ]
+            for k in stale:
+                self._replay_first_charged.discard(k)
         if (replay_key not in self._replay_first_charged
                 and float(self.spec.first_issue_us) > 0.0):
             duration_ms += float(self.spec.first_issue_us) / MS_PER_S
             self._replay_first_charged.add(replay_key)
+        self._replay_active_counts[replay_key] = (
+            self._replay_active_counts.get(replay_key, 0) + 1
+        )
 
         after_events = [descriptor_ready]
         if self.spec.release_policy == "stream_predecessor_done":
@@ -390,10 +416,43 @@ class StarsDescriptorQueue:
         self._active_records[ordinal] = record
         return record, credit_alloc
 
+    def _fold_retired_up_to(self, horizon_ns: int | None) -> None:
+        """Fold retired intervals ending <= ``horizon_ns`` into O(1) counters."""
+        if not self._retired_desc_ns and not self._retired_comp_ns:
+            return
+        if horizon_ns is None:
+            self._folded_desc_ns += sum(e - s for s, e in self._retired_desc_ns)
+            self._folded_comp_ns += sum(e - s for s, e in self._retired_comp_ns)
+            self._folded_uncovered_ns += _diff_ns_intervals(
+                self._retired_desc_ns, self._retired_comp_ns
+            )
+            self._retired_desc_ns = []
+            self._retired_comp_ns = []
+            return
+        fold_desc = [iv for iv in self._retired_desc_ns if iv[1] <= horizon_ns]
+        keep_desc = [iv for iv in self._retired_desc_ns if iv[1] > horizon_ns]
+        fold_comp = [iv for iv in self._retired_comp_ns if iv[1] <= horizon_ns]
+        keep_comp = [iv for iv in self._retired_comp_ns if iv[1] > horizon_ns]
+        if not fold_desc and not fold_comp:
+            return
+        self._folded_desc_ns += sum(e - s for s, e in fold_desc)
+        self._folded_comp_ns += sum(e - s for s, e in fold_comp)
+        self._folded_uncovered_ns += _diff_ns_intervals(fold_desc, fold_comp)
+        self._retired_desc_ns = keep_desc
+        self._retired_comp_ns = keep_comp
+
     def _retire_record(self, ordinal: int) -> None:
         rec = self._active_records.pop(ordinal, None)
         if rec is None:
             return
+        rkey = (rec.descriptor_id.replay, rec.descriptor_id.die)
+        rem = self._replay_active_counts.get(rkey, 0) - 1
+        if rem <= 0:
+            self._replay_active_counts.pop(rkey, None)
+            if rec.descriptor_id.replay < self._latest_replay_by_die.get(rec.descriptor_id.die, -1):
+                self._replay_first_charged.discard(rkey)
+        else:
+            self._replay_active_counts[rkey] = rem
         issue_iv, comp_iv = rec.retire()
         if issue_iv is not None:
             s_ns = int(round(issue_iv[0] * NS_PER_MS))
@@ -409,6 +468,19 @@ class StarsDescriptorQueue:
                 self._retired_comp_ns = _merge_ns_intervals(
                     (*self._retired_comp_ns, (s_ns, e_ns))
                 )
+        if not self._active_records:
+            self._fold_retired_up_to(None)
+        else:
+            starts: list[int] = []
+            all_started = True
+            for active in self._active_records.values():
+                s_ev = active.issue_start_event
+                if s_ev is None or s_ev.time is None:
+                    all_started = False
+                    break
+                starts.append(int(round(s_ev.time * NS_PER_MS)))
+            if all_started and starts:
+                self._fold_retired_up_to(min(starts))
 
     def bind_kernel_execution(
         self,
@@ -517,7 +589,7 @@ class StarsDescriptorQueue:
             "release_policy": self.spec.release_policy,
             "descriptor_count": self._descriptor_count,
             "active_records": len(self._active_records),
-            "descriptor_union_ns": sum(e - s for s, e in desc_ns),
-            "compute_union_ns": sum(e - s for s, e in comp_ns),
-            "uncovered_stars_ns": _diff_ns_intervals(desc_ns, comp_ns),
+            "descriptor_union_ns": self._folded_desc_ns + sum(e - s for s, e in desc_ns),
+            "compute_union_ns": self._folded_comp_ns + sum(e - s for s, e in comp_ns),
+            "uncovered_stars_ns": self._folded_uncovered_ns + _diff_ns_intervals(desc_ns, comp_ns),
         }

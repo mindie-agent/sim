@@ -29,31 +29,12 @@ from typing import Any
 
 import pytest
 
-from mindie_sim import compose_case, graph_costs, parse_case, target_graphs
 from mindie_sim.observations.multilevel_gate import (
-    CaptureBoundary,
-    CohortKey,
-    EngineInterval,
-    EngineRunReceipt,
-    FrozenFitManifest,
-    FrozenFitParameter,
-    GateCase,
-    Manifest,
-    Residual,
-    bind_engine_interval,
-    bind_engine_rung_interval,
-    evaluate,
-    gate_decision,
-    parse_gate_case,
-    run_l1,
-    run_l2,
-    run_l3,
-    sanitize_capture_uri,
-    sanitize_source_ref,
-    stream_jsonl,
-    stream_manifest,
-    summarize_cohorts,
-    validate_lineage,
+    CaptureBoundary, CohortKey, EngineInterval, EngineRunReceipt, FrozenFitManifest,
+    FrozenFitParameter, GateCase, Manifest, Residual, bind_engine_interval,
+    bind_engine_rung_interval, evaluate, gate_decision, parse_gate_case, run_l1,
+    run_l2, run_l3, sanitize_capture_uri, sanitize_source_ref, stream_jsonl,
+    stream_manifest, summarize_cohorts, validate_lineage,
 )
 from mindie_sim.prediction.runtime.engine import Engine, Resource
 from mindie_sim.schema.common import ModelingError
@@ -126,7 +107,7 @@ def _case(
 
 
 def _run_engine_for_ns(start_name: str, end_name: str, duration_ns: int) -> tuple[Engine, Any, Any]:
-    eng = Engine([Resource("device", 1_000_000.0, "ns", "fifo")])
+    eng = Engine([Resource("device", 1_000_000.0, "ns", "fifo")], trace_limit=32)
     s_ev = eng.submit(start_name, {"device": 100.0})
     e_ev = eng.submit(end_name, {"device": float(duration_ns)}, after=(s_ev,))
     eng.advance(until=(e_ev,))
@@ -205,19 +186,19 @@ def test_lineage_case_normalization_event_scoping_and_fit_closure(tmp_path: Path
     cap_doc = {"device_ranks": [0], "clock_domain": "device_monotonic", "start_event": "k_start", "end_event": "k_end", "event_ids": ["ev-ok"]}
     cap_path = cap_dir / "cap_ok.json"
     cap_path.write_text(json.dumps(cap_doc), encoding="utf-8")
-    cap_sha = hashlib.sha256(cap_path.read_bytes()).hexdigest()
-    good_case = _case("cap_ok", tag="4", raw_sha=cap_sha, events=("ev-ok",), uri="capture://suite/cap_ok.json")
+    good_case = _case("cap_ok", tag="4", raw_sha=hashlib.sha256(cap_path.read_bytes()).hexdigest(), events=("ev-ok",), uri="capture://suite/cap_ok.json")
     validate_lineage(Manifest("m_disk", "1", (good_case,)), fits, capture_root=tmp_path, require_capture_files=True)
-
-    bad_sha_case = _case("cap_bad_sha", tag="4", raw_sha=_sha("f"), events=("ev-ok",), uri="capture://suite/cap_ok.json")
+    with pytest.raises(ModelingError, match="capture_file_missing"):
+        validate_lineage(Manifest("m_noloc", "1", (good_case,)), fits, require_capture_files=True)
     with pytest.raises(ModelingError, match="capture_digest_mismatch"):
-        validate_lineage(Manifest("m_b1", "1", (bad_sha_case,)), fits, capture_root=tmp_path)
+        validate_lineage(Manifest("m_b1", "1", (_case("cap_bad_sha", tag="4", raw_sha=_sha("f"), events=("ev-ok",), uri="capture://suite/cap_ok.json"),)), fits, capture_root=tmp_path)
 
     for fname, bad_payload, err in (
         ("bad_rank.json", {**cap_doc, "device_ranks": [1]}, "capture_rank_mismatch"),
         ("bad_clk.json", {**cap_doc, "clock_domain": "host_wall"}, "capture_clock_domain_mismatch"),
         ("bad_ev.json", {**cap_doc, "event_ids": ["other_ev"]}, "capture_event_mismatch"),
         ("bad_se.json", {**cap_doc, "start_event": "wrong_start"}, "capture_event_mismatch"),
+        ("unrel.json", {"summary": "unrelated_without_events"}, "capture_event_mismatch"),
     ):
         fp = cap_dir / fname
         fp.write_text(json.dumps(bad_payload), encoding="utf-8")
@@ -279,27 +260,33 @@ def test_engine_receipt_binding_and_mandatory_three_level_coverage() -> None:
     with pytest.raises(ModelingError, match="l2_cloned_or_divided_from_l3_forbidden"):
         run_l2(c_l2, _LiveEngineRunner({"l2_clone": _live_interval(c_l2, 5000, source_level="L3")}))
 
-    # Reusing the same live Engine across L2 and L3 must fail closed.
+    # Reusing the same live Engine or foreign Event handles across unrelated Engines must fail (#8).
     c_l3 = _case("l3_step", level="L3", tag="3", measured_ns=50_000)
     shared_eng, shared_s, shared_e = _run_engine_for_ns("k_start", "k_end", 5000)
     iv_l2 = bind_engine_interval(c_l2, shared_eng, shared_s, shared_e)
     iv_l3 = bind_engine_interval(c_l3, shared_eng, shared_s, shared_e)
     with pytest.raises(ModelingError, match="cross_level_engine_receipt_clone"):
         list(evaluate(Manifest("m_rcpt", "1", (c_l2, c_l3)), FrozenFitManifest("f", "1", ()), _LiveEngineRunner({"l2_clone": iv_l2, "l3_step": iv_l3})))
+    other_eng, _, _ = _run_engine_for_ns("other_start", "other_end", 5000)
+    twin_eng, _, _ = _run_engine_for_ns("k_start", "k_end", 5000)
+    untraced_eng = Engine([Resource("device", 1_000_000.0, "ns", "fifo")])
+    us, ue = untraced_eng.submit("k_start", {"device": 100.0}), None
+    ue = untraced_eng.submit("k_end", {"device": 1000.0}, after=(us,))
+    untraced_eng.advance(until=(ue,))
+    with pytest.raises(ModelingError, match="engine_event_not_owned_by_engine"):
+        bind_engine_interval(c_l1, other_eng, shared_s, shared_e)
+    with pytest.raises(ModelingError, match="engine_event_not_owned_by_engine:.*cross_engine_handle"):
+        bind_engine_interval(c_l1, twin_eng, shared_s, shared_e)
+    with pytest.raises(ModelingError, match="engine_event_not_owned_by_engine:.*trace_required"):
+        bind_engine_interval(c_l1, untraced_eng, us, ue)
 
     # Strict 3-level gate requires independent L1, L2, AND L3 cohorts (L1-only never passes!).
-    fits = FrozenFitManifest("f", "1", ())
-    runner = _LiveEngineRunner(scale=1.03)
-    res_l1 = list(evaluate(Manifest("m_l1", "1", (c_l1,)), fits, runner))
-    dec_l1 = gate_decision(summarize_cohorts(res_l1))
+    fits, runner = FrozenFitManifest("f", "1", ()), _LiveEngineRunner(scale=1.03)
+    dec_l1 = gate_decision(summarize_cohorts(list(evaluate(Manifest("m_l1", "1", (c_l1,)), fits, runner))))
     assert dec_l1["status"] == "insufficient_evidence" and dec_l1["missing_levels"] == ["L2", "L3"]
-
-    res_l12 = list(evaluate(Manifest("m_l12", "1", (c_l1, c_l2)), fits, runner))
-    dec_l12 = gate_decision(summarize_cohorts(res_l12))
+    dec_l12 = gate_decision(summarize_cohorts(list(evaluate(Manifest("m_l12", "1", (c_l1, c_l2)), fits, runner))))
     assert dec_l12["status"] == "insufficient_evidence" and dec_l12["missing_levels"] == ["L3"]
-
-    res_all = list(evaluate(Manifest("m_all", "1", (c_l1, c_l2, c_l3)), fits, runner))
-    dec_all = gate_decision(summarize_cohorts(res_all))
+    dec_all = gate_decision(summarize_cohorts(list(evaluate(Manifest("m_all", "1", (c_l1, c_l2, c_l3)), fits, runner))))
     assert dec_all["status"] == "pass" and dec_all["missing_levels"] == [] and dec_all["covered_levels"] == ["L1", "L2", "L3"]
 
     # Non-independent acquisition roots across levels never pass gate_decision.
@@ -457,10 +444,12 @@ def test_tail_diagnoser_moved_tail_unassessed_stages_and_conflicts(tmp_path: Pat
     assert stages_missing[2] == "unassessed" and stages_missing[3] == "unassessed" and stages_missing[4] == "unassessed"
     assert stages_missing[5] == "action_required"
 
-    # Mismatched boundary_kind in reference_run must NOT pair or escalate.
+    # Mismatched boundary_kind OR same acquisition as current & reference must NOT escalate (#10).
     ref_wrong_bnd = [{"case_id": "op_b", "acquisition_root": "acq-rep-2", "boundary_kind": "model_step", "absolute_percentage_error": 0.15}]
-    wrong_bnd_rep = diag.diagnose_tail_clusters([row_a, row_b], reference_run=ref_wrong_bnd, threshold_pct=10.0)
-    assert "persistent_tail_across_independent_repeat" not in wrong_bnd_rep["clusters"][0]["escalation_reasons"]
+    assert "persistent_tail_across_independent_repeat" not in diag.diagnose_tail_clusters([row_a, row_b], reference_run=ref_wrong_bnd, threshold_pct=10.0)["clusters"][0]["escalation_reasons"]
+    same_acq_rep = diag.diagnose_tail_clusters([row_a, row_b], reference_run=[row_a, row_b], threshold_pct=10.0)
+    assert same_acq_rep["clusters"][0]["blocking"] is False
+    assert "persistent_tail_across_independent_repeat" not in same_acq_rep["clusters"][0]["escalation_reasons"]
 
     # Verified independent repeat exceeding on the SAME (case_id, boundary_kind) escalates + full 5-stage ladder.
     lin_b = {"case_id": "op_b", "acquisition_root": "acq-2", "boundary_kind": "device_kernel", "capture_uri": "capture://s/b", "warmup_contaminated": True}
@@ -511,21 +500,18 @@ def test_producer_end_to_end_report_assembly_boundary_and_precision(tmp_path: Pa
     assert prod._stats([0.0999999])["status"] == "pass"
     assert prod._stats([0.10])["status"] == "fail"
 
-    # Assemble minimal real captures for end-to-end build_report verification.
+    # Assemble independent literal measured captures (NEVER graph_costs!) for build_report (#9).
     sku = "Ascend950DT_9582"
-    cs_model = parse_case(compose_case("qwen3.8-27b", hardware=sku, dp=1, tp=2, ep=1, num_devices=2, layers=4, quant="none"))
-    l3_ms = float(graph_costs(cs_model, target_graphs(cs_model, phase="decode", tokens=1, context=511, sequences=8, scope="model"), external_inputs={"analysis_input": 0}, include_submission=True, isolated=False, fast_span_only=True)["duration_ms"])
-    l2_one_layer_us = float(graph_costs(cs_model, target_graphs(cs_model, phase="decode", tokens=1, context=511, sequences=8, scope="body", layer_limit=1), external_inputs={"analysis_input": 0}, include_submission=False, isolated=False, fast_span_only=True)["duration_ms"]) * 1000.0
-    l2_full_body_us = float(graph_costs(cs_model, target_graphs(cs_model, phase="decode", tokens=1, context=511, sequences=8, scope="body"), external_inputs={"analysis_input": 0}, include_submission=False, isolated=False, fast_span_only=True)["duration_ms"]) * 1000.0
-    assert l2_full_body_us > l2_one_layer_us * 2.5
-
     (tmp_path / "acquisition_split_manifest.json").write_text(json.dumps({
         "acquisitions": [
             {"acquisition_uid": "acq-l1-tr", "split": "train"},
             {"acquisition_uid": "acq-l1-ho", "split": "heldout"},
             {"acquisition_uid": "acq-hotspot-run", "split": "heldout"},
+            {"acquisition_uid": "acq-d2-one", "split": "heldout"},
             {"acquisition_uid": "acq-m-tr", "split": "train"},
             {"acquisition_uid": "acq-m-ho", "split": "heldout"},
+            {"acquisition_uid": "acq-l2-indep", "split": "heldout"},
+            {"acquisition_uid": "acq-l2-tr", "split": "train"},
         ]
     }), encoding="utf-8")
     (tmp_path / "cann93_single_op_measurements.json").write_text(json.dumps({
@@ -538,8 +524,16 @@ def test_producer_end_to_end_report_assembly_boundary_and_precision(tmp_path: Pa
         },
         "collective_measurements": [],
     }), encoding="utf-8")
-    (tmp_path / "cann93_seq512_to_400k_measurements.json").write_text(json.dumps({"records": []}), encoding="utf-8")
-    # 3 hotspot records from ONE acquisition run must ALL stay in heldout (never index-split!).
+    # Two d2 rows (seq 512 vs 2048) from ONE run stay in ONE acquisition root (never seq-split!).
+    (tmp_path / "cann93_seq512_to_400k_measurements.json").write_text(json.dumps({
+        "acquisition_uid": "acq-d2-one",
+        "records": [
+            {"status": "ok", "domain": "shard0_fia_decode", "op_name": f"fia_s{seq}",
+             "shape": {"B": 1, "S": 1, "Hq": 8, "Hkv": 2, "D": 128, "seq_kv": seq, "kv_dtype": "bf16", "swa_window": 0},
+             "metrics": {"cold_p50_us": 25.0 + seq * 0.005}}
+            for seq in (512, 2048)
+        ],
+    }), encoding="utf-8")
     (tmp_path / "task1_kimi_k31_silicon_hotspots.json").write_text(json.dumps({
         "acquisition_uid": "acq-hotspot-run",
         "records": [
@@ -556,25 +550,33 @@ def test_producer_end_to_end_report_assembly_boundary_and_precision(tmp_path: Pa
                 "dp": 1, "tp": 2, "ep": False,
                 "fx_compilation_summary": {"pre_split_full_graph_summary": {"op_counts": {"vllm.unquantized_gemm": 4}}, "num_compiled_fx_subgraphs": 1},
                 "resolved_compilation_and_ascend_config": {"cudagraph_mode": "FULL_AND_PIECEWISE", "cudagraph_capture_sizes": [8]},
-                "step_and_layer_timings": {"decode_B8_S512_step_p50_ms": l3_ms, "decode_B8_S512_per_layer_us": l2_one_layer_us},
+                "independent_l2_measured_us": 180.0,
+                "step_and_layer_timings": {"decode_B8_S512_step_p50_ms": 0.92, "decode_B8_S512_per_layer_us": 230.0},
+            },
+            "r_no_l2": {
+                "run_id": "r_no_l2", "model_id": "qwen3.8-27b", "rung": "merged", "sku": sku, "status": "ok",
+                "acquisition_uid": "acq-m-ho", "l2_acquisition_uid": "acq-l2-tr",
+                "num_layers": 4, "orig_layers": 4, "dp": 1, "tp": 2, "ep": False,
+                "fx_compilation_summary": {"pre_split_full_graph_summary": {"op_counts": {"vllm.unquantized_gemm": 4}}, "num_compiled_fx_subgraphs": 1},
+                "resolved_compilation_and_ascend_config": {"cudagraph_mode": "FULL_AND_PIECEWISE", "cudagraph_capture_sizes": [8]},
+                "step_and_layer_timings": {"decode_B8_S512_step_p50_ms": 0.92, "decode_B8_S512_per_layer_us": 230.0},
             },
         }}}
     }), encoding="utf-8")
 
     report = prod.build_report(tmp_path, workers=1)
-    # Live execution/*.py hashed (sorted), no deleted execution.py FileNotFoundError.
     exec_keys = sorted(k for k in report["source_sha256"] if k.startswith("mindie_sim/prediction/execution/"))
     assert len(exec_keys) >= 8 and "mindie_sim/prediction/execution.py" not in report["source_sha256"]
     assert report["disjoint_split_verification"]["acquisition_root_overlap"] == 0
-    # All 3 hotspot rows from acq-hotspot-run stayed together in heldout (0 leaked into train).
-    hotspot_train = [r for r in report["level1_operators"]["train"]["sample_records"] if "kimi_" in r["id"]]
-    hotspot_held = [r for r in report["level1_operators"]["heldout"]["sample_records"] if "kimi_" in r["id"]]
-    assert len(hotspot_train) == 0 and len(hotspot_held) == 3
-    # L2 matched 1-layer boundary (NOT 4-layer full body!).
-    l2_rec = report["level2_subgraphs_and_blocks"]["heldout"]["records"][0]
-    assert l2_rec["status"] == "ok" and l2_rec["l2_layers"] == 1
-    assert l2_rec["predicted_block_us"] == pytest.approx(round(l2_one_layer_us, 2), abs=0.05)
-    assert l2_rec["ape_pct"] < 1.0
+    # Hotspots + d2 (seq 512 & 2048) stay unsplit in heldout; absent L2 frozen train never scores heldout.
+    assert len([r for r in report["level1_operators"]["train"]["sample_records"] if "kimi_" in r["id"] or "fia_s" in r["id"]]) == 0
+    d2_held = [r for r in report["level1_operators"]["heldout"]["sample_records"] if "fia_s" in r["id"]]
+    assert len(d2_held) == 2 and len({r["acquisition_root"] for r in d2_held}) == 1
+    l2_ho = report["level2_subgraphs_and_blocks"]["heldout"]["records"]
+    assert len(l2_ho) == 1 and l2_ho[0]["run_id"] == "r_ho" and l2_ho[0]["status"] == "ok" and l2_ho[0]["l2_layers"] == 1
+    assert l2_ho[0]["measured_block_us"] == 180.0 and l2_ho[0]["acquisition_root"] == "acq-l2-indep"
+    l2_tr = [r for r in report["level2_subgraphs_and_blocks"]["train"]["records"] if r["run_id"] == "r_no_l2"]
+    assert len(l2_tr) == 1 and l2_tr[0]["status"] == "missing_evidence" and l2_tr[0]["ape_pct"] is None
 
     # Conflicting split declaration on one acquisition must fail closed.
     bad_manifest = tmp_path / "bad_split.json"

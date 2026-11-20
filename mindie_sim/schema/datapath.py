@@ -143,10 +143,14 @@ class DatapathCapabilitySpec:
 
     def _validate_route_owner(self, path: DataPath, src: str, dst: str, owner_group: Any) -> None:
         aic_to_aivs = {int(aic): frozenset(int(a) for a in aivs) for aic, aivs in self.aic_aiv_pairs}
+        named_pair: tuple[int, int] | None = None
         if isinstance(owner_group, Mapping):
-            aic_val = owner_group.get("aic", owner_group.get("src") if src != "ub" else owner_group.get("dst"))
-            aiv_val = owner_group.get("aiv", owner_group.get("dst") if src != "ub" else owner_group.get("src"))
-            pair = (aic_val, aiv_val)
+            if "aic" in owner_group or "aiv" in owner_group:
+                named_pair = (owner_group.get("aic"), owner_group.get("aiv"))
+                pair = named_pair
+            else:
+                src_v, dst_v = owner_group.get("src"), owner_group.get("dst")
+                pair = (src_v, dst_v)
         elif isinstance(owner_group, (tuple, list)):
             pair = tuple(owner_group)
         elif isinstance(owner_group, int) and not isinstance(owner_group, bool):
@@ -165,7 +169,10 @@ class DatapathCapabilitySpec:
                     f"datapath_route_owner_invalid:{src}->{dst}",
                     f"cross-core path {src}->{dst} requires (src_core, dst_core) ints",
                 )
-            aic_id, aiv_id = (pair[1], pair[0]) if src == "ub" else (pair[0], pair[1])
+            if named_pair is not None:
+                aic_id, aiv_id = named_pair
+            else:
+                aic_id, aiv_id = (pair[1], pair[0]) if src == "ub" else (pair[0], pair[1])
             if not (0 <= aic_id < self.aic_count and aiv_id in aic_to_aivs.get(aic_id, frozenset())):
                 raise self._route_err(
                     f"datapath_route_owner_unreachable:{src}->{dst}:{aic_id}->{aiv_id}",
@@ -218,11 +225,13 @@ class DatapathCapabilitySpec:
             tile_bytes = total_bits // BITS_PER_BYTE
         else:
             raise self._route_err(f"datapath_route_tile_invalid:{src}->{dst}", f"unsupported tile {tile!r}")
-        if dst in dict(self.buffers) and tile_bytes > self.usable_bytes(dst):
-            raise self._route_err(
-                f"datapath_route_tile_exceeds_buffer:{dst}:{tile_bytes}",
-                f"tile {tile_bytes}B exceeds usable {dst} capacity",
-            )
+        buffers = dict(self.buffers)
+        for buf_name in (src, dst):
+            if buf_name in buffers and tile_bytes > self.usable_bytes(buf_name):
+                raise self._route_err(
+                    f"datapath_route_tile_exceeds_buffer:{buf_name}:{tile_bytes}",
+                    f"tile {tile_bytes}B exceeds usable {buf_name} capacity",
+                )
 
     def route(
         self, src: str, dst: str, representation: str = "",

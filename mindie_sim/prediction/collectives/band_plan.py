@@ -176,7 +176,9 @@ class BandCollectivePlan:
                             )
                             transaction_frames[res] = frame_pair
                         hop_lat = (
-                            hop_startup_ms if band.startup_us > 0.0 else hop.propagation_ms
+                            (hop_startup_ms + hop.switch_propagation_ms)
+                            if band.startup_us > 0.0
+                            else hop.propagation_ms
                         )
                         path_lat += hop_lat
                     max_path_latency = max(max_path_latency, path_lat)
@@ -199,6 +201,62 @@ class BandCollectivePlan:
             max_path_latency,
         )
         return self.topology._work_with_capacity(work)
+
+    def cache_key(self) -> tuple:
+        """Return a stable structural key for Execution program caching."""
+        return (
+            self.family,
+            tuple(
+                (group.ranks, group.lowered.band, group.lowered.api_bytes_per_rank,
+                 group.lowered.total_wire_bytes)
+                for group in self.groups
+            ),
+        )
+
+    def lower_with_local_work(self, context, base_program):
+        """Wrap this lowered collective plan inside local pack/vector/unpack stages."""
+        from ..program import KernelProgram, Stage
+
+        link_names = frozenset(self.accounting().wire_by_resource)
+        stages_in = base_program.stages
+        # Unwrap outer setup -> body container from TopologyCollectiveRecipe
+        if (len(stages_in) == TWO_PHASES
+                and stages_in[0].name == "setup"
+                and stages_in[1].program is not None):
+            stages_in = stages_in[1].program.stages
+
+        pack_work: dict[str, float] = {}
+        vec_work: dict[str, float] = {}
+        unpack_work: dict[str, float] = {}
+        for stg in stages_in:
+            local = {k: v for k, v in stg.work.items() if k not in link_names}
+            if not local:
+                continue
+            if stg.name == "pack":
+                for k, v in local.items():
+                    pack_work[k] = pack_work.get(k, 0.0) + v
+            elif stg.name == "unpack_store":
+                for k, v in local.items():
+                    unpack_work[k] = unpack_work.get(k, 0.0) + v
+            else:
+                for k, v in local.items():
+                    vec_work[k] = vec_work.get(k, 0.0) + v
+
+        out: list[Stage] = []
+        prev: tuple[str, ...] = ()
+        if pack_work:
+            out.append(Stage("pack", work=pack_work, keep_empty=True))
+            prev = ("pack",)
+        out.append(Stage(
+            "band_collective", work=vec_work, after=prev,
+            program=self, keep_empty=True,
+        ))
+        if unpack_work:
+            out.append(Stage(
+                "unpack_store", work=unpack_work, after=("band_collective",),
+                keep_empty=True,
+            ))
+        return KernelProgram(tuple(out), minimum_ms=context.minimum_ms)
 
 
 def build_band_collective_plan(

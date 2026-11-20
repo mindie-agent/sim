@@ -122,6 +122,12 @@ def test_datapath_capabilities_and_route_argument_validation():
         dp_next.route("l0c", "ub", owner_group=(0, 47))
     with pytest.raises(UnmodeledCapabilityError, match="datapath_route_tile"):
         dp_next.route("l0c", "ub", tile=(1, 1))
+    # ub->l1 normalizes named owners once & validates BOTH src and dst buffer capacities (#7)
+    assert dp_next.route("ub", "l1", owner_group={"aic": 1, "aiv": 2}).path.source == "ub"
+    with pytest.raises(UnmodeledCapabilityError, match="datapath_route_owner_unreachable"):
+        dp_next.route("ub", "l1", owner_group={"aic": 2, "aiv": 1})
+    with pytest.raises(UnmodeledCapabilityError, match="datapath_route_tile_exceeds_buffer"):
+        dp_next.route("ub", "l1", representation="fp16", tile=(256, 512))
 
 
 def test_stars_queue_covered_exposed_zero_issue_depth_and_stream_order():
@@ -206,6 +212,21 @@ def test_stars_queue_covered_exposed_zero_issue_depth_and_stream_order():
     )
     eng_g.advance()
     assert math.isclose(g1_done.time, 0.120, rel_tol=1e-9)
+
+    # 5) 400 completed depth-1 replays fold intervals/keys into O(1) bounded totals (#5)
+    q_bnd = StarsDescriptorQueue(replace(spec_cov, queue_depth=1, first_issue_us=2.0), die_id=0)
+    eng_b = Engine([Resource("aic", 1.0, "ms", "fifo")])
+    prev_ev = eng_b.submit("r0")
+    for rep in range(400):
+        prev_ev, _ = q_bnd.submit_kernel(
+            eng_b, replay=rep, stream="main", kernel_occurrence=rep,
+            descriptor_ready=prev_ev, work={"aic": 0.010},
+        )
+    eng_b.advance()
+    s_bnd = q_bnd.summary()
+    assert s_bnd["descriptor_count"] == 400 and s_bnd["descriptor_union_ns"] == 400 * 7_000
+    assert len(q_bnd._retired_desc_ns) == 0 and len(q_bnd._retired_comp_ns) == 0
+    assert len(q_bnd._replay_first_charged) <= 1
 
 
 def test_stars_release_policies_multistream_and_zero_kernel_views():
@@ -313,9 +334,11 @@ def test_execution_stars_piecewise_segments_queue_scope_and_host_disabled():
     sum_die = ex_die.summary()
     assert sum_die["submission"]["included"] is False and sum_die["submission"]["host_service_ms"] == 0
     stage_die = sum_die["stars"]["r0:s0"]
-    assert stage_die["descriptor_count"] == 2
-    # Each piecewise segment charged (25 + 5) = 30 us -> 60 us total (not 35 us!)
-    assert stage_die["descriptor_union_ns"] == 60_000
+    # TP=2 issues across BOTH participating dies: 2 segments x 2 dies = 4 x 30 us (#5)
+    assert stage_die["descriptor_count"] == 4 and stage_die["die_count"] == 2
+    assert stage_die["total_descriptor_ns"] == 120_000
+    assert stage_die["dies"]["d0"]["descriptor_union_ns"] == 60_000
+    assert stage_die["dies"]["d1"]["descriptor_union_ns"] == 60_000
 
     # 2) dp=2, tp=1 on dual-die package 0: queue_scope="die" isolates vs "package" contends
     def _run_two_replicas(q_scope: str) -> dict:
@@ -439,36 +462,45 @@ def test_eager_split_barrier_dependency_order_independence_and_prod_wiring():
     b_single = _run_eager_moe_dispatch(num_experts=4)
     b_multi = _run_eager_moe_dispatch(num_experts=16)
     assert b_single["input_splits_bytes"] == 32 and b_single["output_splits_bytes"] == 32
-    assert b_single["explicit_device_sync"] is True
-    assert b_multi["explicit_device_sync"] is False
+    assert b_single["total_d2h_bytes"] == 256 and b_single["participating_ranks"] == [0, 1, 2, 3]
+    assert b_single["explicit_device_sync"] is True and b_multi["explicit_device_sync"] is False
+    # Real 4-layer raw_eager prefill at TP=EP=4 submits per-rank splits (256 B) + counts AllGather (#6)
+    from mindie_sim import compose_case as top_compose, graph_costs as top_graph_costs, parse_case as top_parse, target_graphs as top_target_graphs
+    ds_eager = top_parse(top_compose(MOE_MODEL_ID, LEGACY_ARCH_SKU, dp=1, tp=4, ep=4, pp=1, layers=4, raw_eager=True))
+    gc_eager = top_graph_costs(
+        ds_eager, top_target_graphs(ds_eager, phase="prefill", tokens=16, scope="body"),
+        external_inputs={"analysis_input": 0}, include_submission=True, isolated=False,
+    )
+    ex_eager = gc_eager["execution"]
+    eb = ex_eager["eager_split_barriers"][0]
+    assert eb["total_d2h_bytes"] == 256 and eb["participating_ranks"] == [0, 1, 2, 3]
+    assert eb["counts_allgather_mode"] == "lowered_collective"
+    assert math.isclose(ex_eager["serviced"]["host_rc:n0:rc0:d2h"], 256.0, rel_tol=1e-9)
 
 
 def test_serving_io_couples_concurrent_replicas_to_shared_root_complex():
-    """Eight concurrent replicas H2D cap at node_peak_bw_gbps on shared RC (#6)."""
+    """Solo H2D caps at 59.5 GB/s per die while 8 concurrent replicas cap at 238.8 GB/s RC (#4)."""
     payload_bytes = 64_000_000
     base = sdk_api.compose_case(
         TINY_MODEL_ID, hardware=DUAL_DIE_LARGE_SKU,
         options={"dp": 8, "tp": 1, "pp": 1, "ranks_per_node": 8, "layers": 1},
     )
-    io_cfg = {
-        "h2d": {
-            "fixed_bytes": payload_bytes,
-            "bytes_per_s": 59.5e9,
-            "latency_us": 0.0,
-        }
-    }
+    io_cfg = {"h2d": {"fixed_bytes": payload_bytes, "bytes_per_s": 500.0e9, "latency_us": 0.0}}
     case = replace(base, runtime=replace(base.runtime, serving_io=io_cfg))
-    ex = Execution(case, CostModel(case), include_submission=False, include_serving_io=True)
+    solo_gbps = float(case.machine.host_solo_bw_gbps("h2d") or 0.0)
     rc_gbps = float(case.machine.host_root_complex_ceiling_gbps("h2d") or 0.0)
-    assert math.isclose(rc_gbps, 238.8, rel_tol=1e-6)
+    assert math.isclose(solo_gbps, 59.5, rel_tol=1e-6) and math.isclose(rc_gbps, 238.8, rel_tol=1e-6)
+    # 1) Single replica transfer must NOT exceed solo 59.5 GB/s even with 500 GB/s policy
+    ex_solo = Execution(case, CostModel(case), include_submission=False, include_serving_io=True)
+    done_solo = ex_solo.serving_io.transfer(ex_solo, "h2d", "r0", 0, ex_solo.engine.submit("s0"), tokens=1, requests=1)
+    ex_solo.engine.advance()
+    assert math.isclose(done_solo.time, payload_bytes / (solo_gbps * 1_000_000.0), rel_tol=1e-4)
+    # 2) Eight concurrent replicas saturate shared 238.8 GB/s root complex
+    ex = Execution(case, CostModel(case), include_submission=False, include_serving_io=True)
     ready = ex.engine.submit("all_ready")
-    dones = [
-        ex.serving_io.transfer(ex, "h2d", f"r{rep}", rep, ready, tokens=1, requests=1)
-        for rep in range(8)
-    ]
+    dones = [ex.serving_io.transfer(ex, "h2d", f"r{rep}", rep, ready, tokens=1, requests=1) for rep in range(8)]
     ex.engine.advance()
-    expected_ms = (8.0 * payload_bytes) / (rc_gbps * 1_000_000.0)
-    assert math.isclose(max(ev.time for ev in dones), expected_ms, rel_tol=1e-4)
+    assert math.isclose(max(ev.time for ev in dones), (8.0 * payload_bytes) / (rc_gbps * 1_000_000.0), rel_tol=1e-4)
 
 
 def test_spine_single_evaluation_constructs_cost_model_and_bindings_once(monkeypatch):

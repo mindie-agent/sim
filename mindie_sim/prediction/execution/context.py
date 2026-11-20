@@ -595,6 +595,9 @@ class _ContextMixin:
         do_compact = not self.legacy_diagnostics and (
             not engine.trace.maxlen or self._compact_step
         )
+        cp_binding = getattr(context, "collective_plan", None)
+        cp_plan = getattr(cp_binding, "plan", None) if cp_binding is not None else None
+        band_key = cp_plan.cache_key() if hasattr(cp_plan, "cache_key") else None
         prog_key = (
             owner, do_compact, _freeze_key(recipe), op.family, op.recipe, op.phase, op.stage,
             op.dtype, op.layout, op.semantic_shape, op.local_shape, op.padded_shape,
@@ -610,6 +613,7 @@ class _ContextMixin:
             getattr(context.physical_mechanisms, "signature", None),
             op.stream or "main",
             context.stream_owners,
+            band_key,
         )
         token = _rank_token(context)
         replayable = (
@@ -650,6 +654,14 @@ class _ContextMixin:
             record_service=cap_svc if orig_svc is not None else None,
         )
         program = self.lower_program(run_ctx, recipe)
+        cp_binding = getattr(context, "collective_plan", None)
+        cp_plan = getattr(cp_binding, "plan", None) if cp_binding is not None else None
+        if (cp_plan is not None
+                and hasattr(cp_plan, "lower_with_local_work")
+                and getattr(recipe, "algorithm", None) is None
+                and getattr(cp_binding, "algorithm", None) != "direct_mesh"
+                and context.joint_native_service is None):
+            program = cp_plan.lower_with_local_work(context, program)
         program = self._apply_resource_service_program(context, program)
         program = self._apply_stream_owners_program(context, program)
         if do_compact:

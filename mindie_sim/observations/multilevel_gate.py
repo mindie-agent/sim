@@ -426,7 +426,7 @@ def validate_lineage(
         acq_uid = _req_str(b.acquisition_uid, f"acquisition_uid_missing:{case.case_id}")
         run_uid = _req_str(b.run_uid, f"run_uid_missing:{case.case_id}")
         session_scope = (b.session_id.strip() if b.session_id else "") or run_uid
-        if cap_root is not None or capture_files is not None:
+        if require_capture_files or cap_root is not None or capture_files is not None:
             cap_path = resolve_capture_file(
                 b.capture_uri, b.source_ref, capture_root=cap_root,
                 capture_files=capture_files, case_id=case.case_id, raw_sha256=raw_sha,
