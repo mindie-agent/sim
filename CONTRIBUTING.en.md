@@ -15,7 +15,7 @@ All hardware targets share the **single canonical execution spine, 7 architectur
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **Ascend A2** | `DAV_2201`<br/>(`npu_arch_2201`) | `Ascend910B1`, `B2`, `B2C`, `B3`, `B4`, `B4-1` (6 SKUs) | `a2`, `910b`, `910b1..b4`, `800i-a2` | Single-Die package (`20/24 AIC`), `L0C = 128 KiB`, `UB = 192 KiB`, `L2 = 192 / 96 MiB`, native BF16/INT8/INT4 (**no native FP8**), AIC<->AIV via GM/L2, 8P HCCS / 16P bridged | [**Ascend A2 Guide**](docs/contributing/ascend-a2.md) |
 | **Ascend A3** | `DAV_2201` Dual-Die<br/>(`npu_arch_2201`) | `Ascend910_9391`, `9392`, `9381`, `9382`, `9372`, `9362` (6 SKUs) | `a3`, `910c`, `800i-a3-8p`, `800i-a3-16p`, `a3-pod` | **Dual-Die package (`dies_per_package = 2`, 1 rank per Die `Phy-ID 0..15`)**, intra-package `SIO` (`448 GB/s`) + intra-node `HCCS_SW` + **CloudMatrix 384** SuperPoD, `L2 = 192 / 168 MiB` | [**Ascend A3 Guide**](docs/contributing/ascend-a3.md) |
-| **Ascend A5** | `DAV_3510`<br/>(`npu_arch_3510`) | `Ascend950DT_9581`, `9582`, `Ascend950PR_9579`, `Ascend950PR_958b` (4 SKUs) | `a5`, `950`, `950pr_958b`, `a5-pod`, `a5-server-dt`, `a5-pod-pr` | Single-Die package (`32 AIC / 64 AIV`), **`L0C = 256 KiB`**, `UB = 248 KiB`, `L2 = 128 MiB` (DT `4.0 TB/s` / PR `1.6` & `1.4 TB/s`), **native FP8/INT8/BF16**, on-chip `l0c->ub` path, `K_8` `per_pair` UB direct mesh & **Atlas 950 SuperPoD** | [**Ascend A5 Guide**](docs/contributing/ascend-a5.md) |
+| **Ascend A5** | `DAV_3510`<br/>(`npu_arch_3510`) | `Ascend950DT_9581`, `9582`, `Ascend950PR_9579`, `Ascend950PR_958b` (4 SKUs + commercial derived aliases `425-96`, `486-96`, `547-96`, `547-144`) | `a5`, `950`, `950pr_958b`, `425-96..547-144`, `a5-pod`, `a5-server-dt`, `a5-pod-pr` | Single-Die package (`32 AIC / 64 AIV` base, `28/32/36 AIC` derived SKUs), **`L0C = 256 KiB`**, `UB = 248 KiB`, `L2 = 128 MiB` (DT `4.0 TB/s` / PR `1.6` & `1.4 TB/s`), **native FP8/INT8/BF16**, on-chip `l0c->ub` path, `K_8` `per_pair` UB direct mesh & **Atlas 950 SuperPoD** | [**Ascend A5 Guide**](docs/contributing/ascend-a5.md) |
 
 ---
 
@@ -70,7 +70,7 @@ Every human contributor and coding Agent must obey all **7 iron prohibitions** b
 
    - **Conflict Resolution Rule**: Record the verified `{repository, revision}` before editing. Whenever an old issue description or historical assumption conflicts with fresh upstream source code + real `msprof` captures, **follow fresh upstream source + real captures** and document the upstream evolution in your PR evidence.
 2. **`mindie-sim <-> mindie-profiler` Cross-Repo SSOT Contract**:
-   - `mindie_sim.observed_contracts`, `mindie_sim.subgraph_math`, and `mindie_sim.structure*` act as the single source of truth consumed by `mindie-profiler` (for example, `execution.resource_geometry` in `structure.py` keeps only structural topology keys without mutable peak rates so `compare_cohorts` preserves stable `graph_id`s across calibrations, and `structure_physical.py` strips `ep_rank` recursively inside `fusion_phases`). Whenever you touch those modules or `source_boundary`, mount `../profiler` and run both test suites together.
+   - `mindie_sim.observed_contracts`, `mindie_sim.subgraph_math`, and `mindie_sim.structure*` act as the single source of truth consumed by `mindie-profiler`: [`mindie_sim/prediction/fusion_regions.py`](mindie_sim/prediction/fusion_regions.py) maintains single-owner fused region lineage (`absorbed_source_ops` vs. `FusionBoundary`, unioning `structure_subgraph_memberships` without double-charging shared composite calls); [`mindie_sim/compose_runtime.py`](mindie_sim/compose_runtime.py) stamps explicit `recipe_binding_origins` (`caller` / `stack_profile` / `body_default`); and [`mindie_sim/structure.py`](mindie_sim/structure.py) supports `--draft-prepare` / `draft_prepare=True` for prefill draft-KV preparation, keeps only structural topology keys in `execution.resource_geometry` so `compare_cohorts` preserves stable `graph_id`s across calibrations, and sanitizes CLI file inputs to `source: {"kind": "case_file", "sha256": ...}`. Whenever you touch those modules or `source_boundary`, mount `../profiler` and run both test suites together.
 
 ---
 
@@ -645,7 +645,8 @@ Reuse existing architecture builders (`deepseek.py`, `qwen.py`, `glm.py`, `kimi.
 
 > [!TIP]
 > - If a checkpoint includes a vision tower while only the text backbone is modeled, set `ModelSpec(..., accounting_scope="text_backbone")` explicitly; `"full_checkpoint"` requires modeling the vision tower and projector/aligner parameters in full.
-> - For native MTP / NextN / DSpark speculative heads, declare explicit `layer_plans`, embedding/LM-head sharing, and `execution_mode ∈ {"stack", "cyclic_nextn"}` in `DraftSpec`—never implicitly clone the final decoder layer.
+> - For native MTP / NextN / DSpark / Eagle3 speculative heads, declare explicit `layer_plans`, embedding/LM-head sharing, `execution_mode ∈ {"stack", "sequential_mtp", "cyclic_nextn", "block_dspark", "eagle3_serial"}`, and generalized draft context fields (`independent_context: bool`, `context_projection_mode ∈ {"none", "fused_kv_bank", "per_layer_qkv", "mla_prolog"}`, `dcp_sharded: bool`) in [`DraftSpec`](mindie_sim/catalog/draft_spec.py), and verify prefill draft-cache reconciliation via `mindie-sim structure --draft-prepare`, `mindie-sim graph --draft-prepare --export-structure`, and `compare_cohorts`—never implicitly clone the final decoder layer or assume external drafters use MLA.
+> - Across all **37 core catalog models + 4 distinct architecture presets (41 models across `G1–G11` families)**, preserve exact source-level structural truths: `Gemma-4` (`G10`) uses standard `RMSNorm` (`norm_weight_offset=0.0`, `4` norms on dense / `7` on MoE layers, weight-free `v_norm`, `k_eq_v=True` omitting `v_proj` on full-attention layers, and YOCO `num_kv_shared_layers`); `MiniMax-M3` / `M3.1-Flash` (`G8`) uses `(1+w)` `GemmaRMSNorm` (`norm_weight_offset=1.0`, `swigluoai`) plus the 7-layer dense GQA DSpark drafter ([`mindie_sim/catalog/minimax_draft.py`](mindie_sim/catalog/minimax_draft.py), `#20167`, `per_layer_qkv`, `dcp_sharded=False`); `Step-5-Preview` (`G9`) uses native CSA `_C_ascend.npu_indexer_region_score`, `supports_torch_compile=False` (`do_not_compile=True`), `fp32_residual=True`, and 3-layer `cyclic_nextn` (`92..94`); and `Kimi-K3` (`G5`) uses 5-layer GQA DSpark (`fused_kv_bank`, `dcp_sharded=False`, `#15851`) whereas `Kimi-K3.1` uses 5-layer MLA DSpark (`mla_prolog`).
 > - Delegate non-divisible expert parallelism (e.g., `E=288, EP=64`) to [`mindie_sim/catalog/expert_slots.py`](mindie_sim/catalog/expert_slots.py) rather than rejecting `E % EP != 0`.
 
 ### Step 3: Wire the Independent `torch.device("meta")` Reference Oracle & Manifest
@@ -763,34 +764,33 @@ You are contributing incremental Ascend hardware calibration (`A2` / `A3` / `A5`
 
 ---
 
-## 6. Onboarding Runtime Stacks & Three-State Feature Tracks
+## 6. Onboarding Runtime Stacks, Four-Rung Feature Waterfall & Orthogonal Compilation
 
-The simulator separates **what the hardware can do** from **what a serving stack has shipped**. Every optimization is a framework-neutral `OptimizationMechanism` (Layer 1) that a `RuntimeStackProfile` (Layer 2) binds to one of three explicit states:
+The simulator separates **what the hardware can do** from **what a serving stack has shipped**. Every optimization is a framework-neutral Layer-1 `OptimizationMechanism` ([`mindie_sim/feature_mechanisms.py`](mindie_sim/feature_mechanisms.py) and [`mindie_sim/feature_mechanisms_cann93.py`](mindie_sim/feature_mechanisms_cann93.py)) that a Layer-2 `RuntimeStackProfile` ([`mindie_sim/stack_tracks.py`](mindie_sim/stack_tracks.py)) resolves across **four explicit rungs**:
 
 | Track | Meaning | Selection |
 | :--- | :--- | :--- |
-| `merged` | Exactly what the stack's `main` branch runs today (default `vllm-ascend`) | `--feature-track merged` |
-| `unmerged_pr` | `merged` plus audited in-flight PRs modeled by their real physical mechanism | `--feature-track unmerged_pr` |
-| `expected_ideal` | Every structurally compatible mechanism, regardless of a served PR | `--feature-track expected_ideal` |
+| `raw_eager` | Framework-neutral unfused PyTorch/ATen eager baseline with graph capture and `torch.compile` off (never model-gated) | `--feature-track raw_eager` |
+| `merged` | Exactly what the stack's `main` branch runs today (default `vllm-ascend@405617bae` + CANN `9.3.0`) | `--feature-track merged` |
+| `unmerged_pr` | `merged` plus audited in-flight PRs modeled by their real physical mechanisms (preserving multi-PR option/ref unions) | `--feature-track unmerged_pr` |
+| `expected_ideal` | Stack-neutral first-principles ceiling activating every structurally eligible `OptimizationMechanism` for `(model, hardware, parallel)` | `--feature-track expected_ideal` |
 
-`mindie-sim feature-tracks --model <name> --hardware a5 --tp 8 --ep 8` prints the four-level waterfall (`current_merged` -> `current_unmerged_pr` -> `expected_ideal` -> `hardware_roofline`), and `--enable-opt` / `--disable-opt` isolate one mechanism for What-If A/B evaluation.
-
-Built-in `RUNTIME_STACKS` are deliberately limited to two profiles:
-- `vllm-ascend` — audited against the real `vllm-project/vllm-ascend` `main` branch and open performance PRs;
-- `raw_eager` — the framework-neutral unfused PyTorch/ATen baseline with zero optional fusions.
+- **Four-Rung Waterfall & Dual PR Ablations ([`mindie_sim/feature_waterfall.py`](mindie_sim/feature_waterfall.py))**: `mindie-sim feature-tracks --model <name> --hardware a5 --tp 8 --ep 8` evaluates **`raw_eager` -> `current_merged` -> `current_unmerged_pr` -> `expected_ideal` -> `hardware_roofline`** (`evaluate_target_efficiency(..., mode="exact_target")` for `0.80x` target and `1.0x` physical lower bounds), audits rung monotonicity, and emits both **`single_pr_ablation`** (`merged + {PR}`) and **`leave_one_out_ablation`** (`unmerged_pr - {PR}`). In `compose`, `--enable-opt` / `--disable-opt` isolate individual mechanisms for What-If A/B evaluation.
+- **CANN `9.3.0` + `vllm-ascend@405617bae` Provenance Manifest**: Built-in `RUNTIME_STACKS` are deliberately limited to source-audited `vllm-ascend` (backed by [`mindie_sim/stack_sources/vllm_ascend_cann93.json`](mindie_sim/stack_sources/vllm_ascend_cann93.json) and [`mindie_sim/va_stack_bindings.py`](mindie_sim/va_stack_bindings.py), capturing `_A5_PROFILE` capability truth—merged `MegaMoE(enable_fused_mc2=3)`, `Chunk64`, `_C_ascend.npu_hc_pre_v3/v2`, `GBSA`, `MlaPrologV4`, omitted `GRAPH_QKV_NORM_ROPE_FUSION`, plus 35 open PRs including `PR #22147` `Chunk32`, `PR #21794` `text_gated_residual`, `PR #22333` `situglu` MegaMoE, `PR #22467` C8 `KvQuantSFA`, and `PR #22235` `msa_index_score_v2`) and `raw_eager`.
+- **Orthogonal Two-Layer Compilation Flags on [`Software`](mindie_sim/schema/case.py)**: `Software` decouples outer `ModelRunner` capture (`graph_capture_mode ∈ {"none", "piecewise", "full"}`) from inner compiler flags (`enable_torch_compile`, `enable_npugraph_ex`, `enable_static_kernel`, `enable_super_kernel`): models with `do_not_compile=True` (`supports_torch_compile=False`, e.g., `Step-5-Preview` on `405617bae`) keep **`graph_capture_mode="full"`** (`FULL_DECODE_ONLY` `ACLGraph`) while disabling `enable_torch_compile` and `npugraph_ex`, whereas `graph_capture_mode != "full"` (`piecewise` / `none`) disables `enable_npugraph_ex`, `enable_static_kernel`, and `enable_super_kernel`.
 
 **Never register an unverified third-party stack as a built-in profile.** `mindie-llm`, `sglang`, `xllm`, and every other external framework onboard exclusively through a `mindie-sim.stack-manifest/1` JSON manifest or an explicit `register_runtime_stack(...)` in the contributor's own integration, and must declare the models they actually support:
 
 | Field | Meaning | Enforcement |
 | :--- | :--- | :--- |
-| `supported_models` | Models supported on the stack's **merged** `main` branch. Empty `()` means unrestricted / structural-only (e.g., `raw_eager`, or the `vllm-ascend` catalog fallback). | A non-empty list gates `merged` and also counts as supported on `unmerged_pr`. |
+| `supported_models` | Models supported on the stack's **merged** `main` branch. Empty `()` means unrestricted / structural-only (e.g., `raw_eager`). | A non-empty list gates `merged` and also counts as supported on `unmerged_pr`. |
 | `unmerged_pr_models` | Models whose architecture onboarding itself is still an **open PR** on that stack. | A non-empty list additionally permits those models on `unmerged_pr`, never on `merged`. |
 
-With either field non-empty, `resolve_stack_track(...)` raises `model_not_supported_by_runtime_stack:<stack>:<model>:<track>` when a real stack track cannot serve the model. `expected_ideal` is **always** allowed: it is stack-neutral first-principles modeling and must never be blocked by an upstream framework's lack of model support.
+With either field non-empty, `resolve_stack_track(...)` raises `model_not_supported_by_runtime_stack:<stack>:<model>:<track>` when a real stack track cannot serve the model. `raw_eager` and `expected_ideal` are **always** allowed: `expected_ideal` is stack-neutral first-principles modeling and must never be blocked by an upstream framework's lack of model support.
 
 1. **Pure JSON onboarding (zero Python changes)**: write a `mindie-sim.stack-manifest/1` document declaring `name`, `repository`, optional `supported_models` / `unmerged_pr_models`, and `bindings` (`mechanism_id` from `list_optimization_mechanisms()`, `state: "merged" | "unmerged_pr"`, `ref: "<org>/<repo>#<PR>"`, optional `models` / `archs` / `options`), then pass `--stack-manifest my_stack.json` to `mindie-sim compose` or `mindie-sim feature-tracks` (or `runtime_stack="my_stack.json"` in Python).
 2. **Registering new physical mechanisms**: call `register_optimization_mechanism(OptimizationMechanism(...))` with real `OpSpec` / lowering-pass / `Software` transformations executed by the canonical engine. Never encode a latency multiplier; a mechanism must remove modeled traffic, fuse a declared boundary, or change a real `Software` field.
-3. **Syncing open vs. merged PRs**: run `python3 scripts/audit_stack_prs.py --stack <name> --repo <owner/repo>` (or `--offline-fixture snapshot.json` in CI) to detect PRs that merged onto `main` (promote `unmerged_pr` -> `merged`) and newly opened performance PRs that are not cataloged yet.
+3. **Syncing open vs. merged PRs**: run `python3 scripts/audit_stack_prs.py --stack cann93` (or `--stack <name> --repo <owner/repo>`, or `--offline-fixture snapshot.json` in CI) to detect PRs that merged onto `main` (promote `unmerged_pr` -> `merged`) and newly opened performance PRs that are not cataloged yet.
 
 ---
 

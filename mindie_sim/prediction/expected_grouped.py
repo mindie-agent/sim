@@ -12,6 +12,9 @@ import math
 
 ROW_TILE = 128
 FRACTAL = 16
+A5_MXFP4_LOW_OCC_ROWS = 16
+A5_MXFP4_DECODE_UNPACK_FRAC = 0.65
+A5_MXFP4_FORMATS = frozenset({"mxfp4", "fp4", "fp4_e2m1"})
 
 
 def inclusion_probability(probabilities, *, tokens):
@@ -104,8 +107,27 @@ class ExpectedGroupedMatmul:
         if group_rows is not None:
             from .matrix_steady import SteadyMatmul
             if isinstance(self.matrix, SteadyMatmul):
-                return self.matrix.lower(mapped_context, group_rows=group_rows)
-        return self.matrix.lower(mapped_context)
+                inner = self.matrix.lower(mapped_context, group_rows=group_rows)
+            else:
+                inner = self.matrix.lower(mapped_context)
+        else:
+            inner = self.matrix.lower(mapped_context)
+        if (
+            "mte2_aic_dram" in context.service_modes
+            and op.phase == "decode"
+            and str(meta.get("weight_format", "")) in A5_MXFP4_FORMATS
+            and per_bank <= A5_MXFP4_LOW_OCC_ROWS
+            and "hbm" in context.resource_names
+        ):
+            hbm_rate = float(context.rates.get(context.resource_names["hbm"], 0.0))
+            if hbm_rate > 0.0:
+                from .program import KernelProgram, Stage
+                extra_ms = A5_MXFP4_DECODE_UNPACK_FRAC * (float(op.hbm_bytes) / hbm_rate)
+                return KernelProgram((
+                    Stage("a5_mxfp4_unpack", latency=extra_ms),
+                    Stage("gmm_body", after=("a5_mxfp4_unpack",), program=inner),
+                ))
+        return inner
 
 
 def adapt(recipe, op):

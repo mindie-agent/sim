@@ -10,30 +10,27 @@ from mindie_sim.schema.common import dtype_bytes
 
 
 LAYER_NORM_SOURCE = {
-    "repository": "vllm",
-    "base_revision": "58d3918e3ea0a544ffedadad2ba84559e9c51d8f",
-    "source_state": "clean_at_revision",
-    "path": "vllm/model_executor/layers/layernorm.py",
-    "sha256": "3460eba01758849027bb59b8592626406e33ab25b23d2def729bb0ec42afce67",
-    "symbol": "LayerNorm.forward", "lines": [310, 325],
+    "repository": "vllm-project/vllm-ascend",
+    "revision": "405617bae227fe5b097ff163efaa60bb7f22c698",
+    "relative_path": "vllm_ascend/ops/layernorm.py",
+    "source_sha256": "5d23daa6eba43ddcefcb7ef79a1a2894e3d38a90d9c02ddfe9120f88e8ef745d",
+    "symbol": "LayerNorm.forward",
     "scope": "independent_source_semantics; not_capture_binary_identity",
 }
 BATCHED_MATRIX_SOURCE = {
-    "repository": "vllm-ascend",
-    "base_revision": "175ef4d49c2072f9233619636f0309f4f88b4e2c",
-    "source_state": "clean_at_revision",
-    "path": "vllm_ascend/attention/sfa_v1.py",
-    "sha256": "c4ea3f33ba6c71d9a9163dc397c12d92dba67aa26c292ab1ce52605b3c91ad42",
-    "symbol": "_q_proj_and_k_up_proj/_v_up_proj", "lines": [917, 948],
+    "repository": "vllm-project/vllm-ascend",
+    "revision": "405617bae227fe5b097ff163efaa60bb7f22c698",
+    "relative_path": "vllm_ascend/attention/sfa_v1.py",
+    "source_sha256": "058aeb723a4ef3cdb0e07a5fc0180ec53f8227f62d98710144ecffb9cc66678f",
+    "symbol": "_q_proj_and_k_up_proj/_v_up_proj",
     "scope": "independent_source_semantics; not_capture_binary_identity",
 }
 GROUPED_OUTPUT_SOURCE = {
-    "repository": "vllm-ascend",
-    "base_revision": "ae923905948f360f4b7ab06df52d0789a0c9316e",
-    "source_state": "clean_at_revision",
-    "path": "vllm_ascend/attention/dsa_v1.py",
-    "sha256": "3fb4e94672e6adb931cb2e2a164201000822fe89250fd3bfd3585ba397acf52e",
-    "symbol": "npu_transpose_batchmatmul", "lines": [1530, 1572],
+    "repository": "vllm-project/vllm-ascend",
+    "revision": "405617bae227fe5b097ff163efaa60bb7f22c698",
+    "relative_path": "vllm_ascend/attention/dsa_v41.py",
+    "source_sha256": "1da24c133d0fd473e367aea28419dabd7f42d5e90e4a9215c35e787c182cc195",
+    "symbol": "npu_transpose_batchmatmul",
     "scope": "independent_source_semantics; not_capture_binary_identity",
 }
 

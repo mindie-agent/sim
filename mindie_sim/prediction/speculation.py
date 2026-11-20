@@ -117,7 +117,14 @@ def draft_program(frontend, model, runtime, views, ready, *, global_views=None, 
     all_active = tuple(view for view in (global_views or views) if selected_view(view))
     # Autoregressive MTP computes one proposal at a time. A parallel block
     # drafter computes its declared query block in one transformer pass.
-    serial = not prefill and not draft.noncausal_query_block and draft.kind == "mtp"
+    serial = (
+        not prefill
+        and not draft.noncausal_query_block
+        and (
+            draft.kind == "mtp"
+            or draft.execution_mode in {"sequential_mtp", "cyclic_nextn", "eagle3_serial"}
+        )
+    )
     steps = max(view.draft_proposal_tokens for view in all_active) if serial else 1
     plans = draft_layer_plans(model, kind)
     draft_model = replace(
@@ -132,14 +139,25 @@ def draft_program(frontend, model, runtime, views, ready, *, global_views=None, 
     context_prolog_v3 = True
     if external_context:
         from .draft_context import draft_cache_requires_prolog_v3
-        context_prolog_v3 = draft_cache_requires_prolog_v3(
-            model, runtime=runtime, machine=machine)
+        draft_kv_dtype = str(getattr(draft_model.quant, "kv_dtype", "") or "bf16")
+        if draft.attention_kind == "mla":
+            context_prolog_v3 = draft_cache_requires_prolog_v3(
+                model, runtime=runtime, machine=machine)
+            cache_reps = {"mla_kv": {"dtype": draft_kv_dtype}}
+        else:
+            context_prolog_v3 = False
+            cache_reps = {
+                "gqa_kv": {"dtype": draft_kv_dtype},
+                "kv_cache": {"dtype": draft_kv_dtype},
+            }
         metadata = dict(draft_model.metadata)
         metadata.pop("cache_allocator", None)
-        metadata["cache_representations"] = {"mla_kv": {"dtype": "bf16"}}
+        metadata["cache_representations"] = cache_reps
         metadata["attention_execution"] = {
             **metadata.get("attention_execution", {}), "dcp_indexer_sharded": False}
-        draft_model = replace(draft_model, kv_dtype="bf16", metadata=tuple(metadata.items()))
+        draft_model = replace(
+            draft_model, kv_dtype=draft_kv_dtype, metadata=tuple(metadata.items())
+        )
     regions, previous = [], ready
     stage = runtime.parallel.pp - 1
     # ``index_share_for_mtp_iteration`` reuses one TopK selection across the
@@ -177,8 +195,13 @@ def draft_program(frontend, model, runtime, views, ready, *, global_views=None, 
             global_views=global_proposals, model_scope="draft")
         from .frontend import mark_analytical_runtime
         selected_runtime = mark_analytical_runtime(selected_runtime, selections)
-        if external_context:
+        if external_context and draft.attention_kind == "mla":
             selected_runtime = _independent_draft_runtime(selected_runtime, selections)
+        if external_context and not draft.dcp_sharded and selected_runtime.parallel.cp > 1:
+            selected_runtime = replace(
+                selected_runtime,
+                parallel=replace(selected_runtime.parallel, cp=1),
+            )
         # Sequence-parallel lowering is body-scoped; draft_program manages TP
         # feature gather explicitly before entering the draft body.
         if "sequence_parallel" in selected_runtime.kernels:

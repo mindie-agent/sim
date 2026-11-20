@@ -58,6 +58,7 @@ OCCURRENCE_FIELDS = frozenset({
 
 #: Metadata keys whose values name other occurrences and must be normalized.
 REFERENCE_KEYS = frozenset({
+    "absorbed_source_ops",
     "activation_input_segments",
     "activation_payload_producer",
     "activation_residual_inputs",
@@ -65,7 +66,9 @@ REFERENCE_KEYS = frozenset({
     "audit_trail",
     "binding_name",
     "collective_id",
+    "composite_shared_subgraphs",
     "device_kernel_group",
+    "folded_subgraph_key",
     "fused_members",
     "fused_origin_scopes",
     "fusion_boundary",
@@ -78,6 +81,8 @@ REFERENCE_KEYS = frozenset({
     "input_ports",
     "inverse_index_producer",
     "kda_recurrent_params",
+    "output_port_aliases",
+    "primary_anchor_id",
     "recover_ssm_geometry",
     "prefix_cache_reads",
     "kda_state_contract",
@@ -89,6 +94,7 @@ REFERENCE_KEYS = frozenset({
     "quantizer_op",
     "receive_allocation",
     "reverse_of_collective",
+    "semantic_metadata",
     "storage",
     "synchronization_boundary",
     "typed_outputs",

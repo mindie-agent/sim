@@ -523,6 +523,7 @@ class SubmissionPolicy:
     scheduler_ms: float = 0
     completion_ms: float = 0
     kernel_launch_ms: float | None = None
+    piecewise_sync_ms: float = 0.0
 
     def launch_ms(self, dies, *, captured=False):
         """Software submission overrides the explicit legacy device parameter."""
@@ -4283,6 +4284,15 @@ class Execution:
                     dies = self.stage_dies[stage_key]
                     duration = self.submission.launch_ms(dies, captured=captured)
                     host_deps = (prepared,) + ((self.hosts[stage_key],) if stage_key in self.hosts else ())
+                    if (
+                        captured
+                        and scope == "piecewise"
+                        and self.submission.piecewise_sync_ms > 0.0
+                    ):
+                        if deps:
+                            host_deps = tuple(deps) + host_deps
+                        if self.submission_counts["graph_replays"] > 0:
+                            duration += float(self.submission.piecewise_sync_ms)
                     launch = engine.submit(name + ":submit", {names["host"]: duration},
                                            after=host_deps, owner=owner)
                     self.hosts[stage_key] = launch

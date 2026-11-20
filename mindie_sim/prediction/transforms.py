@@ -17,14 +17,13 @@ import math
 
 from mindie_sim.catalog.ops import vector_op
 from mindie_sim.schema.common import ModelingError, dtype_bytes
+from .fusion_regions import fold_region_metadata_dict
 from .implementations import (
-    add_input_ports, append_audit, attach_quantized_ports,
-    capture_fusion_overlap, field_disposition, input_ports, member_contracts,
+    add_input_ports, append_audit,
+    capture_fusion_overlap, field_disposition, input_ports,
     set_input_ports,
-    merge_typed_roles, nested_boundary, producer_input_values, produced_values,
-    replaced_occurrences, rewire_replacement, rewire_replacements,
-    semantic_attrs, typed_outputs,
-    typed_roles, typed_value,
+    merge_typed_roles, producer_input_values, produced_values,
+    typed_outputs,
 )
 from .passes_ffn_fusion import (
     activation_quant_fusion,
@@ -39,6 +38,22 @@ from .passes_mhc_recurrent import (
     mhc_boundary_fusion_overlap,
     qkv_norm_rope_fusion,
 )
+from .transform_norm_quant import (
+    _norm_quant_domain,
+    norm_quant,
+    residual_norm,
+)
+
+TORCH_COMPILE_PASSES = frozenset({
+    "norm_quant",
+    "activation_quant",
+    "gmm_swiglu_quant",
+    "moe_tail_residual",
+})
+NPUGRAPH_EX_PASSES = frozenset({
+    "gmm_swiglu_quant",
+    "moe_tail_residual",
+})
 
 
 # A selected source subgraph owns its own kernel boundaries.  A generic rewrite
@@ -106,129 +121,8 @@ def _rewrite_outside_native_groups(fn, ops, source_dtype, excluded):
     return aliased
 
 
-def _value_map(ops):
-    result = {}
-    for op in ops:
-        try:
-            result[op.op_id] = produced_values(op)
-        except ModelingError:
-            result[op.op_id] = ()
-    return result
-
-
-def _first_value(values):
-    return values[0] if values else None
-
-
-def _declared_input_bytes(op):
-    metadata = dict(op.metadata)
-    dtype = str(metadata.get("input_format") or metadata.get("activation_format")
-                or op.dtype or "")
-    try:
-        return float(math.prod(op.local_shape) * dtype_bytes(dtype))
-    except (KeyError, ValueError, TypeError):
-        return 0.0
-
-
-def _same_representation(op, values):
-    if not values:
-        return True
-    metadata = dict(op.metadata)
-    if metadata.get("input_repeats") or metadata.get("operand_read_bytes"):
-        return False
-    declared = str(metadata.get("input_format") or metadata.get("activation_format")
-                   or op.dtype or "")
-    elements = math.prod(op.local_shape)
-    for value in values:
-        if str(value.get("dtype")) != declared:
-            return False
-        logical_elems = math.prod(value.get("logical_shape") or ())
-        storage_elems = math.prod(value.get("storage_shape") or ())
-        written_bytes = value.get("write_bytes")
-        try:
-            expected_bytes = elements * dtype_bytes(declared)
-        except (KeyError, ValueError, TypeError):
-            expected_bytes = None
-        if (logical_elems != elements and storage_elems != elements
-                and (written_bytes is None or expected_bytes is None
-                     or not math.isclose(float(written_bytes), float(expected_bytes)))):
-            return False
-    return True
-
-
-def _parameter_read_bytes(op):
-    metadata = dict(op.metadata)
-    declared = (metadata.get("parameter_read_bytes")
-                or metadata.get("parameter_reads") or {})
-    if isinstance(declared, dict):
-        total = sum(float(value) for value in declared.values())
-    elif isinstance(declared, (int, float)) and not isinstance(declared, bool):
-        total = float(declared)
-    else:
-        total = 0.0
-    for key in ("norm_gamma_runtime_bytes", "norm_gamma_bytes",
-                "gamma_read_bytes", "parameter_bytes"):
-        value = metadata.get(key)
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            total = max(total, float(value))
-    return total
-
-
-def _access_read(values, fallback):
-    reads = [value.get("read_bytes") for value in values
-             if value.get("read_bytes") is not None]
-    return sum(reads) if reads else fallback
-
-
-def _read_bytes(value, op, *, fallback=0.0):
-    if value is None:
-        return fallback
-    actual = value.get("write_bytes")
-    if actual is None:
-        actual = value.get("storage_bytes") or value.get("bytes")
-    if actual is None:
-        return fallback
-    metadata = dict(op.metadata)
-    declared_dtype = str(metadata.get("input_format") or metadata.get("activation_format")
-                         or op.dtype or "")
-    declared = fallback
-    try:
-        declared = math.prod(op.local_shape) * dtype_bytes(declared_dtype)
-    except (KeyError, ValueError, TypeError):
-        declared = fallback
-    return float(actual) + max(0.0, float(op.mte2_bytes) - float(declared))
-
-
-def _users(ops):
-    users = defaultdict(list)
-    for op in ops:
-        for dep in op.deps:
-            users[dep].append(op.op_id)
-    return users
-
-
 def _fusion_metadata(*ops):
-    merged, origins = {}, {}
-    for op in ops:
-        meta = dict(op.metadata)
-        merged.update(meta)
-        for origin in meta.get("fused_origin_scopes", ()):
-            origins[origin["op_id"]] = origin
-        origins[op.op_id] = {
-            "op_id": op.op_id, "layer": op.layer, "stage": op.stage,
-            "block": meta.get("structure_block"), "role": meta.get("structure_role"),
-        }
-    for key in ("structure_subgraph_memberships", "structure_subgraph_entries",
-                "structure_subgraphs"):
-        values = []
-        for op in ops:
-            for value in dict(op.metadata).get(key, ()):
-                if value not in values:
-                    values.append(value)
-        if values:
-            merged[key] = tuple(values)
-    merged["fused_origin_scopes"] = tuple(origins.values())
-    return merged
+    return fold_region_metadata_dict(ops)
 
 
 def activation_quantization(ops, source_dtype):
@@ -416,424 +310,6 @@ def activation_quantization(ops, source_dtype):
     return result
 
 
-#: Declared native groups that already own their norm/quantization boundary.
-_OWNED_FUSION_ROLES = ("mla_prolog", "compressor")
-
-
-def _declared_fusion_owns(op):
-    """True when a native group declaration owns this node's boundary."""
-    memberships = dict(op.metadata).get("structure_subgraph_memberships", ())
-    return any(str(key).rsplit(".", 1)[-1] in _OWNED_FUSION_ROLES
-               for key in memberships or ())
-
-
-def _norm_quant_domain(kernels):
-    domains = kernels.get("fusion_domains", {})
-    if not isinstance(domains, Mapping) or set(domains) - {"norm_quant"}:
-        raise ModelingError("fusion_domains_require_declared_norm_quant_consumer_domain")
-    raw = domains.get("norm_quant")
-    if raw is None:
-        return None, "eliminate"
-    if not isinstance(raw, Mapping) or set(raw) - {"consumers", "external_outputs"}:
-        raise ModelingError("norm_quant_domain_requires_consumers")
-    if "consumers" not in raw:
-        raise ModelingError("norm_quant_domain_requires_consumers")
-    selectors = raw["consumers"]
-    fields = {"recipe", "family", "structure_block", "structure_role"}
-    if (not isinstance(selectors, (list, tuple)) or any(
-            not isinstance(item, Mapping) or not item or set(item) - fields
-            or any(not isinstance(value, str) or not value for value in item.values())
-            for item in selectors)):
-        raise ModelingError("norm_quant_consumers_require_semantic_recipe_family_or_structure_selectors")
-    external = raw.get("external_outputs", "eliminate")
-    if external not in {"eliminate", "materialize"}:
-        raise ModelingError("norm_quant_external_output_mode_unknown")
-    return tuple(dict(item) for item in selectors), external
-
-
-def _consumers_match(consumer_ids, by_id, selectors):
-    if selectors is None:
-        return True
-    # A shared payload/scales conversion is one producer. Fusion can only be
-    # selected if every consumer permits the complete fused call boundary.
-    def matches(op, rule):
-        metadata = dict(op.metadata)
-        return all((getattr(op, key) if key in {"recipe", "family"} else
-                    metadata.get(key)) == value for key, value in rule.items())
-    return bool(consumer_ids) and all(any(matches(by_id[node], rule) for rule in selectors)
-                                      for node in consumer_ids)
-
-
-def _capture_state(op, partition):
-    metadata = dict(op.metadata)
-    fallback = (metadata.get("graph_captured"), metadata.get("graph_segment"))
-    if partition is not None:
-        return partition.get(op.op_id, fallback)
-    return fallback
-
-
-def norm_quant(ops, _, *, consumers=None, external_output="eliminate",
-               capture_state=None):
-    if external_output not in {"eliminate", "materialize"}:
-        raise ModelingError("norm_quant_external_output_mode_unknown")
-    by_id, users = {op.op_id: op for op in ops}, _users(ops)
-    positions = {op.op_id: index for index, op in enumerate(ops)}
-    values_by_id = _value_map(ops)
-    replacements, removed, ports, removed_map = {}, set(), {}, {}
-    for op in ops:
-        if op.plan_required or op.family != "quantize" or len(op.deps) != 1:
-            continue
-        norm = by_id.get(op.deps[0])
-        if (norm is None or norm.plan_required or norm.family != "rmsnorm"
-                or norm.local_shape != op.local_shape or norm.stage != op.stage
-                or norm.stream != op.stream):
-            continue
-        if _declared_fusion_owns(norm) or _declared_fusion_owns(op):
-            # A selected native prolog/compressor plan owns the complete
-            # normalization and quantization boundary; a second generic fusion
-            # would split that boundary and double-charge its intermediate.
-            continue
-        if op.op_id not in users[norm.op_id]:
-            continue
-        external = [user for user in users[norm.op_id] if user != op.op_id]
-        norm_values = produced_values(norm)
-        norm_primary = (norm_values[0].get("output") if norm_values else "norm")
-        external_norm_outputs = set()
-        external_records = []
-        for user in external:
-            entries = [entry for entry in input_ports(by_id[user])
-                       if entry.get("op") == norm.op_id]
-            if entries:
-                names = {value.get("output") for value in norm_values}
-                for entry in entries:
-                    output = entry.get("output")
-                    if output not in names:
-                        output = norm_primary
-                    external_norm_outputs.add(output)
-                    external_records.append({
-                        "consumer": user, "source_op": norm.op_id,
-                        "output": output})
-            else:
-                external_norm_outputs.add(norm_primary)
-                external_records.append({
-                    "consumer": user, "source_op": norm.op_id,
-                    "output": norm_primary})
-        external_primary = norm_primary in external_norm_outputs
-        if external_primary and external_output != "materialize":
-            # Keep the old producer/consumer pair when no caller selected the
-            # legal "fuse and still materialize the norm output" plan.
-            continue
-        if [user for user in users[norm.op_id]
-                if by_id[user].family == "quantize"] != [op.op_id]:
-            # Two quantization consumers mean two overlapping fused plans;
-            # leave the shared producer standalone instead of double-charging.
-            continue
-        # A fused plan may still materialize the norm output for a later
-        # consumer, but it cannot move the output before the fused occurrence.
-        if any(positions[user] < positions[op.op_id] for user in external):
-            continue
-        if _capture_state(norm, capture_state) != _capture_state(op, capture_state):
-            # Capture boundaries are not fusion boundaries.  Do not fold a
-            # graph-captured producer into an eager consumer (or vice versa).
-            continue
-        if not _consumers_match(users[op.op_id], by_id, consumers):
-            continue
-        norm_meta = dict(norm.metadata)
-        quant_meta = dict(op.metadata)
-        norm_inputs = producer_input_values(norm, values_by_id)
-        norm_input_value = _first_value(norm_inputs)
-        norm_dtype = str(norm_meta.get("output_format") or norm.dtype)
-        outputs = list(typed_outputs(op))
-        if outputs:
-            outputs[0] = {**outputs[0], "output": "payload", "role": "activation",
-                          "source": f"{op.op_id}:output_format"}
-        for norm_value in norm_values:
-            value_output = norm_value.get("output")
-            if value_output == norm_primary:
-                if not external_primary:
-                    continue
-                port = "norm"
-            elif value_output in external_norm_outputs:
-                port = value_output
-            else:
-                continue
-            outputs.append({**norm_value, "producer": op.op_id,
-                            "output": port, "role": "external_intermediate",
-                            "materialized": True})
-        outputs = tuple(outputs)
-        if _same_representation(norm, norm_inputs):
-            read = norm.mte2_bytes
-        else:
-            read = (_access_read(norm_inputs, norm.mte2_bytes)
-                    + _parameter_read_bytes(norm))
-        external_norm_writes = sum(
-            float(value.get("write_bytes") or 0.0)
-            for value in norm_values
-            if ((value.get("output") == norm_primary and external_primary)
-                or value.get("output") in external_norm_outputs))
-        write = op.mte3_bytes + external_norm_writes
-        exposed_norm_names = tuple(
-            "norm" if value.get("output") == norm_primary else value.get("output")
-            for value in norm_values
-            if ((value.get("output") == norm_primary and external_primary)
-                or value.get("output") in external_norm_outputs))
-        returned = tuple(dict.fromkeys((*op.returns, *exposed_norm_names)))
-        capture = capture_fusion_overlap((norm, op), kind="norm_quant")
-        dispositions = (
-            field_disposition("normalization.input", "consume", norm.op_id,
-                              "read once by the fused normalization"),
-            field_disposition("normalization.weight", "preserve", norm.op_id,
-                              "gamma runtime/storage representation is retained"),
-            field_disposition("normalization.epsilon", "preserve", norm.op_id,
-                              "normalization attribute is retained"),
-            field_disposition("normalization.output", "rewrite", op.op_id,
-                              ("materialized as the named norm port" if external else
-                               "eliminated as a private intermediate")),
-            field_disposition("quantization.payload", "rewrite", op.op_id,
-                              "payload is a fused output value"),
-            field_disposition("quantization.scales", "rewrite", op.op_id,
-                              "scale shape/format are separate from the payload"),
-            field_disposition("quantization.group_size", "consume", op.op_id,
-                              "grouped amax/scale reduction"),
-        )
-        boundary = {
-            "kind": "norm_quant",
-            "replaces_work": True, "replaces_allocation": True,
-            "replaced_occurrences": (norm.op_id, op.op_id),
-            "replacement_occurrence": op.op_id,
-            "work": {"mte2_bytes": read, "mte3_bytes": write,
-                     "hbm_bytes": read + write,
-                     "vector_ops": norm.vector_ops + op.vector_ops,
-                     "flops": op.flops},
-            "allocations": {
-                "replaced": (norm.op_id, op.op_id),
-                "materialized": tuple(value["output"] for value in outputs),
-                "eliminated": (() if external else ("normalization.output",)),
-            },
-            "external_outputs": exposed_norm_names,
-            "external_consumers": tuple(external_records),
-            "events": {"deps": list(norm.deps), "stream": op.stream or "main",
-                       "outputs": list(returned)},
-            "capture": capture["capture"],
-            "overlap": capture["overlap"],
-            "capture_fusion_overlap_separate": True,
-            "field_dispositions": dispositions,
-            "inputs": tuple(norm_inputs),
-        }
-        meta = _fusion_metadata(norm, op)
-        meta.update({
-            "fused_from": ("rmsnorm", "quantize"),
-            "primary_output": "payload",
-            "norm_output_materialized": bool(external),
-        })
-        audit = {
-            **boundary,
-            "transform_members": member_contracts((norm, op)),
-            "typed_outputs": outputs,
-            "typed_roles": merge_typed_roles(norm, op),
-            "semantic_attrs": semantic_attrs(
-                (norm, op), ("reduction_width", "norm_eps", "epsilon",
-                             "activation_group_size", "activation_scale_shape",
-                             "activation_scale_format")),
-            "output_ports": tuple(
-                {"output": value["output"], "dtype": value["dtype"],
-                 "role": value["role"], "materialized": value["materialized"]}
-                for value in outputs),
-            "selection": {"basis": "selected_software_plan",
-                          "kind": "norm_quant"},
-        }
-        append_audit(meta, kind="transform_boundary", op_id=op.op_id,
-                     boundary=audit, layer=op.layer, stage=op.stage,
-                     block=meta.get("structure_block"),
-                     role=meta.get("structure_role"))
-        if consumers is not None:
-            meta["fusion_consumer_domain"] = {"pass": "norm_quant", "consumers": consumers}
-        fused = replace(
-            op, family="rmsnorm_quant", recipe="rmsnorm_quantize", deps=norm.deps,
-            vector_ops=norm.vector_ops + op.vector_ops,
-            mte2_bytes=read, mte3_bytes=write, hbm_bytes=read + write,
-            returns=returned, metadata=tuple(meta.items()),
-        )
-        replacements[op.op_id] = fused
-        removed.add(norm.op_id)
-        removed_map[norm.op_id] = op.op_id
-        if exposed_norm_names:
-            ports[norm.op_id] = {
-                ("norm" if value.get("output") == norm_primary else value.get("output")):
-                ("norm" if value.get("output") == norm_primary else value.get("output"))
-                for value in norm_values
-                if ((value.get("output") == norm_primary and external_primary)
-                    or value.get("output") in external_norm_outputs)}
-    if not replacements:
-        return list(ops)
-    aliases = {old: old for old in replacements}
-    # Each removed norm points at its own quant replacement; multiple fusions
-    # in one graph must not alias across layers.
-    aliases.update(removed_map)
-    result = rewire_replacements(
-        ops, replacements=replacements, aliases=aliases,
-        removed=removed, ports=ports)
-    return attach_quantized_ports(result, replacements)
-
-
-def residual_norm(ops, _, *, capture_state=None):
-    by_id, users = {op.op_id: op for op in ops}, _users(ops)
-    positions = {op.op_id: index for index, op in enumerate(ops)}
-    values_by_id = _value_map(ops)
-    replacements, removed, residual_map, ports = {}, set(), {}, {}
-    for norm in ops:
-        if (norm.plan_required or "implementation_binding" in dict(norm.metadata)
-                or norm.family not in {"rmsnorm", "rmsnorm_quant"}
-                or len(norm.deps) != 1):
-            continue
-        residual = by_id.get(norm.deps[0])
-        if (residual is None or residual.plan_required or residual.recipe != "residual_add"
-                or residual.op_id in removed):
-            continue
-        if (norm.stage != residual.stage or norm.stream != residual.stream
-                or math.prod(norm.local_shape) != math.prod(residual.local_shape)
-                or any(positions[user] < positions[norm.op_id]
-                       for user in users[residual.op_id])):
-            continue
-        if _capture_state(norm, capture_state) != _capture_state(residual, capture_state):
-            continue
-        # The residual is still consumed by subsequent sublayers. It remains an
-        # explicit output of the fused operator, unlike the eliminated norm input.
-        residual_inputs = producer_input_values(residual, values_by_id)
-        residual_input_value = _first_value(residual_inputs)
-        residual_meta = dict(residual.metadata)
-        residual_same = _same_representation(residual, residual_inputs)
-        norm_inputs_for_read = producer_input_values(norm, values_by_id)
-        norm_same = _same_representation(norm, norm_inputs_for_read)
-        if residual_same and norm_same:
-            read = residual.mte2_bytes + norm.mte2_bytes - residual.mte3_bytes
-        else:
-            residual_read = (_access_read(residual_inputs, residual.mte2_bytes)
-                             + _parameter_read_bytes(residual))
-            norm_read = (_access_read(norm_inputs_for_read, norm.mte2_bytes)
-                         + _parameter_read_bytes(norm))
-            read = residual_read + norm_read - residual.mte3_bytes
-        write = norm.mte3_bytes + residual.mte3_bytes
-        quantized = norm.family == "rmsnorm_quant"
-        norm_meta = dict(norm.metadata)
-        residual_meta = dict(residual.metadata)
-        nested = nested_boundary(norm)
-        outputs = list(norm_meta.get("typed_outputs", ()) or
-                       nested.get("typed_outputs", ()))
-        if outputs:
-            # A previously selected norm/quant plan already names its payload,
-            # scales and any externally materialized norm output.
-            if not quantized:
-                outputs[0] = {**outputs[0], "output": "norm", "role": "activation"}
-        else:
-            outputs = list(typed_outputs(norm))
-            if not quantized and outputs:
-                outputs[0] = {**outputs[0], "output": "norm", "role": "activation"}
-        residual_value = produced_values(residual)[0] if produced_values(residual) else None
-        if residual_value is not None:
-            outputs.append({**residual_value, "producer": norm.op_id,
-                            "output": "residual", "role": "residual",
-                            "materialized": True})
-        outputs = tuple(outputs)
-        returned = tuple(dict.fromkeys((*norm.returns, "residual")))
-        external_residual = [user for user in users[residual.op_id] if user != norm.op_id]
-        dispositions = (
-            field_disposition("residual.input", "consume", residual.op_id,
-                              "residual inputs feed the fused add"),
-            field_disposition("residual.output", "preserve", norm.op_id,
-                              "residual is still consumed by later sublayers"),
-            field_disposition("normalization.output", "preserve", norm.op_id,
-                              "norm payload remains the primary fused output"),
-            field_disposition("normalization.epsilon", "preserve", norm.op_id,
-                              "normalization attribute is retained"),
-        )
-        if quantized:
-            dispositions += (
-                field_disposition("quantization.scales", "rewrite", norm.op_id,
-                                  "scale values remain a separate output"),
-                field_disposition("quantization.group_size", "consume", norm.op_id,
-                                  "grouped quantization is unchanged"),
-            )
-        capture = capture_fusion_overlap((residual, norm), kind="residual_norm")
-        external_outputs = ("residual",) + (
-            ("norm",) if (not quantized
-                          or norm_meta.get("norm_output_materialized")) else ())
-        boundary = {
-            "kind": "residual_norm",
-            "replaces_work": True, "replaces_allocation": True,
-            "replaced_occurrences": replaced_occurrences(residual, norm),
-            "replacement_occurrence": norm.op_id,
-            "work": {"mte2_bytes": read, "mte3_bytes": write,
-                     "hbm_bytes": read + write,
-                     "vector_ops": residual.vector_ops + norm.vector_ops,
-                     "flops": norm.flops},
-            "allocations": {
-                "replaced": replaced_occurrences(residual, norm),
-                "materialized": tuple(value["output"] for value in outputs),
-                "eliminated": ("residual.intermediate_write",
-                               *nested.get("allocations", {}).get("eliminated", ())),
-            },
-            "external_outputs": external_outputs,
-            "external_consumers": (
-                *nested.get("external_consumers", ()),
-                *(  {"consumer": user, "source_op": residual.op_id,
-                     "output": "residual"} for user in external_residual)),
-            "events": {"deps": list(residual.deps), "stream": norm.stream or "main",
-                       "outputs": list(returned)},
-            "capture": capture["capture"],
-            "overlap": capture["overlap"],
-            "capture_fusion_overlap_separate": True,
-            "field_dispositions": dispositions,
-            "inputs": tuple(residual_inputs),
-        }
-        meta = _fusion_metadata(residual, norm)
-        meta.update({
-            "fused_from": ("residual_add", "rmsnorm",
-                           *(("quantize",) if quantized else ())),
-            "primary_output": "payload" if quantized else "norm",
-            "residual_output_materialized": True,
-        })
-        audit = {
-            **boundary,
-            "transform_members": member_contracts((residual, norm)),
-            "typed_outputs": outputs,
-            "typed_roles": merge_typed_roles(residual, norm),
-            "semantic_attrs": semantic_attrs(
-                (norm,), ("reduction_width", "norm_eps", "epsilon",
-                          "activation_group_size", "activation_scale_shape",
-                          "activation_scale_format")),
-            "output_ports": tuple(
-                {"output": value["output"], "dtype": value["dtype"],
-                 "role": value["role"], "materialized": value["materialized"]}
-                for value in outputs),
-            "selection": {"basis": "selected_software_plan",
-                          "kind": "residual_norm"},
-        }
-        append_audit(meta, kind="transform_boundary", op_id=norm.op_id,
-                     boundary=audit, layer=norm.layer, stage=norm.stage,
-                     block=meta.get("structure_block"),
-                     role=meta.get("structure_role"))
-        replacements[norm.op_id] = replace(
-            norm, deps=residual.deps,
-            family="add_rmsnorm_quant" if quantized else "add_rmsnorm",
-            recipe="add_rmsnorm_quantize" if quantized else "add_rmsnorm",
-            vector_ops=residual.vector_ops + norm.vector_ops,
-            mte2_bytes=read, mte3_bytes=write, hbm_bytes=read + write,
-            metadata=tuple(meta.items()), returns=returned,
-        )
-        removed.add(residual.op_id)
-        residual_map[residual.op_id] = norm.op_id
-        ports[residual.op_id] = "residual"
-    if not replacements:
-        return list(ops)
-    aliases = {old: old for old in replacements}
-    aliases.update(residual_map)
-    result = rewire_replacements(
-        ops, replacements=replacements, aliases=aliases,
-        removed=removed, ports=ports)
-    return attach_quantized_ports(result, replacements)
-
-
 LOWERING_PASSES = {
     "activation_quantization": activation_quantization,
     "norm_quant": norm_quant,
@@ -883,8 +359,20 @@ def lower_implementations(ops, runtime, source_dtype, *, passes=None, resource_f
     activation_quantized = bool(preactivated)
     native = select(bindings, "native_fusion")
     native_roles = set(native.options.get("roles", ())) if native else set()
+    enable_compile = bool(getattr(runtime, "enable_torch_compile", True))
+    enable_npugraph_ex = bool(
+        enable_compile and getattr(runtime, "enable_npugraph_ex", True)
+    )
+    rt_meta = dict(getattr(runtime, "metadata", ()) or ())
+    qkv_fx_only = rt_meta.get("qkv_norm_rope_mode") == "fx"
     for name in runtime.lowering_passes:
         if name in skip_passes:
+            continue
+        if name in TORCH_COMPILE_PASSES and not enable_compile:
+            continue
+        if name in NPUGRAPH_EX_PASSES and not enable_npugraph_ex:
+            continue
+        if name == "qkv_norm_rope" and qkv_fx_only and not enable_npugraph_ex:
             continue
         protected = PROTECTED_PASS_ROLES.get(name)
         if protected and protected.intersection(native_roles):

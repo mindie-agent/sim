@@ -612,11 +612,14 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                 grp_outputs = batch_general_mla_ops(
                     b.ops, grp_outputs, views=grp_views, prefix=grp_prefix,
                     runtime=runtime, policy=policy)
-            cfg_fam = runtime.kernels.get("families", {}) if runtime else {}
-            cfg_rec = runtime.kernels.get("recipes", {}) if runtime else {}
-            pinned_attn = "attention" in cfg_fam or any(
-                item in cfg_rec for item in
-                ("latent_attention0", "latent_attention_batch"))
+            from .implementation_selection import is_caller_pinned_binding
+            pinned_attn = (
+                is_caller_pinned_binding(runtime, "families", "attention")
+                or any(
+                    is_caller_pinned_binding(runtime, "recipes", item)
+                    for item in ("latent_attention0", "latent_attention_batch")
+                )
+            )
             if gathered_dcp:
                 grp_outputs = latent_dcp.attention_batch(
                     b, grp_outputs, grp_views, plan=plan, heads=heads,
@@ -637,17 +640,25 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                         and plan.cache_kind == "dense"
                         else annotate_sparse_prefix_unknown(op_item, runtime))
                 elif len(grp_outputs) == 1:
+                    read_mode = str(getattr(runtime, "prefix_read_mode", "auto") or "auto")
+                    reuse_kind = (
+                        ("native_per_sequence" if read_mode == "batch_shared" else "paged_l2")
+                        if pinned_attn
+                        else (
+                            "batch_tile"
+                            if runtime is not None and runtime.prefix_cache_mode == "shared"
+                            else "tile"
+                        )
+                    )
                     b.ops[idx_op] = apply_attention_prefix_reads(
                         op_item, views=grp_views, sweeps_by_view=sweeps_by_view,
                         shared_sweeps_by_view=shared_by_view, row_bytes=float(kv_row_b),
                         layer_index=plan.index, runtime=runtime,
-                        kernel_reuse=("batch_tile"
-                                      if runtime is not None
-                                      and runtime.prefix_cache_mode == "shared"
-                                      else ("native_per_sequence" if pinned_attn else "tile")),
+                        kernel_reuse=reuse_kind,
                         allow_recipe_rebind=not pinned_attn,
                         kv_hbm_bytes=kv_hbm_total,
-                        kv_mte2_bytes=kv_mte2_total)
+                        kv_mte2_bytes=kv_mte2_total,
+                        geometry=hierarchy)
                 else:
                     record = view_records[grp_outputs.index(op_item.op_id)] \
                         if op_item.op_id in grp_outputs else None

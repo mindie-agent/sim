@@ -20,10 +20,14 @@ from .mechanism import PlannedRecipe, Work
 from .mc2_phase import RECIPE, build, contract
 from .operators.mc2_fullmesh import SOURCE, dispatch_layout, combine_layout
 from .operators.mc2_mx_quant import mx32_work
-from .moe_comm_selection import MC2, MoeCommConfig
+from .operators import megamoe_arch35
+from .moe_comm_selection import FUSED_MC2, MC2, MoeCommConfig
 
 NETWORK = "arch35_fullmesh_peer_channel"
 NO_ASSIGNMENTS = 0
+MX_DISPATCH_GROUP = 32
+FUSED_MC2_ROUTED_MODE = 2
+FUSED_MC2_SHARED_MODE = 3
 EXPLICIT_ROUTING_LOWERINGS = frozenset(
     {"route_pack", "route_unpack", "moe_init_routing"})
 
@@ -130,7 +134,7 @@ def recipes(kernels):
     # declares the explicit kernel entry.  Ordinary selection may come from the
     # common MoeCommConfig, and the recipe must exist for that graph without
     # mutating the caller's runtime.  Registration is not selection.
-    result = {RECIPE: PlannedRecipe(build)}
+    result = {RECIPE: PlannedRecipe(build), **megamoe_arch35.recipes()}
     if selected is not None:
         result[NETWORK] = DirectPeerCollective(
             max_inflight_per_rank=selected.get("max_inflight_per_rank"),
@@ -152,15 +156,18 @@ def select_common(runtime, features=None, *, tokens, top_k, experts, ep):
     explicit = select(kernels)
     if explicit is not None:
         return explicit
-    if EXPLICIT_ROUTING_LOWERINGS & set(kernels.get("lowerings") or {}):
-        # An explicitly lowered routing/init kernel owns the expert input
-        # representation; automatic MC2 selection must not replace it.
+    if (EXPLICIT_ROUTING_LOWERINGS & set(kernels.get("lowerings") or {})
+            or bool(getattr(runtime, "enable_dbo", False))):
+        # An explicitly lowered routing/init kernel or DBO microbatch split owns
+        # the expert input representation; automatic MC2 selection must not replace it.
         return None
     rmeta = dict(getattr(runtime, "metadata", ()) or ())
     radditional = rmeta.get("additional_config")
     radditional = dict(radditional) if isinstance(radditional, dict) else {}
     has_runtime_moe_comm = bool(
         "enable_fused_mc2" in radditional
+        or "enable_mega_moe" in radditional
+        or rmeta.get("moe_mega_moe_supported")
         or rmeta.get("moe_comm_mode")
         or rmeta.get("image")
         or rmeta.get("image_id")
@@ -173,12 +180,18 @@ def select_common(runtime, features=None, *, tokens, top_k, experts, ep):
         return None
     config = MoeCommConfig.from_features(
         features, ep=ep, top_k=top_k, experts=experts)
-    if config is None or config.select(max(0, int(tokens))) != MC2:
+    if config is None:
         return None
+    chosen = config.select(max(0, int(tokens)))
+    if chosen not in {MC2, FUSED_MC2}:
+        return None
+    fused_level = int(radditional.get("enable_fused_mc2", 0) or 0)
     return {"kind": "arch35_fullmesh", "max_inflight_per_rank": None,
             "chunk_bytes": None, "hop_startup_us": 0.0,
             "receive_capacity_bytes_per_peer": None,
-            "selection": "moe_comm_config", "moe_comm": config.to_items()}
+            "selection": "moe_comm_config", "selected_method": chosen,
+            "fused_mc2_level": fused_level,
+            "moe_comm": config.to_items()}
 
 
 def lower(ops, *, runtime, prefix, tokens, top_k, width, experts, ep,
@@ -247,6 +260,137 @@ def lower(ops, *, runtime, prefix, tokens, top_k, width, experts, ep,
         if quant not in {"none", absorbed_quant}:
             raise ModelingError("mc2_init_routing_absorption_conflicts_with_dispatch_quant")
         quant = absorbed_quant
+    if (selected.get("selection") == "moe_comm_config"
+            and "dispatch_quant" not in selected
+            and pack_quant is not None
+            and absorbed is None):
+        pmeta = dict(pack_quant.metadata)
+        gate_cand = by_id.get(prefix + ".expert_up")
+        gmeta = dict(gate_cand.metadata) if gate_cand is not None else {}
+        if (gate_cand is not None and gate_cand.deps == (dispatch.op_id,)
+                and gate_cand.local_shape[-1] == width):
+            if (pmeta.get("output_format") in {"fp8_e4m3", "fp8_e5m2"}
+                    and pmeta.get("activation_group_size") == MX_DISPATCH_GROUP
+                    and pmeta.get("activation_scale_format") in {"fp8_e8m0", "e8m0"}
+                    and gmeta.get("activation_format") == pmeta.get("output_format")
+                    and gmeta.get("activation_group_size") == MX_DISPATCH_GROUP
+                    and gmeta.get("activation_scale_format") == "fp8_e8m0"):
+                quant = "mx"
+            elif (pmeta.get("output_format") == "int8"
+                  and pmeta.get("activation_group_size") == width
+                  and pmeta.get("activation_scale_format") == "fp32"
+                  and gmeta.get("activation_format") == "int8"):
+                quant = "per_token_int8"
+    parallel_cfg = getattr(runtime, "parallel", None)
+    has_redundant_slots = int(getattr(parallel_cfg, "redundant_experts_per_rank", 0) or 0) > 0
+    if (selected.get("selected_method") == FUSED_MC2
+            and received_assignments
+            and not has_redundant_slots
+            and not bool(getattr(runtime, "enable_dbo", False))):
+        e_up = by_id.get(prefix + ".expert_up")
+        e_act = by_id.get(prefix + ".expert_act")
+        e_down = by_id.get(prefix + ".expert_down")
+        up_meta = dict(e_up.metadata) if e_up is not None else {}
+        e_comp = str(up_meta.get("compute_format") or "").lower()
+        e_wfmt = str(up_meta.get("weight_format") or "").lower()
+        mx_act = (
+            up_meta.get("activation_group_size") == MX_DISPATCH_GROUP
+            and up_meta.get("activation_scale_format") in {"fp8_e8m0", "e8m0"}
+        )
+        mxfp_eligible = mx_act and (
+            e_comp in {"fp8_e4m3", "mxfp4", "fp4_e2m1"}
+            or e_wfmt in {"mxfp8", "mxfp4", "fp8_e4m3", "fp4_e2m1"}
+        )
+        if (e_up is not None and e_act is not None and e_down is not None
+                and e_up.deps == (dispatch.op_id,)
+                and e_act.deps == (e_up.op_id,)
+                and e_down.deps == (e_act.op_id,)
+                and combine.deps == (e_down.op_id,)
+                and mxfp_eligible):
+            act_meta = dict(e_act.metadata)
+            act_kind = str(act_meta.get("activation_kind") or e_act.family or "swiglu").lower()
+            if act_kind in megamoe_arch35.SUPPORTED_ACTIVATIONS:
+                fused_lvl = int(selected.get("fused_mc2_level") or FUSED_MC2_ROUTED_MODE)
+                fused_lvl = FUSED_MC2_SHARED_MODE if fused_lvl >= FUSED_MC2_SHARED_MODE else FUSED_MC2_ROUTED_MODE
+                moe_inter = int(e_down.local_shape[-1])
+                down_meta = dict(e_down.metadata)
+                w13_b = float(up_meta.get("packed_weight_bytes") or max(0.0, e_up.mte2_bytes - received_assignments * width))
+                w2_b = float(down_meta.get("packed_weight_bytes") or max(0.0, e_down.mte2_bytes - received_assignments * moe_inter))
+                sh_ops = [item for item in ops if item.op_id.startswith(prefix + ".shared.")]
+                join_op = by_id.get(prefix + ".join")
+                sh_up = by_id.get(prefix + ".shared.gate_up")
+                sh_down = by_id.get(prefix + ".shared.down")
+                fuse_shared = (
+                    fused_lvl == FUSED_MC2_SHARED_MODE
+                    and bool(sh_ops) and sh_up is not None
+                    and sh_down is not None and join_op is not None
+                    and len(join_op.deps) == 2 and unpack.op_id in join_op.deps
+                    and any(dep.startswith(prefix + ".shared.") for dep in join_op.deps)
+                )
+                sh_inter = int(sh_up.local_shape[1] // 2) if fuse_shared else 0
+                sh_w13 = float(dict(sh_up.metadata).get("packed_weight_bytes") or 0.0) if fuse_shared else 0.0
+                sh_w2 = float(dict(sh_down.metadata).get("packed_weight_bytes") or 0.0) if fuse_shared else 0.0
+                removed_ids = {
+                    pack.op_id, dispatch.op_id, e_up.op_id, e_act.op_id,
+                    e_down.op_id, combine.op_id, unpack.op_id,
+                }
+                if pack_quant is not None:
+                    removed_ids.add(pack_quant.op_id)
+                target_id = unpack.op_id
+                mega_deps = list(pack.deps)
+                for dep in unpack.deps:
+                    if dep not in removed_ids and dep not in mega_deps:
+                        mega_deps.append(dep)
+                if fuse_shared:
+                    sh_ids = {item.op_id for item in sh_ops}
+                    removed_ids.update(sh_ids)
+                    removed_ids.add(join_op.op_id)
+                    target_id = join_op.op_id
+                    for item in sh_ops:
+                        for dep in item.deps:
+                            if dep not in removed_ids and dep not in mega_deps:
+                                mega_deps.append(dep)
+                if not any(
+                    dep in removed_ids and dep != target_id
+                    for item in ops if item.op_id not in removed_ids
+                    for dep in item.deps
+                ):
+                    mega_op = megamoe_arch35.make_op(
+                        op_id=target_id, deps=tuple(mega_deps),
+                        stage=unpack.stage, layer=unpack.layer,
+                        requests=unpack.requests, phase=unpack.phase,
+                        tokens=int(tokens), hidden=int(width),
+                        moe_inter=moe_inter, top_k=int(top_k),
+                        routed_rows=float(received_assignments),
+                        w13_bytes=w13_b, w2_bytes=w2_b,
+                        enable_fused_mc2=fused_lvl if fuse_shared else FUSED_MC2_ROUTED_MODE,
+                        ep=int(ep), activation=act_kind,
+                        compute_dtype="fp8_e4m3", output_dtype=dtype,
+                        dispatch_link_bytes=float(dispatch.link_bytes),
+                        combine_link_bytes=float(combine.link_bytes),
+                        shared_inter=sh_inter, shared_w13_bytes=sh_w13,
+                        shared_w2_bytes=sh_w2,
+                        extra_metadata=(
+                            ("device_kernel_group", {
+                                "id": prefix + ".megamoe",
+                                "entry": True,
+                                "exit": True,
+                                "kernel": megamoe_arch35.NATIVE_KIND,
+                            }),
+                        ),
+                    )
+                    rebuilt = []
+                    inserted = False
+                    for item in ops:
+                        if item.op_id == target_id:
+                            rebuilt.append(mega_op)
+                            inserted = True
+                        elif item.op_id in removed_ids:
+                            continue
+                        else:
+                            rebuilt.append(item)
+                    if inserted:
+                        return rebuilt
     received_quant = None
     if pack_quant is not None and quant == "none" and received_assignments:
         gate = by_id.get(prefix + ".expert_up")

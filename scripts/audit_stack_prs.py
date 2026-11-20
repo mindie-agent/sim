@@ -38,7 +38,10 @@ from mindie_sim.stack_tracks import resolve_runtime_stack  # noqa: E402
 GH_TIMEOUT_SECONDS = 30
 GH_OPEN_LIMIT = 100
 PR_REF_RE = re.compile(r"^(?:([^#]+))?#(\d+)$")
-PERF_KEYWORDS = ("performance", "fuse", "overlap", "triton", "chunk", "recoverssm", "megamoe", "mhc")
+PERF_KEYWORDS = (
+    "performance", "fuse", "overlap", "triton", "chunk", "chunk32",
+    "recoverssm", "megamoe", "mhc", "gbsa", "sfa", "indexer", "dspark", "fa3",
+)
 
 
 def _parse_pr_ref(ref: str | None, default_repo: str) -> tuple[str, int] | None:
@@ -145,7 +148,7 @@ def audit_snapshot(stack_name: str, repo: str, bindings: list[dict[str, Any]],
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stack", default="vllm-ascend",
-                        help="registered stack name or JSON manifest path")
+                        help="registered stack name, 'cann93', or JSON manifest path")
     parser.add_argument("--repo", default=None,
                         help="override GitHub owner/repo (defaults to stack.repository)")
     parser.add_argument("--offline-fixture", default=None,
@@ -153,7 +156,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", "-o", default=None)
     args = parser.parse_args(argv)
 
-    profile = resolve_runtime_stack(args.stack)
+    stack_arg = args.stack
+    if str(stack_arg).strip().lower() in {"cann93", "vllm-ascend-cann93"}:
+        from mindie_sim.va_stack_bindings import MANIFEST_PATH
+        stack_arg = MANIFEST_PATH
+    profile = resolve_runtime_stack(stack_arg)
     repo = args.repo or profile.repository
     bindings = [b.to_dict() for b in profile.bindings]
     tracked_nums = [

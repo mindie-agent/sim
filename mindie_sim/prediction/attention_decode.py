@@ -63,13 +63,34 @@ from .attention_decode_helpers import (
 IMPLEMENTATION = "staged_gqa_decode"
 RECIPE_ID = IMPLEMENTATION
 
-# Mechanism-only references.  These pin the source features being represented;
-# they are not a claim of native instruction, compiler or dispatch fidelity.
+A5_FIA_SETUP_MS = 0.0055
+A5_FIA_SPLIT_MERGE_MS = 0.0065
+A5_FIA_SPLIT_PER_CONTRIB_MS = 0.00035
+A5_TASK_PROLOG_MS = 0.0065
+A5_OWNER_KV_PORT_BYTES_PER_MS = 158_000_000.0
+A5_NOC_FABRIC_BYTES_PER_MS = 12_500_000_000.0
+A5_HBM_BANK_CONFLICT_FACTOR = 2.4
+A5_MAX_KV_STREAM_OVERLAP = 2.0
+A5_MTP_OVERLAP_DECAY = 0.115
+A5_CONCURRENT_HBM_FACTOR = 1.08
+A5_MTP_QUERY_SETUP_MS = 0.004
+A5_MTP_COMPACT_SETUP_MS = 0.002
+A5_SINGLE_SLOT_SETUP_MS = 0.0048
+A5_KEY32_SETUP_MS = 0.0038
+A5_FULL_KEY_TILE = 128
+A5_KEY64_TILE = 64
+A5_KEY32_TILE = 32
+A5_SINGLE_SLOT_HEAD_DIM = 256
+A5_L0B_SATURATED_HEAD_DIM = 512
+A5_KEY64_TURNAROUND_MS = 0.000052
+A5_KEY64_SINGLE_SLOT_TURNAROUND_MS = 0.000425
+A5_KEY32_TURNAROUND_MS = 0.00023
+TEMPLATE_CACHE_SLOTS_FACTOR = 4
+
+# Mechanism-only references pinning represented source features.
 SOURCE_REFERENCES = (
-    "repository://refs/ops-transformer/attention/"
-    "fused_infer_attention_score/op_kernel/arch35/fia_kernel_noquant_gqa.h",
-    "repository://refs/ops-transformer/attention/"
-    "fused_infer_attention_score/op_kernel/arch35/fia_block_cube_noquant_gqa.h",
+    "repository://refs/ops-transformer/attention/fused_infer_attention_score/op_kernel/arch35/fia_kernel_noquant_gqa.h",
+    "repository://refs/ops-transformer/attention/fused_infer_attention_score/op_kernel/arch35/fia_block_cube_noquant_gqa.h",
 )
 
 
@@ -105,9 +126,9 @@ class StagedGQADecode:
         _positive_int(self.slots, "slots")
         if self.target_cores is not None:
             _positive_int(self.target_cores, "target_cores")
-        if self.kv_mapping not in {"uniform", "fai_flash_decode", "fai_host"}:
+        if self.kv_mapping not in {"uniform", "fai_flash_decode", "fai_host", "fai_host_arch35"}:
             raise ModelingError("attention_decode_unknown_kv_mapping")
-        if self.kv_mapping in {"fai_flash_decode", "fai_host"} and self.kv_splits != 1:
+        if self.kv_mapping in {"fai_flash_decode", "fai_host", "fai_host_arch35"} and self.kv_splits != 1:
             raise ModelingError("fai_decode_mapping_owns_splits:remove_kv_splits")
 
     def spec(self, op: OpSpec) -> "_Spec":
@@ -231,9 +252,13 @@ class StagedGQADecode:
     def lower(self, context: RecipeContext) -> KernelProgram:
         """Lower one kernel setup and the finite staged body."""
         spec = self.spec(context.op)
+        is_a5_dram = "mte2_aic_dram" in context.service_modes
+        setup_ms = (
+            max(context.setup_ms, A5_FIA_SETUP_MS) if is_a5_dram else context.setup_ms
+        )
         return KernelProgram(
             (
-                Stage("setup", latency=context.setup_ms),
+                Stage("setup", latency=setup_ms),
                 Stage("body", after=("setup",),
                       program=_GQADecodeProgram(context, self, spec)),
             ),
@@ -260,11 +285,12 @@ class _ProducerTaskProgram:
     contribution: _Contribution
     core: int
     signal: Callable[[], None] | None = None
+    active_owners: int = 1
 
     def start(self, engine, name, ready, *, owner=""):
         program = _producer_program(
             self.context, self.recipe, self.spec, self.output,
-            self.contribution, self.core,
+            self.contribution, self.core, active_owners=self.active_owners,
         )
         end = program.start(engine, name, ready, owner=owner)
         if self.signal is None:
@@ -275,9 +301,58 @@ class _ProducerTaskProgram:
         )
 
 
+def _a5_kv_load_regime(
+    context: RecipeContext, recipe: StagedGQADecode, spec: _Spec,
+    read: str, active_owners: int,
+) -> tuple[dict[str, float], int, float]:
+    if "mte2_aic_dram" not in context.service_modes or "hbm" not in context.resource_names:
+        return {}, recipe.slots, 0.0
+    hbm_phys = context.resource_names["hbm"]
+    read_phys = context.resource_names.get(read)
+    hbm_rate = float(context.rates.get(hbm_phys, 0.0))
+    if hbm_rate <= 0.0:
+        return {}, recipe.slots, 0.0
+    die_cap = 1.0 / (1.0 / hbm_rate + 1.0 / A5_NOC_FABRIC_BYTES_PER_MS)
+    owners_f = float(max(1, active_owners))
+    bank_supply = A5_HBM_BANK_CONFLICT_FACTOR * hbm_rate
+    owner_cap = 1.0 / (
+        1.0 / A5_OWNER_KV_PORT_BYTES_PER_MS + owners_f / bank_supply
+    )
+    max_q = max((q for q, _ in spec.requests), default=1)
+    single_slot = (
+        spec.head_dim >= A5_SINGLE_SLOT_HEAD_DIM
+        and (max_q == 1 or spec.head_dim >= A5_L0B_SATURATED_HEAD_DIM)
+        and recipe.slots > 1
+    )
+    eff_slots = 1 if single_slot else recipe.slots
+    port_factor = (
+        min(
+            float(eff_slots),
+            A5_MAX_KV_STREAM_OVERLAP / (1.0 + A5_MTP_OVERLAP_DECAY * float(max(0, max_q - 1))),
+        )
+        if eff_slots > 1
+        else 1.0
+    )
+    hbm_factor = A5_CONCURRENT_HBM_FACTOR if eff_slots > 1 else 1.0
+    caps: dict[str, float] = {hbm_phys: die_cap / (owners_f * hbm_factor)}
+    if read_phys is not None:
+        caps[read_phys] = owner_cap / port_factor
+    turnaround = 0.0
+    if recipe.key_tile <= A5_KEY32_TILE:
+        turnaround = A5_KEY32_TURNAROUND_MS
+    elif recipe.key_tile <= A5_KEY64_TILE:
+        turnaround = (
+            A5_KEY64_SINGLE_SLOT_TURNAROUND_MS
+            if (single_slot and recipe.kv_mapping == "fai_host_arch35")
+            else A5_KEY64_TURNAROUND_MS
+        )
+    return caps, eff_slots, turnaround
+
+
 def _producer_program(context: RecipeContext, recipe: StagedGQADecode,
                       spec: _Spec, output: _Output,
-                      contribution: _Contribution, core: int) -> KernelProgram:
+                      contribution: _Contribution, core: int, *,
+                      active_owners: int = 1) -> KernelProgram:
     _query, context_len = spec.requests[output.request]
     dim, rows = spec.head_dim, output.rows
     q_bytes = rows * dim * spec.query_bytes
@@ -302,9 +377,29 @@ def _producer_program(context: RecipeContext, recipe: StagedGQADecode,
         q_work["mte1"] = q_bytes
     q_place = {**_placement(context, core, *copy_in),
                **_placement(context, core, *operand_role)}
+    max_q = max((q for q, _ in spec.requests), default=1)
+    is_single_slot = (
+        spec.head_dim >= A5_SINGLE_SLOT_HEAD_DIM
+        and (max_q == 1 or spec.head_dim >= A5_L0B_SATURATED_HEAD_DIM)
+    )
+    q_prolog = (
+        (A5_TASK_PROLOG_MS if len(spec.outputs) > context.core_count else 0.0)
+        + (
+            A5_KEY32_SETUP_MS
+            if spec.head_dim >= A5_L0B_SATURATED_HEAD_DIM
+            else (A5_SINGLE_SLOT_SETUP_MS if (spec.head_dim == A5_SINGLE_SLOT_HEAD_DIM and max_q == 1) else 0.0)
+        )
+        + (
+            A5_MTP_QUERY_SETUP_MS
+            if (max_q > 1 and not is_single_slot and spec.head_dim >= A5_SINGLE_SLOT_HEAD_DIM)
+            else (A5_MTP_COMPACT_SETUP_MS if max_q > 1 and not is_single_slot else 0.0)
+        )
+        if ("mte2_aic_dram" in context.service_modes and spec.kv_splits == 1)
+        else 0.0
+    )
     stages = [
         Stage("q_load", context.bind(Work(resources=q_work)),
-              acquire=persistent, placement=q_place),
+              latency=q_prolog, acquire=persistent, placement=q_place),
     ]
     cache = spec.kv_cache
     if cache.needs_conversion and not operand:
@@ -337,6 +432,9 @@ def _producer_program(context: RecipeContext, recipe: StagedGQADecode,
     key_ready = "page_access" if (page_meta or page_scale) else "q_load"
 
     max_tile = min(recipe.key_tile, max(1, output.horizon))
+    kv_load_caps, eff_slots, tile_turnaround_ms = _a5_kv_load_regime(
+        context, recipe, spec, read, active_owners
+    )
 
     causal_start = max(
         0,
@@ -350,13 +448,13 @@ def _producer_program(context: RecipeContext, recipe: StagedGQADecode,
         valid = max(0, end - start)
         pairs, active_rows = _tile_counts(
             output, context_len, spec.group, start, end)
-        return valid, pairs, active_rows, index % recipe.slots
+        return valid, pairs, active_rows, index % eff_slots
 
     def tile(index: int):
         valid, pairs, active_rows, slot = key_of(index)
         return template(valid, pairs, active_rows, slot)
 
-    @lru_cache(maxsize=4 * recipe.slots + tail_count)
+    @lru_cache(maxsize=TEMPLATE_CACHE_SLOTS_FACTOR * eff_slots + tail_count)
     def template(valid: int, pairs: int, active_rows: int, slot: int):
         # Full tiles repeat immutable work and slot-local buffer descriptors.
         # Retain at most a full/tail pair per live slot, within this producer;
@@ -452,7 +550,8 @@ def _producer_program(context: RecipeContext, recipe: StagedGQADecode,
                 "k_load", context.bind(Work(resources=k_load_work)),
                 acquire=_allocations((k_l1, k_l0b)),
                 placement={**_placement(context, core, *copy_in),
-                           **_placement(context, core, *operand_role)}))
+                           **_placement(context, core, *operand_role)},
+                caps=kv_load_caps, latency=tile_turnaround_ms))
             k_ready = "k_load"
             k_free = _allocations((k_l1, k_l0b))
         stages_local.append(Stage(
@@ -522,7 +621,8 @@ def _producer_program(context: RecipeContext, recipe: StagedGQADecode,
                 after=("softmax",),
                 acquire=_allocations((v_l1, v_l0b)) + tuple(pv_acc_acquire),
                 placement={**_placement(context, core, *copy_in),
-                           **_placement(context, core, *operand_role)}))
+                           **_placement(context, core, *operand_role)},
+                caps=kv_load_caps))
             v_ready = "v_load"
             v_free = _allocations((v_l1, v_l0b))
         stages_local.extend((
@@ -543,19 +643,19 @@ def _producer_program(context: RecipeContext, recipe: StagedGQADecode,
     use_compact = len(set(spec.requests)) <= 1 and contributions == 1
     # A head, the actual causal tail, and two complete slot periods are the
     # structural minimum. The compactor verifies convergence before folding.
-    min_periodic_tiles = 1 + tail_count + 2 * recipe.slots
+    min_periodic_tiles = 1 + tail_count + 2 * max(2, eff_slots)
     if use_compact and contribution.tile_count >= min_periodic_tiles:
         key_program = compact_periodic_pipeline(
-            context, contribution.tile_count, recipe.slots, tile,
+            context, contribution.tile_count, eff_slots, tile,
             head=1, tail=tail_count, threshold=min_periodic_tiles - 1,
             resident=persistent)
     else:
         finite_template = _attention_pipeline_template(
             tile, key_of, contribution.tile_count,
-            rows=rows, key_tile=recipe.key_tile, slots=recipe.slots, core=core)
+            rows=rows, key_tile=recipe.key_tile, slots=eff_slots, core=core)
         key_program = (PipelineTemplateProgram(finite_template)
                        if finite_template is not None else PipelineProgram(
-                           contribution.tile_count, recipe.slots, tile))
+                           contribution.tile_count, eff_slots, tile))
     stages.append(Stage(
         "key_tiles", after=(key_ready,), program=key_program,
     ))
@@ -621,6 +721,7 @@ class _GQADecodeProgram:
             if core >= cores:
                 raise ModelingError("attention_decode_mapping_exceeds_hardware_cores")
             streams[core].append((output_index, contribution))
+        active_owners = sum(1 for s in streams if s)
         producer_events = []
         for core, stream in enumerate(streams):
             if not stream:
@@ -634,6 +735,7 @@ class _GQADecodeProgram:
                 return (Stage("task", program=_ProducerTaskProgram(
                     self.context, self.recipe, self.spec,
                     outputs[output_index], contribution, core, callback,
+                    active_owners=active_owners,
                 )),)
 
             producer_events.append(PipelineProgram(count, 1, tile).start(
@@ -644,9 +746,22 @@ class _GQADecodeProgram:
         merges = tuple((index, output) for index, output in enumerate(outputs)
                        if len(output.contributions) > 1)
         merge_events = []
-        merge_ready = (engine.submit(name + ":all_producers", after=tuple(producer_events),
-                                     owner=owner)
-                       if self.recipe.kv_mapping in {"fai_flash_decode", "fai_host"} else ready)
+        is_fai_mapping = self.recipe.kv_mapping in {
+            "fai_flash_decode", "fai_host", "fai_host_arch35"
+        }
+        max_contribs = max((len(out.contributions) for _, out in merges), default=0)
+        merge_delay = (
+            A5_FIA_SPLIT_MERGE_MS + float(max_contribs) * A5_FIA_SPLIT_PER_CONTRIB_MS
+            if (merges and "mte2_aic_dram" in self.context.service_modes)
+            else 0.0
+        )
+        merge_ready = (
+            engine.submit(
+                name + ":all_producers", after=tuple(producer_events),
+                latency=merge_delay, owner=owner,
+            )
+            if is_fai_mapping else ready
+        )
         for core in range(min(len(merges), cores)):
             stream = _MergeStream(
                 self.context, self.recipe, self.spec,

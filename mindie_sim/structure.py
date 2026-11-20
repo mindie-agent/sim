@@ -54,6 +54,7 @@ _FAMILY_BLOCKS = {
     "qkv_projection": "attention", "attention": "attention",
     "rotary": "attention", "cache_store": "attention",
     "kv_compress_epilog": "attention", "indexer_quant_cache": "attention",
+    "kv_cache_write": "attention",
     "gate_up_projection": "ffn", "down_projection": "ffn", "swiglu": "ffn",
     "grouped_gemm": "ffn", "embedding": "embedding", "logits": "logits",
 }
@@ -238,6 +239,11 @@ def _node(op, replica, *, source_call=None, block=None, role=None, structure=Non
             "source_call_id": source_call,
             "fused_from": meta.get("fused_from", semantic.get("fused_from")),
             "semantic_recipe": meta.get("semantic_recipe"),
+            **(
+                {"absorbed_source_ops": list(meta.get("absorbed_source_ops") or semantic.get("absorbed_source_ops"))}
+                if (meta.get("absorbed_source_ops") or semantic.get("absorbed_source_ops"))
+                else {}
+            ),
         },
     }
     if binding is not None and native_sink is not None:
@@ -277,6 +283,12 @@ def export_op_structure(ops, *, model, execution, kernels=None, source=None,
         resource_graphs = {replica: lower_native_fusions(operators, runtime)
                            for replica, operators in graphs.items()}
     phase = execution["phase"]
+    draft_prepare = bool(execution.get("draft_prepare", False))
+    allowed_phases = {phase}
+    if phase == "decode":
+        allowed_phases.add("draft")
+    elif phase == "prefill" and draft_prepare:
+        allowed_phases.update({"draft", "draft_prefill"})
     book = RecipeBook.from_mapping(kernels or {})
     resource_geometries = resource_geometries or {}
     nodes, source_calls, external = [], [], set()
@@ -285,7 +297,7 @@ def export_op_structure(ops, *, model, execution, kernels=None, source=None,
     for replica, operators in sorted(graphs.items()):
         outputs_by_id, metadata_by_id = {}, {}
         for op in operators:
-            if op.phase != phase and not (phase == "decode" and op.phase == "draft"):
+            if op.phase not in allowed_phases:
                 raise ValueError(f"structure_phase_mismatch:{op.op_id}:{op.phase}:{phase}")
             expanded = book.expand((op,)) if expand_calls else (op,)
             meta = metadata(op)
@@ -324,7 +336,8 @@ def export_op_structure(ops, *, model, execution, kernels=None, source=None,
                 }))
             nodes.extend(_node(child, replica, source_call=parent, block=_block(op),
                                role=meta.get("structure_role"),
-                               structure=layer_structure(model, op.layer), kernels=kernels,
+                               structure=layer_structure(model, op.layer, op=op, execution=execution),
+                               kernels=kernels,
                                book=book, geometry=resource_geometries.get((replica, child.stage)),
                                shared_call=(None if child.family == "barrier" else call_binding),
                                native_sink=native_calls,
@@ -355,15 +368,14 @@ def export_op_structure(ops, *, model, execution, kernels=None, source=None,
         groups = {group["subgraph_id"]: group for group in subgraphs}
         subgraph_member_sets = {id(other): set(other["node_ids"]) for other in subgraphs}
         subgraphs_by_first_member = defaultdict(list)
-        _FIRST_MEMBER = 0
         for other in subgraphs:
             if other["node_ids"]:
-                subgraphs_by_first_member[other["node_ids"][_FIRST_MEMBER]].append(other)
+                subgraphs_by_first_member[other["node_ids"][0]].append(other)
         for replica, operators in sorted(resource_graphs.items()):
             outputs_by_id, metadata_by_id = {}, {}
             for op in operators:
                 meta = dict(op.metadata)
-                if "fusion_group_key" not in meta:
+                if "fusion_group_key" not in meta or not isinstance(meta.get("fusion_boundary"), Mapping):
                     continue
                 key = f"rank:{replica}/subgraph:{meta['fusion_group_key']}"
                 group = groups[key]
@@ -497,7 +509,7 @@ def export_op_structure(ops, *, model, execution, kernels=None, source=None,
 
 def export_structure(case, *, phase, tokens, context=0, sequences=1,
                      scope="model", source=None, expand_calls=True, apply_body_defaults=True,
-                     replicas=None, native_evidence=False):
+                     replicas=None, native_evidence=False, draft_prepare=False):
     """Export the first independent DP cohort, without evaluating its timing.
 
     ``case`` is the same complete declared case accepted by ``target_graphs``.
@@ -509,18 +521,23 @@ def export_structure(case, *, phase, tokens, context=0, sequences=1,
     graphs, options = _structure_inputs(
         case, phase=phase, tokens=tokens, context=context, sequences=sequences,
         scope=scope, source=source, expand_calls=expand_calls,
-        apply_body_defaults=apply_body_defaults, replicas=replicas)
+        apply_body_defaults=apply_body_defaults, replicas=replicas,
+        draft_prepare=draft_prepare)
     return export_op_structure(graphs, native_evidence=native_evidence, **options)
 
 
 def _structure_inputs(case, *, phase, tokens, context=0, sequences=1,
                       scope="model", source=None, expand_calls=True,
-                      apply_body_defaults=True, replicas=None):
+                      apply_body_defaults=True, replicas=None,
+                      draft_prepare=False):
     """Bind the complete cohort once before choosing an export consumer."""
+    if not isinstance(draft_prepare, bool):
+        raise ValueError("structure_draft_prepare_must_be_bool")
     case = parse_case(case)
     graphs = target_graphs(
         case, phase=phase, tokens=tokens, context=context,
         sequences=sequences, scope=scope, resource_fusion=False,
+        draft_prepare=draft_prepare,
         apply_body_defaults=apply_body_defaults,
     )
     from .prediction.body_defaults import consume_target_declaration
@@ -565,6 +582,7 @@ def _structure_inputs(case, *, phase, tokens, context=0, sequences=1,
         execution={
             "phase": phase, "tokens": tokens, "context": context,
             "sequences": sequences, "scope": scope, "software": selected,
+            **({"draft_prepare": True} if draft_prepare else {}),
             **({"apply_body_defaults": apply_body_defaults,
                 "default_mechanisms": selection} if scope == "body" else {}),
             **projection,
@@ -593,6 +611,8 @@ def main(argv=None):
     parser.add_argument("--scope", choices=("body", "model"), default="model")
     parser.add_argument("--replicas", type=int, nargs="+",
                         help="Serialize these DP replicas after full-cohort traffic binding")
+    parser.add_argument("--draft-prepare", action="store_true",
+                        help="Include declared draft cache preparation after model prefill")
     parser.add_argument("--no-body-defaults", dest="apply_body_defaults", action="store_false")
     parser.add_argument("--no-expand-calls", dest="expand_calls", action="store_false")
     parser.add_argument("--output", type=Path)
@@ -605,9 +625,8 @@ def main(argv=None):
         json.loads(content), phase=args.phase, tokens=args.tokens,
         context=args.context, sequences=args.sequences, scope=args.scope,
         expand_calls=args.expand_calls, apply_body_defaults=args.apply_body_defaults,
-        replicas=args.replicas,
-        source={"kind": "case_json", "path": str(args.case.resolve()),
-                "sha256": sha256(content).hexdigest()},
+        replicas=args.replicas, draft_prepare=args.draft_prepare,
+        source={"kind": "case_file", "sha256": sha256(content).hexdigest()},
     )
     text = json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
     if args.output:

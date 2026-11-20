@@ -121,21 +121,39 @@ def raw_eager_requested(runtime):
     return _policy(runtime)[2]
 
 
+def _is_a5_runtime(runtime) -> bool:
+    if runtime is None:
+        return False
+    meta = dict(getattr(runtime, "metadata", ()) or ())
+    fam = str(meta.get("arch_family") or "").upper()
+    if fam:
+        return fam == "A5"
+    hw = str(getattr(runtime, "hardware", "") or "").lower()
+    return hw.startswith(("a5", "ascend950"))
+
+
+NATIVE_LIGHTNING_INDEXER_IMPLEMENTATIONS = frozenset({
+    "cann_bf16_lightning_indexer_v2_complete",
+    "cann_c8_lightning_indexer",
+})
+
+
 def native_indexer_active(runtime, machine=None):
     """True when a CANN indexer implementation owns this graph.
 
-    Explicit native lowerings own the boundary first.  On a declared Ascend
-    family the CANN 9.2.1 graph also owns non-KPool indexers; a caller that
-    explicitly requested the legacy PyTorch BF16 path keeps it.
+    Explicit native lowerings (including ``cann_bf16_lightning_indexer_v2_complete``
+    and ``cann_c8_lightning_indexer``) own the boundary unless ``raw_eager`` was
+    requested.  A caller that explicitly binds a non-CANN PyTorch path keeps it.
     """
-    if runtime is None:
+    if runtime is None or raw_eager_requested(runtime):
         return False
     lowerings = dict(getattr(runtime, "kernels", {}).get("lowerings", {}) or {})
     if (select(lowerings, "pool_key_indexer") is not None
             or select(lowerings, "quant_lightning_indexer") is not None):
         return True
-    if select(lowerings, "lightning_indexer") is not None:
-        return False
+    bf16_or_c8 = select(lowerings, "lightning_indexer")
+    if bf16_or_c8 is not None:
+        return bf16_or_c8.name in NATIVE_LIGHTNING_INDEXER_IMPLEMENTATIONS
     return native_fusion_active(runtime, machine)
 
 
@@ -395,7 +413,8 @@ def lower_index_path(builder, *, plan, model, quant, parallel, views, deps, runt
             normalized = index_layer_norm(
                 b, source=projected, rows=index_rows, width=plan.index_dim,
                 native=native_indexer and (
-                    explicit_quant_indexer
+                    _is_a5_runtime(runtime)
+                    or explicit_quant_indexer
                     or quant.index_dtype not in {"bf16", "fp16", "fp32"}))
             if index_rope:
                 normalized = b.vector(
@@ -420,8 +439,27 @@ def lower_index_path(builder, *, plan, model, quant, parallel, views, deps, runt
         )
         index_store = b.store("index_store", (normalized,), index_store_rows,
                               index_row_bytes(model, plan.index_dim), quant.index_dtype)
-        index_store = index_row_quantization(
-            b, index_store, quantize_id, width=plan.index_dim, native=native_indexer)
+        if quantize_id is not None:
+            index_store = index_row_quantization(
+                b, index_store, quantize_id, width=plan.index_dim, native=native_indexer)
+        elif native_indexer:
+            from .index_cache_writer import SCATTER_PA_KV_RECIPE, SCATTER_PA_KV_SOURCE
+            store_op = next((item for item in reversed(b.ops)
+                             if item.op_id == index_store), None)
+            if store_op is not None and store_op.family == "cache_store":
+                upgraded = replace(
+                    store_op,
+                    family="kv_cache_write",
+                    recipe=SCATTER_PA_KV_RECIPE,
+                    metadata=store_op.metadata + (
+                        ("native_kind", KV_SCATTER_EPILOG),
+                        ("native_cache_store", True),
+                        ("zero_external_casts", True),
+                        ("native_source", SCATTER_PA_KV_SOURCE),
+                    ),
+                )
+                b.ops = [upgraded if item.op_id == index_store else item
+                         for item in b.ops]
     if pcp_prefill and plan.indexer and plan.owns_index_k and index_store is not None:
         # One stored index vector is index_dim wide, not index_heads copies of it.
         if plan.index_kpool > 1:

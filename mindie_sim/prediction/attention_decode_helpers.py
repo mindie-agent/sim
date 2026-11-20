@@ -210,10 +210,21 @@ def _spec(op: OpSpec, recipe: StagedGQADecode) -> _Spec:
                     request_index, kv_head, query_tile, row_start, row_end,
                     token_first, token_last, horizon, contributions,
                 ))
-    if recipe.kv_mapping in {"fai_flash_decode", "fai_host"}:
-        from .fai_decode_mapping import partitions, host_partitions
-        mapper = host_partitions if recipe.kv_mapping == "fai_host" else partitions
-        mapping = mapper(requests, heads, kv_heads, recipe.target_cores,
+    if recipe.kv_mapping in {"fai_flash_decode", "fai_host", "fai_host_arch35"}:
+        from .fai_decode_mapping import (
+            host_partitions,
+            host_partitions_arch35,
+            partitions,
+        )
+        if recipe.kv_mapping == "fai_host_arch35":
+            mapping = host_partitions_arch35(
+                requests, heads, kv_heads, recipe.target_cores,
+                key_tile=recipe.key_tile, query_tile=recipe.query_tile,
+                head_dim=dim,
+            )
+        else:
+            mapper = host_partitions if recipe.kv_mapping == "fai_host" else partitions
+            mapping = mapper(requests, heads, kv_heads, recipe.target_cores,
                              key_tile=recipe.key_tile, query_tile=recipe.query_tile)
         outputs = [replace(output, contributions=tuple(
             _Contribution(index, start, end - start, owner)

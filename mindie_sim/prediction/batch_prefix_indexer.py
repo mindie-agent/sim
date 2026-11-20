@@ -79,6 +79,7 @@ def apply_indexer_prefix_reads(
     hbm_component: float | None = None,
     mte2_component: float | None = None,
     compression_ratio: int = MIN_COMPRESSION_RATIO,
+    window_tokens: int = EMPTY_INDEX_ROWS,
 ) -> Any:
     """Replace the precharged index-K components with their physical union."""
     if runtime is None or getattr(runtime, "prefix_cache_mode", "private") != "shared":
@@ -119,6 +120,7 @@ def apply_indexer_prefix_reads(
             layer=int(layer_index),
             component="index_k",
             logical_rows=int(rows),
+            window_tokens=max(EMPTY_INDEX_ROWS, int(window_tokens)),
         ))
     meta = dict(getattr(op, "metadata", ()) or ())
     meta.setdefault("component", "index_k")

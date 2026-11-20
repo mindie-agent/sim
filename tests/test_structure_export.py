@@ -264,6 +264,8 @@ def test_projection_preserves_complete_unequal_expert_traffic_and_owned_output()
 
 
 def test_cli_writes_source_backed_structure(tmp_path):
+    from hashlib import sha256
+
     input_path, output_path = tmp_path / "case.json", tmp_path / "structure.json"
     input_path.write_text(json.dumps(case()), encoding="utf-8")
     assert main([str(input_path), "--phase", "prefill", "--tokens", "3",
@@ -272,5 +274,8 @@ def test_cli_writes_source_backed_structure(tmp_path):
     expected = export_structure(case(), phase="prefill", tokens=3)
     assert report["graph_id"] == expected["graph_id"]
     assert report["nodes"] == expected["nodes"]
-    assert report["source"]["path"] == str(input_path)
-    assert len(report["source"]["sha256"]) == 64
+    assert "path" not in report["source"]
+    assert report["source"] == {
+        "kind": "case_file",
+        "sha256": sha256(input_path.read_bytes()).hexdigest(),
+    }

@@ -257,13 +257,38 @@ def effective_physical_work(report, member_ids):
     return totals, ()
 
 
-def exclusive_family_members(groups, family_for):
+def _composite_shared_node_ids(groups, nodes_by_id=None) -> set[str]:
+    shared: set[str] = set()
+    for group in groups:
+        coverage = group.get("coverage") or {}
+        if isinstance(coverage, Mapping) and (
+            coverage.get("composite_shared") or coverage.get("kind") == "composite_shared"
+        ):
+            shared.update(group.get("node_ids") or ())
+    if nodes_by_id:
+        for node_id, node in nodes_by_id.items():
+            meta = ((node.get("operator") or {}).get("metadata") or {})
+            if meta.get("composite_shared_subgraphs"):
+                shared.add(node_id)
+    return shared
+
+
+def exclusive_family_members(groups, family_for, *, nodes_by_id=None):
     """Union members per family and reject unresolved cross-family ownership."""
+    composite_shared = _composite_shared_node_ids(groups, nodes_by_id)
     by_family = defaultdict(set)
+    primary_owner: dict[str, str] = {}
     for group in groups:
         family = family_for(group)
-        if family is not None:
-            by_family[family].update(group["node_ids"])
+        if family is None:
+            continue
+        for node_id in group["node_ids"]:
+            if node_id in composite_shared:
+                owner = primary_owner.setdefault(node_id, family)
+                if owner == family:
+                    by_family[family].add(node_id)
+            else:
+                by_family[family].add(node_id)
 
     assigned = set()
     for family, members in sorted(by_family.items()):
@@ -475,22 +500,31 @@ def compute_subgraph_math_summaries(report: Mapping[str, Any]) -> list[SubgraphM
     return [_summary(report, group) for group in report.get("subgraphs") or ()]
 
 
-def _family_scopes(groups, family_for) -> dict[str, dict[tuple, set[str]]]:
+def _family_scopes(groups, family_for, *, allowed_members=None) -> dict[str, dict[tuple, set[str]]]:
     scopes: dict[str, dict[tuple, set[str]]] = defaultdict(lambda: defaultdict(set))
     for group in groups:
         family = family_for(group)
         if family is None:
             continue
         key = (group.get("replica"), group.get("stage"), group.get("phase"))
-        scopes[family][key].update(group["node_ids"])
+        members = group["node_ids"]
+        if allowed_members is not None:
+            allowed = allowed_members.get(family, set())
+            members = [nid for nid in members if nid in allowed]
+        scopes[family][key].update(members)
     return scopes
 
 
 def build_subgraph_math_rollup(report: Mapping[str, Any]) -> dict[str, Any]:
     """Disjoint per-family union totals; never a whole-model total."""
     groups = list(report.get("subgraphs") or ())
-    families = exclusive_family_members(groups, semantic_family_of_group)
-    scopes = _family_scopes(groups, semantic_family_of_group)
+    nodes_by_id = {n["node_id"]: n for n in (report.get("nodes") or ())}
+    families = exclusive_family_members(
+        groups, semantic_family_of_group, nodes_by_id=nodes_by_id
+    )
+    scopes = _family_scopes(
+        groups, semantic_family_of_group, allowed_members=families
+    )
     rollup: dict[str, Any] = {}
     for family in sorted(families):
         realized = 0.0

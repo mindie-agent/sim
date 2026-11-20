@@ -34,10 +34,17 @@ import json
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from dataclasses import replace
 from .cache_meta_oracle import (
-    PLE_DEFAULT_CONV_KERNEL, PLE_DEFAULT_DIVISOR, REFERENCE_PINS, RefLayer, _i,
+    REFERENCE_PINS, RefLayer, _i,
     build_layers, cache_layout_declaration, cache_totals, flatten_config,
+)
+from .draft_meta_oracle import (
+    _aux_decl,
+    _engram_decl,
+    _engram_entries,
+    _standalone_head_entries,
+    _vision_decl,
+    _vision_entries,
 )
 
 MANIFEST_SCHEMA = "mindie-catalog-reference-manifest/1"
@@ -46,8 +53,6 @@ ONE, TWO = 1, 2
 THREE, FOUR = 3, 4
 ZERO = 0
 MHC_HEAD_ROWS = 4
-_SMALL_PRIMES = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
-_MILLER_RABIN_BASES = (2, 325, 9375, 28178, 450775, 9780504, 1795265022)
 
 
 def make_meta_parameters(shapes, aliases):
@@ -131,11 +136,11 @@ class ReferenceModel:
             out.extend(_layer_entries(self, layer))
         out.extend(_head_entries(self))
         if self.geometry.get("vision") is not None:
-            out.extend(_vision_entries(self.geometry["vision"], self.hidden))
+            out.extend(_vision_entries(self.geometry["vision"], self.hidden, _add))
         if self.geometry.get("engram") is not None:
-            out.extend(_engram_entries(self.geometry["engram"]))
+            out.extend(_engram_entries(self.geometry["engram"], _add))
         if self.geometry.get("standalone"):
-            out.extend(_standalone_head_entries(self))
+            out.extend(_standalone_head_entries(self, _add))
         return out
 
     def source_total(self) -> int:
@@ -426,94 +431,6 @@ def _head_entries(model: ReferenceModel) -> list[Entry]:
         _add(out, "hc_head_scale", 1, 1)
     return out
 
-def _vision_entries(v: Mapping[str, Any], text_hidden: int) -> list[Entry]:
-    out: list[Entry] = []
-    hidden, layers = int(v["hidden"]), int(v["layers"])
-    inter, qkv = int(v["intermediate"]), int(v["qkv"])
-    bias, norm_type = bool(v["bias"]), str(v["norm_type"])
-    _add(out, "vision_patch", hidden, int(v["patch_width"]))
-    _add(out, "vision_pos", max(1, int(v["pos"])), hidden)
-    if bias:
-        _add(out, "vision_patch_bias", hidden, 1)
-    per = [("vision_qkv", qkv, hidden), ("vision_wo", hidden, int(v["query"])),
-           ("vision_fc0", (TWO if v["gated"] else ONE) * inter, hidden),
-           ("vision_fc1", hidden, inter), ("vision_norm1", hidden, 1),
-           ("vision_norm2", hidden, 1)]
-    for name, rows, cols in per:
-        _add(out, name, rows, cols, layers)
-    if bias:
-        for name, rows in (("vision_qkv_bias", qkv), ("vision_wo_bias", hidden),
-                           ("vision_fc0_bias", (TWO if v["gated"] else ONE) * inter),
-                           ("vision_fc1_bias", hidden)):
-            _add(out, name, rows, 1, layers)
-    if norm_type == "layernorm":
-        _add(out, "vision_norm1_bias", hidden, 1, layers)
-        _add(out, "vision_norm2_bias", hidden, 1, layers)
-    _add(out, "vision_final_norm", hidden, 1)
-    if norm_type == "layernorm":
-        _add(out, "vision_final_norm_bias", hidden, 1)
-    aligner_in = int(v["aligner_in"])
-    out_h = int(v["out_hidden"]) or text_hidden
-    kind = str(v["kind"])
-    if kind == "deepseek_v41":
-        _add(out, "aligner_norm", aligner_in, 1)
-        _add(out, "aligner_w1", out_h, aligner_in)
-        _add(out, "aligner_w1_bias", out_h, 1)
-        _add(out, "aligner_w2", out_h, out_h)
-        _add(out, "aligner_w2_bias", out_h, 1)
-    elif kind == "kimi_k3":
-        _add(out, "projector_w0", int(v["aligner_hidden"]), aligner_in)
-        _add(out, "projector_w2", out_h, int(v["aligner_hidden"]))
-        _add(out, "projector_norm", out_h, 1)
-    else:
-        _add(out, "merger_norm", aligner_in, 1)
-        _add(out, "merger_norm_bias", aligner_in, 1)
-        _add(out, "merger_w1", aligner_in, aligner_in)
-        _add(out, "merger_w1_bias", aligner_in, 1)
-        _add(out, "merger", out_h, aligner_in)
-        _add(out, "merger_bias", out_h, 1)
-    for name in ("image_start", "image_end", "image_newline"):
-        _add(out, name, text_hidden, 1)
-    return out
-
-
-def _engram_entries(e: Mapping[str, Any]) -> list[Entry]:
-    out: list[Entry] = []
-    if e.get("kind") == "ple":
-        hc, h, each = int(e["hc_mult"]), int(e["hidden"]), int(e["hc_mult"]) * int(e["hidden"])
-        for table in e["tables"]:
-            _add(out, f"ple_table_{table['id']}", table["rows"], table["width"])
-        for _ in e["tables"]:
-            _add(out, "ple_kv_proj", each + h, int(e["embed"]))
-            _add(out, "ple_norm_key", each, 1)
-            _add(out, "ple_norm_query", each, 1)
-            _add(out, "ple_norm_conv", each, 1)
-            _add(out, "ple_conv1d", each, int(e["conv_k"]))
-        return out
-    hc, h = int(e["hc_mult"]), int(e["hidden"])
-    for table in e["tables"]:
-        _add(out, f"engram_table_{table['id']}", table["rows"], table["width"])
-    for _ in e["tables"]:
-        _add(out, "engram_gate_wkv", (hc + 1) * h, int(e["columns"]) * int(e["width"]))
-        _add(out, "engram_q", hc, h)
-        _add(out, "engram_k", hc, h)
-    return out
-
-
-def _standalone_head_entries(model: ReferenceModel) -> list[Entry]:
-    draft, h, out = model.geometry.get("draft") or {}, model.hidden, []
-    _add(out, "draft_input_proj", h, int(draft["input_width"]))
-    _add(out, "draft_input_norm", h, 1)
-    _add(out, "draft_final_norm", h, 1)
-    markov = int(draft.get("markov_rank", 0))
-    if markov:
-        _add(out, "markov_embed", model.vocab, markov)
-        _add(out, "markov_head", model.vocab, markov)
-    return out
-
-
-
-
 def _assemble_geometry(config, raw):
     c, vision_raw = flatten_config(config)
     builder, layers = raw["builder"], raw["layers"]
@@ -536,156 +453,6 @@ def _assemble_geometry(config, raw):
             "quant": _quant_decl(c, builder), "sharing": sharing,
             "hidden": _i(c, "hidden_size"), "vocab": _i(c, "vocab_size"),
             "tie_word_embeddings": bool(c.get("tie_word_embeddings", False))}
-
-
-def _vision_decl(v: Mapping[str, Any], *, layer_hidden: int) -> dict[str, Any]:
-    model_type = str(v.get("model_type", ""))
-    if "vt_hidden_size" in v:
-        merge = v.get("merge_kernel_size") or [2, 2]
-        return {"kind": "kimi_k3", "hidden": _i(v, "vt_hidden_size"),
-                "layers": _i(v, "vt_num_hidden_layers"),
-                "intermediate": _i(v, "vt_intermediate_size"),
-                "query": _i(v, "qkv_hidden_size"), "qkv": 3 * _i(v, "qkv_hidden_size"),
-                "patch_width": 3 * _i(v, "patch_size") ** 2,
-                "pos": _i(v, "init_pos_emb_height") * _i(v, "init_pos_emb_width"),
-                "bias": False, "gated": False, "norm_type": "rmsnorm",
-                "aligner_in": _i(v, "vt_hidden_size") * int(merge[0]) * int(merge[1]),
-                "aligner_hidden": _i(v, "vt_intermediate_size"),
-                "out_hidden": _i(v, "text_hidden_size", layer_hidden)}
-    if "deepseek_v41" in model_type:
-        downsample = _i(v, "downsample_ratio", 1) or 1
-        hidden = _i(v, "hidden_size")
-        return {"kind": "deepseek_v41", "hidden": hidden,
-                "layers": _i(v, "num_hidden_layers"),
-                "intermediate": _i(v, "intermediate_size"),
-                "query": hidden, "qkv": 3 * hidden,
-                "patch_width": 3 * _i(v, "patch_size") ** 2,
-                "pos": 0, "bias": True, "gated": True, "norm_type": "layernorm",
-                "aligner_in": hidden * downsample * downsample,
-                "aligner_hidden": layer_hidden, "out_hidden": layer_hidden}
-    merge = _i(v, "spatial_merge_size", 2) or 2
-    hidden = _i(v, "hidden_size")
-    return {"kind": "qwen3_5", "hidden": hidden, "layers": _i(v, "depth"),
-            "intermediate": _i(v, "intermediate_size"), "query": hidden,
-            "qkv": 3 * hidden,
-            "patch_width": 3 * _i(v, "patch_size") ** 2 * (_i(v, "temporal_patch_size", 1) or 1),
-            "pos": _i(v, "num_position_embeddings"), "bias": False, "gated": False,
-            "norm_type": "layernorm", "aligner_in": hidden * merge * merge,
-            "aligner_hidden": 0, "out_hidden": _i(v, "out_hidden_size", layer_hidden)}
-
-
-def _is_prime_64(value: int) -> bool:
-    if value < TWO:
-        return False
-    for prime in _SMALL_PRIMES:
-        if value % prime == ZERO:
-            return value == prime
-    exponent, shifts = value - ONE, ZERO
-    while not exponent % TWO:
-        exponent //= TWO; shifts += ONE
-    for base in _MILLER_RABIN_BASES:
-        if base % value == ZERO:
-            continue
-        witness = pow(base, exponent, value)
-        if witness in (ONE, value - ONE):
-            continue
-        for _ in range(shifts - ONE):
-            witness = pow(witness, TWO, value)
-            if witness == value - ONE:
-                break
-        else:
-            return False
-    return True
-
-
-def _nth_prime_after(start: int, count: int) -> int:
-    prime = int(start)
-    for _ in range(count):
-        candidate = prime + ONE
-        if candidate <= TWO:
-            prime = TWO; continue
-        if not candidate % TWO:
-            candidate += ONE
-        while not _is_prime_64(candidate):
-            candidate += TWO
-        prime = candidate
-    return prime
-
-
-def _engram_decl(c: Mapping[str, Any], layers: list[RefLayer]) -> dict[str, Any] | None:
-    ple_layers = [int(v) for v in c.get("ple_layer_ids", ()) or ()]
-    hidden = _i(c, "hidden_size")
-    hc = max((layer.hc_mult for layer in layers), default=1)
-    if ple_layers:
-        ngram, heads = _i(c, "ngram_size"), _i(c, "heads_per_ngram")
-        embed = _i(c, "ple_embed_dim")
-        ngram_heads = (ngram - ONE) * heads
-        width = embed // ngram_heads
-        divisor = _i(c, "make_ngram_vocab_size_divisible_by", PLE_DEFAULT_DIVISOR)
-        base = _i(c, "ngram_vocab_size_base")
-        conv_k = _i(c, "ple_conv_kernel_size", PLE_DEFAULT_CONV_KERNEL)
-        tables = []
-        for index, ple_id in enumerate(ple_layers):
-            total = ZERO
-            for local_head in range(ngram_heads):
-                global_head = index * ngram_heads + local_head
-                total += _nth_prime_after(base - ONE, global_head + ONE)
-            rows = ((total + divisor - ONE) // divisor) * divisor
-            tables.append({"id": index, "layer": ple_id - ONE, "rows": rows, "width": width})
-        for table in tables:
-            layers[table["layer"]] = _with_engram(layers[table["layer"]])
-        return {"kind": "ple", "tables": tables, "hidden": hidden, "hc_mult": hc,
-                "embed": embed, "conv_k": conv_k, "max_ngram": ngram}
-    layer_ids = [int(v) for v in c.get("engram_layer_ids", ()) or ()]
-    rows = [int(v) for v in c.get("engram_num_embeddings", ()) or ()]
-    if not layer_ids:
-        return None
-    width, ngram = _i(c, "engram_head_dim"), _i(c, "engram_max_ngram_size")
-    heads = _i(c, "engram_n_heads")
-    tables = [{"id": index, "layer": layer, "rows": row, "width": width}
-              for index, (layer, row) in enumerate(zip(layer_ids, rows))]
-    for table in tables:
-        layers[table["layer"]] = _with_engram(layers[table["layer"]])
-    return {"kind": "engram", "tables": tables, "hidden": hidden, "hc_mult": hc,
-            "width": width, "columns": (ngram - ONE) * heads}
-
-
-def _with_engram(layer: RefLayer) -> RefLayer:
-    return replace(layer, engram=True)
-
-
-def _aux_decl(c: Mapping[str, Any], builder: str) -> dict[str, Any]:
-    targets = tuple(int(v) for v in c.get("dspark_target_layer_ids", ()) or ())
-    nextn = _i(c, "num_nextn_predict_layers")
-    if builder in {"deepseek_v4", "deepseek_v41"}:
-        layers = len(targets) if targets else nextn
-        if layers <= 0:
-            return {}
-        block = _i(c, "dspark_block_size", 1)
-        markov = _i(c, "dspark_markov_rank")
-        # A declared multi-token DSpark block (block_size > 1 and a Markov
-        # rank) is the native DSpark module, not an ordinary NextN module.
-        kind = "dspark" if (block > 1 or markov) else "mtp_dspark"
-        return {"kind": kind, "layers": layers, "standalone": False,
-                "target_layer_ids": list(targets),
-                "block_size": block}
-    if builder == "kimi":
-        targets = targets or (2, 23, 47, 71, 89)
-        return {"kind": "dspark", "layers": 5, "standalone": False,
-                "external": True, "target_layer_ids": list(targets),
-                "block_size": _i(c, "dspark_block_size", 5)}
-    if builder == "kimi_dspark":
-        return {"kind": "standalone_draft",
-                "layers": _i(c, "num_hidden_layers"), "standalone": True}
-    if builder == "glm" and nextn > 0:
-        return {"kind": "mtp", "layers": nextn, "standalone": False}
-    mtp = _i(c, "mtp_num_hidden_layers")
-    if builder == "qwen" and mtp > 0:
-        return {"kind": "mtp", "layers": mtp, "standalone": False}
-    if builder == "step5" and nextn > 0:
-        # Step-5 owns native NextN blocks with ids num_hidden_layers .. +nextn-1.
-        return {"kind": "mtp", "layers": nextn, "standalone": False}
-    return {}
 
 
 def _quant_decl(c: Mapping[str, Any], builder: str) -> dict[str, Any]:

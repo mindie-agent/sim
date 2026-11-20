@@ -75,8 +75,18 @@ RUNTIME_MODE_DEFAULTS = MappingProxyType({
 })
 KDA_PROJ_TP_ALIAS = "kda_proj_tp"
 LINEAR_PROJ_TP = "linear_proj_tp"
+COMPILATION_BOOL_NAMES = (
+    "enable_torch_compile",
+    "enable_npugraph_ex",
+    "enable_static_kernel",
+    "enable_super_kernel",
+)
 PARALLEL_FEATURE_NAMES = frozenset(LOCAL_PARALLEL_DEFAULTS) | {KDA_PROJ_TP_ALIAS}
-RUNTIME_FEATURE_NAMES = frozenset(RUNTIME_MODE_DEFAULTS) | {"recover_ssm"}
+RUNTIME_FEATURE_NAMES = (
+    frozenset(RUNTIME_MODE_DEFAULTS)
+    | {"recover_ssm"}
+    | frozenset(COMPILATION_BOOL_NAMES)
+)
 SOFTWARE_ALIAS_KEYS = frozenset({"recover_ssm"})
 SOFTWARE_ALIAS = "software"
 ROUTING_KEY = "routing"
@@ -186,6 +196,9 @@ def normalize_runtime_features(raw: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(value, bool):
             raise ModelingError("runtime_recover_ssm_invalid")
         result["recover_ssm"] = value
+    for flag in COMPILATION_BOOL_NAMES:
+        if flag in result:
+            result[flag] = _feature_bool(result[flag], flag)
     return result
 
 
@@ -272,6 +285,8 @@ def validate_runtime_features(runtime: Any) -> None:
     for name, allowed in _MODES.items():
         _feature_mode(getattr(runtime, name), name, allowed)
     _feature_bool(getattr(runtime, "recover_ssm", False), "recover_ssm")
+    for flag in COMPILATION_BOOL_NAMES:
+        _feature_bool(getattr(runtime, flag, False), flag)
     routing = getattr(runtime, "routing", {}) or {}
     if REDUNDANT_EXPERTS_KEY in routing:
         raise ModelingError(

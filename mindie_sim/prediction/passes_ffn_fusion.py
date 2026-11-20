@@ -486,6 +486,7 @@ def activation_quant_fusion(ops, source_dtype):
             continue
         act = by_id.get(quant.deps[0])
         if (act is None or act.plan_required or act.family not in {"swiglu", "situ", "geglu"}
+                or float(dict(act.metadata).get("activation_limit", 0.0) or 0.0) > 0.0
                 or act.stage != quant.stage or act.stream != quant.stream):
             continue
         if users[act.op_id] != [quant.op_id]:
@@ -563,17 +564,32 @@ def gmm_swiglu_quant_fusion(ops, source_dtype):
             continue
         if gate.op_id in replacements or tail.op_id in replacements:
             continue
+        gate_meta = dict(gate.metadata)
+        act_dtype = str(gate_meta.get("output_format") or tail.dtype or gate.dtype)
+        if len(gate.local_shape) >= 2:
+            intermediate_bytes = float(
+                gate.local_shape[0] * gate.local_shape[1] * dtype_bytes(act_dtype)
+            )
+        else:
+            intermediate_bytes = min(float(gate.mte3_bytes), float(tail.mte2_bytes))
+        eliminated_write = min(float(gate.mte3_bytes), intermediate_bytes)
+        eliminated_read = min(float(tail.mte2_bytes), intermediate_bytes)
+        new_gate_mte3 = max(0.0, float(gate.mte3_bytes) - eliminated_write)
+        new_gate_hbm = max(0.0, float(gate.hbm_bytes) - eliminated_write)
+        new_tail_mte2 = max(0.0, float(tail.mte2_bytes) - eliminated_read)
+        new_tail_hbm = max(0.0, float(tail.hbm_bytes) - eliminated_read)
         replacements[gate.op_id] = replace(
             gate,
-            mte3_bytes=0.0,
-            hbm_bytes=max(0.0, float(gate.hbm_bytes) - float(gate.mte3_bytes)),
+            mte3_bytes=new_gate_mte3,
+            hbm_bytes=new_gate_hbm,
             metadata=merge_meta(gate, extra=(
                 ("onchip_handoff_to", tail.op_id),
-                ("fusion_boundary", {
+                ("onchip_handoff_boundary", {
                     "implementation": "declared_onchip_handoff",
                     "native": "GroupedMatmulSwigluQuantOnChip",
                     "submitted_kernels": 2,
                     "semantic_phase_count": 2,
+                    "eliminated_activation_write_bytes": eliminated_write,
                     "timing_basis": "resource_DAG_not_sum_of_kernel_durations",
                     "launch_reduction_claimed": False,
                 }),
@@ -581,10 +597,11 @@ def gmm_swiglu_quant_fusion(ops, source_dtype):
         )
         replacements[tail.op_id] = replace(
             tail,
-            mte2_bytes=0.0,
-            hbm_bytes=float(tail.mte3_bytes),
+            mte2_bytes=new_tail_mte2,
+            hbm_bytes=new_tail_hbm,
             metadata=merge_meta(tail, extra=(
                 ("onchip_handoff_from", gate.op_id),
+                ("eliminated_activation_read_bytes", eliminated_read),
                 ("fused_from", ("grouped_gemm", tail.recipe)),
             )),
         )

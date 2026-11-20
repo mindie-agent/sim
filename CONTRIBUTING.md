@@ -15,7 +15,7 @@
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **Ascend A2** | `DAV_2201`<br/>(`npu_arch_2201`) | `Ascend910B1`、`B2`、`B2C`、`B3`、`B4`、`B4-1`（6 款） | `a2`、`910b`、`910b1..b4`、`800i-a2` | 单封装单 Die（`20/24 AIC`），`L0C = 128 KiB`，`UB = 192 KiB`，`L2 = 192 / 96 MiB`，原生 BF16/INT8/INT4（**无原生 FP8**），AIC<->AIV 经 GM/L2 通信，8P HCCS / 16P 桥接 | [**Ascend A2 校准与开发指南**](docs/contributing/ascend-a2.md) |
 | **Ascend A3** | `DAV_2201` 双 Die<br/>(`npu_arch_2201`) | `Ascend910_9391`、`9392`、`9381`、`9382`、`9372`、`9362`（6 款） | `a3`、`910c`、`800i-a3-8p`、`800i-a3-16p`、`a3-pod` | **单封装双 Die（`dies_per_package = 2`，每 Die 独立 Rank `Phy-ID 0..15`）**，片内 `SIO`（`448 GB/s`）+ 机内 `HCCS_SW` + **CloudMatrix 384** 超节点，`L2 = 192 / 168 MiB` | [**Ascend A3 校准与开发指南**](docs/contributing/ascend-a3.md) |
-| **Ascend A5** | `DAV_3510`<br/>(`npu_arch_3510`) | `Ascend950DT_9581`、`9582`、`Ascend950PR_9579`、`Ascend950PR_958b`（4 款） | `a5`、`950`、`950pr_958b`、`a5-pod`、`a5-server-dt`、`a5-pod-pr` | 单封装单 Die（`32 AIC / 64 AIV`），**`L0C = 256 KiB`**，`UB = 248 KiB`，`L2 = 128 MiB`（DT `4.0 TB/s` / PR `1.6` & `1.4 TB/s`），**原生 FP8/INT8/BF16**，新增片上 `l0c->ub` 直连，`K_8` `per_pair` UB 直连网与 **Atlas 950 SuperPoD** | [**Ascend A5 校准与开发指南**](docs/contributing/ascend-a5.md) |
+| **Ascend A5** | `DAV_3510`<br/>(`npu_arch_3510`) | `Ascend950DT_9581`、`9582`、`Ascend950PR_9579`、`Ascend950PR_958b`（4 款，另支持商用派生别名 `425-96`、`486-96`、`547-96`、`547-144`） | `a5`、`950`、`950pr_958b`、`425-96..547-144`、`a5-pod`、`a5-server-dt`、`a5-pod-pr` | 单封装单 Die（`32 AIC / 64 AIV` 基线，商用派生覆盖 `28/32/36 AIC`），**`L0C = 256 KiB`**，`UB = 248 KiB`，`L2 = 128 MiB`（DT `4.0 TB/s` / PR `1.6` & `1.4 TB/s`），**原生 FP8/INT8/BF16**，新增片上 `l0c->ub` 直连，`K_8` `per_pair` UB 直连网与 **Atlas 950 SuperPoD** | [**Ascend A5 校准与开发指南**](docs/contributing/ascend-a5.md) |
 
 ---
 
@@ -74,7 +74,7 @@ flowchart LR
 
    - **冲突裁决铁律**：动工前必须记录实际核对的 `{repository, revision}`；当历史 Issue 描述、旧文档假设与最新上游源码或真机 `msprof` 抓包冲突时，**一律以最新真实源码 + 实测抓包为唯一真源**，并在 PR Evidence 中写明上游演进差异（例如默认开关下库、新旧内核维度约束差异），严禁盲从过时描述把正确实现改错。
 2. **`mindie-sim <-> mindie-profiler` 跨仓 SSOT 单源契约**：
-   - `mindie_sim.observed_contracts`、`mindie_sim.subgraph_math` 与 `mindie_sim.structure*` 是 `mindie-profiler` 的单一事实源（例如 `structure.py` 中 `execution.resource_geometry` 仅保留拓扑结构键而不混入可变硬件峰值速率，确保 `compare_cohorts` 跨标定态的 `graph_id` 稳定；`structure_physical.py` 在 `fusion_phases` 列表内递归剥离 `ep_rank`）。修改上述模块或算子 `source_boundary` 时，必须挂载同级 `../profiler` 联合运行跨仓测试套件。
+   - `mindie_sim.observed_contracts`、`mindie_sim.subgraph_math` 与 `mindie_sim.structure*` 是 `mindie-profiler` 的单一事实源：[`mindie_sim/prediction/fusion_regions.py`](mindie_sim/prediction/fusion_regions.py) 统一维护单归属融合算子谱系（区分 `absorbed_source_ops` 与完整 `FusionBoundary`，求并集保留跨组 `structure_subgraph_memberships` 且杜绝共享复合算子重复计费）；[`mindie_sim/compose_runtime.py`](mindie_sim/compose_runtime.py) 显式标记 `recipe_binding_origins`（区分 `caller`、`stack_profile` 与 `body_default`）；[`mindie_sim/structure.py`](mindie_sim/structure.py) 支持 `--draft-prepare` / `draft_prepare=True` 导出投机预填充草稿缓存构建子图，其 `execution.resource_geometry` 仅保留拓扑结构键以维持跨标定态 `graph_id` 稳定，且 CLI 默认将输入路径脱敏为 `source: {"kind": "case_file", "sha256": ...}`。修改上述模块或算子 `source_boundary` 时，必须挂载同级 `../profiler` 联合运行跨仓测试套件。
 
 ---
 
@@ -655,7 +655,8 @@ def attach_custom_sparse_window_traffic(op, hierarchy, q_lens: tuple[int, ...], 
 
 > [!TIP]
 > - 若模型 Checkpoint 含视觉塔但仅建模文本主干，必须显式设置 `ModelSpec(..., accounting_scope="text_backbone")`；声明 `"full_checkpoint"` 则必须完整建模视觉塔与 Aligner/Projector 参数。
-> - 若模型带原生 MTP / NextN / DSpark 投机头，必须在 `DraftSpec` 中显式给出 `layer_plans`、词表/输出头共享归属及 `execution_mode ∈ {"stack", "cyclic_nextn"}`，严禁从最后一层隐式猜测克隆。
+> - 若模型带原生 MTP / NextN / DSpark / Eagle3 投机头，必须在 [`mindie_sim/catalog/draft_spec.py`](mindie_sim/catalog/draft_spec.py) 的 `DraftSpec` 中显式声明 `layer_plans`、词表/输出头共享归属、`execution_mode ∈ {"stack", "sequential_mtp", "cyclic_nextn", "block_dspark", "eagle3_serial"}` 以及泛化上下文构建契约（`independent_context: bool`、`context_projection_mode ∈ {"none", "fused_kv_bank", "per_layer_qkv", "mla_prolog"}`、`dcp_sharded: bool`），并通过 `mindie-sim structure --draft-prepare`、`mindie-sim graph --draft-prepare --export-structure` 及 `compare_cohorts` 校验预填充草稿上下文对账，严禁从最后一层隐式猜测克隆或假定外部草稿头均为 MLA。
+> - 对齐全量 **37 款核心目录模型 + 4 款独立架构预设（共 41 款，覆盖 `G1–G11` 11 个同构模型族）** 时，严守源码级结构真相：例如 `Gemma-4`（`G10`）采用标准 `RMSNorm`（`norm_weight_offset=0.0`，Dense 层 `4` 个 / MoE 层 `7` 个 Norm、无权重 `v_norm`、全注意力层 `k_eq_v=True` 省去 `v_proj` 与 YOCO `num_kv_shared_layers`）；`MiniMax-M3` / `M3.1-Flash`（`G8`）采用 `(1+w)` `GemmaRMSNorm`（`norm_weight_offset=1.0`、`swigluoai`）并配套 7 层稠密 GQA DSpark（[`mindie_sim/catalog/minimax_draft.py`](mindie_sim/catalog/minimax_draft.py)，`#20167`，`per_layer_qkv` + `dcp_sharded=False`）；`Step-5-Preview`（`G9`）使用原生 CSA `_C_ascend.npu_indexer_region_score`、`supports_torch_compile=False`（`do_not_compile=True`）、`fp32_residual=True` 与 3 层 `cyclic_nextn`（`92..94`）；`Kimi-K3`（`G5`）采用 5 层 GQA DSpark（`fused_kv_bank`、`dcp_sharded=False`，`#15851`），而 `Kimi-K3.1` 采用 5 层 MLA DSpark（`mla_prolog`）。
 > - 非整除专家并行（如 `E=288, EP=64`）统一交由 [`mindie_sim/catalog/expert_slots.py`](mindie_sim/catalog/expert_slots.py) 计算物理槽位与自动 Padding，切勿硬编码 `E % EP == 0` 拦截。
 
 ### 步骤 3：接入独立 `torch.device("meta")` 参考预言机与基准清单
@@ -788,34 +789,33 @@ You are contributing incremental Ascend hardware calibration (`A2` / `A3` / `A5`
      6. `PYTHONDONTWRITEBYTECODE=1 python3 -B -m pytest -q -n auto --dist worksteal -p no:cacheprovider -m "not live_npu"`
 ````
 
-## Onboarding Runtime Stacks & Three-State Feature Tracks
+---
 
-The simulator separates **what the hardware can do** from **what a serving stack has shipped**. Every optimization is a framework-neutral `OptimizationMechanism` (Layer 1) that a `RuntimeStackProfile` (Layer 2) binds to one of three explicit states:
+## 六、运行时栈接入、四阶特性瀑布与正交编译契约
 
-| Track | Meaning | Selection |
+模拟器严格分离**硬件物理上能达到什么**与**特定推理服务栈当前交付了什么**。每项优化均为框架中立的 Layer-1 `OptimizationMechanism`（[`mindie_sim/feature_mechanisms.py`](mindie_sim/feature_mechanisms.py) 与 [`mindie_sim/feature_mechanisms_cann93.py`](mindie_sim/feature_mechanisms_cann93.py)），由 Layer-2 `RuntimeStackProfile`（[`mindie_sim/stack_tracks.py`](mindie_sim/stack_tracks.py)）映射到以下**四阶特性状态（4-Rung Feature Tracks）**：
+
+| 轨道（Track） | 物理与工程语义 | CLI 选择参数 |
 | :--- | :--- | :--- |
-| `merged` | Exactly what the stack's `main` branch runs today (default `vllm-ascend`) | `--feature-track merged` |
-| `unmerged_pr` | `merged` plus audited in-flight PRs modeled by their real physical mechanism | `--feature-track unmerged_pr` |
-| `expected_ideal` | Every structurally compatible mechanism, regardless of a served PR | `--feature-track expected_ideal` |
+| `raw_eager` | 零可选栈级融合、关闭图捕获与 `torch.compile` 的纯 PyTorch/ATen Eager 基线（不设模型白名单门禁） | `--feature-track raw_eager` |
+| `merged` | 服务栈当前主干已合入的真实机制集合（默认 `vllm-ascend@405617bae` + CANN `9.3.0`） | `--feature-track merged` |
+| `unmerged_pr` | `merged` 叠加已审计的活跃未合入 PR 物理机制（多 PR 同机制自动合并选项与溯源引用，绝不字典覆盖丢失） | `--feature-track unmerged_pr` |
+| `expected_ideal` | 栈中立第一性原理上界：激活当前 `(model, hardware, parallel)` 结构兼容的全部 `OptimizationMechanism` | `--feature-track expected_ideal` |
 
-`mindie-sim feature-tracks --model <name> --hardware a5 --tp 8 --ep 8` prints the four-level waterfall (`current_merged` -> `current_unmerged_pr` -> `expected_ideal` -> `hardware_roofline`), and `--enable-opt` / `--disable-opt` isolate one mechanism for What-If A/B evaluation.
+- **四阶瀑布与双视角 PR 消融（[`mindie_sim/feature_waterfall.py`](mindie_sim/feature_waterfall.py)）**：执行 `mindie-sim feature-tracks --model <name> --hardware a5 --tp 8 --ep 8` 可一次性输出 **`raw_eager` -> `current_merged` -> `current_unmerged_pr` -> `expected_ideal` -> `hardware_roofline`**（调用 `evaluate_target_efficiency(..., mode="exact_target")` 给出 `0.80x` 关键路径目标与 `1.0x` 物理理想下界），自动审计阶梯单调性，并在 `current_unmerged_pr` 下同时给出正向单加 **`single_pr_ablation`**（`merged + {PR}`）与留一剔除 **`leave_one_out_ablation`**（`unmerged_pr - {PR}`）；`compose` 的 `--enable-opt` / `--disable-opt` 支持单机制正交 What-If 对比。
+- **CANN `9.3.0` + `vllm-ascend@405617bae` 栈真源清单**：内置 `RUNTIME_STACKS` 仅保留经逐行源码审计的 `vllm-ascend`（由 [`mindie_sim/stack_sources/vllm_ascend_cann93.json`](mindie_sim/stack_sources/vllm_ascend_cann93.json) 与 [`mindie_sim/va_stack_bindings.py`](mindie_sim/va_stack_bindings.py) 驱动，精确对齐 `_A5_PROFILE` 中已合入的 `MegaMoE(enable_fused_mc2=3)`、`Chunk64`、`_C_ascend.npu_hc_pre_v3/v2`、`GBSA`、`MlaPrologV4`、缺省的 `GRAPH_QKV_NORM_ROPE_FUSION`，以及 `PR #22147` `Chunk32`、`PR #21794` `text_gated_residual`、`PR #22333` `situglu` MegaMoE、`PR #22467` C8 `KvQuantSFA`、`PR #22235` `msa_index_score_v2` 等 35 个活跃未合入 PR）与框架中立的 `raw_eager`。
+- **`Software` 正交两层编译契约（[`mindie_sim/schema/case.py`](mindie_sim/schema/case.py)）**：`Software` 将外层图捕获 `graph_capture_mode`（`"none"` / `"piecewise"` / `"full"`，对应 `ModelRunner` `NPUGraph` / `FULL_DECODE_ONLY` `ACLGraph`）与内层编译器布尔开关（`enable_torch_compile`、`enable_npugraph_ex`、`enable_static_kernel`、`enable_super_kernel`）正交解耦：模型标记 `do_not_compile=True`（`supports_torch_compile=False`）时**保留 `graph_capture_mode="full"`** 而仅关闭 `enable_torch_compile` / `enable_npugraph_ex`；当 `graph_capture_mode != "full"`（如 `piecewise`）或 `enable_torch_compile=False` 时，自动关闭 `enable_npugraph_ex`、`enable_static_kernel` 与 `enable_super_kernel`。
 
-Built-in `RUNTIME_STACKS` are deliberately limited to two profiles:
+**严禁将未经验证的第三方推理栈硬编码为内置 Profile。** `mindie-llm`、`sglang`、`xllm` 等外部框架一律通过 `mindie-sim.stack-manifest/1` JSON 清单或调用方显式 `register_runtime_stack(...)` 接入，并如实声明模型支持范围：
 
-- `vllm-ascend` — audited against the real `vllm-project/vllm-ascend` `main` branch and open performance PRs;
-- `raw_eager` — the framework-neutral unfused PyTorch/ATen baseline with zero optional fusions.
-
-**Never register an unverified third-party stack as a built-in profile.** `mindie-llm`, `sglang`, `xllm`, and every other external framework onboard exclusively through a `mindie-sim.stack-manifest/1` JSON manifest or an explicit `register_runtime_stack(...)` in the contributor's own integration, and must declare the models they actually support:
-
-| Field | Meaning | Enforcement |
+| 字段 | 含义 | 门禁约束 |
 | :--- | :--- | :--- |
-| `supported_models` | Models supported on the stack's **merged** `main` branch. Empty `()` means unrestricted / structural-only (e.g. `raw_eager`, or the `vllm-ascend` catalog fallback). | A non-empty list gates `merged` and also counts as supported on `unmerged_pr`. |
-| `unmerged_pr_models` | Models whose architecture onboarding itself is still an **open PR** on that stack. | A non-empty list additionally permits those models on `unmerged_pr`, never on `merged`. |
+| `supported_models` | 该栈**已合入主干（`merged`）**支持的模型列表；空元组 `()` 仅保留给不受限的结构基线（如 `raw_eager`）。 | 非空时门禁拦截不在列表中的 `merged` 请求，且自动计入 `unmerged_pr` 支持集。 |
+| `unmerged_pr_models` | 模型接入本身仍处于**未合入 Open PR** 状态的模型列表。 | 非空时额外放行 `unmerged_pr`，但绝不在 `merged` 上放行。 |
 
-With either field non-empty, `resolve_stack_track(...)` raises `model_not_supported_by_runtime_stack:<stack>:<model>:<track>` when a real stack track cannot serve the model. `expected_ideal` is **always** allowed: it is stack-neutral first-principles modeling and must never be blocked by an upstream framework's lack of model support.
+当不满足支持集时，`resolve_stack_track(...)` 显式抛出 `model_not_supported_by_runtime_stack:<stack>:<model>:<track>`；而 `raw_eager` 与 `expected_ideal` 始终放行，绝不因外部框架未支持某模型而阻断第一性原理建模：
 
-1. **Pure JSON onboarding (zero Python changes)**: write a `mindie-sim.stack-manifest/1` document declaring `name`, `repository`, optional `supported_models` / `unmerged_pr_models`, and `bindings` (`mechanism_id` from `list_optimization_mechanisms()`, `state: "merged" | "unmerged_pr"`, `ref: "<org>/<repo>#<PR>"`, optional `models` / `archs` / `options`), then pass `--stack-manifest my_stack.json` to `mindie-sim compose` or `mindie-sim feature-tracks` (or `runtime_stack="my_stack.json"` in Python). For example:
-
+1. **纯 JSON 零代码接入**：编写符合 `mindie-sim.stack-manifest/1` 的清单文件，通过 `--stack-manifest my_stack.json` 传给 `mindie-sim compose` 或 `mindie-sim feature-tracks`（或 Python `runtime_stack="my_stack.json"`）：
    ```json
    {
      "schema": "mindie-sim.stack-manifest/1",
@@ -829,10 +829,8 @@ With either field non-empty, `resolve_stack_track(...)` raises `model_not_suppor
      ]
    }
    ```
-
-   Declare only models the stack has really implemented. An empty `supported_models` / `unmerged_pr_models` pair is reserved for unrestricted structural baselines; do not use it to claim unsupported third-party coverage.
-2. **Registering new physical mechanisms**: call `register_optimization_mechanism(OptimizationMechanism(...))` with real `OpSpec` / lowering-pass / `Software` transformations executed by the canonical engine. Never encode a latency multiplier; a mechanism must remove modeled traffic, fuse a declared boundary, or change a real `Software` field.
-3. **Syncing open vs merged PRs**: run `python3 scripts/audit_stack_prs.py --stack <name> --repo <owner/repo>` (or `--offline-fixture snapshot.json` in CI) to detect PRs that merged onto `main` (promote `unmerged_pr` -> `merged`) and newly opened performance PRs that are not cataloged yet.
+2. **注册新物理优化机制**：调用 `register_optimization_mechanism(OptimizationMechanism(...))` 提供由唯一因果引擎执行的真实 `OpSpec` / Lowering Pass / `Software` 变换——严禁编码经验耗时乘子。
+3. **巡检与同步 PR 合入状态**：运行 `python3 scripts/audit_stack_prs.py --stack cann93`（或 `--stack <name> --repo <owner/repo>`、CI 离线 `--offline-fixture snapshot.json`）自动检测已合入 `main` 待晋升为 `merged` 的 PR 及未收录的新性能 PR。
 
 ---
 

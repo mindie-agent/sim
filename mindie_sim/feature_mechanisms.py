@@ -37,9 +37,9 @@ SERIAL_CONTEXT_DEGREE = 1
 
 PASS_PRIORITY_ORDER: tuple[str, ...] = (
     "activation_quantization",
-    "moe_tail_residual",
     "norm_quant",
     "residual_norm",
+    "moe_tail_residual",
     "mhc_boundary_pr",
     "mhc_boundary_ideal",
     "indexer_online_topk",
@@ -105,6 +105,18 @@ def _has_quant_activations(model: ModelSpec) -> bool:
             and str(model.quant.activation_format) != str(model.activation_dtype))
 
 
+def _torch_compile_active(rt: Mapping[str, Any], model: ModelSpec) -> bool:
+    if "enable_torch_compile" in rt:
+        return bool(rt["enable_torch_compile"])
+    meta = dict(rt.get("metadata") or {})
+    if "enable_torch_compile" in meta:
+        return bool(meta["enable_torch_compile"])
+    facts = dict(model.catalog_facts)
+    if facts.get("supports_torch_compile") is False:
+        return False
+    return True
+
+
 def _apply_aclgraph(rt: dict[str, Any], ctx: MechanismContext) -> None:
     if "graph_capture_mode" in ctx.caller_explicit:
         return
@@ -117,6 +129,9 @@ def _apply_aclgraph(rt: dict[str, Any], ctx: MechanismContext) -> None:
     rt["graph_capture_keys"] = capture_keys(int(rt["max_num_seqs"]), draft)
     policy = dict(meta.get("execution_policy") or {})
     policy["graph_capture_mode"] = "full"
+    compile_on = _torch_compile_active(rt, ctx.model)
+    policy.setdefault("enable_torch_compile", compile_on)
+    meta.setdefault("enable_torch_compile", compile_on)
     meta["execution_policy"] = policy
     rt["metadata"] = meta
 
@@ -143,8 +158,13 @@ def _apply_sp(rt: dict[str, Any], ctx: MechanismContext) -> None:
 
 
 def _apply_basic_norm_quant(rt: dict[str, Any], ctx: MechanismContext) -> None:
+    compile_on = _torch_compile_active(rt, ctx.model)
     if _has_quant_activations(ctx.model):
-        _append_passes(rt, "activation_quantization", "norm_quant")
+        _append_passes(rt, "activation_quantization")
+        if compile_on:
+            _append_passes(rt, "norm_quant")
+    if not compile_on:
+        return
     normalization = dict(ctx.model.catalog_facts).get("normalization") or {}
     # ``add_rmsnorm`` is the residual boundary and is independent of qk_norm.
     if (ctx.model.activation_dtype == "bf16"
@@ -302,14 +322,13 @@ def _apply_packed_proj_zero_copy(rt: dict[str, Any], _ctx: MechanismContext) -> 
 
 
 def _apply_gdn_chunk64(rt: dict[str, Any], ctx: MechanismContext) -> None:
+    from mindie_sim.prediction.gdn_domain import model_supports_gdn_chunk64
+
+    tp = int(ctx.parallel.get("tp", 1))
     policy = dict(rt.get("attention_policy") or {})
     policy.setdefault("recurrent_chunk", GDN_DEFAULT_CHUNK_SIZE)
     rt["attention_policy"] = policy
-    gdn_plans = [p for p in ctx.model.layer_plans if p.attention == "gdn"]
-    if (gdn_plans
-            and all(p.recurrent_state_dtype == "fp32"
-                    and p.conv_state_dtype == ctx.model.activation_dtype
-                    for p in gdn_plans)):
+    if model_supports_gdn_chunk64(ctx.model, tp):
         _set_lowering(rt, "gdn_prefill", "gdn_prefill_arch35")
 
 
@@ -500,3 +519,5 @@ for _item in (
     ),
 ):
     register_optimization_mechanism(_item)
+
+from mindie_sim import feature_mechanisms_cann93 as _cann93_mechanisms  # noqa: E402,F401

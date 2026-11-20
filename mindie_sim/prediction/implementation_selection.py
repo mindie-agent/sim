@@ -22,6 +22,47 @@ _CATEGORIES = {"phases": {"prefill", "decode"},
 
 
 AUTOMATIC_LOWERINGS_KEY = "automatic_lowerings"
+RECIPE_BINDING_ORIGINS_KEY = "recipe_binding_origins"
+ALLOWED_BINDING_ORIGINS = frozenset({"caller", "stack_profile", "body_default"})
+_ORIGIN_PRECEDENCE = {"body_default": 0, "stack_profile": 1, "caller": 2}
+
+
+def record_binding_origin(metadata, section: str, name: str, origin: str):
+    """Record whether a kernel binding came from ``caller``, ``stack_profile`` or ``body_default``."""
+    if origin not in ALLOWED_BINDING_ORIGINS:
+        raise ModelingError(f"recipe_binding_origin_invalid:{origin}")
+    values = dict(metadata or ())
+    table = dict(values.get(RECIPE_BINDING_ORIGINS_KEY) or {})
+    key = f"{section}.{name}"
+    existing = table.get(key)
+    if existing is None or _ORIGIN_PRECEDENCE.get(origin, 0) >= _ORIGIN_PRECEDENCE.get(existing, 0):
+        table[key] = origin
+    values[RECIPE_BINDING_ORIGINS_KEY] = table
+    return values
+
+
+def binding_origin(runtime, section: str, name: str) -> str | None:
+    """Return ``caller | stack_profile | body_default`` for an installed kernel binding."""
+    if runtime is None:
+        return None
+    kernels = getattr(runtime, "kernels", None) or {}
+    section_map = kernels.get(section) or {}
+    if name not in section_map:
+        return None
+    meta = dict(getattr(runtime, "metadata", ()) or ())
+    table = meta.get(RECIPE_BINDING_ORIGINS_KEY)
+    if isinstance(table, dict):
+        declared = table.get(f"{section}.{name}")
+        if declared in ALLOWED_BINDING_ORIGINS:
+            return str(declared)
+    if section == "lowerings" and is_automatic_lowering(meta, name):
+        return "body_default"
+    return "caller"
+
+
+def is_caller_pinned_binding(runtime, section: str, name: str) -> bool:
+    """True only when ``section[name]`` was explicitly pinned by the caller."""
+    return binding_origin(runtime, section, name) == "caller"
 
 
 def with_automatic_lowering(metadata, selector):

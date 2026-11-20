@@ -234,7 +234,8 @@ def test_explicit_generic_router_recipe_disables_the_fused_call():
 
 
 def test_ep_dispatch_quantizer_is_absorbed_into_init_routing_once():
-    case = compose("glm-5.3-flash", quant="w8a8_mxfp8", layers=4)
+    case = compose("glm-5.3-flash", quant="w8a8_mxfp8", layers=4,
+                   exclude_optimizations=("cann_megamoe_fusion",))
     ops = graph(case)
     assert not any(op.op_id.endswith(".pack.quantize") for op in ops)
     pack = next(op for op in ops if op.op_id.endswith(".pack"))

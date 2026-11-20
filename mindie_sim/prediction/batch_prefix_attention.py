@@ -267,6 +267,7 @@ def apply_attention_prefix_reads(
     unique_prefix_rows_by_view: Sequence[int] | None = None,
     unique_rows_by_view: Sequence[int] | None = None,
     shared_intervals_by_view: Sequence[tuple[tuple[int, int], ...]] | None = None,
+    geometry: Any = None,
 ) -> Any:
     """Replace the precharged KV components with their physical union."""
     if runtime is None or getattr(runtime, "prefix_cache_mode", "private") != "shared":
@@ -314,10 +315,13 @@ def apply_attention_prefix_reads(
             component="kv",
             logical_rows=int(sweeps),
             unique_rows=0 if unique_caps is None else max(0, unique_caps[idx]),
+            window_tokens=0,
             shared_intervals=() if interval_caps is None else interval_caps[idx],
         ))
     read_mode = str(getattr(runtime, "prefix_read_mode", "auto") or "auto")
-    plan = plan_prefix_reads(accesses, mode=read_mode, kernel_reuse=kernel_reuse)
+    plan = plan_prefix_reads(
+        accesses, mode=read_mode, kernel_reuse=kernel_reuse, geometry=geometry
+    )
     updated = apply_prefix_read_plan(
         op, plan, hbm_component=kv_hbm_bytes, mte2_component=kv_mte2_bytes)
     if allow_recipe_rebind and select(updated, runtime) == RECIPE_NAME:

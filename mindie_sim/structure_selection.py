@@ -17,7 +17,7 @@ from .structure import SCHEMA_VERSION, _json_value, _structure_inputs, export_op
 ARRAYS = ('nodes', 'source_calls', 'subgraphs', 'resource_operators')
 
 
-def select_structure_targets(case, target_ids, **geometry):
+def select_structure_targets(case, target_ids, *, draft_prepare: bool = False, **geometry):
     requested = set(target_ids)
     targets = {}
 
@@ -26,7 +26,7 @@ def select_structure_targets(case, target_ids, **geometry):
         if key in {'nodes', 'subgraphs'} and identifier in requested:
             targets[identifier] = row
 
-    identity = _scan_structure(case, collect, **geometry)
+    identity = _scan_structure(case, collect, draft_prepare=draft_prepare, **geometry)
     return {**identity, 'targets': targets}
 
 
@@ -80,13 +80,13 @@ def _merge_blockers(found, records):
             set(record["op_ids"]) | set(blocker["op_ids"])))
 
 
-def _scan_structure(case, consume, **geometry):
+def _scan_structure(case, consume, *, draft_prepare: bool = False, **geometry):
     """Hash the complete export while visiting one replica's records at a time."""
     from .prediction.unmodeled_gate import (
         HINT_KEYS, _hint_for, collect_blockers,
     )
 
-    graphs, options = _structure_inputs(case, **geometry)
+    graphs, options = _structure_inputs(case, draft_prepare=draft_prepare, **geometry)
     external, all_ids = set(), set()
     blockers: dict[tuple[int, str], dict] = {}
     _merge_blockers(blockers, collect_blockers({"model": options['model']}))

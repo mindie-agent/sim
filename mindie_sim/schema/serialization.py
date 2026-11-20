@@ -71,7 +71,7 @@ def engram(raw):
 
 def auxiliary(raw):
     data = dict(raw)
-    derived = ("input_width", "proposal_tokens")
+    derived = ("input_width", "proposal_tokens", "verify_tokens")
     for name in ("mtp", "dspark"):
         if data.get(name) is not None:
             draft = {key: value for key, value in dict(data[name]).items()

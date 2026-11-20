@@ -93,6 +93,7 @@ INDEXER_TOPK_RECIPES = frozenset({
 })
 LINEAR_FAMILIES = frozenset({
     "recurrent_local", "recurrent_output", "triangular_solve",
+    "gdn_prepare", "gdn_state", "gdn_output",
 })
 COLLECTIVE_FAMILIES = frozenset({
     "allgather", "allreduce", "alltoall", "alltoallv", "dcp_allgather",
@@ -185,16 +186,36 @@ def physical_recipe_bindings() -> dict[str, object]:
     registered physical mechanism unchanged, so this registry never adds a
     hardware branch to the execution loop.
     """
+    from .gdn_chunk32 import recipes as chunk32_recipes
+    from .index_cache_writer import recipes as cache_writer_recipes
     from .matrix_splitk import (ScopedRouterRecipe, build_router_splitk)
     from .moe_cann_fusion import ScopedGatingRecipe, build_moe_gating_topk
     from .mxfp8_grouped import ScopedSwigluRecipe, build_swiglu_mx_quant
+    from .operators.block_sparse_attention_arch35 import recipes as bsa_recipes
+    from .operators.hc_gated_residual_arch35 import recipes as hc_recipes
+    from .operators.megamoe_arch35 import recipes as megamoe_recipes
+    from .operators.mla_prolog_v4_arch35 import recipes as prolog_v4_recipes
+    from .operators.sparse_index_scorers_arch35 import recipes as scorer_recipes
     bindings = {recipe: INDEXER for recipe in INDEXER_TOPK_RECIPES}
     bindings.update({
         "moe_gating_topk": ScopedGatingRecipe(build_moe_gating_topk),
         "router": ScopedRouterRecipe(build_router_splitk),
     })
     bindings.update({
-        f"{family}_quantize": ScopedSwigluRecipe(build_swiglu_mx_quant)
-        for family in ("swiglu", "situ", "geglu")
+        "dynamic_quantize": ScopedSwigluRecipe(build_swiglu_mx_quant),
+        **{
+            f"{family}_quantize": ScopedSwigluRecipe(build_swiglu_mx_quant)
+            for family in ("swiglu", "situ", "geglu")
+        },
     })
+    for group in (
+        cache_writer_recipes(),
+        chunk32_recipes(),
+        megamoe_recipes(),
+        bsa_recipes(),
+        scorer_recipes(),
+        prolog_v4_recipes(),
+        hc_recipes(),
+    ):
+        bindings.update(group)
     return bindings

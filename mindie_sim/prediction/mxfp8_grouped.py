@@ -276,12 +276,12 @@ def build_swiglu_mx_quant(op, geometry):
     clock_ms = SWIGLU_MX_NOMINAL_CLOCK_HZ / SWIGLU_MS_PER_SECOND
 
     def program(context):
-        # The AIV read path is a declared DRAM service; HBM still owns the
-        # physical bus bytes and the store stream.
-        mode = context.service_modes.get("mte2_aiv_dram")
-        if mode is not None:
-            context = _replace(context, service_modes={
-                **context.service_modes, "mte2": mode})
+        multi_wave = rows >= SWIGLU_MX_AIV_UNITS
+        if multi_wave:
+            mode = context.service_modes.get("mte2_aiv_dram")
+            if mode is not None:
+                context = _replace(context, service_modes={
+                    **context.service_modes, "mte2": mode})
         placement = context.owned(0, 1, ("mte2_aiv", "vector", "mte3"))
 
         def tile(index):
@@ -306,9 +306,10 @@ def build_swiglu_mx_quant(op, geometry):
                     after=("swiglu_amax_ue8m0",), placement=placement),
             )
 
+        drain_ms = (SWIGLU_MX_PROLOGUE_DRAIN_CYCLES / clock_ms) if multi_wave else 0.0
         return KernelProgram((
-            Stage("kernel_prologue_drain",
-                  latency=SWIGLU_MX_PROLOGUE_DRAIN_CYCLES / clock_ms),
+            Stage("kernel_prologue_drain", latency=drain_ms,
+                  keep_empty=drain_ms <= 0.0),
             Stage("row_tiles", after=("kernel_prologue_drain",),
                   program=PipelineProgram(waves, 2, tile)),
         ))
@@ -326,6 +327,8 @@ def build_swiglu_mx_quant(op, geometry):
 @dataclass(frozen=True)
 class ScopedSwigluRecipe(PlannedRecipe):
     """Register the A5 group-32 row planner without rebinding other quantize ops."""
+
+    traffic_rewrite_capable: bool = True
 
     def prepare(self, op, geometry):
         if not (_a5_row_wave(geometry) and _mx_group32(op)):
