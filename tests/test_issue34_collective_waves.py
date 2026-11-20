@@ -10,7 +10,7 @@ from mindie_sim.prediction.engine import Engine
 from mindie_sim.prediction.topology import Topology
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.parallel import ParallelSpec
-from issue34_helpers import hardware
+from _support.builders import hardware
 
 
 def topology(ranks=4):

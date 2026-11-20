@@ -26,6 +26,7 @@ Read [`CONTRIBUTING.md`](CONTRIBUTING.md) ([English](CONTRIBUTING.en.md)) for th
   - Write natural math/index literals (`0`, `1`, `2`, `0.5`, `100`, `1000`, `1024`, `1e-6..1e-12`) directly, never define tautological digit-word constants (`ZERO`, `ONE`, `SIXTY_FOUR`), and extract non-trivial domain constants to `UPPER_SNAKE_CASE` module symbols or `ascend.json` (`scripts/check_no_magic_numbers.py`).
   - Shard full-catalog / multi-SKU sweeps via `@pytest.mark.parametrize("hardware", SKUS)` and size wall-clock assertions for shared 2-core / 4-worker `pytest-xdist` CI runners; when touching `observed_contracts`, `subgraph_math`, `structure*`, or `source_boundary`, also run tests with `PYTHONPATH=".:../profiler"`.
 - Tests must establish behavior or independent mathematical invariants, not merely type checks, static strings, documentation prose, or a fabricated external schema.
+- Place tests in `tests/<domain>/test_<mechanism>.py` listed in `tests/TAXONOMY.toml`, with a module-level `tier0`/`tier1` mark; never encode issue/round/wave/SKU/ISA/model provenance in test file or function names (sweep SKUs/ISAs via `tests/_support/axes.py`), never import another test module, and never add root-level `tests/test_*.py` files (`scripts/check_test_orthogonality.py`).
 - Maintain one current schema and runtime. Do not restore deleted A3 prediction paths, migration shims, or old-baseline fallbacks; see [`docs/migration.md`](docs/migration.md) and [`docs/archive/README.md`](docs/archive/README.md).
 - Use Unix `LF` (`\n`) line endings everywhere.
 
@@ -49,6 +50,7 @@ cd ../.worktrees/sim-<topic>
 # 1. Hygiene, 37-model independent catalog conservation, LF & differential literal gates
 python3 .github/scripts/check_lf_eol.py
 python3 -B scripts/check_no_magic_numbers.py --base origin/main --root .
+python3 -B scripts/check_test_orthogonality.py --root . --base origin/main   # tests/<domain>/ per tests/TAXONOMY.toml
 python3 -B scripts/verify_m1.py hygiene
 python3 -B scripts/verify_m1.py catalog-meta --require-models 37
 

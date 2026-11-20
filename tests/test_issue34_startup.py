@@ -8,7 +8,7 @@ from mindie_sim.prediction.topology import Topology
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.schema.parallel import ParallelSpec
-from issue34_helpers import hardware
+from _support.builders import hardware
 
 
 def exchange(volume=30.0, *, family="alltoall", steps=None, mode=None):

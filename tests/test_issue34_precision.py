@@ -15,7 +15,7 @@ from mindie_sim.schema.compute_peak_aliases import (
     validate_compute_peak_aliases,
 )
 from mindie_sim.schema.hardware import Hardware
-from issue34_helpers import hardware, quant
+from _support.builders import hardware, quant
 
 
 def a5():

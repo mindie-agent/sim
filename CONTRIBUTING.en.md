@@ -650,7 +650,7 @@ Reuse existing architecture builders (`deepseek.py`, `qwen.py`, `glm.py`, `kimi.
 > - Delegate non-divisible expert parallelism (e.g., `E=288, EP=64`) to [`mindie_sim/catalog/expert_slots.py`](mindie_sim/catalog/expert_slots.py) rather than rejecting `E % EP != 0`.
 
 ### Step 3: Wire the Independent `torch.device("meta")` Reference Oracle & Manifest
-1. Verify (or extend) independent shape derivation in [`tests/reference/catalog_meta_oracle.py`](tests/reference/catalog_meta_oracle.py) and [`tests/reference/cache_meta_oracle.py`](tests/reference/cache_meta_oracle.py). **Iron rule: oracle files must NEVER `import mindie_sim`**—they read raw JSON directly and construct `torch.nn.Parameter` tensors under `with torch.device("meta"):` to verify `numel()` and tied-tensor deduplication (`id(tensor)`).
+1. Verify (or extend) independent shape derivation in [`tests/_oracles/catalog_meta_oracle.py`](tests/_oracles/catalog_meta_oracle.py) and [`tests/_oracles/cache_meta_oracle.py`](tests/_oracles/cache_meta_oracle.py). **Iron rule: oracle files must NEVER `import mindie_sim`**—they read raw JSON directly and construct `torch.nn.Parameter` tensors under `with torch.device("meta"):` to verify `numel()` and tied-tensor deduplication (`id(tensor)`).
 2. Compute the config SHA-256 (`shasum -a 256 mindie_sim/model_configs/<model-key>.json`), generate the reference declaration via `catalog_meta_oracle.declaration(reference)`, and record it in [`tests/fixtures/catalog_reference_manifest.json`](tests/fixtures/catalog_reference_manifest.json).
 3. Add `<model-key>` to `CATALOG_MODELS` in [`scripts/verify_m1.py`](scripts/verify_m1.py) (incrementing the default `--require-models` count) and `MODELS` in [`scripts/verify_m2.py`](scripts/verify_m2.py).
 
@@ -756,7 +756,7 @@ You are contributing incremental Ascend hardware calibration (`A2` / `A3` / `A5`
 4. **PhysicalRecipe, Custom Attention (Tiers 1–3) & Model Catalog Conservation**:
    - Conserve stage work per physical resource ($W_{\text{prepared}} = W_{\text{plan}} = \sum_s W_s$), put Cube FLOPs in `Work(matrix={dtype: flops})`, keep `mte2_aic` and `mte2_aiv` separate, and bind private core pipes via `ctx.owned(...)`.
    - Integrate custom Attention via Tiers 1–3 rather than forcing custom kernels into `IFA`/`FIA`.
-   - Register zero-`mindie_sim`-import references in `tests/reference/catalog_meta_oracle.py` and `tests/fixtures/catalog_reference_manifest.json` with exact `0` parameter and KV delta.
+   - Register zero-`mindie_sim`-import references in `tests/_oracles/catalog_meta_oracle.py` and `tests/fixtures/catalog_reference_manifest.json` with exact `0` parameter and KV delta.
 
 5. **5-Axis Perturbation Review, Code Hygiene & Pre-PR Gates**:
    - Write natural math/index literals inline; NEVER define digit-word constants (`ZERO`, `ONE`, `TWO`, `SIXTY_FOUR`). Keep modules `< 800` lines with 4-part headers and Unix `LF`, and pass `check_lf_eol.py`, `check_no_magic_numbers.py`, `check_lean_no_sorry.py`, `verify_m1.py`, `verify_m2.py`, and `pytest -m "not live_npu"`.

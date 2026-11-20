@@ -15,7 +15,7 @@ from mindie_sim.prediction.expert_slot_work import (
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.schema.parallel import ParallelSpec
-from issue34_helpers import dense_layer, quant
+from _support.builders import dense_layer, quant
 
 
 def layer(experts=8):

@@ -825,7 +825,7 @@ def test_simplified_and_gqa_cursors_cross_m_without_four_kv_slots():
 
     from mindie_sim.prediction import attention_prefill as ap
     from mindie_sim.prediction.attention_prefill_nofd import owner_s2_plan
-    from tests.test_sku_pipeline_profiles import A5_BUFFERS
+    from _support.hardware import A5_BUFFERS
 
     def native(dim, heads, reconstruct):
         op = make_op(((32, 992),), heads=heads, kv_heads=1, dim=dim)
@@ -901,7 +901,7 @@ def test_key256_cursor_is_hand_segments_not_the_equal_chunk_owner():
     from mindie_sim.prediction.attention_prefill_nofd import _work_from_spec
     from mindie_sim.prediction.cost import CostModel
     from mindie_sim.prediction.program import RecipeBook
-    from tests.test_sku_pipeline_profiles import A5_BUFFERS
+    from _support.hardware import A5_BUFFERS
 
     def drive(dim, query_tile, key_tile, k_count):
         recipe = StagedGQAPrefill(query_tile=query_tile, key_tile=key_tile)

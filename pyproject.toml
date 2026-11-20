@@ -38,5 +38,9 @@ testpaths = ["tests"]
 pythonpath = [".", "tests"]
 addopts = "-p no:cacheprovider"
 markers = [
+    "tier0: in-memory core logic; zero subprocess/network/sleep; < 5 s per module",
+    "tier1: local process / C11 compile / wheel / spawn boundary; < 15 s per module",
     "live_npu: standing A2/A3 Ascend NPU non-destructive live integration",
+    "requires_profiler: needs the sibling mindie-profiler checkout (PYTHONPATH=.:../profiler)",
+    "requires_capture_mount(*paths): needs retained capture paths (repo-relative or absolute)",
 ]

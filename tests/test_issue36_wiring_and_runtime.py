@@ -53,7 +53,7 @@ from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.schema.parallel import ParallelSpec
 from mindie_sim.schema.workload import IterationPlan, RequestView
-from issue34_helpers import dense_case, dense_layer, hardware
+from _support.builders import dense_case, dense_layer, hardware
 
 
 def glm_case(*, layers=4, dp=8, ep=8, sequences=1, reuse="off",

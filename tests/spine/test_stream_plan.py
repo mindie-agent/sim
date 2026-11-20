@@ -47,6 +47,8 @@ from mindie_sim.schema.operators import OpSpec
 from mindie_sim.stack_registry import LoweringRequest, RankOps
 import mindie_sim.structure as structure_mod
 
+pytestmark = pytest.mark.tier0
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 

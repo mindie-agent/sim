@@ -12,7 +12,7 @@ from mindie_sim.catalog.speculative_state import (
 from mindie_sim.catalog.cache import request_cache_breakdown
 from mindie_sim.schema.case import Software
 from mindie_sim.schema.parallel import ParallelSpec
-from issue34_helpers import linear_model, view
+from _support.builders import linear_model, view
 
 
 FAMILIES = ("kda", "gdn", "mamba", "gla", "deltanet", "lightning", "retnet")

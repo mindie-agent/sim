@@ -32,6 +32,15 @@ jobs:
             base="$(git rev-parse HEAD^)"
           fi
           python3 -B scripts/check_no_magic_numbers.py --base "$base" --root .
+      - name: Product-orthogonal test layout
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          base="$BASE_SHA"
+          if ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            base="$(git rev-parse HEAD^)"
+          fi
+          python3 -B scripts/check_test_orthogonality.py --root . --base "$base"
       - name: Classify PR diff scope
         id: scope
         env:

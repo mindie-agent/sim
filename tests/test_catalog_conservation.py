@@ -2,7 +2,7 @@
 
 [Role]
   Consume the declared reference manifest, rebuild every parameter shape and KV
-  cache byte total from the raw JSON config through ``tests/reference`` and
+  cache byte total from the raw JSON config through ``tests/_oracles`` and
   compare the result with the simulator's declared terms.  The simulator is
   imported only here for the actual side of the comparison; the oracle modules
   never import it.
@@ -29,11 +29,11 @@ from pathlib import Path
 
 import pytest
 
-from reference.catalog_meta_oracle import (
+from _oracles.catalog_meta_oracle import (
     Entry, build_reference, compare_entries, load_manifest, logical_numel,
     make_meta_parameters, manifest_models,
 )
-from reference.cache_meta_oracle import cache_totals
+from _oracles.cache_meta_oracle import cache_totals
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "tests" / "fixtures" / "catalog_reference_manifest.json"

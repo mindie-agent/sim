@@ -1,17 +1,18 @@
-"""Shared isolated-runtime and isolated-cache fixtures for MindIE-Sim tests.
+"""Root fixtures: zero host pollution, isolated accelerator cache, requires_* markers.
 
-[Role] Keep user HOME/config/data/diagnostics/cache directories and accelerator
-  build memos untouched across every test module.
-[Invariants] `isolated_cache` provides one session-local `MINDIE_CACHE_HOME` and
-  cleans it on teardown; `isolated_short_root` gives reproducer storage a fresh
-  short ASCII root under the platform temp parent (or the short POSIX temp when
-  that path is too long for the product's 48-byte contract) so concurrent runs
-  cannot collide in the shared host reproducer directory;
-  `isolated_runtime` isolates per-test runtime paths. Every session temporary
-  root is also tracked for session/process cleanup.
+[Role] Keep every user/host directory (HOME, APPDATA, XDG_*, MINDIE_*, auth,
+  uv cache, TMPDIR) and accelerator build memos untouched by any test, and turn
+  optional sibling/mount requirements into explicit markers.
+[Invariants] All 15 host-path variables point into pytest-owned temporary
+  roots for every test; ``MINDIE_CACHE_HOME`` is one session-local root so the
+  C11 accelerator builds once per worker; ``isolated_short_root`` gives
+  reproducer storage a fresh short ASCII root (<= 48 bytes contract);
+  ``requires_profiler`` / ``requires_capture_mount`` skip with a visible
+  reason locally and FAIL when ``MINDIE_SIM_REQUIRE_ALL=1`` (CI), so missing
+  coverage is never silent.
 [Timeouts & Locks] No threads, sleeps, or external I/O beyond temporary dirs.
 [Side-Effect Policy] Writes and removes only temporary directories created by
-  pytest/tempfile.
+  pytest/tempfile; environment changes are owned by ``MonkeyPatch`` and unwind.
 """
 from __future__ import annotations
 
@@ -29,14 +30,61 @@ TESTS = Path(__file__).resolve().parent
 #: ``repro_storage`` ignores roots longer than 48 bytes; leave room for
 #: ``mprof-`` plus the 8-character ``mkdtemp`` suffix.
 SHORT_PARENT_MAX_BYTES = 34
+REQUIRE_ALL_ENV = "MINDIE_SIM_REQUIRE_ALL"
+#: Per-test host-path variables -> subdirectory of the worker runtime root.
+HOST_PATH_VARS = {
+    "HOME": "home",
+    "USERPROFILE": "home",
+    "APPDATA": "appdata/roaming",
+    "LOCALAPPDATA": "appdata/local",
+    "XDG_CONFIG_HOME": "xdg/config",
+    "XDG_STATE_HOME": "xdg/state",
+    "XDG_DATA_HOME": "xdg/data",
+    "MINDIE_CONFIG_HOME": "config",
+    "MINDIE_DATA_HOME": "data",
+    "MINDIE_DIAGNOSTICS_ROOT": "diagnostics",
+    "REMOTE_DEV_AUTH_DIR": "remote-dev-auth",
+    "UV_CACHE_DIR": "uv-cache",
+}
+#: Session-scoped variables ``MINDIE_CACHE_HOME``, ``XDG_CACHE_HOME`` and
+#: ``TMPDIR`` live in ``isolated_cache`` (the accelerator cache must survive).
+ACCEL_OVERRIDE_VARS = ("MINDIE_SIM_ACCEL", "MINDIE_SIM_ENGINE_BACKEND", "MINDIE_SIM_CC")
 for _entry in (ROOT, TESTS):
     if str(_entry) not in sys.path:
         sys.path.insert(0, str(_entry))
 
-from temp_cleanup import cleanup as cleanup_tempdirs  # noqa: E402
-from temp_cleanup import tempdir  # noqa: E402
+from _support.tempdirs import cleanup as cleanup_tempdirs  # noqa: E402
+from _support.tempdirs import tempdir  # noqa: E402
 from mindie_sim.observations.kernels import PROFILER_API_REQUIREMENT  # noqa: E402
 from mindie_sim.prediction.runtime import accel_build  # noqa: E402
+
+
+def _missing(reason: str) -> None:
+    """Skip visibly in local runs; fail in CI so missing coverage is never silent."""
+    if os.environ.get(REQUIRE_ALL_ENV) == "1":
+        pytest.fail(f"{reason} ({REQUIRE_ALL_ENV}=1)", pytrace=False)
+    pytest.skip(reason)
+
+
+def _profiler_available() -> bool:
+    for module in ("mindie_profiler.normalized", "mindie_profiler.tensor_contracts"):
+        try:
+            importlib.import_module(module)
+        except ModuleNotFoundError as exc:
+            if exc.name not in {"mindie_profiler", module}:
+                raise
+            return False
+    return True
+
+
+def pytest_runtest_setup(item):
+    if item.get_closest_marker("requires_profiler") and not _profiler_available():
+        _missing(PROFILER_API_REQUIREMENT)
+    mount = item.get_closest_marker("requires_capture_mount")
+    if mount:
+        absent = [str(p) for p in mount.args if not (Path(p) if Path(p).is_absolute() else ROOT / p).exists()]
+        if absent:
+            _missing(f"retained capture unavailable: {', '.join(absent)}")
 
 
 def pytest_sessionfinish(session, exitstatus):
@@ -46,30 +94,21 @@ def pytest_sessionfinish(session, exitstatus):
 
 @pytest.fixture(scope="session", autouse=True)
 def isolated_cache():
-    base = tempdir("nr-s3-accel-")
-    names = (
-        "MINDIE_CACHE_HOME",
-        "MINDIE_DATA_HOME",
-        "XDG_CACHE_HOME",
-        "MINDIE_SIM_ACCEL",
-        "MINDIE_SIM_ENGINE_BACKEND",
-        "MINDIE_SIM_CC",
-    )
-    old = {name: os.environ.get(name) for name in names}
-    os.environ["MINDIE_CACHE_HOME"] = str(base)
-    for name in names[1:]:
-        os.environ.pop(name, None)
-    accel_build.reset_build_memo()
-    try:
-        yield Path(base)
-    finally:
-        for name, value in old.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
+    """One accelerator cache, XDG cache and subprocess TMPDIR per worker session."""
+    base = tempdir("msim-session-")
+    (base / "tmp").mkdir()
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("MINDIE_CACHE_HOME", str(base / "cache"))
+        patch.setenv("XDG_CACHE_HOME", str(base / "xdg-cache"))
+        patch.setenv("TMPDIR", str(base / "tmp"))
+        for name in ACCEL_OVERRIDE_VARS:
+            patch.delenv(name, raising=False)
         accel_build.reset_build_memo()
-        shutil.rmtree(base, ignore_errors=True)
+        try:
+            yield base / "cache"
+        finally:
+            accel_build.reset_build_memo()
+    shutil.rmtree(base, ignore_errors=True)
 
 
 def _short_root_parent() -> Path:
@@ -113,7 +152,7 @@ def isolated_short_root(monkeypatch):
 
 @pytest.fixture(scope="session")
 def _worker_runtime_root():
-    root = tempdir("nr-s3-runtime-").resolve()
+    root = tempdir("msim-runtime-").resolve()
     try:
         yield root
     finally:
@@ -122,6 +161,7 @@ def _worker_runtime_root():
 
 @pytest.fixture(autouse=True)
 def isolated_runtime(_worker_runtime_root, monkeypatch):
+    """Point every per-test host-path variable at a fresh directory tree."""
     with os.scandir(_worker_runtime_root) as it:
         dirty = [entry.path for entry in it]
     for entry_path in dirty:
@@ -129,18 +169,11 @@ def isolated_runtime(_worker_runtime_root, monkeypatch):
             shutil.rmtree(entry_path, ignore_errors=True)
         else:
             os.unlink(entry_path)
-    monkeypatch.setenv("HOME", str(_worker_runtime_root / "home"))
-    monkeypatch.setenv("MINDIE_CONFIG_HOME", str(_worker_runtime_root / "config"))
-    monkeypatch.setenv("MINDIE_DATA_HOME", str(_worker_runtime_root / "data"))
-    monkeypatch.setenv("MINDIE_DIAGNOSTICS_ROOT", str(_worker_runtime_root / "diagnostics"))
+    for name, sub in HOST_PATH_VARS.items():
+        monkeypatch.setenv(name, str(_worker_runtime_root / sub))
 
 
 @pytest.fixture
 def profiler_api():
-    for module in ("mindie_profiler.normalized", "mindie_profiler.tensor_contracts"):
-        try:
-            importlib.import_module(module)
-        except ModuleNotFoundError as exc:
-            if exc.name not in {"mindie_profiler", module}:
-                raise
-            pytest.skip(PROFILER_API_REQUIREMENT)
+    if not _profiler_available():
+        _missing(PROFILER_API_REQUIREMENT)

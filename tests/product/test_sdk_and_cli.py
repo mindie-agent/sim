@@ -20,12 +20,15 @@ import sys
 
 import pytest
 
+from _support.axes import SKUS
 import mindie_sim
 import mindie_sim.api as sdk_api
 import mindie_sim.cli as cli_mod
 from mindie_sim.cli_parser import resolve_route
 from mindie_sim.compose import compose_case as compose_raw_case
 from mindie_sim.prediction.results import DEFAULT_TARGET_EFFICIENCY, StepRequest
+
+pytestmark = pytest.mark.tier1
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -149,7 +152,7 @@ def test_cli_entrypoint_parity_disambiguation_and_timeout_propagation(tmp_path, 
         pub_cli.profile_main(["inspect", "dummy.json"])
 
 
-@pytest.mark.parametrize("sku", ("Ascend910B2", "Ascend910_9382", "Ascend950DT_9581"))
+@pytest.mark.parametrize("sku", SKUS)
 def test_typed_sdk_three_tier_evaluation_and_exports(sku):
     from mindie_sim.prediction.spine import _scale_case_efficiency, default_spine
     from mindie_sim.stack_registry import LoweringRequest

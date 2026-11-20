@@ -660,7 +660,7 @@ def attach_custom_sparse_window_traffic(op, hierarchy, q_lens: tuple[int, ...], 
 > - 非整除专家并行（如 `E=288, EP=64`）统一交由 [`mindie_sim/catalog/expert_slots.py`](mindie_sim/catalog/expert_slots.py) 计算物理槽位与自动 Padding，切勿硬编码 `E % EP == 0` 拦截。
 
 ### 步骤 3：接入独立 `torch.device("meta")` 参考预言机与基准清单
-1. 在 [`tests/reference/catalog_meta_oracle.py`](tests/reference/catalog_meta_oracle.py) 与 [`tests/reference/cache_meta_oracle.py`](tests/reference/cache_meta_oracle.py) 中核对（或补充新架构分支）独立形状推导逻辑。**铁律：预言机文件严禁 `import mindie_sim` 任何模块**，只能直接读取原始 JSON 并在 `with torch.device("meta"):` 下构造 `torch.nn.Parameter` 校验 `numel()` 与共享张量去重（`id(tensor)`）。
+1. 在 [`tests/_oracles/catalog_meta_oracle.py`](tests/_oracles/catalog_meta_oracle.py) 与 [`tests/_oracles/cache_meta_oracle.py`](tests/_oracles/cache_meta_oracle.py) 中核对（或补充新架构分支）独立形状推导逻辑。**铁律：预言机文件严禁 `import mindie_sim` 任何模块**，只能直接读取原始 JSON 并在 `with torch.device("meta"):` 下构造 `torch.nn.Parameter` 校验 `numel()` 与共享张量去重（`id(tensor)`）。
 2. 计算配置文件的 SHA256（`shasum -a 256 mindie_sim/model_configs/<model-key>.json`），用 `catalog_meta_oracle.declaration(reference)` 生成参考声明并写入 [`tests/fixtures/catalog_reference_manifest.json`](tests/fixtures/catalog_reference_manifest.json)。
 3. 将 `<model-key>` 同步加入 [`scripts/verify_m1.py`](scripts/verify_m1.py) 的 `CATALOG_MODELS`（同步递增 `--require-models` 默认计数）与 [`scripts/verify_m2.py`](scripts/verify_m2.py) 的 `MODELS`。
 
@@ -774,7 +774,7 @@ You are contributing incremental Ascend hardware calibration (`A2` / `A3` / `A5`
 4. **PhysicalRecipe, Custom Attention (Tiers 1–3) & Model Catalog Conservation**:
    - Conserve stage work per physical resource: $W_{\text{prepared}} = W_{\text{plan}} = \sum_{s} W_s$. Put Cube FLOPs in `Work(matrix={dtype: flops})` (never `"cube"` in `resources`), keep `mte2_aic` and `mte2_aiv` separate, and bind private core resources via `ctx.owned(...)`.
    - Built-in CANN Attention ops (`npu_fusion_attention`, `IFA`, `FIA`, `paged_mla_*`) are out-of-the-box baselines ONLY — NEVER force custom Attention kernels (AscendC `.o`, Triton-Ascend, TileLang, ATB/XLLM/SGLang custom Paged/FlashMLA/Sparse/Linear Attention) into `IFA`/`FIA`! Integrate custom Attention via Tiers 1–3: (Tier 1) override `physical_mechanisms.attention` or `case.runtime.kernels.recipes` on `Class A`; (Tier 2) add a self-contained `PlannedRecipe` in `mindie_sim/prediction/operators/<custom_attn>.py` checking per-Die SRAM from `geometry.buffers`; (Tier 3) build `AttentionAccessSpec` + `plan_attention_traffic()` in `Frontend` for custom sparse/compressed-KV/hybrid-window geometry.
-   - Any new model in `mindie_sim/model_configs/<name>.json` + `mindie_sim/catalog/` must register a zero-simulator-import reference in `tests/reference/catalog_meta_oracle.py` and `tests/fixtures/catalog_reference_manifest.json` with `0` parameter and KV byte delta.
+   - Any new model in `mindie_sim/model_configs/<name>.json` + `mindie_sim/catalog/` must register a zero-simulator-import reference in `tests/_oracles/catalog_meta_oracle.py` and `tests/fixtures/catalog_reference_manifest.json` with `0` parameter and KV byte delta.
 
 5. **5-Axis Parametric Perturbation Review, Code Style & Pre-PR Verification Gates**:
    - Write natural math and structural numbers directly (`0`, `1`, `2 * m * k * n`, `q * (q + 1) // 2`, `shape[-2:]`, `1000.0`). NEVER define tautological digit-word constants (`ZERO = 0`, `ONE = 1`, `TWO = 2`, `SIXTY_FOUR = 64`, `FOUR_FLOAT = 4.0`, `_NUM_*`); `scripts/check_no_magic_numbers.py` explicitly rejects them.

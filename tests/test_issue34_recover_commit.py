@@ -10,7 +10,7 @@ from mindie_sim.prediction.recover_ssm_work import commit_tokens_for_view
 from mindie_sim.schema.case import Software
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import OpSpec
-from issue34_helpers import view
+from _support.builders import view
 
 
 def intent(owner="layer0", version="v0", requests=("r0", "r1")):
