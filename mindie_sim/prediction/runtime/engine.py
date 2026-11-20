@@ -55,15 +55,17 @@ def _stop_window(now: float, horizon: float, releases, latency_active, tasks) ->
     if latency_active:
         if len(latency_active) == 1:
             ltask = tasks[next(iter(latency_active))]
-            if ltask.start + ltask.latency > now:
-                lat_dt = ltask.start + ltask.latency - now
+            anchor = ltask.first_service if ltask.latency_from_first_service else ltask.start
+            if anchor is not None and anchor + ltask.latency > now:
+                lat_dt = anchor + ltask.latency - now
                 if lat_dt < dt:
                     dt = lat_dt
         else:
             for lkey in latency_active:
                 ltask = tasks[lkey]
-                if ltask.start + ltask.latency > now:
-                    lat_dt = ltask.start + ltask.latency - now
+                anchor = ltask.first_service if ltask.latency_from_first_service else ltask.start
+                if anchor is not None and anchor + ltask.latency > now:
+                    lat_dt = anchor + ltask.latency - now
                     if lat_dt < dt:
                         dt = lat_dt
     return dt
@@ -208,7 +210,7 @@ class Engine(
         auditing thousands of rows.
         """
         if (task.acquire or task.free or task.allocation_demands
-                or task.start_callback is not None):
+                or task.start_callback is not None or task.latency_from_first_service):
             return True
         if task.callback is not None and not task.native_hook:
             return True
@@ -659,6 +661,8 @@ class Engine(
                             used, residual = remaining, 0.0
                         else:
                             used = scaled
+                    if task.first_service is None and used > 0.0:
+                        task.first_service = now
                     service = task.service
                     service[name] = service.get(name, 0.0) + used
                     serviced[name] += used

@@ -385,19 +385,19 @@ class NativeBackend:
         self.disable(engine, self._mixed_reason())
         self.made_progress = True
     def _sync_counters(self, engine) -> None:
-        """publish counters before another call can fail (no prefix too)."""
         if self.arena is None:
             return
         busy, serv = self.arena.counters()
         for i, name in enumerate(self.res_names):
             engine.busy_ms[name] = busy[i]
             engine.serviced[name] = serv[i]
+        if engine._delivery_live:
+            from .accel_terms import sync_native_deliveries
+            sync_native_deliveries(self, engine)
     def _apply_prefix(self, engine, error: KernelFault) -> None:
         """publish the kernel-accepted prefix of a failing epoch."""
         prefix = getattr(error, "prefix", None)
         if prefix is None or not getattr(error, "has_prefix", False):
-            # even an accepted-nothing failure must publish the native
-            # counters already earned by an earlier successful call.
             self._sync_counters(engine)
             return
         now, _boundary, steps, ncomp, nstart = prefix
@@ -561,7 +561,6 @@ class NativeBackend:
         self.native_steps += steps
         engine.now, engine.advance_steps = now, engine.advance_steps + steps
         self._sync_counters(engine)
-        _at.record_native_starts(self, engine, nstart)
         obs_prog = _at.drain_obs_bridge(self, engine)
         self._apply(engine, nstart, ncomp)
         if boundary == B_OUTPUT and (self.enabled or self.pending_handback):
@@ -577,7 +576,9 @@ class NativeBackend:
             raise KernelFault(E_STALL, "idle", f"mirrored={len(engine._native_slots)}")
         return steps
     def _apply(self, engine, nstart: int, ncomp: int) -> None:
-        """Publish one kernel result batch exactly once."""
+        if engine._wave_recorder is not None and nstart > 0:
+            from .accel_terms import record_native_starts
+            record_native_starts(self, engine, nstart, ncomp)
         tasks, slots = engine._tasks, engine._native_slots
         self.applying = True
         try:

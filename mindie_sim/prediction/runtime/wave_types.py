@@ -343,3 +343,95 @@ class FusedPipelineDescriptor:
 
     def to_dict(self) -> dict[str, Any]:
         return _to_json_obj(self)
+
+
+_FRACTIONAL_NS_EPS = 1e-9
+_FRACTIONAL_EXPAND_LIMIT = 4096
+
+
+def _union_float_intervals(
+    intervals: Sequence[tuple[float, float]],
+) -> tuple[tuple[float, float], ...]:
+    cleaned = [(lo, hi) for lo, hi in intervals if hi > lo]
+    if not cleaned:
+        return ()
+    cleaned.sort()
+    merged: list[tuple[float, float]] = [cleaned[0]]
+    for lo, hi in cleaned[1:]:
+        p_lo, p_hi = merged[-1]
+        if lo <= p_hi:
+            if hi > p_hi:
+                merged[-1] = (p_lo, hi)
+        else:
+            merged.append((lo, hi))
+    return tuple(merged)
+
+
+def _subtract_float_intervals(
+    base: Sequence[tuple[float, float]], cut: Sequence[tuple[float, float]],
+) -> tuple[tuple[float, float], ...]:
+    if not base or not cut:
+        return tuple(base)
+    out: list[tuple[float, float]] = []
+    for lo, hi in base:
+        cur = lo
+        for c_lo, c_hi in cut:
+            if c_hi <= cur:
+                continue
+            if c_lo >= hi:
+                break
+            if c_lo > cur:
+                out.append((cur, c_lo))
+            if c_hi > cur:
+                cur = c_hi
+            if cur >= hi:
+                break
+        if cur < hi:
+            out.append((cur, hi))
+    return tuple(out)
+
+
+def _intersect_float_intervals(
+    left: Sequence[tuple[float, float]], right: Sequence[tuple[float, float]],
+) -> tuple[tuple[float, float], ...]:
+    out: list[tuple[float, float]] = []
+    for l_lo, l_hi in left:
+        for r_lo, r_hi in right:
+            lo = l_lo if l_lo > r_lo else r_lo
+            hi = l_hi if l_hi < r_hi else r_hi
+            if hi > lo:
+                out.append((lo, hi))
+    return _union_float_intervals(out)
+
+
+def _is_exact_ns_period(pr: PeriodicRun) -> bool:
+    if abs(pr.period_ms * NS_PER_MS - round(pr.period_ms * NS_PER_MS)) > _FRACTIONAL_NS_EPS:
+        return False
+    for _pn, lo, hi in (*pr.service_pattern, *pr.handoff_pattern):
+        if abs(lo * NS_PER_MS - round(lo * NS_PER_MS)) > _FRACTIONAL_NS_EPS:
+            return False
+        if abs(hi * NS_PER_MS - round(hi * NS_PER_MS)) > _FRACTIONAL_NS_EPS:
+            return False
+    return True
+
+
+def _peaks_from_buffers(buffers: Sequence[BufferResidency]) -> tuple[OwnerPoolPeak, ...]:
+    events_by_key: dict[tuple[int, str], list[tuple[int, int]]] = {}
+    for buf in buffers:
+        if buf.alias_of is not None:
+            continue
+        ev = events_by_key.setdefault((buf.owner, buf.pool), [])
+        ev.append((buf.grant_ns, buf.size_bytes))
+        if buf.release_ns is not None:
+            ev.append((buf.release_ns, -buf.size_bytes))
+    out: list[OwnerPoolPeak] = []
+    for (owner, pool), ev in sorted(events_by_key.items()):
+        ev.sort(key=lambda item: (item[0], item[1]))
+        cur = peak = 0
+        for _t, delta in ev:
+            cur += delta
+            if cur > peak:
+                peak = cur
+        if peak > 0:
+            out.append(OwnerPoolPeak(owner=owner, pool=pool, peak_bytes=peak))
+    return tuple(out)

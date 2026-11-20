@@ -175,8 +175,7 @@ def drain_output(backend, engine) -> int:
             engine.now = now
             engine.advance_steps += steps
             backend._sync_counters(engine)
-            from .accel_terms import drain_obs_bridge, record_native_starts
-            record_native_starts(backend, engine, nstart)
+            from .accel_terms import drain_obs_bridge
             drain_obs_bridge(backend, engine)
             backend._apply(engine, nstart, ncomp)
             # Every completion and trace eviction published by this

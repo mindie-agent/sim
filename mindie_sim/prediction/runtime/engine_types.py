@@ -162,6 +162,10 @@ class _Task:
     ready_at: float | None = None
     blocker_event: str = ""
     blocker_reason: str = ""
+    fifo_order: tuple[int, int] | None = None
+    latency_from_first_service: bool = False
+    first_service: float | None = None
+    pending_preds: list[Event] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,6 +197,7 @@ class _PreparedTask:
     pool_unit_masks: tuple[tuple[str, int], ...] | None = ()
     cohort_widened: tuple[str, ...] = ()
     cohort_members: tuple[tuple[str, tuple[tuple[int, ...], ...]], ...] = ()
+    latency_from_first_service: bool = False
 
 
 _EMPTY_TASK = _PreparedTask({}, 0.0, {}, (), (), {}, False, (), 0)

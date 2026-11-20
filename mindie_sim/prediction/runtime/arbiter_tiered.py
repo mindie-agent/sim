@@ -452,7 +452,8 @@ def _tiered_coupled(resources, tasks, active, solver) -> dict[str, dict[int, flo
                   key=lambda key: (
                       tasks[key].start is None,
                       tasks[key].start if tasks[key].start is not None else math.inf,
-                      tasks[key].priority, key))
+                      tasks[key].priority,
+                      tasks[key].fifo_order if getattr(tasks[key], "fifo_order", None) is not None else (key, 0)))
         for name, resource in resources.items()
         if resource.policy == "fifo"
         and any(tasks[key].remaining.get(name, 0.0) > 0.0 for key in active)}
@@ -626,7 +627,8 @@ def _tiered_simple(resources, tasks, active) -> dict[str, dict[int, float]]:
                 winner = min(eligible, key=lambda key: (
                     tasks[key].start is None,
                     tasks[key].start if tasks[key].start is not None else math.inf,
-                    tasks[key].priority, key))
+                    tasks[key].priority,
+                    tasks[key].fifo_order if getattr(tasks[key], "fifo_order", None) is not None else (key, 0)))
                 declared = tasks[winner].placement.get(name)
                 placements = ({winner: declared} if declared is not None
                               else {winner: None})

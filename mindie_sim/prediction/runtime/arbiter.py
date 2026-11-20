@@ -22,15 +22,18 @@ from .arbiter_tiered import (
 
 
 def fifo_winner(caps: Mapping[int, float], tasks) -> int:
-    """Non-preemptive owner: actual start, then priority, then sequence."""
+    """Non-preemptive owner: actual start, then priority, then preserved FIFO order."""
     return min(caps, key=lambda key: (
         tasks[key].start is None,
         tasks[key].start if tasks[key].start is not None else math.inf,
-        tasks[key].priority, key))
+        tasks[key].priority,
+        tasks[key].fifo_order if getattr(tasks[key], "fifo_order", None) is not None else (key, 0)))
 
 
 def _fast_eligible_task(resources, task) -> bool:
     """True when single-tier fast arbitration matches the per-unit solver."""
+    if getattr(task, "latency_from_first_service", False):
+        return False
     rem = task.remaining
     if not rem:
         return True
@@ -222,7 +225,8 @@ def component_rates(resources, tasks, active, *, coupled_solver=None,
                     return single_fn(resources, key, task)
                 proxy = (task.start is None,
                          task.start if task.start is not None else math.inf,
-                         task.priority, key)
+                         task.priority,
+                         task.fifo_order if getattr(task, "fifo_order", None) is not None else (key, 0))
                 rates = coupled_solver(resources, {proxy: task})
                 return {name: {key: components[proxy]}
                         for name, components in rates.items()
@@ -241,10 +245,12 @@ def component_rates(resources, tasks, active, *, coupled_solver=None,
                         return fast
                 p0 = (t0.start is None,
                       t0.start if t0.start is not None else math.inf,
-                      t0.priority, k0)
+                      t0.priority,
+                      t0.fifo_order if getattr(t0, "fifo_order", None) is not None else (k0, 0))
                 p1 = (t1.start is None,
                       t1.start if t1.start is not None else math.inf,
-                      t1.priority, k1)
+                      t1.priority,
+                      t1.fifo_order if getattr(t1, "fifo_order", None) is not None else (k1, 0))
                 reverse = {p0: k0, p1: k1}
                 rates = coupled_solver(resources, {p0: t0, p1: t1})
                 return {name: {reverse[proxy]: value
@@ -260,7 +266,8 @@ def component_rates(resources, tasks, active, *, coupled_solver=None,
                         active_task = tasks[active_key]
                         proxy = (active_task.start is None,
                                  active_task.start if active_task.start is not None else math.inf,
-                                 active_task.priority, active_key)
+                                 active_task.priority,
+                                 active_task.fifo_order if getattr(active_task, "fifo_order", None) is not None else (active_key, 0))
                         view[proxy] = active_task
                         reverse[proxy] = active_key
                     rates = coupled_solver(resources, view)

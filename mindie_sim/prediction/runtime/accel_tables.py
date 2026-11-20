@@ -305,7 +305,7 @@ def pure_task(engine, task) -> bool:
     if engine._periodic_runs:
         return False
     if (task.start_callback is not None or task.acquire or task.free
-            or task.allocation_demands):
+            or task.allocation_demands or task.latency_from_first_service):
         return False
     if task.cohort_widened and len(task.remaining) > MAX_R:
         return False

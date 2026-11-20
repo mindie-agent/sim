@@ -53,6 +53,8 @@ def _stage_signature(stage, *, widen_pipelines: bool = False):
     return (
         stage.name, stage.after, stage.previous, stage.latency, stage.coupled,
         stage.priority, stage.cohort_size, stage.keep_empty, stage.cohort_widened,
+        stage.latency_from_first_service,
+        tuple(sorted(stage.metadata.items())),
         tuple(sorted(stage.work_units.items())),
         tuple(sorted(stage.work.items())),
         tuple(sorted(stage.caps.items())),
@@ -254,6 +256,10 @@ def _merge_stages(
     free = _merge_allocations([stage.free for stage in stages])
     if acquire is None or free is None:
         return None
+    deliv_sum: dict[str, float] = {}
+    for stage in stages:
+        for cid, amt in stage.deliveries:
+            deliv_sum[cid] = deliv_sum.get(cid, 0.0) + float(amt)
     return Stage(
         first.name, work, after=first.after, latency=first.latency,
         caps=caps, acquire=acquire, free=free, placement=placement,
@@ -262,6 +268,8 @@ def _merge_stages(
         cohort_widened=tuple(widened_keys),
         cohort_members=cohort_members if widened_keys else {},
         metadata=first.metadata,
+        deliveries=tuple(deliv_sum.items()),
+        latency_from_first_service=first.latency_from_first_service,
     )
 
 

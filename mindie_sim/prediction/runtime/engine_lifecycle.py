@@ -277,6 +277,8 @@ class _EngineLifecycleMixin:
                     deliv[ctr_id] = deliv.get(ctr_id, 0.0) + rem_amt
                     if acc is not None:
                         acc[ctr_id] = total_amt
+            if self._delivery_live > 0:
+                self._delivery_live -= 1
         if not task.is_split_child and task.metadata:
             occurrence = task.metadata.get("occurrence")
             if isinstance(occurrence, OccurrenceKey):
@@ -333,13 +335,24 @@ class _EngineLifecycleMixin:
                 successor = waiters.pop()
                 dependent = tasks.get(successor)
                 if dependent is not None:
+                    if dependent.pending_preds is not None:
+                        try:
+                            dependent.pending_preds.remove(task.event)
+                        except ValueError:
+                            pass
+                        if len(dependent.pending_preds) == 1:
+                            sole = dependent.pending_preds[0]
+                            dependent.blocker_event = sole.name
+                            dependent.blocker_reason = "publish"
+                            dependent.ready_at = now if now >= dependent.release else dependent.release
                     w = dependent.waiting - 1
                     dependent.waiting = w
                     if not w:
-                        dependent.blocker_event = task.event.name
-                        dependent.ready_at = now
-                        if not dependent.blocker_reason:
+                        if not dependent.blocker_event:
+                            dependent.blocker_event = task.event.name
                             dependent.blocker_reason = "publish"
+                        if dependent.ready_at is None:
+                            dependent.ready_at = now
                         if dependent.release <= now:
                             if successor not in ready_seen:
                                 ready_seen.add(successor)
@@ -351,12 +364,23 @@ class _EngineLifecycleMixin:
                     dependent = tasks.get(successor)
                     if dependent is None:
                         continue
+                    if dependent.pending_preds is not None:
+                        try:
+                            dependent.pending_preds.remove(task.event)
+                        except ValueError:
+                            pass
+                        if len(dependent.pending_preds) == 1:
+                            sole = dependent.pending_preds[0]
+                            dependent.blocker_event = sole.name
+                            dependent.blocker_reason = "publish"
+                            dependent.ready_at = now if now >= dependent.release else dependent.release
                     dependent.waiting -= 1
                     if not dependent.waiting:
-                        dependent.blocker_event = task.event.name
-                        dependent.ready_at = now
-                        if not dependent.blocker_reason:
+                        if not dependent.blocker_event:
+                            dependent.blocker_event = task.event.name
                             dependent.blocker_reason = "publish"
+                        if dependent.ready_at is None:
+                            dependent.ready_at = now
                         if dependent.release <= now:
                             if successor not in ready_seen:
                                 ready_seen.add(successor)
@@ -488,7 +512,7 @@ class _EngineLifecycleMixin:
                             first_gen = False
                         wave_rec.on_allocation(
                             item.pool, int(unit), slot_id, gen, int(round(item.size)),
-                            now, "grant",
+                            now, "grant", task_id=key,
                         )
         else:
             admit_gen = 0
@@ -502,11 +526,14 @@ class _EngineLifecycleMixin:
             blockers = ()
             if task.blocker_event:
                 p_pipe = next(iter(task.demand), "")
-                r_ms = task.ready_at if task.ready_at is not None else now
-                blockers = ((p_pipe, task.blocker_event, r_ms, task.blocker_reason or "publish"),)
+                if p_pipe:
+                    r_ms = task.ready_at if task.ready_at is not None else now
+                    blockers = ((p_pipe, task.blocker_event, r_ms, task.blocker_reason or "publish"),)
             wave_rec.on_admit(
                 key, now, owners=owners, generation=admit_gen, blockers=blockers,
             )
+        if task.latency_from_first_service and not task.demand:
+            task.first_service = now
         if self._accel is not None and key in self._native_seqs:
             self._accel.activate(self, key)
         if task.demand or task.latency > 0.0:
@@ -545,14 +572,16 @@ class _EngineLifecycleMixin:
             if len(latency_active) == 1:
                 lkey = next(iter(latency_active))
                 ltask = tasks_map[lkey]
-                if not ltask.remaining and now >= ltask.start + ltask.latency:
+                anchor = ltask.first_service if ltask.latency_from_first_service else ltask.start
+                if not ltask.remaining and anchor is not None and now >= anchor + ltask.latency:
                     if lkey not in self._completable_seen:
                         self._completable_seen.add(lkey)
                         heapq.heappush(self._completable, lkey)
             else:
                 for key in latency_active:
                     task = tasks_map[key]
-                    if not task.remaining and now >= task.start + task.latency:
+                    anchor = task.first_service if task.latency_from_first_service else task.start
+                    if not task.remaining and anchor is not None and now >= anchor + task.latency:
                         if key not in self._completable_seen:
                             self._completable_seen.add(key)
                             heapq.heappush(self._completable, key)
@@ -601,13 +630,17 @@ class _EngineLifecycleMixin:
                 key = completable.pop()
                 completable_seen.discard(key)
                 task = tasks.get(key)
-                if (task is not None and not task.remaining
-                        and self.now >= task.start + task.latency):
-                    _complete(task)
+                if task is not None and not task.remaining:
+                    anchor = task.first_service if task.latency_from_first_service else task.start
+                    if anchor is not None and self.now >= anchor + task.latency:
+                        _complete(task)
             else:
                 for key in frontier.take_completable(self):
                     task = tasks.get(key)
-                    if task is None or task.remaining or self.now < task.start + task.latency:
+                    if task is None or task.remaining:
+                        continue
+                    anchor = task.first_service if task.latency_from_first_service else task.start
+                    if anchor is None or self.now < anchor + task.latency:
                         continue
                     _complete(task)
             # A completion callback may submit another zero-work successor at
@@ -686,6 +719,7 @@ class _EngineLifecycleMixin:
                     orig.remaining.clear()
                     self._complete(orig, moment=member_ev.time)
 
+            base_fifo = task.fifo_order[0] if task.fifo_order is not None else key
             for idx in range(cohort):
                 m_rem = {r: amt / cohort for r, amt in task.remaining.items()}
                 m_caps = {r: cap / cohort for r, cap in task.caps.items()}
@@ -698,6 +732,7 @@ class _EngineLifecycleMixin:
                 m_prep = self._prepare(
                     m_ev.name, m_rem, latency=task.latency, caps=m_caps,
                     placement=m_place, coupled=task.coupled, priority=task.priority,
+                    latency_from_first_service=task.latency_from_first_service,
                 )
                 m_task = _Task(
                     m_ev, dict(m_rem), m_prep.demand, 0, task.release,
@@ -705,6 +740,9 @@ class _EngineLifecycleMixin:
                     m_prep.placement, (), task.priority, task.coupled, None, None,
                     task.start, {}, False, None, 0, 0, _EMPTY_FROZENSET, None, (),
                     1, m_prep, None, False, (), (), (), None, True,
+                    fifo_order=(base_fifo, idx),
+                    latency_from_first_service=task.latency_from_first_service,
+                    first_service=task.first_service,
                 )
                 m_task.callback = lambda ev, mt=m_task, fn=_member_done: fn(ev, mt)
                 tasks[m_ev.sequence] = m_task

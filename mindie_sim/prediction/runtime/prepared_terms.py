@@ -153,8 +153,8 @@ def bind_vector_groups(
             stages.append(Stage(
                 f"{grp.group_id}:prefix",
                 work={
-                    issue_res: float(prefix_count * grp.issue_slots) / eff_issue,
-                    pipe_res: float(prefix_count * grp.initiation_cycles) / eff_pipes[grp.pipe],
+                    issue_res: float(prefix_count * grp.issue_slots) / target_eff,
+                    pipe_res: float(prefix_count * grp.initiation_cycles) / target_eff,
                 },
                 after=deps_after,
                 placement=pl,
@@ -163,50 +163,44 @@ def bind_vector_groups(
             stages.append(Stage(
                 grp.group_id,
                 work={
-                    issue_res: float(grp.issue_slots) / eff_issue,
-                    pipe_res: float(grp.initiation_cycles) / eff_pipes[grp.pipe],
+                    issue_res: float(grp.issue_slots) / target_eff,
+                    pipe_res: float(grp.initiation_cycles) / target_eff,
                 },
                 after=(f"{grp.group_id}:prefix",),
+                latency=raw_lat_ms,
                 placement=pl,
                 coupled=True,
-            ))
-            stages.append(Stage(
-                f"{grp.group_id}:raw_timer",
-                latency=raw_lat_ms,
-                after=(f"{grp.group_id}:prefix",),
+                latency_from_first_service=True,
             ))
             stages.append(Stage(
                 f"{grp.group_id}:raw",
-                after=(grp.group_id, f"{grp.group_id}:raw_timer"),
+                after=(grp.group_id,),
                 keep_empty=True,
             ))
         elif grp.count == 1 and raw_lat_ms > 0.0 and grp.last_issue_mark:
             stages.append(Stage(
                 grp.group_id,
                 work={
-                    issue_res: issue_w / eff_issue,
-                    pipe_res: exec_w / eff_pipes[grp.pipe],
+                    issue_res: issue_w / target_eff,
+                    pipe_res: exec_w / target_eff,
                 },
                 after=deps_after,
+                latency=raw_lat_ms,
                 placement=pl,
                 coupled=True,
-            ))
-            stages.append(Stage(
-                f"{grp.group_id}:raw_timer",
-                latency=raw_lat_ms,
-                after=deps_after,
+                latency_from_first_service=True,
             ))
             stages.append(Stage(
                 f"{grp.group_id}:raw",
-                after=(grp.group_id, f"{grp.group_id}:raw_timer"),
+                after=(grp.group_id,),
                 keep_empty=True,
             ))
         else:
             stages.append(Stage(
                 grp.group_id,
                 work={
-                    issue_res: issue_w / eff_issue,
-                    pipe_res: exec_w / eff_pipes[grp.pipe],
+                    issue_res: issue_w / target_eff,
+                    pipe_res: exec_w / target_eff,
                 } if grp.count > 0 else {},
                 after=deps_after,
                 placement=pl if grp.count > 0 else {},

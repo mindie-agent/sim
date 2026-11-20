@@ -371,8 +371,10 @@ def _uncoupled_pair_fast(resources, k0, t0, k1, t1):
         c0 = t0.caps.get(name, math.inf) if t0.caps else math.inf
         c1 = t1.caps.get(name, math.inf) if t1.caps else math.inf
         if res.policy == "fifo":
-            key0 = (t0.start if t0.start is not None else math.inf, t0.priority, k0)
-            key1 = (t1.start if t1.start is not None else math.inf, t1.priority, k1)
+            key0 = (t0.start if t0.start is not None else math.inf, t0.priority,
+                    t0.fifo_order if getattr(t0, "fifo_order", None) is not None else (k0, 0))
+            key1 = (t1.start if t1.start is not None else math.inf, t1.priority,
+                    t1.fifo_order if getattr(t1, "fifo_order", None) is not None else (k1, 0))
             if key0 < key1:
                 rates0.append((name, c0 if c0 < res.rate else res.rate))
             else:

@@ -80,6 +80,7 @@ class Stage:
     cohort_members: Mapping[str, tuple[tuple[int, ...], ...]] = field(default_factory=dict)
     metadata: Mapping[str, Any] = field(default_factory=dict)
     deliveries: tuple[tuple[str, float], ...] = ()
+    latency_from_first_service: bool = False
 
     def __post_init__(self):
         work = MappingProxyType(dict(self.work)) if self.work else _EMPTY_MAPPING
@@ -87,12 +88,10 @@ class Stage:
         if not self.placement:
             placement = _EMPTY_MAPPING
         else:
-            placement = MappingProxyType(
-                {
-                    key: units if units.__class__ is tuple else tuple(units)
-                    for key, units in self.placement.items()
-                }
-            )
+            placement = MappingProxyType({
+                k: u if u.__class__ is tuple else tuple(u)
+                for k, u in self.placement.items()
+            })
         if not self.work_units:
             units = _EMPTY_MAPPING
         else:
@@ -141,7 +140,9 @@ class Stage:
         if self.metadata:
             raw_meta = dict(self.metadata)
             for mk, mv in raw_meta.items():
-                if type(mk) is not str or mk == "occurrence" or type(mv) not in _STAGE_METADATA_BUILTINS:
+                ok_v = (type(mv) in _STAGE_METADATA_BUILTINS
+                        or (type(mv) is tuple and all(type(x) is int for x in mv)))
+                if type(mk) is not str or mk == "occurrence" or not ok_v:
                     raise ModelingError(f"stage_metadata_invalid:{self.name}:{mk!r}")
             object.__setattr__(self, "metadata", MappingProxyType(raw_meta))
         else:
@@ -154,7 +155,7 @@ class Stage:
             "name", "work", "after", "latency", "caps", "program", "placement",
             "previous", "coupled", "work_units", "priority", "fragment",
             "cohort_size", "keep_empty", "cohort_widened", "cohort_members",
-            "metadata", "deliveries",
+            "metadata", "deliveries", "latency_from_first_service",
         ):
             object.__setattr__(clone, attr, getattr(self, attr))
         object.__setattr__(clone, "acquire", acquire)
@@ -173,6 +174,8 @@ class Stage:
                 extra["cohort_widened"] = self.cohort_widened
             if self.cohort_members:
                 extra["cohort_members"] = self.cohort_members
+            if self.latency_from_first_service:
+                extra["latency_from_first_service"] = True
             return prepare(
                 name, self.work, latency=self.latency, caps=self.caps,
                 acquire=acquire, free=free, placement=self.placement,
@@ -183,6 +186,7 @@ class Stage:
             name, self.work, self.latency, self.caps, acquire, free,
             self.placement, self.coupled, self.priority, self.cohort_size,
             self.cohort_widened, self.cohort_members, self.metadata,
+            self.deliveries, self.latency_from_first_service,
         )
 
     def submit(self, engine, name, predecessors, scoped, owner, prepared=None):
@@ -220,6 +224,8 @@ class Stage:
                     kwargs["cohort_widened"] = self.cohort_widened
                 if self.cohort_members:
                     kwargs["cohort_members"] = self.cohort_members
+                if self.latency_from_first_service:
+                    kwargs["latency_from_first_service"] = True
                 event = engine.submit(
                     name, self.work, after=predecessors, latency=self.latency,
                     caps=self.caps, acquire=acquire, free=free,
@@ -253,6 +259,7 @@ class _PreparedStageDeclaration:
     cohort_members: Mapping[str, tuple[tuple[int, ...], ...]] = field(default_factory=dict)
     metadata: Mapping[str, Any] = field(default_factory=dict)
     deliveries: tuple[tuple[str, float], ...] = ()
+    latency_from_first_service: bool = False
 
 
 def stage_from_fragment(
@@ -414,19 +421,11 @@ def _declares_no_work(stage) -> bool:
 def _is_pure_root_delay(stage, all_consumed: set[str], stages) -> bool:
     """True when a root stage is a pure clock delay before sole-dep stages."""
     return (
-        not stage.after
-        and stage.name in all_consumed
-        and not stage.keep_empty
-        and not any(stage.work.values())
-        and stage.latency > 0.0
-        and not stage.acquire
-        and not stage.free
-        and not any(stage.caps.values())
-        and not stage.coupled
-        and stage.priority == 0
-        and stage.program is None
-        and stage.fragment is None
-        and not stage.previous
+        not stage.after and stage.name in all_consumed and not stage.keep_empty
+        and not any(stage.work.values()) and stage.latency > 0.0
+        and not stage.acquire and not stage.free and not any(stage.caps.values())
+        and not stage.coupled and stage.priority == 0 and stage.program is None
+        and stage.fragment is None and not stage.previous and not stage.metadata
         and all(st.after == (stage.name,) for st in stages if stage.name in st.after)
     )
 
@@ -437,7 +436,7 @@ def _compile_leaf_kernel_ops(
     """Compile a leaf KernelProgram into flat prepared submission instructions."""
     stages = prog.stages
     for s in stages:
-        if s.program is not None or s.fragment is not None or s.metadata or s.deliveries:
+        if s.program is not None or s.fragment is not None or s.metadata or s.deliveries or s.latency_from_first_service:
             return None
     all_consumed = {k for st in stages for k in st.after}
     slot_by_name: dict[str, int] = {}

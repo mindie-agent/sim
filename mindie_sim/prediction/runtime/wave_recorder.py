@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+import math
 from typing import Any, Literal
 
 from mindie_sim.schema.common import ModelingError
@@ -38,12 +39,18 @@ from .wave_types import (
     ResourceRowRef,
     TileWaveTimeline,
     WaitWitness,
+    _FRACTIONAL_EXPAND_LIMIT,
     _clamp_intervals,
+    _intersect_float_intervals,
     _intersect_intervals,
+    _is_exact_ns_period,
     _measure,
     _ms_to_ns,
+    _peaks_from_buffers,
     _pipe_base_role,
+    _subtract_float_intervals,
     _subtract_intervals,
+    _union_float_intervals,
     _union_intervals,
 )
 
@@ -71,12 +78,19 @@ class WaveRecorder:
         self._service_by_pipe: dict[tuple[int, int], list[tuple[int, int]]] = {}
         self._owner_time_by_pipe: dict[tuple[int, int], int] = {}
         self._handoff_by_pipe: dict[tuple[int, int], list[tuple[int, int]]] = {}
+        self._service_by_task: dict[int, list[tuple[int, int, int, int]]] = {}
+        self._handoff_by_task: dict[int, list[tuple[int, int, int, int]]] = {}
+        self._occ_head: dict[Any, list[IntervalRun]] = {}
+        self._occ_tail: dict[Any, list[IntervalRun]] = {}
         self._wait_witnesses: list[WaitWitness] = []
         self._head: list[IntervalRun] = []
         self._tail: list[IntervalRun] = []
         self._steady: list[PeriodicRun] = []
+        self._steady_occ: list[Any] = []
         self._live_allocs: dict[tuple[str, int, int, int], BufferResidency] = {}
+        self._alloc_task: dict[tuple[str, int, int, int], int] = {}
         self._closed_allocs: list[BufferResidency] = []
+        self._closed_alloc_entries: list[tuple[int | None, BufferResidency]] = []
         self._live_pool_bytes: dict[tuple[int, str], int] = {}
         self._peak_pool_bytes: dict[tuple[int, str], int] = {}
         self._alloc_name_slot_gen: dict[tuple[str, int, str], tuple[int, int]] = {}
@@ -212,9 +226,14 @@ class WaveRecorder:
                     pid = self.register_pipe(str(pipe_name))
                     key = (self.scope_id, pid)
                     self._handoff_by_pipe.setdefault(key, []).append((start_ns, admit_ns))
+                    tid = int(task_id)
+                    if tid in self._task_occurrences:
+                        self._handoff_by_task.setdefault(tid, []).append(
+                            (self.scope_id, pid, start_ns, admit_ns)
+                        )
                     self._note_bounds(start_ns, admit_ns)
                     self._wait_witnesses.append(WaitWitness(
-                        task_id=int(task_id),
+                        task_id=tid,
                         blocker_event=str(blocker_ev),
                         pipe_id=pid,
                         start_ns=start_ns,
@@ -246,15 +265,27 @@ class WaveRecorder:
         self._service_by_pipe.setdefault(key, []).append((lo_ns, hi_ns))
         self._owner_time_by_pipe[key] = self._owner_time_by_pipe.get(key, 0) + (hi_ns - lo_ns)
         self._note_bounds(lo_ns, hi_ns)
+        tid = int(task_id)
         run = IntervalRun(
             start_ns=lo_ns,
             end_ns=hi_ns,
-            task_id=int(task_id),
+            task_id=tid,
             pipe_id=pid,
             scope_id=sid,
             owner=int(owner),
             delivered=float(delivered),
         )
+        if tid in self._task_occurrences:
+            self._service_by_task.setdefault(tid, []).append((sid, pid, lo_ns, hi_ns))
+            occ = self._task_occurrences[tid]
+            o_head = self._occ_head.setdefault(occ, [])
+            if len(o_head) < self.max_head_tail:
+                o_head.append(run)
+            else:
+                o_tail = self._occ_tail.setdefault(occ, [])
+                if len(o_tail) >= self.max_head_tail:
+                    o_tail.pop(0)
+                o_tail.append(run)
         if len(self._head) < self.max_head_tail:
             self._head.append(run)
         else:
@@ -274,6 +305,7 @@ class WaveRecorder:
         action: Literal["grant", "release"],
         *,
         alias_of: str | None = None,
+        task_id: int | None = None,
     ) -> None:
         t_ns = _ms_to_ns(t_ms)
         key = (str(pool), int(owner), int(slot), int(generation))
@@ -289,6 +321,8 @@ class WaveRecorder:
                 release_ns=None,
                 alias_of=alias_of,
             )
+            if task_id is not None:
+                self._alloc_task[key] = int(task_id)
             if alias_of is None:
                 cur = self._live_pool_bytes.get(pool_key, 0) + int(size_bytes)
                 self._live_pool_bytes[pool_key] = cur
@@ -296,8 +330,9 @@ class WaveRecorder:
                     self._peak_pool_bytes[pool_key] = cur
         elif action == "release":
             live = self._live_allocs.pop(key, None)
+            owner_tid = self._alloc_task.pop(key, None)
             if live is not None:
-                self._closed_allocs.append(BufferResidency(
+                closed = BufferResidency(
                     pool=live.pool,
                     owner=live.owner,
                     slot=live.slot,
@@ -306,7 +341,9 @@ class WaveRecorder:
                     grant_ns=live.grant_ns,
                     release_ns=t_ns,
                     alias_of=live.alias_of,
-                ))
+                )
+                self._closed_allocs.append(closed)
+                self._closed_alloc_entries.append((owner_tid, closed))
                 if live.alias_of is None:
                     cur = max(0, self._live_pool_bytes.get(pool_key, 0) - live.size_bytes)
                     self._live_pool_bytes[pool_key] = cur
@@ -323,6 +360,7 @@ class WaveRecorder:
         service_pattern: Sequence[tuple[str, float, float]] = (),
         handoff_pattern: Sequence[tuple[str, float, float]] = (),
         scope_id: int | None = None,
+        occurrence: Any = None,
     ) -> None:
         """Record a proved periodic skip in O(1) space preserving relative phase offsets."""
         if repeats < 1 or period_ms <= 0.0:
@@ -339,7 +377,7 @@ class WaveRecorder:
             key = (sid, pid)
             self._owner_time_by_pipe[key] = (
                 self._owner_time_by_pipe.get(key, 0)
-                + int(repeats) * max(0, _ms_to_ns(hi) - _ms_to_ns(lo))
+                + max(0, _ms_to_ns(float(repeats) * (hi - lo)))
             )
         for pn, _lo, _hi in ho_norm:
             self.register_pipe(pn)
@@ -353,97 +391,178 @@ class WaveRecorder:
             handoff_pattern=ho_norm,
             scope_id=sid,
         ))
+        self._steady_occ.append(occurrence)
         self._note_bounds(
             _ms_to_ns(anchor_ms),
             _ms_to_ns(anchor_ms + float(repeats) * period_ms),
         )
 
     def _periodic_pipe_contrib(
-        self, sid: int, pname: str, start_ns: int, end_ns: int,
+        self,
+        sid: int,
+        pname: str,
+        start_ns: int,
+        end_ns: int,
+        steady_runs: Sequence[PeriodicRun],
     ) -> tuple[int, int, int | None, int | None, list[tuple[int, int]], list[tuple[int, int]]]:
-        """Integrate compressed periodic skips for one pipe in O(#runs)."""
+        """Integrate compressed periodic skips for one pipe without rounding drift."""
         extra_busy = 0
         extra_ho = 0
         first_a: int | None = None
         last_b: int | None = None
         edge_busy: list[tuple[int, int]] = []
         edge_ho: list[tuple[int, int]] = []
-        for pr in self._steady:
+        for pr in steady_runs:
             if pr.scope_id != sid:
                 continue
-            period_ns = _ms_to_ns(pr.period_ms)
-            if period_ns <= 0:
-                continue
             anchor_ns = _ms_to_ns(pr.anchor_ms)
             run_end_ns = _ms_to_ns(pr.anchor_ms + float(pr.repeats) * pr.period_ms)
             if run_end_ns <= start_ns or anchor_ns >= end_ns:
                 continue
-            rel_b = _union_intervals(
-                (_ms_to_ns(lo), _ms_to_ns(hi))
-                for pn, lo, hi in pr.service_pattern if pn == pname
-            )
-            rel_h0 = _union_intervals(
-                (_ms_to_ns(lo), _ms_to_ns(hi))
-                for pn, lo, hi in pr.handoff_pattern if pn == pname
-            )
-            rel_h = _subtract_intervals(rel_h0, rel_b)
-            if not rel_b and not rel_h:
+            if _is_exact_ns_period(pr):
+                period_ns = _ms_to_ns(pr.period_ms)
+                if period_ns <= 0:
+                    continue
+                rel_b = _union_intervals(
+                    (_ms_to_ns(lo), _ms_to_ns(hi))
+                    for pn, lo, hi in pr.service_pattern if pn == pname
+                )
+                rel_h0 = _union_intervals(
+                    (_ms_to_ns(lo), _ms_to_ns(hi))
+                    for pn, lo, hi in pr.handoff_pattern if pn == pname
+                )
+                rel_h = _subtract_intervals(rel_h0, rel_b)
+                if not rel_b and not rel_h:
+                    continue
+                r_lo = max(0, (start_ns - anchor_ns) // period_ns)
+                r_hi = min(pr.repeats, (end_ns - anchor_ns + period_ns - 1) // period_ns)
+                if r_hi <= r_lo:
+                    continue
+                boundary_reps = {r_lo, r_hi - 1}
+                for rep in sorted(boundary_reps):
+                    base_ns = _ms_to_ns(pr.anchor_ms + float(rep) * pr.period_ms)
+                    edge_busy.extend((base_ns + a, base_ns + b) for a, b in rel_b)
+                    edge_ho.extend((base_ns + a, base_ns + b) for a, b in rel_h)
+                n_mid = max(0, (r_hi - r_lo) - len(boundary_reps))
+                if n_mid > 0:
+                    extra_busy += n_mid * _measure(rel_b)
+                    extra_ho += n_mid * _measure(rel_h)
+                    if rel_b:
+                        mid_lo_ns = _ms_to_ns(pr.anchor_ms + float(r_lo + 1) * pr.period_ms) + rel_b[0][0]
+                        mid_hi_ns = _ms_to_ns(pr.anchor_ms + float(r_hi - 2) * pr.period_ms) + rel_b[-1][1]
+                        if first_a is None or mid_lo_ns < first_a:
+                            first_a = max(start_ns, mid_lo_ns)
+                        if last_b is None or mid_hi_ns > last_b:
+                            last_b = min(end_ns, mid_hi_ns)
                 continue
-            r_lo = max(0, (start_ns - anchor_ns) // period_ns)
-            r_hi = min(pr.repeats, (end_ns - anchor_ns + period_ns - 1) // period_ns)
+            rel_b_f = _union_float_intervals(
+                [(lo, hi) for pn, lo, hi in pr.service_pattern if pn == pname]
+            )
+            rel_h0_f = _union_float_intervals(
+                [(lo, hi) for pn, lo, hi in pr.handoff_pattern if pn == pname]
+            )
+            rel_h_f = _subtract_float_intervals(rel_h0_f, rel_b_f)
+            if not rel_b_f and not rel_h_f:
+                continue
+            r_lo = max(0, math.floor(((start_ns / NS_PER_MS) - pr.anchor_ms) / pr.period_ms))
+            r_hi = min(pr.repeats, math.ceil(((end_ns / NS_PER_MS) - pr.anchor_ms) / pr.period_ms))
             if r_hi <= r_lo:
                 continue
-            boundary_reps = {r_lo, r_hi - 1}
-            for rep in sorted(boundary_reps):
-                base_ns = _ms_to_ns(pr.anchor_ms + float(rep) * pr.period_ms)
-                edge_busy.extend((base_ns + a, base_ns + b) for a, b in rel_b)
-                edge_ho.extend((base_ns + a, base_ns + b) for a, b in rel_h)
-            n_mid = max(0, (r_hi - r_lo) - len(boundary_reps))
-            if n_mid > 0:
-                extra_busy += n_mid * _measure(rel_b)
-                extra_ho += n_mid * _measure(rel_h)
-                if rel_b:
-                    mid_lo_ns = _ms_to_ns(pr.anchor_ms + float(r_lo + 1) * pr.period_ms) + rel_b[0][0]
-                    mid_hi_ns = _ms_to_ns(pr.anchor_ms + float(r_hi - 2) * pr.period_ms) + rel_b[-1][1]
-                    if first_a is None or mid_lo_ns < first_a:
-                        first_a = max(start_ns, mid_lo_ns)
-                    if last_b is None or mid_hi_ns > last_b:
-                        last_b = min(end_ns, mid_hi_ns)
+            if r_hi - r_lo <= _FRACTIONAL_EXPAND_LIMIT:
+                for rep in range(r_lo, r_hi):
+                    base_ms = pr.anchor_ms + float(rep) * pr.period_ms
+                    rep_b = _union_intervals(
+                        (_ms_to_ns(base_ms + lo), _ms_to_ns(base_ms + hi)) for lo, hi in rel_b_f
+                    )
+                    rep_h0 = _union_intervals(
+                        (_ms_to_ns(base_ms + lo), _ms_to_ns(base_ms + hi)) for lo, hi in rel_h0_f
+                    )
+                    edge_busy.extend(rep_b)
+                    edge_ho.extend(_subtract_intervals(rep_h0, rep_b))
+            else:
+                boundary_reps = {r_lo, r_hi - 1}
+                for rep in sorted(boundary_reps):
+                    base_ms = pr.anchor_ms + float(rep) * pr.period_ms
+                    rep_b = _union_intervals(
+                        (_ms_to_ns(base_ms + lo), _ms_to_ns(base_ms + hi)) for lo, hi in rel_b_f
+                    )
+                    rep_h0 = _union_intervals(
+                        (_ms_to_ns(base_ms + lo), _ms_to_ns(base_ms + hi)) for lo, hi in rel_h0_f
+                    )
+                    edge_busy.extend(rep_b)
+                    edge_ho.extend(_subtract_intervals(rep_h0, rep_b))
+                n_mid = (r_hi - r_lo) - len(boundary_reps)
+                mid_lo = max(start_ns, _ms_to_ns(pr.anchor_ms + float(r_lo + 1) * pr.period_ms))
+                mid_hi = min(end_ns, _ms_to_ns(pr.anchor_ms + float(r_hi - 1) * pr.period_ms))
+                mid_span = max(0, mid_hi - mid_lo)
+                b_ns = min(mid_span, int(round(n_mid * sum(h - l for l, h in rel_b_f) * NS_PER_MS)))
+                h_ns = min(
+                    max(0, mid_span - b_ns),
+                    int(round(n_mid * sum(h - l for l, h in rel_h_f) * NS_PER_MS)),
+                )
+                extra_busy += b_ns
+                extra_ho += h_ns
+                if rel_b_f:
+                    m_fa = max(start_ns, _ms_to_ns(pr.anchor_ms + float(r_lo + 1) * pr.period_ms + rel_b_f[0][0]))
+                    m_lb = min(end_ns, _ms_to_ns(pr.anchor_ms + float(r_hi - 2) * pr.period_ms + rel_b_f[-1][1]))
+                    if first_a is None or m_fa < first_a:
+                        first_a = m_fa
+                    if last_b is None or m_lb > last_b:
+                        last_b = m_lb
         return extra_busy, extra_ho, first_a, last_b, edge_busy, edge_ho
 
-    def _periodic_cv_overlap(self, start_ns: int, end_ns: int) -> int:
-        """Compute O(#runs) compressed cube-vector overlap honoring phase offsets."""
+    def _periodic_cv_overlap(
+        self, start_ns: int, end_ns: int, steady_runs: Sequence[PeriodicRun],
+    ) -> int:
+        """Compute interior-repeat cube-vector overlap (boundary reps live in unions)."""
         total = 0
-        for pr in self._steady:
-            period_ns = _ms_to_ns(pr.period_ms)
-            if period_ns <= 0:
-                continue
+        for pr in steady_runs:
             anchor_ns = _ms_to_ns(pr.anchor_ms)
             run_end_ns = _ms_to_ns(pr.anchor_ms + float(pr.repeats) * pr.period_ms)
             if run_end_ns <= start_ns or anchor_ns >= end_ns:
                 continue
-            rel_c = _union_intervals(
-                (_ms_to_ns(lo), _ms_to_ns(hi))
-                for pn, lo, hi in pr.service_pattern if _pipe_base_role(pn) in CUBE_PIPE_ROLES
-            )
-            rel_v = _union_intervals(
-                (_ms_to_ns(lo), _ms_to_ns(hi))
-                for pn, lo, hi in pr.service_pattern if _pipe_base_role(pn) in VECTOR_PIPE_ROLES
-            )
-            ov_rel = _intersect_intervals(rel_c, rel_v)
-            if not ov_rel:
+            if _is_exact_ns_period(pr):
+                period_ns = _ms_to_ns(pr.period_ms)
+                if period_ns <= 0:
+                    continue
+                rel_c = _union_intervals(
+                    (_ms_to_ns(lo), _ms_to_ns(hi))
+                    for pn, lo, hi in pr.service_pattern if _pipe_base_role(pn) in CUBE_PIPE_ROLES
+                )
+                rel_v = _union_intervals(
+                    (_ms_to_ns(lo), _ms_to_ns(hi))
+                    for pn, lo, hi in pr.service_pattern if _pipe_base_role(pn) in VECTOR_PIPE_ROLES
+                )
+                ov_rel = _intersect_intervals(rel_c, rel_v)
+                if not ov_rel:
+                    continue
+                r_lo = max(0, (start_ns - anchor_ns) // period_ns)
+                r_hi = min(pr.repeats, (end_ns - anchor_ns + period_ns - 1) // period_ns)
+                if r_hi <= r_lo:
+                    continue
+                boundary_reps = {r_lo, r_hi - 1}
+                n_mid = max(0, (r_hi - r_lo) - len(boundary_reps))
+                if n_mid > 0:
+                    total += n_mid * _measure(ov_rel)
                 continue
-            r_lo = max(0, (start_ns - anchor_ns) // period_ns)
-            r_hi = min(pr.repeats, (end_ns - anchor_ns + period_ns - 1) // period_ns)
-            if r_hi <= r_lo:
+            r_lo = max(0, math.floor(((start_ns / NS_PER_MS) - pr.anchor_ms) / pr.period_ms))
+            r_hi = min(pr.repeats, math.ceil(((end_ns / NS_PER_MS) - pr.anchor_ms) / pr.period_ms))
+            if r_hi - r_lo <= _FRACTIONAL_EXPAND_LIMIT:
                 continue
-            boundary_reps = {r_lo, r_hi - 1}
-            for rep in sorted(boundary_reps):
-                base_ns = _ms_to_ns(pr.anchor_ms + float(rep) * pr.period_ms)
-                total += _measure(_clamp_intervals([(base_ns + a, base_ns + b) for a, b in ov_rel], start_ns, end_ns))
-            n_mid = max(0, (r_hi - r_lo) - len(boundary_reps))
-            if n_mid > 0:
-                total += n_mid * _measure(ov_rel)
+            rel_c_f = _union_float_intervals(
+                [(lo, hi) for pn, lo, hi in pr.service_pattern if _pipe_base_role(pn) in CUBE_PIPE_ROLES]
+            )
+            rel_v_f = _union_float_intervals(
+                [(lo, hi) for pn, lo, hi in pr.service_pattern if _pipe_base_role(pn) in VECTOR_PIPE_ROLES]
+            )
+            ov_f = _intersect_float_intervals(rel_c_f, rel_v_f)
+            if not ov_f:
+                continue
+            n_mid = (r_hi - r_lo) - 2
+            mid_lo = max(start_ns, _ms_to_ns(pr.anchor_ms + float(r_lo + 1) * pr.period_ms))
+            mid_hi = min(end_ns, _ms_to_ns(pr.anchor_ms + float(r_hi - 1) * pr.period_ms))
+            mid_span = max(0, mid_hi - mid_lo)
+            total += min(mid_span, int(round(n_mid * sum(h - l for l, h in ov_f) * NS_PER_MS)))
         return total
 
     def finish(
@@ -459,24 +578,99 @@ class WaveRecorder:
         uncovered_stars_ns: int = 0,
     ) -> FusedPipelineDescriptor:
         """Compute exact 4-bucket idle rows and return ``FusedPipelineDescriptor``."""
-        start_ns = (
-            _ms_to_ns(window_start_ms)
-            if window_start_ms is not None else (self._min_ns or 0)
-        )
+        occ_filter = bool(self._task_occurrences)
+        if occ_filter:
+            occ_tids = {
+                tid for tid, occ in self._task_occurrences.items() if occ == occurrence_key
+            }
+            svc_map: dict[tuple[int, int], list[tuple[int, int]]] = {}
+            owner_time_map: dict[tuple[int, int], int] = {}
+            ho_map: dict[tuple[int, int], list[tuple[int, int]]] = {}
+            f_min: int | None = None
+            f_max: int | None = None
+            for tid in occ_tids:
+                for sid, pid, lo, hi in self._service_by_task.get(tid, ()):
+                    svc_map.setdefault((sid, pid), []).append((lo, hi))
+                    owner_time_map[(sid, pid)] = owner_time_map.get((sid, pid), 0) + (hi - lo)
+                    f_min = lo if f_min is None or lo < f_min else f_min
+                    f_max = hi if f_max is None or hi > f_max else f_max
+                for sid, pid, lo, hi in self._handoff_by_task.get(tid, ()):
+                    ho_map.setdefault((sid, pid), []).append((lo, hi))
+                    f_min = lo if f_min is None or lo < f_min else f_min
+                    f_max = hi if f_max is None or hi > f_max else f_max
+            steady_runs = [
+                pr for pr, p_occ in zip(self._steady, self._steady_occ)
+                if p_occ == occurrence_key
+            ]
+            steady_keys: set[tuple[int, int]] = set()
+            for pr in steady_runs:
+                p_lo = _ms_to_ns(pr.anchor_ms)
+                p_hi = _ms_to_ns(pr.anchor_ms + float(pr.repeats) * pr.period_ms)
+                f_min = p_lo if f_min is None or p_lo < f_min else f_min
+                f_max = p_hi if f_max is None or p_hi > f_max else f_max
+                for pn, lo_f, hi_f in pr.service_pattern:
+                    pid = self._pipe_ids.get(pn)
+                    if pid is not None:
+                        steady_keys.add((pr.scope_id, pid))
+                        owner_time_map[(pr.scope_id, pid)] = (
+                            owner_time_map.get((pr.scope_id, pid), 0)
+                            + max(0, _ms_to_ns(float(pr.repeats) * (hi_f - lo_f)))
+                        )
+                for pn, _lo, _hi in pr.handoff_pattern:
+                    pid = self._pipe_ids.get(pn)
+                    if pid is not None:
+                        steady_keys.add((pr.scope_id, pid))
+            all_keys = sorted(set(svc_map) | set(ho_map) | steady_keys)
+            auto_min, auto_max = f_min, f_max
+            head_runs = tuple(self._occ_head.get(occurrence_key, ()))
+            tail_runs = tuple(self._occ_tail.get(occurrence_key, ()))
+            witnesses = tuple(w for w in self._wait_witnesses if w.task_id in occ_tids)
+            bindings = tuple(
+                MemberBinding(member_id=mid, task_ids=ftids)
+                for mid, tids in sorted(self._member_tasks.items())
+                if (ftids := tuple(t for t in tids if t in occ_tids))
+            )
+            buffers = tuple((
+                *(res for tid, res in self._closed_alloc_entries if tid in occ_tids),
+                *(res for ak, res in self._live_allocs.items() if self._alloc_task.get(ak) in occ_tids),
+            ))
+            peaks = _peaks_from_buffers(buffers)
+            default_kcnt = len(occ_tids)
+        else:
+            svc_map = self._service_by_pipe
+            owner_time_map = self._owner_time_by_pipe
+            ho_map = self._handoff_by_pipe
+            steady_runs = self._steady
+            all_keys = sorted(
+                {(self.scope_id, pid) for pid in self._pipe_names}
+                | set(svc_map)
+                | set(ho_map)
+            )
+            auto_min, auto_max = self._min_ns, self._max_ns
+            head_runs = tuple(self._head)
+            tail_runs = tuple(self._tail)
+            witnesses = tuple(self._wait_witnesses)
+            bindings = tuple(
+                MemberBinding(member_id=mid, task_ids=tuple(tids))
+                for mid, tids in sorted(self._member_tasks.items())
+            )
+            buffers = tuple((*self._closed_allocs, *self._live_allocs.values()))
+            peaks = tuple(
+                OwnerPoolPeak(owner=owner, pool=pool, peak_bytes=peak)
+                for (owner, pool), peak in sorted(self._peak_pool_bytes.items())
+            )
+            default_kcnt = len(self._submitted_tasks)
+
+        start_ns = _ms_to_ns(window_start_ms) if window_start_ms is not None else (auto_min or 0)
         end_ns = (
             _ms_to_ns(window_end_ms)
-            if window_end_ms is not None else (self._max_ns if self._max_ns is not None else start_ns)
+            if window_end_ms is not None else (auto_max if auto_max is not None else start_ns)
         )
         if end_ns < start_ns:
             raise ModelingError(f"wave_recorder_window_reversed:{start_ns}>{end_ns}")
         span_ns = end_ns - start_ns
         window_iv = ((start_ns, end_ns),) if span_ns > 0 else ()
 
-        all_keys = sorted(
-            {(self.scope_id, pid) for pid in self._pipe_names}
-            | set(self._service_by_pipe)
-            | set(self._handoff_by_pipe)
-        )
         pipe_rows: list[PipeIdleRow] = []
         cube_intervals: list[tuple[int, int]] = []
         vec_intervals: list[tuple[int, int]] = []
@@ -486,10 +680,10 @@ class WaveRecorder:
         for sid, pid in all_keys:
             pname = self._pipe_names.get(pid, f"pipe_{pid}")
             p_busy, p_ho, p_fa, p_lb, eb, eh = self._periodic_pipe_contrib(
-                sid, pname, start_ns, end_ns,
+                sid, pname, start_ns, end_ns, steady_runs,
             )
-            busy_set = _clamp_intervals((*self._service_by_pipe.get((sid, pid), ()), *eb), start_ns, end_ns)
-            h0_set = _clamp_intervals((*self._handoff_by_pipe.get((sid, pid), ()), *eh), start_ns, end_ns)
+            busy_set = _clamp_intervals((*svc_map.get((sid, pid), ()), *eb), start_ns, end_ns)
+            h0_set = _clamp_intervals((*ho_map.get((sid, pid), ()), *eh), start_ns, end_ns)
             handoff_set = _subtract_intervals(h0_set, busy_set)
             covered = _union_intervals((*busy_set, *handoff_set))
             idle_j = _subtract_intervals(window_iv, covered)
@@ -524,7 +718,7 @@ class WaveRecorder:
                 handoff_ns=handoff_ns,
                 inactive_in_window=inactive,
                 pipe_name=pname,
-                owner_time_ns=self._owner_time_by_pipe.get((sid, pid), 0),
+                owner_time_ns=owner_time_map.get((sid, pid), 0),
             ))
             role = _pipe_base_role(pname)
             if role in CUBE_PIPE_ROLES:
@@ -540,37 +734,27 @@ class WaveRecorder:
 
         cube_union = _union_intervals(cube_intervals)
         vec_union = _union_intervals(vec_intervals)
-        overlap_ns = _measure(_intersect_intervals(cube_union, vec_union)) + self._periodic_cv_overlap(start_ns, end_ns)
+        overlap_ns = _measure(_intersect_intervals(cube_union, vec_union)) + self._periodic_cv_overlap(
+            start_ns, end_ns, steady_runs,
+        )
 
         timeline = TileWaveTimeline(
             start_ns=start_ns,
             end_ns=end_ns,
-            head=tuple(self._head),
-            steady=tuple(self._steady),
-            tail=tuple(self._tail),
+            head=head_runs,
+            steady=tuple(steady_runs),
+            tail=tail_runs,
             pipe_rows=tuple(pipe_rows),
             cube_vector_overlap_ns=overlap_ns,
         )
-        peaks = tuple(
-            OwnerPoolPeak(owner=owner, pool=pool, peak_bytes=peak)
-            for (owner, pool), peak in sorted(self._peak_pool_bytes.items())
-        )
         diagnosis = BottleneckDiagnosis(
             limiting_rows=tuple(limiting),
-            exposed_waits=tuple(self._wait_witnesses),
+            exposed_waits=witnesses,
             peak_allocations=peaks,
             critical_events=tuple(self._critical_events),
             uncovered_stars_ns=int(uncovered_stars_ns),
         )
-        bindings = tuple(
-            MemberBinding(member_id=mid, task_ids=tuple(tids))
-            for mid, tids in sorted(self._member_tasks.items())
-        )
-        buffers = tuple((*self._closed_allocs, *self._live_allocs.values()))
-        kernel_cnt = (
-            len(self._submitted_tasks)
-            if submitted_kernel_count is None else int(submitted_kernel_count)
-        )
+        kernel_cnt = default_kcnt if submitted_kernel_count is None else int(submitted_kernel_count)
         return FusedPipelineDescriptor(
             spec=spec,
             occurrence_key=occurrence_key,

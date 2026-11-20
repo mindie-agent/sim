@@ -44,15 +44,17 @@ class _EngineSoloStepMixin:
         if latency_active:
             if len(latency_active) == 1:
                 ltask = tasks[next(iter(latency_active))]
-                if ltask.start + ltask.latency > now:
-                    lat_dt = ltask.start + ltask.latency - now
+                anchor = ltask.first_service if ltask.latency_from_first_service else ltask.start
+                if anchor is not None and anchor + ltask.latency > now:
+                    lat_dt = anchor + ltask.latency - now
                     if lat_dt < stop_dt:
                         stop_dt = lat_dt
             else:
                 for lkey in latency_active:
                     ltask = tasks[lkey]
-                    if ltask.start + ltask.latency > now:
-                        lat_dt = ltask.start + ltask.latency - now
+                    anchor = ltask.first_service if ltask.latency_from_first_service else ltask.start
+                    if anchor is not None and anchor + ltask.latency > now:
+                        lat_dt = anchor + ltask.latency - now
                         if lat_dt < stop_dt:
                             stop_dt = lat_dt
         if not rem:

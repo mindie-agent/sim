@@ -316,35 +316,41 @@ def has_asymmetric_cohort(engine: Any) -> bool:
     return False
 
 
+def _cohort_needs_split_with(cohort: Any, all_tasks: Sequence[Any], fifo_names: Any) -> bool:
+    if fifo_names and any(r in fifo_names for r in cohort.remaining):
+        return True
+    if not cohort.cohort_members:
+        return False
+    return any(other is not cohort and _peer_breaks_cohort(cohort, other) for other in all_tasks)
+
+
 def cohort_break_horizon(engine: Any, horizon: float) -> float:
-    """Clamp epoch horizon to the earliest future peer release breaking a cohort."""
-    cohorts = [
-        t for t in engine._tasks.values()
-        if t.cohort_size > 1 and t.cohort_members and t.remaining
-    ]
-    if not cohorts:
+    """Clamp epoch horizon to the earliest future peer or cohort release breaking symmetry."""
+    all_tasks = [t for t in engine._tasks.values() if t.remaining]
+    cohorts = [t for t in all_tasks if t.cohort_size > 1 and t.cohort_members]
+    fifo_names = engine.fifo_resource_names() if engine._fifo_live else ()
+    if not cohorts and not any(t.cohort_size > 1 for t in all_tasks):
         return horizon
     now = engine.now
     eff = horizon
-    for peer in engine._tasks.values():
-        if peer.start is not None or peer.waiting != 0 or peer.release <= now:
+    for fut in all_tasks:
+        if fut.start is not None or fut.release <= now or fut.release >= eff:
             continue
-        if peer.release >= eff:
-            continue
-        if any(peer is not c and _peer_breaks_cohort(c, peer) for c in cohorts):
-            eff = peer.release
+        if any(fut is not c and _peer_breaks_cohort(c, fut) for c in cohorts) or (
+            fut.cohort_size > 1 and _cohort_needs_split_with(fut, all_tasks, fifo_names)
+        ):
+            eff = fut.release
     return eff
 
 
 def stop_slots_for_epoch(engine: Any, until: Sequence[Any]) -> list[int]:
-    """Collect ``until`` slots plus predecessors whose completion activates a cohort breaker."""
+    """Collect ``until`` slots plus predecessors waking an asymmetric peer or cohort."""
     slots = engine._native_slots
     out = [slots[e.sequence] for e in until if not e.done and e.sequence in slots]
-    cohorts = [
-        t for t in engine._tasks.values()
-        if t.cohort_size > 1 and t.cohort_members and t.remaining
-    ]
-    if not cohorts:
+    all_tasks = [t for t in engine._tasks.values() if t.remaining]
+    cohorts = [t for t in all_tasks if t.cohort_size > 1 and t.cohort_members]
+    fifo_names = engine.fifo_resource_names() if engine._fifo_live else ()
+    if not cohorts and not any(t.cohort_size > 1 for t in all_tasks):
         return out
     seen = set(out)
     tasks = engine._tasks
@@ -355,8 +361,12 @@ def stop_slots_for_epoch(engine: Any, until: Sequence[Any]) -> list[int]:
         if pred is None or not pred.event._waiters:
             continue
         for wseq in pred.event._waiters:
-            peer = tasks.get(wseq)
-            if peer is not None and any(peer is not c and _peer_breaks_cohort(c, peer) for c in cohorts):
+            w = tasks.get(wseq)
+            if w is None or not w.remaining:
+                continue
+            if any(w is not c and _peer_breaks_cohort(c, w) for c in cohorts) or (
+                w.cohort_size > 1 and _cohort_needs_split_with(w, all_tasks, fifo_names)
+            ):
                 out.append(slot)
                 seen.add(slot)
                 break
@@ -438,25 +448,82 @@ def drain_obs_bridge(backend: Any, engine: Any) -> bool:
     return bool(count > 0 or overflow.value > 0)
 
 
-def record_native_starts(backend: Any, engine: Any, nstart: int) -> None:
+def sync_native_deliveries(backend: Any, engine: Any) -> None:
+    """Flush partial delivery counters for live native tasks at epoch/horizon boundaries."""
+    arena = backend.arena
+    if arena is None or not engine._delivery_live or not engine._native_slots:
+        return
+    tasks = engine._tasks
+    deliv = engine.delivered
+    export_fn = arena.library.msim_ctx_export
+    ctx = arena.ctx
+    for seq, slot in engine._native_slots.items():
+        task = tasks.get(seq)
+        if task is None or not task.deliveries:
+            continue
+        ref_r = next(iter(task.demand), None)
+        if ref_r is None:
+            continue
+        rem_names = tuple(task.remaining)
+        n = len(rem_names)
+        if n == 0 or ref_r not in task.remaining:
+            frac = 1.0
+        else:
+            buf = (ctypes.c_double * (2 * n))()
+            got = int(export_fn(ctx, slot, buf, 2 * n))
+            if got != n:
+                continue
+            idx = rem_names.index(ref_r)
+            svc = task.service.get(ref_r, 0.0) + float(buf[n + idx])
+            ref_d = task.demand[ref_r]
+            frac = min(1.0, svc / ref_d) if ref_d > 0.0 else 1.0
+        acc = task.delivered_acc
+        for ctr_id, total_amt in task.deliveries:
+            prev = acc.get(ctr_id, 0.0) if acc is not None else 0.0
+            target = total_amt * frac
+            delta = target - prev
+            if delta > 0.0:
+                deliv[ctr_id] = deliv.get(ctr_id, 0.0) + delta
+                if acc is not None:
+                    acc[ctr_id] = target
+
+
+def record_native_starts(backend: Any, engine: Any, nstart: int, ncomp: int = 0) -> None:
     """Mirror native C11 start records into ``engine._wave_recorder.on_admit``."""
     rec = getattr(engine, "_wave_recorder", None)
     if rec is None or nstart <= 0 or backend.arena is None:
         return
     tasks = engine._tasks
+    comp_times: dict[int, float] | None = None
     for seq, moment in backend.arena.starts(nstart):
         task = tasks.get(seq)
-        if task is not None:
-            owners = tuple(
-                sorted({u for units in (task.placement or {}).values() for u in units})
-            ) or (0,)
-            gen = int(task.metadata["generation"]) if task.metadata and "generation" in task.metadata else 0
-            blockers = ()
-            if task.blocker_event:
-                p_pipe = next(iter(task.demand), "")
+        if task is None:
+            continue
+        owners = tuple(
+            sorted({u for units in (task.placement or {}).values() for u in units})
+        ) or (0,)
+        gen = int(task.metadata["generation"]) if task.metadata and "generation" in task.metadata else 0
+        blockers = ()
+        p_pipe = next(iter(task.demand), "")
+        if p_pipe:
+            if task.pending_preds is not None and len(task.pending_preds) >= 2:
+                if comp_times is None:
+                    comp_times = (
+                        {cseq: cmom for cseq, cmom, _ in backend.arena.completions(ncomp)}
+                        if ncomp > 0 else {}
+                    )
+                ordered = sorted(
+                    (p.time if p.time is not None else comp_times.get(p.sequence, moment), i, p)
+                    for i, p in enumerate(task.pending_preds)
+                )
+                prev_t, _prev_i, _prev_p = ordered[len(ordered) - 2]
+                _last_t, _last_i, last_p = ordered[-1]
+                sole_since = task.release if task.release > prev_t else prev_t
+                blockers = ((p_pipe, last_p.name, sole_since, "publish"),)
+            elif task.blocker_event:
                 r_ms = task.ready_at if task.ready_at is not None else moment
                 blockers = ((p_pipe, task.blocker_event, r_ms, task.blocker_reason or "publish"),)
-            rec.on_admit(seq, moment, owners=owners, generation=gen, blockers=blockers)
+        rec.on_admit(seq, moment, owners=owners, generation=gen, blockers=blockers)
 
 
 class PreparedTermsRunner:

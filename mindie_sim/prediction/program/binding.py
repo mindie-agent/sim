@@ -306,6 +306,15 @@ class RecipeContext:
             return int(self.datapath.aic_count)
         return int(self.core_count)
 
+    def _units_for(self, role: str, physical: str, default: int) -> int:
+        if physical in self.resource_units:
+            return max(1, int(self.resource_units[physical]))
+        if role in self.resource_units:
+            return max(1, int(self.resource_units[role]))
+        if role.startswith("mte2") and "mte2" in self.resource_units:
+            return max(1, int(self.resource_units["mte2"]))
+        return max(1, int(default))
+
     @property
     def effective_aiv_cores(self) -> int:
         owners = self.stream_owners
@@ -313,7 +322,7 @@ class RecipeContext:
             return int(owners.aiv_limit)
         if self.datapath is not None and getattr(self.datapath, "aiv_count", None) is not None:
             return int(self.datapath.aiv_count)
-        return int(self.resource_units.get("vector", self.core_count))
+        return self._units_for("vector", self.resource_names.get("vector", "vector"), self.core_count)
 
     def bind_coupled_stream_placement(
         self, aic_role: str = "cube", aiv_role: str = "vector",
@@ -324,8 +333,8 @@ class RecipeContext:
             return {}
         aic_name = self.resource_names.get(aic_role, aic_role)
         aiv_name = self.resource_names.get(aiv_role, aiv_role)
-        aic_total = int(self.resource_units.get(aic_name, self.core_count))
-        aiv_total = int(self.resource_units.get(aiv_name, self.core_count))
+        aic_total = self._units_for(aic_role, aic_name, self.core_count)
+        aiv_total = self._units_for(aiv_role, aiv_name, self.core_count)
         aic_sub, aiv_sub = proportional_coupled_placement(
             owners.aic, owners.aiv, aic_total, aiv_total,
         )
@@ -350,7 +359,7 @@ class RecipeContext:
         if pipe_role not in self.resource_names:
             raise ModelingError(f"bind_access_pipe_missing:{pattern.pipe}")
         pipe_row = self.resource_names[pipe_role]
-        pipe_units = max(1, int(self.resource_units.get(pipe_row, 1)))
+        pipe_units = self._units_for(pattern.pipe, pipe_row, self._units_for(pipe_role, pipe_row, 1))
         pipe_rate = float(self.rates[pipe_row]) / float(pipe_units)
         hit_rate = pipe_rate if copy_hit_bytes_per_ms is None else float(copy_hit_bytes_per_ms)
         miss_rate = pipe_rate if copy_miss_bytes_per_ms is None else float(copy_miss_bytes_per_ms)
@@ -385,6 +394,7 @@ class RecipeContext:
             copy_hit_bytes_per_ms=hit_rate,
             copy_miss_bytes_per_ms=miss_rate,
             l2_bytes_per_ms=l2_rate,
+            nominal_pipe_bytes_per_ms=pipe_rate,
             pipe_row_id=pipe_row,
             l2_row_id=l2_row,
             burst_rules=burst_rules,

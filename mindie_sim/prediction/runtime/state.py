@@ -235,6 +235,7 @@ class RuntimeState:
         #: skips per-resource pinned partitions.
         self._coupled_active = 0
         self._placed_active = 0
+        self._delivery_live = 0
         #: Structural cache of validated immutable Stage declarations.  Only
         #: static work/caps/placement validation is shared; every occurrence
         #: still binds and validates its own scoped allocations.

@@ -87,6 +87,30 @@ def _measure_byte_intervals(intervals: Sequence[tuple[int, int]]) -> int:
     return sum(hi - lo for lo, hi in intervals)
 
 
+def _subtract_byte_intervals(
+    base: Sequence[tuple[int, int]], cut: Sequence[tuple[int, int]],
+) -> tuple[tuple[int, int], ...]:
+    if not base or not cut:
+        return tuple(base)
+    out: list[tuple[int, int]] = []
+    j = 0
+    for lo, hi in base:
+        cur = lo
+        while j < len(cut) and cut[j][1] <= cur:
+            j += 1
+        k = j
+        while k < len(cut) and cut[k][0] < hi:
+            if cut[k][0] > cur:
+                out.append((cur, min(hi, cut[k][0])))
+            cur = max(cur, cut[k][1])
+            if cur >= hi:
+                break
+            k += 1
+        if cur < hi:
+            out.append((cur, hi))
+    return tuple(out)
+
+
 @dataclass(frozen=True, slots=True)
 class ReuseKey:
     """Unique L2 reuse stream identity on a single physical die."""
@@ -306,7 +330,7 @@ class AddressRunPlan:
             s0 = (run.base_byte // sec) * sec
             if run.rows == 1 or run.stride_bytes == 0:
                 ivs.append((s0, _align_up(run.base_byte + run.row_bytes, sec)))
-            elif run.stride_bytes <= run.row_bytes + sec:
+            elif run.stride_bytes <= run.row_bytes:
                 end = run.base_byte + (run.rows - 1) * run.stride_bytes + run.row_bytes
                 ivs.append((s0, _align_up(end, sec)))
             elif run.rows <= _MAX_EXPLICIT_SECTOR_INTERVALS:
@@ -425,6 +449,7 @@ class BoundAccess:
     pipe_row_id: str = ""
     l2_row_id: str = ""
     row_rates: Mapping[str, float] = field(default_factory=dict)
+    bind_config: tuple[Any, ...] | None = None
 
     def stage_placement(self) -> dict[str, tuple[int, ...]]:
         """Pin the copy pipe to ``owner`` when it carries positive work."""

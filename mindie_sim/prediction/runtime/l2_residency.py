@@ -20,6 +20,8 @@ from dataclasses import dataclass
 
 from mindie_sim.schema.common import ModelingError
 from .memory_physics import (
+    AddressRun,
+    AddressRunPlan,
     BoundAccess,
     BurstTurnRule,
     ByteLedger,
@@ -32,6 +34,8 @@ from .memory_physics import (
     _intersect_byte_intervals,
     _measure_byte_intervals,
     _merge_byte_intervals,
+    _subtract_byte_intervals,
+    burst_turnaround_efficiency,
 )
 
 
@@ -228,12 +232,13 @@ class AdmissionMemoryView:
         n_eff = max(1, len(keys) + sum(1 for s in streams if s not in covered))
         avail = max(0, self._l2_capacity[key.die] - self.reserved_bytes(key.die))
         eff = self.granule_bytes * (avail // (self.granule_bytes * n_eff))
-        working_set = (
+        req_ivs = pattern.runs.sector_intervals()
+        working_set = max(
             pattern.reuse_distance_bytes
-            if pattern.reuse_distance_bytes is not None else aligned_bytes
+            if pattern.reuse_distance_bytes is not None else aligned_bytes,
+            _measure_byte_intervals(req_ivs),
         )
         existing = self._resident.get(key)
-        req_ivs = pattern.runs.sector_intervals()
         if pattern.direction == "read":
             if (
                 existing is not None and not existing.evicted
@@ -245,6 +250,44 @@ class AdmissionMemoryView:
         if pattern.visibility.private_workspace and not pattern.visibility.live_out and working_set <= eff:
             return aligned_bytes, 0
         return 0, aligned_bytes
+
+    def resident_intervals_for(
+        self, pattern: MemoryAccessPattern, aligned_bytes: int,
+    ) -> tuple[tuple[int, int], ...]:
+        """Return currently resident L2 sector intervals applicable to ``pattern``."""
+        req_ivs = pattern.runs.sector_intervals()
+        if aligned_bytes <= 0 or not req_ivs:
+            return ()
+        key = pattern.reuse_key
+        if key is None or key.die != pattern.die or key.die not in self._l2_capacity:
+            return ()
+        existing = self._resident.get(key)
+        if (
+            pattern.direction == "read" and existing is not None
+            and not existing.evicted and existing.version == pattern.version
+        ):
+            keys = set(self._active_keys.get(key.die, ()))
+            keys.add(key)
+            streams = self._active_streams.get(key.die, ())
+            covered = {k.reuse_stream for k in keys}
+            n_eff = max(1, len(keys) + sum(1 for s in streams if s not in covered))
+            avail = max(0, self._l2_capacity[key.die] - self.reserved_bytes(key.die))
+            eff = self.granule_bytes * (avail // (self.granule_bytes * n_eff))
+            ws = max(
+                pattern.reuse_distance_bytes if pattern.reuse_distance_bytes is not None else aligned_bytes,
+                _measure_byte_intervals(req_ivs),
+            )
+            if existing.working_set_bytes <= eff and ws <= eff:
+                return existing.resident_ranges
+        return ()
+
+    def miss_intervals(
+        self, pattern: MemoryAccessPattern, aligned_bytes: int,
+    ) -> tuple[tuple[int, int], ...]:
+        """Return exact missed sector byte intervals for ``pattern`` against current L2."""
+        req_ivs = pattern.runs.sector_intervals()
+        res_ivs = self.resident_intervals_for(pattern, aligned_bytes)
+        return _subtract_byte_intervals(req_ivs, res_ivs) if res_ivs else req_ivs
 
     def admit_access(
         self,
@@ -264,12 +307,13 @@ class AdmissionMemoryView:
         self._active_keys[key.die].add(key)
         self._evict_over_capacity(key.die)
         eff = self.effective_l2_bytes(key.die)
-        working_set = (
-            pattern.reuse_distance_bytes
-            if pattern.reuse_distance_bytes is not None else aligned_bytes
+        req_ivs = pattern.runs.sector_intervals()
+        req_span = _measure_byte_intervals(req_ivs)
+        working_set = max(
+            pattern.reuse_distance_bytes if pattern.reuse_distance_bytes is not None else aligned_bytes,
+            req_span,
         )
         existing = self._resident.get(key)
-        req_ivs = pattern.runs.sector_intervals()
         if pattern.direction == "read":
             if (
                 existing is not None and not existing.evicted
@@ -277,8 +321,18 @@ class AdmissionMemoryView:
             ):
                 hit_b, miss_b = self._range_hit_miss(req_ivs, existing.resident_ranges, aligned_bytes)
                 if miss_b > 0:
-                    existing.resident_ranges = _merge_byte_intervals((*existing.resident_ranges, *req_ivs))
-                    existing.working_set_bytes = max(existing.working_set_bytes, working_set)
+                    merged = _merge_byte_intervals((*existing.resident_ranges, *req_ivs))
+                    merged_b = _measure_byte_intervals(merged)
+                    if max(existing.working_set_bytes, working_set, merged_b) <= eff:
+                        existing.resident_ranges = merged
+                        existing.working_set_bytes = max(existing.working_set_bytes, working_set, merged_b)
+                    else:
+                        self._settle_eviction(existing)
+                        self._resident[key] = _ResidentL2Entry(
+                            key=key, working_set_bytes=working_set, version=pattern.version,
+                            dirty=False, private_workspace=pattern.visibility.private_workspace,
+                            evicted=False, resident_ranges=req_ivs,
+                        )
                 return hit_b, miss_b
             if working_set <= eff:
                 self._resident[key] = _ResidentL2Entry(
@@ -291,14 +345,22 @@ class AdmissionMemoryView:
             return 0, aligned_bytes
         is_priv = pattern.visibility.private_workspace and not pattern.visibility.live_out
         if is_priv and working_set <= eff:
-            prev_res = existing.resident_ranges if (existing and not existing.evicted and existing.version == pattern.version) else ()
-            prev_dirty = existing.dirty_ranges if (existing and not existing.evicted and existing.version == pattern.version) else ()
+            same = existing is not None and not existing.evicted and existing.version == pattern.version
+            prev_res = existing.resident_ranges if same else ()
+            prev_dirty = existing.dirty_ranges if same else ()
+            merged = _merge_byte_intervals((*prev_res, *req_ivs))
+            merged_b = _measure_byte_intervals(merged)
+            if same and max(existing.working_set_bytes, working_set, merged_b) <= eff:
+                res_ivs, dirty_ivs = merged, _merge_byte_intervals((*prev_dirty, *req_ivs))
+                ws_new = max(existing.working_set_bytes, working_set, merged_b)
+            else:
+                if existing is not None and not existing.evicted:
+                    self._settle_eviction(existing)
+                res_ivs, dirty_ivs, ws_new = req_ivs, req_ivs, working_set
             self._resident[key] = _ResidentL2Entry(
-                key=key, working_set_bytes=working_set, version=pattern.version,
+                key=key, working_set_bytes=ws_new, version=pattern.version,
                 dirty=True, private_workspace=True, evicted=False,
-                resident_ranges=_merge_byte_intervals((*prev_res, *req_ivs)),
-                dirty_ranges=_merge_byte_intervals((*prev_dirty, *req_ivs)),
-                has_future_reader=True,
+                resident_ranges=res_ivs, dirty_ranges=dirty_ivs, has_future_reader=True,
             )
             return aligned_bytes, 0
         if working_set <= eff:
@@ -310,6 +372,51 @@ class AdmissionMemoryView:
         elif existing is not None:
             self._settle_eviction(existing)
         return 0, aligned_bytes
+
+
+def _missed_dram_sector_and_service(
+    plan: AddressRunPlan,
+    resident_ivs: tuple[tuple[int, int], ...],
+    burst_rules: Sequence[BurstTurnRule],
+) -> tuple[int, float]:
+    """Compute exact DRAM sector & burst-adjusted bytes over missed run intervals."""
+    if not resident_ivs:
+        return plan.dram_sector_and_service(burst_rules)
+    sec = plan.sector_bytes
+    seen_aliases: set[str] = set()
+    covered = resident_ivs
+    sector_total = 0
+    service_total = 0.0
+    for run in plan.runs:
+        if run.rows == 0 or run.row_bytes == 0:
+            continue
+        if run.proven_alias_group is not None:
+            if run.proven_alias_group in seen_aliases:
+                continue
+            seen_aliases.add(run.proven_alias_group)
+        run_ivs = AddressRunPlan(
+            (run,), alignment_bytes=plan.alignment_bytes, sector_bytes=sec,
+        ).sector_intervals()
+        missed = _subtract_byte_intervals(run_ivs, covered)
+        if not missed:
+            continue
+        for lo, hi in missed:
+            span = hi - lo
+            if run.stride_bytes == 0:
+                stride_eff = 0
+            elif run.stride_bytes > run.row_bytes:
+                stride_eff = run.stride_bytes
+            else:
+                stride_eff = span
+            eta = burst_turnaround_efficiency(span, stride_eff, burst_rules)
+            sector_total += span
+            service_total += float(span) / eta
+        covered = _merge_byte_intervals((*covered, *missed))
+    if sector_total > 0 and plan.scale_bytes > 0:
+        scale_sec = ((plan.scale_bytes + sec - 1) // sec) * sec
+        sector_total += scale_sec
+        service_total += float(scale_sec)
+    return sector_total, service_total
 
 
 def bind_memory_access(
@@ -324,12 +431,23 @@ def bind_memory_access(
     l2_row_id: str,
     burst_rules: Sequence[BurstTurnRule] = (),
     commit: bool = False,
+    nominal_pipe_bytes_per_ms: float | None = None,
 ) -> BoundAccess:
     """Bind one ``MemoryAccessPattern`` into exact 3-ledger audit and row terms."""
     if hbm_bus.die != pattern.die:
         raise ModelingError(f"hbm_bus_die_mismatch:{hbm_bus.die}!={pattern.die}")
     if copy_hit_bytes_per_ms <= 0.0 or copy_miss_bytes_per_ms <= 0.0 or l2_bytes_per_ms <= 0.0:
         raise ModelingError("bind_access_pipe_rate_nonpositive")
+    nom_pipe = (
+        float(nominal_pipe_bytes_per_ms)
+        if nominal_pipe_bytes_per_ms is not None else float(copy_hit_bytes_per_ms)
+    )
+    if nom_pipe <= 0.0:
+        raise ModelingError("bind_access_pipe_rate_nonpositive")
+    bind_cfg = (
+        hbm_bus, float(copy_hit_bytes_per_ms), float(copy_miss_bytes_per_ms),
+        float(l2_bytes_per_ms), pipe_row_id, l2_row_id, tuple(burst_rules), nom_pipe,
+    )
 
     aligned_bytes = pattern.runs.aligned_copy_bytes()
     if aligned_bytes == 0:
@@ -342,8 +460,10 @@ def bind_memory_access(
         return BoundAccess(
             ledger=ledger, constraints=(), deliveries=(), after=after,
             owner=pattern.owner, pipe_row_id=pipe_row_id, l2_row_id=l2_row_id,
+            bind_config=bind_cfg,
         )
 
+    res_ivs = state.resident_intervals_for(pattern, aligned_bytes) if state is not None else ()
     if state is not None:
         hit_bytes, miss_bytes = (
             state.admit_access(pattern, aligned_bytes)
@@ -353,11 +473,12 @@ def bind_memory_access(
         hit_bytes, miss_bytes = 0, aligned_bytes
 
     if miss_bytes > 0:
-        sector_bytes, dram_service_bytes = pattern.runs.dram_sector_and_service(burst_rules)
-        if hit_bytes > 0 and aligned_bytes > 0:
-            miss_ratio = float(miss_bytes) / float(aligned_bytes)
-            sector_bytes = int(round(sector_bytes * miss_ratio))
-            dram_service_bytes *= miss_ratio
+        if hit_bytes > 0 and res_ivs:
+            sector_bytes, dram_service_bytes = _missed_dram_sector_and_service(
+                pattern.runs, res_ivs, burst_rules,
+            )
+        else:
+            sector_bytes, dram_service_bytes = pattern.runs.dram_sector_and_service(burst_rules)
     else:
         sector_bytes = 0
         dram_service_bytes = 0.0
@@ -379,9 +500,7 @@ def bind_memory_access(
     row_rates: dict[str, float] = {}
     if pipe_ms > 0.0:
         constraints.append(ConstraintTerm(pipe_row_id, pipe_ms))
-        row_rates[pipe_row_id] = (
-            copy_miss_bytes_per_ms if miss_bytes >= hit_bytes else copy_hit_bytes_per_ms
-        )
+        row_rates[pipe_row_id] = nom_pipe
     if hit_bytes > 0:
         constraints.append(ConstraintTerm(l2_row_id, float(hit_bytes) / l2_bytes_per_ms))
         row_rates[l2_row_id] = l2_bytes_per_ms
@@ -401,7 +520,7 @@ def bind_memory_access(
     return BoundAccess(
         ledger=ledger, constraints=tuple(constraints), deliveries=tuple(deliveries),
         after=after, owner=pattern.owner, pipe_row_id=pipe_row_id,
-        l2_row_id=l2_row_id, row_rates=row_rates,
+        l2_row_id=l2_row_id, row_rates=row_rates, bind_config=bind_cfg,
     )
 
 

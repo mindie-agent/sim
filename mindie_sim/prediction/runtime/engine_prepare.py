@@ -92,10 +92,12 @@ class _EnginePrepareMixin:
         memory_bindings: Mapping[str, Mapping] | None = None,
         native_hook: bool = False,
         deliveries: Sequence[tuple[str, float]] = (),
+        latency_from_first_service: bool = False,
     ) -> Event:
         if (work is None and latency == 0.0 and caps is None and not acquire
                 and not free and placement is None and not coupled
-                and cohort_size == 1 and not cohort_widened and not cohort_members):
+                and cohort_size == 1 and not cohort_widened and not cohort_members
+                and not latency_from_first_service):
             prepared = _EMPTY_TASK
         else:
             prepared = self._prepare(
@@ -103,6 +105,7 @@ class _EnginePrepareMixin:
                 placement=placement, coupled=coupled, priority=priority,
                 cohort_size=cohort_size, cohort_widened=cohort_widened,
                 cohort_members=cohort_members,
+                latency_from_first_service=latency_from_first_service,
             )
         return self._submit_prepared(
             prepared, name, after=after, release=release, owner=owner,
@@ -116,16 +119,19 @@ class _EnginePrepareMixin:
         self, name, work=None, *, latency=0.0, caps=None, acquire=(), free=(),
         placement=None, coupled=False, priority=0, cohort_size=1,
         cohort_widened=None, cohort_members=None,
+        latency_from_first_service=False,
     ) -> _PreparedTask:
         """Validate a template against this engine's physical resource binding."""
         if (work is None and latency == 0 and caps is None and acquire == ()
                 and free == () and placement is None and not coupled
-                and cohort_size == 1 and not cohort_widened and not cohort_members):
+                and cohort_size == 1 and not cohort_widened and not cohort_members
+                and not latency_from_first_service):
             return _EMPTY_TASK
         if (work is not None and work.__class__ is dict and not caps
                 and not acquire and not free and placement is None
                 and not coupled and latency == 0.0 and not priority
-                and cohort_size == 1 and not cohort_widened and not cohort_members):
+                and cohort_size == 1 and not cohort_widened and not cohort_members
+                and not latency_from_first_service):
             # Ordinary finite work on declared resources: the same checks as
             # the general path, without building the four unused structures.
             resources = self.resources
@@ -314,7 +320,8 @@ class _EnginePrepareMixin:
             priority, cohort_size, (), (), acq_pools, 0, fits_empty,
             c_demand, c_cap_limit, c_solo_rates, demand_keys,
             s_rates, c_res_info, u_res_info,
-            _compute_pool_unit_masks(acq_t), norm_widened, norm_members)
+            _compute_pool_unit_masks(acq_t), norm_widened, norm_members,
+            bool(latency_from_first_service))
 
     @staticmethod
     def clone_prepared_scoped(static: _PreparedTask,
@@ -330,7 +337,8 @@ class _EnginePrepareMixin:
             static.coupled_cap_limit, static.coupled_solo_rates,
             static.demand_keys, static.solo_rates,
             static.coupled_res_info, static.uncoupled_res_info,
-            static.pool_unit_masks, static.cohort_widened, static.cohort_members)
+            static.pool_unit_masks, static.cohort_widened, static.cohort_members,
+            static.latency_from_first_service)
 
     def prepared_stage(self, stage, acquire=(), free=()):
         """Validate one immutable Stage declaration, caching its static part.
@@ -370,13 +378,14 @@ class _EnginePrepareMixin:
             stg_free = lookup_stage.free
             free_sig = (tuple((a.pool, a.size, a.units) for a in stg_free)
                         if stg_free else ())
+            lffs = bool(getattr(lookup_stage, "latency_from_first_service", False))
             proto_cache = self._stage_proto_prepared
             proto_key = (id(lookup_stage.work), id(lookup_stage.caps),
                          id(lookup_stage.placement),
                          lookup_stage.name, lookup_stage.latency,
                          lookup_stage.coupled, lookup_stage.priority,
                          cohort_size, cohort_widened, members_sig,
-                         acq_sig, free_sig)
+                         acq_sig, free_sig, lffs)
             phit = proto_cache.get(proto_key)
             if (phit is not None and phit[0] is lookup_stage.work
                     and phit[1] is lookup_stage.caps
@@ -388,7 +397,7 @@ class _EnginePrepareMixin:
                        tuple((name, units)
                              for name, units in lookup_stage.placement.items()),
                        lookup_stage.coupled, lookup_stage.priority, cohort_size,
-                       cohort_widened, members_sig, acq_sig, free_sig)
+                       cohort_widened, members_sig, acq_sig, free_sig, lffs)
                 cache = self._stage_prepared
                 static_base = cache.get(key)
                 if static_base is None:
@@ -401,7 +410,8 @@ class _EnginePrepareMixin:
                         priority=lookup_stage.priority,
                         cohort_size=cohort_size,
                         cohort_widened=cohort_widened or None,
-                        cohort_members=raw_members or None)
+                        cohort_members=raw_members or None,
+                        latency_from_first_service=lffs)
                     object.__setattr__(static_base, "static_id", id(static_base))
                     if len(cache) >= 16384:
                         cache.clear()
@@ -429,7 +439,8 @@ class _EnginePrepareMixin:
                     static_base.coupled_res_info,
                     static_base.uncoupled_res_info,
                     static_base.pool_unit_masks,
-                    static_base.cohort_widened, static_base.cohort_members)
+                    static_base.cohort_widened, static_base.cohort_members,
+                    static_base.latency_from_first_service)
             if len(id_cache) >= 16384:
                 id_cache.clear()
             id_cache[id(lookup_stage)] = (weakref.ref(lookup_stage), static)
@@ -446,7 +457,8 @@ class _EnginePrepareMixin:
                 static.coupled_cap_limit, static.coupled_solo_rates,
                 _EMPTY_FROZENSET, static.solo_rates,
                 static.coupled_res_info, static.uncoupled_res_info, (),
-                static.cohort_widened, static.cohort_members)
+                static.cohort_widened, static.cohort_members,
+                static.latency_from_first_service)
         if acquire.__class__ is not tuple:
             acquire = tuple(acquire)
         if free.__class__ is not tuple:
@@ -460,7 +472,8 @@ class _EnginePrepareMixin:
                 static.coupled_cap_limit, static.coupled_solo_rates,
                 _EMPTY_FROZENSET, static.solo_rates,
                 static.coupled_res_info, static.uncoupled_res_info, (),
-                static.cohort_widened, static.cohort_members)
+                static.cohort_widened, static.cohort_members,
+                static.latency_from_first_service)
         static_acq = static.acquire
         n_acq = len(acquire)
         if n_acq == len(static_acq):
@@ -522,7 +535,8 @@ class _EnginePrepareMixin:
                 static.coupled_cap_limit, static.coupled_solo_rates,
                 frozenset(k for k, _ in demands_tuple), static.solo_rates,
                 static.coupled_res_info, static.uncoupled_res_info,
-                p_masks_1, static.cohort_widened, static.cohort_members)
+                p_masks_1, static.cohort_widened, static.cohort_members,
+                static.latency_from_first_service)
         pools = self.pools
         pool_units = self.pool_units
         demands = {}
@@ -560,17 +574,19 @@ class _EnginePrepareMixin:
             frozenset(demands), static.solo_rates,
             static.coupled_res_info, static.uncoupled_res_info,
             _compute_pool_unit_masks(acquire),
-            static.cohort_widened, static.cohort_members)
+            static.cohort_widened, static.cohort_members,
+            static.latency_from_first_service)
 
     def prepare_stage(self, name, work=None, *, latency=0.0, caps=None,
                       acquire=(), free=(), placement=None, coupled=False,
                       priority=0, cohort_size=1, cohort_widened=None,
-                      cohort_members=None):
+                      cohort_members=None, latency_from_first_service=False):
         return self._prepare(
             name, work, latency=latency, caps=caps, acquire=acquire,
             free=free, placement=placement, coupled=coupled, priority=priority,
             cohort_size=cohort_size, cohort_widened=cohort_widened,
-            cohort_members=cohort_members)
+            cohort_members=cohort_members,
+            latency_from_first_service=latency_from_first_service)
 
     def submit_prepared(self, prepared, name: str, *, after=(), release=None,
                         owner="", metadata=None, on_complete=None,

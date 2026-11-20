@@ -187,6 +187,7 @@ def _fold_kernel_stages(stages: tuple[Stage, ...]) -> tuple[Stage, ...]:
             empty_ctrl = (
                 s.program is None and not any(s.work.values()) and not any(s.caps.values())
                 and s.latency <= 0.0 and not s.coupled and s.priority == 0
+                and not s.metadata and not s.deliveries
             )
             if empty_ctrl and s.acquire and not s.free and len(consumers[s.name]) == 1:
                 succ_idx = consumers[s.name][0]
@@ -224,6 +225,8 @@ def _fold_kernel_stages(stages: tuple[Stage, ...]) -> tuple[Stage, ...]:
                     and s.caps == succ.caps and s.placement == succ.placement
                     and s.priority == succ.priority and s.work_units == succ.work_units
                     and s.metadata == succ.metadata
+                    and not s.deliveries and not succ.deliveries
+                    and not s.latency_from_first_service and not succ.latency_from_first_service
                 ):
                     rname = next(iter(s.work))
                     w1, w2 = s.work[rname], succ.work[rname]
