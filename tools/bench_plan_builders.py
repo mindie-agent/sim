@@ -402,98 +402,61 @@ def attention_shape_dims(
         seq_len = max((int(q) + int(c) for q, c in reqs), default=max(1, int(kv_length or tokens)))
         q_len = max((int(q) for q, _ in reqs), default=max(1, tokens // max(1, s_cnt)))
         heads = int(gqa.get("query_heads") or 1)
-        return {
-            "tokens": tokens, "sequences": s_cnt, "q_len": q_len, "kv_len": seq_len,
-            "is_prefill": is_prefill, "heads": heads,
-            "kv_heads": int(gqa.get("kv_heads") or heads),
-            "seq_len": seq_len, "head_dim": int(gqa.get("head_dim") or _DEFAULT_HEAD_DIM),
-        }
+        return {"tokens": tokens, "sequences": s_cnt, "q_len": q_len, "kv_len": seq_len, "is_prefill": is_prefill,
+                "heads": heads, "kv_heads": int(gqa.get("kv_heads") or heads), "seq_len": seq_len,
+                "head_dim": int(gqa.get("head_dim") or _DEFAULT_HEAD_DIM)}
     mla = raw_meta.get("paged_mla_geometry")
     if isinstance(mla, Mapping):
-        kvs = mla.get("kv_lengths") or ()
-        ctxs = mla.get("contexts") or ()
-        s_cnt = len(kvs) or len(ctxs) or seqs_val
-        tokens = int(dims[0]) if dims else s_cnt
+        kvs, ctxs = mla.get("kv_lengths") or (), mla.get("contexts") or ()
+        s_cnt, tokens = len(kvs) or len(ctxs) or seqs_val, int(dims[0]) if dims else (len(kvs) or len(ctxs) or seqs_val)
         heads = int(mla.get("logical_heads") or mla.get("heads") or 1)
-        seq_len = (
-            max((int(v) for v in kvs), default=1)
-            if kvs else max((int(c) + 1 for c in ctxs), default=max(1, int(kv_length or 1)))
-        )
+        seq_len = (max((int(v) for v in kvs), default=1) if kvs
+                   else max((int(c) + 1 for c in ctxs), default=max(1, int(kv_length or 1))))
         abi = raw_meta.get("native_attention_abi")
         latent = int(abi.get("latent_width") or _MLA_LATENT_DIM) if isinstance(abi, Mapping) else _MLA_LATENT_DIM
-        return {
-            "tokens": tokens, "sequences": s_cnt,
-            "q_len": max(1, tokens // max(1, s_cnt)), "kv_len": seq_len,
-            "is_prefill": is_prefill, "heads": heads, "kv_heads": 1,
-            "seq_len": seq_len, "head_dim": latent,
-        }
+        return {"tokens": tokens, "sequences": s_cnt, "q_len": max(1, tokens // max(1, s_cnt)), "kv_len": seq_len,
+                "is_prefill": is_prefill, "heads": heads, "kv_heads": 1, "seq_len": seq_len, "head_dim": latent}
     idx = raw_meta.get("indexed_attention_geometry")
     if isinstance(idx, Mapping):
         seqs = idx.get("sequences") or ()
         s_cnt = len(seqs) if seqs else seqs_val
-        tokens = (
-            sum(int(q) for q, _ in seqs)
-            if seqs else int(idx.get("query") or (dims[0] if dims else 0))
-        )
-        seq_len = (
-            max((int(q) + int(c) for q, c in seqs), default=1)
-            if seqs else max(1, int(idx.get("query") or 0) + int(idx.get("context") or 0))
-        )
+        tokens = sum(int(q) for q, _ in seqs) if seqs else int(idx.get("query") or (dims[0] if dims else 0))
+        seq_len = (max((int(q) + int(c) for q, c in seqs), default=1) if seqs
+                   else max(1, int(idx.get("query") or 0) + int(idx.get("context") or 0)))
         q_len = max((int(q) for q, _ in seqs), default=max(1, tokens // max(1, s_cnt)))
-        return {
-            "tokens": tokens, "sequences": s_cnt, "q_len": q_len, "kv_len": seq_len,
-            "is_prefill": is_prefill, "heads": int(idx.get("heads") or 1),
-            "kv_heads": 1, "seq_len": seq_len,
-            "head_dim": int(idx.get("latent") or _MLA_LATENT_DIM),
-        }
+        return {"tokens": tokens, "sequences": s_cnt, "q_len": q_len, "kv_len": seq_len, "is_prefill": is_prefill,
+                "heads": int(idx.get("heads") or 1), "kv_heads": 1, "seq_len": seq_len,
+                "head_dim": int(idx.get("latent") or _MLA_LATENT_DIM)}
     tv = raw_meta.get("attention_tensor_view")
     if isinstance(tv, Mapping):
         q_sh = tuple(int(x) for x in (tv.get("query_shape") or ()) if isinstance(x, int))
         k_sh = tuple(int(x) for x in (tv.get("key_shape") or tv.get("cache_head_shape") or ()) if isinstance(x, int))
         kvs = tv.get("kv_lengths") or ()
-        s_cnt = len(kvs) if kvs else seqs_val
-        tokens = q_sh[0] if q_sh else (int(dims[0]) if dims else 0)
+        s_cnt, tokens = (len(kvs) if kvs else seqs_val), (q_sh[0] if q_sh else (int(dims[0]) if dims else 0))
         heads = q_sh[1] if len(q_sh) >= 2 else 1
         head_dim = q_sh[-1] if len(q_sh) >= _Q_VIEW_RANK_3D else _DEFAULT_HEAD_DIM
         kv_heads = k_sh[_KV_HEAD_AXIS] if len(k_sh) >= 2 else 1
-        seq_len = (
-            max((int(v) for v in kvs), default=1)
-            if kvs else (k_sh[0] if len(k_sh) == _Q_VIEW_RANK_3D else (
-                int(kv_length) if kv_length is not None else (int(dims[1]) if len(dims) >= _Q_VIEW_RANK_4D else max(1, tokens))))
-        )
-        return {
-            "tokens": tokens, "sequences": s_cnt,
-            "q_len": max(1, tokens // max(1, s_cnt)), "kv_len": seq_len,
-            "is_prefill": is_prefill, "heads": heads, "kv_heads": kv_heads,
-            "seq_len": seq_len, "head_dim": head_dim,
-        }
+        seq_len = (max((int(v) for v in kvs), default=1) if kvs else (k_sh[0] if len(k_sh) == _Q_VIEW_RANK_3D else (
+            int(kv_length) if kv_length is not None else (int(dims[1]) if len(dims) >= _Q_VIEW_RANK_4D else max(1, tokens)))))
+        return {"tokens": tokens, "sequences": s_cnt, "q_len": max(1, tokens // max(1, s_cnt)), "kv_len": seq_len,
+                "is_prefill": is_prefill, "heads": heads, "kv_heads": kv_heads, "seq_len": seq_len, "head_dim": head_dim}
     tokens = int(dims[0]) if dims else 0
-    heads = int(
-        raw_meta.get("heads")
-        or (dims[2] if len(dims) >= _Q_VIEW_RANK_4D else (dims[1] if len(dims) > 1 else 1))
-    )
-    seq_len = (
-        int(kv_length) if kv_length is not None
-        else (int(dims[1]) if len(dims) >= _Q_VIEW_RANK_4D
-              else int(raw_meta.get("seq_len") or (dims[2] if len(dims) > 2 else max(1, tokens))))
-    )
-    return {
-        "tokens": tokens, "sequences": seqs_val,
-        "q_len": max(1, tokens // seqs_val), "kv_len": seq_len,
-        "is_prefill": is_prefill, "heads": heads,
-        "kv_heads": int(raw_meta.get("key_heads") or heads),
-        "seq_len": seq_len,
-        "head_dim": int(dims[3]) if len(dims) > _Q_VIEW_RANK_3D else int(raw_meta.get("head_dim") or _DEFAULT_HEAD_DIM),
-    }
+    heads = int(raw_meta.get("heads") or (dims[2] if len(dims) >= _Q_VIEW_RANK_4D else (dims[1] if len(dims) > 1 else 1)))
+    seq_len = (int(kv_length) if kv_length is not None else (int(dims[1]) if len(dims) >= _Q_VIEW_RANK_4D
+               else int(raw_meta.get("seq_len") or (dims[2] if len(dims) > 2 else max(1, tokens)))))
+    return {"tokens": tokens, "sequences": seqs_val, "q_len": max(1, tokens // seqs_val), "kv_len": seq_len,
+            "is_prefill": is_prefill, "heads": heads, "kv_heads": int(raw_meta.get("key_heads") or heads),
+            "seq_len": seq_len, "head_dim": int(dims[3]) if len(dims) > _Q_VIEW_RANK_3D else int(raw_meta.get("head_dim") or _DEFAULT_HEAD_DIM)}
 
 
 _FABRIC_OP_FAMILIES = {
     "all_reduce": "allreduce", "quantized_all_reduce": "allreduce",
     "all_gather": "allgather", "reduce_scatter": "reduce_scatter",
     "all_to_all": "alltoall", "all_to_all_v": "alltoallv",
-    "p2p_send_recv": "pp_p2p",
+    "p2p_send_recv": "pp_p2p", "send_recv": "pp_p2p",
 }
-_CROSS_NODE_LINK_MARKERS = ("inter_node", "inter_pod", "roce", "rdma", "scaleout", "scale_out")
+_ROCE_STRICT_MARKERS = ("roce", "rdma", "scaleout", "scale_out")
+_CROSS_NODE_LINK_MARKERS = (*_ROCE_STRICT_MARKERS, "inter_node", "inter_pod")
 
 
 def resolve_fabric_collective_abi(collective_op: str) -> tuple[str, str]:
@@ -505,7 +468,26 @@ def resolve_fabric_collective_abi(collective_op: str) -> tuple[str, str]:
     return resolve_builder_strict(family, op, "", ("fp32",))
 
 
-def _machine_topology(hardware: Mapping[str, Any], machine: Any | None) -> tuple[list[list[int]], list[list[int]], bool, set[int] | None]:
+def _inter_link_groups(links: Sequence[Any], rank_node: Mapping[int, int]) -> list[list[list[int]]]:
+    strict_groups: list[list[list[int]]] = []
+    generic_groups: list[list[list[int]]] = []
+    for lnk in links:
+        text = (f"{lnk.get('channel', '')} {lnk.get('name', '')}" if isinstance(lnk, Mapping)
+                else f"{getattr(lnk, 'channel', '')} {getattr(lnk, 'name', '')}").lower()
+        raw_members = lnk.get("members", ()) if isinstance(lnk, Mapping) else getattr(lnk, "members", ())
+        members = sorted({int(r) for r in (raw_members or ()) if int(r) in rank_node})
+        nids = sorted({rank_node[r] for r in members})
+        if len(nids) < 2:
+            continue
+        grouped = [[r for r in members if rank_node[r] == nid] for nid in nids]
+        if any(m in text for m in _ROCE_STRICT_MARKERS):
+            strict_groups.append(grouped)
+        elif any(m in text for m in _CROSS_NODE_LINK_MARKERS):
+            generic_groups.append(grouped)
+    return strict_groups + generic_groups
+
+
+def _machine_topology(hardware: Mapping[str, Any], machine: Any | None) -> tuple[list[list[int]], list[list[int]], list[list[list[int]]], bool, set[int] | None]:
     if machine is not None:
         dies = list(getattr(machine, "dies", ()) or ())
         node_ids = sorted({int(getattr(d, "node", 0)) for d in dies})
@@ -513,13 +495,8 @@ def _machine_topology(hardware: Mapping[str, Any], machine: Any | None) -> tuple
         by_node = [sorted(int(d.rank) for d in dies if int(getattr(d, "node", 0)) == n) for n in node_ids]
         by_pkg = [sorted(int(d.rank) for d in dies if (int(getattr(d, "node", 0)), int(getattr(d, "package", 0))) == k) for k in pkg_keys]
         rank_node = {int(d.rank): int(getattr(d, "node", 0)) for d in dies}
-        links = list(getattr(machine, "links", ()) or ())
-        has_inter = any(
-            len({rank_node[int(r)] for r in getattr(lnk, "members", ()) if int(r) in rank_node}) >= 2
-            and any(m in f"{getattr(lnk, 'channel', '')} {getattr(lnk, 'name', '')}".lower() for m in _CROSS_NODE_LINK_MARKERS)
-            for lnk in links
-        )
-        return by_node, by_pkg, has_inter, {int(d.rank) for d in dies}
+        inter = _inter_link_groups(list(getattr(machine, "links", ()) or ()), rank_node)
+        return by_node, by_pkg, inter, bool(inter), {int(d.rank) for d in dies}
     raw_by_node = hardware.get("ranks_by_node")
     raw_by_pkg = hardware.get("package_ranks")
     raw_ranks = hardware.get("ranks")
@@ -527,11 +504,14 @@ def _machine_topology(hardware: Mapping[str, Any], machine: Any | None) -> tuple
     if raw_by_node is not None:
         by_node = [[int(r) for r in grp] for grp in raw_by_node]
         by_pkg = [[int(r) for r in grp] for grp in (raw_by_pkg or ())]
-        has_inter = bool(hardware.get("has_inter_node_link", len(by_node) >= 2))
+        rank_node = {r: idx for idx, grp in enumerate(by_node) for r in grp}
+        declared_links = hardware.get("declared_links")
+        inter = _inter_link_groups(declared_links, rank_node) if declared_links is not None else []
+        has_inter = bool(inter) if declared_links is not None else bool(hardware.get("has_inter_node_link", len(by_node) >= 2))
         if avail is None:
             avail = {r for grp in by_node for r in grp}
-        return by_node, by_pkg, has_inter, avail
-    return [], [], bool(hardware.get("has_inter_node_link", True)), avail
+        return by_node, by_pkg, inter, has_inter, avail
+    return [], [], [], bool(hardware.get("has_inter_node_link", True)), avail
 
 
 def fabric_route_ranks(
@@ -552,7 +532,7 @@ def fabric_route_ranks(
         raise BenchGeometryError(f"fabric_dies_per_node_invalid:{raw_node}:per_pkg={raw_pkg}")
     if raw_node % raw_pkg != 0:
         raise BenchGeometryError(f"fabric_node_not_divisible_by_package:dies_per_node={raw_node},dies_per_package={raw_pkg}")
-    by_node, by_pkg, has_inter, declared_avail = _machine_topology(hardware, machine)
+    by_node, by_pkg, inter_groups, has_inter, declared_avail = _machine_topology(hardware, machine)
     if route_key == "intra_package_die":
         if raw_pkg < 2 or participants > raw_pkg:
             raise BenchGeometryError(f"fabric_intra_package_unrealizable:participants={participants},dies_per_package={raw_pkg}")
@@ -584,7 +564,16 @@ def fabric_route_ranks(
         if declared_nodes < 2 or not has_inter:
             raise BenchTopologyError(f"fabric_inter_node_requires_multi_node:nodes={declared_nodes}")
         half, rem = participants // 2, participants - (participants // 2)
-        if by_node:
+        if inter_groups:
+            chosen_pair = next(
+                ((ga, gb) for grp in inter_groups for i, ga in enumerate(grp)
+                 for gb in grp[i + 1 :] if len(ga) >= half and len(gb) >= rem),
+                None,
+            )
+            if chosen_pair is None:
+                raise BenchGeometryError(f"fabric_inter_node_half_exceeds_node:half={rem}")
+            ranks = [*chosen_pair[0][:half], *chosen_pair[1][:rem]]
+        elif by_node:
             if len(by_node[0]) < half or len(by_node[1]) < rem:
                 raise BenchGeometryError(f"fabric_inter_node_half_exceeds_node:half={rem},node_dies={len(by_node[0])}")
             ranks = [*by_node[0][:half], *by_node[1][:rem]]
@@ -696,15 +685,20 @@ def resolve_collective_group_ranks(
         return None
     cosets = resolve_collective_cosets(topology, metadata, stage)
     declared = metadata.get("group_ranks")
+    meta_rank = metadata.get("physical_rank")
+    if meta_rank is None:
+        meta_rank = metadata.get("rank")
     if declared is not None:
         members = tuple(int(r) for r in declared)
         matched = next((grp for grp in cosets if len(grp) == len(members) and set(grp) == set(members)), None)
         if matched is None:
             raise BenchTopologyError(f"collective_declared_group_unmatched:declared={list(members)},cosets={cosets}")
+        if meta_rank is not None and int(meta_rank) not in matched:
+            raise BenchTopologyError(f"collective_metadata_rank_not_in_declared_group:rank={meta_rank},declared={list(members)}")
         if rank is not None and int(rank) not in matched:
             raise BenchTopologyError(f"collective_rank_not_in_declared_group:rank={rank},declared={list(members)}")
         return list(matched)
-    target = int(rank) if rank is not None else int(metadata.get("physical_rank", metadata.get("rank", 0)))
+    target = int(rank) if rank is not None else int(meta_rank if meta_rank is not None else 0)
     chosen = next((grp for grp in cosets if target in grp), None)
     if chosen is None:
         raise BenchTopologyError(f"collective_rank_not_in_cosets:rank={target},stage={stage},cosets={cosets}")

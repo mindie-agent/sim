@@ -503,13 +503,17 @@ def explicit_ledger(
         raise PlanError(f"explicit_ledger_slot_plan_mismatch:{resolved.logical_experts}:{resolved.ranks}")
     base = int(resolved.base_slots_by_rank[0])
     rank_rows = [[0] * len(resolved.expert_ids_by_rank[r]) for r in range(ep)]
-    primary_slot = {
-        expert: (expert // base, resolved.expert_ids_by_rank[expert // base].index(expert))
-        for expert in range(experts)
-    }
-    for ids in topk_ids:
-        for expert in ids:
-            owner_rank, slot_index = primary_slot[int(expert)]
+    copy_index: dict[int, tuple[tuple[int, int], ...]] = {}
+    for rank_idx, ids in enumerate(resolved.expert_ids_by_rank):
+        for pos, eid in enumerate(ids):
+            copy_index.setdefault(int(eid), ())
+            copy_index[int(eid)] = (*copy_index[int(eid)], (rank_idx, pos))
+    for expert in range(experts):
+        copies = copy_index.get(expert, ())
+        if not copies:
+            raise PlanError(f"explicit_ledger_expert_unplaced:{expert}")
+        for offset in range(declared[expert]):
+            owner_rank, slot_index = copies[offset % len(copies)]
             rank_rows[owner_rank][slot_index] += 1
     local_rows = list(rank_rows[0])
     return {

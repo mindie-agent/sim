@@ -143,17 +143,18 @@ def speculative_state_plan(
     )
     state_bytes = float(exact_element_bytes(recurrent_elements, state_dtype))
     conv_raw = int(getattr(layer, "conv_state_elements", 0) or 0)
-    conv_width, kernel, conv_dtype = _conv_geometry(layer, parallel, shards)
-    conv_element = float(dtype_bytes(conv_dtype))
-    history = int(contract.get("kernel_history", kernel))
-    history = max(1, history)
+    local_conv = _ceil_div(conv_raw, total_shards)
+    kernel = max(1, int(getattr(layer, "conv_kernel", 0) or 1))
+    conv_dtype = str(getattr(layer, "conv_state_dtype", "") or "bf16")
+    slice_width = _ceil_div(local_conv, kernel) if local_conv > 0 else 0
+    history = max(1, int(contract.get("kernel_history", kernel)))
     conv_snapshots = int(contract.get("conv_snapshot_slots", 0) or 0)
+    base_conv_elements = local_conv if history == kernel else slice_width * history
     if conv_snapshots > 0:
-        conv_bytes = float(conv_snapshots) * conv_width * history * conv_element
-    elif q == 1 and history == kernel:
-        conv_bytes = float(exact_element_bytes(_ceil_div(conv_raw, total_shards), conv_dtype))
+        conv_bytes = float(exact_element_bytes(conv_snapshots * base_conv_elements, conv_dtype))
     else:
-        conv_bytes = float(history + q - 1) * conv_width * conv_element
+        rollback_elements = (q - 1) * slice_width if q > 1 else 0
+        conv_bytes = float(exact_element_bytes(base_conv_elements + rollback_elements, conv_dtype))
     transient = float(contract.get("transient_bytes", 0) or 0)
     if q <= 1:
         return SpeculativeStatePlan(

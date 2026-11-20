@@ -41,11 +41,13 @@ from mindie_sim.catalog.cache_pools import (
     target_mla_page_bytes,
 )
 from mindie_sim.catalog.hf_value_formats import model_value_formats
+from mindie_sim.catalog.speculative_state import speculative_state_plan
 from mindie_sim.catalog.types import AuxiliarySpec, DraftSpec, QuantSpec
 from mindie_sim.catalog.weight_layer_terms import layer_weight_terms
 from mindie_sim.compose import compose_case
 from mindie_sim.model_catalog import CATALOG, MODEL_ALIASES, load_model
-from mindie_sim.prediction.local_tp_groups import collective_requires_cohort, expert_tp_groups
+from mindie_sim.prediction.expert_slot_work import physical_slot_work
+from mindie_sim.prediction.local_tp_groups import collective_requires_cohort, expert_tp_groups, local_tp_groups
 from mindie_sim.prediction.operator_analysis import synchronize_moe_allgather_cohort
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.prediction.topology import Topology
@@ -182,6 +184,18 @@ def test_cache_pools_integer_ceiling_arithmetic_and_breakdown_consistency() -> N
     assert breakdown["by_component"]["recurrent_state"] + breakdown["by_component"]["conv_state"] == 20.0
     assert breakdown["by_component"]["draft_kv"] == 2 * 160.0
     assert breakdown["total_bytes"] == 8788.0
+    # Per-layer catalog row report matches packed INT8 MLA capacity row width (528 B).
+    assert weights.cache_row_bytes_by_layer(base_model)[0] == (0, 528)
+    # Explicit interleave=128 overrides runtime.kv_block_size=16; omitted interleave uses runtime block size.
+    rt_b16 = SimpleNamespace(kv_block_size=16, metadata=())
+    bd_explicit = cache.request_cache_breakdown(base_model, par_dcp2, 32, interleave=128, runtime=rt_b16)
+    bd_default = cache.request_cache_breakdown(base_model, par_dcp2, 32, runtime=rt_b16)
+    assert bd_explicit["by_component"]["mla_kv"] == 67584.0
+    assert bd_default["by_component"]["mla_kv"] == 8448.0
+    # KDA rollback q=1 -> q=2 preserves integer-sized base conv history (4 B -> 6 B, never 0 B).
+    conv_q1 = speculative_state_plan(None, linear_layer, par_dcp2, query_tokens=1, recover_ssm=False, capacity_padded=True)
+    conv_q2 = speculative_state_plan(None, linear_layer, par_dcp2, query_tokens=2, recover_ssm=False, capacity_padded=True)
+    assert conv_q1.conv_bytes == 4.0 and conv_q2.conv_bytes == 6.0
 
     # draft_sharded checks actual draft DCP sharding rather than dcp > 1 alone.
     model_mla_draft = replace(base_model, auxiliary=AuxiliarySpec(mtp=sharded_mla_draft))
@@ -254,6 +268,17 @@ def test_parallel_world_size_five_axes_expert_tp_and_rank_table_contracts() -> N
     assert expert_tp_groups(Topology(etp2_case.machine, etp2_case.runtime.parallel), replica=0, stage=0) == (
         (0, 2), (1, 3), (4, 6), (5, 7),
     )
+    # Explicit EP rank_table [[0,2],[1,3]] under TP=4 groups equal EP positions -> ((0,1),(2,3)).
+    etp_tbl_case = parse_case(compose_case("deepseek-v2-lite", "Ascend910_9362", tp=4, dp=1, ep=2, layers=2))
+    etp_tbl_par = ParallelSpec(tp=4, dp=1, ep=2, rank_table=((0, 2), (1, 3)))
+    assert expert_tp_groups(Topology(etp_tbl_case.machine, etp_tbl_par), replica=0, stage=0) == ((0, 1), (2, 3))
+    # External-DP local-TP builds groups independently inside each external replica -> ((0,1),(2,3)).
+    ext_ltp_case = parse_case(compose_case("qwen3-32b", "Ascend910_9362", tp=1, dp=2, ep=1, num_devices=4, layers=1))
+    ext_ltp_par = ParallelSpec(external_dp=2, dp=2, tp=1, ep=1, o_proj_tp=2)
+    assert local_tp_groups(ext_ltp_case.machine, ext_ltp_par, stage=0, width=2) == ((0, 1), (2, 3))
+    assert resolve_collective_cosets(
+        Topology(ext_ltp_case.machine, ext_ltp_par), {"group_axis": "local_tp", "local_tp_width": 2}, stage=0,
+    ) == [[0, 1], [2, 3]]
 
     non_contig = ParallelSpec(dp=2, tp=2, pcp=2, ep=2, rank_table=((0, 4), (2, 6)))
     non_contig.validate(mla_moe)
@@ -316,6 +341,8 @@ def test_bench_plan_builders_zero_fallback_cosets_and_fabric_routes() -> None:
         resolve_collective_group_ranks(topo, {"group_axis": "tp"}, stage=0, rank=99)
     with pytest.raises(BenchTopologyError, match="collective_declared_group_unmatched"):
         resolve_collective_group_ranks(topo, {"group_axis": "tp", "group_ranks": [0, 3]}, stage=0)
+    with pytest.raises(BenchTopologyError, match="collective_metadata_rank_not_in_declared_group"):
+        resolve_collective_group_ranks(topo, {"group_axis": "tp", "group_ranks": [0, 1], "physical_rank": 99}, stage=0)
     with pytest.raises(BenchTopologyError):
         resolve_collective_cosets(topo, {"group_axis": "bogus_axis"}, stage=0)
 
@@ -324,7 +351,7 @@ def test_bench_plan_builders_zero_fallback_cosets_and_fabric_routes() -> None:
     ext_topo = Topology(ext_case.machine, ParallelSpec(external_dp=2, dp=1, tp=2, ep=1))
     assert resolve_collective_cosets(ext_topo, {"group_axis": "tp"}, stage=0) == [[0, 1], [2, 3]]
 
-    # Node exporter honors declared group_ranks / physical_rank instead of picking rank 0.
+    # Node exporter honors declared group_ranks / physical_rank and rejects absent replica_idx.
     built_coll = _node_fields(
         node_id="c0", family="allreduce", recipe="tp_allreduce",
         operator={"dtype": "bf16", "local_shape": [4, 64], "metadata": {"group_axis": "tp", "group_ranks": [2, 3]}},
@@ -332,8 +359,16 @@ def test_bench_plan_builders_zero_fallback_cosets_and_fabric_routes() -> None:
         parallel={"tp": 2, "dp": 2, "ep": 4}, topology=topo,
     )
     assert built_coll["group_ranks"] == [2, 3] and built_coll["group_cosets"] == [[0, 1], [2, 3]]
+    with pytest.raises(BenchTopologyError, match="collective_replica_has_no_ranks"):
+        _node_fields(
+            node_id="c1", family="allreduce", recipe="tp_allreduce",
+            operator={"dtype": "bf16", "local_shape": [4, 64], "metadata": {"group_axis": "tp"}},
+            metadata={"group_axis": "tp"}, deps=(), outputs=(),
+            parallel={"tp": 2, "dp": 2, "ep": 4}, topology=topo, replica_idx=99,
+        )
 
-    # Fabric routes: single-node 16-die machine never emits inter_node_roce or ranks >= 16.
+    # Fabric routes: single-node 16-die machine never emits inter_node_roce or ranks >= 16;
+    # 3-node topology with RoCE only on nodes 1-2 picks nodes 1-2 endpoints (not node 0 SuperPod).
     single_node_view = _hardware_view("Ascend910_9362", "Ascend910_9362")
     assert single_node_view["nodes"] == 1 and single_node_view["has_inter_node_link"] is False
     fab_cases = _fabric_cases(single_node_view)
@@ -343,6 +378,15 @@ def test_bench_plan_builders_zero_fallback_cosets_and_fabric_routes() -> None:
     assert ar_case["nodes"][0]["upstream_abi"] == "hcclAllReduce"
     with pytest.raises(BenchTopologyError, match="fabric_inter_node_requires_multi_node"):
         fabric_route_ranks("inter_node_roce", 8, single_node_view)
+    hw_3node = {
+        "dies_per_package": 2, "dies_per_node": 4, "nodes": 3,
+        "ranks_by_node": [[0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11]],
+        "declared_links": [
+            {"name": "superpod_0_1", "channel": "superpod", "members": [0, 1, 2, 3, 4, 5, 6, 7]},
+            {"name": "inter_node_roce_1_2", "channel": "roce", "members": [4, 5, 6, 7, 8, 9, 10, 11]},
+        ],
+    }
+    assert fabric_route_ranks("inter_node_roce", 4, hw_3node) == [4, 5, 8, 9]
 
     dual_node_hw = {"dies_per_package": 2, "dies_per_node": 16, "nodes": 2}
     single_die_hw = {"dies_per_package": 1, "dies_per_node": 8, "nodes": 1}
@@ -395,6 +439,11 @@ def test_export_plan_abi_separation_redundant_expert_slots_and_packet_validation
     assert ledger["padded_expert_slots"] == 2 and len(ledger["group_list"]) == bank["local_experts"] == 4
     assert ledger["local_weight_expert_ids"] == bank["local_weight_expert_ids"]
     assert sum(ledger["rank_assignment_rows"]) == sum(expert_rows) == 20
+    # Redundant-slot round-robin matches runtime physical_slot_work ([1, 1, 0, 0] for topk=[[3],[3]]).
+    rr_rows = [0, 0, 0, 2, 0, 0, 0, 0, 0, 0]
+    rr_ledger = _explicit_ledger(rr_rows, [[3], [3]], ep=4, slots=slots)
+    rr_runtime = physical_slot_work(slot_plan=slots, logical_inclusions={}, global_tokens=2, routing_realization={3: 2})
+    assert rr_ledger["rank_assignment_rows"] == [1, 1, 0, 0] == [int(v) for v in rr_runtime.expected_rows_by_rank]
     with pytest.raises(PlanError, match="explicit_ledger_topk_histogram_mismatch"):
         _explicit_ledger([1] + [0] * 9, [[9]], ep=4, slots=slots)
 
@@ -424,6 +473,29 @@ def test_export_plan_abi_separation_redundant_expert_slots_and_packet_validation
         build_packets([_fabric_row(0, group_size=2, split=None), _fabric_row(1, group_size=2, split=None)])
     with pytest.raises(PacketError, match="observation_requires_explicit_source"):
         build_packets([_fabric_row(0, group_size=2, source=None), _fabric_row(1, group_size=2, source=None)])
+
+    # 4-rank send_recv repeat across pairs [0,1] and [2,3] validates communicator rank count cleanly;
+    # heldout 32 KiB all_reduce preserves/resolves hcclAllReduce for accuracy pairing.
+    sr_rows = [
+        row
+        for size in (4096, 16384)
+        for row in (
+            _fabric_row(0, op="send_recv", bytes=size, group_size=4, group_ranks=[0, 1, 2, 3], pair=[0, 1], pair_index=0, device_completion_us=50.0),
+            _fabric_row(1, op="send_recv", bytes=size, group_size=4, group_ranks=[0, 1, 2, 3], pair=[0, 1], pair_index=0, device_completion_us=50.5),
+            _fabric_row(2, op="send_recv", bytes=size, group_size=4, group_ranks=[0, 1, 2, 3], pair=[2, 3], pair_index=1, device_completion_us=52.0),
+            _fabric_row(3, op="send_recv", bytes=size, group_size=4, group_ranks=[0, 1, 2, 3], pair=[2, 3], pair_index=1, device_completion_us=52.5),
+        )
+    ]
+    sr_bundle = build_packets(sr_rows)
+    assert sr_bundle["manifest"]["observations"] == 4 and len(sr_bundle["fit-rate"]) == 1
+    assert sr_bundle["rate_conditions"][0]["identity"]["implementation"] == "hcclSendRecv"
+    heldout_ar = [
+        _fabric_row(r, op="all_reduce", group_size=4, group_ranks=[0, 1, 2, 3], bytes=32768, split="heldout",
+                    identity={"implementation": "hcclAllReduce"})
+        for r in range(4)
+    ]
+    ar_bundle = build_packets(heldout_ar)
+    assert ar_bundle["accuracy"]["observations"][0]["identity"]["implementation"] == "hcclAllReduce"
 
     case_spec = parse_case(compose_case("qwen3-32b", hardware="Ascend910_9362", tp=4, pcp=2, ep=1, layers=2))
     rep = export_structure(case_spec, phase="prefill", tokens=64, context=0, sequences=1)

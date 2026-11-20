@@ -419,7 +419,7 @@ def cache_row_bytes_by_layer(model: ModelSpec) -> tuple[tuple[int, int], ...]:
     """Per-layer cache row width using the declared cache representation."""
     from mindie_sim.catalog.cache import packed_region_row_bytes
     from mindie_sim.catalog.cache_format import cache_format
-    mla = cache_format(model, "mla_kv")
+    from mindie_sim.catalog.cache_pools import _packed_mla_row_bytes
     gqa = cache_format(model, "gqa_kv")
     rows = []
     for plan in model.layer_plans:
@@ -428,7 +428,7 @@ def cache_row_bytes_by_layer(model: ModelSpec) -> tuple[tuple[int, int], ...]:
             row = gqa.row_bytes(plan.cache_row_elements)
         elif plan.attention == "mla":
             if plan.cache_kind == "dense":
-                row = mla.row_bytes(plan.cache_row_elements)
+                row = _packed_mla_row_bytes(model, plan)
             elif plan.window > 0:
                 row = packed_region_row_bytes(model, "window", plan.cache_row_elements)
             elif plan.owns_long_kv:

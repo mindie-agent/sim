@@ -43,7 +43,7 @@ from mindie_sim.prediction.structure import parse_case
 from mindie_sim.prediction.topology import Topology
 from mindie_sim.structure import export_structure
 from tools.bench_plan_builders import (
-    BUILDERS, COLLECTIVE_BUILDERS, CONTROL_FAMILIES, UnmodeledCapabilityError,
+    BUILDERS, COLLECTIVE_BUILDERS, CONTROL_FAMILIES, BenchTopologyError, UnmodeledCapabilityError,
     attention_shape_dims, collapse_device_kernel_groups, fabric_route_ranks,
     is_ladder_kv_node, resolve_builder_strict, resolve_collective_cosets,
     resolve_collective_group_ranks, resolve_fabric_collective_abi,
@@ -218,11 +218,13 @@ def _node_fields(*, node_id, family, recipe, operator, metadata, deps, outputs, 
     cosets = resolve_collective_cosets(topology, topo_meta, stage_idx) if (collective and topology is not None) else None
     if cosets is not None:
         has_explicit = any(k in topo_meta for k in ("group_ranks", "physical_rank", "rank"))
-        rep_ranks = () if has_explicit else tuple(topology.ranks(int(replica_idx), stage_idx))
-        granks = resolve_collective_group_ranks(
-            topology, topo_meta, stage_idx,
-            rank=(None if has_explicit else (int(rep_ranks[0]) if rep_ranks else 0)),
-        )
+        if has_explicit:
+            granks = resolve_collective_group_ranks(topology, topo_meta, stage_idx, rank=None)
+        else:
+            rep_ranks = tuple(topology.ranks(int(replica_idx), stage_idx))
+            if not rep_ranks:
+                raise BenchTopologyError(f"collective_replica_has_no_ranks:replica={replica_idx},stage={stage_idx}")
+            granks = resolve_collective_group_ranks(topology, topo_meta, stage_idx, rank=int(rep_ranks[0]))
     else:
         granks = None
     gsize = len(granks) if granks else (collective_group_size(metadata, parallel) if collective else None)

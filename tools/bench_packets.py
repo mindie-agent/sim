@@ -244,16 +244,10 @@ def _identity(raw: Mapping[str, Any], sample_id: str) -> dict[str, Any]:
     identity = raw.get("service_identity") or raw.get("identity")
     if isinstance(identity, Mapping):
         return _validate_identity_fields(identity, sample_id, raw)
-    boundary = str(raw.get("boundary") or "device_kernel")
     candidate = {
-        "level": str(raw.get("level") or "operator"),
-        "boundary": boundary,
-        "hardware": raw.get("hardware"),
-        "implementation": raw.get("implementation"),
-        "phase": raw.get("phase"),
-        "shape": deepcopy(raw.get("shape") or {}),
-        "dtype": raw.get("dtype"),
-        "layout": raw.get("layout"),
+        "level": str(raw.get("level") or "operator"), "boundary": str(raw.get("boundary") or "device_kernel"),
+        "hardware": raw.get("hardware"), "implementation": raw.get("implementation"), "phase": raw.get("phase"),
+        "shape": deepcopy(raw.get("shape") or {}), "dtype": raw.get("dtype"), "layout": raw.get("layout"),
         "execution": raw.get("execution") or {"mode": "eager"},
     }
     return _validate_identity_fields(candidate, sample_id, raw)
@@ -354,9 +348,23 @@ def _fabric_hardware(raw: Mapping[str, Any]) -> str:
     return str(raw.get("hardware") or nested.get("hardware") or "").strip()
 
 
+def _fabric_implementation(sample: Mapping[str, Any], nested: Mapping[str, Any], op_name: str) -> str:
+    """Preserve certified upstream ABI on fabric samples or resolve via strict op-to-ABI mapping."""
+    for candidate in (nested.get("implementation"), sample.get("upstream_abi"), sample.get("implementation")):
+        text = str(candidate or "").strip()
+        if text and text != "declared" and text != op_name:
+            return text
+    from tools.bench_plan_builders import BenchTopologyError, resolve_fabric_collective_abi
+    try:
+        return resolve_fabric_collective_abi(op_name)[1]
+    except BenchTopologyError:
+        return str(nested.get("implementation") or sample.get("implementation") or op_name)
+
+
 def _fabric_reduced(raws: Sequence[Mapping[str, Any]]) -> tuple[list[dict[str, Any]], int, str | None]:
     groups: dict[tuple[Any, ...], dict[str, Any]] = {}
     repeat_splits: dict[tuple[Any, ...], set[str]] = {}
+    repeat_comm_ranks: dict[tuple[Any, ...], set[int]] = {}
     rejected_count, last_unqualified = 0, None
     for raw in raws:
         if raw.get("validated") is not True:
@@ -388,52 +396,51 @@ def _fabric_reduced(raws: Sequence[Mapping[str, Any]]) -> tuple[list[dict[str, A
             last_unqualified = str(raw.get("run_id") or "fabric")
             continue
         key = (*tuple(raw.get(name) for name in FABRIC_GROUP_FIELDS), group_ranks, pair)
-        group = groups.setdefault(key, {"rows": [], "ranks": set(), "group_ranks": set(), "pair": pair, "sample": raw})
+        repeat_key = (*tuple(raw.get(name) for name in FABRIC_GROUP_FIELDS if name != "pair_index"), group_ranks)
+        group = groups.setdefault(key, {"rows": [], "ranks": set(), "group_ranks": set(), "pair": pair, "sample": raw, "repeat_key": repeat_key})
         group["rows"].append(raw)
         if raw.get("rank") is not None:
-            group["ranks"].add(int(raw["rank"]))
+            rk = int(raw["rank"])
+            group["ranks"].add(rk)
+            repeat_comm_ranks.setdefault(repeat_key, set()).add(rk)
         group["group_ranks"].update(group_ranks)
     reduced = []
     for key, group in groups.items():
         declared_group_size = _positive_int(key[3], "fabric_group_size")
-        expected_ranks = set(group["pair"]) if group["pair"] else group["group_ranks"]
-        if not expected_ranks or group["ranks"] != expected_ranks:
-            raise PacketError(f"incomplete_fabric_repeat_ranks:{key}")
-        if len(group["ranks"]) != declared_group_size:
-            raise PacketError(
-                f"fabric_group_size_rank_count_mismatch:declared={declared_group_size},observed={len(group['ranks'])}"
-            )
+        if group["pair"]:
+            pair_set = set(group["pair"])
+            if len(pair_set) < 2 or group["ranks"] != pair_set:
+                raise PacketError(f"incomplete_fabric_repeat_ranks:{key}")
+            comm_ranks = repeat_comm_ranks.get(group["repeat_key"], set())
+            if len(comm_ranks) != declared_group_size or (group["group_ranks"] and comm_ranks != group["group_ranks"]):
+                raise PacketError(f"fabric_group_size_rank_count_mismatch:declared={declared_group_size},observed={len(comm_ranks)}")
+        else:
+            if not group["group_ranks"] or group["ranks"] != group["group_ranks"]:
+                raise PacketError(f"incomplete_fabric_repeat_ranks:{key}")
+            if len(group["ranks"]) != declared_group_size:
+                raise PacketError(f"fabric_group_size_rank_count_mismatch:declared={declared_group_size},observed={len(group['ranks'])}")
         sample = group["sample"]
         size = int(key[4])
         duration = max(float(row["device_completion_us"]) for row in group["rows"]) / 1000.0
         row_splits = {str(row["split"]) for row in group["rows"]}
         if len(row_splits) != 1:
             raise PacketError(f"conflicting_fabric_repeat_splits:{key}")
-        split = next(iter(row_splits))
         hardwares = {_fabric_hardware(row) for row in group["rows"]}
-        if not hardwares or len(hardwares) != 1:
+        if len(hardwares) != 1 or not (hardware := next(iter(hardwares))) or hardware == "declared":
             raise PacketError("fabric_sample_requires_consistent_hardware")
-        hardware = next(iter(hardwares))
-        if not hardware or hardware == "declared":
-            raise PacketError("fabric_sample_requires_hardware")
-        for row in group["rows"]:
-            _source(row, _sample_id(row), fabric=True)
         nested = sample.get("identity") if isinstance(sample.get("identity"), Mapping) else {}
-        boundary = str(nested.get("boundary") or "device_kernel")
-        dtype = str(sample.get("dtype") or nested.get("dtype") or "fp32")
         raw_layout = sample.get("layout") if sample.get("layout") is not None else nested.get("layout")
         if str(raw_layout or "").strip() == "declared":
             raise PacketError("fabric_sample_declared_layout_rejected")
-        layout = _normalize_layout(raw_layout)
-        execution = (deepcopy(dict(nested["execution"]))
-                     if isinstance(nested.get("execution"), Mapping) else {"mode": "eager"})
+        execution = (deepcopy(dict(nested["execution"])) if isinstance(nested.get("execution"), Mapping) else {"mode": "eager"})
         sample_id = _digest({"fabric": [list(item) if isinstance(item, tuple) else item for item in key]}, "fabric-")
         rate_identity = {
-            "level": "operator", "boundary": boundary, "hardware": hardware,
-            "implementation": str(key[2]), "phase": "fabric",
-            "shape": {"group_size": int(key[3] or 0)}, "dtype": dtype,
-            "layout": layout, "execution": execution,
+            "level": "operator", "boundary": str(nested.get("boundary") or "device_kernel"), "hardware": hardware,
+            "implementation": _fabric_implementation(sample, nested, str(key[2])), "phase": "fabric",
+            "shape": {"group_size": int(key[3] or 0)}, "dtype": str(sample.get("dtype") or nested.get("dtype") or "fp32"),
+            "layout": _normalize_layout(raw_layout), "execution": execution,
         }
+        split = next(iter(row_splits))
         reduced.append({
             "kind": "fabric", "record_type": "observation", "sample_id": sample_id,
             "run_id": sample.get("run_id"), "repeat_index": _repeat_index(sample.get("repeat_index")),
@@ -442,6 +449,7 @@ def _fabric_reduced(raws: Sequence[Mapping[str, Any]]) -> tuple[list[dict[str, A
             "source": _source(sample, sample_id, fabric=True), "status": "ok", "split": split,
             "route": sample.get("route"), "tier": key[1], "protocol": key[5],
             "split_style": key[8], "regime": key[6],
+            **({"pair_index": key[11]} if group["pair"] else {}),
             "identity": {**rate_identity, "shape": {**rate_identity["shape"], "bytes": size}},
             "rate_identity": rate_identity,
         })
@@ -579,7 +587,7 @@ def _rate_packets(receipts: Sequence[Mapping[str, Any]]) -> tuple[list[dict[str,
             "run_id": _run_id(raw, sample_id), "repeat_index": _repeat_index(raw.get("repeat_index")),
             "source": _source(raw, sample_id, fabric=raw.get("kind") == "fabric"), "split": "train",
         }
-        repeat_key = (sample["run_id"], sample["repeat_index"], sample["work_bytes"])
+        repeat_key = (sample["run_id"], sample["repeat_index"], sample["work_bytes"], raw.get("pair_index"))
         if repeat_key in group["seen"] and group["seen"][repeat_key] != sample["duration_ms"]:
             raise PacketError(f"rate_repeat_conflict:{sample_id}")
         group["seen"][repeat_key] = sample["duration_ms"]
@@ -706,12 +714,8 @@ def build_packets(receipts: Iterable[Mapping[str, Any]],
     rate, rate_conditions, skipped_rate = _rate_packets(observations)
     calibrate = _calibrate_samples(observations)
     accuracy = _accuracy_packet(observations, predictions, training_ids)
-    for packet in service:
-        assert_public_provenance(packet, "$.fit-service")
-    for packet in rate:
-        assert_public_provenance(packet, "$.fit-rate")
-    for sample in calibrate:
-        assert_public_provenance(sample, "$.calibrate")
+    for packet in (*service, *rate, *calibrate):
+        assert_public_provenance(packet, "$.packet")
     return {
         "fit-service": service, "fit-rate": rate, "calibrate": calibrate,
         "accuracy": accuracy, "rate_conditions": rate_conditions,
@@ -719,12 +723,10 @@ def build_packets(receipts: Iterable[Mapping[str, Any]],
             "schema": SCHEMA, "receipts": receipt_count, "observations": len(observations),
             "rejected_unqualified_observations": rejected_unqualified,
             "fit-service_conditions": len(service), "fit-rate_conditions": len(rate),
-            "calibrate_samples": len(calibrate),
-            "skipped_single_point_service_groups": skipped_service,
+            "calibrate_samples": len(calibrate), "skipped_single_point_service_groups": skipped_service,
             "skipped_single_point_rate_groups": skipped_rate,
             "training_sample_ids": len(accuracy["training_sample_ids"]),
-            "heldout_observations": len(accuracy["observations"]),
-            "predictions": len(accuracy["predictions"]),
+            "heldout_observations": len(accuracy["observations"]), "predictions": len(accuracy["predictions"]),
         },
     }
 

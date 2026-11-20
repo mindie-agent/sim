@@ -51,41 +51,51 @@ def _device_map(machine: Any) -> dict[int, Any]:
     return {int(device.rank): device for device in machine.dies}
 
 
-def _stage_rank_buckets(machine: Any, parallel: Any, *, stage: int) -> dict[tuple[int, int], list[int]]:
+def _stage_rank_buckets(
+    machine: Any, parallel: Any, *, stage: int,
+) -> dict[tuple[int, int, int], list[int]]:
     from mindie_sim.prediction.topology import Topology
 
     topology = Topology(machine, parallel)
-    buckets: dict[tuple[int, int], list[int]] = {}
-    replicas = max(ONE, int(parallel.dp) * int(parallel.active_pcp_lanes))
+    buckets: dict[tuple[int, int, int], list[int]] = {}
+    ext_dp = max(ONE, int(getattr(parallel, "external_dp", ONE) or ONE))
+    internal_replicas = max(ONE, int(parallel.dp) * int(parallel.active_pcp_lanes))
     devices = _device_map(machine)
-    for replica in range(replicas):
-        ranks = topology.ranks(replica, stage)
-        for position, rank in enumerate(ranks):
-            device = devices.get(int(rank))
-            if device is None:
-                raise ModelingError(f"local_tp_rank_undeclared:{rank}")
-            lane = (position // max(ONE, int(parallel.tp))
-                    if int(parallel.pcp) > ONE else ZERO)
-            key = (int(getattr(device, "node", ZERO)), lane)
-            buckets.setdefault(key, []).append(int(rank))
+    for ext in range(ext_dp):
+        for local_rep in range(internal_replicas):
+            replica = ext * internal_replicas + local_rep
+            ranks = topology.ranks(replica, stage)
+            if not ranks:
+                if ext == ZERO:
+                    continue
+                raise ModelingError(f"local_tp_external_replica_missing:{ext}:stage{stage}")
+            for position, rank in enumerate(ranks):
+                device = devices.get(int(rank))
+                if device is None:
+                    raise ModelingError(f"local_tp_rank_undeclared:{rank}")
+                lane = (position // max(ONE, int(parallel.tp))
+                        if int(parallel.pcp) > ONE else ZERO)
+                key = (ext, int(getattr(device, "node", ZERO)), lane)
+                buckets.setdefault(key, []).append(int(rank))
     return buckets
 
 
 def local_tp_groups(
     machine: Any, parallel: Any, *, stage: int, width: int,
 ) -> tuple[tuple[int, ...], ...]:
-    """Partition actual node/stage/PCP ranks into consecutive groups of width."""
+    """Partition actual external-DP/node/stage/PCP ranks into consecutive groups of width."""
     if isinstance(width, bool) or not isinstance(width, int) or width < ONE:
         raise ModelingError(f"local_tp_width_invalid:{width}")
     groups: list[tuple[int, ...]] = []
-    for key, ranks in sorted(_stage_rank_buckets(machine, parallel, stage=stage).items()):
+    for (ext, node, lane), ranks in sorted(_stage_rank_buckets(machine, parallel, stage=stage).items()):
+        del ext
         ordered = tuple(sorted(ranks))
         if width > len(ordered):
             raise ModelingError(
                 f"local_tp_width_exceeds_node_lane:{width}>{len(ordered)}")
         if len(ordered) % width != ZERO:
             raise ModelingError(
-                f"local_tp_width_not_divisor:{width}!|{len(ordered)}:node{key[FIRST]}:lane{key[SECOND]}")
+                f"local_tp_width_not_divisor:{width}!|{len(ordered)}:node{node}:lane{lane}")
         for start in range(ZERO, len(ordered), width):
             groups.append(ordered[start:start + width])
     if not groups:
@@ -125,7 +135,8 @@ def local_tp_cohorts(
 
     topology = Topology(machine, parallel)
     edges: list[tuple[int, int]] = []
-    replicas = max(ONE, int(parallel.dp) * int(parallel.active_pcp_lanes))
+    ext_dp = max(ONE, int(getattr(parallel, "external_dp", ONE) or ONE))
+    replicas = max(ONE, ext_dp * int(parallel.dp) * int(parallel.active_pcp_lanes))
     for stage in range(max(ONE, int(parallel.pp))):
         for replica in range(replicas):
             for group in topology.groups("ep", replica, stage):
@@ -178,9 +189,10 @@ def validate_local_projection_tp(case: Any) -> None:
     from mindie_sim.prediction.topology import Topology
 
     topology = Topology(hardware, parallel)
+    ext_dp = max(ONE, int(getattr(parallel, "external_dp", ONE) or ONE))
     expected = {
         rank
-        for replica in range(max(ONE, int(parallel.dp) * int(parallel.active_pcp_lanes)))
+        for replica in range(max(ONE, ext_dp * int(parallel.dp) * int(parallel.active_pcp_lanes)))
         for stage in range(max(ONE, int(parallel.pp)))
         for rank in topology.ranks(replica, stage)
     }
@@ -227,7 +239,12 @@ def rank_zero_graph_reuse(parallel: Any, replicas: int, has_device_group: bool) 
 def expert_tp_groups(
     topology: Any, *, replica: int = ZERO, stage: int = ZERO,
 ) -> tuple[tuple[int, ...], ...]:
-    """Construct expert-TP rank groups from the resolved ``parallel.etp`` width."""
+    """Construct expert-TP rank groups from the resolved ``parallel.etp`` width.
+
+    When an explicit EP ``rank_table`` is declared, ranks inside each ``tp``
+    slice are grouped by equal EP position so only ranks owning the same
+    experts share an expert-TP group.
+    """
     parallel = topology.parallel
     sources = tuple(int(rank) for rank in topology.ranks(replica, stage))
     if not sources:
@@ -238,6 +255,29 @@ def expert_tp_groups(
         raise ModelingError(f"expert_tp_not_divisor_of_tp:{etp}!|{tp}")
     if etp <= ONE:
         return tuple((rank,) for rank in sources)
+    table = getattr(parallel, "rank_table", None)
+    if table:
+        ep_pos = {
+            int(rank): pos
+            for ep_group in table
+            for pos, rank in enumerate(ep_group)
+        }
+        groups: list[tuple[int, ...]] = []
+        for base in range(ZERO, len(sources), tp):
+            tp_slice = sources[base : base + tp]
+            if all(rank in ep_pos for rank in tp_slice):
+                by_pos: dict[int, list[int]] = {}
+                for rank in tp_slice:
+                    by_pos.setdefault(ep_pos[rank], []).append(rank)
+                groups.extend(tuple(members) for members in by_pos.values() if members)
+                continue
+            stride = tp // etp
+            groups.extend(
+                group
+                for offset in range(stride)
+                if (group := tp_slice[offset::stride])
+            )
+        return tuple(groups)
     stride = tp // etp
     return tuple(
         group

@@ -519,12 +519,12 @@ def stage_cache_components(
 
 def request_cache_breakdown(
     model: Any, parallel: ParallelSpec, sequence_tokens: int,
-    *, draft_kind: str | None = None, interleave: int = INDEX_INTERLEAVE_TOKENS,
+    *, draft_kind: str | None = None, interleave: int | None = None,
     runtime: Any = None, query_tokens: int | None = None, phase: str = "decode",
 ) -> dict[str, Any]:
     block_size = int(
-        interleave if interleave != INDEX_INTERLEAVE_TOKENS
-        else (getattr(runtime, "kv_block_size", 0) or interleave or 1)
+        interleave if interleave is not None
+        else (getattr(runtime, "kv_block_size", 0) or INDEX_INTERLEAVE_TOKENS)
     )
     stages = stage_cache_components(
         model, parallel, sequence_tokens, draft_kind=draft_kind, interleave=block_size,
