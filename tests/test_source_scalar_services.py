@@ -8,8 +8,8 @@ from mindie_sim.prediction.cost import CostModel
 from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.program import RecipeBook
 from mindie_sim.prediction.structure import parse_case
-from test_moe_init_mxfp8 import case as init_case,graph,RECIPE
-from test_grouped_dequant_arch35 import ordinary,selected
+from _support.moe_hc_mc2_fixtures import RECIPE, mxfp8_case as init_case, mxfp8_graph as graph
+from _support.moe_hc_mc2_fixtures import ordinary, selected
 
 
 def services(raw,**rates):

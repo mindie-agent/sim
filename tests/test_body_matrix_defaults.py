@@ -10,7 +10,7 @@ from mindie_sim.prediction.program import RecipeBook
 from mindie_sim.prediction.matrix import TiledMatmul
 from mindie_sim.structure import export_structure
 from test_prediction_system import case
-from test_grouped_family_selection import grouped_case
+from _support.moe_hc_mc2_fixtures import grouped_case
 
 
 MATRIX_FAMILIES = {"qkv_projection", "output_projection", "gate_up_projection", "down_projection"}

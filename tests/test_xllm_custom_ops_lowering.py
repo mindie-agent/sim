@@ -724,7 +724,7 @@ def test_cache_write_completion_orders_the_next_attention_consumer():
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from test_attnres_ownership import _case
+    from _support.moe_hc_mc2_fixtures import attnres_case as _case
     from mindie_sim import graph_costs
 
     case = _case(8, hidden=128)

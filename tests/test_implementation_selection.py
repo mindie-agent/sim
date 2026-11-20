@@ -120,7 +120,7 @@ def test_prefill_kda_chooses_its_chunk_source_without_decode_source_in_mixed_bat
 
 
 def test_hc_prefill_geometry_selects_source_only_inside_its_declared_row_domain():
-    from test_hc_arch35_source import raw_case
+    from _support.moe_hc_mc2_fixtures import raw_case
 
     parsed = parse_case(raw_case())
     parsed = replace(parsed, model=replace(parsed.model, layers=1, body_layers=1,
@@ -208,7 +208,7 @@ def test_draft_calls_select_their_own_phase_and_q1_geometry_before_target_verifi
 
 
 def test_target_mxfp8_routing_does_not_rewrite_explicit_analytical_bf16_draft():
-    from test_moe_init_mxfp8 import case as glm_case
+    from _support.moe_hc_mc2_fixtures import mxfp8_case as glm_case
     from mindie_sim.prediction.moe_init_mxfp8 import RECIPE
 
     parsed = parse_case(glm_case(16))

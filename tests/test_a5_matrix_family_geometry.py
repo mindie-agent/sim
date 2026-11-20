@@ -350,7 +350,7 @@ def test_explicit_token_basis_accepts_contiguous_physical_bank_on_rank_one():
 
 
 def test_explicit_token_route_enters_real_grouped_source_lowering():
-    from test_moe_explicit_route_a5 import _case
+    from _support.moe_hc_mc2_fixtures import explicit_route_case as _case
     raw = _case(route=((6, 10, 8, 8), True))
     raw["runtime"]["kernels"] = {"lowerings": {
         "grouped_gemm": {"implementation": "ascendc_grouped_nd_bf16"}}}

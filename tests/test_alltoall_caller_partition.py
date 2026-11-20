@@ -15,7 +15,7 @@ import pytest
 from mindie_sim import graph_costs, target_graphs
 from mindie_sim.prediction.moe_token_partition import ALLTOALL_KIND
 from mindie_sim.prediction.structure import parse_case
-from test_moe_quant_transport import SELECTOR, transport_case
+from _support.moe_hc_mc2_fixtures import SELECTOR, transport_case
 
 ROOT = Path(__file__).resolve().parents[1]
 
