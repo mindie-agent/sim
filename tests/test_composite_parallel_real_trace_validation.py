@@ -89,7 +89,7 @@ HELDOUT_CASES = (
 CAPTURES = (
     ("a2-qwen35-w8a8-ep4-sn", "qwen3.5-35b-a3b", "a2", "w8a8", "Ascend910B4", 2, 2, 4, None, 2, 8, "decode", 1, 128, 1, 0.32733359096420134),
     ("a3-9362-qwen35-w8a8-ep8-sn", "qwen3.5-35b-a3b", "Ascend910_9362", "w8a8", "Ascend910_9362", 4, 2, 8, None, 2, 8, "decode", 1, 256, 1, 0.38764630148423035),
-    ("a3-9392-glm53-w4a8-ep2-sn", "glm-5.3", "Ascend910_9392", "w4a8", "Ascend910_9392", 2, 1, 2, None, 4, 8, "decode", 1, 128, 1, 1.0583827380739714),
+    ("a3-9392-glm53-w4a8-ep2-sn", "glm-5.3", "Ascend910_9392", "w4a8", "Ascend910_9392", 2, 1, 2, None, 4, 8, "decode", 1, 128, 1, 1.0254303184311158),  # same-package SIO
     ("a5-9582-qwen35-fp8-prefill", "qwen3.5-35b-a3b", "Ascend950DT_9582", "fp8", "Ascend950DT_9582", 2, 1, 2, None, 2, 8, "prefill", 128, 0, 1, 0.4071915593317939),
     ("a5-9582-qwen397-w4a8", "qwen3.5-397b-a17b", "Ascend950DT_9582", "w4a8", "Ascend950DT_9582", 2, 1, 2, None, 2, 8, "decode", 1, 128, 1, 0.4053741192651771),
     ("a2-dsv32-w8a8-ep4", "deepseek-v3.2", "a2", "w8a8", "Ascend910B4", 2, 2, 4, None, 4, 8, "decode", 1, 128, 1, 2.597629181033372),

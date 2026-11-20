@@ -1,13 +1,14 @@
 """Explicit hardware datapath and ISA capability view derived from ComputeArchSpec.
 
 [Role] Derive immutable per-die datapath capabilities, AIC/AIV owner pairing,
-  usable local data routes and upstream source citations strictly from declared
-  ``ComputeArchSpec`` and ``Device`` records.
+  usable local data routes, SIMT UB carveout, sub-tile waves, STARS dispatch
+  sync, directional HBM bus specs and upstream source citations strictly from
+  declared ``ComputeArchSpec`` and ``Device`` records.
 [Invariants] Zero SKU-name, ``arch_family``, ``compute_peaks`` or
   ``service_modes`` capability sniffing. Direct routes (``l0c->ub``,
-  ``ub->l1``) exist only when explicitly declared on ``ComputeArchSpec.paths``.
-  Representative multi-die stages require homogeneous ``compute_arch`` and
-  datapath declarations.
+  ``ub->l1``) exist only when explicitly declared on ``ComputeArchSpec.paths``;
+  missing physical routes raise ``UnmodeledCapabilityError``. Representative
+  multi-die stages require homogeneous ``compute_arch`` and datapath signatures.
 [Timeouts & Locks] Pure metadata derivation over finite device tuples; no I/O
   or locks.
 [Side-Effect Policy] Returns new frozen records; never mutates input devices.
@@ -16,11 +17,19 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import NewType
+from typing import Any, NewType
 
 from .common import ModelingError
 from .compute_arch import ComputeArchSpec, DataPath
+from .device_input import (
+    DeviceInput,
+    DispatchSyncSpec,
+    MemoryAccessSpec,
+    StarsSpec,
+    SubtileWaveSpec,
+)
 from .hardware import Device, Link
+from .hardware_links import CollectiveBandSpec, validate_protocol_bands
 
 ArchId = NewType("ArchId", str)
 DieSpec = Device
@@ -65,6 +74,18 @@ class StarsQueueSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class RoutePlan:
+    """Resolved physical data route between two on-chip or GM buffers."""
+
+    source: str
+    destination: str
+    path: DataPath
+    representation: str = ""
+    owner_group: Any = None
+    tile: Any = None
+
+
+@dataclass(frozen=True, slots=True)
 class DatapathCapabilitySpec:
     """Immutable per-die hardware datapath and owner-pairing capability view."""
 
@@ -76,10 +97,23 @@ class DatapathCapabilitySpec:
     matrix_output_paths: frozenset[str]
     ub_peer_edges: tuple[tuple[int, int], ...]
     stars: StarsQueueSpec | None
+    simt_ub_carveout_bytes: int = 0
+    subtile_wave: tuple[SubtileWaveSpec, ...] = ()
+    dispatch_sync: DispatchSyncSpec | None = None
+    hbm_rw_alpha: float = 0.0
+    hbm_read_bytes_per_s: float = 0.0
+    hbm_write_bytes_per_s: float = 0.0
+    memory_access: MemoryAccessSpec | None = None
+    buffers: tuple[tuple[str, int], ...] = ()
 
     @property
     def arch_id(self) -> ArchId:
         return self.compute_arch.arch_id
+
+    @property
+    def supported_output_paths(self) -> tuple[str, ...]:
+        """Sorted projection of declared supported matrix output paths."""
+        return tuple(sorted(self.matrix_output_paths))
 
     def has_path(self, source: str, destination: str, /) -> bool:
         """True iff a directional route ``source -> destination`` is declared."""
@@ -96,6 +130,69 @@ class DatapathCapabilitySpec:
     def has_ub_to_l1(self) -> bool:
         return self.has_path("ub", "l1")
 
+    def route(
+        self,
+        src: str,
+        dst: str,
+        representation: str = "",
+        owner_group: Any = None,
+        tile: Any = None,
+    ) -> RoutePlan:
+        """Resolve a physical directed path or raise ``UnmodeledCapabilityError``."""
+        rep = str(representation or "").strip().lower()
+        candidates = [
+            path for path in self.usable_paths
+            if path.source == src and path.target == dst
+        ]
+        for path in candidates:
+            if not rep or not path.representations or rep in path.representations:
+                return RoutePlan(
+                    source=src, destination=dst, path=path,
+                    representation=rep, owner_group=owner_group, tile=tile,
+                )
+        from mindie_sim.public.errors import UnmodeledCapabilityError
+        raise UnmodeledCapabilityError(
+            capability="datapath_route",
+            entry="DatapathCapabilitySpec.route",
+            code=f"datapath_route_unsupported:{src}->{dst}",
+            message=(
+                f"arch {self.arch_id} does not declare directed route "
+                f"{src}->{dst} (representation={rep or 'any'})"
+            ),
+        )
+
+    def usable_bytes(
+        self,
+        pool: str,
+        owner: Any = None,
+        kernel: Any = None,
+    ) -> int:
+        """Return usable per-owner bytes for ``pool`` after SIMT UB carveout."""
+        del owner
+        pool_key = str(pool).strip().lower()
+        capacity = dict(self.buffers).get(pool_key)
+        if capacity is None:
+            raise ModelingError(f"datapath_buffer_pool_undeclared:{pool_key}")
+        is_simt = False
+        if isinstance(kernel, bool):
+            is_simt = kernel
+        elif isinstance(kernel, str):
+            is_simt = "simt" in kernel.lower()
+        elif isinstance(kernel, Mapping):
+            is_simt = bool(kernel.get("simt")) or "simt" in str(kernel.get("abi") or "").lower()
+        elif kernel is not None:
+            is_simt = bool(getattr(kernel, "simt", False)) or "simt" in str(
+                getattr(kernel, "abi", "") or getattr(kernel, "name", "")
+            ).lower()
+        if pool_key == "ub" and is_simt and self.simt_ub_carveout_bytes > 0:
+            return max(0, int(capacity) - int(self.simt_ub_carveout_bytes))
+        return max(0, int(capacity))
+
+    @property
+    def stars_spec(self) -> StarsSpec | None:
+        """Return declared ``StarsSpec`` from ``dispatch_sync`` if present."""
+        return None if self.dispatch_sync is None else self.dispatch_sync.stars
+
     @property
     def signature(self) -> tuple:
         """Hashable structural capability identity for cache keys."""
@@ -111,6 +208,14 @@ class DatapathCapabilitySpec:
             (None if self.stars is None else (
                 self.stars.resource, self.stars.slots_per_die,
                 self.stars.descriptor_path.name)),
+            self.simt_ub_carveout_bytes,
+            self.subtile_wave,
+            self.dispatch_sync,
+            self.hbm_rw_alpha,
+            self.hbm_read_bytes_per_s,
+            self.hbm_write_bytes_per_s,
+            self.memory_access,
+            self.buffers,
         )
 
 
@@ -181,6 +286,9 @@ def datapath_for_die(
     aic_count = int(die.compute_units)
     aiv_count = _aiv_count(die)
     usable_paths = tuple(spec.paths)
+    hbm_rate = float(dict(die.rates).get("hbm", 0.0) or 0.0)
+    hbm_read = float(die.hbm_read_bytes_per_s) if die.hbm_read_bytes_per_s is not None else hbm_rate
+    hbm_write = float(die.hbm_write_bytes_per_s) if die.hbm_write_bytes_per_s is not None else hbm_rate
     return DatapathCapabilitySpec(
         compute_arch=identity,
         aic_count=aic_count,
@@ -190,6 +298,43 @@ def datapath_for_die(
         matrix_output_paths=_matrix_output_paths(die, usable_paths),
         ub_peer_edges=tuple(ub_peer_edges),
         stars=_stars_queue(die, usable_paths),
+        simt_ub_carveout_bytes=int(die.simt_ub_carveout_bytes),
+        subtile_wave=tuple(die.subtile_wave),
+        dispatch_sync=die.dispatch_sync,
+        hbm_rw_alpha=float(die.hbm_rw_alpha),
+        hbm_read_bytes_per_s=hbm_read,
+        hbm_write_bytes_per_s=hbm_write,
+        memory_access=die.memory_access,
+        buffers=tuple(die.buffers),
+    )
+
+
+def device_input_for_die(
+    die: Device,
+    /,
+    *,
+    links: Sequence[Link] = (),
+    transfer_channels: Mapping[str, object] | Sequence[tuple[str, object]] = (),
+    provenance: Mapping[str, object] | None = None,
+) -> DeviceInput:
+    """Build a typed ``DeviceInput`` normalized view for one physical die."""
+    edges = ub_peer_edges_for_rank(die.rank, links, transfer_channels)
+    datapath = datapath_for_die(die, ub_peer_edges=edges)
+    entries = (
+        tuple((str(k), tuple(sorted(dict(v).items()))) for k, v in transfer_channels.items())
+        if isinstance(transfer_channels, Mapping)
+        else tuple((str(k), tuple(v)) for k, v in transfer_channels)
+    )
+    return DeviceInput(
+        compute_arch=die.compute_arch,
+        datapath=datapath,
+        kernel_invocations=tuple(die.kernel_invocations),
+        transfer_channels=entries,
+        rates=tuple(die.rates),
+        units=tuple(die.resource_units),
+        buffers=tuple(die.buffers),
+        peaks=tuple(die.compute_peaks),
+        provenance=tuple(sorted((str(k), v) for k, v in dict(provenance or {}).items())),
     )
 
 
@@ -268,7 +413,6 @@ def _ub_relative_connectivity(
     edges: tuple[tuple[int, int], ...],
     stage_ranks: frozenset[int],
 ) -> tuple[int, int]:
-    """Return ``(in_stage_peer_count, out_of_stage_peer_count)`` for homogeneity check."""
     in_stage = sum(1 for src, dst in edges if src == rank and dst in stage_ranks)
     out_stage = sum(1 for src, dst in edges if src == rank and dst not in stage_ranks)
     return (in_stage, out_stage)
@@ -291,6 +435,13 @@ def _homogeneity_key(
         (None if spec.stars is None else (
             spec.stars.resource, spec.stars.slots_per_die,
             spec.stars.descriptor_path.name)),
+        spec.simt_ub_carveout_bytes,
+        spec.subtile_wave,
+        spec.dispatch_sync,
+        spec.hbm_rw_alpha,
+        spec.hbm_read_bytes_per_s,
+        spec.hbm_write_bytes_per_s,
+        spec.memory_access,
     )
 
 
@@ -327,15 +478,151 @@ def datapath_for_devices(
     return first_arch, first_datapath
 
 
+_CAPABILITY_REQUIRED_FAMILIES = frozenset({"A2", "A3", "A5"})
+
+
+def resolve_device_compute_arch(data: dict, raw: Mapping, arch_family: str) -> ComputeArchSpec:
+    """Resolve and attach registered native compute_arch capabilities for Ascend families."""
+    arch = ComputeArchSpec.from_mapping(
+        data.get("compute_arch", {}),
+        source=f"compute_arch:{data.get('sku', arch_family)}")
+    if arch_family in _CAPABILITY_REQUIRED_FAMILIES and not arch.has_native_modes():
+        from mindie_sim.backends import registered_capability
+        resolved = registered_capability(
+            str(data.get("sku") or raw.get("sku") or ""), arch_family)
+        if resolved is None:
+            raise ModelingError(
+                "hardware_native_capability_required:"
+                f"{arch_family}:{data.get('sku', '')}")
+        existing = data.get("compute_arch") or {}
+        if not isinstance(existing, Mapping):
+            existing = {}
+        merged = {**existing, **resolved}
+        merged["preset"] = resolved["preset"]
+        for field_name in ("instruction_services", "representations",
+                           "native_compute", "casts", "paths", "runtimes"):
+            if field_name in existing and field_name in resolved:
+                merged[field_name] = {**resolved[field_name], **existing[field_name]}
+        arch = ComputeArchSpec.from_mapping(
+            merged, source=f"registered_capability:{arch_family}")
+    return arch
+
+
+def scale_explicit_placement_device(
+    data: dict, explicit_decl: Mapping,
+    new_aic: int, rec_base_aic: int, rec_base_aiv: int,
+) -> None:
+    """Proportionally scale non-overridden rates/units for an explicit core-count override."""
+    scale_aic = new_aic / rec_base_aic
+    explicit_units = {str(key) for key in explicit_decl.get("resource_units", {})}
+    cur_units = dict(data.get("resource_units", {}))
+    new_aiv = int(cur_units.get("vector", rec_base_aiv) or rec_base_aiv)
+    scale_aiv = (new_aiv / rec_base_aiv) if rec_base_aiv > 0 else 1.0
+    if scale_aic == 1.0 and scale_aiv == 1.0:
+        return
+    explicit_peaks = {str(key) for key in explicit_decl.get("compute_peaks", {})}
+    data["compute_peaks"] = {
+        k: (float(v) if k in explicit_peaks else float(v) * scale_aic)
+        for k, v in data.get("compute_peaks", {}).items()
+    }
+    aic_u = {"cube", "mte1", "mte2_aic", "fixpipe"}
+    data["resource_units"] = {
+        k: (int(v) if k in explicit_units else max(
+            1, int(round(int(v) * (scale_aic if k in aic_u else scale_aiv)))))
+        for k, v in cur_units.items()
+    }
+    explicit_buf_u = {str(key) for key in explicit_decl.get("buffer_units", {})}
+    explicit_modes = {
+        str(name) for name, mode in explicit_decl.get("service_modes", {}).items()
+        if isinstance(mode, Mapping) and "rate" in mode
+    }
+    aic_b = {"l1", "l0a", "l0b", "l0c"}
+    data["buffer_units"] = {
+        k: (int(v) if k in explicit_buf_u else max(
+            1, int(round(int(v) * (scale_aic if k in aic_b
+                                   else (scale_aiv if k == "ub" else 1.0))))))
+        for k, v in data.get("buffer_units", {}).items()
+    }
+    explicit_rates = {str(key) for key in explicit_decl.get("rates", {})}
+    aic_r = {"mte1", "mte2_aic", "fixpipe"}
+    aiv_r = {"vector", "mte2_aiv", "mte3", "reg_data_writes",
+             "reg_ub_accesses", "reg_ub_stores", "reg_alu_lanes",
+             "reg_special_lanes", "reg_reduce_lanes", "reg_shuffle_lanes",
+             "scalar_store_issue"}
+    scaled_r = {
+        k: (float(v) * scale_aic if k in aic_r and k not in explicit_rates
+            else (float(v) * scale_aiv if k in aiv_r and k not in explicit_rates
+                  else float(v)))
+        for k, v in data.get("rates", {}).items()
+    }
+    if "mte2" in scaled_r and "mte2" not in explicit_rates:
+        scaled_r["mte2"] = (
+            min(scaled_r["mte2_aic"], scaled_r["mte2_aiv"])
+            if "mte2_aic" in scaled_r and "mte2_aiv" in scaled_r
+            else scaled_r["mte2"] * min(scale_aic, scale_aiv))
+    data["rates"] = scaled_r
+    data["service_modes"] = {
+        k: ({**m, "rate": float(m["rate"]) * (scale_aic if m.get("resource") in aic_r else scale_aiv)}
+            if k not in explicit_modes and "rate" in m
+            and m.get("resource") in (aic_r | aiv_r)
+            and m.get("resource") not in explicit_rates
+            else dict(m))
+        for k, m in data.get("service_modes", {}).items()
+    }
+
+
+def _alias_cores(mapping: Mapping) -> dict:
+    out = dict(mapping)
+    if "compute_units" not in out and "aic_count" not in out:
+        for key in ("num_cores", "cores"):
+            if out.get(key) is not None:
+                out["compute_units"] = int(out[key])
+                break
+    return out
+
+
+def normalize_core_aliases(raw: Mapping) -> dict:
+    """Normalize top-level and per-device ``num_cores``/``cores`` aliases."""
+    out = _alias_cores(raw)
+    if isinstance(out.get("device"), Mapping):
+        out["device"] = _alias_cores(out["device"])
+    for key in ("devices", "dies"):
+        if isinstance(out.get(key), (list, tuple)):
+            items = []
+            for item in out[key]:
+                if isinstance(item, Mapping):
+                    rec = _alias_cores(item)
+                    if isinstance(rec.get("device"), Mapping):
+                        rec["device"] = _alias_cores(rec["device"])
+                    items.append(rec)
+                else:
+                    items.append(item)
+            out[key] = items
+    return out
+
+
+def has_core_override(declaration: Mapping) -> bool:
+    return bool(declaration.get("compute_units") or declaration.get("resource_units"))
+
+
 __all__ = [
     "ArchId",
+    "CollectiveBandSpec",
     "ComputeArchIdentity",
     "DatapathCapabilitySpec",
+    "DeviceInput",
     "DieSpec",
+    "DispatchSyncSpec",
     "GENERIC_ARCH_ID",
+    "MemoryAccessSpec",
+    "RoutePlan",
     "SourceRef",
     "StarsQueueSpec",
+    "StarsSpec",
+    "SubtileWaveSpec",
     "datapath_for_devices",
     "datapath_for_die",
+    "device_input_for_die",
     "ub_peer_edges_for_rank",
+    "validate_protocol_bands",
 ]

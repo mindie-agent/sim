@@ -25,7 +25,7 @@
 """
 from __future__ import annotations
 
-import argparse, json, os, statistics, sys, time
+import argparse, json, math, os, statistics, sys, time
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import replace
 from hashlib import sha256
@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any
 
 from mindie_sim import compose_case, graph_costs, parse_case, target_graphs
-from mindie_sim.catalog.ops import gemm_op
+from mindie_sim.catalog.ops import comm_op, gemm_op
 from mindie_sim.prediction.api import RecipeBook
 from mindie_sim.prediction.attention_decode import RECIPE_ID, StagedGQADecode
 from mindie_sim.prediction.call_builders import build_aclnn_call
@@ -52,21 +52,49 @@ ROOT = Path(__file__).resolve().parents[2]
 TRAIN_SEQS = frozenset({512, 1024, 4096, 32768, 65536, 409600})
 HELDOUT_SEQS = frozenset({2048, 8192, 16384, 131072, 262144})
 STEADY_COLL_MIN_BYTES = 16777216
-UB_MESH_PAIR_BW_GBPS = 47.5
-UB_MESH_2P_SYNC_US = 12.0
-UB_MESH_8P_SYNC_US = 45.0
+STRICT_THRESHOLD_PCT = 10.0
 
 
 def _stats(apes: list[float]) -> dict[str, Any]:
     if not apes:
-        return {"count": 0, "mape_pct": 0.0, "medape_pct": 0.0, "p90_ape_pct": 0.0}
+        return {
+            "status": "insufficient_evidence",
+            "count": 0,
+            "mape_pct": None,
+            "medape_pct": None,
+            "p90_ape_pct": None,
+        }
     s = sorted(apes)
+    mape = round(statistics.mean(s) * 100.0, 2)
+    medape = round(statistics.median(s) * 100.0, 2)
+    p90_idx = min(len(s) - 1, max(0, math.ceil(0.9 * len(s)) - 1))
     return {
+        "status": "pass" if (mape < STRICT_THRESHOLD_PCT and medape < STRICT_THRESHOLD_PCT) else "fail",
         "count": len(s),
-        "mape_pct": round(statistics.mean(s) * 100.0, 2),
-        "medape_pct": round(statistics.median(s) * 100.0, 2),
-        "p90_ape_pct": round(s[min(len(s) - 1, int(0.9 * len(s)))] * 100.0, 2),
+        "mape_pct": mape,
+        "medape_pct": medape,
+        "p90_ape_pct": round(s[p90_idx] * 100.0, 2),
     }
+
+
+def _eval_collective(cs_comm, coll: str, world_size: int, payload_bytes: int) -> float:
+    w = max(2, int(world_size))
+    if coll == "AllReduce":
+        op = comm_op(
+            op_id=f"allreduce_w{w}_{payload_bytes}", deps=(), stage=0, layer=0, requests=("r0",),
+            family="allreduce", phase="prefill", recipe="ring_allreduce",
+            link_bytes=2.0 * (w - 1) / w * payload_bytes, shape=(1, max(1, payload_bytes // 2)),
+            metadata=(("group_axis", "tp"), ("collective", "all_reduce"), ("steps", 2 * (w - 1))),
+        )
+    else:
+        op = comm_op(
+            op_id=f"alltoall_w{w}_{payload_bytes}", deps=(), stage=0, layer=0, requests=("r0",),
+            family="alltoall", phase="prefill", recipe="expert_dispatch",
+            link_bytes=(w - 1) / w * payload_bytes, shape=(1, max(1, payload_bytes // 2)),
+            metadata=(("group_axis", "tp"), ("collective", "all_to_all")),
+        )
+    rep = graph_costs(cs_comm, {0: [op]}, include_submission=False, isolated=False, fast_span_only=True)
+    return float(rep["duration_ms"]) * 1000.0
 
 
 def _eval_planned(cs, op: OpSpec, builder_fn) -> float:
@@ -143,7 +171,7 @@ def evaluate_level1(captures_dir: Path) -> dict[str, Any]:
                 q_spec = replace(cs_mx.model.quant.for_category("expert"), weight_format="mxfp4") if is_fp4 else cs_mx.model.quant
                 meta = (("compute_format", "fp8_e4m3"), ("matrix_mapping_domain", "aggregate_experts"), ("routing_basis", "probability_moments"), ("expected_active_experts", float(act_e)), ("expected_rows", float(sh["M_total"])), ("matrix_groups", act_e))
                 op = gemm_op(op_id=name, deps=(), stage=0, layer=0, requests=("r0",), m=sh["M_total"], n=sh["N"], k=sh["K"], quant=q_spec, category="expert", phase="prefill", recipe="aclnn_grouped_matmul", family="grouped_gemm", activation_dtype="fp8_e4m3", weight_count=act_e, metadata=meta)
-                add(sp, "moe_gmm", sku, name, meas, float(graph_costs(cs_mx, {0: [op]}, recipes=gmm_rb, include_submission=False, isolated=False, fast_span_only=True)["duration_ms"]) * 1000.0 + 4.2, uri)
+                add(sp, "moe_gmm", sku, name, meas, float(graph_costs(cs_mx, {0: [op]}, recipes=gmm_rb, include_submission=False, isolated=False, fast_span_only=True)["duration_ms"]) * 1000.0, uri)
             elif dom == "domain4_fia" and "fia_v1" in name and sh.get("swa", 0) == 0:
                 add(sp, "fia_decode", sku, name, meas, _eval_fia(cs_bf, sh["B"], sh["S"], sh["Hq"], sh["Hkv"], sh["D"], sh["seq_kv"]), uri)
             elif dom == "probe1_c8_sfa":
@@ -170,12 +198,16 @@ def evaluate_level1(captures_dir: Path) -> dict[str, Any]:
             elif dom == "domain5_gdn_chunks" and "chunk32" in name:
                 add(sp, "gdn_chunk32", sku, name, meas, _eval_gdn_chunk32(cs_bf, sh["T"], sh["Hk"], sh["Hv"], sh["K"], sh["V"]), uri)
 
+    comm_cases: dict[tuple[str, int], Any] = {}
     for r in d1.get("collective_measurements", []):
         sp, b, coll, w, sku = r.get("split"), int(r.get("bytes", 0)), r.get("collective", ""), int(r.get("world_size", 2)), r.get("sku", "Ascend950DT_9582")
         meas = float((r.get("metrics") or {}).get("eager_p50_us") or 0.0)
         if sp in ("train", "heldout") and b >= STEADY_COLL_MIN_BYTES and meas > 0.0 and coll in ("AllReduce", "AllToAll"):
-            factor = 2.0 * (w - 1) / w if coll == "AllReduce" else (w - 1) / w
-            pred = (b * factor) / (max(1, w - 1) * UB_MESH_PAIR_BW_GBPS * 1000.0) + (UB_MESH_8P_SYNC_US if w >= 8 else UB_MESH_2P_SYNC_US)
+            cs_comm = comm_cases.get((sku, w))
+            if cs_comm is None:
+                cs_comm = parse_case(compose_case("qwen3.8-27b", hardware=sku, tp=w, ep=1, num_devices=w, layers=1, quant="none"))
+                comm_cases[(sku, w)] = cs_comm
+            pred = _eval_collective(cs_comm, coll, w, b)
             add(sp, "ub_mesh_collectives", sku, f"{coll}_w{w}_{b}", meas, pred, str(r.get("source_ref") or f"capture://cann93-a5-microbench/{sku}/ub_mesh/{coll}_{b}"))
 
     cs_dt = cases_bf["Ascend950DT_9582"]
@@ -248,7 +280,7 @@ def _eval_model_run(r: dict[str, Any]) -> dict[str, Any]:
     tp = int(r.get("tp") or pt.get("tensor_parallel_size") or 2)
     pcp = int(r.get("pcp") or pt.get("prefill_context_parallel_size") or 1)
     dcp = int(r.get("dcp") or pt.get("decode_context_parallel_size") or 1)
-    world = dp * tp * max(1, pcp) * max(1, dcp)
+    world = dp * tp * max(1, pcp)
     ep = world if bool(r.get("ep") if r.get("ep") is not None else pt.get("enable_expert_parallel", False)) else 1
     track = "unmerged_pr" if "unmerged_pr" in rung else ("raw_eager" if "raw_eager" in rung else "merged")
     fx = r.get("fx_compilation_summary") or {}
@@ -296,25 +328,33 @@ def _eval_model_run(r: dict[str, Any]) -> dict[str, Any]:
         if cap_mode == "piecewise":
             raw["runtime"]["mixed_mode"] = "piecewise"
             raw["runtime"]["splitting_ops"] = ["attention", "attention_qk", "attention_pv", "attention_softmax", "attention_merge", "mla", "gdn", "gdn_prepare", "gdn_state", "gdn_output", "recurrent_vector", "kda", "kda_recurrent"]
-        base_pw = (0.20 + 0.00005 * sched_toks) if ep == 1 else (0.36 + 0.00018 * sched_toks)
-        if cg_mode == "PIECEWISE" and sched_toks > cg_max:
-            base_pw += 0.60
-        pw_sync = base_pw * (1.0 + 0.45 * max(0, dp - 1))
-        raw["runtime"]["submission"] = {
-            "kernel_launch_ms": 0.062, "graph_replay_ms": 0.30,
-            "piecewise_sync_ms": pw_sync if cap_mode == "piecewise" else 0.0,
-            "scheduler_ms": 1.40 if ph == "decode" else 0.70, "completion_ms": 0.65 if ph == "decode" else 0.35,
-        }
         cs = parse_case(raw)
         rep = graph_costs(cs, target_graphs(cs, phase=ph, tokens=tok, context=ctx, sequences=seqs, scope="model"), external_inputs={"analysis_input": 0}, include_submission=True, isolated=False, fast_span_only=True)
         pred_ms = float(rep["duration_ms"])
         ape = abs(pred_ms - float(meas)) / float(meas)
         replays_per_rep = max(1, int(rep["execution"]["submission"]["graph_replays"]) // max(1, dp))
+        indep_l2_uri = r.get("independent_l2_capture_uri")
+        indep_l2_meas = t.get(lkey)
+        if indep_l2_uri and indep_l2_meas is not None and float(indep_l2_meas) > 0.0:
+            l2_rep = graph_costs(cs, target_graphs(cs, phase=ph, tokens=tok, context=ctx, sequences=seqs, scope="body"), external_inputs={"analysis_input": 0}, include_submission=False, isolated=False, fast_span_only=True)
+            l2_pred_us = float(l2_rep["duration_ms"]) * 1000.0
+            l2_meas_us = float(indep_l2_meas)
+            l2_ape = abs(l2_pred_us - l2_meas_us) / l2_meas_us
+            l2_block = {
+                "status": "ok", "capture_uri": str(indep_l2_uri),
+                "measured_block_us": round(l2_meas_us, 2), "predicted_block_us": round(l2_pred_us, 2),
+                "ape": l2_ape, "ape_pct": round(l2_ape * 100.0, 2),
+            }
+        else:
+            l2_block = {
+                "status": "missing_evidence", "reason": "independent_l2_block_capture_absent",
+                "capture_uri": "", "measured_block_us": None, "predicted_block_us": None,
+                "ape": None, "ape_pct": None,
+            }
         phases[ptag] = {
             "phase": ph, "cap_mode": cap_mode, "measured_ms": round(float(meas), 3), "predicted_ms": round(pred_ms, 3),
             "ape": ape, "ape_pct": round(ape * 100.0, 2),
-            "measured_per_layer_us": round(float(t.get(lkey) or (float(meas) * 1000.0 / L)), 2),
-            "predicted_per_layer_us": round(pred_ms * 1000.0 / L, 2),
+            "l2_block": l2_block,
             "fx_post_split_subgraphs": fx_sub, "predicted_replays": replays_per_rep,
         }
     return {
@@ -345,11 +385,13 @@ def main(argv: list[str] | None = None) -> int:
         for ptag, pv in rr["phases"].items():
             if pv["cap_mode"] == "piecewise" and pv["fx_post_split_subgraphs"] is not None and int(pv["fx_post_split_subgraphs"]) == int(pv["predicted_replays"]):
                 fx_matches += 1
+            blk = pv["l2_block"]
             l2[sp].append({
                 "id": f"{rr['run_id']}:{ptag}:layer_block", "model_id": rr["model_id"], "rung": rr["rung"], "phase": pv["phase"],
-                "measured_per_layer_us": pv["measured_per_layer_us"], "predicted_per_layer_us": pv["predicted_per_layer_us"],
+                "status": blk["status"], **({"reason": blk["reason"]} if "reason" in blk else {}),
+                "measured_block_us": blk["measured_block_us"], "predicted_block_us": blk["predicted_block_us"],
                 "fx_post_split_subgraphs": pv["fx_post_split_subgraphs"], "predicted_replays": pv["predicted_replays"],
-                "ape_pct": pv["ape_pct"], "ape": pv["ape"], "capture_uri": rr["capture_uri"],
+                "ape_pct": blk["ape_pct"], "ape": blk["ape"], "capture_uri": blk["capture_uri"],
             })
             l3[sp].append({
                 "id": f"{rr['run_id']}:{ptag}", "run_id": rr["run_id"], "model_id": rr["model_id"], "rung": rr["rung"],
@@ -377,7 +419,16 @@ def main(argv: list[str] | None = None) -> int:
             "exact_fx_subgraph_matches": fx_matches,
         },
         "level1_operators": {sp: {k: v for k, v in l1[sp].items() if k != "ids"} for sp in ("train", "heldout")},
-        "level2_subgraphs_and_blocks": {sp: {"summary": _stats([x["ape"] for x in l2[sp]]), "records": [{k: v for k, v in x.items() if k != "ape"} for x in l2[sp]]} for sp in ("train", "heldout")},
+        "level2_subgraphs_and_blocks": {
+            sp: {
+                "summary": {
+                    **_stats([x["ape"] for x in l2[sp] if x.get("status") == "ok" and x.get("ape") is not None]),
+                    "missing_evidence": sum(1 for x in l2[sp] if x.get("status") == "missing_evidence"),
+                },
+                "records": [{k: v for k, v in x.items() if k != "ape"} for x in l2[sp]],
+            }
+            for sp in ("train", "heldout")
+        },
         "level3_model_steps": {sp: {"summary": _stats([x["ape"] for x in l3[sp]]), "records": [{k: v for k, v in x.items() if k != "ape"} for x in l3[sp]]} for sp in ("train", "heldout")},
         "wall_seconds": round(time.perf_counter() - t0, 2),
     }

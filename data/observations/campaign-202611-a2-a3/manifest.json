@@ -1,0 +1,31 @@
+{
+  "schema": "mindie-sim.observation-campaign/1",
+  "campaign_id": "campaign-202611-a2-a3",
+  "captured_on": "2026-11-19",
+  "cann_baseline": "9.3.0",
+  "npu_arch": "DAV_2201",
+  "methodology": {
+    "clock_lock": "30x_4096x4096_bf16_gemm_warmup",
+    "cold_ring_eviction": "ge_3x_l2_per_die_rotating_slots",
+    "stream_saturation": "2.5ms_zero_l2_stream_blocker",
+    "pure_read_aiv_dram_rule": "mte2_aiv_dram_fitted_strictly_from_pure_read_mte2_aiv_read_medians_excluding_recycled_output_vector_ops",
+    "split_isolation": "strict_train_only_calibration_with_zero_heldout_leakage"
+  },
+  "calibrated_anchor_skus": {
+    "Ascend910B4": "data/observations/campaign-202611-a2-a3/a2_910b4_train_calibration.json",
+    "Ascend910_9362": "data/observations/campaign-202611-a2-a3/a3_9362_train_calibration.json",
+    "Ascend910_9382": "data/observations/campaign-202611-a2-a3/a3_9382_train_calibration.json"
+  },
+  "physics_scaled_siblings": {
+    "Ascend910B1": "Ascend910B4",
+    "Ascend910B2": "Ascend910B4",
+    "Ascend910B2C": "Ascend910B4",
+    "Ascend910B3": "Ascend910B4",
+    "Ascend910B4-1": "Ascend910B4",
+    "Ascend910_9391": "Ascend910_9382",
+    "Ascend910_9392": "Ascend910_9382",
+    "Ascend910_9381": "Ascend910_9382",
+    "Ascend910_9372": "Ascend910_9362"
+  },
+  "fabric_and_host_bus": "data/observations/campaign-202611-a2-a3/fabric_and_host_bus_train_summary.json"
+}

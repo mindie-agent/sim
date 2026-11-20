@@ -1,0 +1,86 @@
+{
+  "schema": "mindie-sim.fabric-and-host-bus-train/1",
+  "split": "train",
+  "a2_pcie_gen4x16_and_k8_mesh": {
+    "source": "capture://campaign-202611-a2-a3/a2_910b4/host_and_fabric_train.jsonl",
+    "h2d": {
+      "protocol": "PCIe_Gen4x16",
+      "transport_mode": "pcie_dma",
+      "uni_peak_bw_gbps": 31.5,
+      "calibrated_uni_bw_gbps": 25.5,
+      "bi_peak_bw_gbps": 35.8,
+      "pageable_uni_bw_gbps": 21.2,
+      "alpha_us": 9.2,
+      "node_peak_bw_gbps": 200.0
+    },
+    "d2h": {
+      "protocol": "PCIe_Gen4x16",
+      "transport_mode": "pcie_dma",
+      "uni_peak_bw_gbps": 31.5,
+      "calibrated_uni_bw_gbps": 28.7,
+      "bi_peak_bw_gbps": 35.8,
+      "pageable_uni_bw_gbps": 23.4,
+      "alpha_us": 8.1,
+      "node_peak_bw_gbps": 225.0
+    },
+    "d2d_intra_node": {
+      "protocol": "HCCS_DIRECT_K8_MESH",
+      "channel_semantics": "per_pair",
+      "uni_peak_bw_gbps": 24.0,
+      "bi_peak_bw_gbps": 44.4,
+      "calibrated_uni_bw_gbps": 18.2,
+      "alpha_us": 16.0
+    }
+  },
+  "a3_host_hccs_sio_and_superpod": {
+    "source": "capture://campaign-202611-a2-a3/a3_9362_9382/host_and_fabric_train.jsonl",
+    "h2d": {
+      "protocol": "HCCS",
+      "transport_mode": "hccs_dma",
+      "uni_peak_bw_gbps": 64.0,
+      "calibrated_uni_bw_gbps_9362": 58.4,
+      "calibrated_uni_bw_gbps_9382": 59.5,
+      "bi_peak_bw_gbps": 53.7,
+      "pageable_uni_bw_gbps": 14.3,
+      "alpha_us_9362": 6.11,
+      "alpha_us_9382": 4.5,
+      "node_peak_bw_gbps": 238.8
+    },
+    "d2h": {
+      "protocol": "HCCS",
+      "transport_mode": "hccs_dma",
+      "uni_peak_bw_gbps": 48.0,
+      "calibrated_uni_bw_gbps_9362": 42.7,
+      "calibrated_uni_bw_gbps_9382": 41.5,
+      "bi_peak_bw_gbps": 53.7,
+      "pageable_uni_bw_gbps": 17.7,
+      "alpha_us_9362": 5.4,
+      "alpha_us_9382": 4.9,
+      "node_peak_bw_gbps": 160.0
+    },
+    "d2d_intra_package_sio": {
+      "protocol": "SIO",
+      "uni_peak_bw_gbps": 224.0,
+      "bi_peak_bw_gbps": 414.4,
+      "calibrated_uni_bw_gbps": 122.0,
+      "raw_sdma_uni_bw_gbps": 163.8,
+      "alpha_us": 0.8
+    },
+    "d2d_intra_node_hccs_sw": {
+      "protocol": "HCCS_SW",
+      "uni_peak_bw_gbps": 196.0,
+      "bi_peak_bw_gbps": 362.6,
+      "calibrated_2p_uni_bw_gbps": 111.0,
+      "hierarchical_4p_16p_busbw_gbps_range": [224.0, 233.2],
+      "alpha_us": 1.8
+    },
+    "a3_superpod_optical_hccs": {
+      "protocol": "HCCS_OPTICAL_SUPERPOD",
+      "superpod_size": 384,
+      "uni_peak_bw_gbps": 280.0,
+      "allgather_effective_bw_gbps": 220.2,
+      "alltoall_effective_bw_gbps": 139.5,
+      "alpha_us": 3.5
+    }
+  }
+}

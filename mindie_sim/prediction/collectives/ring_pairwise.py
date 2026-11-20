@@ -1,14 +1,22 @@
 """Bounded ring and pairwise collective transport on the common engine.
 
-[Role] Execute declared allreduce, reduce-scatter, allgather and alltoall
-  transport rounds, including complete cross-DP cohorts.
-[Invariants] A rank's next send follows its own prior first-hop service and its
-  own prior receive. Peer sends are not serialized by a collective-wide barrier.
-  Every hop is routed and framed once by Topology.route_message, then served,
-  propagated and forwarded causally. Empty traffic consumes no wire or latency.
-[Timeouts & Locks] Virtual events; O(ranks) counters plus actual in-flight
-  messages. Pairwise rounds are generated lazily rather than retained.
-[Side-Effect Policy] Submits tasks to the caller's Engine; no runtime dispatch.
+[Role]
+  Execute declared allreduce, reduce-scatter, allgather and alltoall transport
+  rounds, including complete cross-DP cohorts.
+
+[Invariants]
+  * A rank's next send follows its own prior first-hop service and its own
+    prior receive; peer sends are not serialized by a collective-wide barrier.
+  * Every hop is routed and framed once by ``Topology.route_message``, then
+    served, propagated and forwarded causally.
+  * Empty traffic consumes no wire bytes or latency.
+
+[Timeouts & Locks]
+  Virtual events; O(ranks) counters plus actual in-flight messages. Pairwise
+  rounds are generated lazily rather than retained.
+
+[Side-Effect Policy]
+  Submits tasks to the caller's Engine; no runtime dispatch or external I/O.
 """
 from __future__ import annotations
 
@@ -17,7 +25,7 @@ import math
 from typing import ClassVar
 
 from mindie_sim.schema.common import ModelingError
-from .communication import MessageFlow, RoutedMessage
+from ..communication import MessageFlow, RoutedMessage
 
 
 def plan_options(recipe, op):
@@ -76,8 +84,6 @@ class RingGroup:
         def retire(index):
             event = complete[self.ranks[index]]
             predecessor = (index - 1) % count
-            # received[i] is source i's message arriving at i+1. Rank index's
-            # own last receive is therefore received[predecessor].
             if (sent[index] >= self.rounds - 1
                     and received[predecessor] >= self.rounds - 1):
                 if not event.done:
@@ -92,8 +98,6 @@ class RingGroup:
             issued[index] = next_round
             message = self.messages[index]
             prefix = f"{name}:rank{self.ranks[index]}:round{next_round}"
-            # The first send waits source and destination entry. Later sends
-            # retain predecessor receive-forward ordering without a new gate.
             dependencies = ((initial[self.ranks[index]],
                              initial[message.flow.destination])
                             if next_round == 0
@@ -234,7 +238,7 @@ class PairwiseGroup:
                     engine.resolve(event)
 
         def deliver(index, round_index, event):
-            """Advance a receiver by contiguous rounds; buffer only actual early arrivals."""
+            """Advance a receiver by contiguous rounds; buffer only early arrivals."""
             if round_index < expected_receive[index]:
                 raise ModelingError("pairwise_collective_receive_round_regressed")
             if round_index > expected_receive[index]:
@@ -268,7 +272,6 @@ class PairwiseGroup:
                        if self.peer_traffic is not None
                        else volumes[source] / rounds)
             dependencies = [initial[source]]
-            # A zero-byte logical send has no destination buffer obligation.
             if payload:
                 dependencies.append(initial[destination])
             if round_index:
@@ -304,7 +307,8 @@ class PairwiseGroup:
                     service = engine.submit(
                         f"{prefix}:hop{hop_index}:service",
                         hop.demand, after=(previous,),
-                        owner=owner, coupled=True, on_complete=sent if hop_index == 0 else None,
+                        owner=owner, coupled=True,
+                        on_complete=sent if hop_index == 0 else None,
                     )
                     previous = engine.submit(
                         f"{prefix}:hop{hop_index}:arrival", after=(service,),
@@ -334,7 +338,6 @@ class PairwiseGroup:
 class PairwisePlan:
     family: str
     groups: tuple[PairwiseGroup, ...]
-    #: Declared startup model (abstract); a physical program owns its arrivals.
     startup_rounds: int | None = None
     startup_application: str = "startup_model"
 
@@ -408,7 +411,7 @@ class RingCollective:
     algorithm: ClassVar[str] = "ring"
 
     def lower(self, context):
-        from .program import KernelProgram, Stage
+        from ..program import KernelProgram, Stage
 
         if any(amount for role, amount in context.native_work.items() if role != "link"):
             raise ModelingError("ring_collective_requires_transport_only_work")
@@ -419,8 +422,6 @@ class RingCollective:
         if context.collective_plan is None:
             raise ModelingError("ring_collective_requires_bound_topology")
         plan = context.collective_plan()
-        # The aggregate setup_ms contains all ring propagation delays. Every
-        # actual message now carries its own latency; adding it again is wrong.
         plan.validate_path_model(self.path_model)
         return KernelProgram((Stage("ring", program=plan),), minimum_ms=context.minimum_ms)
 
@@ -433,7 +434,7 @@ class PairwiseCollective:
     algorithm: ClassVar[str] = "pairwise"
 
     def lower(self, context):
-        from .program import KernelProgram, Stage
+        from ..program import KernelProgram, Stage
 
         if any(amount for role, amount in context.native_work.items() if role != "link"):
             raise ModelingError("pairwise_collective_requires_transport_only_work")
@@ -444,9 +445,7 @@ class PairwiseCollective:
             if not context.native_work.get("link"):
                 return KernelProgram((), minimum_ms=context.minimum_ms)
             raise ModelingError("pairwise_collective_requires_bound_topology")
-        # A locally idle source may still receive from its bound cohort.
         plan = context.collective_plan()
-        # setup_ms is an aggregate legacy estimate; per-hop events are exact.
         plan.validate_path_model(self.path_model)
         return KernelProgram((Stage("pairwise", program=plan),),
                              minimum_ms=context.minimum_ms)

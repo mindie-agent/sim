@@ -86,8 +86,8 @@ transport recipe.
 ## Source absorption
 
 Useful-versus-wire framing, rank placement, and dependent round scheduling live
-in `mindie_sim/prediction/topology.py` and
-`mindie_sim/prediction/collectives.py` without empirical timing multipliers.
+in `mindie_sim/prediction/collectives/topology.py` and
+`mindie_sim/prediction/collectives/ring_pairwise.py` without empirical timing multipliers.
 
 The receive-forward dependency was checked against official NVIDIA NCCL source
 at fixed tag `v2.26.6-1`, not an asserted latest release:

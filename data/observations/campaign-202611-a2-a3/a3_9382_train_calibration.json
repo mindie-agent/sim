@@ -1,0 +1,62 @@
+{
+  "schema": "mindie-sim.sku-train-calibration/1",
+  "sku": "Ascend910_9382",
+  "architecture": "A3",
+  "npu_arch": "DAV_2201",
+  "split": "train",
+  "provenance": {
+    "domain1_to_5": "capture://campaign-202611-a2-a3/a3_9382/domain1_to_5_train.jsonl",
+    "fabric_intra": "capture://campaign-202611-a2-a3/a3_9382/fabric_intra_train.jsonl"
+  },
+  "geometry": {
+    "aic_count": 24,
+    "aiv_count": 48,
+    "active_clock_mhz": 1800.0,
+    "dies_per_package": 2,
+    "memory_bytes": 68719476736,
+    "l2_capacity_bytes": 201326592,
+    "hbm_peak_bw_gbps": 1600.0
+  },
+  "service_rates_bytes_per_s": {
+    "mte2_aic_l2": 3123200000000.0,
+    "mte2_aic_dram": 1424000000000.0,
+    "mte2_aiv_l2": 1423200000000.0,
+    "mte2_aiv_dram": 1322000000000.0,
+    "hbm_atomic_rmw": 940700000000.0,
+    "grouped_mte2_dram": 1237600000000.0
+  },
+  "matrix_ceilings_flops_per_s": {
+    "bf16_sustained": 319800000000000.0,
+    "w8a8_fractal_nz": 547000000000000.0,
+    "w4a8_unpack_fractal_nz": 330200000000000.0
+  },
+  "kernel_invocations_ms": {
+    "empty_aic": 0.00168,
+    "vector": 0.00192,
+    "cube": 0.0021,
+    "norm": 0.00248,
+    "w8a8_nd_bf16": 0.00868
+  },
+  "samples": [
+    {
+      "resource": "mte2_aiv_dram",
+      "work": 167772160,
+      "work_bytes": 167772160,
+      "duration_ms": 0.12691,
+      "run_id": "train-aiv-read-160m",
+      "repeat_index": 0,
+      "source": "capture://campaign-202611-a2-a3/a3_9382/domain1_to_5_train.jsonl",
+      "split": "train"
+    },
+    {
+      "resource": "mte2_aiv_dram",
+      "work": 268435456,
+      "work_bytes": 268435456,
+      "duration_ms": 0.20305,
+      "run_id": "train-aiv-read-256m",
+      "repeat_index": 0,
+      "source": "capture://campaign-202611-a2-a3/a3_9382/domain1_to_5_train.jsonl",
+      "split": "train"
+    }
+  ]
+}

@@ -1,0 +1,68 @@
+{
+  "schema": "mindie-sim.sku-train-calibration/1",
+  "sku": "Ascend910B4",
+  "architecture": "A2",
+  "npu_arch": "DAV_2201",
+  "split": "train",
+  "provenance": {
+    "domain1_to_5": "capture://campaign-202611-a2-a3/a2_910b4/domain1_to_5_train.jsonl",
+    "cann930_delta": "capture://campaign-202611-a2-a3/a2_910b4/cann930_kernel_delta_train.jsonl",
+    "fabric_intra": "capture://campaign-202611-a2-a3/a2_910b4/fabric_intra_train.jsonl"
+  },
+  "geometry": {
+    "aic_count": 20,
+    "aiv_count": 40,
+    "active_clock_mhz": 1650.0,
+    "memory_bytes": 34359738368,
+    "l2_capacity_bytes": 100663296,
+    "hbm_peak_bw_gbps": 800.0
+  },
+  "service_rates_bytes_per_s": {
+    "mte2_aic_l2": 3474870000000.0,
+    "mte2_aic_dram": 757990000000.0,
+    "mte2_aiv_l2": 3592980000000.0,
+    "mte2_aiv_dram": 756420000000.0,
+    "hbm_atomic_rmw": 585220000000.0,
+    "grouped_mte2_dram": 733810000000.0
+  },
+  "matrix_ceilings_flops_per_s": {
+    "bf16_sustained": 240642000000000.0,
+    "w8a8_fractal_nz": 430638000000000.0,
+    "w4a8_unpack_fractal_nz": 265303000000000.0
+  },
+  "kernel_invocations_ms": {
+    "empty_aic": 0.00164,
+    "vector": 0.00155,
+    "cube": 0.00148,
+    "norm": 0.00423,
+    "w8a8_nd_bf16": 0.00695
+  },
+  "cann930_skinny_w8a8_reference": {
+    "shape": [16, 7168, 2048],
+    "layout": "FRACTAL_NZ",
+    "cann930_duration_us": 30.38,
+    "split": "train"
+  },
+  "samples": [
+    {
+      "resource": "mte2_aiv_dram",
+      "work": 67108864,
+      "work_bytes": 67108864,
+      "duration_ms": 0.08872,
+      "run_id": "train-aiv-read-64m",
+      "repeat_index": 0,
+      "source": "capture://campaign-202611-a2-a3/a2_910b4/domain1_to_5_train.jsonl",
+      "split": "train"
+    },
+    {
+      "resource": "mte2_aiv_dram",
+      "work": 134217728,
+      "work_bytes": 134217728,
+      "duration_ms": 0.17744,
+      "run_id": "train-aiv-read-128m",
+      "repeat_index": 0,
+      "source": "capture://campaign-202611-a2-a3/a2_910b4/domain1_to_5_train.jsonl",
+      "split": "train"
+    }
+  ]
+}
