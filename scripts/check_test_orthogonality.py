@@ -68,17 +68,45 @@ class ManifestError(Exception):
     """The taxonomy manifest is missing or malformed (exit code 2)."""
 
 
+def _pos_int(raw: object, field: str) -> int:
+    if isinstance(raw, bool):
+        raise ManifestError(f"{field} must be an integer, got {raw!r}")
+    try:
+        value = int(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise ManifestError(f"{field} must be an integer, got {raw!r}") from exc
+    if value < 1:
+        raise ManifestError(f"{field} must be >= 1, got {value}")
+    return value
+
+
 def load_manifest(tests: Path) -> dict:
     path = tests / "TAXONOMY.toml"
     try:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except TimeoutError:
+        raise
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise ManifestError(f"{path}: {exc}") from exc
+    if data.get("schema_version") != 1:
+        raise ManifestError(f"{path}: schema_version must be 1, got {data.get('schema_version')!r}")
+    max_lines = _pos_int(data.get("max_lines", 600), "max_lines")
+    max_modules = _pos_int(data.get("max_modules", 80), "max_modules")
+    if max_lines >= HARD_MAX_LINES:
+        raise ManifestError(f"max_lines ({max_lines}) must be < {HARD_MAX_LINES}")
+    if max_modules > 80:
+        raise ManifestError(f"max_modules ({max_modules}) must be <= 80")
     modules = {}
     for entry in data.get("module", []):
+        if not isinstance(entry, dict):
+            raise ManifestError(f"module entry must be a table: {entry!r}")
         rel = entry.get("path")
         if not rel or entry.get("tier") not in TIERS:
             raise ManifestError(f"module entry needs path and tier in {TIERS}: {entry}")
+        if "max_lines" in entry:
+            entry_cap = _pos_int(entry["max_lines"], f"{rel}.max_lines")
+            if entry_cap >= HARD_MAX_LINES:
+                raise ManifestError(f"{rel}.max_lines ({entry_cap}) must be < {HARD_MAX_LINES}")
         if rel in modules:
             raise ManifestError(f"duplicate manifest module {rel}")
         modules[rel] = entry
@@ -87,13 +115,14 @@ def load_manifest(tests: Path) -> dict:
         raise ManifestError("manifest declares no domains")
     return {"domains": domains, "modules": modules,
             "support_dirs": tuple(data.get("support_dirs", ())),
-            "max_lines": int(data.get("max_lines", 600)),
-            "max_modules": int(data.get("max_modules", 80))}
+            "max_lines": max_lines,
+            "max_modules": max_modules}
 
 
 def git(root: Path, *args: str) -> str:
     done = subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True,
-                          timeout=GIT_TIMEOUT_S, check=False)
+                          stdin=subprocess.DEVNULL, timeout=GIT_TIMEOUT_S, check=False,
+                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     if done.returncode:
         raise ManifestError(f"git {' '.join(args)} failed: {done.stderr.strip()}")
     return done.stdout
@@ -162,6 +191,13 @@ class ModuleCheck(ast.NodeVisitor):
         self.findings: list[Finding] = []
         self.scope_tier1 = 0
         self.repo_names: set[str] = set()
+        self.aliases: dict[str, str] = {}
+
+    def resolve(self, node: ast.AST) -> str:
+        raw = dotted(node)
+        head, sep, tail = raw.partition(".")
+        mapped = self.aliases.get(head)
+        return f"{mapped}{sep}{tail}" if mapped else raw
 
     def visit_Module(self, node: ast.Module) -> None:
         for stmt in node.body:
@@ -225,14 +261,19 @@ class ModuleCheck(ast.NodeVisitor):
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
             self._imported(node, alias.name)
+            if alias.asname:
+                self.aliases[alias.asname] = alias.name
         self.generic_visit(node)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         module = node.module or ""
         self._imported(node, module)
         for alias in node.names:
-            if node.level and not module or alias.name == "ProcessPoolExecutor":
-                self._imported(node, f"{module}.{alias.name}".lstrip("."))
+            target = f"{module}.{alias.name}".lstrip(".") if module else alias.name
+            if alias.name.startswith("test_") or node.level and not module or alias.name == "ProcessPoolExecutor":
+                self._imported(node, target)
+            if not node.level and module:
+                self.aliases[alias.asname or alias.name] = f"{module}.{alias.name}"
         self.generic_visit(node)
 
     def _imported(self, node: ast.AST, module: str) -> None:
@@ -260,11 +301,11 @@ class ModuleCheck(ast.NodeVisitor):
         self.generic_visit(node)
 
     def _env_target(self, target: ast.AST) -> None:
-        if isinstance(target, ast.Subscript) and dotted(target.value) == "os.environ":
+        if isinstance(target, ast.Subscript) and self.resolve(target.value) == "os.environ":
             self.add(target, "TO007", "direct os.environ write: use monkeypatch / MonkeyPatch.context()")
 
     def visit_Call(self, node: ast.Call) -> None:
-        name = dotted(node.func)
+        name = self.resolve(node.func)
         head, _, attr = name.rpartition(".")
         if head == "os.environ" and attr in ENV_MUTATORS or name in {"os.putenv", "os.unsetenv"}:
             self.add(node, "TO007", f"{name}(): use monkeypatch")
@@ -330,18 +371,20 @@ class Gate:
     def classify(self, rel: str) -> str:
         """Return 'test', 'support', 'oracle', 'conftest', 'data', 'manifest' or 'other'."""
         parts = Path(rel).parts[1:]
+        if "__pycache__" in parts:
+            return "data"
         if rel == "tests/TAXONOMY.toml":
             return "manifest"
-        if parts and parts[0] == "fixtures" or "__pycache__" in parts:
-            return "data"
         if parts and parts[-1] == "conftest.py":
             return "conftest"
+        if parts and parts[-1].startswith("test_") and parts[-1].endswith(".py"):
+            return "test"
+        if parts and parts[0] == "fixtures":
+            return "data"
         if parts and parts[0] == "_oracles":
             return "oracle"
         if parts and parts[0] == "_support":
             return "support"
-        if parts and parts[-1].startswith("test_") and parts[-1].endswith(".py"):
-            return "test"
         return "other"
 
     def check_file(self, rel: str, status: str, base: str | None) -> None:
@@ -417,7 +460,32 @@ class Gate:
         check.visit(tree)
         self.findings.extend(check.findings)
 
-    def check_tree(self, strict: bool) -> None:
+    def _support_imports(self, path: Path, *, in_support: bool) -> set[str]:
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"), filename=str(path))
+        except SyntaxError:
+            return set()
+        refs: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    parts = alias.name.split(".")
+                    if parts[:1] == ["_support"] and len(parts) >= 2:
+                        refs.add(parts[1])
+                    elif parts[:2] == ["tests", "_support"] and len(parts) >= 3:
+                        refs.add(parts[2])
+            elif isinstance(node, ast.ImportFrom):
+                mod = node.module or ""
+                parts = mod.split(".") if mod else []
+                if in_support and node.level == 1:
+                    refs.update((parts[0],) if parts else (a.name for a in node.names))
+                elif parts[:1] == ["_support"]:
+                    refs.update((parts[1],) if len(parts) >= 2 else (a.name for a in node.names))
+                elif parts[:2] == ["tests", "_support"]:
+                    refs.update((parts[2],) if len(parts) >= 3 else (a.name for a in node.names))
+        return refs
+
+    def check_tree(self, strict: bool, base: str | None) -> None:
         on_disk = {str(p.relative_to(self.tests)).replace("\\", "/")
                    for p in self.tests.glob("*/test_*.py") if p.parent.name in self.m["domains"]}
         if len(on_disk) > self.m["max_modules"]:
@@ -429,13 +497,26 @@ class Gate:
             for rel, entry in self.m["modules"].items():
                 if rel not in on_disk and not entry.get("reserved"):
                     self.add(f"tests/{rel}", 1, "TO003", "manifest module missing on disk (mark reserved or remove)")
-        corpus = "\n".join(p.read_text(encoding="utf-8", errors="replace") for p in self.tests.rglob("*.py")
-                           if "__pycache__" not in p.parts)
-        corpus += "\n" + "\n".join(p.read_text(encoding="utf-8", errors="replace")
-                                   for p in (self.root / "scripts").glob("*.py"))
-        for path in (self.tests / "_support").glob("*.py"):
-            if path.name != "__init__.py" and not re.search(rf"\b_support(\.|\s+import\s+){path.stem}\b|\b_support\.{path.stem}\b|from\s+_support\s+import\s+[\w\s,]*\b{path.stem}\b", corpus):
-                self.add(f"tests/_support/{path.name}", 1, "TO013", "orphan _support module (no importer)")
+        elif base is not None:
+            base_files = set(git(self.root, "ls-tree", "-r", "--name-only", base, "--", "tests").splitlines())
+            for rel, entry in self.m["modules"].items():
+                if f"tests/{rel}" in base_files and rel not in on_disk and not entry.get("reserved"):
+                    self.add(f"tests/{rel}", 1, "TO003", "established manifest module deleted on disk")
+        support_dir = self.tests / "_support"
+        support_edges = {p.stem: self._support_imports(p, in_support=True) - {p.stem}
+                         for p in support_dir.glob("*.py") if p.name != "__init__.py"}
+        used: set[str] = set()
+        roots = [p for p in self.tests.rglob("*.py") if "__pycache__" not in p.parts and support_dir not in p.parents]
+        roots.extend((self.root / "scripts").glob("*.py"))
+        stack = list({ref for p in roots for ref in self._support_imports(p, in_support=False)})
+        while stack:
+            stem = stack.pop()
+            if stem not in used:
+                used.add(stem)
+                stack.extend(support_edges.get(stem, ()))
+        for stem in sorted(support_edges):
+            if stem not in used:
+                self.add(f"tests/_support/{stem}.py", 1, "TO013", "orphan _support module (no AST importer)")
 
     def run(self, base: str | None, strict: bool) -> None:
         if strict:
@@ -448,7 +529,7 @@ class Gate:
         for rel, status in sorted(targets.items()):
             if (self.root / rel).is_file():
                 self.check_file(rel, status, base_ref)
-        self.check_tree(strict)
+        self.check_tree(strict, base_ref)
 
 
 def main(argv: list[str] | None = None) -> int:

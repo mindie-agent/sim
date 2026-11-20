@@ -125,8 +125,19 @@ VIOLATIONS = [
                  id="signature-point-test"),
     pytest.param({"tests/schema/test_profiles.py": CLEAN, "tests/artifacts/receipt.txt": "ok\n"}, "TO013",
                  id="stray-artifact"),
-    pytest.param({"tests/schema/test_profiles.py": CLEAN, "tests/_support/unused.py": "VALUE = 1\n"}, "TO013",
-                 id="orphan-support"),
+    pytest.param({"tests/schema/test_profiles.py": CLEAN, "tests/fixtures/test_unlisted.py": CLEAN},
+                 "TO002", id="test-inside-fixtures"),
+    pytest.param({"tests/schema/test_profiles.py": "from tests.runtime import test_engine_core\n" + CLEAN},
+                 "TO006", id="from-package-import-test"),
+    pytest.param({"tests/schema/test_profiles.py": _body("def test_law():\n    from os import environ\n"
+                                                          "    environ['HOME'] = 'x'\n")}, "TO007",
+                 id="aliased-environ-write"),
+    pytest.param({"tests/schema/test_profiles.py": _body("def test_law():\n    from inspect import signature\n"
+                                                          "    signature(print)\n")}, "TO011",
+                 id="aliased-signature"),
+    pytest.param({"tests/schema/test_profiles.py": CLEAN,
+                  "tests/_support/unused.py": "# mention _support.unused in comment only\nVALUE = 1\n"},
+                 "TO013", id="comment-only-support-orphan"),
 ]
 
 
@@ -159,6 +170,20 @@ def test_gate_ratchet_lets_legacy_root_tests_shrink_or_swap_imports_but_never_gr
     assert "TO002" in _codes(root, base=base)
     (root / "tests/test_added.py").write_text(CLEAN, encoding="utf-8")
     assert "TO002" in _codes(root, base=base)
+
+
+def test_gate_ratchet_catches_deleted_manifest_module_and_bad_manifests_exit_2(tmp_path):
+    root = _tree(tmp_path, {"tests/schema/test_profiles.py": CLEAN})
+    _git(root, "init", "-q")
+    _git(root, "add", ".")
+    _git(root, "-c", "user.email=ci@example.com", "-c", "user.name=CI", "commit", "-qm", "base")
+    base = _git(root, "rev-parse", "HEAD")
+    (root / "tests/schema/test_profiles.py").unlink()
+    assert "TO003" in _codes(root, base=base)
+    for bad in ("schema_version = 2\n", MANIFEST.replace("max_modules = 4", "max_modules = 81"),
+                MANIFEST.replace("max_lines = 600", 'max_lines = "bad"')):
+        (root / "tests/TAXONOMY.toml").write_text(bad, encoding="utf-8")
+        assert gate.main(["--root", str(root), "--strict"]) == 2
 
 
 def test_manifest_names_only_orthogonal_modules_within_the_ceiling():
@@ -220,7 +245,9 @@ def test_ci_scope_needs_payload_only_allows_skips_for_successful_docs_only(quali
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX path simulates a missing temp parent")
 def test_short_root_fixture_creates_a_missing_platform_temp_and_unwinds(monkeypatch):
-    missing = Path("/tmp") / f"mprobe-{os.getpid()}"
+    owned = tempdirs.tempdir("mp-", directory="/tmp")
+    missing = owned / "sub"
+    assert not missing.exists()
     assert len(os.fspath(missing).encode("utf-8")) <= conftest.SHORT_PARENT_MAX_BYTES
     monkeypatch.setattr(conftest.tempfile, "gettempdir", lambda: str(missing))
     monkeypatch.delenv("MINDIE_REPRO_SHORT_ROOT", raising=False)
@@ -237,7 +264,7 @@ def test_short_root_fixture_creates_a_missing_platform_temp_and_unwinds(monkeypa
         assert os.environ.get("MINDIE_REPRO_SHORT_ROOT") is None
     finally:
         patch.undo()
-        shutil.rmtree(missing, ignore_errors=True)
+        shutil.rmtree(owned, ignore_errors=True)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="short POSIX fallback is not used on Windows")
@@ -261,12 +288,43 @@ def test_temp_roots_stay_owned_until_removal_succeeds(monkeypatch):
     assert tempdirs._ROOTS == [] and not root.exists()
 
 
-def test_isolated_runtime_redirects_every_host_path_variable(_worker_runtime_root):
+@pytest.fixture(scope="module")
+def _module_fixture_env_snapshot():
+    return {
+        "home": os.environ["HOME"],
+        "appdata": os.environ["APPDATA"],
+        "tempdir": conftest.tempfile.gettempdir(),
+        "session": str(Path(os.environ["MINDIE_CACHE_HOME"]).parent),
+    }
+
+
+def test_isolated_runtime_and_module_scope_redirect_host_paths_and_tempdir(
+    _worker_runtime_root, _module_fixture_env_snapshot, monkeypatch
+):
     for name, sub in conftest.HOST_PATH_VARS.items():
         assert os.environ[name] == str(_worker_runtime_root / sub), name
     session = Path(os.environ["MINDIE_CACHE_HOME"]).parent
     assert os.environ["TMPDIR"] == str(session / "tmp")
+    assert Path(conftest.tempfile.gettempdir()) == session / "tmp"
     assert os.environ["XDG_CACHE_HOME"] == str(session / "xdg-cache")
+    assert _module_fixture_env_snapshot["home"].startswith(_module_fixture_env_snapshot["session"])
+    assert _module_fixture_env_snapshot["appdata"].startswith(_module_fixture_env_snapshot["session"])
+    assert _module_fixture_env_snapshot["tempdir"] == str(session / "tmp")
+
+    class _FakeItem:
+        def get_closest_marker(self, _name):
+            return None
+
+        def iter_markers(self, name):
+            assert name == "requires_capture_mount"
+            return [
+                pytest.mark.requires_capture_mount("pyproject.toml").mark,
+                pytest.mark.requires_capture_mount("tests/fixtures/__absent_parent_mount__").mark,
+            ]
+
+    monkeypatch.setenv(conftest.REQUIRE_ALL_ENV, "1")
+    with pytest.raises(pytest.fail.Exception, match="__absent_parent_mount__"):
+        conftest.pytest_runtest_setup(_FakeItem())
 
 
 class _Cp936Stdout:

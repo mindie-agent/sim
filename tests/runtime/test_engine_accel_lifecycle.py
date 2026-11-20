@@ -411,21 +411,41 @@ def test_drain_allocation_failure_publishes_accepted_prefix(fault_library, scena
                 act()
         assert fault_library.drain_fault_count() == before + 1 and info.value.code == 1
         if scenario == "admission":
-            assert info.value.prefix == (0.0, 0, 0, 0, 1) and all(e.started == 0.0 for e in evs)
+            assert info.value.has_prefix and info.value.prefix == (0.0, 0, 0, 0, 1) and all(e.started == 0.0 for e in evs)
+            assert (eng.now, eng.advance_steps, eng.completed_count) == (0.0, 0, 0)
+            assert eng.accel_status()["native_calls"] == 2
         elif scenario == "completion":
-            assert info.value.prefix == (1.0, 0, 0, 1, 0) and (eng.completed_count, eng.serviced["r"]) == (4097, 4097.0)
+            assert info.value.has_prefix and info.value.prefix == (1.0, 0, 0, 1, 0)
+            assert (eng.now, eng.advance_steps, eng.completed_count) == (1.0, 1, 4097)
+            assert evs[-1].time == 1.0 and eng.busy_ms["r"] == 1.0 and eng.serviced["r"] == 4097.0
         else:
-            assert not info.value.has_prefix and good.time == 0.5 and sum(e.started is not None for e in evs) == 4096
+            assert not info.value.has_prefix and info.value.prefix is None and good.time == 0.5
+            assert (eng.now, eng.advance_steps) == (1.0, 2) and sum(e.started is not None for e in evs) == 4096
+            assert eng.busy_ms["r"] == 0.5 and eng.serviced["r"] == 0.5
         close(eng)
 
 
 def test_static_task_link_solver_and_implicit_unit_frontiers():
+    eng_t_max = Engine([Resource("r", 65536.0)], backend="c")
+    [eng_t_max.submit(f"t{i}", {"r": 1.0}) for i in range(65536)]
+    eng_t_max.advance()
+    assert eng_t_max.accel_status()["fallback_reason"] is None and eng_t_max.accel_status()["native_steps"] > 0
+    close(eng_t_max)
+
+    ns32 = [f"r{i}" for i in range(32)]
+    eng_l_max = Engine([Resource(n, 8192.0) for n in ns32], backend="c")
+    [eng_l_max.submit(f"t{i}", dict.fromkeys(ns32, 1.0)) for i in range(8192)]
+    eng_l_max.advance()
+    assert eng_l_max.accel_status()["fallback_reason"] is None and eng_l_max.accel_status()["native_steps"] > 0
+    close(eng_l_max)
+
     for make in (
         lambda: (e := Engine([Resource("r", 1e6)], backend="c"), [e.submit(f"t{i}", {}) for i in range(65537)])[0],
-        lambda: (ns := [f"r{i}" for i in range(32)], e := Engine([Resource(n, 1000.0) for n in ns], backend="c"),
-                 [e.submit(f"t{i}", dict.fromkeys(ns, 1.0)) for i in range(8193)])[1],
-        lambda: (ns := [f"r{i}" for i in range(32)], e := Engine([Resource(n, 100.0) for n in ns], backend="c"),
-                 [e.submit(f"c{i}", dict.fromkeys(ns, 1.0), coupled=True) for i in range(4096)])[1],
+        lambda: (e := Engine([Resource(n, 1000.0) for n in ns32], backend="c"),
+                 [e.submit(f"t{i}", dict.fromkeys(ns32, 1.0)) for i in range(8192)],
+                 e.submit("extra", {"r0": 1.0}))[0],
+        lambda: (e := Engine([Resource(n, 100.0) for n in ns32], backend="c"),
+                 [e.submit(f"c{i}", dict.fromkeys(ns32, 1.0), coupled=True) for i in range(4096)])[0],
         lambda: (e := Engine([Resource("r", 64.0, units=64)], backend="c"),
                  [e.submit(f"p{i}", {"r": 1.0}, placement={"r": tuple(range(64))}) for i in range(32769)])[0],
     ):
@@ -444,19 +464,32 @@ def test_static_task_link_solver_and_implicit_unit_frontiers():
     for b in NATIVE:
         assert out[b][:3] == out["python"][:3] and out[b][3] > 0
 
-    mid = {}
-    for b in ("python", "c"):
+    drained = {}
+    for b in BACKENDS:
         eng = Engine([Resource("r", 64.0, units=64)], backend=b)
-        for i in range(64):
-            eng.submit(f"w{i}", {"r": 1.0})
+        warm = [eng.submit(f"w{i}", {"r": 1.0}) for i in range(64)]
         eng.advance(horizon=0.5)
-        for i in range(32704):
-            eng.submit(f"d{i}", {"r": 1.0})
-        eng.submit("pinned", {"r": 1.0}, placement={"r": tuple(range(63))})
+        midpoint = (eng.now, eng.advance_steps, eng.accel_status()["native_steps"])
+        batch = [eng.submit(f"d{i}", {"r": 1.0}) for i in range(32704)]
+        pinned = eng.submit("pinned", {"r": 1.0}, placement={"r": tuple(range(63))})
         eng.advance(horizon=1.0)
-        mid[b] = (eng.now, eng.completed_count, eng.serviced["r"], eng.accel_status()["fallback_reason"])
+        mid1 = (eng.now, eng.completed_count, eng.serviced["r"])
+        eng.advance()
+        status = eng.accel_status()
+        drained[b] = (
+            midpoint, mid1, eng.now, eng.completed_count, dict(eng.serviced), dict(eng.busy_ms),
+            eng.advance_steps, warm[0].time, pinned.time, batch[0].time, batch[-1].time,
+            status["fallback_reason"],
+        )
         close(eng)
-    assert mid["c"][:3] == mid["python"][:3] and mid["c"][3] == "capacity_exceeded"
+    assert drained["python"][0] == (0.5, 1, 0)
+    assert (drained["python"][2], drained["python"][3], drained["python"][5]) == (
+        512.015873015873, 32769, {"r": 512.015873015873})
+    assert drained["python"][4]["r"] == pytest.approx(32769.0, abs=1e-7)
+    for b in NATIVE:
+        assert drained[b][0][:2] == drained["python"][0][:2] and drained[b][0][2] > 0, b
+        assert drained[b][1:11] == drained["python"][1:11], b
+        assert drained[b][2] == 512.015873015873 and drained[b][11] == "capacity_exceeded", b
 
 
 def test_native_source_and_sanitizer_harness_pass_asan_ubsan_and_werror(tmp_path):
@@ -481,6 +514,9 @@ def test_installed_pep517_wheel_ships_runtime_resources_and_runs_native():
         assert wheel.name == f"mindie_sim-{ver}-py3-none-any.whl"
         entries = verify_wheel_record(wheel)
         package = {k: v for k, v in entries.items() if k.startswith("mindie_sim/")}
+        dist_files = set(entries) - set(package)
+        expected_dist = {dist_dir + k for k in ("METADATA", "WHEEL", "top_level.txt", "RECORD")}
+        assert expected_dist <= dist_files <= (expected_dist | {dist_dir + "entry_points.txt"})
         meta = entries[dist_dir + "WHEEL"].decode()
         assert "Root-Is-Purelib: true" in meta and "Tag: py3-none-any" in meta
         assert set(package) == set(workspace) and all(package[k] == workspace[k] for k in workspace)

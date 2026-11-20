@@ -80,11 +80,14 @@ def _profiler_available() -> bool:
 def pytest_runtest_setup(item):
     if item.get_closest_marker("requires_profiler") and not _profiler_available():
         _missing(PROFILER_API_REQUIREMENT)
-    mount = item.get_closest_marker("requires_capture_mount")
-    if mount:
-        absent = [str(p) for p in mount.args if not (Path(p) if Path(p).is_absolute() else ROOT / p).exists()]
-        if absent:
-            _missing(f"retained capture unavailable: {', '.join(absent)}")
+    absent: list[str] = []
+    for mount in item.iter_markers("requires_capture_mount"):
+        for raw in mount.args:
+            target = Path(raw) if Path(raw).is_absolute() else ROOT / raw
+            if not target.exists() and str(raw) not in absent:
+                absent.append(str(raw))
+    if absent:
+        _missing(f"retained capture unavailable: {', '.join(absent)}")
 
 
 def pytest_sessionfinish(session, exitstatus):
@@ -94,21 +97,31 @@ def pytest_sessionfinish(session, exitstatus):
 
 @pytest.fixture(scope="session", autouse=True)
 def isolated_cache():
-    """One accelerator cache, XDG cache and subprocess TMPDIR per worker session."""
+    """Session-level cache, temp dir, and host-path defaults (protects module fixtures)."""
+    old_tempdir = tempfile.tempdir
     base = tempdir("msim-session-")
-    (base / "tmp").mkdir()
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setenv("MINDIE_CACHE_HOME", str(base / "cache"))
-        patch.setenv("XDG_CACHE_HOME", str(base / "xdg-cache"))
-        patch.setenv("TMPDIR", str(base / "tmp"))
-        for name in ACCEL_OVERRIDE_VARS:
-            patch.delenv(name, raising=False)
-        accel_build.reset_build_memo()
-        try:
-            yield base / "cache"
-        finally:
+    session_tmp = base / "tmp"
+    session_tmp.mkdir()
+    session_home = base / "session"
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setenv("MINDIE_CACHE_HOME", str(base / "cache"))
+            patch.setenv("XDG_CACHE_HOME", str(base / "xdg-cache"))
+            for temp_var in ("TMPDIR", "TEMP", "TMP"):
+                patch.setenv(temp_var, str(session_tmp))
+            patch.setattr(tempfile, "tempdir", str(session_tmp))
+            for name, sub in HOST_PATH_VARS.items():
+                patch.setenv(name, str(session_home / sub))
+            for name in ACCEL_OVERRIDE_VARS:
+                patch.delenv(name, raising=False)
             accel_build.reset_build_memo()
-    shutil.rmtree(base, ignore_errors=True)
+            try:
+                yield base / "cache"
+            finally:
+                accel_build.reset_build_memo()
+    finally:
+        tempfile.tempdir = old_tempdir
+        shutil.rmtree(base, ignore_errors=True)
 
 
 def _short_root_parent() -> Path:

@@ -45,8 +45,8 @@ from mindie_sim.schema.parallel import ParallelSpec
 
 from _support.axes import ALL_SKUS, REPRESENTATIVE_SKUS, SKUS
 from _support.hardware import (
-    MODEL, WORKLOAD, Matrix, OneMode, OwnerMoves, ReadMoves, declared_supply, hardware_case,
-    isa_of, machine, op, run, sku_case,
+    EXPECTED_L2_BYTES, MODEL, WORKLOAD, Matrix, OneMode, OwnerMoves, ReadMoves,
+    declared_supply, hardware_case, isa_of, machine, op, run, sku_case,
 )
 
 pytestmark = pytest.mark.tier0
@@ -98,9 +98,9 @@ def test_profile_declaration_materializes_owners_buffers_supply_precision_and_li
     rates, modes, peaks = dict(device.rates), dict(device.service_modes), dict(device.compute_peaks)
     assert len(profiles()) == len(ALL_SKUS) == 16
     assert (device.memory_bytes, device.launch_us, device.compute_units) == (memory, 0, aic)
-    assert rates["hbm"] == pytest.approx(hbm)
+    assert rates["hbm"] == pytest.approx(hbm) and float(decl["hbm_peak_bw_gbps"]) * 1e9 == pytest.approx(hbm)
     buffers = dict(device.buffers)
-    assert buffers.pop("l2") == float(decl["l2_capacity_mib"]) * 2 ** 20 and buffers == isa["buffers"]
+    assert buffers.pop("l2") == EXPECTED_L2_BYTES[sku] == float(decl["l2_capacity_mib"]) * 2 ** 20 and buffers == isa["buffers"]
     units = dict(device.buffer_units)
     assert units["l2"] == 1 and units["ub"] == aiv and units["l1"] == aic
     for role, per_cycle in isa["pipes"].items():

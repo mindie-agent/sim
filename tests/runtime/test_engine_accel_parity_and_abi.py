@@ -38,16 +38,16 @@ from _support.axes import REPRESENTATIVE_SKUS, SKUS
 from mindie_sim.prediction.engine import Engine, ExecutionError, Resource
 from mindie_sim.prediction.program import KernelProgram, Stage
 from mindie_sim.prediction.runtime import accel_build, accel_tables as tables
-from mindie_sim.prediction.runtime.accel_tables import (
-    ABI_VERSION, KernelFault, MAX_R, MAX_U, PROBE_GOLDEN,
-)
-from mindie_sim.prediction.runtime.engine import (
-    _EMPTY_FROZENSET as ENGINE_EMPTY_FROZENSET,
-)
+from mindie_sim.prediction.runtime.accel_tables import ABI_VERSION, KernelFault, PROBE_GOLDEN
+from mindie_sim.prediction.runtime.engine import _EMPTY_FROZENSET as ENGINE_EMPTY_FROZENSET
 
 pytestmark = pytest.mark.tier0
 ULP_BOUND = 8
 INF = float("inf")
+
+
+class _ParityGapError(AssertionError):
+    """Raised only after native execution completes cleanly yet exceeds ULP target."""
 
 
 # -- seeded random programs & standard graphs -------------------------------
@@ -71,37 +71,41 @@ def test_coupled_random_programs_match_python_on_the_native_path(sku, seed):
     assert max_ulps(python, native) <= ULP_BOUND
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "coupled accumulation drift > 8 ULP: "
-    "mindie_sim/prediction/runtime/_engine_accel_rates.h:471"))
-def test_long_coupled_programs_and_minimal_witness_meet_bit_and_8ulp_target():
-    res3 = [Resource("a", 26.289056632197735), Resource("b", 36.495015663833634)]
-    tasks3 = [
-        {"work": {"a": 7.05924503470419, "b": 8.494354162581535}, "coupled": True},
-        {"work": {"a": 6.694301119164283, "b": 5.5353786183562095}, "coupled": True},
-        {"work": {"a": 8.483307144965345, "b": 7.87160639063931}, "coupled": True},
-    ]
-    py3, c3 = (run_program(res3, tasks3, b) for b in ("python", "c"))
-    res96, tasks96 = random_program(2, REPRESENTATIVE_SKUS["a5"], size=96)
-    py96, c96 = (run_program(res96, tasks96, b) for b in ("python", "c"))
-    assert c3["steps"] > 0 and c96["steps"] > 0
-    assert max_ulps(py96, c96) <= ULP_BOUND and max_ulps(py3, c3) == 0
-
-
-@pytest.mark.xfail(strict=True, reason=(
-    "disjoint coupled + overlapping uncoupled solver mismatch: "
-    "mindie_sim/prediction/runtime/arbiter.py:198"))
-def test_disjoint_coupled_peer_does_not_alter_overlapping_uncoupled_order():
-    res = [Resource("cube", 245.76, units=20), Resource("vector", 1.92, units=40)]
-    tasks = [
-        {"work": {"cube": 1.0154159211083948}, "placement": {"cube": (10, 15, 17)}},
-        {"work": {"cube": 3.6808735333841436},
-         "placement": {"cube": (0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18, 19)}},
-        {"work": {"cube": 500.0, "vector": 100.0}, "coupled": True,
-         "placement": {"cube": (3, 4), "vector": (6, 7, 8, 9)}},
-    ]
-    python, native = (run_program(res, tasks, b) for b in ("python", "c"))
-    assert native["steps"] > 0 and max_ulps(python, native) <= ULP_BOUND
+@pytest.mark.parametrize(("build", "target_ulps"), (
+    pytest.param(
+        lambda: ([Resource("a", 26.289056632197735), Resource("b", 36.495015663833634)], [
+            {"work": {"a": 7.05924503470419, "b": 8.494354162581535}, "coupled": True},
+            {"work": {"a": 6.694301119164283, "b": 5.5353786183562095}, "coupled": True},
+            {"work": {"a": 8.483307144965345, "b": 7.87160639063931}, "coupled": True},
+        ]), 0, id="coupled-3task-bit-exact",
+        marks=pytest.mark.xfail(strict=True, raises=_ParityGapError, reason=(
+            "coupled 3-task 2-ULP order drift: mindie_sim/prediction/runtime/_engine_accel_rates.h:471")),
+    ),
+    pytest.param(
+        lambda: random_program(2, REPRESENTATIVE_SKUS["a5"], size=96), ULP_BOUND, id="coupled-96task-8ulp",
+        marks=pytest.mark.xfail(strict=True, raises=_ParityGapError, reason=(
+            "coupled 96-task >8-ULP accumulation drift: mindie_sim/prediction/runtime/_engine_accel_rates.h:471")),
+    ),
+    pytest.param(
+        lambda: ([Resource("cube", 245.76, units=20), Resource("vector", 1.92, units=40)], [
+            {"work": {"cube": 1.0154159211083948}, "placement": {"cube": (10, 15, 17)}},
+            {"work": {"cube": 3.6808735333841436},
+             "placement": {"cube": (0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18, 19)}},
+            {"work": {"cube": 500.0, "vector": 100.0}, "coupled": True,
+             "placement": {"cube": (3, 4), "vector": (6, 7, 8, 9)}},
+        ]), ULP_BOUND, id="disjoint-coupled-solver",
+        marks=pytest.mark.xfail(strict=True, raises=_ParityGapError, reason=(
+            "disjoint coupled + overlapping uncoupled solver mismatch: mindie_sim/prediction/runtime/arbiter.py:198")),
+    ),
+))
+def test_coupled_parity_gap_witnesses_run_natively_and_track_ulp_targets(build, target_ulps):
+    resources, tasks = build()
+    python, native = (run_program(resources, tasks, b) for b in ("python", "c"))
+    assert native["steps"] > 0 and native["reason"] is None
+    assert native["completed"] == python["completed"] == len(tasks)
+    observed = max_ulps(python, native)
+    if observed > target_ulps:
+        raise _ParityGapError(f"observed {observed} ULP > target {target_ulps}")
 
 
 @pytest.mark.parametrize("sku", SKUS)
@@ -112,9 +116,8 @@ def test_standard_stage_graph_takes_native_path_without_fallback(sku):
     aiv = width * vector.units // cube.units
     program = KernelProgram((
         Stage("load", {"mte2": resources[2].rate}),
-        Stage("fused", {"cube": cube.rate, "vector": vector.rate},
-              after=("load",), coupled=True,
-              placement={"cube": tuple(range(width)), "vector": tuple(range(aiv))}),
+        Stage("fused", {"cube": cube.rate, "vector": vector.rate}, after=("load",),
+              coupled=True, placement={"cube": tuple(range(width)), "vector": tuple(range(aiv))}),
         Stage("store", {"hbm": resources[4].rate}, after=("fused",)),
     ))
     results = {}
@@ -138,10 +141,7 @@ def test_build_flags_forbid_value_changing_float_optimisation():
 
 
 # -- bit-identical boundary programs ----------------------------------------
-@pytest.mark.parametrize(
-    ("builder", "auto_native"),
-    [pytest.param(fn, auto_ok, id=label) for label, fn, auto_ok in BOUNDARY_CASES],
-)
+@pytest.mark.parametrize(("builder", "auto_native"), [pytest.param(fn, ok, id=k) for k, fn, ok in BOUNDARY_CASES])
 def test_boundary_programs_are_bit_identical_to_python(builder, auto_native):
     observed, steps, reasons = {}, {}, {}
     for backend in BACKENDS:
@@ -476,13 +476,13 @@ def test_coupled_placement_must_be_proportional_to_owner_counts(sku, extra):
 
 
 def test_arena_resource_and_unit_ceilings_decline_one_past_limit():
-    for count, reason in ((MAX_R, None), (MAX_R + 1, "resource_count")):
+    for count, reason in ((2048, None), (2049, "resource_count")):
         eng = Engine([Resource(f"r{i}", 1.0) for i in range(count)], backend="c")
         [eng.submit(f"t{i}", {f"r{i}": 1.0}) for i in range(count)]
         eng.advance()
         assert eng.accel_status()["fallback_reason"] == reason and (eng.accel_status()["native_steps"] > 0) == (reason is None)
         close(eng)
-    for units, reason in ((MAX_U, None), (MAX_U + 1, "resource_shape")):
+    for units, reason in ((128, None), (129, "resource_shape")):
         eng = Engine([Resource("r", float(units), units=units)], backend="c")
         [eng.submit(f"t{i}", {"r": 1.0}, placement={"r": tuple(range(units))}) for i in range(64)]
         eng.advance()

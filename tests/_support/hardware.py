@@ -1,15 +1,15 @@
-"""Shared SKU case builders and pinned-owner recipes for hardware/datapath tests.
+"""Shared SKU case builders, independent datasheet specs, and pinned-owner recipes.
 
-[Role] Build tiny Ascend cases from a registered SKU and lower explicit
-  byte/FLOP work onto named physical owners, so schema tests and the
-  not-yet-migrated legacy files share one definition instead of importing
-  another ``test_*`` module.
-[Invariants] Expectations are never stored here: per-SKU supply tuples are
-  read from each profile's ``source.declaration`` (independent of the
-  materialized device fields under test); recipes only bind declared work and
-  placements; ``run`` asserts the Engine drains every task, program and pool.
+[Role] Hold the independent 16-SKU Ascend datasheet supply/L2 expectations,
+  build tiny Ascend cases from a registered SKU, and lower explicit byte/FLOP
+  work onto named physical owners so schema tests and legacy callers share one
+  non-tautological oracle instead of reading ``profiles()`` back against itself.
+[Invariants] ``EXPECTED_SKU_SPECS``, ``EXPECTED_L2_BYTES``, and ``A5_BUFFERS``
+  are independent literal hardware specs (zero reads from ``profiles()``);
+  recipes only bind declared work and placements; ``run`` asserts the Engine
+  drains every task, program, and pool.
 [Timeouts & Locks] None; pure in-memory construction.
-[Side-Effect Policy] Reads the packaged profile registry; writes nothing.
+[Side-Effect Policy] Side-effect-free; writes nothing.
 """
 from __future__ import annotations
 
@@ -29,24 +29,50 @@ WORKLOAD = {"requests": [{"prompt_tokens": 1, "output_tokens": 1}]}
 MIB = 2 ** 20
 REGBASE_ISA = "npu_arch_3510"
 
+#: Independent physical datasheet specs: ``(clock_hz, aic, aiv, memory_bytes, hbm_bytes_per_s)``.
+EXPECTED_SKU_SPECS: dict[str, tuple[float, int, int, int, float]] = {
+    "Ascend910B1": (1.85e9, 24, 48, 68719476736, 1.8e12),
+    "Ascend910B2": (1.80e9, 24, 48, 68719476736, 1.8e12),
+    "Ascend910B2C": (1.80e9, 24, 48, 68719476736, 1.8e12),
+    "Ascend910B3": (1.80e9, 20, 40, 68719476736, 1.6e12),
+    "Ascend910B4": (1.50e9, 20, 40, 34359738368, 0.8e12),
+    "Ascend910B4-1": (1.65e9, 20, 40, 68719476736, 1.2e12),
+    "Ascend910_9391": (1.85e9, 24, 48, 68719476736, 1.6e12),
+    "Ascend910_9392": (1.80e9, 24, 48, 68719476736, 1.6e12),
+    "Ascend910_9381": (1.80e9, 20, 40, 68719476736, 1.6e12),
+    "Ascend910_9382": (1.65e9, 20, 40, 68719476736, 1.6e12),
+    "Ascend910_9372": (1.65e9, 20, 40, 68719476736, 1.4e12),
+    "Ascend910_9362": (1.65e9, 20, 40, 68719476736, 1.2e12),
+    "Ascend950DT_9581": (1.65e9, 32, 64, 154618822656, 4.0e12),
+    "Ascend950DT_9582": (1.65e9, 32, 64, 103079215104, 4.0e12),
+    "Ascend950PR_9579": (1.65e9, 32, 64, 68719476736, 1.6e12),
+    "Ascend950PR_958b": (1.65e9, 32, 64, 120259084288, 1.4e12),
+}
+EXPECTED_L2_BYTES: dict[str, int] = {
+    "Ascend910B1": 201326592, "Ascend910B2": 201326592,
+    "Ascend910B2C": 201326592, "Ascend910B3": 201326592,
+    "Ascend910B4": 100663296, "Ascend910B4-1": 100663296,
+    "Ascend910_9391": 201326592, "Ascend910_9392": 201326592,
+    "Ascend910_9381": 201326592, "Ascend910_9382": 201326592,
+    "Ascend910_9372": 201326592, "Ascend910_9362": 176160768,
+    "Ascend950DT_9581": 134217728, "Ascend950DT_9582": 134217728,
+    "Ascend950PR_9579": 134217728, "Ascend950PR_958b": 134217728,
+}
+
 
 def declared_supply(sku: str) -> tuple[float, int, int, int, float]:
-    """``(clock_hz, aic, aiv, memory_bytes, hbm_bytes_per_s)`` from the source declaration."""
-    decl = profiles()[sku]["source"]["declaration"]
-    return (float(decl["configured_clock_mhz"]) * 1e6, int(decl["aic_count_per_die"]),
-            int(decl["aiv_count_per_die"]), int(float(decl["platform_config_hbm_mib"]) * MIB),
-            float(decl["hbm_peak_bw_gbps"]) * 1e9)
+    """Independent datasheet ``(clock_hz, aic, aiv, memory_bytes, hbm_bytes_per_s)``."""
+    return EXPECTED_SKU_SPECS[sku]
 
 
 def isa_of(sku: str) -> str:
     return profiles()[sku]["device"]["compute_arch"]["preset"]
 
 
-#: Every register-based (DAV_3510) profile, keyed by SKU, with its declared supply.
-A5 = {sku: declared_supply(sku) for sku in profiles() if isa_of(sku) == REGBASE_ISA}
-#: Per-owner on-chip buffers declared by the first register-based profile (no L2).
-A5_BUFFERS = {name: size for name, size in profiles()[next(iter(A5))]["device"]["buffers"].items()
-              if name != "l2"}
+#: Every register-based (DAV_3510) SKU mapped to its independent datasheet supply.
+A5 = {sku: EXPECTED_SKU_SPECS[sku] for sku in ("Ascend950DT_9581", "Ascend950DT_9582", "Ascend950PR_9579", "Ascend950PR_958b")}
+#: Independent per-owner on-chip buffers for register-based DAV_3510 dies.
+A5_BUFFERS = {"l1": 524288, "l0a": 65536, "l0b": 65536, "l0c": 262144, "ub": 253952}
 
 
 def machine(sku: str, **overrides) -> Hardware:
