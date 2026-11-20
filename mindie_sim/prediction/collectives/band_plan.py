@@ -25,7 +25,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from mindie_sim.schema.common import ModelingError
 from ..communication import CommunicationWork
@@ -214,7 +214,7 @@ class BandCollectivePlan:
         )
 
     def lower_with_local_work(self, context, base_program):
-        """Wrap this lowered collective plan inside local pack/vector/unpack stages."""
+        """Wrap this lowered collective plan inside preserved local stages."""
         from ..program import KernelProgram, Stage
 
         link_names = frozenset(self.accounting().wire_by_resource)
@@ -222,40 +222,80 @@ class BandCollectivePlan:
         # Unwrap outer setup -> body container from TopologyCollectiveRecipe
         if (len(stages_in) == TWO_PHASES
                 and stages_in[0].name == "setup"
-                and stages_in[1].program is not None):
+                and isinstance(stages_in[1].program, KernelProgram)):
             stages_in = stages_in[1].program.stages
 
-        pack_work: dict[str, float] = {}
-        vec_work: dict[str, float] = {}
-        unpack_work: dict[str, float] = {}
-        for stg in stages_in:
-            local = {k: v for k, v in stg.work.items() if k not in link_names}
-            if not local:
-                continue
-            if stg.name == "pack":
-                for k, v in local.items():
-                    pack_work[k] = pack_work.get(k, 0.0) + v
-            elif stg.name == "unpack_store":
-                for k, v in local.items():
-                    unpack_work[k] = unpack_work.get(k, 0.0) + v
-            else:
-                for k, v in local.items():
-                    vec_work[k] = vec_work.get(k, 0.0) + v
+        def _strip_links(stg: Stage, after: tuple[str, ...]) -> Stage | None:
+            local_work = {k: v for k, v in stg.work.items() if k not in link_names}
+            local_caps = {k: v for k, v in stg.caps.items() if k not in link_names}
+            local_place = {k: v for k, v in stg.placement.items() if k not in link_names}
+            local_units = {k: v for k, v in stg.work_units.items() if k not in link_names}
+            local_widened = tuple(k for k in stg.cohort_widened if k not in link_names)
+            local_members = {k: v for k, v in stg.cohort_members.items() if k not in link_names}
+            local_deliv = tuple((k, v) for k, v in stg.deliveries if k not in link_names)
+            has_local = bool(
+                local_work or stg.metadata or local_deliv or stg.acquire
+                or stg.free or stg.latency > 0.0 or stg.program is not None
+                or stg.fragment is not None
+            )
+            if not has_local:
+                return None
+            return replace(
+                stg,
+                work=local_work,
+                caps=local_caps,
+                placement=local_place,
+                work_units=local_units,
+                cohort_widened=local_widened,
+                cohort_members=local_members,
+                deliveries=local_deliv,
+                coupled=stg.coupled and bool(local_work),
+                after=after,
+                keep_empty=True,
+            )
+
+        def _remap_after(raw: tuple[str, ...], inherited: dict[str, tuple[str, ...]], valid: set[str]) -> tuple[str, ...]:
+            deps: list[str] = []
+            for dep in raw:
+                for target in inherited.get(dep, (dep,)):
+                    if target in valid and target not in deps:
+                        deps.append(target)
+            return tuple(deps)
+
+        pre_mid = [s for s in stages_in if s.name != "unpack_store"]
+        unpack_stages = [s for s in stages_in if s.name == "unpack_store"]
 
         out: list[Stage] = []
-        prev: tuple[str, ...] = ()
-        if pack_work:
-            out.append(Stage("pack", work=pack_work, keep_empty=True))
-            prev = ("pack",)
-        out.append(Stage(
-            "band_collective", work=vec_work, after=prev,
-            program=self, keep_empty=True,
-        ))
-        if unpack_work:
-            out.append(Stage(
-                "unpack_store", work=unpack_work, after=("band_collective",),
-                keep_empty=True,
-            ))
+        valid: set[str] = set()
+        inherited: dict[str, tuple[str, ...]] = {}
+        consumed_by_downstream: set[str] = set()
+        for stg in pre_mid:
+            eff_after = _remap_after(stg.after, inherited, valid)
+            kept = _strip_links(stg, eff_after)
+            if kept is None:
+                inherited[stg.name] = eff_after
+                continue
+            out.append(kept)
+            valid.add(kept.name)
+            consumed_by_downstream.update(eff_after)
+
+        terminals = tuple(s.name for s in out if s.name not in consumed_by_downstream)
+        reserved = valid | {s.name for s in unpack_stages}
+        plan_name = "band_collective" if "band_collective" not in reserved else "band_collective:plan"
+        out.append(Stage(plan_name, after=terminals, program=self, keep_empty=True))
+
+        post_valid: set[str] = {plan_name}
+        post_inherited: dict[str, tuple[str, ...]] = {}
+        for stg in unpack_stages:
+            internal = _remap_after(stg.after, post_inherited, post_valid)
+            eff_after = internal if plan_name in internal else (plan_name, *internal)
+            kept = _strip_links(stg, eff_after)
+            if kept is None:
+                post_inherited[stg.name] = eff_after
+                continue
+            out.append(kept)
+            post_valid.add(kept.name)
+
         return KernelProgram(tuple(out), minimum_ms=context.minimum_ms)
 
 

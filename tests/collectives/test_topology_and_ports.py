@@ -29,28 +29,24 @@ import importlib
 import json
 import math
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from mindie_sim import api as sdk_api
 from mindie_sim.backends import ascend
 from mindie_sim.prediction.collectives import (
-    LoweredCollective,
-    PairKey,
-    PortKey,
-    RootComplexKey,
-    SwitchKey,
-    Topology,
-    frame_wire_bytes,
-    lower_collective,
-    root_complex_resources_for_dies,
-    select_band,
-    submit_lowered_collective,
+    LoweredCollective, PairKey, PortKey, RootComplexKey, SwitchKey, Topology,
+    frame_wire_bytes, lower_collective, root_complex_resources_for_dies,
+    select_band, submit_lowered_collective,
 )
+from mindie_sim.prediction.collectives.band_plan import build_band_collective_plan
 from mindie_sim.prediction.communication import MessageFlow
 from mindie_sim.prediction.cost import CostModel
-from mindie_sim.prediction.engine import Engine, Resource
+from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.execution import Execution
+from mindie_sim.prediction.program import KernelProgram, Stage
+from mindie_sim.prediction.runtime.wave_recorder import WaveRecorder
 from mindie_sim.prediction.topology import MessageFlow as LegacyTopologyMessageFlow
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.hardware import Hardware
@@ -433,42 +429,27 @@ def test_collective_byte_conventions_zero_payload_and_alltoallv_validation():
 
 def test_band_algorithm_expansion_multihop_credits_and_production_execution():
     """Verify expansion_mode, direct alg, multi-hop + credit_bytes, and Execution HCCL."""
+    def _band(coll: str, alg: str, startup_us: float, *, scope: str = "node", exp: str | None = None,
+              gmax: int = 8, sscope: str = "collective", cred: int = 0, eid: str = "ev") -> CollectiveBandSpec:
+        return CollectiveBandSpec(
+            collective=coll, stack_id="default", topology_scope=scope, group_min=2, group_max=gmax,
+            expansion_mode=exp or alg, payload_min_inclusive=0, payload_max_exclusive=None,
+            algorithm=alg, protocol="simple", startup_scope=sscope, startup_us=startup_us,
+            payload_bytes_per_frame=4096, wire_bytes_per_frame=4096, credit_bytes=cred, evidence_id=eid,
+        )
+
     # 1) expansion_mode disambiguation & algorithm="direct" single-phase lowering
-    b_ring = CollectiveBandSpec(
-        collective="allreduce", stack_id="default", topology_scope="node",
-        group_min=2, group_max=4, expansion_mode="ring",
-        payload_min_inclusive=0, payload_max_exclusive=None,
-        algorithm="ring", protocol="simple", startup_scope="collective",
-        startup_us=10.0, payload_bytes_per_frame=4096, wire_bytes_per_frame=4096,
-        credit_bytes=0, evidence_id="ev_ring",
-    )
-    b_direct = CollectiveBandSpec(
-        collective="allreduce", stack_id="default", topology_scope="node",
-        group_min=2, group_max=4, expansion_mode="direct",
-        payload_min_inclusive=0, payload_max_exclusive=None,
-        algorithm="direct", protocol="simple", startup_scope="collective",
-        startup_us=3.0, payload_bytes_per_frame=4096, wire_bytes_per_frame=4096,
-        credit_bytes=0, evidence_id="ev_direct",
-    )
-    topo_exp = Topology(
-        _make_custom_machine(SINGLE_DIE_SKU, num_devices=2, ranks_per_node=2, links=[{
-            "name": "exp_link", "members": [0, 1], "capacity_bytes_per_ms": 100_000_000.0,
-            "semantics": "per_port", "scope": "node",
-            "protocol_bands": [b_ring.to_dict(), b_direct.to_dict()],
-        }]),
-        ParallelSpec(tp=2),
-    )
+    b_ring = _band("allreduce", "ring", 10.0, gmax=4, eid="ev_ring")
+    b_direct = _band("allreduce", "direct", 3.0, gmax=4, eid="ev_direct")
+    topo_exp = Topology(_make_custom_machine(SINGLE_DIE_SKU, num_devices=2, ranks_per_node=2, links=[{
+        "name": "exp_link", "members": [0, 1], "capacity_bytes_per_ms": 100_000_000.0,
+        "semantics": "per_port", "scope": "node", "protocol_bands": [b_ring.to_dict(), b_direct.to_dict()],
+    }]), ParallelSpec(tp=2))
     assert select_band("allreduce", (0, 1), topo_exp, 4096, expansion_mode="direct") == b_direct
     low_dir = lower_collective("allreduce", (0, 1), topo_exp, 4096, expansion_mode="direct")
     assert tuple(p.name for p in low_dir.phases) == ("direct",)
     # 1b) 4-rank tree AllGather delivers full gathered buffer to ALL 4 ranks incl. 1 & 3 (#2)
-    b_tree = CollectiveBandSpec(
-        collective="allgather", stack_id="default", topology_scope="node",
-        group_min=2, group_max=8, expansion_mode="tree", payload_min_inclusive=0,
-        payload_max_exclusive=None, algorithm="tree", protocol="simple",
-        startup_scope="collective", startup_us=1.0, payload_bytes_per_frame=4096,
-        wire_bytes_per_frame=4096, credit_bytes=0, evidence_id="ev_tree",
-    )
+    b_tree = _band("allgather", "tree", 1.0, eid="ev_tree")
     topo_tr = Topology(_make_custom_machine(SINGLE_DIE_SKU, num_devices=4, ranks_per_node=4, links=[{
         "name": "tr_link", "members": [0, 1, 2, 3], "capacity_bytes_per_ms": 100_000_000.0,
         "semantics": "per_port", "scope": "node", "protocol_bands": [b_tree.to_dict()],
@@ -480,13 +461,8 @@ def test_band_algorithm_expansion_multihop_credits_and_production_execution():
 
     # 2) Multi-hop pipelining + credit_bytes + switch propagation preserved on startup > 0 (#3)
     def _run_mh(startup_us: float, sw_lat_us: float = 0.0) -> float:
-        bh = CollectiveBandSpec(
-            collective="alltoallv", stack_id="default", topology_scope="node",
-            group_min=2, group_max=4, expansion_mode="direct", payload_min_inclusive=0,
-            payload_max_exclusive=None, algorithm="direct", protocol="simple",
-            startup_scope="hop", startup_us=startup_us, payload_bytes_per_frame=4096,
-            wire_bytes_per_frame=4096, credit_bytes=4096 if sw_lat_us == 0.0 else 0, evidence_id="ev_hop",
-        )
+        bh = _band("alltoallv", "direct", startup_us, gmax=4, sscope="hop",
+                   cred=4096 if sw_lat_us == 0.0 else 0, eid="ev_hop")
         tmh = Topology(_make_custom_machine(SINGLE_DIE_SKU, num_devices=3, ranks_per_node=3, links=[
             {"name": f"hop_{a}{b}", "members": [a, b], "capacity_bytes_per_ms": 1_000_000.0 if sw_lat_us == 0.0 else 1e12,
              "latency_us": 0.0, "switch_hops": 1 if sw_lat_us else 0, "switch_hop_latency_us": sw_lat_us,
@@ -505,31 +481,24 @@ def test_band_algorithm_expansion_multihop_credits_and_production_execution():
     assert math.isclose(_run_mh(1.0, 1000.0), 2.002, abs_tol=1e-4)
 
     # 3) Production Execution consumes band startup_us & credit_bytes window (#1)
-    def _run_prod_allreduce(sku: str, startup_us: float, *, credit_bytes: int = 0, scope_m: str = "collective") -> float:
+    def _band_hw(sku: str, startup_us: float, *, credit_bytes: int = 0, scope_m: str = "collective"):
         raw_hw = ascend({"sku": sku, "num_devices": 4, "ranks_per_node": 4})
-        band = CollectiveBandSpec(
-            collective="allreduce", stack_id="default", topology_scope="any",
-            group_min=2, group_max=8, expansion_mode="ring",
-            payload_min_inclusive=0, payload_max_exclusive=None,
-            algorithm="ring", protocol="simple", startup_scope=scope_m,
-            startup_us=startup_us, payload_bytes_per_frame=4096, wire_bytes_per_frame=4096,
-            credit_bytes=credit_bytes, evidence_id=f"prod_ar_{int(startup_us)}_{credit_bytes}",
-        )
+        band = _band("allreduce", "ring", startup_us, scope="any", sscope=scope_m,
+                     cred=credit_bytes, eid=f"prod_ar_{int(startup_us)}_{credit_bytes}")
         for ch_key in ("d2d_intra_node", "d2d_intra_package"):
             if ch_key in raw_hw["transfer_channels"]:
                 raw_hw["transfer_channels"][ch_key]["protocol_bands"] = [band.to_dict()]
-        case = sdk_api.compose_case(TINY_MODEL_ID, hardware=raw_hw, options={"dp": 1, "tp": 4, "pp": 1, "layers": 1})
+        return raw_hw
+
+    def _run_prod_allreduce(sku: str, startup_us: float, *, credit_bytes: int = 0, scope_m: str = "collective") -> float:
+        case = sdk_api.compose_case(TINY_MODEL_ID, hardware=_band_hw(sku, startup_us, credit_bytes=credit_bytes, scope_m=scope_m),
+                                    options={"dp": 1, "tp": 4, "pp": 1, "layers": 1})
         ex = Execution(case, CostModel(case), include_submission=False)
-        op = OpSpec(
-            op_id="ar_0", family="allreduce", recipe="all_reduce", phase="decode", stage=0, layer=0,
-            stream="main", dtype="bf16", link_bytes=65536, link_scope="tp", requests=("req0",),
-            semantic_shape=(1, 1, 32768), local_shape=(1, 1, 32768), padded_shape=(1, 1, 32768), launch_shape=(1, 1, 32768),
-        )
-        work = IterationWork(
-            plan=IterationPlan(iteration=0, requests=(RequestView("req0", q_len=1, context=16, samples=True, phase="decode"),)),
-            ops=(op,), stage_count=1, mode="decode", valid_tokens=1, padded_tokens=1,
-            graph_bucket=1, recipe="default", replay_scope="full",
-        )
+        op = OpSpec(op_id="ar_0", family="allreduce", recipe="all_reduce", phase="decode", stage=0, layer=0,
+                    stream="main", dtype="bf16", link_bytes=65536, link_scope="tp", requests=("req0",),
+                    semantic_shape=(1, 1, 32768), local_shape=(1, 1, 32768), padded_shape=(1, 1, 32768), launch_shape=(1, 1, 32768))
+        work = IterationWork(plan=IterationPlan(iteration=0, requests=(RequestView("req0", q_len=1, context=16, samples=True, phase="decode"),)),
+                             ops=(op,), stage_count=1, mode="decode", valid_tokens=1, padded_tokens=1, graph_bucket=1, recipe="default", replay_scope="full")
         step = ex.add(work, replica=0, release_ms=0.0)
         ex.engine.advance()
         return float(step.completion.time)
@@ -537,10 +506,37 @@ def test_band_algorithm_expansion_multihop_credits_and_production_execution():
     for sku in (SINGLE_DIE_SKU, DUAL_DIE_SMALL_SKU):
         t_fast, t_slow = _run_prod_allreduce(sku, 2.5), _run_prod_allreduce(sku, 5000.0)
         assert t_fast < 0.5 and t_slow >= 5.0 and (t_slow - t_fast) >= 4.99
-    # Credit window in production Execution matches lowered BandCollectivePlan (no bypass)
     t_nocred = _run_prod_allreduce(DUAL_DIE_SMALL_SKU, 1000.0, credit_bytes=0, scope_m="hop")
     t_cred = _run_prod_allreduce(DUAL_DIE_SMALL_SKU, 1000.0, credit_bytes=4096, scope_m="hop")
     assert t_cred > t_nocred * 2.5
+
+    # 4) lower_with_local_work preserves Stage metadata/deliveries/placement/caps/allocs into Engine + WaveRecorder
+    topo_s = Topology(Hardware.from_mapping(_band_hw(DUAL_DIE_SMALL_SKU, 2.5)), ParallelSpec(tp=4))
+    plan_s = build_band_collective_plan(topo_s, "allreduce", ((0, 1, 2, 3),), {r: 98304.0 for r in range(4)}, {})
+    link_res = next(iter(plan_s.accounting().wire_by_resource))
+    alloc = Allocation("pack_buf", "l1", 64.0, (0,))
+    base_prog = KernelProgram((Stage("setup", latency=0.05), Stage("body", after=("setup",), program=KernelProgram((
+        Stage("pack", work={"hbm@d0": 32768.0}, placement={"hbm@d0": (0,)}, caps={"hbm@d0": 1e9}, acquire=(alloc,),
+              free=(alloc,), latency=0.001, coupled=True, priority=2, work_units={"hbm@d0": "bytes"},
+              metadata={"generation": 7}, deliveries=(("hbm_read@d0", 32768.0),), latency_from_first_service=True),
+        Stage("reduce_scatter", work={link_res: 65536.0, "vec@d0": 1024.0}, after=("pack",), metadata={"generation": 8}),
+        Stage("unpack_store", work={"hbm@d0": 32768.0}, after=("reduce_scatter",), deliveries=(("hbm_write@d0", 32768.0),)),
+    )))))
+    low_prog = plan_s.lower_with_local_work(SimpleNamespace(minimum_ms=0.0), base_prog)
+    stgs = {s.name: s for s in low_prog.stages}
+    assert stgs["pack"].metadata == {"generation": 7} and stgs["pack"].deliveries == (("hbm_read@d0", 32768.0),)
+    assert stgs["pack"].placement == {"hbm@d0": (0,)} and stgs["pack"].caps == {"hbm@d0": 1e9} and stgs["pack"].acquire == (alloc,)
+    assert stgs["pack"].free == (alloc,) and stgs["pack"].priority == 2 and stgs["pack"].coupled and stgs["pack"].latency == 0.001
+    assert stgs["pack"].work_units == {"hbm@d0": "bytes"} and stgs["pack"].latency_from_first_service
+    assert link_res not in stgs["reduce_scatter"].work and stgs["reduce_scatter"].metadata == {"generation": 8}
+    for backend in ("python", "c"):
+        eng = Engine([*topo_s.resources(), Resource("hbm@d0", 1e9, units=1), Resource("vec@d0", 1e9, units=1)],
+                     pools={"l1": 64.0}, pool_units={"l1": 1}, backend=backend)
+        rec = WaveRecorder(declared_pipes=("hbm@d0", "vec@d0"))
+        eng.attach_wave_recorder(rec)
+        eng.advance(until=(low_prog.start(eng, "ar", eng.submit("r")),))
+        assert eng.delivered.get("hbm_read@d0") == 32768.0 and eng.delivered.get("hbm_write@d0") == 32768.0
+        assert {7, 8} <= {row[3] for row in rec._admitted.values()}
 
 
 def test_startup_scope_and_key_validation_and_catalog_invariants():
