@@ -75,13 +75,25 @@ class SpeculativeStatePlan:
         }
 
 
-def _local_heads(layer: Any, parallel: Any) -> int:
-    heads = int(getattr(layer, "linear_value_heads", ZERO)
-                or getattr(layer, "linear_heads", ZERO) or ONE)
-    tp = max(ONE, int(parallel.tp))
-    if heads % tp != ZERO:
+KDA_PARALLEL_AXIS = "tp_x_pcp"
+
+
+def _kda_shards(layer: Any, parallel: Any, runtime: Any) -> int:
+    """The KDA TP x PCP history shard count, or one every other family uses."""
+    if str(getattr(layer, "attention", "")) != "kda" or runtime is None:
+        return 1
+    metadata = dict(getattr(runtime, "metadata", ()) or ())
+    axis = str(metadata.get("kda_parallel_axis", ""))
+    return max(1, int(parallel.pcp)) if axis == KDA_PARALLEL_AXIS else 1
+
+
+def _local_heads(layer: Any, parallel: Any, shards: int = 1) -> int:
+    heads = int(getattr(layer, "linear_value_heads", 0)
+                or getattr(layer, "linear_heads", 0) or 1)
+    tp = max(1, int(parallel.tp)) * max(1, int(shards))
+    if heads % tp != 0:
         raise ModelingError(f"linear_state_heads_not_divisible_by_tp:{heads}%{tp}")
-    return max(ONE, heads // tp)
+    return max(1, heads // tp)
 
 
 def _head_geometry(layer: Any) -> tuple[int, int]:
@@ -96,10 +108,10 @@ def record_head_bytes(dk: int, dv: int, kg_dtype: str = DEFAULT_RECORD_KG_DTYPE)
     return int(dv) * CORRECTION_BYTES + TWO * int(dk) * int(dtype_bytes(kg_dtype))
 
 
-def _conv_geometry(layer: Any, parallel: Any) -> tuple[int, int, str]:
-    elements = float(getattr(layer, "conv_state_elements", ZERO) or ZERO)
-    elements /= max(ONE, int(parallel.tp))
-    kernel = max(ONE, int(getattr(layer, "conv_kernel", ZERO) or ONE))
+def _conv_geometry(layer: Any, parallel: Any, shards: int = 1) -> tuple[int, int, str]:
+    elements = float(getattr(layer, "conv_state_elements", 0) or 0)
+    elements /= max(1, int(parallel.tp)) * max(1, int(shards))
+    kernel = max(1, int(getattr(layer, "conv_kernel", 0) or 1))
     width = elements / float(kernel) if kernel else elements
     dtype = str(getattr(layer, "conv_state_dtype", "") or "bf16")
     return int(round(width)), kernel, dtype
@@ -108,6 +120,7 @@ def _conv_geometry(layer: Any, parallel: Any) -> tuple[int, int, str]:
 def speculative_state_plan(
     model: Any, layer: Any, parallel: Any, *, query_tokens: int,
     recover_ssm: bool, capacity_padded: bool, state_contract: Mapping[str, Any] | None = None,
+    runtime: Any = None,
 ) -> SpeculativeStatePlan:
     """Resolve one layer's active verify-window state/record residency."""
     del model, capacity_padded
@@ -115,45 +128,62 @@ def speculative_state_plan(
     if kind not in LINEAR_ATTENTION_KINDS:
         raise ModelingError(f"speculative_state_requires_linear_attention:{kind}")
     q = int(query_tokens)
-    if q < ONE:
+    if q < 1:
         raise ModelingError(f"speculative_state_query_tokens_invalid:{query_tokens}")
     contract = dict(state_contract or {})
-    heads = _local_heads(layer, parallel)
+    shards = _kda_shards(layer, parallel, runtime)
+    heads = _local_heads(layer, parallel, shards)
     dk, dv = _head_geometry(layer)
     state_dtype = str(getattr(layer, "recurrent_state_dtype", "") or "fp32")
     kg_dtype = str(contract.get("record_kg_dtype", DEFAULT_RECORD_KG_DTYPE))
-    recurrent_elements = float(getattr(layer, "recurrent_state_elements", ZERO) or ZERO)
-    recurrent_elements /= max(ONE, int(parallel.tp))
+    recurrent_elements = float(getattr(layer, "recurrent_state_elements", 0) or 0)
+    recurrent_elements /= max(1, int(parallel.tp)) * shards
     state_bytes = recurrent_elements * float(dtype_bytes(state_dtype))
-    conv_width, kernel, conv_dtype = _conv_geometry(layer, parallel)
+    conv_width, kernel, conv_dtype = _conv_geometry(layer, parallel, shards)
     conv_element = float(dtype_bytes(conv_dtype))
     history = int(contract.get("kernel_history", kernel))
-    history = max(ONE, history)
-    conv_snapshots = int(contract.get("conv_snapshot_slots", ZERO) or ZERO)
-    if conv_snapshots > ZERO:
+    history = max(1, history)
+    conv_snapshots = int(contract.get("conv_snapshot_slots", 0) or 0)
+    if conv_snapshots > 0:
         conv_bytes = float(conv_snapshots) * conv_width * history * conv_element
     else:
-        conv_bytes = float(history + q - ONE) * conv_width * conv_element
-    transient = float(contract.get("transient_bytes", ZERO) or ZERO)
-    if q <= ONE:
+        conv_bytes = float(history + q - 1) * conv_width * conv_element
+    transient = float(contract.get("transient_bytes", 0) or 0)
+    if q <= 1:
         return SpeculativeStatePlan(
-            q, ONE, state_bytes, conv_bytes, ZERO, transient, MODE_SINGLE)
+            q, 1, state_bytes, conv_bytes, 0, transient, MODE_SINGLE)
     if not recover_ssm:
         slots = int(contract.get("base_state_slots", q) or q)
         if slots < q:
             raise ModelingError(f"speculative_state_slots_below_verify:{slots}<{q}")
         return SpeculativeStatePlan(
-            q, slots, state_bytes * float(slots), conv_bytes, ZERO,
+            q, slots, state_bytes * float(slots), conv_bytes, 0,
             transient, MODE_CHECKPOINT)
-    record = record_head_bytes(dk, dv, kg_dtype) * float(heads)
+    if kind == "gdn":
+        # Qwen GDN keeps ``(Dk + Dv + 1)`` FP32 elements per head, distinct
+        # from the KDA correction+kg record.
+        from mindie_sim.prediction.recover_ssm_work import gdn_record_head_bytes
+        record = gdn_record_head_bytes(dk, dv) * float(heads)
+    else:
+        record = record_head_bytes(dk, dv, kg_dtype) * float(heads)
     override = contract.get("record_bytes_per_token")
     if override is not None:
         record = float(override)
-    if record < ZERO:
+    if record < 0:
         raise ModelingError("speculative_state_record_bytes_invalid")
     return SpeculativeStatePlan(
-        q, ONE, state_bytes, conv_bytes, record * float(q),
+        q, 1, state_bytes, conv_bytes, record * float(q),
         transient, MODE_REPLAY)
+
+
+def runtime_recover_ssm(runtime: Any) -> bool:
+    """Whether the resolved runtime keeps compact RecoverSSM records."""
+    if runtime is None:
+        return False
+    if bool(getattr(runtime, "recover_ssm", False)):
+        return True
+    metadata = dict(getattr(runtime, "metadata", ()) or ())
+    return metadata.get("recover_ssm") is True
 
 
 def resolve_speculative_query_tokens(

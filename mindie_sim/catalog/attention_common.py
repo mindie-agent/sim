@@ -36,27 +36,40 @@ ONE = 1
 ZERO_FLOAT = 0.0
 LSE_SCALAR_WIDTH = 1
 MERGE_OPS_PER_ELEM = 3.0
+PACK_LSE_OPS = 4.0
+FP32_LSE_BYTES = 4.0
 UPDATE_TYPE_ZERO = 0
 PREFILL_PHASES = frozenset({"prefill", "draft_prefill"})
 
 
 def min_positive(*bounds: int) -> int:
     """Minimum of positive bounds, or ``0`` when all bounds are unbounded/disabled."""
-    positives = [int(bound) for bound in bounds if int(bound) > ZERO]
-    return min(positives) if positives else ZERO
+    positives = [int(bound) for bound in bounds if int(bound) > 0]
+    return min(positives) if positives else 0
 
 
 def active_dcp_degree(parallel: ParallelSpec, phase: str) -> int:
-    """Effective KV-sharding DCP width for ``phase``."""
-    cp = int(getattr(parallel, "cp", ONE) or ONE)
-    if cp <= ONE:
-        return ONE
+    """Effective KV-sharding DCP width for attention execution in ``phase``."""
+    cp = int(getattr(parallel, "cp", 1) or 1)
+    if cp <= 1 or str(phase) in PREFILL_PHASES:
+        return 1
+    cp_plan = str(getattr(parallel, "cp_plan", "dcp") or "dcp")
+    if cp_plan in {"dcp", "pcp_dcp"}:
+        return cp
+    return 1
+
+
+def store_dcp_degree(parallel: ParallelSpec, phase: str) -> int:
+    """Effective KV-cache store sharding degree for ``phase``."""
+    cp = int(getattr(parallel, "cp", 1) or 1)
+    if cp <= 1:
+        return 1
     cp_plan = str(getattr(parallel, "cp_plan", "dcp") or "dcp")
     if cp_plan == "dcp":
         return cp
     if cp_plan == "pcp_dcp":
-        return ONE if str(phase) in PREFILL_PHASES else cp
-    return ONE
+        return 1 if str(phase) in PREFILL_PHASES else cp
+    return 1
 
 
 @dataclass
@@ -256,4 +269,145 @@ def dcp_partial_merge_ops(
         ),
     )
     return [merge, update], update.op_id
+
+
+def dcp_fia_query_heads(local_heads: int, tp: int, pcp: int, cp: int) -> int:
+    """Local FIA query head count after vLLM-Ascend pre-attention Q gather."""
+    pcp_deg = max(1, int(pcp))
+    tp_deg = max(1, int(tp))
+    cp_deg = max(1, int(cp))
+    if cp_deg <= 1 or (pcp_deg > 1 and cp_deg == pcp_deg):
+        return int(local_heads)
+    gather_deg = cp_deg if pcp_deg <= 1 else tp_deg
+    return int(local_heads) * max(1, gather_deg)
+
+
+def dcp_query_gather_ops(
+    *, prefix: str, q_ready: str, rotary: str | None, q: int,
+    local_heads: int, q_nope_dim: int, q_rope_dim: int, act_dtype: str,
+    parallel: ParallelSpec, cp: int, stage: int, layer: int,
+    requests: tuple[str, ...], mode: str,
+) -> tuple[list[OpSpec], str, str | None, int]:
+    """Emit vLLM-Ascend ``_dcp_all_gather_fragments`` pre-attention Q gathers."""
+    pcp = int(getattr(parallel, "pcp", 1) or 1)
+    tp = int(getattr(parallel, "tp", 1) or 1)
+    fia_heads = dcp_fia_query_heads(local_heads, tp, pcp, cp)
+    if fia_heads == int(local_heads):
+        return [], q_ready, rotary, local_heads
+    gather_axis = "cp" if pcp <= 1 else "tp"
+    gather_deg = cp if pcp <= 1 else tp
+    elem_b = float(dtype_bytes(act_dtype))
+    rows = max(1, int(q))
+    ops: list[OpSpec] = []
+    nope_op = comm_op(
+        op_id=f"{prefix}.dcp_q_nope_allgather" if q_rope_dim > 0 else f"{prefix}.dcp_q_allgather",
+        deps=(q_ready,), stage=stage, layer=layer, requests=requests,
+        family="allgather", phase=mode, recipe="dcp_query_allgather",
+        link_bytes=float(rows * local_heads * q_nope_dim * elem_b * (gather_deg - 1)),
+        shape=(rows, fia_heads, q_nope_dim),
+        metadata=(("group_axis", gather_axis), ("collective", "allgather"),
+                  ("gathered_heads", fia_heads)),
+    )
+    ops.append(nope_op)
+    new_rotary = rotary
+    if q_rope_dim > 0 and rotary is not None:
+        pe_op = comm_op(
+            op_id=f"{prefix}.dcp_q_pe_allgather",
+            deps=(rotary,), stage=stage, layer=layer, requests=requests,
+            family="allgather", phase=mode, recipe="dcp_query_allgather",
+            link_bytes=float(rows * local_heads * q_rope_dim * elem_b * (gather_deg - 1)),
+            shape=(rows, fia_heads, q_rope_dim),
+            metadata=(("group_axis", gather_axis), ("collective", "allgather"),
+                      ("gathered_heads", fia_heads)),
+        )
+        ops.append(pe_op)
+        new_rotary = pe_op.op_id
+    return ops, nope_op.op_id, new_rotary, fia_heads
+
+
+def dcp_a2a_combine_ops(
+    *, prefix: str, views: Sequence[Any], cp: int, parallel: ParallelSpec,
+    local_heads: int, fia_heads: int, v_dim: int, out_dtype: str,
+    stage: int, layer: int, mode: str, deps: tuple[str, ...],
+    total_pairs: float, local_pairs: float, total_rows: int, local_rows: int,
+    interleave: int,
+) -> tuple[list[OpSpec], str]:
+    """Emit vLLM-Ascend ``dcp_a2a_fused`` across PCP=1, DCP=PCP, and DCP=TP*PCP."""
+    pcp = int(getattr(parallel, "pcp", 1) or 1)
+    tp = int(getattr(parallel, "tp", 1) or 1)
+    q = max(1, sum(int(item.q_len) for item in views))
+    requests = tuple(item.request_id for item in views)
+    modes = {item.execution_mode for item in views}
+    exec_phase = next(iter(modes)) if len(modes) == 1 else mode
+    out_b = float(dtype_bytes(out_dtype))
+    head_bytes = float(v_dim) * out_b + FP32_LSE_BYTES
+    ops: list[OpSpec] = []
+    if pcp > 1 and cp == pcp:
+        gather = comm_op(
+            op_id=f"{prefix}.dcp_merge", deps=deps, stage=stage, layer=layer,
+            requests=requests, family="dcp_allgather", phase=exec_phase,
+            recipe="catalog_dcp_lse_merge",
+            link_bytes=float(q * local_heads * head_bytes * (pcp - 1)),
+            shape=(q, local_heads, v_dim + LSE_SCALAR_WIDTH),
+            metadata=(("group_axis", "pcp"), ("collective", "allgather"),
+                      ("cp", cp), ("cp_interleave", interleave),
+                      ("cp_pairs_total", float(total_pairs)),
+                      ("cp_pairs_local", float(local_pairs)),
+                      ("cp_rows_total", int(total_rows)),
+                      ("cp_rows_local", int(local_rows))),
+        )
+        ops.append(gather)
+        combine_deps = (gather.op_id,)
+        combine_recipe = "catalog_dcp_attention_update"
+    else:
+        pack = vector_op(
+            op_id=f"{prefix}.dcp_output_pack", deps=deps, stage=stage, layer=layer,
+            requests=requests, elements=q * fia_heads, ops_per_element=PACK_LSE_OPS,
+            dtype=out_dtype, family="elementwise", phase=exec_phase,
+            recipe="dcp_output_pack", shape=(q, fia_heads, v_dim),
+            read_bytes_override=float(q * fia_heads * head_bytes),
+            write_bytes_override=float(q * fia_heads * head_bytes),
+        )
+        ops.append(pack)
+        a2a_axis = "cp" if pcp <= 1 else "tp"
+        a2a_deg = cp if pcp <= 1 else tp
+        a2a = comm_op(
+            op_id=f"{prefix}.dcp_output_alltoall", deps=(pack.op_id,),
+            stage=stage, layer=layer, requests=requests, family="alltoall",
+            phase=exec_phase, recipe="dcp_output_alltoall",
+            link_bytes=float(q * local_heads * head_bytes * (a2a_deg - 1)),
+            shape=(q, local_heads, v_dim + LSE_SCALAR_WIDTH),
+            metadata=(("group_axis", a2a_axis), ("collective", "alltoall"),
+                      ("source", "dcp_a2a_fused"), ("cp", cp)),
+        )
+        ops.append(a2a)
+        combine_deps = (a2a.op_id,)
+        if pcp > 1:
+            pcp_ag = comm_op(
+                op_id=f"{prefix}.dcp_pcp_allgather", deps=combine_deps,
+                stage=stage, layer=layer, requests=requests,
+                family="dcp_allgather", phase=exec_phase,
+                recipe="catalog_dcp_lse_merge",
+                link_bytes=float(q * local_heads * tp * head_bytes * (pcp - 1)),
+                shape=(q, local_heads, v_dim + LSE_SCALAR_WIDTH),
+                metadata=(("group_axis", "pcp"), ("collective", "allgather"),
+                          ("cp", cp), ("cp_interleave", interleave)),
+            )
+            ops.append(pcp_ag)
+            combine_deps = (pcp_ag.op_id,)
+        combine_recipe = "dcp_lse_merge"
+    elements = int(merge_update_elements(q, local_heads, v_dim, cp))
+    combine = vector_op(
+        op_id=f"{prefix}.dcp_lse_combine", deps=combine_deps, stage=stage,
+        layer=layer, requests=requests, elements=elements,
+        ops_per_element=MERGE_OPS_PER_ELEM, dtype="fp32",
+        family="attention_merge", phase=exec_phase, recipe=combine_recipe,
+        semantic_family="dcp_logsumexp_attention_update",
+        shape=(q, local_heads, v_dim),
+        read_bytes_override=float(q * local_heads * head_bytes * cp),
+        write_bytes_override=float(q * local_heads * v_dim * out_b),
+        metadata=merge_metadata(cp, q, local_heads, v_dim),
+    )
+    ops.append(combine)
+    return ops, combine.op_id
 

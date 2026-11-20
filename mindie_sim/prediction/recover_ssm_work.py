@@ -30,6 +30,7 @@ LAST = -1
 
 GDN_ARCH35_RECOVER_SSM_RECIPE = "vllm_ascend_recurrent_gated_delta_rule_arch35_fp32_recover_ssm"
 COMMIT_INTENT_STAGE = "commit_intent"
+FP32_RECORD_BYTES = 4
 
 
 def recover_ssm_enabled(runtime: Any) -> bool:
@@ -42,7 +43,18 @@ def recover_ssm_enabled(runtime: Any) -> bool:
 
 def record_head_bytes(dk: int, dv: int, kg_dtype: str = "bf16") -> int:
     """Per-token per-head compact trajectory record (FP32 correction + k/g)."""
-    return int(dv) * 4 + 2 * int(dk) * int(dtype_bytes(kg_dtype))
+    return int(dv) * FP32_RECORD_BYTES + 2 * int(dk) * int(dtype_bytes(kg_dtype))
+
+
+def gdn_record_head_bytes(dk: int, dv: int) -> int:
+    """Qwen GDN compact record: ``(Dk + Dv + 1)`` FP32 elements per token/head."""
+    return (int(dk) + int(dv) + 1) * FP32_RECORD_BYTES
+
+
+def gdn_record_slice_bytes(dk: int, slice_width: int, part_index: int) -> int:
+    """Value-tile slice of the GDN record; ``Dk + 1`` is emitted at tile 0."""
+    return (int(slice_width) * FP32_RECORD_BYTES
+            + ((int(dk) + 1) * FP32_RECORD_BYTES if int(part_index) == 0 else 0))
 
 
 def record_slice_bytes(dk: int, slice_width: int, part_index: int, kg_dtype: str = "bf16") -> int:
@@ -85,41 +97,51 @@ def emit_commit_op(b: Any, *, name: str, deps: Sequence[str], views: Sequence[An
     if not spec_views:
         return None
     plan = getattr(b, "plan", None)
+    gdn = str(attention_kind) == "gdn"
+    record_head = (gdn_record_head_bytes(dk, dv) if gdn
+                   else record_head_bytes(dk, dv, kg_dtype))
     geometry = {
         "heads": int(heads), "dk": int(dk), "dv": int(dv),
         "state_dtype": str(state_dtype), "kg_dtype": str(kg_dtype),
+        "record_bytes_per_token": int(heads) * record_head,
         "scope": str(getattr(plan, "scope", "target")),
-        "layer": int(getattr(plan, "index", ZERO)),
+        "layer": int(getattr(plan, "index", 0)),
     }
     request_ids = tuple(str(view.request_id) for view in spec_views)
     op_id = b.work(
         name, tuple(deps), (len(spec_views), int(heads), int(dk), int(dv)),
-        flops=ZERO, vector=ZERO, read=ZERO, write=ZERO, family="elementwise",
+        flops=0, vector=0, read=0, write=0, family="elementwise",
         metadata=(
             ("recover_ssm", True), ("recover_ssm_intent", True),
             ("recover_ssm_stage", COMMIT_INTENT_STAGE),
             ("recover_ssm_pending_acceptance", True),
             ("recover_ssm_geometry", geometry),
+            ("record_bytes_per_token", int(heads) * record_head),
             ("recurrent_attention_kind", str(attention_kind)),
             ("requests", request_ids),
         ),
     )
-    b.ops[LAST] = replace(b.ops[LAST], requests=request_ids)
+    b.ops[-1] = replace(b.ops[-1], requests=request_ids)
     return op_id
 
 
 def rewrite_gdn_analytical_scan(scan: Any, *, active_views: Sequence[Any], heads: int,
                                 dk: int, dv: int, state_dtype: str = "fp32",
-                                kg_dtype: str = "bf16") -> Any:
+                                kg_dtype: str = "bf16",
+                                attention_kind: str = "kda") -> Any:
     spec_tokens = sum(int(v.q_len) for v in active_views if int(v.q_len) > 1)
     if spec_tokens <= 0:
         return scan
     state_bytes = int(heads) * int(dk) * int(dv) * int(dtype_bytes(state_dtype))
-    rec_bytes = int(heads) * record_head_bytes(dk, dv, kg_dtype)
+    rec_head = (gdn_record_head_bytes(dk, dv) if attention_kind == "gdn"
+                else record_head_bytes(dk, dv, kg_dtype))
+    rec_bytes = int(heads) * rec_head
     saved_writes = spec_tokens * (state_bytes - rec_bytes)
     meta = {
         **dict(scan.metadata), "recover_ssm": True,
         "recover_ssm_stage": "verify_compact_record",
+        "recurrent_attention_kind": str(attention_kind),
+        "record_kg_dtype": str(kg_dtype),
         "record_bytes_per_token": rec_bytes,
         "state_checkpoints": sum(1 for v in active_views if int(v.q_len) == 1),
     }
@@ -150,9 +172,15 @@ def build_gdn_arch35_recover_ssm(op: Any, geometry: Any, *, compact: bool = True
     total = sum(lengths) * heads
     tensor_reads = len(lengths) * heads * dk * dv * 4 + total * (2 * dk + dv) * 2
     scalar_payload = total * (4 + 2 * parts)
-    rec_head = record_head_bytes(dk, dv, op.dtype)
+    gdn = str(dict(op.metadata).get("recurrent_attention_kind", "")) == "gdn" or (
+        "gdn" in str(op.recipe))
+    rec_head = (gdn_record_head_bytes(dk, dv) if gdn
+                else record_head_bytes(dk, dv, op.dtype))
+    slice_bytes = (
+        (lambda n, part: gdn_record_slice_bytes(dk, n, part)) if gdn else
+        (lambda n, part: record_slice_bytes(dk, n, part, op.dtype)))
     writes = sum(
-        q * heads * ((rec_head if q > 1 else dk * dv * 4) + dv * 2)
+        q * heads * ((rec_head if q > 1 else dk * dv * FP32_RECORD_BYTES) + dv * 2)
         for q in lengths
     )
     vector = len(lengths) * heads * ak * dv + total * (8 * ak * dv + dv + 6 * ak + av)
@@ -169,7 +197,8 @@ def build_gdn_arch35_recover_ssm(op: Any, geometry: Any, *, compact: bool = True
 
                 def part(part_index):
                     n = min(value_step, dv - part_index * value_step)
-                    out_state = record_slice_bytes(dk, n, part_index, op.dtype) if q > 1 else dk * n * 4
+                    out_state = (slice_bytes(n, part_index) if q > 1
+                                 else dk * n * FP32_RECORD_BYTES)
 
                     def token(t):
                         first = part_index == 0 and t == 0

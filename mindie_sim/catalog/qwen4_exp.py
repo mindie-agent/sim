@@ -25,8 +25,13 @@ from __future__ import annotations
 import math
 from typing import Any, Mapping
 
+from mindie_sim.catalog.cache_pools import gbsa_cache_layout
 from mindie_sim.catalog.config import _int
 from mindie_sim.catalog.ops import comm_op, gemm_op, vector_op
+from mindie_sim.catalog.speculative_state import (
+    PHASE_DECODE, resolve_speculative_query_tokens, runtime_recover_ssm,
+    speculative_state_plan,
+)
 from mindie_sim.catalog.types import (
     DraftSpec, EngramSpec, EngramTableSpec, merge_source,
 )
@@ -42,6 +47,12 @@ TWO = 2
 ONE_FLOAT = 1.0
 ZERO_FLOAT = 0.0
 BF16_BYTES = 2
+FP32_BYTES = 4
+MX_GROUP = 32
+INT8_SCALE_BYTES = 4
+MXFP8_SCALE_BYTES = 1
+PLE_UVA_RECIPE = "ple_host_uva_lookup"
+PLE_QUANTIZED_FORMATS = frozenset({"int8", "mxfp8"})
 KERNEL_BLOCK_TOKENS = 128
 DEFAULT_PLE_CONV_KERNEL = 4
 DEFAULT_PLE_DIVISOR = 128
@@ -176,6 +187,68 @@ def ple_gate_terms_by_layer(model: ModelSpec) -> dict[int, list[WeightTerm]]:
     return by_layer
 
 
+def ple_lookup_format(model: Any, runtime: Any = None) -> str:
+    """Resolve the declared PLE table representation.
+
+    A model whose quantization plan is MXFP8 keeps MXFP8 group-32 code/scales;
+    otherwise an active quantized-lookup declaration selects INT8; without one
+    the table stays BF16.  The declared runtime metadata only states *that* a
+    quantized lookup is active, never which weight format the model uses.
+    """
+    metadata = dict(getattr(runtime, "metadata", ()) or ())
+    declared = str(metadata.get("ple_lookup_format", "") or "")
+    active = (declared in PLE_QUANTIZED_FORMATS
+              or "ple_quantized_lookup" in tuple(
+                  getattr(runtime, "lowering_passes", ()) or ()))
+    if not active:
+        return "bf16"
+    quant = getattr(model, "quant", None)
+    if quant is not None:
+        name = str(getattr(quant, "name", "") or "").lower()
+        source = dict(getattr(quant, "source", ()) or ())
+        if ("mxfp8" in name
+                or "mxfp8" in str(source.get("quant_method", "") or "").lower()
+                or (int(getattr(quant, "activation_group_size", 0) or 0)
+                    == MX_GROUP
+                    and str(getattr(quant, "scale_format", "") or "")
+                    == "fp8_e8m0")):
+            return "mxfp8"
+    return "int8"
+
+
+def _ple_owned_hits(lookups: int, tp: int) -> int:
+    """Actual table rows owned by one TP rank; zero only with no lookups.
+
+    A short lookup row (``lookups < tp``) still lands on the front ranks, so
+    the analytical owner reports the ceiling instead of dropping every hit to
+    zero.
+    """
+    lookups, tp = int(lookups), max(1, int(tp))
+    if lookups <= 0:
+        return 0
+    quotient, remainder = divmod(lookups, tp)
+    return quotient + (1 if remainder > 0 else 0)
+
+
+def _ple_scale_bytes(lookup_format: str) -> int:
+    return MXFP8_SCALE_BYTES if lookup_format == "mxfp8" else INT8_SCALE_BYTES
+
+
+def _ple_read_bytes(hits_local: int, width: int, lookup_format: str) -> float:
+    """Owner read for one table: BF16 rows or quantized codes plus group scales."""
+    width = int(width)
+    if lookup_format == "bf16":
+        return float(int(hits_local) * width * BF16_BYTES)
+    scales = _ceil_div(width, MX_GROUP) * _ple_scale_bytes(lookup_format)
+    return float(int(hits_local) * (width + scales))
+
+
+def _ple_activation_bytes(padded_tokens: int, columns: int, width: int,
+                          act_bytes: int) -> float:
+    """Publish all ``columns_per_table * width`` activation lanes exactly once."""
+    return float(int(padded_tokens) * int(columns) * int(width) * int(act_bytes))
+
+
 def lower_ple(
     *, prefix: str, plan: Any, stage: int, deps: str, model: ModelSpec,
     parallel: ParallelSpec, quant: Any, mode: str, padded_tokens: int,
@@ -187,15 +260,32 @@ def lower_ple(
     engram.validate()
     requests = tuple(view.request_id for view in views)
     h = model.hidden_size
-    hc_mult = plan.hc_mult or ONE
-    embed = engram.columns_per_table * engram.width
+    hc_mult = plan.hc_mult or 1
+    columns = engram.columns_per_table
+    width = engram.width
+    embed = columns * width
     act_bytes = dtype_bytes(model.activation_dtype)
-    lookups = max(ONE, padded_tokens * engram.lookups_per_token_per_table)
+    lookups = max(1, padded_tokens * engram.lookups_per_token_per_table)
+    lookup_format = ple_lookup_format(model, runtime)
+    hits_local = _ple_owned_hits(lookups, parallel.tp)
+    read_bytes = _ple_read_bytes(hits_local, width, lookup_format)
+    lookup_meta = (
+        ("lookups", lookups), ("row_width", width),
+        ("engram_width", width), ("columns_per_table", columns),
+        ("padded_tokens", padded_tokens),
+        ("tp", parallel.tp), ("etp", parallel.etp),
+        ("lookup_format", lookup_format),
+        ("ple_lookup_format", lookup_format),
+    )
     conv_k = int(dict(engram.source).get("ple_conv_kernel_size", DEFAULT_PLE_CONV_KERNEL))
-    state_bytes = ple_conv_state_bytes(model, runtime) * max(ONE, len(views))
+    state_bytes = ple_conv_state_bytes(model, runtime) * max(1, len(views))
     conv_input = float(padded_tokens * hc_mult * h * act_bytes)
     gated_output = float(padded_tokens * hc_mult * h * act_bytes)
     outer_residual = float(padded_tokens * hc_mult * h * act_bytes)
+    activation_bytes = _ple_activation_bytes(
+        padded_tokens, columns, width, act_bytes)
+    dequant_ops = (float(hits_local * width)
+                   if lookup_format in PLE_QUANTIZED_FORMATS else 0.0)
     ops: list[OpSpec] = []
     last = ""
     for table in engram.tables:
@@ -207,35 +297,51 @@ def lower_ple(
             elements=lookups, ops_per_element=PLE_LOOKUP_OPS_PER_ELEM,
             dtype="fp32", family="engram_query", phase=mode, recipe="ple_ngram_ids",
             shape=(padded_tokens, engram.lookups_per_token_per_table),
-            metadata=(("table_id", table.table_id), ("lookups", lookups)))
+            metadata=(("table_id", table.table_id), ("lookups", lookups),
+                      ("columns_per_table", columns), ("row_width", width)))
         ops.append(query)
-        gathered = query.op_id
         has_host = bool(getattr(runtime, "engram_cpu_offload", False))
         if has_host:
-            uva_bytes = float(lookups * engram.row_bytes / max(ONE, parallel.tp))
+            # The baseline UVA caller keeps the host lookup, one host-vector
+            # decode pass and the H2D payload; it never charges device work.
+            # ``ple_uva_lookup`` (when active) annotates ``uva_dequant_device``
+            # and the registered scoped recipe moves the decode onto the NPU.
+            payload = read_bytes
             lookup = vector_op(
                 op_id=f"{prefix}.ple_host_uva_t{table.table_id}", deps=(query.op_id,),
                 stage=stage, layer=plan.index, requests=requests,
-                elements=ZERO, ops_per_element=ZERO_FLOAT,
+                elements=0, ops_per_element=0.0,
                 dtype="bf16", family="engram_rh2d", phase=mode,
-                recipe="ple_host_uva_lookup", shape=(padded_tokens, embed),
-                read_bytes_override=ZERO_FLOAT,
-                write_bytes_override=ZERO_FLOAT,
-                metadata=(("resource_work", {
-                    "host_memory": uva_bytes,
+                recipe=PLE_UVA_RECIPE, shape=(padded_tokens, embed),
+                read_bytes_override=0.0,
+                write_bytes_override=0.0,
+                metadata=((("resource_work", {
+                    "host_memory": payload,
                     "host_vector": float(lookups * PLE_LOOKUP_OPS_PER_ELEM),
-                    "h2d": uva_bytes,
-                }),))
+                    "h2d": payload,
+                }),) + lookup_meta + (
+                    ("table_id", table.table_id),
+                    ("activation_output_bytes", activation_bytes),
+                    ("ple_dequant_ops", dequant_ops),
+                    ("device_table_read_bytes", 0.0),
+                )))
         else:
             lookup = vector_op(
                 op_id=f"{prefix}.ple_device_lookup_t{table.table_id}", deps=(query.op_id,),
                 stage=stage, layer=plan.index, requests=requests,
-                elements=max(ONE, padded_tokens * embed),
+                elements=max(1, padded_tokens * embed),
                 ops_per_element=PLE_LOOKUP_OPS_PER_ELEM, dtype="bf16",
                 family="engram_gather", phase=mode, recipe="ple_device_lookup",
                 shape=(padded_tokens, embed),
-                read_bytes_override=float(lookups * engram.row_bytes / max(ONE, parallel.tp)),
-                write_bytes_override=float(padded_tokens * embed * BF16_BYTES))
+                read_bytes_override=read_bytes,
+                write_bytes_override=activation_bytes,
+                vector_ops_override=dequant_ops,
+                metadata=lookup_meta + (
+                    ("table_id", table.table_id),
+                    ("activation_output_bytes", activation_bytes),
+                    ("quantized_lookup_charged", True),
+                    ("dequantize_on_npu", lookup_format in PLE_QUANTIZED_FORMATS),
+                ))
         ops.append(lookup)
         gathered = lookup.op_id
         if parallel.tp > ONE:
@@ -292,6 +398,80 @@ def lower_ple(
     if not last:
         raise ModelingError(f"catalog_engram_table_not_at_layer:{plan.index}")
     return ops, last
+
+
+def _lower_ple_uva_npu_dequant(context: Any) -> Any:
+    """Three declared phases: host lookup, H2D transfer and NPU dequant publish."""
+    from mindie_sim.prediction.program import KernelProgram, Stage
+
+    names = dict(getattr(context, "resource_names", {}) or ())
+    work = {str(key): float(value) for key, value in dict(context.work).items()}
+
+    def take(role: str) -> dict[str, float]:
+        name = names.get(role)
+        if name is None or name not in work:
+            return {}
+        return {name: work.pop(name)}
+
+    lookup = take("host_memory")
+    transfer = take("h2d")
+    publish: dict[str, float] = {}
+    for role in ("vector", "mte3", "hbm"):
+        publish.update(take(role))
+    for name, value in tuple(work.items()):
+        # Conserve any residual declared resource on the publish phase.
+        publish[name] = publish.get(name, 0.0) + value
+    return KernelProgram((
+        Stage("lookup", lookup),
+        Stage("transfer", transfer, after=("lookup",)),
+        Stage("dequant_publish", publish, after=("transfer",)),
+    ), context.minimum_ms)
+
+
+def build_ple_uva_npu_dequant(op: OpSpec, geometry: Any) -> Any:
+    """Planned recipe for the UVA PLE lookup with NPU-side dequantization.
+
+    The payload crosses H2D; the device table is never read (``mte2_aiv`` is a
+    declared zero).  The dequant lane work and the activation output write are
+    each paid exactly once and replace the host-vector decode stage.
+    """
+    from mindie_sim.prediction.mechanism import OperatorPlan, Work
+
+    del geometry
+    meta = dict(getattr(op, "metadata", ()) or ())
+    declared = dict(meta.get("resource_work", {}) or {})
+    payload = float(declared.get("host_memory", 0.0) or 0.0)
+    transfer = float(declared.get("h2d", payload) or 0.0)
+    publish = float(meta.get("activation_output_bytes", 0.0) or 0.0)
+    dequant = float(meta.get("ple_dequant_ops", 0.0) or 0.0)
+    return OperatorPlan(
+        Work(resources={
+            "host_memory": payload,
+            "h2d": transfer,
+            "vector": dequant,
+            "mte3": publish,
+            "hbm": publish,
+            "mte2_aiv": 0.0,
+        }), _lower_ple_uva_npu_dequant,
+        metadata={
+            "physical_class": "PleUvaNpuDequant",
+            "stage_basis": "declared_host_lookup_transfer_npu_dequant_phases",
+        })
+
+
+def build_ple_host_staging(op: OpSpec, geometry: Any) -> Any:
+    """Renderer for callers that keep the host-vector decode (pass excluded)."""
+    from mindie_sim.prediction.mechanism import OperatorPlan
+    from mindie_sim.prediction.physical_recipe_base import work_from_op
+    from mindie_sim.prediction.program import HostStaging
+
+    del geometry
+    return OperatorPlan(
+        work_from_op(op), HostStaging().lower,
+        metadata={
+            "physical_class": "PleHostStaging",
+            "stage_basis": "host_lookup_host_vector_decode_h2d_transfer",
+        })
 
 
 def lowrank_hc_layer_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
@@ -376,16 +556,34 @@ def qwen4_exp_pool_breakdown(
     tp = max(ONE, parallel.tp)
     seq = int(sequence_tokens)
     slot_count = len(qsa)
-    local_kv = max(ONE, (qsa[ZERO].num_kv_heads + tp - ONE) // tp)
-    kv_elem = dtype_bytes(str(getattr(getattr(model, "quant", None), "kv_dtype", "")
-                              or getattr(model, "kv_dtype", "bf16")))
-    kv_token_bytes = int(TWO * local_kv * qsa[ZERO].head_dim * kv_elem)
+    local_kv = max(1, (qsa[0].num_kv_heads + tp - 1) // tp)
+    int8_fa3 = gbsa_cache_layout(runtime) == "int8_fa3"
+    if int8_fa3:
+        # C8 reserves ``h*(D+4)`` for each K/V region: INT8 codes, the dynamic
+        # K scale and the reserved static V scale slot.
+        kv_token_bytes = int(2 * local_kv * (qsa[0].head_dim + FP32_BYTES))
+    else:
+        kv_elem = dtype_bytes(str(getattr(getattr(model, "quant", None), "kv_dtype", "")
+                                  or getattr(model, "kv_dtype", "bf16")))
+        kv_token_bytes = int(2 * local_kv * qsa[0].head_dim * kv_elem)
+    # A verify window owns ``q`` recurrent checkpoint matrices (or the replay
+    # record set); the pool must reserve the full active multiplicity, not one
+    # slot per request.
+    state_plans = tuple(
+        speculative_state_plan(
+            model, plan, parallel,
+            query_tokens=resolve_speculative_query_tokens(
+                runtime, phase=PHASE_DECODE),
+            recover_ssm=runtime_recover_ssm(runtime),
+            capacity_padded=True,
+            state_contract=getattr(plan, "state_contract", None),
+            runtime=runtime)
+        for plan in gdn)
     max_ssm_bytes = max(
-        int(math.ceil(p.recurrent_state_elements / tp) * dtype_bytes(p.recurrent_state_dtype))
-        for p in gdn)
+        int(math.ceil(state.recurrent_bytes + state.replay_bytes))
+        for state in state_plans)
     conv_bytes = max(
-        int(math.ceil(p.conv_state_elements / tp) * dtype_bytes(p.conv_state_dtype))
-        for p in gdn)
+        int(math.ceil(state.conv_bytes)) for state in state_plans)
     subpage_alignment = KERNEL_BLOCK_TOKENS * kv_token_bytes
     min_block_tokens = _round_up(_ceil_div(max_ssm_bytes, kv_token_bytes), KERNEL_BLOCK_TOKENS)
     cfg_block = int(getattr(runtime, "kv_block_size", KERNEL_BLOCK_TOKENS)
@@ -394,11 +592,18 @@ def qwen4_exp_pool_breakdown(
     main_page_bytes = manager_block_size * kv_token_bytes
     state_stride = _round_up(max(conv_bytes + max_ssm_bytes, main_page_bytes), subpage_alignment)
     manager_block_size = state_stride // kv_token_bytes
-    ratio = max(ONE, qsa[ZERO].index_kpool)
+    ratio = max(1, qsa[0].index_kpool)
     idx_elem = dtype_bytes(str(getattr(getattr(model, "quant", None), "index_dtype", "")
                                or "bf16"))
-    raw_page_bytes = int(TWO * ratio * qsa[ZERO].index_dim * BF16_BYTES)
-    compressed_page_bytes = int((manager_block_size // ratio) * qsa[ZERO].index_dim * idx_elem)
+    raw_page_bytes = int(2 * ratio * qsa[0].index_dim * BF16_BYTES)
+    if int8_fa3:
+        # INT8 compressed-index codes plus one FP16 row scale written into the
+        # declared ``Di + 4`` aligned pitch (132 B at Di=128).
+        compressed_page_bytes = int(
+            (manager_block_size // ratio) * (qsa[0].index_dim + FP32_BYTES))
+    else:
+        compressed_page_bytes = int(
+            (manager_block_size // ratio) * qsa[0].index_dim * idx_elem)
     slot_backing_bytes = state_stride + raw_page_bytes + compressed_page_bytes
     pool_bytes_per_block = slot_count * slot_backing_bytes
     qsa_blocks = _ceil_div(max(ONE, seq), manager_block_size) if seq > ZERO else ZERO
@@ -417,7 +622,8 @@ def qwen4_exp_pool_breakdown(
 
 
 __all__ = [
-    "build_ple_spec", "is_qwen4_exp_ple", "lower_ple", "ple_table_terms",
+    "build_ple_spec", "is_qwen4_exp_ple", "lower_ple", "ple_lookup_format",
+    "build_ple_uva_npu_dequant", "build_ple_host_staging", "ple_table_terms",
     "ple_gate_terms_by_layer", "lowrank_hc_layer_terms", "lowrank_hc_head_terms",
     "lowrank_hc_draft_terms", "lowrank_hc_draft_head_terms", "qsa_indexer_terms",
     "ple_conv_state_bytes", "qwen4_exp_pool_breakdown",

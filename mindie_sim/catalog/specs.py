@@ -66,7 +66,20 @@ def _set_facts(model: ModelSpec, facts: Sequence[tuple[str, Any]]) -> None:
 def build_model_spec(key: str, config: Mapping[str, Any]) -> ModelSpec:
     """Lower one raw config and declare its native auxiliary plans once."""
     from .draft import declare_native_auxiliary_plans
-    return declare_native_auxiliary_plans(_build_model_spec(key, config))
+    model = _build_model_spec(key, config)
+    c, _text, _vision = flatten_config(config)
+    facts = dict(model.catalog_facts)
+    if "normalization" not in facts and (
+            bool(c.get("use_gemma_norm")) or bool(c.get("apply_layernorm_1p"))):
+        # Gemma-style ``(1 + gamma)`` normalization is a declared model
+        # semantic regardless of the family adapter that assembled the plans.
+        _set_facts(model, list(model.catalog_facts) + [(
+            "normalization",
+            {"norm_weight_offset": 1.0,
+             "norm_multiply_before_output_cast": True,
+             "source": {"declaration": "use_gemma_norm_or_apply_layernorm_1p"}},
+        )])
+    return declare_native_auxiliary_plans(model)
 
 
 def _build_model_spec(key: str, config: Mapping[str, Any]) -> ModelSpec:

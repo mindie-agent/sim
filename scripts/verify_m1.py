@@ -38,6 +38,8 @@ import sys
 import time
 
 SIM_ROOT = Path(__file__).resolve().parents[1]
+if str(SIM_ROOT) not in sys.path:
+    sys.path.insert(0, str(SIM_ROOT))
 DEFAULT_OUTPUT = SIM_ROOT / "state" / "m1"
 CATALOG_MODELS = (
     "deepseek-v4-10t", "deepseek-v4-flash-0731", "deepseek-v4-pro-0813",
@@ -45,9 +47,10 @@ CATALOG_MODELS = (
     "deepseek-v3", "deepseek-r1", "deepseek-v3.2", "glm-5.3",
     "glm-5.3-flash", "glm-5.1", "glm-5.2", "kimi-k3", "kimi-k3.1",
     "kimi-k3-dspark", "kimi-k3-dspark-block5", "kimi-k2", "kimi-k2-thinking",
-    "kimi-k2.5", "qwen3-30b-a3b", "qwen3-32b", "qwen3-235b-a22b",
+    "kimi-k2.5", "kimi-k2.6", "qwen3-30b-a3b", "qwen3-32b", "qwen3-235b-a22b",
     "qwen3-next-80b-a3b", "qwen3.5-27b", "qwen3.5-35b-a3b",
-    "qwen3.5-397b-a17b", "qwen3.6-27b", "qwen3.8-2.4t-a95b", "qwen3.8-27b",
+    "qwen3.5-122b-a10b", "qwen3.5-397b-a17b", "qwen3.6-27b",
+    "qwen3.8-2.4t-a95b", "qwen3.8-27b",
     "minimax-m3", "minimax-m3.1-flash", "gemma-4-26b-a4b", "gemma-4-31b",
     "qwen3.6-35b-a3b", "qwen3.8-flash-next", "step-5-preview",
 )
@@ -89,20 +92,24 @@ def _climb(start: Path, name: str) -> Path | None:
 
 SKIP_SCAN_DIRS = frozenset({
     ".venv", "venv", ".git", "__pycache__", ".pytest_cache",
-    ".mypy_cache", "build", "dist", ".ruff_cache",
+    ".mypy_cache", "build", "dist", ".ruff_cache", "site-packages", "node_modules",
 })
 
 
 def _python_files(root: Path):
-    for path in sorted(root.rglob("*.py")):
-        if any(part in SKIP_SCAN_DIRS for part in path.relative_to(root).parts):
-            continue
-        try:
-            if path.stat().st_size > STREAM_LIMIT:
+    """Repository sources only; prune excluded subtrees relative to ``root``."""
+    for directory, dirs, files in os.walk(root):
+        dirs[:] = [name for name in sorted(dirs) if name not in SKIP_SCAN_DIRS]
+        for name in sorted(files):
+            if not name.endswith(".py"):
                 continue
-        except OSError:
-            continue
-        yield path
+            path = Path(directory) / name
+            try:
+                if path.stat().st_size > STREAM_LIMIT:
+                    continue
+            except OSError:
+                continue
+            yield path
 
 
 def hygiene(args) -> dict:
@@ -279,6 +286,13 @@ def _auxiliary_summary(model) -> dict:
     return {}
 
 
+def _manifest_reference_label(manifest_path: Path) -> str:
+    """Repository-relative manifest label; never leak the host worktree path."""
+    if manifest_path.is_relative_to(SIM_ROOT):
+        return manifest_path.relative_to(SIM_ROOT).as_posix()
+    return manifest_path.name
+
+
 def catalog_meta(args) -> dict:
     from mindie_sim.model_catalog import load_model
     from mindie_sim.schema.parallel import ParallelSpec
@@ -288,8 +302,9 @@ def catalog_meta(args) -> dict:
         return _fail("catalog-meta",
                      f"catalog_model_set_size:{len(CATALOG_MODELS)}!={required}")
     manifest_path = Path(args.references or DEFAULT_MANIFEST).resolve()
+    reference_label = _manifest_reference_label(manifest_path)
     if not manifest_path.is_file():
-        return _fail("catalog-meta", f"reference_manifest_missing:{manifest_path}")
+        return _fail("catalog-meta", f"reference_manifest_missing:{reference_label}")
     try:
         manifest = catalog.load_manifest(manifest_path)
         models = catalog.manifest_models(manifest)
@@ -304,7 +319,7 @@ def catalog_meta(args) -> dict:
             required_models=required, manifest_models=len(models),
             missing_references=missing[:REPORT_SHAPES],
             extra_references=extra[:REPORT_SHAPES],
-            references=str(manifest_path), references_sha256=manifest_digest)
+            references=reference_label, references_sha256=manifest_digest)
     rows = []
     failures = []
     parameter_total = 0
@@ -405,7 +420,7 @@ def catalog_meta(args) -> dict:
         "manifest_models": len(models),
         "completed_models": len(rows),
         "failed_models": len(failures),
-        "references": str(manifest_path),
+        "references": reference_label,
         "references_sha256": manifest_digest,
         "parameter_total": parameter_total,
         "parameter_reference_total": reference_parameter_total,
@@ -548,7 +563,7 @@ def main(argv=None) -> int:
 
     catalog_parser = sub.add_parser("catalog-meta")
     catalog_parser.add_argument("--references", default=str(DEFAULT_MANIFEST))
-    catalog_parser.add_argument("--require-models", type=int, default=37)
+    catalog_parser.add_argument("--require-models", type=int, default=39)
     catalog_parser.add_argument("--output", default=None)
 
     spine_parser = sub.add_parser("spine-benchmark")

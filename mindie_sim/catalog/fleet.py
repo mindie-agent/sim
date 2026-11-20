@@ -63,9 +63,11 @@ CORE_CATALOG_ENTRIES: dict[str, str] = {
     "kimi-k3": "kimi-k3.json", "kimi-k3.1": "kimi-k3.1.json", "kimi-k3-dspark": "kimi-k3-dspark.json",
     "kimi-k3-dspark-block5": "kimi-k3-dspark-block5.json",
     "kimi-k2": "kimi-k2.json", "kimi-k2-thinking": "kimi-k2-thinking.json", "kimi-k2.5": "kimi-k2.5.json",
+    "kimi-k2.6": "kimi-k2.6.json",
     "qwen3-30b-a3b": "qwen3-30b-a3b.json", "qwen3-32b": "qwen3-32b.json",
     "qwen3-235b-a22b": "qwen3-235b-a22b.json", "qwen3-next-80b-a3b": "qwen3-next-80b-a3b.json",
     "qwen3.5-27b": "qwen3.5-27b.json", "qwen3.5-35b-a3b": "qwen3.5-35b-a3b.json",
+    "qwen3.5-122b-a10b": "qwen3.5-122b-a10b.json",
     "qwen3.5-397b-a17b": "qwen3.5-397b-a17b.json", "qwen3.6-27b": "qwen3.6-27b.json",
     "qwen3.8-2.4t-a95b": "qwen3.8-2.4t-a95b.json", "qwen3.8-27b": "qwen3.8-27b.json",
     **FLEET_CATALOG_ENTRIES,
@@ -153,6 +155,9 @@ CORE_MODEL_ALIASES: dict[str, str] = {
     "Kimi-K2": "kimi-k2", "Kimi-K2-Instruct": "kimi-k2", "kimi-k2-instruct": "kimi-k2", "kimi_k2": "kimi-k2",
     "Kimi-K2-Thinking": "kimi-k2-thinking", "kimi-k2-thinking": "kimi-k2-thinking", "kimi_k2_thinking": "kimi-k2-thinking",
     "Kimi-K2.5": "kimi-k2.5", "kimi_k2.5": "kimi-k2.5", "kimi_k25": "kimi-k2.5", "kimi-k25": "kimi-k2.5",
+    "Kimi-K2.6": "kimi-k2.6", "kimi_k2.6": "kimi-k2.6", "kimi_k26": "kimi-k2.6", "kimi-k26": "kimi-k2.6",
+    "Kimi-K2.6-w4a8": "kimi-k2.6", "Kimi-K2.6_w4a8": "kimi-k2.6",
+    "kimi-k2.6-w4a8": "kimi-k2.6", "kimi-k2.6_w4a8": "kimi-k2.6",
     "Qwen3-30B-A3B": "qwen3-30b-a3b", "qwen30ba3b": "qwen3-30b-a3b",
     "Qwen3-32B": "qwen3-32b", "qwen3_32b": "qwen3-32b",
     "Qwen3-235B-A22B": "qwen3-235b-a22b", "qwen3_235b_a22b": "qwen3-235b-a22b", "qwen3-235b": "qwen3-235b-a22b",
@@ -163,6 +168,10 @@ CORE_MODEL_ALIASES: dict[str, str] = {
     "Qwen3.6-27B": "qwen3.6-27b", "qwen3.6-27b": "qwen3.6-27b",
     "Qwen3.5-35B-A3B": "qwen3.5-35b-a3b", "qwen3.5-35b-a3b": "qwen3.5-35b-a3b", "qwen3_5_moe_a3b": "qwen3.5-35b-a3b",
     "Qwen3.5-397B-A17B": "qwen3.5-397b-a17b", "qwen3_5_397b_a17b": "qwen3.5-397b-a17b", "qwen3.5-397b": "qwen3.5-397b-a17b",
+    "Qwen3.5-122B-A10B": "qwen3.5-122b-a10b", "qwen3_5_122b_a10b": "qwen3.5-122b-a10b",
+    "qwen35_122b_a10b": "qwen3.5-122b-a10b", "qwen35-122b-a10b": "qwen3.5-122b-a10b",
+    "qwen3.5-122b": "qwen3.5-122b-a10b", "Qwen3.5-122B-A10B-w8a8-mtp": "qwen3.5-122b-a10b",
+    "qwen3.5-122b-a10b-w8a8-mtp": "qwen3.5-122b-a10b",
     **FLEET_MODEL_ALIASES,
 }
 
@@ -197,7 +206,11 @@ def _facts(family: str, config: Mapping[str, Any], c: Mapping[str, Any],
         ("num_nextn_predict_layers", _int(c, "num_nextn_predict_layers")),
         ("source_scope", "structural_config_no_latency_labels"),
     ]
-    facts.append(("hc_lowrank", max((p.hc_lowrank for p in plans), default=ZERO)))
+    facts.append(("hc_lowrank", max((p.hc_lowrank for p in plans), default=0)))
+    if bool(c.get("fp32_residual_connection", False)):
+        facts.append(("fp32_residual_connection", True))
+    if str(c.get("norm_dtype", "")).lower() in {"float32", "fp32"}:
+        facts.append(("norm_dtype", "fp32"))
     facts.extend(extra.items())
     return facts
 

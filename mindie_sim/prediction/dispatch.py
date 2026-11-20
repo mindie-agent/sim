@@ -528,33 +528,30 @@ def submit_batch(case, schedulers, plans, execution, lower, now, *,
         logical_local = dict(local)
         phase = next((view.phase for plan in local.values()
                       for view in plan.requests), "decode")
+        allgather_padded = None
         if isinstance(lower, Frontend):
-            from .operator_analysis import graph_padded_idle
-            from .graph import GraphPolicy
-            from mindie_sim.schema.workload import RequestView
+            from .operator_analysis import (
+                graph_padded_idle, synchronize_moe_allgather_cohort,
+            )
             counts = {replica: len(plan.requests)
                       for replica, plan in local.items()}
-            if graph_padded_idle(case, phase, counts):
-                context0 = next(
-                    (view.context for plan in logical_local.values()
-                     for view in plan.requests), 0)
-                for replica, plan in local.items():
-                    if plan.requests:
-                        continue
-                    probe = RequestView(
-                        f"serving{replica}:bucket_probe", 0, context0,
-                        False, phase, padding=True, draft_verify=False,
-                        draft_prepare=False)
-                    bucket, _ = GraphPolicy().select((probe,), case.runtime)
-                    physical = int(bucket or 0)
-                    if physical:
-                        local[replica] = replace(plan, requests=(RequestView(
-                            f"serving{replica}:padding", physical, context0,
-                            False, phase, padding=True, draft_verify=False,
-                            draft_prepare=False),))
+            pad_idle = graph_padded_idle(case, phase, counts)
+            context0 = next(
+                (view.context for plan in logical_local.values()
+                 for view in plan.requests), 0)
+            synced_views, allgather_padded = synchronize_moe_allgather_cohort(
+                case, phase,
+                {r: plan.requests for r, plan in logical_local.items()},
+                pad_idle=pad_idle, default_context=context0, prefix="serving",
+            )
+            for replica, reqs in synced_views.items():
+                if reqs != local[replica].requests:
+                    local[replica] = replace(local[replica], requests=reqs)
         global_views = tuple(view for plan in local.values() for view in plan.requests)
-        context = ({"global_views": global_views, "global_tokens": sum(
-            view.q_len + view.draft_proposal_tokens for view in global_views)} if len(plans) > 1 else {})
+        context = ({"global_views": global_views, "global_tokens": (
+            allgather_padded if allgather_padded is not None
+            else sum(view.q_len + view.draft_proposal_tokens for view in global_views)
+        )} if len(plans) > 1 else {})
         sp_padding = case.runtime.kernels.get("sequence_parallel", {}).get("padding")
         if len(plans) > 1 and (case.runtime.routing.get("policy") == "balanced"
                                or sp_padding == "right_to_tp"):

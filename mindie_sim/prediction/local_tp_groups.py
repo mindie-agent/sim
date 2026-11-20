@@ -235,7 +235,7 @@ def collective_requires_cohort(op: Any, topology: Any) -> bool:
         for rank in topology.ranks(replica, stage):
             owner[int(rank)] = replica
     axis = str(metadata.get("group_axis", "tp"))
-    if axis not in {"cp", "etp", "pcp", "ep", "tp", LOCAL_TP_AXIS}:
+    if axis not in {"cp", "etp", "pcp", "ep", "tp", "dp", LOCAL_TP_AXIS}:
         return False
     declared = metadata.get("group_ranks")
     groups: Sequence[Sequence[int]] = (tuple(declared),) if declared else tuple(

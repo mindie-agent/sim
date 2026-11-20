@@ -412,6 +412,96 @@ def _routing_views_for(value, replica):
     return value
 
 
+def synchronize_moe_allgather_cohort(
+    case, phase: str, logical_views: Mapping[int, tuple], *, pad_idle: bool,
+    default_context: int = 0, prefix: str = "analysis",
+) -> tuple[dict[int, tuple], int | None]:
+    """Synchronize DP replica extents for captured idle lanes and MoE collectives."""
+    from mindie_sim.schema.workload import RequestView
+    from .graph import GraphPolicy
+
+    gp = GraphPolicy()
+    participants = tuple(logical_views.keys())
+    active_rows = {
+        r: sum(v.q_len + v.draft_proposal_tokens for v in logical_views[r])
+        for r in participants
+    }
+    cohort_bucket = 0
+    if pad_idle:
+        for r in participants:
+            if logical_views[r]:
+                b_sel, _ = gp.select(logical_views[r], case.runtime)
+                cohort_bucket = max(cohort_bucket, int(b_sel or active_rows[r]))
+    non_sp_allgather = False
+    requires_nonzero_local = False
+    if (len(participants) > 1
+            and int(getattr(case.model, "num_experts", 0) or 0) > 0
+            and int(getattr(case.runtime.parallel, "ep", 1) or 1) > 1
+            and any(active_rows.values())):
+        from .mc2_graph import select_common as select_moe_comm
+        moe_features = FeatureConfig.from_runtime(
+            case.runtime, case.model, machine=case.machine)
+        sel = select_moe_comm(
+            case.runtime, moe_features,
+            tokens=max(active_rows.values(), default=0),
+            top_k=case.model.top_k, experts=case.model.num_experts,
+            ep=case.runtime.parallel.ep,
+        )
+        sel_kind = str(sel.get("kind") or "") if isinstance(sel, Mapping) else ""
+        rmeta = dict(getattr(case.runtime, "metadata", ()) or ())
+        if "sequence_parallel" not in case.runtime.kernels:
+            non_sp_allgather = bool(
+                sel_kind == "allgather_comm"
+                or str(rmeta.get("moe_comm_mode") or "").strip().lower() == "allgather"
+            )
+        requires_nonzero_local = bool(
+            (sel_kind == "arch22_v2_caller" and not sel.get("global_bs"))
+            or (isinstance(sel, Mapping) and sel.get("requires_nonzero_local_tokens"))
+            or bool(rmeta.get("eager_dp_dummy_run"))
+        )
+    max_dp_rows = (
+        max(cohort_bucket, max(active_rows.values(), default=0))
+        if pad_idle else max(active_rows.values(), default=0)
+    )
+    eager_dp_dummy = (
+        not pad_idle and not non_sp_allgather
+        and phase == "decode"
+        and any(active_rows.values())
+        and bool(case.runtime.parallel.ep_spans_dp)
+        and requires_nonzero_local
+    )
+    views: dict[int, tuple] = {}
+    for r in participants:
+        cur = logical_views[r]
+        cur_rows = active_rows[r]
+        if not cur and pad_idle:
+            probe = RequestView(
+                f"{prefix}{r}:bucket_probe", 0, default_context, False, phase,
+                padding=True, draft_verify=False, draft_prepare=False)
+            b0, _ = gp.select((probe,), case.runtime)
+            phys = int(cohort_bucket or b0 or 0)
+            views[r] = ((RequestView(
+                f"{prefix}{r}:padding", phys, default_context, False, phase,
+                padding=True, draft_verify=False, draft_prepare=False),)
+                if phys else ())
+        elif non_sp_allgather and cur_rows < max_dp_rows:
+            pad_q = max_dp_rows - cur_rows
+            views[r] = (*cur, RequestView(
+                f"{prefix}{r}:dp_allgather_pad", pad_q, default_context, False,
+                phase, padding=True, draft_verify=False, draft_prepare=False))
+        elif not cur and eager_dp_dummy:
+            views[r] = (RequestView(
+                f"{prefix}{r}:dummy_run", 1, default_context, False, phase,
+                padding=True, draft_verify=False, draft_prepare=False),)
+        else:
+            views[r] = cur
+    padded_total = (
+        len(participants) * max_dp_rows
+        if (non_sp_allgather and max_dp_rows > 0) else None
+    )
+    return views, padded_total
+
+
 def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
                   media_tokens_per_sequence=None, resource_fusion=True,
                   draft_prepare=False, apply_body_defaults=True,
@@ -425,7 +515,6 @@ def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
     physical padding view launches the actual graph bucket and EP kernel
     participation without inventing a logical request.
     """
-    from mindie_sim.schema.workload import RequestView
     from .dispatch import cohorts
 
     case = parse_model(case) if pure_model else parse_case(case)
@@ -437,35 +526,19 @@ def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
     sequences = _group_sequences(sequences, participants, case.runtime.parallel)
     counts = cohort_sequence_counts(sequences, participants)
     pad_idle = padded_idle or graph_padded_idle(case, phase, counts)
-    logical_views = {}
-    views = {}
-    for replica in participants:
-        count = counts[replica]
-        logical_views[replica] = tuple(
+    logical_views = {
+        replica: tuple(
             analysis_view(
                 case, f"analysis{replica}:{i}", tokens, context, scope,
                 phase, index=i, draft_prepare=draft_prepare,
                 **_analysis_prefix_fields(case, i, context),
-            ) for i in range(count))
-        if count == 0 and pad_idle:
-            # A physical graph row is not a logical request.  A zero-length
-            # padded view lets GraphPolicy select the declared capture bucket;
-            # the frontend then lowers that many physical rows while the
-            # logical ledger remains zero.
-            from .graph import GraphPolicy
-            probe = RequestView(
-                f"analysis{replica}:bucket_probe", 0, context, False, phase,
-                padding=True, draft_verify=False, draft_prepare=False,
-            )
-            bucket, _replay = GraphPolicy().select(
-                (probe,), case.runtime)
-            physical = int(bucket or 0)
-            views[replica] = ((RequestView(
-                f"analysis{replica}:padding", physical, context, False, phase,
-                padding=True, draft_verify=False, draft_prepare=False,
-            ),) if physical else ())
-        else:
-            views[replica] = logical_views[replica]
+            ) for i in range(counts[replica]))
+        for replica in participants
+    }
+    views, allgather_padded_cohort = synchronize_moe_allgather_cohort(
+        case, phase, logical_views, pad_idle=pad_idle,
+        default_context=context, prefix="analysis",
+    )
     active_rows_by_replica = {
         replica: sum(v.q_len + v.draft_proposal_tokens
                      for v in logical_views[replica])
@@ -475,7 +548,7 @@ def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
                        scope, media_tokens_per_sequence)
     global_views = (tuple(v for group in logical_views.values() for v in group)
                     if len(logical_views) > 1 else None)
-    padded_cohort = None
+    padded_cohort = allgather_padded_cohort
     sp_padding = case.runtime.kernels.get("sequence_parallel", {}).get("padding")
     if len(logical_views) > 1 and (case.runtime.routing.get("policy") == "balanced"
                                    or sp_padding == "right_to_tp"):
