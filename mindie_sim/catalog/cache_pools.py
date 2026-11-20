@@ -64,8 +64,11 @@ _EXACT_DTYPE_RATIO: dict[str, tuple[int, int]] = {
     "bool": (1, 1),
     "int4": (1, 2),
     "w4a8": (1, 2),
+    "w4a16": (1, 2),
     "fp4": (1, 2),
     "fp4_e2m1": (1, 2),
+    "fp64": (8, 1),
+    "float64": (8, 1),
 }
 
 LINEAR_ATTENTION_KINDS = frozenset({
@@ -111,16 +114,8 @@ def gbsa_cache_layout(runtime: Any) -> str:
         "gbsa_cache_layout", "") or "")
 
 
-def _packed_mla_row_bytes(model: Any, plan: Any) -> int:
-    """Physical MLA row width from the declared cache representation.
-
-    An explicit ``cache_representations['mla_kv']`` mapping is authoritative.
-    A declared INT8 KV row is the packed C8 record ``latent + FP32 group
-    scales + BF16 rotary`` (512 + 16 + 0 = 528 B for NoPE C8); every other
-    row keeps its declared ``CacheFormat`` price.
-    """
-    from mindie_sim.catalog.cache import packed_region_row_bytes
-
+def _packed_mla_row_parts(model: Any, plan: Any) -> tuple[int, int] | None:
+    """Return ``(payload_bytes, scale_bytes)`` for implicit packed INT8 MLA rows."""
     width = int(plan.cache_row_elements)
     regions = dict(getattr(model, "metadata", ()) or ()).get(
         "cache_representations", {})
@@ -131,10 +126,24 @@ def _packed_mla_row_bytes(model: Any, plan: Any) -> int:
     if ("mla_kv" not in dict(regions) and kv_dtype in INT8_PACKED_KV_DTYPES
             and latent > 0 and latent + rope == width):
         scales = _ceil_div(latent, C8_SCALE_GROUP) * FP32_BYTES
-        return int(latent + scales + rope * BF16_BYTES)
-    row_val = packed_region_row_bytes(model, "mla_kv", width)
-    frac = Fraction(float(row_val)).limit_denominator(FRACTION_DENOM_LIMIT)
-    return _ceil_div(frac.numerator, frac.denominator)
+        return int(latent + rope * BF16_BYTES), int(scales)
+    return None
+
+
+def _packed_mla_row_bytes(model: Any, plan: Any) -> int:
+    """Physical MLA row width from the declared cache representation.
+
+    An explicit ``cache_representations['mla_kv']`` mapping is authoritative.
+    A declared INT8 KV row is the packed C8 record ``latent + FP32 group
+    scales + BF16 rotary`` (512 + 16 + 0 = 528 B for NoPE C8); every other
+    row keeps its declared ``CacheFormat`` price as an exact integer.
+    """
+    from mindie_sim.catalog.cache import packed_region_row_bytes
+
+    parts = _packed_mla_row_parts(model, plan)
+    if parts is not None:
+        return parts[0] + parts[1]
+    return int(packed_region_row_bytes(model, "mla_kv", int(plan.cache_row_elements)))
 
 
 def target_mla_page_bytes(model: Any, block_size: int, *,

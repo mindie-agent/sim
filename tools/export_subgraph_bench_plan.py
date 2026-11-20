@@ -46,6 +46,7 @@ from tools.bench_plan_builders import (
     BUILDERS, COLLECTIVE_BUILDERS, CONTROL_FAMILIES, UnmodeledCapabilityError,
     attention_shape_dims, collapse_device_kernel_groups, fabric_route_ranks,
     is_ladder_kv_node, resolve_builder_strict, resolve_collective_cosets,
+    resolve_collective_group_ranks, resolve_fabric_collective_abi,
 )
 from tools.bench_plan_parallel import (
     ARCHETYPES, DEFAULT_TP, DENSE_EP, GEOMETRY_ARMS, HELDOUT_BATCH,
@@ -104,7 +105,7 @@ issued_rows matrix_weight_bank_groups topk_ids_dtype topk_ids_producer topk_weig
 payload_row_bytes payload_row_elements payload_semantics weight_representation weight_payload_bytes
 weight_scale_bytes activation_input_bytes cache_resolution cache_visible heads head_dim key_heads group_size
 participants nbytes per_token_scale collective_op mc2_mode qli_abi onchip_handoff_to sp_collective_kind
-quantized_all_reduce quantized_all_reduce_applied recover_ssm pipeline_gather pipeline_scatter""".split())
+quantized_all_reduce quantized_all_reduce_applied recover_ssm pipeline_gather pipeline_scatter physical_rank""".split())
 
 
 def _catalog_entries() -> dict[str, str]:
@@ -198,7 +199,7 @@ def _display_name(family: Any, recipe: Any, fallback: str = "") -> str:
 
 def _node_fields(*, node_id, family, recipe, operator, metadata, deps, outputs, parallel,
                  model_id="", layer_idx=MISSING_LAYER, topology=None, stage_idx=0,
-                 batch=1, kv_length=None, phase="decode"):
+                 replica_idx=0, batch=1, kv_length=None, phase="decode"):
     raw_meta = dict(operator.get("metadata") or {})
     dtype = str(operator.get("dtype") or "")
     raw_layout = str(operator.get("layout") or "").strip()
@@ -213,8 +214,17 @@ def _node_fields(*, node_id, family, recipe, operator, metadata, deps, outputs, 
     kind, routing = _node_kind(family, builder), _routing_block(metadata)
     group = routing["group_list"] if routing else metadata.get("matrix_group_rows")
     collective = builder in COLLECTIVE_BUILDERS
-    cosets = resolve_collective_cosets(topology, metadata, stage_idx) if (collective and topology is not None) else None
-    granks = next((grp for grp in cosets if 0 in grp), cosets[0]) if cosets else None
+    topo_meta = {**metadata, **{k: raw_meta[k] for k in ("group_ranks", "physical_rank", "rank") if k in raw_meta}}
+    cosets = resolve_collective_cosets(topology, topo_meta, stage_idx) if (collective and topology is not None) else None
+    if cosets is not None:
+        has_explicit = any(k in topo_meta for k in ("group_ranks", "physical_rank", "rank"))
+        rep_ranks = () if has_explicit else tuple(topology.ranks(int(replica_idx), stage_idx))
+        granks = resolve_collective_group_ranks(
+            topology, topo_meta, stage_idx,
+            rank=(None if has_explicit else (int(rep_ranks[0]) if rep_ranks else 0)),
+        )
+    else:
+        granks = None
     gsize = len(granks) if granks else (collective_group_size(metadata, parallel) if collective else None)
     shape = _shape_dims(family, builder, recipe, operator, metadata, parallel,
                         raw_meta=raw_meta, batch=batch, kv_length=kv_length, phase=phase)
@@ -272,7 +282,8 @@ def _node_payload(node, *, model_id, archetype, parallel, arm, batch, kv_length,
         node_id=node["node_id"], family=node.get("family"), recipe=operator.get("recipe"),
         operator=operator, metadata=metadata, deps=node.get("deps") or (), outputs=(),
         parallel=parallel, model_id=model_id, layer_idx=layer_idx, topology=topology,
-        stage_idx=int(node.get("stage", 0)), batch=batch, kv_length=kv_length, phase=node_phase,
+        stage_idx=int(node.get("stage", 0)), replica_idx=int(node.get("replica", 0)),
+        batch=batch, kv_length=kv_length, phase=node_phase,
     )
     stage, boundary = _stage_and_boundary([built])
     return {
@@ -300,7 +311,8 @@ def _subgraph_payload(subgraph, members, *, model_id, archetype, parallel, arm, 
         operator=m.get("operator") or {}, metadata=_metadata(m.get("operator") or {}),
         deps=m.get("deps") or (), outputs=dependents.get(m["node_id"], ()), parallel=parallel,
         model_id=model_id, layer_idx=int(m.get("layer", subgraph.get("layer", MISSING_LAYER))),
-        topology=topology, stage_idx=int(m.get("stage", 0)), batch=batch, kv_length=kv_length,
+        topology=topology, stage_idx=int(m.get("stage", 0)), replica_idx=int(m.get("replica", 0)),
+        batch=batch, kv_length=kv_length,
         phase=str(m.get("phase", sub_phase)),
     ) for m in members]
     kv = kv_length if any(_kv_dependent(m.get("family"), (m.get("operator") or {}).get("recipe")) for m in members) else None
@@ -483,34 +495,54 @@ def _hardware_view(sku, structure_sku):
     machine, die = _hardware_machine(sku)
     l2_bytes = int(dict(die.buffers).get("l2", 0))
     cold_ring = FABRIC_COLD_RING_FACTOR * l2_bytes
+    node_ids = sorted({int(getattr(d, "node", 0)) for d in machine.dies})
+    pkg_keys = sorted({(int(getattr(d, "node", 0)), int(getattr(d, "package", 0))) for d in machine.dies})
+    rank_node = {int(d.rank): int(getattr(d, "node", 0)) for d in machine.dies}
+    has_inter = any(
+        len({rank_node[int(r)] for r in lnk.members if int(r) in rank_node}) >= 2
+        and any(m in f"{lnk.channel} {lnk.name}".lower() for m in ("inter_node", "inter_pod", "roce", "rdma", "scaleout", "scale_out"))
+        for lnk in machine.links
+    )
     return {
         "sku": sku, "architecture": machine.arch_family, "capability_preset": die.capability.preset,
         "dies_per_node": int(machine.ranks_per_node), "capability_digest": _digest(_capability_tokens(die)),
         "dies_per_package": int(machine.dies_per_package), "l2_bytes_per_die": l2_bytes,
         "hbm_bytes_per_die": int(die.memory_bytes), "fabric_cold_ring_bytes": cold_ring,
         "structure_identity_sku": structure_sku,
+        "nodes": len(node_ids), "total_dies": len(machine.dies),
+        "ranks": [int(d.rank) for d in machine.dies],
+        "ranks_by_node": [sorted(int(d.rank) for d in machine.dies if int(getattr(d, "node", 0)) == n) for n in node_ids],
+        "package_ranks": [sorted(int(d.rank) for d in machine.dies if (int(getattr(d, "node", 0)), int(getattr(d, "package", 0))) == k) for k in pkg_keys],
+        "has_inter_node_link": has_inter,
+        "declared_links": [{"name": lnk.name, "channel": lnk.channel, "members": sorted(int(r) for r in lnk.members)} for lnk in machine.links],
         "fabric_cold_ring_8mib_slots": int(math.ceil(cold_ring / FABRIC_SLOT_BYTES)),
         "structure_identity_is_sku_independent": False,
     }
 
 
 def _fabric_cases(hardware):
-    routes = [r for r in FABRIC_ROUTES if r != "intra_package_die" or hardware["dies_per_package"] >= 2]
+    routes = [
+        r for r in FABRIC_ROUTES
+        if (r != "intra_package_die" or hardware["dies_per_package"] >= 2)
+        and (r != "intra_node_hccs" or hardware["dies_per_node"] // max(1, hardware["dies_per_package"]) >= 2)
+        and (r != "inter_node_roce" or (int(hardware.get("nodes") or 1) >= 2 and bool(hardware.get("has_inter_node_link", True))))
+    ]
     cases = []
     for collective_op in FABRIC_COLLECTIVES:
+        builder, upstream_abi = resolve_fabric_collective_abi(collective_op)
         for route in routes:
             for payload in FABRIC_LADDER_BYTES:
                 participants = FABRIC_PARTICIPANTS[route]
                 ranks = fabric_route_ranks(route, participants, hardware)
                 node = {
                     "schema": NODE_SCHEMA, "node_id": "fab0", "kind": "collective", "op": collective_op,
-                    "display_name": f"collective:{collective_op}", "builder": collective_op,
-                    "upstream_abi": collective_op, "dtype": "fp32", "output_dtype": "fp32",
+                    "display_name": f"collective:{collective_op}", "builder": builder,
+                    "upstream_abi": upstream_abi, "dtype": "fp32", "output_dtype": "fp32",
                     "layout": "contiguous", "inputs": [], "outputs": [], "group_list": None,
                     "group_list_type": 1, "per_token_scale": None, "format_code": None,
                     "nbytes": int(payload), "group_size": participants, "group": route,
-                    "group_ranks": ranks, "group_cosets": [ranks], "implementation": collective_op,
-                    "implementation_source": "fabric_probe", "kernel": collective_op,
+                    "group_ranks": ranks, "group_cosets": [ranks], "implementation": upstream_abi,
+                    "implementation_source": "builder_upstream_abi", "kernel": upstream_abi,
                     "shape": {"bytes": int(payload), "group_size": participants},
                 }
                 cases.append({
@@ -539,11 +571,14 @@ def _heldout_probe_models(models):
 def _model_record(model_id):
     model = load_model(model_id)
     parallel = parallel_policy(model)
+    slots = (_slot_plan_for(int(model.num_experts), int(parallel["ep"]),
+                            redundant=int(parallel.get("redundant_experts_per_rank") or 0))
+             if int(model.num_experts) > 0 else None)
     return {
         "model_id": model_id, "archetype": model_archetype(model_id, model), "parallel": parallel,
         "parameter_count": _parameter_count(model), "layers": int(model.layers), "attention": model.attention,
         "ffn": model.ffn, "num_experts": int(model.num_experts), "top_k": int(model.top_k),
-        "quantization": model.quant.name, "expert_bank": _expert_bank_bytes(model, parallel),
+        "quantization": model.quant.name, "expert_bank": _expert_bank_bytes(model, parallel, slots=slots),
         "layer_signatures": layer_signatures(model), "proposal_tokens": _proposal_tokens(model),
         "compiled_arms": [], "_model": model,
     }

@@ -28,6 +28,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+from mindie_sim.catalog.cache_pools import _ceil_div, exact_element_bytes
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 
 
@@ -136,9 +137,12 @@ def speculative_state_plan(
     dk, dv = _head_geometry(layer)
     state_dtype = str(getattr(layer, "recurrent_state_dtype", "") or "fp32")
     kg_dtype = str(contract.get("record_kg_dtype", DEFAULT_RECORD_KG_DTYPE))
-    recurrent_elements = float(getattr(layer, "recurrent_state_elements", 0) or 0)
-    recurrent_elements /= max(1, int(parallel.tp)) * shards
-    state_bytes = recurrent_elements * float(dtype_bytes(state_dtype))
+    total_shards = max(1, int(parallel.tp)) * shards
+    recurrent_elements = _ceil_div(
+        int(getattr(layer, "recurrent_state_elements", 0) or 0), total_shards,
+    )
+    state_bytes = float(exact_element_bytes(recurrent_elements, state_dtype))
+    conv_raw = int(getattr(layer, "conv_state_elements", 0) or 0)
     conv_width, kernel, conv_dtype = _conv_geometry(layer, parallel, shards)
     conv_element = float(dtype_bytes(conv_dtype))
     history = int(contract.get("kernel_history", kernel))
@@ -146,6 +150,8 @@ def speculative_state_plan(
     conv_snapshots = int(contract.get("conv_snapshot_slots", 0) or 0)
     if conv_snapshots > 0:
         conv_bytes = float(conv_snapshots) * conv_width * history * conv_element
+    elif q == 1 and history == kernel:
+        conv_bytes = float(exact_element_bytes(_ceil_div(conv_raw, total_shards), conv_dtype))
     else:
         conv_bytes = float(history + q - 1) * conv_width * conv_element
     transient = float(contract.get("transient_bytes", 0) or 0)

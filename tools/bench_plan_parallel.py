@@ -285,9 +285,12 @@ def collective_group_size(metadata: Mapping[str, Any], parallel: Mapping[str, An
     tp, pcp = int(parallel.get("tp") or 1), int(parallel.get("pcp") or 1)
     dcp = int(parallel.get("dcp") or parallel.get("cp") or 1)
     ep, dp, pp = int(parallel.get("ep") or 1), int(parallel.get("dp") or 1), int(parallel.get("pp") or 1)
+    raw_etp = parallel.get("expert_tp")
+    etp = (int(raw_etp) if raw_etp is not None
+           else (tp if ep <= 1 else (tp // ep if ep <= tp and tp % ep == 0 else 1)))
     axis_sizes = {
         "tp": tp, "ep": ep, "pcp": pcp, "cp": dcp, "dcp": dcp, "dp": dp, "pp": pp,
-        "etp": 1 if ep > tp * pcp else max(1, tp // max(1, ep)),
+        "etp": etp,
     }
     return max(1, int(axis_sizes.get(axis, tp)))
 
@@ -327,16 +330,17 @@ def slot_plan_for(experts: int, ep: int, *, redundant: int = 0) -> Any:
     )
 
 
-def expert_bank_bytes(model: Any, parallel: Mapping[str, Any]) -> dict[str, Any] | None:
-    """Resident routed-expert bank aligned with ``expert_slot_plan`` padded slots."""
+def expert_bank_bytes(model: Any, parallel: Mapping[str, Any], *, slots: Any = None) -> dict[str, Any] | None:
+    """Resident routed-expert bank aligned with ``expert_slot_plan`` padded/redundant slots."""
     experts = int(model.num_experts)
     if experts <= 0:
         return None
     ep = int(parallel["ep"])
     redundant = int(parallel.get("redundant_experts_per_rank") or 0)
-    slots = slot_plan_for(experts, ep, redundant=redundant)
-    local_base = int(slots.base_slots_by_rank[0])
-    local_total = local_base + int(slots.redundant_slots_by_rank[0])
+    resolved = slots if slots is not None else slot_plan_for(experts, ep, redundant=redundant)
+    local_base = int(resolved.base_slots_by_rank[0])
+    local_extra = int(resolved.redundant_slots_by_rank[0])
+    local_total = len(resolved.expert_ids_by_rank[0])
     padded_slots = ep * local_base - experts
     intermediate = int(model.moe_intermediate_size) or max(
         (int(plan.moe_intermediate_size) for plan in model.layer_plans), default=0,
@@ -348,7 +352,8 @@ def expert_bank_bytes(model: Any, parallel: Mapping[str, Any]) -> dict[str, Any]
     elements = local_total * ROUTED_EXPERT_MATRIX_FACTOR * int(model.hidden_size) * intermediate
     return {
         "local_experts": local_total, "base_local_experts": local_base,
-        "redundant_local_experts": int(slots.redundant_slots_by_rank[0]),
+        "redundant_local_experts": local_extra,
+        "local_weight_expert_ids": list(resolved.expert_ids_by_rank[0]),
         "padded_expert_slots": padded_slots, "expert_count": experts, "ep": ep,
         "expert_weight_format": fmt, "bytes_per_element": width,
         "matrices_per_expert": ROUTED_EXPERT_MATRIX_FACTOR,
@@ -360,33 +365,29 @@ def expert_bank_bytes(model: Any, parallel: Mapping[str, Any]) -> dict[str, Any]
 
 
 def _normalized_layer(plan: Any, scope: str) -> dict[str, Any]:
-    fields = asdict(plan)
-    for key in ("index", "native_layer_id", "kv_owner_layer_id", "index_k_owner_layer_id",
-                "topk_owner_layer_id", "candidate_source_layer_id", "index_source_layer_id"):
-        fields.pop(key, None)
-    return {**fields, "scope": scope}
+    drop = {"index", "native_layer_id", "kv_owner_layer_id", "index_k_owner_layer_id",
+            "topk_owner_layer_id", "candidate_source_layer_id", "index_source_layer_id"}
+    return {**{k: v for k, v in asdict(plan).items() if k not in drop}, "scope": scope}
 
 
 def layer_signatures(model: Any) -> list[dict[str, Any]]:
     """Group every declared body/draft layer by its normalized structure."""
     plans = [(plan, "body") for plan in model.layer_plans]
-    auxiliary = getattr(model, "auxiliary", None)
-    if auxiliary is not None and not auxiliary.standalone_draft:
+    aux = getattr(model, "auxiliary", None)
+    if aux is not None and not aux.standalone_draft:
         for name in ("mtp", "dspark"):
-            draft = getattr(auxiliary, name, None)
-            if draft is not None:
+            if (draft := getattr(aux, name, None)) is not None:
                 plans.extend((plan, name) for plan in draft.layer_plans)
     groups: dict[str, dict[str, Any]] = {}
     for plan, scope in plans:
         payload = _normalized_layer(plan, scope)
-        record = groups.setdefault(canonical_json(payload), {
-            "signature_id": short_digest(payload, "layer-"), "scope": scope,
-            "layer_ids": [], "fields": payload,
+        rec = groups.setdefault(canonical_json(payload), {
+            "signature_id": short_digest(payload, "layer-"), "scope": scope, "layer_ids": [], "fields": payload,
         })
-        record["layer_ids"].append(int(plan.index))
-    for record in groups.values():
-        record["layer_ids"].sort()
-        record["occurrences"] = len(record["layer_ids"])
+        rec["layer_ids"].append(int(plan.index))
+    for rec in groups.values():
+        rec["layer_ids"].sort()
+        rec["occurrences"] = len(rec["layer_ids"])
     return sorted(groups.values(), key=lambda item: (item["scope"], item["layer_ids"]))
 
 
@@ -478,29 +479,44 @@ def topk_ids_for_counts(expert_rows: Sequence[int], tokens: int, top_k: int) -> 
     return result
 
 
-def explicit_ledger(expert_rows: Sequence[int], topk_ids: Sequence[Sequence[int]], ep: int) -> dict[str, Any]:
+def explicit_ledger(
+    expert_rows: Sequence[int], topk_ids: Sequence[Sequence[int]], ep: int,
+    *, redundant: int = 0, slots: Any = None,
+) -> dict[str, Any]:
     """Build exact per-rank integer routing ledger aligned with ``expert_slot_plan``."""
     experts = len(expert_rows)
     if ep <= 0 or experts <= 0:
         raise PlanError(f"explicit_ledger_invalid_geometry:{experts}:{ep}")
-    slots = slot_plan_for(experts, ep)
-    base = int(slots.base_slots_by_rank[0])
-    rank_rows = [[0] * base for _ in range(ep)]
+    if any(type(v) is not int or v < 0 for v in expert_rows):
+        raise PlanError("explicit_ledger_expert_rows_require_nonnegative_integers")
+    declared = [int(v) for v in expert_rows]
+    observed = [0] * experts
+    for ids in topk_ids:
+        for raw_id in ids:
+            if type(raw_id) is not int or not (0 <= raw_id < experts):
+                raise PlanError(f"explicit_ledger_topk_expert_out_of_range:{raw_id}:experts={experts}")
+            observed[raw_id] += 1
+    if observed != declared:
+        raise PlanError(f"explicit_ledger_topk_histogram_mismatch:declared={declared},observed={observed}")
+    resolved = slots if slots is not None else slot_plan_for(experts, ep, redundant=redundant)
+    if int(resolved.logical_experts) != experts or int(resolved.ranks) != ep:
+        raise PlanError(f"explicit_ledger_slot_plan_mismatch:{resolved.logical_experts}:{resolved.ranks}")
+    base = int(resolved.base_slots_by_rank[0])
+    rank_rows = [[0] * len(resolved.expert_ids_by_rank[r]) for r in range(ep)]
     primary_slot = {
-        expert: (expert // base, slots.expert_ids_by_rank[expert // base].index(expert))
+        expert: (expert // base, resolved.expert_ids_by_rank[expert // base].index(expert))
         for expert in range(experts)
     }
     for ids in topk_ids:
         for expert in ids:
             owner_rank, slot_index = primary_slot[int(expert)]
             rank_rows[owner_rank][slot_index] += 1
-    if sum(sum(row) for row in rank_rows) != sum(expert_rows):
-        raise PlanError("explicit_ledger_lost_assignments")
     local_rows = list(rank_rows[0])
     return {
-        "basis": "explicit_token_routing_integer", "expert_rows": list(expert_rows),
+        "basis": "explicit_token_routing_integer", "expert_rows": declared,
         "rank_expert_rows": rank_rows, "rank_assignment_rows": [sum(row) for row in rank_rows],
-        "local_expert_rows": local_rows, "local_weight_expert_ids": list(slots.expert_ids_by_rank[0]),
+        "local_expert_rows": local_rows, "local_weight_expert_ids": list(resolved.expert_ids_by_rank[0]),
+        "redundant_local_experts": int(resolved.redundant_slots_by_rank[0]),
         "padded_expert_slots": ep * base - experts,
         "topk_ids": [list(row) for row in topk_ids], "group_list": local_rows,
         "group_list_cumulative": list(accumulate(local_rows)), "group_list_type": 1, "m": sum(local_rows),
@@ -650,12 +666,11 @@ def reverse_index_cases(cases: Mapping[str, Mapping[str, Any]]) -> dict[str, lis
 
 def compact_signature(record: Mapping[str, Any]) -> dict[str, Any]:
     fields = record.get("fields") or {}
-    compact = {"signature_id": record["signature_id"], "scope": record["scope"],
-               "layer_ids": list(record["layer_ids"]), "occurrences": record["occurrences"]}
-    for key in ("attention", "window", "compress_ratio", "engram", "num_experts"):
-        if key in fields:
-            compact[key] = fields[key]
-    return compact
+    return {
+        "signature_id": record["signature_id"], "scope": record["scope"],
+        "layer_ids": list(record["layer_ids"]), "occurrences": record["occurrences"],
+        **{k: fields[k] for k in ("attention", "window", "compress_ratio", "engram", "num_experts") if k in fields},
+    }
 
 
 def compact_model(record: Mapping[str, Any]) -> dict[str, Any]:
@@ -667,14 +682,12 @@ def compact_model(record: Mapping[str, Any]) -> dict[str, Any]:
 def layer_coverage(model: Any, signatures: Sequence[Mapping[str, Any]], draft_layers: set[int], *, has_decode_arm: bool = True) -> dict[str, Any]:
     body_layers = {layer for record in signatures if record["scope"] == "body" for layer in record["layer_ids"]}
     body_complete = sorted(body_layers) == list(range(int(model.layers)))
-    drafts: dict[str, Any] = {}
-    auxiliary = getattr(model, "auxiliary", None)
-    active = ("mtp" if auxiliary is not None and getattr(auxiliary, "mtp", None) is not None
-              else ("dspark" if auxiliary is not None and getattr(auxiliary, "dspark", None) is not None else None))
-    if auxiliary is not None and not auxiliary.standalone_draft:
+    drafts, aux = {}, getattr(model, "auxiliary", None)
+    active = ("mtp" if aux is not None and getattr(aux, "mtp", None) is not None
+              else ("dspark" if aux is not None and getattr(aux, "dspark", None) is not None else None))
+    if aux is not None and not aux.standalone_draft:
         for name in ("mtp", "dspark"):
-            draft = getattr(auxiliary, name, None)
-            if draft is None:
+            if (draft := getattr(aux, name, None)) is None:
                 continue
             declared = int(draft.layers)
             covered = len(draft_layers) if (name == active and has_decode_arm) else 0
@@ -725,11 +738,12 @@ def add_routing_arms(structural: Mapping[str, Any]) -> None:
     for representative in representatives.values():
         base = representative["payload"]
         record = structural["models"][base["model_id"]]
-        ep = int((base.get("parallel") or record["parallel"])["ep"])
+        par = base.get("parallel") or record["parallel"]
+        ep, redundant = int(par["ep"]), int(par.get("redundant_experts_per_rank") or 0)
         experts = int(record["expert_bank"]["expert_count"])
         top_k = int(base["routing"].get("top_k") or record["top_k"])
-        slots = slot_plan_for(experts, ep)
-        local_experts, m_local = int(slots.base_slots_by_rank[0]), int(base.get("matrix_rows") or 0)
+        slots = slot_plan_for(experts, ep, redundant=redundant)
+        local_experts, m_local = len(slots.expert_ids_by_rank[0]), int(base.get("matrix_rows") or 0)
         for distribution in ROUTING_DISTRIBUTIONS:
             for fraction in ZERO_EXPERT_FRACTIONS:
                 positive = positive_experts(experts, fraction)
@@ -741,7 +755,7 @@ def add_routing_arms(structural: Mapping[str, Any]) -> None:
                         "zero_expert_fraction": fraction, "reason": "fewer_assignments_than_positive_experts",
                     })
                     continue
-                ledger = explicit_ledger(rows, topk_ids_for_counts(rows, tokens, top_k), ep)
+                ledger = explicit_ledger(rows, topk_ids_for_counts(rows, tokens, top_k), ep, slots=slots)
                 ledger.update({"distribution": distribution, "zero_expert_fraction": fraction,
                                "tokens": tokens, "top_k": top_k, "num_experts": experts, "ep": ep})
                 register_routing_case(structural["cases"], representative, ledger, m=ledger["m"],

@@ -224,6 +224,29 @@ def rank_zero_graph_reuse(parallel: Any, replicas: int, has_device_group: bool) 
             and not parallel.ep_spans_dp and not local_tp_spans_dp(parallel))
 
 
+def expert_tp_groups(
+    topology: Any, *, replica: int = ZERO, stage: int = ZERO,
+) -> tuple[tuple[int, ...], ...]:
+    """Construct expert-TP rank groups from the resolved ``parallel.etp`` width."""
+    parallel = topology.parallel
+    sources = tuple(int(rank) for rank in topology.ranks(replica, stage))
+    if not sources:
+        raise ModelingError(f"expert_tp_stage_has_no_ranks:{stage}")
+    tp = max(ONE, int(parallel.tp))
+    etp = max(ONE, int(parallel.etp))
+    if tp % etp != ZERO:
+        raise ModelingError(f"expert_tp_not_divisor_of_tp:{etp}!|{tp}")
+    if etp <= ONE:
+        return tuple((rank,) for rank in sources)
+    stride = tp // etp
+    return tuple(
+        group
+        for base in range(ZERO, len(sources), tp)
+        for offset in range(stride)
+        if (group := sources[base + offset : base + tp : stride])
+    )
+
+
 def collective_requires_cohort(op: Any, topology: Any) -> bool:
     """True when the op's actual group spans more than one DP replica."""
     metadata = dict(getattr(op, "metadata", ()) or ())
@@ -238,9 +261,18 @@ def collective_requires_cohort(op: Any, topology: Any) -> bool:
     if axis not in {"cp", "etp", "pcp", "ep", "tp", "dp", LOCAL_TP_AXIS}:
         return False
     declared = metadata.get("group_ranks")
-    groups: Sequence[Sequence[int]] = (tuple(declared),) if declared else tuple(
-        topology.groups(axis, int(metadata.get("replica", ZERO)), stage,
-                        metadata=metadata))
+    rep = int(metadata.get("replica", ZERO))
+    if declared:
+        groups: Sequence[Sequence[int]] = (tuple(declared),)
+    elif axis == "etp":
+        groups = expert_tp_groups(topology, replica=rep, stage=stage)
+    elif axis == "dp":
+        dp_count = max(ONE, int(parallel.dp))
+        rows = [tuple(int(rk) for rk in topology.ranks(r, stage)) for r in range(dp_count)]
+        width = min((len(row) for row in rows), default=ZERO)
+        groups = tuple(tuple(rows[r][off] for r in range(dp_count)) for off in range(width))
+    else:
+        groups = tuple(topology.groups(axis, rep, stage, metadata=metadata))
     for group in groups:
         owners = {owner.get(int(rank)) for rank in group if int(rank) in owner}
         owners.discard(None)

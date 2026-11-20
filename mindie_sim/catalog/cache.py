@@ -52,6 +52,12 @@ from mindie_sim.catalog.cache_index import (
 )
 from mindie_sim.catalog.cache_pools import (
     LINEAR_ATTENTION_KINDS as _LINEAR_ATTENTION_KINDS,
+    _ceil_div,
+    _draft_is_dcp_sharded,
+    _draft_row_bytes_int,
+    _packed_mla_row_bytes,
+    _packed_mla_row_parts,
+    exact_element_bytes,
     gbsa_cache_layout,
     request_pool_page_pitches,
     separate_pool_page_pitches,
@@ -118,20 +124,23 @@ def cache_row_split(model: Any, region: str, width: int) -> tuple[float, float]:
     quantized = int(width) - int(fmt.suffix_elements)
     if quantized < 0:
         raise ModelingError("cache_suffix_exceeds_row_width")
-    total = float(fmt.row_bytes(int(width)))
-    scale = (math.ceil(quantized / fmt.group_size) * dtype_bytes(fmt.scale_dtype)
-             if fmt.group_size else 0.0)
+    total = int(fmt.row_bytes(int(width)))
+    scale = (
+        exact_element_bytes(_ceil_div(quantized, fmt.group_size), fmt.scale_dtype)
+        if fmt.group_size else 0
+    )
     payload = total - scale
-    if payload < 0.0:
+    if payload < 0:
         raise ModelingError("cache_row_split_negative_payload")
-    return payload, float(scale)
+    return float(payload), float(scale)
 
 
 def packed_region_row_bytes(model: Any, region: str, width: int) -> int:
     """Physical row width for ``region``, honoring arch35 MQSMLA Mode-1/2."""
-    packed = _mqsmla_mode_row_split(model, region, width)
-    if packed is not None:
-        return int(round(packed[0] + packed[1]))
+    parts = packed_row_parts(model, region, width)
+    if parts is not None:
+        data, scales, padding = parts
+        return int(data) + int(scales) + int(padding)
     return int(cache_format(model, region).row_bytes(int(width)))
 
 
@@ -143,7 +152,11 @@ def cache_component_split(
     if total <= 0.0:
         return 0.0, 0.0
     if component in {"mla_kv", "window", "compressed_kv"}:
-        payload, scale = cache_row_split(model, component, plan.cache_row_elements)
+        packed_parts = _packed_mla_row_parts(model, plan) if component == "mla_kv" else None
+        if packed_parts is not None:
+            payload, scale = float(packed_parts[0]), float(packed_parts[1])
+        else:
+            payload, scale = cache_row_split(model, component, plan.cache_row_elements)
     elif component == "gqa_kv":
         width = 2 * local_kv_heads(plan.num_kv_heads, parallel.tp) * plan.head_dim
         payload, scale = cache_row_split(model, "gqa_kv", width)
@@ -330,8 +343,14 @@ def layer_cache_components(model: Any, plan: Any, parallel: ParallelSpec,
                 sequence_tokens=seq, query_tokens=query_tokens, phase=phase,
                 capacity_padded=capacity_padded)
         else:
-            result["recurrent_state"] = plan.recurrent_state_elements / tp * dtype_bytes(plan.recurrent_state_dtype)
-            result["conv_state"] = plan.conv_state_elements / tp * dtype_bytes(plan.conv_state_dtype)
+            result["recurrent_state"] = float(exact_element_bytes(
+                _ceil_div(int(plan.recurrent_state_elements), tp),
+                str(plan.recurrent_state_dtype),
+            ))
+            result["conv_state"] = float(exact_element_bytes(
+                _ceil_div(int(plan.conv_state_elements), tp),
+                str(plan.conv_state_dtype),
+            ))
         if plan.engram and seq > 0:
             from mindie_sim.catalog.qwen4_exp import is_qwen4_exp_ple, ple_conv_state_bytes
             if is_qwen4_exp_ple(getattr(model, "engram", None)):
@@ -355,8 +374,7 @@ def layer_cache_components(model: Any, plan: Any, parallel: ParallelSpec,
     elif plan.cache_kind == "dense":
         rows = min(seq, plan.window) if plan.window else seq
         start = max(0, seq - rows) if plan.window else 0
-        result["mla_kv"] = local_rows(rows, start=start) * cache_format(
-            model, "mla_kv").row_bytes(plan.cache_row_elements)
+        result["mla_kv"] = local_rows(rows, start=start) * _packed_mla_row_bytes(model, plan)
     else:
         if plan.window:
             rows = min(seq, plan.window)
@@ -479,14 +497,22 @@ def stage_cache_components(
                     "draft_state", 0.0) + float(draft_values["draft_state"])
         else:
             from mindie_sim.catalog.draft import optional_draft_spec
-            from mindie_sim.catalog.paired_sfa import draft_row
             draft = optional_draft_spec(model, draft_kind)
-            row_bytes = draft_row(model, draft, tp=parallel.tp)
+            row_bytes = _draft_row_bytes_int(model, draft, tp=parallel.tp)
             seq = max(0, int(sequence_tokens))
-            seq = (_context_shard_blocks(seq, interleave, parallel.cp) if capacity_padded
-                   else seq / parallel.cp)
+            block = max(1, int(interleave))
+            draft_sharded = _draft_is_dcp_sharded(
+                model, parallel, draft_kind,
+                dcp=int(getattr(parallel, "cp", 1) or 1),
+                draft_page=block * row_bytes,
+            )
+            draft_cp = int(parallel.cp) if draft_sharded else 1
+            seq_rows = (
+                _context_shard_blocks(seq, block, draft_cp) if capacity_padded
+                else seq / draft_cp
+            )
             stages[-1]["draft_kv"] = stages[-1].get("draft_kv", 0.0) + float(
-                seq * row_bytes * draft.layers
+                seq_rows * row_bytes * draft.layers
             )
     return stages
 
@@ -496,8 +522,12 @@ def request_cache_breakdown(
     *, draft_kind: str | None = None, interleave: int = INDEX_INTERLEAVE_TOKENS,
     runtime: Any = None, query_tokens: int | None = None, phase: str = "decode",
 ) -> dict[str, Any]:
+    block_size = int(
+        interleave if interleave != INDEX_INTERLEAVE_TOKENS
+        else (getattr(runtime, "kv_block_size", 0) or interleave or 1)
+    )
     stages = stage_cache_components(
-        model, parallel, sequence_tokens, draft_kind=draft_kind, interleave=interleave,
+        model, parallel, sequence_tokens, draft_kind=draft_kind, interleave=block_size,
         runtime=runtime, query_tokens=query_tokens, phase=phase,
     )
     totals: dict[str, float] = {}
@@ -517,7 +547,6 @@ def request_cache_breakdown(
     }
     if qwen4_pool is not None:
         out["qwen4_exp_pool"] = qwen4_pool
-    block_size = int(getattr(runtime, "kv_block_size", 0) or interleave or 1)
     pool_page_pitches = request_pool_page_pitches(
         model, parallel, block_size=block_size, draft_kind=draft_kind,
         dcp=int(getattr(parallel, "cp", 1) or 1), runtime=runtime,
@@ -529,18 +558,23 @@ def request_cache_breakdown(
 
 def state_bytes_per_request_per_rank(model: Any, parallel: ParallelSpec,
                                      runtime: Any = None) -> float:
-    total = 0.0
+    total = 0
     pcp = max(1, int(getattr(parallel, "pcp", 1) or 1))
     axis = str(dict(getattr(runtime, "metadata", ()) or ()).get(
         "kda_parallel_axis", ""))
     for plan in model.layer_plans:
         if plan.attention not in _LINEAR_ATTENTION_KINDS:
             continue
-        shards = pcp if (axis == "tp_x_pcp" and plan.attention == "kda") else 1
-        recurrent, conv = _local_state_sharded(plan, parallel.tp * shards)
-        total += (
-            recurrent * dtype_bytes(plan.recurrent_state_dtype)
-            + conv * dtype_bytes(plan.conv_state_dtype)
+        shards = max(1, int(parallel.tp)) * (
+            pcp if (axis == "tp_x_pcp" and plan.attention == "kda") else 1
+        )
+        total += exact_element_bytes(
+            _ceil_div(int(plan.recurrent_state_elements), shards),
+            str(plan.recurrent_state_dtype),
+        )
+        total += exact_element_bytes(
+            _ceil_div(int(plan.conv_state_elements), shards),
+            str(plan.conv_state_dtype),
         )
     return float(total)
 

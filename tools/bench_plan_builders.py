@@ -107,6 +107,49 @@ _ELEMENTWISE_MUL_GATE_RECIPES = frozenset({
     "index_key_basis_scale", "index_query_basis_scale",
     "route_normalize", "router_group_mask",
 })
+_DIRECT_FAMILY_BUILDERS: dict[str, tuple[str, str]] = {
+    "allgather": ("all_gather", "hcclAllGather"), "engram_broadcast": ("all_gather", "hcclAllGather"),
+    "dcp_allgather": ("all_gather", "hcclAllGather"), "engram_ids": ("all_to_all_v", "hcclAlltoAllV"),
+    "reduce_scatter": ("reduce_scatter", "hcclReduceScatter"),
+    "pp_p2p": ("p2p_send_recv", "hcclSendRecv"), "cache_transfer": ("p2p_send_recv", "hcclSendRecv"),
+    "state_publish": ("p2p_send_recv", "hcclSendRecv"), "state_transfer": ("p2p_send_recv", "hcclSendRecv"),
+    "add_rmsnorm_quant": ("add_rms_norm_quant", "aclnnAddRmsNormDynamicQuantV2"),
+    "rmsnorm_quant": ("rms_norm_quant", "aclnnRmsNormDynamicQuant"),
+    "add_rmsnorm": ("add_rms_norm", "aclnnAddRmsNorm"), "layernorm": ("layer_norm", "aclnnLayerNorm"),
+    "geglu": ("geglu", "aclnnGeGluV2"), "gelu": ("gelu", "aclnnGelu"),
+    "situ": ("situ_activation", "aclnnSitu"), "sigmoid": ("sigmoid", "aclnnSigmoid"),
+    "softmax": ("softmax", "aclnnSoftmaxV2"), "attention_softmax": ("softmax", "aclnnSoftmaxV2"),
+    "dequant_swiglu_quant": ("dequant_swiglu_quant", "aclnnDequantSwigluQuant"),
+    "attention_merge": ("dcp_lse_attention_merge", "aclnnRingAttentionUpdate"),
+    "indexer_quant_cache": ("indexer_quant_cache", "aclnnIndexerQuantCache"),
+    "key_pool": ("key_pool", "aclnnKeyPool"), "kv_compress_epilog": ("kv_compress_epilog", "aclnnKvCompressEpilog"),
+    "histogram": ("histogram_v2", "aclnnHistogramV2"), "moe_init_routing": ("moe_init_routing", "aclnnMoeInitRoutingV3"),
+    "causal_conv1d_fn": ("causal_conv1d_fn", "aclnnCausalConv1d"),
+    "short_convolution": ("causal_conv1d_update", "aclnnCausalConv1dUpdate"),
+    "conv1d": ("causal_conv1d_update", "aclnnCausalConv1dUpdate"),
+    "gdn_gating": ("fused_gdn_gating", "fused_gdn_gating_kernel"),
+    "gdn_prepare": ("chunk_gdn_fwd_prepare", "aclnnChunkGatedDeltaRuleFwdPrepare"),
+    "gdn_state": ("chunk_gdn_fwd_h", "aclnnChunkFwdH"), "gdn_output": ("chunk_gdn_fwd_o", "aclnnChunkFwdO"),
+    "triangular_solve": ("kda_triangular_solve", "solve_tril_16x16_kernel"),
+    "state_gather": ("ssm_state_gather", "_gather_ssm_states_kernel"),
+    "state_scatter": ("ssm_state_scatter", "_scatter_ssm_states_kernel"),
+    "attn_res_prefix": ("attn_res_prefix", "aclnnAttnResFwd"),
+    "engram_gather": ("ple_lookup", "aclnnEmbedding"), "engram_query": ("engram_ngram_hash", "engram_ngram_ids_kernel"),
+    "engram_rh2d": ("engram_uva_h2d", "aclrtMemcpyAsync"), "engram_apply": ("gated_mul_add", "aclnnMul"),
+    "embedding": ("vocab_embedding", "aclnnEmbedding"),
+    "sampling": ("categorical_sampler", "_categorical_sample_kernel"),
+    "confidence": ("categorical_sampler", "_categorical_sample_kernel"),
+    "token_commit": ("categorical_sampler", "_categorical_sample_kernel"),
+    "moe_ffn": ("megamoe_fused_mc2", "aclnnMegaMoe"),
+    "index_add": ("index_add", "aclnnIndexAdd"), "scatter_add": ("index_add", "aclnnIndexAdd"),
+    "gather": ("strided_gather", "aclnnIndexSelect"), "strided_gather": ("strided_gather", "aclnnIndexSelect"),
+    "tensor_select": ("strided_gather", "aclnnIndexSelect"),
+    "pad": ("tensor_pad", "aclnnPadV3"), "cast": ("dtype_cast", "aclnnCast"),
+    "tensor_copy": ("tensor_copy", "aclnnInplaceCopy"), "tensor_materialization": ("tensor_copy", "aclnnInplaceCopy"),
+    "tensor_view": ("tensor_copy", "aclnnInplaceCopy"),
+    "tensor_fill": ("tensor_fill", "aclnnInplaceZero"), "zero_fill": ("tensor_fill", "aclnnInplaceZero"),
+    "fill": ("tensor_fill", "aclnnInplaceZero"),
+}
 
 
 def resolve_builder_strict(
@@ -171,52 +214,18 @@ def resolve_builder_strict(
         if rec in {"alltoall", "all_to_all_v", "expert_quantized_dispatch",
                    "expert_scale_dispatch"} or fam == "alltoallv":
             return ("all_to_all_v", "hcclAlltoAllV")
-    if fam in {"allgather", "engram_broadcast", "dcp_allgather"}:
-        return ("all_gather", "hcclAllGather")
-    if fam == "engram_ids":
-        return ("all_to_all_v", "hcclAlltoAllV")
     if fam in {"allreduce", "tp_allreduce"}:
         if (meta_dict.get("quantized_all_reduce")
                 or meta_dict.get("quantized_all_reduce_applied")
                 or rec == "quantized_all_reduce"):
             return ("quantized_all_reduce", "hcclAllReduceInt8")
         return ("all_reduce", "hcclAllReduce")
-    if fam == "reduce_scatter":
-        return ("reduce_scatter", "hcclReduceScatter")
-    if fam in {"pp_p2p", "cache_transfer", "state_publish", "state_transfer"}:
-        return ("p2p_send_recv", "hcclSendRecv")
-
-    if fam == "add_rmsnorm_quant":
-        return ("add_rms_norm_quant", "aclnnAddRmsNormDynamicQuantV2")
-    if fam == "rmsnorm_quant":
-        return ("rms_norm_quant", "aclnnRmsNormDynamicQuant")
-    if fam == "add_rmsnorm":
-        return ("add_rms_norm", "aclnnAddRmsNorm")
     if fam == "rmsnorm":
-        if "gemma" in rec:
-            return ("gemma_rms_norm", "aclnnGemmaRmsNorm")
-        return ("rms_norm", "aclnnRmsNorm")
-    if fam == "layernorm":
-        return ("layer_norm", "aclnnLayerNorm")
-
+        return ("gemma_rms_norm", "aclnnGemmaRmsNorm") if "gemma" in rec else ("rms_norm", "aclnnRmsNorm")
     if fam == "swiglu":
-        if "oai" in rec:
-            return ("swiglu_oai", "aclnnSwiGluOai")
-        return ("swiglu", "aclnnSwiGlu")
-    if fam == "geglu":
-        return ("geglu", "aclnnGeGluV2")
-    if fam == "gelu":
-        return ("gelu", "aclnnGelu")
-    if fam == "situ":
-        return ("situ_activation", "aclnnSitu")
+        return ("swiglu_oai", "aclnnSwiGluOai") if "oai" in rec else ("swiglu", "aclnnSwiGlu")
     if fam == "activation" and rec == "hc_silu":
         return ("silu_mul", "aclnnSilu")
-    if fam == "sigmoid":
-        return ("sigmoid", "aclnnSigmoid")
-    if fam in {"softmax", "attention_softmax"}:
-        return ("softmax", "aclnnSoftmaxV2")
-    if fam == "dequant_swiglu_quant":
-        return ("dequant_swiglu_quant", "aclnnDequantSwigluQuant")
     if fam == "quantize":
         if rec == "swiglu_quantize":
             return ("swiglu_dynamic_quant", "aclnnSwigluQuant")
@@ -224,39 +233,25 @@ def resolve_builder_strict(
             return ("dequant_situ_quant", "aclnnDequantSituQuant")
         if rec in {"dynamic_quantize", "index_query_quantize", "quantize"}:
             return ("dynamic_quant", "aclnnDynamicQuantV2")
-
-    if fam == "grouped_gemm" or (
-            fam == "gemm" and rec in {"grouped_output_a", "grouped_output_b"}):
+    if fam == "grouped_gemm" or (fam == "gemm" and rec in {"grouped_output_a", "grouped_output_b"}):
         if meta_dict.get("onchip_handoff_to"):
-            return ("grouped_matmul_swiglu_quant",
-                    "aclnnGroupedMatmulSwigluQuantWeightNZ")
+            return ("grouped_matmul_swiglu_quant", "aclnnGroupedMatmulSwigluQuantWeightNZ")
         return ("grouped_matmul", "aclnnGroupedMatmulV5")
-
     if fam == "mla" and rec == "draft_context_mla_prolog_v3":
         return ("mla_prolog_v3", "aclnnMlaPrologV3WeightNz")
     if fam == "mla_prolog" or rec in {"mla_prolog_v2", "mla_prolog", "mla_preprocess"}:
         return ("mla_prolog_v2", "aclnnMlaPrologV2WeightNz")
     if fam == "compressed_attention" and rec == "aclnn_compressor":
         return ("mla_kv_compressor", "aclnnCompressor")
-    if fam == "attention_merge":
-        return ("dcp_lse_attention_merge", "aclnnRingAttentionUpdate")
     if fam == "attention":
-        if (rec == "aclnn_mixed_quant_sparse_flash_mla"
-                or imp == "aclnnMixedQuantSparseFlashMla"):
+        if rec == "aclnn_mixed_quant_sparse_flash_mla" or imp == "aclnnMixedQuantSparseFlashMla":
             return ("mixed_quant_sparse_mla", "aclnnMixedQuantSparseFlashMla")
-        if (rec in {"sparse_flash_attention", "dsa_sparse_attention"}
-                or imp == "SparseFlashAttention"):
+        if rec in {"sparse_flash_attention", "dsa_sparse_attention"} or imp == "SparseFlashAttention":
             return ("sparse_flash_attention", "aclnnSparseFlashAttention")
-        if rec in {
-            "ascend_paged_mla_decode_arch22",
-            "ascend_paged_mla_decode_arch35",
-            "latent_attention0",
-            "latent_attention_batch",
-            "paired_mla_attention_analytic",
-        }:
+        if rec in {"ascend_paged_mla_decode_arch22", "ascend_paged_mla_decode_arch35",
+                   "latent_attention0", "latent_attention_batch", "paired_mla_attention_analytic"}:
             return ("absorbed_mla", "aclnnFusedInferAttentionScoreV4")
-        if (str(meta_dict.get("cache_layout") or "") == "int8_fa3"
-                or rec in {"gbsa_attention", "generic_block_sparse_attention"}):
+        if str(meta_dict.get("cache_layout") or "") == "int8_fa3" or rec in {"gbsa_attention", "generic_block_sparse_attention"}:
             return ("block_sparse_attention_c8", "aclnnGenericBlockSparseAttention")
         if rec == "flash_attention_decode":
             return ("incre_flash_attention", "aclnnFusedInferAttentionScoreV3")
@@ -264,7 +259,6 @@ def resolve_builder_strict(
             return ("fusion_attention", "aclnnFlashAttentionVarLenScoreV2")
         if rec == "fused_infer_attention":
             return ("fused_infer_attention", "aclnnFusedInferAttentionScoreV3")
-
     if fam == "lightning_indexer" and rec == "bf16_lightning_indexer_v2":
         return ("lightning_indexer", "aclnnLightningIndexerV2")
     if fam == "indexer":
@@ -272,19 +266,11 @@ def resolve_builder_strict(
             return ("pool_key_indexer", "aclnnPoolKeyIndexer")
         if rec in {"quant_lightning_indexer", "index_scores", "index_online_topk"}:
             return ("lightning_indexer", "aclnnQuantLightningIndexerV2")
-    if fam == "indexer_quant_cache":
-        return ("indexer_quant_cache", "aclnnIndexerQuantCache")
     if fam == "kv_cache_write":
         if rec == "scatter_pa_kv_cache":
             return ("scatter_pa_kv_cache", "aclnnScatterPaKvCache")
         if rec == "qsa_index_cache_write":
             return ("scatter_index_cache", "aclnnScatterNdUpdate")
-    if fam == "key_pool":
-        return ("key_pool", "aclnnKeyPool")
-    if fam == "kv_compress_epilog":
-        return ("kv_compress_epilog", "aclnnKvCompressEpilog")
-    if fam == "histogram":
-        return ("histogram_v2", "aclnnHistogramV2")
     if fam == "cache_store":
         if rec in {"kv_store", "draft_context_kv_scatter"}:
             return ("scatter_pa_kv_cache", "aclnnScatterPaKvCache")
@@ -292,14 +278,11 @@ def resolve_builder_strict(
             return ("scatter_index_cache", "aclnnScatterNdUpdate")
     if fam == "topk":
         if rec == "moe_gating_topk":
-            if "Hash" in imp:
-                return ("moe_gating_topk_hash", "aclnnMoeGatingTopKHash")
-            return ("moe_gating_topk", "aclnnMoeGatingTopKSoftmaxV2")
+            return (("moe_gating_topk_hash", "aclnnMoeGatingTopKHash") if "Hash" in imp
+                    else ("moe_gating_topk", "aclnnMoeGatingTopKSoftmaxV2"))
         if rec in {"index_topk", "index_online_topk", "router_expert_topk",
-                   "router_group_score_top2", "router_group_topk",
-                   "candidate_merge"}:
+                   "router_group_score_top2", "router_group_topk", "candidate_merge"}:
             return ("indexer_topk", "aclnnTopkV2")
-
     if fam == "routing":
         if rec == "moe_init_routing_v3":
             return ("moe_init_routing", "aclnnMoeInitRoutingV3")
@@ -308,48 +291,28 @@ def resolve_builder_strict(
         if rec == "router_weight_gather":
             return ("strided_gather", "aclnnGatherElements")
         if rec == "route_unpack":
-            if int(meta_dict.get("mc2_mode") or 0) == 3:
-                return ("megamoe_fused_mc2", "aclnnMegaMoe")
-            return ("moe_token_unpermute", "aclnnMoeTokenUnpermute")
-    if fam == "moe_init_routing":
-        return ("moe_init_routing", "aclnnMoeInitRoutingV3")
-
+            return (("megamoe_fused_mc2", "aclnnMegaMoe") if int(meta_dict.get("mc2_mode") or 0) == 3
+                    else ("moe_token_unpermute", "aclnnMoeTokenUnpermute"))
     if fam == "rotary" or (fam == "elementwise" and rec == "rotary"):
-        if rec in {"split_qkv_rmsnorm_mrope_fused",
-                   "split_qkv_rmsnorm_rope_fused",
-                   "split_qkv_rmsnorm_rope_vnorm_fused"}:
+        if rec in {"split_qkv_rmsnorm_mrope_fused", "split_qkv_rmsnorm_rope_fused", "split_qkv_rmsnorm_rope_vnorm_fused"}:
             return ("split_qkv_rmsnorm_rope", "split_qkv_rmsnorm_mrope_kernel")
         return ("rotary_embedding", "aclnnApplyRotaryPosEmbV2")
-
-    if fam == "causal_conv1d_fn":
-        return ("causal_conv1d_fn", "aclnnCausalConv1d")
-    if fam in {"short_convolution", "conv1d"} or (
-            fam == "elementwise" and rec == "short_convolution"):
+    if fam == "elementwise" and rec == "short_convolution":
         return ("causal_conv1d_update", "aclnnCausalConv1dUpdate")
-    if fam == "gdn_gating" or (fam == "elementwise" and rec == "delta_gates"):
+    if fam == "elementwise" and rec == "delta_gates":
         return ("fused_gdn_gating", "fused_gdn_gating_kernel")
     if fam == "gdn_prefill" and rec == "gdn_phase6_arch22":
         return ("chunk_gated_delta_rule", "aclnnChunkGatedDeltaRuleFwd")
-    if fam == "gdn_prepare":
-        return ("chunk_gdn_fwd_prepare", "aclnnChunkGatedDeltaRuleFwdPrepare")
-    if fam == "gdn_state":
-        return ("chunk_gdn_fwd_h", "aclnnChunkFwdH")
-    if fam == "gdn_output":
-        return ("chunk_gdn_fwd_o", "aclnnChunkFwdO")
     if fam == "recurrent_vector":
         if "recover_ssm" in rec or bool(meta_dict.get("recover_ssm")):
             return ("recurrent_gdn_recover_ssm", "aclnnRecurrentGatedDeltaRule")
         return ("recurrent_gated_delta_rule", "aclnnRecurrentGatedDeltaRule")
     if fam in {"recurrent_scan", "kda_recurrent"}:
-        if (rec in {"vllm_ascend_recurrent_kda_arch22",
-                    "vllm_ascend_recurrent_kda_arch35"}
-                or imp == "RecurrentKda"):
+        if rec in {"vllm_ascend_recurrent_kda_arch22", "vllm_ascend_recurrent_kda_arch35"} or imp == "RecurrentKda":
             return ("fused_recurrent_kda", "aclnnRecurrentKda")
         if "gdn_state_contract" in meta_dict or "pcp_segment" in meta_dict:
             return ("chunk_gated_delta_rule", "aclnnChunkGatedDeltaRuleFwd")
-        if (rec.startswith("recurrent_scan")
-                or rec in {"chunk_kda_fwd", "chunk_kda_fwd_arch22"}
-                or fam == "kda_recurrent"):
+        if rec.startswith("recurrent_scan") or rec in {"chunk_kda_fwd", "chunk_kda_fwd_arch22"} or fam == "kda_recurrent":
             return ("chunk_kda_fwd", "aclnnChunkKdaFwd")
     if fam == "recurrent_local":
         if rec.startswith("chunk_products"):
@@ -358,14 +321,10 @@ def resolve_builder_strict(
             return ("kda_wy_transform", "recompute_w_u_fwd_kernel")
     if fam == "recurrent_output" and rec.startswith("recurrent_output"):
         return ("kda_chunk_output", "aclnnChunkKdaFwdFinalize")
-    if fam == "triangular_solve":
-        return ("kda_triangular_solve", "solve_tril_16x16_kernel")
-    if fam == "state_gather" or (fam == "copy" and rec == "cann_keypool_state_gather"):
+    if fam == "copy" and rec == "cann_keypool_state_gather":
         return ("ssm_state_gather", "_gather_ssm_states_kernel")
-    if fam == "state_scatter" or (
-            fam == "elementwise" and rec == "recover_ssm_commit"):
+    if fam == "elementwise" and rec == "recover_ssm_commit":
         return ("ssm_state_scatter", "_scatter_ssm_states_kernel")
-
     if fam == "mhc":
         if rec in {"hc_pre_fused", "hc_pre", "hc_pre_mix"}:
             return ("hc_pre", "aclnnHcPre")
@@ -375,40 +334,18 @@ def resolve_builder_strict(
             return ("hc_combine_norm", "_hc_combine_norm_kernel")
         if rec == "mc2_routed_expert_program":
             return ("megamoe_fused_mc2", "aclnnMegaMoe")
-        if rec in {"hc_inverse_rms", "hc_normalize_scale_bias_gate",
-                   "hc_sinkhorn", "hc_gate_mix", "hc_combine"}:
+        if rec in {"hc_inverse_rms", "hc_normalize_scale_bias_gate", "hc_sinkhorn", "hc_gate_mix", "hc_combine"}:
             return ("mhc_stream_mix", f"mhc_{rec}_kernel")
-    if fam == "attn_res_prefix":
-        return ("attn_res_prefix", "aclnnAttnResFwd")
-
-    if fam == "engram_gather":
-        return ("ple_lookup", "aclnnEmbedding")
-    if fam == "engram_query":
-        return ("engram_ngram_hash", "engram_ngram_ids_kernel")
-    if fam == "engram_rh2d":
-        return ("engram_uva_h2d", "aclrtMemcpyAsync")
-    if fam == "engram_apply":
-        return ("gated_mul_add", "aclnnMul")
-    if fam == "embedding":
-        return ("vocab_embedding", "aclnnEmbedding")
-
     if fam == "acceptance" and rec == "speculative_acceptance":
         return ("rejection_sampler", "rejection_sample_kernel")
-    if fam in {"sampling", "confidence", "token_commit"}:
-        return ("categorical_sampler", "_categorical_sample_kernel")
-
-    if fam == "moe_ffn" or rec == "mc2_routed_expert_program":
+    if rec == "mc2_routed_expert_program":
         return ("megamoe_fused_mc2", "aclnnMegaMoe")
     if fam in _DENSE_GEMM_FAMILIES:
-        if rec == "mc2_routed_expert_program":
-            return ("megamoe_fused_mc2", "aclnnMegaMoe")
         if has_quant and fam not in _UNQUANTIZED_GEMM_ROLES:
             return ("quant_matmul", "aclnnQuantMatmulWeightNz")
         return ("matmul", "aclnnMatmul")
-
     if fam == "elementwise":
-        if rec in {"decode_q_l2norm", "decode_k_l2norm", "phase6_q_l2norm",
-                   "phase6_k_l2norm", "qk_l2norm"} or "l2norm" in rec:
+        if rec in {"decode_q_l2norm", "decode_k_l2norm", "phase6_q_l2norm", "phase6_k_l2norm", "qk_l2norm"} or "l2norm" in rec:
             return ("l2_norm", "l2norm_fwd_kernel2")
         if rec == "linear_output_norm_gate":
             return ("rms_norm_gated", "_layer_norm_fwd_1pass_kernel_npu")
@@ -422,18 +359,10 @@ def resolve_builder_strict(
             return ("vector_pack_indices", "aclnnIndexSelect")
         if rec in {"dcp_output_pack", "dcp_query_pack"}:
             return ("tensor_copy", "aclnnInplaceCopy")
-    if fam in {"index_add", "scatter_add"}:
-        return ("index_add", "aclnnIndexAdd")
-    if fam in {"gather", "strided_gather", "tensor_select"}:
-        return ("strided_gather", "aclnnIndexSelect")
-    if fam == "pad":
-        return ("tensor_pad", "aclnnPadV3")
-    if fam == "cast":
-        return ("dtype_cast", "aclnnCast")
-    if fam in {"tensor_copy", "copy", "tensor_materialization", "tensor_view"}:
+    if fam in _DIRECT_FAMILY_BUILDERS:
+        return _DIRECT_FAMILY_BUILDERS[fam]
+    if fam == "copy":
         return ("tensor_copy", "aclnnInplaceCopy")
-    if fam in {"tensor_fill", "zero_fill", "fill"}:
-        return ("tensor_fill", "aclnnInplaceZero")
 
     hint = {
         "schema": ONBOARDING_HINT_SCHEMA, "model_id": str(model_id), "layer_idx": int(layer_idx),
@@ -558,12 +487,56 @@ def attention_shape_dims(
     }
 
 
+_FABRIC_OP_FAMILIES = {
+    "all_reduce": "allreduce", "quantized_all_reduce": "allreduce",
+    "all_gather": "allgather", "reduce_scatter": "reduce_scatter",
+    "all_to_all": "alltoall", "all_to_all_v": "alltoallv",
+    "p2p_send_recv": "pp_p2p",
+}
+_CROSS_NODE_LINK_MARKERS = ("inter_node", "inter_pod", "roce", "rdma", "scaleout", "scale_out")
+
+
+def resolve_fabric_collective_abi(collective_op: str) -> tuple[str, str]:
+    """Resolve ``(builder, upstream_abi)`` for a fabric collective via ``resolve_builder_strict``."""
+    op = str(collective_op or "").strip()
+    family = _FABRIC_OP_FAMILIES.get(op)
+    if family is None:
+        raise BenchTopologyError(f"fabric_collective_unknown:{op}")
+    return resolve_builder_strict(family, op, "", ("fp32",))
+
+
+def _machine_topology(hardware: Mapping[str, Any], machine: Any | None) -> tuple[list[list[int]], list[list[int]], bool, set[int] | None]:
+    if machine is not None:
+        dies = list(getattr(machine, "dies", ()) or ())
+        node_ids = sorted({int(getattr(d, "node", 0)) for d in dies})
+        pkg_keys = sorted({(int(getattr(d, "node", 0)), int(getattr(d, "package", 0))) for d in dies})
+        by_node = [sorted(int(d.rank) for d in dies if int(getattr(d, "node", 0)) == n) for n in node_ids]
+        by_pkg = [sorted(int(d.rank) for d in dies if (int(getattr(d, "node", 0)), int(getattr(d, "package", 0))) == k) for k in pkg_keys]
+        rank_node = {int(d.rank): int(getattr(d, "node", 0)) for d in dies}
+        links = list(getattr(machine, "links", ()) or ())
+        has_inter = any(
+            len({rank_node[int(r)] for r in getattr(lnk, "members", ()) if int(r) in rank_node}) >= 2
+            and any(m in f"{getattr(lnk, 'channel', '')} {getattr(lnk, 'name', '')}".lower() for m in _CROSS_NODE_LINK_MARKERS)
+            for lnk in links
+        )
+        return by_node, by_pkg, has_inter, {int(d.rank) for d in dies}
+    raw_by_node = hardware.get("ranks_by_node")
+    raw_by_pkg = hardware.get("package_ranks")
+    raw_ranks = hardware.get("ranks")
+    avail = {int(r) for r in raw_ranks} if raw_ranks is not None else None
+    if raw_by_node is not None:
+        by_node = [[int(r) for r in grp] for grp in raw_by_node]
+        by_pkg = [[int(r) for r in grp] for grp in (raw_by_pkg or ())]
+        has_inter = bool(hardware.get("has_inter_node_link", len(by_node) >= 2))
+        if avail is None:
+            avail = {r for grp in by_node for r in grp}
+        return by_node, by_pkg, has_inter, avail
+    return [], [], bool(hardware.get("has_inter_node_link", True)), avail
+
+
 def fabric_route_ranks(
-    route: str,
-    participants: int,
-    hardware: Mapping[str, Any],
-    *,
-    available_ranks: Sequence[int] | None = None,
+    route: str, participants: int, hardware: Mapping[str, Any], *,
+    available_ranks: Sequence[int] | None = None, machine: Any | None = None,
 ) -> list[int]:
     """Construct verified physical rank IDs guaranteed to traverse ``route``."""
     route_key = str(route or "").strip()
@@ -571,49 +544,59 @@ def fabric_route_ranks(
         raise BenchGeometryError(f"fabric_route_unknown:{route_key}")
     if isinstance(participants, bool) or not isinstance(participants, int) or participants < 2:
         raise BenchGeometryError(f"fabric_participants_invalid:{participants}")
-    raw_pkg = hardware.get("dies_per_package")
-    raw_node = hardware.get("dies_per_node")
+    raw_pkg = int(machine.dies_per_package) if machine is not None else hardware.get("dies_per_package")
+    raw_node = int(machine.ranks_per_node) if machine is not None else hardware.get("dies_per_node")
     if isinstance(raw_pkg, bool) or not isinstance(raw_pkg, int) or raw_pkg < 1:
         raise BenchGeometryError(f"fabric_dies_per_package_invalid:{raw_pkg}")
     if isinstance(raw_node, bool) or not isinstance(raw_node, int) or raw_node < raw_pkg:
         raise BenchGeometryError(f"fabric_dies_per_node_invalid:{raw_node}:per_pkg={raw_pkg}")
     if raw_node % raw_pkg != 0:
-        raise BenchGeometryError(
-            f"fabric_node_not_divisible_by_package:dies_per_node={raw_node},dies_per_package={raw_pkg}"
-        )
+        raise BenchGeometryError(f"fabric_node_not_divisible_by_package:dies_per_node={raw_node},dies_per_package={raw_pkg}")
+    by_node, by_pkg, has_inter, declared_avail = _machine_topology(hardware, machine)
     if route_key == "intra_package_die":
         if raw_pkg < 2 or participants > raw_pkg:
-            raise BenchGeometryError(
-                f"fabric_intra_package_unrealizable:participants={participants},dies_per_package={raw_pkg}"
-            )
-        ranks = list(range(participants))
+            raise BenchGeometryError(f"fabric_intra_package_unrealizable:participants={participants},dies_per_package={raw_pkg}")
+        if by_pkg:
+            pkg = next((grp for grp in by_pkg if len(grp) >= participants), None)
+            if pkg is None:
+                raise BenchGeometryError(f"fabric_intra_package_unrealizable:participants={participants}")
+            ranks = list(pkg[:participants])
+        else:
+            ranks = list(range(participants))
     elif route_key == "intra_node_hccs":
         if participants > raw_node:
-            raise BenchGeometryError(
-                f"fabric_intra_node_exceeds_node:participants={participants},dies_per_node={raw_node}"
-            )
+            raise BenchGeometryError(f"fabric_intra_node_exceeds_node:participants={participants},dies_per_node={raw_node}")
         packages_per_node = raw_node // raw_pkg
         if packages_per_node < 2:
-            raise BenchGeometryError(
-                f"fabric_intra_node_hccs_requires_multiple_packages:packages={packages_per_node}"
-            )
-        ranks = ([idx * raw_pkg for idx in range(participants)]
-                 if participants <= packages_per_node else list(range(participants)))
+            raise BenchGeometryError(f"fabric_intra_node_hccs_requires_multiple_packages:packages={packages_per_node}")
+        if by_node:
+            node0 = by_node[0]
+            if len(node0) < participants:
+                raise BenchGeometryError(f"fabric_intra_node_exceeds_node:participants={participants},node_dies={len(node0)}")
+            node0_pkgs = [grp for grp in by_pkg if grp and grp[0] in set(node0)]
+            ranks = ([grp[0] for grp in node0_pkgs[:participants]]
+                     if len(node0_pkgs) >= participants else list(node0[:participants]))
+        else:
+            ranks = ([idx * raw_pkg for idx in range(participants)]
+                     if participants <= packages_per_node else list(range(participants)))
     else:
-        half = participants // 2
-        rem = participants - half
-        if rem > raw_node:
-            raise BenchGeometryError(
-                f"fabric_inter_node_half_exceeds_node:half={rem},dies_per_node={raw_node}"
-            )
-        ranks = [*range(half), *range(raw_node, raw_node + rem)]
-    if available_ranks is not None:
-        avail = {int(r) for r in available_ranks}
-        missing = [r for r in ranks if r not in avail]
+        declared_nodes = len(by_node) if by_node else int(hardware.get("nodes") or 1)
+        if declared_nodes < 2 or not has_inter:
+            raise BenchTopologyError(f"fabric_inter_node_requires_multi_node:nodes={declared_nodes}")
+        half, rem = participants // 2, participants - (participants // 2)
+        if by_node:
+            if len(by_node[0]) < half or len(by_node[1]) < rem:
+                raise BenchGeometryError(f"fabric_inter_node_half_exceeds_node:half={rem},node_dies={len(by_node[0])}")
+            ranks = [*by_node[0][:half], *by_node[1][:rem]]
+        else:
+            if rem > raw_node:
+                raise BenchGeometryError(f"fabric_inter_node_half_exceeds_node:half={rem},dies_per_node={raw_node}")
+            ranks = [*range(half), *range(raw_node, raw_node + rem)]
+    effective_avail = ({int(r) for r in available_ranks} if available_ranks is not None else declared_avail)
+    if effective_avail is not None:
+        missing = [r for r in ranks if r not in effective_avail]
         if missing:
-            raise BenchGeometryError(
-                f"fabric_route_ranks_unavailable:route={route_key},missing={missing}"
-            )
+            raise BenchGeometryError(f"fabric_route_ranks_unavailable:route={route_key},missing={missing}")
     return ranks
 
 
@@ -636,7 +619,7 @@ def is_ladder_kv_node(node: Mapping[str, Any]) -> bool:
 def resolve_collective_cosets(
     topology: Any, metadata: Mapping[str, Any], stage: int = 0,
 ) -> list[list[int]]:
-    """Resolve all physical rank cosets for one collective axis without swallowing errors."""
+    """Resolve all physical rank cosets across every internal and ``external_dp`` replica."""
     if topology is None:
         raise BenchTopologyError("collective_topology_missing")
     raw_axis = str(metadata.get("group_axis") or "tp").strip()
@@ -644,28 +627,34 @@ def resolve_collective_cosets(
     stage_idx = int(stage)
     parallel = getattr(topology, "parallel", None)
     dp = max(1, int(getattr(parallel, "dp", 1) or 1))
+    ext_dp = max(1, int(getattr(parallel, "external_dp", 1) or 1))
     pp = max(1, int(getattr(parallel, "pp", 1) or 1))
+    total_dp = ext_dp * dp
     if axis == "dp":
-        try:
-            per_replica = [tuple(int(r) for r in topology.ranks(r, stage_idx)) for r in range(dp)]
-        except Exception as exc:
-            raise BenchTopologyError(f"collective_topology_dp_failed:stage={stage_idx}:{exc}") from exc
-        if not per_replica or not per_replica[0]:
-            raise BenchTopologyError(f"collective_topology_dp_empty:stage={stage_idx}")
-        width = len(per_replica[0])
-        if any(len(row) != width for row in per_replica):
-            raise BenchTopologyError(f"collective_topology_dp_ragged:stage={stage_idx}")
-        return [[per_replica[r][offset] for r in range(dp)] for offset in range(width)]
-    if axis == "pp":
         cosets: list[list[int]] = []
+        for ext in range(ext_dp):
+            try:
+                per_rep = [tuple(int(r) for r in topology.ranks(ext * dp + r, stage_idx)) for r in range(dp)]
+            except Exception as exc:
+                raise BenchTopologyError(f"collective_topology_dp_failed:stage={stage_idx}:{exc}") from exc
+            if not per_rep or not per_rep[0]:
+                raise BenchTopologyError(f"collective_topology_dp_empty:stage={stage_idx},ext={ext}")
+            width = len(per_rep[0])
+            if any(len(row) != width for row in per_rep):
+                raise BenchTopologyError(f"collective_topology_dp_ragged:stage={stage_idx},ext={ext}")
+            cosets.extend([per_rep[r][off] for r in range(dp)] for off in range(width))
+        return cosets
+    if axis == "pp":
+        cosets = []
         try:
-            for replica in range(dp):
+            for replica in range(total_dp):
                 per_stage = [tuple(int(r) for r in topology.ranks(replica, s)) for s in range(pp)]
                 if not per_stage or not per_stage[0]:
                     raise BenchTopologyError(f"collective_topology_pp_empty:replica={replica}")
                 width = len(per_stage[0])
-                for offset in range(width):
-                    cosets.append([per_stage[s][offset] for s in range(pp)])
+                if any(len(row) != width for row in per_stage):
+                    raise BenchTopologyError(f"collective_topology_pp_ragged:replica={replica}")
+                cosets.extend([per_stage[s][off] for s in range(pp)] for off in range(width))
         except BenchTopologyError:
             raise
         except Exception as exc:
@@ -673,9 +662,16 @@ def resolve_collective_cosets(
         return cosets
     seen: set[tuple[int, ...]] = set()
     cosets = []
-    for replica in range(dp):
+    from mindie_sim.prediction.local_tp_groups import expert_tp_groups
+    for replica in range(total_dp):
         try:
-            groups = topology.groups(axis, replica, stage_idx, metadata=metadata)
+            if not topology.ranks(replica, stage_idx):
+                raise BenchTopologyError(f"collective_topology_missing_ranks:axis={axis},stage={stage_idx},replica={replica}")
+            groups = (expert_tp_groups(topology, replica=replica, stage=stage_idx)
+                      if axis == "etp"
+                      else topology.groups(axis, replica, stage_idx, metadata=metadata))
+        except BenchTopologyError:
+            raise
         except Exception as exc:
             raise BenchTopologyError(
                 f"collective_topology_resolution_failed:axis={axis},stage={stage_idx},replica={replica}:{exc}"
@@ -683,9 +679,7 @@ def resolve_collective_cosets(
         for grp in groups:
             key = tuple(int(r) for r in grp)
             if not key:
-                raise BenchTopologyError(
-                    f"collective_topology_empty_group:axis={axis},stage={stage_idx},replica={replica}"
-                )
+                raise BenchTopologyError(f"collective_topology_empty_group:axis={axis},stage={stage_idx},replica={replica}")
             if key not in seen:
                 seen.add(key)
                 cosets.append(list(key))
@@ -695,14 +689,25 @@ def resolve_collective_cosets(
 
 
 def resolve_collective_group_ranks(
-    topology: Any, metadata: Mapping[str, Any], stage: int = 0, *, rank: int = 0,
+    topology: Any, metadata: Mapping[str, Any], stage: int = 0, *, rank: int | None = None,
 ) -> list[int] | None:
-    """Return the physical rank coset containing ``rank`` (strict on topology errors)."""
+    """Return the coset matching declared ``group_ranks`` or physical ``rank`` (strict on mismatch)."""
     if topology is None:
         return None
     cosets = resolve_collective_cosets(topology, metadata, stage)
-    target = int(rank)
-    chosen = next((grp for grp in cosets if target in grp), cosets[0])
+    declared = metadata.get("group_ranks")
+    if declared is not None:
+        members = tuple(int(r) for r in declared)
+        matched = next((grp for grp in cosets if len(grp) == len(members) and set(grp) == set(members)), None)
+        if matched is None:
+            raise BenchTopologyError(f"collective_declared_group_unmatched:declared={list(members)},cosets={cosets}")
+        if rank is not None and int(rank) not in matched:
+            raise BenchTopologyError(f"collective_rank_not_in_declared_group:rank={rank},declared={list(members)}")
+        return list(matched)
+    target = int(rank) if rank is not None else int(metadata.get("physical_rank", metadata.get("rank", 0)))
+    chosen = next((grp for grp in cosets if target in grp), None)
+    if chosen is None:
+        raise BenchTopologyError(f"collective_rank_not_in_cosets:rank={target},stage={stage},cosets={cosets}")
     return list(chosen)
 
 
@@ -786,6 +791,6 @@ __all__ = [
     "ONBOARDING_HINT_SCHEMA", "SUPPORTED_FABRIC_ROUTES",
     "BenchGeometryError", "BenchTopologyError", "UnmodeledCapabilityError",
     "attention_shape_dims", "collapse_device_kernel_groups", "fabric_route_ranks",
-    "is_ladder_kv_node", "resolve_builder_strict",
+    "is_ladder_kv_node", "resolve_builder_strict", "resolve_fabric_collective_abi",
     "resolve_collective_cosets", "resolve_collective_group_ranks",
 ]

@@ -72,7 +72,6 @@ OK_STATUSES = frozenset({"ok", "completed", "passed", "success", "measured"})
 SKIP_KINDS = frozenset({"status", "control"})
 SKIP_RECORD_TYPES = frozenset({"case_complete", "control", "summary"})
 REQUIRED_IDENTITY_KEYS = ("hardware", "implementation", "phase", "dtype")
-HELDOUT_FABRIC_BYTES = frozenset({1 << 15, 1 << 19, 1 << 23, 1 << 27})
 FABRIC_GROUP_FIELDS = (
     "run_id", "tier", "op", "group_size", "bytes", "protocol", "regime",
     "timing_mode", "split_style", "trial_index", "repeat_index", "pair_index", "round_index",
@@ -194,11 +193,10 @@ def _sample_id(raw: Mapping[str, Any]) -> str:
 
 
 def _source(raw: Mapping[str, Any], sample_id: str, *, fabric: bool = False) -> str:
+    del fabric
     value = raw.get("source")
-    if value is None:
-        if not fabric:
-            raise PacketError(f"observation_requires_explicit_source:{sample_id}")
-        return f"capture://fabric/{sample_id}"
+    if value is None or not str(value).strip():
+        raise PacketError(f"observation_requires_explicit_source:{sample_id}")
     source = str(value).strip()
     if not source.startswith("capture://"):
         raise PacketError(f"observation_source_requires_capture_uri:{sample_id}:{source}")
@@ -370,9 +368,11 @@ def _fabric_reduced(raws: Sequence[Mapping[str, Any]]) -> tuple[list[dict[str, A
         group_ranks = tuple(int(rank) for rank in (raw.get("group_ranks") or ()))
         pair = tuple(int(rank) for rank in (raw.get("pair") or ()))
         size = int(raw.get("bytes") or 0)
-        row_split = str(raw.get("split") or ("heldout" if size in HELDOUT_FABRIC_BYTES else "train"))
-        if row_split not in {"train", "heldout"}:
-            raise PacketError(f"fabric_split_requires_train_or_heldout:{row_split}")
+        raw_split = raw.get("split")
+        if raw_split not in {"train", "heldout"}:
+            raise PacketError(f"fabric_sample_requires_explicit_split:{raw_split}")
+        row_split = str(raw_split)
+        _source(raw, _sample_id(raw))
         split_key = (
             raw.get("run_id"), raw.get("tier"), raw.get("op"), raw.get("group_size"),
             size, raw.get("protocol"), raw.get("regime"), raw.get("split_style"),
@@ -395,16 +395,18 @@ def _fabric_reduced(raws: Sequence[Mapping[str, Any]]) -> tuple[list[dict[str, A
         group["group_ranks"].update(group_ranks)
     reduced = []
     for key, group in groups.items():
+        declared_group_size = _positive_int(key[3], "fabric_group_size")
         expected_ranks = set(group["pair"]) if group["pair"] else group["group_ranks"]
         if not expected_ranks or group["ranks"] != expected_ranks:
             raise PacketError(f"incomplete_fabric_repeat_ranks:{key}")
+        if len(group["ranks"]) != declared_group_size:
+            raise PacketError(
+                f"fabric_group_size_rank_count_mismatch:declared={declared_group_size},observed={len(group['ranks'])}"
+            )
         sample = group["sample"]
         size = int(key[4])
         duration = max(float(row["device_completion_us"]) for row in group["rows"]) / 1000.0
-        row_splits = {
-            str(row.get("split") or ("heldout" if size in HELDOUT_FABRIC_BYTES else "train"))
-            for row in group["rows"]
-        }
+        row_splits = {str(row["split"]) for row in group["rows"]}
         if len(row_splits) != 1:
             raise PacketError(f"conflicting_fabric_repeat_splits:{key}")
         split = next(iter(row_splits))
