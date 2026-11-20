@@ -180,7 +180,7 @@ def test_gate_ratchet_catches_deleted_manifest_module_and_bad_manifests_exit_2(t
     base = _git(root, "rev-parse", "HEAD")
     (root / "tests/schema/test_profiles.py").unlink()
     assert "TO003" in _codes(root, base=base)
-    for bad in ("schema_version = 2\n", MANIFEST.replace("max_modules = 4", "max_modules = 81"),
+    for bad in ("schema_version = 2\n", MANIFEST.replace("max_modules = 4", "max_modules = 97"),
                 MANIFEST.replace("max_lines = 600", 'max_lines = "bad"')):
         (root / "tests/TAXONOMY.toml").write_text(bad, encoding="utf-8")
         assert gate.main(["--root", str(root), "--strict"]) == 2

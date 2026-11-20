@@ -312,7 +312,7 @@ def test_three_ledger_sector_union_turnaround_and_l2_sector_residency_rules():
     b_mix = ctx.bind_access(p_mix, state=v_b, hbm_bus=bus, burst_rules=(BurstTurnRule(1, 65, 0, 65, 32.0),))
     assert b_mix.ledger.l2_hit_bytes == 32 and b_mix.ledger.dram_bus_transaction_bytes == pytest.approx(64.0)
 
-    k_other = ReuseKey(0, "buf2", 1, reuse_stream="main")
+    k_other = ReuseKey(0, "buf2", 1, reuse_stream="aux")
     p_other = MemoryAccessPattern("o", 1, 0, 0, "write", "mte3", 48 * mib, AddressRunPlan((AddressRun(0, 1, 48 * mib, 48 * mib),)),
                                   reuse_key=k_other, visibility=VisibilityContract(scope="owner", private_workspace=True, live_out=False))
     assert view.admit_access(p_other, 48 * mib) == (48 * mib, 0) and view.effective_l2_bytes(0) == 64 * mib

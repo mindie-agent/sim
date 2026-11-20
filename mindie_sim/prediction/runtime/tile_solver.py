@@ -114,6 +114,18 @@ class LiveBufferSpec:
             raise ModelingError(f"live_buffer_interval_reversed:{self.name}")
         if self.alignment_bytes < 1:
             raise ModelingError(f"live_buffer_alignment_invalid:{self.name}")
+        if self.pool in AIC_POOLS and self.owner_kind != "aic":
+            raise ModelingError(
+                f"live_buffer_pool_owner_mismatch:{self.name}:{self.pool}:{self.owner_kind}"
+            )
+        if self.pool in AIV_POOLS and self.owner_kind != "aiv":
+            raise ModelingError(
+                f"live_buffer_pool_owner_mismatch:{self.name}:{self.pool}:{self.owner_kind}"
+            )
+        if self.pool == "l2" and self.owner_kind not in {"aic", "aiv", "die"}:
+            raise ModelingError(
+                f"live_buffer_pool_owner_mismatch:{self.name}:{self.pool}:{self.owner_kind}"
+            )
 
 
 @dataclass(frozen=True, slots=True)

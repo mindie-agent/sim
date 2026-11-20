@@ -5,7 +5,7 @@ schema_version = 1
 domains = ["schema", "runtime", "collectives", "operators", "spine", "serving", "observations", "product", "hygiene"]
 support_dirs = ["_support", "_oracles", "fixtures", "runtime/native"]
 max_lines = 600
-max_modules = 80
+max_modules = 96
 
 # ---------------------------------------------------------------- schema (hardware, datapath, catalog)
 [[module]]
@@ -50,6 +50,15 @@ reserved = true
 path = "schema/test_deployment_and_workload.py"
 tier = "tier0"
 reserved = true
+
+[[module]]
+path = "schema/test_l0_primitives.py"
+tier = "tier0"
+owns = [
+  "mindie_sim/primitives",
+  "data/primitives",
+  "tools/bench_l0_primitives.py",
+]
 
 # ---------------------------------------------------------------- runtime (Engine, C11, memory physics)
 [[module]]
@@ -122,6 +131,14 @@ reserved = true
 path = "runtime/test_invocation_boundary.py"
 tier = "tier0"
 reserved = true
+
+[[module]]
+path = "runtime/test_remote_exec.py"
+tier = "tier0"
+owns = [
+  "mindie_sim/remote_exec.py",
+  "mindie_sim/_remote_worker.py",
+]
 
 [[module]]
 path = "runtime/test_formal_lean_locks.py"
