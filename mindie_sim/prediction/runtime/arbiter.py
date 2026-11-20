@@ -36,6 +36,8 @@ def _fast_eligible_task(resources, task) -> bool:
         return True
     pl = task.placement
     if task.coupled:
+        if getattr(task, "cohort_size", 1) > 1:
+            return False
         first_u = first_tot = 0
         for rname in rem:
             res = resources[rname]
@@ -103,25 +105,20 @@ def _needs_unit_tier_solver(resources, tasks, active) -> bool:
     return multi_prio and (any_coupled or any_fair)
 
 
-_ZERO_COUNT = 0
-_MULTI_RESOURCE_CUTOFF = 1
-
-
 def _has_overlapping_subunit_coupled(resources, tasks, active) -> bool:
     """True when a coupled task shares a strict sub-unit owner with any peer.
 
-    C11 solves every active coupled cohort jointly.  An unpinned coupled peer
-    must therefore not take the closed-form two-task path while an uncoupled
-    peer owns only part of one of its resources: the shared owner unit meters
-    both flows, and only the per-unit residual solver preserves that capacity.
-    An unplaced participant spans every declared unit, so any strict sub-unit
-    placement on the resource overlaps it.
+    An unpinned coupled peer must not take the closed-form two-task path while
+    an uncoupled peer owns only part of one of its resources: the shared owner
+    unit meters both flows, and only the per-unit residual solver preserves
+    that capacity. An unplaced participant spans every declared unit, so any
+    strict sub-unit placement on the resource overlaps it.
     """
     for key in active:
         task = tasks[key]
         rem = task.remaining
         pl = task.placement
-        if not (task.coupled and len(rem) > _MULTI_RESOURCE_CUTOFF):
+        if not (task.coupled and len(rem) > 1):
             continue
         for rname, amt in rem.items():
             if amt <= 0.0:
@@ -136,10 +133,8 @@ def _has_overlapping_subunit_coupled(resources, tasks, active) -> bool:
                 peer = tasks[peer_key]
                 if peer.remaining.get(rname, 0.0) <= 0.0:
                     continue
-                peer_units = (peer.placement.get(rname)
-                              if peer.placement else None)
-                peer_subunit = (peer_units is not None
-                                and len(peer_units) < res.units)
+                peer_units = peer.placement.get(rname) if peer.placement else None
+                peer_subunit = peer_units is not None and len(peer_units) < res.units
                 if not (own_subunit or peer_subunit):
                     continue
                 if unit_set is None or peer_units is None:
@@ -155,7 +150,7 @@ def component_rates(resources, tasks, active, *, coupled_solver=None,
     """Return {physical_resource: {task_sequence: native_work/ms}}."""
     if not active:
         return {}
-    if coupled_active == _ZERO_COUNT:
+    if coupled_active == 0:
         first_prio = None
         multi_prio = False
         for key in active:
@@ -169,7 +164,7 @@ def component_rates(resources, tasks, active, *, coupled_solver=None,
                     break
         need_tier = (
             _needs_unit_tier_solver(resources, tasks, active)
-            if (multi_prio or (placed_active != _ZERO_COUNT and any(r.policy != "fair" for r in resources.values())))
+            if (multi_prio or (placed_active != 0 and any(r.policy != "fair" for r in resources.values())))
             else False
         )
     else:
@@ -195,7 +190,7 @@ def component_rates(resources, tasks, active, *, coupled_solver=None,
                 return {name: {key: components[proxy]}
                         for name, components in rates.items()
                         if proxy in components}
-        elif ((placed_active is None or placed_active != _ZERO_COUNT)
+        elif ((placed_active is None or placed_active != 0)
               and _has_overlapping_subunit_coupled(resources, tasks, active)):
             return _tiered_coupled(resources, tasks, active, coupled_solver)
         elif n_active == 2:

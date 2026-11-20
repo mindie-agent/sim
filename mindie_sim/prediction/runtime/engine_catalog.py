@@ -280,6 +280,7 @@ class _EngineCatalogMixin:
             coupled=bool(getattr(stage, "coupled", False)),
             priority=int(getattr(stage, "priority", 0)),
             cohort_size=int(getattr(stage, "cohort_size", 1)),
+            cohort_widened=tuple(getattr(stage, "cohort_widened", ())) or None,
             after=tuple(deps), owner=owner, on_complete=on_complete,
             metadata={"occurrence": frame.occurrence,
                       "catalog_stage": stage.label})

@@ -192,6 +192,14 @@ class _EngineLifecycleMixin:
                 popped_pools.append(live)
                 if alloc_dq is not None:
                     alloc_dq.append((now, 0, live, tname))
+            wave_rec = self._wave_recorder
+            if wave_rec is not None:
+                for live in popped_pools:
+                    for unit in live.units:
+                        wave_rec.on_allocation(
+                            live.pool, int(unit), 0, 0, int(round(live.size)),
+                            now, "release",
+                        )
             n_free = len(task.free)
             self.allocation_event_count += n_free
             self._alloc_state_version += n_free
@@ -444,6 +452,20 @@ class _EngineLifecycleMixin:
                 self._alloc_state_version += n_acq
                 if empty_pools:
                     self._seen_floor_peaks.add(sid)
+            wave_rec = self._wave_recorder
+            if wave_rec is not None:
+                for item in task.acquire:
+                    for unit in item.units:
+                        wave_rec.on_allocation(
+                            item.pool, int(unit), 0, 0, int(round(item.size)),
+                            now, "grant",
+                        )
+        wave_rec = self._wave_recorder
+        if wave_rec is not None:
+            owners = tuple(
+                sorted({u for units in (task.placement or {}).values() for u in units})
+            ) or (0,)
+            wave_rec.on_admit(key, now, owners=owners)
         if self._accel is not None and key in self._native_seqs:
             self._accel.activate(self, key)
         if task.demand or task.latency > 0.0:
@@ -546,3 +568,96 @@ class _EngineLifecycleMixin:
             self._settle_rounds += 1
             if self._settle_rounds > self.zero_progress_limit:
                 raise ExecutionError("execution_zero_progress")
+
+    def _split_asymmetric_cohorts(self) -> bool:
+        """Split active widened cohorts when a peer breaks member unit symmetry."""
+        if self._placed_active == 0 or len(self._active) < 2:
+            return False
+        to_split: list[int] = []
+        tasks = self._tasks
+        active = self._active
+        for key in active:
+            task = tasks[key]
+            if task.cohort_size <= 1 or not task.cohort_members or not task.remaining:
+                continue
+            members_dict = dict(task.cohort_members)
+            broken = False
+            for peer_key in active:
+                if peer_key == key:
+                    continue
+                peer = tasks[peer_key]
+                if not peer.placement or not peer.remaining:
+                    continue
+                for rname, members in members_dict.items():
+                    if rname not in task.remaining or peer.remaining.get(rname, 0.0) <= 0.0:
+                        continue
+                    peer_units = peer.placement.get(rname)
+                    if peer_units is None:
+                        continue
+                    peer_set = set(peer_units)
+                    if len({len(peer_set.intersection(m)) for m in members}) > 1:
+                        broken = True
+                        break
+                if broken:
+                    break
+            if broken:
+                to_split.append(key)
+        if not to_split:
+            return False
+        from .engine_types import _EMPTY_FROZENSET
+        for key in to_split:
+            task = tasks[key]
+            cohort = task.cohort_size
+            members_dict = dict(task.cohort_members)
+            active.discard(key)
+            if task.latency > 0.0:
+                self._latency_active.discard(key)
+            if task.coupled:
+                self._coupled_active -= 1
+            if task.placement:
+                self._placed_active -= 1
+            remaining_members = [cohort]
+            orig_task = task
+
+            def _member_done(member_ev, m_task_ref, orig=orig_task, rem_box=remaining_members):
+                for rn, amt in m_task_ref.service.items():
+                    orig.service[rn] = orig.service.get(rn, 0.0) + amt
+                rem_box[0] -= 1
+                if rem_box[0] == 0:
+                    orig.remaining.clear()
+                    self._complete(orig, moment=member_ev.time)
+
+            for idx in range(cohort):
+                m_rem = {r: amt / cohort for r, amt in task.remaining.items()}
+                m_caps = {r: cap / cohort for r, cap in task.caps.items()}
+                m_place = {
+                    r: (members_dict[r][idx] if r in members_dict else units)
+                    for r, units in task.placement.items()
+                }
+                self._sequence += 1
+                m_ev = Event(self._sequence, f"{task.event.name}#member{idx}", started=task.start)
+                m_prep = self._prepare(
+                    m_ev.name, m_rem, latency=task.latency, caps=m_caps,
+                    placement=m_place, coupled=task.coupled, priority=task.priority,
+                )
+                m_task = _Task(
+                    m_ev, dict(m_rem), m_prep.demand, 0, task.release,
+                    task.latency, m_prep.caps, (), (), task.owner, task.metadata,
+                    m_prep.placement, (), task.priority, task.coupled, None, None,
+                    task.start, {}, False, None, 0, 0, _EMPTY_FROZENSET, None, (),
+                    1, m_prep, None, False, (), (),
+                )
+                m_task.callback = lambda ev, mt=m_task, fn=_member_done: fn(ev, mt)
+                tasks[m_ev.sequence] = m_task
+                if self.task_uses_fifo(m_task):
+                    self._fifo_live += 1
+                if self.task_blocks_native(m_task):
+                    self._inline_blocked += 1
+                active.add(m_ev.sequence)
+                if m_task.latency > 0.0:
+                    self._latency_active.add(m_ev.sequence)
+                if m_task.coupled:
+                    self._coupled_active += 1
+                if m_task.placement:
+                    self._placed_active += 1
+        return True

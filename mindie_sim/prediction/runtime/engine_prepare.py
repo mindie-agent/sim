@@ -21,6 +21,60 @@ from .engine_types import (
 )
 
 
+def _normalize_cohort_symmetry(
+    name: str,
+    placement: dict[str, tuple[int, ...]],
+    cohort_size: int,
+    cohort_widened: Sequence[str] | None,
+    cohort_members: Mapping[str, Sequence[Sequence[int]]] | Sequence | None,
+) -> tuple[tuple[str, ...], tuple[tuple[str, tuple[tuple[int, ...], ...]], ...]]:
+    """Validate explicit cohort widening and per-member unit tuples."""
+    if not cohort_widened and not cohort_members:
+        return (), ()
+    if cohort_size <= 1:
+        raise ExecutionError(f"cohort_widened_requires_cohort:{name}")
+    widened_set: set[str] = set()
+    members_map: dict[str, tuple[tuple[int, ...], ...]] = {}
+    if cohort_members:
+        items = (
+            cohort_members.items()
+            if isinstance(cohort_members, Mapping)
+            else cohort_members
+        )
+        for key, raw_rows in items:
+            if type(key) is not str or key not in placement:
+                raise ExecutionError(f"cohort_members_resource_missing:{name}:{key}")
+            rows = tuple(tuple(int(u) for u in row) for row in raw_rows)
+            if len(rows) != cohort_size or any(not row for row in rows):
+                raise ExecutionError(f"cohort_members_count_invalid:{name}:{key}")
+            members_map[key] = rows
+            if len(set(rows)) > 1:
+                if len({len(r) for r in rows}) != 1:
+                    raise ExecutionError(f"cohort_members_asymmetric:{name}:{key}")
+                flat = tuple(u for row in rows for u in row)
+                if len(set(flat)) != len(flat) or set(flat) != set(placement[key]):
+                    raise ExecutionError(f"cohort_members_not_disjoint_union:{name}:{key}")
+                widened_set.add(key)
+    if cohort_widened:
+        for key in cohort_widened:
+            if type(key) is not str or key not in placement:
+                raise ExecutionError(f"cohort_widened_resource_missing:{name}:{key}")
+            units = placement[key]
+            if len(units) < cohort_size or len(units) % cohort_size != 0:
+                raise ExecutionError(f"cohort_widened_width_invalid:{name}:{key}")
+            if key in members_map and key not in widened_set:
+                raise ExecutionError(f"cohort_widened_conflicts_with_shared_members:{name}:{key}")
+            widened_set.add(key)
+            if key not in members_map:
+                stride = len(units) // cohort_size
+                members_map[key] = tuple(
+                    units[i * stride:(i + 1) * stride] for i in range(cohort_size)
+                )
+    widened_tuple = tuple(sorted(widened_set))
+    members_tuple = tuple(sorted(members_map.items()))
+    return widened_tuple, members_tuple
+
+
 class _EnginePrepareMixin:
     def submit(
         self, name: str, work: Mapping[str, float] | None = None, *,
@@ -32,19 +86,22 @@ class _EnginePrepareMixin:
         on_start: Callable[[Event], None] | None = None,
         placement: Mapping[str, Sequence[int]] | None = None,
         coupled: bool = False, priority: int = 0, cohort_size: int = 1,
+        cohort_widened: Sequence[str] | None = None,
+        cohort_members: Mapping[str, Sequence[Sequence[int]]] | None = None,
         memory=None, memory_pools: Sequence[str] | None = None,
         memory_bindings: Mapping[str, Mapping] | None = None,
         native_hook: bool = False,
     ) -> Event:
         if (work is None and latency == 0.0 and caps is None and not acquire
                 and not free and placement is None and not coupled
-                and cohort_size == 1):
+                and cohort_size == 1 and not cohort_widened and not cohort_members):
             prepared = _EMPTY_TASK
         else:
             prepared = self._prepare(
                 name, work, latency=latency, caps=caps, acquire=acquire, free=free,
                 placement=placement, coupled=coupled, priority=priority,
-                cohort_size=cohort_size,
+                cohort_size=cohort_size, cohort_widened=cohort_widened,
+                cohort_members=cohort_members,
             )
         return self._submit_prepared(
             prepared, name, after=after, release=release, owner=owner,
@@ -56,16 +113,17 @@ class _EnginePrepareMixin:
     def _prepare(
         self, name, work=None, *, latency=0.0, caps=None, acquire=(), free=(),
         placement=None, coupled=False, priority=0, cohort_size=1,
+        cohort_widened=None, cohort_members=None,
     ) -> _PreparedTask:
         """Validate a template against this engine's physical resource binding."""
         if (work is None and latency == 0 and caps is None and acquire == ()
                 and free == () and placement is None and not coupled
-                and cohort_size == 1):
+                and cohort_size == 1 and not cohort_widened and not cohort_members):
             return _EMPTY_TASK
         if (work is not None and work.__class__ is dict and not caps
                 and not acquire and not free and placement is None
                 and not coupled and latency == 0.0 and not priority
-                and cohort_size == 1):
+                and cohort_size == 1 and not cohort_widened and not cohort_members):
             # Ordinary finite work on declared resources: the same checks as
             # the general path, without building the four unused structures.
             resources = self.resources
@@ -125,6 +183,9 @@ class _EnginePrepareMixin:
                 unit < 0 or unit >= self.resources[key].units for unit in units
             ):
                 raise ExecutionError(f"resource_unit_out_of_range:{key}")
+        norm_widened, norm_members = _normalize_cohort_symmetry(
+            name, placement, cohort_size, cohort_widened, cohort_members,
+        )
         allocation_demands = {}
         seen_acquire: set[str] = set()
         for allocation in acquire:
@@ -161,11 +222,18 @@ class _EnginePrepareMixin:
         u_res_info = None
         if (coupled and demands
                 and all(self.resources[k].policy != "fifo" for k in demands)):
-            scale0 = max(d / self.resources[k].rate
-                         for k, d in demands.items())
-            if cohort_size > 1 and scale0:
-                scale0 /= cohort_size
-            if scale0 > 0.0:
+            scale0 = 0.0
+            for k, d in demands.items():
+                res = self.resources[k]
+                decl = placement.get(k) if placement else None
+                n_u = res.units if decl is None else len(decl)
+                denom = (res.rate / res.units) * n_u
+                if cohort_size > 1 and k not in norm_widened:
+                    denom *= cohort_size
+                s_k = d / denom if denom > 0.0 else math.inf
+                if s_k > scale0:
+                    scale0 = s_k
+            if scale0 > 0.0 and math.isfinite(scale0):
                 c_demand = {k: d / scale0 for k, d in demands.items()}
                 if limits:
                     for k, amt in c_demand.items():
@@ -217,10 +285,11 @@ class _EnginePrepareMixin:
                     s_rate = cap_val
                 s_rates[k] = s_rate
                 u_cap = r_rate / res.units
-                scale_u = d_val / r_rate
+                uc_u = res.units if uk is None else len(uk)
+                denom_u = u_cap * uc_u
+                scale_u = d_val / denom_u if denom_u > 0.0 else 0.0
                 if u_res_info is not None and scale_u > 0.0 and math.isfinite(scale_u):
                     amt_u = d_val / scale_u
-                    uc_u = res.units if uk is None else len(uk)
                     pu_u = amt_u if uc_u == 1 else amt_u / uc_u
                     lim_u = math.inf
                     if cap_val is not None and amt_u:
@@ -242,7 +311,7 @@ class _EnginePrepareMixin:
             priority, cohort_size, (), (), acq_pools, 0, fits_empty,
             c_demand, c_cap_limit, c_solo_rates, demand_keys,
             s_rates, c_res_info, u_res_info,
-            _compute_pool_unit_masks(acq_t))
+            _compute_pool_unit_masks(acq_t), norm_widened, norm_members)
 
     @staticmethod
     def clone_prepared_scoped(static: _PreparedTask,
@@ -258,7 +327,7 @@ class _EnginePrepareMixin:
             static.coupled_cap_limit, static.coupled_solo_rates,
             static.demand_keys, static.solo_rates,
             static.coupled_res_info, static.uncoupled_res_info,
-            static.pool_unit_masks)
+            static.pool_unit_masks, static.cohort_widened, static.cohort_members)
 
     def prepared_stage(self, stage, acquire=(), free=()):
         """Validate one immutable Stage declaration, caching its static part.
@@ -278,6 +347,12 @@ class _EnginePrepareMixin:
             static = hit[1]
         else:
             cohort_size = getattr(lookup_stage, "cohort_size", 1)
+            cohort_widened = getattr(lookup_stage, "cohort_widened", ())
+            raw_members = getattr(lookup_stage, "cohort_members", ())
+            members_sig = (
+                tuple(sorted(raw_members.items()))
+                if isinstance(raw_members, Mapping) else tuple(raw_members)
+            )
             stg_acq = lookup_stage.acquire
             if not stg_acq:
                 acq_sig = ()
@@ -297,7 +372,8 @@ class _EnginePrepareMixin:
                          id(lookup_stage.placement),
                          lookup_stage.name, lookup_stage.latency,
                          lookup_stage.coupled, lookup_stage.priority,
-                         cohort_size, acq_sig, free_sig)
+                         cohort_size, cohort_widened, members_sig,
+                         acq_sig, free_sig)
             phit = proto_cache.get(proto_key)
             if (phit is not None and phit[0] is lookup_stage.work
                     and phit[1] is lookup_stage.caps
@@ -309,7 +385,7 @@ class _EnginePrepareMixin:
                        tuple((name, units)
                              for name, units in lookup_stage.placement.items()),
                        lookup_stage.coupled, lookup_stage.priority, cohort_size,
-                       acq_sig, free_sig)
+                       cohort_widened, members_sig, acq_sig, free_sig)
                 cache = self._stage_prepared
                 static_base = cache.get(key)
                 if static_base is None:
@@ -320,7 +396,9 @@ class _EnginePrepareMixin:
                         placement=lookup_stage.placement,
                         coupled=lookup_stage.coupled,
                         priority=lookup_stage.priority,
-                        cohort_size=cohort_size)
+                        cohort_size=cohort_size,
+                        cohort_widened=cohort_widened or None,
+                        cohort_members=raw_members or None)
                     object.__setattr__(static_base, "static_id", id(static_base))
                     if len(cache) >= 16384:
                         cache.clear()
@@ -347,7 +425,8 @@ class _EnginePrepareMixin:
                     static_base.demand_keys, static_base.solo_rates,
                     static_base.coupled_res_info,
                     static_base.uncoupled_res_info,
-                    static_base.pool_unit_masks)
+                    static_base.pool_unit_masks,
+                    static_base.cohort_widened, static_base.cohort_members)
             if len(id_cache) >= 16384:
                 id_cache.clear()
             id_cache[id(lookup_stage)] = (weakref.ref(lookup_stage), static)
@@ -363,7 +442,8 @@ class _EnginePrepareMixin:
                 _EMPTY_FROZENSET, 0, True, static.coupled_demand,
                 static.coupled_cap_limit, static.coupled_solo_rates,
                 _EMPTY_FROZENSET, static.solo_rates,
-                static.coupled_res_info, static.uncoupled_res_info, ())
+                static.coupled_res_info, static.uncoupled_res_info, (),
+                static.cohort_widened, static.cohort_members)
         if acquire.__class__ is not tuple:
             acquire = tuple(acquire)
         if free.__class__ is not tuple:
@@ -376,7 +456,8 @@ class _EnginePrepareMixin:
                 _EMPTY_FROZENSET, 0, True, static.coupled_demand,
                 static.coupled_cap_limit, static.coupled_solo_rates,
                 _EMPTY_FROZENSET, static.solo_rates,
-                static.coupled_res_info, static.uncoupled_res_info, ())
+                static.coupled_res_info, static.uncoupled_res_info, (),
+                static.cohort_widened, static.cohort_members)
         static_acq = static.acquire
         n_acq = len(acquire)
         if n_acq == len(static_acq):
@@ -385,16 +466,7 @@ class _EnginePrepareMixin:
                 s0 = static_acq[0]
                 if (a0.size == s0.size and a0.pool == s0.pool
                         and (a0.units is s0.units or a0.units == s0.units)):
-                    return _PreparedTask(
-                        static.demand, static.latency, static.caps, acquire, free,
-                        static.placement, static.coupled, static.allocation_demands,
-                        static.priority, static.cohort_size, static.acquire_assigns,
-                        static.free_pairs, static.acquire_pools, static.static_id,
-                        static.fits_empty_pools, static.coupled_demand,
-                        static.coupled_cap_limit, static.coupled_solo_rates,
-                        static.demand_keys, static.solo_rates,
-                        static.coupled_res_info, static.uncoupled_res_info,
-                        static.pool_unit_masks)
+                    return self.clone_prepared_scoped(static, acquire, free)
             elif n_acq == 2:
                 a0, a1 = acquire
                 s0, s1 = static_acq
@@ -403,16 +475,7 @@ class _EnginePrepareMixin:
                         and (a0.units is s0.units or a0.units == s0.units)
                         and a1.size == s1.size and a1.pool == s1.pool
                         and (a1.units is s1.units or a1.units == s1.units)):
-                    return _PreparedTask(
-                        static.demand, static.latency, static.caps, acquire, free,
-                        static.placement, static.coupled, static.allocation_demands,
-                        static.priority, static.cohort_size, static.acquire_assigns,
-                        static.free_pairs, static.acquire_pools, static.static_id,
-                        static.fits_empty_pools, static.coupled_demand,
-                        static.coupled_cap_limit, static.coupled_solo_rates,
-                        static.demand_keys, static.solo_rates,
-                        static.coupled_res_info, static.uncoupled_res_info,
-                        static.pool_unit_masks)
+                    return self.clone_prepared_scoped(static, acquire, free)
             else:
                 same_shape = True
                 for a_item, s_item in zip(acquire, static_acq):
@@ -422,16 +485,7 @@ class _EnginePrepareMixin:
                         same_shape = False
                         break
                 if same_shape and len({a.name for a in acquire}) == n_acq:
-                    return _PreparedTask(
-                        static.demand, static.latency, static.caps, acquire, free,
-                        static.placement, static.coupled, static.allocation_demands,
-                        static.priority, static.cohort_size, static.acquire_assigns,
-                        static.free_pairs, static.acquire_pools, static.static_id,
-                        static.fits_empty_pools, static.coupled_demand,
-                        static.coupled_cap_limit, static.coupled_solo_rates,
-                        static.demand_keys, static.solo_rates,
-                        static.coupled_res_info, static.uncoupled_res_info,
-                        static.pool_unit_masks)
+                    return self.clone_prepared_scoped(static, acquire, free)
         if n_acq == 1:
             allocation = acquire[0]
             size = allocation.size
@@ -465,7 +519,7 @@ class _EnginePrepareMixin:
                 static.coupled_cap_limit, static.coupled_solo_rates,
                 frozenset(k for k, _ in demands_tuple), static.solo_rates,
                 static.coupled_res_info, static.uncoupled_res_info,
-                p_masks_1)
+                p_masks_1, static.cohort_widened, static.cohort_members)
         pools = self.pools
         pool_units = self.pool_units
         demands = {}
@@ -502,15 +556,18 @@ class _EnginePrepareMixin:
             static.coupled_cap_limit, static.coupled_solo_rates,
             frozenset(demands), static.solo_rates,
             static.coupled_res_info, static.uncoupled_res_info,
-            _compute_pool_unit_masks(acquire))
+            _compute_pool_unit_masks(acquire),
+            static.cohort_widened, static.cohort_members)
 
     def prepare_stage(self, name, work=None, *, latency=0.0, caps=None,
                       acquire=(), free=(), placement=None, coupled=False,
-                      priority=0, cohort_size=1):
+                      priority=0, cohort_size=1, cohort_widened=None,
+                      cohort_members=None):
         return self._prepare(
             name, work, latency=latency, caps=caps, acquire=acquire,
             free=free, placement=placement, coupled=coupled, priority=priority,
-            cohort_size=cohort_size)
+            cohort_size=cohort_size, cohort_widened=cohort_widened,
+            cohort_members=cohort_members)
 
     def submit_prepared(self, prepared, name: str, *, after=(), release=None,
                         owner="", metadata=None, on_complete=None,

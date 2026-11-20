@@ -171,8 +171,20 @@ class _EngineSubmitMixin:
             prepared.priority, prepared.coupled, on_complete, on_start,
             None, {}, False, task_ledger, memory_replica, memory_stage, pools,
             bindings, (), prepared.cohort_size, prepared, None, native_hook,
+            prepared.cohort_widened, prepared.cohort_members,
         )
         tasks[event.sequence] = task
+        wave_rec = self._wave_recorder
+        if wave_rec is not None:
+            preds = (
+                (pending_one.sequence,) if pending_one is not None
+                else (tuple(p.sequence for p in pending) if pending is not None else ())
+            )
+            wave_rec.on_submit(
+                event.sequence, name,
+                aliases=(owner,) if owner else (),
+                predecessors=preds,
+            )
         if self.task_uses_fifo(task):
             self._fifo_live += 1
         if self.task_blocks_native(task):
@@ -297,9 +309,21 @@ class _EngineSubmitMixin:
             None, {}, False,
             ledger if host_accounting else None, memory_replica,
             memory_stage, pools,
-            bindings, (), prepared.cohort_size, prepared, obs,
+            bindings, (), prepared.cohort_size, prepared, obs, False,
+            prepared.cohort_widened, prepared.cohort_members,
         )
         tasks[seq_launch] = task
+        wave_rec = self._wave_recorder
+        if wave_rec is not None:
+            preds = (
+                (pending_one.sequence,) if pending_one is not None
+                else (tuple(p.sequence for p in pending) if pending is not None else ())
+            )
+            wave_rec.on_submit(
+                seq_launch, name,
+                aliases=(owner,) if owner else (),
+                predecessors=preds,
+            )
         if self.task_uses_fifo(task):
             self._fifo_live += 1
         if self.task_blocks_native(task):

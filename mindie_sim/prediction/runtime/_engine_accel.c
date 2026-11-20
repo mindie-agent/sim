@@ -177,4 +177,5 @@ static int32_t build_order(msim_ctx *c, int32_t r, int32_t *n_out)
 }
 
 #include "_engine_accel_submit.h"
+#include "_engine_accel_terms.h"
 #include "_engine_accel_abi.h"

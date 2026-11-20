@@ -248,7 +248,7 @@ def _stable_task_payloads(task, engine=None) -> bool:
             return False
         if any(type(unit) is not int for unit in units):
             return False
-    return True
+    return _inert_str_tuple(task.cohort_widened) and type(task.cohort_members) is tuple
 
 
 def callback_capable(task, engine=None) -> bool:
@@ -306,6 +306,8 @@ def pure_task(engine, task) -> bool:
     if (task.start_callback is not None or task.acquire or task.free
             or task.allocation_demands):
         return False
+    if task.cohort_widened and len(task.remaining) > MAX_U:
+        return False
     # An ordinary callback stays Python.  A declared native boundary hook is
     # marked ``MSIM_F_CALLBACK``, so the kernel halts at that exact instant.
     if task.callback is not None and not task.native_hook:
@@ -345,16 +347,6 @@ def pure_task(engine, task) -> bool:
             for unit in units:
                 if type(unit) is not int or unit < 0 or unit >= limit:
                     return False
-    if task.coupled and len(task.remaining) > 1 and task.placement:
-        u0 = tot0 = 0
-        for name in task.remaining:
-            res_obj = engine.resources[name]
-            units = task.placement.get(name)
-            ulen = res_obj.units if units is None else len(units)
-            if tot0 == 0:
-                u0, tot0 = ulen, res_obj.units
-            elif ulen * tot0 != u0 * res_obj.units:
-                return False
     return True
 
 #: Boundary kinds returned by ``msim_ctx_run``.
@@ -604,7 +596,8 @@ class Arena:
         place = 0
         li = 0
         for i, row in enumerate(tasks):
-            seq, flags, prio, cohort, waiting, start, latency, release, links = row
+            seq, flags, prio, cohort, waiting, start, latency, release, links = row[:9]
+            widened_mask = int(row[9]) if len(row) > 9 else 0
             # Representable bounds are enforced *before* ctypes packing so a
             # wide Python integer can never wrap into a valid-looking cell.
             if not isinstance(prio, int) or isinstance(prio, bool) or prio < 0 \
@@ -622,7 +615,7 @@ class Arena:
             self.rows[base + 2] = prio
             self.rows[base + 3] = cohort
             self.rows[base + 4] = waiting
-            self.rows[base + 5] = 0
+            self.rows[base + 5] = widened_mask
             self.rows[base + 6] = bits(start)
             self.rows[base + 7] = bits(latency)
             self.rows[base + 8] = bits(release)

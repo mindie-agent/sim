@@ -154,6 +154,8 @@ class _Task:
     #: before Python admits the pre-prepared successors.  Only rows whose hook
     #: is virtual-time independent set this.
     native_hook: bool = False
+    cohort_widened: tuple[str, ...] = ()
+    cohort_members: tuple[tuple[str, tuple[tuple[int, ...], ...]], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,6 +185,8 @@ class _PreparedTask:
     coupled_res_info: dict[str, tuple[float, float, float, float, tuple[int, ...] | None]] | None = None
     uncoupled_res_info: dict[str, tuple[float, float, float, float, float, tuple[int, ...] | None]] | None = None
     pool_unit_masks: tuple[tuple[str, int], ...] | None = ()
+    cohort_widened: tuple[str, ...] = ()
+    cohort_members: tuple[tuple[str, tuple[tuple[int, ...], ...]], ...] = ()
 
 
 _EMPTY_TASK = _PreparedTask({}, 0.0, {}, (), (), {}, False, (), 0)

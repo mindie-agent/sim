@@ -68,6 +68,8 @@ MSIM_EXPORT int32_t msim_ctx_reset(void *ctx)
     c->heap_n = 0; c->rheap_n = 0; c->cheap_n = 0; c->act_n = 0;
     c->resume_compl = 0;
     c->pending_hold = 0;
+    c->obs_count = 0; c->obs_overflow = 0;
+    c->pt_nprogs = 0; c->pt_nterms = 0; c->pt_ndels = 0; c->pt_nctrs = 0;
     if (!msim_grow((void **)&c->free, &c->free_cap, c->task_cap, sizeof(int32_t)))
         return -1;
     for (i = 0; i < c->task_cap; i++) {
@@ -632,6 +634,14 @@ drain_compl_snapshot:
             next_time = now + dt;
             if (dt > 0.0 && next_time == now) next_time = nextafter(now, INFINITY);
             if (!(next_time > now)) { rc = MSIM_E_STALL; goto fail; }
+            if (c->obs_buf != NULL && c->obs_count > 0 && dt > 0.0) {
+                uint32_t need_obs = 0;
+                for (i = 0; i < c->nl; i++) {
+                    msim_link *l = &c->link[i];
+                    if (l->rate > 0.0 && l->rem > 0.0 && c->task[l->task].state == 1) need_obs++;
+                }
+                if (c->obs_count + need_obs > c->obs_cap) { boundary = MSIM_B_OUTPUT; goto done; }
+            }
             for (i = 0; i < c->nres; i++) {
                 int32_t k2, any = 0;
                 for (k2 = 0; k2 < c->nl; k2++) {
@@ -660,6 +670,12 @@ drain_compl_snapshot:
                     l->svc += used;
                     c->serv[l->res] += used;
                     l->rem = residual;
+                    if (c->obs_buf != NULL && dt > 0.0) {
+                        uint32_t owner_u = l->plen > 0 ? c->units[l->pstart] : 0u;
+                        msim_emit_obs_service(
+                            c, now, next_time, c->task[l->task].seq,
+                            (uint32_t)l->res, owner_u, used);
+                    }
                 }
             }
             now = next_time;

@@ -207,14 +207,16 @@ static bool rates_overlap(msim_ctx *c, const int32_t *idx, int32_t n,
     return true;
 }
 
-/* Python ``_tier_flows`` normalizes a coupled span by the participating
- * units' share ``(rate / units) * len(placement)``; using the full aggregate
- * rate makes pinned and unpinned peers advance on different clocks. */
-static double coupled_scale(const msim_ctx *c, const msim_link *l)
+/* Normalize a coupled span by one cohort member's bottleneck duration:
+ * explicitly widened disjoint placements already span ``cohort`` members'
+ * units, while unplaced or shared-unit links multiply denominator by
+ * ``cohort`` once so demand is never scaled twice. */
+static double coupled_scale(const msim_ctx *c, const msim_link *l, uint64_t cohort)
 {
     const msim_res *res = &c->res[l->res];
     int32_t len = unit_len(c, l);
     double denom = (res->rate / (double)res->units) * (double)len;
+    if (cohort > 1 && !l->widened) denom *= (double)cohort;
     if (denom <= 0.0) return INFINITY;
     return l->rem / denom;
 }
@@ -223,7 +225,7 @@ static double coupled_scale(const msim_ctx *c, const msim_link *l)
 static int32_t rates_coupled(msim_ctx *c)
 {
     int32_t nf = 0, nc = 0, nslot = 0, nent = 0, owner_n = 0, ti, k, r, i;
-    int32_t total_u = 0;
+    int32_t total_u = 0, nact = 0;
     int32_t *ohead = c->ohead, *onext = c->onext, *oslot = c->oslot;
     msim_task *T = c->task;
     msim_link *L = c->link;
@@ -234,9 +236,23 @@ static int32_t rates_coupled(msim_ctx *c)
     msim_row *row = c->row;
 
     for (r = 0; r < c->nres; r++) c->fifo_first[r] = -1;
-    for (ti = 0; ti < c->task_cap; ti++) {
-        msim_task *t = &T[ti];
-        if (t->state != 1 || t->nlink <= 0) continue;
+    /* Sort active task slots by ascending ``seq`` to match Python
+     * ``sorted(active)`` binary64 summation order bit-for-bit. */
+    for (i = 0; i < c->act_n; i++) {
+        int32_t cur = c->act[i], pos;
+        if (T[cur].state != 1) continue;
+        pos = nact;
+        while (pos > 0 && T[c->idx[pos - 1]].seq > T[cur].seq) {
+            c->idx[pos] = c->idx[pos - 1];
+            pos--;
+        }
+        c->idx[pos] = cur;
+        nact++;
+    }
+    for (i = 0; i < nact; i++) {
+        msim_task *t = &T[c->idx[i]];
+        ti = c->idx[i];
+        if (t->nlink <= 0) continue;
         for (k = 0; k < (int32_t)t->nlink; k++) {
             int32_t li = (int32_t)t->lstart + k, rr;
             if (L[li].rem <= 0.0) continue;
@@ -245,10 +261,11 @@ static int32_t rates_coupled(msim_ctx *c)
                     || proxy_less(c, ti, c->fifo_first[rr]))) c->fifo_first[rr] = ti;
         }
     }
-    for (ti = 0; ti < c->task_cap; ti++) {
-        msim_task *t = &T[ti];
+    for (i = 0; i < nact; i++) {
+        msim_task *t;
         int32_t na = 0, groups, gi, act[MSIM_MAX_R];
-        if (t->state != 1) continue;
+        ti = c->idx[i];
+        t = &T[ti];
         for (k = 0; k < (int32_t)t->nlink; k++) {
             int32_t li = (int32_t)t->lstart + k;
             if (L[li].rem > 0.0) {
@@ -262,6 +279,7 @@ static int32_t rates_coupled(msim_ctx *c)
             int32_t cnt = groups == 1 ? na : 1;
             double scale;
             msim_flow *f;
+            uint64_t cohort = (t->flags & MSIM_F_COUPLED) ? t->cohort : 1u;
             if (nf >= MSIM_MAX_F) return MSIM_E_ARITH;
             if (!msim_fits((size_t)nc, (size_t)cnt, (size_t)MSIM_MAX_COEF))
                 return MSIM_E_ARITH;
@@ -269,15 +287,14 @@ static int32_t rates_coupled(msim_ctx *c)
             f->task = ti; f->coeff_start = nc; f->coeff_count = cnt;
             f->limit = INFINITY; f->assigned = 0.0; ohead[nf] = -1;
             if (cnt == 1) {
-                scale = coupled_scale(c, &L[act[gi]]);
+                scale = coupled_scale(c, &L[act[gi]], cohort);
             } else {
                 scale = -INFINITY;
                 for (k = 0; k < cnt; k++) {
-                    double sm = coupled_scale(c, &L[act[k]]);
+                    double sm = coupled_scale(c, &L[act[k]], cohort);
                     if (sm > scale) scale = sm;
                 }
             }
-            if ((t->flags & MSIM_F_COUPLED) && t->cohort > 1) scale /= (double)t->cohort;
             if (!isfinite(scale) || scale <= 0.0) return MSIM_E_ARITH;
             for (k = 0; k < cnt; k++) {
                 int32_t li = groups == 1 ? act[k] : act[gi], rr = L[li].res;

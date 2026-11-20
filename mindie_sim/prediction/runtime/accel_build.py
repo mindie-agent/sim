@@ -50,6 +50,7 @@ SOURCE_NAMES = (
     "_engine_accel_core.h",
     "_engine_accel_rates.h",
     "_engine_accel_submit.h",
+    "_engine_accel_terms.h",
 )
 CACHE_SUBDIR = ("mindie", "sim", "engine")
 COMPILE_TIMEOUT_SECONDS = 20.0

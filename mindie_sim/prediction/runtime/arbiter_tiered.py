@@ -144,11 +144,14 @@ def _tier_flows(resources, tasks, tier, unit_remaining, fifo_winners) -> list:
             if blocked or not spans:
                 continue
             cohort = max(1, int(getattr(task, "cohort_size", 1) or 1))
+            widened_set = getattr(task, "cohort_widened", ())
             scale = 0.0
             for name, units in spans.items():
                 capacity = resources[name].rate / max(
                     1, int(resources[name].units))
                 denominator = capacity * len(units)
+                if cohort > 1 and name not in widened_set:
+                    denominator *= cohort
                 if denominator <= 0.0:
                     scale = math.inf
                     break
@@ -161,7 +164,7 @@ def _tier_flows(resources, tasks, tier, unit_remaining, fifo_winners) -> list:
             rates: list[tuple[str, float]] = []
             terms: list[tuple[str, int, float]] = []
             for name, units in spans.items():
-                demand = float(remaining[name]) / scale * cohort
+                demand = float(remaining[name]) / scale
                 rates.append((name, demand))
                 weight = demand / len(units)
                 terms.extend((name, unit, weight) for unit in units)

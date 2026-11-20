@@ -152,11 +152,23 @@ typedef struct {
     int32_t plen;
     int32_t pstart;
     int32_t mode;           /* partition group id, -1 otherwise */
+    uint8_t widened;        /* 1 when placement is disjointly widened over cohort */
     double rem;
     double cap;
     double rate;
     double svc;             /* accumulated ``task.service`` for this link */
 } msim_link;
+
+typedef struct {
+    uint64_t t_start_ns;
+    uint64_t t_end_ns;
+    uint64_t task_id;
+    uint32_t pipe_id;
+    uint32_t owner_id;
+    uint16_t kind;
+    uint16_t reason_code;
+    double work_done;
+} msim_obs;
 
 typedef struct {
     double rate;
@@ -238,6 +250,20 @@ typedef struct msim_ctx {
     int32_t *onext;
     int32_t *oslot;
     int32_t own_cap;          /* grown owner/entry scratch capacity */
+    /* Caller-owned observation buffer (non-owning pointer, never freed). */
+    msim_obs *obs_buf;
+    uint32_t obs_cap, obs_count, obs_overflow;
+    /* Prepared-terms epoch solver tables (owned by ctx). */
+    void *pt_rows;
+    void *pt_progs;
+    void *pt_terms;
+    void *pt_dels;
+    double *pt_ctrs;
+    int32_t pt_nrows, pt_row_cap;
+    int32_t pt_nprogs, pt_prog_cap;
+    int32_t pt_nterms, pt_term_cap;
+    int32_t pt_ndels, pt_del_cap;
+    int32_t pt_nctrs, pt_ctr_cap;
 } msim_ctx;
 
 /* -- validated helpers -------------------------------------------------- */
@@ -414,6 +440,8 @@ static void msim_ctx_release(msim_ctx *c)
     free(c->coef); free(c->flow); free(c->entry); free(c->slot); free(c->row);
     free(c->slot_rem); free(c->slot_slope); free(c->slot_bounds);
     free(c->ohead); free(c->onext); free(c->oslot);
+    free(c->pt_rows); free(c->pt_progs); free(c->pt_terms);
+    free(c->pt_dels); free(c->pt_ctrs);
     memset(c, 0, sizeof *c);
     free(c);
 }
