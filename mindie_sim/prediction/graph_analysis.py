@@ -408,7 +408,8 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
             if signature not in cohort_cache:
                 report = cohort_operator_costs(
                     case, {item["replica"]: item["op"] for item in participants},
-                    recipes=book, primitives=primitives, replay_scope=scopes)
+                    recipes=book, primitives=primitives, replay_scope=scopes,
+                    evaluation=ctx, stream_plans=stream_plans)
                 report["id"] = f"cohort{len(cohort_cache)}"
                 report["occurrences"] = 0
                 for row in report["operators"]:
@@ -428,10 +429,12 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
         for r, items in graphs.items():
             local = tuple(op for op in items if (r, op.op_id) not in joint_nodes)
             report = operator_costs(case, local, recipes=book, primitives=primitives,
-                                    replay_scope=scopes[r], replica=r)
+                                    replay_scope=scopes[r], replica=r,
+                                    evaluation=ctx, stream_plans=stream_plans)
             for row in report["operators"]:
                 costs.append({"replica": r, **row})
-                durations[r, row["operator"]["stage"], row["physical_id"]] = row["duration_ms"]
+                row_stream = (row["operator"].get("stream") or "main") if stream_plans else ""
+                durations[r, row["operator"]["stage"], row["physical_id"], row_stream] = row["duration_ms"]
         isolated_sum = sum(row["total_ms"] for row in costs)
     profile = None
     if compact:
@@ -535,8 +538,9 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
                     rank.update(cohort_id=record["cohort_id"],
                                 isolation_boundary="complete_collective_cohort")
                 else:
+                    op_stream = (op.stream or "main") if stream_plans else ""
                     iso = (0 if op.family == "barrier"
-                           else durations[r, op.stage, physical_id(op)])
+                           else durations[r, op.stage, physical_id(op), op_stream])
                     record["isolated_ms"] = iso
                 rank["isolated_ms"] = rank.get("isolated_ms", 0.0) + iso
                 stats["isolated_ms"] = stats.get("isolated_ms", 0.0) + iso
@@ -580,8 +584,9 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
                     precedence_ms=0, cohort_id=record["cohort_id"],
                     isolation_boundary="complete_collective_cohort")
             else:
+                op_stream = (op.stream or "main") if stream_plans else ""
                 row["isolated_ms"] = (0 if op.family == "barrier"
-                                      else durations[r, op.stage, physical_id(op)])
+                                      else durations[r, op.stage, physical_id(op), op_stream])
         rows.append(row)
     isolated_profile = None
     if compact and isolated:
@@ -612,7 +617,8 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
         "capacity_per_ms": engine.resources[name].rate,
         "capacity_bound_ms": amount / engine.resources[name].rate,
         "busy_ms": engine.busy_ms[name],
-    } for name, amount in engine.serviced.items() if amount]
+    } for name, amount in engine.serviced.items()
+        if amount and "stream_quota@" not in name]
     resources.sort(key=lambda row: row["capacity_bound_ms"], reverse=True)
     accel_view = engine.accel_status()
     accel_view = engine.accel_status()

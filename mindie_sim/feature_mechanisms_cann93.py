@@ -125,7 +125,7 @@ def _apply_cann_megamoe(rt: dict[str, Any], ctx: MechanismContext) -> None:
         return
     if not _ep_within_ub_domain(ctx):
         return
-    if bool(rt.get("enable_dbo", False)) or int(ctx.parallel.get("redundant_experts_per_rank", 0) or 0) > 0:
+    if int(ctx.parallel.get("redundant_experts_per_rank", 0) or 0) > 0:
         return
     has_latent_or_situ = any(
         p.ffn == "moe" and (p.expert_latent_size > 0 or p.ffn_activation == "situ")

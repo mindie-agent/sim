@@ -11,7 +11,7 @@ from dataclasses import dataclass, replace
 import math
 from types import MappingProxyType
 
-from mindie_sim.schema.common import dtype_bytes
+from mindie_sim.schema.common import ModelingError, dtype_bytes
 from .engine import Allocation
 from .program import (KernelProgram, ParallelProgram, PipelinePhase,
                       PipelineProgram, PipelineTemplate,
@@ -199,7 +199,12 @@ class _TiledGeometry:
         self.nn = _ceil_div(self.n, recipe.tile_n)
         self.nk = _ceil_div(self.k, recipe.tile_k)
         self.tiles = self.groups * self.nm * self.nn
-        self.cores = int(context.core_count)
+        effective_cores = int(getattr(context, "effective_aic_cores", context.core_count))
+        if getattr(context, "stream_owners", None) is not None and effective_cores <= 0:
+            raise ModelingError(
+                f"stream_zero_aic_budget:{op.stream or 'main'}:{op.op_id}"
+            )
+        self.cores = max(1, effective_cores)
         self.epilogue = MatrixEpilogue.from_op(op)
         self.input_bytes, self.weight = self.epilogue.operands(op)
         names = context.resource_names

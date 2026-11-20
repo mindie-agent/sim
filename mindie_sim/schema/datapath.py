@@ -14,13 +14,13 @@
 """
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import NewType
 
 from .common import ModelingError
 from .compute_arch import ComputeArchSpec, DataPath
-from .hardware import Device
+from .hardware import Device, Link
 
 ArchId = NewType("ArchId", str)
 DieSpec = Device
@@ -193,9 +193,63 @@ def datapath_for_die(
     )
 
 
+def _ub_channel_names(
+    transfer_channels: Mapping[str, object] | Sequence[tuple[str, object]] = (),
+) -> tuple[frozenset[str], bool]:
+    if not transfer_channels:
+        return frozenset(), False
+    entries = (
+        transfer_channels.items()
+        if isinstance(transfer_channels, Mapping)
+        else transfer_channels
+    )
+    ub: set[str] = set()
+    has_entries = False
+    for channel, spec in entries:
+        has_entries = True
+        mapping = dict(spec) if isinstance(spec, (Mapping, tuple, list)) else {}
+        protocol = str(mapping.get("protocol") or "").strip().upper()
+        if protocol == "UB" or protocol.startswith("UB_"):
+            ub.add(str(channel))
+    return frozenset(ub), has_entries
+
+
+def ub_peer_edges_for_rank(
+    rank: int,
+    links: Sequence[Link] = (),
+    transfer_channels: Mapping[str, object] | Sequence[tuple[str, object]] = (),
+) -> tuple[tuple[int, int], ...]:
+    """Derive sorted directed UB direct-mesh peer edges ``(rank, peer)`` from ``links``."""
+    if not links:
+        return ()
+    target = int(rank)
+    ub_channels, has_channels = _ub_channel_names(transfer_channels)
+    edges: set[tuple[int, int]] = set()
+    for link in links:
+        if target not in link.members:
+            continue
+        is_ub = (
+            link.channel in ub_channels
+            or str(link.channel).lower().startswith("ub_")
+            or (not has_channels and link.semantics == "per_pair")
+        )
+        if not is_ub:
+            continue
+        for member in link.members:
+            peer = int(member)
+            if peer != target:
+                edges.add((target, peer))
+    return tuple(sorted(edges))
+
+
 def _arch_capability_key(spec: ComputeArchSpec) -> tuple:
     return (
         spec.preset,
+        tuple(
+            (s.name, s.unit, s.owner_axis, s.per_owner_rate, s.scale_with,
+             s.resource, s.clock_hz, s.cycles_per_unit)
+            for s in spec.instruction_services
+        ),
         tuple((r.name, r.bits, r.roles, r.alignment_bytes) for r in spec.representations),
         tuple((m.name, m.kind, m.operands, m.unit, m.accumulators, m.implementations)
               for m in spec.native_modes),
@@ -206,25 +260,47 @@ def _arch_capability_key(spec: ComputeArchSpec) -> tuple:
     )
 
 
+def _homogeneity_key(spec: DatapathCapabilitySpec) -> tuple:
+    return (
+        spec.compute_arch.arch_id,
+        spec.aic_count,
+        spec.aiv_count,
+        spec.aic_aiv_pairs,
+        tuple((p.name, p.source, p.target, p.unit, p.executor, p.sync)
+              for p in spec.usable_paths),
+        tuple(sorted(spec.matrix_output_paths)),
+        len(spec.ub_peer_edges),
+        (None if spec.stars is None else (
+            spec.stars.resource, spec.stars.slots_per_die,
+            spec.stars.descriptor_path.name)),
+    )
+
+
 def datapath_for_devices(
     devices: Sequence[Device],
     /,
+    *,
+    links: Sequence[Link] = (),
+    transfer_channels: Mapping[str, object] | Sequence[tuple[str, object]] = (),
 ) -> tuple[ComputeArchSpec, DatapathCapabilitySpec]:
-    """Validate homogeneous ``compute_arch`` and datapath routes across stage dies."""
+    """Validate homogeneous ``compute_arch``, owner counts, and datapath across stage dies."""
     dies = tuple(devices)
     if not dies:
         raise ModelingError("stage_devices_empty")
     first_arch = dies[0].compute_arch
     first_key = _arch_capability_key(first_arch)
-    first_datapath = datapath_for_die(dies[0])
+    first_edges = ub_peer_edges_for_rank(dies[0].rank, links, transfer_channels)
+    first_datapath = datapath_for_die(dies[0], ub_peer_edges=first_edges)
+    first_dp_key = _homogeneity_key(first_datapath)
     for die in dies[1:]:
         if _arch_capability_key(die.compute_arch) != first_key:
             raise ModelingError(
                 "stage_devices_heterogeneous_compute_arch:"
                 f"{first_arch.preset}:{die.compute_arch.preset}"
             )
-        other_datapath = datapath_for_die(die)
-        if other_datapath.matrix_output_paths != first_datapath.matrix_output_paths:
+        other_edges = ub_peer_edges_for_rank(die.rank, links, transfer_channels)
+        other_datapath = datapath_for_die(die, ub_peer_edges=other_edges)
+        if _homogeneity_key(other_datapath) != first_dp_key:
             raise ModelingError(
                 "stage_devices_heterogeneous_datapath:"
                 f"{first_datapath.arch_id}:{other_datapath.arch_id}"
@@ -242,4 +318,5 @@ __all__ = [
     "StarsQueueSpec",
     "datapath_for_devices",
     "datapath_for_die",
+    "ub_peer_edges_for_rank",
 ]

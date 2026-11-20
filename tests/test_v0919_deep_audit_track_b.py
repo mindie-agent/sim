@@ -422,20 +422,23 @@ def test_local_tp_quantizer_and_gemm_derive_the_same_scale_geometry():
 
 
 def test_dbo_join_waits_for_every_partition_sink():
-    # Framework graph layer no longer performs whole-graph DBO splitting;
-    # enable_dbo keeps a single unsplit graph without synthetic dbo.join barriers.
+    # Whole-graph DBO splitting has been removed; explicit enable_dbo=True
+    # fails honestly with UnmodeledCapabilityError until Stage 3 in-op DBO lands.
+    from mindie_sim.public.errors import UnmodeledCapabilityError
+
     raw = compose_case(
         "qwen3-32b", hardware="a5", tp=1, ep=1, num_devices=1, layers=1,
         enable_dbo=True, max_num_batched_tokens=128, max_num_seqs=2,
         prompt_tokens=64, output_tokens=2)
-    graphs = target_graphs(
-        parse_case(raw), phase="decode", tokens=1, context=64,
-        sequences=2, scope="body")
-    assert not [op for op in graphs[0] if op.op_id.endswith("dbo.join")]
-    assert not [op for op in graphs[0] if op.op_id.startswith("dbo")]
+    with pytest.raises(UnmodeledCapabilityError, match="unmodeled_in_op_dbo_pending_stage3"):
+        target_graphs(
+            parse_case(raw), phase="decode", tokens=1, context=64,
+            sequences=2, scope="body")
 
 
 def test_dbo_moe_partition_reduces_the_global_row_ledger_without_doubling():
+    from mindie_sim.public.errors import UnmodeledCapabilityError
+
     def grouped(enable_dbo):
         raw = compose_case(
             "qwen3-30b-a3b", hardware="a5", tp=1, dp=2, ep=2,
@@ -448,16 +451,17 @@ def test_dbo_moe_partition_reduces_the_global_row_ledger_without_doubling():
                      if op.recipe in {"grouped_gate_up", "grouped_down"})
 
     direct = grouped(False)
-    with_flag = grouped(True)
-    assert len(with_flag) == len(direct)
-    assert sum(op.flops for op in with_flag) == pytest.approx(
-        sum(op.flops for op in direct))
+    assert len(direct) >= 2
+    with pytest.raises(UnmodeledCapabilityError, match="unmodeled_in_op_dbo_pending_stage3"):
+        grouped(True)
 
 
 def test_dbo_qualifies_shared_expert_stream_per_partition():
+    from mindie_sim.public.errors import UnmodeledCapabilityError
+
     raw = compose_case(
         "deepseek-v4-pro", hardware="a5", tp=1, dp=1, ep=1,
-        num_devices=1, layers=1, enable_dbo=True,
+        num_devices=1, layers=1, enable_dbo=False,
         multistream_overlap_shared_expert=True,
         prompt_tokens=8, output_tokens=2, max_num_seqs=2)
     graphs = target_graphs(
@@ -466,6 +470,16 @@ def test_dbo_qualifies_shared_expert_stream_per_partition():
     streams = {op.stream for op in graphs[0] if "shared" in op.stream}
     assert "shared_stream" in streams
     assert not any(stream.startswith("dbo") for stream in streams)
+
+    raw_dbo = compose_case(
+        "deepseek-v4-pro", hardware="a5", tp=1, dp=1, ep=1,
+        num_devices=1, layers=1, enable_dbo=True,
+        multistream_overlap_shared_expert=True,
+        prompt_tokens=8, output_tokens=2, max_num_seqs=2)
+    with pytest.raises(UnmodeledCapabilityError, match="unmodeled_in_op_dbo_pending_stage3"):
+        target_graphs(
+            parse_case(raw_dbo), phase="decode", tokens=1, context=32,
+            sequences=2, scope="body")
 
 
 def test_pd_handoff_intersects_token_spans_before_charging_rows():
@@ -740,25 +754,12 @@ def _dbo_gate_rows(sequences):
 
 
 def test_dbo_microbatches_conserve_assignments_and_split_the_ep_cohort():
-    graphs = _dbo_gate_rows([2, 3])
-    per_rank = []
-    for replica in (0, 1):
-        assert not [op for op in graphs[replica] if op.op_id.startswith("dbo")]
-        gates = [op for op in graphs[replica] if op.recipe == "grouped_gate_up"]
-        assert len(gates) == 1
-        per_rank.append(gates[0].local_shape[0])
-    assert per_rank == [20, 20]
-    assert sum(per_rank) == 40
+    from mindie_sim.public.errors import UnmodeledCapabilityError
 
-    graphs = _dbo_gate_rows([2, 1])
-    for replica in (0, 1):
-        dispatches = [op for op in graphs[replica]
-                      if op.recipe == "expert_dispatch"]
-        assert len(dispatches) == 1
-        assert not [op for op in graphs[replica]
-                    if op.op_id.startswith("dbo")]
-        gates = [op for op in graphs[replica] if op.recipe == "grouped_gate_up"]
-        assert sum(op.local_shape[0] for op in gates) == 12
+    with pytest.raises(UnmodeledCapabilityError, match="unmodeled_in_op_dbo_pending_stage3"):
+        _dbo_gate_rows([2, 3])
+    with pytest.raises(UnmodeledCapabilityError, match="unmodeled_in_op_dbo_pending_stage3"):
+        _dbo_gate_rows([2, 1])
 
 
 def test_local_tp_packed_views_use_the_parent_row_stride():

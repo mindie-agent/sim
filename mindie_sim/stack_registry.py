@@ -120,6 +120,37 @@ def _stack_name_for_case(case: Case, requested: str | None) -> str:
     return DEFAULT_STACK_NAME
 
 
+def _mtp_proposal_tokens(case: Case) -> int:
+    """Resolve draft/MTP proposal token count matching ``scheduler.py``."""
+    dspark = getattr(case.runtime, "dspark", None)
+    if dspark is not None:
+        step_spec = dspark.step_spec()
+        if getattr(step_spec, "draft_len", 0):
+            return int(step_spec.draft_len)
+    meta = dict(case.runtime.metadata)
+    spec = meta.get("speculative")
+    if isinstance(spec, Mapping):
+        for key in ("draft_tokens", "proposal_tokens", "num_speculative_tokens", "draft_len"):
+            val = spec.get(key)
+            if val:
+                return int(val)
+    elif spec is not None:
+        for attr in ("draft_tokens", "proposal_tokens", "num_speculative_tokens", "draft_len"):
+            val = getattr(spec, attr, 0)
+            if val:
+                return int(val)
+    if meta.get("draft_proposal_tokens"):
+        return int(meta["draft_proposal_tokens"])
+    aux = getattr(case.model, "auxiliary", None)
+    mtp = getattr(aux, "mtp", None) if aux is not None else None
+    if mtp is not None and getattr(mtp, "proposal_tokens", 0):
+        return int(mtp.proposal_tokens)
+    model_spec = getattr(case.model, "speculative", None)
+    if model_spec is not None and getattr(model_spec, "proposal_tokens", 0):
+        return int(model_spec.proposal_tokens)
+    return 0
+
+
 def _apply_production_decode_capture(
     case: Case,
     request: LoweringRequest,
@@ -127,7 +158,12 @@ def _apply_production_decode_capture(
 ) -> Case:
     if not request.production_capture or request.step is None or request.step.phase != "decode":
         return case
-    if case.runtime.graph_capture_mode == stack.decode_capture_mode:
+    target_mode = (
+        stack.decode_capture_mode
+        if stack.decode_capture_mode and stack.decode_capture_mode != "none"
+        else "full"
+    )
+    if case.runtime.graph_capture_mode == target_mode and case.runtime.graph_capture_keys:
         return case
     max_seqs = max(
         MIN_CAPTURE_SEQS,
@@ -135,11 +171,11 @@ def _apply_production_decode_capture(
         request.step.sequences if isinstance(request.step.sequences, int)
         else max(request.step.sequences, default=1),
     )
-    mtp = int(case.runtime.mtp_proposal_tokens or 0)
+    mtp = _mtp_proposal_tokens(case)
     keys = tuple(case.runtime.graph_capture_keys or capture_keys(max_seqs, mtp))
     runtime = replace(
         case.runtime,
-        graph_capture_mode=stack.decode_capture_mode,
+        graph_capture_mode=target_mode,
         graph_capture_keys=keys,
     )
     return replace(case, runtime=runtime)

@@ -83,3 +83,80 @@ def test_arch_governance_rules_ag001_through_ag005_and_differential_mode(tmp_pat
         v.path.as_posix().startswith("mindie_sim/prediction/operators/demo/")
         for v in delta
     )
+
+
+def test_arch_governance_tightened_loopholes(tmp_path):
+    pkg = tmp_path / "mindie_sim" / "prediction"
+    fam = pkg / "operators" / "demo"
+    fam.mkdir(parents=True)
+    # Owning family __init__.py static absolute import is allowed; aliased __all__ re-export is rejected.
+    (fam / "__init__.py").write_text(
+        "import mindie_sim.prediction.operators.demo.arch22 as engine\n"
+        "__all__ = ['engine']\n",
+        encoding="utf-8",
+    )
+    # AG005 loopholes: comment (not docstring) Upstream-ABI, bare AnnAssign STRATEGY, 7-char SHA.
+    (fam / "arch22.py").write_text(
+        "# Upstream-ABI: fake_comment_abi\n"
+        "from mindie_sim.schema.datapath import SourceRef\n"
+        "STRATEGY: object\n"
+        "SOURCES = (\n"
+        "    SourceRef('cann/ops-transformer', '2d3f4f6', 'a/b.cpp', '0' * 64),\n"
+        ")\n",
+        encoding="utf-8",
+    )
+    # Keyword family directory must be rejected as an unmanaged ISA leaf (AG001).
+    kw_fam = pkg / "operators" / "class"
+    kw_fam.mkdir(parents=True)
+    (kw_fam / "arch22.py").write_text("X = 1\n", encoding="utf-8")
+
+    # AG003/AG004 subscript & compute_peaks map truthiness sniffing.
+    (pkg / "subscript_sniff.py").write_text(
+        "def g(ctx):\n"
+        "    if 'mte2_aiv_dram' in ctx['service_modes']:\n"
+        "        return 1\n"
+        "    if ctx.compute_peaks:\n"
+        "        return 2\n"
+        "    if 'fp8' in ctx['compute_peaks']:\n"
+        "        return 3\n"
+        "    return 0\n",
+        encoding="utf-8",
+    )
+
+    found = arch_gov.scan_repository(tmp_path)
+    by_file: dict[str, list[arch_gov.Violation]] = {}
+    for item in found:
+        by_file.setdefault(item.path.as_posix(), []).append(item)
+
+    init_msgs = [v.message for v in by_file.get("mindie_sim/prediction/operators/demo/__init__.py", ())]
+    assert any("must not re-export leaf 'engine'" in m for m in init_msgs)
+    assert not any("forbidden leaf access" in m for m in init_msgs)
+
+    leaf_msgs = [v.message for v in by_file.get("mindie_sim/prediction/operators/demo/arch22.py", ())]
+    assert any("module docstring" in m for m in leaf_msgs)
+    assert any("STRATEGY" in m for m in leaf_msgs)
+    assert any("malformed SourceRef" in m or "SourceRef must statically" in m for m in leaf_msgs)
+
+    kw_rules = {v.rule for v in by_file.get("mindie_sim/prediction/operators/class/arch22.py", ())}
+    assert "AG001" in kw_rules
+
+    sniff_rules = {v.rule for v in by_file.get("mindie_sim/prediction/subscript_sniff.py", ())}
+    assert {"AG003", "AG004"} <= sniff_rules
+
+    # Valid leaf scanned with --refs-root pointing at a directory lacking the repo must emit AG005.
+    valid_sha = "a" * 64
+    valid_rev = "b" * 40
+    (fam / "arch22.py").write_text(
+        '"""Valid leaf.\n\nUpstream-ABI: aclnnDemo\n"""\n'
+        "from mindie_sim.schema.datapath import SourceRef\n"
+        "STRATEGY = object()\n"
+        f"SOURCES = (SourceRef('cann/missing-repo', '{valid_rev}', 'src/a.cpp', '{valid_sha}'),)\n",
+        encoding="utf-8",
+    )
+    missing_refs = tmp_path / "empty_refs"
+    missing_refs.mkdir()
+    refs_found = arch_gov.scan_repository(tmp_path, refs_root=missing_refs)
+    assert any(
+        v.rule == "AG005" and "refs repo directory not found" in v.message
+        for v in refs_found
+    )

@@ -33,6 +33,7 @@ import json
 import os
 from pathlib import Path
 import statistics
+import subprocess
 import sys
 import time
 
@@ -157,8 +158,17 @@ def hygiene(args) -> dict:
         sys.path.insert(0, str(scripts_dir))
     import check_arch_governance as arch_gov
 
+    arch_gov_base = "c1bc55e59facc21a6a775da346e7ad7ae4909cfd"
     raw_gov = arch_gov.scan_repository(sim)
-    gov_active = arch_gov.filter_allowlisted(raw_gov)
+    has_base = subprocess.run(
+        ["git", "-C", str(sim), "cat-file", "-e", f"{arch_gov_base}^{{commit}}"],
+        check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    ).returncode == 0
+    if has_base:
+        base_gov = arch_gov.scan_repository(sim, revision=arch_gov_base)
+        gov_active = arch_gov.new_violations(raw_gov, base_gov)
+    else:
+        gov_active = arch_gov.filter_allowlisted(raw_gov)
     gov_list = [
         f"{item.path.as_posix()}:{item.line}:{item.rule}:{item.message}"
         for item in gov_active

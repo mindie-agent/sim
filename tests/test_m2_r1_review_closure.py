@@ -419,19 +419,15 @@ def test_locked_sweep_reuses_one_plan_or_rejects_unsupported_comparison():
 # [P1 #14] Framework layer never performs whole-graph DBO microbatch splitting.
 # --------------------------------------------------------------------------- #
 def test_enable_dbo_builds_two_distinct_microbatch_partitions():
+    from mindie_sim.public.errors import UnmodeledCapabilityError
+
     case = parse_case(compose_case(
         "qwen3-30b-a3b", hardware="a5", tp=8, ep=8, num_devices=8,
         ranks_per_node=8, prompt_tokens=64, output_tokens=2, concurrency=16))
     case = replace(case, runtime=replace(case.runtime, enable_dbo=True))
     views = tuple(RequestView(f"r{idx}", 1, 32, True, "decode") for idx in range(16))
-    work = Frontend()(IterationPlan(views), case.model, case.runtime,
-                      case.machine)
-    assert not any("dbo_microbatch" in dict(op.metadata) for op in work.ops)
-    assert not any(op.op_id.startswith("dbo") for op in work.ops)
-    ids = [op.op_id for op in work.ops]
-    assert len(ids) == len(set(ids))
-    streams = {op.stream for op in work.ops if op.stream}
-    assert not any(stream.startswith("dbo") for stream in streams)
+    with pytest.raises(UnmodeledCapabilityError, match="unmodeled_in_op_dbo_pending_stage3"):
+        Frontend()(IterationPlan(views), case.model, case.runtime, case.machine)
 
 
 # --------------------------------------------------------------------------- #

@@ -18,7 +18,6 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields, is_dataclass
 import math
 from pathlib import Path
-from types import MappingProxyType
 from typing import Literal, TypeAlias
 
 from mindie_sim.schema.case import Case
@@ -42,6 +41,34 @@ HardwareInput: TypeAlias = str | Mapping[str, object]
 DEFAULT_TARGET_EFFICIENCY = 0.80
 
 
+class FrozenJsonMapping(Mapping[str, JsonValue]):
+    """Picklable immutable JSON object mapping safe under ``spawn`` multiprocessing."""
+
+    __slots__ = ("_data",)
+
+    def __init__(
+        self,
+        items: Mapping[str, JsonValue] | Sequence[tuple[str, JsonValue]] = (),
+        /,
+    ) -> None:
+        object.__setattr__(self, "_data", dict(items))
+
+    def __getitem__(self, key: str) -> JsonValue:
+        return self._data[key]
+
+    def __iter__(self):
+        return iter(self._data)
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def __repr__(self) -> str:
+        return f"FrozenJsonMapping({self._data!r})"
+
+    def __reduce__(self):
+        return (FrozenJsonMapping, (tuple(self._data.items()),))
+
+
 def freeze_json(value: object, /) -> JsonValue:
     """Recursively freeze arbitrary JSON-compatible values into immutable types."""
     if value is None or isinstance(value, (bool, int, str)):
@@ -53,12 +80,12 @@ def freeze_json(value: object, /) -> JsonValue:
     if isinstance(value, Path):
         return str(value)
     if is_dataclass(value) and not isinstance(value, type):
-        return MappingProxyType({
+        return FrozenJsonMapping({
             f.name: freeze_json(getattr(value, f.name))
             for f in fields(value)
         })
     if isinstance(value, Mapping):
-        return MappingProxyType({
+        return FrozenJsonMapping({
             str(key): freeze_json(item) for key, item in value.items()
         })
     if isinstance(value, (tuple, list)):
@@ -358,6 +385,7 @@ __all__ = [
     "AlignedSequenceTable",
     "CaseInput",
     "DEFAULT_TARGET_EFFICIENCY",
+    "FrozenJsonMapping",
     "FusedPipelineDescriptor",
     "FusedPipelineSpec",
     "HardwareInput",

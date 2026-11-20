@@ -53,21 +53,18 @@ def _disable_homogeneous_lowering(monkeypatch):
 # Finding 1 (P0): homogeneous lowering must not bypass DBO partitioning.
 # --------------------------------------------------------------------------- #
 def test_dbo_partitioning_is_never_bypassed_by_homogeneous_lowering(monkeypatch):
+    from mindie_sim.public.errors import UnmodeledCapabilityError
+
     case = compose_case(
         "qwen3-32b", hardware="a5", tp=1, ep=1, num_devices=1, layers=4,
         enable_dbo=True, prompt_tokens=64, output_tokens=2, max_num_seqs=2)
-    optimized = analyze_network_efficiency(
-        case, phase="decode", tokens=1, context=64, sequences=2)
+    with pytest.raises(UnmodeledCapabilityError, match="unmodeled_in_op_dbo_pending_stage3"):
+        analyze_network_efficiency(
+            case, phase="decode", tokens=1, context=64, sequences=2)
     _disable_homogeneous_lowering(monkeypatch)
-    direct = analyze_network_efficiency(
-        case, phase="decode", tokens=1, context=64, sequences=2)
-
-    assert len(optimized["operators"]) == len(direct["operators"])
-    assert optimized["graph_duration_ms"] == pytest.approx(
-        direct["graph_duration_ms"])
-    assert optimized["total_flops"] == pytest.approx(direct["total_flops"])
-    prefixes = {op["op_id"].split(".", 1)[0] for op in optimized["operators"]}
-    assert not ({"dbo0", "dbo1"} & prefixes)
+    with pytest.raises(UnmodeledCapabilityError, match="unmodeled_in_op_dbo_pending_stage3"):
+        analyze_network_efficiency(
+            case, phase="decode", tokens=1, context=64, sequences=2)
 
 
 # --------------------------------------------------------------------------- #

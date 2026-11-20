@@ -104,6 +104,12 @@ class RewritePipeline:
                 RankOps(replica=int(replica), ops=tuple(ops))
                 for replica, ops in sorted(graphs.items())
             )
+            unmatched = set(stream_by_rank) - {entry.replica for entry in logical}
+            if unmatched:
+                raise ModelingError(
+                    "stream_plan_unmatched_rank:"
+                    + ",".join(str(r) for r in sorted(unmatched))
+                )
             executable = tuple(
                 RankOps(
                     replica=entry.replica,
@@ -125,6 +131,12 @@ class RewritePipeline:
 
         if request.declared_ops:
             logical = tuple(request.declared_ops)
+            unmatched = set(stream_by_rank) - {entry.replica for entry in logical}
+            if unmatched:
+                raise ModelingError(
+                    "stream_plan_unmatched_rank:"
+                    + ",".join(str(r) for r in sorted(unmatched))
+                )
             executable = tuple(
                 RankOps(
                     replica=entry.replica,
@@ -147,6 +159,13 @@ class RewritePipeline:
         )
         logical_rows: list[RankOps] = []
         executable_rows: list[RankOps] = []
+        known_replicas = {int(replica) for replica, _ in request.iterations}
+        unmatched = set(stream_by_rank) - known_replicas
+        if unmatched:
+            raise ModelingError(
+                "stream_plan_unmatched_rank:"
+                + ",".join(str(r) for r in sorted(unmatched))
+            )
         for replica, iteration in request.iterations:
             work = frontend(
                 iteration, base.case.model, base.case.runtime, base.case.machine,

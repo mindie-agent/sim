@@ -59,6 +59,25 @@ FINAL_LAYER = -1
 
 
 
+def _reject_unmodeled_dbo(runtime, entry: str) -> None:
+    if not bool(getattr(runtime, "enable_dbo", False)):
+        return
+    from mindie_sim.public.errors import UnmodeledCapabilityError
+
+    raise UnmodeledCapabilityError(
+        capability="dbo",
+        entry=entry,
+        code="unmodeled_in_op_dbo_pending_stage3",
+        message=(
+            "Whole-graph DBO microbatch splitting has been removed; "
+            "in-operator DBO belongs to operators/grouped_moe and "
+            "operators/mc2 (Stage 3)."
+        ),
+        affected_results=("latency", "operator_timeline", "throughput"),
+        minimal_replay_input={"enable_dbo": True},
+    )
+
+
 def _scope(ops, block, role="body"):
     """The composing builder owns scope; operator names do not identify it."""
     return [replace(op, metadata=tuple({
@@ -288,6 +307,7 @@ class Frontend:
              include_recover_commits: bool = False, machine=None,
              layer_limit: int | None = None,
              topk_scope=None, reuse_index_selection: bool = False, rank_ledger=None):
+        _reject_unmodeled_dbo(runtime, "frontend.body")
         p = runtime.parallel
         if layer_limit is not None:
             limit = max(ONE, int(layer_limit))
@@ -739,6 +759,7 @@ class Frontend:
         # ``plan``; a cached template owner can read this envelope without
         # inferring a slot from local list positions.
         requested_rank = physical_rank
+        _reject_unmodeled_dbo(runtime, "frontend")
         if assembly not in {"model", "service"}:
             raise ModelingError(f"assembly_scope_unknown:{assembly}")
         if resource_fusion is None:

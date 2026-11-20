@@ -101,7 +101,43 @@ def test_compute_arch_and_datapath_plumbing_through_bindings_and_context(
 
 
 def test_geometry_rejects_heterogeneous_compute_arch_stage():
+    from dataclasses import replace
+
     die22 = _case_for("Ascend910B2").machine.dies[0]
     die35 = _case_for("Ascend950DT_9581").machine.dies[0]
     with pytest.raises(ModelingError, match="stage_devices_heterogeneous_compute_arch"):
         Geometry.from_devices((die22, die35))
+
+    # Same preset (npu_arch_2201) but differing core counts (B2 24/48 vs B4 20/40).
+    die_b4 = _case_for("Ascend910B4").machine.dies[0]
+    with pytest.raises(ModelingError, match="stage_devices_heterogeneous_datapath"):
+        Geometry.from_devices((die22, die_b4))
+
+    # Same preset & cores, but differing instruction_services on compute_arch.
+    die35_mod = replace(
+        die35,
+        compute_arch=replace(die35.compute_arch, instruction_services=()),
+    )
+    with pytest.raises(ModelingError, match="stage_devices_heterogeneous_compute_arch"):
+        Geometry.from_devices((die35, die35_mod))
+
+
+def test_ub_peer_edges_derived_from_a5_ub_mesh_links():
+    a5_tp8 = sdk_api.compose_case(
+        "qwen3-32b",
+        hardware="Ascend950DT_9581",
+        options={"dp": 1, "tp": 8, "pp": 1, "num_devices": 8, "layers": 1},
+    )
+    bindings_a5 = ExecutionBindings.create(a5_tp8)
+    dp0 = bindings_a5.datapath_for_rank(0)
+    dp7 = bindings_a5.datapath_for_rank(7)
+    assert dp0.ub_peer_edges == tuple((0, peer) for peer in range(1, 8))
+    assert dp7.ub_peer_edges == tuple((7, peer) for peer in range(7))
+    assert bindings_a5.datapath_for_stage(0, 0).ub_peer_edges == dp0.ub_peer_edges
+
+    b2_tp8 = sdk_api.compose_case(
+        "qwen3-32b",
+        hardware="Ascend910B2",
+        options={"dp": 1, "tp": 8, "pp": 1, "num_devices": 8, "layers": 1},
+    )
+    assert ExecutionBindings.create(b2_tp8).datapath_for_rank(0).ub_peer_edges == ()

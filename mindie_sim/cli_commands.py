@@ -183,10 +183,40 @@ def _dispatch_sdk(args: argparse.Namespace) -> object | None:
         view = str(getattr(args, "view", "step"))
         if view == "efficiency":
             from .prediction.efficiency import analyze_network_efficiency
-            return analyze_network_efficiency(
-                raw, phase=args.phase, tokens=args.tokens, context=args.context,
-                sequences=args.sequences, scope=args.scope,
-            )
+            from .prediction.evaluation import EvaluationContext
+            from .prediction.graph_analysis import graph_costs
+            from .prediction.operator_analysis import operator_costs, target_graphs
+
+            with PrimitiveStore(args.primitives) if args.primitives else nullcontext(None) as store:
+                if (
+                    args.draft_prepare
+                    or args.media_tokens_per_sequence is not None
+                    or store is not None
+                ):
+                    case = parse_case(raw)
+                    ops = target_graphs(
+                        case, phase=args.phase, tokens=args.tokens, context=args.context,
+                        sequences=args.sequences, scope=args.scope,
+                        media_tokens_per_sequence=args.media_tokens_per_sequence,
+                        draft_prepare=bool(args.draft_prepare),
+                    )
+                    ctx = EvaluationContext.create(case, None, store)
+                    op_report = operator_costs(case, ops, primitives=store, evaluation=ctx)
+                    gr_report = graph_costs(
+                        case, ops, primitives=store,
+                        include_submission=bool(args.include_submission),
+                        isolated=False, evaluation=ctx,
+                    )
+                    return analyze_network_efficiency(
+                        case, phase=args.phase, tokens=args.tokens, context=args.context,
+                        sequences=args.sequences, scope=args.scope,
+                        operator_report=op_report, graph_report=gr_report,
+                        evaluation_context=ctx,
+                    )
+                return analyze_network_efficiency(
+                    raw, phase=args.phase, tokens=args.tokens, context=args.context,
+                    sequences=args.sequences, scope=args.scope,
+                )
         if view == "operators":
             from .prediction.operator_analysis import operator_costs, target_graphs
             case = parse_case(raw)
@@ -196,15 +226,16 @@ def _dispatch_sdk(args: argparse.Namespace) -> object | None:
                 media_tokens_per_sequence=args.media_tokens_per_sequence,
                 draft_prepare=args.draft_prepare,
             )
-            return {
-                **operator_costs(case, ops),
-                "graph_scope": args.scope,
-                "tokens_per_sequence": args.tokens,
-                "sequences": args.sequences,
-                "sequences_per_replica": args.sequences,
-                "draft_prepare": args.draft_prepare,
-                "deployment_scope": "first_independent_dp_cohort",
-            }
+            with PrimitiveStore(args.primitives) if args.primitives else nullcontext(None) as store:
+                return {
+                    **operator_costs(case, ops, primitives=store),
+                    "graph_scope": args.scope,
+                    "tokens_per_sequence": args.tokens,
+                    "sequences": args.sequences,
+                    "sequences_per_replica": args.sequences,
+                    "draft_prepare": args.draft_prepare,
+                    "deployment_scope": "first_independent_dp_cohort",
+                }
         req = StepRequest(
             phase=args.phase,
             tokens=args.tokens,

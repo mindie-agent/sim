@@ -156,10 +156,9 @@ def select_common(runtime, features=None, *, tokens, top_k, experts, ep):
     explicit = select(kernels)
     if explicit is not None:
         return explicit
-    if (EXPLICIT_ROUTING_LOWERINGS & set(kernels.get("lowerings") or {})
-            or bool(getattr(runtime, "enable_dbo", False))):
-        # An explicitly lowered routing/init kernel or DBO microbatch split owns
-        # the expert input representation; automatic MC2 selection must not replace it.
+    if EXPLICIT_ROUTING_LOWERINGS & set(kernels.get("lowerings") or {}):
+        # An explicitly lowered routing/init kernel owns the expert input
+        # representation; automatic MC2 selection must not replace it.
         return None
     rmeta = dict(getattr(runtime, "metadata", ()) or ())
     radditional = rmeta.get("additional_config")
@@ -285,8 +284,7 @@ def lower(ops, *, runtime, prefix, tokens, top_k, width, experts, ep,
     has_redundant_slots = int(getattr(parallel_cfg, "redundant_experts_per_rank", 0) or 0) > 0
     if (selected.get("selected_method") == FUSED_MC2
             and received_assignments
-            and not has_redundant_slots
-            and not bool(getattr(runtime, "enable_dbo", False))):
+            and not has_redundant_slots):
         e_up = by_id.get(prefix + ".expert_up")
         e_act = by_id.get(prefix + ".expert_act")
         e_down = by_id.get(prefix + ".expert_down")

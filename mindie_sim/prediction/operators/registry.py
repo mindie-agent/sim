@@ -71,7 +71,10 @@ class FamilyRegistry:
         if recipe_id and recipe_id in self._by_recipe:
             return self._by_recipe[recipe_id]
         family = str(getattr(op, "family", "") or "")
-        return self._by_family.get(family)
+        spec = self._by_family.get(family)
+        if spec is not None and not recipe_id:
+            return spec
+        return None
 
     def lookup(self, op: OpSpec, /) -> OperatorFamilySpec:
         """Return the owning ``OperatorFamilySpec`` or raise ``ModelingError``."""

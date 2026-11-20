@@ -85,7 +85,7 @@ def test_rotary_work_conservation_and_live_spine_execution(tier, sku, expected_a
     coeff_bytes = 2 * 8 * 64 * elem_bytes
     expected_read = elems * elem_bytes + coeff_bytes
     expected_write = elems * elem_bytes
-    assert prepared_op.vector_ops == pytest.approx(float(elems * 4))
+    assert prepared_op.vector_ops == pytest.approx(float(elems * 3.5))
     assert prepared_op.mte2_bytes == pytest.approx(float(expected_read))
     assert prepared_op.mte3_bytes == pytest.approx(float(expected_write))
     assert prepared_op.hbm_bytes == pytest.approx(float(expected_read + expected_write))
@@ -155,3 +155,66 @@ def test_rotary_rejects_unsupported_abi_and_missing_datapath():
     )
     with pytest.raises(ModelingError, match="rotary_datapath_missing_gm_ub"):
         resolve_rotary_plan(_rotary_op("rope_no_ub"), no_ub_ctx)
+
+
+def test_rotary_bsnd_4d_abi_domain_picklability_and_hbm_split():
+    import pickle
+
+    registry = builtin_family_registry()
+    case = _case_for("Ascend950DT_9581")
+    geom = Geometry.from_devices(
+        case.machine.dies,
+        links=case.machine.links,
+        transfer_channels=case.machine.transfer_channels,
+    )
+    assert geom.datapath is not None
+
+    # 4D BSND [1, 8, 16, 64]: tokens = 1 * 8 = 8 (not shape[0] == 1).
+    bsnd_op = replace(
+        _rotary_op("rope_bsnd"),
+        local_shape=(1, 8, 16, 64),
+        semantic_shape=(1, 8, 16, 64),
+        padded_shape=(1, 8, 16, 64),
+        launch_shape=(1, 8, 16, 64),
+    )
+    ctx_ok = OperatorPlanningContext(
+        occurrence=OpOccurrence(0, 0, 0, "rope_bsnd"),
+        geometry=geom,
+        datapath=geom.datapath,
+        requested_abi="aclnnRotaryPositionEmbedding",
+    )
+    resolved = resolve_rotary_plan(bsnd_op, ctx_ok)
+    elems = 1 * 8 * 16 * 64
+    coeff_bytes = 2 * (1 * 8) * 64 * 2
+    tensor_bytes = elems * 2
+    assert resolved.recipe.work.resources["mte2"] == pytest.approx(float(tensor_bytes + coeff_bytes))
+    assert resolved.recipe.work.resources["mte3"] == pytest.approx(float(tensor_bytes))
+    assert resolved.recipe.work.resources["vector"] == pytest.approx(float(elems * 3.5))
+
+    # Descriptor HBM read/write split matches io_weight (write == mte3, read == total - write).
+    assert resolved.descriptor is not None
+    load_hbm = next(w.amount for w in resolved.descriptor.phases[0].work if w.resource == "hbm")
+    store_hbm = next(w.amount for w in resolved.descriptor.phases[2].work if w.resource == "hbm")
+    assert store_hbm == pytest.approx(float(tensor_bytes))
+    assert load_hbm == pytest.approx(float(tensor_bytes + coeff_bytes))
+
+    # Dual-tensor aclnnApplyRotaryPosEmb must be rejected by single-tensor rotary.
+    ctx_dual = replace(ctx_ok, requested_abi="aclnnApplyRotaryPosEmb")
+    with pytest.raises(ModelingError, match="rotary_abi_unsupported"):
+        resolve_rotary_plan(bsnd_op, ctx_dual)
+
+    # Misspelled explicit recipe ID must not be hijacked by FamilyRegistry.
+    typo_op = replace(bsnd_op, recipe="rotary_misspelled")
+    assert registry.match(typo_op) is None
+    with pytest.raises(ModelingError, match="unregistered_operator_family"):
+        registry.lookup(typo_op)
+
+    # OperatorPlan and StepEvaluation must pickle cleanly under multiprocessing spawn.
+    plan_roundtrip = pickle.loads(pickle.dumps(resolved.recipe))
+    assert plan_roundtrip.work == resolved.recipe.work
+    spine = PredictionSpine(families=registry)
+    step = spine.lower(case, LoweringRequest(declared_ops=(RankOps(0, (bsnd_op,)),)))
+    ev = spine.run_step(step)
+    assert ev.operators[0].occurrence.rank == 0
+    assert any(item.resource == "vector" and item.amount > 0.0 for item in ev.operators[0].work)
+    assert pickle.loads(pickle.dumps(ev)) == ev

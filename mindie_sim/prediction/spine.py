@@ -84,39 +84,45 @@ class PreparedStep:
 
 
 def _scale_case_efficiency(case: Case, efficiency: float) -> Case:
-    """Scale declared scalable hardware throughput ceilings by ``efficiency`` once."""
+    """Derive scalable hardware ceilings once from 1.0x declared peaks * ``efficiency``."""
     if isinstance(efficiency, bool) or not math.isfinite(efficiency) or not (0.0 < efficiency <= 1.0):
         raise ModelingError(f"target_efficiency_out_of_range:{efficiency}")
-    if math.isclose(efficiency, 1.0):
-        return case
     scaled_dies: list[Device] = []
     for die in case.machine.dies:
+        base_rates = dict(die.rates)
+        hbm_peak = float(base_rates.get("hbm", 0.0))
         peaks = tuple((k, float(v) * efficiency) for k, v in die.compute_peaks)
         rates = tuple((k, float(v) * efficiency) for k, v in die.rates)
-        modes = tuple(
-            (name, (role, float(rate) * efficiency))
-            for name, (role, rate) in die.service_modes
-        )
+        modes: list[tuple[str, tuple[str, float]]] = []
+        for name, (role, rate) in die.service_modes:
+            if name.endswith("_dram") and hbm_peak > 0.0:
+                role_peak = float(base_rates.get(role, hbm_peak))
+                base_mode_rate = min(hbm_peak, role_peak)
+            else:
+                base_mode_rate = float(rate)
+            modes.append((name, (role, base_mode_rate * efficiency)))
         scaled_dies.append(replace(
             die,
             compute_peaks=peaks,
             rates=rates,
-            service_modes=modes,
+            service_modes=tuple(modes),
         ))
     scaled_links: list[Link] = []
     for link in case.machine.links:
-        peak_cap = (
-            None if link.peak_capacity_bytes_per_ms is None
-            else float(link.peak_capacity_bytes_per_ms) * efficiency
-        )
+        base_cap = float(link.effective_peak_capacity_bytes_per_ms)
+        util = float(link.bw_utilization)
+        if link.peak_capacity_bytes_per_ms is None and 0.0 < util < 1.0:
+            base_cap = float(link.capacity_bytes_per_ms) / util
+        util_div = util if 0.0 < util < 1.0 else 1.0
         endpoints = tuple(
-            (rank, float(rate) * efficiency)
+            (rank, (float(rate) / util_div) * efficiency)
             for rank, rate in link.endpoint_rates
         )
         scaled_links.append(replace(
             link,
-            capacity_bytes_per_ms=float(link.capacity_bytes_per_ms) * efficiency,
-            peak_capacity_bytes_per_ms=peak_cap,
+            capacity_bytes_per_ms=base_cap * efficiency,
+            peak_capacity_bytes_per_ms=base_cap,
+            bw_utilization=float(efficiency),
             endpoint_rates=endpoints,
         ))
     machine = replace(
@@ -124,6 +130,12 @@ def _scale_case_efficiency(case: Case, efficiency: float) -> Case:
         dies=tuple(scaled_dies),
         links=tuple(scaled_links),
     )
+    kernels = dict(case.runtime.kernels)
+    if "service_regimes" in kernels or "resource_services" in kernels:
+        kernels.pop("service_regimes", None)
+        kernels.pop("resource_services", None)
+        runtime = replace(case.runtime, kernels=kernels)
+        return replace(case, machine=machine, runtime=runtime)
     return replace(case, machine=machine)
 
 
@@ -158,31 +170,21 @@ def _parse_occurrence(node_id: str, fallback_replica: int, stage: int) -> OpOccu
     return OpOccurrence(fallback_replica, stage, None, node_id)
 
 
-def _wave_breakdown_from_report(report: Mapping[str, Any], case: Case) -> WaveBreakdown:
-    clocks = report.get("exposed_breakdown_ms") or {}
-    if not clocks:
-        exposed = report.get("exposed_breakdown") or {}
-        clocks = exposed.get("clocks_ms") or {}
-    cube_ms = float(clocks.get("cube", clocks.get("cube_ms", 0.0)) or 0.0)
-    vector_ms = float(clocks.get("vector", clocks.get("vector_ms", 0.0)) or 0.0)
-    memory_ms = float(clocks.get("memory", clocks.get("memory_ms", 0.0)) or 0.0)
-    comm_ms = float(clocks.get("communication", clocks.get("communication_ms", 0.0)) or 0.0)
-    control_ms = float(clocks.get("control", clocks.get("control_ms", 0.0)) or 0.0)
-    span_ms = float(report.get("duration_ms", 0.0) or 0.0)
-    total_owners = int(case.machine.dies[0].compute_units) if case.machine.dies else 1
-    serial_sum = cube_ms + vector_ms + memory_ms + comm_ms + control_ms
-    overlap = max(0.0, 1.0 - span_ms / serial_sum) if serial_sum > 0.0 else 0.0
+def _wave_breakdown_from_report(report: Mapping[str, Any]) -> WaveBreakdown | None:
+    raw = report.get("wave_breakdown")
+    if not isinstance(raw, Mapping):
+        return None
     return WaveBreakdown(
-        waves=1,
-        active_owners=total_owners,
-        total_owners=total_owners,
-        tail_owners=0,
-        cube_ms=cube_ms,
-        vector_ms=vector_ms,
-        memory_ms=memory_ms,
-        communication_ms=comm_ms,
-        control_ms=control_ms,
-        overlap_ratio=overlap,
+        waves=int(raw["waves"]),
+        active_owners=int(raw["active_owners"]),
+        total_owners=int(raw["total_owners"]),
+        tail_owners=int(raw["tail_owners"]),
+        cube_ms=float(raw["cube_ms"]),
+        vector_ms=float(raw["vector_ms"]),
+        memory_ms=float(raw["memory_ms"]),
+        communication_ms=float(raw["communication_ms"]),
+        control_ms=float(raw["control_ms"]),
+        overlap_ratio=float(raw["overlap_ratio"]),
     )
 
 
@@ -210,23 +212,31 @@ class PredictionSpine:
         dies = case.machine.dies[start : start + width]
         if not dies:
             dies = case.machine.dies[:1]
-        return Geometry.from_devices(dies)
+        return Geometry.from_devices(
+            dies,
+            links=case.machine.links,
+            transfer_channels=case.machine.transfer_channels,
+        )
 
     def _bind_stream_plans(
         self,
         case: Case,
         streams: tuple[StreamPlan, ...],
+        active_replicas: frozenset[int],
     ) -> dict[tuple[int, int, str], StreamOwners]:
         if not streams:
             return {}
         p = case.runtime.parallel
         bound: dict[tuple[int, int, str], StreamOwners] = {}
         for plan in streams:
+            rep = int(plan.rank)
+            if rep not in active_replicas:
+                raise ModelingError(f"stream_plan_unmatched_rank:{plan.rank}")
             for stage in range(p.pp):
-                geom = self._stage_geometry(case, int(plan.rank), stage)
+                geom = self._stage_geometry(case, rep, stage)
                 owners_map = bind_stream_owners(plan, geom.datapath)  # type: ignore[arg-type]
                 for stream_id, owners in owners_map.items():
-                    bound[(int(plan.rank), stage, stream_id)] = owners
+                    bound[(rep, stage, stream_id)] = owners
         return bound
 
     def _resolve_governed_operators(
@@ -245,11 +255,6 @@ class PredictionSpine:
             for op in rank_ops.ops:
                 spec = self.families.match(op)
                 if spec is None:
-                    continue
-                if (
-                    op.recipe not in spec.owned_recipe_ids
-                    and op.recipe in book.recipes
-                ):
                     continue
                 key = (rank_ops.replica, int(op.stage))
                 geom = geometries.get(key)
@@ -301,7 +306,6 @@ class PredictionSpine:
         if (
             req.step is not None
             and rewritten.target_graphs is not None
-            and not rewritten.streams
             and not self.rewrite.rules
         ):
             phys_map = {entry.replica: entry.ops for entry in rewritten.executable}
@@ -370,7 +374,10 @@ class PredictionSpine:
             consume_target_declaration(base.case, rewritten.target_graphs)
             if rewritten.target_graphs is not None else base.case
         )
-        bound_owners = self._bind_stream_plans(effective_case, rewritten.streams)
+        active_replicas = frozenset(entry.replica for entry in rewritten.executable)
+        bound_owners = self._bind_stream_plans(
+            effective_case, rewritten.streams, active_replicas
+        )
         book = RecipeBook.from_mapping(
             effective_case.runtime.kernels, family_registry=self.families
         )
@@ -441,22 +448,32 @@ class PredictionSpine:
             for res in step.operators
         }
         rows: list[OperatorSequenceRow] = []
+        p = case.runtime.parallel
+        width = p.tp * p.pcp
         timeline = report.get("timeline") or report.get("operators") or ()
         for ordinal, row in enumerate(timeline):
             replica = int(row.get("replica", 0))
             op_id = str(row.get("op_id", ""))
             spec = op_index.get((replica, op_id))
             stage = int(spec.stage) if spec is not None else int(row.get("stage", 0))
-            occ = OpOccurrence(replica=replica, stage=stage, rank=None, op_id=op_id)
+            res = resolved_by_occ.get((replica, op_id))
+            rank_idx = (replica * p.pp + stage) * width
+            physical_rank = (
+                res.occurrence.rank
+                if res is not None
+                else (int(case.machine.dies[rank_idx].rank)
+                      if 0 <= rank_idx < len(case.machine.dies) else None)
+            )
+            occ = OpOccurrence(replica=replica, stage=stage, rank=physical_rank, op_id=op_id)
             preds = tuple(
                 _parse_occurrence(str(dep), replica, stage)
                 for dep in row.get("predecessors", ())
             )
-            res = resolved_by_occ.get((replica, op_id))
             impl = (
                 res.implementation
                 if res is not None else str(row.get("program") or row.get("recipe") or "")
             )
+            effective_spec = res.op if res is not None else spec
             ready = row.get("ready_ms")
             complete = row.get("complete_ms")
             iso = row.get("isolated_ms")
@@ -468,9 +485,9 @@ class PredictionSpine:
                 implementation=impl,
                 predecessors=preds,
                 stream=coerce_stream(stream_val),
-                shape=tuple(int(x) for x in (spec.local_shape if spec is not None else ())),
-                dtype=str(spec.dtype if spec is not None else ""),
-                work=_work_items(spec) if spec is not None else (),
+                shape=tuple(int(x) for x in (effective_spec.local_shape if effective_spec is not None else ())),
+                dtype=str(effective_spec.dtype if effective_spec is not None else ""),
+                work=_work_items(effective_spec) if effective_spec is not None else (),
                 ready_ms=float(ready) if ready is not None else None,
                 start_ms=float(ready) if ready is not None else None,
                 end_ms=float(complete) if complete is not None else None,
@@ -481,7 +498,7 @@ class PredictionSpine:
             res.descriptor for res in step.operators if res.descriptor is not None
         )
         accel = report.get("accel_status") or {}
-        wave = _wave_breakdown_from_report(report, case)
+        wave = _wave_breakdown_from_report(report)
         return StepEvaluation(
             graph_id=step.graph_id,
             request=step_req,
@@ -573,8 +590,8 @@ class PredictionSpine:
         finally:
             ACTIVE_DEADLINE_MONO.reset(token)
         metrics = report.get("metrics") or {}
-        completed = int(metrics.get("completed_requests", 0) or 0)
-        emitted = int(metrics.get("total_output_tokens", 0) or 0)
+        completed = int(metrics.get("served_requests", 0) or 0)
+        emitted = int(metrics.get("output_tokens", 0) or 0)
         span_ms = float(metrics.get("makespan_ms", 0.0) or 0.0)
         return ServiceEvaluation(
             summary=freeze_json(report),  # type: ignore[arg-type]
@@ -600,11 +617,14 @@ class PredictionSpine:
         candidates: list[SlaCandidate] = []
         hw_label = str(case.machine.sku or case.machine.name)
         for scenario in report.get("scenarios", ()):
-            label = str(scenario.get("id") or hw_label)
-            seqs = int(scenario.get("max_feasible_sequences_per_dp", 0) or 0)
-            span = float(scenario.get("step_ms_at_max_feasible", 0.0) or 0.0)
-            tps = float(scenario.get("system_throughput_tokens_per_s", 0.0) or 0.0)
-            fits = bool(scenario.get("feasible", seqs > 0))
+            label = str(scenario.get("scenario_id") or scenario.get("id") or hw_label)
+            seqs = int(scenario.get("b_feasible", 0) or 0)
+            raw_span = scenario.get("step_ms_feasible")
+            if raw_span is None:
+                raw_span = scenario.get("step_ms_at_b1", 0.0)
+            span = float(raw_span or 0.0)
+            tps = float(scenario.get("tps_feasible", 0.0) or 0.0)
+            fits = bool(scenario.get("capacity_feasible", False))
             candidates.append(SlaCandidate(
                 hardware=label,
                 sequences_per_dp=seqs,
@@ -612,7 +632,10 @@ class PredictionSpine:
                 throughput_tokens_s=tps,
                 fits_memory=fits,
             ))
-        feasible = [c for c in candidates if c.fits_memory and c.sequences_per_dp > 0]
+        feasible = [
+            c for c, scen in zip(candidates, report.get("scenarios", ()))
+            if bool(scen.get("feasible", False)) and c.sequences_per_dp > 0
+        ]
         best = max(feasible, key=lambda c: c.throughput_tokens_s) if feasible else None
         return SlaEvaluation(best=best, candidates=tuple(candidates))
 
@@ -626,6 +649,7 @@ class PredictionSpine:
     ) -> TopologySweepResult:
         """Sweep topology or P/D disaggregation candidates and return Pareto frontier."""
         from mindie_sim.sweep import sweep_pd_disaggregation_ratios, sweep_topologies_iter
+        from mindie_sim.sweep_engine import compute_pareto_frontier
 
         if request.mode == "pd":
             total_dies = (
@@ -640,25 +664,25 @@ class PredictionSpine:
                 output_tokens=max(1, request.sla.output_budget),
                 tpot_sla_ms=request.sla.latency_ms,
             )
-            rows = report.get("candidates", ())
+            all_rows = report.get("candidates", ())
+            front_rows = report.get("pareto_frontier", ())
             frontier: list[TopologyPoint] = []
-            for row in rows:
-                if not row.get("feasible"):
-                    continue
+            for row in front_rows:
+                raw_span = row.get("effective_tpot_ms")
+                if raw_span is None:
+                    raw_span = row.get("decode_step_ms", 0.0)
                 frontier.append(TopologyPoint(
-                    device_count=total_dies,
+                    device_count=int(row.get("used_dies", total_dies)),
                     parallel=(("prefill_dies", int(row.get("prefill_dies", 0))),),
                     decode_parallel=(("decode_dies", int(row.get("decode_dies", 0))),),
-                    span_ms=float(row.get("decode_tpot_ms", 0.0) or 0.0),
-                    throughput_tokens_s=float(row.get("system_throughput_tokens_per_s", 0.0) or 0.0),
+                    span_ms=float(raw_span or 0.0),
+                    throughput_tokens_s=float(row.get("sustainable_tps", 0.0) or 0.0),
                     fits_memory=True,
                 ))
-            return TopologySweepResult(evaluated_count=len(rows), frontier=tuple(frontier))
+            return TopologySweepResult(evaluated_count=len(all_rows), frontier=tuple(frontier))
 
-        evaluated = 0
-        points: list[TopologyPoint] = []
         grid = list(request.device_counts) if request.device_counts else None
-        for row in sweep_topologies_iter(
+        evaluated_rows = list(sweep_topologies_iter(
             case,
             num_devices_grid=grid,
             sla_ms=request.sla.latency_ms,
@@ -668,20 +692,25 @@ class PredictionSpine:
             max_sequences_per_dp=request.sla.max_sequences_per_dp,
             phase=request.sla.step.phase,
             scope=request.sla.step.scope,
-        ):
-            evaluated += 1
-            if not row.get("feasible", row.get("status") == "feasible"):
+        ))
+        compute_pareto_frontier(evaluated_rows)
+        points: list[TopologyPoint] = []
+        for row in evaluated_rows:
+            if not row.get("pareto_optimal"):
                 continue
             par = row.get("parallel") or {}
+            raw_span = row.get("step_ms_feasible")
+            if raw_span is None:
+                raw_span = row.get("step_ms_at_b1", 0.0)
             points.append(TopologyPoint(
                 device_count=int(row.get("num_devices", len(case.machine.dies))),
                 parallel=tuple(sorted((str(k), int(v)) for k, v in par.items())),
                 decode_parallel=None,
-                span_ms=float(row.get("step_ms_at_max_feasible", row.get("step_ms_at_b1", 0.0)) or 0.0),
-                throughput_tokens_s=float(row.get("system_throughput_tokens_per_s", 0.0) or 0.0),
+                span_ms=float(raw_span or 0.0),
+                throughput_tokens_s=float(row.get("tps_feasible", 0.0) or 0.0),
                 fits_memory=True,
             ))
-        return TopologySweepResult(evaluated_count=evaluated, frontier=tuple(points))
+        return TopologySweepResult(evaluated_count=len(evaluated_rows), frontier=tuple(points))
 
     def project_structure(
         self,

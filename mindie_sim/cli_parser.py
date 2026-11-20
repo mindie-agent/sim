@@ -39,6 +39,7 @@ DEFAULT_SLA_CONTEXT = 126000
 DEFAULT_TARGET_MBU = 0.80
 DEFAULT_TARGET_CUBE_MFU = 0.75
 DEFAULT_TARGET_VEC_MFU = 0.65
+BIND_PROFILER_MIN_POSITIONALS = 3
 
 _BOOLEAN_FLAGS = frozenset({
     "-h", "--help", "--isolated", "--include-submission", "--draft-prepare",
@@ -164,7 +165,10 @@ def resolve_route(argv: Sequence[str], /) -> tuple[CliRoute, tuple[str, ...]]:
         pos = _count_positionals(after)
         if sub == "record" and pos >= 2:
             return CliRoute(("calibrate", "record"), "calibrate"), after
-        if sub == "bind-profiler":
+        if sub == "bind-profiler" and (
+            pos >= BIND_PROFILER_MIN_POSITIONALS
+            or any(tok in {"-h", "--help"} for tok in after)
+        ):
             return CliRoute(("calibrate", "bind-profiler"), "bind-profiler"), after
         if sub == "fit" and len(head) >= 3:
             fit_kind = head[2]

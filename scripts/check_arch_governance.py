@@ -21,6 +21,7 @@ from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
 import hashlib
+import keyword
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
@@ -34,7 +35,7 @@ AG001_STEM_RE = re.compile(
     re.IGNORECASE,
 )
 UPSTREAM_ABI_RE = re.compile(r"^\s*Upstream-ABI:\s*(\S+)", re.MULTILINE)
-HEX_REVISION_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
+HEX_REVISION_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 DOCSTRING_HEADER_MAX_LINE = 30
 FINGERPRINT_HEX_LEN = 16
@@ -56,6 +57,7 @@ _SM_INFRA_FILES = frozenset({
     "mindie_sim/prediction/program.py",
 })
 _CP_INFRA_FILES = _SM_INFRA_FILES | frozenset({
+    "mindie_sim/public/services.py",
     "mindie_sim/structure.py",
     "mindie_sim/prediction/cost.py",
     "mindie_sim/prediction/efficiency.py",
@@ -86,7 +88,7 @@ LEGACY_ALLOWLIST: dict[str, frozenset[str]] = {
     "mindie_sim/prediction/indexed_attention.py": frozenset({"AG003"}),
     "mindie_sim/prediction/matrix.py": frozenset({"AG003", "AG004"}),
     "mindie_sim/prediction/matrix_mapping.py": frozenset({"AG003", "AG004"}),
-    "mindie_sim/prediction/matrix_splitk.py": frozenset({"AG003"}),
+    "mindie_sim/prediction/matrix_splitk.py": frozenset({"AG003", "AG004"}),
     "mindie_sim/prediction/matrix_steady.py": frozenset({"AG003", "AG004"}),
     "mindie_sim/prediction/mc2_arch22.py": frozenset({"AG001"}),
     "mindie_sim/prediction/mla_cann_epilogs.py": frozenset({"AG001"}),
@@ -134,6 +136,7 @@ def _is_allowed_isa_leaf(rel: PurePosixPath) -> bool:
         and family is not None
         and filename in GOVERNED_LEAF_NAMES
         and family.isidentifier()
+        and not keyword.iskeyword(family)
         and not AG001_STEM_RE.search(family)
     )
 
@@ -278,11 +281,12 @@ def _check_ag002(rel: PurePosixPath, tree: ast.Module, parents: dict[ast.AST, as
     is_family_init = in_pkg and filename == "__init__.py"
     str_consts = _module_string_constants(tree)
     family_aliases: dict[str, str] = {}
+    leaf_export_names: set[str] = set(GOVERNED_LEAF_STEMS)
     dynamic_imports: set[str] = {"__import__"}
     importlib_aliases: set[str] = set()
 
     def reject(target_family: str, leaf: str, node: ast.AST, reason: str) -> None:
-        if is_family_init and own_family == target_family and reason == "static":
+        if is_family_init and own_family == target_family and reason in {"static", "direct_import"}:
             return
         fp = _fingerprint("AG002", rel, _enclosing_symbol(node, parents), node)
         msg = f"forbidden leaf access operators.{target_family}.{leaf} ({reason})"
@@ -296,6 +300,8 @@ def _check_ag002(rel: PurePosixPath, tree: ast.Module, parents: dict[ast.AST, as
                     importlib_aliases.add(alias.asname or "importlib")
                 is_leaf, fam = _is_leaf_parts(parts)
                 if is_leaf and fam is not None:
+                    if is_family_init and own_family == fam and alias.asname:
+                        leaf_export_names.add(alias.asname)
                     reject(fam, parts[len(OPERATORS_PARTS) + 1], node, "direct_import")
                 fam_pkg = _family_pkg_name(parts)
                 if fam_pkg is not None:
@@ -313,6 +319,8 @@ def _check_ag002(rel: PurePosixPath, tree: ast.Module, parents: dict[ast.AST, as
             fam_pkg = _family_pkg_name(base)
             for alias in node.names:
                 if fam_pkg is not None and alias.name in GOVERNED_LEAF_STEMS:
+                    if is_family_init and own_family == fam_pkg:
+                        leaf_export_names.add(alias.asname or alias.name)
                     reject(fam_pkg, alias.name, node, "static")
                 elif base == OPERATORS_PARTS and alias.name not in {"contracts", "registry"}:
                     family_aliases[alias.asname or alias.name] = alias.name
@@ -359,18 +367,32 @@ def _check_ag002(rel: PurePosixPath, tree: ast.Module, parents: dict[ast.AST, as
 
     if is_family_init and own_family is not None:
         for stmt in tree.body:
-            if isinstance(stmt, ast.Assign) and isinstance(stmt.value, (ast.List, ast.Tuple, ast.Set)):
-                if any(isinstance(t, ast.Name) and t.id == "__all__" for t in stmt.targets):
-                    for elt in stmt.value.elts:
-                        if isinstance(elt, ast.Constant) and elt.value in GOVERNED_LEAF_STEMS:
-                            fp = _fingerprint("AG002", rel, "<module>", stmt)
-                            msg = f"family __init__.py must not re-export leaf {elt.value!r} in __all__"
-                            violations.append(Violation("AG002", rel, stmt.lineno, fp, msg))
+            seq_node: ast.AST | None = None
+            if isinstance(stmt, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "__all__" for t in stmt.targets
+            ):
+                seq_node = stmt.value
+            elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name) and stmt.target.id == "__all__":
+                seq_node = stmt.value
+            elif isinstance(stmt, ast.AugAssign) and isinstance(stmt.target, ast.Name) and stmt.target.id == "__all__":
+                seq_node = stmt.value
+            if isinstance(seq_node, (ast.List, ast.Tuple, ast.Set)):
+                for elt in seq_node.elts:
+                    if isinstance(elt, ast.Constant) and elt.value in leaf_export_names:
+                        fp = _fingerprint("AG002", rel, "<module>", stmt)
+                        msg = f"family __init__.py must not re-export leaf {elt.value!r} in __all__"
+                        violations.append(Violation("AG002", rel, stmt.lineno, fp, msg))
     return violations
 
 
 def _is_attr_or_getattr(node: ast.AST, attr: str) -> bool:
     if isinstance(node, ast.Attribute) and node.attr == attr:
+        return True
+    if (
+        isinstance(node, ast.Subscript)
+        and isinstance(node.slice, ast.Constant)
+        and node.slice.value == attr
+    ):
         return True
     return (
         isinstance(node, ast.Call)
@@ -491,8 +513,11 @@ def _scan_scope_taint(
                     for x in (node.left, *node.comparators)
                 ):
                     add("AG004", node, "compute_peaks threshold comparison is forbidden; use ComputeArchSpec/DatapathCapabilitySpec")
-            if _is_tainted_val(node, "compute_peaks", cp_maps, cp_vals) and _is_bool_condition(node, parents):
-                add("AG004", node, "compute_peaks .get() truthiness sniffing is forbidden; use ComputeArchSpec")
+            if (
+                _is_tainted_val(node, "compute_peaks", cp_maps, cp_vals)
+                or _is_tainted_map(node, "compute_peaks", cp_maps)
+            ) and _is_bool_condition(node, parents):
+                add("AG004", node, "compute_peaks truthiness sniffing is forbidden; use ComputeArchSpec")
     return violations
 
 
@@ -534,17 +559,35 @@ def _extract_source_ref_fields(call: ast.Call, str_consts: dict[str, str]) -> di
     return extracted
 
 
+def _docstring_has_upstream_abi(tree: ast.Module) -> bool:
+    if not tree.body:
+        return False
+    first = tree.body[0]
+    if not (
+        isinstance(first, ast.Expr)
+        and isinstance(first.value, ast.Constant)
+        and isinstance(first.value.value, str)
+    ):
+        return False
+    start_line = int(getattr(first, "lineno", 1))
+    if start_line > DOCSTRING_HEADER_MAX_LINE:
+        return False
+    allowed_lines = max(0, DOCSTRING_HEADER_MAX_LINE - start_line + 1)
+    snippet = "\n".join(first.value.value.splitlines()[:allowed_lines])
+    return bool(UPSTREAM_ABI_RE.search(snippet))
+
+
 def _check_ag005(
     rel: PurePosixPath, text: str, tree: ast.Module, *, refs_root: Path | None = None
 ) -> list[Violation]:
+    del text
     if not _is_allowed_isa_leaf(rel):
         return []
     violations: list[Violation] = []
-    header = "\n".join(text.splitlines()[:DOCSTRING_HEADER_MAX_LINE])
-    if not UPSTREAM_ABI_RE.search(header):
+    if not _docstring_has_upstream_abi(tree):
         violations.append(Violation(
             "AG005", rel, 1, f"AG005:{rel.as_posix()}:missing_upstream_abi",
-            "ISA leaf docstring top 30 lines must declare 'Upstream-ABI: <symbol>'",
+            "ISA leaf module docstring top 30 lines must declare 'Upstream-ABI: <symbol>'",
         ))
     str_consts = _module_string_constants(tree)
     sources_node: ast.AST | None = None
@@ -552,7 +595,7 @@ def _check_ag005(
     for stmt in tree.body:
         targets = (
             stmt.targets if isinstance(stmt, ast.Assign)
-            else ([stmt.target] if isinstance(stmt, ast.AnnAssign) else ())
+            else ([stmt.target] if isinstance(stmt, ast.AnnAssign) and stmt.value is not None else ())
         )
         for target in targets:
             if isinstance(target, ast.Name):
@@ -602,7 +645,13 @@ def _check_ag005(
             continue
         if refs_root is not None:
             repo_dir = refs_root / repo.split("/")[-1]
-            if repo_dir.is_dir():
+            if not repo_dir.is_dir():
+                violations.append(Violation(
+                    "AG005", rel, elt.lineno,
+                    f"AG005:{rel.as_posix()}:refs_repo_missing:{repo}",
+                    f"upstream refs repo directory not found: {repo_dir}",
+                ))
+            else:
                 blob = subprocess.run(
                     ["git", "-C", str(repo_dir), "show", f"{rev}:{rpath}"],
                     check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE,

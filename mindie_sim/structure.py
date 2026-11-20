@@ -566,7 +566,11 @@ def structure_inputs_from_graphs(
                 key = replica, op.stage
                 if key not in geometries:
                     start = (replica * parallel.pp + op.stage) * width
-                    geometries[key] = Geometry.from_devices(case.machine.dies[start:start + width])
+                    geometries[key] = Geometry.from_devices(
+                        case.machine.dies[start:start + width],
+                        links=case.machine.links,
+                        transfer_channels=case.machine.transfer_channels,
+                    )
     software = case.runtime.to_dict()
     selected = {key: software[key] for key in _SOFTWARE_FIELDS if key in software}
     selected["kernels"] = case.runtime.kernels

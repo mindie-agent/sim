@@ -38,7 +38,11 @@ from typing import Any, Mapping
 
 from mindie_sim.schema.case import Case as CaseSpec
 from mindie_sim.schema.common import ModelingError
-from mindie_sim.schema.datapath import DatapathCapabilitySpec, datapath_for_die
+from mindie_sim.schema.datapath import (
+    DatapathCapabilitySpec,
+    datapath_for_die,
+    ub_peer_edges_for_rank,
+)
 
 
 BOUNDED_CACHE_LIMIT = 4096
@@ -218,7 +222,15 @@ class ExecutionBindings:
             case.machine, case.runtime.parallel, "",
             collective_startup_mode=case.runtime.collective_startup_mode)
         datapaths = tuple(
-            (int(die.rank), datapath_for_die(die))
+            (
+                int(die.rank),
+                datapath_for_die(
+                    die,
+                    ub_peer_edges=ub_peer_edges_for_rank(
+                        die.rank, case.machine.links, case.machine.transfer_channels
+                    ),
+                ),
+            )
             for die in case.machine.dies
         )
         signature = (

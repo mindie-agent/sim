@@ -1637,11 +1637,17 @@ class RecipeBook:
             meta = dict(op.metadata) if op.metadata else {}
             requested_abi = meta.get("requested_abi")
             ctx = OperatorPlanningContext(
-                occurrence=OpOccurrence(0, int(getattr(op, "stage", 0)), None, str(op.op_id)),
+                occurrence=OpOccurrence(
+                    int(getattr(geometry, "replica", 0)),
+                    int(getattr(op, "stage", 0)),
+                    getattr(geometry, "rank", None),
+                    str(op.op_id),
+                ),
                 geometry=geometry,
                 datapath=datapath,
                 recipe_book=book,
                 requested_abi=str(requested_abi) if requested_abi else None,
+                stream_owners=getattr(geometry, "stream_owners", None),
             )
             resolved = dispatcher.resolve_plan(op, ctx)
             return resolved.recipe
@@ -1740,10 +1746,7 @@ class RecipeBook:
                     _mxfp4_config(op)
         else:
             governed = self._family_registry.match(op)
-            if governed is not None and (
-                recipe_name in governed.owned_recipe_ids
-                or recipe_name not in self.recipes
-            ):
+            if governed is not None:
                 recipe = self._governed_recipe(governed)
             else:
                 recipe = self.recipes.get(recipe_name, self.families.get(

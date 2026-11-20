@@ -354,7 +354,11 @@ def lightning_indexer_reason(case, layers):
         return "lightning_indexer_requires_declared_index_geometry"
     worst = max(layers, key=lambda plan: (plan.index_heads, plan.index_topk,
                                           plan.index_dim))
-    geometry = Geometry.from_devices(case.machine.dies)
+    geometry = Geometry.from_devices(
+        case.machine.dies,
+        links=case.machine.links,
+        transfer_channels=case.machine.transfer_channels,
+    )
     recipe = li.recipes()[li.RECIPE]
     page = max(1, int(case.runtime.kv_block_size))
     topk = max(1, worst.index_topk)

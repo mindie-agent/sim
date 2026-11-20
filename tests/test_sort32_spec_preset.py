@@ -113,7 +113,7 @@ def test_per_device_clock_is_resolved_after_inheritance_and_macro_work_stays_unk
     assert [execute(device) for device in devices] == pytest.approx([.016, .008])
     inventory = PrimitiveInventory({"vbitsort32": 7, "vmrgsort4v2": 9,
                                     "source_sort32_blocks": 128})
-    priced, unknown = inventory.partition(Geometry.from_devices(devices).resource_units)
+    priced, unknown = inventory.partition(Geometry.from_devices((devices[0],)).resource_units)
     assert priced.resources == {"vbitsort32": 7}
     assert unknown == {"vmrgsort4v2": 9, "source_sort32_blocks": 128}
 

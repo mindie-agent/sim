@@ -464,7 +464,10 @@ def build_stage_profiles(case: CaseSpec, namespace: str = "", *,
                     "representative_shard_requires_matching_resource_geometry:"
                     f"replica={replica}:stage={stage};"
                     "heterogeneous_owners_require_per_rank_execution")
-            compute_arch, datapath = datapath_for_devices(dies)
+            compute_arch, datapath = datapath_for_devices(
+                dies, links=case.machine.links,
+                transfer_channels=case.machine.transfer_channels,
+            )
             roles = dict(dies[0].rates)
             work_units = {**NATIVE_WORK_UNITS, **dict(dies[0].work_units)}
             rates = {
@@ -1458,19 +1461,39 @@ class Execution:
             pool_units.update(profile.pool_units)
             active_ranks.update(int(die.rank) for die in profile.dies)
         self.stream_owners: dict[tuple[int, int, str], Any] = {}
+        self.stream_quota_by_res: dict[tuple[str, str], str] = {}
         if stream_plans:
-            from .streams import bind_stream_owners
+            from .streams import bind_stream_owners, stream_quota_resources
             plans_seq = (
                 tuple(stream_plans.values())
                 if isinstance(stream_plans, _AbcMapping)
                 else tuple(stream_plans)
             )
             for plan in plans_seq:
+                matched = False
                 for (rep, stg), profile in self.stage_profiles.items():
-                    if rep == int(plan.rank):
-                        bound = bind_stream_owners(plan, profile.datapath)
-                        for stream_id, owners in bound.items():
-                            self.stream_owners[(rep, stg, stream_id)] = owners
+                    if rep != int(plan.rank):
+                        continue
+                    matched = True
+                    bound = bind_stream_owners(plan, profile.datapath)
+                    for stream_id, owners in bound.items():
+                        self.stream_owners[(rep, stg, stream_id)] = owners
+                    stage_rates = {res.name: float(res.rate) for res in profile.resources}
+                    qres, qmap = stream_quota_resources(
+                        bound,
+                        profile.datapath,
+                        resource_names=profile.names,
+                        rates=stage_rates,
+                        work_units=profile.work_units,
+                        replica=rep,
+                        stage=stg,
+                        namespace=self.namespace,
+                    )
+                    resources.extend(qres)
+                    for (sid, phys), qname in qmap.items():
+                        self.stream_quota_by_res[(phys, sid)] = qname
+                if not matched and selected_replica is None:
+                    raise ModelingError(f"stream_plan_unmatched_rank:{plan.rank}")
         self.topology = (
             bindings.topology
             if bindings is not None and bindings.topology is not None
@@ -1505,8 +1528,13 @@ class Execution:
         self.resource_rates = ResourceRates(self.engine.resources)
         # Hardware bindings are stage properties. Thousands of pending kernels
         # retain their own work/readiness, but share these immutable inputs.
-        self.stage_geometry = {key: Geometry.from_devices(dies)
-                               for key, dies in self.stage_dies.items()}
+        self.stage_geometry = {
+            key: Geometry.from_devices(
+                dies, links=case.machine.links,
+                transfer_channels=case.machine.transfer_channels,
+            )
+            for key, dies in self.stage_dies.items()
+        }
         self.stage_contexts = {key: self._stage_context(key, dies)
                                for key, dies in self.stage_dies.items()}
         self.work = dict.fromkeys(("flops", "vector_ops", "hbm_bytes", "link_bytes"), 0.0)
@@ -2917,8 +2945,7 @@ class Execution:
             return _ServiceSetupProgram(body, service.fixed_us / 1000.0)
         return body
 
-    @staticmethod
-    def _apply_stream_owners_program(context, program):
+    def _apply_stream_owners_program(self, context, program):
         owners = context.stream_owners
         if owners is None or context.datapath is None:
             return program
@@ -2935,6 +2962,11 @@ class Execution:
             stream_id=stream_id,
             label=str(getattr(context.op, "op_id", "op")),
         )
+        quota_map = {
+            phys: self.stream_quota_by_res[(phys, stream_id)]
+            for phys in context.resource_names.values()
+            if (phys, stream_id) in self.stream_quota_by_res
+        }
         return apply_stream_owners_to_program(
             program,
             owners,
@@ -2943,6 +2975,9 @@ class Execution:
             resource_units=context.resource_units,
             rates=context.rates,
             stream_id=stream_id,
+            quota_resources=quota_map or None,
+            pool_names=context.pool_names,
+            pool_units=context.pool_units,
         )
 
     def prepare(self, op, replica=ZERO):
@@ -2950,9 +2985,12 @@ class Execution:
         from .unmodeled_gate import assert_timing_supported
         assert_timing_supported(None, (op,), entry="execution_prepare")
         geom = self.stage_geometry[replica, op.stage]
+        stream_owners = self.stream_owners.get((replica, op.stage, op.stream or "main"))
+        if stream_owners is not None or geom.replica != int(replica):
+            geom = replace(geom, replica=int(replica), stream_owners=stream_owners)
         startup_mode = self.case.runtime.collective_startup_mode
         prep_key = (
-            id(self.recipes), _freeze_key(geom), startup_mode, op.stage,
+            id(self.recipes), _freeze_key(geom), stream_owners, startup_mode, op.stage,
             op.family, op.recipe, op.phase, op.dtype, op.layout,
             op.semantic_shape, op.local_shape, op.padded_shape,
             op.launch_shape, op.flops, op.matrix_flops, op.mte2_bytes,
@@ -3011,7 +3049,10 @@ class Execution:
         profile = self.stage_profiles.get(key)
         if profile is None:
             names = self.stage_names[key]
-            compute_arch, datapath = datapath_for_devices(dies)
+            compute_arch, datapath = datapath_for_devices(
+                dies, links=self.case.machine.links,
+                transfer_channels=self.case.machine.transfer_channels,
+            )
             return RecipeContext(
                 None, {}, names, self.resource_rates,
                 dies[FIRST].aic_count,

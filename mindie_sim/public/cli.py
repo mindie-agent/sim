@@ -86,6 +86,8 @@ def extensions_main(argv: Sequence[str] | None = None, *,
             payload = context.describe(extension_id=args.id)
             payload["inspection"] = {"id": args.id}
         return _emit(payload, args.output)
+    except TimeoutError:
+        raise
     except (ExtensionError, OSError, ValueError) as exc:
         print(json.dumps({"status": "failed", "error": str(exc)}), file=sys.stderr)
         return 2
@@ -109,6 +111,8 @@ def profile_main(argv: Sequence[str] | None = None, *,
     try:
         profile = load_user_profile(args.file, profile_id=args.profile_id)
         return _emit(profile.describe(), args.output)
+    except TimeoutError:
+        raise
     except (ExtensionError, OSError, ValueError) as exc:
         print(json.dumps({"status": "failed", "error": str(exc)}), file=sys.stderr)
         return 2

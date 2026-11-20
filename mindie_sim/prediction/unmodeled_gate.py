@@ -169,8 +169,31 @@ def structure_hints(ops=(), case_like=None) -> tuple[dict, ...]:
     return tuple(_hint_for(blocker) for blocker in collect_blockers(case_like, ops))
 
 
+def _runtime_enable_dbo(case_like) -> bool:
+    if case_like is None:
+        return False
+    if isinstance(case_like, Mapping):
+        rt = case_like.get("runtime")
+        return bool(rt.get("enable_dbo", False)) if isinstance(rt, Mapping) else False
+    rt = getattr(case_like, "runtime", None)
+    return bool(getattr(rt, "enable_dbo", False)) if rt is not None else False
+
+
 def assert_timing_supported(case_like=None, ops=(), *, entry: str) -> None:
-    """Refuse to price a graph whose attention core has no physical model."""
+    """Refuse to price a graph whose attention core or DBO mode has no physical model."""
+    if _runtime_enable_dbo(case_like):
+        raise UnmodeledCapabilityError(
+            capability="dbo",
+            entry=entry,
+            code="unmodeled_in_op_dbo_pending_stage3",
+            message=(
+                f"{entry} refused to fabricate timing for enable_dbo=True: "
+                "whole-graph DBO splitting has been removed and in-operator "
+                "DBO is scheduled for operators/grouped_moe & operators/mc2."
+            ),
+            affected_results=_affected_results(entry),
+            minimal_replay_input={"enable_dbo": True},
+        )
     blockers = collect_blockers(case_like, ops)
     if not blockers:
         return

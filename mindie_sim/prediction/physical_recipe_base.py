@@ -186,7 +186,8 @@ def phased_program(context, phases: Sequence[Phase], *,
 
 def _tile_count(context, *, cap: int = MAX_TILES) -> int:
     op = context.op
-    units = int(context.resource_units.get(
+    effective_aiv = int(getattr(context, "effective_aiv_cores", 0) or 0)
+    units = effective_aiv or int(context.resource_units.get(
         "vector", max(1, context.core_count)))
     bytes_to_cover = max(float(getattr(op, "mte2_bytes", 0.0) or 0.0),
                          float(getattr(op, "hbm_bytes", 0.0) or 0.0))

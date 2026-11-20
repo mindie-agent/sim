@@ -49,13 +49,15 @@ SOURCES: tuple[SourceRef, ...] = (
     ),
 )
 SUPPORTED_ABIS: frozenset[str] = frozenset({
-    "aclnnApplyRotaryPosEmb",
     "aclnnRotaryPositionEmbedding",
 })
 
-# Rotate-half per element: x*cos + rotate_half(x)*sin (2 mul + 1 neg + 1 add).
-ROTARY_OPS_PER_ELEMENT = 4
+# Rotate-half per element (ops-transformer rotate_half.h:124 & rotate_half_base.h:294-296):
+# Muls(sin, -1, halfD) = 0.5 + Mul(x, cos) = 1.0 + Mul(xNew, sin) = 1.0 + Add(xNew, x) = 1.0.
+ROTARY_OPS_PER_ELEMENT = 3.5
 COS_SIN_TENSOR_COUNT = 2
+BSND_MIN_RANK = 3
+TWO_DIM_RANK = 2
 MS_PER_SECOND = 1000.0
 AIV_DRAM_SERVICE_MODE = "mte2_aiv_dram"
 
@@ -78,7 +80,12 @@ def _derive_rotary_work(op: OpSpec) -> Work:
     elem_bytes = dtype_bytes(op.dtype or "bf16")
     elements = math.prod(shape)
     rotary_dim = shape[-1]
-    tokens = shape[0] if len(shape) >= 2 else 1
+    if len(shape) >= BSND_MIN_RANK:
+        tokens = math.prod(shape[:-2])
+    elif len(shape) == TWO_DIM_RANK:
+        tokens = shape[0]
+    else:
+        tokens = 1
     tensor_bytes = float(elements * elem_bytes)
     coeff_bytes = float(COS_SIN_TENSOR_COUNT * tokens * rotary_dim * elem_bytes)
     read_bytes = tensor_bytes + coeff_bytes
@@ -113,9 +120,9 @@ def _pipeline_spec(work: Work, dtype: str) -> FusedPipelineSpec:
     )
     mte3_bytes = float(work.resources.get("mte3", 0.0))
     vec_ops = float(work.resources.get("vector", 0.0))
-    io_total = mte2_bytes + mte3_bytes
-    read_hbm = hbm_total * (mte2_bytes / io_total) if io_total > 0.0 else hbm_total * 0.5
-    write_hbm = hbm_total - read_hbm
+    # Match physical_recipe_base.io_weight / vector_pipeline.py HBM read/write split.
+    write_hbm = min(hbm_total, max(0.0, mte3_bytes)) if hbm_total > 0.0 else 0.0
+    read_hbm = max(0.0, hbm_total - write_hbm)
     phases = (
         PipelinePhase(
             phase_id="tile_load",
@@ -154,13 +161,9 @@ def build(op: OpSpec, ctx: OperatorPlanningContext, /) -> OperatorPlan:
     work = declared if _has_declared_work(declared) else _derive_rotary_work(op)
     dtype = str(op.dtype or "bf16")
     spec = _pipeline_spec(work, dtype)
-
-    def lower(context: RecipeContext):
-        return _AIV_VECTOR_RECIPE.lower(context)
-
     return OperatorPlan(
         work=work,
-        program=lower,
+        program=_AIV_VECTOR_RECIPE.lower,
         metadata={
             "implementation": IMPLEMENTATION,
             "arch_id": str(ctx.compute_arch.arch_id),

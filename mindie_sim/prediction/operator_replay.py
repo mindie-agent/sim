@@ -158,7 +158,7 @@ def _communication_description(accounting, recipe):
 
 def cohort_operator_costs(case, ops, *, recipes, primitives=None,
                           replay_scope="none", input_ready_ms=0,
-                          evaluation=None):
+                          evaluation=None, stream_plans=None):
     """Isolate one complete transport cohort, attributing wire to source ranks."""
     from .cost import CostLedger
     from .evaluation import EvaluationContext, context_for
@@ -166,7 +166,8 @@ def cohort_operator_costs(case, ops, *, recipes, primitives=None,
            else EvaluationContext.create(case, recipes, primitives))
     execution = Execution(
         case, ctx.cost, recipes=recipes,
-        bindings=ctx.bindings, ledger=CostLedger(), evaluation=ctx)
+        bindings=ctx.bindings, ledger=CostLedger(), evaluation=ctx,
+        stream_plans=stream_plans)
     execution._compact_step = not execution.legacy_diagnostics
     execution.engine._compact_step = execution._compact_step
     engine, participants, identities, replica_scopes = execution.engine, [], {}, {}
@@ -222,7 +223,7 @@ def cohort_operator_costs(case, ops, *, recipes, primitives=None,
 
 
 def _cohort_costs(case, graphs, recipes, primitives, replay_scope, input_ready_ms,
-                  evaluation=None):
+                  evaluation=None, stream_plans=None):
     """Isolate joint transports once, retaining each replica's local programs."""
     from .dispatch import cohorts
 
@@ -261,7 +262,8 @@ def _cohort_costs(case, graphs, recipes, primitives, replay_scope, input_ready_m
             result = cohort_operator_costs(
                 case, dict(sorted(members.items())), recipes=recipes, primitives=primitives,
                 replay_scope={rank: scopes[rank] for rank in members},
-                input_ready_ms=input_ready_ms, evaluation=evaluation)
+                input_ready_ms=input_ready_ms, evaluation=evaluation,
+                stream_plans=stream_plans)
             result.update(id=f"cohort{len(cache)}", occurrences=0)
             for row in result["operators"]:
                 row.update(cohort_id=result["id"], occurrences=0, total_ms=0)
@@ -278,7 +280,7 @@ def _cohort_costs(case, graphs, recipes, primitives, replay_scope, input_ready_m
         result = operator_costs(
             case, local, recipes=recipes, primitives=primitives,
             replay_scope=scopes[rank], input_ready_ms=input_ready_ms, replica=rank,
-            evaluation=evaluation)
+            evaluation=evaluation, stream_plans=stream_plans)
         rows.extend({"replica": rank, **row} for row in result["operators"])
     isolation_modes = {item[-1] for item in isolation}
     return {
@@ -315,7 +317,7 @@ def _replay_scope(ops, declared):
 
 
 def operator_costs(case, ops, *, recipes=None, primitives=None, replay_scope=None,
-                    input_ready_ms=0, replica=0, evaluation=None):
+                    input_ready_ms=0, replica=0, evaluation=None, stream_plans=None):
     """Price local operators or complete replica->operators cohort mappings."""
     from .program import RecipeBook
     if input_ready_ms < 0 or not math.isfinite(input_ready_ms):
@@ -333,7 +335,7 @@ def operator_costs(case, ops, *, recipes=None, primitives=None, replay_scope=Non
         from .exposed_breakdown import unavailable_breakdown
         result = _cohort_costs(
             case, ops, recipes, primitives, replay_scope, input_ready_ms,
-            evaluation=ctx)
+            evaluation=ctx, stream_plans=stream_plans)
         result.update(unavailable_breakdown(
             "operator_only", boundary="operator_sum"))
         return result
@@ -352,20 +354,38 @@ def operator_costs(case, ops, *, recipes=None, primitives=None, replay_scope=Non
     for op in ops:
         if op.family == "barrier":
             continue
-        key = op.stage, physical_signature(op)
+        stream_key = (op.stream or "main") if stream_plans else ""
+        key = op.stage, physical_signature(op), stream_key
         if key not in groups:
             groups[key] = {"op": op, "count": 0}
         groups[key]["count"] += 1
     rows = []
     isolated_cache = getattr(ctx, "isolated_results", None)
     execution = None
+    stream_owners_lookup = {}
+    if stream_plans:
+        from .streams import bind_stream_owners
+        plans_seq = (
+            tuple(stream_plans.values())
+            if isinstance(stream_plans, Mapping)
+            else tuple(stream_plans)
+        )
+        for plan in plans_seq:
+            if int(plan.rank) != int(replica):
+                continue
+            for profile in ctx.bindings.stage_profiles:
+                if profile.replica == int(replica):
+                    bound = bind_stream_owners(plan, profile.datapath)
+                    for sid, owners in bound.items():
+                        stream_owners_lookup[(int(replica), profile.stage, sid)] = owners
     for group in groups.values():
         op = group["op"]
         signature = physical_signature(op)
         identity = physical_id(op)
         profile_key = ctx.bindings.profile_key(replica, op.stage)
+        op_owners = stream_owners_lookup.get((int(replica), int(op.stage), op.stream or "main"))
         cache_key = (profile_key, int(op.stage), signature, replay_scope,
-                     float(input_ready_ms))
+                     float(input_ready_ms), op_owners)
         if isolated_cache is not None:
             cached = isolated_cache.get(cache_key)
             if cached is not None:
@@ -377,7 +397,8 @@ def operator_costs(case, ops, *, recipes=None, primitives=None, replay_scope=Non
             execution = Execution(
                 case, ctx.cost, recipes=recipes,
                 bindings=ctx.bindings, ledger=CostLedger(),
-                isolated_replica=int(replica), evaluation=ctx)
+                isolated_replica=int(replica), evaluation=ctx,
+                stream_plans=stream_plans)
             execution._compact_step = not execution.legacy_diagnostics
             execution.engine._compact_step = execution._compact_step
         else:
@@ -390,6 +411,8 @@ def operator_costs(case, ops, *, recipes=None, primitives=None, replay_scope=Non
         engine = execution.engine
         ready = engine.submit("input_ready", release=input_ready_ms)
         program = execution.lower_program(context, recipe)
+        program = execution._apply_resource_service_program(context, program)
+        program = execution._apply_stream_owners_program(context, program)
         from .program import NativeProgram
         if isinstance(program, NativeProgram):
             # An isolated native call still uses its declared physical rank

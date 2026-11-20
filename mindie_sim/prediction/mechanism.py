@@ -75,12 +75,17 @@ class Geometry:
     compute_peaks: Mapping[str, float] = field(default_factory=dict)
     compute_arch: ComputeArchSpec | None = None
     datapath: DatapathCapabilitySpec | None = None
+    replica: int = 0
+    rank: int | None = None
+    stream_owners: object = None
 
     @classmethod
-    def from_devices(cls, devices):
+    def from_devices(cls, devices, *, links=(), transfer_channels=()):
         """Use the same representative-shard ownership in export and execution."""
         first = devices[0]
-        compute_arch, datapath = datapath_for_devices(devices)
+        compute_arch, datapath = datapath_for_devices(
+            devices, links=links, transfer_channels=transfer_channels
+        )
         roles = dict(first.rates).keys() | {"cube", "host"}
         modes = dict(first.service_modes)
         pools = dict(first.buffers)
@@ -95,6 +100,8 @@ class Geometry:
             dict(first.compute_peaks),
             compute_arch,
             datapath,
+            0,
+            int(first.rank),
         )
 
 
