@@ -29,6 +29,7 @@ DEFAULT_SECTOR_BYTES = 32
 DEFAULT_ALIGN_BYTES = 32
 DEFAULT_L2_GRANULE_BYTES = 128
 BINARY64_EXACT_INT_LIMIT = 1 << 53
+_MAX_EXPLICIT_SECTOR_INTERVALS = 4096
 HBM_DIR_READ = 0
 HBM_DIR_WRITE = 1
 VALID_COPY_PIPES = frozenset({"mte2_aic", "mte2_aiv", "mte3", "fixpipe"})
@@ -43,6 +44,47 @@ def _align_up(value: int, alignment: int) -> int:
     if value <= 0 or alignment <= 1:
         return max(0, value)
     return ((value + alignment - 1) // alignment) * alignment
+
+
+def _merge_byte_intervals(
+    intervals: Sequence[tuple[int, int]],
+) -> tuple[tuple[int, int], ...]:
+    cleaned = [(lo, hi) for lo, hi in intervals if hi > lo]
+    if not cleaned:
+        return ()
+    cleaned.sort()
+    merged: list[tuple[int, int]] = [cleaned[0]]
+    for lo, hi in cleaned[1:]:
+        p_lo, p_hi = merged[-1]
+        if lo <= p_hi:
+            if hi > p_hi:
+                merged[-1] = (p_lo, hi)
+        else:
+            merged.append((lo, hi))
+    return tuple(merged)
+
+
+def _intersect_byte_intervals(
+    left: Sequence[tuple[int, int]], right: Sequence[tuple[int, int]],
+) -> tuple[tuple[int, int], ...]:
+    if not left or not right:
+        return ()
+    out: list[tuple[int, int]] = []
+    i = j = 0
+    while i < len(left) and j < len(right):
+        lo = max(left[i][0], right[j][0])
+        hi = min(left[i][1], right[j][1])
+        if hi > lo:
+            out.append((lo, hi))
+        if left[i][1] < right[j][1]:
+            i += 1
+        else:
+            j += 1
+    return tuple(out)
+
+
+def _measure_byte_intervals(intervals: Sequence[tuple[int, int]]) -> int:
+    return sum(hi - lo for lo, hi in intervals)
 
 
 @dataclass(frozen=True, slots=True)
@@ -254,6 +296,28 @@ class AddressRunPlan:
             service_total += float(scale_sec)
         return sector_total, service_total
 
+    def sector_intervals(self) -> tuple[tuple[int, int], ...]:
+        """Return canonical disjoint ``[lo, hi)`` sector-aligned byte intervals."""
+        sec = self.sector_bytes
+        ivs: list[tuple[int, int]] = []
+        for run in self.runs:
+            if run.rows == 0 or run.row_bytes == 0:
+                continue
+            s0 = (run.base_byte // sec) * sec
+            if run.rows == 1 or run.stride_bytes == 0:
+                ivs.append((s0, _align_up(run.base_byte + run.row_bytes, sec)))
+            elif run.stride_bytes <= run.row_bytes + sec:
+                end = run.base_byte + (run.rows - 1) * run.stride_bytes + run.row_bytes
+                ivs.append((s0, _align_up(end, sec)))
+            elif run.rows <= _MAX_EXPLICIT_SECTOR_INTERVALS:
+                for step in range(run.rows):
+                    addr = run.base_byte + step * run.stride_bytes
+                    ivs.append(((addr // sec) * sec, _align_up(addr + run.row_bytes, sec)))
+            else:
+                end = run.base_byte + (run.rows - 1) * run.stride_bytes + run.row_bytes
+                ivs.append((s0, _align_up(end, sec)))
+        return _merge_byte_intervals(ivs)
+
 
 @dataclass(frozen=True, slots=True)
 class MemoryAccessPattern:
@@ -357,14 +421,53 @@ class BoundAccess:
     constraints: tuple[ConstraintTerm, ...]
     deliveries: tuple[CounterTerm, ...]
     after: tuple[str, ...] = ()
+    owner: int = 0
+    pipe_row_id: str = ""
+    l2_row_id: str = ""
+    row_rates: Mapping[str, float] = field(default_factory=dict)
 
-    def stage_work(self) -> dict[str, float]:
-        """Return merged physical resource demand mapping suitable for ``Stage``."""
+    def stage_placement(self) -> dict[str, tuple[int, ...]]:
+        """Pin the copy pipe to ``owner`` when it carries positive work."""
+        if not self.pipe_row_id:
+            return {}
+        if any(t.row_id == self.pipe_row_id and t.ms_per_progress > 0.0 for t in self.constraints):
+            return {self.pipe_row_id: (self.owner,)}
+        return {}
+
+    def stage_work(
+        self, *, resource_rates: Mapping[str, float] | None = None,
+    ) -> dict[str, float]:
+        """Return Engine-native work without double-dividing byte-rate pipes."""
         work: dict[str, float] = {}
         for term in self.constraints:
-            if term.ms_per_progress > 0.0:
-                work[term.row_id] = work.get(term.row_id, 0.0) + term.ms_per_progress
+            if term.ms_per_progress <= 0.0:
+                continue
+            rate = (
+                resource_rates[term.row_id]
+                if resource_rates is not None and term.row_id in resource_rates
+                else self.row_rates.get(term.row_id)
+            )
+            amt = term.ms_per_progress * float(rate) if rate is not None else term.ms_per_progress
+            work[term.row_id] = work.get(term.row_id, 0.0) + amt
         return work
+
+    def to_stage(
+        self,
+        name: str,
+        *,
+        after: Sequence[str] = (),
+        resource_rates: Mapping[str, float] | None = None,
+    ) -> Any:
+        """Build a coupled owner-pinned ``Stage`` for this bound access."""
+        from ..program.stages import Stage
+        deps = tuple(dict.fromkeys((*self.after, *after)))
+        work = self.stage_work(resource_rates=resource_rates)
+        delivs = tuple((c.counter_id, c.work_per_progress) for c in self.deliveries if c.work_per_progress > 0.0)
+        return Stage(
+            name, work=work, after=deps,
+            placement=self.stage_placement(), coupled=bool(work),
+            deliveries=delivs,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -420,254 +523,7 @@ class HbmBusSpec:
         )
 
 
-@dataclass(slots=True)
-class _ResidentL2Entry:
-    key: ReuseKey
-    working_set_bytes: int
-    version: int
-    dirty: bool
-    private_workspace: bool
-    evicted: bool = False
-
-
-class AdmissionMemoryView:
-    """Dynamic per-die shared L2 working-set knee tracker across N >= 1 active streams."""
-
-    def __init__(
-        self,
-        l2_capacity_by_die: Mapping[int, int],
-        *,
-        l2_buffer_units_by_die: Mapping[int, int] | None = None,
-        granule_bytes: int = DEFAULT_L2_GRANULE_BYTES,
-    ) -> None:
-        if type(granule_bytes) is not int or granule_bytes < 1:
-            raise ModelingError(f"l2_granule_invalid:{granule_bytes!r}")
-        self.granule_bytes = granule_bytes
-        self._l2_capacity: dict[int, int] = {}
-        self._reserved: dict[int, dict[str, int]] = {}
-        self._active_streams: dict[int, set[str]] = {}
-        self._resident: dict[ReuseKey, _ResidentL2Entry] = {}
-        units_map = dict(l2_buffer_units_by_die or {})
-        for die, cap in l2_capacity_by_die.items():
-            if type(die) is not int or die < 0 or type(cap) is not int or cap < 0:
-                raise ModelingError(f"l2_capacity_invalid:{die!r}:{cap!r}")
-            if units_map.get(die, 1) != 1:
-                raise ModelingError("shared_l2_buffer_requires_one_die_owner")
-            self._l2_capacity[die] = cap
-            self._reserved[die] = {}
-            self._active_streams[die] = set()
-
-    def active_stream_count(self, die: int) -> int:
-        return len(self._active_streams.get(die, ()))
-
-    def reserved_bytes(self, die: int) -> int:
-        return sum(self._reserved.get(die, {}).values())
-
-    def effective_l2_bytes(self, die: int) -> int:
-        """Compute ``g * floor(max(0, C_L2 - C_reserved) / (g * max(1, n_active)))``."""
-        cap = self._l2_capacity.get(die)
-        if cap is None:
-            raise ModelingError(f"l2_die_undeclared:{die}")
-        avail = max(0, cap - self.reserved_bytes(die))
-        n_active = max(1, self.active_stream_count(die))
-        granule = self.granule_bytes
-        return granule * (avail // (granule * n_active))
-
-    def _evict_over_capacity(self, die: int) -> None:
-        eff = self.effective_l2_bytes(die)
-        for entry in self._resident.values():
-            if entry.key.die == die and not entry.evicted and entry.working_set_bytes > eff:
-                entry.evicted = True
-
-    def enter_stream(self, die: int, stream_id: str) -> int:
-        """Activate a reuse stream on ``die`` and immediately evict over-knee entries."""
-        if die not in self._l2_capacity:
-            raise ModelingError(f"l2_die_undeclared:{die}")
-        self._active_streams[die].add(stream_id)
-        self._evict_over_capacity(die)
-        return self.effective_l2_bytes(die)
-
-    def exit_stream(self, die: int, stream_id: str) -> int:
-        """Deactivate a reuse stream; never resurrects previously evicted entries."""
-        if die not in self._l2_capacity:
-            raise ModelingError(f"l2_die_undeclared:{die}")
-        self._active_streams[die].discard(stream_id)
-        return self.effective_l2_bytes(die)
-
-    def grant_reservation(self, die: int, alloc_id: str, size_bytes: int) -> int:
-        """Reserve explicit L2 capacity on ``die`` and immediately evict over-knee entries."""
-        if die not in self._l2_capacity:
-            raise ModelingError(f"l2_die_undeclared:{die}")
-        if type(size_bytes) is not int or size_bytes < 0:
-            raise ModelingError(f"l2_reservation_invalid:{alloc_id}:{size_bytes!r}")
-        self._reserved[die][alloc_id] = size_bytes
-        self._evict_over_capacity(die)
-        return self.effective_l2_bytes(die)
-
-    def release_reservation(self, die: int, alloc_id: str) -> int:
-        """Release explicit L2 reservation without resurrecting evicted lines."""
-        if die not in self._l2_capacity:
-            raise ModelingError(f"l2_die_undeclared:{die}")
-        self._reserved[die].pop(alloc_id, None)
-        return self.effective_l2_bytes(die)
-
-    def retire_workspace(self, key: ReuseKey) -> None:
-        """Terminate dead private workspace residency without DRAM writeback."""
-        self._resident.pop(key, None)
-
-    def is_resident(self, key: ReuseKey) -> bool:
-        entry = self._resident.get(key)
-        return entry is not None and not entry.evicted
-
-    def admit_access(
-        self,
-        pattern: MemoryAccessPattern,
-        aligned_bytes: int,
-    ) -> tuple[int, int]:
-        """Classify ``(l2_hit_bytes, dram_miss_copy_bytes)`` and update L2 state."""
-        if aligned_bytes <= 0:
-            return 0, 0
-        key = pattern.reuse_key
-        if key is None:
-            return 0, aligned_bytes
-        if key.die != pattern.die:
-            raise ModelingError(f"reuse_key_die_mismatch:{key.die}!={pattern.die}")
-        self.enter_stream(key.die, key.reuse_stream)
-        eff = self.effective_l2_bytes(key.die)
-        working_set = (
-            pattern.reuse_distance_bytes
-            if pattern.reuse_distance_bytes is not None else aligned_bytes
-        )
-        existing = self._resident.get(key)
-        if pattern.direction == "read":
-            if (
-                existing is not None
-                and not existing.evicted
-                and existing.version == pattern.version
-                and working_set <= eff
-            ):
-                return aligned_bytes, 0
-            if working_set <= eff:
-                self._resident[key] = _ResidentL2Entry(
-                    key=key,
-                    working_set_bytes=working_set,
-                    version=pattern.version,
-                    dirty=False,
-                    private_workspace=pattern.visibility.private_workspace,
-                    evicted=False,
-                )
-            elif existing is not None:
-                existing.evicted = True
-            return 0, aligned_bytes
-        # Write path: private workspace fitting in C_eff avoids DRAM writeback;
-        # live-out dirty writes settle to DRAM.
-        if pattern.visibility.private_workspace and not pattern.visibility.live_out and working_set <= eff:
-            self._resident[key] = _ResidentL2Entry(
-                key=key,
-                working_set_bytes=working_set,
-                version=pattern.version,
-                dirty=True,
-                private_workspace=True,
-                evicted=False,
-            )
-            return aligned_bytes, 0
-        if working_set <= eff:
-            self._resident[key] = _ResidentL2Entry(
-                key=key,
-                working_set_bytes=working_set,
-                version=pattern.version,
-                dirty=False,
-                private_workspace=False,
-                evicted=False,
-            )
-        elif existing is not None:
-            existing.evicted = True
-        return 0, aligned_bytes
-
-
-def bind_memory_access(
-    pattern: MemoryAccessPattern,
-    state: AdmissionMemoryView | None,
-    *,
-    hbm_bus: HbmBusSpec,
-    copy_hit_bytes_per_ms: float,
-    copy_miss_bytes_per_ms: float,
-    l2_bytes_per_ms: float,
-    pipe_row_id: str,
-    l2_row_id: str,
-    burst_rules: Sequence[BurstTurnRule] = (),
-) -> BoundAccess:
-    """Bind one ``MemoryAccessPattern`` into exact 3-ledger audit and normalized row terms."""
-    if hbm_bus.die != pattern.die:
-        raise ModelingError(f"hbm_bus_die_mismatch:{hbm_bus.die}!={pattern.die}")
-    if copy_hit_bytes_per_ms <= 0.0 or copy_miss_bytes_per_ms <= 0.0 or l2_bytes_per_ms <= 0.0:
-        raise ModelingError("bind_access_pipe_rate_nonpositive")
-
-    aligned_bytes = pattern.runs.aligned_copy_bytes()
-    if aligned_bytes == 0:
-        ledger = ByteLedger(
-            logical_tensor_bytes=pattern.logical_bytes,
-            aligned_transfer_bytes=0,
-            dram_bus_transaction_bytes=0.0,
-            l2_hit_bytes=0,
-            dram_miss_copy_bytes=0,
-            dram_sector_bytes=0,
-        )
-        after = (pattern.visibility.producer_event,) if pattern.visibility.producer_event else ()
-        return BoundAccess(ledger=ledger, constraints=(), deliveries=(), after=after)
-
-    if state is not None:
-        hit_bytes, miss_bytes = state.admit_access(pattern, aligned_bytes)
-    else:
-        hit_bytes, miss_bytes = 0, aligned_bytes
-
-    if miss_bytes > 0:
-        sector_bytes, dram_service_bytes = pattern.runs.dram_sector_and_service(burst_rules)
-        if hit_bytes > 0 and aligned_bytes > 0:
-            miss_ratio = float(miss_bytes) / float(aligned_bytes)
-            sector_bytes = int(round(sector_bytes * miss_ratio))
-            dram_service_bytes *= miss_ratio
-    else:
-        sector_bytes = 0
-        dram_service_bytes = 0.0
-
-    ledger = ByteLedger(
-        logical_tensor_bytes=pattern.logical_bytes,
-        aligned_transfer_bytes=aligned_bytes,
-        dram_bus_transaction_bytes=dram_service_bytes,
-        l2_hit_bytes=hit_bytes,
-        dram_miss_copy_bytes=miss_bytes,
-        dram_sector_bytes=sector_bytes,
-    )
-
-    constraints: list[ConstraintTerm] = []
-    pipe_ms = (
-        float(hit_bytes) / copy_hit_bytes_per_ms
-        + float(miss_bytes) / copy_miss_bytes_per_ms
-    )
-    if pipe_ms > 0.0:
-        constraints.append(ConstraintTerm(pipe_row_id, pipe_ms))
-    if hit_bytes > 0:
-        constraints.append(ConstraintTerm(l2_row_id, float(hit_bytes) / l2_bytes_per_ms))
-    deliveries: list[CounterTerm] = [CounterTerm(pipe_row_id, float(aligned_bytes))]
-    if hit_bytes > 0:
-        deliveries.append(CounterTerm(l2_row_id, float(hit_bytes)))
-    if dram_service_bytes > 0.0:
-        term_r, term_w = hbm_bus.terms_for(pattern.direction, dram_service_bytes)
-        if term_r.ms_per_progress > 0.0:
-            constraints.append(term_r)
-        if term_w.ms_per_progress > 0.0:
-            constraints.append(term_w)
-        ctr_id = hbm_bus.ctr_r if pattern.direction == "read" else hbm_bus.ctr_w
-        deliveries.append(CounterTerm(ctr_id, dram_service_bytes))
-
-    after = (pattern.visibility.producer_event,) if pattern.visibility.producer_event else ()
-    return BoundAccess(
-        ledger=ledger,
-        constraints=tuple(constraints),
-        deliveries=tuple(deliveries),
-        after=after,
-    )
+from .l2_residency import AdmissionMemoryView, DirtyWriteback, bind_memory_access
 
 
 __all__ = [
@@ -683,6 +539,7 @@ __all__ = [
     "DEFAULT_ALIGN_BYTES",
     "DEFAULT_L2_GRANULE_BYTES",
     "DEFAULT_SECTOR_BYTES",
+    "DirtyWriteback",
     "HBM_DIR_READ",
     "HBM_DIR_WRITE",
     "HbmBusSpec",

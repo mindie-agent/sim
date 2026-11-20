@@ -78,7 +78,7 @@ def _solve_two_flow_slot(
 def _coupled_demand_and_cap_limit(resources, task):
     rem = task.remaining
     prep = getattr(task, "prepared", None)
-    if prep is not None:
+    if prep is not None and not task.service:
         c_dem = prep.coupled_demand
         if c_dem is not None and len(rem) == len(c_dem):
             return c_dem, prep.coupled_cap_limit
@@ -164,8 +164,7 @@ def _uncoupled_component_metrics(resources, name: str, r_u: float, tu):
     pu_map = tu.placement
     uu = pu_map.get(name) if pu_map else None
     uc_u = res.units if uu is None else len(uu)
-    denom_u = u_cap * uc_u
-    amount_u = r_u / (r_u / denom_u) if denom_u > 0.0 else 0.0
+    amount_u = r_u / (r_u / (u_cap * uc_u)) if u_cap > 0.0 else 0.0
     lim_u = math.inf
     caps_u = tu.caps
     if caps_u and amount_u > 0.0:
@@ -184,7 +183,7 @@ def _coupled_pair_mixed_fast(resources, kc, tc, ku, tu):
     rem_u = tu.remaining
     prep_c = tc.prepared
     if (
-        prep_c is not None and prep_c.coupled_res_info is not None
+        prep_c is not None and not tc.service and prep_c.coupled_res_info is not None
         and len(rem_c) == len(prep_c.coupled_demand) and len(rem_u) == 1
     ):
         name_u, r_u = next(iter(rem_u.items()))
@@ -230,7 +229,7 @@ def _coupled_pair_mixed_fast(resources, kc, tc, ku, tu):
                 )
     c_info = None
     c_excl = None
-    if prep_c is None or prep_c.coupled_demand is None:
+    if prep_c is None or prep_c.coupled_demand is None or tc.service:
         for name in rem_c:
             if resources[name].policy == "fifo":
                 return None
@@ -265,7 +264,7 @@ def _coupled_pair_mixed_fast(resources, kc, tc, ku, tu):
                         continue
                     if uc is None or uu is None:
                         return None
-                    if not (uc[-1] < uu[0] or uu[-1] < uc[0]) and not set(uc).isdisjoint(uu):
+                    if not set(uc).isdisjoint(uu):
                         return None
                     if c_lim_c < limit_c:
                         limit_c = c_lim_c
@@ -300,7 +299,7 @@ def _coupled_pair_mixed_fast(resources, kc, tc, ku, tu):
             continue
         if uc is None or uu is None:
             return None
-        if not (uc[-1] < uu[0] or uu[-1] < uc[0]) and not set(uc).isdisjoint(uu):
+        if not set(uc).isdisjoint(uu):
             return None
         if c_lim_c < limit_c:
             limit_c = c_lim_c
@@ -426,7 +425,7 @@ def _coupled_pair_fast(resources, k0, t0, k1, t1):
         return _coupled_pair_mixed_fast(resources, k0, t0, k1, t1)
     prep0, prep1 = t0.prepared, t1.prepared
     c_info0 = c_info1 = None
-    if prep0 is None or prep0.coupled_demand is None:
+    if prep0 is None or prep0.coupled_demand is None or t0.service:
         if any(resources[name].policy == "fifo" for name in rem0):
             return None
         demand0, limit0 = _coupled_demand_and_cap_limit(resources, t0)
@@ -436,7 +435,7 @@ def _coupled_pair_fast(resources, k0, t0, k1, t1):
             c_info0 = prep0.coupled_res_info[0]
     else:
         demand0, limit0 = _coupled_demand_and_cap_limit(resources, t0)
-    if prep1 is None or prep1.coupled_demand is None:
+    if prep1 is None or prep1.coupled_demand is None or t1.service:
         if any(name not in rem0 and resources[name].policy == "fifo" for name in rem1):
             return None
         demand1, limit1 = _coupled_demand_and_cap_limit(resources, t1)
@@ -466,7 +465,7 @@ def _coupled_pair_fast(resources, k0, t0, k1, t1):
                 continue
             if u0 is None or u1 is None:
                 return None
-            if not (u0[-1] < u1[0] or u1[-1] < u0[0]) and not set(u0).isdisjoint(u1):
+            if not set(u0).isdisjoint(u1):
                 return None
             if clim0 < limit0:
                 limit0 = clim0
@@ -503,7 +502,7 @@ def _coupled_pair_fast(resources, k0, t0, k1, t1):
                 continue
             if u0 is None or u1 is None:
                 return None
-            if not (u0[-1] < u1[0] or u1[-1] < u0[0]) and not set(u0).isdisjoint(u1):
+            if not set(u0).isdisjoint(u1):
                 return None
             if pu0:
                 c_lim = cap / pu0
@@ -745,16 +744,22 @@ def coupled_rates(resources, tasks):
                     result.setdefault(name, {})[keys[flow]] = amount * limit
         return result
 
+    def _slot_slope(rows):
+        s = c = 0.0
+        for flow, x in rows:
+            if active[flow]:
+                t = s + x
+                c += ((s - t) + x) if abs(s) >= abs(x) else ((x - t) + s)
+                s = t
+        return s + c
+
     remaining = capacities
     assigned = [0.0] * len(keys)
     active = [limit > 0 for limit in limits]
     pending = [flow for flow, enabled in enumerate(active) if enabled]
-    slopes = [sum(value for flow, value in rows if active[flow]) for rows in consumers]
+    slopes = [_slot_slope(rows) for rows in consumers]
     while pending:
-        bounds = [
-            amount / slope if slope else math.inf
-            for amount, slope in zip(remaining, slopes)
-        ]
+        bounds = [amount / slope if slope else math.inf for amount, slope in zip(remaining, slopes)]
         delta = min(min(bounds), min(limits[flow] - assigned[flow] for flow in pending))
         for slot, slope in enumerate(slopes):
             if slope:
@@ -774,7 +779,7 @@ def coupled_rates(resources, tasks):
         pending = survivors
         if pending:
             for slot in changed:
-                slopes[slot] = sum(value for flow, value in consumers[slot] if active[flow])
+                slopes[slot] = _slot_slope(consumers[slot])
 
     result = {}
     for flow, fraction in enumerate(assigned):

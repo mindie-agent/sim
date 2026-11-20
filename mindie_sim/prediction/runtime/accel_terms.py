@@ -33,6 +33,8 @@ from .prepared_terms import (
 DEFAULT_OBS_BUFFER_CAP = 4096
 NS_PER_MS = 1_000_000.0
 MAX_WIDENED_LINK_BITS = 64
+TERMS_ABI_VERSION = 3
+TERMS_ABI_PROBE_CELLS = 16
 _PAD_BYTES_CAPACITY_ROW = 7
 _OBS_BUFFERS: weakref.WeakKeyDictionary[Any, tuple[Any, Any, int]] = (
     weakref.WeakKeyDictionary()
@@ -127,34 +129,76 @@ class MsimObs(ctypes.Structure):
 
 class MsimSlotGen(ctypes.Structure):
     _fields_ = [
-        ("ring_id", ctypes.c_uint32),
+        ("occurrence", ctypes.c_uint64),
+        ("generation", ctypes.c_uint64),
+        ("allocation_id", ctypes.c_uint64),
+        ("die", ctypes.c_uint32),
+        ("owner", ctypes.c_uint32),
+        ("pool_id", ctypes.c_uint32),
         ("slot_id", ctypes.c_uint32),
-        ("gen", ctypes.c_uint64),
-        ("producer_task_id", ctypes.c_uint64),
-        ("publish_event_id", ctypes.c_uint64),
-        ("last_use_event_id", ctypes.c_uint64),
+        ("producer_node", ctypes.c_uint32),
+        ("publish_node", ctypes.c_uint32),
+        ("last_use_node", ctypes.c_uint32),
         ("consumer_count", ctypes.c_uint32),
-        ("reader_done_count", ctypes.c_uint32),
     ]
 
 
 class MsimDep(ctypes.Structure):
     _fields_ = [
-        ("src_event_id", ctypes.c_uint64),
-        ("dst_task_id", ctypes.c_uint64),
+        ("src_node", ctypes.c_uint32),
+        ("dst_node", ctypes.c_uint32),
         ("kind", ctypes.c_uint16),
         ("flags", ctypes.c_uint16),
         ("pad", ctypes.c_uint32),
     ]
 
 
+def expected_terms_abi_probe() -> tuple[int, ...]:
+    """Return expected 16-cell ``msim_terms_abi_probe`` size/offset vector."""
+    return (
+        TERMS_ABI_VERSION,
+        ctypes.sizeof(MsimHbmBus),
+        int(MsimHbmBus.alpha_rw.offset),
+        ctypes.sizeof(MsimAccess),
+        int(MsimAccess.dram_service_bytes.offset),
+        ctypes.sizeof(MsimTerm),
+        ctypes.sizeof(MsimDelivery),
+        ctypes.sizeof(MsimProgress),
+        int(MsimProgress.max_dz_ms.offset),
+        ctypes.sizeof(MsimCapacityRow),
+        int(MsimCapacityRow.capacity.offset),
+        ctypes.sizeof(MsimObs),
+        int(MsimObs.work_done.offset),
+        ctypes.sizeof(MsimSlotGen),
+        int(MsimSlotGen.consumer_count.offset),
+        ctypes.sizeof(MsimDep),
+    )
+
+
+def verify_terms_abi(library: Any) -> tuple[int, ...]:
+    """Verify terms ABI version (>2) and all 16 struct sizes/offsets against C11."""
+    ver = int(library.msim_terms_abi_version())
+    if ver != TERMS_ABI_VERSION:
+        raise ModelingError(f"terms_abi_version_mismatch:{ver}!={TERMS_ABI_VERSION}")
+    buf = (ctypes.c_uint64 * TERMS_ABI_PROBE_CELLS)()
+    rc = int(library.msim_terms_abi_probe(buf, TERMS_ABI_PROBE_CELLS))
+    if rc != 0:
+        raise ModelingError(f"terms_abi_probe_failed:{rc}")
+    got = tuple(int(buf[i]) for i in range(TERMS_ABI_PROBE_CELLS))
+    exp = expected_terms_abi_probe()
+    if got != exp:
+        raise ModelingError(f"terms_abi_layout_mismatch:{got}!={exp}")
+    return got
+
+
 def bind_terms_abi(library: Any) -> Any:
-    """Bind ``_engine_accel_terms.h`` signatures on a loaded ctypes library."""
+    """Bind ``_engine_accel_terms.h`` signatures and verify layout on a CDLL."""
     if getattr(library, "_msim_terms_bound", False):
         return library
     c_void = ctypes.c_void_p
     c_i32 = ctypes.c_int32
     c_u32 = ctypes.c_uint32
+    c_u64 = ctypes.c_uint64
     c_u8 = ctypes.c_uint8
     c_dbl = ctypes.c_double
 
@@ -162,6 +206,16 @@ def bind_terms_abi(library: Any) -> Any:
     library.msim_ctx_create.restype = c_void
     library.msim_ctx_free.argtypes = [c_void]
     library.msim_ctx_free.restype = None
+
+    library.msim_terms_abi_version.argtypes = []
+    library.msim_terms_abi_version.restype = c_u32
+    library.msim_terms_abi_probe.argtypes = [ctypes.POINTER(c_u64), ctypes.c_size_t]
+    library.msim_terms_abi_probe.restype = c_i32
+    library.msim_validate_ring.argtypes = [
+        ctypes.POINTER(MsimSlotGen), c_u32,
+        ctypes.POINTER(MsimDep), c_u32, c_u32,
+    ]
+    library.msim_validate_ring.restype = c_i32
 
     library.msim_hbm_terms.argtypes = [
         ctypes.POINTER(MsimHbmBus), c_u8, c_dbl,
@@ -203,32 +257,110 @@ def bind_terms_abi(library: Any) -> Any:
     ]
     library.msim_read_term_state.restype = c_i32
 
+    verify_terms_abi(library)
     library._msim_terms_bound = True
     return library
 
 
-def has_asymmetric_cohort(engine: Any) -> bool:
-    """True when any live task has cohort_members broken by another live task."""
-    tasks = engine._tasks
-    if len(tasks) < 2:
-        return False
-    for seq, task in tasks.items():
-        if task.cohort_size <= 1 or not task.cohort_members or not task.remaining:
+def coupled_placement_proportional(engine: Any, task: Any) -> bool:
+    """True when multi-unit resources on a coupled task have proportional widths."""
+    if not (task.coupled and task.placement and len(task.remaining) > 1):
+        return True
+    first_u = first_tot = 0
+    for name in task.remaining:
+        res_obj = engine.resources[name]
+        if res_obj.units <= 1:
             continue
-        members_dict = dict(task.cohort_members)
-        for peer_seq, peer in tasks.items():
-            if peer_seq == seq or not peer.placement or not peer.remaining:
-                continue
-            for rname, members in members_dict.items():
-                if rname not in task.remaining or peer.remaining.get(rname, 0.0) <= 0.0:
-                    continue
-                peer_units = peer.placement.get(rname)
-                if peer_units is None:
-                    continue
-                peer_set = set(peer_units)
-                if len({len(peer_set.intersection(m)) for m in members}) > 1:
-                    return True
+        units = task.placement.get(name)
+        u_len = res_obj.units if units is None else len(units)
+        if first_tot == 0:
+            first_u, first_tot = u_len, res_obj.units
+        elif u_len * first_tot != first_u * res_obj.units:
+            return False
+    return True
+
+
+def _peer_breaks_cohort(task: Any, peer: Any) -> bool:
+    if not task.cohort_members or not peer.placement or not peer.remaining:
+        return False
+    for rname, members in task.cohort_members:
+        if rname not in task.remaining or peer.remaining.get(rname, 0.0) <= 0.0:
+            continue
+        peer_units = peer.placement.get(rname)
+        if peer_units is None:
+            continue
+        peer_set = set(peer_units)
+        if len({len(peer_set.intersection(m)) for m in members}) > 1:
+            return True
     return False
+
+
+def has_asymmetric_cohort(engine: Any) -> bool:
+    """True when an active/ready cohort touches FIFO or has symmetry broken now."""
+    now = engine.now
+    fifo_names = engine.fifo_resource_names() if engine._fifo_live else ()
+    live_now = [
+        t for t in engine._tasks.values()
+        if t.remaining and (t.start is not None or (t.waiting == 0 and t.release <= now))
+    ]
+    for task in live_now:
+        if task.cohort_size <= 1:
+            continue
+        if fifo_names and any(r in fifo_names for r in task.remaining):
+            return True
+        if not task.cohort_members:
+            continue
+        for peer in live_now:
+            if peer is not task and _peer_breaks_cohort(task, peer):
+                return True
+    return False
+
+
+def cohort_break_horizon(engine: Any, horizon: float) -> float:
+    """Clamp epoch horizon to the earliest future peer release breaking a cohort."""
+    cohorts = [
+        t for t in engine._tasks.values()
+        if t.cohort_size > 1 and t.cohort_members and t.remaining
+    ]
+    if not cohorts:
+        return horizon
+    now = engine.now
+    eff = horizon
+    for peer in engine._tasks.values():
+        if peer.start is not None or peer.waiting != 0 or peer.release <= now:
+            continue
+        if peer.release >= eff:
+            continue
+        if any(peer is not c and _peer_breaks_cohort(c, peer) for c in cohorts):
+            eff = peer.release
+    return eff
+
+
+def stop_slots_for_epoch(engine: Any, until: Sequence[Any]) -> list[int]:
+    """Collect ``until`` slots plus predecessors whose completion activates a cohort breaker."""
+    slots = engine._native_slots
+    out = [slots[e.sequence] for e in until if not e.done and e.sequence in slots]
+    cohorts = [
+        t for t in engine._tasks.values()
+        if t.cohort_size > 1 and t.cohort_members and t.remaining
+    ]
+    if not cohorts:
+        return out
+    seen = set(out)
+    tasks = engine._tasks
+    for seq, slot in slots.items():
+        if slot in seen:
+            continue
+        pred = tasks.get(seq)
+        if pred is None or not pred.event._waiters:
+            continue
+        for wseq in pred.event._waiters:
+            peer = tasks.get(wseq)
+            if peer is not None and any(peer is not c and _peer_breaks_cohort(c, peer) for c in cohorts):
+                out.append(slot)
+                seen.add(slot)
+                break
+    return out
 
 
 def widened_mask_for_task(task: Any) -> int | None:
@@ -253,14 +385,14 @@ def prepare_obs_bridge(backend: Any, engine: Any) -> None:
     arena = backend.arena
     if arena is None:
         return
-    lib = bind_terms_abi(arena.library)
     rec = getattr(engine, "_wave_recorder", None)
     entry = _OBS_BUFFERS.get(backend)
     if rec is None:
         if entry is not None:
-            lib.msim_set_obs_buffer(arena.ctx, None, 0)
+            bind_terms_abi(arena.library).msim_set_obs_buffer(arena.ctx, None, 0)
             _OBS_BUFFERS.pop(backend, None)
         return
+    lib = bind_terms_abi(arena.library)
     if entry is None or entry[0] != arena.ctx:
         buf = (MsimObs * DEFAULT_OBS_BUFFER_CAP)()
         rc = int(lib.msim_set_obs_buffer(arena.ctx, buf, DEFAULT_OBS_BUFFER_CAP))
@@ -269,13 +401,13 @@ def prepare_obs_bridge(backend: Any, engine: Any) -> None:
         _OBS_BUFFERS[backend] = (arena.ctx, buf, DEFAULT_OBS_BUFFER_CAP)
 
 
-def drain_obs_bridge(backend: Any, engine: Any) -> None:
+def drain_obs_bridge(backend: Any, engine: Any) -> bool:
     """Drain C11 ``msim_obs`` service records into ``engine._wave_recorder``."""
     rec = getattr(engine, "_wave_recorder", None)
     arena = backend.arena
     entry = _OBS_BUFFERS.get(backend)
     if rec is None or arena is None or entry is None or entry[0] != arena.ctx:
-        return
+        return False
     _, buf, cap = entry
     lib = bind_terms_abi(arena.library)
     overflow = ctypes.c_uint32(0)
@@ -297,12 +429,13 @@ def drain_obs_bridge(backend: Any, engine: Any) -> None:
             float(item.work_done),
         )
     if overflow.value > 0:
-        new_cap = cap * 2
+        new_cap = max(cap * 2, int(overflow.value))
         new_buf = (MsimObs * new_cap)()
         rc = int(lib.msim_set_obs_buffer(arena.ctx, new_buf, new_cap))
         if rc != 0:
             raise ModelingError(f"obs_buffer_grow_failed:{rc}")
         _OBS_BUFFERS[backend] = (arena.ctx, new_buf, new_cap)
+    return bool(count > 0 or overflow.value > 0)
 
 
 def record_native_starts(backend: Any, engine: Any, nstart: int) -> None:
@@ -317,7 +450,13 @@ def record_native_starts(backend: Any, engine: Any, nstart: int) -> None:
             owners = tuple(
                 sorted({u for units in (task.placement or {}).values() for u in units})
             ) or (0,)
-            rec.on_admit(seq, moment, owners=owners)
+            gen = int(task.metadata["generation"]) if task.metadata and "generation" in task.metadata else 0
+            blockers = ()
+            if task.blocker_event:
+                p_pipe = next(iter(task.demand), "")
+                r_ms = task.ready_at if task.ready_at is not None else moment
+                blockers = ((p_pipe, task.blocker_event, r_ms, task.blocker_reason or "publish"),)
+            rec.on_admit(seq, moment, owners=owners, generation=gen, blockers=blockers)
 
 
 class PreparedTermsRunner:
@@ -384,6 +523,59 @@ class PreparedTermsRunner:
         rc = int(self.library.msim_config_rows(self.ctx, arr if n else None, n))
         if rc != 0:
             raise ModelingError(f"msim_config_rows_failed:{rc}")
+        self._nprogs = 0
+        self._ncounters = 0
+
+    def terms_abi_probe(self) -> tuple[int, ...]:
+        """Return the C11 16-cell struct size/offset probe vector."""
+        return verify_terms_abi(self.library)
+
+    def roundtrip_ring(self, ring: Any) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
+        """Pack, validate via C11 ``msim_validate_ring``, and decode ring records."""
+        from .ring_buffer import DepRecord, SlotGenRecord
+        slot_recs, dep_recs = ring.to_c_records()
+        ns, nd = len(slot_recs), len(dep_recs)
+        s_arr = (MsimSlotGen * max(1, ns))()
+        for i, s in enumerate(slot_recs):
+            s_arr[i] = MsimSlotGen(
+                occurrence=int(s.occurrence), generation=int(s.generation),
+                allocation_id=int(s.allocation_id), die=int(s.die),
+                owner=int(s.owner), pool_id=int(s.pool_id), slot_id=int(s.slot_id),
+                producer_node=int(s.producer_node), publish_node=int(s.publish_node),
+                last_use_node=int(s.last_use_node), consumer_count=int(s.consumer_count),
+            )
+        d_arr = (MsimDep * max(1, nd))()
+        for i, d in enumerate(dep_recs):
+            d_arr[i] = MsimDep(
+                src_node=int(d.src_node), dst_node=int(d.dst_node),
+                kind=int(d.kind), flags=int(d.flags), pad=0,
+            )
+        nnodes = len(ring._nodes)
+        rc = int(self.library.msim_validate_ring(
+            s_arr if ns else None, ns, d_arr if nd else None, nd, nnodes,
+        ))
+        if rc != 0:
+            raise ModelingError(f"msim_validate_ring_failed:{rc}")
+        dec_slots = tuple(
+            SlotGenRecord(
+                occurrence=int(s_arr[i].occurrence), generation=int(s_arr[i].generation),
+                allocation_id=int(s_arr[i].allocation_id), die=int(s_arr[i].die),
+                owner=int(s_arr[i].owner), pool_id=int(s_arr[i].pool_id),
+                slot_id=int(s_arr[i].slot_id), producer_node=int(s_arr[i].producer_node),
+                publish_node=int(s_arr[i].publish_node),
+                last_use_node=int(s_arr[i].last_use_node),
+                consumer_count=int(s_arr[i].consumer_count),
+            )
+            for i in range(ns)
+        )
+        dec_deps = tuple(
+            DepRecord(
+                src_node=int(d_arr[i].src_node), dst_node=int(d_arr[i].dst_node),
+                kind=int(d_arr[i].kind), flags=int(d_arr[i].flags),
+            )
+            for i in range(nd)
+        )
+        return dec_slots, dec_deps
 
     def prepare_terms(
         self,

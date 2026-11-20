@@ -196,8 +196,11 @@ class _EngineLifecycleMixin:
             if wave_rec is not None:
                 for live in popped_pools:
                     for unit in live.units:
+                        slot_id, gen = wave_rec.release_slot_generation(
+                            live.pool, int(unit), live.name,
+                        )
                         wave_rec.on_allocation(
-                            live.pool, int(unit), 0, 0, int(round(live.size)),
+                            live.pool, int(unit), slot_id, gen, int(round(live.size)),
                             now, "release",
                         )
             n_free = len(task.free)
@@ -264,7 +267,17 @@ class _EngineLifecycleMixin:
                         pool_masks[lpool] = new_m
                         if not new_m:
                             allocated[lpool] = 0
-        if task.metadata:
+        if task.deliveries:
+            deliv = self.delivered
+            acc = task.delivered_acc
+            for ctr_id, total_amt in task.deliveries:
+                prev = acc.get(ctr_id, 0.0) if acc is not None else 0.0
+                rem_amt = total_amt - prev
+                if rem_amt > 0.0:
+                    deliv[ctr_id] = deliv.get(ctr_id, 0.0) + rem_amt
+                    if acc is not None:
+                        acc[ctr_id] = total_amt
+        if not task.is_split_child and task.metadata:
             occurrence = task.metadata.get("occurrence")
             if isinstance(occurrence, OccurrenceKey):
                 record = self.occurrence_metrics.setdefault(
@@ -290,17 +303,18 @@ class _EngineLifecycleMixin:
         if self._inline_blocked and self.task_blocks_native(task):
             self._inline_blocked -= 1
         del self._tasks[key]
-        self.completed_count += 1
-        t_ml = self._trace_maxlen
-        if t_ml:
-            tdq = self._trace_dq
-            if t_ml > 0 and len(tdq) == t_ml:
-                self.trace_dropped += 1
-            tdq.append((
-                task.event.name, task.owner, task.start, now,
-                task.demand, task.service, task.metadata,
-                task.placement, task.coupled,
-            ))
+        if not task.is_split_child:
+            self.completed_count += 1
+            t_ml = self._trace_maxlen
+            if t_ml:
+                tdq = self._trace_dq
+                if t_ml > 0 and len(tdq) == t_ml:
+                    self.trace_dropped += 1
+                tdq.append((
+                    task.event.name, task.owner, task.start, now,
+                    task.demand, task.service, task.metadata,
+                    task.placement, task.coupled,
+                ))
         if native:
             self._native_slots.pop(key, None)
             self._native_seqs.discard(key)
@@ -322,6 +336,10 @@ class _EngineLifecycleMixin:
                     w = dependent.waiting - 1
                     dependent.waiting = w
                     if not w:
+                        dependent.blocker_event = task.event.name
+                        dependent.ready_at = now
+                        if not dependent.blocker_reason:
+                            dependent.blocker_reason = "publish"
                         if dependent.release <= now:
                             if successor not in ready_seen:
                                 ready_seen.add(successor)
@@ -335,6 +353,10 @@ class _EngineLifecycleMixin:
                         continue
                     dependent.waiting -= 1
                     if not dependent.waiting:
+                        dependent.blocker_event = task.event.name
+                        dependent.ready_at = now
+                        if not dependent.blocker_reason:
+                            dependent.blocker_reason = "publish"
                         if dependent.release <= now:
                             if successor not in ready_seen:
                                 ready_seen.add(successor)
@@ -452,20 +474,39 @@ class _EngineLifecycleMixin:
                 self._alloc_state_version += n_acq
                 if empty_pools:
                     self._seen_floor_peaks.add(sid)
+            admit_gen = 0
             wave_rec = self._wave_recorder
             if wave_rec is not None:
+                first_gen = True
                 for item in task.acquire:
                     for unit in item.units:
+                        slot_id, gen = wave_rec.allocate_slot_generation(
+                            item.pool, int(unit), item.name,
+                        )
+                        if first_gen:
+                            admit_gen = gen
+                            first_gen = False
                         wave_rec.on_allocation(
-                            item.pool, int(unit), 0, 0, int(round(item.size)),
+                            item.pool, int(unit), slot_id, gen, int(round(item.size)),
                             now, "grant",
                         )
+        else:
+            admit_gen = 0
         wave_rec = self._wave_recorder
         if wave_rec is not None:
             owners = tuple(
                 sorted({u for units in (task.placement or {}).values() for u in units})
             ) or (0,)
-            wave_rec.on_admit(key, now, owners=owners)
+            if task.metadata and "generation" in task.metadata:
+                admit_gen = int(task.metadata["generation"])
+            blockers = ()
+            if task.blocker_event:
+                p_pipe = next(iter(task.demand), "")
+                r_ms = task.ready_at if task.ready_at is not None else now
+                blockers = ((p_pipe, task.blocker_event, r_ms, task.blocker_reason or "publish"),)
+            wave_rec.on_admit(
+                key, now, owners=owners, generation=admit_gen, blockers=blockers,
+            )
         if self._accel is not None and key in self._native_seqs:
             self._accel.activate(self, key)
         if task.demand or task.latency > 0.0:
@@ -536,6 +577,13 @@ class _EngineLifecycleMixin:
                     continue
                 if ((task.acquire or task.allocation_demands)
                         and not self._can_allocate(task)):
+                    if task.blocker_reason != "credit":
+                        task.ready_at = self.now
+                        task.blocker_reason = "credit"
+                        if task.acquire:
+                            task.blocker_event = task.acquire[0].name
+                        elif task.allocation_demands:
+                            task.blocker_event = f"pool:{task.allocation_demands[0][0][0]}"
                     if deferred is None:
                         deferred = [key]
                     else:
@@ -570,15 +618,22 @@ class _EngineLifecycleMixin:
                 raise ExecutionError("execution_zero_progress")
 
     def _split_asymmetric_cohorts(self) -> bool:
-        """Split active widened cohorts when a peer breaks member unit symmetry."""
-        if self._placed_active == 0 or len(self._active) < 2:
+        """Split active cohorts on FIFO resources or asymmetric peer unit overlap."""
+        if not self._active or (self._placed_active == 0 and self._fifo_live == 0):
             return False
+        from .engine_types import _EMPTY_FROZENSET, _EMPTY_METADATA
+        fifo_names = self.fifo_resource_names() if self._fifo_live else _EMPTY_FROZENSET
         to_split: list[int] = []
         tasks = self._tasks
         active = self._active
         for key in active:
             task = tasks[key]
-            if task.cohort_size <= 1 or not task.cohort_members or not task.remaining:
+            if task.cohort_size <= 1 or not task.remaining:
+                continue
+            if fifo_names and any(r in fifo_names for r in task.remaining):
+                to_split.append(key)
+                continue
+            if not task.cohort_members or len(active) < 2:
                 continue
             members_dict = dict(task.cohort_members)
             broken = False
@@ -604,7 +659,11 @@ class _EngineLifecycleMixin:
                 to_split.append(key)
         if not to_split:
             return False
-        from .engine_types import _EMPTY_FROZENSET
+        if self._accel is not None and any(k in self._native_slots for k in to_split):
+            self._accel.disable(self, "asymmetric_cohort_split")
+            to_split = [k for k in to_split if k in active and tasks[k].remaining]
+            if not to_split:
+                return False
         for key in to_split:
             task = tasks[key]
             cohort = task.cohort_size
@@ -642,10 +701,10 @@ class _EngineLifecycleMixin:
                 )
                 m_task = _Task(
                     m_ev, dict(m_rem), m_prep.demand, 0, task.release,
-                    task.latency, m_prep.caps, (), (), task.owner, task.metadata,
+                    task.latency, m_prep.caps, (), (), task.owner, _EMPTY_METADATA,
                     m_prep.placement, (), task.priority, task.coupled, None, None,
                     task.start, {}, False, None, 0, 0, _EMPTY_FROZENSET, None, (),
-                    1, m_prep, None, False, (), (),
+                    1, m_prep, None, False, (), (), (), None, True,
                 )
                 m_task.callback = lambda ev, mt=m_task, fn=_member_done: fn(ev, mt)
                 tasks[m_ev.sequence] = m_task

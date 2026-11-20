@@ -239,7 +239,7 @@ def _pool_peak_bytes(
     pool: str,
     granule: int,
     *,
-    die_owner_scale: int = 1,
+    active_by_kind: Mapping[str, int] | None = None,
 ) -> int:
     """Compute exact ``max_t sum_{live at t} align(bytes, g_p)`` with alias folding."""
     matching = [
@@ -248,6 +248,7 @@ def _pool_peak_bytes(
     ]
     if not matching:
         return 0
+    scales = active_by_kind or {"aic": 1, "aiv": 1, "die": 1}
     time_points = sorted({buf.live_start for buf in matching})
     peak = 0
     for moment in time_points:
@@ -261,8 +262,9 @@ def _pool_peak_bytes(
             eff_granule = max(granule, buf.alignment_bytes)
             per_slot = _align_up(buf.bytes_per_owner + buf.scale_bytes, eff_granule)
             total_b = per_slot * buf.slots
-            if pool == "l2" and buf.owner_kind != "die":
-                total_b *= max(1, die_owner_scale)
+            if pool == "l2":
+                kind_scale = int(scales.get(buf.owner_kind, 1))
+                total_b *= max(0, kind_scale)
             if buf.alias_group is not None:
                 prev = alias_peaks.get(buf.alias_group, 0)
                 if total_b > prev:
@@ -332,6 +334,8 @@ def _issued_flops_for(
 
     if candidate.issued_flops is not None:
         return int(candidate.issued_flops), issuable_m, subtile_waves
+    if candidate.work_items == 0 and candidate.logical_flops == 0:
+        return 0, issuable_m, 0
     if shape.m == 0 or shape.n == 0 or shape.k == 0:
         return int(candidate.logical_flops), issuable_m, subtile_waves
     pad_m = _align_up(shape.m, bm)
@@ -344,7 +348,7 @@ def _issued_flops_for(
         scale_tiles = _ceil_div(candidate.logical_flops, per_tile_logical)
         issued = scale_tiles * per_tile_issued
     else:
-        issued = per_tile_issued * max(1, candidate.work_items)
+        issued = per_tile_issued * candidate.work_items
     return max(int(candidate.logical_flops), issued), issuable_m, subtile_waves
 
 
@@ -356,9 +360,14 @@ def solve(spec: TilePipelineSpec, op: Any, hw: Any) -> TileSolution:
 
     subtile_by_mode = {sw.native_mode: sw for sw in spec.subtile_waves}
     rejections: list[TileRejection] = []
+    ordered_candidates = sorted(
+        spec.candidates, key=lambda c: ALGORITHM_LADDER_RANK[c.algorithm],
+    )
 
-    for candidate in spec.candidates:
-        avail_owners = _effective_owners(hw, candidate.owner_axis)
+    for candidate in ordered_candidates:
+        avail_aic = _effective_owners(hw, "aic")
+        avail_aiv = _effective_owners(hw, "aiv")
+        avail_owners = avail_aic if candidate.owner_axis == "aic" else avail_aiv
         if avail_owners <= 0:
             rejections.append(TileRejection(
                 algorithm=candidate.algorithm,
@@ -370,15 +379,27 @@ def solve(spec: TilePipelineSpec, op: Any, hw: Any) -> TileSolution:
             ))
             continue
 
-        part_owners = (
-            candidate.owner_partition[0]
-            if candidate.owner_axis == "aic" else candidate.owner_partition[1]
-        )
-        total_owners = min(avail_owners, part_owners) if part_owners > 0 else avail_owners
+        part_aic, part_aiv = candidate.owner_partition
+        total_aic = min(avail_aic, part_aic) if part_aic > 0 else avail_aic
+        total_aiv = min(avail_aiv, part_aiv) if part_aiv > 0 else avail_aiv
+        total_owners = total_aic if candidate.owner_axis == "aic" else total_aiv
         u_c = candidate.work_items
         waves = _ceil_div(u_c, total_owners) if u_c > 0 else 0
         active_owners = min(u_c, total_owners) if u_c > 0 else 0
         tail_owners = (u_c - (waves - 1) * total_owners) if waves > 0 else 0
+        if u_c == 0:
+            active_aic = 0
+            active_aiv = 0
+        elif candidate.owner_axis == "aic":
+            active_aic = active_owners
+            if total_aic > 0 and total_aiv >= total_aic:
+                active_aiv = min(total_aiv, active_aic * _ceil_div(total_aiv, total_aic))
+            else:
+                active_aiv = min(u_c, total_aiv)
+        else:
+            active_aiv = active_owners
+            active_aic = min(u_c, total_aic)
+        active_by_kind = {"aic": active_aic, "aiv": active_aiv, "die": 1}
 
         peaks: list[OwnerPoolPeak] = []
         overflow: TileRejection | None = None
@@ -393,7 +414,7 @@ def solve(spec: TilePipelineSpec, op: Any, hw: Any) -> TileSolution:
                 owner_kind,
                 pool,
                 granule,
-                die_owner_scale=max(1, active_owners),
+                active_by_kind=active_by_kind,
             )
             if peak <= 0:
                 continue

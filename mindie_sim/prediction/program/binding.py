@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 import json
+import math
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from mindie_sim.schema.common import ModelingError
@@ -38,6 +39,28 @@ from .stages import KernelProgram, ParallelProgram, Program, Stage
 
 _MS_PER_SECOND = 1000.0
 _DEFAULT_VECTOR_CLOCK_HZ = 1_000_000_000.0
+
+
+def proportional_coupled_placement(
+    aic_units: Sequence[int],
+    aiv_units: Sequence[int],
+    aic_total: int,
+    aiv_total: int,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Trim ``(aic_units, aiv_units)`` to the largest proportional AIC/AIV subset."""
+    if aic_total < 1 or aiv_total < 1:
+        raise ModelingError(f"proportional_totals_invalid:{aic_total}:{aiv_total}")
+    aic = tuple(sorted(set(int(u) for u in aic_units)))
+    aiv = tuple(sorted(set(int(u) for u in aiv_units)))
+    g = math.gcd(aic_total, aiv_total)
+    step_c = aic_total // g
+    step_v = aiv_total // g
+    groups = min(len(aic) // step_c, len(aiv) // step_v)
+    if groups < 1:
+        raise ModelingError(
+            f"stream_proportional_subset_empty:{len(aic)}/{aic_total}:{len(aiv)}/{aiv_total}"
+        )
+    return aic[: groups * step_c], aiv[: groups * step_v]
 
 
 def _transport_identity(value):
@@ -274,6 +297,40 @@ class RecipeContext:
             demand[name] = demand.get(name, 0) + amount
         return demand
 
+    @property
+    def effective_aic_cores(self) -> int:
+        owners = self.stream_owners
+        if owners is not None and getattr(owners, "aic_limit", None) is not None:
+            return int(owners.aic_limit)
+        if self.datapath is not None and getattr(self.datapath, "aic_count", None) is not None:
+            return int(self.datapath.aic_count)
+        return int(self.core_count)
+
+    @property
+    def effective_aiv_cores(self) -> int:
+        owners = self.stream_owners
+        if owners is not None and getattr(owners, "aiv_limit", None) is not None:
+            return int(owners.aiv_limit)
+        if self.datapath is not None and getattr(self.datapath, "aiv_count", None) is not None:
+            return int(self.datapath.aiv_count)
+        return int(self.resource_units.get("vector", self.core_count))
+
+    def bind_coupled_stream_placement(
+        self, aic_role: str = "cube", aiv_role: str = "vector",
+    ) -> dict[str, tuple[int, ...]]:
+        """Bind largest proportional AIC/AIV subset from active ``stream_owners``."""
+        owners = self.stream_owners
+        if owners is None or getattr(owners, "isolation", "shared_cap") != "disjoint":
+            return {}
+        aic_name = self.resource_names.get(aic_role, aic_role)
+        aiv_name = self.resource_names.get(aiv_role, aiv_role)
+        aic_total = int(self.resource_units.get(aic_name, self.core_count))
+        aiv_total = int(self.resource_units.get(aiv_name, self.core_count))
+        aic_sub, aiv_sub = proportional_coupled_placement(
+            owners.aic, owners.aiv, aic_total, aiv_total,
+        )
+        return {aic_name: aic_sub, aiv_name: aiv_sub}
+
     def bind_access(
         self,
         pattern: MemoryAccessPattern,
@@ -284,6 +341,7 @@ class RecipeContext:
         copy_hit_bytes_per_ms: float | None = None,
         copy_miss_bytes_per_ms: float | None = None,
         l2_bytes_per_ms: float | None = None,
+        commit: bool = False,
     ) -> BoundAccess:
         """Bind a ``MemoryAccessPattern`` into exact 3-ledger byte accounting and row terms."""
         pipe_role = pattern.pipe
@@ -292,7 +350,8 @@ class RecipeContext:
         if pipe_role not in self.resource_names:
             raise ModelingError(f"bind_access_pipe_missing:{pattern.pipe}")
         pipe_row = self.resource_names[pipe_role]
-        pipe_rate = float(self.rates[pipe_row])
+        pipe_units = max(1, int(self.resource_units.get(pipe_row, 1)))
+        pipe_rate = float(self.rates[pipe_row]) / float(pipe_units)
         hit_rate = pipe_rate if copy_hit_bytes_per_ms is None else float(copy_hit_bytes_per_ms)
         miss_rate = pipe_rate if copy_miss_bytes_per_ms is None else float(copy_miss_bytes_per_ms)
         l2_row = self.resource_names.get("l2", "l2")
@@ -329,6 +388,7 @@ class RecipeContext:
             pipe_row_id=pipe_row,
             l2_row_id=l2_row,
             burst_rules=burst_rules,
+            commit=commit,
         )
 
     def bind_vector(
@@ -402,4 +462,3 @@ class TransferRecipe:
             Stage("setup", latency=context.setup_ms),
             Stage("transactions", after=("setup",), program=ParallelProgram(tuple(paths))),
         ), minimum_ms=context.minimum_ms)
-

@@ -157,6 +157,7 @@ def _merge_stages(
             stage.latency, stage.name, stage.coupled, stage.priority,
             stage.keep_empty, stage.after, stage.previous,
             tuple(sorted(stage.work_units.items())),
+            tuple(sorted(stage.metadata.items())),
         )
         for stage in stages
     }) != 1:
@@ -181,14 +182,27 @@ def _merge_stages(
             first.name, after=first.after, previous=first.previous,
             coupled=first.coupled, work_units=first.work_units,
             priority=first.priority, program=merged, keep_empty=first.keep_empty,
+            metadata=first.metadata,
         )
     if any(set(stage.placement) != set(first.placement) for stage in stages):
         return None
     work = {key: sum(stage.work[key] for stage in stages) for key in first.work}
     caps = {key: sum(stage.caps[key] for stage in stages) for key in first.caps}
+    active_work = {k for k, v in first.work.items() if v > 0.0}
+    if not first.coupled and active_work:
+        # Merging uncoupled work that shares any unplaced or common-placement
+        # resource collapses fair-share contender multiplicity (e.g. 2+1 -> 1+1)
+        # or coalesces distinct FIFO grants. Only allow uncoupled merge when
+        # every active work resource has strictly disjoint per-member placement.
+        if not active_work.issubset(first.placement):
+            return None
+        for key in active_work:
+            rows_k = [tuple(stage.placement[key]) for stage in stages]
+            if len(set(rows_k)) == 1:
+                return None
     cohort_size = (
         sum(stage.cohort_size for stage in stages)
-        if (first.coupled and scale_coupled_cohort)
+        if ((first.coupled and scale_coupled_cohort) or (not first.coupled and active_work))
         else first.cohort_size
     )
     has_unplaced_work = (
@@ -247,6 +261,7 @@ def _merge_stages(
         priority=first.priority, cohort_size=cohort_size, keep_empty=first.keep_empty,
         cohort_widened=tuple(widened_keys),
         cohort_members=cohort_members if widened_keys else {},
+        metadata=first.metadata,
     )
 
 

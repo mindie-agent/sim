@@ -29,6 +29,7 @@ ST_CELLS = 8
 IO_CELLS = 8
 TASK_STRIDE = 12
 LINK_STRIDE = 6
+LINK_WIDENED_BIT_SHIFT = 32
 COMP_STRIDE = 3
 SVC_STRIDE = 3
 MAX_T = 65536
@@ -306,7 +307,7 @@ def pure_task(engine, task) -> bool:
     if (task.start_callback is not None or task.acquire or task.free
             or task.allocation_demands):
         return False
-    if task.cohort_widened and len(task.remaining) > MAX_U:
+    if task.cohort_widened and len(task.remaining) > MAX_R:
         return False
     # An ordinary callback stays Python.  A declared native boundary hook is
     # marked ``MSIM_F_CALLBACK``, so the kernel halts at that exact instant.
@@ -347,7 +348,8 @@ def pure_task(engine, task) -> bool:
             for unit in units:
                 if type(unit) is not int or unit < 0 or unit >= limit:
                     return False
-    return True
+    from .accel_terms import coupled_placement_proportional
+    return coupled_placement_proportional(engine, task)
 
 #: Boundary kinds returned by ``msim_ctx_run``.
 B_NONE, B_CALLBACK, B_HORIZON, B_LATENCY, B_BUDGET, B_IDLE, B_RELEASE, B_STOP = range(8)
@@ -622,14 +624,16 @@ class Arena:
             self.rows[base + 9] = len(links)
             self.rows[base + 10] = li
             self.rows[base + 11] = 0
-            for res, remaining, cap, units in links:
+            for link in links:
+                res, remaining, cap, units = link[:4]
+                wid = 1 if (len(link) > 4 and link[4]) else 0
                 off = li * LINK_STRIDE
                 self.links[off + 0] = i
                 self.links[off + 1] = res
                 self.links[off + 2] = bits(remaining)
                 self.links[off + 3] = bits(cap)
                 self.links[off + 4] = place
-                self.links[off + 5] = len(units)
+                self.links[off + 5] = len(units) | (wid << LINK_WIDENED_BIT_SHIFT)
                 for u in units:
                     self.place[place] = u
                     place += 1

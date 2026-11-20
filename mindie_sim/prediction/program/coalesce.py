@@ -223,6 +223,7 @@ def _fold_kernel_stages(stages: tuple[Stage, ...]) -> tuple[Stage, ...]:
                     and len(succ.work) == 1 and s.work.keys() == succ.work.keys()
                     and s.caps == succ.caps and s.placement == succ.placement
                     and s.priority == succ.priority and s.work_units == succ.work_units
+                    and s.metadata == succ.metadata
                 ):
                     rname = next(iter(s.work))
                     w1, w2 = s.work[rname], succ.work[rname]

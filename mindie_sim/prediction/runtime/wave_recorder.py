@@ -15,335 +15,37 @@
 """
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, fields, is_dataclass
-import hashlib
-import json
+from collections.abc import Sequence
 from typing import Any, Literal
 
 from mindie_sim.schema.common import ModelingError
-
-NS_PER_MS = 1_000_000.0
-SCHEMA_VERSION = "fused-pipeline-descriptor/1"
-SPEC_ID_HEX_LEN = 24
-CUBE_PIPE_ROLES = frozenset({"cube", "aic", "fixpipe", "mte1"})
-VECTOR_PIPE_ROLES = frozenset({"vec", "vector", "vec_issue", "vec_alu", "vec_sfu", "vec_reduce"})
-SINGLE_CAUSE_HANDOFF_KINDS = frozenset({
-    "publish", "last_use", "cross_core_workspace", "kernel_handoff", "cross_pipe_handoff",
-})
-
-
-def _ms_to_ns(t_ms: float) -> int:
-    return int(round(float(t_ms) * NS_PER_MS))
-
-
-def _union_intervals(intervals: Sequence[tuple[int, int]]) -> tuple[tuple[int, int], ...]:
-    cleaned = [(lo, hi) for lo, hi in intervals if hi > lo]
-    if not cleaned:
-        return ()
-    cleaned.sort()
-    merged: list[tuple[int, int]] = [cleaned[0]]
-    for lo, hi in cleaned[1:]:
-        p_lo, p_hi = merged[-1]
-        if lo <= p_hi:
-            if hi > p_hi:
-                merged[-1] = (p_lo, hi)
-        else:
-            merged.append((lo, hi))
-    return tuple(merged)
-
-
-def _clamp_intervals(
-    intervals: Sequence[tuple[int, int]], start_ns: int, end_ns: int,
-) -> tuple[tuple[int, int], ...]:
-    if end_ns <= start_ns or not intervals:
-        return ()
-    clamped = []
-    for lo, hi in intervals:
-        c_lo = lo if lo > start_ns else start_ns
-        c_hi = hi if hi < end_ns else end_ns
-        if c_hi > c_lo:
-            clamped.append((c_lo, c_hi))
-    return _union_intervals(clamped)
-
-
-def _subtract_intervals(
-    base: Sequence[tuple[int, int]], cut: Sequence[tuple[int, int]],
-) -> tuple[tuple[int, int], ...]:
-    if not base or not cut:
-        return tuple(base)
-    out: list[tuple[int, int]] = []
-    cut_idx = 0
-    n_cut = len(cut)
-    for lo, hi in base:
-        cur = lo
-        while cut_idx < n_cut and cut[cut_idx][1] <= cur:
-            cut_idx += 1
-        j = cut_idx
-        while j < n_cut and cut[j][0] < hi:
-            c_lo, c_hi = cut[j]
-            if c_lo > cur:
-                out.append((cur, c_lo))
-            if c_hi > cur:
-                cur = c_hi
-            if cur >= hi:
-                break
-            j += 1
-        if cur < hi:
-            out.append((cur, hi))
-    return tuple(out)
-
-
-def _intersect_intervals(
-    left: Sequence[tuple[int, int]], right: Sequence[tuple[int, int]],
-) -> tuple[tuple[int, int], ...]:
-    if not left or not right:
-        return ()
-    out: list[tuple[int, int]] = []
-    i = j = 0
-    while i < len(left) and j < len(right):
-        lo = max(left[i][0], right[j][0])
-        hi = min(left[i][1], right[j][1])
-        if hi > lo:
-            out.append((lo, hi))
-        if left[i][1] < right[j][1]:
-            i += 1
-        else:
-            j += 1
-    return tuple(out)
-
-
-def _measure(intervals: Sequence[tuple[int, int]]) -> int:
-    return sum(hi - lo for lo, hi in intervals)
-
-
-def _to_json_obj(value: Any) -> Any:
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    if is_dataclass(value) and not isinstance(value, type):
-        return {f.name: _to_json_obj(getattr(value, f.name)) for f in fields(value)}
-    if isinstance(value, Mapping):
-        return {str(k): _to_json_obj(v) for k, v in value.items()}
-    if isinstance(value, (tuple, list)):
-        return [_to_json_obj(v) for v in value]
-    if isinstance(value, (set, frozenset)):
-        return [_to_json_obj(v) for v in sorted(value, key=repr)]
-    return str(value)
-
-
-@dataclass(frozen=True, slots=True)
-class RecordedPipelineSpec:
-    """Pre-coalesce pipeline specification attached to ``OperatorPlan``."""
-
-    schema_version: str
-    spec_id: str
-    physical_signature: str
-    family: str
-    recipe_id: str
-    native_abi: str
-    source_refs: tuple[Any, ...] = ()
-    numerical_contract: str = ""
-    members: tuple[str, ...] = ()
-    public_ports: tuple[Any, ...] = ()
-    solution: Any = None
-    nodes: tuple[Any, ...] = ()
-    edges: tuple[Any, ...] = ()
-    stages: tuple[Any, ...] = ()
-    kernel_boundaries: tuple[Any, ...] = ()
-
-    @classmethod
-    def create(
-        cls,
-        *,
-        physical_signature: str,
-        family: str,
-        recipe_id: str,
-        native_abi: str,
-        source_refs: Sequence[Any] = (),
-        numerical_contract: str = "",
-        members: Sequence[str] = (),
-        public_ports: Sequence[Any] = (),
-        solution: Any = None,
-        nodes: Sequence[Any] = (),
-        edges: Sequence[Any] = (),
-        stages: Sequence[Any] = (),
-        kernel_boundaries: Sequence[Any] = (),
-    ) -> RecordedPipelineSpec:
-        payload = json.dumps(
-            _to_json_obj({
-                "physical_signature": physical_signature,
-                "family": family,
-                "recipe_id": recipe_id,
-                "native_abi": native_abi,
-                "source_refs": tuple(source_refs),
-                "numerical_contract": numerical_contract,
-                "members": tuple(members),
-                "solution": solution,
-            }),
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        spec_id = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:SPEC_ID_HEX_LEN]
-        return cls(
-            schema_version=SCHEMA_VERSION,
-            spec_id=spec_id,
-            physical_signature=physical_signature,
-            family=family,
-            recipe_id=recipe_id,
-            native_abi=native_abi,
-            source_refs=tuple(source_refs),
-            numerical_contract=numerical_contract,
-            members=tuple(members),
-            public_ports=tuple(public_ports),
-            solution=solution,
-            nodes=tuple(nodes),
-            edges=tuple(edges),
-            stages=tuple(stages),
-            kernel_boundaries=tuple(kernel_boundaries),
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class PipeIdleRow:
-    """Exact 4-bucket idle decomposition for one physical ``(scope_id, pipe_id)``."""
-
-    scope_id: int
-    pipe_id: int
-    span_ns: int
-    busy_ns: int
-    fill_ns: int
-    steady_bubble_ns: int
-    drain_ns: int
-    handoff_ns: int
-    inactive_in_window: bool
-    pipe_name: str = ""
-    owner_time_ns: int = 0
-
-    def __post_init__(self) -> None:
-        total = (
-            self.busy_ns + self.fill_ns + self.steady_bubble_ns
-            + self.drain_ns + self.handoff_ns
-        )
-        if total != self.span_ns:
-            raise ModelingError(
-                f"pipe_idle_row_conservation_violated:{self.pipe_id}:{total}!={self.span_ns}"
-            )
-
-
-@dataclass(frozen=True, slots=True)
-class IntervalRun:
-    """One recorded positive-rate service interval in integer ns."""
-
-    start_ns: int
-    end_ns: int
-    task_id: int
-    pipe_id: int
-    scope_id: int
-    owner: int
-    delivered: float
-
-
-@dataclass(frozen=True, slots=True)
-class PeriodicRun:
-    """One proved periodic skip record anchored to its exact floating-point period."""
-
-    anchor_ms: float
-    period_ms: float
-    repeats: int
-    template_id: str
-    state_digest: str
-
-
-@dataclass(frozen=True, slots=True)
-class TileWaveTimeline:
-    """Bounded head/steady/tail timeline with exact per-pipe idle rows."""
-
-    start_ns: int
-    end_ns: int
-    head: tuple[IntervalRun, ...]
-    steady: tuple[PeriodicRun, ...]
-    tail: tuple[IntervalRun, ...]
-    pipe_rows: tuple[PipeIdleRow, ...]
-    cube_vector_overlap_ns: int
-
-
-@dataclass(frozen=True, slots=True)
-class ResourceRowRef:
-    row_id: int
-    name: str
-    scope_id: int
-
-
-@dataclass(frozen=True, slots=True)
-class WaitWitness:
-    task_id: int
-    blocker_event: str
-    pipe_id: int
-    start_ns: int
-    end_ns: int
-    reason: str
-
-
-@dataclass(frozen=True, slots=True)
-class OwnerPoolPeak:
-    owner: int
-    pool: str
-    peak_bytes: int
-
-
-@dataclass(frozen=True, slots=True)
-class BottleneckDiagnosis:
-    limiting_rows: tuple[ResourceRowRef, ...]
-    exposed_waits: tuple[WaitWitness, ...]
-    peak_allocations: tuple[OwnerPoolPeak, ...]
-    critical_events: tuple[str, ...]
-    uncovered_stars_ns: int = 0
-
-
-@dataclass(frozen=True, slots=True)
-class BufferResidency:
-    pool: str
-    owner: int
-    slot: int
-    generation: int
-    size_bytes: int
-    grant_ns: int
-    release_ns: int | None
-    alias_of: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class MemberBinding:
-    member_id: str
-    task_ids: tuple[int, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class FusedPipelineDescriptor:
-    """Occurrence-bound wave timeline and diagnosis ready for JSON export."""
-
-    spec: Any
-    occurrence_key: Any
-    semantic_group_id: str
-    member_bindings: tuple[MemberBinding, ...]
-    timing_scope: Literal["graph_occurrence", "isolated_occurrence"]
-    submitted_kernel_count: int
-    buffers: tuple[BufferResidency, ...]
-    timeline: TileWaveTimeline
-    diagnosis: BottleneckDiagnosis
-
-    def to_dict(self) -> dict[str, Any]:
-        return _to_json_obj(self)
-
-
-def _pipe_base_role(pipe_name: str) -> str:
-    base = pipe_name.split("@", 1)[0]
-    if ":" in base:
-        base = base.rsplit(":", 1)[-1]
-    return base
-
-
-DEFAULT_HEAD_TAIL_LIMIT = 256
+from .wave_types import (
+    CUBE_PIPE_ROLES,
+    DEFAULT_HEAD_TAIL_LIMIT,
+    NS_PER_MS,
+    SCHEMA_VERSION,
+    SINGLE_CAUSE_HANDOFF_KINDS,
+    VECTOR_PIPE_ROLES,
+    BottleneckDiagnosis,
+    BufferResidency,
+    FusedPipelineDescriptor,
+    IntervalRun,
+    MemberBinding,
+    OwnerPoolPeak,
+    PeriodicRun,
+    PipeIdleRow,
+    RecordedPipelineSpec,
+    ResourceRowRef,
+    TileWaveTimeline,
+    WaitWitness,
+    _clamp_intervals,
+    _intersect_intervals,
+    _measure,
+    _ms_to_ns,
+    _pipe_base_role,
+    _subtract_intervals,
+    _union_intervals,
+)
 
 
 class WaveRecorder:
@@ -363,6 +65,7 @@ class WaveRecorder:
         for name in declared_pipes:
             self.register_pipe(name)
         self._member_tasks: dict[str, list[int]] = {}
+        self._task_occurrences: dict[int, Any] = {}
         self._submitted_tasks: set[int] = set()
         self._admitted: dict[int, tuple[float, tuple[int, ...], str, int, tuple[str, ...]]] = {}
         self._service_by_pipe: dict[tuple[int, int], list[tuple[int, int]]] = {}
@@ -376,6 +79,8 @@ class WaveRecorder:
         self._closed_allocs: list[BufferResidency] = []
         self._live_pool_bytes: dict[tuple[int, str], int] = {}
         self._peak_pool_bytes: dict[tuple[int, str], int] = {}
+        self._alloc_name_slot_gen: dict[tuple[str, int, str], tuple[int, int]] = {}
+        self._alloc_next_gen: dict[tuple[str, int, int], int] = {}
         self._critical_events: list[str] = []
         self._min_ns: int | None = None
         self._max_ns: int | None = None
@@ -387,6 +92,68 @@ class WaveRecorder:
             self._pipe_ids[pipe_name] = pid
             self._pipe_names[pid] = pipe_name
         return pid
+
+    def allocate_slot_generation(
+        self, pool: str, owner: int, alloc_name: str,
+    ) -> tuple[int, int]:
+        """Return a distinct ``(slot, generation)`` pair for an allocation grant."""
+        key = (str(pool), int(owner), str(alloc_name))
+        existing = self._alloc_name_slot_gen.get(key)
+        if existing is not None:
+            return existing
+        slot = 0
+        if ":slot" in alloc_name:
+            tail = alloc_name.rsplit(":slot", 1)[1]
+            digits = ""
+            for ch in tail:
+                if ch.isdigit():
+                    digits += ch
+                else:
+                    break
+            if digits:
+                slot = int(digits)
+        else:
+            live_slots = {
+                s for (p, o, s, _) in self._live_allocs
+                if p == str(pool) and o == int(owner)
+            }
+            slot = 0
+            while slot in live_slots:
+                slot += 1
+        gkey = (str(pool), int(owner), slot)
+        gen = self._alloc_next_gen.get(gkey, 0)
+        self._alloc_next_gen[gkey] = gen + 1
+        pair = (slot, gen)
+        self._alloc_name_slot_gen[key] = pair
+        return pair
+
+    def release_slot_generation(
+        self, pool: str, owner: int, alloc_name: str,
+    ) -> tuple[int, int]:
+        """Look up and release the ``(slot, generation)`` assigned at grant."""
+        return self._alloc_name_slot_gen.pop((str(pool), int(owner), str(alloc_name)), (0, 0))
+
+    def extract_cycle_pattern(
+        self,
+        cycle_start_ms: float,
+        cycle_end_ms: float,
+        *,
+        scope_id: int | None = None,
+    ) -> tuple[tuple[tuple[str, float, float], ...], tuple[tuple[str, float, float], ...]]:
+        """Extract exact relative per-pipe intervals observed in one proved cycle."""
+        lo_ns = _ms_to_ns(cycle_start_ms)
+        hi_ns = _ms_to_ns(cycle_end_ms)
+        if hi_ns <= lo_ns:
+            return (), ()
+        sid = self.scope_id if scope_id is None else int(scope_id)
+        svc_pat: list[tuple[str, float, float]] = []
+        ho_pat: list[tuple[str, float, float]] = []
+        for pid, pname in sorted(self._pipe_names.items()):
+            for a, b in _clamp_intervals(self._service_by_pipe.get((sid, pid), ()), lo_ns, hi_ns):
+                svc_pat.append((pname, (a - lo_ns) / NS_PER_MS, (b - lo_ns) / NS_PER_MS))
+            for a, b in _clamp_intervals(self._handoff_by_pipe.get((sid, pid), ()), lo_ns, hi_ns):
+                ho_pat.append((pname, (a - lo_ns) / NS_PER_MS, (b - lo_ns) / NS_PER_MS))
+        return tuple(svc_pat), tuple(ho_pat)
 
     def _note_bounds(self, lo_ns: int, hi_ns: int) -> None:
         if self._min_ns is None or lo_ns < self._min_ns:
@@ -404,8 +171,11 @@ class WaveRecorder:
         signals: Sequence[str] = (),
         occurrence: Any = None,
     ) -> None:
-        del predecessors, occurrence
-        self._submitted_tasks.add(int(task_id))
+        del predecessors
+        tid = int(task_id)
+        self._submitted_tasks.add(tid)
+        if occurrence is not None:
+            self._task_occurrences[tid] = occurrence
         members = tuple(aliases) if aliases else (str(stage_id),)
         for member in members:
             self._member_tasks.setdefault(str(member), []).append(int(task_id))
@@ -541,7 +311,7 @@ class WaveRecorder:
                     cur = max(0, self._live_pool_bytes.get(pool_key, 0) - live.size_bytes)
                     self._live_pool_bytes[pool_key] = cur
 
-    # Point 5: proved periodic skip
+    # Point 5: proved periodic skip (compressed O(1) storage and integration)
     def on_period(
         self,
         anchor_ms: float,
@@ -554,40 +324,127 @@ class WaveRecorder:
         handoff_pattern: Sequence[tuple[str, float, float]] = (),
         scope_id: int | None = None,
     ) -> None:
-        """Translate exact periodic service and handoff patterns without rounding drift."""
+        """Record a proved periodic skip in O(1) space preserving relative phase offsets."""
         if repeats < 1 or period_ms <= 0.0:
             raise ModelingError("wave_recorder_periodic_skip_invalid")
         sid = self.scope_id if scope_id is None else int(scope_id)
+        svc_norm = tuple(
+            (str(pn), float(lo), float(hi)) for pn, lo, hi in service_pattern if hi > lo
+        )
+        ho_norm = tuple(
+            (str(pn), float(lo), float(hi)) for pn, lo, hi in handoff_pattern if hi > lo
+        )
+        for pn, lo, hi in svc_norm:
+            pid = self.register_pipe(pn)
+            key = (sid, pid)
+            self._owner_time_by_pipe[key] = (
+                self._owner_time_by_pipe.get(key, 0)
+                + int(repeats) * max(0, _ms_to_ns(hi) - _ms_to_ns(lo))
+            )
+        for pn, _lo, _hi in ho_norm:
+            self.register_pipe(pn)
         self._steady.append(PeriodicRun(
             anchor_ms=float(anchor_ms),
             period_ms=float(period_ms),
             repeats=int(repeats),
             template_id=str(template_id),
             state_digest=str(state_digest),
+            service_pattern=svc_norm,
+            handoff_pattern=ho_norm,
+            scope_id=sid,
         ))
         self._note_bounds(
             _ms_to_ns(anchor_ms),
             _ms_to_ns(anchor_ms + float(repeats) * period_ms),
         )
-        for rep in range(repeats):
-            base_ms = anchor_ms + float(rep) * period_ms
-            for pipe_name, rel_lo_ms, rel_hi_ms in service_pattern:
-                lo_ns = _ms_to_ns(base_ms + rel_lo_ms)
-                hi_ns = _ms_to_ns(base_ms + rel_hi_ms)
-                if hi_ns > lo_ns:
-                    pid = self.register_pipe(str(pipe_name))
-                    key = (sid, pid)
-                    self._service_by_pipe.setdefault(key, []).append((lo_ns, hi_ns))
-                    self._owner_time_by_pipe[key] = (
-                        self._owner_time_by_pipe.get(key, 0) + (hi_ns - lo_ns)
-                    )
-            for pipe_name, rel_lo_ms, rel_hi_ms in handoff_pattern:
-                lo_ns = _ms_to_ns(base_ms + rel_lo_ms)
-                hi_ns = _ms_to_ns(base_ms + rel_hi_ms)
-                if hi_ns > lo_ns:
-                    pid = self.register_pipe(str(pipe_name))
-                    key = (sid, pid)
-                    self._handoff_by_pipe.setdefault(key, []).append((lo_ns, hi_ns))
+
+    def _periodic_pipe_contrib(
+        self, sid: int, pname: str, start_ns: int, end_ns: int,
+    ) -> tuple[int, int, int | None, int | None, list[tuple[int, int]], list[tuple[int, int]]]:
+        """Integrate compressed periodic skips for one pipe in O(#runs)."""
+        extra_busy = 0
+        extra_ho = 0
+        first_a: int | None = None
+        last_b: int | None = None
+        edge_busy: list[tuple[int, int]] = []
+        edge_ho: list[tuple[int, int]] = []
+        for pr in self._steady:
+            if pr.scope_id != sid:
+                continue
+            period_ns = _ms_to_ns(pr.period_ms)
+            if period_ns <= 0:
+                continue
+            anchor_ns = _ms_to_ns(pr.anchor_ms)
+            run_end_ns = _ms_to_ns(pr.anchor_ms + float(pr.repeats) * pr.period_ms)
+            if run_end_ns <= start_ns or anchor_ns >= end_ns:
+                continue
+            rel_b = _union_intervals(
+                (_ms_to_ns(lo), _ms_to_ns(hi))
+                for pn, lo, hi in pr.service_pattern if pn == pname
+            )
+            rel_h0 = _union_intervals(
+                (_ms_to_ns(lo), _ms_to_ns(hi))
+                for pn, lo, hi in pr.handoff_pattern if pn == pname
+            )
+            rel_h = _subtract_intervals(rel_h0, rel_b)
+            if not rel_b and not rel_h:
+                continue
+            r_lo = max(0, (start_ns - anchor_ns) // period_ns)
+            r_hi = min(pr.repeats, (end_ns - anchor_ns + period_ns - 1) // period_ns)
+            if r_hi <= r_lo:
+                continue
+            boundary_reps = {r_lo, r_hi - 1}
+            for rep in sorted(boundary_reps):
+                base_ns = _ms_to_ns(pr.anchor_ms + float(rep) * pr.period_ms)
+                edge_busy.extend((base_ns + a, base_ns + b) for a, b in rel_b)
+                edge_ho.extend((base_ns + a, base_ns + b) for a, b in rel_h)
+            n_mid = max(0, (r_hi - r_lo) - len(boundary_reps))
+            if n_mid > 0:
+                extra_busy += n_mid * _measure(rel_b)
+                extra_ho += n_mid * _measure(rel_h)
+                if rel_b:
+                    mid_lo_ns = _ms_to_ns(pr.anchor_ms + float(r_lo + 1) * pr.period_ms) + rel_b[0][0]
+                    mid_hi_ns = _ms_to_ns(pr.anchor_ms + float(r_hi - 2) * pr.period_ms) + rel_b[-1][1]
+                    if first_a is None or mid_lo_ns < first_a:
+                        first_a = max(start_ns, mid_lo_ns)
+                    if last_b is None or mid_hi_ns > last_b:
+                        last_b = min(end_ns, mid_hi_ns)
+        return extra_busy, extra_ho, first_a, last_b, edge_busy, edge_ho
+
+    def _periodic_cv_overlap(self, start_ns: int, end_ns: int) -> int:
+        """Compute O(#runs) compressed cube-vector overlap honoring phase offsets."""
+        total = 0
+        for pr in self._steady:
+            period_ns = _ms_to_ns(pr.period_ms)
+            if period_ns <= 0:
+                continue
+            anchor_ns = _ms_to_ns(pr.anchor_ms)
+            run_end_ns = _ms_to_ns(pr.anchor_ms + float(pr.repeats) * pr.period_ms)
+            if run_end_ns <= start_ns or anchor_ns >= end_ns:
+                continue
+            rel_c = _union_intervals(
+                (_ms_to_ns(lo), _ms_to_ns(hi))
+                for pn, lo, hi in pr.service_pattern if _pipe_base_role(pn) in CUBE_PIPE_ROLES
+            )
+            rel_v = _union_intervals(
+                (_ms_to_ns(lo), _ms_to_ns(hi))
+                for pn, lo, hi in pr.service_pattern if _pipe_base_role(pn) in VECTOR_PIPE_ROLES
+            )
+            ov_rel = _intersect_intervals(rel_c, rel_v)
+            if not ov_rel:
+                continue
+            r_lo = max(0, (start_ns - anchor_ns) // period_ns)
+            r_hi = min(pr.repeats, (end_ns - anchor_ns + period_ns - 1) // period_ns)
+            if r_hi <= r_lo:
+                continue
+            boundary_reps = {r_lo, r_hi - 1}
+            for rep in sorted(boundary_reps):
+                base_ns = _ms_to_ns(pr.anchor_ms + float(rep) * pr.period_ms)
+                total += _measure(_clamp_intervals([(base_ns + a, base_ns + b) for a, b in ov_rel], start_ns, end_ns))
+            n_mid = max(0, (r_hi - r_lo) - len(boundary_reps))
+            if n_mid > 0:
+                total += n_mid * _measure(ov_rel)
+        return total
 
     def finish(
         self,
@@ -628,23 +485,30 @@ class WaveRecorder:
 
         for sid, pid in all_keys:
             pname = self._pipe_names.get(pid, f"pipe_{pid}")
-            busy_set = _clamp_intervals(self._service_by_pipe.get((sid, pid), ()), start_ns, end_ns)
-            h0_set = _clamp_intervals(self._handoff_by_pipe.get((sid, pid), ()), start_ns, end_ns)
+            p_busy, p_ho, p_fa, p_lb, eb, eh = self._periodic_pipe_contrib(
+                sid, pname, start_ns, end_ns,
+            )
+            busy_set = _clamp_intervals((*self._service_by_pipe.get((sid, pid), ()), *eb), start_ns, end_ns)
+            h0_set = _clamp_intervals((*self._handoff_by_pipe.get((sid, pid), ()), *eh), start_ns, end_ns)
             handoff_set = _subtract_intervals(h0_set, busy_set)
             covered = _union_intervals((*busy_set, *handoff_set))
             idle_j = _subtract_intervals(window_iv, covered)
 
-            busy_ns = _measure(busy_set)
-            handoff_ns = _measure(handoff_set)
-            if busy_set:
-                first_a = busy_set[0][0]
-                last_b = busy_set[-1][1]
+            busy_ns = _measure(busy_set) + p_busy
+            handoff_ns = _measure(handoff_set) + p_ho
+            first_a = busy_set[0][0] if busy_set else p_fa
+            if p_fa is not None and (first_a is None or p_fa < first_a):
+                first_a = p_fa
+            last_b = busy_set[-1][1] if busy_set else p_lb
+            if p_lb is not None and (last_b is None or p_lb > last_b):
+                last_b = p_lb
+            if first_a is not None and last_b is not None:
                 fill_ns = _measure(_clamp_intervals(idle_j, start_ns, first_a))
-                steady_bubble_ns = _measure(_clamp_intervals(idle_j, first_a, last_b))
                 drain_ns = _measure(_clamp_intervals(idle_j, last_b, end_ns))
+                steady_bubble_ns = max(0, span_ns - busy_ns - handoff_ns - fill_ns - drain_ns)
                 inactive = False
             else:
-                fill_ns = _measure(_subtract_intervals(window_iv, handoff_set))
+                fill_ns = max(0, span_ns - handoff_ns)
                 steady_bubble_ns = 0
                 drain_ns = 0
                 inactive = True
@@ -676,7 +540,7 @@ class WaveRecorder:
 
         cube_union = _union_intervals(cube_intervals)
         vec_union = _union_intervals(vec_intervals)
-        overlap_ns = _measure(_intersect_intervals(cube_union, vec_union))
+        overlap_ns = _measure(_intersect_intervals(cube_union, vec_union)) + self._periodic_cv_overlap(start_ns, end_ns)
 
         timeline = TileWaveTimeline(
             start_ns=start_ns,

@@ -14,9 +14,23 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+import hashlib
 from typing import Any
 
 from mindie_sim.schema.common import ModelingError
+
+DEP_KIND_CREDIT = 1
+DEP_KIND_PUBLISH = 2
+DEP_KIND_CONSUMER = 3
+DEP_KIND_LAST_USE = 4
+DEP_KIND_EXTRA = 5
+_ALLOC_ID_BYTES = 8
+
+
+def allocation_wire_id(allocation: str) -> int:
+    """Deterministic 64-bit integer wire identifier for a ring allocation name."""
+    digest = hashlib.blake2b(allocation.encode("utf-8"), digest_size=_ALLOC_ID_BYTES).digest()
+    return int.from_bytes(digest, "little", signed=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,24 +60,29 @@ class GenerationEvents:
 
 @dataclass(frozen=True, slots=True)
 class SlotGenRecord:
-    """Flat integer representation mirroring C11 ``msim_slot_gen``."""
+    """Flat allocation-aware integer record mirroring C11 ``msim_slot_gen``."""
 
     occurrence: int
     generation: int
+    allocation_id: int
     die: int
     owner: int
-    pool: int
-    slot: int
-    publish: int
-    last_use: int
+    pool_id: int
+    slot_id: int
+    producer_node: int
+    publish_node: int
+    last_use_node: int
+    consumer_count: int
 
 
 @dataclass(frozen=True, slots=True)
 class DepRecord:
     """Flat integer dependency edge mirroring C11 ``msim_dep``."""
 
-    predecessor: int
-    successor: int
+    src_node: int
+    dst_node: int
+    kind: int = DEP_KIND_EXTRA
+    flags: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,6 +131,7 @@ class RingBuffer:
         self.pool = pool
         self.pool_id = int(pool_id)
         self.allocation = allocation
+        self.allocation_id = allocation_wire_id(allocation)
         self.slot_bytes = slot_bytes
         self.depth = depth
         self._nodes: list[_NodeSpec] = []
@@ -277,26 +297,43 @@ class RingBuffer:
         return tuple(self._generations[k] for k in sorted(self._generations))
 
     def to_c_records(self) -> tuple[tuple[SlotGenRecord, ...], tuple[DepRecord, ...]]:
-        """Export flat integer ``msim_slot_gen`` and ``msim_dep`` tables for C11."""
+        """Export flat allocation-aware ``msim_slot_gen`` and ``msim_dep`` tables."""
         slot_gens: list[SlotGenRecord] = []
+        edge_kinds: dict[tuple[str, str], int] = {}
         for ev in self.generations:
             sg = ev.slot_gen
+            prod_nid = self._node_ids.get(ev.write, self._node_ids[ev.publish])
             slot_gens.append(SlotGenRecord(
                 occurrence=sg.occurrence,
                 generation=sg.generation,
+                allocation_id=self.allocation_id,
                 die=sg.die,
                 owner=sg.owner,
-                pool=self.pool_id,
-                slot=sg.slot,
-                publish=self._node_ids[ev.publish],
-                last_use=self._node_ids[ev.last_use],
+                pool_id=self.pool_id,
+                slot_id=sg.slot,
+                producer_node=prod_nid,
+                publish_node=self._node_ids[ev.publish],
+                last_use_node=self._node_ids[ev.last_use],
+                consumer_count=len(ev.read_done),
             ))
+            if ev.credit and ev.write:
+                edge_kinds[(ev.credit, ev.write)] = DEP_KIND_CREDIT
+            if ev.write and ev.publish != ev.write:
+                edge_kinds[(ev.write, ev.publish)] = DEP_KIND_PUBLISH
+            for rd in ev.read_done:
+                edge_kinds[(ev.publish, rd)] = DEP_KIND_CONSUMER
+                if ev.last_use != rd:
+                    edge_kinds[(rd, ev.last_use)] = DEP_KIND_LAST_USE
+            if not ev.read_done and ev.last_use != ev.publish:
+                edge_kinds[(ev.publish, ev.last_use)] = DEP_KIND_LAST_USE
         deps: list[DepRecord] = []
         for node in self._nodes:
             for pred_name in node.after:
                 deps.append(DepRecord(
-                    predecessor=self._node_ids[pred_name],
-                    successor=node.node_id,
+                    src_node=self._node_ids[pred_name],
+                    dst_node=node.node_id,
+                    kind=edge_kinds.get((pred_name, node.name), DEP_KIND_EXTRA),
+                    flags=0,
                 ))
         return tuple(slot_gens), tuple(deps)
 
@@ -404,10 +441,16 @@ def lower_generation(
 
 
 __all__ = [
+    "DEP_KIND_CONSUMER",
+    "DEP_KIND_CREDIT",
+    "DEP_KIND_EXTRA",
+    "DEP_KIND_LAST_USE",
+    "DEP_KIND_PUBLISH",
     "DepRecord",
     "GenerationEvents",
     "RingBuffer",
     "SlotGenRecord",
     "SlotGenerationId",
+    "allocation_wire_id",
     "lower_generation",
 ]

@@ -78,9 +78,11 @@ static int32_t submit_links_check(msim_ctx *c, const uint64_t *links,
     size_t i;
     for (i = 0; i < nlinks; i++) {
         const uint64_t *row = links + i * link_stride;
+        uint64_t lflags = row[5] >> 32;
         int64_t owner = (int64_t)row[0], res = (int64_t)row[1];
-        int64_t ps = (int64_t)row[4], pl = (int64_t)row[5];
+        int64_t ps = (int64_t)row[4], pl = (int64_t)(row[5] & 0xFFFFFFFFULL);
         double rem = msim_from_bits(row[2]), cap = msim_from_bits(row[3]);
+        if (lflags > 1u) return reject(st, nst, MSIM_E_RANGE);
         if (owner < 0 || (uint64_t)owner >= (uint64_t)nrows)
             return reject(st, nst, MSIM_E_RANGE);
         if (res < 0 || res >= c->nres) return reject(st, nst, MSIM_E_RANGE);
@@ -158,17 +160,17 @@ MSIM_EXPORT int32_t msim_ctx_submit(void *ctx, const uint64_t *rows, size_t nrow
         return -1;
     for (i = 0; i < nrows; i++) {
         const uint64_t *row = rows + i * row_stride;
-        uint64_t wmask = row[5];
-        if (wmask != 0u) {
-            uint64_t cohort = row[3];
-            int64_t k, nlink = (int64_t)row[9], lstart = (int64_t)row[10];
-            for (k = 0; k < nlink && k < 64; k++) {
-                if ((wmask >> (unsigned)k) & 1u) {
-                    const uint64_t *lrow = links + (size_t)(lstart + k) * link_stride;
-                    int64_t pl = (int64_t)lrow[5];
-                    if (pl <= 0 || (uint64_t)pl < cohort || ((uint64_t)pl % cohort) != 0u)
-                        return reject(st, nst, MSIM_E_RANGE);
-                }
+        uint64_t wmask = row[5], cohort = row[3];
+        int64_t k, nlink = (int64_t)row[9], lstart = (int64_t)row[10];
+        for (k = 0; k < nlink; k++) {
+            const uint64_t *lrow = links + (size_t)(lstart + k) * link_stride;
+            uint64_t lw = (lrow[5] >> 32) & 1u;
+            uint64_t bw = (k < 64 && ((wmask >> (unsigned)k) & 1u)) ? 1u : 0u;
+            if (lw || bw) {
+                int64_t pl = (int64_t)(lrow[5] & 0xFFFFFFFFULL);
+                if (cohort <= 1u || pl <= 0 || (uint64_t)pl < cohort
+                    || ((uint64_t)pl % cohort) != 0u)
+                    return reject(st, nst, MSIM_E_RANGE);
             }
         }
     }
@@ -251,9 +253,10 @@ MSIM_EXPORT int32_t msim_ctx_submit(void *ctx, const uint64_t *rows, size_t nrow
             l->rem = msim_from_bits(lrow[2]);
             l->cap = msim_from_bits(lrow[3]);
             l->pstart = (int32_t)(base + (size_t)lrow[4]);
-            l->plen = (int32_t)(int64_t)lrow[5];
+            l->plen = (int32_t)(lrow[5] & 0xFFFFFFFFULL);
             l->mode = -1;
-            l->widened = (k < 64 && ((wmask >> (unsigned)k) & 1u)) ? 1u : 0u;
+            l->widened = (((lrow[5] >> 32) & 1u)
+                || (k < 64 && ((wmask >> (unsigned)k) & 1u))) ? 1u : 0u;
         }
     }
     c->nu = (int32_t)(base + nplace);

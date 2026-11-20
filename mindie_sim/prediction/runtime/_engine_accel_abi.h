@@ -634,13 +634,16 @@ drain_compl_snapshot:
             next_time = now + dt;
             if (dt > 0.0 && next_time == now) next_time = nextafter(now, INFINITY);
             if (!(next_time > now)) { rc = MSIM_E_STALL; goto fail; }
-            if (c->obs_buf != NULL && c->obs_count > 0 && dt > 0.0) {
+            if (c->obs_buf != NULL && dt > 0.0) {
                 uint32_t need_obs = 0;
                 for (i = 0; i < c->nl; i++) {
                     msim_link *l = &c->link[i];
                     if (l->rate > 0.0 && l->rem > 0.0 && c->task[l->task].state == 1) need_obs++;
                 }
-                if (c->obs_count + need_obs > c->obs_cap) { boundary = MSIM_B_OUTPUT; goto done; }
+                if (c->obs_count + need_obs > c->obs_cap) {
+                    if (need_obs > c->obs_cap) c->obs_overflow = need_obs;
+                    boundary = MSIM_B_OUTPUT; goto done;
+                }
             }
             for (i = 0; i < c->nres; i++) {
                 int32_t k2, any = 0;

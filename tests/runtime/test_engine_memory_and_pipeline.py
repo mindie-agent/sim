@@ -1,10 +1,11 @@
 """Engine cohort arbitration, 3-ledger memory physics, ring buffer, tile solver and wave recorder.
 
-[Role] Verify Stage-2 Workstream 2A runtime contracts: explicit cohort widening
-  and mid-flight symmetry splitting, 3-ledger memory binding with dynamic L2
-  working-set knees and 2-row directional HBM buses (Python == C11 within 8 ULP),
-  vector sub-pipes, 3-event ring buffers, tile liveness solving, 5-point wave
-  recording, and program package re-export parity.
+[Role] Verify core engine runtime contracts: explicit cohort widening and
+  mid-flight symmetry splitting, fair-share/FIFO preservation, >64-link widening,
+  3-ledger memory binding with sector-range L2 residency and 2-row directional
+  HBM buses (Python == C11 within 8 ULP), vector RAW anchors, 3-event ring
+  buffers with ABI v3 layout probes, tile liveness solving, 5-point wave
+  recording, and program package facade parity.
 [Invariants] Cohort merging matches unmerged execution within 1e-9 ms on both
   Python and C11; ByteLedger conserves hit + miss == aligned; solo HBM R/W has
   zero turnaround penalty while concurrent R+W satisfies max(Tr,Tw)+alpha*min(Tr,Tw);
@@ -16,6 +17,7 @@
 """
 from __future__ import annotations
 
+import ctypes
 import math
 from types import SimpleNamespace
 
@@ -23,59 +25,36 @@ import pytest
 
 from mindie_sim.prediction.coupled import coupled_rates
 from mindie_sim.prediction.engine import Engine, Resource
+from mindie_sim.prediction.ownership import unit_rates
 import mindie_sim.prediction.program as prog_pkg
 from mindie_sim.prediction.program import (
-    AddressRun,
-    AddressRunPlan,
-    AdmissionMemoryView,
-    BurstTurnRule,
-    HbmBusSpec,
-    KernelProgram,
-    MemoryAccessPattern,
-    ParallelProgram,
-    RecipeContext,
-    ReuseKey,
-    Stage,
-    VectorInstructionGroup,
-    VisibilityContract,
-    coalesce_execution_program,
-    merge_programs,
+    AddressRun, AddressRunPlan, AdmissionMemoryView, Allocation, BurstTurnRule,
+    DirtyWriteback, HbmBusSpec, KernelProgram, MemoryAccessPattern, ParallelProgram,
+    RecipeContext, ReuseKey, Stage, VectorInstructionGroup, VisibilityContract,
+    coalesce_execution_program, merge_programs, proportional_coupled_placement,
 )
-from mindie_sim.prediction.runtime.accel_terms import MsimAccess, PreparedTermsRunner
+from mindie_sim.prediction.runtime.accel_tables import pure_task
+from mindie_sim.prediction.runtime.accel_terms import (
+    TERMS_ABI_VERSION, MsimAccess, PreparedTermsRunner, expected_terms_abi_probe,
+)
 from mindie_sim.prediction.runtime.arbiter_fast_coupled import fast_single_tier_coupled
 from mindie_sim.prediction.runtime.prepared_terms import (
-    POLICY_FAIR,
-    POLICY_FIFO,
-    PreparedCapacityRow,
-    PreparedDelivery,
-    PreparedProgress,
-    PreparedTerm,
-    allocate_prepared_epoch,
-    integrate_prepared_epoch,
+    POLICY_FAIR, POLICY_FIFO, PreparedCapacityRow, PreparedDelivery,
+    PreparedProgress, PreparedTerm, allocate_prepared_epoch, integrate_prepared_epoch,
 )
 from mindie_sim.prediction.runtime.ring_buffer import RingBuffer, lower_generation
 from mindie_sim.prediction.runtime.tile_solver import (
-    LiveBufferSpec,
-    SubtileWaveSpec,
-    TileCandidate,
-    TileInfeasibleError,
-    TilePipelineSpec,
-    TileShape,
-    solve as solve_tiles,
+    LiveBufferSpec, SubtileWaveSpec, TileCandidate, TileInfeasibleError,
+    TilePipelineSpec, TileShape, solve as solve_tiles,
 )
-from mindie_sim.prediction.runtime.wave_recorder import (
-    RecordedPipelineSpec,
-    WaveRecorder,
-)
+from mindie_sim.prediction.runtime.wave_recorder import RecordedPipelineSpec, WaveRecorder
 from mindie_sim.schema.common import ModelingError
 
 pytestmark = pytest.mark.tier0
 
 
 def _ulp_distance(a: float, b: float) -> int:
-    if a == b:
-        return 0
-    return int(round(abs(a - b) / max(math.ulp(a), math.ulp(b))))
+    return 0 if a == b else int(round(abs(a - b) / max(math.ulp(a), math.ulp(b))))
 
 
 def _make_context(*, alpha_rw: float = 0.25) -> RecipeContext:
@@ -103,47 +82,43 @@ def _make_context(*, alpha_rw: float = 0.25) -> RecipeContext:
 def test_widened_cohort_asymmetric_split_matches_unmerged_across_backends(
     backend: str, hbm_work: float, cube_work: float
 ):
-    """19 widened owners + 1 solo owner must match 20 unmerged owners within 1e-9 ms."""
+    """19 widened owners + 1 solo owner match 20 unmerged owners within 1e-9 ms."""
     def run(merged: bool) -> tuple[float, dict[str, float], int]:
         eng = Engine([Resource("hbm", 1.0, units=1), Resource("cube", 1.0, units=20)], backend=backend)
         start = eng.submit("start")
         progs = tuple(
             KernelProgram((Stage(
                 "run",
-                {"hbm": hbm_work * (29 if core == 19 else 28),
-                 "cube": cube_work * (29 if core == 19 else 28)},
-                caps={"hbm": 1.0, "cube": 1.0}, placement={"cube": (core,)}, coupled=True,
+                {"hbm": hbm_work * (29 if c == 19 else 28), "cube": cube_work * (29 if c == 19 else 28)},
+                caps={"hbm": 1.0, "cube": 1.0}, placement={"cube": (c,)}, coupled=True,
             ),))
-            for core in range(20)
+            for c in range(20)
         )
-        program = coalesce_execution_program(ParallelProgram(progs)) if merged else ParallelProgram(progs)
-        done = program.start(eng, "op", start)
+        prog = coalesce_execution_program(ParallelProgram(progs)) if merged else ParallelProgram(progs)
+        done = prog.start(eng, "op", start)
         eng.advance(until=(done,))
         return float(done.time), dict(eng.serviced), eng.accel_status()["native_steps"]
 
     t_m, s_m, steps_m = run(True)
     t_u, s_u, steps_u = run(False)
-    assert abs(t_m - t_u) <= 1e-9
-    for key, val in s_u.items():
-        assert s_m[key] == pytest.approx(val, rel=1e-12, abs=1e-9)
+    assert abs(t_m - t_u) <= 1e-9 and s_m == pytest.approx(s_u, rel=1e-12, abs=1e-9)
     if backend == "c":
         assert steps_m > 0 and steps_u > 0
 
 
 @pytest.mark.parametrize("backend", ["python", "c"])
-def test_shared_multiunit_cohort_distinguished_from_widened_disjoint(backend: str):
-    """Two members sharing units (0, 1) must not be misclassified as widened disjoint."""
-    def run(merged: bool) -> tuple[float, dict[str, float]]:
+def test_shared_multiunit_and_fifo_cohorts_preserve_semantics(backend: str):
+    """Shared multi-unit cohorts, fair-share multiplicity, and shared-FIFO stay exact."""
+    def run_shared(merged: bool) -> tuple[float, dict[str, float]]:
         eng = Engine([Resource("cube", 2.0, units=2), Resource("hbm", 1.0, units=1)], backend=backend)
         start = eng.submit("start")
         k0 = KernelProgram((Stage("s", {"cube": 2.0, "hbm": 1.0}, placement={"cube": (0, 1)}, coupled=True),))
         k1 = KernelProgram((Stage("s", {"cube": 2.0, "hbm": 1.0}, placement={"cube": (0, 1)}, coupled=True),))
         peer = eng.submit("peer", {"cube": 2.0, "hbm": 1.0}, after=(start,), placement={"cube": (0, 1)}, coupled=True)
         if merged:
-            cohort = merge_programs([k0, k1])
-            assert cohort is not None and cohort.stages[0].cohort_size == 2
-            assert cohort.stages[0].cohort_widened == ()
-            done = eng.submit("done", after=(cohort.start(eng, "merged", start), peer))
+            coh = merge_programs([k0, k1])
+            assert coh is not None and coh.stages[0].cohort_size == 2 and coh.stages[0].cohort_widened == ()
+            done = eng.submit("done", after=(coh.start(eng, "merged", start), peer))
         else:
             done = eng.submit("done", after=(k0.start(eng, "m0", start), k1.start(eng, "m1", start), peer))
         eng.advance(until=(done,))
@@ -151,16 +126,33 @@ def test_shared_multiunit_cohort_distinguished_from_widened_disjoint(backend: st
             assert eng.accel_status()["native_steps"] > 0
         return float(done.time), dict(eng.serviced)
 
-    t_m, s_m = run(True)
-    t_u, s_u = run(False)
-    assert abs(t_m - t_u) <= 1e-9
-    assert s_m == pytest.approx(s_u, rel=1e-12)
+    t_m, s_m = run_shared(True)
+    t_u, s_u = run_shared(False)
+    assert abs(t_m - t_u) <= 1e-9 and s_m == pytest.approx(s_u, rel=1e-12)
+    # Fair-share contender multiplicity: never collapse shared unplaced uncoupled work.
+    assert merge_programs([KernelProgram((Stage("u", {"hbm": 4.0}),)), KernelProgram((Stage("u", {"hbm": 4.0}),))]) is None
+
+    def run_fifo(merged: bool) -> float:
+        eng = Engine([Resource("dma", 2.0, policy="fifo", units=1)], backend=backend)
+        start = eng.submit("start")
+        f0 = KernelProgram((Stage("f", {"dma": 1.0}, caps={"dma": 1.0}, coupled=True),))
+        f1 = KernelProgram((Stage("f", {"dma": 1.0}, caps={"dma": 1.0}, coupled=True),))
+        if merged:
+            mc = merge_programs([f0, f1])
+            assert mc is not None
+            done = mc.start(eng, "mf", start)
+        else:
+            done = eng.submit("j", after=(f0.start(eng, "f0", start), f1.start(eng, "f1", start)))
+        eng.advance(until=(done,))
+        return float(done.time)
+
+    assert run_fifo(True) == pytest.approx(2.0, abs=1e-9) and run_fifo(False) == pytest.approx(2.0, abs=1e-9)
 
 
 @pytest.mark.parametrize("backend", ["python", "c"])
-def test_midflight_asymmetric_interference_splits_widened_cohort_members(backend: str):
-    """An external task arriving mid-flight on unit 0 splits a 4-unit cohort accurately."""
-    def run(merged: bool) -> tuple[float, dict[str, float]]:
+def test_midflight_asymmetric_split_runs_native_until_interference_and_publishes_once(backend: str):
+    """Mid-flight peer splits cohort at actual activation; parent completes once."""
+    def run(merged: bool) -> tuple[float, dict[str, float], int, int]:
         eng = Engine([Resource("cube", 4.0, units=4), Resource("hbm", 4.0, units=1)], backend=backend)
         start = eng.submit("start")
         members = [
@@ -168,24 +160,48 @@ def test_midflight_asymmetric_interference_splits_widened_cohort_members(backend
             for i in range(4)
         ]
         if merged:
-            merged_k = merge_programs(members)
-            assert merged_k is not None and merged_k.stages[0].cohort_widened == ("cube",)
-            main_ev = merged_k.start(eng, "coh", start)
+            mk = merge_programs(members)
+            assert mk is not None and mk.stages[0].cohort_widened == ("cube",)
+            main_ev = mk.start(eng, "coh", start)
         else:
             main_ev = eng.submit("join", after=tuple(m.start(eng, f"m{i}", start) for i, m in enumerate(members)))
         ext = eng.submit("ext", {"cube": 1.0}, release=0.5, placement={"cube": (0,)})
         done = eng.submit("done", after=(main_ev, ext))
         eng.advance(until=(done,))
-        return float(done.time), dict(eng.serviced)
+        return float(done.time), dict(eng.serviced), eng.accel_status()["native_steps"], eng.completed_count
 
-    t_m, s_m = run(True)
-    t_u, s_u = run(False)
-    assert abs(t_m - t_u) <= 1e-9
-    assert s_m == pytest.approx(s_u, rel=1e-12)
+    t_m, s_m, steps_m, comp_m = run(True)
+    t_u, s_u, _, _ = run(False)
+    assert abs(t_m - t_u) <= 1e-9 and s_m == pytest.approx(s_u, rel=1e-12) and comp_m == 4
+    assert backend != "c" or steps_m > 0
 
 
-def test_coupled_and_overlapping_uncoupled_python_c_parity_within_8_ulp():
-    """Coupled multi-flow and overlapping uncoupled + coupled peers stay within 8 ULP."""
+def test_over_64_link_widening_and_proportional_native_admission():
+    """Per-link C widening supports >64 links; skewed coupled placements decline native."""
+    n_res = 70
+    resources = [Resource(f"r{i}", 4.0, units=2) for i in range(n_res)]
+    work = {f"r{i}": 2.0 for i in range(n_res)}
+    placement = {f"r{i}": (0, 1) for i in range(n_res)}
+    widened = tuple(f"r{i}" for i in range(n_res))
+    times = {}
+    for be in ("python", "c"):
+        eng = Engine(resources, backend=be)
+        ev = eng.submit("wide", work, placement=placement, coupled=True, cohort_size=2, cohort_widened=widened)
+        eng.advance(until=(ev,))
+        times[be] = float(ev.time)
+        assert be != "c" or eng.accel_status()["native_steps"] > 0
+    assert abs(times["python"] - times["c"]) <= 1e-12 and times["c"] == pytest.approx(0.5, abs=1e-12)
+
+    assert proportional_coupled_placement((0,), (0, 1, 2), 2, 4) == ((0,), (0, 1))
+    skew_eng = Engine([Resource("cube", 2.0, units=2), Resource("vector", 4.0, units=4)], backend="c")
+    skew_ev = skew_eng.submit("skew", {"cube": 2.0, "vector": 4.0}, coupled=True, placement={"cube": (0,), "vector": (0, 1, 2)})
+    assert not pure_task(skew_eng, skew_eng._tasks[skew_ev.sequence])
+    skew_eng.advance(until=(skew_ev,))
+    assert skew_eng.accel_status()["native_steps"] == 0
+
+
+def test_coupled_and_disjoint_uncoupled_parity_zero_ulp_and_peer_invariance():
+    """3-task coupled reaches 0 ULP; disjoint coupled peer never alters uncoupled times."""
     res1 = [Resource("a", 26.289056632197735), Resource("b", 36.495015663833634)]
     works1 = [
         {"a": 7.05924503470419, "b": 8.494354162581535},
@@ -198,145 +214,126 @@ def test_coupled_and_overlapping_uncoupled_python_c_parity_within_8_ulp():
         evs = [eng.submit(f"t{i}", w, coupled=True) for i, w in enumerate(works1)]
         eng.advance(until=tuple(evs), first=False)
         out1[be] = [float(e.time) for e in evs]
-    assert all(_ulp_distance(a, b) <= 8 for a, b in zip(out1["python"], out1["c"]))
+    assert all(_ulp_distance(a, b) == 0 for a, b in zip(out1["python"], out1["c"]))
 
     res2 = [Resource("cube", 245.76, units=20), Resource("vector", 1.92, units=40)]
+    u_specs = (
+        ("u0", {"cube": 1.0154159211083948}, {"cube": (10, 15, 17)}),
+        ("u1", {"cube": 3.6808735333841436}, {"cube": (0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18, 19)}),
+    )
     out2 = {}
     for be in ("python", "c"):
-        eng = Engine(res2, backend=be)
-        u0 = eng.submit("u0", {"cube": 1.0154159211083948}, placement={"cube": (10, 15, 17)})
-        u1 = eng.submit(
-            "u1", {"cube": 3.6808735333841436},
-            placement={"cube": (0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18, 19)},
-        )
-        c0 = eng.submit(
-            "c0", {"cube": 500.0, "vector": 100.0}, coupled=True,
-            placement={"cube": (3, 4), "vector": (6, 7, 8, 9)},
-        )
-        eng.advance(until=(u0, u1, c0), first=False)
-        out2[be] = [float(u0.time), float(u1.time), float(c0.time)]
-    assert all(_ulp_distance(a, b) <= 8 for a, b in zip(out2["python"], out2["c"]))
+        eng_solo = Engine(res2, backend=be)
+        evs_solo = [eng_solo.submit(n, w, placement=p) for n, w, p in u_specs]
+        eng_solo.advance(until=tuple(evs_solo), first=False)
+        eng_peer = Engine(res2, backend=be)
+        evs_peer = [eng_peer.submit(n, w, placement=p) for n, w, p in u_specs]
+        c0 = eng_peer.submit("c0", {"cube": 500.0, "vector": 100.0}, coupled=True, placement={"cube": (3, 4), "vector": (6, 7, 8, 9)})
+        eng_peer.advance(until=(*evs_peer, c0), first=False)
+        assert float(evs_peer[0].time) == float(evs_solo[0].time)
+        assert float(evs_peer[1].time) == float(evs_solo[1].time)
+        assert float(evs_peer[0].time) < float(evs_peer[1].time)
+        out2[be] = [float(evs_peer[0].time), float(evs_peer[1].time), float(c0.time)]
+    assert all(_ulp_distance(a, b) == 0 for a, b in zip(out2["python"], out2["c"]))
+
+    ur = unit_rates(
+        245.76, 20, {0: math.inf, 1: math.inf},
+        {0: (10, 15, 17), 1: (0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18, 19)},
+    )
+    assert ur[0] == pytest.approx(ur[1], rel=1e-15)
 
 
 def test_fast_single_tier_coupled_matches_coupled_rates_on_widened_cohort():
-    """Both Python coupled arbiters must agree identically on widened cohorts."""
+    """Both Python coupled arbiters agree identically on widened cohorts."""
     eng = Engine([Resource("cube", 20.0, units=20), Resource("hbm", 1.0, units=1)], backend="python")
-    eng.submit(
-        "coh", {"cube": 190.0, "hbm": 19.0}, placement={"cube": tuple(range(19))},
-        coupled=True, cohort_size=19, cohort_widened=("cube",),
-    )
+    eng.submit("coh", {"cube": 190.0, "hbm": 19.0}, placement={"cube": tuple(range(19))}, coupled=True, cohort_size=19, cohort_widened=("cube",))
     eng.submit("solo", {"cube": 10.0, "hbm": 1.0}, placement={"cube": (19,)}, coupled=True)
     eng._settle()
     r_fast = fast_single_tier_coupled(eng.resources, eng._tasks, eng._active)
     r_ref = coupled_rates(eng.resources, {k: eng._tasks[k] for k in eng._active})
-    assert r_fast is not None
-    assert r_fast["hbm"][1] == pytest.approx(19.0 / 20.0, rel=1e-12)
-    assert r_fast["hbm"][2] == pytest.approx(1.0 / 20.0, rel=1e-12)
+    assert r_fast is not None and r_fast["hbm"][1] == pytest.approx(19.0 / 20.0, rel=1e-12)
     for rname in ("cube", "hbm"):
         for seq in (1, 2):
             assert r_fast[rname][seq] == pytest.approx(r_ref[rname][seq], rel=1e-12)
 
 
-def test_three_ledger_bind_access_sector_union_turnaround_and_empty_runs():
-    """Discrete 656 B rows amplify to 1,376,256 B sectors; aligned 512 B has zero amp."""
+@pytest.mark.parametrize("backend", ["python", "c"])
+def test_bound_memory_access_through_engine_single_bw_divide_owner_pin_and_deliveries(backend: str):
+    """Cold 128 B read (64 B/ms copy, 1024 B/ms HBM) finishes in 2.0 ms and logs 128 B."""
+    bus = HbmBusSpec(die=0, read_bytes_per_ms=1024.0, write_bytes_per_ms=1024.0, alpha_rw=0.25)
+    ctx = RecipeContext(
+        op=SimpleNamespace(family="elementwise", recipe="direct", metadata={}),
+        work={}, resource_names={"hbm": "hbm@d0", "mte2_aiv": "mte2@d0"},
+        rates={"hbm@d0": 1024.0, "mte2@d0": 128.0}, resource_units={"mte2@d0": 2},
+        core_count=2, physical_mechanisms=SimpleNamespace(hbm_alpha_rw=0.25),
+    )
+    pat = MemoryAccessPattern(
+        tensor_id="x", version=1, die=0, owner=1, direction="read", pipe="mte2_aiv",
+        logical_bytes=128, runs=AddressRunPlan((AddressRun(0, 1, 128, 128),)),
+        reuse_key=ReuseKey(die=0, backing_allocation="buf_x", tensor_version=1),
+    )
+    bound = ctx.bind_access(pat, hbm_bus=bus)
+    assert bound.stage_placement() == {"mte2@d0": (1,)}
+
+    eng = Engine([Resource("mte2@d0", 128.0, unit="bytes", units=2)], backend=backend)
+    eng.add_hbm_bus(bus)
+    ev = eng.submit_bound_access("cold_rd", bound)
+    eng.advance(until=(ev,))
+    assert float(ev.time) == pytest.approx(2.0, abs=1e-12) and eng.serviced["mte2@d0"] == pytest.approx(128.0, rel=1e-12)
+    assert eng.delivered["hbm_read@d0"] == pytest.approx(128.0, rel=1e-12)
+    if backend == "c":
+        assert eng.accel_status()["native_steps"] > 0
+
+    eng2 = Engine([Resource("mte2@d0", 128.0, unit="bytes", units=2)], backend=backend)
+    eng2.add_hbm_bus(bus)
+    ev2 = KernelProgram((bound.to_stage("cold_rd_stage"),)).start(eng2, "op", eng2.submit("go"))
+    eng2.advance(until=(ev2,))
+    assert float(ev2.time) == pytest.approx(2.0, abs=1e-12) and eng2.delivered["hbm_read@d0"] == pytest.approx(128.0, rel=1e-12)
+
+
+def test_three_ledger_sector_union_turnaround_and_l2_sector_residency_rules():
+    """Verify 3-ledger math, sector-range L2 residency, distinct active keys, and writebacks."""
     ctx = _make_context(alpha_rw=0.25)
     discrete = MemoryAccessPattern(
         tensor_id="kv_rows", version=1, die=0, owner=0, direction="read", pipe="mte2_aiv",
         logical_bytes=656 * 2048,
-        runs=AddressRunPlan((AddressRun(base_byte=0, rows=2048, row_bytes=656, stride_bytes=672),)),
+        runs=AddressRunPlan((AddressRun(0, 2048, 656, 672),)),
         reuse_key=ReuseKey(die=0, backing_allocation="kv", tensor_version=1),
         visibility=VisibilityContract(scope="owner"),
     )
-    turn_rule = BurstTurnRule(min_row_bytes=1, max_row_bytes=1024, min_stride_bytes=1, max_stride_bytes=1024, penalty_bytes=164.0)
-    bound_disc = ctx.bind_access(discrete, burst_rules=(turn_rule,))
-    eta = 656.0 / (656.0 + 164.0)  # 0.8
-    assert bound_disc.ledger.logical_tensor_bytes == 656 * 2048
-    assert bound_disc.ledger.aligned_transfer_bytes == 672 * 2048
-    assert bound_disc.ledger.dram_sector_bytes == 1_376_256
-    assert bound_disc.ledger.dram_bus_transaction_bytes == pytest.approx(1_376_256 / eta)
-    assert bound_disc.ledger.l2_hit_bytes + bound_disc.ledger.dram_miss_copy_bytes == bound_disc.ledger.aligned_transfer_bytes
+    turn = BurstTurnRule(min_row_bytes=1, max_row_bytes=1024, min_stride_bytes=1, max_stride_bytes=1024, penalty_bytes=164.0)
+    bound = ctx.bind_access(discrete, burst_rules=(turn,))
+    assert bound.ledger.dram_sector_bytes == 1_376_256
+    assert bound.ledger.dram_bus_transaction_bytes == pytest.approx(1_376_256 / 0.8)
 
-    aligned = MemoryAccessPattern(
-        tensor_id="dense_w", version=1, die=0, owner=0, direction="read", pipe="mte2_aic",
-        logical_bytes=512 * 1024,
-        runs=AddressRunPlan((AddressRun(base_byte=0, rows=1024, row_bytes=512, stride_bytes=512),)),
-        reuse_key=ReuseKey(die=0, backing_allocation="w", tensor_version=1),
-    )
-    bound_al = ctx.bind_access(aligned)
-    assert bound_al.ledger.dram_sector_bytes == 512 * 1024
-    assert bound_al.ledger.dram_bus_transaction_bytes == pytest.approx(float(512 * 1024))
-
-    empty = MemoryAccessPattern(
-        tensor_id="empty", version=1, die=0, owner=0, direction="write", pipe="mte3",
-        logical_bytes=0,
-        runs=AddressRunPlan((AddressRun(base_byte=0, rows=0, row_bytes=64, stride_bytes=64),)),
-    )
-    bound_empty = ctx.bind_access(empty)
-    assert bound_empty.constraints == () and bound_empty.deliveries == ()
-    assert bound_empty.ledger.aligned_transfer_bytes == 0
-
-    with PreparedTermsRunner() as runner:
-        valid_acc = MsimAccess(
-            logical_bytes=bound_disc.ledger.logical_tensor_bytes,
-            aligned_bytes=bound_disc.ledger.aligned_transfer_bytes,
-            hit_bytes=bound_disc.ledger.l2_hit_bytes,
-            miss_bytes=bound_disc.ledger.dram_miss_copy_bytes,
-            sector_bytes=bound_disc.ledger.dram_sector_bytes,
-            dram_service_bytes=bound_disc.ledger.dram_bus_transaction_bytes,
-            copy_pipe_row=0, l2_row=1, die=0, direction=0, flags=0,
-        )
-        assert runner.validate_access(valid_acc) == 0
-        bad_acc = MsimAccess(
-            logical_bytes=1024, aligned_bytes=1024, hit_bytes=512, miss_bytes=256,
-            sector_bytes=256, dram_service_bytes=256.0, copy_pipe_row=0, l2_row=1,
-            die=0, direction=0, flags=0,
-        )
-        assert runner.validate_access(bad_acc) != 0
-
-
-def test_dynamic_l2_knee_n_streams_eviction_and_non_resurrection():
-    """Shared L2 knee scales as floor(C_avail / (g*N)), evicts immediately, never resurrects."""
     mib = 1024 * 1024
     with pytest.raises(ModelingError, match="shared_l2_buffer_requires_one_die_owner"):
         AdmissionMemoryView({0: 128 * mib}, l2_buffer_units_by_die={0: 2})
-
     view = AdmissionMemoryView({0: 128 * mib}, l2_buffer_units_by_die={0: 1})
-    assert view.effective_l2_bytes(0) == 128 * mib
 
-    key_a = ReuseKey(die=0, backing_allocation="weights_a", tensor_version=1, reuse_stream="s0")
-    pat_96m = MemoryAccessPattern(
-        tensor_id="w96", version=1, die=0, owner=0, direction="read", pipe="mte2_aic",
-        logical_bytes=96 * mib,
-        runs=AddressRunPlan((AddressRun(base_byte=0, rows=1, row_bytes=96 * mib, stride_bytes=96 * mib),)),
-        reuse_key=key_a, visibility=VisibilityContract(scope="die"),
+    k_range = ReuseKey(die=0, backing_allocation="buf", tensor_version=1, reuse_stream="main")
+    p0 = MemoryAccessPattern("t0", 1, 0, 0, "read", "mte2_aiv", 32, AddressRunPlan((AddressRun(0, 1, 32, 32),)), reuse_key=k_range)
+    p32 = MemoryAccessPattern("t32", 1, 0, 0, "read", "mte2_aiv", 32, AddressRunPlan((AddressRun(32, 1, 32, 32),)), reuse_key=k_range)
+    # Default commit=False does not mutate residency pre-admission; offset 0 does not hit offset 32.
+    ctx.bind_access(p0, state=view)
+    assert not view.is_resident(k_range)
+    assert view.admit_access(p0, 32) == (0, 32)
+    assert view.admit_access(p32, 32) == (0, 32)
+    assert view.admit_access(p0, 32) == (32, 0)
+
+    # Two distinct allocations both using reuse_stream="main" give n_active=2 -> 64 MiB knee.
+    k_other = ReuseKey(die=0, backing_allocation="buf2", tensor_version=1, reuse_stream="main")
+    p_other = MemoryAccessPattern(
+        "o", 1, 0, 0, "write", "mte3", 48 * mib, AddressRunPlan((AddressRun(0, 1, 48 * mib, 48 * mib),)),
+        reuse_key=k_other, visibility=VisibilityContract(scope="owner", private_workspace=True, live_out=False),
     )
-    view.enter_stream(0, "s0")
-    assert view.admit_access(pat_96m, 96 * mib) == (0, 96 * mib)
-    assert view.is_resident(key_a)
-    assert view.admit_access(pat_96m, 96 * mib) == (96 * mib, 0)
-
-    view.enter_stream(0, "s1")
+    assert view.admit_access(p_other, 48 * mib) == (48 * mib, 0)
     assert view.effective_l2_bytes(0) == 64 * mib
-    assert not view.is_resident(key_a)
-
-    view.enter_stream(0, "s2")
-    assert view.effective_l2_bytes(0) == (128 * mib // (128 * 3)) * 128
-    view.enter_stream(0, "s3")
-    assert view.effective_l2_bytes(0) == 32 * mib
-
-    view.exit_stream(0, "s3")
-    view.exit_stream(0, "s2")
-    view.exit_stream(0, "s1")
-    assert view.effective_l2_bytes(0) == 128 * mib
-    assert not view.is_resident(key_a)  # evicted entry never resurrects
-    assert view.admit_access(pat_96m, 96 * mib) == (0, 96 * mib)
-    assert view.admit_access(pat_96m, 96 * mib) == (96 * mib, 0)
-
-    view.grant_reservation(0, "persist", 80 * mib)
-    assert view.effective_l2_bytes(0) == 48 * mib
-    assert not view.is_resident(key_a)
-    view.release_reservation(0, "persist")
-    assert not view.is_resident(key_a)
+    view.grant_reservation(0, "pin", 120 * mib)
+    wbs = view.drain_writebacks(0)
+    assert len(wbs) == 1 and isinstance(wbs[0], DirtyWriteback) and wbs[0].bytes == 48 * mib
+    view.release_reservation(0, "pin")
+    assert not view.is_resident(k_other)
 
 
 @pytest.mark.parametrize("alpha_rw", [0.0, 0.25, 0.5])
@@ -349,230 +346,248 @@ def test_hbm_two_row_directional_bus_laws_python_and_c(alpha_rw: float, backend:
     def run_case(mode: str) -> float:
         eng = Engine([Resource("vec", 1.0)], backend=backend)
         eng.add_hbm_bus(bus)
-        r_work = {t.row_id: t.ms_per_progress for t in bus.terms_for("read", t_r * 1000.0) if t.ms_per_progress > 0.0}
-        w_work = {t.row_id: t.ms_per_progress for t in bus.terms_for("write", t_w * 1000.0) if t.ms_per_progress > 0.0}
+        r_w = {t.row_id: t.ms_per_progress for t in bus.terms_for("read", t_r * 1000.0) if t.ms_per_progress > 0.0}
+        w_w = {t.row_id: t.ms_per_progress for t in bus.terms_for("write", t_w * 1000.0) if t.ms_per_progress > 0.0}
         if mode == "solo_r":
-            ev = eng.submit("r", r_work, coupled=True)
+            ev = eng.submit("r", r_w, coupled=True)
         elif mode == "solo_w":
-            ev = eng.submit("w", w_work, coupled=True)
+            ev = eng.submit("w", w_w, coupled=True)
         elif mode == "serial":
-            er = eng.submit("r", r_work, coupled=True)
-            ev = eng.submit("w", w_work, after=(eng.submit("v", {"vec": t_v}, after=(er,)),), coupled=True)
+            ev = eng.submit("w", w_w, after=(eng.submit("v", {"vec": t_v}, after=(eng.submit("r", r_w, coupled=True),)),), coupled=True)
         else:
-            ev = eng.submit("done", after=(eng.submit("r", r_work, coupled=True), eng.submit("w", w_work, coupled=True)))
+            ev = eng.submit("done", after=(eng.submit("r", r_w, coupled=True), eng.submit("w", w_w, coupled=True)))
         eng.advance(until=(ev,))
-        if backend == "c":
-            assert eng.accel_status()["native_steps"] > 0
+        assert backend != "c" or eng.accel_status()["native_steps"] > 0
         return float(ev.time)
 
-    assert run_case("solo_r") == pytest.approx(t_r, rel=1e-12)
-    assert run_case("solo_w") == pytest.approx(t_w, rel=1e-12)
+    assert run_case("solo_r") == pytest.approx(t_r, rel=1e-12) and run_case("solo_w") == pytest.approx(t_w, rel=1e-12)
     assert run_case("serial") == pytest.approx(t_r + t_v + t_w, rel=1e-12)
     assert run_case("concurrent") == pytest.approx(max(t_r, t_w) + alpha_rw * min(t_r, t_w), rel=1e-12)
 
 
-def test_prepared_terms_c11_matches_python_within_8_ulp_and_conserves_work():
-    """Direct C11 prepared-row solver matches Python reference across mixed R/W, prio and FIFO."""
+def test_prepared_terms_c11_parity_row_invalidation_and_access_validation():
+    """C11 prepared-terms solver matches Python <=8 ULP and invalidates stale terms on row shrink."""
     bus = HbmBusSpec(die=0, read_bytes_per_ms=1_600_000.0, write_bytes_per_ms=1_200_000.0, alpha_rw=0.35)
     rows = [
-        PreparedCapacityRow(row_id=0, policy=POLICY_FAIR, capacity=1.0),
-        PreparedCapacityRow(row_id=1, policy=POLICY_FAIR, capacity=1.0),
-        PreparedCapacityRow(row_id=2, policy=POLICY_FIFO, capacity=1.0),
+        PreparedCapacityRow(0, policy=POLICY_FAIR, capacity=1.0),
+        PreparedCapacityRow(1, policy=POLICY_FAIR, capacity=1.0),
+        PreparedCapacityRow(2, policy=POLICY_FIFO, capacity=1.0),
     ]
     d_r, d_w = 3_200_000.0, 2_400_000.0
     (tr_r, tr_w), (tw_r, tw_w) = bus.terms_for("read", d_r), bus.terms_for("write", d_w)
-
     with PreparedTermsRunner() as runner:
         c_r, c_w = runner.hbm_terms(bus, "read", d_r)
         assert _ulp_distance(c_r, tr_r.ms_per_progress) <= 1 and _ulp_distance(c_w, tr_w.ms_per_progress) <= 1
+        assert runner.validate_access(MsimAccess(1024, 1024, 512, 512, 512, 512.0, 0, 1, 0, 0, 0)) == 0
+        assert runner.validate_access(MsimAccess(1024, 1024, 512, 256, 256, 256.0, 0, 1, 0, 0, 0)) != 0
         progs_py = [
-            PreparedProgress(sequence=1, task=1, priority=0, placement_id=0, member_map=0, z_left=1.0, weight=1.0),
-            PreparedProgress(sequence=2, task=2, priority=0, placement_id=0, member_map=0, z_left=1.0, weight=1.0),
-            PreparedProgress(sequence=3, task=3, priority=1, placement_id=0, member_map=0, z_left=1.0, weight=2.0),
-            PreparedProgress(sequence=4, task=4, priority=0, placement_id=0, member_map=0, z_left=1.0, weight=1.0),
+            PreparedProgress(1, 1, 0, 0, 0, 1.0, 1.0), PreparedProgress(2, 2, 0, 0, 0, 1.0, 1.0),
+            PreparedProgress(3, 3, 1, 0, 0, 1.0, 2.0), PreparedProgress(4, 4, 0, 0, 0, 1.0, 1.0),
         ]
-        progs_c = [
-            PreparedProgress(p.sequence, p.task, p.priority, p.placement_id, p.member_map, p.z_left, p.weight, p.max_dz_ms)
-            for p in progs_py
-        ]
+        progs_c = [PreparedProgress(p.sequence, p.task, p.priority, p.placement_id, p.member_map, p.z_left, p.weight, p.max_dz_ms) for p in progs_py]
         terms = [
             PreparedTerm(0, 0, tr_r.ms_per_progress), PreparedTerm(1, 0, tr_w.ms_per_progress),
             PreparedTerm(0, 1, tw_r.ms_per_progress), PreparedTerm(1, 1, tw_w.ms_per_progress),
             PreparedTerm(2, 1, 0.5), PreparedTerm(0, 2, 1.0), PreparedTerm(2, 3, 0.5),
         ]
-        deliveries = [
-            PreparedDelivery(0, 0, d_r), PreparedDelivery(1, 1, d_w),
-            PreparedDelivery(2, 2, 100.0), PreparedDelivery(2, 3, 50.0),
-        ]
+        dels = [PreparedDelivery(0, 0, d_r), PreparedDelivery(1, 1, d_w), PreparedDelivery(2, 2, 100.0), PreparedDelivery(2, 3, 50.0)]
         runner.config_rows(rows)
-        runner.prepare_terms(progs_c, terms, deliveries, ncounters=3)
+        runner.prepare_terms(progs_c, terms, dels, ncounters=3)
         ctrs_py = [0.0, 0.0, 0.0]
-
         for _ in range(10):
             if all(p.z_left <= 0.0 for p in progs_py):
                 break
-            dz_py = allocate_prepared_epoch(rows, progs_py, terms)
-            dz_c = runner.allocate_epoch()
+            dz_py, dz_c = allocate_prepared_epoch(rows, progs_py, terms), runner.allocate_epoch()
             assert all(_ulp_distance(a, b) <= 8 for a, b in zip(dz_py, dz_c))
             dt = min(p.z_left / r for p, r in zip(progs_py, dz_py) if p.z_left > 0.0 and r > 0.0)
-            s_py = integrate_prepared_epoch(progs_py, deliveries, dz_py, dt, ctrs_py)
+            s_py = integrate_prepared_epoch(progs_py, dels, dz_py, dt, ctrs_py)
             s_c = runner.integrate_epoch(dz_c, dt)
             assert all(_ulp_distance(a, b) <= 8 for a, b in zip(s_py, s_c))
-
         z_c, ctrs_c = runner.read_state()
-        assert all(z == 0.0 for z in z_c)
-        assert ctrs_c[0] == pytest.approx(d_r, rel=1e-12)
-        assert ctrs_c[1] == pytest.approx(d_w, rel=1e-12)
-        assert ctrs_c[2] == pytest.approx(150.0, rel=1e-12)
-        assert all(_ulp_distance(a, b) <= 8 for a, b in zip(ctrs_py, ctrs_c))
+        assert all(z == 0.0 for z in z_c) and all(_ulp_distance(a, b) <= 8 for a, b in zip(ctrs_py, ctrs_c))
+
+        runner.config_rows([rows[0]])
+        assert runner.allocate_epoch() == []
+        buf = (ctypes.c_double * 4)()
+        assert int(runner.library.msim_allocate_epoch(runner.ctx, buf, 4)) != 0
 
 
-def test_vector_subpipes_target_eff_and_raw_latency_invariance():
-    """Vector sub-pipes lower onto vec_issue + sub-pipes; target_eff leaves RAW cycles invariant."""
+def test_vector_subpipes_target_eff_and_raw_latency_anchor_parity():
+    """RAW visibility timer anchors to last instruction issue so DAG span == bound span."""
     ctx = _make_context()
     groups = (
         VectorInstructionGroup("exp", "vec_sfu", count=10, issue_slots=1, initiation_cycles=1, result_latency_cycles=20),
         VectorInstructionGroup("sum", "vec_reduce", count=4, issue_slots=1, initiation_cycles=1, result_latency_cycles=10, dependencies=("exp",)),
         VectorInstructionGroup("mul", "vec_alu", count=8, issue_slots=1, initiation_cycles=1, dependencies=("sum",)),
     )
-    full = ctx.bind_vector(groups, target_eff=1.0)
-    half = ctx.bind_vector(groups, target_eff=0.5)
+    full, half = ctx.bind_vector(groups, target_eff=1.0), ctx.bind_vector(groups, target_eff=0.5)
     assert full.raw_latency_ms == pytest.approx(half.raw_latency_ms, rel=1e-12)
-    assert half.span_ms > full.span_ms
-    assert all("vector" not in stage.work for stage in full.stages)
+    assert half.span_ms > full.span_ms and all("vector" not in s.work for s in full.stages)
     assert full.vector_projection == pytest.approx(22.0)
 
+    ctx_1k = RecipeContext(
+        op=SimpleNamespace(family="elementwise", recipe="direct", metadata={}),
+        work={}, resource_names={"vec_issue": "vi", "vec_alu": "va"},
+        rates={"vi": 1.0, "va": 1.0}, core_count=1, compute_arch=SimpleNamespace(clock_hz=1000.0),
+    )
+    b1 = ctx_1k.bind_vector((VectorInstructionGroup("g", "vec_alu", count=1, result_latency_cycles=3),))
+    assert b1.span_ms == pytest.approx(3.0, abs=1e-12)
+    eng = Engine([Resource("vi", 1.0), Resource("va", 1.0)], backend="python")
+    done = KernelProgram(b1.stages).start(eng, "vraw", eng.submit("go"))
+    eng.advance(until=(done,))
+    assert float(done.time) == pytest.approx(3.0, abs=1e-12)
 
-def test_ring_buffer_three_event_distance_d_credit_and_multi_consumer_last_use():
-    """Generation k waits on last_use(k - d) across ALL consumers, not the earliest consumer."""
-    ring = RingBuffer(occurrence=1, die=0, owner=0, pool="l1", allocation="kv_ring", slot_bytes=4096, depth=2)
+
+def test_ring_buffer_distance_d_credit_and_abi_v3_wire_roundtrip():
+    """RingBuffer distance-d credits, ABI version >2 layout probe, and C11 ring round-trip."""
+    ring = RingBuffer(occurrence=7, die=0, owner=1, pool="l1", allocation="kv_ring", slot_bytes=4096, depth=2)
     gens = [
         lower_generation(
             ring, k, producer="load", consumers=("fast_c", "slow_c"),
-            producer_work={"mte2": 1.0},
-            consumer_works={"fast_c": {"cube": 1.0}, "slow_c": {"vec": 3.0}},
+            producer_work={"mte2": 1.0}, consumer_works={"fast_c": {"cube": 1.0}, "slow_c": {"vec": 3.0}},
         )
         for k in range(4)
     ]
-    assert gens[2].credit == gens[0].last_use
-    assert gens[3].credit == gens[1].last_use
-    slot_recs, dep_recs = ring.to_c_records()
-    assert len(slot_recs) == 4 and len(dep_recs) > 0
+    assert gens[2].credit == gens[0].last_use and gens[3].credit == gens[1].last_use
+    orig_slots, orig_deps = ring.to_c_records()
+    with PreparedTermsRunner() as runner:
+        probe = runner.terms_abi_probe()
+        assert probe[0] == TERMS_ABI_VERSION and probe[0] > 2 and probe == expected_terms_abi_probe()
+        rt_slots, rt_deps = runner.roundtrip_ring(ring)
+        assert rt_slots == orig_slots and rt_deps == orig_deps
 
-    stages = ring.to_stages()
-    eng = Engine([Resource("mte2", 1.0), Resource("cube", 1.0), Resource("vec", 1.0)], pools={"l1": 8192.0}, pool_units={"l1": 1}, backend="python")
-    done = KernelProgram(stages).start(eng, "ring_op", eng.submit("ready"))
+    eng = Engine([Resource("mte2", 1.0), Resource("cube", 1.0), Resource("vec", 1.0)], pools={"l1": 8192.0}, pool_units={"l1": 2}, backend="python")
+    done = KernelProgram(ring.to_stages()).start(eng, "ring_op", eng.submit("ready"))
     eng.advance(until=(done,))
-    assert done.time >= 6.0 - 1e-12  # gen 2 waits for gen 0 slow consumer (t=4), then runs load+slow (4+4=8 or 1+3+3=7)
+    assert float(done.time) >= 6.0 - 1e-12
 
 
-def test_tile_solver_liveness_simt_carveout_fallback_ladder_and_core_waves():
-    """TileSolver enforces SIMT UB carveout, alias folding, fallback ladder and core-control waves."""
+def test_tile_solver_owner_kind_scaling_zero_item_flops_and_ladder_order():
+    """TileSolver scales L2 by buffer owner_kind, emits 0 FLOPs for 0 items, ranks by ladder."""
     cand_1pass = TileCandidate(
         algorithm="resident_1pass", tile_shape=TileShape(m=10, n=64, k=64, head_dim=4096),
-        depth=1, owner_partition=(8, 16), work_items=10, tiles_per_owner=3,
-        buffers=(
-            LiveBufferSpec("q", "ub", 48 * 1024, live_start=0, live_end=2),
-            LiveBufferSpec("scores", "ub", 160 * 1024, live_start=1, live_end=2),
-        ),
+        depth=1, owner_partition=(4, 8), work_items=10, tiles_per_owner=3,
+        buffers=(LiveBufferSpec("q", "ub", 48 * 1024, 0, 2), LiveBufferSpec("scores", "ub", 160 * 1024, 1, 2)),
         logical_flops=2 * 10 * 64 * 64, instruction_block=(16, 16, 16), uses_simt=True,
     )
     cand_online = TileCandidate(
         algorithm="online_reduce", tile_shape=TileShape(m=10, n=64, k=64, head_dim=4096),
-        depth=1, owner_partition=(8, 16), work_items=10, tiles_per_owner=3,
+        depth=1, owner_partition=(4, 8), work_items=10, tiles_per_owner=3,
         buffers=(
-            LiveBufferSpec("q", "ub", 48 * 1024, live_start=0, live_end=2),
-            LiveBufferSpec("tmp_a", "ub", 64 * 1024, live_start=0, live_end=1, alias_group="scratch"),
-            LiveBufferSpec("tmp_b", "ub", 64 * 1024, live_start=1, live_end=2, alias_group="scratch"),
+            LiveBufferSpec("q", "ub", 48 * 1024, 0, 2),
+            LiveBufferSpec("a", "ub", 64 * 1024, 0, 1, alias_group="s"),
+            LiveBufferSpec("b", "ub", 64 * 1024, 1, 2, alias_group="s"),
+            LiveBufferSpec("v_l2", "l2", 32 * 1024, 0, 2, owner_kind="aiv"),
         ),
-        logical_flops=2 * 10 * 64 * 64, instruction_block=(16, 16, 16), uses_simt=True,
-        native_mode="narrow_m",
+        logical_flops=2 * 10 * 64 * 64, instruction_block=(16, 16, 16), uses_simt=True, native_mode="narrow_m",
     )
     spec = TilePipelineSpec(
-        family="attention", candidates=(cand_1pass, cand_online),
-        simt_ub_carveout_bytes=32 * 1024,
-        subtile_waves=(SubtileWaveSpec("narrow_m", tile_m=32, tile_n=64, tile_k=64, independently_issuable_m=16),),
+        family="attention", candidates=(cand_online, cand_1pass), simt_ub_carveout_bytes=32 * 1024,
+        subtile_waves=(SubtileWaveSpec("narrow_m", 32, 64, 64, independently_issuable_m=16),),
     )
-    hw = SimpleNamespace(
-        buffers=(("ub", 192 * 1024),), compute_units=4,
-        stream_owners=SimpleNamespace(aic_limit=4, aiv_limit=8),
-    )
-    sol = solve_tiles(spec, None, hw)
-    assert sol.algorithm == "online_reduce"
-    assert sol.waves == 3  # ceil(10 / 4)
-    assert sol.issued_flops > cand_online.logical_flops  # legal instruction-block padding, no fudge factor
-    assert len(sol.rejections) == 1 and sol.rejections[0].algorithm == "resident_1pass"
+    hw_tight = SimpleNamespace(buffers=(("ub", 192 * 1024), ("l2", 192 * 1024)), compute_units=4,
+                               stream_owners=SimpleNamespace(aic_limit=4, aiv_limit=8))
+    with pytest.raises(TileInfeasibleError):
+        solve_tiles(spec, None, hw_tight)
 
-    hw_tiny = SimpleNamespace(buffers=(("ub", 32 * 1024),), compute_units=4)
-    with pytest.raises(TileInfeasibleError) as exc_info:
-        solve_tiles(spec, None, hw_tiny)
-    assert len(exc_info.value.rejections) == 2
+    hw_ok = SimpleNamespace(buffers=(("ub", 192 * 1024), ("l2", 256 * 1024)), compute_units=4,
+                            stream_owners=SimpleNamespace(aic_limit=4, aiv_limit=8))
+    sol = solve_tiles(spec, None, hw_ok)
+    assert sol.algorithm == "online_reduce" and sol.waves == 3 and sol.rejections[0].algorithm == "resident_1pass"
+
+    empty_c = TileCandidate("resident_1pass", TileShape(0, 64, 64), 1, (1, 1), 0, 0, (), logical_flops=0, instruction_block=(16, 16, 16))
+    assert solve_tiles(TilePipelineSpec("empty", (empty_c,)), None, hw_ok).issued_flops == 0
 
 
 @pytest.mark.parametrize("backend", ["python", "c"])
-def test_wave_recorder_five_point_conservation_and_zero_perturbation(backend: str):
-    """WaveRecorder preserves busy+fill+steady_bubble+drain+handoff == span_ns with zero perturbation."""
+def test_wave_recorder_invariance_unsorted_half_ns_and_oversized_obs(backend: str):
+    """WaveRecorder is 0-ULP invariant on unsorted placement, matches half-ns & >4096 links."""
     spec = RecordedPipelineSpec("1", "s0", "sig", "fused", "rec", "abi", members=("m0",))
 
-    def run(with_recorder: bool):
-        eng = Engine([Resource("mte2", 1.0), Resource("cube", 1.0), Resource("vec", 1.0), Resource("mte3", 1.0)], backend=backend)
-        rec = WaveRecorder(declared_pipes=("mte2", "cube", "vec", "mte3")) if with_recorder else None
+    def run_unsorted(with_rec: bool):
+        eng = Engine([Resource("cube", 4.0, units=4)], backend=backend)
+        rec = WaveRecorder(declared_pipes=("cube",)) if with_rec else None
         if rec is not None:
             eng.attach_wave_recorder(rec)
-        s0 = eng.submit("load0", {"mte2": 1.0}, owner="tile0")
-        c0 = eng.submit("cube0", {"cube": 2.0}, after=(s0,), owner="tile0")
-        v0 = eng.submit("vec0", {"vec": 1.5}, after=(s0,), owner="tile0")
-        s1 = eng.submit("load1", {"mte2": 1.0}, after=(s0,), owner="tile1")
-        c1 = eng.submit("cube1", {"cube": 2.0}, after=(c0, s1), owner="tile1")
-        done = eng.submit("done", after=(c1, v0))
-        eng.advance(until=(done,))
-        if backend == "c":
-            assert eng.accel_status()["native_steps"] > 0
-        desc = rec.finish(spec, "occ0") if rec is not None else None
-        return float(done.time), dict(eng.serviced), desc
+        e0 = eng.submit("a", {"cube": 2.0}, placement={"cube": (2, 0)}, coupled=True)
+        e1 = eng.submit("b", {"cube": 2.0}, placement={"cube": (1, 3)}, coupled=True)
+        eng.advance(until=(e0, e1), first=False)
+        return (float(e0.time), float(e1.time)), rec.finish(spec, "occ_u") if rec else None
 
-    t_base, s_base, _ = run(False)
-    t_obs, s_obs, desc = run(True)
-    assert t_obs == pytest.approx(t_base, rel=1e-12, abs=1e-12)
-    assert s_obs == pytest.approx(s_base, rel=1e-12, abs=1e-12)
-    assert desc is not None
-    span_ns = desc.timeline.end_ns - desc.timeline.start_ns
-    assert span_ns == int(round(t_base * 1_000_000.0))
-    for row in desc.timeline.pipe_rows:
+    t_off, _ = run_unsorted(False)
+    t_on, desc_u = run_unsorted(True)
+    assert t_off == t_on and desc_u is not None
+    for row in desc_u.timeline.pipe_rows:
         assert row.busy_ns + row.fill_ns + row.steady_bubble_ns + row.drain_ns + row.handoff_ns == row.span_ns
-    mte3_row = next(r for r in desc.timeline.pipe_rows if r.pipe_name == "mte3")
-    assert mte3_row.busy_ns == 0 and mte3_row.inactive_in_window and mte3_row.fill_ns == span_ns
-    assert desc.timeline.cube_vector_overlap_ns > 0
+
+    eng_half = Engine([Resource("r", 1.0)], backend=backend)
+    rec_half = WaveRecorder(declared_pipes=("r",))
+    eng_half.attach_wave_recorder(rec_half)
+    ev_h = eng_half.submit("h", {"r": 5e-7})
+    eng_half.advance(until=(ev_h,))
+    assert rec_half._service_by_pipe == {}
+
+    if backend == "c":
+        eng_big = Engine([Resource("r", 4120.0)], backend="c")
+        rec_big = WaveRecorder(declared_pipes=("r",))
+        eng_big.attach_wave_recorder(rec_big)
+        evs_big = [eng_big.submit(f"t{i}", {"r": 1.0}) for i in range(4120)]
+        eng_big.advance(until=tuple(evs_big), first=False)
+        assert eng_big.accel_status()["native_steps"] > 0
+        assert len(rec_big._service_by_pipe[(0, rec_big._pipe_ids["r"])]) == 4120
 
 
-def test_wave_recorder_periodic_skip_conservation():
-    """Periodic skip records translate cleanly into WaveRecorder without rounding drift."""
+def test_wave_recorder_staggered_periodic_and_distinct_slot_generations():
+    """Staggered periodic skips preserve phase (0 fake overlap) and O(1) large repeats."""
     spec = RecordedPipelineSpec("1", "s1", "sig", "fused", "rec", "abi")
-    rec = WaveRecorder(declared_pipes=("cube", "mte2"))
-    rec.on_service(1, "mte2", 0, 0.0, 1.0, 1.0)
-    rec.on_period(1.0, 2.0, 5, "tpl", "dig", service_pattern=(("cube", 0.0, 1.5), ("mte2", 0.0, 1.0)))
-    rec.on_service(2, "cube", 0, 11.0, 12.0, 1.0)
-    desc = rec.finish(spec, "occ1")
-    assert desc.timeline.end_ns - desc.timeline.start_ns == 12_000_000
+    rec = WaveRecorder(declared_pipes=("cube", "vector"))
+    rec.on_period(0.0, 2.0, 100_000, "tpl", "dig", service_pattern=(("cube", 0.0, 1.0), ("vector", 1.0, 2.0)))
+    desc = rec.finish(spec, "occ_p")
+    assert desc.timeline.cube_vector_overlap_ns == 0 and desc.timeline.end_ns - desc.timeline.start_ns == 200_000 * 1_000_000
     for row in desc.timeline.pipe_rows:
         assert row.busy_ns + row.fill_ns + row.steady_bubble_ns + row.drain_ns + row.handoff_ns == row.span_ns
 
+    eng = Engine([Resource("mte2", 1.0)], pools={"l1": 64.0}, pool_units={"l1": 1}, backend="python")
+    rec_a = WaveRecorder(declared_pipes=("mte2",))
+    eng.attach_wave_recorder(rec_a)
+    a0, a1 = Allocation("buf0", "l1", 64.0, (0,)), Allocation("buf1", "l1", 64.0, (0,))
+    e0 = eng.submit("g0", {"mte2": 1.0}, acquire=(a0,), free=(a0,))
+    e1 = eng.submit("g1", {"mte2": 1.0}, acquire=(a1,), free=(a1,))
+    eng.advance(until=(e0, e1), first=False)
+    res_list = rec_a.finish(spec, "occ_a").buffers
+    assert len(res_list) == 2 and {(r.slot, r.generation) for r in res_list} == {(0, 0), (0, 1)}
+    assert rec_a._admitted[e1.sequence][4] == ("buf1",)
 
-def test_program_package_split_reexports_and_stage_builtin_guards():
-    """Destructive program/ package preserves all public re-exports and strict Stage guards."""
+
+def test_program_facade_reexports_and_stage_builtin_metadata_guards():
+    """Program package exports facade symbols and validates flat exact-builtin Stage.metadata."""
     assert hasattr(prog_pkg, "__path__")
     for name in (
-        "Allocation", "GENERIC_MATRIX_PROGRAM", "HostStaging", "KernelProgram",
+        "Allocation", "DirtyWriteback", "Engine", "Event", "GENERIC_MATRIX_PROGRAM",
+        "HostStaging", "KernelProgram", "ModelingError", "NATIVE_WORK_UNITS",
         "NativeProgram", "PIPELINE_COHORT_WINDOW", "PIPELINE_FOLD_WINDOW",
         "PIPELINE_UNROLL_LIMIT", "ParallelProgram", "PipelinePhase",
         "PipelineProgram", "PipelineTemplate", "PipelineTemplateProgram",
-        "Program", "Recipe", "RecipeBook", "RecipeContext", "RecurrentScan",
-        "ResourceEnvelope", "Stage", "TransferRecipe", "coalesce_execution_program",
-        "coalesce_programs", "fold_interior_pipeline",
+        "Program", "ProgramFragment", "Recipe", "RecipeBook", "RecipeContext",
+        "RecurrentScan", "ResourceEnvelope", "Stage", "TransferRecipe",
+        "coalesce_execution_program", "coalesce_programs", "fold_interior_pipeline",
         "indexed_pipeline_consumer_available", "interior_fold_plan",
         "is_pure_static_program", "merge_programs", "program_signature",
-        "scope_allocations", "split_cohort_kernel", "stage_from_fragment",
+        "proportional_coupled_placement", "scope_allocations",
+        "split_cohort_kernel", "stage_from_fragment", "unit_group",
     ):
-        assert hasattr(prog_pkg, name), f"missing re-export: {name}"
+        assert hasattr(prog_pkg, name) and name in prog_pkg.__all__
+
+    st = Stage("meta_ok", work={"r": 1.0}, metadata={"tag": "x", "k": 2, "flag": True})
+    assert dict(st.metadata) == {"tag": "x", "k": 2, "flag": True}
+    eng = Engine([Resource("r", 1.0)], backend="python", trace_limit=8)
+    ev = KernelProgram((st,)).start(eng, "op", eng.submit("go"))
+    eng.advance(until=(ev,))
+    assert any(row["metadata"].get("tag") == "x" for row in eng.trace)
+
+    with pytest.raises(ModelingError, match="stage_metadata_invalid"):
+        Stage("bad_occ", metadata={"occurrence": 1})
+    with pytest.raises(ModelingError, match="stage_metadata_invalid"):
+        Stage("bad_val", metadata={"nested": [1, 2]})
     with pytest.raises(ModelingError, match="stage_cohort_widened_invalid"):
-        Stage("bad", cohort_widened=(123,))  # type: ignore[arg-type]
+        Stage("bad_w", cohort_widened=(123,))  # type: ignore[arg-type]

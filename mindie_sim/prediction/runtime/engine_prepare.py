@@ -91,6 +91,7 @@ class _EnginePrepareMixin:
         memory=None, memory_pools: Sequence[str] | None = None,
         memory_bindings: Mapping[str, Mapping] | None = None,
         native_hook: bool = False,
+        deliveries: Sequence[tuple[str, float]] = (),
     ) -> Event:
         if (work is None and latency == 0.0 and caps is None and not acquire
                 and not free and placement is None and not coupled
@@ -108,6 +109,7 @@ class _EnginePrepareMixin:
             metadata=metadata, on_complete=on_complete, on_start=on_start,
             memory=memory, memory_pools=memory_pools,
             memory_bindings=memory_bindings, native_hook=native_hook,
+            deliveries=deliveries,
         )
 
     def _prepare(
@@ -183,6 +185,7 @@ class _EnginePrepareMixin:
                 unit < 0 or unit >= self.resources[key].units for unit in units
             ):
                 raise ExecutionError(f"resource_unit_out_of_range:{key}")
+        placement = {key: tuple(sorted(units)) for key, units in placement.items()}
         norm_widened, norm_members = _normalize_cohort_symmetry(
             name, placement, cohort_size, cohort_widened, cohort_members,
         )

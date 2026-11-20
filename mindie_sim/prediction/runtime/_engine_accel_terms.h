@@ -93,24 +93,42 @@ typedef struct {
     double capacity;
 } msim_capacity_row;
 
+#define MSIM_TERMS_ABI_VERSION 3u
+#define MSIM_TERMS_ABI_PROBE_CELLS 16u
+
 typedef struct {
-    uint32_t ring_id;
+    uint64_t occurrence;
+    uint64_t generation;
+    uint64_t allocation_id;
+    uint32_t die;
+    uint32_t owner;
+    uint32_t pool_id;
     uint32_t slot_id;
-    uint64_t gen;
-    uint64_t producer_task_id;
-    uint64_t publish_event_id;
-    uint64_t last_use_event_id;
+    uint32_t producer_node;
+    uint32_t publish_node;
+    uint32_t last_use_node;
     uint32_t consumer_count;
-    uint32_t reader_done_count;
 } msim_slot_gen;
 
 typedef struct {
-    uint64_t src_event_id;
-    uint64_t dst_task_id;
+    uint32_t src_node;
+    uint32_t dst_node;
     uint16_t kind;
     uint16_t flags;
     uint32_t pad;
 } msim_dep;
+
+static uint64_t msim_ms_to_ns_even(double t_ms)
+{
+    double scaled = t_ms * 1000000.0;
+    double fl, rounded;
+    if (!isfinite(scaled) || scaled <= 0.0) return 0u;
+    fl = floor(scaled);
+    rounded = floor(scaled + 0.5);
+    if ((scaled - fl) == 0.5 && fmod(rounded, 2.0) != 0.0)
+        rounded -= 1.0;
+    return (uint64_t)rounded;
+}
 
 static bool msim_emit_obs_service(
     msim_ctx *c, double t0_ms, double t1_ms, uint64_t task_seq,
@@ -123,8 +141,8 @@ static bool msim_emit_obs_service(
         return false;
     }
     rec = &c->obs_buf[c->obs_count++];
-    rec->t_start_ns = (uint64_t)llround(t0_ms * 1000000.0);
-    rec->t_end_ns = (uint64_t)llround(t1_ms * 1000000.0);
+    rec->t_start_ns = msim_ms_to_ns_even(t0_ms);
+    rec->t_end_ns = msim_ms_to_ns_even(t1_ms);
     rec->task_id = task_seq;
     rec->pipe_id = pipe_id;
     rec->owner_id = owner_id;
@@ -138,6 +156,65 @@ static bool msim_emit_obs_service(
  * prepared-terms entrypoints so the second TU emits neither duplicate symbols
  * nor unused-function warnings. */
 #ifndef msim_abi_version
+
+MSIM_EXPORT uint32_t msim_terms_abi_version(void)
+{
+    return MSIM_TERMS_ABI_VERSION;
+}
+
+MSIM_EXPORT int32_t msim_terms_abi_probe(uint64_t *out, size_t nout)
+{
+    if (out == NULL || nout < (size_t)MSIM_TERMS_ABI_PROBE_CELLS)
+        return MSIM_E_RANGE;
+    out[0] = (uint64_t)MSIM_TERMS_ABI_VERSION;
+    out[1] = (uint64_t)sizeof(msim_hbm_bus);
+    out[2] = (uint64_t)offsetof(msim_hbm_bus, alpha_rw);
+    out[3] = (uint64_t)sizeof(msim_access);
+    out[4] = (uint64_t)offsetof(msim_access, dram_service_bytes);
+    out[5] = (uint64_t)sizeof(msim_term);
+    out[6] = (uint64_t)sizeof(msim_delivery);
+    out[7] = (uint64_t)sizeof(msim_progress);
+    out[8] = (uint64_t)offsetof(msim_progress, max_dz_ms);
+    out[9] = (uint64_t)sizeof(msim_capacity_row);
+    out[10] = (uint64_t)offsetof(msim_capacity_row, capacity);
+    out[11] = (uint64_t)sizeof(msim_obs);
+    out[12] = (uint64_t)offsetof(msim_obs, work_done);
+    out[13] = (uint64_t)sizeof(msim_slot_gen);
+    out[14] = (uint64_t)offsetof(msim_slot_gen, consumer_count);
+    out[15] = (uint64_t)sizeof(msim_dep);
+    return 0;
+}
+
+MSIM_EXPORT int32_t msim_validate_ring(
+    const msim_slot_gen *slots, uint32_t nslots,
+    const msim_dep *deps, uint32_t ndeps, uint32_t nnodes)
+{
+    uint32_t i, j;
+    if ((nslots > 0 && slots == NULL) || (ndeps > 0 && deps == NULL))
+        return MSIM_E_RANGE;
+    for (i = 0; i < nslots; i++) {
+        if (slots[i].producer_node >= nnodes || slots[i].publish_node >= nnodes
+            || slots[i].last_use_node >= nnodes)
+            return MSIM_E_RANGE;
+        for (j = i + 1; j < nslots; j++) {
+            if (slots[i].occurrence == slots[j].occurrence
+                && slots[i].allocation_id == slots[j].allocation_id
+                && slots[i].die == slots[j].die
+                && slots[i].owner == slots[j].owner
+                && slots[i].pool_id == slots[j].pool_id
+                && slots[i].slot_id == slots[j].slot_id
+                && slots[i].generation == slots[j].generation)
+                return MSIM_E_VALUE;
+        }
+    }
+    for (i = 0; i < ndeps; i++) {
+        if (deps[i].src_node >= nnodes || deps[i].dst_node >= nnodes)
+            return MSIM_E_RANGE;
+        if (deps[i].src_node == deps[i].dst_node || deps[i].kind > 4u)
+            return MSIM_E_VALUE;
+    }
+    return 0;
+}
 
 /* Emit 2-row directional HBM bus normalized coefficients (ms per unit z). */
 MSIM_EXPORT int32_t msim_hbm_terms(
@@ -230,6 +307,10 @@ MSIM_EXPORT int32_t msim_config_rows(
         return MSIM_E_RANGE;
     if (nrows > 0) memcpy(c->pt_rows, rows, (size_t)nrows * sizeof(msim_capacity_row));
     c->pt_nrows = (int32_t)nrows;
+    c->pt_nprogs = 0;
+    c->pt_nterms = 0;
+    c->pt_ndels = 0;
+    c->pt_nctrs = 0;
     return 0;
 }
 
@@ -348,6 +429,10 @@ MSIM_EXPORT int32_t msim_allocate_epoch(void *ctx, double *out_dz, uint32_t npro
     rows = (const msim_capacity_row *)c->pt_rows;
     progs = (const msim_progress *)c->pt_progs;
     terms = (const msim_term *)c->pt_terms;
+    for (i = 0; i < nt; i++) {
+        if (terms[i].flow >= (uint32_t)np || terms[i].row >= (uint32_t)nr)
+            return MSIM_E_RANGE;
+    }
 
     order = (uint32_t *)malloc((size_t)np * sizeof(uint32_t));
     t_start = (int32_t *)malloc((size_t)np * sizeof(int32_t));

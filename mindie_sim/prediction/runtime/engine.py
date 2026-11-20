@@ -70,6 +70,9 @@ def _stop_window(now: float, horizon: float, releases, latency_active, tasks) ->
 
 
 DEADLINE_POLL_MASK = 255
+_CACHED_MIXED_PLAN_KIND = 3
+_CACHED_MIXED_REM_IDX = 6
+_TRIPLE_ACTIVE_COUNT = 3
 
 #: Default no-progress guard of one Engine advance (structural, not physics).
 DEFAULT_ZERO_PROGRESS_LIMIT = 100_000
@@ -439,6 +442,8 @@ class Engine(
                 return complete
             if max_steps is not None and steps >= max_steps:
                 raise ExecutionError("execution_step_budget_exhausted")
+            if self._placed_active or self._fifo_live:
+                self._split_asymmetric_cohorts()
             if self._periodic_runs:
                 skipped = self._periodic_observe(horizon)
                 if skipped is not None:
@@ -458,8 +463,6 @@ class Engine(
                 if accel.made_progress:
                     continue
             if not self._periodic_runs:
-                if self._placed_active:
-                    self._split_asymmetric_cohorts()
                 n_act = len(active)
                 if n_act == 0:
                     dt = horizon - now
@@ -477,127 +480,155 @@ class Engine(
                     steps += 1
                     self.now = next_time
                     continue
-                if self._wave_recorder is None:
-                    solo_key = 0
-                    solo_task = None
-                    if n_act == 1:
-                        solo_key = next(iter(active))
-                        solo_task = tasks[solo_key]
-                    elif n_act == 2:
-                        it_a = iter(active)
-                        k0, k1 = next(it_a), next(it_a)
-                        t0, t1 = tasks[k0], tasks[k1]
-                        rem0, rem1 = t0.remaining, t1.remaining
-                        if not rem0:
-                            solo_key, solo_task = k1, t1
-                        elif not rem1:
-                            solo_key, solo_task = k0, t0
-                        elif (t0.priority == t1.priority
-                              and _fast_eligible_task(resources, t0)
-                              and _fast_eligible_task(resources, t1)):
-                            p0, p1 = t0.prepared, t1.prepared
-                            if (p0 is not None and p1 is not None
-                                    and len(rem0) == len(p0.demand)
-                                    and len(rem1) == len(p1.demand)):
-                                hit = pair_cache.get((id(p0), id(p1)))
-                                if hit is not None and hit[0] is p0 and hit[1] is p1:
-                                    cplan = hit[2]
-                                    if cplan.__class__ is tuple:
-                                        if (cplan[0] != 3
-                                                or (rem1[cplan[3]] if cplan[1] else rem0[cplan[3]]) == cplan[6]):
-                                            dt = _stop_window(now, horizon, releases, latency_active, tasks)
-                                            next_time = _step_cached_pair(cplan, k0, t0, k1, t1, now, dt)
-                                            self.advance_steps += 1
-                                            steps += 1
-                                            self.now = next_time
-                                            continue
-                                        cp_fast = _coupled_pair_fast(resources, k0, t0, k1, t1)
-                                    elif cplan is False:
-                                        cp_fast = _coupled_pair_fast(resources, k0, t0, k1, t1)
-                                    else:
-                                        cp_fast = None
-                                else:
-                                    cp_fast = _coupled_pair_fast(resources, k0, t0, k1, t1)
-                                    _cache_pair_plan(p0, p1, t0, cp_fast)
-                            else:
-                                cp_fast = _coupled_pair_fast(resources, k0, t0, k1, t1)
-                            if cp_fast is not None:
-                                dt = _stop_window(now, horizon, releases, latency_active, tasks)
-                                next_time = _step_pair_fast(cp_fast, now, dt)
-                                self.advance_steps += 1
-                                steps += 1
-                                self.now = next_time
-                                continue
-                    elif n_act == 3:
-                        it_a = iter(active)
-                        k0, k1, k2 = next(it_a), next(it_a), next(it_a)
-                        t0, t1, t2 = tasks[k0], tasks[k1], tasks[k2]
-                        rem0, rem1, rem2 = t0.remaining, t1.remaining, t2.remaining
-                        if (t0.priority == t1.priority == t2.priority
-                                and _fast_eligible_task(resources, t0)
-                                and _fast_eligible_task(resources, t1)
-                                and _fast_eligible_task(resources, t2)):
-                            if not rem0 or not rem1 or not rem2:
-                                if not rem0:
-                                    ka, ta, kb, tb = k1, t1, k2, t2
-                                elif not rem1:
-                                    ka, ta, kb, tb = k0, t0, k2, t2
-                                else:
-                                    ka, ta, kb, tb = k0, t0, k1, t1
-                                cp_fast = _coupled_pair_fast(resources, ka, ta, kb, tb)
-                                if cp_fast is not None:
-                                    dt = _stop_window(now, horizon, releases, latency_active, tasks)
-                                    next_time = _step_pair_fast(cp_fast, now, dt)
-                                    self.advance_steps += 1
-                                    steps += 1
-                                    self.now = next_time
-                                    continue
-                            else:
-                                ks, ts = 0, None
-                                if not t0.coupled and len(rem0) == 1:
-                                    rcand = next(iter(rem0))
-                                    if rcand not in rem1 and rcand not in rem2:
-                                        ks, ts, rs = k0, t0, rcand
-                                        ka, ta, kb, tb = k1, t1, k2, t2
-                                if ts is None and not t1.coupled and len(rem1) == 1:
-                                    rcand = next(iter(rem1))
-                                    if rcand not in rem0 and rcand not in rem2:
-                                        ks, ts, rs = k1, t1, rcand
-                                        ka, ta, kb, tb = k0, t0, k2, t2
-                                if ts is None and not t2.coupled and len(rem2) == 1:
-                                    rcand = next(iter(rem2))
-                                    if rcand not in rem0 and rcand not in rem1:
-                                        ks, ts, rs = k2, t2, rcand
-                                        ka, ta, kb, tb = k0, t0, k1, t1
-                                if ts is not None:
-                                    cp_fast = _coupled_pair_fast(resources, ka, ta, kb, tb)
-                                    if cp_fast is not None:
-                                        prep_s = ts.prepared
-                                        if prep_s is not None and prep_s.solo_rates is not None:
-                                            rate_s = prep_s.solo_rates[rs]
-                                        else:
-                                            res_s = resources[rs]
-                                            if res_s.policy == "fifo":
-                                                rate_s = res_s.rate
-                                            elif ts.placement and rs in ts.placement:
-                                                rate_s = res_s.rate / res_s.units * len(ts.placement[rs])
-                                            else:
-                                                rate_s = res_s.rate
-                                            if ts.caps and rs in ts.caps and ts.caps[rs] < rate_s:
-                                                rate_s = ts.caps[rs]
+                wave_rec = self._wave_recorder
+                solo_key = 0
+                solo_task = None
+                if n_act == 1:
+                    solo_key = next(iter(active))
+                    solo_task = tasks[solo_key]
+                elif n_act == 2:
+                    it_a = iter(active)
+                    k0, k1 = next(it_a), next(it_a)
+                    t0, t1 = tasks[k0], tasks[k1]
+                    rem0, rem1 = t0.remaining, t1.remaining
+                    if not rem0:
+                        solo_key, solo_task = k1, t1
+                    elif not rem1:
+                        solo_key, solo_task = k0, t0
+                    elif (t0.priority == t1.priority
+                          and _fast_eligible_task(resources, t0)
+                          and _fast_eligible_task(resources, t1)):
+                        p0, p1 = t0.prepared, t1.prepared
+                        if (p0 is not None and p1 is not None
+                                and not t0.service and not t1.service
+                                and len(rem0) == len(p0.demand)
+                                and len(rem1) == len(p1.demand)):
+                            hit = pair_cache.get((id(p0), id(p1)))
+                            if hit is not None and hit[0] is p0 and hit[1] is p1:
+                                cplan = hit[2]
+                                if cplan.__class__ is tuple:
+                                    if (cplan[0] != _CACHED_MIXED_PLAN_KIND
+                                            or (rem1[cplan[_CACHED_MIXED_PLAN_KIND]] if cplan[1] else rem0[cplan[_CACHED_MIXED_PLAN_KIND]]) == cplan[_CACHED_MIXED_REM_IDX]):
                                         dt = _stop_window(now, horizon, releases, latency_active, tasks)
-                                        next_time = _step_pair_fast(cp_fast, now, dt, ks, ts, rs, rate_s)
+                                        watched = (
+                                            ((k0, t0, dict(t0.service)), (k1, t1, dict(t1.service)))
+                                            if (wave_rec is not None or t0.deliveries or t1.deliveries) else ()
+                                        )
+                                        next_time = _step_cached_pair(cplan, k0, t0, k1, t1, now, dt)
+                                        if watched:
+                                            self._emit_fast_step_observers(wave_rec, watched, now, next_time)
                                         self.advance_steps += 1
                                         steps += 1
                                         self.now = next_time
                                         continue
-                    if solo_task is not None and _fast_eligible_task(resources, solo_task):
-                        next_solo = _step_solo_fast(solo_key, solo_task, now, horizon, max_steps)
-                        if next_solo is not None:
+                                    cp_fast = _coupled_pair_fast(resources, k0, t0, k1, t1)
+                                elif cplan is False:
+                                    cp_fast = _coupled_pair_fast(resources, k0, t0, k1, t1)
+                                else:
+                                    cp_fast = None
+                            else:
+                                cp_fast = _coupled_pair_fast(resources, k0, t0, k1, t1)
+                                _cache_pair_plan(p0, p1, t0, cp_fast)
+                        else:
+                            cp_fast = _coupled_pair_fast(resources, k0, t0, k1, t1)
+                        if cp_fast is not None:
+                            dt = _stop_window(now, horizon, releases, latency_active, tasks)
+                            watched = (
+                                ((k0, t0, dict(t0.service)), (k1, t1, dict(t1.service)))
+                                if (wave_rec is not None or t0.deliveries or t1.deliveries) else ()
+                            )
+                            next_time = _step_pair_fast(cp_fast, now, dt)
+                            if watched:
+                                self._emit_fast_step_observers(wave_rec, watched, now, next_time)
                             self.advance_steps += 1
                             steps += 1
-                            self.now = next_solo
+                            self.now = next_time
                             continue
+                elif n_act == _TRIPLE_ACTIVE_COUNT:
+                    it_a = iter(active)
+                    k0, k1, k2 = next(it_a), next(it_a), next(it_a)
+                    t0, t1, t2 = tasks[k0], tasks[k1], tasks[k2]
+                    rem0, rem1, rem2 = t0.remaining, t1.remaining, t2.remaining
+                    if (t0.priority == t1.priority == t2.priority
+                            and _fast_eligible_task(resources, t0)
+                            and _fast_eligible_task(resources, t1)
+                            and _fast_eligible_task(resources, t2)):
+                        if not rem0 or not rem1 or not rem2:
+                            if not rem0:
+                                ka, ta, kb, tb = k1, t1, k2, t2
+                            elif not rem1:
+                                ka, ta, kb, tb = k0, t0, k2, t2
+                            else:
+                                ka, ta, kb, tb = k0, t0, k1, t1
+                            cp_fast = _coupled_pair_fast(resources, ka, ta, kb, tb)
+                            if cp_fast is not None:
+                                dt = _stop_window(now, horizon, releases, latency_active, tasks)
+                                watched = (
+                                    ((ka, ta, dict(ta.service)), (kb, tb, dict(tb.service)))
+                                    if (wave_rec is not None or ta.deliveries or tb.deliveries) else ()
+                                )
+                                next_time = _step_pair_fast(cp_fast, now, dt)
+                                if watched:
+                                    self._emit_fast_step_observers(wave_rec, watched, now, next_time)
+                                self.advance_steps += 1
+                                steps += 1
+                                self.now = next_time
+                                continue
+                        else:
+                            ks, ts = 0, None
+                            if not t0.coupled and len(rem0) == 1:
+                                rcand = next(iter(rem0))
+                                if rcand not in rem1 and rcand not in rem2:
+                                    ks, ts, rs = k0, t0, rcand
+                                    ka, ta, kb, tb = k1, t1, k2, t2
+                            if ts is None and not t1.coupled and len(rem1) == 1:
+                                rcand = next(iter(rem1))
+                                if rcand not in rem0 and rcand not in rem2:
+                                    ks, ts, rs = k1, t1, rcand
+                                    ka, ta, kb, tb = k0, t0, k2, t2
+                            if ts is None and not t2.coupled and len(rem2) == 1:
+                                rcand = next(iter(rem2))
+                                if rcand not in rem0 and rcand not in rem1:
+                                    ks, ts, rs = k2, t2, rcand
+                                    ka, ta, kb, tb = k0, t0, k1, t1
+                            if ts is not None:
+                                cp_fast = _coupled_pair_fast(resources, ka, ta, kb, tb)
+                                if cp_fast is not None:
+                                    prep_s = ts.prepared
+                                    if prep_s is not None and prep_s.solo_rates is not None:
+                                        rate_s = prep_s.solo_rates[rs]
+                                    else:
+                                        res_s = resources[rs]
+                                        if res_s.policy == "fifo":
+                                            rate_s = res_s.rate
+                                        elif ts.placement and rs in ts.placement:
+                                            rate_s = res_s.rate / res_s.units * len(ts.placement[rs])
+                                        else:
+                                            rate_s = res_s.rate
+                                        if ts.caps and rs in ts.caps and ts.caps[rs] < rate_s:
+                                            rate_s = ts.caps[rs]
+                                    dt = _stop_window(now, horizon, releases, latency_active, tasks)
+                                    watched = (
+                                        ((ka, ta, dict(ta.service)), (kb, tb, dict(tb.service)),
+                                         (ks, ts, dict(ts.service)))
+                                        if (wave_rec is not None or ta.deliveries or tb.deliveries or ts.deliveries) else ()
+                                    )
+                                    next_time = _step_pair_fast(cp_fast, now, dt, ks, ts, rs, rate_s)
+                                    if watched:
+                                        self._emit_fast_step_observers(wave_rec, watched, now, next_time)
+                                    self.advance_steps += 1
+                                    steps += 1
+                                    self.now = next_time
+                                    continue
+                if solo_task is not None and _fast_eligible_task(resources, solo_task):
+                    next_solo = _step_solo_fast(solo_key, solo_task, now, horizon, max_steps)
+                    if next_solo is not None:
+                        if solo_task.deliveries:
+                            self._update_task_deliveries(solo_task)
+                        self.advance_steps += 1
+                        steps += 1
+                        self.now = next_solo
+                        continue
             rates = self._rates()
             dt = _stop_window(now, horizon, releases, latency_active, tasks)
             for name, consumers in rates.items():
@@ -642,6 +673,8 @@ class Engine(
                         if not task.remaining and task.latency <= 0.0:
                             completable_seen.add(key)
                             _heappush(completable, key)
+                    if task.deliveries:
+                        self._update_task_deliveries(task)
             self.advance_steps += 1
             steps += 1
             self.now = next_time

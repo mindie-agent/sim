@@ -22,6 +22,7 @@ from mindie_sim.schema.operators import ProgramFragment
 from ..engine import Allocation, Engine, Event
 
 _EMPTY_MAPPING = MappingProxyType({})
+_STAGE_METADATA_BUILTINS = frozenset({bool, int, float, str, bytes, type(None)})
 #: Default live-stage bound for coalescing a repeated finite pipeline window.
 PIPELINE_UNROLL_LIMIT = 64
 _COMPILED_CACHE_LIMIT = 4096
@@ -76,9 +77,9 @@ class Stage:
     cohort_size: int = 1
     keep_empty: bool = False
     cohort_widened: tuple[str, ...] = ()
-    cohort_members: Mapping[str, tuple[tuple[int, ...], ...]] = field(
-        default_factory=dict
-    )
+    cohort_members: Mapping[str, tuple[tuple[int, ...], ...]] = field(default_factory=dict)
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+    deliveries: tuple[tuple[str, float], ...] = ()
 
     def __post_init__(self):
         work = MappingProxyType(dict(self.work)) if self.work else _EMPTY_MAPPING
@@ -121,11 +122,7 @@ class Stage:
             if val.__class__ is not tuple:
                 object.__setattr__(self, attr, tuple(val))
         if self.cohort_widened:
-            widened = (
-                self.cohort_widened
-                if self.cohort_widened.__class__ is tuple
-                else tuple(self.cohort_widened)
-            )
+            widened = self.cohort_widened if self.cohort_widened.__class__ is tuple else tuple(self.cohort_widened)
             if any(type(key) is not str for key in widened):
                 raise ModelingError(f"stage_cohort_widened_invalid:{self.name}")
             object.__setattr__(self, "cohort_widened", widened)
@@ -141,6 +138,14 @@ class Stage:
             object.__setattr__(self, "cohort_members", members)
         else:
             object.__setattr__(self, "cohort_members", _EMPTY_MAPPING)
+        if self.metadata:
+            raw_meta = dict(self.metadata)
+            for mk, mv in raw_meta.items():
+                if type(mk) is not str or mk == "occurrence" or type(mv) not in _STAGE_METADATA_BUILTINS:
+                    raise ModelingError(f"stage_metadata_invalid:{self.name}:{mk!r}")
+            object.__setattr__(self, "metadata", MappingProxyType(raw_meta))
+        else:
+            object.__setattr__(self, "metadata", _EMPTY_MAPPING)
 
     def _with_buffers(self, acquire: tuple[Allocation, ...], free: tuple[Allocation, ...]) -> Stage:
         """Clone an already-validated Stage replacing only tuple acquire/free."""
@@ -149,6 +154,7 @@ class Stage:
             "name", "work", "after", "latency", "caps", "program", "placement",
             "previous", "coupled", "work_units", "priority", "fragment",
             "cohort_size", "keep_empty", "cohort_widened", "cohort_members",
+            "metadata", "deliveries",
         ):
             object.__setattr__(clone, attr, getattr(self, attr))
         object.__setattr__(clone, "acquire", acquire)
@@ -176,7 +182,7 @@ class Stage:
         return _PreparedStageDeclaration(
             name, self.work, self.latency, self.caps, acquire, free,
             self.placement, self.coupled, self.priority, self.cohort_size,
-            self.cohort_widened, self.cohort_members,
+            self.cohort_widened, self.cohort_members, self.metadata,
         )
 
     def submit(self, engine, name, predecessors, scoped, owner, prepared=None):
@@ -186,23 +192,28 @@ class Stage:
             self.program is not None and not self.work and self.latency <= 0.0
             and not self.acquire and not self.free and not self.caps
             and not self.coupled and self.priority == 0
-            and not self.keep_empty
+            and not self.keep_empty and not self.metadata
             and self.fragment is None and len(predecessors) == 1
         ):
             return self.program.start(
                 engine, name + ":program", predecessors[0], owner=owner
             )
+        extra_kw: dict[str, Any] = {}
+        if self.metadata:
+            extra_kw["metadata"] = dict(self.metadata)
+        if self.deliveries:
+            extra_kw["deliveries"] = self.deliveries
         if prepared is not None and not isinstance(prepared, _PreparedStageDeclaration):
             sub_fn = getattr(engine, "_submit_prepared", None) or engine.submit_prepared
-            event = sub_fn(prepared, name, after=predecessors, owner=owner)
+            event = sub_fn(prepared, name, after=predecessors, owner=owner, **extra_kw)
         else:
             prepare = getattr(engine, "prepared_stage", None)
             if prepare is not None and not self.program:
                 prepared = prepare(self, acquire, free)
                 sub_fn = getattr(engine, "_submit_prepared", None) or engine.submit_prepared
-                event = sub_fn(prepared, name, after=predecessors, owner=owner)
+                event = sub_fn(prepared, name, after=predecessors, owner=owner, **extra_kw)
             else:
-                kwargs: dict[str, Any] = {}
+                kwargs: dict[str, Any] = dict(extra_kw)
                 if self.cohort_size != 1:
                     kwargs["cohort_size"] = self.cohort_size
                 if self.cohort_widened:
@@ -239,9 +250,9 @@ class _PreparedStageDeclaration:
     priority: int
     cohort_size: int = 1
     cohort_widened: tuple[str, ...] = ()
-    cohort_members: Mapping[str, tuple[tuple[int, ...], ...]] = field(
-        default_factory=dict
-    )
+    cohort_members: Mapping[str, tuple[tuple[int, ...], ...]] = field(default_factory=dict)
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+    deliveries: tuple[tuple[str, float], ...] = ()
 
 
 def stage_from_fragment(
@@ -396,6 +407,7 @@ def _declares_no_work(stage) -> bool:
         and stage.latency <= 0.0 and not stage.acquire and not stage.free
         and not any(stage.caps.values()) and not stage.coupled
         and stage.priority == 0 and stage.fragment is None
+        and not stage.metadata
     )
 
 
@@ -425,7 +437,7 @@ def _compile_leaf_kernel_ops(
     """Compile a leaf KernelProgram into flat prepared submission instructions."""
     stages = prog.stages
     for s in stages:
-        if s.program is not None or s.fragment is not None:
+        if s.program is not None or s.fragment is not None or s.metadata or s.deliveries:
             return None
     all_consumed = {k for st in stages for k in st.after}
     slot_by_name: dict[str, int] = {}

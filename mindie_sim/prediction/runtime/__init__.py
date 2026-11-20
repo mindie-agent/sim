@@ -17,8 +17,9 @@ from .contracts import (
 )
 from .memory_physics import (
     AddressRun, AddressRunPlan, AdmissionMemoryView, BoundAccess, BurstTurnRule,
-    ByteLedger, ConstraintTerm, CounterTerm, HbmBusSpec, MemoryAccessPattern,
-    ReuseKey, VisibilityContract, bind_memory_access, burst_turnaround_efficiency,
+    ByteLedger, ConstraintTerm, CounterTerm, DirtyWriteback, HbmBusSpec,
+    MemoryAccessPattern, ReuseKey, VisibilityContract, bind_memory_access,
+    burst_turnaround_efficiency,
 )
 from .prepared_terms import (
     BoundVectorOp, PreparedCapacityRow, PreparedDelivery, PreparedProgress,
@@ -62,7 +63,7 @@ __all__ = [
     "BottleneckDiagnosis", "BoundAccess", "BoundVectorOp", "BufferResidency",
     "BurstTurnRule", "ByteLedger", "CapTerm", "CapacityDomainState",
     "CatalogGeneration", "ConstraintTerm", "CounterTerm", "DepRecord",
-    "EdgeSpec", "Engine", "Event", "EventKey", "ExecutionError",
+    "DirtyWriteback", "EdgeSpec", "Engine", "Event", "EventKey", "ExecutionError",
     "FiniteProgramSpec", "FusedPipelineDescriptor", "GenerationEvents",
     "GrantResult", "HbmBusSpec", "HostProgramSpec", "IntervalRun",
     "LiveBufferSpec", "MemberBinding", "MemoryAccessPattern", "OccurrenceKey",

@@ -156,6 +156,12 @@ class _Task:
     native_hook: bool = False
     cohort_widened: tuple[str, ...] = ()
     cohort_members: tuple[tuple[str, tuple[tuple[int, ...], ...]], ...] = ()
+    deliveries: tuple[tuple[str, float], ...] = ()
+    delivered_acc: dict[str, float] | None = None
+    is_split_child: bool = False
+    ready_at: float | None = None
+    blocker_event: str = ""
+    blocker_reason: str = ""
 
 
 @dataclass(frozen=True, slots=True)

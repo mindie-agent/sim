@@ -547,12 +547,12 @@ class NativeBackend:
         if not self.seeded:
             self.arena.seed([engine.busy_ms[n] for n in self.res_names], [engine.serviced[n] for n in self.res_names])
             self.seeded = True
-        stop = [engine._native_slots[e.sequence] for e in until if not e.done and e.sequence in engine._native_slots]
+        stop = _at.stop_slots_for_epoch(engine, until)
         if stop:
             self.arena.call("msim_ctx_mark_external", stop)
         _at.prepare_obs_bridge(self, engine)
         try:
-            now, boundary, steps, ncomp, nstart = self.arena.run(engine.now, horizon, engine._frontier_next_release(), budget)
+            now, boundary, steps, ncomp, nstart = self.arena.run(engine.now, _at.cohort_break_horizon(engine, horizon), engine._frontier_next_release(), budget)
         except KernelFault as error:
             _at.drain_obs_bridge(self, engine)
             self._apply_prefix(engine, error)
@@ -562,14 +562,14 @@ class NativeBackend:
         engine.now, engine.advance_steps = now, engine.advance_steps + steps
         self._sync_counters(engine)
         _at.record_native_starts(self, engine, nstart)
-        _at.drain_obs_bridge(self, engine)
+        obs_prog = _at.drain_obs_bridge(self, engine)
         self._apply(engine, nstart, ncomp)
         if boundary == B_OUTPUT and (self.enabled or self.pending_handback):
             steps += drain_output(self, engine)
         finish_handback(self, engine)
         if boundary:
             self.native_boundaries += 1
-        self.made_progress = bool(steps or ncomp or nstart)
+        self.made_progress = bool(steps or ncomp or nstart or obs_prog)
         if self.needs_settle or self.pending:
             self._settle_instant(engine)
         if not self.made_progress and boundary == B_IDLE and engine._native_seqs:

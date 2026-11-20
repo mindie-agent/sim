@@ -106,6 +106,10 @@ def wake_successors(state, event, *, native: bool = False) -> None:
             continue
         dependent.waiting -= 1
         if not dependent.waiting:
+            dependent.blocker_event = event.name
+            dependent.ready_at = state.now
+            if not dependent.blocker_reason:
+                dependent.blocker_reason = "publish"
             queue_ready(state, dependent)
     event._waiters.clear()
 

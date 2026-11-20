@@ -10,7 +10,11 @@
 """
 from __future__ import annotations
 
-from ..engine import Allocation
+from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.hardware import NATIVE_WORK_UNITS
+from mindie_sim.schema.operators import ProgramFragment
+from ..engine import Allocation, Engine, Event
+from ..ownership import unit_group
 from ..runtime.memory_physics import (
     AddressRun,
     AddressRunPlan,
@@ -20,13 +24,20 @@ from ..runtime.memory_physics import (
     ByteLedger,
     ConstraintTerm,
     CounterTerm,
+    DirtyWriteback,
     HbmBusSpec,
     MemoryAccessPattern,
     ReuseKey,
     VisibilityContract,
 )
 from ..runtime.prepared_terms import BoundVectorOp, VectorInstructionGroup
-from .binding import Recipe, RecipeContext, ResourceEnvelope, TransferRecipe
+from .binding import (
+    Recipe,
+    RecipeContext,
+    ResourceEnvelope,
+    TransferRecipe,
+    proportional_coupled_placement,
+)
 from .coalesce import (
     _FloorParallelProgram,
     coalesce_execution_program,
@@ -77,11 +88,16 @@ __all__ = [
     "ByteLedger",
     "ConstraintTerm",
     "CounterTerm",
+    "DirtyWriteback",
+    "Engine",
+    "Event",
     "GENERIC_MATRIX_PROGRAM",
     "HbmBusSpec",
     "HostStaging",
     "KernelProgram",
     "MemoryAccessPattern",
+    "ModelingError",
+    "NATIVE_WORK_UNITS",
     "NativeProgram",
     "PIPELINE_COHORT_WINDOW",
     "PIPELINE_FOLD_WINDOW",
@@ -92,6 +108,7 @@ __all__ = [
     "PipelineTemplate",
     "PipelineTemplateProgram",
     "Program",
+    "ProgramFragment",
     "Recipe",
     "RecipeBook",
     "RecipeContext",
@@ -110,7 +127,9 @@ __all__ = [
     "is_pure_static_program",
     "merge_programs",
     "program_signature",
+    "proportional_coupled_placement",
     "scope_allocations",
     "split_cohort_kernel",
     "stage_from_fragment",
+    "unit_group",
 ]

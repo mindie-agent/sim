@@ -144,6 +144,7 @@ typedef struct {
     int32_t link_block;     /* first reusable link cell owned by this slot */
     int32_t link_block_len; /* cells reserved at ``link_block`` */
     int32_t first_succ;     /* head of the mirrored-successor edge list */
+    uint8_t coupled_comp;   /* scratch: 1 if in a coupled owner component */
 } msim_task;
 
 typedef struct {

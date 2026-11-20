@@ -130,12 +130,15 @@ def bind_vector_groups(
         raw_lat_ms = float(grp.result_latency_cycles) * cycle_ms
         if raw_lat_ms > max_raw_lat:
             max_raw_lat = raw_lat_ms
-        if grp.count > 1 and raw_lat_ms > 0.0 and grp.last_issue_mark:
-            per_inst_ms = thru_ms / float(grp.count)
-            last_issue_ms = start_ms + float(grp.count - 1) * per_inst_ms
-            raw_ready = max(start_ms + thru_ms, last_issue_ms + raw_lat_ms)
+        if raw_lat_ms > 0.0 and grp.count > 0:
+            if grp.last_issue_mark:
+                per_inst_ms = thru_ms / float(grp.count)
+                last_issue_ms = start_ms + float(grp.count - 1) * per_inst_ms
+                raw_ready = max(start_ms + thru_ms, last_issue_ms + raw_lat_ms)
+            else:
+                raw_ready = start_ms + thru_ms + raw_lat_ms
         else:
-            raw_ready = max(start_ms + thru_ms, start_ms + raw_lat_ms) if grp.count > 0 else start_ms
+            raw_ready = start_ms + thru_ms if grp.count > 0 else start_ms
         raw_ready_by_id[grp.group_id] = raw_ready
 
         issue_res = res_map.get("vec_issue", "vec_issue")
@@ -168,9 +171,35 @@ def bind_vector_groups(
                 coupled=True,
             ))
             stages.append(Stage(
-                f"{grp.group_id}:raw",
+                f"{grp.group_id}:raw_timer",
                 latency=raw_lat_ms,
                 after=(f"{grp.group_id}:prefix",),
+            ))
+            stages.append(Stage(
+                f"{grp.group_id}:raw",
+                after=(grp.group_id, f"{grp.group_id}:raw_timer"),
+                keep_empty=True,
+            ))
+        elif grp.count == 1 and raw_lat_ms > 0.0 and grp.last_issue_mark:
+            stages.append(Stage(
+                grp.group_id,
+                work={
+                    issue_res: issue_w / eff_issue,
+                    pipe_res: exec_w / eff_pipes[grp.pipe],
+                },
+                after=deps_after,
+                placement=pl,
+                coupled=True,
+            ))
+            stages.append(Stage(
+                f"{grp.group_id}:raw_timer",
+                latency=raw_lat_ms,
+                after=deps_after,
+            ))
+            stages.append(Stage(
+                f"{grp.group_id}:raw",
+                after=(grp.group_id, f"{grp.group_id}:raw_timer"),
+                keep_empty=True,
             ))
         else:
             stages.append(Stage(
