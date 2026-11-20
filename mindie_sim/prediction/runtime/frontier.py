@@ -96,16 +96,32 @@ def wake_successors(state, event, *, native: bool = False) -> None:
     hand the delivery to the kernel instead of touching the Python heaps.
     """
     slots = getattr(state, "_native_seqs", None)
+    ev_t = event.time if event.time is not None else state.now
     for successor in event._waiters:
         dependent = state._tasks.get(successor)
         if dependent is None:
             continue
+        if dependent.pending_preds is not None:
+            try:
+                dependent.pending_preds.remove(event)
+            except ValueError:
+                pass
+            if len(dependent.pending_preds) == 1:
+                sole = dependent.pending_preds[0]
+                dependent.blocker_event = sole.name
+                dependent.blocker_reason = "publish"
+                dependent.ready_at = ev_t if ev_t >= dependent.release else dependent.release
         if slots is not None and successor in slots:
             if not native:
                 state._native_deliver(successor)
             continue
         dependent.waiting -= 1
         if not dependent.waiting:
+            if not dependent.blocker_event:
+                dependent.blocker_event = event.name
+                dependent.blocker_reason = "publish"
+            if dependent.ready_at is None:
+                dependent.ready_at = ev_t
             queue_ready(state, dependent)
     event._waiters.clear()
 

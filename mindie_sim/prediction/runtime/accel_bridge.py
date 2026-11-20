@@ -385,19 +385,19 @@ class NativeBackend:
         self.disable(engine, self._mixed_reason())
         self.made_progress = True
     def _sync_counters(self, engine) -> None:
-        """publish counters before another call can fail (no prefix too)."""
         if self.arena is None:
             return
         busy, serv = self.arena.counters()
         for i, name in enumerate(self.res_names):
             engine.busy_ms[name] = busy[i]
             engine.serviced[name] = serv[i]
+        if engine._delivery_live:
+            from .accel_terms import sync_native_deliveries
+            sync_native_deliveries(self, engine)
     def _apply_prefix(self, engine, error: KernelFault) -> None:
         """publish the kernel-accepted prefix of a failing epoch."""
         prefix = getattr(error, "prefix", None)
         if prefix is None or not getattr(error, "has_prefix", False):
-            # even an accepted-nothing failure must publish the native
-            # counters already earned by an earlier successful call.
             self._sync_counters(engine)
             return
         now, _boundary, steps, ncomp, nstart = prefix
@@ -527,9 +527,12 @@ class NativeBackend:
             return 0
         if self._trace_blocks_epoch(engine):
             return 0
-        if (len(engine._native_seqs) != len(engine._tasks)
-                or tuple(engine.resources) != self.res_names):
-            # Sync back when Python-owned tasks or resource changes mix the frontier.
+        from . import accel_terms as _at
+        if _at.has_asymmetric_cohort(engine):
+            self.disable(engine, "cohort_symmetry_break")
+            self.made_progress = True
+            return 0
+        if len(engine._native_seqs) != len(engine._tasks) or tuple(engine.resources) != self.res_names:
             self.disable(engine, "mixed_frontier")
             self.made_progress = True
             return 0
@@ -542,31 +545,30 @@ class NativeBackend:
             self.made_progress = True
             return 0
         if not self.seeded:
-            self.arena.seed([engine.busy_ms[n] for n in self.res_names],
-                            [engine.serviced[n] for n in self.res_names])
+            self.arena.seed([engine.busy_ms[n] for n in self.res_names], [engine.serviced[n] for n in self.res_names])
             self.seeded = True
-        stop = [engine._native_slots[event.sequence] for event in until
-                if not event.done and event.sequence in engine._native_slots]
+        stop = _at.stop_slots_for_epoch(engine, until)
         if stop:
             self.arena.call("msim_ctx_mark_external", stop)
+        _at.prepare_obs_bridge(self, engine)
         try:
-            now, boundary, steps, ncomp, nstart = self.arena.run(
-                engine.now, horizon, engine._frontier_next_release(), budget)
+            now, boundary, steps, ncomp, nstart = self.arena.run(engine.now, _at.cohort_break_horizon(engine, horizon), engine._frontier_next_release(), budget)
         except KernelFault as error:
+            _at.drain_obs_bridge(self, engine)
             self._apply_prefix(engine, error)
             self._translate_fault(error)
         self.native_calls += 1
         self.native_steps += steps
-        engine.now = now
-        engine.advance_steps += steps
+        engine.now, engine.advance_steps = now, engine.advance_steps + steps
         self._sync_counters(engine)
+        obs_prog = _at.drain_obs_bridge(self, engine)
         self._apply(engine, nstart, ncomp)
         if boundary == B_OUTPUT and (self.enabled or self.pending_handback):
             steps += drain_output(self, engine)
         finish_handback(self, engine)
         if boundary:
             self.native_boundaries += 1
-        self.made_progress = bool(steps or ncomp or nstart)
+        self.made_progress = bool(steps or ncomp or nstart or obs_prog)
         if self.needs_settle or self.pending:
             self._settle_instant(engine)
         if not self.made_progress and boundary == B_IDLE and engine._native_seqs:
@@ -574,21 +576,19 @@ class NativeBackend:
             raise KernelFault(E_STALL, "idle", f"mirrored={len(engine._native_slots)}")
         return steps
     def _apply(self, engine, nstart: int, ncomp: int) -> None:
-        """Publish one kernel result batch exactly once."""
-        tasks = engine._tasks
-        slots = engine._native_slots
+        if engine._wave_recorder is not None and nstart > 0:
+            from .accel_terms import record_native_starts
+            record_native_starts(self, engine, nstart, ncomp)
+        tasks, slots = engine._tasks, engine._native_slots
         self.applying = True
         try:
             for seq, moment in self.arena.starts(nstart):
                 task = tasks.get(seq)
                 if task is None:
                     continue
-                task.start = moment
-                task.event.started = moment
+                task.start = task.event.started = moment
                 engine._active.add(seq)
                 engine._native_active += 1
-                # The arbiter fast paths read these live counters; a kernel
-                # start must publish the same state ``_start_ready`` would have.
                 if task.coupled:
                     engine._coupled_active += 1
                 if task.placement:

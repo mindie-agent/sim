@@ -16,31 +16,19 @@ from __future__ import annotations
 
 import math
 
-_NEG_ONE_I = -1
-_ZERO_I = 0
-_ONE_I = 1
-_TWO_I = 2
-_ZERO_F = 0.0
-_ONE_F = 1.0
-_TWO_F = 2.0
-_MIN_RATE_PER_MS = 1.0 / 1000000 / 1000000
-_HALF_STEP = 1.0 / 2.0
-_CAP_ULPS = float(2 * 2 * 2)
-_SAT_ULPS = _CAP_ULPS * 2.0
-_NEXTAFTER_STEPS = int(_SAT_ULPS) * 2 * 2
-_MAX_ATTEMPTS = _NEXTAFTER_STEPS * 2 * 2
+_MIN_RATE_PER_MS = 1e-12
+_HALF_STEP = 0.5
+_CAP_ULPS = 8.0
+_SAT_ULPS = 16.0
+_NEXTAFTER_STEPS = 64
+_MAX_ATTEMPTS = 256
 _UNIT_RANGE_CACHE: dict[int, tuple[int, ...]] = {}
 
 
 def fast_single_tier_coupled(resources, tasks, active) -> dict[str, dict[int, float]] | None:
     """Fast path for single-priority non-FIFO cohorts; ``None`` delegates out."""
-    ni = _NEG_ONE_I
-    zi = _ZERO_I
-    oi = _ONE_I
-    ti = _TWO_I
-    zf = _ZERO_F
-    of = _ONE_F
-    tf = _TWO_F
+    ni, zi, oi, ti = -1, 0, 1, 2
+    zf, of, tf = 0.0, 1.0, 2.0
 
     first_prio = None
     tier: list[int] = []
@@ -84,6 +72,10 @@ def fast_single_tier_coupled(resources, tasks, active) -> dict[str, dict[int, fl
         placement = task.placement
         caps_map = task.caps
         if task.coupled:
+            cohort = task.cohort_size or oi
+            if cohort < oi:
+                cohort = oi
+            widened_set = getattr(task, "cohort_widened", ())
             spans: list[tuple[str, float, tuple[int, ...], int, float, list, bool]] = []
             spans_append = spans.append
             blocked = False
@@ -125,6 +117,8 @@ def fast_single_tier_coupled(resources, tasks, active) -> dict[str, dict[int, fl
                     is_full = units == full_u
                 amt_f = float(amount)
                 denom = u_cap * n_u
+                if cohort > oi and name not in widened_set:
+                    denom *= cohort
                 if denom <= zf:
                     scale = inf
                 elif scale != inf:
@@ -138,16 +132,12 @@ def fast_single_tier_coupled(resources, tasks, active) -> dict[str, dict[int, fl
                 raise ZeroDivisionError("coupled_scale_underflow")
             if not isfinite(scale) or scale < zf:
                 continue
-            cohort = task.cohort_size or oi
-            if cohort < oi:
-                cohort = oi
-            inv_scale_cohort = cohort / scale
             limit = of
             if caps_map:
                 for name, amt_f, _units, _n_u, _u_cap, _sbox, _is_full in spans:
                     cap = caps_map.get(name)
                     if cap is not None:
-                        demand = amt_f * inv_scale_cohort
+                        demand = amt_f / scale
                         c_lim = (max(zf, float(cap)) / demand) if demand > zf else zf
                         if c_lim < limit:
                             limit = c_lim
@@ -156,10 +146,10 @@ def fast_single_tier_coupled(resources, tasks, active) -> dict[str, dict[int, fl
             f_idx = len(flow_keys)
             fk_append(key)
             fl_append(limit)
-            fr_append([(name, amt_f * inv_scale_cohort)
+            fr_append([(name, amt_f / scale)
                        for name, amt_f, _u, _nu, _uc, _sb, _if in spans])
             for name, amt_f, units, n_u, _u_cap, sbox, is_full in spans:
-                weight = (amt_f * inv_scale_cohort) / n_u
+                weight = (amt_f / scale) / n_u
                 item = (f_idx, weight)
                 if is_full:
                     fslot = sbox[zi]

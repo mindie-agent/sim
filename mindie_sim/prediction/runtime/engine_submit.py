@@ -26,7 +26,7 @@ class _EngineSubmitMixin:
         self, prepared, name, *, after=(), release=None, owner="", metadata=None,
         on_complete=None, on_start=None, memory=None, memory_pools=None,
         memory_bindings=None, acquire_override=None, free_override=None,
-        native_hook: bool = False,
+        native_hook: bool = False, deliveries=(),
     ) -> Event:
         # Dependencies and allocations remain live invocation state. Only static
         # work, supply and placement validation can be shared by repeated tiles.
@@ -161,6 +161,11 @@ class _EngineSubmitMixin:
         event = Event(self._sequence, name)
         waiting_count = (1 if pending_one is not None
                          else (0 if pending is None else len(pending)))
+        deliv_tuple = (
+            tuple((str(cid), float(amt)) for cid, amt in deliveries if float(amt) > 0.0)
+            if deliveries else ()
+        )
+        wave_rec = self._wave_recorder
         task = _Task(
             event, prepared.demand.copy() if prepared.demand else {},
             prepared.demand,
@@ -171,8 +176,29 @@ class _EngineSubmitMixin:
             prepared.priority, prepared.coupled, on_complete, on_start,
             None, {}, False, task_ledger, memory_replica, memory_stage, pools,
             bindings, (), prepared.cohort_size, prepared, None, native_hook,
+            prepared.cohort_widened, prepared.cohort_members,
+            deliv_tuple, {} if deliv_tuple else None, False,
+            release if waiting_count <= 1 else None,
+            pending_one.name if pending_one is not None else "",
+            "publish" if pending_one is not None else "",
+            None, prepared.latency_from_first_service, None,
+            list(pending) if (wave_rec is not None and pending is not None) else None,
         )
         tasks[event.sequence] = task
+        if deliv_tuple:
+            self._delivery_live += 1
+        if wave_rec is not None:
+            preds = (
+                (pending_one.sequence,) if pending_one is not None
+                else (tuple(p.sequence for p in pending) if pending is not None else ())
+            )
+            occ = the_metadata.get("occurrence") if the_metadata else None
+            wave_rec.on_submit(
+                event.sequence, name,
+                aliases=(owner,) if owner else (),
+                predecessors=preds,
+                occurrence=occ,
+            )
         if self.task_uses_fifo(task):
             self._fifo_live += 1
         if self.task_blocks_native(task):
@@ -297,9 +323,21 @@ class _EngineSubmitMixin:
             None, {}, False,
             ledger if host_accounting else None, memory_replica,
             memory_stage, pools,
-            bindings, (), prepared.cohort_size, prepared, obs,
+            bindings, (), prepared.cohort_size, prepared, obs, False,
+            prepared.cohort_widened, prepared.cohort_members,
         )
         tasks[seq_launch] = task
+        wave_rec = self._wave_recorder
+        if wave_rec is not None:
+            preds = (
+                (pending_one.sequence,) if pending_one is not None
+                else (tuple(p.sequence for p in pending) if pending is not None else ())
+            )
+            wave_rec.on_submit(
+                seq_launch, name,
+                aliases=(owner,) if owner else (),
+                predecessors=preds,
+            )
         if self.task_uses_fifo(task):
             self._fifo_live += 1
         if self.task_blocks_native(task):
@@ -404,6 +442,81 @@ class _EngineSubmitMixin:
                 event._callbacks.append(callback)
             return
         raise ExecutionError(f"callback_target_not_submitted:{event.name}")
+
+    def _bound_access_work_and_place(self, bound):
+        res_rates: dict[str, float] = {}
+        if bound.pipe_row_id and bound.pipe_row_id in self.resources:
+            res_p = self.resources[bound.pipe_row_id]
+            res_rates[bound.pipe_row_id] = res_p.rate / res_p.units
+        if bound.l2_row_id and bound.l2_row_id in self.resources:
+            res_rates[bound.l2_row_id] = self.resources[bound.l2_row_id].rate
+        raw_work = bound.stage_work(resource_rates=res_rates)
+        if bound.l2_row_id and bound.l2_row_id not in self.resources:
+            raw_work.pop(bound.l2_row_id, None)
+        place = {k: tuple(v) for k, v in bound.stage_placement().items() if k in raw_work}
+        delivs = tuple(
+            (str(c.counter_id), float(c.work_per_progress))
+            for c in bound.deliveries if float(c.work_per_progress) > 0.0
+        )
+        return raw_work, place, delivs
+
+    def submit_bound_access(
+        self,
+        name: str,
+        bound,
+        *,
+        after: Sequence[Event] = (),
+        release: float | None = None,
+        owner: str = "",
+        priority: int = 0,
+        memory_state=None,
+        pattern=None,
+    ) -> Event:
+        """Submit one ``BoundAccess`` as a single coupled, owner-pinned flow."""
+        work, placement, deliveries = self._bound_access_work_and_place(bound)
+        on_start = None
+        if memory_state is not None and pattern is not None:
+            cfg = getattr(bound, "bind_config", None)
+            if cfg is not None:
+                def _admit_and_rebind(ev, ms=memory_state, pat=pattern, bcfg=cfg):
+                    from .l2_residency import bind_memory_access
+                    hbm_bus, c_hit, c_miss, l2_r, pipe_r, l2_id, b_rules, nom_p = bcfg
+                    live_b = bind_memory_access(
+                        pat, ms, hbm_bus=hbm_bus,
+                        copy_hit_bytes_per_ms=c_hit,
+                        copy_miss_bytes_per_ms=c_miss,
+                        l2_bytes_per_ms=l2_r,
+                        pipe_row_id=pipe_r, l2_row_id=l2_id,
+                        burst_rules=b_rules, commit=True,
+                        nominal_pipe_bytes_per_ms=nom_p,
+                    )
+                    live_w, live_p, live_d = self._bound_access_work_and_place(live_b)
+                    t_obj = self._tasks.get(ev.sequence)
+                    if t_obj is None:
+                        return
+                    had_fifo = self.task_uses_fifo(t_obj)
+                    had_deliv = bool(t_obj.deliveries)
+                    t_obj.demand = live_w
+                    t_obj.remaining = dict(live_w)
+                    t_obj.placement = live_p
+                    t_obj.coupled = bool(live_w)
+                    t_obj.prepared = None
+                    t_obj.deliveries = live_d
+                    t_obj.delivered_acc = {} if live_d else None
+                    has_fifo = self.task_uses_fifo(t_obj)
+                    if has_fifo != had_fifo:
+                        self._fifo_live += 1 if has_fifo else -1
+                    if bool(live_d) != had_deliv:
+                        self._delivery_live += 1 if live_d else -1
+                on_start = _admit_and_rebind
+            else:
+                aligned = bound.ledger.aligned_transfer_bytes
+                on_start = lambda _ev, ms=memory_state, pat=pattern, ab=aligned: ms.admit_access(pat, ab)
+        return self.submit(
+            name, work=work, after=after, release=release, owner=owner,
+            placement=placement, coupled=bool(work),
+            priority=priority, on_start=on_start, deliveries=deliveries,
+        )
 
     def _wake(self, event: Event, *, native: bool = False) -> None:
         frontier.wake_successors(self, event, native=native)

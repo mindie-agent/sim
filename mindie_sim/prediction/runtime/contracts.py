@@ -172,6 +172,7 @@ class StageSpec:
     #: Symmetric owner multiplicity of a merged coupled cohort; the Engine
     #: normalizes joint progress by this count, exactly like ``Stage``.
     cohort_size: int = 1
+    cohort_widened: tuple[str, ...] = ()
     placement: tuple[PlacementSpec, ...] = ()
     acquire: tuple[AllocationSpec, ...] = ()
     release: tuple[ReleaseSpec, ...] = ()

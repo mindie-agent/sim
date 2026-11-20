@@ -113,17 +113,18 @@ def flush_pending(backend, engine) -> None:
     slots = engine._native_slots
     rows = []
     for event, task, pending in backend.pending:
+        wset = set(task.cohort_widened) if (task.cohort_size > 1 and task.cohort_widened) else ()
         links = []
         for name, remaining in task.remaining.items():
             units = task.placement.get(name, ()) if task.placement else ()
             links.append((index[name], remaining,
-                          task.caps.get(name, math.inf), units))
+                          task.caps.get(name, math.inf), units, name in wset))
         flags = task_flags(task, engine)
         task.waiting = sum(
             1 for predecessor in pending if not predecessor.done)
         rows.append((
             event.sequence, flags, int(task.priority), int(task.cohort_size),
-            task.waiting, engine.now, task.latency, task.release, links))
+            task.waiting, engine.now, task.latency, task.release, links, 0))
     assigned = backend.arena.submit(rows)
     edges = []
     for (event, _task, pending), slot in zip(backend.pending, assigned):
@@ -174,6 +175,8 @@ def drain_output(backend, engine) -> int:
             engine.now = now
             engine.advance_steps += steps
             backend._sync_counters(engine)
+            from .accel_terms import drain_obs_bridge
+            drain_obs_bridge(backend, engine)
             backend._apply(engine, nstart, ncomp)
             # Every completion and trace eviction published by this
             # chunk must settle before another drain call can admit an awakened

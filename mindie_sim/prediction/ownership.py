@@ -130,8 +130,13 @@ def unit_rates(rate, count, caps, placements):
     result = dict.fromkeys(caps, 0.0)
     active = set(caps)
     while active:
-        slopes = {unit: sum(weight for key, weight in consumers.items() if key in active)
-                  for unit, consumers in weights.items()}
+        slopes = {}
+        for unit, consumers in weights.items():
+            total = 0.0
+            for key, weight in consumers.items():
+                if key in active:
+                    total += weight
+            slopes[unit] = total
         bounds = {unit: remaining[unit] / slope
                   for unit, slope in slopes.items() if slope}
         delta = min(min(bounds.values(), default=math.inf),

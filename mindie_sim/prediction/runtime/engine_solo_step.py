@@ -44,15 +44,17 @@ class _EngineSoloStepMixin:
         if latency_active:
             if len(latency_active) == 1:
                 ltask = tasks[next(iter(latency_active))]
-                if ltask.start + ltask.latency > now:
-                    lat_dt = ltask.start + ltask.latency - now
+                anchor = ltask.first_service if ltask.latency_from_first_service else ltask.start
+                if anchor is not None and anchor + ltask.latency > now:
+                    lat_dt = anchor + ltask.latency - now
                     if lat_dt < stop_dt:
                         stop_dt = lat_dt
             else:
                 for lkey in latency_active:
                     ltask = tasks[lkey]
-                    if ltask.start + ltask.latency > now:
-                        lat_dt = ltask.start + ltask.latency - now
+                    anchor = ltask.first_service if ltask.latency_from_first_service else ltask.start
+                    if anchor is not None and anchor + ltask.latency > now:
+                        lat_dt = anchor + ltask.latency - now
                         if lat_dt < stop_dt:
                             stop_dt = lat_dt
         if not rem:
@@ -105,6 +107,10 @@ class _EngineSoloStepMixin:
                 service = task.service
                 service[rname] = service.get(rname, 0.0) + used
                 serviced[rname] += used
+                wave_rec = self._wave_recorder
+                if wave_rec is not None and dt > 0.0:
+                    pl_u = task.placement.get(rname) if task.placement else None
+                    wave_rec.on_service(key, rname, pl_u[0] if pl_u else 0, now, next_time, used)
                 if residual:
                     rem[rname] = residual
                 else:
@@ -146,10 +152,14 @@ class _EngineSoloStepMixin:
                 if max_wdt > 0 and next_time == now:
                     next_time = _nextafter(now, _inf)
                 service = task.service
+                wave_rec = self._wave_recorder
                 for rname, remaining, _rate, wdt in entries:
                     busy_ms[rname] += wdt
                     service[rname] = service.get(rname, 0.0) + remaining
                     serviced[rname] += remaining
+                    if wave_rec is not None and wdt > 0.0:
+                        pl_u = task.placement.get(rname) if task.placement else None
+                        wave_rec.on_service(key, rname, pl_u[0] if pl_u else 0, now, now + wdt, remaining)
                 rem.clear()
                 if task.latency <= 0.0:
                     completable_seen.add(key)
@@ -163,6 +173,7 @@ class _EngineSoloStepMixin:
             if dt > 0 and next_time == now:
                 next_time = _nextafter(now, _inf)
             service = task.service
+            wave_rec = self._wave_recorder
             for rname, remaining, rate, _wdt in entries:
                 busy_ms[rname] += dt
                 scaled = dt * rate
@@ -176,6 +187,9 @@ class _EngineSoloStepMixin:
                         used = scaled
                 service[rname] = service.get(rname, 0.0) + used
                 serviced[rname] += used
+                if wave_rec is not None and dt > 0.0:
+                    pl_u = task.placement.get(rname) if task.placement else None
+                    wave_rec.on_service(key, rname, pl_u[0] if pl_u else 0, now, next_time, used)
                 if residual:
                     rem[rname] = residual
                 else:
@@ -187,6 +201,7 @@ class _EngineSoloStepMixin:
         prep = task.prepared
         c_rates = (prep.coupled_solo_rates
                    if (prep is not None
+                       and not task.service
                        and prep.coupled_solo_rates is not None
                        and len(rem) == len(prep.coupled_solo_rates))
                    else None)
@@ -232,6 +247,7 @@ class _EngineSoloStepMixin:
         if dt > 0 and next_time == now:
             next_time = _nextafter(now, _inf)
         service = task.service
+        wave_rec = self._wave_recorder
         for rname, rate in c_rates:
             busy_ms[rname] += dt
             remaining = rem[rname]
@@ -246,6 +262,9 @@ class _EngineSoloStepMixin:
                     used = scaled
             service[rname] = service.get(rname, 0.0) + used
             serviced[rname] += used
+            if wave_rec is not None and dt > 0.0:
+                pl_u = task.placement.get(rname) if task.placement else None
+                wave_rec.on_service(key, rname, pl_u[0] if pl_u else 0, now, next_time, used)
             if residual:
                 rem[rname] = residual
             else:
@@ -254,3 +273,35 @@ class _EngineSoloStepMixin:
             completable_seen.add(key)
             _heappush(completable, key)
         return next_time
+
+    def _update_task_deliveries(self, task: _Task) -> None:
+        if not task.deliveries:
+            return
+        ref_r = next(iter(task.demand), None)
+        if ref_r is None:
+            return
+        ref_d = task.demand[ref_r]
+        frac = min(1.0, task.service.get(ref_r, 0.0) / ref_d) if ref_d > 0.0 else 1.0
+        deliv = self.delivered
+        acc = task.delivered_acc
+        for ctr_id, total_amt in task.deliveries:
+            prev = acc.get(ctr_id, 0.0) if acc is not None else 0.0
+            target = total_amt * frac
+            delta = target - prev
+            if delta > 0.0:
+                deliv[ctr_id] = deliv.get(ctr_id, 0.0) + delta
+                if acc is not None:
+                    acc[ctr_id] = target
+
+    def _emit_fast_step_observers(
+        self, wave_rec, watched, now: float, next_time: float,
+    ) -> None:
+        for k, t, prev_svc in watched:
+            if t.deliveries:
+                self._update_task_deliveries(t)
+            if wave_rec is not None and next_time > now:
+                for rn, post in t.service.items():
+                    delta = post - prev_svc.get(rn, 0.0)
+                    if delta > 0.0:
+                        pl_u = t.placement.get(rn) if t.placement else None
+                        wave_rec.on_service(k, rn, pl_u[0] if pl_u else 0, now, next_time, delta)

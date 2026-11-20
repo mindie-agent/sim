@@ -29,6 +29,7 @@ ST_CELLS = 8
 IO_CELLS = 8
 TASK_STRIDE = 12
 LINK_STRIDE = 6
+LINK_WIDENED_BIT_SHIFT = 32
 COMP_STRIDE = 3
 SVC_STRIDE = 3
 MAX_T = 65536
@@ -248,7 +249,7 @@ def _stable_task_payloads(task, engine=None) -> bool:
             return False
         if any(type(unit) is not int for unit in units):
             return False
-    return True
+    return _inert_str_tuple(task.cohort_widened) and type(task.cohort_members) is tuple
 
 
 def callback_capable(task, engine=None) -> bool:
@@ -304,7 +305,9 @@ def pure_task(engine, task) -> bool:
     if engine._periodic_runs:
         return False
     if (task.start_callback is not None or task.acquire or task.free
-            or task.allocation_demands):
+            or task.allocation_demands or task.latency_from_first_service):
+        return False
+    if task.cohort_widened and len(task.remaining) > MAX_R:
         return False
     # An ordinary callback stays Python.  A declared native boundary hook is
     # marked ``MSIM_F_CALLBACK``, so the kernel halts at that exact instant.
@@ -345,17 +348,8 @@ def pure_task(engine, task) -> bool:
             for unit in units:
                 if type(unit) is not int or unit < 0 or unit >= limit:
                     return False
-    if task.coupled and len(task.remaining) > 1 and task.placement:
-        u0 = tot0 = 0
-        for name in task.remaining:
-            res_obj = engine.resources[name]
-            units = task.placement.get(name)
-            ulen = res_obj.units if units is None else len(units)
-            if tot0 == 0:
-                u0, tot0 = ulen, res_obj.units
-            elif ulen * tot0 != u0 * res_obj.units:
-                return False
-    return True
+    from .accel_terms import coupled_placement_proportional
+    return coupled_placement_proportional(engine, task)
 
 #: Boundary kinds returned by ``msim_ctx_run``.
 B_NONE, B_CALLBACK, B_HORIZON, B_LATENCY, B_BUDGET, B_IDLE, B_RELEASE, B_STOP = range(8)
@@ -604,7 +598,8 @@ class Arena:
         place = 0
         li = 0
         for i, row in enumerate(tasks):
-            seq, flags, prio, cohort, waiting, start, latency, release, links = row
+            seq, flags, prio, cohort, waiting, start, latency, release, links = row[:9]
+            widened_mask = int(row[9]) if len(row) > 9 else 0
             # Representable bounds are enforced *before* ctypes packing so a
             # wide Python integer can never wrap into a valid-looking cell.
             if not isinstance(prio, int) or isinstance(prio, bool) or prio < 0 \
@@ -622,21 +617,23 @@ class Arena:
             self.rows[base + 2] = prio
             self.rows[base + 3] = cohort
             self.rows[base + 4] = waiting
-            self.rows[base + 5] = 0
+            self.rows[base + 5] = widened_mask
             self.rows[base + 6] = bits(start)
             self.rows[base + 7] = bits(latency)
             self.rows[base + 8] = bits(release)
             self.rows[base + 9] = len(links)
             self.rows[base + 10] = li
             self.rows[base + 11] = 0
-            for res, remaining, cap, units in links:
+            for link in links:
+                res, remaining, cap, units = link[:4]
+                wid = 1 if (len(link) > 4 and link[4]) else 0
                 off = li * LINK_STRIDE
                 self.links[off + 0] = i
                 self.links[off + 1] = res
                 self.links[off + 2] = bits(remaining)
                 self.links[off + 3] = bits(cap)
                 self.links[off + 4] = place
-                self.links[off + 5] = len(units)
+                self.links[off + 5] = len(units) | (wid << LINK_WIDENED_BIT_SHIFT)
                 for u in units:
                     self.place[place] = u
                     place += 1

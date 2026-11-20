@@ -154,6 +154,18 @@ class _Task:
     #: before Python admits the pre-prepared successors.  Only rows whose hook
     #: is virtual-time independent set this.
     native_hook: bool = False
+    cohort_widened: tuple[str, ...] = ()
+    cohort_members: tuple[tuple[str, tuple[tuple[int, ...], ...]], ...] = ()
+    deliveries: tuple[tuple[str, float], ...] = ()
+    delivered_acc: dict[str, float] | None = None
+    is_split_child: bool = False
+    ready_at: float | None = None
+    blocker_event: str = ""
+    blocker_reason: str = ""
+    fifo_order: tuple[int, int] | None = None
+    latency_from_first_service: bool = False
+    first_service: float | None = None
+    pending_preds: list[Event] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,6 +195,9 @@ class _PreparedTask:
     coupled_res_info: dict[str, tuple[float, float, float, float, tuple[int, ...] | None]] | None = None
     uncoupled_res_info: dict[str, tuple[float, float, float, float, float, tuple[int, ...] | None]] | None = None
     pool_unit_masks: tuple[tuple[str, int], ...] | None = ()
+    cohort_widened: tuple[str, ...] = ()
+    cohort_members: tuple[tuple[str, tuple[tuple[int, ...], ...]], ...] = ()
+    latency_from_first_service: bool = False
 
 
 _EMPTY_TASK = _PreparedTask({}, 0.0, {}, (), (), {}, False, (), 0)

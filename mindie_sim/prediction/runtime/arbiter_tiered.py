@@ -144,11 +144,14 @@ def _tier_flows(resources, tasks, tier, unit_remaining, fifo_winners) -> list:
             if blocked or not spans:
                 continue
             cohort = max(1, int(getattr(task, "cohort_size", 1) or 1))
+            widened_set = getattr(task, "cohort_widened", ())
             scale = 0.0
             for name, units in spans.items():
                 capacity = resources[name].rate / max(
                     1, int(resources[name].units))
                 denominator = capacity * len(units)
+                if cohort > 1 and name not in widened_set:
+                    denominator *= cohort
                 if denominator <= 0.0:
                     scale = math.inf
                     break
@@ -161,7 +164,7 @@ def _tier_flows(resources, tasks, tier, unit_remaining, fifo_winners) -> list:
             rates: list[tuple[str, float]] = []
             terms: list[tuple[str, int, float]] = []
             for name, units in spans.items():
-                demand = float(remaining[name]) / scale * cohort
+                demand = float(remaining[name]) / scale
                 rates.append((name, demand))
                 weight = demand / len(units)
                 terms.extend((name, unit, weight) for unit in units)
@@ -449,7 +452,8 @@ def _tiered_coupled(resources, tasks, active, solver) -> dict[str, dict[int, flo
                   key=lambda key: (
                       tasks[key].start is None,
                       tasks[key].start if tasks[key].start is not None else math.inf,
-                      tasks[key].priority, key))
+                      tasks[key].priority,
+                      tasks[key].fifo_order if getattr(tasks[key], "fifo_order", None) is not None else (key, 0)))
         for name, resource in resources.items()
         if resource.policy == "fifo"
         and any(tasks[key].remaining.get(name, 0.0) > 0.0 for key in active)}
@@ -623,7 +627,8 @@ def _tiered_simple(resources, tasks, active) -> dict[str, dict[int, float]]:
                 winner = min(eligible, key=lambda key: (
                     tasks[key].start is None,
                     tasks[key].start if tasks[key].start is not None else math.inf,
-                    tasks[key].priority, key))
+                    tasks[key].priority,
+                    tasks[key].fifo_order if getattr(tasks[key], "fifo_order", None) is not None else (key, 0)))
                 declared = tasks[winner].placement.get(name)
                 placements = ({winner: declared} if declared is not None
                               else {winner: None})

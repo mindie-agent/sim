@@ -29,6 +29,7 @@ _EMPTY_FROZENSET: frozenset = frozenset()
 #: opt-in task trace: disabling the verbose ``trace`` must never change what
 #: allocation evidence a settled run reports.
 ALLOCATION_TRACE_CAPACITY = 8192
+DEFAULT_ZERO_PROGRESS_LIMIT = 100_000
 
 
 class _LazyTraceDeque:
@@ -170,7 +171,7 @@ class _LazyAllocTraceDeque:
 class RuntimeState:
     def __init__(
         self, *, resources: Mapping[str, Any], pools=None, trace_limit: int = 0,
-        pool_units=None, zero_progress_limit: int = 100_000,
+        pool_units=None, zero_progress_limit: int = DEFAULT_ZERO_PROGRESS_LIMIT,
     ):
         self.uid = uuid4().hex
         self.capacity_domains: dict[str, CapacityDomainState] = {}
@@ -208,6 +209,7 @@ class RuntimeState:
         self.allocations: dict[str, Allocation] = {}
         self.now = 0.0
         self.serviced = dict.fromkeys(self.resources, 0.0)
+        self.delivered: dict[str, float] = {}
         self.busy_ms = dict.fromkeys(self.resources, 0.0)
         self._tasks: dict[int, _Task] = {}
         self._promises: dict[int, Event] = {}
@@ -233,6 +235,7 @@ class RuntimeState:
         #: skips per-resource pinned partitions.
         self._coupled_active = 0
         self._placed_active = 0
+        self._delivery_live = 0
         #: Structural cache of validated immutable Stage declarations.  Only
         #: static work/caps/placement validation is shared; every occurrence
         #: still binds and validates its own scoped allocations.
