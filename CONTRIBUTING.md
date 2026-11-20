@@ -52,7 +52,7 @@ flowchart LR
 | 编号 | 绝对红线 | 代码级拦截机制与精确报错 |
 | :--- | :--- | :--- |
 | **红线 1** | **零旁路计算器与第二套 IR**<br/>严禁新建或恢复独立于 `runtime.Engine` 的公式估算器、私有子图 IR、独立通信耗时计算器或效率侧 `max(...)` 补丁。 | [`scripts/verify_m1.py`](scripts/verify_m1.py) 的 `hygiene` 门禁自动扫描并阻断 `opflow`、`op_formulas`、`prediction.piecewise`、`prediction.subgraphs` 等旁路模块及导入。 |
-| **红线 2** | **零静默回退与严禁 `ResourceEnvelope` `1.0x` 峰值除法兜底**<br/>默认矩阵路径统一采用 `SteadyMatmul`；严禁使用 `ResourceEnvelope`，也严禁把整个算子的 `context.work` 塞入单个未分相的聚合 `Stage` 变相伪装包络；未知算子或未建模结构必须显式报错，绝不静默放行零工作量（仅显式声明的控制同步族 `CONTROL_FAMILIES` 允许空载荷）。 | [`mindie_sim/prediction/program.py`](mindie_sim/prediction/program.py) 中 `ResourceEnvelope.lower()` 直接抛出 `ModelingError("resource_envelope_banned")`；所有公开计时入口通过 [`unmodeled_gate.py`](mindie_sim/prediction/unmodeled_gate.py) 统一抛出携带 `mindie-unmodeled-structure-hint/1` 的 `UnmodeledCapabilityError`。 |
+| **红线 2** | **零静默回退与严禁 `ResourceEnvelope` `1.0x` 峰值除法兜底**<br/>默认矩阵路径统一采用 `SteadyMatmul`；严禁使用 `ResourceEnvelope`，也严禁把整个算子的 `context.work` 塞入单个未分相的聚合 `Stage` 变相伪装包络；未知算子或未建模结构必须显式报错，绝不静默放行零工作量（仅显式声明的控制同步族 `CONTROL_FAMILIES` 允许空载荷）。 | [`mindie_sim/prediction/program/`](mindie_sim/prediction/program/) 中 `ResourceEnvelope.lower()` 直接抛出 `ModelingError("resource_envelope_banned")`；所有公开计时入口通过 [`unmodeled_gate.py`](mindie_sim/prediction/unmodeled_gate.py) 统一抛出携带 `mindie-unmodeled-structure-hint/1` 的 `UnmodeledCapabilityError`。 |
 | **红线 3** | **100% 结构与张量属性泛化（零 `model_id` 绑定、零 LUT 与零残差乘子）**<br/>算子选择（`implementation_selection`）、融合 pass 与 `PhysicalRecipe` **严禁按 `model_id` / 模型名分支绑定**（`model_scopes` 仅允许区分 `target` / `draft` 子图作用域），必须仅依据层结构类型、缓存连续性、量化精度与硬件 `Geometry` 泛化触发，确保同构新模型零代码继承校准结果；严禁按 `(model_name, M, N, K)` 硬编码耗时查表、反向拟合 `step/body/e2e` 窗口或虚构经验折损乘子。 | [`mindie_sim/observations/service_fitting.py`](mindie_sim/observations/service_fitting.py) 硬性拒绝 `step` / `body` / `serving` / `e2e` 窗口及 `target_ms` / `residual_ms` 字段；[`scripts/verify_m2.py`](scripts/verify_m2.py) 审计全量目录模型零包络命中。 |
 | **红线 4** | **严禁容器镜像 SHA 分发与私有开发机/内网路径泄漏**<br/>源码与配置中严禁出现宿主机个人家目录绝对路径（如 macOS/Linux `$HOME/...` 本地绝对路径）、实验室内网 IP 或按容器镜像 Digest（`docker.io/`、`swr.cn-`、`@sha256:`）做分支路由。 | [`scripts/verify_m1.py`](scripts/verify_m1.py) 自动扫描阻断；源码溯源统一使用 `{repository, revision, relative_path, source_sha256}`，抓包引用统一使用 `capture://<capture-id>/<member>`。 |
 | **红线 5** | **`buffer_units.l2 = 1` 共享 L2 容量归属不变量**<br/>只要在 `device.buffers` 中声明了 `"l2"` 容量，`device.buffer_units.l2` **必须且只能等于 `1`**（每颗物理 Die 共享唯一 L2 池，绝不能按 AIC/AIV 核数倍乘）。 | [`mindie_sim/schema/hardware.py`](mindie_sim/schema/hardware.py) 在解析硬件声明时强校验：若 `buffer_units.l2 != 1` 直接抛出 `ModelingError("shared_l2_buffer_requires_one_die_owner")`。 |
@@ -390,7 +390,7 @@ def build(op, geometry: Geometry) -> OperatorPlan:
 `mindie-sim` **绝不将 Attention 锁死在 CANN 内置的 `IFA` / `FIA` 上**。面对自研 AscendC 算子、Triton-Ascend 内核、TileLang 算子或 ATB / XLLM / SGLang 中的 FlashMLA / 块稀疏 / 混合窗口变体，请按变更深度由轻到重选择以下 **三级渐进扩展路径（Tiers 1–3）**：
 
 #### Tier 1 — 参数化复用（仅分块 / 页大小 / Split-K 不同，核内流水拓扑不变）
-如果自定义内核仍遵循标准的 `Q 加载 -> KV 重填 -> QK Cube -> Online Softmax -> PV Cube -> 归一化写回` 流水，仅调整了 `(B_q, B_k)` 分块大小、KV 页块粒度或双缓冲槽位数，**无需编写任何 Python 代码**，直接在 Profile 的 `physical_mechanisms.attention` 或 `Case` 的 `runtime` 中覆写参数即可（[`mindie_sim/prediction/program.py`](mindie_sim/prediction/program.py) 中调用方显式 `recipes` 拥有最高选择优先级，其余自动回落至 [`mindie_sim/prediction/attention_pipeline.py`](mindie_sim/prediction/attention_pipeline.py) 的 `Class A` `TiledFlashAndPagedAttentionRecipe`）：
+如果自定义内核仍遵循标准的 `Q 加载 -> KV 重填 -> QK Cube -> Online Softmax -> PV Cube -> 归一化写回` 流水，仅调整了 `(B_q, B_k)` 分块大小、KV 页块粒度或双缓冲槽位数，**无需编写任何 Python 代码**，直接在 Profile 的 `physical_mechanisms.attention` 或 `Case` 的 `runtime` 中覆写参数即可（[`mindie_sim/prediction/program/`](mindie_sim/prediction/program/) 中调用方显式 `recipes` 拥有最高选择优先级，其余自动回落至 [`mindie_sim/prediction/attention_pipeline.py`](mindie_sim/prediction/attention_pipeline.py) 的 `Class A` `TiledFlashAndPagedAttentionRecipe`）：
 
 ```json
 {
@@ -418,7 +418,7 @@ def build(op, geometry: Geometry) -> OperatorPlan:
 #### Tier 2 — 自定义核内流水配方（Custom AscendC / Triton-Ascend 核间乒乓、自定义 Quant / Mask / Workspace）
 当自定义内核改变了核内阶段依赖、在线反量化或核间 Workspace 交互（例如在 A2 / A3 `DAV_2201` 上由 AIC 计算 `QK` 后经共享 L2 / GM 向 AIV 传递分数块 `S`，AIV 完成 Online-Softmax 后写回概率块 `P` 供 AIC 执行 `PV`；或在 A5 `DAV_3510` 上经 `l0c->ub` 直连传递）时：
 1. 在 `mindie_sim/prediction/operators/<custom_attn>.py` 编写独立的 `build(op, geometry) -> OperatorPlan` 并封装为 `PlannedRecipe(build)`；
-2. 在 [`mindie_sim/prediction/implementations.py`](mindie_sim/prediction/implementations.py)（通过 `case.runtime.kernels.lowerings` 选择）或 [`mindie_sim/prediction/physical_recipe_registry.py`](mindie_sim/prediction/physical_recipe_registry.py) / [`mindie_sim/prediction/program.py`](mindie_sim/prediction/program.py) 中注册 `(phase, "attention", "<custom_recipe>")`。
+2. 在 [`mindie_sim/prediction/implementations.py`](mindie_sim/prediction/implementations.py)（通过 `case.runtime.kernels.lowerings` 选择）或 [`mindie_sim/prediction/physical_recipe_registry.py`](mindie_sim/prediction/physical_recipe_registry.py) / [`mindie_sim/prediction/program/`](mindie_sim/prediction/program/) 中注册 `(phase, "attention", "<custom_recipe>")`。
 
 下面给出 **100% 通过 `check_no_magic_numbers.py` 门禁**且直接从 `geometry.buffers` 读取当前芯片 SRAM 上限（在 A2/A3 上自动执行 `L1 <= 512 KiB, L0C <= 128 KiB, UB <= 192 KiB`，在 A5 上自动放宽至 `L0C <= 256 KiB, UB <= 248 KiB`）的自定义 Attention 核间乒乓配方样板，同时精确区分 **L2 驻留的核间 Score/Prob 乒乓流量** 与 **冷 HBM KV 读取流量**：
 

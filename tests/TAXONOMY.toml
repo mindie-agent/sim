@@ -21,7 +21,15 @@ owns = ["mindie_sim/backends/ascend.py", "mindie_sim/schema/hardware.py", "mindi
 [[module]]
 path = "schema/test_catalog_and_parallel_axes.py"
 tier = "tier0"
-owns = ["mindie_sim/catalog", "mindie_sim/schema/parallel.py"]
+owns = [
+  "mindie_sim/catalog",
+  "mindie_sim/schema/parallel.py",
+  "mindie_sim/prediction/local_tp_groups.py",
+  "tools/export_subgraph_bench_plan.py",
+  "tools/bench_plan_builders.py",
+  "tools/bench_plan_parallel.py",
+  "tools/bench_packets.py",
+]
 
 [[module]]
 path = "schema/test_hf_config_adapters.py"
@@ -77,7 +85,16 @@ owns = ["mindie_sim/prediction/engine_periodic.py"]
 [[module]]
 path = "runtime/test_engine_memory_and_pipeline.py"
 tier = "tier0"
-# three byte ledgers, hbm_bus alpha_rw, L2 knee, RingBuffer, TileSolver, WaveRecorder (s2-engine)
+owns = [
+  "mindie_sim/prediction/program",
+  "mindie_sim/prediction/runtime/memory_physics.py",
+  "mindie_sim/prediction/runtime/l2_residency.py",
+  "mindie_sim/prediction/runtime/prepared_terms.py",
+  "mindie_sim/prediction/runtime/ring_buffer.py",
+  "mindie_sim/prediction/runtime/tile_solver.py",
+  "mindie_sim/prediction/runtime/wave_recorder.py",
+  "mindie_sim/prediction/runtime/accel_terms.py",
+]
 
 [[module]]
 path = "runtime/test_indexed_pipeline_templates.py"
@@ -109,13 +126,26 @@ reserved = true
 [[module]]
 path = "runtime/test_formal_lean_locks.py"
 tier = "tier0"
-# six Lean 4 correspondence locks (s2-catalog)
+owns = [
+  "formal/MindIESimSpec",
+  "formal/AxiomCheck.lean",
+  "mindie_sim/prediction/exposed_breakdown.py",
+  "mindie_sim/prediction/weight_prefetch.py",
+  "mindie_sim/prediction/local_projection_tp.py",
+  "mindie_sim/prediction/recover_ssm_work.py",
+  "mindie_sim/prediction/collective_startup.py",
+  "mindie_sim/prediction/roofline_graph.py",
+]
 
 # ---------------------------------------------------------------- collectives
 [[module]]
 path = "collectives/test_topology_and_ports.py"
 tier = "tier0"
-# SIO / HCCS / HCCS_SW / RoCE / Host-HCCS, port cosets (s2-exec)
+owns = [
+  "mindie_sim/prediction/collectives",
+  "mindie_sim/schema/hardware_links.py",
+  "mindie_sim/backends/ascend_channels.py",
+]
 
 [[module]]
 path = "collectives/test_collective_startup_and_bands.py"
@@ -268,7 +298,11 @@ owns = ["mindie_sim/prediction/streams.py"]
 [[module]]
 path = "spine/test_stars_and_eager_d2h.py"
 tier = "tier0"
-# ACLGraph + STARS queue, SQ/CQ, Eager D2H split barrier (s2-exec)
+owns = [
+  "mindie_sim/prediction/execution",
+  "mindie_sim/prediction/serving_io.py",
+  "mindie_sim/schema/datapath.py",
+]
 
 [[module]]
 path = "spine/test_prediction_spine.py"
@@ -325,7 +359,11 @@ reserved = true
 [[module]]
 path = "observations/test_multilevel_gate.py"
 tier = "tier0"
-# independent L1/L2/L3 gate (s2-exec)
+owns = [
+  "mindie_sim/observations/multilevel_gate.py",
+  "mindie_sim/observations/multilevel_stream.py",
+  "scripts/diagnose_tail_cluster.py",
+]
 
 [[module]]
 path = "observations/test_capture_ingestion.py"

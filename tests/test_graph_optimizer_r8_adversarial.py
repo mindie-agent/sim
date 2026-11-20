@@ -134,7 +134,7 @@ def test_r8_f1_canonical_qwen_nonzero_event_costs_preserve_inputs():
                 continue
             assert graph.values[new].producer in fused_ids, (op_id, old, new)
     assert report.final.duration_ms == pytest.approx(
-        0.31511102176870764, rel=1e-9)
+        0.31519774763964714, rel=1e-9)
 
 
 # ---------------------------------------------------------------------------

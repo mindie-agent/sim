@@ -259,19 +259,21 @@ def test_parallel_world_size_five_axes_expert_tp_and_rank_table_contracts() -> N
     # Expert-TP groups under TP=2, PCP=2, EP=4 emit four singletons with zero empty tuples.
     pcp_ep_case = parse_case(compose_case("deepseek-v2-lite", "Ascend910_9362", tp=2, pcp=2, ep=4, layers=2))
     pcp_ep_topo = Topology(pcp_ep_case.machine, pcp_ep_case.runtime.parallel)
-    assert expert_tp_groups(pcp_ep_topo, replica=0, stage=0) == ((0,), (1,), (2,), (3,))
+    assert pcp_ep_topo.groups("etp", 0, 0) == expert_tp_groups(pcp_ep_topo, replica=0, stage=0) == ((0,), (1,), (2,), (3,))
     assert resolve_collective_cosets(pcp_ep_topo, {"group_axis": "etp"}, stage=0) == [[0], [1], [2], [3]]
     assert collective_requires_cohort(SimpleNamespace(stage=0, metadata=(("group_axis", "etp"),)), pcp_ep_topo) is False
 
     # Non-trivial etp=2 with TP=4, PCP=2, EP=2 yields strided pairs ((0,2),(1,3),(4,6),(5,7)).
     etp2_case = parse_case(compose_case("deepseek-v2-lite", "Ascend910_9362", tp=4, pcp=2, ep=2, layers=2))
-    assert expert_tp_groups(Topology(etp2_case.machine, etp2_case.runtime.parallel), replica=0, stage=0) == (
+    etp2_topo = Topology(etp2_case.machine, etp2_case.runtime.parallel)
+    assert etp2_topo.groups("etp", 0, 0) == expert_tp_groups(etp2_topo, replica=0, stage=0) == (
         (0, 2), (1, 3), (4, 6), (5, 7),
     )
     # Explicit EP rank_table [[0,2],[1,3]] under TP=4 groups equal EP positions -> ((0,1),(2,3)).
     etp_tbl_case = parse_case(compose_case("deepseek-v2-lite", "Ascend910_9362", tp=4, dp=1, ep=2, layers=2))
     etp_tbl_par = ParallelSpec(tp=4, dp=1, ep=2, rank_table=((0, 2), (1, 3)))
-    assert expert_tp_groups(Topology(etp_tbl_case.machine, etp_tbl_par), replica=0, stage=0) == ((0, 1), (2, 3))
+    etp_tbl_topo = Topology(etp_tbl_case.machine, etp_tbl_par)
+    assert etp_tbl_topo.groups("etp", 0, 0) == expert_tp_groups(etp_tbl_topo, replica=0, stage=0) == ((0, 1), (2, 3))
     # External-DP local-TP builds groups independently inside each external replica -> ((0,1),(2,3)).
     ext_ltp_case = parse_case(compose_case("qwen3-32b", "Ascend910_9362", tp=1, dp=2, ep=1, num_devices=4, layers=1))
     ext_ltp_par = ParallelSpec(external_dp=2, dp=2, tp=1, ep=1, o_proj_tp=2)

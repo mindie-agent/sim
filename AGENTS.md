@@ -47,12 +47,12 @@ cd ../.worktrees/sim-<topic>
 ## 3. Verification Commands
 
 ```bash
-# 1. Hygiene, 37-model independent catalog conservation, LF & differential literal gates
+# 1. Hygiene, 39-model independent catalog conservation, LF & differential literal gates
 python3 .github/scripts/check_lf_eol.py
 python3 -B scripts/check_no_magic_numbers.py --base origin/main --root .
 python3 -B scripts/check_test_orthogonality.py --root . --base origin/main   # tests/<domain>/ per tests/TAXONOMY.toml
 python3 -B scripts/verify_m1.py hygiene
-python3 -B scripts/verify_m1.py catalog-meta --require-models 37
+python3 -B scripts/verify_m1.py catalog-meta --require-models 39
 
 # 2. Prebuild C accelerator & run maintained non-live-NPU test suite
 python3 -B -c "import mindie_sim.prediction.runtime.accel_build as b; b.build_accel()"

@@ -562,12 +562,9 @@ class Topology(_TopologyPlansMixin):
                 for idx in range(len(sources))
             )
         if axis == "etp":
-            etp = max(1, int(p.etp))
-            if p.ep_spans_dp or etp <= 1:
-                return tuple((rank,) for rank in sources)
-            stride = max(1, p.tp // etp)
-            return tuple(sources[base + i:base + p.tp:stride]
-                         for base in range(0, len(sources), p.tp) for i in range(stride))
+            from ..local_tp_groups import expert_tp_groups
+
+            return expert_tp_groups(self, replica=replica, stage=stage)
         if axis == "pcp":
             return tuple(sources[i::p.tp] for i in range(p.tp))
         if axis == "ep":

@@ -142,7 +142,7 @@ jobs:
           MINDIE_CACHE_HOME: ${{ runner.temp }}/mindie-sim-cache
         run: |
           uv run --no-project python -B scripts/verify_m1.py hygiene
-          uv run --no-project python -B scripts/verify_m1.py catalog-meta --require-models 37
+          uv run --no-project python -B scripts/verify_m1.py catalog-meta --require-models 39
 
   wheel:
     needs: [quality]

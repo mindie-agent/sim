@@ -8,10 +8,9 @@
   the exact-builtin eligibility rule declines every weakrefable/mutable payload
   and ``"occurrence"``; coupled placements must be proportional; ``MAX_R/U``
   ceilings and raw ABI preflights reject malformed input before mutation.
-[Invariants] The Python backend is the oracle in every comparison.  Two known
-  coupled parity defects are pinned as strict xfails: accumulation drift >8 ULP
-  (``_engine_accel_rates.h:471``) and disjoint-coupled + overlapping-uncoupled
-  solver dispatch mismatch (``arbiter.py:198``).
+[Invariants] The Python backend is the oracle in every comparison.  All
+  coupled multi-resource and disjoint-coupled + overlapping-uncoupled
+  witnesses run natively on C11 and pass strictly within their ULP targets.
 [Timeouts & Locks] No sleeps; one bounded thread pool; the compiled library
   comes from the session build memo.
 [Side-Effect Policy] In-memory only; no subprocesses, no file writes.
@@ -46,10 +45,6 @@ ULP_BOUND = 8
 INF = float("inf")
 
 
-class _ParityGapError(AssertionError):
-    """Raised only after native execution completes cleanly yet exceeds ULP target."""
-
-
 # -- seeded random programs & standard graphs -------------------------------
 @pytest.mark.parametrize("sku", SKUS)
 @pytest.mark.parametrize("seed", (0, 1))
@@ -78,13 +73,9 @@ def test_coupled_random_programs_match_python_on_the_native_path(sku, seed):
             {"work": {"a": 6.694301119164283, "b": 5.5353786183562095}, "coupled": True},
             {"work": {"a": 8.483307144965345, "b": 7.87160639063931}, "coupled": True},
         ]), 0, id="coupled-3task-bit-exact",
-        marks=pytest.mark.xfail(strict=True, raises=_ParityGapError, reason=(
-            "coupled 3-task 2-ULP order drift: mindie_sim/prediction/runtime/_engine_accel_rates.h:471")),
     ),
     pytest.param(
         lambda: random_program(2, REPRESENTATIVE_SKUS["a5"], size=96), ULP_BOUND, id="coupled-96task-8ulp",
-        marks=pytest.mark.xfail(strict=True, raises=_ParityGapError, reason=(
-            "coupled 96-task >8-ULP accumulation drift: mindie_sim/prediction/runtime/_engine_accel_rates.h:471")),
     ),
     pytest.param(
         lambda: ([Resource("cube", 245.76, units=20), Resource("vector", 1.92, units=40)], [
@@ -94,8 +85,6 @@ def test_coupled_random_programs_match_python_on_the_native_path(sku, seed):
             {"work": {"cube": 500.0, "vector": 100.0}, "coupled": True,
              "placement": {"cube": (3, 4), "vector": (6, 7, 8, 9)}},
         ]), ULP_BOUND, id="disjoint-coupled-solver",
-        marks=pytest.mark.xfail(strict=True, raises=_ParityGapError, reason=(
-            "disjoint coupled + overlapping uncoupled solver mismatch: mindie_sim/prediction/runtime/arbiter.py:198")),
     ),
 ))
 def test_coupled_parity_gap_witnesses_run_natively_and_track_ulp_targets(build, target_ulps):
@@ -103,9 +92,7 @@ def test_coupled_parity_gap_witnesses_run_natively_and_track_ulp_targets(build, 
     python, native = (run_program(resources, tasks, b) for b in ("python", "c"))
     assert native["steps"] > 0 and native["reason"] is None
     assert native["completed"] == python["completed"] == len(tasks)
-    observed = max_ulps(python, native)
-    if observed > target_ulps:
-        raise _ParityGapError(f"observed {observed} ULP > target {target_ulps}")
+    assert max_ulps(python, native) <= target_ulps
 
 
 @pytest.mark.parametrize("sku", SKUS)
