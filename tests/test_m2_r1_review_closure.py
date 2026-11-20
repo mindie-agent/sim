@@ -416,38 +416,22 @@ def test_locked_sweep_reuses_one_plan_or_rejects_unsupported_comparison():
 
 
 # --------------------------------------------------------------------------- #
-# [P1 #14] enable_dbo builds two real microbatch partitions.
+# [P1 #14] Framework layer never performs whole-graph DBO microbatch splitting.
 # --------------------------------------------------------------------------- #
 def test_enable_dbo_builds_two_distinct_microbatch_partitions():
     case = parse_case(compose_case(
         "qwen3-30b-a3b", hardware="a5", tp=8, ep=8, num_devices=8,
         ranks_per_node=8, prompt_tokens=64, output_tokens=2, concurrency=16))
     case = replace(case, runtime=replace(case.runtime, enable_dbo=True))
-    under_budget = Frontend()(
-        IterationPlan((RequestView("u0", 1, 32, True, "decode"),
-                       RequestView("u1", 1, 32, True, "decode"))),
-        case.model, case.runtime, case.machine)
-    assert not any("dbo_microbatch" in dict(op.metadata) for op in under_budget.ops)
     views = tuple(RequestView(f"r{idx}", 1, 32, True, "decode") for idx in range(16))
     work = Frontend()(IterationPlan(views), case.model, case.runtime,
                       case.machine)
-    partitions = {}
-    for op in work.ops:
-        metadata = dict(op.metadata)
-        if "dbo_microbatch" in metadata:
-            partitions.setdefault(metadata["dbo_microbatch"], []).append(op)
-    assert set(partitions) == {0, 1}
+    assert not any("dbo_microbatch" in dict(op.metadata) for op in work.ops)
+    assert not any(op.op_id.startswith("dbo") for op in work.ops)
     ids = [op.op_id for op in work.ops]
     assert len(ids) == len(set(ids))
     streams = {op.stream for op in work.ops if op.stream}
-    assert "dbo0:compute" in streams and "dbo1:compute" in streams
-    assert "dbo0:comm" in streams and "dbo1:comm" in streams
-    by_id = {op.op_id: op for op in work.ops}
-    cross = [op for op in partitions[1]
-             if any(dep in by_id
-                    and dict(by_id[dep].metadata).get("dbo_microbatch") == 0
-                    for dep in op.deps)]
-    assert cross
+    assert not any(stream.startswith("dbo") for stream in streams)
 
 
 # --------------------------------------------------------------------------- #

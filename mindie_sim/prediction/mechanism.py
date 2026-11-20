@@ -13,6 +13,8 @@ from dataclasses import dataclass, field, replace
 import math
 from typing import Callable, Mapping
 
+from mindie_sim.schema.compute_arch import ComputeArchSpec
+from mindie_sim.schema.datapath import DatapathCapabilitySpec, datapath_for_devices
 from mindie_sim.schema.operators import OpSpec
 from .program import KernelProgram, Program, RecipeContext, Stage
 
@@ -71,11 +73,14 @@ class Geometry:
     #: physical supply; these are source hardware facts, not observations.
     rates: Mapping[str, float] = field(default_factory=dict)
     compute_peaks: Mapping[str, float] = field(default_factory=dict)
+    compute_arch: ComputeArchSpec | None = None
+    datapath: DatapathCapabilitySpec | None = None
 
     @classmethod
     def from_devices(cls, devices):
         """Use the same representative-shard ownership in export and execution."""
         first = devices[0]
+        compute_arch, datapath = datapath_for_devices(devices)
         roles = dict(first.rates).keys() | {"cube", "host"}
         modes = dict(first.service_modes)
         pools = dict(first.buffers)
@@ -88,6 +93,8 @@ class Geometry:
             first.physical_mechanisms,
             dict(first.rates),
             dict(first.compute_peaks),
+            compute_arch,
+            datapath,
         )
 
 
@@ -100,6 +107,17 @@ class OperatorPlan:
     #: common Execution launches it through launch_native_cohort instead of
     #: wrapping it in a synthetic KernelProgram stage.
     native: bool = False
+    #: Structured pipeline specification attached before Engine lowering (never
+    #: placed inside C11 Stage metadata).
+    pipeline_spec: object = None
+    #: Optional physical service context binder applied before work binding.
+    context_binder: Callable[[RecipeContext], RecipeContext] | None = None
+    traffic_rewrite_capable: bool = False
+
+    def bind_context(self, context: RecipeContext) -> RecipeContext:
+        if self.context_binder is not None:
+            return self.context_binder(context)
+        return context
 
     def lower(self, context: RecipeContext) -> Program:
         if self.native:
@@ -120,6 +138,7 @@ class PlannedRecipe:
 
     build: Callable[[OpSpec, Geometry], OperatorPlan]
     kernels: Callable[[OpSpec], tuple[OpSpec, ...]] | None = None
+    traffic_rewrite_capable: bool = False
 
     def prepare(self, op: OpSpec, geometry: Geometry):
         plan = self.build(op, geometry)

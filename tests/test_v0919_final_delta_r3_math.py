@@ -17,7 +17,7 @@ import test_wave4b_indexer_conv1d_calibration as b
 from mindie_sim.catalog.mqsmla_layout import packed_row_parts
 from mindie_sim.prediction import family_mqsmla, index_pool_native, latent_dcp, mqsmla
 from mindie_sim.prediction.batch_prefix_attention import nested_prefix_union
-from mindie_sim.prediction.dbo_ledger import _capacities
+from mindie_sim.prediction.rank_ledger import rank_ledger_for
 from mindie_sim.prediction.index_pool import native_shard_sizes
 from mindie_sim.prediction.lowering import Builder
 from mindie_sim.prediction.pd_ranges import transfers_for_runs
@@ -35,22 +35,17 @@ def test_dbo_matches_unsplit_physical_assignments(dp, ep, pcp):
     def graph():
         return prior.target_graphs(prior.parse_case(raw), phase="prefill",
                                    tokens=8, context=0, sequences=2, scope="body")
-    split = graph()
+    with_dbo = graph()
     raw["runtime"]["enable_dbo"] = False
     whole = graph()
-    for replica, ops in split.items():
+    for replica, ops in with_dbo.items():
+        assert not [op for op in ops if op.op_id.startswith("dbo")]
         packs = [op.local_shape[0] * op.local_shape[1] for op in ops if op.recipe == "route_pack"]
         gates = [op.local_shape[0] for op in ops if op.recipe == "grouped_gate_up"]
         unpack = [op.local_shape[0] * op.local_shape[1] for op in ops if op.recipe == "route_unpack"]
-        assert packs == gates == unpack == [32, 32]
+        assert packs == gates == unpack == [64]
         assert sum(gates) == sum(op.local_shape[0] for op in whole[replica]
                                  if op.recipe == "grouped_gate_up")
-
-
-def test_capture_capacity_is_distributed_once():
-    assert _capacities([2, 1], 8, 2) == [2, 6]
-    assert _capacities([1, 1], 2, 2) == ()
-    assert _capacities([5, 3], 8, 1) == [5, 3]
 
 
 def test_two_receivers_read_one_named_source_extent():
@@ -218,25 +213,23 @@ def test_rank_table_membership_can_cross_pcp_inside_each_dp_replica():
     assert Topology(case.machine, case.runtime.parallel).groups("ep", 3, 0) == ((7, 6),)
     g = prior.target_graphs(case, phase="prefill", tokens=8, context=0, sequences=2,
                             selected_replica=3, physical_rank=7, scope="body")
-    assert [op.local_shape[0] for op in g[3] if op.recipe == "grouped_gate_up"] == [32, 32]
+    assert [op.local_shape[0] for op in g[3] if op.recipe == "grouped_gate_up"] == [64]
 
 
 def test_real_sp_bucket_preserves_every_rank_and_valid_row():
     import json
-    from mindie_sim.prediction.dbo_ledger import plan
     from mindie_sim.prediction.frontend import Frontend
     raw = json.loads((prior.ROOT / "examples/cases/kimi-k3-a5-sp-right-pad-conditional.json").read_text())
     case = prior.parse_case(raw)
     counts = (10, 12, 14, 16)
     peers = {d: tuple(RequestView(f"{d}-{i}", 1, 128, False, "decode")
                       for i in range(n)) for d, n in enumerate(counts)}
-    chunks = plan(Frontend(), case.model, case.runtime, peers[0], 16,
-                  peers, 0, case.machine, 0, 2)
-    assert [chunk.capacity for chunk in chunks] == [8, 8]
-    for part in chunks:
-        assert part.allocated == (1,) * 32 and part.physical == 32
-        assert part.valid == tuple(int(i < n // 2) for n in counts for i in range(8))
-    assert sum(map(lambda x: sum(x.valid), chunks)) == sum(counts)
+    ledger = rank_ledger_for(Frontend(), case.model, case.runtime, peers[0], 16,
+                             peers, 0, case.machine, 0)
+    assert ledger is not None
+    assert ledger.capacity == 16
+    assert ledger.allocated == (2,) * 32 and ledger.physical == 64
+    assert sum(ledger.valid) == sum(counts)
 
 
 def test_forced_mask_marginals_match_inverse_and_expert_banks():
@@ -265,7 +258,6 @@ def test_native_small_batch_has_no_gather_and_override_is_explicit():
 
 @pytest.mark.parametrize("groups", [((0, 2), (1, 3)), ((3, 0), (2, 1)), ((1, 0), (3, 2))])
 def test_sp_source_is_the_tp_coordinate_even_if_ep_groups_cross_dp(groups):
-    from mindie_sim.prediction.dbo_ledger import plan
     p = SimpleNamespace(tp=2, dp=2, pcp=1, pp=1, ep=2, rank_table=groups,
                         pcp_lane_policy="parked")
     runtime = SimpleNamespace(parallel=p, routing={}, kernels={"sequence_parallel": {"padding": "right_to_tp"}})
@@ -275,10 +267,10 @@ def test_sp_source_is_the_tp_coordinate_even_if_ep_groups_cross_dp(groups):
     for group in groups:
         rank = group[0]
         d = rank // 2
-        chunks = plan(frontend, None, runtime, peers[d], len(peers[d]), peers, d, None, rank, 2)
-        expected = tuple((1, 2)[r // 2] for r in group)
-        assert len(chunks) == 2
-        assert all(x.valid == x.allocated == expected and x.physical == sum(expected) for x in chunks)
+        ledger = rank_ledger_for(frontend, None, runtime, peers[d], len(peers[d]), peers, d, None, rank)
+        expected = tuple((2, 4)[r // 2] for r in group)
+        assert ledger is not None
+        assert ledger.valid == ledger.allocated == expected and ledger.physical == sum(expected)
 
 
 

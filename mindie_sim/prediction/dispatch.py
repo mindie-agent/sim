@@ -58,7 +58,7 @@ def cohorts(parallel, machine=None):
     if machine is not None:
         from .local_tp_groups import local_tp_replica_cohorts, local_tp_spans_dp
         if local_tp_spans_dp(parallel):
-            from .dbo_ledger import replica_cohorts
+            from .rank_ledger import replica_cohorts
             return replica_cohorts(machine, parallel, list(local_tp_replica_cohorts(machine, parallel)))
     width = ONE if parallel.rank_table is not None else parallel.ep_dp_width
     if int(parallel.tp) == ONE:
@@ -71,7 +71,7 @@ def cohorts(parallel, machine=None):
                 combined = math.lcm(width, candidate)
                 if int(parallel.dp) % combined == ZERO:
                     width = combined
-    from .dbo_ledger import replica_cohorts
+    from .rank_ledger import replica_cohorts
     groups = [tuple(range(first, first + width)) for first in range(ZERO, parallel.dp, width)]
     return replica_cohorts(machine, parallel, groups)
 

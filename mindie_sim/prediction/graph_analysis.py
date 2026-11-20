@@ -231,7 +231,7 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
                 input_ready_ms=ZERO, include_submission=False, replay_scope=None,
                 isolated=True, trace_limit=ZERO, compact=False,
                 audit_allocations=False, evaluation=None,
-                fast_span_only=False):
+                fast_span_only=False, stream_plans=None):
     """Run a declared DAG or replica->DAG mapping without a request scheduler.
 
     External input keys are operator dependency names and values are absolute
@@ -321,7 +321,8 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
                           ledger=CostLedger(), include_submission=include_submission,
                           on_operator=None if fast_span_only else observe,
                           trace_limit=trace_limit, evaluation=ctx,
-                          accel_eager_attach=op_count >= EAGER_GRAPH_MIN_OPS)
+                          accel_eager_attach=op_count >= EAGER_GRAPH_MIN_OPS,
+                          stream_plans=stream_plans)
     # Physical-work coalescing is exact; only an explicit legacy diagnostic run
     # keeps the uncoalesced per-tile shape.
     execution._compact_step = not execution.legacy_diagnostics

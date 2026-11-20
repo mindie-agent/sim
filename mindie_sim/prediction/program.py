@@ -1318,6 +1318,40 @@ class RecipeContext:
     transport_identity: Mapping | None = None
     #: Immutable typed physical declaration selected for this device cohort.
     physical_mechanisms: object = None
+    #: Homogeneity-checked ComputeArchSpec and derived DatapathCapabilitySpec.
+    compute_arch: object = None
+    datapath: object = None
+    #: Bound per-stream core-control owners (AIC/AIV slice and effective limits).
+    stream_owners: object = None
+
+    @property
+    def effective_aic_cores(self) -> int:
+        """Effective AIC core limit for this operator's stream (``控核``)."""
+        if self.stream_owners is not None:
+            return int(self.stream_owners.aic_limit)
+        if self.datapath is not None:
+            return int(self.datapath.aic_count)
+        return int(self.core_count)
+
+    @property
+    def effective_aiv_cores(self) -> int:
+        """Effective AIV core limit for this operator's stream (``控核``)."""
+        if self.stream_owners is not None:
+            return int(self.stream_owners.aiv_limit)
+        if self.datapath is not None:
+            return int(self.datapath.aiv_count)
+        return int(self.resource_units.get("vector", self.core_count))
+
+    def wave_count(self, tiles: int, *, kind: str = "aic") -> int:
+        """Return ``ceil(tiles / active_cores)`` under this stream's core budget."""
+        if tiles <= 0:
+            return 0
+        active = (
+            self.effective_aic_cores if kind == "aic" else self.effective_aiv_cores
+        )
+        if active <= 0:
+            raise ModelingError(f"stream_zero_{kind}_budget:wave_count")
+        return (int(tiles) + active - 1) // active
 
     def __post_init__(self):
         # T04 historically folded the typed option into service_identity.  Keep
@@ -1359,7 +1393,13 @@ class RecipeContext:
         )
 
     def physical_role(self, role):
-        return self.service_modes[role][0] if role in self.service_modes else role
+        entry = self.service_modes.get(role)
+        return entry[0] if entry is not None else role
+
+    def service_rate(self, role: str) -> float | None:
+        """Return the declared physical service rate for a named service mode."""
+        entry = self.service_modes.get(role)
+        return None if entry is None else float(entry[1])
 
     def placement(self, role, units):
         return {self.resource_names[self.physical_role(role)]: tuple(units)}
@@ -1416,18 +1456,19 @@ class RecipeContext:
         for dtype, flops in work.matrix.items():
             if not flops:
                 continue
-            if dtype not in self.compute_peaks:
+            peak = self.compute_peaks.get(dtype)
+            if peak is None:
                 raise ModelingError(f"compute_precision_rate_required:{dtype}")
             name = self.resource_names["cube"]
-            demand[name] = demand.get(name, 0) + 1000 * flops / self.compute_peaks[dtype]
+            demand[name] = demand.get(name, 0) + 1000 * flops / peak
         matrix_consumer = any(float(value) > 0.0
                               for value in work.matrix.values())
         for role, amount in work.resources.items():
             if not amount:
                 continue
-            if role in self.service_modes:
-                resource = self.physical_role(role)
-                rate = self.service_modes[role][1]
+            mode_entry = self.service_modes.get(role)
+            if mode_entry is not None:
+                resource, rate = mode_entry
                 name = self.resource_names[resource]
                 # Modes retain physical byte counts. Only service is expressed
                 # in the base pipe's units so its different instructions contend.
@@ -1508,9 +1549,11 @@ class RecipeBook:
 
     def __init__(self, recipes: Mapping[str, Recipe] | None = None,
                  *, families: Mapping[str, Recipe] | None = None, default: Recipe | None = None,
-                 programs: Mapping[str, Recipe] | None = None):
+                 programs: Mapping[str, Recipe] | None = None,
+                 family_registry: Any = None):
         from .matrix_mapping import MappedMatmul
         from .matrix_steady import SteadyMatmul
+        from .operators.registry import FamilyDispatcher, builtin_family_registry
         from .state_program import RecurrentVector
         generic_grouped = (programs or {}).get("matmul", MappedMatmul())
         self._generic_grouped = generic_grouped
@@ -1521,6 +1564,11 @@ class RecipeBook:
         from .batch_prefix_indexer import RECIPE as _batch_prefix_idx
         from .physical_recipe_registry import (physical_family_bindings,
                                                physical_recipe_bindings)
+        self._family_registry = (
+            builtin_family_registry() if family_registry is None else family_registry
+        )
+        self._family_dispatcher = FamilyDispatcher(self._family_registry)
+        self._governed_recipes: dict[str, Any] = {}
         self._explicit_recipes = frozenset((recipes or {}).keys()) | {
             "batch_prefix_attention", "batch_prefix_indexer",
         }
@@ -1552,6 +1600,57 @@ class RecipeBook:
         self._select_id_cache: dict[int, tuple[object, Recipe]] = {}
         self._expand_id_cache: dict[int, tuple[object, tuple]] = {}
         self._prev_expand: tuple | None = None
+
+    def _governed_recipe(self, spec: Any):
+        cached = self._governed_recipes.get(spec.name)
+        if cached is not None:
+            return cached
+        from mindie_sim.schema.datapath import (
+            ComputeArchIdentity,
+            DatapathCapabilitySpec,
+            GENERIC_ARCH_ID,
+        )
+        from .mechanism import PlannedRecipe
+        from .operators.contracts import OperatorPlanningContext
+        from .results import OpOccurrence
+
+        book = self
+        dispatcher = self._family_dispatcher
+
+        def _build(op, geometry):
+            datapath = getattr(geometry, "datapath", None)
+            if datapath is None:
+                res_units = dict(getattr(geometry, "resource_units", {}) or {})
+                datapath = DatapathCapabilitySpec(
+                    compute_arch=ComputeArchIdentity(
+                        arch_id=GENERIC_ARCH_ID,
+                        declared=getattr(geometry, "compute_arch", None),
+                    ),
+                    aic_count=int(getattr(geometry, "compute_units", 1) or 1),
+                    aiv_count=int(res_units.get("vector", 0)),
+                    aic_aiv_pairs=(),
+                    usable_paths=(),
+                    matrix_output_paths=frozenset({"gm"}),
+                    ub_peer_edges=(),
+                    stars=None,
+                )
+            meta = dict(op.metadata) if op.metadata else {}
+            requested_abi = meta.get("requested_abi")
+            ctx = OperatorPlanningContext(
+                occurrence=OpOccurrence(0, int(getattr(op, "stage", 0)), None, str(op.op_id)),
+                geometry=geometry,
+                datapath=datapath,
+                recipe_book=book,
+                requested_abi=str(requested_abi) if requested_abi else None,
+            )
+            resolved = dispatcher.resolve_plan(op, ctx)
+            return resolved.recipe
+
+        planned = PlannedRecipe(
+            _build, traffic_rewrite_capable=bool(spec.traffic_rewrite_capable)
+        )
+        self._governed_recipes[spec.name] = planned
+        return planned
 
     def select(self, op: object) -> Recipe:
         hit = self._select_id_cache.get(id(op))
@@ -1640,8 +1739,15 @@ class RecipeBook:
                     # rows must surface its real error, not silently fall back.
                     _mxfp4_config(op)
         else:
-            recipe = self.recipes.get(recipe_name, self.families.get(
-                op.family, self.programs.get(kind)))
+            governed = self._family_registry.match(op)
+            if governed is not None and (
+                recipe_name in governed.owned_recipe_ids
+                or recipe_name not in self.recipes
+            ):
+                recipe = self._governed_recipe(governed)
+            else:
+                recipe = self.recipes.get(recipe_name, self.families.get(
+                    op.family, self.programs.get(kind)))
         if recipe is None:
             from .physical_recipe_registry import PROJECTION_FAMILIES
             if family_name in PROJECTION_FAMILIES:
@@ -1736,7 +1842,7 @@ class RecipeBook:
         return out
 
     @classmethod
-    def from_mapping(cls, raw):
+    def from_mapping(cls, raw, *, family_registry: Any = None):
         from .implementations import recipes as implementation_recipes
         from .mc2_graph import recipes as native_moe_recipes
         from .hccl_graph import recipes as hccl_recipes
@@ -1932,7 +2038,8 @@ class RecipeBook:
                     **attn_res_recipes(),
                     **build(raw.get("recipes", {}))}
         book = cls(explicit, families=build(raw.get("families", {})),
-                   programs=build(raw.get("programs", {})))
+                   programs=build(raw.get("programs", {})),
+                   family_registry=family_registry)
         book._caller_recipes = frozenset((raw.get("recipes") or {}).keys())
         book._family_kinds = {
             name: value.get("kind") for name, value in

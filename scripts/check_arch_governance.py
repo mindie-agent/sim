@@ -1,0 +1,708 @@
+#!/usr/bin/env python3
+"""Architecture governance AST & file-layout gate (AG001..AG005) for ``mindie_sim``.
+
+[Role] Enforce governed ``mindie_sim/prediction/operators/<family>/`` package
+  boundaries, forbid flat ISA/CANN filename sprawl under ``mindie_sim/**/*.py``,
+  block direct leaf imports, block ``service_modes`` / ``compute_peaks``
+  capability sniffing, and verify upstream ABI/SHA-256 provenance on ISA leaves.
+[Invariants] ``AG001`` scans strictly ``mindie_sim/**/*.py`` so model catalog
+  JSON files (e.g. ``qwen3.5-35b-a3b.json``) are never flagged. Governed
+  ``operators/<family>/**`` modules allow zero violations in every mode.
+  Differential mode (``--base``) subtracts violations by multiset fingerprint.
+[Timeouts & Locks] Bounded local AST scans and git ls-tree/show calls; no locks
+  or network access.
+[Side-Effect Policy] Read-only; never modifies repository files or git state.
+"""
+from __future__ import annotations
+
+import argparse
+import ast
+from collections import Counter
+from collections.abc import Sequence
+from dataclasses import dataclass
+import hashlib
+from pathlib import Path, PurePosixPath
+import re
+import subprocess
+import sys
+
+SIM_PACKAGE_ROOT = "mindie_sim"
+GOVERNED_LEAF_NAMES = frozenset({"arch22.py", "arch35.py"})
+GOVERNED_LEAF_STEMS = frozenset({"arch22", "arch35"})
+AG001_STEM_RE = re.compile(
+    r"(?:arch22|arch35|cann|(?:^|_)(?:a2|a3|a5)(?:$|_))",
+    re.IGNORECASE,
+)
+UPSTREAM_ABI_RE = re.compile(r"^\s*Upstream-ABI:\s*(\S+)", re.MULTILINE)
+HEX_REVISION_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
+SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+DOCSTRING_HEADER_MAX_LINE = 30
+FINGERPRINT_HEX_LEN = 16
+PREVIEW_SHA_LEN = 12
+GOVERNED_PATH_DEPTH = 5
+FAMILY_PKG_DEPTH = 4
+OPERATORS_PARTS = ("mindie_sim", "prediction", "operators")
+SOURCE_REF_FIELDS = ("repository", "revision", "relative_path", "source_sha256")
+EXIT_OK = 0
+EXIT_VIOLATIONS = 1
+EXIT_USAGE = 2
+
+_INFRA_PREFIXES = ("mindie_sim/schema/", "mindie_sim/backends/")
+_SM_INFRA_FILES = frozenset({
+    "mindie_sim/custom_hardware.py",
+    "mindie_sim/hardware_derivation.py",
+    "mindie_sim/prediction/evaluation.py",
+    "mindie_sim/prediction/execution.py",
+    "mindie_sim/prediction/program.py",
+})
+_CP_INFRA_FILES = _SM_INFRA_FILES | frozenset({
+    "mindie_sim/structure.py",
+    "mindie_sim/prediction/cost.py",
+    "mindie_sim/prediction/efficiency.py",
+    "mindie_sim/prediction/matrix_precision.py",
+})
+
+# Explicit Stage-1 allowlist ONLY for untouched pre-Stage-3 files that Stage 3
+# will delete or migrate. NEVER add mindie_sim/prediction/operators/<family>/**.
+LEGACY_ALLOWLIST: dict[str, frozenset[str]] = {
+    "mindie_sim/feature_mechanisms_cann93.py": frozenset({"AG001"}),
+    "mindie_sim/observations/a5_comm_binding.py": frozenset({"AG001"}),
+    "mindie_sim/observations/a5_comm_calibration.py": frozenset({"AG001"}),
+    "mindie_sim/observations/a5_comm_golden.py": frozenset({"AG001"}),
+    "mindie_sim/observations/a5_comm_ingest.py": frozenset({"AG001"}),
+    "mindie_sim/prediction/attention_decode.py": frozenset({"AG003", "AG004"}),
+    "mindie_sim/prediction/attention_prefill.py": frozenset({"AG003", "AG004"}),
+    "mindie_sim/prediction/body_defaults.py": frozenset({"AG003", "AG004"}),
+    "mindie_sim/prediction/expected_grouped.py": frozenset({"AG003"}),
+    "mindie_sim/prediction/family_hc_arch35.py": frozenset({"AG001"}),
+    "mindie_sim/prediction/family_kda_recurrent_arch22.py": frozenset({"AG001"}),
+    "mindie_sim/prediction/family_paged_mla_arch22.py": frozenset({"AG001"}),
+    "mindie_sim/prediction/fusion_recipe.py": frozenset({"AG004"}),
+    "mindie_sim/prediction/gdn_chunk32.py": frozenset({"AG003"}),
+    "mindie_sim/prediction/grouped_dequant_arch35.py": frozenset({"AG001"}),
+    "mindie_sim/prediction/hc_arch35_compact.py": frozenset({"AG001"}),
+    "mindie_sim/prediction/hc_arch35_program.py": frozenset({"AG001"}),
+    "mindie_sim/prediction/hccl_alltoallv.py": frozenset({"AG003"}),
+    "mindie_sim/prediction/indexed_attention.py": frozenset({"AG003"}),
+    "mindie_sim/prediction/matrix.py": frozenset({"AG003", "AG004"}),
+    "mindie_sim/prediction/matrix_mapping.py": frozenset({"AG003", "AG004"}),
+    "mindie_sim/prediction/matrix_splitk.py": frozenset({"AG003"}),
+    "mindie_sim/prediction/matrix_steady.py": frozenset({"AG003", "AG004"}),
+    "mindie_sim/prediction/mc2_arch22.py": frozenset({"AG001"}),
+    "mindie_sim/prediction/mla_cann_epilogs.py": frozenset({"AG001"}),
+    "mindie_sim/prediction/mla_prolog_arch22.py": frozenset({"AG001"}),
+    "mindie_sim/prediction/moe_cann_fusion.py": frozenset({"AG001"}),
+    "mindie_sim/prediction/mxfp8_grouped.py": frozenset({"AG003"}),
+    "mindie_sim/prediction/operators/block_sparse_attention_arch35.py": frozenset({"AG001", "AG003"}),
+    "mindie_sim/prediction/operators/hc_gated_residual_arch35.py": frozenset({"AG001", "AG003"}),
+    "mindie_sim/prediction/operators/kda_recurrent_arch22.py": frozenset({"AG001"}),
+    "mindie_sim/prediction/operators/megamoe_arch35.py": frozenset({"AG001"}),
+    "mindie_sim/prediction/operators/mla_prolog_v4_arch35.py": frozenset({"AG001", "AG003"}),
+    "mindie_sim/prediction/operators/sparse_index_scorers_arch35.py": frozenset({"AG001", "AG003"}),
+    "mindie_sim/prediction/paged_mla_arch22.py": frozenset({"AG001"}),
+    "mindie_sim/prediction/paged_mla_arch22_dispatch.py": frozenset({"AG001"}),
+    "mindie_sim/prediction/paged_mla_arch22_matrix.py": frozenset({"AG001"}),
+    "mindie_sim/prediction/service_regimes.py": frozenset({"AG003"}),
+    "mindie_sim/prediction/sparse_indexer_pipeline.py": frozenset({"AG003"}),
+    "mindie_sim/prediction/vector_pipeline.py": frozenset({"AG003"}),
+    "mindie_sim/prediction/w4a8_matrix.py": frozenset({"AG003", "AG004"}),
+}
+
+
+@dataclass(frozen=True, slots=True)
+class Violation:
+    """Single architecture governance finding."""
+
+    rule: str
+    path: PurePosixPath
+    line: int
+    fingerprint: str
+    message: str
+
+
+def _is_governed_family_path(rel: PurePosixPath) -> tuple[bool, str | None, str]:
+    parts = rel.parts
+    if len(parts) == GOVERNED_PATH_DEPTH and parts[: len(OPERATORS_PARTS)] == OPERATORS_PARTS:
+        return True, parts[len(OPERATORS_PARTS)], parts[len(OPERATORS_PARTS) + 1]
+    return False, None, rel.name
+
+
+def _is_allowed_isa_leaf(rel: PurePosixPath) -> bool:
+    in_pkg, family, filename = _is_governed_family_path(rel)
+    return (
+        in_pkg
+        and family is not None
+        and filename in GOVERNED_LEAF_NAMES
+        and family.isidentifier()
+        and not AG001_STEM_RE.search(family)
+    )
+
+
+def _git(root: Path, *args: str) -> str:
+    done = subprocess.run(
+        ["git", "-C", str(root), *args],
+        check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    if done.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)} failed: {done.stderr.strip()}")
+    return done.stdout
+
+
+def _is_git_repo(root: Path) -> bool:
+    done = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--is-inside-work-tree"],
+        check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    return done.returncode == 0 and done.stdout.strip() == "true"
+
+
+def _enumerate_py_files(
+    root: Path, *, revision: str | None = None
+) -> list[tuple[PurePosixPath, str]]:
+    entries: list[tuple[PurePosixPath, str]] = []
+    if revision is not None:
+        names = _git(root, "ls-tree", "-r", "--name-only", revision, "--", SIM_PACKAGE_ROOT)
+        for line in sorted(names.splitlines()):
+            if line.endswith(".py"):
+                entries.append((PurePosixPath(line), _git(root, "show", f"{revision}:{line}")))
+        return entries
+
+    pkg_dir = root / SIM_PACKAGE_ROOT
+    if not pkg_dir.is_dir():
+        return entries
+    if _is_git_repo(root):
+        tracked = _git(root, "ls-files", "--", SIM_PACKAGE_ROOT).splitlines()
+        untracked = _git(
+            root, "ls-files", "--others", "--exclude-standard", "--", SIM_PACKAGE_ROOT
+        ).splitlines()
+        for name in sorted({n for n in (*tracked, *untracked) if n.endswith(".py")}):
+            disk = root / name
+            if disk.is_file():
+                entries.append((PurePosixPath(name), disk.read_text(encoding="utf-8")))
+        return entries
+
+    for path in sorted(pkg_dir.rglob("*.py")):
+        if "__pycache__" not in path.parts:
+            rel = PurePosixPath(path.relative_to(root).as_posix())
+            entries.append((rel, path.read_text(encoding="utf-8")))
+    return entries
+
+
+def _package_parts(rel: PurePosixPath) -> tuple[str, ...]:
+    parts = list(rel.with_suffix("").parts)
+    return tuple(parts[:-1]) if parts else ()
+
+
+def _resolve_import_from(rel: PurePosixPath, module: str | None, level: int) -> tuple[str, ...]:
+    if level == 0:
+        return tuple(module.split(".")) if module else ()
+    pkg = _package_parts(rel)
+    up = level - 1
+    base = pkg[: len(pkg) - up] if up <= len(pkg) else ()
+    return base + (tuple(module.split(".")) if module else ())
+
+
+def _is_leaf_parts(parts: tuple[str, ...]) -> tuple[bool, str | None]:
+    idx = len(OPERATORS_PARTS)
+    if len(parts) >= GOVERNED_PATH_DEPTH and parts[:idx] == OPERATORS_PARTS:
+        if parts[idx + 1] in GOVERNED_LEAF_STEMS:
+            return True, parts[idx]
+    return False, None
+
+
+def _family_pkg_name(parts: tuple[str, ...]) -> str | None:
+    if len(parts) == FAMILY_PKG_DEPTH and parts[: len(OPERATORS_PARTS)] == OPERATORS_PARTS:
+        return parts[len(OPERATORS_PARTS)]
+    return None
+
+
+def _fold_string(node: ast.AST, env: dict[str, str]) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Name):
+        return env.get(node.id)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left, right = _fold_string(node.left, env), _fold_string(node.right, env)
+        return None if left is None or right is None else left + right
+    return None
+
+
+def _module_string_constants(tree: ast.Module) -> dict[str, str]:
+    constants: dict[str, str] = {}
+    for stmt in tree.body:
+        target = None
+        value = None
+        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+            target, value = stmt.targets[0], stmt.value
+        elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
+            target, value = stmt.target, stmt.value
+        if isinstance(target, ast.Name) and value is not None:
+            folded = _fold_string(value, constants)
+            if folded is not None:
+                constants[target.id] = folded
+    return constants
+
+
+def _parents(tree: ast.Module) -> dict[ast.AST, ast.AST]:
+    return {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+
+
+def _enclosing_symbol(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> str:
+    names: list[str] = []
+    cur = parents.get(node)
+    while cur is not None:
+        if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.append(cur.name)
+        cur = parents.get(cur)
+    return ".".join(reversed(names)) or "<module>"
+
+
+def _fingerprint(rule: str, rel: PurePosixPath, scope: str, node: ast.AST) -> str:
+    raw = f"{rule}|{rel.as_posix()}|{scope}|{ast.dump(node, include_attributes=False)}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:FINGERPRINT_HEX_LEN]
+
+
+def _check_ag001(rel: PurePosixPath) -> list[Violation]:
+    if not AG001_STEM_RE.search(rel.stem) or _is_allowed_isa_leaf(rel):
+        return []
+    msg = (
+        f"unmanaged ISA/CANN filename {rel.name!r}; only "
+        "mindie_sim/prediction/operators/<family>/{arch22,arch35}.py allowed"
+    )
+    return [Violation("AG001", rel, 1, f"AG001:{rel.as_posix()}", msg)]
+
+
+def _check_ag002(rel: PurePosixPath, tree: ast.Module, parents: dict[ast.AST, ast.AST]) -> list[Violation]:
+    violations: list[Violation] = []
+    in_pkg, own_family, filename = _is_governed_family_path(rel)
+    is_family_init = in_pkg and filename == "__init__.py"
+    str_consts = _module_string_constants(tree)
+    family_aliases: dict[str, str] = {}
+    dynamic_imports: set[str] = {"__import__"}
+    importlib_aliases: set[str] = set()
+
+    def reject(target_family: str, leaf: str, node: ast.AST, reason: str) -> None:
+        if is_family_init and own_family == target_family and reason == "static":
+            return
+        fp = _fingerprint("AG002", rel, _enclosing_symbol(node, parents), node)
+        msg = f"forbidden leaf access operators.{target_family}.{leaf} ({reason})"
+        violations.append(Violation("AG002", rel, getattr(node, "lineno", 1), fp, msg))
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                parts = tuple(alias.name.split("."))
+                if alias.name == "importlib":
+                    importlib_aliases.add(alias.asname or "importlib")
+                is_leaf, fam = _is_leaf_parts(parts)
+                if is_leaf and fam is not None:
+                    reject(fam, parts[len(OPERATORS_PARTS) + 1], node, "direct_import")
+                fam_pkg = _family_pkg_name(parts)
+                if fam_pkg is not None:
+                    family_aliases[alias.asname or alias.name] = fam_pkg
+        elif isinstance(node, ast.ImportFrom):
+            base = _resolve_import_from(rel, node.module, node.level)
+            if base == ("importlib",):
+                for alias in node.names:
+                    if alias.name == "import_module":
+                        dynamic_imports.add(alias.asname or "import_module")
+            is_leaf, fam = _is_leaf_parts(base)
+            if is_leaf and fam is not None:
+                reject(fam, base[len(OPERATORS_PARTS) + 1], node, "static")
+                continue
+            fam_pkg = _family_pkg_name(base)
+            for alias in node.names:
+                if fam_pkg is not None and alias.name in GOVERNED_LEAF_STEMS:
+                    reject(fam_pkg, alias.name, node, "static")
+                elif base == OPERATORS_PARTS and alias.name not in {"contracts", "registry"}:
+                    family_aliases[alias.asname or alias.name] = alias.name
+        elif isinstance(node, ast.Attribute):
+            if (
+                node.attr in GOVERNED_LEAF_STEMS
+                and isinstance(node.value, ast.Name)
+                and node.value.id in family_aliases
+            ):
+                reject(family_aliases[node.value.id], node.attr, node, "attribute")
+        elif isinstance(node, ast.Call):
+            func = node.func
+            if (
+                isinstance(func, ast.Name)
+                and func.id == "getattr"
+                and len(node.args) >= len(("obj", "attr"))
+                and isinstance(node.args[0], ast.Name)
+                and node.args[0].id in family_aliases
+            ):
+                attr = _fold_string(node.args[1], str_consts)
+                if attr in GOVERNED_LEAF_STEMS:
+                    reject(family_aliases[node.args[0].id], attr, node, "getattr")
+            is_dyn = (
+                (isinstance(func, ast.Name) and func.id in dynamic_imports)
+                or (
+                    isinstance(func, ast.Attribute)
+                    and func.attr == "import_module"
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id in importlib_aliases
+                )
+            )
+            if is_dyn and node.args:
+                target_str = _fold_string(node.args[0], str_consts)
+                if target_str:
+                    pkg_arg = _fold_string(node.args[1], str_consts) if len(node.args) > 1 else None
+                    for kw in node.keywords:
+                        if kw.arg == "package":
+                            pkg_arg = _fold_string(kw.value, str_consts)
+                    full = f"{pkg_arg}.{target_str.lstrip('.')}" if target_str.startswith(".") and pkg_arg else target_str
+                    parts = tuple(p for p in full.split(".") if p)
+                    is_leaf, fam = _is_leaf_parts(parts)
+                    if is_leaf and fam is not None:
+                        reject(fam, parts[len(OPERATORS_PARTS) + 1], node, "dynamic_import")
+
+    if is_family_init and own_family is not None:
+        for stmt in tree.body:
+            if isinstance(stmt, ast.Assign) and isinstance(stmt.value, (ast.List, ast.Tuple, ast.Set)):
+                if any(isinstance(t, ast.Name) and t.id == "__all__" for t in stmt.targets):
+                    for elt in stmt.value.elts:
+                        if isinstance(elt, ast.Constant) and elt.value in GOVERNED_LEAF_STEMS:
+                            fp = _fingerprint("AG002", rel, "<module>", stmt)
+                            msg = f"family __init__.py must not re-export leaf {elt.value!r} in __all__"
+                            violations.append(Violation("AG002", rel, stmt.lineno, fp, msg))
+    return violations
+
+
+def _is_attr_or_getattr(node: ast.AST, attr: str) -> bool:
+    if isinstance(node, ast.Attribute) and node.attr == attr:
+        return True
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "getattr"
+        and len(node.args) > 1
+        and isinstance(node.args[1], ast.Constant)
+        and node.args[1].value == attr
+    )
+
+
+def _is_tainted_map(node: ast.AST, attr: str, tainted: set[str]) -> bool:
+    if _is_attr_or_getattr(node, attr) or (isinstance(node, ast.Name) and node.id in tainted):
+        return True
+    if isinstance(node, ast.Call):
+        if isinstance(node.func, ast.Name) and node.func.id == "dict" and node.args:
+            return _is_tainted_map(node.args[0], attr, tainted)
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "keys":
+            return _is_tainted_map(node.func.value, attr, tainted)
+    return False
+
+
+def _is_tainted_val(
+    node: ast.AST, attr: str, maps: set[str], vals: set[str], *, peak_call: bool = False
+) -> bool:
+    if isinstance(node, ast.Name) and node.id in vals:
+        return True
+    if isinstance(node, ast.Subscript) and _is_tainted_map(node.value, attr, maps):
+        return True
+    if isinstance(node, ast.Call):
+        if isinstance(node.func, ast.Attribute):
+            if node.func.attr == "get" and _is_tainted_map(node.func.value, attr, maps):
+                return True
+            if peak_call and node.func.attr == "peak" and len(node.args) == 1:
+                return True
+        if isinstance(node.func, ast.Name) and node.func.id in {"float", "int"} and node.args:
+            return _is_tainted_val(node.args[0], attr, maps, vals, peak_call=peak_call)
+    return False
+
+
+def _is_bool_condition(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
+    parent = parents.get(node)
+    if isinstance(parent, (ast.If, ast.IfExp, ast.While)) and parent.test is node:
+        return True
+    if isinstance(parent, ast.BoolOp):
+        return True
+    if isinstance(parent, ast.UnaryOp) and isinstance(parent.op, ast.Not):
+        return True
+    if isinstance(parent, ast.Call) and isinstance(parent.func, ast.Name):
+        return parent.func.id in {"bool", "all", "any"}
+    if isinstance(parent, ast.Compare) and any(isinstance(op, (ast.Is, ast.IsNot)) for op in parent.ops):
+        return any(isinstance(c, ast.Constant) and c.value is None for c in parent.comparators)
+    return False
+
+
+def _scope_nodes(stmts: list[ast.stmt]):
+    stack: list[ast.AST] = list(reversed(stmts))
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        yield node
+        children = [
+            c for c in ast.iter_child_nodes(node)
+            if not isinstance(c, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        ]
+        stack.extend(reversed(children))
+
+
+def _scan_scope_taint(
+    rel: PurePosixPath,
+    scope: str,
+    body: list[ast.stmt],
+    parents: dict[ast.AST, ast.AST],
+    *,
+    check_sm: bool,
+    check_cp: bool,
+) -> list[Violation]:
+    violations: list[Violation] = []
+    sm_maps, sm_vals, cp_maps, cp_vals = set(), set(), set(), set()
+    nodes = list(_scope_nodes(body))
+
+    for node in nodes:
+        if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if not isinstance(target, ast.Name):
+                    continue
+                if _is_tainted_map(node.value, "service_modes", sm_maps):
+                    sm_maps.add(target.id)
+                elif _is_tainted_val(node.value, "service_modes", sm_maps, sm_vals):
+                    sm_vals.add(target.id)
+                if _is_tainted_map(node.value, "compute_peaks", cp_maps):
+                    cp_maps.add(target.id)
+                elif _is_tainted_val(node.value, "compute_peaks", cp_maps, cp_vals, peak_call=True):
+                    cp_vals.add(target.id)
+
+    def add(rule: str, node: ast.AST, msg: str) -> None:
+        fp = _fingerprint(rule, rel, scope, node)
+        violations.append(Violation(rule, rel, getattr(node, "lineno", 1), fp, msg))
+
+    for node in nodes:
+        if check_sm:
+            if isinstance(node, ast.Compare):
+                for op, comp in zip(node.ops, node.comparators):
+                    if isinstance(op, (ast.In, ast.NotIn)) and _is_tainted_map(comp, "service_modes", sm_maps):
+                        add("AG003", node, "service_modes membership check is forbidden; use DatapathCapabilitySpec")
+            if _is_tainted_val(node, "service_modes", sm_maps, sm_vals) and _is_bool_condition(node, parents):
+                add("AG003", node, "service_modes .get() truthiness branch is forbidden; use DatapathCapabilitySpec or RecipeContext.service_rate")
+        if check_cp:
+            if isinstance(node, ast.Compare):
+                if any(isinstance(op, (ast.In, ast.NotIn)) for op in node.ops) and any(
+                    _is_tainted_map(c, "compute_peaks", cp_maps) for c in node.comparators
+                ):
+                    add("AG004", node, "compute_peaks membership sniffing is forbidden; use ComputeArchSpec")
+                if any(isinstance(op, (ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.Eq, ast.NotEq)) for op in node.ops) and any(
+                    _is_tainted_val(x, "compute_peaks", cp_maps, cp_vals, peak_call=True)
+                    for x in (node.left, *node.comparators)
+                ):
+                    add("AG004", node, "compute_peaks threshold comparison is forbidden; use ComputeArchSpec/DatapathCapabilitySpec")
+            if _is_tainted_val(node, "compute_peaks", cp_maps, cp_vals) and _is_bool_condition(node, parents):
+                add("AG004", node, "compute_peaks .get() truthiness sniffing is forbidden; use ComputeArchSpec")
+    return violations
+
+
+def _check_ag003_ag004(rel: PurePosixPath, tree: ast.Module, parents: dict[ast.AST, ast.AST]) -> list[Violation]:
+    rel_str = rel.as_posix()
+    check_sm = not (rel_str.startswith(_INFRA_PREFIXES) or rel_str in _SM_INFRA_FILES)
+    check_cp = not (rel_str.startswith(_INFRA_PREFIXES) or rel_str in _CP_INFRA_FILES)
+    if not (check_sm or check_cp):
+        return []
+    violations = _scan_scope_taint(rel, "<module>", tree.body, parents, check_sm=check_sm, check_cp=check_cp)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            scope = _enclosing_symbol(node, parents)
+            full_scope = f"{scope}.{node.name}" if scope != "<module>" else node.name
+            violations.extend(_scan_scope_taint(rel, full_scope, node.body, parents, check_sm=check_sm, check_cp=check_cp))
+    return violations
+
+
+def _extract_source_ref_fields(call: ast.Call, str_consts: dict[str, str]) -> dict[str, str] | None:
+    func_name = call.func.id if isinstance(call.func, ast.Name) else (
+        call.func.attr if isinstance(call.func, ast.Attribute) else None
+    )
+    if func_name != "SourceRef":
+        return None
+    extracted: dict[str, str] = {}
+    for idx, arg in enumerate(call.args):
+        if idx >= len(SOURCE_REF_FIELDS):
+            return None
+        val = _fold_string(arg, str_consts)
+        if val is None:
+            return None
+        extracted[SOURCE_REF_FIELDS[idx]] = val
+    for kw in call.keywords:
+        if kw.arg in SOURCE_REF_FIELDS:
+            val = _fold_string(kw.value, str_consts)
+            if val is None:
+                return None
+            extracted[kw.arg] = val
+    return extracted
+
+
+def _check_ag005(
+    rel: PurePosixPath, text: str, tree: ast.Module, *, refs_root: Path | None = None
+) -> list[Violation]:
+    if not _is_allowed_isa_leaf(rel):
+        return []
+    violations: list[Violation] = []
+    header = "\n".join(text.splitlines()[:DOCSTRING_HEADER_MAX_LINE])
+    if not UPSTREAM_ABI_RE.search(header):
+        violations.append(Violation(
+            "AG005", rel, 1, f"AG005:{rel.as_posix()}:missing_upstream_abi",
+            "ISA leaf docstring top 30 lines must declare 'Upstream-ABI: <symbol>'",
+        ))
+    str_consts = _module_string_constants(tree)
+    sources_node: ast.AST | None = None
+    has_strategy = False
+    for stmt in tree.body:
+        targets = (
+            stmt.targets if isinstance(stmt, ast.Assign)
+            else ([stmt.target] if isinstance(stmt, ast.AnnAssign) else ())
+        )
+        for target in targets:
+            if isinstance(target, ast.Name):
+                if target.id == "SOURCES":
+                    sources_node = stmt.value
+                elif target.id == "STRATEGY":
+                    has_strategy = True
+    if not has_strategy:
+        violations.append(Violation(
+            "AG005", rel, 1, f"AG005:{rel.as_posix()}:missing_strategy",
+            "ISA leaf must define module-level STRATEGY",
+        ))
+    if not isinstance(sources_node, ast.Tuple) or not sources_node.elts:
+        violations.append(Violation(
+            "AG005", rel, getattr(sources_node, "lineno", 1),
+            f"AG005:{rel.as_posix()}:missing_sources",
+            "ISA leaf must define non-empty SOURCES: tuple[SourceRef, ...]",
+        ))
+        return violations
+    for elt in sources_node.elts:
+        if not isinstance(elt, ast.Call):
+            violations.append(Violation(
+                "AG005", rel, getattr(elt, "lineno", 1),
+                f"AG005:{rel.as_posix()}:invalid_source_entry",
+                "SOURCES entries must be SourceRef(...) calls",
+            ))
+            continue
+        fields = _extract_source_ref_fields(elt, str_consts)
+        if fields is None or len(fields) < len(SOURCE_REF_FIELDS):
+            violations.append(Violation(
+                "AG005", rel, elt.lineno,
+                f"AG005:{rel.as_posix()}:incomplete_source_ref:{elt.lineno}",
+                "SourceRef must statically specify repository, revision, relative_path, source_sha256",
+            ))
+            continue
+        repo, rev, rpath, sha = (fields[k].strip() for k in SOURCE_REF_FIELDS)
+        if (
+            not repo or not HEX_REVISION_RE.match(rev) or not rpath
+            or rpath.startswith("/") or ".." in PurePosixPath(rpath).parts
+            or not SHA256_HEX_RE.match(sha)
+        ):
+            violations.append(Violation(
+                "AG005", rel, elt.lineno,
+                f"AG005:{rel.as_posix()}:malformed_source_ref:{rpath}",
+                f"malformed SourceRef(repo={repo!r}, rev={rev!r}, path={rpath!r}, sha256={sha[:PREVIEW_SHA_LEN]!r}...)",
+            ))
+            continue
+        if refs_root is not None:
+            repo_dir = refs_root / repo.split("/")[-1]
+            if repo_dir.is_dir():
+                blob = subprocess.run(
+                    ["git", "-C", str(repo_dir), "show", f"{rev}:{rpath}"],
+                    check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+                if blob.returncode != 0:
+                    violations.append(Violation(
+                        "AG005", rel, elt.lineno,
+                        f"AG005:{rel.as_posix()}:source_missing:{rpath}",
+                        f"upstream source {repo}@{rev}:{rpath} not found",
+                    ))
+                else:
+                    actual_sha = hashlib.sha256(blob.stdout).hexdigest()
+                    if actual_sha != sha:
+                        violations.append(Violation(
+                            "AG005", rel, elt.lineno,
+                            f"AG005:{rel.as_posix()}:sha_mismatch:{rpath}",
+                            f"SHA-256 mismatch for {rpath}: expected {sha}, got {actual_sha}",
+                        ))
+    return violations
+
+
+def scan_repository(
+    root: Path, /, *, revision: str | None = None, refs_root: Path | None = None
+) -> tuple[Violation, ...]:
+    """Scan ``mindie_sim/**/*.py`` and return all sorted ``AG001..AG005`` violations."""
+    violations: list[Violation] = []
+    for rel, text in _enumerate_py_files(root, revision=revision):
+        violations.extend(_check_ag001(rel))
+        try:
+            tree = ast.parse(text, filename=rel.as_posix())
+        except SyntaxError as exc:
+            violations.append(Violation(
+                "AG005", rel, int(exc.lineno or 1),
+                f"AG005:{rel.as_posix()}:syntax_error", f"syntax_error:{exc.msg}",
+            ))
+            continue
+        parents = _parents(tree)
+        violations.extend(_check_ag002(rel, tree, parents))
+        violations.extend(_check_ag003_ag004(rel, tree, parents))
+        violations.extend(_check_ag005(rel, text, tree, refs_root=refs_root))
+    violations.sort(key=lambda v: (v.path.as_posix(), v.line, v.rule, v.message))
+    return tuple(violations)
+
+
+def filter_allowlisted(violations: Sequence[Violation], /) -> tuple[Violation, ...]:
+    """Drop only tracked pre-Stage-3 legacy violations; never waive governed operators."""
+    kept: list[Violation] = []
+    for item in violations:
+        in_pkg, _family, _fname = _is_governed_family_path(item.path)
+        if in_pkg or item.rule not in LEGACY_ALLOWLIST.get(item.path.as_posix(), frozenset()):
+            kept.append(item)
+    return tuple(kept)
+
+
+def new_violations(
+    current: Sequence[Violation], baseline: Sequence[Violation], /
+) -> tuple[Violation, ...]:
+    """Multiset differential subtraction preserving governed-package strictness."""
+    remaining: Counter[tuple[str, str, str]] = Counter(
+        (v.rule, v.path.as_posix(), v.fingerprint) for v in baseline
+    )
+    added: list[Violation] = []
+    for item in current:
+        in_pkg, _family, _fname = _is_governed_family_path(item.path)
+        if in_pkg:
+            added.append(item)
+            continue
+        key = (item.rule, item.path.as_posix(), item.fingerprint)
+        if remaining[key] > 0:
+            remaining[key] -= 1
+        else:
+            added.append(item)
+    return tuple(added)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", default=".", help="repository root")
+    parser.add_argument("--base", default=None, help="git base ref for differential scan")
+    parser.add_argument("--strict", action="store_true", help="ignore legacy allowlist")
+    parser.add_argument("--refs-root", default=None, help="local upstream repos root for SHA-256 check")
+    args = parser.parse_args(argv)
+    root = Path(args.root).resolve()
+    refs_root = Path(args.refs_root).resolve() if args.refs_root else None
+    try:
+        current = scan_repository(root, refs_root=refs_root)
+        if args.base is not None:
+            active = new_violations(current, scan_repository(root, revision=args.base))
+        elif args.strict:
+            active = current
+        else:
+            active = filter_allowlisted(current)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return EXIT_USAGE
+    for item in active:
+        print(f"{item.path.as_posix()}:{item.line}: {item.rule} {item.message}")
+    print(f"arch governance violations: {len(active)}")
+    return EXIT_VIOLATIONS if active else EXIT_OK
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

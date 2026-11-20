@@ -21,6 +21,7 @@ from typing import Any, Mapping
 from mindie_sim.schema.operators import IterationWork
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.case import Case as CaseSpec
+from mindie_sim.schema.datapath import datapath_for_devices
 from mindie_sim.schema.hardware import NATIVE_WORK_UNITS
 from .cost import CostModel
 from .cohort_traffic import bind_cohort_traffic
@@ -436,6 +437,8 @@ class StageProfile:
     work_units: dict
     store_queues: dict
     physical_mechanisms: Any
+    compute_arch: Any = None
+    datapath: Any = None
 
     @property
     def profile_key(self) -> tuple:
@@ -461,6 +464,7 @@ def build_stage_profiles(case: CaseSpec, namespace: str = "", *,
                     "representative_shard_requires_matching_resource_geometry:"
                     f"replica={replica}:stage={stage};"
                     "heterogeneous_owners_require_per_rank_execution")
+            compute_arch, datapath = datapath_for_devices(dies)
             roles = dict(dies[0].rates)
             work_units = {**NATIVE_WORK_UNITS, **dict(dies[0].work_units)}
             rates = {
@@ -513,6 +517,8 @@ def build_stage_profiles(case: CaseSpec, namespace: str = "", *,
                 service_modes=service_modes, work_units=work_units,
                 store_queues=store_queues,
                 physical_mechanisms=dies[0].physical_mechanisms,
+                compute_arch=compute_arch,
+                datapath=datapath,
             ))
     return tuple(profiles)
 
@@ -1355,6 +1361,7 @@ class Execution:
         lazy_frontier: bool = True, host_lookahead: int = HOST_LOOKAHEAD_DEFAULT,
         bindings=None, ledger=None, isolated_replica: int | None = None,
         evaluation=None, accel_eager_attach: bool = False,
+        stream_plans=None,
     ):
         from .cost import CostLedger
         self.case, self.cost = case, cost
@@ -1450,6 +1457,20 @@ class Execution:
             pools.update(profile.pools)
             pool_units.update(profile.pool_units)
             active_ranks.update(int(die.rank) for die in profile.dies)
+        self.stream_owners: dict[tuple[int, int, str], Any] = {}
+        if stream_plans:
+            from .streams import bind_stream_owners
+            plans_seq = (
+                tuple(stream_plans.values())
+                if isinstance(stream_plans, _AbcMapping)
+                else tuple(stream_plans)
+            )
+            for plan in plans_seq:
+                for (rep, stg), profile in self.stage_profiles.items():
+                    if rep == int(plan.rank):
+                        bound = bind_stream_owners(plan, profile.datapath)
+                        for stream_id, owners in bound.items():
+                            self.stream_owners[(rep, stg, stream_id)] = owners
         self.topology = (
             bindings.topology
             if bindings is not None and bindings.topology is not None
@@ -2625,6 +2646,7 @@ class Execution:
             live_rates,
             context.group_buffers,
             getattr(context.physical_mechanisms, "signature", None),
+            context.stream_owners,
         )
         token = _rank_token(context)
         replayable = (
@@ -2672,6 +2694,7 @@ class Execution:
         )
         program = self.lower_program(run_ctx, recipe)
         program = self._apply_resource_service_program(context, program)
+        program = self._apply_stream_owners_program(context, program)
         if do_compact:
             from .program import coalesce_execution_program
             program = coalesce_execution_program(program)
@@ -2894,6 +2917,34 @@ class Execution:
             return _ServiceSetupProgram(body, service.fixed_us / 1000.0)
         return body
 
+    @staticmethod
+    def _apply_stream_owners_program(context, program):
+        owners = context.stream_owners
+        if owners is None or context.datapath is None:
+            return program
+        from .streams import (
+            MAIN_STREAM,
+            apply_stream_owners_to_program,
+            check_work_against_stream_budget,
+        )
+        stream_id = getattr(context.op, "stream", None) or MAIN_STREAM
+        check_work_against_stream_budget(
+            context.work,
+            owners,
+            resource_names=context.resource_names,
+            stream_id=stream_id,
+            label=str(getattr(context.op, "op_id", "op")),
+        )
+        return apply_stream_owners_to_program(
+            program,
+            owners,
+            context.datapath,
+            resource_names=context.resource_names,
+            resource_units=context.resource_units,
+            rates=context.rates,
+            stream_id=stream_id,
+        )
+
     def prepare(self, op, replica=ZERO):
         # Directly submitted blocking work must not reach the Engine either.
         from .unmodeled_gate import assert_timing_supported
@@ -2960,6 +3011,7 @@ class Execution:
         profile = self.stage_profiles.get(key)
         if profile is None:
             names = self.stage_names[key]
+            compute_arch, datapath = datapath_for_devices(dies)
             return RecipeContext(
                 None, {}, names, self.resource_rates,
                 dies[FIRST].aic_count,
@@ -2981,6 +3033,8 @@ class Execution:
                 store_queues={name: dict(queue) for name, queue in dies[FIRST].store_queues
                               if all(dict(d.store_queues).get(name) == queue for d in dies)},
                 physical_mechanisms=dies[FIRST].physical_mechanisms,
+                compute_arch=compute_arch,
+                datapath=datapath,
             )
         return RecipeContext(
             None, {}, profile.names, self.resource_rates,
@@ -2997,6 +3051,8 @@ class Execution:
             store_queues={name: dict(queue)
                           for name, queue in profile.store_queues.items()},
             physical_mechanisms=profile.physical_mechanisms,
+            compute_arch=profile.compute_arch,
+            datapath=profile.datapath,
         )
 
     def _context(self, op: Any, replica: int, scope: str, *, recipe=None) -> RecipeContext:
@@ -3047,9 +3103,11 @@ class Execution:
                 self._service_identity_cache.pop(next(iter(self._service_identity_cache)))
             self._service_identity_cache[sid_key] = sid
         declared = _declaration_of(op)
+        stream_owners = self.stream_owners.get((replica, op.stage, op.stream or "main"))
         context = replace(template, op=op, native_work=cost.work, compute_peaks=peaks,
             service_identity=sid,
-            service_boundary="resource_phase" if declared else "device_kernel")
+            service_boundary="resource_phase" if declared else "device_kernel",
+            stream_owners=stream_owners)
         bind_context = getattr(recipe, "bind_context", None)
         if bind_context is not None:
             context = bind_context(context)
@@ -3478,6 +3536,7 @@ class Execution:
                             op.flops, op.matrix_flops, op.mte2_bytes, op.mte3_bytes,
                             op.vector_ops, op.hbm_bytes, op.link_bytes, op.link_scope,
                             op.source_boundary, op.returns, self._op_key(op),
+                            self.stream_owners.get((replica, op.stage, op.stream or "main")),
                         )
                         entry = lazy_cache.get(lazy_key)
                         if entry is not None and entry is not False:
@@ -3666,6 +3725,7 @@ class Execution:
             replay_counts["real"] += 1
             program = self.lower_program(run_ctx, recipe)
             program = self._apply_resource_service_program(ctx, program)
+            program = self._apply_stream_owners_program(ctx, program)
             if compact_exec:
                 from .program import coalesce_execution_program
                 program = coalesce_execution_program(program)

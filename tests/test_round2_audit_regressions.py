@@ -67,7 +67,7 @@ def test_dbo_partitioning_is_never_bypassed_by_homogeneous_lowering(monkeypatch)
         direct["graph_duration_ms"])
     assert optimized["total_flops"] == pytest.approx(direct["total_flops"])
     prefixes = {op["op_id"].split(".", 1)[0] for op in optimized["operators"]}
-    assert {"dbo0", "dbo1"} <= prefixes
+    assert not ({"dbo0", "dbo1"} & prefixes)
 
 
 # --------------------------------------------------------------------------- #

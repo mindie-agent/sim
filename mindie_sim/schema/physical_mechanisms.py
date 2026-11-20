@@ -28,7 +28,7 @@ DEFAULT_MIN_K_PER_SPLIT = 64
 DEFAULT_INPUT_SLOTS = 2
 DEFAULT_COMPUTE_SLOTS = 2
 DEFAULT_SWIZZLE_WINDOWS = ((1, 1), (2, 8), (4, 8))
-DEFAULT_OUTPUT_PATHS = ("gm", "l0c_to_ub", "onchip_reduce")
+DEFAULT_OUTPUT_PATHS = ("gm", "onchip_reduce")
 DEFAULT_MICRO_TILES = {
     "bf16": ((128, 128, 128), (64, 64, 128), (16, 16, 16)),
     "fp16": ((128, 128, 128), (64, 64, 128), (16, 16, 16)),

@@ -240,7 +240,6 @@
           ],
           "supported_output_paths": [
             "gm",
-            "l0c_to_ub",
             "onchip_reduce"
           ]
         },
@@ -749,7 +748,6 @@
           ],
           "supported_output_paths": [
             "gm",
-            "l0c_to_ub",
             "onchip_reduce"
           ]
         },
@@ -1258,7 +1256,6 @@
           ],
           "supported_output_paths": [
             "gm",
-            "l0c_to_ub",
             "onchip_reduce"
           ]
         },
@@ -1767,7 +1764,6 @@
           ],
           "supported_output_paths": [
             "gm",
-            "l0c_to_ub",
             "onchip_reduce"
           ]
         },
@@ -2276,7 +2272,6 @@
           ],
           "supported_output_paths": [
             "gm",
-            "l0c_to_ub",
             "onchip_reduce"
           ]
         },
@@ -2786,7 +2781,6 @@
           ],
           "supported_output_paths": [
             "gm",
-            "l0c_to_ub",
             "onchip_reduce"
           ]
         },
@@ -3295,7 +3289,6 @@
           ],
           "supported_output_paths": [
             "gm",
-            "l0c_to_ub",
             "onchip_reduce"
           ]
         },
@@ -3813,7 +3806,6 @@
           ],
           "supported_output_paths": [
             "gm",
-            "l0c_to_ub",
             "onchip_reduce"
           ]
         },
@@ -4331,7 +4323,6 @@
           ],
           "supported_output_paths": [
             "gm",
-            "l0c_to_ub",
             "onchip_reduce"
           ]
         },
@@ -4849,7 +4840,6 @@
           ],
           "supported_output_paths": [
             "gm",
-            "l0c_to_ub",
             "onchip_reduce"
           ]
         },
@@ -5367,7 +5357,6 @@
           ],
           "supported_output_paths": [
             "gm",
-            "l0c_to_ub",
             "onchip_reduce"
           ]
         },
@@ -5885,7 +5874,6 @@
           ],
           "supported_output_paths": [
             "gm",
-            "l0c_to_ub",
             "onchip_reduce"
           ]
         },

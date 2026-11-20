@@ -37,6 +37,8 @@ import json
 from typing import Any, Mapping
 
 from mindie_sim.schema.case import Case as CaseSpec
+from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import DatapathCapabilitySpec, datapath_for_die
 
 
 BOUNDED_CACHE_LIMIT = 4096
@@ -204,6 +206,8 @@ class ExecutionBindings:
     topology: Any = None
     recipes: Any = None
     stage_profiles: tuple = ()
+    datapaths: tuple[tuple[int, DatapathCapabilitySpec], ...] = ()
+    compute_arch: Any = None
 
     @classmethod
     def create(cls, case: CaseSpec, recipes: Any = None) -> "ExecutionBindings":
@@ -213,15 +217,41 @@ class ExecutionBindings:
         topology = Topology(
             case.machine, case.runtime.parallel, "",
             collective_startup_mode=case.runtime.collective_startup_mode)
+        datapaths = tuple(
+            (int(die.rank), datapath_for_die(die))
+            for die in case.machine.dies
+        )
         signature = (
             hardware.digest(), geometry, _runtime_signature(case),
             tuple(getattr(item, "name", str(item)) for item in topology.resources()),
         )
         from .execution import build_stage_profiles
         profiles = build_stage_profiles(case, "")
+        compute_arch = (
+            case.machine.dies[0].compute_arch
+            if case.machine.dies and case.machine.homogeneous
+            else None
+        )
         return cls(hardware=hardware, resource_signature=signature,
                    stage_geometry=geometry, topology=topology, recipes=recipes,
-                   stage_profiles=profiles)
+                   stage_profiles=profiles, datapaths=datapaths,
+                   compute_arch=compute_arch)
+
+    def datapath_for_rank(self, rank: int, /) -> DatapathCapabilitySpec:
+        """Return the precomputed immutable datapath spec for one physical rank."""
+        target = int(rank)
+        for die_rank, spec in self.datapaths:
+            if die_rank == target:
+                return spec
+        raise ModelingError(f"datapath_rank_unknown:{target}")
+
+    def datapath_for_stage(self, replica: int, stage: int, /) -> DatapathCapabilitySpec:
+        """Return the homogeneity-checked datapath spec for ``(replica, stage)``."""
+        target_replica, target_stage = int(replica), int(stage)
+        for profile in self.stage_profiles:
+            if profile.replica == target_replica and profile.stage == target_stage:
+                return profile.datapath
+        raise ModelingError(f"datapath_stage_unknown:{target_replica}:{target_stage}")
 
     def signature_for(self, stage: int, replica: int) -> tuple:
         return (self.resource_signature, int(stage), int(replica))
@@ -239,7 +269,8 @@ class ExecutionBindings:
             hardware=self.hardware, resource_signature=self.resource_signature,
             stage_geometry=self.stage_geometry, resources=self.resources,
             pools=self.pools, topology=self.topology, recipes=recipes,
-            stage_profiles=self.stage_profiles)
+            stage_profiles=self.stage_profiles, datapaths=self.datapaths,
+            compute_arch=self.compute_arch)
 
 
 @dataclass

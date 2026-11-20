@@ -422,6 +422,8 @@ def test_local_tp_quantizer_and_gemm_derive_the_same_scale_geometry():
 
 
 def test_dbo_join_waits_for_every_partition_sink():
+    # Framework graph layer no longer performs whole-graph DBO splitting;
+    # enable_dbo keeps a single unsplit graph without synthetic dbo.join barriers.
     raw = compose_case(
         "qwen3-32b", hardware="a5", tp=1, ep=1, num_devices=1, layers=1,
         enable_dbo=True, max_num_batched_tokens=128, max_num_seqs=2,
@@ -429,10 +431,8 @@ def test_dbo_join_waits_for_every_partition_sink():
     graphs = target_graphs(
         parse_case(raw), phase="decode", tokens=1, context=64,
         sequences=2, scope="body")
-    joins = [op for op in graphs[0] if op.op_id.endswith("dbo.join")]
-    assert len(joins) == 1
-    assert joins[0].deps == (
-        "dbo0.s0.l0.ffn.residual", "dbo1.s0.l0.ffn.residual")
+    assert not [op for op in graphs[0] if op.op_id.endswith("dbo.join")]
+    assert not [op for op in graphs[0] if op.op_id.startswith("dbo")]
 
 
 def test_dbo_moe_partition_reduces_the_global_row_ledger_without_doubling():
@@ -448,9 +448,9 @@ def test_dbo_moe_partition_reduces_the_global_row_ledger_without_doubling():
                      if op.recipe in {"grouped_gate_up", "grouped_down"})
 
     direct = grouped(False)
-    partitioned = grouped(True)
-    assert len(partitioned) == 2 * len(direct)
-    assert sum(op.flops for op in partitioned) == pytest.approx(
+    with_flag = grouped(True)
+    assert len(with_flag) == len(direct)
+    assert sum(op.flops for op in with_flag) == pytest.approx(
         sum(op.flops for op in direct))
 
 
@@ -464,7 +464,8 @@ def test_dbo_qualifies_shared_expert_stream_per_partition():
         parse_case(raw), phase="decode", tokens=1, context=32,
         sequences=2, scope="body")
     streams = {op.stream for op in graphs[0] if "shared" in op.stream}
-    assert {"dbo0:shared_stream", "dbo1:shared_stream"} <= streams
+    assert "shared_stream" in streams
+    assert not any(stream.startswith("dbo") for stream in streams)
 
 
 def test_pd_handoff_intersects_token_spans_before_charging_rows():
@@ -742,16 +743,13 @@ def test_dbo_microbatches_conserve_assignments_and_split_the_ep_cohort():
     graphs = _dbo_gate_rows([2, 3])
     per_rank = []
     for replica in (0, 1):
+        assert not [op for op in graphs[replica] if op.op_id.startswith("dbo")]
         gates = [op for op in graphs[replica] if op.recipe == "grouped_gate_up"]
-        assert len(gates) == 2
-        assert all("dbo_microbatch" in dict(op.metadata) for op in gates)
-        per_rank.append(sum(op.local_shape[0] for op in gates))
+        assert len(gates) == 1
+        per_rank.append(gates[0].local_shape[0])
     assert per_rank == [20, 20]
     assert sum(per_rank) == 40
 
-    # A peer with one active row cannot split its single view.  DBO must stay
-    # off for the whole collective cohort instead of raising a rendezvous
-    # mismatch between one split rank and one unsplit rank.
     graphs = _dbo_gate_rows([2, 1])
     for replica in (0, 1):
         dispatches = [op for op in graphs[replica]

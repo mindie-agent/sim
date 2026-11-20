@@ -56,7 +56,6 @@ _ENV_REPLICA = 3
 _ENV_FEATURES = 4
 ZERO_FLOAT = 0.0
 FINAL_LAYER = -1
-MIN_DBO_MICROBATCHES = 2
 
 
 
@@ -287,7 +286,7 @@ class Frontend:
              cohort_views_by_replica=None,
              physical_rank=None, query_position=None,
              include_recover_commits: bool = False, machine=None,
-             dbo_partition: int | None = None, layer_limit: int | None = None,
+             layer_limit: int | None = None,
              topk_scope=None, reuse_index_selection: bool = False, rank_ledger=None):
         p = runtime.parallel
         if layer_limit is not None:
@@ -297,98 +296,15 @@ class Frontend:
         # An explicit mechanism exclusion owns every selector it can install,
         # including the structural body default resolved before this call.
         runtime = strip_excluded_native_kda(runtime)
-        if runtime.enable_dbo and dbo_partition is None and len(views) > ONE:
-            from .dbo_ledger import plan as dbo_plan
-            from .physical_recipe_registry import COLLECTIVE_FAMILIES
-            partitions = dbo_plan(self, model, runtime, views, tokens,
-                                  cohort_views_by_replica, replica, machine, physical_rank,
-                                  MIN_DBO_MICROBATCHES, routing_views)
-            if partitions and reuse_index_selection:
-                # A shared TopK selection is one per proposal step; splitting
-                # that step into independent microbatches has no single owner.
-                raise ModelingError("mtp_shared_index_selection_requires_single_microbatch")
-            if partitions:
-                merged, previous_partition_attention, sinks = [], None, []
-                partition_requests = tuple(view.request_id for view in views)
-                for part in partitions:
-                    region, region_rows_value = part.region, part.capacity
-                    partition_global = part.physical
-                    partition_source_rows = (part.valid if runtime.kernels.get(
-                        "force_eplb_source") else part.allocated)
-                    partition_routing = part.routing
-                    from .dbo_ledger import partition_runtime
-                    part_ops, part_last = self.body(
-                        model, partition_runtime(runtime, part), region.views,
-                        prefix=f"{prefix}dbo{region.index}.",
-                        ready=ready,
-                        tokens=region_rows_value,
-                        mode=mode,
-                        global_tokens=partition_global,
-                        stages=stages,
-                        replica=replica, features=features,
-                        source_rows_by_replica=partition_source_rows, rank_ledger=part,
-                        routing_global_tokens=part.physical,
-                        routing_views=partition_routing,
-                        physical_rank=physical_rank,
-                        query_position=query_position,
-                        include_recover_commits=include_recover_commits,
-                        machine=machine, dbo_partition=region.index)
-                    first_attention = None
-                    for op in part_ops:
-                        collective = op.family in COLLECTIVE_FAMILIES
-                        auxiliary = (op.stream
-                                     if op.stream and op.stream != region.stream
-                                     else "")
-                        stream = (f"dbo{region.index}:{auxiliary}" if auxiliary
-                                  else region.comm_stream if collective
-                                  else region.stream)
-                        metadata = dict(op.metadata)
-                        metadata.update({
-                            "dbo_microbatch": region.index,
-                            "dbo_microbatch_count": len(partitions),
-                            "dbo_compute_stream": region.stream,
-                        })
-                        if auxiliary:
-                            metadata["dbo_auxiliary_stream"] = auxiliary
-                        if collective:
-                            metadata["collective_rendezvous"] = (
-                                f"dbo{region.index}:{op.op_id}")
-                        if op.family == "attention" and first_attention is None:
-                            first_attention = op.op_id
-                        merged.append(replace(
-                            op, stream=stream,
-                            metadata=tuple(sorted(metadata.items()))))
-                    if previous_partition_attention and first_attention:
-                        position = next(
-                            index for index, op in enumerate(merged)
-                            if op.op_id == first_attention)
-                        merged[position] = replace(
-                            merged[position],
-                            deps=tuple(dict.fromkeys(
-                                (*merged[position].deps,
-                                 previous_partition_attention))))
-                    previous_partition_attention = (
-                        first_attention or previous_partition_attention)
-                    sinks.append(part_last)
-                # Every partition's residual/FFN sink must finish before the
-                # shared final norm, logits and token commit.  Returning only
-                # the last partition's tail lets the commit overtake partition
-                # zero and understates the DBO step.
-                joined = barrier_op(
-                    op_id=prefix + "dbo.join", deps=tuple(dict.fromkeys(sinks)),
-                    stage=stages[ZERO] if stages else ZERO, layer=-1,
-                    requests=partition_requests, phase=mode,
-                    recipe="dbo_partition_join", shape=(len(partition_requests),))
-                merged.append(joined)
-                return merged, joined.op_id
         if (rank_ledger is None and cohort_views_by_replica is not None and views
-                and (runtime.enable_dbo or runtime.parallel.rank_table is not None
-                     or runtime.parallel.pcp > ONE or runtime.kernels.get("force_eplb_source"))):
-            from .dbo_ledger import plan as dbo_plan
-            parent = dbo_plan(self, model, runtime, views, tokens, cohort_views_by_replica,
-                              replica, machine, physical_rank, ONE, routing_views)
-            if parent:
-                rank_ledger = parent[ZERO]
+                and (runtime.parallel.rank_table is not None
+                     or runtime.parallel.pcp > 1 or runtime.kernels.get("force_eplb_source"))):
+            from .rank_ledger import rank_ledger_for
+            parent = rank_ledger_for(self, model, runtime, views, tokens,
+                                     cohort_views_by_replica, replica, machine,
+                                     physical_rank, routing_views)
+            if parent is not None:
+                rank_ledger = parent
                 global_tokens = routing_global_tokens = rank_ledger.physical
                 source_rows_by_replica = (rank_ledger.valid if runtime.kernels.get(
                     "force_eplb_source") else rank_ledger.allocated)
@@ -914,7 +830,7 @@ class Frontend:
                                deps=tuple(rename[dep] for dep in op.deps) or (previous,))
                        for op in media.ops)
             previous = rename[media.last]
-        from .dbo_ledger import selected_lane
+        from .rank_ledger import selected_lane
         local_views, local_tokens, pcp_prefill = self.partition_views(
             views, runtime, padded, model=model,
             lane=selected_lane(runtime.parallel, machine, replica, requested_rank))
@@ -1101,7 +1017,7 @@ class Frontend:
         layers = model.layer_plans
         if (len(layers) <= 2 or local_tokens <= 0 or scope != "none"
                 or before or has_after_draft or pcp_prefill
-                or runtime.enable_dbo or runtime.parallel.pp != 1):
+                or runtime.parallel.pp != 1):
             return None
         fusions_cfg = runtime.kernels.get("fusions") or ()
         if "residual_norm" in fusions_cfg:

@@ -136,3 +136,20 @@ __all__ = [
     "register_runtime_stack", "load_runtime_stack_manifest",
     "compare_feature_tracks",
 ]
+
+_LAZY_SUBMODULES = frozenset({
+    "api", "cli", "cohort_comparison", "stack_registry", "structure",
+})
+
+
+def __getattr__(name: str):
+    if name in _LAZY_SUBMODULES:
+        import importlib
+        module = importlib.import_module(f"{__name__}.{name}")
+        globals()[name] = module
+        return module
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__) | _LAZY_SUBMODULES)

@@ -86,8 +86,16 @@ def _climb(start: Path, name: str) -> Path | None:
     return None
 
 
+SKIP_SCAN_DIRS = frozenset({
+    ".venv", "venv", ".git", "__pycache__", ".pytest_cache",
+    ".mypy_cache", "build", "dist", ".ruff_cache",
+})
+
+
 def _python_files(root: Path):
     for path in sorted(root.rglob("*.py")):
+        if any(part in SKIP_SCAN_DIRS for part in path.relative_to(root).parts):
+            continue
         try:
             if path.stat().st_size > STREAM_LIMIT:
                 continue
@@ -144,6 +152,17 @@ def hygiene(args) -> dict:
     except Exception as error:  # pragma: no cover - import failure detail
         imports_ok = False
         detail = f"{type(error).__name__}:{error}"
+    scripts_dir = SIM_ROOT / "scripts"
+    if str(scripts_dir) not in sys.path:
+        sys.path.insert(0, str(scripts_dir))
+    import check_arch_governance as arch_gov
+
+    raw_gov = arch_gov.scan_repository(sim)
+    gov_active = arch_gov.filter_allowlisted(raw_gov)
+    gov_list = [
+        f"{item.path.as_posix()}:{item.line}:{item.rule}:{item.message}"
+        for item in gov_active
+    ]
     metrics = {
         "deleted_paths_present": present,
         "sidecar_imports": sidecar_imports,
@@ -151,8 +170,11 @@ def hygiene(args) -> dict:
         "image_literals": image_literals,
         "canonical_imports": imports_ok,
         "canonical_import_detail": detail,
+        "arch_governance_violations": gov_list,
+        "arch_governance_ok": not gov_list,
     }
-    if present or sidecar_imports or private_paths or image_literals or not imports_ok:
+    if (present or sidecar_imports or private_paths or image_literals
+            or not imports_ok or gov_list):
         return _fail("hygiene", "hygiene_violation", **metrics)
     return _pass("hygiene", **metrics)
 

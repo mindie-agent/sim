@@ -1,0 +1,608 @@
+"""CLI command dispatch, bounded JSON ingress, and UTF-8/LF emission.
+
+[Role] Execute parsed CLI commands by routing canonical subcommands through
+  ``mindie_sim.api`` -> ``PredictionSpine`` and preserving all 29 legacy
+  command handlers, bounded 50 MiB JSON reads, and profiler supply injection.
+[Invariants] Every JSON read enforces ``MAX_CLI_JSON_BYTES`` (50 MiB). Output
+  files are written as UTF-8 with Unix LF endings and ``allow_nan=False``;
+  non-UTF-8 stdout streams fall back to ASCII-escaped JSON cleanly.
+[Timeouts & Locks] Bounded metadata reads and streaming observation imports;
+  propagates ``TimeoutError`` without masking.
+[Side-Effect Policy] Writes only explicitly requested output, index or store
+  paths.
+"""
+from __future__ import annotations
+
+import argparse
+from contextlib import nullcontext
+import json
+from pathlib import Path
+import sys
+
+from . import api as sdk_api
+from . import predict
+from .cli_sku import SKU_COMMANDS, run_sku_command
+from .prediction.primitives import PrimitiveKey, PrimitiveStore
+from .prediction.results import ReplayOptions, StepRequest, json_payload
+from .prediction.structure import parse_case
+
+MIB_BYTES = 1024 * 1024
+MAX_CLI_JSON_BYTES = 50 * MIB_BYTES
+DEFAULT_PD_DIES = 16
+DEFAULT_FIT_MBU = 0.80
+DEFAULT_FIT_CUBE_MFU = 0.75
+DEFAULT_FIT_VEC_MFU = 0.65
+
+
+class CliUsageError(RuntimeError):
+    """Local usage rejection; never a profiler runtime dependency."""
+
+
+def load_cli_json(path: str | Path) -> object:
+    """Bounded CLI JSON ingress: size gate, UTF-8 and finite constants."""
+    target = Path(path)
+    if target.stat().st_size > MAX_CLI_JSON_BYTES:
+        raise CliUsageError("JSON input exceeds 50 MiB budget")
+    try:
+        raw = target.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise CliUsageError("invalid UTF-8 JSON input") from exc
+
+    def bad_const(token: str) -> None:
+        raise CliUsageError(f"non-finite JSON constant: {token}")
+
+    try:
+        return json.loads(raw, parse_constant=bad_const)
+    except (ValueError, RecursionError) as exc:
+        raise CliUsageError(f"invalid JSON input: {exc}") from exc
+
+
+def read_json(path: str | Path, /, *, bounded: bool = False) -> object:
+    """Read a JSON file bounded to 50 MiB."""
+    target = Path(path)
+    if target.stat().st_size > MAX_CLI_JSON_BYTES:
+        raise ValueError("metadata_input_exceeds_50_MiB:use_streaming_observation_import")
+    if bounded:
+        return load_cli_json(target)
+    with target.open(encoding="utf-8") as stream:
+        return json.load(stream)
+
+
+def emit(value: object, output: str | Path | None, /) -> None:
+    """Serialize JSON with Unix LF endings and CP936-safe stdout fallback."""
+    text = json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
+    data = text.encode("utf-8")
+    if output:
+        Path(output).write_bytes(data)
+        return
+    try:
+        print(text, end="")
+    except UnicodeEncodeError:
+        print(json.dumps(value, ensure_ascii=True, indent=2, allow_nan=False))
+
+
+def _case_with_supply(args: argparse.Namespace):
+    raw = read_json(args.case)
+    if getattr(args, "supply", None):
+        from .observations.calibration import apply_profiler_supply
+        raw = apply_profiler_supply(
+            raw,
+            args.supply,
+            recipe=getattr(args, "supply_recipe", None),
+            kernel=getattr(args, "supply_kernel", None),
+            hardware=getattr(args, "supply_hardware", None),
+            owners=getattr(args, "supply_owners", None),
+            legacy_diagnostics=bool(getattr(args, "supply_legacy_diagnostics", False)),
+        )
+    return raw
+
+
+def _export_structure_sidecar(args: argparse.Namespace, case, *, phase, tokens, context, sequences):
+    from .structure import export_structure
+    report = export_structure(
+        case,
+        phase=phase,
+        tokens=tokens,
+        context=context,
+        sequences=sequences,
+        scope=args.scope,
+        apply_body_defaults=args.apply_body_defaults,
+        draft_prepare=bool(getattr(args, "draft_prepare", False)),
+    )
+    path = Path(args.export_structure)
+    data = (json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n").encode("utf-8")
+    path.write_bytes(data)
+    return {
+        "structure_export": {
+            "path": str(path),
+            "nodes": len(report["nodes"]),
+            "graph_scope": report.get("graph_scope"),
+        }
+    }
+
+
+def _inspect_case(raw_case) -> dict:
+    from .prediction.attention import AttentionPolicy
+    from .prediction.body_defaults import effective_body_declaration
+    from .prediction.capacity import Memory
+    from .prediction.frontend import Frontend
+    from .prediction.graph import GraphPolicy
+    from .prediction.implementation_selection import (
+        combine_summaries, records_summary, resolve,
+    )
+    from .prediction.scheduler import Scheduler
+
+    case = parse_case(raw_case)
+    memory = Memory(case)
+    scheduler = Scheduler(case, list(case.workload.requests), memory)
+    plan = scheduler.schedule(min(r.arrival_ms for r in case.workload.requests))
+    if plan is None:
+        return {
+            "case": case.to_dict(),
+            "memory": memory.to_dict(),
+            "operators": [],
+            "operator_selection_summary": {},
+        }
+    views = tuple(plan.requests)
+    phase = next((view.phase for view in views), "decode")
+    effective, selection = effective_body_declaration(
+        case, phase, tokens=max(1, sum(view.q_len for view in views)), scope="body"
+    )
+    runtime = scheduler.next_runtime(plan)
+    bucket, replay_scope = GraphPolicy().select(views, runtime)
+    padded = max(sum(view.q_len for view in views), bucket or 0)
+    runtime, records = resolve(
+        runtime, views, padded_tokens=padded, replay_scope=replay_scope
+    )
+    frontend = Frontend(attention_policy=AttentionPolicy(**runtime.attention_policy))
+    work = frontend(plan, effective.model, runtime, effective.machine)
+    summary = combine_summaries([
+        selection.get("operator_selection_summary"),
+        records_summary(
+            arch_family=effective.machine.arch_family, phase=phase, records=records
+        ),
+    ])
+    return {
+        "case": case.to_dict(),
+        "memory": memory.to_dict(),
+        "operators": [op.to_dict() for op in work.ops],
+        "operator_selection_summary": summary,
+    }
+
+
+def _dispatch_sdk(args: argparse.Namespace) -> object | None:
+    cmd = args.command
+    if cmd == "predict-service":
+        raw = _case_with_supply(args)
+        replay = ReplayOptions(event_limit=int(args.event_limit))
+        with PrimitiveStore(args.primitives) if args.primitives else nullcontext(None) as store:
+            result = sdk_api.evaluate_service(raw, replay=replay, primitives=store)
+        return json_payload(result)
+    if cmd == "predict-step":
+        raw = _case_with_supply(args)
+        view = str(getattr(args, "view", "step"))
+        if view == "efficiency":
+            from .prediction.efficiency import analyze_network_efficiency
+            return analyze_network_efficiency(
+                raw, phase=args.phase, tokens=args.tokens, context=args.context,
+                sequences=args.sequences, scope=args.scope,
+            )
+        if view == "operators":
+            from .prediction.operator_analysis import operator_costs, target_graphs
+            case = parse_case(raw)
+            ops = target_graphs(
+                case, phase=args.phase, tokens=args.tokens, context=args.context,
+                sequences=args.sequences, scope=args.scope,
+                media_tokens_per_sequence=args.media_tokens_per_sequence,
+                draft_prepare=args.draft_prepare,
+            )
+            return {
+                **operator_costs(case, ops),
+                "graph_scope": args.scope,
+                "tokens_per_sequence": args.tokens,
+                "sequences": args.sequences,
+                "sequences_per_replica": args.sequences,
+                "draft_prepare": args.draft_prepare,
+                "deployment_scope": "first_independent_dp_cohort",
+            }
+        req = StepRequest(
+            phase=args.phase,
+            tokens=args.tokens,
+            context=args.context,
+            sequences=args.sequences,
+            scope=args.scope,
+            media_tokens_per_sequence=args.media_tokens_per_sequence,
+            draft_prepare=bool(args.draft_prepare),
+        )
+        replay = ReplayOptions(
+            include_submission=bool(args.include_submission),
+            isolated=bool(args.isolated),
+            event_limit=int(args.event_limit),
+        )
+        with PrimitiveStore(args.primitives) if args.primitives else nullcontext(None) as store:
+            result = sdk_api.evaluate_step(raw, req, replay=replay, primitives=store)
+        return json_payload(result)
+    if cmd == "predict-tiers":
+        raw = _case_with_supply(args)
+        req = StepRequest(
+            phase=args.phase,
+            tokens=args.tokens,
+            context=args.context,
+            sequences=args.sequences,
+            scope=args.scope,
+        )
+        replay = ReplayOptions(
+            isolated=bool(args.isolated),
+            event_limit=int(args.event_limit),
+        )
+        with PrimitiveStore(args.primitives) if args.primitives else nullcontext(None) as store:
+            result = sdk_api.evaluate_three_tiers(
+                raw, req, target_eff=float(args.target_eff),
+                replay=replay, primitives=store,
+            )
+        return json_payload(result)
+    return None
+
+
+def _dispatch_sweep(args: argparse.Namespace) -> object:
+    from .cli_options import (
+        apply_case_mapping_overrides,
+        case_overrides,
+        load_hardware_derivations,
+    )
+    from .sweep import sweep_pd_disaggregation_ratios, sweep_topologies
+
+    case_data = apply_case_mapping_overrides(read_json(args.case), case_overrides(args))
+    if args.mode == "pd":
+        decode_data = read_json(args.decode_case) if args.decode_case else case_data
+        return sweep_pd_disaggregation_ratios(
+            case_data,
+            decode_data,
+            total_dies=args.num_devices or DEFAULT_PD_DIES,
+            prompt_tokens=args.prompt_tokens,
+            output_tokens=args.output_tokens,
+            ttft_sla_ms=args.ttft_sla_ms,
+            tpot_sla_ms=args.tpot_sla_ms,
+        )
+    if args.resume and not (args.output_jsonl or args.checkpoint_jsonl):
+        raise CliUsageError("--resume requires --checkpoint-jsonl or --output-jsonl")
+    grids = (
+        [int(item) for item in str(args.num_devices_grid).split(",") if item.strip()]
+        if args.num_devices_grid else None
+    )
+    dcp_candidates = (
+        [int(item) for item in str(args.dcp_candidates).split(",") if item.strip()]
+        if args.dcp_candidates else None
+    )
+    explicit = read_json(args.candidates) if args.candidates else None
+    derivations = (
+        load_hardware_derivations(args.hardware_derivations)
+        if args.hardware_derivations else None
+    )
+    progress = None
+    if args.progress:
+        def progress(row):
+            print(
+                f"{row.get('candidate_id', '')} {row.get('status', '')} "
+                f"{row.get('evaluation_stage', '')} d={row.get('num_devices', '')} "
+                f"b1={row.get('step_ms_at_b1')}",
+                file=sys.stderr, flush=True,
+            )
+    return sweep_topologies(
+        case_data,
+        candidates=explicit,
+        num_devices=args.num_devices,
+        num_devices_grid=grids,
+        sla_ms=args.sla_ms,
+        context=args.context,
+        tokens_per_seq=args.tokens_per_seq,
+        output_budget=args.output_budget,
+        max_sequences_per_dp=args.max_sequences_per_dp,
+        phase=args.phase,
+        scope=args.scope,
+        allow_pp=args.allow_pp,
+        allow_pcp=args.allow_pcp,
+        allow_dcp=args.allow_dcp,
+        dcp_candidates=dcp_candidates,
+        hardware_derivations=derivations,
+        two_stage=args.two_stage,
+        finalist_top_k=args.finalist_top_k,
+        candidate_timeout_s=args.candidate_timeout_s,
+        output_jsonl=args.output_jsonl,
+        checkpoint_jsonl=args.checkpoint_jsonl,
+        isolate_workers=args.isolate_workers,
+        resume=args.resume,
+        progress_callback=progress,
+    )
+
+
+def _dispatch_sla(args: argparse.Namespace) -> object:
+    from . import runtime_advisor
+    from .cli_options import apply_case_mapping_overrides, case_overrides
+    from .prediction.efficiency import DEFAULT_SLA_SCENARIOS, solve_sla_sizing
+
+    case_data = apply_case_mapping_overrides(read_json(args.case), case_overrides(args))
+    has_custom_scale = any(
+        v is not None for v in (
+            args.hbm_bw_scale, args.cube_flops_scale, args.vector_ops_scale,
+            args.link_bw_scale, args.hbm_capacity_scale,
+        )
+    )
+    if args.scenarios:
+        scenarios = read_json(args.scenarios)
+    elif has_custom_scale:
+        scenarios = [
+            {
+                "id": "baseline", "label": "1x Baseline",
+                "hbm_bw_scale": 1.0, "cube_flops_scale": 1.0,
+                "vector_ops_scale": 1.0, "link_bw_scale": 1.0,
+                "hbm_capacity_scale": 1.0,
+            },
+            {
+                "id": "scaled", "label": "Custom Scaled",
+                "hbm_bw_scale": 1.0 if args.hbm_bw_scale is None else args.hbm_bw_scale,
+                "cube_flops_scale": 1.0 if args.cube_flops_scale is None else args.cube_flops_scale,
+                "vector_ops_scale": 1.0 if args.vector_ops_scale is None else args.vector_ops_scale,
+                "link_bw_scale": 1.0 if args.link_bw_scale is None else args.link_bw_scale,
+                "hbm_capacity_scale": 1.0 if args.hbm_capacity_scale is None else args.hbm_capacity_scale,
+            },
+        ]
+    else:
+        scenarios = None
+    jobs = runtime_advisor.resolve_jobs(
+        args.jobs, task_count=len(scenarios or DEFAULT_SLA_SCENARIOS)
+    )
+    result = solve_sla_sizing(
+        case_data,
+        sla_ms=args.sla_ms,
+        context=args.context,
+        tokens_per_seq=args.tokens_per_seq,
+        emitted_tokens_per_seq=args.emitted_tokens_per_seq,
+        max_sequences_per_dp=args.max_sequences_per_dp,
+        phase=args.phase,
+        scope=args.scope,
+        output_budget=args.output_budget,
+        target_mbu=args.target_mbu,
+        target_cube_mfu=args.target_cube_mfu,
+        target_vec_mfu=args.target_vec_mfu,
+        scenarios=scenarios,
+        sensitivity=args.sensitivity,
+        jobs=jobs,
+    )
+    result["sensitivity"] = args.sensitivity
+    result["jobs"] = jobs
+    return result
+
+
+def dispatch(args: argparse.Namespace, /) -> object:
+    """Execute one parsed command namespace and return its report payload."""
+    sdk_result = _dispatch_sdk(args)
+    if sdk_result is not None:
+        return sdk_result
+
+    cmd = args.command
+    if cmd == "call":
+        from .prediction.call import call_costs
+        from .prediction.call_builders import build_call
+        declaration = read_json(args.declaration)
+        call = build_call(declaration)
+        return {
+            **call_costs(
+                read_json(args.case), call.ops, recipes=call.recipes,
+                include_submission=args.include_submission,
+                **declaration.get("protocol", {}),
+            ),
+            "call": call.ledger,
+            "limitations": list(call.limitations),
+        }
+    if cmd == "compare-calls":
+        from .observations.call_alignment import compare_calls
+        return compare_calls(
+            read_json(args.case),
+            read_json(args.protocol),
+            root=args.root,
+            include_submission=args.include_submission,
+            submission=read_json(args.submission) if args.submission else None,
+            max_predictions=args.max_predictions,
+            max_conditions=args.max_conditions,
+        )
+    if cmd == "study":
+        from .study import study
+        packet = read_json(args.manifest)
+        root = Path(args.manifest).resolve().parent
+        candidates = [
+            {**row, "case": read_json(root / row["case"])}
+            if isinstance(row.get("case"), str) else row
+            for row in packet["candidates"]
+        ]
+        with PrimitiveStore(args.primitives) if args.primitives else nullcontext(None) as store:
+            return study(candidates, packet["probes"], primitives=store, **packet.get("options", {}))
+    if cmd == "accuracy":
+        from .observations.accuracy import accuracy_report
+        return accuracy_report(read_json(args.packet))
+    if cmd == "graph":
+        from .prediction.graph_analysis import graph_costs
+        from .prediction.operator_analysis import target_graphs
+        case = parse_case(_case_with_supply(args))
+        graphs = target_graphs(
+            case, phase=args.phase, tokens=args.tokens, context=args.context,
+            sequences=args.sequences, scope=args.scope,
+            media_tokens_per_sequence=args.media_tokens_per_sequence,
+            draft_prepare=args.draft_prepare,
+            apply_body_defaults=args.apply_body_defaults,
+        )
+        inputs = {"analysis_input": args.input_ready_ms} if args.scope == "body" else None
+        exported = {}
+        if args.export_structure:
+            exported = _export_structure_sidecar(
+                args, case, phase=args.phase, tokens=args.tokens,
+                context=args.context, sequences=args.sequences,
+            )
+        with PrimitiveStore(args.primitives) if args.primitives else nullcontext(None) as store:
+            return {
+                **graph_costs(
+                    case, graphs, primitives=store, external_inputs=inputs,
+                    input_ready_ms=args.input_ready_ms,
+                    include_submission=args.include_submission,
+                    replay_scope=args.replay_scope, isolated=not args.skip_isolated,
+                    trace_limit=args.event_limit,
+                ),
+                "graph_scope": args.scope,
+                "tokens_per_sequence": args.tokens,
+                "sequences_per_replica": args.sequences,
+                "media_tokens_per_sequence": args.media_tokens_per_sequence,
+                "draft_prepare": args.draft_prepare,
+                "deployment_scope": "first_independent_dp_cohort",
+                **exported,
+            }
+    if cmd == "operators":
+        from .prediction.operator_analysis import operator_costs, target_graphs
+        case = parse_case(_case_with_supply(args))
+        ops = target_graphs(
+            case, phase=args.phase, tokens=args.tokens, context=args.context,
+            sequences=args.sequences, scope=args.scope,
+            media_tokens_per_sequence=args.media_tokens_per_sequence,
+            draft_prepare=args.draft_prepare,
+            apply_body_defaults=args.apply_body_defaults,
+        )
+        return {
+            **operator_costs(case, ops),
+            "graph_scope": args.scope,
+            "tokens_per_sequence": args.tokens,
+            "sequences": args.sequences,
+            "sequences_per_replica": args.sequences,
+            "draft_prepare": args.draft_prepare,
+            "deployment_scope": "first_independent_dp_cohort",
+        }
+    if cmd == "predict":
+        with PrimitiveStore(args.primitives) if args.primitives else nullcontext(None) as store:
+            return predict(
+                _case_with_supply(args), primitives=store,
+                trace_limit=args.trace_limit, event_limit=args.event_limit,
+                scope=args.scope, phase=args.phase, tokens=args.tokens,
+                context=args.context, sequences=args.sequences,
+            )
+    if cmd == "inspect":
+        return _inspect_case(read_json(args.case))
+    if cmd == "catalog":
+        from .model_catalog import list_models, load_model
+        return load_model(args.name).to_dict() if args.name else list_models()
+    if cmd == "observations":
+        from .observations.store import ObservationIndex
+        with ObservationIndex(args.index) as index:
+            for directory in args.scan:
+                index.scan(directory)
+            if args.attach_profiler:
+                index.attach_profiler_catalogue(args.attach_profiler)
+            return index.find_sources(args.find) if args.find else index.inventory()
+    if cmd == "profiler-rows":
+        from itertools import islice
+        from .observations.store import ProfilerCatalogue, profiler_rows
+        if Path(args.source).suffix == ".csv":
+            return list(islice(profiler_rows(args.source), min(1000, args.limit)))
+        with ProfilerCatalogue(args.source) as catalog:
+            return list(catalog.variants(limit=args.limit, after=args.after))
+    if cmd == "calibrate":
+        import ijson
+        with PrimitiveStore(args.store, writable=True) as store, Path(args.samples).open("rb") as stream:
+            for sample in ijson.items(stream, "", multiple_values=True, use_float=True):
+                key = PrimitiveKey.from_mapping(sample.pop("key"))
+                store.record(key, **sample)
+            return store.inventory()
+    if cmd == "validate":
+        from .observations.validation import compare, service_observation
+        return compare(
+            read_json(args.prediction), service_observation(args.observation),
+            boundary=args.boundary,
+        )
+    if cmd == "bind-profiler":
+        import ijson
+        from .observations.calibration import import_profiler
+        with PrimitiveStore(args.store, writable=True) as store, Path(args.bindings).open("rb") as stream:
+            return import_profiler(
+                args.catalogue, store,
+                ijson.items(stream, "", multiple_values=True, use_float=True),
+            )
+    if cmd == "fit-rate":
+        from .observations.validation import fit_resource_rate
+        return fit_resource_rate(read_json(args.observations)["samples"])
+    if cmd == "fit-service":
+        from .observations.service_fitting import fit_service_curve
+        return fit_service_curve(read_json(args.observations))
+    if cmd == "compose":
+        from .cli_options import compose_case_kwargs
+        from .compose import compose_case
+        if not args.model:
+            raise ValueError("compose_requires_model")
+        return compose_case(
+            model=args.model, hardware=args.hardware or "a3",
+            **compose_case_kwargs(args),
+        )
+    if cmd == "feature-tracks":
+        from .feature_waterfall import compare_feature_tracks
+        return compare_feature_tracks(
+            args.model, args.hardware,
+            runtime_stack=(args.stack_manifest or args.stack),
+            phase=args.phase, tokens=args.tokens, context=args.context,
+            sequences=args.sequences, scope=args.scope,
+            ablate_prs=bool(args.ablate_prs),
+            tp=args.tp or 1, dp=args.dp or 1, ep=args.ep or 1,
+            pp=args.pp or 1, pcp=args.pcp or 1, dcp=args.dcp or 1,
+            num_devices=args.num_devices, layers=args.layers,
+            quant=args.quant, mtp_proposal_tokens=args.mtp_tokens or 0,
+        )
+    if cmd == "sweep":
+        return _dispatch_sweep(args)
+    if cmd == "efficiency":
+        from .prediction.efficiency import analyze_network_efficiency, fit_efficiency_targets
+        case_data = read_json(args.case)
+        if args.fit_targets or any(
+            v is not None for v in (
+                args.target_mbu, args.target_cube_mfu,
+                args.target_vec_mfu, args.target_link_util,
+            )
+        ):
+            fit_res = fit_efficiency_targets(
+                case_data, phase=args.phase, tokens=args.tokens,
+                context=args.context, sequences=args.sequences, scope=args.scope,
+                target_mbu=DEFAULT_FIT_MBU if args.target_mbu is None else args.target_mbu,
+                target_cube_mfu=(
+                    DEFAULT_FIT_CUBE_MFU if args.target_cube_mfu is None
+                    else args.target_cube_mfu
+                ),
+                target_vec_mfu=(
+                    DEFAULT_FIT_VEC_MFU if args.target_vec_mfu is None
+                    else args.target_vec_mfu
+                ),
+                target_link_util=args.target_link_util,
+                fixed_launch_us=args.fixed_launch_us,
+                mode=args.mode,
+            )
+            return {**fit_res["baseline_analysis"], **fit_res, "schema": "mindie-sim.efficiency/1"}
+        return analyze_network_efficiency(
+            case_data, phase=args.phase, tokens=args.tokens,
+            context=args.context, sequences=args.sequences, scope=args.scope,
+            observed_durations_ms=(
+                read_json(args.observed_durations) if args.observed_durations else None
+            ),
+            pmu_by_op=read_json(args.pmu) if args.pmu else None,
+            run_graph=not args.skip_graph,
+        )
+    if cmd == "sla":
+        return _dispatch_sla(args)
+    if cmd in SKU_COMMANDS:
+        return run_sku_command(args)
+    if cmd == "build-accel":
+        from .prediction.runtime.accel_build import build_accel
+        return build_accel(force=bool(args.force), check_only=bool(args.check))
+    raise ValueError("unknown_command")
+
+
+__all__ = [
+    "CliUsageError",
+    "MAX_CLI_JSON_BYTES",
+    "dispatch",
+    "emit",
+    "load_cli_json",
+    "read_json",
+]

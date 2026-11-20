@@ -168,7 +168,7 @@ def target_operators(case, *, phase, tokens, context=0, sequences=1, scope="body
     case = _media_case(case, views, scope, media_tokens_per_sequence)
     from .local_tp_groups import local_tp_spans_dp
     if (len(group) > 1
-            and (case.runtime.enable_dbo or case.runtime.kernels.get("sequence_parallel")
+            and (case.runtime.kernels.get("sequence_parallel")
                  or local_tp_spans_dp(case.runtime.parallel))):
         # A single rank cannot resolve cross-DP SP without the complete
         # cohort's query totals. Delegate only the cohort graph binding.
@@ -286,7 +286,7 @@ def _target_ops(case, views, scope, *, global_views=None, resource_fusion=True,
     from .frontend import mark_analytical_runtime
     runtime = mark_analytical_runtime(runtime, selections)
     case = replace(case, runtime=runtime)
-    from .dbo_ledger import selected_lane
+    from .rank_ledger import selected_lane
     local, local_tokens, pcp_prefill = frontend.partition_views(
         views, case.runtime, padded_tokens, model=case.model,
         lane=selected_lane(case.runtime.parallel, case.machine, replica, physical_rank))
@@ -521,7 +521,7 @@ def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
             "source_owner", "query_position"))
         for item in (case.runtime.routing.get("realizations") or ()))
     uniform_replicas = (
-        not case.runtime.enable_dbo and case.runtime.parallel.rank_table is None
+        case.runtime.parallel.rank_table is None
         and len(set(counts.values())) <= UNIFORM_COUNT_CARDINALITY
         and (scope != "model" or (
             case.machine.homogeneous

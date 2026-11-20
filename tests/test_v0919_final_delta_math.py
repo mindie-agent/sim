@@ -108,15 +108,17 @@ def _dbo_graphs(sequences):
 
 
 def test_dbo_microbatches_use_the_cohort_row_ledger():
+    # Framework graph layer keeps a single unsplit step (DBO belongs inside
+    # composite MoE/MC2 operators, never whole-graph microbatch splitting).
     graphs = _dbo_graphs([4, 3])
     per_replica = []
     for replica in (0, 1):
+        assert not [op for op in graphs[replica] if op.op_id.startswith("dbo")]
         gates = [op for op in graphs[replica] if op.recipe == "grouped_gate_up"]
-        assert [op.local_shape[0] for op in gates] == [16, 12]
-        per_replica.append([op.local_shape[0] for op in gates])
-    # Cohort assignments conserve exactly: microbatch zero owns 2 + 2 rows
-    # (32 assignments) and microbatch one owns 2 + 1 rows (24 assignments).
-    assert [sum(row[index] for row in per_replica) for index in (0, 1)] == [32, 24]
+        assert len(gates) == 1
+        per_replica.append(gates[0].local_shape[0])
+    # Total cohort assignments conserve: (4 + 3) * top_k(8) == 56 across 2 ranks.
+    assert sum(per_replica) == 56
 
 
 # ---------------------------------------------------------------------------
@@ -506,16 +508,16 @@ def test_dbo_pcp_microbatches_consume_only_their_sharded_rows():
         sequences=2, scope="body")
     packed, consumed = [], []
     for replica in graphs:
+        assert not [op for op in graphs[replica] if op.op_id.startswith("dbo")]
         packs = [op for op in graphs[replica] if op.recipe == "route_pack"]
         gates = [op for op in graphs[replica] if op.recipe == "grouped_gate_up"]
         packed.extend(int(op.local_shape[0]) * int(op.local_shape[1])
                       for op in packs)
         consumed.extend(int(op.local_shape[0]) for op in gates)
-    # Two 8-token prefills split into two 4-token PCP microbatches; each packs
-    # and consumes 4 * top_k == 32 assignments, never the unsharded 8 tokens.
-    assert packed == [32, 32]
-    assert consumed == [32, 32]
-    assert sum(consumed) == 64
+    # Two 8-token prefills under PCP=2 hold 8 sharded rows on this lane;
+    # without whole-graph splitting, one step packs and consumes 8 * top_k == 64.
+    assert packed == [64]
+    assert consumed == [64]
 
 
 # ---------------------------------------------------------------------------

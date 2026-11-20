@@ -526,20 +526,12 @@ def export_structure(case, *, phase, tokens, context=0, sequences=1,
     return export_op_structure(graphs, native_evidence=native_evidence, **options)
 
 
-def _structure_inputs(case, *, phase, tokens, context=0, sequences=1,
-                      scope="model", source=None, expand_calls=True,
-                      apply_body_defaults=True, replicas=None,
-                      draft_prepare=False):
-    """Bind the complete cohort once before choosing an export consumer."""
-    if not isinstance(draft_prepare, bool):
-        raise ValueError("structure_draft_prepare_must_be_bool")
-    case = parse_case(case)
-    graphs = target_graphs(
-        case, phase=phase, tokens=tokens, context=context,
-        sequences=sequences, scope=scope, resource_fusion=False,
-        draft_prepare=draft_prepare,
-        apply_body_defaults=apply_body_defaults,
-    )
+def structure_inputs_from_graphs(
+    case, graphs, *, phase, tokens, context=0, sequences=1,
+    scope="model", source=None, expand_calls=True, apply_body_defaults=True,
+    replicas=None, draft_prepare=False, physical_graphs=None,
+):
+    """Build ``export_op_structure`` inputs from already-lowered cohort graphs."""
     from .prediction.body_defaults import consume_target_declaration
     case = consume_target_declaration(case, graphs)
     cohort_replicas = sorted(graphs)
@@ -560,8 +552,11 @@ def _structure_inputs(case, *, phase, tokens, context=0, sequences=1,
     from .prediction.native_fusion import lower_native_fusions
     from .prediction.mechanism import Geometry
 
-    physical_graphs = {replica: lower_native_fusions(ops, case.runtime)
-                       for replica, ops in graphs.items()}
+    if physical_graphs is None:
+        physical_graphs = {replica: lower_native_fusions(ops, case.runtime)
+                           for replica, ops in graphs.items()}
+    else:
+        physical_graphs = {replica: physical_graphs[replica] for replica in graphs}
     geometries = {}
     parallel = case.runtime.parallel
     width = parallel.tp * parallel.pcp
@@ -593,11 +588,33 @@ def _structure_inputs(case, *, phase, tokens, context=0, sequences=1,
             **({"resource_geometry": {
                 f"replica:{replica}/stage:{stage}": {
                     key: field for key, field in asdict(value).items()
-                    if key not in {"rates", "compute_peaks"}
+                    if key not in {"rates", "compute_peaks", "compute_arch", "datapath"}
                 }
                 for (replica, stage), value in geometries.items()}}
                if geometries else {}),
         },
+    )
+
+
+def _structure_inputs(case, *, phase, tokens, context=0, sequences=1,
+                      scope="model", source=None, expand_calls=True,
+                      apply_body_defaults=True, replicas=None,
+                      draft_prepare=False):
+    """Bind the complete cohort once before choosing an export consumer."""
+    if not isinstance(draft_prepare, bool):
+        raise ValueError("structure_draft_prepare_must_be_bool")
+    case = parse_case(case)
+    graphs = target_graphs(
+        case, phase=phase, tokens=tokens, context=context,
+        sequences=sequences, scope=scope, resource_fusion=False,
+        draft_prepare=draft_prepare,
+        apply_body_defaults=apply_body_defaults,
+    )
+    return structure_inputs_from_graphs(
+        case, graphs, phase=phase, tokens=tokens, context=context,
+        sequences=sequences, scope=scope, source=source,
+        expand_calls=expand_calls, apply_body_defaults=apply_body_defaults,
+        replicas=replicas, draft_prepare=draft_prepare,
     )
 
 

@@ -120,7 +120,9 @@ def _opaque_ids(ops: tuple[OpSpec, ...], book: RecipeBook) -> tuple[str, ...]:
             raise
         except Exception:
             continue
-        if isinstance(recipe, PlannedRecipe):
+        if isinstance(recipe, PlannedRecipe) and not getattr(
+            recipe, "traffic_rewrite_capable", False
+        ):
             found.add(op.op_id)
     return tuple(sorted(found))
 
