@@ -100,6 +100,8 @@ DEFAULT_SWIZZLE_OFFSETS = (1, 2, 3, 4, 6, 8, 12, 16)
 DEFAULT_SIMT_BLOCK = (128, 1, 1)
 _MATRIX_SHAPE_RANK = 3
 _RING_COUNT = 5
+_DEFAULT_STAGE_DEPTHS = (2, 2, 2, 2, 1)
+_MUTEX_STAGE_DEPTHS = (2, 2, 2, 2, 2)
 _DTYPE_ALIASES = {"float32": "fp32", "float16": "fp16", "bfloat16": "bf16"}
 
 
@@ -134,6 +136,9 @@ class CatlassProblem:
     c_id: str = "c"
     has_bias: bool = False
     mx_mode: str | None = None
+    indices: tuple[int, ...] | None = None
+    physical_m: int | None = None
+    indices_id: str = "indices"
 
     def __post_init__(self) -> None:
         if any(type(n) is not int or n < 1 for n in (self.m, self.n, self.k)):
@@ -142,6 +147,18 @@ class CatlassProblem:
             raise ModelingError("catlass_group_rows_invalid")
         if len({self.a_id, self.b_id, self.c_id}) != _MATRIX_SHAPE_RANK or not all((self.a_id, self.b_id, self.c_id)):
             raise ModelingError("catlass_operand_id_invalid")
+        if self.physical_m is not None and (type(self.physical_m) is not int or self.physical_m < self.m):
+            raise ModelingError("catlass_physical_row_count_invalid")
+        if self.indices is not None and (
+            len(self.indices) != self.m or any(type(i) is not int or i < 0 for i in self.indices)
+            or (self.physical_m is not None and max(self.indices) >= self.physical_m)
+            or not self.indices_id or self.indices_id in {self.a_id, self.b_id, self.c_id}
+        ):
+            raise ModelingError("catlass_gather_scatter_indices_invalid")
+
+    @property
+    def output_rows(self) -> int:
+        return self.physical_m or max(self.m, max(self.indices or (), default=-1) + 1)
 
 
 def matrix_problem(problem: CatlassProblem | Mapping) -> CatlassProblem:
@@ -241,6 +258,11 @@ def validate_catlass_spec(spec: CatlassKernelSpec, p: CatlassProblem, datapath: 
         "MatmulGatherScatterSimt", "tla_dsl", "GroupedMxMatmulFinalizeRoutingTla",
     }):
         raise ModelingError("catlass_simt_dispatch_policy_required")
+    if (p.indices is not None or p.physical_m is not None) and (
+        spec.dispatch_policy != "MatmulGatherScatterSimt"
+        or (spec.layout_a, spec.layout_b, spec.layout_c) != ("RowMajor",) * _MATRIX_SHAPE_RANK
+    ):
+        raise ModelingError("catlass_indexed_operands_require_gather_scatter")
     if spec.template_id in {"catlass.mx_matmul", "catlass.grouped_mx_swiglu_mx_quant"} and not spec.mx_scale_group:
         raise ModelingError("catlass_scale_specialization_required")
     if spec.enable_unit_flag and spec.stages[-1] != 1:
@@ -311,7 +333,7 @@ def enumerate_catlass_specs(
     template_ids: Iterable[str] = CATLASS_TEMPLATE_IDS,
     l1_tiles: Iterable[tuple[int, int, int]] = DEFAULT_L1_TILES,
     l0_tiles: Iterable[tuple[int, int, int]] | None = None,
-    stage_options: Iterable[tuple[int, int, int, int, int]] = ((2, 2, 2, 2, 1),),
+    stage_options: Iterable[tuple[int, int, int, int, int]] | None = None,
     swizzle_offsets: Iterable[int] = DEFAULT_SWIZZLE_OFFSETS,
     evg_tree: tuple[EvgVisitorNode, ...] = (),
     simt_variants: Iterable[str] = ("MatmulGatherScatterSimt", "tla_dsl", "GroupedMxMatmulFinalizeRoutingTla"),
@@ -327,7 +349,8 @@ def enumerate_catlass_specs(
     aiv = datapath.aiv_count if aiv_budget is None else aiv_budget
     if not (1 <= aic <= datapath.aic_count and 0 <= aiv <= datapath.aiv_count):
         raise ModelingError("catlass_core_budget_invalid")
-    stage_options, swizzle_offsets = tuple(stage_options), tuple(swizzle_offsets)
+    stage_options = None if stage_options is None else tuple(stage_options)
+    swizzle_offsets = tuple(swizzle_offsets)
     simt_variants, simt_thread_blocks = tuple(simt_variants), tuple(simt_thread_blocks)
     l0_tiles = None if l0_tiles is None else tuple(l0_tiles)
     tiles = tuple(l1_tiles)
@@ -351,7 +374,11 @@ def enumerate_catlass_specs(
             "catlass.mx_matmul": "MmadA8W4Mx" if p.mx_mode == "a8w4_mx" else "MmadMx",
             "catlass.grouped_mx_swiglu_mx_quant": "MmadMx",
         }.get(name, "MmadPingpong" if modern else "MmadAtlasA2Pingpong"),)
-        for l1, raw_stages, (direction, offset), policy in product(tiles, stage_options, swizzles, policies):
+        default_stages = (_MUTEX_STAGE_DEPTHS if name == "catlass.mutex_block_mmad" and not enable_unit_flag
+                          else _DEFAULT_STAGE_DEPTHS)
+        for l1, raw_stages, (direction, offset), policy in product(
+            tiles, (default_stages,) if stage_options is None else stage_options, swizzles, policies,
+        ):
             tm, tn, tk = l1
             if min(l1) < 1:
                 raise ModelingError("catlass_tile_shape_invalid")

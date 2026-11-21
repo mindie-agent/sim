@@ -30,6 +30,7 @@ from .dsl_catalog import (
     QsliProblem,
     QkvQuantMode,
     enumerate_dsl_specs,
+    resolve_flash_kda_route,
 )
 from .dsl_lower import lower_dsl_spec
 from .fuse_region import compile_fuse_region
@@ -64,4 +65,5 @@ __all__ = [
     "enumerate_dsl_specs",
     "lower_catlass_spec",
     "lower_dsl_spec",
+    "resolve_flash_kda_route",
 ]

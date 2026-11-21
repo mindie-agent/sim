@@ -28,6 +28,40 @@ def all_template_source_refs() -> tuple[TemplateSourceRef, ...]:
     return tuple(dict.fromkeys((*CATLASS_SOURCE_REFS, *DSL_SOURCE_REFS)))
 
 
+def default_cube_peak(datapath, dtype):
+    """Find a unique packaged precision rate for the supplied capability view."""
+    from mindie_sim.backends import ascend_profiles
+
+    arch = datapath.compute_arch.declared
+    if arch is None or not arch.supports_native("matrix", dtype):
+        raise ModelingError(f"fuse_region_matrix_precision_unsupported:{dtype}")
+    profiles = (
+        profile["device"] for profile in ascend_profiles().values()
+        if profile["device"]["compute_arch"].get("preset") == datapath.arch_id
+    )
+    candidates, buffers = [], dict(datapath.buffers)
+    for device in profiles:
+        rates = device["rates"]
+        if (device.get("hbm_read_bytes_per_s", rates["hbm"]) != datapath.hbm_read_bytes_per_s
+                or device.get("hbm_write_bytes_per_s", rates["hbm"]) != datapath.hbm_write_bytes_per_s
+                or device["compute_units"] != datapath.aic_count):
+            continue
+        peaks = device["compute_peaks"]
+        name = device.get("compute_peak_aliases", {}).get(dtype, dtype)
+        try:
+            rate = peaks[name]
+        except KeyError:
+            continue
+        matches = sum(buffers.get(pool) == size for pool, size in device["buffers"].items())
+        candidates.append((matches, rate))
+    if candidates:
+        best = max(matches for matches, _ in candidates)
+        peaks = {peak for matches, peak in candidates if matches == best}
+        if len(peaks) == 1:
+            return peaks.pop()
+    raise ModelingError(f"fuse_region_compute_precision_requires_context:{dtype}")
+
+
 class TemplateCatalog:
     """Public dispatcher for concrete template specs and shipping family plans."""
 

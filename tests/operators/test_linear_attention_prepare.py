@@ -14,8 +14,8 @@ import pytest
 
 from _support.axes import REPRESENTATIVE_SKUS, SKUS
 from _support.builders import linear_layer, linear_model
-from _support.hardware import machine
-from _support.linear_cases import kda_hardware_case
+from _support.linear_cases import kda_hardware_case, sku_planning_context
+from mindie_sim.prediction.gdn_chunk32 import PR22147_SOURCE
 from mindie_sim import graph_costs, operator_costs, predict, target_graphs, target_operators
 from mindie_sim.observations.gdn_binding import bind_observation
 from mindie_sim.observations.historical import call_observations
@@ -28,8 +28,6 @@ from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.mechanism import Geometry, PlannedRecipe
 from mindie_sim.prediction.operators import gdn_prepare as gdn, kda_prepare
 from mindie_sim.prediction.operators import native_causal_conv_prefill as convolution
-from mindie_sim.prediction.operators.contracts import OperatorPlanningContext
-from mindie_sim.prediction.results import OpOccurrence
 from mindie_sim.prediction.operators.linear_attention import build, compute_wy_chunk_work, resolve_operator_plan
 from mindie_sim.prediction.program import RecipeBook
 from mindie_sim.prediction.recurrent import linear
@@ -508,11 +506,6 @@ def test_gate_barrier_ready_and_empty_owners_survive_compaction():
     assert engine.summary()["live_tasks"] == 0
 
 
-def _planning_context(sku, op_id):
-    geom = Geometry.from_devices(machine(sku).dies)
-    return geom, OperatorPlanningContext(OpOccurrence(0, 0, 0, op_id), geom, geom.datapath)
-
-
 def _wy_op(**metadata):
     return OpSpec("wy", "gdn_prefill", "prefill", 0, 0, ("r",), (), (), (), (), recipe="gdn_prefill", dtype="bf16",
                   metadata=tuple(dict({"lengths": (64,), "dk": 64, "dv": 128}, **metadata).items()))
@@ -520,7 +513,7 @@ def _wy_op(**metadata):
 
 @pytest.mark.parametrize("sku", SKUS)
 def test_wy_dispatch_conserves_contractions_and_launch_boundaries(sku):
-    geometry, ctx = _planning_context(sku, "wy")
+    geometry, ctx = sku_planning_context(sku, "wy")
     op = _wy_op()
     resolved = resolve_operator_plan(op, ctx)
     plan = resolved.recipe
@@ -534,11 +527,11 @@ def test_wy_dispatch_conserves_contractions_and_launch_boundaries(sku):
             "SyncAll.entry", "SyncAll.prepare", "SyncAll.state", "SyncAll.output")
         return
 
-    score, mixed, value = 2 * 64**3, 2 * 64**2 * 128, 2 * 64**2 * 128
+    score, mixed = 2 * 64**2 * 128, 2 * 64 * 128**2
     contractions = {
         "KKT_QKT": 2 * score, "offdiagonal_inverse": 2 * 2 * 32**3,
-        "Kcd_U": score + value, "R_O_inter": 2 * mixed,
-        "delta_L0C_to_UB": mixed, "O_L0C_to_GM": value,
+        "Kcd_U": 2 * score, "R_O_inter": 2 * mixed,
+        "delta_L0C_to_UB": mixed, "O_L0C_to_GM": score,
     }
     assert {name: sum(w.amount for w in phase.work if w.resource == "cube")
             for name, phase in phases.items() if any(w.resource == "cube" for w in phase.work)} == contractions
@@ -549,14 +542,34 @@ def test_wy_dispatch_conserves_contractions_and_launch_boundaries(sku):
     assert phases["S_next"].after == ("delta_L0C_to_UB",)
 
 
+@pytest.mark.parametrize("lengths,dim,streamed,chunked,cube", (
+    ((1,), 64, 1, 0, 0), ((65,), 128, 0, 1, 23_330_816), ((65, 1), 64, 1, 1, 23_330_816),
+))
+def test_gdn_dispatches_each_varlen_sequence_and_issues_padded_bf16(lengths, dim, streamed, chunked, cube):
+    geom, _ = sku_planning_context(NEWEST_SKU, "wy")
+    plan = build(_wy_op(lengths=lengths, dk=dim, dv=dim), geom)
+    assert sum(plan.work.matrix.values()) == cube and set(plan.work.matrix) <= {"bf16"}
+    assert (plan.metadata["streaming_exact_sequences"], plan.metadata["chunked_wy_sequences"]) == (streamed, chunked)
+    assert plan.metadata["launch_count"] == 1 and plan.work.resources["vector"] > 0
+
+
 def test_wy_chunk_width_requires_pinned_source_abi():
-    _, ctx = _planning_context(NEWEST_SKU, "wy")
+    _, ctx = sku_planning_context(NEWEST_SKU, "wy")
     with pytest.raises(ModelingError, match="requires_pinned_abi"):
         resolve_operator_plan(_wy_op(bt=32), ctx)
     plan = resolve_operator_plan(_wy_op(bt=32, abi="gdn_chunk32"), ctx).recipe
     assert plan.metadata["offdiag_inv_flops"] == compute_wy_chunk_work(32, 64, 128, 32).offdiag_inv_flops == 0
     assert plan.metadata["launch_count"] == len(plan.metadata["launch_boundaries"]) == 3
     assert compute_wy_chunk_work(64, 64, 128).offdiag_inv_flops == 2 * 2 * 32**3
+    for leaf in ("prepare", "state", "output"):
+        abi = f"gdn_{leaf}_arch35_chunk32"
+        for hv in (1, 2, 3, 4):
+            result = resolve_operator_plan(_wy_op(bt=32, abi=abi, hv=hv, hk=1), ctx)
+            assert result.recipe.metadata["launch_count"] == 1
+            assert result.recipe.metadata["launch_boundaries"] == (abi,)
+            assert [ref.to_dict() for ref in result.sources] == [PR22147_SOURCE]
+        with pytest.raises(ModelingError, match="head"):
+            resolve_operator_plan(_wy_op(bt=32, abi=abi, hv=8, hk=1), ctx)
 
 
 @pytest.mark.parametrize("metadata", (
@@ -564,7 +577,7 @@ def test_wy_chunk_width_requires_pinned_source_abi():
     {"abi": "gdn_chunk32"}, {"abi": "flash_kda_persistent"},
 ))
 def test_staged_isa_rejects_direct_routes_and_foreign_abis(metadata):
-    _, ctx = _planning_context(OLDER_SKU, "wy")
+    _, ctx = sku_planning_context(OLDER_SKU, "wy")
     op = _wy_op(**metadata)
     if metadata.get("abi") == "flash_kda_persistent":
         op = replace(op, family="kda_prefill", recipe="kda_prefill")
@@ -573,8 +586,8 @@ def test_staged_isa_rejects_direct_routes_and_foreign_abis(metadata):
 
 
 def test_direct_isa_rejects_synthetic_datapath_without_routes():
-    _, ctx = _planning_context(NEWEST_SKU, "wy")
-    _, staged = _planning_context(OLDER_SKU, "wy")
+    _, ctx = sku_planning_context(NEWEST_SKU, "wy")
+    _, staged = sku_planning_context(OLDER_SKU, "wy")
     with pytest.raises(ModelingError, match="L0C to UB and UB to L1"):
         resolve_operator_plan(_wy_op(), replace(ctx, datapath=replace(
             ctx.datapath, usable_paths=staged.datapath.usable_paths)))

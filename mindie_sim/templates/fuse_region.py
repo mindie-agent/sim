@@ -13,7 +13,6 @@ from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from fractions import Fraction
-from graphlib import CycleError, TopologicalSorter
 from types import SimpleNamespace
 
 from mindie_sim.prediction.mechanism import Work
@@ -30,10 +29,11 @@ from mindie_sim.prediction.runtime.tile_solver import (
 )
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import DatapathCapabilitySpec
+from mindie_sim.schema.hardware import NATIVE_WORK_UNITS
 
 from .contracts import (
     EdgeRouteBinding, FuseRegionSpec, FusedRegionSummary, SemanticWorkItem,
-    TemplateLoweringResult, TensorRangeObligation, _union_obligations, ceil_div,
+    TemplateLoweringResult, TensorRangeObligation, _region_order, _topological, _union_obligations, ceil_div,
 )
 
 _VECTOR_PIPES = {"vector", "vec_alu", "vec_sfu", "vec_reduce", "aiv_simt", "sort_topk"}
@@ -74,13 +74,6 @@ def solve_template_tile(datapath, family, candidate, *, state=None, die=0, reser
     return solution
 
 
-def _topological(parents, message):
-    try:
-        return tuple(TopologicalSorter(parents).static_order())
-    except CycleError as exc:
-        raise ModelingError(message) from exc
-
-
 def ordered_stages(stages: Sequence[Stage]) -> tuple[Stage, ...]:
     by_name = {stage.name: stage for stage in stages}
     if len(by_name) != len(stages):
@@ -91,6 +84,10 @@ def ordered_stages(stages: Sequence[Stage]) -> tuple[Stage, ...]:
     return tuple(by_name[name] for name in order)
 
 
+def ring_credit(ring, generation):
+    return ring.initial_credit(ring.slot(generation)) if generation < ring.depth else ring.last_use(generation - ring.depth)
+
+
 @dataclass(frozen=True)
 class _BoundTemplateProgram(KernelProgram):
     """Declare directional admission rows before submitting the bound DAG."""
@@ -98,6 +95,7 @@ class _BoundTemplateProgram(KernelProgram):
     hbm_bus: HbmBusSpec | None = None
     live_state: AdmissionMemoryView | None = None
     l2_reservation: tuple[int, int, int] | None = None
+    summary: FusedRegionSummary | None = None
 
     def start(self, engine, name, ready, *, owner=""):
         bus = self.hbm_bus
@@ -107,20 +105,34 @@ class _BoundTemplateProgram(KernelProgram):
                 engine.add_hbm_bus(bus)
             elif not all(present):
                 raise ModelingError("template_directional_hbm_rows_incomplete")
-        if self.l2_reservation is None or self.live_state is None:
+        if self.live_state is None:
             return super().start(engine, name, ready, owner=owner)
-        die, reserved, capacity = self.l2_reservation
-        state = self.live_state
-        key = name + ":l2_reservation"
+        delivered = Counter()
+        stages = tuple(replace(stage, program=replace(stage.program, delivered=delivered))
+                       if isinstance(stage.program, _LiveAccess) else stage for stage in self.stages)
+        state, key = self.live_state, name + ":l2_reservation"
+        reservation = self.l2_reservation
+        if reservation is not None:
+            die, reserved, capacity = reservation
 
-        def grant(_event):
-            if state.reserved_bytes(die) + reserved > capacity:
-                raise ModelingError("fuse_region_live_l2_reservation_overflow")
-            state.grant_reservation(die, key, reserved)
+            def grant(_event):
+                if state.reserved_bytes(die) + reserved > capacity:
+                    raise ModelingError("fuse_region_live_l2_reservation_overflow")
+                state.grant_reservation(die, key, reserved)
 
-        acquired = engine.submit(key, after=(ready,), owner=owner, on_start=grant)
-        done = super().start(engine, name, acquired, owner=owner)
-        engine.on_complete(done, lambda _event: state.release_reservation(die, key))
+            ready = engine.submit(key, after=(ready,), owner=owner, on_start=grant)
+        invocation = KernelProgram(stages)
+        done = invocation.start(engine, name, ready, owner=owner)
+        # Scoped observers are unique to this invocation and cannot reuse a compiled plan.
+        engine._compiled_programs.pop(id(invocation), None)
+
+        def finalize(_event):
+            if reservation is not None:
+                state.release_reservation(die, key)
+            total = delivered[bus.ctr_r] + delivered[bus.ctr_w]
+            object.__setattr__(self.summary, "realized_hbm_bytes", total)
+
+        engine.on_complete(done, finalize)
         return done
 
 
@@ -129,12 +141,38 @@ class _LiveAccess:
     bound: BoundAccess
     state: AdmissionMemoryView
     pattern: MemoryAccessPattern
+    delivered: Counter | None = None
 
     def start(self, engine, name, ready, *, owner=""):
-        return engine.submit_bound_access(
-            name, self.bound, after=(ready,), owner=owner,
-            memory_state=self.state, pattern=self.pattern,
-        )
+        done = engine.future(name + ":delivered")
+
+        def admit(event):
+            bus, hit, miss, l2, copy_row, l2_row, rules, nominal = self.bound.bind_config
+            bound = bind_memory_access(
+                self.pattern, self.state, hbm_bus=bus, copy_hit_bytes_per_ms=hit, copy_miss_bytes_per_ms=miss,
+                l2_bytes_per_ms=l2, pipe_row_id=copy_row, l2_row_id=l2_row, burst_rules=rules,
+                nominal_pipe_bytes_per_ms=nominal, commit=True,
+            )
+            access = engine.submit_bound_access(name, bound, after=(event,), owner=owner)
+            deliveries = [(term.counter_id, term.work_per_progress) for term in bound.deliveries]
+            dirty = sum(item.bytes for item in self.state.drain_writebacks(bus.die))
+            if dirty:
+                deliveries.append((bus.ctr_w, dirty))
+                work = {term.row_id: term.ms_per_progress for term in bus.terms_for("write", dirty)
+                        if term.ms_per_progress}
+                access = engine.submit(name + ":dirty_writeback", work, after=(access,), owner=owner,
+                                       coupled=True, deliveries=((bus.ctr_w, dirty),))
+
+            def record(_event):
+                if self.delivered is not None:
+                    for counter, amount in deliveries:
+                        self.delivered[counter] += amount
+                engine.resolve(done)
+
+            engine.on_complete(access, record)
+
+        engine.on_complete(ready, admit)
+        return done
 
 
 class Lowering:
@@ -158,7 +196,7 @@ class Lowering:
                 row_r=hbm + ":r", row_w=hbm + ":w",
                 ctr_r=hbm + ":ctr_r", ctr_w=hbm + ":ctr_w",
             )
-        if live_admission and (context is None or memory_view is None):
+        if live_admission and (self.hbm_bus is None or memory_view is None):
             raise ModelingError("template_live_admission_requires_context_and_view")
         self.live_state = memory_view if live_admission else None
         self.state = deepcopy(memory_view) if memory_view is not None else AdmissionMemoryView({
@@ -203,6 +241,12 @@ class Lowering:
         return self.add(Stage("aicpu_metadata", after=after, latency=float(self.metadata_ms),
                               metadata={"aicpu_metadata": True}))
 
+    def binding_role(self, role):
+        if role in _VECTOR_PIPES - {"vector", "aiv_simt"}:
+            if self.context.service_rate(role) is None and role not in self.context.resource_names:
+                return "vector"
+        return role
+
     def work(self, name, role, amount, *, after=(), owner=0, dtype=None, metadata=None) -> str:
         if amount < 0:
             raise ModelingError(f"template_stage_negative_work:{name}")
@@ -214,11 +258,9 @@ class Lowering:
                 self.vector[role] += amount
             physical = Work(resources={role: amount})
         if self.context is not None:
-            role_for_binding = role
-            if role in {"vec_alu", "vec_sfu", "vec_reduce", "sort_topk"}:
-                if self.context.service_rate(role) is None and role not in self.context.resource_names:
-                    role_for_binding = "vector"
-                    physical = Work(resources={role_for_binding: amount})
+            role_for_binding = self.binding_role(role)
+            if role_for_binding != role:
+                physical = Work(resources={role_for_binding: amount})
             work = self.context.bind(physical)
             axis_count = self.datapath.aic_count if role in _AIC_RESOURCES else self.datapath.aiv_count
             placement = self.context.owned(owner, axis_count, (role_for_binding,)) if work else {}
@@ -257,6 +299,8 @@ class Lowering:
         amount = sum(item.bytes for item in evictions)
         self.sectors += amount
         self.service += amount
+        if self.live_state is not None:
+            return after
         if self.hbm_bus is not None:
             work = {term.row_id: term.ms_per_progress for term in self.hbm_bus.terms_for("write", amount)
                     if term.ms_per_progress}
@@ -301,18 +345,14 @@ class Lowering:
         plan = pattern.runs
         resident = self.state.resident_intervals_for(pattern, plan.aligned_copy_bytes())
         if self.context is not None:
-            preview = (
-                self.context.bind_access(pattern, self.state, hbm_bus=self.hbm_bus, burst_rules=self.burst_rules)
-                if self.live_state is not None else None
-            )
             bound = self.context.bind_access(
                 pattern, self.state, hbm_bus=self.hbm_bus, burst_rules=self.burst_rules, commit=True,
             )
             stage = bound.to_stage(name, after=after)
             if bound.l2_row_id not in self.context.rates and bound.l2_row_id in stage.work:
                 stage = replace(stage, work={role: value for role, value in stage.work.items() if role != bound.l2_row_id})
-            if preview is not None:
-                stage = Stage(name, after=after, program=_LiveAccess(preview, self.live_state, pattern))
+            if self.live_state is not None:
+                stage = Stage(name, after=after, program=_LiveAccess(bound, self.live_state, pattern))
         else:
             # Unit-rate normalization recovers native byte work independently
             # of hardware service rates. An Engine supplies real rates later.
@@ -339,10 +379,11 @@ class Lowering:
             tuple(sorted(self.vector.items())), _union_obligations(self.reads), _union_obligations(self.writes),
             self.logical, self.copied, self.sectors, self.service, self.hits, tuple(comm), launches,
             self.metadata_ms, tuple((peak.pool, peak.peak_bytes) for peak in solution.pool_peaks), spec,
+            None if self.live_state is not None else float(self.service),
         )
         program = (
             _BoundTemplateProgram(stages, hbm_bus=self.hbm_bus, live_state=self.live_state,
-                                  l2_reservation=self.l2_reservation)
+                                  l2_reservation=self.l2_reservation, summary=summary)
             if self.hbm_bus is not None else KernelProgram(stages)
         )
         return TemplateLoweringResult(program, summary, len(stages), self.hits, self.misses)
@@ -376,76 +417,6 @@ def _rational_service(plan, resident, rules):
     if service and plan.scale_bytes:
         service += ceil_div(plan.scale_bytes, plan.sector_bytes) * plan.sector_bytes
     return service
-
-
-def _region_order(op_ids, dependencies, barriers, edge_routes, waits, numerics, views):
-    selected = set(op_ids)
-    if not selected or len(selected) != len(op_ids) or not selected <= dependencies.keys():
-        raise ModelingError("fuse_region_op_ids_invalid")
-    if selected.intersection(barriers):
-        raise ModelingError("fuse_region_collective_barrier")
-    if any(parent not in dependencies for parents in dependencies.values() for parent in parents):
-        raise ModelingError("fuse_region_graph_parent_unknown")
-    order = _topological(dependencies, "fuse_region_graph_cycle")
-    escaped = set()
-    for name in order:
-        if name in selected:
-            if escaped.intersection(dependencies[name]):
-                raise ModelingError(f"fuse_region_not_convex:{name}")
-        elif (selected | escaped).intersection(dependencies[name]):
-            escaped.add(name)
-    internal = {name: set(dependencies[name]) & selected for name in selected}
-    edge_keys = set()
-    for edge in edge_routes:
-        if edge.dst_op not in selected or edge.src_op not in internal[edge.dst_op]:
-            raise ModelingError(f"fuse_region_edge_not_internal:{edge.view_id}")
-        key = (edge.src_op, edge.producer_version, edge.view_id, edge.dst_op, edge.iter_kind)
-        if key in edge_keys:
-            raise ModelingError(f"fuse_region_duplicate_edge:{edge.view_id}")
-        edge_keys.add(key)
-    if {(edge.src_op, edge.dst_op) for edge in edge_routes} != {
-        (producer, consumer) for consumer, producers in internal.items() for producer in producers
-    }:
-        raise ModelingError("fuse_region_internal_route_missing")
-    for publisher, consumer in waits:
-        if publisher not in selected or consumer not in selected:
-            raise ModelingError("fuse_region_wait_endpoint_outside")
-        internal[consumer].add(publisher)
-    _topological(internal, "fuse_region_credit_publish_deadlock")
-    if not numerics.keys() <= selected or any(before != after for before, after in numerics.values()):
-        raise ModelingError("fuse_region_numerical_equivalence_failed")
-
-    def precedes(earlier, later):
-        pending = list(internal[later])
-        visited = set()
-        while pending:
-            predecessor = pending.pop()
-            if predecessor == earlier:
-                return True
-            if predecessor not in visited:
-                visited.add(predecessor)
-                pending.extend(internal[predecessor])
-        return False
-
-    for mutation in (edge for edge in edge_routes if edge.in_place_mutates):
-        for reader in edge_routes:
-            if reader is mutation:
-                continue
-            mut_view, read_view = views.get(mutation.view_id), views.get(reader.view_id)
-            if mut_view is not None and read_view is not None:
-                m_allocation, m_lo, m_hi = mut_view
-                r_allocation, r_lo, r_hi = read_view
-                aliases = m_allocation == r_allocation and max(m_lo, r_lo) < min(m_hi, r_hi)
-            else:
-                aliases = mutation.view_id == reader.view_id or mutation.src_op == reader.src_op
-            if (aliases and reader.producer_version <= mutation.producer_version
-                    and not precedes(reader.dst_op, mutation.dst_op)):
-                raise ModelingError(f"fuse_region_in_place_unread_alias:{mutation.view_id}:{reader.dst_op}")
-    carried = {(edge.src_op, edge.dst_op) for edge in edge_routes if edge.iter_kind == "chunk_carried"}
-    same_tile = {(edge.src_op, edge.dst_op) for edge in edge_routes if edge.iter_kind != "chunk_carried"} | set(waits)
-    for src, dst in carried - same_tile:
-        internal[dst].discard(src)
-    return tuple(name for name in order if name in selected), internal
 
 
 def _route_edge(datapath, edge, owners, tile, explicit_bytes):
@@ -488,6 +459,25 @@ def _validate_coupling(stage, units):
         count, total = active[0]
         if any(owners * total != count * size for owners, size in active):
             raise ModelingError(f"fuse_region_coupled_placement_not_proportional:{stage.name}")
+
+
+def _barrier_storage(routed, op_stages, context):
+    """Find source allocations that a full-barrier consumer would otherwise hold."""
+    releases, moved = {}, set()
+    l0c = context.pool_names.get("l0c", "l0c") if context else "l0c"
+    for _, edge, _, _, _ in routed:
+        if edge.iter_kind != "full_barrier" or edge.src_owner_axis != "aic":
+            continue
+        acquired = {a.name for a in op_stages[edge.src_op].acquire if a.pool in {"l0c", l0c}}
+        for allocation in op_stages[edge.dst_op].free:
+            if allocation.name in acquired:
+                releases.setdefault(edge.src_op, {})[allocation.name] = allocation
+                moved.add((edge.dst_op, allocation.name))
+    return releases, moved
+
+
+def _route_publication(scope, i, edge):
+    return f"{scope}:edge:{i}" + (":write" if edge.route_kind == "gm_spill" else "")
 
 
 def compile_fuse_region(
@@ -587,11 +577,23 @@ def compile_fuse_region(
         units.update({context.resource_names.get(key, key): value for key, value in context.resource_units.items()})
     plan.reads.extend(read_ranges)
     plan.writes.extend(write_ranges)
+    releases, moved = _barrier_storage(routed, op_stages, context)
     passes = (op_stages, second) if second else (op_stages,)
     for pass_idx, declarations in enumerate(passes):
         completions = []
         for tile in range(tile_count):
             scope = f"p{pass_idx}:t{tile}"
+
+            def scoped(allocations):
+                pools = context.pool_names if context else {}
+                return tuple(replace(a, name=f"{scope}:{a.name}", pool=pools.get(a.pool, a.pool))
+                             for a in allocations)
+
+            if not pass_idx:
+                for source, allocations in releases.items():
+                    publications = tuple(_route_publication(scope, i, edge) for i, edge, _, _, _ in routed
+                                         if edge.src_op == source and edge.iter_kind != "chunk_carried")
+                    plan.add(Stage(f"{scope}:{source}:released", after=publications, free=scoped(allocations.values())))
             final_names = {op: f"{scope}:{op}:done" for op in declarations}
             for op in order:
                 if op not in declarations:
@@ -607,14 +609,10 @@ def compile_fuse_region(
                         continue
                     src = f"p{pass_idx}:t{src_tile}:{edge.src_op}:done"
                     generation = src_tile
-                    if edge.iter_kind == "full_barrier":
-                        barrier_deps = tuple(f"p{pass_idx}:t{t}:{edge.src_op}:done" for t in range(tile_count))
-                        src = plan.add(Stage(f"{scope}:edge:{i}:barrier", after=barrier_deps))
                     credit = ()
                     if i in rings:
                         ring = rings[i]
-                        credit = (ring.initial_credit(ring.slot(generation)) if generation < ring.depth
-                                  else ring.last_use(generation - ring.depth),)
+                        credit = (ring_credit(ring, generation),)
                     name = f"{scope}:edge:{i}"
                     dependencies_for_route = (src, *credit)
                     if edge.route_kind == "gm_spill":
@@ -622,13 +620,21 @@ def compile_fuse_region(
                         pipe = "fixpipe" if edge.src_owner_axis == "aic" else "mte3"
                         spill = plan.access(name + ":write", tensor, size, direction="write", pipe=pipe,
                                             after=dependencies_for_route, private=True, owner=owners[0], offset=src_tile * size)
-                        dep = plan.access(name + ":read", tensor, size, pipe=f"mte2_{edge.dst_owner_axis}",
-                                          after=(spill,), private=True, owner=owners[1], offset=src_tile * size)
+                        dep = spill
                     elif route is not None:
                         owner = owners[0] if route.path.executor == edge.src_owner_axis else owners[1]
                         dep = plan.work(name, route.path.unit, size, after=dependencies_for_route, owner=owner)
                     else:
                         dep = plan.add(Stage(name, after=dependencies_for_route))
+                    if edge.iter_kind == "full_barrier":
+                        barrier_deps = tuple(
+                            f"p{pass_idx}:t{t}:{edge.src_op}:released" if edge.src_op in releases
+                            else _route_publication(f"p{pass_idx}:t{t}", i, edge) for t in range(tile_count)
+                        )
+                        dep = plan.add(Stage(name + ":barrier", after=barrier_deps))
+                    if edge.route_kind == "gm_spill":
+                        dep = plan.access(name + ":read", tensor, size, pipe=f"mte2_{edge.dst_owner_axis}",
+                                          after=(dep,), private=True, owner=owners[1], offset=src_tile * size)
                     if i in rings:
                         event = lower_generation(
                             rings[i], generation, "route", ("op",), producer_extra_after=(dep,),
@@ -640,8 +646,10 @@ def compile_fuse_region(
                     if obligation.initial_residency == "onchip_resident":
                         continue
                     after.append(_obligation_access(plan, scope, op, index, obligation, tile, tile_count, "read", tuple(after)))
-                _account_declared_work(plan, stage, semantic_work)
-                run = plan.add(replace(stage, name=f"{scope}:{op}", after=tuple(dict.fromkeys(after))))
+                stage = _bind_declared_work(plan, stage, semantic_work)
+                freed = tuple(a for a in stage.free if pass_idx or (op, a.name) not in moved)
+                run = plan.add(replace(stage, name=f"{scope}:{op}", after=tuple(dict.fromkeys(after)),
+                                       acquire=scoped(stage.acquire), free=scoped(freed)))
                 done = [run]
                 if pass_idx == len(passes) - 1:
                     for index, obligation in enumerate(writes.get(op, ())):
@@ -654,28 +662,61 @@ def compile_fuse_region(
     return spec, plan.result("K3", region_id, order, spec, semantic_work, solution)
 
 
-def _account_declared_work(plan, stage, semantic):
+def _bind_declared_work(plan, stage, semantic):
     context = plan.context
-    cube_role = context.resource_names.get("cube", "cube") if context is not None else "cube"
-    amount = stage.metadata.get("issued_cube_flops", stage.work.get(cube_role, 0))
-    if amount:
-        if context is not None and "issued_cube_flops" not in stage.metadata:
-            raise ModelingError("fuse_region_bound_cube_stage_requires_issued_flops")
-        if int(amount) != amount or amount < 0:
-            raise ModelingError("fuse_region_cube_work_requires_integer_flops")
-        dtypes = {item.dtype for item in semantic if "cube" in item.admitted_engines}
-        default_dtype = next(iter(dtypes)) if len(dtypes) == 1 else getattr(
-            context.op if context is not None else None, "dtype", "unspecified",
-        )
-        dtype = stage.metadata.get("cube_dtype", default_dtype)
-        if not isinstance(dtype, str) or not dtype:
-            raise ModelingError("fuse_region_cube_dtype_invalid")
-        plan.cube[dtype] += int(amount)
-    for pipe in _VECTOR_PIPES:
-        role = context.resource_names.get(pipe, pipe) if context is not None else pipe
-        ops = stage.metadata.get(f"issued_{pipe}_ops", stage.work.get(role, 0))
-        if ops:
-            plan.vector[pipe] += ops
+    resource_names = context.resource_names if context else {}
+    cube_row = resource_names.get("cube", "cube")
+    work, placement, caps, units = Counter(), {}, {}, {}
+    physical_pipes = {resource_names.get(pipe, pipe): pipe for pipe in _VECTOR_PIPES}
+    for role, amount in stage.work.items():
+        if not amount:
+            continue
+        row, unit = role, stage.work_units.get(role)
+        if role in {"cube", "matrix", cube_row}:
+            raw = stage.metadata.get("issued_cube_flops")
+            if raw is None:
+                if unit == "peak_ms" or (context and role == cube_row and role not in {"cube", "matrix"}):
+                    raise ModelingError("fuse_region_bound_cube_stage_requires_issued_flops")
+                raw = amount
+            if int(raw) != raw or raw <= 0:
+                raise ModelingError("fuse_region_cube_work_requires_integer_flops")
+            dtypes = {item.dtype for item in semantic if "cube" in item.admitted_engines}
+            fallback = next(iter(dtypes)) if len(dtypes) == 1 else getattr(context.op if context else None, "dtype", "bf16")
+            dtype = stage.metadata.get("cube_dtype", fallback)
+            if not isinstance(dtype, str) or not dtype:
+                raise ModelingError("fuse_region_cube_dtype_invalid")
+            plan.cube[dtype] += int(raw)
+            if context:
+                row, bound = next(iter(context.bind(Work(matrix={dtype: raw})).items()))
+            else:
+                from .registry import default_cube_peak
+                bound = 1000 * raw / default_cube_peak(plan.datapath, dtype)
+            unit = "peak_ms"
+        else:
+            pipe = physical_pipes.get(role)
+            if pipe is not None:
+                plan.vector[pipe] += stage.metadata.get(f"issued_{pipe}_ops", amount)
+            bound = amount
+            if context and (role not in context.rates or context.service_rate(role) is not None):
+                role_for_binding = plan.binding_role(role)
+                bound_work = context.bind(Work(resources={role_for_binding: amount}))
+                if not bound_work:
+                    continue
+                row, bound = next(iter(bound_work.items()))
+                unit = context.work_units.get(context.physical_role(role_for_binding), unit)
+            if unit is None:
+                unit = "ops" if pipe is not None else NATIVE_WORK_UNITS.get(role)
+        work[row] += bound
+        if role in stage.placement:
+            owners = stage.placement[role]
+            if row in placement and placement[row] != owners:
+                raise ModelingError(f"fuse_region_conflicting_placement:{stage.name}:{row}")
+            placement[row] = owners
+        if role in stage.caps:
+            caps[row] = stage.caps[role] * bound / amount
+        if unit is not None:
+            units[row] = unit
+    return replace(stage, work=work, placement=placement, caps=caps, work_units=units)
 
 
 def _obligation_access(plan, scope, op, index, entry, tile, tiles, direction, after):

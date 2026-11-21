@@ -7,7 +7,7 @@
 """
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 
@@ -15,7 +15,10 @@ from mindie_sim.prediction.runtime.tile_solver import LiveBufferSpec, TileCandid
 from mindie_sim.schema.common import ModelingError
 
 from .catlass_catalog import dtype_name, unmodeled
-from .contracts import DIRECT_MATRIX_ARCH_IDS, DslKernelSpec, TemplateSourceRef, ceil_div
+from .contracts import (
+    ATTN_RES_HIDDEN_SIZE, ATTN_RES_UB_BYTES, BF16_BYTES, DIRECT_MATRIX_ARCH_IDS, FP32_BYTES, KDA_HEAD_DIM, KDA_STATE_HALF,
+    DslKernelSpec, TemplateSourceRef, attn_res_tiling, attn_res_ub_footprint, ceil_div, commit_replay_bytes, commit_rows, flash_kda_rounds,
+)
 from .fuse_region import solve_template_tile
 
 DSL_REPOSITORY = "cann/cannbot-dsl"
@@ -23,6 +26,8 @@ DSL_REVISION = "5e7ace8cdcc16a5b062ba69d8fdf93d4f1d62223"
 DSL_SOURCE_REFS = (
     TemplateSourceRef(DSL_REPOSITORY, DSL_REVISION, "samples/attention/flash_kda/flash_kda_metadata.py",
         "5033e923d9d63602708918691f75fcf8f210a0782e850d7822090362f4242377", "_select_template_on_host", (480, 575)),
+    TemplateSourceRef(DSL_REPOSITORY, DSL_REVISION, "samples/attention/flash_kda/flash_kda_metadata.py",
+        "5033e923d9d63602708918691f75fcf8f210a0782e850d7822090362f4242377", "_DT_ROUTE_PARAMETERS", (1530, 1560)),
     TemplateSourceRef(DSL_REPOSITORY, DSL_REVISION, "samples/attention/flash_kda/flash_kda_persistent.py",
         "16f01982db4fc4f053f238e353637ac314cdc4d589ed948a32ee391297d50b08", "CHUNK_SIZE", (66, 175)),
     TemplateSourceRef(DSL_REPOSITORY, DSL_REVISION, "samples/attention/flash_kda/flash_kda_staged.py",
@@ -47,17 +52,13 @@ MLA_PROLOG = "dsl.mla_prolog_v4"
 ATTN_RES = "dsl.block_attn_res_update_rms_norm"
 QSLI = "dsl.quant_sparse_lightning_indexer"
 MQSMLA = "dsl.mixed_quant_sparse_flash_mla"
-_FLASH_SOURCE_COUNT = 3
+_FLASH_SOURCE_COUNT = 4
 _DSL_SOURCES = dict(zip((FLASH_KDA, MEGA_KDA, COMMIT_KDA, MLA_PROLOG, ATTN_RES, QSLI, MQSMLA),
                         (DSL_SOURCE_REFS[:_FLASH_SOURCE_COUNT],
                          *((ref,) for ref in DSL_SOURCE_REFS[_FLASH_SOURCE_COUNT:]))))
 DSL_KERNEL_IDS = tuple(_DSL_SOURCES)
-FP32_BYTES = 4
-BF16_BYTES = 2
 INT32_BYTES = 4
-KDA_HEAD_DIM = 128
 KDA_CHUNK = 64
-KDA_STATE_HALF = KDA_HEAD_DIM // 2
 KDA_INVERSE_BUFFERS = 4
 KDA_AIC_CORE_LIMIT = 32
 KDA_DEFAULT_WORKSPACE_SLOTS = 861
@@ -66,35 +67,38 @@ KDA_HEADER_WORDS = 11
 KDA_CALIBRATED_CHUNK_RANGE = range(64, 257)
 KDA_CALIBRATED_GROUP_LIMIT = 16
 KDA_MAX_VALUE_HEADS = 96
-KDA_DEFAULT_CHUNK_GROUP = 8
 KDA_MAX_CHUNK_GROUP = 512
+KDA_SHORT_TRAIN_GROUP = 13
+KDA_SHORT_TRAIN_MIN_LENGTH = 8192
 KDA_MODEL_HEADS = 96
 KDA_HIDDEN_SIZE = 7168
 KDA_BETA_TILE = 16
 MEGA_TP_DEGREES = (4, 8, 16)
 MEGA_SEQUENCE_LENGTHS = (4, 8)
+KDA_REPLAY_CAPACITY = max(MEGA_SEQUENCE_LENGTHS)
 MEGA_MODEL_BATCH_LIMIT = 32
 MEGA_AIC_QUOTAS = (8, 16, 24, 28, 32)
 COMMIT_CORE_QUOTAS = (8, 24, 28, 32)
-COMMIT_SMALL_HEADS = 16
-COMMIT_MEDIUM_HEADS = 32
-COMMIT_SMALL_ROWS = 32
 ATTN_RES_VL = 64
-ATTN_RES_HIDDEN_SIZE = 7168
-ATTN_RES_UB_BYTES = 240 * 1024
-ATTN_RES_MAX_TILE_T = 4095
-ATTN_RES_FP32_ALIGN = 8
-ATTN_RES_BF16_ALIGN = 16
-ATTN_RES_TILE_FP32_ROWS = 2
-ATTN_RES_STAT_COUNT = 3
 ROUTE_COST_SCALE = 64
 PARTS_PER_MILLION = 1_000_000
 _ROUTE_PARAMS_STRIDE = 16
 _ROUTE_SCHEMA = 13
-_ROUTE_MARGIN = 14
 _ROUTE_SCHEMAS = {6, 7}
 _INT64_MAX = (1 << 63) - 1
 _MAX_SCALED_QUANTITY = _INT64_MAX // ROUTE_COST_SCALE
+_ROUTE_PARAMETERS = (
+    0, 2711857704, 699286307, 16555661144, 28359460, 94263834, 94263834, 12013349865,
+    1045656019, 84358156, 12842477, 2527878117, 181898838, 6, 8441, 0,
+    0, 692059912, 851406583, 21510815509, 73490570, 81791118, 166178779, 12029971961,
+    2552246171, 459139222, 45086212, 2303638937, 143977434, 6, 18992, 0,
+)
+_DT_ROUTE_PARAMETERS = (
+    4135271144, 193981546, 366448654, 12881511041, 29417161, 4351059785, 158980371, 10652650460,
+    3206978745, 332321804, 0, 419242242, 29945874, 7, 0, 0,
+    20317858430, 1160598799, 1018161115, 1015361233, 14389959, 933231823, 115749683, 11499084207,
+    4373896639, 413928806, 41555011, 0, 0, 7, 0, 0,
+)
 MLA_COLUMN_TILE = 96
 MLA_K_TILE = 128
 MLA_TOKEN_PROFILES = ((1, 1, 1), (8, 2, 8), (16, 9, 16), (32, 17, 32), (64, 33, 64), (128, 65, 128))
@@ -104,6 +108,8 @@ MLA_DEFAULT_KVR = 576
 MLA_DEFAULT_HEADS = 128
 MLA_DEFAULT_NOPE = 128
 MLA_DEFAULT_ROPE = 64
+MLA_CACHE_PAGE_SIZE = 16
+MLA_CACHE_NZ_LANE_BYTES = 32
 MLA_SCRATCH_TOKEN_CAP = 1024
 MLA_SCRATCH_TARGET_BYTES = 32 * 1024 * 1024
 MLA_SCRATCH_ALIGNMENT = 32
@@ -139,6 +145,7 @@ MQSMLA_FD_BYTES_PER_CORE = 2 * MQSMLA_FD_SLOT_BYTES
 class QkvQuantMode(str, Enum):
     A16C16 = "A16C16"
     FP8 = "FP8"
+    FP8_TENSOR = "FP8_TENSOR"
     HiF8 = "HiF8"
     PA_BSND = "PA_BSND"
 
@@ -151,10 +158,10 @@ class FlashKdaProblem:
     requested_template: str = "auto"
     route_coefficients: tuple[int, ...] = ()
     workspace_slots: int = KDA_DEFAULT_WORKSPACE_SLOTS
-    max_chunk_group: int = KDA_DEFAULT_CHUNK_GROUP
+    max_chunk_group: int | None = None
     layout_kind: int = 0
     has_cu: bool = False
-    calibration_enabled: bool = False
+    calibration_enabled: bool = True
     metadata_word_capacity: int | None = None
     metadata_ms: float = 0
     eager_d2h_bytes: int = 0
@@ -162,6 +169,10 @@ class FlashKdaProblem:
     save_matrices: bool = False
     save_kernel_caches: bool = False
     save_chunk_states: bool = False
+    device_name: str = ""
+    has_initial_state: bool = False
+    return_final_state: bool = True
+    enable_grad: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,6 +185,8 @@ class MegaRecurrentKdaProblem:
     unfused_launches: tuple[str, ...] = (
         "input_projection", "causal_conv", "recurrent_kda", "output_gate", "output_projection",
     )
+    state_indices: tuple[int, ...] = ()
+    replay_capacity: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,6 +194,8 @@ class CommitRecurrentKdaProblem:
     accepted: tuple[int, ...]
     heads: int = 1
     row_partitions: int | None = None
+    state_indices: tuple[int, ...] = ()
+    replay_capacity: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,9 +207,29 @@ class MlaPrologProblem:
     heads: int = MLA_DEFAULT_HEADS
     q_nope: int = MLA_DEFAULT_NOPE
     rope: int = MLA_DEFAULT_ROPE
-    mode: QkvQuantMode = QkvQuantMode.A16C16
+    mode: QkvQuantMode | int = QkvQuantMode.A16C16
     weight_format: str = "nz"
     return_qr: bool = True
+    cache_layout: str = "PA_BSND"
+    cache_page_size: int = MLA_CACHE_PAGE_SIZE
+
+    @property
+    def quant_mode(self) -> QkvQuantMode:
+        mode = self.mode
+        if type(mode) is int and 0 <= mode < len(_MLA_QUANT_MODES):
+            return _MLA_QUANT_MODES[mode]
+        return QkvQuantMode.A16C16 if mode == QkvQuantMode.PA_BSND else QkvQuantMode(mode)
+
+    @property
+    def cache_row_bytes(self) -> int:
+        if self.quant_mode == QkvQuantMode.FP8:
+            latent = self.kvr - self.rope
+            return latent + self.rope * BF16_BYTES + ceil_div(latent, KDA_HEAD_DIM) * FP32_BYTES
+        return self.kvr * BF16_BYTES if self.quant_mode == QkvQuantMode.A16C16 else self.kvr
+
+
+_MLA_QUANT_MODES = (QkvQuantMode.A16C16, QkvQuantMode.FP8, QkvQuantMode.FP8_TENSOR, QkvQuantMode.HiF8)
+MLA_QUANTIZED_QUERY = {QkvQuantMode.FP8_TENSOR, QkvQuantMode.HiF8}
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,6 +259,17 @@ class MixedQuantSparseMlaProblem:
     split_parts: int = 1
     metadata_ms: float = 0
     part_lengths: tuple[int, ...] = ()
+    topk_indices: tuple[int, ...] | tuple[tuple[int, ...], ...] = ()
+    page_table: tuple[int, ...] = ()
+    block_table: tuple[int, ...] = ()
+    page_size: int = MQSMLA_KV_TILE
+    has_sink: bool = False
+    sink_size: int = 0
+
+    def sparse_rows(self, query):
+        if self.topk_indices and isinstance(self.topk_indices[0], (tuple, list)):
+            return self.topk_indices[query]
+        return self.topk_indices
 
 
 _DSL_PROBLEMS = dict(zip(DSL_KERNEL_IDS, (
@@ -243,56 +289,86 @@ def dsl_problem(kernel_id, problem):
     return name, normalized
 
 
-def flash_kda_rounds(chunks, heads, slots, max_group):
-    batches_per_set = slots // heads
-    if min(batches_per_set, max_group) < 1:
-        raise ModelingError("flash_kda_workspace_group_invalid")
-    for first in range(0, len(chunks), batches_per_set):
-        remaining = list(chunks[first:first + batches_per_set])
-        while max(remaining) > 0:
-            low, high = 1, min(max_group, max(remaining), batches_per_set)
-            while low < high:
-                mid = (low + high + 1) // 2
-                if sum(min(count, mid) for count in remaining) <= batches_per_set:
-                    low = mid
-                else:
-                    high = mid - 1
-            take = tuple(min(count, low) for count in remaining)
-            yield first, take
-            remaining = [left - used for left, used in zip(remaining, take)]
+def flash_kda_lane_tasks(p, spec):
+    chunks = tuple(ceil_div(length, KDA_CHUNK) for length in p.lengths)
+    if spec.template_variant == "persistent":
+        loads = [0] * spec.aic_budget
+        for batch in sorted(range(len(chunks)), key=lambda i: (-chunks[i], i)):
+            for head in range(p.value_heads):
+                owner = min(range(len(loads)), key=loads.__getitem__)
+                loads[owner] += chunks[batch]
+                yield tuple((batch, head, chunk, owner, 0) for chunk in range(chunks[batch]))
+        return
+    _, group = flash_kda_schedule(p, spec.aic_budget)
+    consumed = [0] * len(chunks)
+    for first, batch_counts in flash_kda_rounds(chunks, p.value_heads, p.workspace_slots, group):
+        tasks = []
+        for batch, count in enumerate(batch_counts, first):
+            for head in range(p.value_heads):
+                owner = (batch * p.value_heads + head) % spec.aic_budget
+                for chunk in range(consumed[batch], consumed[batch] + count):
+                    tasks.append((batch, head, chunk, owner, len(tasks)))
+            consumed[batch] += count
+        yield tuple(tasks)
 
 
 def flash_kda_schedule(problem: FlashKdaProblem, core_count: int) -> tuple[str, int]:
-    """Replay the host route comparison and chunk-group limit in integer units."""
     p = problem
-    if not p.lengths or min(p.lengths) < 1 or not 1 <= core_count <= KDA_AIC_CORE_LIMIT:
+    return resolve_flash_kda_route(
+        p.lengths, p.value_heads, core_count, requested_template=p.requested_template,
+        device_name=p.device_name, route_coefficients=p.route_coefficients, layout_kind=p.layout_kind,
+        workspace_slots=p.workspace_slots, max_chunk_group=p.max_chunk_group, metadata_word_capacity=p.metadata_word_capacity,
+        has_cu=p.has_cu, calibration_enabled=p.calibration_enabled, enable_grad=p.enable_grad, query_heads=p.query_heads,
+    )
+
+
+def resolve_flash_kda_route(
+    lengths: Sequence[int], value_heads: int, core_count: int, *,
+    requested_template: str = "auto", device_name: str = "", route_coefficients: Sequence[int] = (),
+    layout_kind: int = 0, workspace_slots: int = KDA_DEFAULT_WORKSPACE_SLOTS, max_chunk_group: int | None = None,
+    metadata_word_capacity: int | None = None, has_cu: bool = False, calibration_enabled: bool = True,
+    enable_grad: bool = False, query_heads: int | None = None,
+) -> tuple[str, int]:
+    """Replay the pinned launcher and host route comparison in integer units."""
+    if not lengths or min(lengths) < 1 or not 1 <= core_count <= KDA_AIC_CORE_LIMIT:
         raise ModelingError("flash_kda_sequence_or_cores_invalid")
-    if (min(p.query_heads, p.value_heads, p.max_chunk_group) < 1
-            or p.workspace_slots < p.value_heads or p.layout_kind not in {0, 1}
-            or not p.query_heads <= p.value_heads <= KDA_MAX_VALUE_HEADS
-            or p.value_heads % p.query_heads
-            or p.max_chunk_group > KDA_MAX_CHUNK_GROUP):
+    query_heads = value_heads if query_heads is None else query_heads
+    if (not 1 <= query_heads <= value_heads <= KDA_MAX_VALUE_HEADS or value_heads % query_heads
+            or workspace_slots < value_heads or layout_kind not in {0, 1}):
         raise ModelingError("flash_kda_workspace_or_layout_invalid")
-    if p.requested_template in {"persistent", "staged"}:
-        return p.requested_template, p.max_chunk_group
-    if p.requested_template != "auto":
+    if max_chunk_group is None:
+        short_training = (
+            enable_grad and layout_kind == 0 and not has_cu and len(lengths) == 1
+            and query_heads == value_heads == core_count == KDA_AIC_CORE_LIMIT
+            and lengths[0] >= KDA_SHORT_TRAIN_MIN_LENGTH and lengths[0] % KDA_CHUNK == 0
+        )
+        max_chunk_group = KDA_SHORT_TRAIN_GROUP if short_training else KDA_MAX_CHUNK_GROUP
+    if not 1 <= max_chunk_group <= KDA_MAX_CHUNK_GROUP:
+        raise ModelingError("flash_kda_workspace_or_layout_invalid")
+    if requested_template in {"persistent", "staged"}:
+        return requested_template, max_chunk_group
+    if requested_template != "auto":
         raise ModelingError("flash_kda_requested_template_invalid")
-    chunks = tuple(ceil_div(length, KDA_CHUNK) for length in p.lengths)
-    max_group = p.max_chunk_group
+    if not calibration_enabled:
+        return "staged", max_chunk_group
+    chunks = tuple(ceil_div(length, KDA_CHUNK) for length in lengths)
     if (
-        p.calibration_enabled and p.layout_kind == 1 and core_count == KDA_AIC_CORE_LIMIT
-        and len(chunks) == 1 and KDA_AIC_CORE_LIMIT < p.value_heads <= KDA_MAX_VALUE_HEADS
+        layout_kind == 1 and core_count == KDA_AIC_CORE_LIMIT
+        and len(chunks) == 1 and KDA_AIC_CORE_LIMIT < value_heads
         and chunks[0] in KDA_CALIBRATED_CHUNK_RANGE
     ):
-        max_group = min(max_group, KDA_CALIBRATED_GROUP_LIMIT)
-    if p.has_cu and len(chunks) > 1 and max(chunks) <= 2:
-        return "persistent", max_group
-    return _flash_route(p, chunks, core_count, max_group), max_group
+        max_chunk_group = min(max_chunk_group, KDA_CALIBRATED_GROUP_LIMIT)
+    if has_cu and len(chunks) > 1 and max(chunks) <= 2:
+        return "persistent", max_chunk_group
+    params = route_coefficients or (_DT_ROUTE_PARAMETERS if not device_name or "950DT" in device_name.upper()
+                                    else _ROUTE_PARAMETERS)
+    start = layout_kind * _ROUTE_PARAMS_STRIDE
+    route = _flash_route(lengths, chunks, value_heads, query_heads, core_count, workspace_slots,
+                         max_chunk_group, metadata_word_capacity, params[start:start + _ROUTE_PARAMS_STRIDE])
+    return route, max_chunk_group
 
 
-def _flash_route(p, chunks, cores, max_group):
-    start = p.layout_kind * _ROUTE_PARAMS_STRIDE if len(p.route_coefficients) > _ROUTE_PARAMS_STRIDE else 0
-    coefficients = p.route_coefficients[start:start + _ROUTE_PARAMS_STRIDE]
+def _flash_route(lengths, chunks, heads, q_heads, cores, slots, max_group, metadata_capacity, coefficients):
     if len(coefficients) != _ROUTE_PARAMS_STRIDE:
         return "staged"
     (s0, s_parallel, s_peak, s_round, s_query, s_compute, s_mem, p0, p_peak, p_heads,
@@ -300,26 +376,25 @@ def _flash_route(p, chunks, cores, max_group):
     if schema not in _ROUTE_SCHEMAS or not 0 <= margin < PARTS_PER_MILLION or min(coefficients[:_ROUTE_SCHEMA]) < 0:
         return "staged"
     cyc, lpt, core_rows = [0] * cores, [0] * cores, [0] * cores
-    head_count = p.value_heads * len(chunks)
+    head_count = heads * len(chunks)
     min_metadata = KDA_HEADER_WORDS + KDA_AIC_CORE_LIMIT + KDA_CHUNK_TASK_WORDS * head_count + len(chunks)
-    if p.metadata_word_capacity is not None and min_metadata > p.metadata_word_capacity:
+    if metadata_capacity is not None and min_metadata > metadata_capacity:
+        return "staged"
+    query_rows, total_rows = q_heads * sum(lengths), heads * sum(lengths)
+    parallel = ceil_div(heads * sum(chunks), cores)
+    if max(query_rows, total_rows) > _INT64_MAX or parallel > _MAX_SCALED_QUANTITY:
         return "staged"
     for batch, count in enumerate(chunks):
-        for head in range(p.value_heads):
-            cyc[(batch * p.value_heads + head) % cores] += count
+        for head in range(heads):
+            cyc[(batch * heads + head) % cores] += count
     for batch in sorted(range(len(chunks)), key=lambda index: (-chunks[index], index)):
-        for _ in range(p.value_heads):
+        for _ in range(heads):
             owner = min(range(cores), key=lpt.__getitem__)
             lpt[owner] += chunks[batch]
-            core_rows[owner] += p.lengths[batch]
-    parallel = ceil_div(sum(cyc), cores)
+            core_rows[owner] += lengths[batch]
     staged_peak, persistent_peak = max(cyc), max(lpt)
-    rounds = sum(1 for _ in flash_kda_rounds(chunks, p.value_heads, p.workspace_slots, max_group))
+    rounds = sum(1 for _ in flash_kda_rounds(chunks, heads, slots, max_group))
     if max(parallel, staged_peak, persistent_peak, rounds, head_count) > _MAX_SCALED_QUANTITY:
-        return "staged"
-    query_rows = p.query_heads * sum(p.lengths)
-    total_rows = p.value_heads * sum(p.lengths)
-    if max(query_rows, total_rows) > _INT64_MAX:
         return "staged"
     staged = (
         (s0 + s_parallel * parallel + s_peak * staged_peak + s_round * rounds) * ROUTE_COST_SCALE
@@ -352,85 +427,18 @@ def commit_aic_quota(available):
     return choices[-1]
 
 
-def commit_replay_bytes(row_partitions, accepted=1, d=KDA_HEAD_DIM):
-    if not 1 <= row_partitions <= d or accepted < 0 or d != KDA_HEAD_DIM:
-        raise ModelingError("commit_kda_replay_geometry_invalid")
-    return accepted * d * (FP32_BYTES + (BF16_BYTES + FP32_BYTES) * row_partitions)
-
-
-def commit_rows(p, aiv_budget):
-    """Rows assigned to each AIV lane, including split halves in the large regime."""
-    heads = len(p.accepted) * p.heads
-    if not heads:
-        return ()
-    if p.row_partitions is not None or heads <= COMMIT_MEDIUM_HEADS:
-        partitions = p.row_partitions
-        if partitions is None:
-            partitions = KDA_HEAD_DIM // (COMMIT_SMALL_ROWS if heads <= COMMIT_SMALL_HEADS else KDA_STATE_HALF)
-        if partitions < 1 or KDA_HEAD_DIM % partitions:
-            raise ModelingError("commit_kda_row_partition_invalid")
-        rows = KDA_HEAD_DIM // partitions
-        lanes = min(heads * partitions, aiv_budget)
-        return tuple(tuple((item // partitions, item % partitions * rows, rows)
-                           for item in range(lane, heads * partitions, lanes))
-                     for lane in range(lanes))
-    lanes = min(heads, aiv_budget)
-    base, extra = divmod(2 * heads, lanes)
-    full_heads = lanes * (base // 2) + extra * (ceil_div(base, 2) - base // 2)
-    schedules = []
-    start = 0
-    for lane in range(lanes):
-        full = ceil_div(base, 2) if lane < extra else base // 2
-        items = [(head, 0, KDA_HEAD_DIM) for head in range(start, start + full)]
-        start += full
-        if base % 2 == 0 and lane < extra:
-            items.append((full_heads + lane // 2, lane % 2 * KDA_STATE_HALF, KDA_STATE_HALF))
-        if base % 2 and lane >= extra:
-            half = lane - extra
-            items.append((full_heads + half // 2, half % 2 * KDA_STATE_HALF, KDA_STATE_HALF))
-        schedules.append(tuple(items))
-    return tuple(schedules)
-
-
-def attn_res_ub_footprint(d, tile_t, depth):
-    if min(d, tile_t, depth) < 1:
-        raise ModelingError("attn_res_tile_invalid")
-    s32 = ceil_div(d, ATTN_RES_FP32_ALIGN) * ATTN_RES_FP32_ALIGN
-    s16 = ceil_div(d, ATTN_RES_BF16_ALIGN) * ATTN_RES_BF16_ALIGN
-    s_stat = ceil_div(tile_t, ATTN_RES_FP32_ALIGN) * ATTN_RES_FP32_ALIGN
-    return FP32_BYTES * s32 + BF16_BYTES * s16 + depth * (
-        tile_t * (ATTN_RES_TILE_FP32_ROWS * FP32_BYTES * s32 + BF16_BYTES * s16)
-        + ATTN_RES_STAT_COUNT * FP32_BYTES * s_stat
-    )
-
-
-def attn_res_tiling(tokens, aiv, ub_bytes=ATTN_RES_UB_BYTES):
-    if min(tokens, aiv) < 1:
-        raise ModelingError("attn_res_problem_invalid")
-    rows = ceil_div(tokens, aiv)
-    d = ATTN_RES_HIDDEN_SIZE
-    row_bytes = d * (ATTN_RES_TILE_FP32_ROWS * FP32_BYTES + BF16_BYTES) + ATTN_RES_STAT_COUNT * FP32_BYTES
-    tile = min(ceil_div(rows, 2), ATTN_RES_MAX_TILE_T, (ub_bytes - d * (FP32_BYTES + BF16_BYTES)) // (2 * row_bytes))
-    while tile > 0 and attn_res_ub_footprint(d, tile, 2) > ub_bytes:
-        tile -= 1
-    if tile < 1:
-        raise ModelingError("attn_res_double_buffered_row_does_not_fit")
-    count = ceil_div(rows, tile)
-    return ceil_div(tokens, rows), rows, ceil_div(rows, count), 1 if count == 1 else 2
-
-
 def _aligned(value, boundary):
     return ceil_div(value, boundary) * boundary
 
 
 def mla_workspaces(p, aic):
     """Replay launcher scratch shapes, alignment and alias groups."""
-    mode = QkvQuantMode(p.mode)
+    mode = p.quant_mode
     profile = next((size for size, lo, hi in MLA_TOKEN_PROFILES if lo <= p.tokens <= hi), 0)
     rows = profile or _aligned(p.tokens, MLA_K_TILE)
     qp = p.heads * (p.q_nope + p.rope)
     padded_qa, padded_kva, padded_qp = (_aligned(width, MLA_COLUMN_TILE) for width in (p.q_lora, p.kvr, qp))
-    quantized = mode in {QkvQuantMode.FP8, QkvQuantMode.HiF8}
+    quantized = mode in MLA_QUANTIZED_QUERY
     scratch_rows = rows
     if rows > MLA_SCRATCH_TOKEN_CAP:
         per_row = BF16_BYTES * (max(padded_qa, padded_qp) + padded_kva + p.q_lora + p.dim)
@@ -462,7 +470,7 @@ def mla_workspaces(p, aic):
         specs["ws_x_pad"] = scratch_rows * p.dim * BF16_BYTES
     groups = [max(specs["ws_qa"], specs["ws_q_proj"]), specs["ws_qb_aux"], specs.get("ws_x_pad", 0),
               specs.get("ws_amax", 0)]
-    if mode == QkvQuantMode.FP8 or recompute:
+    if mode == QkvQuantMode.FP8_TENSOR or recompute:
         groups.append(max(specs["ws_kva"], specs["ws_q_fp"]))
     else:
         groups.extend((specs["ws_kva"], specs.get("ws_q_fp", 0)))
@@ -515,6 +523,7 @@ def _mega(p, aic, aiv, datapath, variant):
         or aic not in MEGA_AIC_QUOTAS or aiv < 2 * aic
     ):
         raise ModelingError("mega_kda_schedule_unsupported")
+    _validate_kda_slots(p, p.batch * p.tp, p.sequence)
     heads = KDA_MODEL_HEADS // p.tp
     rows = p.batch * p.tp * p.sequence
     workspace = mega_workspace_sizes(p)
@@ -543,6 +552,7 @@ def mega_workspace_sizes(p):
 def _commit(p, aic, aiv, datapath, variant):
     if p.heads < 1 or (p.accepted and min(p.accepted) < 0):
         raise ModelingError("commit_kda_problem_invalid")
+    _validate_kda_slots(p, len(p.accepted), max(p.accepted, default=0))
     scheduling = commit_rows(p, aiv)
     rows = max((row[2] for lane in scheduling for row in lane), default=KDA_HEAD_DIM)
     buffers = (
@@ -556,10 +566,28 @@ def _commit(p, aic, aiv, datapath, variant):
     return (f"quota{aic}", (rows, KDA_HEAD_DIM, 1), buffers, 0, (), (), sum(map(len, scheduling)))
 
 
+def _validate_kda_slots(p, batch, required):
+    slots = p.state_indices
+    capacity = replay_pool_capacity(p.replay_capacity, required)
+    if type(capacity) is not int or capacity < max(1, required) or (slots and (
+        len(slots) != batch or len(set(slots)) != batch or any(type(i) is not int or i < 0 for i in slots)
+    )):
+        raise ModelingError("recurrent_kda_paged_state_geometry_invalid")
+
+
+def replay_pool_capacity(requested, required):
+    return max(KDA_REPLAY_CAPACITY, required) if requested is None else requested
+
+
 def _mla(p, aic, aiv, datapath, variant):
-    if min(p.tokens, p.dim, p.q_lora, p.kvr, p.heads, p.q_nope, p.rope) < 1 or p.weight_format not in {"nd", "nz"}:
+    if (min(p.tokens, p.dim, p.q_lora, p.heads, p.q_nope, p.cache_page_size) < 1 or not 0 <= p.rope < p.kvr
+            or p.weight_format not in {"nd", "nz"} or p.cache_layout not in {"PA_BSND", "PA_NZ"}):
         raise ModelingError("mla_prolog_problem_invalid")
-    mode = QkvQuantMode(p.mode)
+    mode = p.quant_mode
+    if mode == QkvQuantMode.FP8 and p.cache_layout != "PA_BSND":
+        raise ModelingError("mla_prolog_group_fp8_requires_pa_bsnd")
+    if p.cache_layout == "PA_NZ" and p.cache_row_bytes % MLA_CACHE_NZ_LANE_BYTES:
+        raise ModelingError("mla_prolog_pa_nz_cache_row_unaligned")
     _, workspace, scratch_rows, _ = mla_workspaces(p, aic)
     m = min(scratch_rows, MLA_K_TILE)
     tile = (m, MLA_COLUMN_TILE, MLA_K_TILE)
@@ -571,7 +599,7 @@ def _mla(p, aic, aiv, datapath, variant):
         _buf("projection_out", "l0c", m * MLA_COLUMN_TILE * FP32_BYTES),
         _buf("norm_rope_quant", "ub", min(m, KDA_STATE_HALF) * MLA_COLUMN_TILE * FP32_BYTES, 2),
     )
-    return mode.value, tile, buffers, workspace, (), (), p.tokens
+    return QkvQuantMode.PA_BSND.value if p.mode == QkvQuantMode.PA_BSND else mode.value, tile, buffers, workspace, (), (), p.tokens
 
 
 def _attn_res(p, aic, aiv, datapath, variant):
@@ -598,9 +626,12 @@ def qsli_workspace_sizes(p, aic):
 
 
 def _qsli(p, aic, aiv, datapath, variant):
-    if (not 1 <= p.topk <= p.candidates or p.query_rows < 1 or not 1 <= p.split_parts <= min(p.candidates, aic)
+    if (p.topk < 1 or p.candidates < 0 or p.query_rows < 1
+            or not 1 <= p.split_parts <= min(max(1, p.candidates), aic)
             or aic > QSLI_MAX_CUBE_WORKERS):
         raise ModelingError("qsli_problem_invalid")
+    if not p.candidates:
+        return "histogram_topk", (1, 1, 1), (), 0, (), (), p.query_rows
     buffers = (
         _buf("q_l1", "l1", QSLI_TILE_M * QSLI_PACKED_D, scale=QSLI_TILE_M * QSLI_SCALE_ROW_BYTES),
         _buf("k_l1", "l1", QSLI_TILE_N * QSLI_PACKED_D, 2, scale=QSLI_TILE_N * QSLI_SCALE_ROW_BYTES),
@@ -621,6 +652,21 @@ def _mqsmla(p, aic, aiv, datapath, variant):
         raise ModelingError("mqsmla_fixed_head_geometry_required")
     if min(p.n_ori, p.n_cmp) < 0 or p.queries < 1 or not 1 <= p.split_parts <= aic:
         raise ModelingError("mqsmla_problem_invalid")
+    table = p.page_table or p.block_table
+    if (p.page_table and p.block_table or p.page_size < 1 or p.sink_size < 0
+            or any(type(page) is not int or page < 0 for page in table)):
+        raise ModelingError("mqsmla_paged_operand_invalid")
+    total = p.n_ori + p.n_cmp
+    if p.topk_indices:
+        batched = isinstance(p.topk_indices[0], (tuple, list))
+        if batched and len(p.topk_indices) != p.queries:
+            raise ModelingError("mqsmla_sparse_indices_invalid")
+        for row in p.topk_indices if batched else (p.topk_indices,):
+            if (not isinstance(row, (tuple, list)) or len(row) != total
+                    or any(type(i) is not int or i < 0 or (table and i // p.page_size >= len(table)) for i in row)):
+                raise ModelingError("mqsmla_sparse_indices_invalid")
+    elif table and max(p.n_ori, p.n_cmp) > len(table) * p.page_size:
+        raise ModelingError("mqsmla_paged_operand_invalid")
     if p.split_parts > 1 and p.queries * p.split_parts > 2 * aic:
         raise ModelingError("mqsmla_fd_partial_slots_exhausted")
     if p.split_parts > max(1, p.n_ori + p.n_cmp) or (

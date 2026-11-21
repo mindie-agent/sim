@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from heapq import heapify, heapreplace
 from types import MappingProxyType, SimpleNamespace
 from typing import Any, Literal
 
@@ -18,6 +17,9 @@ from mindie_sim.public.errors import UnmodeledCapabilityError
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.datapath import DatapathCapabilitySpec, SourceRef
 from mindie_sim.schema.operators import OpSpec
+from mindie_sim.templates.dsl_catalog import KDA_AIC_CORE_LIMIT as KDA_MAX_AIC_CORES
+from mindie_sim.templates.dsl_catalog import KDA_DEFAULT_WORKSPACE_SLOTS as KDA_WORKSPACE_SLOTS
+from ...gdn_domain import GDN_CHUNK64_GQA_RATIOS
 from ...mechanism import OperatorPlan, Work
 from ...ownership import unit_group
 from ...program import KernelProgram, Program, RecipeContext, Stage
@@ -39,39 +41,26 @@ DEFAULT_KEY_TILE = 64
 REPLAY_OPS_PER_STATE_ELEMENT = 4
 SILU_OPS_PER_ELEMENT = 4
 SYNC_SCRATCH_BYTES = 32
-ROUTE_COST_SCALE = 64
-PARTS_PER_MILLION = 1_000_000
-INT64_MAX = 2**63 - 1
-ROUTE_PARAMETER_WORDS = 16
-ROUTE_SCHEMA_INDEX = 13
-ROUTE_MARGIN_INDEX = 14
-ROUTE_SCHEMAS = (6, 7)
-KDA_WORKSPACE_SLOTS = 861
-KDA_MAX_CHUNK_GROUP = 512
-KDA_MAX_AIC_CORES = 32
-KDA_MAX_VALUE_HEADS = 96
-KDA_METADATA_HEADER_WORDS = 11
-KDA_CHUNK_TASK_WORDS = 6
-KDA_TRAINING_GROUP_LIMIT = 16
-KDA_TRAINING_CHUNK_RANGE = range(64, 257)
-# Default host parameter block. A caller can supply the exact block for its stack.
-KDA_ROUTE_PARAMETERS = (
-    0, 2711857704, 699286307, 16555661144, 28359460, 94263834, 94263834,
-    12013349865, 1045656019, 84358156, 12842477, 2527878117, 181898838, 6, 8441, 0,
-    0, 692059912, 851406583, 21510815509, 73490570, 81791118, 166178779,
-    12029971961, 2552246171, 459139222, 45086212, 2303638937, 143977434, 6, 18992, 0,
+ACCEPTANCE_WORD_BYTES = 4
+CHUNK32_KERNELS = (
+    "gdn_prepare_arch35_chunk32", "gdn_state_arch35_chunk32", "gdn_output_arch35_chunk32",
 )
 CHUNK32_ABIS = frozenset({
-    "gdn_chunk32", "gdn_prepare_arch35_chunk32", "gdn_state_arch35_chunk32",
-    "gdn_output_arch35_chunk32",
+    "gdn_chunk32", *CHUNK32_KERNELS, "gdn_chunk32_prepare", "gdn_chunk32_state", "gdn_chunk32_output",
 })
+CHUNK32_LEAVES = dict(zip(
+    ("gdn_chunk32_prepare", "gdn_chunk32_state", "gdn_chunk32_output"), CHUNK32_KERNELS, strict=True,
+))
+CANN_GDN_ABI = "aclnnChunkGatedDeltaRule"
+FLA_GDN_ABIS = frozenset({"fla_chunk_gdn", "chunk_state_bank"})
+FLASH_KDA_TEMPLATE_BY_ABI = {"flash_kda_persistent": "persistent", "flash_kda_staged": "staged"}
 ABI_OPERATIONS = {
     **dict.fromkeys(CHUNK32_ABIS, "gdn_chunk32"),
-    "aclnnChunkGatedDeltaRuleArch22": "gdn_prefill",
+    **dict.fromkeys(FLA_GDN_ABIS | {CANN_GDN_ABI, "aclnnChunkGatedDeltaRuleArch22"}, "gdn_prefill"),
     "aclnnChunkGatedDeltaRuleArch35": "gdn_prefill",
     "gdn_prefill_arch35": "gdn_prefill",
-    "flash_kda": "kda_prefill", "flash_kda_staged": "kda_prefill",
-    "flash_kda_persistent": "kda_prefill", "flash_kda_arch35": "kda_prefill",
+    **dict.fromkeys(FLASH_KDA_TEMPLATE_BY_ABI, "kda_prefill"),
+    "flash_kda": "kda_prefill", "flash_kda_arch35": "kda_prefill",
     "fused_recurrent_kda": "kda_recurrent",
     "causal_conv1d_update": "causal_conv1d", "commit_recurrent_kda": "recover_ssm_commit",
 }
@@ -137,11 +126,13 @@ class LinearAttentionContract:
         object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
         _positive(self.hq, self.hk, self.hv, self.dk, self.dv, self.bt, self.bv, self.bk,
                   self.active_l2_streams)
+        pinned = self.abi in CHUNK32_ABIS or self.metadata.get("chunk32") is True
+        if pinned and (self.hv % self.hk or self.hv // self.hk not in GDN_CHUNK64_GQA_RATIOS):
+            raise ModelingError("gdn_chunk32_unsupported_value_to_key_head_ratio")
         if self.hv % self.hk or self.hq % self.hk:
             raise ModelingError("linear_attention_head_groups_not_divisible")
         if self.operation not in OPERATIONS - {"causal_conv1d"}:
             raise ModelingError(f"linear_attention_operation_unsupported:{self.operation}")
-        pinned = self.abi in CHUNK32_ABIS or self.metadata.get("chunk32") is True
         if self.bt == DIAG_BLOCK_WIDTH and not pinned:
             raise ModelingError("linear_attention_chunk32_requires_pinned_abi")
         if (self.bt not in (GDN_CHUNK64_TOKENS, DIAG_BLOCK_WIDTH)
@@ -172,10 +163,23 @@ class CausalConvContract:
     activation: str = "none"
     write_state: bool = True
     speculative_width: int = 1
+    state_len: int | None = None
+    state_offsets: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "lengths", _lengths(self.lengths))
         _positive(self.channels, self.width, self.speculative_width)
+        history = self.width - 1
+        state_len = history if self.state_len is None else self.state_len
+        offsets = tuple(self.state_offsets) or (0,) * len(self.lengths)
+        if type(state_len) is not int or state_len < history:
+            raise ModelingError("causal_conv1d_state_len_unsupported")
+        if len(offsets) != len(self.lengths) or any(
+            type(offset) is not int or not 0 <= offset <= state_len - history for offset in offsets
+        ):
+            raise ModelingError("causal_conv1d_state_offset_out_of_bounds")
+        object.__setattr__(self, "state_len", state_len)
+        object.__setattr__(self, "state_offsets", offsets)
         _validate_flags(self.has_bias, self.write_state)
         element_bytes(self.dtype)
         element_bytes(self.state_dtype)
@@ -202,22 +206,36 @@ def validate_contract(op: OpSpec, ctx: OperatorPlanningContext) -> LinearAttenti
     lengths = _lengths(metadata.get("lengths", metadata.get("sequence_lengths", metadata.get("sequence_tokens", ()))))
     dtype = metadata.get("dtype", op.dtype or "bf16")
     if operation == "causal_conv1d":
-        contract = CausalConvContract(
-            metadata.get("channels"), metadata.get("width", metadata.get("taps")), lengths,
+        channels, width = metadata.get("channels"), metadata.get("width", metadata.get("taps"))
+        _positive(channels, width)
+        weights = metadata.get("weight_shape", (channels, width))
+        if not isinstance(weights, (tuple, list)) or tuple(weights) != (channels, width):
+            raise ModelingError("causal_conv1d_weight_or_history_shape_mismatch")
+        state_len = metadata.get("state_len", metadata.get("state_history_slots"))
+        history = metadata.get("history_shape")
+        if history is not None:
+            if (not isinstance(history, (tuple, list)) or len(history) not in (2, 3)
+                    or history[-1] != channels or (len(history) == 3 and history[0] != len(lengths))
+                    or (state_len is not None and history[-2] != state_len)):
+                raise ModelingError("causal_conv1d_weight_or_history_shape_mismatch")
+            state_len = history[-2]
+        accepted = metadata.get("accepted_tokens")
+        offsets = metadata.get("state_offset", accepted if accepted is not None else 0)
+        offsets = tuple(offsets) if isinstance(offsets, (tuple, list)) else (offsets,) * len(lengths)
+        if "state_offset" not in metadata and accepted is not None:
+            if any(type(n) is not int or n < 0 for n in offsets):
+                raise ModelingError("causal_conv1d_invalid_accepted_tokens")
+            offsets = tuple(max(0, n - 1) for n in offsets)
+        return CausalConvContract(
+            channels, width, lengths,
             mode=metadata.get("mode", "incremental" if abi == "causal_conv1d_update" else "varlen"),
             dtype=dtype, state_dtype=metadata.get("state_dtype", dtype),
             has_bias=metadata.get("has_bias", False), activation=metadata.get("activation", "none"),
-            write_state=metadata.get("write_state", True),
-            speculative_width=metadata.get("speculative_width", 1),
+            write_state=metadata.get("write_state", True), state_len=state_len, state_offsets=offsets,
+            speculative_width=metadata.get("speculative_width", metadata.get(
+                "q", max(lengths) if accepted is not None or "state_offset" in metadata else 1
+            )),
         )
-        weights = metadata.get("weight_shape", (contract.channels, contract.width))
-        history = metadata.get("history_shape", (contract.width - 1, contract.channels))
-        valid_history = {(contract.width - 1, contract.channels),
-                         (len(lengths), contract.width - 1, contract.channels)}
-        if (not isinstance(weights, (list, tuple)) or not isinstance(history, (list, tuple))
-                or tuple(weights) != (contract.channels, contract.width) or tuple(history) not in valid_history):
-            raise ModelingError("causal_conv1d_weight_or_history_shape_mismatch")
-        return contract
 
     pinned = abi in CHUNK32_ABIS or metadata.get("chunk32") is True
     hv = metadata.get("hv", metadata.get("heads", 1))
@@ -228,6 +246,10 @@ def validate_contract(op: OpSpec, ctx: OperatorPlanningContext) -> LinearAttenti
         "use_initial_state", "output_final_state", "save_intermediate_state", "save_matrices",
         "kda_template_request", "l2_capacity_bytes", "active_l2_streams",
     ) if key in metadata}
+    if operation == "kda_prefill":
+        for alias, field_name in (("has_initial_state", "use_initial_state"), ("return_final_state", "output_final_state")):
+            if alias in metadata:
+                fields[field_name] = metadata[alias]
     bt = metadata.get("bt", metadata.get("chunk_size", DIAG_BLOCK_WIDTH if pinned else GDN_CHUNK64_TOKENS))
     return LinearAttentionContract(
         operation, lengths, metadata.get("hq", hv), metadata.get("hk", hv), hv, dk, dv, bt,
@@ -393,7 +415,7 @@ def rank_one_transition(family: str, dk: int, dv: int, *, state_dtype: str = "fp
         "kda": ("keywise", "exp(gate) * S + correction outer raw_K"),
         "gdn": ("scalar", "decay * S + correction outer normalized_K"),
         "deltanet": ("scalar" if gated else "identity", "decay * S + correction outer K"),
-        "gla": ("separable", "fold value gate into correction; apply key gate to state columns"),
+        "gla": ("separable", "g_v[:, None] * S * g_k[None, :] + correction outer K"),
         "lightning": ("head", "head_decay * S + V outer K"),
         "retnet": ("head", "retention_decay * S + projected_V outer projected_K"),
         "mamba": ("diagonal_selective", "exp(dt * A_diag) * S + dt * input outer B; read with C_proj"),
@@ -401,6 +423,8 @@ def rank_one_transition(family: str, dk: int, dv: int, *, state_dtype: str = "fp
     key, decay, extra = FP32_BYTES * dk, FP32_BYTES, 0
     if family in {"kda", "gla"}:
         key = decay = dk * packed
+        if family == "gla":
+            extra = dv * packed  # Value-axis decay remains live with a zero correction.
     elif family == "deltanet" and not gated:
         decay = 0
     elif family == "mamba" and gated:
@@ -446,7 +470,7 @@ def build_recover_ssm_verify(family: str, dk: int, dv: int, *, q: int, heads: in
                                      kg_dtype=kg_dtype, gated=gated, factors=factors)
     owners = heads * sequences
     return RecoverSsmVerifyPlan(transition, q, owners * dk * dv * element_bytes(state_dtype),
-                               owners * q * transition.record_bytes, q * sequences, q == 1)
+                               owners * q * transition.record_bytes if q > 1 else 0, q * sequences, q == 1)
 
 def build_recover_ssm_commit(family: str, dk: int, dv: int, *, q: int, a: int, heads: int = 1,
                              sequences: int = 1, state_dtype: str = "fp32", kg_dtype: str = "bf16",
@@ -466,109 +490,51 @@ def build_recover_ssm_commit(family: str, dk: int, dv: int, *, q: int, a: int, h
     verify = build_recover_ssm_verify(family, dk, dv, q=q, heads=heads, sequences=sequences,
                                      state_dtype=state_dtype, kg_dtype=kg_dtype, gated=gated, factors=factors)
     state = verify.state_read_bytes if a else 0
+    checkpoints = tuple(point for point in boundaries if point <= a)
+    replay_tokens = a * heads * sequences if q > 1 else 0
     return RecoverSsmCommitPlan(
-        verify.transition, q, a, state, heads * sequences * a * verify.transition.record_bytes,
-        REPLAY_OPS_PER_STATE_ELEMENT * a * sequences * heads * dk * dv, state,
-        base_version, base_version + int(a > 0), a == 0,
-        tuple(point for point in boundaries if point <= a),
+        verify.transition, q, a, state, replay_tokens * verify.transition.record_bytes,
+        (REPLAY_OPS_PER_STATE_ELEMENT + (family == "gla")) * replay_tokens * dk * dv,
+        state * (1 + sum(point < a for point in checkpoints)),
+        base_version, base_version + int(a > 0), a == 0, checkpoints,
     )
 
 def flash_kda_workspace_groups(
     chunks: Sequence[int], slots_per_head: int, max_group: int,
 ) -> Iterator[tuple[int, int, tuple[int, ...]]]:
-    _positive(slots_per_head, max_group)
-    for start in range(0, len(chunks), slots_per_head):
-        group = chunks[start:start + slots_per_head]
-        consumed = 0
-        longest = max(group)
-        while consumed < longest:
-            low, high = 1, min(max_group, longest - consumed, slots_per_head)
-            while low < high:
-                mid = (low + high + 1) // 2
-                if sum(min(max(0, n - consumed), mid) for n in group) <= slots_per_head:
-                    low = mid
-                else:
-                    high = mid - 1
-            yield start, consumed, tuple(min(max(0, n - consumed), low) for n in group)
-            consumed += low
+    from mindie_sim.templates.dsl_catalog import flash_kda_rounds
 
-def flash_kda_group_limit(chunks: Sequence[int], heads: int, cores: int, layout: int,
-                          requested: int | None, calibration_enabled: bool) -> int:
-    group = KDA_MAX_CHUNK_GROUP if requested is None else requested
-    _positive(group)
-    if (calibration_enabled and layout == 1 and cores == KDA_MAX_AIC_CORES and len(chunks) == 1
-            and KDA_MAX_AIC_CORES < heads <= KDA_MAX_VALUE_HEADS and chunks[0] in KDA_TRAINING_CHUNK_RANGE):
-        return min(group, KDA_TRAINING_GROUP_LIMIT)
-    return group
+    previous, consumed = -1, 0
+    for start, counts in flash_kda_rounds(chunks, 1, slots_per_head, max_group):
+        if start != previous:
+            previous, consumed = start, 0
+        yield start, consumed, counts
+        consumed += max(counts)
 
 def select_flash_kda_template(
     lengths: LinearAttentionContract | Sequence[int], *, value_heads: int | None = None,
     query_heads: int | None = None, core_num: int, template_request: str = "auto",
-    route_coefficients: Sequence[int] = KDA_ROUTE_PARAMETERS, layout_kind: int = 0,
+    device_name: str = "", route_coefficients: Sequence[int] = (), layout_kind: int = 0,
     workspace_slots: int = KDA_WORKSPACE_SLOTS, max_chunk_group: int | None = None,
     metadata_word_capacity: int | None = None, has_cu: bool = False,
-    calibration_enabled: bool = True,
+    calibration_enabled: bool = True, enable_grad: bool = False,
 ) -> str:
+    from mindie_sim.templates.dsl_catalog import resolve_flash_kda_route
+
     if isinstance(lengths, LinearAttentionContract):
         contract = lengths
         value_heads, query_heads = contract.hv, contract.hq
-        template_request = contract.kda_template_request if template_request == "auto" else template_request
+        if template_request == "auto":
+            template_request = FLASH_KDA_TEMPLATE_BY_ABI.get(contract.abi, contract.kda_template_request)
+        device_name = device_name or contract.metadata.get("device_name", "")
         lengths = contract.lengths
-    lengths = _lengths(lengths)
-    _positive(value_heads, query_heads, core_num, workspace_slots)
-    if template_request in {"staged", "persistent"}:
-        return template_request
-    if (template_request != "auto" or workspace_slots < value_heads or layout_kind not in (0, 1)
-            or core_num > KDA_MAX_AIC_CORES or value_heads > KDA_MAX_VALUE_HEADS):
-        raise ModelingError("flash_kda_route_geometry_invalid")
-    if not calibration_enabled:
-        return "staged"
-    chunks = tuple(ceil_div(n, GDN_CHUNK64_TOKENS) for n in lengths)
-    peak = max(chunks)
-    group = flash_kda_group_limit(chunks, value_heads, core_num, layout_kind, max_chunk_group, calibration_enabled)
-    if has_cu and len(lengths) > 1 and peak <= 2:
-        return "persistent"
-    owners = len(lengths) * value_heads
-    if metadata_word_capacity is not None and (
-        KDA_METADATA_HEADER_WORDS + KDA_MAX_AIC_CORES + KDA_CHUNK_TASK_WORDS * owners + len(lengths)
-        > metadata_word_capacity
-    ):
-        return "staged"
-    base = layout_kind * ROUTE_PARAMETER_WORDS
-    coeff = route_coefficients[base:base + ROUTE_PARAMETER_WORDS]
-    if (len(coeff) != ROUTE_PARAMETER_WORDS or any(type(n) is not int or n < 0 for n in coeff[:-1])
-            or coeff[ROUTE_SCHEMA_INDEX] not in ROUTE_SCHEMAS or coeff[ROUTE_MARGIN_INDEX] >= PARTS_PER_MILLION):
-        return "staged"
-
-    cyclic = [0] * core_num
-    lpt = [(0, index, 0) for index in range(core_num)]
-    heapify(lpt)
-    for batch in sorted(range(len(chunks)), key=lambda i: (-chunks[i], i)):
-        for head in range(value_heads):
-            cyclic[(batch * value_heads + head) % core_num] += chunks[batch]
-            load, core, rows = lpt[0]
-            heapreplace(lpt, (load + chunks[batch], core, rows + lengths[batch]))
-    parallel = ceil_div(sum(chunks) * value_heads, core_num)
-    staged_peak, persistent_peak = max(cyclic), max(load for load, _, _ in lpt)
-    if max(parallel, staged_peak, persistent_peak, owners) > INT64_MAX // ROUTE_COST_SCALE:
-        return "staged"
-    rounds = sum(1 for _ in flash_kda_workspace_groups(chunks, workspace_slots // value_heads, group))
-
-    (s_base, s_parallel, s_peak, s_round, s_query, s_compute, s_memory,
-     p_base, p_peak, p_head, p_query, p_compute, p_memory, _, margin, _) = coeff
-    scale = ROUTE_COST_SCALE
-    total_rows, query_rows = sum(lengths) * value_heads, sum(lengths) * query_heads
-    staged = (scale * (s_base + s_parallel * parallel + s_peak * staged_peak + s_round * rounds)
-              + s_query * query_rows + max(s_compute * parallel * scale, s_memory * total_rows))
-    persistent = scale * (p_base + p_peak * persistent_peak + p_head * owners) + p_query * query_rows
-    previous = 0
-    for index, rows in enumerate(sorted(rows for _, _, rows in lpt)):
-        persistent += max(p_compute, p_memory * (core_num - index)) * (rows - previous)
-        previous = rows
-    if max(staged, persistent) > INT64_MAX:
-        return "staged"
-    required_gain = staged * margin // PARTS_PER_MILLION
-    return "persistent" if persistent < staged - required_gain else "staged"
+    _positive(value_heads, core_num)
+    return resolve_flash_kda_route(
+        lengths, value_heads, core_num, requested_template=template_request, device_name=device_name,
+        route_coefficients=route_coefficients, layout_kind=layout_kind, workspace_slots=workspace_slots,
+        max_chunk_group=max_chunk_group, metadata_word_capacity=metadata_word_capacity, has_cu=has_cu,
+        calibration_enabled=calibration_enabled, enable_grad=enable_grad, query_heads=query_heads,
+    )[0]
 
 
 @dataclass(frozen=True, slots=True)
@@ -660,14 +626,17 @@ def build_causal_conv1d_plan(contract: CausalConvContract, ctx: OperatorPlanning
     c = contract
     size, stored = element_bytes(c.dtype), element_bytes(c.state_dtype)
     tokens = sum(c.lengths)
-    history = len(c.lengths) * (c.width - 1) * c.channels * stored
+    history_rows = c.width - 1
+    row_bytes = c.channels * stored
+    history = len(c.lengths) * history_rows * row_bytes
     output = tokens * c.channels * size
     workers = min(ctx.effective_aiv_cores, len(c.lengths) * c.channels)
     _positive(weight_copies)
     macs = 2 * c.channels * tokens * c.width
     state_writes = history
-    if c.mode == "incremental" and c.width > 1 and c.speculative_width > 1:
-        state_writes += sum(min(n, c.speculative_width) - 1 for n in c.lengths) * c.channels * stored
+    if c.mode == "incremental" and c.speculative_width > 1:
+        state_writes = row_bytes * sum(min(c.state_len, history_rows + min(n, c.speculative_width) - 1)
+                                       for n in c.lengths)
     phases = [
         Phase("input", transfer(ctx, read=output)),
         Phase("history", transfer(ctx, read=history)),
@@ -688,7 +657,8 @@ def build_causal_conv1d_plan(contract: CausalConvContract, ctx: OperatorPlanning
     if c.write_state:
         phases.append(Phase("state_writeback", transfer(ctx, write=state_writes), ("history", "input", "output")))
     return make_plan(ctx, implementation, phases, sources=sources, family="causal_conv1d", owners=workers,
-                     metadata={"mode": c.mode, "mac_flops": macs, "history_rows": c.width - 1,
+                     metadata={"mode": c.mode, "mac_flops": macs, "history_rows": history_rows,
+                               "state_len": c.state_len, "state_offsets": c.state_offsets,
                                "speculative_width": c.speculative_width})
 
 def build_recover_ssm_plan(contract: LinearAttentionContract, ctx: OperatorPlanningContext, *,
@@ -705,12 +675,13 @@ def build_recover_ssm_plan(contract: LinearAttentionContract, ctx: OperatorPlann
         verify = build_recover_ssm_verify(family, c.dk, c.dv, **options)
         tokens = verify.output_tokens if "q" in m else sum(c.lengths)
         gate_width = c.dk if family in {"kda", "gla"} else 1
+        gate_width += c.dv if family == "gla" else 0
         inputs = tokens * (
             ((c.hq + c.hk) * c.dk + c.hv * c.dv) * element_bytes(c.dtype)
             + c.hv * (gate_width * element_bytes(c.gate_dtype) + element_bytes(c.beta_dtype))
         )
         output = tokens * c.hv * c.dv * element_bytes(c.dtype)
-        checkpoint = tokens == len(c.lengths)
+        checkpoint = verify.single_checkpoint
         state_or_rec = (
             Phase("write_state_checkpoint", transfer(ctx, write=verify.state_read_bytes), ("verify_tokens",))
             if checkpoint
@@ -720,7 +691,7 @@ def build_recover_ssm_plan(contract: LinearAttentionContract, ctx: OperatorPlann
         phases = (
             Phase("read_base_state", transfer(ctx, read=verify.state_read_bytes)),
             Phase("verify_inputs", transfer(ctx, read=inputs)),
-            Phase("verify_tokens", Work(resources={"vector": 2 * REPLAY_OPS_PER_STATE_ELEMENT
+            Phase("verify_tokens", Work(resources={"vector": (2 * REPLAY_OPS_PER_STATE_ELEMENT + (family == "gla"))
                                                    * tokens * c.hv * c.dk * c.dv}),
                   ("read_base_state", "verify_inputs")),
             Phase("verify_outputs", transfer(ctx, write=output), ("verify_tokens",)),
@@ -731,11 +702,18 @@ def build_recover_ssm_plan(contract: LinearAttentionContract, ctx: OperatorPlann
     else:
         commit = build_recover_ssm_commit(
             family, c.dk, c.dv, a=m.get("a", m.get("accepted")),
-            base_version=m.get("base_version", 0), boundary_checkpoints=m.get("boundary_checkpoints", ()), **options,
+            base_version=m.get("base_version", 0),
+            boundary_checkpoints=m.get("boundary_checkpoints", m.get("boundaries", ())), **options,
         )
-        record_read = replay_bytes(commit) if replay_bytes else commit.record_read_bytes
+        record_read = replay_bytes(commit) if replay_bytes and commit.record_read_bytes else commit.record_read_bytes
         phases = []
-        if not commit.skipped_zero_accept:
+        if q == 1 and commit.a:
+            phases.extend((
+                Phase("read_acceptance", transfer(ctx, read=len(c.lengths) * ACCEPTANCE_WORD_BYTES)),
+                Phase("read_checkpoint", transfer(ctx, read=commit.state_read_bytes), ("read_acceptance",)),
+                Phase("publish", transfer(ctx, write=commit.state_write_bytes), ("read_checkpoint",)),
+            ))
+        elif commit.a:
             phases.extend((Phase("read_base_state", transfer(ctx, read=commit.state_read_bytes)),
                            Phase("read_records", transfer(ctx, read=record_read))))
             after, previous = ("read_base_state", "read_records"), 0
@@ -744,7 +722,11 @@ def build_recover_ssm_plan(contract: LinearAttentionContract, ctx: OperatorPlann
                 replay = Work(resources={"vector": commit.vector_ops // commit.a * (end - previous)})
                 phases.append(Phase(name, replay, after))
                 after, previous = (name,), end
-            phases.append(Phase("publish", transfer(ctx, write=commit.state_write_bytes), after))
+                if end < commit.a:
+                    checkpoint = f"publish_boundary_{end}"
+                    phases.append(Phase(checkpoint, transfer(ctx, write=commit.state_read_bytes), after))
+                    after = (checkpoint,)
+            phases.append(Phase("publish", transfer(ctx, write=commit.state_read_bytes), after))
         result = {"q": q, "a": commit.a, "published_version": commit.published_version,
                   "base_version": commit.base_version, "skipped_zero_accept": commit.skipped_zero_accept,
                   "boundary_checkpoints": commit.boundary_checkpoints, "physical_record_read_bytes": record_read}

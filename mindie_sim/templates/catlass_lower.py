@@ -25,8 +25,8 @@ from .catlass_catalog import (
     matrix_problem, mx_scale_bytes, packed_bytes, should_elide_l1_reload,
     streamk_partition, swizzle_block_coord, validate_catlass_spec,
 )
-from .contracts import SemanticWorkItem, ceil_div, evg_order
-from .fuse_region import Lowering, solve_template_tile
+from .contracts import SemanticWorkItem, ceil_div, eligible_matrix_engines, evg_order
+from .fuse_region import Lowering, ring_credit, solve_template_tile
 
 _NOMINAL_BUFFER_ALIGNMENT = 32
 A8W4_PROLOGUE_SUBBLOCK_ALIGNMENT = 32
@@ -168,6 +168,11 @@ class _MatrixLowerer:
         self.gk = ceil_div(problem.k, self.tk)
         self.resident = {}
         self.l1_generations = defaultdict(int)
+        self.owner_rings = {}
+        self.owner_generation = defaultdict(int)
+        self.owner_micro = defaultdict(int)
+        self.mma_tail = {}
+        self.fixpipe_tail = {}
         self._tile_index = 0
 
     def tile(self, index, *, group=0, group_start=0, rows=None, start_core=0, n_cols=None):
@@ -213,7 +218,7 @@ class _MatrixLowerer:
         slot = self.l1_generations[lane] % ring.depth
         self.l1_generations[lane] += 1
         previous = self.resident.get((*lane, slot))
-        credit = _ring_credit(ring, generation)
+        credit = ring_credit(ring, generation)
         deps = (*after, credit)
         elide = previous is not None and should_elide_l1_reload(
             previous[0], previous[1:], location[0], location[1:], s.enable_l1_resident,
@@ -268,29 +273,42 @@ class _MatrixLowerer:
         core = tile.owner
         l1m, l1n, l1k = s.l1_tile_shape
         l0m, l0n, l0k = s.l0_tile_shape
-        rings = tuple(
-            RingBuffer(
-                die=plan.die, owner=core, pool=pool, allocation=f"{name}:{tag}", depth=depth,
-                slot_bytes=packed_bytes(elements, dtype)
-                + (_scale(s, elements, l1=pool == "l1") if pool != "l0c" else 0)
-                if plan.context is not None else 0,
+        mutex = s.dispatch_policy == "MmadPingpongMutex"
+        rings = self.owner_rings.get(core) if mutex else None
+        if rings is None:
+            prefix = f"owner:{core}" if mutex else name
+            rings = tuple(
+                RingBuffer(
+                    die=plan.die, owner=core, pool=pool, allocation=f"{prefix}:{tag}", depth=depth,
+                    slot_bytes=packed_bytes(elements, dtype)
+                    + (_scale(s, elements, l1=pool == "l1") if pool != "l0c" else 0)
+                    if plan.context is not None else 0,
+                )
+                for (tag, pool, elements, dtype), depth in zip((
+                    ("l1a", "l1", l1m * l1k, s.dtype_a), ("l1b", "l1", l1n * l1k, _compute_b(s)),
+                    ("l0a", "l0a", l0m * l0k, s.dtype_a), ("l0b", "l0b", l0n * l0k, _compute_b(s)),
+                    ("l0c", "l0c", l0m * l0n, s.dtype_acc),
+                ), s.stages)
             )
-            for (tag, pool, elements, dtype), depth in zip((
-                ("l1a", "l1", l1m * l1k, s.dtype_a), ("l1b", "l1", l1n * l1k, _compute_b(s)),
-                ("l0a", "l0a", l0m * l0k, s.dtype_a), ("l0b", "l0b", l0n * l0k, _compute_b(s)),
-                ("l0c", "l0c", l0m * l0n, s.dtype_acc),
-            ), s.stages)
-        )
+            if mutex:
+                self.owner_rings[core] = rings
         l1a, l1b, l0a, l0b, accum = rings
-        acc_credit = _ring_credit(accum, 0)
+        generation = self.owner_generation[core] if mutex else 0
+        panel_start = self.l1_generations[core, "a"] if mutex else 0
+        micro_start = self.owner_micro[core] if mutex else 0
+        acc_credit = ring_credit(accum, generation)
         previous = (*after, acc_credit)
+        if mutex:
+            self.owner_generation[core] += 1
+            if core in self.mma_tail:
+                previous += (self.mma_tail[core],)
         if s.has_bias:
             previous = (plan.access(
                 f"{name}:bias", p.c_id + ":bias", packed_bytes(tile.n, s.dtype_acc),
                 owner=core, pipe="mte2_aic", offset=packed_bytes(tile.col, s.dtype_acc), after=previous,
             ),)
         g = 0
-        for outer, panel in enumerate(panels):
+        for outer, panel in enumerate(panels, panel_start):
             k_start = panel * self.tk
             k_len = min(self.tk, p.k - k_start)
             last_load = f"{name}:micro:{g + ceil_div(k_len, self.micro_k) - 1}:loaded"
@@ -304,15 +322,16 @@ class _MatrixLowerer:
             for start in range(0, k_len, self.micro_k):
                 micro = min(k_len - start, self.micro_k)
                 mma = f"{name}:micro:{g}:mma"
+                slot_generation = micro_start + g
                 r0 = []
                 for rows, dtype, ring, prior in (
                     (tile.m, s.dtype_a, l0a, r1[0]), (tile.n, _compute_b(s), l0b, r1[1]),
                 ):
                     moved = packed_bytes(rows * micro, dtype) + _scale(s, rows * micro)
-                    load = plan.work(f"{ring.allocation}:g{g}:load", "mte1", moved, owner=core,
-                                     after=(prior, _ring_credit(ring, g)))
+                    load = plan.work(f"{ring.allocation}:g{slot_generation}:load", "mte1", moved, owner=core,
+                                     after=(prior, ring_credit(ring, slot_generation)))
                     r0.append(lower_generation(
-                        ring, g, "mte1", ("mma",), producer_extra_after=(load,),
+                        ring, slot_generation, "mte1", ("mma",), producer_extra_after=(load,),
                         consumer_extra_after={"mma": (mma,)},
                     ).publish)
                 loaded = plan.add(Stage(f"{name}:micro:{g}:loaded", after=tuple(r0)))
@@ -321,23 +340,29 @@ class _MatrixLowerer:
                                       dtype=_cube_dtype(s), metadata={"logical_flops": 2 * tile.m * tile.n * micro}),)
                 g += 1
         event = lower_generation(
-            accum, 0, "mma", ("fixpipe",), producer_extra_after=previous,
+            accum, generation, "mma", ("fixpipe",), producer_extra_after=previous,
             consumer_extra_after={"fixpipe": (f"{name}:accumulator_consumed",)},
         )
-        for ring in rings:
-            plan.add_ring(ring, after=after)
+        if mutex:
+            self.owner_micro[core] += g
+            self.mma_tail[core] = previous[0]
+        else:
+            for ring in rings:
+                plan.add_ring(ring, after=after)
         return name, event.publish
 
     def _consume(self, name, dependency):
         return self.plan.add(Stage(f"{name}:accumulator_consumed", after=(dependency,)))
 
-    def _write_output(self, name, tile, after, *, pipe="fixpipe", owner=None, width=None):
+    def _write_output(self, name, tile, after, *, pipe="fixpipe", owner=None, width=None, physical_rows=None):
         dtype = self.spec.dtype_c
         full_n = self.p.n if width is None else width
         if self.spec.layout_c == "RowMajor":
             stride = packed_bytes(full_n, dtype)
             row_bytes = packed_bytes(tile.n, dtype)
-            runs = (AddressRun(tile.row * stride + packed_bytes(tile.col, dtype), tile.m, row_bytes, stride),)
+            col = packed_bytes(tile.col, dtype)
+            runs = ((AddressRun(tile.row * stride + col, tile.m, row_bytes, stride),) if physical_rows is None
+                    else tuple(AddressRun(row * stride + col, 1, row_bytes, stride) for row in physical_rows))
             amount = row_bytes * tile.m
         elif self.spec.layout_c == "ColumnMajor":
             stride = packed_bytes(self.p.m, dtype)
@@ -356,7 +381,12 @@ class _MatrixLowerer:
         s, p, plan = self.spec, self.p, self.plan
         epilogue = s.epilogue_kind
         if epilogue == "none":
-            out = self._write_output(name + ":fixpipe", tile, (ready,))
+            after = (ready,)
+            if s.dispatch_policy == "MmadPingpongMutex" and tile.owner in self.fixpipe_tail:
+                after += (self.fixpipe_tail[tile.owner],)
+            out = self._write_output(name + ":fixpipe", tile, after)
+            if s.dispatch_policy == "MmadPingpongMutex":
+                self.fixpipe_tail[tile.owner] = out
             self._consume(name, out)
             return out
         if epilogue == "finalize_routing":
@@ -455,17 +485,43 @@ class _MatrixLowerer:
         name = f"simt:{self._tile_index}"
         self._tile_index += 1
         owner = tile.owner % s.aiv_budget
-        a = self._rect(p.a_id, s.dtype_a, tile.row, 0, tile.m, p.k, p.k, name=name + ":gather",
-                       pipe="mte2_aiv", owner=owner, after=after)
+        indexed = s.dispatch_policy == "MatmulGatherScatterSimt"
+        physical_rows = None
+        if indexed:
+            index_bytes = packed_bytes(1, "int32")
+            index = plan.access(name + ":indices", p.indices_id, tile.m * index_bytes, owner=owner,
+                                after=after, offset=tile.row * index_bytes,
+                                obligation=p.indices is not None or p.physical_m is not None)
+            physical_rows = (p.indices[tile.row:tile.row + tile.m] if p.indices is not None
+                             else range(tile.row, tile.row + tile.m))
+            stride = packed_bytes(p.k, s.dtype_a)
+            a = plan.access(name + ":gather", p.a_id, tile.m * stride, owner=owner, after=(index,),
+                            runs=tuple(AddressRun(row * stride, 1, stride, stride) for row in physical_rows))
+        else:
+            a = self._rect(p.a_id, s.dtype_a, tile.row, 0, tile.m, p.k, p.k, name=name + ":gather",
+                           pipe="mte2_aiv", owner=owner, after=after)
         b = self._rect(p.b_id, s.dtype_b, 0, tile.col, p.k, tile.n, p.n, name=name + ":weights",
                        pipe="mte2_aiv", owner=owner, after=after)
         simt = plan.work(name + ":simt_mac", "aiv_simt", 2 * tile.m * tile.n * p.k,
                          owner=owner, after=(a, b), metadata={"thread_block_dim": s.simt_thread_block_dim})
-        return self._write_output(name + ":scatter", tile, (simt,), pipe="mte3", owner=owner)
+        return self._write_output(name + ":scatter", tile, (simt,), pipe="mte3", owner=owner,
+                                  physical_rows=physical_rows)
 
-
-def _ring_credit(ring, index):
-    return ring.initial_credit(ring.slot(index)) if index < ring.depth else ring.last_use(index - ring.depth)
+    def zero_destination(self, launch):
+        p, s, plan = self.p, self.spec, self.plan
+        sector = plan.sector
+        total = packed_bytes(p.output_rows * p.n, s.dtype_c)
+        sectors = ceil_div(total, sector)
+        writes = []
+        for lane in range(s.aiv_budget):
+            start = sectors * lane // s.aiv_budget * sector
+            end = min(total, sectors * (lane + 1) // s.aiv_budget * sector)
+            if start < end:
+                writes.append(plan.access(
+                    f"simt:zero_output:{lane}", p.c_id, end - start, direction="write",
+                    pipe="mte3", owner=lane, offset=start, after=(launch,),
+                ))
+        return plan.add(Stage("simt:zero_output:barrier", after=tuple(writes)))
 
 
 def _issued_ops(m, n, k, spec, datapath):
@@ -510,6 +566,8 @@ def _partial(lowerer, parts, block, tile, panels, after, offset, row_stride):
 
 
 def _normal_waves(lowerer, start, stop, after):
+    if lowerer.spec.dispatch_policy == "MmadPingpongMutex":
+        return tuple(lowerer.ordinary(lowerer.tile(i), after) for i in range(start, stop))
     cores = lowerer.spec.aic_budget
     for first in range(start, stop, cores):
         after = tuple(lowerer.ordinary(lowerer.tile(i), after) for i in range(first, min(first + cores, stop)))
@@ -546,17 +604,16 @@ def _split_schedule(lowerer, launch, blocks):
         owner_done = {}
         stride = packed_bytes(lowerer.p.n, spec.dtype_acc)
         matrix_bytes = lowerer.p.m * stride
-        for block in range(blocks):
-            start = 0
-            for split in range(spec.splitk_factor):
-                owner = (block * spec.splitk_factor + split) % spec.aic_budget
-                stop = start + base + (split < rem)
+        for split in range(spec.splitk_factor):
+            start = split * base + min(split, rem)
+            stop = start + base + (split < rem)
+            for block in range(blocks):
+                owner = (split * blocks + block) % spec.aic_budget
                 tile = replace(lowerer.tile(block), owner=owner)
                 offset = split * matrix_bytes + tile.row * stride + packed_bytes(tile.col, spec.dtype_acc)
                 _partial(lowerer, parts, block, tile, range(start, stop),
                          (owner_done.get(owner, launch),), offset, stride)
                 owner_done[owner] = parts[block][-1][1]
-                start = stop
         signal = plan.add(Stage("cross_core_set_flag", after=tuple(owner_done.values())))
     _reduce_partials(lowerer, parts, signal)
 
@@ -574,6 +631,8 @@ def lower_catlass_spec(
     plan = Lowering(datapath, context=context, memory_view=memory_view, die=die, live_admission=live_admission)
     lowerer = _MatrixLowerer(plan, spec, p)
     launch = plan.launch()
+    if spec.dispatch_policy == "MatmulGatherScatterSimt":
+        launch = lowerer.zero_destination(launch)
     blocks = ceil_div(p.m, lowerer.tm) * ceil_div(p.n, lowerer.tn)
     if spec.scheduler == "grouped_slice_m":
         n_cols = p.n // 2 if spec.epilogue_kind == "grouped_swiglu_mx_quant" else p.n
@@ -591,16 +650,21 @@ def lower_catlass_spec(
         _split_schedule(lowerer, launch, blocks)
     else:
         _normal_waves(lowerer, 0, blocks, (launch,))
+    for rings in lowerer.owner_rings.values():
+        for ring in rings:
+            plan.add_ring(ring, after=(launch,))
     rid = region_id or spec.template_id
     semantic = [SemanticWorkItem(
         rid + ":matrix", "matrix_mac", _cube_dtype(spec), 2 * p.m * p.n * p.k,
-        ("aiv_simt",) if _is_simt_matrix(spec) else ("cube",), (spec.scheduler,),
+        eligible_matrix_engines(p, datapath), (spec.scheduler,),
     )]
     kinds = {"vec_alu": "vector_alu", "vec_sfu": "vector_sfu", "vec_reduce": "vector_reduce",
              "aiv_simt": "vector_alu"}
     semantic.extend(
         SemanticWorkItem(rid + ":" + pipe, kinds[pipe], dtype_name(spec.dtype_acc), int(ops),
                          ("aiv_simt",) if pipe == "aiv_simt" else ("aiv_simd",), (spec.scheduler,))
-        for pipe, ops in plan.vector.items() if ops and not (pipe == "aiv_simt" and _is_simt_matrix(spec))
+        for pipe, ops in plan.vector.items() if ops
+        and not (pipe == "aiv_simt" and _is_simt_matrix(spec))
+        and not (pipe == "vec_reduce" and spec.scheduler in {"streamk", "multi_core_splitk"})
     )
     return plan.result("K2", rid, (rid,), spec, semantic, solution)

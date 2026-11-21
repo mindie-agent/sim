@@ -176,14 +176,29 @@ def _valid_fields(ref):
 def _load_blob(repo_dir, revision, path):
     if repo_dir is None or not repo_dir.is_dir():
         return "source_repository_missing", None
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(repo_dir), "show", f"{revision}:{path}"],
+
+    def read(*args):
+        return subprocess.run(
+            ["git", "-C", str(repo_dir), "--no-replace-objects", "cat-file", *args],
             capture_output=True, timeout=_GIT_TIMEOUT_SECONDS, check=False,
         )
+
+    try:
+        commit = read("-t", revision)
+        if commit.returncode or commit.stdout.strip() != b"commit":
+            return "source_revision_not_commit", None
+        object_name = f"{revision}:{path}"
+        blob_type = read("-t", object_name)
+        if blob_type.returncode:
+            return "source_blob_missing", None
+        if blob_type.stdout.strip() != b"blob":
+            return "source_path_not_blob", None
+        result = read("blob", object_name)
     except TimeoutError:
         raise
-    except (OSError, subprocess.TimeoutExpired):
+    except OSError:
+        return "source_git_read_failed", None
+    except subprocess.TimeoutExpired:
         return "source_git_read_failed", None
     if result.returncode:
         return "source_blob_missing", None
@@ -225,8 +240,6 @@ def verify(root, *, runtime=True, refs_root=None, repo_map=None):
         if identity in verified:
             continue
         verified.add(identity)
-        if refs_root is None and not repo_map:
-            continue
         repository, revision, path, sha = (ref[key] for key in _SOURCE_FIELDS)
         basename = repository.split("/")[-1]
         directory = repo_map.get(repository, repo_map.get(basename))
@@ -249,7 +262,10 @@ def verify(root, *, runtime=True, refs_root=None, repo_map=None):
             symbol = ref["symbol"]
             if end > len(lines):
                 violations.append(Violation(location, f"source_line_range_exceeds_blob:{path}:{end}"))
-            elif not any(symbol.encode("utf-8") in line for line in lines[start - 1:end]):
+            elif not re.search(
+                rb"(?<![A-Za-z0-9_])" + re.escape(symbol.encode("utf-8")) + rb"(?![A-Za-z0-9_])",
+                b"\n".join(lines[start - 1:end]),
+            ):
                 violations.append(Violation(location, f"symbol_missing_from_range:{path}:{symbol}"))
     return len(verified), violations
 

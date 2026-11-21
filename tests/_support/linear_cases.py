@@ -6,36 +6,48 @@
 [Invariants] Zero cross-test imports, zero host-absolute path literals, zero
   mutated global state, and deterministic in-memory construction.
 [Timeouts & Locks] Pure in-memory construction and bounded single-op execution;
-  no sleeps, locks, or network access.
-[Side-Effect Policy] Read-only against packaged model/example JSON fixtures.
+  no sleeps, locks, or network access. Provenance fixture Git calls time out.
+[Side-Effect Policy] Read packaged fixtures and write provenance test data under temporary roots.
 """
 from __future__ import annotations
 
 from dataclasses import replace
+from hashlib import sha256
+from importlib.util import module_from_spec, spec_from_file_location
 import json
 from pathlib import Path
+import subprocess
+import sys
 from typing import Any
 
+from .hardware import machine
 from mindie_sim import target_graphs
-from mindie_sim.backends import ascend
 from mindie_sim.catalog.quant import quant_preset
 from mindie_sim.model_catalog import load_model
 from mindie_sim.prediction.attention import AttentionPolicy
 from mindie_sim.prediction.cost import CostModel
+from mindie_sim.prediction.engine import Engine, Resource
 from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.family_kda_recurrent import IMPLEMENTATION as KDA_REC_IMPL
 from mindie_sim.prediction.frontend import Frontend
 from mindie_sim.prediction.gdn_decode_programs import CONV, GATING
 from mindie_sim.prediction.mechanism import Geometry
 from mindie_sim.prediction.operators.contracts import OperatorPlanningContext
+from mindie_sim.prediction.program import RecipeContext, Stage
 from mindie_sim.prediction.recurrent import linear
 from mindie_sim.prediction.results import OpOccurrence
+from mindie_sim.prediction.runtime.memory_physics import AdmissionMemoryView
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.case import Software
+from mindie_sim.schema.compute_arch import NativeComputeMode, RepresentationCapability
 from mindie_sim.schema.datapath import datapath_for_die
 from mindie_sim.schema.parallel import ParallelSpec
-from mindie_sim.schema.operators import IterationWork
+from mindie_sim.schema.operators import IterationWork, OpSpec
 from mindie_sim.schema.workload import IterationPlan, RequestView
+from mindie_sim.templates import (
+    EdgeRouteBinding, EvgVisitorNode, TemplateSourceRef, compile_fuse_region, enumerate_catlass_specs, enumerate_dsl_specs,
+    lower_dsl_spec,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 _KDA_CASE_DIR = "examples/cases/high-concurrency-20261030/kimi-source-paged-host"
@@ -347,10 +359,8 @@ def sku_planning_context(
     requested_abi: str | None = None,
 ) -> tuple[Geometry, OperatorPlanningContext]:
     """Build a real Geometry and OperatorPlanningContext from a packaged SKU."""
-    hw = ascend.hardware(sku, devices=1)
-    die = hw.dies[0]
-    geom = Geometry.from_devices(hw.dies)
-    dp = datapath_for_die(die)
+    geom = Geometry.from_devices(machine(sku).dies)
+    dp = geom.datapath
     ctx = OperatorPlanningContext(
         occurrence=OpOccurrence(replica=0, stage=0, rank=0, op_id=op_id),
         geometry=geom,
@@ -358,6 +368,17 @@ def sku_planning_context(
         requested_abi=requested_abi,
     )
     return geom, ctx
+
+
+def recipe_context(geometry: Geometry, op) -> RecipeContext:
+    """Bind an isolated program to the real geometry with readable resource names."""
+    rates = {**geometry.rates, "cube": 1000}
+    return RecipeContext(
+        op, {}, {role: role for role in rates}, rates, geometry.compute_units,
+        resource_units=geometry.resource_units, compute_peaks=geometry.compute_peaks,
+        pool_names={pool: pool for pool in geometry.buffers}, pool_units=geometry.buffer_units,
+        datapath=geometry.datapath,
+    )
 
 
 __all__ = [
@@ -370,5 +391,146 @@ __all__ = [
     "gdn_decode_source_case",
     "kda_hardware_case",
     "packed_roles",
+    "recipe_context",
     "sku_planning_context",
 ]
+
+
+def lower_reference(name, p, dp, *, live_rates=None, **options):
+    spec, = enumerate_dsl_specs(name, p, dp, **{"aic_budget": 8, "aiv_budget": 16, **options})
+    bindings = template_live_bindings(dp, p, **live_rates) if live_rates is not None else {}
+    return spec, lower_dsl_spec(spec, p, dp, **bindings)
+
+def stages_by_name(result):
+    return {stage.name: stage for stage in result.program.stages}
+
+def stage_ancestors(stages, name):
+    seen, pending = set(), list(stages[name].after)
+    while pending:
+        parent = pending.pop()
+        if parent not in seen:
+            seen.add(parent)
+            pending.extend(stages[parent].after)
+    return seen
+
+def stage_bytes(stages, suffix, pipe):
+    return sum(stage.work.get(pipe, 0) for name, stage in stages.items() if name.endswith(suffix))
+
+def template_context(dp, p, **extra_rates):
+    units = dict.fromkeys(("cube", "mte1", "mte2_aic", "fixpipe"), dp.aic_count)
+    units.update(dict.fromkeys(("mte2_aiv", "mte3", "vec_reduce"), dp.aiv_count), hbm=1, l2=1)
+    units.update(dict.fromkeys(extra_rates.keys() - units.keys(), dp.aiv_count))
+    rates = dict.fromkeys(units, 10**6) | extra_rates
+    return RecipeContext(p, {}, dict(zip(units, units)), rates, dp.aic_count, resource_units=units,
+                         compute_peaks={"bf16": 1000 * rates["cube"]},
+                         pool_names={pool: pool for pool, _ in dp.buffers})
+
+def run_template(dp, context, result, *, trace_limit=0):
+    resources = [Resource(role, context.rates[role], units=units)
+                 for role, units in context.resource_units.items() if role != "hbm"]
+    pools = dict(dp.buffers)
+    engine = Engine(resources, pools=pools, backend="python", trace_limit=trace_limit, pool_units={
+        pool: 1 if pool == "l2" else dp.aiv_count if pool == "ub" else dp.aic_count for pool in pools
+    })
+    done = result.program.start(engine, "matrix", engine.submit("ready", release=1))
+    engine.advance(until=(done,))
+    assert done.time > 1 and not engine.allocations
+    return engine
+
+def tile_edge(route="l0c->ub", axes=("aic", "aiv"), dst="take", view="tile"):
+    return EdgeRouteBinding("make", 0, view, dst, "tile_pipelined", route, *axes, "fp32", "RowMajor", 2)
+
+def compile_tile_region(dp, edge, **overrides):
+    return compile_fuse_region("fused", ("make", "take"), dp, **{
+        "dependencies": {"make": (), "take": ("make",)}, "edge_routes": (edge,), "edge_bytes": {edge.view_id: 64},
+        "op_stages": {name: Stage(name) for name in ("make", "take")}, **overrides,
+    })
+
+def load_template_provenance(monkeypatch):
+    spec = spec_from_file_location("template_provenance", REPO_ROOT / "scripts" / "check_template_provenance.py")
+    audit = module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, audit)
+    spec.loader.exec_module(audit)
+    return audit
+
+
+def provenance_git_fixture(root, relative_path, blob, symbol, line_range):
+    repo = root / "upstream"
+    path = repo / relative_path
+    path.parent.mkdir(parents=True)
+    path.write_bytes(blob)
+
+    def git(*args):
+        return subprocess.check_output(("git", "-C", str(repo), *args), text=True, timeout=5).strip()
+
+    git("init", "--quiet")
+    git("add", "--", relative_path)
+    git("-c", "user.name=Provenance Test", "-c", "user.email=fixture@example.test",
+        "commit", "--quiet", "--no-gpg-sign", "-m", "Source fixture")
+    ref = TemplateSourceRef("test/upstream", git("rev-parse", "HEAD"), relative_path,
+                            sha256(blob).hexdigest(), symbol, line_range)
+    return repo, ref, git("rev-parse", "HEAD^{tree}")
+
+
+def verify_template_declaration(audit, root, ref, repo=None):
+    path = root / "mindie_sim" / "templates" / "fixture.py"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"TemplateSourceRef{tuple(ref.values())!r}\n", encoding="utf-8")
+    repo_map = {ref["repository"]: repo} if repo is not None else {}
+    _, findings = audit.verify(root, runtime=False, repo_map=repo_map)
+    return [f.reason.split(":")[0] for f in findings]
+
+
+def enumerate_matrix(name, p, dp, *, tile=(32, 32, 32), **options):
+    return enumerate_catlass_specs(p, dp, template_ids=("catlass." + name,), l1_tiles=(tile,),
+                                   **{"aic_budget": 4, "aiv_budget": 8, **options})
+
+
+def with_mx_modes(direct):
+    arch = direct.compute_arch.declared
+    formats = (("mxfp8", 8), ("mxfp4", 4), ("a8w4_mx", 4))
+    arch = replace(arch, representations=(*arch.representations, *(RepresentationCapability(name, bits, ("operand",))
+                   for name, bits in formats)), native_modes=(*arch.native_modes, *(
+                       NativeComputeMode(name, "matrix", (name,), "cube", ("fp32",)) for name, _ in formats)))
+    return replace(direct, compute_arch=replace(direct.compute_arch, declared=arch))
+
+
+def visitor_graph():
+    roots = (EvgVisitorNode("acc", "acc_load", "fp32"), *(EvgVisitorNode(kind, kind, "bf16", aux_tensor_id=kind)
+              for kind in ("aux_load", "row_broadcast", "col_broadcast")))
+    unary = ("exp", "relu", "sqrt", "rsqrt_fast", "leaky_relu", "silu", "cast", "muls")
+    chain = tuple(EvgVisitorNode(kind, kind, "fp32", inputs=(parent,), scalar_param=0.25)
+                  for kind, parent in zip(unary, ("acc", *unary)))
+    tree = (*roots, *chain, EvgVisitorNode("mul", "mul", "fp32", inputs=("muls", "row_broadcast")),
+            EvgVisitorNode("add", "add", "fp32", inputs=("mul", "col_broadcast")),
+            EvgVisitorNode("store", "aux_store", "bf16", inputs=("add",), aux_tensor_id="aux_output"))
+    return tree, chain[0]
+
+
+def serpentine(major, minor):
+    bands = [range(start, min(start + 2, major)) for start in range(0, major, 2)]
+    return [(i, j) for band, strip in enumerate(bands)
+            for j in (range(minor) if band % 2 == 0 else reversed(range(minor))) for i in strip]
+
+
+def flash_kda_op(problem):
+    metadata = dict(lengths=problem.lengths, hv=problem.value_heads, hq=problem.query_heads,
+                    device_name=problem.device_name, has_initial_state=problem.has_initial_state,
+                    return_final_state=problem.return_final_state)
+    return OpSpec("kda", "kda_prefill", "prefill", 0, 0, (), (), (), (), (), dtype="bf16", layout="BNSD",
+                  recipe="kda_prefill", metadata=tuple(metadata.items()))
+
+
+def template_datapath(sku):
+    return datapath_for_die(machine(sku).dies[0])
+
+
+def template_live_bindings(dp, problem, **rates):
+    return dict(context=template_context(dp, problem, **rates),
+                memory_view=AdmissionMemoryView({0: dp.usable_bytes("l2")}), live_admission=True)
+
+
+def mounted_catalog_sources(root, refs):
+    repositories = {ref.repository.split("/")[-1] for ref in refs}
+    candidates = (parent / "refs" for parent in root.parents)
+    return next((path for path in candidates if all((path / repo).is_dir() for repo in repositories)), None)

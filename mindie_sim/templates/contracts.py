@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from fractions import Fraction
 from graphlib import CycleError, TopologicalSorter
 from math import isfinite
@@ -41,8 +41,110 @@ def _hex(value: str, length: int) -> bool:
     return isinstance(value, str) and len(value) == length and bool(re.fullmatch("[0-9a-fA-F]+", value))
 
 
+FP32_BYTES = 4
+BF16_BYTES = 2
+KDA_HEAD_DIM = 128
+KDA_STATE_HALF = KDA_HEAD_DIM // 2
+COMMIT_SMALL_HEADS = 16
+COMMIT_MEDIUM_HEADS = 32
+COMMIT_SMALL_ROWS = 32
+
+ATTN_RES_HIDDEN_SIZE = 7168
+ATTN_RES_UB_BYTES = 240 * 1024
+ATTN_RES_MAX_TILE_T = 4095
+ATTN_RES_FP32_ALIGN = 8
+ATTN_RES_BF16_ALIGN = 16
+ATTN_RES_TILE_FP32_ROWS = 2
+ATTN_RES_STAT_COUNT = 3
+
 def ceil_div(numerator: int, denominator: int) -> int:
     return (numerator + denominator - 1) // denominator
+
+
+def attn_res_ub_footprint(d, tile_t, depth):
+    if min(d, tile_t, depth) < 1:
+        raise ModelingError("attn_res_tile_invalid")
+    s32 = ceil_div(d, ATTN_RES_FP32_ALIGN) * ATTN_RES_FP32_ALIGN
+    s16 = ceil_div(d, ATTN_RES_BF16_ALIGN) * ATTN_RES_BF16_ALIGN
+    s_stat = ceil_div(tile_t, ATTN_RES_FP32_ALIGN) * ATTN_RES_FP32_ALIGN
+    return FP32_BYTES * s32 + BF16_BYTES * s16 + depth * (
+        tile_t * (ATTN_RES_TILE_FP32_ROWS * FP32_BYTES * s32 + BF16_BYTES * s16)
+        + ATTN_RES_STAT_COUNT * FP32_BYTES * s_stat
+    )
+
+
+def attn_res_tiling(tokens, aiv, ub_bytes=ATTN_RES_UB_BYTES):
+    if min(tokens, aiv) < 1:
+        raise ModelingError("attn_res_problem_invalid")
+    rows = ceil_div(tokens, aiv)
+    d = ATTN_RES_HIDDEN_SIZE
+    row_bytes = d * (ATTN_RES_TILE_FP32_ROWS * FP32_BYTES + BF16_BYTES) + ATTN_RES_STAT_COUNT * FP32_BYTES
+    tile = min(ceil_div(rows, 2), ATTN_RES_MAX_TILE_T, (ub_bytes - d * (FP32_BYTES + BF16_BYTES)) // (2 * row_bytes))
+    while tile > 0 and attn_res_ub_footprint(d, tile, 2) > ub_bytes:
+        tile -= 1
+    if tile < 1:
+        raise ModelingError("attn_res_double_buffered_row_does_not_fit")
+    count = ceil_div(rows, tile)
+    return ceil_div(tokens, rows), rows, ceil_div(rows, count), 1 if count == 1 else 2
+
+
+def flash_kda_rounds(chunks, heads, slots, max_group):
+    batches_per_set = slots // heads
+    if min(batches_per_set, max_group) < 1:
+        raise ModelingError("flash_kda_workspace_group_invalid")
+    for first in range(0, len(chunks), batches_per_set):
+        remaining = list(chunks[first:first + batches_per_set])
+        while max(remaining) > 0:
+            low, high = 1, min(max_group, max(remaining), batches_per_set)
+            while low < high:
+                mid = (low + high + 1) // 2
+                if sum(min(count, mid) for count in remaining) <= batches_per_set:
+                    low = mid
+                else:
+                    high = mid - 1
+            take = tuple(min(count, low) for count in remaining)
+            yield first, take
+            remaining = [left - used for left, used in zip(remaining, take)]
+
+
+def commit_replay_bytes(row_partitions, accepted=1, d=KDA_HEAD_DIM):
+    if not 1 <= row_partitions <= d or accepted < 0 or d != KDA_HEAD_DIM:
+        raise ModelingError("commit_kda_replay_geometry_invalid")
+    return accepted * d * (FP32_BYTES + (BF16_BYTES + FP32_BYTES) * row_partitions)
+
+
+def commit_rows(p, aiv_budget):
+    """Rows assigned to each AIV lane, including split halves in the large regime."""
+    heads = len(p.accepted) * p.heads
+    if not heads:
+        return ()
+    if p.row_partitions is not None or heads <= COMMIT_MEDIUM_HEADS:
+        partitions = p.row_partitions
+        if partitions is None:
+            partitions = KDA_HEAD_DIM // (COMMIT_SMALL_ROWS if heads <= COMMIT_SMALL_HEADS else KDA_STATE_HALF)
+        if partitions < 1 or KDA_HEAD_DIM % partitions:
+            raise ModelingError("commit_kda_row_partition_invalid")
+        rows = KDA_HEAD_DIM // partitions
+        lanes = min(heads * partitions, aiv_budget)
+        return tuple(tuple((item // partitions, item % partitions * rows, rows)
+                           for item in range(lane, heads * partitions, lanes))
+                     for lane in range(lanes))
+    lanes = min(heads, aiv_budget)
+    base, extra = divmod(2 * heads, lanes)
+    full_heads = lanes * (base // 2) + extra * (ceil_div(base, 2) - base // 2)
+    schedules = []
+    start = 0
+    for lane in range(lanes):
+        full = ceil_div(base, 2) if lane < extra else base // 2
+        items = [(head, 0, KDA_HEAD_DIM) for head in range(start, start + full)]
+        start += full
+        if base % 2 == 0 and lane < extra:
+            items.append((full_heads + lane // 2, lane % 2 * KDA_STATE_HALF, KDA_STATE_HALF))
+        if base % 2 and lane >= extra:
+            half = lane - extra
+            items.append((full_heads + half // 2, half % 2 * KDA_STATE_HALF, KDA_STATE_HALF))
+        schedules.append(tuple(items))
+    return tuple(schedules)
 
 
 @dataclass(frozen=True, slots=True)
@@ -252,6 +354,10 @@ class SemanticWorkItem:
     admitted_engines: tuple[Literal["cube", "aiv_simd", "aiv_simt"], ...]
     admissible_schedulers: tuple[str, ...]
 
+    @property
+    def eligible_engines(self) -> tuple[str, ...]:
+        return self.admitted_engines
+
     def __post_init__(self) -> None:
         if (
             not self.work_id or not self.dtype or type(self.logical_ops) is not int or self.logical_ops < 0
@@ -260,6 +366,17 @@ class SemanticWorkItem:
             or self.kind not in {"matrix_mac", "vector_alu", "vector_sfu", "vector_reduce", "sort_topk"}
         ):
             raise ModelingError(f"template_semantic_work_invalid:{self.work_id}")
+
+
+def eligible_matrix_engines(problem, datapath) -> tuple[str, ...]:
+    if problem.indices is not None or problem.physical_m is not None:
+        return ("aiv_simt",)
+    fp16 = {"fp16", "float16"}
+    if (datapath.arch_id in DIRECT_MATRIX_ARCH_IDS and datapath.simt_ub_carveout_bytes > 0
+            and not problem.has_bias and not problem.groups
+            and {problem.dtype_a.lower(), problem.dtype_b.lower()} <= fp16):
+        return ("cube", "aiv_simt")
+    return ("cube",)
 
 
 @dataclass(frozen=True, slots=True)
@@ -282,6 +399,8 @@ class FusedRegionSummary:
     aicpu_metadata_ms: Fraction
     sram_peaks_bytes: tuple[tuple[str, int], ...]
     spec: CatlassKernelSpec | DslKernelSpec | FuseRegionSpec | None
+    # A live program publishes the latest completed invocation's delivery.
+    realized_hbm_bytes: float | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -304,18 +423,31 @@ def _union_obligations(
     residency = ("hbm_cold", "l2_warm", "onchip_resident")
     result = []
     for key, entries in sorted(grouped.items()):
-        merged: list[tuple[int, int]] = []
-        for lo, hi in sorted(interval for entry in entries for interval in entry.ranges):
-            if merged and lo <= merged[-1][1]:
-                merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
-            else:
-                merged.append((lo, hi))
-        if merged:
-            result.append(TensorRangeObligation(
-                *key, tuple(merged),
-                min((entry.initial_residency for entry in entries), key=residency.index),
-                max((entry.required_final_visibility for entry in entries), key=visibility.index),
-            ))
+        events = {}
+        for entry in entries:
+            attributes = (residency.index(entry.initial_residency), visibility.index(entry.required_final_visibility))
+            for lo, hi in entry.ranges:
+                events.setdefault(lo, []).append((attributes, 1))
+                events.setdefault(hi, []).append((attributes, -1))
+        active, merged = {}, {}
+        previous = 0
+        for offset, changes in sorted(events.items()):
+            if active:
+                state = min(r for r, _ in active), max(v for _, v in active)
+                ranges = merged.setdefault(state, [])
+                if ranges and ranges[-1][1] == previous:
+                    ranges[-1] = (ranges[-1][0], offset)
+                else:
+                    ranges.append((previous, offset))
+            for attributes, delta in changes:
+                count = active.get(attributes, 0) + delta
+                if count:
+                    active[attributes] = count
+                else:
+                    active.pop(attributes, None)
+            previous = offset
+        result.extend(TensorRangeObligation(*key, tuple(ranges), residency[r], visibility[v])
+                      for (r, v), ranges in merged.items())
     return tuple(result)
 
 
@@ -334,3 +466,80 @@ def compose_step_obligations(
             if entry.required_final_visibility in {"device", "host"}
         ),
     )
+
+
+def _topological(parents, message):
+    try:
+        return tuple(TopologicalSorter(parents).static_order())
+    except CycleError as exc:
+        raise ModelingError(message) from exc
+
+
+def _region_order(op_ids, dependencies, barriers, edge_routes, waits, numerics, views):
+    selected = set(op_ids)
+    if not selected or len(selected) != len(op_ids) or not selected <= dependencies.keys():
+        raise ModelingError("fuse_region_op_ids_invalid")
+    if selected.intersection(barriers):
+        raise ModelingError("fuse_region_collective_barrier")
+    if any(parent not in dependencies for parents in dependencies.values() for parent in parents):
+        raise ModelingError("fuse_region_graph_parent_unknown")
+    order = _topological(dependencies, "fuse_region_graph_cycle")
+    escaped = set()
+    for name in order:
+        if name in selected:
+            if escaped.intersection(dependencies[name]):
+                raise ModelingError(f"fuse_region_not_convex:{name}")
+        elif (selected | escaped).intersection(dependencies[name]):
+            escaped.add(name)
+    internal = {name: set(dependencies[name]) & selected for name in selected}
+    edge_keys = set()
+    for edge in edge_routes:
+        if edge.dst_op not in selected or edge.src_op not in internal[edge.dst_op]:
+            raise ModelingError(f"fuse_region_edge_not_internal:{edge.view_id}")
+        key = (edge.src_op, edge.producer_version, edge.view_id, edge.dst_op, edge.iter_kind)
+        if key in edge_keys:
+            raise ModelingError(f"fuse_region_duplicate_edge:{edge.view_id}")
+        edge_keys.add(key)
+    if {(edge.src_op, edge.dst_op) for edge in edge_routes} != {
+        (producer, consumer) for consumer, producers in internal.items() for producer in producers
+    }:
+        raise ModelingError("fuse_region_internal_route_missing")
+    for publisher, consumer in waits:
+        if publisher not in selected or consumer not in selected:
+            raise ModelingError("fuse_region_wait_endpoint_outside")
+        internal[consumer].add(publisher)
+    _topological(internal, "fuse_region_credit_publish_deadlock")
+    if not numerics.keys() <= selected or any(before != after for before, after in numerics.values()):
+        raise ModelingError("fuse_region_numerical_equivalence_failed")
+
+    def precedes(earlier, later):
+        pending = list(internal[later])
+        visited = set()
+        while pending:
+            predecessor = pending.pop()
+            if predecessor == earlier:
+                return True
+            if predecessor not in visited:
+                visited.add(predecessor)
+                pending.extend(internal[predecessor])
+        return False
+
+    for mutation in (edge for edge in edge_routes if edge.in_place_mutates):
+        for reader in edge_routes:
+            if reader is mutation:
+                continue
+            mut_view, read_view = views.get(mutation.view_id), views.get(reader.view_id)
+            if mut_view is not None and read_view is not None:
+                m_allocation, m_lo, m_hi = mut_view
+                r_allocation, r_lo, r_hi = read_view
+                aliases = m_allocation == r_allocation and max(m_lo, r_lo) < min(m_hi, r_hi)
+            else:
+                aliases = mutation.view_id == reader.view_id or mutation.src_op == reader.src_op
+            if (aliases and reader.producer_version <= mutation.producer_version
+                    and not precedes(reader.dst_op, mutation.dst_op)):
+                raise ModelingError(f"fuse_region_in_place_unread_alias:{mutation.view_id}:{reader.dst_op}")
+    carried = {(edge.src_op, edge.dst_op) for edge in edge_routes if edge.iter_kind == "chunk_carried"}
+    same_tile = {(edge.src_op, edge.dst_op) for edge in edge_routes if edge.iter_kind != "chunk_carried"} | set(waits)
+    for src, dst in carried - same_tile:
+        internal[dst].discard(src)
+    return tuple(name for name in order if name in selected), internal

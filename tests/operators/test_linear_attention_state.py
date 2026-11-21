@@ -11,8 +11,9 @@ from itertools import accumulate, groupby
 import pytest
 
 from _support.axes import REPRESENTATIVE_SKUS
-from _support.hardware import machine
-from _support.linear_cases import execute_one, gdn_decode_source_case as source_case, kda_hardware_case
+from _support.linear_cases import (
+    execute_one, gdn_decode_source_case as source_case, kda_hardware_case, recipe_context, sku_planning_context,
+)
 from mindie_sim.model_catalog import load_model
 from mindie_sim.prediction.attention import AttentionPolicy
 from mindie_sim.prediction.cost import CostModel
@@ -24,14 +25,12 @@ from mindie_sim.prediction.frontend import Frontend
 from mindie_sim.prediction.gdn_decode_programs import CONV, conv_plan
 from mindie_sim.prediction.mechanism import Geometry, PlannedRecipe
 from mindie_sim.prediction.operators import gdn_state, kda_recurrent, kda_recurrent_arch22, kda_state
-from mindie_sim.prediction.operators.contracts import OperatorPlanningContext
 from mindie_sim.prediction.operators.kda_state_selection import resolve
 from mindie_sim.prediction.operators.linear_attention import (
     LinearAttentionContract, analyze_state_residency, resolve_operator_plan, select_flash_kda_template,
 )
 from mindie_sim.prediction.program import RecipeBook
 from mindie_sim.prediction.recurrent import linear
-from mindie_sim.prediction.results import OpOccurrence
 from mindie_sim.prediction.scheduling import FragmentConductor
 from mindie_sim.prediction.runtime.tile_solver import TileInfeasibleError
 from mindie_sim.prediction.structure import parse_case
@@ -522,8 +521,7 @@ def test_kda_state_stride_ragged_work_and_stream_initialization(lengths, heads, 
 
 @pytest.fixture
 def planning_context():
-    geom = Geometry.from_devices(machine(REPRESENTATIVE_SKUS["a5"]).dies)
-    return OperatorPlanningContext(OpOccurrence(0, 0, 0, "state"), geom, geom.datapath)
+    return sku_planning_context(REPRESENTATIVE_SKUS["a5"], "state")[1]
 
 
 @pytest.mark.parametrize("bt,counts,stored", ((64, (8, 64, 512), "bf16"), (32, (16, 128, 1024), "fp32")))
@@ -577,3 +575,25 @@ def test_flash_kda_metadata_controls_route_and_saved_output_cache(planning_conte
     assert plan.metadata["persistent_ub_resident"] is (selected == "persistent")
     assert plan.metadata["saved_entry_state_bytes"] == sum((n + 63)//64 for n in lengths) * 2*64*128*2
     assert plan.metadata.get("saved_outputs_l2_cache_disabled", False) is (selected == "staged")
+    phases = {p.phase_id: p.after for p in plan.pipeline_spec.phases}
+    update, save = ("state_and_output_group", "save_entry_state_uncached") if selected == "staged" else ("R_O_inter", "save_entry_state")
+    assert save in phases[update]
+
+
+@pytest.mark.parametrize("length", (512, 4096, 32768))
+def test_cann_gdn_reuses_final_state_slot_while_fla_stores_each_chunk(length):
+    geometry, ctx = sku_planning_context(REPRESENTATIVE_SKUS["a2"], "state")
+    op = OpSpec("state", "gdn_prefill", "prefill", 0, 0, (), (), (), (), (), recipe="gdn_prefill",
+                dtype="bf16", metadata=(("lengths", (length,)), ("dk", 128), ("dv", 128)))
+    rolling = resolve_operator_plan(op, ctx).recipe
+    fla = resolve_operator_plan(replace(op, recipe="fla_chunk_gdn"), ctx).recipe
+    assert rolling.metadata["rolling_state_slot_bytes"] == rolling.metadata["rolling_state_gm_bytes"] == 32 * 1024
+    assert rolling.metadata["chunk_state_bank"] == 0
+    assert fla.metadata["rolling_state_gm_bytes"] == 0
+    assert fla.metadata["chunk_state_bank"] == (length // 64) * 32 * 1024
+    groups = next(stage.program for stage in rolling.program(recipe_context(geometry, op)).stages if stage.name == "chunk_groups")
+    for group in {0, groups.count - 1}:
+        chunks = next(stage.program for stage in groups.tile(group) if stage.name == "RunStage2")
+        for chunk in {0, chunks.count - 1}:
+            store = next(stage for stage in chunks.tile(chunk) if stage.name == "write_rolling_state")
+            assert store.metadata["base_byte"] == 0 and store.metadata["head_stride_bytes"] == store.work["fixpipe"] == 32 * 1024

@@ -19,18 +19,20 @@ from itertools import chain
 from mindie_sim.schema.common import ModelingError, align_up
 from mindie_sim.schema.datapath import ArchId, SourceRef
 from mindie_sim.schema.operators import OpSpec
+from ...gdn_chunk32 import PR22147_SOURCE
 from ...mechanism import OperatorPlan, Work
 from ...ownership import unit_group
 from ...program import KernelProgram, ParallelProgram, PipelineProgram, RecipeContext, Stage
 from ...runtime.ring_buffer import RingBuffer, lower_generation
 from ..contracts import ArchStrategy, OperatorPlanningContext
 from .common import (
-    DIAG_BLOCK_WIDTH, FP32_BYTES, KDA_MAX_AIC_CORES, KDA_ROUTE_PARAMETERS, KDA_WORKSPACE_SLOTS,
+    CHUNK32_KERNELS, CHUNK32_LEAVES, DIAG_BLOCK_WIDTH, FLASH_KDA_TEMPLATE_BY_ABI, FLA_GDN_ABIS,
+    FP32_BYTES, GDN_CHUNK64_TOKENS, KDA_MAX_AIC_CORES, KDA_WORKSPACE_SLOTS,
     CausalConvContract, LinearAttentionContract, Phase, RecoverSsmCommitPlan,
     analyze_state_residency, bind_phase, build_causal_conv1d_plan, build_recover_ssm_plan,
-    ceil_div, compute_wy_chunk_work, element_bytes, flash_kda_group_limit,
+    ceil_div, compute_wy_chunk_work, element_bytes,
     flash_kda_workspace_groups, make_plan, missing, owner_units,
-    select_flash_kda_template, transfer, validate_contract,
+    transfer, validate_contract,
 )
 
 OPS_REVISION = "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946"
@@ -67,6 +69,16 @@ SOURCES: tuple[SourceRef, ...] = (
         source_sha256="41957c35307c32dc5326278a01e176325f264bd63d414c059166f12bfd47ac17",
     ),
     SourceRef(
+        repository="cann/ops-transformer", revision=OPS_REVISION,
+        relative_path="attention/chunk_gated_delta_rule/op_kernel/arch35/chunk_gated_delta_rule_basic_block.h",
+        source_sha256="b8c938e623b4207c5f95b39fd4b8c8422b201b32c2b473918c42a11069c5f582",
+    ),
+    SourceRef(
+        repository="cann/cannbot-dsl", revision=DSL_REVISION,
+        relative_path="samples/attention/fused_recurrent_kda_snapshot/fused_recurrent_kda_snapshot.py",
+        source_sha256="e0e78d2a77126389605ea73972eb8c4da5a3727b877c95cbf019ea644a528352",
+    ),
+    SourceRef(
         repository="cann/cannbot-dsl", revision=DSL_REVISION,
         relative_path="samples/attention/commit_recurrent_kda/commit_recurrent_kda.py",
         source_sha256="81e2ff105aba687f5fb6fc8eadae0149365bb85cf8c01e2889c66a6a906973c4",
@@ -80,15 +92,22 @@ TRIANGULAR_FMA_DIVISOR = 3
 GDN_INVERSE_OPERAND_PANELS = 4
 WY_PREPROCESSED_KEY_PANELS = 5
 STAGED_KEY_WORKSPACES = 3
-STATE_UPDATE_OPS_PER_ELEMENT = 3
 LOW_PRECISION_BYTES = 2
 COMMIT_VALUE_TILE = 128
-SHORT_TRAIN_MIN_LENGTH = 8192
-SHORT_TRAIN_CHUNK_GROUP = 13
+STAGED_STATE_WAVE_START = 3
 KDA_PACKED_INVERSE_PRODUCTS = 5
-CHUNK32_KERNELS = (
-    "gdn_prepare_arch35_chunk32", "gdn_state_arch35_chunk32", "gdn_output_arch35_chunk32",
+GDN_CUBE_DIM = 128
+GDN_STREAM_VECTOR_COST = 256
+GDN_STREAM_STATE_OPS_PER_ELEMENT = 7
+GDN_SCORE_PRODUCTS = 5
+GDN_STATE_PRODUCTS = 3
+GDN_CUBE_FLOPS_PER_CHUNK = 2 * (
+    GDN_SCORE_PRODUCTS * GDN_CHUNK64_TOKENS**2 * GDN_CUBE_DIM
+    + GDN_STATE_PRODUCTS * GDN_CHUNK64_TOKENS * GDN_CUBE_DIM**2
+    + 2 * DIAG_BLOCK_WIDTH**3
 )
+GDN_SOURCES = (SOURCES[0], SOURCES[-3])
+CHUNK32_SOURCES = (SourceRef(**PR22147_SOURCE),)
 
 
 def _pairs(ctx: OperatorPlanningContext, c: LinearAttentionContract) -> tuple[tuple[int, tuple[int, ...]], ...]:
@@ -127,7 +146,15 @@ def _chunk_phases(c: LinearAttentionContract, ctx: OperatorPlanningContext, rows
     gate = rows * gate_width
     state_elem = element_bytes(c.state_dtype)
     inputs = (2 * key + value) * elem + gate * element_bytes(c.gate_dtype) + rows * element_bytes(c.beta_dtype)
-    inverse = w.offdiag_inv_flops
+    # The CANN WY kernel zero-pads Q/K/V to its fixed 64x128 operands.
+    gdn_wy = not kda and c.bt == GDN_CHUNK64_TOKENS
+    issued = compute_wy_chunk_work(c.bt, GDN_CUBE_DIM, GDN_CUBE_DIM, c.bt) if gdn_wy else w
+    cube_dtype = "bf16" if gdn_wy else c.dtype
+    cube_key = c.bt * GDN_CUBE_DIM if gdn_wy else key
+    cube_value = c.bt * GDN_CUBE_DIM if gdn_wy else value
+    cube_score = c.bt**2 if gdn_wy else score
+    cube_state = GDN_CUBE_DIM**2 if gdn_wy else state
+    inverse = issued.offdiag_inv_flops
     inverse_operand_bytes = GDN_INVERSE_OPERAND_PANELS * DIAG_BLOCK_WIDTH**2 * LOW_PRECISION_BYTES if inverse else 0
     diagonal = w.diag_inv_ops
     if kda:
@@ -138,14 +165,15 @@ def _chunk_phases(c: LinearAttentionContract, ctx: OperatorPlanningContext, rows
     matrix_saves = 2 * rows * c.bt * elem if c.save_matrices else 0
     state_save = state * element_bytes(c.stored_chunk_state_dtype) if c.save_intermediate_state else 0
 
+    inverse_dtype = "fp16" if kda else cube_dtype
     initialize = transfer(ctx, read=state * state_elem * c.use_initial_state) + Work(resources={
         "vector": state if c.use_initial_state else 2 * state, "mte3": state * elem,
     })
     return (
         Phase("state_begin", initialize),
         Phase("load_tokens", transfer(ctx, read=inputs)),
-        Phase("KKT_QKT", Work({c.dtype: w.kkt_flops + w.qkt_flops},
-                              {"mte1": 2 * key * elem, "fixpipe": 2 * score * FP32_BYTES}), ("load_tokens",)),
+        Phase("KKT_QKT", Work({cube_dtype: issued.kkt_flops + issued.qkt_flops},
+                              {"mte1": 2 * cube_key * elem, "fixpipe": 2 * cube_score * FP32_BYTES}), ("load_tokens",)),
         Phase("gate_operands", Work(resources={
             "vector": w.gate_ops + (2 * rows * (gate_width - 1) if kda else 0),
             "mte3": (WY_PREPROCESSED_KEY_PANELS * key + value) * elem,
@@ -153,25 +181,25 @@ def _chunk_phases(c: LinearAttentionContract, ctx: OperatorPlanningContext, rows
         Phase("mask_and_diagonal_inverse", Work(resources={
             "vector": w.mask_ops + diagonal, "mte3": 2 * score * elem,
         }), ("KKT_QKT", "gate_operands")),
-        Phase("offdiagonal_inverse", Work({"fp16": inverse}, {
+        Phase("offdiagonal_inverse", Work({inverse_dtype: inverse}, {
             "mte1": inverse_operand_bytes, "fixpipe": inverse_operand_bytes // 2,
         }), ("mask_and_diagonal_inverse",)),
-        Phase("Kcd_U", Work({c.dtype: w.kcd_flops + w.u_flops}, {
-            "mte1": (score + key + value) * elem, "fixpipe": (key + value) * elem,
+        Phase("Kcd_U", Work({cube_dtype: issued.kcd_flops + issued.u_flops}, {
+            "mte1": (cube_score + cube_key + cube_value) * elem, "fixpipe": (cube_key + cube_value) * elem,
         }), ("offdiagonal_inverse",)),
         Phase("save_matrices", Work(resources={"hbm": matrix_saves, "fixpipe": matrix_saves}),
               ("offdiagonal_inverse",)),
         Phase("save_entry_state", transfer(ctx, write=state_save), ("state_begin",)),
-        Phase("R_O_inter", Work({c.dtype: w.r_flops + w.o_inter_flops}, {
-            "mte1": (2 * key + state) * elem, "fixpipe": value * FP32_BYTES,
+        Phase("R_O_inter", Work({cube_dtype: issued.r_flops + issued.o_inter_flops}, {
+            "mte1": (2 * cube_key + cube_state) * elem, "fixpipe": cube_value * FP32_BYTES,
         }), ("Kcd_U", "save_entry_state")),
         Phase("R32_to_R16_UB_to_L1", Work(resources={"vector": w.cast_ops, "mte3": value * elem}),
               ("R_O_inter",)),
-        Phase("delta_L0C_to_UB", Work({c.dtype: w.delta_flops}, {
-            "mte1": (value + key) * elem, "fixpipe": state * FP32_BYTES,
+        Phase("delta_L0C_to_UB", Work({cube_dtype: issued.delta_flops}, {
+            "mte1": (cube_value + cube_key) * elem, "fixpipe": cube_state * FP32_BYTES,
         }), ("R32_to_R16_UB_to_L1",)),
-        Phase("O_L0C_to_GM", Work({c.dtype: w.o_intra_flops}, {
-            "mte1": (score + value) * elem, "fixpipe": value * elem, "hbm": value * elem,
+        Phase("O_L0C_to_GM", Work({cube_dtype: issued.o_intra_flops}, {
+            "mte1": (cube_score + cube_value) * elem, "fixpipe": value * elem, "hbm": value * elem,
         }), ("delta_L0C_to_UB",)),
         Phase("S_next", Work(resources={
             "vector": w.state_update_ops + state * (snapshot or kda), "mte3": state * elem * snapshot,
@@ -291,10 +319,9 @@ def _build_persistent(c: LinearAttentionContract, ctx: OperatorPlanningContext,
         return ParallelProgram(tuple(lane_program(aic, aivs, spans)
                                      for (aic, aivs), spans in zip(pairs, lanes, strict=False)))
 
-    sources = (SOURCES[1], SOURCES[3], SOURCES[4]) if kda else SOURCES[:1]
+    sources = (SOURCES[1], SOURCES[3], SOURCES[4]) if kda else GDN_SOURCES
     implementation = "flash_kda_persistent" if kda else ABI
-    offdiag = sum(compute_wy_chunk_work(rows, c.dk, c.dv, c.bt).offdiag_inv_flops * count
-                  for (rows, _), count in counts.items())
+    offdiag = sum(sum(p.work.matrix.values()) for p in totals if p.name == "offdiagonal_inverse")
     return make_plan(ctx, implementation, totals, sources=sources, program=lower, metadata={
         "template": "persistent", "persistent_ub_resident": report.persistent_ub_resident,
         "total_chunks": report.total_chunks, "chunk_tokens": c.bt, "chunk_state_bank": 0,
@@ -302,15 +329,13 @@ def _build_persistent(c: LinearAttentionContract, ctx: OperatorPlanningContext,
         "saved_entry_state_bytes": report.total_chunks * c.hv * c.dk * c.dv
         * element_bytes(c.stored_chunk_state_dtype) * c.save_intermediate_state,
         "l1_state_ring_bytes": report.l1_state_ring_bytes, "aic_per_head": 1, "aiv_per_head": 2,
-        "offdiag_inv_flops": offdiag if not kda else sum(
-            p.work.matrix.get("fp16", 0) for p in totals if p.name == "offdiagonal_inverse"
-        ),
+        "offdiag_inv_flops": offdiag,
     })
 
 
 def _staged_work(c: LinearAttentionContract, ctx: OperatorPlanningContext, *, kda: bool,
                  loads: int, stores: int) -> tuple[tuple[Phase, ...], dict[str, int]]:
-    report = analyze_state_residency(c, ctx)
+    report = analyze_state_residency(c, ctx, persistent=kda)
     size = element_bytes(c.dtype)
     state = element_bytes(c.state_dtype) * c.hv * c.dk * c.dv
     tokens = sum(c.lengths) * c.hv
@@ -324,10 +349,11 @@ def _staged_work(c: LinearAttentionContract, ctx: OperatorPlanningContext, *, kd
         for name in ("load_tokens", "KKT_QKT", "gate_operands", "mask_and_diagonal_inverse",
                      "offdiagonal_inverse", "Kcd_U"):
             prepare += by_name[name]
-        for name in ("R_O_inter", "R32_to_R16_UB_to_L1", "delta_L0C_to_UB", "S_next"):
-            recurrence += by_name[name]
-        output += by_name["O_L0C_to_GM"]
-        offdiag += by_name["offdiagonal_inverse"].matrix.get("fp16", 0)
+        if not kda:
+            for name in ("R_O_inter", "R32_to_R16_UB_to_L1", "delta_L0C_to_UB", "S_next"):
+                recurrence += by_name[name]
+            output += by_name["O_L0C_to_GM"]
+        offdiag += sum(by_name["offdiagonal_inverse"].matrix.values())
         score_bytes += rows * c.bt * size * count
 
     # Stage 1 publishes decayed K/Q, U, Kg, decay/gamma and the score workspace.
@@ -340,30 +366,29 @@ def _staged_work(c: LinearAttentionContract, ctx: OperatorPlanningContext, *, kd
     prepare += transfer(ctx, write=operands + gamma) + Work(
         resources={"hbm": score_bytes + saved, "fixpipe": score_bytes + saved},
     )
-    recurrence += (
-        transfer(ctx, read=operands, aiv=False)
-        + transfer(ctx, read=gamma + state * loads, write=report.compulsory_store_bytes + state * stores)
-        + Work(resources={"vector": (2 * len(c.lengths) - loads) * c.hv * c.dk * c.dv,
-                          "mte3": len(c.lengths) * c.hv * c.dk * c.dv * size})
-    )
-    output += transfer(ctx, read=score_bytes, aiv=False)
-    bank_read = transfer(ctx, read=bank, aiv=False, hits=report.l2_hit_bytes)
     if kda:
         phases = (
             Phase("prepare_workspace_group", prepare),
             Phase("SyncAll.workspace", Work(), ("prepare_workspace_group",)),
-            Phase("state_and_output_group", recurrence + bank_read + output, ("SyncAll.workspace",)),
-            Phase("save_entry_state_uncached", transfer(ctx, write=report.chunk_bank_bytes * c.save_intermediate_state),
-                  ("state_and_output_group",)),
         )
-    else:
-        recurrence += transfer(ctx, write=residual)
-        output += bank_read + transfer(ctx, read=residual, aiv=False)
-        phases = (
-            Phase(CHUNK32_KERNELS[0], prepare),
-            Phase(CHUNK32_KERNELS[1], recurrence, (CHUNK32_KERNELS[0],)),
-            Phase(CHUNK32_KERNELS[2], output, (CHUNK32_KERNELS[1],)),
-        )
+        # Stage 2 writes H_c before mutating its UB state, including staging at group boundaries.
+        bank_bytes = report.total_chunks * c.hv * c.dk * c.dv * element_bytes(c.stored_chunk_state_dtype)
+        return phases, {"offdiag_inv_flops": offdiag, "total_chunks": report.total_chunks,
+                        "chunk_state_bank": bank_bytes,
+                        "saved_entry_state_bytes": bank_bytes * c.save_intermediate_state}
+    recurrence += (
+        transfer(ctx, read=operands, aiv=False)
+        + transfer(ctx, read=gamma + state * loads,
+                   write=report.compulsory_store_bytes + state * stores + residual)
+        + Work(resources={"vector": (2 * len(c.lengths) - loads) * c.hv * c.dk * c.dv,
+                          "mte3": len(c.lengths) * c.hv * c.dk * c.dv * size})
+    )
+    output += transfer(ctx, read=score_bytes + residual + bank, aiv=False, hits=report.l2_hit_bytes)
+    phases = (
+        Phase(CHUNK32_KERNELS[0], prepare),
+        Phase(CHUNK32_KERNELS[1], recurrence, (CHUNK32_KERNELS[0],)),
+        Phase(CHUNK32_KERNELS[2], output, (CHUNK32_KERNELS[1],)),
+    )
     return phases, {
         "offdiag_inv_flops": offdiag, "total_chunks": report.total_chunks,
         "chunk_state_bank": report.chunk_bank_bytes, "l2_hit_bytes": report.l2_hit_bytes,
@@ -373,27 +398,90 @@ def _staged_work(c: LinearAttentionContract, ctx: OperatorPlanningContext, *, kd
     }
 
 
+def _flash_kda_state_wave(c: LinearAttentionContract, ctx: OperatorPlanningContext,
+                          sizes: Counter[int], save_entry: bool) -> tuple[Phase, ...]:
+    size = element_bytes(c.dtype)
+    head_chunks = sum(sizes.values()) * c.hv
+    state_bytes = c.dk * c.dv * element_bytes(c.stored_chunk_state_dtype)
+    work = Work()
+    for rows, count in sizes.items():
+        selected = {"R_O_inter", "R32_to_R16_UB_to_L1", "delta_L0C_to_UB", "S_next", "O_L0C_to_GM"}
+        for phase in _chunk_phases(c, ctx, rows, kda=True, snapshot=False):
+            if phase.name in selected:
+                work += phase.work.scaled(count * c.hv)
+        operands = rows * ((STAGED_KEY_WORKSPACES * c.dk + c.dv) + c.bt) * size
+        work += transfer(ctx, read=operands * count * c.hv, aiv=False)
+    work += transfer(ctx, read=head_chunks * c.dk * FP32_BYTES)
+    return (
+        Phase("save_entry_state_uncached", transfer(ctx, write=head_chunks * state_bytes * save_entry)),
+        Phase("state_and_output_group", work, ("save_entry_state_uncached",)),
+    )
+
+
+def _flash_kda_state_group(c: LinearAttentionContract, ctx: OperatorPlanningContext,
+                           loads: int, finals: int, continued: bool, carry: int):
+    elements = c.hv * c.dk * c.dv
+    entry = elements * element_bytes(c.stored_chunk_state_dtype)
+    state = elements * element_bytes(c.state_dtype)
+    load = Phase("load_state_group", transfer(ctx, read=loads * (entry if continued else state))
+                 + Work(resources={"vector": (2 * len(c.lengths) - loads) * elements,
+                                   "mte3": elements * len(c.lengths) * element_bytes(c.dtype)}),
+                 ("SyncAll.workspace",))
+    store = Phase("store_state_group", transfer(ctx, write=finals * state + carry * entry),
+                  ("state_and_output_group",))
+    wave_count = ceil_div(max(c.lengths), c.bt)
+
+    def wave(index: int):
+        offset = index * c.bt
+        sizes = Counter(min(c.bt, length - offset) for length in c.lengths if length > offset)
+        return _flash_kda_state_wave(c, ctx, sizes, save_entry=not continued or index > 0)
+
+    sizes = Counter()
+    for length in c.lengths:
+        full, tail = divmod(length, c.bt)
+        if full:
+            sizes[c.bt] += full
+        if tail:
+            sizes[tail] += 1
+    save, recur = _flash_kda_state_wave(c, ctx, sizes, save_entry=True)
+    if continued:
+        save = replace(save, work=transfer(ctx, write=entry * (sum(sizes.values()) - len(c.lengths))))
+    return (load, replace(save, after=(load.name,)), recur, store), wave_count, wave
+
+
 def _staged_shapes(c: LinearAttentionContract, kda: bool, slots: int, group_limit: int):
     if not kda:
-        yield c.lengths, len(c.lengths) * c.use_initial_state, len(c.lengths) * c.output_final_state
+        yield c.lengths, len(c.lengths) * c.use_initial_state, len(c.lengths) * c.output_final_state, False, 0
         return
     chunk_counts = tuple(ceil_div(n, c.bt) for n in c.lengths)
     for start, consumed, counts in flash_kda_workspace_groups(chunk_counts, slots // c.hv, group_limit):
         rows = tuple(min(n * c.bt, c.lengths[start + i] - consumed * c.bt)
                      for i, n in enumerate(counts) if n)
         loads = len(rows) * (c.use_initial_state or consumed > 0)
-        stores = sum(bool(n) and (c.output_final_state or consumed + n < chunk_counts[start + i])
-                     for i, n in enumerate(counts))
-        yield rows, loads, stores
+        carry = sum(bool(n) and consumed + n < chunk_counts[start + i] for i, n in enumerate(counts))
+        finals = (len(rows) - carry) * c.output_final_state
+        yield rows, loads, finals, consumed > 0, carry
 
 
 def _build_staged(c: LinearAttentionContract, ctx: OperatorPlanningContext, *,
                   kda: bool, pairs: tuple[tuple[int, tuple[int, ...]], ...],
                   slots: int = KDA_WORKSPACE_SLOTS, group_limit: int = 1) -> OperatorPlan:
+    leaf = None if kda else CHUNK32_LEAVES.get(c.abi, c.abi)
+    if leaf not in CHUNK32_KERNELS:
+        leaf = None
+
     @lru_cache(maxsize=CHUNK_WORK_CACHE_SIZE)
     def group(key):
-        rows, loads, stores = key
-        return _staged_work(replace(c, lengths=rows), ctx, kda=kda, loads=loads, stores=stores)
+        rows, loads, finals, continued, carry = key
+        group_contract = replace(c, lengths=rows)
+        phases, details = _staged_work(group_contract, ctx, kda=kda, loads=loads, stores=finals)
+        waves, wave = 0, None
+        if kda:
+            state_phases, waves, wave = _flash_kda_state_group(group_contract, ctx, loads, finals, continued, carry)
+            phases += state_phases
+        elif leaf:
+            phases = tuple(replace(p, after=()) for p in phases if p.name == leaf)
+        return phases, details, waves, wave
 
     counts = Counter()
     spans = []
@@ -408,7 +496,7 @@ def _build_staged(c: LinearAttentionContract, ctx: OperatorPlanningContext, *,
     workspace = Counter()
     phase_work = {}
     for key, count in counts.items():
-        phases, payload = group(key)
+        phases, payload, _, _ = group(key)
         workspace.update({name: value * count for name, value in payload.items()})
         for phase in phases:
             phase_work[phase.name] = phase_work.get(phase.name, Work()) + phase.work.scaled(count)
@@ -417,19 +505,29 @@ def _build_staged(c: LinearAttentionContract, ctx: OperatorPlanningContext, *,
 
     def lower(rc: RecipeContext) -> KernelProgram:
         def tile(index: int) -> tuple[Stage, ...]:
-            phases, details = group(spans[bisect_right(ends, index)][1])
+            phases, details, waves, wave = group(spans[bisect_right(ends, index)][1])
             used = pairs[:min(len(pairs), details["total_chunks"] * c.hv)]
             aics = tuple(aic for aic, _ in used)
             aivs = tuple(chain.from_iterable(pair for _, pair in used))
-            return tuple(bind_phase(phase, rc, ctx, aics, aivs) for phase in phases)
+            if wave is None:
+                return tuple(bind_phase(p, rc, ctx, aics, aivs) for p in phases)
+
+            def state_tile(chunk: int) -> tuple[Stage, ...]:
+                return tuple(bind_phase(p, rc, ctx, aics, aivs) for p in wave(chunk))
+
+            before = tuple(bind_phase(p, rc, ctx, aics, aivs) for p in phases[:STAGED_STATE_WAVE_START])
+            store = replace(bind_phase(phases[-1], rc, ctx, aics, aivs), after=("state_chunks",))
+            return (*before, Stage("state_chunks", after=(before[-1].name,),
+                                   program=PipelineProgram(waves, 1, state_tile)), store)
 
         if not kda:
             return KernelProgram(tile(0))
         return KernelProgram((Stage("workspace_groups", program=PipelineProgram(ends[-1], 1, tile)),))
 
-    sources = (SOURCES[1], SOURCES[3], SOURCES[5]) if kda else SOURCES[:1]
-    boundaries = ("flash_kda_staged",) if kda else CHUNK32_KERNELS
-    return make_plan(ctx, "flash_kda_staged" if kda else "gdn_chunk32", totals, sources=sources,
+    sources = (SOURCES[1], SOURCES[3], SOURCES[5]) if kda else CHUNK32_SOURCES
+    boundaries = ("flash_kda_staged",) if kda else (leaf,) if leaf else CHUNK32_KERNELS
+    implementation = "flash_kda_staged" if kda else c.abi if leaf else "gdn_chunk32"
+    return make_plan(ctx, implementation, totals, sources=sources,
                      launch_count=len(boundaries), program=lower, metadata={
                          "template": "staged", "launch_boundaries": boundaries, "workspace_groups": ends[-1],
                          "persistent_ub_resident": False, "chunk_tokens": c.bt,
@@ -437,29 +535,103 @@ def _build_staged(c: LinearAttentionContract, ctx: OperatorPlanningContext, *,
                      })
 
 
-def _build_recurrent(c: LinearAttentionContract, ctx: OperatorPlanningContext) -> OperatorPlan:
-    kda = c.operation == "kda_recurrent"
-    ctx.datapath.route("gm", "ub", c.dtype)
-    ctx.datapath.route("ub", "gm", c.state_dtype)
-    record = analyze_state_residency(c, ctx, persistent=True)
-    tokens = sum(c.lengths) * c.hv
+def _recurrent_work(c: LinearAttentionContract, ctx: OperatorPlanningContext, tokens: int,
+                    *, kda: bool, save_tokens: bool) -> tuple[Phase, ...]:
     elem = element_bytes(c.dtype)
-    state = len(c.lengths) * c.hv * c.dk * c.dv * element_bytes(c.state_dtype)
     width = c.dk if kda else 1
+    state = tokens * c.dk * c.dv
     inputs = tokens * ((2 * c.dk + c.dv) * elem + width * element_bytes(c.gate_dtype) + element_bytes(c.beta_dtype))
-    contraction = 2 * tokens * c.dk * c.dv
-    state_ops = STATE_UPDATE_OPS_PER_ELEMENT * tokens * c.dk * c.dv + tokens * (width + 2 * c.dv)
-    phases = (
-        Phase("load_state_and_tokens", transfer(ctx, read=inputs + c.use_initial_state * state)),
-        Phase("key_dot", Work(resources={"vector": contraction}), ("load_state_and_tokens",)),
-        Phase("gate_rank1_update", Work(resources={"vector": state_ops}), ("key_dot",)),
-        Phase("query_dot", Work(resources={"vector": contraction}), ("gate_rank1_update",)),
-        Phase("publish", transfer(ctx, write=tokens * c.dv * elem + c.output_final_state * state), ("query_dot",)),
+    contraction = 2 * state
+    return (
+        Phase("load_tokens", transfer(ctx, read=inputs)),
+        Phase("decay", Work(resources={"vector": state + tokens * width}), ("load_tokens",)),
+        Phase("key_dot", Work(resources={"vector": contraction}), ("decay",)),
+        Phase("rank1_update", Work(resources={"vector": 2 * state + 2 * tokens * c.dv}), ("key_dot",)),
+        Phase("query_dot", Work(resources={"vector": contraction}), ("rank1_update",)),
+        Phase("publish_output", transfer(ctx, write=tokens * c.dv * elem), ("query_dot",)),
+        Phase("publish_token_state", transfer(ctx, write=state * FP32_BYTES * save_tokens), ("query_dot",)),
     )
-    return make_plan(ctx, "fused_recurrent_kda" if kda else "gdn_recurrent", phases,
-                     owners=len(c.lengths) * c.hv * ceil_div(c.dv, c.bv),
-                     metadata={"owner_ub_bytes": record.owner_ub_bytes, "state_tile_bytes": record.state_tile_bytes,
-                               "state_contraction_ops": contraction, "persistent_ub_resident": True})
+
+
+def _build_recurrent(c: LinearAttentionContract, ctx: OperatorPlanningContext, *,
+                     streaming: bool = False) -> OperatorPlan:
+    kda = c.operation == "kda_recurrent"
+    save_tokens = kda and (c.output_final_state or c.save_intermediate_state)
+    nheads = len(c.lengths) * c.hv
+    ctx.datapath.route("gm", "ub", c.dtype)
+    ctx.datapath.route("ub", "gm", "fp32" if save_tokens else c.state_dtype)
+    report = analyze_state_residency(c, ctx, persistent=True)
+    sequences = tuple(sorted(c.lengths))
+    tokens = sum(sequences) * c.hv
+    state = nheads * c.dk * c.dv * element_bytes(c.state_dtype)
+
+    @lru_cache(maxsize=CHUNK_WORK_CACHE_SIZE)
+    def token_work(count: int) -> tuple[Phase, ...]:
+        return _recurrent_work(c, ctx, count, kda=kda, save_tokens=save_tokens)
+
+    read = Phase("load_initial_state", transfer(ctx, read=state * c.use_initial_state))
+    write = Phase("publish_final_state", transfer(ctx, write=state * (not kda and c.output_final_state)),
+                  ("publish_output",))
+    token_phases = token_work(tokens)
+    totals = (read, replace(token_phases[0], after=(read.name,)), *token_phases[1:], write)
+    owners = nheads * ceil_div(c.dv, c.bv)
+
+    def lower(rc: RecipeContext) -> KernelProgram:
+        aics, aivs = owner_units(ctx)
+        aivs = aivs[:owners]
+
+        def tile(index: int) -> tuple[Stage, ...]:
+            active = (len(sequences) - bisect_right(sequences, index)) * c.hv
+            stages = tuple(bind_phase(p, rc, ctx, aics, aivs) for p in token_work(active))
+            if not save_tokens:
+                return stages
+            # Each head writes to the packed slot for sequence_start + token_index.
+            checkpoint = replace(stages[-1], metadata={"phase": stages[-1].name, "token_index": index})
+            return (*stages[:-1], checkpoint)
+
+        return KernelProgram((
+            bind_phase(read, rc, ctx, aics, aivs),
+            Stage("tokens", after=(read.name,), program=PipelineProgram(sequences[-1], 1, tile)),
+            replace(bind_phase(write, rc, ctx, aics, aivs), after=("tokens",)),
+        ))
+
+    implementation = ABI if streaming else "fused_recurrent_kda" if kda else "gdn_recurrent"
+    sources = GDN_SOURCES if streaming else (SOURCES[-2],) if kda else ()
+    return make_plan(ctx, implementation, totals, sources=sources, program=lower, metadata={
+        "owner_ub_bytes": report.owner_ub_bytes, "state_tile_bytes": report.state_tile_bytes,
+        "state_contraction_ops": 2 * tokens * c.dk * c.dv, "persistent_ub_resident": True,
+        "token_state_slots": tokens if save_tokens else 0,
+        "token_state_bytes": tokens * c.dk * c.dv * FP32_BYTES if save_tokens else 0,
+    })
+
+
+def _build_gdn(c: LinearAttentionContract, ctx: OperatorPlanningContext) -> OperatorPlan:
+    if max(c.dk, c.dv) > GDN_CUBE_DIM:
+        raise missing("linear_attention_gdn_dimension_unsupported", "CANN Arch35 GDN supports Dk and Dv up to 128")
+    streaming, wy = [], []
+    for length in c.lengths:
+        stream_cost = length * c.dk * c.dv * GDN_STREAM_STATE_OPS_PER_ELEMENT * GDN_STREAM_VECTOR_COST
+        cube_cost = ceil_div(length, c.bt) * GDN_CUBE_FLOPS_PER_CHUNK
+        (streaming if stream_cost < cube_cost else wy).append(length)
+
+    routes = {"streaming_exact_sequences": len(streaming), "chunked_wy_sequences": len(wy)}
+    if not wy:
+        plan = _build_recurrent(c, ctx, streaming=True)
+        return replace(plan, metadata={**plan.metadata, **routes, "template": "streaming_exact",
+                                       "total_chunks": 0, "offdiag_inv_flops": 0, "chunk_state_bank": 0})
+    chunked = replace(c, lengths=tuple(wy))
+    plan = _build_persistent(chunked, ctx, _pairs(ctx, chunked))
+    if not streaming:
+        return replace(plan, metadata={**plan.metadata, **routes})
+
+    stream = _build_recurrent(replace(c, lengths=tuple(streaming)), ctx, streaming=True)
+    # Independent tasks share one launch and contend for the same physical units.
+    stream_phases = tuple(replace(p, phase_id=f"stream_{p.phase_id}", after=tuple(f"stream_{d}" for d in p.after))
+                          for p in stream.pipeline_spec.phases)
+    spec = replace(plan.pipeline_spec, phases=stream_phases + plan.pipeline_spec.phases)
+    return replace(plan, work=plan.work + stream.work, pipeline_spec=spec,
+                   program=lambda rc: ParallelProgram((stream.program(rc), plan.program(rc))),
+                   metadata={**plan.metadata, **routes, "template": "mixed"})
 
 
 def _build_commit(c: LinearAttentionContract, ctx: OperatorPlanningContext) -> OperatorPlan:
@@ -489,7 +661,8 @@ class Arch35LinearAttentionStrategy:
         c = validate_contract(op, ctx)
         if isinstance(c, CausalConvContract):
             return c.mode == "incremental" or (ctx.requested_abi or dict(op.metadata).get("abi") or op.recipe) == "causal_conv1d_update"
-        return c.abi != "aclnnChunkGatedDeltaRuleArch22" and c.operation != "recover_ssm_verify"
+        return (c.abi not in FLA_GDN_ABIS | {"aclnnChunkGatedDeltaRuleArch22"}
+                and c.operation != "recover_ssm_verify")
 
     def build(self, op: OpSpec, ctx: OperatorPlanningContext, /) -> OperatorPlan:
         c = validate_contract(op, ctx)
@@ -506,35 +679,29 @@ class Arch35LinearAttentionStrategy:
             return _build_commit(c, ctx)
         if c.operation.endswith("_recurrent"):
             return _build_recurrent(c, ctx)
+        if c.operation == "gdn_prefill" and c.bt != DIAG_BLOCK_WIDTH:
+            return _build_gdn(c, ctx)
         pairs = _pairs(ctx, c)
         if c.operation == "gdn_chunk32" or c.bt == DIAG_BLOCK_WIDTH:
             return _build_staged(c, ctx, kda=False, pairs=pairs)
-        if c.operation == "kda_prefill":
-            pairs = pairs[:KDA_MAX_AIC_CORES]
-            request = {
-                "flash_kda_persistent": "persistent", "flash_kda_staged": "staged",
-            }.get(c.abi, c.kda_template_request)
-            m = c.metadata
-            layout = m.get("layout_kind", int(op.layout.upper() in {"BSND", "TND"}))
-            has_cu = m.get("has_cu", op.layout.upper() == "TND")
-            slots = m.get("workspace_slots", KDA_WORKSPACE_SLOTS)
-            max_group = m.get("max_chunk_group")
-            calibrated = m.get("calibration_enabled", True)
-            if (max_group is None and m.get("enable_grad") is True and layout == 0 and not has_cu
-                    and len(c.lengths) == 1 and c.hq == c.hv == len(pairs) == KDA_MAX_AIC_CORES
-                    and c.lengths[0] >= SHORT_TRAIN_MIN_LENGTH and not c.lengths[0] % c.bt):
-                max_group = SHORT_TRAIN_CHUNK_GROUP
-            selected = select_flash_kda_template(
-                c, core_num=len(pairs), template_request=request,
-                route_coefficients=m.get("route_coefficients", KDA_ROUTE_PARAMETERS), layout_kind=layout,
-                workspace_slots=slots, max_chunk_group=max_group, metadata_word_capacity=m.get("metadata_word_capacity"),
-                has_cu=has_cu, calibration_enabled=calibrated,
-            )
-            if selected == "staged":
-                chunks = tuple(ceil_div(n, c.bt) for n in c.lengths)
-                group = flash_kda_group_limit(chunks, c.hv, len(pairs), layout, max_group,
-                                              request == "auto" and calibrated)
-                return _build_staged(c, ctx, kda=True, pairs=pairs, slots=slots, group_limit=group)
+
+        from mindie_sim.templates.dsl_catalog import resolve_flash_kda_route
+
+        pairs = pairs[:KDA_MAX_AIC_CORES]
+        request = FLASH_KDA_TEMPLATE_BY_ABI.get(c.abi, c.kda_template_request)
+        m = c.metadata
+        layout = m.get("layout_kind", int(op.layout.upper() in {"BSND", "TND"}))
+        slots = m.get("workspace_slots", KDA_WORKSPACE_SLOTS)
+        selected, group = resolve_flash_kda_route(
+            c.lengths, c.hv, len(pairs), requested_template=request, device_name=m.get("device_name", ""),
+            route_coefficients=m.get("route_coefficients", ()), layout_kind=layout, workspace_slots=slots,
+            max_chunk_group=m.get("max_chunk_group"), metadata_word_capacity=m.get("metadata_word_capacity"),
+            has_cu=m.get("has_cu", op.layout.upper() == "TND"),
+            calibration_enabled=m.get("calibration_enabled", True), enable_grad=m.get("enable_grad", False),
+            query_heads=c.hq,
+        )
+        if selected == "staged":
+            return _build_staged(c, ctx, kda=True, pairs=pairs, slots=slots, group_limit=group)
         return _build_persistent(c, ctx, pairs)
 
 

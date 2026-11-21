@@ -16,8 +16,7 @@ import pytest
 
 from _support.axes import REPRESENTATIVE_SKUS, SKUS
 from _support.builders import linear_model, view
-from _support.hardware import machine
-from _support.linear_cases import caller, execute_one, gdn_decode_source_case, kda_hardware_case, packed_roles
+from _support.linear_cases import caller, execute_one, gdn_decode_source_case, kda_hardware_case, packed_roles, recipe_context, sku_planning_context
 from mindie_sim import graph_costs
 from mindie_sim.catalog.speculative_state import MODE_CHECKPOINT, MODE_REPLAY, MODE_SINGLE, speculative_state_plan
 from mindie_sim.prediction.call_gdn import make_call
@@ -27,7 +26,6 @@ from mindie_sim.prediction.gdn_decode_programs import CONV, GATING, gating_plan
 from mindie_sim.prediction.gdn_recurrent import build as build_gdn, head_ownership, head_runs
 from mindie_sim.prediction.mechanism import Geometry
 from mindie_sim.prediction.operators import gdn_output, kda_recurrent, kda_recurrent_arch22
-from mindie_sim.prediction.operators.contracts import OperatorPlanningContext
 from mindie_sim.prediction.operators.linear_attention import (
     RECOVER_SSM_FAMILIES, build as build_governed, build_recover_ssm_commit, build_recover_ssm_verify,
     rank_one_transition, resolve_operator_plan,
@@ -37,7 +35,6 @@ from mindie_sim.prediction.recover_ssm_commit import bind_declared_body_commits,
 from mindie_sim.prediction.recover_ssm_work import commit_tokens_for_view
 from mindie_sim.prediction.recurrent import _sum_valid_powers
 from mindie_sim.prediction.recurrent_template import lower_recurrent_scan, recurrent_scan_classes
-from mindie_sim.prediction.results import OpOccurrence
 from mindie_sim.prediction.verification import verify_operator
 from mindie_sim.schema.case import Software
 from mindie_sim.schema.common import ModelingError
@@ -459,15 +456,10 @@ def _governed_op(recipe, lengths, **metadata):
                                        "bv": 32, "bk": 16}, **metadata).items()))
 
 
-def _context(sku):
-    geom = Geometry.from_devices(machine(sku).dies)
-    return geom, OperatorPlanningContext(OpOccurrence(0, 0, 0, "scan"), geom, geom.datapath)
-
-
 @pytest.mark.parametrize("sku", SKUS)
 @pytest.mark.parametrize("kind,gate_width", (("gdn", 1), ("kda", 32)))
 def test_governed_decode_conserves_state_contractions_and_fp32_tile(sku, kind, gate_width):
-    geom, ctx = _context(sku)
+    geom, ctx = sku_planning_context(sku, "scan")
     op = _governed_op(f"{kind}_recurrent", (1, 4))
     plan = resolve_operator_plan(op, ctx).recipe
     tokens, dk, dv = 10, 32, 64
@@ -477,8 +469,25 @@ def test_governed_decode_conserves_state_contractions_and_fp32_tile(sku, kind, g
     assert plan.work.resources["vector"] == 2 * contraction + tokens * (3 * dk * dv + gate_width + 2 * dv)
     state = 2 * 2 * 4 * dk * dv
     payload = tokens * ((2 * dk + dv) * 2 + gate_width * 4 + 2)
-    assert plan.work.resources["hbm"] == 2 * state + payload + tokens * 2 * dv
+    checkpoint = tokens * dk * dv * 4 if sku == REPRESENTATIVE_SKUS["a5"] and kind == "kda" else state
+    assert plan.work.resources["hbm"] == state + checkpoint + payload + tokens * 2 * dv
     assert build_governed(op, geom).work == plan.work
+
+
+def test_recurrent_kda_gates_before_key_dot_and_checkpoints_each_valid_token():
+    geometry, ctx = sku_planning_context(REPRESENTATIVE_SKUS["a5"], "scan")
+    op = _governed_op("kda_recurrent", (1, 3), hv=1, dk=128, dv=128)
+    plan = resolve_operator_plan(op, ctx).recipe
+    tokens = next(stage.program for stage in plan.program(recipe_context(geometry, op)).stages if stage.name == "tokens")
+    stored = 0
+    for i, active in enumerate((2, 1, 1)):
+        stages = {stage.name: stage for stage in tokens.tile(i)}
+        assert stages["key_dot"].after == ("decay",)
+        checkpoint = stages["publish_token_state"]
+        assert checkpoint.after == ("query_dot",) and checkpoint.metadata["token_index"] == i
+        assert checkpoint.work["mte3"] == active * 128**2 * 4
+        stored += checkpoint.work["mte3"]
+    assert plan.metadata["token_state_slots"] == 4 and plan.metadata["token_state_bytes"] == stored == 262_144
 
 
 DK, DV = 32, 64
@@ -488,7 +497,7 @@ ABI_WIDTHS = (
     ("gdn", False, (4*DV, 4*DK, 4, 0)),
     ("deltanet", False, (4*DV, 4*DK, 0, 0)),
     ("deltanet", True, (4*DV, 4*DK, 4, 0)),
-    ("gla", False, (4*DV, 2*DK, 2*DK, 0)),
+    ("gla", False, (4*DV, 2*DK, 2*DK, 2*DV)),
     ("lightning", False, (4*DV, 4*DK, 4, 0)),
     ("retnet", False, (4*DV, 4*DK, 4, 0)),
     ("mamba", False, (4*DV, 4*DK, 4, 0)),
@@ -498,11 +507,14 @@ ABI_WIDTHS = (
 
 @pytest.mark.parametrize("family,gated,widths", ABI_WIDTHS)
 def test_recover_verification_and_commit_cover_exact_abi_prefix(family, gated, widths):
-    _, ctx = _context(REPRESENTATIVE_SKUS["a5"])
+    _, ctx = sku_planning_context(REPRESENTATIVE_SKUS["a5"], "scan")
     options = dict(gated=gated, factors=FACTORS if family == "mamba" else None)
     transition = rank_one_transition(family, DK, DV, **options)
     assert (transition.correction_field_bytes, transition.key_field_bytes,
             transition.decay_field_bytes, transition.extra_field_bytes) == widths
+    if family == "gla":
+        decay, _, _ = transition.reconstruction_rule.partition(" + ")
+        assert transition.decay_kind == "separable" and decay == "g_v[:, None] * S * g_k[None, :]"
     record, state, heads = sum(widths), 2 * 4 * DK * DV, 2
     for q in (1, 4):
         verify = build_recover_ssm_verify(family, DK, DV, q=q, heads=heads, **options)
@@ -516,7 +528,7 @@ def test_recover_verification_and_commit_cover_exact_abi_prefix(family, gated, w
         if q > 1:
             assert verify.record_write_bytes == size
         for a in range(q + 1):
-            boundaries = (1, q) if q > 1 else (1,)
+            boundaries = (1,)
             commit = build_recover_ssm_commit(family, DK, DV, q=q, a=a, heads=heads,
                                               base_version=8, boundary_checkpoints=boundaries, **options)
             op = _governed_op("recover_ssm_commit", (q,), q=q, a=a, ssm_family=family,
@@ -524,14 +536,21 @@ def test_recover_verification_and_commit_cover_exact_abi_prefix(family, gated, w
             replay = resolve_operator_plan(op, ctx).recipe
             assert commit.published_version == replay.metadata["published_version"] == 8 + bool(a)
             assert commit.boundary_checkpoints == tuple(n for n in boundaries if n <= a)
-            assert commit.state_read_bytes == commit.state_write_bytes == state * bool(a)
-            assert commit.record_read_bytes == a * heads * record
-            assert commit.vector_ops == replay.work.resources.get("vector", 0) == 4 * a * heads * DK * DV
-            phases = replay.pipeline_spec.phases
-            assert replay.work.resources.get("hbm", 0) == 2 * state * bool(a) + a * heads * record
-            assert [p.phase_id for p in phases].count("publish") == bool(a)
-            if a:
-                assert phases[-1].after == (f"replay_to_{a}",)
+            read, written = state * bool(a), state * (bool(a) + (q > 1 and a > 1))
+            records = a * heads * record if q > 1 else 0
+            replay_ops = (4 + (family == "gla")) * a * heads * DK * DV if q > 1 else 0
+            assert (commit.state_read_bytes, commit.state_write_bytes, commit.record_read_bytes) == (read, written, records)
+            assert commit.vector_ops == replay.work.resources.get("vector", 0) == replay_ops
+            assert replay.work.resources.get("hbm", 0) == read + written + records + 4 * (q == a == 1)
+            phases = {p.phase_id: p for p in replay.pipeline_spec.phases}
+            if q == a == 1:
+                assert tuple(phases) == ("read_acceptance", "read_checkpoint", "publish")
+                assert phases["publish"].after == ("read_checkpoint",)
+            elif a:
+                assert phases["publish"].after == (f"replay_to_{a}",)
+                assert replay.metadata["boundary_checkpoints"] == (1,)
+                if a > 1:
+                    assert phases[f"replay_to_{a}"].after == ("publish_boundary_1",)
             else:
                 assert not phases and replay.metadata["launch_count"] == 0
 
@@ -551,7 +570,7 @@ def test_recover_selective_factors_and_boundary_checkpoints_are_validated():
 
 
 def test_partitioned_kda_commit_reloads_key_decay_pair_for_each_value_tile():
-    _, ctx = _context(REPRESENTATIVE_SKUS["a5"])
+    _, ctx = sku_planning_context(REPRESENTATIVE_SKUS["a5"], "scan")
     dim, partitions, accepted = 128, 4, 3
     op = _governed_op("recover_ssm_commit", (4,), abi="commit_recurrent_kda", hv=1,
                       q=4, a=accepted, dk=dim, dv=dim, row_partitions=partitions)

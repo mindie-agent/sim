@@ -11,21 +11,22 @@ from __future__ import annotations
 from collections import Counter
 
 from mindie_sim.prediction.program.stages import Stage
+from mindie_sim.prediction.runtime.memory_physics import AddressRun
 from mindie_sim.prediction.runtime.ring_buffer import RingBuffer, lower_generation
 from mindie_sim.schema.common import ModelingError
 
 from .contracts import SemanticWorkItem, ceil_div
 from .dsl_catalog import (
-    ATTN_RES, BF16_BYTES, COMMIT_KDA, FLASH_KDA, FP32_BYTES, INT32_BYTES,
+    ATTN_RES, ATTN_RES_VL, BF16_BYTES, COMMIT_KDA, FLASH_KDA, FP32_BYTES, INT32_BYTES,
     KDA_CHUNK, KDA_HEAD_DIM, KDA_HIDDEN_SIZE, KDA_MODEL_HEADS, KV_ROW_BYTES_CMP, KV_ROW_BYTES_ORI,
-    MEGA_KDA, MLA_PROLOG, MQSMLA, MQSMLA_FD_BYTES_PER_CORE, MQSMLA_FD_SLOT_BYTES,
+    MEGA_KDA, MLA_CACHE_NZ_LANE_BYTES, MLA_PROLOG, MLA_QUANTIZED_QUERY, MQSMLA, MQSMLA_FD_BYTES_PER_CORE, MQSMLA_FD_SLOT_BYTES,
     MQSMLA_KV_DEPTH, MQSMLA_KV_TILE, QSLI, QSLI_HISTOGRAM_BINS, QSLI_METADATA_BYTES,
     QSLI_PACKED_D, QSLI_SCALE_ROW_BYTES, QSLI_STAGING_DEPTH, QSLI_TILE_M, QSLI_TILE_N,
     QSLI_TRUNK, QkvQuantMode, commit_rows, describe_dsl_kernel,
-    dsl_problem, flash_kda_rounds, flash_kda_schedule, mega_workspace_sizes,
-    mla_workspaces, qsli_workspace_sizes,
+    dsl_problem, flash_kda_lane_tasks, mega_workspace_sizes,
+    mla_workspaces, qsli_workspace_sizes, replay_pool_capacity,
 )
-from .fuse_region import Lowering
+from .fuse_region import Lowering, ring_credit
 
 KDA_INVERSE_PRODUCTS = 5
 KDA_INPUT_VECTORS = 4
@@ -34,6 +35,7 @@ KDA_RECURRENT_STATE_OPS = 7
 KDA_CONV_TAPS = 3
 ATTN_RES_MERGE_OPS = 5
 ATTN_RES_NORM_OPS = 4
+ATTN_RES_SCORE_OPS = 5
 MQSMLA_ONLINE_SCORE_OPS = 4
 MQSMLA_ONLINE_VALUE_OPS = 3
 
@@ -50,13 +52,13 @@ class _DslLowering:
         return self.plan.add(Stage(name, after=tuple(after), metadata=metadata))
 
     def access(self, name, tensor, amount, *, after=(), owner=0, write=False, private=False,
-               cube=False, offset=0, working_set=None, bypass=False, version=None):
+               cube=False, offset=0, working_set=None, bypass=False, version=None, runs=None):
         pipe = ("fixpipe" if cube else "mte3") if write else ("mte2_aic" if cube else "mte2_aiv")
         allocation = f"{self.region_id}:{tensor}" if private else tensor
         return self.plan.access(
             name, allocation, amount, pipe=pipe, after=after, owner=owner, offset=offset,
             direction="write" if write else "read", private=private, working_set=working_set,
-            bypass=bypass, version=version,
+            bypass=bypass, version=version, runs=runs,
         )
 
     def spill(self, name, tensor, size, after, *, owner=0, src_owner=None, dst_owner=None,
@@ -71,7 +73,10 @@ class _DslLowering:
     def vector(self, name, ops, after, owner=0, role="vec_alu", **metadata):
         return self.plan.work(name, role, ops, after=after, owner=owner, metadata=metadata)
 
-    def cube(self, name, logical, after, owner=0, *, dtype="bf16", issued=None):
+    def cube(self, name, logical, after, owner=0, *, dtype="bf16", issued=None, operands=None):
+        if operands is not None:
+            after = tuple(self.local(f"{name}:l0{bank}", "mte1", size, after, owner)
+                          for bank, size in zip(("a", "b"), operands))
         self.logical_cube[dtype] += logical
         return self.plan.work(name, "cube", logical if issued is None else issued, dtype=dtype, after=after,
                               owner=owner, metadata={"logical_flops": logical})
@@ -123,10 +128,6 @@ class _DslLowering:
         return work
 
 
-def _credit(ring, generation):
-    return ring.initial_credit(ring.slot(generation)) if generation < ring.depth else ring.last_use(generation - ring.depth)
-
-
 def _read_ring(ring, generation, ready, consumer):
     return lower_generation(
         ring, generation, "write", ("consume",), producer_extra_after=(ready,),
@@ -134,39 +135,17 @@ def _read_ring(ring, generation, ready, consumer):
     ).publish
 
 
-def _flash_lane_tasks(p, spec):
-    chunks = tuple(ceil_div(length, KDA_CHUNK) for length in p.lengths)
-    if spec.template_variant == "persistent":
-        loads = [0] * spec.aic_budget
-        for batch in sorted(range(len(chunks)), key=lambda i: (-chunks[i], i)):
-            for head in range(p.value_heads):
-                owner = min(range(len(loads)), key=loads.__getitem__)
-                loads[owner] += chunks[batch]
-                yield tuple((batch, head, chunk, owner, 0) for chunk in range(chunks[batch]))
-        return
-    _, group = flash_kda_schedule(p, spec.aic_budget)
-    consumed = [0] * len(chunks)
-    for first, batch_counts in flash_kda_rounds(chunks, p.value_heads, p.workspace_slots, group):
-        tasks = []
-        for batch, count in enumerate(batch_counts, first):
-            for head in range(p.value_heads):
-                owner = (batch * p.value_heads + head) % spec.aic_budget
-                for chunk in range(consumed[batch], consumed[batch] + count):
-                    tasks.append((batch, head, chunk, owner, len(tasks)))
-            consumed[batch] += count
-        yield tuple(tasks)
-
-
 def _lower_flash(lower, p, ready):
     plan, spec = lower.plan, lower.spec
     d = KDA_HEAD_DIM
+    state_bytes = d * d * FP32_BYTES
     staged = spec.template_variant == "staged"
     buffers, lane_last, lane_generation, prior_chunk = {}, {}, Counter(), {}
     previous_round = (ready,)
     token_base = [0]
     for length in p.lengths:
         token_base.append(token_base[-1] + length)
-    for round_tasks in _flash_lane_tasks(p, spec):
+    for round_tasks in flash_kda_lane_tasks(p, spec):
         for batch, head, chunk, core, slot in round_tasks:
             vector = lower.paired(core)[0]
             name = f"kda:{batch}:{head}:{chunk}"
@@ -177,6 +156,7 @@ def _lower_flash(lower, p, ready):
             generation = lane_generation[core]
             lane_generation[core] += 1
             seq = (batch, head)
+            state_offset = (batch * p.value_heads + head) * state_bytes
             tail = min(KDA_CHUNK, p.lengths[batch] - chunk * KDA_CHUNK)
             row = token_base[batch] + chunk * KDA_CHUNK
             deps = tuple(dict.fromkeys((*previous_round, lane_last.get(core, ready))))
@@ -212,6 +192,10 @@ def _lower_flash(lower, p, ready):
                         f"{name}:save_{tensor}", f"kda:{tensor}:{head}", tail * d * element,
                         after=(wy,), offset=row * d * element, owner=vector, write=True, bypass=True,
                     ))
+            entry = prior_chunk.get(seq, ready)
+            if chunk == 0 and p.has_initial_state:
+                entry = lower.access(name + ":initial_state", "kda:initial_state", state_bytes,
+                                     owner=vector, after=deps, offset=state_offset)
             if staged:
                 q_size = tail * d * BF16_BYTES
                 gamma_size = d * FP32_BYTES
@@ -231,32 +215,33 @@ def _lower_flash(lower, p, ready):
                 else:
                     aqk = lower.spill(name + ":Aqk", f"Aqk:{head}", matrix_bytes, (wy,), owner=core,
                                       cube_src=True, cube_dst=True, offset=matrix_offset)
-                deps = (q, gamma, *wk, aqk, prior_chunk.get(seq, ready))
+                deps = (q, gamma, *wk, aqk, entry)
             else:
-                deps = (wy, prior_chunk.get(seq, ready), _credit(ring, generation))
+                deps = (wy, entry, ring_credit(ring, generation))
             state = lower.local(name + ":state_to_l1", "mte3", d * d * BF16_BYTES, deps, vector)
             if ring is not None:
                 state = _read_ring(ring, generation, state, name + ":state_products")
             inter = lower.cube(name + ":state_products", 2 * 2 * tail * d * d, (state,), core)
             delta = lower.cube(name + ":delta", 2 * tail * d * d, (inter,), core)
-            delta_ub = lower.local(name + ":delta_to_ub", "fixpipe", d * d * FP32_BYTES, (delta,), core)
-            update = lower.vector(name + ":fp32_state_update", d * d * 2, (delta_ub,), vector)
+            delta_ub = lower.local(name + ":delta_to_ub", "fixpipe", state_bytes, (delta,), core)
+            update_deps = (delta_ub,)
+            if p.save_chunk_states:
+                h_offset = (sum(ceil_div(length, KDA_CHUNK) for length in p.lengths[:batch]) + chunk) * state_bytes
+                update_deps += (lower.access(name + ":save_h", f"kda:h:{head}", state_bytes,
+                                             after=(state,), owner=vector, offset=h_offset, write=True, bypass=True),)
+            update = lower.vector(name + ":fp32_state_update", d * d * 2, update_deps, vector)
             intra = lower.cube(name + ":intra", 2 * tail * tail * d, (inter,), core)
             output = lower.access(name + ":output", f"kda:head:{head}:output", tail * d * BF16_BYTES,
                                   offset=row * d * BF16_BYTES, after=(intra,), cube=True, owner=core, write=True)
             epilogue = (output, update, *saved)
-            if p.save_chunk_states:
-                size = d * d * FP32_BYTES
-                offset = (sum(ceil_div(length, KDA_CHUNK) for length in p.lengths[:batch]) + chunk) * size
-                epilogue += (lower.access(
-                    name + ":save_h", f"kda:h:{head}", size, after=(update,), owner=vector,
-                    offset=offset, write=True, bypass=True,
-                ),)
-            if staged and chunk + 1 < ceil_div(p.lengths[batch], KDA_CHUNK):
-                size = d * d * FP32_BYTES
-                sid = (batch * p.value_heads + head) * size
-                epilogue += (lower.spill(name + ":stage_state", "staged_state", size, (update,),
-                                         owner=vector, offset=sid, working_set=size * p.value_heads),)
+            final = chunk + 1 == ceil_div(p.lengths[batch], KDA_CHUNK)
+            if final and p.return_final_state:
+                epilogue += (lower.access(name + ":final_state", "kda:final_state", state_bytes,
+                                          after=(update,), owner=vector, offset=state_offset, write=True),)
+            elif staged and not final:
+                update = lower.spill(name + ":stage_state", "staged_state", state_bytes, (update,),
+                                     owner=vector, offset=state_offset, working_set=state_bytes * p.value_heads)
+                epilogue += (update,)
             prior_chunk[seq] = update
             lane_last[core] = lower.stage(name + ":done", epilogue)
         if staged:
@@ -270,6 +255,7 @@ def _lower_mega(lower, p, ready):
     h = KDA_MODEL_HEADS // p.tp
     d, batch = KDA_HEAD_DIM, p.batch * p.tp
     workspaces = mega_workspace_sizes(p)
+    capacity = replay_pool_capacity(p.replay_capacity, p.sequence)
     if not p.unfused_launches or len(set(p.unfused_launches)) != len(p.unfused_launches):
         raise ModelingError("mega_kda_unfused_launch_baseline_invalid")
     ready = lower.stage("mega:unfused_baseline", (ready,), saved_launches=len(p.unfused_launches) - 1)
@@ -278,13 +264,14 @@ def _lower_mega(lower, p, ready):
     lane_last = {}
     for tile in range(batch):
         core, vector = tile % spec.aic_budget, tile % spec.aiv_budget
+        slot = p.state_indices[tile] if p.state_indices else tile
         name = f"mega:{tile}"
         prior = (lane_last.get(core, ready),)
         hidden = lower.access(name + ":hidden", "hidden_states", p.sequence * KDA_HIDDEN_SIZE * BF16_BYTES,
                               cube=True, owner=core, after=prior, offset=tile * p.sequence * KDA_HIDDEN_SIZE * BF16_BYTES)
         conv_bytes = (KDA_CONV_TAPS - 1) * conv_width * BF16_BYTES
         conv_history = lower.access(name + ":conv_read", "mega:conv_state", conv_bytes, owner=vector, after=prior,
-                                    offset=tile * conv_bytes)
+                                    offset=slot * (p.sequence + KDA_CONV_TAPS - 1) * conv_width * BF16_BYTES)
         decay_weight = lower.access(name + ":decay_a_weight", "mega:w_decay_a",
                                     KDA_HIDDEN_SIZE * d * BF16_BYTES, cube=True, owner=core, after=(ready,))
         decay_a = lower.cube(name + ":decay_a", 2 * p.sequence * KDA_HIDDEN_SIZE * d, (hidden, decay_weight), core)
@@ -313,15 +300,24 @@ def _lower_mega(lower, p, ready):
                 f"{name}:{tensor}:gm", tensor, amount, (vector_dep,), owner=vector,
                 offset=tile * (workspaces[tensor] // batch), working_set=workspaces[tensor],
             )
-        conv_out = lower.access(name + ":conv_write", "mega:conv_state", conv_bytes, owner=vector,
-                                after=tuple(projected[t] for t in ("Q", "K", "V")), offset=tile * conv_bytes, write=True)
+        conv_stride = conv_bytes + p.sequence * conv_width * BF16_BYTES
+        conv_out = lower.access(name + ":conv_write", "mega:conv_state", conv_stride, owner=vector,
+                                after=tuple(projected[t] for t in ("Q", "K", "V")), offset=slot * conv_stride, write=True)
         state_size = h * d * d * FP32_BYTES
-        state = lower.access(name + ":state_read", "mega:state", state_size,
-                             owner=vector, after=(ready,), offset=tile * state_size)
+        indices = lower.access(name + ":state_index", "state_indices", INT32_BYTES,
+                               owner=vector, after=prior, offset=tile * INT32_BYTES)
+        state = lower.access(name + ":state_read", "checkpoint", state_size,
+                             owner=vector, after=(indices,), offset=slot * state_size)
         rec = lower.vector(name + ":recurrent", p.sequence * h * (d * d * KDA_RECURRENT_STATE_OPS + 2 * d),
                            (state, *(dep for tensor, dep in projected.items() if tensor != "output_gate")), vector)
-        state_out = lower.access(name + ":state_write", "mega:state", state_size, owner=vector,
-                                 after=(rec,), write=True, offset=tile * state_size)
+        records = []
+        for tensor, element in _REPLAY_DTYPES:
+            row_bytes = d * element
+            stride = capacity * row_bytes
+            for token in range(p.sequence):
+                offset = slot * h * stride + token * row_bytes
+                records.append(lower.access(f"{name}:{tensor}:{token}:write", tensor, h * row_bytes, after=(rec,),
+                                            owner=vector, write=True, runs=(AddressRun(offset, h, row_bytes, stride),)))
         gated = lower.vector(name + ":gate", p.sequence * h * d, (rec, projected["output_gate"]), vector)
         payload = p.sequence * h * d * BF16_BYTES
         handoff = lower.access(name + ":gate_workspace", "Q", payload, owner=vector, after=(gated,),
@@ -336,40 +332,48 @@ def _lower_mega(lower, p, ready):
         output = p.sequence * KDA_HIDDEN_SIZE * BF16_BYTES
         out = lower.access(name + ":output", "mega:output", output, after=(result,), cube=True, owner=core,
                            write=True, offset=tile * output)
-        lane_last[core] = lower.stage(name + ":done", (conv_out, state_out, out))
+        lane_last[core] = lower.stage(name + ":done", (conv_out, out, *records))
+
+
+_REPLAY_DTYPES = (("replay_u", FP32_BYTES), ("replay_k", BF16_BYTES), ("replay_decay", FP32_BYTES))
 
 
 def _lower_commit(lower, p, ready):
     d = KDA_HEAD_DIM
+    capacity = replay_pool_capacity(p.replay_capacity, max(p.accepted, default=0))
     for lane, items in enumerate(commit_rows(p, lower.spec.aiv_budget)):
         previous = ready
         for item, row, rows in items:
             batch, head = divmod(item, p.heads)
             accepted = p.accepted[batch]
+            name = f"commit:{item}:{row}"
+            previous = lower.access(name + ":accepted_read", "accepted", INT32_BYTES, owner=lane,
+                                    offset=batch * INT32_BYTES, after=(previous,))
             if not accepted:
                 continue
-            name = f"commit:{item}:{row}"
-            state_offset = (item * d + row) * d * FP32_BYTES
+            slot = p.state_indices[batch] if p.state_indices else batch
+            state_head = slot * p.heads + head
+            state_offset = (state_head * d + row) * d * FP32_BYTES
             state_size = rows * d * FP32_BYTES
-            item_ready = previous
+            item_ready = lower.access(name + ":state_index", "state_indices", INT32_BYTES, owner=lane,
+                                      after=(previous,), offset=batch * INT32_BYTES)
             previous = lower.access(name + ":checkpoint_read", "checkpoint", state_size, owner=lane,
                                     offset=state_offset, after=(item_ready,))
             rings = tuple(
                 RingBuffer(die=lower.plan.die, owner=lane, pool="ub", depth=2, allocation=f"{name}:{tensor}",
                            slot_bytes=d * element if lower.plan.context is not None else 0)
-                for tensor, element in (("replay_u", FP32_BYTES), ("replay_k", BF16_BYTES), ("replay_decay", FP32_BYTES))
+                for tensor, element in _REPLAY_DTYPES
             )
             for token in range(accepted):
                 updated = f"{name}:token{token}:update"
                 publish = []
-                for ring, tensor, payload, element, col in zip(
-                    rings, ("replay_u", "replay_k", "replay_decay"),
-                    (rows, d, d), (FP32_BYTES, BF16_BYTES, FP32_BYTES), (row, 0, 0),
+                for ring, (tensor, element), payload, col in zip(
+                    rings, _REPLAY_DTYPES, (rows, d, d), (row, 0, 0),
                 ):
-                    offset = (token * d + col) * element
+                    offset = ((state_head * capacity + token) * d + col) * element
                     read = lower.access(
-                        f"{name}:token{token}:{tensor}:read", f"{tensor}:{batch}:{head}",
-                        payload * element, owner=lane, after=(item_ready, _credit(ring, token)), offset=offset,
+                        f"{name}:token{token}:{tensor}:read", tensor,
+                        payload * element, owner=lane, after=(item_ready, ring_credit(ring, token)), offset=offset, version=1,
                     )
                     publish.append(_read_ring(ring, token, read, updated))
                 previous = lower.vector(updated, KDA_STATE_UPDATE_OPS * rows * d,
@@ -382,7 +386,7 @@ def _lower_commit(lower, p, ready):
 
 def _lower_mla(lower, p, ready):
     spec = lower.spec
-    mode = QkvQuantMode(p.mode)
+    mode = p.quant_mode
     workspace, _, scratch_rows, recompute = mla_workspaces(p, spec.aic_budget)
     qp = p.heads * (p.q_nope + p.rope)
     latent = p.kvr - p.rope
@@ -390,10 +394,17 @@ def _lower_mla(lower, p, ready):
         raise ModelingError("mla_prolog_latent_width_invalid")
     weights = {"wqa": p.dim * p.q_lora, "wkva": p.dim * p.kvr, "wqb": p.q_lora * qp,
                "wkb": p.heads * p.q_nope * latent}
+    inputs = {"wqa": p.dim, "wkva": p.dim, "wqb": p.q_lora, "wkb": p.heads * p.q_nope}
     weight_dep = {
         weight: lower.access(weight + ":load", weight, elements * BF16_BYTES, after=(ready,), cube=True)
         for weight, elements in weights.items()
     }
+
+    def project(name, weight, rows, after, core):
+        operands = (rows * inputs[weight] * BF16_BYTES, weights[weight] * BF16_BYTES)
+        return lower.cube(name, 2 * rows * weights[weight], (*after, weight_dep[weight]), core, operands=operands)
+
+    cache_row = p.cache_row_bytes
     quant_rows = []
     maxima_by_core = {core: [] for core in range(spec.aic_budget)}
     previous = (ready,)
@@ -406,8 +417,8 @@ def _lower_mla(lower, p, ready):
         if "ws_x_pad" in workspace:
             x = lower.spill(name + ":pad", "ws_x_pad", workspace["ws_x_pad"], (x,), src_owner=vector,
                             dst_owner=core, cube_dst=True, working_set=workspace["ws_x_pad"])
-        qa = lower.cube(name + ":wqa", 2 * rows * weights["wqa"], (x, weight_dep["wqa"]), core)
-        kva = lower.cube(name + ":wkva", 2 * rows * weights["wkva"], (x, weight_dep["wkva"]), core)
+        qa = project(name + ":wqa", "wqa", rows, (x,), core)
+        kva = project(name + ":wkva", "wkva", rows, (x,), core)
         qa_read = lower.spill(name + ":ws_qa", "ws_qa", workspace["ws_qa"], (qa,),
                               src_owner=core, dst_owner=vector, cube_src=True, working_set=workspace["ws_qa"])
         kval = lower.spill(name + ":ws_kva", "ws_kva", workspace["ws_kva"], (kva,),
@@ -423,18 +434,23 @@ def _lower_mla(lower, p, ready):
             norm = lower.spill(name + ":ws_qb_aux", "ws_qb_aux", qa_bytes, (norm,), src_owner=vector,
                                dst_owner=core, cube_dst=True, working_set=workspace["ws_qb_aux"])
         kv_norm = lower.vector(name + ":kv_norm_rope", rows * p.kvr * ATTN_RES_NORM_OPS, (kval,), vector)
-        kv_bytes = rows * (p.kvr * BF16_BYTES if mode == QkvQuantMode.A16C16 else p.kvr + p.rope)
-        cache = lower.access(name + ":kv_cache", "mla:kv_cache", kv_bytes, after=(kv_norm,), owner=vector,
-                             write=True, offset=start * (kv_bytes // rows))
-        qb = lower.cube(name + ":wqb", 2 * rows * weights["wqb"], (norm, cache, weight_dep["wqb"]), core)
+        lane = MLA_CACHE_NZ_LANE_BYTES
+        runs = None if p.cache_layout == "PA_BSND" else tuple(
+            AddressRun(page * p.cache_page_size * cache_row + row * lane, cache_row // lane,
+                       lane, p.cache_page_size * lane)
+            for page, row in (divmod(pos, p.cache_page_size) for pos in range(start, start + rows))
+        )
+        cache = lower.access(name + ":kv_cache", "mla:kv_cache", rows * cache_row, after=(kv_norm,), owner=vector,
+                             write=True, offset=start * cache_row, runs=runs)
+        qb = project(name + ":wqb", "wqb", rows, (norm, cache), core)
         proj = lower.spill(name + ":ws_q_proj", "ws_q_proj", workspace["ws_q_proj"], (qb,),
                            owner=core, cube_src=True, cube_dst=True, working_set=workspace["ws_q_proj"])
-        kb = lower.cube(name + ":wkb", 2 * rows * weights["wkb"], (proj, weight_dep["wkb"]), core)
+        kb = project(name + ":wkb", "wkb", rows, (proj,), core)
         q_elements = rows * p.heads * p.kvr
         rope = lower.vector(name + ":q_rope", rows * p.heads * p.rope * ATTN_RES_NORM_OPS, (kb,), vector)
-        if mode in {QkvQuantMode.FP8, QkvQuantMode.HiF8}:
+        if mode in MLA_QUANTIZED_QUERY:
             size = q_elements * FP32_BYTES
-            offset = 0 if mode == QkvQuantMode.FP8 or recompute else start * p.heads * p.kvr * FP32_BYTES
+            offset = 0 if mode == QkvQuantMode.FP8_TENSOR or recompute else start * p.heads * p.kvr * FP32_BYTES
             q_value = lower.access(name + ":ws_q_fp_write", "ws_q_fp", size, after=(rope,),
                                    owner=vector, offset=offset, private=True, write=True, working_set=workspace["ws_q_fp"])
             if mode == QkvQuantMode.HiF8:
@@ -451,7 +467,7 @@ def _lower_mla(lower, p, ready):
             q_value = lower.access(name + ":ws_q_fp_read", "ws_q_fp", size, after=(q_value,),
                                    owner=vector, private=True, working_set=workspace["ws_q_fp"])
             rope = lower.vector(name + ":q_quant", q_elements * 2, (q_value,), vector)
-        elem = 1 if mode == QkvQuantMode.FP8 else BF16_BYTES
+        elem = 1 if mode == QkvQuantMode.FP8_TENSOR else BF16_BYTES
         output = lower.access(name + ":q_output", "mla:q", q_elements * elem, after=(rope,), write=True,
                               offset=start * p.heads * p.kvr * elem, owner=vector)
         previous = (output,)
@@ -476,8 +492,8 @@ def _lower_mla(lower, p, ready):
             qr = lower.access(name + ":recompute_qr", "mla:qr" if p.return_qr else "ws_qb_aux",
                               rows * p.q_lora * BF16_BYTES, after=after, cube=True, owner=core,
                               offset=start * p.q_lora * BF16_BYTES, private=not p.return_qr)
-            qb = lower.cube(name + ":wqb_recompute", 2 * rows * weights["wqb"], (qr, weight_dep["wqb"]), core)
-            kb = lower.cube(name + ":wkb_recompute", 2 * rows * weights["wkb"], (qb, weight_dep["wkb"]), core)
+            qb = project(name + ":wqb_recompute", "wqb", rows, (qr,), core)
+            kb = project(name + ":wkb_recompute", "wkb", rows, (qb,), core)
             after = (kb,)
         else:
             after = (lower.access(name + ":ws_q_fp_read", "ws_q_fp", size, after=after, private=True,
@@ -513,13 +529,18 @@ def _lower_attn_res(lower, p, ready):
                 f"{name}:{tensor}", f"attn_res:{tensor}", count * FP32_BYTES,
                 owner=lane, after=(previous,), offset=first * FP32_BYTES,
             ) for tensor in ("logit_max", "exp_sum"))
+            scores = lower.vector(name + ":score_dot_and_squares", elems * ATTN_RES_SCORE_OPS, (weight, a, b), lane)
+            reduce = lower.vector(name + ":score_reduce", 2 * elems, (scores,), lane, "vec_reduce")
+            score_rms = lower.vector(name + ":score_sqrt", count, (reduce,), lane, "vec_sfu")
+            score = lower.vector(name + ":score_divide", count, (score_rms,), lane)
+            exp = lower.vector(name + ":merge_exp", 2 * count * ATTN_RES_VL, (score, *stat), lane, "vec_sfu")
             merge = lower.vector(name + ":merge_round_bf16", elems * ATTN_RES_MERGE_OPS,
-                                 (weight, a, b, numerator, *stat),
-                                 lane, buffer_depth=depth, inplace=True)
+                                 (scores, numerator, exp), lane, buffer_depth=depth, inplace=True)
             partial = lower.access(name + ":inplace_partial", "attn_res:partial_block", elems * FP32_BYTES,
                                    after=(merge,), owner=lane, write=True, offset=first * d * FP32_BYTES)
             reduce = lower.vector(name + ":sum_squares", elems * 2, (merge,), lane, "vec_reduce")
-            rms = lower.vector(name + ":rms_norm", elems * ATTN_RES_NORM_OPS, (reduce,), lane)
+            root = lower.vector(name + ":norm_sqrt", count, (reduce,), lane, "vec_sfu")
+            rms = lower.vector(name + ":rms_norm", elems * ATTN_RES_NORM_OPS, (root,), lane)
             out = lower.access(name + ":output", "attn_res:y", elems * BF16_BYTES, owner=lane, after=(rms,),
                                write=True, offset=first * d * BF16_BYTES)
             previous = lower.stage(name + ":done", (partial, out))
@@ -532,8 +553,9 @@ def _lower_qsli(lower, p, ready):
     q_payload = QSLI_PACKED_D + QSLI_SCALE_ROW_BYTES
     query_ready = (meta,)
     for query in range(p.query_rows):
+        owner = query % spec.aiv_budget
         parts = []
-        for split in range(p.split_parts):
+        for split in range(p.split_parts if p.candidates else 0):
             core = (query * p.split_parts + split) % spec.aic_budget
             pair = lower.paired(core)
             name = f"qsli:{query}:{split}"
@@ -552,7 +574,7 @@ def _lower_qsli(lower, p, ready):
                 real = min(QSLI_TILE_N, end - pos)
                 n = f"{name}:tile{tile}"
                 gather = lower.access(n + ":gather_pa", "qsli:key", real * q_payload, owner=pair[0],
-                                      after=(*query_ready, _credit(staging, tile)), offset=pos * q_payload)
+                                      after=(*query_ready, ring_credit(staging, tile)), offset=pos * q_payload)
                 staging_slot = (core * QSLI_STAGING_DEPTH + tile % QSLI_STAGING_DEPTH) * QSLI_TILE_N
                 packed = lower.spill(n + ":publish_packed_k", "staging_key", real * QSLI_PACKED_D, (gather,),
                                      src_owner=pair[0], dst_owner=core, cube_dst=True,
@@ -560,14 +582,14 @@ def _lower_qsli(lower, p, ready):
                 scale = lower.spill(n + ":publish_scale", "staging_scale", real * QSLI_SCALE_ROW_BYTES, (gather,),
                                     src_owner=pair[-1], dst_owner=core, cube_dst=True,
                                     offset=staging_slot * QSLI_SCALE_ROW_BYTES, working_set=workspace["staging_scale"])
-                staged = lower.stage(n + ":staged_key_scale", (packed, scale, _credit(k_l1, tile)))
+                staged = lower.stage(n + ":staged_key_scale", (packed, scale, ring_credit(k_l1, tile)))
                 staged = _read_ring(staging, tile, staged, n + ":l0_operands")
                 refill = _read_ring(k_l1, tile, staged, n + ":l0_operands")
                 k_l0 = lower.local(n + ":l0_operands", "mte1", real * q_payload,
-                                   (refill, _credit(l0b, tile)), core)
+                                   (refill, ring_credit(l0b, tile)), core)
                 operand = _read_ring(l0b, tile, k_l0, n + ":QsliCube")
                 logical = 2 * QSLI_TILE_M * real * KDA_HEAD_DIM
-                score = lower.cube(n + ":QsliCube", logical, (q_l0, operand, _credit(l0c, tile)), core,
+                score = lower.cube(n + ":QsliCube", logical, (q_l0, operand, ring_credit(l0c, tile)), core,
                                    dtype="mxfp4", issued=2 * QSLI_TILE_M * QSLI_TILE_N * KDA_HEAD_DIM)
                 score = _read_ring(l0c, tile, score, n + ":fix_done")
                 fixes = []
@@ -604,8 +626,7 @@ def _lower_qsli(lower, p, ready):
                     part += (lower.access(f"{name}:{tensor}", tensor, partial_size * elem, owner=pair[0],
                                           after=(positions,), private=True, write=True, offset=core * p.topk * elem),)
             parts.append((core, partial_size, part))
-        deps = tuple(dep for _, _, group in parts for dep in group)
-        owner = query % spec.aiv_budget
+        deps = tuple(dep for _, _, group in parts for dep in group) if p.candidates else query_ready
         if p.split_parts > 1:
             barrier = lower.stage(f"qsli:{query}:ld_barrier", deps, launch_wide=True)
             reads = [
@@ -616,6 +637,9 @@ def _lower_qsli(lower, p, ready):
             ]
             deps = (lower.vector(f"qsli:{query}:LdMergeStage", sum(part[1] for part in parts),
                                  tuple(reads), owner, "sort_topk"),)
+        if p.topk > p.candidates:
+            deps = (lower.vector(f"qsli:{query}:pad_topk", 2 * (p.topk - p.candidates), deps, owner,
+                                 index=-1, value="-inf"),)
         query_ready = tuple(lower.access(
             f"qsli:{query}:{tensor}", f"qsli:{tensor}", p.topk * elem, owner=owner, after=deps,
             write=True, offset=query * p.topk * elem,
@@ -632,7 +656,9 @@ def _lower_mqsmla(lower, p, ready):
     )
     deferred = []
     partial_publications = []
+    table = p.page_table or p.block_table
     for query in range(p.queries):
+        sparse = p.sparse_rows(query)
         start, partials = 0, []
         for part, size in enumerate(sizes):
             core = (query * p.split_parts + part) % spec.aic_budget
@@ -641,18 +667,37 @@ def _lower_mqsmla(lower, p, ready):
             q = lower.access(name + ":q", "mqsmla:q", h * d * BF16_BYTES, after=(ready,), owner=core, cube=True,
                              offset=query * h * d * BF16_BYTES)
             state = (q,)
+            if p.has_sink or p.sink_size:
+                state += (lower.access(name + ":sink", "mqsmla:sink", (p.sink_size or h) * FP32_BYTES,
+                                       after=(ready,), owner=vector),)
             ring = RingBuffer(die=lower.plan.die, owner=core, pool="l1", allocation=name + ":kv_l1", depth=MQSMLA_KV_DEPTH)
             for i, pos in enumerate(range(start, start + size, MQSMLA_KV_TILE)):
                 n = f"{name}:kv:{i}"
                 end = min(pos + MQSMLA_KV_TILE, start + size)
                 rows = end - pos
                 ori, cmp = max(0, min(end, p.n_ori) - pos), max(0, end - max(pos, p.n_ori))
-                indexed = lower.vector(n + ":pa_addresses", rows, (ready,), vector)
-                k1 = lower.access(n + ":ori", "mqsmla:ori", ori * KV_ROW_BYTES_ORI, owner=vector,
-                                  after=(indexed, _credit(ring, i)), offset=pos * KV_ROW_BYTES_ORI)
-                k2 = lower.access(n + ":cmp", "mqsmla:cmp", cmp * KV_ROW_BYTES_CMP, owner=vector,
-                                  after=(indexed, _credit(ring, i)), offset=max(0, pos - p.n_ori) * KV_ROW_BYTES_CMP)
-                dq = lower.vector(n + ":dequant_kv", rows * d, (k1, k2), vector)
+                reads = []
+                for bank, count, base, width in (
+                    ("ori", ori, pos, KV_ROW_BYTES_ORI), ("cmp", cmp, max(pos, p.n_ori), KV_ROW_BYTES_CMP),
+                ):
+                    if not count:
+                        continue
+                    first = base if bank == "ori" else base - p.n_ori
+                    indices = sparse[base:base + count] if sparse else range(first, first + count)
+                    deps = (lower.access(f"{n}:{bank}:indices", f"mqsmla:{bank}:indices", count * INT32_BYTES,
+                                         owner=vector, after=(ready,), offset=(query * total + base) * INT32_BYTES),)
+                    pages = tuple(divmod(index, p.page_size) for index in indices)
+                    if table:
+                        words = tuple(AddressRun(page * INT32_BYTES, 1, INT32_BYTES, INT32_BYTES)
+                                      for page in dict.fromkeys(page for page, _ in pages))
+                        deps = (lower.access(f"{n}:{bank}:block_table", f"mqsmla:{bank}:block_table",
+                                             len(words) * INT32_BYTES, after=deps, owner=vector, runs=words),)
+                    runs = tuple(AddressRun(((table[page] if table else page) * p.page_size + row) * width,
+                                            1, width, width) for page, row in pages)
+                    indexed = lower.vector(f"{n}:{bank}:pa_addresses", count, deps, vector)
+                    reads.append(lower.access(f"{n}:{bank}", f"mqsmla:{bank}", count * width, owner=vector,
+                                              after=(indexed, ring_credit(ring, i)), runs=runs))
+                dq = lower.vector(n + ":dequant_kv", rows * d, reads, vector)
                 kv = lower.local(n + ":ub_to_l1", "mte3", rows * d * BF16_BYTES, (dq,), vector)
                 publish = _read_ring(ring, i, kv, n + ":pv")
                 qk = lower.cube(n + ":qk", 2 * h * rows * d, (q, publish), core)
@@ -671,7 +716,7 @@ def _lower_mqsmla(lower, p, ready):
                 partials.append((partial, offset))
                 partial_publications.append(partial)
             else:
-                partials.append((state[-1], 0))
+                partials.append((lower.stage(name + ":done", state) if len(state) > 1 else state[-1], 0))
             start += size
         deferred.append(tuple(partials))
     barrier = lower.stage("mqsmla:fd_barrier", partial_publications, launch_wide=True) if partial_publications else None
