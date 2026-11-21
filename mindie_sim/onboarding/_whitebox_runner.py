@@ -50,6 +50,8 @@ from .contracts import (
 
 _MIN_WORKLOAD_TRACE_LIMIT = 65536
 _TRACE_PER_OP_FACTOR = 256
+_TRACE_PER_SEQ_FACTOR = 128
+_MAX_WORKLOAD_TRACE_LIMIT = 524288
 _DEFAULT_AIV_PER_AIC_RATIO = 2
 _PERIODIC_BOUNDARY_REPS = 2
 _OBSERVER_COMPACT_THRESHOLD = 4096
@@ -276,7 +278,7 @@ def _build_executed_witness_program_dag(
         for dep in getattr(op, "deps", ()) or ():
             src_idx = node_idx.get((replica, str(dep)))
             if src_idx is not None and src_idx != dst_idx:
-                edges.append({"src": src_idx, "dst": dst_idx, "lag_ns": 0})
+                edges.append({"src": src_idx, "dst": dst_idx, "wire_ns": 0})
     if not node_quanta:
         node_quanta = [max(row_ns)]
     lean_dag = {"node_quantum_ns": node_quanta, "edges": edges}
@@ -464,6 +466,8 @@ def _run_graphs_on_real_engine(
     start_event_name: str,
     end_event_name: str,
     external_inputs: Mapping[str, float] | None,
+    family_registry: Any = None,
+    sequences: int = 1,
 ) -> tuple[Any, Any, Any, float, float, _BusyUnionObserver]:
     from mindie_sim.prediction.cohort_traffic import bind_cohort_traffic
     from mindie_sim.prediction.cost import CostLedger
@@ -476,14 +480,17 @@ def _run_graphs_on_real_engine(
     from mindie_sim.schema.operators import IterationWork
     from mindie_sim.schema.workload import IterationPlan
 
-    ctx = EvaluationContext.create(sim_case)
-    book = RecipeBook.from_mapping(sim_case.runtime.kernels)
+    book = RecipeBook.from_mapping(sim_case.runtime.kernels, family_registry=family_registry)
+    ctx = EvaluationContext.create(sim_case, book)
     expanded = {r: tuple(book.expand(items)) for r, items in graphs.items()}
     expanded = bind_cohort_traffic(sim_case, expanded)
     external = dict(external_inputs or {})
     groups = cohorts(sim_case.runtime.parallel, sim_case.machine)
     op_count = sum(len(group) for group in expanded.values())
-    trace_limit = max(_MIN_WORKLOAD_TRACE_LIMIT, op_count * _TRACE_PER_OP_FACTOR)
+    trace_limit = min(
+        _MAX_WORKLOAD_TRACE_LIMIT,
+        max(_MIN_WORKLOAD_TRACE_LIMIT, op_count * _TRACE_PER_OP_FACTOR, int(sequences) * _TRACE_PER_SEQ_FACTOR),
+    )
     execution = Execution(
         sim_case, ctx.cost, recipes=book, bindings=ctx.bindings,
         ledger=CostLedger(), include_submission=False,
@@ -624,11 +631,13 @@ class WhiteboxSpineRunner:
             "analysis_input" in op.deps for ops in graphs.values() for op in ops
         ) else None
         engine, start_ev, end_ev, elapsed_ms, busy_ms, observer = _run_graphs_on_real_engine(
-            sim_case,
+            prepared.case,
             graphs,
             start_event_name=case.boundary.start_event,
             end_event_name=case.boundary.end_event,
             external_inputs=external_inputs,
+            family_registry=spine.families,
+            sequences=sequences,
         )
         elapsed_ns = int(round(elapsed_ms * NS_PER_MS))
         busy_ns = int(round(busy_ms * NS_PER_MS))

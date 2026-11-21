@@ -181,13 +181,13 @@ def family_default_tiling_axes(
     if clean_family in _SPARSE_INDEXER_FAMILIES:
         tk = int(topk_threshold) if topk_threshold is not None else LIGHTNING_TOPK_ABOVE_THRESHOLD
         bounds_rule = default_topk_abi_rule(
-            above_threshold=tk,
+            above_threshold=LIGHTNING_TOPK_ABOVE_THRESHOLD,
             divisor=1,
             max_value=LIGHTNING_TOPK_MAX_VALUE,
             arch_presets=(),
         )
         dav22_div_rule = default_topk_abi_rule(
-            above_threshold=tk,
+            above_threshold=LIGHTNING_TOPK_ABOVE_THRESHOLD,
             divisor=LIGHTNING_TOPK_DIVISOR,
             max_value=LIGHTNING_TOPK_MAX_VALUE,
             arch_presets=(ARCH_PRESET_22,),
@@ -220,7 +220,7 @@ def family_default_tiling_axes(
         thresholds_list.append(("topk", tk_val))
         rules.append(
             default_topk_abi_rule(
-                above_threshold=tk_val,
+                above_threshold=LIGHTNING_TOPK_ABOVE_THRESHOLD,
                 divisor=1,
                 max_value=LIGHTNING_TOPK_MAX_VALUE,
                 arch_presets=(),
@@ -228,7 +228,7 @@ def family_default_tiling_axes(
         )
         rules.append(
             default_topk_abi_rule(
-                above_threshold=tk_val,
+                above_threshold=LIGHTNING_TOPK_ABOVE_THRESHOLD,
                 divisor=LIGHTNING_TOPK_DIVISOR,
                 max_value=LIGHTNING_TOPK_MAX_VALUE,
                 arch_presets=(ARCH_PRESET_22,),

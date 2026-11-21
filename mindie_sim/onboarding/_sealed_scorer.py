@@ -39,6 +39,7 @@ from .contracts import (
     DEFAULT_CLOCK_OPERATOR, DEFAULT_HELDOUT_APE_THRESHOLD_PCT, DISPLAY_ROUND_DIGITS,
     FORBIDDEN_CALLER_PREDICTION_KEYS, NS_PER_MS, NS_PER_US, PERCENT_SCALE,
     VALID_CLOCK_OPERATORS, assert_sanitized_payload, sanitize_public_alias,
+    sanitize_public_capture_uri, sanitize_public_run_id,
 )
 
 STANDARD_LEVEL_BOUNDARY_KINDS: Mapping[str, str] = {
@@ -682,7 +683,9 @@ def score_sealed_gate_cases(
             "engine_busy_union_ns": clk.get("busy_union_ns"), "engine_elapsed_span_ns": clk.get("elapsed_span_ns"),
             "program_dag_sha256": clk.get("program_dag_sha256", ""),
             "executed_op_families": clk.get("executed_op_families", []), "engine_uid": clk.get("engine_uid", ""),
-            "raw_sha256": meta["raw_sha256"], "capture_uri": meta["capture_uri"], "run_uid": meta["run_uid"],
+            "raw_sha256": meta["raw_sha256"],
+            "capture_uri": sanitize_public_capture_uri(meta["capture_uri"], raw_sha256=meta["raw_sha256"]),
+            "run_uid": sanitize_public_run_id(meta["run_uid"]),
             "event_ids": meta["event_ids"], "device_ranks": meta["device_ranks"],
             "start_event": meta["start_event"], "end_event": meta["end_event"],
             "clock_domain": meta["clock_domain"], "parent_digests": meta["parent_digests"],

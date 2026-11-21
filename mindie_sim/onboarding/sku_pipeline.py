@@ -80,6 +80,7 @@ from .contracts import (
     SHORT_DIGEST_LEN,
     GateCheckOutcome,
     assert_sanitized_payload,
+    collect_receipt_warnings,
     read_bounded_json,
     sanitize_lease_for_receipt,
     write_atomic_json,
@@ -108,6 +109,7 @@ def validate_512_400k(
     capture_root: str | Path | None = None,
     capture_files: Mapping[str, str | Path] | None = None,
     require_capture_files: bool = True,
+    ssh_runner: Callable[[str, str, int], Any] | None = None,
 ) -> dict[str, Any]:
     """Stage 3: Orchestrate and score disjoint 2D Anchor + Cliff 512..400K + L1/L2/L3."""
     cap_threshold = validate_strict_threshold_pct(threshold_pct)
@@ -179,7 +181,19 @@ def validate_512_400k(
             else:
                 raise ModelingError("validate_512_400k_observations_invalid")
         elif profiler_runner is not None:
-            obs_rows = list(profiler_runner(plan_doc))
+            if lease_acquirer is not None:
+                req_npus = required_ranks_for_plan(plan_doc)
+                lease_ttl_s = DEFAULT_L0_BUDGET_S + DEFAULT_CLEANUP_GRACE_S
+                raw_lease: Mapping[str, Any] = {}
+                with lease_acquirer(sku, lease_ttl_s) as lease_info:
+                    raw_lease = lease_info if isinstance(lease_info, Mapping) else {}
+                    validate_host_queue_grant(
+                        raw_lease, required_devices=req_npus, min_ttl_seconds=lease_ttl_s
+                    )
+                    obs_rows = list(profiler_runner(plan_doc))
+                lease_public = sanitize_lease_for_receipt(raw_lease)
+            else:
+                obs_rows = list(profiler_runner(plan_doc))
         elif live_profiler:
             req_npus = required_ranks_for_plan(plan_doc)
             lease_ttl_s = DEFAULT_L0_BUDGET_S + DEFAULT_CLEANUP_GRACE_S
@@ -195,7 +209,7 @@ def validate_512_400k(
                     coordinator_bin=coordinator_bin,
                 )
             )
-            raw_lease: Mapping[str, Any] = {}
+            raw_lease = {}
             with lease_ctx as lease_info:
                 raw_lease = lease_info if isinstance(lease_info, Mapping) else {}
                 _, fence, granted, _ = validate_host_queue_grant(
@@ -210,6 +224,7 @@ def validate_512_400k(
                     fence_token=fence,
                     timeout_s=DEFAULT_L0_BUDGET_S,
                     capture_out_dir=eff_capture_root,
+                    ssh_runner=ssh_runner,
                 )
                 if abi_rejection_results is None and live_abi:
                     abi_rejection_results = live_abi
@@ -301,9 +316,10 @@ def validate_512_400k(
         "heldout_summary": scored["heldout_summary"], "train_summary": scored["train_summary"],
         "residuals": scored["residuals"], "plan": plan_doc,
     }
-    if lease_public.get("receipt_unconfirmed"):
-        report["receipt_unconfirmed"] = True
-        report["receipt_warning"] = lease_public.get("receipt_warning", "")
+    rec_unconf, rec_warn = collect_receipt_warnings(lease_public)
+    if rec_unconf or rec_warn:
+        report["receipt_unconfirmed"] = rec_unconf
+        report["receipt_warning"] = rec_warn
     report["report_hmac"] = sign_stage_report("sku_validation", report)
     if report_out is not None:
         write_atomic_json(report_out, report)
@@ -337,6 +353,8 @@ def verify_sku_gates(
 ) -> dict[str, Any]:
     """Stage 4: Execute multilevel, mandatory SKU/CANN primitives, joined Lean, repo gates, receipt."""
     cap_threshold = validate_strict_threshold_pct(threshold_pct)
+    if not require_capture_files:
+        raise ModelingError("release_certification_requires_capture_files")
     root = resolve_repo_root(repo_root)
     val_doc = (
         read_bounded_json(validation_report_json)
@@ -369,7 +387,7 @@ def verify_sku_gates(
             stage3_env = str((val_doc or {}).get("primitives_envelope_sha256") or "").strip()
             env_match = (
                 True
-                if multilevel_manifest_json is not None or val_doc is None
+                if val_doc is None
                 else (bool(stage3_env) and stage3_env == table.envelope_sha256)
             )
             prim_ok = cal_cnt > 0 and sku_match and cann_match and env_match
@@ -457,7 +475,17 @@ def verify_sku_gates(
                 artifacts["heldout_max_ape_pct"] = str(round(float(max_ape), DISPLAY_ROUND_DIGITS))
 
     val_hmac_ok = val_doc is not None and verify_stage_report("sku_validation", val_doc)
-    live_verified = val_hmac_ok and verify_live_silicon_evidence(val_doc, stage2_lease=stage2_lease)
+    prim_env_matches_val = (
+        parsed_table is not None
+        and val_doc is not None
+        and str(val_doc.get("primitives_envelope_sha256") or "").strip() == parsed_table.envelope_sha256
+    )
+    live_verified = (
+        val_hmac_ok
+        and ml_outcome.passed
+        and prim_env_matches_val
+        and verify_live_silicon_evidence(val_doc, stage2_lease=stage2_lease)
+    )
     if acquisition_mode == "live_silicon" and not live_verified:
         gates.append(
             GateCheckOutcome(
@@ -468,14 +496,16 @@ def verify_sku_gates(
     eff_mode: Literal["live_silicon", "offline_reverify"] = (
         "live_silicon" if (live_verified and acquisition_mode != "offline_reverify") else "offline_reverify"
     )
+    rec_unconf, rec_warn = collect_receipt_warnings(val_doc, stage2_lease)
     receipt = seal_onboarding_receipt(
         kind="sku", target_id=sku, sku=sku, gates=gates, artifacts=artifacts,
         diagnosis_report=diagnosis_report, acquisition_mode=eff_mode,
+        receipt_unconfirmed=rec_unconf, receipt_warning=rec_warn,
     )
     receipt_dict = receipt.to_dict()
     if out_receipt is not None:
         write_atomic_json(out_receipt, receipt_dict)
-    return {
+    out: dict[str, Any] = {
         "stage": "verify-gates", "sku": sku, "ok": receipt.ok,
         "status": receipt.status, "acquisition_mode": receipt.acquisition_mode,
         "receipt_sha256": receipt.receipt_sha256,
@@ -483,6 +513,10 @@ def verify_sku_gates(
         "diagnosis_triggered": diagnosis_report is not None,
         "receipt": receipt_dict,
     }
+    if rec_unconf or rec_warn:
+        out["receipt_unconfirmed"] = rec_unconf
+        out["receipt_warning"] = rec_warn
+    return out
 
 
 def run_sku_onboarding(
@@ -515,9 +549,12 @@ def run_sku_onboarding(
     capture_root: str | Path | None = None,
     capture_files: Mapping[str, str | Path] | None = None,
     require_capture_files: bool = True,
+    ssh_runner: Callable[[str, str, int], Any] | None = None,
 ) -> dict[str, Any]:
     """Execute all 4 New-SKU onboarding stages end-to-end with real owners and fail-closed gating."""
     cap_threshold = validate_strict_threshold_pct(threshold_pct)
+    if not require_capture_files:
+        raise ModelingError("release_certification_requires_capture_files")
     base_out = Path(out_dir) if out_dir is not None else None
     stage1 = probe_soc(
         endpoint_alias=endpoint_alias, probe_json=probe_json,
@@ -553,6 +590,7 @@ def run_sku_onboarding(
         lease_acquirer=lease_acquirer, l0_runner=l0_runner, fabric_runner=fabric_runner,
         live_bench=live_bench, repo_root=repo_root, profiler_root=profiler_root,
         coordinator_bin=coordinator_bin, profile_override=profile_override,
+        ssh_runner=ssh_runner,
     )
     if not stage2["ok"]:
         return {
@@ -561,35 +599,43 @@ def run_sku_onboarding(
             "stages": {"probe-soc": stage1, "calibrate-l0-and-fabric": stage2},
         }
 
-    eff_cap_root = capture_root if capture_root is not None else ((base_out / "captures") if (live_profiler and base_out) else None)
-    stage3 = validate_512_400k(
-        sku=resolved_sku, observations_json=observations_json,
-        abi_rejection_results=abi_rejection_results,
-        train_manifest_json=stage2["train_manifest"],
-        primitives_json=stage2["primitives_payload"],
-        plan_out=(base_out / "cliff_plan.json") if base_out else None,
-        report_out=(base_out / "validation_512_400k.json") if base_out else None,
-        threshold_pct=cap_threshold, runner=runner, profiler_runner=profiler_runner,
-        live_profiler=live_profiler, endpoint_alias=endpoint_alias,
-        profiler_root=profiler_root, lease_acquirer=lease_acquirer,
-        coordinator_bin=coordinator_bin, profile_override=profile_override,
-        capture_root=eff_cap_root, capture_files=capture_files,
-        require_capture_files=require_capture_files,
+    eff_cap_root: str | Path | None = capture_root if capture_root is not None else ((base_out / "captures") if (live_profiler and base_out) else None)
+    cap_ctx: AbstractContextManager[str | None] = (
+        tempfile.TemporaryDirectory(prefix="msim-sku-runall-cap-")
+        if (live_profiler and eff_cap_root is None and observations_json is None and profiler_runner is None)
+        else nullcontext(None)
     )
-    stage4 = verify_sku_gates(
-        sku=resolved_sku, validation_report_json=stage3,
-        lean_bounds_json=lean_bounds_json, primitives_json=stage2["primitives_payload"],
-        expected_cann_version=stage2["cann_version"], profile_override=profile_override,
-        capture_root=eff_cap_root, capture_files=capture_files,
-        require_capture_files=require_capture_files,
-        repo_root=repo_root, threshold_pct=cap_threshold,
-        run_repo_gates=run_repo_gates, orthogonality_base=orthogonality_base,
-        out_receipt=(base_out / "sku_onboarding_receipt.json") if base_out else None,
-        diagnosis_out=(base_out / "tail_cluster_diagnosis.json") if base_out else None,
-        stage2_lease=stage2.get("lease"),
-    )
+    with cap_ctx as tmp_cap_dir:
+        if tmp_cap_dir is not None:
+            eff_cap_root = Path(tmp_cap_dir)
+        stage3 = validate_512_400k(
+            sku=resolved_sku, observations_json=observations_json,
+            abi_rejection_results=abi_rejection_results,
+            train_manifest_json=stage2["train_manifest"],
+            primitives_json=stage2["primitives_payload"],
+            plan_out=(base_out / "cliff_plan.json") if base_out else None,
+            report_out=(base_out / "validation_512_400k.json") if base_out else None,
+            threshold_pct=cap_threshold, runner=runner, profiler_runner=profiler_runner,
+            live_profiler=live_profiler, endpoint_alias=endpoint_alias,
+            profiler_root=profiler_root, lease_acquirer=lease_acquirer,
+            coordinator_bin=coordinator_bin, profile_override=profile_override,
+            capture_root=eff_cap_root, capture_files=capture_files,
+            require_capture_files=True, ssh_runner=ssh_runner,
+        )
+        stage4 = verify_sku_gates(
+            sku=resolved_sku, validation_report_json=stage3,
+            lean_bounds_json=lean_bounds_json, primitives_json=stage2["primitives_payload"],
+            expected_cann_version=stage2["cann_version"], profile_override=profile_override,
+            capture_root=eff_cap_root, capture_files=capture_files,
+            require_capture_files=True,
+            repo_root=repo_root, threshold_pct=cap_threshold,
+            run_repo_gates=run_repo_gates, orthogonality_base=orthogonality_base,
+            out_receipt=(base_out / "sku_onboarding_receipt.json") if base_out else None,
+            diagnosis_out=(base_out / "tail_cluster_diagnosis.json") if base_out else None,
+            stage2_lease=stage2.get("lease"),
+        )
     all_ok = bool(stage1["ok"] and stage2["ok"] and stage3["ok"] and stage4["ok"])
-    return {
+    out: dict[str, Any] = {
         "stage": "run-all", "sku": resolved_sku, "ok": all_ok,
         "status": stage4["status"] if all_ok else "failed",
         "acquisition_mode": stage4["acquisition_mode"],
@@ -601,6 +647,10 @@ def run_sku_onboarding(
             "verify-gates": stage4,
         },
     }
+    if stage4.get("receipt_unconfirmed") or stage4.get("receipt_warning"):
+        out["receipt_unconfirmed"] = bool(stage4.get("receipt_unconfirmed"))
+        out["receipt_warning"] = str(stage4.get("receipt_warning") or "")
+    return out
 
 
 __all__ = [

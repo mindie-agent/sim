@@ -49,6 +49,7 @@ from .contracts import (
     assert_sanitized_payload,
     canonical_json_bytes,
     compute_receipt_sha256,
+    sanitize_public_warning,
     utc_now_iso,
 )
 
@@ -342,6 +343,8 @@ def seal_onboarding_receipt(
     artifacts: Mapping[str, str],
     diagnosis_report: Mapping[str, Any] | None = None,
     acquisition_mode: Literal["live_silicon", "offline_reverify"] = "offline_reverify",
+    receipt_unconfirmed: bool = False,
+    receipt_warning: str = "",
 ) -> OnboardingReceipt:
     """Build, sanitize, and SHA-256-seal an ``OnboardingReceipt``."""
     schema = (
@@ -358,7 +361,9 @@ def seal_onboarding_receipt(
     )
     sorted_artifacts = tuple(sorted((str(k), str(v)) for k, v in artifacts.items()))
     created_utc = utc_now_iso()
-    draft = {
+    clean_warning = sanitize_public_warning(receipt_warning) if receipt_warning else ""
+    eff_unconf = bool(receipt_unconfirmed)
+    draft: dict[str, Any] = {
         "schema": schema,
         "kind": kind,
         "target_id": str(target_id),
@@ -371,6 +376,9 @@ def seal_onboarding_receipt(
         "artifacts": {k: v for k, v in sorted_artifacts},
         "diagnosis_report": dict(diagnosis_report) if diagnosis_report else None,
     }
+    if eff_unconf or clean_warning:
+        draft["receipt_unconfirmed"] = eff_unconf
+        draft["receipt_warning"] = clean_warning
     assert_sanitized_payload(draft, field_name="onboarding_receipt")
     digest = compute_receipt_sha256(draft)
     return OnboardingReceipt(
@@ -386,6 +394,8 @@ def seal_onboarding_receipt(
         diagnosis_report=diagnosis_report,
         receipt_sha256=digest,
         acquisition_mode=acquisition_mode,
+        receipt_unconfirmed=eff_unconf,
+        receipt_warning=clean_warning,
     )
 
 

@@ -105,7 +105,19 @@ _OPAQUE_ALIAS_RE = re.compile(r"^ep-[0-9a-f]{12}$")
 _OPAQUE_CAMPAIGN_RE = re.compile(r"^camp-[0-9a-f]{12}$")
 _OPAQUE_RUN_RE = re.compile(r"^run-[0-9a-f]{12}$")
 _OPAQUE_LEASE_RE = re.compile(r"^lease-[0-9a-f]{16}$")
-_OPAQUE_WARNING_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
+_OPAQUE_WARNING_REF_RE = re.compile(r"^([a-z][a-z0-9_]{1,63}):ref=([0-9a-f]{12})$")
+_SAFE_HEX_CAPTURE_NAME_RE = re.compile(r"^[0-9a-f]{64}(?:\.jsonl?)?$")
+_KNOWN_PUBLIC_WARNING_CODES = frozenset({
+    "receipt_warning",
+    "receipt_unconfirmed",
+    "host_queue_lease_acquire_unconfirmed",
+    "host_queue_lease_release_unconfirmed",
+    "lease_acquire_warning",
+    "lease_release_warning",
+    "release_delayed",
+    "acquire_delayed",
+    "coordinator_receipt_unconfirmed",
+})
 _SUBPROCESS_NO_WINDOW = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
 
@@ -406,9 +418,11 @@ class OnboardingReceipt:
     diagnosis_report: Mapping[str, Any] | None
     receipt_sha256: str
     acquisition_mode: Literal["live_silicon", "offline_reverify"] = "offline_reverify"
+    receipt_unconfirmed: bool = False
+    receipt_warning: str = ""
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "schema": self.schema,
             "kind": self.kind,
             "target_id": self.target_id,
@@ -422,6 +436,10 @@ class OnboardingReceipt:
             "diagnosis_report": dict(self.diagnosis_report) if self.diagnosis_report else None,
             "receipt_sha256": self.receipt_sha256,
         }
+        if self.receipt_unconfirmed or self.receipt_warning:
+            out["receipt_unconfirmed"] = bool(self.receipt_unconfirmed)
+            out["receipt_warning"] = self.receipt_warning
+        return out
 
 
 def utc_now_iso() -> str:
@@ -483,20 +501,64 @@ def sanitize_public_run_id(run_id: str) -> str:
     return f"run-{hashlib.sha256(seed).hexdigest()[:_OPAQUE_ALIAS_HEX]}"
 
 
+def _sanitize_single_warning(segment: str) -> str:
+    clean = segment.strip()
+    if not clean:
+        return ""
+    matched = _OPAQUE_WARNING_REF_RE.fullmatch(clean)
+    if matched and matched.group(1) in _KNOWN_PUBLIC_WARNING_CODES:
+        return clean
+    primary = clean.split(":", 1)[0].strip().lower()
+    code = primary if primary in _KNOWN_PUBLIC_WARNING_CODES else "receipt_warning"
+    ref = hashlib.sha256(clean.encode("utf-8")).hexdigest()[:_OPAQUE_ALIAS_HEX]
+    return f"{code}:ref={ref}"
+
+
 def sanitize_public_warning(warning: str) -> str:
-    """Reduce any free-form warning into a structured opaque code + digest ref."""
+    """Reduce any free-form warning into fixed known warning code(s) + opaque ref hash."""
     raw = str(warning or "").strip()
     if not raw:
         return ""
-    parts = [p.strip().lower() for p in raw.split(":") if p.strip()]
-    primary = parts[0] if parts and _OPAQUE_WARNING_CODE_RE.fullmatch(parts[0]) else "receipt_warning"
-    secondary = parts[1] if len(parts) > 1 and _OPAQUE_WARNING_CODE_RE.fullmatch(parts[1]) else ""
-    if len(parts) == 1 and _OPAQUE_WARNING_CODE_RE.fullmatch(parts[0]):
-        return primary
-    if len(parts) == 2 and secondary:
-        return f"{primary}:{secondary}"
-    ref = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:_OPAQUE_ALIAS_HEX]
-    return f"{primary}:{secondary}:ref={ref}" if secondary else f"{primary}:ref={ref}"
+    out: list[str] = []
+    for part in raw.split(";"):
+        item = _sanitize_single_warning(part)
+        if item and item not in out:
+            out.append(item)
+    return "; ".join(out)
+
+
+def sanitize_public_capture_uri(capture_uri: str, *, raw_sha256: str = "") -> str:
+    """Rewrite any capture locator to opaque ``capture://<sha16>/<safe_name>``."""
+    raw_uri = str(capture_uri or "").strip()
+    norm_sha = str(raw_sha256 or "").strip().lower()
+    if norm_sha.startswith("sha256:"):
+        norm_sha = norm_sha[7:]
+    if len(norm_sha) != SHA256_HEX_LENGTH or not all(c in "0123456789abcdef" for c in norm_sha):
+        norm_sha = hashlib.sha256((raw_uri or "capture").encode("utf-8")).hexdigest()
+    tail = raw_uri.rsplit("/", 1)[-1].strip().lower() if raw_uri else ""
+    safe_name = tail if _SAFE_HEX_CAPTURE_NAME_RE.fullmatch(tail) else f"{norm_sha}.json"
+    return f"capture://{norm_sha[:SHORT_DIGEST_LEN]}/{safe_name}"
+
+
+def collect_receipt_warnings(*sources: Mapping[str, Any] | None) -> tuple[bool, str]:
+    """Accumulate ``receipt_unconfirmed`` and sanitized ``receipt_warning`` across stages/leases."""
+    unconfirmed = False
+    warnings: list[str] = []
+    for src in sources:
+        if not isinstance(src, Mapping):
+            continue
+        for item in (src, src.get("lease") if isinstance(src.get("lease"), Mapping) else None):
+            if not isinstance(item, Mapping):
+                continue
+            if item.get("receipt_unconfirmed"):
+                unconfirmed = True
+            raw_w = str(item.get("receipt_warning") or "").strip()
+            if raw_w:
+                for seg in sanitize_public_warning(raw_w).split(";"):
+                    s = seg.strip()
+                    if s and s not in warnings:
+                        warnings.append(s)
+    return unconfirmed, "; ".join(warnings)
 
 
 def sanitize_lease_for_receipt(lease_info: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -663,12 +725,14 @@ __all__ = [
     "assert_sanitized_payload",
     "build_capture_uri",
     "canonical_json_bytes",
+    "collect_receipt_warnings",
     "compute_receipt_sha256",
     "default_topk_abi_rule",
     "read_bounded_json",
     "sanitize_lease_for_receipt",
     "sanitize_public_alias",
     "sanitize_public_campaign_id",
+    "sanitize_public_capture_uri",
     "sanitize_public_run_id",
     "sanitize_public_warning",
     "subprocess_window_kwargs",

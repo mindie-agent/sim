@@ -80,6 +80,7 @@ from .contracts import (
     OperatorCliffParameters,
     TilingAxes,
     assert_sanitized_payload,
+    collect_receipt_warnings,
     read_bounded_json,
     sanitize_lease_for_receipt,
     write_atomic_json,
@@ -154,6 +155,7 @@ def bench_and_score_operator(
     capture_root: str | Path | None = None,
     capture_files: Mapping[str, str | Path] | None = None,
     require_capture_files: bool = True,
+    ssh_runner: Callable[[str, str, int], Any] | None = None,
 ) -> dict[str, Any]:
     """Stage 3: Dispatch bench plan (under exact-rank HostQueue lease if live) and score."""
     cap_threshold = validate_strict_threshold_pct(threshold_pct)
@@ -193,7 +195,18 @@ def bench_and_score_operator(
             else:
                 rows = list(captured_json)
         elif bench_dispatcher is not None:
-            rows = list(bench_dispatcher(plan_doc, int(timeout_s)))
+            if lease_acquirer is not None:
+                lease_ttl_s = int(timeout_s) + DEFAULT_CLEANUP_GRACE_S
+                raw_lease: Mapping[str, Any] = {}
+                with lease_acquirer(sku, lease_ttl_s) as lease_info:
+                    raw_lease = lease_info if isinstance(lease_info, Mapping) else {}
+                    validate_host_queue_grant(
+                        raw_lease, required_devices=req_npus, min_ttl_seconds=lease_ttl_s
+                    )
+                    rows = list(bench_dispatcher(plan_doc, int(timeout_s)))
+                lease_public = sanitize_lease_for_receipt(raw_lease)
+            else:
+                rows = list(bench_dispatcher(plan_doc, int(timeout_s)))
         elif live_profiler:
             lease_ttl_s = int(timeout_s) + DEFAULT_CLEANUP_GRACE_S
             lease_ctx = (
@@ -208,7 +221,7 @@ def bench_and_score_operator(
                     coordinator_bin=coordinator_bin,
                 )
             )
-            raw_lease: Mapping[str, Any] = {}
+            raw_lease = {}
             with lease_ctx as lease_info:
                 raw_lease = lease_info if isinstance(lease_info, Mapping) else {}
                 _, fence, granted, _ = validate_host_queue_grant(
@@ -223,6 +236,7 @@ def bench_and_score_operator(
                     fence_token=fence,
                     timeout_s=int(timeout_s),
                     capture_out_dir=eff_capture_root,
+                    ssh_runner=ssh_runner,
                 )
                 if abi_rejection_results is None and live_abi:
                     abi_rejection_results = live_abi
@@ -289,9 +303,10 @@ def bench_and_score_operator(
         "heldout_summary": scored["heldout_summary"], "train_summary": scored["train_summary"],
         "residuals": scored["residuals"],
     }
-    if lease_public.get("receipt_unconfirmed"):
-        report["receipt_unconfirmed"] = True
-        report["receipt_warning"] = lease_public.get("receipt_warning", "")
+    rec_unconf, rec_warn = collect_receipt_warnings(lease_public)
+    if rec_unconf or rec_warn:
+        report["receipt_unconfirmed"] = rec_unconf
+        report["receipt_warning"] = rec_warn
     report["report_hmac"] = sign_stage_report("operator_score", report)
     assert_sanitized_payload(report, field_name="bench_and_score_report")
     if out_score is not None:
@@ -342,6 +357,8 @@ def certify_operator(
 ) -> dict[str, Any]:
     """Stage 4: Enforce complete contract, bound receipts, verified captures, pointwise <10%, joined Lean."""
     cap_threshold = validate_strict_threshold_pct(threshold_pct)
+    if not require_capture_files:
+        raise ModelingError("release_certification_requires_capture_files")
     root = resolve_repo_root(repo_root)
     c_doc = read_bounded_json(contract_report) if isinstance(contract_report, (str, Path)) else dict(contract_report)
     s_doc = read_bounded_json(score_report) if isinstance(score_report, (str, Path)) else dict(score_report)
@@ -404,12 +421,12 @@ def certify_operator(
     captures_ok = True
     capture_err = ""
     if heldout_rows:
-        if capture_root is not None or capture_files is not None:
+        if s_doc.get("capture_files_verified") is not True:
+            captures_ok, capture_err = False, "capture_files_unverified_for_release"
+        else:
             reverify_report_captures(
                 all_score_rows, capture_root=capture_root, capture_files=capture_files, require_capture_files=True
             )
-        elif require_capture_files and s_doc.get("capture_files_verified") is not True:
-            captures_ok, capture_err = False, "capture_files_unverified_for_release"
 
     allowed_impls = {
         str(v).strip()
@@ -541,7 +558,7 @@ def certify_operator(
     if c_doc.get("target"):
         artifacts["operator_target"] = str(c_doc["target"])
 
-    live_verified = s_hmac_ok and verify_live_silicon_evidence(s_doc)
+    live_verified = s_hmac_ok and cliff_ok and verify_live_silicon_evidence(s_doc)
     if acquisition_mode == "live_silicon" and not live_verified:
         gates.append(
             GateCheckOutcome(
@@ -552,15 +569,16 @@ def certify_operator(
     eff_mode: Literal["live_silicon", "offline_reverify"] = (
         "live_silicon" if (live_verified and acquisition_mode != "offline_reverify") else "offline_reverify"
     )
+    rec_unconf, rec_warn = collect_receipt_warnings(s_doc)
     receipt = seal_onboarding_receipt(
         kind="operator", target_id=operator_id, sku=sku,
         gates=gates, artifacts=artifacts, diagnosis_report=diagnosis_report,
-        acquisition_mode=eff_mode,
+        acquisition_mode=eff_mode, receipt_unconfirmed=rec_unconf, receipt_warning=rec_warn,
     )
     receipt_dict = receipt.to_dict()
     if out_receipt is not None:
         write_atomic_json(out_receipt, receipt_dict)
-    return {
+    out: dict[str, Any] = {
         "stage": "certify", "operator_id": operator_id, "sku": sku,
         "ok": receipt.ok, "status": receipt.status, "acquisition_mode": receipt.acquisition_mode,
         "receipt_sha256": receipt.receipt_sha256,
@@ -568,6 +586,10 @@ def certify_operator(
         "diagnosis_triggered": diagnosis_report is not None,
         "receipt": receipt_dict,
     }
+    if rec_unconf or rec_warn:
+        out["receipt_unconfirmed"] = rec_unconf
+        out["receipt_warning"] = rec_warn
+    return out
 
 
 def run_operator_onboarding(
@@ -615,9 +637,12 @@ def run_operator_onboarding(
     capture_root: str | Path | None = None,
     capture_files: Mapping[str, str | Path] | None = None,
     require_capture_files: bool = True,
+    ssh_runner: Callable[[str, str, int], Any] | None = None,
 ) -> dict[str, Any]:
     """Execute all 4 New-Operator onboarding stages end-to-end."""
     cap_threshold = validate_strict_threshold_pct(threshold_pct)
+    if not require_capture_files:
+        raise ModelingError("release_certification_requires_capture_files")
     base_out = Path(out_dir) if out_dir is not None else None
     stage1 = validate_operator_contract(
         target_path=target_path, repo_root=repo_root, refs_root=refs_root, repo_map=repo_map,
@@ -635,28 +660,36 @@ def run_operator_onboarding(
         bytes_per_token=bytes_per_token, topk_threshold=topk_threshold, tiling_axes=tiling_axes,
         plan_out=(base_out / "operator_cliff_plan.json") if base_out else None,
     )
-    eff_cap_root = capture_root if capture_root is not None else ((base_out / "captures") if (live_profiler and base_out) else None)
-    stage3 = bench_and_score_operator(
-        cliff_plan=stage2["plan"], sku=sku, captured_json=captured_json,
-        abi_rejection_results=abi_rejection_results, bench_dispatcher=bench_dispatcher,
-        live_profiler=live_profiler, endpoint_alias=endpoint_alias, profiler_root=profiler_root,
-        lease_acquirer=lease_acquirer, coordinator_bin=coordinator_bin, runner=runner,
-        threshold_pct=cap_threshold,
-        out_score=(base_out / "operator_score_report.json") if base_out else None,
-        capture_root=eff_cap_root, capture_files=capture_files,
-        require_capture_files=require_capture_files,
+    eff_cap_root: str | Path | None = capture_root if capture_root is not None else ((base_out / "captures") if (live_profiler and base_out) else None)
+    cap_ctx: AbstractContextManager[str | None] = (
+        tempfile.TemporaryDirectory(prefix="msim-op-runall-cap-")
+        if (live_profiler and eff_cap_root is None and captured_json is None and bench_dispatcher is None)
+        else nullcontext(None)
     )
-    stage4 = certify_operator(
-        operator_id=operator_id, sku=sku, contract_report=stage1, score_report=stage3,
-        lean_bounds_json=lean_bounds_json, repo_root=repo_root, threshold_pct=cap_threshold,
-        run_repo_gates=run_repo_gates, orthogonality_base=orthogonality_base,
-        capture_root=eff_cap_root, capture_files=capture_files,
-        require_capture_files=require_capture_files,
-        out_receipt=(base_out / "operator_onboarding_receipt.json") if base_out else None,
-        diagnosis_out=(base_out / "operator_tail_diagnosis.json") if base_out else None,
-    )
+    with cap_ctx as tmp_cap_dir:
+        if tmp_cap_dir is not None:
+            eff_cap_root = Path(tmp_cap_dir)
+        stage3 = bench_and_score_operator(
+            cliff_plan=stage2["plan"], sku=sku, captured_json=captured_json,
+            abi_rejection_results=abi_rejection_results, bench_dispatcher=bench_dispatcher,
+            live_profiler=live_profiler, endpoint_alias=endpoint_alias, profiler_root=profiler_root,
+            lease_acquirer=lease_acquirer, coordinator_bin=coordinator_bin, runner=runner,
+            threshold_pct=cap_threshold,
+            out_score=(base_out / "operator_score_report.json") if base_out else None,
+            capture_root=eff_cap_root, capture_files=capture_files,
+            require_capture_files=True, ssh_runner=ssh_runner,
+        )
+        stage4 = certify_operator(
+            operator_id=operator_id, sku=sku, contract_report=stage1, score_report=stage3,
+            lean_bounds_json=lean_bounds_json, repo_root=repo_root, threshold_pct=cap_threshold,
+            run_repo_gates=run_repo_gates, orthogonality_base=orthogonality_base,
+            capture_root=eff_cap_root, capture_files=capture_files,
+            require_capture_files=True,
+            out_receipt=(base_out / "operator_onboarding_receipt.json") if base_out else None,
+            diagnosis_out=(base_out / "operator_tail_diagnosis.json") if base_out else None,
+        )
     all_ok = bool(stage1["ok"] and stage2["ok"] and stage3["ok"] and stage4["ok"])
-    return {
+    out: dict[str, Any] = {
         "stage": "run-all", "operator_id": operator_id, "sku": sku,
         "ok": all_ok,
         "status": stage4["status"] if all_ok else "failed",
@@ -669,6 +702,10 @@ def run_operator_onboarding(
             "certify": stage4,
         },
     }
+    if stage4.get("receipt_unconfirmed") or stage4.get("receipt_warning"):
+        out["receipt_unconfirmed"] = bool(stage4.get("receipt_unconfirmed"))
+        out["receipt_warning"] = str(stage4.get("receipt_warning") or "")
+    return out
 
 
 __all__ = [

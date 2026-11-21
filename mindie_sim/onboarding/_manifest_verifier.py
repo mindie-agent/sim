@@ -49,6 +49,8 @@ from .contracts import (
     PERCENT_SCALE,
     GateCheckOutcome,
     read_bounded_json,
+    sanitize_public_capture_uri,
+    sanitize_public_run_id,
 )
 
 _ENGINE_RECEIPT_PREFIX = "capture://engine-receipt/"
@@ -206,7 +208,36 @@ def _evaluate_manifest_path(
             "point_id": pid,
             "split": gc.split,
             "measured_p99_ns": auth_p99,
+            "raw_sha256": gc.boundary.raw_sha256,
+            "capture_uri": sanitize_public_capture_uri(gc.boundary.capture_uri, raw_sha256=gc.boundary.raw_sha256),
+            "run_uid": sanitize_public_run_id(gc.boundary.run_uid),
         }
+
+    if validation_doc is not None:
+        manifest_pairs = {(gc.case_id, _norm_digest(gc.boundary.raw_sha256)) for gc in parsed_cases}
+        report_pairs = {
+            (str(r.get("case_id") or ""), _norm_digest(str(r.get("raw_sha256") or "")))
+            for r in (validation_doc.get("residuals") or ())
+            if isinstance(r, Mapping) and r.get("case_id") and r.get("raw_sha256")
+        }
+        if not manifest_pairs or not report_pairs or manifest_pairs != report_pairs:
+            return (
+                GateCheckOutcome(
+                    "multilevel_gate", False, "fail",
+                    "manifest_validation_report_capture_digest_mismatch",
+                ),
+                [],
+            )
+        if primitive_table is not None:
+            val_env = str(validation_doc.get("primitives_envelope_sha256") or "").strip()
+            if not val_env or val_env != primitive_table.envelope_sha256:
+                return (
+                    GateCheckOutcome(
+                        "multilevel_gate", False, "fail",
+                        "manifest_validation_report_primitives_envelope_mismatch",
+                    ),
+                    [],
+                )
 
     manifest = Manifest(
         manifest_id=str(raw_manifest.get("manifest_id") or f"manifest-{sku}"),
@@ -273,6 +304,9 @@ def _evaluate_manifest_path(
             "engine_elapsed_span_ns": clk.get("elapsed_span_ns"),
             "program_dag_sha256": clk.get("program_dag_sha256", ""),
             "engine_uid": clk.get("engine_uid", ""),
+            "raw_sha256": meta["raw_sha256"],
+            "capture_uri": meta["capture_uri"],
+            "run_uid": meta["run_uid"],
         })
 
     missing_heldout = sorted(set(held_plan_by_id) - scored_heldout_ids)
@@ -334,6 +368,8 @@ def run_multilevel_verdict(
     )
 
     cap_threshold = validate_strict_threshold_pct(threshold_pct)
+    if not require_capture_files:
+        raise ModelingError("release_certification_requires_capture_files")
     if multilevel_manifest_json is not None:
         return _evaluate_manifest_path(
             sku=sku,
@@ -346,7 +382,7 @@ def run_multilevel_verdict(
             abi_rejection_results=abi_rejection_results,
             capture_root=capture_root,
             capture_files=capture_files,
-            require_capture_files=require_capture_files,
+            require_capture_files=True,
             cap_threshold=cap_threshold,
         )
 
@@ -366,15 +402,14 @@ def run_multilevel_verdict(
     abi_ok = bool((validation_doc.get("abi_rejection_check") or {}).get("ok", False))
     if not heldout_rows:
         return GateCheckOutcome("multilevel_gate", False, "insufficient_evidence", "validation report contains zero heldout residuals"), []
-    if capture_root is not None or capture_files is not None:
-        reverify_report_captures(
-            all_report_rows,
-            capture_root=capture_root,
-            capture_files=capture_files,
-            require_capture_files=True,
-        )
-    elif require_capture_files and validation_doc.get("capture_files_verified") is not True:
+    if validation_doc.get("capture_files_verified") is not True:
         return GateCheckOutcome("multilevel_gate", False, "fail", "capture_files_unverified_for_release"), heldout_rows
+    reverify_report_captures(
+        all_report_rows,
+        capture_root=capture_root,
+        capture_files=capture_files,
+        require_capture_files=True,
+    )
     for row in heldout_rows:
         rcpt = str(row.get("engine_receipt") or "")
         if not rcpt.startswith(_ENGINE_RECEIPT_PREFIX):

@@ -431,6 +431,19 @@ def acquire_coordinator_host_queue_lease(
         "receipt_unconfirmed": False,
         "receipt_warning": "",
     }
+    warnings: list[str] = []
+
+    def _record_warning(raw_msg: str) -> None:
+        lease_record["receipt_unconfirmed"] = True
+        clean = sanitize_public_warning(raw_msg)
+        if clean and clean not in warnings:
+            warnings.append(clean)
+        lease_record["receipt_warning"] = "; ".join(warnings)
+
+    acq_unconf = bool(acquired.get("receipt_unconfirmed") or data.get("receipt_unconfirmed"))
+    acq_warn = str(acquired.get("receipt_warning") or data.get("receipt_warning") or "").strip()
+    if acq_unconf or acq_warn:
+        _record_warning(acq_warn or "host_queue_lease_acquire_unconfirmed")
     try:
         if outcome not in _VALID_LEASE_OUTCOMES:
             raise ModelingError(f"host_queue_lease_acquire_rejected:outcome={outcome}")
@@ -459,17 +472,13 @@ def acquire_coordinator_host_queue_lease(
                 rel_unconf = bool(rel_resp.get("receipt_unconfirmed") or rel_data.get("receipt_unconfirmed"))
                 rel_warn = str(rel_resp.get("receipt_warning") or rel_data.get("receipt_warning") or "").strip()
                 if rel_unconf or rel_warn or rel_outcome not in _VALID_LEASE_OUTCOMES or rel_status not in _VALID_LEASE_STATUSES:
-                    lease_record["receipt_unconfirmed"] = True
-                    lease_record["receipt_warning"] = sanitize_public_warning(
+                    _record_warning(
                         rel_warn or f"host_queue_lease_release_unconfirmed:{rel_status or rel_outcome}"
                     )
             except TimeoutError:
                 raise
             except (ModelingError, OSError) as exc:
-                lease_record["receipt_unconfirmed"] = True
-                lease_record["receipt_warning"] = sanitize_public_warning(
-                    f"host_queue_lease_release_unconfirmed:{exc}"
-                )
+                _record_warning(f"host_queue_lease_release_unconfirmed:{exc}")
 
 
 def resolve_profiler_builder_strict(

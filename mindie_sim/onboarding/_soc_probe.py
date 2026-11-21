@@ -237,6 +237,22 @@ def _ssh_exec(
         raise ModelingError(f"onboarding_ssh_failed:{exc}") from exc
 
 
+def run_ssh_command(
+    endpoint_alias: str,
+    remote_cmd: str,
+    timeout_s: int,
+    *,
+    endpoints_path: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Execute ``remote_cmd`` on ``endpoint_alias`` via sanctioned ``endpoints.json`` SSH."""
+    return _ssh_exec(
+        endpoint_alias,
+        remote_cmd,
+        timeout_s=int(timeout_s),
+        endpoints_path=endpoints_path,
+    )
+
+
 def _resolve_explicit_arch(
     raw_arch_preset: str,
     raw_architecture: str,
@@ -698,5 +714,6 @@ __all__ = [
     "parse_npu_smi_topology",
     "parse_platform_config_ini",
     "probe_soc",
+    "run_ssh_command",
     "verify_idle_die_telemetry",
 ]

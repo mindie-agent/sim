@@ -19,7 +19,7 @@ from typing import Any
 import pytest
 
 from mindie_sim.cli import main as mindie_sim_main
-from mindie_sim.observations.multilevel_gate import CaptureBoundary, EngineInterval, GateCase, bind_engine_interval
+from mindie_sim.observations.multilevel_gate import CaptureBoundary, CohortKey, EngineInterval, GateCase, bind_engine_interval
 from mindie_sim.observations.multilevel_stream import verify_capture_file_consistency
 from mindie_sim.onboarding import (
     ANCHOR_CONTEXT_GRID, OFF_GRID_CLIFF_HELDOUT_GRID, OperatorCliffParameters, TimeoutBudget,
@@ -34,11 +34,14 @@ from mindie_sim.onboarding._gate_runners import (
     acquire_coordinator_host_queue_lease, load_canonical_l0_sealer, normalize_profiler_records,
     run_profiler_bench_subprocess, validate_host_queue_grant,
 )
+from mindie_sim.onboarding._lean_and_receipts import check_lean_non_inversion
+from mindie_sim.onboarding._profiler_dispatch import build_profiler_subgraph_plan
+from mindie_sim.onboarding.contracts import sanitize_public_warning
 from mindie_sim.onboarding._operator_contract import (
     _build_default_planning_context, _verify_resolved_operator_dual_bound,
 )
 from mindie_sim.onboarding.tiling_axes import ARCH_PRESET_22, ARCH_PRESET_35
-from mindie_sim.optimization.dual_bound import EventDagSpec, ResourceChoiceProgram, certify_lower_bound
+from mindie_sim.optimization.dual_bound import DagEdge, EventDagSpec, ResourceChoiceProgram, certify_lower_bound
 from mindie_sim.prediction.mechanism import OperatorPlan, Work
 from mindie_sim.prediction.operators.contracts import OperatorFamilySpec, ResolvedOperator
 from mindie_sim.prediction.operators.registry import FamilyRegistry
@@ -72,8 +75,7 @@ def _git_repo_with_blob(tmp_path: Path, name: str, rel_path: str, content: bytes
     env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@e.invalid", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@e.invalid"}
     for cmd in (["init", "-q"], ["add", rel_path], ["commit", "-q", "-m", "init"]):
         subprocess.run(["git", "-C", str(repo), *cmd], check=True, env=env, capture_output=True)
-    rev = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
-    return repo, rev, hashlib.sha256(content).hexdigest()
+    return repo, subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip(), hashlib.sha256(content).hexdigest()
 
 
 def _synthetic_repo(tmp_path: Path, *, family: str = "demo_op") -> Path:
@@ -86,9 +88,7 @@ def _synthetic_repo(tmp_path: Path, *, family: str = "demo_op") -> Path:
     (syn / "scripts/check_template_provenance.py").write_text("print('template provenance violations: 0')\n", encoding="utf-8")
     (syn / f"tests/operators/test_{family}.py").write_text('"""Test."""\nimport pytest\npytestmark = pytest.mark.tier0\n', encoding="utf-8")
     (syn / "tests/TAXONOMY.toml").write_text(
-        'schema_version = 1\ndomains = ["operators"]\nmax_lines = 600\nmax_modules = 8\n'
-        f'[[module]]\npath = "operators/test_{family}.py"\ntier = "tier0"\n'
-        f'owns = ["mindie_sim/prediction/operators/{family}", "mindie_sim/templates/{family}_spec.py"]\n',
+        f'schema_version = 1\ndomains = ["operators"]\nmax_lines = 600\nmax_modules = 8\n[[module]]\npath = "operators/test_{family}.py"\ntier = "tier0"\nowns = ["mindie_sim/prediction/operators/{family}", "mindie_sim/templates/{family}_spec.py"]\n',
         encoding="utf-8",
     )
     return syn
@@ -282,17 +282,22 @@ def test_probe_soc_conflicts_capture_gate_and_unspoofable_status(tmp_path):
     obs, preds, leans, abis, pshas = _plan_fixture_bundle(new_plan, capture_dir=cap_dir)
     raw_l0 = tmp_path / "new_l0.json"
     raw_l0.write_text(json.dumps(_raw_l0_samples(new_sku)), encoding="utf-8")
-    # Missing capture files MUST fail closed on release run-all; signed report fails empty capture_root & cannot spoof silicon_certified!
+    # Missing capture files, omitted capture_root on signed report, require_capture_files=False, & live_silicon spoof MUST fail!
     with pytest.raises(ModelingError, match="capture_file_missing"):
         run_sku_onboarding(probe_json=full_probe, raw_l0_json=raw_l0, allow_scaffold=True, base_template_sku=A2_SKU, profiler_runner=lambda _p: obs, abi_rejection_results=abis, runner=_independent_engine_runner(preds, prog_sha_by_id=pshas), lean_bounds_json=leans, repo_root=_synthetic_repo(tmp_path, family="no_cap"))
+    with pytest.raises(ModelingError, match="release_certification_requires_capture_files"):
+        run_sku_onboarding(probe_json=full_probe, raw_l0_json=raw_l0, allow_scaffold=True, base_template_sku=A2_SKU, profiler_runner=lambda _p: obs, abi_rejection_results=abis, require_capture_files=False, runner=_independent_engine_runner(preds, prog_sha_by_id=pshas), lean_bounds_json=leans, repo_root=_synthetic_repo(tmp_path, family="no_cap2"))
     run_new = run_sku_onboarding(probe_json=full_probe, raw_l0_json=raw_l0, allow_scaffold=True, base_template_sku=A2_SKU, profiler_runner=lambda _p: obs, abi_rejection_results=abis, capture_root=cap_dir, runner=_independent_engine_runner(preds, prog_sha_by_id=pshas), lean_bounds_json=leans, repo_root=_synthetic_repo(tmp_path, family="new_sku"), out_dir=tmp_path / "new_sku_out")
     assert run_new["ok"] is True and run_new["status"] == "offline_reverify"
-    empty_caps = tmp_path / "empty_caps"
+    empty_caps, empty_repo = tmp_path / "empty_caps", _synthetic_repo(tmp_path, family="empty_c")
     empty_caps.mkdir()
-    with pytest.raises(ModelingError, match="capture_file_missing"):
-        verify_sku_gates(sku=new_sku, validation_report_json=run_new["stages"]["validate-512-400k"], primitives_json=run_new["stages"]["calibrate-l0-and-fabric"]["primitives_payload"], lean_bounds_json=leans, profile_override=run_new["stages"]["probe-soc"]["scaffold_profile"][new_sku], capture_root=empty_caps, repo_root=_synthetic_repo(tmp_path, family="empty_c"))
+    for cap_arg in (empty_caps, None):
+        with pytest.raises(ModelingError, match="capture_file_missing"):
+            verify_sku_gates(sku=new_sku, validation_report_json=run_new["stages"]["validate-512-400k"], primitives_json=run_new["stages"]["calibrate-l0-and-fabric"]["primitives_payload"], lean_bounds_json=leans, profile_override=run_new["stages"]["probe-soc"]["scaffold_profile"][new_sku], capture_root=cap_arg, repo_root=empty_repo)
     spoof = verify_sku_gates(sku=new_sku, validation_report_json=run_new["stages"]["validate-512-400k"], primitives_json=run_new["stages"]["calibrate-l0-and-fabric"]["primitives_payload"], lean_bounds_json=leans, profile_override=run_new["stages"]["probe-soc"]["scaffold_profile"][new_sku], capture_root=cap_dir, acquisition_mode="live_silicon", repo_root=_synthetic_repo(tmp_path, family="spoof_s"))
     assert spoof["ok"] is False and spoof["status"] != "silicon_certified"
+    warn_gate = verify_sku_gates(sku=new_sku, validation_report_json=run_new["stages"]["validate-512-400k"], primitives_json=run_new["stages"]["calibrate-l0-and-fabric"]["primitives_payload"], lean_bounds_json=leans, profile_override=run_new["stages"]["probe-soc"]["scaffold_profile"][new_sku], capture_root=cap_dir, stage2_lease={"lease_mode": "coordinator_host_queue", "lease_digest": "lease-0123456789abcdef", "fence_token": 7, "device_count": 1, "receipt_unconfirmed": True, "receipt_warning": "release_delayed:audit-node.internal.example"}, repo_root=_synthetic_repo(tmp_path, family="warn_s"))
+    assert warn_gate["ok"] is True and warn_gate["receipt"]["receipt_unconfirmed"] is True and "audit-node" not in json.dumps(warn_gate["receipt"]) and verify_receipt_sha256(warn_gate["receipt"]) is True
 
 
 def test_sealer_cann_manifest_conflicts_and_campaign_privacy(tmp_path):
@@ -328,9 +333,10 @@ def test_lock3_dav2201_vs_dav3510_lightning_abi_and_strict_rejections():
 
     sp35 = synthesize_operator_cliff_plan(OperatorCliffParameters("sp:v2", "sparse_indexer", 128, 32, 192 * 1024**2), sku=A5_SKU)
     sp22 = synthesize_operator_cliff_plan(OperatorCliffParameters("sp:v2", "sparse_indexer", 128, 20, 100 * 1024**2), sku=A2_SKU)
+    sp22_2050 = synthesize_operator_cliff_plan(OperatorCliffParameters("sp:v2", "sparse_indexer", 128, 20, 100 * 1024**2, topk_threshold=2050), sku=A2_SKU)
     assert not any(pt.topk == 2049 for pt in sp35.abi_rejection_points) and any(pt.topk == 2049 for pt in sp35.heldout_points)
-    assert any(pt.topk == 8193 for pt in sp35.abi_rejection_points)
-    assert any(pt.topk == 2049 for pt in sp22.abi_rejection_points)
+    assert any(pt.topk == 8193 for pt in sp35.abi_rejection_points) and any(pt.topk == 2049 for pt in sp22.abi_rejection_points)
+    assert not any(pt.topk == 2049 for pt in sp22_2050.heldout_points) and any(pt.topk == 2049 for pt in sp22_2050.abi_rejection_points)
     assert set(ANCHOR_CONTEXT_GRID) == {pt.value for pt in sp22.train_points if pt.axis == "context_len"}
     assert set(OFF_GRID_CLIFF_HELDOUT_GRID).issubset({pt.value for pt in sp22.heldout_points if pt.axis == "context_len"})
 
@@ -430,9 +436,13 @@ def test_operator_stub_template_ownership_identity_and_certify(tmp_path):
         out_dir=tmp_path / "op_out",
     )
     assert op_run["ok"] is True and op_run["status"] == "offline_reverify" and verify_receipt_sha256(op_run["stages"]["certify"]["receipt"]) is True
-    # Unowned variant `demo_op:unimplemented` and caller `acquisition_mode="live_silicon"` spoof MUST fail!
+    # Unowned variant, omitted capture_root, require_capture_files=False, & live_silicon spoof MUST fail!
     bad_var = certify_operator(operator_id="demo_op:unimplemented", sku=A2_SKU, contract_report=op_run["stages"]["validate-contract"], score_report=op_run["stages"]["bench-and-score"], lean_bounds_json=op_leans, capture_root=op_caps, repo_root=syn)
     assert bad_var["ok"] is False
+    with pytest.raises(ModelingError, match="capture_file_missing"):
+        certify_operator(operator_id="demo_op:aclnnDemoOpV1", sku=A2_SKU, contract_report=op_run["stages"]["validate-contract"], score_report=op_run["stages"]["bench-and-score"], lean_bounds_json=op_leans, repo_root=syn)
+    with pytest.raises(ModelingError, match="release_certification_requires_capture_files"):
+        certify_operator(operator_id="demo_op:aclnnDemoOpV1", sku=A2_SKU, contract_report=op_run["stages"]["validate-contract"], score_report=op_run["stages"]["bench-and-score"], lean_bounds_json=op_leans, require_capture_files=False, repo_root=syn)
     op_spoof = certify_operator(operator_id="demo_op:aclnnDemoOpV1", sku=A2_SKU, contract_report=op_run["stages"]["validate-contract"], score_report=op_run["stages"]["bench-and-score"], lean_bounds_json=op_leans, capture_root=op_caps, acquisition_mode="live_silicon", repo_root=syn)
     assert op_spoof["ok"] is False and op_spoof["status"] != "silicon_certified"
 
@@ -461,68 +471,75 @@ def test_host_queue_unified_grant_cleanup_and_profiler_roundtrip(tmp_path):
             pass
     assert rel_log.read_text(encoding="utf-8") == "released"
 
-    # Successful release returning receipt_unconfirmed=true + hostname warning propagates & scrubs hostname!
+    # Acquire-side warning survives clean release & scrubs "PermissionError: audituser"; release warning also preserved!
+    assert "audituser" not in sanitize_public_warning("PermissionError: audituser") and "permissionerror" not in sanitize_public_warning("PermissionError: audituser")
     c_warn = tmp_path / "c_warn.py"
     c_warn.write_text(
         f"#!{sys.executable}\nimport json, sys\nargs = sys.argv[1:]\nact = args[args.index('--action') + 1]\n"
-        "if act == 'acquire':\n    print(json.dumps({'outcome':'success','status':'ready','data':{'lease_id':'lease-audituser-2','fence_token':7,'devices':[0,1,2,3]}}))\n"
-        "else:\n    print(json.dumps({'outcome':'success','status':'ok','receipt_unconfirmed':True,'receipt_warning':'release_delayed:audit-node.internal.example'}))\n",
+        "if act == 'acquire':\n    print(json.dumps({'outcome':'success','status':'ready','receipt_unconfirmed':True,'receipt_warning':'PermissionError: audituser','data':{'lease_id':'lease-audituser-2','fence_token':7,'devices':[0,1,2,3]}}))\n"
+        "else:\n    print(json.dumps({'outcome':'success','status':'ok'}))\n",
         encoding="utf-8",
     )
     c_warn.chmod(0o755)
     with acquire_coordinator_host_queue_lease("audit-node.internal.example", npu_count=4, ttl_seconds=180, min_subprocess_timeout_s=120, coordinator_bin=str(c_warn)) as linfo:
         assert linfo["devices"] == [0, 1, 2, 3]
-    assert linfo["receipt_unconfirmed"] is True and "audit-node" not in linfo["receipt_warning"]
+    assert linfo["receipt_unconfirmed"] is True and "audituser" not in linfo["receipt_warning"] and "permissionerror" not in linfo["receipt_warning"]
 
-    # Custom lease_acquirer with devices=[] (L0) OR 5 devices on 4-rank plan (operator) rejected via unified validator!
+    # Custom lease_acquirer rejected BEFORE injected l0_runner callback (live_bench=True) and on 5-device operator plan!
     @contextmanager
-    def _bad_acq(devs: list[int], ttl: int):
-        yield {"lease_mode": "coordinator_host_queue", "lease_id": "l-bad", "fence_token": 1, "devices": devs, "ttl_seconds": ttl}
+    def _bad_acq(devs: list[int], ttl: int, fence: int = 1):
+        yield {"lease_mode": "coordinator_host_queue", "lease_id": "l-bad", "fence_token": fence, "devices": devs, "ttl_seconds": ttl}
 
-    with pytest.raises(ModelingError, match="host_queue_lease_device_count_mismatch"):
-        calibrate_l0_and_fabric(sku=A2_SKU, live_bench=True, lease_acquirer=lambda _s, _t: _bad_acq([], 660))
+    ran_cb: list[bool] = []
+    with pytest.raises(ModelingError, match="host_queue_lease_"):
+        calibrate_l0_and_fabric(sku=A2_SKU, live_bench=True, l0_runner=lambda _s, _t: (ran_cb.append(True) or {}), lease_acquirer=lambda _s, _t: _bad_acq([], 1, fence=0))
+    assert not ran_cb
     plan_doc = generate_operator_cliff_plan(operator_id="live:v1", family="live", sku=A2_SKU, tile_dim=128, core_count=20, l2_bytes=A2_ORACLE["l2"])["plan"]
     with pytest.raises(ModelingError, match="host_queue_lease_device_count_mismatch"):
         bench_and_score_operator(cliff_plan=plan_doc, sku=A2_SKU, live_profiler=True, lease_acquirer=lambda _s, _t: _bad_acq([0, 1, 2, 3, 4], 900))
+    # B4 translated subgraph plan: world_size=4 & zero sku_suite unmodeled nodes; busy_union-only fails; multi-mode base+eager joins run001!
+    b4_sub = build_profiler_subgraph_plan(synthesize_sku_512_400k_plan(sku=A2_SKU, core_count=20, l2_bytes=A2_ORACLE["l2"]).to_dict(), sku=A2_SKU)
+    assert b4_sub["world_size"] == 4 and all(c["nodes"][0]["family"] != "sku_suite" and c["nodes"][0].get("builder") for c in b4_sub["cases"])
+    with pytest.raises(ModelingError, match="clock_operator_plan_mismatch"):
+        normalize_profiler_records([{"schema": "mindie-bench-observation/1", "record_type": "observation", "case_id": "offgrid_ctx_768", "run_id": "r1.base.stream_saturated.t0", "trial": 0, "split": "heldout", "boundary": "device_kernel", "timing_mode": "stream_saturated", "duration_ms": 0.0075, "sample_id": "s0", "sku": A2_SKU, "validated": True, "qualified": True}], plan_doc=plan_doc, sku=A2_SKU)
     cap_out = tmp_path / "prof_caps"
     norm_obs, norm_abi = normalize_profiler_records(
         [
-            {"schema": "mindie-bench-observation/1", "record_type": "observation", "case_id": "offgrid_ctx_768", "run_id": "run001.eager_device.t0", "trial": 0, "split": "heldout", "boundary": "device_kernel", "timing_mode": "eager_device", "duration_ms": 0.020, "sample_id": "obs-0", "rank": None, "sku": A2_SKU, "validated": True, "qualified": True, "identity": {"level": "operator", "implementation": "aclnnLive"}},
-            {"schema": "mindie-bench-observation/1", "record_type": "observation", "case_id": "offgrid_ctx_768", "run_id": "run001.eager_device.t1", "trial": 1, "split": "heldout", "boundary": "device_kernel", "timing_mode": "eager_device", "duration_ms": 0.022, "sample_id": "obs-1", "rank": None, "sku": A2_SKU, "validated": True, "qualified": True, "identity": {"level": "operator", "implementation": "aclnnLive"}},
+            {"schema": "mindie-bench-observation/1", "record_type": "observation", "case_id": "offgrid_ctx_768", "run_id": "run001.base.eager.t0", "trial": 0, "split": "heldout", "boundary": "device_kernel", "timing_mode": "eager", "duration_ms": 0.020, "sample_id": "obs-0", "rank": None, "sku": A2_SKU, "validated": True, "qualified": True, "identity": {"level": "operator", "implementation": "aclnnLive"}},
+            {"schema": "mindie-bench-observation/1", "record_type": "observation", "case_id": "offgrid_ctx_768", "run_id": "run001.base.stream_saturated.t0", "trial": 0, "split": "heldout", "boundary": "device_kernel", "timing_mode": "stream_saturated", "duration_ms": 0.0075, "sample_id": "obs-1", "rank": None, "sku": A2_SKU, "validated": True, "qualified": True, "identity": {"level": "operator", "implementation": "aclnnLive"}},
             {"schema": "mindie-bench-observation/1", "record_type": "case_complete", "case_id": "offgrid_ctx_768", "run_id": "run001", "split": "heldout", "status": "ok", "summary": {"op": "live", "actual_shape": {"context_len": 768, "batch_size": 1, "query_tokens": 1}, "participating_ranks": [2]}},
-            {"schema": "mindie-bench-receipt/1", "case_id": "abi_1", "status": "abi_rejected", "reason": "abi_divisibility_violation:topk=2049", "requested_shape": {"context_len": 2049, "topk": 2049, "batch_size": 1, "query_tokens": 1}},
+            {"schema": "mindie-bench-receipt/1", "case_id": "abi_1", "status": "unsupported_binding", "reason": "abi_divisibility_violation:topk=2049", "requested_shape": {"context_len": 2049, "topk": 2049, "batch_size": 1, "query_tokens": 1}},
         ],
         plan_doc=plan_doc, sku=A2_SKU, endpoint_alias="audit-node.internal.example", capture_out_dir=cap_out,
     )
-    assert len(norm_obs) == 1 and norm_obs[0]["device_ranks"] == [2] and len(norm_abi) == 1
+    assert len(norm_obs) == 1 and norm_obs[0]["device_ranks"] == [2] and norm_obs[0]["context_len"] == 768 and norm_obs[0]["clock_operator"] == "elapsed_span" and "sim_case" in norm_obs[0] and len(norm_abi) == 1
     assert "audit-node" not in json.dumps(norm_obs) and norm_obs[0]["run_uid"].startswith("run-")
-    cap_file = cap_out / f"{norm_obs[0]['raw_sha256']}.json"
-    verify_capture_file_consistency(
-        "offgrid_ctx_768",
-        CaptureBoundary(norm_obs[0]["raw_sha256"], norm_obs[0]["acquisition_root"], norm_obs[0]["run_uid"], (), tuple(norm_obs[0]["event_ids"]), tuple(norm_obs[0]["device_ranks"]), "device_monotonic", "k_start", "k_end", "device_kernel", "ns", norm_obs[0]["capture_uri"]),
-        cap_file,
-    )
+    verify_capture_file_consistency("offgrid_ctx_768", CaptureBoundary(norm_obs[0]["raw_sha256"], norm_obs[0]["acquisition_root"], norm_obs[0]["run_uid"], (), tuple(norm_obs[0]["event_ids"]), tuple(norm_obs[0]["device_ranks"]), "device_monotonic", "k_start", "k_end", "device_kernel", "ns", norm_obs[0]["capture_uri"]), cap_out / f"{norm_obs[0]['raw_sha256']}.json")
 
-    # Plan-consuming dispatch uses `bench subgraph --plan` (local & SSH), reads BOTH obs+out, verifies plan_sha256!
+    # Separate train/heldout acquisitions, .rank0.json + partial exit 2 for planned ABI rejection, & remote endpoint routes via SSH (never local)!
+    abi_plan = synthesize_operator_cliff_plan(OperatorCliffParameters("sp:v2", "sparse_indexer", 128, 20, A2_ORACLE["l2"]), sku=A2_SKU).to_dict()
+    abi_pid = abi_plan["abi_rejection_points"][0]["point_id"]
     fake_prof = tmp_path / "fake_prof_sub"
     (fake_prof / "mindie_profiler/bench").mkdir(parents=True)
     (fake_prof / "mindie_profiler/__init__.py").write_text("", encoding="utf-8")
     (fake_prof / "mindie_profiler/__main__.py").write_text(
-        "import json, sys\nfrom pathlib import Path\nargs = sys.argv[1:]\n"
-        "assert args[:2] == ['bench', 'subgraph']\n"
+        "import json, sys\nfrom pathlib import Path\nargs = sys.argv[1:]\nassert args[:2] == ['bench', 'subgraph']\n"
         "plan = json.loads(Path(args[args.index('--plan') + 1]).read_text(encoding='utf-8'))\n"
-        "Path(args[args.index('--observations') + 1]).write_text(json.dumps({'schema':'mindie-bench-observation/1','record_type':'observation','case_id':'offgrid_ctx_768','run_id':'r1.eager_device.t0','trial':0,'split':'heldout','timing_mode':'eager_device','duration_ms':0.02,'sample_id':'s0','sku':plan['sku'],'validated':True,'qualified':True}) + '\\n', encoding='utf-8')\n"
-        "Path(args[args.index('--out') + 1]).write_text(json.dumps({'plan_id':plan['plan_id'],'cases':[{'schema':'mindie-bench-receipt/1','case_id':'abi_1','status':'abi_rejected','reason':'abi_divisibility_violation:topk=2049'}]}), encoding='utf-8')\n",
+        "obs_p, out_p = Path(args[args.index('--observations') + 1]), Path(args[args.index('--out') + 1])\n"
+        "is_tr = plan['plan_id'].endswith(':train')\n"
+        "cid = 'anchor_ctx_512' if is_tr else 'offgrid_ctx_768'\nrid = 'r_tr' if is_tr else 'r_ho'\n"
+        "obs_p.write_text(json.dumps({'schema':'mindie-bench-observation/1','record_type':'observation','case_id':cid,'run_id':f'{rid}.base.eager.t0','trial':0,'split':'train' if is_tr else 'heldout','timing_mode':'eager','duration_ms':0.02,'sample_id':'s0','sku':plan['sku'],'validated':True,'qualified':True}) + '\\n', encoding='utf-8')\n"
+        f"recs = [{{'case_id': cid, 'status': 'ok'}}] + ([] if is_tr else [{{'case_id': {abi_pid!r}, 'status': 'unsupported_binding', 'reason': 'abi_divisibility_violation:topk=2049'}}])\n"
+        "Path(f'{out_p}.rank0.json').write_text(json.dumps({'schema':'mindie-bench-subgraph-run/1','status':'ok' if is_tr else 'partial','plan_id':plan['plan_id'],'records':recs}), encoding='utf-8')\n"
+        "sys.exit(0 if is_tr else 2)\n",
         encoding="utf-8",
     )
-    obs_l, abi_l = run_profiler_bench_subprocess(plan_doc, sku=A2_SKU, profiler_root=fake_prof, allowed_phy_ids=[0, 1, 2, 3], fence_token=7)
-    assert len(obs_l) == 1 and len(abi_l) == 1
-    seen_ssh: list[str] = []
-    obs_s, _ = run_profiler_bench_subprocess(
-        plan_doc, sku=A2_SKU, endpoint_alias="audit-node.internal.example", allowed_phy_ids=[0, 1, 2, 3], fence_token=7,
-        ssh_runner=lambda _ep, cmd, _t: (seen_ssh.append(cmd) or subprocess.CompletedProcess([], 0, json.dumps({"plan_id": plan_doc["plan_sha256"], "cases": [{"case_id": "offgrid_ctx_768", "status": "ok"}]}), "")),
-    )
-    assert seen_ssh and "bench subgraph --plan" in seen_ssh[0] and len(obs_s) == 1
+    obs_l, abi_l = run_profiler_bench_subprocess(abi_plan, sku=A2_SKU, profiler_root=fake_prof, allowed_phy_ids=[0, 1, 2, 3], fence_token=7)
+    assert len(obs_l) == 2 and obs_l[0]["run_uid"] != obs_l[1]["run_uid"] and len(abi_l) == 1 and abi_l[0]["point_id"] == abi_pid
+    with pytest.raises(ModelingError, match="onboarding_endpoint_unknown|onboarding_json_read_failed"):
+        validate_512_400k(sku=A2_SKU, live_profiler=True, endpoint_alias="audit-node.internal.example", profiler_root=fake_prof, lease_acquirer=lambda _s, _t: _bad_acq([0, 1, 2, 3], 600))
+    with pytest.raises(ModelingError, match="onboarding_endpoint_unknown|onboarding_json_read_failed"):
+        bench_and_score_operator(cliff_plan=plan_doc, sku=A2_SKU, live_profiler=True, endpoint_alias="audit-node.internal.example", profiler_root=fake_prof, lease_acquirer=lambda _s, _t: _bad_acq([0, 1, 2, 3], 900))
 
 
 def test_whitebox_sku_check_2d_kv_heads_dcp_compose_and_real_dag(tmp_path):
@@ -543,34 +560,39 @@ def test_whitebox_sku_check_2d_kv_heads_dcp_compose_and_real_dag(tmp_path):
         score_sealed_gate_cases([{**base_l1, "case_id": "bx-odd", "point_id": "bx-odd", "batch_x_kv_heads": 2559, "sim_case": gqa_case}], sku=A2_SKU, runner=WhiteboxSpineRunner(clock_operator="busy_union"))
     assert score_sealed_gate_cases([{**base_l1, "case_id": "bx-1kv", "point_id": "bx-1kv", "batch_x_kv_heads": 2559}], sku=A2_SKU, runner=WhiteboxSpineRunner(clock_operator="busy_union"))["residuals"][0]["predicted_ns"] > 0
 
-    # Dependent L2 (`norm1 -> q_proj`) vs independent L2 (`q_proj, kv_a` without dep between them) emit DIFFERENT program_dag_sha256!
-    l2_dep = {**base_l1, "case_id": "l2-dep", "point_id": "l2-dep", "level": "L2", "target_family": None, "target_op_ids": ["s0.l0.norm1", "s0.l0.q_proj"]}
+    # Dependent L2 (`norm1 -> q_proj`) emits `wire_ns` & passes check_lean_non_inversion; private capture URI scrubbed to opaque locator!
+    l2_dep = {**base_l1, "case_id": "l2-dep", "point_id": "l2-dep", "level": "L2", "capture_uri": f"capture://audit-node.internal.example/lease-audituser-0abc/{base_l1['raw_sha256']}.json", "target_family": None, "target_op_ids": ["s0.l0.norm1", "s0.l0.q_proj"]}
     l2_ind = {**base_l1, "case_id": "l2-ind", "point_id": "l2-ind", "level": "L2", "target_family": None, "target_op_ids": ["s0.l0.q_proj", "s0.l0.kv_a"]}
-    r_dep = score_sealed_gate_cases([l2_dep], sku=A2_SKU, runner=WhiteboxSpineRunner(clock_operator="busy_union"))["residuals"][0]
-    r_ind = score_sealed_gate_cases([l2_ind], sku=A2_SKU, runner=WhiteboxSpineRunner(clock_operator="busy_union"))["residuals"][0]
-    assert r_dep["program_dag_sha256"] and r_ind["program_dag_sha256"] and r_dep["program_dag_sha256"] != r_ind["program_dag_sha256"]
+    wb_r = WhiteboxSpineRunner(clock_operator="busy_union")
+    r_dep = score_sealed_gate_cases([l2_dep], sku=A2_SKU, runner=wb_r)["residuals"][0]
+    r_ind = score_sealed_gate_cases([l2_ind], sku=A2_SKU, runner=wb_r)["residuals"][0]
+    assert r_dep["program_dag_sha256"] and r_dep["program_dag_sha256"] != r_ind["program_dag_sha256"] and "audit-node" not in r_dep["capture_uri"] and "audituser" not in r_dep["capture_uri"]
+    dep_gc = GateCase("l2-dep", "L2", "heldout", CaptureBoundary(base_l1["raw_sha256"], "acq-l2", "r1", (), ("s1", "e1"), (0,), "device_ns", "s1", "e1", "fx_region", "ns", r_dep["capture_uri"]), "in", "st", "wb", CohortKey("L2", "c", A2_SKU, "decode", "eager", "cliff", "tp1"), 2500, payload=(("clock_operator", "busy_union"), ("context_len", 64), ("phase", "decode"), ("sim_case", b4_case), ("target_op_ids", ["s0.l0.norm1", "s0.l0.q_proj"])))
+    dep_diag = dict(wb_r.run_l2(dep_gc).diagnostics)
+    lp, ld = dep_diag["lean_program"], dep_diag["lean_dag"]
+    assert ld["edges"] and "wire_ns" in ld["edges"][0]
+    d_cert, _ = certify_lower_bound(ResourceChoiceProgram(lp["num_resources"], tuple(lp["global_work"]), ()), EventDagSpec(tuple(ld["node_quantum_ns"]), tuple(DagEdge(e["src"], e["dst"], e["wire_ns"]) for e in ld["edges"])))
+    lean_ok, _, lean_v = check_lean_non_inversion([{"case_id": "l2-dep", "l_star_lean_ns": d_cert.l_star_lean_ns, "t_sim_ns": dep_diag["busy_union_ns"], "t_silicon_p99_ns": max(dep_diag["busy_union_ns"], 2600), "program": lp, "dag": ld, "certificate": {"farkas": {"scale_d": d_cert.farkas.scale_d, "lambda_num": list(d_cert.farkas.lambda_num), "mu_num": list(d_cert.farkas.mu_num), "lower_bound_ns": d_cert.farkas.lower_bound_ns}, "path_edges": list(d_cert.path_edges), "sink_node_id": d_cert.sink_node_id, "l_star_lean_ns": d_cert.l_star_lean_ns}}], expected_case_timings={"l2-dep": (dep_diag["busy_union_ns"], 2500, max(dep_diag["busy_union_ns"], 2600), dep_diag["program_dag_sha256"])})
+    assert lean_ok is True and not lean_v
 
-    # Full manifest gate rejects partial manifest & missing captures, passes full authoritative plan + real captures!
+    # Full manifest gate rejects partial/missing captures & cross-run live report spoofing, passes verified full manifest!
     raw_full = tmp_path / "full.json"
     raw_full.write_text(json.dumps(_raw_l0_samples(A2_SKU)), encoding="utf-8")
     cal_full = calibrate_l0_and_fabric(sku=A2_SKU, raw_l0_json=raw_full)["primitives_payload"]
     full_plan = synthesize_sku_512_400k_plan(sku=A2_SKU, core_count=A2_ORACLE["aic"], l2_bytes=A2_ORACLE["l2"]).to_dict()
-    cap_dir = tmp_path / "captures"
+    cap_dir, cap_dir_a = tmp_path / "captures", tmp_path / "captures_a"
     m_rows, m_preds, m_leans, m_abis, m_shas = _plan_fixture_bundle(full_plan, capture_dir=cap_dir)
-    ml_cases = [
-        {
-            "case_id": r["case_id"], "point_id": r["point_id"], "level": r["level"], "split": r["split"],
-            "boundary": {"raw_sha256": r["raw_sha256"], "acquisition_uid": r["acquisition_root"], "run_uid": r["run_uid"], "parent_digests": [], "event_ids": r["event_ids"], "device_ranks": r["device_ranks"], "clock_domain": "device_ns", "start_event": "start", "end_event": "end", "boundary_kind": {"L1": "device_kernel", "L2": "fx_region", "L3": "model_step"}[r["level"]], "unit": "ns", "capture_uri": r["capture_uri"]},
-            "input_digest": r["raw_sha256"], "stack_digest": hashlib.sha256(b"st").hexdigest(), "implementation": "whitebox",
-            "cohort": {"level": r["level"], "cohort_name": "wb", "sku": A2_SKU, "phase": "decode", "mode": "eager", "shape_regime": "cliff", "parallel_topology": r["parallel_topology"]},
-            "measured_ns": r["measured_ns"], "measured_p99_ns": r["measured_p99_ns"], "clock_operator": r["clock_operator"],
-            "payload": {k: r[k] for k in ("context_len", "tokens", "batch_size", "query_tokens", "parallel_topology", "topk", "batch_x_kv_heads") if r.get(k) is not None},
-        }
-        for r in m_rows
-    ]
+    ml_cases = [{"case_id": r["case_id"], "point_id": r["point_id"], "level": r["level"], "split": r["split"], "boundary": {"raw_sha256": r["raw_sha256"], "acquisition_uid": r["acquisition_root"], "run_uid": r["run_uid"], "parent_digests": [], "event_ids": r["event_ids"], "device_ranks": r["device_ranks"], "clock_domain": "device_ns", "start_event": "start", "end_event": "end", "boundary_kind": {"L1": "device_kernel", "L2": "fx_region", "L3": "model_step"}[r["level"]], "unit": "ns", "capture_uri": r["capture_uri"]}, "input_digest": r["raw_sha256"], "stack_digest": hashlib.sha256(b"st").hexdigest(), "implementation": "whitebox", "cohort": {"level": r["level"], "cohort_name": "wb", "sku": A2_SKU, "phase": "decode", "mode": "eager", "shape_regime": "cliff", "parallel_topology": r["parallel_topology"]}, "measured_ns": r["measured_ns"], "measured_p99_ns": r["measured_p99_ns"], "clock_operator": r["clock_operator"], "payload": {k: r[k] for k in ("context_len", "tokens", "batch_size", "query_tokens", "parallel_topology", "topk", "batch_x_kv_heads") if r.get(k) is not None}} for r in m_rows]
     full_f = tmp_path / "ml_full.json"
     full_f.write_text(json.dumps({"manifest_id": "m-full", "schema_version": "mindie-multilevel-manifest/1", "cases": ml_cases, "abi_rejection_results": m_abis}), encoding="utf-8")
     with pytest.raises(ModelingError, match="capture_file_missing"):
         verify_sku_gates(sku=A2_SKU, multilevel_manifest_json=full_f, runner=_independent_engine_runner(m_preds, prog_sha_by_id=m_shas), primitives_json=cal_full, lean_bounds_json=m_leans, repo_root=_synthetic_repo(tmp_path, family="ml_nocap"))
     full_ok = verify_sku_gates(sku=A2_SKU, multilevel_manifest_json=full_f, capture_root=cap_dir, runner=_independent_engine_runner(m_preds, prog_sha_by_id=m_shas), primitives_json=cal_full, lean_bounds_json=m_leans, repo_root=_synthetic_repo(tmp_path, family="ml_ok"))
     assert full_ok["ok"] is True and full_ok["status"] == "offline_reverify"
+    raw_a = tmp_path / "raw_a.json"
+    raw_a.write_text(json.dumps(_raw_l0_samples(A2_SKU, scale=1.01)), encoding="utf-8")
+    cal_a = calibrate_l0_and_fabric(sku=A2_SKU, raw_l0_json=raw_a)["primitives_payload"]
+    a_rows, a_preds, _, a_abis, a_shas = _plan_fixture_bundle(full_plan, scale=1.01, capture_dir=cap_dir_a)
+    val_a = validate_512_400k(sku=A2_SKU, primitives_json=cal_a, profiler_runner=lambda _p: a_rows, abi_rejection_results=a_abis, capture_root=cap_dir_a, runner=_independent_engine_runner(a_preds, prog_sha_by_id=a_shas))
+    cross_spoof = verify_sku_gates(sku=A2_SKU, validation_report_json=val_a, multilevel_manifest_json=full_f, capture_root=cap_dir, runner=_independent_engine_runner(m_preds, prog_sha_by_id=m_shas), primitives_json=cal_full, lean_bounds_json=m_leans, acquisition_mode="live_silicon", repo_root=_synthetic_repo(tmp_path, family="ml_spoof"))
+    assert cross_spoof["ok"] is False and cross_spoof["status"] != "silicon_certified"

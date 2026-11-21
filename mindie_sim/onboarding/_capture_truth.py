@@ -48,7 +48,31 @@ from .contracts import (
 
 _P99_QUANTILE = 0.99
 _SAMPLE_DECLARE_TOLERANCE_NS = 1
+_MAX_CAPTURE_SCAN_FILES = 4096
 _OPAQUE_LEASE_DIGEST_RE = re.compile(r"^lease-[0-9a-f]{16}$")
+
+
+def _find_capture_by_digest(root_path: Path, raw_sha256: str) -> Path | None:
+    sha = str(raw_sha256 or "").strip().lower()
+    if sha.startswith("sha256:"):
+        sha = sha[7:]
+    if not sha or not root_path.is_dir():
+        return None
+    wanted = {f"{sha}.json", f"{sha}.jsonl"}
+    for name in (f"{sha}.json", f"{sha}.jsonl"):
+        cand = root_path / name
+        if cand.is_file():
+            return cand
+    checked = 0
+    for cand in root_path.rglob("*"):
+        if not cand.is_file():
+            continue
+        checked += 1
+        if cand.name.lower() in wanted:
+            return cand
+        if checked >= _MAX_CAPTURE_SCAN_FILES:
+            break
+    return None
 
 
 def _quantile_ns(sorted_ns: Sequence[int], q: float) -> int:
@@ -139,6 +163,8 @@ def resolve_and_verify_capture_truth(
         case_id=cid,
         raw_sha256=boundary.raw_sha256,
     )
+    if resolved is None and root_path is not None:
+        resolved = _find_capture_by_digest(root_path, boundary.raw_sha256)
     if resolved is None:
         if require_capture_files:
             raise ModelingError(f"capture_file_missing:{cid}")

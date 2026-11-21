@@ -59,6 +59,7 @@ from .contracts import (
     TRAIN_OBSERVATION_MANIFEST_SCHEMA,
     TimeoutBudget,
     assert_sanitized_payload,
+    collect_receipt_warnings,
     sanitize_lease_for_receipt,
     sanitize_public_campaign_id,
     write_atomic_json,
@@ -277,10 +278,11 @@ def _collect_live_fabric_via_profiler(
     *,
     sku: str,
     endpoint_alias: str,
-    profiler_root: str | Path,
+    profiler_root: str | Path | None,
     granted_devices: Sequence[int],
     fence_token: int | None,
     timeout_s: int,
+    ssh_runner: Callable[[str, str, int], Any] | None = None,
 ) -> dict[str, Any] | None:
     fab_plan = {
         "schema": "mindie-sim.cliff-bench-plan/2",
@@ -292,6 +294,7 @@ def _collect_live_fabric_via_profiler(
         fab_plan, sku=sku, profiler_root=profiler_root,
         endpoint_alias=endpoint_alias, allowed_phy_ids=granted_devices,
         fence_token=fence_token, domain=_FABRIC_DOMAIN_ID, timeout_s=timeout_s,
+        ssh_runner=ssh_runner,
     )
     h2d_bps, d2h_bps = [], []
     for row in obs_rows:
@@ -340,6 +343,7 @@ def calibrate_l0_and_fabric(
     coordinator_bin: str = "",
     profile_override: Mapping[str, Any] | None = None,
     probe_cann_version: str = "",
+    ssh_runner: Callable[[str, str, int], Any] | None = None,
 ) -> dict[str, Any]:
     """Stage 2: Acquire HostQueue lease, run L0+fabric calibration, seal via canonical sealer."""
     resolved_outer = (
@@ -363,6 +367,7 @@ def calibrate_l0_and_fabric(
         )
 
     use_live = bool(live_bench and raw_l0_json is None and l0_runner is None)
+    require_grant = bool(live_bench or lease_acquirer is not None)
     if lease_acquirer is not None:
         lease_ctx: AbstractContextManager[Mapping[str, Any]] = lease_acquirer(sku, budget.outer_timeout_s)
     elif use_live:
@@ -384,7 +389,7 @@ def calibrate_l0_and_fabric(
     fabric_coverage = "not_provided"
     with lease_ctx as acquired:
         raw_lease_info = acquired if isinstance(acquired, Mapping) else {}
-        if use_live:
+        if require_grant:
             _, fence_val, granted_devices, _ = validate_host_queue_grant(
                 raw_lease_info,
                 required_devices=1,
@@ -411,6 +416,7 @@ def calibrate_l0_and_fabric(
         else:
             raw_l0 = None
 
+        remote_ep = endpoint_alias.strip().lower() not in {"", "local", "localhost", "127.0.0.1", "::1"}
         if raw_fabric_json is not None:
             parsed_fab, fab_sha = _read_bounded_json_and_sha256(Path(raw_fabric_json))
             extra_train_digests.append(fab_sha)
@@ -419,12 +425,13 @@ def calibrate_l0_and_fabric(
         elif fabric_runner is not None:
             raw_fabric = unwrap_capture_envelope(dict(fabric_runner(sku, int(fabric_budget_s))))
             fabric_coverage = "provided_runner"
-        elif use_live and profiler_root is not None:
+        elif use_live and (profiler_root is not None or ssh_runner is not None or remote_ep):
             raw_fabric = _collect_live_fabric_via_profiler(
                 sku=sku, endpoint_alias=endpoint_alias, profiler_root=profiler_root,
                 granted_devices=granted_devices,
                 fence_token=int(fence_val) if type(fence_val) is int else None,
                 timeout_s=int(fabric_budget_s),
+                ssh_runner=ssh_runner,
             )
             fabric_coverage = "collected_live_profiler" if raw_fabric else "missing_live_fabric_samples"
         elif use_live:
@@ -501,9 +508,10 @@ def calibrate_l0_and_fabric(
         "coverage_matrix": coverage_matrix,
         "train_manifest": train_manifest, "primitives_payload": payload,
     }
-    if public_lease.get("receipt_unconfirmed"):
-        result["receipt_unconfirmed"] = True
-        result["receipt_warning"] = public_lease.get("receipt_warning", "")
+    rec_unconf, rec_warn = collect_receipt_warnings(public_lease)
+    if rec_unconf or rec_warn:
+        result["receipt_unconfirmed"] = rec_unconf
+        result["receipt_warning"] = rec_warn
     assert_sanitized_payload(result, field_name="calibrate_l0_result")
     return result
 
