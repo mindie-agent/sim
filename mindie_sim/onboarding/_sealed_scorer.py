@@ -32,13 +32,13 @@ from mindie_sim.observations.multilevel_gate import (
 from mindie_sim.primitives.schema import PrimitiveTable
 from mindie_sim.schema.common import ModelingError
 
-from ._capture_truth import build_content_digest_index, verify_capture_and_override_case
+from ._capture_truth import verify_capture_and_override_case
 from ._lean_and_receipts import validate_strict_threshold_pct
 from ._whitebox_runner import WhiteboxSpineRunner, check_no_service_regimes
 from .contracts import (
-    DEFAULT_CLOCK_OPERATOR, DEFAULT_HELDOUT_APE_THRESHOLD_PCT, DISPLAY_ROUND_DIGITS,
-    FORBIDDEN_CALLER_PREDICTION_KEYS, NS_PER_MS, NS_PER_US, PERCENT_SCALE,
-    VALID_CLOCK_OPERATORS, assert_sanitized_payload, sanitize_public_alias,
+    DEFAULT_CLOCK_OPERATOR, DEFAULT_HELDOUT_APE_THRESHOLD_PCT, DEFAULT_PHYSICAL_ATOL_NS,
+    DISPLAY_ROUND_DIGITS, FORBIDDEN_CALLER_PREDICTION_KEYS, NS_PER_MS, NS_PER_US,
+    PERCENT_SCALE, VALID_CLOCK_OPERATORS, assert_sanitized_payload, sanitize_public_alias,
     sanitize_public_capture_uri, sanitize_public_run_id,
 )
 
@@ -50,6 +50,18 @@ STANDARD_LEVEL_BOUNDARY_KINDS: Mapping[str, str] = {
 REQUIRED_MULTILEVEL_LEVELS = ("L1", "L2", "L3")
 _P90_QUANTILE = 0.90
 _ALLOWED_OK_STATUSES = frozenset({"", "ok", "pass", "passed", "success"})
+
+
+def exceeds_physical_tolerance(
+    predicted_ns: int,
+    measured_ns: int,
+    *,
+    threshold_pct: float,
+    atol_ns: int = DEFAULT_PHYSICAL_ATOL_NS,
+) -> bool:
+    """Return True iff ``|predicted_ns - measured_ns| > max(rtol * measured_ns, atol_ns)``."""
+    tol_ns = max((float(threshold_pct) / PERCENT_SCALE) * float(measured_ns), float(atol_ns))
+    return abs(int(predicted_ns) - int(measured_ns)) > tol_ns
 
 
 def _norm_digest(token: str) -> str:
@@ -302,7 +314,7 @@ def _row_to_gate_case(row: Mapping[str, Any], *, sku: str, idx: int, plan_pt: Ma
     clock_op = resolve_authoritative_clock_operator(row, cid, plan_pt=plan_pt)
     coord_keys = (
         "sim_case", "target_op_id", "target_family", "target_layer", "target_op_ids",
-        "measured_binding", "actual_shape", "plan_key",
+        "measured_binding", "actual_shape", "plan_key", "timed_nodes",
         "context_len", "tokens", "batch_size", "query_tokens", "batch_x_kv_heads", "parallel_topology", "topk",
     )
     if isinstance(row.get("boundary"), Mapping) and isinstance(row.get("cohort"), Mapping):
@@ -505,67 +517,25 @@ def _bind_active_runner(
     return runner
 
 
-def score_sealed_gate_cases(
-    observations: Sequence[Mapping[str, Any]],
+def _build_and_verify_gate_cases(
+    scorable_rows: Sequence[Mapping[str, Any]],
     *,
     sku: str,
-    runner: EvaluationRunner | None = None,
-    primitive_table: PrimitiveTable | None = None,
-    profile_override: Mapping[str, Any] | None = None,
-    threshold_pct: float = DEFAULT_HELDOUT_APE_THRESHOLD_PCT,
-    external_train_roots: Sequence[str] = (),
-    external_train_digests: Sequence[str] = (),
-    external_train_uris: Sequence[str] = (),
-    expected_points: Sequence[Mapping[str, Any]] = (),
-    expected_train_points: Sequence[Mapping[str, Any]] = (),
-    expected_point_ids: Sequence[str] = (),
-    expected_family: str = "",
-    expected_implementations: Sequence[str] = (),
-    require_disjoint_level_roots: bool = True,
-    capture_root: str | Path | None = None,
-    capture_files: Mapping[str, str | Path] | None = None,
-    require_capture_files: bool = False,
-) -> dict[str, Any]:
-    """Score observations strictly via ``GateCase -> EvaluationRunner -> EngineRunReceipt``."""
-    cap_threshold = validate_strict_threshold_pct(threshold_pct)
-    plan_by_id: dict[str, Mapping[str, Any]] = {
-        str(pt["point_id"]): pt for pt in expected_points if isinstance(pt, Mapping) and pt.get("point_id")
-    }
-    train_plan_by_id: dict[str, Mapping[str, Any]] = {
-        str(pt["point_id"]): pt for pt in expected_train_points if isinstance(pt, Mapping) and pt.get("point_id")
-    }
-    all_expected_ids = sorted(set(expected_point_ids) | set(plan_by_id))
-    all_expected_train_ids = sorted(train_plan_by_id)
-    if not observations:
-        return {
-            "ok": False, "status": "insufficient_evidence", "sku": sku,
-            "threshold_pct": cap_threshold,
-            "lineage": {"train_roots": sorted(set(external_train_roots)), "heldout_roots": [], "level_roots": {}, "disjoint_ok": False},
-            "heldout_summary": _summarize_apes([], []), "train_summary": _summarize_apes([], []),
-            "missing_plan_points": all_expected_ids,
-            "missing_train_points": all_expected_train_ids,
-            "over_budget_points": [], "failing_cases": [], "residuals": [],
-        }
-
-    over_budget_rows: list[dict[str, Any]] = []
-    scorable_rows: list[Mapping[str, Any]] = []
-    for idx, row in enumerate(observations):
-        cid = str(row.get("case_id") or row.get("point_id") or f"obs-{idx}")
-        _check_no_caller_predictions(row, cid)
-        if str(row.get("status") or "").strip().lower() == "over_budget":
-            over_budget_rows.append({"case_id": cid, "point_id": str(row.get("point_id") or cid), "status": "over_budget", "executed_shape": row.get("executed_shape")})
-            continue
-        scorable_rows.append(row)
-
-    lineage = validate_disjoint_lineage(
-        scorable_rows,
-        external_train_roots=external_train_roots,
-        external_train_digests=external_train_digests,
-        external_train_uris=external_train_uris,
-        require_disjoint_level_roots=require_disjoint_level_roots,
-    )
-    allowed_impls = {str(x).strip() for x in expected_implementations if str(x).strip()}
-    exp_fam = expected_family.strip()
+    plan_by_id: Mapping[str, Mapping[str, Any]],
+    train_plan_by_id: Mapping[str, Mapping[str, Any]],
+    exp_fam: str,
+    allowed_impls: set[str],
+    capture_root: str | Path | None,
+    capture_files: Mapping[str, str | Path] | None,
+    require_capture_files: bool,
+) -> tuple[
+    list[GateCase],
+    dict[str, str],
+    dict[str, dict[str, Any]],
+    dict[str, Mapping[str, Any]],
+    dict[str, str | Path],
+    list[bool],
+]:
     cases: list[GateCase] = []
     expected_clock: dict[str, str] = {}
     case_meta: dict[str, dict[str, Any]] = {}
@@ -574,7 +544,6 @@ def score_sealed_gate_cases(
     seen_train_ids: set[str] = set()
     seen_heldout_captures: dict[tuple[str, frozenset[str], tuple[int, ...], str], str] = {}
     captures_verified_flags: list[bool] = []
-    digest_index = build_content_digest_index(Path(capture_root)) if capture_root is not None else None
     resolved_files: dict[str, str | Path] = dict(capture_files or {})
 
     for idx, row in enumerate(scorable_rows):
@@ -589,7 +558,7 @@ def score_sealed_gate_cases(
             capture_root=capture_root, capture_files=capture_files,
             require_capture_files=require_capture_files,
             row_p99_ns=extract_measured_p99_ns(row),
-            digest_index=digest_index,
+            digest_index=None,
             resolved_files=resolved_files,
         )
         captures_verified_flags.append(cap_verified)
@@ -630,40 +599,18 @@ def score_sealed_gate_cases(
             "start_event": gc.boundary.start_event, "end_event": gc.boundary.end_event,
             "clock_domain": gc.boundary.clock_domain, "parent_digests": list(gc.boundary.parent_digests),
         }
+    return cases, expected_clock, case_meta, plan_by_case, resolved_files, captures_verified_flags
 
-    manifest = Manifest(
-        manifest_id=f"onboarding-{sanitize_public_alias(sku, 'sku')}",
-        schema_version="mindie-multilevel-manifest/1",
-        cases=tuple(cases),
-        strict_three_level_blind=require_disjoint_level_roots,
-    )
-    all_fit_tokens = sorted(
-        {str(t).strip() for t in (*external_train_roots, *external_train_digests) if str(t).strip()}
-    )
-    fit_params = tuple(
-        FrozenFitParameter(parameter_id=f"train-tok-{i}", training_digests=(tok,))
-        for i, tok in enumerate(all_fit_tokens)
-    )
-    fits = FrozenFitManifest("onboarding-frozen-fits", "mindie-frozen-fits/1", fit_params)
-    eff_cap_files = resolved_files or capture_files
-    validate_lineage(
-        manifest, fits, capture_root=capture_root, capture_files=eff_cap_files,
-        require_capture_files=require_capture_files,
-    )
-    active_runner = _bind_active_runner(
-        runner, primitive_table=primitive_table, profile_override=profile_override
-    )
-    checked_runner = ClockParityRunner(
-        active_runner, expected_clock, expected_family=exp_fam, plan_by_case=plan_by_case
-    )
-    raw_residuals = list(
-        evaluate_multilevel(
-            manifest, fits, checked_runner, target_split="all",
-            capture_root=capture_root, capture_files=eff_cap_files,
-            require_capture_files=require_capture_files,
-        )
-    )
 
+def _aggregate_scored_residuals(
+    raw_residuals: Sequence[Any],
+    *,
+    case_meta: Mapping[str, Mapping[str, Any]],
+    expected_clock: Mapping[str, str],
+    engine_clocks: Mapping[str, Mapping[str, Any]],
+    cap_threshold: float,
+    atol_ns: int,
+) -> tuple[list[dict[str, Any]], list[float], list[float], list[float], list[float], list[str], set[str], set[str]]:
     residual_dicts: list[dict[str, Any]] = []
     heldout_apes, heldout_signed, train_apes, train_signed = [], [], [], []
     failing_cases: list[str] = []
@@ -671,15 +618,20 @@ def score_sealed_gate_cases(
     scored_train_ids: set[str] = set()
     for res in raw_residuals:
         meta = case_meta[res.case_id]
-        clk = checked_runner.engine_clocks.get(res.case_id, {})
+        clk = engine_clocks.get(res.case_id, {})
         scored_pred_ns = int(clk.get("scored_predicted_ns", res.predicted_ns))
         signed_err = (scored_pred_ns - res.measured_ns) / float(res.measured_ns) if res.measured_ns > 0 else res.signed_error
         ape = abs(signed_err)
         ape_pct = ape * PERCENT_SCALE
         signed_pct = signed_err * PERCENT_SCALE
+        abs_err_ns = abs(scored_pred_ns - int(res.measured_ns))
+        exceeds = exceeds_physical_tolerance(
+            scored_pred_ns, int(res.measured_ns), threshold_pct=cap_threshold, atol_ns=atol_ns
+        )
         row_dict = {
             **res.to_dict(),
             "predicted_ns": scored_pred_ns, "signed_error": signed_err, "absolute_percentage_error": ape,
+            "abs_error_ns": abs_err_ns, "atol_ns": atol_ns, "within_physical_tolerance": not exceeds,
             "point_id": meta["point_id"], "split": meta["split"],
             "target_family": meta["target_family"], "implementation": meta["implementation"],
             "operator_id": meta["operator_id"], "upstream_abi": meta["upstream_abi"],
@@ -701,13 +653,127 @@ def score_sealed_gate_cases(
             scored_heldout_ids.add(meta["point_id"])
             heldout_apes.append(ape_pct)
             heldout_signed.append(signed_pct)
-            if ape_pct >= cap_threshold:
+            if exceeds:
                 failing_cases.append(res.case_id)
         elif meta["split"] == "train" and res.status == "ok":
             scored_train_ids.add(meta["point_id"])
             train_apes.append(ape_pct)
             train_signed.append(signed_pct)
+    return residual_dicts, heldout_apes, heldout_signed, train_apes, train_signed, failing_cases, scored_heldout_ids, scored_train_ids
 
+
+def score_sealed_gate_cases(
+    observations: Sequence[Mapping[str, Any]],
+    *,
+    sku: str,
+    runner: EvaluationRunner | None = None,
+    primitive_table: PrimitiveTable | None = None,
+    profile_override: Mapping[str, Any] | None = None,
+    threshold_pct: float = DEFAULT_HELDOUT_APE_THRESHOLD_PCT,
+    atol_ns: int = DEFAULT_PHYSICAL_ATOL_NS,
+    external_train_roots: Sequence[str] = (),
+    external_train_digests: Sequence[str] = (),
+    external_train_uris: Sequence[str] = (),
+    expected_points: Sequence[Mapping[str, Any]] = (),
+    expected_train_points: Sequence[Mapping[str, Any]] = (),
+    expected_point_ids: Sequence[str] = (),
+    expected_family: str = "",
+    expected_implementations: Sequence[str] = (),
+    require_disjoint_level_roots: bool = True,
+    capture_root: str | Path | None = None,
+    capture_files: Mapping[str, str | Path] | None = None,
+    require_capture_files: bool = False,
+) -> dict[str, Any]:
+    """Score observations strictly via ``GateCase -> EvaluationRunner -> EngineRunReceipt``."""
+    cap_threshold = validate_strict_threshold_pct(threshold_pct)
+    eff_atol_ns = max(0, int(atol_ns))
+    plan_by_id: dict[str, Mapping[str, Any]] = {
+        str(pt["point_id"]): pt for pt in expected_points if isinstance(pt, Mapping) and pt.get("point_id")
+    }
+    train_plan_by_id: dict[str, Mapping[str, Any]] = {
+        str(pt["point_id"]): pt for pt in expected_train_points if isinstance(pt, Mapping) and pt.get("point_id")
+    }
+    all_expected_ids = sorted(set(expected_point_ids) | set(plan_by_id))
+    all_expected_train_ids = sorted(train_plan_by_id)
+    if not observations:
+        return {
+            "ok": False, "status": "insufficient_evidence", "sku": sku,
+            "threshold_pct": cap_threshold, "atol_ns": eff_atol_ns,
+            "lineage": {"train_roots": sorted(set(external_train_roots)), "heldout_roots": [], "level_roots": {}, "disjoint_ok": False},
+            "heldout_summary": _summarize_apes([], []), "train_summary": _summarize_apes([], []),
+            "missing_plan_points": all_expected_ids, "missing_train_points": all_expected_train_ids,
+            "over_budget_points": [], "failing_cases": [], "residuals": [],
+        }
+
+    over_budget_rows: list[dict[str, Any]] = []
+    scorable_rows: list[Mapping[str, Any]] = []
+    for idx, row in enumerate(observations):
+        cid = str(row.get("case_id") or row.get("point_id") or f"obs-{idx}")
+        _check_no_caller_predictions(row, cid)
+        if str(row.get("status") or "").strip().lower() == "over_budget":
+            over_budget_rows.append({"case_id": cid, "point_id": str(row.get("point_id") or cid), "status": "over_budget", "executed_shape": row.get("executed_shape")})
+            continue
+        scorable_rows.append(row)
+
+    lineage = validate_disjoint_lineage(
+        scorable_rows,
+        external_train_roots=external_train_roots,
+        external_train_digests=external_train_digests,
+        external_train_uris=external_train_uris,
+        require_disjoint_level_roots=require_disjoint_level_roots,
+    )
+    exp_fam = expected_family.strip()
+    allowed_impls = {str(x).strip() for x in expected_implementations if str(x).strip()}
+    cases, expected_clock, case_meta, plan_by_case, resolved_files, captures_verified_flags = (
+        _build_and_verify_gate_cases(
+            scorable_rows, sku=sku, plan_by_id=plan_by_id, train_plan_by_id=train_plan_by_id,
+            exp_fam=exp_fam, allowed_impls=allowed_impls,
+            capture_root=capture_root, capture_files=capture_files,
+            require_capture_files=require_capture_files,
+        )
+    )
+    manifest = Manifest(
+        manifest_id=f"onboarding-{sanitize_public_alias(sku, 'sku')}",
+        schema_version="mindie-multilevel-manifest/1",
+        cases=tuple(cases),
+        strict_three_level_blind=require_disjoint_level_roots,
+    )
+    all_fit_tokens = sorted(
+        {str(t).strip() for t in (*external_train_roots, *external_train_digests) if str(t).strip()}
+    )
+    fits = FrozenFitManifest(
+        "onboarding-frozen-fits",
+        "mindie-frozen-fits/1",
+        tuple(
+            FrozenFitParameter(parameter_id=f"train-tok-{i}", training_digests=(tok,))
+            for i, tok in enumerate(all_fit_tokens)
+        ),
+    )
+    eff_cap_files = resolved_files or capture_files
+    validate_lineage(
+        manifest, fits, capture_root=capture_root, capture_files=eff_cap_files,
+        require_capture_files=require_capture_files,
+    )
+    active_runner = _bind_active_runner(
+        runner, primitive_table=primitive_table, profile_override=profile_override
+    )
+    checked_runner = ClockParityRunner(
+        active_runner, expected_clock, expected_family=exp_fam, plan_by_case=plan_by_case
+    )
+    raw_residuals = list(
+        evaluate_multilevel(
+            manifest, fits, checked_runner, target_split="all",
+            capture_root=capture_root, capture_files=eff_cap_files,
+            require_capture_files=require_capture_files,
+        )
+    )
+    (
+        residual_dicts, heldout_apes, heldout_signed, train_apes, train_signed,
+        failing_cases, scored_heldout_ids, scored_train_ids,
+    ) = _aggregate_scored_residuals(
+        raw_residuals, case_meta=case_meta, expected_clock=expected_clock,
+        engine_clocks=checked_runner.engine_clocks, cap_threshold=cap_threshold, atol_ns=eff_atol_ns,
+    )
     missing_plan_points = sorted(set(all_expected_ids) - scored_heldout_ids)
     missing_train_points = sorted(set(all_expected_train_ids) - scored_train_ids)
     if not heldout_apes or missing_plan_points or missing_train_points:
@@ -718,7 +784,8 @@ def score_sealed_gate_cases(
         ok, status = True, "pass"
 
     result = {
-        "ok": ok, "status": status, "sku": sku, "threshold_pct": cap_threshold,
+        "ok": ok, "status": status, "sku": sku,
+        "threshold_pct": cap_threshold, "atol_ns": eff_atol_ns,
         "capture_files_verified": bool(captures_verified_flags) and all(captures_verified_flags),
         "lineage": lineage,
         "heldout_summary": _summarize_apes(heldout_apes, heldout_signed),
@@ -740,6 +807,7 @@ __all__ = [
     "STANDARD_LEVEL_BOUNDARY_KINDS",
     "ClockParityRunner",
     "WhiteboxSpineRunner",
+    "exceeds_physical_tolerance",
     "extract_measured_p99_ns",
     "measured_ns_from_row",
     "resolve_authoritative_clock_operator",

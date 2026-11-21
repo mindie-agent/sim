@@ -247,6 +247,166 @@ def _append_guarded_point(
     )
 
 
+def _pick_cross_context(
+    candidates: tuple[int, ...],
+    idx: int,
+    *,
+    params: OperatorCliffParameters,
+    axes: TilingAxes,
+    arch_preset: str,
+) -> int:
+    rotated = [candidates[(idx + offset) % len(candidates)] for offset in range(len(candidates))]
+    for cand in (*rotated, *OFF_GRID_CLIFF_HELDOUT_GRID):
+        if params.context_min <= cand <= params.context_max:
+            ok_c, _ = validate_abi(
+                {"axis": "context_len", "value": cand, "context_len": cand, "batch_size": 1, "query_tokens": 1},
+                axes,
+                arch_preset=arch_preset,
+            )
+            if ok_c:
+                return cand
+    return candidates[idx % len(candidates)]
+
+
+def _append_cross_sample_cliffs(
+    add_point: Any,
+    *,
+    params: OperatorCliffParameters,
+    axes: TilingAxes,
+    arch_preset: str,
+) -> None:
+    for ctx in OFF_GRID_CLIFF_HELDOUT_GRID:
+        if params.context_min <= ctx <= params.context_max:
+            add_point(
+                point_id=f"offgrid_ctx_{ctx}", grid_kind="off_grid_cliff",
+                axis="context_len", value=ctx, regime_tag="off_grid_heldout",
+                rationale="canonical_off_grid_cliff_heldout_grid",
+            )
+    for idx, batch in enumerate(b for b in axes.batch_axis if b > 1):
+        ctx = _pick_cross_context(_CROSS_BATCH_CONTEXTS, idx, params=params, axes=axes, arch_preset=arch_preset)
+        if params.context_min <= ctx <= params.context_max:
+            add_point(
+                point_id=f"cross_b{batch}_ctx_{ctx}", grid_kind="cross_sample_2d",
+                axis="context_len", value=ctx, regime_tag="high_batch_decode_2d",
+                rationale="2d_high_batch_decode_core_wave_cliff",
+                batch_size=batch, query_tokens=1,
+            )
+    for idx, q_tok in enumerate(q for q in axes.query_tokens_axis if 1 < q < _CROSS_CHUNK_THRESHOLD):
+        ctx = _pick_cross_context(_CROSS_MTP_CONTEXTS, idx, params=params, axes=axes, arch_preset=arch_preset)
+        if params.context_min <= ctx <= params.context_max:
+            add_point(
+                point_id=f"cross_mtp_q{q_tok}_ctx_{ctx}", grid_kind="cross_sample_2d",
+                axis="context_len", value=ctx, regime_tag="mtp_decode_2d",
+                rationale="2d_mtp_multi_query_decode_cliff",
+                batch_size=1, query_tokens=q_tok,
+            )
+    for idx, q_tok in enumerate(q for q in axes.query_tokens_axis if q >= _CROSS_CHUNK_THRESHOLD):
+        ctx = _pick_cross_context(_CROSS_CHUNK_CONTEXTS, idx, params=params, axes=axes, arch_preset=arch_preset)
+        if params.context_min <= ctx <= params.context_max:
+            add_point(
+                point_id=f"cross_chunk_q{q_tok}_ctx_{ctx}", grid_kind="cross_sample_2d",
+                axis="context_len", value=ctx, regime_tag="chunked_prefill_2d",
+                rationale="2d_long_context_chunked_prefill_cliff",
+                batch_size=1, query_tokens=q_tok,
+            )
+    for ctx, topo in _CROSS_PARALLEL_SPECS:
+        if ctx >= CROSS_SAMPLE_PARALLEL_CONTEXT_MIN and params.context_min <= ctx <= params.context_max:
+            add_point(
+                point_id=f"cross_{topo}_ctx_{ctx}", grid_kind="cross_sample_2d",
+                axis="context_len", value=ctx, regime_tag="multi_rank_cp_2d",
+                rationale="2d_multi_rank_pcp_dcp_long_context_cliff",
+                batch_size=1, query_tokens=1, parallel_topology=topo,
+            )
+
+
+def _append_boundary_and_topk_cliffs(
+    add_point: Any,
+    *,
+    params: OperatorCliffParameters,
+    axes: TilingAxes,
+    arch_preset: str,
+) -> None:
+    core_axes = tuple(axes.core_product_axes) or ("tokens",)
+    for tile in axes.tile_dims:
+        for delta, tag in ((-1, "minus1"), (0, "exact"), (1, "plus1")):
+            add_point(
+                point_id=f"tile_{tile}_{tag}_{tile + delta}", grid_kind="boundary_cliff",
+                axis="tokens", value=tile + delta, regime_tag="tile_boundary",
+                rationale=f"tile_dim({tile}){delta:+d}_tail_wave_boundary",
+            )
+        full_wave = params.core_count * tile
+        for c_axis in core_axes:
+            axis_key = "tokens" if c_axis == "tokens" else c_axis
+            for delta, tag in ((-1, "minus1"), (1, "plus1")):
+                add_point(
+                    point_id=f"cores_wave_{axis_key}_{tile}_{tag}_{full_wave + delta}",
+                    grid_kind="boundary_cliff",
+                    axis=axis_key, value=full_wave + delta, regime_tag="core_wave_cliff",
+                    rationale=f"cores({params.core_count})*tile({tile}){delta:+d}_on_{axis_key}",
+                )
+
+    topk_thresholds: list[int] = [int(params.topk_threshold)] if params.topk_threshold is not None else []
+    for pt_axis, thresh in axes.phase_thresholds:
+        if pt_axis == "topk":
+            if int(thresh) not in topk_thresholds:
+                topk_thresholds.append(int(thresh))
+            continue
+        for delta, tag in ((-1, "minus1"), (0, "exact"), (1, "plus1")):
+            val = thresh + delta
+            if pt_axis == "context_len" and not (params.context_min <= val <= params.context_max):
+                continue
+            add_point(
+                point_id=f"phase_{pt_axis}_{thresh}_{tag}_{val}",
+                grid_kind="boundary_cliff",
+                axis=pt_axis, value=val, regime_tag="declared_phase_threshold",
+                rationale=f"phase_threshold({pt_axis}={thresh}){delta:+d}",
+            )
+    for rule in axes.abi_divisibility:
+        if rule.applies_to(arch_preset) and rule.axis == "topk":
+            if rule.above_threshold > 0 and rule.above_threshold not in topk_thresholds:
+                topk_thresholds.append(int(rule.above_threshold))
+
+    for tk in topk_thresholds:
+        add_point(
+            point_id=f"topk_ctx_{tk + 1}_k_{tk}", grid_kind="boundary_cliff",
+            axis="context_len", value=tk + 1, regime_tag="topk_perf_cliff",
+            rationale=f"legal_sparse_topk_perf_cliff:ctx={tk + 1}:topk={tk}", topk=tk,
+        )
+        add_point(
+            point_id=f"topk_ctx_{tk - 1}_k_{tk - 1}", grid_kind="boundary_cliff",
+            axis="context_len", value=tk - 1, regime_tag="topk_pre_threshold",
+            rationale=f"legal_sparse_topk_below_threshold:ctx={tk - 1}:topk={tk - 1}", topk=tk - 1,
+        )
+        add_point(
+            point_id=f"topk_attr_{tk + 1}", grid_kind="boundary_cliff",
+            axis="context_len", value=tk + 1, regime_tag="topk_threshold_plus1",
+            rationale=f"topk_threshold({tk})+1_abi_alignment_guard", topk=tk + 1,
+        )
+
+    seen_over_max_axes: set[str] = set()
+    for rule in axes.abi_divisibility:
+        if rule.applies_to(arch_preset) and rule.axis == "topk" and rule.max_value is not None:
+            if rule.axis in seen_over_max_axes:
+                continue
+            seen_over_max_axes.add(rule.axis)
+            over_max = rule.max_value + 1
+            add_point(
+                point_id=f"topk_over_max_{over_max}", grid_kind="boundary_cliff",
+                axis="context_len", value=min(params.context_max, max(params.context_min, over_max)),
+                regime_tag="topk_over_max_guard",
+                rationale=f"topk_max({rule.max_value})_exceeded_abi_guard", topk=over_max,
+            )
+
+    if params.bytes_per_token > 0:
+        l2_knee = _clamp_in_domain(params.l2_bytes // params.bytes_per_token, low=2)
+        for delta, tag in ((-1, "minus1"), (1, "plus1")):
+            add_point(
+                point_id=f"l2_knee_{tag}_{l2_knee + delta}", grid_kind="boundary_cliff",
+                axis="context_len", value=l2_knee + delta, regime_tag="l2_capacity_knee",
+                rationale=f"l2_capacity_knee({l2_knee}){delta:+d}_residency_cliff",
+            )
+
+
 def synthesize_operator_cliff_plan(
     params: OperatorCliffParameters,
     *,
@@ -281,12 +441,8 @@ def synthesize_operator_cliff_plan(
                 train_keys.add(("context_len", ctx))
                 train_points.append(
                     CliffPointSpec(
-                        point_id=f"anchor_ctx_{ctx}",
-                        split="train",
-                        grid_kind="anchor",
-                        axis="context_len",
-                        value=ctx,
-                        regime_tag="anchor_train",
+                        point_id=f"anchor_ctx_{ctx}", split="train", grid_kind="anchor",
+                        axis="context_len", value=ctx, regime_tag="anchor_train",
                         rationale="canonical_anchor_context_grid_512_to_409600",
                     )
                 )
@@ -305,159 +461,12 @@ def synthesize_operator_cliff_plan(
             train_keys=train_keys, axes=axes, arch_preset=resolved_arch, **kw,
         )
 
-    for ctx in OFF_GRID_CLIFF_HELDOUT_GRID:
-        if params.context_min <= ctx <= params.context_max:
-            _add(
-                point_id=f"offgrid_ctx_{ctx}", grid_kind="off_grid_cliff",
-                axis="context_len", value=ctx, regime_tag="off_grid_heldout",
-                rationale="canonical_off_grid_cliff_heldout_grid",
-            )
-
-    def _pick_ctx(candidates: tuple[int, ...], idx: int) -> int:
-        rotated = [candidates[(idx + offset) % len(candidates)] for offset in range(len(candidates))]
-        for cand in (*rotated, *OFF_GRID_CLIFF_HELDOUT_GRID):
-            if params.context_min <= cand <= params.context_max:
-                ok_c, _ = validate_abi(
-                    {"axis": "context_len", "value": cand, "context_len": cand, "batch_size": 1, "query_tokens": 1},
-                    axes,
-                    arch_preset=resolved_arch,
-                )
-                if ok_c:
-                    return cand
-        return candidates[idx % len(candidates)]
-
-    for idx, batch in enumerate(b for b in axes.batch_axis if b > 1):
-        ctx = _pick_ctx(_CROSS_BATCH_CONTEXTS, idx)
-        if params.context_min <= ctx <= params.context_max:
-            _add(
-                point_id=f"cross_b{batch}_ctx_{ctx}", grid_kind="cross_sample_2d",
-                axis="context_len", value=ctx, regime_tag="high_batch_decode_2d",
-                rationale="2d_high_batch_decode_core_wave_cliff",
-                batch_size=batch, query_tokens=1,
-            )
-
-    for idx, q_tok in enumerate(q for q in axes.query_tokens_axis if 1 < q < _CROSS_CHUNK_THRESHOLD):
-        ctx = _pick_ctx(_CROSS_MTP_CONTEXTS, idx)
-        if params.context_min <= ctx <= params.context_max:
-            _add(
-                point_id=f"cross_mtp_q{q_tok}_ctx_{ctx}", grid_kind="cross_sample_2d",
-                axis="context_len", value=ctx, regime_tag="mtp_decode_2d",
-                rationale="2d_mtp_multi_query_decode_cliff",
-                batch_size=1, query_tokens=q_tok,
-            )
-
-    for idx, q_tok in enumerate(q for q in axes.query_tokens_axis if q >= _CROSS_CHUNK_THRESHOLD):
-        ctx = _pick_ctx(_CROSS_CHUNK_CONTEXTS, idx)
-        if params.context_min <= ctx <= params.context_max:
-            _add(
-                point_id=f"cross_chunk_q{q_tok}_ctx_{ctx}", grid_kind="cross_sample_2d",
-                axis="context_len", value=ctx, regime_tag="chunked_prefill_2d",
-                rationale="2d_long_context_chunked_prefill_cliff",
-                batch_size=1, query_tokens=q_tok,
-            )
-
-    for ctx, topo in _CROSS_PARALLEL_SPECS:
-        if ctx >= CROSS_SAMPLE_PARALLEL_CONTEXT_MIN and params.context_min <= ctx <= params.context_max:
-            _add(
-                point_id=f"cross_{topo}_ctx_{ctx}", grid_kind="cross_sample_2d",
-                axis="context_len", value=ctx, regime_tag="multi_rank_cp_2d",
-                rationale="2d_multi_rank_pcp_dcp_long_context_cliff",
-                batch_size=1, query_tokens=1, parallel_topology=topo,
-            )
-
-    core_axes = tuple(axes.core_product_axes) or ("tokens",)
-    for tile in axes.tile_dims:
-        for delta, tag in ((-1, "minus1"), (0, "exact"), (1, "plus1")):
-            _add(
-                point_id=f"tile_{tile}_{tag}_{tile + delta}", grid_kind="boundary_cliff",
-                axis="tokens", value=tile + delta, regime_tag="tile_boundary",
-                rationale=f"tile_dim({tile}){delta:+d}_tail_wave_boundary",
-            )
-        full_wave = params.core_count * tile
-        for c_axis in core_axes:
-            axis_key = "tokens" if c_axis == "tokens" else c_axis
-            for delta, tag in ((-1, "minus1"), (1, "plus1")):
-                _add(
-                    point_id=f"cores_wave_{axis_key}_{tile}_{tag}_{full_wave + delta}",
-                    grid_kind="boundary_cliff",
-                    axis=axis_key, value=full_wave + delta, regime_tag="core_wave_cliff",
-                    rationale=f"cores({params.core_count})*tile({tile}){delta:+d}_on_{axis_key}",
-                )
-
-    topk_thresholds: list[int] = []
-    if params.topk_threshold is not None:
-        topk_thresholds.append(int(params.topk_threshold))
-    for pt_axis, thresh in axes.phase_thresholds:
-        if pt_axis == "topk":
-            if int(thresh) not in topk_thresholds:
-                topk_thresholds.append(int(thresh))
-            continue
-        for delta, tag in ((-1, "minus1"), (0, "exact"), (1, "plus1")):
-            val = thresh + delta
-            if pt_axis == "context_len" and not (params.context_min <= val <= params.context_max):
-                continue
-            _add(
-                point_id=f"phase_{pt_axis}_{thresh}_{tag}_{val}",
-                grid_kind="boundary_cliff",
-                axis=pt_axis, value=val, regime_tag="declared_phase_threshold",
-                rationale=f"phase_threshold({pt_axis}={thresh}){delta:+d}",
-            )
-    for rule in axes.abi_divisibility:
-        if rule.applies_to(resolved_arch) and rule.axis == "topk":
-            if rule.above_threshold > 0 and rule.above_threshold not in topk_thresholds:
-                topk_thresholds.append(int(rule.above_threshold))
-
-    for tk in topk_thresholds:
-        _add(
-            point_id=f"topk_ctx_{tk + 1}_k_{tk}", grid_kind="boundary_cliff",
-            axis="context_len", value=tk + 1, regime_tag="topk_perf_cliff",
-            rationale=f"legal_sparse_topk_perf_cliff:ctx={tk + 1}:topk={tk}",
-            topk=tk,
-        )
-        _add(
-            point_id=f"topk_ctx_{tk - 1}_k_{tk - 1}", grid_kind="boundary_cliff",
-            axis="context_len", value=tk - 1, regime_tag="topk_pre_threshold",
-            rationale=f"legal_sparse_topk_below_threshold:ctx={tk - 1}:topk={tk - 1}",
-            topk=tk - 1,
-        )
-        _add(
-            point_id=f"topk_attr_{tk + 1}", grid_kind="boundary_cliff",
-            axis="context_len", value=tk + 1, regime_tag="topk_threshold_plus1",
-            rationale=f"topk_threshold({tk})+1_abi_alignment_guard",
-            topk=tk + 1,
-        )
-
-    seen_over_max_axes: set[str] = set()
-    for rule in axes.abi_divisibility:
-        if rule.applies_to(resolved_arch) and rule.axis == "topk" and rule.max_value is not None:
-            if rule.axis in seen_over_max_axes:
-                continue
-            seen_over_max_axes.add(rule.axis)
-            over_max = rule.max_value + 1
-            _add(
-                point_id=f"topk_over_max_{over_max}", grid_kind="boundary_cliff",
-                axis="context_len", value=min(params.context_max, max(params.context_min, over_max)),
-                regime_tag="topk_over_max_guard",
-                rationale=f"topk_max({rule.max_value})_exceeded_abi_guard",
-                topk=over_max,
-            )
-
-    if params.bytes_per_token > 0:
-        l2_knee = _clamp_in_domain(params.l2_bytes // params.bytes_per_token, low=2)
-        for delta, tag in ((-1, "minus1"), (1, "plus1")):
-            _add(
-                point_id=f"l2_knee_{tag}_{l2_knee + delta}", grid_kind="boundary_cliff",
-                axis="context_len", value=l2_knee + delta, regime_tag="l2_capacity_knee",
-                rationale=f"l2_capacity_knee({l2_knee}){delta:+d}_residency_cliff",
-            )
+    _append_cross_sample_cliffs(_add, params=params, axes=axes, arch_preset=resolved_arch)
+    _append_boundary_and_topk_cliffs(_add, params=params, axes=axes, arch_preset=resolved_arch)
 
     body = {
-        "schema": CLIFF_PLAN_SCHEMA,
-        "target_id": params.operator_id,
-        "family": params.family,
-        "sku": sku,
-        "campaign_id": clean_campaign,
-        "cold_ring_l2_multiplier": COLD_RING_L2_MULTIPLIER,
+        "schema": CLIFF_PLAN_SCHEMA, "target_id": params.operator_id, "family": params.family,
+        "sku": sku, "campaign_id": clean_campaign, "cold_ring_l2_multiplier": COLD_RING_L2_MULTIPLIER,
         "train_points": [pt.to_dict() for pt in train_points],
         "heldout_points": [pt.to_dict() for pt in heldout],
         "abi_rejection_points": [pt.to_dict() for pt in abi_rejections],
@@ -466,20 +475,13 @@ def synthesize_operator_cliff_plan(
     plan_sha256 = hashlib.sha256(canonical_json_bytes(body)).hexdigest()
     short = plan_sha256[:SHORT_DIGEST_LEN]
     plan = CliffBenchPlan(
-        schema=CLIFF_PLAN_SCHEMA,
-        plan_id=f"plan-{clean_sku}-{short}",
-        target_id=params.operator_id,
-        sku=sku,
-        train_lineage_root=f"acq-train-{clean_campaign}-{short}",
+        schema=CLIFF_PLAN_SCHEMA, plan_id=f"plan-{clean_sku}-{short}", target_id=params.operator_id,
+        sku=sku, train_lineage_root=f"acq-train-{clean_campaign}-{short}",
         heldout_lineage_root=f"acq-heldout-{clean_campaign}-{short}",
         cold_ring_l2_multiplier=COLD_RING_L2_MULTIPLIER,
-        train_points=tuple(train_points),
-        heldout_points=tuple(heldout),
-        plan_sha256=plan_sha256,
-        abi_rejection_points=tuple(abi_rejections),
-        tiling_axes=axes,
-        family=params.family,
-        campaign_id=clean_campaign,
+        train_points=tuple(train_points), heldout_points=tuple(heldout),
+        plan_sha256=plan_sha256, abi_rejection_points=tuple(abi_rejections),
+        tiling_axes=axes, family=params.family, campaign_id=clean_campaign,
     )
     assert_sanitized_payload(plan.to_dict(), field_name="cliff_bench_plan")
     return plan
@@ -547,6 +549,22 @@ def _check_abi_row_shape(row: Mapping[str, Any], planned_pt: Mapping[str, Any]) 
         return "executed_shape_missing"
     shape_map = dict(shape_raw)
     planned_axis = str(planned_pt.get("axis") or "").strip()
+    alias_groups: list[tuple[str, tuple[str, ...]]] = [
+        ("topk", ("topk", "top_k", "sparse_count")),
+        ("query_tokens", ("query_tokens", "q_len")),
+    ]
+    if planned_axis != "batch_x_kv_heads":
+        alias_groups.append(("batch_size", ("batch_size", "sequences")))
+    for field, keys in alias_groups:
+        seen = [(k, shape_map[k]) for k in keys if k in shape_map and shape_map[k] is not None]
+        if any(type(v) is not int for _k, v in seen):
+            return f"shape_alias_invalid:{field}:{seen!r}"
+        if len({v for _k, v in seen}) > 1:
+            detail = ",".join(f"{k}={v}" for k, v in seen)
+            return f"shape_alias_conflict:{field}:{detail}"
+        if seen and field not in shape_map:
+            shape_map[field] = seen[0][1]
+
     planned_val = planned_pt.get("value")
     checks: list[tuple[str, Any, Any]] = [
         ("batch_size", planned_pt.get("batch_size", 1), shape_map.get("batch_size")),

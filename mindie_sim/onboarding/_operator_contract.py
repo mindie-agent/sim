@@ -439,6 +439,147 @@ def _verify_sim_owner_dispatch(
     return lower_ok, detail, violations
 
 
+def _scan_target_ast_contract(
+    files: Sequence[Path], *, is_family_pkg: bool
+) -> tuple[dict[str, str], list[dict[str, str]], set[str], str, set[str], list[str]]:
+    abis: dict[str, str] = {}
+    all_refs: list[dict[str, str]] = []
+    symbols: set[str] = set()
+    declared_builder = ""
+    declared_template_ids: set[str] = set()
+    shared_constants: dict[str, str] = {}
+    parsed_files: list[tuple[Path, ast.Module]] = []
+    violations: list[str] = []
+
+    for py_file in files:
+        tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
+        parsed_files.append((py_file, tree))
+        shared_constants.update(extract_module_str_constants(tree))
+    for py_file, tree in parsed_files:
+        top_names = extract_top_level_names(tree)
+        symbols |= extract_symbol_mentions(tree)
+        file_consts = {**shared_constants, **extract_module_str_constants(tree)}
+        declared_template_ids |= extract_declared_template_ids(tree, file_consts)
+        file_refs = extract_source_refs(tree, py_file, file_consts)
+        all_refs.extend(file_refs)
+        abi = extract_upstream_abi(tree)
+        if py_file.name in ("arch22.py", "arch35.py") or not is_family_pkg:
+            if not abi:
+                violations.append(f"missing_upstream_abi_header:{py_file.name}")
+            else:
+                abis[py_file.name] = abi
+            if is_family_pkg and "STRATEGY" not in top_names:
+                violations.append(f"missing_strategy_export:{py_file.name}")
+            if "SOURCES" not in top_names and not file_refs:
+                violations.append(f"missing_sources_declaration:{py_file.name}")
+        if not declared_builder and "PROFILER_BENCH_BUILDER" in file_consts:
+            declared_builder = file_consts["PROFILER_BENCH_BUILDER"]
+        violations.extend(find_unimplemented_stubs(tree, py_file))
+    if is_family_pkg and len(abis) >= 2 and len(set(abis.values())) < len(abis):
+        violations.append("duplicate_upstream_abi_across_arch_leaves")
+    return abis, all_refs, symbols, declared_builder, declared_template_ids, violations
+
+
+def _verify_source_refs_contract(
+    all_refs: Sequence[Mapping[str, str]],
+    *,
+    resolved_refs_root: Path | None,
+    resolved_repo_map: Mapping[str, Path],
+    require_mounted_refs: bool,
+) -> tuple[list[dict[str, Any]], bool, list[str]]:
+    violations: list[str] = []
+    if not all_refs:
+        violations.append("source_ref_missing")
+    source_checks: list[dict[str, Any]] = []
+    all_blobs_verified = bool(all_refs)
+    for ref in all_refs:
+        ref_errors: list[str] = []
+        if not ref["repository"]:
+            ref_errors.append("repository_empty")
+        if len(ref["revision"]) < HEX_COMMIT_LEN or not _HEX_RE.fullmatch(ref["revision"]):
+            ref_errors.append("revision_not_full_sha")
+        if not ref["relative_path"] or ref["relative_path"].startswith("/") or ".." in Path(ref["relative_path"]).parts:
+            ref_errors.append("relative_path_unsafe")
+        if len(ref["source_sha256"]) != SHA256_HEX_LENGTH or not _HEX_RE.fullmatch(ref["source_sha256"]):
+            ref_errors.append("source_sha256_invalid")
+        blob_status, blob_verified = "skipped_invalid_ref", False
+        if not ref_errors:
+            ok_blob, blob_verified, blob_status = _verify_git_blob_sha256(
+                ref, refs_root=resolved_refs_root, repo_map=resolved_repo_map, require_mounted_refs=require_mounted_refs,
+            )
+            if not ok_blob:
+                ref_errors.append(blob_status)
+        if not blob_verified:
+            all_blobs_verified = False
+        if ref_errors:
+            violations.append(f"source_ref_invalid:{ref['file']}:{','.join(ref_errors)}")
+        source_checks.append({**dict(ref), "status": blob_status, "blob_verified": blob_verified, "errors": ref_errors})
+    return source_checks, all_blobs_verified, violations
+
+
+def _verify_profiler_builder_contract(
+    *,
+    family: str,
+    declared_builder: str,
+    abis: Mapping[str, str],
+    sim_owner_detail: Mapping[str, Any],
+    profiler_root: str | Path | None,
+    profiler_family: str,
+    profiler_recipe: str,
+    profiler_impl: str,
+    profiler_dtypes: Sequence[str],
+    profiler_meta: Mapping[str, Any] | None,
+    require_profiler_builder: bool,
+) -> tuple[dict[str, Any], list[str]]:
+    violations: list[str] = []
+    builder_belongs = bool(
+        declared_builder
+        and (declared_builder == family or declared_builder.startswith(f"{family}_") or declared_builder.startswith(f"{family}."))
+    )
+    allowed_prof_families = {family} | ({declared_builder} if builder_belongs else set())
+    req_prof_family = profiler_family.strip()
+    if declared_builder and not builder_belongs and not req_prof_family:
+        violations.append(f"profiler_builder_unrelated_to_target:declared={declared_builder}:family={family}")
+    eff_prof_family = (req_prof_family or (declared_builder if builder_belongs else "") or family).strip()
+    eff_prof_recipe = (profiler_recipe or eff_prof_family).strip()
+    eff_prof_impl = (profiler_impl or next(iter(abis.values()), "")).strip()
+    profiler_check: dict[str, Any] = {
+        "checked": bool(require_profiler_builder), "verified": False,
+        "family": eff_prof_family, "recipe": eff_prof_recipe, "impl": eff_prof_impl,
+        "resolved_builder": "", "resolved_abi": "",
+    }
+    if not require_profiler_builder:
+        return profiler_check, violations
+    if req_prof_family and req_prof_family not in allowed_prof_families:
+        err = f"profiler_family_unrelated_to_target:requested={req_prof_family}:allowed={sorted(allowed_prof_families)}"
+        profiler_check["error"] = err
+        violations.append(err)
+        return profiler_check, violations
+    try:
+        b_name, b_abi = resolve_profiler_builder_strict(
+            eff_prof_family, eff_prof_recipe, eff_prof_impl,
+            dtypes=profiler_dtypes, meta=profiler_meta, profiler_root=profiler_root,
+        )
+    except ModelingError as exc:
+        profiler_check["error"] = str(exc)
+        violations.append(str(exc))
+        return profiler_check, violations
+    sim_impl = str(sim_owner_detail.get("resolved_implementation") or "").strip()
+    declared_abis = set(abis.values())
+    allowed_abis = (
+        {sim_impl}
+        if sim_impl and (sim_impl in declared_abis or sim_impl.startswith("aclnn"))
+        else (declared_abis | ({sim_impl} if sim_impl else set()))
+    )
+    if allowed_abis and b_abi not in allowed_abis:
+        err = f"profiler_abi_mismatch:resolved={b_abi}:declared={sorted(allowed_abis)}"
+        profiler_check.update(resolved_builder=b_name, resolved_abi=b_abi, error=err)
+        violations.append(err)
+    else:
+        profiler_check.update(verified=True, resolved_builder=b_name, resolved_abi=b_abi)
+    return profiler_check, violations
+
+
 def validate_operator_contract(
     *,
     target_path: str | Path,
@@ -488,69 +629,20 @@ def validate_operator_contract(
     else:
         files = [target]
 
-    abis: dict[str, str] = {}
-    all_refs: list[dict[str, str]] = []
-    symbols: set[str] = set()
-    declared_builder = ""
-    declared_template_ids: set[str] = set()
-    shared_constants: dict[str, str] = {}
-    parsed_files: list[tuple[Path, ast.Module]] = []
-    for py_file in files:
-        tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
-        parsed_files.append((py_file, tree))
-        shared_constants.update(extract_module_str_constants(tree))
-    for py_file, tree in parsed_files:
-        top_names = extract_top_level_names(tree)
-        symbols |= extract_symbol_mentions(tree)
-        file_consts = {**shared_constants, **extract_module_str_constants(tree)}
-        declared_template_ids |= extract_declared_template_ids(tree, file_consts)
-        file_refs = extract_source_refs(tree, py_file, file_consts)
-        all_refs.extend(file_refs)
-        abi = extract_upstream_abi(tree)
-        if py_file.name in ("arch22.py", "arch35.py") or not is_family_pkg:
-            if not abi:
-                violations.append(f"missing_upstream_abi_header:{py_file.name}")
-            else:
-                abis[py_file.name] = abi
-            if is_family_pkg and "STRATEGY" not in top_names:
-                violations.append(f"missing_strategy_export:{py_file.name}")
-            if "SOURCES" not in top_names and not file_refs:
-                violations.append(f"missing_sources_declaration:{py_file.name}")
-        if not declared_builder and "PROFILER_BENCH_BUILDER" in file_consts:
-            declared_builder = file_consts["PROFILER_BENCH_BUILDER"]
-        violations.extend(find_unimplemented_stubs(tree, py_file))
-
-    if is_family_pkg and len(abis) >= 2 and len(set(abis.values())) < len(abis):
-        violations.append("duplicate_upstream_abi_across_arch_leaves")
+    abis, all_refs, symbols, declared_builder, declared_template_ids, ast_violations = (
+        _scan_target_ast_contract(files, is_family_pkg=is_family_pkg)
+    )
+    violations.extend(ast_violations)
 
     resolved_refs_root = Path(refs_root).resolve() if refs_root is not None else None
     resolved_repo_map = {str(k): Path(v).resolve() for k, v in (repo_map or {}).items()}
-    if not all_refs:
-        violations.append("source_ref_missing")
-    source_checks: list[dict[str, Any]] = []
-    all_blobs_verified = bool(all_refs)
-    for ref in all_refs:
-        ref_errors: list[str] = []
-        if not ref["repository"]:
-            ref_errors.append("repository_empty")
-        if len(ref["revision"]) < HEX_COMMIT_LEN or not _HEX_RE.fullmatch(ref["revision"]):
-            ref_errors.append("revision_not_full_sha")
-        if not ref["relative_path"] or ref["relative_path"].startswith("/") or ".." in Path(ref["relative_path"]).parts:
-            ref_errors.append("relative_path_unsafe")
-        if len(ref["source_sha256"]) != SHA256_HEX_LENGTH or not _HEX_RE.fullmatch(ref["source_sha256"]):
-            ref_errors.append("source_sha256_invalid")
-        blob_status, blob_verified = "skipped_invalid_ref", False
-        if not ref_errors:
-            ok_blob, blob_verified, blob_status = _verify_git_blob_sha256(
-                ref, refs_root=resolved_refs_root, repo_map=resolved_repo_map, require_mounted_refs=require_mounted_refs,
-            )
-            if not ok_blob:
-                ref_errors.append(blob_status)
-        if not blob_verified:
-            all_blobs_verified = False
-        if ref_errors:
-            violations.append(f"source_ref_invalid:{ref['file']}:{','.join(ref_errors)}")
-        source_checks.append({**ref, "status": blob_status, "blob_verified": blob_verified, "errors": ref_errors})
+    source_checks, all_blobs_verified, ref_violations = _verify_source_refs_contract(
+        all_refs,
+        resolved_refs_root=resolved_refs_root,
+        resolved_repo_map=resolved_repo_map,
+        require_mounted_refs=require_mounted_refs,
+    )
+    violations.extend(ref_violations)
 
     provenance_gate_outcome = None
     if not is_family_pkg and target_rel.startswith("mindie_sim/templates/") and (resolved_refs_root is not None or resolved_repo_map):
@@ -585,69 +677,25 @@ def validate_operator_contract(
     if require_taxonomy and not taxonomy_ok:
         violations.append(taxonomy_detail)
 
-    builder_belongs = bool(
-        declared_builder
-        and (declared_builder == family or declared_builder.startswith(f"{family}_") or declared_builder.startswith(f"{family}."))
+    profiler_check, prof_violations = _verify_profiler_builder_contract(
+        family=family, declared_builder=declared_builder, abis=abis,
+        sim_owner_detail=sim_owner_detail, profiler_root=profiler_root,
+        profiler_family=profiler_family, profiler_recipe=profiler_recipe,
+        profiler_impl=profiler_impl, profiler_dtypes=profiler_dtypes,
+        profiler_meta=profiler_meta, require_profiler_builder=require_profiler_builder,
     )
-    allowed_prof_families = {family} | ({declared_builder} if builder_belongs else set())
-    req_prof_family = profiler_family.strip()
-    if declared_builder and not builder_belongs and not req_prof_family:
-        violations.append(f"profiler_builder_unrelated_to_target:declared={declared_builder}:family={family}")
-    eff_prof_family = (req_prof_family or (declared_builder if builder_belongs else "") or family).strip()
-    eff_prof_recipe = (profiler_recipe or eff_prof_family).strip()
-    eff_prof_impl = (profiler_impl or next(iter(abis.values()), "")).strip()
-    profiler_check: dict[str, Any] = {
-        "checked": bool(require_profiler_builder), "verified": False,
-        "family": eff_prof_family, "recipe": eff_prof_recipe, "impl": eff_prof_impl,
-        "resolved_builder": "", "resolved_abi": "",
-    }
-    if require_profiler_builder:
-        if req_prof_family and req_prof_family not in allowed_prof_families:
-            err = f"profiler_family_unrelated_to_target:requested={req_prof_family}:allowed={sorted(allowed_prof_families)}"
-            profiler_check["error"] = err
-            violations.append(err)
-        else:
-            try:
-                b_name, b_abi = resolve_profiler_builder_strict(
-                    eff_prof_family, eff_prof_recipe, eff_prof_impl,
-                    dtypes=profiler_dtypes, meta=profiler_meta, profiler_root=profiler_root,
-                )
-            except ModelingError as exc:
-                profiler_check["error"] = str(exc)
-                violations.append(str(exc))
-            else:
-                sim_impl = str(sim_owner_detail.get("resolved_implementation") or "").strip()
-                declared_abis = set(abis.values())
-                allowed_abis = (
-                    {sim_impl}
-                    if sim_impl and (sim_impl in declared_abis or sim_impl.startswith("aclnn"))
-                    else (declared_abis | ({sim_impl} if sim_impl else set()))
-                )
-                if allowed_abis and b_abi not in allowed_abis:
-                    err = f"profiler_abi_mismatch:resolved={b_abi}:declared={sorted(allowed_abis)}"
-                    profiler_check.update(resolved_builder=b_name, resolved_abi=b_abi, error=err)
-                    violations.append(err)
-                else:
-                    profiler_check.update(verified=True, resolved_builder=b_name, resolved_abi=b_abi)
+    violations.extend(prof_violations)
 
     result: dict[str, Any] = {
-        "stage": "validate-contract",
-        "ok": not violations,
-        "status": "pass" if not violations else "fail",
-        "target": target_rel,
-        "family": family,
-        "upstream_abis": abis,
-        "source_refs_checked": len(source_checks),
-        "source_blobs_verified": all_blobs_verified,
+        "stage": "validate-contract", "ok": not violations, "status": "pass" if not violations else "fail",
+        "target": target_rel, "family": family, "upstream_abis": abis,
+        "source_refs_checked": len(source_checks), "source_blobs_verified": all_blobs_verified,
         "source_refs": source_checks,
         "template_provenance_gate": provenance_gate_outcome.to_dict() if provenance_gate_outcome is not None else None,
-        "semantic_work_declared": has_semantic,
-        "tensor_obligations_declared": has_obligations,
-        "tiling_axes_declared": has_tiling_axes,
-        "sim_owner_dispatch": sim_owner_detail,
+        "semantic_work_declared": has_semantic, "tensor_obligations_declared": has_obligations,
+        "tiling_axes_declared": has_tiling_axes, "sim_owner_dispatch": sim_owner_detail,
         "taxonomy": {"checked": bool(require_taxonomy), "registered": taxonomy_ok, "detail": taxonomy_detail},
-        "profiler_builder": profiler_check,
-        "violations": violations,
+        "profiler_builder": profiler_check, "violations": violations,
     }
     result["report_hmac"] = sign_stage_report("operator_contract", result)
     assert_sanitized_payload(result, field_name="operator_contract_validation")

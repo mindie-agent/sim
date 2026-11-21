@@ -42,7 +42,6 @@ from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import datapath_for_die
 
 from ._capture_truth import (
-    build_content_digest_index,
     reverify_report_captures,
     verify_capture_and_override_case,
 )
@@ -50,7 +49,7 @@ from ._lean_and_receipts import validate_strict_threshold_pct, verify_stage_repo
 from ._sku_calibration import materialize_sku_hardware
 from ._whitebox_runner import check_no_service_regimes
 from .contracts import (
-    PERCENT_SCALE,
+    DEFAULT_PHYSICAL_ATOL_NS,
     GateCheckOutcome,
     read_bounded_json,
     sanitize_public_capture_uri,
@@ -82,6 +81,199 @@ def _parse_fits(fits_json: str | Path | None) -> FrozenFitManifest:
     )
 
 
+def _parse_manifest_cases(
+    raw_cases: Sequence[Mapping[str, Any]],
+    *,
+    sku: str,
+    held_plan_by_id: Mapping[str, Mapping[str, Any]],
+    train_plan_by_id: Mapping[str, Mapping[str, Any]],
+    capture_root: str | Path | None,
+    capture_files: Mapping[str, str | Path] | None,
+    require_capture_files: bool,
+) -> tuple[
+    GateCheckOutcome | None,
+    list[GateCase],
+    dict[str, str],
+    dict[str, dict[str, Any]],
+    dict[str, Mapping[str, Any]],
+    dict[str, str | Path],
+]:
+    from ._sealed_scorer import (
+        _check_no_caller_predictions,
+        _norm_digest,
+        extract_measured_p99_ns,
+        measured_ns_from_row,
+        resolve_authoritative_clock_operator,
+        validate_event_ids_and_ranks,
+        validate_row_matches_plan_point,
+    )
+
+    parsed_cases: list[GateCase] = []
+    expected_clock: dict[str, str] = {}
+    case_meta: dict[str, dict[str, Any]] = {}
+    plan_by_case: dict[str, Mapping[str, Any]] = {}
+    seen_heldout_ids: set[str] = set()
+    seen_train_ids: set[str] = set()
+    seen_captures: dict[tuple[str, frozenset[str], tuple[int, ...], str], str] = {}
+    resolved_files: dict[str, str | Path] = dict(capture_files or {})
+
+    for idx, row in enumerate(raw_cases):
+        cid = str(row.get("case_id") or f"manifest-{idx}")
+        _check_no_caller_predictions(row, cid)
+        check_no_service_regimes(row, path=cid)
+        row_status = str(row.get("status") or "").strip().lower()
+        if row_status not in _ALLOWED_OK_STATUSES:
+            raise ModelingError(f"observation_status_not_ok:{cid}:status={row_status}")
+        if row.get("validated") is False or row.get("qualified") is False:
+            raise ModelingError(f"observation_unvalidated_or_unqualified:{cid}")
+        raw_copy = dict(row)
+        payload = dict(raw_copy.get("payload") or {})
+        pid = str(row.get("point_id") or payload.get("point_id") or cid).strip()
+        plan_pt = held_plan_by_id.get(pid) or train_plan_by_id.get(pid)
+        clock_op = resolve_authoritative_clock_operator(row, cid, plan_pt=plan_pt)
+        payload["clock_operator"] = clock_op
+        if plan_pt is not None:
+            payload.setdefault("axis", str(plan_pt.get("axis") or ""))
+            payload.setdefault("value", int(plan_pt["value"]))
+        raw_copy["payload"] = payload
+        gc = parse_gate_case(raw_copy)
+        if gc.cohort.sku != sku:
+            err_outcome = GateCheckOutcome(
+                "multilevel_gate", False, "fail",
+                f"multilevel_manifest_sku_mismatch:expected={sku}:got={gc.cohort.sku}",
+            )
+            return err_outcome, [], {}, {}, {}, {}
+        validate_event_ids_and_ranks(gc.boundary.event_ids, gc.boundary.device_ranks, cid)
+        measured_ns_from_row(row, cid, clock_op=clock_op, parsed_measured_ns=gc.measured_ns)
+        gc, _cap_ok, auth_p99 = verify_capture_and_override_case(
+            gc, row, clock_op=clock_op,
+            capture_root=capture_root, capture_files=capture_files,
+            require_capture_files=require_capture_files,
+            row_p99_ns=extract_measured_p99_ns(row),
+            digest_index=None,
+            resolved_files=resolved_files,
+        )
+        if gc.split == "heldout":
+            if pid in seen_heldout_ids:
+                raise ModelingError(f"duplicate_heldout_point_id:{pid}")
+            seen_heldout_ids.add(pid)
+            if pid in held_plan_by_id:
+                validate_row_matches_plan_point(row, held_plan_by_id[pid], sku=sku, pid=pid, device_ranks=gc.boundary.device_ranks)
+                plan_by_case[gc.case_id] = held_plan_by_id[pid]
+            cap_key = (
+                _norm_digest(gc.boundary.raw_sha256),
+                frozenset(gc.boundary.event_ids),
+                gc.boundary.device_ranks,
+                gc.boundary.run_uid,
+            )
+            if cap_key in seen_captures:
+                raise ModelingError(f"duplicate_heldout_physical_capture:{pid}:collides_with={seen_captures[cap_key]}")
+            seen_captures[cap_key] = pid
+        elif gc.split == "train":
+            if pid in seen_train_ids:
+                raise ModelingError(f"duplicate_train_point_id:{pid}")
+            seen_train_ids.add(pid)
+            if pid in train_plan_by_id:
+                validate_row_matches_plan_point(row, train_plan_by_id[pid], sku=sku, pid=pid, device_ranks=gc.boundary.device_ranks)
+                plan_by_case[gc.case_id] = train_plan_by_id[pid]
+        parsed_cases.append(gc)
+        expected_clock[gc.case_id] = clock_op
+        case_meta[gc.case_id] = {
+            "point_id": pid, "split": gc.split, "measured_p99_ns": auth_p99,
+            "raw_sha256": gc.boundary.raw_sha256,
+            "capture_uri": sanitize_public_capture_uri(gc.boundary.capture_uri, raw_sha256=gc.boundary.raw_sha256),
+            "run_uid": sanitize_public_run_id(gc.boundary.run_uid),
+        }
+    return None, parsed_cases, expected_clock, case_meta, plan_by_case, resolved_files
+
+
+def _summarize_manifest_residuals(
+    raw_residuals: Sequence[Residual],
+    *,
+    case_meta: Mapping[str, Mapping[str, Any]],
+    expected_clock: Mapping[str, str],
+    engine_clocks: Mapping[str, Mapping[str, Any]],
+    held_plan_by_id: Mapping[str, Mapping[str, Any]],
+    train_plan_by_id: Mapping[str, Mapping[str, Any]],
+    abi_check: Mapping[str, Any],
+    cap_threshold: float,
+    atol_ns: int,
+) -> tuple[GateCheckOutcome, list[dict[str, Any]]]:
+    from ._sealed_scorer import REQUIRED_MULTILEVEL_LEVELS, exceeds_physical_tolerance
+
+    heldout_res_objs: list[Residual] = []
+    heldout_dicts: list[dict[str, Any]] = []
+    scored_heldout_ids: set[str] = set()
+    scored_train_ids: set[str] = set()
+    pw_fail: list[str] = []
+    for res in raw_residuals:
+        meta = case_meta[res.case_id]
+        clk = engine_clocks.get(res.case_id, {})
+        scored_pred_ns = int(clk.get("scored_predicted_ns", res.predicted_ns))
+        signed_err = (scored_pred_ns - res.measured_ns) / float(res.measured_ns) if res.measured_ns > 0 else res.signed_error
+        ape = abs(signed_err)
+        adj_res = replace(
+            res, predicted_ns=scored_pred_ns, signed_error=signed_err, absolute_percentage_error=ape,
+        )
+        if meta["split"] == "train":
+            if adj_res.status == "ok":
+                scored_train_ids.add(meta["point_id"])
+            continue
+        heldout_res_objs.append(adj_res)
+        exceeds = exceeds_physical_tolerance(
+            scored_pred_ns, int(adj_res.measured_ns), threshold_pct=cap_threshold, atol_ns=atol_ns
+        )
+        if adj_res.status == "ok":
+            scored_heldout_ids.add(meta["point_id"])
+            if exceeds:
+                pw_fail.append(adj_res.case_id)
+        heldout_dicts.append({
+            **adj_res.to_dict(),
+            "abs_error_ns": abs(scored_pred_ns - int(adj_res.measured_ns)),
+            "atol_ns": atol_ns, "within_physical_tolerance": not exceeds,
+            "point_id": meta["point_id"], "split": "heldout",
+            "clock_operator": clk.get("clock_operator", expected_clock[res.case_id]),
+            "measured_p99_ns": meta["measured_p99_ns"],
+            "engine_busy_union_ns": clk.get("busy_union_ns"), "engine_elapsed_span_ns": clk.get("elapsed_span_ns"),
+            "program_dag_sha256": clk.get("program_dag_sha256", ""), "engine_uid": clk.get("engine_uid", ""),
+            "raw_sha256": meta["raw_sha256"], "capture_uri": meta["capture_uri"], "run_uid": meta["run_uid"],
+        })
+
+    missing_heldout = sorted(set(held_plan_by_id) - scored_heldout_ids)
+    missing_train = sorted(set(train_plan_by_id) - scored_train_ids)
+    summaries = summarize_cohorts(heldout_res_objs, threshold_pct=cap_threshold)
+    verdict = gate_decision(summaries, required_levels=REQUIRED_MULTILEVEL_LEVELS, require_disjoint_level_roots=True)
+    missing_any = bool(missing_heldout or missing_train)
+    passed = verdict["status"] == "pass" and not pw_fail and not missing_any and bool(abi_check["ok"])
+    eff_st = (
+        "pass" if passed
+        else ("fail" if (pw_fail or not abi_check["ok"]) else ("insufficient_evidence" if missing_any else verdict["status"]))
+    )
+    return (
+        GateCheckOutcome(
+            name="multilevel_gate", passed=passed, status=eff_st,
+            detail=(
+                f"status={eff_st};levels={verdict['covered_levels']};missing={verdict['missing_levels']}"
+                f";missing_heldout={len(missing_heldout)};missing_train={len(missing_train)}"
+                f";abi_ok={abi_check['ok']};pointwise_failures={len(pw_fail)}"
+            ),
+            metrics=(
+                ("covered_levels", verdict["covered_levels"]),
+                ("missing_levels", verdict["missing_levels"]),
+                ("missing_plan_points", len(missing_heldout)),
+                ("missing_train_points", len(missing_train)),
+                ("abi_ok", bool(abi_check["ok"])),
+                ("overlapping_level_roots", verdict["overlapping_level_roots"]),
+                ("failed_cohorts", verdict["failed_cohorts"]),
+                ("pointwise_failures", sorted(pw_fail)),
+                ("threshold_pct", cap_threshold),
+                ("atol_ns", atol_ns),
+            ),
+        ),
+        heldout_dicts,
+    )
+
+
 def _evaluate_manifest_path(
     *,
     sku: str,
@@ -96,19 +288,9 @@ def _evaluate_manifest_path(
     capture_files: Mapping[str, str | Path] | None,
     require_capture_files: bool,
     cap_threshold: float,
+    atol_ns: int = DEFAULT_PHYSICAL_ATOL_NS,
 ) -> tuple[GateCheckOutcome, list[dict[str, Any]]]:
-    from ._sealed_scorer import (
-        REQUIRED_MULTILEVEL_LEVELS,
-        ClockParityRunner,
-        _bind_active_runner,
-        _check_no_caller_predictions,
-        _norm_digest,
-        extract_measured_p99_ns,
-        measured_ns_from_row,
-        resolve_authoritative_clock_operator,
-        validate_event_ids_and_ranks,
-        validate_row_matches_plan_point,
-    )
+    from ._sealed_scorer import ClockParityRunner, _bind_active_runner, _norm_digest
     from .cliff_planner import evaluate_abi_rejections, synthesize_sku_512_400k_plan
 
     if validation_doc is not None and (
@@ -139,87 +321,12 @@ def _evaluate_manifest_path(
     train_plan_by_id = {str(pt["point_id"]): pt for pt in auth_plan["train_points"]}
 
     raw_cases: list[Mapping[str, Any]] = [c for c in raw_manifest["cases"] if isinstance(c, Mapping)]
-    parsed_cases: list[GateCase] = []
-    expected_clock: dict[str, str] = {}
-    case_meta: dict[str, dict[str, Any]] = {}
-    plan_by_case: dict[str, Mapping[str, Any]] = {}
-    seen_heldout_ids: set[str] = set()
-    seen_train_ids: set[str] = set()
-    seen_captures: dict[tuple[str, frozenset[str], tuple[int, ...], str], str] = {}
-    digest_index = build_content_digest_index(Path(capture_root)) if capture_root is not None else None
-    resolved_files: dict[str, str | Path] = dict(capture_files or {})
-
-    for idx, row in enumerate(raw_cases):
-        cid = str(row.get("case_id") or f"manifest-{idx}")
-        _check_no_caller_predictions(row, cid)
-        check_no_service_regimes(row, path=cid)
-        row_status = str(row.get("status") or "").strip().lower()
-        if row_status not in _ALLOWED_OK_STATUSES:
-            raise ModelingError(f"observation_status_not_ok:{cid}:status={row_status}")
-        if row.get("validated") is False or row.get("qualified") is False:
-            raise ModelingError(f"observation_unvalidated_or_unqualified:{cid}")
-        raw_copy = dict(row)
-        payload = dict(raw_copy.get("payload") or {})
-        pid = str(row.get("point_id") or payload.get("point_id") or cid).strip()
-        plan_pt = held_plan_by_id.get(pid) or train_plan_by_id.get(pid)
-        clock_op = resolve_authoritative_clock_operator(row, cid, plan_pt=plan_pt)
-        payload["clock_operator"] = clock_op
-        if plan_pt is not None:
-            payload.setdefault("axis", str(plan_pt.get("axis") or ""))
-            payload.setdefault("value", int(plan_pt["value"]))
-        raw_copy["payload"] = payload
-        gc = parse_gate_case(raw_copy)
-        if gc.cohort.sku != sku:
-            return (
-                GateCheckOutcome(
-                    "multilevel_gate", False, "fail",
-                    f"multilevel_manifest_sku_mismatch:expected={sku}:got={gc.cohort.sku}",
-                ),
-                [],
-            )
-        validate_event_ids_and_ranks(gc.boundary.event_ids, gc.boundary.device_ranks, cid)
-        measured_ns_from_row(row, cid, clock_op=clock_op, parsed_measured_ns=gc.measured_ns)
-        gc, _cap_ok, auth_p99 = verify_capture_and_override_case(
-            gc, row, clock_op=clock_op,
-            capture_root=capture_root, capture_files=capture_files,
-            require_capture_files=require_capture_files,
-            row_p99_ns=extract_measured_p99_ns(row),
-            digest_index=digest_index,
-            resolved_files=resolved_files,
-        )
-        if gc.split == "heldout":
-            if pid in seen_heldout_ids:
-                raise ModelingError(f"duplicate_heldout_point_id:{pid}")
-            seen_heldout_ids.add(pid)
-            if pid in held_plan_by_id:
-                validate_row_matches_plan_point(row, held_plan_by_id[pid], sku=sku, pid=pid, device_ranks=gc.boundary.device_ranks)
-                plan_by_case[gc.case_id] = held_plan_by_id[pid]
-            cap_key = (
-                _norm_digest(gc.boundary.raw_sha256),
-                frozenset(gc.boundary.event_ids),
-                gc.boundary.device_ranks,
-                gc.boundary.run_uid,
-            )
-            if cap_key in seen_captures:
-                raise ModelingError(f"duplicate_heldout_physical_capture:{pid}:collides_with={seen_captures[cap_key]}")
-            seen_captures[cap_key] = pid
-        elif gc.split == "train":
-            if pid in seen_train_ids:
-                raise ModelingError(f"duplicate_train_point_id:{pid}")
-            seen_train_ids.add(pid)
-            if pid in train_plan_by_id:
-                validate_row_matches_plan_point(row, train_plan_by_id[pid], sku=sku, pid=pid, device_ranks=gc.boundary.device_ranks)
-                plan_by_case[gc.case_id] = train_plan_by_id[pid]
-        parsed_cases.append(gc)
-        expected_clock[gc.case_id] = clock_op
-        case_meta[gc.case_id] = {
-            "point_id": pid,
-            "split": gc.split,
-            "measured_p99_ns": auth_p99,
-            "raw_sha256": gc.boundary.raw_sha256,
-            "capture_uri": sanitize_public_capture_uri(gc.boundary.capture_uri, raw_sha256=gc.boundary.raw_sha256),
-            "run_uid": sanitize_public_run_id(gc.boundary.run_uid),
-        }
+    err_out, parsed_cases, expected_clock, case_meta, plan_by_case, resolved_files = _parse_manifest_cases(
+        raw_cases, sku=sku, held_plan_by_id=held_plan_by_id, train_plan_by_id=train_plan_by_id,
+        capture_root=capture_root, capture_files=capture_files, require_capture_files=require_capture_files,
+    )
+    if err_out is not None:
+        return err_out, []
 
     if validation_doc is not None:
         manifest_pairs = {(gc.case_id, _norm_digest(gc.boundary.raw_sha256)) for gc in parsed_cases}
@@ -229,23 +336,11 @@ def _evaluate_manifest_path(
             if isinstance(r, Mapping) and r.get("case_id") and r.get("raw_sha256")
         }
         if not manifest_pairs or not report_pairs or manifest_pairs != report_pairs:
-            return (
-                GateCheckOutcome(
-                    "multilevel_gate", False, "fail",
-                    "manifest_validation_report_capture_digest_mismatch",
-                ),
-                [],
-            )
+            return GateCheckOutcome("multilevel_gate", False, "fail", "manifest_validation_report_capture_digest_mismatch"), []
         if primitive_table is not None:
             val_env = str(validation_doc.get("primitives_envelope_sha256") or "").strip()
             if not val_env or val_env != primitive_table.envelope_sha256:
-                return (
-                    GateCheckOutcome(
-                        "multilevel_gate", False, "fail",
-                        "manifest_validation_report_primitives_envelope_mismatch",
-                    ),
-                    [],
-                )
+                return GateCheckOutcome("multilevel_gate", False, "fail", "manifest_validation_report_primitives_envelope_mismatch"), []
 
     manifest = Manifest(
         manifest_id=str(raw_manifest.get("manifest_id") or f"manifest-{sku}"),
@@ -257,8 +352,7 @@ def _evaluate_manifest_path(
     fits = _parse_fits(fits_json)
     eff_cap_files = resolved_files or capture_files
     validate_lineage(
-        manifest, fits,
-        capture_root=capture_root, capture_files=eff_cap_files,
+        manifest, fits, capture_root=capture_root, capture_files=eff_cap_files,
         require_capture_files=require_capture_files,
     )
     active_runner = _bind_active_runner(
@@ -276,81 +370,11 @@ def _evaluate_manifest_path(
     if eff_abi_results is None and isinstance(raw_manifest.get("abi_rejection_results"), list):
         eff_abi_results = list(raw_manifest["abi_rejection_results"])
     abi_check = evaluate_abi_rejections(auth_plan["abi_rejection_points"], eff_abi_results)
-
-    heldout_res_objs: list[Residual] = []
-    heldout_dicts: list[dict[str, Any]] = []
-    scored_heldout_ids: set[str] = set()
-    scored_train_ids: set[str] = set()
-    pw_fail: list[str] = []
-    for res in raw_residuals:
-        meta = case_meta[res.case_id]
-        clk = checked_runner.engine_clocks.get(res.case_id, {})
-        scored_pred_ns = int(clk.get("scored_predicted_ns", res.predicted_ns))
-        signed_err = (scored_pred_ns - res.measured_ns) / float(res.measured_ns) if res.measured_ns > 0 else res.signed_error
-        ape = abs(signed_err)
-        adj_res = replace(
-            res,
-            predicted_ns=scored_pred_ns,
-            signed_error=signed_err,
-            absolute_percentage_error=ape,
-        )
-        if meta["split"] == "train":
-            if adj_res.status == "ok":
-                scored_train_ids.add(meta["point_id"])
-            continue
-        heldout_res_objs.append(adj_res)
-        if adj_res.status == "ok":
-            scored_heldout_ids.add(meta["point_id"])
-            if ape * PERCENT_SCALE >= cap_threshold:
-                pw_fail.append(adj_res.case_id)
-        heldout_dicts.append({
-            **adj_res.to_dict(),
-            "point_id": meta["point_id"],
-            "split": "heldout",
-            "clock_operator": clk.get("clock_operator", expected_clock[res.case_id]),
-            "measured_p99_ns": meta["measured_p99_ns"],
-            "engine_busy_union_ns": clk.get("busy_union_ns"),
-            "engine_elapsed_span_ns": clk.get("elapsed_span_ns"),
-            "program_dag_sha256": clk.get("program_dag_sha256", ""),
-            "engine_uid": clk.get("engine_uid", ""),
-            "raw_sha256": meta["raw_sha256"],
-            "capture_uri": meta["capture_uri"],
-            "run_uid": meta["run_uid"],
-        })
-
-    missing_heldout = sorted(set(held_plan_by_id) - scored_heldout_ids)
-    missing_train = sorted(set(train_plan_by_id) - scored_train_ids)
-    summaries = summarize_cohorts(heldout_res_objs, threshold_pct=cap_threshold)
-    verdict = gate_decision(summaries, required_levels=REQUIRED_MULTILEVEL_LEVELS, require_disjoint_level_roots=True)
-    missing_any = bool(missing_heldout or missing_train)
-    passed = verdict["status"] == "pass" and not pw_fail and not missing_any and bool(abi_check["ok"])
-    eff_st = (
-        "pass" if passed
-        else ("fail" if (pw_fail or not abi_check["ok"]) else ("insufficient_evidence" if missing_any else verdict["status"]))
-    )
-    return (
-        GateCheckOutcome(
-            name="multilevel_gate",
-            passed=passed,
-            status=eff_st,
-            detail=(
-                f"status={eff_st};levels={verdict['covered_levels']};missing={verdict['missing_levels']}"
-                f";missing_heldout={len(missing_heldout)};missing_train={len(missing_train)}"
-                f";abi_ok={abi_check['ok']};pointwise_failures={len(pw_fail)}"
-            ),
-            metrics=(
-                ("covered_levels", verdict["covered_levels"]),
-                ("missing_levels", verdict["missing_levels"]),
-                ("missing_plan_points", len(missing_heldout)),
-                ("missing_train_points", len(missing_train)),
-                ("abi_ok", bool(abi_check["ok"])),
-                ("overlapping_level_roots", verdict["overlapping_level_roots"]),
-                ("failed_cohorts", verdict["failed_cohorts"]),
-                ("pointwise_failures", sorted(pw_fail)),
-                ("threshold_pct", cap_threshold),
-            ),
-        ),
-        heldout_dicts,
+    return _summarize_manifest_residuals(
+        raw_residuals, case_meta=case_meta, expected_clock=expected_clock,
+        engine_clocks=checked_runner.engine_clocks, held_plan_by_id=held_plan_by_id,
+        train_plan_by_id=train_plan_by_id, abi_check=abi_check,
+        cap_threshold=cap_threshold, atol_ns=atol_ns,
     )
 
 
@@ -373,6 +397,7 @@ def run_multilevel_verdict(
     from ._sealed_scorer import (
         REQUIRED_MULTILEVEL_LEVELS,
         STANDARD_LEVEL_BOUNDARY_KINDS,
+        exceeds_physical_tolerance,
         validate_disjoint_lineage,
     )
 
@@ -426,14 +451,17 @@ def run_multilevel_verdict(
     validate_disjoint_lineage(heldout_rows, require_disjoint_level_roots=True)
     res_objs: list[Residual] = []
     pw_fail: list[str] = []
+    eff_atol_ns = max(0, int(validation_doc.get("atol_ns", DEFAULT_PHYSICAL_ATOL_NS)))
     for row in heldout_rows:
         lvl = str(row.get("level") or "L1").upper()
         c_raw = row.get("cohort") if isinstance(row.get("cohort"), Mapping) else {}
         cohort = CohortKey(lvl, str(c_raw.get("cohort_name") or "onboarding"), str(c_raw.get("sku") or sku), str(c_raw.get("phase") or "decode"), str(c_raw.get("mode") or "eager"), str(c_raw.get("shape_regime") or "cliff"), str(c_raw.get("parallel_topology") or "tp1"))  # type: ignore[arg-type]
+        meas_ns = int(row.get("measured_ns") or 1)
+        pred_ns = int(row.get("predicted_ns") or 1)
         ape = float(row.get("absolute_percentage_error", 0.0))
-        if ape * PERCENT_SCALE >= cap_threshold:
+        if exceeds_physical_tolerance(pred_ns, meas_ns, threshold_pct=cap_threshold, atol_ns=eff_atol_ns):
             pw_fail.append(str(row.get("case_id") or ""))
-        res_objs.append(Residual(str(row.get("case_id") or ""), lvl, cohort, str(row.get("acquisition_root") or ""), int(row.get("measured_ns") or 1), int(row.get("predicted_ns") or 1), str(row.get("engine_receipt") or ""), float(row.get("signed_error", 0.0)), ape, "ok", boundary_kind=str(row.get("boundary_kind") or STANDARD_LEVEL_BOUNDARY_KINDS.get(lvl, "device_kernel"))))
+        res_objs.append(Residual(str(row.get("case_id") or ""), lvl, cohort, str(row.get("acquisition_root") or ""), meas_ns, pred_ns, str(row.get("engine_receipt") or ""), float(row.get("signed_error", 0.0)), ape, "ok", boundary_kind=str(row.get("boundary_kind") or STANDARD_LEVEL_BOUNDARY_KINDS.get(lvl, "device_kernel"))))
     summaries = summarize_cohorts(res_objs, threshold_pct=cap_threshold)
     verdict = gate_decision(summaries, required_levels=REQUIRED_MULTILEVEL_LEVELS, require_disjoint_level_roots=True)
     missing_any = bool(missing_plan or missing_train or missing_anchors or missing_cliffs)
@@ -443,7 +471,7 @@ def run_multilevel_verdict(
         GateCheckOutcome(
             name="multilevel_gate", passed=passed, status=eff_status,
             detail=f"status={eff_status};levels={verdict['covered_levels']};missing_levels={verdict['missing_levels']};missing_plan={len(missing_plan)};missing_train={len(missing_train)};pointwise_failures={len(pw_fail)};abi_ok={abi_ok}",
-            metrics=(("covered_levels", verdict["covered_levels"]), ("missing_levels", verdict["missing_levels"]), ("missing_plan_points", len(missing_plan)), ("missing_train_points", len(missing_train)), ("missing_anchors", len(missing_anchors)), ("missing_cliffs", len(missing_cliffs)), ("overlapping_level_roots", verdict["overlapping_level_roots"]), ("failed_cohorts", verdict["failed_cohorts"]), ("pointwise_failures", sorted(pw_fail)), ("abi_ok", abi_ok), ("threshold_pct", cap_threshold)),
+            metrics=(("covered_levels", verdict["covered_levels"]), ("missing_levels", verdict["missing_levels"]), ("missing_plan_points", len(missing_plan)), ("missing_train_points", len(missing_train)), ("missing_anchors", len(missing_anchors)), ("missing_cliffs", len(missing_cliffs)), ("overlapping_level_roots", verdict["overlapping_level_roots"]), ("failed_cohorts", verdict["failed_cohorts"]), ("pointwise_failures", sorted(pw_fail)), ("abi_ok", abi_ok), ("threshold_pct", cap_threshold), ("atol_ns", eff_atol_ns)),
         ),
         heldout_rows,
     )

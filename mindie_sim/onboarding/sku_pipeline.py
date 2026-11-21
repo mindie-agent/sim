@@ -55,7 +55,11 @@ from ._lean_and_receipts import (
     validate_strict_threshold_pct,
     verify_stage_report,
 )
-from ._sealed_scorer import REQUIRED_MULTILEVEL_LEVELS, run_multilevel_verdict
+from ._sealed_scorer import (
+    REQUIRED_MULTILEVEL_LEVELS,
+    exceeds_physical_tolerance,
+    run_multilevel_verdict,
+)
 from ._sku_calibration import calibrate_l0_and_fabric, materialize_sku_hardware
 from ._soc_probe import (
     parse_npu_smi_topology,
@@ -74,9 +78,9 @@ from .contracts import (
     DEFAULT_CLEANUP_GRACE_S,
     DEFAULT_HELDOUT_APE_THRESHOLD_PCT,
     DEFAULT_L0_BUDGET_S,
+    DEFAULT_PHYSICAL_ATOL_NS,
     DISPLAY_ROUND_DIGITS,
     OFF_GRID_CLIFF_HELDOUT_GRID,
-    PERCENT_SCALE,
     SHORT_DIGEST_LEN,
     GateCheckOutcome,
     assert_sanitized_payload,
@@ -85,6 +89,163 @@ from .contracts import (
     sanitize_lease_for_receipt,
     write_atomic_json,
 )
+
+
+def _collect_sku_validation_inputs(
+    *,
+    sku: str,
+    plan_doc: Mapping[str, Any],
+    observations_json: str | Path | None,
+    abi_rejection_results: Sequence[Mapping[str, Any]] | None,
+    profiler_runner: Callable[[Mapping[str, Any]], Sequence[Mapping[str, Any]]] | None,
+    live_profiler: bool,
+    endpoint_alias: str,
+    profiler_root: str | Path | None,
+    lease_acquirer: Callable[[str, int], AbstractContextManager[Mapping[str, Any]]] | None,
+    coordinator_bin: str,
+    eff_capture_root: str | Path | None,
+    ssh_runner: Callable[[str, str, int], Any] | None,
+) -> tuple[
+    list[Mapping[str, Any]] | None,
+    Sequence[Mapping[str, Any]] | None,
+    dict[str, Any],
+    Literal["live_silicon", "offline_reverify"],
+]:
+    lease_public: dict[str, Any] = {"lease_mode": "offline_replay"}
+    acquisition_mode: Literal["live_silicon", "offline_reverify"] = "offline_reverify"
+    if observations_json is not None:
+        raw_obs = read_bounded_json(observations_json)
+        if isinstance(raw_obs, Mapping):
+            obs_rows: list[Mapping[str, Any]] | None = list(
+                raw_obs.get("observations") or raw_obs.get("cases") or ()
+            )
+            if abi_rejection_results is None and raw_obs.get("abi_rejection_results") is not None:
+                abi_rejection_results = list(raw_obs["abi_rejection_results"])
+        elif isinstance(raw_obs, list):
+            obs_rows = list(raw_obs)
+        else:
+            raise ModelingError("validate_512_400k_observations_invalid")
+        return obs_rows, abi_rejection_results, lease_public, acquisition_mode
+
+    if profiler_runner is not None:
+        if lease_acquirer is None and not live_profiler:
+            return list(profiler_runner(plan_doc)), abi_rejection_results, lease_public, acquisition_mode
+        req_npus = required_ranks_for_plan(plan_doc)
+        lease_ttl_s = DEFAULT_L0_BUDGET_S + DEFAULT_CLEANUP_GRACE_S
+        lease_ctx = (
+            lease_acquirer(sku, lease_ttl_s)
+            if lease_acquirer is not None
+            else acquire_coordinator_host_queue_lease(
+                endpoint_alias, npu_count=req_npus, ttl_seconds=lease_ttl_s,
+                min_subprocess_timeout_s=DEFAULT_L0_BUDGET_S,
+                cleanup_grace_s=DEFAULT_CLEANUP_GRACE_S, coordinator_bin=coordinator_bin,
+            )
+        )
+        raw_lease: Mapping[str, Any] = {}
+        with lease_ctx as lease_info:
+            raw_lease = lease_info if isinstance(lease_info, Mapping) else {}
+            validate_host_queue_grant(raw_lease, required_devices=req_npus, min_ttl_seconds=lease_ttl_s)
+            obs_rows = list(profiler_runner(plan_doc))
+        return obs_rows, abi_rejection_results, sanitize_lease_for_receipt(raw_lease), acquisition_mode
+
+    if live_profiler:
+        req_npus = required_ranks_for_plan(plan_doc)
+        lease_ttl_s = DEFAULT_L0_BUDGET_S + DEFAULT_CLEANUP_GRACE_S
+        lease_ctx = (
+            lease_acquirer(sku, lease_ttl_s)
+            if lease_acquirer is not None
+            else acquire_coordinator_host_queue_lease(
+                endpoint_alias, npu_count=req_npus, ttl_seconds=lease_ttl_s,
+                min_subprocess_timeout_s=DEFAULT_L0_BUDGET_S,
+                cleanup_grace_s=DEFAULT_CLEANUP_GRACE_S, coordinator_bin=coordinator_bin,
+            )
+        )
+        raw_lease = {}
+        with lease_ctx as lease_info:
+            raw_lease = lease_info if isinstance(lease_info, Mapping) else {}
+            _, fence, granted, _ = validate_host_queue_grant(
+                raw_lease, required_devices=req_npus, min_ttl_seconds=lease_ttl_s
+            )
+            obs_rows, live_abi = run_profiler_bench_subprocess(
+                plan_doc, sku=sku, profiler_root=profiler_root, endpoint_alias=endpoint_alias,
+                allowed_phy_ids=granted, fence_token=fence, timeout_s=DEFAULT_L0_BUDGET_S,
+                capture_out_dir=eff_capture_root, ssh_runner=ssh_runner,
+            )
+            if abi_rejection_results is None and live_abi:
+                abi_rejection_results = live_abi
+        lease_public = sanitize_lease_for_receipt(raw_lease)
+        if lease_public.get("lease_mode") == "coordinator_host_queue":
+            acquisition_mode = "live_silicon"
+        return obs_rows, abi_rejection_results, lease_public, acquisition_mode
+
+    return None, abi_rejection_results, lease_public, acquisition_mode
+
+
+def _extract_external_train_tokens(
+    plan_train_root: str,
+    primitives_json: str | Path | Mapping[str, Any] | None,
+    train_manifest_json: str | Path | Mapping[str, Any] | None,
+) -> tuple[PrimitiveTable | None, list[str], list[str], list[str]]:
+    parsed_table: PrimitiveTable | None = None
+    roots: list[str] = [plan_train_root]
+    digests: list[str] = []
+    uris: list[str] = []
+    if primitives_json is not None:
+        p_doc = read_bounded_json(primitives_json) if isinstance(primitives_json, (str, Path)) else dict(primitives_json)
+        parsed_table = parse_primitive_table(p_doc, verify_envelope=True)
+        digests.append(parsed_table.envelope_sha256)
+        prim_uri = str(parsed_table.provenance.capture_uri or "").strip()
+        if prim_uri:
+            uris.append(prim_uri)
+            digests.append(prim_uri.rsplit("/", 1)[-1])
+        for cell in parsed_table.primitives.values():
+            ev_id = str(cell.evidence_id or "").strip()
+            if ev_id:
+                uris.append(ev_id)
+                digests.append(ev_id.rsplit("/", 1)[-1])
+    if train_manifest_json is not None:
+        t_doc = read_bounded_json(train_manifest_json) if isinstance(train_manifest_json, (str, Path)) else dict(train_manifest_json)
+        if t_doc.get("train_lineage_root"):
+            roots.append(str(t_doc["train_lineage_root"]))
+        digests.extend(str(d) for d in (t_doc.get("train_digests") or ()))
+        if t_doc.get("primitives_envelope_sha256"):
+            digests.append(str(t_doc["primitives_envelope_sha256"]))
+        uris.extend(str(u) for u in (t_doc.get("train_capture_uris") or ()))
+        if t_doc.get("capture_uri"):
+            uris.append(str(t_doc["capture_uri"]))
+    return parsed_table, roots, digests, uris
+
+
+def _build_sku_plan_only_report(
+    *,
+    sku: str,
+    plan: Any,
+    plan_doc: Mapping[str, Any],
+    lease_public: Mapping[str, Any],
+    expected_heldout_ids: Sequence[str],
+    expected_train_ids: Sequence[str],
+    report_out: str | Path | None,
+) -> dict[str, Any]:
+    plan_only: dict[str, Any] = {
+        "stage": "validate-512-400k", "sku": sku, "ok": False,
+        "status": "plan_only", "verdict": "insufficient_evidence",
+        "error": "validate_512_400k_plan_only_no_observations",
+        "plan_sha256": plan.plan_sha256, "plan": plan_doc,
+        "required_ranks": required_ranks_for_plan(plan_doc),
+        "acquisition_mode": "offline_reverify", "capture_files_verified": False,
+        "lease": dict(lease_public),
+        "missing_plan_points": sorted(expected_heldout_ids),
+        "missing_train_points": sorted(expected_train_ids),
+        "missing_anchors": list(ANCHOR_CONTEXT_GRID),
+        "missing_cliffs": list(OFF_GRID_CLIFF_HELDOUT_GRID),
+        "abi_rejection_check": evaluate_abi_rejections(plan_doc["abi_rejection_points"], None),
+        "heldout_summary": None, "residuals": [],
+    }
+    plan_only["report_hmac"] = sign_stage_report("sku_validation", plan_only)
+    if report_out is not None:
+        write_atomic_json(report_out, plan_only)
+    assert_sanitized_payload(plan_only, field_name="validate_512_400k_plan_only")
+    return plan_only
 
 
 def validate_512_400k(
@@ -118,47 +279,16 @@ def validate_512_400k(
     dp = datapath_for_die(die)
     l2_bytes = int(dict(die.buffers).get("l2", 0))
     plan = synthesize_sku_512_400k_plan(
-        sku=sku,
-        core_count=int(dp.aic_count),
-        l2_bytes=max(1, l2_bytes),
-        campaign_id=campaign_id,
-        profile_override=profile_override,
+        sku=sku, core_count=int(dp.aic_count), l2_bytes=max(1, l2_bytes),
+        campaign_id=campaign_id, profile_override=profile_override,
     )
     plan_doc = plan.to_dict()
     if plan_out is not None:
         write_atomic_json(plan_out, plan_doc)
 
-    parsed_table: PrimitiveTable | None = None
-    external_train_roots: list[str] = [plan.train_lineage_root]
-    external_train_digests: list[str] = []
-    external_train_uris: list[str] = []
-    if primitives_json is not None:
-        p_doc = read_bounded_json(primitives_json) if isinstance(primitives_json, (str, Path)) else dict(primitives_json)
-        parsed_table = parse_primitive_table(p_doc, verify_envelope=True)
-        external_train_digests.append(parsed_table.envelope_sha256)
-        prim_uri = str(parsed_table.provenance.capture_uri or "").strip()
-        if prim_uri:
-            external_train_uris.append(prim_uri)
-            external_train_digests.append(prim_uri.rsplit("/", 1)[-1])
-        for cell in parsed_table.primitives.values():
-            ev_id = str(cell.evidence_id or "").strip()
-            if ev_id:
-                external_train_uris.append(ev_id)
-                external_train_digests.append(ev_id.rsplit("/", 1)[-1])
-    if train_manifest_json is not None:
-        t_doc = read_bounded_json(train_manifest_json) if isinstance(train_manifest_json, (str, Path)) else dict(train_manifest_json)
-        if t_doc.get("train_lineage_root"):
-            external_train_roots.append(str(t_doc["train_lineage_root"]))
-        external_train_digests.extend(str(d) for d in (t_doc.get("train_digests") or ()))
-        if t_doc.get("primitives_envelope_sha256"):
-            external_train_digests.append(str(t_doc["primitives_envelope_sha256"]))
-        external_train_uris.extend(str(u) for u in (t_doc.get("train_capture_uris") or ()))
-        if t_doc.get("capture_uri"):
-            external_train_uris.append(str(t_doc["capture_uri"]))
-
-    obs_rows: list[Mapping[str, Any]] | None = None
-    lease_public: dict[str, Any] = {"lease_mode": "offline_replay"}
-    acquisition_mode: Literal["live_silicon", "offline_reverify"] = "offline_reverify"
+    parsed_table, external_train_roots, external_train_digests, external_train_uris = (
+        _extract_external_train_tokens(plan.train_lineage_root, primitives_json, train_manifest_json)
+    )
     eff_capture_root: str | Path | None = capture_root
     temp_cap_ctx: AbstractContextManager[str | None] = nullcontext(None)
     if live_profiler and observations_json is None and profiler_runner is None and eff_capture_root is None:
@@ -167,108 +297,27 @@ def validate_512_400k(
         else:
             temp_cap_ctx = tempfile.TemporaryDirectory(prefix="msim-sku-cap-")
 
+    expected_heldout_pts = list(plan_doc["heldout_points"])
+    expected_train_pts = list(plan_doc["train_points"])
+    expected_heldout_ids = [str(pt["point_id"]) for pt in expected_heldout_pts]
+    expected_train_ids = [str(pt["point_id"]) for pt in expected_train_pts]
+
     with temp_cap_ctx as tmp_cap_dir:
         if tmp_cap_dir is not None:
             eff_capture_root = Path(tmp_cap_dir)
-        if observations_json is not None:
-            raw_obs = read_bounded_json(observations_json)
-            if isinstance(raw_obs, Mapping):
-                obs_rows = list(raw_obs.get("observations") or raw_obs.get("cases") or ())
-                if abi_rejection_results is None and raw_obs.get("abi_rejection_results") is not None:
-                    abi_rejection_results = list(raw_obs["abi_rejection_results"])
-            elif isinstance(raw_obs, list):
-                obs_rows = list(raw_obs)
-            else:
-                raise ModelingError("validate_512_400k_observations_invalid")
-        elif profiler_runner is not None:
-            if lease_acquirer is not None or live_profiler:
-                req_npus = required_ranks_for_plan(plan_doc)
-                lease_ttl_s = DEFAULT_L0_BUDGET_S + DEFAULT_CLEANUP_GRACE_S
-                lease_ctx = (
-                    lease_acquirer(sku, lease_ttl_s)
-                    if lease_acquirer is not None
-                    else acquire_coordinator_host_queue_lease(
-                        endpoint_alias,
-                        npu_count=req_npus,
-                        ttl_seconds=lease_ttl_s,
-                        min_subprocess_timeout_s=DEFAULT_L0_BUDGET_S,
-                        cleanup_grace_s=DEFAULT_CLEANUP_GRACE_S,
-                        coordinator_bin=coordinator_bin,
-                    )
-                )
-                raw_lease: Mapping[str, Any] = {}
-                with lease_ctx as lease_info:
-                    raw_lease = lease_info if isinstance(lease_info, Mapping) else {}
-                    validate_host_queue_grant(
-                        raw_lease, required_devices=req_npus, min_ttl_seconds=lease_ttl_s
-                    )
-                    obs_rows = list(profiler_runner(plan_doc))
-                lease_public = sanitize_lease_for_receipt(raw_lease)
-            else:
-                obs_rows = list(profiler_runner(plan_doc))
-        elif live_profiler:
-            req_npus = required_ranks_for_plan(plan_doc)
-            lease_ttl_s = DEFAULT_L0_BUDGET_S + DEFAULT_CLEANUP_GRACE_S
-            lease_ctx = (
-                lease_acquirer(sku, lease_ttl_s)
-                if lease_acquirer is not None
-                else acquire_coordinator_host_queue_lease(
-                    endpoint_alias,
-                    npu_count=req_npus,
-                    ttl_seconds=lease_ttl_s,
-                    min_subprocess_timeout_s=DEFAULT_L0_BUDGET_S,
-                    cleanup_grace_s=DEFAULT_CLEANUP_GRACE_S,
-                    coordinator_bin=coordinator_bin,
-                )
-            )
-            raw_lease = {}
-            with lease_ctx as lease_info:
-                raw_lease = lease_info if isinstance(lease_info, Mapping) else {}
-                _, fence, granted, _ = validate_host_queue_grant(
-                    raw_lease, required_devices=req_npus, min_ttl_seconds=lease_ttl_s
-                )
-                obs_rows, live_abi = run_profiler_bench_subprocess(
-                    plan_doc,
-                    sku=sku,
-                    profiler_root=profiler_root,
-                    endpoint_alias=endpoint_alias,
-                    allowed_phy_ids=granted,
-                    fence_token=fence,
-                    timeout_s=DEFAULT_L0_BUDGET_S,
-                    capture_out_dir=eff_capture_root,
-                    ssh_runner=ssh_runner,
-                )
-                if abi_rejection_results is None and live_abi:
-                    abi_rejection_results = live_abi
-            lease_public = sanitize_lease_for_receipt(raw_lease)
-            if lease_public.get("lease_mode") == "coordinator_host_queue":
-                acquisition_mode = "live_silicon"
-
-        expected_heldout_pts = list(plan_doc["heldout_points"])
-        expected_train_pts = list(plan_doc["train_points"])
-        expected_heldout_ids = [str(pt["point_id"]) for pt in expected_heldout_pts]
-        expected_train_ids = [str(pt["point_id"]) for pt in expected_train_pts]
+        obs_rows, abi_rejection_results, lease_public, acquisition_mode = _collect_sku_validation_inputs(
+            sku=sku, plan_doc=plan_doc, observations_json=observations_json,
+            abi_rejection_results=abi_rejection_results, profiler_runner=profiler_runner,
+            live_profiler=live_profiler, endpoint_alias=endpoint_alias, profiler_root=profiler_root,
+            lease_acquirer=lease_acquirer, coordinator_bin=coordinator_bin,
+            eff_capture_root=eff_capture_root, ssh_runner=ssh_runner,
+        )
         if obs_rows is None:
-            plan_only: dict[str, Any] = {
-                "stage": "validate-512-400k", "sku": sku, "ok": False,
-                "status": "plan_only", "verdict": "insufficient_evidence",
-                "error": "validate_512_400k_plan_only_no_observations",
-                "plan_sha256": plan.plan_sha256, "plan": plan_doc,
-                "required_ranks": required_ranks_for_plan(plan_doc),
-                "acquisition_mode": "offline_reverify", "capture_files_verified": False,
-                "lease": lease_public,
-                "missing_plan_points": sorted(expected_heldout_ids),
-                "missing_train_points": sorted(expected_train_ids),
-                "missing_anchors": list(ANCHOR_CONTEXT_GRID),
-                "missing_cliffs": list(OFF_GRID_CLIFF_HELDOUT_GRID),
-                "abi_rejection_check": evaluate_abi_rejections(plan_doc["abi_rejection_points"], None),
-                "heldout_summary": None, "residuals": [],
-            }
-            plan_only["report_hmac"] = sign_stage_report("sku_validation", plan_only)
-            if report_out is not None:
-                write_atomic_json(report_out, plan_only)
-            assert_sanitized_payload(plan_only, field_name="validate_512_400k_plan_only")
-            return plan_only
+            return _build_sku_plan_only_report(
+                sku=sku, plan=plan, plan_doc=plan_doc, lease_public=lease_public,
+                expected_heldout_ids=expected_heldout_ids, expected_train_ids=expected_train_ids,
+                report_out=report_out,
+            )
 
         scored = score_sealed_gate_cases(
             obs_rows, sku=sku, runner=runner, primitive_table=parsed_table,
@@ -276,10 +325,8 @@ def validate_512_400k(
             external_train_roots=external_train_roots,
             external_train_digests=external_train_digests,
             external_train_uris=external_train_uris,
-            expected_points=expected_heldout_pts,
-            expected_train_points=expected_train_pts,
-            expected_point_ids=expected_heldout_ids,
-            require_disjoint_level_roots=True,
+            expected_points=expected_heldout_pts, expected_train_points=expected_train_pts,
+            expected_point_ids=expected_heldout_ids, require_disjoint_level_roots=True,
             capture_root=eff_capture_root, capture_files=capture_files,
             require_capture_files=require_capture_files,
         )
@@ -313,8 +360,8 @@ def validate_512_400k(
     report: dict[str, Any] = {
         "stage": "validate-512-400k", "sku": sku, "ok": final_ok,
         "status": final_status, "verdict": final_status,
-        "threshold_pct": cap_threshold, "plan_sha256": plan.plan_sha256,
-        "required_ranks": required_ranks_for_plan(plan_doc),
+        "threshold_pct": cap_threshold, "atol_ns": int(scored.get("atol_ns", DEFAULT_PHYSICAL_ATOL_NS)),
+        "plan_sha256": plan.plan_sha256, "required_ranks": required_ranks_for_plan(plan_doc),
         "acquisition_mode": acquisition_mode,
         "capture_files_verified": bool(scored.get("capture_files_verified", False)),
         "lease": lease_public,
@@ -337,6 +384,77 @@ def validate_512_400k(
         write_atomic_json(report_out, report)
     assert_sanitized_payload(report, field_name="validate_512_400k_report")
     return report
+
+
+def _evaluate_sku_primitives_gate(
+    *,
+    sku: str,
+    primitives_json: str | Path | Mapping[str, Any] | None,
+    expected_cann_version: str,
+    val_doc: Mapping[str, Any] | None,
+) -> tuple[GateCheckOutcome, PrimitiveTable | None, str]:
+    if primitives_json is None:
+        return GateCheckOutcome("primitives_envelope", False, "fail", "primitives_json_required_for_sku_certification"), None, ""
+    prim_doc = read_bounded_json(primitives_json) if isinstance(primitives_json, (str, Path)) else dict(primitives_json)
+    try:
+        table = parse_primitive_table(prim_doc, verify_envelope=True)
+    except ModelingError as exc:
+        return GateCheckOutcome("primitives_envelope", False, "fail", str(exc)), None, ""
+    cal_cnt = sum(1 for cell in table.primitives.values() if cell.status == "calibrated")
+    sku_match = table.sku == sku
+    cann_match = (not expected_cann_version) or (table.cann_version == expected_cann_version)
+    stage3_env = str((val_doc or {}).get("primitives_envelope_sha256") or "").strip()
+    env_match = True if val_doc is None else (bool(stage3_env) and stage3_env == table.envelope_sha256)
+    prim_ok = cal_cnt > 0 and sku_match and cann_match and env_match
+    reasons: list[str] = []
+    if not sku_match:
+        reasons.append(f"primitives_sku_mismatch:table={table.sku}:target={sku}")
+    if not cann_match:
+        reasons.append(f"primitives_cann_mismatch:table={table.cann_version}:expected={expected_cann_version}")
+    if not env_match:
+        reasons.append(f"primitives_stage3_stage4_envelope_mismatch:stage3={stage3_env or 'missing'}:stage4={table.envelope_sha256[:SHORT_DIGEST_LEN]}")
+    if cal_cnt == 0:
+        reasons.append("l0_calibration_zero_calibrated_primitives")
+    outcome = GateCheckOutcome(
+        name="primitives_envelope", passed=prim_ok, status="pass" if prim_ok else "fail",
+        detail=f"calibrated={cal_cnt}/{len(table.primitives)};cann={table.cann_version};envelope={table.envelope_sha256[:SHORT_DIGEST_LEN]}" if prim_ok else "; ".join(reasons),
+        metrics=(("calibrated_count", cal_cnt), ("total_primitives", len(table.primitives)), ("sku_match", sku_match), ("cann_match", cann_match), ("stage3_envelope_match", env_match)),
+    )
+    return outcome, table, table.envelope_sha256
+
+
+def _evaluate_sku_lean_gate(
+    diag_residuals: Sequence[Mapping[str, Any]],
+    lean_bounds_json: str | Path | Sequence[Mapping[str, Any]] | None,
+) -> tuple[GateCheckOutcome, list[Any]]:
+    expected_timings = {
+        str(r["case_id"]): (
+            int(r["predicted_ns"]), int(r["measured_ns"]),
+            int(r["measured_p99_ns"]) if r.get("measured_p99_ns") is not None else None,
+            str(r.get("program_dag_sha256") or ""),
+        )
+        for r in diag_residuals
+        if r.get("case_id") and r.get("predicted_ns") and r.get("measured_ns")
+    }
+    if isinstance(lean_bounds_json, (str, Path)):
+        raw_lean = read_bounded_json(lean_bounds_json)
+        lean_rows = raw_lean.get("bounds", raw_lean) if isinstance(raw_lean, Mapping) else raw_lean
+    else:
+        lean_rows = list(lean_bounds_json or ())
+    lean_ok, lean_checked, lean_violations = check_lean_non_inversion(
+        lean_rows, require_non_empty=True, verify_certificates=True,
+        require_captured_p99=True, require_program_dag_join=True,
+        expected_case_timings=expected_timings if expected_timings else None,
+    )
+    if not expected_timings:
+        lean_ok = False
+        lean_violations = (*lean_violations, "lean_no_scored_heldout_cases_to_join")
+    outcome = GateCheckOutcome(
+        name="lean_optimality_non_inversion", passed=lean_ok, status="pass" if lean_ok else "fail",
+        detail="0 inversions (witness joined & verified)" if lean_ok else "; ".join(lean_violations),
+        metrics=(("cases_checked", len(lean_checked)), ("violations", len(lean_violations))),
+    )
+    return outcome, list(lean_checked)
 
 
 def verify_sku_gates(
@@ -384,44 +502,13 @@ def verify_sku_gates(
             detail="registered" if sku_registered else f"unknown_sku:{sku}",
         )
     )
-
-    parsed_table: PrimitiveTable | None = None
-    if primitives_json is None:
-        gates.append(GateCheckOutcome("primitives_envelope", False, "fail", "primitives_json_required_for_sku_certification"))
-    else:
-        prim_doc = read_bounded_json(primitives_json) if isinstance(primitives_json, (str, Path)) else dict(primitives_json)
-        try:
-            table = parse_primitive_table(prim_doc, verify_envelope=True)
-            parsed_table = table
-            cal_cnt = sum(1 for cell in table.primitives.values() if cell.status == "calibrated")
-            sku_match = table.sku == sku
-            cann_match = (not expected_cann_version) or (table.cann_version == expected_cann_version)
-            stage3_env = str((val_doc or {}).get("primitives_envelope_sha256") or "").strip()
-            env_match = (
-                True
-                if val_doc is None
-                else (bool(stage3_env) and stage3_env == table.envelope_sha256)
-            )
-            prim_ok = cal_cnt > 0 and sku_match and cann_match and env_match
-            reasons: list[str] = []
-            if not sku_match:
-                reasons.append(f"primitives_sku_mismatch:table={table.sku}:target={sku}")
-            if not cann_match:
-                reasons.append(f"primitives_cann_mismatch:table={table.cann_version}:expected={expected_cann_version}")
-            if not env_match:
-                reasons.append(f"primitives_stage3_stage4_envelope_mismatch:stage3={stage3_env or 'missing'}:stage4={table.envelope_sha256[:SHORT_DIGEST_LEN]}")
-            if cal_cnt == 0:
-                reasons.append("l0_calibration_zero_calibrated_primitives")
-            gates.append(
-                GateCheckOutcome(
-                    name="primitives_envelope", passed=prim_ok, status="pass" if prim_ok else "fail",
-                    detail=f"calibrated={cal_cnt}/{len(table.primitives)};cann={table.cann_version};envelope={table.envelope_sha256[:SHORT_DIGEST_LEN]}" if prim_ok else "; ".join(reasons),
-                    metrics=(("calibrated_count", cal_cnt), ("total_primitives", len(table.primitives)), ("sku_match", sku_match), ("cann_match", cann_match), ("stage3_envelope_match", env_match)),
-                )
-            )
-            artifacts["primitives_envelope_sha256"] = table.envelope_sha256
-        except ModelingError as exc:
-            gates.append(GateCheckOutcome("primitives_envelope", False, "fail", str(exc)))
+    prim_gate, parsed_table, prim_env_sha = _evaluate_sku_primitives_gate(
+        sku=sku, primitives_json=primitives_json,
+        expected_cann_version=expected_cann_version, val_doc=val_doc,
+    )
+    gates.append(prim_gate)
+    if prim_env_sha:
+        artifacts["primitives_envelope_sha256"] = prim_env_sha
 
     ml_outcome, diag_residuals = run_multilevel_verdict(
         sku=sku, validation_doc=val_doc, multilevel_manifest_json=multilevel_manifest_json,
@@ -432,9 +519,13 @@ def verify_sku_gates(
     )
     gates.append(ml_outcome)
 
+    eff_atol_ns = max(0, int((val_doc or {}).get("atol_ns", DEFAULT_PHYSICAL_ATOL_NS)))
     failing_cliffs = [
         r for r in diag_residuals
-        if float(r.get("absolute_percentage_error", 0.0)) * PERCENT_SCALE >= cap_threshold
+        if exceeds_physical_tolerance(
+            int(r.get("predicted_ns") or 0), int(r.get("measured_ns") or 1),
+            threshold_pct=cap_threshold, atol_ns=eff_atol_ns,
+        )
     ]
     diagnosis_report: dict[str, Any] | None = None
     if failing_cliffs:
@@ -442,38 +533,8 @@ def verify_sku_gates(
             diag_residuals, repo_root=root, threshold_pct=cap_threshold, output_path=diagnosis_out,
         )
 
-    expected_timings = {
-        str(r["case_id"]): (
-            int(r["predicted_ns"]),
-            int(r["measured_ns"]),
-            int(r["measured_p99_ns"]) if r.get("measured_p99_ns") is not None else None,
-            str(r.get("program_dag_sha256") or ""),
-        )
-        for r in diag_residuals
-        if r.get("case_id") and r.get("predicted_ns") and r.get("measured_ns")
-    }
-    if isinstance(lean_bounds_json, (str, Path)):
-        raw_lean = read_bounded_json(lean_bounds_json)
-        lean_rows = raw_lean.get("bounds", raw_lean) if isinstance(raw_lean, Mapping) else raw_lean
-    else:
-        lean_rows = list(lean_bounds_json or ())
-    lean_ok, lean_checked, lean_violations = check_lean_non_inversion(
-        lean_rows,
-        require_non_empty=True, verify_certificates=True,
-        require_captured_p99=True, require_program_dag_join=True,
-        expected_case_timings=expected_timings if expected_timings else None,
-    )
-    if not expected_timings:
-        lean_ok = False
-        lean_violations = (*lean_violations, "lean_no_scored_heldout_cases_to_join")
-    gates.append(
-        GateCheckOutcome(
-            name="lean_optimality_non_inversion", passed=lean_ok, status="pass" if lean_ok else "fail",
-            detail="0 inversions (witness joined & verified)" if lean_ok else "; ".join(lean_violations),
-            metrics=(("cases_checked", len(lean_checked)), ("violations", len(lean_violations))),
-        )
-    )
-
+    lean_gate, lean_checked = _evaluate_sku_lean_gate(diag_residuals, lean_bounds_json)
+    gates.append(lean_gate)
     if run_repo_gates:
         gates.append(run_arch_governance_gate(repo_root=root, strict=True))
         gates.append(run_test_orthogonality_gate(repo_root=root, strict=orthogonality_base is None, base=orthogonality_base))
@@ -493,9 +554,7 @@ def verify_sku_gates(
         and str(val_doc.get("primitives_envelope_sha256") or "").strip() == parsed_table.envelope_sha256
     )
     live_verified = (
-        val_hmac_ok
-        and ml_outcome.passed
-        and prim_env_matches_val
+        val_hmac_ok and ml_outcome.passed and prim_env_matches_val
         and verify_live_silicon_evidence(val_doc, stage2_lease=stage2_lease)
     )
     if acquisition_mode == "live_silicon" and not live_verified:

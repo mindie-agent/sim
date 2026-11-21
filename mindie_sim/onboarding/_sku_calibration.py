@@ -318,6 +318,98 @@ def _collect_live_fabric_via_profiler(
     return out
 
 
+def _collect_l0_and_fabric_under_lease(
+    *,
+    sku: str,
+    endpoint_alias: str,
+    raw_l0_json: str | Path | None,
+    raw_fabric_json: str | Path | None,
+    campaign_id: str,
+    cann_version: str,
+    l0_budget_s: int,
+    fabric_budget_s: int,
+    budget: TimeoutBudget,
+    lease_acquirer: Callable[[str, int], AbstractContextManager[Mapping[str, Any]]] | None,
+    l0_runner: Callable[[str, int], Mapping[str, Any]] | None,
+    fabric_runner: Callable[[str, int], Mapping[str, Any]] | None,
+    live_bench: bool,
+    use_live: bool,
+    repo_root: str | Path | None,
+    profiler_root: str | Path | None,
+    coordinator_bin: str,
+    profile_override: Mapping[str, Any] | None,
+    ssh_runner: Callable[[str, str, int], Any] | None,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, list[str], Mapping[str, Any], str]:
+    require_grant = bool(live_bench or lease_acquirer is not None)
+    if lease_acquirer is not None:
+        lease_ctx: AbstractContextManager[Mapping[str, Any]] = lease_acquirer(sku, budget.outer_timeout_s)
+    elif live_bench:
+        lease_ctx = acquire_coordinator_host_queue_lease(
+            endpoint_alias, npu_count=1, ttl_seconds=budget.outer_timeout_s,
+            min_subprocess_timeout_s=budget.total_inner_s, cleanup_grace_s=budget.cleanup_grace_s,
+            coordinator_bin=coordinator_bin,
+        )
+    else:
+        lease_ctx = nullcontext({
+            "lease_mode": "offline_replay" if (raw_l0_json is not None or l0_runner is not None) else "uncalibrated_dry_run"
+        })
+
+    extra_train_digests: list[str] = []
+    raw_lease_info: Mapping[str, Any] = {}
+    fabric_coverage = "not_provided"
+    with lease_ctx as acquired:
+        raw_lease_info = acquired if isinstance(acquired, Mapping) else {}
+        if require_grant:
+            _, fence_val, granted_devices, _ = validate_host_queue_grant(
+                raw_lease_info, required_devices=1,
+                min_ttl_seconds=budget.total_inner_s + budget.cleanup_grace_s,
+            )
+        else:
+            granted_devices = [int(d) for d in (raw_lease_info.get("devices") or ()) if not isinstance(d, bool)]
+            fence_val = raw_lease_info.get("fence_token")
+        if raw_l0_json is not None:
+            parsed_l0, l0_sha = _read_bounded_json_and_sha256(Path(raw_l0_json))
+            extra_train_digests.append(l0_sha)
+            raw_l0: dict[str, Any] | None = unwrap_capture_envelope(parsed_l0)
+        elif l0_runner is not None:
+            raw_l0 = unwrap_capture_envelope(dict(l0_runner(sku, int(l0_budget_s))))
+        elif live_bench:
+            prof_entry = profile_override if profile_override is not None else ascend_profiles().get(sku)
+            dies_per_pkg = max(1, int((prof_entry or {}).get("dies_per_package", 1)))
+            raw_l0 = run_live_l0_bench_subprocess(
+                sku=sku, endpoint_alias=endpoint_alias, campaign_id=campaign_id,
+                cann_version=cann_version, repo_root=repo_root, timeout_s=int(l0_budget_s),
+                visible_devices=granted_devices, dies_per_package=dies_per_pkg,
+                profile_override=profile_override,
+            )
+        else:
+            raw_l0 = None
+
+        remote_ep = endpoint_alias.strip().lower() not in {"", "local", "localhost", "127.0.0.1", "::1"}
+        if raw_fabric_json is not None:
+            parsed_fab, fab_sha = _read_bounded_json_and_sha256(Path(raw_fabric_json))
+            extra_train_digests.append(fab_sha)
+            raw_fabric: dict[str, Any] | None = unwrap_capture_envelope(parsed_fab)
+            fabric_coverage = "provided_offline"
+        elif fabric_runner is not None:
+            raw_fabric = unwrap_capture_envelope(dict(fabric_runner(sku, int(fabric_budget_s))))
+            fabric_coverage = "provided_runner"
+        elif use_live and (profiler_root is not None or ssh_runner is not None or remote_ep):
+            raw_fabric = _collect_live_fabric_via_profiler(
+                sku=sku, endpoint_alias=endpoint_alias, profiler_root=profiler_root,
+                granted_devices=granted_devices,
+                fence_token=int(fence_val) if type(fence_val) is int else None,
+                timeout_s=int(fabric_budget_s), ssh_runner=ssh_runner,
+            )
+            fabric_coverage = "collected_live_profiler" if raw_fabric else "missing_live_fabric_samples"
+        elif use_live:
+            raw_fabric = None
+            fabric_coverage = "missing_live_fabric_collector"
+        else:
+            raw_fabric = None
+    return raw_l0, raw_fabric, extra_train_digests, raw_lease_info, fabric_coverage
+
+
 def calibrate_l0_and_fabric(
     *,
     sku: str,
@@ -367,78 +459,17 @@ def calibrate_l0_and_fabric(
         )
 
     use_live = bool(live_bench and raw_l0_json is None and l0_runner is None)
-    require_grant = bool(live_bench or lease_acquirer is not None)
-    if lease_acquirer is not None:
-        lease_ctx: AbstractContextManager[Mapping[str, Any]] = lease_acquirer(sku, budget.outer_timeout_s)
-    elif live_bench:
-        lease_ctx = acquire_coordinator_host_queue_lease(
-            endpoint_alias,
-            npu_count=1,
-            ttl_seconds=budget.outer_timeout_s,
-            min_subprocess_timeout_s=budget.total_inner_s,
-            cleanup_grace_s=budget.cleanup_grace_s,
-            coordinator_bin=coordinator_bin,
+    raw_l0, raw_fabric, extra_train_digests, raw_lease_info, fabric_coverage = (
+        _collect_l0_and_fabric_under_lease(
+            sku=sku, endpoint_alias=endpoint_alias, raw_l0_json=raw_l0_json,
+            raw_fabric_json=raw_fabric_json, campaign_id=campaign_id, cann_version=cann_version,
+            l0_budget_s=int(l0_budget_s), fabric_budget_s=int(fabric_budget_s), budget=budget,
+            lease_acquirer=lease_acquirer, l0_runner=l0_runner, fabric_runner=fabric_runner,
+            live_bench=live_bench, use_live=use_live, repo_root=repo_root,
+            profiler_root=profiler_root, coordinator_bin=coordinator_bin,
+            profile_override=profile_override, ssh_runner=ssh_runner,
         )
-    else:
-        lease_ctx = nullcontext({
-            "lease_mode": "offline_replay" if (raw_l0_json is not None or l0_runner is not None) else "uncalibrated_dry_run"
-        })
-
-    extra_train_digests: list[str] = []
-    raw_lease_info: Mapping[str, Any] = {}
-    fabric_coverage = "not_provided"
-    with lease_ctx as acquired:
-        raw_lease_info = acquired if isinstance(acquired, Mapping) else {}
-        if require_grant:
-            _, fence_val, granted_devices, _ = validate_host_queue_grant(
-                raw_lease_info,
-                required_devices=1,
-                min_ttl_seconds=budget.total_inner_s + budget.cleanup_grace_s,
-            )
-        else:
-            granted_devices = [int(d) for d in (raw_lease_info.get("devices") or ()) if not isinstance(d, bool)]
-            fence_val = raw_lease_info.get("fence_token")
-        if raw_l0_json is not None:
-            parsed_l0, l0_sha = _read_bounded_json_and_sha256(Path(raw_l0_json))
-            extra_train_digests.append(l0_sha)
-            raw_l0 = unwrap_capture_envelope(parsed_l0)
-        elif l0_runner is not None:
-            raw_l0 = unwrap_capture_envelope(dict(l0_runner(sku, int(l0_budget_s))))
-        elif live_bench:
-            prof_entry = profile_override if profile_override is not None else ascend_profiles().get(sku)
-            dies_per_pkg = max(1, int((prof_entry or {}).get("dies_per_package", 1)))
-            raw_l0 = run_live_l0_bench_subprocess(
-                sku=sku, endpoint_alias=endpoint_alias, campaign_id=campaign_id,
-                cann_version=cann_version, repo_root=repo_root, timeout_s=int(l0_budget_s),
-                visible_devices=granted_devices, dies_per_package=dies_per_pkg,
-                profile_override=profile_override,
-            )
-        else:
-            raw_l0 = None
-
-        remote_ep = endpoint_alias.strip().lower() not in {"", "local", "localhost", "127.0.0.1", "::1"}
-        if raw_fabric_json is not None:
-            parsed_fab, fab_sha = _read_bounded_json_and_sha256(Path(raw_fabric_json))
-            extra_train_digests.append(fab_sha)
-            raw_fabric = unwrap_capture_envelope(parsed_fab)
-            fabric_coverage = "provided_offline"
-        elif fabric_runner is not None:
-            raw_fabric = unwrap_capture_envelope(dict(fabric_runner(sku, int(fabric_budget_s))))
-            fabric_coverage = "provided_runner"
-        elif use_live and (profiler_root is not None or ssh_runner is not None or remote_ep):
-            raw_fabric = _collect_live_fabric_via_profiler(
-                sku=sku, endpoint_alias=endpoint_alias, profiler_root=profiler_root,
-                granted_devices=granted_devices,
-                fence_token=int(fence_val) if type(fence_val) is int else None,
-                timeout_s=int(fabric_budget_s),
-                ssh_runner=ssh_runner,
-            )
-            fabric_coverage = "collected_live_profiler" if raw_fabric else "missing_live_fabric_samples"
-        elif use_live:
-            raw_fabric = None
-            fabric_coverage = "missing_live_fabric_collector"
-        else:
-            raw_fabric = None
+    )
 
     sealer = load_canonical_l0_sealer(repo_root)
     merged_raw = _merge_l0_and_fabric_measurements(raw_l0, raw_fabric, sku=sku)
@@ -498,15 +529,12 @@ def calibrate_l0_and_fabric(
         "stage": "calibrate-l0-and-fabric", "sku": sku, "cann_version": effective_cann,
         "ok": cal_ok, "status": "ok" if cal_ok else "uncalibrated",
         "error": "" if cal_ok else "l0_calibration_zero_calibrated_primitives",
-        "sealer_owner": "mindie_sim.primitives.sealer",
-        "fabric_coverage": fabric_coverage,
+        "sealer_owner": "mindie_sim.primitives.sealer", "fabric_coverage": fabric_coverage,
         "default_table_path": default_rel, "timeout_budget": budget.to_dict(),
         "lease": public_lease, "envelope_sha256": payload["envelope_sha256"],
         "capture_uri": capture_uri, "calibrated_count": calibrated_count,
-        "total_primitives": len(payload["primitives"]),
-        "metric_conflicts": metric_conflicts,
-        "coverage_matrix": coverage_matrix,
-        "train_manifest": train_manifest, "primitives_payload": payload,
+        "total_primitives": len(payload["primitives"]), "metric_conflicts": metric_conflicts,
+        "coverage_matrix": coverage_matrix, "train_manifest": train_manifest, "primitives_payload": payload,
     }
     rec_unconf, rec_warn = collect_receipt_warnings(public_lease)
     if rec_unconf or rec_warn:

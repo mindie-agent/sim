@@ -1,33 +1,41 @@
 """Authoritative raw-capture timing, clock parity, and live-silicon evidence verifier.
 
 [Role] Resolve and hash-verify on-disk raw capture files for onboarding release
-  gates, extract capture-authoritative ``clock_operator``, ``measured_ns`` (from
-  repeat samples or clock-matched capture fields), and ``measured_p99_ns`` (from
-  repeat samples or explicit capture ``p99``, never row overrides), re-verify
-  signed stage reports against ``capture_root`` / ``capture_files``, and derive
-  ``silicon_certified`` strictly from verified ``coordinator_host_queue`` lease
-  and capture evidence (never caller strings).
+  gates, maintain a local private digest-to-relative-path index under
+  ``capture_root`` (never emitted into public reports/receipts) so opaque
+  ``capture://`` locators resolve intact nested non-digest files in O(1) even
+  with >4,096 unrelated files in the tree, extract capture-authoritative
+  ``clock_operator``, ``measured_ns`` (from repeat samples or clock-matched
+  capture fields), and ``measured_p99_ns``, re-verify signed stage reports
+  against ``capture_root`` / ``capture_files``, and derive ``silicon_certified``
+  strictly from verified ``coordinator_host_queue`` lease and capture evidence.
 [Invariants]
   * Never trusts row-supplied ``measured_ns``, ``busy_union_ns``,
     ``elapsed_span_ns``, or ``measured_p99_ns`` over hash-verified raw capture
     bytes.
-  * Raw captures lacking both repeat samples and explicit capture ``p99`` return
-    ``cap_p99_ns = None``, causing strict Lean non-inversion to fail closed with
-    ``lean_captured_p99_missing``.
+  * Every lookup via the private digest index STILL rehashes the target file
+    via ``verify_capture_file_consistency`` (failing closed if deleted/tampered)
+    and rejects any path escaping ``capture_root``.
+  * Fallback tree walks stream via ``os.walk`` without materializing the full
+    directory list; ``TimeoutError`` always propagates before ``OSError``.
   * ``verify_live_silicon_evidence`` requires HMAC-verified stage evidence,
     ``lease_mode == "coordinator_host_queue"``, opaque ``lease_digest``,
     positive ``fence_token``, sufficient granted ``device_count``, and
     ``capture_files_verified is True``.
 [Timeouts & Locks] Pure local bounded file verification; zero locks, subprocesses,
   or device contexts.
-[Side-Effect Policy] Strictly read-only over local capture files.
+[Side-Effect Policy] Read-only over capture files; best-effort atomic write of
+  the private ``.mindie_capture_index.json`` sidecar strictly inside
+  ``capture_root`` when writable (never leaked to public receipts).
 """
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 import math
-from pathlib import Path
+import os
+from pathlib import Path, PurePosixPath
 import re
 import statistics
 from typing import Any
@@ -46,12 +54,17 @@ from .contracts import (
     NS_PER_US,
     VALID_CLOCK_OPERATORS,
     read_bounded_json,
+    write_atomic_json,
 )
 
 _P99_QUANTILE = 0.99
 _SAMPLE_DECLARE_TOLERANCE_NS = 1
 _MAX_CAPTURE_SCAN_FILES = 4096
+_PRIVATE_INDEX_MAX_ENTRIES = 8192
+_PRIVATE_INDEX_FILENAME = ".mindie_capture_index.json"
+_PRIVATE_INDEX_SCHEMA = "mindie-private-capture-index/1"
 _OPAQUE_LEASE_DIGEST_RE = re.compile(r"^lease-[0-9a-f]{16}$")
+_PRIVATE_DIGEST_CACHE: OrderedDict[tuple[str, str], str] = OrderedDict()
 
 
 def _norm_sha_hex(raw_sha256: str) -> str:
@@ -59,26 +72,125 @@ def _norm_sha_hex(raw_sha256: str) -> str:
     return sha[7:] if sha.startswith("sha256:") else sha
 
 
+def _safe_relative_candidate(root_path: Path, rel_posix: str) -> Path | None:
+    rel = PurePosixPath(rel_posix)
+    if not rel.parts or rel.is_absolute() or ".." in rel.parts:
+        return None
+    cand = root_path / Path(*rel.parts)
+    try:
+        resolved_root = root_path.resolve()
+        resolved_cand = cand.resolve()
+        if not resolved_cand.is_relative_to(resolved_root):
+            return None
+        return resolved_cand if resolved_cand.is_file() else None
+    except TimeoutError:
+        raise
+    except OSError:
+        return None
+
+
+def _load_private_index_entries(root_path: Path) -> dict[str, str]:
+    idx_path = root_path / _PRIVATE_INDEX_FILENAME
+    if not idx_path.is_file():
+        return {}
+    try:
+        doc = read_bounded_json(idx_path)
+    except TimeoutError:
+        raise
+    except (ModelingError, OSError):
+        return {}
+    entries = doc.get("entries") if isinstance(doc, Mapping) else None
+    if not isinstance(entries, Mapping):
+        return {}
+    return {
+        _norm_sha_hex(str(k)): str(v)
+        for k, v in entries.items()
+        if str(k).strip() and isinstance(v, str) and v.strip()
+    }
+
+
+def _record_private_capture_location(root_path: Path, raw_sha256: str, resolved_file: Path) -> None:
+    """Persist a private ``sha256 -> relative_posix_path`` entry strictly under ``root_path``."""
+    sha = _norm_sha_hex(raw_sha256)
+    if not sha:
+        return
+    try:
+        r_root = root_path.resolve()
+        r_file = resolved_file.resolve()
+        if not r_file.is_relative_to(r_root) or r_file.name == _PRIVATE_INDEX_FILENAME:
+            return
+        rel_posix = r_file.relative_to(r_root).as_posix()
+    except TimeoutError:
+        raise
+    except (OSError, ValueError):
+        return
+    cache_key = (str(r_root), sha)
+    _PRIVATE_DIGEST_CACHE[cache_key] = rel_posix
+    _PRIVATE_DIGEST_CACHE.move_to_end(cache_key)
+    while len(_PRIVATE_DIGEST_CACHE) > _PRIVATE_INDEX_MAX_ENTRIES:
+        _PRIVATE_DIGEST_CACHE.popitem(last=False)
+    try:
+        entries = _load_private_index_entries(r_root)
+        if entries.get(sha) != rel_posix:
+            entries[sha] = rel_posix
+            if len(entries) > _PRIVATE_INDEX_MAX_ENTRIES:
+                for drop_k in list(entries.keys())[: len(entries) - _PRIVATE_INDEX_MAX_ENTRIES]:
+                    entries.pop(drop_k, None)
+            write_atomic_json(
+                r_root / _PRIVATE_INDEX_FILENAME,
+                {"schema": _PRIVATE_INDEX_SCHEMA, "entries": entries},
+            )
+    except TimeoutError:
+        raise
+    except (ModelingError, OSError):
+        pass
+
+
+def _lookup_private_index(
+    root_path: Path, sha: str, *, private_entries: dict[str, str] | None = None
+) -> Path | None:
+    try:
+        root_key = str(root_path.resolve())
+    except TimeoutError:
+        raise
+    except OSError:
+        root_key = str(root_path)
+    rel = _PRIVATE_DIGEST_CACHE.get((root_key, sha))
+    if rel:
+        cand = _safe_relative_candidate(root_path, rel)
+        if cand is not None:
+            return cand
+    entries = private_entries if private_entries is not None else _load_private_index_entries(root_path)
+    rel_disk = entries.get(sha)
+    if rel_disk:
+        return _safe_relative_candidate(root_path, rel_disk)
+    return None
+
+
 def build_content_digest_index(root_path: Path) -> dict[str, Path]:
-    """Build a bounded private ``{sha256: Path}`` index over retained files under ``root_path``."""
+    """Stream a bounded private ``{sha256: Path}`` index over ``root_path`` without full-tree materialization."""
     index: dict[str, Path] = {}
     if not root_path.is_dir():
         return index
     scanned = 0
-    for cand in sorted(root_path.rglob("*")):
-        if not cand.is_file():
-            continue
-        scanned += 1
-        try:
-            if cand.stat().st_size <= MAX_READ_JSON_BYTES:
-                digest = digest_file_streaming(cand)
-                index.setdefault(digest, cand)
-        except TimeoutError:
-            raise
-        except OSError:
-            pass
-        if scanned >= _MAX_CAPTURE_SCAN_FILES:
-            break
+    for dirpath, dirnames, filenames in os.walk(root_path):
+        dirnames.sort()
+        filenames.sort()
+        for fname in filenames:
+            if fname == _PRIVATE_INDEX_FILENAME:
+                continue
+            cand = Path(dirpath) / fname
+            scanned += 1
+            try:
+                if cand.is_file() and cand.stat().st_size <= MAX_READ_JSON_BYTES:
+                    digest = digest_file_streaming(cand)
+                    index.setdefault(digest, cand)
+            except TimeoutError:
+                raise
+            except OSError:
+                pass
+            if scanned >= _MAX_CAPTURE_SCAN_FILES:
+                return index
     return index
 
 
@@ -87,6 +199,7 @@ def _find_capture_by_digest(
     raw_sha256: str,
     *,
     digest_index: dict[str, Path] | None = None,
+    private_entries: dict[str, str] | None = None,
 ) -> Path | None:
     sha = _norm_sha_hex(raw_sha256)
     if not sha or not root_path.is_dir():
@@ -95,9 +208,31 @@ def _find_capture_by_digest(
         cand = root_path / name
         if cand.is_file():
             return cand
+    indexed = _lookup_private_index(root_path, sha, private_entries=private_entries)
+    if indexed is not None:
+        return indexed
     if digest_index is not None:
         return digest_index.get(sha)
-    return build_content_digest_index(root_path).get(sha)
+    scanned = 0
+    for dirpath, dirnames, filenames in os.walk(root_path):
+        dirnames.sort()
+        filenames.sort()
+        for fname in filenames:
+            if fname == _PRIVATE_INDEX_FILENAME:
+                continue
+            cand = Path(dirpath) / fname
+            scanned += 1
+            try:
+                if cand.is_file() and cand.stat().st_size <= MAX_READ_JSON_BYTES:
+                    if digest_file_streaming(cand) == sha:
+                        return cand
+            except TimeoutError:
+                raise
+            except OSError:
+                pass
+            if scanned >= _MAX_CAPTURE_SCAN_FILES:
+                return None
+    return None
 
 
 def _quantile_ns(sorted_ns: Sequence[int], q: float) -> int:
@@ -179,6 +314,7 @@ def resolve_and_verify_capture_truth(
     require_capture_files: bool,
     digest_index: dict[str, Path] | None = None,
     resolved_files: dict[str, str | Path] | None = None,
+    private_entries: dict[str, str] | None = None,
 ) -> tuple[bool, int | None, int | None]:
     """Hash-verify on-disk capture and derive authoritative ``(measured_ns, p99_ns)``."""
     root_path = Path(capture_root) if capture_root is not None else None
@@ -192,7 +328,7 @@ def resolve_and_verify_capture_truth(
     )
     if resolved is None and root_path is not None:
         resolved = _find_capture_by_digest(
-            root_path, boundary.raw_sha256, digest_index=digest_index
+            root_path, boundary.raw_sha256, digest_index=digest_index, private_entries=private_entries,
         )
     if resolved is None:
         if require_capture_files:
@@ -200,6 +336,8 @@ def resolve_and_verify_capture_truth(
         return False, None, None
 
     verify_capture_file_consistency(cid, boundary, resolved)
+    if root_path is not None:
+        _record_private_capture_location(root_path, boundary.raw_sha256, resolved)
     if resolved_files is not None:
         resolved_files[cid] = resolved
     cap_obj = read_bounded_json(resolved)
@@ -285,7 +423,8 @@ def reverify_report_captures(
     must_verify = bool(require_capture_files or capture_root is not None or capture_files is not None)
     if not must_verify:
         return False
-    digest_index = build_content_digest_index(Path(capture_root)) if capture_root is not None else None
+    root_path = Path(capture_root) if capture_root is not None else None
+    private_entries = _load_private_index_entries(root_path) if root_path is not None else None
     for row in rows:
         cid = str(row.get("case_id") or "").strip()
         raw_sha = str(row.get("raw_sha256") or "").strip()
@@ -318,7 +457,7 @@ def reverify_report_captures(
             capture_root=capture_root,
             capture_files=capture_files,
             require_capture_files=True,
-            digest_index=digest_index,
+            private_entries=private_entries,
         )
         if not verified or cap_ns is None:
             raise ModelingError(f"capture_file_missing:{cid}")

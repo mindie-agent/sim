@@ -475,64 +475,57 @@ def _validate_profile_against_probe(
     return conflicts, summary
 
 
-def probe_soc(
+def _fetch_raw_soc_probe(
     *,
-    endpoint_alias: str = "",
-    probe_json: str | Path | None = None,
-    profiles_path: str | Path | None = None,
-    scaffold_out: str | Path | None = None,
-    allow_scaffold: bool = False,
-    base_template_sku: str = "",
-    container: str = "",
-    npu_id: int = 0,
-    campaign_id: str = "camp-probe-soc",
-    timeout_s: int = DEFAULT_PROBE_TIMEOUT_S,
-    ssh_runner: Callable[[str, str, int], subprocess.CompletedProcess[str]] | None = None,
-) -> dict[str, Any]:
-    """Stage 1: Probe silicon SoC truth and validate or scaffold ``ascend.json`` profile."""
-    if probe_json is None and not endpoint_alias:
-        raise ModelingError("probe_soc_requires_endpoint_or_probe_json")
-    if container and not _SAFE_CONTAINER_RE.fullmatch(container):
-        raise ModelingError("probe_soc_container_invalid")
-
+    endpoint_alias: str,
+    probe_json: str | Path | None,
+    container: str,
+    npu_id: int,
+    timeout_s: int,
+    ssh_runner: Callable[[str, str, int], subprocess.CompletedProcess[str]] | None,
+) -> Mapping[str, Any]:
     if probe_json is not None:
         raw_probe = read_bounded_json(probe_json)
         if not isinstance(raw_probe, Mapping):
             raise ModelingError("probe_soc_json_must_be_mapping")
-    else:
-        probe_script = (
-            "SOC=$(python3 -c 'import torch_npu,torch; print(torch.npu.get_device_name(0))' 2>/dev/null || true); "
-            "echo \"__SOC__=$SOC\"; "
-            "echo '__COMMON__'; npu-smi info -t common -i " + str(int(npu_id)) + "; "
-            "echo '__TOPO__'; npu-smi info -t topo 2>/dev/null || true; "
-            "INI=$(find /usr/local/Ascend -name \"${SOC}.ini\" 2>/dev/null | head -n 1); "
-            "echo '__INI__'; [ -n \"$INI\" ] && cat \"$INI\" || true"
-        )
-        remote_cmd = (
-            f"docker exec -i {shlex.quote(container)} bash -lc {shlex.quote(probe_script)}"
-            if container
-            else f"bash -lc {shlex.quote(probe_script)}"
-        )
-        done = (
-            ssh_runner(endpoint_alias, remote_cmd, timeout_s)
-            if ssh_runner is not None
-            else _ssh_exec(endpoint_alias, remote_cmd, timeout_s=timeout_s)
-        )
-        if done.returncode != 0:
-            raise ModelingError(f"probe_soc_ssh_failed:rc={done.returncode}")
-        out = done.stdout or ""
-        soc_m = re.search(r"__SOC__=(.+)", out)
-        common_part = out.split("__COMMON__", 1)[1].split("__TOPO__", 1)[0] if "__COMMON__" in out else ""
-        topo_part = out.split("__TOPO__", 1)[1].split("__INI__", 1)[0] if "__TOPO__" in out else ""
-        ini_part = out.split("__INI__", 1)[1] if "__INI__" in out else ""
-        raw_probe = {
-            "aclrt_soc_name": soc_m.group(1).strip() if soc_m else "",
-            "platform_config_ini": ini_part,
-            "npu_smi_common": common_part,
-            "npu_smi_topo": topo_part,
-            "endpoint_alias": endpoint_alias,
-        }
+        return raw_probe
+    probe_script = (
+        "SOC=$(python3 -c 'import torch_npu,torch; print(torch.npu.get_device_name(0))' 2>/dev/null || true); "
+        "echo \"__SOC__=$SOC\"; "
+        "echo '__COMMON__'; npu-smi info -t common -i " + str(int(npu_id)) + "; "
+        "echo '__TOPO__'; npu-smi info -t topo 2>/dev/null || true; "
+        "INI=$(find /usr/local/Ascend -name \"${SOC}.ini\" 2>/dev/null | head -n 1); "
+        "echo '__INI__'; [ -n \"$INI\" ] && cat \"$INI\" || true"
+    )
+    remote_cmd = (
+        f"docker exec -i {shlex.quote(container)} bash -lc {shlex.quote(probe_script)}"
+        if container
+        else f"bash -lc {shlex.quote(probe_script)}"
+    )
+    done = (
+        ssh_runner(endpoint_alias, remote_cmd, timeout_s)
+        if ssh_runner is not None
+        else _ssh_exec(endpoint_alias, remote_cmd, timeout_s=timeout_s)
+    )
+    if done.returncode != 0:
+        raise ModelingError(f"probe_soc_ssh_failed:rc={done.returncode}")
+    out = done.stdout or ""
+    soc_m = re.search(r"__SOC__=(.+)", out)
+    common_part = out.split("__COMMON__", 1)[1].split("__TOPO__", 1)[0] if "__COMMON__" in out else ""
+    topo_part = out.split("__TOPO__", 1)[1].split("__INI__", 1)[0] if "__TOPO__" in out else ""
+    ini_part = out.split("__INI__", 1)[1] if "__INI__" in out else ""
+    return {
+        "aclrt_soc_name": soc_m.group(1).strip() if soc_m else "",
+        "platform_config_ini": ini_part,
+        "npu_smi_common": common_part,
+        "npu_smi_topo": topo_part,
+        "endpoint_alias": endpoint_alias,
+    }
 
+
+def _reconcile_soc_probe_record(
+    raw_probe: Mapping[str, Any], *, endpoint_alias: str, campaign_id: str
+) -> tuple[SocProbeRecord, dict[str, Any], list[SiliconProfileConflict]]:
     ini_parsed = parse_platform_config_ini(str(raw_probe.get("platform_config_ini") or ""))
     smi_common_text = str(raw_probe.get("npu_smi_common") or "")
     smi_parsed = parse_npu_smi_topology(smi_common_text, str(raw_probe.get("npu_smi_topo") or ""))
@@ -547,9 +540,7 @@ def probe_soc(
             if other_val != first_val:
                 source_conflicts.append(
                     SiliconProfileConflict(
-                        field=f"{field}:{other_src}",
-                        observed=other_val,
-                        declared=first_val,
+                        field=f"{field}:{other_src}", observed=other_val, declared=first_val,
                         reason=f"silicon_profile_conflict:source_mismatch:{field}:{other_src}={other_val}:{first_src}={first_val}",
                     )
                 )
@@ -584,17 +575,9 @@ def probe_soc(
     raw_arch_norm, _ = _resolve_explicit_arch(str(raw_probe.get("arch_preset") or ""), "")
     arch_preset = str(_agree("arch_preset", (("raw", raw_arch_norm), ("ini", str(ini_parsed["arch_preset"] or "")))))
     architecture = str(_agree("architecture", (("raw", str(raw_probe.get("architecture") or "").strip()), ("ini", str(ini_parsed.get("architecture") or "").strip()))))
-    resolved_template_sku = str(base_template_sku or raw_probe.get("base_template_sku") or "").strip()
-    clean_alias = sanitize_public_alias(
-        str(raw_probe.get("endpoint_alias") or endpoint_alias or soc_name),
-        soc_name,
-    )
+    clean_alias = sanitize_public_alias(str(raw_probe.get("endpoint_alias") or endpoint_alias or soc_name), soc_name)
     fabric_map = raw_probe.get("fabric_channels")
-    fabric_channels = (
-        tuple(sorted((str(k), float(v)) for k, v in fabric_map.items()))
-        if isinstance(fabric_map, Mapping)
-        else ()
-    )
+    fabric_channels = tuple(sorted((str(k), float(v)) for k, v in fabric_map.items())) if isinstance(fabric_map, Mapping) else ()
     sanitized_body = {
         "schema": SOC_PROBE_SCHEMA, "soc_name": soc_name, "arch_preset": arch_preset,
         "architecture": architecture, "ini_sha256": ini_parsed["ini_sha256"],
@@ -605,9 +588,7 @@ def probe_soc(
         "cann_version": str(raw_probe.get("cann_version") or "unknown"),
         "endpoint_alias": clean_alias, "fabric_channels": {k: v for k, v in fabric_channels},
     }
-    capture_uri, probe_sha256 = build_capture_uri(
-        clean_alias, campaign_id, canonical_json_bytes(sanitized_body)
-    )
+    capture_uri, probe_sha256 = build_capture_uri(clean_alias, campaign_id, canonical_json_bytes(sanitized_body))
     probe = SocProbeRecord(
         soc_name=soc_name, arch_preset=arch_preset, architecture=architecture,
         aic_count=aic, aiv_count=aiv, aicore_freq_mhz=freq,
@@ -618,10 +599,42 @@ def probe_soc(
         endpoint_alias=clean_alias, capture_uri=capture_uri, probe_sha256=probe_sha256,
         fabric_channels=fabric_channels, topology_preset=str(raw_probe.get("topology_preset") or ""),
     )
+    return probe, ini_parsed, source_conflicts
 
+
+def probe_soc(
+    *,
+    endpoint_alias: str = "",
+    probe_json: str | Path | None = None,
+    profiles_path: str | Path | None = None,
+    scaffold_out: str | Path | None = None,
+    allow_scaffold: bool = False,
+    base_template_sku: str = "",
+    container: str = "",
+    npu_id: int = 0,
+    campaign_id: str = "camp-probe-soc",
+    timeout_s: int = DEFAULT_PROBE_TIMEOUT_S,
+    ssh_runner: Callable[[str, str, int], subprocess.CompletedProcess[str]] | None = None,
+) -> dict[str, Any]:
+    """Stage 1: Probe silicon SoC truth and validate or scaffold ``ascend.json`` profile."""
+    if probe_json is None and not endpoint_alias:
+        raise ModelingError("probe_soc_requires_endpoint_or_probe_json")
+    if container and not _SAFE_CONTAINER_RE.fullmatch(container):
+        raise ModelingError("probe_soc_container_invalid")
+
+    raw_probe = _fetch_raw_soc_probe(
+        endpoint_alias=endpoint_alias, probe_json=probe_json, container=container,
+        npu_id=npu_id, timeout_s=timeout_s, ssh_runner=ssh_runner,
+    )
+    probe, ini_parsed, source_conflicts = _reconcile_soc_probe_record(
+        raw_probe, endpoint_alias=endpoint_alias, campaign_id=campaign_id,
+    )
+    soc_name = probe.soc_name
+    resolved_template_sku = str(base_template_sku or raw_probe.get("base_template_sku") or "").strip()
     all_profiles = read_bounded_json(profiles_path) if profiles_path is not None else ascend_profiles()
     probe_cann_raw = str(raw_probe.get("cann_version") or "").strip()
     probe_cann = "" if probe_cann_raw.lower() in {"", "unknown", "unmeasured"} else probe_cann_raw
+
     if soc_name in all_profiles:
         profile_conflicts, datapath_summary = _validate_profile_against_probe(probe, all_profiles[soc_name])
         conflicts = [*source_conflicts, *profile_conflicts]
@@ -635,24 +648,13 @@ def probe_soc(
         if probe.ub_bytes < 1:
             missing_evidence.append("ub_bytes")
         ok = not conflicts and not missing_evidence
-        err_code = (
-            ""
-            if ok
-            else ("silicon_profile_conflict" if conflicts else "silicon_probe_incomplete")
-        )
+        err_code = "" if ok else ("silicon_profile_conflict" if conflicts else "silicon_probe_incomplete")
         result: dict[str, Any] = {
-            "schema": SOC_PROBE_SCHEMA,
-            "stage": "probe-soc",
-            "mode": "validated_existing",
-            "sku": soc_name,
-            "probe_cann_version": probe_cann,
-            "ok": ok,
-            "status": "ok" if ok else "failed",
-            "error": err_code,
-            "missing_probe_fields": missing_evidence,
-            "ini_sha256": ini_parsed["ini_sha256"],
-            "probe": probe.to_dict(),
-            "datapath_summary": datapath_summary,
+            "schema": SOC_PROBE_SCHEMA, "stage": "probe-soc", "mode": "validated_existing",
+            "sku": soc_name, "probe_cann_version": probe_cann, "ok": ok,
+            "status": "ok" if ok else "failed", "error": err_code,
+            "missing_probe_fields": missing_evidence, "ini_sha256": ini_parsed["ini_sha256"],
+            "probe": probe.to_dict(), "datapath_summary": datapath_summary,
             "canonical_bindings": _derive_canonical_bindings(soc_name, datapath_summary["arch_id"]),
             "conflicts": [c.to_dict() for c in conflicts],
         }
@@ -662,47 +664,31 @@ def probe_soc(
     missing_caps = _missing_scaffold_capabilities(probe, resolved_template_sku)
     if missing_caps:
         result = {
-            "schema": SOC_PROBE_SCHEMA,
-            "stage": "probe-soc",
-            "mode": "capabilities_incomplete",
-            "sku": soc_name,
-            "probe_cann_version": probe_cann,
-            "ok": False,
-            "status": "failed",
-            "error": "silicon_capabilities_incomplete",
-            "missing_capabilities": missing_caps,
-            "ini_sha256": ini_parsed["ini_sha256"],
-            "probe": probe.to_dict(),
+            "schema": SOC_PROBE_SCHEMA, "stage": "probe-soc", "mode": "capabilities_incomplete",
+            "sku": soc_name, "probe_cann_version": probe_cann, "ok": False, "status": "failed",
+            "error": "silicon_capabilities_incomplete", "missing_capabilities": missing_caps,
+            "ini_sha256": ini_parsed["ini_sha256"], "probe": probe.to_dict(),
             "conflicts": [c.to_dict() for c in source_conflicts],
         }
         assert_sanitized_payload(result, field_name="probe_soc_result")
         return result
 
-    scaffolded = _scaffold_sku_profile(
-        probe,
-        all_profiles,
-        base_template_sku=resolved_template_sku,
-    )
+    scaffolded = _scaffold_sku_profile(probe, all_profiles, base_template_sku=resolved_template_sku)
     profile_conflicts, datapath_summary = _validate_profile_against_probe(probe, scaffolded)
     conflicts = [*source_conflicts, *profile_conflicts]
     if scaffold_out is not None:
         write_atomic_json(scaffold_out, {soc_name: scaffolded})
     can_succeed = (allow_scaffold or scaffold_out is not None) and not conflicts
     result = {
-        "schema": SOC_PROBE_SCHEMA,
-        "stage": "probe-soc",
+        "schema": SOC_PROBE_SCHEMA, "stage": "probe-soc",
         "mode": "scaffolded_new" if can_succeed else "profile_missing",
-        "sku": soc_name,
-        "probe_cann_version": probe_cann,
-        "ok": can_succeed,
+        "sku": soc_name, "probe_cann_version": probe_cann, "ok": can_succeed,
         "status": "scaffolded" if can_succeed else "failed",
         "error": "" if can_succeed else ("silicon_profile_conflict" if conflicts else "sku_profile_missing"),
-        "ini_sha256": ini_parsed["ini_sha256"],
-        "probe": probe.to_dict(),
+        "ini_sha256": ini_parsed["ini_sha256"], "probe": probe.to_dict(),
         "datapath_summary": datapath_summary,
         "canonical_bindings": _derive_canonical_bindings(soc_name, datapath_summary["arch_id"]),
-        "conflicts": [c.to_dict() for c in conflicts],
-        "scaffold_profile": {soc_name: scaffolded},
+        "conflicts": [c.to_dict() for c in conflicts], "scaffold_profile": {soc_name: scaffolded},
     }
     assert_sanitized_payload(result, field_name="probe_soc_result")
     return result
