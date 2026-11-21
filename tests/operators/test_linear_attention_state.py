@@ -26,7 +26,7 @@ from mindie_sim.prediction.family_kda_state import IMPLEMENTATION as STATE
 from mindie_sim.prediction.frontend import Frontend
 from mindie_sim.prediction.gdn_decode_programs import CONV, conv_plan
 from mindie_sim.prediction.mechanism import Geometry, PlannedRecipe
-from mindie_sim.prediction.operators import gdn_state, kda_recurrent, kda_recurrent_arch22, kda_state
+from mindie_sim.prediction.operators import gdn_state, kda_recurrent, kda_recurrent_membase, kda_state
 from mindie_sim.prediction.operators.kda_state_selection import resolve
 from mindie_sim.prediction.operators.linear_attention import (
     LinearAttentionContract, analyze_state_residency, resolve_operator_plan, select_flash_kda_template,
@@ -333,7 +333,7 @@ def test_old_accepted_count_cannot_exceed_current_q_even_when_index_table_has_sp
     declaration = {"kind": "exact", "prefix": [0, 1], "index_layout": "speculative",
                    "index_row_stride": 8, "state_indices": [list(range(8))],
                    "accepted_tokens": [7], "state_capacity": 8}
-    for module in (kda_recurrent_arch22, kda_recurrent):
+    for module in (kda_recurrent_membase, kda_recurrent):
         with pytest.raises(ModelingError, match="accepted_values_outside_sequence"):
             module.make_op({"lengths": (1,), "heads": 1, "key_heads": 1,
                            "state_selection": declaration})

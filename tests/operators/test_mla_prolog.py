@@ -28,7 +28,7 @@ from mindie_sim.prediction.compression import compressor
 from mindie_sim.prediction.engine import Engine, Resource
 from mindie_sim.prediction.lowering import Builder
 from mindie_sim.prediction.mechanism import Geometry
-from mindie_sim.prediction.mla_cann_epilogs import index_head_weights, index_row_quantization
+from mindie_sim.prediction.mla_epilogs import index_head_weights, index_row_quantization
 from mindie_sim.prediction.mla_native import index_layer_norm
 from mindie_sim.prediction.native_fusion_traffic import apply_traffic_profile
 from mindie_sim.prediction.operator_analysis import target_operators

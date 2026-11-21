@@ -606,7 +606,7 @@ def test_pcp_kv_gather_uses_the_region_row_format():
 
 
 def test_arch22_prolog_rejects_nope_and_sharded_cache_ownership():
-    from mindie_sim.prediction.mla_prolog_arch22 import validate_declared_view
+    from mindie_sim.prediction.native_fusion_mla_membase import validate_declared_view
     from mindie_sim.schema.common import ModelingError
     view = {
         "token_dtype": "int8", "projection_weight_dtypes": ("int8",) * 3,

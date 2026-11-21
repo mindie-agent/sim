@@ -17,21 +17,27 @@
 from dataclasses import replace
 
 from mindie_sim.schema.common import ModelingError, dtype_bytes
-from mindie_sim.schema.invocation import Occurrence
+from mindie_sim.schema.invocation import Occurrence as Occurrence
 from mindie_sim.schema.operators import (
-    FieldDisposition, OpSpec, ProgramFragment, SemanticAttr, SemanticRef,
-    StateEffect, WorkSet,
+    FieldDisposition as FieldDisposition, OpSpec, ProgramFragment as ProgramFragment,
+    SemanticAttr as SemanticAttr, SemanticRef as SemanticRef,
+    StateEffect as StateEffect, WorkSet as WorkSet,
 )
 from mindie_sim.schema.subgraphs import (
-    EventPortSpec, PortSet, StatePortSpec, TensorPortSpec,
+    EventPortSpec as EventPortSpec, PortSet as PortSet,
+    StatePortSpec as StatePortSpec, TensorPortSpec as TensorPortSpec,
 )
-from .mechanism import PlannedRecipe
+
 from . import paged_mla
+from .family_paged_mla_contract import _fragment
+from .mechanism import PlannedRecipe
 
 IMPLEMENTATION = paged_mla.IMPLEMENTATION
 PAGE_TILE = paged_mla.KEY_TILE
 _ARCH35_BRANCH = 'arch35_bf16_noquant_mla'
 _ARCH35_RECIPE = 'mindie_sim.prediction.paged_mla.build'
+_LATENT_WIDTH = 512
+_ROPE_WIDTH = 64
 
 
 def _augment_plan(plan, op):
@@ -181,7 +187,7 @@ def _declared_operands(*, plan, query_dtype='bf16', cache_dtype='bf16',
                        attention_scale_source='unresolved'):
     latent = int(plan.kv_lora_rank)
     rope = int(plan.qk_rope_head_dim)
-    if (latent, rope) != (512, 64):
+    if (latent, rope) != (_LATENT_WIDTH, _ROPE_WIDTH):
         raise ModelingError(
             f'paged_mla_selected_branch_requires_latent512_rope64:{latent}:{rope}')
     output_dtype = output_dtype or query_dtype
@@ -436,165 +442,6 @@ def _declaration(*, views, plan, parallel, runtime, padded_tokens=None,
         'request_rank': request_rank,
         'unresolved_fields': tuple(unresolved),
     }
-
-
-def _fragment(declaration, *, views, plan, occurrence=None):
-    if occurrence is not None and not isinstance(occurrence, Occurrence):
-        raise ModelingError('paged_mla_native_occurrence_invalid')
-    geometry = declaration['geometry']
-    operands = declaration['operands']
-    active = geometry['active_sequence_count']
-    capacity = geometry['native_query_capacity']
-    logical = geometry['logical_heads']
-    physical = geometry['physical_heads']
-    return ProgramFragment(
-        'paged_mla_decode',
-        occurrence=occurrence,
-        semantic_refs=(SemanticRef('subgraph', 'mla_attention', role='mla_decode'),),
-        attrs=(
-            SemanticAttr('native_kind', 'FusedInferAttentionScore',
-                         source='source_binding'),
-            SemanticAttr('implementation', declaration['implementation'],
-                         source='selected_program'),
-            SemanticAttr('program_recipe', declaration['program_recipe'],
-                         source='selected_program'),
-            SemanticAttr('branch', declaration['branch'],
-                         source='selected_program'),
-            SemanticAttr('dispatch', declaration['dispatch'],
-                         source='selected_program'),
-            SemanticAttr('retained_kv_rows', declaration['retained_kv_rows'],
-                         unit='row', source='selected_program'),
-            SemanticAttr('retained_kv_layout',
-                         geometry['retained_kv_layout'],
-                         source='selected_program'),
-            SemanticAttr('retained_kv_capacity_owner',
-                         geometry['retained_kv_capacity_owner'],
-                         source='selected_program'),
-            SemanticAttr('dtype', operands['query_dtype'], source='typed_input'),
-            SemanticAttr('query_dtype', operands['query_dtype'],
-                         source='typed_input'),
-            SemanticAttr('cache_dtype', operands['cache_dtype'],
-                         source='typed_input'),
-            SemanticAttr('output_dtype', operands['output_dtype'],
-                         source='typed_input'),
-            SemanticAttr('query_layout', operands['query_layout'],
-                         source='typed_input'),
-            SemanticAttr('output_layout', operands['output_layout'],
-                         source='typed_input'),
-            SemanticAttr('cache_layout', operands['cache_layout'],
-                         source='typed_input'),
-            SemanticAttr('latent_width', operands['latent_width'],
-                         unit='element'),
-            SemanticAttr('rope_width', operands['rope_width'], unit='element'),
-            SemanticAttr('logical_heads', logical, unit='head'),
-            SemanticAttr('physical_heads', physical, unit='head'),
-            SemanticAttr('contexts', geometry['contexts'], unit='token'),
-            SemanticAttr('kv_lengths', geometry['kv_lengths'], unit='token'),
-            SemanticAttr('position_ranges', geometry['position_ranges'],
-                         unit='token'),
-            SemanticAttr('active_sequence_count', active, unit='sequence'),
-            SemanticAttr('native_query_capacity', capacity, unit='sequence'),
-            SemanticAttr('inactive_sequence_kv_length', 0, unit='token'),
-            SemanticAttr('page_size', geometry['page_size'], unit='token'),
-            SemanticAttr('page_counts', geometry['page_counts'], unit='page'),
-            SemanticAttr('page_entries', geometry['page_entries'], unit='entry'),
-            SemanticAttr('page_table_dtype', 'int32', source='native_abi'),
-            SemanticAttr('kv_split_source', geometry['kv_split_source'],
-                         source='selected_program'),
-            SemanticAttr('effective_kv_splits', geometry['effective_kv_splits'],
-                         unit='split', source='selected_program'),
-            SemanticAttr('quant_scales', operands['quant_scales'],
-                         source='absent:bf16_cache_has_no_quant_scales'),
-            SemanticAttr('attention_scale', operands['attention_scale'],
-                         source=operands['attention_scale_source']),
-            SemanticAttr('output_alias',
-                         'NBSD[:logical_heads]; leading-head contiguous slice; no copy',
-                         source='caller_view'),
-            SemanticAttr('kv_owner', declaration['kv_owner'] or 'self',
-                         source='selected_state_owner'),
-            SemanticAttr('kv_owner_source', declaration['kv_owner_source']),
-            SemanticAttr('kv_version', declaration['kv_version'],
-                         unit='version', source='runtime_state'),
-            SemanticAttr('kv_condition', declaration['kv_condition'],
-                         source='selected_program'),
-            SemanticAttr('kv_producer', declaration['kv_producer'],
-                         source='selected_state_producer'),
-            SemanticAttr('kv_output', declaration['kv_output'],
-                         source='selected_state_output'),
-            SemanticAttr('kv_storage', declaration['kv_storage'],
-                         source='selected_state_storage'),
-            SemanticAttr('kv_span', declaration['kv_span'],
-                         unit='range', source='request_span'),
-            SemanticAttr('kv_request_ids', declaration['request_ids'],
-                         source='request_scope'),
-            SemanticAttr('kv_request_rank', declaration['request_rank'],
-                         source='request_scope'),
-            SemanticAttr('unresolved_fields', declaration['unresolved_fields'],
-                         source='specific_request'),
-        ),
-        ports=PortSet(
-            tensor_in=(
-                TensorPortSpec('q', 'in', 'activation',
-                               dtype=operands['query_dtype'],
-                               layout_kind=operands['query_layout'],
-                               scope='layer'),
-                TensorPortSpec('q_rope', 'in', 'activation',
-                               dtype=operands['query_dtype'],
-                               layout_kind=operands['query_layout'],
-                               scope='layer'),
-                TensorPortSpec('kv_cache', 'in', 'latent_kv_cache',
-                               dtype=operands['cache_dtype'],
-                               layout_kind=operands['cache_layout'],
-                               scope='cohort'),
-                TensorPortSpec('page_table', 'in', 'index', dtype='int32',
-                               layout_kind='flat', scope='cohort'),
-            ),
-            tensor_out=(
-                TensorPortSpec('attention_output', 'out', 'activation',
-                               dtype=operands['output_dtype'],
-                               layout_kind=operands['output_layout'],
-                               scope='layer'),
-            ),
-            state_in=(
-                StatePortSpec('kv_cache_state', 'in', 'paged_latent_kv',
-                              scope='cohort', readiness='producer_complete',
-                              owner=declaration['kv_owner'] or 'self'),
-            ),
-            event_in=(
-                EventPortSpec('q_ready', 'in', 'ready'),
-                EventPortSpec('kv_cache_ready', 'in', 'ready'),
-                EventPortSpec('page_table_ready', 'in', 'ready'),
-            ),
-            event_out=(EventPortSpec('done', 'out', 'complete'),),
-        ),
-        work=WorkSet(),
-        state_effects=(
-            StateEffect('kv_cache', 'read', version=declaration['kv_version'],
-                        condition=declaration['kv_condition']),
-        ),
-        field_effects=(
-            FieldDisposition('q.dtype', 'preserve'),
-            FieldDisposition('q.layout', 'consume',
-                             source='native query layout view'),
-            FieldDisposition('q_rope.dtype', 'preserve'),
-            FieldDisposition('kv_cache.dtype', 'preserve'),
-            FieldDisposition('kv_cache.state_version', 'consume',
-                             source='runtime cache request state'),
-            FieldDisposition('kv_cache.page_size', 'consume',
-                             source='runtime.kv_block_size'),
-            FieldDisposition('position', 'consume',
-                             source='request view context and query range'),
-            FieldDisposition('scale', 'preserve',
-                             source=operands['attention_scale_source']),
-            FieldDisposition('quant_scales', 'preserve',
-                             source='bf16 cache: no quant scales'),
-            FieldDisposition('output.alias', 'consume',
-                             source='leading logical heads view; no copy'),
-        ),
-        notes=('work supplied by selected recipe plan; no duplicate timing',
-               'ports and attrs are executable-contract declarations',
-               'dispatch and retained KV are implementation options'),
-    )
 
 
 def _declaration_op(declaration, *, views, plan, deps=(), op_id='paged_mla_decode'):

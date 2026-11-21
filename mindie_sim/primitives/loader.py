@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal
@@ -23,7 +24,11 @@ RateRole = Literal["sim", "dual"]
 
 
 def default_primitives_dir() -> Path:
-    return Path(__file__).resolve().parents[2] / "data" / "primitives"
+    checkout = Path(__file__).resolve().parents[2] / "data" / "primitives"
+    if checkout.is_dir():
+        return checkout
+    installed = Path(sys.prefix) / "data" / "primitives"
+    return installed if installed.is_dir() else checkout
 
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:

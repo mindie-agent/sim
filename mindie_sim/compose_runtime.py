@@ -28,9 +28,9 @@ from typing import Any
 from mindie_sim.compose_inputs import _arch_key, _resolve_hardware
 from mindie_sim.model_catalog import ARCHITECTURE_PRESET_ALIASES, MODEL_ALIASES
 from mindie_sim.prediction.structure import parse_case
+from mindie_sim.runtime_profiles import simulation_config
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.model import ModelSpec
-from mindie_sim.va_profiles import simulation_config
 
 MX_GROUP_SIZE = 32
 MX_SCALE_PACK = 2

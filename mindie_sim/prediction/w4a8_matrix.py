@@ -10,7 +10,7 @@
 from dataclasses import dataclass, replace
 import math
 
-from .matrix import HierarchicalMatmul
+from .matrix import HierarchicalMatmul, directional_mte1_available
 from .matrix_steady import SteadyMatmul
 from .mechanism import Work
 from .ownership import read_role
@@ -126,8 +126,7 @@ def matrix_program(context, schedule, *, compact=True):
             record({**mapping, "source_control": control,
                     "inner_mapping_basis": "declared_shared_core_not_recovered_MatmulImpl",
                     "physical_mte1_operand_bytes": list(operand_bytes(schedule)),
-                    "directional_mte1": all(key in context.service_modes
-                                             for key in ("mte1_l0a", "mte1_l0b"))})
+                    "directional_mte1": directional_mte1_available(context)})
         bound = replace(bound, record_mapping=record_source)
     counts = {record.owner: record.tiles for record in schedule.matrix}
     owners = tuple((counts.get(owner, 0), owner_rectangles(schedule, owner))

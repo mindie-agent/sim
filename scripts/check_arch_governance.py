@@ -64,51 +64,9 @@ _CP_INFRA_FILES = _SM_INFRA_FILES | frozenset({
     "mindie_sim/prediction/matrix_precision.py",
 })
 
-# Explicit Stage-1 allowlist ONLY for untouched pre-Stage-3 files that Stage 3
-# will delete or migrate. NEVER add mindie_sim/prediction/operators/<family>/**.
-LEGACY_ALLOWLIST: dict[str, frozenset[str]] = {
-    "mindie_sim/feature_mechanisms_cann93.py": frozenset({"AG001"}),
-    "mindie_sim/observations/a5_comm_binding.py": frozenset({"AG001"}),
-    "mindie_sim/observations/a5_comm_calibration.py": frozenset({"AG001"}),
-    "mindie_sim/observations/a5_comm_golden.py": frozenset({"AG001"}),
-    "mindie_sim/observations/a5_comm_ingest.py": frozenset({"AG001"}),
-    "mindie_sim/prediction/attention_decode.py": frozenset({"AG003", "AG004"}),
-    "mindie_sim/prediction/attention_prefill.py": frozenset({"AG003", "AG004"}),
-    "mindie_sim/prediction/body_defaults.py": frozenset({"AG003", "AG004"}),
-    "mindie_sim/prediction/expected_grouped.py": frozenset({"AG003"}),
-    "mindie_sim/prediction/family_hc_arch35.py": frozenset({"AG001"}),
-    "mindie_sim/prediction/family_kda_recurrent_arch22.py": frozenset({"AG001"}),
-    "mindie_sim/prediction/family_paged_mla_arch22.py": frozenset({"AG001"}),
-    "mindie_sim/prediction/fusion_recipe.py": frozenset({"AG004"}),
-    "mindie_sim/prediction/gdn_chunk32.py": frozenset({"AG003"}),
-    "mindie_sim/prediction/grouped_dequant_arch35.py": frozenset({"AG001"}),
-    "mindie_sim/prediction/hc_arch35_compact.py": frozenset({"AG001"}),
-    "mindie_sim/prediction/hc_arch35_program.py": frozenset({"AG001"}),
-    "mindie_sim/prediction/hccl_alltoallv.py": frozenset({"AG003"}),
-    "mindie_sim/prediction/indexed_attention.py": frozenset({"AG003"}),
-    "mindie_sim/prediction/matrix.py": frozenset({"AG003", "AG004"}),
-    "mindie_sim/prediction/matrix_mapping.py": frozenset({"AG003", "AG004"}),
-    "mindie_sim/prediction/matrix_splitk.py": frozenset({"AG003", "AG004"}),
-    "mindie_sim/prediction/matrix_steady.py": frozenset({"AG003", "AG004"}),
-    "mindie_sim/prediction/mc2_arch22.py": frozenset({"AG001"}),
-    "mindie_sim/prediction/mla_cann_epilogs.py": frozenset({"AG001"}),
-    "mindie_sim/prediction/mla_prolog_arch22.py": frozenset({"AG001"}),
-    "mindie_sim/prediction/moe_cann_fusion.py": frozenset({"AG001"}),
-    "mindie_sim/prediction/mxfp8_grouped.py": frozenset({"AG003"}),
-    "mindie_sim/prediction/operators/block_sparse_attention_arch35.py": frozenset({"AG001", "AG003"}),
-    "mindie_sim/prediction/operators/hc_gated_residual_arch35.py": frozenset({"AG001", "AG003"}),
-    "mindie_sim/prediction/operators/kda_recurrent_arch22.py": frozenset({"AG001"}),
-    "mindie_sim/prediction/operators/megamoe_arch35.py": frozenset({"AG001"}),
-    "mindie_sim/prediction/operators/mla_prolog_v4_arch35.py": frozenset({"AG001", "AG003"}),
-    "mindie_sim/prediction/operators/sparse_index_scorers_arch35.py": frozenset({"AG001", "AG003"}),
-    "mindie_sim/prediction/paged_mla_arch22.py": frozenset({"AG001"}),
-    "mindie_sim/prediction/paged_mla_arch22_dispatch.py": frozenset({"AG001"}),
-    "mindie_sim/prediction/paged_mla_arch22_matrix.py": frozenset({"AG001"}),
-    "mindie_sim/prediction/service_regimes.py": frozenset({"AG003"}),
-    "mindie_sim/prediction/sparse_indexer_pipeline.py": frozenset({"AG003"}),
-    "mindie_sim/prediction/vector_pipeline.py": frozenset({"AG003"}),
-    "mindie_sim/prediction/w4a8_matrix.py": frozenset({"AG003", "AG004"}),
-}
+# All flat ISA/CANN sidecars and AG003/AG004 legacy debt have been retired;
+# strict mode requires zero allowlist entries.
+LEGACY_ALLOWLIST: dict[str, frozenset[str]] = {}
 
 
 @dataclass(frozen=True, slots=True)

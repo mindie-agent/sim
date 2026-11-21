@@ -31,14 +31,35 @@ SOURCE = {
                'vector': '176bd97f6286611570cf99549395a6b23d74ecd212fc9cd5d8d13ebb417b87b8'},
     'scope': 'M64/S2_128/D512/rope64; declared split count; source-compatible not binary identity',
 }
-KEY_TILE, HEAD_TILE = 128, 64
+KEY_TILE = 128
+HEAD_TILE = 64
+
+_LATENT_WIDTH = 512
+_ROPE_WIDTH = 64
+_QK_WIDTH = _LATENT_WIDTH + _ROPE_WIDTH
+_CUBE_ALIGNMENT = 16
+_SCORE_COLUMN_ALIGNMENT = 8
+_FP32_BYTES = 4
+_PAGE_INDEX_BYTES = 4
+_SPLIT_STATS_BYTES = 2 * _FP32_BYTES
+_SOFTMAX_OPS_PER_SCORE = 8
+_SOFTMAX_FIRST_OPS_PER_HEAD = 26
+_SOFTMAX_NEXT_OPS_PER_HEAD = 32
+_LATER_UPDATE_OPS_PER_ELEM = 3
+_MERGE_OPS_PER_ELEM = 3
+_MERGE_OPS_PER_PARTIAL = 6
+_MERGE_OPS_PER_HEAD = _MERGE_OPS_PER_ELEM * _LATENT_WIDTH + _MERGE_OPS_PER_PARTIAL
+_PLAN_CACHE_SIZE = 64
+_CYCLE_TEMPLATE_CACHE_SIZE = 8
+_PIPELINE_SLOTS = 3
+
 # Exact no-mask/no-LSE allocations: kernel CV queues plus Vector-owned queues.
 BUFFERS = {'l1': 3*128*576*2 + 64*576*2, 'l0a': 65536, 'l0b': 65536,
            'l0c': 262144, 'ub': 2*32*(128+512)*4 + 6*256 + 2*1024 + 512
            + 32*512*4 + 33*128*2}
 
 
-def aligned(value, step=16):
+def aligned(value, step=_CUBE_ALIGNMENT):
     return (value + step - 1) // step * step
 
 
@@ -60,22 +81,23 @@ def segments(contexts, requested):
 def tile_work(keys, heads, *, first, last):
     """Source memory directions and executed matrix footprint, without timers."""
     hm, kn = aligned(heads), aligned(keys)
-    score = aligned(heads, 2) * aligned(keys, 8) * 4
-    pv = aligned(heads, 2) * 512 * 4
+    score = aligned(heads, 2) * aligned(keys, _SCORE_COLUMN_ALIGNMENT) * _FP32_BYTES
+    pv = aligned(heads, 2) * _LATENT_WIDTH * _FP32_BYTES
+    softmax_ops = _SOFTMAX_FIRST_OPS_PER_HEAD if first else _SOFTMAX_NEXT_OPS_PER_HEAD
     return (
-        ('load', Work(resources={'hbm': keys*576*2, 'mte2_aic': keys*576*2})),
-        ('qk_operands', Work(resources={'mte1': (hm + kn)*576*2})),
-        ('qk', Work(matrix={'bf16': 2*hm*kn*576})),
+        ('load', Work(resources={'hbm': keys*_QK_WIDTH*2, 'mte2_aic': keys*_QK_WIDTH*2})),
+        ('qk_operands', Work(resources={'mte1': (hm + kn)*_QK_WIDTH*2})),
+        ('qk', Work(matrix={'bf16': 2*hm*kn*_QK_WIDTH})),
         ('scores', Work(resources={'fixpipe': score})),
-        ('softmax', Work(resources={'vector': 8*heads*keys + (26 if first else 32)*heads})),
+        ('softmax', Work(resources={'vector': heads * (_SOFTMAX_OPS_PER_SCORE * keys + softmax_ops)})),
         ('probability', Work(resources={'mte3': heads*KEY_TILE*2})),
         # MatmulN loads the declared M64 probability matrix once, then reuses
         # L0A across four N128 products; realM bounds the actual Mmad rows.
-        ('pv_operands', Work(resources={'mte1': (HEAD_TILE + 512)*kn*2})),
-        ('pv', Work(matrix={'bf16': 2*hm*kn*512})),
+        ('pv_operands', Work(resources={'mte1': (HEAD_TILE + _LATENT_WIDTH)*kn*2})),
+        ('pv', Work(matrix={'bf16': 2*hm*kn*_LATENT_WIDTH})),
         ('partial', Work(resources={'fixpipe': pv})),
-        ('update', Work(resources={'vector': heads*512*(2 if first else 3)
-                                  + (heads*512 if last else 0)})),
+        ('update', Work(resources={'vector': heads*_LATENT_WIDTH*(2 if first else _LATER_UPDATE_OPS_PER_ELEM)
+                                  + (heads*_LATENT_WIDTH if last else 0)})),
     )
 
 
@@ -111,23 +133,23 @@ class Spec:
 
 def _ends(spec, segment):
     sequence, start, count, splits = segment
-    query = Work(resources={'hbm': spec.heads*576*2, 'mte2_aic': spec.heads*576*2})
+    query = Work(resources={'hbm': spec.heads*_QK_WIDTH*2, 'mte2_aic': spec.heads*_QK_WIDTH*2})
     # One 32-bit physical page index per encountered page; scalar issue and
     # translation latency remain declared omissions, not a timing floor.
     first = start*KEY_TILE
     end = min((start+count)*KEY_TILE, spec.contexts[sequence]+1)
     pages = (end + spec.page_size-1)//spec.page_size - first//spec.page_size
-    query += Work(resources={'hbm': pages*4, 'mte2_aic': pages*4})
-    out_bytes = spec.heads * (512*4+8 if splits > 1 else 512*2)
+    query += Work(resources={'hbm': pages*_PAGE_INDEX_BYTES, 'mte2_aic': pages*_PAGE_INDEX_BYTES})
+    out_bytes = spec.heads * (_LATENT_WIDTH*_FP32_BYTES+_SPLIT_STATS_BYTES if splits > 1 else _LATENT_WIDTH*2)
     return query, Work(resources={'hbm': out_bytes, 'mte3': out_bytes})
 
 
 def merge_work(spec, count, heads=None):
     heads = spec.heads if heads is None else heads
-    read = count * heads * (512*4+8)
-    write = heads*512*2
+    read = count * heads * (_LATENT_WIDTH*_FP32_BYTES+_SPLIT_STATS_BYTES)
+    write = heads*_LATENT_WIDTH*2
     return (Work(resources={'hbm': read, 'mte2_aiv': read}),
-            Work(resources={'vector': heads*(count*(3*512+6)+512)}),
+            Work(resources={'vector': heads * (count * _MERGE_OPS_PER_HEAD + _LATENT_WIDTH)}),
             Work(resources={'hbm': write, 'mte3': write}))
 
 
@@ -146,7 +168,7 @@ def build(op, geometry):
     return _plan(spec, geometry.compute_units)
 
 
-@lru_cache(maxsize=64)
+@lru_cache(maxsize=_PLAN_CACHE_SIZE)
 def _plan(spec, cores):
     if spec.dispatch:
         by_owner = spec.dispatch.jobs()
@@ -209,7 +231,7 @@ def _plan(spec, cores):
                 sequence, start, count, _ = job
                 begin, end = _ends(spec, job)
 
-                @lru_cache(maxsize=8)
+                @lru_cache(maxsize=_CYCLE_TEMPLATE_CACHE_SIZE)
                 def cycle_template(keys, old_keys, first, old_first, old_last, parity):
                     # ExecuteTask issues C1(i), C2(i-1), and independently
                     # V1(i), V2(i-1). Distinct physical pipes may overlap, but
@@ -257,7 +279,7 @@ def _plan(spec, cores):
                                           index == count, index % 2)
                 return KernelProgram((stage('query', begin, owner),
                     Stage('tiles', after=('query',), program=compact_periodic_pipeline(
-                        ctx, count + 1, 3, cycle, head=2, tail=2)),
+                        ctx, count + 1, _PIPELINE_SLOTS, cycle, head=2, tail=2)),
                     stage('output', end, owner, after=('tiles',))))
 
             return PipelineProgram(len(local), 1,
@@ -266,11 +288,11 @@ def _plan(spec, cores):
         merged = []
         def merge_program(count, owner, heads, aiv=None):
             read, _, write = merge_work(spec, count, heads)
-            update = Work(resources={'vector': heads*(3*512+6)})
+            update = Work(resources={'vector': heads * _MERGE_OPS_PER_HEAD})
             return KernelProgram((Stage('partials', program=PipelineProgram(count, 1, lambda _: (
                     stage('read', read.scaled(1/count), owner,aiv=aiv),
                     stage('accumulate', update, owner,aiv=aiv, after=('read',))))),
-                stage('normalize', Work(resources={'vector':heads*512}), owner,aiv=aiv,
+                stage('normalize', Work(resources={'vector':heads*_LATENT_WIDTH}), owner,aiv=aiv,
                       after=('partials',)), stage('write', write, owner,aiv=aiv, after=('normalize',))))
 
         if spec.dispatch:

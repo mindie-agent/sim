@@ -356,6 +356,9 @@ def build_pep517_wheel(base: Path) -> Path:
     source = base / "source"
     ignore = shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo")
     shutil.copytree(ROOT / "mindie_sim", source / "mindie_sim", ignore=ignore)
+    primitives_data = ROOT / "data" / "primitives"
+    if primitives_data.is_dir():
+        shutil.copytree(primitives_data, source / "data" / "primitives")
     shutil.copy2(ROOT / "pyproject.toml", source / "pyproject.toml")
     readme = ROOT / "README.md"
     if readme.exists():

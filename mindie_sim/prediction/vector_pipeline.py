@@ -16,7 +16,6 @@ from .physical_recipe_base import (IO_HBM_CATEGORY, Phase, build_plan,
                                    io_weight, tiled_phased_program)
 
 MS_PER_SECOND = 1000
-RATE_INDEX = 1
 HALF_SHARE = 0.5
 STREAM_LOAD_SHARE = 0.30
 STREAM_STORE_SHARE = 0.70
@@ -40,12 +39,12 @@ class AIVTiledVectorAndGatherRecipe:
 
     def bind_context(self, context):
         """Use declared sustainable DRAM service on the shared HBM bus."""
-        mode = context.service_modes.get("mte2_aiv_dram")
-        if mode is None:
+        dram_rate = context.service_rate("mte2_aiv_dram")
+        if dram_rate is None:
             return context
         # Only service units change. Native HBM bytes and on-chip MTE2
         # refills remain intact; reads and writes contend on the same bus.
-        ceiling = min(mode[RATE_INDEX],
+        ceiling = min(dram_rate,
                       context.rates[context.resource_names["hbm"]] * MS_PER_SECOND)
         return replace(context, service_modes={
             **context.service_modes, "hbm": ("hbm", ceiling)})

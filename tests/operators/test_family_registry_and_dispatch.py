@@ -288,7 +288,7 @@ def test_coupling_retains_both_resources_and_ties_follow_submission_order():
         assert engine.serviced == {"a": 30, "b": 10} and done.time == 3
         assert engine.busy_ms == {"a": 3, "b": 3 if coupled else 1}
 EXTENSIONS = ("cuda_norm", "cuda_quant", "attention", "grouped_gemm", "moe_align",
-              "moe_combine", "causal_conv_prefill", "gdn_prepare", "gdn_state")
+              "moe_combine", "gdn_prepare", "gdn_state")
 def _source_case(name):
     if name == "attention":
         return attention, replace(OPS[attention.register_family()], requests=("r",)), sku_case(REPRESENTATIVE_SKUS["a5"])

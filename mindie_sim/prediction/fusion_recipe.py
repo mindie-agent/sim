@@ -264,7 +264,8 @@ def _planned_recipe(pattern: RecipePattern, analysis: RegionAnalysis,
     resources = _resources(phase_work, matrix_work)
     if conserved_hbm is not None:
         resources["hbm"] = float(conserved_hbm)
-    work = Work(matrix=dict(matrix_work), resources=resources)
+    cube_work = Work(matrix=dict(matrix_work))
+    work = Work(matrix=cube_work.matrix, resources=resources)
 
     def meters(work: dict[str, float]) -> dict[str, float]:
         work.pop("cube", None)
@@ -279,12 +280,8 @@ def _planned_recipe(pattern: RecipePattern, analysis: RegionAnalysis,
             demand = {names[role]: amount for role, amount in payload.items()
                       if role in names and amount}
             if "cube" in work:
-                for dtype, amount in matrix_work:
-                    peak = context.compute_peaks.get(dtype)
-                    if not peak:
-                        raise ValueError(f"compute_precision_rate_required:{dtype}")
-                    demand[names["cube"]] = demand.get(names["cube"], 0.0) + \
-                        1000.0 * amount / peak
+                for name, amount in context.bind(cube_work).items():
+                    demand[name] = demand.get(name, 0.0) + amount
             if not demand and index != len(phase_work) - 1:
                 continue
             name = phase if phase not in [s.name for s in stages] else f"{phase}:{index}"

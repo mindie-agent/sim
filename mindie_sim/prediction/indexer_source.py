@@ -11,6 +11,7 @@
   source family: it requires BF16 q/k, TND query and paged key, and never a
   query scale or INT8 representation. C4/V2, absent qscale, other
   images/sources remain non-C8; no defaults are invented.
+[Timeouts & Locks] Constant-time metadata inspection; no I/O or locks.
 [Side-Effect Policy] Pure metadata.
 """
 from __future__ import annotations

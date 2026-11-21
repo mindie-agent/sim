@@ -26,16 +26,17 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import json
 from pathlib import Path
 from typing import Any
 
 from mindie_sim.feature_mechanisms import MECHANISM_CATALOG, MechanismContext
+from mindie_sim.runtime_profiles import VA_RECOMMENDED_PROFILES
 from mindie_sim.schema.common import ModelingError
-from mindie_sim.va_profiles import VA_RECOMMENDED_PROFILES
 
 STACK_MANIFEST_SCHEMA = "mindie-sim.stack-manifest/1"
+VLLM_ASCEND_MANIFEST_PATH = Path(__file__).resolve().parent / "stack_sources" / "vllm_ascend_cann93.json"
 MAX_MANIFEST_BYTES = 50 * 1024 * 1024
 
 TRACK_ALIASES: dict[str, str] = {
@@ -392,118 +393,36 @@ def apply_resolved_mechanisms(
 
 # --- Built-in Stack Profiles ------------------------------------------------
 
-import importlib
-
-try:
-    importlib.import_module("mindie_sim.feature_mechanisms_cann93")
-except ModuleNotFoundError as _cann93_mech_exc:
-    if _cann93_mech_exc.name != "mindie_sim.feature_mechanisms_cann93":
-        raise
-
-try:
-    _va_ext = importlib.import_module("mindie_sim.va_stack_bindings")
-except ModuleNotFoundError as _va_bind_exc:
-    if _va_bind_exc.name != "mindie_sim.va_stack_bindings":
-        raise
-    _va_ext = None
-
-_VA_REPO = "vllm-project/vllm-ascend"
-_VA_DOCUMENTED_MODELS = tuple(sorted(VA_RECOMMENDED_PROFILES))
-_VA_MODEL_DEFAULTS = {
-    k: {
-        "quant": dict(v.get("quant") or {}),
-        "sp": v.get("sp", True),
-        "mlapo": "VLLM_ASCEND_ENABLE_MLAPO" in (v.get("env") or {}),
-        "kv_block_size": v.get("kv_block_size"),
-        "mtp_proposal_tokens": v.get("mtp_proposal_tokens", 0),
-        "graph_capture_mode": v.get("graph_capture_mode", "full"),
+def _vllm_ascend_profile() -> RuntimeStackProfile:
+    profile = load_runtime_stack_manifest(VLLM_ASCEND_MANIFEST_PATH)
+    documented_models = tuple(sorted(VA_RECOMMENDED_PROFILES))
+    model_defaults = {
+        key: {
+            "quant": dict(value.get("quant") or {}),
+            "sp": value.get("sp", True),
+            "mlapo": "VLLM_ASCEND_ENABLE_MLAPO" in (value.get("env") or {}),
+            "kv_block_size": value.get("kv_block_size"),
+            "mtp_proposal_tokens": value.get("mtp_proposal_tokens", 0),
+            "graph_capture_mode": value.get("graph_capture_mode", "full"),
+        }
+        for key, value in VA_RECOMMENDED_PROFILES.items()
     }
-    for k, v in VA_RECOMMENDED_PROFILES.items()
-}
+    scoped_defaults = {"aclgraph_decode_capture", "sequence_parallel"}
+    bindings = tuple(
+        replace(binding, models=documented_models)
+        if not binding.models and binding.state == "merged" and binding.mechanism_id in scoped_defaults
+        else binding
+        for binding in profile.bindings
+    )
+    return replace(
+        profile,
+        description="vLLM-Ascend main baseline and audited open performance PRs",
+        model_defaults=model_defaults,
+        bindings=bindings,
+    )
 
-_FALLBACK_VA_BINDINGS: tuple[StackMechanismBinding, ...] = (
-    StackMechanismBinding("aclgraph_decode_capture", "merged", f"{_VA_REPO}@main",
-                          models=_VA_DOCUMENTED_MODELS),
-    StackMechanismBinding("sequence_parallel", "merged", f"{_VA_REPO}@main",
-                          models=_VA_DOCUMENTED_MODELS),
-    StackMechanismBinding("add_rmsnorm_quant_fusion", "merged", f"{_VA_REPO}@main"),
-    StackMechanismBinding("mla_prolog_fusion", "merged", f"{_VA_REPO}@main"),
-    StackMechanismBinding("attn_res_prefix_fusion", "merged", f"{_VA_REPO}@main"),
-    StackMechanismBinding("recurrent_decode_native_kernels", "merged", f"{_VA_REPO}@main"),
-    StackMechanismBinding(
-        "mhc_boundary_fusion_overlap", "unmerged_pr", f"{_VA_REPO}#22142",
-        models=("deepseek-v4.1-flash", "deepseek-v4-flash-0731"),
-        notes="Fuse DeepSeek V4.1 HcPost+HcPreMix+RMSNorm and overlap HcPreCoefficients (<=72 rows)",
-    ),
-    StackMechanismBinding(
-        "mhc_boundary_fusion_overlap", "unmerged_pr", f"{_VA_REPO}#20824",
-        models=("qwen3.8-flash-next",),
-        notes="Overlap Qwen4Exp low-rank HC injection on auxiliary stream with Attention/MoE",
-    ),
-    StackMechanismBinding(
-        "gdn_chunk64_prefill", "unmerged_pr", f"{_VA_REPO}#22147",
-        archs=("a5",),
-        notes="Arch35 FLA Chunk64 GDN prefill composite (+ PR #21693 Qwen3.8-Flash-Next PCP)",
-    ),
-    StackMechanismBinding(
-        "gdn_strided_gate_zero_copy", "unmerged_pr", f"{_VA_REPO}#21466",
-        notes="Direct strided BA inputs in GDN gating + head-first QKV storage reuse (#22010, #21467, #21820)",
-    ),
-    StackMechanismBinding(
-        "gdn_projection_multistream_overlap", "unmerged_pr", f"{_VA_REPO}#21037",
-        notes="Overlap Qwen GDN BA projection on auxiliary NPU stream during ACLGraph decode",
-    ),
-    StackMechanismBinding(
-        "kda_in_kernel_l2norm", "unmerged_pr", f"{_VA_REPO}#22048",
-        models=("glm-5.3-flash", "kimi-k3", "kimi-k3.1"),
-        notes="In-kernel Q/K L2 normalization for chunk KDA (+ #21510/#21017 TPxPCP KDA sharding)",
-    ),
-    StackMechanismBinding(
-        "fused_recover_ssm", "unmerged_pr", f"{_VA_REPO}#22045",
-        models=("qwen3.8-27b", "qwen3.6-35b-a3b", "qwen3.8-flash-next", "glm-5.3-flash"),
-        notes="Triton RecoverSSM compact speculative state records + colocated PCP (#22045, #22146)",
-    ),
-    StackMechanismBinding(
-        "qkv_norm_rope_fusion", "unmerged_pr", f"{_VA_REPO}#22086",
-        models=("qwen3.8-flash-next", "qwen3.8-27b"),
-        notes="Fuse QSA/GQA QKV RMSNorm + MRoPE head preparation (#22086, #22101)",
-    ),
-    StackMechanismBinding(
-        "unit_offset_rmsnorm_fusion", "unmerged_pr", f"{_VA_REPO}#21449",
-        models=("qwen3.8-27b", "gemma-4-31b", "gemma-4-26b-a4b"),
-        notes="Pre-fold Gemma/Qwen (1+w) RMSNorm unit-offset weights enabling fused AddRmsNorm",
-    ),
-    StackMechanismBinding(
-        "activation_quant_fusion", "unmerged_pr", f"{_VA_REPO}#21543",
-        notes="FX SwiGLU/SiTU graph fusion + dynamic quant fusion (#21543)",
-    ),
-    StackMechanismBinding(
-        "moe_tail_residual_fusion", "unmerged_pr", f"{_VA_REPO}#21999",
-        notes="Plain tensor add / fused residual combine for MoE shared+routed tail (#21999)",
-    ),
-    StackMechanismBinding(
-        "shared_expert_multistream_overlap", "unmerged_pr", f"{_VA_REPO}#22128",
-        models=("deepseek-v4.1-flash", "deepseek-v4-10t", "glm-5.3-flash",
-                "qwen3.8-flash-next", "kimi-k3.1"),
-        notes="Multi-stream / MegaMoE shared-expert overlap (#22128, #21095, #21624)",
-    ),
-)
 
-_VA_ACTIVE_BINDINGS = (
-    tuple(_va_ext.VLLM_ASCEND_CANN93_BINDINGS)
-    if _va_ext is not None and hasattr(_va_ext, "VLLM_ASCEND_CANN93_BINDINGS")
-    else _FALLBACK_VA_BINDINGS
-)
-
-register_runtime_stack(RuntimeStackProfile(
-    name="vllm-ascend",
-    repository=str(getattr(_va_ext, "VLLM_ASCEND_REPOSITORY", _VA_REPO)),
-    description="vLLM-Ascend main baseline and audited open performance PRs",
-    model_defaults=_VA_MODEL_DEFAULTS,
-    bindings=_VA_ACTIVE_BINDINGS,
-    supported_models=tuple(getattr(_va_ext, "VLLM_ASCEND_SUPPORTED_MODELS", ())),
-    unmerged_pr_models=tuple(getattr(_va_ext, "VLLM_ASCEND_UNMERGED_PR_MODELS", ())),
-))
+register_runtime_stack(_vllm_ascend_profile())
 
 register_runtime_stack(RuntimeStackProfile(
     name="raw_eager",

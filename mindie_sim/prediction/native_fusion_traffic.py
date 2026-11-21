@@ -12,9 +12,11 @@ from dataclasses import replace
 from mindie_sim.schema.common import ModelingError
 
 from .mla_prolog_packed import PROFILE as MLA_PACKED_PROFILE
-from .mla_prolog_arch22 import PROFILE as MLA_ARCH22_PROFILE
-from .mla_prolog_arch22 import SOURCE as MLA_ARCH22_SOURCE
-from .mla_prolog_arch22 import validate_declared_view as validate_mla_arch22_view
+from .native_fusion_mla_membase import PROFILE as MLA_ARCH22_PROFILE
+from .native_fusion_mla_membase import SOURCE as MLA_ARCH22_SOURCE
+from .native_fusion_mla_membase import validate_declared_view as validate_mla_arch22_view
+
+_HC_COEFFICIENT_BYTES = 4
 
 
 PROFILE_ROLES = {
@@ -147,7 +149,9 @@ def apply_traffic_profile(ops, declaration, profile, *, external_outputs=()):
         })
         return tuple(phases), ledger
     role, view = declaration["role"], declaration["tensor_view"]
-    from .family_hc_arch35 import PRE_PROFILE, COMPACT_PRE_PROFILE, POST_PROFILE, SOURCE, LIMITATIONS
+    from .native_fusion_hc_regbase import (
+        COMPACT_PRE_PROFILE, LIMITATIONS, POST_PROFILE, PRE_PROFILE, SOURCE,
+    )
     if profile in {PRE_PROFILE, COMPACT_PRE_PROFILE, POST_PROFILE}:
         ledger["representation_guard"] = {
             "role": role, "dtype": view.get("dtype"),
@@ -214,8 +218,8 @@ def apply_traffic_profile(ops, declaration, profile, *, external_outputs=()):
     elif role == "hc_pre":
         affine, sinkhorn, mix = (
             recipe(name) for name in ("hc_normalize_scale_bias_gate", "hc_sinkhorn", "hc_pre_mix"))
-        remove(affine, sinkhorn, view["tokens"] * view["mixed"] * 4)
-        remove(sinkhorn, mix, view["tokens"] * view["hc"] * 4, preserve_output=True)
+        remove(affine, sinkhorn, view["tokens"] * view["mixed"] * _HC_COEFFICIENT_BYTES)
+        remove(sinkhorn, mix, view["tokens"] * view["hc"] * _HC_COEFFICIENT_BYTES, preserve_output=True)
         ledger["source"] = _HC_SOURCE
         ledger["limitations"].extend([
             "source_plan_replaces_analytical_inverse_rms_with_shared_operand_gram",

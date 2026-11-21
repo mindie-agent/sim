@@ -1,23 +1,14 @@
 """Typed immutable physical identity for lowered operators.
 
-[Role]
-  Provide the grouping primitive for lowered operators.  A physical key is a
-  hashable, typed tuple projection of one operator's declared physical work and
-  implementation, built directly from ``OpSpec`` fields.  Schema-recognized
-  graph references are alpha-renamed to an occurrence-relative form so
-  corresponding operators in different layers compare equal without erasing
-  physical information.  Serialization happens only when a caller explicitly
-  asks for ``physical_signature`` or ``physical_id``.
+[Role] Provide the hashable, typed grouping primitive for lowered operators
+  with alpha-renamed graph references and on-demand serialization.
+[Invariants] Only declared graph-reference leaves are alpha-renamed; every
+  tensor shape, stride, layout, dtype, routing, cache, and state field is
+  preserved verbatim.
+[Timeouts & Locks] O(op metadata size) pure projection; no I/O or locks.
+[Side-Effect Policy] Pure immutable key construction; zero mutation.
 
-[Invariants]
-  * Only declared graph-reference leaves are normalized.  Every tensor shape,
-    stride, offset, layout, dtype, quantization block/scale, byte count,
-    routing distribution, cache geometry, state effect and allocation size is
-    preserved verbatim.
-  * Alpha-renaming is injective over the declared reference namespace: a
-    self-reference becomes ``s0.l0.``, a reference to the previous layer stays
-    ``s0.l-1.``, and role suffixes are never rewritten.  Equality and
-    inequality of references, aliasing and ownership relationships therefore
+Details:
     survive the normalization.
   * Layer-indexed state references (``kda.layer[L]`` / ``gdn.layer[L]``) and the
     integer ``stage``/``layer`` leaves of ``state_accesses`` and

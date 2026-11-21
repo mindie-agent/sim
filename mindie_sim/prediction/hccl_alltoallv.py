@@ -183,7 +183,7 @@ def bind_local_work(values, context):
     """Bind local payload/copy/control work; retain absent physical services."""
     omitted = {role: value for role, value in values
                if value and role in OPTIONAL_SERVICES
-               and role not in context.resource_names and role not in context.service_modes}
+               and role not in context.resource_names and context.service_rate(role) is None}
     work = Work(resources={role: value for role, value in values if role not in omitted})
     return context.bind(work), omitted
 

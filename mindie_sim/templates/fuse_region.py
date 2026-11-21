@@ -327,7 +327,7 @@ class Lowering:
         if not amount:
             return self.add(Stage(name, after=after))
         version = (0 if private or direction == "read" else 1) if version is None else version
-        key = None if bypass else ReuseKey(self.die, tensor, version)
+        key = None if bypass else ReuseKey(self.die, tensor, version, reuse_stream=f"{tensor}:{version}")
         visibility = VisibilityContract(
             scope="die" if private else "device",
             live_out=direction == "write" and not private, private_workspace=private,

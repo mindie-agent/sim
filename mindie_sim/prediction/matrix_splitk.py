@@ -93,10 +93,14 @@ def _router_recipe(op, geometry):
         raise ModelingError("router_mapping_requires_declared_pipe_rates")
     rates = {names[role]: float(rate) / MS_PER_SECOND
              for role, rate in declared_rates.items() if role in names}
-    peaks = dict(getattr(geometry, "compute_peaks", {}) or ())
+    peaks = dict(getattr(geometry, "compute_peaks", ()))
     compute = str(dict(op.metadata).get("compute_format", op.dtype or "bf16"))
-    cube = (MS_PER_SECOND * float(op.flops) / float(peaks[compute])
-            if compute in peaks else 0.0)
+    try:
+        peak = float(peaks[compute])
+    except KeyError:
+        cube = 0.0
+    else:
+        cube = MS_PER_SECOND * float(op.flops) / peak
     context = RecipeContext(
         op, {names["cube"]: cube} if cube else {}, names, rates,
         int(getattr(geometry, "compute_units", A5_AIC_UNITS)),
@@ -251,12 +255,11 @@ def _k_slices(k: float, count: int) -> tuple[int, ...]:
 
 def _per_owner_cap(context, owners: int) -> dict[str, float]:
     """Service-mode bytes/second as a bytes/ms cap for one active owner."""
-    mode = dict(context.service_modes).get(DRAM_SERVICE_MODE)
+    rate = context.service_rate(DRAM_SERVICE_MODE)
     hbm = context.resource_names.get("hbm")
-    if not mode or hbm is None or owners < 1:
+    if rate is None or hbm is None or owners < 1:
         return {}
-    rate = float(mode[1]) / (MS_PER_SECOND * float(int(owners)))
-    return {hbm: rate}
+    return {hbm: rate / (MS_PER_SECOND * float(int(owners)))}
 
 
 def _placement(context, index: int, cores: int, roles) -> dict:

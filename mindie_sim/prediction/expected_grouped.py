@@ -113,7 +113,7 @@ class ExpectedGroupedMatmul:
         else:
             inner = self.matrix.lower(mapped_context)
         if (
-            "mte2_aic_dram" in context.service_modes
+            context.service_rate("mte2_aic_dram") is not None
             and op.phase == "decode"
             and str(meta.get("weight_format", "")) in A5_MXFP4_FORMATS
             and per_bank <= A5_MXFP4_LOW_OCC_ROWS

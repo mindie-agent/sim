@@ -188,14 +188,14 @@ def physical_recipe_bindings() -> dict[str, object]:
     """
     from .gdn_chunk32 import recipes as chunk32_recipes
     from .index_cache_writer import recipes as cache_writer_recipes
+    from .lowrank_hc_vector import recipes as lowrank_hc_recipes
     from .matrix_splitk import (ScopedRouterRecipe, build_router_splitk)
-    from .moe_cann_fusion import ScopedGatingRecipe, build_moe_gating_topk
+    from .mc2_megamoe import recipes as megamoe_recipes
+    from .moe_gating_fusion import ScopedGatingRecipe, build_moe_gating_topk
     from .mxfp8_grouped import ScopedSwigluRecipe, build_swiglu_mx_quant
-    from .operators.block_sparse_attention_arch35 import recipes as bsa_recipes
-    from .operators.hc_gated_residual_arch35 import recipes as hc_recipes
-    from .operators.megamoe_arch35 import recipes as megamoe_recipes
-    from .operators.mla_prolog_v4_arch35 import recipes as prolog_v4_recipes
-    from .operators.sparse_index_scorers_arch35 import recipes as scorer_recipes
+    from .operators.attention import recipes as bsa_recipes
+    from .operators.mla_prolog import recipes as prolog_v4_recipes
+    from .operators.sparse_indexer import recipes as scorer_recipes
     bindings = {recipe: INDEXER for recipe in INDEXER_TOPK_RECIPES}
     bindings.update({
         "moe_gating_topk": ScopedGatingRecipe(build_moe_gating_topk),
@@ -215,7 +215,7 @@ def physical_recipe_bindings() -> dict[str, object]:
         bsa_recipes(),
         scorer_recipes(),
         prolog_v4_recipes(),
-        hc_recipes(),
+        lowrank_hc_recipes(),
     ):
         bindings.update(group)
     return bindings

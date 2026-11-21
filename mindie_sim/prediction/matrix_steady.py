@@ -100,8 +100,9 @@ class SteadyMatmul(MappedMatmul):
                                           else "individual_serial_tiles"),
                 "geometry": geometry.to_dict(),
             })
+        dram_rate = context.service_rate("mte2_aic_dram")
         if (getattr(recipe, "k_splits", DEFAULT_SPLIT_K) > DEFAULT_SPLIT_K
-                and "mte2_aic_dram" in context.service_modes):
+                and dram_rate is not None):
             if include_record:
                 record.update({
                     "execution_abstraction": "finite_split_k",
@@ -127,11 +128,10 @@ class SteadyMatmul(MappedMatmul):
         count, tail = divmod(k, recipe.tile_k)
         epilogue = MatrixEpilogue.from_op(op)
         inputs, weights = epilogue.operands(op)
-        dram_mode = dict(context.service_modes).get("mte2_aic_dram")
-        single_m_hbm_cap = (
-            {names["hbm"]: float(dram_mode[1])
-             / (MS_PER_SECOND * max(1, int(context.core_count)))}
-            if (nm == 1 and dram_mode and "hbm" in names) else {})
+        single_m_hbm_cap = {}
+        if nm == 1 and dram_rate is not None and "hbm" in names:
+            single_m_hbm_cap[names["hbm"]] = (
+                dram_rate / (MS_PER_SECOND * max(1, int(context.core_count))))
         operand_read = read_role(names)
         scale_read = read_role(names, aiv=0)
         width = dtype_bytes(meta.get("compute_format", op.dtype or "bf16"))

@@ -125,9 +125,9 @@ def _build_mixed_plan(
             total_work += split_reads(aic_w, aic_w.resources["mte2"], geometry.resource_units)
 
     def program(context):
-        is_a5 = "mte2_aic_dram" in context.service_modes
-        setup_ms = KERNEL_LAUNCH_SETUP_MS if is_a5 else 0.0
-        sync_ms = step_sync_ms if is_a5 else 0.0
+        has_dram_service = context.service_rate("mte2_aic_dram") is not None
+        setup_ms = KERNEL_LAUNCH_SETUP_MS if has_dram_service else 0.0
+        sync_ms = step_sync_ms if has_dram_service else 0.0
 
         def per_core(core: int, items: tuple[Any, ...]):
             if not items:

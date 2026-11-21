@@ -192,9 +192,11 @@ def _read_kv(demand: _Demand, c: PagedMlaContract, seq: int, query: int, start: 
             spans = tuple(span for base, rows in ranges for span in _spans(base, rows, c.page_size))
             _read_sparse_bank(demand, c, branch, spans, count, table, width)
             pages = tuple(sorted({page for page, _, _ in spans}))
-            demand.transfer(f"{branch}_pages", "mte2_aiv", len(pages) * INDEX_BYTES,
-                            AddressRunPlan(tuple(AddressRun(p * INDEX_BYTES, 1, INDEX_BYTES, INDEX_BYTES)
-                                                 for p in pages)))
+            for page_idx in pages:
+                demand.transfer(
+                    f"{branch}_pages", "mte2_aiv", INDEX_BYTES,
+                    AddressRunPlan((AddressRun(page_idx * INDEX_BYTES, 1, INDEX_BYTES, INDEX_BYTES),)),
+                )
         else:
             packed = ACLNN_MQS_INLINE_ROW_BYTES
             runs = tuple(AddressRun(base * packed, rows, packed, packed, c.kv_layout) for base, rows in ranges)

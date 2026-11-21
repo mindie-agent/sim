@@ -36,7 +36,7 @@
    - **严禁向 A2 的 `compute_peaks` 添加 `fp8` / `fp8_e4m3` / `fp8_e5m2`**，否则触发 `ModelingError("native_compute_mode_unsupported:matrix:fp8...")`。
 3. **AIC <-> AIV 核间数据通路（无片上 `l0c->ub` 直连）**：
    - 在 `npu_arch_2201`（`_paths_2201`）中，独立的 AIC 与 AIV 核**必须经由 GM（共享 L2 或 HBM）交换中间张量**（`l0c->gm` 经 `fixpipe`，`gm->ub` 经 `mte2_aiv`，`ub->gm` 经 `mte3`）；
-   - 编写 A2 融合算子配方（如 [`paged_mla_arch22.py`](../../mindie_sim/prediction/paged_mla_arch22.py) 或自定义 AscendC/Triton Attention）时，`supported_output_paths` 不得声明 A5 专属的 `"l0c_to_ub"`，且跨核传递 Score / Probability / 中间激活必须计入 `fixpipe` / `mte2_aiv` / `mte3`（及未命中 L2 时的 `hbm`）流量。
+   - 编写 A2 融合算子配方（如 [`operators/paged_mla/`](../../mindie_sim/prediction/operators/paged_mla/__init__.py) 或自定义 AscendC/Triton Attention）时，`supported_output_paths` 不得声明 A5 专属的 `"l0c_to_ub"`，且跨核传递 Score / Probability / 中间激活必须计入 `fixpipe` / `mte2_aiv` / `mte3`（及未命中 L2 时的 `hbm`）流量。
 4. **Attention 开箱默认基线与自定义内核扩展**：
    - 开箱默认基线覆盖 `npu_fusion_attention`（Prefill）、`npu_incre_flash_attention`（IFA）、`npu_fused_infer_attention_score`（FIA）及 `ascend_paged_mla_decode_arch22`（`KEY_TILE = 512`，`decode_max_q = 16`，物理头数 `8` 或 `16`）；
    - 若使用自研 AscendC / Triton-Ascend / TileLang / FlashMLA 内核，直接按 [总指南 `3.4` 节](../../CONTRIBUTING.md#34-专项实战如何接入自定义-attention-算子ascendc--triton--稀疏与融合变体) 的 Tiers 1–3 接入，无需迁就 IFA / FIA。

@@ -26,29 +26,24 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from mindie_sim.feature_mechanism_catalog import (
+    MX_SCALE_GROUP_SIZE,
+    PASS_PRIORITY_ORDER,
+    _append_passes,
+    _apply_mhc_fusion_overlap,
+    _apply_shared_expert_overlap,
+    _has_quant_activations,
+    _set_layout_strided,
+    _set_lowering,
+    source_mechanisms as _source_mechanisms,
+)
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.model import ModelSpec
 
-MX_SCALE_GROUP_SIZE = 32
 MX_SCALE_PACK_FACTOR = 2
 GDN_DEFAULT_CHUNK_SIZE = 64
 MAX_RECURRENT_DECODE_QUERY = 8
 SERIAL_CONTEXT_DEGREE = 1
-
-PASS_PRIORITY_ORDER: tuple[str, ...] = (
-    "activation_quantization",
-    "norm_quant",
-    "residual_norm",
-    "moe_tail_residual",
-    "mhc_boundary_pr",
-    "mhc_boundary_ideal",
-    "indexer_online_topk",
-    "qkv_norm_rope",
-    "kda_in_kernel_l2norm",
-    "gdn_projection_overlap",
-    "activation_quant",
-    "gmm_swiglu_quant",
-)
 
 
 @dataclass(frozen=True)
@@ -71,38 +66,6 @@ class OptimizationMechanism:
     summary: str
     eligible: Callable[[MechanismContext], bool]
     apply: Callable[[dict[str, Any], MechanismContext], None]
-
-
-def _append_passes(runtime_dict: dict[str, Any], *names: str) -> None:
-    current = list(runtime_dict.get("lowering_passes") or ())
-    for name in names:
-        if name not in current:
-            current.append(name)
-    order = {name: idx for idx, name in enumerate(PASS_PRIORITY_ORDER)}
-    current.sort(key=lambda item: order.get(item, len(PASS_PRIORITY_ORDER)))
-    runtime_dict["lowering_passes"] = current
-
-
-def _set_lowering(runtime_dict: dict[str, Any], selector: str, binding: Any) -> None:
-    kernels = dict(runtime_dict.get("kernels") or {})
-    lowerings = dict(kernels.get("lowerings") or {})
-    lowerings.setdefault(selector, binding)
-    kernels["lowerings"] = lowerings
-    runtime_dict["kernels"] = kernels
-
-
-def _set_layout_strided(runtime_dict: dict[str, Any], consumer: str, *args: str) -> None:
-    layouts = dict(runtime_dict.get("tensor_layouts") or {})
-    entry = dict(layouts.get(consumer) or {})
-    for arg in args:
-        entry.setdefault(arg, "strided")
-    layouts[consumer] = entry
-    runtime_dict["tensor_layouts"] = layouts
-
-
-def _has_quant_activations(model: ModelSpec) -> bool:
-    return (model.quant is not None
-            and str(model.quant.activation_format) != str(model.activation_dtype))
 
 
 def _torch_compile_active(rt: Mapping[str, Any], model: ModelSpec) -> bool:
@@ -300,16 +263,6 @@ def _apply_recurrent_decode(rt: dict[str, Any], ctx: MechanismContext) -> None:
         })
 
 
-def _apply_mhc_fusion_overlap(rt: dict[str, Any], ctx: MechanismContext) -> None:
-    unbounded = bool(ctx.options.get("unbounded_rows", False))
-    pass_name = "mhc_boundary_ideal" if unbounded else "mhc_boundary_pr"
-    # Upgrade PR-bounded pass to ideal pass cleanly if both are requested
-    existing = [p for p in (rt.get("lowering_passes") or ())
-                if p not in {"mhc_boundary_pr", "mhc_boundary_ideal"}]
-    rt["lowering_passes"] = existing
-    _append_passes(rt, pass_name)
-
-
 def _apply_gdn_zero_copy(rt: dict[str, Any], _ctx: MechanismContext) -> None:
     _set_layout_strided(rt, "gdn_gating", "beta", "alpha")
     _set_layout_strided(rt, "short_convolution", "input")
@@ -338,16 +291,6 @@ def _apply_recover_ssm(rt: dict[str, Any], ctx: MechanismContext) -> None:
     meta = dict(rt.get("metadata") or {})
     if int(meta.get("draft_proposal_tokens", 0) or 0) > 0:
         rt["recover_ssm"] = True
-
-
-def _apply_shared_expert_overlap(rt: dict[str, Any], ctx: MechanismContext) -> None:
-    if "multistream_overlap_shared_expert" in ctx.caller_explicit:
-        return
-    if int(ctx.parallel.get("ep", 1)) > 1:
-        rt["multistream_overlap_shared_expert"] = True
-        meta = dict(rt.get("metadata") or {})
-        meta["multistream_overlap_shared_expert"] = True
-        rt["metadata"] = meta
 
 
 def _apply_dynamic_mc2(rt: dict[str, Any], ctx: MechanismContext) -> None:
@@ -520,4 +463,5 @@ for _item in (
 ):
     register_optimization_mechanism(_item)
 
-from mindie_sim import feature_mechanisms_cann93 as _cann93_mechanisms  # noqa: E402,F401
+for _source_item in _source_mechanisms():
+    register_optimization_mechanism(_source_item)

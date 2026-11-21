@@ -289,16 +289,25 @@ def c8_gather_accounting(
         plan = packed_selection_runs(selection, row_bytes)
         count = sum(run.rows for run in plan.runs)
         rows += count
-        sectors += plan.dram_sector_and_service()[0]
-        pattern = MemoryAccessPattern(tensor_id, 0, die, owner, "read", "mte2_aiv",
-                                      count * row_bytes, plan, reuse_key=key)
-        ledger = bind_memory_access(
-            pattern, view, hbm_bus=bus, copy_hit_bytes_per_ms=1, copy_miss_bytes_per_ms=1,
-            l2_bytes_per_ms=1, pipe_row_id="mte2_aiv", l2_row_id="l2", commit=True,
-        ).ledger
-        aligned += ledger.aligned_transfer_bytes
-        hits += ledger.l2_hit_bytes
-        dram += ledger.dram_sector_bytes
+        # Independent gather runs in one query preserve repeat accesses before L2
+        # fill; physically contiguous rows were already coalesced into one AddressRun.
+        for run in plan.runs:
+            run_plan = _PaddedGatherRuns((run,), alignment_bytes=plan.alignment_bytes,
+                                         sector_bytes=plan.sector_bytes)
+            sectors += run_plan.dram_sector_and_service()[0]
+            pattern = MemoryAccessPattern(tensor_id, 0, die, owner, "read", "mte2_aiv",
+                                          run.rows * row_bytes, run_plan, reuse_key=key)
+            ledger = bind_memory_access(
+                pattern, view, hbm_bus=bus, copy_hit_bytes_per_ms=1, copy_miss_bytes_per_ms=1,
+                l2_bytes_per_ms=1, pipe_row_id="mte2_aiv", l2_row_id="l2", commit=False,
+            ).ledger
+            aligned += ledger.aligned_transfer_bytes
+            hits += ledger.l2_hit_bytes
+            dram += ledger.dram_sector_bytes
+        if view is not None:
+            full_pattern = MemoryAccessPattern(tensor_id, 0, die, owner, "read", "mte2_aiv",
+                                               count * row_bytes, plan, reuse_key=key)
+            view.admit_access(full_pattern, plan.aligned_copy_bytes())
     return GatherAccounting(row_bytes, rows, rows * row_bytes, sectors, aligned, hits, dram)
 
 

@@ -210,7 +210,7 @@ def _indexer_pair(flops=100.0, vector=10.0, metadata=()):
 
 
 def test_online_indexer_topk_conserves_work_and_removes_roundtrip():
-    from mindie_sim.prediction.passes_indexer import online_indexer_topk
+    from mindie_sim.prediction.rewrite_indexer_rules import online_indexer_topk
 
     score, topk = _indexer_pair()
     fused = online_indexer_topk([score, topk], "bf16")
@@ -239,7 +239,7 @@ def test_online_indexer_topk_conserves_work_and_removes_roundtrip():
     {"index_head_reduction": "partial"},
 ])
 def test_online_indexer_topk_preserves_incomplete_reductions(override):
-    from mindie_sim.prediction.passes_indexer import online_indexer_topk
+    from mindie_sim.prediction.rewrite_indexer_rules import online_indexer_topk
 
     score, topk = _indexer_pair()
     metadata = tuple((key, override.get(key, value))
@@ -250,7 +250,7 @@ def test_online_indexer_topk_preserves_incomplete_reductions(override):
 
 
 def test_online_indexer_topk_requires_single_consumer_and_segment():
-    from mindie_sim.prediction.passes_indexer import online_indexer_topk
+    from mindie_sim.prediction.rewrite_indexer_rules import online_indexer_topk
 
     score, topk = _indexer_pair()
     extra = replace(topk, op_id="l0.other", recipe="other")

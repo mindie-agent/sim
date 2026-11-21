@@ -15,6 +15,8 @@
   the way the host loop does, and are not emitted as tasks.  Costs use the
   host 16/64 alignment, not elapsed time.
 
+[Timeouts & Locks]
+  Bounded search over declared core counts and tile shapes; no I/O or locks.
 [Side-Effect Policy]
   Pure arithmetic.  No device runtime, file, or measurement.
 """

@@ -56,10 +56,10 @@ from mindie_sim.prediction.gdn_chunk32 import OUTPUT, PREPARE, STATE
 from mindie_sim.prediction.matrix_steady import SteadyMatmul
 from mindie_sim.prediction.mechanism import PlannedRecipe
 from mindie_sim.prediction.operators import (
-    block_sparse_attention_arch35 as bsa,
-    hc_gated_residual_arch35 as hc,
-    mla_prolog_v4_arch35 as prolog4,
-    sparse_index_scorers_arch35 as scorer,
+    attention as bsa,
+    hyper_connections as hc,
+    mla_prolog as prolog4,
+    sparse_indexer as scorer,
 )
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import OpSpec
@@ -75,10 +75,10 @@ STATIC_TRACKED_FILES = (
     "mindie_sim/prediction/attention_decode.py",
     "mindie_sim/prediction/expected_grouped.py",
     "mindie_sim/prediction/gdn_chunk32.py",
-    "mindie_sim/prediction/operators/block_sparse_attention_arch35.py",
-    "mindie_sim/prediction/operators/hc_gated_residual_arch35.py",
-    "mindie_sim/prediction/operators/mla_prolog_v4_arch35.py",
-    "mindie_sim/prediction/operators/sparse_index_scorers_arch35.py",
+    "mindie_sim/prediction/operators/attention/__init__.py",
+    "mindie_sim/prediction/operators/hyper_connections/__init__.py",
+    "mindie_sim/prediction/operators/mla_prolog/__init__.py",
+    "mindie_sim/prediction/operators/sparse_indexer/__init__.py",
 )
 EXECUTION_PACKAGE_REL = Path("mindie_sim") / "prediction" / "execution"
 DEFAULT_SPLIT_MANIFEST_NAMES = ("acquisition_split_manifest.json", "split_manifest.json")
@@ -283,6 +283,35 @@ def _eval_planned(cs, op: OpSpec, builder_fn) -> float:
     return float(rep["duration_ms"]) * 1000.0
 
 
+_HC_VARIANT_RECIPES = {
+    "hc_pre_v3": "npu_hc_pre_v3_arch35",
+    "hc_pre_v2": "npu_hc_pre_v2_arch35",
+    "hc_post": "npu_hc_post_arch35",
+    "mhc_post_collapse": "mhc_post_collapse_norm_arch35",
+    "text_gated_residual": "text_gated_residual_arch35",
+}
+
+
+def _make_hc_op(
+    *, variant: str, op_id: str, rows: int, hidden_size: int,
+    hc_mult: int = 4, hc_lowrank: int = 16,
+) -> OpSpec:
+    kind = str(variant).strip().lower()
+    recipe = _HC_VARIANT_RECIPES[kind]
+    shape = (max(1, int(rows)), max(1, int(hc_mult)), max(1, int(hidden_size)))
+    meta = (
+        ("hc_geometry", {
+            "variant": kind, "rows": shape[0], "hidden_size": shape[2],
+            "hc_mult": shape[1], "hc_lowrank": max(1, int(hc_lowrank)),
+        }),
+    )
+    return OpSpec(
+        op_id=op_id, deps=(), family="mhc", recipe=recipe, phase="decode", stage=0, layer=0,
+        requests=(), semantic_shape=shape, local_shape=shape, padded_shape=shape, launch_shape=shape,
+        dtype="bf16", source_boundary="kernel", metadata=meta,
+    )
+
+
 def _eval_fia(cs, B: int, S: int, Hq: int, Hkv: int, D: int, seq_kv: int) -> float:
     gqa_meta = {
         "requests": tuple((S, max(0, seq_kv - S)) for _ in range(B)),
@@ -373,7 +402,7 @@ def evaluate_level1(captures_dir: Path, resolver: _LineageSplitResolver) -> dict
             elif dom in ("probe2_mhc_arch35", "probe2_mhc", "probe2_qwen4exp_hc") and "sinkhorn_T960" not in name:
                 M, S_hc, C, lr = (sh[0], sh[1], sh[2], 16) if isinstance(sh, list) else (sh["M"], sh.get("hc_mult", sh.get("channels", 4)), sh.get("C", sh.get("H", 2560)), sh.get("low_rank", 16))
                 var = "text_gated_residual" if "text_gated" in name else ("hc_post" if "post" in name else "hc_pre_v3")
-                add(sp, "mhc_and_gated_residual", sku, name, meas, _eval_planned(cs_bf, hc.make_hc_op(variant=var, op_id=name, rows=M, hidden_size=C, hc_mult=S_hc, hc_lowrank=lr), hc.build_hc), uri, acq_root)
+                add(sp, "mhc_and_gated_residual", sku, name, meas, _eval_planned(cs_bf, _make_hc_op(variant=var, op_id=name, rows=M, hidden_size=C, hc_mult=S_hc, hc_lowrank=lr), hc.build), uri, acq_root)
             elif dom == "probe3_mla_prolog":
                 M, D_hid, ql, H = sh
                 add(sp, "mla_prolog_v3_v4", sku, name, meas, _eval_planned(cs_bf, prolog4.make_op(op_id=name, tokens=M, hidden_size=D_hid, num_heads=H, q_lora_rank=ql, weight_quant_mode=0, kv_cache_quant_mode=0), prolog4.build), uri, acq_root)
@@ -419,11 +448,11 @@ def evaluate_level1(captures_dir: Path, resolver: _LineageSplitResolver) -> dict
         elif dom == "shard3_gdn_chunk32":
             add(sp, "gdn_chunk32", "Ascend950DT_9582", name, meas, _eval_gdn_chunk32(cs_dt, sh["T"], sh["Hk"], sh["Hv"], sh["D"], sh["D"]), uri, acq_root)
         elif dom == "shard3_mhc":
-            add(sp, "mhc_and_gated_residual", "Ascend950DT_9582", name, meas, _eval_planned(cs_dt, hc.make_hc_op(variant="hc_post" if "post" in name else "hc_pre_v3", op_id=name, rows=sh["M"], hidden_size=sh["C"], hc_mult=sh["hc_mult"]), hc.build_hc), uri, acq_root)
+            add(sp, "mhc_and_gated_residual", "Ascend950DT_9582", name, meas, _eval_planned(cs_dt, _make_hc_op(variant="hc_post" if "post" in name else "hc_pre_v3", op_id=name, rows=sh["M"], hidden_size=sh["C"], hc_mult=sh["hc_mult"]), hc.build), uri, acq_root)
         elif dom in ("shard3_mla_prolog_v3", "shard3_mla_prolog_v4"):
             add(sp, "mla_prolog_v3_v4", "Ascend950DT_9582", name, meas, _eval_planned(cs_dt, prolog4.make_op(op_id=name, tokens=sh["M"], hidden_size=sh["D_hid"], num_heads=sh["H"], q_lora_rank=sh["q_lora"], weight_quant_mode=3 if "v4" in dom else 0, kv_cache_quant_mode=1 if "v4" in dom else 0), prolog4.build), uri, acq_root)
         elif dom == "shard3_text_gated_residual":
-            add(sp, "mhc_and_gated_residual", "Ascend950DT_9582", name, meas, _eval_planned(cs_dt, hc.make_hc_op(variant="text_gated_residual", op_id=name, rows=sh["M"], hidden_size=sh["H"], hc_mult=sh["channels"], hc_lowrank=sh["low_rank"]), hc.build_hc), uri, acq_root)
+            add(sp, "mhc_and_gated_residual", "Ascend950DT_9582", name, meas, _eval_planned(cs_dt, _make_hc_op(variant="text_gated_residual", op_id=name, rows=sh["M"], hidden_size=sh["H"], hc_mult=sh["channels"], hc_lowrank=sh["low_rank"]), hc.build), uri, acq_root)
 
     # Kimi hotspot records strictly follow frozen acquisition manifest lineage (never index order!).
     for r in d4.get("records", ()):

@@ -14,6 +14,9 @@ from .operators import kda_recurrent
 IMPLEMENTATION = kda_recurrent.IMPLEMENTATION
 SOURCE = kda_recurrent.SOURCE
 CAPABILITIES = frozenset({"decode", "in_kernel_gates", "decode_recurrent_source"})
+_SOURCE_KEY_WIDTH = 128
+_SOURCE_VALUE_WIDTHS = (128, 256)
+_SOURCE_MAX_VALUE_HEADS = 256
 
 
 def recipes():
@@ -21,8 +24,9 @@ def recipes():
 
 
 def validate(*, key_heads, value_heads, key_width, value_width, model):
-    if (key_width != 128 or value_width not in (128, 256)
-            or not 1 <= key_heads <= value_heads <= 256 or value_heads % key_heads
+    if (key_width != _SOURCE_KEY_WIDTH or value_width not in _SOURCE_VALUE_WIDTHS
+            or not 1 <= key_heads <= value_heads <= _SOURCE_MAX_VALUE_HEADS
+            or value_heads % key_heads
             or model.activation_dtype != "bf16"):
         raise ModelingError("recurrent_kda_source_head_geometry_or_precision_unsupported")
 

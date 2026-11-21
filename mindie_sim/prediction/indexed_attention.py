@@ -355,13 +355,13 @@ def bind_sustained_dram(context):
     HBM bus, so the bus keeps its physical identity and only its declared
     service rate changes.
     """
-    mode = context.service_modes.get("mte2_aiv_dram")
-    if mode is None:
+    dram_rate = context.service_rate("mte2_aiv_dram")
+    if dram_rate is None:
         return context
     name = context.resource_names.get("hbm")
     if name is None:
         return context
-    ceiling = min(float(mode[1]), float(context.rates[name]) * MS_PER_SECOND)
+    ceiling = min(dram_rate, float(context.rates[name]) * MS_PER_SECOND)
     return replace(context, service_modes={
         **context.service_modes, "hbm": ("hbm", ceiling)})
 

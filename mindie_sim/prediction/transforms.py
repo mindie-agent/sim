@@ -25,13 +25,13 @@ from .implementations import (
     merge_typed_roles, producer_input_values, produced_values,
     typed_outputs,
 )
-from .passes_ffn_fusion import (
+from .rewrite_ffn_rules import (
     activation_quant_fusion,
     gmm_swiglu_quant_fusion,
     moe_tail_residual_fusion,
 )
-from .passes_indexer import online_indexer_topk
-from .passes_mhc_recurrent import (
+from .rewrite_indexer_rules import online_indexer_topk
+from .rewrite_mhc_rules import (
     MHC_DEFAULT_CUTOFF_ROWS,
     gdn_projection_overlap,
     kda_in_kernel_l2norm,

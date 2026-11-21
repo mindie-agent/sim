@@ -285,13 +285,28 @@ class RecipeBook:
                 else:
                     _mxfp4_config(op)
         else:
-            governed = self._family_registry.match(op)
-            if governed is not None:
+            legacy_recover_commit = (
+                recipe_name == "recover_ssm_commit"
+                and family_name == "elementwise"
+                and not any(
+                    k in meta for k in ("lengths", "sequence_lengths", "sequence_tokens")
+                )
+            )
+            governed = (
+                None if (recipe_name in self.recipes or legacy_recover_commit)
+                else self._family_registry.match(op)
+            )
+            if governed is not None and (
+                recipe_name
+                or family_name == "rotary"
+                or family_name not in self.families
+            ):
                 recipe = self._governed_recipe(governed)
             else:
                 fam_spec = self._family_registry.spec_for_family(family_name)
                 if (
                     recipe_name and fam_spec is not None
+                    and fam_spec.name == "rotary"
                     and recipe_name not in self.recipes
                     and recipe_name not in fam_spec.delegated_legacy_recipe_ids
                 ):

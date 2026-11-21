@@ -260,7 +260,6 @@ def _mx_group32(op) -> bool:
 
 def build_swiglu_mx_quant(op, geometry):
     """A5 group-32 row program; otherwise the registered Class D quantize plan."""
-    from dataclasses import replace as _replace
     from .mechanism import OperatorPlan, Work
     from .physical_recipe_base import build_plan, work_from_op
     from .program import KernelProgram, PipelineProgram, Stage
@@ -277,11 +276,9 @@ def build_swiglu_mx_quant(op, geometry):
 
     def program(context):
         multi_wave = rows >= SWIGLU_MX_AIV_UNITS
-        if multi_wave:
-            mode = context.service_modes.get("mte2_aiv_dram")
-            if mode is not None:
-                context = _replace(context, service_modes={
-                    **context.service_modes, "mte2": mode})
+        read_role = "mte2"
+        if multi_wave and context.service_rate("mte2_aiv_dram") is not None:
+            read_role = "mte2_aiv_dram"
         placement = context.owned(0, 1, ("mte2_aiv", "vector", "mte3"))
 
         def tile(index):
@@ -296,7 +293,7 @@ def build_swiglu_mx_quant(op, geometry):
                 # next load may address it; the two declared slots bound the
                 # producer but never invert the finite row order.
                 Stage("load_gate_up", context.bind(Work(
-                    resources={"hbm": load, "mte2": load})),
+                    resources={"hbm": load, read_role: load})),
                     placement=placement, previous=("store_payload_scale",)),
                 Stage("swiglu_amax_ue8m0", context.bind(Work(
                     resources={"vector": compute})),

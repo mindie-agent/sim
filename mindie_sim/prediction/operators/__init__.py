@@ -28,9 +28,29 @@ from .registry import (
 
 def load_builtin_families() -> tuple[OperatorFamilySpec, ...]:
     """Return every migrated governed operator family specification."""
-    from . import rotary
+    from . import (
+        attention,
+        grouped_moe,
+        hyper_connections,
+        linear_attention,
+        mc2,
+        mla_prolog,
+        paged_mla,
+        rotary,
+        sparse_indexer,
+    )
 
-    return (rotary.register_family(),)
+    return (
+        rotary.register_family(),
+        mla_prolog.register_family(),
+        paged_mla.register_family(),
+        attention.register_family(),
+        sparse_indexer.register_family(),
+        grouped_moe.register_family(),
+        linear_attention.register_family(),
+        hyper_connections.register_family(),
+        mc2.register_family(),
+    )
 
 
 __all__ = [

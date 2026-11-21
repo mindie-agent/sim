@@ -8,6 +8,8 @@
   hardcoded false: the optional typed plan field is the only source.  A view's
   exact context/acceptance is available for explicit state contracts, never
   inferred as a balanced sequence or a default all-row commit.
+[Timeouts & Locks] Constant-time metadata resolution; no I/O or locks.
+[Side-Effect Policy] Pure immutable selection metadata.
 """
 from __future__ import annotations
 

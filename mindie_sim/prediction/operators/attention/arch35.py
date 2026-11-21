@@ -193,6 +193,11 @@ class _C8Admission:
         self.resident = self.view.resident_intervals_for(pattern, aligned_bytes)
         return self.resident
 
+    def resident_coverage_for(self, pattern, aligned_bytes):
+        from ...runtime.memory_physics import SectorCoverage
+
+        return SectorCoverage(self.resident_intervals_for(pattern, aligned_bytes))
+
     def admit_access(self, pattern, aligned_bytes):
         resident, self.resident = self.resident, ()
         hit = self.view.hit_bytes(pattern, resident)
@@ -227,10 +232,15 @@ class _C8MemoryView:
     def hit_bytes(pattern, resident):
         hit = 0
         if resident:
+            from ...runtime.memory_physics import SectorCoverage
+
+            res_cov = SectorCoverage(resident)
             for run in pattern.runs.runs:
-                sectors = AddressRunPlan((run,), sector_bytes=pattern.runs.sector_bytes).sector_intervals()
+                req_cov = AddressRunPlan(
+                    (run,), sector_bytes=pattern.runs.sector_bytes
+                ).sector_coverage()
                 copied = run.rows * ceil(run.row_bytes / SECTOR_BYTES) * SECTOR_BYTES
-                hit += AdmissionMemoryView._range_hit_miss(sectors, resident, copied)[0]
+                hit += AdmissionMemoryView._coverage_hit_miss(req_cov, res_cov, copied)[0]
         return hit
 
     def touch(self, key, intervals, *, fill=False):

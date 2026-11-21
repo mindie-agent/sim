@@ -206,7 +206,7 @@ def vector_elements(rows, width):
 def build(op, geometry):
     config = dict(op.metadata)["grouped_dequant"]
     if config.get("dequant_program") == "arch35_full_load":
-        from .grouped_dequant_arch35 import build as source_build
+        from .grouped_dequant import build as source_build
         return source_build(op, geometry)
     groups, width = tuple(config["expert_rows"]), config["width"]
     if sum(groups) != op.local_shape[0] or width != op.local_shape[1]:

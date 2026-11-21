@@ -25,7 +25,7 @@ from mindie_sim.catalog.quant import quant_preset
 from mindie_sim.prediction.cost import CostModel
 from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.family_moe_init import apply, capabilities
-from mindie_sim.prediction.moe_cann_fusion import absorb_init_routing
+from mindie_sim.prediction.moe_gating_fusion import absorb_init_routing
 from mindie_sim.prediction.moe_init_instructions import source_operations
 from mindie_sim.prediction.moe_init_mxfp8 import RECIPE, row_runs
 from mindie_sim.prediction.program import RecipeBook

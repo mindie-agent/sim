@@ -25,10 +25,14 @@ DEFAULT_SPLIT_K = 1
 MAX_SPLIT_K = 32
 
 
+def directional_mte1_available(context):
+    """Check whether both operand transfer modes have a declared service."""
+    return all(context.service_rate(role) is not None for role in ("mte1_l0a", "mte1_l0b"))
+
+
 def operand_transfer(context, left, right, *, directional=False):
     """A/B instructions share one MTE1 pipe; a source may select its modes."""
-    if directional and all(role in context.service_modes
-                           for role in ("mte1_l0a", "mte1_l0b")):
+    if directional and directional_mte1_available(context):
         from .mechanism import Work
         return context.bind(Work(resources={"mte1_l0a": left, "mte1_l0b": right}))
     name = context.resource_names.get("mte1")
@@ -61,7 +65,7 @@ def _owner_template(pipe, owner, panels, k_tail):
     template = pipe.template(owner=owner, panels_per_output=panels,
                              k_tail=k_tail)
     waves = pipe.count // panels if panels else 0
-    motif = tuple(template.phases[:3]) if len(template.phases) >= 3 else tuple(template.phases)
+    motif = tuple(template.phases[:3])
     registry = getattr(pipe, "producer_bindings", None)
     bindings = (registry.rows(owner) if registry is not None
                 else _producer_bindings(template))
@@ -121,12 +125,7 @@ def _ceil_div(value: int, divisor: int) -> int:
 def _tile_lengths(total: int, tile: int) -> tuple[int, ...]:
     """Quotient/remainder gives each axis at most one full and one tail length."""
     quotient, remainder = divmod(total, tile)
-    lengths = []
-    if quotient:
-        lengths.append(tile)
-    if remainder:
-        lengths.append(remainder)
-    return tuple(lengths)
+    return ((tile,) if quotient else ()) + ((remainder,) if remainder else ())
 
 
 def _k_panel_classes(k: int, tile_k: int):
@@ -180,10 +179,8 @@ class _TiledGeometry:
     """
 
     def __init__(self, recipe, context):
-        if min(recipe.tile_m, recipe.tile_n, recipe.tile_k,
-               recipe.slots) < 1:
-            raise ValueError(
-                "matrix_tile_dimensions_and_slots_must_be_positive")
+        if min(recipe.tile_m, recipe.tile_n, recipe.tile_k, recipe.slots) < 1:
+            raise ValueError("matrix_tile_dimensions_and_slots_must_be_positive")
         self.recipe = recipe
         self.context = context
         op = context.op
@@ -247,9 +244,6 @@ class _TiledGeometry:
             return 0
         waves = 1 + (self.tiles - 1 - owner) // self.cores
         return waves * self.nk
-
-    def pipeline_count(self, owner: int) -> int:
-        return self.indexed_panels(owner)
 
     def coordinates(self, owner: int, index: int):
         """The contract's absolute-index mapping for one logical panel."""
@@ -354,7 +348,6 @@ class _TiledGeometry:
                 ("mte3", writes, store)):
             if role in names:
                 target[names[role]] = volume
-        fk = fraction * k_fraction
         # Exact panel share: multiplying by an integer numerator before the
         # single division keeps tile work additive over the whole matrix, so
         # the served FLOP total conserves the operator total bit-for-bit.
@@ -508,11 +501,9 @@ class TiledMatmul:
         panels = max(1, math.ceil(k / self.tile_k)) if k else 1
         tail = bool(k and k % self.tile_k)
         setup = tuple(stage for stage in program.stages if stage.name == "setup")
-        result = []
-        for owner, pipe in enumerate(cores.programs):
-            template = _owner_template(pipe, owner, panels, tail)
-            result.append(replace(template, setup=setup))
-        return tuple(result)
+        return tuple(
+            replace(_owner_template(pipe, owner, panels, tail), setup=setup)
+            for owner, pipe in enumerate(cores.programs))
 
     def lower(self, context):
         geometry = _TiledGeometry(self, context)
@@ -528,27 +519,23 @@ class TiledMatmul:
                 ), minimum_ms=context.minimum_ms)
         registry = _TiledBindings()
 
-        def panel(core, index, registry=None):
+        def panel(core, index):
             (a, b, kd, first, last, wave, _panel, _group,
              _row, _column) = geometry.coordinates(core, index)
             stages, operand, accumulator = geometry.panel_stages(
                 core, a, b, kd, first=first, last=last,
                 operand_symbol=f"panel{index}",
                 accumulator_symbol=f"accumulator{wave}")
-            if registry is not None:
-                if operand:
-                    registry.record(operand[0], "panel", index)
-                if accumulator:
-                    registry.record(accumulator[0], "output", wave)
+            if operand:
+                registry.record(operand[0], "panel", index)
+            if accumulator:
+                registry.record(accumulator[0], "output", wave)
             return stages
-
-        def bind_panel(core, index):
-            return panel(core, index, registry)
 
         pipelines = tuple(
             PipelineProgram(
-                geometry.pipeline_count(core), self.slots,
-                lambda index, core=core: bind_panel(core, index),
+                geometry.indexed_panels(core), self.slots,
+                lambda index, core=core: panel(core, index),
                 # The detailed reference path keeps its unrolled per-tile
                 # program on ``start()`` (``template_start=False``) while still
                 # declaring panel-class homogeneity for explicit ``template()``
@@ -653,7 +640,7 @@ class HierarchicalMatmul:
                 result[names["hbm"]] = hbm
             return result
 
-        def panel(core, index, registry=None):
+        def panel(core, index):
             wave, kk = divmod(index, nk)
             if tile_sources is None:
                 tile = wave * cores + core

@@ -12,6 +12,7 @@ recursive-include tests *.py
 recursive-include tests/fixtures *
 recursive-include data/measurements *.json *.stdout *.stderr
 recursive-include data/observations *
+recursive-include data/primitives *.json
 recursive-include data/verification *.json
 recursive-include tools *.py *.ptx *.cpp *.sh
 recursive-include benchmarks *.py *.json

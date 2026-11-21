@@ -10,12 +10,12 @@ from mindie_sim.model_catalog import derive_expert_pruned, load_model
 from mindie_sim.prediction.attention_decode import StagedGQADecode
 from mindie_sim.prediction.body_defaults import effective_body_declaration
 from mindie_sim.prediction.fai_decode_mapping import host_partitions, partitions
-from mindie_sim.prediction.grouped_dequant_arch35 import Config, assignments, build as build_dsq
+from mindie_sim.prediction.grouped_dequant import Config, assignments, build as build_dsq
 from mindie_sim.prediction.index_pool_native import IMPLEMENTATION as KEYPOOL_IMPL
 from mindie_sim.prediction.mechanism import Geometry
 from mindie_sim.prediction.moe_init_mxfp8 import RECIPE as MXFP8_INIT_RECIPE, build as build_mxfp8_init
 from mindie_sim.prediction.paged_mla import build as build_paged_mla
-from mindie_sim.prediction.paged_mla_arch22 import build as build_paged_mla_arch22
+from mindie_sim.prediction.paged_mla_membase import build as build_paged_mla_arch22
 from mindie_sim.prediction.program import PipelineProgram
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.case import Case
@@ -199,8 +199,8 @@ def test_attention_decode_compaction_conserves_causal_tail_and_ragged_multi_requ
 
 def test_paged_mla_arch22_multi_job_owner_and_refill_steady_subblock_isolation():
     from _support.operator_cases import paged_mla_membase_run as a2_run
-    from mindie_sim.prediction.paged_mla_arch22_dispatch import source_dispatch
-    import mindie_sim.prediction.paged_mla_arch22 as pma22
+    from mindie_sim.prediction.paged_mla_membase_dispatch import source_dispatch
+    import mindie_sim.prediction.paged_mla_membase as pma22
     from mindie_sim.prediction.refill_steady import _extract_stage
     from mindie_sim.prediction.program import Stage
 

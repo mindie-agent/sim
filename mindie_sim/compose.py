@@ -71,8 +71,8 @@ from mindie_sim.compose_runtime import (
     va_recommended_config,
 )
 from mindie_sim.prediction.structure import parse_case
+from mindie_sim.runtime_profiles import VA_RECOMMENDED_PROFILES
 from mindie_sim.schema.common import ModelingError
-from mindie_sim.va_profiles import VA_RECOMMENDED_PROFILES
 
 NOMINAL_HOST_MEM_BPS = 64_000_000_000.0
 NOMINAL_HOST_VEC_OPS = 50_000_000_000.0

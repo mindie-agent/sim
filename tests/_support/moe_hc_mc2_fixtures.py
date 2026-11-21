@@ -18,10 +18,10 @@ from types import SimpleNamespace
 from mindie_sim import target_graphs, target_operators
 from mindie_sim.catalog.quant import quant_preset
 from mindie_sim.catalog.types import QuantSpec
-from mindie_sim.prediction.family_hc_arch35 import POST_PROFILE, PRE_PROFILE
+from mindie_sim.prediction.native_fusion_hc_regbase import POST_PROFILE, PRE_PROFILE
 from mindie_sim.prediction.mechanism import Geometry
 from mindie_sim.prediction.moe_init_mxfp8 import RECIPE
-from mindie_sim.prediction.passes_ffn_fusion import router_gemm
+from mindie_sim.prediction.rewrite_ffn_rules import router_gemm
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, PipelineProgram, RecipeContext
 from mindie_sim.prediction.structure import parse_case
 

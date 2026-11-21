@@ -23,7 +23,7 @@ from .implementations import select
 from .implementation_selection import is_automatic_lowering
 from .lowering import Builder
 from .compression import compressor
-from .mla_cann_epilogs import (
+from .mla_epilogs import (
     SharedSelectionRef, block_quant_epilog, kv_cache_epilog, native_cache_store,
     native_fusion_active, lower_index_path,
 )

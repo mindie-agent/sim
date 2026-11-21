@@ -514,7 +514,11 @@ def test_installed_pep517_wheel_ships_runtime_resources_and_runs_native():
         assert wheel.name == f"mindie_sim-{ver}-py3-none-any.whl"
         entries = verify_wheel_record(wheel)
         package = {k: v for k, v in entries.items() if k.startswith("mindie_sim/")}
-        dist_files = set(entries) - set(package)
+        data_prefix = f"mindie_sim-{ver}.data/data/data/primitives/"
+        data_files = {k for k in entries if k.startswith(data_prefix)}
+        assert data_prefix + "manifest.json" in data_files
+        assert any(k.endswith(".capture.json") for k in data_files)
+        dist_files = set(entries) - set(package) - data_files
         expected_dist = {dist_dir + k for k in ("METADATA", "WHEEL", "top_level.txt", "RECORD")}
         assert expected_dist <= dist_files <= (expected_dist | {dist_dir + "entry_points.txt"})
         meta = entries[dist_dir + "WHEEL"].decode()

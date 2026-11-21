@@ -28,7 +28,7 @@ from mindie_sim.prediction.frontend import Frontend
 from mindie_sim.prediction.gdn_decode_programs import CONV, GATING, gating_plan
 from mindie_sim.prediction.gdn_recurrent import build as build_gdn, head_ownership, head_runs
 from mindie_sim.prediction.mechanism import Geometry
-from mindie_sim.prediction.operators import gdn_output, kda_recurrent, kda_recurrent_arch22
+from mindie_sim.prediction.operators import gdn_output, kda_recurrent, kda_recurrent_membase
 from mindie_sim.prediction.operators.linear_attention import (
     RECOVER_SSM_FAMILIES, build as build_governed, build_recover_ssm_commit, build_recover_ssm_verify,
     rank_one_transition, resolve_operator_plan,
@@ -165,7 +165,7 @@ def test_gdn_recurrent_payload_uses_real_values_and_padded_compute(lengths, dk, 
         "hbm": incoming + outgoing + tokens * (4 + 2 * len(tiles))}
     assert all(row["start_ms"] >= 3 for row in engine.trace if row["demand"])
 
-@pytest.mark.parametrize("module", (None, kda_recurrent, kda_recurrent_arch22), ids=("gdn", "kda", "staged-kda"))
+@pytest.mark.parametrize("module", (None, kda_recurrent, kda_recurrent_membase), ids=("gdn", "kda", "staged-kda"))
 @pytest.mark.parametrize("lengths,units,contender", (((4, 4), 1, None), ((4, 4, 1, 4), 4, {"mte3": 10000})))
 def test_recurrent_compaction_conserves_owner_work(module, lengths, units, contender):
     args = dict(module=module, units=units, contender=contender)
@@ -189,7 +189,7 @@ def test_recurrent_compaction_conserves_owner_work(module, lengths, units, conte
 def test_kda_state_payload_and_owner_sequence_beta_reuse(lengths, heads, units, dv, state):
     args = dict(heads=heads, units=units, dv=dv, state_dtype=state)
     old, _, _ = _scan(lengths, module=kda_recurrent, **args)
-    new, engine, _ = _scan(lengths, module=kda_recurrent_arch22, **args)
+    new, engine, _ = _scan(lengths, module=kda_recurrent_membase, **args)
     tokens = sum(lengths) * heads
     state_bytes = 128 * dv * (4 if state == "fp32" else 2)
     incoming = tokens * ((2 * 128 + dv + 128 + heads) * 2) + len(lengths) * heads * (state_bytes + 4 + 128 * 4)

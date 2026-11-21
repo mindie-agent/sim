@@ -17,6 +17,8 @@
 [Timeouts & Locks]
   Only the descriptor window is submitted ahead.  Finished steps drop their
   tile handles.  O(window) live stages per core.
+[Side-Effect Policy]
+  Pure finite program construction; no device runtime, I/O, or locks.
 """
 from __future__ import annotations
 

@@ -14,11 +14,7 @@ from math import ceil
 
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 
-
 _GDN_CALLER = "vllm_ascend_gdn_decode"
-
-
-ONE = 1
 # Dense paged-MLA source domains. A5 keeps source split-core v2 for every
 # integral local head count; A2/A3 use the page-tile kernel.
 MAX_PAGED_MLA_HEADS = 64
@@ -49,6 +45,22 @@ GQA_QUERY_TILE_CANDIDATES = (64, 32, 16, 8, 4, 2, 1)
 GQA_KEY_TILE_CANDIDATES = (128, 64, 32, 16, 8, 4, 2, 1)
 GQA_SCORE_ACCUM_BYTES = 4
 GQA_ONLINE_STATS_BYTES = 8
+
+_GDN_CONV_MIN_UB_BYTES = 188416
+_GDN_CONV_WIDTHS = (2, 3, 4)
+_GDN_MULTI_TOKEN_CONV_WIDTH = _GDN_CONV_WIDTHS[-1]
+_GDN_RESIDENT_MAX_TOKENS = 8
+_GDN_RESIDENT_MAX_HEAD_DIM = 512
+_GDN_RESIDENT_MAX_HEADS = 256
+_GDN_STATE_TILE_ALIGNMENT = 16
+_GDN_STATE_TILE_BYTES = _GDN_STATE_TILE_ALIGNMENT * 4
+_GDN_QUERY_TILE_BYTES = 16384
+_KDA_SOURCE_MAX_HEADS = 256
+_KDA_SOURCE_KEY_DIM = 128
+_KDA_SOURCE_WIDE_VALUE_DIM = 256
+_ATTNRES_UB_RESERVE_BYTES = 32768
+_INDEXED_MAX_HEADS = {"int8": 64, "bf16": 128}
+_INDEXED_MLA_CACHE_GEOMETRIES = ((512, 64), (512, 0))
 
 
 def _gdn_source_options(binding):
@@ -182,7 +194,7 @@ def _strip_automatic_lowerings(case, declared):
     return replace(case, runtime=replace(case.runtime, kernels=kernels))
 
 
-def effective_body_declaration(case, phase, *, tokens=ONE, scope=DEFAULT_SCOPE,
+def effective_body_declaration(case, phase, *, tokens=1, scope=DEFAULT_SCOPE,
                               enabled=True):
     """Resolve one effective declaration before either structure or timing lowers it.
 
@@ -438,13 +450,13 @@ def _gdn_default(case, phase, tokens, kernels):
               "gdn_independent_copy_pipes_not_declared" if any(
                   not pipes <= dict(d.rates).keys() for d in case.machine.dies) else
               "gdn_convolution_buffers_outside_declared_capacity" if any(
-                  dict(d.buffers).get("ub", 0) < 188416 for d in case.machine.dies) else "")
+                  dict(d.buffers).get("ub", 0) < _GDN_CONV_MIN_UB_BYTES for d in case.machine.dies) else "")
     if not reason:
         for plan in layers:
             keys = ceil((plan.linear_key_heads or plan.linear_heads) / parallel.tp)
             heads = ceil((plan.linear_value_heads or plan.linear_heads) / parallel.tp)
-            if (heads % keys or plan.conv_kernel not in {2, 3, 4}
-                    or tokens > 1 and plan.conv_kernel != 4):
+            if (heads % keys or plan.conv_kernel not in _GDN_CONV_WIDTHS
+                    or tokens > 1 and plan.conv_kernel != _GDN_MULTI_TOKEN_CONV_WIDTH):
                 reason = "gdn_head_ratio_or_convolution_outside_source_domain"
                 break
     options = {}
@@ -454,13 +466,14 @@ def _gdn_default(case, phase, tokens, kernels):
         # arch35's resident-state kernel has a stricter UB/query domain than
         # the shared caller. Keep the caller useful outside that kernel domain.
         from .gdn_recurrent import UB_BYTES
-        native = (case.machine.arch_family == "A5" and tokens <= 8
+        native = (case.machine.arch_family == "A5" and tokens <= _GDN_RESIDENT_MAX_TOKENS
                   and all(dict(d.buffers).get("ub", 0) >= UB_BYTES for d in case.machine.dies)
-                  and all(1 <= (p.linear_key_head_dim or p.linear_head_dim) <= 512
-                          and 1 <= p.linear_head_dim <= 512
-                          and 1 <= ceil((p.linear_value_heads or p.linear_heads) / parallel.tp) <= 256
+                  and all(1 <= (p.linear_key_head_dim or p.linear_head_dim) <= _GDN_RESIDENT_MAX_HEAD_DIM
+                          and 1 <= p.linear_head_dim <= _GDN_RESIDENT_MAX_HEAD_DIM
+                          and 1 <= ceil((p.linear_value_heads or p.linear_heads) / parallel.tp) <= _GDN_RESIDENT_MAX_HEADS
                           and tokens * ceil(max(p.linear_key_head_dim or p.linear_head_dim,
-                                                p.linear_head_dim) / 16) * 16 * 4 <= 16384
+                                                p.linear_head_dim) / _GDN_STATE_TILE_ALIGNMENT)
+                          * _GDN_STATE_TILE_BYTES <= _GDN_QUERY_TILE_BYTES
                           for p in layers))
         if native:
             options["recurrent_implementation"] = "arch35_fp32"
@@ -512,7 +525,7 @@ def _kda_default(case, phase, tokens, kernels):
     reason = ("explicit_implementation_preserved" if explicit else
               # The source recurrence is a decode-only, single-context domain.
               "kda_source_requires_decode_only_pcp1" if (
-                  parallel.pcp != ONE or parallel.cp != ONE and recurrent_sharded) else
+                  parallel.pcp != 1 or parallel.cp != 1 and recurrent_sharded) else
               "partitioned_kda_caller_domain" if phase != "decode" and parallel.pcp != 1 else
               "decode_profile_only" if phase != "decode" or not 1 <= tokens <= KDA_SOURCE_MAX_QUERY_TOKENS else
               "kda_requires_bf16_inputs_and_state" if case.model.activation_dtype != "bf16"
@@ -527,8 +540,8 @@ def _kda_default(case, phase, tokens, kernels):
             heads = ceil((plan.linear_value_heads or plan.linear_heads) / parallel.tp)
             dk = plan.linear_key_head_dim or plan.linear_head_dim
             dv = plan.linear_head_dim
-            if (not 1 <= keys <= heads <= 256 or heads % keys != 0
-                    or dk != 128 or dv not in {128, 256}):
+            if (not 1 <= keys <= heads <= _KDA_SOURCE_MAX_HEADS or heads % keys != 0
+                    or dk != _KDA_SOURCE_KEY_DIM or dv not in {_KDA_SOURCE_KEY_DIM, _KDA_SOURCE_WIDE_VALUE_DIM}):
                 reason = "kda_head_geometry_outside_source_domain"
                 break
     if not reason:
@@ -578,7 +591,7 @@ def _attnres_default(case, phase, kernels):
     reason = ("explicit_implementation_preserved" if explicit else
               "attnres_source_image_or_domain_unsupported" if not source_domain else
               "attnres_independent_copy_pipes_not_declared" if any(
-                  not pipes <= dict(d.rates).keys() or dict(d.buffers).get("ub", 0) <= 32768
+                  not pipes <= dict(d.rates).keys() or dict(d.buffers).get("ub", 0) <= _ATTNRES_UB_RESERVE_BYTES
                   for d in case.machine.dies) else "")
     if not reason:
         kernels.setdefault("lowerings", {})["attention_residual"] = "vllm_ascend_attn_res_prefix"
@@ -586,7 +599,7 @@ def _attnres_default(case, phase, kernels):
             "reason": reason or "supported_tensor_and_resource_geometry"}
 
 
-def attention_defaults(case, phase, *, tokens=ONE):
+def attention_defaults(case, phase, *, tokens=1):
     prior_kernels = case.runtime.kernels or {}
     prior_keys = {
         section: set((prior_kernels.get(section) or {}).keys())
@@ -619,10 +632,10 @@ def attention_defaults(case, phase, *, tokens=ONE):
         reason = ("explicit_implementation_preserved" if explicit else
                   "gathered_head_attention_contract" if family == "indexed_mla"
                   and execution(case.model).get("dcp_query_gather") else
-                  "partitioned_attention_domain" if phase != "decode" and parallel.pcp != ONE else
+                  "partitioned_attention_domain" if phase != "decode" and parallel.pcp != 1 else
                   "decode_profile_only" if phase != "decode" else
                   "independent_copy_pipes_not_declared" if not pipes else
-                  "partitioned_attention_domain" if parallel.cp != ONE else "")
+                  "partitioned_attention_domain" if parallel.cp != 1 else "")
         if not reason and family == "gqa_decode":
             if case.model.activation_dtype not in floating:
                 reason = "gqa_activation_precision_outside_fattention_domain"
@@ -641,10 +654,10 @@ def attention_defaults(case, phase, *, tokens=ONE):
                 else:
                     recipes["flash_attention_decode"] = tiles
         elif not reason:
-            max_heads = 64 if case.model.quant.kv_dtype == "int8" else 128
+            max_heads = _INDEXED_MAX_HEADS.get(case.model.quant.kv_dtype, _INDEXED_MAX_HEADS["bf16"])
             if (case.model.activation_dtype != "bf16" or case.model.quant.kv_dtype not in {"bf16", "int8"}
                     or any(p.cache_kind != "dense" or p.window or p.noncausal_attention
-                           or (p.kv_lora_rank, p.qk_rope_head_dim) not in {(512, 64), (512, 0)}
+                           or (p.kv_lora_rank, p.qk_rope_head_dim) not in _INDEXED_MLA_CACHE_GEOMETRIES
                            or not 1 <= p.num_heads // parallel.tp <= max_heads for p in layers)):
                 reason = "indexed_source_geometry_outside_reviewed_domain"
             else:
@@ -671,7 +684,7 @@ def attention_defaults(case, phase, *, tokens=ONE):
         records.append({"family": family, "selection": "preserved" if reason else "default_installed",
                         "reason": reason or "supported_tensor_and_resource_geometry"})
     if dense_mla:
-        from . import paged_mla, paged_mla_arch22
+        from . import paged_mla, paged_mla_membase
         explicit = ("attention" in kernels.get("families", {}) or "mla_attention" in recipes
                     or any(k in lowerings for k in ("paged_mla_attention", "mla_decode")))
         arch_family = case.machine.arch_family
@@ -683,7 +696,7 @@ def attention_defaults(case, phase, *, tokens=ONE):
                        if is_a5 else (lambda h: h > 0 and (1 << (h - 1).bit_length())
                                       in ARCH22_PAGED_MLA_HEAD_CEILINGS))
         page_tile = PAGED_MLA_A5_PAGE_TILE if is_a5 else ARCH22_PAGED_MLA_PAGE_TILE
-        req_buffers = paged_mla.BUFFERS if is_a5 else paged_mla_arch22.BUFFERS
+        req_buffers = paged_mla.BUFFERS if is_a5 else paged_mla_membase.BUFFERS
         paired_pipes = all(
             all(dict(d.buffers).get(pool, 0) >= needed for pool, needed in req_buffers.items())
             and all(d.units(role) == d.compute_units * ratio for role, ratio in (

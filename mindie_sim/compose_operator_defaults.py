@@ -291,7 +291,7 @@ def mqsmla_default(case, kernels):
     layers = v41_cached_layers(case)
     if not layers or not any(p.compressor_kind == "gated_ring" for p in layers):
         return None
-    from mindie_sim.prediction.mla_cann_epilogs import raw_eager_requested
+    from mindie_sim.prediction.mla_epilogs import raw_eager_requested
     if raw_eager_requested(case.runtime):
         return {"family": MQSMLA_FAMILY, "selection": "preserved",
                 "reason": "raw_eager_requested", "degraded": True, "installed": False}
@@ -402,7 +402,7 @@ def lightning_indexer_default(case, kernels):
     layers = [p for p in case.model.layer_plans if p.indexer and p.index_kpool == 1]
     if not layers:
         return None
-    from mindie_sim.prediction.mla_cann_epilogs import raw_eager_requested
+    from mindie_sim.prediction.mla_epilogs import raw_eager_requested
     if raw_eager_requested(case.runtime):
         return {"family": LIGHTNING_INDEXER_FAMILY, "selection": "preserved",
                 "reason": "raw_eager_requested", "degraded": True}

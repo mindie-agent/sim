@@ -263,8 +263,9 @@ def _rate(context, declaration):
     role = declaration["resource"]
     if role == "cube":
         return context.compute_peaks[declaration["dtype"]]
-    if role in context.service_modes:
-        return context.service_modes[role][1]
+    service_rate = context.service_rate(role)
+    if service_rate is not None:
+        return service_rate
     if role in context.resource_names:
         return context.rates[context.resource_names[role]] * 1000
     if role == "link":

@@ -25,11 +25,11 @@ from mindie_sim.prediction.body_defaults import TargetGraphSet
 from mindie_sim.prediction.direct_peer import DirectPeerCollective
 from mindie_sim.prediction.mechanism import Geometry
 from mindie_sim.prediction.moe_callers import LOCAL_EXPERT_REDUCE, local_expert_reduce_recipe
-from mindie_sim.prediction.moe_cann_fusion import (
+from mindie_sim.prediction.moe_gating_fusion import (
     HASH_NATIVE_KIND, INIT_ROUTING_NATIVE_KIND, SOFTMAX_NATIVE_KIND, build_selection, cann_native_active)
 from mindie_sim.prediction.operators import grouped_moe, mc2
 from mindie_sim.prediction.operators.contracts import OperatorPlanningContext
-from mindie_sim.prediction.passes_ffn_fusion import raw_selection
+from mindie_sim.prediction.rewrite_ffn_rules import raw_selection
 from mindie_sim.prediction.program import RecipeBook
 from mindie_sim.prediction.results import OpOccurrence
 from mindie_sim.prediction.routing_realizations import select_realization

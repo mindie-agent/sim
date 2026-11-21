@@ -5,6 +5,7 @@
   per packed 256B group one normalized VLD, 2 SHR + 1 SHL + 2 AND, one
   two-destination VINTLV, two VST.  U8 opcodes have no shared FP16/FP32 lane
   resource and no separate element-shuffle lane ceiling in this contract.
+[Timeouts & Locks] Constant-time inventory construction; no I/O or locks.
 [Side-Effect Policy] Pure immutable inventory; physical Work comes from the
   common InstructionInventory.capacity_work.
 """

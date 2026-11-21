@@ -61,12 +61,6 @@ tier = "tier0"
 [[module]]
 path = "schema/test_l0_primitives.py"
 tier = "tier0"
-reserved = true
-# L0 micro-primitive schema/loader/lowering (s3a-remote-l0)
-
-[[module]]
-path = "schema/test_l0_primitives.py"
-tier = "tier0"
 owns = [
   "mindie_sim/primitives",
   "data/primitives",
@@ -102,7 +96,7 @@ owns = ["mindie_sim/prediction/coupled.py", "mindie_sim/prediction/primitives.py
 [[module]]
 path = "runtime/test_periodic_cycle_detector.py"
 tier = "tier0"
-owns = ["mindie_sim/prediction/engine_periodic.py"]
+owns = ["mindie_sim/prediction/engine_periodic"]
 
 [[module]]
 path = "runtime/test_engine_memory_and_pipeline.py"
@@ -121,7 +115,7 @@ owns = [
 [[module]]
 path = "runtime/test_indexed_pipeline_templates.py"
 tier = "tier0"
-owns = ["mindie_sim/prediction/matrix.py", "mindie_sim/prediction/scheduling.py"]
+owns = ["mindie_sim/prediction/matrix.py", "mindie_sim/prediction/scheduling"]
 # TiledMatmul finite indexed catalog; R7 remainder (kernel groups, transfers, fragment executor)
 # folds into test_engine_memory_and_pipeline / test_invocation_boundary in S2d.
 
@@ -170,12 +164,6 @@ tier = "tier0"
 path = "runtime/test_fragment_executor.py"
 tier = "tier0"
 # common fragment executor, event ports/preflight, state visibility ledger, stage conductors (S2d)
-
-[[module]]
-path = "runtime/test_remote_exec.py"
-tier = "tier0"
-reserved = true
-# remote-first CPU execution dispatcher (s3a-remote-l0)
 
 [[module]]
 path = "runtime/test_remote_exec.py"
@@ -293,7 +281,7 @@ owns = [
   "mindie_sim/prediction/operators/grouped_moe",
   "mindie_sim/prediction/family_moe.py",
   "mindie_sim/prediction/moe_callers.py",
-  "mindie_sim/prediction/moe_cann_fusion.py",
+  "mindie_sim/prediction/moe_gating_fusion.py",
 ]
 
 [[module]]
@@ -355,7 +343,6 @@ path = "operators/test_causal_conv.py"
 tier = "tier0"
 owns = [
   "mindie_sim/prediction/operators/linear_attention",
-  "mindie_sim/prediction/operators/causal_conv_prefill.py",
   "mindie_sim/prediction/operators/native_causal_conv_prefill.py",
   "mindie_sim/prediction/operators/native_causal_conv_spec.py",
   "mindie_sim/prediction/family_causal_conv.py",
@@ -416,12 +403,6 @@ reserved = true
 path = "operators/test_custom_op_libraries.py"
 tier = "tier0"
 reserved = true
-
-[[module]]
-path = "operators/test_catlass_and_dsl_templates.py"
-tier = "tier0"
-reserved = true
-# CATLASS K2 + cannbot-dsl K3 template catalog (s3a-linear-templates)
 
 # ---------------------------------------------------------------- spine (PredictionSpine)
 [[module]]

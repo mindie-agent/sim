@@ -94,7 +94,7 @@ def test_sparse_decode_metadata_is_explicitly_excluded_from_prefill():
 
 def test_prefill_kda_chooses_its_chunk_source_without_decode_source_in_mixed_batch():
     from _support.linear_cases import caller
-    from mindie_sim.prediction.family_kda_recurrent_arch22 import IMPLEMENTATION as DECODE
+    from mindie_sim.prediction.family_kda_recurrent_membase import IMPLEMENTATION as DECODE
     from mindie_sim.prediction.family_kda_state import IMPLEMENTATION as PREFILL
 
     parsed, _ = caller((1,))

@@ -33,6 +33,10 @@ include = ["mindie_sim*"]
   "**/*.json",
 ]
 
+[tool.setuptools.data-files]
+"data/primitives" = ["data/primitives/*.json"]
+"data/primitives/captures" = ["data/primitives/captures/*.capture.json"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = [".", "tests"]

@@ -1,5 +1,12 @@
 """Per-token DynamicQuantV2 ahead of a dynamic int activation.
 
+[Role] Model explicit ``npu_dynamic_quant`` traffic and vector work ahead of
+  dynamic int8 activations (not a GEMM epilogue or FP8/MX quantizer).
+[Invariants] Qualifies strictly on resolved dynamic int8 activation formats;
+  BF16 role overrides and static/FP8/MX methods do not take this producer.
+[Timeouts & Locks] Bounded per-op schedule construction; no I/O or locks.
+[Side-Effect Policy] Pure immutable plan construction; zero device context.
+
 The producer is the explicit ``npu_dynamic_quant`` call in vllm-ascend
 W8A8 dynamic ``apply``: the GEMM consumes that int8 row and its scale.
 It is not a GEMM epilogue and not the FP8/MX quantizer.

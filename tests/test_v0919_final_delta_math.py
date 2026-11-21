@@ -230,7 +230,7 @@ def test_mqsmla_mode_writers_use_the_packed_row_bytes(scale_dtype, row_bytes):
 
 
 def test_mqsmla_epilog_prefers_the_declared_cache_row_width():
-    from mindie_sim.prediction.mla_cann_epilogs import (
+    from mindie_sim.prediction.mla_epilogs import (
         KV_COMPRESS_EPILOG_FAMILY, kv_cache_epilog,
     )
     model = _packed_mode_model("bf16")

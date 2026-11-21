@@ -29,6 +29,9 @@ from .program import KernelProgram, RecipeBook, Stage, TransferRecipe
 
 RECIPE = "declared_native_fusion"
 
+_MXFP4_DECODE_GROUP_ROWS_LIMIT = 34
+_MXFP4_PACKED_GROUP_BYTES = 256
+
 _PRODUCER_FIELDS = {
     "activation_scale_producer": "activation_scales",
     "input_scale_producer": "activation_scales",
@@ -52,7 +55,7 @@ def recipes():
 class NativeFusionRecipe(PlannedRecipe):
     def prepare(self, op, geometry):
         prepared, plan = super().prepare(op, geometry)
-        from .mla_prolog_arch22 import PROFILE, describe, geometry as source_geometry
+        from .native_fusion_mla_membase import PROFILE, describe, geometry as source_geometry
         metadata = dict(prepared.metadata)
         if metadata.get("fusion_source_profile") == PROFILE:
             view = metadata["fusion_tensor_view"]
@@ -115,16 +118,16 @@ def _phase_op(record):
 def build(op, geometry):
     from .mechanism import PlannedRecipe
     from .family_hc import selected_plan
-    from .mla_prolog_arch22 import selected_plan as selected_mla_arch22
+    from .native_fusion_mla_membase import selected_plan as selected_mla_membase
 
-    from .family_hc_arch35 import selected_plan as selected_hc_arch35
-    selected = selected_hc_arch35(op, geometry)
+    from .native_fusion_hc_regbase import selected_plan as selected_hc_regbase
+    selected = selected_hc_regbase(op, geometry)
     if selected is not None:
         return selected
     selected = selected_plan(op, geometry)
     if selected is not None:
         return selected
-    selected = selected_mla_arch22(op, geometry)
+    selected = selected_mla_membase(op, geometry)
     if selected is not None:
         return selected
     metadata = dict(op.metadata)
@@ -255,7 +258,7 @@ def lower_native_fusions(ops, runtime, *, local_tokens=None, public_outputs=()):
         if (declaration["role"] == "grouped_gate_up_situ_quant"
                 and str(view.get("weight_dtype", "")) == "mxfp4"
                 and members and str(members[0].phase) == "decode"
-                and gate_rows and max(gate_rows) < 34):
+                and gate_rows and max(gate_rows) < _MXFP4_DECODE_GROUP_ROWS_LIMIT):
             from . import mxfp4_supply
             from . import family_gate_up_situ_mxfp4
             from .mechanism import PlannedRecipe
@@ -263,7 +266,7 @@ def lower_native_fusions(ops, runtime, *, local_tokens=None, public_outputs=()):
             gate = gate_members[0]
             from .gmmsq_quant_typed import work as gmmsq_work
             groups = (sum(config.group_rows) * 2 * config.output_width
-                      * config.k // 2) // 256
+                      * config.k // 2) // _MXFP4_PACKED_GROUP_BYTES
             typed_work, _, _ = gmmsq_work(groups)
             typed_resources = dict(typed_work.resources)
             gate = replace(
@@ -446,10 +449,10 @@ def lower_native_fusions(ops, runtime, *, local_tokens=None, public_outputs=()):
                 declaration, traffic, declaration.get("tensor_view") or {})
             if hc_call is not None:
                 metadata["native_call"] = hc_call
-        from .mla_prolog_arch22 import PROFILE as MLA_ARCH22_PROFILE
+        from .native_fusion_mla_membase import PROFILE as MLA_ARCH22_PROFILE
         source_work = None
         if profile == MLA_ARCH22_PROFILE:
-            from .mla_prolog_arch22 import boundary_metadata
+            from .native_fusion_mla_membase import boundary_metadata
             source = boundary_metadata(declaration, members, outputs)
             metadata["fusion_semantic_recipes"] = source["program"]["fusion_semantic_recipes"]
             metadata["fusion_source_profile"] = MLA_ARCH22_PROFILE

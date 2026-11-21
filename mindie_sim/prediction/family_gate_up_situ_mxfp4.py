@@ -6,6 +6,8 @@ members keep their existing lowerings; this recipe replaces only the gate
 matrix member's hidden generic tile work and AIC ownership.
 [Invariants] Only integer active bank rows produce tiles.  Zero banks skip.
 No BF16 workspace, no supply-only elapsed, no second kernel IR.
+[Timeouts & Locks] Bounded tile-schedule planning; no I/O or locks.
+[Side-Effect Policy] Pure immutable plan construction.
 """
 from collections import Counter
 from dataclasses import dataclass, replace

@@ -20,11 +20,11 @@ from .deepep import (deepep_exchange_factor, resolve_exchange_options,
                      split_deepep_dispatch_overlap, split_deepep_down_overlap,
                      split_deepep_up_overlap)
 from .moe_callers import RoutingPolicy, local_expert_reduce_recipe, tp_join_reduce
-from .moe_cann_fusion import (
+from .moe_gating_fusion import (
     absorb_init_routing, build_selection, cann_native_active,
     dispatch_quantizes_internally,
 )
-from .passes_ffn_fusion import (
+from .rewrite_ffn_rules import (
     bind_expert_slots, bind_transport_gate, declare_gate_up_fusion_group,
     routed_expert_work, router_gemm,
 )

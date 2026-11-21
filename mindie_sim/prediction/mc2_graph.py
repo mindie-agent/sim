@@ -17,10 +17,10 @@ import math
 from mindie_sim.schema.common import ModelingError
 from .direct_peer import DirectPeerCollective
 from .mechanism import PlannedRecipe, Work
+from . import mc2_megamoe
 from .mc2_phase import RECIPE, build, contract
 from .operators.mc2_fullmesh import SOURCE, dispatch_layout, combine_layout
 from .operators.mc2_mx_quant import mx32_work
-from .operators import megamoe_arch35
 from .moe_comm_selection import FUSED_MC2, MC2, MoeCommConfig
 
 NETWORK = "arch35_fullmesh_peer_channel"
@@ -128,13 +128,13 @@ def select(kernels):
 def recipes(kernels):
     selected = select(kernels)
     if selected is not None and selected["kind"] == "arch22_v2_caller":
-        from .mc2_arch22 import recipes as arch22_recipes
-        return arch22_recipes(selected)
+        from .mc2_local_caller import recipes as local_caller_recipes
+        return local_caller_recipes(selected)
     # The native planner is registered independently of whether this runtime
     # declares the explicit kernel entry.  Ordinary selection may come from the
     # common MoeCommConfig, and the recipe must exist for that graph without
     # mutating the caller's runtime.  Registration is not selection.
-    result = {RECIPE: PlannedRecipe(build), **megamoe_arch35.recipes()}
+    result = {RECIPE: PlannedRecipe(build), **mc2_megamoe.recipes()}
     if selected is not None:
         result[NETWORK] = DirectPeerCollective(
             max_inflight_per_rank=selected.get("max_inflight_per_rank"),
@@ -208,8 +208,8 @@ def lower(ops, *, runtime, prefix, tokens, top_k, width, experts, ep,
     if selected is None:
         return ops
     if selected["kind"] == "arch22_v2_caller":
-        from .mc2_arch22 import lower as lower_arch22
-        return lower_arch22(
+        from .mc2_local_caller import lower as lower_local_caller
+        return lower_local_caller(
             ops, selected=selected, runtime=runtime, prefix=prefix, tokens=tokens,
             top_k=top_k, width=width, experts=experts, ep=ep,
             source_partitions=source_partitions, received_assignments=received_assignments,
@@ -307,7 +307,7 @@ def lower(ops, *, runtime, prefix, tokens, top_k, width, experts, ep,
                 and mxfp_eligible):
             act_meta = dict(e_act.metadata)
             act_kind = str(act_meta.get("activation_kind") or e_act.family or "swiglu").lower()
-            if act_kind in megamoe_arch35.SUPPORTED_ACTIVATIONS:
+            if act_kind in mc2_megamoe.SUPPORTED_ACTIVATIONS:
                 fused_lvl = int(selected.get("fused_mc2_level") or FUSED_MC2_ROUTED_MODE)
                 fused_lvl = FUSED_MC2_SHARED_MODE if fused_lvl >= FUSED_MC2_SHARED_MODE else FUSED_MC2_ROUTED_MODE
                 moe_inter = int(e_down.local_shape[-1])
@@ -353,7 +353,7 @@ def lower(ops, *, runtime, prefix, tokens, top_k, width, experts, ep,
                     for item in ops if item.op_id not in removed_ids
                     for dep in item.deps
                 ):
-                    mega_op = megamoe_arch35.make_op(
+                    mega_op = mc2_megamoe.make_op(
                         op_id=target_id, deps=tuple(mega_deps),
                         stage=unpack.stage, layer=unpack.layer,
                         requests=unpack.requests, phase=unpack.phase,
@@ -373,7 +373,7 @@ def lower(ops, *, runtime, prefix, tokens, top_k, width, experts, ep,
                                 "id": prefix + ".megamoe",
                                 "entry": True,
                                 "exit": True,
-                                "kernel": megamoe_arch35.NATIVE_KIND,
+                                "kernel": mc2_megamoe.NATIVE_KIND,
                             }),
                         ),
                     )
@@ -415,9 +415,9 @@ def lower(ops, *, runtime, prefix, tokens, top_k, width, experts, ep,
             direct = (gate.deps == (dispatch.op_id,) and gate.local_shape[-1] == width
                       and meta.get("activation_format") == payload_dtype)
             if quant == "mx":
-                matched = (meta.get("activation_group_size") == 32
+                matched = (meta.get("activation_group_size") == MX_DISPATCH_GROUP
                            and meta.get("activation_scale_format") == "fp8_e8m0"
-                           and tuple(meta.get("activation_scale_shape", ()))[1:] == (width // 64, 2))
+                           and tuple(meta.get("activation_scale_shape", ()))[1:] == (width // (2 * MX_DISPATCH_GROUP), 2))
                 requirement = "matching_e4m3_e8m0_group32"
             else:
                 matched = (meta.get("activation_group_size") == width
@@ -559,9 +559,9 @@ def lower(ops, *, runtime, prefix, tokens, top_k, width, experts, ep,
         received_output = {
             "output_format": payload_dtype,
             "activation_payload_shape": (rows, width),
-            "activation_group_size": 32 if quant == "mx" else width,
+            "activation_group_size": MX_DISPATCH_GROUP if quant == "mx" else width,
             "activation_scale_format": "fp8_e8m0" if quant == "mx" else "fp32",
-            "activation_scale_shape": (rows, width // 64, 2) if quant == "mx" else (rows,),
+            "activation_scale_shape": (rows, width // (2 * MX_DISPATCH_GROUP), 2) if quant == "mx" else (rows,),
             "activation_scale_bytes": received_assignments * layouts[0].scale_bytes,
             "activation_expected_rows": received_assignments,
         }

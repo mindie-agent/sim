@@ -1,33 +1,13 @@
 """Staged analytic GQA decode on the common finite resource engine.
 
-[Role]
-  Lower the declared ``metadata['gqa_decode']`` geometry into finite
-  ``(batch, kv_head, query_tile, kv_split)`` owners.  Each owner loads a
-  resident query tile, streams bounded key/value tiles through
-  QK -> softmax -> PV -> online accumulation, and stores a partial or final
-  output.  Split partials are merged by a separate, barrier-gated program.
-
-[Invariants]
-  * Real request lengths and the causal triangular tail determine work; no
-    padded cache capacity or query-head multiplier is applied to KV.
-  * One key tile is loaded once per contributing split and query tile.  K/V
-    traffic is never multiplied by the GQA query-head group.
-  * QK and PV together are ``4 * pairs * query_heads * head_dim`` FLOPs.
-  * A split partial is materialized only when at least two split producers
-    contribute to one output.  One contributing split writes the final output
-    directly.  The final output is written exactly once.
-  * On-chip operands, scores, probabilities and accumulators use advertised
-    pools when present and are released by the owning task.  They are never
-    added to HBM traffic.
-  * Owners are physical placements; their task streams cannot borrow idle units.
-
-[Timeouts & Locks]
-  Planning and lowering are pure arithmetic.  Key tiles are generated lazily
-  through a bounded pipeline window; no per-tile list is materialized.
-
-[Side-Effect Policy]
-  No device runtimes, measurements, files or external I/O.  Programs submit
-  only to the caller's virtual ``Engine``.
+[Role] Lower GQA decode to physical owners by request, KV head, query tile
+  and KV split. A resident query streams through QK, softmax, PV and update.
+[Invariants] Real lengths and causal tails determine work. Each contributing
+  split loads K/V once per query tile, shared across its query heads.
+  A barrier gates the merge when multiple splits contribute to an output.
+  Each output is written once. Owners use their assigned pools and service.
+[Timeouts & Locks] Key tiles are generated lazily in a bounded window.
+[Side-Effect Policy] Programs submit only to the caller's virtual engine.
 """
 from __future__ import annotations
 
@@ -96,19 +76,12 @@ SOURCE_REFERENCES = (
 
 @dataclass(frozen=True)
 class StagedGQADecode:
-    """Finite analytic GQA decode recipe.
+    """Bound the K/V tiles, flattened query rows and live pipeline slots.
 
-    ``key_tile`` is the K/V row tile.  ``query_tile`` bounds the flattened
-    ``(token, query_head_in_group)`` rows in one owner task.  ``kv_splits`` is
-    an explicit requested partition count, reduced to real key tiles.
-    ``slots`` is the bounded key/value pipeline window.
-    Optional ``target_cores`` increases partitions to fill the declared owner
-    budget after batch/head/query parallelism. It is an analytic mapping;
-    captured dispatch should continue to declare its explicit split count.
-    ``kv_mapping='fai_flash_decode'`` instead uses the pinned FAI host budget
-    across query boundaries and a global producer/merge barrier. Device stages
-    remain analytical; selecting host ownership does not select a native kernel.
-    ``fai_host`` also selects the regular speculative-query host path when the
+    ``kv_splits`` requests partitions over real key tiles. ``target_cores``
+    can increase partitions after batch/head/query parallelism. FAI mappings
+    use the source host budget across query tiles and gate merges on all
+    producers. ``fai_host`` also handles speculative queries for which the
     source occupancy threshold disables flash splitting.
     """
 
@@ -252,10 +225,9 @@ class StagedGQADecode:
     def lower(self, context: RecipeContext) -> KernelProgram:
         """Lower one kernel setup and the finite staged body."""
         spec = self.spec(context.op)
-        is_a5_dram = "mte2_aic_dram" in context.service_modes
-        setup_ms = (
-            max(context.setup_ms, A5_FIA_SETUP_MS) if is_a5_dram else context.setup_ms
-        )
+        setup_ms = context.setup_ms
+        if context.service_rate("mte2_aic_dram") is not None:
+            setup_ms = max(setup_ms, A5_FIA_SETUP_MS)
         return KernelProgram(
             (
                 Stage("setup", latency=setup_ms),
@@ -269,11 +241,6 @@ class StagedGQADecode:
 def build(op: OpSpec, geometry: Geometry | None = None) -> OperatorPlan:
     """Independent verification binding for the default recipe options."""
     return StagedGQADecode().build(op, geometry)
-
-
-# ---------------------------------------------------------------------------
-# Executable programs.
-# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -305,7 +272,7 @@ def _a5_kv_load_regime(
     context: RecipeContext, recipe: StagedGQADecode, spec: _Spec,
     read: str, active_owners: int,
 ) -> tuple[dict[str, float], int, float]:
-    if "mte2_aic_dram" not in context.service_modes or "hbm" not in context.resource_names:
+    if context.service_rate("mte2_aic_dram") is None or "hbm" not in context.resource_names:
         return {}, recipe.slots, 0.0
     hbm_phys = context.resource_names["hbm"]
     read_phys = context.resource_names.get(read)
@@ -394,7 +361,7 @@ def _producer_program(context: RecipeContext, recipe: StagedGQADecode,
             if (max_q > 1 and not is_single_slot and spec.head_dim >= A5_SINGLE_SLOT_HEAD_DIM)
             else (A5_MTP_COMPACT_SETUP_MS if max_q > 1 and not is_single_slot else 0.0)
         )
-        if ("mte2_aic_dram" in context.service_modes and spec.kv_splits == 1)
+        if context.service_rate("mte2_aic_dram") is not None and spec.kv_splits == 1
         else 0.0
     )
     stages = [
@@ -419,9 +386,8 @@ def _producer_program(context: RecipeContext, recipe: StagedGQADecode,
         if page_meta:
             page_work[read] = page_work.get(read, 0) + page_meta
         if page_scale:
-            vector_read = _read_role(context, vector=True)
+            vector_read, = vector_copy_in
             page_work[vector_read] = page_work.get(vector_read, 0) + page_scale
-        if page_scale:
             page_scale_ub = _allocation(
                 context, core, "ub", "page_scale_ub", page_scale)
         stages.append(Stage(
@@ -478,11 +444,9 @@ def _producer_program(context: RecipeContext, recipe: StagedGQADecode,
                            rows * valid * spec.query_bytes)
         pv_acc = _allocation(context, core, "l0c", f"pv_acc_{suffix}",
                              rows * dim * _FP32_BYTES)
-        score_acquire = _allocations((scores,))
-        prob_acquire = _allocations((probs,))
-        pv_acc_acquire = _allocations((pv_acc,))
-        score_release = _allocations((scores,))
-        prob_release = _allocations((probs,))
+        score_buffer = _allocations((scores,))
+        prob_buffer = _allocations((probs,))
+        pv_acc_buffer = _allocations((pv_acc,))
 
         qk = Work(
             matrix={spec.query_dtype: 2 * dim * pairs},
@@ -556,12 +520,12 @@ def _producer_program(context: RecipeContext, recipe: StagedGQADecode,
             k_free = _allocations((k_l1, k_l0b))
         stages_local.append(Stage(
             "qk", context.bind(qk), after=(k_ready,),
-            acquire=score_acquire, free=k_free, placement={
+            acquire=score_buffer, free=k_free, placement={
                 **_placement(context, core, *cube),
                 **_placement(context, core, *vector)}))
         stages_local.append(Stage(
             "softmax", context.bind(softmax), after=("qk",),
-            acquire=prob_acquire, free=score_release,
+            acquire=prob_buffer, free=score_buffer,
             placement=_placement(context, core, *vector)))
 
         # V mirrors K; PV consumes the materialized V operand and probability.
@@ -581,7 +545,7 @@ def _producer_program(context: RecipeContext, recipe: StagedGQADecode,
                     "hbm": value_payload,
                     _read_role(context, vector=True): value_payload})),
                 after=("softmax",),
-                acquire=_allocations((v_payload_ub,)) + tuple(pv_acc_acquire),
+                acquire=_allocations((v_payload_ub,)) + pv_acc_buffer,
                 placement=_placement(context, core, *vector_copy_in)))
             v_after = ("v_load",)
             if value_scale:
@@ -619,7 +583,7 @@ def _producer_program(context: RecipeContext, recipe: StagedGQADecode,
             stages_local.append(Stage(
                 "v_load", context.bind(Work(resources=v_load_work)),
                 after=("softmax",),
-                acquire=_allocations((v_l1, v_l0b)) + tuple(pv_acc_acquire),
+                acquire=_allocations((v_l1, v_l0b)) + pv_acc_buffer,
                 placement={**_placement(context, core, *copy_in),
                            **_placement(context, core, *operand_role)},
                 caps=kv_load_caps))
@@ -631,10 +595,10 @@ def _producer_program(context: RecipeContext, recipe: StagedGQADecode,
                   after=("softmax",), acquire=_allocations((p_l0a,)),
                   placement=_placement(context, core, *operand_role)),
             Stage("pv", context.bind(pv), after=(v_ready, "probability_operand"),
-                  free=v_free + _allocations((p_l0a,)) + tuple(pv_acc_acquire),
+                  free=v_free + _allocations((p_l0a,)) + pv_acc_buffer,
                   placement=_placement(context, core, *cube)),
             Stage("online_update", context.bind(online), after=("pv",),
-                  free=prob_release, previous=("online_update",),
+                  free=prob_buffer, previous=("online_update",),
                   placement=_placement(context, core, *vector)),
         ))
         return tuple(stages_local)
@@ -752,7 +716,7 @@ class _GQADecodeProgram:
         max_contribs = max((len(out.contributions) for _, out in merges), default=0)
         merge_delay = (
             A5_FIA_SPLIT_MERGE_MS + float(max_contribs) * A5_FIA_SPLIT_PER_CONTRIB_MS
-            if (merges and "mte2_aic_dram" in self.context.service_modes)
+            if merges and self.context.service_rate("mte2_aic_dram") is not None
             else 0.0
         )
         merge_ready = (
@@ -778,12 +742,7 @@ class _GQADecodeProgram:
 
 
 def planned_recipe(**options) -> PlannedRecipe:
-    """Return a planned recipe with every declared option preserved.
-
-    The recipe factory registers this callable as ``staged_gqa_decode``.
-    ``PlannedRecipe`` applies the work ledger and metadata once through
-    ``prepare`` on the caller's engine.
-    """
+    """Bind the declared options to the staged decode work and program."""
     return PlannedRecipe(StagedGQADecode(**options).build)
 
 
