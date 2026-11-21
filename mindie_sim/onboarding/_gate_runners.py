@@ -15,10 +15,13 @@
 """
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
+import importlib.util
 import json
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -37,6 +40,9 @@ from .contracts import (
 _VIOLATION_COUNT_RE = re.compile(r"(?:violations|findings):\s*(\d+)")
 _DIAGNOSE_ESCALATED_EXIT = 1
 _PREVIEW_LINES = 8
+_COORDINATOR_LEASE_RPC_TIMEOUT_S = 45
+_DEFAULT_LEASE_TTL_S = 600
+_CANONICAL_SEALER_CACHE: dict[str, Any] = {}
 
 
 def resolve_repo_root(repo_root: str | Path | None = None) -> Path:
@@ -347,10 +353,225 @@ def run_live_l0_bench_subprocess(
     return dict(payload)
 
 
+def load_canonical_l0_sealer(repo_root: str | Path | None = None) -> Any:
+    """Load the single canonical L0 primitive sealer module ``tools/bench_l0_primitives.py``."""
+    root = resolve_repo_root(repo_root)
+    script = root / "tools" / "bench_l0_primitives.py"
+    if not script.is_file():
+        script = resolve_repo_root(None) / "tools" / "bench_l0_primitives.py"
+    if not script.is_file():
+        raise ModelingError(f"canonical_l0_sealer_not_found:{script}")
+    cache_key = str(script.resolve())
+    cached = _CANONICAL_SEALER_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    spec = importlib.util.spec_from_file_location("_mindie_canonical_bench_l0", script)
+    if spec is None or spec.loader is None:
+        raise ModelingError(f"canonical_l0_sealer_unimportable:{script}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    _CANONICAL_SEALER_CACHE[cache_key] = mod
+    return mod
+
+
+def _run_coordinator_lease_cmd(
+    *,
+    action: str,
+    endpoint_alias: str,
+    payload: Mapping[str, Any],
+    timeout_s: int,
+    coordinator_bin: str = "",
+) -> dict[str, Any]:
+    exe = coordinator_bin.strip() or shutil.which("mindie-coordinator") or ""
+    if not exe:
+        raise ModelingError("coordinator_cli_not_found:mindie-coordinator")
+    cmd = [
+        exe,
+        "lease",
+        "--action",
+        action,
+        "--alias",
+        endpoint_alias,
+        "--json",
+        json.dumps(dict(payload), sort_keys=True),
+    ]
+    try:
+        done = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            check=False,
+            **subprocess_window_kwargs(),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(f"coordinator_lease_{action}_timeout:timeout_s={timeout_s}") from exc
+    except TimeoutError:
+        raise
+    except OSError as exc:
+        raise ModelingError(f"coordinator_lease_{action}_os_error:{exc}") from exc
+    if done.returncode != 0:
+        raise ModelingError(
+            f"coordinator_lease_{action}_failed:rc={done.returncode}:{(done.stderr or done.stdout).strip()}"
+        )
+    try:
+        parsed = json.loads(done.stdout or "{}")
+    except ValueError as exc:
+        raise ModelingError(f"coordinator_lease_{action}_invalid_json:{exc}") from exc
+    if not isinstance(parsed, Mapping):
+        raise ModelingError(f"coordinator_lease_{action}_non_mapping_response")
+    return dict(parsed)
+
+
+@contextmanager
+def acquire_coordinator_host_queue_lease(
+    endpoint_alias: str,
+    *,
+    devices: int = 1,
+    ttl_s: int = _DEFAULT_LEASE_TTL_S,
+    rpc_timeout_s: int = _COORDINATOR_LEASE_RPC_TIMEOUT_S,
+    coordinator_bin: str = "",
+) -> Iterator[dict[str, Any]]:
+    """Acquire and unconditionally release a real ``HostQueue`` lease (``lease_id`` + ``fence_token``)."""
+    alias = endpoint_alias.strip()
+    if not alias:
+        raise ModelingError("host_queue_lease_requires_endpoint_alias")
+    acquired = _run_coordinator_lease_cmd(
+        action="acquire",
+        endpoint_alias=alias,
+        payload={"devices": int(devices), "ttl_s": int(ttl_s)},
+        timeout_s=int(rpc_timeout_s),
+        coordinator_bin=coordinator_bin,
+    )
+    lease_id = str(acquired.get("lease_id") or "").strip()
+    fence_raw = acquired.get("fence_token")
+    if not lease_id or fence_raw is None or isinstance(fence_raw, bool):
+        raise ModelingError("host_queue_lease_missing_lease_id_or_fence_token")
+    fence_token = int(fence_raw)
+    lease_record = {
+        "lease_mode": "coordinator_host_queue",
+        "lease_id": lease_id,
+        "fence_token": fence_token,
+        "devices": list(acquired.get("devices") or ()),
+    }
+    try:
+        yield lease_record
+    finally:
+        try:
+            _run_coordinator_lease_cmd(
+                action="release",
+                endpoint_alias=alias,
+                payload={"lease_id": lease_id, "fence_token": fence_token},
+                timeout_s=int(rpc_timeout_s),
+                coordinator_bin=coordinator_bin,
+            )
+        except TimeoutError:
+            raise
+        except ModelingError:
+            pass
+
+
+def resolve_profiler_builder_strict(
+    family: str,
+    recipe: str,
+    impl: str,
+    *,
+    dtypes: Sequence[str] = (),
+    meta: Mapping[str, Any] | None = None,
+    profiler_root: str | Path | None = None,
+) -> tuple[str, str]:
+    """Resolve ``(builder_name, upstream_abi)`` via canonical ``mindie_profiler.bench.operators.resolve_builder_strict``."""
+    added_path = ""
+    saved_modules: dict[str, Any] = {}
+    if profiler_root is not None:
+        root_str = str(Path(profiler_root).resolve())
+        for mod_name in list(sys.modules):
+            if mod_name == "mindie_profiler" or mod_name.startswith("mindie_profiler."):
+                saved_modules[mod_name] = sys.modules.pop(mod_name)
+        if root_str not in sys.path:
+            sys.path.insert(0, root_str)
+            added_path = root_str
+    try:
+        try:
+            from mindie_profiler.bench.operators import (
+                BenchUnmodeledOperatorError,
+                resolve_builder_strict,
+            )
+        except ImportError as exc:
+            raise ModelingError(f"profiler_owner_unavailable:{exc}") from exc
+        try:
+            builder_name, resolved_abi = resolve_builder_strict(
+                family,
+                recipe,
+                impl,
+                dtypes=tuple(dtypes),
+                meta=meta or {},
+            )
+        except BenchUnmodeledOperatorError as exc:
+            raise ModelingError(f"profiler_builder_unmodeled:{exc}") from exc
+        return str(builder_name), str(resolved_abi)
+    finally:
+        if added_path and added_path in sys.path:
+            sys.path.remove(added_path)
+        if profiler_root is not None:
+            for mod_name in list(sys.modules):
+                if mod_name == "mindie_profiler" or mod_name.startswith("mindie_profiler."):
+                    sys.modules.pop(mod_name, None)
+            sys.modules.update(saved_modules)
+
+
+def run_profiler_bench_subprocess(
+    plan_doc: Mapping[str, Any],
+    *,
+    sku: str,
+    endpoint_alias: str,
+    profiler_root: str | Path | None = None,
+    timeout_s: int = DEFAULT_GATE_SUBPROCESS_TIMEOUT_S,
+) -> list[dict[str, Any]]:
+    """Invoke canonical ``mindie_profiler.bench.bench_sku_microbench`` over a serialized plan."""
+    if not endpoint_alias.strip():
+        raise ModelingError("profiler_bench_requires_endpoint_alias")
+    if profiler_root is None:
+        raise ModelingError("profiler_bench_requires_profiler_root")
+    script = Path(profiler_root).resolve() / "mindie_profiler" / "bench" / "bench_sku_microbench.py"
+    if not script.is_file():
+        raise ModelingError(f"profiler_bench_script_not_found:{script}")
+    with tempfile.TemporaryDirectory(prefix="msim-prof-bench-") as tmp_dir:
+        tmp = Path(tmp_dir)
+        plan_file = tmp / "cliff_plan.json"
+        out_file = tmp / "observations.json"
+        write_atomic_json(plan_file, dict(plan_doc))
+        cli_args = [
+            "--sku", sku,
+            "--endpoint-alias", endpoint_alias,
+            "--plan-json", str(plan_file),
+            "--out", str(out_file),
+        ]
+        done = _run_python_script(script, cli_args, cwd=Path(profiler_root).resolve(), timeout_s=timeout_s)
+        if done.returncode != 0:
+            raise ModelingError(
+                f"profiler_bench_failed:rc={done.returncode}:{(done.stderr or done.stdout).strip()}"
+            )
+        if not out_file.is_file():
+            raise ModelingError("profiler_bench_missing_output_json")
+        try:
+            raw = json.loads(out_file.read_text(encoding="utf-8"))
+        except ValueError as exc:
+            raise ModelingError(f"profiler_bench_invalid_json:{exc}") from exc
+    rows = raw.get("observations", raw) if isinstance(raw, Mapping) else raw
+    if not isinstance(rows, list):
+        raise ModelingError("profiler_bench_observations_not_list")
+    return [dict(r) for r in rows if isinstance(r, Mapping)]
+
+
 __all__ = [
+    "acquire_coordinator_host_queue_lease",
+    "load_canonical_l0_sealer",
+    "resolve_profiler_builder_strict",
     "resolve_repo_root",
     "run_arch_governance_gate",
     "run_live_l0_bench_subprocess",
+    "run_profiler_bench_subprocess",
     "run_tail_cluster_diagnosis",
     "run_template_provenance_gate",
     "run_test_orthogonality_gate",

@@ -1,107 +1,161 @@
-"""Deterministic disjoint train/off-grid cliff bench planner and white-box scorer.
+"""Disjoint 2D cliff-plan synthesis with declarative TilingAxes ABI guards.
 
-[Role] Synthesize strictly disjoint ``train`` anchor and ``heldout`` off-grid
-  cliff benchmark plans for both new SKUs (512..400K + L1/L2/L3) and new
-  operators (tile ± 1, cores * tile ± 1, topk ± 1, L2 knee ± 1, 512..400K),
-  validate acquisition-lineage separation, and score pure white-box predictions
-  against measured silicon ``p50`` timings.
-[Invariants] ``train`` and ``heldout`` never share context points or normalized
-  acquisition lineage roots; ``L1 != L2 != L3`` heldout roots stay pairwise
-  disjoint; ``service_regimes`` crutches are unconditionally rejected; all
-  scored residuals use fractional ``signed_error`` / ``absolute_percentage_error``
-  matching ``multilevel_gate.Residual`` and ``scripts/diagnose_tail_cluster.py``.
-[Timeouts & Locks] Pure deterministic planning and in-memory scoring; no locks,
-  subprocesses, or device contexts.
-[Side-Effect Policy] Read-only over inputs; returns new immutable plans and
-  serializable reports.
+[Role] Synthesize strictly disjoint ``train`` + 2D ``(B/q x Context x Parallel)``
+  off-grid cliff ``heldout`` + ``abi_rejection`` benchmark plans from declared
+  ``TilingAxes`` / ``OperatorCliffParameters`` (Prevention Lock 3), and
+  re-export sealed ``GateCase -> EvaluationRunner -> EngineRunReceipt`` scoring
+  from ``_sealed_scorer``.
+[Invariants]
+  * ``train`` vs ``heldout`` contexts, point coordinates, and acquisition
+    lineage roots are strictly disjoint; ``262144`` is ``train`` and
+    ``400000`` (``heldout``) is distinct from ``409600`` (``train``).
+  * All candidate cliffs are filtered through ``validate_abi``; illegal ABI
+    shapes (e.g., ``topk=2049``) route to ``abi_rejection_points`` while legal
+    performance cliffs (e.g., ``context=2049, topk=2048``) stay in ``heldout``.
+[Timeouts & Locks] Pure in-memory plan synthesis; zero subprocesses, network
+  calls, or device contexts.
+[Side-Effect Policy] Zero filesystem writes or global state mutations.
 """
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping, Sequence
 import hashlib
-import math
-import statistics
 from typing import Any
 
-from mindie_sim.observations.multilevel_gate import (
-    CohortKey,
-    Residual,
-    normalize_lineage_token,
+from ._sealed_scorer import (
+    STANDARD_LEVEL_BOUNDARY_KINDS,
+    WhiteboxSpineRunner,
+    score_sealed_gate_cases,
+    validate_disjoint_lineage,
 )
-from mindie_sim.schema.common import ModelingError
-
 from .contracts import (
     ANCHOR_CONTEXT_GRID,
     CLIFF_PLAN_SCHEMA,
     COLD_RING_L2_MULTIPLIER,
-    DEFAULT_HELDOUT_APE_THRESHOLD_PCT,
-    DISPLAY_ROUND_DIGITS,
-    NS_PER_MS,
+    CONTEXT_MAX_TOKENS,
+    CONTEXT_MIN_TOKENS,
+    DEFAULT_SPARSE_TOPK,
     OFF_GRID_CLIFF_HELDOUT_GRID,
-    PERCENT_SCALE,
     SHORT_DIGEST_LEN,
     CliffBenchPlan,
     CliffPointSpec,
     OperatorCliffParameters,
+    assert_sanitized_payload,
     canonical_json_bytes,
-    compute_receipt_sha256,
+    sanitize_public_alias,
+)
+from .tiling_axes import (
+    CROSS_SAMPLE_BATCH_SIZES,
+    CROSS_SAMPLE_CHUNK_Q,
+    CROSS_SAMPLE_MTP_Q,
+    CROSS_SAMPLE_PARALLEL_CONTEXT_MIN,
+    TilingAxes,
+    default_topk_abi_rule,
+    validate_abi,
 )
 
-TAIL_QUANTILE_P90 = 0.9
-WAVE_TAIL_MAX_TOKENS = 4097
-SPARSE_PHASE_CHANGE_TOKEN = 2049
-L2_KNEE_MIN_TOKENS = 24576
-L2_KNEE_MAX_TOKENS = 98304
-
-STANDARD_SEQUENCE_OPERATORS: tuple[str, ...] = (
-    "fused_infer_attention",
-    "paged_mla",
-    "c8_sfa",
-    "lightning_indexer_topk",
-    "dcp_lse_attention_merge",
-    "chunk_gated_delta_rule",
-    "recurrent_gated_delta_rule",
-    "chunk_kda",
-    "recurrent_kda",
-    "matmul",
-    "grouped_matmul",
-    "mhc_combine",
-    "all_reduce",
+_DEFAULT_SKU_TILE_DIM = 128
+_CROSS_BATCH_CONTEXTS: tuple[int, ...] = (4097, 24576, 98304)
+_CROSS_MTP_CONTEXTS: tuple[int, ...] = (2049, 24576, 98304)
+_CROSS_CHUNK_CONTEXTS: tuple[int, ...] = (98304, 200000)
+_CROSS_PARALLEL_SPECS: tuple[tuple[int, str], ...] = (
+    (200000, "pcp2_dcp2"),
+    (400000, "pcp4_dcp2"),
 )
 
-STANDARD_LEVEL_BOUNDARY_KINDS: Mapping[str, str] = {
-    "L1": "single_operator",
-    "L2": "subgraph_block",
-    "L3": "model_step",
-}
 
-_FORBIDDEN_CRUTCH_KEYS = frozenset({"service_regimes", "service_regime_override"})
+def _clamp_in_domain(value: int, *, low: int = 1, high: int = CONTEXT_MAX_TOKENS) -> int:
+    return max(low, min(high, int(value)))
 
 
-def _lineage_root(tag: str, seed_payload: Mapping[str, Any]) -> str:
-    digest = hashlib.sha256(canonical_json_bytes(seed_payload)).hexdigest()[:SHORT_DIGEST_LEN]
-    return f"acq-{tag}-{digest}"
+def _resolve_tiling_axes(params: OperatorCliffParameters) -> TilingAxes:
+    if params.tiling_axes is not None:
+        return params.tiling_axes
+    thresholds: list[tuple[str, int]] = []
+    rules = []
+    if params.topk_threshold is not None:
+        thresholds.append(("topk", int(params.topk_threshold)))
+        rules.append(default_topk_abi_rule(above_threshold=int(params.topk_threshold)))
+    return TilingAxes(
+        tile_dims=(int(params.tile_dim),),
+        core_product_axes=("tokens", "batch_x_kv_heads"),
+        phase_thresholds=tuple(thresholds),
+        abi_divisibility=tuple(rules),
+    )
 
 
-def _cliff_regime_for_context(seq_len: int) -> tuple[str, str]:
-    if seq_len == SPARSE_PHASE_CHANGE_TOKEN:
-        return (
-            "dsa_topk_phase_change",
-            "Exact transition across dsa_index_topk=2048 dense-to-sparse phase boundary.",
+def _append_guarded_point(
+    *,
+    heldout: list[CliffPointSpec],
+    abi_rejections: list[CliffPointSpec],
+    seen_perf: set[tuple[str, int, int, int, int | None, str]],
+    seen_reject: set[tuple[str, int, int | None]],
+    train_keys: set[tuple[str, int]],
+    axes: TilingAxes,
+    point_id: str,
+    grid_kind: str,
+    axis: str,
+    value: int,
+    regime_tag: str,
+    rationale: str,
+    batch_size: int = 1,
+    query_tokens: int = 1,
+    topk: int | None = None,
+    parallel_topology: str = "tp1",
+) -> None:
+    if value < 1:
+        return
+    probe_shape: dict[str, Any] = {
+        "axis": axis,
+        "value": value,
+        "batch_size": batch_size,
+        "query_tokens": query_tokens,
+    }
+    if axis == "context_len":
+        probe_shape["context_len"] = value
+    if topk is not None:
+        probe_shape["topk"] = topk
+    ok_abi, reject_reason = validate_abi(probe_shape, axes)
+    if not ok_abi:
+        rkey = (axis, value, topk)
+        if rkey not in seen_reject:
+            seen_reject.add(rkey)
+            abi_rejections.append(
+                CliffPointSpec(
+                    point_id=f"abi_reject_{point_id}",
+                    split="abi_rejection",
+                    grid_kind="abi_rejection",
+                    axis=axis,
+                    value=value,
+                    regime_tag=f"abi_reject_{regime_tag}",
+                    rationale=rationale,
+                    batch_size=batch_size,
+                    query_tokens=query_tokens,
+                    topk=topk,
+                    parallel_topology=parallel_topology,
+                    abi_expected_error=reject_reason,
+                )
+            )
+        return
+    if (axis, value) in train_keys:
+        return
+    pkey = (axis, value, batch_size, query_tokens, topk, parallel_topology)
+    if pkey in seen_perf:
+        return
+    seen_perf.add(pkey)
+    heldout.append(
+        CliffPointSpec(
+            point_id=point_id,
+            split="heldout",
+            grid_kind=grid_kind,  # type: ignore[arg-type]
+            axis=axis,
+            value=value,
+            regime_tag=regime_tag,
+            rationale=rationale,
+            batch_size=batch_size,
+            query_tokens=query_tokens,
+            topk=topk,
+            parallel_topology=parallel_topology,
         )
-    if seq_len <= WAVE_TAIL_MAX_TOKENS:
-        return (
-            "partial_wave_tail_block",
-            "Partial-wave / split_kv +1 tail-block wave-quantization cliff.",
-        )
-    if L2_KNEE_MIN_TOKENS <= seq_len <= L2_KNEE_MAX_TOKENS:
-        return (
-            "l2_residency_knee",
-            "L2 cache residency knee where KV/page-table working set spills to cold HBM.",
-        )
-    return (
-        "ultra_long_sort_mrg_dcp",
-        "Ultra-long-context Lightning Indexer + Sort32/MrgSort multi-pass merge & DCP regime.",
     )
 
 
@@ -110,461 +164,201 @@ def synthesize_operator_cliff_plan(
     *,
     sku: str,
     campaign_id: str = "onboard-op",
-    include_context_grids: bool = True,
 ) -> CliffBenchPlan:
-    """Synthesize a strictly disjoint train + off-grid cliff plan for an operator."""
-    if not sku or not sku.strip():
-        raise ModelingError("cliff_plan_sku_missing")
-    tile = params.tile_dim
-    wave = params.core_count * tile
+    """Synthesize disjoint train + 2D off-grid cliff heldout + ABI-rejection plan."""
+    clean_sku = sanitize_public_alias(sku, "sku")
+    clean_campaign = sanitize_public_alias(campaign_id, "onboard")
+    axes = _resolve_tiling_axes(params)
 
-    heldout_raw: list[CliffPointSpec] = [
-        CliffPointSpec(
-            f"tile-minus-1-{tile - 1}", "heldout", "boundary_cliff", "tile_m", tile - 1,
-            "tile_tail_underfill", f"tile - 1 ({tile - 1}) stresses partial-tile padding and masking.",
-        ),
-        CliffPointSpec(
-            f"tile-plus-1-{tile + 1}", "heldout", "boundary_cliff", "tile_m", tile + 1,
-            "tile_tail_spill", f"tile + 1 ({tile + 1}) forces an extra tail tile beyond {tile}.",
-        ),
-        CliffPointSpec(
-            f"wave-minus-1-{wave - 1}", "heldout", "boundary_cliff", "wave_m", wave - 1,
-            "wave_under_occupancy", f"cores * tile - 1 ({wave - 1}) stresses last-core partial load.",
-        ),
-        CliffPointSpec(
-            f"wave-plus-1-{wave + 1}", "heldout", "boundary_cliff", "wave_m", wave + 1,
-            "wave_quantization_cliff", f"cores * tile + 1 ({wave + 1}) adds a 1-item tail wave across {params.core_count} cores.",
-        ),
-    ]
-    train_raw: list[CliffPointSpec] = [
-        CliffPointSpec(
-            f"tile-exact-{tile}", "train", "anchor", "tile_m", tile,
-            "tile_aligned_anchor", f"Exact single-tile anchor ({tile}).",
-        ),
-        CliffPointSpec(
-            f"wave-exact-{wave}", "train", "anchor", "wave_m", wave,
-            "full_wave_anchor", f"Exact full-wave anchor ({params.core_count} * {tile}).",
-        ),
-    ]
+    train_points: list[CliffPointSpec] = []
+    train_keys: set[tuple[str, int]] = set()
+    for ctx in ANCHOR_CONTEXT_GRID:
+        if params.context_min <= ctx <= params.context_max:
+            train_keys.add(("context_len", ctx))
+            train_points.append(
+                CliffPointSpec(
+                    point_id=f"anchor_ctx_{ctx}",
+                    split="train",
+                    grid_kind="anchor",
+                    axis="context_len",
+                    value=ctx,
+                    regime_tag="anchor_train",
+                    rationale="canonical_anchor_context_grid_512_to_409600",
+                )
+            )
+    if not train_points:
+        train_keys.add(("context_len", params.context_min))
+        train_points.append(
+            CliffPointSpec(
+                point_id=f"anchor_ctx_{params.context_min}",
+                split="train",
+                grid_kind="anchor",
+                axis="context_len",
+                value=params.context_min,
+                regime_tag="anchor_train",
+                rationale="domain_min_anchor",
+            )
+        )
+
+    heldout: list[CliffPointSpec] = []
+    abi_rejections: list[CliffPointSpec] = []
+    seen_perf: set[tuple[str, int, int, int, int | None, str]] = set()
+    seen_reject: set[tuple[str, int, int | None]] = set()
+
+    def _add(**kw: Any) -> None:
+        _append_guarded_point(
+            heldout=heldout, abi_rejections=abi_rejections,
+            seen_perf=seen_perf, seen_reject=seen_reject,
+            train_keys=train_keys, axes=axes, **kw,
+        )
+
+    for ctx in OFF_GRID_CLIFF_HELDOUT_GRID:
+        if params.context_min <= ctx <= params.context_max:
+            _add(
+                point_id=f"offgrid_ctx_{ctx}", grid_kind="off_grid_cliff",
+                axis="context_len", value=ctx, regime_tag="off_grid_heldout",
+                rationale="canonical_off_grid_cliff_heldout_grid",
+            )
+
+    for batch, ctx in zip(CROSS_SAMPLE_BATCH_SIZES, _CROSS_BATCH_CONTEXTS):
+        if params.context_min <= ctx <= params.context_max:
+            _add(
+                point_id=f"cross_b{batch}_ctx_{ctx}", grid_kind="cross_sample_2d",
+                axis="context_len", value=ctx, regime_tag="high_batch_decode_2d",
+                rationale="2d_high_batch_decode_core_wave_cliff",
+                batch_size=batch, query_tokens=1,
+            )
+
+    for q_tok, ctx in zip(CROSS_SAMPLE_MTP_Q, _CROSS_MTP_CONTEXTS):
+        if params.context_min <= ctx <= params.context_max:
+            _add(
+                point_id=f"cross_mtp_q{q_tok}_ctx_{ctx}", grid_kind="cross_sample_2d",
+                axis="context_len", value=ctx, regime_tag="mtp_decode_2d",
+                rationale="2d_mtp_multi_query_decode_cliff",
+                batch_size=1, query_tokens=q_tok,
+            )
+
+    for q_tok, ctx in zip(CROSS_SAMPLE_CHUNK_Q, _CROSS_CHUNK_CONTEXTS):
+        if params.context_min <= ctx <= params.context_max:
+            _add(
+                point_id=f"cross_chunk_q{q_tok}_ctx_{ctx}", grid_kind="cross_sample_2d",
+                axis="context_len", value=ctx, regime_tag="chunked_prefill_2d",
+                rationale="2d_long_context_chunked_prefill_cliff",
+                batch_size=1, query_tokens=q_tok,
+            )
+
+    for ctx, topo in _CROSS_PARALLEL_SPECS:
+        if ctx >= CROSS_SAMPLE_PARALLEL_CONTEXT_MIN and params.context_min <= ctx <= params.context_max:
+            _add(
+                point_id=f"cross_{topo}_ctx_{ctx}", grid_kind="cross_sample_2d",
+                axis="context_len", value=ctx, regime_tag="multi_rank_cp_2d",
+                rationale="2d_multi_rank_pcp_dcp_long_context_cliff",
+                batch_size=1, query_tokens=1, parallel_topology=topo,
+            )
+
+    for tile in axes.tile_dims:
+        for delta, tag in ((-1, "minus1"), (0, "exact"), (1, "plus1")):
+            _add(
+                point_id=f"tile_{tile}_{tag}_{tile + delta}", grid_kind="boundary_cliff",
+                axis="tokens", value=tile + delta, regime_tag="tile_boundary",
+                rationale=f"tile_dim({tile}){delta:+d}_tail_wave_boundary",
+            )
+        full_wave = params.core_count * tile
+        for delta, tag in ((-1, "minus1"), (1, "plus1")):
+            _add(
+                point_id=f"cores_wave_{tile}_{tag}_{full_wave + delta}", grid_kind="boundary_cliff",
+                axis="tokens", value=full_wave + delta, regime_tag="core_wave_cliff",
+                rationale=f"cores({params.core_count})*tile({tile}){delta:+d}_wave_step_cliff",
+            )
 
     if params.topk_threshold is not None:
-        tk = params.topk_threshold
-        train_raw.append(
-            CliffPointSpec(
-                f"topk-exact-{tk}", "train", "anchor", "topk", tk,
-                "topk_dense_anchor", f"Exact dense/sparse topk boundary anchor ({tk}).",
-            )
+        tk = int(params.topk_threshold)
+        _add(
+            point_id=f"topk_ctx_{tk + 1}_k_{tk}", grid_kind="boundary_cliff",
+            axis="context_len", value=tk + 1, regime_tag="topk_perf_cliff",
+            rationale=f"legal_sparse_topk_perf_cliff:ctx={tk + 1}:topk={tk}",
+            topk=tk,
         )
-        heldout_raw.extend((
-            CliffPointSpec(
-                f"topk-minus-1-{tk - 1}", "heldout", "boundary_cliff", "topk", tk - 1,
-                "topk_below_threshold", f"topk - 1 ({tk - 1}) stays just inside dense/fast selection.",
-            ),
-            CliffPointSpec(
-                f"topk-plus-1-{tk + 1}", "heldout", "boundary_cliff", "topk", tk + 1,
-                "topk_above_threshold", f"topk + 1 ({tk + 1}) triggers sparse/multi-pass selection.",
-            ),
-        ))
+        _add(
+            point_id=f"topk_ctx_{tk - 1}_k_{tk - 1}", grid_kind="boundary_cliff",
+            axis="context_len", value=tk - 1, regime_tag="topk_pre_threshold",
+            rationale=f"legal_sparse_topk_below_threshold:ctx={tk - 1}:topk={tk - 1}",
+            topk=tk - 1,
+        )
+        _add(
+            point_id=f"topk_attr_{tk + 1}", grid_kind="boundary_cliff",
+            axis="context_len", value=tk + 1, regime_tag="topk_threshold_plus1",
+            rationale=f"topk_threshold({tk})+1_abi_alignment_guard",
+            topk=tk + 1,
+        )
 
     if params.bytes_per_token > 0:
-        l2_knee = max(2, params.l2_bytes // params.bytes_per_token)
-        train_raw.append(
-            CliffPointSpec(
-                f"l2-knee-anchor-{l2_knee}", "train", "anchor", "l2_tokens", l2_knee,
-                "l2_capacity_anchor", f"Exact L2 residency boundary ({l2_knee} tokens).",
+        l2_knee = _clamp_in_domain(params.l2_bytes // params.bytes_per_token, low=2)
+        for delta, tag in ((-1, "minus1"), (1, "plus1")):
+            _add(
+                point_id=f"l2_knee_{tag}_{l2_knee + delta}", grid_kind="boundary_cliff",
+                axis="context_len", value=l2_knee + delta, regime_tag="l2_capacity_knee",
+                rationale=f"l2_capacity_knee({l2_knee}){delta:+d}_residency_cliff",
             )
-        )
-        heldout_raw.extend((
-            CliffPointSpec(
-                f"l2-knee-minus-1-{l2_knee - 1}", "heldout", "boundary_cliff", "l2_tokens", l2_knee - 1,
-                "l2_warm_boundary", f"l2_knee - 1 ({l2_knee - 1}) stays warm in L2.",
-            ),
-            CliffPointSpec(
-                f"l2-knee-plus-1-{l2_knee + 1}", "heldout", "boundary_cliff", "l2_tokens", l2_knee + 1,
-                "l2_cold_spill_cliff", f"l2_knee + 1 ({l2_knee + 1}) spills working set to cold HBM.",
-            ),
-        ))
 
-    if include_context_grids:
-        for seq_len in ANCHOR_CONTEXT_GRID:
-            if params.context_min <= seq_len <= params.context_max:
-                train_raw.append(
-                    CliffPointSpec(
-                        f"ctx-anchor-{seq_len}", "train", "anchor", "context_len", seq_len,
-                        "anchor_context_grid", f"Canonical power-of-2 / 400K anchor context ({seq_len}).",
-                    )
-                )
-        for seq_len in OFF_GRID_CLIFF_HELDOUT_GRID:
-            if params.context_min <= seq_len <= params.context_max:
-                regime_tag, rationale = _cliff_regime_for_context(seq_len)
-                heldout_raw.append(
-                    CliffPointSpec(
-                        f"ctx-cliff-{seq_len}", "heldout", "off_grid_cliff", "context_len", seq_len,
-                        regime_tag, rationale,
-                    )
-                )
-
-    heldout_seen: set[tuple[str, int]] = set()
-    heldout_dedup: list[CliffPointSpec] = []
-    for pt in heldout_raw:
-        key = (pt.axis, pt.value)
-        if key not in heldout_seen:
-            heldout_seen.add(key)
-            heldout_dedup.append(pt)
-
-    train_seen: set[tuple[str, int]] = set()
-    train_dedup: list[CliffPointSpec] = []
-    for pt in train_raw:
-        key = (pt.axis, pt.value)
-        if key not in heldout_seen and key not in train_seen:
-            train_seen.add(key)
-            train_dedup.append(pt)
-
-    plan_id = f"{campaign_id}:{params.operator_id}:{sku}"
-    train_root = _lineage_root("train", {"plan_id": plan_id, "split": "train"})
-    heldout_root = _lineage_root("heldout", {"plan_id": plan_id, "split": "heldout"})
-    draft = {
+    body = {
         "schema": CLIFF_PLAN_SCHEMA,
-        "plan_id": plan_id,
         "target_id": params.operator_id,
         "sku": sku,
-        "train_lineage_root": train_root,
-        "heldout_lineage_root": heldout_root,
+        "campaign_id": clean_campaign,
         "cold_ring_l2_multiplier": COLD_RING_L2_MULTIPLIER,
-        "train_points": [pt.to_dict() for pt in train_dedup],
-        "heldout_points": [pt.to_dict() for pt in heldout_dedup],
+        "train_points": [pt.to_dict() for pt in train_points],
+        "heldout_points": [pt.to_dict() for pt in heldout],
+        "abi_rejection_points": [pt.to_dict() for pt in abi_rejections],
+        "tiling_axes": axes.to_dict(),
     }
-    digest = compute_receipt_sha256(draft, digest_field="plan_sha256")
-    return CliffBenchPlan(
+    plan_sha256 = hashlib.sha256(canonical_json_bytes(body)).hexdigest()
+    short = plan_sha256[:SHORT_DIGEST_LEN]
+    plan = CliffBenchPlan(
         schema=CLIFF_PLAN_SCHEMA,
-        plan_id=plan_id,
+        plan_id=f"plan-{clean_sku}-{short}",
         target_id=params.operator_id,
         sku=sku,
-        train_lineage_root=train_root,
-        heldout_lineage_root=heldout_root,
+        train_lineage_root=f"acq-train-{clean_campaign}-{short}",
+        heldout_lineage_root=f"acq-heldout-{clean_campaign}-{short}",
         cold_ring_l2_multiplier=COLD_RING_L2_MULTIPLIER,
-        train_points=tuple(train_dedup),
-        heldout_points=tuple(heldout_dedup),
-        plan_sha256=digest,
+        train_points=tuple(train_points),
+        heldout_points=tuple(heldout),
+        plan_sha256=plan_sha256,
+        abi_rejection_points=tuple(abi_rejections),
+        tiling_axes=axes,
     )
+    assert_sanitized_payload(plan.to_dict(), field_name="cliff_bench_plan")
+    return plan
 
 
 def synthesize_sku_512_400k_plan(
-    sku: str,
     *,
+    sku: str,
+    core_count: int,
     l2_bytes: int,
-    aic_count: int,
-    aiv_count: int,
-    operators: Sequence[str] = STANDARD_SEQUENCE_OPERATORS,
-    campaign_id: str = "onboard-sku-512-400k",
-) -> dict[str, Any]:
-    """Build a complete disjoint Anchor + Off-Grid Cliff + L1/L2/L3 bench plan for a SKU."""
-    if not sku or not sku.strip():
-        raise ModelingError("sku_plan_name_missing")
-    if l2_bytes < 1 or aic_count < 1 or aiv_count < 1:
-        raise ModelingError("sku_plan_hardware_dimensions_invalid")
-    train_root = _lineage_root("train", {"sku": sku, "campaign_id": campaign_id, "split": "train"})
-    level_heldout_roots = {
-        level: _lineage_root(
-            f"heldout-{level.lower()}",
-            {"sku": sku, "campaign_id": campaign_id, "split": "heldout", "level": level},
-        )
-        for level in ("L1", "L2", "L3")
-    }
-    cases: list[dict[str, Any]] = []
-    for op_name in operators:
-        for seq_len in ANCHOR_CONTEXT_GRID:
-            cases.append({
-                "case_id": f"{sku}:{op_name}:anchor:{seq_len}",
-                "level": "L1",
-                "split": "train",
-                "grid_kind": "anchor",
-                "operator": op_name,
-                "context_len": seq_len,
-                "acquisition_root": train_root,
-                "boundary_kind": STANDARD_LEVEL_BOUNDARY_KINDS["L1"],
-            })
-        for seq_len in OFF_GRID_CLIFF_HELDOUT_GRID:
-            regime_tag, _rationale = _cliff_regime_for_context(seq_len)
-            cases.append({
-                "case_id": f"{sku}:{op_name}:cliff:{seq_len}",
-                "level": "L1",
-                "split": "heldout",
-                "grid_kind": "off_grid_cliff",
-                "operator": op_name,
-                "context_len": seq_len,
-                "regime_tag": regime_tag,
-                "acquisition_root": level_heldout_roots["L1"],
-                "boundary_kind": STANDARD_LEVEL_BOUNDARY_KINDS["L1"],
-            })
-    for level in ("L2", "L3"):
-        for seq_len in OFF_GRID_CLIFF_HELDOUT_GRID:
-            regime_tag, _rationale = _cliff_regime_for_context(seq_len)
-            cases.append({
-                "case_id": f"{sku}:{level.lower()}:cliff:{seq_len}",
-                "level": level,
-                "split": "heldout",
-                "grid_kind": "off_grid_cliff",
-                "operator": "decoder_block" if level == "L2" else "full_model_step",
-                "context_len": seq_len,
-                "regime_tag": regime_tag,
-                "acquisition_root": level_heldout_roots[level],
-                "boundary_kind": STANDARD_LEVEL_BOUNDARY_KINDS[level],
-            })
-    payload = {
-        "schema": CLIFF_PLAN_SCHEMA,
-        "sku": sku,
-        "campaign_id": campaign_id,
-        "cold_ring_l2_multiplier": COLD_RING_L2_MULTIPLIER,
-        "cold_ring_min_bytes": COLD_RING_L2_MULTIPLIER * l2_bytes,
-        "hardware": {"l2_bytes": l2_bytes, "aic_count": aic_count, "aiv_count": aiv_count},
-        "anchor_grid": list(ANCHOR_CONTEXT_GRID),
-        "off_grid_cliff_heldout_grid": list(OFF_GRID_CLIFF_HELDOUT_GRID),
-        "train_lineage_root": train_root,
-        "heldout_lineage_roots_by_level": level_heldout_roots,
-        "operators": list(operators),
-        "case_count": len(cases),
-        "cases": cases,
-    }
-    payload["plan_sha256"] = compute_receipt_sha256(payload, digest_field="plan_sha256")
-    return payload
-
-
-def validate_disjoint_lineage(
-    train_roots: Iterable[str],
-    heldout_roots: Iterable[str],
-    *,
-    level_roots: Mapping[str, Iterable[str]] | None = None,
-) -> None:
-    """Enforce strictly disjoint normalized acquisition roots across train/heldout and L1/L2/L3."""
-    norm_train = {
-        normalize_lineage_token(tok) for tok in train_roots if isinstance(tok, str) and tok.strip()
-    }
-    norm_heldout = {
-        normalize_lineage_token(tok) for tok in heldout_roots if isinstance(tok, str) and tok.strip()
-    }
-    leaked = sorted(norm_train & norm_heldout)
-    if leaked:
-        raise ModelingError(f"onboarding_lineage_split_leakage:roots={','.join(leaked)}")
-    if level_roots:
-        seen_by_root: dict[str, set[str]] = {}
-        for level, roots in level_roots.items():
-            for raw_tok in roots:
-                if not isinstance(raw_tok, str) or not raw_tok.strip():
-                    continue
-                tok = normalize_lineage_token(raw_tok)
-                if tok in norm_train:
-                    raise ModelingError(
-                        f"onboarding_lineage_split_leakage:level={level}:root={tok}"
-                    )
-                seen_by_root.setdefault(tok, set()).add(str(level))
-        for tok, levels in sorted(seen_by_root.items()):
-            if len(levels) > 1:
-                raise ModelingError(
-                    f"onboarding_cross_level_root_overlap:root={tok}:levels={','.join(sorted(levels))}"
-                )
-
-
-def _reject_service_regimes(obj: Any) -> None:
-    if isinstance(obj, Mapping):
-        for key, value in obj.items():
-            if str(key) in _FORBIDDEN_CRUTCH_KEYS and value:
-                raise ModelingError(f"service_regimes_crutch_forbidden:{key}")
-            _reject_service_regimes(value)
-    elif isinstance(obj, (list, tuple)):
-        for item in obj:
-            _reject_service_regimes(item)
-
-
-def _summarize_apes(apes_pct: Sequence[float], signed_pct: Sequence[float]) -> dict[str, Any]:
-    if not apes_pct:
-        return {
-            "count": 0,
-            "mape_pct": None,
-            "medape_pct": None,
-            "median_signed_pct": None,
-            "p90_ape_pct": None,
-            "max_ape_pct": None,
-        }
-    ordered = sorted(apes_pct)
-    p90_idx = min(len(ordered) - 1, max(0, math.ceil(TAIL_QUANTILE_P90 * len(ordered)) - 1))
-    return {
-        "count": len(ordered),
-        "mape_pct": round(float(statistics.fmean(ordered)), DISPLAY_ROUND_DIGITS),
-        "medape_pct": round(float(statistics.median(ordered)), DISPLAY_ROUND_DIGITS),
-        "median_signed_pct": round(float(statistics.median(signed_pct)), DISPLAY_ROUND_DIGITS),
-        "p90_ape_pct": round(float(ordered[p90_idx]), DISPLAY_ROUND_DIGITS),
-        "max_ape_pct": round(float(ordered[-1]), DISPLAY_ROUND_DIGITS),
-    }
-
-
-def _to_int_ns(value: Any, label: str) -> int:
-    if value is None or isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ModelingError(f"observation_duration_invalid:{label}")
-    fval = float(value)
-    if not math.isfinite(fval) or fval <= 0.0:
-        raise ModelingError(f"observation_duration_nonpositive:{label}")
-    return int(round(fval))
-
-
-def _predict_whitebox_from_case(row: Mapping[str, Any]) -> int | None:
-    sim_case = row.get("sim_case")
-    if not isinstance(sim_case, Mapping):
-        return None
-    _reject_service_regimes(sim_case)
-    from mindie_sim.api import evaluate_step
-    from mindie_sim.prediction.results import StepRequest
-
-    req = StepRequest(
-        phase=str(row.get("phase") or "decode"),  # type: ignore[arg-type]
-        tokens=int(row.get("tokens") or 1),
-        context=int(row.get("context_len") or 0),
-        sequences=int(row.get("sequences") or 1),
-        scope=str(row.get("scope") or "body"),  # type: ignore[arg-type]
+    tile_dim: int = _DEFAULT_SKU_TILE_DIM,
+    topk_threshold: int = DEFAULT_SPARSE_TOPK,
+    campaign_id: str = "onboard-sku",
+) -> CliffBenchPlan:
+    """Synthesize canonical 512..400K disjoint Anchor + 2D Cliff Heldout plan for a SKU."""
+    params = OperatorCliffParameters(
+        operator_id=f"sku:{sku}:512-400k",
+        family="sku_suite",
+        tile_dim=int(tile_dim),
+        core_count=max(1, int(core_count)),
+        l2_bytes=max(1, int(l2_bytes)),
+        topk_threshold=int(topk_threshold),
+        context_min=CONTEXT_MIN_TOKENS,
+        context_max=CONTEXT_MAX_TOKENS,
     )
-    step = evaluate_step(sim_case, req)
-    return int(round(float(step.span_ms) * NS_PER_MS))
-
-
-def score_whitebox_observations(
-    observations: Sequence[Mapping[str, Any]],
-    *,
-    sku: str,
-    threshold_pct: float = DEFAULT_HELDOUT_APE_THRESHOLD_PCT,
-    predictor: Callable[[Mapping[str, Any]], int] | None = None,
-    external_train_roots: Iterable[str] = (),
-) -> dict[str, Any]:
-    """Score pure white-box predictions vs silicon p50 and emit multilevel/diagnosis residuals."""
-    _reject_service_regimes(observations)
-    train_roots: set[str] = set(external_train_roots)
-    heldout_roots: set[str] = set()
-    level_roots: dict[str, set[str]] = {}
-    residuals: list[dict[str, Any]] = []
-    heldout_apes: list[float] = []
-    heldout_signed: list[float] = []
-    train_apes: list[float] = []
-    train_signed: list[float] = []
-    failing_cliffs: list[dict[str, Any]] = []
-    seen_anchor_ctx: set[int] = set()
-    seen_cliff_ctx: set[int] = set()
-
-    for idx, row in enumerate(observations):
-        cid = str(row.get("case_id") or f"obs-{idx}")
-        split = str(row.get("split") or "").strip().lower()
-        if split not in ("train", "heldout"):
-            raise ModelingError(f"observation_split_invalid:{cid}:{split}")
-        level = str(row.get("level") or "L1").strip().upper()
-        if level not in ("L1", "L2", "L3"):
-            raise ModelingError(f"observation_level_invalid:{cid}:{level}")
-        root = str(row.get("acquisition_root") or row.get("acquisition_uid") or "").strip()
-        if not root:
-            raise ModelingError(f"observation_lineage_root_missing:{cid}")
-        if split == "train":
-            train_roots.add(root)
-        else:
-            heldout_roots.add(root)
-            level_roots.setdefault(level, set()).add(root)
-
-        measured_ns = _to_int_ns(
-            row.get("measured_p50_ns", row.get("measured_ns")), f"{cid}:measured"
-        )
-        raw_pred = row.get("predicted_ns")
-        if raw_pred is None and predictor is not None:
-            raw_pred = predictor(row)
-        if raw_pred is None:
-            raw_pred = _predict_whitebox_from_case(row)
-        predicted_ns = _to_int_ns(raw_pred, f"{cid}:predicted")
-
-        signed = (predicted_ns - measured_ns) / float(measured_ns)
-        ape_ratio = abs(signed)
-        ape_pct = ape_ratio * PERCENT_SCALE
-        grid_kind = str(row.get("grid_kind") or ("anchor" if split == "train" else "off_grid_cliff"))
-        ctx_len = row.get("context_len")
-        if isinstance(ctx_len, int) and not isinstance(ctx_len, bool):
-            if split == "train":
-                seen_anchor_ctx.add(ctx_len)
-            else:
-                seen_cliff_ctx.add(ctx_len)
-
-        cohort = CohortKey(
-            level=level,  # type: ignore[arg-type]
-            cohort_name=str(row.get("cohort_name") or row.get("operator") or "onboarding"),
-            sku=str(row.get("sku") or sku),
-            phase=str(row.get("phase") or "decode"),
-            mode=str(row.get("mode") or "eager"),
-            shape_regime=str(row.get("regime_tag") or grid_kind),
-            parallel_topology=str(row.get("parallel_topology") or "tp1_dp1"),
-        )
-        boundary_kind = str(row.get("boundary_kind") or STANDARD_LEVEL_BOUNDARY_KINDS[level])
-        receipt_id = str(row.get("engine_receipt") or f"whitebox:{level}:{cid}")
-        regime_dims = tuple(
-            sorted((str(k), str(v)) for k, v in dict(row.get("regime_dims") or {}).items())
-        )
-        res_obj = Residual(
-            case_id=cid,
-            level=level,
-            cohort=cohort,
-            acquisition_root=root,
-            measured_ns=measured_ns,
-            predicted_ns=predicted_ns,
-            engine_receipt=receipt_id,
-            signed_error=signed,
-            absolute_percentage_error=ape_ratio,
-            status="ok",
-            boundary_kind=boundary_kind,
-            regime_dims=regime_dims,
-        )
-        res_dict = res_obj.to_dict()
-        res_dict["split"] = split
-        res_dict["grid_kind"] = grid_kind
-        res_dict["ape_pct"] = round(ape_pct, DISPLAY_ROUND_DIGITS)
-        residuals.append(res_dict)
-
-        if split == "train":
-            train_apes.append(ape_pct)
-            train_signed.append(signed * PERCENT_SCALE)
-        else:
-            heldout_apes.append(ape_pct)
-            heldout_signed.append(signed * PERCENT_SCALE)
-            if ape_pct >= threshold_pct:
-                failing_cliffs.append({
-                    "case_id": cid,
-                    "level": level,
-                    "operator": cohort.cohort_name,
-                    "grid_kind": grid_kind,
-                    "context_len": ctx_len,
-                    "measured_ns": measured_ns,
-                    "predicted_ns": predicted_ns,
-                    "ape_pct": round(ape_pct, DISPLAY_ROUND_DIGITS),
-                    "acquisition_root": root,
-                })
-
-    validate_disjoint_lineage(train_roots, heldout_roots, level_roots=level_roots)
-    heldout_summary = _summarize_apes(heldout_apes, heldout_signed)
-    train_summary = _summarize_apes(train_apes, train_signed)
-    passed = bool(heldout_apes) and not failing_cliffs
-    return {
-        "sku": sku,
-        "threshold_pct": threshold_pct,
-        "passed": passed,
-        "ok": passed,
-        "train_roots": sorted(train_roots),
-        "heldout_roots": sorted(heldout_roots),
-        "heldout_roots_by_level": {lvl: sorted(roots) for lvl, roots in sorted(level_roots.items())},
-        "train_summary": train_summary,
-        "heldout_summary": heldout_summary,
-        "covered_anchor_contexts": sorted(seen_anchor_ctx),
-        "covered_cliff_contexts": sorted(seen_cliff_ctx),
-        "failing_cliff_count": len(failing_cliffs),
-        "failing_cliffs": failing_cliffs,
-        "residuals": residuals,
-    }
+    return synthesize_operator_cliff_plan(params, sku=sku, campaign_id=campaign_id)
 
 
 __all__ = [
     "STANDARD_LEVEL_BOUNDARY_KINDS",
-    "STANDARD_SEQUENCE_OPERATORS",
-    "score_whitebox_observations",
+    "WhiteboxSpineRunner",
+    "score_sealed_gate_cases",
     "synthesize_operator_cliff_plan",
     "synthesize_sku_512_400k_plan",
     "validate_disjoint_lineage",

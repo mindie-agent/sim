@@ -109,70 +109,40 @@ def _render_leaf(family: str, arch_label: str, arch_id: str, abi: str, sources_b
 
 def _render_common(family: str, tile_dim: int, builder_name: str) -> str:
     return (
-        f'"""Shared work conservation, semantic obligations, and lowering for ``{family}``.\n\n'
-        f"[Role] Derive conserved work, ``SemanticWorkItem``, and\n"
-        f"  ``TensorRangeObligation`` records for ``{family}`` across Ascend ISAs.\n"
-        "[Invariants] Pure structural derivation with zero SKU-name or peak sniffing.\n"
+        f'"""Shared work conservation, semantic obligations, and TilingAxes for ``{family}``.\n\n'
+        f"[Role] Declare ``TILING_AXES``, conserved work, ``SemanticWorkItem``, and\n"
+        f"  ``TensorRangeObligation`` hooks for ``{family}`` across Ascend ISAs.\n"
+        "[Invariants] Pure structural derivation with zero SKU-name or peak sniffing;\n"
+        "  scaffold stubs raise ``NotImplementedError`` until real operator physics\n"
+        "  and tensor obligations are authored.\n"
         "[Timeouts & Locks] O(1) deterministic planning; no I/O or locks.\n"
         "[Side-Effect Policy] Returns immutable work and plan records.\n"
         '"""\n'
         "from __future__ import annotations\n\n"
-        "from mindie_sim.schema.common import dtype_bytes\n"
+        "from mindie_sim.onboarding.tiling_axes import TilingAxes\n"
         "from mindie_sim.schema.operators import OpSpec\n"
         "from mindie_sim.templates.contracts import SemanticWorkItem, TensorRangeObligation\n"
-        "from ...mechanism import OperatorPlan, Work\n"
-        "from ...results import FusedPipelineDescriptor, FusedPipelineSpec, PipelinePhase, WorkItem\n"
-        "from ...vector_pipeline import AIVTiledVectorAndGatherRecipe\n"
+        "from ...mechanism import OperatorPlan\n"
+        "from ...results import FusedPipelineDescriptor, FusedPipelineSpec\n"
         "from ..contracts import OperatorPlanningContext\n\n"
         f"FAMILY = {family!r}\n"
         f"DEFAULT_TILE_DIM = {int(tile_dim)}\n"
         f"PROFILER_BENCH_BUILDER = {builder_name!r}\n"
-        "_VECTOR_RECIPE = AIVTiledVectorAndGatherRecipe()\n\n\n"
+        "TILING_AXES = TilingAxes(\n"
+        "    tile_dims=(DEFAULT_TILE_DIM,),\n"
+        '    core_product_axes=("tokens", "batch_x_kv_heads"),\n'
+        ")\n\n\n"
         "def build_semantic_work(op: OpSpec, *, die: int = 0) -> tuple[SemanticWorkItem, ...]:\n"
-        "    elems = max(1, int(op.local_shape[0]) if op.local_shape else DEFAULT_TILE_DIM)\n"
-        "    return (\n"
-        "        SemanticWorkItem(\n"
-        '            work_id=f"{op.op_id}:vec",\n'
-        '            kind="vector_alu",\n'
-        '            dtype=str(op.dtype or "bf16"),\n'
-        "            logical_ops=elems,\n"
-        '            admitted_engines=("aiv_simd",),\n'
-        "            die=die,\n"
-        "        ),\n"
-        "    )\n\n\n"
+        "    del op, die\n"
+        f'    raise NotImplementedError("implement_{family}_semantic_work_from_upstream_abi")\n\n\n'
         "def build_tensor_obligations(\n"
         "    op: OpSpec, *, die: int = 0\n"
         ") -> tuple[tuple[TensorRangeObligation, ...], tuple[TensorRangeObligation, ...]]:\n"
-        "    elems = max(1, int(op.local_shape[0]) if op.local_shape else DEFAULT_TILE_DIM)\n"
-        '    nbytes = max(1, elems * dtype_bytes(op.dtype or "bf16"))\n'
-        "    reads = (\n"
-        '        TensorRangeObligation(die, f"{op.op_id}:in", 0, ((0, nbytes),), "hbm_cold", "owner"),\n'
-        "    )\n"
-        "    writes = (\n"
-        '        TensorRangeObligation(die, f"{op.op_id}:out", 1, ((0, nbytes),), "onchip_resident", "device"),\n'
-        "    )\n"
-        "    return reads, writes\n\n\n"
+        "    del op, die\n"
+        f'    raise NotImplementedError("implement_{family}_tensor_range_obligations")\n\n\n'
         "def build_plan(op: OpSpec, ctx: OperatorPlanningContext, abi: str, sources) -> OperatorPlan:\n"
-        "    elems = max(1, int(op.local_shape[0]) if op.local_shape else DEFAULT_TILE_DIM)\n"
-        '    nbytes = float(elems * dtype_bytes(op.dtype or "bf16"))\n'
-        '    work = Work(resources={"hbm": 2.0 * nbytes, "mte2": nbytes, "mte3": nbytes, "vector": float(elems)})\n'
-        "    spec = FusedPipelineSpec(\n"
-        "        family=FAMILY,\n"
-        "        implementation=abi,\n"
-        "        phases=(\n"
-        '            PipelinePhase("tile_load", (), (WorkItem("hbm", "bytes", nbytes, op.dtype or "bf16"),)),\n'
-        '            PipelinePhase("tile_compute", ("tile_load",), (WorkItem("vector", "op", float(elems), op.dtype or "bf16"),)),\n'
-        '            PipelinePhase("tile_store", ("tile_compute",), (WorkItem("mte3", "bytes", nbytes, op.dtype or "bf16"),)),\n'
-        "        ),\n"
-        "        sources=sources,\n"
-        "        repeats=1,\n"
-        "    )\n"
-        "    return OperatorPlan(\n"
-        "        work=work,\n"
-        "        program=_VECTOR_RECIPE.lower,\n"
-        '        metadata={"implementation": abi, "governed_family": FAMILY, "arch_id": str(ctx.compute_arch.arch_id)},\n'
-        "        pipeline_spec=spec,\n"
-        "    )\n\n\n"
+        "    del op, ctx, abi, sources\n"
+        f'    raise NotImplementedError("implement_{family}_operator_plan_lowering")\n\n\n'
         "def describe(op: OpSpec, ctx: OperatorPlanningContext, plan: OperatorPlan) -> FusedPipelineDescriptor:\n"
         "    spec = plan.pipeline_spec\n"
         "    assert isinstance(spec, FusedPipelineSpec)\n"
@@ -181,7 +151,7 @@ def _render_common(family: str, tile_dim: int, builder_name: str) -> str:
         "        member_op_ids=(op.op_id,), absorbed_source_op_ids=(), phases=spec.phases,\n"
         "        sources=spec.sources, repeats=spec.repeats,\n"
         "    )\n\n\n"
-        '__all__ = [\n    "DEFAULT_TILE_DIM", "FAMILY", "PROFILER_BENCH_BUILDER",\n'
+        '__all__ = [\n    "DEFAULT_TILE_DIM", "FAMILY", "PROFILER_BENCH_BUILDER", "TILING_AXES",\n'
         '    "build_plan", "build_semantic_work", "build_tensor_obligations", "describe",\n]\n'
     )
 
@@ -220,31 +190,32 @@ def _render_init(family: str) -> str:
     )
 
 
-def _render_template_spec(family: str, abi: str, builder_name: str, sources_block: str) -> str:
+def _render_template_spec(
+    family: str, abi: str, builder_name: str, sources_block: str, tile_dim: int
+) -> str:
     return (
         f'"""Governed template specification for ``{family}``.\n\n'
         f"Upstream-ABI: {abi}\n\n"
-        f"[Role] Declare pinned provenance, ``SemanticWorkItem``, and\n"
-        f"  ``TensorRangeObligation`` helpers for ``{family}``.\n"
-        "[Invariants] Verified SourceRef provenance; zero device contexts.\n"
+        f"[Role] Declare pinned provenance, ``TILING_AXES``, ``SemanticWorkItem``,\n"
+        f"  and ``TensorRangeObligation`` hooks for ``{family}``.\n"
+        "[Invariants] Verified SourceRef provenance; scaffold stubs raise\n"
+        "  ``NotImplementedError`` until real template lowering is authored.\n"
         "[Timeouts & Locks] Pure deterministic declarations; no locks.\n"
         "[Side-Effect Policy] Zero side effects.\n"
         '"""\n'
         "from __future__ import annotations\n\n"
+        "from mindie_sim.onboarding.tiling_axes import TilingAxes\n"
         "from mindie_sim.schema.datapath import SourceRef\n"
         "from mindie_sim.templates.contracts import SemanticWorkItem, TensorRangeObligation\n\n"
         f"UPSTREAM_ABI = {abi!r}\n"
         f"PROFILER_BENCH_BUILDER = {builder_name!r}\n"
+        f"TILING_AXES = TilingAxes(tile_dims=({int(tile_dim)},))\n"
         f"{sources_block}\n\n\n"
-        "def make_probe_obligations(byte_size: int) -> tuple[SemanticWorkItem, TensorRangeObligation]:\n"
-        "    work = SemanticWorkItem(\n"
-        f'        work_id="{family}:work", kind="vector_alu", dtype="bf16",\n'
-        '        logical_ops=max(1, byte_size), admitted_engines=("aiv_simd",),\n'
-        "    )\n"
-        "    read = TensorRangeObligation(\n"
-        f'        0, "{family}:in", 0, ((0, max(1, byte_size)),), "hbm_cold", "owner",\n'
-        "    )\n"
-        "    return work, read\n"
+        "def build_template_obligations(\n"
+        "    problem: object,\n"
+        ") -> tuple[tuple[SemanticWorkItem, ...], tuple[TensorRangeObligation, ...]]:\n"
+        "    del problem\n"
+        f'    raise NotImplementedError("implement_{family}_template_obligations")\n'
     )
 
 
@@ -275,7 +246,7 @@ def scaffold_operator(
         rel_target = f"mindie_sim/templates/{family}_spec.py"
         files_to_write: dict[Path, str] = {
             root / rel_target: _render_template_spec(
-                family, upstream_abi_arch35, builder_name, sources_block
+                family, upstream_abi_arch35, builder_name, sources_block, tile_dim
             ),
         }
     else:
@@ -304,8 +275,8 @@ def scaffold_operator(
             "from __future__ import annotations\n\n"
             "import pytest\n\n"
             "pytestmark = pytest.mark.tier0\n\n\n"
-            f"def test_{family}_conservation_contract():\n"
-            "    assert True\n"
+            f"def test_{family}_conservation_and_ag007_contract():\n"
+            f'    raise NotImplementedError("implement_{family}_conservation_and_ag007_tests")\n'
         )
 
     for path in files_to_write:

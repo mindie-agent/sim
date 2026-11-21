@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from copy import deepcopy
+import hashlib
 from pathlib import Path
 import re
 import shlex
@@ -26,6 +27,7 @@ from mindie_sim.backends import ascend_profiles
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import datapath_for_die, scale_explicit_placement_device
 from mindie_sim.schema.hardware import Hardware
+from mindie_sim.stack_registry import default_stack_registry
 
 from .contracts import (
     DEFAULT_PROBE_TIMEOUT_S,
@@ -49,11 +51,16 @@ MAX_IDLE_HBM_UTIL_PCT = 10
 DEFAULT_SSH_PORT = 22
 ARCH_PRESET_22 = "npu_arch_2201"
 ARCH_PRESET_35 = "npu_arch_3510"
-DEFAULT_TEMPLATE_SKU_BY_ARCH = {
-    (ARCH_PRESET_35, 1): "Ascend950DT_9582",
-    (ARCH_PRESET_22, 2): "Ascend910_9362",
-    (ARCH_PRESET_22, 1): "Ascend910B4",
+KNOWN_ARCH_PRESETS = frozenset({ARCH_PRESET_22, ARCH_PRESET_35})
+_ISA_TOKEN_TO_PRESET = {
+    "npu_arch_2201": ARCH_PRESET_22,
+    "arch22": ARCH_PRESET_22,
+    "dav-c220": ARCH_PRESET_22,
+    "npu_arch_3510": ARCH_PRESET_35,
+    "arch35": ARCH_PRESET_35,
+    "dav-c310": ARCH_PRESET_35,
 }
+_SAFE_SLUG_RE = re.compile(r"[^a-z0-9]+")
 
 _SIZE_UNIT_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([kmg]?i?b)?\s*$", re.IGNORECASE)
 _UNIT_MULTIPLIERS = {
@@ -104,12 +111,18 @@ def parse_platform_config_ini(ini_text: str) -> dict[str, Any]:
         digits = re.match(r"(\d+)", raw)
         return int(digits.group(1)) if digits else 0
 
-    soc_ver = _first("soc_version", "soc_name", "cube_arch", "isa_version")
-    is_arch35 = "3510" in soc_ver or "950" in soc_ver
-    arch_preset = ARCH_PRESET_35 if is_arch35 else (ARCH_PRESET_22 if soc_ver else "")
+    soc_ver = _first("soc_version", "soc_name")
+    isa_raw = _first("arch_preset", "compute_arch", "isa_version", "cube_arch", "ai_core_arch").lower()
+    arch_preset = ""
+    for token, preset in _ISA_TOKEN_TO_PRESET.items():
+        if token in isa_raw:
+            arch_preset = preset
+            break
+    ini_sha256 = hashlib.sha256(ini_text.encode("utf-8")).hexdigest() if ini_text.strip() else ""
     return {
         "soc_version": soc_ver,
         "arch_preset": arch_preset,
+        "ini_sha256": ini_sha256,
         "aic_count": _int_of("ai_core_cnt", "aic_count", "cube_core_cnt"),
         "aiv_count": _int_of("vector_core_cnt", "aiv_count", "ai_vector_core_cnt"),
         "aicore_freq_mhz": _int_of("aic_freq", "aicore_freq", "cube_freq", "ai_core_freq"),
@@ -223,28 +236,74 @@ def _ssh_exec(
         raise ModelingError(f"onboarding_ssh_failed:{exc}") from exc
 
 
-def _infer_arch_family(soc_name: str, arch_preset: str, dies_per_package: int) -> tuple[str, str]:
-    low = soc_name.lower()
-    if arch_preset == ARCH_PRESET_35 or "950" in low:
-        return ARCH_PRESET_35, "A5"
-    if "_93" in low or dies_per_package > 1:
-        return ARCH_PRESET_22, "A3"
-    return ARCH_PRESET_22, "A2"
+def _resolve_explicit_arch(
+    raw_arch_preset: str,
+    raw_architecture: str,
+) -> tuple[str, str]:
+    """Normalize explicit architecture declarations without SKU-name sniffing."""
+    preset_raw = raw_arch_preset.strip().lower()
+    arch_preset = _ISA_TOKEN_TO_PRESET.get(preset_raw, "")
+    architecture = raw_architecture.strip()
+    return arch_preset, architecture
+
+
+def _missing_scaffold_capabilities(
+    probe: SocProbeRecord,
+    base_template_sku: str,
+) -> list[str]:
+    missing: list[str] = []
+    if probe.arch_preset not in KNOWN_ARCH_PRESETS:
+        missing.append("arch_preset")
+    if not probe.architecture:
+        missing.append("architecture")
+    if probe.aic_count < 1:
+        missing.append("aic_count")
+    if probe.aiv_count < 1:
+        missing.append("aiv_count")
+    if probe.hbm_bytes < 1:
+        missing.append("hbm_bytes")
+    if probe.l2_bytes < 1:
+        missing.append("l2_bytes")
+    if probe.ub_bytes < 1:
+        missing.append("ub_bytes")
+    if not base_template_sku.strip():
+        missing.append("base_template_sku")
+    return missing
+
+
+def _derive_canonical_bindings(
+    soc_name: str,
+    arch_id: str,
+) -> dict[str, Any]:
+    slug = _SAFE_SLUG_RE.sub("_", soc_name.lower()).strip("_")
+    arch_tag = "arch35" if arch_id == ARCH_PRESET_35 else "arch22"
+    stack_names = sorted(default_stack_registry().list_stacks())
+    return {
+        "compose_sku": soc_name,
+        "primitive_table_relpath": f"data/primitives/{arch_tag}_{slug}.json",
+        "registered_stacks": stack_names,
+    }
 
 
 def _scaffold_sku_profile(
     probe: SocProbeRecord,
     all_profiles: Mapping[str, Any],
+    *,
+    base_template_sku: str,
 ) -> dict[str, Any]:
-    template_key = DEFAULT_TEMPLATE_SKU_BY_ARCH.get(
-        (probe.arch_preset, min(2, probe.dies_per_package)),
-        "Ascend910B4",
-    )
-    base = deepcopy(all_profiles[template_key])
+    if base_template_sku not in all_profiles:
+        raise ModelingError(f"silicon_template_sku_unknown:{base_template_sku}")
+    base = deepcopy(all_profiles[base_template_sku])
     dev = base["device"]
+    base_preset = str(dev.get("compute_arch", {}).get("preset") or "")
+    if base_preset != probe.arch_preset:
+        raise ModelingError(
+            f"silicon_template_arch_mismatch:template={base_template_sku}"
+            f":template_arch={base_preset}:probe_arch={probe.arch_preset}"
+        )
     base_aic = int(dev["compute_units"])
     base_aiv = int(dev["resource_units"].get("vector", base_aic * 2))
-    target_aiv = probe.aiv_count if probe.aiv_count > 0 else probe.aic_count * 2
+    target_aiv = probe.aiv_count
     dev["compute_units"] = probe.aic_count
     dev["resource_units"]["vector"] = target_aiv
     scale_explicit_placement_device(
@@ -254,8 +313,7 @@ def _scaffold_sku_profile(
         base_aic,
         base_aiv,
     )
-    if probe.hbm_bytes > 0:
-        dev["memory_bytes"] = probe.hbm_bytes
+    dev["memory_bytes"] = probe.hbm_bytes
     for pool, val in (
         ("l2", probe.l2_bytes),
         ("ub", probe.ub_bytes),
@@ -268,7 +326,7 @@ def _scaffold_sku_profile(
             dev["buffers"][pool] = val
     dev["buffer_units"]["l2"] = 1
     mem_hier = dev.get("physical_mechanisms", {}).get("memory_hierarchy")
-    if isinstance(mem_hier, dict) and probe.l2_bytes > 0:
+    if isinstance(mem_hier, dict):
         mem_hier["l2_capacity_bytes"] = probe.l2_bytes
         prov = mem_hier.get("provenance")
         if isinstance(prov, dict):
@@ -284,7 +342,7 @@ def _scaffold_sku_profile(
             "calibrated": False,
             "rate_provenance": "declared_nominal",
             "source_sku": probe.soc_name,
-            "anchor_sku": probe.soc_name,
+            "anchor_sku": base_template_sku,
             "capture_uri": probe.capture_uri,
         }
     }
@@ -360,6 +418,7 @@ def probe_soc(
     profiles_path: str | Path | None = None,
     scaffold_out: str | Path | None = None,
     allow_scaffold: bool = False,
+    base_template_sku: str = "",
     container: str = "",
     npu_id: int = 0,
     campaign_id: str = "camp-probe-soc",
@@ -436,11 +495,13 @@ def probe_soc(
     l0c_bytes = int(raw_probe.get("l0c_bytes") or ini_parsed["l0c_bytes"] or 0)
     dies_pkg = int(raw_probe.get("dies_per_package") or smi_parsed["dies_per_package"] or 1)
     ranks_node = int(raw_probe.get("ranks_per_node") or smi_parsed["ranks_per_node"] or dies_pkg)
-    arch_preset, architecture = _infer_arch_family(
-        soc_name,
+    arch_preset, architecture = _resolve_explicit_arch(
         str(raw_probe.get("arch_preset") or ini_parsed["arch_preset"] or ""),
-        dies_pkg,
+        str(raw_probe.get("architecture") or ""),
     )
+    resolved_template_sku = str(
+        base_template_sku or raw_probe.get("base_template_sku") or ""
+    ).strip()
     clean_alias = sanitize_public_alias(
         str(raw_probe.get("endpoint_alias") or endpoint_alias or soc_name),
         soc_name,
@@ -456,6 +517,7 @@ def probe_soc(
         "soc_name": soc_name,
         "arch_preset": arch_preset,
         "architecture": architecture,
+        "ini_sha256": ini_parsed["ini_sha256"],
         "aic_count": aic,
         "aiv_count": aiv,
         "aicore_freq_mhz": freq,
@@ -511,14 +573,38 @@ def probe_soc(
             "ok": ok,
             "status": "ok" if ok else "failed",
             "error": "" if ok else "silicon_profile_conflict",
+            "ini_sha256": ini_parsed["ini_sha256"],
             "probe": probe.to_dict(),
             "datapath_summary": datapath_summary,
+            "canonical_bindings": _derive_canonical_bindings(soc_name, datapath_summary["arch_id"]),
             "conflicts": [c.to_dict() for c in conflicts],
         }
         assert_sanitized_payload(result, field_name="probe_soc_result")
         return result
 
-    scaffolded = _scaffold_sku_profile(probe, all_profiles)
+    missing_caps = _missing_scaffold_capabilities(probe, resolved_template_sku)
+    if missing_caps:
+        result = {
+            "schema": SOC_PROBE_SCHEMA,
+            "stage": "probe-soc",
+            "mode": "capabilities_incomplete",
+            "sku": soc_name,
+            "ok": False,
+            "status": "failed",
+            "error": "silicon_capabilities_incomplete",
+            "missing_capabilities": missing_caps,
+            "ini_sha256": ini_parsed["ini_sha256"],
+            "probe": probe.to_dict(),
+            "conflicts": [],
+        }
+        assert_sanitized_payload(result, field_name="probe_soc_result")
+        return result
+
+    scaffolded = _scaffold_sku_profile(
+        probe,
+        all_profiles,
+        base_template_sku=resolved_template_sku,
+    )
     conflicts, datapath_summary = _validate_profile_against_probe(probe, scaffolded)
     if scaffold_out is not None:
         write_atomic_json(scaffold_out, {soc_name: scaffolded})
@@ -531,8 +617,10 @@ def probe_soc(
         "ok": can_succeed,
         "status": "scaffolded" if can_succeed else "failed",
         "error": "" if can_succeed else ("silicon_profile_conflict" if conflicts else "sku_profile_missing"),
+        "ini_sha256": ini_parsed["ini_sha256"],
         "probe": probe.to_dict(),
         "datapath_summary": datapath_summary,
+        "canonical_bindings": _derive_canonical_bindings(soc_name, datapath_summary["arch_id"]),
         "conflicts": [c.to_dict() for c in conflicts],
         "scaffold_profile": {soc_name: scaffolded},
     }

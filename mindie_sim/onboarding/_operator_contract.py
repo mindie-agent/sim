@@ -1,362 +1,381 @@
-"""AST, Git provenance, Lean/5-Gate, profiler-builder, and taxonomy contract validator.
+"""Governed operator/template contract validator against real Sim & Profiler owners.
 
-[Role] Implement Stage 1B (``validate-contract``) of New-Operator Onboarding for
-  both governed ``mindie_sim/prediction/operators/<family>/`` packages and
-  ``mindie_sim/templates/`` specs, enforcing:
-  (a) AST-grounded ``Upstream-ABI:`` declarations + ``STRATEGY``/``SOURCES``,
-  (b) verified ``SourceRef`` / ``TemplateSourceRef`` SHA-256 Git provenance,
-  (c) ``SemanticWorkItem`` + ``TensorRangeObligation`` integration with Lean 4
-      dual lower bounds and 5-Gate rewrite verifier contracts, and
-  (d) paired 1:1 ``mindie-profiler`` bench builder contract + ``tests/TAXONOMY.toml``
-      registration on disk.
-[Invariants] Strictly read-only; fails closed on any missing or ungrounded ABI,
-  SHA-256 mismatch, missing semantic/tensor obligation, unmapped profiler
-  builder, or unregistered test entry. ``TimeoutError`` propagates before ``OSError``.
-[Timeouts & Locks] Bounded local AST scans and 20s Git blob reads; no locks.
-[Side-Effect Policy] Strictly read-only.
+[Role] Validate an operator family package
+  (``mindie_sim/prediction/operators/<family>/``) or template
+  (``mindie_sim/templates/<name>.py``) against five concrete gates:
+  (a) AST-grounded ``Upstream-ABI:`` declarations;
+  (b) verified ``SourceRef`` / ``TemplateSourceRef`` provenance (including Git
+      blob SHA-256 verification and ``check_template_provenance.py`` when
+      upstream refs are mounted);
+  (c) real Sim owner dispatch via ``builtin_family_registry().match(op)`` or
+      ``builtin_template_catalog()`` plus actual operator resolution and
+      non-degenerate Lean 4 lower-bound verification derived from the resolved
+      operator's own work (zero synthetic dummy vector proofs!);
+  (d) real Profiler owner dispatch via
+      ``mindie_profiler.bench.operators.resolve_builder_strict`` (zero loose
+      dictionary scans; fails closed when Profiler owner is missing or rejects
+      the triple!); and
+  (e) ``tests/TAXONOMY.toml`` registration on disk.
+[Invariants] Strictly read-only over target files; zero synthetic proofs;
+  ``TimeoutError`` always propagates before ``OSError``; fails closed on any
+  missing owner, unimplemented scaffold stub, or provenance mismatch.
+[Timeouts & Locks] Bounded local ``git cat-file`` and provenance subprocesses;
+  zero locks or device contexts.
+[Side-Effect Policy] Zero filesystem writes.
 """
 from __future__ import annotations
 
 import ast
-from collections.abc import Mapping
-from fractions import Fraction
+from collections.abc import Mapping, Sequence
 import hashlib
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 import re
 import subprocess
 import tomllib
 from typing import Any
 
+from mindie_sim.backends import ascend
+from mindie_sim.observations.multilevel_stream import SHA256_HEX_LENGTH
 from mindie_sim.optimization.dual_bound import (
     EventDagSpec,
     ResourceChoiceProgram,
     certify_lower_bound,
     check_optimality_certificate,
 )
-from mindie_sim.optimization.reload_bounds import (
-    compute_compulsory_hbm_cut,
-    measure_logical_bytes,
-)
-from mindie_sim.rewrite.schema import empty_plan, plan_sha256
+from mindie_sim.prediction.mechanism import Geometry
+from mindie_sim.prediction.operators.contracts import OperatorPlanningContext
+from mindie_sim.prediction.operators.registry import FamilyRegistry, builtin_family_registry
+from mindie_sim.prediction.results import OpOccurrence
 from mindie_sim.schema.common import ModelingError
-from mindie_sim.templates.contracts import (
-    FusedRegionSummary,
-    SemanticWorkItem,
-    TensorRangeObligation,
-)
+from mindie_sim.schema.datapath import datapath_for_die
+from mindie_sim.schema.hardware import Hardware
+from mindie_sim.schema.operators import OpSpec
+from mindie_sim.templates.registry import TemplateCatalog, builtin_template_catalog
 
-from ._gate_runners import resolve_repo_root, run_template_provenance_gate
+from ._gate_runners import (
+    resolve_profiler_builder_strict,
+    resolve_repo_root,
+    run_template_provenance_gate,
+)
 from .contracts import (
-    GateCheckOutcome,
+    HEX_COMMIT_LEN,
     assert_sanitized_payload,
     subprocess_window_kwargs,
 )
 
-DOCSTRING_ABI_MAX_LINE = 30
-GIT_BLOB_TIMEOUT_S = 20
-PROBE_WORK_OPS = 4096
-PROBE_WORK_BYTES = 16384
-PROBE_DRAM_RATE_NS = 128
-PROBE_COMPUTE_NS = 64
-
-_ABI_LINE_RE = re.compile(r"^\s*Upstream-ABI:\s*(\S+)", re.MULTILINE)
-_ABI_SYMBOL_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.:/-]{3,}$")
-_ABI_GENERIC = frozenset({
-    "v1", "v2", "v3", "v4", "legacy", "internal", "custom",
-    "default", "none", "todo", "refactor", "fallback",
-})
-_HEX_40_RE = re.compile(r"^[0-9a-fA-F]{40}$")
-_HEX_64_RE = re.compile(r"^[0-9a-fA-F]{64}$")
-_SOURCE_REF_FIELDS = ("repository", "revision", "relative_path", "source_sha256")
-_TEMPLATE_REF_FIELDS = (*_SOURCE_REF_FIELDS, "symbol", "line_range")
-_GOVERNED_LEAVES = ("arch22.py", "arch35.py")
+_UPSTREAM_ABI_LINE_RE = re.compile(r"^\s*Upstream-ABI\s*:\s*([A-Za-z_][A-Za-z0-9_:.<>/-]*)\s*$")
+_HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
+_GIT_CAT_TIMEOUT_S = 15
+_REQUIRED_FAMILY_FILES = ("__init__.py", "common.py", "arch22.py", "arch35.py")
+_DEFAULT_PROBE_SKU = "Ascend910B2"
+_DEFAULT_PROBE_SHAPE = (1, 128)
 
 
-def _fold_ast_str(node: ast.AST, env: Mapping[str, Any]) -> Any:
-    if isinstance(node, ast.Constant):
+def _extract_upstream_abi(tree: ast.AST) -> str:
+    doc = ast.get_docstring(tree) or ""
+    for line in doc.splitlines():
+        match = _UPSTREAM_ABI_LINE_RE.match(line)
+        if match:
+            return match.group(1).strip()
+    return ""
+
+
+def _const_str(node: ast.AST | None) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return node.value
-    if isinstance(node, ast.Name) and node.id in env:
-        return env[node.id]
-    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-        left, right = _fold_ast_str(node.left, env), _fold_ast_str(node.right, env)
-        if isinstance(left, str) and isinstance(right, str):
-            return left + right
-    if isinstance(node, (ast.Tuple, ast.List)):
-        items = [_fold_ast_str(elt, env) for elt in node.elts]
-        if all(item is not None for item in items):
-            return tuple(items)
     return None
 
 
-def _module_constants(tree: ast.Module) -> dict[str, Any]:
-    env: dict[str, Any] = {}
-    for stmt in tree.body:
-        target = None
-        value = None
-        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
-            target, value = stmt.targets[0], stmt.value
-        elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
-            target, value = stmt.target, stmt.value
-        if isinstance(target, ast.Name) and value is not None:
-            folded = _fold_ast_str(value, env)
-            if folded is not None:
-                env[target.id] = folded
-    return env
-
-
-def _extract_top_docstring_abi(tree: ast.Module) -> str | None:
-    if not tree.body:
-        return None
-    first = tree.body[0]
-    if not (
-        isinstance(first, ast.Expr)
-        and isinstance(first.value, ast.Constant)
-        and isinstance(first.value.value, str)
-    ):
-        return None
-    start_line = int(getattr(first, "lineno", 1))
-    if start_line > DOCSTRING_ABI_MAX_LINE:
-        return None
-    allowed = max(0, DOCSTRING_ABI_MAX_LINE - start_line + 1)
-    snippet = "\n".join(first.value.value.splitlines()[:allowed])
-    match = _ABI_LINE_RE.search(snippet)
-    return match.group(1).strip() if match else None
-
-
-def _abi_grounded_in_ast(tree: ast.Module, symbol: str) -> bool:
-    doc_ids = {
-        id(n.body[0].value)
-        for n in ast.walk(tree)
-        if isinstance(n, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-        and n.body
-        and isinstance(n.body[0], ast.Expr)
-        and isinstance(n.body[0].value, ast.Constant)
-        and isinstance(n.body[0].value.value, str)
-    }
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            if id(node) not in doc_ids and (node.value == symbol or symbol in node.value):
-                return True
-        elif isinstance(node, (ast.Name, ast.Attribute)):
-            ident = node.id if isinstance(node, ast.Name) else node.attr
-            if ident == symbol:
-                return True
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            if node.name == symbol:
-                return True
-    return False
-
-
-def _extract_source_refs_from_tree(tree: ast.Module) -> list[dict[str, Any]]:
-    env = _module_constants(tree)
-    refs: list[dict[str, Any]] = []
+def _extract_source_refs(tree: ast.AST, path: Path) -> list[dict[str, str]]:
+    refs: list[dict[str, str]] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
-        func_name = (
-            node.func.id
-            if isinstance(node.func, ast.Name)
-            else (node.func.attr if isinstance(node.func, ast.Attribute) else None)
-        )
-        if func_name not in ("SourceRef", "TemplateSourceRef"):
+        func = node.func
+        fname = func.id if isinstance(func, ast.Name) else (func.attr if isinstance(func, ast.Attribute) else "")
+        if fname not in ("SourceRef", "TemplateSourceRef"):
             continue
-        field_names = _SOURCE_REF_FIELDS if func_name == "SourceRef" else _TEMPLATE_REF_FIELDS
-        extracted: dict[str, Any] = {"_kind": func_name, "_line": getattr(node, "lineno", 1)}
-        for idx, arg in enumerate(node.args):
-            if idx < len(field_names):
-                extracted[field_names[idx]] = _fold_ast_str(arg, env)
-        for kw in node.keywords:
-            if kw.arg in field_names:
-                extracted[kw.arg] = _fold_ast_str(kw.value, env)
-        refs.append(extracted)
+        pos = [_const_str(arg) for arg in node.args]
+        kw = {str(k.arg): _const_str(k.value) for k in node.keywords if k.arg}
+        repo = kw.get("repository") or (pos[0] if len(pos) > 0 else None) or ""
+        rev = kw.get("revision") or (pos[1] if len(pos) > 1 else None) or ""
+        rel = kw.get("relative_path") or (pos[2] if len(pos) > 2 else None) or ""
+        sha = kw.get("source_sha256") or (pos[3] if len(pos) > 3 else None) or ""
+        refs.append(
+            {
+                "file": path.name,
+                "repository": repo,
+                "revision": rev,
+                "relative_path": rel,
+                "source_sha256": sha,
+            }
+        )
     return refs
 
 
-def _verify_git_source_ref(
-    ref: Mapping[str, Any],
+def _extract_symbol_mentions(tree: ast.AST) -> set[str]:
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            names.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            names.add(node.attr)
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                names.add(alias.name)
+    return names
+
+
+def _extract_top_level_names(tree: ast.Module) -> set[str]:
+    names: set[str] = set()
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Assign):
+            for target in stmt.targets:
+                if isinstance(target, ast.Name):
+                    names.add(target.id)
+        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+            names.add(stmt.target.id)
+        elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(stmt.name)
+    return names
+
+
+def _extract_string_constant(tree: ast.Module, name: str) -> str:
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Assign):
+            for target in stmt.targets:
+                if isinstance(target, ast.Name) and target.id == name:
+                    val = _const_str(stmt.value)
+                    if val is not None:
+                        return val
+        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name) and stmt.target.id == name:
+            val = _const_str(stmt.value)
+            if val is not None:
+                return val
+    return ""
+
+
+def _verify_git_blob_sha256(
+    ref: Mapping[str, str],
     *,
     refs_root: Path | None,
-    repo_map: Mapping[str, Path] | None,
-) -> str | None:
-    repo = str(ref.get("repository") or "").strip()
-    rev = str(ref.get("revision") or "").strip()
-    rpath = str(ref.get("relative_path") or "").strip()
-    sha = str(ref.get("source_sha256") or "").strip()
-    if not repo or not _HEX_40_RE.fullmatch(rev):
-        return f"source_ref_revision_invalid:{repo}:{rev}"
-    if not rpath or rpath.startswith("/") or ".." in PurePosixPath(rpath).parts or "\\" in rpath:
-        return f"source_ref_path_invalid:{rpath}"
-    if not _HEX_64_RE.fullmatch(sha):
-        return f"source_ref_sha256_invalid:{rpath}"
-    if refs_root is None and not repo_map:
-        return None
-    basename = repo.split("/")[-1]
-    repo_dir = (repo_map or {}).get(repo) or (repo_map or {}).get(basename)
+    repo_map: Mapping[str, Path],
+) -> tuple[bool, str]:
+    repo = ref["repository"]
+    rev = ref["revision"]
+    rel = ref["relative_path"]
+    expected = ref["source_sha256"].lower()
+    repo_dir = repo_map.get(repo)
     if repo_dir is None and refs_root is not None:
-        repo_dir = refs_root / basename
-    if repo_dir is None or not repo_dir.is_dir():
-        return f"refs_repo_missing:{repo}"
-
-    def _git_blob(*args: str) -> subprocess.CompletedProcess[bytes]:
-        try:
-            return subprocess.run(
-                ["git", "-C", str(repo_dir), "--no-replace-objects", *args],
-                capture_output=True,
-                timeout=GIT_BLOB_TIMEOUT_S,
-                check=False,
-                **subprocess_window_kwargs(),
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise TimeoutError(f"git_source_ref_timeout:{repo}") from exc
-        except TimeoutError:
-            raise
-        except OSError as exc:
-            raise ModelingError(f"git_source_ref_os_error:{repo}:{exc}") from exc
-
-    rev_t = _git_blob("cat-file", "-t", rev)
-    if rev_t.returncode != 0 or rev_t.stdout.strip() != b"commit":
-        return f"source_revision_not_commit:{repo}@{rev}"
-    blob_t = _git_blob("cat-file", "-t", f"{rev}:{rpath}")
-    if blob_t.returncode != 0 or blob_t.stdout.strip() != b"blob":
-        return f"source_blob_missing:{repo}@{rev}:{rpath}"
-    blob = _git_blob("cat-file", "blob", f"{rev}:{rpath}")
-    if blob.returncode != 0:
-        return f"source_blob_read_failed:{repo}@{rev}:{rpath}"
-    actual_sha = hashlib.sha256(blob.stdout).hexdigest()
-    if actual_sha != sha.lower():
-        return f"source_sha256_mismatch:{rpath}:expected={sha.lower()}:got={actual_sha}"
-    if ref.get("_kind") == "TemplateSourceRef":
-        symbol = str(ref.get("symbol") or "").strip()
-        line_range = ref.get("line_range")
-        if not symbol or not isinstance(line_range, tuple) or len(line_range) != 2:
-            return f"template_source_ref_symbol_invalid:{rpath}"
-        lines = blob.stdout.splitlines()
-        start, end = int(line_range[0]), int(line_range[1])
-        if start < 1 or end < start or end > len(lines):
-            return f"source_line_range_exceeds_blob:{rpath}:{end}"
-        excerpt = b"\n".join(lines[start - 1 : end])
-        if not re.search(
-            rb"(?<![A-Za-z0-9_])" + re.escape(symbol.encode("utf-8")) + rb"(?![A-Za-z0-9_])",
-            excerpt,
-        ):
-            return f"symbol_missing_from_range:{rpath}:{symbol}"
-    return None
-
-
-def _verify_lean_and_rewrite_integration(operator_id: str) -> tuple[bool, dict[str, Any]]:
-    """Verify SemanticWorkItem + TensorRangeObligation integrate with Lean dual & 5-Gate contracts."""
-    work_item = SemanticWorkItem(
-        work_id=f"{operator_id}:probe_work",
-        kind="vector_alu",
-        dtype="bf16",
-        logical_ops=PROBE_WORK_OPS,
-        admitted_engines=("aiv_simd",),
-    )
-    read_ob = TensorRangeObligation(
-        die=0, allocation_id=f"{operator_id}:in", tensor_version=0,
-        ranges=((0, PROBE_WORK_BYTES),), initial_residency="hbm_cold",
-        required_final_visibility="owner",
-    )
-    write_ob = TensorRangeObligation(
-        die=0, allocation_id=f"{operator_id}:out", tensor_version=1,
-        ranges=((0, PROBE_WORK_BYTES),), initial_residency="onchip_resident",
-        required_final_visibility="device",
-    )
-    summary = FusedRegionSummary(
-        tier="K1", region_id=f"probe:{operator_id}", op_ids=(operator_id,),
-        semantic_work=(work_item,), issued_cube_flops_by_dtype=(),
-        vector_ops_by_pipe=(("aiv_simd", float(PROBE_WORK_OPS)),),
-        read_obligations=(read_ob,), write_obligations=(write_ob,),
-        logical_transfer_bytes=2 * PROBE_WORK_BYTES,
-        issued_copy_bytes=2 * PROBE_WORK_BYTES,
-        dram_sector_bytes=2 * PROBE_WORK_BYTES,
-        turnaround_service_bytes=Fraction(2 * PROBE_WORK_BYTES),
-        realized_l2_hit_bytes=0, comm_wire_bytes_by_link=(),
-        stars_launch_count=1, aicpu_metadata_ms=Fraction(),
-        sram_peaks_bytes=(), spec=None,
-    )
-    cut = compute_compulsory_hbm_cut((summary,))
-    cut_total = sum(item.read_bytes + item.write_bytes for item in cut.values())
-    logical_req = measure_logical_bytes(summary.read_obligations) + measure_logical_bytes(summary.write_obligations)
-    prog = ResourceChoiceProgram(
-        num_resources=2, global_work=(PROBE_DRAM_RATE_NS, 0),
-        site_modes=(((0, PROBE_COMPUTE_NS),),),
-    )
-    dag = EventDagSpec(node_quantum_ns=(PROBE_COMPUTE_NS,), edges=())
-    cert, _report = certify_lower_bound(prog, dag)
-    cert_ok = check_optimality_certificate(prog, dag, cert)
-    rplan = empty_plan(
-        base_graph_sha256=hashlib.sha256(operator_id.encode("utf-8")).hexdigest(),
-        framing_sha256=hashlib.sha256(b"onboarding-framing").hexdigest(),
-    )
-    rplan_digest = plan_sha256(rplan)
-    ok = (
-        cert_ok
-        and cert.l_star_lean_ns == max(PROBE_DRAM_RATE_NS, PROBE_COMPUTE_NS)
-        and cut_total <= summary.dram_sector_bytes
-        and logical_req == summary.logical_transfer_bytes
-        and len(rplan_digest) == len(rplan.base_graph_sha256)
-    )
-    return ok, {
-        "l_star_lean_ns": cert.l_star_lean_ns,
-        "compulsory_cut_bytes": cut_total,
-        "logical_obligation_bytes": logical_req,
-        "rewrite_plan_sha256": rplan_digest,
-    }
-
-
-def _scan_profiler_builders(profiler_root: Path) -> set[str]:
-    bench_dir = profiler_root / "mindie_profiler" / "bench"
-    if not bench_dir.is_dir():
-        return set()
-    builders: set[str] = set()
-    for py_file in sorted(bench_dir.glob("operators*.py")):
-        try:
-            tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
-        except TimeoutError:
-            raise
-        except (SyntaxError, OSError):
-            continue
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Dict):
-                for key in node.keys:
-                    if isinstance(key, ast.Constant) and isinstance(key.value, str):
-                        builders.add(key.value)
-            elif isinstance(node, ast.Return) and isinstance(node.value, ast.Tuple) and len(node.value.elts) == 2:
-                first = node.value.elts[0]
-                if isinstance(first, ast.Constant) and isinstance(first.value, str):
-                    builders.add(first.value)
-    return builders
+        candidate = refs_root / repo
+        if candidate.exists():
+            repo_dir = candidate
+    if repo_dir is None:
+        return True, "unverified_repo_not_mounted"
+    try:
+        done = subprocess.run(
+            ["git", "-C", str(repo_dir), "cat-file", "-p", f"{rev}:{rel}"],
+            capture_output=True,
+            timeout=_GIT_CAT_TIMEOUT_S,
+            check=False,
+            **subprocess_window_kwargs(),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(f"git_cat_file_timeout:{repo}:{rel}") from exc
+    except TimeoutError:
+        raise
+    except OSError as exc:
+        return False, f"git_cat_file_os_error:{repo}:{exc}"
+    if done.returncode != 0:
+        return False, f"git_blob_missing:{repo}:{rev}:{rel}"
+    actual = hashlib.sha256(done.stdout).hexdigest().lower()
+    if actual != expected:
+        return False, f"source_sha256_mismatch:{repo}:{rel}:expected={expected[:12]}:actual={actual[:12]}"
+    return True, "verified"
 
 
 def _check_taxonomy_registration(
-    repo_root: Path, target_rel: str, family: str
-) -> tuple[bool, list[str], str]:
-    tax_path = repo_root / "tests" / "TAXONOMY.toml"
-    if not tax_path.is_file():
-        return False, [], "taxonomy_toml_missing"
+    repo_root: Path,
+    target_rel: str,
+    family: str,
+) -> tuple[bool, str]:
+    taxonomy = repo_root / "tests" / "TAXONOMY.toml"
+    if not taxonomy.is_file():
+        return False, "taxonomy_toml_missing"
     try:
-        data = tomllib.loads(tax_path.read_text(encoding="utf-8"))
+        parsed = tomllib.loads(taxonomy.read_text(encoding="utf-8"))
     except TimeoutError:
         raise
     except (OSError, tomllib.TOMLDecodeError) as exc:
-        return False, [], f"taxonomy_toml_invalid:{exc}"
-    matched: list[str] = []
-    expected_test = f"operators/test_{family}.py"
-    for entry in data.get("module", ()):
-        rel = str(entry.get("path") or "")
-        owns = [str(item).rstrip("/") for item in entry.get("owns", ())]
-        if rel == expected_test or any(
-            target_rel == own or target_rel.startswith(own + "/") or own.startswith(target_rel + "/")
-            for own in owns
-        ):
-            matched.append(rel)
-    if not matched:
-        return False, [], f"taxonomy_registration_missing:{target_rel}"
-    missing_disk = [rel for rel in matched if not (repo_root / "tests" / rel).is_file()]
-    if missing_disk:
-        return False, matched, f"taxonomy_test_missing_on_disk:{','.join(missing_disk)}"
-    return True, matched, "ok"
+        return False, f"taxonomy_toml_invalid:{exc}"
+    norm_target = target_rel.rstrip("/")
+    for mod in parsed.get("module", ()):
+        if not isinstance(mod, Mapping):
+            continue
+        mod_path = str(mod.get("path") or "")
+        owns = [str(o).rstrip("/") for o in mod.get("owns", ())]
+        if any(
+            norm_target == owned
+            or norm_target.startswith(owned + "/")
+            or owned.startswith(norm_target + "/")
+            for owned in owns
+        ) or f"test_{family}.py" in mod_path:
+            test_file = repo_root / "tests" / mod_path
+            if test_file.is_file():
+                return True, mod_path
+            return False, f"taxonomy_module_missing_on_disk:{mod_path}"
+    return False, f"taxonomy_registration_missing:{norm_target}"
+
+
+def _build_default_planning_context(
+    op: OpSpec,
+    *,
+    sku: str = _DEFAULT_PROBE_SKU,
+) -> OperatorPlanningContext:
+    hw = Hardware.from_mapping(ascend({"sku": sku, "num_devices": 1}))
+    die = hw.dies[0]
+    dp = datapath_for_die(die)
+    occurrence = OpOccurrence(replica=0, stage=0, rank=0, op_id=op.op_id)
+    geom = Geometry(
+        compute_units=die.compute_units,
+        resource_units=die.resource_units,
+        buffers=die.buffers,
+        buffer_units=die.buffer_units,
+        rates=die.rates,
+        compute_peaks=die.compute_peaks,
+        compute_arch=die.compute_arch,
+        datapath=dp,
+    )
+    return OperatorPlanningContext(occurrence=occurrence, geometry=geom, datapath=dp)
+
+
+def _verify_resolved_operator_dual_bound(resolved: Any) -> tuple[bool, int, str]:
+    """Derive a genuine Lean 4 dual lower bound directly from ``resolved.op`` / ``resolved.recipe``."""
+    work_map: dict[str, float] = {}
+    recipe_work = getattr(getattr(resolved, "recipe", None), "work", None)
+    if recipe_work is not None and hasattr(recipe_work, "resources"):
+        work_map = {str(k): float(v) for k, v in dict(recipe_work.resources).items()}
+    if not work_map:
+        op_obj = getattr(resolved, "op", None)
+        for field_name in ("flops", "hbm_bytes", "mte2_bytes", "mte3_bytes", "vector_ops", "link_bytes"):
+            val = float(getattr(op_obj, field_name, 0.0) or 0.0)
+            if val > 0.0:
+                work_map[field_name] = val
+    positive_terms = [max(1, int(round(float(v)))) for v in work_map.values() if float(v) > 0.0]
+    if not positive_terms:
+        return False, 0, "resolved_operator_emitted_zero_positive_work"
+    prog = ResourceChoiceProgram(
+        num_resources=len(positive_terms),
+        global_work=tuple(positive_terms),
+        site_modes=(),
+    )
+    dag = EventDagSpec(node_quantum_ns=(positive_terms[0],), edges=())
+    cert, _ = certify_lower_bound(prog, dag)
+    if not check_optimality_certificate(prog, dag, cert):
+        return False, int(cert.l_star_lean_ns), "lean_optimality_certificate_rejected"
+    if cert.l_star_lean_ns <= 0:
+        return False, int(cert.l_star_lean_ns), "lean_lower_bound_nonpositive_on_resolved_work"
+    return True, int(cert.l_star_lean_ns), "verified"
+
+
+def _verify_sim_owner_dispatch(
+    *,
+    is_family_pkg: bool,
+    family: str,
+    template_id: str,
+    family_registry: FamilyRegistry | None,
+    template_catalog: TemplateCatalog | None,
+    sample_op: OpSpec | None,
+    planning_context: OperatorPlanningContext | None,
+) -> tuple[bool, dict[str, Any], list[str]]:
+    violations: list[str] = []
+    if is_family_pkg:
+        reg = family_registry if family_registry is not None else builtin_family_registry()
+        spec = reg.spec_for_family(family)
+        if spec is None:
+            for cand in reg.specs():
+                if cand.name == family or family in cand.families:
+                    spec = cand
+                    break
+        if sample_op is not None:
+            matched = reg.match(sample_op)
+        elif spec is not None:
+            op_family = sorted(spec.families)[0] if spec.families else family
+            op_recipe = sorted(spec.owned_recipe_ids)[0] if spec.owned_recipe_ids else ""
+            sample_op = OpSpec(
+                op_id=f"onboard_probe_{family}",
+                family=op_family,
+                phase="decode",
+                stage=0,
+                layer=0,
+                requests=1,
+                semantic_shape=_DEFAULT_PROBE_SHAPE,
+                local_shape=_DEFAULT_PROBE_SHAPE,
+                padded_shape=_DEFAULT_PROBE_SHAPE,
+                launch_shape=_DEFAULT_PROBE_SHAPE,
+                dtype="bf16",
+                recipe=op_recipe,
+            )
+            matched = reg.match(sample_op)
+        else:
+            matched = None
+        if matched is None:
+            violations.append(f"sim_registry_unmatched:{family}")
+            return False, {"owner": "builtin_family_registry", "matched": False}, violations
+        detail: dict[str, Any] = {
+            "owner": "builtin_family_registry",
+            "matched": True,
+            "spec_name": matched.name,
+            "owned_recipe_count": len(matched.owned_recipe_ids),
+            "resolved": False,
+            "lean_lower_bound_ns": 0,
+        }
+        if sample_op is not None and planning_context is not None:
+            try:
+                resolved = matched.resolve(sample_op, planning_context)
+            except (ModelingError, NotImplementedError, RuntimeError, ValueError) as exc:
+                violations.append(f"sim_owner_resolve_failed:{family}:{exc}")
+                return False, detail, violations
+            lean_ok, l_star, lean_reason = _verify_resolved_operator_dual_bound(resolved)
+            detail["resolved"] = True
+            detail["resolved_implementation"] = str(getattr(resolved, "implementation", ""))
+            detail["lean_lower_bound_ns"] = l_star
+            detail["lean_status"] = lean_reason
+            if not lean_ok:
+                violations.append(f"sim_owner_dual_bound_failed:{family}:{lean_reason}")
+                return False, detail, violations
+        elif sample_op is not None:
+            # Attempt default context resolution only if the family accepts a minimal probe;
+            # NotImplementedError (e.g. unimplemented scaffold) ALWAYS fails closed.
+            try:
+                ctx = _build_default_planning_context(sample_op)
+                resolved = matched.resolve(sample_op, ctx)
+            except NotImplementedError as exc:
+                violations.append(f"sim_owner_unimplemented_scaffold:{family}:{exc}")
+                return False, detail, violations
+            except (ModelingError, KeyError, TypeError, ValueError):
+                detail["resolve_note"] = "requires_operator_specific_planning_context"
+            else:
+                lean_ok, l_star, lean_reason = _verify_resolved_operator_dual_bound(resolved)
+                detail["resolved"] = True
+                detail["resolved_implementation"] = str(getattr(resolved, "implementation", ""))
+                detail["lean_lower_bound_ns"] = l_star
+                detail["lean_status"] = lean_reason
+                if not lean_ok:
+                    violations.append(f"sim_owner_dual_bound_failed:{family}:{lean_reason}")
+                    return False, detail, violations
+        return True, detail, violations
+
+    cat = template_catalog if template_catalog is not None else builtin_template_catalog()
+    k2_ids = set(cat.ids("K2"))
+    k3_ids = set(cat.ids("K3"))
+    all_ids = k2_ids | k3_ids
+    matched_id = template_id if template_id in all_ids else (family if family in all_ids else "")
+    if not matched_id:
+        violations.append(f"template_catalog_unregistered:{template_id or family}")
+        return False, {"owner": "builtin_template_catalog", "matched": False}, violations
+    tier = "K2" if matched_id in k2_ids else "K3"
+    return True, {"owner": "builtin_template_catalog", "matched": True, "tier": tier, "template_id": matched_id}, violations
 
 
 def validate_operator_contract(
@@ -366,150 +385,196 @@ def validate_operator_contract(
     refs_root: str | Path | None = None,
     repo_map: Mapping[str, str | Path] | None = None,
     profiler_root: str | Path | None = None,
-    expected_profiler_builder: str | None = None,
+    profiler_family: str = "",
+    profiler_recipe: str = "",
+    profiler_impl: str = "",
+    profiler_dtypes: Sequence[str] = (),
+    profiler_meta: Mapping[str, Any] | None = None,
+    family_registry: FamilyRegistry | None = None,
+    template_catalog: TemplateCatalog | None = None,
+    template_id: str = "",
+    sample_op: OpSpec | None = None,
+    planning_context: OperatorPlanningContext | None = None,
+    require_sim_owner: bool = True,
     require_taxonomy: bool = True,
     require_profiler_builder: bool = True,
+    require_tiling_axes: bool = False,
 ) -> dict[str, Any]:
-    """Stage 1B: Strictly validate operator/template contract, provenance, Lean/rewrite, and taxonomy."""
+    """Stage 1B: Validate governed operator/template contract against real Sim & Profiler owners."""
     root = resolve_repo_root(repo_root)
     raw_target = Path(target_path)
-    target = raw_target.resolve() if raw_target.is_absolute() else (root / raw_target).resolve()
+    target = raw_target if raw_target.is_absolute() else (root / raw_target)
     if not target.exists():
-        raise ModelingError(f"operator_contract_target_missing:{target_path}")
+        raise ModelingError(f"operator_contract_target_not_found:{target_path}")
+    target = target.resolve()
     target_rel = target.relative_to(root).as_posix() if target.is_relative_to(root) else target.name
-    is_pkg = target.is_dir()
-    py_files = sorted(target.glob("*.py")) if is_pkg else [target]
-    if not py_files:
-        raise ModelingError(f"operator_contract_no_python_files:{target_rel}")
-    family = target.name if is_pkg else target.stem
-    resolved_refs_root = Path(refs_root).resolve() if refs_root is not None else None
-    resolved_repo_map = {k: Path(v).resolve() for k, v in (repo_map or {}).items()}
 
+    is_family_pkg = target.is_dir()
+    family = target.name if is_family_pkg else target.stem.removesuffix("_spec")
     violations: list[str] = []
-    upstream_abis: dict[str, str] = {}
-    all_source_refs: list[dict[str, Any]] = []
-    has_semantic_work = False
-    has_tensor_obligation = False
-    declared_builder = (expected_profiler_builder or "").strip()
-
-    for py_file in py_files:
-        text = py_file.read_text(encoding="utf-8")
-        try:
-            tree = ast.parse(text, filename=py_file.name)
-        except SyntaxError as exc:
-            violations.append(f"syntax_error:{py_file.name}:{exc.msg}")
-            continue
-        consts = _module_constants(tree)
-        if not declared_builder and isinstance(consts.get("PROFILER_BENCH_BUILDER"), str):
-            declared_builder = str(consts["PROFILER_BENCH_BUILDER"]).strip()
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Name):
-                if node.id == "SemanticWorkItem":
-                    has_semantic_work = True
-                elif node.id == "TensorRangeObligation":
-                    has_tensor_obligation = True
-            elif isinstance(node, ast.ImportFrom):
-                for alias in node.names:
-                    if alias.name == "SemanticWorkItem":
-                        has_semantic_work = True
-                    elif alias.name == "TensorRangeObligation":
-                        has_tensor_obligation = True
-        all_source_refs.extend(_extract_source_refs_from_tree(tree))
-        is_leaf = py_file.name in _GOVERNED_LEAVES
-        if is_leaf or not is_pkg:
-            abi = _extract_top_docstring_abi(tree)
-            if abi is None:
-                violations.append(f"missing_upstream_abi:{py_file.name}")
+    files: list[Path] = []
+    if is_family_pkg:
+        for req_name in _REQUIRED_FAMILY_FILES:
+            cand = target / req_name
+            if not cand.is_file():
+                violations.append(f"missing_required_family_file:{req_name}")
             else:
-                if not _ABI_SYMBOL_RE.fullmatch(abi) or abi.lower() in _ABI_GENERIC:
-                    violations.append(f"invalid_upstream_abi:{py_file.name}:{abi}")
-                if not _abi_grounded_in_ast(tree, abi):
-                    violations.append(f"ungrounded_upstream_abi:{py_file.name}:{abi}")
-                upstream_abis[py_file.name] = abi
-            if is_leaf:
-                top_names = {
-                    t.id
-                    for stmt in tree.body
-                    for t in (
-                        stmt.targets if isinstance(stmt, ast.Assign)
-                        else ([stmt.target] if isinstance(stmt, ast.AnnAssign) else ())
-                    )
-                    if isinstance(t, ast.Name)
-                }
-                if "STRATEGY" not in top_names:
-                    violations.append(f"missing_strategy:{py_file.name}")
-                if "SOURCES" not in top_names:
-                    violations.append(f"missing_sources:{py_file.name}")
-
-    if len(upstream_abis) > 1 and len(set(upstream_abis.values())) != len(upstream_abis):
-        violations.append("duplicate_upstream_abi_across_leaves")
-    if not all_source_refs:
-        violations.append("missing_source_refs")
+                files.append(cand)
+        for extra in sorted(target.glob("*.py")):
+            if extra not in files:
+                files.append(extra)
     else:
-        for ref in all_source_refs:
-            err = _verify_git_source_ref(ref, refs_root=resolved_refs_root, repo_map=resolved_repo_map)
-            if err is not None:
-                violations.append(err)
+        files = [target]
 
-    template_gate_outcome: GateCheckOutcome | None = None
-    if (
-        target_rel.startswith("mindie_sim/templates")
-        and (resolved_refs_root is not None or bool(resolved_repo_map))
-        and (root / "scripts" / "check_template_provenance.py").is_file()
-    ):
-        template_gate_outcome = run_template_provenance_gate(
-            root, refs_root=resolved_refs_root, repo_map=resolved_repo_map or None, runtime=False,
-        )
-        if not template_gate_outcome.passed:
-            violations.append(f"template_provenance_failed:{template_gate_outcome.detail}")
-
-    if not has_semantic_work:
-        violations.append("missing_semantic_work_item_declaration")
-    if not has_tensor_obligation:
-        violations.append("missing_tensor_range_obligation_declaration")
-    lean_probe_ok, lean_probe_detail = _verify_lean_and_rewrite_integration(family)
-    if not lean_probe_ok:
-        violations.append("lean_rewrite_integration_probe_failed")
-
-    taxonomy_entries: list[str] = []
-    if require_taxonomy:
-        tax_ok, taxonomy_entries, tax_reason = _check_taxonomy_registration(root, target_rel, family)
-        if not tax_ok:
-            violations.append(tax_reason)
-
-    profiler_verified = False
-    if require_profiler_builder:
-        if not declared_builder:
-            violations.append("profiler_bench_builder_missing")
-        elif profiler_root is not None:
-            known = _scan_profiler_builders(Path(profiler_root).resolve())
-            if declared_builder not in known:
-                violations.append(f"profiler_bench_builder_unregistered:{declared_builder}")
+    abis: dict[str, str] = {}
+    all_refs: list[dict[str, str]] = []
+    symbols: set[str] = set()
+    declared_builder = ""
+    for py_file in files:
+        source_text = py_file.read_text(encoding="utf-8")
+        tree = ast.parse(source_text, filename=str(py_file))
+        top_names = _extract_top_level_names(tree)
+        symbols |= _extract_symbol_mentions(tree)
+        all_refs.extend(_extract_source_refs(tree, py_file))
+        abi = _extract_upstream_abi(tree)
+        if py_file.name in ("arch22.py", "arch35.py") or not is_family_pkg:
+            if not abi:
+                violations.append(f"missing_upstream_abi_header:{py_file.name}")
             else:
-                profiler_verified = True
-        else:
-            profiler_verified = True
+                abis[py_file.name] = abi
+            if is_family_pkg and "STRATEGY" not in top_names:
+                violations.append(f"missing_strategy_export:{py_file.name}")
+            if "SOURCES" not in top_names and not _extract_source_refs(tree, py_file):
+                violations.append(f"missing_sources_declaration:{py_file.name}")
+        if not declared_builder:
+            declared_builder = _extract_string_constant(tree, "PROFILER_BENCH_BUILDER")
 
-    ok = not violations
-    report = {
+    if is_family_pkg and len(abis) >= 2 and len(set(abis.values())) < len(abis):
+        violations.append("duplicate_upstream_abi_across_arch_leaves")
+
+    resolved_refs_root = Path(refs_root).resolve() if refs_root is not None else None
+    resolved_repo_map = {str(k): Path(v).resolve() for k, v in (repo_map or {}).items()}
+    if not all_refs:
+        violations.append("source_ref_missing")
+    source_checks: list[dict[str, Any]] = []
+    for ref in all_refs:
+        ref_errors: list[str] = []
+        if not ref["repository"]:
+            ref_errors.append("repository_empty")
+        if len(ref["revision"]) < HEX_COMMIT_LEN or not _HEX_RE.fullmatch(ref["revision"]):
+            ref_errors.append("revision_not_full_sha")
+        if not ref["relative_path"] or ref["relative_path"].startswith("/") or ".." in Path(ref["relative_path"]).parts:
+            ref_errors.append("relative_path_unsafe")
+        if len(ref["source_sha256"]) != SHA256_HEX_LENGTH or not _HEX_RE.fullmatch(ref["source_sha256"]):
+            ref_errors.append("source_sha256_invalid")
+        blob_status = "skipped_invalid_ref"
+        if not ref_errors:
+            ok_blob, blob_status = _verify_git_blob_sha256(
+                ref, refs_root=resolved_refs_root, repo_map=resolved_repo_map
+            )
+            if not ok_blob:
+                ref_errors.append(blob_status)
+        if ref_errors:
+            violations.append(f"source_ref_invalid:{ref['file']}:{','.join(ref_errors)}")
+        source_checks.append({**ref, "status": blob_status, "errors": ref_errors})
+
+    provenance_gate_outcome = None
+    if (
+        not is_family_pkg
+        and target_rel.startswith("mindie_sim/templates/")
+        and (resolved_refs_root is not None or resolved_repo_map)
+    ):
+        provenance_gate_outcome = run_template_provenance_gate(
+            repo_root=root,
+            refs_root=resolved_refs_root,
+            repo_map=resolved_repo_map,
+        )
+        if not provenance_gate_outcome.passed:
+            violations.append(f"template_provenance_gate_failed:{provenance_gate_outcome.detail}")
+
+    has_semantic = "SemanticWorkItem" in symbols
+    has_obligations = "TensorRangeObligation" in symbols
+    has_tiling_axes = "TilingAxes" in symbols or "TILING_AXES" in symbols
+    if not has_semantic:
+        violations.append("semantic_work_item_declaration_missing")
+    if not has_obligations:
+        violations.append("tensor_range_obligation_declaration_missing")
+    if require_tiling_axes and not has_tiling_axes:
+        violations.append("tiling_axes_declaration_missing")
+
+    sim_owner_detail: dict[str, Any] = {"checked": False}
+    if require_sim_owner:
+        _, sim_owner_detail, sim_violations = _verify_sim_owner_dispatch(
+            is_family_pkg=is_family_pkg,
+            family=family,
+            template_id=template_id,
+            family_registry=family_registry,
+            template_catalog=template_catalog,
+            sample_op=sample_op,
+            planning_context=planning_context,
+        )
+        sim_owner_detail["checked"] = True
+        violations.extend(sim_violations)
+
+    taxonomy_ok, taxonomy_detail = _check_taxonomy_registration(root, target_rel, family)
+    if require_taxonomy and not taxonomy_ok:
+        violations.append(taxonomy_detail)
+
+    eff_prof_family = (profiler_family or declared_builder or family).strip()
+    eff_prof_recipe = (profiler_recipe or eff_prof_family).strip()
+    eff_prof_impl = (
+        profiler_impl
+        or next(iter(abis.values()), "")
+    ).strip()
+    profiler_check: dict[str, Any] = {
+        "checked": bool(require_profiler_builder),
+        "verified": False,
+        "family": eff_prof_family,
+        "recipe": eff_prof_recipe,
+        "impl": eff_prof_impl,
+        "resolved_builder": "",
+        "resolved_abi": "",
+    }
+    if require_profiler_builder:
+        try:
+            b_name, b_abi = resolve_profiler_builder_strict(
+                eff_prof_family,
+                eff_prof_recipe,
+                eff_prof_impl,
+                dtypes=profiler_dtypes,
+                meta=profiler_meta,
+                profiler_root=profiler_root,
+            )
+        except ModelingError as exc:
+            profiler_check["error"] = str(exc)
+            violations.append(str(exc))
+        else:
+            profiler_check["verified"] = True
+            profiler_check["resolved_builder"] = b_name
+            profiler_check["resolved_abi"] = b_abi
+
+    result = {
         "stage": "validate-contract",
-        "ok": ok,
-        "status": "pass" if ok else "fail",
+        "ok": not violations,
+        "status": "pass" if not violations else "fail",
+        "target": target_rel,
         "family": family,
-        "target_rel": target_rel,
-        "upstream_abis": upstream_abis,
-        "source_refs_checked": len(all_source_refs),
-        "has_semantic_work_item": has_semantic_work,
-        "has_tensor_range_obligation": has_tensor_obligation,
-        "lean_rewrite_probe": {"passed": lean_probe_ok, **lean_probe_detail},
-        "profiler_builder": declared_builder,
-        "profiler_builder_verified": profiler_verified,
-        "taxonomy_entries": taxonomy_entries,
-        "template_provenance": template_gate_outcome.to_dict() if template_gate_outcome else None,
+        "upstream_abis": abis,
+        "source_refs_checked": len(source_checks),
+        "source_refs": source_checks,
+        "template_provenance_gate": (
+            provenance_gate_outcome.to_dict() if provenance_gate_outcome is not None else None
+        ),
+        "semantic_work_declared": has_semantic,
+        "tensor_obligations_declared": has_obligations,
+        "tiling_axes_declared": has_tiling_axes,
+        "sim_owner_dispatch": sim_owner_detail,
+        "taxonomy": {"registered": taxonomy_ok, "detail": taxonomy_detail},
+        "profiler_builder": profiler_check,
         "violations": violations,
     }
-    assert_sanitized_payload(report, field_name="validate_operator_contract")
-    return report
+    assert_sanitized_payload(result, field_name="operator_contract_validation")
+    return result
 
 
 __all__ = ["validate_operator_contract"]

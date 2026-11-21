@@ -5,8 +5,9 @@
   reused by ``tools/onboard_sku.py`` and ``tools/onboard_operator.py``.
 [Invariants] Both ``mindie-sim onboard-sku`` / ``tools/onboard_sku.py`` and
   ``mindie-sim onboard-operator`` / ``tools/onboard_operator.py`` share one
-  authoritative flag grammar and return exit code ``2`` when any gate or
-  contract check fails (``ok is False``). ``TimeoutError`` propagates cleanly.
+  authoritative flag grammar and return exit code ``2`` whenever any gate,
+  contract check, ``calibrated_count == 0``, or ``plan_only`` fails
+  (``ok is False``). ``TimeoutError`` propagates cleanly.
 [Timeouts & Locks] Pure argument construction; delegates bounded execution to
   ``mindie_sim.onboarding``.
 [Side-Effect Policy] Writes only caller-requested output paths via the
@@ -46,11 +47,15 @@ from .onboarding.contracts import read_bounded_json
 ONBOARDING_COMMANDS = frozenset({"onboard-sku", "onboard-operator"})
 ONBOARDING_BOOLEAN_FLAGS = frozenset({
     "--allow-scaffold",
+    "--live-bench",
+    "--live-profiler",
     "--skip-repo-gates",
     "--overwrite",
     "--no-scaffold-test",
+    "--no-require-sim-owner",
     "--no-require-taxonomy",
     "--no-require-profiler-builder",
+    "--require-tiling-axes",
 })
 DEFAULT_TILE_DIM = 128
 CLI_FAILURE_EXIT = 2
@@ -76,13 +81,14 @@ def _configure_sku_stages(parser: argparse.ArgumentParser) -> None:
     p1.add_argument("--profiles-path", default=None)
     p1.add_argument("--scaffold-out", default=None)
     p1.add_argument("--allow-scaffold", action="store_true")
+    p1.add_argument("--base-template-sku", default="")
     p1.add_argument("--container", default="")
     p1.add_argument("--npu-id", type=int, default=0)
     p1.add_argument("--campaign-id", default="camp-probe-soc")
     p1.add_argument("--timeout-s", type=int, default=DEFAULT_PROBE_TIMEOUT_S)
     p1.add_argument("--output", "-o", default=None)
 
-    p2 = stages.add_parser("calibrate-l0-and-fabric", help="calibrate P01..P20 L0 + fabric/DMA")
+    p2 = stages.add_parser("calibrate-l0-and-fabric", help="calibrate P01..P20 L0 + fabric/DMA via canonical sealer")
     p2.add_argument("--sku", required=True)
     p2.add_argument("--endpoint-alias", default="")
     p2.add_argument("--raw-l0-json", default=None)
@@ -98,9 +104,10 @@ def _configure_sku_stages(parser: argparse.ArgumentParser) -> None:
     p2.add_argument("--outer-timeout-s", type=int, default=None)
     p2.add_argument("--live-bench", action="store_true")
     p2.add_argument("--repo-root", default=None)
+    p2.add_argument("--coordinator-bin", default="")
     p2.add_argument("--output", "-o", default=None)
 
-    p3 = stages.add_parser("validate-512-400k", help="score disjoint 512..400K Anchor + Cliff + L1/L2/L3")
+    p3 = stages.add_parser("validate-512-400k", help="score disjoint 2D 512..400K Anchor + Cliff + L1/L2/L3")
     p3.add_argument("--sku", required=True)
     p3.add_argument("--observations-json", default=None)
     p3.add_argument("--train-manifest-json", default=None)
@@ -108,9 +115,12 @@ def _configure_sku_stages(parser: argparse.ArgumentParser) -> None:
     p3.add_argument("--report-out", default=None)
     p3.add_argument("--threshold-pct", type=float, default=DEFAULT_HELDOUT_APE_THRESHOLD_PCT)
     p3.add_argument("--campaign-id", default="camp-onboard-512-400k")
+    p3.add_argument("--live-profiler", action="store_true")
+    p3.add_argument("--endpoint-alias", default="")
+    p3.add_argument("--profiler-root", default=None)
     p3.add_argument("--output", "-o", default=None)
 
-    p4 = stages.add_parser("verify-gates", help="verify multilevel, Lean, governance, orthogonality gates")
+    p4 = stages.add_parser("verify-gates", help="verify pointwise multilevel, witnessed Lean, governance, orthogonality")
     p4.add_argument("--sku", required=True)
     p4.add_argument("--validation-report-json", default=None)
     p4.add_argument("--multilevel-manifest-json", default=None)
@@ -135,7 +145,12 @@ def _configure_sku_stages(parser: argparse.ArgumentParser) -> None:
     pa.add_argument("--lean-bounds-json", default=None)
     pa.add_argument("--out-dir", default=None)
     pa.add_argument("--repo-root", default=None)
+    pa.add_argument("--profiler-root", default=None)
+    pa.add_argument("--coordinator-bin", default="")
     pa.add_argument("--allow-scaffold", action="store_true")
+    pa.add_argument("--base-template-sku", default="")
+    pa.add_argument("--live-bench", action="store_true")
+    pa.add_argument("--live-profiler", action="store_true")
     pa.add_argument("--skip-repo-gates", action="store_true")
     pa.add_argument("--orthogonality-base", default=None)
     pa.add_argument("--threshold-pct", type=float, default=DEFAULT_HELDOUT_APE_THRESHOLD_PCT)
@@ -146,7 +161,7 @@ def _configure_sku_stages(parser: argparse.ArgumentParser) -> None:
 def _configure_operator_stages(parser: argparse.ArgumentParser) -> None:
     stages = parser.add_subparsers(dest="stage", required=True)
 
-    p1a = stages.add_parser("scaffold", help="scaffold governed operator package skeleton")
+    p1a = stages.add_parser("scaffold", help="scaffold governed operator package skeleton with TilingAxes")
     p1a.add_argument("--family", required=True)
     p1a.add_argument("--upstream-abi-arch22", required=True)
     p1a.add_argument("--upstream-abi-arch35", required=True)
@@ -159,18 +174,23 @@ def _configure_operator_stages(parser: argparse.ArgumentParser) -> None:
     p1a.add_argument("--no-scaffold-test", dest="scaffold_test", action="store_false")
     p1a.add_argument("--output", "-o", default=None)
 
-    p1b = stages.add_parser("validate-contract", help="validate operator/template ABI, SourceRef, Lean, taxonomy")
+    p1b = stages.add_parser("validate-contract", help="validate ABI, SourceRef, real Sim & Profiler owners, taxonomy")
     p1b.add_argument("--target", required=True)
     p1b.add_argument("--repo-root", default=None)
     p1b.add_argument("--refs-root", default=None)
     p1b.add_argument("--repo-map", action="append", default=[])
     p1b.add_argument("--profiler-root", default=None)
-    p1b.add_argument("--expected-profiler-builder", default=None)
+    p1b.add_argument("--profiler-family", default="")
+    p1b.add_argument("--profiler-recipe", default="")
+    p1b.add_argument("--profiler-impl", default="")
+    p1b.add_argument("--template-id", default="")
+    p1b.add_argument("--no-require-sim-owner", dest="require_sim_owner", action="store_false")
     p1b.add_argument("--no-require-taxonomy", dest="require_taxonomy", action="store_false")
     p1b.add_argument("--no-require-profiler-builder", dest="require_profiler_builder", action="store_false")
+    p1b.add_argument("--require-tiling-axes", action="store_true")
     p1b.add_argument("--output", "-o", default=None)
 
-    p2 = stages.add_parser("generate-cliff-plan", help="synthesize disjoint train + off-grid cliff bench plan")
+    p2 = stages.add_parser("generate-cliff-plan", help="synthesize disjoint 2D cliff + ABI-rejection plan")
     p2.add_argument("--operator-id", required=True)
     p2.add_argument("--family", required=True)
     p2.add_argument("--sku", required=True)
@@ -185,15 +205,18 @@ def _configure_operator_stages(parser: argparse.ArgumentParser) -> None:
     p2.add_argument("--plan-out", default=None)
     p2.add_argument("--output", "-o", default=None)
 
-    p3 = stages.add_parser("bench-and-score", help="score white-box predictions against captured silicon p50")
+    p3 = stages.add_parser("bench-and-score", help="score sealed white-box Engine predictions vs silicon p50")
     p3.add_argument("--cliff-plan-json", required=True)
     p3.add_argument("--sku", required=True)
-    p3.add_argument("--captured-json", required=True)
+    p3.add_argument("--captured-json", default=None)
+    p3.add_argument("--live-profiler", action="store_true")
+    p3.add_argument("--endpoint-alias", default="")
+    p3.add_argument("--profiler-root", default=None)
     p3.add_argument("--threshold-pct", type=float, default=DEFAULT_HELDOUT_APE_THRESHOLD_PCT)
     p3.add_argument("--out-score", default=None)
     p3.add_argument("--output", "-o", default=None)
 
-    p4 = stages.add_parser("certify", help="certify operator <10% cliff APE, 0 Lean inversions, strict gates")
+    p4 = stages.add_parser("certify", help="certify pointwise <10% cliff APE, witnessed Lean, strict gates")
     p4.add_argument("--operator-id", required=True)
     p4.add_argument("--sku", required=True)
     p4.add_argument("--contract-report-json", required=True)
@@ -209,6 +232,7 @@ def _configure_operator_stages(parser: argparse.ArgumentParser) -> None:
 
     pa = stages.add_parser("run-all", help="execute all 4 operator onboarding stages end-to-end")
     pa.add_argument("--operator-id", required=True)
+    pa.add_argument("--family", default="")
     pa.add_argument("--target", required=True)
     pa.add_argument("--sku", required=True)
     pa.add_argument("--tile-dim", type=int, required=True)
@@ -216,13 +240,21 @@ def _configure_operator_stages(parser: argparse.ArgumentParser) -> None:
     pa.add_argument("--l2-bytes", type=int, required=True)
     pa.add_argument("--bytes-per-token", type=int, default=0)
     pa.add_argument("--topk-threshold", type=int, default=None)
-    pa.add_argument("--captured-json", required=True)
-    pa.add_argument("--lean-bounds-json", required=True)
+    pa.add_argument("--captured-json", default=None)
+    pa.add_argument("--lean-bounds-json", default=None)
     pa.add_argument("--repo-root", default=None)
     pa.add_argument("--refs-root", default=None)
     pa.add_argument("--repo-map", action="append", default=[])
     pa.add_argument("--profiler-root", default=None)
-    pa.add_argument("--expected-profiler-builder", default=None)
+    pa.add_argument("--profiler-family", default="")
+    pa.add_argument("--profiler-recipe", default="")
+    pa.add_argument("--profiler-impl", default="")
+    pa.add_argument("--template-id", default="")
+    pa.add_argument("--endpoint-alias", default="")
+    pa.add_argument("--live-profiler", action="store_true")
+    pa.add_argument("--no-require-sim-owner", dest="require_sim_owner", action="store_false")
+    pa.add_argument("--no-require-taxonomy", dest="require_taxonomy", action="store_false")
+    pa.add_argument("--no-require-profiler-builder", dest="require_profiler_builder", action="store_false")
     pa.add_argument("--out-dir", default=None)
     pa.add_argument("--skip-repo-gates", action="store_true")
     pa.add_argument("--orthogonality-base", default=None)
@@ -253,6 +285,7 @@ def _run_sku_stage(args: argparse.Namespace) -> dict[str, Any]:
             profiles_path=args.profiles_path,
             scaffold_out=args.scaffold_out,
             allow_scaffold=bool(args.allow_scaffold),
+            base_template_sku=args.base_template_sku,
             container=args.container,
             npu_id=args.npu_id,
             campaign_id=args.campaign_id,
@@ -275,6 +308,7 @@ def _run_sku_stage(args: argparse.Namespace) -> dict[str, Any]:
             outer_timeout_s=args.outer_timeout_s,
             live_bench=bool(args.live_bench),
             repo_root=args.repo_root,
+            coordinator_bin=args.coordinator_bin,
         )
     if stage == "validate-512-400k":
         return validate_512_400k(
@@ -285,6 +319,9 @@ def _run_sku_stage(args: argparse.Namespace) -> dict[str, Any]:
             report_out=args.report_out,
             threshold_pct=args.threshold_pct,
             campaign_id=args.campaign_id,
+            live_profiler=bool(args.live_profiler),
+            endpoint_alias=args.endpoint_alias,
+            profiler_root=args.profiler_root,
         )
     if stage == "verify-gates":
         return verify_sku_gates(
@@ -313,10 +350,15 @@ def _run_sku_stage(args: argparse.Namespace) -> dict[str, Any]:
             out_dir=args.out_dir,
             repo_root=args.repo_root,
             allow_scaffold=bool(args.allow_scaffold),
+            base_template_sku=args.base_template_sku,
             run_repo_gates=not bool(args.skip_repo_gates),
             orthogonality_base=args.orthogonality_base,
             threshold_pct=args.threshold_pct,
             cann_version=args.cann_version,
+            live_bench=bool(args.live_bench),
+            live_profiler=bool(args.live_profiler),
+            profiler_root=args.profiler_root,
+            coordinator_bin=args.coordinator_bin,
         )
     raise ValueError(f"unknown_sku_stage:{stage}")
 
@@ -345,9 +387,14 @@ def _run_operator_stage(args: argparse.Namespace) -> dict[str, Any]:
             refs_root=args.refs_root,
             repo_map=_parse_repo_map(args.repo_map) or None,
             profiler_root=args.profiler_root,
-            expected_profiler_builder=args.expected_profiler_builder,
+            profiler_family=args.profiler_family,
+            profiler_recipe=args.profiler_recipe,
+            profiler_impl=args.profiler_impl,
+            template_id=args.template_id,
+            require_sim_owner=bool(args.require_sim_owner),
             require_taxonomy=bool(args.require_taxonomy),
             require_profiler_builder=bool(args.require_profiler_builder),
+            require_tiling_axes=bool(args.require_tiling_axes),
         )
     if stage == "generate-cliff-plan":
         return generate_operator_cliff_plan(
@@ -369,6 +416,9 @@ def _run_operator_stage(args: argparse.Namespace) -> dict[str, Any]:
             cliff_plan=args.cliff_plan_json,
             sku=args.sku,
             captured_json=args.captured_json,
+            live_profiler=bool(args.live_profiler),
+            endpoint_alias=args.endpoint_alias,
+            profiler_root=args.profiler_root,
             threshold_pct=args.threshold_pct,
             out_score=args.out_score,
         )
@@ -387,8 +437,10 @@ def _run_operator_stage(args: argparse.Namespace) -> dict[str, Any]:
             diagnosis_out=args.diagnosis_out,
         )
     if stage == "run-all":
+        inferred_family = args.family or Path(args.target).stem.removesuffix("_spec")
         return run_operator_onboarding(
             operator_id=args.operator_id,
+            family=inferred_family,
             target_path=args.target,
             sku=args.sku,
             tile_dim=args.tile_dim,
@@ -402,11 +454,19 @@ def _run_operator_stage(args: argparse.Namespace) -> dict[str, Any]:
             refs_root=args.refs_root,
             repo_map=_parse_repo_map(args.repo_map) or None,
             profiler_root=args.profiler_root,
-            expected_profiler_builder=args.expected_profiler_builder,
+            profiler_family=args.profiler_family,
+            profiler_recipe=args.profiler_recipe,
+            profiler_impl=args.profiler_impl,
+            template_id=args.template_id,
+            require_sim_owner=bool(args.require_sim_owner),
+            require_taxonomy=bool(args.require_taxonomy),
+            require_profiler_builder=bool(args.require_profiler_builder),
             out_dir=args.out_dir,
             run_repo_gates=not bool(args.skip_repo_gates),
             orthogonality_base=args.orthogonality_base,
             threshold_pct=args.threshold_pct,
+            live_profiler=bool(args.live_profiler),
+            endpoint_alias=args.endpoint_alias,
         )
     raise ValueError(f"unknown_operator_stage:{stage}")
 

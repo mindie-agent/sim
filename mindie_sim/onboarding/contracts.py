@@ -17,12 +17,11 @@
 """
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
-import math
 import os
 from pathlib import Path
 import re
@@ -35,21 +34,30 @@ from mindie_sim.observations.multilevel_stream import (
     sanitize_capture_uri,
     validate_provenance_text,
 )
-from mindie_sim.optimization.dual_bound import (
-    DagEdge,
-    EventDagSpec,
-    FarkasCertificate,
-    OptimalityCertificate,
-    ResourceChoiceProgram,
-    check_optimality_certificate,
-)
 from mindie_sim.schema.common import ModelingError
+from .tiling_axes import (
+    AbiDivisibilityRule,
+    TilingAxes,
+    default_topk_abi_rule,
+    validate_abi,
+)
 
 SKU_ONBOARDING_RECEIPT_SCHEMA = "mindie-sim.sku-onboarding-receipt/1"
 OPERATOR_ONBOARDING_RECEIPT_SCHEMA = "mindie-sim.operator-onboarding-receipt/1"
-CLIFF_PLAN_SCHEMA = "mindie-sim.cliff-bench-plan/1"
+CLIFF_PLAN_SCHEMA = "mindie-sim.cliff-bench-plan/2"
 SOC_PROBE_SCHEMA = "mindie-sim.soc-probe/1"
 TRAIN_OBSERVATION_MANIFEST_SCHEMA = "mindie-sim.train-observation-manifest/1"
+VALID_CLOCK_OPERATORS: tuple[str, ...] = ("busy_union", "elapsed_span")
+DEFAULT_CLOCK_OPERATOR = "elapsed_span"
+FORBIDDEN_CALLER_PREDICTION_KEYS: frozenset[str] = frozenset(
+    {
+        "predicted_ns",
+        "predicted_ms",
+        "predicted_us",
+        "predicted_s",
+        "predicted_duration",
+    }
+)
 
 DEFAULT_HELDOUT_APE_THRESHOLD_PCT = 10.0
 ANCHOR_CONTEXT_GRID: tuple[int, ...] = (
@@ -198,21 +206,33 @@ class SocProbeRecord:
 
 @dataclass(frozen=True, slots=True)
 class CliffPointSpec:
-    """Single deterministic anchor or off-grid cliff benchmark point."""
+    """Single deterministic anchor, 2D cliff, or ABI-rejection benchmark point."""
 
     point_id: str
-    split: Literal["train", "heldout"]
-    grid_kind: Literal["anchor", "off_grid_cliff", "boundary_cliff"]
+    split: Literal["train", "heldout", "abi_rejection"]
+    grid_kind: Literal["anchor", "off_grid_cliff", "boundary_cliff", "cross_sample_2d", "abi_rejection"]
     axis: str
     value: int
     regime_tag: str
     rationale: str
+    batch_size: int = 1
+    query_tokens: int = 1
+    topk: int | None = None
+    parallel_topology: str = "tp1"
+    clock_operator: str = DEFAULT_CLOCK_OPERATOR
+    abi_expected_error: str = ""
 
     def __post_init__(self) -> None:
         if not self.point_id or not self.axis or type(self.value) is not int or self.value < 1:
             raise ModelingError(f"cliff_point_invalid:{self.point_id}:{self.axis}:{self.value}")
-        if self.split not in ("train", "heldout"):
+        if self.split not in ("train", "heldout", "abi_rejection"):
             raise ModelingError(f"cliff_point_split_invalid:{self.split}")
+        if type(self.batch_size) is not int or self.batch_size < 1:
+            raise ModelingError(f"cliff_point_batch_invalid:{self.batch_size}")
+        if type(self.query_tokens) is not int or self.query_tokens < 1:
+            raise ModelingError(f"cliff_point_query_invalid:{self.query_tokens}")
+        if self.clock_operator not in VALID_CLOCK_OPERATORS:
+            raise ModelingError(f"cliff_point_clock_operator_invalid:{self.clock_operator}")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -231,6 +251,7 @@ class OperatorCliffParameters:
     topk_threshold: int | None = None
     context_min: int = CONTEXT_MIN_TOKENS
     context_max: int = CONTEXT_MAX_TOKENS
+    tiling_axes: TilingAxes | None = None
 
     def __post_init__(self) -> None:
         if not self.operator_id or not self.family:
@@ -253,7 +274,7 @@ class OperatorCliffParameters:
 
 @dataclass(frozen=True, slots=True)
 class CliffBenchPlan:
-    """SHA-256-sealed disjoint train + off-grid cliff heldout bench plan."""
+    """SHA-256-sealed disjoint train + 2D cliff heldout + ABI-rejection bench plan."""
 
     schema: str
     plan_id: str
@@ -265,6 +286,8 @@ class CliffBenchPlan:
     train_points: tuple[CliffPointSpec, ...]
     heldout_points: tuple[CliffPointSpec, ...]
     plan_sha256: str
+    abi_rejection_points: tuple[CliffPointSpec, ...] = ()
+    tiling_axes: TilingAxes | None = None
 
     def __post_init__(self) -> None:
         if self.schema != CLIFF_PLAN_SCHEMA:
@@ -277,11 +300,22 @@ class CliffBenchPlan:
             raise ModelingError(
                 f"cliff_plan_cold_ring_too_small:{self.cold_ring_l2_multiplier}"
             )
-        train_keys = {(pt.axis, pt.value) for pt in self.train_points}
-        heldout_keys = {(pt.axis, pt.value) for pt in self.heldout_points}
+        train_keys = {
+            (pt.axis, pt.value, pt.batch_size, pt.query_tokens, pt.parallel_topology)
+            for pt in self.train_points
+        }
+        heldout_keys = {
+            (pt.axis, pt.value, pt.batch_size, pt.query_tokens, pt.parallel_topology)
+            for pt in self.heldout_points
+        }
         overlap = sorted(train_keys & heldout_keys)
         if overlap:
             raise ModelingError(f"cliff_plan_train_heldout_point_overlap:{overlap[0]}")
+        train_ctx = {pt.value for pt in self.train_points if pt.axis == "context_len"}
+        heldout_ctx = {pt.value for pt in self.heldout_points if pt.axis == "context_len"}
+        ctx_overlap = sorted(train_ctx & heldout_ctx)
+        if ctx_overlap:
+            raise ModelingError(f"cliff_plan_train_heldout_context_overlap:{ctx_overlap[0]}")
         if len(self.plan_sha256) != SHA256_HEX_LENGTH:
             raise ModelingError("cliff_plan_sha256_invalid")
 
@@ -296,6 +330,8 @@ class CliffBenchPlan:
             "cold_ring_l2_multiplier": self.cold_ring_l2_multiplier,
             "train_points": [pt.to_dict() for pt in self.train_points],
             "heldout_points": [pt.to_dict() for pt in self.heldout_points],
+            "abi_rejection_points": [pt.to_dict() for pt in self.abi_rejection_points],
+            "tiling_axes": self.tiling_axes.to_dict() if self.tiling_axes is not None else None,
             "plan_sha256": self.plan_sha256,
         }
 
@@ -498,164 +534,15 @@ def write_atomic_json(path: str | Path, payload: Mapping[str, Any]) -> None:
                 pass
 
 
-def _parse_certificate_witness(
-    row: Mapping[str, Any]
-) -> tuple[ResourceChoiceProgram, EventDagSpec, OptimalityCertificate] | None:
-    prog_raw = row.get("program")
-    dag_raw = row.get("dag")
-    cert_raw = row.get("certificate")
-    if prog_raw is None and dag_raw is None and cert_raw is None:
-        return None
-    if not (isinstance(prog_raw, Mapping) and isinstance(dag_raw, Mapping) and isinstance(cert_raw, Mapping)):
-        raise ModelingError("lean_certificate_witness_incomplete")
-    prog = ResourceChoiceProgram(
-        num_resources=int(prog_raw["num_resources"]),
-        global_work=tuple(int(v) for v in prog_raw["global_work"]),
-        site_modes=tuple(
-            tuple(tuple(int(x) for x in mode) for mode in site)
-            for site in prog_raw.get("site_modes", ())
-        ),
-    )
-    edges = tuple(
-        DagEdge(int(e["src"]), int(e["dst"]), int(e["wire_ns"]))
-        for e in dag_raw.get("edges", ())
-    )
-    dag = EventDagSpec(
-        node_quantum_ns=tuple(int(v) for v in dag_raw["node_quantum_ns"]),
-        edges=edges,
-    )
-    farkas_raw = cert_raw["farkas"]
-    farkas = FarkasCertificate(
-        scale_d=int(farkas_raw["scale_d"]),
-        lambda_num=tuple(int(v) for v in farkas_raw["lambda_num"]),
-        mu_num=tuple(int(v) for v in farkas_raw.get("mu_num", ())),
-        lower_bound_ns=int(farkas_raw["lower_bound_ns"]),
-    )
-    cert = OptimalityCertificate(
-        farkas=farkas,
-        path_edges=tuple(int(v) for v in cert_raw.get("path_edges", ())),
-        sink_node_id=int(cert_raw["sink_node_id"]),
-        l_star_lean_ns=int(cert_raw["l_star_lean_ns"]),
-    )
-    return prog, dag, cert
-
-
-def check_lean_non_inversion(
-    rows: Sequence[Mapping[str, Any]],
-    *,
-    require_non_empty: bool = True,
-    verify_certificates: bool = False,
-) -> tuple[bool, tuple[LeanBoundCheckRow, ...], tuple[str, ...]]:
-    """Enforce ``L*_Lean <= T_sim`` and ``L*_Lean <= T_silicon_p99`` with certificate verification."""
-    if not rows:
-        if require_non_empty:
-            return False, (), ("lean_bounds_missing",)
-        return True, (), ()
-    checked: list[LeanBoundCheckRow] = []
-    violations: list[str] = []
-    for idx, row in enumerate(rows):
-        cid = str(row.get("case_id") or f"case-{idx}")
-        l_star_raw = row.get("l_star_lean_ns")
-        t_sim_raw = row.get("t_sim_ns")
-        t_p99_raw = row.get("t_silicon_p99_ns")
-        if any(
-            v is None or isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(float(v))
-            for v in (l_star_raw, t_sim_raw, t_p99_raw)
-        ):
-            violations.append(f"lean_bound_fields_invalid:{cid}")
-            checked.append(LeanBoundCheckRow(cid, -1, 0, 0, False, False, True, True))
-            continue
-        l_star = int(round(float(l_star_raw)))
-        t_sim = int(round(float(t_sim_raw)))
-        t_p99 = int(round(float(t_p99_raw)))
-        cert_checked = False
-        cert_valid = l_star >= 0 and t_sim > 0 and t_p99 > 0
-        try:
-            witness = _parse_certificate_witness(row)
-        except (ModelingError, KeyError, TypeError, ValueError) as exc:
-            cert_valid = False
-            witness = None
-            violations.append(f"lean_certificate_malformed:{cid}:{exc}")
-        if witness is not None:
-            cert_checked = True
-            prog, dag, cert = witness
-            ok_witness = check_optimality_certificate(prog, dag, cert) and cert.l_star_lean_ns == l_star
-            if not ok_witness:
-                cert_valid = False
-                violations.append(f"lean_certificate_invalid:{cid}")
-        elif verify_certificates:
-            cert_valid = False
-            violations.append(f"lean_certificate_missing:{cid}")
-        sim_inv = l_star > t_sim
-        sil_inv = l_star > t_p99
-        if sim_inv:
-            violations.append(f"lean_sim_inversion:{cid}:l_star={l_star}>t_sim={t_sim}")
-        if sil_inv:
-            violations.append(f"lean_silicon_p99_inversion:{cid}:l_star={l_star}>t_p99={t_p99}")
-        if l_star < 0 or t_sim <= 0 or t_p99 <= 0:
-            violations.append(f"lean_nonpositive_timing:{cid}")
-        checked.append(
-            LeanBoundCheckRow(
-                case_id=cid, l_star_lean_ns=l_star, t_sim_ns=t_sim, t_silicon_p99_ns=t_p99,
-                certificate_checked=cert_checked, certificate_valid=cert_valid,
-                sim_inverted=sim_inv, silicon_inverted=sil_inv,
-            )
-        )
-    return not violations, tuple(checked), tuple(violations)
-
-
-def seal_onboarding_receipt(
-    *,
-    kind: Literal["sku", "operator"],
-    target_id: str,
-    sku: str,
-    gates: Sequence[GateCheckOutcome],
-    artifacts: Mapping[str, str],
-    diagnosis_report: Mapping[str, Any] | None = None,
-) -> OnboardingReceipt:
-    """Build, sanitize, and SHA-256-seal an ``OnboardingReceipt``."""
-    schema = (
-        SKU_ONBOARDING_RECEIPT_SCHEMA
-        if kind == "sku"
-        else OPERATOR_ONBOARDING_RECEIPT_SCHEMA
-    )
-    gate_tuple = tuple(gates)
-    all_passed = bool(gate_tuple) and all(g.passed for g in gate_tuple)
-    status: Literal["certified", "failed"] = "certified" if all_passed else "failed"
-    sorted_artifacts = tuple(sorted((str(k), str(v)) for k, v in artifacts.items()))
-    created_utc = utc_now_iso()
-    draft = {
-        "schema": schema,
-        "kind": kind,
-        "target_id": str(target_id),
-        "sku": str(sku),
-        "status": status,
-        "ok": all_passed,
-        "created_utc": created_utc,
-        "gates": [gate.to_dict() for gate in gate_tuple],
-        "artifacts": {k: v for k, v in sorted_artifacts},
-        "diagnosis_report": dict(diagnosis_report) if diagnosis_report else None,
-    }
-    assert_sanitized_payload(draft, field_name="onboarding_receipt")
-    digest = compute_receipt_sha256(draft)
-    return OnboardingReceipt(
-        schema=schema,
-        kind=kind,
-        target_id=str(target_id),
-        sku=str(sku),
-        status=status,
-        ok=all_passed,
-        created_utc=created_utc,
-        gates=gate_tuple,
-        artifacts=sorted_artifacts,
-        diagnosis_report=diagnosis_report,
-        receipt_sha256=digest,
-    )
-
-
 def subprocess_window_kwargs() -> dict[str, Any]:
     """Return windowless ``creationflags`` on Windows and empty dict on POSIX."""
     return {"creationflags": _SUBPROCESS_NO_WINDOW} if _SUBPROCESS_NO_WINDOW else {}
+
+
+from ._lean_and_receipts import (  # noqa: E402
+    check_lean_non_inversion,
+    seal_onboarding_receipt,
+)
 
 
 __all__ = [
@@ -665,6 +552,7 @@ __all__ = [
     "CONTEXT_MAX_TOKENS",
     "CONTEXT_MIN_TOKENS",
     "DEFAULT_CLEANUP_GRACE_S",
+    "DEFAULT_CLOCK_OPERATOR",
     "DEFAULT_DEVICE_VRAM_BUDGET_GIB",
     "DEFAULT_FABRIC_BUDGET_S",
     "DEFAULT_GATE_SUBPROCESS_TIMEOUT_S",
@@ -675,6 +563,7 @@ __all__ = [
     "DEFAULT_SPARSE_TOPK",
     "DEFAULT_SSH_CONNECT_TIMEOUT_S",
     "DISPLAY_ROUND_DIGITS",
+    "FORBIDDEN_CALLER_PREDICTION_KEYS",
     "GIB_BYTES",
     "HEX_COMMIT_LEN",
     "MAX_CALIBRATED_CV_PCT",
@@ -689,6 +578,8 @@ __all__ = [
     "SKU_ONBOARDING_RECEIPT_SCHEMA",
     "SOC_PROBE_SCHEMA",
     "TRAIN_OBSERVATION_MANIFEST_SCHEMA",
+    "VALID_CLOCK_OPERATORS",
+    "AbiDivisibilityRule",
     "CliffBenchPlan",
     "CliffPointSpec",
     "GateCheckOutcome",
@@ -697,17 +588,20 @@ __all__ = [
     "OperatorCliffParameters",
     "SiliconProfileConflict",
     "SocProbeRecord",
+    "TilingAxes",
     "TimeoutBudget",
     "assert_sanitized_payload",
     "build_capture_uri",
     "canonical_json_bytes",
     "check_lean_non_inversion",
     "compute_receipt_sha256",
+    "default_topk_abi_rule",
     "read_bounded_json",
     "sanitize_public_alias",
     "seal_onboarding_receipt",
     "subprocess_window_kwargs",
     "utc_now_iso",
+    "validate_abi",
     "verify_receipt_sha256",
     "write_atomic_json",
 ]

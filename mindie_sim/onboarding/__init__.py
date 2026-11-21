@@ -1,14 +1,17 @@
 """Standardized turnkey SKU and operator onboarding pipelines for ``mindie_sim``.
 
-[Role] Expose immutable onboarding contracts, deterministic disjoint
-  train/off-grid cliff planning, 4-stage New-SKU onboarding (``probe-soc``,
-  ``calibrate-l0-and-fabric``, ``validate-512-400k``, ``verify-gates``,
-  ``run-all``), and 4-stage New-Operator onboarding (``scaffold``,
-  ``validate-contract``, ``generate-cliff-plan``, ``bench-and-score``,
-  ``certify``, ``run-all``).
-[Invariants] Zero device context initialization on import; every stage fails
-  closed on silicon/profile conflict, lineage leakage, ``service_regimes``
-  crutches, missing provenance, or Lean dual-bound inversion.
+[Role] Expose immutable onboarding contracts, Lock-3 ``TilingAxes`` +
+  ``validate_abi`` cliff planning, sealed ``GateCase -> EvaluationRunner ->
+  EngineRunReceipt`` scoring (Lock 2), 4-stage New-SKU onboarding
+  (``probe-soc``, ``calibrate-l0-and-fabric``, ``validate-512-400k``,
+  ``verify-gates``, ``run-all``), and 4-stage New-Operator onboarding
+  (``scaffold``, ``validate-contract``, ``generate-cliff-plan``,
+  ``bench-and-score``, ``certify``, ``run-all``).
+[Invariants] Zero device context initialization on import; zero duplicate
+  primitive sealers; zero caller-supplied ``predicted_*``; every stage fails
+  closed on silicon/profile conflict, lineage leakage, clock-operator mismatch,
+  ``service_regimes`` crutches, missing owners/provenance, ``plan_only``,
+  ``calibrated_count == 0``, or witness-free/inverted Lean dual bounds.
 [Timeouts & Locks] Pure re-exports; runtime stages enforce explicit bounded
   timeout arithmetic.
 [Side-Effect Policy] Zero side effects on import.
@@ -17,8 +20,8 @@ from __future__ import annotations
 
 from .cliff_planner import (
     STANDARD_LEVEL_BOUNDARY_KINDS,
-    STANDARD_SEQUENCE_OPERATORS,
-    score_whitebox_observations,
+    WhiteboxSpineRunner,
+    score_sealed_gate_cases,
     synthesize_operator_cliff_plan,
     synthesize_sku_512_400k_plan,
     validate_disjoint_lineage,
@@ -30,16 +33,20 @@ from .contracts import (
     CONTEXT_MAX_TOKENS,
     CONTEXT_MIN_TOKENS,
     DEFAULT_CLEANUP_GRACE_S,
+    DEFAULT_CLOCK_OPERATOR,
     DEFAULT_FABRIC_BUDGET_S,
     DEFAULT_HELDOUT_APE_THRESHOLD_PCT,
     DEFAULT_L0_BUDGET_S,
     DEFAULT_OUTER_TIMEOUT_S,
     DEFAULT_PROBE_TIMEOUT_S,
+    FORBIDDEN_CALLER_PREDICTION_KEYS,
     OFF_GRID_CLIFF_HELDOUT_GRID,
     OPERATOR_ONBOARDING_RECEIPT_SCHEMA,
     SKU_ONBOARDING_RECEIPT_SCHEMA,
     SOC_PROBE_SCHEMA,
     TRAIN_OBSERVATION_MANIFEST_SCHEMA,
+    VALID_CLOCK_OPERATORS,
+    AbiDivisibilityRule,
     CliffBenchPlan,
     CliffPointSpec,
     GateCheckOutcome,
@@ -48,13 +55,16 @@ from .contracts import (
     OperatorCliffParameters,
     SiliconProfileConflict,
     SocProbeRecord,
+    TilingAxes,
     TimeoutBudget,
     assert_sanitized_payload,
     build_capture_uri,
     check_lean_non_inversion,
     compute_receipt_sha256,
+    default_topk_abi_rule,
     sanitize_public_alias,
     seal_onboarding_receipt,
+    validate_abi,
     verify_receipt_sha256,
 )
 from .operator_pipeline import (
@@ -83,18 +93,21 @@ __all__ = [
     "CONTEXT_MAX_TOKENS",
     "CONTEXT_MIN_TOKENS",
     "DEFAULT_CLEANUP_GRACE_S",
+    "DEFAULT_CLOCK_OPERATOR",
     "DEFAULT_FABRIC_BUDGET_S",
     "DEFAULT_HELDOUT_APE_THRESHOLD_PCT",
     "DEFAULT_L0_BUDGET_S",
     "DEFAULT_OUTER_TIMEOUT_S",
     "DEFAULT_PROBE_TIMEOUT_S",
+    "FORBIDDEN_CALLER_PREDICTION_KEYS",
     "OFF_GRID_CLIFF_HELDOUT_GRID",
     "OPERATOR_ONBOARDING_RECEIPT_SCHEMA",
     "SKU_ONBOARDING_RECEIPT_SCHEMA",
     "SOC_PROBE_SCHEMA",
     "STANDARD_LEVEL_BOUNDARY_KINDS",
-    "STANDARD_SEQUENCE_OPERATORS",
     "TRAIN_OBSERVATION_MANIFEST_SCHEMA",
+    "VALID_CLOCK_OPERATORS",
+    "AbiDivisibilityRule",
     "CliffBenchPlan",
     "CliffPointSpec",
     "GateCheckOutcome",
@@ -103,7 +116,9 @@ __all__ = [
     "OperatorCliffParameters",
     "SiliconProfileConflict",
     "SocProbeRecord",
+    "TilingAxes",
     "TimeoutBudget",
+    "WhiteboxSpineRunner",
     "assert_sanitized_payload",
     "bench_and_score_operator",
     "build_capture_uri",
@@ -111,6 +126,7 @@ __all__ = [
     "certify_operator",
     "check_lean_non_inversion",
     "compute_receipt_sha256",
+    "default_topk_abi_rule",
     "generate_operator_cliff_plan",
     "parse_npu_smi_topology",
     "parse_platform_config_ini",
@@ -119,11 +135,12 @@ __all__ = [
     "run_sku_onboarding",
     "sanitize_public_alias",
     "scaffold_operator",
-    "score_whitebox_observations",
+    "score_sealed_gate_cases",
     "seal_onboarding_receipt",
     "synthesize_operator_cliff_plan",
     "synthesize_sku_512_400k_plan",
     "validate_512_400k",
+    "validate_abi",
     "validate_disjoint_lineage",
     "validate_operator_contract",
     "verify_idle_die_telemetry",
