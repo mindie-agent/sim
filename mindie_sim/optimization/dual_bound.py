@@ -598,7 +598,7 @@ _COLD_WEIGHT_FAMILIES = frozenset({
     "gemm", "linear", "qkv_projection", "output_projection", "gate_up_projection",
     "down_projection", "projection", "lm_head", "logits",
 })
-_WEIGHT_ID_KEYS = ("weight_allocation_id", "allocation_id", "weight_tensor_id", "parameter_name", "weight_key")
+_WEIGHT_ID_KEYS = ("weight_allocation_id", "allocation_id")
 
 def _cold_weight_read(op, meta, die):
     mte2_bytes = getattr(op, "mte2_bytes", 0)
@@ -606,7 +606,8 @@ def _cold_weight_read(op, meta, die):
         return None
     identity = next((value for key in _WEIGHT_ID_KEYS
                      if isinstance(value := meta.get(key), str) and value.strip()), None)
-    if identity is None or meta.get("initial_residency") not in (None, "hbm_cold"):
+    residency = meta.get("weight_initial_residency", meta.get("initial_residency"))
+    if identity is None or residency != "hbm_cold":
         return None
     ranges = meta.get("weight_ranges", meta.get("ranges"))
     if ranges is None:

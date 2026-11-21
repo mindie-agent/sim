@@ -16,20 +16,26 @@ import pytest
 
 from _support.axes import REPRESENTATIVE_SKUS
 from mindie_sim.compose import compose_case
-from mindie_sim.optimization import build_dual_inputs_from_scenario, certify_lower_bound
+from mindie_sim.optimization import (
+    EventDagSpec, ResourceChoiceProgram, build_dual_inputs_from_scenario, certify_lower_bound,
+)
 from mindie_sim.prediction.cost import CostModel
 from mindie_sim.prediction.evaluation import EvaluationContext, ExecutionBindings
 from mindie_sim.prediction.primitives import PrimitiveStore
 from mindie_sim.prediction.results import StepRequest
 from mindie_sim.prediction.spine import PredictionSpine
 from mindie_sim.rewrite import (
-    Edit, EvalBudget, OracleCache, QuantizeContract, ScenarioRequest, StepArchetype,
+    Edit, EvalBudget, OpRef, OracleCache, PortRef, QuantizeContract, ScenarioRequest, StepArchetype, WeightPrefetch,
     evaluate_rewrites, finalize_plan, intern_step_archetypes, plan_sha256, prepare_scenario,
     verify_plan,
 )
 from mindie_sim.schema.common import ModelingError
 
 pytestmark = pytest.mark.tier0
+
+PREFETCH_BATCH_BUDGET_MS = 50
+PREFETCH_COPY_STEP_BYTES = 4096
+NS_PER_SECOND = 10**9
 
 
 @pytest.fixture(scope="module")
@@ -134,27 +140,52 @@ def test_prepare_reuses_one_context_and_evicts_digest_and_request_alias(request_
 
 
 @pytest.mark.parametrize("size", (4, 8))
-def test_warm_batch_screens_distinct_changed_archetype_plans(size):
+def test_warm_batch_screens_fresh_prefetch_work_within_budget(size):
     case = compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a5"], tp=1, dp=1, layers=64)
     dossier = prepare_scenario(ScenarioRequest(case, StepRequest("decode", context=64)))
-    plans = _candidate_plans(dossier, {0, 1, 31, 63})[:size]
-    assert len(plans) == size
-    assert sum(archetype.multiplicity for archetype in dossier.archetypes) == 64
-    warmup = evaluate_rewrites(dossier.handle, plans)
+    archetypes = sorted(dossier.archetypes, key=lambda a: a.representative_layer)
+    assert [a.multiplicity for a in archetypes] == [1, 62, 1]
+
+    def prefetch(archetype, amount):
+        target = next(op for op in archetype.ops if op.family == "qkv_projection")
+        anchor, = target.deps
+        edit = Edit("prefetch", operation=WeightPrefetch(
+            PortRef(OpRef("atom", target.op_id), "weight", 0),
+            PortRef(OpRef("atom", anchor), "output", 0), max_bytes=amount,
+        ))
+        return replace(dossier.unmerge_plan, edits=(edit,))
+
+    warmup = tuple(prefetch(a, PREFETCH_COPY_STEP_BYTES) for a in archetypes)
+    warmed = evaluate_rewrites(dossier.handle, (dossier.unmerge_plan, *warmup))
+    base, *warm_copies = warmed.results
+    assert base.accepted and all(item.accepted for item in warm_copies)
+    amounts = tuple((i + 2) * PREFETCH_COPY_STEP_BYTES for i in range(size))
+    plans = tuple(prefetch(archetypes[i % len(archetypes)], amount) for i, amount in enumerate(amounts))
+    assert {plan_sha256(plan) for plan in plans}.isdisjoint(item.plan_sha256 for item in warmed.results)
+
     result = evaluate_rewrites(dossier.handle, plans)
-    print(f"{size}-plan batch: cold {warmup.elapsed_ms:.3f} ms, warm {result.elapsed_ms:.3f} ms")
-    assert warmup.elapsed_ms < 50, f"cold {size}-plan batch took {warmup.elapsed_ms:.3f} ms"
-    assert result.elapsed_ms < 50, f"warm {size}-plan batch took {result.elapsed_ms:.3f} ms"
+    print(f"{size} fresh prefetch plans took {result.elapsed_ms:.3f} ms")
+    assert result.elapsed_ms < PREFETCH_BATCH_BUDGET_MS
     assert result.scenario_digest == dossier.scenario_digest and result.scope == "archetype"
-    assert result.results == warmup.results
-    assert len({item.plan_sha256 for item in result.results}) == len(plans)
-    for candidate, plan in zip(result.results, plans, strict=True):
+    assert len({item.plan_sha256 for item in result.results}) == size
+    die, = dossier.handle.scenario.case.machine.dies
+    hbm_bytes_per_second = dict(die.rates)["hbm"]
+    for candidate, plan, amount in zip(result.results, plans, amounts, strict=True):
         assert candidate.plan_sha256 == plan_sha256(plan)
         assert candidate.accepted and candidate.coverage_ratio == 1
-        assert candidate.estimated_wall_ns > 0 and candidate.archetype_wall_ns > 0
+        dma_ns = round(amount * NS_PER_SECOND / hbm_bytes_per_second)
+        assert dma_ns > 0
+        assert candidate.estimated_wall_ns == base.estimated_wall_ns + dma_ns
+        assert candidate.archetype_wall_ns == base.archetype_wall_ns + dma_ns
         assert candidate.verification.scope == "archetype" and candidate.verification.passed
         assert candidate.verification.wall_ns == candidate.estimated_wall_ns
         assert len(candidate.verification.gates) == 4
+
+    replay = finalize_plan(dossier.handle, plans[-1])
+    assert replay.verification.passed
+    copy, = (row for row in replay.step_eval.operators if row.family == "prefetch")
+    assert copy.start_ms < copy.end_ms
+    assert sum(item.amount for item in copy.work if item.resource == "hbm") == amounts[-1]
 
 
 @pytest.mark.parametrize("limit", (0, 1, 3, 8))
@@ -223,6 +254,29 @@ def test_finalize_replays_every_occurrence_and_matches_spine(dossier, candidates
     assert result.verification == verify_plan(
         scenario, result.applied, step_eval=result.step_eval,
         baseline_u_ns=handle.full_u_ns, baseline_m_ns=handle.full_m_ns, **options,
+    )
+
+
+def test_finalize_binds_certificate_to_prepared_scenario():
+    case = compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a5"], tp=2, dp=1, layers=1)
+    dossier = prepare_scenario(ScenarioRequest(case, StepRequest("decode", context=64)))
+    handle, plan = dossier.handle, dossier.unmerge_plan
+    program, dag, _ = build_dual_inputs_from_scenario(handle.scenario)
+    certificate, _ = certify_lower_bound(program, dag)
+    accepted = finalize_plan(handle, plan, dual_program=program, event_dag=dag, dual_certificate=certificate)
+    assert accepted.verification.passed
+    assert accepted.verification.l_star_ns == certificate.l_star_lean_ns
+
+    other_program, other_dag = ResourceChoiceProgram(1, (1,), ()), EventDagSpec((1,), ())
+    other_certificate, _ = certify_lower_bound(other_program, other_dag)
+    assert other_certificate.l_star_lean_ns == 1 < accepted.wall_ns
+    rejected = finalize_plan(handle, plan, dual_program=other_program, event_dag=other_dag,
+                             dual_certificate=other_certificate)
+    *ordinary, bound = rejected.verification.gates
+    assert all(gate.passed for gate in ordinary)
+    assert rejected.wall_ns == accepted.wall_ns
+    assert (bound.passed, bound.reason, bound.detail) == (
+        False, "LEAN_CERTIFICATE_INVALID", "certificate_unbound_to_scenario",
     )
 
 

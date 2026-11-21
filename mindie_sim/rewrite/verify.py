@@ -8,7 +8,7 @@
 """
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from graphlib import CycleError, TopologicalSorter
@@ -17,6 +17,8 @@ from itertools import combinations
 from math import fsum, isclose, isfinite
 from typing import Literal
 
+from mindie_sim.prediction.evaluation import ACTIVE_DEADLINE_MONO
+from mindie_sim.prediction.operator_replay import operator_costs
 from mindie_sim.prediction.results import OpOccurrence, OperatorSequenceRow, StepEvaluation
 from mindie_sim.prediction.spine import _parse_occurrence, _wave_breakdown_from_report, _work_items
 from mindie_sim.prediction.runtime.accel_tables import (
@@ -30,7 +32,7 @@ from mindie_sim.schema.common import ModelingError
 from .apply import (
     AppliedPlan, ResolvedScenario, SIMT_UB_CARVEOUT_BYTES, _check_stream, _convex, _die, _path, _solve_tiles, _successors, _topological,
 )
-from .schema import FuseRegion, HoistOrDeduplicate, QuantizeContract, SelectTemplate, WeightPrefetch, _flat
+from .schema import FuseRegion, HoistOrDeduplicate, QuantizeContract, SelectTemplate, _flat
 
 FAKE_OVERLAP_THRESHOLD_PCT = 5.0
 SHIPPING_REGRESSION_TOLERANCE_NS = 1000
@@ -40,6 +42,9 @@ SERVICE_CONSERVATION_ABS_TOL = 1e-6
 _CAPACITY_POOLS = frozenset({"ub", "l1", "l0a", "l0b", "l0c", "l2", "hbm"})
 _NON_MATRIX_IMPLEMENTATIONS = frozenset({"TiledPointwise", "RingCollective", "PairwiseCollective"})
 _MATRIX_SERVICE_PREFIXES = ("matrix@", "cube@", "simt@")
+_TRANSFER_SERVICE = {"mte2": ("mte2@", "mte2_aic@", "mte2_aiv@"), "hbm": ("memory@",)}
+_TEMPLATE_SERVICE = {**_TRANSFER_SERVICE, "cube": _MATRIX_SERVICE_PREFIXES,
+                     "vector": ("vector@",), "mte3": ("mte3@",), "link": ("link:",)}
 _COHORT_PREFIX = "rewrite_cohort"
 
 
@@ -310,8 +315,8 @@ def _capacity_checks(scenario, applied, step_eval):
             fallback = (ordinal, ordinal + 1) if rank.replica not in streams else (0, 1)
             start, end = _span(row, default=fallback)
             if op.op_id in candidates:
-                solved = _solve_tiles(scenario, rank.replica, op, candidates[op.op_id],
-                                      streams.get(rank.replica))
+                solved, _ = _solve_tiles(scenario, rank.replica, op, candidates[op.op_id],
+                                         streams.get(rank.replica))
                 owners_by_lane = (bind_stream_owners(streams[rank.replica], path)
                                   if rank.replica in streams else {})
                 lane_owners = owners_by_lane.get(lane)
@@ -485,7 +490,39 @@ def _work_totals(ops):
     return {key: fsum(values) for key, values in work.items() if any(values)}
 
 
-def _executed_service_conservation(scenario, applied, step_eval, baseline_eval):
+def _dropped(actual, expected, allowance=0):
+    return actual + allowance + SERVICE_CONSERVATION_ABS_TOL < expected * (1 - SERVICE_CONSERVATION_REL_TOL)
+
+
+def _service_amount(service, prefixes):
+    return fsum(value for key, value in service.items() if key.startswith(prefixes))
+
+
+def _template_service(scenario, applied, edited, replay):
+    graphs, book, baseline_book, context, deadline = replay
+    targets = {op_id for _, op_id in edited}
+    profiles = []
+    token = ACTIVE_DEADLINE_MONO.set(deadline)
+    try:
+        for ranks, recipes, streams in (
+            ({rank.replica: rank.ops for rank in scenario.atomic_ops}, baseline_book, scenario.stream_plans),
+            (graphs, book, applied.streams),
+        ):
+            site_graphs = {op_id: dict.fromkeys(ranks, ()) for op_id in targets}
+            for rank, ops in ranks.items():
+                for op in ops:
+                    if op.op_id in targets:
+                        site_graphs[op.op_id][rank] = (op,)
+            profiles.append({(row["replica"], op_id): row["serviced"]
+                             for op_id, site in site_graphs.items()
+                             for row in operator_costs(scenario.atomic_step.case, site, recipes=recipes,
+                                 evaluation=context, stream_plans=streams or None)["operators"]})
+    finally:
+        ACTIVE_DEADLINE_MONO.reset(token)
+    return profiles
+
+
+def _executed_service_conservation(scenario, applied, step_eval, baseline_eval, service_replay):
     if step_eval is None:
         return
     edits = applied.plan.edits
@@ -505,20 +542,55 @@ def _executed_service_conservation(scenario, applied, step_eval, baseline_eval):
     base_serviced = _execution_evidence(baseline_eval or scenario.atomic_step).get("serviced")
     if not isinstance(got_serviced, dict) or not isinstance(base_serviced, dict):
         raise ModelingError("WORK_CONSERVATION_MISMATCH:missing_executed_service")
+    leases = Counter()
+    for lease in applied.prefetch_leases:
+        if lease.max_bytes > 0:
+            leases[lease.target_op] += lease.max_bytes
     kinds = {type(edit.operation) for edit in edits}
     checks = {"link": ("link:",)}
     if not kinds & {QuantizeContract, HoistOrDeduplicate}:
         checks["matrix"] = _MATRIX_SERVICE_PREFIXES
-    if SelectTemplate in kinds and FuseRegion not in kinds:
-        checks["vector"] = ("vector@",)
-        if not kinds & {QuantizeContract, HoistOrDeduplicate, WeightPrefetch}:
-            checks["mte2"] = ("mte2_aic@", "mte2_aiv@")
-            checks["memory"] = ("memory@",)
+    if SelectTemplate in kinds:
+        checks.update(_TRANSFER_SERVICE)
+        if FuseRegion not in kinds:
+            checks["vector"] = ("vector@",)
     for name, prefixes in checks.items():
-        expected = fsum(v for k, v in base_serviced.items() if k.startswith(prefixes))
-        actual = fsum(v for k, v in got_serviced.items() if k.startswith(prefixes))
-        if actual + SERVICE_CONSERVATION_ABS_TOL < expected * (1 - SERVICE_CONSERVATION_REL_TOL):
-            raise ModelingError(f"WORK_CONSERVATION_MISMATCH:executed_{name}_service_dropped")
+        expected = _service_amount(base_serviced, prefixes)
+        actual = _service_amount(got_serviced, prefixes)
+        allowance = sum(leases.values()) if name in _TRANSFER_SERVICE else 0
+        if _dropped(actual, expected, allowance):
+            detail = "memory" if name == "hbm" else name
+            raise ModelingError(f"WORK_CONSERVATION_MISMATCH:executed_{detail}_service_dropped")
+    quantized = {op_id for receipt in applied.edit_receipts
+                 if receipt.opcode == QuantizeContract.__name__ and receipt.status == "applied"
+                 for op_id in receipt.affected_ops}
+    rebound = {binding.target_op for binding in applied.template_bindings} & exec_by_id.keys()
+    base_rows = {(row.occurrence.replica, row.occurrence.op_id): row
+                 for row in getattr(baseline_eval or scenario.atomic_step, "operators", ())
+                 if isinstance(row, OperatorSequenceRow) and row.occurrence.op_id in rebound}
+    actual_rows = {(row.occurrence.replica, row.occurrence.op_id): row
+                   for row in getattr(step_eval, "operators", ()) if row.occurrence.op_id in rebound}
+    if base_rows.keys() - actual_rows.keys():
+        raise ModelingError("WORK_CONSERVATION_MISMATCH:missing_template_work")
+    audited = _template_service(scenario, applied, base_rows, service_replay) if service_replay and base_rows else None
+    for occurrence, row in base_rows.items():
+        _, op_id = occurrence
+        actual = Counter()
+        expected = Counter()
+        for item in actual_rows[occurrence].work:
+            actual[item.resource] += item.amount
+        for item in row.work:
+            expected[item.resource] += item.amount
+        for role, prefixes in _TEMPLATE_SERVICE.items():
+            allowance = leases[op_id] if role in _TRANSFER_SERVICE else 0
+            if op_id in quantized and role in {"hbm", "mte2", "mte3"}:
+                continue
+            if _dropped(actual[role], expected[role], allowance):
+                raise ModelingError(f"WORK_CONSERVATION_MISMATCH:{op_id}:{role}")
+            if audited:
+                before, after = (_service_amount(profile.get(occurrence, {}), prefixes) for profile in audited)
+                if _dropped(after, before, allowance):
+                    raise ModelingError(f"WORK_CONSERVATION_MISMATCH:{op_id}:executed_{role}")
 
 
 def _run_ranges(run):
@@ -553,7 +625,8 @@ def _logical_bytes(obligations):
     return total
 
 
-def _conservation(scenario, applied, summaries, step_eval=None, baseline_eval=None, baseline_work=None):
+def _conservation(scenario, applied, summaries, step_eval=None, baseline_eval=None, baseline_work=None,
+                  service_replay=None):
     hoists = set(applied.hoisted_load_time)
     cse = {edit.edit_id for edit in applied.plan.edits
            if isinstance(edit.operation, HoistOrDeduplicate) and edit.operation.scope == "intra_step"}
@@ -611,7 +684,9 @@ def _conservation(scenario, applied, summaries, step_eval=None, baseline_eval=No
         required = _logical_bytes(summary.read_obligations) + _logical_bytes(summary.write_obligations)
         if logical < required:
             raise ModelingError(f"LEDGER_RECONCILIATION_ERROR:{summary.region_id}:logical_bytes")
-    _executed_service_conservation(scenario, applied, step_eval, baseline_eval)
+        if issued < logical:
+            raise ModelingError(f"LEDGER_RECONCILIATION_ERROR:{summary.region_id}:issued_copy_bytes")
+    _executed_service_conservation(scenario, applied, step_eval, baseline_eval, service_replay)
 
 
 def _capture(name, check, *args):
@@ -654,7 +729,7 @@ def verify_plan(
     scenario: ResolvedScenario, applied: AppliedPlan, *, step_eval=None, wall_ns=None,
     dual_certificate=None, dual_program=None, event_dag=None, baseline_u_ns=None,
     baseline_m_ns=None, framework_ns=None, dsl_ns=None, region_summaries=(), scope="full",
-    baseline_eval=None, baseline_work=None,
+    baseline_eval=None, baseline_work=None, service_replay=None, certificate_bound=True,
 ) -> VerificationReceipt:
     """Run structural and replay gates for the stated occurrence coverage."""
     if scope not in {"archetype", "full"}:
@@ -675,11 +750,14 @@ def verify_plan(
         reason, _, detail = str(error).partition(":")
         gates.append(GateReceipt(name, False, reason, detail))
     gates.append(_capture("work_conservation_and_ledgers", _conservation,
-                          scenario, applied, region_summaries, step_eval, baseline_eval, baseline_work))
+                          scenario, applied, region_summaries, step_eval, baseline_eval, baseline_work,
+                          service_replay))
     l_star = regression = None
     if scope == "full":
         name = "lean_bound_and_monotonicity"
         try:
+            if not certificate_bound:
+                raise ModelingError("LEAN_CERTIFICATE_INVALID:certificate_unbound_to_scenario")
             l_star = _bound(dual_certificate, dual_program, event_dag, wall_ns,
                             baseline_u_ns, baseline_m_ns, framework_ns, dsl_ns)
             gates.append(GateReceipt(name, True))

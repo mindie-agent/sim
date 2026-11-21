@@ -16,7 +16,8 @@ import pytest
 
 from _support.axes import REPRESENTATIVE_SKUS
 from mindie_sim.compose import compose_case
-from mindie_sim.prediction.fusion_ports import declared_control_order
+from mindie_sim.prediction.expected_grouped import ExpectedGroupedMatmul
+from mindie_sim.prediction.fusion_ports import declared_control_order, full_operand_ports
 from mindie_sim.prediction.results import ReplayOptions, StepRequest
 from mindie_sim.prediction.runtime.tile_solver import LiveBufferSpec, TileCandidate, TileShape
 from mindie_sim.prediction.streams import bind_stream_owners
@@ -25,7 +26,7 @@ from mindie_sim.rewrite import (
     PipelineTiles, PortRef, QuantizeContract, RewritePlan, SelectTemplate, StreamCoreBudget,
     ScenarioRequest, StreamEvent, StreamLane, StreamSchedule, TilePipelineSpec, WeightPrefetch, apply_plan,
     compute_overlap_pct, decode_rewrite_plan, empty_plan, encode_rewrite_plan, finalize_plan, plan_sha256,
-    prepare_scenario, resolve_scenario,
+    prepare_scenario, resolve_scenario, verify_plan,
 )
 from mindie_sim.schema.common import ModelingError
 
@@ -353,6 +354,39 @@ def test_fusion_redirects_control_and_typed_edges_without_flattening_ports(dense
     assert dict(user_after.metadata)["typed_inputs"] == ({**typed, "producer": region.op_id},)
 
 
+def test_fusion_keeps_distinct_live_outputs_for_each_producer_and_version(dense):
+    rank, = dense.atomic_ops
+    first, second, consumer, *_ = rank.ops
+    keys = (("a", 0), ("b", 0), ("a", 1), ("b", 1))
+    ports = {key: {"producer": key[0], "port": "output", "version": key[1]} for key in keys}
+
+    def producer(op, name, deps):
+        outputs = tuple({**port, "value": key} for key, port in ports.items() if key[0] == name)
+        return replace(op, op_id=name, deps=deps, metadata=(("typed_outputs", outputs),))
+
+    a, b = producer(first, "a", ()), producer(second, "b", ("a",))
+    user = replace(consumer, op_id="user", deps=("a", "b"), metadata=(
+        ("typed_inputs", tuple(ports.values())),
+    ))
+    scenario = replace(dense, atomic_ops=(replace(rank, ops=(a, b, user)),))
+    region = replace(_fuse("a", "b"), preserve_ports=tuple(
+        PortRef(_atom(producer), "output", version) for producer, version in keys
+    ))
+    result = apply_plan(_plan(scenario, Edit("region", operation=region)), scenario)
+    fused, rewritten = result.executable[0].ops
+    assert rewritten.deps == (fused.op_id,)
+    outputs = dict(fused.metadata)["typed_outputs"]
+    by_port = {(port["port"], port["version"]): port["value"] for port in outputs}
+    assert len(by_port) == len(outputs) == len(keys)
+    inputs = dict(rewritten.metadata)["typed_inputs"]
+    assert all(port["producer"] == fused.op_id for port in inputs)
+    assert tuple(by_port[port["port"], port["version"]] for port in inputs) == keys
+    positional = full_operand_ports(rewritten)
+    assert [producer for producer, _ in positional] == [fused.op_id, fused.op_id]
+    names = [port.removeprefix(f"{producer}:") for producer, port in positional]
+    assert tuple(by_port["output" if name == "out" else name, 0] for name in names) == keys[:2]
+
+
 def test_deduplication_requires_equal_constant_values(dense):
     rank, = dense.atomic_ops
     prototype, consumer, *_ = rank.ops
@@ -378,6 +412,35 @@ def test_pipeline_rejects_aic_buffer_in_aiv_ub(dense):
     edit = Edit("oversized", operation=PipelineTiles(_atom(target.op_id), pipeline))
     with pytest.raises(ModelingError, match=r"MULTI_POOL_CAPACITY:.*:ub:owner"):
         apply_plan(_plan(dense, edit), dense)
+
+
+def test_pipeline_rejects_overlapping_hbm_buffers_and_keeps_feasible_fallback(dense):
+    die, = dense.case.machine.dies
+    target = _atom(dense.atomic_ops[0].ops[0].op_id)
+    spec = _pipeline("scratch")
+    candidate, = spec.candidates
+    hbm = LiveBufferSpec("first", "hbm", die.memory_bytes // 2 + 32, 0, 1, owner_kind="die")
+    overlapping = replace(candidate, buffers=(hbm, replace(hbm, name="second")))
+    separated = replace(overlapping, buffers=(hbm, replace(hbm, name="second", live_start=1, live_end=2)))
+
+    def apply(*candidates):
+        tile = PipelineTiles(target, replace(spec, candidates=candidates))
+        return apply_plan(_plan(dense, Edit("tile", operation=tile)), dense)
+
+    assert apply(separated).tile_bindings
+    with pytest.raises(ModelingError, match="MULTI_POOL_CAPACITY:.*:hbm:bytes"):
+        apply(overlapping)
+
+    buffer, = candidate.buffers
+    oversized = replace(candidate, buffers=(replace(buffer, bytes_per_owner=dict(die.buffers)["ub"] + 1),))
+    fallback = replace(candidate, algorithm="online_reduce")
+    assert buffer.bytes_per_owner == 1024
+    with pytest.raises(ModelingError, match="MULTI_POOL_CAPACITY"):
+        apply(oversized)
+    planned = apply(oversized, fallback)
+    op = next(op for op in planned.executable[0].ops if op.op_id == target.id)
+    assert dict(op.metadata)["tile_algorithm"] == fallback.algorithm
+    assert verify_plan(dense, planned).gates[1].passed
 
 
 def test_pipeline_replay_rejects_unregistered_template():
@@ -408,18 +471,43 @@ def test_ring_replay_uses_the_intra_package_link():
     assert any(name.startswith(f"link:{route}") and size > 0 for name, size in link_work.items())
 
 
-def test_two_cohort_replay_records_positive_intervals_on_each_half():
+def test_two_cohort_replay_records_positive_intervals_and_routing_moments(monkeypatch):
     case = compose_case("deepseek-v4-flash", REPRESENTATIVE_SKUS["a5"], tp=4, ep=4, layers=1)
     dossier = prepare_scenario(ScenarioRequest(case, StepRequest("decode", sequences=8, context=64)))
     grouped = next(op for op in dossier.handle.scenario.atomic_ops[0].ops if op.family == "grouped_gemm")
     assert grouped.local_shape[0] == 12
     edit = Edit("split", operation=PipelineTiles(_atom(grouped.op_id), None, "dbo_2cohort"))
+    moments = {}
+    lower = ExpectedGroupedMatmul.lower
+
+    def record(recipe, context):
+        kernel = context.service_identity.get("kernel", "")
+        if context.op.op_id == grouped.op_id and kernel.startswith("rewrite_cohort_"):
+            meta = dict(context.op.metadata)
+            moments.setdefault(kernel, set()).add((context.op.local_shape[0], meta["expected_rows"],
+                                                   meta["expected_active_experts"], meta["weight_bytes"]))
+        return lower(recipe, context)
+
+    monkeypatch.setattr(ExpectedGroupedMatmul, "lower", record)
     baseline = finalize_plan(dossier.handle, dossier.unmerge_plan)
     replayed = finalize_plan(dossier.handle, replace(dossier.unmerge_plan, edits=(edit,)))
     assert not baseline.step_eval.cohort_intervals
     assert replayed.verification.passed and replayed.verification.l_star_ns <= replayed.wall_ns
     intervals = replayed.step_eval.cohort_intervals[grouped.op_id]
     assert set(intervals) == {0, 1}
+    case = dossier.handle.scenario.case
+    layer = case.model.layer_plans[grouped.layer]
+    experts = layer.num_experts // case.runtime.parallel.ep
+    per_token = layer.top_k / layer.num_experts
+    expected_active = experts * (1 - (1 - per_token)**(dossier.handle.scenario.step.sequences // 2))
+    assert expected_active == pytest.approx(5.792, abs=0.001)
+    assert len(moments) == len(intervals)
+    original = dict(grouped.metadata)
+    for samples in moments.values():
+        (rows, expected_rows, active, weights), = samples
+        assert rows == expected_rows == grouped.local_shape[0] // 2
+        assert active == pytest.approx(expected_active)
+        assert weights == pytest.approx(original["weight_bytes"] * active / original["expected_active_experts"])
     row = next(row for row in replayed.step_eval.operators if row.occurrence.op_id == grouped.op_id)
     for cohort in intervals.values():
         assert cohort and all(row.start_ms <= start < end <= row.end_ms for start, end in cohort)

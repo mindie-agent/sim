@@ -36,9 +36,10 @@ from mindie_sim.prediction.runtime.engine import Engine, Resource
 from mindie_sim.prediction.runtime.memory_physics import AddressRun
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.rewrite import (
-    CollectiveTransform, Edit, FuseRegion, KernelBoundary, OpRef, ScenarioRequest, SelectTemplate,
-    evaluate_rewrites, finalize_plan, prepare_scenario,
+    CollectiveTransform, Edit, FuseRegion, KernelBoundary, OpRef, PortRef, ScenarioRequest,
+    SelectTemplate, WeightPrefetch, evaluate_rewrites, finalize_plan, prepare_scenario,
 )
+from mindie_sim.rewrite import oracle
 from mindie_sim.schema.hardware import Device
 from mindie_sim.schema.operators import OpSpec
 
@@ -89,9 +90,13 @@ def test_public_replay_matches_certified_integer_ladder(hardware, phase):
     assert sum(item.delta_ns for item in ordered) == main - dsl
     edits = {edit.edit_id: type(edit.operation).__name__ for edit in report.dsl_plan.edits}
     shipping = [impact for impact in waterfall.loo_impacts if impact.edit_id == SHIPPING_OVERLAY]
-    assert [(impact.opcode, impact.marginal_delta_ns) for impact in shipping] == (
-        [("ShippingOverlay", main - unmerge)] if main != unmerge else []
-    )
+    dossier = prepare_scenario(ScenarioRequest(case, step))
+    expected_shipping = []
+    if main != unmerge and report.dsl_plan.base_graph_sha256 == dossier.mainline_plan.base_graph_sha256:
+        without = finalize_plan(dossier.handle, replace(dossier.unmerge_plan, edits=report.dsl_plan.edits))
+        if without.verification.passed:
+            expected_shipping = [("ShippingOverlay", without.wall_ns - dsl)]
+    assert [(impact.opcode, impact.marginal_delta_ns) for impact in shipping] == expected_shipping
     assert all(edits[impact.edit_id] == impact.opcode for impact in waterfall.loo_impacts if impact not in shipping)
     regression = waterfall.shipping_regression
     if main > unmerge + SHIPPING_REGRESSION_TOLERANCE_NS:
@@ -149,7 +154,7 @@ def test_shipping_regression_reports_measured_leave_one_out_culprit():
     search = _TrialSearch(dossier, max_trials=2)
     assert search.loo(shipping_plan, shipping.wall_ns, 1) == ((edit.edit_id, -delta),)
     result = _shipping_regression(shipping.verification, unmerge.wall_ns, shipping.wall_ns)
-    assert result.delta_ns == delta and sum(impact for _, impact in result.loo_culprits) == delta
+    assert result.delta_ns == delta and result.loo_culprits == ((SHIPPING_OVERLAY, -delta),)
     assert (result.baseline_u_ns, result.baseline_m_ns) == (unmerge.wall_ns, shipping.wall_ns)
     assert _shipping_regression(shipping.verification, unmerge.wall_ns,
                                 unmerge.wall_ns + SHIPPING_REGRESSION_TOLERANCE_NS) is None
@@ -160,20 +165,39 @@ def test_shipping_regression_reports_measured_leave_one_out_culprit():
     assert ladder.m_mainline_ns - ladder.u_unmerge_ns > SHIPPING_REGRESSION_TOLERANCE_NS
     assert regression == report.verification.shipping_regression
     assert (regression.baseline_u_ns, regression.baseline_m_ns) == (ladder.u_unmerge_ns, ladder.m_mainline_ns)
-    assert regression.loo_culprits
-    attribution = {impact.edit_id: impact.marginal_delta_ns for impact in report.waterfall.loo_impacts}
-    assert all(attribution[edit_id] == saved for edit_id, saved in regression.loo_culprits)
+    assert regression.loo_culprits == ((SHIPPING_OVERLAY, ladder.delta_shipping_ns),)
+    assert report.waterfall.loo_impacts == ()
 
 
 def test_mainline_seed_screens_against_its_own_faster_wall():
     case = _case(REPRESENTATIVE_SKUS["a2"], tp=1)
-    dossier = prepare_scenario(ScenarioRequest(case, StepRequest("prefill", tokens=16, context=64)))
+    step = StepRequest("prefill", tokens=16, context=64)
+    dossier = prepare_scenario(ScenarioRequest(case, step))
     assert dossier.m_wall_ns < dossier.u_wall_ns
     batch = evaluate_rewrites(dossier.handle, (dossier.unmerge_plan, dossier.mainline_plan))
     unmerge, mainline = batch.results
     assert unmerge.accepted and mainline.accepted
     assert (unmerge.estimated_wall_ns, mainline.estimated_wall_ns) == (dossier.u_wall_ns, dossier.m_wall_ns)
     assert unmerge.plan_sha256 != mainline.plan_sha256
+    report = api.optimize_ladder(case, step)
+    assert report.dsl_plan == dossier.mainline_plan
+    impact, = report.waterfall.loo_impacts
+    assert impact.edit_id == SHIPPING_OVERLAY
+    assert impact.marginal_delta_ns == dossier.u_wall_ns - dossier.m_wall_ns == 466
+
+
+def test_unmerge_winner_has_empty_leave_one_out_despite_shipping_regression():
+    case = _case(REPRESENTATIVE_SKUS["a5"], tp=1)
+    step = StepRequest("prefill", tokens=16, context=64)
+    dossier = prepare_scenario(ScenarioRequest(case, step))
+    report = api.optimize_ladder(case, step)
+    assert report.dsl_plan == dossier.unmerge_plan and not report.dsl_plan.edits
+    assert report.waterfall.loo_impacts == ()
+    regression = report.waterfall.shipping_regression
+    assert regression == report.verification.shipping_regression
+    assert regression.delta_ns == dossier.m_wall_ns - dossier.u_wall_ns == 1754
+    assert report.ladder.delta_shipping_ns == -regression.delta_ns
+    assert regression.loo_culprits == ((SHIPPING_OVERLAY, -regression.delta_ns),)
 
 
 def test_target_efficiency_scaling_is_retired():
@@ -286,25 +310,31 @@ def test_efficiency_analysis_uses_package_report_and_attribution_hooks(monkeypat
 
 
 def test_compulsory_cut_unions_disjoint_periodic_runs():
-    even = AddressRun(1, 4097, 1, 64)
-    odd = AddressRun(33, 4097, 1, 64)
-    read = TensorRangeObligation(0, "interleaved", 0, (), "hbm_cold", "owner", (even, odd))
+    runs = (AddressRun(1, 4097, 1, 101), AddressRun(33, 4097, 1, 101))
+    sectors = [{(run.base_byte + row * run.stride_bytes) // 32 for row in range(run.rows)}
+               for run in runs]
+    assert sectors[0].isdisjoint(sectors[1])
+    read = TensorRangeObligation(0, "interleaved", 0, (), "hbm_cold", "owner", runs)
     summary = SimpleNamespace(read_obligations=(read,), write_obligations=())
-    assert compute_compulsory_hbm_cut((summary,))[0].read_bytes == 2 * 4097 * 32
+    assert compute_compulsory_hbm_cut((summary,))[0].read_bytes == 32 * len(set.union(*sectors)) == 262208
 
 
-@pytest.mark.parametrize("allocations,expected_bytes", (
-    (("shared", "shared"), 4096), (("left", "right"), 8192), ((None, None), 0),
+@pytest.mark.parametrize("identity_key,allocations,residency,expected_bytes", (
+    ("allocation_id", ("shared", "shared"), "hbm_cold", 4096),
+    ("allocation_id", ("left", "right"), "hbm_cold", 8192),
+    ("parameter_name", ("left", "right"), "hbm_cold", 0),
+    ("parameter_name", ("left", "right"), None, 0),
+    ("allocation_id", ("shared", "shared"), None, 0),
 ))
-def test_compulsory_cut_counts_physical_weight_allocation_once(allocations, expected_bytes):
+def test_compulsory_cut_counts_physical_weight_allocation_once(identity_key, allocations, residency, expected_bytes):
     die = Device(rank=0, compute_units=1, memory_bytes=16384, rates=(("hbm", 10**9),),
                  compute_peaks=(("bf16", 10**13),))
     shape = (16, 16, 16)
     ops = tuple(OpSpec(
         f"gemm-{i}", "gemm", "decode", 0, 0, (), shape, shape, shape, shape,
         dtype="bf16", flops=8192, mte2_bytes=4096,
-        metadata=(("weight_bytes", 4096), ("initial_residency", "hbm_cold"))
-        + (("allocation_id", identity),) * (identity is not None),
+        metadata=(("weight_bytes", 4096), (identity_key, identity))
+        + (("initial_residency", residency),) * (residency is not None),
     ) for i, identity in enumerate(allocations))
     scenario = SimpleNamespace(machine=SimpleNamespace(dies=(die,), links=()), atomic_ops=ops)
     program, dag, names = build_dual_inputs_from_scenario(scenario)
@@ -314,6 +344,8 @@ def test_compulsory_cut_counts_physical_weight_allocation_once(allocations, expe
         # At one byte/ns, the duration before the inward guard equals the byte count.
         assert demand["hbm_bus_r@r0.p0.d0"] == expected_bytes - 3
         assert expected_bytes - 3 <= certificate.l_star_lean_ns <= expected_bytes + 1
+        if allocations[0] == allocations[1]:
+            assert certificate.l_star_lean_ns <= 4097.64
     else:
         assert not any(name.startswith("hbm_bus") for name in names)
         assert certificate.l_star_lean_ns <= 1
@@ -347,9 +379,13 @@ def test_work_gate_rejects_unary_swiglu_recipe_in_screening_and_replay(monkeypat
     }
     dossier = prepare_scenario(ScenarioRequest(case, StepRequest("decode", context=64)))
     swiglu = next(op for op in dossier.handle.scenario.atomic_ops[0].ops if op.family == "swiglu")
-    plan = replace(dossier.unmerge_plan, edits=(Edit(
-        "unary", operation=SelectTemplate(OpRef("atom", swiglu.op_id), "K3", "unary"),
-    ),))
+    anchor, target, *_ = dossier.handle.scenario.atomic_ops[0].ops
+    select = Edit("unary", operation=SelectTemplate(OpRef("atom", swiglu.op_id), "K3", "unary"))
+    prefetch = Edit("empty_prefetch", operation=WeightPrefetch(
+        PortRef(OpRef("atom", target.op_id), "weight", 0),
+        PortRef(OpRef("atom", anchor.op_id), "output", 0), max_bytes=0,
+    ))
+    plan = replace(dossier.unmerge_plan, edits=(select, prefetch))
     unary_read_bytes = []
     lower = TiledPointwise.lower
 
@@ -364,14 +400,29 @@ def test_work_gate_rejects_unary_swiglu_recipe_in_screening_and_replay(monkeypat
     monkeypatch.setattr(TiledPointwise, "lower", record_loads)
     baseline, rebound = (finalize_plan(dossier.handle, p) for p in (dossier.unmerge_plan, plan))
     assert baseline.verification.passed
+    assert not rebound.applied.prefetch_leases
     row = next(r for r in baseline.step_eval.operators if r.occurrence.op_id == swiglu.op_id)
     assert sum(item.amount for item in row.work if item.resource == "mte2") == 102400
     assert unary_read_bytes and set(unary_read_bytes) == {51200}
     screened, = evaluate_rewrites(dossier.handle, (plan,)).results
     for receipt in (rebound.verification, screened.verification):
+        assert all(gate.passed for gate in receipt.gates[:3])
         gate = receipt.gates[3]
         assert not gate.passed and gate.reason == "WORK_CONSERVATION_MISMATCH"
         assert gate.detail == "executed_mte2_service_dropped"
+
+    # Equal aggregate service can hide a shortfall on an individual operator.
+    from_report = oracle._evaluation
+
+    def match_aggregate_service(*args, **kwargs):
+        replay = from_report(*args, **kwargs)
+        evidence = {**replay.execution_evidence, "serviced": baseline.step_eval.execution_evidence["serviced"]}
+        return replace(replay, execution_evidence=evidence)
+
+    monkeypatch.setattr(oracle, "_evaluation", match_aggregate_service)
+    gate = finalize_plan(dossier.handle, plan).verification.gates[3]
+    assert not gate.passed and gate.reason == "WORK_CONSERVATION_MISMATCH"
+    assert gate.detail == f"{swiglu.op_id}:executed_mte2"
 
 
 def test_strided_run_rounds_to_exact_sector_union():

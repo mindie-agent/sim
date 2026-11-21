@@ -2,16 +2,19 @@
 
 [Role] Bound cut traffic and expose direction choices for excess service.
 [Invariants] Union compulsory sectors by version. Share reload bounds by maximum.
-[Timeouts & Locks] Logarithmic inversion and bounded row expansion, with no locks.
+[Timeouts & Locks] Logarithmic inversion and bounded sector-union storage, with no locks.
 [Side-Effect Policy] Pure integer and rational calculations.
 """
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from fractions import Fraction
-from math import isqrt, lcm
+from heapq import merge
+from math import gcd, isqrt, lcm
+
+from mindie_sim.prediction.runtime.memory_physics import AddressRun
 
 from .contracts import BilinearContractionSpec, FusedRegionSummary, TensorRangeObligation
 from .dual_bound import EpochAccount, verify_epoch_trace
@@ -19,6 +22,8 @@ from .dual_bound import EpochAccount, verify_epoch_trace
 SECTOR_BYTES = 32
 BITS_PER_BYTE = 8
 MAX_EXPLICIT_STRIDED_ROWS = 4096
+MAX_PERIODIC_LCM = 65536
+MAX_PERIODIC_SPANS = 65536
 MAX_EXPLICIT_EPOCH_ACCOUNTS = 65536
 BILINEAR_PRODUCT_FACTOR = 4
 RANK_ONE_KINDS = frozenset({
@@ -63,19 +68,30 @@ class SurplusCouplingSite:
     modes: tuple[tuple[str, tuple[tuple[str, Fraction], ...]], ...]
 
 
-def _union_count(spans: Sequence[tuple[int, int]]) -> int:
-    end = count = 0
-    for lo, hi in sorted(spans):
-        count += max(0, hi - max(end, lo))
-        end = max(end, hi)
-    return count
+def _merged_spans(spans: Iterable[tuple[int, int]]) -> Iterator[tuple[int, int]]:
+    start = end = 0
+    for lo, hi in spans:
+        if lo > end:
+            if end > start:
+                yield start, end
+            start, end = lo, hi
+        elif hi > end:
+            end = hi
+    if end > start:
+        yield start, end
+
+
+def _run_spans(run: AddressRun, sector: int) -> Iterator[tuple[int, int]]:
+    end_offset = run.row_bytes + sector - 1
+    stop = run.base_byte + run.rows * run.stride_bytes
+    return ((lo // sector, (lo + end_offset) // sector)
+            for lo in range(run.base_byte, stop, run.stride_bytes))
 
 
 @dataclass(slots=True)
 class _SectorSet:
     intervals: set[tuple[int, int]] = field(default_factory=set)
-    periodic: list[tuple[int, int, int, int]] = field(default_factory=list)
-    periodic_bytes: int = 0
+    strided: set[AddressRun] = field(default_factory=set)
 
     def add(self, obligation: TensorRangeObligation, sector: int) -> None:
         def add_range(lo: int, hi: int) -> None:
@@ -89,47 +105,79 @@ class _SectorSet:
         for run in obligation.address_runs:
             if run.rows == 0 or run.row_bytes == 0:
                 continue
-            if run.stride_bytes == 0:
-                run = replace(run, rows=1)
-            row0_hi = (run.base_byte + run.row_bytes + sector - 1) // sector
-            row1_lo = (run.base_byte + run.stride_bytes) // sector
-            if run.rows == 1 or run.stride_bytes <= run.row_bytes or (
-                run.stride_bytes % sector == 0 and row0_hi >= row1_lo
-            ):
+            if run.rows == 1 or run.stride_bytes <= max(sector, run.row_bytes):
                 end_byte = run.base_byte + (run.rows - 1) * run.stride_bytes + run.row_bytes
                 add_range(run.base_byte, end_byte)
-            elif run.rows > MAX_EXPLICIT_STRIDED_ROWS:
-                if run.stride_bytes % sector == 0:
-                    s0 = run.base_byte // sector
-                    self.periodic.append((s0, row0_hi - s0, run.stride_bytes // sector, run.rows))
-                self.periodic_bytes = max(self.periodic_bytes, run.sector_union_bytes(sector))
             else:
-                for row in range(run.rows):
-                    lo = run.base_byte + row * run.stride_bytes
-                    add_range(lo, lo + run.row_bytes)
+                self.strided.add(run)
 
     def measure(self, sector: int) -> int:
-        if self.periodic:
-            period = lcm(*(step for _, _, step, _ in self.periodic))
-            if period <= MAX_EXPLICIT_STRIDED_ROWS:
-                by_res: dict[int, list[tuple[int, int]]] = defaultdict(list)
-                for lo, hi in self.intervals:
-                    for res in range(period):
-                        q_lo = (lo - res + period - 1) // period
-                        q_hi = (hi - 1 - res) // period + 1
-                        if q_lo < q_hi:
-                            by_res[res].append((q_lo, q_hi))
-                for s0, width_sec, step, rows in self.periodic:
-                    mult = period // step
-                    for j in range(width_sec):
-                        for m in range(min(mult, rows)):
-                            start_sec = s0 + j + m * step
-                            count = (rows - 1 - m) // mult + 1
-                            q0, res = divmod(start_sec, period)
-                            by_res[res].append((q0, q0 + count))
-                total = sum(_union_count(spans) for spans in by_res.values())
-                return max(total * sector, self.periodic_bytes)
-        return max(_union_count(tuple(self.intervals)) * sector, self.periodic_bytes)
+        intervals = list(self.intervals)
+        periodic = set()
+        for run in self.strided:
+            # Every row in a phase has the same byte offset within its first sector.
+            phase_rows = sector // gcd(run.stride_bytes, sector)
+            step = phase_rows * run.stride_bytes // sector
+            for phase in range(min(phase_rows, run.rows)):
+                base = run.base_byte + phase * run.stride_bytes
+                rows = (run.rows - 1 - phase) // phase_rows + 1
+                lo = base // sector
+                hi = (base + run.row_bytes + sector - 1) // sector
+                if rows == 1 or hi - lo >= step:
+                    intervals.append((lo, hi + (rows - 1) * step))
+                else:
+                    periodic.add((lo, hi - lo, step, rows))
+
+        if not periodic:
+            return sector * sum(hi - lo for lo, hi in _merged_spans(sorted(intervals)))
+        if len(periodic) == 1 and not intervals:
+            _, width, _, rows = next(iter(periodic))
+            return sector * width * rows
+        steps = {step for _, _, step, _ in periodic}
+        period = 1
+        for step in steps:
+            period = lcm(period, step)
+            if period > MAX_PERIODIC_LCM and len(steps) > 1:
+                break
+        else:
+            # Quotient spans pay for allocation and sorting, so use them when they compress the rows.
+            span_limit = min(MAX_PERIODIC_SPANS, sum(run.rows for run in self.strided) // 2)
+            if sum(width * min(period // step, rows) for _, width, step, rows in periodic) <= span_limit:
+                return sector * self._measure_periodic(sorted(intervals), periodic, period)
+        # A large common period can cost more than merging the sorted runs directly.
+        runs = (_run_spans(run, sector) for run in self.strided)
+        return sector * sum(hi - lo for lo, hi in _merged_spans(merge(sorted(self.intervals), *runs)))
+
+    @staticmethod
+    def _measure_periodic(intervals, periodic, period: int) -> int:
+        by_res: dict[int, list[tuple[int, int]]] = defaultdict(list)
+        for start, width, step, rows in periodic:
+            cycle = period // step
+            for row in range(min(cycle, rows)):
+                count = (rows - 1 - row) // cycle + 1
+                first = start + row * step
+                for address in range(first, first + width):
+                    quotient, residue = divmod(address, period)
+                    by_res[residue].append((quotient, quotient + count))
+        # Include all explicit sectors, then reconcile only occupied residues.
+        total = 0
+        for lo, hi in _merged_spans(intervals):
+            total += hi - lo
+            if hi - lo < len(by_res):
+                for address in range(lo, hi):
+                    quotient, residue = divmod(address, period)
+                    if residue in by_res:
+                        by_res[residue].append((quotient, quotient + 1))
+                        total -= 1
+            else:
+                for residue, spans in by_res.items():
+                    q_lo = (lo - residue + period - 1) // period
+                    q_hi = (hi - residue + period - 1) // period
+                    if q_hi > q_lo:
+                        spans.append((q_lo, q_hi))
+                        total -= q_hi - q_lo
+        return total + sum(hi - lo for spans in by_res.values()
+                           for lo, hi in _merged_spans(sorted(spans)))
 
 
 def compute_compulsory_hbm_cut(

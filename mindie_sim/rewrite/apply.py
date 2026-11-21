@@ -158,30 +158,44 @@ def _path(scenario, replica, stage):
 def _solve_tiles(scenario, replica, op, spec, stream=None):
     die = _die(scenario, replica, op.stage)
     path = _die_path(scenario.case.machine, die)
-    capacities = dict(die.buffers)
-    pool_owners = {pool: "aic" for pool in tile_solver.AIC_POOLS}
-    pool_owners.update(dict.fromkeys(tile_solver.AIV_POOLS, "aiv"), hbm="die")
-    capacities["hbm"] = die.memory_bytes
-    for candidate in spec.candidates:
-        for buffer in candidate.buffers:
-            if (buffer.pool != "l2" and pool_owners.get(buffer.pool) != buffer.owner_kind
-                    or buffer.pool == "l2" and buffer.owner_kind not in {"aic", "aiv", "die"}):
-                raise ModelingError(f"MULTI_POOL_CAPACITY:{op.op_id}:{buffer.pool}:owner")
-            if (buffer.bytes_per_owner + buffer.scale_bytes) * buffer.slots > capacities.get(buffer.pool, 0):
-                raise ModelingError(f"MULTI_POOL_CAPACITY:{op.op_id}:{buffer.pool}:bytes")
+    pool_owners = {**dict.fromkeys(tile_solver.AIC_POOLS, {"aic"}),
+                   **dict.fromkeys(tile_solver.AIV_POOLS, {"aiv"}),
+                   "hbm": {"die"}, "l2": {"aic", "aiv", "die"}}
     owners = (None if stream is None else bind_stream_owners(stream, path)[
         dict(stream.assignments).get(op.op_id, MAIN_STREAM)])
     hw = SimpleNamespace(datapath=path, buffers=die.buffers, buffer_units=die.buffer_units,
                          stream_owners=owners)
-    if any(candidate.uses_simt for candidate in spec.candidates):
-        spec = replace(spec, simt_ub_carveout_bytes=max(
-            spec.simt_ub_carveout_bytes, path.simt_ub_carveout_bytes, SIMT_UB_CARVEOUT_BYTES))
-    return tile_solver.solve(spec, op, hw)
+    carveout = max(spec.simt_ub_carveout_bytes, path.simt_ub_carveout_bytes, SIMT_UB_CARVEOUT_BYTES)
+    rejected = []
+    for candidate in sorted(spec.candidates, key=lambda item: tile_solver.ALGORITHM_LADDER_RANK[item.algorithm]):
+        invalid = next((buf.pool for buf in candidate.buffers if buf.owner_kind not in pool_owners.get(buf.pool, ())),
+                       None)
+        if invalid is not None:
+            rejected.append(f"{invalid}:owner")
+            continue
+        granule = spec.pool_granules.get("hbm", tile_solver.DEFAULT_POOL_GRANULE_BYTES)
+        peak = tile_solver._pool_peak_bytes(candidate.buffers, "die", "hbm", granule)
+        if peak > die.memory_bytes:
+            rejected.append(f"hbm:bytes:{peak}>{die.memory_bytes}")
+            continue
+        try:
+            solved = tile_solver.solve(replace(spec, candidates=(candidate,), simt_ub_carveout_bytes=carveout),
+                                       op, hw)
+        except tile_solver.TileInfeasibleError as error:
+            rejected.append(str(error))
+            continue
+        hbm = (tile_solver.OwnerPoolPeak("die", "hbm", peak, die.memory_bytes),) if peak else ()
+        return replace(solved, pool_peaks=(*solved.pool_peaks, *hbm)), candidate
+    raise ModelingError(f"MULTI_POOL_CAPACITY:{op.op_id}:{','.join(rejected) or 'no_candidate'}")
 def _typed_inputs(op):
     return tuple((key, port) for key, fields in op.metadata if key in {"typed_inputs", "input_ports"}
                  for port in fields if isinstance(port, Mapping))
-
-
+def _port_key(port):
+    return (port.get("port") or port.get("output") or port.get("name") or "output",
+            port.get("version", port.get("state_version")) or 0)
+def _positional_name(dep, port):
+    name = port.removeprefix(dep + ":")
+    return "output" if name == "out" else name
 def _named_inputs(op):
     return {key: dep for key, dep in op.metadata if key.endswith("_producer") and isinstance(dep, str)}
 
@@ -259,7 +273,7 @@ def _ports(op):
     for key in ("typed_inputs", "typed_outputs", "output_ports", "input_ports", "ports"):
         for port in meta.get(key, ()):
             if isinstance(port, Mapping):
-                name = port.get("name") or port.get("output") or port.get("consumer_field")
+                name = port.get("name") or port.get("output") or port.get("port") or port.get("consumer_field")
                 if isinstance(name, str):
                     version = port.get("version", port.get("state_version"))
                     result.add((name, 0 if version is None else int(version)))
@@ -333,12 +347,12 @@ class _RankDraft:
             raise ModelingError(f"rewrite_unknown_port:{op.op_id}:{ref.name}:{ref.version}")
         return op
 
-    def replace_nodes(self, removed, replacement):
+    def replace_nodes(self, removed, replacement, outputs=None):
         removed = removed - {replacement}
         redirects = dict.fromkeys(removed, replacement)
-        for key in removed:
-            del self.ops[key]
         for key, op in self.ops.items():
+            if key in removed:
+                continue
             ports = input_port_entries(op.metadata)
             typed = {port.get("producer") for _, port in _typed_inputs(op)}
             controls = declared_control_order(op.metadata)
@@ -354,13 +368,26 @@ class _RankDraft:
                     return redirects.get(dep, dep)
                 metadata = tuple((k, endpoint(v)) if k in named else (k, v)
                                  for k, v in metadata if k not in named or endpoint(v))
+                def position(dep, port):
+                    name = (outputs or {}).get((dep, _positional_name(dep, port), 0),
+                                               port.removeprefix(dep + ":"))
+                    if name == "output" and port == f"{dep}:out":
+                        name = "out"
+                    return endpoint(dep), f"{replacement}:{name}" if dep in removed else port
+
+                def typed_port(port):
+                    producer = port["producer"]
+                    name, version = _port_key(port)
+                    renamed = (outputs or {}).get((producer, name, version), name)
+                    return {**port, "producer": endpoint(producer), **{
+                        k: renamed for k in ("port", "output", "name") if port.get(k) == name}}
+
+                if outputs is not None:
+                    ports = full_operand_ports(op, self.ops)
                 metadata = replace_input_ports(metadata, tuple(
-                    (endpoint(dep), port if dep not in removed else
-                     f"{replacement}:{port.removeprefix(dep + ':')}")
-                    for dep, port in ports if endpoint(dep)
-                ))
+                    position(dep, port) for dep, port in ports if endpoint(dep)))
                 metadata = tuple((k, tuple(
-                    {**port, "producer": endpoint(port["producer"])}
+                    typed_port(port)
                     if isinstance(port, Mapping) and port.get("producer") in removed else port
                     for port in v if not isinstance(port, Mapping)
                     or port.get("producer") not in removed or replacement is not None
@@ -368,6 +395,8 @@ class _RankDraft:
                 deps = tuple(dict.fromkeys(dep for src in inputs
                     if (dep := endpoint(src)) and dep != key))
                 self.ops[key] = replace(op, deps=deps, metadata=metadata)
+        for key in removed:
+            del self.ops[key]
         if self.stream is not None:
             assign = dict(self.stream.assignments)
             if replacement is not None:
@@ -428,12 +457,15 @@ class _RankDraft:
                       if port.get("producer") not in keys)
         named = {key: dep for op in ordered for key, dep in _named_inputs(op).items() if dep not in keys}
         cut = {dep for op in ordered for dep in (*op.deps, *dependencies[op.op_id]) if dep not in keys}
-        readers = {dep for op in self.ops.values() if op.op_id not in keys for dep in (
-            *(dep for dep, _ in full_operand_ports(op, self.ops)),
-            *(port.get("producer") for _, port in _typed_inputs(op)),
-            *_named_inputs(op).values(),
-        ) if dep in keys}
-        preserved = {self.port(ref).op_id for ref in spec.preserve_ports}
+        users = tuple(op for op in self.ops.values() if op.op_id not in keys)
+        declared = {(port["producer"], *_port_key(port)) for op in users
+                    for _, port in _typed_inputs(op) if port.get("producer") in keys}
+        consumed = {(dep, _positional_name(dep, port), 0) for op in users
+                    for dep, port in full_operand_ports(op, self.ops) if dep in keys}
+        retained = {(self.port(ref).op_id, ref.name, ref.version) for ref in spec.preserve_ports}
+        readers = {dep for dep, _, _ in consumed | declared} | {
+            dep for op in users for dep in _named_inputs(op).values() if dep in keys}
+        preserved = {dep for dep, _, _ in retained}
         if preserved - (keys | cut):
             raise ModelingError("rewrite_fusion_port_outside_cut")
         if (readers - {ordered[-1].op_id}) - preserved:
@@ -452,9 +484,26 @@ class _RankDraft:
                 matrix[dtype] += amount
         link_scope = next((item.link_scope for item in ordered if item.link_bytes), tail.link_scope)
         abi = spec.kernel_boundaries[-1].abi_id
+        live = consumed | declared | {key for key in retained if key[0] in keys}
+        reserved = {name for _, name, _ in live} | set(tail.returns) | {"op", "out"}
+        outputs, used = {}, set()
+        for dep, name, version in sorted(live, key=lambda item: (item[0] != tail.op_id, item)):
+            port = name
+            while (port, version) in used or (port != name and port in reserved):
+                port = f"{port}__{dep}"
+            outputs[dep, name, version] = port
+            used.add((port, version))
+        source_ports = {(op.op_id, *_port_key(port)): port for op in ordered
+                        for key, ports in op.metadata if key == "typed_outputs" for port in ports
+                        if isinstance(port, Mapping)}
+        typed_keys = (declared | source_ports.keys()) & live | {key for key in live if key[-1]}
+        typed_outputs = tuple({**source_ports.get(key, {}), "producer": fused_id,
+                               "port": outputs[key], "output": outputs[key], "name": outputs[key], "version": key[-1]}
+                              for key in sorted(typed_keys))
         fused = replace(
             tail, op_id=fused_id, family="rewrite_fused", recipe=abi, source_boundary="",
-            returns=tuple(dict.fromkeys((*tail.returns, *(ref.name for ref in spec.preserve_ports)))),
+            returns=tuple(dict.fromkeys((*tail.returns, *(ref.name for ref in spec.preserve_ports),
+                                        *outputs.values()))),
             flops=sum(op.flops for op in ordered), matrix_flops=tuple(sorted(matrix.items())),
             vector_ops=sum(op.vector_ops for op in ordered),
             link_bytes=sum(op.link_bytes for op in ordered), link_scope=link_scope,
@@ -471,11 +520,13 @@ class _RankDraft:
         metadata += tuple(named.items())
         metadata += tuple((key, tuple(port for name, port in typed if name == key))
                           for key in dict.fromkeys(name for name, _ in typed))
+        if typed_outputs:
+            metadata += (("typed_outputs", typed_outputs),)
         fused = replace(fused, deps=tuple(dict.fromkeys((*fused.deps, *sorted(cut)))), metadata=metadata)
         insertion = next(key for key in self.ops if key in keys)
         self.ops = {key: item for previous, op in self.ops.items() for key, item in (
             ((fused_id, fused), (previous, op)) if previous == insertion else ((previous, op),))}
-        self.replace_nodes(keys, fused_id)
+        self.replace_nodes(keys, fused_id, outputs)
         self.absorbed[fused_id] = tuple(atom for op in ordered
                                         for atom in self.absorbed.pop(op.op_id, (op.op_id,)))
         self.tiers[fused_id] = spec.fusion_tier
@@ -646,10 +697,8 @@ def _target_edit(draft, edit, scenario):
                 raise ModelingError(f"rewrite_dbo_empty_cohort:{key}")
         hints = {"cohort_split": spec.cohort_split}
         if tile is not None:
-            solution = _solve_tiles(scenario, draft.replica, target, tile, draft.stream)
-            hints.update(tile_algorithm=solution.algorithm, tile_uses_simt=any(
-                choice.uses_simt and choice.algorithm == solution.algorithm
-                and choice.tile_shape == solution.tile_shape for choice in tile.candidates))
+            solution, candidate = _solve_tiles(scenario, draft.replica, target, tile, draft.stream)
+            hints.update(tile_algorithm=solution.algorithm, tile_uses_simt=candidate.uses_simt)
         draft.ops[key] = _annotate(target, **hints)
         draft.tiles.append(TileBinding(edit.edit_id, key, spec.cohort_split, tile))
     elif isinstance(spec, CollectiveTransform):

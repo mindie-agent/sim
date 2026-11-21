@@ -349,21 +349,22 @@ def test_ledger_gate_rejects_inconsistent_transfer_evidence(real_graph, mutation
     assert _reason(receipt, 3) == "LEDGER_RECONCILIATION_ERROR"
 
 
-def test_ledger_gate_requires_strided_cold_sectors(real_graph):
+@pytest.mark.parametrize("runs,logical,dram", (
+    ((AddressRun(0, 4, 1, 64),), 4, 128),
+    ((AddressRun(1, 4097, 1, 101), AddressRun(33, 4097, 1, 101)), 8194, 262208),
+))
+def test_ledger_gate_requires_strided_cold_sectors(real_graph, runs, logical, dram):
     scenario, _ = real_graph
     applied, summary = _fused_summary(scenario)
-    run = AddressRun(base_byte=0, rows=4, row_bytes=1, stride_bytes=64)
-    read = replace(summary.read_obligations[0], ranges=(), address_runs=(run,))
-    sectors = len({(run.base_byte + row * run.stride_bytes) // 32 for row in range(run.rows)})
+    read = replace(summary.read_obligations[0], ranges=(), address_runs=runs)
     valid = replace(summary, read_obligations=(read,), write_obligations=(),
-                    logical_transfer_bytes=4, issued_copy_bytes=128,
-                    dram_sector_bytes=sectors * 32, turnaround_service_bytes=Fraction(128))
-    assert valid.dram_sector_bytes == 128
+                    logical_transfer_bytes=logical, issued_copy_bytes=dram,
+                    dram_sector_bytes=dram, turnaround_service_bytes=Fraction(dram))
     assert verify_plan(scenario, applied, region_summaries=(valid,)).gates[3].passed
     for changes, detail in (
-        (dict(logical_transfer_bytes=0, issued_copy_bytes=0, dram_sector_bytes=0,
-              turnaround_service_bytes=Fraction(0)), "dram_sector_bytes"),
-        (dict(logical_transfer_bytes=0), "logical_bytes"),
+        (dict(dram_sector_bytes=dram - 1), "dram_sector_bytes"),
+        (dict(logical_transfer_bytes=logical - 1), "logical_bytes"),
+        (dict(issued_copy_bytes=1), "issued_copy_bytes"),
     ):
         gate = verify_plan(scenario, applied, region_summaries=(replace(valid, **changes),)).gates[3]
         assert (gate.passed, gate.reason, gate.detail) == (

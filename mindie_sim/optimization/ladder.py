@@ -20,7 +20,7 @@ from .dual_bound import (
     build_dual_inputs_from_scenario, certify_lower_bound,
 )
 from .framework_solver import (
-    _TrialSearch, _field, _resolved, _step, _verification,
+    _TrialSearch, _accepted, _field, _resolved, _seed_plans, _step, _verification, _wall,
     solve_framework,
 )
 
@@ -257,11 +257,28 @@ def _shipping_regression(verification, u, m):
     regression = getattr(verification, "shipping_regression", None)
     if regression is not None and regression.loo_culprits:
         return regression
-    culprits = ((SHIPPING_OVERLAY, delta),)
+    culprits = ((SHIPPING_OVERLAY, -delta),)
     if regression is not None:
         return replace(regression, loo_culprits=culprits)
     return ShippingRegression(delta_ns=delta, loo_culprits=culprits,
                               baseline_u_ns=u, baseline_m_ns=m)
+
+
+def _shipping_overlay_loo(search, dossier, plan, wall, u, m):
+    unmerge, mainline = _seed_plans(dossier)
+    if (m == u or plan.base_graph_sha256 != mainline.base_graph_sha256
+            or plan.base_graph_sha256 == unmerge.base_graph_sha256):
+        return ()
+    rebased = replace(plan, base_graph_sha256=unmerge.base_graph_sha256,
+                      framing_sha256=unmerge.framing_sha256)
+    if not rebased.edits:
+        without = u
+    else:
+        result = search.try_finalize(rebased)
+        if result is None or not _accepted(result):
+            return ()
+        without = _wall(result)
+    return (LooMarginalImpact(SHIPPING_OVERLAY, "ShippingOverlay", without - wall),)
 
 
 def solve_five_level_ladder(
@@ -320,18 +337,19 @@ def solve_five_level_ladder(
         raise ValueError(f"region wall attribution does not reconcile: {reconciliation}")
 
     verification = _verification(dsl.best_eval)
-    search = _TrialSearch(dossier, max_trials, dual_program=program, event_dag=dag,
+    plan = dsl.best_plan
+    search = _TrialSearch(dossier, len(plan.edits), dual_program=program, event_dag=dag,
                           dual_certificate=certificate)
-    search.seed(dsl.best_plan, dsl.best_eval)
+    search.seed(plan, dsl.best_eval)
     regression = _shipping_regression(verification, u, m)
     if regression is not None and verification is not None:
         verification = replace(verification, shipping_regression=regression)
-    impacts = (framework.loo_impacts if dsl.best_plan == framework.best_plan
-               else search.loo(dsl.best_plan, a_dsl, search.remaining))
-    opcodes = {edit.edit_id: type(edit.operation).__name__ for edit in dsl.best_plan.edits}
+    impacts = framework.loo_impacts if plan == framework.best_plan else ()
+    if len(impacts) < len(plan.edits):
+        impacts = search.loo(plan, a_dsl, search.remaining)
+    opcodes = {edit.edit_id: type(edit.operation).__name__ for edit in plan.edits}
     loo = tuple(LooMarginalImpact(edit_id, opcodes[edit_id], impact) for edit_id, impact in impacts)
-    if m != u:
-        loo += (LooMarginalImpact(SHIPPING_OVERLAY, "ShippingOverlay", m - u),)
+    loo += _shipping_overlay_loo(search, dossier, plan, a_dsl, u, m)
     waterfall = FiveLevelWaterfall(
         _ordered_telescope(m, framework, dsl),
         loo,
