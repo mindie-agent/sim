@@ -8,9 +8,10 @@
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, fields, is_dataclass, replace
 from functools import partial
+import hashlib
 from math import prod
 from typing import TYPE_CHECKING
 
@@ -38,6 +39,7 @@ if TYPE_CHECKING:
     from mindie_sim.rewrite.schema import RewritePlan
 
 MATRIX_RANK = 3
+_RECIPE_DIGEST_LEN = 16
 _GROUPED_FAMILIES = frozenset({"grouped_gemm", "grouped_matmul", "grouped_moe", "mc2"})
 _MX_MODES = frozenset({"mxfp8", "mxfp4", "a8w4_mx"})
 _CATLASS_FIELDS = ("dispatch_policy", "scheduler", "splitk_factor", "swizzle_offset", "swizzle_direction",
@@ -460,6 +462,28 @@ def bind_catalog_recipe(op, members, datapath, *, tier, identifier, params, limi
         return OperatorPlan(work, program)
 
     return PlannedRecipe(build), summary
+
+
+def _canon_digest_value(value):
+    if is_dataclass(value) and not isinstance(value, type):
+        return (type(value).__qualname__, tuple(
+            (name, _canon_digest_value(getattr(value, name)))
+            for name in sorted(field.name for field in fields(value))
+        ))
+    if isinstance(value, Mapping):
+        return tuple(sorted((str(k), _canon_digest_value(v)) for k, v in value.items()))
+    if isinstance(value, (set, frozenset)):
+        return tuple(sorted(_canon_digest_value(v) for v in value))
+    if isinstance(value, (list, tuple)):
+        return tuple(_canon_digest_value(v) for v in value)
+    return value
+
+
+def catalog_recipe_id(replica: int, op: OpSpec, template, summary) -> str:
+    """Content-address bound catalog recipes so isolated caches never collide."""
+    payload = _canon_digest_value((summary, template))
+    digest = hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()[:_RECIPE_DIGEST_LEN]
+    return f"rewrite_template:{replica}:{op.op_id}:{digest}"
 
 
 def solve_dsl(

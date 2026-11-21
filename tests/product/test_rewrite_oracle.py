@@ -551,3 +551,30 @@ def test_indexed_catlass_simt_screens_and_finalizes_on_vector_rate():
     assert dict(summary.vector_ops_by_pipe)["aiv_simt"] == op.flops
     service = full.step_eval.execution_evidence["serviced"]
     assert sum(value for role, value in service.items() if role.startswith("vector@")) == op.flops
+
+
+def test_k3_isolated_cache_key_distinguishes_same_edit_id_declarations():
+    base = parse_case(_catalog_case())
+    die, = base.machine.dies
+    rate = 1024 * 1000
+    die = replace(die, hbm_read_bytes_per_s=rate, hbm_write_bytes_per_s=rate, hbm_rw_alpha=0.0,
+                  rates=tuple(dict(die.rates, hbm=rate).items()))
+    case = replace(base, machine=replace(base.machine, dies=(die,)))
+    make, take = _pointwise("make"), _pointwise("take", deps=("make",))
+    decls = tuple(dict(
+        numerically_equivalent=True, region_id="same_id", op_ids=("make", "take"), edge_routes=(edg,), backend="dsl_vec",
+        compiler_options=dict(edge_bytes={edg.view_id: 8192}, l2_reservation_bytes=int(dict(die.buffers)["l2"]),
+                              op_stages={op.op_id: Stage(op.op_id, {"vector": op.vector_ops}) for op in (make, take)},
+                              semantic_work=tuple(SemanticWorkItem(op.op_id, "vector_alu", op.dtype, int(op.vector_ops), ("aiv_simd",))
+                                                  for op in (make, take))),
+    ) for edg in (replace(tile_edge("ub->ub", ("aiv", "aiv")), representation=make.dtype),
+                  replace(tile_edge("gm_spill", ("aiv", "aiv")), representation=make.dtype)))
+    take_d = replace(take, metadata=(*take.metadata, ("fuse_regions", decls)))
+    dossier = prepare_scenario(ScenarioRequest(case, StepRequest("decode")), spine=_DeclaredGraphSpine(make, take_d))
+    dp = dossier.handle.scenario.datapath
+    props = list(_dsl_proposals((make, take_d), dp, dp.aic_count, dp.aiv_count))
+    p_ub = replace(dossier.unmerge_plan, edits=(Edit("f", operation=props[0][0][0]),))
+    p_gm = replace(dossier.unmerge_plan, edits=(Edit("f", operation=props[1][0][0]),))
+    f_ub, f_gm = _replay_checked(dossier.handle, p_ub), _replay_checked(dossier.handle, p_gm)
+    assert f_ub.region_summaries[0].dram_sector_bytes == 0
+    assert f_gm.region_summaries[0].dram_sector_bytes == 16384 and f_gm.verification.l_star_ns is not None

@@ -16,11 +16,79 @@ from typing import Any, Mapping, Sequence
 from .contracts import (
     AllocationKey, BindingFrame, OccurrenceKey, PortBinding, Submission,
 )
-from .engine_types import Allocation, Event, ExecutionError, _FULL_FINITE_PREFLIGHT
+from .engine_prepare import _discover_hbm_bus_aliases, _retrofit_hbm_bus_tasks
+from .engine_types import Allocation, Event, ExecutionError, Resource, _FULL_FINITE_PREFLIGHT
 from .host import cursor_for
 
 
 class _EngineCatalogMixin:
+    def _clear_prepared_caches(self) -> None:
+        self._compiled_programs.clear()
+        self._stage_id_prepared.clear()
+        self._stage_proto_prepared.clear()
+        self._stage_prepared.clear()
+        self._stage_prepared_id.clear()
+        self._pair_rate_cache.clear()
+
+    def _discover_hbm_bus_aliases(self) -> None:
+        probe = dict(self._hbm_bus_aliases)
+        if not _discover_hbm_bus_aliases(self.resources, probe):
+            return
+        for base, bus in probe.items():
+            if base not in self._hbm_bus_aliases:
+                self.bind_hbm_bus(bus)
+
+    def _flush_pending_hbm_retrofits(self) -> None:
+        if not self._pending_hbm_retrofits:
+            return
+        pending = tuple(self._pending_hbm_retrofits.items())
+        self._pending_hbm_retrofits.clear()
+        for base, (bus, replacing) in pending:
+            _retrofit_hbm_bus_tasks(
+                self._tasks, self._native_slots, base, bus,
+                replacing=replacing, include_native=True,
+            )
+
+    def bind_hbm_bus(self, bus) -> None:
+        """Bind a die's scalar HBM resource onto its directional bus rows."""
+        base = (bus.row_r[:-2] if bus.row_r.endswith(":r")
+                and bus.row_w == bus.row_r[:-2] + ":w" else "")
+        if not base or base not in self.resources:
+            return
+        if bus.row_r not in self.resources or bus.row_w not in self.resources:
+            return
+        prev = self._hbm_bus_aliases.get(base)
+        if prev == bus:
+            return
+        replacing = prev is not None
+        needs_retrofit = any(
+            task.remaining.get(base, 0.0) > 0.0
+            and (replacing or (bus.row_r not in task.remaining and bus.row_w not in task.remaining))
+            for task in self._tasks.values()
+        )
+        if needs_retrofit and self._accel is not None and self._accel.enabled:
+            self._accel.disable(self, "mixed_frontier")
+        self._hbm_bus_aliases[base] = bus
+        self._hbm_bus_epoch += 1
+        self._clear_prepared_caches()
+        if needs_retrofit and _retrofit_hbm_bus_tasks(
+            self._tasks, self._native_slots, base, bus, replacing=replacing,
+        ):
+            self._pending_hbm_retrofits[base] = (bus, replacing)
+
+    def add_hbm_bus(self, bus) -> tuple[Resource, Resource]:
+        """Declare a die's 2-row directional HBM bus resources on this Engine."""
+        rows = (
+            Resource(bus.row_r, 1.0, unit="row_fraction", policy="fair", units=1),
+            Resource(bus.row_w, 1.0, unit="row_fraction", policy="fair", units=1),
+        )
+        adding = any(row.name not in self.resources for row in rows)
+        if adding and self._accel is not None and self._accel.enabled and self._native_slots:
+            self._accel.disable(self, "mixed_frontier")
+        self.extend(rows, _discover_hbm=False)
+        self.bind_hbm_bus(bus)
+        return rows
+
     def new_occurrence(self, *, replica: int = 0, rank: int = 0,
                        stage: int = 0, ordinal: int = 0) -> OccurrenceKey:
         """Allocate one monotonically increasing launch identity."""

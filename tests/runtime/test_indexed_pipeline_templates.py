@@ -363,3 +363,59 @@ def test_two_owners_and_two_invocations_build_independent_catalogs():
     for left, right in zip(first, second):
         assert left is not right and left.index_of(0) == right.index_of(0)
         assert left.phases[0].stages[0] is not right.phases[0].stages[0]
+
+
+def test_split_and_reread_periodic_l2_admission_stay_memory_bounded():
+    from types import SimpleNamespace
+    import tracemalloc
+    from _support.axes import REPRESENTATIVE_SKUS
+    from mindie_sim.compose import compose_case
+    from mindie_sim.prediction.runtime.memory_physics import (
+        AddressRun, AddressRunPlan, AdmissionMemoryView, MemoryAccessPattern, ReuseKey,
+    )
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.schema.datapath import datapath_for_die
+    from mindie_sim.templates.fuse_region import Lowering
+
+    rows, half, stride, sparse, sector = 4_194_304, 2_097_152, 4097, 4_194_336, 32
+    dp = datapath_for_die(parse_case(compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a5"], dp=1, pp=1, layers=1, tp=1)).machine.dies[0])
+    mask_runs = AddressRunPlan((AddressRun(0, half, sector, sparse), AddressRun(half * sparse, half, sector, sparse)), sector_bytes=sector)
+    r_a = AddressRun(0, half, sector, stride)
+    key = ReuseKey(0, "rows", 0, "rows:0")
+    mask_pat = MemoryAccessPattern("rows", 0, 0, 0, "read", "mte2_aiv", mask_runs.aligned_copy_bytes(), mask_runs, key)
+    sol = SimpleNamespace(pool_peaks=())
+    for runs_pair in (
+        (r_a, AddressRun(half * stride, half, sector, stride)),
+        (r_a, AddressRun((half + 1) * stride, half, sector, stride)),
+    ):
+        view = AdmissionMemoryView({0: 512 * 1024**2}, granule_bytes=128)
+        view.admit_access(mask_pat, mask_runs.aligned_copy_bytes())
+        data_plan = AddressRunPlan(runs_pair, sector_bytes=sector)
+        tracemalloc.start()
+        try:
+            low = Lowering(dp, memory_view=view, die=0)
+            low.access("read_split", "rows", data_plan.aligned_copy_bytes(), runs=runs_pair, version=0)
+            res = low.result("K3_dsl_pipeline", "split_test", ("op0",), None, (), sol)
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        assert peak < 8 * 1024**2 and res.summary.l2_hit_bytes == 1024
+        assert res.summary.issued_copy_bytes - res.summary.l2_hit_bytes == 134_216_704
+
+    view = AdmissionMemoryView({0: 512 * 1024**2}, granule_bytes=128)
+    view.admit_access(mask_pat, mask_runs.aligned_copy_bytes())
+    full_plan = AddressRunPlan((AddressRun(0, rows, sector, stride),), sector_bytes=sector)
+    full_pat = MemoryAccessPattern("rows", 0, 0, 0, "read", "mte2_aiv", full_plan.aligned_copy_bytes(), full_plan, key)
+    view.admit_access(full_pat, full_plan.aligned_copy_bytes())
+    gapped_plan = AddressRunPlan((r_a, AddressRun((half + 1) * stride, half - 1, sector, stride)), sector_bytes=sector)
+    gapped_pat = MemoryAccessPattern("rows", 0, 0, 0, "read", "mte2_aiv", gapped_plan.aligned_copy_bytes(), gapped_plan, key)
+    tracemalloc.start()
+    try:
+        hit_full, miss_full = view.preview_access(full_pat, full_plan.aligned_copy_bytes())
+        hit_gap, miss_gap = view.preview_access(gapped_pat, gapped_plan.aligned_copy_bytes())
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert peak < 8 * 1024**2
+    assert (hit_full, miss_full) == (134_217_728, 0)
+    assert (hit_gap, miss_gap) == (gapped_plan.aligned_copy_bytes(), 0)

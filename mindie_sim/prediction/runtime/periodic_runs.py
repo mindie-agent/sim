@@ -167,14 +167,96 @@ def _disjoint_periodic(runs) -> bool:
     return all(left._bounds()[1] <= right._bounds()[0] for left, right in zip(ordered, ordered[1:]))
 
 
+def _coalesce_periodic_runs(runs: tuple) -> tuple:
+    """Merge consecutive identical-geometry periodic runs into one descriptor."""
+    if len(runs) <= 1:
+        return runs
+    ordered = sorted(runs, key=lambda r: (r.stride_bytes, r.row_bytes, r.sector_bytes, r.base_byte))
+    merged = [ordered[0]]
+    for run in ordered[1:]:
+        prev = merged[-1]
+        if (prev.stride_bytes == run.stride_bytes > 0
+                and prev.row_bytes == run.row_bytes
+                and prev.sector_bytes == run.sector_bytes
+                and prev.base_byte + prev.rows * prev.stride_bytes == run.base_byte):
+            merged[-1] = replace(prev, rows=prev.rows + run.rows)
+        else:
+            merged.append(run)
+    return tuple(merged)
+
+
+def _two_color_periodic(runs) -> tuple[tuple, tuple] | None:
+    """Partition periodic runs into at most two mutually bounding-disjoint groups."""
+    ordered = sorted(runs, key=lambda r: r._bounds())
+    group_a: list = []
+    group_b: list = []
+    end_a = -1
+    end_b = -1
+    for run in ordered:
+        lo, hi = run._bounds()
+        if hi <= lo:
+            continue
+        if lo >= end_a:
+            group_a.append(run)
+            end_a = hi
+        elif lo >= end_b:
+            group_b.append(run)
+            end_b = hi
+        else:
+            return None
+    return tuple(group_a), tuple(group_b)
+
+
+def _periodic_subrun(sub, sup) -> bool:
+    """True when every row of ``sub`` is an exact row of ``sup``."""
+    if sub == sup:
+        return True
+    if (sub.stride_bytes != sup.stride_bytes or sub.stride_bytes <= 0
+            or sub.row_bytes != sup.row_bytes or sub.sector_bytes != sup.sector_bytes):
+        return False
+    delta = sub.base_byte - sup.base_byte
+    return delta >= 0 and delta % sup.stride_bytes == 0 and (delta // sup.stride_bytes) + sub.rows <= sup.rows
+
+
+def _prune_periodic_subruns(runs: tuple) -> tuple:
+    """Drop periodic descriptors completely covered by another run in ``runs``."""
+    unique = tuple(dict.fromkeys(runs))
+    if len(unique) <= 1:
+        return unique
+    kept = []
+    for idx, run in enumerate(unique):
+        if any(j != idx and _periodic_subrun(run, other) for j, other in enumerate(unique)):
+            continue
+        kept.append(run)
+    return tuple(kept)
+
+
 def _coverage_overlap(left: SectorCoverage, right: SectorCoverage) -> int:
     if left.empty or right.empty:
         return 0
-    if not left.intervals and not right.intervals and left.periodic and right.periodic:
-        if len(left.periodic) == 1 and len(right.periodic) == 1:
-            if left.periodic[0] == right.periodic[0]:
-                return left.periodic[0].total_bytes()
-            dense, sparse = sorted((*left.periodic, *right.periodic), key=lambda r: r.stride_bytes)
+    left_c = _prune_periodic_subruns(_coalesce_periodic_runs(left.periodic)) if left.periodic else ()
+    right_c = _prune_periodic_subruns(_coalesce_periodic_runs(right.periodic)) if right.periodic else ()
+    if not left.intervals and left_c and all(any(_periodic_subrun(l, r) for r in right_c) for l in left_c):
+        return _merged_bytes(SectorCoverage((), left_c))
+    if not right.intervals and right_c and all(any(_periodic_subrun(r, l) for l in left_c) for r in right_c):
+        return _merged_bytes(SectorCoverage((), right_c))
+    if not left.intervals and not right.intervals and left_c and right_c:
+        left_p = tuple(
+            l for l in left_c
+            if any(l._bounds()[0] < r._bounds()[1] and r._bounds()[0] < l._bounds()[1] for r in right_c)
+        )
+        if not left_p:
+            return 0
+        right_p = tuple(
+            r for r in right_c
+            if any(l._bounds()[0] < r._bounds()[1] and r._bounds()[0] < l._bounds()[1] for l in left_p)
+        )
+        if not right_p:
+            return 0
+        if len(left_p) == 1 and len(right_p) == 1:
+            if left_p[0] == right_p[0]:
+                return left_p[0].total_bytes()
+            dense, sparse = sorted((left_p[0], right_p[0]), key=lambda r: r.stride_bytes)
             d_lo, d_hi = dense._bounds()
             s_lo, s_hi = sparse._bounds()
             if d_hi <= s_lo or s_hi <= d_lo:
@@ -182,21 +264,41 @@ def _coverage_overlap(left: SectorCoverage, right: SectorCoverage) -> int:
             if sparse.stride_bytes >= sparse.row_bytes + sparse.sector_bytes and _sparse_window(dense, (sparse,)):
                 rows = _window_rows(sparse, d_lo - sparse.sector_bytes, d_hi + sparse.sector_bytes)
                 return sum(dense.overlap_with_interval(*sparse._row_bounds(row)) for row in rows)
-        elif _disjoint_periodic(left.periodic) and len(right.periodic) == 1:
-            return sum(_coverage_overlap(SectorCoverage((), (r,)), right) for r in left.periodic)
-        elif len(left.periodic) == 1 and _disjoint_periodic(right.periodic):
-            return sum(_coverage_overlap(left, SectorCoverage((), (r,))) for r in right.periodic)
-    elif not left.intervals and len(left.periodic) == 1 and left.periodic[0] in right.periodic:
-        return left.periodic[0].total_bytes()
+        elif _disjoint_periodic(left_p) and len(left_p) > 1:
+            return sum(
+                _coverage_overlap(SectorCoverage((), (l,)), SectorCoverage((), right_p))
+                for l in left_p
+            )
+        elif _disjoint_periodic(right_p) and len(right_p) > 1:
+            return sum(
+                _coverage_overlap(SectorCoverage((), left_p), SectorCoverage((), (r,)))
+                for r in right_p
+            )
     return left.overlap_bytes(right)
 
 
 def _merged_bytes(coverage: SectorCoverage) -> int:
-    if not coverage.intervals and len(coverage.periodic) == 2:
-        left, right = coverage.periodic
-        return left.total_bytes() + right.total_bytes() - _coverage_overlap(
-            SectorCoverage((), (left,)), SectorCoverage((), (right,)),
-        )
+    if coverage.periodic:
+        runs = _prune_periodic_subruns(_coalesce_periodic_runs(coverage.periodic))
+        if not coverage.intervals:
+            if len(runs) == 1:
+                return runs[0].total_bytes()
+            colored = _two_color_periodic(runs)
+            if colored is not None:
+                group_a, group_b = colored
+                total = sum(r.total_bytes() for r in group_a) + sum(r.total_bytes() for r in group_b)
+                if group_a and group_b:
+                    total -= sum(
+                        _coverage_overlap(SectorCoverage((), (a,)), SectorCoverage((), (b,)))
+                        for a in group_a for b in group_b
+                    )
+                return total
+        elif _disjoint_periodic(runs):
+            ivs = coverage.intervals
+            return sum(hi - lo for lo, hi in ivs) + sum(
+                max(0, r.total_bytes() - sum(r.overlap_with_interval(lo, hi) for lo, hi in ivs))
+                for r in runs
+            )
     return coverage.measure_bytes()
 
 

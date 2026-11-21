@@ -115,7 +115,7 @@ class AdmissionMemoryView:
     def _settle_eviction(self, entry: _ResidentL2Entry) -> None:
         if entry.dirty and entry.has_future_reader:
             wb_bytes = (
-                entry.dirty_coverage.measure_bytes()
+                _merged_bytes(entry.dirty_coverage)
                 or _measure_byte_intervals(entry.dirty_ranges)
                 or entry.working_set_bytes
             )
@@ -303,7 +303,7 @@ class AdmissionMemoryView:
     ) -> tuple[int, int]:
         if req_cov.empty or res_cov.empty:
             return 0, aligned_bytes
-        req_b = req_cov.measure_bytes()
+        req_b = _merged_bytes(req_cov)
         if req_b <= 0:
             return 0, aligned_bytes
         ov_b = _coverage_overlap(req_cov, res_cov)
@@ -373,7 +373,7 @@ class AdmissionMemoryView:
         working_set = max(
             pattern.reuse_distance_bytes
             if pattern.reuse_distance_bytes is not None else aligned_bytes,
-            req_cov.measure_bytes(),
+            _merged_bytes(req_cov),
         )
         return self._classify_access(
             pattern, aligned_bytes, eff, req_cov, working_set, evicted_keys=evicted_keys,
@@ -401,7 +401,7 @@ class AdmissionMemoryView:
             evicted_keys = {e.key for e in self._eviction_victims(key.die, eff, avail)}
             ws = max(
                 pattern.reuse_distance_bytes if pattern.reuse_distance_bytes is not None else aligned_bytes,
-                req_cov.measure_bytes(),
+                _merged_bytes(req_cov),
             )
             if key not in evicted_keys and existing.working_set_bytes <= eff and ws <= eff:
                 return existing.resident_coverage
@@ -440,7 +440,7 @@ class AdmissionMemoryView:
         eff = self.effective_l2_bytes(key.die)
         req_cov = pattern.runs.sector_coverage()
         req_ivs = req_cov.intervals
-        req_span = req_cov.measure_bytes()
+        req_span = _merged_bytes(req_cov)
         working_set = max(
             pattern.reuse_distance_bytes if pattern.reuse_distance_bytes is not None else aligned_bytes,
             req_span,
@@ -552,7 +552,7 @@ def _dram_service_segments(
             continue
         run_cov = AddressRunPlan((run,), sector_bytes=sec).sector_coverage()
         if not partial or run_cov.periodic:
-            missed = (run_cov.measure_bytes() - _coverage_overlap(run_cov, covered)
+            missed = (_merged_bytes(run_cov) - _coverage_overlap(run_cov, covered)
                       if run_cov.periodic or covered.periodic else
                       _measure_byte_intervals(_subtract_byte_intervals(run_cov.intervals, covered.intervals)))
             if missed > 0:

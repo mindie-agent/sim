@@ -127,7 +127,10 @@ class Engine(
         self._native_active = 0
         self._native_seeded = False
         self._wave_recorder = None
-        self._hbm_bus_aliases: dict[str, tuple[str, str]] = {}
+        self._hbm_bus_aliases: dict[str, Any] = {}
+        self._hbm_bus_epoch: int = 0
+        self._pending_hbm_retrofits: dict[str, tuple[Any, bool]] = {}
+        self._discover_hbm_bus_aliases()
         if self._accel is not None and getattr(self._accel, "mode", "") == "c":
             self._accel.try_attach(self)
 
@@ -143,49 +146,6 @@ class Engine(
         recorder = self._wave_recorder
         self._wave_recorder = None
         return recorder
-
-    def add_hbm_bus(self, bus) -> tuple[Resource, Resource]:
-        """Declare a die's 2-row directional HBM bus resources on this Engine."""
-        rows = (
-            Resource(bus.row_r, 1.0, unit="row_fraction", policy="fair", units=1),
-            Resource(bus.row_w, 1.0, unit="row_fraction", policy="fair", units=1),
-        )
-        base = (bus.row_r[:-2] if bus.row_r.endswith(":r")
-                and bus.row_w == bus.row_r[:-2] + ":w" else "")
-        needs_alias = bool(base and base in self.resources and base not in self._hbm_bus_aliases)
-        needs_retrofit = needs_alias and any(
-            task.remaining.get(base, 0.0) > 0.0
-            and bus.row_r not in task.remaining and bus.row_w not in task.remaining
-            for task in self._tasks.values()
-        )
-        adding = any(row.name not in self.resources for row in rows)
-        if (self._accel is not None and self._accel.enabled
-                and ((adding and self._native_slots) or needs_retrofit)):
-            self._accel.disable(self, "mixed_frontier")
-        self.extend(rows)
-        if needs_alias:
-            self._hbm_bus_aliases[base] = (bus.row_r, bus.row_w)
-            if needs_retrofit:
-                self._retrofit_hbm_bus_alias(base, bus.row_r, bus.row_w)
-        return rows
-
-    def _retrofit_hbm_bus_alias(self, base: str, row_r: str, row_w: str) -> None:
-        """Bind already-submitted shipping HBM tasks onto the die's directional rows."""
-        rate = self.resources[base].rate
-        if rate <= 0.0:
-            return
-        for task in self._tasks.values():
-            rem = task.remaining.get(base, 0.0)
-            if rem <= 0.0 or row_r in task.remaining or row_w in task.remaining:
-                continue
-            dem = task.demand.get(base, rem)
-            task.demand = {**task.demand, row_r: dem / rate, row_w: dem / rate}
-            task.remaining[row_r] = rem / rate
-            task.remaining[row_w] = rem / rate
-            if base in task.caps:
-                cap = task.caps[base] / rate
-                task.caps = {**task.caps, row_r: cap, row_w: cap}
-            task.prepared = None
 
     @property
     def accel_backend(self) -> str:
@@ -264,7 +224,7 @@ class Engine(
                 return True
         return False
 
-    def extend(self, resources=(), pools=None, pool_units=None):
+    def extend(self, resources=(), pools=None, pool_units=None, *, _discover_hbm: bool = True):
         """Add a disjoint physical pool to the same virtual clock.
 
         A second ``Execution``/``Memory`` binding may re-declare the exact
@@ -295,12 +255,9 @@ class Engine(
             self._pool_unit_masks[name] = 0
             self._alloc_state_version += 1
         self._seen_floor_peaks.clear()
-        self._compiled_programs.clear()
-        self._stage_id_prepared.clear()
-        self._stage_proto_prepared.clear()
-        self._stage_prepared.clear()
-        self._stage_prepared_id.clear()
-        self._pair_rate_cache.clear()
+        self._clear_prepared_caches()
+        if added_resource and _discover_hbm:
+            self._discover_hbm_bus_aliases()
         if (added_resource and self._accel is not None
                 and self._accel.enabled
                 and not self._tasks and not self._native_slots):

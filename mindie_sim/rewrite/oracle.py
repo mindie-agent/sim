@@ -530,7 +530,7 @@ def _device_counts(ops, targets, book, case, include_submission):
 
 def _bind_replay(scenario, applied, book, handle):
     """Bind the selected executable recipes and collect catalog audit summaries."""
-    from mindie_sim.optimization.dsl_solver import replay_catalog_binding
+    from mindie_sim.optimization.dsl_solver import catalog_recipe_id, replay_catalog_binding
     if applied.prefetch_leases and applied.streams:
         raise ModelingError("rewrite_prefetch_stream_events_unbound")
     templates = {binding.target_op: binding for binding in applied.template_bindings}
@@ -551,7 +551,7 @@ def _bind_replay(scenario, applied, book, handle):
             catalog = replay_catalog_binding(scenario, atomic[entry.replica], op, template,
                                              applied, streams.get(entry.replica))
             if catalog:
-                identifier = f"rewrite_template:{entry.replica}:{op.op_id}"
+                identifier = catalog_recipe_id(entry.replica, op, template, catalog[1])
                 registered[identifier], summary = catalog
                 summaries.append(summary)
                 op = replace(op, recipe=identifier)
@@ -571,7 +571,7 @@ def _bind_replay(scenario, applied, book, handle):
                         or any(not any(name == binding.topology_route for name, _, _ in topology.route(a, b))
                                for a, b in pairs)):
                     raise ModelingError(f"rewrite_collective_route_recipe_unbound:{op.op_id}")
-                identifier = f"rewrite_collective:{op.op_id}"
+                identifier = f"rewrite_collective:{op.op_id}:{binding.mode}:{binding.topology_route}"
                 registered[identifier] = recipes[binding.mode]()
                 op = replace(op, recipe=identifier)
             if op.family == "rewrite_fused" and (len(next(

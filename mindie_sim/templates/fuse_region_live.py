@@ -72,7 +72,9 @@ class _BoundTemplateProgram(KernelProgram):
             present = (bus.row_r in engine.resources, bus.row_w in engine.resources)
             if not any(present):
                 engine.add_hbm_bus(bus)
-            elif not all(present):
+            elif all(present):
+                engine.bind_hbm_bus(bus)
+            else:
                 raise ModelingError("template_directional_hbm_rows_incomplete")
         if self.live_state is None:
             return super().start(engine, name, ready, owner=owner)

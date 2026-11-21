@@ -536,3 +536,53 @@ def test_host_split_elision_replays_with_device_count_rendezvous():
     dispatch = rows[barrier["op_id"]]
     assert gather.occurrence in dispatch.predecessors and gather.end_ms <= dispatch.start_ms
     assert dispatch.implementation == "TopologyCollectiveRecipe"
+
+
+def test_asymmetric_hbm_arbiter_and_catlass_base_byte_obligation():
+    from mindie_sim.catalog.ops import gemm_op
+    from mindie_sim.catalog.types import QuantSpec
+    from mindie_sim.optimization.dsl_solver import _catlass_proposals
+    from mindie_sim.prediction.spine import PredictionSpine
+    from mindie_sim.prediction.streams import StreamCoreBudget, StreamLane
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.rewrite.schema import StreamSchedule
+    from mindie_sim.templates.catlass_catalog import CatlassProblem
+
+    def spine_for(*ops):
+        class _Spine(PredictionSpine):
+            def lower(self, case, request, **kwargs):
+                prepared = super().lower(case, request, **kwargs)
+                rank, = prepared.graph.executable
+                return replace(prepared, graph=replace(prepared.graph, executable=(replace(rank, ops=ops),), streams=()))
+        return _Spine()
+
+    base = parse_case(compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a5"], dp=1, pp=1, layers=1, tp=1))
+    die, = base.machine.dies
+    asym = replace(die, hbm_read_bytes_per_s=512 * 1000, hbm_write_bytes_per_s=1024 * 1000, hbm_rw_alpha=0.0,
+                   rates=tuple(dict(die.rates, hbm=1024 * 1000).items()))
+    case_asym = replace(base, machine=replace(base.machine, dies=(asym,)))
+    mk = lambda oid, md: gemm_op(op_id=oid, deps=(), requests=(), stage=0, layer=0, m=1, n=64, k=64,
+                                 quant=QuantSpec("bf16"), category="dense", phase="decode", metadata=md)
+    g0 = mk("g0", (("weight_allocation_id", "W0"), ("weight_initial_residency", "hbm_cold"), ("weight_ranges", ((8192, 16384),))))
+    g1 = mk("g1", (("weight_allocation_id", "W1"), ("weight_initial_residency", "hbm_cold"), ("weight_bytes", 8192)))
+    dossier = prepare_scenario(ScenarioRequest(case_asym, StepRequest("decode")), spine=spine_for(g0, g1))
+    dp = dossier.handle.scenario.datapath
+    ha, hv = dp.aic_count // 2, dp.aiv_count // 2
+    lanes = (StreamLane("main", StreamCoreBudget(ha, hv, "disjoint")),
+             StreamLane("aux", StreamCoreBudget(dp.aic_count - ha, dp.aiv_count - hv, "disjoint")))
+    for target in (g0, g1):
+        (cat_edit,), _ = next(_catlass_proposals((target,), dp, ha, hv))
+        plan = replace(dossier.unmerge_plan, edits=(
+            Edit("s", operation=StreamSchedule(lanes, ((_atom("g0"), "main"), (_atom("g1"), "aux")), ())),
+            Edit("c", operation=cat_edit)))
+        full = finalize_plan(dossier.handle, plan)
+        assert full.verification.passed and full.step_eval.span_ms >= 32.0 and full.verification.l_star_ns <= full.wall_ns
+
+    prob = CatlassProblem(1, 64, 64, "bf16", "bf16", "bf16", "fp32", b_id="W", b_base_byte=8192)
+    g_off = mk("g0", (("weight_allocation_id", "W"), ("weight_initial_residency", "hbm_cold"),
+                      ("weight_payload_bytes", 8192), ("catlass_problem", prob)))
+    d_off = prepare_scenario(ScenarioRequest(base, StepRequest("decode")), spine=spine_for(g_off))
+    dp_off = d_off.handle.scenario.datapath
+    (cat_off,), _ = next(_catlass_proposals((g_off,), dp_off, dp_off.aic_count, dp_off.aiv_count))
+    full_off = finalize_plan(d_off.handle, replace(d_off.unmerge_plan, edits=(Edit("c", operation=cat_off),)))
+    assert full_off.verification.passed and full_off.verification.l_star_ns <= full_off.wall_ns

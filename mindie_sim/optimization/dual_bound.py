@@ -608,6 +608,11 @@ def _cold_weight_read(op, meta, die):
     residency = meta.get("weight_initial_residency", meta.get("initial_residency"))
     if identity is None or residency != "hbm_cold":
         return None
+    decl = meta.get("catlass_problem")
+    raw_base = decl.get("b_base_byte", 0) if isinstance(decl, Mapping) else getattr(decl, "b_base_byte", 0)
+    raw_ver = decl.get("b_version", 0) if isinstance(decl, Mapping) else getattr(decl, "b_version", 0)
+    decl_base = raw_base if type(raw_base) is int and raw_base >= 0 else 0
+    decl_ver = raw_ver if type(raw_ver) is int and raw_ver >= 0 else 0
     ranges = meta.get("weight_ranges", meta.get("ranges"))
     if ranges is None:
         # A declared allocation can describe its contiguous payload by size.
@@ -617,8 +622,9 @@ def _cold_weight_read(op, meta, die):
         touched = min(size, mte2_bytes)
         if not touched >= 1:
             return None
-        ranges = ((0, int(touched)),)
-    version = meta.get("weight_tensor_version", meta.get("tensor_version", 0))
+        ranges = ((decl_base, decl_base + int(touched)),)
+    meta_ver = meta.get("weight_tensor_version", meta.get("tensor_version", 0))
+    version = decl_ver if decl_ver else (meta_ver if type(meta_ver) is int and meta_ver >= 0 else 0)
     return TensorRangeObligation(die, identity, version, tuple(ranges), "hbm_cold", "owner")
 
 def _derive_default_obligations(scenario, demands, aliases, covered, *, infer_work=True):

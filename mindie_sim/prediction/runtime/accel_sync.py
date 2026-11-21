@@ -424,6 +424,7 @@ def sync_back(backend, engine) -> None:
                     task.remaining[name] = remaining
                 else:
                     task.remaining.pop(name, None)
+    engine._flush_pending_hbm_retrofits()
     releases = {entry[1] for entry in engine._releases}
     settled: list[int] = []
     for sequence in tuple(engine._native_slots):

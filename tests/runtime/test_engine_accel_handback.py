@@ -441,3 +441,83 @@ def test_periodic_template_blocks_rearm_during_callbacks_then_resumes_past_int32
         outcomes[backend] = (eng.now, eng.serviced["r"], [t.time for t in tails])
         close(eng)
     assert outcomes["auto"] == outcomes["python"]
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_hbm_bus_directional_aliasing_preprepared_and_native_hook(backend):
+    from mindie_sim.prediction.runtime.memory_physics import HbmBusSpec
+
+    # Equal-rate alpha=0: shipping read and independent catalog write overlap in 8 ms.
+    bus_eq = HbmBusSpec(0, 1024.0, 1024.0, 0.0, row_r="memory@r0:s0:r", row_w="memory@r0:s0:w")
+    eng = Engine([Resource("memory@r0:s0", 1024.0), Resource("mte2_aic@r0:s0", 8192.0)], backend=backend)
+    eng.add_hbm_bus(bus_eq)
+    ev_r = eng.submit("ship_read", {"memory@r0:s0": 8192.0, "mte2_aic@r0:s0": 8192.0})
+    ev_w = eng.submit("cat_write", {"memory@r0:s0:w": 8.0})
+    eng.advance(until=(ev_r, ev_w), first=False)
+    assert eng.now == pytest.approx(8.0)
+    close(eng)
+
+    # Pre-prepared stage refreshes against later bus registration (16 ms).
+    eng2 = Engine([Resource("memory@r0:s0", 1024.0)], backend=backend)
+    prep = eng2.prepare_stage("ship_read", {"memory@r0:s0": 8192.0})
+    eng2.add_hbm_bus(bus_eq)
+    e1 = eng2.submit_prepared(prep, "ship_read")
+    e2 = eng2.submit("cat_read", {"memory@r0:s0:r": 8.0})
+    eng2.advance(until=(e1, e2), first=False)
+    assert eng2.now == pytest.approx(16.0)
+    close(eng2)
+
+    # Pre-existing directional rows register aliases immediately (16 ms).
+    eng3 = Engine([
+        Resource("memory@r0:s0", 1024.0),
+        Resource("memory@r0:s0:r", 1.0, unit="row_fraction", policy="fair", units=1),
+        Resource("memory@r0:s0:w", 1.0, unit="row_fraction", policy="fair", units=1),
+    ], backend=backend)
+    e1 = eng3.submit("ship_read", {"memory@r0:s0": 8192.0})
+    e2 = eng3.submit("cat_read", {"memory@r0:s0:r": 8.0})
+    eng3.advance(until=(e1, e2), first=False)
+    assert eng3.now == pytest.approx(16.0)
+    close(eng3)
+
+    # Registering bus from a native_hook=True callback defers native-slot retrofit cleanly.
+    eng4 = Engine([Resource("memory@r0:s0", 1024.0)], backend=backend)
+    ship = eng4.submit("ship_read", {"memory@r0:s0": 10240.0})
+    eng4.submit("hook", latency=3.0, on_complete=lambda _ev: eng4.add_hbm_bus(bus_eq), native_hook=True)
+    eng4.advance(until=(ship,))
+    assert ship.time == pytest.approx(10.0)
+    close(eng4)
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_tensor_view_alias_waits_for_backing_dirty_writeback(backend):
+    from mindie_sim.prediction.runtime.memory_physics import (
+        AddressRun, AddressRunPlan, AdmissionMemoryView, HbmBusSpec,
+        MemoryAccessPattern, ReuseKey, VisibilityContract, bind_memory_access,
+    )
+
+    size = 64
+    bus = HbmBusSpec(0, 64.0, 16.0, 0.0)
+    view = AdmissionMemoryView({0: size}, granule_bytes=size)
+    eng = Engine([Resource("mte3", 32.0, units=1), Resource("mte2_aiv", 64.0, units=1),
+                  Resource("l2", 64.0, units=1)], backend=backend, trace_limit=64)
+    eng.add_hbm_bus(bus)
+    key = ReuseKey(0, "buf_X", 1, "s0")
+    runs = AddressRunPlan((AddressRun(0, 1, size, size),))
+    p_wr = MemoryAccessPattern("X", 1, 0, 0, "write", "mte3", size, runs, key,
+                               visibility=VisibilityContract(scope="die", private_workspace=True))
+    p_rd = MemoryAccessPattern("X", 1, 0, 0, "read", "mte2_aiv", size, runs, key,
+                               visibility=VisibilityContract(scope="die", private_workspace=True))
+    b_wr = bind_memory_access(p_wr, view, hbm_bus=bus, copy_hit_bytes_per_ms=32.0, copy_miss_bytes_per_ms=32.0,
+                              l2_bytes_per_ms=64.0, pipe_row_id="mte3", l2_row_id="l2", commit=False)
+    b_rd = bind_memory_access(p_rd, view, hbm_bus=bus, copy_hit_bytes_per_ms=64.0, copy_miss_bytes_per_ms=64.0,
+                              l2_bytes_per_ms=64.0, pipe_row_id="mte2_aiv", l2_row_id="l2", commit=False)
+    ev_w = eng.submit_bound_access("wr", b_wr, release=0.0, memory_state=view, pattern=p_wr)
+    eng.advance(until=(ev_w,))
+    eng.advance(horizon=2.5)
+    view.grant_reservation(0, "full", size)
+    r1 = eng.submit_bound_access("r1", b_rd, release=3.0, memory_state=view, pattern=p_rd)
+    r2 = eng.submit_bound_access("r2", b_rd, release=4.1, memory_state=view, pattern=p_rd)
+    eng.advance(until=(r1, r2), first=False)
+    wb_end = next(r["end_ms"] for r in eng.trace if "dirty_writeback" in r["task"])
+    assert r1.time >= wb_end and r2.time >= wb_end and eng.delivered[bus.ctr_w] == float(size)
+    close(eng)

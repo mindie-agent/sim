@@ -198,6 +198,7 @@ class _PreparedTask:
     cohort_widened: tuple[str, ...] = ()
     cohort_members: tuple[tuple[str, tuple[tuple[int, ...], ...]], ...] = ()
     latency_from_first_service: bool = False
+    hbm_bus_epoch: int = 0
 
 
 _EMPTY_TASK = _PreparedTask({}, 0.0, {}, (), (), {}, False, (), 0)

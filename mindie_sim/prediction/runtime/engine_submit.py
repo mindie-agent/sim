@@ -16,6 +16,7 @@ from typing import Callable, Sequence
 
 from . import frontier
 from .contracts import OccurrenceKey
+from .engine_prepare import _refresh_prepared_for_hbm_bus
 from .engine_types import (
     Event, ExecutionError, _EMPTY_FROZENSET, _EMPTY_METADATA, _Task,
     _chain_callbacks,
@@ -23,7 +24,15 @@ from .engine_types import (
 from .memory_physics import (
     AdmissionMemoryView, CACHE_POLICY_DISABLE, CACHE_POLICY_LAST_USE, SectorCoverage, bind_memory_access,
 )
-from .l2_residency import _coverage_overlap, _coverage_runs, _residency_runs
+from .l2_residency import _coverage_overlap, _coverage_runs, _merged_bytes, _residency_runs
+
+
+def _backing_identity(pattern) -> tuple[int, str, int]:
+    """Return canonical ``(die, backing_allocation, tensor_version)`` for coherence."""
+    key = pattern.reuse_key
+    if key is not None:
+        return key.die, key.backing_allocation, key.tensor_version
+    return pattern.die, pattern.tensor_id, pattern.version
 
 
 class _EngineSubmitMixin:
@@ -35,6 +44,7 @@ class _EngineSubmitMixin:
     ) -> Event:
         # Dependencies and allocations remain live invocation state. Only static
         # work, supply and placement validation can be shared by repeated tiles.
+        prepared = _refresh_prepared_for_hbm_bus(self, prepared, name)
         now = self.now
         tasks = self._tasks
         pending_one = None
@@ -262,6 +272,7 @@ class _EngineSubmitMixin:
         self, prepared, name: str, obs_name: str, after, owner: str = "",
     ) -> tuple[Event, Event]:
         """Submit a host launch task and its start_boundary observer in one step."""
+        prepared = _refresh_prepared_for_hbm_bus(self, prepared, name)
         now = self.now
         tasks = self._tasks
         pending_one = None
@@ -553,8 +564,9 @@ class _EngineSubmitMixin:
                 pat = pattern() if callable(pattern) else pattern
             resident = memory_state.resident_coverage_for(pat, aligned)
             coverage = pat.runs.sector_coverage()
+            wb_die, wb_alloc, wb_ver = _backing_identity(pat)
             if pat.direction == "read" and not coverage.empty:
-                pending_wbs = memory_state.pop_matching_writebacks(pat.die, pat.tensor_id, pat.version, coverage)
+                pending_wbs = memory_state.pop_matching_writebacks(wb_die, wb_alloc, wb_ver, coverage)
                 if pending_wbs:
                     wb_entries = tuple(
                         (item.die, item.key.backing_allocation, item.key.tensor_version,
@@ -565,7 +577,7 @@ class _EngineSubmitMixin:
                     admit_extra += sum(item.bytes for item in pending_wbs)
                     launch_writebacks(name + ":dirty_writeback", wb_entries, (event,))
                 wbs = getattr(self, "_inflight_writebacks", None)
-                wb_pending = wbs.get((memory_state, pat.die, pat.tensor_id, pat.version)) if wbs else None
+                wb_pending = wbs.get((memory_state, wb_die, wb_alloc, wb_ver)) if wbs else None
                 wb_waits = _overlapping_writebacks(wb_pending, coverage, resident) if wb_pending else ()
                 if wb_waits:
                     def retry_wb(ready):
@@ -588,7 +600,7 @@ class _EngineSubmitMixin:
             fills = getattr(self, "_inflight_l2_fills", None)
             pending = fills.get(identity) if fills else None
             working_set = max(aligned if pat.reuse_distance_bytes is None else pat.reuse_distance_bytes,
-                              coverage.measure_bytes())
+                              _merged_bytes(coverage))
             waits = (_overlapping_fills(pending, coverage, resident)
                      if pending and working_set <= memory_state._preview_effective_l2(key) else ())
             if waits:
@@ -636,7 +648,7 @@ class _EngineSubmitMixin:
                 drained = memory_state.drain_writebacks(bus.die)
                 entries = []
                 if extra_self:
-                    entries.append((pat.die, pat.tensor_id, pat.version, coverage, extra_self))
+                    entries.append((wb_die, wb_alloc, wb_ver, coverage, extra_self))
                 for item in drained:
                     item_cov = item.coverage if not item.coverage.empty else SectorCoverage(intervals=item.ranges)
                     entries.append((item.die, item.key.backing_allocation, item.key.tensor_version,
@@ -714,7 +726,7 @@ def _overlapping_writebacks(pending, requested, resident):
                 waits.append(done)
             else:
                 excluded = (_coverage_overlap(requested, resident) + _coverage_overlap(wb_cov, resident)
-                            - requested.union(wb_cov).overlap_bytes(resident))
+                            - _coverage_overlap(requested.union(wb_cov), resident))
                 if overlap > excluded:
                     waits.append(done)
     return tuple(waits)
@@ -727,7 +739,7 @@ def _overlapping_fills(pending, requested, resident):
         if overlap:
             available = resident.union(previously_resident)
             excluded = (_coverage_overlap(requested, available) + _coverage_overlap(filling, available)
-                        - requested.union(filling).overlap_bytes(available))
+                        - _coverage_overlap(requested.union(filling), available))
             if overlap > excluded:
                 waits.append(done)
     return tuple(waits)
@@ -751,5 +763,5 @@ def _settle_access(state, pattern, ledger, resident, coverage):
     _, miss = state.admit_access(pattern, aligned)
     if pattern.direction == "write" and ledger.l2_hit_bytes and miss:
         # Reservation or stream pressure can remove capacity during the write.
-        return coverage.measure_bytes()
+        return _merged_bytes(coverage)
     return 0
