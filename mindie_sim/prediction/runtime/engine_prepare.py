@@ -134,7 +134,7 @@ class _EnginePrepareMixin:
                 and cohort_size == 1 and not cohort_widened and not cohort_members
                 and not latency_from_first_service):
             return _EMPTY_TASK
-        hbm_accounting: tuple[tuple[str, float, float | None], ...] = ()
+        hbm_accounting: tuple[tuple[str, float, float, float | None, str, float, str, float], ...] = ()
         if work and self._hbm_bus_aliases:
             work, caps, hbm_accounting = _expand_hbm_bus_work(self._hbm_bus_aliases, name, work, caps)
         if (work is not None and work.__class__ is dict and not caps

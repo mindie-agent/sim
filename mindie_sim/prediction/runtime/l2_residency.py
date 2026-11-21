@@ -57,6 +57,7 @@ class _ResidentL2Entry:
     evicted: bool = False
     resident_ranges: tuple[tuple[int, int], ...] = ()
     resident_coverage: SectorCoverage = SectorCoverage()
+    resident_bytes: int = 0
     dirty_ranges: tuple[tuple[int, int], ...] = ()
     dirty_coverage: SectorCoverage = SectorCoverage()
     has_future_reader: bool = True
@@ -458,11 +459,16 @@ class AdmissionMemoryView:
                         existing.evicted = True
                     return hit_b, miss_b
                 if miss_b > 0:
-                    merged_cov = existing.resident_coverage.union(req_cov)
-                    merged_b = _merged_bytes(merged_cov)
+                    ov_b = (
+                        _coverage_overlap(req_cov, existing.resident_coverage)
+                        if hit_b > 0 else 0
+                    )
+                    merged_b = existing.resident_bytes + req_span - ov_b
                     if max(existing.working_set_bytes, working_set, merged_b) <= eff:
+                        merged_cov = existing.resident_coverage.union(req_cov)
                         existing.resident_coverage = merged_cov
                         existing.resident_ranges = merged_cov.intervals
+                        existing.resident_bytes = merged_b
                         existing.working_set_bytes = max(
                             existing.working_set_bytes, working_set, merged_b,
                         )
@@ -473,6 +479,7 @@ class AdmissionMemoryView:
                             key=key, working_set_bytes=working_set, version=pattern.version,
                             dirty=False, private_workspace=pattern.visibility.private_workspace,
                             evicted=False, resident_ranges=req_ivs, resident_coverage=req_cov,
+                            resident_bytes=req_span,
                         ))
                 else:
                     self._touch_resident(existing)
@@ -485,6 +492,7 @@ class AdmissionMemoryView:
                     key=key, working_set_bytes=working_set, version=pattern.version,
                     dirty=False, private_workspace=pattern.visibility.private_workspace,
                     evicted=False, resident_ranges=req_ivs, resident_coverage=req_cov,
+                    resident_bytes=req_span,
                 ))
                 self._evict_over_capacity(key.die, protect_key=key)
             elif existing is not None:
@@ -500,19 +508,20 @@ class AdmissionMemoryView:
             if same and max(existing.working_set_bytes, working_set, merged_b) <= eff:
                 res_cov = merged_cov
                 res_ivs = merged_cov.intervals
+                res_b = merged_b
                 dirty_ivs = _merge_byte_intervals((*prev_dirty, *req_ivs))
                 dirty_cov = prev_dirty_cov.union(req_cov)
                 ws_new = max(existing.working_set_bytes, working_set, merged_b)
             else:
                 if existing is not None and not existing.evicted:
                     self._settle_eviction(existing)
-                res_cov, res_ivs, dirty_ivs, dirty_cov, ws_new = (
-                    req_cov, req_ivs, req_ivs, req_cov, working_set,
+                res_cov, res_ivs, res_b, dirty_ivs, dirty_cov, ws_new = (
+                    req_cov, req_ivs, req_span, req_ivs, req_cov, working_set,
                 )
             self._touch_resident(_ResidentL2Entry(
                 key=key, working_set_bytes=ws_new, version=pattern.version,
                 dirty=True, private_workspace=True, evicted=False,
-                resident_ranges=res_ivs, resident_coverage=res_cov,
+                resident_ranges=res_ivs, resident_coverage=res_cov, resident_bytes=res_b,
                 dirty_ranges=dirty_ivs, dirty_coverage=dirty_cov, has_future_reader=True,
             ))
             self._evict_over_capacity(key.die, protect_key=key)
@@ -524,6 +533,7 @@ class AdmissionMemoryView:
                 key=key, working_set_bytes=working_set, version=pattern.version,
                 dirty=False, private_workspace=False, evicted=False,
                 resident_ranges=req_ivs, resident_coverage=req_cov,
+                resident_bytes=req_span,
             ))
             self._evict_over_capacity(key.die, protect_key=key)
         elif existing is not None:
@@ -569,7 +579,8 @@ def _dram_service_segments(
                     missed_sectors = True
                     stride = run.stride_bytes
                     yield span, span, stride if stride == 0 or stride > run.row_bytes else span
-        covered = covered.union(run_cov)
+        if len(plan.runs) > 1:
+            covered = covered.union(run_cov)
     if missed_sectors and plan.scale_bytes:
         yield ((plan.scale_bytes + sec - 1) // sec) * sec, 0, 0
 

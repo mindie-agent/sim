@@ -18,7 +18,11 @@ import math
 from math import gcd, lcm
 from typing import Any
 
-from ._periodic_stream import _stream_intersect_bytes, _stream_union_bytes
+from ._periodic_stream import (
+    _overlap_canonical_intervals,
+    _stream_intersect_bytes,
+    _stream_union_bytes,
+)
 
 from .memory_physics import (
     AddressRun,
@@ -469,6 +473,11 @@ def _measure_periodic_combo(
         return _measure_byte_intervals(_merge_byte_intervals((*extra_left_ivs, *extra_right_ivs)))
     if intersect and ((not left_c and not extra_left_ivs) or (not right_c and not extra_right_ivs)):
         return 0
+    if intersect and not left_c and not right_c:
+        return _overlap_canonical_intervals(
+            _merge_byte_intervals(extra_left_ivs),
+            _merge_byte_intervals(extra_right_ivs),
+        )
     if not intersect and len(left_c) == 1 and not right_c:
         r0, ivs = left_c[0], _merge_byte_intervals((*extra_left_ivs, *extra_right_ivs))
         return _measure_byte_intervals(ivs) + max(0, r0.total_bytes() - sum(r0.overlap_with_interval(a, b) for a, b in ivs))

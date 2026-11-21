@@ -448,11 +448,38 @@ def drain_obs_bridge(backend: Any, engine: Any) -> bool:
     return bool(count > 0 or overflow.value > 0)
 
 
+def sync_native_hbm_accounting(backend: Any, engine: Any) -> None:
+    """Credit incremental scalar HBM service from live native directional slots."""
+    arena = backend.arena
+    if arena is None or not engine._hbm_acct_live or not engine._native_slots:
+        return
+    from ._engine_hbm_bus import _sync_task_hbm_accounting
+    tasks = engine._tasks
+    export_fn = arena.library.msim_ctx_export
+    ctx = arena.ctx
+    for seq, slot in engine._native_slots.items():
+        task = tasks.get(seq)
+        if task is None or not task.hbm_accounting:
+            continue
+        rem_names = tuple(task.remaining)
+        n = len(rem_names)
+        if n == 0:
+            _sync_task_hbm_accounting(engine, task, {})
+            continue
+        buf = (ctypes.c_double * (2 * n))()
+        got = int(export_fn(ctx, slot, buf, 2 * n))
+        if got != n:
+            continue
+        live_rem = {rem_names[i]: float(buf[i]) for i in range(n)}
+        _sync_task_hbm_accounting(engine, task, live_rem)
+
+
 def sync_native_deliveries(backend: Any, engine: Any) -> None:
     """Flush partial delivery counters for live native tasks at epoch/horizon boundaries."""
     arena = backend.arena
     if arena is None or not engine._delivery_live or not engine._native_slots:
         return
+    from ._engine_hbm_bus import _hbm_delivery_fraction
     tasks = engine._tasks
     deliv = engine.delivered
     export_fn = arena.library.msim_ctx_export
@@ -466,7 +493,26 @@ def sync_native_deliveries(backend: Any, engine: Any) -> None:
             continue
         rem_names = tuple(task.remaining)
         n = len(rem_names)
-        if n == 0 or ref_r not in task.remaining:
+        if task.hbm_accounting:
+            if n == 0:
+                live_rem: dict[str, float] = {}
+            else:
+                buf = (ctypes.c_double * (2 * n))()
+                got = int(export_fn(ctx, slot, buf, 2 * n))
+                if got != n:
+                    continue
+                live_rem = {rem_names[i]: float(buf[i]) for i in range(n)}
+            hbm_frac = _hbm_delivery_fraction(task, live_rem)
+            if hbm_frac is not None:
+                frac = hbm_frac
+            elif n == 0 or ref_r not in task.remaining:
+                frac = 1.0
+            else:
+                idx = rem_names.index(ref_r)
+                svc = task.service.get(ref_r, 0.0) + float(buf[n + idx])
+                ref_d = task.demand[ref_r]
+                frac = min(1.0, svc / ref_d) if ref_d > 0.0 else 1.0
+        elif n == 0 or ref_r not in task.remaining:
             frac = 1.0
         else:
             buf = (ctypes.c_double * (2 * n))()

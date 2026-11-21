@@ -1,13 +1,15 @@
 """Directional HBM bus aliasing, work expansion, and live task retrofit helpers.
 
 [Role] Map scalar shipping HBM work onto bound directional ``:r``/``:w`` bus
-  rows while keeping the scalar HBM byte total as completion accounting only
-  so concurrent read/write shipping stages achieve full-duplex throughput.
+  rows while keeping live incremental scalar HBM accounting and delivery
+  progress tied to directional bus progress across Python and C11 execution.
 [Invariants] Directional bus rows govern bus contention exclusively once bound;
-  scalar HBM byte totals are conserved in ``task.service`` and ``Engine.serviced``
-  across Python and C11 execution without double counting or serialization.
+  scalar HBM work order is preserved in-place for delivery reference semantics;
+  live scalar HBM service and rebinds compute remaining fractions strictly from
+  each entry's own binding snapshot with exact total byte conservation.
 [Timeouts & Locks] Pure bounded in-memory dict/task rewrites; no locks or I/O.
-[Side-Effect Policy] Mutates only live task work/accounting fields on retrofit.
+[Side-Effect Policy] Mutates only live task work/accounting fields and Engine
+  service counters on step sync or retrofit.
 """
 from __future__ import annotations
 
@@ -16,6 +18,8 @@ import re
 from typing import Mapping
 
 from .memory_physics import HbmBusSpec
+
+HbmAccountingEntry = tuple[str, float, float, float | None, str, float, str, float]
 
 _READ_PIPE_PREFIXES = frozenset({"mte2", "mte2_aic", "mte2_aiv"})
 _WRITE_PIPE_PREFIXES = frozenset({"mte3", "fixpipe"})
@@ -29,6 +33,99 @@ _NAME_SPLIT_RE = re.compile(r"[^a-z0-9]+")
 _ROW_READ_SUFFIX = ":r"
 _ROW_WRITE_SUFFIX = ":w"
 _UNIT_ROW_RATE = 1.0
+
+
+def _replace_keys_in_place(
+    mapping: Mapping[str, float],
+    replace_keys: tuple[str, ...],
+    row_r: str, val_r: float, row_w: str, val_w: float,
+) -> dict[str, float]:
+    """Replace any key in ``replace_keys`` in-place preserving first-match order."""
+    match = set(replace_keys)
+    match.add(row_r)
+    match.add(row_w)
+    out: dict[str, float] = {}
+    inserted = False
+    for k, v in mapping.items():
+        if k in match:
+            if not inserted:
+                if val_r > 0.0:
+                    out[row_r] = val_r
+                if val_w > 0.0:
+                    out[row_w] = val_w
+                inserted = True
+            continue
+        out[k] = v
+    if not inserted:
+        if val_r > 0.0:
+            out[row_r] = val_r
+        if val_w > 0.0:
+            out[row_w] = val_w
+    return out
+
+
+def _hbm_rem_fraction(remaining: Mapping[str, float], entry: HbmAccountingEntry) -> float:
+    """Return outstanding directional fraction in ``[0.0, 1.0]`` against the entry's bind snapshot."""
+    _, _, _, _, row_r, t_r, row_w, t_w = entry
+    ratios: list[float] = []
+    if t_r > 0.0:
+        ratios.append(remaining.get(row_r, 0.0) / t_r)
+    if t_w > 0.0:
+        ratios.append(remaining.get(row_w, 0.0) / t_w)
+    if not ratios:
+        return 0.0
+    return min(1.0, max(0.0, max(ratios)))
+
+
+def _hbm_entry_done_fraction(entry: HbmAccountingEntry, remaining: Mapping[str, float]) -> float:
+    """Return total task-lifetime completion fraction ``[0.0, 1.0]`` for one bound HBM entry."""
+    _, total_b, rem_at_bind, _, _, _, _, _ = entry
+    if total_b <= 0.0:
+        return 1.0
+    rem_now = rem_at_bind * _hbm_rem_fraction(remaining, entry)
+    return min(1.0, max(0.0, 1.0 - rem_now / total_b))
+
+
+def _hbm_delivery_fraction(
+    task, live_remaining: Mapping[str, float] | None = None,
+) -> float | None:
+    """Return directional HBM progress fraction when the task's delivery reference is HBM-bound."""
+    if not task.hbm_accounting:
+        return None
+    ref_r = next(iter(task.demand), None)
+    if ref_r is None:
+        return None
+    rem_map = task.remaining if live_remaining is None else live_remaining
+    for entry in task.hbm_accounting:
+        if ref_r == entry[4] or ref_r == entry[6]:
+            return _hbm_entry_done_fraction(entry, rem_map)
+    return None
+
+
+def _sync_task_hbm_accounting(
+    engine, task, live_remaining: Mapping[str, float] | None = None,
+) -> None:
+    """Credit incremental scalar HBM bytes derived from live directional bus progress."""
+    if not task.hbm_accounting:
+        return
+    rem_map = task.remaining if live_remaining is None else live_remaining
+    credited = task.hbm_credited
+    if credited is None:
+        credited = task.hbm_credited = {}
+    acct_serviced = engine._hbm_accounting_serviced
+    serviced = engine.serviced
+    task_svc = task.service
+    for entry in task.hbm_accounting:
+        base = entry[0]
+        rem_at_bind = entry[2]
+        done_since_bind = rem_at_bind * (1.0 - _hbm_rem_fraction(rem_map, entry))
+        prev = credited.get(base, 0.0)
+        delta = done_since_bind - prev
+        if delta > 0.0:
+            credited[base] = done_since_bind
+            task_svc[base] = task_svc.get(base, 0.0) + delta
+            serviced[base] = serviced.get(base, 0.0) + delta
+            acct_serviced[base] = acct_serviced.get(base, 0.0) + delta
 
 
 def _hbm_bus_alias_terms(
@@ -82,13 +179,13 @@ def _hbm_bus_alias_terms(
 def _expand_hbm_bus_work(
     aliases: Mapping[str, object], name: str,
     work: Mapping[str, float], caps: Mapping[str, float] | None,
-) -> tuple[Mapping[str, float], Mapping[str, float] | None, tuple[tuple[str, float, float | None], ...]]:
-    """Route shipping scalar HBM demands onto directional bus rows without scalar serialization."""
+) -> tuple[Mapping[str, float], Mapping[str, float] | None, tuple[HbmAccountingEntry, ...]]:
+    """Route shipping scalar HBM demands onto directional bus rows preserving work order."""
     if not any(base in work and work[base] for base in aliases):
         return work, caps, ()
     expanded = dict(work)
     expanded_caps = dict(caps) if caps else None
-    accounting: list[tuple[str, float, float | None]] = []
+    accounting: list[HbmAccountingEntry] = []
     for base, bus in aliases.items():
         amount = expanded.get(base)
         if not amount or bus.row_r in expanded or bus.row_w in expanded:
@@ -99,10 +196,7 @@ def _expand_hbm_bus_work(
         t_r, t_w = _hbm_bus_alias_terms(bus, base, name, expanded, amt)
         if t_r <= 0.0 and t_w <= 0.0:
             continue
-        if t_r > 0.0:
-            expanded[bus.row_r] = t_r
-        if t_w > 0.0:
-            expanded[bus.row_w] = t_w
+        expanded = _replace_keys_in_place(expanded, (base,), bus.row_r, t_r, bus.row_w, t_w)
         orig_cap: float | None = None
         if expanded_caps is not None and base in expanded_caps:
             cap_val = float(expanded_caps[base])
@@ -113,8 +207,7 @@ def _expand_hbm_bus_work(
                 if t_w > 0.0:
                     expanded_caps.setdefault(bus.row_w, t_w * cap_val / amt)
                 expanded_caps.pop(base, None)
-        expanded.pop(base, None)
-        accounting.append((base, amt, orig_cap))
+        accounting.append((base, amt, amt, orig_cap, bus.row_r, t_r, bus.row_w, t_w))
     return expanded, expanded_caps, tuple(accounting)
 
 
@@ -142,7 +235,7 @@ def _discover_hbm_bus_aliases(resources: Mapping, aliases: dict) -> bool:
 
 def _retrofit_hbm_bus_tasks(
     tasks: Mapping, native_slots: Mapping, base: str, bus, *,
-    replacing: bool = False, include_native: bool = False,
+    engine=None, replacing: bool = False, include_native: bool = False,
 ) -> bool:
     """Bind already-submitted shipping HBM tasks onto ``bus`` directional rows."""
     deferred = False
@@ -155,24 +248,11 @@ def _retrofit_hbm_bus_tasks(
             if not include_native and seq in native_slots:
                 deferred = True
                 continue
-            dem = task.demand.get(base, rem)
+            had_acct = bool(task.hbm_accounting)
+            total_b = float(task.demand.get(base, rem))
             t_r, t_w = _hbm_bus_alias_terms(bus, base, task.event.name, task.demand, rem)
-            d_r, d_w = _hbm_bus_alias_terms(bus, base, task.event.name, task.demand, dem)
-            new_demand = {k: v for k, v in task.demand.items() if k not in (base, bus.row_r, bus.row_w)}
-            if d_r > 0.0:
-                new_demand[bus.row_r] = d_r
-            if d_w > 0.0:
-                new_demand[bus.row_w] = d_w
-            task.demand = new_demand
-            task.remaining.pop(base, None)
-            if t_r > 0.0:
-                task.remaining[bus.row_r] = t_r
-            else:
-                task.remaining.pop(bus.row_r, None)
-            if t_w > 0.0:
-                task.remaining[bus.row_w] = t_w
-            else:
-                task.remaining.pop(bus.row_w, None)
+            task.demand = _replace_keys_in_place(task.demand, (base,), bus.row_r, t_r, bus.row_w, t_w)
+            task.remaining = _replace_keys_in_place(task.remaining, (base,), bus.row_r, t_r, bus.row_w, t_w)
             orig_cap: float | None = None
             if base in task.caps:
                 cap_val = float(task.caps[base])
@@ -185,45 +265,54 @@ def _retrofit_hbm_bus_tasks(
                         new_caps[bus.row_w] = t_w * cap_val / rem
                 task.caps = new_caps
             other_acct = tuple(item for item in task.hbm_accounting if item[0] != base)
-            task.hbm_accounting = (*other_acct, (base, rem, orig_cap))
+            task.hbm_accounting = (
+                *other_acct,
+                (base, total_b, rem, orig_cap, bus.row_r, t_r, bus.row_w, t_w),
+            )
+            if task.hbm_credited is None:
+                task.hbm_credited = {base: 0.0}
+            else:
+                task.hbm_credited[base] = 0.0
+            if engine is not None and not had_acct:
+                engine._hbm_acct_live += 1
             task.prepared = None
         elif replacing and acct_entry is not None:
             if not include_native and seq in native_slots:
                 deferred = True
                 continue
-            _, orig_rem, orig_cap = acct_entry
-            ratios = [
-                task.remaining.get(row, 0.0) / task.demand[row]
-                for row in (bus.row_r, bus.row_w)
-                if task.demand.get(row, 0.0) > 0.0
-            ]
-            frac = max(ratios) if ratios else 0.0
-            if frac <= 0.0:
+            if engine is not None:
+                _sync_task_hbm_accounting(engine, task)
+            _, total_b, rem_at_bind, orig_cap, old_r, _, old_w, _ = acct_entry
+            rem_frac = _hbm_rem_fraction(task.remaining, acct_entry)
+            if rem_frac <= 0.0:
                 continue
-            rem_now = orig_rem * frac
+            rem_now = rem_at_bind * rem_frac
             t_r, t_w = _hbm_bus_alias_terms(bus, base, task.event.name, task.demand, rem_now)
-            d_r, d_w = _hbm_bus_alias_terms(bus, base, task.event.name, task.demand, orig_rem)
-            new_demand = {k: v for k, v in task.demand.items() if k not in (base, bus.row_r, bus.row_w)}
-            if d_r > 0.0:
-                new_demand[bus.row_r] = d_r
-            if d_w > 0.0:
-                new_demand[bus.row_w] = d_w
-            task.demand = new_demand
-            if t_r > 0.0:
-                task.remaining[bus.row_r] = t_r
-            else:
-                task.remaining.pop(bus.row_r, None)
-            if t_w > 0.0:
-                task.remaining[bus.row_w] = t_w
-            else:
-                task.remaining.pop(bus.row_w, None)
+            task.demand = _replace_keys_in_place(
+                task.demand, (base, old_r, old_w), bus.row_r, t_r, bus.row_w, t_w,
+            )
+            task.remaining = _replace_keys_in_place(
+                task.remaining, (base, old_r, old_w), bus.row_r, t_r, bus.row_w, t_w,
+            )
             if orig_cap is not None and rem_now > 0.0:
-                new_caps = {k: v for k, v in task.caps.items() if k not in (base, bus.row_r, bus.row_w)}
+                new_caps = {
+                    k: v for k, v in task.caps.items()
+                    if k not in (base, old_r, old_w, bus.row_r, bus.row_w)
+                }
                 if t_r > 0.0:
                     new_caps[bus.row_r] = t_r * orig_cap / rem_now
                 if t_w > 0.0:
                     new_caps[bus.row_w] = t_w * orig_cap / rem_now
                 task.caps = new_caps
+            other_acct = tuple(item for item in task.hbm_accounting if item[0] != base)
+            task.hbm_accounting = (
+                *other_acct,
+                (base, total_b, rem_now, orig_cap, bus.row_r, t_r, bus.row_w, t_w),
+            )
+            if task.hbm_credited is None:
+                task.hbm_credited = {base: 0.0}
+            else:
+                task.hbm_credited[base] = 0.0
             task.prepared = None
     return deferred
 
@@ -231,7 +320,7 @@ def _retrofit_hbm_bus_tasks(
 def _refresh_prepared_for_hbm_bus(engine, prepared, name: str):
     """Re-prepare cached shipping tasks whenever HBM directional bindings changed."""
     aliases = engine._hbm_bus_aliases
-    acct_map = {base: (amt, cap) for base, amt, cap in prepared.hbm_accounting}
+    acct_map = {entry[0]: (entry[1], entry[3]) for entry in prepared.hbm_accounting}
     if (not aliases or prepared.hbm_bus_epoch == engine._hbm_bus_epoch
             or (not prepared.demand and not acct_map)):
         return prepared
@@ -242,10 +331,27 @@ def _refresh_prepared_for_hbm_bus(engine, prepared, name: str):
         if base in prepared.demand or base in acct_map
         for row in (bus.row_r, bus.row_w)
     }
-    raw_demand = {k: v for k, v in prepared.demand.items() if k not in drop}
+    raw_demand: dict[str, float] = {}
+    restored: set[str] = set()
+    row_to_base = {
+        row: base for base, bus in aliases.items()
+        if base in acct_map
+        for row in (bus.row_r, bus.row_w)
+    }
+    for k, v in prepared.demand.items():
+        if k in row_to_base:
+            b = row_to_base[k]
+            if b not in restored:
+                raw_demand[b] = acct_map[b][0]
+                restored.add(b)
+            continue
+        if k not in drop:
+            raw_demand[k] = v
+    for b, (amt, _) in acct_map.items():
+        if b not in restored:
+            raw_demand[b] = amt
     raw_caps = {k: v for k, v in prepared.caps.items() if k not in drop} if prepared.caps else {}
-    for base, (amt, cap) in acct_map.items():
-        raw_demand[base] = amt
+    for base, (_, cap) in acct_map.items():
         if cap is not None:
             raw_caps[base] = cap
     return engine._prepare(

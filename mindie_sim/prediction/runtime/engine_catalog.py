@@ -46,7 +46,7 @@ class _EngineCatalogMixin:
         for base, (bus, replacing) in pending:
             _retrofit_hbm_bus_tasks(
                 self._tasks, self._native_slots, base, bus,
-                replacing=replacing, include_native=True,
+                engine=self, replacing=replacing, include_native=True,
             )
 
     def bind_hbm_bus(self, bus) -> None:
@@ -73,7 +73,7 @@ class _EngineCatalogMixin:
         self._hbm_bus_epoch += 1
         self._clear_prepared_caches()
         if needs_retrofit and _retrofit_hbm_bus_tasks(
-            self._tasks, self._native_slots, base, bus, replacing=replacing,
+            self._tasks, self._native_slots, base, bus, engine=self, replacing=replacing,
         ):
             self._pending_hbm_retrofits[base] = (bus, replacing)
 

@@ -199,10 +199,13 @@ class _EngineSubmitMixin:
             None, prepared.latency_from_first_service, None,
             list(pending) if (wave_rec is not None and pending is not None) else None,
             prepared.hbm_accounting,
+            {} if prepared.hbm_accounting else None,
         )
         tasks[event.sequence] = task
         if deliv_tuple:
             self._delivery_live += 1
+        if prepared.hbm_accounting:
+            self._hbm_acct_live += 1
         if wave_rec is not None:
             preds = (
                 (pending_one.sequence,) if pending_one is not None
@@ -353,8 +356,11 @@ class _EngineSubmitMixin:
             bindings, (), prepared.cohort_size, prepared, obs, False,
             prepared.cohort_widened, prepared.cohort_members,
             hbm_accounting=prepared.hbm_accounting,
+            hbm_credited={} if prepared.hbm_accounting else None,
         )
         tasks[seq_launch] = task
+        if prepared.hbm_accounting:
+            self._hbm_acct_live += 1
         wave_rec = self._wave_recorder
         if wave_rec is not None:
             preds = (

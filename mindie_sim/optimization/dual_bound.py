@@ -462,7 +462,7 @@ class _Demands:
         self.devices = {device.rank: device for device in getattr(machine, "dies", ())}
         self.paths = {die: datapath_for_die(device) for die, device in self.devices.items()}
         self.links = {link.name: link for link in getattr(machine, "links", ())}
-        if self.certified and self.table is not None:
+        if self.table is not None:
             from mindie_sim.primitives.loader import validate_table_sku_compatibility
             for device in self.devices.values():
                 if getattr(device, "sku", ""):

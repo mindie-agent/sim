@@ -28,6 +28,17 @@ from types import MappingProxyType
 from typing import Any, Literal, cast
 
 from mindie_sim.schema.common import ModelingError
+from ._capture_verify import (
+    CAPTURE_URI_SCHEME,
+    _CAPTURE_META_KEYS,
+    _JSONL_SUFFIXES,
+    _JSON_SUFFIXES,
+    _capture_ranks,
+    _collect_event_names,
+    _extract_capture_meta as _extract_capture_meta_impl,
+    resolve_capture_file,
+    verify_capture_file_consistency as _verify_capture_file_consistency_impl,
+)
 
 STREAM_CHUNK_BYTES = 64 * 1024
 STREAM_WHOLE_READ_LIMIT_BYTES = 50 * 1024 * 1024
@@ -36,20 +47,12 @@ MS_TO_NS = 1_000_000
 _CLOCK_EPS_MS = 1e-6
 _HMAC_KEY_BYTES = 32
 _RECEIPT_HMAC_KEY = secrets.token_bytes(_HMAC_KEY_BYTES)
-CAPTURE_URI_SCHEME = "capture://"
 _SHA256_PREFIX = "sha256:"
 Level = Literal["L1", "L2", "L3"]
 VALID_CLOCK_OPERATORS = frozenset({"elapsed_span", "busy_union"})
 SOURCE_REF_KEYS = frozenset({"repository", "revision", "relative_path", "source_sha256"})
 TIME_UNIT_SCALE_NS: Mapping[str, int] = MappingProxyType({
     "ns": 1, "us": 1000, "ms": 1_000_000, "s": 1_000_000_000,
-})
-_JSON_SUFFIXES = frozenset({".json", ".jsonl", ".ndjson"})
-_JSONL_SUFFIXES = frozenset({".jsonl", ".ndjson"})
-_CAPTURE_META_KEYS = frozenset({
-    "device_ranks", "ranks", "profiled_ranks", "device_rank", "rank",
-    "clock_domain", "clock_operator", "start_event", "end_event", "event_ids", "events",
-    "boundary", "metadata",
 })
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _HEX_ANYCASE_RE = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -374,157 +377,24 @@ def digest_file_streaming(path: Path) -> str:
     return hasher.hexdigest().lower()
 
 
-def resolve_capture_file(
-    capture_uri: str, source_ref: tuple[tuple[str, str], ...], *,
-    capture_root: Path | None, capture_files: Mapping[str, str | Path] | None,
-    case_id: str, raw_sha256: str,
-) -> Path | None:
-    """Resolve an optional local capture file without storing host paths in manifests."""
-    if capture_files:
-        for key in (case_id, capture_uri, raw_sha256.lower()):
-            if key and key in capture_files:
-                resolved = Path(capture_files[key])
-                if not resolved.is_file():
-                    raise ModelingError(f"capture_file_missing:{case_id}")
-                return resolved
-    if capture_root is None:
-        return None
-    if capture_uri and capture_uri.startswith(CAPTURE_URI_SCHEME):
-        rel = capture_uri[len(CAPTURE_URI_SCHEME):].lstrip("/")
-        rel_path = PurePosixPath(rel)
-        if ".." in rel_path.parts or not rel_path.parts:
-            raise ModelingError(f"capture_uri_path_unsafe:{case_id}")
-        candidates = [capture_root / rel_path, *([capture_root / f"{rel}.json"] if not rel_path.suffix else []), capture_root / rel_path.name]
-        for cand in candidates:
-            if cand.is_file():
-                return cand
-    if rel_ref := dict(source_ref).get("relative_path"):
-        cand = capture_root / PurePosixPath(rel_ref)
-        if cand.is_file():
-            return cand
-    return None
-
-
-def _collect_event_names(raw_events: Any) -> set[str]:
-    names: set[str] = set()
-    if isinstance(raw_events, Sequence) and not isinstance(raw_events, (str, bytes)):
-        for item in raw_events:
-            if isinstance(item, str) and item.strip():
-                names.add(item.strip())
-            elif isinstance(item, Mapping):
-                for field in ("event_id", "id", "name"):
-                    if isinstance(val := item.get(field), str) and val.strip():
-                        names.add(val.strip())
-    return names
-
-
 def _extract_capture_meta(path: Path, *, ijson_mod: Any = None) -> dict[str, Any]:
-    if path.suffix.lower() in _JSONL_SUFFIXES:
-        merged: dict[str, Any] = {}
-        events_found: set[str] = set()
-        for row in stream_jsonl(path):
-            for key in _CAPTURE_META_KEYS - {"events", "event_ids"}:
-                if key in row:
-                    merged.setdefault(key, row[key])
-            events_found |= _collect_event_names(row.get("event_ids")) | _collect_event_names(row.get("events"))
-            for field in ("event_id", "name"):
-                if isinstance(row.get(field), str) and row[field].strip():
-                    events_found.add(row[field].strip())
-        if events_found:
-            merged["event_ids"] = sorted(events_found)
-        return merged
-    meta: dict[str, Any] = {}
-    with path.open("rb") as handle:
-        events = _iter_json_events(handle, ijson_mod=ijson_mod)
-        if next(events)[0] != "start_map":
-            return meta
-        while (entry := next(events))[0] != "end_map":
-            key = str(entry[1])
-            if key in _CAPTURE_META_KEYS:
-                meta[key] = _read_value(events)
-            else:
-                _skip_value(events)
-    return meta
-
-
-def _capture_ranks(meta: Mapping[str, Any]) -> set[int] | None:
-    for container in (meta, meta.get("boundary"), meta.get("metadata")):
-        if not isinstance(container, Mapping):
-            continue
-        for key in ("device_ranks", "ranks", "profiled_ranks"):
-            raw = container.get(key)
-            if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
-                ranks = {int(x) for x in raw if not isinstance(x, bool) and isinstance(x, int)}
-                return ranks if len(ranks) == len(raw) else set()
-        for key in ("device_rank", "rank"):
-            raw = container.get(key)
-            if isinstance(raw, int) and not isinstance(raw, bool):
-                return {raw}
-    return None
+    return _extract_capture_meta_impl(
+        path, ijson_mod=ijson_mod,
+        stream_jsonl_fn=stream_jsonl,
+        iter_json_events_fn=_iter_json_events,
+        read_value_fn=_read_value,
+        skip_value_fn=_skip_value,
+    )
 
 
 def verify_capture_file_consistency(case_id: str, boundary: Any, path: Path, *, ijson_mod: Any = None) -> None:
     """Fail closed when an on-disk capture file mismatches digest, rank, clock, or events."""
-    try:
-        actual_sha = digest_file_streaming(path)
-    except TimeoutError:
-        raise
-    except OSError as exc:
-        raise ModelingError(f"capture_file_unreadable:{case_id}") from exc
-    expected_sha = str(boundary.raw_sha256).strip().lower()
-    if actual_sha != expected_sha:
-        raise ModelingError(f"capture_digest_mismatch:{case_id}:expected={expected_sha}:actual={actual_sha}")
-    is_json_file = path.suffix.lower() in _JSON_SUFFIXES
-    if not is_json_file:
-        with path.open("rb") as handle:
-            is_json_file = handle.read(STREAM_CHUNK_BYTES).lstrip().startswith((b"{", b"["))
-    if not is_json_file:
-        return
-    try:
-        meta = _extract_capture_meta(path, ijson_mod=ijson_mod)
-    except TimeoutError:
-        raise
-    except ModelingError as exc:
-        raise ModelingError(f"capture_file_unreadable:{case_id}:{exc.reason}") from exc
-    except (OSError, StopIteration) as exc:
-        raise ModelingError(f"capture_file_unreadable:{case_id}") from exc
-    cap_ranks = _capture_ranks(meta)
-    if cap_ranks is not None and cap_ranks != set(boundary.device_ranks):
-        raise ModelingError(f"capture_rank_mismatch:{case_id}:expected={sorted(boundary.device_ranks)}:actual={sorted(cap_ranks)}")
-    cap_events: set[str] = set()
-    matched_start = False
-    matched_end = False
-    for container in (meta, meta.get("boundary"), meta.get("metadata")):
-        if not isinstance(container, Mapping):
-            continue
-        if "clock_operator" in container and container["clock_operator"] != boundary.clock_operator:
-            raise ModelingError(f"capture_clock_operator_mismatch:{case_id}:expected={boundary.clock_operator}")
-        if (cap_clock := container.get("clock_domain")) is not None and str(cap_clock).strip() != str(boundary.clock_domain).strip():
-            raise ModelingError(f"capture_clock_domain_mismatch:{case_id}:expected={boundary.clock_domain}:actual={cap_clock}")
-        if (cap_start := container.get("start_event")) is not None:
-            if str(cap_start).strip() != str(boundary.start_event).strip():
-                raise ModelingError(f"capture_event_mismatch:{case_id}:start_event")
-            matched_start = True
-        if (cap_end := container.get("end_event")) is not None:
-            if str(cap_end).strip() != str(boundary.end_event).strip():
-                raise ModelingError(f"capture_event_mismatch:{case_id}:end_event")
-            matched_end = True
-        for key in ("event_ids", "events"):
-            cap_events |= _collect_event_names(container.get(key))
-    start_name = str(boundary.start_event).strip()
-    end_name = str(boundary.end_event).strip()
-    if not matched_start and start_name not in cap_events:
-        raise ModelingError(f"capture_event_mismatch:{case_id}:start_event_absent:{start_name}")
-    if not matched_end and end_name not in cap_events:
-        raise ModelingError(f"capture_event_mismatch:{case_id}:end_event_absent:{end_name}")
-    if boundary.event_ids:
-        known_events = set(cap_events)
-        if matched_start:
-            known_events.add(start_name)
-        if matched_end:
-            known_events.add(end_name)
-        if missing := [ev for ev in boundary.event_ids if ev.strip() not in known_events]:
-            raise ModelingError(f"capture_event_mismatch:{case_id}:missing={','.join(missing)}")
+    _verify_capture_file_consistency_impl(
+        case_id, boundary, path, ijson_mod=ijson_mod,
+        digest_fn=digest_file_streaming,
+        stream_chunk_bytes=STREAM_CHUNK_BYTES,
+        extract_meta_fn=_extract_capture_meta,
+    )
 
 
 @dataclass(frozen=True, slots=True)

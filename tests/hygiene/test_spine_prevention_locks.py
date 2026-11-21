@@ -29,7 +29,7 @@ from mindie_sim.optimization import (
 from mindie_sim.prediction.program import Stage
 from mindie_sim.prediction.results import StepRequest
 from mindie_sim.prediction.runtime.engine import Engine
-from mindie_sim.prediction.runtime.engine_types import Resource
+from mindie_sim.prediction.runtime.engine_types import Allocation, Resource
 from mindie_sim.prediction.runtime.memory_physics import (
     AddressRun, AddressRunPlan, AdmissionMemoryView, HbmBusSpec, PeriodicSectorRun, SectorCoverage,
     _measure_periodic_combo,
@@ -49,11 +49,11 @@ from mindie_sim.schema.hardware import Device
 from mindie_sim.schema.hardware_links import Link
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.stack_registry import LoweringRequest
-from mindie_sim.templates import _catlass_coalesced as catlass_coalesced
 from mindie_sim.templates import catlass_lower, compile_fuse_region, registry as templates_registry
 from mindie_sim.templates.catlass_catalog import CatlassProblem, enumerate_catlass_specs
 from _support.axes import REPRESENTATIVE_SKUS
 from _support.collective_cases import case as col_case, exchange
+from _support.linear_cases import recipe_context, sku_planning_context
 
 pytestmark = pytest.mark.tier0
 
@@ -196,8 +196,8 @@ def test_lock5_dual_bound_nonzero_across_all_work_classes_and_partial_annotation
 
 def test_lock5_k2_k3_autogeneration_and_search_stats_disclosure():
     base_table = load_primitives(SKU_A5)
-    case_qwen = compose_case("qwen3-32b", hardware=SKU_A5, tp=4, layers=1, quant="bf16")
-    report = api.optimize_ladder(case_qwen, StepRequest("decode", context=DECODE_CTX),
+    case_ds = compose_case("deepseek-v4-flash", hardware=SKU_A5, tp=1, layers=1)
+    report = api.optimize_ladder(case_ds, StepRequest("decode", context=DECODE_CTX),
                                  primitive_table=base_table, max_trials=2)
     assert isinstance(report.search_stats, CandidateSearchStats)
     assert report.search_stats.eligible_sites > 0
@@ -207,6 +207,7 @@ def test_lock5_k2_k3_autogeneration_and_search_stats_disclosure():
     assert isinstance(report.primitive_coverage_gaps, tuple) and report.primitive_coverage_gaps
 
     spine = PredictionSpine()
+    case_qwen = compose_case("qwen3-32b", hardware=SKU_A5, tp=4, layers=1, quant="bf16")
     case_obj = Case.from_mapping(case_qwen)
     dp = datapath_for_die(case_obj.machine.dies[0])
     prep_q = spine.lower(case_obj, LoweringRequest(step=StepRequest("decode", context=DECODE_CTX),
@@ -282,34 +283,41 @@ def test_rc14_dual_bound_soundness_for_onchip_copy_per_pair_link_and_pure_vector
     assert 0 < cert2.l_star_lean_ns <= wall2_ns
 
 
-def test_rc14_catlass_coalescing_parity_splitk_and_small_l2_guards():
+def test_rc14_catlass_exact_panel_causality_l0a_hold_l2_and_splitk():
+    geo, _ = sku_planning_context(SKU_A5)
     dp = datapath_for_die(parse_case(compose_case("qwen3-32b", hardware=SKU_A5, tp=1, layers=1)).machine.dies[0])
-    p1 = CatlassProblem(m=1, n=1024, k=512, dtype_a="bf16", dtype_b="bf16", dtype_c="bf16", dtype_acc="fp32")
-    s1 = next(s for s in enumerate_catlass_specs(p1, dp)
-              if s.scheduler == "dataparallel" and s.epilogue_kind == "none"
-              and not s.mx_scale_group and s.dispatch_policy != "MmadPingpongMutex")
-    orig_t = catlass_coalesced.COALESCED_PANEL_THRESHOLD
-    try:
-        catlass_coalesced.COALESCED_PANEL_THRESHOLD = 10**9
-        ru = catlass_lower.lower_catlass_spec(s1, p1, dp)
-        catlass_coalesced.COALESCED_PANEL_THRESHOLD = 1
-        rc = catlass_lower.lower_catlass_spec(s1, p1, dp)
-        assert (ru.l2_hit_bytes, ru.dram_miss_bytes, ru.summary.dram_sector_bytes, ru.summary.semantic_work) == (
-            rc.l2_hit_bytes, rc.dram_miss_bytes, rc.summary.dram_sector_bytes, rc.summary.semantic_work,
-        )
-        p3 = CatlassProblem(m=64, n=288, k=512, dtype_a="bf16", dtype_b="bf16", dtype_c="bf16", dtype_acc="fp32")
-        s3 = next(s for s in enumerate_catlass_specs(p3, dp, l1_tiles=((32, 32, 32),), l0_tiles=((32, 32, 32),))
-                  if s.scheduler == "dataparallel" and s.epilogue_kind == "none" and s.dispatch_policy == "MmadPingpong")
-        low3 = catlass_lower._MatrixLowerer(catlass_lower.Lowering(dp, memory_view=AdmissionMemoryView({0: 8192}, granule_bytes=32)), s3, p3)
-        assert not catlass_coalesced.can_coalesce(low3, 18)
-    finally:
-        catlass_coalesced.COALESCED_PANEL_THRESHOLD = orig_t
+    p1 = CatlassProblem(m=1, n=32, k=32800, dtype_a="bf16", dtype_b="bf16", dtype_c="bf16", dtype_acc="fp32")
+    s1 = next(s for s in enumerate_catlass_specs(p1, dp, l1_tiles=((32, 32, 32),), l0_tiles=((32, 32, 32),), aic_budget=2, aiv_budget=2)
+              if s.scheduler == "dataparallel" and s.epilogue_kind == "none" and s.dispatch_policy == "MmadPingpong")
+    ctx1 = recipe_context(geo, p1)
+    r1 = catlass_lower.lower_catlass_spec(s1, p1, dp, context=ctx1)
+    pools = dict(dp.buffers)
+    resources = [Resource(role, rate, units=ctx1.resource_units.get(role, 1)) for role, rate in ctx1.rates.items()]
+    punits = {pool: 1 if pool == "l2" else dp.aiv_count if pool == "ub" else dp.aic_count for pool in pools}
+    eng1 = Engine(resources, pools=pools, pool_units=punits, trace_limit=200000)
+    done1 = r1.program.start(eng1, "k1", eng1.submit("start"))
+    eng1.advance(until=(done1,))
+    b_end = max(row["end_ms"] for row in eng1.trace if ":gm_b" in row["task"])
+    mma_end = max(row["end_ms"] for row in eng1.trace if ":mma" in row["task"])
+    assert mma_end >= b_end
+    eng1h = Engine(resources, pools=pools, pool_units=punits)
+    hold = eng1h.submit("hold_l0a", latency=1.0,
+                        acquire=(Allocation("hold_l0a", "l0a", pools["l0a"], units=(0,)),),
+                        free=(Allocation("hold_l0a", "l0a", pools["l0a"], units=(0,)),))
+    done1h = catlass_lower.lower_catlass_spec(s1, p1, dp, context=recipe_context(geo, p1)).program.start(eng1h, "k1h", eng1h.submit("start"))
+    eng1h.advance(until=(done1h, hold), first=False)
+    assert done1h.time >= done1.time + 0.99
 
-    p2 = CatlassProblem(m=32, n=32, k=8224, dtype_a="bf16", dtype_b="bf16", dtype_c="bf16", dtype_acc="fp32")
-    s2_sk = next(s for s in enumerate_catlass_specs(p2, dp, l1_tiles=((32, 32, 32),), l0_tiles=((32, 32, 32),), aic_budget=2, aiv_budget=2)
+    p2 = CatlassProblem(m=32, n=2080, k=512, dtype_a="bf16", dtype_b="bf16", dtype_c="bf16", dtype_acc="fp32")
+    s2 = next(s for s in enumerate_catlass_specs(p2, dp, l1_tiles=((32, 32, 32),), l0_tiles=((32, 32, 32),), aic_budget=4, aiv_budget=4)
+              if s.scheduler == "dataparallel" and s.epilogue_kind == "none" and s.dispatch_policy == "MmadPingpong")
+    r2 = catlass_lower.lower_catlass_spec(s2, p2, dp, memory_view=AdmissionMemoryView({0: 65536}, granule_bytes=32))
+    assert (r2.l2_hit_bytes, r2.summary.dram_sector_bytes) == (1_572_864, 2_820_096)
+
+    p3 = CatlassProblem(m=32, n=32, k=8224, dtype_a="bf16", dtype_b="bf16", dtype_c="bf16", dtype_acc="fp32")
+    s3_sk = next(s for s in enumerate_catlass_specs(p3, dp, l1_tiles=((32, 32, 32),), l0_tiles=((32, 32, 32),), aic_budget=2, aiv_budget=2)
                  if s.scheduler == "multi_core_splitk" and s.epilogue_kind == "none" and s.splitk_factor == 2)
-    assert not catlass_coalesced.can_coalesce(catlass_lower._MatrixLowerer(catlass_lower.Lowering(dp), s2_sk, p2), 1)
-    r_sk = catlass_lower.lower_catlass_spec(s2_sk, p2, dp)
+    r_sk = catlass_lower.lower_catlass_spec(s3_sk, p3, dp)
     assert sum(st.work.get("vec_reduce", 0) for st in r_sk.program.stages) == 1024
 
 
@@ -318,10 +326,15 @@ def test_rc14_full_duplex_hbm_shipping_stages_python_and_c11():
     for backend in ("python", "c"):
         eng = Engine([Resource("hbm", 1024.0), Resource("mte2_aic", 8192.0), Resource("mte3", 8192.0)], backend=backend)
         eng.add_hbm_bus(bus)
-        ev_r = eng.submit("ship_read", {"hbm": 8192.0, "mte2_aic": 8192.0})
+        ev_r = eng.submit("ship_read", {"hbm": 8192.0, "mte2_aic": 8192.0}, deliveries=(("hbm_r", 8192.0),))
         ev_w = eng.submit("ship_write", {"hbm": 8192.0, "mte3": 8192.0})
+        eng.advance(horizon=1.0)
+        assert eng.delivered["hbm_r"] == pytest.approx(1024.0)
+        assert eng.serviced["hbm"] == pytest.approx(2048.0)
+        assert eng.service_of(ev_r)["hbm"] == pytest.approx(1024.0)
         eng.advance(until=(ev_r, ev_w), first=False)
         assert eng.now == pytest.approx(8.0) and eng.serviced["hbm"] == pytest.approx(16384.0)
+        assert eng.delivered["hbm_r"] == pytest.approx(8192.0)
         ev_r2 = eng.submit("ship_read_2", {"hbm": 4096.0, "mte2_aic": 4096.0}, after=(ev_r, ev_w))
         ev_w2 = eng.submit("ship_write_2", {"hbm": 4096.0, "mte3": 4096.0}, after=(ev_r, ev_w))
         eng.advance(until=(ev_r2, ev_w2), first=False)
@@ -333,6 +346,14 @@ def test_rc14_full_duplex_hbm_shipping_stages_python_and_c11():
         eng_ret.add_hbm_bus(bus)
         eng_ret.advance(until=(r_ret, w_ret), first=False)
         assert eng_ret.now == pytest.approx(9.0) and eng_ret.serviced["hbm"] == pytest.approx(16384.0)
+        eng_re = Engine([Resource("hbm", 1024.0), Resource("mte2_aic", 8192.0)], backend=backend)
+        ev_re = eng_re.submit("ship_read", {"hbm": 8192.0}, deliveries=(("hbm_b", 8192.0),))
+        eng_re.advance(horizon=2.0)
+        eng_re.add_hbm_bus(bus)
+        eng_re.bind_hbm_bus(HbmBusSpec(0, 512.0, 512.0, 0.0, row_r="hbm:r", row_w="hbm:w"))
+        eng_re.advance(until=(ev_re,))
+        assert eng_re.now == pytest.approx(14.0) and eng_re.serviced["hbm"] == pytest.approx(8192.0)
+        assert eng_re.delivered["hbm_b"] == pytest.approx(8192.0)
 
 
 def test_rc14_periodic_streaming_coprime_and_disjoint_pruning():
@@ -340,6 +361,8 @@ def test_rc14_periodic_streaming_coprime_and_disjoint_pruning():
     t0 = perf_counter()
     measured = plan.sector_coverage().measure_bytes()
     assert measured == 780_607_488 and (perf_counter() - t0) < 5.0
+    contained = AddressRunPlan((AddressRun(1024, 4097, 960, 4096), AddressRun(0, 4097, 2048, 4096)))
+    assert contained.sector_coverage().measure_bytes() == 8_390_656
     disjoint = tuple(PeriodicSectorRun(i * 10**8, 8192, 32, 4097, 32) for i in range(SWEEP_INTERVAL_COUNT))
     t1 = perf_counter()
     assert len(_prune_periodic_subruns(disjoint)) == SWEEP_INTERVAL_COUNT
@@ -370,6 +393,9 @@ def test_rc14_primitive_cache_isolation_sku_compatibility_and_dtype_aliases():
         resolve_sim_rate_overlay(dt_table, datapath_for_die(dev_pr), sku=dev_pr.sku)
     with pytest.raises(ModelingError, match="primitive_table_sku_mismatch"):
         prepare_scenario(ScenarioRequest(c_pr, StepRequest("decode", context=DECODE_CTX), primitive_table=dt_table))
+    dos_pr = prepare_scenario(ScenarioRequest(c_pr, StepRequest("decode", context=DECODE_CTX)))
+    with pytest.raises(ModelingError, match="primitive_table_sku_mismatch"):
+        build_dual_inputs_from_scenario(dos_pr.handle.scenario, primitive_table=dt_table)
 
     for gen in ("a2", "a3", "a5"):
         dev = parse_case(compose_case("qwen3-32b", hardware=REPRESENTATIVE_SKUS[gen], tp=1, layers=1)).machine.dies[0]

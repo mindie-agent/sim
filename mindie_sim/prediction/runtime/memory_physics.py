@@ -18,6 +18,7 @@
 """
 from __future__ import annotations
 
+from bisect import bisect_left
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 import math
@@ -30,6 +31,7 @@ DEFAULT_ALIGN_BYTES = 32
 DEFAULT_L2_GRANULE_BYTES = 128
 BINARY64_EXACT_INT_LIMIT = 1 << 53
 _MAX_EXPLICIT_SECTOR_INTERVALS = 4096
+_BISECT_OVERLAP_RATIO = 16
 HBM_DIR_READ = 0
 HBM_DIR_WRITE = 1
 VALID_COPY_PIPES = frozenset({"mte2_aic", "mte2_aiv", "mte3", "fixpipe"})
@@ -102,14 +104,23 @@ def _subtract_byte_intervals(
 ) -> tuple[tuple[int, int], ...]:
     if not base or not cut:
         return tuple(base)
+    if base[-1][1] <= cut[0][0] or cut[-1][1] <= base[0][0]:
+        return tuple(base)
     out: list[tuple[int, int]] = []
+    nc = len(cut)
+    use_bisect = len(base) * _BISECT_OVERLAP_RATIO < nc
     j = 0
     for lo, hi in base:
         cur = lo
-        while j < len(cut) and cut[j][1] <= cur:
-            j += 1
+        if use_bisect:
+            j = bisect_left(cut, (cur, 0))
+            if j > 0 and cut[j - 1][1] > cur:
+                j -= 1
+        else:
+            while j < nc and cut[j][1] <= cur:
+                j += 1
         k = j
-        while k < len(cut) and cut[k][0] < hi:
+        while k < nc and cut[k][0] < hi:
             if cut[k][0] > cur:
                 out.append((cur, min(hi, cut[k][0])))
             cur = max(cur, cut[k][1])
@@ -379,25 +390,48 @@ class SectorCoverage:
 
     intervals: tuple[tuple[int, int], ...] = ()
     periodic: tuple[PeriodicSectorRun, ...] = ()
+    _canonical: bool = field(default=False, repr=False, compare=False)
 
     @property
     def empty(self) -> bool:
         return not self.intervals and not self.periodic
 
     def measure_bytes(self) -> int:
+        if not self.periodic:
+            if self._canonical:
+                return _measure_byte_intervals(self.intervals)
+            return _measure_byte_intervals(_merge_byte_intervals(self.intervals))
         return _measure_periodic_combo(self.periodic, (), intersect=False, extra_left_ivs=self.intervals)
 
     def overlap_bytes(self, other: SectorCoverage) -> int:
-        return 0 if (self.empty or other.empty) else _measure_periodic_combo(
+        if self.empty or other.empty:
+            return 0
+        if not self.periodic and not other.periodic:
+            from ._periodic_stream import _overlap_canonical_intervals
+            left = self.intervals if self._canonical else _merge_byte_intervals(self.intervals)
+            right = other.intervals if other._canonical else _merge_byte_intervals(other.intervals)
+            return _overlap_canonical_intervals(left, right)
+        return _measure_periodic_combo(
             self.periodic, other.periodic, intersect=True,
             extra_left_ivs=self.intervals, extra_right_ivs=other.intervals,
         )
 
     def union(self, other: SectorCoverage) -> SectorCoverage:
-        return SectorCoverage(
-            intervals=_merge_byte_intervals((*self.intervals, *other.intervals)),
-            periodic=tuple(dict.fromkeys(r.canonical() for r in (*self.periodic, *other.periodic))),
+        if self.empty:
+            return other
+        if other.empty:
+            return self
+        if self._canonical and other._canonical:
+            from ._periodic_stream import _merge_canonical_pairs
+            ivs = _merge_canonical_pairs(self.intervals, other.intervals)
+        else:
+            ivs = _merge_byte_intervals((*self.intervals, *other.intervals))
+        per = (
+            self.periodic if not other.periodic
+            else other.periodic if not self.periodic
+            else tuple(dict.fromkeys(r.canonical() for r in (*self.periodic, *other.periodic)))
         )
+        return SectorCoverage(intervals=ivs, periodic=per, _canonical=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -488,7 +522,7 @@ class AddressRunPlan:
 
     def sector_coverage(self) -> SectorCoverage:
         """Exact sector coverage retaining periodic strided sets without gap collapse."""
-        return SectorCoverage(intervals=self.sector_intervals(), periodic=self.periodic_sector_runs())
+        return SectorCoverage(intervals=self.sector_intervals(), periodic=self.periodic_sector_runs(), _canonical=True)
 
 
 @dataclass(frozen=True, slots=True)

@@ -24,6 +24,7 @@ from typing import Any, Mapping, Sequence
 from ..coupled import coupled_rates, _coupled_pair_fast
 from ..ownership import unit_rates
 from .arbiter import component_rates, _fast_eligible_task
+from ._engine_hbm_bus import _hbm_rem_fraction, _sync_task_hbm_accounting
 from .contracts import (
     AllocationBinding, AllocationKey, BindingFrame, EventKey, OccurrenceKey,
     PortBinding, Submission,
@@ -129,6 +130,7 @@ class Engine(
         self._wave_recorder = None
         self._hbm_bus_aliases: dict[str, Any] = {}
         self._hbm_bus_epoch: int = 0
+        self._hbm_acct_live: int = 0
         self._hbm_accounting_serviced: dict[str, float] = {}
         self._pending_hbm_retrofits: dict[str, tuple[Any, bool]] = {}
         self._discover_hbm_bus_aliases()
@@ -509,7 +511,8 @@ class Engine(
                                         dt = _stop_window(now, horizon, releases, latency_active, tasks)
                                         watched = (
                                             ((k0, t0, dict(t0.service)), (k1, t1, dict(t1.service)))
-                                            if (wave_rec is not None or t0.deliveries or t1.deliveries) else ()
+                                            if (wave_rec is not None or t0.deliveries or t1.deliveries
+                                                or t0.hbm_accounting or t1.hbm_accounting) else ()
                                         )
                                         next_time = _step_cached_pair(cplan, k0, t0, k1, t1, now, dt)
                                         if watched:
@@ -532,7 +535,8 @@ class Engine(
                             dt = _stop_window(now, horizon, releases, latency_active, tasks)
                             watched = (
                                 ((k0, t0, dict(t0.service)), (k1, t1, dict(t1.service)))
-                                if (wave_rec is not None or t0.deliveries or t1.deliveries) else ()
+                                if (wave_rec is not None or t0.deliveries or t1.deliveries
+                                    or t0.hbm_accounting or t1.hbm_accounting) else ()
                             )
                             next_time = _step_pair_fast(cp_fast, now, dt)
                             if watched:
@@ -562,7 +566,8 @@ class Engine(
                                 dt = _stop_window(now, horizon, releases, latency_active, tasks)
                                 watched = (
                                     ((ka, ta, dict(ta.service)), (kb, tb, dict(tb.service)))
-                                    if (wave_rec is not None or ta.deliveries or tb.deliveries) else ()
+                                    if (wave_rec is not None or ta.deliveries or tb.deliveries
+                                        or ta.hbm_accounting or tb.hbm_accounting) else ()
                                 )
                                 next_time = _step_pair_fast(cp_fast, now, dt)
                                 if watched:
@@ -608,7 +613,8 @@ class Engine(
                                     watched = (
                                         ((ka, ta, dict(ta.service)), (kb, tb, dict(tb.service)),
                                          (ks, ts, dict(ts.service)))
-                                        if (wave_rec is not None or ta.deliveries or tb.deliveries or ts.deliveries) else ()
+                                        if (wave_rec is not None or ta.deliveries or tb.deliveries or ts.deliveries
+                                            or ta.hbm_accounting or tb.hbm_accounting or ts.hbm_accounting) else ()
                                     )
                                     next_time = _step_pair_fast(cp_fast, now, dt, ks, ts, rs, rate_s)
                                     if watched:
@@ -620,6 +626,8 @@ class Engine(
                 if solo_task is not None and _fast_eligible_task(resources, solo_task):
                     next_solo = _step_solo_fast(solo_key, solo_task, now, horizon, max_steps)
                     if next_solo is not None:
+                        if solo_task.hbm_accounting:
+                            _sync_task_hbm_accounting(self, solo_task)
                         if solo_task.deliveries:
                             self._update_task_deliveries(solo_task)
                         self.advance_steps += 1
@@ -672,6 +680,8 @@ class Engine(
                         if not task.remaining and task.latency <= 0.0:
                             completable_seen.add(key)
                             _heappush(completable, key)
+                    if task.hbm_accounting:
+                        _sync_task_hbm_accounting(self, task)
                     if task.deliveries:
                         self._update_task_deliveries(task)
             self.advance_steps += 1
@@ -694,6 +704,15 @@ class Engine(
                 merged = dict(task.service)
                 for idx, name in enumerate(names):
                     merged[name] = merged.get(name, 0.0) + float(buf[n + idx])
+                if task.hbm_accounting:
+                    live_rem = {name: float(buf[idx]) for idx, name in enumerate(names)}
+                    credited = task.hbm_credited or {}
+                    for entry in task.hbm_accounting:
+                        base = entry[0]
+                        done_since = entry[2] * (1.0 - _hbm_rem_fraction(live_rem, entry))
+                        delta = done_since - credited.get(base, 0.0)
+                        if delta > 0.0:
+                            merged[base] = merged.get(base, 0.0) + delta
                 return merged
         return dict(task.service)
 

@@ -392,6 +392,9 @@ class NativeBackend:
     def _sync_counters(self, engine) -> None:
         if self.arena is None:
             return
+        if engine._hbm_acct_live:
+            from .accel_terms import sync_native_hbm_accounting
+            sync_native_hbm_accounting(self, engine)
         busy, serv = self.arena.counters()
         acct = engine._hbm_accounting_serviced
         for i, name in enumerate(self.res_names):

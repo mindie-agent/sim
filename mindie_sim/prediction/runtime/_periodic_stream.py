@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+from bisect import bisect_left
 import math
 
 from .memory_physics import PeriodicSectorRun
@@ -18,6 +19,77 @@ from .memory_physics import PeriodicSectorRun
 _PAIR_RUNS = 2
 _TRIPLE_RUNS = 3
 _HALF_MOD_DIVISOR = 2
+_BISECT_OVERLAP_RATIO = 16
+
+
+def _merge_canonical_pairs(
+    left: tuple[tuple[int, int], ...], right: tuple[tuple[int, int], ...],
+) -> tuple[tuple[int, int], ...]:
+    """Merge two canonical sorted disjoint interval tuples in O(|left| + |right|)."""
+    if not left:
+        return right
+    if not right:
+        return left
+    if left[-1][1] < right[0][0]:
+        return left + right
+    if right[-1][1] < left[0][0]:
+        return right + left
+    merged: list[tuple[int, int]] = []
+    i = j = 0
+    nl, nr = len(left), len(right)
+    while i < nl or j < nr:
+        if j >= nr or (i < nl and left[i][0] <= right[j][0]):
+            lo, hi = left[i]
+            i += 1
+        else:
+            lo, hi = right[j]
+            j += 1
+        if merged and lo <= merged[-1][1]:
+            if hi > merged[-1][1]:
+                merged[-1] = (merged[-1][0], hi)
+        else:
+            merged.append((lo, hi))
+    return tuple(merged)
+
+
+def _overlap_canonical_intervals(
+    left: tuple[tuple[int, int], ...], right: tuple[tuple[int, int], ...],
+) -> int:
+    """Exact overlap byte count between two canonical sorted disjoint interval tuples."""
+    if not left or not right:
+        return 0
+    if left[-1][1] <= right[0][0] or right[-1][1] <= left[0][0]:
+        return 0
+    if len(left) > len(right):
+        left, right = right, left
+    total = 0
+    nr = len(right)
+    if len(left) * _BISECT_OVERLAP_RATIO < nr:
+        for lo, hi in left:
+            idx = bisect_left(right, (lo, 0))
+            if idx > 0 and right[idx - 1][1] > lo:
+                idx -= 1
+            while idx < nr and right[idx][0] < hi:
+                ov_hi = hi if hi < right[idx][1] else right[idx][1]
+                ov_lo = lo if lo > right[idx][0] else right[idx][0]
+                if ov_hi > ov_lo:
+                    total += ov_hi - ov_lo
+                idx += 1
+        return total
+    i = j = 0
+    nl = len(left)
+    while i < nl and j < nr:
+        a_lo, a_hi = left[i]
+        b_lo, b_hi = right[j]
+        ov_lo = a_lo if a_lo > b_lo else b_lo
+        ov_hi = a_hi if a_hi < b_hi else b_hi
+        if ov_hi > ov_lo:
+            total += ov_hi - ov_lo
+        if a_hi < b_hi:
+            i += 1
+        else:
+            j += 1
+    return total
 
 
 def _run_overlap_small_interval(run: PeriodicSectorRun, lo: int, hi: int) -> int:
@@ -72,8 +144,8 @@ def _iter_two_run_overlap(a: PeriodicSectorRun, b: PeriodicSectorRun, lo: int, h
     ka_hi = min(a.rows - 1, (hi - 1 - ba) // sa)
     if ka_lo > ka_hi:
         return
-    hi_mod = ra + seca + secb - 1
-    lo_mod = rb + seca + secb - 1
+    hi_mod = rb + seca + secb - 1
+    lo_mod = ra + seca + secb - 1
     use_mod_jump = sb > hi_mod + lo_mod + 1
     step_mod = sa % sb
     half_sb = sb // _HALF_MOD_DIVISOR

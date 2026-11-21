@@ -166,7 +166,8 @@ class _Task:
     latency_from_first_service: bool = False
     first_service: float | None = None
     pending_preds: list[Event] | None = None
-    hbm_accounting: tuple[tuple[str, float, float | None], ...] = ()
+    hbm_accounting: tuple[tuple[str, float, float, float | None, str, float, str, float], ...] = ()
+    hbm_credited: dict[str, float] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,7 +201,7 @@ class _PreparedTask:
     cohort_members: tuple[tuple[str, tuple[tuple[int, ...], ...]], ...] = ()
     latency_from_first_service: bool = False
     hbm_bus_epoch: int = 0
-    hbm_accounting: tuple[tuple[str, float, float | None], ...] = ()
+    hbm_accounting: tuple[tuple[str, float, float, float | None, str, float, str, float], ...] = ()
 
 
 _EMPTY_TASK = _PreparedTask({}, 0.0, {}, (), (), {}, False, (), 0)

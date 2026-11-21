@@ -281,10 +281,17 @@ class _EngineLifecycleMixin:
                 self._delivery_live -= 1
         if task.hbm_accounting:
             acct_serviced = self._hbm_accounting_serviced
-            for base, amt, _ in task.hbm_accounting:
-                task.service[base] = task.service.get(base, 0.0) + amt
-                self.serviced[base] = self.serviced.get(base, 0.0) + amt
-                acct_serviced[base] = acct_serviced.get(base, 0.0) + amt
+            credited = task.hbm_credited or {}
+            for entry in task.hbm_accounting:
+                base = entry[0]
+                rem_at_bind = entry[2]
+                delta = rem_at_bind - credited.get(base, 0.0)
+                if delta > 0.0:
+                    task.service[base] = task.service.get(base, 0.0) + delta
+                    self.serviced[base] = self.serviced.get(base, 0.0) + delta
+                    acct_serviced[base] = acct_serviced.get(base, 0.0) + delta
+            if self._hbm_acct_live > 0:
+                self._hbm_acct_live -= 1
         if not task.is_split_child and task.metadata:
             occurrence = task.metadata.get("occurrence")
             if isinstance(occurrence, OccurrenceKey):

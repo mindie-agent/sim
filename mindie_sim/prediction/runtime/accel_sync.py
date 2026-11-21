@@ -424,6 +424,9 @@ def sync_back(backend, engine) -> None:
                     task.remaining[name] = remaining
                 else:
                     task.remaining.pop(name, None)
+            if task.hbm_accounting:
+                from ._engine_hbm_bus import _sync_task_hbm_accounting
+                _sync_task_hbm_accounting(engine, task)
     engine._flush_pending_hbm_retrofits()
     releases = {entry[1] for entry in engine._releases}
     settled: list[int] = []

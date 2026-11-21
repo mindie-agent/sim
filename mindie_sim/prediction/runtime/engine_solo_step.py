@@ -14,6 +14,7 @@ import heapq
 import math
 
 from ..coupled import _coupled_demand_and_cap_limit
+from ._engine_hbm_bus import _hbm_delivery_fraction, _sync_task_hbm_accounting
 from .engine_types import ExecutionError, _Task
 
 
@@ -277,11 +278,15 @@ class _EngineSoloStepMixin:
     def _update_task_deliveries(self, task: _Task) -> None:
         if not task.deliveries:
             return
-        ref_r = next(iter(task.demand), None)
-        if ref_r is None:
-            return
-        ref_d = task.demand[ref_r]
-        frac = min(1.0, task.service.get(ref_r, 0.0) / ref_d) if ref_d > 0.0 else 1.0
+        hbm_frac = _hbm_delivery_fraction(task)
+        if hbm_frac is not None:
+            frac = hbm_frac
+        else:
+            ref_r = next(iter(task.demand), None)
+            if ref_r is None:
+                return
+            ref_d = task.demand[ref_r]
+            frac = min(1.0, task.service.get(ref_r, 0.0) / ref_d) if ref_d > 0.0 else 1.0
         deliv = self.delivered
         acc = task.delivered_acc
         for ctr_id, total_amt in task.deliveries:
@@ -297,11 +302,13 @@ class _EngineSoloStepMixin:
         self, wave_rec, watched, now: float, next_time: float,
     ) -> None:
         for k, t, prev_svc in watched:
-            if t.deliveries:
-                self._update_task_deliveries(t)
             if wave_rec is not None and next_time > now:
                 for rn, post in t.service.items():
                     delta = post - prev_svc.get(rn, 0.0)
                     if delta > 0.0:
                         pl_u = t.placement.get(rn) if t.placement else None
                         wave_rec.on_service(k, rn, pl_u[0] if pl_u else 0, now, next_time, delta)
+            if t.hbm_accounting:
+                _sync_task_hbm_accounting(self, t)
+            if t.deliveries:
+                self._update_task_deliveries(t)

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from math import prod
 
 from mindie_sim.prediction.program.stages import Stage
@@ -26,11 +27,11 @@ from .catlass_catalog import (
     matrix_problem, mx_scale_bytes, packed_bytes, should_elide_l1_reload,
     streamk_partition, swizzle_block_coord, validate_catlass_spec,
 )
-from ._catlass_coalesced import can_coalesce, lower_coalesced
 from .contracts import SemanticWorkItem, ceil_div, eligible_matrix_engines, evg_order
 from .fuse_region import Lowering, ring_credit, solve_template_tile
 
 _NOMINAL_BUFFER_ALIGNMENT = 32
+_PURE_LOWER_CACHE_SIZE = 64
 A8W4_PROLOGUE_SUBBLOCK_ALIGNMENT = 32
 A8W4_PROLOGUE_UB_SLOT_BYTES = 2 * 32 * 1024
 GATHER_SCATTER_FULL_LOAD_UB_BYTES = 216 * 1024
@@ -662,11 +663,31 @@ def _split_schedule(lowerer, launch, blocks):
     _reduce_partials(lowerer, parts, signal)
 
 
+@lru_cache(maxsize=_PURE_LOWER_CACHE_SIZE)
+def _lower_catlass_pure_cached(spec, p, datapath, die: int, region_id):
+    return _lower_catlass_impl(spec, p, datapath, context=None, memory_view=None, die=die,
+                               live_admission=False, region_id=region_id)
+
+
 def lower_catlass_spec(
     spec, problem, datapath, *, context=None, memory_view=None, die=0, live_admission=False, region_id=None,
 ):
     """Lower a concrete specialization and return its executable audit record."""
     p = matrix_problem(problem)
+    if context is None and memory_view is None and not live_admission:
+        try:
+            hash((spec, p, datapath, die, region_id))
+        except TypeError:
+            return _lower_catlass_impl(spec, p, datapath, context=None, memory_view=None, die=die,
+                                       live_admission=False, region_id=region_id)
+        return _lower_catlass_pure_cached(spec, p, datapath, die, region_id)
+    return _lower_catlass_impl(spec, p, datapath, context=context, memory_view=memory_view, die=die,
+                               live_admission=live_admission, region_id=region_id)
+
+
+def _lower_catlass_impl(
+    spec, p, datapath, *, context=None, memory_view=None, die=0, live_admission=False, region_id=None,
+):
     solution = solve_catlass_tile(spec, p, datapath, memory_view=memory_view, die=die)
     expected = _workspace_bytes(spec.template_id, p, spec.l1_tile_shape, spec.aic_budget,
                                 spec.splitk_factor, spec.dispatch_policy, spec.epilogue_kind)
@@ -690,11 +711,6 @@ def lower_catlass_spec(
                 tile = lowerer.tile(task, group=index, group_start=row_start, rows=rows, start_core=start, n_cols=n_cols)
                 owner_done[tile.owner] = lowerer.ordinary(tile, (owner_done.get(tile.owner, launch),))
             row_start += rows
-    elif can_coalesce(lowerer, blocks):
-        lower_coalesced(
-            lowerer, launch, blocks,
-            scale_fn=_scale, compute_b_fn=_compute_b, cube_dtype_fn=_cube_dtype, issued_fn=_issued_ops,
-        )
     elif spec.scheduler in {"streamk", "multi_core_splitk"}:
         _split_schedule(lowerer, launch, blocks)
     else:

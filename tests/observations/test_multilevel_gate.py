@@ -175,14 +175,14 @@ def test_lineage_case_normalization_event_scoping_and_fit_closure(tmp_path: Path
         ("bad_clk.json", {**cap_doc, "clock_domain": "host_wall"}, "capture_clock_domain_mismatch"),
         ("bad_clock_top.json", {**cap_doc, "clock_operator": "elapsed_span"}, "capture_clock_operator_mismatch"),
         ("bad_clock_boundary.json", {**cap_doc, "boundary": {"clock_operator": "elapsed_span"}}, "capture_clock_operator_mismatch"),
+        ("bad_clock_event.jsonl", json.dumps({"event_id": "hdr", "start_event": "k_start", "end_event": "k_end", "clock_operator": "busy_union", "device_ranks": [0], "clock_domain": "device_monotonic"}) + "\n" + json.dumps({"event_id": "ev-ok", "clock_operator": "elapsed_span"}) + "\n", "capture_clock_operator_mismatch"),
         ("bad_ev.json", {**cap_doc, "event_ids": ["other_ev"]}, "capture_event_mismatch"),
         ("bad_se.json", {**cap_doc, "start_event": "wrong_start"}, "capture_event_mismatch"),
         ("unrel.json", {"summary": "unrelated_without_events"}, "capture_event_mismatch"),
     ):
         fp = cap_dir / fname
-        fp.write_text(json.dumps(bad_payload), encoding="utf-8")
-        c_bad = _case(fname, tag="5", raw_sha=hashlib.sha256(fp.read_bytes()).hexdigest(), events=("ev-ok",), uri=f"capture://suite/{fname}")
-        c_bad = replace(c_bad, boundary=replace(c_bad.boundary, clock_operator="busy_union"))
+        fp.write_text(bad_payload if isinstance(bad_payload, str) else json.dumps(bad_payload), encoding="utf-8")
+        c_bad = replace(_case(fname, tag="5", raw_sha=hashlib.sha256(fp.read_bytes()).hexdigest(), events=("ev-ok",), uri=f"capture://suite/{fname}"), boundary=replace(_case(fname, tag="5", raw_sha=hashlib.sha256(fp.read_bytes()).hexdigest(), events=("ev-ok",), uri=f"capture://suite/{fname}").boundary, clock_operator="busy_union"))
         with pytest.raises(ModelingError, match=err):
             validate_lineage(Manifest(f"m_{fname}", "1", (c_bad,)), fits, capture_root=tmp_path, require_capture_files=True)
 
