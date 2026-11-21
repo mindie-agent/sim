@@ -1,43 +1,32 @@
-"""Dynamic N-stream L2 working-set residency, dirty writeback, and 3-ledger binding.
+"""Shared per-die L2 residency and directional memory-access binding.
 
-[Role] Track per-die shared L2 residency across arbitrary N >= 1 active streams
-  and full ``ReuseKey`` identities using exact sector coverage, settle
-  dirty private evictions with future readers as explicit ``DirtyWriteback``
-  records, and bind ``MemoryAccessPattern`` into 3-ledger ``BoundAccess``
-  without bind-time mutation (``commit=False`` default).
-[Invariants] Shared L2 enforces ``l2_buffer_units == 1`` per die. Every
-  classified access conserves ``l2_hit_bytes + dram_miss_copy_bytes ==
-  aligned_transfer_bytes``. Evicted entries never resurrect when pressure drops.
-  Untouched sector ranges never false-hit on resident sibling offsets.
-[Timeouts & Locks] Pure in-memory interval arithmetic; no I/O, threads or locks.
-[Side-Effect Policy] Read-only ``preview_access`` never mutates state; mutations
-  occur strictly on explicit admission/release/reservation transitions.
+[Role] Track exact sector coverage, dirty evictions and bound byte ledgers.
+[Invariants] One L2 owner per die. Hit and miss bytes sum to aligned copy bytes.
+  Evicted coverage stays cold until an explicit fill.
+[Timeouts & Locks] In-memory interval arithmetic with no I/O, threads or locks.
+[Side-Effect Policy] Only explicit admission, release and reservation mutate L2.
 """
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from heapq import merge
+from itertools import groupby
+from math import gcd, lcm
 
 from mindie_sim.schema.common import ModelingError
 from .memory_physics import (
-    AddressRun,
-    AddressRunPlan,
-    BoundAccess,
-    BurstTurnRule,
-    ByteLedger,
+    AddressRun, AddressRunPlan,
+    BoundAccess, BurstTurnRule, ByteLedger,
     CACHE_POLICY_LAST_USE,
-    ConstraintTerm,
-    CounterTerm,
+    ConstraintTerm, CounterTerm,
     DEFAULT_L2_GRANULE_BYTES,
-    HbmBusSpec,
-    MemoryAccessPattern,
-    ReuseKey,
-    SectorCoverage,
-    _L2_CACHE_DISABLE,
-    _intersect_byte_intervals,
-    _measure_byte_intervals,
-    _merge_byte_intervals,
-    _subtract_byte_intervals,
+    HbmBusSpec, MemoryAccessPattern,
+    ReuseKey, SectorCoverage,
+    _L2_CACHE_DISABLE, _MAX_EXPLICIT_SECTOR_INTERVALS,
+    _ceil_div, _intersect_byte_intervals,
+    _measure_byte_intervals, _merge_byte_intervals, _subtract_byte_intervals,
     burst_turnaround_efficiency,
 )
 
@@ -178,6 +167,10 @@ class AdmissionMemoryView:
         for victim in self._eviction_victims(die, eff, avail, protect_key=protect_key):
             self._settle_eviction(victim)
 
+    def _activate_key(self, key: ReuseKey) -> None:
+        self._active_keys[key.die].add(key)
+        self._evict_over_capacity(key.die)
+
     def pending_writebacks(self, die: int) -> tuple[DirtyWriteback, ...]:
         return tuple(self._pending_writebacks.get(die, ()))
 
@@ -282,7 +275,7 @@ class AdmissionMemoryView:
         req_b = req_cov.measure_bytes()
         if req_b <= 0:
             return 0, aligned_bytes
-        ov_b = req_cov.overlap_bytes(res_cov)
+        ov_b = _coverage_overlap(req_cov, res_cov)
         if ov_b <= 0:
             return 0, aligned_bytes
         if ov_b >= req_b:
@@ -329,9 +322,7 @@ class AdmissionMemoryView:
             return aligned_bytes, 0
         return 0, aligned_bytes
 
-    def preview_access(
-        self, pattern: MemoryAccessPattern, aligned_bytes: int,
-    ) -> tuple[int, int]:
+    def preview_access(self, pattern: MemoryAccessPattern, aligned_bytes: int) -> tuple[int, int]:
         """Read-only ``(l2_hit_bytes, dram_miss_copy_bytes)`` with zero state mutation."""
         if aligned_bytes <= 0:
             return 0, 0
@@ -385,61 +376,9 @@ class AdmissionMemoryView:
                 return existing.resident_coverage
         return SectorCoverage()
 
-    def resident_intervals_for(
-        self, pattern: MemoryAccessPattern, aligned_bytes: int,
-    ) -> tuple[tuple[int, int], ...]:
+    def resident_intervals_for(self, pattern: MemoryAccessPattern, aligned_bytes: int) -> tuple[tuple[int, int], ...]:
         """Return currently resident L2 sector intervals applicable to ``pattern``."""
         return self.resident_coverage_for(pattern, aligned_bytes).intervals
-
-    def _fill_identity(self, pattern):
-        key = pattern.reuse_key
-        if key is not None and pattern.direction == "read" and pattern.cache_policy != _L2_CACHE_DISABLE:
-            return self, key.die, key.backing_allocation, key.tensor_version
-
-    def inflight_fill_dependencies(self, engine, pattern, resident: SectorCoverage):
-        """Return same-allocation fills that cover sectors this reader still misses."""
-        identity = self._fill_identity(pattern)
-        pending = getattr(engine, "_inflight_l2_fills", {}).get(identity)
-        if not pending:
-            return ()
-        requested = pattern.runs.sector_coverage()
-        waits = []
-        for done, (filling, previously_resident) in pending.items():
-            overlap = requested.overlap_bytes(filling)
-            if not overlap:
-                continue
-            available = resident.union(previously_resident)
-            # Inclusion-exclusion gives the intersection of both requests with
-            # the sectors excluded from the reader's or the fill's misses.
-            excluded = (requested.overlap_bytes(available) + filling.overlap_bytes(available)
-                        - requested.union(filling).overlap_bytes(available))
-            if overlap > excluded:
-                waits.append(done)
-        return tuple(waits)
-
-    def start_l2_fill(self, engine, name, pattern, aligned_bytes, resident: SectorCoverage):
-        identity = self._fill_identity(pattern)
-        if identity is None or pattern.cache_policy == CACHE_POLICY_LAST_USE:
-            return None
-        coverage = pattern.runs.sector_coverage()
-        working_set = pattern.reuse_distance_bytes if pattern.reuse_distance_bytes is not None else aligned_bytes
-        if max(working_set, coverage.measure_bytes()) > self._preview_effective_l2(pattern.reuse_key):
-            return None
-        done = engine.future(name + ":l2_fill")
-        # The engine owns events. Analytical snapshots of this view contain
-        # committed residency only and never copy a running engine.
-        if not hasattr(engine, "_inflight_l2_fills"):
-            engine._inflight_l2_fills = {}
-        engine._inflight_l2_fills.setdefault(identity, {})[done] = (coverage, resident)
-        return done
-
-    def finish_l2_fill(self, engine, pattern, done):
-        identity = self._fill_identity(pattern)
-        fills = engine._inflight_l2_fills
-        del fills[identity][done]
-        if not fills[identity]:
-            del fills[identity]
-        engine.resolve(done)
 
     def miss_intervals(
         self, pattern: MemoryAccessPattern, aligned_bytes: int,
@@ -466,8 +405,7 @@ class AdmissionMemoryView:
             raise ModelingError(f"reuse_key_die_mismatch:{key.die}!={pattern.die}")
         if key.die not in self._l2_capacity:
             raise ModelingError(f"l2_die_undeclared:{key.die}")
-        self._active_keys[key.die].add(key)
-        self._evict_over_capacity(key.die)
+        self._activate_key(key)
         eff = self.effective_l2_bytes(key.die)
         req_cov = pattern.runs.sector_coverage()
         req_ivs = req_cov.intervals
@@ -490,7 +428,7 @@ class AdmissionMemoryView:
                     return hit_b, miss_b
                 if miss_b > 0:
                     merged_cov = existing.resident_coverage.union(req_cov)
-                    merged_b = merged_cov.measure_bytes()
+                    merged_b = _merged_bytes(merged_cov)
                     if max(existing.working_set_bytes, working_set, merged_b) <= eff:
                         existing.resident_coverage = merged_cov
                         existing.resident_ranges = merged_cov.intervals
@@ -527,7 +465,7 @@ class AdmissionMemoryView:
             prev_dirty = existing.dirty_ranges if same else ()
             prev_dirty_cov = existing.dirty_coverage if same else SectorCoverage()
             merged_cov = prev_cov.union(req_cov)
-            merged_b = merged_cov.measure_bytes()
+            merged_b = _merged_bytes(merged_cov)
             if same and max(existing.working_set_bytes, working_set, merged_b) <= eff:
                 res_cov = merged_cov
                 res_ivs = merged_cov.intervals
@@ -562,6 +500,138 @@ class AdmissionMemoryView:
         return hit_b, miss_b
 
 
+def _range_run(lo, hi):
+    return AddressRun(lo, 1, hi - lo, hi - lo)
+
+def _run_end(run):
+    return run.base_byte + (run.rows - 1) * run.stride_bytes + run.row_bytes
+
+def _coverage_runs(coverage: SectorCoverage):
+    yield from (_range_run(lo, hi) for lo, hi in coverage.intervals)
+    for run in coverage.periodic:
+        # A sector-aligned phase repeats after the row's byte offset realigns.
+        phase_rows = run.sector_bytes // gcd(run.sector_bytes, run.stride_bytes)
+        stride = phase_rows * run.stride_bytes
+        for phase in range(min(phase_rows, run.rows)):
+            lo, hi = run._row_bounds(phase)
+            rows = (run.rows - 1 - phase) // phase_rows + 1
+            yield AddressRun(lo, rows, hi - lo, stride)
+
+def _sweep(events):
+    """Yield consecutive byte spans with the labels active throughout each span."""
+    active, previous = Counter(), 0
+    for offset, changes in groupby(events, key=lambda event: event[0]):
+        if active and offset > previous:
+            yield previous, offset, active
+        for _, label, delta in changes:
+            active[label] += delta
+            if not active[label]:
+                del active[label]
+        previous = offset
+
+def _window_rows(run, lo, hi):
+    return range(max(0, (lo - run.base_byte - run.row_bytes) // run.stride_bytes + 1),
+                 min(run.rows, _ceil_div(hi - run.base_byte, run.stride_bytes)))
+
+def _row_events(run, label, lo, hi):
+    for row in _window_rows(run, lo, hi):
+        start = run.base_byte + row * run.stride_bytes
+        yield max(lo, start), label, 1
+        yield min(hi, start + run.row_bytes), label, -1
+
+def _classified_spans(events, classify):
+    previous = None
+    for lo, hi, active in _sweep(events):
+        state = classify(active)
+        if previous is not None and previous[1] == lo and previous[2] == state:
+            previous = previous[0], hi, state
+            continue
+        if previous is not None:
+            yield previous
+        previous = (lo, hi, state) if state is not None else None
+    if previous is not None:
+        yield previous
+
+def _partition_runs(tagged_runs, classify):
+    """Apply a byte-set operation across repeating spans without expanding their rows."""
+    events = []
+    for run, label in dict.fromkeys(tagged_runs):
+        end = _run_end(run)
+        if run.rows == 1 or run.stride_bytes <= run.row_bytes:
+            run = _range_run(run.base_byte, end)
+        events.extend(((run.base_byte, (run, label), 1), (end, (run, label), -1)))
+    for lo, hi, active in _sweep(sorted(events, key=lambda event: event[0])):
+        if all(run.rows == 1 for run, _ in active):
+            if (state := classify({label for _, label in active})) is not None:
+                yield state, _range_run(lo, hi)
+            continue
+        # Each active run repeats over its bounding span. Only one common
+        # period needs scanning, with the final repeat clipped to the span.
+        period = lcm(*(run.stride_bytes for run, _ in active if run.rows > 1))
+        end = min(hi, lo + period)
+        streams = (_row_events(run, label, lo, end) for run, label in active)
+        for begin, finish, state in _classified_spans(merge(*streams, key=lambda event: event[0]), classify):
+            rows = (hi - finish) // period + 1
+            width = finish - begin
+            yield state, AddressRun(begin, rows, width, period) if rows > 1 else _range_run(begin, finish)
+            if (tail := hi - (begin + rows * period)) > 0:
+                yield state, _range_run(hi - tail, hi)
+
+def _sparse_window(run, masks):
+    period = lcm(run.stride_bytes, *(r.stride_bytes for r in masks if r.rows > 1))
+    rows = sum(len(_window_rows(mask, run.base_byte, _run_end(run))) for mask in masks)
+    return min(run.rows, period // run.stride_bytes) > max(_MAX_EXPLICIT_SECTOR_INTERVALS, rows)
+
+def _coverage_overlap(left, right):
+    if not left.intervals and len(left.periodic) == 1:
+        if left.periodic[0] in right.periodic:
+            return left.periodic[0].total_bytes()
+        if not right.intervals and len(right.periodic) == 1:
+            dense, sparse = sorted((*left.periodic, *right.periodic), key=lambda r: r.stride_bytes)
+            if sparse.stride_bytes >= sparse.row_bytes + sparse.sector_bytes and _sparse_window(dense, (sparse,)):
+                lo, hi = dense._bounds()
+                rows = _window_rows(sparse, lo - sparse.sector_bytes, hi + sparse.sector_bytes)
+                return sum(dense.overlap_with_interval(*sparse._row_bounds(row)) for row in rows)
+    return left.overlap_bytes(right)
+
+def _merged_bytes(coverage):
+    if not coverage.intervals and len(coverage.periodic) == 2:
+        left, right = coverage.periodic
+        return left.total_bytes() + right.total_bytes() - _coverage_overlap(SectorCoverage((), (left,)),
+                                                                           SectorCoverage((), (right,)))
+    return coverage.measure_bytes()
+
+def _residency_runs(data, masks):
+    if len(data) == 1 and _sparse_window(data[0], masks):
+        run = data[0]
+        lo, hi = run.base_byte, _run_end(run)
+        streams = (_row_events(mask, True, lo, hi) for mask in masks)
+        for begin, end, _ in _classified_spans(merge(*streams, key=lambda e: e[0]), bool):
+            warm = tuple(_clip_rows(run, begin, end))
+            if not warm:
+                continue
+            yield from ((False, part) for part in _clip_rows(run, lo, begin))
+            yield from ((True, part) for part in warm)
+            lo = end
+        yield from ((False, part) for part in _clip_rows(run, lo, hi))
+    else:
+        yield from _partition_runs(
+            (*((r, False) for r in data), *((r, True) for r in masks)),
+            lambda labels: True in labels if False in labels else None,
+        )
+
+def _clip_rows(run, lo, hi):
+    rows = _window_rows(run, lo, hi)
+    if rows and hi > lo:
+        first = run.base_byte + rows.start * run.stride_bytes
+        yield _range_run(max(lo, first), min(hi, first + run.row_bytes))
+        if len(rows) > 2:
+            yield replace(run, base_byte=first + run.stride_bytes, rows=len(rows) - 2)
+        if len(rows) > 1:
+            last = run.base_byte + (rows.stop - 1) * run.stride_bytes
+            yield _range_run(last, min(hi, last + run.row_bytes))
+
+
 def _dram_service_segments(
     plan: AddressRunPlan, covered: SectorCoverage,
 ) -> Iterator[tuple[int, int, int]]:
@@ -583,7 +653,7 @@ def _dram_service_segments(
             continue
         run_cov = AddressRunPlan((run,), sector_bytes=sec).sector_coverage()
         if not partial or run_cov.periodic:
-            missed = (run_cov.measure_bytes() - run_cov.overlap_bytes(covered)
+            missed = (run_cov.measure_bytes() - _coverage_overlap(run_cov, covered)
                       if run_cov.periodic or covered.periodic else
                       _measure_byte_intervals(_subtract_byte_intervals(run_cov.intervals, covered.intervals)))
             if missed > 0:

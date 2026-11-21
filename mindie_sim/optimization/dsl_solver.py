@@ -15,7 +15,7 @@ from math import prod
 from typing import TYPE_CHECKING
 
 from mindie_sim.prediction.mechanism import OperatorPlan, PlannedRecipe, Work
-from mindie_sim.prediction.program import KernelProgram
+from mindie_sim.prediction.program import Program
 from mindie_sim.prediction.streams import MAIN_STREAM, bind_stream_owners
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import DatapathCapabilitySpec, datapath_for_die
@@ -25,7 +25,7 @@ from mindie_sim.templates.dsl_catalog import ATTN_RES, AttnResProblem, DSL_KERNE
 from mindie_sim.templates.registry import builtin_template_catalog
 
 from .contracts import CatlassKernelSpec, DslKernelSpec, FuseRegionSpec
-from .dual_bound import _unique_ops
+from .dual_bound import _unique_ops, _weight_allocation_id
 from .framework_solver import (
     DEFAULT_MAX_TRIALS, FrameworkSolveResult, _TrialSearch, _atomic_ops, _machine,
     _interleave, _search_bases, _stream_candidates, _stream_plan, _wall, _with_operations,
@@ -64,9 +64,11 @@ def streamk_crossing_partials(b_tot: int, g_k: int, c_aic: int) -> int:
 def _matrix_problem(op, meta):
     if op.source_boundary == "call":
         return None
+    weight_id = _weight_allocation_id(meta)
     declared = meta.get("catlass_problem")
     if declared is not None:
-        return matrix_problem(declared)
+        problem = matrix_problem(declared)
+        return replace(problem, b_id=weight_id) if weight_id is not None else problem
     shape = tuple(meta.get("matrix_shape", op.local_shape))
     if len(shape) != MATRIX_RANK or min(shape, default=0) <= 0 or op.link_bytes or op.vector_ops:
         return None
@@ -84,7 +86,7 @@ def _matrix_problem(op, meta):
     return CatlassProblem(
         *shape, dtype_a, dtype_b, meta.get("dtype_c", meta.get("output_format", op.dtype)),
         meta.get("dtype_acc", "int32" if dtype_a == "int8" else "fp32"),
-        groups=groups, a_id=f"{op.op_id}:a", b_id=meta.get("weight_allocation_id", f"{op.op_id}:b"),
+        groups=groups, a_id=f"{op.op_id}:a", b_id=weight_id or f"{op.op_id}:b",
         c_id=f"{op.op_id}:c", has_bias=bool(meta.get("has_bias")), mx_mode=mx_mode,
     )
 
@@ -161,7 +163,7 @@ def _convex_members(ops, ids):
 def select_dsl_candidates(
     ops: Sequence[OpSpec], datapath: DatapathCapabilitySpec, aic_budget: int, aiv_budget: int,
 ) -> tuple[tuple[DslKernelSpec, tuple[str, ...]], ...]:
-    return tuple(dict.fromkeys((spec, ids) for spec, ids, _ in _dsl_candidates(
+    return tuple(dict.fromkeys((spec, ids) for spec, ids, _, _ in _dsl_candidates(
         ops, datapath, aic_budget, aiv_budget,
     )))
 
@@ -181,7 +183,7 @@ def _dsl_candidates(ops, datapath, aic, aiv):
             except ModelingError:
                 continue
             for spec in specs:
-                yield spec, members, index
+                yield spec, members, op.op_id, index
 
 
 def _declared_regions(ops):
@@ -191,10 +193,16 @@ def _declared_regions(ops):
                 yield declaration
 
 
-def _region_lowerer(declaration, members):
+def _replay_ops(ops):
+    # Compiler declarations can contain Stage objects and do not affect baseline execution.
+    return tuple(replace(op, metadata=tuple((key, value) for key, value in op.metadata if key != "fuse_regions"))
+                 if any(key == "fuse_regions" for key, _ in op.metadata) else op for op in ops)
+
+
+def _region_lowerer(declaration, members, graph_ops):
     options = dict(declaration["compiler_options"])
     options.update(
-        dependencies={op.op_id: op.deps for op in members}, edge_routes=tuple(declaration["edge_routes"]),
+        dependencies={op.op_id: op.deps for op in graph_ops}, edge_routes=tuple(declaration["edge_routes"]),
         live_in_obligations=tuple(declaration.get("live_in_obligations", ())),
         live_out_obligations=tuple(declaration.get("live_out_obligations", ())),
         backend=declaration["backend"],
@@ -211,15 +219,16 @@ def _region_lowerer(declaration, members):
 def _dsl_proposals(ops, datapath, aic, aiv):
     from mindie_sim.rewrite.schema import FuseRegion, KernelBoundary, OpRef, SelectTemplate
 
-    for spec, ids, index in _dsl_candidates(ops, datapath, aic, aiv):
+    for spec, ids, declaring_op, index in _dsl_candidates(ops, datapath, aic, aiv):
         refs = tuple(OpRef("atom", op_id) for op_id in ids)
         meta = next(dict(op.metadata) for op in ops if op.op_id == ids[-1])
+        params = (("aic_budget", spec.aic_budget), ("aiv_budget", spec.aiv_budget), ("declaration", index))
         if len(refs) == 1:
-            yield (SelectTemplate(refs[0], "K3", spec.kernel_id, (
-                ("aic_budget", spec.aic_budget), ("aiv_budget", spec.aiv_budget), ("declaration", index),
-            )),), spec
+            yield (SelectTemplate(refs[0], "K3", spec.kernel_id, params),), spec
         elif "dsl_preserve_ports" in meta:
-            yield (FuseRegion(refs, tuple(meta["dsl_preserve_ports"]), (KernelBoundary(spec.kernel_id, refs),),
+            params += (("declaring_op", declaring_op), ("variant", spec.template_variant))
+            boundary = KernelBoundary(spec.kernel_id, refs, params)
+            yield (FuseRegion(refs, tuple(meta["dsl_preserve_ports"]), (boundary,),
                               fusion_tier="K3_dsl_pipeline"),), spec
     for declaration in _declared_regions(ops):
         ids = tuple(declaration["op_ids"])
@@ -228,7 +237,7 @@ def _dsl_proposals(ops, datapath, aic, aiv):
             continue
         identifier = declaration["region_id"]
         try:
-            result = _region_lowerer(declaration, members)(datapath, region_id=identifier)
+            result = _region_lowerer(declaration, members, ops)(datapath, region_id=identifier)
         except ModelingError:
             continue
         refs = tuple(OpRef("atom", op_id) for op_id in ids)
@@ -253,9 +262,11 @@ def _catlass_proposals(ops, datapath, aic, aiv):
             yield (SelectTemplate(OpRef("atom", op.op_id), "K2", spec.template_id, params),), spec
 
 
-def _catalog_lowerer(op, members, datapath, tier, identifier, params, limits):
+def _catalog_lowerer(op, members, graph_ops, datapath, tier, identifier, params, limits):
     catalog = builtin_template_catalog()
     options = dict(params)
+    if len(options) != len(params):
+        raise ModelingError(f"rewrite_template_params_invalid:{op.op_id}")
     aic = options.pop("aic_budget", limits[0])
     aiv = options.pop("aiv_budget", limits[1])
     if any(type(budget) is not int or not 0 <= budget <= limit for budget, limit in zip((aic, aiv), limits)):
@@ -272,13 +283,16 @@ def _catalog_lowerer(op, members, datapath, tier, identifier, params, limits):
             declared_region = next((entry for entry in _declared_regions(members)
                                     if entry["region_id"] == identifier and tuple(entry["op_ids"]) == ids), None)
             if declared_region is not None:
-                return _region_lowerer(declared_region, members)
+                return _region_lowerer(declared_region, members, graph_ops)
         index = options.pop("declaration", None)
+        declaring_op = options.pop("declaring_op", None)
         kernel = "dsl." + identifier.removeprefix("dsl.").partition(".")[0]
         if options.keys() <= {"variant"} and (index is None or type(index) is int):
             choices = []
             member_ids = tuple(member.op_id for member in members)
             for source in members:
+                if declaring_op is not None and source.op_id != declaring_op:
+                    continue
                 for ordinal, declared, problem, ids in _dsl_declarations(source):
                     if (ids == member_ids and declared in {kernel, identifier}
                             and (index is None or index == ordinal)):
@@ -291,7 +305,7 @@ def _catalog_lowerer(op, members, datapath, tier, identifier, params, limits):
     raise ModelingError(f"rewrite_template_recipe_unbound:{op.op_id}:{identifier}")
 
 
-def replay_catalog_binding(scenario, entry, op, binding, plan, stream):
+def replay_catalog_binding(scenario, entry, op, binding, applied, stream):
     from mindie_sim.rewrite.apply import _die, _path
     from mindie_sim.rewrite.schema import FuseRegion
 
@@ -299,14 +313,15 @@ def replay_catalog_binding(scenario, entry, op, binding, plan, stream):
         tier, identifier, params = binding.tier, binding.template_id, binding.params
         members = (op,)
     elif op.family == "rewrite_fused" and dict(op.metadata).get("fusion_tier") == "K3_dsl_pipeline":
-        edit = next(edit for edit in plan.edits if op.op_id == f"rewrite:{edit.edit_id}")
+        edit = next(edit for edit in applied.plan.edits if op.op_id == f"rewrite:{edit.edit_id}")
         operation = edit.operation
         if (not isinstance(operation, FuseRegion) or len(operation.kernel_boundaries) != 1
                 or any(ref.kind != "atom" for ref in operation.members)):
             return None
         ids = {ref.id for ref in operation.members}
         members = tuple(member for member in entry.ops if member.op_id in ids)
-        tier, identifier, params = "K3", op.recipe, ()
+        boundary, = operation.kernel_boundaries
+        tier, identifier, params = "K3", boundary.abi_id, boundary.params
         if not identifier.startswith("dsl.") and not any(
             decl["region_id"] == identifier for decl in _declared_regions(members)
         ):
@@ -318,14 +333,29 @@ def replay_catalog_binding(scenario, entry, op, binding, plan, stream):
     if stream is not None:
         owners = bind_stream_owners(stream, path)[dict(stream.assignments).get(op.op_id, MAIN_STREAM)]
         limits = owners.aic_limit, owners.aiv_limit
-    return bind_catalog_recipe(op, members, path, tier=tier, identifier=identifier, params=params,
-                               limits=limits, die=_die(scenario, entry.replica, op.stage).rank,
-                               replica=entry.replica)
+    recipe, summary = bind_catalog_recipe(
+        op, members, path, tier=tier, identifier=identifier, params=params, limits=limits,
+        die=_die(scenario, entry.replica, op.stage).rank, replica=entry.replica, graph_ops=entry.ops,
+    )
+    if binding and op.family == "rewrite_fused":
+        summary = replace(summary, op_ids=dict(applied.absorbed_atoms)[op.op_id])
+    return recipe, summary
 
 
-def bind_catalog_recipe(op, members, datapath, *, tier, identifier, params, limits, die, replica):
+@dataclass(frozen=True, slots=True)
+class _CatalogReplayProgram:
+    """Keep directional row registration intact through static DAG coalescing."""
+
+    program: Program
+
+    def start(self, engine, name, ready, *, owner=""):
+        return self.program.start(engine, name, ready, owner=owner)
+
+
+def bind_catalog_recipe(op, members, datapath, *, tier, identifier, params, limits, die, replica, graph_ops=None):
     """Resolve the edit against its problem and use one specialization for audit and execution."""
-    lower = _catalog_lowerer(op, members, datapath, tier, identifier, params, limits)
+    lower = _catalog_lowerer(op, members, graph_ops if graph_ops is not None else members,
+                             datapath, tier, identifier, params, limits)
     result = lower(datapath, die=die, region_id=op.op_id)
     raw = result.summary
     summary = replace(
@@ -351,31 +381,11 @@ def bind_catalog_recipe(op, members, datapath, *, tier, identifier, params, limi
 
     def build(_op, _geometry):
         def program(context):
-            program = lower(context.datapath or datapath, context=context, die=die, region_id=op.op_id).program
-            return _share_hbm_row(program, context)
+            bound = lower(context.datapath or datapath, context=context, die=die, region_id=op.op_id).program
+            return _CatalogReplayProgram(bound) if getattr(bound, "hbm_bus", None) is not None else bound
         return OperatorPlan(work, program)
 
     return PlannedRecipe(build), summary
-
-
-def _share_hbm_row(program, context):
-    """Bind native HBM service bytes to the shared row used by shipping kernels."""
-    bus = getattr(program, "hbm_bus", None)
-    if bus is None:
-        return program
-    row = context.resource_names["hbm"]
-    directional = {bus.row_r, bus.row_w}
-    counters = {bus.ctr_r, bus.ctr_w}
-    stages = []
-    for stage in program.stages:
-        amount = sum(value for key, value in stage.deliveries if key in counters)
-        if amount:
-            work = {key: value for key, value in stage.work.items() if key not in directional}
-            duration = max(stage.work.get(key, 0) for key in directional)
-            stage = replace(stage, work={**work, row: amount}, caps={**stage.caps, row: amount / duration},
-                            coupled=True)
-        stages.append(stage)
-    return KernelProgram(tuple(stages), program.minimum_ms)
 
 
 def solve_dsl(

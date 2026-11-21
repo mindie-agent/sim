@@ -24,11 +24,11 @@ import pytest
 
 from _support.axes import REPRESENTATIVE_SKUS
 from _support.hardware import sku_case
-from mindie_sim import _remote_worker as worker
-from mindie_sim import api, remote_exec as remote
+from mindie_sim import _remote_worker as worker, api, remote_exec as remote
 from mindie_sim.optimization.contracts import PrimitiveCapacityEntry, PrimitiveCapacityTable
 from mindie_sim.prediction.results import ReplayOptions, StepRequest, json_payload
 from mindie_sim.prediction.spine import default_spine
+from mindie_sim.primitives.loader import load_primitives
 from mindie_sim.stack_registry import LoweringRequest
 
 pytestmark = pytest.mark.tier0
@@ -73,21 +73,26 @@ def _dispatcher(cwd, target, *, warm=False, endpoints=None, probe=None, **kwargs
     )
 
 
-@pytest.mark.parametrize("entrypoint", ["optimize_ladder", "evaluate_three_tiers"])
-def test_local_dispatch_matches_public_prediction(endpoint_paths, monkeypatch, prediction_case, entrypoint):
-    _, cwd, _ = endpoint_paths
+@pytest.mark.parametrize("variant", ["capacity_table", "primitive_table", "three_tiers"])
+def test_local_dispatch_matches_public_prediction(tmp_path, monkeypatch, prediction_case, variant):
     monkeypatch.setattr(remote, "_read_config", _unexpected)
     monkeypatch.setattr(remote, "_exchange", _unexpected)
-    dispatcher = _dispatcher(cwd, "local", endpoints=_unexpected, probe=_unexpected,
+    dispatcher = _dispatcher(tmp_path, "local", endpoints=_unexpected, probe=_unexpected,
                              stage_fn=_unexpected, exec_fn=_unexpected)
     step = StepRequest(phase="decode", context=16, sequences=(2,))
     replay = ReplayOptions(include_submission=True)
+    entrypoint = "evaluate_three_tiers" if variant == "three_tiers" else "optimize_ladder"
     options = {}
-    if entrypoint == "optimize_ladder":
+    if variant == "capacity_table":
         die = prediction_case.machine.dies[0]
         rate = dict(die.rates)["hbm"]
         table = PrimitiveCapacityTable(die.sku, (PrimitiveCapacityEntry("hbm_bus_r", rate, rate, "B/s"),))
         options = dict(max_trials=1, stack_id="raw_eager", primitive_table=table, primitives=None)
+    elif variant == "primitive_table":
+        table = load_primitives("Ascend950DT_9582")
+        prediction_case = sku_case(table.sku)
+        step = replace(step, phase="prefill", context=0, tokens=1024)
+        options = dict(max_trials=0, primitive_table=table)
     expected = json_payload(getattr(api, entrypoint)(prediction_case, step, replay=replay, **options))
     spine = default_spine()
     predict = Mock(wraps=getattr(spine, entrypoint))
@@ -104,19 +109,21 @@ def test_local_dispatch_matches_public_prediction(endpoint_paths, monkeypatch, p
         for report in (actual, expected):
             del report["dual_subgradient"]["solve_ms"]
     assert actual == expected
+    if variant == "primitive_table":
+        assert predict.call_args.kwargs["primitive_table"].to_envelope_dict() == table.to_envelope_dict()
+        ladder = actual["ladder"]
+        assert all(gate["passed"] for gate in actual["verification"]["gates"])
+        assert 0 < ladder["l_star_hw_ns"] <= ladder["l_star_lean_ns"] <= ladder["a_star_dsl_ns"]
 
 
-@pytest.mark.parametrize(
-    "target,warm,count,expected,reason",
-    [
-        ("auto", True, 1, "local", "warm_local_c11"),
-        ("auto", True, 3, "local", "warm_local_c11"),
-        ("auto", True, 4, "remote", None),
-        ("auto", True, 5, "remote", None),
-        ("auto", False, 1, "remote", None),
-        ("prefer_remote", True, 1, "remote", None),
-    ],
-)
+@pytest.mark.parametrize("target,warm,count,expected,reason", [
+    ("auto", True, 1, "local", "warm_local_c11"),
+    ("auto", True, 3, "local", "warm_local_c11"),
+    ("auto", True, 4, "remote", None),
+    ("auto", True, 5, "remote", None),
+    ("auto", False, 1, "remote", None),
+    ("prefer_remote", True, 1, "remote", None),
+])
 def test_execution_target_resolution(endpoint_paths, target, warm, count, expected, reason):
     _, cwd, _ = endpoint_paths
     load = Mock(return_value={ALIAS: ENDPOINT})
@@ -185,12 +192,10 @@ def test_unattended_dispatch_requires_exact_endpoint_pin(endpoint_paths, spoof):
     receipt = dispatcher.resolve_target(1)
     assert receipt.resolved_target == "local" and receipt.fallback_reason == "no_authorized_endpoint"
     probe.assert_not_called()
-
     _write_pin(home, endpoint)
     _write_config(home / ".mindie/endpoints.json", {ALIAS: ENDPOINT})
     assert dispatcher.resolve_target(1).endpoint_id == endpoint.endpoint_id
     probe.reset_mock()
-
     replacement = ENDPOINT | spoof
     assert remote._endpoint(replacement).endpoint_id != endpoint.endpoint_id
     _write_config(cwd / "endpoints.json", {ALIAS: replacement})
@@ -272,8 +277,7 @@ def bundle_source(tmp_path):
 
 def _stage(source, cache, request_id=REQUEST_ID, quota=CACHE_QUOTA_BYTES):
     digest = remote.compute_bundle_digest(source)
-    archive = remote.build_bundle_archive(source)
-    stage = remote.stage_bundle_local_dir(archive, cache, digest, request_id=request_id,
+    stage = remote.stage_bundle_local_dir(remote.build_bundle_archive(source), cache, digest, request_id=request_id,
                                           cache_quota_bytes=quota, build_c11=False)
     return stage, digest
 
@@ -291,7 +295,6 @@ def test_digest_stage_private_mode_manifest_and_job_lease(bundle_source, tmp_pat
     lease = stage / "leases" / f"{os.getpid()}-{REQUEST_ID}.lease"
     assert list(lease.parent.iterdir()) == [lease]
     assert lease.read_bytes() == b""
-
     staged_module = stage / "mindie_sim/example.py"
     staged_module.write_bytes(staged_module.read_bytes().replace(b"1", b"2", 1))
     with pytest.raises(ValueError, match="^staged manifest mismatch$"):
@@ -332,13 +335,11 @@ def test_cache_byte_quota_protects_active_lease_then_evicts(bundle_source, tmp_p
     (bundle_source / "mindie_sim/example.py").write_bytes(b"VALUE = 2\n")
     next_digest = remote.compute_bundle_digest(bundle_source)
     assert next_digest != first_digest
-
     with pytest.raises(ValueError, match="staging cache quota exhausted"):
         _stage(bundle_source, cache, request_id="c" * 32, quota=quota)
     assert lease.exists()
     assert remote.verify_staged_manifest(first) == first_digest
     assert not (cache / next_digest).exists()
-
     lease.unlink()
     abandoned = cache / ".incoming-stale"
     abandoned.mkdir()
@@ -356,7 +357,6 @@ def test_unsent_submission_can_run_locally(endpoint_paths, target):
     stage = Mock(return_value=(f"/stage/{BUNDLE_DIGEST}", BUNDLE_DIGEST))
     dispatcher = _dispatcher(cwd, target, exec_fn=exec_fn, stage_fn=stage)
     result, receipt = dispatcher.dispatch_batch("run_step", {}, [{}], local_runner=local)
-
     exec_fn.assert_called_once()
     local.assert_called_once()
     remote_payload = exec_fn.call_args.args[1]

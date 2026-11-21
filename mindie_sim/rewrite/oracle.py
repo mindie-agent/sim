@@ -276,12 +276,15 @@ def _check_budget(budget, deadline):
     if budget.cancelled is not None and budget.cancelled():
         raise TimeoutError("rewrite_oracle_cancelled")
 def _report(case, graphs, context, book, replay, *, deadline=None, fast=False, trace_limit=0, streams=(), cut=False):
+    from mindie_sim.optimization.dsl_solver import _replay_ops
+
     external = {dep: 0.0 for ops in graphs.values()
                 for dep in _external_dependencies(ops) if cut or dep == "analysis_input"}
     token = ACTIVE_DEADLINE_MONO.set(deadline)
     try:
         return graph_costs(
-            case, graphs, recipes=book, external_inputs=external, evaluation=context,
+            case, {rank: _replay_ops(ops) for rank, ops in graphs.items()},
+            recipes=book, external_inputs=external, evaluation=context,
             isolated=replay.isolated and not cut, include_submission=replay.include_submission,
             trace_limit=max(trace_limit, replay.event_limit) if not fast else 0,
             fast_span_only=fast, stream_plans=streams or None,
@@ -546,7 +549,7 @@ def _bind_replay(scenario, applied, book, handle):
         for op in ops:
             template = templates.get(op.op_id)
             catalog = replay_catalog_binding(scenario, atomic[entry.replica], op, template,
-                                             applied.plan, streams.get(entry.replica))
+                                             applied, streams.get(entry.replica))
             if catalog:
                 identifier = f"rewrite_template:{entry.replica}:{op.op_id}"
                 registered[identifier], summary = catalog
@@ -772,7 +775,7 @@ def finalize_plan(
         cached = scenario._certificate.get(resolved.base_graph_sha256) if cacheable else None
         if cached is None:
             dual_program, event_dag, _ = build_dual_inputs_from_scenario(
-                resolved, region_summaries=summaries, primitive_table=primitive_table, rate_mode=rate_mode)
+                resolved, applied=applied, region_summaries=summaries, primitive_table=primitive_table, rate_mode=rate_mode)
             dual_certificate, _ = certify_lower_bound(dual_program, event_dag)
             if cacheable:
                 with scenario._cache_lock:

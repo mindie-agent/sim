@@ -20,7 +20,7 @@ from .dsl_catalog import (
     ATTN_RES, ATTN_RES_VL, BF16_BYTES, COMMIT_KDA, FLASH_KDA, FP32_BYTES, INT32_BYTES,
     KDA_CHUNK, KDA_HEAD_DIM, KDA_HIDDEN_SIZE, KDA_MODEL_HEADS, KV_ROW_BYTES_CMP, KV_ROW_BYTES_ORI,
     MEGA_KDA, MLA_CACHE_NZ_LANE_BYTES, MLA_PROLOG, MLA_QUANTIZED_QUERY, MQSMLA, MQSMLA_FD_BYTES_PER_CORE, MQSMLA_FD_SLOT_BYTES,
-    MQSMLA_KV_DEPTH, MQSMLA_KV_TILE, QSLI, QSLI_HISTOGRAM_BINS, QSLI_METADATA_BYTES,
+    MQSMLA_KV_DEPTH, MQSMLA_KV_TILE, QSLI, QSLI_HISTOGRAM_BINS, QSLI_MATRIX_DTYPE, QSLI_METADATA_BYTES,
     QSLI_PACKED_D, QSLI_SCALE_ROW_BYTES, QSLI_STAGING_DEPTH, QSLI_TILE_M, QSLI_TILE_N,
     QSLI_TRUNK, QkvQuantMode, commit_rows, describe_dsl_kernel,
     dsl_problem, flash_kda_lane_tasks, mega_workspace_sizes,
@@ -607,7 +607,7 @@ def _lower_qsli(lower, p, ready):
                 operand = _read_ring(l0b, tile, k_l0, n + ":QsliCube")
                 logical = 2 * QSLI_TILE_M * real * KDA_HEAD_DIM
                 score = lower.cube(n + ":QsliCube", logical, (q_l0, operand, ring_credit(l0c, tile)), core,
-                                   dtype="mxfp4", issued=2 * QSLI_TILE_M * QSLI_TILE_N * KDA_HEAD_DIM)
+                                   dtype=QSLI_MATRIX_DTYPE, issued=2 * QSLI_TILE_M * QSLI_TILE_N * KDA_HEAD_DIM)
                 score = _read_ring(l0c, tile, score, n + ":fix_done")
                 fixes = []
                 for sub, lane in enumerate(pair[:2]):

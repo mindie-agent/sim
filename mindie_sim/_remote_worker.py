@@ -318,11 +318,19 @@ def _candidate(entrypoint, base, candidate, deadline):
         else:
             options = dict(candidate.get("options", {}))
             if (table := options.get("primitive_table")) is not None:
-                from mindie_sim.optimization.contracts import PrimitiveCapacityEntry, PrimitiveCapacityTable
+                if table.get("kind") == "primitive_table":
+                    from mindie_sim.primitives.schema import parse_primitive_table
 
-                options["primitive_table"] = PrimitiveCapacityTable(
-                    sku=table["sku"], entries=tuple(PrimitiveCapacityEntry(**entry) for entry in table["entries"]),
-                )
+                    parsed = parse_primitive_table(table["envelope"])
+                    # The loader attaches warnings outside the digested envelope.
+                    object.__setattr__(parsed, "warnings", tuple(table.get("warnings", ())))
+                    options["primitive_table"] = parsed
+                else:
+                    from mindie_sim.optimization.contracts import PrimitiveCapacityEntry, PrimitiveCapacityTable
+
+                    options["primitive_table"] = PrimitiveCapacityTable(
+                        sku=table["sku"], entries=tuple(PrimitiveCapacityEntry(**entry) for entry in table["entries"]),
+                    )
             result = spine.optimize_ladder(case, _step_request(raw), replay=replay, **options)
         check_active_deadline()
         return {"candidate_id": candidate["candidate_id"], "objective_key": candidate["objective_key"],

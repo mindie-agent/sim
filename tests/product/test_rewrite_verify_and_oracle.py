@@ -337,6 +337,38 @@ def test_work_gate_rejects_forged_summary_work(real_graph):
     assert not receipt.gates[3].passed
 
 
+def test_empty_plan_rejects_certificate_for_unbound_cold_read():
+    case = compose_case("qwen3-30b-a3b", REPRESENTATIVE_SKUS["a5"], tp=2, dp=1)
+    scenario = resolve_scenario(case, StepRequest("decode", context=64))
+    applied = apply_plan(_empty(scenario), scenario)
+    cold_bytes = 511_212_000
+    read = TensorRangeObligation(0, "external", 0, ((0, cold_bytes),), "hbm_cold", "owner")
+    forged = FusedRegionSummary(
+        "K2", "missing", ("missing",), (), (), (), (read,), (),
+        cold_bytes, cold_bytes, cold_bytes, Fraction(cold_bytes), 0, (), 1, Fraction(0), (), None,
+    )
+    program, dag, _ = build_dual_inputs_from_scenario(scenario, region_summaries=(forged,))
+    evidence = _certificate_evidence(program, dag)
+    receipt = verify_plan(scenario, applied, wall_ns=evidence["dual_certificate"].l_star_lean_ns,
+                          region_summaries=(forged,), **evidence)
+    assert not receipt.passed and receipt.l_star_ns is None
+    assert _reason(receipt, 3) == "LEDGER_RECONCILIATION_ERROR"
+    assert receipt.gates[3].detail == "unbound_region_summary:missing"
+    assert _reason(receipt, 4) == "LEAN_CERTIFICATE_INVALID"
+    assert receipt.gates[4].detail == "certificate_unbound_to_scenario"
+
+
+def test_fused_summary_requires_exact_region_members_and_one_summary_per_occurrence(real_graph):
+    scenario, _ = real_graph
+    applied, summary = _fused_summary(scenario)
+    for summaries in ((replace(summary, region_id="missing"),),
+                      (replace(summary, op_ids=summary.op_ids[:1]),),
+                      (summary, summary)):
+        receipt = verify_plan(scenario, applied, region_summaries=summaries, scope="archetype")
+        assert _reason(receipt, 3) == "LEDGER_RECONCILIATION_ERROR"
+        assert receipt.gates[3].detail.startswith("unbound_region_summary:")
+
+
 @pytest.mark.parametrize("mutation", (
     {"logical_transfer_bytes": 31}, {"issued_copy_bytes": -1}, {"dram_sector_bytes": 96},
     {"turnaround_service_bytes": 85.5}, {"turnaround_service_bytes": Fraction(63)},

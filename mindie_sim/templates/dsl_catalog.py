@@ -658,7 +658,13 @@ def qsli_workspace_sizes(p, aic):
     }
 
 
+QSLI_MATRIX_DTYPE = "mxfp4"
+
+
 def _qsli(p, aic, aiv, datapath, variant):
+    arch = datapath.compute_arch.declared
+    if arch is None or not arch.supports_native("matrix", QSLI_MATRIX_DTYPE, "fp32"):
+        raise unmodeled(QSLI, "qsli_requires_native_mxfp4")
     if (p.topk < 1 or p.candidates < 0 or p.query_rows < 1
             or not 1 <= p.split_parts <= min(max(1, p.candidates), aic)
             or aic > QSLI_MAX_CUBE_WORKERS):

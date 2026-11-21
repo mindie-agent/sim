@@ -7,19 +7,22 @@
 """
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass, replace
 from fractions import Fraction
 
-from mindie_sim.prediction.program.stages import KernelProgram
+from mindie_sim.prediction.program.stages import KernelProgram, Stage, scope_allocations
 from mindie_sim.prediction.runtime.l2_residency import _dram_service_segments
 from mindie_sim.prediction.runtime.memory_physics import (
     AdmissionMemoryView, BoundAccess, HbmBusSpec, MemoryAccessPattern, ReuseKey,
-    SectorCoverage, bind_memory_access,
+    SectorCoverage,
 )
 from mindie_sim.schema.common import ModelingError
 
-from .contracts import FusedRegionSummary, _logical_obligation, _obligation_runs, _split_entry_residency
+from .contracts import (
+    FuseRegionSpec, FusedRegionSummary, TensorRangeObligation, _entry_with_runs, _logical_obligation,
+    _obligation_runs, _partition_runs, _split_entry_residency, _union_obligations,
+)
 
 
 class _ReuseLifetimes:
@@ -30,14 +33,12 @@ class _ReuseLifetimes:
         self.pending = Counter(p.reuse_key for p in patterns if p.reuse_key is not None)
         self.keys: dict[ReuseKey, tuple[ReuseKey, bool]] = {}
 
-    def resolve(self, pattern, *, retain=True):
+    def resolve(self, pattern):
         key = pattern.reuse_key
         if key is None:
             return pattern
         if key not in self.keys:
             resolved = self.state.resolve_reuse_key(key)
-            if not retain:
-                return replace(pattern, reuse_key=resolved)
             self.keys[key] = resolved, self.state.retain_template_key(resolved)
         return replace(pattern, reuse_key=self.keys[key][0])
 
@@ -79,8 +80,19 @@ class _BoundTemplateProgram(KernelProgram):
         lifetimes = _ReuseLifetimes(self.live_state, (
             stage.program.pattern for stage in self.stages if isinstance(stage.program, _LiveAccess)
         ))
-        stages = tuple(replace(stage, program=replace(stage.program, delivered=delivered, lifetimes=lifetimes))
-                       if isinstance(stage.program, _LiveAccess) else stage for stage in self.stages)
+        obligations = {"read": [], "write": []}
+        explicit = self.summary.spec if isinstance(self.summary.spec, FuseRegionSpec) else None
+        stages = []
+        for stage in self.stages:
+            if isinstance(stage.program, _LiveAccess):
+                stage = replace(stage, program=replace(stage.program, delivered=delivered, lifetimes=lifetimes,
+                                                       obligations=obligations, explicit=explicit is not None))
+            elif (engine._accel is not None and (stage.acquire or stage.free)
+                    and not (stage.program or stage.work or stage.latency or stage.fragment or stage.deliveries)):
+                scoped = replace(stage, acquire=scope_allocations(name, stage.acquire),
+                                 free=scope_allocations(name, stage.free))
+                stage = Stage(stage.name, after=stage.after, program=_LiveAllocation(f"{name}:{stage.name}", scoped))
+            stages.append(stage)
         state, key = self.live_state, name + ":l2_reservation"
         reservation = self.l2_reservation
         if reservation is not None:
@@ -91,8 +103,8 @@ class _BoundTemplateProgram(KernelProgram):
                     raise ModelingError("fuse_region_live_l2_reservation_overflow")
                 state.grant_reservation(die, key, reserved)
 
-            ready = engine.submit(key, after=(ready,), owner=owner, on_start=grant)
-        invocation = KernelProgram(stages)
+            ready = engine.submit(key, after=(ready,), owner=owner, on_complete=grant, native_hook=True)
+        invocation = KernelProgram(tuple(stages))
         done = invocation.start(engine, name, ready, owner=owner)
         # Scoped observers are unique to this invocation and cannot reuse a compiled plan.
         engine._compiled_programs.pop(id(invocation), None)
@@ -101,10 +113,23 @@ class _BoundTemplateProgram(KernelProgram):
             lifetimes.close()
             if reservation is not None:
                 state.release_reservation(die, key)
-            self.summary._record_delivery(delivered)
+            reads, writes = obligations["read"], obligations["write"]
+            if explicit is not None:
+                reads = _observed_obligations(explicit.live_in_obligations, reads)
+                writes = _observed_obligations(explicit.live_out_obligations, writes)
+            self.summary._record_delivery(delivered, _union_obligations(reads), _union_obligations(writes))
 
-        engine.on_complete(done, finalize)
-        return done
+        return engine.submit(name + ":delivery", after=(done,), owner=owner,
+                             on_complete=finalize, native_hook=True)
+
+
+@dataclass(frozen=True, slots=True)
+class _LiveAllocation:
+    name: str
+    stage: Stage
+
+    def start(self, engine, name, ready, *, owner=""):
+        return engine._submit_allocation_boundary(self.name, self.stage, (ready,), owner=owner)
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,85 +137,60 @@ class _LiveAccess:
     bound: BoundAccess
     state: AdmissionMemoryView
     pattern: MemoryAccessPattern
+    obligation: TensorRangeObligation | None
     delivered: Counter | None = None
     lifetimes: _ReuseLifetimes | None = None
+    obligations: dict | None = None
+    explicit: bool = False
 
     def start(self, engine, name, ready, *, owner=""):
-        done = engine.future(name + ":delivered")
+        def record(ledger, resident, dirty):
+            pattern = self.pattern
+            if self.delivered is not None:
+                self.delivered.update({
+                    "logical_transfer_bytes": ledger.logical_tensor_bytes,
+                    "issued_copy_bytes": ledger.aligned_transfer_bytes,
+                    "dram_sector_bytes": ledger.dram_sector_bytes + dirty,
+                    "turnaround_service_bytes": dirty + (
+                        _rational_service(pattern.runs, resident, self.bound.bind_config[-2])
+                        if ledger.dram_sector_bytes else 0
+                    ),
+                    "realized_l2_hit_bytes": ledger.l2_hit_bytes,
+                    "realized_l2_miss_bytes": ledger.dram_miss_copy_bytes,
+                    "realized_hbm_bytes": ledger.dram_bus_transaction_bytes + dirty,
+                })
+                entry = self.obligation
+                if self.explicit and not pattern.visibility.private_workspace:
+                    entry = _logical_obligation(pattern)
+                if entry is not None:
+                    self.obligations[pattern.direction].extend(_split_entry_residency(entry, resident))
+            self.lifetimes.complete(pattern.reuse_key)
 
-        def admit(event):
-            bus, hit, miss, l2, copy_row, l2_row, rules, nominal = self.bound.bind_config
-            pattern = self.lifetimes.resolve(self.pattern, retain=False)
-            plan = pattern.runs
-            aligned = plan.aligned_copy_bytes()
-            resident = self.state.resident_coverage_for(pattern, aligned)
-            waits = self.state.inflight_fill_dependencies(engine, pattern, resident)
-            if waits:
-                barrier = engine.boundary(name + ":await_l2_fill", after=(event, *waits))
-                engine.on_complete(barrier, admit)
-                return
-            pattern = self.lifetimes.resolve(self.pattern)
-            bound = bind_memory_access(
-                pattern, self.state, hbm_bus=bus, copy_hit_bytes_per_ms=hit, copy_miss_bytes_per_ms=miss,
-                l2_bytes_per_ms=l2, pipe_row_id=copy_row, l2_row_id=l2_row, burst_rules=rules,
-                nominal_pipe_bytes_per_ms=nominal, commit=False,
-            )
-            ledger = bound.ledger
-            if not ledger.l2_hit_bytes:
-                resident = SectorCoverage()
-            fill = self.state.start_l2_fill(engine, name, pattern, aligned, resident) if ledger.dram_sector_bytes else None
-            access = engine.submit_bound_access(name, bound, after=(event,), owner=owner)
+        return engine.submit_bound_access(
+            name, self.bound, after=(ready,), owner=owner, memory_state=self.state,
+            pattern=lambda: self.lifetimes.resolve(self.pattern), on_delivery=record,
+        )
 
-            def record(dirty):
-                if self.delivered is not None:
-                    self.delivered.update({
-                        "logical_transfer_bytes": ledger.logical_tensor_bytes,
-                        "issued_copy_bytes": ledger.aligned_transfer_bytes,
-                        "dram_sector_bytes": ledger.dram_sector_bytes + dirty,
-                        "turnaround_service_bytes": dirty + (
-                            _rational_service(plan, resident, rules)
-                            if ledger.dram_sector_bytes else 0
-                        ),
-                        "realized_l2_hit_bytes": ledger.l2_hit_bytes,
-                        "realized_l2_miss_bytes": ledger.dram_miss_copy_bytes,
-                        "realized_hbm_bytes": ledger.dram_bus_transaction_bytes + dirty,
-                    })
-                self.lifetimes.complete(self.pattern.reuse_key)
-                engine.resolve(done)
 
-            def complete(transfer):
-                self._settle_residency(pattern, ledger, resident)
-                dirty = sum(item.bytes for item in self.state.drain_writebacks(bus.die))
-                if fill is not None:
-                    self.state.finish_l2_fill(engine, pattern, fill)
-                if dirty:
-                    work = {term.row_id: term.ms_per_progress for term in bus.terms_for("write", dirty)
-                            if term.ms_per_progress}
-                    writeback = engine.submit(name + ":dirty_writeback", work, after=(transfer,), owner=owner,
-                                              coupled=len(work) > 1, deliveries=((bus.ctr_w, dirty),))
-                    engine.on_complete(writeback, lambda _: record(dirty))
-                else:
-                    record(0)
-
-            engine.on_complete(access, complete)
-
-        engine.on_complete(ready, admit)
-        return done
-
-    def _settle_residency(self, pattern, ledger, resident):
-        aligned = ledger.aligned_transfer_bytes
-        if pattern.direction == "read" and ledger.l2_hit_bytes:
-            # Only bytes fetched from HBM may repopulate sectors evicted while
-            # this access was in flight.
-            if not ledger.dram_miss_copy_bytes:
-                if self.state.preview_access(pattern, aligned)[1]:
-                    return
-            else:
-                entry = _logical_obligation(pattern)
-                cold = tuple(run for item in _split_entry_residency(entry, resident)
-                             if item.initial_residency == "hbm_cold" for run in _obligation_runs(item))
-                pattern = replace(pattern, runs=replace(pattern.runs, runs=cold))
-        self.state.admit_access(pattern, aligned)
+def _observed_obligations(declared, observed):
+    """Use observed residency for the covered parts of explicit region obligations."""
+    by_tensor = defaultdict(list)
+    for entry in observed:
+        by_tensor[entry.die, entry.allocation_id, entry.tensor_version].append(entry)
+    for entry in declared:
+        matching = by_tensor[entry.die, entry.allocation_id, entry.tensor_version]
+        if not matching or entry.initial_residency == "onchip_resident":
+            yield entry
+            continue
+        tagged = [(run, None) for run in _obligation_runs(entry)]
+        tagged.extend((run, item.initial_residency) for item in matching for run in _obligation_runs(item))
+        split = defaultdict(list)
+        for residency, run in _partition_runs(tagged, lambda labels: (
+            "hbm_cold" if "hbm_cold" in labels else "l2_warm" if "l2_warm" in labels else entry.initial_residency
+        ) if None in labels else None):
+            split[residency].append(run)
+        for residency, runs in split.items():
+            yield _entry_with_runs(entry, runs, initial_residency=residency)
 
 
 def _rational_service(plan, resident: SectorCoverage, rules):

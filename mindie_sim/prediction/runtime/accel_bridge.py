@@ -366,10 +366,15 @@ class NativeBackend:
         return False
     def _mixed_reason(self) -> str:
         return "auto_mixed_frontier" if self.mode == "auto" else "mixed_frontier"
+    def can_publish_control(self, engine) -> bool:
+        """Allow one zero-work Python grant at a native publication boundary."""
+        return (self.applying and self.enabled
+                and len(engine._native_seqs) == len(engine._tasks) - 1)
     def on_callback_registered(self, engine, event) -> None:
         """a live mirrored row acquired a Python completion observer.
 
-        The kernel can no longer run through that row's completion: it cannot
+        An undeclared hook was not marked when the task was mirrored. The
+        kernel can no longer run through that row's completion: it cannot
         invoke the callback at the exact instant and it would publish the epoch
         clock past it.  Hand the whole frontier back before the next native
         step, deferring the transfer when this registration happens inside
@@ -448,6 +453,28 @@ class NativeBackend:
         self.disable(engine, "mixed_frontier")
         self.made_progress = True
         self.needs_settle = False
+    def _refresh_resources(self, engine) -> bool:
+        names = tuple(engine.resources)
+        if names == self.res_names:
+            return True
+        if engine._native_slots or not 1 <= len(names) <= MAX_R:
+            return False
+        rates, units, policy = resource_table(engine)
+        if not all(math.isfinite(rate) and rate > 0 and 1 <= unit <= MAX_U
+                   for rate, unit in zip(rates, units)):
+            return False
+        has_fair = 0 in policy
+        priorities = {task.priority for _, task, _ in self.pending} if has_fair else set()
+        if len(priorities) > 1:
+            return False
+        # A nested program can declare its directional rows after its ready
+        # event was queued. Unflushed rows have no native resource indices yet.
+        self.arena.configure(rates, units, policy)
+        self.res_names = names
+        self.has_fair_res = has_fair
+        self.fair_prio = next(iter(priorities), None)
+        self.seeded = False
+        return True
     def _settle_instant(self, engine, force: bool = False) -> None:
         """Publish same-instant admission after a callback completion.
 
@@ -465,7 +492,7 @@ class NativeBackend:
                 self.needs_settle = False
                 return
             if (len(engine._native_seqs) != len(engine._tasks)
-                    or tuple(engine.resources) != self.res_names):
+                    or not self._refresh_resources(engine)):
                 self._handback_mixed(engine)
                 return
             self.engine_slots = engine._native_slots
@@ -532,7 +559,7 @@ class NativeBackend:
             self.disable(engine, "cohort_symmetry_break")
             self.made_progress = True
             return 0
-        if len(engine._native_seqs) != len(engine._tasks) or tuple(engine.resources) != self.res_names:
+        if len(engine._native_seqs) != len(engine._tasks) or not self._refresh_resources(engine):
             self.disable(engine, "mixed_frontier")
             self.made_progress = True
             return 0

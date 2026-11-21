@@ -12,14 +12,15 @@ from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field, replace
 from fractions import Fraction
 from graphlib import CycleError, TopologicalSorter
-from heapq import merge
-from itertools import groupby
-from math import gcd, isfinite, lcm
+from math import isfinite, lcm
 from typing import Iterable, Literal
 
 from mindie_sim.prediction.program.stages import KernelProgram
 from mindie_sim.prediction.runtime.memory_physics import (
     AddressRun, SectorCoverage, _MAX_EXPLICIT_SECTOR_INTERVALS, _merge_byte_intervals,
+)
+from mindie_sim.prediction.runtime.l2_residency import (
+    _coverage_runs, _partition_runs, _range_run, _residency_runs, _run_end,
 )
 from mindie_sim.prediction.runtime.tile_solver import AlgorithmKind, TileSolution
 from mindie_sim.schema.common import ModelingError
@@ -456,7 +457,9 @@ class FusedRegionSummary:
     def l2_miss_bytes(self) -> int:
         return self.realized_l2_miss_bytes
 
-    def _record_delivery(self, delivered):
+    def _record_delivery(self, delivered, reads, writes):
+        object.__setattr__(self, "read_obligations", reads)
+        object.__setattr__(self, "write_obligations", writes)
         for name in ("logical_transfer_bytes", "issued_copy_bytes", "dram_sector_bytes", "turnaround_service_bytes",
                      "realized_l2_hit_bytes", "realized_l2_miss_bytes", "realized_hbm_bytes"):
             object.__setattr__(self, name, delivered[name])
@@ -477,92 +480,9 @@ class TemplateLoweringResult:
         return self.summary.l2_miss_bytes
 
 
-def _range_run(lo, hi):
-    return AddressRun(lo, 1, hi - lo, hi - lo)
-
-
 def _obligation_runs(entry):
     yield from (_range_run(lo, hi) for lo, hi in entry.ranges)
     yield from entry.address_runs
-
-
-def _run_end(run):
-    return run.base_byte + (run.rows - 1) * run.stride_bytes + run.row_bytes
-
-
-def _coverage_runs(coverage: SectorCoverage):
-    yield from (_range_run(lo, hi) for lo, hi in coverage.intervals)
-    for run in coverage.periodic:
-        # A sector-aligned phase repeats after the row's byte offset realigns.
-        phase_rows = run.sector_bytes // gcd(run.sector_bytes, run.stride_bytes)
-        stride = phase_rows * run.stride_bytes
-        for phase in range(min(phase_rows, run.rows)):
-            lo, hi = run._row_bounds(phase)
-            rows = (run.rows - 1 - phase) // phase_rows + 1
-            yield AddressRun(lo, rows, hi - lo, stride)
-
-
-def _sweep(events):
-    """Yield consecutive byte spans with the labels active throughout each span."""
-    active, previous = Counter(), 0
-    for offset, changes in groupby(events, key=lambda event: event[0]):
-        if active and offset > previous:
-            yield previous, offset, active
-        for _, label, delta in changes:
-            active[label] += delta
-            if not active[label]:
-                del active[label]
-        previous = offset
-
-
-def _row_events(run, label, lo, hi):
-    """Stream row boundaries in a single period, clipping its boundary rows."""
-    first = max(0, (lo - run.base_byte - run.row_bytes) // run.stride_bytes + 1)
-    stop = min(run.rows, ceil_div(hi - run.base_byte, run.stride_bytes))
-    for row in range(first, stop):
-        start = run.base_byte + row * run.stride_bytes
-        yield max(lo, start), label, 1
-        yield min(hi, start + run.row_bytes), label, -1
-
-
-def _classified_spans(events, classify):
-    previous = None
-    for lo, hi, active in _sweep(events):
-        state = classify(active)
-        if previous is not None and previous[1] == lo and previous[2] == state:
-            previous = previous[0], hi, state
-            continue
-        if previous is not None:
-            yield previous
-        previous = (lo, hi, state) if state is not None else None
-    if previous is not None:
-        yield previous
-
-
-def _partition_runs(tagged_runs, classify):
-    """Apply a byte-set operation across repeating spans without expanding their rows."""
-    events = []
-    for run, label in dict.fromkeys(tagged_runs):
-        end = _run_end(run)
-        if run.rows == 1 or run.stride_bytes <= run.row_bytes:
-            run = _range_run(run.base_byte, end)
-        events.extend(((run.base_byte, (run, label), 1), (end, (run, label), -1)))
-    for lo, hi, active in _sweep(sorted(events, key=lambda event: event[0])):
-        if all(run.rows == 1 for run, _ in active):
-            if (state := classify({label for _, label in active})) is not None:
-                yield state, _range_run(lo, hi)
-            continue
-        # Each active run repeats over its bounding span. Only one common
-        # period needs scanning, with the final repeat clipped to the span.
-        period = lcm(*(run.stride_bytes for run, _ in active if run.rows > 1))
-        end = min(hi, lo + period)
-        streams = (_row_events(run, label, lo, end) for run, label in active)
-        for begin, finish, state in _classified_spans(merge(*streams, key=lambda event: event[0]), classify):
-            rows = (hi - finish) // period + 1
-            width = finish - begin
-            yield state, AddressRun(begin, rows, width, period) if rows > 1 else _range_run(begin, finish)
-            if (tail := hi - (begin + rows * period)) > 0:
-                yield state, _range_run(hi - tail, hi)
 
 
 def _entry_with_runs(entry, runs, **updates):
@@ -606,12 +526,9 @@ def _split_entry_residency(entry, resident: SectorCoverage):
     if resident.empty:
         yield entry
         return
-    tagged = ((run, "data") for run in _obligation_runs(entry))
-    masks = ((run, "resident") for run in _coverage_runs(resident))
+    data, masks = tuple(_obligation_runs(entry)), tuple(_coverage_runs(resident))
     groups = defaultdict(list)
-    for state, run in _partition_runs(
-        (*tagged, *masks), lambda labels: ("resident" in labels) if "data" in labels else None,
-    ):
+    for state, run in _residency_runs(data, masks):
         groups[state].append(run)
     for warm, runs in groups.items():
         yield _entry_with_runs(entry, runs, initial_residency="l2_warm" if warm else entry.initial_residency)

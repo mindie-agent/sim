@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping as _AbcMapping
+from dataclasses import replace
 import heapq
 from typing import Callable, Sequence
 
@@ -19,6 +20,10 @@ from .engine_types import (
     Event, ExecutionError, _EMPTY_FROZENSET, _EMPTY_METADATA, _Task,
     _chain_callbacks,
 )
+from .memory_physics import (
+    AdmissionMemoryView, CACHE_POLICY_DISABLE, CACHE_POLICY_LAST_USE, SectorCoverage, bind_memory_access,
+)
+from .l2_residency import _coverage_overlap, _coverage_runs, _residency_runs
 
 
 class _EngineSubmitMixin:
@@ -26,7 +31,7 @@ class _EngineSubmitMixin:
         self, prepared, name, *, after=(), release=None, owner="", metadata=None,
         on_complete=None, on_start=None, memory=None, memory_pools=None,
         memory_bindings=None, acquire_override=None, free_override=None,
-        native_hook: bool = False, deliveries=(),
+        native_hook: bool = False, deliveries=(), inline_control: bool = False,
     ) -> Event:
         # Dependencies and allocations remain live invocation state. Only static
         # work, supply and placement validation can be shared by repeated tiles.
@@ -217,6 +222,16 @@ class _EngineSubmitMixin:
             for predecessor in pending:
                 predecessor._waiters.append(event.sequence)
         accel = self._accel
+        if (inline_control and accel is not None and accel.can_publish_control(self)
+                and not waiting_count and release <= now and not self._completable
+                and not (task.remaining or task.latency)
+                and self._can_allocate(task)):
+            # C has paused at the grant's dependency boundary. A zero-work
+            # allocation can settle now using the ordinary Python ledger.
+            self._start_ready(event.sequence)
+            self._completable.pop()
+            self._complete(task)
+            return event
         if (accel is not None
                 and accel.eligible(self, task)
                 and len(self._native_seqs) == len(tasks) - 1):
@@ -432,7 +447,7 @@ class _EngineSubmitMixin:
             previous = task.callback
             task.callback = (callback if previous is None
                              else _chain_callbacks(previous, callback))
-            if not event.done and self._accel is not None:
+            if previous is None and self._accel is not None:
                 self._accel.on_callback_registered(self, event)
             return
         if event.sequence in self._promises:
@@ -460,6 +475,20 @@ class _EngineSubmitMixin:
         )
         return raw_work, place, delivs
 
+    def _submit_allocation_boundary(self, name, stage, after, *, owner=""):
+        """Keep zero-work template grants and releases at native completion boundaries."""
+        done = self.future(name + ":visible")
+        prepared = self.prepared_stage(stage, stage.acquire, stage.free)
+
+        def publish(ready):
+            event = self._submit_prepared(prepared, name, after=(ready,), owner=owner,
+                                          metadata=dict(stage.metadata), inline_control=True)
+            self.on_complete(event, lambda _: self.resolve(done))
+
+        self.submit(name + ":allocation_ready", after=after, owner=owner,
+                    on_complete=publish, native_hook=True)
+        return done
+
     def submit_bound_access(
         self,
         name: str,
@@ -471,51 +500,124 @@ class _EngineSubmitMixin:
         priority: int = 0,
         memory_state=None,
         pattern=None,
+        on_delivery=None,
     ) -> Event:
-        """Submit one ``BoundAccess`` as a single coupled, owner-pinned flow."""
+        """Submit a coupled transfer and publish live residency after its delivery."""
+        if memory_state is None or pattern is None:
+            return self._submit_access_flow(name, bound, after=after, release=release,
+                                            owner=owner, priority=priority)
+
+        if not isinstance(memory_state, AdmissionMemoryView) or bound.bind_config is None:
+            return self._submit_custom_access(name, bound, memory_state, pattern, after, release, owner, priority)
+
+        done = self.future(name)
+        aligned = bound.ledger.aligned_transfer_bytes
+        bus = bound.bind_config[0]
+
+        def admit(event, pat=None):
+            if pat is None:
+                pat = pattern() if callable(pattern) else pattern
+            resident = memory_state.resident_coverage_for(pat, aligned)
+            coverage = pat.runs.sector_coverage()
+            key = pat.reuse_key
+            identity = None
+            cacheable = key is not None and aligned > 0 and pat.cache_policy != CACHE_POLICY_DISABLE
+            if cacheable and key.die == pat.die and pat.direction == "read":
+                identity = memory_state, key.die, key.backing_allocation, key.tensor_version
+            fills = getattr(self, "_inflight_l2_fills", None)
+            pending = fills.get(identity) if fills else None
+            working_set = max(aligned if pat.reuse_distance_bytes is None else pat.reuse_distance_bytes,
+                              coverage.measure_bytes())
+            waits = (_overlapping_fills(pending, coverage, resident)
+                     if pending and working_set <= memory_state._preview_effective_l2(key) else ())
+            if waits:
+                def retry(ready):
+                    # Primitive callers may name different reuse streams for
+                    # the same allocation. Template lifetimes pin their key.
+                    resolved = pat
+                    if not callable(pattern):
+                        reuse = memory_state.resolve_reuse_key(key)
+                        if memory_state.is_resident(reuse):
+                            resolved = replace(pat, reuse_key=reuse)
+                    admit(ready, resolved)
+
+                self.submit(name + ":wait_fill", {}, after=waits, owner=owner, priority=priority,
+                            on_complete=retry, native_hook=True)
+                return
+
+            live = _rebind_access(bound, pat, memory_state, commit=False)
+            if cacheable:
+                # Other streams see the working-set pressure during the copy.
+                memory_state._activate_key(key)
+            ledger = live.ledger
+            if not ledger.l2_hit_bytes:
+                resident = SectorCoverage()
+            fill = None
+            if identity is not None and ledger.dram_sector_bytes and pat.cache_policy != CACHE_POLICY_LAST_USE:
+                if working_set <= memory_state._preview_effective_l2(key):
+                    fill = self.future(name + ":l2_fill")
+                    if fills is None:
+                        fills = self._inflight_l2_fills = {}
+                    fills.setdefault(identity, {})[fill] = coverage, resident
+
+            def publish(extra):
+                if fill is not None:
+                    del fills[identity][fill]
+                    if not fills[identity]:
+                        del fills[identity]
+                    self.resolve(fill)
+                if on_delivery is not None:
+                    on_delivery(ledger, resident, extra)
+                self.resolve(done)
+
+            def complete(transfer):
+                extra = _settle_access(memory_state, pat, ledger, resident, coverage)
+                extra += sum(item.bytes for item in memory_state.drain_writebacks(bus.die))
+                if extra:
+                    work = {term.row_id: term.ms_per_progress for term in bus.terms_for("write", extra)
+                            if term.ms_per_progress}
+                    self.submit(name + ":dirty_writeback", work, after=(transfer,), owner=owner, priority=priority,
+                                coupled=len(work) > 1, deliveries=((bus.ctr_w, extra),),
+                                on_complete=lambda _: publish(extra), native_hook=True)
+                else:
+                    publish(0)
+
+            done.started = event.time
+            self._submit_access_flow(name, live, after=(event,), owner=owner, priority=priority, callback=complete)
+
+        self.submit(name + ":admit", {}, after=after, release=release, owner=owner, priority=priority,
+                    on_complete=admit, native_hook=True)
+        return done
+
+    def _submit_custom_access(self, name, bound, state, pattern, after, release, owner, priority):
+        """Keep caller-owned admission protocols at their original start boundary."""
         work, placement, deliveries = self._bound_access_work_and_place(bound)
-        on_start = None
-        if memory_state is not None and pattern is not None:
-            cfg = getattr(bound, "bind_config", None)
-            if cfg is not None:
-                def _admit_and_rebind(ev, ms=memory_state, pat=pattern, bcfg=cfg):
-                    from .l2_residency import bind_memory_access
-                    hbm_bus, c_hit, c_miss, l2_r, pipe_r, l2_id, b_rules, nom_p = bcfg
-                    live_b = bind_memory_access(
-                        pat, ms, hbm_bus=hbm_bus,
-                        copy_hit_bytes_per_ms=c_hit,
-                        copy_miss_bytes_per_ms=c_miss,
-                        l2_bytes_per_ms=l2_r,
-                        pipe_row_id=pipe_r, l2_row_id=l2_id,
-                        burst_rules=b_rules, commit=True,
-                        nominal_pipe_bytes_per_ms=nom_p,
-                    )
-                    live_w, live_p, live_d = self._bound_access_work_and_place(live_b)
-                    t_obj = self._tasks.get(ev.sequence)
-                    if t_obj is None:
-                        return
-                    had_fifo = self.task_uses_fifo(t_obj)
-                    had_deliv = bool(t_obj.deliveries)
-                    t_obj.demand = live_w
-                    t_obj.remaining = dict(live_w)
-                    t_obj.placement = live_p
-                    t_obj.coupled = bool(live_w)
-                    t_obj.prepared = None
-                    t_obj.deliveries = live_d
-                    t_obj.delivered_acc = {} if live_d else None
-                    has_fifo = self.task_uses_fifo(t_obj)
-                    if has_fifo != had_fifo:
-                        self._fifo_live += 1 if has_fifo else -1
-                    if bool(live_d) != had_deliv:
-                        self._delivery_live += 1 if live_d else -1
-                on_start = _admit_and_rebind
-            else:
-                aligned = bound.ledger.aligned_transfer_bytes
-                on_start = lambda _ev, ms=memory_state, pat=pattern, ab=aligned: ms.admit_access(pat, ab)
+
+        def admit(event):
+            if bound.bind_config is None:
+                state.admit_access(pattern, bound.ledger.aligned_transfer_bytes)
+                return
+            live = _rebind_access(bound, pattern, state, commit=True)
+            live_work, live_place, live_deliveries = self._bound_access_work_and_place(live)
+            task = self._tasks[event.sequence]
+            had_fifo, had_deliveries = self.task_uses_fifo(task), bool(task.deliveries)
+            task.demand, task.remaining, task.placement = live_work, dict(live_work), live_place
+            task.coupled, task.prepared = bool(live_work), None
+            task.deliveries, task.delivered_acc = live_deliveries, {} if live_deliveries else None
+            self._fifo_live += self.task_uses_fifo(task) - had_fifo
+            self._delivery_live += bool(live_deliveries) - had_deliveries
+
         return self.submit(
-            name, work=work, after=after, release=release, owner=owner,
-            placement=placement, coupled=bool(work),
-            priority=priority, on_start=on_start, deliveries=deliveries,
+            name, work=work, after=after, release=release, owner=owner, priority=priority,
+            placement=placement, coupled=bool(work), on_start=admit, deliveries=deliveries,
+        )
+
+    def _submit_access_flow(self, name, bound, *, after, owner, priority, release=None, callback=None):
+        work, placement, deliveries = self._bound_access_work_and_place(bound)
+        return self.submit(
+            name, work=work, after=after, release=release, owner=owner, priority=priority,
+            placement=placement, coupled=bool(work), deliveries=deliveries,
+            on_complete=callback, native_hook=callback is not None,
         )
 
     def _wake(self, event: Event, *, native: bool = False) -> None:
@@ -526,3 +628,47 @@ class _EngineSubmitMixin:
         frontier.push_completable(self, key)
     def _queue(self, task: _Task) -> None:
         frontier.queue_ready(self, task)
+
+
+def _rebind_access(bound, pattern, state, *, commit):
+    bus, hit, miss, l2, pipe_row, l2_row, rules, nominal = bound.bind_config
+    return bind_memory_access(
+        pattern, state, hbm_bus=bus, copy_hit_bytes_per_ms=hit, copy_miss_bytes_per_ms=miss,
+        l2_bytes_per_ms=l2, pipe_row_id=pipe_row, l2_row_id=l2_row, burst_rules=rules,
+        nominal_pipe_bytes_per_ms=nominal, commit=commit,
+    )
+
+
+def _overlapping_fills(pending, requested, resident):
+    waits = []
+    for done, (filling, previously_resident) in pending.items():
+        overlap = _coverage_overlap(requested, filling)
+        if overlap:
+            available = resident.union(previously_resident)
+            excluded = (_coverage_overlap(requested, available) + _coverage_overlap(filling, available)
+                        - requested.union(filling).overlap_bytes(available))
+            if overlap > excluded:
+                waits.append(done)
+    return tuple(waits)
+
+
+def _settle_access(state, pattern, ledger, resident, coverage):
+    aligned = ledger.aligned_transfer_bytes
+    if pattern.direction == "read" and not resident.empty:
+        current = state.resident_coverage_for(pattern, aligned)
+        if current != resident and _coverage_overlap(coverage, current.union(resident)) > _coverage_overlap(coverage, current):
+            # Previously warm sectors that were evicted in flight were never
+            # fetched. Only the cold part can return to L2.
+            cold = tuple(run for warm, run in _residency_runs(tuple(_coverage_runs(coverage)),
+                                                              tuple(_coverage_runs(resident))) if not warm)
+            if not cold:
+                return 0
+            pattern = replace(pattern, runs=replace(pattern.runs, runs=cold))
+    if pattern.direction == "write" and ledger.dram_sector_bytes:
+        # The original flow already published these bytes to HBM.
+        pattern = replace(pattern, visibility=replace(pattern.visibility, live_out=True))
+    _, miss = state.admit_access(pattern, aligned)
+    if pattern.direction == "write" and ledger.l2_hit_bytes and miss:
+        # Reservation or stream pressure can remove capacity during the write.
+        return coverage.measure_bytes()
+    return 0

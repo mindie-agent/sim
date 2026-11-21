@@ -16,6 +16,9 @@ from itertools import combinations
 from math import fsum, isclose, isfinite
 from typing import Literal
 
+from mindie_sim.optimization.dsl_solver import _replay_ops
+from mindie_sim.optimization.dual_bound import _check_region_summary_bindings
+from mindie_sim.optimization.reload_bounds import compute_compulsory_hbm_cut, measure_logical_bytes
 from mindie_sim.prediction.evaluation import ACTIVE_DEADLINE_MONO
 from mindie_sim.prediction.operator_replay import operator_costs
 from mindie_sim.prediction.results import OpOccurrence, OperatorSequenceRow, StepEvaluation
@@ -497,6 +500,20 @@ def _service_amount(service, prefixes):
     return fsum(value for key, value in service.items() if key.startswith(prefixes))
 
 
+def _hbm_service_bytes(service, profile):
+    name = profile.names["hbm"]
+    path, alpha = profile.datapath, profile.datapath.hbm_rw_alpha
+    read = service.get(name + ":r", 0)
+    write = service.get(name + ":w", 0)
+    fallback = profile.rates["hbm"][0]
+    read_rate = path.hbm_read_bytes_per_s / 1000 or fallback
+    write_rate = path.hbm_write_bytes_per_s / 1000 or fallback
+    if alpha == 1 or read_rate == write_rate:
+        # Fully coupled rows only identify total time. Use the maximum possible bytes.
+        return (read + write) / (1 + alpha) * max(read_rate, write_rate)
+    return ((read - alpha * write) * read_rate + (write - alpha * read) * write_rate) / (1 - alpha**2)
+
+
 def _template_service(scenario, applied, edited, replay):
     graphs, book, baseline_book, context, deadline = replay
     targets = {op_id for _, op_id in edited}
@@ -511,7 +528,7 @@ def _template_service(scenario, applied, edited, replay):
             for rank, ops in ranks.items():
                 for op in ops:
                     if op.op_id in targets:
-                        site_graphs[op.op_id][rank] = (op,)
+                        site_graphs[op.op_id][rank] = _replay_ops((op,))
             profiles.append({(row["replica"], op_id): row["serviced"]
                              for op_id, site in site_graphs.items()
                              for row in operator_costs(scenario.atomic_step.case, site, recipes=recipes,
@@ -555,13 +572,6 @@ def _executed_service_conservation(scenario, applied, step_eval, baseline_eval, 
         checks.update(_TRANSFER_SERVICE)
         if FuseRegion not in kinds:
             checks["vector"] = ("vector@",)
-    for name, prefixes in checks.items():
-        expected = _service_amount(base_serviced, prefixes)
-        actual = _service_amount(got_serviced, prefixes)
-        allowance = sum(leases.values()) if name in _TRANSFER_SERVICE else 0
-        if _dropped(actual, expected, allowance):
-            detail = "memory" if name == "hbm" else name
-            raise ModelingError(f"WORK_CONSERVATION_MISMATCH:executed_{detail}_service_dropped")
     quantized = {op_id for receipt in applied.edit_receipts
                  if receipt.opcode == QuantizeContract.__name__ and receipt.status == "applied"
                  for op_id in receipt.affected_ops}
@@ -576,20 +586,32 @@ def _executed_service_conservation(scenario, applied, step_eval, baseline_eval, 
         raise ModelingError("WORK_CONSERVATION_MISMATCH:missing_template_work")
     targets = base_rows.keys() | catalog.keys()
     audited = _template_service(scenario, applied, targets, service_replay) if service_replay and targets else None
+    profiles = {(item.replica, item.stage): item for item in service_replay[3].bindings.stage_profiles} if catalog else {}
+    displaced_matrix = 0
     for occurrence, summary in catalog.items():
-        _, op_id = occurrence
+        replica, op_id = occurrence
         service = audited[1].get(occurrence, {})
         op = exec_by_site[occurrence]
-        read, write = _logical_bytes(summary.read_obligations), _logical_bytes(summary.write_obligations)
+        read, write = measure_logical_bytes(summary.read_obligations), measure_logical_bytes(summary.write_obligations)
         if len(summary.op_ids) == 1 and (read < op.mte2_bytes or write < op.mte3_bytes):
             raise ModelingError(f"WORK_CONSERVATION_MISMATCH:{op_id}:template_operand_bytes")
-        for role, prefixes, required in (
-            ("hbm", _TRANSFER_SERVICE["hbm"], float(summary.turnaround_service_bytes)),
-            ("mte2", _TRANSFER_SERVICE["mte2"], read),
-            ("output", ("fixpipe@", "mte3@"), write),
+        simt = dict(summary.vector_ops_by_pipe).get("aiv_simt", 0)
+        if simt and not summary.issued_cube_flops_by_dtype:
+            displaced_matrix += _service_amount(audited[0].get(occurrence, {}), _MATRIX_SERVICE_PREFIXES)
+        for role, actual, required in (
+            ("hbm", _hbm_service_bytes(service, profiles[replica, op.stage]), float(summary.turnaround_service_bytes)),
+            ("mte2", _service_amount(service, _TRANSFER_SERVICE["mte2"]), read),
+            ("output", _service_amount(service, ("fixpipe@", "mte3@")), write),
+            ("aiv_simt", _service_amount(service, ("aiv_simt@", "simt@", "vector@")), simt),
         ):
-            if _dropped(_service_amount(service, prefixes), required):
+            if _dropped(actual, required):
                 raise ModelingError(f"WORK_CONSERVATION_MISMATCH:{op_id}:executed_{role}")
+    for name, prefixes in checks.items():
+        expected, actual = (_service_amount(service, prefixes) for service in (base_serviced, got_serviced))
+        allowance = sum(leases.values()) if name in _TRANSFER_SERVICE else displaced_matrix if name == "matrix" else 0
+        if _dropped(actual, expected, allowance):
+            detail = "memory" if name == "hbm" else name
+            raise ModelingError(f"WORK_CONSERVATION_MISMATCH:executed_{detail}_service_dropped")
     for occurrence, row in base_rows.items():
         if occurrence in catalog:
             continue
@@ -612,14 +634,9 @@ def _executed_service_conservation(scenario, applied, step_eval, baseline_eval, 
                     raise ModelingError(f"WORK_CONSERVATION_MISMATCH:{op_id}:executed_{role}")
 
 
-def _logical_bytes(obligations):
-    from mindie_sim.optimization.reload_bounds import measure_logical_bytes
-
-    return measure_logical_bytes(obligations)
-
-
 def _conservation(scenario, applied, summaries, step_eval=None, baseline_eval=None, baseline_work=None,
                   service_replay=None):
+    _check_region_summary_bindings(scenario, applied, summaries)
     hoists = set(applied.hoisted_load_time)
     cse = {edit.edit_id for edit in applied.plan.edits
            if isinstance(edit.operation, HoistOrDeduplicate) and edit.operation.scope == "intra_step"}
@@ -671,12 +688,10 @@ def _conservation(scenario, applied, summaries, step_eval=None, baseline_eval=No
                     exp_vec, got_vec, rel_tol=1e-12, abs_tol=1e-9
                 ):
                     raise ModelingError(f"WORK_CONSERVATION_MISMATCH:{summary.region_id}:semantic_work")
-        from mindie_sim.optimization.reload_bounds import compute_compulsory_hbm_cut
-
         cut = compute_compulsory_hbm_cut((summary,))
         if sum(item.read_bytes + item.write_bytes for item in cut.values()) > dram:
             raise ModelingError(f"LEDGER_RECONCILIATION_ERROR:{summary.region_id}:dram_sector_bytes")
-        required = _logical_bytes(summary.read_obligations) + _logical_bytes(summary.write_obligations)
+        required = measure_logical_bytes(summary.read_obligations) + measure_logical_bytes(summary.write_obligations)
         if logical < required:
             raise ModelingError(f"LEDGER_RECONCILIATION_ERROR:{summary.region_id}:logical_bytes")
         if issued < logical:
@@ -693,12 +708,12 @@ def _capture(name, check, *args):
     return GateReceipt(name, True)
 
 
-def _bound(scenario, summaries, primitive_table, rate_mode, certificate, program, dag, wall, u, m, framework, dsl):
+def _bound(scenario, applied, summaries, primitive_table, rate_mode, certificate, program, dag, wall, u, m, framework, dsl):
     from mindie_sim.optimization.dual_bound import build_dual_inputs_from_scenario, check_optimality_certificate
 
     if program is not None or dag is not None:
         canonical_program, canonical_dag, _ = build_dual_inputs_from_scenario(
-            scenario, region_summaries=summaries, primitive_table=primitive_table, rate_mode=rate_mode,
+            scenario, applied=applied, region_summaries=summaries, primitive_table=primitive_table, rate_mode=rate_mode,
         )
         if (program is not None and program != canonical_program) or (dag is not None and dag != canonical_dag):
             raise ModelingError("LEAN_CERTIFICATE_INVALID:certificate_unbound_to_scenario")
@@ -758,7 +773,9 @@ def verify_plan(
     if scope == "full":
         name = "lean_bound_and_monotonicity"
         try:
-            l_star = _bound(scenario, region_summaries, primitive_table, rate_mode,
+            if region_summaries and not gates[-1].passed:
+                raise ModelingError("LEAN_CERTIFICATE_INVALID:certificate_unbound_to_scenario")
+            l_star = _bound(scenario, applied, region_summaries, primitive_table, rate_mode,
                             dual_certificate, dual_program, event_dag, wall_ns,
                             baseline_u_ns, baseline_m_ns, framework_ns, dsl_ns)
             gates.append(GateReceipt(name, True))

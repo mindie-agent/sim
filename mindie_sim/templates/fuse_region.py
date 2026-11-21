@@ -120,6 +120,7 @@ class Lowering:
         self.state.drain_writebacks(die)
         self.stages: list[Stage] = []
         self.accesses: dict[str, MemoryAccessPattern] = {}
+        self.obligations: dict[str, TensorRangeObligation] = {}
         self.cube: Counter[str] = Counter()
         self.vector: Counter[str] = Counter()
         self.reads: list[TensorRangeObligation] = []
@@ -157,7 +158,7 @@ class Lowering:
                               metadata={"aicpu_metadata": True}))
 
     def binding_role(self, role):
-        if role in _VECTOR_PIPES - {"vector", "aiv_simt"}:
+        if role in _VECTOR_PIPES - {"vector"}:
             if self.context.service_rate(role) is None and role not in self.context.resource_names:
                 return "vector"
         return role
@@ -247,6 +248,7 @@ class Lowering:
         )
         self.accesses[name] = pattern
         if not private and obligation and (entry := _logical_obligation(pattern)):
+            self.obligations[name] = entry
             if direction == "read":
                 if key is not None:
                     pattern = replace(pattern, reuse_key=self.state.resolve_reuse_key(key))
@@ -269,7 +271,7 @@ class Lowering:
             if bound.l2_row_id not in self.context.rates and bound.l2_row_id in stage.work:
                 stage = replace(stage, work={role: value for role, value in stage.work.items() if role != bound.l2_row_id})
             if self.live_state is not None:
-                stage = Stage(name, after=after, program=_LiveAccess(bound, self.live_state, declared))
+                stage = Stage(name, after=after, program=_LiveAccess(bound, self.live_state, declared, self.obligations.get(name)))
         else:
             # Unit-rate normalization recovers native byte work independently
             # of hardware service rates. An Engine supplies real rates later.
@@ -294,7 +296,8 @@ class Lowering:
                 self.add(self._bind_access(stage, pattern, lifetimes) if pattern is not None else stage)
             stages = ordered_stages(self.stages)
         summary = FusedRegionSummary(
-            tier, region_id, tuple(op_ids), tuple(semantic), tuple(sorted(self.cube.items())),
+            tier, region_id, tuple(op_ids), tuple(replace(item, die=self.die) for item in semantic),
+            tuple(sorted(self.cube.items())),
             tuple(sorted(self.vector.items())), _union_obligations(self.reads), _union_obligations(self.writes),
             self.logical, self.copied, self.sectors, self.service, self.hits, tuple(comm), launches,
             self.metadata_ms, tuple((peak.pool, peak.peak_bytes) for peak in solution.pool_peaks), spec,

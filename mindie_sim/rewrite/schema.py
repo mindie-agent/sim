@@ -47,6 +47,7 @@ class PortRef:
 class KernelBoundary:
     abi_id: str
     members: tuple[OpRef, ...]
+    params: tuple[tuple[str, str | int | bool], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,6 +202,8 @@ def _ordered_edits(edits: tuple[Edit, ...], *, handles: bool = False) -> tuple[E
 
 def _wire(value: Any) -> Any:
     if is_dataclass(value):
+        if isinstance(value, KernelBoundary) and not value.params:
+            return {"abi_id": value.abi_id, "members": _wire(value.members)}
         return {field.name: _wire(getattr(value, field.name)) for field in fields(value)}
     if isinstance(value, tuple):
         return [_wire(item) for item in value]

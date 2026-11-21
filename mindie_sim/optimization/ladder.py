@@ -301,8 +301,8 @@ def solve_five_level_ladder(
     framework = solve_framework(dossier, dual_report=pricing, max_trials=max_trials)
     dsl = solve_dsl(dossier, framework, dual_report=pricing, max_trials=max_trials)
     resolved = _baseline(dossier.handle, dsl.best_plan).scenario
-    summaries = dsl.best_eval.region_summaries
-    program, dag, names = build_dual_inputs_from_scenario(resolved, region_summaries=summaries)
+    binding = dict(applied=dsl.best_eval.applied, region_summaries=dsl.best_eval.region_summaries)
+    program, dag, names = build_dual_inputs_from_scenario(resolved, **binding)
     certificate, subgradient = certify_lower_bound(program, dag)
     names_by_index = dict(zip(subgradient.resource_names, names))
     subgradient = replace(subgradient, resource_names=names,
@@ -311,8 +311,7 @@ def solve_five_level_ladder(
     hw_bound = None
     if primitive_table is not None:
         hw_prog, hw_dag, _ = build_dual_inputs_from_scenario(
-            resolved, region_summaries=summaries, primitive_table=primitive_table,
-            rate_mode="certified_upper_capacity",
+            resolved, primitive_table=primitive_table, rate_mode="certified_upper_capacity", **binding,
         )
         hw_cert, _ = certify_lower_bound(hw_prog, hw_dag)
         hw_bound = hw_cert.l_star_lean_ns

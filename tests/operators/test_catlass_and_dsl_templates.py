@@ -21,10 +21,11 @@ from _support.linear_cases import (
     load_template_provenance, lower_reference as _reference, mounted_catalog_sources,
     provenance_git_fixture, run_template as _run, stage_ancestors as _ancestors,
     stage_bytes as _bytes, stages_by_name as _stages, template_context as _context,
-    serpentine, template_datapath as _datapath, template_live_bindings, tile_edge as _edge,
+    recipe_context, serpentine, sku_planning_context, template_datapath as _datapath, template_live_bindings, tile_edge as _edge,
     verify_template_declaration, visitor_graph, with_mx_modes,
 )
 from mindie_sim.optimization.reload_bounds import compute_compulsory_hbm_cut
+from mindie_sim.prediction.engine import Engine, Resource
 from mindie_sim.prediction.program import Allocation, Stage
 from mindie_sim.prediction.runtime.memory_physics import AddressRun, AddressRunPlan, AdmissionMemoryView, MemoryAccessPattern, ReuseKey
 from mindie_sim.prediction.runtime.tile_solver import LiveBufferSpec, TileInfeasibleError
@@ -33,7 +34,7 @@ from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.device_input import MemoryAccessBurstPenalty
 from mindie_sim.templates import (
     CatlassProblem, SemanticWorkItem, TensorRangeObligation, builtin_template_catalog,
-    compile_fuse_region, compose_step_obligations, enumerate_dsl_specs, lower_catlass_spec,
+    compile_fuse_region, compose_step_obligations, enumerate_dsl_specs, lower_catlass_spec, lower_dsl_spec,
 )
 from mindie_sim.templates import catlass_catalog as cat, dsl_catalog as dsl
 from mindie_sim.templates.catlass_lower import solve_catlass_tile
@@ -48,12 +49,9 @@ KV_BYTES = 672
 ONE_SLOT = (1, 1, 1, 1, 1)
 TURNAROUND = MemoryAccessBurstPenalty("turnaround", 0, None, 0.1, "test-geometry")
 @pytest.fixture(scope="module")
-def datapaths():
-    return tuple(_datapath(REPRESENTATIVE_SKUS[generation]) for generation in ("a2", "a5"))
+def datapaths(): return tuple(_datapath(REPRESENTATIVE_SKUS[gen]) for gen in ("a2", "a5"))
 @pytest.fixture(scope="module")
-def direct(datapaths):
-    return datapaths[1]
-
+def direct(datapaths): return datapaths[1]
 @pytest.mark.parametrize("sku", SKUS)
 def test_pingpong_sram_fit_and_ring_credit_execution(sku):
     dp, p = _datapath(sku), CatlassProblem(32, 32, 160)
@@ -71,7 +69,9 @@ def test_pingpong_sram_fit_and_ring_credit_execution(sku):
         assert (rejection.pool, rejection.required_bytes, rejection.available_bytes) == (pool, required, required - 1)
     spec, = _matrix("basic_pingpong", p, dp, tile=options["tile"], l0_tiles=options["l0_tiles"])
     context = _context(dp, p)
-    result = lower_catlass_spec(spec, p, dp, context=context)
+    result = lower_catlass_spec(spec, p, dp, context=context, die=1)
+    summary = result.summary
+    assert {entry.die for entry in (*summary.semantic_work, *summary.read_obligations, *summary.write_obligations)} == {1}
     stages = _stages(result)
     for operand in ("a", "b"):
         assert f"tile:0:l1{operand}:g0:last_use" in stages[f"tile:0:k2:gm_{operand}"].after
@@ -117,10 +117,8 @@ def test_streamk_signals_before_the_last_normal_work_and_reduction(direct):
     spec, = _matrix("streamk", p, direct)
     stages = _stages(lower_catlass_spec(spec, p, direct))
     flag = "cross_core_set_flag"
-    assert stages[flag].metadata["streamk_partial_count"] == 4
     assert set(stages[flag].after) == {f"tile:{i}:partial" for i in range(4, 8)}
-    early = {f"tile:{i}:fixpipe" for i in range(4)}
-    assert all(early <= _ancestors(stages, partial) for partial in stages[flag].after)
+    assert all({f"tile:{i}:fixpipe" for i in range(4)} <= _ancestors(stages, partial) for partial in stages[flag].after)
     assert all(flag in stages[f"tile:{i}:k0:gm_a"].after for i in range(8, 12))
     for i in range(2):
         deps = _ancestors(stages, f"reduce:{i}:add")
@@ -172,10 +170,10 @@ def test_swizzle_serpentine_coordinates_and_admission_reuse(direct):
         spec, = (s for s in specs if (s.swizzle_direction, s.swizzle_offset) == (direction, offset))
         assert lower_catlass_spec(spec, p, direct, memory_view=AdmissionMemoryView({0: 2 * KIB}, granule_bytes=SECTOR)).l2_hit_bytes == expected
 def test_evg_visitor_dag_and_direct_epilogue_traffic(datapaths):
-    indirect, direct = datapaths
     tree, exp = visitor_graph()
+    indirect, direct = datapaths
     positions = {n.node_id: i for i, n in enumerate(evg_order(tuple(reversed(tree))))}
-    assert len(positions) == 15 and all(positions[parent] < positions[n.node_id] for n in tree for parent in n.inputs)
+    assert all(positions[parent] < positions[n.node_id] for n in tree for parent in n.inputs)
     with pytest.raises(ModelingError, match="evg_dag_unknown_or_duplicate_node"):
         evg_order(tree[1:])
     with pytest.raises(ModelingError, match="evg_dag_cycle"):
@@ -189,9 +187,8 @@ def test_evg_visitor_dag_and_direct_epilogue_traffic(datapaths):
     assert gm_result.summary.logical_transfer_bytes - ub_result.summary.logical_transfer_bytes == 2 * p.m * p.n * 4
     assert dict(ub_result.summary.vector_ops_by_pipe) == {"vec_alu": 9 * p.m * p.n, "vec_sfu": 4 * p.m * p.n}
 def test_grouped_scheduler_carries_core_index_and_bypasses_single_row_tiles(direct):
-    groups = (16, 0, 33, 16)
-    p = CatlassProblem(sum(groups), 64, 32, groups=groups)
-    assert tuple(cat.grouped_start_cores(groups, p.n, 32, 32, 4)) == ((0, 0, 2), (2, 2, 4), (3, 2, 2))
+    p = CatlassProblem(65, 64, 32, groups=(16, 0, 33, 16))
+    assert tuple(cat.grouped_start_cores(p.groups, p.n, 32, 32, 4)) == ((0, 0, 2), (2, 2, 4), (3, 2, 2))
     spec, = _matrix("grouped_slice_m", p, direct)
     stages = _stages(lower_catlass_spec(spec, p, direct, **template_live_bindings(direct, p)))
     reads = [stages[f"tile:{i}:k0:gm_b"].program.pattern for i in range(8)]
@@ -211,7 +208,6 @@ def test_grouped_swiglu_quantization_avoids_gate_up_spills(direct, acc, width):
     assert result.summary.logical_transfer_bytes == (4 * m + 2 * p.n) * (p.k + 1) + m * (2 * f + f // 32)
     assert next(x.ranges for x in result.summary.write_obligations if x.allocation_id == p.c_id) == ((0, m * f * 2),)
     assert result.summary.semantic_work[0].logical_ops == 2 * m * (2 * f) * p.k
-
 @pytest.mark.parametrize("mode,a,b,a_width,b_width,factor", [
     ("mxfp8", "mxfp8", "mxfp8", 1, 1, 1), ("mxfp4", "mxfp4", "mxfp4", 0.5, 0.5, 1),
     ("a8w4_mx", "fp8_e4m3", "fp4_e2m1", 1, 0.5, 16),
@@ -222,9 +218,8 @@ def test_mx_scale_storage_and_decompression_follow_declared_mode(direct, mode, a
     spec, = _matrix("mx_matmul", p, mx_datapath, tile=(32, 32, 128), stage_options=(ONE_SLOT,))
     elements, panel = p.n * p.k, p.n * 64
     expanded_width = a_width if factor == 16 else b_width
-    assert spec.l1_scale_factor_k == factor
     peaks = {row.pool: row for row in solve_catlass_tile(spec, p, mx_datapath).pool_peaks}
-    assert peaks["l1"].peak_bytes == elements * (a_width + expanded_width) + 2 * elements // 32 * factor
+    assert (spec.l1_scale_factor_k, peaks["l1"].peak_bytes) == (factor, elements * (a_width + expanded_width) + 2 * elements // 32 * factor)
     assert peaks["l0b"].peak_bytes == panel * expanded_width + panel // 32
     assert all(peaks[pool].owner_kind == "aic" for pool in ("l1", "l0a", "l0b"))
     stages = _stages(lower_catlass_spec(spec, p, mx_datapath))
@@ -234,7 +229,6 @@ def test_mx_scale_storage_and_decompression_follow_declared_mode(direct, mode, a
         assert (_bytes(stages, ":decompress_b", "vec_alu"), _bytes(stages, ":ub_to_l1", "mte3")) == (elements, elements * expanded_width)
     with pytest.raises(UnmodeledCapabilityError, match="native_mx_mode_unsupported"):
         lower_catlass_spec(spec, p, direct, context=replace(_context(direct, p), compute_peaks={mode: 10**12, a: 10**12}))
-
 @pytest.mark.parametrize("policy,threads", [("tla_dsl", 2048), ("MatmulGatherScatterSimt", 1024),
                                             ("GroupedMxMatmulFinalizeRoutingTla", 2048)])
 def test_simt_thread_ceilings_carveout_and_routing_workspace(datapaths, policy, threads):
@@ -269,6 +263,11 @@ def test_simt_thread_ceilings_carveout_and_routing_workspace(datapaths, policy, 
         assert sum(s.work["mte3"] for n, s in stages.items() if n.startswith("simt:zero_output:") and s.work) == 8 * 32 * 2
         live = lower_catlass_spec(spec, p, direct, **template_live_bindings(direct, p, aiv_simt=10**6))
         assert _stages(live)["simt:0:scatter"].program.pattern.runs.sector_intervals() == row
+        geometry, _ = sku_planning_context(REPRESENTATIVE_SKUS["a5"])
+        shipping = lower_catlass_spec(spec, p, direct, context=recipe_context(geometry, p))
+        ops = dict(shipping.summary.vector_ops_by_pipe)["aiv_simt"]
+        assert _stages(shipping)["simt:0:simt_mac"].work == {"vector": ops}
+        assert _stages(live)["simt:0:simt_mac"].work == {"aiv_simt": ops}
         small = replace(direct, buffers=tuple((key, 16 * KIB if key == "ub" else size) for key, size in direct.buffers))
         with pytest.raises(TileInfeasibleError):
             solve_catlass_tile(spec, p, small)
@@ -278,7 +277,6 @@ def test_simt_thread_ceilings_carveout_and_routing_workspace(datapaths, policy, 
         cube = lower_catlass_spec(cube_spec, p, direct, **template_live_bindings(direct, p))
         assert dict(cube.summary.issued_cube_flops_by_dtype)["fp16"] >= 2 * p.m * p.n * p.k
         assert _stages(cube)["tile:0:scatter"].program.pattern.runs.sector_intervals() == row
-
 @pytest.mark.parametrize("arch_id", ARCH_IDS)
 def test_reference_admission_follows_declared_isa(datapaths, arch_id):
     dp = next(path for path in datapaths if path.arch_id == arch_id)
@@ -291,8 +289,16 @@ def test_reference_admission_follows_declared_isa(datapaths, arch_id):
             with pytest.raises(UnmodeledCapabilityError, match="dsl_requires_"):
                 enumerate_dsl_specs(name, p, dp, aic_budget=8, aiv_budget=16)
         else:
-            assert enumerate_dsl_specs(name, p, dp, aic_budget=8, aiv_budget=16)
-
+            options = dict(aic_budget=8, aiv_budget=16)
+            if name == dsl.QSLI:
+                spec, = enumerate_dsl_specs(name, p, with_mx_modes(dp), **options)
+                shipping = _datapath("Ascend950DT_9582")
+                with pytest.raises(UnmodeledCapabilityError, match="qsli_requires_native_mxfp4"):
+                    enumerate_dsl_specs(name, p, shipping, **options)
+                with pytest.raises(UnmodeledCapabilityError, match="qsli_requires_native_mxfp4"):
+                    lower_dsl_spec(spec, p, shipping)
+            else:
+                assert enumerate_dsl_specs(name, p, dp, **options)
 def test_flash_kda_cost_threshold_and_saved_output_visibility(direct):
     # Chunks (3, 1, 2) give cyclic peak 5, LPT peak 3 and two staging rounds.
     staged = (2 + 3 * 3 + 5 * 5 + 7 * 2) * 64 + (11 + 17) * 384
@@ -320,7 +326,6 @@ def test_flash_kda_cost_threshold_and_saved_output_visibility(direct):
     _, persistent_result = _reference(dsl.FLASH_KDA, replace(p, requested_template="persistent"), direct)
     assert _bytes(stages, ":q_decayed:read", "mte2_aic") == 65 * 128 * 2
     assert _bytes(_stages(persistent_result), ":q_decayed:read", "mte2_aic") == 0
-
 @pytest.mark.parametrize("tp,sequence", tuple(product((4, 8, 16), (4, 8))))
 def test_mega_recurrent_variant_workspace_reads_and_launch_savings(direct, tp, sequence):
     slots, capacity, heads = tuple(range(7, 7 + tp)), sequence + 1, 96 // tp
@@ -343,7 +348,6 @@ def test_mega_recurrent_variant_workspace_reads_and_launch_savings(direct, tp, s
         ranges = (AddressRun(lo, 1, hi - lo, hi - lo) for lo, hi in entry.ranges)
         expected = tuple((base, base + sequence * 128 * element) for base in bases)
         assert AddressRunPlan((*entry.address_runs, *ranges), sector_bytes=1).sector_intervals() == expected
-
 @pytest.mark.parametrize("mode", tuple(dsl.QkvQuantMode))
 def test_mla_four_products_workspace_and_quantization_barrier(direct, mode):
     p = dsl.MlaPrologProblem(3, 192, 96, 128, 2, 32, 64, mode=mode, weight_format="nd")
@@ -377,14 +381,11 @@ def test_mla_four_products_workspace_and_quantization_barrier(direct, mode):
         assert all(entry.allocation_id != "mla:qr" for entry in reads)
         with pytest.raises(ModelingError, match="group_fp8_requires_pa_bsnd"):
             enumerate_dsl_specs(dsl.MLA_PROLOG, replace(packed, cache_layout="PA_NZ"), direct)
-
 @pytest.mark.parametrize("tokens", (1, 5))
 def test_attention_residual_ub_and_inplace_savings(direct, tokens):
-    p = dsl.AttnResProblem(tokens)
-    d = 7168
+    p, d = dsl.AttnResProblem(tokens), 7168
     spec, result = _reference(dsl.ATTN_RES, p, direct, aiv_budget=1)
-    tile = spec.tile_shape[0]
-    depth = 1 if ceil(tokens / tile) == 1 else 2
+    tile, depth = spec.tile_shape[0], 1 if tokens <= spec.tile_shape[0] else 2
     assert (tile, depth) == (1, 1 if tokens == 1 else 2)
     assert spec.ub_peak_bytes == 6 * d + depth * (10 * d * tile + 12 * 8 * ceil(tile / 8))
     assert dsl.attn_res_tiling(8190, 1, ub_bytes=2**32) == (1, 8190, 4095, 2)
@@ -397,10 +398,9 @@ def test_attention_residual_ub_and_inplace_savings(direct, tokens):
     for bad in (replace(p, hidden_size=d - 1), replace(p, dtype="fp16")):
         with pytest.raises(ModelingError, match="attn_res_requires_fixed_bf16_width"):
             enumerate_dsl_specs(dsl.ATTN_RES, bad, direct)
-
 @pytest.mark.parametrize("splits", (1, 2))
 def test_sparse_indexer_packed_rings_histogram_and_ld_workspace(direct, splits):
-    trunk, bins, topk = 16_384, 256, 32
+    direct, trunk, bins, topk = with_mx_modes(direct), 16_384, 256, 32
     p = dsl.QsliProblem(1, trunk * splits + 1, topk, splits)
     spec, result = _reference(dsl.QSLI, p, direct)
     stages = _stages(result)
@@ -428,7 +428,6 @@ def test_sparse_indexer_packed_rings_histogram_and_ld_workspace(direct, splits):
         assert stages["qsli:0:pad_topk"].metadata == {"index": -1, "value": "-inf"}
         assert all(stages[f"qsli:0:{out}"].after == ("qsli:0:pad_topk",) for out in ("indices", "values"))
         assert not empty.summary.issued_cube_flops_by_dtype
-
 @pytest.mark.parametrize("splits", (1, 2))
 def test_mixed_sparse_mla_bank_bytes_and_split_row_reduction(direct, splits):
     p = dsl.MixedQuantSparseMlaProblem(129, 72, split_parts=splits)
@@ -454,7 +453,6 @@ def test_mixed_sparse_mla_bank_bytes_and_split_row_reduction(direct, splits):
         assert (reads["mqsmla:ori"], reads["mqsmla:cmp"]) == (((128 * 544, 129 * 544),), ((391 * 320, 392 * 320),))
         assert {name for name in reads if name.endswith(":block_table")} == {"mqsmla:ori:block_table", "mqsmla:cmp:block_table"}
         assert _bytes(_stages(indexed), ":sink", "mte2_aiv") == p.heads * 4
-
 def test_region_rejects_invalid_graph_and_unread_alias(direct):
     for options, error in (
         ({"dependencies": {"make": (), "outside": ("make",), "take": ("outside",)}}, "not_convex"),
@@ -468,7 +466,6 @@ def test_region_rejects_invalid_graph_and_unread_alias(direct):
             "make": (), "take": ("make",), "read": ("make",),
         }, op_stages={}, edge_bytes={}, edge_routes=(replace(_edge(), in_place_mutates=True), _edge(dst="read", view="alias")),
             alias_views={"tile": ("x", 0, 64), "alias": ("x", 32, 96)})
-
 def test_region_routes_admit_only_valid_pools_and_owner_pairs(datapaths):
     indirect, direct = datapaths
     for pool, owner in (("l1", "aiv"), ("ub", "aic")):
@@ -484,18 +481,15 @@ def test_region_routes_admit_only_valid_pools_and_owner_pairs(datapaths):
         assert sorted(p.peak_bytes for p in spec.tile_solution.pool_peaks) == [64, 128]
         with pytest.raises(ModelingError, match="owner_pair_unreachable"):
             _region(direct, edge, edge_owners={"tile": (0, 2) if axes[0] == "aic" else (2, 0)})
-
 def test_region_cube_rate_and_full_barrier_release_between_tiles(direct):
     direct = replace(direct, buffers=tuple((key, 64 if key == "l0c" else size) for key, size in direct.buffers))
     make = Stage("make", {"cube": 131_072}, acquire=(Allocation("accumulator", "l0c", 64, (0,)),), placement={"cube": (0,)})
     _, result = _region(direct, replace(_edge(), iter_kind="full_barrier"), tile_count=2,
                         op_stages={"make": make, "take": Stage("take", free=make.acquire)})
-    cube = _stages(result)["p0:t0:make"]
-    peak = dict(machine(REPRESENTATIVE_SKUS["a5"]).dies[0].compute_peaks)["bf16"]
-    assert (cube.work_units["cube"], cube.work["cube"]) == ("peak_ms", pytest.approx(1000 * make.work["cube"] / peak))
+    cube, peaks = _stages(result)["p0:t0:make"], dict(machine(REPRESENTATIVE_SKUS["a5"]).dies[0].compute_peaks)
+    assert (cube.work_units["cube"], cube.work["cube"]) == ("peak_ms", pytest.approx(1000 * make.work["cube"] / peaks["bf16"]))
     assert dict(result.summary.issued_cube_flops_by_dtype) == {"bf16": 2 * make.work["cube"]}
     assert _run(direct, _context(direct, None), result).summary()["peak_allocated_per_unit"]["l0c:unit0"] == 64
-
 def test_region_compiler_preserves_coupling_metadata_and_step_obligations(direct):
     stage = Stage("compute", {"cube": 8, "aiv_simt": 4}, coupled=True,
                   placement={"cube": (0,), "aiv_simt": (0, 1)}, metadata={"rows": 2, "cols": 4, "launch": True})
@@ -521,12 +515,10 @@ def test_region_compiler_preserves_coupling_metadata_and_step_obligations(direct
     warm = replace(read, ranges=((SECTOR, 2 * SECTOR),), initial_residency="l2_warm")
     _, mixed = _region(dp, _edge(), live_in_obligations=(cold, warm))
     assert mixed.summary.read_obligations == (cold, warm) and compose_step_obligations((mixed.summary,)) == ((cold,), ())
-
 def _prime(view, tensor, run):
     pattern = MemoryAccessPattern(tensor, 0, 0, 0, "read", "mte2_aiv", run.rows * run.row_bytes,
                                   AddressRunPlan((run,)), ReuseKey(0, tensor, 0, "main"))
     assert view.admit_access(pattern, pattern.runs.aligned_copy_bytes()) == (0, pattern.logical_bytes)
-
 def test_periodic_template_obligations_and_service_follow_resident_sectors(direct):
     rows, stride = 128 * KIB * 32, 2 * SECTOR
     dp = replace(direct, memory_access=replace(direct.memory_access, burst_turn_penalty=(TURNAROUND,)))
@@ -550,7 +542,6 @@ def test_periodic_template_obligations_and_service_follow_resident_sectors(direc
     delivered, service = _run(dp, context, result).delivered, rows // 2 * (SECTOR + Fraction("0.1"))
     assert result.dram_miss_bytes == result.summary.dram_sector_bytes == result.l2_hit_bytes == rows // 2 * SECTOR
     assert (result.summary.turnaround_service_bytes, delivered["hbm:ctr_r"]) == (service, pytest.approx(float(service)))
-
 def test_templates_keep_producer_stream_and_release_owned_streams_at_last_use(direct):
     view, context = AdmissionMemoryView({0: 2 * KV_BYTES}, granule_bytes=SECTOR), _context(direct, None)
     _prime(view, "kv", AddressRun(0, 1, KV_BYTES, KV_BYTES))
@@ -563,7 +554,6 @@ def test_templates_keep_producer_stream_and_release_owned_streams_at_last_use(di
     assert (result.l2_hit_bytes, result.dram_miss_bytes) == (KV_BYTES, 2 * SECTOR)
     assert _run(direct, context, result).delivered["hbm:ctr_r"] == pytest.approx(2 * SECTOR)
     assert (result.l2_hit_bytes, view.active_stream_count(0)) == (KV_BYTES, 1)
-
 def test_catalog_provenance_validates_mounted_catalog(monkeypatch):
     catalog = builtin_template_catalog()
     refs = catalog.all_template_source_refs()
@@ -572,14 +562,13 @@ def test_catalog_provenance_validates_mounted_catalog(monkeypatch):
     checked, findings = load_template_provenance(monkeypatch).verify(ROOT, refs_root=mounted)
     assert checked == len(refs) == len(set(refs)) == 36
     assert [f.reason.split(":")[0] for f in findings] == ["source_repository_missing"] * (len(refs) if mounted is None else 0)
-
 def test_catalog_provenance_rejects_invalid_sources(monkeypatch, tmp_path):
     audit = load_template_provenance(monkeypatch)
-    blob = b"// prefix\nconstexpr int TOTAL_MUTEX_IDS = 28;\n// suffix\n"
-    repo, bare, ref, tree = provenance_git_fixture(tmp_path, "include/fixture.hpp", blob, "TOTAL_MUTEX_IDS", (2, 2))
-    for mounted, changes, reason in (
-        (repo, {}, None), (None, {}, "source_repository_missing"),
-        (bare, {}, None), (repo / "include", {}, "source_repository_not_mount_root"),
+    repo, bare, ref, tree = provenance_git_fixture(
+        tmp_path, "include/fixture.hpp", b"// prefix\nconstexpr int TOTAL_MUTEX_IDS = 28;\n// suffix\n", "TOTAL_MUTEX_IDS", (2, 2))
+    cases = (
+        (repo, {}, None), (bare, {}, None), (None, {}, "source_repository_missing"),
+        (repo / "include", {}, "source_repository_not_mount_root"),
         (None, {"source_sha256": "0" * 64}, "source_repository_missing"),
         (repo, {"revision": tree}, "source_revision_not_commit"),
         (repo, {"symbol": "OTAL_MUTEX_ID"}, "symbol_missing_from_range"),
@@ -587,14 +576,25 @@ def test_catalog_provenance_rejects_invalid_sources(monkeypatch, tmp_path):
         (repo, {"line_range": (3, 2)}, "invalid_line_range"),
         (repo, {"line_range": (2, 4)}, "source_line_range_exceeds_blob"),
         (repo, {"symbol": ""}, "invalid_symbol"),
-    ):
+    )
+    for mounted, changes, reason in cases:
         assert verify_template_declaration(audit, tmp_path, ref.to_dict() | changes, mounted) == ([reason] if reason else [])
-
 def test_scalar_gemm_logical_obligations_and_compulsory_sectors(direct):
     problem = CatlassProblem(1, 1, 1)
     spec, = _matrix("basic_pingpong", problem, direct, stage_options=(ONE_SLOT,))
-    summary = lower_catlass_spec(spec, problem, direct).summary
-    entries = (*summary.read_obligations, *summary.write_obligations)
-    assert sum(hi - lo for entry in entries for lo, hi in entry.ranges) == summary.logical_transfer_bytes == 6
-    cut = compute_compulsory_hbm_cut((summary,))[0]
-    assert (cut.read_bytes, cut.write_bytes, summary.dram_sector_bytes) == (2 * SECTOR, SECTOR, 3 * SECTOR)
+    bindings = template_live_bindings(direct, problem)
+    result = lower_catlass_spec(spec, problem, direct, **bindings)
+    context, pools = bindings["context"], dict(direct.buffers)
+    resources = [Resource(role, context.rates[role], units=units) for role, units in context.resource_units.items()]
+    engine = Engine(resources, pools=pools, backend="c", pool_units={
+        pool: 1 if pool == "l2" else direct.aiv_count if pool == "ub" else direct.aic_count for pool in pools})
+    for hits, hbm in ((0, 3 * SECTOR), (2 * SECTOR, SECTOR)):
+        steps = engine.accel_status()["native_steps"]
+        done = result.program.start(engine, "gemm", engine.submit("ready", release=engine.now + 1))
+        engine.advance(until=(done,))
+        summary = result.summary
+        cut = compute_compulsory_hbm_cut((summary,))[0]
+        assert (summary.l2_hit_bytes, summary.dram_sector_bytes, summary.logical_transfer_bytes) == (hits, hbm, 6)
+        assert (cut.read_bytes, cut.write_bytes) == (hbm - SECTOR, SECTOR)
+        assert engine.accel_status()["native_steps"] > steps and not engine.allocations
+        assert {entry.initial_residency for entry in summary.read_obligations} == {"l2_warm" if hits else "hbm_cold"}

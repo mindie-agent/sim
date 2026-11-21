@@ -726,7 +726,6 @@ class RemoteDispatcher:
         return RemoteExecReceipt(fallback_reason=reason), None
 
     def resolve_target(self, n_candidates: int) -> RemoteExecReceipt: return self._resolve(n_candidates)[0]
-
     def dispatch_batch(self, entrypoint: str, base_case: CaseInput, candidates: Sequence[Mapping], *,
                        local_runner=None, deadline_s: float | None = None) -> tuple[object, RemoteExecReceipt]:
         from mindie_sim._remote_worker import execute_worker_request
@@ -738,6 +737,14 @@ class RemoteDispatcher:
         budget = policy.job_timeout_s if deadline_s is None else min(deadline_s, policy.job_timeout_s)
         if not math.isfinite(budget) or budget <= 0: raise ValueError("invalid execution deadline")
         job_deadline, request_id = time.monotonic() + budget, uuid.uuid4().hex
+        if entrypoint == "optimize_ladder":
+            from mindie_sim.primitives.schema import PrimitiveTable
+            candidates = list(candidates)
+            for index, candidate in enumerate(candidates):
+                options = candidate.get("options")
+                if isinstance(options, Mapping) and isinstance(table := options.get("primitive_table"), PrimitiveTable):
+                    wire = dict(kind="primitive_table", envelope=table.to_envelope_dict(), warnings=table.warnings)
+                    candidates[index] = dict(candidate, options=dict(options, primitive_table=wire))
         payload = dict(protocol_version=PROTOCOL_VERSION, request_id=request_id, deadline_s=budget,
                        entrypoint=entrypoint, base_case=json_payload(base_case.to_dict() if isinstance(base_case, Case) else base_case),
                        candidates=json_payload(candidates), stage_root=None, max_workers=policy.max_remote_workers,

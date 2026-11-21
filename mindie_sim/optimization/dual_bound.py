@@ -24,7 +24,7 @@ from .contracts import (
 )
 
 if TYPE_CHECKING:
-    from mindie_sim.rewrite.apply import ResolvedScenario
+    from mindie_sim.rewrite.apply import AppliedPlan, ResolvedScenario
     from .contracts import CapacityTable
 
 BINARY64_ULP_SHIFT = 52
@@ -596,12 +596,15 @@ _COLD_WEIGHT_FAMILIES = frozenset({
 })
 _WEIGHT_ID_KEYS = ("weight_allocation_id", "allocation_id")
 
+def _weight_allocation_id(meta):
+    return next((value for key in _WEIGHT_ID_KEYS
+                 if isinstance(value := meta.get(key), str) and value.strip()), None)
+
 def _cold_weight_read(op, meta, die):
     mte2_bytes = getattr(op, "mte2_bytes", 0)
     if mte2_bytes <= 0 or op.family not in _COLD_WEIGHT_FAMILIES:
         return None
-    identity = next((value for key in _WEIGHT_ID_KEYS
-                     if isinstance(value := meta.get(key), str) and value.strip()), None)
+    identity = _weight_allocation_id(meta)
     residency = meta.get("weight_initial_residency", meta.get("initial_residency"))
     if identity is None or residency != "hbm_cold":
         return None
@@ -670,15 +673,46 @@ def _derive_default_obligations(scenario, demands, aliases, covered, *, infer_wo
     ),), placements
 
 
+def _check_region_summary_bindings(scenario, applied, summaries):
+    if not summaries:
+        return
+    from mindie_sim.rewrite.apply import _die
+    from mindie_sim.rewrite.schema import FuseRegion
+
+    fusions = {f"rewrite:{edit.edit_id}" for edit in applied.plan.edits if isinstance(edit.operation, FuseRegion)}
+    members = {region: atoms for region, atoms in applied.absorbed_atoms if region in fusions}
+    members.update((binding.target_op, (binding.target_op,)) for binding in applied.template_bindings
+                   if binding.target_op not in members)
+    bound = defaultdict(set)
+    for rank in applied.executable:
+        for op in rank.ops:
+            if op.op_id in members and (op.op_id not in fusions or op.family == "rewrite_fused"):
+                die = _die(scenario, rank.replica, op.stage).rank
+                bound[op.op_id, members[op.op_id]].add((rank.replica, op.stage, die))
+    for summary in summaries:
+        work_sites = {(item.replica, item.pp_stage, item.die) for item in summary.semantic_work}
+        dies = {item.die for group in (summary.read_obligations, summary.write_obligations) for item in group}
+        key = summary.region_id, tuple(summary.op_ids)
+        matches = {site for site in bound.get(key, ())
+                   if (not work_sites or work_sites == {site}) and (not dies or dies == {site[-1]})}
+        if not matches:
+            raise ModelingError(f"LEDGER_RECONCILIATION_ERROR:unbound_region_summary:{summary.region_id}")
+        bound[key].remove(min(matches))
+
+
 def build_dual_inputs_from_scenario(
     scenario: ResolvedScenario, *, region_summaries: tuple[FusedRegionSummary, ...] = (),
     primitive_table: CapacityTable | None = None, rate_mode: str = "engine_ceiling",
+    applied: AppliedPlan | None = None,
 ) -> tuple[ResourceChoiceProgram, EventDagSpec, tuple[str, ...]]:
     """Use only universal work obligations and admitted alternatives for the scenario."""
+    if applied is not None:
+        _check_region_summary_bindings(scenario, applied, region_summaries)
+    elif not region_summaries:
+        region_summaries = getattr(scenario, "region_summaries", ())
     demands = _Demands(scenario, primitive_table, rate_mode)
     operations, aliases = _semantic_ops(scenario)
-    summaries = tuple(summary for summary in
-                      (region_summaries or getattr(scenario, "region_summaries", ()))
+    summaries = tuple(summary for summary in region_summaries
                       if not any(op_id in aliases for op_id in summary.op_ids))
     contractions = getattr(scenario, "bilinear_contractions", ())
     placements = dict(getattr(scenario, "die_placements", ()))
