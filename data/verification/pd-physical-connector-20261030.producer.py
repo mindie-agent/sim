@@ -67,7 +67,11 @@ expected = {
 }
 for scan, values in expected.items():
     assert [row["finish_ms"] for row in rows if row["scan"] == scan] == values
-files = ["mindie_sim/prediction/pd_connector.py", "mindie_sim/prediction/disaggregated.py"]
+files = [
+    path.relative_to(ROOT).as_posix()
+    for pkg in ("mindie_sim/prediction/pd_connector", "mindie_sim/prediction/disaggregated")
+    for path in sorted((ROOT / pkg).glob("*.py"))
+]
 print(json.dumps({
     "boundary": "public predict_pd serving with synthetic three-token prefill and two decode steps",
     "evidence_kind": "structural_and_capacity_controls_not_hardware_calibration",

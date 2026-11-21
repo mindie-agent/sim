@@ -1,0 +1,477 @@
+"""Finite ordered and indexed pipeline execution.
+
+[Role] Submit declared setup, tile stages and drain on the caller's Engine.
+[Invariants] Allocation scopes, dependencies and stage work are preserved for each tile.
+[Timeouts & Locks] Only a slot window is in flight. Indexed phases are resolved on
+  demand.
+[Side-Effect Policy] Submits Engine tasks and maintains periodic bookkeeping.
+"""
+from __future__ import annotations
+
+from collections.abc import Mapping as _AbcMapping
+from dataclasses import replace
+from typing import Mapping, Sequence
+
+from ..engine import Allocation, Engine, Event
+from .state import FragmentContractError
+
+
+def _scoped_allocations(
+    label: str, items: Sequence[Allocation], *,
+    root: str | None = None, bindings: Mapping[str, str] | None = None,
+    persistent: frozenset[str] = frozenset(),
+) -> tuple[Allocation, ...]:
+    """Bind allocations by the template's invocation/output/panel scope.
+
+    ``bindings`` comes from ``PipelineTemplate.allocation_bindings``. The
+    invocation scope is the explicit template root (never derived from a display
+    task name); output allocations span panels of one output; panel allocations
+    remain tile-local. Setup/body/drain use this same function.
+    """
+    scope_root = root or _pipeline_scope(label)
+    table = dict(bindings or {})
+    result = []
+    for item in items:
+        scope = table.get(item.name)
+        if scope == "invocation":
+            prefix = scope_root
+        elif scope == "output":
+            digits = "".join(ch for ch in item.name if ch.isdigit())
+            prefix = f"{scope_root}:output{digits or 0}"
+        elif scope == "panel":
+            prefix = label
+        elif item.name in persistent:
+            prefix = scope_root
+        else:
+            prefix = label
+        result.append(Allocation(f"{prefix}:{item.name}", item.pool,
+                                 item.size, item.units))
+    return tuple(result)
+
+
+def _indexed_scoped_allocations(
+    items: Sequence[Allocation], *, launch_uid: str, owner: int, index: int,
+    output: int | None, panel: int | None, slot: int | None,
+    bindings: Mapping[str, Mapping],
+    persistent: frozenset[str],
+) -> tuple[Allocation, ...]:
+    """Bind one indexed tile's allocations by real scope ordinal.
+
+    The producer's binding row is authoritative.  A row with an explicit
+    physical identity is used verbatim; otherwise the local key is
+    ``launch_uid/owner/scope/ordinal/symbol``.  Indexed symbols are stable
+    names such as ``panel``/``accumulator``, so no digit parsing is possible.
+    """
+    result = []
+    for item in items:
+        row = bindings.get(item.name)
+        row = row if isinstance(row, _AbcMapping) else {}
+        scope = row.get("scope")
+        explicit = None
+        for key in ("identity", "physical", "physical_name", "external"):
+            value = row.get(key)
+            if isinstance(value, str) and value:
+                explicit = value
+                break
+        if explicit is not None:
+            name = explicit
+        elif scope == "invocation":
+            name = f"{launch_uid}:owner{owner}:invocation0:{item.name}"
+        elif scope == "output":
+            ordinal = output if output is not None else int(
+                row.get("ordinal", 0))
+            name = f"{launch_uid}:owner{owner}:output{ordinal}:{item.name}"
+        elif scope == "slot":
+            ordinal = slot if slot is not None else int(row.get("ordinal", 0))
+            name = f"{launch_uid}:owner{owner}:slot{ordinal}:{item.name}"
+        elif scope == "panel" or item.name not in persistent:
+            # A panel is one concrete absolute panel, not a recurring wave
+            # residue: using the absolute index keeps overlapping slots apart.
+            ordinal = index if index is not None else int(row.get("ordinal", 0))
+            name = f"{launch_uid}:owner{owner}:panel{ordinal}:{item.name}"
+        else:
+            name = f"{launch_uid}:owner{owner}:invocation0:{item.name}"
+        result.append(Allocation(name, item.pool, item.size, item.units))
+    return tuple(result)
+
+
+def _pipeline_scope(label: str) -> str:
+    # ``label`` is a tile task name (name:tileN) or a setup/drain label.
+    marker = ":tile"
+    index = label.find(marker)
+    return label[:index] if index >= 0 else label.split(":setup", 1)[0].split(":drain", 1)[0]
+
+
+def _drop_periodic_run(engine: Engine, run_id: int) -> None:
+    engine._periodic_runs.pop(run_id, None)
+    for sequence, metadata in tuple(engine._periodic_tasks.items()):
+        if metadata and metadata[0] == run_id:
+            engine._periodic_tasks.pop(sequence, None)
+
+
+def start_pipeline_template(
+    engine: Engine, template, name: str, ready: Event, *, owner: str = "",
+    quiescent: bool = False,
+) -> Event:
+    """Submit a finite ``PipelineTemplate`` lazily on the caller's Engine.
+
+    This is the T04 side of the T10 handoff. It consumes the duck-typed
+    ``PipelinePhase(stages, count)`` / ``PipelineTemplate(slots, phases, setup,
+    drain, setup_ms, minimum_ms)`` contract without importing ``program.py``.
+    At most ``slots`` tiles are in flight; each retire issues the next real tile.
+    ``Stage.after``/``previous``, per-stage work/caps/placement/priority,
+    coupled progress and per-tile scoped allocations are preserved. No phase is
+    averaged into one body and no whole-phase allocation maximum is reserved.
+    An indexed template is selected by absolute ``index_of(i)`` and
+    ``phases[phase_id].stages_for(i)``; it never materializes every panel.
+    """
+    if not isinstance(engine, Engine):
+        raise FragmentContractError("pipeline_template_requires_engine")
+    phases = tuple(getattr(template, "phases", ()))
+    slots = int(getattr(template, "slots", 0))
+    if slots < 1:
+        raise FragmentContractError("pipeline_template_requires_positive_slots")
+    indexed_panels = getattr(template, "indexed_panels", None)
+    index_of = getattr(template, "index_of", None)
+    has_indexed_panels = indexed_panels is not None
+    has_index_of = index_of is not None
+    if has_indexed_panels != has_index_of:
+        raise FragmentContractError(
+            "pipeline_indexed_template_requires_both_fields")
+    indexed = has_indexed_panels and has_index_of
+    if indexed:
+        if (type(indexed_panels) is not int or indexed_panels < 0
+                or not callable(index_of)):
+            raise FragmentContractError("pipeline_indexed_panels_invalid")
+        if any(type(getattr(phase, "count", 0)) is not int
+               or getattr(phase, "count") != 1 for phase in phases):
+            raise FragmentContractError(
+                "pipeline_indexed_phase_count_must_be_one")
+        if any(getattr(phase, "end", None) is not None for phase in phases):
+            raise FragmentContractError(
+                "pipeline_indexed_phase_end_must_be_none")
+        if indexed_panels and not phases:
+            raise FragmentContractError(
+                "pipeline_indexed_template_requires_catalog")
+        total = indexed_panels
+    else:
+        total = sum(int(getattr(phase, "count", 0)) for phase in phases)
+        if total < 0:
+            raise FragmentContractError("pipeline_template_count_invalid")
+    for phase in phases:
+        if not tuple(getattr(phase, "stages", ())):
+            raise FragmentContractError("pipeline_template_phase_requires_stages")
+        if int(getattr(phase, "count", 0)) < 1:
+            raise FragmentContractError("pipeline_template_phase_requires_positive_count")
+    # Names acquired and freed at different phase boundaries are resident
+    # across tiles (accumulator/KV/workspace). Names acquired and freed inside
+    # the same phase are tile-local.
+    acquire_phase: dict[str, set[int]] = {}
+    free_phase: dict[str, set[int]] = {}
+    for phase_index, phase in enumerate(phases):
+        for stage in tuple(getattr(phase, "stages", ())):
+            for allocation in tuple(getattr(stage, "acquire", ())):
+                acquire_phase.setdefault(allocation.name, set()).add(phase_index)
+            for allocation in tuple(getattr(stage, "free", ())):
+                free_phase.setdefault(allocation.name, set()).add(phase_index)
+    persistent_names = frozenset(
+        name for name, acquired in acquire_phase.items()
+        if not free_phase.get(name)
+        or not free_phase[name].issubset(acquired))
+    binding_rows = tuple(getattr(template, "allocation_bindings", ()) or ())
+    allocation_bindings = {
+        str(row.get("name")): str(row.get("scope"))
+        for row in binding_rows if isinstance(row, _AbcMapping) and row.get("name")}
+    indexed_binding_rows = {
+        str(row.get("name")): dict(row)
+        for row in binding_rows
+        if isinstance(row, _AbcMapping) and row.get("name")}
+    # Immutable, allocation-free Stage validation can be shared by every
+    # repeat. Acquire/free stages still bind each occurrence's allocation id and
+    # therefore keep Stage.prepare dynamic.
+    prepared_cache: dict[int, object] = {}
+
+    def prepared_for(stage):
+        if stage.acquire or stage.free or stage.program is not None:
+            return None
+        key = (
+            stage.name, tuple(sorted(stage.work.items())), stage.latency,
+            tuple(sorted(stage.caps.items())),
+            tuple(sorted((name, tuple(units))
+                         for name, units in stage.placement.items())),
+            stage.coupled, stage.priority,
+            tuple(sorted(stage.work_units.items())),
+        )
+        prepared = prepared_cache.get(key)
+        if prepared is None:
+            prepared = stage.prepare(engine, f"{name}:prepare", lambda items: ())
+            prepared_cache[key] = prepared
+        return prepared
+
+    setup = tuple(getattr(template, "setup", ()))
+    drain = tuple(getattr(template, "drain", ()))
+    # Setup/body/drain share the same invocation symbols. The producer's
+    # allocation_bindings scans body phases; any allocation first visible in
+    # setup/drain is invocation-scoped here rather than getting a new label.
+    template_owner = getattr(template, "owner", 0)
+    if indexed and (type(template_owner) is not int or template_owner < 0):
+        raise FragmentContractError("pipeline_template_owner_invalid")
+    for stage in (*setup, *drain):
+        for allocation in (*stage.acquire, *stage.free):
+            allocation_bindings.setdefault(allocation.name, "invocation")
+            indexed_binding_rows.setdefault(allocation.name, {
+                "name": allocation.name, "scope": "invocation",
+                "owner": template_owner,
+            })
+
+    def scoped_at(label: str, index: int, output: int | None,
+                  panel: int | None, slot: int | None):
+        if indexed:
+            return lambda items: _indexed_scoped_allocations(
+                items, launch_uid=name, owner=template_owner, index=index,
+                output=output, panel=panel, slot=slot,
+                bindings=indexed_binding_rows, persistent=persistent_names)
+        return lambda items: _scoped_allocations(
+            label, items, root=name, bindings=allocation_bindings,
+            persistent=persistent_names)
+
+    setup_ms = float(getattr(template, "setup_ms", 0.0))
+    minimum_ms = float(getattr(template, "minimum_ms", 0.0))
+    if setup_ms < 0 or minimum_ms < 0:
+        raise FragmentContractError("pipeline_template_negative_fixed_time")
+
+    def indexed_mapping(index: int):
+        mapped = index_of(index)
+        if not isinstance(mapped, tuple) or len(mapped) != 5:
+            raise FragmentContractError("pipeline_index_mapping_invalid")
+        phase_id, end, output, panel, slot = mapped
+        if (type(phase_id) is not int or not 0 <= phase_id < len(phases)
+                or type(end) is not int or not index < end <= total
+                or type(output) is not int or output < 0
+                or type(panel) is not int or panel < 0
+                or type(slot) is not int or not 0 <= slot < slots):
+            raise FragmentContractError("pipeline_index_mapping_invalid")
+        return phase_id, end, output, panel, slot
+
+    drain_index = total - 1 if total else 0
+    if indexed and total:
+        (_drain_phase, _drain_end, drain_output,
+         drain_panel, drain_slot) = indexed_mapping(drain_index)
+    else:
+        drain_output = drain_panel = drain_slot = 0
+
+    current = ready
+    if setup_ms:
+        current = engine.submit(name + ":setup", after=(ready,),
+                                latency=setup_ms, owner=owner)
+    if setup:
+        local: dict[str, Event] = {}
+        for stage in setup:
+            deps = tuple(local[key] for key in stage.after)
+            scoped = scoped_at(name + ":setup:" + stage.name, 0, 0, 0, 0)
+            local[stage.name] = stage.submit(
+                engine, f"{name}:setup:{stage.name}", deps or (current,),
+                scoped, owner, prepared=prepared_for(stage))
+        current = engine.submit(name + ":setup_complete",
+                                after=tuple(local.values()) or (current,),
+                                owner=owner)
+    observation = (engine.submit(name + ":span", after=(current,),
+                                 latency=minimum_ms, owner=owner)
+                   if minimum_ms > 0 else current)
+    complete = engine.future(name + ":complete")
+    run_id = complete.sequence
+    periodic_run = {
+        "run_id": run_id, "template": template, "name": name, "owner": owner,
+        "phase_ordinal": 0,
+        "phase_end": int(getattr(phases[0], "count", 0)) if phases else 0,
+        "next": 0, "finished": 0, "slots": (),
+        "live_tiles": set(), "retire_tiles": {}, "stage_tail": {}, "retire": None,
+        "indexed": indexed,
+    }
+    engine._periodic_runs[run_id] = periodic_run
+    if (quiescent and not indexed and phases
+            and all(tuple(phase.stages) == tuple(phases[0].stages)
+                    for phase in phases)):
+        # A fully quiescent, dependency-free, allocation-free homogeneous phase
+        # run can be integrated as one meta-cycle: every stage carries K times
+        # its real work, the barrier preserves the tile boundary, and the
+        # caller guarantees no external submit until completion. Anything with
+        # after/previous/alloc/latency/tail falls back to the detailed lazy
+        # path below.
+        batch_count = total
+        batch_stages = tuple(getattr(phases[0], "stages", ()))
+        batchable = (
+            batch_count > 1
+            and all(not stage.after and not stage.previous
+                    and not stage.acquire and not stage.free
+                    and stage.program is None and stage.latency == 0
+                    for stage in batch_stages))
+        if batchable:
+            barrier = []
+            for stage in batch_stages:
+                work = {resource: amount * batch_count
+                        for resource, amount in stage.work.items()}
+                batched = replace(stage, work=work)
+                barrier.append(batched.submit(
+                    engine, f"{name}:batch:{stage.name}",
+                    (current,), lambda items: _scoped_allocations(
+                        name, items, root=name,
+                        bindings=allocation_bindings), owner,
+                    prepared=prepared_for(batched)))
+            periodic_run.update({
+                "next": total, "finished": total, "phase_ordinal": 0,
+                "phase_end": total, "stage_tail": {},
+                "last_events": tuple(barrier) or (current,),
+                "total": total, "persistent_names": persistent_names,
+                "batch_mode": True,
+            })
+            batch_complete = engine.submit(
+                name + ":batch_complete", after=tuple(barrier) or (current,),
+                on_complete=lambda _: drain_and_resolve(), owner=owner)
+            engine._periodic_tasks[batch_complete.sequence] = (
+                run_id, total, len(batch_stages), "batch")
+            periodic_run["slots"] = ()
+            batch_mode = True
+        else:
+            batch_mode = False
+    else:
+        batch_mode = False
+    if not batch_mode:
+        periodic_run.update({
+            "next": 0, "finished": 0, "phase_ordinal": 0,
+            "phase_end": int(getattr(phases[0], "count", 0)) if phases else 0,
+            "stage_tail": {}, "last_events": (current,), "retire": None,
+            "total": total, "persistent_names": persistent_names,
+        })
+
+    def drop_run() -> None:
+        _drop_periodic_run(engine, run_id)
+
+    def select_stages(index: int):
+        if indexed:
+            phase_id, end, output, panel, slot = indexed_mapping(index)
+            # The producer's end is an absolute exclusive phase bound. Keep it
+            # for observation, but choose the class afresh for every absolute
+            # index: class ids are catalog ids, not an ordered cursor.
+            periodic_run["phase_ordinal"] = phase_id
+            periodic_run["phase_end"] = end
+            phase = phases[phase_id]
+            selector = getattr(phase, "stages_for", None)
+            stages = (selector(index) if callable(selector)
+                      else getattr(phase, "stages"))
+            selected = tuple(stages)
+            if not selected:
+                raise FragmentContractError(
+                    "pipeline_indexed_phase_requires_stages")
+            return selected, (output, panel, slot)
+        while (periodic_run["phase_ordinal"] + 1 < len(phases)
+               and index >= periodic_run["phase_end"]):
+            ordinal = periodic_run["phase_ordinal"] + 1
+            periodic_run["phase_ordinal"] = ordinal
+            periodic_run["phase_end"] += int(
+                getattr(phases[ordinal], "count", 0))
+        selected = tuple(getattr(phases[periodic_run["phase_ordinal"]],
+                                 "stages"))
+        if not selected:
+            raise FragmentContractError("pipeline_template_phase_requires_stages")
+        return selected, None
+
+    def drain_and_resolve() -> None:
+        if not drain:
+            engine.resolve(complete)
+            drop_run()
+            return
+        local: dict[str, Event] = {}
+        for stage in drain:
+            deps = [local[key] for key in stage.after]
+            deps.extend(periodic_run["stage_tail"][key]
+                        for key in stage.previous
+                        if key in periodic_run["stage_tail"])
+            scoped = scoped_at(name + ":drain:" + stage.name, drain_index,
+                               drain_output, drain_panel, drain_slot)
+            local[stage.name] = stage.submit(
+                engine, f"{name}:drain:{stage.name}",
+                tuple(deps) or periodic_run["last_events"], scoped, owner,
+                prepared=prepared_for(stage))
+
+        def finished(_event: Event) -> None:
+            engine.resolve(complete)
+            drop_run()
+
+        engine.submit(name + ":drain_complete", after=tuple(local.values()),
+                      on_complete=finished, owner=owner)
+
+    def retire(_event: Event) -> None:
+        finished = periodic_run["finished"] + 1
+        periodic_run["finished"] = finished
+        tile_index = periodic_run["retire_tiles"].pop(_event.sequence, None)
+        if tile_index is not None:
+            periodic_run["live_tiles"].discard(tile_index)
+        periodic_run["slots"] = tuple(sorted(
+            tile - finished for tile in periodic_run["live_tiles"]))
+        if finished == total:
+            drain_and_resolve()
+            return
+        issue()
+
+    def issue() -> None:
+        index = periodic_run["next"]
+        if index >= total:
+            return
+        stages, coordinates = select_stages(index)
+        periodic_run["next"] = index + 1
+        local: dict[str, Event] = {}
+        # One immutable snapshot per panel: a same-panel ``after`` edge never
+        # masquerades as the previous panel's stream tail.
+        previous = dict(periodic_run["stage_tail"])
+        label = f"{name}:tile{index}"
+        if indexed:
+            output, panel, slot = coordinates
+            scoped = scoped_at(label, index, output, panel, slot)
+        else:
+            scoped = scoped_at(label, index, None, None, None)
+        for stage in stages:
+            deps = [local[key] for key in stage.after]
+            deps.extend(previous[key] for key in stage.previous
+                        if key in previous)
+            if stage.name in previous:
+                deps.append(previous[stage.name])
+            event = stage.submit(
+                engine, f"{label}:{stage.name}",
+                tuple(deps) or (current,), scoped, owner,
+                prepared=prepared_for(stage))
+            local[stage.name] = event
+            periodic_run["stage_tail"][stage.name] = event
+            engine._periodic_tasks[event.sequence] = (
+                run_id, index, len(local) - 1, "stage")
+        periodic_run["last_events"] = tuple(local.values())
+        retire_event = engine.submit(f"{label}:retire",
+                                     after=periodic_run["last_events"],
+                                     on_complete=retire, owner=owner)
+        periodic_run["retire"] = retire_event
+        engine._periodic_tasks[retire_event.sequence] = (
+            run_id, index, len(stages), "retire")
+        periodic_run["retire_tiles"][retire_event.sequence] = index
+        periodic_run["live_tiles"].add(index)
+        periodic_run["slots"] = tuple(sorted(
+            tile - periodic_run["finished"]
+            for tile in periodic_run["live_tiles"]))
+
+    def begin(_event: Event) -> None:
+        if not total:
+            drain_and_resolve()
+            return
+        for _ in range(min(slots, total)):
+            issue()
+
+    if not batch_mode:
+        engine.submit(name + ":begin", after=(current,), on_complete=begin,
+                      owner=owner)
+    return engine.submit(name + ":complete_outer",
+                         after=(complete, observation), owner=owner)
+
+
+# Capability evidence is the real callable's integer marker, never a producer
+# self-report.  The indexed reader above is connected before this is published;
+# old readers still see no marker and keep the exact legacy encoding.
+start_pipeline_template.indexed_panels_abi = 1
