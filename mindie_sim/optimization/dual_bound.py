@@ -19,11 +19,13 @@ from typing import TYPE_CHECKING
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import datapath_for_die
 
-from .contracts import FusedRegionSummary, SemanticWorkItem, TensorRangeObligation, _provider_capacity_per_second
+from .contracts import (
+    FusedRegionSummary, SemanticWorkItem, TensorRangeObligation, certified_capacity_per_second,
+)
 
 if TYPE_CHECKING:
     from mindie_sim.rewrite.apply import ResolvedScenario
-    from .contracts import UpperCapacityProvider
+    from .contracts import CapacityTable
 
 BINARY64_ULP_SHIFT = 52
 C11_ULP_GUARD_FACTOR = 8
@@ -470,14 +472,8 @@ class _Demands:
         device = self.devices.get(scope[-1])
         if self.table is None or (device and self.table.sku and device.sku and self.table.sku != device.sku):
             return 0
-        candidates = ([f"{pipe}:{dtype}"] if dtype else []) + [pipe]
-        if pipe == "hbm_bus_r":
-            candidates.append("P01_hbm_read")
-        for primitive in candidates:
-            capacity = _provider_capacity_per_second(self.table, primitive)
-            if capacity is not None:
-                return max(capacity, engine)
-        return 0
+        capacity = certified_capacity_per_second(self.table, pipe, dtype, self.paths.get(scope[-1]))
+        return max(capacity, engine) if capacity is not None else 0
 
     def engine_rate(self, scope, pipe, dtype):
         if pipe.startswith("link:"):
@@ -622,7 +618,7 @@ def _cold_weight_read(op, meta, die):
     version = meta.get("weight_tensor_version", meta.get("tensor_version", 0))
     return TensorRangeObligation(die, identity, version, tuple(ranges), "hbm_cold", "owner")
 
-def _derive_default_obligations(scenario, demands, aliases, *, infer_work=True):
+def _derive_default_obligations(scenario, demands, aliases, covered, *, infer_work=True):
     atomic = getattr(scenario, "atomic_step", None)
     case = getattr(atomic, "case", None) or getattr(scenario, "case", None)
     dies = tuple(demands.devices)
@@ -643,7 +639,7 @@ def _derive_default_obligations(scenario, demands, aliases, *, infer_work=True):
         die = dies[die_idx] if 0 <= die_idx < len(dies) else 0
         placements.setdefault(die, (replica, stage))
         key = replica, stage, op.op_id
-        if infer_work and key not in seen:
+        if infer_work and key not in seen and key not in covered:
             seen.add(key)
             dtype = getattr(op, "dtype", "") or default_dt
             pairs = getattr(op, "matrix_flops", ()) or ((dtype, getattr(op, "flops", 0)),)
@@ -676,7 +672,7 @@ def _derive_default_obligations(scenario, demands, aliases, *, infer_work=True):
 
 def build_dual_inputs_from_scenario(
     scenario: ResolvedScenario, *, region_summaries: tuple[FusedRegionSummary, ...] = (),
-    primitive_table: UpperCapacityProvider | None = None, rate_mode: str = "engine_ceiling",
+    primitive_table: CapacityTable | None = None, rate_mode: str = "engine_ceiling",
 ) -> tuple[ResourceChoiceProgram, EventDagSpec, tuple[str, ...]]:
     """Use only universal work obligations and admitted alternatives for the scenario."""
     demands = _Demands(scenario, primitive_table, rate_mode)
@@ -686,11 +682,14 @@ def build_dual_inputs_from_scenario(
                       if not any(op_id in aliases for op_id in summary.op_ids))
     contractions = getattr(scenario, "bilinear_contractions", ())
     placements = dict(getattr(scenario, "die_placements", ()))
-    if not summaries:
-        infer_work = not any(meta.get("semantic_work") for _, meta in operations)
-        summaries, derived_places = _derive_default_obligations(scenario, demands, aliases, infer_work=infer_work)
-        for die, coord in derived_places.items():
-            placements.setdefault(die, coord)
+    covered = {(item.replica, item.pp_stage, op_id) for summary in summaries
+               for item in summary.semantic_work for op_id in summary.op_ids}
+    defaults, derived_places = _derive_default_obligations(
+        scenario, demands, aliases, covered, infer_work=not any(meta.get("semantic_work") for _, meta in operations),
+    )
+    summaries += defaults
+    for die, coord in derived_places.items():
+        placements.setdefault(die, coord)
     seen = set()
 
     def add_work(item):

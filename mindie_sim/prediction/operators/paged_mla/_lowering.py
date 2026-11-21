@@ -441,6 +441,7 @@ class _PagedMlaProgramBuilder:
     def _split_program(self, ctx, seq, query, heads, live, pair, offset, count, partials, interval):
         layout = self.layout
         aivs = pair[1]
+        aiv_owners = ",".join(map(str, aivs)) if layout.pv_panel_width else ""
         pair = (pair[0], pair[1][:heads])
         mm2_slot = interval % FIA_WORKSPACE_DEPTH
         mm2_offset = mm2_slot * align_bytes(layout.head_tile * self.contract.dv * FP32_BYTES)
@@ -493,7 +494,7 @@ class _PagedMlaProgramBuilder:
                         metadata.update(bn2_idx_in_cur_core=interval, mm2_slot=mm2_slot, mm2_offset_bytes=mm2_offset)
                 if layout.pv_panel_width and step in {"pv0", "pv1", "partial0", "partial1", "release0", "release1"}:
                     panel = int(step[-1])
-                    metadata.update(mm2_slot=panel, mm2_generation=index, aiv_owners=aivs,
+                    metadata.update(mm2_slot=panel, mm2_generation=index, aiv_owners=aiv_owners,
                                     column_start=panel * layout.pv_panel_width, columns=layout.pv_panel_width)
                 for region, consumer, depth in credits.get(step, ()):
                     depend(consumer, index - depth)

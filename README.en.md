@@ -27,8 +27,8 @@
 When optimizing custom kernels or distributed LLM inference (`DP × TP × EP × PP × DCP / DSA-CP / PCP` and disaggregated Prefill-Decode serving for DeepSeek, Qwen, GLM, or Kimi) on Ascend NPUs, the biggest waste of engineering time is **blind trial-and-error without a causal performance baseline**:
 
 - **"Which hardware resource actually bottlenecks this operator or model?"** — Back-of-the-envelope `FLOPs / peak_tflops` estimates ignore on-chip `UB`/`L1` alignment, tile tails, multi-stream contention, and kernel invocation overheads (`startup_ms` / `minimum_ms`). `mindie-sim` decomposes every operator, subgraph, and network pass into **`Cube_MFU`, `Vec_MFU`, `MBU`, `Link_Util`, and `CV_Overlap`**, pinpointing whether work is `memory_bound`, `cube_bound`, `vector_bound`, `link_bound`, or `launch_bound`.
-- **"If we fuse or tune these memory-bound kernels to reach `0.80x MBU`, how many milliseconds will end-to-end Decode drop?"** — Before writing hundreds of lines of AscendC or Triton code, counterfactual Roofline target fitting (`fit_efficiency_targets`) computes the exact latency reduction while preserving physical work conservation and kernel startup floors.
-- **"Under a `<= 30 ms` Decode TPOT SLA, what is the maximum batch size and throughput — and what if we scale HBM bandwidth or compute by `2x`?"** — The hardware scaling & SLA solver (`solve_sla_sizing`) jointly solves the VRAM capacity ceiling (`B*_VRAM`) and SLA latency ceiling (`B*_SLA`) across hardware scaling scenarios (`2x HBM`, `2x Compute`, `1x HW + 0.80x MBU`).
+- **"How much physically achievable headroom remains between our current schedule and the hardware lower bound?"** — Before writing hundreds of lines of AscendC or Triton code, the five-level Primal-Dual certified ladder (`optimize_ladder`) pairs a Lean 4-verified theoretical floor ($L^*_{\text{Lean}}$) with replay-verified framework and CATLASS/DSL fusion plans ($A^*_{\text{DSL/CATLASS+Fusion}} \le A^*_{\text{Framework}} \le \min(M, U)$).
+- **"Under a `<= 30 ms` Decode TPOT SLA, what is the maximum batch size and throughput — and what if we scale HBM bandwidth or compute by `2x`?"** — The hardware scaling & SLA solver (`solve_sla_sizing`) jointly solves the VRAM capacity ceiling (`B*_VRAM`) and SLA latency ceiling (`B*_SLA`) across hardware scaling scenarios (`2x HBM`, `2x Compute`, `2x Cube`, `2x HBM + 2x Compute`).
 - **"How do we evaluate isolated operators, subgraphs, callbacks, and full serving with consistent physics?"** — `mindie-sim` uses a **single unified causal engine (`prediction.engine.Engine`)** across isolated operator programs (`operators`), shared-resource target graphs (`graph`), callback protocols (`call`), candidate comparisons (`study`), and full-service scheduling (`predict` / `predict_pd`).
 
 ```mermaid
@@ -37,7 +37,7 @@ flowchart TB
     Frontend["🧱 Structural Lowering & Work Conservation (schema / catalog / frontend)<br/>(Attention / MLA / GDN / KDA / MoE Routing / Quantization & KV Cache Capacity)"]
     Program["⚙️ Finite Resource Programs & Pipelines (program / matrix / invocations)<br/>(M/N/K Tiling & Tails · Cube/Vector/MTE/HBM/Link Service · Startup & Completion Floors)"]
     Engine["🔗 Unified Causal Event Engine (prediction.engine.Engine)<br/>(operators Isolated Costs · graph Shared-Resource DAG · call Protocols · predict Serving)"]
-    Analysis["🧭 4D Efficiency, Counterfactual Roofline & SLA Scaling Solver (efficiency / study)<br/>(Cube_MFU · Vec_MFU · MBU · Link_Util · CV_Overlap · 0.80x MBU Fit · B*_SLA Throughput)"]
+    Analysis["🧭 4D Efficiency, Primal-Dual Certified Ladder & SLA Scaling Solver (efficiency / optimization / study)<br/>(Cube_MFU · Vec_MFU · MBU · Link_Util · CV_Overlap · L*_Lean Certified Floor · B*_SLA Throughput)"]
 
     Input --> Frontend --> Program --> Engine --> Analysis
 ```
@@ -74,7 +74,7 @@ If you are an AI Agent receiving the prompt above, execute the following steps t
    ```
 4. **Agent Optimization Workflow**:
    - Before writing or modifying custom kernels, fusion patterns, or parallel layouts (`TP`/`DP`/`EP`/`PP`/`DCP`/`DSA-CP`/`PCP`), run `mindie-sim operators`, `mindie-sim graph`, `mindie-sim predict`, or `mindie-sim study` to quantify stage latencies and resource bottlenecks.
-   - To evaluate 4D efficiency (`Cube_MFU`, `Vec_MFU`, `MBU`, `Link_Util`, `CV_Overlap`), counterfactual `0.80x MBU` optimization headroom, or SLA-constrained maximum throughput, call `analyze_network_efficiency`, `fit_efficiency_targets`, and `solve_sla_sizing` from `mindie_sim.prediction.efficiency`.
+   - To evaluate 4D efficiency (`Cube_MFU`, `Vec_MFU`, `MBU`, `Link_Util`, `CV_Overlap`), the five-level Primal-Dual certified ladder, or SLA-constrained maximum throughput, call `analyze_network_efficiency`, `optimize_ladder`, and `solve_sla_sizing` from `mindie_sim`.
 
 </details>
 
@@ -104,18 +104,18 @@ Conserves physical FLOPs, vector OPs, HBM bytes, and interconnect bytes across i
 
 Every operator is classified by execution kind (`cube` / `vector` / `cv_fused` / `communication` / `memory_only`) and dominant bottleneck (`memory_bound` / `cube_bound` / `vector_bound` / `link_bound` / `launch_bound`).
 
-### 2. Counterfactual Multi-Pipe Roofline Target Fitting (`evaluate_target_efficiency` / `fit_efficiency_targets`)
+### 2. Five-Level Primal-Dual Certified Optimization Ladder (`optimize_ladder`)
 
-Want to know how much faster Decode becomes if memory-bound kernels are optimized to `0.80x MBU`? `fit_efficiency_targets` evaluates counterfactual efficiency caps ($t_{\text{body}} = \max_k W_k / (\eta_k \cdot P_k)$) while preserving kernel `startup_ms` and `minimum_ms`:
-- Reproduces baseline simulator latency with **0.00% drift** at `1.0x` scaling;
-- Computes per-subgraph and whole-network `baseline_ms`, `target_ms`, `saved_ms`, and `speedup_ratio` under configurable targets (e.g., `target_mbu=0.80`, `target_cube_mfu=0.75`, `target_vec_mfu=0.65`).
+Combines work-conserving rewrites with a Lean 4-verified dual certificate (`OptimalityCertificate`) to establish the strict five-level monotonic ladder $0 \le L^*_{\text{Lean}} \le A^*_{\text{DSL/CATLASS+Fusion}} \le A^*_{\text{Framework}} \le \min(M, U)$:
+- Derives an unbreakable theoretical lower bound $L^*_{\text{Lean}}$ from physical resource cuts and mandatory DAG critical paths;
+- Verifies framework and CATLASS/DSL fusion plans on the unified causal engine with exact LOO marginal attribution and certified optimality gaps.
 
 ### 3. Hardware Scaling & SLA Throughput Solver (`scale_case_hardware` / `solve_sla_sizing`)
 
 Supports non-mutating counterfactual hardware scaling (`hbm_bw_scale`, `cube_flops_scale`, `vector_ops_scale`, `link_bw_scale`, `hbm_capacity_scale`) and jointly solves maximum throughput under a target Decode latency SLA (e.g., `<= 30.0 ms`):
 - **VRAM Capacity Ceiling (`B*_VRAM`)**: Maximum sequences per replica after accounting for model weights, runtime workspace, draft caches, and per-token KV cache growth;
 - **SLA Latency Ceiling (`B*_SLA`)**: Monotonic binary search over batch sizes to find the largest concurrency meeting `latency_ms <= sla_ms`;
-- **Feasible Optimum (`B* = min(B*_SLA, B*_VRAM)`)**: Evaluates `DEFAULT_SLA_SCENARIOS` (`baseline`, `2x_hbm`, `2x_compute`, `2x_cube_only`, `2x_hbm_2x_compute`, `target_0.8x_mbu`) and reports peak `tokens/s` and the active limiting factor (`sla_latency` / `vram_capacity` / `sla_unachievable_at_b1`).
+- **Feasible Optimum (`B* = min(B*_SLA, B*_VRAM)`)**: Evaluates `DEFAULT_SLA_SCENARIOS` (`baseline`, `2x_hbm`, `2x_compute`, `2x_cube_only`, `2x_hbm_2x_compute`) and reports peak `tokens/s` and the active limiting factor (`sla_latency` / `vram_capacity` / `sla_unachievable_at_b1`).
 
 ### 4. Full-Dimensional Parallelism & Three Context-Parallel Strategies (`ParallelSpec`)
 
@@ -225,10 +225,9 @@ from mindie_sim import (
     study,                         # Multi-candidate comparative study
     analyze_operator_row,          # Single-operator 4D efficiency (Cube_MFU/Vec_MFU/MBU/Link/CV_Overlap)
     analyze_network_efficiency,    # Whole-network, layer-group & subgraph 4D efficiency breakdown
-    evaluate_target_efficiency,    # Single-operator counterfactual Roofline target evaluation
-    fit_efficiency_targets,        # Whole-network counterfactual Roofline fitting (e.g. 0.80x MBU)
+    optimize_ladder,               # Five-level Primal-Dual certified ladder & Lean 4 lower-bound certificate
     scale_case_hardware,           # Non-mutating counterfactual hardware bandwidth/compute/VRAM scaling
-    solve_sla_sizing, # Joint SLA latency & VRAM capacity maximum throughput solver
+    solve_sla_sizing,              # Joint SLA latency & VRAM capacity maximum throughput solver
 )
 ```
 
@@ -249,16 +248,17 @@ mindie-sim operators examples/quickstart.json --phase decode --tokens 1 --sequen
 mindie-sim graph examples/quickstart.json --phase decode --tokens 1 --sequences 16 --scope body
 ```
 
-### Example 2: 4D Efficiency Breakdown, `0.80x MBU` Counterfactual Fit & `30 ms` SLA Scaling Solver
+### Example 2: 4D Efficiency Breakdown, 5-Level Primal-Dual Certified Ladder & `30 ms` SLA Scaling Solver
 
 ```python
 import json
 from pathlib import Path
 from mindie_sim import (
     analyze_network_efficiency,
-    fit_efficiency_targets,
+    optimize_ladder,
     solve_sla_sizing,
 )
+from mindie_sim.prediction.spine import StepRequest
 
 case = json.loads(Path("examples/quickstart.json").read_text())
 
@@ -266,24 +266,20 @@ case = json.loads(Path("examples/quickstart.json").read_text())
 eff = analyze_network_efficiency(
     case, phase="decode", tokens=1, context=4096, sequences=16, scope="body"
 )
-print("Whole-network summary:", eff["whole_network"])
-print("Dominant bound breakdown:", eff["bound_breakdown"])
+print(
+    f"Graph={eff['graph_duration_ms']:.3f} ms, "
+    f"MBU={eff['network_mbu']:.1%}, Cube MFU={eff['network_cube_mfu']:.1%}"
+)
 
-# 2. Counterfactual fit: how much faster is Decode if memory-bound kernels reach 0.80x MBU?
-target = fit_efficiency_targets(
+# 2. Five-level Primal-Dual certified ladder (L*_Lean theoretical floor vs executable plans)
+report = optimize_ladder(
     case,
-    phase="decode",
-    tokens=1,
-    context=4096,
-    sequences=16,
-    target_mbu=0.80,
-    target_cube_mfu=0.75,
-    target_vec_mfu=0.65,
+    StepRequest(phase="decode", tokens=1, context=4096, sequences=16, scope="body"),
+    max_trials=0,
 )
 print(
-    f"Baseline: {target['baseline_total_ms']:.2f} ms -> "
-    f"Target (0.80x MBU): {target['target_total_ms']:.2f} ms "
-    f"(Speedup: {target['speedup_ratio']:.2f}x)"
+    f"L*_Lean={report.dual_certificate.l_star_lean_ns} ns, "
+    f"Ladder={report.ladder}"
 )
 
 # 3. Solve maximum throughput under a 30ms Decode SLA across baseline and 2x scaled hardware
@@ -291,14 +287,14 @@ sla_report = solve_sla_sizing(
     case,
     sla_ms=30.0,
     context=4096,
-    tokens=1,
-    max_batch_search=256,
+    tokens_per_seq=1,
+    max_sequences_per_dp=16,
 )
 for row in sla_report["scenarios"]:
     print(
-        f"[{row['label']}] B*_SLA={row['b_star_sla']}, B*_VRAM={row['b_star_vram']}, "
-        f"B*={row['b_star']} -> Max Throughput={row['max_throughput_tokens_per_s']:.1f} tok/s "
-        f"({row['limiting_factor']})"
+        f"[{row['scenario_id']}] B_SLA={row['b_sla']}, B_VRAM={row['b_vram_max']}, "
+        f"B_Feas={row['b_feasible']} -> TPS_Feas={row['tps_feasible']:.1f} tok/s "
+        f"({row['feasibility_status']})"
     )
 ```
 

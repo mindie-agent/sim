@@ -285,6 +285,7 @@ class Mc2Program:
     def __call__(self, context: RecipeContext) -> KernelProgram:
         stages = []
         injection_resources = {}
+        encoded_rows: dict[int, str] = {}
         for phase in self.phases:
             info = dict(phase.metadata)
             if phase.service_mode and phase.work.resources["link"]:
@@ -304,6 +305,14 @@ class Mc2Program:
                     name: owners for name, owners in context.owned(0, 1, roles).items() if name in demand
                 }
                 placement = {name: owners[:units] for name, owners in placement.items()}
+            # Every peer phase of a cohort shares the same row sequences.
+            for key in ("cohort_row_ids", "cohort_compact_indices", "cohort_restore_map"):
+                rows = info.get(key)
+                if type(rows) is tuple:
+                    identity = id(rows)
+                    if identity not in encoded_rows:
+                        encoded_rows[identity] = ",".join(map(str, rows))
+                    info[key] = encoded_rows[identity]
             stages.append(Stage(phase.name, demand, phase.after, caps=caps, placement=placement,
                                 coupled=phase.shmem and len(demand) > 1,
                                 metadata=info, keep_empty=True))

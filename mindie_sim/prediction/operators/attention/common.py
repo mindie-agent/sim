@@ -311,7 +311,7 @@ def c8_gather_accounting(
         if view is not None:
             full_pattern = MemoryAccessPattern(tensor_id, 0, die, owner, "read", "mte2_aiv",
                                                count * row_bytes, plan, reuse_key=key)
-            view.admit_access(full_pattern, plan.aligned_copy_bytes())
+            view.admit_access(full_pattern, plan.sector_coverage().measure_bytes())
     return GatherAccounting(row_bytes, rows, rows * row_bytes, sectors, aligned, hits, dram)
 
 

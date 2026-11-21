@@ -11,10 +11,12 @@ C=R/'data/verification/kimi-mixed-projection-source-control-20261030.json'
 fields=['Type','Input Shapes','Input Data Types','Input Formats','Output Shapes','Output Data Types','Output Formats','Block Num','Mix Block Num']
 counters=['Duration(us)','aicore_time(us)','aic_mac_time(us)','aic_scalar_time(us)','aic_mte1_time(us)','aic_mte2_time(us)','aic_fixpipe_time(us)','aiv_time(us)','aiv_vec_time(us)','aiv_scalar_time(us)','aiv_mte2_time(us)','aiv_mte3_time(us)']
 def pin(p):
- h=hashlib.sha256()
- with p.open('rb') as f:
+ p=Path(p);rp=p.resolve();h=hashlib.sha256()
+ with rp.open('rb') as f:
   for b in iter(lambda:f.read(1024*1024),b''):h.update(b)
- return {'path':str(p),'sha256':h.hexdigest(),'size_bytes':p.stat().st_size}
+ try:label=rp.relative_to(ROOT.resolve()).as_posix()
+ except ValueError:label=f'capture://{h.hexdigest()[:16]}/{p.name}'
+ return {'path':label,'sha256':h.hexdigest(),'size_bytes':rp.stat().st_size}
 def stats(a):
  valid=[float(x) for x in a if x!='N/A'];return {'count':len(valid),'unavailable_count':len(a)-len(valid),**({'min':min(valid),'median':statistics.median(valid),'mean':statistics.fmean(valid),'max':max(valid)} if valid else {})}
 def work(batch,heads,context):

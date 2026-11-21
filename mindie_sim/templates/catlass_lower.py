@@ -529,8 +529,10 @@ class _MatrixLowerer:
                            pipe="mte2_aiv", owner=owner, after=after)
         b = self._rect(p.b_id, s.dtype_b, 0, tile.col, p.k, tile.n, p.n, name=name + ":weights",
                        pipe="mte2_aiv", owner=owner, after=after)
+        x, y, z = s.simt_thread_block_dim
         simt = plan.work(name + ":simt_mac", "aiv_simt", 2 * tile.m * tile.n * p.k,
-                         owner=owner, after=(a, b), metadata={"thread_block_dim": s.simt_thread_block_dim})
+                         owner=owner, after=(a, b),
+                         metadata={"thread_block_x": x, "thread_block_y": y, "thread_block_z": z})
         return self._write_output(name + ":scatter", tile, (simt,), pipe="mte3", owner=owner,
                                   physical_rows=physical_rows)
 

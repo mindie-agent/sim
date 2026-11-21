@@ -544,3 +544,11 @@ def test_mindie_v3_binds_packed_operands_and_eight_bit_scale_planes(mode, dst_ty
                             ({"query_block_size": 32}, "64-multiple"), ({"abi": MINDIE_V2_ABI}, "V3")):
         with pytest.raises(UnmodeledCapabilityError, match=message):
             governed.build(governed.make_attention_op(replace(contract, **change), op_id="bad"), geometry())
+
+
+def test_c8_gather_l2_admission_uses_unique_sector_union_not_duplicate_copy_bytes():
+    accounting = governed.c8_gather_accounting(
+        query_tokens=2, selected_tokens=1, selection_lists=((0, 0), (0,)), l2_capacity_bytes=1024,
+    )
+    assert accounting.aligned_transfer_bytes == 3 * 672
+    assert accounting.l2_hit_bytes == 672 and accounting.dram_sector_bytes == 2 * 672

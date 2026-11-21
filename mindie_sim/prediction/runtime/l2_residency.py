@@ -391,6 +391,56 @@ class AdmissionMemoryView:
         """Return currently resident L2 sector intervals applicable to ``pattern``."""
         return self.resident_coverage_for(pattern, aligned_bytes).intervals
 
+    def _fill_identity(self, pattern):
+        key = pattern.reuse_key
+        if key is not None and pattern.direction == "read" and pattern.cache_policy != _L2_CACHE_DISABLE:
+            return self, key.die, key.backing_allocation, key.tensor_version
+
+    def inflight_fill_dependencies(self, engine, pattern, resident: SectorCoverage):
+        """Return same-allocation fills that cover sectors this reader still misses."""
+        identity = self._fill_identity(pattern)
+        pending = getattr(engine, "_inflight_l2_fills", {}).get(identity)
+        if not pending:
+            return ()
+        requested = pattern.runs.sector_coverage()
+        waits = []
+        for done, (filling, previously_resident) in pending.items():
+            overlap = requested.overlap_bytes(filling)
+            if not overlap:
+                continue
+            available = resident.union(previously_resident)
+            # Inclusion-exclusion gives the intersection of both requests with
+            # the sectors excluded from the reader's or the fill's misses.
+            excluded = (requested.overlap_bytes(available) + filling.overlap_bytes(available)
+                        - requested.union(filling).overlap_bytes(available))
+            if overlap > excluded:
+                waits.append(done)
+        return tuple(waits)
+
+    def start_l2_fill(self, engine, name, pattern, aligned_bytes, resident: SectorCoverage):
+        identity = self._fill_identity(pattern)
+        if identity is None or pattern.cache_policy == CACHE_POLICY_LAST_USE:
+            return None
+        coverage = pattern.runs.sector_coverage()
+        working_set = pattern.reuse_distance_bytes if pattern.reuse_distance_bytes is not None else aligned_bytes
+        if max(working_set, coverage.measure_bytes()) > self._preview_effective_l2(pattern.reuse_key):
+            return None
+        done = engine.future(name + ":l2_fill")
+        # The engine owns events. Analytical snapshots of this view contain
+        # committed residency only and never copy a running engine.
+        if not hasattr(engine, "_inflight_l2_fills"):
+            engine._inflight_l2_fills = {}
+        engine._inflight_l2_fills.setdefault(identity, {})[done] = (coverage, resident)
+        return done
+
+    def finish_l2_fill(self, engine, pattern, done):
+        identity = self._fill_identity(pattern)
+        fills = engine._inflight_l2_fills
+        del fills[identity][done]
+        if not fills[identity]:
+            del fills[identity]
+        engine.resolve(done)
+
     def miss_intervals(
         self, pattern: MemoryAccessPattern, aligned_bytes: int,
     ) -> tuple[tuple[int, int], ...]:

@@ -502,3 +502,34 @@ def test_export_plan_abi_separation_redundant_expert_slots_and_packet_validation
     case_spec = parse_case(compose_case("qwen3-32b", hardware="Ascend910_9362", tp=4, pcp=2, ep=1, layers=2))
     rep = export_structure(case_spec, phase="prefill", tokens=64, context=0, sequences=1)
     assert any((n.get("operator") or {}).get("recipe") == "pcp_kv_gather" for n in rep["nodes"])
+
+
+from mindie_sim.model_catalog import list_models as _list_catalog_models
+
+_CATALOG_KEYS = tuple(entry["key"] for entry in _list_catalog_models())
+
+
+@pytest.mark.parametrize("key", _CATALOG_KEYS, ids=list(_CATALOG_KEYS))
+def test_physical_key_count_is_bounded_by_layer_archetypes_not_layer_count(key):
+    from mindie_sim import target_graphs
+    from mindie_sim.prediction.physical_key import physical_key
+
+    cases = {n: compose_case(key, hardware="a5", layers=n) for n in (2, 6, 12)}
+    counts = {
+        n: len({
+            physical_key(op)
+            for ops in target_graphs(case, scope="body", phase="decode", tokens=1, context=128, sequences=1).values()
+            for op in ops
+        })
+        for n, case in cases.items()
+    }
+    assert counts[2] > 0 and counts[6] > 0 and counts[12] > 0
+    assert counts[6] <= 3 * counts[2], (key, counts)
+    archetypes = {
+        (p["attention"], p["ffn"], p["indexer"], p["window"], p["compress_ratio"])
+        for p in cases[6]["model"]["layer_plans"]
+    }
+    if len(archetypes) == 1:
+        assert counts[2] == counts[6] == counts[12], (key, counts)
+    else:
+        assert counts[12] <= counts[6] + counts[2] + 4, (key, counts)

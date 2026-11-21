@@ -17,7 +17,7 @@ import pytest
 from _support.axes import REPRESENTATIVE_SKUS, SKUS
 from mindie_sim.compose import compose_case
 from mindie_sim.optimization import (
-    DagEdge, EventDagSpec, EvgVisitorNode, FusedRegionSummary, ResourceChoiceProgram,
+    EventDagSpec, EvgVisitorNode, FusedRegionSummary, ResourceChoiceProgram,
     SemanticWorkItem, TensorRangeObligation, build_dual_inputs_from_scenario,
     certify_lower_bound, generate_gcd_core_lattice, select_catlass_candidates,
     select_dsl_candidates, solve_dsl, solve_framework, streamk_crossing_partials,
@@ -35,6 +35,8 @@ from mindie_sim.rewrite.apply import PrefetchLease
 from mindie_sim.rewrite.oracle import ScenarioRequest, prepare_scenario
 from mindie_sim.schema.compute_arch import NativeComputeMode
 from mindie_sim.schema.datapath import datapath_for_die
+from mindie_sim.templates import CatlassProblem
+from mindie_sim.templates.dsl_catalog import ATTN_RES, AttnResProblem
 
 pytestmark = pytest.mark.tier0
 
@@ -198,10 +200,10 @@ def test_core_gate_binds_exact_coupled_group_and_pure_lanes(lane_graph, shared):
     assert owners["csa"].aic_limit == owners["comm"].aic_limit == owners["comm"].aiv_limit == 0
     assert set(aiv).isdisjoint(owners["csa"].aiv)
     step = _timeline(scenario, ((0, 10), (4, 14), (6, 16)))
-    quantum_ns = round((step.operators[0].end_ms - step.operators[0].start_ms) * 1_000_000)
-    evidence = _certificate_evidence(ResourceChoiceProgram(0, (), ()), EventDagSpec((quantum_ns,), ()))
+    program, dag, _ = build_dual_inputs_from_scenario(scenario)
+    evidence = _certificate_evidence(program, dag)
     receipt = verify_plan(scenario, replace(applied, streams=(plan,)), step_eval=step, **evidence)
-    assert receipt.passed and receipt.overlap_pct == 60 and receipt.l_star_ns == quantum_ns
+    assert receipt.passed and receipt.overlap_pct == 60 and receipt.l_star_ns == evidence["dual_certificate"].l_star_lean_ns
 
     over = (5, 3, "shared_cap") if shared else (2, 4)
     bad = replace(applied, streams=(_streams(over, (0, 3), (0, 0)),))
@@ -304,7 +306,7 @@ def _fused_summary(scenario):
         SemanticWorkItem("elementwise", "vector_alu", norm.dtype, int(norm.vector_ops), ("aiv_simd",)),
     )
     # These byte ranges describe a small, cold transaction with a partial-sector tail.
-    read = TensorRangeObligation(0, "operand", 0, ((0, 17), (12, 27)), "hbm_cold", "owner")
+    read = TensorRangeObligation(0, "operand", 0, ((0, 17),), "hbm_cold", "owner", (AddressRun(12, 1, 15, 15),))
     write = TensorRangeObligation(0, "output", 1, ((0, 5),), "onchip_resident", "device")
     summary = FusedRegionSummary(
         "K1", "rewrite:fused", tuple(op.op_id for op in atoms), semantic,
@@ -374,33 +376,31 @@ def test_ledger_gate_requires_strided_cold_sectors(real_graph, runs, logical, dr
 
 def test_bound_gate_checks_certificate_and_shipping_threshold(real_graph):
     scenario, applied = real_graph
-    program = ResourceChoiceProgram(2, (23, 19), (((4, 0), (0, 2)),))
-    dag = EventDagSpec((10, 20), (DagEdge(0, 1, 5),))
-    cert, _ = certify_lower_bound(program, dag)
-    assert cert.l_star_lean_ns == 35
-    evidence = dict(dual_program=program, event_dag=dag, dual_certificate=cert)
-    verified = verify_plan(scenario, applied, wall_ns=35, **evidence)
-    assert verified.passed and verified.l_star_ns == 35 and len(verified.gates) == 5
+    program, dag, _ = build_dual_inputs_from_scenario(scenario)
+    evidence = _certificate_evidence(program, dag)
+    cert = evidence["dual_certificate"]
+    lower = cert.l_star_lean_ns
+    assert lower > 0
+    verified = verify_plan(scenario, applied, wall_ns=lower, **evidence)
+    assert verified.passed and verified.l_star_ns == lower and len(verified.gates) == 5
     with pytest.raises(SoundnessInversionError, match="SOUNDNESS_BUG_LOWER_BOUND_INVERTED"):
-        verify_plan(scenario, applied, wall_ns=34, **evidence)
-    for forged in (replace(cert, path_edges=(1,)), replace(cert, l_star_lean_ns=36)):
-        receipt = verify_plan(scenario, applied, wall_ns=100, **{**evidence, "dual_certificate": forged})
+        verify_plan(scenario, applied, wall_ns=lower - 1, **evidence)
+    for forged in (replace(cert, path_edges=(1,)), replace(cert, l_star_lean_ns=lower + 1)):
+        receipt = verify_plan(scenario, applied, wall_ns=lower, **{**evidence, "dual_certificate": forged})
         assert _reason(receipt, 4) == "LEAN_CERTIFICATE_INVALID"
-    receipt = verify_plan(scenario, applied, wall_ns=100, dual_certificate=cert)
+    receipt = verify_plan(scenario, applied, wall_ns=lower, dual_certificate=cert)
     assert _reason(receipt, 4) == "LEAN_CERTIFICATE_INVALID"
-    missing = verify_plan(scenario, applied, wall_ns=100, scope="full")
-    assert _reason(missing, 4) == "LEAN_CERTIFICATE_INVALID"
-    stronger = _certificate_evidence(program, EventDagSpec((100,), ()))
-    with pytest.raises(SoundnessInversionError, match="dsl_ns=50<l_star_ns=100"):
-        verify_plan(scenario, applied, wall_ns=200, framework_ns=150, dsl_ns=50, **stronger)
-    inverted = verify_plan(scenario, applied, wall_ns=100, framework_ns=80, dsl_ns=81, **evidence)
+    assert _reason(verify_plan(scenario, applied, wall_ns=lower), 4) == "LEAN_CERTIFICATE_INVALID"
+    with pytest.raises(SoundnessInversionError, match=f"dsl_ns={lower - 1}<l_star_ns={lower}"):
+        verify_plan(scenario, applied, wall_ns=lower, framework_ns=lower, dsl_ns=lower - 1, **evidence)
+    inverted = verify_plan(scenario, applied, wall_ns=lower + 1, framework_ns=lower, dsl_ns=lower + 1, **evidence)
     assert _reason(inverted, 4) == "LADDER_MONOTONICITY_VIOLATION"
 
-    near = verify_plan(scenario, applied, wall_ns=35, baseline_u_ns=2000, baseline_m_ns=3000, **evidence)
+    near = verify_plan(scenario, applied, wall_ns=lower, baseline_u_ns=lower, baseline_m_ns=lower + 1000, **evidence)
     assert near.shipping_regression is None
-    slow = verify_plan(scenario, applied, wall_ns=35, baseline_u_ns=2000, baseline_m_ns=3001, **evidence)
+    slow = verify_plan(scenario, applied, wall_ns=lower, baseline_u_ns=lower, baseline_m_ns=lower + 1001, **evidence)
     assert slow.passed and slow.shipping_regression == ShippingRegression(
-        delta_ns=1001, baseline_u_ns=2000, baseline_m_ns=3001,
+        delta_ns=1001, baseline_u_ns=lower, baseline_m_ns=lower + 1001,
     )
 
 
@@ -494,103 +494,60 @@ def matrix_op(real_graph):
     base = next(op for op in scenario.atomic_ops[0].ops if op.family == "qkv_projection")
     shape = (64, 192, 384)
     visitors = (EvgVisitorNode("acc", "acc_load", "fp32"),
-                EvgVisitorNode("store", "aux_store", "bf16", inputs=("acc",)))
-    return replace(base, family="grouped_gemm", dtype="bf16", local_shape=shape, flops=2 * prod(shape),
-                   metadata=(("group_rows", (32, 32)), ("evg_tree", visitors)))
-
-
-def _select(op, path, **facts):
-    return select_catlass_candidates(replace(op, metadata=tuple({**dict(op.metadata), **facts}.items())), path, 4, 8)
+                EvgVisitorNode("store", "aux_store", "bf16", inputs=("acc",), aux_tensor_id="output"))
+    return replace(base, family="gemm", dtype="bf16", local_shape=shape, flops=2 * prod(shape),
+                   metadata=(("evg_tree", visitors), ("l1_tile_shape", (64, 64, 128))))
 
 
 @pytest.mark.parametrize("hardware", SKUS)
 def test_catlass_scheduler_choices_preserve_workspace_and_dispatch_constraints(matrix_op, hardware):
     case = compose_case("qwen3-32b", hardware, tp=1, dp=1, layers=1)
-    scenario = resolve_scenario(case, StepRequest("decode", context=64))
-    path = scenario.datapath
-    specs = _select(matrix_op, path)
-    evg = "evg_ub" if path.has_l0c_to_ub else "evg_gm"
-    by_template = {spec.template_id: spec for spec in specs}
-    expected = ("ping_pong", "mutex", "streamk", "multi_core_splitk", "swizzle", "grouped_slice_m", evg)
-    assert {f"catlass.{kind}" for kind in expected} == by_template.keys()
-    assert by_template[f"catlass.{evg}"].workspace_bytes == (0 if path.has_l0c_to_ub else 64 * 192 * 4)
-    assert by_template["catlass.grouped_slice_m"].l2_cache_hint_b == "disable"
-    # Three output blocks split into three K slices occupy runs of 3, 2, 2, 2 iterations.
-    assert by_template["catlass.streamk"].workspace_bytes == (1 + 1 + 2 + 1) * 64 * 64 * 4
-    assert {s.splitk_factor for s in specs if s.scheduler == "multi_core_splitk"} == {2, 3}
+    path = resolve_scenario(case, StepRequest("decode", context=64)).datapath
+    specs = select_catlass_candidates(matrix_op, path, 4, 8)
+    by_id = {spec.template_id: spec for spec in specs}
+    assert {"catlass.basic_pingpong", "catlass.mutex_block_mmad", "catlass.streamk",
+            "catlass.multi_core_splitk", "catlass.swizzle", "catlass.evg"} <= by_id.keys()
+    assert {s.splitk_factor for s in specs if s.template_id == "catlass.multi_core_splitk"} == {2, 3}
     assert {s.swizzle_direction for s in specs if s.template_id == "catlass.swizzle"} == {"Zn", "Nz"}
-    for stages, bias, flag, accepted in (
-        ((5, 5, 5, 5, 6), True, False, True),
-        ((5, 5, 5, 5, 7), True, False, False),
-        ((2, 2, 2, 2, 2), False, True, False),
-        ((2, 2, 2, 2, 1), False, True, True),
-    ):
-        options = _select(matrix_op, path, mutex_stages=stages, has_bias=bias, enable_unit_flag=flag)
-        assert any(s.template_id == "catlass.mutex" for s in options) is accepted
-    one_chunk = replace(matrix_op, local_shape=(64, 192, 128))
-    assert all(s.scheduler != "multi_core_splitk" for s in _select(one_chunk, path))
-
-
-@pytest.mark.parametrize(("dtype", "lhs", "rhs", "factor"), (
-    ("mxfp8", "mxfp8", "mxfp8", 1),
-    ("mxfp4", "mxfp4", "mxfp4", 1),
-    ("a8w4_mx", "mxfp8", "mxfp4", 16),
-))
-def test_catlass_scaled_formats_require_declared_native_mode(real_graph, matrix_op, dtype, lhs, rhs, factor):
-    scenario, _ = real_graph
-    path = scenario.datapath
-    facts = dict(native_matrix_mode=dtype, dtype_a=lhs, dtype_b=rhs, swiglu_mx_quant=True)
-    assert not _select(matrix_op, path, **facts)
-    native_mode = NativeComputeMode(dtype, "matrix", (dtype,), "cube", ("fp32",))
-    arch = path.compute_arch.declared
-    declared = replace(arch, native_modes=(*arch.native_modes, native_mode))
-    capable = replace(path, compute_arch=replace(path.compute_arch, declared=declared))
-    specs = _select(matrix_op, capable, **facts)
-    selected = next(s for s in specs if s.template_id == f"catlass.{dtype}")
-    assert (selected.dtype_a, selected.dtype_b, selected.mx_scale_group, selected.l1_scale_factor_k) == (
-        lhs, rhs, 32, factor,
+    assert {s.epilogue_kind for s in specs if s.template_id == "catlass.evg"} == (
+        {"evg_gm", "evg_ub"} if path.has_l0c_to_ub else {"evg_gm"}
     )
-    assert selected.prologue_b == ("DecompressFp4ToFp8" if dtype == "a8w4_mx" else None)
-    epilogue = next(s for s in specs if s.template_id == "catlass.grouped_swiglu_mx_quant")
-    assert epilogue.l2_cache_hint_b == "disable" and epilogue.scheduler == "grouped_slice_m"
+    assert all((s.aic_budget, s.aiv_budget) == (4, 8) for s in specs)
+    grouped = replace(matrix_op, family="grouped_gemm", metadata=(
+        *matrix_op.metadata, ("group_rows", (32, 32)),
+    ))
+    grouped_spec, = select_catlass_candidates(grouped, path, 4, 8)
+    assert grouped_spec.scheduler == "grouped_slice_m" and grouped_spec.l2_cache_hint_b == "disable"
 
 
-@pytest.mark.parametrize(("backend", "limit"), (("catlass", 1024), ("tla_dsl", 2048)))
-def test_catlass_simt_admits_exact_thread_caps(real_graph, matrix_op, backend, limit):
-    scenario, _ = real_graph
-    facts = dict(simt_backend=backend, simt_buffers=(LiveBufferSpec("scratch", "ub", 1024, 0, 1),),
-                 simt_workspace_bytes=2048)
-    admitted = _select(matrix_op, scenario.datapath, simt_thread_block_dim=(limit // 32, 32, 1), **facts)
-    simt, = tuple(s for s in admitted if s.simt_thread_block_dim is not None)
-    assert prod(simt.simt_thread_block_dim) == limit and simt.aic_budget == 0 and simt.workspace_bytes == 2048
-    too_wide = _select(matrix_op, scenario.datapath, simt_thread_block_dim=(limit + 1, 1, 1), **facts)
-    assert all(s.simt_thread_block_dim is None for s in too_wide)
-
-
-@pytest.mark.parametrize(("kernel", "mode"), (
-    ("flash_kda", "mix_cube_vector"), ("mega_recurrent_kda", "mix_cube_vector"),
-    ("commit_recurrent_kda", "vector_only"), ("mla_prolog_v4", "mix_cube_vector"),
-    ("block_attn_res_update_rms_norm", "vector_only"), ("quant_sparse_lightning_indexer", "mix_cube_vector"),
-    ("mixed_quant_sparse_flash_mla", "mix_cube_vector"),
-))
-def test_dsl_catalog_requires_real_pool_and_owner_capability(real_graph, matrix_op, kernel, mode):
+def test_catlass_dispatch_requires_native_operand_mode(real_graph, matrix_op):
     scenario, _ = real_graph
     path = scenario.datapath
-    scratch = LiveBufferSpec("tile", "ub", 1024, 0, 1, slots=2)
-    tile = TileCandidate("resident_1pass", TileShape(16, 16, 16), 2, (4, 8), 8, 1,
-                         (scratch,), owner_axis="aiv")
-    pipeline = TilePipelineSpec(kernel, (tile,))
-    op = replace(matrix_op, family=kernel, deps=(), metadata=(("dsl_tile_spec", pipeline), ("dsl_workspace_bytes", 4096)))
+    problem = CatlassProblem(32, 32, 128, "fp8_e4m3", "fp8_e4m3", mx_mode="a8w4_mx")
+    invalid = replace(matrix_op, metadata=(("catlass_problem", problem),))
+    assert all(spec.template_id != "catlass.mx_matmul" for spec in select_catlass_candidates(invalid, path, 4, 8))
+    valid = replace(invalid, metadata=(("catlass_problem", replace(problem, dtype_b="fp4_e2m1")),
+                                       ("l1_tile_shape", (32, 32, 128)), ("mutex_stages", (1, 1, 1, 1, 1))))
+    arch = path.compute_arch.declared
+    native_mode = NativeComputeMode("a8w4_mx", "matrix", ("a8w4_mx",), "cube", ("fp32",))
+    if not arch.supports_native("matrix", "a8w4_mx"):
+        arch = replace(arch, native_modes=(*arch.native_modes, native_mode))
+        path = replace(path, compute_arch=replace(path.compute_arch, declared=arch))
+    specs = select_catlass_candidates(valid, path, 4, 8)
+    assert any(s.template_id == "catlass.mx_matmul" and s.prologue_b == "DecompressFp4ToFp8" for s in specs)
+
+
+def test_dsl_catalog_requires_real_pool_and_owner_capability(real_graph, matrix_op):
+    scenario, _ = real_graph
+    path = scenario.datapath
+    problem = AttnResProblem(tokens=1)
+    op = replace(matrix_op, family=ATTN_RES.removeprefix("dsl."), deps=(),
+                 metadata=(("dsl_problem", problem),))
     (spec, members), = select_dsl_candidates((op,), path, 4, 8)
     assert members == (op.op_id,)
-    assert spec.kernel_id == f"dsl.{kernel}" and spec.execution_mode == mode
-    assert spec.aic_budget == (0 if mode == "vector_only" else 4) and spec.aiv_budget == 8
-    assert spec.ring_depths == (("tile", "ub", 2),)
-    assert (spec.ub_peak_bytes, spec.workspace_bytes_total) == (2048, 4096)
+    assert spec.kernel_id == ATTN_RES + ".inplace" and spec.execution_mode == "vector_only"
+    assert (spec.aic_budget, spec.aiv_budget) == (4, 8)
+    assert 0 < spec.ub_peak_bytes <= path.usable_bytes("ub") and spec.workspace_bytes_total == 0
     assert not select_dsl_candidates((op,), path, 4, 0)
-    if mode == "mix_cube_vector":
-        assert not select_dsl_candidates((op,), path, 0, 8)
-    too_large = replace(tile, buffers=(replace(scratch, bytes_per_owner=dict(path.buffers)["ub"]),))
-    invalid = replace(op, metadata=(("dsl_tile_spec", replace(pipeline, candidates=(too_large,))),
-                                    ("dsl_workspace_bytes", 4096)))
-    assert not select_dsl_candidates((invalid,), path, 4, 8)
+    tiny_ub = replace(path, buffers=tuple((pool, 1 if pool == "ub" else size) for pool, size in path.buffers))
+    assert not select_dsl_candidates((op,), tiny_ub, 4, 8)

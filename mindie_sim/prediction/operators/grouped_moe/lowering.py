@@ -33,6 +33,10 @@ MX_DTYPES = frozenset({"mxfp8", "mxfp4"})
 QUANT_OPS_PER_ELEMENT = 4
 AIC_ROLES = frozenset({"cube", "mte1", "mte2_aic", "fixpipe"})
 AIV_ROLES = frozenset({"mte2_aiv", "mte3", "vector"})
+_ROUTING_SEQUENCE_KEYS = frozenset({
+    "row_ids", "restore_map", "expert_rows", "wave_expert_rows",
+    "cohort_row_ids", "cohort_compact_indices", "cohort_restore_map",
+})
 
 
 def ceil_div(value: int, divisor: int) -> int:
@@ -95,6 +99,7 @@ class GroupedMoeProgram:
 
     def __call__(self, context: RecipeContext) -> Program:
         stages = []
+        encoded_rows: dict[int, str] = {}
         for demand in self.demands:
             work = context.bind(demand.work)
             placement = {}
@@ -105,9 +110,17 @@ class GroupedMoeProgram:
                     name: units for name, units in context.owned(demand.owner, owners, roles).items()
                     if name in work
                 }
+            metadata = dict(demand.metadata)
+            # Routing builders use the tuples. Executable stages share one string per sequence.
+            for key, rows in metadata.items():
+                if type(rows) is tuple and key in _ROUTING_SEQUENCE_KEYS:
+                    identity = id(rows)
+                    if identity not in encoded_rows:
+                        encoded_rows[identity] = ",".join(map(str, rows))
+                    metadata[key] = encoded_rows[identity]
             stages.append(Stage(
                 demand.name, work, after=demand.after, placement=placement, coupled=bool(work),
-                metadata=dict(demand.metadata),
+                metadata=metadata,
                 acquire=_slot(context, demand.owner, demand.ub_acquire),
                 free=_slot(context, demand.owner, demand.ub_release),
             ))

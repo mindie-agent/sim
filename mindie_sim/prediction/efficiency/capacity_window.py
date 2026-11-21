@@ -361,22 +361,17 @@ def apply_sla_baseline_gains(results: Sequence[dict[str, Any]],
 
     Extracted so a caller that evaluates each counterfactual in its own worker
     (one flat pool over ``(sku, scenario)``) reproduces exactly the fields a
-    single-call solve publishes.
+    single-call solve publishes. Each throughput gain requires a positive
+    baseline throughput at the same boundary.
     """
-    base_tps = (base_r["tps_at_sla"] if base_r["tps_at_sla"] > 0
-                else base_r["tps_at_b1"])
-    base_feas_tps = (base_r["tps_feasible"] if base_r["tps_feasible"] > 0
-                     else base_r["tps_at_b1"])
+    base_tps = base_r["tps_at_sla"]
+    base_feas_tps = base_r["tps_feasible"]
     base_b = max(1, base_r["b_sla"])
     for row in results:
-        eff_tps = (row["tps_at_sla"] if base_r["tps_at_sla"] > 0
-                   else row["tps_at_b1"])
-        eff_feas = (row["tps_feasible"] if base_r["tps_feasible"] > 0
-                    else row["tps_at_b1"])
-        row["tps_gain_vs_baseline"] = ((eff_tps / base_tps)
-                                       if base_tps > 0 else 1.0)
+        row["tps_gain_vs_baseline"] = (
+            row["tps_at_sla"] / base_tps if base_tps > 0 else None)
         row["tps_feasible_gain_vs_baseline"] = (
-            (eff_feas / base_feas_tps) if base_feas_tps > 0 else 1.0)
+            row["tps_feasible"] / base_feas_tps if base_feas_tps > 0 else None)
         row["concurrency_gain_vs_baseline"] = (
             (row["b_sla"] / base_b) if base_r["b_sla"] > 0
             else ((base_r["step_ms_at_b1"] / row["step_ms_at_b1"])

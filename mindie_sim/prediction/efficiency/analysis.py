@@ -368,6 +368,7 @@ def scale_case_hardware(case: CaseSpec | Mapping[str, Any], *, hbm_bw_scale: flo
         return parsed
     kw = dict(hbm_bw_scale=hbm_bw_scale, cube_flops_scale=cube_flops_scale, vector_ops_scale=vector_ops_scale, link_bw_scale=link_bw_scale)
     mode_to_role = {m_name: m_role for die in parsed.machine.dies for m_name, (m_role, _) in die.service_modes}
+    # Serialized dies include machine-wide device defaults and per-die overrides.
     machine_dict = deepcopy(parsed.machine.to_dict())
     for die, dev_dict in zip(parsed.machine.dies, machine_dict["devices"]):
         ins_map = dev_dict.get("compute_arch", {}).get("instruction_services", {})
@@ -375,6 +376,9 @@ def scale_case_hardware(case: CaseSpec | Mapping[str, Any], *, hbm_bw_scale: flo
         dev_dict["memory_bytes"] = max(1, int(round(die.memory_bytes * hbm_capacity_scale)))
         dev_dict["compute_peaks"] = {dt: float(val) * cube_flops_scale for dt, val in dev_dict.get("compute_peaks", {}).items()}
         dev_dict["rates"] = {r: float(val) * _role_scale_factor(svc_role.get(r, r), **kw) for r, val in dev_dict.get("rates", {}).items()}
+        for key in ("hbm_read_bytes_per_s", "hbm_write_bytes_per_s"):
+            if dev_dict.get(key) is not None:
+                dev_dict[key] = float(dev_dict[key]) * hbm_bw_scale
         for m_name, m_spec in dev_dict.get("service_modes", {}).items():
             if m_spec.get("rate") is not None:
                 m_spec["rate"] = float(m_spec["rate"]) * _role_scale_factor(str(m_spec.get("resource") or svc_role.get(m_name) or mode_to_role.get(m_name, m_name)), **kw)

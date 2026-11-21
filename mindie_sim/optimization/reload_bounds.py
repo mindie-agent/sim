@@ -130,9 +130,17 @@ class _SectorSet:
 
         if not periodic:
             return sector * sum(hi - lo for lo, hi in _merged_spans(sorted(intervals)))
-        if len(periodic) == 1 and not intervals:
-            _, width, _, rows = next(iter(periodic))
-            return sector * width * rows
+        if len(periodic) == 1:
+            start, width, step, rows = next(iter(periodic))
+
+            def run_prefix(address):
+                completed, tail = divmod(max(0, address - start), step)
+                return min(completed, rows) * width + (min(tail, width) if completed < rows else 0)
+
+            return sector * (width * rows + sum(
+                hi - lo - (run_prefix(hi) - run_prefix(lo))
+                for lo, hi in _merged_spans(sorted(intervals))
+            ))
         steps = {step for _, _, step, _ in periodic}
         period = 1
         for step in steps:
@@ -178,6 +186,13 @@ class _SectorSet:
                         total -= q_hi - q_lo
         return total + sum(hi - lo for spans in by_res.values()
                            for lo, hi in _merged_spans(sorted(spans)))
+
+
+def measure_logical_bytes(obligations: Sequence[TensorRangeObligation]) -> int:
+    coverage: dict[tuple[int, str, int], _SectorSet] = defaultdict(_SectorSet)
+    for item in obligations:
+        coverage[item.die, item.allocation_id, item.tensor_version].add(item, 1)
+    return sum(spans.measure(1) for spans in coverage.values())
 
 
 def compute_compulsory_hbm_cut(

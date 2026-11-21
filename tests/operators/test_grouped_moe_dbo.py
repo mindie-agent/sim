@@ -183,10 +183,10 @@ def test_enabled_plan_covers_both_cohorts_and_pickles(geometry, mode):
         for upstream, downstream in zip((dispatch, gmm, act, down), (gmm, act, down, combine)):
             assert upstream in ancestry[downstream]
         meta = logical[dispatch].metadata
-        assert meta["row_ids"] == owned
+        assert tuple(map(int, meta["row_ids"].split(","))) == owned
         assert (meta["row_start"], meta["row_end"]) == (cohort * HALF_BATCH, (cohort + 1) * HALF_BATCH)
-        assert meta["restore_map"] == owned
-        partitions.append((set(owned), meta["expert_rows"]))
+        assert meta["restore_map"] == meta["row_ids"]
+        partitions.append((set(owned), tuple(map(int, meta["expert_rows"].split(",")))))
     assert partitions[0][0].isdisjoint(partitions[1][0])
     assert partitions[0][0] | partitions[1][0] == set(range(2 * HALF_BATCH))
     assert tuple(map(sum, zip(*(rows for _, rows in partitions)))) == (HALF_BATCH,) * 2
@@ -365,7 +365,9 @@ def test_embedded_mc2_preserves_cohort_rows_and_wire_work(geometry, row_ids):
     for row in (s for s in stages if ":transport:" in s.name):
         cid = row.metadata["cohort_id"]
         assert (row.metadata["row_start"], row.metadata["row_end"]) == (cid * HALF_BATCH, (cid + 1) * HALF_BATCH)
-        assert row.metadata["row_ids"] == row.metadata["restore_map"] == row_ids[cid]
+        expected = ",".join(map(str, row_ids[cid]))
+        assert row.metadata["row_ids"] == row.metadata["restore_map"] == expected
+        assert row.metadata["cohort_row_ids"] == row.metadata["cohort_restore_map"] == expected
         if row.name.endswith("_consume"):
             assert row.name.replace("_consume", "_ready") in graph[row.name]
     for cid in range(2):
@@ -391,7 +393,7 @@ def test_off_rank_cohorts_separate_wire_work_received_rows_and_local_outputs(geo
         prefix = f"c{cid}_"
         dispatch, combine = (by_name[prefix + phase + ":local"] for phase in ("dispatch", "combine"))
         assert dispatch.metadata["source_tokens"] == combine.metadata["output_tokens"] == send[cid]
-        assert dispatch.metadata["row_ids"] == combine.metadata["restore_map"] == row_ids[cid]
+        assert dispatch.metadata["row_ids"] == combine.metadata["restore_map"] == ",".join(map(str, row_ids[cid]))
         assert combine.work.get("mte3", 0) == 2 * WIDTH * send[cid]
         if receive[cid]:
             assert by_name[prefix + "gmm1"].metadata["useful_flops"] == 2 * receive[cid] * WIDTH * (2 * WIDTH)
@@ -426,8 +428,13 @@ def test_wave_transport_uses_the_directed_cut_supplied_by_the_caller(geometry):
         cohort_transport_builder=transport_builder,
     )
     resolved, _, stages = stages_for(op, geometry)
-    actual = {(stage.metadata["cohort_id"], stage.metadata["wave"], stage.metadata["transport_direction"]):
-              stage.work["link"] for stage in stages if "link" in stage.work}
+    actual = {}
+    for stage in stages:
+        if "link" in stage.work:
+            tag = stage.metadata
+            cid = tag["cohort_id"]
+            assert tag["wave_expert_rows"] == ("1,0", "0,1")[cid]
+            actual[cid, tag["wave"], tag["transport_direction"]] = stage.work["link"]
     assert actual == {(cid, wave, direction): amount for (cid, wave), pair in wire.items()
                       for direction, amount in zip(("dispatch", "combine"), pair) if amount}
     assert resolved.recipe.work.resources["link"] == 384

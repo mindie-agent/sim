@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Literal
 
 from mindie_sim.prediction.results import ReplayOptions, StepEvaluation, StepRequest
 
-from .contracts import CatlassKernelSpec, DslKernelSpec, FuseRegionSpec, PrimitiveCapacityTable
+from .contracts import CapacityTable, CatlassKernelSpec, DslKernelSpec, FuseRegionSpec
 from .dsl_solver import solve_dsl
 from .dual_bound import (
     NS_PER_MS, DualSubgradientReport, OptimalityCertificate,
@@ -283,18 +283,26 @@ def _shipping_overlay_loo(search, dossier, plan, wall, u, m):
 
 def solve_five_level_ladder(
     case, request: StepRequest, *, spine=None, replay: ReplayOptions = ReplayOptions(),
-    primitives=None, primitive_table: PrimitiveCapacityTable | None = None,
+    primitives=None, primitive_table: CapacityTable | None = None,
     stack_id: str = "cann93_va_main", max_trials: int = DEFAULT_LADDER_TRIALS,
 ) -> FiveLevelReport:
-    from mindie_sim.rewrite.oracle import EvalBudget, ScenarioRequest, prepare_scenario
+    from mindie_sim.rewrite.oracle import EvalBudget, ScenarioRequest, _baseline, prepare_scenario
     from mindie_sim.rewrite.verify import SoundnessInversionError
 
     scenario_request = ScenarioRequest(case, request, stack_id, replay)
     dossier = prepare_scenario(scenario_request, budget=EvalBudget(deadline_mono=replay.deadline_mono),
                                spine=spine, primitives=primitives)
     scenario = _resolved(dossier)
-    summaries = getattr(dossier, "region_summaries", ())
-    program, dag, names = build_dual_inputs_from_scenario(scenario, region_summaries=summaries)
+    program, dag, names = build_dual_inputs_from_scenario(scenario)
+    _, pricing = certify_lower_bound(program, dag)
+    prices_by_index = dict(zip(pricing.resource_names, names))
+    pricing = replace(pricing, resource_names=names,
+                      tight_resources=tuple(prices_by_index[key] for key in pricing.tight_resources))
+    framework = solve_framework(dossier, dual_report=pricing, max_trials=max_trials)
+    dsl = solve_dsl(dossier, framework, dual_report=pricing, max_trials=max_trials)
+    resolved = _baseline(dossier.handle, dsl.best_plan).scenario
+    summaries = dsl.best_eval.region_summaries
+    program, dag, names = build_dual_inputs_from_scenario(resolved, region_summaries=summaries)
     certificate, subgradient = certify_lower_bound(program, dag)
     names_by_index = dict(zip(subgradient.resource_names, names))
     subgradient = replace(subgradient, resource_names=names,
@@ -303,16 +311,12 @@ def solve_five_level_ladder(
     hw_bound = None
     if primitive_table is not None:
         hw_prog, hw_dag, _ = build_dual_inputs_from_scenario(
-            scenario, region_summaries=summaries, primitive_table=primitive_table,
+            resolved, region_summaries=summaries, primitive_table=primitive_table,
             rate_mode="certified_upper_capacity",
         )
         hw_cert, _ = certify_lower_bound(hw_prog, hw_dag)
         hw_bound = hw_cert.l_star_lean_ns
 
-    options = dict(dual_report=subgradient, dual_program=program, event_dag=dag,
-                   dual_certificate=certificate, max_trials=max_trials)
-    framework = solve_framework(dossier, **options)
-    dsl = solve_dsl(dossier, framework, **options)
     u, m = framework.seed_u_ns, framework.seed_m_ns
     a_fw, a_dsl = framework.best_wall_ns, dsl.best_wall_ns
     if not 0 <= lower_bound <= a_dsl <= a_fw <= min(m, u):
@@ -338,8 +342,7 @@ def solve_five_level_ladder(
 
     verification = _verification(dsl.best_eval)
     plan = dsl.best_plan
-    search = _TrialSearch(dossier, len(plan.edits), dual_program=program, event_dag=dag,
-                          dual_certificate=certificate)
+    search = _TrialSearch(dossier, len(plan.edits))
     search.seed(plan, dsl.best_eval)
     regression = _shipping_regression(verification, u, m)
     if regression is not None and verification is not None:

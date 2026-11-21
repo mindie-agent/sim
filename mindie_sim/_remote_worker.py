@@ -265,15 +265,22 @@ def _thaw(value):
     return tuple(_thaw(item) for item in value) if isinstance(value, list) else value
 
 
-def _lowering(raw):
+def _step_request(raw):
     from mindie_sim.prediction.results import StepRequest
+
+    if isinstance(raw.get("sequences"), list):
+        raw = raw | {"sequences": tuple(raw["sequences"])}
+    return StepRequest(**raw)
+
+
+def _lowering(raw):
     from mindie_sim.schema.operators import OpSpec
     from mindie_sim.schema.workload import IterationPlan, RequestView
     from mindie_sim.stack_registry import LoweringRequest, RankOps
 
     fields = dict(raw)
     if fields.get("step") is not None:
-        fields["step"] = StepRequest(**fields["step"])
+        fields["step"] = _step_request(fields["step"])
     fields["iterations"] = tuple((rank, IterationPlan(**{
         **plan, "requests": tuple(RequestView(**view) for view in plan["requests"]),
     })) for rank, plan in fields.get("iterations", ()))
@@ -284,7 +291,7 @@ def _lowering(raw):
     return LoweringRequest(**fields)
 def _candidate(entrypoint, base, candidate, deadline):
     from mindie_sim.prediction.evaluation import ACTIVE_DEADLINE_MONO, check_active_deadline
-    from mindie_sim.prediction.results import ReplayOptions, SlaRequest, StepRequest, SweepRequest, json_payload
+    from mindie_sim.prediction.results import ReplayOptions, SlaRequest, SweepRequest, json_payload
     from mindie_sim.prediction.spine import default_spine
     from mindie_sim.schema.case import Case
 
@@ -298,26 +305,25 @@ def _candidate(entrypoint, base, candidate, deadline):
         if entrypoint == "run_step":
             result = spine.run_step(spine.lower(case, _lowering(raw)), replay)
         elif entrypoint == "evaluate_three_tiers":
-            opts = dict(candidate.get("options", {}))
-            if "target_eff" in opts:
-                result = spine.evaluate_three_tiers(case, StepRequest(**raw), replay=replay, **opts)
-            else:
-                try:
-                    result = spine.evaluate_three_tiers(case, StepRequest(**raw), replay=replay, target_eff=1.0, **opts)
-                except TypeError:
-                    result = spine.evaluate_three_tiers(case, StepRequest(**raw), replay=replay, **opts)
+            result = spine.evaluate_three_tiers(
+                case, _step_request(raw), replay=replay, **candidate.get("options", {}),
+            )
         elif entrypoint == "solve_sla":
-            result = spine.solve_sla(case, SlaRequest(**(raw | {"step": StepRequest(**raw["step"])})))
+            result = spine.solve_sla(case, SlaRequest(**(raw | {"step": _step_request(raw["step"])})))
         elif entrypoint == "sweep_topology":
             sla = raw["sla"]
-            request = SweepRequest(**(raw | {"sla": SlaRequest(**(sla | {"step": StepRequest(**sla["step"])}))}))
+            request = SweepRequest(**(raw | {"sla": SlaRequest(**(sla | {"step": _step_request(sla["step"])}))}))
             decode = candidate.get("decode_case")
             result = spine.sweep_topology(case, request, decode_case=Case.from_mapping(decode) if decode is not None else None)
         else:
-            optimize = getattr(spine, "optimize_ladder", None)
-            if optimize is None:
-                raise RuntimeError("ladder optimization unavailable in this simulator build")
-            result = optimize(case, raw, replay=replay)
+            options = dict(candidate.get("options", {}))
+            if (table := options.get("primitive_table")) is not None:
+                from mindie_sim.optimization.contracts import PrimitiveCapacityEntry, PrimitiveCapacityTable
+
+                options["primitive_table"] = PrimitiveCapacityTable(
+                    sku=table["sku"], entries=tuple(PrimitiveCapacityEntry(**entry) for entry in table["entries"]),
+                )
+            result = spine.optimize_ladder(case, _step_request(raw), replay=replay, **options)
         check_active_deadline()
         return {"candidate_id": candidate["candidate_id"], "objective_key": candidate["objective_key"],
                 "result": json_payload(result)}

@@ -27,8 +27,8 @@
 在昇腾（Ascend）NPU 上优化算子或大模型推理（如 DeepSeek、Qwen、GLM、Kimi 在 A2 / A3 / A5 上的 `DP × TP × EP × PP × DCP / DSA-CP / PCP` 部署与 PD 分离服务）时，最消耗工程时间的往往不是写代码，而是**在没有物理依据的方向上盲目试错**：
 
 - **“这个算子或整网到底卡在哪一维硬件资源？”** —— 仅凭粗略的 `FLOPs / 峰值算力` 估算会忽略片上 `UB`/`L1` 容量对齐、尾块（tile tail）开销、多流并发争用以及 Kernel 启动固定耗时（`startup_ms` / `minimum_ms`）。`mindie-sim` 对每个算子、子图和整网显式分解 **`Cube_MFU`、`Vec_MFU`、`MBU`、`Link_Util` 与 `CV_Overlap`**，直接指出瓶颈属于 `memory_bound`、`cube_bound`、`vector_bound`、`link_bound` 还是 `launch_bound`。
-- **“如果我把访存带宽利用率优化到 `0.80x MBU`，端到端延迟到底能降多少毫秒？”** —— 在动手重写 AscendC / Triton 融合算子之前，可以通过反事实 Roofline 目标拟合（`fit_efficiency_targets`），在保留真实启动开销与物理工作量守恒的前提下，直接算出优化后的理论耗时与端到端提速比。
-- **“在 Decode TPOT `<= 30 ms` 的 SLA 约束下，当前硬件最多能跑多大并发？如果升级带宽或算力呢？”** —— 通过硬件缩放与 SLA 吞吐求解器（`solve_sla_sizing`），一行调用即可联合求解显存容量上限 `B*_VRAM`、SLA 延迟上限 `B*_SLA` 以及不同硬件缩放场景（如 `2x HBM`、`2x Compute`、`1x HW + 0.80x MBU`）下的最大吞吐（`tokens/s`）。
+- **“这个算子或整网距离硬件理论极限还有多少真实可挖掘的优化空间？”** —— 在动手重写 AscendC / Triton 融合算子之前，可以通过五级 Primal-Dual 认证优化阶梯（`optimize_ladder`），由 Lean 4 证明的理论下界 $L^*_{\text{Lean}}$ 与可执行重排/融合方案（$A^*_{\text{DSL/CATLASS+Fusion}} \le A^*_{\text{Framework}} \le \min(M, U)$）定量给出可实现的优化收益。
+- **“在 Decode TPOT `<= 30 ms` 的 SLA 约束下，当前硬件最多能跑多大并发？如果升级带宽或算力呢？”** —— 通过硬件缩放与 SLA 吞吐求解器（`solve_sla_sizing`），一行调用即可联合求解显存容量上限 `B*_VRAM`、SLA 延迟上限 `B*_SLA` 以及不同硬件缩放场景（如 `2x HBM`、`2x Compute`、`2x Cube`、`2x HBM + 2x Compute`）下的最大吞吐（`tokens/s`）。
 - **“怎么用同一套机制同时分析单算子、局部子图、算子回调与整网在线服务？”** —— `mindie-sim` 采用**单一统一因果引擎（`prediction.engine.Engine`）**，算子评估（`operators`）、共享设备资源子图（`graph`）、完整回调协议（`call`）、多方案对比（`study`）与整网/PD 分离预测（`predict` / `predict_pd`）全部基于同一套物理工作量与因果资源调度契约。
 
 ```mermaid
@@ -37,7 +37,7 @@ flowchart TB
     Frontend["🧱 结构解析与物理工作量展开 (schema / catalog / frontend)<br/>(Attention / MLA / GDN / KDA / MoE 路由 / 量化与 KV Cache 容量规划)"]
     Program["⚙️ 算子资源程序与流水建模 (program / matrix / invocations)<br/>(M/N/K 分块与尾块 · Cube/Vector/MTE/HBM/Link 并发服务 · 启动下界约束)"]
     Engine["🔗 统一因果事件引擎 (prediction.engine.Engine)<br/>(operators 独立算子 · graph 共享资源子图 · call 回调协议 · predict 整网服务)"]
-    Analysis["🧭 四维效率、反事实 Roofline 与 SLA 硬件缩放求解 (efficiency / study)<br/>(Cube_MFU · Vec_MFU · MBU · Link_Util · CV_Overlap · 0.80x MBU 拟合 · B*_SLA 吞吐)"]
+    Analysis["🧭 四维效率、Primal-Dual 认证优化阶梯与 SLA 硬件缩放求解 (efficiency / optimization / study)<br/>(Cube_MFU · Vec_MFU · MBU · Link_Util · CV_Overlap · L*_Lean 认证下界 · B*_SLA 吞吐)"]
 
     Input --> Frontend --> Program --> Engine --> Analysis
 ```
@@ -74,7 +74,7 @@ flowchart TB
    ```
 4. **Agent 调优工作流规范**：
    - 在编写或修改算子、融合子图或调整并行配置（`TP`/`DP`/`EP`/`PP`/`DCP`/`DSA-CP`/`PCP`）前，先使用 `mindie-sim operators`、`mindie-sim graph`、`mindie-sim predict` 或 `mindie-sim study` 评估各层耗时与瓶颈。
-   - 需要评估四维效率（`Cube_MFU`、`Vec_MFU`、`MBU`、`Link_Util`、`CV_Overlap`）、`0.80x MBU` 反事实优化空间或 Decode SLA 最大吞吐时，直接调用 `mindie_sim.prediction.efficiency` 中的 `analyze_network_efficiency`、`fit_efficiency_targets` 与 `solve_sla_sizing`。
+   - 需要评估四维效率（`Cube_MFU`、`Vec_MFU`、`MBU`、`Link_Util`、`CV_Overlap`）、五级 Primal-Dual 认证优化阶梯或 Decode SLA 最大吞吐时，直接调用 `mindie_sim` 中的 `analyze_network_efficiency`、`optimize_ladder` 与 `solve_sla_sizing`。
 
 </details>
 
@@ -104,18 +104,18 @@ flowchart TB
 
 每个算子同时标注类型（`cube` / `vector` / `cv_fused` / `communication` / `memory_only`）与主导边界（`memory_bound` / `cube_bound` / `vector_bound` / `link_bound` / `launch_bound`）。
 
-### 2. 反事实多管线 Roofline 目标拟合（`evaluate_target_efficiency` / `fit_efficiency_targets`）
+### 2. 五级 Primal-Dual 认证优化阶梯（`optimize_ladder`）
 
-想要预判“把某个子图的访存带宽利用率提升到 `0.80x MBU` 能省多少时间”？`fit_efficiency_targets` 在严格保留算子启动延迟（`startup_ms`）与最小执行下界（`minimum_ms`）的前提下，按多管线 Roofline（$t_{\text{body}} = \max_k W_k / (\eta_k \cdot P_k)$）反推目标耗时：
-- 在 `1.0x` 基准效率下，多管线分解与仿真器原始延迟 **0.00% 漂移**；
-- 支持对指定算子类别（如仅针对 `memory_bound` 算子）设定 `target_mbu=0.80`、`target_cube_mfu=0.75`、`target_vec_mfu=0.65`，直接输出各子图与整网的 `baseline_ms`、`target_ms`、`saved_ms` 与 `speedup_ratio`。
+通过物理守恒重写与 Lean 4 形式化对偶证书（`OptimalityCertificate`），严格构建五级单调阶梯 $0 \le L^*_{\text{Lean}} \le A^*_{\text{DSL/CATLASS+Fusion}} \le A^*_{\text{Framework}} \le \min(M, U)$：
+- 基于硬件真实资源割与 DAG 关键路径推导不可突破的理论时间下界 $L^*_{\text{Lean}}$；
+- 在统一因果回放引擎上验证框架级与 CATLASS/DSL 融合方案，并输出精确的 LOO 边际贡献归因与认证最优差距。
 
 ### 3. 硬件缩放与 SLA 最大吞吐求解器（`scale_case_hardware` / `solve_sla_sizing`）
 
 支持对 `hbm_bw_scale`、`cube_flops_scale`、`vector_ops_scale`、`link_bw_scale`、`hbm_capacity_scale` 进行无损反事实缩放，并在给定延迟 SLA（如 Decode TPOT `<= 30.0 ms`）下联合求解：
 - **显存容量并发上限 `B*_VRAM`**：扣除模型权重、运行时开销与投机解码草稿缓存后，KV Cache 可承载的最大并发序列数；
 - **SLA 延迟并发上限 `B*_SLA`**：通过单调二分搜索找到满足 `latency_ms <= sla_ms` 的最大每副本并发数；
-- **可行最优并发 `B* = min(B*_SLA, B*_VRAM)`**：输出 `DEFAULT_SLA_SCENARIOS`（`baseline`、`2x_hbm`、`2x_compute`、`2x_cube_only`、`2x_hbm_2x_compute`、`target_0.8x_mbu`）下的最大吞吐（`tokens/s`）与限制因素（`sla_latency` / `vram_capacity` / `sla_unachievable_at_b1`）。
+- **可行最优并发 `B* = min(B*_SLA, B*_VRAM)`**：输出 `DEFAULT_SLA_SCENARIOS`（`baseline`、`2x_hbm`、`2x_compute`、`2x_cube_only`、`2x_hbm_2x_compute`）下的最大吞吐（`tokens/s`）与限制因素（`sla_latency` / `vram_capacity` / `sla_unachievable_at_b1`）。
 
 ### 4. 全维并行分解与三类上下文并行策略（`ParallelSpec`）
 
@@ -225,10 +225,9 @@ from mindie_sim import (
     study,                         # 多候选方案对比研究
     analyze_operator_row,          # 单算子 4D 效率 (Cube_MFU/Vec_MFU/MBU/Link/CV_Overlap)
     analyze_network_efficiency,    # 整网/层段/结构子图 4D 效率与瓶颈分布
-    evaluate_target_efficiency,    # 单算子反事实 Roofline 目标效率耗时评估
-    fit_efficiency_targets,        # 整网反事实 Roofline 目标效率拟合 (如 0.80x MBU)
+    optimize_ladder,               # 五级 Primal-Dual 认证优化阶梯与 Lean 4 下界证书
     scale_case_hardware,           # 硬件带宽/算力/显存容量无损反事实缩放
-    solve_sla_sizing, # SLA 延迟与显存容量联合约束下的最大并发与吞吐求解
+    solve_sla_sizing,              # SLA 延迟与显存容量联合约束下的最大并发与吞吐求解
 )
 ```
 
@@ -249,16 +248,17 @@ mindie-sim operators examples/quickstart.json --phase decode --tokens 1 --sequen
 mindie-sim graph examples/quickstart.json --phase decode --tokens 1 --sequences 16 --scope body
 ```
 
-### 示例 2：四维效率分析、`0.80x MBU` 反事实拟合与 `30 ms` SLA 吞吐求解
+### 示例 2：四维效率分析、五级 Primal-Dual 认证优化阶梯与 `30 ms` SLA 吞吐求解
 
 ```python
 import json
 from pathlib import Path
 from mindie_sim import (
     analyze_network_efficiency,
-    fit_efficiency_targets,
+    optimize_ladder,
     solve_sla_sizing,
 )
+from mindie_sim.prediction.spine import StepRequest
 
 case = json.loads(Path("examples/quickstart.json").read_text())
 
@@ -266,24 +266,20 @@ case = json.loads(Path("examples/quickstart.json").read_text())
 eff = analyze_network_efficiency(
     case, phase="decode", tokens=1, context=4096, sequences=16, scope="body"
 )
-print("Whole-network summary:", eff["whole_network"])
-print("Dominant bound breakdown:", eff["bound_breakdown"])
+print(
+    f"Graph={eff['graph_duration_ms']:.3f} ms, "
+    f"MBU={eff['network_mbu']:.1%}, Cube MFU={eff['network_cube_mfu']:.1%}"
+)
 
-# 2. 反事实预估：若将访存受限算子优化至 0.80x MBU，端到端能提速多少？
-target = fit_efficiency_targets(
+# 2. 五级 Primal-Dual 认证优化阶梯（L*_Lean 理论下界与实际可执行方案对比）
+report = optimize_ladder(
     case,
-    phase="decode",
-    tokens=1,
-    context=4096,
-    sequences=16,
-    target_mbu=0.80,
-    target_cube_mfu=0.75,
-    target_vec_mfu=0.65,
+    StepRequest(phase="decode", tokens=1, context=4096, sequences=16, scope="body"),
+    max_trials=0,
 )
 print(
-    f"Baseline: {target['baseline_total_ms']:.2f} ms -> "
-    f"Target (0.80x MBU): {target['target_total_ms']:.2f} ms "
-    f"(Speedup: {target['speedup_ratio']:.2f}x)"
+    f"L*_Lean={report.dual_certificate.l_star_lean_ns} ns, "
+    f"Ladder={report.ladder}"
 )
 
 # 3. 求解 30ms Decode SLA 约束下，基准硬件与 2x HBM / 2x Compute 缩放方案的最大吞吐
@@ -291,14 +287,14 @@ sla_report = solve_sla_sizing(
     case,
     sla_ms=30.0,
     context=4096,
-    tokens=1,
-    max_batch_search=256,
+    tokens_per_seq=1,
+    max_sequences_per_dp=16,
 )
 for row in sla_report["scenarios"]:
     print(
-        f"[{row['label']}] B*_SLA={row['b_star_sla']}, B*_VRAM={row['b_star_vram']}, "
-        f"B*={row['b_star']} -> Max Throughput={row['max_throughput_tokens_per_s']:.1f} tok/s "
-        f"({row['limiting_factor']})"
+        f"[{row['scenario_id']}] B_SLA={row['b_sla']}, B_VRAM={row['b_vram_max']}, "
+        f"B_Feas={row['b_feasible']} -> TPS_Feas={row['tps_feasible']:.1f} tok/s "
+        f"({row['feasibility_status']})"
     )
 ```
 

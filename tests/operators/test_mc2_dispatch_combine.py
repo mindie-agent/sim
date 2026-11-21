@@ -433,8 +433,8 @@ def test_interleaved_cohorts_use_exact_rows_and_restore_order(backend):
     trace = timings(engine)
     for part in slices:
         sent = trace[f"cohort{part.cohort_id}_send_1"]["metadata"]
-        assert sent["cohort_row_ids"] == sent["cohort_restore_map"] == part.row_ids
-        assert sent["cohort_compact_indices"] == (0, 1)
+        assert sent["cohort_row_ids"] == sent["cohort_restore_map"] == ",".join(map(str, part.row_ids))
+        assert sent["cohort_compact_indices"] == "0,1"
     assert trace["cohort9_pack"]["start_ms"] >= trace["cohort5_slot_release"]["end_ms"]
     returns = tuple(replace(part, source_assignments=0, remote_assignments=0, received_assignments=2)
                     for part in slices)

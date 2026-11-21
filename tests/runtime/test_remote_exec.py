@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+from dataclasses import replace
 import io
 import json
 import os
@@ -24,8 +25,10 @@ import pytest
 from _support.axes import REPRESENTATIVE_SKUS
 from _support.hardware import sku_case
 from mindie_sim import _remote_worker as worker
-from mindie_sim import remote_exec as remote
-from mindie_sim.prediction.results import StepRequest
+from mindie_sim import api, remote_exec as remote
+from mindie_sim.optimization.contracts import PrimitiveCapacityEntry, PrimitiveCapacityTable
+from mindie_sim.prediction.results import ReplayOptions, StepRequest, json_payload
+from mindie_sim.prediction.spine import default_spine
 from mindie_sim.stack_registry import LoweringRequest
 
 pytestmark = pytest.mark.tier0
@@ -70,18 +73,37 @@ def _dispatcher(cwd, target, *, warm=False, endpoints=None, probe=None, **kwargs
     )
 
 
-def test_explicit_local_never_reads_endpoint_configuration(endpoint_paths, monkeypatch):
+@pytest.mark.parametrize("entrypoint", ["optimize_ladder", "evaluate_three_tiers"])
+def test_local_dispatch_matches_public_prediction(endpoint_paths, monkeypatch, prediction_case, entrypoint):
     _, cwd, _ = endpoint_paths
-    (cwd / "endpoints.json").parent.mkdir()
-    (cwd / "endpoints.json").write_text("invalid JSON", encoding="utf-8")
     monkeypatch.setattr(remote, "_read_config", _unexpected)
-    dispatcher = remote.RemoteDispatcher(
-        remote.RemoteExecPolicy(target="local"), cwd=cwd, endpoints_loader=_unexpected,
-        probe_fn=_unexpected, local_c11_ready_fn=_unexpected,
-    )
-    receipt = dispatcher.resolve_target(100)
-    assert receipt.resolved_target == "local"
-    assert receipt.fallback_reason is None
+    monkeypatch.setattr(remote, "_exchange", _unexpected)
+    dispatcher = _dispatcher(cwd, "local", endpoints=_unexpected, probe=_unexpected,
+                             stage_fn=_unexpected, exec_fn=_unexpected)
+    step = StepRequest(phase="decode", context=16, sequences=(2,))
+    replay = ReplayOptions(include_submission=True)
+    options = {}
+    if entrypoint == "optimize_ladder":
+        die = prediction_case.machine.dies[0]
+        rate = dict(die.rates)["hbm"]
+        table = PrimitiveCapacityTable(die.sku, (PrimitiveCapacityEntry("hbm_bus_r", rate, rate, "B/s"),))
+        options = dict(max_trials=1, stack_id="raw_eager", primitive_table=table, primitives=None)
+    expected = json_payload(getattr(api, entrypoint)(prediction_case, step, replay=replay, **options))
+    spine = default_spine()
+    predict = Mock(wraps=getattr(spine, entrypoint))
+    monkeypatch.setattr(spine, entrypoint, predict)
+    if entrypoint == "optimize_ladder":
+        result, receipt = dispatcher.optimize_ladder(prediction_case, [dict(request=step, replay=replay, options=options)])
+    else:
+        result, receipt = dispatcher.evaluate_three_tiers(prediction_case, step, replay=replay)
+    assert receipt.resolved_target == "local" and receipt.fallback_reason is None
+    deadline = predict.call_args.kwargs["replay"].deadline_mono
+    predict.assert_called_once_with(prediction_case, step, replay=replace(replay, deadline_mono=deadline), **options)
+    actual = result["results"][0]["result"]
+    if entrypoint == "optimize_ladder":
+        for report in (actual, expected):
+            del report["dual_subgradient"]["solve_ms"]
+    assert actual == expected
 
 
 @pytest.mark.parametrize(
@@ -152,28 +174,20 @@ def _write_pin(home, endpoint, *, mode=0o600):
     }, mode=mode)
 
 
-def test_unattended_dispatch_refuses_repository_only_alias(endpoint_paths):
-    _, cwd, _ = endpoint_paths
-    _write_config(cwd / "endpoints.json", {ALIAS: ENDPOINT})
-    local = Mock(return_value="computed locally")
-    dispatcher = remote.RemoteDispatcher(cwd=cwd, local_c11_ready_fn=lambda: False,
-                                         probe_fn=_unexpected, stage_fn=_unexpected, exec_fn=_unexpected)
-    result, receipt = dispatcher.dispatch_batch("run_step", {}, [{}], local_runner=local)
-    assert result == "computed locally"
-    local.assert_called_once()
-    assert receipt.resolved_target == "local"
-    assert receipt.fallback_reason == "no_authorized_endpoint"
-
-
 @pytest.mark.parametrize("spoof", [{"host": "other.example.invalid"}, {"port": 2222}], ids=["host", "port"])
 def test_unattended_dispatch_requires_exact_endpoint_pin(endpoint_paths, spoof):
     home, cwd, _ = endpoint_paths
     endpoint = remote._endpoint(ENDPOINT)
-    _write_pin(home, endpoint)
-    _write_config(home / ".mindie/endpoints.json", {ALIAS: ENDPOINT})
+    _write_config(cwd / "endpoints.json", {ALIAS: ENDPOINT})
     probe = Mock(return_value=CAPACITY)
     dispatcher = remote.RemoteDispatcher(cwd=cwd, local_c11_ready_fn=lambda: False,
                                          probe_fn=probe, stage_fn=_unexpected, exec_fn=_unexpected)
+    receipt = dispatcher.resolve_target(1)
+    assert receipt.resolved_target == "local" and receipt.fallback_reason == "no_authorized_endpoint"
+    probe.assert_not_called()
+
+    _write_pin(home, endpoint)
+    _write_config(home / ".mindie/endpoints.json", {ALIAS: ENDPOINT})
     assert dispatcher.resolve_target(1).endpoint_id == endpoint.endpoint_id
     probe.reset_mock()
 
@@ -181,8 +195,7 @@ def test_unattended_dispatch_requires_exact_endpoint_pin(endpoint_paths, spoof):
     assert remote._endpoint(replacement).endpoint_id != endpoint.endpoint_id
     _write_config(cwd / "endpoints.json", {ALIAS: replacement})
     result, receipt = dispatcher.dispatch_batch("run_step", {}, [{}], local_runner=lambda _: "local")
-    assert result == "local"
-    assert receipt.resolved_target == "local"
+    assert result == "local" and receipt.resolved_target == "local"
     assert receipt.endpoint_id is None
     probe.assert_not_called()
 
@@ -429,9 +442,7 @@ def test_batch_parity_preserves_order_counts_and_predicted_spans(
     for candidate_id, context in contexts.items():
         step = StepRequest(phase="decode", context=context)
         request = LoweringRequest(step=step) if entrypoint == "run_step" else step
-        candidates.append(dict(
-            candidate_id=candidate_id, objective_key=int(candidate_id == "beta"), request=request,
-        ))
+        candidates.append(dict(candidate_id=candidate_id, objective_key=int(candidate_id == "beta"), request=request))
 
     def stage_fn(endpoint, request_id, policy):
         stage, digest = _stage(bundle_source, cache, request_id, policy.cache_quota_bytes)
@@ -460,19 +471,15 @@ def test_batch_parity_preserves_order_counts_and_predicted_spans(
     native.assert_called_once_with(stage)
     assert not list((stage / "leases").iterdir())
     expected_order = [(0, "alpha"), (0, "zeta"), (1, "beta")]
-    for result in (local_result, remote_result):
-        assert [(row["objective_key"], row["candidate_id"]) for row in result["results"]] == expected_order
-    for direct, routed_row in zip(local_result["results"], remote_result["results"], strict=True):
-        left, right = direct["result"], routed_row["result"]
-        context = contexts[direct["candidate_id"]]
-        pairs = [(left, right)] if entrypoint == "run_step" else [(left[tier], right[tier]) for tier in ("unmerge", "mainline", "should_achieve")]
-        for local_step, remote_step in pairs:
-            assert local_step["graph_id"] == remote_step["graph_id"] and local_step["request"]["context"] == remote_step["request"]["context"] == context
-            assert local_step["native_steps"] == remote_step["native_steps"] == 0
-            local_ops, remote_ops = local_step["operators"], remote_step["operators"]
-            assert len(local_ops) == len(remote_ops) > 0 and len(local_step["pipelines"]) == len(remote_step["pipelines"])
-            assert all([op["ordinal"] for op in ops] == list(range(len(ops))) for ops in (local_ops, remote_ops))
-            assert local_step["span_ms"] > 0 and abs(local_step["span_ms"] - remote_step["span_ms"]) <= 1e-12
+    assert local_result["results"] == remote_result["results"]
+    assert [(row["objective_key"], row["candidate_id"]) for row in local_result["results"]] == expected_order
+    for row in local_result["results"]:
+        result = row["result"]
+        steps = (result,) if entrypoint == "run_step" else (result[tier] for tier in ("unmerge", "mainline", "should_achieve"))
+        for step in steps:
+            assert step["request"]["context"] == contexts[row["candidate_id"]]
+            assert step["native_steps"] == 0 and step["span_ms"] > 0 and step["operators"]
+            assert [op["ordinal"] for op in step["operators"]] == list(range(len(step["operators"])))
 
 
 @pytest.mark.tier1
@@ -564,10 +571,7 @@ def test_timeout_preserved_remaining_deadline_sent_and_c11_rebuilds_on_miss(endp
 @POSIX_ONLY
 @pytest.mark.tier1
 def test_multiworker_staged_c11_matches_python_with_positive_native_steps(endpoint_paths, tmp_path, monkeypatch):
-    from dataclasses import replace
     from _support.hardware import MODEL, WORKLOAD
-    from mindie_sim.prediction.results import ReplayOptions
-    from mindie_sim.prediction.spine import default_spine
     from mindie_sim.schema.case import Case
     from mindie_sim.stack_registry import RankOps
     _, cwd, _ = endpoint_paths

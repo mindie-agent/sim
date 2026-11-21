@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from fractions import Fraction
 from types import SimpleNamespace
 
@@ -19,11 +19,9 @@ from mindie_sim.prediction.mechanism import Work
 from mindie_sim.prediction.program.binding import RecipeContext
 from mindie_sim.prediction.program.stages import KernelProgram, Stage
 from mindie_sim.prediction.runtime.memory_physics import (
-    AddressRun, AddressRunPlan, AdmissionMemoryView, BoundAccess, BurstTurnRule, HbmBusSpec,
+    AddressRun, AddressRunPlan, AdmissionMemoryView, BurstTurnRule, HbmBusSpec,
     MemoryAccessPattern, ReuseKey, SectorCoverage, VisibilityContract, bind_memory_access,
-    _intersect_byte_intervals, _merge_byte_intervals, _subtract_byte_intervals,
 )
-from mindie_sim.prediction.runtime.l2_residency import _dram_service_segments
 from mindie_sim.prediction.runtime.ring_buffer import RingBuffer, lower_generation
 from mindie_sim.prediction.runtime.tile_solver import (
     AIC_POOLS, LiveBufferSpec, TileCandidate, TilePipelineSpec, TileShape, solve,
@@ -34,9 +32,11 @@ from mindie_sim.schema.hardware import NATIVE_WORK_UNITS
 
 from .contracts import (
     EdgeRouteBinding, FuseRegionSpec, FusedRegionSummary, SemanticWorkItem,
-    TemplateLoweringResult, TensorRangeObligation, _external_reads, _record_produced,
-    _region_order, _topological, _union_obligations, ceil_div,
+    TemplateLoweringResult, TensorRangeObligation, _external_reads, _logical_obligation, _obligation_runs,
+    _record_produced, _region_order, _run_end, _split_entry_residency, _topological,
+    _union_obligations, ceil_div,
 )
+from .fuse_region_live import _BoundTemplateProgram, _LiveAccess, _ReuseLifetimes, _rational_service
 
 _VECTOR_PIPES = {"vector", "vec_alu", "vec_sfu", "vec_reduce", "aiv_simt", "sort_topk"}
 _AIC_RESOURCES = {"cube", "fixpipe", "mte2_aic", "mte1"}
@@ -88,142 +88,6 @@ def ordered_stages(stages: Sequence[Stage]) -> tuple[Stage, ...]:
 
 def ring_credit(ring, generation):
     return ring.initial_credit(ring.slot(generation)) if generation < ring.depth else ring.last_use(generation - ring.depth)
-
-
-class _ReuseLifetimes:
-    """Pin each allocation to its producer key through its final access."""
-
-    def __init__(self, state, patterns):
-        self.state = state
-        self.pending = Counter(p.reuse_key for p in patterns if p.reuse_key is not None)
-        self.keys: dict[ReuseKey, tuple[ReuseKey, bool]] = {}
-
-    def resolve(self, pattern):
-        key = pattern.reuse_key
-        if key is None:
-            return pattern
-        if key not in self.keys:
-            resolved = self.state.resolve_reuse_key(key)
-            self.keys[key] = resolved, self.state.retain_template_key(resolved)
-        return replace(pattern, reuse_key=self.keys[key][0])
-
-    def complete(self, key):
-        if key is not None:
-            self.pending[key] -= 1
-            if not self.pending[key]:
-                resolved, owned = self.keys.pop(key)
-                if owned:
-                    self.state.release_template_key(resolved)
-
-    def close(self):
-        for resolved, owned in self.keys.values():
-            if owned:
-                self.state.release_template_key(resolved)
-        self.keys.clear()
-
-
-@dataclass(frozen=True)
-class _BoundTemplateProgram(KernelProgram):
-    """Declare directional admission rows before submitting the bound DAG."""
-
-    hbm_bus: HbmBusSpec | None = None
-    live_state: AdmissionMemoryView | None = None
-    l2_reservation: tuple[int, int, int] | None = None
-    summary: FusedRegionSummary | None = None
-
-    def start(self, engine, name, ready, *, owner=""):
-        bus = self.hbm_bus
-        if bus is not None:
-            present = (bus.row_r in engine.resources, bus.row_w in engine.resources)
-            if not any(present):
-                engine.add_hbm_bus(bus)
-            elif not all(present):
-                raise ModelingError("template_directional_hbm_rows_incomplete")
-        if self.live_state is None:
-            return super().start(engine, name, ready, owner=owner)
-        delivered = Counter()
-        lifetimes = _ReuseLifetimes(self.live_state, (
-            stage.program.pattern for stage in self.stages if isinstance(stage.program, _LiveAccess)
-        ))
-        stages = tuple(replace(stage, program=replace(stage.program, delivered=delivered, lifetimes=lifetimes))
-                       if isinstance(stage.program, _LiveAccess) else stage for stage in self.stages)
-        state, key = self.live_state, name + ":l2_reservation"
-        reservation = self.l2_reservation
-        if reservation is not None:
-            die, reserved, capacity = reservation
-
-            def grant(_event):
-                if state.reserved_bytes(die) + reserved > capacity:
-                    raise ModelingError("fuse_region_live_l2_reservation_overflow")
-                state.grant_reservation(die, key, reserved)
-
-            ready = engine.submit(key, after=(ready,), owner=owner, on_start=grant)
-        invocation = KernelProgram(stages)
-        done = invocation.start(engine, name, ready, owner=owner)
-        # Scoped observers are unique to this invocation and cannot reuse a compiled plan.
-        engine._compiled_programs.pop(id(invocation), None)
-
-        def finalize(_event):
-            lifetimes.close()
-            if reservation is not None:
-                state.release_reservation(die, key)
-            self.summary._record_delivery(delivered)
-
-        engine.on_complete(done, finalize)
-        return done
-
-
-@dataclass(frozen=True, slots=True)
-class _LiveAccess:
-    bound: BoundAccess
-    state: AdmissionMemoryView
-    pattern: MemoryAccessPattern
-    delivered: Counter | None = None
-    lifetimes: _ReuseLifetimes | None = None
-
-    def start(self, engine, name, ready, *, owner=""):
-        done = engine.future(name + ":delivered")
-
-        def admit(event):
-            bus, hit, miss, l2, copy_row, l2_row, rules, nominal = self.bound.bind_config
-            pattern = self.lifetimes.resolve(self.pattern)
-            plan = pattern.runs
-            resident = self.state.resident_coverage_for(pattern, plan.aligned_copy_bytes())
-            bound = bind_memory_access(
-                pattern, self.state, hbm_bus=bus, copy_hit_bytes_per_ms=hit, copy_miss_bytes_per_ms=miss,
-                l2_bytes_per_ms=l2, pipe_row_id=copy_row, l2_row_id=l2_row, burst_rules=rules,
-                nominal_pipe_bytes_per_ms=nominal, commit=True,
-            )
-            access = engine.submit_bound_access(name, bound, after=(event,), owner=owner)
-            dirty = sum(item.bytes for item in self.state.drain_writebacks(bus.die))
-            if dirty:
-                work = {term.row_id: term.ms_per_progress for term in bus.terms_for("write", dirty)
-                        if term.ms_per_progress}
-                access = engine.submit(name + ":dirty_writeback", work, after=(access,), owner=owner,
-                                       coupled=True, deliveries=((bus.ctr_w, dirty),))
-
-            def record(_event):
-                if self.delivered is not None:
-                    ledger = bound.ledger
-                    self.delivered.update({
-                        "logical_transfer_bytes": ledger.logical_tensor_bytes,
-                        "issued_copy_bytes": ledger.aligned_transfer_bytes,
-                        "dram_sector_bytes": ledger.dram_sector_bytes + dirty,
-                        "turnaround_service_bytes": dirty + (
-                            _rational_service(plan, resident if ledger.l2_hit_bytes else SectorCoverage(), rules)
-                            if ledger.dram_sector_bytes else 0
-                        ),
-                        "realized_l2_hit_bytes": ledger.l2_hit_bytes,
-                        "realized_l2_miss_bytes": ledger.dram_miss_copy_bytes,
-                        "realized_hbm_bytes": ledger.dram_bus_transaction_bytes + dirty,
-                    })
-                self.lifetimes.complete(self.pattern.reuse_key)
-                engine.resolve(done)
-
-            engine.on_complete(access, record)
-
-        engine.on_complete(ready, admit)
-        return done
 
 
 class Lowering:
@@ -356,7 +220,9 @@ class Lowering:
                     if term.ms_per_progress}
         else:
             work = {"hbm": amount}
-        return (self.add(Stage(f"{name}:dirty_writeback", work, after=after, coupled=len(work) > 1)),)
+        deliveries = ((self.hbm_bus.ctr_w, amount),) if self.hbm_bus is not None else ()
+        return (self.add(Stage(f"{name}:dirty_writeback", work, after=after, coupled=len(work) > 1,
+                               deliveries=deliveries)),)
 
     def access(
         self, name, tensor, amount, *, direction="read", pipe="mte2_aiv",
@@ -380,8 +246,7 @@ class Lowering:
             working_set, visibility,
         )
         self.accesses[name] = pattern
-        if not private and obligation and (ranges := _exact_sector_intervals(plan)):
-            entry = TensorRangeObligation(self.die, tensor, version, ranges, "hbm_cold", visibility.scope)
+        if not private and obligation and (entry := _logical_obligation(pattern)):
             if direction == "read":
                 if key is not None:
                     pattern = replace(pattern, reuse_key=self.state.resolve_reuse_key(key))
@@ -441,40 +306,6 @@ class Lowering:
             if self.hbm_bus is not None else KernelProgram(stages)
         )
         return TemplateLoweringResult(program, summary, len(stages))
-
-
-def _exact_sector_intervals(plan):
-    coverage = plan.sector_coverage()
-    if not coverage.periodic:
-        return coverage.intervals
-    return _merge_byte_intervals((*coverage.intervals, *(
-        interval for run in coverage.periodic for interval in run._window_intervals(*run._bounds())
-    )))
-
-
-def _split_entry_residency(entry, resident: SectorCoverage):
-    warm = _intersect_byte_intervals(entry.ranges, resident.intervals)
-    cold = _subtract_byte_intervals(entry.ranges, warm)
-    if resident.periodic:
-        warm = _merge_byte_intervals((*warm, *(
-            interval for lo, hi in cold for run in resident.periodic for interval in run._window_intervals(lo, hi)
-        )))
-        cold = _subtract_byte_intervals(cold, warm)
-    if cold:
-        yield replace(entry, ranges=cold)
-    if warm:
-        yield replace(entry, ranges=warm, initial_residency="l2_warm")
-
-
-def _rational_service(plan, resident: SectorCoverage, rules):
-    service = Fraction()
-    for sectors, width, stride in _dram_service_segments(plan, resident):
-        service += sectors
-        if width:
-            penalty = sum((Fraction(str(rule.penalty_bytes)) for rule in rules
-                           if rule.matches(width, stride)), Fraction())
-            service += sectors * penalty / width
-    return service
 
 
 def _route_edge(datapath, edge, owners, tile, explicit_bytes):
@@ -784,16 +615,37 @@ def _bind_declared_work(plan, stage, semantic):
 def _obligation_access(plan, scope, op, index, entry, tile, tiles, direction, after):
     if entry.die != plan.die:
         raise ModelingError(f"fuse_region_cross_die_access_requires_collective:{entry.allocation_id}")
-    runs = []
-    for low, high in entry.ranges:
-        start = low + (high - low) * tile // tiles
-        end = low + (high - low) * (tile + 1) // tiles
-        if end > start:
-            runs.append(AddressRun(start, 1, end - start, end - start))
+    runs = tuple(segment for run in _obligation_runs(entry) for segment in _tile_address_run(run, tile, tiles))
     return plan.access(
-        f"{scope}:{op}:{direction}:{index}", entry.allocation_id, sum(run.row_bytes for run in runs),
+        f"{scope}:{op}:{direction}:{index}", entry.allocation_id, sum(run.rows * run.row_bytes for run in runs),
         direction=direction, pipe="mte2_aiv" if direction == "read" else "mte3",
         after=after, runs=runs, version=entry.tensor_version,
         private=entry.required_final_visibility in {"owner", "die"} and direction == "write",
         obligation=False,
     )
+
+
+def _tile_address_run(run, tile, tiles):
+    """Partition unpadded row payload into tiles, retaining all interior rows."""
+    width, stride = run.row_bytes, run.stride_bytes
+    if stride <= width:
+        width = stride = _run_end(run) - run.base_byte
+        rows = 1
+    else:
+        rows = run.rows
+    start = rows * width * tile // tiles
+    stop = rows * width * (tile + 1) // tiles
+    if stop <= start:
+        return
+    first, skip = divmod(start, width)
+    if skip:
+        size = min(width - skip, stop - start)
+        yield AddressRun(run.base_byte + first * stride + skip, 1, size, size)
+        first += 1
+        if start + size == stop:
+            return
+    last, tail = divmod(stop, width)
+    if last > first:
+        yield AddressRun(run.base_byte + first * stride, last - first, width, stride)
+    if tail:
+        yield AddressRun(run.base_byte + last * stride, 1, tail, tail)

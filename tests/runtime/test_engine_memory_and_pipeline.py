@@ -19,10 +19,14 @@ from __future__ import annotations
 
 import ctypes
 import math
+from dataclasses import replace
+from fractions import Fraction
 from types import SimpleNamespace
 
 import pytest
 
+from _support.axes import REPRESENTATIVE_SKUS
+from _support.linear_cases import template_context, template_datapath
 from mindie_sim.prediction.coupled import coupled_rates
 from mindie_sim.prediction.engine import Engine, OccurrenceKey, Resource
 from mindie_sim.prediction.ownership import unit_rates
@@ -49,13 +53,12 @@ from mindie_sim.prediction.runtime.tile_solver import (
 )
 from mindie_sim.prediction.runtime.wave_recorder import RecordedPipelineSpec, WaveRecorder
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.templates.fuse_region import Lowering
 
 pytestmark = pytest.mark.tier0
 
-
 def _ulp_distance(a: float, b: float) -> int:
     return 0 if a == b else int(round(abs(a - b) / max(math.ulp(a), math.ulp(b))))
-
 
 def _make_context(*, alpha_rw: float = 0.25) -> RecipeContext:
     res_names = {k: f"{k}@d0" for k in ("hbm", "mte2_aic", "mte2_aiv", "mte3", "l2", "vec_issue", "vec_alu", "vec_sfu", "vec_reduce")}
@@ -68,7 +71,6 @@ def _make_context(*, alpha_rw: float = 0.25) -> RecipeContext:
         rates=rates, core_count=20, physical_mechanisms=SimpleNamespace(hbm_alpha_rw=alpha_rw),
         compute_arch=SimpleNamespace(clock_hz=1_000_000_000.0),
     )
-
 
 @pytest.mark.parametrize("backend", ["python", "c"])
 @pytest.mark.parametrize("hbm_work,cube_work", [(1.0, 10.0), (10.0, 1.0)])
@@ -86,7 +88,6 @@ def test_widened_cohort_asymmetric_split_matches_unmerged_across_backends(backen
     t_u, s_u, steps_u = run(False)
     assert abs(t_m - t_u) <= 1e-9 and s_m == pytest.approx(s_u, rel=1e-12, abs=1e-9)
     assert backend != "c" or (steps_m > 0 and steps_u > 0)
-
 
 @pytest.mark.parametrize("backend", ["python", "c"])
 def test_shared_multiunit_and_fifo_cohorts_preserve_semantics(backend: str):
@@ -124,7 +125,6 @@ def test_shared_multiunit_and_fifo_cohorts_preserve_semantics(backend: str):
 
     assert run_fifo(True) == pytest.approx(13.0, abs=1e-9) and run_fifo(False) == pytest.approx(13.0, abs=1e-9)
 
-
 @pytest.mark.parametrize("backend", ["python", "c"])
 def test_midflight_asymmetric_split_runs_native_until_interference_and_publishes_once(backend: str):
     """Mid-flight peer or dependency-woken cohort splits at activation and completes once."""
@@ -155,7 +155,6 @@ def test_midflight_asymmetric_split_runs_native_until_interference_and_publishes
     assert float(ph.time) == pytest.approx(17.0 / 14.0, abs=1e-12)
     assert backend != "c" or e_sym.accel_status()["native_steps"] > 0
 
-
 def test_over_64_link_widening_and_proportional_native_admission():
     """Per-link C widening supports >64 links; skewed coupled placements decline native."""
     n_res = 70
@@ -175,7 +174,6 @@ def test_over_64_link_widening_and_proportional_native_admission():
     assert not pure_task(skew_eng, skew_eng._tasks[skew_ev.sequence])
     skew_eng.advance(until=(skew_ev,))
     assert skew_eng.accel_status()["native_steps"] == 0
-
 
 def test_coupled_and_disjoint_uncoupled_parity_zero_ulp_and_peer_invariance():
     """3-task coupled reaches 0 ULP; disjoint coupled peer never alters uncoupled times."""
@@ -207,7 +205,6 @@ def test_coupled_and_disjoint_uncoupled_parity_zero_ulp_and_peer_invariance():
     ur = unit_rates(245.76, 20, {0: math.inf, 1: math.inf}, {0: (10, 15, 17), 1: (0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18, 19)})
     assert ur[0] == pytest.approx(ur[1], rel=1e-15)
 
-
 def test_fast_single_tier_coupled_matches_coupled_rates_on_widened_cohort():
     """Both Python coupled arbiters agree identically on widened cohorts."""
     eng = Engine([Resource("cube", 20.0, units=20), Resource("hbm", 1.0, units=1)], backend="python")
@@ -220,7 +217,6 @@ def test_fast_single_tier_coupled_matches_coupled_rates_on_widened_cohort():
     for rname in ("cube", "hbm"):
         for seq in (1, 2):
             assert r_fast[rname][seq] == pytest.approx(r_ref[rname][seq], rel=1e-12)
-
 
 @pytest.mark.parametrize("backend", ["python", "c"])
 def test_bound_memory_access_through_engine_single_bw_divide_owner_pin_and_deliveries(backend: str):
@@ -264,7 +260,6 @@ def test_bound_memory_access_through_engine_single_bw_divide_owner_pin_and_deliv
     ev3 = merge_programs([k0, k1]).start(eng3, "op", eng3.submit("go"))
     eng3.advance(until=(ev3,))
     assert eng3.delivered["hbm_read@d0"] == pytest.approx(256.0, rel=1e-12)
-
 
 def test_three_ledger_sector_union_turnaround_and_l2_sector_residency_rules():
     """Verify 3-ledger math, strided sector gaps, L2 capacity eviction, admission rebind & burst."""
@@ -322,7 +317,6 @@ def test_three_ledger_sector_union_turnaround_and_l2_sector_residency_rules():
     view.release_reservation(0, "pin")
     assert not view.is_resident(k_other)
 
-
 @pytest.mark.parametrize("alpha_rw", [0.0, 0.25, 0.5])
 @pytest.mark.parametrize("backend", ["python", "c"])
 def test_hbm_two_row_directional_bus_laws_python_and_c(alpha_rw: float, backend: str):
@@ -350,7 +344,6 @@ def test_hbm_two_row_directional_bus_laws_python_and_c(alpha_rw: float, backend:
     assert run_case("solo_r") == pytest.approx(t_r, rel=1e-12) and run_case("solo_w") == pytest.approx(t_w, rel=1e-12)
     assert run_case("serial") == pytest.approx(t_r + t_v + t_w, rel=1e-12)
     assert run_case("concurrent") == pytest.approx(max(t_r, t_w) + alpha_rw * min(t_r, t_w), rel=1e-12)
-
 
 def test_prepared_terms_c11_parity_row_invalidation_and_access_validation():
     """C11 prepared-terms solver matches Python <=8 ULP and invalidates stale terms on row shrink."""
@@ -398,7 +391,6 @@ def test_prepared_terms_c11_parity_row_invalidation_and_access_validation():
         buf = (ctypes.c_double * 4)()
         assert int(runner.library.msim_allocate_epoch(runner.ctx, buf, 4)) != 0
 
-
 def test_vector_subpipes_target_eff_and_raw_latency_anchor_parity():
     """RAW visibility timer anchors to last instruction issue so DAG span == bound span."""
     ctx = _make_context()
@@ -431,7 +423,6 @@ def test_vector_subpipes_target_eff_and_raw_latency_anchor_parity():
     eng2.advance(until=(done2,))
     assert float(done2.time) == pytest.approx(8.0, abs=1e-12)
 
-
 def test_ring_buffer_distance_d_credit_and_abi_v3_wire_roundtrip():
     """RingBuffer distance-d credits, ABI version >2 layout probe, and C11 ring round-trip."""
     ring = RingBuffer(occurrence=7, die=0, owner=1, pool="l1", allocation="kv_ring", slot_bytes=4096, depth=2)
@@ -447,7 +438,6 @@ def test_ring_buffer_distance_d_credit_and_abi_v3_wire_roundtrip():
     done = KernelProgram(ring.to_stages()).start(eng, "ring_op", eng.submit("ready"))
     eng.advance(until=(done,))
     assert float(done.time) >= 6.0 - 1e-12
-
 
 def test_tile_solver_owner_kind_scaling_zero_item_flops_and_ladder_order():
     """TileSolver scales L2 by buffer owner_kind, emits 0 FLOPs for 0 items, ranks by ladder."""
@@ -470,7 +460,6 @@ def test_tile_solver_owner_kind_scaling_zero_item_flops_and_ladder_order():
     assert sol.algorithm == "online_reduce" and sol.waves == 3 and sol.rejections[0].algorithm == "resident_1pass"
     empty_c = TileCandidate("resident_1pass", TileShape(0, 64, 64), 1, (1, 1), 0, 0, (), logical_flops=0, instruction_block=(16, 16, 16))
     assert solve_tiles(TilePipelineSpec("empty", (empty_c,)), None, hw_ok).issued_flops == 0
-
 
 @pytest.mark.parametrize("backend", ["python", "c"])
 def test_wave_recorder_invariance_unsorted_half_ns_and_oversized_obs(backend: str):
@@ -511,7 +500,6 @@ def test_wave_recorder_invariance_unsorted_half_ns_and_oversized_obs(backend: st
     e_s.advance(until=(e_s.submit("c", {"vector": 0.5}, after=(e_s.submit("p", {"cube": 1.0}),)),))
     assert [r for r in r_s.finish(spec, "s").timeline.pipe_rows if r.pipe_name == "vector"][0].handoff_ns == 1_000_000
 
-
 def test_wave_recorder_staggered_periodic_and_distinct_slot_generations():
     """Periodic overlap avoids boundary double-count, fractional-ns rounds cleanly, occurrence filters."""
     spec = RecordedPipelineSpec("1", "s1", "sig", "fused", "rec", "abi")
@@ -550,9 +538,8 @@ def test_wave_recorder_staggered_periodic_and_distinct_slot_generations():
     assert len(res_list) == 2 and {(r.slot, r.generation) for r in res_list} == {(0, 0), (0, 1)}
     assert rec_a._admitted[e1.sequence][4] == ("buf1",)
 
-
 def test_program_facade_reexports_and_stage_builtin_metadata_guards():
-    """Program package exports facade symbols and preserves builtin + int-tuple Stage.metadata."""
+    """Program package exports facade symbols and preserves scalar Stage.metadata."""
     assert hasattr(prog_pkg, "__path__")
     for name in (
         "Allocation", "DirtyWriteback", "Engine", "Event", "GENERIC_MATRIX_PROGRAM",
@@ -570,19 +557,44 @@ def test_program_facade_reexports_and_stage_builtin_metadata_guards():
     ):
         assert hasattr(prog_pkg, name) and name in prog_pkg.__all__
 
-    st = Stage("meta_ok", work={"r": 1.0}, metadata={"tag": "x", "k": 2, "flag": True, "ids": (1, 2)})
-    assert dict(st.metadata) == {"tag": "x", "k": 2, "flag": True, "ids": (1, 2)}
+    st = Stage("meta_ok", work={"r": 1.0}, metadata={"tag": "x", "k": 2, "flag": True, "scale": 0.5})
+    assert dict(st.metadata) == {"tag": "x", "k": 2, "flag": True, "scale": 0.5}
     kp_tag = KernelProgram((Stage("acq", acquire=(Allocation("b", "l1", 64.0, (0,)),), metadata={"stage_id": 7}),
                             Stage("wk", {"r": 1.0}, after=("acq",), free=(Allocation("b", "l1", 64.0, (0,)),))))
     assert any(s.metadata.get("stage_id") == 7 for s in coalesce_execution_program(kp_tag).stages)
     eng = Engine([Resource("r", 1.0)], backend="python", trace_limit=8)
     ev = KernelProgram((st,)).start(eng, "op", eng.submit("go"))
     eng.advance(until=(ev,))
-    assert any(row["metadata"].get("ids") == (1, 2) for row in eng.trace)
-
-    with pytest.raises(ModelingError, match="stage_metadata_invalid"):
-        Stage("bad_occ", metadata={"occurrence": 1})
-    with pytest.raises(ModelingError, match="stage_metadata_invalid"):
-        Stage("bad_val", metadata={"nested": [1, 2]})
+    assert any(row["metadata"].get("scale") == 0.5 for row in eng.trace)
+    invalid = ({"occurrence": 1}, *({"nested": v} for v in ((1, 2), b"bytes", None, [1, 2], Fraction(1, 8))))
+    for metadata in invalid:
+        with pytest.raises(ModelingError, match="stage_metadata_invalid"):
+            Stage("bad_metadata", metadata=metadata)
     with pytest.raises(ModelingError, match="stage_cohort_widened_invalid"):
         Stage("bad_w", cohort_widened=(123,))  # type: ignore[arg-type]
+
+@pytest.mark.parametrize("live", (False, True))
+def test_template_l2_fill_visibility_and_dirty_writeback_delivery(live):
+    sector, capacity = AddressRunPlan().sector_bytes, 1024
+    dp = replace(template_datapath(REPRESENTATIVE_SKUS["a5"]), hbm_read_bytes_per_s=sector * 1000)
+    context = template_context(dp, None, mte2_aiv=sector / 0.002 * dp.aiv_count, l2=sector / 0.002)
+    view = AdmissionMemoryView({0: capacity}, granule_bytes=sector)
+    scratch = MemoryAccessPattern("scratch", 0, 0, 0, "write", "mte3", capacity,
+                                  AddressRunPlan((AddressRun(0, 1, capacity, capacity),)),
+                                  ReuseKey(0, "scratch", 0, "scratch"), visibility=VisibilityContract(private_workspace=True))
+    assert view.admit_access(scratch, capacity) == (capacity, 0)
+    plan = Lowering(dp, context=context, memory_view=view, live_admission=live)
+    plan.access("first", "shared", sector)
+    plan.access("second", "shared", sector)
+    result = plan.result("K3", "readers", (), None, (), SimpleNamespace(pool_peaks=()))
+    resources = [Resource(name, rate, units=context.resource_units[name]) for name, rate in context.rates.items()]
+    engine = Engine(resources, backend="python", trace_limit=32)
+    done = result.program.start(engine, "readers", engine.submit("arrived", release=1.0))
+    engine.advance(until=(done,))
+    if live:
+        trace = {row["task"]: row for row in engine.trace}
+        first, second = (trace[f"readers:{reader}:program"] for reader in ("first", "second"))
+        assert (first["start_ms"], first["end_ms"]) == pytest.approx((1, 2))
+        assert second["start_ms"] >= first["end_ms"] and second["end_ms"] == pytest.approx(2.002)
+    assert result.l2_hit_bytes == engine.delivered["l2"] == engine.delivered["hbm:ctr_r"] == sector
+    assert (engine.delivered["hbm:ctr_w"], result.summary.dram_sector_bytes) == (pytest.approx(capacity), sector + capacity)

@@ -79,6 +79,7 @@ STATIC_TRACKED_FILES = (
 TRACKED_OPERATOR_PACKAGES = (
     Path("mindie_sim") / "prediction" / "operators" / "attention",
     Path("mindie_sim") / "prediction" / "operators" / "hyper_connections",
+    Path("mindie_sim") / "prediction" / "operators" / "linear_attention",
     Path("mindie_sim") / "prediction" / "operators" / "mla_prolog",
     Path("mindie_sim") / "prediction" / "operators" / "sparse_indexer",
 )

@@ -10,11 +10,14 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from fractions import Fraction
-from typing import Literal, Protocol
+from typing import Protocol
 
-from mindie_sim.prediction.runtime.memory_physics import AddressRun
-from mindie_sim.prediction.runtime.tile_solver import AlgorithmKind, TileSolution
-from mindie_sim.schema.datapath import SourceRef
+from mindie_sim.primitives.schema import PrimitiveTable
+from mindie_sim.schema.datapath import DatapathCapabilitySpec
+from mindie_sim.templates.contracts import (
+    CatlassKernelSpec, DslKernelSpec, EdgeRouteBinding, EvgVisitorNode, FusedRegionSummary,
+    FuseRegionSpec, SemanticWorkItem, TensorRangeObligation,
+)
 
 __all__ = (
     "TensorRangeObligation", "SemanticWorkItem", "EvgVisitorNode",
@@ -22,155 +25,6 @@ __all__ = (
     "FusedRegionSummary", "BilinearContractionSpec", "PrimitiveCapacityEntry",
     "PrimitiveCapacityTable", "UpperCapacityProvider", "normalize_capacity_per_second",
 )
-
-
-@dataclass(frozen=True, slots=True)
-class TensorRangeObligation:
-    die: int
-    allocation_id: str
-    tensor_version: int
-    ranges: tuple[tuple[int, int], ...]
-    initial_residency: Literal["hbm_cold", "l2_warm", "onchip_resident"]
-    required_final_visibility: Literal["owner", "die", "device", "host"]
-    address_runs: tuple[AddressRun, ...] = ()
-
-
-@dataclass(frozen=True, slots=True)
-class SemanticWorkItem:
-    work_id: str
-    kind: Literal["matrix_mac", "vector_alu", "vector_sfu", "vector_reduce", "sort_topk"]
-    dtype: str
-    logical_ops: int
-    admitted_engines: tuple[Literal["cube", "aiv_simd", "aiv_simt"], ...] = ("cube",)
-    admissible_schedulers: tuple[str, ...] = ("dataparallel",)
-    inline_epilogue_absorbable: bool = False
-    die: int = 0
-    replica: int = 0
-    pp_stage: int = 0
-
-
-@dataclass(frozen=True, slots=True)
-class EvgVisitorNode:
-    node_id: str
-    kind: Literal[
-        "acc_load", "aux_load", "row_broadcast", "col_broadcast",
-        "exp", "relu", "sqrt", "rsqrt_fast", "leaky_relu", "silu",
-        "cast", "mul", "muls", "add", "aux_store",
-    ]
-    dtype: str
-    layout: str = "RowMajor"
-    inputs: tuple[str, ...] = ()
-    aux_tensor_id: str | None = None
-    scalar_param: float | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class CatlassKernelSpec:
-    template_id: str
-    arch_tag: Literal["AtlasA2", "Ascend950"]
-    dispatch_policy: str
-    dtype_a: str
-    dtype_b: str
-    dtype_c: str
-    dtype_acc: str
-    layout_a: str
-    layout_b: str
-    layout_c: str
-    prologue_a: str | None
-    prologue_b: str | None
-    mx_scale_group: int
-    scale_layout: str | None
-    l1_scale_factor_k: int
-    l1_tile_shape: tuple[int, int, int]
-    l0_tile_shape: tuple[int, int, int]
-    stages: tuple[int, int, int, int, int]
-    has_bias: bool
-    enable_unit_flag: bool
-    enable_l1_resident: bool
-    scheduler: Literal["dataparallel", "streamk", "multi_core_splitk", "grouped_slice_m"]
-    splitk_factor: int
-    swizzle_offset: int
-    swizzle_direction: Literal["Zn", "Nz"]
-    l2_cache_hint_b: Literal["normal", "disable"]
-    epilogue_kind: Literal["none", "evg_gm", "evg_ub", "grouped_swiglu_mx_quant", "finalize_routing"]
-    evg_tree: tuple[EvgVisitorNode, ...]
-    workspace_bytes: int
-    simt_thread_block_dim: tuple[int, int, int] | None
-    aic_budget: int
-    aiv_budget: int
-    source_refs: tuple[SourceRef, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class DslKernelSpec:
-    kernel_id: str
-    execution_mode: Literal["cube_only", "vector_only", "mix_cube_vector"]
-    algorithm: AlgorithmKind
-    template_variant: str
-    tile_shape: tuple[int, ...]
-    ring_depths: tuple[tuple[str, str, int], ...]
-    direct_routes: tuple[tuple[str, str, str], ...]
-    l2_cache_policies: tuple[tuple[str, str], ...]
-    workspace_bytes_total: int
-    uses_aicpu_metadata: bool
-    has_eager_d2h_readback: bool
-    uses_simt: bool
-    aic_budget: int
-    aiv_budget: int
-    ub_peak_bytes: int
-    l1_peak_bytes: int
-    l0c_peak_bytes: int
-    source_refs: tuple[SourceRef, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class EdgeRouteBinding:
-    src_op: str
-    producer_version: int
-    view_id: str
-    dst_op: str
-    iter_kind: Literal["tile_pipelined", "chunk_carried", "full_barrier"]
-    route_kind: Literal["l0c->ub", "l0c->l1", "ub->l1", "ub->ub", "gm_spill"]
-    src_owner_axis: Literal["aic", "aiv"]
-    dst_owner_axis: Literal["aic", "aiv"]
-    representation: str
-    layout: str
-    ring_depth: int
-    in_place_mutates: bool = False
-
-
-@dataclass(frozen=True, slots=True)
-class FuseRegionSpec:
-    region_id: str
-    op_ids: tuple[str, ...]
-    live_in_obligations: tuple[TensorRangeObligation, ...]
-    live_out_obligations: tuple[TensorRangeObligation, ...]
-    edge_routes: tuple[EdgeRouteBinding, ...]
-    reduction_class: AlgorithmKind
-    tile_solution: TileSolution
-    backend: Literal["catlass_evg", "dsl_mix", "dsl_vec", "tla_simt"]
-
-
-@dataclass(frozen=True, slots=True)
-class FusedRegionSummary:
-    tier: Literal["K1", "K2", "K3"]
-    region_id: str
-    op_ids: tuple[str, ...]
-    semantic_work: tuple[SemanticWorkItem, ...]
-    issued_cube_flops_by_dtype: tuple[tuple[str, int], ...]
-    vector_ops_by_pipe: tuple[tuple[str, float], ...]
-    read_obligations: tuple[TensorRangeObligation, ...]
-    write_obligations: tuple[TensorRangeObligation, ...]
-    logical_transfer_bytes: int
-    issued_copy_bytes: int
-    dram_sector_bytes: int
-    turnaround_service_bytes: Fraction
-    realized_l2_hit_bytes: int
-    comm_wire_bytes_by_link: tuple[tuple[str, int], ...]
-    stars_launch_count: int
-    aicpu_metadata_ms: Fraction
-    sram_peaks_bytes: tuple[tuple[str, int], ...]
-    spec: CatlassKernelSpec | DslKernelSpec | FuseRegionSpec | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -275,3 +129,56 @@ class PrimitiveCapacityTable:
     def upper_capacity_per_second(self, primitive_id: str) -> Fraction | None:
         return next((normalize_capacity_per_second(entry.certified_upper_capacity, entry.unit)
                      for entry in self.entries if entry.primitive_id == primitive_id), None)
+
+
+CapacityTable = PrimitiveTable | UpperCapacityProvider
+
+# Table rates are SI. Per-owner metrics must be aggregated over the physical die.
+_HARDWARE_RATE_METRICS = {
+    "hbm_bus_r": (("P01_datacopy", "hbm_read_bytes_per_s", None),),
+    "hbm_bus_w": (("P01_datacopy", "hbm_write_bytes_per_s", None),),
+    "mte2_total": (
+        ("P01_datacopy", "mte2_aic_hit_bytes_per_s_per_core", "aic_count"),
+        ("P01_datacopy", "mte2_aiv_hit_bytes_per_s_per_core", "aiv_count"),
+    ),
+    "write_total": (
+        ("P03_fixpipe", "fixpipe_out_bytes_per_s_per_aic", "aic_count"),
+        ("P04_mte3_store", "mte3_store_bytes_per_s_per_aiv", "aiv_count"),
+    ),
+    "l2_bw": (("P05_l2_residency_reuse", "l2_die_bytes_per_s", None),),
+    "cube": (("P06_mmad", "cube_only_rate", "aic_count"),),
+    "vector": (("P07_vec_alu", "vec_alu_ops_per_s_per_aiv", "aiv_count"),),
+    "simt": (("P11_simt", "simt_ops_per_s_per_aiv", "aiv_count"),),
+}
+_MMAD_MODES = {"bfloat16": "bf16", "float16": "fp16", "float32": "fp32",
+               "w4a8": "int8", "a8w4_mx": "mxfp8", "fp8": "fp8_e4m3"}
+
+
+def certified_capacity_per_second(
+    table: CapacityTable, pipe: str, dtype: str, path: DatapathCapabilitySpec | None,
+) -> Fraction | None:
+    if not isinstance(table, PrimitiveTable):
+        candidates = ([f"{pipe}:{dtype}"] if dtype else []) + [pipe]
+        if pipe == "hbm_bus_r":
+            candidates.append("P01_hbm_read")
+        for primitive in candidates:
+            capacity = _provider_capacity_per_second(table, primitive)
+            if capacity is not None:
+                return capacity
+        return None
+    if path is None or table.arch_preset != path.arch_id:
+        return None
+    metrics = _HARDWARE_RATE_METRICS.get(pipe)
+    if metrics is None:
+        return None
+    total = Fraction()
+    for primitive, metric, owners in metrics:
+        count = getattr(path, owners) if owners else 1
+        if not count:
+            continue
+        cell = table.cell(primitive)
+        mode = (dtype if dtype in cell.modes else _MMAD_MODES.get(dtype, dtype)) if pipe == "cube" else None
+        if (mode is not None and mode not in cell.modes) or cell.mode_status(mode) == "unsupported":
+            return None
+        total += Fraction(str(table.certified_upper_capacity(primitive, metric, mode=mode))) * count
+    return total if total > 0 else None

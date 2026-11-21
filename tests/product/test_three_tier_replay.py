@@ -39,6 +39,7 @@ from mindie_sim.rewrite import (
     CollectiveTransform, Edit, FuseRegion, KernelBoundary, OpRef, PortRef, ScenarioRequest,
     SelectTemplate, WeightPrefetch, evaluate_rewrites, finalize_plan, prepare_scenario,
 )
+from mindie_sim.primitives import load_primitives
 from mindie_sim.rewrite import oracle
 from mindie_sim.schema.hardware import Device
 from mindie_sim.schema.operators import OpSpec
@@ -464,3 +465,36 @@ def test_certified_hbm_capacity_prices_bytes_per_millisecond():
     assert certified.l_star_lean_ns <= engine_bound.l_star_lean_ns <= engine.now * NS_PER_MS
     ladder = api.optimize_ladder(case, StepRequest("decode", context=64), primitive_table=table).ladder
     assert 0 <= ladder.l_star_hw_ns <= ladder.l_star_lean_ns <= ladder.a_star_dsl_ns
+
+
+def test_ladder_certifies_shipped_primitive_capacities():
+    table = load_primitives("Ascend950DT_9582")
+    case = _case(table.sku, tp=1)
+    step = StepRequest("decode", context=64)
+    report = api.optimize_ladder(case, step, primitive_table=table, max_trials=0)
+    ladder = report.ladder
+    assert report.verification.passed
+    assert 0 < ladder.l_star_hw_ns <= ladder.l_star_lean_ns <= ladder.a_star_dsl_ns
+
+    dossier = prepare_scenario(ScenarioRequest(case, step))
+    result = finalize_plan(dossier.handle, report.dsl_plan, primitive_table=table,
+                           rate_mode="certified_upper_capacity")
+    assert result.verification.passed and result.verification.l_star_ns == ladder.l_star_hw_ns
+
+
+def test_certified_primitive_table_prices_directional_hbm_bytes():
+    table = load_primitives("Ascend950DT_9582")
+    machine = parse_case(_case(table.sku, tp=1)).machine
+    scenario = SimpleNamespace(machine=machine)
+    volume = 8_000_000
+    read = TensorRangeObligation(0, "input", 0, ((0, volume),), "hbm_cold", "owner")
+    write = TensorRangeObligation(0, "output", 1, ((0, volume // 2),), "onchip_resident", "device")
+    summary = SimpleNamespace(op_ids=(), semantic_work=(), read_obligations=(read,), write_obligations=(write,))
+    program, dag, names = build_dual_inputs_from_scenario(
+        scenario, region_summaries=(summary,), primitive_table=table, rate_mode="certified_upper_capacity",
+    )
+    assert dict(zip(names, program.global_work, strict=True)) == {
+        "hbm_bus_r@r0.p0.d0": 1997, "hbm_bus_w@r0.p0.d0": 997,
+    }
+    cert, _ = certify_lower_bound(program, dag)
+    assert cert.l_star_lean_ns == 1997

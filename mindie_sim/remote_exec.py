@@ -780,13 +780,13 @@ class RemoteDispatcher:
     def run_step(self, case: CaseInput, request: LoweringRequest, *, replay: ReplayOptions | None = None, deadline_s: float | None = None):
         return self.dispatch_batch("run_step", case, [{"request": request, "replay": replay or {}}], deadline_s=deadline_s)
     def evaluate_three_tiers(self, case: CaseInput, request: StepRequest, *, replay: ReplayOptions | None = None,
-                             target_eff: float | None = None, deadline_s: float | None = None):
-        opts = {} if target_eff is None else {"target_eff": target_eff}
-        return self.dispatch_batch("evaluate_three_tiers", case, [{"request": request, "replay": replay or {}, "options": opts}], deadline_s=deadline_s)
+                             deadline_s: float | None = None):
+        return self.dispatch_batch("evaluate_three_tiers", case, [{"request": request, "replay": replay or {}}], deadline_s=deadline_s)
     def solve_sla(self, case: CaseInput, request: SlaRequest, *, deadline_s: float | None = None):
         return self.dispatch_batch("solve_sla", case, [{"request": request}], deadline_s=deadline_s)
     def sweep_topology(self, case: CaseInput, request: SweepRequest, *, decode_case: CaseInput | None = None, deadline_s: float | None = None):
         from mindie_sim.schema.case import Case
         return self.dispatch_batch("sweep_topology", case, [{"request": request, "decode_case": decode_case.to_dict() if isinstance(decode_case, Case) else decode_case}], deadline_s=deadline_s)
     def optimize_ladder(self, case: CaseInput, candidates: Sequence[Mapping], *, local_runner=None, deadline_s=None):
+        """Dispatch candidates with a StepRequest, optional replay, and ladder options under `options`."""
         return self.dispatch_batch("optimize_ladder", case, candidates, local_runner=local_runner, deadline_s=deadline_s)

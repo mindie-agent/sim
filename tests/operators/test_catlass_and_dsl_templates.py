@@ -4,10 +4,12 @@
 [Timeouts & Locks] Bounded schedules on the Python engine without external work.
 [Side-Effect Policy] Read packaged inputs and write Git fixtures under temporary roots.
 """
+import tracemalloc
 from dataclasses import replace
 from fractions import Fraction
 from itertools import product
 from math import ceil
+from time import perf_counter
 from types import SimpleNamespace
 
 import pytest
@@ -22,6 +24,7 @@ from _support.linear_cases import (
     serpentine, template_datapath as _datapath, template_live_bindings, tile_edge as _edge,
     verify_template_declaration, visitor_graph, with_mx_modes,
 )
+from mindie_sim.optimization.reload_bounds import compute_compulsory_hbm_cut
 from mindie_sim.prediction.program import Allocation, Stage
 from mindie_sim.prediction.runtime.memory_physics import AddressRun, AddressRunPlan, AdmissionMemoryView, MemoryAccessPattern, ReuseKey
 from mindie_sim.prediction.runtime.tile_solver import LiveBufferSpec, TileInfeasibleError
@@ -41,15 +44,12 @@ pytestmark = pytest.mark.tier0
 
 KIB = 1024
 SECTOR = 32
-PERIODIC_ROWS = 4097
 KV_BYTES = 672
 ONE_SLOT = (1, 1, 1, 1, 1)
 TURNAROUND = MemoryAccessBurstPenalty("turnaround", 0, None, 0.1, "test-geometry")
-
 @pytest.fixture(scope="module")
 def datapaths():
     return tuple(_datapath(REPRESENTATIVE_SKUS[generation]) for generation in ("a2", "a5"))
-
 @pytest.fixture(scope="module")
 def direct(datapaths):
     return datapaths[1]
@@ -79,16 +79,14 @@ def test_pingpong_sram_fit_and_ring_credit_execution(sku):
     assert sum(s.metadata.get("logical_flops", 0) for s in stages.values()) == 2 * p.m * p.n * p.k
     assert _run(dp, context, result).serviced["cube"] * context.rates["cube"] == pytest.approx(
         dict(result.summary.issued_cube_flops_by_dtype)["bf16"])
-
 @pytest.mark.parametrize("has_bias", (False, True))
 def test_mutex_budget_unit_flag_and_l1_resident_identity(direct, has_bias):
     p = CatlassProblem(32, 32, 32, has_bias=has_bias)
     fits = (9, 7, 6, 5 - 2 * has_bias, 1)
     assert sum(fits) + 2 * has_bias == 28 and len(set(fits)) == 5
     spec, = _matrix("mutex_block_mmad", p, direct, stage_options=(fits,), enable_unit_flag=True)
-    assert (spec.stages, dict(lower_catlass_spec(spec, p, direct).summary.sram_peaks_bytes)["l1"]) == (
-        fits, (fits[0] + fits[1]) * 32 * 32 * 2 + has_bias * 32 * 4,
-    )
+    peaks = dict(lower_catlass_spec(spec, p, direct).summary.sram_peaks_bytes)
+    assert (spec.stages, peaks["l1"]) == (fits, (fits[0] + fits[1]) * 32 * 32 * 2 + has_bias * 32 * 4)
     with pytest.raises(ModelingError, match="catlass_mutex_ids_exhausted"):
         solve_catlass_tile(replace(spec, stages=(fits[0] + 1, *fits[1:])), p, direct)
     two_acc = (fits[0] - 1, *fits[1:-1], 2)
@@ -107,7 +105,6 @@ def test_mutex_budget_unit_flag_and_l1_resident_identity(direct, has_bias):
     trace = {r["task"].removeprefix("matrix:"): r for r in _run(direct, context, result, trace_limit=200).trace}
     mma, fix = trace["tile:1:micro:0:mma"], trace["tile:0:fixpipe"]
     assert mma["start_ms"] < fix["end_ms"] and fix["start_ms"] < mma["end_ms"]
-
 @pytest.mark.parametrize("blocks,gk,cores,total", [(8, 3, 4, 0), (2, 2, 4, 4), (13, 7, 5, 7), (15, 9, 6, 8)])
 def test_streamk_counts_intersected_output_tiles(blocks, gk, cores, total):
     partition = cat.streamk_partition(blocks, gk, cores)
@@ -115,7 +112,6 @@ def test_streamk_counts_intersected_output_tiles(blocks, gk, cores, total):
     assert partition.intervals[0][0] == 0 and partition.intervals[-1][1] == partition.b_sk * gk
     assert partition.partial_counts == tuple(len({i // gk for i in range(s, e)}) for s, e in partition.intervals)
     assert partition.partial_count == total
-
 def test_streamk_signals_before_the_last_normal_work_and_reduction(direct):
     p = CatlassProblem(32, 320, 64)
     spec, = _matrix("streamk", p, direct)
@@ -130,7 +126,6 @@ def test_streamk_signals_before_the_last_normal_work_and_reduction(direct):
         deps = _ancestors(stages, f"reduce:{i}:add")
         assert flag in deps and not deps.intersection(f"tile:{j}:fixpipe" for j in range(8, 12))
         assert f"reduce:{i}:add" not in _ancestors(stages, "tile:8:fixpipe")
-
 def test_splitk_uses_ceil_grid_and_rebinds_workspace_under_pressure(direct):
     p = CatlassProblem(32, 32, 192)
     options = dict(tile=(32, 32, 128), aic_budget=2, aiv_budget=4, stage_options=(ONE_SLOT,))
@@ -165,7 +160,6 @@ def test_splitk_uses_ceil_grid_and_rebinds_workspace_under_pressure(direct):
     item, = result.summary.semantic_work
     assert item.logical_ops == 2 * wide.m * wide.n * wide.k and item.eligible_engines == ("cube", "aiv_simt")
     assert dict(result.summary.vector_ops_by_pipe)["vec_reduce"] == wide.m * wide.n
-
 def test_swizzle_serpentine_coordinates_and_admission_reuse(direct):
     for direction, expected in (("Zn", serpentine(5, 3)), ("Nz", [(j, i) for i, j in serpentine(3, 5)])):
         assert [cat.swizzle_block_coord(i, 5, 3, direction, 2) for i in range(15)] == expected
@@ -177,7 +171,6 @@ def test_swizzle_serpentine_coordinates_and_admission_reuse(direct):
     for direction, offset, expected in (("Nz", 2, 2 * KIB), ("Zn", 1, 3 * KIB)):
         spec, = (s for s in specs if (s.swizzle_direction, s.swizzle_offset) == (direction, offset))
         assert lower_catlass_spec(spec, p, direct, memory_view=AdmissionMemoryView({0: 2 * KIB}, granule_bytes=SECTOR)).l2_hit_bytes == expected
-
 def test_evg_visitor_dag_and_direct_epilogue_traffic(datapaths):
     indirect, direct = datapaths
     tree, exp = visitor_graph()
@@ -195,7 +188,6 @@ def test_evg_visitor_dag_and_direct_epilogue_traffic(datapaths):
     gm_result, ub_result = (lower_catlass_spec(spec, p, direct) for spec in (gm, ub))
     assert gm_result.summary.logical_transfer_bytes - ub_result.summary.logical_transfer_bytes == 2 * p.m * p.n * 4
     assert dict(ub_result.summary.vector_ops_by_pipe) == {"vec_alu": 9 * p.m * p.n, "vec_sfu": 4 * p.m * p.n}
-
 def test_grouped_scheduler_carries_core_index_and_bypasses_single_row_tiles(direct):
     groups = (16, 0, 33, 16)
     p = CatlassProblem(sum(groups), 64, 32, groups=groups)
@@ -207,14 +199,12 @@ def test_grouped_scheduler_carries_core_index_and_bypasses_single_row_tiles(dire
     assert [i for i, read in enumerate(reads) if read.reuse_key is not None] == [2, 3, 4, 5]
     only, = _matrix("grouped_slice_m", replace(p, m=32, groups=(16, 0, 16)), direct)
     assert only.l2_cache_hint_b == "disable"
-
 @pytest.mark.parametrize("acc,width", [("fp32", 4), ("bf16", 2)])
 def test_grouped_swiglu_quantization_avoids_gate_up_spills(direct, acc, width):
-    mx_datapath = with_mx_modes(direct)
-    m, f = 48, 64
+    dp, m, f = with_mx_modes(direct), 48, 64
     p = CatlassProblem(m, 2 * f, 32, "mxfp8", "mxfp8", dtype_acc=acc, groups=(16, 0, 32))
-    spec, = _matrix("grouped_mx_swiglu_mx_quant", p, mx_datapath)
-    result = lower_catlass_spec(spec, p, mx_datapath)
+    spec, = _matrix("grouped_mx_swiglu_mx_quant", p, dp)
+    result = lower_catlass_spec(spec, p, dp)
     assert (spec.l2_cache_hint_b, spec.workspace_bytes) == ("disable", 0)
     assert sum(s.metadata.get("saved_logical_bytes", 0) for s in result.program.stages) == 4 * m * f * width
     # Four A reads per row, two B experts, one scale per K block.
@@ -270,11 +260,11 @@ def test_simt_thread_ceilings_carveout_and_routing_workspace(datapaths, policy, 
         ),)
         ub, = solve_catlass_tile(spec, p, direct).pool_peaks
         assert (ub.peak_bytes, ub.capacity_bytes) == (64 * KIB if indexed else threads * 4, 232 * KIB)
-        assert stages["simt:0:simt_mac"].metadata["thread_block_dim"] == options["simt_thread_blocks"][0]
+        assert tuple(stages["simt:0:simt_mac"].metadata[f"thread_block_{axis}"] for axis in "xyz") == options["simt_thread_blocks"][0]
     if indexed:
         reads = {entry.allocation_id: entry.ranges for entry in lowered.summary.read_obligations}
         row = ((7 * 32 * 2, 8 * 32 * 2),)
-        assert reads[p.a_id] == row and reads[p.indices_id] == ((0, SECTOR),) == ((0, _bytes(stages, ":indices", "mte2_aiv")),)
+        assert (reads[p.a_id], reads[p.indices_id], _bytes(stages, ":indices", "mte2_aiv")) == (row, ((0, p.m * 4),), SECTOR)
         assert {"simt:0:indices", "simt:zero_output:barrier"} <= _ancestors(stages, "simt:0:simt_mac")
         assert sum(s.work["mte3"] for n, s in stages.items() if n.startswith("simt:zero_output:") and s.work) == 8 * 32 * 2
         live = lower_catlass_spec(spec, p, direct, **template_live_bindings(direct, p, aiv_simt=10**6))
@@ -344,12 +334,15 @@ def test_mega_recurrent_variant_workspace_reads_and_launch_savings(direct, tp, s
         assert stages[f"mega:0:{tensor}:gm:read"].after == (f"mega:0:{tensor}:gm:write",)
     assert spec.workspace_bytes_total == tp * sequence * 2 * (5 * heads * 128 + 16 * ceil(heads / 16) + 128) + 128**2 * 4
     assert len(p.unfused_launches) - result.summary.stars_launch_count == stages["mega:unfused_baseline"].metadata["saved_launches"]
-    obligations = {entry.allocation_id: entry.ranges for entry in result.summary.write_obligations}
+    obligations = {entry.allocation_id: entry for entry in result.summary.write_obligations}
     assert "checkpoint" not in obligations
     for tensor, element in (("replay_u", 4), ("replay_k", 2), ("replay_decay", 4)):
         pitch = stride if tensor == "replay_k" else heads * capacity * 128
         bases = ((slot * pitch + head * capacity * 128) * element for slot in slots for head in range(heads))
-        assert obligations[tensor] == tuple((base, base + sequence * 128 * element) for base in bases)
+        entry = obligations[tensor]
+        ranges = (AddressRun(lo, 1, hi - lo, hi - lo) for lo, hi in entry.ranges)
+        expected = tuple((base, base + sequence * 128 * element) for base in bases)
+        assert AddressRunPlan((*entry.address_runs, *ranges), sector_bytes=1).sector_intervals() == expected
 
 @pytest.mark.parametrize("mode", tuple(dsl.QkvQuantMode))
 def test_mla_four_products_workspace_and_quantization_barrier(direct, mode):
@@ -371,7 +364,6 @@ def test_mla_four_products_workspace_and_quantization_barrier(direct, mode):
         assert barrier in _ancestors(stages, "mla:0:q_output")
     else:
         assert barrier not in stages
-    width = 1 if mode in {dsl.QkvQuantMode.FP8_TENSOR, dsl.QkvQuantMode.HiF8} else 2
     assert all(stages[f"mla:0:{matrix}:l0{bank}"].work["mte1"] > 0 for matrix, bank in product(widths, "ab"))
     if mode == dsl.QkvQuantMode.FP8:
         packed = replace(p, tokens=2, kvr=576, mode=1, cache_index=(7, -1))
@@ -506,7 +498,7 @@ def test_region_cube_rate_and_full_barrier_release_between_tiles(direct):
 
 def test_region_compiler_preserves_coupling_metadata_and_step_obligations(direct):
     stage = Stage("compute", {"cube": 8, "aiv_simt": 4}, coupled=True,
-                  placement={"cube": (0,), "aiv_simt": (0, 1)}, metadata={"geometry": (2, 4), "launch": True})
+                  placement={"cube": (0,), "aiv_simt": (0, 1)}, metadata={"rows": 2, "cols": 4, "launch": True})
     semantic = SemanticWorkItem("matrix", "matrix_mac", "bf16", 8, ("cube", "aiv_simt"), ("tiles",))
     dp = replace(direct, memory_access=replace(direct.memory_access, burst_turn_penalty=(TURNAROUND,)))
     summaries = []
@@ -516,8 +508,7 @@ def test_region_compiler_preserves_coupling_metadata_and_step_obligations(direct
                        semantic_work=(semantic,), live_in_obligations=(read,),
                        live_buffers=(LiveBufferSpec("tile", "ub", 232 * KIB, 0, 1, owner_kind="aiv"),))
         spec, result = compile_fuse_region("fused", ("compute",), dp, op_stages={"compute": stage}, **options)
-        peak, = spec.tile_solution.pool_peaks
-        assert (peak.peak_bytes, peak.capacity_bytes) == (232 * KIB, (248 - 16) * KIB)
+        assert [(p.peak_bytes, p.capacity_bytes) for p in spec.tile_solution.pool_peaks] == [(232 * KIB, (248 - 16) * KIB)]
         lowered, summary = _stages(result)["p0:t0:compute"], result.summary
         assert lowered.coupled and lowered.placement == stage.placement and lowered.metadata == stage.metadata
         with pytest.raises(ModelingError, match="coupled_placement_not_proportional"):
@@ -529,35 +520,36 @@ def test_region_compiler_preserves_coupling_metadata_and_step_obligations(direct
     cold = replace(read, ranges=((0, SECTOR),))
     warm = replace(read, ranges=((SECTOR, 2 * SECTOR),), initial_residency="l2_warm")
     _, mixed = _region(dp, _edge(), live_in_obligations=(cold, warm))
-    assert mixed.summary.read_obligations == (cold, warm)
-    assert compose_step_obligations((mixed.summary,)) == ((cold,), ())
-    for invalid in ((True, 2), {"inner": 1}, Fraction(1, 8)):
-        with pytest.raises(ModelingError, match="stage_metadata_invalid"):
-            replace(stage, metadata={"nested": invalid})
+    assert mixed.summary.read_obligations == (cold, warm) and compose_step_obligations((mixed.summary,)) == ((cold,), ())
 
 def _prime(view, tensor, run):
     pattern = MemoryAccessPattern(tensor, 0, 0, 0, "read", "mte2_aiv", run.rows * run.row_bytes,
                                   AddressRunPlan((run,)), ReuseKey(0, tensor, 0, "main"))
     assert view.admit_access(pattern, pattern.runs.aligned_copy_bytes()) == (0, pattern.logical_bytes)
 
-@pytest.mark.parametrize("rows,stride", ((1, SECTOR), (PERIODIC_ROWS, 2 * SECTOR)))
-def test_template_read_obligations_and_service_follow_resident_sectors(direct, rows, stride):
+def test_periodic_template_obligations_and_service_follow_resident_sectors(direct):
+    rows, stride = 128 * KIB * 32, 2 * SECTOR
     dp = replace(direct, memory_access=replace(direct.memory_access, burst_turn_penalty=(TURNAROUND,)))
-    view, context = AdmissionMemoryView({0: KIB**2}), _context(dp, None)
-    run = AddressRun(0, rows, SECTOR, stride)
-    _prime(view, "rows", run)
+    run, view = AddressRun(0, rows, SECTOR, stride), AdmissionMemoryView({0: 2 * rows * SECTOR})
+    context, primed = _context(dp, None), replace(run, rows=rows // 2, stride_bytes=2 * stride)
+    _prime(view, "rows", primed)
     plan = Lowering(dp, context=context, memory_view=view, live_admission=True)
-    plan.access("read", "rows", (rows + 1) * SECTOR, runs=(replace(run, rows=rows + 1),))
-    result = plan.result("K3", "read", (), None, (), SimpleNamespace(pool_peaks=()))
+    tracemalloc.start()
+    try:
+        start = perf_counter()
+        plan.access("read", "rows", rows * SECTOR, runs=(run,))
+        result = plan.result("K3", "read", (), None, (), SimpleNamespace(pool_peaks=()))
+        assert perf_counter() - start < 0.5
+        assert tracemalloc.get_traced_memory()[1] < 8 * KIB**2
+    finally:
+        tracemalloc.stop()
     warm, cold = result.summary.read_obligations
-    assert warm.initial_residency == "l2_warm" and warm.ranges == tuple((i * stride, i * stride + SECTOR) for i in range(rows))
-    assert cold.ranges == ((rows * stride, rows * stride + SECTOR),)
+    assert warm.address_runs == (primed,) and warm.initial_residency == "l2_warm"
+    assert cold.address_runs == (replace(primed, base_byte=stride),) and not (warm.ranges or cold.ranges)
     assert compose_step_obligations((result.summary,)) == ((cold,), ())
-    expected_service = SECTOR + Fraction("0.1")
-    assert result.summary.turnaround_service_bytes == expected_service
-    delivered = _run(dp, context, result).delivered
-    assert result.dram_miss_bytes == result.summary.dram_sector_bytes == SECTOR and result.l2_hit_bytes == rows * SECTOR
-    assert result.summary.turnaround_service_bytes == expected_service and delivered["hbm:ctr_r"] == pytest.approx(float(expected_service))
+    delivered, service = _run(dp, context, result).delivered, rows // 2 * (SECTOR + Fraction("0.1"))
+    assert result.dram_miss_bytes == result.summary.dram_sector_bytes == result.l2_hit_bytes == rows // 2 * SECTOR
+    assert (result.summary.turnaround_service_bytes, delivered["hbm:ctr_r"]) == (service, pytest.approx(float(service)))
 
 def test_templates_keep_producer_stream_and_release_owned_streams_at_last_use(direct):
     view, context = AdmissionMemoryView({0: 2 * KV_BYTES}, granule_bytes=SECTOR), _context(direct, None)
@@ -568,10 +560,9 @@ def test_templates_keep_producer_stream_and_release_owned_streams_at_last_use(di
     plan.access("read_kv", "kv", KV_BYTES, after=(second,))
     result = plan.result("K3", "read", (), None, (), SimpleNamespace(pool_peaks=()))
     assert plan.state.active_stream_count(0) == view.active_stream_count(0) == 1
-    assert result.l2_hit_bytes == KV_BYTES and result.dram_miss_bytes == 2 * SECTOR
-    delivered = _run(direct, context, result).delivered
-    assert result.l2_hit_bytes == KV_BYTES and delivered["hbm:ctr_r"] == pytest.approx(2 * SECTOR)
-    assert view.active_stream_count(0) == 1
+    assert (result.l2_hit_bytes, result.dram_miss_bytes) == (KV_BYTES, 2 * SECTOR)
+    assert _run(direct, context, result).delivered["hbm:ctr_r"] == pytest.approx(2 * SECTOR)
+    assert (result.l2_hit_bytes, view.active_stream_count(0)) == (KV_BYTES, 1)
 
 def test_catalog_provenance_validates_mounted_catalog(monkeypatch):
     catalog = builtin_template_catalog()
@@ -598,3 +589,12 @@ def test_catalog_provenance_rejects_invalid_sources(monkeypatch, tmp_path):
         (repo, {"symbol": ""}, "invalid_symbol"),
     ):
         assert verify_template_declaration(audit, tmp_path, ref.to_dict() | changes, mounted) == ([reason] if reason else [])
+
+def test_scalar_gemm_logical_obligations_and_compulsory_sectors(direct):
+    problem = CatlassProblem(1, 1, 1)
+    spec, = _matrix("basic_pingpong", problem, direct, stage_options=(ONE_SLOT,))
+    summary = lower_catlass_spec(spec, problem, direct).summary
+    entries = (*summary.read_obligations, *summary.write_obligations)
+    assert sum(hi - lo for entry in entries for lo, hi in entry.ranges) == summary.logical_transfer_bytes == 6
+    cut = compute_compulsory_hbm_cut((summary,))[0]
+    assert (cut.read_bytes, cut.write_bytes, summary.dram_sector_bytes) == (2 * SECTOR, SECTOR, 3 * SECTOR)

@@ -22,7 +22,7 @@ from mindie_sim.schema.operators import ProgramFragment
 from ..engine import Allocation, Engine, Event
 
 _EMPTY_MAPPING = MappingProxyType({})
-_STAGE_METADATA_BUILTINS = frozenset({bool, int, float, str, bytes, type(None)})
+_STAGE_METADATA_BUILTINS = frozenset({bool, int, float, str})
 #: Default live-stage bound for coalescing a repeated finite pipeline window.
 PIPELINE_UNROLL_LIMIT = 64
 _COMPILED_CACHE_LIMIT = 4096
@@ -140,9 +140,7 @@ class Stage:
         if self.metadata:
             raw_meta = dict(self.metadata)
             for mk, mv in raw_meta.items():
-                ok_v = (type(mv) in _STAGE_METADATA_BUILTINS
-                        or (type(mv) is tuple and all(type(x) is int for x in mv)))
-                if type(mk) is not str or mk == "occurrence" or not ok_v:
+                if type(mk) is not str or mk == "occurrence" or type(mv) not in _STAGE_METADATA_BUILTINS:
                     raise ModelingError(f"stage_metadata_invalid:{self.name}:{mk!r}")
             object.__setattr__(self, "metadata", MappingProxyType(raw_meta))
         else:

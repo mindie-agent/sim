@@ -8,14 +8,19 @@
 from __future__ import annotations
 
 import re
+from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field, replace
 from fractions import Fraction
 from graphlib import CycleError, TopologicalSorter
-from math import isfinite
+from heapq import merge
+from itertools import groupby
+from math import gcd, isfinite, lcm
 from typing import Iterable, Literal
 
 from mindie_sim.prediction.program.stages import KernelProgram
-from mindie_sim.prediction.runtime.memory_physics import _merge_byte_intervals, _subtract_byte_intervals
+from mindie_sim.prediction.runtime.memory_physics import (
+    AddressRun, SectorCoverage, _MAX_EXPLICIT_SECTOR_INTERVALS, _merge_byte_intervals,
+)
 from mindie_sim.prediction.runtime.tile_solver import AlgorithmKind, TileSolution
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import SourceRef
@@ -249,7 +254,7 @@ class CatlassKernelSpec:
     simt_thread_block_dim: tuple[int, int, int] | None
     aic_budget: int
     aiv_budget: int
-    source_refs: tuple[TemplateSourceRef, ...]
+    source_refs: tuple[TemplateSourceRef | SourceRef, ...]
 
     def __post_init__(self) -> None:
         if bool(self.evg_tree) != (self.epilogue_kind in {"evg_gm", "evg_ub"}):
@@ -279,7 +284,7 @@ class DslKernelSpec:
     ub_peak_bytes: int
     l1_peak_bytes: int
     l0c_peak_bytes: int
-    source_refs: tuple[TemplateSourceRef, ...]
+    source_refs: tuple[TemplateSourceRef | SourceRef, ...]
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -287,26 +292,41 @@ class DslKernelSpec:
 
 @dataclass(frozen=True, slots=True)
 class TensorRangeObligation:
+    """Exact logical byte coverage, with strided rows retained as address runs."""
+
     die: int
     allocation_id: str
     tensor_version: int
     ranges: tuple[tuple[int, int], ...]
     initial_residency: Literal["hbm_cold", "l2_warm", "onchip_resident"]
     required_final_visibility: Literal["owner", "die", "device", "host"]
+    address_runs: tuple[AddressRun, ...] = ()
 
     def __post_init__(self) -> None:
         if (
             type(self.die) is not int or self.die < 0 or not self.allocation_id
+            or type(self.ranges) is not tuple or type(self.address_runs) is not tuple
+            or not (self.ranges or self.address_runs)
             or type(self.tensor_version) is not int or self.tensor_version < 0
             or self.initial_residency not in {"hbm_cold", "l2_warm", "onchip_resident"}
             or self.required_final_visibility not in {"owner", "die", "device", "host"}
         ):
             raise ModelingError("tensor_range_obligation_invalid")
         end = 0
-        for lo, hi in self.ranges:
+        for interval in self.ranges:
+            if type(interval) is not tuple or len(interval) != 2:
+                raise ModelingError(f"tensor_range_intervals_invalid:{self.allocation_id}")
+            lo, hi = interval
             if type(lo) is not int or type(hi) is not int or not end <= lo < hi:
                 raise ModelingError(f"tensor_range_intervals_invalid:{self.allocation_id}")
             end = hi
+        for run in self.address_runs:
+            if not isinstance(run, AddressRun) or (
+                type(run.base_byte) is not int or type(run.stride_bytes) is not int
+                or type(run.rows) is not int or type(run.row_bytes) is not int
+                or run.rows <= 0 or run.row_bytes <= 0
+            ):
+                raise ModelingError(f"tensor_address_run_invalid:{self.allocation_id}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -354,8 +374,12 @@ class SemanticWorkItem:
     kind: Literal["matrix_mac", "vector_alu", "vector_sfu", "vector_reduce", "sort_topk"]
     dtype: str
     logical_ops: int
-    admitted_engines: tuple[Literal["cube", "aiv_simd", "aiv_simt"], ...]
-    admissible_schedulers: tuple[str, ...]
+    admitted_engines: tuple[Literal["cube", "aiv_simd", "aiv_simt"], ...] = ("cube",)
+    admissible_schedulers: tuple[str, ...] = ("dataparallel",)
+    inline_epilogue_absorbable: bool = False
+    die: int = 0
+    replica: int = 0
+    pp_stage: int = 0
 
     @property
     def eligible_engines(self) -> tuple[str, ...]:
@@ -366,6 +390,8 @@ class SemanticWorkItem:
             not self.work_id or not self.dtype or type(self.logical_ops) is not int or self.logical_ops < 0
             or not self.admitted_engines or not set(self.admitted_engines) <= {"cube", "aiv_simd", "aiv_simt"}
             or not self.admissible_schedulers
+            or type(self.inline_epilogue_absorbable) is not bool
+            or any(type(index) is not int or index < 0 for index in (self.die, self.replica, self.pp_stage))
             or self.kind not in {"matrix_mac", "vector_alu", "vector_sfu", "vector_reduce", "sort_topk"}
         ):
             raise ModelingError(f"template_semantic_work_invalid:{self.work_id}")
@@ -451,42 +477,180 @@ class TemplateLoweringResult:
         return self.summary.l2_miss_bytes
 
 
+def _range_run(lo, hi):
+    return AddressRun(lo, 1, hi - lo, hi - lo)
+
+
+def _obligation_runs(entry):
+    yield from (_range_run(lo, hi) for lo, hi in entry.ranges)
+    yield from entry.address_runs
+
+
+def _run_end(run):
+    return run.base_byte + (run.rows - 1) * run.stride_bytes + run.row_bytes
+
+
+def _coverage_runs(coverage: SectorCoverage):
+    yield from (_range_run(lo, hi) for lo, hi in coverage.intervals)
+    for run in coverage.periodic:
+        # A sector-aligned phase repeats after the row's byte offset realigns.
+        phase_rows = run.sector_bytes // gcd(run.sector_bytes, run.stride_bytes)
+        stride = phase_rows * run.stride_bytes
+        for phase in range(min(phase_rows, run.rows)):
+            lo, hi = run._row_bounds(phase)
+            rows = (run.rows - 1 - phase) // phase_rows + 1
+            yield AddressRun(lo, rows, hi - lo, stride)
+
+
+def _sweep(events):
+    """Yield consecutive byte spans with the labels active throughout each span."""
+    active, previous = Counter(), 0
+    for offset, changes in groupby(events, key=lambda event: event[0]):
+        if active and offset > previous:
+            yield previous, offset, active
+        for _, label, delta in changes:
+            active[label] += delta
+            if not active[label]:
+                del active[label]
+        previous = offset
+
+
+def _row_events(run, label, lo, hi):
+    """Stream row boundaries in a single period, clipping its boundary rows."""
+    first = max(0, (lo - run.base_byte - run.row_bytes) // run.stride_bytes + 1)
+    stop = min(run.rows, ceil_div(hi - run.base_byte, run.stride_bytes))
+    for row in range(first, stop):
+        start = run.base_byte + row * run.stride_bytes
+        yield max(lo, start), label, 1
+        yield min(hi, start + run.row_bytes), label, -1
+
+
+def _classified_spans(events, classify):
+    previous = None
+    for lo, hi, active in _sweep(events):
+        state = classify(active)
+        if previous is not None and previous[1] == lo and previous[2] == state:
+            previous = previous[0], hi, state
+            continue
+        if previous is not None:
+            yield previous
+        previous = (lo, hi, state) if state is not None else None
+    if previous is not None:
+        yield previous
+
+
+def _partition_runs(tagged_runs, classify):
+    """Apply a byte-set operation across repeating spans without expanding their rows."""
+    events = []
+    for run, label in dict.fromkeys(tagged_runs):
+        end = _run_end(run)
+        if run.rows == 1 or run.stride_bytes <= run.row_bytes:
+            run = _range_run(run.base_byte, end)
+        events.extend(((run.base_byte, (run, label), 1), (end, (run, label), -1)))
+    for lo, hi, active in _sweep(sorted(events, key=lambda event: event[0])):
+        if all(run.rows == 1 for run, _ in active):
+            if (state := classify({label for _, label in active})) is not None:
+                yield state, _range_run(lo, hi)
+            continue
+        # Each active run repeats over its bounding span. Only one common
+        # period needs scanning, with the final repeat clipped to the span.
+        period = lcm(*(run.stride_bytes for run, _ in active if run.rows > 1))
+        end = min(hi, lo + period)
+        streams = (_row_events(run, label, lo, end) for run, label in active)
+        for begin, finish, state in _classified_spans(merge(*streams, key=lambda event: event[0]), classify):
+            rows = (hi - finish) // period + 1
+            width = finish - begin
+            yield state, AddressRun(begin, rows, width, period) if rows > 1 else _range_run(begin, finish)
+            if (tail := hi - (begin + rows * period)) > 0:
+                yield state, _range_run(hi - tail, hi)
+
+
+def _entry_with_runs(entry, runs, **updates):
+    compacted = []
+    for run in sorted(runs, key=lambda item: item.base_byte):
+        if compacted:
+            previous = compacted[-1]
+            stride = previous.stride_bytes if previous.rows > 1 else run.stride_bytes
+            if (max(previous.rows, run.rows) > 1 and previous.row_bytes == run.row_bytes
+                    and (run.rows == 1 or run.stride_bytes == stride)
+                    and previous.base_byte + previous.rows * stride == run.base_byte):
+                compacted[-1] = replace(previous, rows=previous.rows + run.rows, stride_bytes=stride)
+                continue
+        compacted.append(run)
+    ranges, address_runs = [], []
+    for run in compacted:
+        if run.rows == 1 or run.stride_bytes <= run.row_bytes:
+            ranges.append((run.base_byte, _run_end(run)))
+        else:
+            address_runs.append(run)
+    return replace(entry, ranges=_merge_byte_intervals(ranges), address_runs=tuple(address_runs), **updates)
+
+
+def _logical_obligation(pattern):
+    ranges, runs = [], []
+    for run in pattern.runs.runs:
+        if not run.rows or not run.row_bytes:
+            continue
+        if run.rows == 1 or run.stride_bytes <= run.row_bytes:
+            ranges.append((run.base_byte, _run_end(run)))
+        else:
+            runs.append(run)
+    if ranges or runs:
+        return TensorRangeObligation(
+            pattern.die, pattern.tensor_id, pattern.version, _merge_byte_intervals(ranges),
+            "hbm_cold", pattern.visibility.scope, tuple(runs),
+        )
+
+
+def _split_entry_residency(entry, resident: SectorCoverage):
+    if resident.empty:
+        yield entry
+        return
+    tagged = ((run, "data") for run in _obligation_runs(entry))
+    masks = ((run, "resident") for run in _coverage_runs(resident))
+    groups = defaultdict(list)
+    for state, run in _partition_runs(
+        (*tagged, *masks), lambda labels: ("resident" in labels) if "data" in labels else None,
+    ):
+        groups[state].append(run)
+    for warm, runs in groups.items():
+        yield _entry_with_runs(entry, runs, initial_residency="l2_warm" if warm else entry.initial_residency)
+
+
 def _union_obligations(
     obligations: Iterable[TensorRangeObligation],
 ) -> tuple[TensorRangeObligation, ...]:
-    grouped: dict[tuple[int, str, int], list[TensorRangeObligation]] = {}
+    grouped = defaultdict(list)
     for obligation in obligations:
-        key = (obligation.die, obligation.allocation_id, obligation.tensor_version)
-        grouped.setdefault(key, []).append(obligation)
+        grouped[obligation.die, obligation.allocation_id, obligation.tensor_version].append(obligation)
     visibility = ("owner", "die", "device", "host")
     residency = ("hbm_cold", "l2_warm", "onchip_resident")
+
+    def classify(labels):
+        return min(r for r, _ in labels), max(v for _, v in labels)
+
     result = []
-    for key, entries in sorted(grouped.items()):
-        events = {}
-        for entry in entries:
-            attributes = (residency.index(entry.initial_residency), visibility.index(entry.required_final_visibility))
-            for lo, hi in entry.ranges:
-                events.setdefault(lo, []).append((attributes, 1))
-                events.setdefault(hi, []).append((attributes, -1))
-        active, merged = {}, {}
-        previous = 0
-        for offset, changes in sorted(events.items()):
-            if active:
-                state = min(r for r, _ in active), max(v for _, v in active)
-                ranges = merged.setdefault(state, [])
-                if ranges and ranges[-1][1] == previous:
-                    ranges[-1] = (ranges[-1][0], offset)
-                else:
-                    ranges.append((previous, offset))
-            for attributes, delta in changes:
-                count = active.get(attributes, 0) + delta
-                if count:
-                    active[attributes] = count
-                else:
-                    active.pop(attributes, None)
-            previous = offset
-        result.extend(TensorRangeObligation(*key, tuple(ranges), residency[r], visibility[v])
-                      for (r, v), ranges in merged.items())
+    for _, entries in sorted(grouped.items()):
+        if all((e.initial_residency, e.required_final_visibility) ==
+               (entries[0].initial_residency, entries[0].required_final_visibility) for e in entries):
+            runs = tuple(dict.fromkeys(run for entry in entries for run in _obligation_runs(entry)))
+            periodic = tuple(run for run in runs if run.rows > 1 and run.stride_bytes > run.row_bytes)
+            period = lcm(*(run.stride_bytes for run in periodic))
+            if len(runs) == 1 or any(min(run.rows, period // run.stride_bytes) > _MAX_EXPLICIT_SECTOR_INTERVALS
+                                      for run in periodic):
+                # A union with a single label can retain overlapping runs as
+                # a set of descriptors, even when their common period is large.
+                result.append(_entry_with_runs(entries[0], runs))
+                continue
+        tagged = (
+            (run, (residency.index(entry.initial_residency), visibility.index(entry.required_final_visibility)))
+            for entry in entries for run in _obligation_runs(entry)
+        )
+        merged = defaultdict(list)
+        for state, run in _partition_runs(tagged, classify):
+            merged[state].append(run)
+        result.extend(_entry_with_runs(entries[0], runs, initial_residency=residency[r],
+                                       required_final_visibility=visibility[v]) for (r, v), runs in merged.items())
     return tuple(result)
 
 
@@ -506,15 +670,22 @@ def compose_step_obligations(
 def _external_reads(reads, produced):
     for entry in reads:
         key = entry.die, entry.allocation_id, entry.tensor_version
-        ranges = _subtract_byte_intervals(entry.ranges, produced.get(key, ()))
-        if ranges:
-            yield replace(entry, ranges=ranges)
+        if not (written := produced.get(key)):
+            yield entry
+            continue
+        tagged = [(run, True) for run in _obligation_runs(entry)]
+        tagged.extend((run, False) for run in written)
+        runs = tuple(run for _, run in _partition_runs(
+            tagged, lambda labels: True if True in labels and False not in labels else None,
+        ))
+        if runs:
+            yield _entry_with_runs(entry, runs)
 
 
 def _record_produced(produced, writes):
     for entry in writes:
         key = entry.die, entry.allocation_id, entry.tensor_version
-        produced[key] = _merge_byte_intervals((*produced.get(key, ()), *entry.ranges))
+        produced.setdefault(key, set()).update(_obligation_runs(entry))
 
 
 def _topological(parents, message):

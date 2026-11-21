@@ -37,6 +37,7 @@ from mindie_sim.prediction.efficiency import (
 )
 from mindie_sim.prediction.graph_analysis import graph_costs
 from mindie_sim.prediction.structure import parse_case
+from mindie_sim.schema.datapath import datapath_for_die
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.study import _normalize_ranking_row, _rankings, study
 from mindie_sim.sweep import sweep_topologies
@@ -233,6 +234,27 @@ def test_hbm_rate_intervention_does_not_scale_independent_onchip_copy():
     assert rates["mte3"] == 1e6
 
 
+@pytest.mark.parametrize("record_key", ["devices", "dies"])
+def test_hbm_rate_intervention_scales_directional_datapath_capacities(record_key):
+    raw = _hybrid_case()
+    machine = raw["machine"]
+    defaults = machine["device"]
+    read, write = "hbm_read_bytes_per_s", "hbm_write_bytes_per_s"
+    override = {write: defaults[write] * 0.5}
+    machine[record_key] = [{}, override]
+    a5_case = parse_case(raw)
+    scaled = scale_case_hardware(a5_case, hbm_bw_scale=2.0)
+
+    for die, scaled_die, rates in zip(a5_case.machine.dies, scaled.machine.dies,
+                                     (defaults, {**defaults, **override}), strict=True):
+        pairs = ((die, scaled_die), (datapath_for_die(die), datapath_for_die(scaled_die)))
+        for original, doubled in pairs:
+            assert original.hbm_read_bytes_per_s == rates[read]
+            assert original.hbm_write_bytes_per_s == rates[write]
+            assert doubled.hbm_read_bytes_per_s == rates[read] * 2.0
+            assert doubled.hbm_write_bytes_per_s == rates[write] * 2.0
+
+
 def test_ready_complete_interval_is_not_published_as_service_busy():
     report = {
         "duration_ms": 10.0, "complete_ms": 10.0, "boundary": "device_graph",
@@ -283,10 +305,29 @@ def test_first_candidate_over_sla_still_probes_larger_candidates(monkeypatch):
         _hybrid_case(), sla_ms=1e-9, context=2048, max_sequences_per_dp=4,
         scenarios=[{"id": "baseline", "hbm_bw_scale": 1.0}])["scenarios"][0]
     assert scenario["b_sla"] == 0
+    assert scenario["b_feasible"] == 0
+    assert scenario["tps_at_b1"] > 0
+    assert scenario["tps_at_sla"] == scenario["tps_feasible"] == 0
+    assert scenario["tps_gain_vs_baseline"] is None
+    assert scenario["tps_feasible_gain_vs_baseline"] is None
     assert scenario["sla_feasible"] is False
     assert 2 in scenario["search"]["bounded_dispatch_probes"]
     assert scenario["search"]["bounded_search_exhaustive"] is True
     assert scenario["feasibility_status"] == "sla_infeasible_within_evaluated_domain"
+
+
+def test_capacity_infeasible_baseline_keeps_latency_sla_gain(monkeypatch):
+    case = _capacity_fixture(monkeypatch, async_scheduling=False, budget_kib=0)
+    _patch_bounded_solver(monkeypatch, lambda batch: float(batch))
+    scenario = solve_sla_sizing(
+        case, sla_ms=1.0, context=0, output_budget=1, max_sequences_per_dp=1,
+        scenarios=[{"id": "baseline"}])["scenarios"][0]
+    assert scenario["b_sla"] == 1
+    assert scenario["b_feasible"] == 0
+    assert scenario["tps_at_sla"] > 0
+    assert scenario["tps_feasible"] == 0
+    assert scenario["tps_gain_vs_baseline"] == 1.0
+    assert scenario["tps_feasible_gain_vs_baseline"] is None
 
 
 @pytest.mark.parametrize("points, expected", [

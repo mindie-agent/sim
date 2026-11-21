@@ -7,21 +7,22 @@
 """
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from importlib import import_module
+from functools import partial
 from math import prod
-from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
-from mindie_sim.prediction.runtime.tile_solver import (
-    AIC_POOLS, AIV_POOLS, LiveBufferSpec, TileCandidate,
-    TileInfeasibleError, TilePipelineSpec, TileShape, solve as solve_tiles,
-)
+from mindie_sim.prediction.mechanism import OperatorPlan, PlannedRecipe, Work
+from mindie_sim.prediction.program import KernelProgram
+from mindie_sim.prediction.streams import MAIN_STREAM, bind_stream_owners
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import DatapathCapabilitySpec, datapath_for_die
 from mindie_sim.schema.operators import OpSpec
+from mindie_sim.templates.catlass_catalog import CatlassProblem, matrix_problem, streamk_partition
+from mindie_sim.templates.dsl_catalog import ATTN_RES, AttnResProblem, DSL_KERNEL_IDS
+from mindie_sim.templates.registry import builtin_template_catalog
 
 from .contracts import CatlassKernelSpec, DslKernelSpec, FuseRegionSpec
 from .dual_bound import _unique_ops
@@ -29,43 +30,16 @@ from .framework_solver import (
     DEFAULT_MAX_TRIALS, FrameworkSolveResult, _TrialSearch, _atomic_ops, _machine,
     _interleave, _search_bases, _stream_candidates, _stream_plan, _wall, _with_operations,
 )
-from .reload_bounds import BITS_PER_BYTE
 
 if TYPE_CHECKING:
     from mindie_sim.rewrite.oracle import FullPlanEvaluation, ScenarioDossier
     from mindie_sim.rewrite.schema import RewritePlan
 
 MATRIX_RANK = 3
-ATTN_RES_WIDTH = 7168
-ATTN_RES_MAX_TILE_ROWS = 4095
-ATTN_RES_STAT_GRANULE = 8
-ATTN_RES_STAT_BYTES = 12
-BF16_COL_GRANULE = 16
-FP32_ELEMENT_BYTES = 4
-SWIZZLE_OFFSETS = (1, 2, 3, 4, 6, 8, 12, 16)
-MUTEX_LIMIT = 28
-MATRIX_BLOCK = 64
-L1_K_TILE = 128
-MX_SCALE_GROUP = 32
-A8W4_SCALE_FACTOR = 16
-CATLASS_SIMT_THREADS = 1024
-TLA_SIMT_THREADS = 2048
-SIMT_UB_CARVEOUT = 16 * 1024
-MX_FORMATS = frozenset({"mxfp8", "mxfp4", "a8w4_mx"})
-MATRIX_FAMILIES = frozenset({"gemm", "matmul", "linear", "grouped_gemm", "grouped_matmul"})
-GROUPED_FAMILIES = frozenset({"grouped_gemm", "grouped_matmul", "grouped_moe", "mc2"})
-FORMAT_BITS = {"fp32": 32, "float32": 32, "int32": 32, "bf16": 16, "bfloat16": 16,
-               "fp16": 16, "float16": 16, "fp8": 8, "mxfp8": 8, "mxfp4": 4,
-               "int8": 8, "int4": 4, "fp4": 4}
-DSL_KERNELS = {
-    "flash_kda": "mix_cube_vector",
-    "mega_recurrent_kda": "mix_cube_vector",
-    "commit_recurrent_kda": "vector_only",
-    "mla_prolog_v4": "mix_cube_vector",
-    "block_attn_res_update_rms_norm": "vector_only",
-    "quant_sparse_lightning_indexer": "mix_cube_vector",
-    "mixed_quant_sparse_flash_mla": "mix_cube_vector",
-}
+_GROUPED_FAMILIES = frozenset({"grouped_gemm", "grouped_matmul", "grouped_moe", "mc2"})
+_MX_MODES = frozenset({"mxfp8", "mxfp4", "a8w4_mx"})
+_CATLASS_FIELDS = ("dispatch_policy", "scheduler", "splitk_factor", "swizzle_offset", "swizzle_direction",
+                   "l1_tile_shape", "l0_tile_shape", "stages", "epilogue_kind", "simt_thread_block_dim")
 DSL_STAGES = ("D1_dsl_fuse", "D2_catlass", "D3_retune")
 __all__ = ("DslSolveResult", "streamk_crossing_partials", "select_catlass_candidates",
            "select_dsl_candidates", "solve_dsl")
@@ -81,316 +55,81 @@ class DslSolveResult:
     stage_history: tuple[tuple[str, int, str], ...]
     tried_candidates: int
 
-def _ceil_div(numerator, denominator):
-    return (numerator + denominator - 1) // denominator
-
 def streamk_crossing_partials(b_tot: int, g_k: int, c_aic: int) -> int:
     if b_tot < 0 or g_k < 1 or c_aic < 0:
         raise ValueError("invalid StreamK geometry")
-    if not c_aic:
-        return 0
-    iters = b_tot % c_aic * g_k
-    base, extra = divmod(iters, c_aic)
-    partials = start = 0
-    for core in range(min(iters, c_aic)):
-        end = start + base + (core < extra)
-        partials += (end - 1) // g_k - start // g_k + 1
-        start = end
-    return partials
+    return streamk_partition(b_tot, g_k, c_aic).partial_count if c_aic else 0
 
-def _external_selector(catalog, selector):
-    module_name = f"mindie_sim.templates.{catalog}"
-    try:
-        module = import_module(module_name)
-    except ModuleNotFoundError as exc:
-        if exc.name not in {"mindie_sim.templates", module_name}:
-            raise
+
+def _matrix_problem(op, meta):
+    if op.source_boundary == "call":
         return None
-    return getattr(module, selector, None)
-
-def _bits(datapath, dtype):
-    declared = datapath.compute_arch.declared
+    declared = meta.get("catlass_problem")
     if declared is not None:
-        try:
-            return declared.representation(dtype).bits
-        except ModelingError:
-            pass
-    return FORMAT_BITS.get(dtype, 0)
-
-def _payload(elements, bits):
-    return _ceil_div(elements * bits, BITS_PER_BYTE)
-
-def _checked_tiles(pipeline, datapath, aic, aiv, op=None):
-    candidates = []
-    for candidate in pipeline.candidates:
-        if (candidate.owner_axis == "aic" and not aic) or (
-            candidate.owner_axis == "aiv" and not aiv
-        ):
-            continue
-        for buf in candidate.buffers:
-            if ((buf.pool in AIC_POOLS and buf.owner_kind != "aic") or
-                    (buf.pool in AIV_POOLS and buf.owner_kind != "aiv") or
-                    (buf.pool == "l2" and buf.owner_kind not in {"aic", "aiv", "die"})):
-                raise ModelingError(f"live_buffer_pool_owner_mismatch:{buf.name}")
-        if any((buf.owner_kind == "aic" and not aic) or
-               (buf.owner_kind == "aiv" and not aiv) for buf in candidate.buffers):
-            continue
-        candidates.append(candidate)
-    # This worktree's runtime accepts explicit owners but does not yet reject
-    # mislabelled buffers itself. Apply the pool-owner check before calling it.
-    hw = SimpleNamespace(buffers=datapath.buffers, datapath=datapath,
-                         stream_owners=SimpleNamespace(aic_limit=aic, aiv_limit=aiv))
-    carveout = max(pipeline.simt_ub_carveout_bytes, datapath.simt_ub_carveout_bytes)
-    checked = replace(pipeline, candidates=tuple(candidates), simt_ub_carveout_bytes=carveout)
-    try:
-        return solve_tiles(checked, op, hw)
-    except TileInfeasibleError:
-        return None
-
-def _matrix_pipeline(spec, op, datapath, shape):
-    m, n, k = shape
-    lm, ln, lk = spec.l1_tile_shape
-    tm, tn, tk = spec.l0_tile_shape
-    a_bits, b_bits, acc_bits = (_bits(datapath, dtype)
-                               for dtype in (spec.dtype_a, spec.dtype_b, spec.dtype_acc))
-    if not min(a_bits, b_bits, acc_bits):
-        return None
-    b_input_bits = b_bits
-    if spec.prologue_b == "DecompressFp4ToFp8":
-        b_bits = FORMAT_BITS["fp8"]
-    output_blocks = _ceil_div(m, tm) * _ceil_div(n, tn)
-    if spec.scheduler == "grouped_slice_m":
-        rows = tuple(dict(op.metadata).get("group_rows", ()))
-        if rows:
-            output_blocks = sum(_ceil_div(count, tm) for count in rows) * _ceil_div(n, tn)
-    buffers = []
-    is_simt = spec.simt_thread_block_dim is not None
-    if not is_simt:
-        for index, (name, pool, elements, bits) in enumerate((
-            ("a_l1", "l1", lm * lk, a_bits), ("b_l1", "l1", ln * lk, b_bits),
-            ("a_l0", "l0a", tm * tk, a_bits), ("b_l0", "l0b", tn * tk, b_bits),
-            ("acc_l0", "l0c", tm * tn, acc_bits),
-        )):
-            scale = 0
-            if pool == "l1" and spec.mx_scale_group:
-                scale = _ceil_div(elements, spec.mx_scale_group) * spec.l1_scale_factor_k
-            buffers.append(LiveBufferSpec(name, pool, _payload(elements, bits), 0, 1,
-                                          owner_kind="aic", slots=spec.stages[index],
-                                          scale_bytes=scale))
-        if b_input_bits != b_bits:
-            buffers.append(LiveBufferSpec("b_packed_l1", "l1", _payload(ln * lk, b_input_bits),
-                                          0, 1, owner_kind="aic", slots=spec.stages[1]))
-        if spec.has_bias:
-            buffers.append(LiveBufferSpec("bias", "l1", _payload(tn, acc_bits), 0, 1,
-                                          owner_kind="aic", slots=2))
-    meta = dict(op.metadata)
-    if is_simt:
-        buffers.extend(meta.get("simt_buffers", ()))
-    if spec.epilogue_kind != "none" or spec.scheduler in {"streamk", "multi_core_splitk"}:
-        buffers.extend(meta.get("epilogue_buffers", ()))
-        if not meta.get("epilogue_buffers"):
-            buffers.append(LiveBufferSpec("epilogue_tile", "ub", _payload(tm * tn, acc_bits),
-                                          0, 1, owner_kind="aiv", slots=2))
-    work_items = output_blocks * spec.splitk_factor
-    candidate = TileCandidate("resident_1pass", TileShape(tm, tn, tk), max(spec.stages),
-                              (spec.aic_budget, spec.aiv_budget), work_items, _ceil_div(k, tk),
-                              tuple(buffers), logical_flops=2 * m * n * k,
-                              uses_simt=is_simt, owner_axis="aiv" if is_simt else "aic",
-                              source_guard=spec.template_id)
-    return TilePipelineSpec(spec.template_id, (candidate,),
-                            simt_ub_carveout_bytes=datapath.simt_ub_carveout_bytes)
-
-def _matrix_shape(op):
-    meta = dict(op.metadata)
+        return matrix_problem(declared)
     shape = tuple(meta.get("matrix_shape", op.local_shape))
-    if len(shape) != MATRIX_RANK or min(shape, default=0) <= 0:
+    if len(shape) != MATRIX_RANK or min(shape, default=0) <= 0 or op.link_bytes or op.vector_ops:
         return None
-    if op.family not in MATRIX_FAMILIES | GROUPED_FAMILIES and "matrix_shape" not in meta:
+    if sum(flops for _, flops in op.matrix_flops or ((op.dtype, op.flops),)) != 2 * prod(shape):
         return None
-    return shape
+    groups = tuple(meta.get("group_rows", ()))
+    if op.family in _GROUPED_FAMILIES and not groups:
+        return None
+    mode = meta.get("native_matrix_mode", op.dtype)
+    dtype_a = meta.get("dtype_a", meta.get("activation_format", op.dtype))
+    dtype_b = meta.get("dtype_b", meta.get("weight_format", op.dtype))
+    mx_mode = mode if mode in _MX_MODES else None
+    if (dtype_a != dtype_b and not mx_mode) or (meta.get("weight_scale_format") and not mx_mode):
+        return None
+    return CatlassProblem(
+        *shape, dtype_a, dtype_b, meta.get("dtype_c", meta.get("output_format", op.dtype)),
+        meta.get("dtype_acc", "int32" if dtype_a == "int8" else "fp32"),
+        groups=groups, a_id=f"{op.op_id}:a", b_id=meta.get("weight_allocation_id", f"{op.op_id}:b"),
+        c_id=f"{op.op_id}:c", has_bias=bool(meta.get("has_bias")), mx_mode=mx_mode,
+    )
+
+
+def _catlass_specs(op, problem, datapath, aic, aiv, template_id=None):
+    meta = dict(op.metadata)
+    options = {}
+    for key, parameter in (("l1_tile_shape", "l1_tiles"), ("l0_tile_shape", "l0_tiles"),
+                           ("mutex_stages", "stage_options"), ("simt_thread_block_dim", "simt_thread_blocks")):
+        if key in meta:
+            options[parameter] = (tuple(meta[key]),)
+    if "swizzle_offsets" in meta:
+        options["swizzle_offsets"] = tuple(meta["swizzle_offsets"])
+    return builtin_template_catalog().enumerate(
+        "K2", problem, datapath, template_id=template_id, aic_budget=aic, aiv_budget=aiv,
+        evg_tree=tuple(meta.get("evg_tree", ())), enable_unit_flag=bool(meta.get("enable_unit_flag")),
+        enable_l1_resident=bool(meta.get("l1_resident_slot_match")), **options,
+    )
+
 
 def select_catlass_candidates(
     op: OpSpec, datapath: DatapathCapabilitySpec, aic_budget: int, aiv_budget: int,
 ) -> tuple[CatlassKernelSpec, ...]:
-    external = _external_selector("catlass_catalog", "select_catlass_candidates")
-    if external is not None:
-        return tuple(external(op, datapath, aic_budget, aiv_budget))
-    shape = _matrix_shape(op)
-    if shape is None or min(aic_budget, aiv_budget) < 0:
+    if not aic_budget:
         return ()
-    meta = dict(op.metadata)
-    m, n, k = shape
-    dtype_a = meta.get("dtype_a", op.dtype)
-    dtype_b = meta.get("dtype_b", op.dtype)
-    dtype_acc = meta.get("dtype_acc", "int32" if dtype_a == "int8" else "fp32")
-    dtype_c = meta.get("dtype_c", op.dtype)
-    arch = datapath.compute_arch.declared
-    mode = meta.get("native_matrix_mode", op.dtype)
-    cube = bool(aic_budget and arch is not None and arch.supports_native("matrix", mode, dtype_acc))
-    modern = datapath.has_l0c_to_ub or datapath.simt_ub_carveout_bytes >= SIMT_UB_CARVEOUT
-    if not min(_bits(datapath, dtype_a), _bits(datapath, dtype_b), _bits(datapath, dtype_acc)):
-        return ()
-    l1 = tuple(meta.get("l1_tile_shape", (MATRIX_BLOCK, MATRIX_BLOCK, L1_K_TILE)))
-    l0 = tuple(meta.get("l0_tile_shape", (l1[0], l1[1], MATRIX_BLOCK)))
-    if len(l1) != MATRIX_RANK or len(l0) != MATRIX_RANK or min(*l1, *l0) <= 0:
-        return ()
-    if l1[:2] != l0[:2] or l0[-1] > l1[-1]:
-        return ()
-    tile_m, tile_n, tile_k = l1
-    g_k = _ceil_div(k, tile_k)
-    blocks = _ceil_div(m, tile_m) * _ceil_div(n, tile_n)
-    acc_bits = _bits(datapath, dtype_acc)
-    base = CatlassKernelSpec(
-        "catlass.ping_pong", "Ascend950" if modern else "AtlasA2",
-        "MmadPingpong" if modern else "MmadAtlasA2Pingpong",
-        dtype_a, dtype_b, dtype_c, dtype_acc,
-        meta.get("layout_a", "RowMajor"), meta.get("layout_b", "ColumnMajor"),
-        meta.get("layout_c", "RowMajor"), meta.get("prologue_a"), meta.get("prologue_b"),
-        0, None, 0, l1, l0, (2, 2, 2, 2, 1), bool(meta.get("has_bias")),
-        bool(meta.get("enable_unit_flag")), bool(meta.get("l1_resident_slot_match")),
-        "dataparallel", 1, 1, "Zn", "normal", "none", (), 0, None,
-        aic_budget, aiv_budget, tuple(meta.get("source_refs", ())),
-    )
-    candidates = []
-    if cube and mode not in MX_FORMATS:
-        candidates.append(base)
-        stages = tuple(meta.get("mutex_stages", (2, 2, 2, 2, 2)))
-        if (len(stages) == len(base.stages) and min(stages) >= 1 and
-            sum(stages) + 2 * base.has_bias <= MUTEX_LIMIT and
-            (not base.enable_unit_flag or stages[-1] == 1)):
-            candidates.append(replace(base, template_id="catlass.mutex",
-                                      dispatch_policy="MmadPingpongMutex", stages=stages))
-        if aiv_budget:
-            partials = streamk_crossing_partials(blocks, g_k, aic_budget)
-            if partials and g_k >= 2:
-                candidates.append(replace(base, template_id="catlass.streamk", scheduler="streamk",
-                                          workspace_bytes=_payload(partials * tile_m * tile_n, acc_bits)))
-            for split in range(2, min(g_k, aic_budget) + 1):
-                candidates.append(replace(base, template_id="catlass.multi_core_splitk",
-                                          scheduler="multi_core_splitk", splitk_factor=split,
-                                          workspace_bytes=_payload(split * m * n, acc_bits)))
-        for direction in ("Zn", "Nz"):
-            for offset in meta.get("swizzle_offsets", SWIZZLE_OFFSETS):
-                if offset >= 1:
-                    candidates.append(replace(base, template_id="catlass.swizzle",
-                                              swizzle_direction=direction, swizzle_offset=offset))
-    if cube and mode in MX_FORMATS:
-        a8w4 = mode == "a8w4_mx"
-        base = replace(base, template_id=f"catlass.{mode}", dispatch_policy="MmadA8W4Mx" if a8w4 else "MmadMx",
-                       prologue_b="DecompressFp4ToFp8" if a8w4 else base.prologue_b,
-                       mx_scale_group=MX_SCALE_GROUP, scale_layout="E8M0_NZ_G32",
-                       l1_scale_factor_k=A8W4_SCALE_FACTOR if a8w4 else 1)
-        candidates.append(base)
-    route = _paired_route(datapath, "l0c", "ub", dtype_acc, aic_budget, aiv_budget)
-    evg = tuple(meta.get("evg_tree", ()))
-    if cube and aiv_budget and evg and _valid_evg(evg):
-        candidates.append(replace(base, template_id="catlass.evg_ub" if route else "catlass.evg_gm",
-                                  epilogue_kind="evg_ub" if route else "evg_gm", evg_tree=evg,
-                                  workspace_bytes=0 if route else _payload(m * n, acc_bits)))
-    groups = tuple(meta.get("group_rows", ()))
-    if cube and op.family in GROUPED_FAMILIES and groups and sum(groups) == m and min(groups) >= 0:
-        hint = "disable" if all(count <= tile_m for count in groups) else "normal"
-        grouped = replace(base, template_id="catlass.grouped_slice_m", scheduler="grouped_slice_m",
-                          l2_cache_hint_b=hint)
-        candidates.append(grouped)
-        if route and mode in MX_FORMATS and meta.get("swiglu_mx_quant"):
-            candidates.append(replace(grouped, template_id="catlass.grouped_swiglu_mx_quant",
-                                      epilogue_kind="grouped_swiglu_mx_quant"))
-    thread_dim = tuple(meta.get("simt_thread_block_dim", ()))
-    thread_limit = TLA_SIMT_THREADS if meta.get("simt_backend") == "tla_dsl" else CATLASS_SIMT_THREADS
-    if (aiv_budget and datapath.simt_ub_carveout_bytes >= SIMT_UB_CARVEOUT and
-        meta.get("simt_buffers") and "simt_workspace_bytes" in meta and
-        len(thread_dim) == MATRIX_RANK and min(thread_dim) > 0 and prod(thread_dim) <= thread_limit):
-        candidates.append(replace(base, template_id="catlass.simt", dispatch_policy="GatherScatterSIMT",
-                                  simt_thread_block_dim=thread_dim, aic_budget=0,
-                                  workspace_bytes=int(meta["simt_workspace_bytes"])))
-    return tuple(spec for spec in candidates if (
-        (pipeline := _matrix_pipeline(spec, op, datapath, shape)) is not None and
-        _checked_tiles(pipeline, datapath, spec.aic_budget, spec.aiv_budget, op) is not None
-    ))
-
-def _valid_evg(nodes):
-    known = set()
-    for node in nodes:
-        if node.node_id in known or any(parent not in known for parent in node.inputs):
-            return False
-        known.add(node.node_id)
-    return any(node.kind == "acc_load" for node in nodes) and nodes[-1].kind == "aux_store"
-
-def _paired_route(datapath, src, dst, dtype, aic, aiv, tile=None):
     try:
-        if (src, dst) in {("l0c", "ub"), ("ub", "l1")}:
-            owner = next(({"aic": aic_id, "aiv": aiv_id}
-                          for aic_id, aiv_ids in datapath.aic_aiv_pairs if aic_id < aic
-                          for aiv_id in aiv_ids if aiv_id < aiv), None)
-            return owner is not None and bool(datapath.route(src, dst, dtype, owner_group=owner,
-                                                              tile=tile))
-        owner_count = aiv if src == "ub" else aic
-        return owner_count > 0 and bool(datapath.route(src, dst, dtype, owner_group=0, tile=tile))
+        problem = _matrix_problem(op, dict(op.metadata))
+        return _catlass_specs(op, problem, datapath, aic_budget, aiv_budget) if problem else ()
     except ModelingError:
-        return False
+        return ()
 
-def _attn_res_tiles(op, datapath, aiv):
-    if (not op.local_shape or op.local_shape[-1] != ATTN_RES_WIDTH
-        or op.dtype not in {"bf16", "bfloat16"} or op.layout != "contiguous"):
-        return None
-    width = ATTN_RES_WIDTH
-    rows = prod(op.local_shape[:-1])
-    fp_cols = _ceil_div(width, ATTN_RES_STAT_GRANULE) * ATTN_RES_STAT_GRANULE
-    bf_cols = _ceil_div(width, BF16_COL_GRANULE) * BF16_COL_GRANULE
-    fixed = FP32_ELEMENT_BYTES * fp_cols + 2 * bf_cols
-    room = datapath.usable_bytes("ub")
-    per_row = 2 * FP32_ELEMENT_BYTES * fp_cols + 2 * bf_cols
-    max_rows = min(rows, ATTN_RES_MAX_TILE_ROWS, max(0, (room - fixed) // per_row))
-    for block in range(max_rows, 0, -1):
-        tiles = _ceil_div(rows, block)
-        depth = 1 if tiles == 1 else 2
-        stat = _ceil_div(block, ATTN_RES_STAT_GRANULE) * ATTN_RES_STAT_GRANULE
-        stage = block * per_row + ATTN_RES_STAT_BYTES * stat
-        if fixed + depth * stage <= room:
-            buffers = (LiveBufferSpec("fixed", "ub", fixed, 0, 1, owner_kind="aiv"),
-                       LiveBufferSpec("row_pipeline", "ub", stage, 0, 1, owner_kind="aiv", slots=depth))
-            return TilePipelineSpec("block_attn_res_update_rms_norm", (
-                TileCandidate("resident_1pass", TileShape(block, width, 1), depth,
-                              (0, aiv), tiles, 1, buffers, owner_axis="aiv"),
-            ))
-    return None
 
-def _dsl_spec(kernel, meta, op, datapath, aic_budget, aiv_budget):
-    mode = DSL_KERNELS[kernel]
-    if not datapath.has_l0c_to_ub or not aiv_budget or (mode == "mix_cube_vector" and not aic_budget):
-        return None
-    pipeline = meta.get("dsl_tile_spec")
-    workspace = meta.get("dsl_workspace_bytes")
-    if pipeline is None and kernel == "block_attn_res_update_rms_norm" and op.family == kernel:
-        if "ub" in dict(datapath.buffers):
-            pipeline, workspace = _attn_res_tiles(op, datapath, aiv_budget), 0
-    if pipeline is None or workspace is None or workspace < 0:
-        return None
-    aic = 0 if mode == "vector_only" else aic_budget
-    tile = _checked_tiles(pipeline, datapath, aic, aiv_budget, op)
-    if tile is None or not tile.pool_peaks:
-        return None
-    candidate = next((candidate for candidate in pipeline.candidates
-                      if candidate.algorithm == tile.algorithm and candidate.tile_shape == tile.tile_shape
-                      and candidate.depth == tile.depth), None)
-    if candidate is None:
-        return None
-    shape = tile.tile_shape
-    pools = {peak.pool: peak.peak_bytes for peak in tile.pool_peaks}
-    routes = tuple(meta.get("dsl_direct_routes", ()))
-    dims = (shape.m, shape.n, shape.k)
-    if any(not _paired_route(datapath, src, dst, op.dtype, aic, aiv_budget, dims)
-           for _, src, dst in routes):
-        return None
-    return DslKernelSpec(
-        f"dsl.{kernel}", mode, tile.algorithm, meta.get("dsl_variant", "default"), dims,
-        tuple((buf.name, buf.pool, buf.slots) for buf in candidate.buffers), routes,
-        tuple(meta.get("dsl_l2_cache_policies", ())), int(workspace),
-        bool(meta.get("uses_aicpu_metadata")), bool(meta.get("has_eager_d2h_readback")),
-        candidate.uses_simt, aic, aiv_budget, pools.get("ub", 0), pools.get("l1", 0),
-        pools.get("l0c", 0), tuple(meta.get("source_refs", ())),
-    )
+def _dsl_declarations(op):
+    base = dict(op.metadata)
+    for index, override in enumerate(base.get("dsl_variants", ({},))):
+        meta = {**base, **override}
+        identifier = meta.get("dsl_kernel", op.family if f"dsl.{op.family}" in DSL_KERNEL_IDS else op.recipe)
+        identifier = "dsl." + identifier.removeprefix("dsl.")
+        kernel = "dsl." + identifier.removeprefix("dsl.").partition(".")[0]
+        problem = meta.get("dsl_problem")
+        if problem is None and kernel == ATTN_RES and op.local_shape and op.layout == "contiguous":
+            problem = AttnResProblem(prod(op.local_shape[:-1]), op.local_shape[-1], op.dtype)
+        if problem is not None and kernel in DSL_KERNEL_IDS:
+            yield index, identifier, problem, tuple(meta.get("dsl_members", (op.op_id,)))
+
 
 def _convex_members(ops, ids):
     if len(ids) != len(set(ids)) or not ids:
@@ -422,104 +161,230 @@ def _convex_members(ops, ids):
 def select_dsl_candidates(
     ops: Sequence[OpSpec], datapath: DatapathCapabilitySpec, aic_budget: int, aiv_budget: int,
 ) -> tuple[tuple[DslKernelSpec, tuple[str, ...]], ...]:
-    external = _external_selector("dsl_catalog", "select_dsl_candidates")
-    if external is not None:
-        return tuple(external(ops, datapath, aic_budget, aiv_budget))
-    candidates = []
-    for op in ops:
-        meta = dict(op.metadata)
-        for variant in meta.get("dsl_variants", ({},)):
-            effective = {**meta, **variant}
-            kernel = effective.get("dsl_kernel", op.family if op.family in DSL_KERNELS else op.recipe)
-            members = tuple(effective.get("dsl_members", (op.op_id,)))
-            if kernel in DSL_KERNELS and _convex_members(ops, members):
-                spec = _dsl_spec(kernel, effective, op, datapath, aic_budget, aiv_budget)
-                if spec is not None:
-                    candidates.append((spec, members))
-    return tuple(candidates)
+    return tuple(dict.fromkeys((spec, ids) for spec, ids, _ in _dsl_candidates(
+        ops, datapath, aic_budget, aiv_budget,
+    )))
 
-def _general_fuse(ops, datapath, aic, aiv):
+
+def _dsl_candidates(ops, datapath, aic, aiv):
+    if not aic or not aiv:
+        return
+    for op in ops:
+        for index, identifier, problem, members in _dsl_declarations(op):
+            if op.op_id not in members or not _convex_members(ops, members):
+                continue
+            try:
+                specs = builtin_template_catalog().enumerate(
+                    "K3", problem, datapath, template_id=identifier, all_variants=True,
+                    aic_budget=aic, aiv_budget=aiv,
+                )
+            except ModelingError:
+                continue
+            for spec in specs:
+                yield spec, members, index
+
+
+def _declared_regions(ops):
     for op in ops:
         for declaration in dict(op.metadata).get("fuse_regions", ()):
-            ids = tuple(declaration["op_ids"])
-            members = _convex_members(ops, ids)
-            routes = tuple(declaration["edge_routes"])
-            if len(members) < 2 or not declaration.get("numerically_equivalent"):
-                continue
-            if len({item.stage for item in members}) != 1 or not routes:
-                continue
-            edges = {(dep, item.op_id) for item in members for dep in item.deps if dep in ids}
-            if {(route.src_op, route.dst_op) for route in routes} != edges:
-                continue
-            # The standalone compiler accepts forward immutable handoffs.
-            # Mutation aliases require the interpreter's full port analysis.
-            if any(route.in_place_mutates or route.ring_depth < 1 for route in routes):
-                continue
-            tile = _checked_tiles(declaration["tile_spec"], datapath, aic, aiv, op)
-            if tile is None or not tile.pool_peaks:
-                continue
-            shape = tile.tile_shape
-            if any(route.route_kind != "gm_spill" and not _paired_route(
-                datapath, *route.route_kind.split("->"), route.representation, aic, aiv,
-                (shape.m, shape.n, shape.k),
-            ) for route in routes):
-                continue
-            spec = FuseRegionSpec(declaration["region_id"], ids,
-                                  tuple(declaration.get("live_in_obligations", ())),
-                                  tuple(declaration.get("live_out_obligations", ())),
-                                  routes, tile.algorithm, tile, declaration["backend"])
-            yield spec, tuple(declaration.get("preserve_ports", ()))
+            if declaration.get("numerically_equivalent") and "compiler_options" in declaration:
+                yield declaration
+
+
+def _region_lowerer(declaration, members):
+    options = dict(declaration["compiler_options"])
+    options.update(
+        dependencies={op.op_id: op.deps for op in members}, edge_routes=tuple(declaration["edge_routes"]),
+        live_in_obligations=tuple(declaration.get("live_in_obligations", ())),
+        live_out_obligations=tuple(declaration.get("live_out_obligations", ())),
+        backend=declaration["backend"],
+    )
+
+    def lower(datapath, *, region_id, **binding):
+        _, result = builtin_template_catalog().compile_region(
+            region_id, tuple(op.op_id for op in members), datapath, **{**options, **binding},
+        )
+        return result
+    return lower
+
 
 def _dsl_proposals(ops, datapath, aic, aiv):
     from mindie_sim.rewrite.schema import FuseRegion, KernelBoundary, OpRef, SelectTemplate
 
-    for spec, ids in select_dsl_candidates(ops, datapath, aic, aiv):
+    for spec, ids, index in _dsl_candidates(ops, datapath, aic, aiv):
         refs = tuple(OpRef("atom", op_id) for op_id in ids)
         meta = next(dict(op.metadata) for op in ops if op.op_id == ids[-1])
         if len(refs) == 1:
             yield (SelectTemplate(refs[0], "K3", spec.kernel_id, (
-                ("variant", spec.template_variant), ("aic_budget", spec.aic_budget),
-                ("aiv_budget", spec.aiv_budget),
+                ("aic_budget", spec.aic_budget), ("aiv_budget", spec.aiv_budget), ("declaration", index),
             )),), spec
         elif "dsl_preserve_ports" in meta:
-            preserve = tuple(meta["dsl_preserve_ports"])
-            yield (FuseRegion(refs, preserve, (KernelBoundary(spec.kernel_id, refs),),
+            yield (FuseRegion(refs, tuple(meta["dsl_preserve_ports"]), (KernelBoundary(spec.kernel_id, refs),),
                               fusion_tier="K3_dsl_pipeline"),), spec
-    for spec, preserve in _general_fuse(ops, datapath, aic, aiv):
-        members = tuple(OpRef("atom", op_id) for op_id in spec.op_ids)
-        yield (FuseRegion(members, preserve, (KernelBoundary(spec.region_id, members),),
-                          fusion_tier="K3_dsl_pipeline"),), spec
+    for declaration in _declared_regions(ops):
+        ids = tuple(declaration["op_ids"])
+        members = _convex_members(ops, ids)
+        if len(members) < 2:
+            continue
+        identifier = declaration["region_id"]
+        try:
+            result = _region_lowerer(declaration, members)(datapath, region_id=identifier)
+        except ModelingError:
+            continue
+        refs = tuple(OpRef("atom", op_id) for op_id in ids)
+        preserve = tuple(declaration.get("preserve_ports", ()))
+        yield (FuseRegion(refs, preserve, (KernelBoundary(identifier, refs),),
+                          fusion_tier="K3_dsl_pipeline"),), result.summary.spec
 
-def _catlass_proposals(ops, datapath, aic, aiv, *, registered=None):
-    from mindie_sim.rewrite.schema import OpRef, PipelineTiles, SelectTemplate
+
+def _encode_spec_value(value):
+    return ",".join(map(str, value)) if isinstance(value, tuple) else "" if value is None else value
+
+
+def _catlass_proposals(ops, datapath, aic, aiv):
+    from mindie_sim.rewrite.schema import OpRef, SelectTemplate
 
     for op in ops:
         candidates = select_catlass_candidates(op, datapath, aic, aiv)
         first_by_template = {spec.template_id: spec for spec in reversed(candidates)}
-        ordered = sorted(candidates, key=lambda spec: spec != first_by_template[spec.template_id])
-        for spec in ordered:
-            if registered is not None and spec.template_id not in registered:
-                continue
-            ref = OpRef("atom", op.op_id)
-            params = (
-                ("scheduler", spec.scheduler), ("splitk_factor", spec.splitk_factor),
-                ("swizzle_offset", spec.swizzle_offset), ("swizzle_direction", spec.swizzle_direction),
-                ("aic_budget", spec.aic_budget), ("aiv_budget", spec.aiv_budget),
-            )
-            pipeline = _matrix_pipeline(spec, op, datapath, _matrix_shape(op))
-            if pipeline is not None:
-                yield (SelectTemplate(ref, "K2", spec.template_id, params), PipelineTiles(ref, pipeline)), spec
+        for spec in sorted(candidates, key=lambda item: item != first_by_template[item.template_id]):
+            params = tuple((key, _encode_spec_value(getattr(spec, key))) for key in _CATLASS_FIELDS)
+            params += (("aic_budget", spec.aic_budget), ("aiv_budget", spec.aiv_budget))
+            yield (SelectTemplate(OpRef("atom", op.op_id), "K2", spec.template_id, params),), spec
+
+
+def _catalog_lowerer(op, members, datapath, tier, identifier, params, limits):
+    catalog = builtin_template_catalog()
+    options = dict(params)
+    aic = options.pop("aic_budget", limits[0])
+    aiv = options.pop("aiv_budget", limits[1])
+    if any(type(budget) is not int or not 0 <= budget <= limit for budget, limit in zip((aic, aiv), limits)):
+        raise ModelingError(f"rewrite_template_core_budget_invalid:{op.op_id}")
+    if tier == "K2":
+        problem = _matrix_problem(op, dict(op.metadata))
+        if problem is not None and options.keys() <= set(_CATLASS_FIELDS):
+            for spec in _catlass_specs(op, problem, datapath, aic, aiv, identifier):
+                if all(_encode_spec_value(getattr(spec, key)) == value for key, value in options.items()):
+                    return partial(catalog.lower, tier, spec, problem)
+    elif tier == "K3":
+        if not options and op.family == "rewrite_fused":
+            ids = tuple(member.op_id for member in members)
+            declared_region = next((entry for entry in _declared_regions(members)
+                                    if entry["region_id"] == identifier and tuple(entry["op_ids"]) == ids), None)
+            if declared_region is not None:
+                return _region_lowerer(declared_region, members)
+        index = options.pop("declaration", None)
+        kernel = "dsl." + identifier.removeprefix("dsl.").partition(".")[0]
+        if options.keys() <= {"variant"} and (index is None or type(index) is int):
+            choices = []
+            member_ids = tuple(member.op_id for member in members)
+            for source in members:
+                for ordinal, declared, problem, ids in _dsl_declarations(source):
+                    if (ids == member_ids and declared in {kernel, identifier}
+                            and (index is None or index == ordinal)):
+                        choices.append(problem)
+            if len(choices) == 1:
+                spec, = catalog.enumerate(
+                    tier, choices[0], datapath, template_id=identifier, aic_budget=aic, aiv_budget=aiv, **options,
+                )
+                return partial(catalog.lower, tier, spec, choices[0])
+    raise ModelingError(f"rewrite_template_recipe_unbound:{op.op_id}:{identifier}")
+
+
+def replay_catalog_binding(scenario, entry, op, binding, plan, stream):
+    from mindie_sim.rewrite.apply import _die, _path
+    from mindie_sim.rewrite.schema import FuseRegion
+
+    if binding and binding.tier in {"K2", "K3"} and binding.template_id.startswith(("catlass.", "dsl.")):
+        tier, identifier, params = binding.tier, binding.template_id, binding.params
+        members = (op,)
+    elif op.family == "rewrite_fused" and dict(op.metadata).get("fusion_tier") == "K3_dsl_pipeline":
+        edit = next(edit for edit in plan.edits if op.op_id == f"rewrite:{edit.edit_id}")
+        operation = edit.operation
+        if (not isinstance(operation, FuseRegion) or len(operation.kernel_boundaries) != 1
+                or any(ref.kind != "atom" for ref in operation.members)):
+            return None
+        ids = {ref.id for ref in operation.members}
+        members = tuple(member for member in entry.ops if member.op_id in ids)
+        tier, identifier, params = "K3", op.recipe, ()
+        if not identifier.startswith("dsl.") and not any(
+            decl["region_id"] == identifier for decl in _declared_regions(members)
+        ):
+            return None
+    else:
+        return None
+    path = _path(scenario, entry.replica, op.stage)
+    limits = path.aic_count, path.aiv_count
+    if stream is not None:
+        owners = bind_stream_owners(stream, path)[dict(stream.assignments).get(op.op_id, MAIN_STREAM)]
+        limits = owners.aic_limit, owners.aiv_limit
+    return bind_catalog_recipe(op, members, path, tier=tier, identifier=identifier, params=params,
+                               limits=limits, die=_die(scenario, entry.replica, op.stage).rank,
+                               replica=entry.replica)
+
+
+def bind_catalog_recipe(op, members, datapath, *, tier, identifier, params, limits, die, replica):
+    """Resolve the edit against its problem and use one specialization for audit and execution."""
+    lower = _catalog_lowerer(op, members, datapath, tier, identifier, params, limits)
+    result = lower(datapath, die=die, region_id=op.op_id)
+    raw = result.summary
+    summary = replace(
+        raw, op_ids=tuple(member.op_id for member in members),
+        semantic_work=tuple(replace(item, die=die, replica=replica, pp_stage=op.stage)
+                            for item in raw.semantic_work),
+    )
+    if isinstance(raw.spec, DslKernelSpec):
+        summary = replace(summary, **{
+            field: tuple(replace(item, allocation_id=f"{op.op_id}:{item.allocation_id}")
+                         for item in getattr(raw, field))
+            for field in ("read_obligations", "write_obligations")
+        })
+    resources = Counter()
+    roles = {"mte2_aic": "mte2", "mte2_aiv": "mte2",
+             "vec_alu": "vector", "vec_reduce": "vector", "vec_sfu": "vector", "sort_topk": "vector",
+             "aiv_simt": "vector"}
+    for stage in result.program.stages:
+        for role, amount in stage.work.items():
+            if role != "cube":
+                resources[roles.get(role, role)] += amount
+    work = Work(dict(summary.issued_cube_flops_by_dtype), resources)
+
+    def build(_op, _geometry):
+        def program(context):
+            program = lower(context.datapath or datapath, context=context, die=die, region_id=op.op_id).program
+            return _share_hbm_row(program, context)
+        return OperatorPlan(work, program)
+
+    return PlannedRecipe(build), summary
+
+
+def _share_hbm_row(program, context):
+    """Bind native HBM service bytes to the shared row used by shipping kernels."""
+    bus = getattr(program, "hbm_bus", None)
+    if bus is None:
+        return program
+    row = context.resource_names["hbm"]
+    directional = {bus.row_r, bus.row_w}
+    counters = {bus.ctr_r, bus.ctr_w}
+    stages = []
+    for stage in program.stages:
+        amount = sum(value for key, value in stage.deliveries if key in counters)
+        if amount:
+            work = {key: value for key, value in stage.work.items() if key not in directional}
+            duration = max(stage.work.get(key, 0) for key in directional)
+            stage = replace(stage, work={**work, row: amount}, caps={**stage.caps, row: amount / duration},
+                            coupled=True)
+        stages.append(stage)
+    return KernelProgram(tuple(stages), program.minimum_ms)
+
 
 def solve_dsl(
     dossier: ScenarioDossier, fw_result: FrameworkSolveResult, *, dual_report=None,
     dual_program=None, event_dag=None, dual_certificate=None, max_trials: int = DEFAULT_MAX_TRIALS,
 ) -> DslSolveResult:
-    from mindie_sim.rewrite.schema import plan_sha256
-
     search = _TrialSearch(dossier, max_trials, dual_program=dual_program, event_dag=event_dag,
                           dual_certificate=dual_certificate)
     search.seed(fw_result.best_plan, fw_result.best_eval)
-    specs_by_edit = {}
 
     def candidates(base, scenario, index, stage):
         ops = _atomic_ops(scenario)
@@ -543,19 +408,12 @@ def solve_dsl(
             if index == 0:
                 proposals = _dsl_proposals(ops, path, aic, aiv)
             else:
-                from mindie_sim.rewrite.oracle import ScenarioHandle, _baseline
-
-                book = (_baseline(search.handle, base).book if isinstance(search.handle, ScenarioHandle)
-                        else getattr(search.handle, "recipe_book", None))
                 bottlenecks = dict(getattr(dossier, "bottleneck_ops", ()))
                 sites = sorted(ops, key=lambda op: -bottlenecks.get(op.op_id, 0))
-                proposals = _catlass_proposals(sites, path, aic, aiv,
-                                               registered=getattr(book, "recipes", None))
+                proposals = _catlass_proposals(sites, path, aic, aiv)
 
-            for operations, spec in proposals:
-                candidate = _with_operations(base, stage, operations)
-                specs_by_edit[plan_sha256(candidate)] = (candidate, spec)
-                yield candidate
+            for operations, _ in proposals:
+                yield _with_operations(base, stage, operations)
 
     for index, stage in enumerate(DSL_STAGES):
         limit = search.remaining // (len(DSL_STAGES) - index)
@@ -563,9 +421,7 @@ def solve_dsl(
         search.stage(stage, _interleave(candidates(base, scenario, index, stage)
                                         for base, scenario in bases), limit)
     best = search.best_plan
-    specs = tuple(dict.fromkeys(spec for plan, spec in specs_by_edit.values()
-                                if plan.base_graph_sha256 == best.base_graph_sha256
-                                and all(edit in best.edits for edit in plan.edits)))
+    specs = tuple(dict.fromkeys(summary.spec for summary in getattr(search.best_eval, "region_summaries", ())))
     return DslSolveResult(search.best_plan, search.best_eval, _wall(search.best_eval),
                           tuple(s for s in specs if isinstance(s, CatlassKernelSpec)),
                           tuple(s for s in specs if isinstance(s, DslKernelSpec)),

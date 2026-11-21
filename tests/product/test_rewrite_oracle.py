@@ -15,10 +15,15 @@ from time import monotonic
 import pytest
 
 from _support.axes import REPRESENTATIVE_SKUS
+from mindie_sim.catalog.ops import gemm_op, vector_op
+from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.compose import compose_case
 from mindie_sim.optimization import (
     EventDagSpec, ResourceChoiceProgram, build_dual_inputs_from_scenario, certify_lower_bound,
+    compute_compulsory_hbm_cut, solve_dsl, solve_framework,
 )
+from mindie_sim.optimization import contracts
+from mindie_sim.optimization.dsl_solver import _catlass_proposals, _dsl_proposals
 from mindie_sim.prediction.cost import CostModel
 from mindie_sim.prediction.evaluation import EvaluationContext, ExecutionBindings
 from mindie_sim.prediction.primitives import PrimitiveStore
@@ -29,7 +34,11 @@ from mindie_sim.rewrite import (
     evaluate_rewrites, finalize_plan, intern_step_archetypes, plan_sha256, prepare_scenario,
     verify_plan,
 )
+from mindie_sim.rewrite import oracle
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.templates import CatlassProblem, FusedRegionSummary, builtin_template_catalog
+from mindie_sim.templates.dsl_catalog import ATTN_RES, AttnResProblem
+from mindie_sim.templates.dsl_lower import ATTN_RES_VL
 
 pytestmark = pytest.mark.tier0
 
@@ -267,17 +276,21 @@ def test_finalize_binds_certificate_to_prepared_scenario():
     assert accepted.verification.passed
     assert accepted.verification.l_star_ns == certificate.l_star_lean_ns
 
-    other_program, other_dag = ResourceChoiceProgram(1, (1,), ()), EventDagSpec((1,), ())
+    invented_ns = accepted.wall_ns + 1
+    other_program, other_dag = ResourceChoiceProgram(1, (invented_ns,), ()), EventDagSpec((invented_ns,), ())
     other_certificate, _ = certify_lower_bound(other_program, other_dag)
-    assert other_certificate.l_star_lean_ns == 1 < accepted.wall_ns
+    assert other_certificate.l_star_lean_ns > accepted.wall_ns
     rejected = finalize_plan(handle, plan, dual_program=other_program, event_dag=other_dag,
                              dual_certificate=other_certificate)
-    *ordinary, bound = rejected.verification.gates
-    assert all(gate.passed for gate in ordinary)
-    assert rejected.wall_ns == accepted.wall_ns
-    assert (bound.passed, bound.reason, bound.detail) == (
-        False, "LEAN_CERTIFICATE_INVALID", "certificate_unbound_to_scenario",
-    )
+    direct = verify_plan(handle.scenario, accepted.applied, wall_ns=accepted.wall_ns,
+                         dual_program=other_program, event_dag=other_dag, dual_certificate=other_certificate)
+    for receipt in (rejected.verification, direct):
+        *ordinary, bound = receipt.gates
+        assert all(gate.passed for gate in ordinary)
+        assert receipt.wall_ns == accepted.wall_ns
+        assert (bound.passed, bound.reason, bound.detail) == (
+            False, "LEAN_CERTIFICATE_INVALID", "certificate_unbound_to_scenario",
+        )
 
 
 def test_reopening_primitive_store_does_not_reuse_closed_context(tmp_path, request_inputs):
@@ -299,3 +312,83 @@ def test_reopening_primitive_store_does_not_reuse_closed_context(tmp_path, reque
         assert second.handle.evaluation_context.cost.primitives is reopened
         result = finalize_plan(second.handle, second.unmerge_plan)
         assert result.verification.passed and result.wall_ns == first_result.wall_ns
+
+
+class _SingleOperatorSpine(PredictionSpine):
+    def __init__(self, op):
+        super().__init__()
+        self.op = op
+
+    def lower(self, case, request, **kwargs):
+        prepared = super().lower(case, request, **kwargs)
+        rank, = prepared.graph.executable
+        graph = replace(prepared.graph, executable=(replace(rank, ops=(self.op,)),), streams=())
+        return replace(prepared, graph=graph)
+
+
+@pytest.mark.parametrize("geometry", ((1, 1, 1), (32, 32, 160)), ids=("scalar", "multi-panel"))
+def test_catalog_matrix_replay_binds_lowered_obligations(geometry):
+    m, n, k = geometry
+    op = gemm_op(op_id="gemm", deps=(), requests=(), stage=0, layer=0,
+                 m=m, n=n, k=k, quant=QuantSpec("bf16"), category="dense", phase="decode",
+                 metadata=(("l1_tile_shape", (32, 32, 64)), ("l0_tile_shape", (32, 32, 32))))
+    case = compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a5"], tp=1, dp=1, layers=1)
+    dossier = prepare_scenario(ScenarioRequest(case, StepRequest("decode")), spine=_SingleOperatorSpine(op))
+    scenario = dossier.handle.scenario
+    path = scenario.datapath
+    (operation,), spec = next(_catlass_proposals((op,), path, path.aic_count, path.aiv_count))
+    assert operation.template_id == "catlass.basic_pingpong" and operation.template_id not in dossier.handle.recipe_book.recipes
+    plan = replace(dossier.unmerge_plan, edits=(Edit("matrix", operation=operation),))
+    screened, = evaluate_rewrites(dossier.handle, (plan,)).results
+    full = finalize_plan(dossier.handle, plan)
+    assert screened.accepted, tuple(g.detail for g in screened.verification.gates) if screened.verification else screened.reason
+    assert full.verification.passed, full.verification
+    summary, = full.region_summaries
+    assert type(summary) is contracts.FusedRegionSummary is FusedRegionSummary
+    assert summary.spec == spec and summary.op_ids == (op.op_id,)
+    lowered = builtin_template_catalog().lower("K2", spec, CatlassProblem(m, n, k), path)
+    if m == 1:
+        assert (summary.logical_transfer_bytes, summary.dram_sector_bytes) == (6, 96)
+    else:
+        assert lowered.stages_count == 106
+    assert summary.logical_transfer_bytes == 2 * (m * k + k * n + m * n)
+    cut = compute_compulsory_hbm_cut((summary,))[0]
+    assert cut.read_bytes + cut.write_bytes == summary.dram_sector_bytes
+    program, dag, _ = build_dual_inputs_from_scenario(scenario, region_summaries=(summary,))
+    certificate, _ = certify_lower_bound(program, dag)
+    receipt = verify_plan(scenario, full.applied, wall_ns=full.wall_ns, region_summaries=(summary,),
+                          dual_program=program, event_dag=dag, dual_certificate=certificate)
+    assert receipt.passed and receipt.l_star_ns == full.verification.l_star_ns
+
+
+def test_constructive_search_replays_catalog_vector_kernel(monkeypatch):
+    problem = AttnResProblem(tokens=1)
+    width = problem.hidden_size
+    op = vector_op(op_id="residual", deps=(), stage=0, layer=0, requests=(), elements=width,
+                   ops_per_element=18, vector_ops_override=18 * width + 3 + 2 * ATTN_RES_VL,
+                   dtype="bf16", family="elementwise", phase="decode", recipe="elementwise",
+                   metadata=(("dsl_kernel", ATTN_RES), ("dsl_problem", problem)),
+                   shape=(1, width), read_bytes_override=16 * width + 8, write_bytes_override=6 * width)
+    case = compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a5"], tp=1, dp=1, layers=1)
+    dossier = prepare_scenario(ScenarioRequest(case, StepRequest("decode")), spine=_SingleOperatorSpine(op))
+    path = dossier.handle.scenario.datapath
+    ((operation,), spec), = _dsl_proposals((op,), path, path.aic_count, path.aiv_count)
+    assert operation.template_id == ATTN_RES + ".inplace" and operation.template_id not in dossier.handle.recipe_book.recipes
+    screened = []
+
+    def record(handle, plans, **kwargs):
+        result = evaluate_rewrites(handle, plans, **kwargs)
+        screened.extend((plan, candidate) for plan, candidate in zip(plans, result.results, strict=True))
+        return result
+
+    monkeypatch.setattr(oracle, "evaluate_rewrites", record)
+    framework = solve_framework(dossier, max_trials=0)
+    solve_dsl(dossier, framework, max_trials=3)
+    (plan, candidate), = [(plan, result) for plan, result in screened
+                          if any(edit.operation == operation for edit in plan.edits)]
+    assert candidate.accepted, tuple(g.detail for g in candidate.verification.gates) if candidate.verification else candidate.reason
+    full = finalize_plan(dossier.handle, plan)
+    assert full.verification.passed, full.verification
+    summary, = full.region_summaries
+    assert summary.spec == spec
+    assert sum(item.logical_ops for item in summary.semantic_work) == op.vector_ops
