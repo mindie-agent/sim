@@ -12,8 +12,8 @@ from types import SimpleNamespace
 import pytest
 
 import test_v0919_final_delta_math as prior
-import test_wave4a_c8sfa_mqsmla_calibration as a
-import test_wave4b_indexer_conv1d_calibration as b
+import _support.operator_calibration_helpers as a
+import _support.operator_calibration_helpers as b
 from mindie_sim.catalog.mqsmla_layout import packed_row_parts
 from mindie_sim.prediction import family_mqsmla, index_pool_native, latent_dcp, mqsmla
 from mindie_sim.prediction.batch_prefix_attention import nested_prefix_union

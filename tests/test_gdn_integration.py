@@ -9,7 +9,7 @@ from mindie_sim.prediction.frontend import Frontend
 from mindie_sim.prediction.operator_analysis import operator_costs
 from mindie_sim.prediction.instructions import REGISTER_RESOURCES
 from mindie_sim.schema.workload import IterationPlan, RequestView
-from test_operator_mechanisms import recurrent_case
+from _support.operator_cases import recurrent_case
 
 
 def native_case():

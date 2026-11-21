@@ -13,7 +13,7 @@ from mindie_sim.schema.operators import IterationWork
 from mindie_sim.schema.workload import IterationPlan
 from test_device_kernel_groups import phase
 from test_graph_analysis import op
-from test_mechanism_contract import hardware_case
+from _support.operator_cases import hardware_case
 
 
 BUFFER = 'shared_scratch'

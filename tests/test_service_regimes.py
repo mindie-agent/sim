@@ -10,7 +10,7 @@ from mindie_sim.prediction.program import KernelProgram, RecipeBook, Stage
 from test_device_kernel_groups import fork
 from test_graph_analysis import op
 from test_invocation_binding import lower_copy
-from test_mechanism_contract import hardware_case
+from _support.operator_cases import hardware_case
 from test_resource_services import copy_op
 
 

@@ -7,8 +7,8 @@ from mindie_sim import graph_costs, operator_costs, predict, target_operators
 from mindie_sim.schema.hardware import Hardware
 from mindie_sim.schema.operators import IterationWork
 from test_graph_analysis import op
-from test_mechanism_contract import hardware_case
-from test_mla_family_selection import mla_case
+from _support.operator_cases import hardware_case
+from _support.operator_cases import mla_case
 
 
 def timed_case():

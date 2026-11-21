@@ -18,8 +18,8 @@ from mindie_sim.schema.operators import IterationWork
 from test_communication_topology import exchange
 from test_graph_analysis import op
 from test_joint_collective_execution import cohort_case
-from test_mechanism_contract import hardware_case
-from test_mla_family_selection import mla_case
+from _support.operator_cases import hardware_case
+from _support.operator_cases import mla_case
 from test_resource_services import copy_op, curve
 
 

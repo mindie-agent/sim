@@ -1,0 +1,255 @@
+"""Public entrypoint for governed Ascend attention.
+
+[Role] Bind structural attention contracts to the declared ISA and source ABI.
+[Invariants] A source ABI selects exactly one strategy. Legacy sparse callers
+  use the same planner and retain their recipe identities.
+[Timeouts & Locks] Bounded source dispatch without I/O or locks.
+[Side-Effect Policy] Pure operator, planning and registration records.
+"""
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import asdict, replace
+
+from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.compute_arch import ComputeArchSpec
+from mindie_sim.schema.datapath import ArchId, ComputeArchIdentity, DatapathCapabilitySpec, GENERIC_ARCH_ID
+from mindie_sim.schema.operators import OpSpec
+from ...mechanism import Geometry, OperatorPlan, PlannedRecipe
+from ...results import OpOccurrence
+from ..contracts import OperatorFamilySpec, OperatorPlanningContext, ResolvedOperator
+from . import arch22, arch35
+from ._cp_tiling import cp_operators, with_collectives
+from .common import (
+    ARCH22, ARCH35, C8_ABI, C8_LATENT_DIM, FIA_ABI, FIA_TILE,
+    GBSA_ABI, MINDIE_ABIS, MINDIE_V3_ABI, NOPE_ABI, QUANT_MODE_BF16, QUANT_MODE_FP8_C8, QUANT_MODE_INT8_C8,
+    QUANT_MODE_MXFP4_CX, QUANT_MODE_MXFP4_OCP, QUANT_MODE_MXFP8, QUANT_MODE_TQ4, SUPPORTED_QUANT_MODES, AttentionContract, ContextParallelPlan,
+    FiaPanelPlan, bsh_kv_access_plan, c8_gather_accounting, describe, lower_cp_collectives,
+    shipping_fia_panel_plan, solve_wide_head_tiling, unmodeled,
+)
+
+FIA_RECIPE = "fused_infer_attention_score"
+GBSA_RECIPE = "generic_block_sparse_attention_arch35"
+KV_QUANT_SFA_C8_RECIPE = "kv_quant_sfa_c8_arch35"
+SPARSE_FLASH_MLA_NOPE_RECIPE = "sparse_flash_mla_nope_arch35"
+LEGACY_RECIPES = frozenset({GBSA_RECIPE, KV_QUANT_SFA_C8_RECIPE, SPARSE_FLASH_MLA_NOPE_RECIPE})
+RECIPE_BY_ABI = {
+    FIA_ABI: FIA_RECIPE, GBSA_ABI: GBSA_RECIPE, C8_ABI: KV_QUANT_SFA_C8_RECIPE,
+    NOPE_ABI: SPARSE_FLASH_MLA_NOPE_RECIPE, **{abi: abi for abi in MINDIE_ABIS},
+}
+ABI_BY_RECIPE = {recipe: abi for abi, recipe in RECIPE_BY_ABI.items()}
+STRATEGIES = {ARCH22: arch22.STRATEGY, ARCH35: arch35.STRATEGY}
+DEFAULT_GBSA_BLOCK_SIZE = 8
+DEFAULT_SFA_SELECTED_TOKENS = 2048
+
+
+def _legacy_contract(op: OpSpec, meta: dict) -> AttentionContract:
+    abi = ABI_BY_RECIPE[op.recipe]
+    if abi == GBSA_ABI:
+        raw = dict(meta.get("gbsa_geometry") or {})
+        q = op.local_shape[0] if op.local_shape else 1
+        heads = op.local_shape[1] if len(op.local_shape) > 1 else 1
+        width = op.local_shape[-1] if op.local_shape else FIA_TILE
+        selected = raw.get("selected_tokens", FIA_TILE)
+        return AttentionContract(
+            raw.get("query_tokens", q), raw.get("num_heads", heads), raw.get("num_kv_heads", 1),
+            raw.get("head_dim", width), raw.get("v_head_dim", raw.get("head_dim", width)),
+            selected_tokens=selected, phase=op.phase, abi=abi,
+            block_size=tuple(raw.get("block_shape") or (1, DEFAULT_GBSA_BLOCK_SIZE))[-1],
+            quant_mode=raw.get("quant_mode", QUANT_MODE_BF16), ssmax=raw.get("ssmax", False),
+            metadata_reuse=raw.get("metadata_reuse", False),
+            batch_size=raw.get("batch_size", q), shared_prefix=raw.get("shared_prefix", False),
+        )
+    raw = dict(meta["sfa_geometry"])
+    latent = raw["kv_lora_rank"]
+    return AttentionContract(
+        raw["query_tokens"], raw["num_heads"], 1, latent + raw["rope_dim"], latent,
+        selected_tokens=raw["selected_tokens"], phase=op.phase, abi=abi,
+        kv_layout="PA_BLK_BSND", quant_mode=raw.get("quant_mode",
+            QUANT_MODE_BF16 if abi == NOPE_ABI else QUANT_MODE_FP8_C8),
+        precompute_scale_addr=raw.get("precompute_scale_addr", True),
+        batch_size=raw.get("batch_size", raw["query_tokens"]),
+        shared_prefix=raw.get("shared_prefix", False),
+    )
+
+
+def _contract(op: OpSpec, requested_abi: str | None) -> AttentionContract:
+    meta = dict(op.metadata)
+    raw = meta.get("attention_contract")
+    if isinstance(raw, AttentionContract):
+        contract = raw
+    elif isinstance(raw, Mapping):
+        values = dict(raw)
+        if values.get("cp_plan"):
+            values["cp_plan"] = tuple(p if isinstance(p, ContextParallelPlan) else ContextParallelPlan(**p)
+                                      for p in values["cp_plan"])
+        if isinstance(values.get("fia_template"), Mapping):
+            template = dict(values["fia_template"])
+            for key in ("k_panels", "v_panels"):
+                template[key] = tuple(template[key])
+            values["fia_template"] = FiaPanelPlan(**template)
+        contract = AttentionContract(**values)
+    elif op.recipe in LEGACY_RECIPES:
+        contract = _legacy_contract(op, meta)
+    else:
+        raise unmodeled("attention_contract_required", "Bind rank-local Q, KV and selection geometry")
+    bindings = (requested_abi, meta.get("native_kind"), ABI_BY_RECIPE.get(op.recipe))
+    if any(abi is not None and abi != contract.abi for abi in bindings):
+        raise unmodeled("attention_abi_conflict", f"Bind one consistent ABI for {op.op_id}")
+    if contract.phase != op.phase:
+        raise ModelingError("attention_op_phase_mismatch")
+    return contract
+
+
+def _planning_context(op: OpSpec, geometry: Geometry) -> OperatorPlanningContext:
+    datapath = geometry.datapath
+    if datapath is None:
+        arch = geometry.compute_arch
+        if arch is None and op.recipe in LEGACY_RECIPES:
+            arch = ComputeArchSpec.from_mapping({"preset": ARCH35})
+        if arch is None:
+            raise unmodeled("attention_datapath_required", "Bind explicit compute architecture and datapath")
+        aics = geometry.compute_units
+        aivs = geometry.resource_units.get("vector", aics)
+        if aics < 1 or aivs < 1:
+            raise unmodeled("attention_owner_pairs", "Bind positive AIC and AIV budgets")
+        ratio, remainder = divmod(aivs, aics)
+        pairs = tuple((aic, tuple(range(aic * ratio, (aic + 1) * ratio))) for aic in range(aics))
+        datapath = DatapathCapabilitySpec(
+            ComputeArchIdentity(ArchId(arch.preset) if arch.preset else GENERIC_ARCH_ID, arch),
+            aics, aivs, pairs if not remainder else (),
+            tuple(arch.paths), frozenset(), (), None, buffers=tuple(geometry.buffers.items()),
+        )
+        geometry = replace(geometry, datapath=datapath)
+    return OperatorPlanningContext(
+        OpOccurrence(geometry.replica, op.stage, geometry.rank, op.op_id), geometry, datapath,
+        stream_owners=geometry.stream_owners,
+    )
+
+
+def build(op: OpSpec, ctx: OperatorPlanningContext | Geometry, /) -> OperatorPlan:
+    """Build the source-bound attention kernel at either planning entrypoint."""
+    if isinstance(ctx, Geometry):
+        ctx = _planning_context(op, ctx)
+    contract = _contract(op, ctx.requested_abi)
+    strategy = STRATEGIES.get(ctx.compute_arch.arch_id)
+    if strategy is None:
+        raise unmodeled("attention_arch_unsupported", f"Bind attention for {ctx.compute_arch.arch_id}")
+    normalized = replace(op, dtype=op.dtype or "bf16", metadata=tuple(sorted({
+        **dict(op.metadata), "attention_contract": contract, "native_kind": contract.abi,
+    }.items())))
+    plan = strategy.build(normalized, ctx)
+    if contract.cp_plan:
+        caller_files = {("common_cp.py", binding.stack_revision) for binding in contract.cp_plan}
+        caller_files.update((binding.caller_site.split(".", 1)[0] + ".py", binding.stack_revision)
+                            for binding in contract.cp_plan)
+        sources = tuple(ref for ref in arch35.CP_SOURCES
+                        if (ref.relative_path.rsplit("/", 1)[-1], ref.revision) in caller_files)
+        plan = with_collectives(plan, cp_operators(normalized, contract.cp_plan), sources)
+    return plan
+
+
+def resolve_operator_plan(op: OpSpec, ctx: OperatorPlanningContext, /) -> ResolvedOperator:
+    """Return the kernel program and occurrence-bound pipeline projection."""
+    plan = build(op, ctx)
+    descriptor = describe(op, ctx, plan)
+    return ResolvedOperator(ctx.occurrence, op, plan, descriptor.implementation, descriptor.sources, descriptor)
+
+
+def register_family() -> OperatorFamilySpec:
+    """Declare the governed family's exact owned recipe IDs."""
+    return OperatorFamilySpec("attention", frozenset({"attention", "mla"}), frozenset(ABI_BY_RECIPE),
+                              resolve_operator_plan)
+
+
+def _kernels(op: OpSpec) -> tuple[OpSpec, ...]:
+    contract = _contract(op, None)
+    gathers = cp_operators(op, contract.cp_plan or ())
+    kernel = replace(
+        op, op_id="attention", deps=(gathers[-1].op_id,) if gathers else (), source_boundary="kernel",
+        metadata=tuple({**dict(op.metadata), "attention_contract": asdict(replace(contract, cp_plan=None))}.items()),
+    )
+    return (*gathers, kernel)
+
+
+def recipes() -> dict[str, PlannedRecipe]:
+    """Expose exact recipe bindings through the existing source-recipe entrypoint."""
+    planner = PlannedRecipe(build, _kernels)
+    return {recipe: planner for recipe in ABI_BY_RECIPE}
+
+
+def make_attention_op(
+    contract: AttentionContract, *, op_id: str, deps: tuple[str, ...] = (), stage: int = 0,
+    layer: int = 0, requests: tuple[str, ...] = (), dtype: str = "bf16",
+) -> OpSpec:
+    """Create a JSON-compatible source kernel declaration from the typed contract."""
+    shape = (contract.query_tokens, contract.num_heads, contract.v_head_dim)
+    family = "mla" if contract.abi in {C8_ABI, NOPE_ABI} else "attention"
+    matrix_dtype = dtype
+    if contract.quant_mode == QUANT_MODE_MXFP8 or (
+        contract.abi in MINDIE_ABIS and contract.quant_mode in {QUANT_MODE_INT8_C8, QUANT_MODE_FP8_C8}
+    ):
+        matrix_dtype = "fp8_e4m3"
+    if contract.abi == MINDIE_V3_ABI and contract.quant_mode in {QUANT_MODE_MXFP4_OCP, QUANT_MODE_MXFP4_CX}:
+        matrix_dtype = "mxfp4"
+    return OpSpec(
+        op_id=op_id, deps=deps, stage=stage, layer=layer, requests=requests,
+        family=family, phase=contract.phase, recipe=RECIPE_BY_ABI[contract.abi],
+        semantic_shape=shape, local_shape=shape, padded_shape=shape, launch_shape=shape,
+        dtype=dtype, layout=contract.kv_layout,
+        source_boundary="call" if contract.cp_plan else "kernel",
+        flops=contract.useful_flops, matrix_flops=((matrix_dtype, contract.useful_flops),),
+        returns=("lse",) if contract.return_lse else (),
+        metadata=(("attention_contract", asdict(contract)), ("native_kind", contract.abi)),
+    )
+
+
+def make_gbsa_op(
+    *, op_id: str, deps: tuple[str, ...] = (), stage: int = 0, layer: int = 0,
+    requests: tuple[str, ...] = (), phase: str = "decode", query_tokens: int, num_heads: int,
+    num_kv_heads: int, head_dim: int, v_head_dim: int | None = None, selected_tokens: int,
+    context_tokens: int | None = None, block_size: int = DEFAULT_GBSA_BLOCK_SIZE,
+    quant_mode: int = QUANT_MODE_BF16, ssmax: bool = False, metadata_reuse: bool = False,
+    batch_size: int | None = None, shared_prefix: bool = False,
+) -> OpSpec:
+    """Bind the legacy GBSA parameters to the governed ABI."""
+    batch = (len(requests) or query_tokens) if batch_size is None else batch_size
+    sequences = ()
+    if context_tokens is not None and query_tokens > 0 and batch > 0:
+        groups = min(query_tokens, batch)
+        quotient, remainder = divmod(query_tokens, groups)
+        sequences = tuple((quotient + (rank < remainder), max(context_tokens, selected_tokens))
+                          for rank in range(groups))
+    contract = AttentionContract(
+        query_tokens, num_heads, num_kv_heads, head_dim, head_dim if v_head_dim is None else v_head_dim,
+        selected_tokens=selected_tokens, phase=phase, abi=GBSA_ABI, block_size=block_size,
+        quant_mode=quant_mode, ssmax=ssmax, metadata_reuse=metadata_reuse,
+        batch_size=batch, shared_prefix=shared_prefix, sequences=sequences,
+    )
+    return make_attention_op(contract, op_id=op_id, deps=deps, stage=stage, layer=layer, requests=requests)
+
+
+def make_kv_quant_sfa_c8_op(
+    *, op_id: str, deps: tuple[str, ...] = (), stage: int = 0, layer: int = 0,
+    requests: tuple[str, ...] = (), phase: str = "decode", query_tokens: int, num_heads: int,
+    kv_lora_rank: int = C8_LATENT_DIM, rope_dim: int = 0, selected_tokens: int = DEFAULT_SFA_SELECTED_TOKENS,
+    precompute_scale_addr: bool = True, nope_bf16: bool = False, batch_size: int | None = None,
+    shared_prefix: bool = False, quant_mode: int = QUANT_MODE_FP8_C8,
+    selection_lists: tuple[tuple[int, ...], ...] = (), kv_tensor_id: str = "", kv_version: int = 0,
+) -> OpSpec:
+    """Bind the legacy C8 or NoPE parameters to their distinct kernel ABI."""
+    contract = AttentionContract(
+        query_tokens, num_heads, 1, kv_lora_rank + rope_dim, kv_lora_rank, selected_tokens=selected_tokens,
+        phase=phase, abi=NOPE_ABI if nope_bf16 else C8_ABI, kv_layout="PA_BLK_BSND",
+        quant_mode=QUANT_MODE_BF16 if nope_bf16 else quant_mode, precompute_scale_addr=precompute_scale_addr,
+        batch_size=(len(requests) or query_tokens) if batch_size is None else batch_size,
+        shared_prefix=shared_prefix, selection_lists=selection_lists, kv_tensor_id=kv_tensor_id, kv_version=kv_version,
+    )
+    return make_attention_op(contract, op_id=op_id, deps=deps, stage=stage, layer=layer, requests=requests)
+
+
+__all__ = [
+    "build", "resolve_operator_plan", "register_family", "AttentionContract", "ContextParallelPlan",
+    "c8_gather_accounting", "bsh_kv_access_plan", "solve_wide_head_tiling", "shipping_fia_panel_plan",
+    "lower_cp_collectives", "make_gbsa_op", "make_kv_quant_sfa_c8_op", "make_attention_op",
+]

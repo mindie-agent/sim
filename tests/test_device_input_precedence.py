@@ -16,7 +16,7 @@ A5_DRAM_SERVICE_SCALE = 1 / 0.8316
 from mindie_sim import operator_costs, study
 from mindie_sim.schema.hardware import Hardware
 from test_graph_analysis import op
-from test_mechanism_contract import hardware_case
+from _support.operator_cases import hardware_case
 
 
 def ascend_case(device):

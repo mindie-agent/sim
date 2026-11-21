@@ -9,7 +9,7 @@ from mindie_sim.catalog.quant import quant_preset
 from mindie_sim.prediction.blocks import norm
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.prediction.transforms import lower_implementations
-from test_mechanism_contract import hardware_case
+from _support.operator_cases import hardware_case
 
 
 @pytest.mark.parametrize("rows,width", ((2, 8), (3, 65)))

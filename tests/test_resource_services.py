@@ -18,7 +18,7 @@ from mindie_sim.prediction.structure import parse_case
 from mindie_sim.prediction.verification import verify_operator
 from mindie_sim.schema.operators import IterationWork, OpSpec
 from mindie_sim.schema.workload import IterationPlan, RequestView
-from test_mechanism_contract import hardware_case
+from _support.operator_cases import hardware_case
 
 
 def copy_op(work=2000, **changes):

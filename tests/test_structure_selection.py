@@ -30,7 +30,7 @@ def test_full_identity_is_preserved_without_retaining_unselected_replicas(sequen
 
 
 def test_source_native_fusion_and_calls_preserve_full_hash_and_boundaries():
-    from test_mla_family_selection import mla_case
+    from _support.operator_cases import mla_case
     raw = mla_case()
     raw['runtime']['kernels']['lowerings'] = {'mla_decode': {
         'implementation': 'vllm_triton_mla_decode_tuple', 'options': {'num_kv_splits': 2}}}

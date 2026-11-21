@@ -14,7 +14,7 @@ from mindie_sim.schema.operators import IterationWork
 from mindie_sim.schema.workload import IterationPlan
 from test_graph_analysis import op
 from test_invocation_binding import declare
-from test_mechanism_contract import hardware_case
+from _support.operator_cases import hardware_case
 
 
 def phase(name, *, group="dispatch", entry=False, exit=False, **kwargs):

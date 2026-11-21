@@ -30,7 +30,7 @@ from mindie_sim.schema.workload import RequestView
 
 @lru_cache(maxsize=1)
 def mq_case():
-    from test_mqsmla_source import case, attention
+    from _support.operator_cases import mqsmla_case as case, mqsmla_attention as attention
     c = case()
     return c, attention(target_graphs(c, phase="decode", tokens=1, context=2048)[0])
 

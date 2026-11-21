@@ -6,7 +6,7 @@ import pytest
 
 from mindie_sim.prediction.operator_analysis import target_operators
 from mindie_sim.structure import export_structure
-from test_mla_family_selection import mla_case
+from _support.operator_cases import mla_case
 from test_prediction_system import case
 
 

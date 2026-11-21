@@ -19,7 +19,7 @@ from test_device_kernel_groups import fork, phase
 from test_graph_analysis import op
 from test_joint_collective_execution import cohort_case
 from test_kernel_group_buffers import raw_case, group, competitor, recipes
-from test_mechanism_contract import hardware_case
+from _support.operator_cases import hardware_case
 from test_resource_services import copy_op
 
 

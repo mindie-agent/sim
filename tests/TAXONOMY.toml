@@ -171,42 +171,46 @@ owns = ["mindie_sim/prediction/operators/rotary"]
 [[module]]
 path = "operators/test_family_registry_and_dispatch.py"
 tier = "tier0"
-reserved = true
+owns = [
+  "mindie_sim/prediction/operators/contracts.py",
+  "mindie_sim/prediction/operators/registry.py",
+  "mindie_sim/prediction/operators/__init__.py",
+]
 
 [[module]]
 path = "operators/test_mla_prolog.py"
 tier = "tier0"
-reserved = true
+owns = ["mindie_sim/prediction/operators/mla_prolog"]
 
 [[module]]
 path = "operators/test_paged_mla.py"
 tier = "tier0"
-reserved = true
+owns = ["mindie_sim/prediction/operators/paged_mla"]
 
 [[module]]
 path = "operators/test_paged_mla_native_wrapper.py"
 tier = "tier0"
-reserved = true
+owns = ["mindie_sim/prediction/operators/paged_mla"]
 
 [[module]]
 path = "operators/test_attention_prefill.py"
 tier = "tier0"
-reserved = true
+owns = ["mindie_sim/prediction/operators/attention"]
 
 [[module]]
 path = "operators/test_attention_decode.py"
 tier = "tier0"
-reserved = true
+owns = ["mindie_sim/prediction/operators/attention"]
 
 [[module]]
 path = "operators/test_attention_sparse.py"
 tier = "tier0"
-reserved = true
+owns = ["mindie_sim/prediction/operators/attention"]
 
 [[module]]
 path = "operators/test_sparse_indexer.py"
 tier = "tier0"
-reserved = true
+owns = ["mindie_sim/prediction/operators/sparse_indexer"]
 
 [[module]]
 path = "operators/test_grouped_moe_routing.py"
@@ -453,7 +457,7 @@ reserved = true
 [[module]]
 path = "operators/test_sparse_indexer_topk.py"
 tier = "tier0"
-reserved = true
+owns = ["mindie_sim/prediction/operators/sparse_indexer"]
 
 [[module]]
 path = "product/test_rewrite_oracle.py"

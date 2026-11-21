@@ -17,14 +17,14 @@ def control(name):
         op=next(op for op in target_graphs(raw,scope='body',phase='decode',tokens=4,
             context=4096,sequences=16)[0] if op.recipe==PROFILE)
     elif name=='paged_mla':
-        from test_paged_mla import case,attention
+        from _support.operator_cases import paged_mla_case as case, paged_mla_attention as attention
         raw=case();op=attention(raw,context=128)[0]
     elif name=='mqsmla':
-        from test_mqsmla_source import case,attention
+        from _support.operator_cases import mqsmla_case as case, mqsmla_attention as attention
         raw=case();op=attention(target_graphs(raw,scope='body',phase='decode',tokens=1,
             context=128,sequences=1)[0])
     else:
-        from test_indexed_quant_attention import case,ops
+        from _support.operator_cases import indexed_quant_case as case, indexed_quant_ops as ops
         raw=case();op=ops(raw,context=128)[0]
     return parse_case(raw),replace(op,deps=())
 
