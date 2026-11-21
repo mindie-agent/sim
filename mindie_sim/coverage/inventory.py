@@ -13,6 +13,7 @@ import csv
 from hashlib import sha256
 import json
 from pathlib import Path
+import sys
 
 
 MAX_METADATA_BYTES = 16 * 1024 * 1024
@@ -22,11 +23,16 @@ _LEDGER_SUMMARY_DIMENSIONS = 5
 INVENTORY_SCHEMA = "mindie-sim.inventory-coverage/1"
 
 
+def _pkg_limit(name: str, default: int) -> int:
+    pkg = sys.modules.get("mindie_sim.coverage")
+    return getattr(pkg, name, default) if pkg is not None else default
+
+
 def source_identity(value):
     """Hash one bounded real input; the report keeps its concrete identity."""
     path = Path(value)
     size = path.stat().st_size
-    if size > MAX_IDENTITY_FILE_BYTES:
+    if size > _pkg_limit("MAX_IDENTITY_FILE_BYTES", MAX_IDENTITY_FILE_BYTES):
         raise ValueError("inventory_source_exceeds_64_mib")
     digest = sha256()
     with path.open("rb") as stream:
@@ -35,10 +41,11 @@ def source_identity(value):
     return {"path": str(path.resolve()), "sha256": digest.hexdigest(), "size_bytes": size}
 
 
-def _read_object(value, name, max_bytes=MAX_METADATA_BYTES):
+def _read_object(value, name, max_bytes=None):
+    limit = _pkg_limit("MAX_METADATA_BYTES", MAX_METADATA_BYTES) if max_bytes is None else max_bytes
     source = source_identity(value) if isinstance(value, (str, Path)) else None
     if source is not None:
-        if source["size_bytes"] > max_bytes:
+        if source["size_bytes"] > limit:
             raise ValueError(f"{name}_exceeds_16_mib")
         value = json.loads(Path(source["path"]).read_text(encoding="utf-8"))
     if not isinstance(value, Mapping):
@@ -57,7 +64,7 @@ def _int_field(container, key, *, required=False):
 
 def _ledger_identity(value, expected_rows):
     source = source_identity(value)
-    if source["size_bytes"] > MAX_IDENTITY_FILE_BYTES:
+    if source["size_bytes"] > _pkg_limit("MAX_IDENTITY_FILE_BYTES", MAX_IDENTITY_FILE_BYTES):
         raise ValueError("inventory_ledger_exceeds_64_mib")
     digest = sha256()
     rows = 0
@@ -84,7 +91,7 @@ def _ledger_identity(value, expected_rows):
                          group_key, size_key, role_key]
         for row in reader:
             rows += 1
-            if rows > MAX_INVENTORY_ROWS:
+            if rows > _pkg_limit("MAX_INVENTORY_ROWS", MAX_INVENTORY_ROWS):
                 raise ValueError("inventory_ledger_exceeds_100000_rows")
             digest.update("|".join(
                 str(row.get(key, "")) for key in digest_fields).encode("utf-8") + b"\n")
@@ -161,7 +168,7 @@ def _ledger_identity(value, expected_rows):
 
 def _a5_record_recovery(value, expected_rows):
     source = source_identity(value)
-    if source["size_bytes"] > MAX_IDENTITY_FILE_BYTES:
+    if source["size_bytes"] > _pkg_limit("MAX_IDENTITY_FILE_BYTES", MAX_IDENTITY_FILE_BYTES):
         raise ValueError("inventory_records_exceed_64_mib")
     flag_keys = (
         "full_per_call_10pct_validated", "per_step_runtime_state_restored",
@@ -184,7 +191,7 @@ def _a5_record_recovery(value, expected_rows):
                         else "record_grain" if "record_grain" in fields else None)
         for row in reader:
             total_rows += 1
-            if total_rows > MAX_INVENTORY_ROWS:
+            if total_rows > _pkg_limit("MAX_INVENTORY_ROWS", MAX_INVENTORY_ROWS):
                 raise ValueError("inventory_records_exceed_100000_rows")
             if str(row.get("hardware_tier", "")).strip() != "A5":
                 continue
@@ -236,7 +243,7 @@ def _a5_record_recovery(value, expected_rows):
 
 def _csv_records(value, name, required):
     source = source_identity(value)
-    if source["size_bytes"] > MAX_IDENTITY_FILE_BYTES:
+    if source["size_bytes"] > _pkg_limit("MAX_IDENTITY_FILE_BYTES", MAX_IDENTITY_FILE_BYTES):
         raise ValueError(f"{name}_exceeds_64_mib")
     rows = []
     with Path(value).open(newline="", encoding="utf-8-sig") as stream:
@@ -245,7 +252,7 @@ def _csv_records(value, name, required):
             raise ValueError(f"{name}_missing_required_columns")
         for row in reader:
             rows.append(row)
-            if len(rows) > MAX_INVENTORY_ROWS:
+            if len(rows) > _pkg_limit("MAX_INVENTORY_ROWS", MAX_INVENTORY_ROWS):
                 raise ValueError(f"{name}_exceeds_100000_rows")
     return rows, source
 

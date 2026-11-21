@@ -10,9 +10,10 @@ from __future__ import annotations
 
 from collections.abc import Hashable, Mapping
 from dataclasses import dataclass
+import sys
 from types import MappingProxyType
 
-from .engine_state import split_engine_state
+from .engine_state import split_engine_state as _default_split_engine_state
 from .interner import (
     CanonicalState,
     _DEFAULT_INTERNER,
@@ -156,7 +157,9 @@ class SettledFrontier:
             object.__setattr__(self, "_state_form", "canonical")
             _STATE_METRICS["canonical_frames"] += 1
         elif isinstance(state, tuple):
-            split = split_engine_state(state)
+            pkg = sys.modules.get("mindie_sim.prediction.engine_periodic")
+            splitter = getattr(pkg, "split_engine_state", _default_split_engine_state) if pkg is not None else _default_split_engine_state
+            split = splitter(state)
             canonical = None
             if split is not None:
                 static, dynamic = split

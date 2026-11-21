@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from copy import deepcopy
+import sys
 from typing import Any
 
 from mindie_sim.schema.common import ModelingError
@@ -149,19 +150,27 @@ def _plain_mapping(value: Any, context: str) -> dict[str, Any]:
             if not str(key).startswith("_")}
 
 
+def _active_archetype_templates() -> Mapping[str, dict[str, Any]]:
+    owner = sys.modules.get("mindie_sim.custom_hardware")
+    if owner is not None and hasattr(owner, "HARDWARE_ARCHETYPE_TEMPLATES"):
+        return owner.HARDWARE_ARCHETYPE_TEMPLATES
+    return HARDWARE_ARCHETYPE_TEMPLATES
+
+
 def _resolve_archetype(
     spec: Mapping[str, Any], archetype: str | None,
     *, prefer_spec_archetype: bool = False,
 ) -> str:
+    templates = _active_archetype_templates()
     declared = spec.get("archetype")
     if archetype is None:
         chosen = declared or _DEFAULT_ARCHETYPE
     elif (prefer_spec_archetype and archetype == _DEFAULT_ARCHETYPE
-          and declared in HARDWARE_ARCHETYPE_TEMPLATES):
+          and declared in templates):
         chosen = declared
     else:
         chosen = archetype
-    if chosen not in HARDWARE_ARCHETYPE_TEMPLATES:
+    if chosen not in templates:
         raise ModelingError(f"unknown_hardware_archetype:{chosen}")
     return str(chosen)
 
@@ -177,7 +186,8 @@ def _merge_inputs(
     resolved = _resolve_archetype(
         spec, archetype, prefer_spec_archetype=prefer_spec_archetype,
     )
-    merged = deepcopy(HARDWARE_ARCHETYPE_TEMPLATES[resolved])
+    templates = _active_archetype_templates()
+    merged = deepcopy(templates[resolved])
     merged.update(explicit)
     merged["archetype"] = resolved
     return resolved, merged, explicit
@@ -187,12 +197,13 @@ def export_hardware_sku_template(
     archetype: str = "ascend_dual_die_ub", *, include_schema_docs: bool = True,
 ) -> dict[str, Any]:
     """Return a fresh, agent-editable template for one structural archetype."""
-    if archetype not in HARDWARE_ARCHETYPE_TEMPLATES:
+    templates = _active_archetype_templates()
+    if archetype not in templates:
         raise ModelingError(f"unknown_hardware_archetype:{archetype}")
     template: dict[str, Any] = {
         "sku": _TEMPLATE_SKU,
         "archetype": archetype,
-        **deepcopy(HARDWARE_ARCHETYPE_TEMPLATES[archetype]),
+        **deepcopy(templates[archetype]),
     }
     if include_schema_docs:
         template["_field_docs"] = dict(_FIELD_DOCS)

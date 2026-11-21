@@ -59,7 +59,6 @@ __all__ = [
     "metrics",
     "reset_metrics",
     "reset_state_caches",
-    "split_engine_state",
     "structural_difference",
     "structural_equal",
 ]
