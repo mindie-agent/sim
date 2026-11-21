@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import sys
 from typing import Any
 
 from mindie_sim.schema.common import ModelingError
@@ -118,6 +119,11 @@ _EXACT_SEMANTIC_ALIASES = {
 }
 
 
+def _custom_ops() -> dict[str, dict[str, Any]]:
+    pkg = sys.modules.get(__package__ or "")
+    return getattr(pkg, "MINDIE_SD_CUSTOM_OPS", MINDIE_SD_CUSTOM_OPS) if pkg is not None else MINDIE_SD_CUSTOM_OPS
+
+
 def capabilities() -> dict[str, Any]:
     """Machine-readable registry of the declarations behind this wrapper."""
     from ..implementations import IMPLEMENTATIONS
@@ -128,6 +134,7 @@ def capabilities() -> dict[str, Any]:
         name: item for name, item in IMPLEMENTATIONS.items() if item.module in modules}
     selector_operators = {
         operator for item in implementations.values() for operator in item.operators}
+    ops = _custom_ops()
     return {
         "vendor": MINDIE_SD_VENDOR,
         "capabilities": tuple(sorted(CAPABILITIES)),
@@ -150,7 +157,7 @@ def capabilities() -> dict[str, Any]:
                 "sparse": bool(spec.get("sparse")),
                 "quantized_cache": bool(spec.get("quantized_cache")),
             }
-            for name, spec in MINDIE_SD_CUSTOM_OPS.items()
+            for name, spec in ops.items()
         },
     }
 
@@ -159,20 +166,21 @@ def _normalize_op_name(raw: str | None) -> str | None:
     if raw is None:
         return None
     clean = str(raw).strip().lower().removeprefix("mindie_sd_")
-    return clean if clean in MINDIE_SD_CUSTOM_OPS else str(raw).strip()
+    return clean if clean in _custom_ops() else str(raw).strip()
 
 
 def _resolve_op_name(op: OpSpec, explicit_op_name: str | None) -> str:
+    ops = _custom_ops()
     norm = _normalize_op_name(explicit_op_name)
     if norm is not None:
-        if norm not in MINDIE_SD_CUSTOM_OPS:
+        if norm not in ops:
             raise ModelingError(f"mindie_sd_custom_op_unknown:{explicit_op_name}")
         return norm
     for candidate in (op.recipe, op.family):
-        if candidate in _EXACT_SEMANTIC_ALIASES:
+        if candidate in _EXACT_SEMANTIC_ALIASES and _EXACT_SEMANTIC_ALIASES[candidate] in ops:
             return _EXACT_SEMANTIC_ALIASES[candidate]
         normalized = _normalize_op_name(candidate)
-        if normalized in MINDIE_SD_CUSTOM_OPS:
+        if normalized in ops:
             return normalized
     raise ModelingError(
         f"mindie_sd_custom_op_requires_explicit_name:{op.family}:{op.recipe}")

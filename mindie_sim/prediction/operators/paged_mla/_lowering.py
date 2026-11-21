@@ -143,25 +143,27 @@ def _sparse_ranges(indices, start: int, count: int):
     for _, run in groupby(enumerate(indices[start:start + count]), lambda item: item[1] - item[0]):
         yield next(run)[1], 1 + sum(1 for _ in run)
 
-def _read_sparse_bank(demand, c, branch, spans, count, table, dsl_width):
+def _read_sparse_bank(demand, c, branch, spans, table, dsl_width):
     if c.abi != MQS_ABI or c.quant_mode != ACLNN_MQS_SEPARATE_SCALE_MODE:
         width = ACLNN_MQS_INLINE_ROW_BYTES if c.abi == MQS_ABI else dsl_width
-        demand.transfer(branch, "mte2_aiv", count * width,
-                        _kv_runs(c, spans, width, width, table, c.kv_layout))
+        for span in spans:
+            demand.transfer(branch, "mte2_aiv", span[2] * width,
+                            _kv_runs(c, (span,), width, width, table, c.kv_layout))
         return
     # PA_BBND mode 2 packs the data plane first, then scale + pad for the block.
     row_width = ACLNN_MQS_DATA_BYTES + ACLNN_MQS_SCALE_BYTES
-    for plane, width, plane_offset in (
-        ("data", ACLNN_MQS_DATA_BYTES, 0), ("scale", ACLNN_MQS_SCALE_BYTES, ACLNN_MQS_DATA_BYTES),
-    ):
-        runs = tuple(AddressRun(
-            ((table[page] if table else page) * row_width + plane_offset) * c.page_size + offset * width,
-            rows, width, width, MQS_PAGED_LAYOUT,
-        ) for page, offset, rows in spans)
-        # The source is contiguous within each plane. Each scale lands in its own padded UB row.
-        demand.transfer(f"{branch}_{plane}", "mte2_aiv", count * width, AddressRunPlan(runs),
-                        aligned_copy_bytes=count * align_bytes(width))
-    demand.metadata[f"{branch}_logical_bytes"] = count * row_width
+    logical_key = f"{branch}_logical_bytes"
+    for page, offset, rows in spans:
+        page_base = (table[page] if table else page) * row_width * c.page_size
+        for plane, width, plane_offset in (
+            ("data", ACLNN_MQS_DATA_BYTES, 0), ("scale", ACLNN_MQS_SCALE_BYTES, ACLNN_MQS_DATA_BYTES),
+        ):
+            base = page_base + plane_offset * c.page_size + offset * width
+            run = AddressRun(base, rows, width, width, MQS_PAGED_LAYOUT)
+            # Each scale lands in its own padded UB row.
+            demand.transfer(f"{branch}_{plane}", "mte2_aiv", rows * width, AddressRunPlan((run,)),
+                            aligned_copy_bytes=rows * align_bytes(width))
+        demand.metadata[logical_key] = demand.metadata.get(logical_key, 0) + rows * row_width
 
 def _read_kv(demand: _Demand, c: PagedMlaContract, seq: int, query: int, start: int, keys: int,
              dqk_bytes: int, dv_bytes: int, *, value: bool = False) -> None:
@@ -190,7 +192,7 @@ def _read_kv(demand: _Demand, c: PagedMlaContract, seq: int, query: int, start: 
         if c.kv_layout == MQS_PAGED_LAYOUT:
             table = tables[seq] if tables else ()
             spans = tuple(span for base, rows in ranges for span in _spans(base, rows, c.page_size))
-            _read_sparse_bank(demand, c, branch, spans, count, table, width)
+            _read_sparse_bank(demand, c, branch, spans, table, width)
             pages = tuple(sorted({page for page, _, _ in spans}))
             for page_idx in pages:
                 demand.transfer(
@@ -199,8 +201,9 @@ def _read_kv(demand: _Demand, c: PagedMlaContract, seq: int, query: int, start: 
                 )
         else:
             packed = ACLNN_MQS_INLINE_ROW_BYTES
-            runs = tuple(AddressRun(base * packed, rows, packed, packed, c.kv_layout) for base, rows in ranges)
-            demand.transfer(branch, "mte2_aiv", count * packed, AddressRunPlan(runs))
+            for base, rows in ranges:
+                run = AddressRun(base * packed, rows, packed, packed, c.kv_layout)
+                demand.transfer(branch, "mte2_aiv", rows * packed, AddressRunPlan((run,)))
         demand.linear(f"{branch}_indices", "mte2_aiv", count * INDEX_BYTES if lists else 0,
                       offset * INDEX_BYTES)
 

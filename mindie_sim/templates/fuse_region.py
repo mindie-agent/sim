@@ -20,9 +20,10 @@ from mindie_sim.prediction.program.binding import RecipeContext
 from mindie_sim.prediction.program.stages import KernelProgram, Stage
 from mindie_sim.prediction.runtime.memory_physics import (
     AddressRun, AddressRunPlan, AdmissionMemoryView, BoundAccess, BurstTurnRule, HbmBusSpec,
-    MemoryAccessPattern, ReuseKey, VisibilityContract, bind_memory_access,
+    MemoryAccessPattern, ReuseKey, SectorCoverage, VisibilityContract, bind_memory_access,
     _intersect_byte_intervals, _merge_byte_intervals, _subtract_byte_intervals,
 )
+from mindie_sim.prediction.runtime.l2_residency import _dram_service_segments
 from mindie_sim.prediction.runtime.ring_buffer import RingBuffer, lower_generation
 from mindie_sim.prediction.runtime.tile_solver import (
     AIC_POOLS, LiveBufferSpec, TileCandidate, TilePipelineSpec, TileShape, solve,
@@ -89,6 +90,38 @@ def ring_credit(ring, generation):
     return ring.initial_credit(ring.slot(generation)) if generation < ring.depth else ring.last_use(generation - ring.depth)
 
 
+class _ReuseLifetimes:
+    """Pin each allocation to its producer key through its final access."""
+
+    def __init__(self, state, patterns):
+        self.state = state
+        self.pending = Counter(p.reuse_key for p in patterns if p.reuse_key is not None)
+        self.keys: dict[ReuseKey, tuple[ReuseKey, bool]] = {}
+
+    def resolve(self, pattern):
+        key = pattern.reuse_key
+        if key is None:
+            return pattern
+        if key not in self.keys:
+            resolved = self.state.resolve_reuse_key(key)
+            self.keys[key] = resolved, self.state.retain_template_key(resolved)
+        return replace(pattern, reuse_key=self.keys[key][0])
+
+    def complete(self, key):
+        if key is not None:
+            self.pending[key] -= 1
+            if not self.pending[key]:
+                resolved, owned = self.keys.pop(key)
+                if owned:
+                    self.state.release_template_key(resolved)
+
+    def close(self):
+        for resolved, owned in self.keys.values():
+            if owned:
+                self.state.release_template_key(resolved)
+        self.keys.clear()
+
+
 @dataclass(frozen=True)
 class _BoundTemplateProgram(KernelProgram):
     """Declare directional admission rows before submitting the bound DAG."""
@@ -109,7 +142,10 @@ class _BoundTemplateProgram(KernelProgram):
         if self.live_state is None:
             return super().start(engine, name, ready, owner=owner)
         delivered = Counter()
-        stages = tuple(replace(stage, program=replace(stage.program, delivered=delivered))
+        lifetimes = _ReuseLifetimes(self.live_state, (
+            stage.program.pattern for stage in self.stages if isinstance(stage.program, _LiveAccess)
+        ))
+        stages = tuple(replace(stage, program=replace(stage.program, delivered=delivered, lifetimes=lifetimes))
                        if isinstance(stage.program, _LiveAccess) else stage for stage in self.stages)
         state, key = self.live_state, name + ":l2_reservation"
         reservation = self.l2_reservation
@@ -128,6 +164,7 @@ class _BoundTemplateProgram(KernelProgram):
         engine._compiled_programs.pop(id(invocation), None)
 
         def finalize(_event):
+            lifetimes.close()
             if reservation is not None:
                 state.release_reservation(die, key)
             self.summary._record_delivery(delivered)
@@ -142,16 +179,18 @@ class _LiveAccess:
     state: AdmissionMemoryView
     pattern: MemoryAccessPattern
     delivered: Counter | None = None
+    lifetimes: _ReuseLifetimes | None = None
 
     def start(self, engine, name, ready, *, owner=""):
         done = engine.future(name + ":delivered")
 
         def admit(event):
             bus, hit, miss, l2, copy_row, l2_row, rules, nominal = self.bound.bind_config
-            plan = self.pattern.runs
-            resident = self.state.resident_intervals_for(self.pattern, plan.aligned_copy_bytes())
+            pattern = self.lifetimes.resolve(self.pattern)
+            plan = pattern.runs
+            resident = self.state.resident_coverage_for(pattern, plan.aligned_copy_bytes())
             bound = bind_memory_access(
-                self.pattern, self.state, hbm_bus=bus, copy_hit_bytes_per_ms=hit, copy_miss_bytes_per_ms=miss,
+                pattern, self.state, hbm_bus=bus, copy_hit_bytes_per_ms=hit, copy_miss_bytes_per_ms=miss,
                 l2_bytes_per_ms=l2, pipe_row_id=copy_row, l2_row_id=l2_row, burst_rules=rules,
                 nominal_pipe_bytes_per_ms=nominal, commit=True,
             )
@@ -171,13 +210,14 @@ class _LiveAccess:
                         "issued_copy_bytes": ledger.aligned_transfer_bytes,
                         "dram_sector_bytes": ledger.dram_sector_bytes + dirty,
                         "turnaround_service_bytes": dirty + (
-                            _rational_service(plan, resident if ledger.l2_hit_bytes else (), rules)
+                            _rational_service(plan, resident if ledger.l2_hit_bytes else SectorCoverage(), rules)
                             if ledger.dram_sector_bytes else 0
                         ),
                         "realized_l2_hit_bytes": ledger.l2_hit_bytes,
                         "realized_l2_miss_bytes": ledger.dram_miss_copy_bytes,
                         "realized_hbm_bytes": ledger.dram_bus_transaction_bytes + dirty,
                     })
+                self.lifetimes.complete(self.pattern.reuse_key)
                 engine.resolve(done)
 
             engine.on_complete(access, record)
@@ -299,9 +339,8 @@ class Lowering:
         self.hits += ledger.l2_hit_bytes
         self.misses += ledger.dram_miss_copy_bytes
         if ledger.dram_sector_bytes:
-            self.service += _rational_service(
-                address_plan, resident if ledger.l2_hit_bytes else (), self.burst_rules,
-            )
+            resident = resident if ledger.l2_hit_bytes else SectorCoverage()
+            self.service += _rational_service(address_plan, resident, self.burst_rules)
 
     def _writebacks(self, name, after):
         evictions = self.state.drain_writebacks(self.die)
@@ -341,24 +380,22 @@ class Lowering:
             working_set, visibility,
         )
         self.accesses[name] = pattern
-        if not private and obligation:
-            ranges = _exact_sector_intervals(plan)
-            if ranges:
-                entry = TensorRangeObligation(
-                    self.die, tensor, version, ranges, "hbm_cold", visibility.scope,
-                )
-                if direction == "read":
-                    resident = self.state.resident_intervals_for(pattern, plan.aligned_copy_bytes())
-                    self.reads.extend(_split_entry_residency(entry, resident))
-                else:
-                    self.writes.append(entry)
+        if not private and obligation and (ranges := _exact_sector_intervals(plan)):
+            entry = TensorRangeObligation(self.die, tensor, version, ranges, "hbm_cold", visibility.scope)
+            if direction == "read":
+                if key is not None:
+                    pattern = replace(pattern, reuse_key=self.state.resolve_reuse_key(key))
+                resident = self.state.resident_coverage_for(pattern, plan.aligned_copy_bytes())
+                self.reads.extend(_split_entry_residency(entry, resident))
+            else:
+                self.writes.append(entry)
         return self.add(Stage(name, after=after))
 
-    def _bind_access(self, placeholder, pattern):
+    def _bind_access(self, placeholder, declared, lifetimes):
         name, after = placeholder.name, placeholder.after
-        pipe = pattern.pipe
+        pattern = lifetimes.resolve(declared)
         plan = pattern.runs
-        resident = self.state.resident_intervals_for(pattern, plan.aligned_copy_bytes())
+        resident = self.state.resident_coverage_for(pattern, plan.aligned_copy_bytes())
         if self.context is not None:
             bound = self.context.bind_access(
                 pattern, self.state, hbm_bus=self.hbm_bus, burst_rules=self.burst_rules, commit=True,
@@ -367,27 +404,29 @@ class Lowering:
             if bound.l2_row_id not in self.context.rates and bound.l2_row_id in stage.work:
                 stage = replace(stage, work={role: value for role, value in stage.work.items() if role != bound.l2_row_id})
             if self.live_state is not None:
-                stage = Stage(name, after=after, program=_LiveAccess(bound, self.live_state, pattern))
+                stage = Stage(name, after=after, program=_LiveAccess(bound, self.live_state, declared))
         else:
             # Unit-rate normalization recovers native byte work independently
             # of hardware service rates. An Engine supplies real rates later.
             bus = HbmBusSpec(self.die, 1, 1, 0, row_r="hbm", row_w="hbm")
             bound = bind_memory_access(
                 pattern, self.state, hbm_bus=bus, copy_hit_bytes_per_ms=1,
-                copy_miss_bytes_per_ms=1, l2_bytes_per_ms=1, pipe_row_id=pipe,
+                copy_miss_bytes_per_ms=1, l2_bytes_per_ms=1, pipe_row_id=pattern.pipe,
                 l2_row_id="l2", burst_rules=self.burst_rules, commit=True,
             )
             stage = bound.to_stage(name, after=after)
         self._account(bound.ledger, plan, resident)
+        lifetimes.complete(declared.reuse_key)
         return replace(stage, after=self._writebacks(name, stage.after))
 
     def result(self, tier, region_id, op_ids, spec, semantic, solution, *, launches=1, comm=()):
         stages = ordered_stages(self.stages)
         if self.accesses:
+            lifetimes = _ReuseLifetimes(self.state, self.accesses.values())
             self.stages = []
             for stage in stages:
                 pattern = self.accesses.pop(stage.name, None)
-                self.add(self._bind_access(stage, pattern) if pattern is not None else stage)
+                self.add(self._bind_access(stage, pattern, lifetimes) if pattern is not None else stage)
             stages = ordered_stages(self.stages)
         summary = FusedRegionSummary(
             tier, region_id, tuple(op_ids), tuple(semantic), tuple(sorted(self.cube.items())),
@@ -405,56 +444,36 @@ class Lowering:
 
 
 def _exact_sector_intervals(plan):
-    sector = plan.sector_bytes
-    ranges = []
-    for run in plan.runs:
-        if not run.rows or not run.row_bytes:
-            continue
-        base, stride, width = run.base_byte, run.stride_bytes, run.row_bytes
-        if stride < width + sector:
-            ranges.append((base // sector * sector, ceil_div(base + (run.rows - 1) * stride + width, sector) * sector))
-        else:
-            ranges.extend((row // sector * sector, ceil_div(row + width, sector) * sector)
-                          for row in range(base, base + run.rows * stride, stride))
-    return _merge_byte_intervals(ranges)
+    coverage = plan.sector_coverage()
+    if not coverage.periodic:
+        return coverage.intervals
+    return _merge_byte_intervals((*coverage.intervals, *(
+        interval for run in coverage.periodic for interval in run._window_intervals(*run._bounds())
+    )))
 
 
-def _split_entry_residency(entry, resident):
-    cold = _subtract_byte_intervals(entry.ranges, resident)
-    warm = _intersect_byte_intervals(entry.ranges, resident)
+def _split_entry_residency(entry, resident: SectorCoverage):
+    warm = _intersect_byte_intervals(entry.ranges, resident.intervals)
+    cold = _subtract_byte_intervals(entry.ranges, warm)
+    if resident.periodic:
+        warm = _merge_byte_intervals((*warm, *(
+            interval for lo, hi in cold for run in resident.periodic for interval in run._window_intervals(lo, hi)
+        )))
+        cold = _subtract_byte_intervals(cold, warm)
     if cold:
         yield replace(entry, ranges=cold)
     if warm:
         yield replace(entry, ranges=warm, initial_residency="l2_warm")
 
 
-def _rational_service(plan, resident, rules):
-    """Use the runtime's sector geometry with rational turnaround penalties."""
+def _rational_service(plan, resident: SectorCoverage, rules):
     service = Fraction()
-    aliases = set()
-    for run in plan.runs:
-        if not run.rows or not run.row_bytes:
-            continue
-        group = run.proven_alias_group
-        if group is not None:
-            if group in aliases:
-                continue
-            aliases.add(group)
-        if not resident:
-            segments = ((run.sector_union_bytes(plan.sector_bytes), run.row_bytes, run.stride_bytes),)
-        else:
-            intervals = AddressRunPlan((run,), sector_bytes=plan.sector_bytes).sector_intervals()
-            missing = _subtract_byte_intervals(intervals, resident)
-            segments = ((hi - lo, hi - lo, (
-                0 if run.stride_bytes == 0 else run.stride_bytes if run.stride_bytes > run.row_bytes else hi - lo
-            )) for lo, hi in missing)
-            resident = _merge_byte_intervals((*resident, *missing))
-        for sectors, rows, stride in segments:
+    for sectors, width, stride in _dram_service_segments(plan, resident):
+        service += sectors
+        if width:
             penalty = sum((Fraction(str(rule.penalty_bytes)) for rule in rules
-                           if rule.matches(rows, stride)), Fraction())
-            service += sectors + sectors * penalty / rows
-    if service and plan.scale_bytes:
-        service += ceil_div(plan.scale_bytes, plan.sector_bytes) * plan.sector_bytes
+                           if rule.matches(width, stride)), Fraction())
+            service += sectors * penalty / width
     return service
 
 

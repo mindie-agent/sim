@@ -274,15 +274,33 @@ def test_paired_sparse_decode_keeps_rank_owned_index_and_lse_pack():
     assert exchange.link_bytes == 12 * (512 + 4) * 2 * (8 - 1)
 
 
-def test_packed_copy_pads_ub_rows_independently_of_gm_sectors():
+@pytest.mark.parametrize("selection,cold_reads", [((0, 0), (672, 672)), ((0, 656), (1312,))])
+def test_packed_gather_charges_cold_runs_and_reuses_them_across_queries(selection, cold_reads):
+    geom = geometry()
     op = governed.make_kv_quant_sfa_c8_op(
-        op_id="gather", query_tokens=1, num_heads=1, selection_lists=((0, 656),),
+        op_id="gather", query_tokens=1, num_heads=1, selection_lists=(selection,), kv_tensor_id="cache",
     )
-    plan = governed.build(op, geometry())
-    gather = stages(plan)["packed_kv_gather"]
+    plan = governed.build(op, geom)
+    phases = stages(plan)
+    gather = phases["packed_kv_gather"]
+    cold_bytes = sum(cold_reads)
     assert gather.work.resources["mte2_aiv"] == 1344
-    assert gather.work.resources["hbm"] == 1312
+    assert gather.work.resources["hbm"] == plan.metadata["kv_sector_bytes"] == cold_bytes
+    other_hbm = sum(phase.work.resources.get("hbm", 0) for phase in phases.values() if phase is not gather)
+    assert plan.work.resources["hbm"] == other_hbm + cold_bytes
     assert plan.metadata["kv_logical_bytes"] == 1312
+
+    engine, context = engine_binding(op, geom)
+    program = plan.lower(context)
+    cold = program.start(engine, "cold", engine.submit("input"))
+    engine.advance(until=(cold,))
+    assert engine.serviced["hbm"] == pytest.approx(plan.work.resources["hbm"])
+    warm = program.start(engine, "warm", cold)
+    engine.advance(until=(warm,))
+    assert engine.serviced["hbm"] == pytest.approx(plan.work.resources["hbm"] + other_hbm)
+    reads = [row["demand"] for row in engine.trace if ":packed_kv_gather:program:read" in row["task"]]
+    assert tuple(row["hbm"] for row in reads[:len(cold_reads)]) == cold_reads
+    assert [row["l2"] for row in reads[len(cold_reads):]] == [1344 // len(cold_reads)] * len(cold_reads)
     audit = verify_operator(sku_case(REGBASE_SKU), op, governed.build)
     assert audit["status"] == "passed"
 
@@ -456,14 +474,16 @@ def test_packed_residency_evicts_oldest_sectors_within_one_allocation():
     warm = request(tuple(range(row_bytes, (warm_rows + 1) * row_bytes, row_bytes)))
     engine, context = engine_binding(warm, geom)
     ready = governed.build(warm, geom).lower(context).start(engine, "warm", engine.submit("input"))
+    engine.advance(until=(ready,))
+    assert engine.delivered["hbm"] == pytest.approx(warm_rows * row_bytes)
     # Hitting row 2 must also refresh it before the next fill evicts from the warm range.
     for i, row in enumerate((0, 0, 2, warm_rows + 1, 2, 3)):
         op = request((row * row_bytes,))
         ready = governed.build(op, geom).lower(context).start(engine, f"row-{i}", ready)
     engine.advance(until=(ready,))
-    reads = [row["demand"] for row in engine.trace if row["task"].endswith(":packed_kv_gather:program:read:program")]
-    assert reads[0]["hbm"] == warm_rows * row_bytes
-    assert [(row.get("l2", 0), row.get("hbm", 0)) for row in reads[1:]] == [
+    suffix = ":packed_kv_gather:program:read:program"
+    rereads = [row["demand"] for row in engine.trace if row["task"].startswith("row-") and row["task"].endswith(suffix)]
+    assert [(row.get("l2", 0), row.get("hbm", 0)) for row in rereads] == [
         (0, 672), (672, 0), (672, 0), (0, 672), (672, 0), (256, 416),
     ]
 

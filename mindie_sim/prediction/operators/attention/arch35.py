@@ -5,7 +5,7 @@ Upstream-ABI: aclnnGenericBlockSparseAttention
 [Role] Model FIA, GBSA, packed SFA, NoPE SFA and the MindIE-SD ABI variants.
 [Invariants] Use declared cross-core routes. Preserve distinct offset,
   gather, QK, softmax and PV work and the physical KV representation.
-  Refresh resident sectors at admission and publish misses after DMA.
+  Refresh resident sectors at admission and publish misses at query completion.
 [Timeouts & Locks] Stream selections in query order. No locks or I/O.
 [Side-Effect Policy] Bind immutable plans. Classify packed KV reads at Engine admission.
 """
@@ -13,7 +13,9 @@ from __future__ import annotations
 
 from bisect import bisect_left
 from collections import Counter, deque
-from dataclasses import dataclass, replace
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
+from functools import partial
 from itertools import islice
 from math import ceil
 
@@ -24,7 +26,7 @@ from ...ownership import unit_group
 from ...program import KernelProgram, ParallelProgram, PipelineProgram, Stage
 from ...runtime.l2_residency import AdmissionMemoryView, bind_memory_access
 from ...runtime.memory_physics import (
-    AddressRun, AddressRunPlan, BoundAccess, HbmBusSpec, MemoryAccessPattern, ReuseKey,
+    AddressRun, AddressRunPlan, BoundAccess, HbmBusSpec, MemoryAccessPattern, ReuseKey, SectorCoverage,
     _intersect_byte_intervals, _measure_byte_intervals, _merge_byte_intervals, _subtract_byte_intervals,
 )
 from ..contracts import OperatorPlanningContext
@@ -36,7 +38,7 @@ from .common import (
     QUANT_MODE_MINDIE_FP8, QUANT_MODE_MXFP4_CX, QUANT_MODE_MXFP4_OCP, QUANT_MODE_MXFP8,
     QUANT_MODE_TQ4, SCALE_ADDRESS_BYTES, SECTOR_BYTES, SOFTMAX_OPS, SUPPORTED_ABIS, TQ4_ROW_BYTES,
     AttentionContract, AttentionPhase, _placement, _stage, bsh_kv_access_plan, make_plan, output_phases,
-    owner_pairs, packed_selection_runs, read_work, unmodeled,
+    owner_pairs, packed_gather_run_plans, packed_selection_runs, read_work, unmodeled,
 )
 
 UPSTREAM_ABI = "aclnnGenericBlockSparseAttention"
@@ -170,40 +172,66 @@ GBSA_HEAD_GROUP_ROWS = 16
 class _C8Read:
     pattern: MemoryAccessPattern
     bound: BoundAccess
+    admission: _C8Admission
+
+    def start(self, engine, name, ready, *, owner=""):
+        return engine.submit_bound_access(
+            name, self.bound, after=(ready,), owner=owner, memory_state=self.admission, pattern=self.pattern,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _C8Query:
+    program: Callable[[_C8Admission], KernelProgram]
+    hbm: str
+    key: ReuseKey
     capacity: int
 
     def start(self, engine, name, ready, *, owner=""):
-        # Store residency on the Engine, scoped to its physical HBM resource.
-        view = _c8_memory(engine, self.pattern, self.bound, self.capacity)
+        view = _c8_memory(engine, self.hbm, self.key.die, self.capacity)
         admission = _C8Admission(view)
-        done = engine.submit_bound_access(
-            name, self.bound, after=(ready,), owner=owner, memory_state=admission, pattern=self.pattern,
-        )
-        engine.on_complete(done, lambda _: view.touch(self.pattern.reuse_key, admission.misses, fill=True))
+        program = self.program(admission)
+        done = program.start(engine, name, ready, owner=owner)
+        _discard_query_programs(engine._compiled_programs, program)
+        engine.on_complete(done, lambda _: admission.fill(self.key))
         return done
+
+
+def _discard_query_programs(cache, program):
+    """Release one-shot stage graphs from the Engine's compilation cache."""
+    if isinstance(program, KernelProgram):
+        cache.pop(id(program), None)
+        for stage in program.stages:
+            if stage.program is not None:
+                _discard_query_programs(cache, stage.program)
+    elif isinstance(program, ParallelProgram):
+        cache.pop(id(program), None)
+        for branch in program.programs:
+            _discard_query_programs(cache, branch)
 
 
 @dataclass(slots=True)
 class _C8Admission:
     view: _C8MemoryView
     resident: tuple[tuple[int, int], ...] = ()
-    misses: tuple[tuple[int, int], ...] = ()
-
-    def resident_intervals_for(self, pattern, aligned_bytes):
-        self.resident = self.view.resident_intervals_for(pattern, aligned_bytes)
-        return self.resident
+    misses: list[tuple[int, int]] = field(default_factory=list)
 
     def resident_coverage_for(self, pattern, aligned_bytes):
-        from ...runtime.memory_physics import SectorCoverage
-
-        return SectorCoverage(self.resident_intervals_for(pattern, aligned_bytes))
+        self.resident = self.view.resident_intervals_for(pattern, aligned_bytes)
+        return SectorCoverage(self.resident)
 
     def admit_access(self, pattern, aligned_bytes):
         resident, self.resident = self.resident, ()
-        hit = self.view.hit_bytes(pattern, resident)
-        self.misses = _subtract_byte_intervals(pattern.runs.sector_intervals(), resident)
+        requested = pattern.runs.sector_intervals()
+        hit, miss = AdmissionMemoryView._coverage_hit_miss(SectorCoverage(requested), SectorCoverage(resident),
+                                                          aligned_bytes)
+        self.misses.extend(_subtract_byte_intervals(requested, resident))
         self.view.touch(pattern.reuse_key, resident)
-        return hit, aligned_bytes - hit
+        return hit, miss
+
+    def fill(self, key):
+        self.view.touch(key, _merge_byte_intervals(self.misses), fill=True)
+        self.misses.clear()
 
 
 class _C8MemoryView:
@@ -227,21 +255,6 @@ class _C8MemoryView:
             if version == key and start < upper and lower < end
         ])
         return _intersect_byte_intervals(requested, candidates)
-
-    @staticmethod
-    def hit_bytes(pattern, resident):
-        hit = 0
-        if resident:
-            from ...runtime.memory_physics import SectorCoverage
-
-            res_cov = SectorCoverage(resident)
-            for run in pattern.runs.runs:
-                req_cov = AddressRunPlan(
-                    (run,), sector_bytes=pattern.runs.sector_bytes
-                ).sector_coverage()
-                copied = run.rows * ceil(run.row_bytes / SECTOR_BYTES) * SECTOR_BYTES
-                hit += AdmissionMemoryView._coverage_hit_miss(req_cov, res_cov, copied)[0]
-        return hit
 
     def touch(self, key, intervals, *, fill=False):
         if not intervals:
@@ -275,12 +288,11 @@ class _C8MemoryView:
                 self.ranges.appendleft((version, start + evicted, end))
 
 
-def _c8_memory(engine, pattern, bound, capacity):
+def _c8_memory(engine, resource, die, capacity):
     views = getattr(engine, "_attention_l2_views", None)
     if views is None:
         views = engine._attention_l2_views = {}
-    resource = bound.bind_config[0].row_r
-    identity = (resource, pattern.die)
+    identity = (resource, die)
     view = views.get(identity)
     if view is None:
         view = views[identity] = _C8MemoryView(capacity)
@@ -292,9 +304,8 @@ class _C8Gather:
     runs: AddressRunPlan
     row_bytes: int
     key: ReuseKey
-    capacity: int
 
-    def lower(self, context, aiv, aiv_count):
+    def lower(self, context, aiv, aiv_count, admission):
         hbm = context.resource_names["hbm"]
         pipe_role = "mte2_aiv" if "mte2_aiv" in context.resource_names else "mte2"
         pipe_units = context.resource_units.get(pipe_role, 1)
@@ -303,12 +314,16 @@ class _C8Gather:
         key = self.key
         bus = HbmBusSpec(key.die, 1, 1, 0, row_r=hbm, ctr_r=hbm)
         owner = unit_group(aiv, aiv_count, pipe_units)[0]
-        pattern = MemoryAccessPattern(
-            key.backing_allocation, key.tensor_version, key.die, owner, "read", "mte2_aiv",
-            sum(run.rows for run in self.runs.runs) * self.row_bytes, self.runs, reuse_key=key,
-        )
-        bound = context.bind_access(pattern, hbm_bus=bus)
-        return KernelProgram((Stage("read", program=_C8Read(pattern, bound, self.capacity)),))
+        stages = []
+        for index, runs in enumerate(packed_gather_run_plans(self.runs)):
+            pattern = MemoryAccessPattern(
+                key.backing_allocation, key.tensor_version, key.die, owner, "read", "mte2_aiv",
+                runs.runs[0].rows * self.row_bytes, runs, reuse_key=key,
+            )
+            bound = context.bind_access(pattern, hbm_bus=bus)
+            stages.append(Stage("read" if index == 0 else f"read-{index}",
+                                program=_C8Read(pattern, bound, admission)))
+        return KernelProgram(tuple(stages))
 
 
 def _l2_capacity(ctx: OperatorPlanningContext) -> int:
@@ -346,7 +361,8 @@ class _PackedAttention:
         selection = (c.selection_lists[query][start:end] if c.selection_lists else
                      AddressRunPlan((AddressRun(start * stride, rows, self.row_bytes, stride),)))
         runs = packed_selection_runs(selection, self.row_bytes)
-        gather = _C8Gather(runs, self.row_bytes, self.key, self.capacity) if self.key and rows else None
+        gather = _C8Gather(runs, self.row_bytes, self.key) if self.key and rows else None
+        cold_bytes = sum(plan.dram_sector_and_service()[0] for plan in packed_gather_run_plans(runs))
         phases = [AttentionPhase("sparse_index", read_work(ctx, rows * INDEX_BYTES, aiv=True), ())]
         gather_deps = ("sparse_index",)
         if c.kv_layout in PAGED_LAYOUTS:
@@ -360,7 +376,7 @@ class _PackedAttention:
             gather_deps += ("scale_address",)
         phases.extend((
             AttentionPhase("packed_kv_gather", read_work(ctx, runs.aligned_copy_bytes(), aiv=True,
-                                                        hbm=runs.dram_sector_and_service()[0]),
+                                                        hbm=cold_bytes),
                            gather_deps, memory=gather),
             AttentionPhase("kv_dequant", Work(resources={"vector": rows * c.v_head_dim * DEQUANT_OPS}),
                            ("packed_kv_gather",)),
@@ -401,7 +417,7 @@ class _PackedAttention:
         places = tuple(_placement(context, pair, datapath.aic_count, datapath.aiv_count) for pair in self.owners)
         owner_count = len(self.owners)
 
-        def query(index, core):
+        def query(index, core, admission=None):
             intervals = tuple(self.intervals(self.counts[index]))
             branches = []
             for split, (start, end) in enumerate(intervals):
@@ -412,16 +428,21 @@ class _PackedAttention:
                     if phase.memory is None:
                         stages.append(_stage(context, phase, places[owner]))
                     else:
-                        gather = phase.memory.lower(context, aiv, datapath.aiv_count)
+                        gather = phase.memory.lower(context, aiv, datapath.aiv_count, admission)
                         stages.append(Stage(phase.name, after=phase.after, program=gather))
                 branches.append(KernelProgram(tuple(stages)))
             stages = [Stage("splits", program=ParallelProgram(tuple(branches)))]
             for phase in self.finish(len(intervals)):
                 stages.append(_stage(context, replace(phase, after=(stages[-1].name,)), places[core]))
-            return (Stage("query", program=KernelProgram(tuple(stages))),)
+            return KernelProgram(tuple(stages))
+
+        def tile(index, core):
+            program = (_C8Query(partial(query, index, core), context.resource_names["hbm"], self.key, self.capacity)
+                       if self.key else query(index, core))
+            return (Stage("query", program=program),)
 
         return ParallelProgram(tuple(
-            PipelineProgram(len(indices), 1, lambda i, core=core, indices=indices: query(indices[i], core))
+            PipelineProgram(len(indices), 1, lambda i, core=core, indices=indices: tile(indices[i], core))
             for core in range(owner_count) if (indices := range(core, len(self.counts), owner_count))
         ))
 

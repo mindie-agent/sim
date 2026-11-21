@@ -7,7 +7,9 @@
 """
 from __future__ import annotations
 
+import importlib.metadata
 import json
+import site
 import sys
 from collections.abc import Mapping
 from pathlib import Path
@@ -25,10 +27,26 @@ RateRole = Literal["sim", "dual"]
 
 def default_primitives_dir() -> Path:
     checkout = Path(__file__).resolve().parents[2] / "data" / "primitives"
-    if checkout.is_dir():
+    if (checkout / "manifest.json").is_file():
         return checkout
-    installed = Path(sys.prefix) / "data" / "primitives"
-    return installed if installed.is_dir() else checkout
+    try:
+        dist = importlib.metadata.distribution("mindie-sim")
+    except importlib.metadata.PackageNotFoundError:
+        dist = None
+    if dist is not None:
+        for rel in dist.files or ():
+            if rel.name == "manifest.json" and "primitives" in rel.parts:
+                located = Path(dist.locate_file(rel)).resolve()
+                if located.is_file():
+                    return located.parent
+        located = Path(dist.locate_file("data/primitives/manifest.json")).resolve()
+        if located.is_file():
+            return located.parent
+    for base in (Path(sys.prefix), Path(site.getuserbase())):
+        candidate = base / "data" / "primitives"
+        if (candidate / "manifest.json").is_file():
+            return candidate
+    return checkout
 
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:

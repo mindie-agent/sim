@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 from math import prod
+import sys
 from typing import Any
 
 from mindie_sim.schema.common import ModelingError
@@ -126,6 +127,11 @@ _EXACT_SEMANTIC_ALIASES = {
 }
 
 
+def _custom_ops() -> dict[str, dict[str, Any]]:
+    pkg = sys.modules.get(__package__ or "")
+    return getattr(pkg, "XLLM_CUSTOM_OPS", XLLM_CUSTOM_OPS) if pkg is not None else XLLM_CUSTOM_OPS
+
+
 def capabilities() -> dict[str, Any]:
     """Machine-readable registry of the declarations behind this wrapper."""
     from ..implementations import IMPLEMENTATIONS
@@ -136,6 +142,7 @@ def capabilities() -> dict[str, Any]:
         name: item for name, item in IMPLEMENTATIONS.items() if item.module in modules}
     selector_operators = {
         operator for item in implementations.values() for operator in item.operators}
+    ops = _custom_ops()
     return {
         "vendor": XLLM_VENDOR,
         "capabilities": tuple(sorted(CAPABILITIES)),
@@ -160,7 +167,7 @@ def capabilities() -> dict[str, Any]:
                 "quantization": spec.get("quantization"),
                 "fp8_owner_recipe": spec.get("fp8_owner_recipe"),
             }
-            for name, spec in XLLM_CUSTOM_OPS.items()
+            for name, spec in ops.items()
         },
     }
 
@@ -200,16 +207,17 @@ def _attention_heads(op: OpSpec, meta: dict[str, Any]) -> int:
 
 
 def _resolve_op_name(op: OpSpec, explicit_op_name: str | None) -> str:
+    ops = _custom_ops()
     if explicit_op_name is not None:
         clean = str(explicit_op_name).strip()
-        if clean not in XLLM_CUSTOM_OPS:
+        if clean not in ops:
             raise ModelingError(f"xllm_custom_op_unknown:{clean}")
         return clean
     # Exact vendor semantic name only.  A shared family such as
     # ``elementwise`` or ``grouped_gemm`` is not a declaration that this
     # vendor operator runs; it must be named by the caller.
     for candidate in (op.recipe, op.family):
-        if candidate in _EXACT_SEMANTIC_ALIASES:
+        if candidate in _EXACT_SEMANTIC_ALIASES and _EXACT_SEMANTIC_ALIASES[candidate] in ops:
             return _EXACT_SEMANTIC_ALIASES[candidate]
     raise ModelingError(f"xllm_custom_op_requires_explicit_name:{op.family}:{op.recipe}")
 

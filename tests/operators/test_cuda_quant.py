@@ -8,6 +8,8 @@ import struct
 import numpy as np
 import pytest
 
+pytestmark = pytest.mark.tier0
+
 from mindie_sim.prediction.cost import CostModel
 from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.mechanism import PlannedRecipe

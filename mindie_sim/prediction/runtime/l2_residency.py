@@ -1,7 +1,7 @@
 """Dynamic N-stream L2 working-set residency, dirty writeback, and 3-ledger binding.
 
 [Role] Track per-die shared L2 residency across arbitrary N >= 1 active streams
-  and full ``ReuseKey`` identities using canonical sector intervals, settle
+  and full ``ReuseKey`` identities using exact sector coverage, settle
   dirty private evictions with future readers as explicit ``DirtyWriteback``
   records, and bind ``MemoryAccessPattern`` into 3-ledger ``BoundAccess``
   without bind-time mutation (``commit=False`` default).
@@ -15,7 +15,7 @@
 """
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 
 from mindie_sim.schema.common import ModelingError
@@ -84,6 +84,7 @@ class AdmissionMemoryView:
         self._reserved: dict[int, dict[str, int]] = {}
         self._active_streams: dict[int, set[str]] = {}
         self._active_keys: dict[int, set[ReuseKey]] = {}
+        self._template_key_users: dict[ReuseKey, int] = {}
         self._resident: dict[ReuseKey, _ResidentL2Entry] = {}
         self._pending_writebacks: dict[int, list[DirtyWriteback]] = {}
         units_map = dict(l2_buffer_units_by_die or {})
@@ -210,6 +211,35 @@ class AdmissionMemoryView:
             raise ModelingError(f"l2_die_undeclared:{key.die}")
         self._active_keys[key.die].discard(key)
         return self.effective_l2_bytes(key.die)
+
+    def resolve_reuse_key(self, fallback: ReuseKey) -> ReuseKey:
+        """Find the latest resident producer, then an active key for this allocation version."""
+        identity = fallback.die, fallback.backing_allocation, fallback.tensor_version
+
+        def matches(key):
+            return (key.die, key.backing_allocation, key.tensor_version) == identity
+
+        for key in reversed(self._resident):
+            if matches(key) and self.is_resident(key):
+                return key
+        active = self._active_keys.get(fallback.die, ())
+        return min((key for key in active if matches(key)), key=lambda key: key.reuse_stream, default=fallback)
+
+    def retain_template_key(self, key: ReuseKey) -> bool:
+        """Share template-owned key lifetimes and leave caller-owned keys with the caller."""
+        users = self._template_key_users.get(key, 0)
+        if not users and key in self._active_keys.get(key.die, ()):
+            return False
+        self._template_key_users[key] = users + 1
+        return True
+
+    def release_template_key(self, key: ReuseKey) -> None:
+        users = self._template_key_users[key]
+        if users == 1:
+            del self._template_key_users[key]
+            self.release_key(key)
+        else:
+            self._template_key_users[key] = users - 1
 
     def grant_reservation(self, die: int, alloc_id: str, size_bytes: int) -> int:
         """Reserve explicit L2 capacity on ``die`` and immediately evict over-knee entries."""
@@ -482,22 +512,14 @@ class AdmissionMemoryView:
         return hit_b, miss_b
 
 
-def _missed_dram_sector_and_service(
-    plan: AddressRunPlan,
-    resident_cov: SectorCoverage | tuple[tuple[int, int], ...],
-    burst_rules: Sequence[BurstTurnRule],
-) -> tuple[int, float]:
-    """Compute exact DRAM sector & burst-adjusted bytes over missed sector coverage."""
-    covered = (
-        resident_cov if isinstance(resident_cov, SectorCoverage)
-        else SectorCoverage(intervals=tuple(resident_cov))
-    )
-    if covered.empty:
-        return plan.dram_sector_and_service(burst_rules)
+def _dram_service_segments(
+    plan: AddressRunPlan, covered: SectorCoverage,
+) -> Iterator[tuple[int, int, int]]:
+    """Yield missed bytes and burst geometry; width zero denotes scale metadata."""
+    partial = not covered.empty
     sec = plan.sector_bytes
     seen_aliases: set[str] = set()
-    sector_total = 0
-    service_total = 0.0
+    missed_sectors = False
     for run in plan.runs:
         if run.rows == 0 or run.row_bytes == 0:
             continue
@@ -505,38 +527,41 @@ def _missed_dram_sector_and_service(
             if run.proven_alias_group in seen_aliases:
                 continue
             seen_aliases.add(run.proven_alias_group)
-        run_cov = AddressRunPlan(
-            (run,), alignment_bytes=plan.alignment_bytes, sector_bytes=sec,
-        ).sector_coverage()
-        if run_cov.periodic:
-            missed_b = max(0, run_cov.measure_bytes() - run_cov.overlap_bytes(covered))
-            if missed_b > 0:
-                eta = burst_turnaround_efficiency(run.row_bytes, run.stride_bytes, burst_rules)
-                sector_total += missed_b
-                service_total += float(missed_b) / eta
-            covered = covered.union(run_cov)
+        if not partial and len(plan.runs) == 1:
+            missed_sectors = True
+            yield run.sector_union_bytes(sec), run.row_bytes, run.stride_bytes
             continue
-        if not covered.periodic:
-            missed = _subtract_byte_intervals(run_cov.intervals, covered.intervals)
-            for lo, hi in missed:
-                span = hi - lo
-                stride_eff = 0 if run.stride_bytes == 0 else (run.stride_bytes if run.stride_bytes > run.row_bytes else span)
-                eta = burst_turnaround_efficiency(span, stride_eff, burst_rules)
-                sector_total += span
-                service_total += float(span) / eta
+        run_cov = AddressRunPlan((run,), sector_bytes=sec).sector_coverage()
+        if not partial or run_cov.periodic:
+            missed = (run_cov.measure_bytes() - run_cov.overlap_bytes(covered)
+                      if run_cov.periodic or covered.periodic else
+                      _measure_byte_intervals(_subtract_byte_intervals(run_cov.intervals, covered.intervals)))
+            if missed > 0:
+                missed_sectors = True
+                yield missed, run.row_bytes, run.stride_bytes
         else:
-            for lo, hi in run_cov.intervals:
-                span = (hi - lo) - SectorCoverage(intervals=((lo, hi),)).overlap_bytes(covered)
+            intervals = (run_cov.intervals if covered.periodic else
+                         _subtract_byte_intervals(run_cov.intervals, covered.intervals))
+            for lo, hi in intervals:
+                span = hi - lo
+                if covered.periodic:
+                    span -= SectorCoverage(intervals=((lo, hi),)).overlap_bytes(covered)
                 if span > 0:
-                    stride_eff = 0 if run.stride_bytes == 0 else (run.stride_bytes if run.stride_bytes > run.row_bytes else span)
-                    eta = burst_turnaround_efficiency(span, stride_eff, burst_rules)
-                    sector_total += span
-                    service_total += float(span) / eta
+                    missed_sectors = True
+                    stride = run.stride_bytes
+                    yield span, span, stride if stride == 0 or stride > run.row_bytes else span
         covered = covered.union(run_cov)
-    if sector_total > 0 and plan.scale_bytes > 0:
-        scale_sec = ((plan.scale_bytes + sec - 1) // sec) * sec
-        sector_total += scale_sec
-        service_total += float(scale_sec)
+    if missed_sectors and plan.scale_bytes:
+        yield ((plan.scale_bytes + sec - 1) // sec) * sec, 0, 0
+
+
+def _missed_dram_sector_and_service(
+    plan: AddressRunPlan, resident_cov: SectorCoverage, burst_rules: Sequence[BurstTurnRule],
+) -> tuple[int, float]:
+    sector_total, service_total = 0, 0.0
+    for span, width, stride in _dram_service_segments(plan, resident_cov):
+        sector_total += span
+        service_total += float(span) / burst_turnaround_efficiency(width, stride, burst_rules)
     return sector_total, service_total
 
 

@@ -528,8 +528,26 @@ def test_installed_pep517_wheel_ships_runtime_resources_and_runs_native():
             assert Path(name).suffix not in PREBUILT_SUFFIXES and not data.startswith(BINARY_MAGIC), name
         extract, report = install_and_smoke_wheel(base, wheel)
         assert report["package"].startswith(str(extract.resolve()))
+        assert report["primitives_dir"].startswith(str(extract.resolve()))
+        assert report["primitive_tables"] >= 1
         assert report["c"] == 1 and report["auto"] == 1 and report["stable"] is False
         for mode in NATIVE:
             assert report[f"desc_{mode}"] == report["desc_python"], mode
+        userbase = base / "userbase"
+        user_env = {**os.environ, "PYTHONUSERBASE": str(userbase), "PIP_DISABLE_PIP_VERSION_CHECK": "1"}
+        inst_u = subprocess.run(
+            [sys.executable, "-B", "-m", "pip", "install", "--user", "--no-deps", "--no-index",
+             "--no-compile", "--no-cache-dir", str(wheel)],
+            env=user_env, capture_output=True, text=True, timeout=240)
+        assert inst_u.returncode == 0, (inst_u.stdout, inst_u.stderr)
+        probe_u = subprocess.run(
+            [sys.executable, "-B", "-c",
+             "from pathlib import Path; from mindie_sim.primitives.loader import default_primitives_dir, load_manifest;"
+             " d = default_primitives_dir().resolve(); m = load_manifest();"
+             " print(d); assert m.get('tables')"],
+            cwd=base / "run", env={k: v for k, v in user_env.items() if k != "PYTHONPATH"},
+            capture_output=True, text=True, timeout=60)
+        assert probe_u.returncode == 0, (probe_u.stdout, probe_u.stderr)
+        assert Path(probe_u.stdout.strip()).is_relative_to(userbase.resolve())
     finally:
         shutil.rmtree(base, ignore_errors=True)

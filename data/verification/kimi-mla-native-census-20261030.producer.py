@@ -4,8 +4,8 @@ from collections import defaultdict
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[2]
 sys.path.insert(0,str(ROOT))
-from mindie_sim.prediction.paged_mla_arch22 import tile_work
-from mindie_sim.prediction.paged_mla_arch22_dispatch import Dispatch,source_dispatch
+from mindie_sim.prediction.paged_mla_membase import tile_work
+from mindie_sim.prediction.paged_mla_membase_dispatch import Dispatch,source_dispatch
 R=ROOT
 C=R/'data/verification/kimi-mixed-projection-source-control-20261030.json'
 fields=['Type','Input Shapes','Input Data Types','Input Formats','Output Shapes','Output Data Types','Output Formats','Block Num','Mix Block Num']

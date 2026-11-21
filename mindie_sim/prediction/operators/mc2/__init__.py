@@ -1,12 +1,13 @@
 """Public entrypoint and family ownership for governed MC2 operators.
 
-[Role] Select the MC2 strategy from the declared compute architecture.
+[Role] Select the MC2 strategy from the declared architecture or protocol.
 [Invariants] Every operator has one selected caller, transport, and topology.
 [Timeouts & Locks] Constant-time dispatch before finite planning; no I/O.
 [Side-Effect Policy] Imports and entrypoints construct metadata only.
 """
 from __future__ import annotations
 
+from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import (
     GENERIC_ARCH_ID, ArchId, ComputeArchIdentity, DatapathCapabilitySpec,
 )
@@ -14,8 +15,7 @@ from mindie_sim.schema.operators import OpSpec
 from ...mechanism import Geometry, OperatorPlan
 from ...results import OpOccurrence
 from ..contracts import ArchStrategy, OperatorFamilySpec, OperatorPlanningContext, ResolvedOperator
-from .arch22 import STRATEGY as _ARCH22
-from .arch35 import STRATEGY as _ARCH35
+from . import arch22, arch35
 from .common import (
     Mc2CohortSlice,
     Mc2Contract,
@@ -28,9 +28,48 @@ from .common import (
 )
 
 _STRATEGIES: dict[ArchId, ArchStrategy] = {
-    _ARCH22.arch_id: _ARCH22,
-    _ARCH35.arch_id: _ARCH35,
+    leaf.STRATEGY.arch_id: leaf.STRATEGY for leaf in (arch22, arch35)
 }
+_NATIVE_PROTOCOLS = {leaf.NATIVE_PROTOCOL_KIND: leaf for leaf in (arch22, arch35)}
+_DEFAULT_NATIVE_PROTOCOL = arch35
+NATIVE_PROTOCOL_NETWORK = _DEFAULT_NATIVE_PROTOCOL.NETWORK
+_NATIVE_PROTOCOL_FIELDS = frozenset({
+    "kind", "max_inflight_per_rank", "dispatch_quant", "global_bs", "chunk_bytes",
+    "hop_startup_us", "receive_capacity_bytes_per_peer",
+})
+
+
+def select_native_protocol(kernels):
+    """Validate and return the caller's explicit protocol declaration."""
+    raw = kernels.get("native_moe_protocol")
+    if raw is None:
+        return None
+    fields = set(raw)
+    if "kind" not in fields or fields - _NATIVE_PROTOCOL_FIELDS:
+        raise ModelingError("native_moe_protocol_requires_supported_caller")
+    strategy = _NATIVE_PROTOCOLS.get(raw["kind"])
+    if strategy is None:
+        raise ModelingError("native_moe_protocol_requires_supported_caller")
+    strategy.validate_native_protocol(raw)
+    return raw
+
+
+def native_protocol_recipes(kernels):
+    """Register recipes for the declared or automatically selected protocol."""
+    selected = select_native_protocol(kernels)
+    strategy = _DEFAULT_NATIVE_PROTOCOL if selected is None else _NATIVE_PROTOCOLS[selected["kind"]]
+    return strategy.native_protocol_recipes(selected)
+
+
+def common_native_protocol(chosen, fused_level, moe_comm):
+    """Describe the protocol used by common MoE communication selection."""
+    return _DEFAULT_NATIVE_PROTOCOL.common_native_protocol(chosen, fused_level, moe_comm)
+
+
+def lower_native_protocol(ops, *, selected, **caller):
+    """Apply the selected protocol's graph lowering."""
+    return _NATIVE_PROTOCOLS[selected["kind"]].lower_native_protocol(
+        ops, selected=selected, **caller)
 
 
 def resolve_operator_plan(op: OpSpec, ctx: OperatorPlanningContext, /) -> ResolvedOperator:
@@ -84,10 +123,15 @@ __all__ = [
     "Mc2CohortSlice",
     "Mc2Contract",
     "Mc2RowLayout",
+    "NATIVE_PROTOCOL_NETWORK",
     "build",
     "build_cohort_transport_stages",
     "combine_row_layout",
+    "common_native_protocol",
     "dispatch_row_layout",
+    "lower_native_protocol",
+    "native_protocol_recipes",
     "register_family",
     "resolve_operator_plan",
+    "select_native_protocol",
 ]

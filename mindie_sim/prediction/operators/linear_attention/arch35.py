@@ -24,7 +24,7 @@ from ...mechanism import OperatorPlan, Work
 from ...ownership import unit_group
 from ...program import KernelProgram, ParallelProgram, PipelineProgram, RecipeContext, Stage
 from ...runtime.ring_buffer import RingBuffer, lower_generation
-from ..contracts import ArchStrategy, OperatorPlanningContext
+from ..contracts import OperatorPlanningContext
 from .common import (
     CHUNK32_KERNELS, CHUNK32_LEAVES, DIAG_BLOCK_WIDTH, FLASH_KDA_TEMPLATE_BY_ABI, FLA_GDN_ABIS,
     FP32_BYTES, GDN_CHUNK64_TOKENS, KDA_MAX_AIC_CORES, KDA_WORKSPACE_SLOTS,
@@ -108,6 +108,7 @@ GDN_CUBE_FLOPS_PER_CHUNK = 2 * (
 )
 GDN_SOURCES = (SOURCES[0], SOURCES[-3])
 CHUNK32_SOURCES = (SourceRef(**PR22147_SOURCE),)
+KERNEL_LAUNCH_SETUP_MS = 0.0022
 
 
 def _pairs(ctx: OperatorPlanningContext, c: LinearAttentionContract) -> tuple[tuple[int, tuple[int, ...]], ...]:
@@ -665,6 +666,13 @@ class Arch35LinearAttentionStrategy:
     abi = ABI
     sources = SOURCES
 
+    def chunk32_timing_policy(
+        self, context: RecipeContext, step_sync_ms: float,
+    ) -> tuple[float, float]:
+        if context.service_rate("mte2_aic_dram") is None:
+            return 0.0, 0.0
+        return KERNEL_LAUNCH_SETUP_MS, step_sync_ms
+
     def accepts(self, op: OpSpec, ctx: OperatorPlanningContext, /) -> bool:
         if ctx.compute_arch.arch_id != self.arch_id:
             return False
@@ -715,4 +723,4 @@ class Arch35LinearAttentionStrategy:
         return _build_persistent(c, ctx, pairs)
 
 
-STRATEGY: ArchStrategy = Arch35LinearAttentionStrategy()
+STRATEGY = Arch35LinearAttentionStrategy()

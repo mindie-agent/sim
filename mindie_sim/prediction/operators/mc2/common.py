@@ -22,6 +22,7 @@ from mindie_sim.public.errors import UnmodeledCapabilityError
 from mindie_sim.schema.common import ModelingError, align_up, dtype_bytes
 from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.operators import OpSpec
+from ...direct_peer import DirectPeerCollective
 from ...mechanism import OperatorPlan, Work
 from ...results import FusedPipelineDescriptor, FusedPipelineSpec, PipelinePhase, WorkItem
 from ...runtime.ring_buffer import RingBuffer, lower_generation
@@ -65,6 +66,21 @@ ABI_ALIASES = {
 }
 TRANSPORTS = frozenset({"auto", "a2_hccl_client", "a3_sio_hccs", "a5_shmem", "a5_mte", "a5_ccu"})
 ALGORITHMS = frozenset({"fullmesh", "ring", "two_tier", "direct_peer"})
+
+
+def validate_native_dispatch_quant(raw: Mapping) -> None:
+    if raw.get("dispatch_quant", "none") not in {"none", "mx", "per_token_int8"}:
+        raise ModelingError("native_moe_protocol_dispatch_quant_requires_none_mx_or_per_token_int8")
+
+
+def native_protocol_peer_transport(raw: Mapping) -> DirectPeerCollective:
+    # An omitted window resolves to the actual peer count on the bound group.
+    return DirectPeerCollective(
+        max_inflight_per_rank=raw.get("max_inflight_per_rank"),
+        chunk_bytes=raw.get("chunk_bytes"),
+        hop_startup_us=raw.get("hop_startup_us", 0.0),
+        receive_capacity_bytes_per_peer=raw.get("receive_capacity_bytes_per_peer"),
+    )
 
 
 def _integer(value, field_name: str, minimum: int = 0) -> int:

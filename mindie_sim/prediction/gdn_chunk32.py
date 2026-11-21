@@ -61,7 +61,6 @@ PIPELINE_WINDOW_SLOTS = 2
 RECURRENCE_SERIAL_SLOTS = 1
 COMPACT_CHUNK_THRESHOLD = 16
 COMPACT_TAIL_CHUNKS = 2
-KERNEL_LAUNCH_SETUP_MS = 0.0022
 RECURRENCE_SYNC_MS = 0.00095
 L2NORM_OPS_PER_ELEM = 5
 SIGMOID_SCALE_OPS_PER_ELEM = 6
@@ -115,6 +114,8 @@ def _build_mixed_plan(
     second_label: str,
     extra_meta: Mapping[str, Any],
 ) -> OperatorPlan:
+    from .operators.linear_attention import chunk32_timing_policy
+
     require_pair(geometry)
     buf_sizes = _check_buffers(geometry)
     total_work = Work()
@@ -125,9 +126,7 @@ def _build_mixed_plan(
             total_work += split_reads(aic_w, aic_w.resources["mte2"], geometry.resource_units)
 
     def program(context):
-        has_dram_service = context.service_rate("mte2_aic_dram") is not None
-        setup_ms = KERNEL_LAUNCH_SETUP_MS if has_dram_service else 0.0
-        sync_ms = step_sync_ms if has_dram_service else 0.0
+        setup_ms, sync_ms = chunk32_timing_policy(geometry, context, step_sync_ms)
 
         def per_core(core: int, items: tuple[Any, ...]):
             if not items:

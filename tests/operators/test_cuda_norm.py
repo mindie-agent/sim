@@ -17,6 +17,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+pytestmark = pytest.mark.tier0
+
 from mindie_sim.prediction.engine import Engine, Resource
 from mindie_sim.prediction.mechanism import Geometry
 from mindie_sim.prediction.operator_analysis import operator_costs

@@ -17,10 +17,10 @@ from mindie_sim.schema.operators import OpSpec
 from .cache import _DEFAULT_KV_PAGE_SIZE, _SLOT_INDEX_BYTES, _cache_row_bytes
 from .contracts import (
     FUSED_GROUPED_RECIPE,
-    XLLM_CUSTOM_OPS,
     XLLM_VENDOR,
     _attention_heads,
     _check_family,
+    _custom_ops,
     _declared_dtype,
     _fused_declared,
     _resolve_op_name,
@@ -54,7 +54,7 @@ def lower_op(
 ) -> OpSpec:
     """Lower one complete semantic occurrence into an xLLM custom operator."""
     resolved = _resolve_op_name(op, op_name)
-    spec = XLLM_CUSTOM_OPS[resolved]
+    spec = _custom_ops()[resolved]
     _check_family(op, spec, resolved)
     if soc_family is not None and soc_family not in spec["supported_socs"]:
         raise ModelingError(f"xllm_custom_op_soc_unsupported:{resolved}:{soc_family}")

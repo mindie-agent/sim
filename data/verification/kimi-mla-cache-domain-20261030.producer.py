@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from mindie_sim import graph_costs, target_graphs
 from mindie_sim.prediction.mechanism import Geometry
-from mindie_sim.prediction.paged_mla_arch22 import IMPLEMENTATION, build
+from mindie_sim.prediction.paged_mla_membase import IMPLEMENTATION, build
 from mindie_sim.prediction.structure import parse_case
 
 

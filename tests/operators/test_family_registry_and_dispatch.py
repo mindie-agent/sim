@@ -51,6 +51,8 @@ pytestmark = pytest.mark.tier0
 ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = ROOT / "tests/fixtures"
 CAPTURE = FIXTURES / "observations/operator-kernels.csv"
+POST_OP = replace(simple_op("post", "npu_hc_post_arch35"), family="hyper_connections",
+                  local_shape=(1, 4, 128), source_boundary="kernel")
 OPS = {
     rotary.register_family(): replace(simple_op("rotation", "rotary"), family="rotary", local_shape=(2, 8, 64)),
     mla_prolog.register_family(): mla_prolog.make_op(op_id="prolog", tokens=2, hidden_size=1024, num_heads=8, weight_quant_mode=0),
@@ -88,6 +90,8 @@ def test_dispatch_projects_prepared_work_from_declared_architecture(hardware, sp
     assert descriptor.member_op_ids == (op.op_id,) and descriptor.family == spec.name
     assert descriptor.phases == plan.pipeline_spec.phases and descriptor.sources == result.sources
     assert (result.op.hbm_bytes, dict(result.op.matrix_flops)) == (plan.work.resources.get("hbm", 0), plan.work.matrix)
+    prepared, selected = RecipeBook().prepare(op, geom)
+    assert prepared == result.op and selected.pipeline_spec == plan.pipeline_spec
     unknown = replace(ctx, datapath=replace(ctx.datapath, compute_arch=replace(ctx.compute_arch, arch_id=ArchId("unknown"))))
     if spec.name != "rotary":  # Rotary is route-based.
         with pytest.raises(UnmodeledCapabilityError):
@@ -125,6 +129,36 @@ def test_mixed_precision_work_shares_one_pipe_and_survives_both_execution_paths(
 def _pair(op):
     return (replace(op, op_id="first", metadata=(("part", 1),)),
             replace(op, op_id="second", deps=("first",), metadata=(("part", 2),)))
+@pytest.mark.parametrize("hardware", SKUS)
+def test_source_required_recipe_uses_its_family_planner(hardware):
+    geom = Geometry.from_devices(sku_case(hardware).machine.dies)
+    op = POST_OP if geom.datapath.arch_id == attention.ARCH35 else replace(POST_OP, recipe="hc_post")
+    prepared, plan = RecipeBook().prepare(op, geom)
+    assert plan.pipeline_spec.implementation == "hc_post" and prepared.vector_ops == plan.work.resources["vector"] > 0
+@pytest.mark.parametrize("boundary", ("", "kernel"))
+def test_attention_recipe_enforces_requested_abi_and_preserves_caller_override(boundary):
+    op = attention.make_kv_quant_sfa_c8_op(op_id="packed", query_tokens=1, num_heads=1, selected_tokens=2)
+    geom = Geometry.from_devices(sku_case(REPRESENTATIVE_SKUS["a5"]).machine.dies)
+    mismatched = replace(op, source_boundary=boundary, metadata=(*op.metadata, ("requested_abi", attention.FIA_ABI)))
+    book = RecipeBook()
+    with pytest.raises(UnmodeledCapabilityError, match="attention_abi_conflict"):
+        book.prepare(mismatched, geom)
+    _, reference = book.prepare(op, geom)
+    for compute_arch in (geom.compute_arch, None):
+        _, synthetic = book.prepare(op, replace(geom, datapath=None, compute_arch=compute_arch))
+        assert synthetic.work == reference.work
+    _, override = RecipeBook({op.recipe: PlannedRecipe(_products)}).prepare(mismatched, geom)
+    assert override.work == _products(op, geom).work
+def test_governed_source_calls_keep_builtin_and_caller_kernel_expanders():
+    op = replace(OPS[attention.register_family()], source_boundary="call")
+    kernel, join = RecipeBook().expand((op,))
+    assert kernel.source_boundary == "kernel" and join.deps == (kernel.op_id,)
+    assert len(RecipeBook({op.recipe: PlannedRecipe(_products, _pair)}).expand((op,))) == 3
+    with pytest.raises(ModelingError, match=f"source_kernel_expansion_required:{op.recipe}"):
+        RecipeBook({op.recipe: PlannedRecipe(_products)}).select(op)
+    post = replace(POST_OP, source_boundary="call")
+    with pytest.raises(ModelingError, match=f"source_kernel_expansion_required:{post.recipe}"):
+        RecipeBook().select(post)
 def test_source_expansion_preserves_launches_and_downstream_dependencies():
     raw = hardware_case()
     raw["machine"]["device"]["launch_us"] = 50

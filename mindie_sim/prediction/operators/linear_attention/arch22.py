@@ -19,7 +19,7 @@ from mindie_sim.schema.operators import OpSpec
 from ...mechanism import OperatorPlan, Work
 from ...program import KernelProgram, PipelineProgram, RecipeContext, Stage
 from ...runtime.ring_buffer import RingBuffer, lower_generation
-from ..contracts import ArchStrategy, OperatorPlanningContext
+from ..contracts import OperatorPlanningContext
 from .common import (
     FLA_GDN_ABIS, FP32_BYTES, CausalConvContract, LinearAttentionContract, Phase, analyze_state_residency,
     bind_phase, ceil_div, compute_wy_chunk_work, element_bytes, make_plan, missing,
@@ -353,6 +353,11 @@ class Arch22LinearAttentionStrategy:
     abi = ABI
     sources = SOURCES
 
+    def chunk32_timing_policy(
+        self, _context: RecipeContext, _step_sync_ms: float,
+    ) -> tuple[float, float]:
+        return 0.0, 0.0
+
     def accepts(self, op: OpSpec, ctx: OperatorPlanningContext, /) -> bool:
         if ctx.compute_arch.arch_id != self.arch_id:
             return False
@@ -379,4 +384,4 @@ class Arch22LinearAttentionStrategy:
         return _build_recurrent(c, ctx)
 
 
-STRATEGY: ArchStrategy = Arch22LinearAttentionStrategy()
+STRATEGY = Arch22LinearAttentionStrategy()

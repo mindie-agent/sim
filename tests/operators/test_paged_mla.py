@@ -227,6 +227,28 @@ def test_contiguous_inline_scale_kv_reads_records_without_page_tables(layout):
     assert load.work == {"mte2_aiv": 2 * 608, "hbm": 2 * 608}
 
 
+@pytest.mark.parametrize("layout,mode,row_bytes,repeated_hbm,contiguous_hbm", [
+    ("PA_BBND", 1, 608, 1280, 1280),
+    ("PA_BBND", 2, 584, 1280, 1248),
+    ("TND", 1, 608, 1248, 1248),
+])
+@pytest.mark.parametrize("second_index", [0, 1])
+def test_sparse_gather_charges_repeats_and_coalesces_contiguous_rows(
+    layout, mode, row_bytes, repeated_hbm, contiguous_hbm, second_index,
+):
+    geom = _governed_geom(DIRECT_SKU)
+    op = governed.make_op(sequences=((1, 2),), logical_heads=1, physical_heads=1, abi=MQS_ABI,
+                          kv_layout=layout, page_size=2, n_ori=2, quant_mode=mode, ori_indices=((0, second_index),))
+    program, trace = _execute(op, governed.build(op, geom), geom)
+    load, = _phase(_tiles(program.tile(0)[0].program), "kv_load")
+    expected_hbm = contiguous_hbm if second_index else repeated_hbm
+    # Contiguous scales can share a GM sector while each scale still takes a padded UB row.
+    assert load.work == {"hbm": expected_hbm, "mte2_aiv": repeated_hbm}
+    assert load.metadata["ori_logical_bytes"] == 2 * row_bytes
+    assert load.metadata["dram_sector_bytes"] == expected_hbm
+    assert sum(row["demand"]["hbm"] for row in trace if ":kv_load:" in row["task"]) == expected_hbm
+
+
 @pytest.mark.parametrize("abi,mode,attributes,error", [
     (MQS_ABI, 1, {"scale_encoding": "bf16_g32"}, "invalid_scale_encoding"),
     (MQS_ABI, 1, {"scale_encoding": "e8m0_g64"}, "invalid_scale_encoding"),

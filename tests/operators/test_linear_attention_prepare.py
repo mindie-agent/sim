@@ -573,8 +573,6 @@ def test_wy_chunk_width_requires_pinned_source_abi():
                 resolve_operator_plan(_wy_op(bt=32, abi=abi, heads=8, **{field: 1}), ctx)
     output = _wy_op(abi="gdn_output_arch35_chunk32", lengths=(32,), heads=1, key_heads=1, dk=128)
     assert resolve_operator_plan(output, ctx).recipe.work.matrix == {"bf16": 1_572_864}
-
-
 @pytest.mark.parametrize("metadata", (
     {"required_routes": "l0c->ub"}, {"required_routes": (("ub", "l1"),)},
     {"abi": "gdn_chunk32"}, {"abi": "flash_kda_persistent"},
@@ -582,15 +580,21 @@ def test_wy_chunk_width_requires_pinned_source_abi():
 def test_staged_isa_rejects_direct_routes_and_foreign_abis(metadata):
     _, ctx = sku_planning_context(OLDER_SKU, "wy")
     op = _wy_op(**metadata)
-    if metadata.get("abi") == "flash_kda_persistent":
-        op = replace(op, family="kda_prefill", recipe="kda_prefill")
+    op = replace(op, family="kda_prefill", recipe="kda_prefill") if metadata.get("abi") == "flash_kda_persistent" else op
     with pytest.raises(ModelingError, match="unavailable"):
         resolve_operator_plan(op, ctx)
-
-
 def test_direct_isa_rejects_synthetic_datapath_without_routes():
-    _, ctx = sku_planning_context(NEWEST_SKU, "wy")
-    _, staged = sku_planning_context(OLDER_SKU, "wy")
+    _, ctx = sku_planning_context(NEWEST_SKU, "wy"); _, staged = sku_planning_context(OLDER_SKU, "wy")
     with pytest.raises(ModelingError, match="L0C to UB and UB to L1"):
-        resolve_operator_plan(_wy_op(), replace(ctx, datapath=replace(
-            ctx.datapath, usable_paths=staged.datapath.usable_paths)))
+        resolve_operator_plan(_wy_op(), replace(ctx, datapath=replace(ctx.datapath, usable_paths=staged.datapath.usable_paths)))
+def test_chunk32_timing_policy_delegates_to_linear_attention_strategies():
+    from _support.hardware import machine
+    from _support.linear_cases import recipe_context
+    from mindie_sim.prediction.gdn_chunk32 import STATE
+    from mindie_sim.prediction.mechanism import Geometry
+    from mindie_sim.prediction.operators import linear_attention
+    op = STATE.make_op({"lengths": (64,), "heads": 1, "key_heads": 1})
+    for sku, exp in ((NEWEST_SKU, (0.0022, 0.00095)), (OLDER_SKU, (0.0, 0.0))):
+        dies = machine(sku).dies; g = Geometry.from_devices(dies); base = recipe_context(g, op)
+        assert linear_attention.chunk32_timing_policy(g, replace(base, service_modes=dict(dies[0].service_modes)), 0.00095) == exp
+        assert linear_attention.chunk32_timing_policy(replace(g, compute_arch=None, datapath=None), replace(base, service_modes={}), 0.00095) == (0.0, 0.0)

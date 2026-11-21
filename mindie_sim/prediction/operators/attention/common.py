@@ -244,6 +244,12 @@ def packed_selection_runs(selection: Iterable[int] | AddressRunPlan, row_bytes: 
     return _PaddedGatherRuns(runs.runs, alignment_bytes=SECTOR_BYTES, sector_bytes=runs.sector_bytes)
 
 
+def packed_gather_run_plans(runs: AddressRunPlan) -> Iterable[AddressRunPlan]:
+    """Keep each gather independent while sharing sectors within a contiguous run."""
+    for run in runs.runs:
+        yield _PaddedGatherRuns((run,), alignment_bytes=runs.alignment_bytes, sector_bytes=runs.sector_bytes)
+
+
 def _selection_runs(addresses: Iterable[int], row_bytes: int) -> AddressRunPlan:
     runs = []
     start = end = None
@@ -291,12 +297,10 @@ def c8_gather_accounting(
         rows += count
         # Independent gather runs in one query preserve repeat accesses before L2
         # fill; physically contiguous rows were already coalesced into one AddressRun.
-        for run in plan.runs:
-            run_plan = _PaddedGatherRuns((run,), alignment_bytes=plan.alignment_bytes,
-                                         sector_bytes=plan.sector_bytes)
+        for run_plan in packed_gather_run_plans(plan):
             sectors += run_plan.dram_sector_and_service()[0]
             pattern = MemoryAccessPattern(tensor_id, 0, die, owner, "read", "mte2_aiv",
-                                          run.rows * row_bytes, run_plan, reuse_key=key)
+                                          run_plan.runs[0].rows * row_bytes, run_plan, reuse_key=key)
             ledger = bind_memory_access(
                 pattern, view, hbm_bus=bus, copy_hit_bytes_per_ms=1, copy_miss_bytes_per_ms=1,
                 l2_bytes_per_ms=1, pipe_row_id="mte2_aiv", l2_row_id="l2", commit=False,

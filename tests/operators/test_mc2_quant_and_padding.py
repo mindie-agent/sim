@@ -578,3 +578,23 @@ def test_tensor_padding_masks_empty_tail_ranks_from_source_realization():
     assert ops["router"].local_shape == (12, 256, HIDDEN)
     assert ops["mc2_tp_gather"].local_shape == (16, HIDDEN)
     assert ops["mc2_output_trim"].local_shape == (12, HIDDEN)
+
+def test_native_protocol_delegates_selection_recipes_and_lowering():
+    from types import SimpleNamespace
+    from mindie_sim.prediction import mc2_graph
+    from mindie_sim.prediction.mechanism import Geometry
+    from mindie_sim.schema.operators import OpSpec
+    for kind, quant, native_r, net_r in (
+        ("arch22_v2_caller", "per_token_int8", "arch22_v2_caller_local", "arch22_v2_declared_peer_channel"),
+        ("arch35_fullmesh", "none", "arch35_fullmesh_resource_phase", mc2_graph.NETWORK),
+    ):
+        decl = {"kind": kind, "dispatch_quant": quant, "max_inflight_per_rank": 2}
+        rt = SimpleNamespace(kernels={"native_moe_protocol": decl}, moe_recipe="alltoall")
+        reg = mc2_graph.recipes(rt.kernels)
+        assert mc2_graph.select(rt.kernels) is decl and reg[net_r].max_inflight_per_rank == 2
+        ops = tuple(OpSpec(n, "moe", "decode", 0, 0, (), (2, 32), (2, 32), (2, 32), (2, 32), deps=d, dtype="bf16")
+                    for n, d in (("m.pack", ("in",)), ("m.dispatch", ("m.pack",)), ("m.combine", ("m.dispatch",)), ("m.unpack", ("m.combine",))))
+        low = mc2_graph.lower(ops, runtime=rt, prefix="m", width=32, dtype="bf16", source_partitions=1, received_assignments=0, tokens=2, top_k=1, experts=2, ep=2)
+        assert {o.recipe for o in low if o.source_boundary == "kernel"} == {native_r} and reg[native_r].prepare(low[0], Geometry(1, {"vector": 2}))[1].native is (kind == "arch35_fullmesh")
+    with pytest.raises(ModelingError, match="native_moe_protocol_requires_supported_caller"):
+        mc2_graph.select({"native_moe_protocol": {"kind": "unknown"}})

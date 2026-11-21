@@ -8,8 +8,10 @@
 """
 from __future__ import annotations
 
+from mindie_sim.schema.datapath import GENERIC_ARCH_ID, ArchId
 from mindie_sim.schema.operators import OpSpec
 from ...mechanism import Geometry, OperatorPlan
+from ...program import RecipeContext
 from ...results import OpOccurrence
 from ..contracts import OperatorFamilySpec, OperatorPlanningContext, ResolvedOperator
 from .arch22 import STRATEGY as _ARCH22
@@ -39,6 +41,20 @@ from .common import (
 )
 
 _STRATEGIES = {_ARCH22.arch_id: _ARCH22, _ARCH35.arch_id: _ARCH35}
+
+
+def chunk32_timing_policy(
+    geometry: Geometry, context: RecipeContext, step_sync_ms: float,
+) -> tuple[float, float]:
+    """Resolve launch setup and per-step synchronization for the Chunk32 plan."""
+    if geometry.datapath is not None:
+        arch_id = geometry.datapath.compute_arch.arch_id
+    else:
+        spec = geometry.compute_arch
+        arch_id = ArchId(spec.preset) if spec is not None and spec.preset else GENERIC_ARCH_ID
+    # The direct Chunk32 planner already binds its native ABI. Synthetic
+    # geometries without a known ISA still use that ABI's service defaults.
+    return _STRATEGIES.get(arch_id, _ARCH35).chunk32_timing_policy(context, step_sync_ms)
 
 
 def resolve_operator_plan(op: OpSpec, ctx: OperatorPlanningContext) -> ResolvedOperator:
@@ -101,6 +117,7 @@ __all__ = [
     "build",
     "build_recover_ssm_commit",
     "build_recover_ssm_verify",
+    "chunk32_timing_policy",
     "compute_wy_chunk_work",
     "rank_one_transition",
     "register_family",

@@ -23,7 +23,7 @@ from .block_ops import (
     _quant_four_over_six_contract,
 )
 from .contracts import _input_dtype, _shape, _tokens_width
-from .registry import MINDIE_SD_CUSTOM_OPS, MINDIE_SD_VENDOR, _resolve_op_name
+from .registry import MINDIE_SD_VENDOR, _custom_ops, _resolve_op_name
 
 
 def lower_op(
@@ -38,7 +38,7 @@ def lower_op(
 ) -> OpSpec:
     """Lower one exact semantic occurrence into a MindIE-SD custom operator."""
     resolved = _resolve_op_name(op, op_name)
-    spec = MINDIE_SD_CUSTOM_OPS[resolved]
+    spec = _custom_ops()[resolved]
     if op.family not in spec["families"] and op.recipe not in spec["families"]:
         raise ModelingError(f"mindie_sd_custom_op_family_mismatch:{resolved}:{op.family}")
     if soc_family is not None and soc_family not in spec["supported_socs"]:

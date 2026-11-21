@@ -395,14 +395,14 @@ tier = "tier0"
 reserved = true
 
 [[module]]
-path = "operators/test_vector_norm_quant.py"
+path = "operators/test_cuda_norm.py"
 tier = "tier0"
-reserved = true
+owns = ["mindie_sim/prediction/operators/cuda_norm.py"]
 
 [[module]]
-path = "operators/test_custom_op_libraries.py"
+path = "operators/test_cuda_quant.py"
 tier = "tier0"
-reserved = true
+owns = ["mindie_sim/prediction/operators/cuda_quant.py"]
 
 # ---------------------------------------------------------------- spine (PredictionSpine)
 [[module]]

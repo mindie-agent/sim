@@ -174,35 +174,49 @@ class RecipeBook:
         self._select_id_cache[id(op)] = (op, recipe)
         return recipe
 
-    def _governed_recipe(self, spec: Any):
+    def _governed_recipe(self, spec: Any, op):
+        from ..mechanism import PlannedRecipe
+        from ..physical_recipe_registry import uses_retained_source_plan
+
+        retained = self.recipes.get(op.recipe)
+        if isinstance(retained, PlannedRecipe) and uses_retained_source_plan(op):
+            return retained
         cached = self._governed_recipes.get(spec.name)
         if cached is not None:
             return cached
         from mindie_sim.schema.datapath import (
-            ComputeArchIdentity, DatapathCapabilitySpec, GENERIC_ARCH_ID,
+            ArchId, ComputeArchIdentity, DatapathCapabilitySpec, GENERIC_ARCH_ID,
         )
-        from ..mechanism import PlannedRecipe
         from ..operators.contracts import OperatorPlanningContext
+        from ..ownership import unit_group
         from ..results import OpOccurrence
 
         book, dispatcher = self, self._family_dispatcher
 
         def _build(op, geometry):
             datapath = getattr(geometry, "datapath", None)
+            if datapath is None and spec.name == "attention":
+                from ..operators.attention import _planning_context
+
+                geometry = _planning_context(op, geometry).geometry
+                datapath = geometry.datapath
             if datapath is None:
-                res_units = dict(getattr(geometry, "resource_units", {}) or {})
-                datapath = DatapathCapabilitySpec(
-                    compute_arch=ComputeArchIdentity(
-                        arch_id=GENERIC_ARCH_ID,
-                        declared=getattr(geometry, "compute_arch", None),
-                    ),
-                    aic_count=int(getattr(geometry, "compute_units", 1) or 1),
-                    aiv_count=int(res_units.get("vector", 0)),
-                    aic_aiv_pairs=(), usable_paths=(),
-                    matrix_output_paths=frozenset({"gm"}), ub_peer_edges=(), stars=None,
+                arch = getattr(geometry, "compute_arch", None)
+                arch_id = ArchId(arch.preset) if arch is not None and arch.preset else GENERIC_ARCH_ID
+                paths = arch.paths if arch is not None else ()
+                aics = geometry.compute_units
+                aivs = geometry.resource_units.get("vector", aics if arch is not None else 0)
+                pairs = (
+                    tuple((aic, unit_group(aic, aics, aivs)) for aic in range(aics))
+                    if aics > 0 and aivs > 0 and aivs % aics == 0 else ()
                 )
-            meta = dict(op.metadata) if op.metadata else {}
-            requested_abi = meta.get("requested_abi")
+                datapath = DatapathCapabilitySpec(
+                    compute_arch=ComputeArchIdentity(arch_id, arch),
+                    aic_count=aics, aiv_count=aivs, aic_aiv_pairs=pairs, usable_paths=paths,
+                    matrix_output_paths=frozenset(path.target for path in paths if path.source == "l0c"),
+                    ub_peer_edges=(), stars=None, buffers=tuple(geometry.buffers.items()),
+                )
+            requested_abi = dict(op.metadata or ()).get("requested_abi")
             ctx = OperatorPlanningContext(
                 occurrence=OpOccurrence(
                     int(getattr(geometry, "replica", 0)),
@@ -229,6 +243,13 @@ class RecipeBook:
         from ..mechanism import PlannedRecipe
         if op.plan_required:
             recipe = self.recipes.get(op.recipe)
+            if op.recipe and op.recipe not in self._caller_recipes and not (
+                op.source_boundary == "call" and isinstance(recipe, PlannedRecipe)
+                and recipe.kernels is not None
+            ):
+                governed = self._family_registry.match(op)
+                if governed is not None:
+                    recipe = self._governed_recipe(governed, op)
             if not isinstance(recipe, PlannedRecipe):
                 raise ModelingError(f"source_plan_binding_required:{op.recipe}")
             if op.source_boundary == "call" and recipe.kernels is None:
@@ -238,7 +259,16 @@ class RecipeBook:
         view = dict(meta.get("attention_tensor_view") or {})
         recipe_name = str(getattr(op, "recipe", ""))
         family_name = str(getattr(op, "family", ""))
-        explicit = recipe_name in self._explicit_recipes or family_name in self._explicit_families
+        legacy_recover_commit = (
+            recipe_name == "recover_ssm_commit" and family_name == "elementwise"
+            and not any(k in meta for k in ("lengths", "sequence_lengths", "sequence_tokens"))
+        )
+        governed = None if legacy_recover_commit else self._family_registry.match(op)
+        exact_governed = governed if recipe_name else None
+        explicit = (
+            exact_governed is not None or recipe_name in self._explicit_recipes
+            or family_name in self._explicit_families
+        )
         kind = meta.get("program_kind")
         if (
             not explicit and kind == "dense_latent_attention_generic"
@@ -251,6 +281,8 @@ class RecipeBook:
         generic_grouped = {"balanced_grouped_gate_up", "balanced_grouped_down"}
         if recipe_name in self._caller_recipes:
             recipe = self.recipes[recipe_name]
+        elif exact_governed is not None:
+            recipe = self._governed_recipe(exact_governed, op)
         elif kind in self._caller_programs and (
             kind == family_name or kind != GENERIC_MATRIX_PROGRAM
         ):
@@ -285,23 +317,10 @@ class RecipeBook:
                 else:
                     _mxfp4_config(op)
         else:
-            legacy_recover_commit = (
-                recipe_name == "recover_ssm_commit"
-                and family_name == "elementwise"
-                and not any(
-                    k in meta for k in ("lengths", "sequence_lengths", "sequence_tokens")
-                )
-            )
-            governed = (
-                None if (recipe_name in self.recipes or legacy_recover_commit)
-                else self._family_registry.match(op)
-            )
             if governed is not None and (
-                recipe_name
-                or family_name == "rotary"
-                or family_name not in self.families
+                family_name == "rotary" or family_name not in self.families
             ):
-                recipe = self._governed_recipe(governed)
+                recipe = self._governed_recipe(governed, op)
             else:
                 fam_spec = self._family_registry.spec_for_family(family_name)
                 if (

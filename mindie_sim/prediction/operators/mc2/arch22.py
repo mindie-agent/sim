@@ -15,11 +15,13 @@ from dataclasses import dataclass
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import ArchId, SourceRef
 from mindie_sim.schema.operators import OpSpec
+from ... import mc2_local_caller
 from ...mechanism import OperatorPlan, Work
 from ..contracts import ArchStrategy, OperatorPlanningContext
 from .common import (
     Mc2Contract, PeerRoute, Phase, Transport, build_transport_stages, capability_gap,
-    contract_fields, make_plan, topology_hops, validate_contract,
+    contract_fields, make_plan, native_protocol_peer_transport, topology_hops,
+    validate_contract, validate_native_dispatch_quant,
 )
 from .lowering import SIO_HCCS, declared_incoming_routes
 
@@ -223,3 +225,34 @@ class _Strategy:
 
 
 STRATEGY: ArchStrategy = _Strategy()
+
+NATIVE_PROTOCOL_KIND = "arch22_v2_caller"
+
+
+def validate_native_protocol(raw):
+    if raw.get("dispatch_quant") != "per_token_int8":
+        raise ModelingError("arch22_v2_caller_requires_per_token_int8_dispatch")
+    if "global_bs" in raw and (type(raw["global_bs"]) is not int or raw["global_bs"] < 0):
+        raise ModelingError("arch22_v2_global_bs_requires_nonnegative_integer")
+    validate_native_dispatch_quant(raw)
+    if any(raw.get(key) is not None for key in (
+        "chunk_bytes", "hop_startup_us", "receive_capacity_bytes_per_peer",
+    )):
+        raise ModelingError("arch22_v2_caller_does_not_accept_chunked_direct_peer_options")
+    native_protocol_peer_transport(raw)
+
+
+def native_protocol_recipes(selected):
+    return mc2_local_caller.recipes(selected)
+
+
+def lower_native_protocol(
+    ops, *, selected, runtime, prefix, tokens, top_k, width, experts, ep,
+    source_partitions, received_assignments, dtype, source_routing=None,
+    valid_tokens=None, source_rows_by_replica=None, destination_rows_by_rank=None,
+):
+    return mc2_local_caller.lower(
+        ops, selected=selected, runtime=runtime, prefix=prefix, tokens=tokens,
+        top_k=top_k, width=width, experts=experts, ep=ep,
+        source_partitions=source_partitions, received_assignments=received_assignments,
+        dtype=dtype, source_routing=source_routing)

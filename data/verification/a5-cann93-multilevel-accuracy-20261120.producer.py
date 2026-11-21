@@ -75,22 +75,31 @@ STATIC_TRACKED_FILES = (
     "mindie_sim/prediction/attention_decode.py",
     "mindie_sim/prediction/expected_grouped.py",
     "mindie_sim/prediction/gdn_chunk32.py",
-    "mindie_sim/prediction/operators/attention/__init__.py",
-    "mindie_sim/prediction/operators/hyper_connections/__init__.py",
-    "mindie_sim/prediction/operators/mla_prolog/__init__.py",
-    "mindie_sim/prediction/operators/sparse_indexer/__init__.py",
+)
+TRACKED_OPERATOR_PACKAGES = (
+    Path("mindie_sim") / "prediction" / "operators" / "attention",
+    Path("mindie_sim") / "prediction" / "operators" / "hyper_connections",
+    Path("mindie_sim") / "prediction" / "operators" / "mla_prolog",
+    Path("mindie_sim") / "prediction" / "operators" / "sparse_indexer",
 )
 EXECUTION_PACKAGE_REL = Path("mindie_sim") / "prediction" / "execution"
 DEFAULT_SPLIT_MANIFEST_NAMES = ("acquisition_split_manifest.json", "split_manifest.json")
 
 
 def _tracked_source_hashes(root: Path = ROOT) -> dict[str, str]:
-    """Hash static tracked modules plus live sorted ``prediction/execution/*.py``."""
+    """Hash static tracked modules plus live sorted execution & operator package ``*.py``."""
     exec_dir = root / EXECUTION_PACKAGE_REL
     exec_files = sorted(p.relative_to(root).as_posix() for p in exec_dir.glob("*.py"))
     if not exec_files:
         raise FileNotFoundError(f"execution_package_sources_missing:{exec_dir}")
-    tracked = sorted({*STATIC_TRACKED_FILES, *exec_files})
+    op_files: list[str] = []
+    for pkg_rel in TRACKED_OPERATOR_PACKAGES:
+        pkg_dir = root / pkg_rel
+        members = sorted(p.relative_to(root).as_posix() for p in pkg_dir.glob("*.py"))
+        if not members:
+            raise FileNotFoundError(f"operator_package_sources_missing:{pkg_dir}")
+        op_files.extend(members)
+    tracked = sorted({*STATIC_TRACKED_FILES, *exec_files, *op_files})
     return {rel: digest_file_streaming(root / rel) for rel in tracked}
 
 

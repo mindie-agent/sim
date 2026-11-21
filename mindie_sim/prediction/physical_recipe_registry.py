@@ -177,14 +177,40 @@ def physical_family_bindings() -> dict[str, object]:
     return bindings
 
 
-def physical_recipe_bindings() -> dict[str, object]:
-    """Default exact recipes for topk/indexer names that are family-ambiguous.
+def uses_retained_source_plan(op) -> bool:
+    """Recognize source contracts that carry the retained planner's inputs."""
+    metadata = dict(op.metadata or ())
+    if metadata.get("requested_abi") or metadata.get("abi"):
+        return False
+    if op.family == "attn_res_prefix" and "attn_res_view" in metadata:
+        from .family_attnres import RECIPE
 
-    The three source-planned kernels below resolve a declared recipe to a
-    ``PlannedRecipe`` builder.  Each builder is capability-scoped inside its own
-    module: A2/A3 or a non-matching operand form returns the previously
-    registered physical mechanism unchanged, so this registry never adds a
-    hardware branch to the execution loop.
+        # Preserve the caller's per-owner service and prepared tensor view.
+        return op.recipe == RECIPE
+    if "megamoe_geometry" in metadata:
+        from .mc2_megamoe import RECIPE
+        from .operators.grouped_moe.common import contract_fields
+
+        # Aggregate routed work has no per-expert histogram for the grouped planner.
+        return op.recipe == RECIPE and not {
+            "matrix_group_rows", "group_rows", "expert_rows", "group_list",
+        }.intersection(contract_fields(op))
+    if metadata.get("implementation") == op.recipe and {
+        "chunk", "lengths", "head_dim_k", "head_dim_v",
+    }.issubset(metadata):
+        from .gdn_chunk32 import OUTPUT_RECIPE, PREPARE_RECIPE, STATE_RECIPE
+
+        # The native Chunk32 caller supplies one leaf's layout and work contract.
+        return op.recipe in {PREPARE_RECIPE, STATE_RECIPE, OUTPUT_RECIPE}
+    return False
+
+
+def physical_recipe_bindings() -> dict[str, object]:
+    """Default exact recipes, including call expanders and retained source plans.
+
+    Kernel planning for owned recipe IDs goes through the family registry.
+    These bindings also provide the legacy Chunk32 and aggregate MegaMoE
+    source contracts and the attention call expanders.
     """
     from .gdn_chunk32 import recipes as chunk32_recipes
     from .index_cache_writer import recipes as cache_writer_recipes
