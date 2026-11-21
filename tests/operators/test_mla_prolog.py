@@ -59,8 +59,8 @@ PACKED_LAYOUT = "packed_int8_bf16_rope_fp32_scale"
 PACKED_PROFILE = "mla_prolog_packed_int8_tile128_analytic"
 FULL_QUANT_PROFILE = "mla_prolog_arch22_fullquant_a3925fd4"
 SPLIT_N_SKU, SPLIT_M_SKU = REPRESENTATIVE_SKUS["a2"], REPRESENTATIVE_SKUS["a5"]
-def _context(sku, op):
-    geom = Geometry.from_devices(sku_case(sku).machine.dies)
+def _context(sku, op, device=None):
+    geom = Geometry.from_devices(sku_case(sku, device).machine.dies)
     return OperatorPlanningContext(OpOccurrence(0, op.stage, 0, op.op_id), geom, geom.datapath)
 def _prolog(tokens=5, **overrides):
     fields = dict(op_id="prolog", tokens=tokens, hidden_size=5120, num_heads=16,
@@ -172,7 +172,6 @@ def _execute(op, plan, geometry):
     assert {k: v for k, v in engine.serviced.items() if v} == pytest.approx(binding.bind(plan.work), rel=1e-12)
     _drained({"execution": engine.summary()})
     return engine.summary()["peak_allocated"].get("hbm", 0)
-
 @pytest.mark.parametrize("sku,abi,mode,size", (
     (SPLIT_N_SKU, ABI_V3_NZ, WEIGHT_QUANT_BF16, 2), (SPLIT_N_SKU, ABI_V3_NZ, WEIGHT_QUANT_INT8, 4),
     (SPLIT_M_SKU, ABI_V4_NZ, WEIGHT_QUANT_BF16, 2), (SPLIT_M_SKU, ABI_V4_NZ, WEIGHT_QUANT_INT8, 4),
@@ -197,14 +196,14 @@ def test_projection_outputs_use_native_gm_element_widths(sku, abi, mode, size):
     if cast_bytes:
         assert _service_bytes(phases["qc_dequant_mte2_aiv"], "mte2_aiv") == 4 * 128 * size
     assert _execute(op, plan, ctx.geometry) == plan.metadata["workspace_slot_bytes"] == cq + kv + query + cast_bytes
-
-@pytest.mark.parametrize("tokens,padded,splits", ((17, 32, 4), (4096, 4128, 20)))
-def test_dsl_split_k_exchanges_fp32_partials_and_retains_local_query(tokens, padded, splits):
-    op = _prolog(tokens, abi=ABI_DSL, dsl_d_width=512)
-    assert op.flops == 2 * tokens * (5120 * (1280 + 512) + 1280 * 16 * 512)
-    ctx = _context(SPLIT_M_SKU, op)
-    plan = governed.build(op, ctx)
+@pytest.mark.parametrize("tokens,padded,splits,ub_kib,workspace", (
+    (17, 32, 4, None, 917_504), (4096, 4128, 1, None, 29_589_504), (4096, 4128, 20, 72, 591_790_080)))
+def test_dsl_split_k_exchanges_fp32_partials_and_retains_local_query(tokens, padded, splits, ub_kib, workspace):
     resident = tokens < 256
+    op = _prolog(tokens, abi=ABI_DSL, dsl_d_width=512, phase="decode" if resident else "prefill")
+    assert op.flops == 2 * tokens * (5120 * (1280 + 512) + 1280 * 16 * 512)
+    ctx = _context(SPLIT_M_SKU, op, {"buffers": {"ub": ub_kib * 1024}} if ub_kib else None)
+    plan = governed.build(op, ctx)
     assert plan.metadata["l1_reuse"] is resident and plan.metadata["k_splits"] == splits
     chunk, = plan.program.groups[0]
     phases = {p.name: p for p in chunk.phases}
@@ -215,28 +214,29 @@ def test_dsl_split_k_exchanges_fp32_partials_and_retains_local_query(tokens, pad
         assert _logical_bytes(write) == _service_bytes(read, "mte2_aiv") == _service_bytes(read, "hbm") == live
         assert _service_bytes(write, "fixpipe") == _service_bytes(write, "hbm") == padded * splits * width * 4
         post = "cq_norm" if tensor == "qa_partials" else "kv_cache"
+        reduce = phases.get(tensor + "_reduce_vector")
+        assert (reduce is not None) == (not resident and splits > 1)
+        if reduce is not None:
+            assert reduce.after == (read.name,)
+            assert _service_bytes(reduce, "vector") == tokens * width * (splits - 1) * ops
+        assert phases[post + "_mte2_aiv"].after == ((reduce or read).name,)
         if resident:
-            assert phases[post + "_mte2_aiv"].after == (read.name,)
             assert {dict(d.audit)["split"] for d in write.demands} == set(range(splits))
             assert len({d.owner for d in write.demands}) > 1
         else:
-            reduce = phases[tensor + "_reduce_vector"]
-            assert reduce.after == (read.name,) and phases[post + "_mte2_aiv"].after == (reduce.name,)
-            assert _service_bytes(reduce, "vector") == tokens * width * (splits - 1) * ops
             assert sum(dict(d.audit)["logical_flops"] for d in phases[product + "_cube"].demands) == 2 * tokens * width * 5120
     assert phases["mm3_wqb_mte2_aic"].after == ("cq_norm_mte3_gm",)
     assert all(set(d.work.resources) == {"fixpipe"} for d in phases["mm3_wqb_fixpipe_ub"].demands)
-    assert _execute(op, plan, ctx.geometry) == plan.metadata["workspace_slot_bytes"] == padded * splits * (1280 + 512) * 4
-    if not resident:
-        return
-    assert plan.metadata["step_batch"] == 32 and plan.work.matrix == {"fp8_e4m3": op.flops * 32 // 17}
-    assert sum(dict(d.audit)["logical_flops"] for d in phases["a1_cube"].demands) == 2 * tokens * 5120 * (1280 + 512)
-    no_l1 = replace(ctx, geometry=replace(ctx.geometry, buffers=dict(ctx.geometry.buffers) | {"l1": 1}))
-    spill = governed.build(op, no_l1)
-    assert not spill.metadata["l1_reuse"] and spill.metadata["logical_flops"] == plan.metadata["logical_flops"]
-    paths = tuple(p for p in ctx.datapath.usable_paths if (p.source, p.target) != ("l0c", "ub"))
-    with pytest.raises(ModelingError, match="l0c.*ub"):
-        governed.build(op, replace(ctx, datapath=replace(ctx.datapath, usable_paths=paths)))
+    assert _execute(op, plan, ctx.geometry) == plan.metadata["workspace_slot_bytes"] == workspace
+    if resident:
+        assert plan.metadata["step_batch"] == 32 and plan.work.matrix == {"fp8_e4m3": op.flops * 32 // 17}
+        assert sum(dict(d.audit)["logical_flops"] for d in phases["a1_cube"].demands) == 2 * tokens * 5120 * (1280 + 512)
+        no_l1 = replace(ctx, geometry=replace(ctx.geometry, buffers=dict(ctx.geometry.buffers) | {"l1": 1}))
+        spill = governed.build(op, no_l1)
+        assert not spill.metadata["l1_reuse"] and spill.metadata["logical_flops"] == plan.metadata["logical_flops"]
+        paths = tuple(p for p in ctx.datapath.usable_paths if (p.source, p.target) != ("l0c", "ub"))
+        with pytest.raises(ModelingError, match="l0c.*ub"):
+            governed.build(op, replace(ctx, datapath=replace(ctx.datapath, usable_paths=paths)))
 def test_disjoint_stream_uses_reachable_physical_owner_ids():
     op = replace(_prolog(17, abi=ABI_DSL, dsl_d_width=512), stream="prolog")
     streams = StreamPlan(0, (StreamLane("main", StreamCoreBudget(7, 14)),

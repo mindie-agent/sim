@@ -165,10 +165,12 @@ def make_lightning_indexer_qsa_op(
 ) -> OpSpec:
     if type(compress_ratio) is not int or compress_ratio <= 0:
         raise ModelingError("sparse_indexer_invalid_compress_ratio")
+    scanned_rows, residual_tokens = divmod(context_tokens, compress_ratio)
     contract = SparseIndexerContract(
-        query_tokens, ceil_div(context_tokens, compress_ratio), index_heads, index_dim,
+        query_tokens, scanned_rows, index_heads, index_dim,
         topk_items=block_topk, cache_dtype=cache_dtype, has_head_weights=has_head_weights, abi=QSA_ABI,
         batch_size=_batch(batch_size, requests, query_tokens), shared_prefix=shared_prefix,
+        compress_ratio=compress_ratio, residual_tokens=residual_tokens,
     )
     return _scorer_op(
         contract, _arch35.QSA_SOURCE if has_head_weights else QSA_OVERLAY_SOURCE,

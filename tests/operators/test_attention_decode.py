@@ -220,6 +220,8 @@ def test_shipping_score_padding_and_full_width_value_publications():
     assert score[0]["end_ms"] <= softmax[0]["start_ms"] <= qk[4]["start_ms"]
     assert qk[-1]["end_ms"] <= score[1]["start_ms"] <= softmax[1]["start_ms"]
     assert len(pv) == 8 and len(publish) == len(online) == 2
+    assert qk[4]["start_ms"] < pv[0]["start_ms"] < online[0]["end_ms"]
+    assert qk[-1]["end_ms"] <= pv[0]["start_ms"]
     assert [row["demand"]["fixpipe"] for row in publish] == [4096, 4096]
     for i, (publication, output) in enumerate(zip(publish, online, strict=True)):
         assert all(panel["end_ms"] <= publication["start_ms"] for panel in pv[i * 4:(i + 1) * 4])
@@ -228,7 +230,8 @@ def test_shipping_score_padding_and_full_width_value_publications():
 
 
 @pytest.mark.parametrize("stack_pin", [False, True])
-def test_history_decode_exchanges_output_and_lse_after_attention(stack_pin):
+@pytest.mark.parametrize("dtype", ["bf16", "fp16"])
+def test_history_decode_exchanges_output_and_lse_after_attention(stack_pin, dtype):
     manifest = REPO_ROOT / "mindie_sim/stack_sources/vllm_ascend_cann93.json"
     revision = json.loads(manifest.read_text())["baseline_revision"] if stack_pin else VLLM_REVISION
     history = governed.ContextParallelPlan(
@@ -236,23 +239,25 @@ def test_history_decode_exchanges_output_and_lse_after_attention(stack_pin):
         (("query", (1, 1, 128), 2),), dcp_size=2,
     )
     contract = governed.AttentionContract(1, 1, 1, 128, 128, selected_tokens=33, cp_plan=history)
-    op = governed.make_attention_op(contract, op_id="history", deps=("input",))
+    op = governed.make_attention_op(contract, op_id="history", deps=("input",), dtype=dtype)
     book = RecipeBook(governed.recipes())
-    gather, attention, exchange, merge, join = book.expand((op,))
+    gather, attention, pack, exchange, merge, join = book.expand((op,))
     assert attention.returns == ("lse",) and attention.local_shape == (1, 2, 128)
-    assert gather.link_bytes == 256 and exchange.link_bytes == 260
-    assert exchange.family == "alltoall" and merge.mte2_bytes == 520 and merge.mte3_bytes == 256
+    assert pack.local_shape == (1, 2, 132) and pack.mte2_bytes == 520 and pack.mte3_bytes == 528
+    assert gather.link_bytes == 256 and exchange.link_bytes == 264
+    assert exchange.family == "alltoall" and exchange.local_shape == (1, 1, 132)
+    assert merge.mte2_bytes == 528 and merge.mte3_bytes == 256
     assert dict(merge.metadata)["partial_reduction"] == "logsumexp"
     assert dict(exchange.metadata)["payload_tensors"] == (("output", (1, 1, 128)), ("lse", (1, 1, 1)))
     assert all(before.op_id in after.deps for before, after in zip(
-        (gather, attention, exchange, merge), (attention, exchange, merge, join), strict=True,
+        (gather, attention, pack, exchange, merge), (attention, pack, exchange, merge, join), strict=True,
     ))
 
     geom = geometry(governed.ARCH35)
     plan = governed.build(op, geom)
     assert any(ref.revision == revision and ref.relative_path.endswith("/attention_cp.py")
                for ref in plan.pipeline_spec.sources)
-    assert plan.work.resources["link"] == 516
+    assert plan.work.resources["link"] == 520
     rates = {**{role: value / 1000 for role, value in geom.rates.items()}, "cube": 1, "link": 1000}
     units = {**geom.resource_units, "link": 1}
     context = RecipeContext(op, {}, {role: role for role in rates}, rates, geom.compute_units,
@@ -261,9 +266,9 @@ def test_history_decode_exchanges_output_and_lse_after_attention(stack_pin):
     done = plan.lower(context).start(engine, "history", engine.submit("input", release=5))
     engine.advance(until=(done,))
     steps = [next(row for row in engine.trace if row["task"].endswith(":" + name))
-             for name in ("query_load", "output", "output_lse_exchange", "output_lse_merge")]
+             for name in ("query_load", "output", "output_lse_pack", "output_lse_exchange", "output_lse_merge")]
     network = [row for row in engine.trace if row["demand"].get("link")]
-    assert [row["demand"]["link"] for row in network] == [256, 260]
+    assert [row["demand"]["link"] for row in network] == [256, 264]
     assert network[0]["end_ms"] <= steps[0]["start_ms"]
     assert steps[1]["demand"]["mte3"] == 520
     assert all(left["end_ms"] <= right["start_ms"] for left, right in zip(steps, steps[1:]))
@@ -273,7 +278,7 @@ def test_history_decode_exchanges_output_and_lse_after_attention(stack_pin):
                         layers=1, block_size=16, prompt_tokens=16, output_tokens=2, concurrency=1)
     result = graph_costs(case, (op,), recipes=book, external_inputs={"input": 5}, isolated=False)
     timeline = {row["op_id"]: row for row in result["timeline"]}
-    for before, after in zip((gather, attention, exchange), (attention, exchange, merge), strict=True):
+    for before, after in zip((gather, attention, pack, exchange), (attention, pack, exchange, merge), strict=True):
         assert timeline[before.op_id]["complete_ms"] <= timeline[after.op_id]["ready_ms"]
 
 

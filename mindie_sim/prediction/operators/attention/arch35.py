@@ -5,12 +5,14 @@ Upstream-ABI: aclnnGenericBlockSparseAttention
 [Role] Model FIA, GBSA, packed SFA, NoPE SFA and the MindIE-SD ABI variants.
 [Invariants] Use declared cross-core routes. Preserve distinct offset,
   gather, QK, softmax and PV work and the physical KV representation.
+  Refresh resident sectors at admission and publish misses after DMA.
 [Timeouts & Locks] Stream selections in query order. No locks or I/O.
 [Side-Effect Policy] Bind immutable plans. Classify packed KV reads at Engine admission.
 """
 from __future__ import annotations
 
-from collections import Counter, OrderedDict
+from bisect import bisect_left
+from collections import Counter, deque
 from dataclasses import dataclass, replace
 from itertools import islice
 from math import ceil
@@ -23,7 +25,7 @@ from ...program import KernelProgram, ParallelProgram, PipelineProgram, Stage
 from ...runtime.l2_residency import AdmissionMemoryView, bind_memory_access
 from ...runtime.memory_physics import (
     AddressRun, AddressRunPlan, BoundAccess, HbmBusSpec, MemoryAccessPattern, ReuseKey,
-    _measure_byte_intervals, _merge_byte_intervals,
+    _intersect_byte_intervals, _measure_byte_intervals, _merge_byte_intervals, _subtract_byte_intervals,
 )
 from ..contracts import OperatorPlanningContext
 from ._fia import dense_fia
@@ -173,66 +175,94 @@ class _C8Read:
     def start(self, engine, name, ready, *, owner=""):
         # Store residency on the Engine, scoped to its physical HBM resource.
         view = _c8_memory(engine, self.pattern, self.bound, self.capacity)
+        admission = _C8Admission(view)
         done = engine.submit_bound_access(
-            name, self.bound, after=(ready,), owner=owner, memory_state=view, pattern=self.pattern,
+            name, self.bound, after=(ready,), owner=owner, memory_state=admission, pattern=self.pattern,
         )
-        engine.on_complete(done, lambda _: view.publish(self.pattern))
+        engine.on_complete(done, lambda _: view.touch(self.pattern.reuse_key, admission.misses, fill=True))
         return done
 
 
+@dataclass(slots=True)
+class _C8Admission:
+    view: _C8MemoryView
+    resident: tuple[tuple[int, int], ...] = ()
+    misses: tuple[tuple[int, int], ...] = ()
+
+    def resident_intervals_for(self, pattern, aligned_bytes):
+        self.resident = self.view.resident_intervals_for(pattern, aligned_bytes)
+        return self.resident
+
+    def admit_access(self, pattern, aligned_bytes):
+        resident, self.resident = self.resident, ()
+        hit = self.view.hit_bytes(pattern, resident)
+        self.misses = _subtract_byte_intervals(pattern.runs.sector_intervals(), resident)
+        self.view.touch(pattern.reuse_key, resident)
+        return hit, aligned_bytes - hit
+
+
 class _C8MemoryView:
-    """Share clean, versioned packed-KV sectors over the physical L2 budget."""
+    """Share versioned packed-KV sectors in oldest-to-newest touch order."""
 
     def __init__(self, capacity):
         self.capacity = capacity // SECTOR_BYTES * SECTOR_BYTES
         self.occupied = 0
-        self.ranges: OrderedDict[str, tuple[ReuseKey, tuple[tuple[int, int], ...]]] = OrderedDict()
+        self.ranges: deque[tuple[ReuseKey, int, int]] = deque()
 
     def resident_intervals_for(self, pattern, aligned_bytes):
         key = pattern.reuse_key
         if key is None or aligned_bytes <= 0:
             return ()
-        version, intervals = self.ranges.get(key.backing_allocation, (None, ()))
-        return intervals if version == key else ()
+        requested = pattern.runs.sector_intervals()
+        if not requested:
+            return ()
+        lower, upper = requested[0][0], requested[-1][1]
+        candidates = _merge_byte_intervals([
+            (start, end) for version, start, end in self.ranges
+            if version == key and start < upper and lower < end
+        ])
+        return _intersect_byte_intervals(requested, candidates)
 
-    def preview_access(self, pattern, aligned_bytes):
-        resident = self.resident_intervals_for(pattern, aligned_bytes)
+    @staticmethod
+    def hit_bytes(pattern, resident):
         hit = 0
         if resident:
             for run in pattern.runs.runs:
                 sectors = AddressRunPlan((run,), sector_bytes=pattern.runs.sector_bytes).sector_intervals()
                 copied = run.rows * ceil(run.row_bytes / SECTOR_BYTES) * SECTOR_BYTES
                 hit += AdmissionMemoryView._range_hit_miss(sectors, resident, copied)[0]
-        return hit, aligned_bytes - hit
+        return hit
 
-    def admit_access(self, pattern, aligned_bytes):
-        # An in-flight DMA has no resident sectors until its completion event.
-        return self.preview_access(pattern, aligned_bytes)
-
-    def publish(self, pattern):
-        key = pattern.reuse_key
-        requested = pattern.runs.sector_intervals()
-        version, old = self.ranges.pop(key.backing_allocation, (None, ()))
-        resident = old if version == key else ()
-        merged = _merge_byte_intervals((*resident, *requested))
-        self.ranges[key.backing_allocation] = (key, merged)
-        self.occupied += _measure_byte_intervals(merged) - _measure_byte_intervals(old)
+    def touch(self, key, intervals, *, fill=False):
+        if not intervals:
+            return
+        retained = deque()
+        lower, upper = intervals[0][0], intervals[-1][1]
+        for region in self.ranges:
+            version, start, end = region
+            if version == key and start < upper and lower < end:
+                first = max(0, bisect_left(intervals, (start,)) - 1)
+                stop = bisect_left(intervals, (end,), first)
+                remainder = _subtract_byte_intervals(((start, end),), intervals[first:stop])
+                retained.extend((version, lo, hi) for lo, hi in remainder)
+                self.occupied -= end - start - _measure_byte_intervals(remainder)
+            elif fill and version != key and version.backing_allocation == key.backing_allocation:
+                self.occupied -= end - start
+            else:
+                retained.append(region)
+        for start, end in intervals:
+            self.occupied += end - start
+            # Compress adjacent sectors when their address order is also their LRU order.
+            if retained and retained[-1][0] == key and retained[-1][2] == start:
+                _, start, _ = retained.pop()
+            retained.append((key, start, end))
+        self.ranges = retained
         while self.occupied > self.capacity:
-            oldest, (version, intervals) = self.ranges.popitem(last=False)
-            excess = self.occupied - self.capacity
-            for index, (start, end) in enumerate(intervals):
-                evicted = min(excess, end - start)
-                self.occupied -= evicted
-                excess -= evicted
-                if excess == 0:
-                    start += evicted
-                    tail = intervals[index + 1:]
-                    if start < end:
-                        tail = ((start, end), *tail)
-                    if tail:
-                        self.ranges[oldest] = (version, tail)
-                        self.ranges.move_to_end(oldest, last=False)
-                    break
+            version, start, end = self.ranges.popleft()
+            evicted = min(self.occupied - self.capacity, end - start)
+            self.occupied -= evicted
+            if start + evicted < end:
+                self.ranges.appendleft((version, start + evicted, end))
 
 
 def _c8_memory(engine, pattern, bound, capacity):
@@ -514,6 +544,11 @@ def _mindie_fp8_scale_bytes(contract):
     preferred = FP8_MIXED_KV_TILE if contract.head_dim <= FIA_TILE else FIA_TILE
     if kv_block == FP8_MAX_KV_TILE and preferred == FP8_MIXED_KV_TILE:
         kv_tile = kv_block
+    elif kv_block % preferred == 0:
+        kv_tile = preferred
+    elif preferred > FIA_TILE and kv_block % FIA_TILE == 0:
+        # CANN's mixed FP8 path prefers 128 here, even if a larger divisor fits.
+        kv_tile = FIA_TILE
     else:
         kv_tile = next(width for width in range(min(kv_block, preferred), 0, -1) if kv_block % width == 0)
     batch = min(contract.batch_size, contract.query_tokens)

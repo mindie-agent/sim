@@ -443,17 +443,43 @@ def test_packed_residency_evicts_by_bytes(capacity, hit, distinct_allocations):
     assert reads[-1].get("l2", 0) == hit and reads[-1].get("hbm", 0) == 672 - hit
 
 
-def test_mindie_v3_fp8_consumes_fp32_scales_and_rejects_unknown_mode():
+def test_packed_residency_evicts_oldest_sectors_within_one_allocation():
+    base = geometry()
+    geom = replace(base, buffers={**base.buffers, "l2": 1024**2})
+    row_bytes, warm_rows = 672, 1560
+
+    def request(offsets):
+        return governed.make_kv_quant_sfa_c8_op(
+            op_id="decode", query_tokens=1, num_heads=1, selection_lists=(offsets,), kv_tensor_id="cache",
+        )
+
+    warm = request(tuple(range(row_bytes, (warm_rows + 1) * row_bytes, row_bytes)))
+    engine, context = engine_binding(warm, geom)
+    ready = governed.build(warm, geom).lower(context).start(engine, "warm", engine.submit("input"))
+    # Hitting row 2 must also refresh it before the next fill evicts from the warm range.
+    for i, row in enumerate((0, 0, 2, warm_rows + 1, 2, 3)):
+        op = request((row * row_bytes,))
+        ready = governed.build(op, geom).lower(context).start(engine, f"row-{i}", ready)
+    engine.advance(until=(ready,))
+    reads = [row["demand"] for row in engine.trace if row["task"].endswith(":packed_kv_gather:program:read:program")]
+    assert reads[0]["hbm"] == warm_rows * row_bytes
+    assert [(row.get("l2", 0), row.get("hbm", 0)) for row in reads[1:]] == [
+        (0, 672), (672, 0), (672, 0), (0, 672), (672, 0), (256, 416),
+    ]
+
+
+@pytest.mark.parametrize("heads,block,selected,q_scale,kv_scale", [(2, 128, 129, 8, 16), (1, 384, 384, 4, 12)])
+def test_mindie_v3_fp8_consumes_fp32_scales_and_rejects_unknown_mode(heads, block, selected, q_scale, kv_scale):
     contract = governed.AttentionContract(
-        1, 2, 1, 128, 128, selected_tokens=129, kv_layout="BNSD", abi=MINDIE_V3_ABI,
-        block_size=128, quant_mode=1,
+        1, heads, 1, 128, 128, selected_tokens=selected, kv_layout="BNSD", abi=MINDIE_V3_ABI,
+        block_size=block, quant_mode=1,
     )
     op = governed.make_attention_op(contract, op_id="block-sparse")
     plan = governed.build(op, geometry())
     phase = stages(plan)
     assert plan.metadata["scale_dtype"] == "fp32"
-    assert plan.metadata["scale_bytes"] == {"query": 8, "key": 16, "value": 16}
-    for tensor, consumer, size in (("query", "qk", 8), ("key", "qk", 16), ("value", "pv", 16)):
+    assert plan.metadata["scale_bytes"] == {"query": q_scale, "key": kv_scale, "value": kv_scale}
+    for tensor, consumer, size in (("query", "qk", q_scale), ("key", "qk", kv_scale), ("value", "pv", kv_scale)):
         scale = f"{tensor}_scale_load"
         assert phase[scale].work.resources["hbm"] == phase[scale].work.resources["mte2_aic"] == size
         assert scale in phase[consumer].after

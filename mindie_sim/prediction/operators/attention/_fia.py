@@ -9,14 +9,18 @@
 from __future__ import annotations
 
 from bisect import bisect_right
+from collections import deque
 from dataclasses import asdict, dataclass, replace
+from functools import partial
 from itertools import accumulate
 from math import ceil, gcd
+from typing import Callable
 
 from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.operators import OpSpec
 from ...mechanism import OperatorPlan, Work
 from ...program import KernelProgram, ParallelProgram, PipelineProgram, Stage
+from ...program.stages import scope_allocations
 from ...runtime.memory_physics import AddressRun, AddressRunPlan
 from ..contracts import OperatorPlanningContext
 from .common import (
@@ -28,6 +32,7 @@ from .common import (
 
 FIXPIPE_ROW_ALIGNMENT = 2
 FIXPIPE_COLUMN_ALIGNMENT = 8
+FIA_PRELOAD_SLOTS = 3
 
 
 def _fixpipe_bytes(rows: int, columns: int) -> int:
@@ -43,6 +48,59 @@ class _FiaRect:
     kv: int
     first: int
     end: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ShippingS2:
+    """Replay the arch35 MM1/Vec1 lookahead and MM2/Vec2 drain."""
+
+    count: int
+    slots: int
+    tile: Callable[[int], tuple[Stage, ...]]
+
+    def start(self, engine, name, ready, *, owner=""):
+        if not self.count:
+            return ready
+        done = engine.future(f"{name}:complete")
+        cube_tail = vector_tail = ready
+        pending = deque()
+        next_tile = 0
+
+        def submit(index, stages, events):
+            tile_name = f"{name}:tile{index}"
+            scoped = partial(scope_allocations, tile_name)
+            for stage in stages:
+                deps = tuple(events[dep] for dep in stage.after)
+                # Gate Cube loads and vector updates on their own issue lanes.
+                if not deps or stage.after == ("probability_transfer",):
+                    deps += (cube_tail,)
+                if stage.name in {"online_softmax", "online_output"}:
+                    deps += (vector_tail,)
+                events[stage.name] = stage.submit(engine, f"{tile_name}:{stage.name}", deps, scoped, owner)
+
+        def issue(_):
+            nonlocal next_tile, cube_tail, vector_tail
+            while len(pending) < self.slots and next_tile < self.count:
+                stages = self.tile(next_tile)
+                vec1_end = next(i for i, stage in enumerate(stages) if stage.name == "probability_transfer") + 1
+                events = {}
+                submit(next_tile, stages[:vec1_end], events)
+                cube_tail, vector_tail = events["score_fixpipe"], events["probability_transfer"]
+                pending.append((next_tile, stages[vec1_end:], events))
+                next_tile += 1
+
+            while pending:
+                index, stages, events = pending.popleft()
+                submit(index, stages, events)
+                cube_tail, vector_tail = events["pv_fixpipe"], events["online_output"]
+                if next_tile < self.count:
+                    # ExecuteTask retires the oldest slot before issuing the next one.
+                    engine.on_complete(vector_tail, issue)
+                    return
+            engine.on_complete(vector_tail, lambda _: engine.resolve(done))
+
+        engine.on_complete(ready, issue)
+        return done
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,7 +267,12 @@ class _FiaLoop:
                     return tuple(_stage(context, phase, place) for phase in self.s2_phases(rect, tiles[i]))
 
                 load = _stage(context, self.query_load(rect, tiles), place, acquire=allocations)
-                loop = Stage("s2", after=(load.name,), program=PipelineProgram(len(tiles), 1, tile))
+                slots = min(FIA_PRELOAD_SLOTS, self.panels.p_l1_slots)
+                if min(len(tiles), slots) > 1 and not self.gm_workspace and self.contract.panel_mode == "shipping":
+                    program = _ShippingS2(len(tiles), slots, tile)
+                else:
+                    program = PipelineProgram(len(tiles), 1, tile)
+                loop = Stage("s2", after=(load.name,), program=program)
                 partial = self.partial(rect, len(ranges) > 1, (loop.name,))
                 commits = tuple(_stage(context, phase, place, free=allocations if phase is partial[-1] else ())
                                 for phase in partial)

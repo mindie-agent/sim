@@ -27,7 +27,7 @@ from ..contracts import OperatorPlanningContext
 from .common import (
     ACLNN_MQS_DATA_BYTES, ACLNN_MQS_INLINE_ROW_BYTES, ACLNN_MQS_SCALE_BYTES, ACLNN_MQS_SEPARATE_SCALE_MODE,
     DSL_MQS_ABI, FAMILY, FP32_BYTES, INDEX_BYTES, MQS_ABI, MQS_COMPRESSED_ROW_BYTES,
-    MQS_ORIGINAL_ROW_BYTES, NZ_BLOCK_BYTES, PagedMlaContract, _query_row, align_bytes,
+    MQS_ORIGINAL_ROW_BYTES, MQS_PAGED_LAYOUT, NZ_BLOCK_BYTES, PagedMlaContract, _query_row, align_bytes,
     capability_gap, ceil_div, latent_record_bytes,
 )
 
@@ -43,6 +43,7 @@ WEIGHTED_MERGE_OPS_PER_VALUE = 3
 FP8_DEQUANT_OPS_PER_VALUE = 6
 FP4_DEQUANT_OPS_PER_VALUE = 4
 SOFTMAX_STATE_SCALARS = 2
+RowCuts = dict[tuple[int, int], tuple[int, ...]]
 
 
 def fixpipe_rectangle_bytes(rows: int, columns: int) -> int:
@@ -120,7 +121,7 @@ def _kv_runs(c: PagedMlaContract, spans, width: int, stride: int, table, layout:
     runs = []
     for page, offset, rows in spans:
         physical_page = table[page] if table else page
-        if layout == "PA_BLK_BSND":
+        if layout in ("PA_BLK_BSND", MQS_PAGED_LAYOUT):
             base = (physical_page * c.page_size + offset) * stride
             runs.append(AddressRun(base, rows, width, stride, layout))
         else:
@@ -135,18 +136,18 @@ def _kv_runs(c: PagedMlaContract, spans, width: int, stride: int, table, layout:
                                        rows, tail, NZ_BLOCK_BYTES, layout))
     return AddressRunPlan(tuple(runs))
 
-def _sparse_spans(indices, start: int, count: int, page_size: int):
+def _sparse_ranges(indices, start: int, count: int):
     if not indices:
-        yield from _spans(start, count, page_size)
+        yield start, count
         return
     for _, run in groupby(enumerate(indices[start:start + count]), lambda item: item[1] - item[0]):
-        yield from _spans(next(run)[1], 1 + sum(1 for _ in run), page_size)
+        yield next(run)[1], 1 + sum(1 for _ in run)
 
 def _read_sparse_bank(demand, c, branch, spans, count, table, dsl_width):
     if c.abi != MQS_ABI or c.quant_mode != ACLNN_MQS_SEPARATE_SCALE_MODE:
         width = ACLNN_MQS_INLINE_ROW_BYTES if c.abi == MQS_ABI else dsl_width
         demand.transfer(branch, "mte2_aiv", count * width,
-                        _kv_runs(c, spans, width, width, table, "PA_BLK_BSND"))
+                        _kv_runs(c, spans, width, width, table, c.kv_layout))
         return
     # PA_BBND mode 2 packs the data plane first, then scale + pad for the block.
     row_width = ACLNN_MQS_DATA_BYTES + ACLNN_MQS_SCALE_BYTES
@@ -155,7 +156,7 @@ def _read_sparse_bank(demand, c, branch, spans, count, table, dsl_width):
     ):
         runs = tuple(AddressRun(
             ((table[page] if table else page) * row_width + plane_offset) * c.page_size + offset * width,
-            rows, width, width, "PA_BBND",
+            rows, width, width, MQS_PAGED_LAYOUT,
         ) for page, offset, rows in spans)
         # The source is contiguous within each plane. Each scale lands in its own padded UB row.
         demand.transfer(f"{branch}_{plane}", "mte2_aiv", count * width, AddressRunPlan(runs),
@@ -185,13 +186,19 @@ def _read_kv(demand: _Demand, c: PagedMlaContract, seq: int, query: int, start: 
             continue
         count, offset = end - first, first - lo
         indices = _query_row(lists[seq], query, indices=True) if lists else ()
-        table = tables[seq] if tables else ()
-        spans = tuple(_sparse_spans(indices, offset, count, c.page_size))
-        _read_sparse_bank(demand, c, branch, spans, count, table, width)
-        pages = tuple(sorted({page for page, _, _ in spans}))
-        demand.transfer(f"{branch}_pages", "mte2_aiv", len(pages) * INDEX_BYTES,
-                        AddressRunPlan(tuple(AddressRun(p * INDEX_BYTES, 1, INDEX_BYTES, INDEX_BYTES)
-                                             for p in pages)))
+        ranges = _sparse_ranges(indices, offset, count)
+        if c.kv_layout == MQS_PAGED_LAYOUT:
+            table = tables[seq] if tables else ()
+            spans = tuple(span for base, rows in ranges for span in _spans(base, rows, c.page_size))
+            _read_sparse_bank(demand, c, branch, spans, count, table, width)
+            pages = tuple(sorted({page for page, _, _ in spans}))
+            demand.transfer(f"{branch}_pages", "mte2_aiv", len(pages) * INDEX_BYTES,
+                            AddressRunPlan(tuple(AddressRun(p * INDEX_BYTES, 1, INDEX_BYTES, INDEX_BYTES)
+                                                 for p in pages)))
+        else:
+            packed = ACLNN_MQS_INLINE_ROW_BYTES
+            runs = tuple(AddressRun(base * packed, rows, packed, packed, c.kv_layout) for base, rows in ranges)
+            demand.transfer(branch, "mte2_aiv", count * packed, AddressRunPlan(runs))
         demand.linear(f"{branch}_indices", "mte2_aiv", count * INDEX_BYTES if lists else 0,
                       offset * INDEX_BYTES)
 
@@ -208,6 +215,7 @@ class _PagedMlaProgramBuilder:
     layout: PipelineLayout
     dtype: str
     owners: tuple[tuple[int, tuple[int, ...]], ...]
+    row_cuts: RowCuts
     def _demand(self, step: str, live: int, *, seq: int = 0, query: int = 0, heads: int = 0,
                 start: int = 0, keys: int = 0, first: bool = False, last: bool = False,
                 partials: int = 0, mm2_offset: int = 0) -> _Demand:
@@ -302,9 +310,29 @@ class _PagedMlaProgramBuilder:
         if c.abi == DSL_MQS_ABI:
             ori, cmp = c.bank_counts(seq, query)
             tiles = ceil_div(ori, width) + ceil_div(cmp, width)
-        else:
-            tiles = ceil_div(c.sequences[seq][1], width)
-        return tiles, min(tiles, self.contract.splits)
+            return tiles, 1 + len(self.row_cuts.get((seq, query), ())) if tiles else 0
+        tiles = ceil_div(c.sequences[seq][1], width)
+        return tiles, min(tiles, c.splits)
+
+    def _split_extent(self, seq: int, query: int, tiles: int, split: int) -> tuple[int, int]:
+        if self.contract.abi == DSL_MQS_ABI:
+            bounds = (0, *self.row_cuts.get((seq, query), ()), tiles)
+            return bounds[split], bounds[split + 1] - bounds[split]
+        return _split_tiles(tiles, self.contract.splits, split)
+
+    def _query_runs(self, seq: int) -> Iterator[tuple[int, int]]:
+        cuts = iter(sorted(query for batch, query in self.row_cuts if batch == seq))
+        cut = next(cuts, None)
+        for start, repeat in self.contract.query_runs(seq):
+            end = start + repeat
+            while cut is not None and cut < end:
+                if start < cut:
+                    yield start, cut - start
+                yield cut, 1
+                start = cut + 1
+                cut = next(cuts, None)
+            if end > start:
+                yield start, end - start
 
     def _tile_extent(self, seq: int, query: int, tile: int) -> tuple[int, int]:
         c, width = self.contract, self.layout.key_tile
@@ -341,7 +369,7 @@ class _PagedMlaProgramBuilder:
 
     def _group_ranges(self, head_groups, prefix):
         for seq in range(len(self.contract.sequences)):
-            for query, repeat in self.contract.query_runs(seq):
+            for query, repeat in self._query_runs(seq):
                 if repeat:
                     start = prefix[seq] + query * head_groups
                     yield start, start + repeat * head_groups, self._counts(seq, query)[1]
@@ -363,7 +391,7 @@ class _PagedMlaProgramBuilder:
             totals["sink_load"] = self._demand("sink_load", 0).work(self.dtype).scaled(len(sink_owners))
         phases = layout.phases
         for seq in range(len(c.sequences)):
-            for query, repeat in c.query_runs(seq):
+            for query, repeat in self._query_runs(seq):
                 if not repeat:
                     continue
                 tiles, partials = self._counts(seq, query)
@@ -371,7 +399,7 @@ class _PagedMlaProgramBuilder:
                     heads = min(layout.head_tile, c.physical_heads - head_start)
                     live = min(heads, max(0, c.logical_heads - head_start))
                     for split in range(partials):
-                        offset, count = _split_tiles(tiles, c.splits, split)
+                        offset, count = self._split_extent(seq, query, tiles, split)
                         for i in range(count):
                             for step in phases:
                                 demand = self._tile_demand(step, seq, query, heads, live, i, offset, count, partials)
@@ -515,7 +543,7 @@ class _PagedMlaProgramBuilder:
             def wave(index):
                 for local in range(min(lanes, partials - index * lanes)):
                     split = index * lanes + local
-                    offset, count = _split_tiles(tiles, c.splits, split)
+                    offset, count = self._split_extent(seq, query, tiles, split)
                     program = self._split_program(
                         context, seq, query, heads, live, self.owners[owner_start + local], offset, count, partials,
                         owner_interval(group_index, local) + index,
@@ -554,7 +582,8 @@ def owner_pairs(ctx: OperatorPlanningContext, abi: str) -> tuple[tuple[int, tupl
     return pairs
 
 def make_plan(op: OpSpec, ctx: OperatorPlanningContext, c: PagedMlaContract,
-              layout: PipelineLayout, sources: tuple[SourceRef, ...], *, pairs=None, **metadata) -> OperatorPlan:
+              layout: PipelineLayout, sources: tuple[SourceRef, ...], *, pairs=None,
+              row_cuts: RowCuts | None = None, **metadata) -> OperatorPlan:
     dtype = op.dtype or "bf16"
     if dtype not in {"bf16", "fp16"} or (c.mixed_quant and dtype != "bf16"):
         raise capability_gap("paged_mla_unsupported_dtype", c.abi, ctx.compute_arch.arch_id)
@@ -562,7 +591,7 @@ def make_plan(op: OpSpec, ctx: OperatorPlanningContext, c: PagedMlaContract,
         pairs = owner_pairs(ctx, c.abi)
     if layout.gm_workspace:
         pairs = tuple((aic, aivs[:1]) for aic, aivs in pairs)
-    builder = _PagedMlaProgramBuilder(c, layout, dtype, pairs)
+    builder = _PagedMlaProgramBuilder(c, layout, dtype, pairs, row_cuts or {})
     phase_totals = builder.totals()
     total = sum(phase_totals.values(), Work())
     phases = []

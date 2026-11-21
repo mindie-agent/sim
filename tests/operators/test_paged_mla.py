@@ -182,11 +182,12 @@ def test_split_softmax_state_bytes_and_stable_merge(keys, splits):
     np.testing.assert_allclose(v / z, weights @ values / weights.sum(), atol=1e-12)
     assert m + np.log(z) == pytest.approx(scores.max() + np.log(weights.sum()))
 
-@pytest.mark.parametrize("mode,row_bytes,encoding", [(1, 608, "bf16_g32"), (2, 584, "e8m0_g32")])
+@pytest.mark.parametrize("mode,row_bytes,encoding", [(1, 608, "bf16_g64"), (2, 584, "e8m0_g64")])
 def test_mixed_quant_payload_and_branch_local_validation(mode, row_bytes, encoding):
     contract = governed.PagedMlaContract(((1, 5),), 1, 1, abi=MQS_ABI, page_size=2,
         n_ori=(2,), n_cmp=(3,), ori_indices=((3, 0),), cmp_indices=((0, 4, 2),),
-        ori_block_table=((8, 4),), cmp_block_table=((1, 7, 9),), quant_mode=mode, scale_encoding=encoding)
+        ori_block_table=((8, 4),), cmp_block_table=((1, 7, 9),), quant_mode=mode,
+        kv_layout="PA_BBND", scale_encoding=encoding)
     operator = governed.make_op(contract)
     geometry = _governed_geom(DIRECT_SKU)
     plan = governed.build(operator, geometry)
@@ -213,6 +214,36 @@ def test_mixed_quant_payload_and_branch_local_validation(mode, row_bytes, encodi
                 governed.make_op(replace(contract, **{field: value}))
     with pytest.raises(ModelingError, match="invalid_scale_encoding"):
         governed.make_op(replace(contract, scale_encoding=("fp32", "fp16_g16")))
+
+
+@pytest.mark.parametrize("layout", ["BSND", "TND"])
+def test_contiguous_inline_scale_kv_reads_records_without_page_tables(layout):
+    geometry = _governed_geom(DIRECT_SKU)
+    op = governed.make_op(sequences=((1, 2),), logical_heads=4, physical_heads=4, abi=MQS_ABI,
+                          kv_layout=layout, n_ori=1, n_cmp=1, scale_encoding=("bf16_g64", "bf16_g64"))
+    program, _ = _execute(op, governed.build(op, geometry), geometry)
+    load, = _phase(_tiles(program.tile(0)[0].program), "kv_load")
+    assert (load.metadata["ori_logical_bytes"], load.metadata["cmp_logical_bytes"]) == (608, 608)
+    assert load.work == {"mte2_aiv": 2 * 608, "hbm": 2 * 608}
+
+
+@pytest.mark.parametrize("abi,mode,attributes,error", [
+    (MQS_ABI, 1, {"scale_encoding": "bf16_g32"}, "invalid_scale_encoding"),
+    (MQS_ABI, 1, {"scale_encoding": "e8m0_g64"}, "invalid_scale_encoding"),
+    (MQS_ABI, 1, {"kv_layout": "PA_BLK_NZ"}, "invalid_kv_layout"),
+    (MQS_ABI, 2, {"scale_encoding": "bf16_g64"}, "invalid_scale_encoding"),
+    (MQS_ABI, 2, {"scale_encoding": ("e8m0_g64", "e8m0_g32")}, "invalid_scale_encoding"),
+    (MQS_ABI, 2, {"kv_layout": "BSND"}, "invalid_kv_layout"),
+    (MQS_ABI, 2, {"kv_layout": "TND"}, "invalid_kv_layout"),
+    (MQS_ABI, 2, {"page_size": 1025}, "invalid_page_size"),
+    (MQS_ABI, 2, {"rope_dim": 32}, "requires_rope_dim"),
+    (DSL_MQS_ABI, 1, {"kv_layout": "TND"}, "invalid_kv_layout"),
+    (DSL_MQS_ABI, 2, {"scale_encoding": "e8m0_g64"}, "invalid_quant_mode"),
+])
+def test_sparse_cache_packing_rejects_cross_abi_or_cross_mode_attributes(abi, mode, attributes, error):
+    with pytest.raises(ModelingError, match=error):
+        governed.make_op(sequences=((1, 2),), logical_heads=64, physical_heads=64,
+                         abi=abi, quant_mode=mode, n_ori=1, n_cmp=1, **attributes)
 
 
 def test_block_scale_plane_uses_physical_page_boundary():
@@ -344,7 +375,7 @@ def test_dsl_mixed_quant_binds_fp32_sinks_and_seeds_even_empty_selection(keys, r
         assert plan.work.resources["hbm"] == 256 + heads * (2 * LATENT + 4 * return_lse)
 
 
-@pytest.mark.parametrize("encoding", ["e8m0_g32", ("e8m0_g32", "bf16_g16"),
+@pytest.mark.parametrize("encoding", ["e8m0_g32", ("e8m0_g32", "bf16_g16"), ("bf16_g64", "bf16_g64"),
                                       ("bf16_g32", "fp16_g16"), ("bf16_g16", "bf16_g32")])
 def test_dsl_mixed_quant_rejects_incompatible_bank_scales(encoding):
     with pytest.raises(ModelingError, match="invalid_scale_encoding"):
@@ -359,22 +390,51 @@ def test_dsl_mixed_quant_rejects_incompatible_sink_tensors(sinks):
                          abi=DSL_MQS_ABI, sinks=sinks)
 
 
-def test_dsl_mixed_quant_continuation_does_not_seed_an_extra_sink():
-    geometry = _one_owner(_governed_geom(DIRECT_SKU))
-    operator = governed.make_op(sequences=((1, 129), (1, 0)), logical_heads=64, physical_heads=64,
-                                abi=DSL_MQS_ABI, n_ori=(129, 0), splits=2)
-    program, _ = _execute(operator, governed.build(operator, geometry), geometry)
-    load, attention = program.stages
-    assert load.metadata["sinks_logical_bytes"] == 256
-    first, empty = (attention.program.tile(i)[0].program for i in range(2))
-    assert _phase(_tiles(first, 0), "sink_init")[0].work["vector"] == 64 * (LATENT + 2)
-    assert not _phase(_tiles(first, 1), "sink_init")[0].work
+def test_dsl_mixed_quant_cost_partition_reduces_only_the_split_row():
+    geometry = _governed_geom(DIRECT_SKU)
+    heads = 64
+    operator = governed.make_op(sequences=((1, 8 * PAGE + 1), (1, 0)), logical_heads=heads, physical_heads=heads,
+                                abi=DSL_MQS_ABI, n_ori=(PAGE, 0), n_cmp=(7 * PAGE + 1, 0), splits=2)
+    plan = governed.build(operator, geometry)
+    program, _ = _execute(operator, plan, geometry)
+    *loads, attention = program.stages
+    assert all(load.metadata["sinks_logical_bytes"] == 256 for load in loads)
+    first, empty = (group.program for group in attention.program.tile(0))
+    # The cheaper tail belongs to the second core. The native cut is 4/5 tiles.
+    slot_bytes = heads * (LATENT + 2) * 4
+    for split, offsets in enumerate((range(4), range(4, 9))):
+        stages = _tiles(first, split)
+        assert [s.metadata["kv_tile"] for s in _phase(stages, "kv_load")] == list(offsets)
+        assert sum(s.metadata.get("vec2_split_state_logical_bytes", 0)
+                   for s in _phase(stages, "split_write")) == slot_bytes
+        assert sum(bool(s.work) for s in _phase(stages, "sink_init")) == int(split == 0)
+    finish = {stage.name: stage for stage in first.stages}
+    assert finish["merge_read"].metadata["vec2_split_state_logical_bytes"] == 2 * slot_bytes
+    assert finish["merge_read"].after == ("splits",)
+    assert finish["merge"].after == ("merge_read",) and finish["merge"].work["vector"] > 0
     assert next(s for s in empty.stages if s.name == "sink_init").work["vector"] == 64 * (LATENT + 2)
 
 
+def test_dsl_mixed_quant_repeated_rows_keep_native_selective_boundaries():
+    geometry = _governed_geom(DIRECT_SKU)
+    heads, rows = 64, 72
+    operator = governed.make_op(sequences=((rows, 5 * PAGE),), logical_heads=heads, physical_heads=heads,
+                                abi=DSL_MQS_ABI, n_ori=PAGE, n_cmp=4 * PAGE, splits=32)
+    plan = governed.build(operator, geometry)
+    program, _ = _execute(operator, plan, geometry)
+    attention = program.stages[-1].program
+    queries = (stage.program for wave in range(attention.count) for stage in attention.tile(wave))
+    for index, query in enumerate(queries):
+        cut = {2: 1, 4: 2, 6: 3}.get(index % 9)
+        expected = (range(5),) if cut is None else (range(cut), range(cut, 5))
+        assert query.stages[-1].metadata["nonempty_splits"] == len(expected)
+        for split, tiles in enumerate(expected):
+            assert [s.metadata["kv_tile"] for s in _phase(_tiles(query, split), "kv_load")] == list(tiles)
+
+
 @pytest.mark.parametrize("nested", [False, True])
-def test_sparse_queries_use_their_own_banks_and_split_state(nested):
-    geometry = _one_owner(_governed_geom(DIRECT_SKU))
+def test_short_sparse_queries_use_their_own_banks_without_split_state(nested):
+    geometry = _governed_geom(DIRECT_SKU)
     heads = 64
     selections = dict(n_ori=[1, 0], n_cmp=[2, 1], ori_indices=[[1], []], cmp_indices=[[0, 1], [2]])
     if nested:
@@ -385,25 +445,24 @@ def test_sparse_queries_use_their_own_banks_and_split_state(nested):
     plan = governed.build(operator, geometry)
     slot_bytes = heads * (LATENT + 2) * 4
     assert plan.metadata["workspace_slots_per_core"] == 2
-    assert plan.metadata["workspace_bytes"] == plan.metadata["workspace_bytes_per_core"] == 2 * slot_bytes
+    assert plan.metadata["workspace_bytes_per_core"] == 2 * slot_bytes
+    assert plan.metadata["workspace_bytes"] == len(geometry.datapath.aic_aiv_pairs) * 2 * slot_bytes
     assert operator.flops == plan.work.matrix["bf16"] == 2 * 4 * heads * (LATENT + LATENT)
-    program, _ = _execute(operator, plan, geometry)
+    program, trace = _execute(operator, plan, geometry)
     attention = program.stages[-1].program
-    first, last = (attention.tile(i)[0].program for i in range(2))
-    ori, cmp, tail = (_phase(stages, "kv_load")[0].metadata
-                      for stages in (_tiles(first, 0), _tiles(first, 1), _tiles(last)))
+    first, last = (group.program for group in attention.tile(0))
+    first_tiles = _tiles(first)
+    ori, cmp = (s.metadata for s in _phase(first_tiles, "kv_load"))
+    tail = _phase(_tiles(last), "kv_load")[0].metadata
     assert (ori["ori_logical_bytes"], cmp["cmp_logical_bytes"], tail["cmp_logical_bytes"]) == (544, 2 * 320, 320)
     assert (ori["ori_indices_logical_bytes"], cmp["cmp_indices_logical_bytes"], tail["cmp_indices_logical_bytes"]) == (4, 8, 4)
-    assert first.stages[1].metadata["vec2_split_state_logical_bytes"] == 2 * slot_bytes
-    assert all(_phase(_tiles(first, split), "split_write")[0].metadata["vec2_split_state_logical_bytes"] == slot_bytes
-               for split in range(2))
-    assert [stage.name for stage in last.stages] == ["splits", "normalize", "store"]
-    assert not _phase(_tiles(last), "split_write")[0].work
-    single = governed.make_op(sequences=((1, 1),), logical_heads=heads, physical_heads=heads,
-                              abi=DSL_MQS_ABI, n_cmp=1, splits=2)
-    unsplit = governed.make_op(sequences=((1, 1),), logical_heads=heads, physical_heads=heads,
-                               abi=DSL_MQS_ABI, n_cmp=1)
-    assert governed.build(single, geometry).work == governed.build(unsplit, geometry).work
+    for group in (first, last):
+        assert [stage.name for stage in group.stages] == ["splits", "normalize", "store"]
+        assert group.stages[-1].metadata["nonempty_splits"] == 1
+        assert all(not s.work for s in _phase(_tiles(group), "split_write"))
+    assert not any(event["demand"] for event in trace
+                   if "split_write" in event["task"] or "merge_read" in event["task"])
+    assert plan.work == governed.build(governed.make_op(inputs | {"splits": 1}), geometry).work
     with pytest.raises(ModelingError, match="cmp_block_table_coverage:0:1"):
         governed.make_op(inputs | {"cmp_block_table": [[4]]})
 

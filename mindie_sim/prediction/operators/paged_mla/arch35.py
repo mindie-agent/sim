@@ -9,6 +9,7 @@ Upstream-ABI: aclnnFlashMla
 """
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass, replace
 
 from mindie_sim.schema.common import dtype_bytes
@@ -19,10 +20,10 @@ from ...runtime.tile_solver import (
     LiveBufferSpec, TileCandidate, TileInfeasibleError, TilePipelineSpec, TileShape, solve,
 )
 from ..contracts import ArchStrategy, OperatorPlanningContext
-from ._lowering import SOFTMAX_STATE_SCALARS, PipelineLayout, fixpipe_rectangle_bytes, make_plan, owner_pairs
+from ._lowering import SOFTMAX_STATE_SCALARS, PipelineLayout, RowCuts, fixpipe_rectangle_bytes, make_plan, owner_pairs
 from .common import (
     DSL_FLASH_ABI, DSL_MQS_ABI, FIA_ABI, FP32_BYTES, MQS_ABI,
-    MQS_ORIGINAL_ROW_BYTES, SUPPORTED_ABIS, align_bytes, capability_gap, ceil_div, contract_for,
+    MQS_ORIGINAL_ROW_BYTES, SUPPORTED_ABIS, PagedMlaContract, align_bytes, capability_gap, ceil_div, contract_for,
 )
 
 ARCH_ID = "npu_arch_3510"
@@ -42,6 +43,18 @@ PIPELINE_DRAIN = 3
 MQS_GATHER_ROWS = 16
 ACLNN_MQS_GATHER_BUFFER_BYTES_PER_ROW = 640
 DSL_MQS_SPLIT_SLOTS_PER_CORE = 2
+FD_MIN_ROW_TILES = 5
+FD_TARGET_TILES_PER_CORE = 4
+FD_MIN_SAVED_TILES = 4
+FD_M_COST = 24  # Cost of 64 query heads in the DSL metadata ABI.
+FD_S2_BLOCK = 64
+FD_S2_BLOCK_COST = 10
+FD_SELECTIVE_ROWS = 72
+FD_SELECTIVE_CORES = 32
+FD_SELECTIVE_GROUP_ROWS = 9
+FD_SELECTIVE_GROUP_CORES = 4
+FD_SELECTIVE_CUT_STRIDE = 11
+FD_SELECTIVE_CMP_TILES = 4
 PV_L0C_WIDTH = 256
 CLOCKS = (
     ("q_load", "kv_load", "dequant", "kv_to_l1", "qk_operands", "qk", "score_store"),
@@ -109,14 +122,129 @@ SOURCES: tuple[SourceRef, ...] = (
         relative_path="samples/attention/mixed_quant_sparse_flash_mla/mixed_quant_sparse_flash_mla_metadata.py",
         source_sha256="51e13bd02d35704f99298dd9fdff36ddd82c941a8106c07d8e668d29664ad40a",
     ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="attention/mixed_quant_sparse_flash_mla/README_en.md",
+        source_sha256="e5f013aca264fd192f5780455eeb4fa9d378a03d9576e34bb31488cdf39e75c0",
+    ),
 )
 ABI_SOURCES = {
     FIA_ABI: SOURCES[:2],
     UPSTREAM_ABI: (SOURCES[2], SOURCES[6]),
-    MQS_ABI: (SOURCES[3], SOURCES[7]),
+    MQS_ABI: (SOURCES[3], SOURCES[7], SOURCES[9]),
     DSL_FLASH_ABI: (SOURCES[4],),
     DSL_MQS_ABI: (SOURCES[5], SOURCES[8]),
 }
+
+
+def _fd_tile_cost(keys: int) -> int:
+    return FD_M_COST + FD_S2_BLOCK_COST * ceil_div(keys, FD_S2_BLOCK)
+
+
+@dataclass(frozen=True, slots=True)
+class _FdRow:
+    ori: int
+    cmp: int
+
+    @property
+    def tiles(self) -> int:
+        return ceil_div(self.ori, MQS_S2_TILE) + ceil_div(self.cmp, MQS_S2_TILE)
+
+    @property
+    def cost(self) -> int:
+        cost = 0
+        for keys in (self.ori, self.cmp):
+            full, tail = divmod(keys, MQS_S2_TILE)
+            cost += full * _fd_tile_cost(MQS_S2_TILE)
+            if tail:
+                cost += _fd_tile_cost(tail)
+        return cost
+
+    def tile_cost(self, tile: int) -> int:
+        ori_tiles = ceil_div(self.ori, MQS_S2_TILE)
+        if tile < ori_tiles:
+            return _fd_tile_cost(min(MQS_S2_TILE, self.ori - tile * MQS_S2_TILE))
+        return _fd_tile_cost(min(MQS_S2_TILE, self.cmp - (tile - ori_tiles) * MQS_S2_TILE))
+
+
+def _fd_row_runs(c: PagedMlaContract) -> Iterator[tuple[int, int, int, _FdRow]]:
+    for seq in range(len(c.sequences)):
+        for query, repeat in c.query_runs(seq):
+            if repeat:
+                yield seq, query, repeat, _FdRow(*c.bank_counts(seq, query))
+
+
+def _fd_core_cuts(c: PagedMlaContract, blocks: int, total_cost: int) -> RowCuts:
+    # Project the native greedy core ranges onto row-local tile boundaries.
+    rows = ((seq, query, row) for seq, start, repeat, row in _fd_row_runs(c)
+            for query in range(start, start + repeat))
+    current = next(rows, None)
+    cuts: dict[tuple[int, int], list[int]] = {}
+    tile, remaining = 0, current[2].cost if current else 0
+    for cores_left in range(blocks, 1, -1):  # The last core takes the remaining rows.
+        budget = limit = total_cost // cores_left
+        assigned = 0
+        whole_rows = True
+        while current is not None:
+            seq, query, row = current
+            tiles = row.tiles
+            short_row = tile == 0 and tiles < FD_MIN_ROW_TILES
+            if whole_rows and (not tiles or budget + row.tile_cost(tiles - 1) // 2 >= remaining
+                               or (short_row and not assigned)):
+                cost, taken = remaining, tiles - tile
+            elif short_row:
+                break
+            else:
+                whole_rows = False
+                cost, taken = row.tile_cost(tile), 1
+                if assigned and budget + cost // 2 < cost:
+                    break
+            assigned += taken
+            budget -= cost
+            remaining -= cost
+            tile += taken
+            if tile == tiles:
+                current = next(rows, None)
+                tile, remaining = 0, current[2].cost if current else 0
+        if current is None:
+            break
+        if tile:
+            cuts.setdefault(current[:2], []).append(tile)
+        total_cost -= limit - budget
+    return {row: tuple(offsets) for row, offsets in cuts.items()}
+
+
+def _dsl_row_cuts(c: PagedMlaContract, owners: int) -> RowCuts:
+    blocks = min(owners, c.splits)
+    if blocks <= 1:
+        return {}
+    rows = sum(q for q, _ in c.sequences)
+    total_tiles = total_cost = max_row_tiles = 0
+    selective = rows == FD_SELECTIVE_ROWS and blocks == FD_SELECTIVE_CORES
+    for _, _, repeat, row in _fd_row_runs(c):
+        total_tiles += row.tiles * repeat
+        total_cost += row.cost * repeat
+        max_row_tiles = max(max_row_tiles, row.tiles)
+        selective &= (row.ori, row.cmp) == (MQS_S2_TILE, FD_SELECTIVE_CMP_TILES * MQS_S2_TILE)
+    if selective:
+        # Native selective plan assigns 11/11/11/12 tiles per four-core group.
+        local_cuts = dict(divmod(core * FD_SELECTIVE_CUT_STRIDE, 1 + FD_SELECTIVE_CMP_TILES)
+                          for core in range(1, FD_SELECTIVE_GROUP_CORES))
+        cuts = {}
+        index = 0
+        for seq, start, repeat, _ in _fd_row_runs(c):
+            for query in range(start, start + repeat):
+                if (cut := local_cuts.get(index % FD_SELECTIVE_GROUP_ROWS)) is not None:
+                    cuts[seq, query] = (cut,)
+                index += 1
+        return cuts
+    if max_row_tiles < FD_MIN_ROW_TILES:
+        return {}
+    plan_blocks = min(blocks, max(rows, total_tiles // FD_TARGET_TILES_PER_CORE))
+    if ceil_div(rows, blocks) * max_row_tiles - ceil_div(total_tiles, plan_blocks) < FD_MIN_SAVED_TILES:
+        return {}
+    return _fd_core_cuts(c, plan_blocks, total_cost)
 
 
 def _solve(op, ctx, c, keys, head_tile, mm1_depth, resident, result_alignment, pairs):
@@ -187,7 +315,7 @@ class _DirectStrategy:
             key_tile = min(FIA_S2_TILE, c.s2_base_size)
         elif c.mixed_quant:
             heads, mm1_depth = MQS_M_TILE, FLASH_MM1_DEPTH
-            key_tile = min(MQS_S2_TILE, c.s2_base_size)
+            key_tile = MQS_S2_TILE if c.abi == DSL_MQS_ABI else min(MQS_S2_TILE, c.s2_base_size)
         else:
             heads, key_tile, mm1_depth = FLASH_M_TILE, FLASH_S2_TILE, FLASH_MM1_DEPTH
         if c.abi == DSL_MQS_ABI:
@@ -249,13 +377,15 @@ class _DirectStrategy:
             pv_panel_width=panel_width,
         )
         workspace = {}
+        row_cuts = None
         if c.abi == DSL_MQS_ABI:
             slot_bytes = c.physical_heads * (c.dv + SOFTMAX_STATE_SCALARS) * FP32_BYTES
             per_core = DSL_MQS_SPLIT_SLOTS_PER_CORE * slot_bytes
             workspace = dict(workspace_slots_per_core=DSL_MQS_SPLIT_SLOTS_PER_CORE,
                              workspace_bytes_per_core=per_core, workspace_bytes=len(pairs) * per_core)
+            row_cuts = _dsl_row_cuts(c, len(pairs))
         return make_plan(
-            op, ctx, c, layout, ABI_SOURCES[c.abi], pairs=pairs,
+            op, ctx, c, layout, ABI_SOURCES[c.abi], pairs=pairs, row_cuts=row_cuts,
             buffer_depths=(Q_DEPTH, mm1_depth, MM2_DEPTH), pool_peaks=peaks,
             matrix_output_path=direct.path.name, probability_path=probability.path.name,
             resident_latent=resident, **workspace,

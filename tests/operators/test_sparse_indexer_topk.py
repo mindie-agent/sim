@@ -236,7 +236,7 @@ def test_region_mask_and_final_index_order_preserve_selection_extent():
     _verified(op, REGBASE)
 
 
-@pytest.mark.parametrize("candidates,tiles", [(512, 1), (513, 2)])
+@pytest.mark.parametrize("candidates,tiles", [(512, 1), (513, 2), (520, 2)])
 def test_packed_candidate_tiles_cross_gm_before_cube(candidates, tiles):
     op = _make(candidates, abi="cannbot_dsl.quant_sparse_lightning_indexer",
                cache_dtype="mxfp4", index_heads=32, topk_items=64)
@@ -265,14 +265,21 @@ def test_packed_candidate_tiles_cross_gm_before_cube(candidates, tiles):
         assert stages["load_operands"].after == (load.name,)
         assert stages["cube_scores"].after == ("load_operands",)
         assert stages["rectification"].placement["vector"] == gather.placement["mte2_aiv"]
+        assert gather.work["mte2_aiv"] == gather.work["hbm"] == staged
         assert store.work["mte3"] == store.work["hbm"] == staged
         assert load.work["mte2_aic"] == load.work["hbm"] == staged
+        assert stages["rectification"].work["vector"] == min(512, candidates - i * 512) * 32
+    owner = query[0].program.programs[0].tile(0)[0].program
+    radix, = (s for s in owner.stages if s.name == "radix_histogram_topk")
+    assert radix.metadata["pair_bytes"] == candidates * 8
     assert plan.work.resources["mte3"] == tiles * staged + 64 * 4
     assert plan.work.resources["mte2_aic"] == tiles * staged + 32 * 68
-    assert plan.work.matrix == {"mxfp4": 2 * candidates * 32 * 128}
+    assert plan.work.resources["mte2_aiv"] == tiles * staged + 32 * 4
+    assert plan.work.matrix == {"mxfp4": 2 * tiles * 512 * 32 * 128}
+    assert op.flops == plan.metadata["useful_flops"] == 2 * candidates * 32 * 128
     assert len(next(s for s in query if s.name == "index_store").placement["mte3"]) == 1
     serviced = _verified(op, case=case)["serviced"]
-    for role in ("mte3", "mte2_aic"):
+    for role in ("mte3", "mte2_aic", "mte2_aiv"):
         assert serviced[f"{role}@r0:s0"] == pytest.approx(plan.work.resources[role])
 
 

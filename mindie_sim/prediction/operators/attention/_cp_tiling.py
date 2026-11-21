@@ -2,7 +2,7 @@
 
 [Role] Bind caller tensor shapes and lower their collective dependencies.
 [Invariants] Each collective uses its input tensor shape and declared group.
-  The history-decode merge consumes the published output and FP32 LSE.
+  History decode exchanges dtype-specific rows of packed output and FP32 LSE.
 [Timeouts & Locks] Finite graph construction without locking.
 [Side-Effect Policy] Pure declarations on the shared execution graph.
 """
@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from math import prod
 
-from mindie_sim.catalog.attention_common import MERGE_OPS_PER_ELEM
+from mindie_sim.catalog.attention_common import MERGE_OPS_PER_ELEM, PACK_LSE_OPS
 from mindie_sim.catalog.context_parallel import merge_update_elements
 from mindie_sim.catalog.ops import comm_op, vector_op
 from mindie_sim.schema.common import ModelingError, dtype_bytes
@@ -35,6 +35,7 @@ HISTORY_PREFILL_SITE = "attention_cp._prefill_query_all_gather"
 HISTORY_DECODE_SITE = "attention_cp._forward_decode_dcp"
 COMPLETE_KV_SITE = "sfa_cp._execute_sparse_flash_attention_process"
 OUTPUT_LSE_EXCHANGE_RECIPE = "attention_cp_output_lse_exchange"
+DCP_NARROW_LSE_LANES = 4
 CP_CALLERS = {
     CACHE_GQA_SITE: CACHE_PUBLICATION,
     CACHE_MLA_SITE: CACHE_PUBLICATION,
@@ -203,27 +204,44 @@ def cp_decode_suffix(op, contract):
         return ()
     group, head_ranks = _history_head_group(binding)
     q, heads, width = contract.query_tokens, contract.num_heads // head_ranks, contract.v_head_dim
-    out_bytes = q * heads * width * dtype_bytes(op.dtype or "bf16")
-    lse_bytes = q * heads * dtype_bytes("fp32")
-    payload = out_bytes + lse_bytes
+    dtype = op.dtype or "bf16"
+    if dtype in {"bf16", "bfloat16", "fp16", "float16"}:
+        lse_lanes = DCP_NARROW_LSE_LANES
+    elif dtype in {"fp32", "float32"}:
+        lse_lanes = 1
+    else:
+        from .common import unmodeled
+        raise unmodeled("attention_dcp_output_lse_dtype", f"Bind a supported DCP output dtype for {dtype}")
+    element_bytes = dtype_bytes(dtype)
+    out_bytes = q * heads * width * element_bytes
+    packed_shape = (q, heads, width + lse_lanes)
+    payload = prod(packed_shape) * element_bytes
     tensors = (("output", (q, heads, width)), ("lse", (q, heads, 1)))
+    payload_metadata = (("payload_tensors", tensors), ("packed_shape", packed_shape))
     arguments = dict(stage=op.stage, layer=op.layer, requests=op.requests, phase=op.phase)
-    ops = []
-    deps = ("attention",)
+    pack = vector_op(
+        op_id="output_lse_pack", deps=("attention",), **arguments, family="elementwise", recipe="dcp_output_pack",
+        shape=(q, heads * head_ranks, packed_shape[-1]), dtype=dtype,
+        elements=q * heads * head_ranks, ops_per_element=PACK_LSE_OPS,
+        read_bytes_override=(out_bytes + q * heads * dtype_bytes("fp32")) * head_ranks,
+        write_bytes_override=payload * head_ranks,
+    )
+    ops = [pack]
+    deps = (pack.op_id,)
     if head_ranks > 1:
         ops.append(comm_op(
             op_id="output_lse_exchange", deps=deps, **arguments, family="alltoall", recipe=OUTPUT_LSE_EXCHANGE_RECIPE,
-            link_bytes=payload * (head_ranks - 1), shape=(q, heads, width),
+            link_bytes=payload * (head_ranks - 1), shape=packed_shape,
             metadata=(("group_axis", "cp" if group == "dcp" else group), ("collective", "alltoall"),
-                      ("payload_tensors", tensors), ("source", "dcp_a2a_fused")),
+                      ("source", "dcp_a2a_fused"), *payload_metadata),
         ))
         deps = (ops[-1].op_id,)
     if binding.pcp_size > 1:
         ops.append(comm_op(
             op_id="output_lse_pcp_gather", deps=deps, **arguments, family="allgather", recipe="ring_allgather",
             link_bytes=payload * head_ranks * (binding.pcp_size - 1),
-            shape=(binding.dcp_size, q, heads, width),
-            metadata=(("group_axis", "pcp"), ("steps", binding.pcp_size - 1), ("payload_tensors", tensors)),
+            shape=(binding.dcp_size, *packed_shape),
+            metadata=(("group_axis", "pcp"), ("steps", binding.pcp_size - 1), *payload_metadata),
         ))
         deps = (ops[-1].op_id,)
     ops.append(vector_op(
@@ -231,7 +249,7 @@ def cp_decode_suffix(op, contract):
         shape=(q, heads, width), dtype="fp32", semantic_family="dcp_logsumexp_attention_update",
         elements=int(merge_update_elements(q, heads, width, binding.dcp_size)), ops_per_element=MERGE_OPS_PER_ELEM,
         read_bytes_override=payload * binding.dcp_size, write_bytes_override=out_bytes,
-        metadata=(("partial_reduction", "logsumexp"), ("payload_tensors", tensors)),
+        metadata=(("partial_reduction", "logsumexp"), *payload_metadata),
     ))
     return tuple(ops)
 

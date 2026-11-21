@@ -208,6 +208,36 @@ def test_shipping_scores_charge_the_tile_rectangle_before_causal_masking():
     assert audit["status"] == "passed" and audit["work_mismatches"] == {}
 
 
+def test_shipping_prefill_reuses_three_slots_and_drains_every_tile():
+    case = sku_case(REPRESENTATIVE_SKUS["a5"])
+    geom = Geometry.from_devices(case.machine.dies)
+    contract = governed.AttentionContract(2, 1, 1, 128, 128, sequences=((2, 385),), phase="prefill")
+    op = governed.make_attention_op(contract, op_id="prefill")
+    plan = governed.build(op, geom)
+    rates = {**{role: rate / 1000 for role, rate in geom.rates.items()}, "cube": 1}
+    units = geom.resource_units
+    context = RecipeContext(op, {}, {role: role for role in rates}, rates, geom.compute_units,
+                            resource_units=units, compute_peaks=geom.compute_peaks)
+    engine = Engine([Resource(role, rate, units=units[role]) for role, rate in rates.items()], trace_limit=128)
+    done = plan.lower(context).start(engine, "prefill", engine.submit("input", release=3))
+    engine.advance(until=(done,))
+
+    def tiles(stage):
+        return [row for row in engine.trace if row["task"].endswith(":" + stage)]
+
+    qk = tiles("qk_panel_0_accumulate")
+    pv = tiles("pv_panel_0")
+    vec2 = tiles("online_output")
+    assert len(qk) == len(pv) == len(vec2) == 4
+    assert qk[0]["start_ms"] >= 3
+    assert qk[2]["end_ms"] <= pv[0]["start_ms"]
+    assert vec2[0]["end_ms"] <= qk[3]["start_ms"]
+    assert qk[3]["end_ms"] <= pv[1]["start_ms"]
+    assert vec2[-1]["end_ms"] <= tiles("output")[0]["start_ms"]
+    assert engine.summary()["live_tasks"] == engine.summary()["live_programs"] == 0
+    assert {role: amount for role, amount in engine.serviced.items() if amount} == pytest.approx(context.bind(plan.work))
+
+
 def test_frontend_ragged_prefill_roundtrips_to_physical_work():
     case = dense_case()
     views = (RequestView("a", 3, 5, False, "prefill"), RequestView("b", 5, 2, False, "prefill"))

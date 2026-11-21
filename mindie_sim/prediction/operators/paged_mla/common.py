@@ -41,6 +41,10 @@ ACLNN_MQS_INLINE_ROW_BYTES = 608
 ACLNN_MQS_DATA_BYTES = 576
 ACLNN_MQS_SCALE_BYTES = 8
 ACLNN_MQS_SEPARATE_SCALE_MODE = 2
+ACLNN_MQS_SCALE_ENCODINGS = {1: "bf16_g64", ACLNN_MQS_SEPARATE_SCALE_MODE: "e8m0_g64"}
+MQS_PAGED_LAYOUT = "PA_BBND"
+MQS_CONTIGUOUS_LAYOUTS = ("BSND", "TND")
+MQS_MAX_PAGE_SIZE = 1024
 FP32_BYTES = 4
 INDEX_BYTES = 4
 NZ_BLOCK_BYTES = 32
@@ -48,11 +52,7 @@ MASK_NONE = 0
 MASK_CAUSAL = 3
 MASK_WINDOW = 4
 MAX_COMPRESSION_RATIO = 128
-MQS_QUANT_MODES = frozenset({1, 2})
 QUERY_INDEX_NESTING = 3
-SCALE_ENCODINGS = frozenset({
-    "bf16_g32", "bf16_g16", "fp16_g32", "fp16_g16", "e8m0_g32", "e8m0_g16",
-})
 BankCounts = int | tuple[int | tuple[int, ...], ...]
 IndexRow = tuple[int, ...]
 BankIndices = tuple[IndexRow | tuple[IndexRow, ...], ...]
@@ -65,6 +65,8 @@ class PagedMlaContract:
     A nested bank row supplies one entry per query in its sequence. Flat bank
     rows are batch-indexed, or query-indexed when their length matches only the
     query count. With per-query counts, the sequence KV extent bounds each row.
+    Paged cache tables omitted from the analytical contract denote identity
+    mapping. For DSL MQSMLA, splits caps the cores participating in FD planning.
     """
 
     sequences: tuple[tuple[int, int], ...]
@@ -74,7 +76,7 @@ class PagedMlaContract:
     rope_dim: int = DEFAULT_ROPE_DIM
     page_size: int = DEFAULT_PAGE_SIZE
     block_table_len: int | None = None
-    kv_layout: str = "PA_BLK_BSND"
+    kv_layout: str | None = None
     abi: str = FIA_ABI
     s2_base_size: int = DEFAULT_S2_BASE_SIZE
     splits: int = 1
@@ -87,7 +89,7 @@ class PagedMlaContract:
     ori_mask_mode: int = MASK_NONE
     cmp_mask_mode: int = MASK_NONE
     topk_value_mode: int = 1
-    scale_encoding: str | tuple[str, str] = DSL_MQS_SCALE_ENCODINGS
+    scale_encoding: str | tuple[str, str] | None = None
     mqsmla_dim: int = MQS_HEAD_DIM
     block_table: tuple[tuple[int, ...], ...] = ()
     ori_block_table: tuple[tuple[int, ...], ...] = ()
@@ -227,9 +229,20 @@ def _validate_mixed(c: PagedMlaContract) -> PagedMlaContract:
         name: _validate_bank_rows(c, name, indices=name.endswith("_indices"))
         for name in ("n_ori", "n_cmp", "ori_indices", "cmp_indices")
     })
-    modes = {1} if c.abi == DSL_MQS_ABI else MQS_QUANT_MODES
+    dsl = c.abi == DSL_MQS_ABI
+    modes = (1,) if dsl else ACLNN_MQS_SCALE_ENCODINGS
     if type(c.quant_mode) is not int or c.quant_mode not in modes:
         raise ModelingError(f"paged_mla_invalid_quant_mode:{c.abi}:{c.quant_mode}")
+    layouts = (MQS_PAGED_LAYOUT,)
+    if not dsl and c.quant_mode != ACLNN_MQS_SEPARATE_SCALE_MODE:
+        layouts += MQS_CONTIGUOUS_LAYOUTS
+    if c.kv_layout not in layouts:
+        raise ModelingError(f"paged_mla_invalid_kv_layout:{c.abi}:{c.quant_mode}:{c.kv_layout}")
+    if c.kv_layout == MQS_PAGED_LAYOUT:
+        if c.page_size > MQS_MAX_PAGE_SIZE:
+            raise ModelingError(f"paged_mla_invalid_page_size:{c.page_size}")
+    elif c.ori_block_table or c.cmp_block_table or c.block_table_len is not None:
+        raise ModelingError(f"paged_mla_block_tables_require_paged_kv:{c.kv_layout}")
     if type(c.cmp_ratio) is not int or not 1 <= c.cmp_ratio <= MAX_COMPRESSION_RATIO:
         raise ModelingError(f"paged_mla_invalid_cmp_ratio:{c.cmp_ratio}")
     for name, value, modes in (
@@ -239,20 +252,23 @@ def _validate_mixed(c: PagedMlaContract) -> PagedMlaContract:
     ):
         if type(value) is not int or value not in modes:
             raise ModelingError(f"paged_mla_invalid_{name}:{value}")
-    encodings = (c.scale_encoding,) if isinstance(c.scale_encoding, str) else c.scale_encoding
-    if (not isinstance(encodings, tuple) or len(encodings) not in (1, 2)
-            or any(not isinstance(e, str) or e not in SCALE_ENCODINGS for e in encodings)):
-        raise ModelingError(f"paged_mla_invalid_scale_encoding:{c.scale_encoding!r}")
-    if c.abi == DSL_MQS_ABI:
+    if dsl:
         if c.physical_heads != DSL_MQS_HEADS:
             raise ModelingError(f"paged_mla_dsl_mqsmla_requires_heads:{DSL_MQS_HEADS}")
         has_compressed = (any(any(row) if isinstance(row, tuple) else row for row in c.n_cmp)
                           if isinstance(c.n_cmp, tuple) else bool(c.n_cmp))
-        allowed = (DSL_MQS_SCALE_ENCODINGS,) if has_compressed else (
-            DSL_MQS_SCALE_ENCODINGS, DSL_MQS_SCALE_ENCODINGS[:1],
-        )
-        if encodings not in allowed:
-            raise ModelingError(f"paged_mla_invalid_scale_encoding:{c.abi}:{c.scale_encoding!r}")
+        default = DSL_MQS_SCALE_ENCODINGS
+        allowed = (default,) if has_compressed else (default, default[:1])
+    else:
+        if c.rope_dim != DEFAULT_ROPE_DIM:
+            raise ModelingError(f"paged_mla_mqsmla_requires_rope_dim:{DEFAULT_ROPE_DIM}")
+        default = ACLNN_MQS_SCALE_ENCODINGS[c.quant_mode]
+        allowed = ((default,), (default, default))
+    encoding = default if c.scale_encoding is None else c.scale_encoding
+    encodings = (encoding,) if isinstance(encoding, str) else encoding
+    if encodings not in allowed:
+        raise ModelingError(f"paged_mla_invalid_scale_encoding:{c.abi}:{c.quant_mode}:{encoding!r}")
+    c = replace(c, scale_encoding=encoding)
     if type(c.mqsmla_dim) is not int or c.mqsmla_dim != MQS_HEAD_DIM or c.rope_dim >= c.mqsmla_dim:
         raise ModelingError("paged_mla_mqsmla_requires_packed_width_512")
     for seq, (_, kv) in enumerate(c.sequences):
@@ -286,10 +302,10 @@ def validate_contract(c: PagedMlaContract) -> PagedMlaContract:
         raise ModelingError("paged_mla_physical_heads_below_logical")
     if c.block_table_len is not None:
         _extent("block_table_len", c.block_table_len)
-    if c.kv_layout not in ("PA_BLK_BSND", "PA_BLK_NZ", "NZ_LATENT"):
-        raise ModelingError(f"paged_mla_invalid_kv_layout:{c.kv_layout}")
     if c.abi not in SUPPORTED_ABIS:
         raise capability_gap("paged_mla_unsupported_abi", c.abi)
+    if c.kv_layout is None:
+        c = replace(c, kv_layout=MQS_PAGED_LAYOUT if c.mixed_quant else "PA_BLK_BSND")
     for name in ("return_lse", "latent_alias", "atomic_split_decode"):
         if type(getattr(c, name)) is not bool:
             raise ModelingError(f"paged_mla_invalid_{name}")
@@ -307,6 +323,8 @@ def validate_contract(c: PagedMlaContract) -> PagedMlaContract:
             raise ModelingError("paged_mla_mqsmla_requires_branch_local_block_tables")
         c = _validate_mixed(c)
     else:
+        if c.kv_layout not in ("PA_BLK_BSND", "PA_BLK_NZ", "NZ_LATENT"):
+            raise ModelingError(f"paged_mla_invalid_kv_layout:{c.kv_layout}")
         if c.n_ori or c.n_cmp or c.ori_indices or c.cmp_indices or c.ori_block_table or c.cmp_block_table:
             raise ModelingError("paged_mla_sparse_attributes_require_mqsmla")
         for seq, (_, kv) in enumerate(c.sequences):

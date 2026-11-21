@@ -2,8 +2,9 @@
 
 [Role] Convert query and S2 geometry into matrix, transfer, reduction and
   selection work. Bind leaf-specific score handoffs and selection schedules.
-[Invariants] The descriptor and executable program use the same phase work;
-  padding affects physical transfers and selection, never logical dot FLOPs.
+[Invariants] The descriptor and executable program use the same phase work.
+  Physical tiles can include padding while useful dot FLOPs and the valid
+  candidate extent follow the live rows.
 [Timeouts & Locks] Planning uses a bounded set of tile shapes. Execution keeps
   only the active owners and their live tiles; no I/O or locks.
 [Side-Effect Policy] Builds immutable plans for the caller's virtual engine.
@@ -114,6 +115,8 @@ class SparseIndexerContract:
     causal: bool = True
     is_sparse_count_over_2k: bool = False
     return_choice: int | None = None
+    compress_ratio: int = 1
+    residual_tokens: int = 0
 
     def __post_init__(self) -> None:
         if self.abi in MSA_ABIS and self.return_choice is not None:
@@ -136,6 +139,10 @@ class SparseIndexerContract:
     @property
     def score_items(self) -> int:
         return ceil_div(self.scanned_rows, self.block_size)
+
+    @property
+    def packed_index_items(self) -> int:
+        return self.topk_items + self.compress_ratio - 1
 
     @property
     def arch22_retained_items(self) -> int:
@@ -174,6 +181,10 @@ def validate_contract(contract: SparseIndexerContract) -> None:
         _integer(name, getattr(contract, name))
     _integer("query_tokens", contract.query_tokens, minimum=0)
     _integer("scanned_rows", contract.scanned_rows, minimum=0)
+    _integer("compress_ratio", contract.compress_ratio)
+    _integer("residual_tokens", contract.residual_tokens, minimum=0)
+    if contract.residual_tokens >= contract.compress_ratio:
+        raise ModelingError("sparse_indexer_residual_tokens_must_fit_compress_ratio")
     if contract.abi not in SUPPORTED_ABIS:
         raise unsupported("abi", f"Unsupported sparse indexer ABI {contract.abi!r}")
     if contract.cache_dtype not in _CACHE_DTYPES:
@@ -363,31 +374,30 @@ class _SparseIndexerProgramBuilder:
         c = self.contract
         g = self.lowering
         valid = min(g.tile_size, rows - index * g.tile_size)
+        physical_rows = g.tile_size if g.gm_key_staging else valid
         heads = queries * c.index_heads
         scores = valid * heads
         score_bytes = g.handoff_bytes(valid, c.index_heads, queries)
         operand_bytes = c.cache_row_bytes - c.aiv_scale_bytes
-        key = valid * operand_bytes
         memory = "l2" if reuse else "hbm"
         score_to_gm = g.score_path == "l0c->gm->ub"
         if g.gm_key_staging:
-            # The private GM buffer carries a full physical tile even at a
-            # candidate tail. The gather uses the declared live key extent.
-            staged = g.tile_size * c.cache_row_bytes
+            # The DSL gather repeats the last valid block to fill the tail tile.
+            key = physical_rows * c.cache_row_bytes
             stages = [
                 PhaseWork("key_gather", Work(resources={memory: key, self.aiv_read: key})),
-                PhaseWork("key_stage_store", Work(resources={"hbm": staged, "mte3": staged}),
+                PhaseWork("key_stage_store", Work(resources={"hbm": key, "mte3": key}),
                           metadata={"aiv_subblocks": g.aivs_per_aic}),
-                PhaseWork("key_stage_load", Work(resources={"hbm": staged, self.aic_read: staged}), True),
+                PhaseWork("key_stage_load", Work(resources={"hbm": key, self.aic_read: key}), True),
             ]
-            key = staged
         else:
+            key = valid * operand_bytes
             stages = [PhaseWork("key_load", Work(resources={memory: key, self.aic_read: key}), True)]
         if (scales := valid * c.aiv_scale_bytes):
             stages.append(PhaseWork("key_scale_load", Work(resources={memory: scales, self.aiv_read: scales})))
         stages.extend((
             PhaseWork("load_operands", Work(resources={"mte1": key + heads * operand_bytes}), True),
-            PhaseWork("cube_scores", Work(matrix={c.matrix_dtype: 2 * scores * c.index_dim}), True),
+            PhaseWork("cube_scores", Work(matrix={c.matrix_dtype: 2 * physical_rows * heads * c.index_dim}), True),
             PhaseWork("score_handoff", Work(resources={
                 "fixpipe": score_bytes, **({"hbm": score_bytes} if score_to_gm else {}),
             }), True, {"route": g.score_path, "score_bytes": score_bytes}),
@@ -507,13 +517,22 @@ class _SparseIndexerProgramBuilder:
         if c.has_mask3_sort:
             stages.append(vector("index_sort", sort_ops(c.topk_items)))
         output_items = score_heads * c.topk_items
+        valid_items = min(c.score_items, c.topk_items)
         size = output_items * INT32_BYTES
         stages.extend((
-            vector("index_extract", output_items, valid_items_per_head=min(c.score_items, c.topk_items),
-                   pair_bytes=score_heads * min(c.score_items, c.topk_items)
-                   * (g.score_row_item_bytes + INT32_BYTES)),
+            vector("index_extract", output_items, valid_items_per_head=valid_items,
+                   pair_bytes=score_heads * valid_items * (g.score_row_item_bytes + INT32_BYTES)),
             PhaseWork("index_store", Work(resources={"hbm": size, "mte3": size})),
         ))
+        if c.abi == QSA_ABI:
+            # Packing reads the live group IDs and writes the fixed compact row,
+            # including the original-token tail and any sentinel slots.
+            group_bytes = valid_items * INT32_BYTES
+            packed_bytes = c.packed_index_items * INT32_BYTES
+            stages.append(PhaseWork("index_pack", Work(resources={
+                "vector": c.packed_index_items, "hbm": group_bytes + packed_bytes, "mte3": packed_bytes,
+                **({self.aiv_read: group_bytes} if group_bytes else {}),
+            }), metadata={"valid_groups": valid_items, "residual_tokens": c.residual_tokens}))
         if c.return_choice == MSA_RETURN_INDICES_VALUES:
             size = output_items * FP32_BYTES
             stages.append(PhaseWork("values_store", Work(resources={"hbm": size, "mte3": size})))
@@ -728,6 +747,9 @@ def build_plan(
             "s2_tile_size": lowering.tile_size, "score_path": lowering.score_path,
             "fused_topk": contract.fused_topk, "cache_row_bytes": contract.cache_row_bytes,
             "s2_splits": builder.partition.owners, "causal": contract.causal,
+            "useful_flops": contract.matrix_flops,
+            **({"compress_ratio": contract.compress_ratio, "residual_tokens": contract.residual_tokens,
+                "packed_index_items": contract.packed_index_items} if contract.abi == QSA_ABI else {}),
             **({"score_stride": contract.msa_score_stride,
                 "score_workspace_bytes": contract.msa_score_heads * contract.query_tokens
                 * contract.msa_score_stride * FP32_BYTES} if contract.abi in MSA_ABIS

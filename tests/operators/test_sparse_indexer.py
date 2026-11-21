@@ -271,6 +271,24 @@ def test_qsa_native_weights_and_weight_free_overlay_have_distinct_sources(hardwa
                    for s in _conserved(unweighted, overlay, geometry))
 
 
+@pytest.mark.parametrize("context,groups,tail", [(259, 64, 3), (3, 0, 3), (256, 64, 0)])
+def test_qsa_scores_complete_groups_and_packs_residual_tokens(context, groups, tail):
+    op = scorer.make_lightning_indexer_qsa_op(
+        op_id="scorer", query_tokens=1, context_tokens=context, compress_ratio=4, block_topk=128,
+    )
+    contract = dict(op.metadata)["indexer_contract"]
+    assert (contract["scanned_rows"], contract["residual_tokens"]) == (groups, tail)
+    plan = scorer.build(op, _geometry())
+    assert plan.metadata["residual_tokens"] == tail
+    assert op.flops == plan.work.matrix.get("bf16", 0) == 2 * groups * 32 * 128
+    pack, = (s for s in _conserved(plan, op) if s.name == "index_pack")
+    assert pack.after == ("index_store",)
+    assert pack.metadata == {"valid_groups": groups, "residual_tokens": tail}
+    assert pack.work.get("mte2_aiv", 0) == groups * 4
+    assert pack.work["mte3"] == (128 + 4 - 1) * 4
+    _verified(sku_case(REGBASE), op)
+
+
 @pytest.mark.parametrize("cache_dtype", ("bf16", "mxfp4"))
 @pytest.mark.parametrize("choice", (0, 1, 2))
 def test_long_blocks_keep_independent_head_maxima_and_topk_ports(cache_dtype, choice):
