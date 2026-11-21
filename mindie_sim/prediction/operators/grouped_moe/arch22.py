@@ -18,10 +18,12 @@ from ...mechanism import OperatorPlan, Work
 from ..contracts import ArchStrategy, OperatorPlanningContext
 from .common import (
     FUSED_MC2_SHARED_MODE, GEMM_MODES, INT32_HANDOFF_BYTES_PER_ELEM, MX_DTYPES,
-    ROUTED_MODES, DualBatchMoEPipeline, activation_stages, capability_gap,
-    PER_TOKEN_SCALE_BYTES, StageDemand, element_bytes, make_plan, matrix_schedule,
-    matrix_stages, routing_stages, validate_contract,
+    ROUTED_MODES, activation_stages, capability_gap,
+    PER_TOKEN_SCALE_BYTES, StageDemand, contract_fields, element_bytes, make_plan, matrix_schedule,
+    matrix_stages, validate_contract,
 )
+
+from .lowering import DualBatchMoEPipeline, routing_stages
 
 SOURCES: tuple[SourceRef, ...] = (
     SourceRef(
@@ -44,9 +46,9 @@ SOURCES: tuple[SourceRef, ...] = (
     ),
     SourceRef(
         repository="cann/ops-transformer",
-        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        revision="af03b86b9c5cf197cef7338a1e750881fcee426b",
         relative_path="mc2/mega_moe/op_kernel/arch22/mega_moe.cpp",
-        source_sha256="0a8d7824e28e93aef07c4c2b67a50afdc29989bd55820e397d3580d88baecd4c",
+        source_sha256="be5dea396c9f60d83c4de585406a2f1b1ba54b1076b2aa07fabba36b2c7abae1",
     ),
     SourceRef(
         repository="cann/ops-nn",
@@ -69,6 +71,22 @@ AIV_INPUT_DTYPES = frozenset({"int32", "fp16", "bf16", "fp32"})
 XLLM_GATED_ABI = "aclnnMoeGroupedMatmulSwigluQuant"
 
 
+def _excludes_packed_weight(fields, ctx):
+    if fields.get("a2_exclude_int32_weight") is True:
+        return True
+    abi = fields.get("transport_abi")
+    if abi in {"a2_hccl_client", "a3_sio_hccs"}:
+        return abi == "a2_hccl_client"
+    tier = str(fields.get("soc_tier", "")).lower()
+    if tier in {"a2", "a3"}:
+        return tier == "a2"
+    variant = str(fields.get("soc_variant", "")).lower()
+    if variant.startswith(("ascend910b", "ascend910_93")):
+        return variant.startswith("ascend910b")
+    memory = getattr(ctx.geometry.physical_mechanisms, "memory_hierarchy", None)
+    return memory is not None and memory.provenance.get("arch") == "A2"
+
+
 def _validate(op, ctx, contract):
     if contract.mode != "dequant_swiglu_quant":
         if not ctx.datapath.has_path("l0c", "gm") or ctx.effective_aic_cores < 1:
@@ -87,22 +105,22 @@ def _validate(op, ctx, contract):
     ) != ("int8", "ND", "int8", "NZ"):
         raise capability_gap(op, ctx, "xllm_requires_int8_nd_by_int8_nz")
     if contract.mode in ROUTED_MODES:
-        if contract.dtype_b == "int32":
+        if contract.dtype_b == "int32" and _excludes_packed_weight(contract_fields(op), ctx):
             raise capability_gap(op, ctx, "arch22_mega_moe_int32_weight")
+        if contract.dtype_b == "int32" and contract.dtype_a != "int8":
+            raise capability_gap(op, ctx, "arch22_mega_moe_packed_weight_requires_int8")
         if contract.compute_dtype not in ROUTED_DTYPES:
             raise capability_gap(op, ctx, f"arch22_mega_moe_dtype:{contract.compute_dtype}")
         if contract.enable_fused_mc2 == FUSED_MC2_SHARED_MODE:
             raise capability_gap(op, ctx, "arch22_shared_mc2")
-    if contract.mode != "dequant_swiglu_quant" and contract.dtype_b not in MATRIX_DTYPES:
+    if contract.mode != "dequant_swiglu_quant" and contract.matrix_weight_dtype not in MATRIX_DTYPES:
         raise capability_gap(op, ctx, f"arch22_weight_dtype:{contract.dtype_b}")
     if contract.mode == "gmm_swiglu_quant" and (
         contract.compute_dtype not in {"int8", "w4a8"} or contract.activation_divisor != 2
     ):
         raise capability_gap(op, ctx, "arch22_gated_int32_accumulator")
     if contract.mode in ROUTED_MODES | {"gmm_swiglu_quant"}:
-        fields = dict(op.metadata)
-        for name in ("grouped_moe_geometry", "megamoe_geometry"):
-            fields.update(dict(fields.get(name, ())))
+        fields = contract_fields(op)
         if fields.get("mask_routing") or fields.get("mask_blocked_output"):
             raise capability_gap(op, ctx, "arch22_mask_routing")
         if fields.get("l0c_to_ub") or fields.get("handoff_path") == "l0c->ub" or ctx.datapath.has_l0c_to_ub:
@@ -135,6 +153,8 @@ def _gated_stages(contract, ctx, name, after, metadata):
 def _routed_stages(ctx, contract, name, after, metadata, transport_builder):
     dispatch, combine = name + "dispatch", name + "combine"
     stages = routing_stages(dispatch, after, contract, metadata, transport_builder)
+    if not contract.m:
+        return stages + routing_stages(combine, (dispatch,), contract, metadata, transport_builder)
     cohort = tuple((key, value) for key, value in metadata if key in {"cohort_id", "slot"})
     gated, _ = _gated_stages(contract, ctx, name, (dispatch,), cohort)
     stages.extend(gated)
@@ -186,13 +206,13 @@ class _Arch22Strategy:
             stages = activation_stages("dequant_swiglu_quant", (), ctx, contract, contract.group_rows)
             implementation = "aclnnDequantSwigluQuant"
         else:
-            transport_builder = dict(op.metadata).get("cohort_transport_builder")
+            transport_builder = contract_fields(op).get("cohort_transport_builder")
             emit = partial(_routed_stages, ctx)
             if contract.dbo_split is not None:
                 stages = DualBatchMoEPipeline(contract.dbo_split).stages(
                     contract, ctx, emit, transport_builder=transport_builder
                 )
-            elif contract.m:
+            elif contract.m or contract.tokens or any(contract.transport_bytes) or transport_builder:
                 stages = emit(contract, "", (), (), transport_builder)
             else:
                 stages = []

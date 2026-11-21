@@ -12,6 +12,7 @@ from mindie_sim.schema.datapath import (
 )
 from mindie_sim.schema.operators import OpSpec
 from ...mechanism import Geometry, OperatorPlan
+from ...ownership import unit_group
 from ...results import OpOccurrence
 from ..contracts import ArchStrategy, OperatorFamilySpec, OperatorPlanningContext, ResolvedOperator
 from .arch22 import STRATEGY as _ARCH22
@@ -19,7 +20,6 @@ from .arch35 import STRATEGY as _ARCH35
 from .common import (
     BlazeGroupSchedule,
     BlazeGroupSlice,
-    DualBatchMoEPipeline,
     GroupedMoeContract,
     MoECohortSplit,
     capability_gap,
@@ -29,6 +29,8 @@ from .common import (
     normalize_group_rows,
     schedule_blaze_groups,
 )
+
+from .lowering import DualBatchMoEPipeline
 
 _STRATEGIES: dict[ArchId, ArchStrategy] = {
     _ARCH22.arch_id: _ARCH22,
@@ -55,11 +57,12 @@ def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
         arch = geometry.compute_arch
         paths = arch.paths if arch is not None else ()
         arch_id = ArchId(arch.preset) if arch is not None and arch.preset else GENERIC_ARCH_ID
+        aic, aiv = geometry.compute_units, geometry.resource_units.get("vector", 0)
         datapath = DatapathCapabilitySpec(
             compute_arch=ComputeArchIdentity(arch_id, arch),
-            aic_count=geometry.compute_units,
-            aiv_count=geometry.resource_units.get("vector", 0),
-            aic_aiv_pairs=(),
+            aic_count=aic,
+            aiv_count=aiv,
+            aic_aiv_pairs=tuple((owner, unit_group(owner, aic, aiv)) for owner in range(aic)) if aiv else (),
             usable_paths=paths,
             matrix_output_paths=frozenset(path.target for path in paths if path.source == "l0c"),
             ub_peer_edges=(),
@@ -79,9 +82,9 @@ def register_family() -> OperatorFamilySpec:
     """Return the package's family and recipe ownership declaration."""
     return OperatorFamilySpec(
         name="grouped_moe",
-        families=frozenset({"grouped_gemm", "grouped_moe", "dual_batch_moe"}),
+        families=frozenset({"dense_gemm", "grouped_gemm", "grouped_moe", "dual_batch_moe"}),
         owned_recipe_ids=frozenset({
-            "grouped_moe", "grouped_gemm", "gmm_swiglu_quant", "dequant_swiglu_quant",
+            "dense_gemm", "grouped_moe", "grouped_gemm", "gmm_swiglu_quant", "dequant_swiglu_quant",
             "mega_moe", "dual_batch_moe", "megamoe_arch35",
         }),
         resolve=resolve_operator_plan,

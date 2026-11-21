@@ -11,9 +11,10 @@
 """
 from __future__ import annotations
 
+from bisect import bisect_right
 from collections import Counter, defaultdict
 from collections.abc import Mapping
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from graphlib import TopologicalSorter
 import math
 
@@ -22,30 +23,29 @@ from mindie_sim.schema.common import ModelingError, align_up, dtype_bytes
 from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.operators import OpSpec
 from ...mechanism import OperatorPlan, Work
-from ...program import KernelProgram, RecipeContext, Stage
 from ...results import FusedPipelineDescriptor, FusedPipelineSpec, PipelinePhase, WorkItem
 from ...runtime.ring_buffer import RingBuffer, lower_generation
 from ..contracts import OperatorPlanningContext
+from .lowering import (
+    CCU, DISPATCH, FP32_SCALE_BYTES, TRIPLE_META_BYTES, Mc2Program, PeerRoute, Phase,
+    Transport, cohort_stages, peer_stages, read_work, store_work,
+)
 
 FRAME_PAYLOAD_BYTES = 480
 FRAME_WIRE_BYTES = 512
+CCU_DISPATCH_COUNT_BYTES = 512
+CCU_DISPATCH_ROW_ALIGN_BYTES = 512
+CCU_DISPATCH_H_ALIGN = 32
 UB_ALIGN_BYTES = 32
-TRIPLE_META_BYTES = 12
-FP32_SCALE_BYTES = 4
 MX_GROUP_SIZE = 32
 MX_ALIGN_BYTES = 256
 GROUP_QUANT_SIZE = 128
-INT32_BYTES = 4
-INT64_BYTES = 8
 GEMM_DIMENSIONS = 3
-INT8_QUANT_OPS = 7
-FP8_QUANT_OPS = 5
 FLOAT_ROWS = frozenset({"bf16", "fp16"})
 FP8_ROWS = frozenset({"fp8_e4m3", "fp8_e5m2"})
 FP4_ROWS = frozenset({"fp4_e2m1", "fp4"})
 AGMM = "all_gather_matmul"
 MMRS = "matmul_reduce_scatter"
-DISPATCH = "dispatch_v2"
 COMBINE = "combine_v2"
 COLLECTIVES = frozenset({AGMM, MMRS})
 NATIVE_ABIS = {
@@ -155,6 +155,8 @@ def combine_row_layout(width: int, *, dtype: str = "bf16") -> Mc2RowLayout:
 
 @dataclass(frozen=True, slots=True)
 class Mc2CohortSlice:
+    """Caller-owned rows identified by exact IDs when supplied, or by a span."""
+
     cohort_id: int
     row_start: int
     row_end: int
@@ -163,14 +165,28 @@ class Mc2CohortSlice:
     remote_assignments: int
     local_assignments: int
     masked_padding_rows: int = 0
+    row_ids: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         for name in self.__slots__:
-            _integer(getattr(self, name), name)
+            if name != "row_ids":
+                _integer(getattr(self, name), name)
+        if not isinstance(self.row_ids, (tuple, list)):
+            raise ModelingError("mc2_invalid_cohort_row_ids")
+        ids = tuple(self.row_ids)
+        for row_id in ids:
+            _integer(row_id, "row_id")
+        if len(set(ids)) != len(ids):
+            raise ModelingError("mc2_duplicate_cohort_row_ids")
+        object.__setattr__(self, "row_ids", ids)
         if self.row_end < self.row_start or self.remote_assignments + self.local_assignments != self.source_assignments:
             raise ModelingError("mc2_cohort_assignment_balance")
         if self.local_assignments > self.received_assignments:
             raise ModelingError("mc2_cohort_local_rows_exceed_received")
+
+    @property
+    def row_count(self) -> int:
+        return len(self.row_ids) if self.row_ids else self.row_end - self.row_start
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,9 +221,41 @@ class Mc2Contract:
     @property
     def peer_payload_bytes(self) -> int | float:
         if self.abi in COLLECTIVES:
-            return (self.world_size - 1) * self.gathered_bytes / self.world_size
-        framed = self.row_layout.packet_bytes if self.row_layout else 0
+            if self.world_size == 1:
+                return 0
+            return (self.world_size - 1) * self.shard_bytes(self.m)
+        if self.row_layout is None:
+            return 0
+        framed, _, _, _ = _peer_framing(self, self.transport_abi)
         return sum(cohort.remote_assignments for cohort in self.cohorts) * framed
+
+    def shard_bytes(self, rows: int) -> int | float:
+        if not self.m:
+            return 0
+        if self.world_size == 1:
+            return self.gathered_bytes * rows / self.m
+        if self.m % self.world_size or self.gathered_bytes % 1:
+            raise ModelingError("mc2_uneven_shard_not_integer")
+        shard, remainder = divmod(int(self.gathered_bytes) * rows, self.m * self.world_size)
+        if remainder:
+            raise ModelingError("mc2_uneven_shard_not_integer")
+        return shard
+
+
+def _peer_framing(contract: Mc2Contract, transport_abi: str) -> tuple[int, int, int, int]:
+    """Return row, count, per-row padding and per-row flag bytes for this ABI."""
+    layout = contract.row_layout
+    if transport_abi != CCU:
+        return layout.packet_bytes, contract.status_bytes, layout.protocol_padding_bytes, layout.flag_bytes
+    if contract.abi == COMBINE:
+        return layout.payload_bytes, 0, 0, 0
+    # CCU dispatch aligns the merged payload and scales to its direct transfer stride.
+    alignment = {"mx": MX_ALIGN_BYTES, "per_group": GROUP_QUANT_SIZE}.get(
+        layout.quant_mode, CCU_DISPATCH_H_ALIGN
+    )
+    merged = math.ceil(align_up(layout.width, alignment) * dtype_bytes(layout.payload_dtype)) + layout.scale_bytes
+    stride = align_up(merged, CCU_DISPATCH_ROW_ALIGN_BYTES)
+    return stride, CCU_DISPATCH_COUNT_BYTES, stride - layout.payload_bytes - layout.scale_bytes, 0
 
 
 def contract_fields(op: OpSpec) -> dict:
@@ -389,14 +437,11 @@ def _routing(fields: Mapping, contract: Mc2Contract) -> Mc2Contract:
     ids = {part.cohort_id for part in slices}
     if len(ids) != len(slices) or set(expected) - ids:
         raise ModelingError("mc2_invalid_cohort_ids")
-    end = 0
-    for part in sorted(slices, key=lambda item: item.row_start):
+    exact = _cohort_row_owners(slices)
+    for part in slices:
         cid, send, receive, local = part.cohort_id, part.source_assignments, part.received_assignments, part.local_assignments
-        if part.row_start < end:
-            raise ModelingError("mc2_overlapping_cohort_rows")
-        end = part.row_end
         rows = send if contract.abi == DISPATCH else receive
-        if rows > (part.row_end - part.row_start) * contract.top_k:
+        if rows > part.row_count * contract.top_k:
             raise ModelingError("mc2_assignment_count_exceeds_top_k")
         if explicit_routes:
             if expected[cid] != [send, receive, local] or masked[cid, rank] > part.masked_padding_rows:
@@ -416,9 +461,12 @@ def _routing(fields: Mapping, contract: Mc2Contract) -> Mc2Contract:
             raise ModelingError("mc2_directed_assignments_required")
         elif local:
             counts[cid, rank, rank] = local
-    bounds = {part.cohort_id: (part.row_start, part.row_end) for part in slices}
+    parts = {part.cohort_id: part for part in slices}
     for cid, src, token in active:
-        if src == rank and (cid not in bounds or not bounds[cid][0] <= token < bounds[cid][1]):
+        if src != rank:
+            continue
+        part = parts.get(cid)
+        if part is None or (exact.get(token) != cid if part.row_ids else not part.row_start <= token < part.row_end):
             raise ModelingError("mc2_source_token_outside_cohort")
     count_fields = ("source_assignments", "received_assignments", "local_assignments",
                     "remote_assignments", "masked_padding_rows")
@@ -426,6 +474,21 @@ def _routing(fields: Mapping, contract: Mc2Contract) -> Mc2Contract:
         if _integer(fields[name], name) != sum(getattr(part, name) for part in slices):
             raise ModelingError(f"mc2_declared_{name}_mismatch")
     return replace(contract, cohorts=slices, assignments=tuple((*key, count) for key, count in sorted(counts.items())))
+
+
+def _cohort_row_owners(slices: tuple[Mc2CohortSlice, ...]) -> dict[int, int]:
+    spans = sorted((part.row_start, part.row_end) for part in slices if not part.row_ids and part.row_count)
+    if any(end > start for (_, end), (start, _) in zip(spans, spans[1:])):
+        raise ModelingError("mc2_overlapping_cohort_rows")
+    starts = [start for start, _ in spans]
+    exact = {}
+    for part in slices:
+        for row in part.row_ids:
+            index = bisect_right(starts, row) - 1
+            if row in exact or (index >= 0 and row < spans[index][1]):
+                raise ModelingError("mc2_overlapping_cohort_rows")
+            exact[row] = part.cohort_id
+    return exact
 
 
 def validate_contract(op: OpSpec, ctx: OperatorPlanningContext) -> Mc2Contract:
@@ -457,7 +520,9 @@ def validate_contract(op: OpSpec, ctx: OperatorPlanningContext) -> Mc2Contract:
         gathered = fields.get("gathered_bytes", fields.get("operand_bytes", m * row_bytes))
         if type(gathered) not in {int, float} or not math.isfinite(gathered) or gathered < 0 or (not m and gathered):
             raise ModelingError("mc2_invalid_gathered_operand_bytes")
-        return replace(contract, m=m, k=k, n=n, gathered_bytes=gathered, operand_dtype=operand)
+        contract = replace(contract, m=m, k=k, n=n, gathered_bytes=gathered, operand_dtype=operand)
+        contract.shard_bytes(m)
+        return contract
     if op.recipe == "arch22_v2_caller_local" and "mc2_v2_local" in fields:
         return contract
     if chunks != 1:
@@ -480,32 +545,6 @@ def validate_contract(op: OpSpec, ctx: OperatorPlanningContext) -> Mc2Contract:
     return _routing(fields, replace(contract, row_layout=layout, top_k=top_k, experts=experts, status_bytes=status))
 
 
-@dataclass(frozen=True, slots=True)
-class PeerRoute:
-    source: int
-    destination: int
-    hops: tuple[str, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class Transport:
-    abi: str
-    algorithm: str
-    routes: tuple[PeerRoute, ...]
-    wire_alignment: int = 1
-    window_alignment: int = 1
-    window_offset: int = 0
-    credits: int = 1
-    slot_depth: int = 1
-    peer_limit: int = 0
-    ccu: bool = False
-    aiv_staging: bool = True
-    direct_remote_gm: bool = False
-
-    def peer_bytes(self, payload: int | float) -> int | float:
-        return align_up(math.ceil(payload), self.wire_alignment) if self.wire_alignment > 1 else payload
-
-
 def topology_hops(fields: Mapping, group: Mapping) -> dict:
     raw = fields.get("topology_hops", group.get("topology_hops", {}))
     hops = {}
@@ -519,90 +558,11 @@ def topology_hops(fields: Mapping, group: Mapping) -> dict:
     return hops
 
 
-@dataclass(frozen=True, slots=True)
-class Phase:
-    name: str
-    after: tuple[str, ...] = ()
-    work: Work = field(default_factory=Work)
-    owner: str = ""
-    metadata: tuple[tuple[str, bool | int | float | str | bytes | None | tuple[int, ...]], ...] = ()
-    service_mode: str = ""
-
-
-def read_work(amount: int | float, *, aic: bool = False, l2: bool = False) -> Work:
-    pipe = "mte2_aic" if aic else "mte2_aiv"
-    return Work(resources={pipe: amount, "hbm": amount, **({"l2": amount} if l2 else {})})
-
-
-def store_work(amount: int | float, *, fixpipe: bool = False, l2: bool = False) -> Work:
-    pipe = "fixpipe" if fixpipe else "mte3"
-    return Work(resources={pipe: amount, "hbm": amount, **({"l2": amount} if l2 else {})})
-
-
-def peer_phase(name: str, after: tuple[str, ...], route: PeerRoute, transport: Transport,
-               payload: int | float, metadata: tuple = ()) -> Phase:
-    wire = transport.peer_bytes(payload)
-    info = (
-        ("source_rank", route.source), ("destination_rank", route.destination),
-        ("topology_hops", "/".join(route.hops)), ("peer_limit", transport.peer_limit),
-        ("wire_padding_bytes", wire - payload),
-    )
-    return Phase(name, after, Work(resources={"link": wire}),
-                 metadata=metadata + info, service_mode="mc2_peer_" + "_".join(route.hops).lower())
-
-
 def _phase_items(work: Work) -> tuple[WorkItem, ...]:
     return tuple(WorkItem("matrix", "flop", value, dtype) for dtype, value in work.matrix.items() if value) + tuple(
         WorkItem(role, "op" if role == "vector" else "bytes", value)
         for role, value in work.resources.items() if value
     )
-
-
-@dataclass(frozen=True, slots=True)
-class Mc2Program:
-    phases: tuple[Phase, ...]
-
-    def __call__(self, context: RecipeContext) -> KernelProgram:
-        stages = []
-        for phase in self.phases:
-            info = dict(phase.metadata)
-            caps = {}
-            if phase.service_mode and phase.work.resources["link"]:
-                amount = phase.work.resources["link"]
-                role = context.physical_role(phase.service_mode)
-                if role == phase.service_mode:
-                    role = context.physical_role("link")
-                if role in context.resource_names:
-                    resource = context.resource_names[role]
-                else:
-                    routed = set(context.work) - set(context.resource_names.values())
-                    if len(routed) != 1:
-                        raise ModelingError(f"mc2_peer_resource_binding_required:{phase.service_mode}")
-                    resource = routed.pop()
-                demand = {resource: amount}
-                rate = context.service_rate(phase.service_mode)
-                if rate is None:
-                    rate = context.service_rate("mc2_peer")
-                injection = context.service_rate("mc2_injection")
-                peer_limit = info["peer_limit"]
-                if injection is not None and peer_limit:
-                    share = injection / peer_limit
-                    rate = share if rate is None else min(rate, share)
-                if rate is not None:
-                    caps[resource] = rate / 1000
-            else:
-                demand = context.bind(phase.work)
-            placement = {}
-            if phase.owner:
-                units = context.effective_aic_cores if phase.owner == "aic" else context.effective_aiv_cores
-                roles = ("cube", "mte2_aic", "mte1", "fixpipe") if phase.owner == "aic" else ("mte2_aiv", "vector", "mte3")
-                placement = {
-                    name: owners for name, owners in context.owned(0, 1, roles).items() if name in demand
-                }
-                placement = {name: owners[:units] for name, owners in placement.items()}
-            stages.append(Stage(phase.name, demand, phase.after, caps=caps, placement=placement,
-                                metadata=info, keep_empty=True))
-        return KernelProgram(tuple(stages))
 
 
 def make_plan(contract: Mc2Contract, transport: Transport, phases: tuple[Phase, ...],
@@ -621,7 +581,8 @@ def make_plan(contract: Mc2Contract, transport: Transport, phases: tuple[Phase, 
     return OperatorPlan(work, Mc2Program(phases), {
         "implementation": implementation, "governed_family": "mc2", "arch_id": arch_id,
         "abi": contract.abi, "transport_abi": transport.abi, "topology_algorithm": transport.algorithm,
-        "peer_payload_bytes": contract.peer_payload_bytes, "internal_chunks": contract.internal_chunks,
+        "peer_payload_bytes": replace(contract, transport_abi=transport.abi).peer_payload_bytes,
+        "internal_chunks": contract.internal_chunks,
         "window_alignment_bytes": transport.window_alignment, "peer_credits": transport.credits,
     }, pipeline_spec=spec)
 
@@ -636,78 +597,12 @@ def build_cohort_transport_stages(
     contract: Mc2Contract, cohort_slice: Mc2CohortSlice, transport: Transport, *,
     after: tuple[str, ...] = (), peer_after: tuple[str, ...] = (),
 ) -> tuple[Phase, ...]:
-    """Lower one caller-owned cohort with explicit data, status and consumption."""
-    part, layout = cohort_slice, contract.row_layout
-    cid = part.cohort_id
-    prefix = f"cohort{cid}_"
-    tag = (("cohort_id", cid), ("row_start", part.row_start), ("row_end", part.row_end))
-    receiving = part.received_assignments
-    working = part.source_assignments + part.masked_padding_rows
-    dispatch = contract.abi == DISPATCH
-    counts = {(src, dst): count for cohort, src, dst, count in contract.assignments if cohort == cid}
-    meta_bytes = layout.expert_scale_bytes + INT32_BYTES if dispatch else TRIPLE_META_BYTES
-    pack = working * (layout.input_bytes + layout.input_scale_bytes + meta_bytes)
-    vector = working  # One validity test per packed or masked assignment.
-    if dispatch and layout.quant_mode != "none":
-        ops = INT8_QUANT_OPS if layout.payload_dtype == "int8" else FP8_QUANT_OPS
-        vector += working * (ops * layout.width - 1)
-    pack_name = prefix + "pack"
-    phases = [Phase(pack_name, after, read_work(pack) + Work(resources={"vector": vector}), "aiv", tag + (
-        ("pack_input_bytes", pack), ("masked_padding_rows", part.masked_padding_rows),
-    ))]
-    ready = []
-    rank = contract.rank
-    for route in transport.routes:
-        peer = route.destination
-        rows = counts.get((rank, peer), 0)
-        incoming = counts.get((peer, rank), 0)
-        payload = rows * layout.packet_bytes
-        receive = incoming * layout.packet_bytes
-        data = prefix + f"send_{peer}"
-        status = prefix + f"status_{peer}"
-        credit = (ready[-transport.credits],) if len(ready) >= transport.credits else ()
-        deps = (pack_name, *credit, *peer_after)
-        window = transport.peer_bytes(payload + contract.status_bytes)
-        if transport.aiv_staging and payload:
-            staged = data + "_stage_ub"
-            phases.append(Phase(staged, deps, Work(resources={"mte3": payload}), "aiv", tag))
-            deps = (staged,)
-        phases.append(peer_phase(data, deps, route, transport, payload, tag + (
-            ("protocol_padding_bytes", rows * layout.protocol_padding_bytes),
-            ("frame_flag_bytes", rows * layout.flag_bytes),
-            ("window_bytes", align_up(math.ceil(window), transport.window_alignment)),
-            ("window_rank", peer), ("window_offset_bytes", transport.window_offset),
-            ("direct_remote_gm", transport.direct_remote_gm),
-            ("transfer", ("write_nbi" if dispatch else "read_nbi") if transport.ccu else "peer_window"),
-        )))
-        visible = data + "_ready"
-        phases.append(Phase(visible, (data,), Work(resources={"hbm": receive}), metadata=tag))
-        phases.append(peer_phase(status, (visible,), route, transport, contract.status_bytes,
-                                 tag + (("status_bytes", contract.status_bytes),)))
-        consume = data + "_consume"
-        phases.append(Phase(consume, (status,), read_work(receive), "aiv", tag))
-        ready.append(consume)
-    count_bytes = contract.status_bytes * (contract.world_size - 1)
-    readiness = prefix + ("cross_core_ready" if transport.ccu else "readiness")
-    phases.append(Phase(readiness, (pack_name, *ready), read_work(count_bytes) + store_work(2 * count_bytes), "aiv", tag))
-    local_bytes = part.local_assignments * layout.materialized_bytes
-    if dispatch:
-        output = receiving * layout.materialized_bytes
-        if contract.experts:
-            output += contract.experts * INT32_BYTES + math.ceil(contract.experts / contract.world_size) * INT64_BYTES
-        unpack = read_work(local_bytes) + store_work(local_bytes + output)
-    else:
-        tokens = part.row_end - part.row_start
-        weighted = 2 * receiving * layout.width  # Multiply and accumulate into each source row.
-        output = tokens * math.ceil(layout.width * dtype_bytes(contract.output_dtype))
-        unpack = read_work(local_bytes + receiving * FP32_SCALE_BYTES) + store_work(local_bytes + output)
-        unpack += Work(resources={"vector": weighted})
-    phases.append(Phase(prefix + "unpack", (readiness,), unpack, "aiv", tag))
-    phases.append(Phase(prefix + "slot_release", (prefix + "unpack",), metadata=tag))
-    return tuple(phases)
+    """Lower one caller-owned cohort using its selected transport framing."""
+    return cohort_stages(contract, cohort_slice, transport, _peer_framing(contract, transport.abi),
+                         after=after, peer_after=peer_after)
 
 
-def _matrix_fragment(contract: Mc2Contract, name: str, after: tuple[str, ...], rows: float,
+def _matrix_fragment(contract: Mc2Contract, name: str, after: tuple[str, ...], rows: int,
                      *, b_bytes: int | float, slot: tuple = (), ub_output: bool = False) -> Phase:
     a_bytes = (contract.gathered_bytes * rows / contract.m if contract.abi == AGMM and contract.m
                else rows * contract.k * dtype_bytes(contract.dtype))
@@ -719,7 +614,8 @@ def _matrix_fragment(contract: Mc2Contract, name: str, after: tuple[str, ...], r
         resources={"mte1": a_bytes + b_bytes}), "aic", slot)
 
 
-def _chunked_stages(contract: Mc2Contract, transport: Transport, *, ub_output: bool = False) -> tuple[Phase, ...]:
+def _chunked_stages(contract: Mc2Contract, transport: Transport, *,
+                    ub_output: bool = False, temp_gm: bool = False) -> tuple[Phase, ...]:
     gathering = contract.abi == AGMM
     chunks = contract.internal_chunks
     ring = RingBuffer(allocation="mc2_chunks", depth=transport.slot_depth)
@@ -728,8 +624,8 @@ def _chunked_stages(contract: Mc2Contract, transport: Transport, *, ub_output: b
     phases: list[Phase] = []
     world = contract.world_size
     routes = transport.routes
-    local_rows = contract.m / world
-    head_rows = min(local_rows, math.ceil(local_rows / chunks)) * world
+    local_rows = contract.m // world
+    head_rows = ((local_rows + chunks - 1) // chunks) * world
     for index in range(chunks):
         rows = contract.m if chunks == 1 else (head_rows if index == 0 else contract.m - head_rows)
         suffix = f"chunk{index}"
@@ -744,19 +640,26 @@ def _chunked_stages(contract: Mc2Contract, transport: Transport, *, ub_output: b
         fragments[events.last_use] = Phase(release, (consumer,), metadata=tag)
         comm_gate = events.credit if gathering else events.publish
         previous = (f"{'ag' if gathering else 'rs'}_chunk{index - 1}",) if index else ()
-        payload = contract.gathered_bytes * (rows / contract.m) / world if contract.m else 0
+        comm_deps = (comm_gate, *previous)
+        payload = contract.shard_bytes(rows)
+        wire_window = len(routes) * transport.peer_bytes(payload)
+        if temp_gm and wire_window:
+            read = comm + "_hccl_read"
+            data_bytes = len(routes) * payload
+            phases.append(Phase(read, comm_deps, Work(resources={"hbm": data_bytes, "l2": data_bytes}),
+                                metadata=tag))
+            comm_deps = (read,)
         names = []
         for route in routes:
             name = f"{comm}_peer_{route.destination}"
             credit = (names[-transport.credits],) if len(names) >= transport.credits else ()
-            phases.append(peer_phase(name, (comm_gate, *previous, *credit), route, transport, payload, tag))
+            phases.extend(peer_stages(name, (*comm_deps, *credit), route, transport, payload, tag))
             names.append(name)
-        wire_window = len(routes) * transport.peer_bytes(payload)
         b_bytes = contract.k * contract.n * dtype_bytes(contract.dtype) if rows else 0
         if gathering:
             local = f"local_gemm_{suffix}"
-            phases.append(_matrix_fragment(contract, local, (), rows / world, b_bytes=b_bytes, slot=tag))
-            remote = rows - rows / world
+            phases.append(_matrix_fragment(contract, local, (), rows // world, b_bytes=b_bytes, slot=tag))
+            remote = rows - rows // world
             fragments[events.read_done[0]] = _matrix_fragment(
                 contract, gemm, (events.publish,), remote, b_bytes=b_bytes if remote else 0, slot=tag)
             fragments[events.write] = Phase(comm, (events.credit, *names),
@@ -765,9 +668,9 @@ def _chunked_stages(contract: Mc2Contract, transport: Transport, *, ub_output: b
             previous_gemm = (f"gemm_chunk{index - 1}",) if index else ()
             fragments[events.write] = _matrix_fragment(contract, gemm, (events.credit, *previous_gemm), rows,
                                                         b_bytes=b_bytes, slot=tag, ub_output=ub_output)
-            own_bytes = rows / world * contract.n * dtype_bytes(contract.output_dtype)
-            reduced = (world - 1) * rows / world * contract.n
-            work = read_work(wire_window + (0 if ub_output else own_bytes), l2=True)
+            own_bytes = rows // world * contract.n * dtype_bytes(contract.output_dtype)
+            reduced = (world - 1) * (rows // world) * contract.n
+            work = read_work((0 if temp_gm else wire_window) + (0 if ub_output else own_bytes), l2=True)
             work += store_work(own_bytes, l2=True) + Work(resources={"vector": reduced})
             fragments[events.read_done[0]] = Phase(
                 comm, (events.publish, *names), work if world > 1 else Work(), "aiv", tag)
@@ -780,15 +683,17 @@ def build_chunked_agmm_stages(contract: Mc2Contract, transport: Transport) -> tu
     return _chunked_stages(contract, transport)
 
 
-def build_chunked_mmrs_stages(contract: Mc2Contract, transport: Transport, *, ub_output: bool = False) -> tuple[Phase, ...]:
-    return _chunked_stages(contract, transport, ub_output=ub_output)
+def build_chunked_mmrs_stages(contract: Mc2Contract, transport: Transport, *,
+                             ub_output: bool = False, temp_gm: bool = False) -> tuple[Phase, ...]:
+    return _chunked_stages(contract, transport, ub_output=ub_output, temp_gm=temp_gm)
 
 
-def build_transport_stages(contract: Mc2Contract, transport: Transport, *, ub_output: bool = False) -> tuple[Phase, ...]:
+def build_transport_stages(contract: Mc2Contract, transport: Transport, *,
+                           ub_output: bool = False, temp_gm: bool = False) -> tuple[Phase, ...]:
     if contract.abi == AGMM:
         return build_chunked_agmm_stages(contract, transport)
     if contract.abi == MMRS:
-        return build_chunked_mmrs_stages(contract, transport, ub_output=ub_output)
+        return build_chunked_mmrs_stages(contract, transport, ub_output=ub_output, temp_gm=temp_gm)
     phases = []
     for index, cohort in enumerate(contract.cohorts):
         reuse = index - transport.slot_depth

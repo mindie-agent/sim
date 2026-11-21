@@ -18,25 +18,19 @@ from _support.axes import ARCH_IDS, SKUS
 from _support.hardware import sku_case
 from mindie_sim import graph_costs, operator_costs, predict, target_graphs, target_operators
 from mindie_sim.catalog.quant import quant_preset
-from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.catalog.weight_terms import term_bytes
 from mindie_sim.catalog.weights import layer_weight_terms
 from mindie_sim.compose import compose_case
 from mindie_sim.prediction.body_defaults import TargetGraphSet
 from mindie_sim.prediction.direct_peer import DirectPeerCollective
-from mindie_sim.prediction.engine import Engine, Resource
-from mindie_sim.prediction.expected_grouped import ExpectedGroupedMatmul
-from mindie_sim.prediction.matrix import TiledMatmul
-from mindie_sim.prediction.matrix_steady import SteadyMatmul
-from mindie_sim.prediction.mc2_phase import contract
 from mindie_sim.prediction.mechanism import Geometry
 from mindie_sim.prediction.moe_callers import LOCAL_EXPERT_REDUCE, local_expert_reduce_recipe
 from mindie_sim.prediction.moe_cann_fusion import (
     HASH_NATIVE_KIND, INIT_ROUTING_NATIVE_KIND, SOFTMAX_NATIVE_KIND, build_selection, cann_native_active)
-from mindie_sim.prediction.operators import grouped_moe
+from mindie_sim.prediction.operators import grouped_moe, mc2
 from mindie_sim.prediction.operators.contracts import OperatorPlanningContext
 from mindie_sim.prediction.passes_ffn_fusion import raw_selection
-from mindie_sim.prediction.program import RecipeBook, RecipeContext
+from mindie_sim.prediction.program import RecipeBook
 from mindie_sim.prediction.results import OpOccurrence
 from mindie_sim.prediction.routing_realizations import select_realization
 from mindie_sim.prediction.source_force_eplb import SOURCE, ledger
@@ -50,7 +44,6 @@ ROOT = Path(__file__).resolve().parents[2]
 WIDTH, BANK_SIZE, TOP_K, EP = 32, 2, 2, 4
 FP32_BYTES, BF16_BYTES = 4, 2
 FRACTAL = 16
-BANK_TILE = 128
 SOURCE_COUNTS = (6, 10, 8, 8)
 GROUPED_SOURCE = {"lowerings": {"grouped_gemm": "ascendc_grouped_nd_bf16"}}
 FULLMESH = {"kind": "arch35_fullmesh", "max_inflight_per_rank": 4}
@@ -183,56 +176,24 @@ def test_balanced_cross_replica_cohort_splits_source_rows_and_serving_wire_work(
         _closed(result)
     assert served["execution"]["serviced"]["link:fabric"] == analytical["execution"]["serviced"]["link:fabric"]
 
-def _expected(rows, active, *, branch="moments", scale=1):
-    n, k, cores = 64, 256, 8
-    rates = dict.fromkeys(("cube", "vector", "hbm", "mte1", "mte3"), 1e12) | {"mte2": 1e5 * scale}
-    sizes = dict.fromkeys(("l1", "l0a", "l0b", "l0c"), 1024**2)
-    units = {key: 1 if key == "hbm" else cores for key in rates}
-    columns, row_scales = FP32_BYTES * active * n, FP32_BYTES * rows
-    weights = active * n * k + columns
-    reads, output = rows * k + weights + row_scales, rows * n * BF16_BYTES
-    meta = dict(compute_format="int8", output_format="bf16", packed_weight_bytes=weights,
-                activation_scale_bytes=row_scales, matrix_groups=active if branch == "integer" else 1,
-                matrix_epilogue={"kind": "row_column_scale", "operations_per_output": 4,
-                                 "row_scale_bytes": row_scales, "column_scale_bytes": columns})
-    if branch != "integer":
-        meta.update(matrix_mapping_domain="aggregate_experts", routing_basis="probability_moments",
-                    expected_rows=rows, expected_active_experts=active)
-    work = {"cube": 2 * rows * n * k, "vector": 4 * rows * n}
-    shape = (rows, n, k)
-    op = OpSpec("matrix", "gemm", "prefill", 0, 0, (), shape, shape, shape, shape, dtype="int8",
-                flops=work["cube"], vector_ops=work["vector"], mte2_bytes=reads, mte3_bytes=output,
-                hbm_bytes=reads + output, metadata=tuple(meta.items()))
-    engine = Engine([Resource(key, rate, units=units[key]) for key, rate in rates.items()],
-                    pools=sizes, pool_units=dict.fromkeys(sizes, cores))
-    records = []
-    context = RecipeContext(op, work, dict(zip(rates, rates)), rates, cores, pool_names=dict(zip(sizes, sizes)),
-                            pool_capacities=sizes, resource_units=units, record_mapping=records.append)
-    matrix = SteadyMatmul() if branch == "compact" else TiledMatmul(BANK_TILE, BANK_TILE, 64)
-    recipe = ExpectedGroupedMatmul(matrix) if branch in {"compact", "moments"} else matrix
-    done = recipe.lower(context).start(engine, "grouped", engine.submit("ready", release=3))
-    engine.advance(horizon=2)
-    assert not any(engine.serviced.values())
-    engine.advance(until=(done,))
-    _closed({"execution": engine.summary()})
-    assert {key: engine.serviced[key] for key in ("cube", "vector", "hbm", "mte3")} == pytest.approx(
-        work | {"hbm": reads + output, "mte3": output})
-    return engine.serviced, done.time - 3, records, reads, weights
+@pytest.mark.parametrize("hardware", SKUS)
+@pytest.mark.parametrize("rows", [(0, 16, 0, 16), (17, 0, 15, 0)])
+def test_exact_banks_refill_only_active_weights(hardware, rows):
+    n, k = 64, 32
+    geometry = Geometry.from_devices(sku_case(hardware).machine.dies[:1])
+    shape = (sum(rows), n, k)
+    op = OpSpec("banked", "grouped_gemm", "prefill", 0, 0, (), shape,
+                shape, shape, shape, dtype="bf16", recipe="grouped_gemm",
+                metadata=(("group_rows", rows), ("base_m", 16), ("base_n", n)))
+    plan = grouped_moe.build(op, geometry)
+    refills = sum(ceil(count / 16) for count in rows)
+    reads = BF16_BYTES * (sum(rows) * k + refills * k * n)
+    writes = BF16_BYTES * sum(rows) * n
+    assert plan.work.resources["mte2_aic"] == reads
+    assert plan.work.resources["fixpipe"] == writes
+    assert plan.work.resources["hbm"] == reads + writes
+    assert plan.metadata["useful_flops"] == 2 * sum(rows) * n * k
 
-@pytest.mark.parametrize("rows,active", [(2560, 512), (6400, 512), (17, 6.25), (1, .75)])
-def test_fractional_bank_mapping_amortizes_weight_refills_and_keeps_work(rows, active):
-    service, _, records, reads, weights = _expected(rows, active)
-    flat, *_ = _expected(rows, active, branch="flat")
-    assert (service["mte2"], flat["mte2"]) == pytest.approx((reads, reads + (ceil(rows / BANK_TILE) - 1) * weights))
-    assert (records[0]["bank_slots"], records[0]["semantic_rows"]) == (ceil(active), rows)
-
-def test_integer_bank_control_and_compact_bandwidth_scaling():
-    moments, time, *_ = _expected(24, 8)
-    integer, integer_time, *_ = _expected(24, 8, branch="integer")
-    assert moments == pytest.approx(integer) and time == pytest.approx(integer_time)
-    results = [_expected(17, 6.25, branch="compact", scale=scale) for scale in (.5, 1, 2)]
-    assert results[0][1] > results[1][1] > results[2][1]
-    assert all(row[0] == pytest.approx(results[0][0]) for row in results[1:])
 
 def _scenario(tokens, phase="prefill", **route):
     return dict(scope="body", layer=0, phase=phase, tokens=tokens, **route)
@@ -453,7 +414,9 @@ def test_eplb_keeps_router_capacity_and_conserves_directed_transport(batch, sele
     report = graph_costs(raw, {0: protocol}, isolated=False, compact=True, input_ready_ms=7)
     bridge = report["profile"]["native_bridge"]
     status = 16 * WIDTH // ep
-    dispatch, combine = (contract(phase, 64).layout.packet_bytes for phase in native)
+    d_meta, c_meta = native[0], native[1]
+    dispatch = mc2.dispatch_row_layout(d_meta["width"], input_dtype=d_meta.get("input_dtype", "bf16"), payload_dtype=d_meta.get("payload_dtype", d_meta.get("input_dtype", "bf16")), quant_mode=d_meta.get("quant_mode", "none")).packet_bytes
+    combine = mc2.combine_row_layout(c_meta["width"], dtype=c_meta.get("input_dtype", "bf16")).packet_bytes
     offdiag = [(s, d) for s in range(ep) for d in range(ep) if s != d]
     serviced = {k: v for k, v in report["execution"]["serviced"].items() if k.startswith("link:")}
     if selected:

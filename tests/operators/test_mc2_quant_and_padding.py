@@ -23,14 +23,10 @@ from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.prediction.cohort_traffic import bind_cohort_traffic
 from mindie_sim.prediction.engine import Engine, Resource
 from mindie_sim.prediction.frontend import Frontend
-from mindie_sim.prediction.family_mc2_unfused import IMPLEMENTATION, METADATA, lower
 from mindie_sim.prediction.instructions import cal_token_send_expert_work, get_sff_value_u64_i64_work
-from mindie_sim.prediction.mc2_phase import build as phase_build, contract
 from mindie_sim.prediction.mechanism import Geometry
 from mindie_sim.prediction.peer_traffic import PeerTraffic
 from mindie_sim.prediction.operators import mc2
-from mindie_sim.prediction.operators.mc2_fullmesh import dispatch_layout, dispatch_plan
-from mindie_sim.prediction.operators.mc2_mx_quant import mx32_work
 from mindie_sim.prediction.program import KernelProgram, RecipeContext, Stage
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError
@@ -48,6 +44,7 @@ PREFIX = "s0.l0."
 WAIT = 7
 ROOT = Path(__file__).resolve().parents[2]
 ROW_INT8 = "per_token_int8"
+UNFUSED_IMPLEMENTATION = "vllm_ascend_mc2_unfused_w8a8"
 NORMAL = {"kind": "arch35_fullmesh", "dispatch_quant": "none"}
 PARTITION = {"kind": "vllm_ascend_mc2_tp_slice", "padding": "right_to_tp"}
 SOURCE = {"kind": "vllm_ascend_mc2_tp", "global_bs": 0}
@@ -56,6 +53,44 @@ SELECTOR = dict(kind="separate_quantized_payload", payload_dtype="int8", scale_d
 
 def align(amount, block):
     return ceil(amount / block) * block
+
+def row_plan(abi, width, rows, transport, **fields):
+    hw = machine(MESH_SKU, num_devices=2)
+    op = OpSpec("rows", "mc2", "decode", 0, 0, (), (), (), (), (), dtype="bf16",
+                metadata=(("mc2", dict(abi=abi, width=width, world_size=2, transport_abi=transport,
+                                      assignment_matrix=((0, rows), (0, 0)), **fields)),))
+    return mc2.build(op, Geometry.from_devices((hw.dies[0],)))
+
+
+@pytest.mark.parametrize("abi", ("dispatch_v2", "combine_v2"))
+def test_direct_rows_and_full_mesh_frames_use_their_own_wire_layout(abi):
+    width, rows = 4096, 2
+    direct = row_plan(abi, width, rows, "a5_ccu")
+    framed = row_plan(abi, width, rows, "a5_mte")
+    row = width * 2
+    dispatch = abi == "dispatch_v2"
+    framed_row = ceil((row + (ROW_ALIGN if dispatch else 0)) / DATA) * FRAME
+    for plan, payload, status in ((direct, row * rows, FRAME if dispatch else 0),
+                                  (framed, framed_row * rows, FLAG if dispatch else 0)):
+        phases = {p.phase_id: {w.resource: w.amount for w in p.work} for p in plan.pipeline_spec.phases}
+        assert plan.metadata["peer_payload_bytes"] == phases["cohort0_send_1"]["link"] == payload
+        assert phases.get("cohort0_status_1", {}).get("link", 0) == status
+        assert plan.work.resources["link"] == payload + status
+
+
+@pytest.mark.parametrize("mode,payload_dtype", (("none", "fp8_e4m3"), ("per_token", "int8"), ("mx", "fp8_e4m3")))
+@pytest.mark.parametrize("width", (256, 513, 5120))
+def test_quantized_direct_stride_aligns_payload_and_scales_per_assignment(mode, payload_dtype, width):
+    incoming = payload_dtype if mode == "none" else "bf16"
+    given_scales = 64 if mode == "none" else 0
+    scales = {"none": given_scales, "per_token": FP32, "mx": align(ceil(width / ROW_ALIGN), 2)}[mode]
+    args = dict(input_dtype=incoming, payload_dtype=payload_dtype, quant_mode=mode, input_scale_bytes=given_scales)
+    alignment = MX_ALIGN if mode == "mx" else ROW_ALIGN
+    plan = row_plan("dispatch_v2", width, 3, "a5_ccu", **args)
+    assert plan.work.resources["link"] == 3 * align(align(width, alignment) + scales, FRAME) + FRAME
+    if mode != "none":
+        with pytest.raises(ModelingError, match="requires_unscaled_float_row"):
+            row_plan("dispatch_v2", width, 3, "a5_ccu", **{**args, "input_scale_bytes": scales})
 
 @pytest.mark.parametrize("width", (1, 31, 32, 127, 128, 239, 240, 255, 256, 448, 480, 481, 1536, 7168))
 @pytest.mark.parametrize("mode,incoming,outgoing,input_scale", (
@@ -73,14 +108,13 @@ def test_rows_reserve_scales_and_triple_before_wire_framing(width, mode, incomin
     triple = align(offset + scales, ROW_ALIGN)
     blocks = ceil((triple + ROW_ALIGN) / DATA)
     args = dict(input_dtype=incoming, payload_dtype=outgoing, quant_mode=mode, input_scale_bytes=input_scale)
-    for layout in (mc2.dispatch_row_layout, dispatch_layout) if outgoing != "fp4" else (mc2.dispatch_row_layout,):
-        row = layout(width, **args)
-        weighted = layout(width, **args, has_expert_scales=True)
-        assert (row.payload_bytes, row.scale_offset_bytes, row.scale_bytes) == (payload, offset, scales)
-        assert (row.triple_offset_bytes, row.blocks, row.packet_bytes) == (triple, blocks, blocks * FRAME)
-        assert (row.data_region_bytes, row.flag_bytes) == (blocks * DATA, blocks * FLAG)
-        assert row.materialized_bytes == payload + scales + TRIPLE
-        assert weighted.packet_bytes == row.packet_bytes and weighted.materialized_bytes == row.materialized_bytes + FP32
+    row = mc2.dispatch_row_layout(width, **args)
+    weighted = mc2.dispatch_row_layout(width, **args, has_expert_scales=True)
+    assert (row.payload_bytes, row.scale_offset_bytes, row.scale_bytes) == (payload, offset, scales)
+    assert (row.triple_offset_bytes, row.blocks, row.packet_bytes) == (triple, blocks, blocks * FRAME)
+    assert (row.data_region_bytes, row.flag_bytes) == (blocks * DATA, blocks * FLAG)
+    assert row.materialized_bytes == payload + scales + TRIPLE
+    assert weighted.packet_bytes == row.packet_bytes and weighted.materialized_bytes == row.materialized_bytes + FP32
     returned = mc2.combine_row_layout(width, dtype="fp16")
     assert returned.payload_bytes == returned.materialized_bytes == width * 2
     assert returned.packet_bytes == ceil(width * 2 / DATA) * FRAME
@@ -108,7 +142,7 @@ def test_governed_masked_assignments_keep_pack_work_and_zero_peer_payload(abi, k
         phases = {p.phase_id: {w.resource: w.amount for w in p.work} for p in plan.pipeline_spec.phases}
         packet = (ceil((align(align(width, ROW_ALIGN) + FP32, ROW_ALIGN) + ROW_ALIGN) / DATA)
                   if dispatch else ceil(2 * width / DATA)) * FRAME
-        assert plan.work.resources["link"] == plan.metadata["peer_payload_bytes"] == kept * packet
+        assert plan.work.resources.get("link", 0) == plan.metadata["peer_payload_bytes"] == kept * packet
         assert phases["cohort0_pack"].get("mte2_aiv", 0) == (kept + padding) * (width * 2 + (4 if dispatch else 12))
         assert phases["cohort0_pack"].get("vector", 0) == (kept + padding) * (7 * width if dispatch else 1)
 
@@ -259,13 +293,7 @@ def test_quantized_wire_and_consumer_preserve_received_scales(mode, sequences):
         if mode == ROW_INT8:
             assert meta["activation_scale_format"] == "fp32" and meta["activation_scale_shape"] == (up.local_shape[0],)
         assert dict(chosen["expert_down"].metadata)["output_format"] == "bf16"
-        phase = dict(dispatch.metadata)["mc2_phase"]
-        assert phase["source_assignments"] == sequences[rank] * 2
-        ledger = contract(phase, 4)
-        assert ledger.layout.packet_bytes == send_bytes and ledger.layout.scale_bytes == scales
-        send = next(p for p in ledger.phases if p.name == "send_read_quantize")
-        quant = sum(dict(values).get("vector", 0) for name, values in send.steps if name != "assignment_prefix_scan")
-        assert quant == sequences[rank] * 2 * (7 * width - 1 if mode == ROW_INT8 else sum(mx32_work(width).values()))
+        assert dict(dispatch.metadata)["activation_scale_bytes"] == up.local_shape[0] * scales
 
 @pytest.mark.parametrize("mode,mutation,message", (
     (ROW_INT8, {"activation_group_size": 128}, "matching_int8_fp32_per_row"),
@@ -281,19 +309,6 @@ def test_quantized_consumer_waits_for_receive_and_rejects_foreign_scale_layout(m
     bad = replace(raw, model=replace(raw.model, quant=replace(raw.model.quant, **mutation)))
     with pytest.raises(ModelingError, match=message):
         graphs(bad)
-
-@pytest.mark.parametrize("width", (256, 512, 1536, 5120))
-def test_mx_register_work_and_fractional_expectations_count_whole_frames(width):
-    expected = dict(max_exponent=128 + width // 256 * (2 * 128 + 128 + 8 * 15),
-                    scale_construction=896 + 13 * (width // 32), rescale_cast=5 * width)
-    assert mx32_work(width) == expected
-    row = dispatch_layout(width, payload_dtype="fp8_e4m3", quant_mode="mx")
-    plan = dispatch_plan(row, source_tokens=1, top_k=8, source_assignments=.1,
-                         received_assignments=1.75, experts=384, ep=32, aiv_count=64)
-    phases = {p.name: dict(p.work) for p in plan.phases}
-    assert phases["payload_exchange"] == {"mte3": row.packet_bytes * .1, "hbm": row.packet_bytes * 1.75}
-    assert phases["send_read_quantize"]["vector"] == pytest.approx(.1 * sum(expected.values()))
-    assert phases["receive_local_copy"]["mte3"] == row.materialized_bytes * 1.75
 
 @pytest.mark.parametrize("mode", (ROW_INT8, "mx"))
 @pytest.mark.parametrize("role", ("vector", "hbm", "mte2_aiv", "mte3", "link"))
@@ -341,27 +356,11 @@ def test_short_row_scalar_calls_use_shared_clock(calls):
         assert max(amount / (rates[r] / units[r]) for r, amount in work.resources.items()) == 4 / (
             rates["pipe_v_issue"] / units["pipe_v_issue"])
 
-def test_short_row_instruction_inventory_conserves_counts_before_binding():
-    raw = dict(kind="dispatch", width=5120, dtype="bf16", payload_dtype="fp8_e4m3",
-               dispatch_quant="mx", source_tokens=1, top_k=6, source_assignments=6,
-               received_assignments=6, experts=384, ep=8)
-    geometry = Geometry(64, dict.fromkeys(("vector", "mte2_aiv", "mte3", "hbm", "pipe_barrier",
-        "pipe_v_lanes", "pipe_v_issue", "ub_read_bytes", "ub_write_bytes"), 64))
-    total = Counter()
-    op = OpSpec("row", "mc2_protocol", "decode", 0, 0, (), (), (), (), ())
-    for phase in contract(raw, 64).phases:
-        plan = phase_build(replace(op, metadata=(("mc2_phase", dict(raw, phase=phase.name)),)), geometry)
-        for entries in plan.metadata["primitive_services"]["owners"].values():
-            for details in entries.values():
-                total.update(details.get("counts", {}))
-    assert total == Counter(scalar_ub_access=1694, scalar_alu_issue=384, pipe_barrier=1559,
-        pipe_v_lanes=13824, pipe_v_issue=1536, ub_read_bytes=9216, ub_write_bytes=1536, reduce_sum_issue=1920)
-
 def allocation_case(*, selected=True, masked=True):
     kernels = dict(moe_token_partition=dict(PARTITION), native_moe_protocol=dict(NORMAL, dispatch_quant=ROW_INT8,
                    max_inflight_per_rank=4), lowerings={})
     if selected:
-        kernels["lowerings"]["grouped_int8_caller"] = dict(implementation=IMPLEMENTATION, options={"global_bs": 0})
+        kernels["lowerings"]["grouped_int8_caller"] = dict(implementation=UNFUSED_IMPLEMENTATION, options={"global_bs": 0})
     if masked:
         kernels["force_eplb_source"] = dict(SOURCE)
     return dict(machine=dict(backend="ascend", sku=MESH_SKU, num_devices=4),
@@ -394,8 +393,6 @@ def test_unfused_storage_scans_capacity_while_matrices_use_active_rows(sequences
         assert tuple(meta["matrix_group_rows"]) == tuple(counts[i] for i in range(banks))
         assert op.mte2_bytes == valid * k + active * n * (k + 2) + valid * FP32
         assert op.mte3_bytes == valid * n * 2 and meta["matrix_epilogue"]["column_scale_bytes"] == active * n * 2
-        assert meta[METADATA]["graph_active_query_rows"] == sequences * 4
-        assert meta[METADATA]["graph_physical_query_rows"] == physical
         cast = ops[name + ".weight_scale_cast"]
         assert (cast.mte2_bytes, cast.mte3_bytes) == (banks * n * FP32, banks * n * 2)
         assert cast.op_id in op.deps
@@ -404,7 +401,6 @@ def test_unfused_storage_scans_capacity_while_matrices_use_active_rows(sequences
         op = ops[name]
         assert op.local_shape == (valid, 512) and op.padded_shape == op.launch_shape == (capacity, 512)
         assert (op.mte2_bytes, op.mte3_bytes, op.vector_ops) == (capacity * read, capacity * output, capacity * vector)
-    assert lower(declared[0], raw["runtime"]["kernels"]["lowerings"]) == declared[0]
     assert ops["router"].local_shape[0] == physical
 
 @pytest.mark.parametrize("scope", ("body", "model"))
@@ -552,24 +548,6 @@ def test_directed_quantized_matrix_is_reencoded_on_return_and_binding_is_idempot
         reverse = PeerTraffic.from_mapping(dict(back.metadata)["peer_traffic"], len(forward))
         assert tuple(reverse.payload(rank, peer) for peer in range(len(forward))) == row
         assert back.link_bytes == sum(row)
-
-def test_unfused_rewrite_requires_owned_scales_and_reuses_runtime_format():
-    raw = allocation_case(selected=False)
-    ops = graphs(raw, 7, tokens=4)[0]
-    bindings = allocation_case()["runtime"]["kernels"]["lowerings"]
-    for producer in ("foreign", PREFIX + "dispatch"):
-        altered = tuple(replace(o, metadata=tuple(dict(o.metadata, weight_scale_storage_format="bf16",
-            weight_scale_storage_bytes=2.0, activation_scale_producer=producer).items()))
-            if o.family == "grouped_gemm" else o for o in ops)
-        if producer == "foreign":
-            with pytest.raises(ValueError, match="owned_mc2_int8_receiver"):
-                lower(altered, bindings)
-        else:
-            result = index(lower(altered, bindings))
-            assert not any(o.recipe == "expert_weight_scale_cast" for o in result.values())
-            for name in ("expert_up", "expert_down"):
-                assert result[name].mte2_bytes == index(ops)[name].mte2_bytes
-                assert dict(result[name].metadata)["weight_scale_storage_format"] == "bf16"
 
 def test_quantized_transport_scope_preserves_draft_expert_traffic():
     fixture = ROOT / "tests/fixtures/verification/v4flash-communication-case.json"

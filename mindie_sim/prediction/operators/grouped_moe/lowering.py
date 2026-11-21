@@ -1,0 +1,293 @@
+"""Lower grouped MoE routing, storage boundaries and physical stage placement.
+
+[Role] Bind physical work and route each cohort through the common Engine.
+[Invariants] UB grants and releases are causal, zero-work stage boundaries.
+[Timeouts & Locks] Finite virtual events. No locks, waits or I/O.
+[Side-Effect Policy] Only program execution submits events to the caller's Engine.
+"""
+from __future__ import annotations
+
+from collections import defaultdict
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field, replace
+from functools import partial
+from typing import TYPE_CHECKING
+
+from mindie_sim.schema.common import ModelingError, dtype_bytes
+from ...mechanism import Work
+from ...ownership import unit_group
+from ...program import KernelProgram, Program, RecipeContext, Stage, scope_allocations
+from ...runtime.ring_buffer import RingBuffer
+
+if TYPE_CHECKING:
+    from .common import MoECohortSplit
+
+ROUTING_INDEX_BYTES = 4
+ROUTING_WEIGHT_BYTES = 4
+GROUP_COUNT_BYTES = 8
+PER_TOKEN_SCALE_BYTES = 4
+MX_SCALE_GROUP_SIZE = 32
+MX_DTYPES = frozenset({"mxfp8", "mxfp4"})
+QUANT_OPS_PER_ELEMENT = 4
+AIC_ROLES = frozenset({"cube", "mte1", "mte2_aic", "fixpipe"})
+AIV_ROLES = frozenset({"mte2_aiv", "mte3", "vector"})
+
+
+def ceil_div(value: int, divisor: int) -> int:
+    return (value + divisor - 1) // divisor
+
+
+def element_bytes(elements: int, dtype: str) -> int:
+    if dtype in {"mxfp4", "fp4", "fp4_e2m1", "int4", "w4a8"}:
+        return ceil_div(elements, 2)
+    return elements * (1 if dtype in {"mxfp8", "hif8"} else int(dtype_bytes(dtype)))
+
+
+def tensor_bytes(rows: int, width: int, dtype: str, *, scaled: bool = False) -> int:
+    scale = ceil_div(width, MX_SCALE_GROUP_SIZE) if dtype in MX_DTYPES else (
+        PER_TOKEN_SCALE_BYTES if scaled else 0
+    )
+    return rows * (element_bytes(width, dtype) + scale)
+
+
+@dataclass(frozen=True, slots=True)
+class StageDemand:
+    name: str
+    after: tuple[str, ...] = ()
+    work: Work = field(default_factory=Work)
+    kind: str = ""
+    owner: int = 0
+    metadata: tuple[tuple[str, object], ...] = ()
+    ub_acquire: tuple[str, int] | None = None
+    ub_release: tuple[str, int] | None = None
+
+
+def _slot(context: RecipeContext, owner: int, spec: tuple[str, int] | None):
+    if spec is None:
+        return ()
+    label, size = spec
+    units = context.pool_units.get("ub", context.effective_aiv_cores)
+    owners = context.datapath.aiv_count if context.datapath else context.resource_units.get("vector", units)
+    mapped = unit_group(owner, owners, units)
+    return tuple(
+        _ring_slot(context.pool_names["ub"], label, size, index) for index in mapped
+    )
+
+
+def _ring_slot(pool, label, size, owner):
+    ring = RingBuffer(owner=owner, pool=pool, allocation=f"{label}:{owner}", slot_bytes=size, depth=1)
+    ring.initial_credit(0)
+    return ring.to_stages(release_slots_at_end=False)[0].acquire[0]
+
+
+@dataclass(frozen=True, slots=True)
+class GroupedMoeProgram:
+    demands: tuple[StageDemand, ...]
+    aic_count: int
+    aiv_count: int
+
+    def __call__(self, context: RecipeContext) -> Program:
+        stages = []
+        for demand in self.demands:
+            work = context.bind(demand.work)
+            placement = {}
+            if demand.kind:
+                roles = AIC_ROLES if demand.kind == "aic" else AIV_ROLES
+                owners = self.aic_count if demand.kind == "aic" else self.aiv_count
+                placement = {
+                    name: units for name, units in context.owned(demand.owner, owners, roles).items()
+                    if name in work
+                }
+            stages.append(Stage(
+                demand.name, work, after=demand.after, placement=placement, coupled=bool(work),
+                metadata=dict(demand.metadata),
+                acquire=_slot(context, demand.owner, demand.ub_acquire),
+                free=_slot(context, demand.owner, demand.ub_release),
+            ))
+        return (BoundedMoEProgram(tuple(stages)) if any(s.acquire or s.free for s in stages)
+                else KernelProgram(tuple(stages)))
+
+
+@dataclass(frozen=True, slots=True)
+class BoundedMoEProgram:
+    """Keep future UB grants and releases out of the live numeric frontier."""
+
+    stages: tuple[Stage, ...]
+
+    def start(self, engine, name, ready, *, owner=""):
+        complete = engine.future(name + ":complete")
+        successors = defaultdict(list)
+        pending = {}
+        for stage in self.stages:
+            parents = stage.after or (None,)
+            pending[stage.name] = len(parents)
+            for parent in parents:
+                successors[parent].append(stage)
+        sinks = sum(stage.name not in successors for stage in self.stages)
+
+        def publish(key, _event):
+            nonlocal sinks
+            children = successors.pop(key, ())
+            if key is not None and not children:
+                sinks -= 1
+                if not sinks:
+                    engine.resolve(complete)
+                return
+            for stage in children:
+                pending[stage.name] -= 1
+                if pending[stage.name] == 0:
+                    del pending[stage.name]
+                    event = engine.submit(
+                        f"{name}:{stage.name}", stage.work,
+                        acquire=scope_allocations(name, stage.acquire),
+                        free=scope_allocations(name, stage.free), metadata=stage.metadata,
+                        placement=stage.placement, coupled=stage.coupled, owner=owner,
+                        native_hook=True, on_complete=partial(publish, stage.name),
+                    )
+                    if stage.acquire or stage.free:
+                        _settle_storage_boundary(engine, event)
+                    elif stage.work and event.sequence not in engine._native_seqs:
+                        # A numeric row the kernel cannot mirror belongs to
+                        # the reference frontier before it receives service.
+                        accel = engine._accel
+                        if accel is not None and accel.enabled:
+                            accel.disable(engine, "mixed_frontier")
+
+        if ready.done:
+            publish(None, ready)
+        else:
+            engine.submit(name + ":entry", after=(ready,), owner=owner,
+                          native_hook=True, on_complete=partial(publish, None))
+        return complete
+
+
+def _settle_storage_boundary(engine, event):
+    """Apply a ready zero-work grant in the native completion publication.
+
+    The Engine's ordinary admission path retains contended grants, including
+    when an earlier Python-ready task is queued. Uncontended boundaries use
+    the same ledger and tracing as normal starts/completions. Settling just
+    this event keeps allocation rows out of the next C11 numeric epoch.
+    """
+    seq = event.sequence
+    task = engine._tasks[seq]
+    if engine._frontier_next_release() <= engine.now or any(
+        (priority, key) < (task.priority, seq) and key in engine._tasks
+        for priority, key in engine._ready_heap
+    ):
+        return
+    if engine._can_allocate(task):
+        engine._start_ready(seq)
+        engine._complete(task)
+
+
+def validate_transport_work(stages, expected):
+    """Check the directed transport ledger at the boundary that declared it."""
+    for direction, amount in zip(("dispatch", "combine"), expected):
+        if amount is not None and amount != sum(
+            stage.work.resources.get("link", 0) for stage in stages
+            if dict(stage.metadata).get("transport_direction") == direction
+        ):
+            raise ModelingError("grouped_moe_transport_link_work_not_conserved")
+
+
+TransportBuilder = Callable[[str, tuple[str, ...], int, tuple[tuple[str, object], ...]], Iterable[StageDemand]]
+
+
+@dataclass(frozen=True, slots=True)
+class DualBatchMoEPipeline:
+    split: MoECohortSplit
+
+    def stages(self, contract, ctx, emit, *, transport_builder=None):
+        self.split.validate_experts(contract.group_rows)
+        stages, combines = [], []
+        preceding_dispatch, start = (), 0
+        splits = (
+            (self.split.cohort0_row_ids, self.split.cohort0_expert_rows),
+            (self.split.cohort1_row_ids, self.split.cohort1_expert_rows),
+        )
+        active_count = sum(bool(ids or any(rows)) for ids, rows in splits)
+        transfers = contract.cohort_transport_bytes
+        if not transfers and not transport_builder and active_count > 1 and any(contract.transport_bytes):
+            raise ModelingError("grouped_moe_dbo_requires_exact_cohort_link_bytes")
+        for cohort, (ids, rows) in enumerate(splits):
+            if transfers:
+                amounts = transfers[cohort]
+            elif transport_builder:
+                amounts = (None, None)
+            else:
+                amounts = contract.transport_bytes if ids or any(rows) else (0, 0)
+            if not (ids or any(rows) or any(amounts) or transport_builder):
+                continue
+            prefix = f"c{cohort}_"
+            end = start + len(ids)
+            metadata = (("cohort_id", cohort), ("slot", cohort), ("row_ids", ids),
+                        ("row_start", start), ("row_end", end), ("restore_map", ids),
+                        ("expert_rows", rows))
+            start = end
+            sub = replace(contract, m=sum(rows), group_rows=rows, tokens=len(ids), transport_bytes=amounts)
+            admit, release = prefix + "ub_admit", prefix + "ub_release"
+            branch = emit(sub, prefix, (admit,), metadata, transport_builder)
+            if not (ids or any(rows) or any(any(stage.work.resources.values()) for stage in branch)):
+                continue
+            capacity = ctx.datapath.usable_bytes("ub")
+            slot = (prefix + "routing", min(capacity // 2, ROUTING_INDEX_BYTES * self.split.top_k))
+            if not slot[1]:
+                raise ModelingError("grouped_moe_dbo_ub_slot_empty")
+            stages.extend((
+                StageDemand(admit, preceding_dispatch, metadata=metadata, ub_acquire=slot),
+                *branch,
+                StageDemand(release, (prefix + "combine",), metadata=metadata, ub_release=slot),
+            ))
+            preceding_dispatch = (prefix + "dispatch",)
+            combines.append(release)
+        if transport_builder:
+            validate_transport_work(stages, contract.transport_bytes)
+        # Combine writes to original row positions, so restore is a completion fence.
+        stages.append(StageDemand("join_restore", tuple(combines)))
+        return stages
+
+
+def _routing_local(name, after, contract, metadata, *, dispatch, publish_output, read_counts):
+    payload_dtype = contract.dtype_a if dispatch else contract.output_dtype
+    payload = tensor_bytes(contract.m, contract.k, payload_dtype, scaled=payload_dtype == "int8")
+    index_bytes = ROUTING_INDEX_BYTES if dispatch else ROUTING_WEIGHT_BYTES
+    count = contract.tokens if dispatch or publish_output else 0
+    token_bytes = count * element_bytes(contract.k, contract.output_dtype)
+    read, write = (token_bytes, payload) if dispatch else (
+        payload + token_bytes * bool(contract.shared_intermediate), token_bytes
+    )
+    read += count * contract.top_k * index_bytes
+    if read_counts and (count or contract.m):
+        read += len(contract.group_rows) * GROUP_COUNT_BYTES
+    vector = count * contract.k * (
+        QUANT_OPS_PER_ELEMENT if dispatch and payload_dtype not in {"bf16", "fp16"} else
+        (1 if dispatch else 2 * contract.top_k + bool(contract.shared_intermediate))
+    )
+    counts = (("source_tokens", count),) if dispatch else (("output_tokens", count),)
+    return StageDemand(name + ":local", after, Work(resources={
+        "hbm": read + write, "l2": read + write, "mte2_aiv": read, "vector": vector, "mte3": write,
+    }), metadata=(*metadata, *counts))
+
+
+def routing_stages(name, after, contract, metadata, builder: TransportBuilder | None, *,
+                   publish_output=True, read_counts=True):
+    """Bind directed peer stages; the endpoint owns token pack and publication."""
+    dispatch = name.endswith("dispatch")
+    local = _routing_local(name, after, contract, metadata, dispatch=dispatch,
+                           publish_output=publish_output, read_counts=read_counts)
+    expected = contract.transport_bytes[0 if dispatch else 1]
+    amount = expected or 0
+    remote = name + ":transport"
+    deps = (local.name,) if dispatch else after
+    tag = (*metadata, ("transport_direction", "dispatch" if dispatch else "combine"))
+    link = [replace(stage, metadata=tuple({**dict(stage.metadata), **dict(tag)}.items()))
+            for stage in builder(remote, deps, amount, tag)] if builder else (
+        [StageDemand(remote, deps, Work(resources={"link": amount}), metadata=tag)] if amount else []
+    )
+    if expected is not None and sum(stage.work.resources.get("link", 0) for stage in link) != expected:
+        raise ModelingError("grouped_moe_transport_link_work_not_conserved")
+    if not dispatch and link:
+        local = replace(local, after=tuple(stage.name for stage in link))
+    stages = [local, *link] if dispatch else [*link, local]
+    return [*stages, StageDemand(name, (local.name, *(stage.name for stage in link)), metadata=metadata)]

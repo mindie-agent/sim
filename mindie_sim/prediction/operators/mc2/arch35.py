@@ -18,9 +18,10 @@ from mindie_sim.schema.operators import OpSpec
 from ...mechanism import OperatorPlan
 from ..contracts import ArchStrategy, OperatorPlanningContext
 from .common import (
-    COLLECTIVES, COMBINE, MMRS, Mc2Contract, PeerRoute, Transport, build_transport_stages, capability_gap,
+    COLLECTIVES, COMBINE, FLOAT_ROWS, MMRS, Mc2Contract, PeerRoute, Transport, build_transport_stages, capability_gap,
     contract_fields, make_plan, topology_hops, validate_contract,
 )
+from .lowering import CCU, SHMEM, declared_incoming_routes
 
 _OPS_REVISION = "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946"
 _SKILLS_REVISION = "750045df251d031bf708de9dc1614c2202eed6dd"
@@ -83,9 +84,7 @@ SOURCES: tuple[SourceRef, ...] = (
 )
 
 
-SHMEM = "a5_shmem"
 MTE_WINDOW = "a5_mte"
-CCU = "a5_ccu"
 URMA_ALIGN_BYTES = 512
 MESH_RANK_LIMIT = 8
 ARCH_TRANSPORTS = frozenset({SHMEM, MTE_WINDOW, CCU})
@@ -164,6 +163,7 @@ def _transport(contract: Mc2Contract, op: OpSpec, ctx: OperatorPlanningContext) 
         slot_depth=depth, peer_limit=len(peers),
         ccu=abi == CCU, aiv_staging=abi == MTE_WINDOW,
         direct_remote_gm=abi == MTE_WINDOW and contract.abi == COMBINE,
+        incoming_routes=declared_incoming_routes(rank, peers, hops),
     )
 
 
@@ -187,9 +187,10 @@ class _Strategy:
             raise capability_gap(op, ctx, "unsupported_compute_architecture")
         contract = validate_contract(op, ctx)
         transport = _transport(contract, op, ctx)
-        ub_output = (contract.abi == MMRS and contract.world_size > 1
-                     and ctx.datapath.has_l0c_to_ub)
-        phases = build_transport_stages(contract, transport, ub_output=ub_output)
+        scatter = contract.abi == MMRS and contract.world_size > 1
+        temp_gm = scatter and contract.dtype in FLOAT_ROWS
+        ub_output = scatter and not temp_gm and ctx.datapath.has_l0c_to_ub
+        phases = build_transport_stages(contract, transport, ub_output=ub_output, temp_gm=temp_gm)
         return make_plan(contract, transport, phases, self.sources, arch_id=self.arch_id)
 
 

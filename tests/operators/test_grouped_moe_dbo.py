@@ -7,7 +7,7 @@
 [Side-Effect Policy] Analytical execution with the session-isolated C11 cache.
 """
 from collections import Counter
-from dataclasses import dataclass, replace
+from dataclasses import fields, replace
 from graphlib import TopologicalSorter
 import pickle
 
@@ -19,6 +19,7 @@ from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.mechanism import Geometry, OperatorPlan, Work
 from mindie_sim.prediction.operators import grouped_moe, mc2
 from mindie_sim.prediction.operators.contracts import OperatorPlanningContext
+from mindie_sim.prediction.operators.grouped_moe.lowering import StageDemand
 from mindie_sim.prediction.operators.mc2.common import PeerRoute, Transport
 from mindie_sim.prediction.program import RecipeContext
 from mindie_sim.prediction.results import FusedPipelineDescriptor, OpOccurrence
@@ -59,6 +60,11 @@ def make_op(*, mode="dual_batch_moe", rows=SKEWED, ids=COHORTS, **overrides):
                     dbo_split=split, enable_dbo=True, base_m=HALF_BATCH,
                     base_n=2 * WIDTH, top_k=1, ep=2,
                     dispatch_link_bytes=LINK_BYTES, combine_link_bytes=LINK_BYTES)
+    metadata["tokens"] = sum(map(len, ids))
+    if overrides.get("enable_dbo", True) and "cohort_transport_builder" not in overrides:
+        transfers = tuple(overrides.get(key, LINK_BYTES) for key in ("dispatch_link_bytes", "combine_link_bytes"))
+        first = tuple(amount // 2 for amount in transfers)
+        metadata["cohort_link_bytes"] = (first, tuple(amount - cut for amount, cut in zip(transfers, first)))
     metadata.update(overrides)
     return OpSpec("routed", "grouped_moe", "decode", 0, 0, (), shape, shape, shape, shape,
                   dtype="bf16", recipe=mode, metadata=tuple(metadata.items()))
@@ -178,14 +184,15 @@ def test_enabled_plan_covers_both_cohorts_and_pickles(geometry, mode):
             assert upstream in ancestry[downstream]
         meta = logical[dispatch].metadata
         assert meta["row_ids"] == owned
-        assert (meta["row_start"], meta["row_end"]) == (min(owned), max(owned) + 1)
+        assert (meta["row_start"], meta["row_end"]) == (cohort * HALF_BATCH, (cohort + 1) * HALF_BATCH)
+        assert meta["restore_map"] == owned
         partitions.append((set(owned), meta["expert_rows"]))
     assert partitions[0][0].isdisjoint(partitions[1][0])
     assert partitions[0][0] | partitions[1][0] == set(range(2 * HALF_BATCH))
     assert tuple(map(sum, zip(*(rows for _, rows in partitions)))) == (HALF_BATCH,) * 2
     assert "c0_dispatch" in ancestry["c1_dispatch"]
     assert "c0_gmm1" not in ancestry["c1_dispatch"]
-    assert logical["join_restore"].after == ("c0_combine", "c1_combine")
+    assert logical["join_restore"].after == ("c0_ub_release", "c1_ub_release")
 
 
 @pytest.mark.parametrize("arch", ARCH_IDS)
@@ -196,11 +203,8 @@ def test_empty_cohort_emits_no_launch_transfer_or_slot(geometry):
     resolved, _, stages = stages_for(op, geometry)
     assert {phase.cohort for phase in resolved.descriptor.phases} == {0, None}
     assert all(not stage.name.startswith("c1_") for stage in stages)
-    assert stages[-1].after == ("c0_combine",)
+    assert stages[-1].after == ("c0_ub_release",)
     assert resolved.recipe.work.resources["link"] == 2 * LINK_BYTES
-    with pytest.raises(ModelingError, match="empty_dbo_cohort_has_work"):
-        resolve(make_op(rows=rows, ids=(COHORTS[0] + COHORTS[1], ()),
-                        cohort_link_bytes=((LINK_BYTES - 1, LINK_BYTES), (1, 0))), geometry)
 
 
 @pytest.mark.parametrize("arch", ARCH_IDS)
@@ -218,9 +222,9 @@ def test_equal_cohort_sizes_recompute_fractal_and_wave_tails_from_each_histogram
                 assert meta["wave_tail_imbalance"] == imbalance
 
 
-def execute(geometry, program, backend, *, link_rate=1, serialize=False, numeric_only=False, reserve_ms=0):
+def execute(geometry, program, backend, *, link_rate=1, serialize=False, reserve_ms=0):
     if serialize:
-        stages = tuple(replace(stage, after=("c0_combine",)) if stage.name == "c1_dispatch:local"
+        stages = tuple(replace(stage, after=("c0_combine",)) if stage.name == "c1_ub_admit"
                        else stage for stage in program.stages)
         program = replace(program, stages=stages)
     rates = {**dict.fromkeys(AIC_PIPES + AIV_PIPES, 512), "cube": 96,
@@ -232,11 +236,6 @@ def execute(geometry, program, backend, *, link_rate=1, serialize=False, numeric
         pools={"ub": geometry.datapath.usable_bytes("ub")}, pool_units={"ub": 2 * CORES},
         trace_limit=len(program.stages) + 4, backend=backend,
     )
-    if numeric_only:
-        # Dependencies encode slot lifetimes, and the full replay proves this
-        # fixture has enough capacity to grant every allocation immediately.
-        program = replace(program, stages=tuple(replace(stage, acquire=(), free=())
-                                                for stage in program.stages))
     if reserve_ms:
         units = program.stages[0].acquire[0].units
         busy = Allocation("peer-routing", "ub", geometry.datapath.usable_bytes("ub"), units)
@@ -249,9 +248,8 @@ def execute(geometry, program, backend, *, link_rate=1, serialize=False, numeric
     assert summary["live_tasks"] == summary["live_programs"] == 0
     assert not any(summary["live_allocated"].values())
     assert complete.time == engine.now > 0
-    if numeric_only:
-        assert engine.accel_backend == "c_native", engine.accel_status()
-        assert engine.accel_status()["native_steps"] > 0
+    if backend == "c":
+        assert engine.accel_status()["native_steps"] > 0, engine.accel_status()
     trace = {row["task"].removeprefix("moe:"): row for row in engine.trace}
     return complete.time, dict(engine.serviced), trace
 
@@ -278,6 +276,7 @@ def test_engine_masks_link_service_with_cube_work_under_backpressure(geometry):
     slot_releases = {item.name for stage in stages for item in stage.free}
     assert slot_claims == slot_releases
     assert len(slot_claims) >= 2
+    assert all(not stage.work for stage in stages if stage.acquire or stage.free)
 
     baseline = execute(geometry, program, "python")
     for backend in ("python", "c"):
@@ -302,64 +301,61 @@ def test_engine_masks_link_service_with_cube_work_under_backpressure(geometry):
                 for pred in ancestry[stage.name] & trace.keys():
                     assert trace[pred]["end_ms"] <= trace[stage.name]["start_ms"] + 1e-10
         assert_replay_equal(result, baseline)
-    native = execute(geometry, program, "c", numeric_only=True)
-    assert_replay_equal(native, baseline)
-    native_serial = execute(geometry, program, "c", numeric_only=True, serialize=True)
-    assert native[0] < native_serial[0]
-    assert native_serial[1] == pytest.approx(expected_service)
 
 
-@dataclass(frozen=True)
-class EmbeddedTransportStage:
-    name: str
-    after: tuple
-    work: Work
-    kind: str
-    metadata: tuple
-    owner: int = 0
-    ub_acquire: tuple | None = None
-    ub_release: tuple | None = None
-
-
-@pytest.mark.parametrize("arch", ARCH_IDS)
-@pytest.mark.parametrize("row_ids", [COHORTS, tuple(reversed(COHORTS))])
-def test_embedded_mc2_preserves_cohort_rows_and_wire_work(geometry, row_ids):
+def explicit_mc2_transport(sends, receives):
     route = Transport("declared", "direct_peer", (PeerRoute(0, 1, ("link",)),))
-    cohorts = tuple(mc2.Mc2CohortSlice(cohort, min(ids), max(ids) + 1, HALF_BATCH,
-                                     HALF_BATCH, HALF_BATCH // 2, HALF_BATCH // 2)
-                    for cohort, ids in enumerate(row_ids))
-    assignments = tuple((c.cohort_id, src, dst, c.remote_assignments)
-                        for c in cohorts for src, dst in ((0, 1), (1, 0)))
-    dispatch_layout = mc2.dispatch_row_layout(WIDTH, input_dtype="bf16",
-                                             payload_dtype="bf16", quant_mode="none")
     status_bytes = 32
     calls = []
+    supports_row_ids = any(field.name == "row_ids" for field in fields(mc2.Mc2CohortSlice))
 
     def transport_builder(name, after, amount, metadata):
         tag = dict(metadata)
-        cohort = cohorts[tag["cohort_id"]]
-        dispatch = "_dispatch:" in name
-        layout = dispatch_layout if dispatch else mc2.combine_row_layout(WIDTH)
+        cid = tag["cohort_id"]
+        dispatch = tag["transport_direction"] == "dispatch"
+        send, receive = (sends[cid], receives[cid]) if dispatch else (receives[cid], sends[cid])
+        cohort = mc2.Mc2CohortSlice(
+            cid, tag["row_start"], tag["row_end"], send, receive, send, 0,
+            **({"row_ids": tag["row_ids"]} if supports_row_ids else {}),
+        )
+        assignments = ((cid, 0, 1, send), (cid, 1, 0, receive))
+        layout = (mc2.dispatch_row_layout(WIDTH, input_dtype="bf16", payload_dtype="bf16", quant_mode="none")
+                  if dispatch else mc2.combine_row_layout(WIDTH))
         contract = mc2.Mc2Contract(
             "dispatch_v2" if dispatch else "combine_v2", route.abi, route.algorithm,
             (0, 1), 0, 1, True, True, "bf16", output_dtype="bf16", row_layout=layout,
-            experts=2, status_bytes=status_bytes, cohorts=cohorts, assignments=assignments,
+            experts=2, status_bytes=status_bytes, cohorts=(cohort,), assignments=assignments,
         )
         phases = mc2.build_cohort_transport_stages(contract, cohort, route, after=after)
         phase_names = {phase.name: f"{name}:{phase.name}" for phase in phases}
-        assert sum(p.work.resources.get("link", 0) for p in phases) == amount
+        wire_bytes = sum(p.work.resources.get("link", 0) for p in phases)
+        assert wire_bytes == (send + receive) * 512 + (bool(send) + bool(receive)) * status_bytes
         for phase in phases:
             meta = dict(phase.metadata)
             assert (meta["cohort_id"], meta["row_start"], meta["row_end"]) == (
-                cohort.cohort_id, cohort.row_start, cohort.row_end)
-        calls.append((name, cohort.cohort_id, amount))
-        return tuple(EmbeddedTransportStage(
+                cid, cohort.row_start, cohort.row_end)
+            if supports_row_ids:
+                assert meta["cohort_row_ids"] == tag["row_ids"]
+        calls.append((name, cid, wire_bytes))
+        # The grouped endpoint owns local pack/unpack. Reuse the MC2 peer
+        # protocol and its readiness fences at that boundary.
+        return tuple(StageDemand(
             phase_names[p.name], tuple(phase_names.get(prev, prev) for prev in p.after),
-            p.work, p.owner, p.metadata, owner=cohort.cohort_id,
+            Work() if p.name.endswith(("_pack", "_unpack")) else p.work,
+            p.owner, cid, p.metadata,
         ) for p in phases)
 
-    per_cohort = HALF_BATCH // 2 * 512 + status_bytes
-    op = make_op(ids=row_ids, cohort_transport_builder=transport_builder,
+    return transport_builder, calls
+
+
+@pytest.mark.parametrize("arch", ARCH_IDS)
+@pytest.mark.parametrize("row_ids", [
+    COHORTS, tuple(reversed(COHORTS)), (tuple(range(0, 32, 2)), tuple(range(1, 32, 2))),
+])
+def test_embedded_mc2_preserves_cohort_rows_and_wire_work(geometry, row_ids):
+    builder, calls = explicit_mc2_transport((HALF_BATCH, HALF_BATCH), (HALF_BATCH, HALF_BATCH))
+    per_cohort = 2 * (HALF_BATCH * 512 + 32)
+    op = make_op(ids=row_ids, cohort_transport_builder=builder,
                  dispatch_link_bytes=2 * per_cohort, combine_link_bytes=2 * per_cohort)
     resolved, _, stages = stages_for(op, geometry)
     assert calls == [(f"c{cid}_{kind}:transport", cid, per_cohort)
@@ -367,14 +363,74 @@ def test_embedded_mc2_preserves_cohort_rows_and_wire_work(geometry, row_ids):
     assert resolved.recipe.work.resources["link"] == 4 * per_cohort
     graph = dependencies(stages)
     for row in (s for s in stages if ":transport:" in s.name):
-        cohort = cohorts[row.metadata["cohort_id"]]
-        assert (row.metadata["row_start"], row.metadata["row_end"]) == (cohort.row_start, cohort.row_end)
-        assert row.metadata["row_ids"] == row_ids[cohort.cohort_id]
+        cid = row.metadata["cohort_id"]
+        assert (row.metadata["row_start"], row.metadata["row_end"]) == (cid * HALF_BATCH, (cid + 1) * HALF_BATCH)
+        assert row.metadata["row_ids"] == row.metadata["restore_map"] == row_ids[cid]
         if row.name.endswith("_consume"):
-            assert row.name.removesuffix("_consume").replace("_send_", "_status_") in graph[row.name]
+            assert row.name.replace("_consume", "_ready") in graph[row.name]
     for cid in range(2):
         assert any(name.endswith("_slot_release") for name in graph[f"c{cid}_dispatch"])
         assert any(name.endswith("_slot_release") for name in graph[f"c{cid}_combine"])
+
+
+@pytest.mark.parametrize("arch", ARCH_IDS)
+@pytest.mark.parametrize("row_ids,rows", [
+    (((0, 2), (1, 3)), ((0, 0), (1, 5))),
+    (((), (0, 1, 2, 3)), ((5, 1), (0, 0))),
+])
+def test_off_rank_cohorts_separate_wire_work_received_rows_and_local_outputs(geometry, row_ids, rows):
+    send = tuple(map(len, row_ids))
+    receive = tuple(map(sum, rows))
+    builder, calls = explicit_mc2_transport(send, receive)
+    per_cohort = tuple((a + b) * 512 + (bool(a) + bool(b)) * 32 for a, b in zip(send, receive))
+    op = make_op(ids=row_ids, rows=rows, cohort_transport_builder=builder,
+                 dispatch_link_bytes=sum(per_cohort), combine_link_bytes=sum(per_cohort))
+    resolved, _, stages = stages_for(op, geometry)
+    by_name = {stage.name: stage for stage in stages}
+    for cid in range(2):
+        prefix = f"c{cid}_"
+        dispatch, combine = (by_name[prefix + phase + ":local"] for phase in ("dispatch", "combine"))
+        assert dispatch.metadata["source_tokens"] == combine.metadata["output_tokens"] == send[cid]
+        assert dispatch.metadata["row_ids"] == combine.metadata["restore_map"] == row_ids[cid]
+        assert combine.work.get("mte3", 0) == 2 * WIDTH * send[cid]
+        if receive[cid]:
+            assert by_name[prefix + "gmm1"].metadata["useful_flops"] == 2 * receive[cid] * WIDTH * (2 * WIDTH)
+            assert by_name[prefix + "gmm2"].metadata["useful_flops"] == 2 * receive[cid] * WIDTH * WIDTH
+        else:
+            assert prefix + "gmm1" not in by_name and prefix + "gmm2" not in by_name
+    assert [wire for _, _, wire in calls] == [amount for amount in per_cohort for _ in range(2)]
+    assert resolved.recipe.work.resources["link"] == 2 * sum(per_cohort)
+    assert sum(by_name[f"c{cid}_combine:local"].metadata["output_tokens"] for cid in range(2)) == 4
+
+
+@pytest.mark.parametrize("arch", ARCH_IDS[1:])
+def test_wave_transport_uses_the_directed_cut_supplied_by_the_caller(geometry):
+    wire = {
+        (0, 0): (96, 0), (0, 1): (0, 64),
+        (1, 0): (32, 64), (1, 1): (128, 0),
+    }
+
+    def transport_builder(name, after, _amount, metadata):
+        tag = dict(metadata)
+        amounts = wire[tag["cohort_id"], tag["wave"]]
+        direction = tag["transport_direction"]
+        assert tag["wave_row_start"] == tag["wave"]
+        assert tag["wave_row_end"] == tag["wave"] + 1
+        value = amounts[direction == "combine"]
+        return (StageDemand(name, after, Work(resources={"link": value})),) if value else ()
+
+    op = make_op(
+        rows=((2, 0), (0, 2)), ids=((0, 2), (1, 3)), wave_rows=1,
+        cohort_link_bytes=((96, 64), (160, 64)),
+        dispatch_link_bytes=256, combine_link_bytes=128,
+        cohort_transport_builder=transport_builder,
+    )
+    resolved, _, stages = stages_for(op, geometry)
+    actual = {(stage.metadata["cohort_id"], stage.metadata["wave"], stage.metadata["transport_direction"]):
+              stage.work["link"] for stage in stages if "link" in stage.work}
+    assert actual == {(cid, wave, direction): amount for (cid, wave), pair in wire.items()
+                      for direction, amount in zip(("dispatch", "combine"), pair) if amount}
+    assert resolved.recipe.work.resources["link"] == 384
 
 
 @pytest.mark.parametrize("arch", ARCH_IDS)

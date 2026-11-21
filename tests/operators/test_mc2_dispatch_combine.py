@@ -8,7 +8,6 @@
 """
 from collections import Counter
 from dataclasses import replace
-from math import ceil
 import pickle
 from types import SimpleNamespace
 
@@ -19,15 +18,12 @@ from _support.hardware import hardware_case, machine
 from mindie_sim import graph_costs, target_graphs
 from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.prediction.engine import Engine, Resource
-from mindie_sim.prediction.mc2_graph import NETWORK, lower, recipes, select
-from mindie_sim.prediction.mc2_phase import build as phase_build, contract
 from mindie_sim.prediction.mechanism import Geometry
 from mindie_sim.prediction.moe_token_partition import KIND, select as select_partition
 from mindie_sim.prediction.operators import mc2
 from mindie_sim.prediction.operators.contracts import OperatorPlanningContext
-from mindie_sim.prediction.operators.mc2_fullmesh import assignment_prefix_work, dispatch_layout, dispatch_plan
 from mindie_sim.prediction.operators.registry import FamilyDispatcher, FamilyRegistry
-from mindie_sim.prediction.program import KernelProgram, RecipeContext, Stage
+from mindie_sim.prediction.program import RecipeContext
 from mindie_sim.prediction.results import FusedPipelineDescriptor, OpOccurrence
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.public.errors import UnmodeledCapabilityError
@@ -40,7 +36,7 @@ GATHER, SCATTER, DISPATCH, COMBINE = (
 CLIENT, SIO_SWITCH, SHMEM, WINDOW, CCU = ("a2_hccl_client", "a3_sio_hccs", "a5_shmem", "a5_mte", "a5_ccu")
 CLIENT_BINDING = {"caller_abi": "hccl_client", "server_mode": "aiv"}
 FRAME, DATA, FLAG, ROW = 512, 480, 32, 240
-M, K, N = 20, 32, 48
+M, K, N = 24, 32, 48
 CHUNK_SETTINGS = dict(internal_chunks=2, independent_buffers=True, independent_handles=True)
 RELEASE, RATE, FAST = 7, 64000, 1e9
 ROLES = ("hbm", "l2", "mte2_aic", "mte2_aiv", "mte1", "mte3", "fixpipe", "vector", "link", "cube")
@@ -65,13 +61,10 @@ def lower_plan(op, geo, **modes):
                             service_modes=modes, datapath=geo.datapath)
     return mc2.build(op, geo), context
 
-def execute(program, rates, units, *, backend="python", external=None):
+def execute(program, rates, units, *, backend="python"):
     engine = Engine([Resource(r, rate, units=units[r]) for r, rate in rates.items()],
                     trace_limit=10000, backend=backend)
     ready = engine.submit("input", release=RELEASE)
-    if external:
-        engine.submit("rival", work={"scalar_ub_access": external},
-                      placement={"scalar_ub_access": (0,)}, release=RELEASE)
     done = program.start(engine, "call", ready)
     engine.advance(horizon=RELEASE - 1)
     assert not any(engine.serviced.values())
@@ -83,6 +76,9 @@ def execute(program, rates, units, *, backend="python", external=None):
 
 def stages(program):
     return {stage.name: stage for stage in program.stages}
+
+def timings(engine):
+    return {stage["task"].rsplit(":", 1)[-1]: stage for stage in engine.trace}
 
 def ancestors(graph, name):
     pending, seen = list(graph[name].after), set()
@@ -167,6 +163,36 @@ def test_die_routes_follow_placement_at_fixed_group_size(packages, expected):
     assert plan.metadata["transport_abi"] == SIO_SWITCH
     assert actual == dict(enumerate((*expected, "edge/pod"), 1))
 
+@pytest.mark.parametrize("hops", (("sio", "hccs_sw"), ("sio", "hccs_sw", "sio")))
+@pytest.mark.parametrize("physical", (False, True))
+def test_each_directed_hop_carries_the_full_transfer(hops, physical):
+    op = call(COMBINE, 2, width=ROW, transport_abi=SIO_SWITCH,
+              assignment_matrix={(1, 0): 2},
+              topology_hops={(0, 1): ("hccs_sw",), (1, 0): hops})
+    plan, ctx = lower_plan(op, geometry(DUAL_SKU, 2))
+    if physical:
+        ctx = replace(ctx, rates={**ctx.rates, "sio": RATE * 2, "hccs_sw": RATE},
+                      resource_names={**ctx.resource_names, "sio": "sio", "hccs_sw": "hccs_sw"},
+                      resource_units={**ctx.resource_units, "sio": 1, "hccs_sw": 1})
+    transfers = sorted((stage for stage in plan.program(ctx).stages if "hop_index" in stage.metadata),
+                       key=lambda stage: stage.metadata["hop_index"])
+    assert tuple(stage.metadata["physical_hop"] for stage in transfers) == hops
+    assert plan.work.resources["link"] == len(hops) * 2 * FRAME
+    assert transfers[-1].name == "cohort0_recv_link_1"
+    _, engine = execute(plan.lower(ctx), ctx.rates, ctx.resource_units)
+    trace = timings(engine)
+    for i, (stage, hop) in enumerate(zip(transfers, hops)):
+        resource = hop if physical else "link"
+        assert stage.work == {resource: 2 * FRAME}
+        assert stage.metadata["hop_bytes"] == 2 * FRAME
+        assert (stage.metadata["source_rank"], stage.metadata["destination_rank"]) == (1, 0)
+        if i:
+            prev = transfers[i - 1].name
+            assert stage.after == (prev,)
+            assert trace[stage.name]["start_ms"] >= trace[prev]["end_ms"]
+    assert trace["cohort0_unpack"]["start_ms"] >= trace[transfers[-1].name]["end_ms"]
+    assert sum(engine.serviced.get(role, 0) for role in ("link", "sio", "hccs_sw")) == len(hops) * 2 * FRAME
+
 @pytest.mark.parametrize("arch", ARCH_IDS)
 def test_foreign_transport_is_rejected_at_public_boundary(arch):
     sku = MESH_SKU if arch == ARCH_IDS[-1].values[0] else BASE_SKU
@@ -177,11 +203,11 @@ def test_foreign_transport_is_rejected_at_public_boundary(arch):
             mc2.build(call(DISPATCH, 1, width=ROW, transport_abi=transport), geo)
         assert failure.value.onboarding_hint["schema"] == "mindie-unmodeled-structure-hint/1"
 
-def test_direct_mesh_alignment_credits_and_shared_injection():
-    peers, credits = 8, 2
+@pytest.mark.parametrize("backend", ("python", "c"))
+def test_direct_mesh_alignment_and_active_peers_share_injection(backend):
+    peers = 8
     geo = geometry(MESH_SKU, peers)
-    fields = dict(transport_abi=SHMEM, width=ROW, status_bytes=0, peer_credits=credits,
-                  assignment_matrix={(src, dst): 1 for src in range(peers) for dst in range(peers)})
+    fields = dict(transport_abi=SHMEM, width=ROW, status_bytes=0)
     binding = {"caller_abi": "shmem", "window_offset_bytes": FRAME}
     for change, error in (({}, "shmem_caller"), ({**binding, "window_offset_bytes": 1}, "aligned_window")):
         with pytest.raises(UnmodeledCapabilityError, match=error):
@@ -189,25 +215,40 @@ def test_direct_mesh_alignment_credits_and_shared_injection():
     op = call(DISPATCH, peers, **fields, transport_binding=binding)
     with pytest.raises(UnmodeledCapabilityError, match="peer_capability"):
         mc2.build(op, replace(geo, datapath=replace(geo.datapath, ub_peer_edges=())))
-    injection = FRAME * 1000
-    plan, ctx = lower_plan(op, geo, mc2_injection=("link", injection), mc2_peer=("link", RATE * 1000))
-    graph = stages(plan.program(ctx))
-    send = [s for s in graph.values() if s.work.get("link")]
-    assert plan.metadata["window_alignment_bytes"] == FRAME
-    assert plan.metadata["peer_credits"] == credits
-    assert {(s.metadata["source_rank"], s.metadata["destination_rank"]) for s in send} == {(0, p) for p in range(1, peers)}
-    for i, s in enumerate(send):
-        assert s.work["link"] == 2 * FRAME
-        assert s.metadata["window_offset_bytes"] == FRAME
-        assert s.caps["link"] == pytest.approx(injection / 1000 / (peers - 1))
-        if i >= credits:
-            assert send[i - credits].name + "_consume" in s.after
-    elapsed, engine = execute(plan.lower(ctx), ctx.rates, ctx.resource_units)
-    assert engine.serviced["link"] == 2 * FRAME * (peers - 1)
-    assert elapsed >= engine.serviced["link"] / (injection / 1000)
+    for active in (1, peers - 1):
+        op = call(DISPATCH, peers, **fields, transport_binding=binding,
+                  assignment_matrix={(0, peer): 1 for peer in range(1, active + 1)})
+        plan, ctx = lower_plan(op, geo, mc2_injection=("link", RATE * 1000), mc2_peer=("link", RATE * 1000))
+        sends = [stage for stage in plan.program(ctx).stages if stage.work.get("link")]
+        assert plan.metadata["window_alignment_bytes"] == FRAME
+        assert plan.metadata["peer_credits"] == peers - 1
+        assert len(sends) == active
+        _, engine = execute(plan.lower(ctx), ctx.rates, ctx.resource_units, backend=backend)
+        trace = timings(engine)
+        assert len({trace[stage.name]["start_ms"] for stage in sends}) == 1
+        for stage in sends:
+            assert stage.work == {"link": 2 * FRAME} and stage.caps == {"link": RATE}
+            assert stage.metadata["window_offset_bytes"] == FRAME
+            transfer = trace[stage.name]
+            assert transfer["end_ms"] - transfer["start_ms"] == pytest.approx(active * 2 * FRAME / RATE)
+        assert engine.serviced["link"] == active * 2 * FRAME
     gemm = mc2.build(call(GATHER, peers, transport_abi=SHMEM, transport_binding=binding), geo)
     assert gemm.metadata["peer_payload_bytes"] == (peers - 1) * M * K * 2 / peers
     assert gemm.work.resources["link"] == (peers - 1) * FRAME
+
+def test_credits_gate_each_peer_window():
+    plan, ctx = lower_plan(call(DISPATCH, 4, width=ROW, peer_credits=2,
+                                assignment_matrix={(0, peer): 1 for peer in range(1, 4)}),
+                           geometry(MESH_SKU, 4))
+    graph = stages(plan.program(ctx))
+    assert "cohort0_status_1" not in ancestors(graph, "cohort0_send_2")
+    assert "cohort0_status_1" in ancestors(graph, "cohort0_send_3")
+    assert "cohort0_status_3" in ancestors(graph, "cohort0_slot_release")
+
+@pytest.mark.parametrize("credits", (0, True, -2))
+def test_invalid_peer_credit_limit_is_rejected(credits):
+    with pytest.raises(UnmodeledCapabilityError, match="invalid_peer_credit_limit"):
+        mc2.build(call(DISPATCH, 2, width=ROW, peer_credits=credits), geometry(MESH_SKU, 2))
 
 @pytest.mark.parametrize("abi,operation", ((DISPATCH, "write_nbi"), (COMBINE, "read_nbi")))
 @pytest.mark.parametrize("transport", (WINDOW, CCU))
@@ -219,12 +260,17 @@ def test_window_publication_and_consumption_precede_reuse(abi, operation, transp
               cohort_assignment_matrices={part.cohort_id: matrix for part in groups})
     plan, ctx = lower_plan(op, geometry(MESH_SKU, 2))
     graph = stages(plan.program(ctx))
-    send, visible, status, consume = (graph["cohort0_" + name] for name in
-                                      ("send_1", "send_1_ready", "status_1", "send_1_consume"))
-    packet = FRAME * (1 if abi == COMBINE else 2)
-    assert visible.after == (send.name,) and visible.work == {"hbm": packet}
-    assert status.after == (visible.name,) and status.work == {"link": FLAG}
-    assert consume.after == (status.name,) and consume.work == {"hbm": packet, "mte2_aiv": packet}
+    send, recv, visible, consume = (graph["cohort0_" + name] for name in
+                                    ("send_1", "recv_link_1", "recv_1_ready", "recv_1_consume"))
+    packet = FRAME * (1 if abi == COMBINE else 2) if transport == WINDOW else (
+        ROW * 2 if abi == COMBINE else FRAME)
+    status_bytes = FLAG if transport == WINDOW else (FRAME if abi == DISPATCH else 0)
+    if status_bytes:
+        status = graph["cohort0_status_1"]
+        assert status.after == (send.name,) and status.work == {"link": status_bytes}
+    assert recv.work == {"link": packet + status_bytes}
+    assert visible.after == (recv.name,) and visible.work == {"hbm": packet}
+    assert consume.after == (visible.name,) and consume.work == {"hbm": packet, "mte2_aiv": packet}
     assert consume.name in ancestors(graph, "cohort0_slot_release")
     assert "cohort0_slot_release" in graph["cohort1_pack"].after
     assert send.work == {"link": packet}
@@ -267,221 +313,122 @@ def test_cohort_helper_passes_parent_dependencies_and_preserves_directed_counts(
         cohorts=(part,), assignments=((1, 0, 0, 1), (1, 0, 1, 2), (1, 1, 0, 1)), status_bytes=FLAG)
     transport = SimpleNamespace(routes=(SimpleNamespace(source=0, destination=1, hops=("UB_WINDOW",)),),
         aiv_staging=True, credits=1, peer_bytes=lambda n: n, peer_limit=1, window_alignment=1,
-        window_offset=0, direct_remote_gm=False, ccu=False)
+        window_offset=0, direct_remote_gm=False, ccu=False, abi=WINDOW, incoming_routes=())
     cohort = {p.name: p for p in mc2.build_cohort_transport_stages(
         ledger, part, transport, after=("router",), peer_after=("prior_slot",))}
     assert cohort["cohort1_pack"].after == ("router",)
     assert cohort["cohort1_send_1_stage_ub"].after == ("cohort1_pack", "prior_slot")
     assert cohort["cohort1_send_1"].work.resources == {"link": 4 * FRAME}
-    assert cohort["cohort1_send_1_ready"].work.resources == {"hbm": 2 * FRAME}
+    assert cohort["cohort1_recv_link_1"].after == ("router", "prior_slot")
+    assert cohort["cohort1_recv_1_ready"].work.resources == {"hbm": 2 * FRAME}
     assert cohort["cohort1_unpack"].work.resources["mte3"] == 3 * (DATA + 12)
 
-def phase_inputs(phase, *, kind="dispatch", tokens=1, top_k=8, units=64, experts=16,
-                 ep=8, received=None, width=ROW, roles=(), issue_units=None, supply=1, copy_units=None, rate=RATE):
-    counts = tokens * top_k
-    other = counts if received is None else received
-    raw = dict(kind=kind, width=width, dtype="bf16", source_tokens=tokens, top_k=top_k,
-               source_assignments=counts if kind == "dispatch" else other,
-               received_assignments=other if kind == "dispatch" else counts, experts=experts, ep=ep, phase=phase)
-    op = replace(call(DISPATCH, 1), family="mc2_protocol", recipe="", metadata=(("mc2_phase", raw),))
-    physical = dict(hbm=1, mte2_aiv=copy_units or units, mte3=copy_units or units, vector=units)
-    physical.update(dict.fromkeys(roles, issue_units or units))
-    rates = dict(hbm=max(FAST, rate), mte2_aiv=rate * supply, mte3=rate * supply, vector=rate * supply)
-    rates.update({r: supply * physical[r] for r in roles})
-    context = RecipeContext(op, {}, {r: r for r in rates}, rates, units, resource_units=physical)
-    return raw, op, Geometry(units, physical), context
-
-def run_phase(phase, *, external=None, **kwargs):
-    raw, op, geo, ctx = phase_inputs(phase, **kwargs)
-    plan = phase_build(op, geo)
-    span, engine = execute(plan.lower(ctx), ctx.rates, ctx.resource_units, external=external)
-    expected = Counter(plan.work.resources)
-    if external:
-        expected["scalar_ub_access"] += external
-    assert +Counter(engine.serviced) == pytest.approx(+expected)
-    return span, engine, plan, {p.name: p for p in contract(raw, geo.compute_units).phases}
-
-PREFIX_FACTOR, STATUS_WORK = 5, 9
-ISSUE = ("scalar_ub_access", "scalar_alu_issue", "pipe_barrier")
-
-@pytest.mark.parametrize("tokens,top_k,units", ((0, 8, 64), (1, 8, 56), (2, 3, 8),
-                                               (4, 8, 64), (17, 5, 16), (128, 8, 56)))
-def test_strided_prefix_and_instruction_work_follow_assignment_indices(tokens, top_k, units):
-    def oracle(owners):
-        expected = dict.fromkeys(range(owners), 0)
-        for index in range(top_k, tokens * top_k):
-            expected[index % owners] += PREFIX_FACTOR * index - 1
-        return expected
-
-    assert dict(assignment_prefix_work(tokens, top_k, tokens * top_k, tuple(range(units)))) == oracle(units)
-    _, engine, plan, phases = run_phase("send_read_quantize", tokens=tokens, top_k=top_k, units=units)
-    count = phases["count_compute"]
-    count_owners = len(count.owner_domain)
-    payload = phases["send_read_quantize"]
-    assert set(count.owner_domain).isdisjoint(payload.owner_domain)
-    assert set(count.owner_domain + payload.owner_domain) == set(range(units))
-    expected = oracle(len(payload.owner_domain))
-    assert engine.serviced["vector"] == pytest.approx(sum(expected.values()))
-    assert engine.serviced["hbm"] == pytest.approx(tokens * top_k * DATA)
-    assert dict(count.work)["vector"] == count_owners * STATUS_WORK * 16
-    for owner in plan.metadata["active_owner_domain"]:
-        own = [r for r in engine.trace if f"owner{owner}:" in r["task"]]
-        for scan in (r for r in own if r["task"].endswith(":assignment_prefix_scan")):
-            assert scan["end_ms"] - scan["start_ms"] == pytest.approx(expected[owner] * units / RATE)
-            assert next(r for r in own if r["task"].endswith(":read"))["start_ms"] >= scan["end_ms"]
-    _, priced, plan, _ = run_phase("send_read_quantize", tokens=tokens, top_k=top_k, units=units, roles=ISSUE)
-    scanned = max(0, (tokens - 1) * top_k)
-    assert priced.serviced["scalar_ub_access"] == pytest.approx(tokens * top_k + scanned)
-    assert priced.serviced["pipe_barrier"] == pytest.approx(4 * scanned)
-    for owner, entries in plan.metadata["primitive_services"]["owners"].items():
-        indices = range(owner, tokens * top_k, len(payload.owner_domain))
-        scanned_owner = sum(index >= top_k for index in indices)
-        assert sum(x["counts"].get("scalar_ub_access", 0) for x in entries.values()) == len(indices) + scanned_owner
-
-def test_retained_counts_do_not_invent_prefix_indices_and_large_scans_stay_compact():
-    row = dispatch_layout(ROW)
-    for tokens, retained in ((2, 3), (2, .5), (.5, 4)):
-        plan = dispatch_plan(row, source_tokens=tokens, top_k=8, source_assignments=retained,
-                             received_assignments=8, experts=16, ep=8, aiv_count=64)
-        phase = next(p for p in plan.phases if p.name == "send_read_quantize")
-        assert dict(phase.details)["assignment_prefix_scan"]["owner_vector_work"] is None
-        assert dict(phase.work)["hbm"] == retained * DATA
-        assert any("retained valid assignment indices" in item for item in plan.unmodeled_features)
-    results = [run_phase("send_read_quantize", tokens=4096, supply=f) for f in (.5, 1, 2)]
-    assert results[0][0] > results[1][0] > results[2][0]
-    for _, engine, _, _ in results:
-        assert engine.summary()["completed_tasks"] < 4 * 64
-        assert engine.serviced["vector"] == sum(PREFIX_FACTOR * i - 1 for i in range(8, 4096 * 8))
-    plan = run_phase("send_read_quantize", tokens=4)[2]
-    entries = [x for owner in plan.metadata["primitive_services"]["owners"].values() for x in owner.values()]
-    assert sum(x["unpriced_service_work"].get("scalar_ub_access", 0) for x in entries) == 56
-
-@pytest.mark.parametrize("experts,units,ep,owners", ((16, 4, 4, 1), (100, 16, 4, 6), (384, 64, 32, 8)))
-def test_idle_senders_publish_counts_and_prefix_to_every_owner(experts, units, ep, owners):
-    opts = dict(tokens=0, experts=experts, units=units, ep=ep, roles=ISSUE)
-    _, counts, _, phases = run_phase("count_compute", **opts)
-    _, prefix, _, _ = run_phase("prefix_counts", **opts)
-    assert counts.serviced["scalar_ub_access"] == experts
-    assert counts.serviced["pipe_barrier"] == owners
-    assert prefix.serviced["scalar_alu_issue"] == experts
-    assert prefix.serviced["scalar_ub_access"] == pytest.approx(2 * experts + 4 * owners + 2 * (owners - 1))
-    assert prefix.serviced["pipe_barrier"] == 2 * owners - 1
-    assert not any(dict(phases["routing_metadata"].work).values())
-    assert dict(phases["receive_counts"].work)["mte3"] == (experts + owners**2) * FLAG
-    assert dict(phases["prefix_counts"].work)["mte3"] == (owners**2 + owners * units) * FLAG + (units + 1) * experts * 4
-    assert dict(phases["prefix_ready"].work)["mte2_aiv"] == owners * units * FLAG
-    assert dict(phases["receive_metadata"].work)["mte2_aiv"] == units * experts * 4
-    assert dict(phases["expert_counts"].work)["mte3"] == experts // ep * 8
-    assert dict(phases["count_status_exchange"].work) == {"mte3": experts * FLAG, "hbm": experts * FLAG}
-
-@pytest.mark.parametrize("tokens,top_k,width", ((1, 1, ROW), (3, 8, ROW), (65, 3, ROW), (1, 8, 3584)))
-def test_successful_flag_poll_is_ordered_and_separate_from_slot_payload(tokens, top_k, width):
-    opts = dict(kind="combine", tokens=tokens, top_k=top_k, width=width)
-    span, engine, plan, phases = run_phase("receive_flags", **opts)
-    blocks = ceil(width * 2 / DATA)
-    compared = ceil(top_k * blocks * 8 / 64) * 64
-    assert engine.serviced["vector"] == tokens * 2 * compared
-    assert engine.serviced["mte2_aiv"] == pytest.approx(tokens * top_k * blocks * FLAG)
-    details = plan.metadata["source_service_details"]
-    assert set(details["scalar_instruction_counts"].values()) == {tokens * compared // 64}
-    assert span == pytest.approx(ceil(tokens / 64) * (2 * compared + top_k * blocks * FLAG) / (RATE / 64))
-    own = [r for r in engine.trace if "owner0:" in r["task"]]
-    init, read, check = (next(r for r in own if r["task"].endswith(":" + s))
-                         for s in ("initialize_flags", "read_flags", "compare_flags"))
-    assert init["end_ms"] <= read["start_ms"] <= read["end_ms"] <= check["start_ms"]
-    assert not phases["receive_slots"].work
-    assert dict(phases["weighted_reduce"].work)["mte2_aiv"] == tokens * top_k * (4 + blocks * DATA)
-    assert phases["clear_data_flags"].after == ("weighted_reduce",)
-    assert dict(phases["publish_output"].work)["mte3"] == tokens * width * 2
-
-@pytest.mark.parametrize("tokens,units", ((1, 2), (1.25, 2), (3, 2), (8.75, 4), (65, 64), (257, 2)))
-def test_token_reduction_matches_eager_arithmetic_and_bounds_live_work(tokens, units):
-    top_k = 3
-    _, op, geo, ctx = phase_inputs("weighted_reduce", kind="combine", tokens=tokens, top_k=top_k, units=units)
-    lazy, engine = execute(phase_build(op, geo).lower(ctx), ctx.rates, ctx.resource_units)
-    eager = []
-    active = min(units, ceil(tokens))
-    base, tail = divmod(tokens, active)
-    for owner in range(active):
-        rows = base + min(1, max(0, tail - owner))
-        previous = ()
-        terms = [("mte2_aiv", rows * top_k * 4)]
-        for token in range(ceil(rows)):
-            fraction = min(1, rows - token)
-            terms += [("vector", fraction * ROW)]
-            terms += [("mte2_aiv", fraction * DATA), *(("vector", fraction * ROW),) * 3] * top_k
-        for index, (role, amount) in enumerate(terms):
-            demand = {role: amount, **({"hbm": amount} if role == "mte2_aiv" else {})}
-            name = f"owner{owner}:{index}"
-            eager.append(Stage(name, demand, after=previous, placement=ctx.owned(owner, units, (role,))))
-            previous = (name,)
-    expected, control = execute(KernelProgram(tuple(eager)), ctx.rates, ctx.resource_units)
-    assert lazy == pytest.approx(expected, abs=1e-11)
-    assert +Counter(engine.serviced) == pytest.approx(+Counter(control.serviced))
-    assert engine.serviced["vector"] == tokens * (3 * top_k + 1) * ROW
-    if tokens > 100:
-        assert engine.summary()["peak_live_tasks"] < 100
-        assert control.summary()["peak_live_tasks"] > 1000
-
-def test_scalar_pipe_contention_and_local_copy_obey_physical_owner_supply():
-    opts = dict(kind="combine", tokens=2, top_k=3, units=4, issue_units=2, roles=ISSUE[:1], rate=1e12)
-    ordinary, _, _, _ = run_phase("weighted_reduce", **opts)
-    rival, engine, _, _ = run_phase("weighted_reduce", **opts, external=6)
-    assert ordinary == pytest.approx(6, abs=1e-6) and rival == pytest.approx(9, abs=1e-6)
-    assert next(row for row in engine.trace if row["task"] == "rival")["end_ms"] == pytest.approx(19)
-    assert all(row["placement"]["scalar_ub_access"] == (0,) for row in engine.trace if "primitive" in row["task"])
-    for factor in (.5, 1, 2):
-        span, _, plan, _ = run_phase("receive_local_copy", received=1, supply=factor)
-        assert span == pytest.approx((2 * DATA + DATA + 12) / (1000 * factor))
-        assert plan.metadata["active_owner_domain"] == (0,)
-
-def test_phase_templates_snapshot_geometry_and_bind_fresh_rates():
-    raw, op, geo, ctx = phase_inputs("weighted_reduce", kind="combine", tokens=8, top_k=6, width=5120, roles=ISSUE)
-    plan = phase_build(op, geo)
-    assert phase_build(replace(op, op_id="another_layer", layer=1), geo) is plan
-    slow, engine = execute(plan.lower(ctx), ctx.rates, ctx.resource_units)
-    faster = replace(ctx, rates={role: value * 2 for role, value in ctx.rates.items()})
-    fast, replay = execute(plan.lower(faster), faster.rates, faster.resource_units)
+def test_cohort_plan_is_compact_and_rebinds_service_rates():
+    width, rows = 481, 4096
+    cells = {(0, 1): 1}
+    op = call(DISPATCH, 2, width=width, payload_dtype="int8", quant_mode="per_token",
+              assignment_matrix=cells)
+    geo = geometry(MESH_SKU, 2)
+    small, ctx = lower_plan(op, geo)
+    cells[0, 1] = rows
+    large = mc2.build(op, geo)
+    assert tuple(stages(large.program(ctx))) == tuple(stages(small.program(ctx)))
+    assert large.metadata["peer_payload_bytes"] == rows * small.metadata["peer_payload_bytes"]
+    assert large.work.resources["vector"] == rows * 7 * width
+    assert small.work.resources["vector"] == 7 * width
+    slow, before = execute(large.lower(ctx), ctx.rates, ctx.resource_units)
+    fast_ctx = replace(ctx, rates={role: rate * 2 for role, rate in ctx.rates.items()})
+    fast, after = execute(large.lower(fast_ctx), fast_ctx.rates, fast_ctx.resource_units)
     assert slow == pytest.approx(2 * fast)
-    assert engine.serviced == pytest.approx(replay.serviced)
-    raw.update(source_tokens=16, source_assignments=96, received_assignments=96)
-    assert phase_build(op, geo).work.resources["hbm"] == 2 * plan.work.resources["hbm"]
-    entry = next(iter(plan.metadata["primitive_services"]["owners"][0].values()))
-    with pytest.raises(TypeError):
-        entry["counts"]["scalar_ub_access"] = 0
-    smaller = phase_build(op, Geometry(4, {r: 4 for r in ROLES if r != "cube"}))
-    assert len(smaller.metadata["active_owner_domain"]) == 4
-    bounded = replace(op, metadata=(("mc2_phase", dict(raw, source_tokens=1_000_000.25,
-                    source_assignments=6_000_001.5, received_assignments=6_000_001.5)),))
-    compact = phase_build(bounded, geo).program(ctx)
-    tiles = [s.program for s in compact.stages if s.program is not None]
-    assert len(tiles) == 64
-    assert all(p.tile(0) is p.tile(p.count // 2) for p in tiles)
-    assert sum(p.tile(0) is not p.tile(p.count - 1) for p in tiles) == 1
+    assert after.serviced == pytest.approx(before.serviced)
+
+@pytest.mark.parametrize("backend", ("python", "c"))
+@pytest.mark.parametrize("transport", (WINDOW, CCU))
+def test_receive_only_rank_waits_for_incoming_transfer(backend, transport):
+    geo = geometry(MESH_SKU, 2)
+    part = mc2.Mc2CohortSlice(3, 0, 0, 0, 2, 0, 0)
+    op = call(DISPATCH, 2, width=4096, transport_abi=transport, cohort_slices=(part,),
+              assignment_matrix=((0, 0), (2, 0)))
+    plan, ctx = lower_plan(op, geo)
+    graph = stages(plan.program(ctx))
+    _, engine = execute(plan.lower(ctx), ctx.rates, ctx.resource_units, backend=backend)
+    if backend == "c":
+        assert engine.summary()["native_steps"] > 0
+    trace = timings(engine)
+    recv = graph["cohort3_recv_link_1"]
+    payload, status = (2 * 4096 * 2, FRAME) if transport == CCU else (2 * 18 * FRAME, FLAG)
+    assert plan.metadata["peer_payload_bytes"] == 0
+    assert recv.work["link"] == engine.serviced["link"] == payload + status
+    assert (recv.metadata["source_rank"], recv.metadata["destination_rank"]) == (1, 0)
+    assert (recv.metadata["payload_bytes"], recv.metadata["status_bytes"]) == (payload, status)
+    assert all("_send_" not in name and "_status_" not in name for name in graph)
+    for name in ("cohort3_recv_1_ready", "cohort3_recv_1_consume", "cohort3_unpack"):
+        assert recv.name in ancestors(graph, name)
+        assert trace[name]["start_ms"] >= trace[recv.name]["end_ms"]
+
+@pytest.mark.parametrize("backend", ("python", "c"))
+def test_interleaved_cohorts_use_exact_rows_and_restore_order(backend):
+    slices = (mc2.Mc2CohortSlice(5, 0, 3, 2, 0, 2, 0, row_ids=(0, 2)),
+              mc2.Mc2CohortSlice(9, 1, 4, 2, 0, 2, 0, row_ids=(1, 3)))
+    routes = tuple(dict(cohort_id=part.cohort_id, source_rank=0, destination_rank=1,
+                        source_token_id=row, top_k_slot=0, destination_expert=1)
+                   for part in slices for row in part.row_ids)
+    geo = geometry(MESH_SKU, 2)
+    forward = call(DISPATCH, 2, width=ROW, routes=routes, cohort_slices=slices)
+    plan, ctx = lower_plan(forward, geo)
+    _, engine = execute(plan.lower(ctx), ctx.rates, ctx.resource_units, backend=backend)
+    trace = timings(engine)
+    for part in slices:
+        sent = trace[f"cohort{part.cohort_id}_send_1"]["metadata"]
+        assert sent["cohort_row_ids"] == sent["cohort_restore_map"] == part.row_ids
+        assert sent["cohort_compact_indices"] == (0, 1)
+    assert trace["cohort9_pack"]["start_ms"] >= trace["cohort5_slot_release"]["end_ms"]
+    returns = tuple(replace(part, source_assignments=0, remote_assignments=0, received_assignments=2)
+                    for part in slices)
+    backward = mc2.build(call(COMBINE, 2, width=ROW, routes=routes, cohort_slices=returns), geo)
+    outputs = {p.phase_id: next(w.amount for w in p.work if w.resource == "mte3")
+               for p in backward.pipeline_spec.phases if p.phase_id.endswith("_unpack")}
+    assert outputs == dict.fromkeys(("cohort5_unpack", "cohort9_unpack"), 2 * ROW * 2)
+    wrong = ({**routes[0], "source_token_id": 1}, routes[1], {**routes[2], "source_token_id": 0}, routes[3])
+    with pytest.raises(ModelingError, match="source_token_outside_cohort"):
+        mc2.build(call(DISPATCH, 2, width=ROW, routes=wrong, cohort_slices=slices), geo)
+    overlap = (slices[0], replace(slices[1], row_ids=(2, 3)))
+    with pytest.raises(ModelingError, match="overlapping_cohort_rows"):
+        mc2.build(call(DISPATCH, 2, width=ROW, routes=routes, cohort_slices=overlap), geo)
+
+@pytest.mark.parametrize("row_ids", ((-1,), (0, 0), (True,), (0.5,), None))
+def test_cohort_rejects_invalid_token_ids(row_ids):
+    with pytest.raises(ModelingError, match="row_id"):
+        mc2.Mc2CohortSlice(0, 0, 2, 0, 0, 0, 0, row_ids=row_ids)
+
+@pytest.mark.parametrize("abi", (GATHER, SCATTER))
+@pytest.mark.parametrize("shape", ({"m": 3}, {"m": 4, "gathered_bytes": 6},
+                                   {"m": 8, "gathered_bytes": 4, "internal_chunks": 2}))
+def test_collectives_require_integer_shard_rows_and_bytes(abi, shape):
+    with pytest.raises(ModelingError, match="^mc2_uneven_shard_not_integer$"):
+        mc2.build(call(abi, 4, **shape), geometry(MESH_SKU, 4))
+
+def test_reduce_scatter_publishes_temp_gm_before_hccl_reads():
+    geo = geometry(MESH_SKU, 4)
+    assert geo.datapath.has_l0c_to_ub
+    plan, ctx = lower_plan(call(SCATTER, 4), geo)
+    graph = stages(plan.program(ctx))
+    gemm, read, link = (graph[name] for name in ("gemm_chunk0", "rs_chunk0_hccl_read", "rs_chunk0_peer_1"))
+    assert gemm.work["fixpipe"] == M * N * 2
+    assert gemm.work["hbm"] == (M * K + K * N + M * N) * 2
+    assert read.work["hbm"] == 3 * (M // 4) * N * 2
+    assert link.work["link"] == (M // 4) * N * 2
+    assert gemm.name in ancestors(graph, read.name)
+    assert read.name in ancestors(graph, link.name)
+    _, engine = execute(plan.lower(ctx), ctx.rates, ctx.resource_units)
+    trace = timings(engine)
+    assert trace[gemm.name]["end_ms"] <= trace[read.name]["start_ms"]
+    assert trace[read.name]["end_ms"] <= trace[link.name]["start_ms"]
 
 NORMAL = {"kind": "arch35_fullmesh", "dispatch_quant": "none"}
 V2_NATIVE = {"kind": "arch22_v2_caller", "dispatch_quant": "per_token_int8",
              "max_inflight_per_rank": 2, "global_bs": 6}
 
-@pytest.mark.parametrize("window", (None, 4))
-def test_protocol_selection_keeps_explicit_credit_override(window):
-    choice = dict(NORMAL) if window is None else dict(NORMAL, max_inflight_per_rank=window)
-    declaration = {"native_moe_protocol": choice}
-    assert select(declaration) == choice
-    assert recipes(declaration)[NETWORK].max_inflight_per_rank == window
-    assert select({"native_moe_protocol": V2_NATIVE}) == V2_NATIVE
-    with pytest.raises(ModelingError):
-        lower([], runtime=SimpleNamespace(kernels=declaration, moe_recipe="alltoall"),
-              prefix="p", tokens=1, top_k=2, width=ROW, experts=16, ep=1,
-              source_partitions=1, received_assignments=2, dtype="bf16")
-
-@pytest.mark.parametrize("value", (0, True, -2))
-def test_invalid_native_peer_window_is_rejected(value):
-    for invalid in (dict(NORMAL, max_inflight_per_rank=value), dict(NORMAL, extra=1),
-                    dict(NORMAL, dispatch_quant="int4"), dict(V2_NATIVE, dispatch_quant="none"),
-                    {"kind": "unknown"}):
-        with pytest.raises(ModelingError):
-            select({"native_moe_protocol": invalid})
 
 def caller_case(tp=1, dp=2, protocol=NORMAL):
     raw = hardware_case()

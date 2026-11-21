@@ -2,37 +2,25 @@
 
 [Role] Derive arithmetic, ownership, and memory traffic from caller geometry.
 [Invariants] The same phase graph prepares work, describes it, and lowers it
-  to the Engine. L2 reuse is local to an invocation's ordered history passes.
+  to the Engine. AttnRes schedules each token's passes on its AIV owner.
 [Timeouts & Locks] Bounded by physical owners and operator phases. No locks.
-[Side-Effect Policy] No external I/O or device runtime. Cache admission is
-  evaluated in a fresh analytical view for each plan or lowering.
+[Side-Effect Policy] No external I/O or device runtime. Live memory admission
+  occurs only during Engine execution.
 """
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, fields
 from typing import Literal
 
-from mindie_sim.public.errors import UnmodeledCapabilityError
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.datapath import ArchId, SourceRef
 from mindie_sim.schema.operators import OpSpec
 from ...mechanism import OperatorPlan, Work
-from ...ownership import unit_group
-from ...program import KernelProgram, RecipeContext, Stage
-from ...results import FusedPipelineSpec, PipelinePhase, WorkItem
-from ...runtime.memory_physics import (
-    DEFAULT_SECTOR_BYTES,
-    AddressRun,
-    AddressRunPlan,
-    AdmissionMemoryView,
-    HbmBusSpec, MemoryAccessPattern,
-    ReuseKey,
-    VisibilityContract, bind_memory_access,
-)
+from ...runtime.memory_physics import AddressRun, AddressRunPlan, ReuseKey
 from ..contracts import OperatorPlanningContext
+from .lowering import FAMILY, PhaseGraph, gap
 
-FAMILY = "hyper_connections"
 ARCH22 = ArchId("npu_arch_2201")
 ARCH35 = ArchId("npu_arch_3510")
 FP32_BYTES = 4
@@ -40,13 +28,14 @@ RESIDUAL_RANK = 3
 RMS_SCALAR_OPS = 3
 MHC_COEFFICIENT_SCALARS = 3
 ENGRAM_PRODUCT_OPS_PER_ELEMENT = 5
-# Two inverse RMS values and their scaled dot, signed root with clamp, then sigmoid and mask.
-ENGRAM_GATE_SCALAR_OPS = 20
+# Two inverse RMS values and their scaled dot, signed root with clamp, then sigmoid.
+ENGRAM_GATE_SCALAR_OPS = 19
 ATTNRES_SOFTMAX_OPS_PER_ROW = 5
 HC_SINKHORN_STREAMS = 4
 SINKHORN_DEFAULT_ITERS = 20
 SINKHORN_INIT_ENTRY_OPS = 3
 SILU_OPS_PER_ELEMENT = 4
+SIGMOID_OPS_PER_ELEMENT = 4
 MHC_COLLAPSE_MAX_ROWS = 72
 TEXT_GATED_EZ1008_MIN_ROWS = 513
 TEXT_GATED_LARGE_MIN_ROWS = 512
@@ -58,8 +47,19 @@ TEXT_GATED_SMALL_RANK_ALIGNMENT = 64
 TEXT_GATED_SMALL_MAX_RANK = 896
 TEXT_GATED_TASK_ALIGNMENT = 32
 TEXT_GATED_FULL_TASK_ROWS = 128
-ATTNRES_UB_OVERHEAD_BYTES = 16384
+SMALL_M_THRESH_A2 = 1024
+TEXT_GATED_A2_C0_TILE_N = 64
+TEXT_GATED_A2_C1_TILE_N = 256
+TEXT_GATED_C0_TILE_K = 512
+TEXT_GATED_C0_SPLITK_LIMIT = 5
+TEXT_GATED_C0_BASIC_SPLITK = True
+TEXT_GATED_C0_CROSS_SPLITK = False
+ATTNRES_UB_OVERHEAD_BYTES = 32 * 1024
+ATTNRES_UB_ALIGNMENT_BYTES = 32
+ATTNRES_FP32_VECTOR_LANES = 64
+ATTNRES_FP32_ALIGNED_SCRATCH_ROWS = 3
 ATTNRES_FP32_SCRATCH_ROWS = 4
+UINT32_MAX = (1 << 32) - 1
 ENGRAM_REDUCTIONS = 3
 ENGRAM_CHUNK_BYTES_PER_ELEMENT = 12
 
@@ -71,10 +71,20 @@ VLLM_CALLER_SOURCES: tuple[SourceRef, ...] = (
               "b77dc41317386e5ac4d9b6b71e9ef5249c52895b5d37163c54b0cd603ff4c361"),
     SourceRef("vllm-ascend", VLLM_REVISION, "csrc/attention/attn_res_fwd/op_host/attn_res_fwd_legacy_plan.h",
               "47c863f70950dcc4ca833aa2e5d2db2cfdb980e4c6475198ee0711d74d3149c3"),
+    SourceRef("vllm-ascend", VLLM_REVISION, "csrc/attention/attn_res_fwd/op_kernel/attn_res_fwd_ub_layout.h",
+              "b1898c8cc2d84fd4e66573623198fbac395fec58a802f9dd6028927aa229daff"),
     SourceRef("vllm-ascend", VLLM_REVISION, "csrc/attention/attn_res_fwd/op_kernel/arch35/attn_res_fwd_reload.h",
               "46b3a1fcec42b5bac511021d1059b4e91ddbb78426563b5a0343d1a9e73db611"),
     SourceRef("vllm-ascend", VLLM_REVISION, "vllm_ascend/ops/triton/engram_gate.py",
               "aa52205e9207af272e6179ebf1b6bbd552de65ef6f1472db6de893aded29e47b"),
+)
+SHARED_SOURCES: tuple[SourceRef, ...] = (
+    SourceRef("cann/cann-recipes-infer", "3c9266727c2a25bd17d503ad37d189a134ff364b",
+              "ops/ascendc/src/hc_pre_sinkhorn/op_kernel/hc_pre_sinkhorn.cpp",
+              "bb65d5f12d447e80ce4d6f0427c112e4008ae3d047ce441dd058403bff6d95b3"),
+    SourceRef("cann/ops-transformer", "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+              "mhc/text_gated_residual/op_kernel/catlass_hc_forward_mul_sum_tiling_data.h",
+              "392ea8212ca6ec2ce53d8a8e5704194ca6e7f1b177ab25f4b12e1fac18f43788"),
 )
 
 MHC_KINDS = frozenset({"hc_pre", "hc_post", "hc_pre_sinkhorn", "mhc_post_collapse"})
@@ -96,13 +106,6 @@ ABI_NAMES = {
 }
 OWNED_RECIPES = frozenset(ABI_NAMES) | LEGACY_ALIASES.keys()
 FAMILY_DEFAULTS = {"attention_residual": "attn_res_fwd", "engram_gate": "engram_gate"}
-HISTORY_KEY = ReuseKey(die=0, backing_allocation="attnres_history_bank", tensor_version=0)
-
-
-def gap(code: str, detail: str) -> UnmodeledCapabilityError:
-    return UnmodeledCapabilityError(
-        capability=FAMILY, entry=f"{FAMILY}.resolve_operator_plan", code=code, message=detail,
-    )
 
 
 def _integer(name: str, value: int, minimum: int = 0) -> None:
@@ -179,6 +182,26 @@ class TextGatedGuardDecision:
     excluded_fusion: str | None = None
 
 
+def _text_gate_a2_small(contract: TextGatedResidualContract, aic_cores: int) -> TextGatedGuardDecision:
+    m, d, r = contract.rows, contract.d_dim, contract.rank
+    tile_m = TEXT_GATED_TASK_ALIGNMENT
+    if m >= TEXT_GATED_FULL_TASK_ROWS:
+        task = _ceil(_ceil(m, 2), tile_m) * tile_m
+    elif m >= TEXT_GATED_FULL_TASK_ROWS // 2:
+        task = TEXT_GATED_FULL_TASK_ROWS
+    else:
+        task = tile_m
+    # HcGetSplitkFactor ignores M/R, L1M/L1N and aicNum. HcC0L1K is
+    # 512 for both element widths in this host revision.
+    split = 1
+    if not TEXT_GATED_C0_BASIC_SPLITK or TEXT_GATED_C0_CROSS_SPLITK:
+        split = max(1, min(TEXT_GATED_C0_SPLITK_LIMIT, _ceil(d, TEXT_GATED_C0_TILE_K)))
+    width = r + (contract.hc_mult if contract.has_gate else 0)
+    c0_loops = _ceil(width, TEXT_GATED_A2_C0_TILE_N) * split * _ceil(task, tile_m)
+    c1_slices = _ceil(d, TEXT_GATED_A2_C1_TILE_N)
+    return TextGatedGuardDecision("native_a2_small", split, task, max(1, min(aic_cores, max(c0_loops, c1_slices))))
+
+
 def evaluate_text_gated_guard(
     contract: TextGatedResidualContract, arch_id: ArchId, aic_cores: int,
 ) -> TextGatedGuardDecision:
@@ -193,12 +216,9 @@ def evaluate_text_gated_guard(
     if contract.stack_binding == "ez1008":
         if m < TEXT_GATED_EZ1008_MIN_ROWS:
             reason = "ez1008_m_le_512"
-    elif m < TEXT_GATED_LARGE_MIN_ROWS:
-        if arch_id == ARCH22:
-            task = _ceil(m, 2) if m >= TEXT_GATED_FULL_TASK_ROWS else m
-            if m >= TEXT_GATED_SMALL_RANK_ALIGNMENT:
-                task = _ceil(task, TEXT_GATED_TASK_ALIGNMENT) * TEXT_GATED_TASK_ALIGNMENT
-            return TextGatedGuardDecision("native_a2_small", 1, task, min(aic_cores, _ceil(m, task)))
+    elif arch_id == ARCH22 and m < SMALL_M_THRESH_A2:
+        return _text_gate_a2_small(contract, aic_cores)
+    elif arch_id == ARCH35 and m < TEXT_GATED_LARGE_MIN_ROWS:
         if not 2 <= c <= TEXT_GATED_SMALL_MAX_STREAMS:
             reason = "a5_small_hc_mult"
         elif not (TEXT_GATED_SMALL_HIDDEN_ALIGNMENT <= h <= TEXT_GATED_SMALL_MAX_HIDDEN
@@ -235,6 +255,8 @@ class AttnResContract:
     cached_rows: int = 0
     dtype: str = "bf16"
     ub_overhead_bytes: int = ATTNRES_UB_OVERHEAD_BYTES
+    fused_chain: bool = False
+    need_backward: bool = False
 
     def __post_init__(self) -> None:
         _integer("tokens", self.tokens)
@@ -256,14 +278,44 @@ def attnres_max_resident_rows(
     hidden: int, ub_bytes: int, *, fuse_add: bool = True,
     ub_overhead_bytes: int = ATTNRES_UB_OVERHEAD_BYTES,
     physical_capacity_cap: int | None = None,
+    regbase: bool = True, fused_chain: bool = False, need_backward: bool = False,
 ) -> int:
-    """Compute the legacy resident admission bound and optional physical cap."""
+    """Apply the host's aligned UB capacity and RegBase admission bounds."""
     _integer("hidden_size", hidden, 1)
     _integer("ub_bytes", ub_bytes)
     _integer("ub_overhead_bytes", ub_overhead_bytes)
-    row = 2 * hidden
-    fixed = ATTNRES_FP32_SCRATCH_ROWS * hidden * FP32_BYTES + 2 * row + ub_overhead_bytes
-    limit = max(0, (ub_bytes - fixed - (row if fuse_add else 0)) // (row + FP32_BYTES))
+    b16 = int(dtype_bytes("bf16"))
+    align = ATTNRES_UB_ALIGNMENT_BYTES
+    meta_block = align // FP32_BYTES
+    row = hidden * b16
+    aligned_b16 = _ceil(row, align) * align
+    aligned_fp32 = _ceil(hidden * FP32_BYTES, align) * align
+    lanes = ATTNRES_FP32_VECTOR_LANES
+    fused_prefix = fuse_add or fused_chain
+
+    def resident_bytes(rows: int) -> int:
+        meta = _ceil(rows, meta_block) * meta_block
+        scores = _ceil(meta, lanes) * lanes if regbase and rows > 2 * lanes else meta
+        scratch = meta if regbase else max(meta, lanes)
+        resident_rows = rows - int(fused_prefix and rows > 0)
+        buffers = (2 + resident_rows + int(fused_prefix)) * aligned_b16
+        buffers += ATTNRES_FP32_ALIGNED_SCRATCH_ROWS * aligned_fp32
+        scalars = scores + scratch + meta * meta_block + meta_block
+        if need_backward:
+            scalars += meta_block + meta
+        return ub_overhead_bytes + buffers + scalars * FP32_BYTES
+
+    low, high = 0, min(ub_bytes // aligned_b16, UINT32_MAX)
+    while low < high:
+        mid = (low + high + 1) // 2
+        if resident_bytes(mid) <= ub_bytes:
+            low = mid
+        else:
+            high = mid - 1
+    limit = low
+    if regbase and limit:
+        admission = hidden * ATTNRES_FP32_SCRATCH_ROWS * FP32_BYTES + (2 + int(fuse_add)) * row
+        limit = min(limit, max(0, (ub_bytes - ub_overhead_bytes - admission) // (row + FP32_BYTES)))
     if physical_capacity_cap is not None:
         _integer("physical_capacity_cap", physical_capacity_cap)
         limit = min(limit, physical_capacity_cap)
@@ -276,9 +328,11 @@ class EngramGateContract:
     active_tokens: int | None = None
     chunk_dim: int | None = None
     dtype: str = "bf16"
+    branches: int = 1
 
     def __post_init__(self) -> None:
         _integer("tokens", self.tokens)
+        _integer("branches", self.branches, 1)
         _integer("hidden_size", self.hidden_size, 1)
         _dtype(self.dtype, {"bf16"})
         if self.active_tokens is None:
@@ -302,159 +356,6 @@ def sinkhorn_vector_ops(tokens: int, hc_mult: int, iters: int) -> int:
     initialization = adds + SINKHORN_INIT_ENTRY_OPS * entries
     half_steps = 2 * iters
     return tokens * (initialization + half_steps * (adds + entries) + max(0, half_steps - 1) * hc_mult)
-
-@dataclass(frozen=True, slots=True)
-class Phase:
-    name: str
-    after: tuple[str, ...]
-    owner_kind: Literal["aic", "aiv"]
-    owners: tuple[int, ...]
-    work: Work = field(default_factory=Work)
-    access: MemoryAccessPattern | None = None
-    metadata: tuple[tuple[str, int | str], ...] = ()
-
-@dataclass(frozen=True, slots=True)
-class PhaseProgram:
-    """A picklable staged program whose access bindings use declared pipe service."""
-
-    phases: tuple[Phase, ...]
-    aic_count: int
-    aiv_count: int
-    l2_capacity: int
-    l2_units: int
-
-    def _memory(self) -> AdmissionMemoryView:
-        return AdmissionMemoryView({0: self.l2_capacity}, l2_buffer_units_by_die={0: self.l2_units})
-
-    def phase_work(self) -> tuple[Work, ...]:
-        """Prepare the same aligned copy, sector, and L2 work the stages issue."""
-        memory = self._memory()
-        work = []
-        for phase in self.phases:
-            native = phase.work
-            access = phase.access
-            if access is not None:
-                # Unit rates expose the byte ledgers independently of timing.
-                ledger = bind_memory_access(
-                    access, memory, hbm_bus=HbmBusSpec(0, 1, 1, 0),
-                    copy_hit_bytes_per_ms=1, copy_miss_bytes_per_ms=1, l2_bytes_per_ms=1,
-                    pipe_row_id=access.pipe, l2_row_id="l2", commit=True,
-                ).ledger
-                native += Work(resources={access.pipe: ledger.aligned_transfer_bytes,
-                                          "hbm": ledger.dram_bus_transaction_bytes, "l2": ledger.l2_hit_bytes})
-            work.append(native)
-        return tuple(work)
-
-    def __call__(self, ctx: RecipeContext) -> KernelProgram:
-        memory = self._memory()
-        stages = []
-        for phase in self.phases:
-            demand = ctx.bind(phase.work)
-            roles = list(phase.work.resources) + (["cube"] if phase.work.matrix else [])
-            metadata = dict(phase.metadata)
-            access = phase.access
-            if access is not None:
-                pipe = access.pipe if access.pipe in ctx.resource_names else "mte2"
-                name = ctx.resource_names[pipe]
-                units = ctx.resource_units.get(pipe, ctx.resource_units.get(name, 1))
-                nominal = ctx.rates[name] / units
-                hit_rate = ctx.service_rate(f"{pipe}_l2")
-                miss_rate = ctx.service_rate(f"{pipe}_dram")
-                bound = ctx.bind_access(
-                    access, memory, commit=True,
-                    copy_hit_bytes_per_ms=nominal if hit_rate is None else hit_rate / (1000 * units),
-                    copy_miss_bytes_per_ms=nominal if miss_rate is None else miss_rate / (1000 * units),
-                )
-                # Standard execution exposes a shared HBM row. The copy
-                # constraint is normalized to one physical pipe unit.
-                demand[name] = bound.stage_work(resource_rates={name: nominal}).get(name, 0)
-                ledger = bound.ledger
-                for role, amount in (("hbm", ledger.dram_bus_transaction_bytes), ("l2", ledger.l2_hit_bytes)):
-                    if amount and (row := ctx.resource_names.get(role)) is not None:
-                        demand[row] = amount
-                roles.append(pipe)
-                metadata.update(logical_bytes=ledger.logical_tensor_bytes, l2_hit_bytes=ledger.l2_hit_bytes)
-            domain = self.aic_count if phase.owner_kind == "aic" else self.aiv_count
-            placement = {}
-            for role in roles:
-                if role in {"hbm", "l2"}:
-                    continue
-                resource = ctx.resource_names[ctx.physical_role(role)]
-                if resource not in demand:
-                    continue
-                units = ctx.resource_units.get(ctx.physical_role(role), domain)
-                placement[resource] = tuple(sorted({
-                    unit for owner in phase.owners for unit in unit_group(owner, domain, units)
-                }))
-            stages.append(Stage(phase.name, demand, after=phase.after, placement=placement,
-                                coupled=access is not None, metadata=metadata))
-        return KernelProgram(tuple(stages))
-
-
-class PhaseGraph:
-    """Assemble a bounded invocation DAG with explicit AIC and AIV ownership."""
-
-    def __init__(self, ctx: OperatorPlanningContext) -> None:
-        self.ctx = ctx
-        self.phases: list[Phase] = []
-        self.aic = self._owners("aic")
-        self.aiv = self._owners("aiv")
-        spec = ctx.datapath.memory_access
-        self.sector = spec.sector_bytes if spec is not None else DEFAULT_SECTOR_BYTES
-
-    def _owners(self, kind: Literal["aic", "aiv"]) -> tuple[int, ...]:
-        available = getattr(self.ctx, f"effective_{kind}_cores")
-        owners = self.ctx.stream_owners
-        if owners is not None and owners.isolation == "disjoint":
-            return tuple(getattr(owners, kind))[:available]
-        return tuple(range(available))
-
-    def add(self, name, after=(), *, work=None, owners=None, aic=False,
-            metadata=(), access=None) -> str:
-        domain = self.aic if aic else self.aiv
-        owners = domain if owners is None else owners
-        if not owners:
-            kind = "aic" if aic else "aiv"
-            raise gap(f"hyper_connections_requires_{kind}_owners", name)
-        self.phases.append(Phase(name, after, "aic" if aic else "aiv", owners,
-                                 work or Work(), access, metadata))
-        return name
-
-    def transfer(self, name, size, after=(), *, aic=False, write=False, owners=None,
-                 run=None, reuse=None, distance=None) -> str:
-        if owners is None:
-            owners = self.aic if aic else self.aiv
-        pipe = ("fixpipe" if aic else "mte3") if write else ("mte2_aic" if aic else "mte2_aiv")
-        runs = AddressRunPlan((run or AddressRun(0, 1, size, size),), sector_bytes=self.sector)
-        access = MemoryAccessPattern(
-            tensor_id=reuse.backing_allocation if reuse else name, version=0,
-            die=0, owner=owners[0] if owners else 0, direction="write" if write else "read",
-            pipe=pipe, logical_bytes=size, runs=runs, reuse_key=reuse,
-            reuse_distance_bytes=distance, visibility=VisibilityContract(live_out=write),
-        )
-        return self.add(name, after, owners=owners, aic=aic, access=access)
-
-    def vector(self, name, amount, after, *, owners=None, metadata=()) -> str:
-        return self.add(name, after, work=Work(resources={"vector": amount}),
-                        owners=owners, metadata=metadata)
-
-    def finish(self, implementation, dtype, sources, metadata) -> OperatorPlan:
-        buffers = dict(self.ctx.datapath.buffers)
-        l2 = buffers.get("l2", self.ctx.geometry.buffers.get("l2", 0))
-        program = PhaseProgram(tuple(self.phases), self.ctx.datapath.aic_count,
-                               self.ctx.datapath.aiv_count, l2,
-                               self.ctx.geometry.buffer_units.get("l2", 1))
-        total = Work()
-        phases = []
-        for phase, work in zip(program.phases, program.phase_work(), strict=True):
-            total += work
-            items = [WorkItem("cube", "flop", flops, precision) for precision, flops in work.matrix.items()]
-            items.extend(WorkItem(role, "op" if role == "vector" else "bytes", value, dtype)
-                         for role, value in work.resources.items() if value)
-            phases.append(PipelinePhase(phase.name, phase.after, tuple(items)))
-        spec = FusedPipelineSpec(FAMILY, implementation, tuple(phases), sources)
-        return OperatorPlan(total, program, metadata, pipeline_spec=spec)
-
 
 def _matrix(graph, name, m, k, n, dtype, after, owners, *, gram=0) -> str:
     elt = int(dtype_bytes(dtype))
@@ -483,11 +384,34 @@ def _partition(graph: PhaseGraph, contract: MhcContract, pre: bool):
     return graph.aiv[:cores - aux], graph.aiv[cores - aux:] if aux else ()
 
 
+def model_pre_sinkhorn(graph: PhaseGraph, t: MhcContract) -> dict:
+    m, c, h = t.rows, t.hc_mult, t.hidden_size
+    if (c, t.sinkhorn_iters) != (HC_SINKHORN_STREAMS, SINKHORN_DEFAULT_ITERS):
+        raise ModelingError("hc_pre_sinkhorn_requires_hc4_and_iters20")
+    sink_ops = sinkhorn_vector_ops(m, c, t.sinkhorn_iters)
+    owners = graph.aiv[:m]
+    if m:
+        mix = t.n_mix
+        elt = int(dtype_bytes(t.dtype))
+        coefficients = graph.transfer(
+            "precomputed_coefficient_inputs",
+            (m * (mix + 1) + mix + MHC_COEFFICIENT_SCALARS) * FP32_BYTES, owners=owners,
+        )
+        affine = graph.vector("scale_bias", m * MHC_COEFFICIENT_SCALARS * mix, (coefficients,), owners=owners)
+        gate = graph.vector("pre_post_gates", m * 2 * c * (SIGMOID_OPS_PER_ELEMENT + 1), (affine,), owners=owners)
+        sink = graph.vector("sinkhorn", sink_ops, (affine,), owners=owners)
+        graph.transfer("comb_output", m * c * c * FP32_BYTES, (sink,), write=True, owners=owners)
+        graph.transfer("post_gate_output", m * c * FP32_BYTES, (gate,), write=True, owners=owners)
+        x = graph.transfer("residual_for_pre_mix", m * c * h * elt, owners=owners)
+        mixed = graph.vector("pre_mix", m * h * (2 * c - 1), (x, gate), owners=owners)
+        graph.transfer("pre_mix_output", m * h * elt, (mixed,), write=True, owners=owners)
+    return {"split_k": 1, "sinkhorn_ops": sink_ops, "projection_flops": 0,
+            "mhc_aux_cores": 0, "primary_aiv_cores": len(owners)}
+
+
 def model_mhc(graph: PhaseGraph, kind: str, t: MhcContract) -> dict:
     m, c, h = t.rows, t.hc_mult, t.hidden_size
-    if kind == "hc_pre_sinkhorn" and (c, t.sinkhorn_iters) != (HC_SINKHORN_STREAMS, SINKHORN_DEFAULT_ITERS):
-        raise ModelingError("hc_pre_sinkhorn_requires_hc4_and_iters20")
-    pre = kind in {"hc_pre", "hc_pre_sinkhorn"}
+    pre = kind == "hc_pre"
     sink_ops = sinkhorn_vector_ops(m, c, t.sinkhorn_iters) if pre else 0
     mix = t.n_mix
     metadata = {"split_k": t.split_k, "sinkhorn_ops": sink_ops,
@@ -577,7 +501,7 @@ def model_text_gate(graph: PhaseGraph, t: TextGatedResidualContract, decision: T
         read = graph.vector("text_split_k_merge", m * raw * (split - 1), (read,), owners=aiv)
         raw_out = graph.transfer("merged_down_write", m * raw * elt, (read,), write=True, owners=aiv)
         read = graph.transfer("merged_down_read", m * raw * elt, (raw_out,), owners=aiv)
-    activation = graph.vector("down_activation", m * r * SILU_OPS_PER_ELEMENT, (read,), owners=aiv)
+    activation = graph.vector("down_activation", m * r * (1 + SILU_OPS_PER_ELEMENT), (read,), owners=aiv)
     lowrank = graph.transfer("lowrank_workspace_write", m * r * elt,
                              (activation,), write=True, owners=aiv)
     up_input = graph.transfer("up_inputs", (m * r + r * d) * elt,
@@ -585,106 +509,103 @@ def model_text_gate(graph: PhaseGraph, t: TextGatedResidualContract, decision: T
     up = _matrix(graph, "up_projection", m, r, d, t.dtype, (up_input,), aic)
     up_bytes = m * d * elt
     up_write = graph.transfer("up_workspace_write", up_bytes, (up,), aic=True, write=True, owners=aic)
-    gate_bytes, mixed_bytes = m * c * elt * int(t.has_gate), m * h * elt
-    if gate_bytes:
-        activation = graph.transfer("inject_output", gate_bytes, (activation,), write=True, owners=aiv)
-    inputs = graph.transfer("gated_reduction_inputs", up_bytes + residual_bytes + gate_bytes,
-                            (up_write, activation), owners=aiv)
-    mix_ops = m * h * (c - 1 + c * int(t.has_gate))
+    if t.has_gate:
+        inject = graph.vector("inject_gate", m * c * (SIGMOID_OPS_PER_ELEMENT + 2), (read,), owners=aiv)
+        graph.transfer("inject_output", m * c * elt, (inject,), write=True, owners=aiv)
+    inputs = graph.transfer("gated_reduction_inputs", up_bytes + residual_bytes,
+                            (up_write,), owners=aiv)
+    products = m * c * h
+    sigmoid = graph.vector("read_gate_sigmoid", products * SIGMOID_OPS_PER_ELEMENT, (inputs,), owners=aiv)
+    gated = graph.vector("sigmoid_weighted_products", products, (sigmoid,), owners=aiv)
     if template == "decomposed_fallback":
-        gated = graph.vector("gated_reductions", 2 * mix_ops, (inputs,), owners=aiv)
-        materialized = graph.transfer("decomposed_gate_write", 2 * mixed_bytes, (gated,), write=True, owners=aiv)
-        inputs = graph.transfer("decomposed_residual_inputs", 2 * mixed_bytes, (materialized,), owners=aiv)
-        mixed = graph.vector("residual_add", m * h, (inputs,), owners=aiv)
-    else:
-        mixed = graph.vector("residual_add_and_gated_reduction", m * d + mix_ops, (inputs,), owners=aiv)
-    graph.transfer("text_gated_output", mixed_bytes, (mixed,), write=True, owners=aiv)
+        materialized = graph.transfer("decomposed_gate_write", products * elt, (gated,), write=True, owners=aiv)
+        gated = graph.transfer("decomposed_gate_read", products * elt, (materialized,), owners=aiv)
+    mixed = graph.vector("channel_mean", m * h * (c - 1 + 1), (gated,), owners=aiv)
+    graph.transfer("text_gated_output", m * h * elt, (mixed,), write=True, owners=aiv)
     return {**metadata, "projection_flops": 2 * m * d * (raw + r)}
 
 
 def model_attnres(graph: PhaseGraph, t: AttnResContract, ub: int, physical_cap: int | None,
-                  bank_write: bool = False) -> dict:
+                  *, regbase: bool, bank_write: bool = False) -> dict:
     m, h, j = t.tokens, t.hidden_size, t.valid_history
     limit = attnres_max_resident_rows(h, ub, fuse_add=t.fuse_add,
-                                     ub_overhead_bytes=t.ub_overhead_bytes, physical_capacity_cap=physical_cap)
+                                     ub_overhead_bytes=t.ub_overhead_bytes, physical_capacity_cap=physical_cap,
+                                     regbase=regbase, fused_chain=t.fused_chain, need_backward=t.need_backward)
     resident = j + 1 <= limit
     cached = j if resident else t.cached_rows
     template = "resident" if resident else "cooperative_reload" if 0 < cached < j else "reload"
-    row = 2 * h
+    elt = int(dtype_bytes(t.dtype))
+    row = elt * h
     metadata = {"resident_row_limit": limit, "selected_template": template,
                 "reread_bytes": m * (j - cached) * row, "history_read_bytes": m * j * row}
     if m and not graph.aiv:
         raise gap("hyper_connections_requires_aiv_owners", "attn_res_fwd")
     if not m:
         return metadata
-    stride = 2 * t.token_stride
-    distance = AddressRunPlan((AddressRun(0, m, j * row, stride),),
-                              sector_bytes=graph.sector).aligned_copy_bytes()
-    scores = []
+    stride = elt * t.token_stride
     per_owner = _ceil(m, len(graph.aiv))
     for index, start in enumerate(range(0, m, per_owner)):
-        rows = min(m - start, per_owner)
         owners = (graph.aiv[index],)
-        inp = graph.transfer(f"prefix_input_{index}", rows * row * (1 + int(t.fuse_add)) + 2 * row,
-                             owners=owners)
-        deps = (inp,)
-        if j:
-            history = graph.transfer(f"history_pass1_{index}", rows * j * row, owners=owners,
-                                     run=AddressRun(start * stride, rows, j * row, stride),
-                                     reuse=HISTORY_KEY, distance=distance)
-            deps += (history,)
-        score_per_row = 2 * (h - 1) + (2 + 2) * h + RMS_SCALAR_OPS
-        softmax = ATTNRES_SOFTMAX_OPS_PER_ROW * (j + 1) - 1
-        fuse = (2 + 2) * h if t.fuse_add else 0
-        score = graph.vector(f"score_softmax_{index}", rows * ((j + 1) * score_per_row + softmax + fuse),
-                             deps, owners=owners)
-        scores.append((score, index, start, rows, owners))
-    score_ready = tuple(score for score, *_ in scores)
-    for score, index, start, rows, owners in scores:
-        deps = (score,)
-        if j > cached:
-            reread = graph.transfer(f"history_pass2_{index}", rows * (j - cached) * row, score_ready,
-                                    owners=owners, run=AddressRun(start * stride + cached * row,
-                                                                 rows, (j - cached) * row, stride),
-                                    reuse=HISTORY_KEY, distance=distance)
-            deps = (reread,)
-        if t.output_norm:
-            deps += (graph.transfer(f"output_gamma_{index}", row, owners=owners),)
-        norm = (2 + 2) * h + 2 * h + h + RMS_SCALAR_OPS if t.output_norm else 0
-        weighted = graph.vector(f"weighted_sum_{index}", rows * (2 * (j + 1) * h + norm),
-                                deps, owners=owners)
-        graph.transfer(f"attnres_output_{index}", rows * row * (1 + int(t.fuse_add) + int(bank_write)),
-                       (weighted,), write=True, owners=owners)
+        previous = ()
+        for token in range(start, min(m, start + per_owner)):
+            prefix = f"token_{token}"
+            prefix_bytes = row * (1 + int(t.fuse_add) + (2 if token == start else 0))
+            inp = graph.transfer(f"{prefix}_prefix_input", prefix_bytes, previous, owners=owners)
+            deps = (inp,)
+            reuse = ReuseKey(0, f"attnres_history_{token}", 0) if j > cached else None
+            distance = None
+            if j:
+                history_run = AddressRun(token * stride, 1, j * row, stride)
+                if reuse is not None:
+                    runs = AddressRunPlan((history_run,), sector_bytes=graph.sector)
+                    distance = max(runs.aligned_copy_bytes(), runs.dram_sector_and_service(())[0])
+                history = graph.transfer(f"{prefix}_pass1_history", j * row, (inp,), owners=owners,
+                                         run=history_run, reuse=reuse, distance=distance)
+                deps = (history,)
+            score_per_row = 2 * (h - 1) + (2 + 2) * h + RMS_SCALAR_OPS
+            fuse = (2 + 2) * h if t.fuse_add else 0
+            score = graph.vector(f"{prefix}_pass1_score", (j + 1) * score_per_row + fuse, deps, owners=owners)
+            softmax = graph.vector(f"{prefix}_softmax", ATTNRES_SOFTMAX_OPS_PER_ROW * (j + 1) - 1,
+                                   (score,), owners=owners)
+            deps = (softmax,)
+            if j > cached:
+                size = (j - cached) * row
+                reread = graph.transfer(f"{prefix}_pass2_history", size, deps, owners=owners,
+                                        run=AddressRun(token * stride + cached * row, 1, size, stride),
+                                        reuse=reuse, distance=distance, final_history_read=True)
+                deps = (reread,)
+            if t.output_norm:
+                deps += (graph.transfer(f"{prefix}_output_gamma", row, owners=owners),)
+            norm = (2 + 2) * h + 2 * h + h + RMS_SCALAR_OPS if t.output_norm else 0
+            weighted = graph.vector(f"{prefix}_pass2_weighted", 2 * (j + 1) * h + norm, deps, owners=owners)
+            output = graph.transfer(f"{prefix}_output", row * (1 + int(t.fuse_add) + int(bank_write)),
+                                    (weighted,), write=True, owners=owners)
+            graph.end_token()
+            previous = (output,)
     return metadata
 
 
 def model_engram(graph: PhaseGraph, t: EngramGateContract, ub: int) -> dict:
     m, h, active = t.tokens, t.hidden_size, t.active_tokens
+    rows = m * t.branches
     chunk = min(t.chunk_dim, h, max(1, (ub - ENGRAM_REDUCTIONS * FP32_BYTES) // ENGRAM_CHUNK_BYTES_PER_ELEMENT))
-    reductions = active * ENGRAM_REDUCTIONS * (h - 1)
+    reductions = rows * ENGRAM_REDUCTIONS * (h - 1)
     metadata = {"chunk_dim": chunk, "hidden_slices": _ceil(h, chunk), "sinkhorn_ops": 0,
-                "active_tokens": active, "reduction_adds": reductions}
+                "active_tokens": active, "branches": t.branches, "evaluated_rows": rows, "reduction_adds": reductions}
     if not m:
         return metadata
-    aiv = graph.aiv[:m]
-    masked = graph.transfer("token_mask", m, owners=aiv)
+    aiv = graph.aiv[:rows]
     elt = int(dtype_bytes(t.dtype))
-    if active:
-        active_owners = aiv[:active]
-        inp = graph.transfer("engram_x_key_weights", active * h * elt * (2 + 2),
-                             (masked,), owners=active_owners)
-        reduce = graph.vector("hidden_slice_partial_reductions", reductions + active * h * ENGRAM_PRODUCT_OPS_PER_ELEMENT,
-                              (inp,), owners=active_owners)
-        gate = graph.vector("rms_signed_root_sigmoid_mask", active * ENGRAM_GATE_SCALAR_OPS,
-                            (reduce,), owners=active_owners)
-        value = graph.transfer("engram_value_and_spilled_x", active * h * elt * (1 + int(chunk < h)),
-                               (gate,), owners=active_owners)
-        out = graph.vector("engram_gated_add", 2 * active * h, (value,), owners=active_owners)
-        graph.transfer("engram_active_output", active * h * elt, (out,), write=True, owners=active_owners)
-    if active < m:
-        inp = graph.transfer("engram_inactive_input", (m - active) * h * elt, (masked,), owners=aiv[:m - active])
-        graph.transfer("engram_inactive_output", (m - active) * h * elt,
-                       (inp,), write=True, owners=aiv[:m - active])
+    inp = graph.transfer("engram_x_key_weights", rows * h * elt * (2 + 2), owners=aiv)
+    reduce = graph.vector("hidden_slice_partial_reductions", reductions + rows * h * ENGRAM_PRODUCT_OPS_PER_ELEMENT,
+                          (inp,), owners=aiv)
+    gate = graph.vector("rms_signed_root_sigmoid", rows * ENGRAM_GATE_SCALAR_OPS, (reduce,), owners=aiv)
+    mask = graph.transfer("token_mask", rows, (gate,), owners=aiv)
+    masked = graph.vector("apply_token_mask", 2 * rows, (mask,), owners=aiv)
+    value = graph.transfer("engram_value_and_spilled_x", rows * h * elt * (1 + int(chunk < h)),
+                           (masked,), owners=aiv)
+    out = graph.vector("engram_gated_add", 2 * rows * h, (value,), owners=aiv)
+    graph.transfer("engram_output", rows * h * elt, (out,), write=True, owners=aiv)
     return metadata
 
 
@@ -727,7 +648,9 @@ class HyperConnectionsStrategy:
         declared_ub = dict(ctx.datapath.buffers).get("ub", ctx.geometry.buffers.get("ub", self.ub_bytes))
         ub = min(self.ub_bytes, declared_ub)
         contract, options = operator_contract(op, kind)
-        if kind in MHC_KINDS:
+        if kind == "hc_pre_sinkhorn":
+            metadata = model_pre_sinkhorn(graph, contract)
+        elif kind in MHC_KINDS:
             metadata = model_mhc(graph, kind, contract)
         elif kind == "text_gated_residual":
             decision = evaluate_text_gated_guard(contract, self.arch_id, len(graph.aic))
@@ -736,7 +659,7 @@ class HyperConnectionsStrategy:
                           decision.excluded_fusion or decision.selected_template)
             metadata = model_text_gate(graph, contract, decision)
         elif kind == "attn_res_fwd":
-            metadata = model_attnres(graph, contract, ub, **options)
+            metadata = model_attnres(graph, contract, ub, regbase=self.arch_id == ARCH35, **options)
         else:
             metadata = model_engram(graph, contract, ub)
         if graph.phases and ctx.datapath.usable_paths:
@@ -745,7 +668,7 @@ class HyperConnectionsStrategy:
                     raise gap("hyper_connections_datapath_unsupported", f"{source}->{target}")
         metadata.update(arch_id=str(self.arch_id), datapath=self.datapath_name,
                         ub_bytes=ub, implementation=kind, governed_family=FAMILY)
-        return graph.finish(kind, contract.dtype, self.sources + VLLM_CALLER_SOURCES, metadata)
+        return graph.finish(kind, contract.dtype, self.sources + SHARED_SOURCES + VLLM_CALLER_SOURCES, metadata)
 
 
 def operator_contract(op: OpSpec, kind: str):
@@ -757,7 +680,10 @@ def operator_contract(op: OpSpec, kind: str):
     shape = op.local_shape or op.semantic_shape
     meta.setdefault("dtype", op.dtype or "bf16")
     rank = RESIDUAL_RANK if kind in MHC_KINDS or kind == "text_gated_residual" else 2
-    if len(shape) != rank:
+    if kind == "engram_gate":
+        if len(shape) not in {2, RESIDUAL_RANK}:
+            raise ModelingError(f"engram_gate_requires_rank2_or_rank3:{op.op_id}")
+    elif len(shape) != rank:
         raise ModelingError(f"hyper_connections_requires_rank{rank}:{op.op_id}")
     options = {}
     if rank == RESIDUAL_RANK:
@@ -778,6 +704,13 @@ def operator_contract(op: OpSpec, kind: str):
         else:
             schema = MhcContract
             meta["has_collapse"] = kind == "mhc_post_collapse" or meta.get("has_collapse", False)
+            if kind == "hc_pre_sinkhorn":
+                meta["split_k"] = 1
+            if kind == "hc_pre":
+                exposed = set(meta.get("fusion_external_outputs", ()))
+                for name, phase in zip(meta.get("fusion_semantic_ids", ()), meta.get("fusion_phases", ())):
+                    if name in exposed and phase["recipe"] not in {"hc_sinkhorn", "hc_pre_mix"}:
+                        raise ModelingError("hc_pre_source_cannot_export_internal_intermediate")
         meta.update(rows=m, hc_mult=c, hidden_size=h)
     else:
         meta.update(tokens=shape[0], hidden_size=shape[-1])
@@ -790,6 +723,7 @@ def operator_contract(op: OpSpec, kind: str):
                        "bank_write": meta.get("block_write_idx", -1) >= 0}
         else:
             schema = EngramGateContract
+            meta["branches"] = shape[1] if len(shape) == RESIDUAL_RANK else 1
             if (mask := meta.get("active_mask")) is not None:
                 if len(mask) != shape[0] or any(value not in (0, 1) for value in mask):
                     raise ModelingError("engram_gate_invalid_active_mask")

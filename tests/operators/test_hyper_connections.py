@@ -18,17 +18,13 @@ import pytest
 from _support.accel import close
 from _support.axes import ARCH_IDS, PHASES, REPRESENTATIVE_SKUS, SKUS
 from mindie_sim import graph_costs, operator_costs, target_graphs, target_operators
-from mindie_sim.prediction import family_attnres as prefix, family_hc as source
-from mindie_sim.prediction import family_hc_arch35 as panel_source
 from mindie_sim.prediction.engine import Engine, Resource
 from mindie_sim.prediction.frontend import Frontend
-from mindie_sim.prediction.hc_arch35_compact import finite_owner_template, first_owner
-from mindie_sim.prediction.hc_arch35_program import phase_program, pre_geometry, pre_owner
 from mindie_sim.prediction.mechanism import Geometry
 from mindie_sim.prediction.native_fusion import _groups, lower_native_fusions
 from mindie_sim.prediction.operators import FamilyDispatcher, FamilyRegistry, OperatorPlanningContext
 from mindie_sim.prediction.operators import hyper_connections as hc
-from mindie_sim.prediction.program import PipelineTemplateProgram, RecipeContext
+from mindie_sim.prediction.program import RecipeContext
 from mindie_sim.prediction.results import OpOccurrence
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.public.errors import UnmodeledCapabilityError
@@ -74,11 +70,14 @@ def _context(op, geom, *, rates=None, modes=None):
                          pool_names=dict(zip(geom.buffers, geom.buffers)), pool_capacities=geom.buffers,
                          pool_units=geom.buffer_units, service_modes=modes or {})
 
-def _run(program, ctx, *, backend="python", blocker=None):
-    engine = Engine([Resource(role, ctx.rates[role], units=units)
-                     for role, units in ctx.resource_units.items()],
+def _engine(ctx, backend="python"):
+    return Engine([Resource(role, ctx.rates[role], units=units)
+                     for role, units in ctx.resource_units.items() if units],
                     pools=ctx.pool_capacities, pool_units=ctx.pool_units,
                     backend=backend, trace_limit=2000)
+
+def _run(program, ctx, *, backend="python", blocker=None):
+    engine = _engine(ctx, backend)
     ready = engine.submit("input", release=7)
     if blocker:
         role, work, owner, delay = blocker
@@ -104,8 +103,7 @@ def _sinkhorn_oracle(m, c, iters):
     return m * (adds + 3 * entries + sum(half_steps))
 
 @pytest.mark.parametrize("arch", ARCH_IDS)
-@pytest.mark.parametrize("kind,c,iters,split,aux", [(PRE, 3, 2, 1, 0), (PRE, 4, 20, 3, 2),
-                                                   (PRE_SINK, 4, 20, 2, None)])
+@pytest.mark.parametrize("kind,c,iters,split,aux", [(PRE, 3, 2, 1, 0), (PRE, 4, 20, 3, 2), (PRE, 4, 20, 2, None)])
 def test_mix_projection_sinkhorn_and_owner_partition(arch, kind, c, iters, split, aux):
     m, h = 11, 64
     k, n = c * h, c * (c + 2) + 2
@@ -129,6 +127,25 @@ def test_mix_projection_sinkhorn_and_owner_partition(arch, kind, c, iters, split
         assert stages["projection_workspace_write"].after == ("split_k_partials",)
         assert stages["split_k_merge"].after == ("projection_workspace_read",)
         assert stages["split_k_merge"].work["vector"] == m * (n + 1) * (split - 1)
+
+@pytest.mark.parametrize("arch", ARCH_IDS)
+def test_standalone_sinkhorn_uses_precomputed_projection_and_inverse_rms(arch):
+    m, c, h = 1, 4, 4096
+    geom = _geometry(arch, aic=0, aiv=2)
+    op = _op(PRE_SINK, (m, c, h), split_k=2)
+    plan = hc.build(op, geom)
+    assert plan.work.matrix == {} and plan.work.apply(op).flops == 0.0
+    assert plan.metadata["projection_flops"] == 0
+    stages = _stages(plan, op, geom)
+    mix = c * (c + 2)
+    assert stages["precomputed_coefficient_inputs"].metadata["logical_bytes"] == 4 * (mix + 1 + mix + 3)
+    assert stages["sinkhorn"].work["vector"] == _sinkhorn_oracle(m, c, 20)
+    assert stages["comb_output"].metadata["logical_bytes"] == 4 * c**2
+    assert stages["post_gate_output"].metadata["logical_bytes"] == 4 * c
+    assert stages["pre_mix_output"].metadata["logical_bytes"] == 2 * h
+    assert all(set(stage.placement) <= {"mte2_aiv", "vector", "mte3"} for stage in stages.values())
+    ctx = _context(op, geom)
+    assert _serviced(_run(plan.lower(ctx), ctx)[0]) == pytest.approx(ctx.bind(plan.work))
 
 @pytest.mark.parametrize("arch", ARCH_IDS)
 @pytest.mark.parametrize("kind,m", [(POST, 73), (COLLAPSE, 72), (PRE, 0), (PRE_SINK, 0),
@@ -160,24 +177,51 @@ def test_mhc_rejects_out_of_domain_contracts(kind, shape, meta, error):
         hc.build(_op(kind, shape, **meta), _geometry())
 
 @pytest.mark.parametrize("arch", ARCH_IDS)
-@pytest.mark.parametrize("binding,m,template", [("ez1008", 512, "decomposed_fallback"),
-                                                ("ez1008", 513, "native_large"),
-                                                ("cann_current", 512, "native_large"),
-                                                ("cann_current", 513, "native_large"),
-                                                ("cann_current", 0, "empty_noop")])
-def test_text_gate_stack_boundary(arch, binding, m, template):
+@pytest.mark.parametrize("binding,m,excluded", [("ez1008", 512, True), ("ez1008", 513, False),
+                                                ("cann_current", 1024, False), ("cann_current", 0, False)])
+def test_text_gate_stack_boundary(arch, binding, m, excluded):
     geom = _geometry(arch)
     op = _op(TEXT, (m, 4, 256), rank=64, has_gate=True, stack_binding=binding)
     plan = hc.build(op, geom)
-    assert plan.metadata["selected_template"] == template
     stages = _stages(plan, op, geom)
     if not m:
+        assert plan.metadata["selected_template"] == "empty_noop"
         assert not stages and not plan.work.resources and not plan.work.matrix
         return
-    decomposed = template == "decomposed_fallback"
-    assert plan.metadata["excluded_fusion"] == ("ez1008_m_le_512" if decomposed else None)
-    assert ("decomposed_gate_write" if decomposed else "residual_add_and_gated_reduction") in stages
+    assert plan.metadata["selected_template"] == ("decomposed_fallback" if excluded else "native_large")
+    assert plan.metadata["excluded_fusion"] == ("ez1008_m_le_512" if excluded else None)
+    assert ("decomposed_gate_write" in stages) == excluded
+    assert stages["inject_gate"].work["vector"] == m * 4 * (4 + 2)
+    assert stages["channel_mean"].work["vector"] == m * 256 * 4
     assert plan.work.matrix == {"bf16": 2 * m * (4 * 256) * (2 * 64 + 4)}
+
+
+@pytest.mark.parametrize("m,template,task,used", [
+    (1, "native_a2_small", 32, 2), (64, "native_a2_small", 128, 4),
+    (640, "native_a2_small", 320, 10), (1024, "native_large", 64, 16),
+])
+def test_text_gate_membase_task_boundary(m, template, task, used):
+    geom = _geometry(MEMBASE, aic=24)
+    plan = hc.build(_op(TEXT, (m, 2, 256), rank=64, stack_binding="cann_current"), geom)
+    # The host's basic, non-cross-core C0 split-K configuration gives one partition.
+    assert tuple(plan.metadata[key] for key in ("selected_template", "m_task", "used_aic", "splitk_factor")) == (
+        template, task, used, 1,
+    )
+
+
+@pytest.mark.parametrize("arch", ARCH_IDS)
+def test_text_gate_read_sigmoid_and_mean_without_injection(arch):
+    m, c, h, rank = 1, 2, 256, 64
+    geom = _geometry(arch)
+    op = _op(TEXT, (m, c, h), rank=rank, has_gate=False)
+    plan = hc.build(op, geom)
+    stages = _stages(plan, op, geom)
+    sigmoid, multiply, mean = (stages[name] for name in ("read_gate_sigmoid", "sigmoid_weighted_products", "channel_mean"))
+    assert plan.work.matrix == {"bf16": 2 * m * c * h * 2 * rank}
+    assert sigmoid.work["vector"] == 4 * 512
+    assert multiply.work["vector"] == 512 and multiply.after == (sigmoid.name,)
+    assert mean.work["vector"] == h * ((c - 1) + 1) and mean.after == (multiply.name,)
+    assert "inject_output" not in stages
 
 @pytest.mark.parametrize("c,h,r,aic,reason", [
     (2, 256, 64, 1, None), (10, 4096, 896, 4, None),
@@ -207,87 +251,126 @@ def test_text_gate_small_fused_domain(c, h, r, aic, reason):
     stages = _stages(plan, op, geom)
     assert stages["text_split_k_merge"].work["vector"] == m * r * (14 - 1)
 
+def _resident_limit_oracle(h, ub, *, regbase, fuse_add, fused_chain=False, need_backward=False):
+    bf16, fp32 = 32 * ceil(h / 16), 32 * ceil(h / 8)
+    candidates = []
+    for rows in range(1, 1 + ub // bf16):
+        meta = 8 * ceil(rows / 8)
+        score = 64 * ceil(meta / 64) if regbase and rows > 128 else meta
+        scratch = meta if regbase else max(meta, 64)
+        resident = rows - (fuse_add or fused_chain)
+        buffers = (2 + resident + (fuse_add or fused_chain)) * bf16 + 3 * fp32
+        scalars = score + scratch + 8 * meta + 8 + (meta + 8 if need_backward else 0)
+        if buffers + 4 * scalars + 32 * 1024 <= ub:
+            candidates.append(rows)
+    cap = max(candidates, default=0)
+    if regbase:
+        cap = min(cap, max(0, (ub - 32 * 1024 - h * (20 + 2 * fuse_add)) // (2 * h + 4)))
+    return cap
+
+
 @pytest.mark.parametrize("arch", ARCH_IDS)
-@pytest.mark.parametrize("fuse", [False, True])
-@pytest.mark.parametrize("physical_cap", [None, 5, 999])
-def test_attnres_exact_resident_cutoff(arch, fuse, physical_cap):
-    h, m, ub = 1024, 3, MIN_UB
-    row = 2 * h
-    ub_cap = (ub - (16 * h + (2 + fuse) * row + 16384)) // (row + 4)
-    limit = ub_cap if physical_cap is None else min(ub_cap, physical_cap)
-    assert hc.attnres_max_resident_rows(h, ub, fuse_add=fuse, physical_capacity_cap=physical_cap) == limit
+@pytest.mark.parametrize("h,fuse,chain,backward,physical_cap", [
+    (1024, False, False, False, None), (1024, True, False, False, 5),
+    (17, True, True, True, None), (17, False, True, False, 999),
+])
+def test_attnres_exact_resident_cutoff(arch, h, fuse, chain, backward, physical_cap):
+    ub, m = MIN_UB, 3
+    cap = _resident_limit_oracle(h, ub, regbase=arch == REGBASE, fuse_add=fuse,
+                                 fused_chain=chain, need_backward=backward)
+    limit = cap if physical_cap is None else min(cap, physical_cap)
     for j, cached, template in ((limit - 1, 0, "resident"), (limit, 0, "reload"),
                                 (limit, 2, "cooperative_reload")):
         op = _op(ATTN, (m, h), capacity=limit + 2, valid_history=j, fuse_add=fuse,
-                 cached_rows=cached, physical_capacity_cap=physical_cap)
+                 cached_rows=cached, physical_capacity_cap=physical_cap, fused_chain=chain, need_backward=backward)
         plan = hc.build(op, _geometry(arch, ub=ub))
         assert plan.metadata["resident_row_limit"] == limit
         assert plan.metadata["selected_template"] == template
-        assert plan.metadata["reread_bytes"] == (0 if j + 1 == limit else row * m * (j - cached))
+        assert plan.metadata["reread_bytes"] == (0 if template == "resident" else 2 * h * m * (j - cached))
 
-@pytest.mark.parametrize("cached", [0, 1])
-def test_attnres_reload_uses_shared_reuse_key_and_only_misses_reach_hbm(monkeypatch, cached):
-    witnessed = []
-    bind = RecipeContext.bind_access
 
-    def record(self, pattern, *args, **kwargs):
-        bound = bind(self, pattern, *args, **kwargs)
-        if pattern.reuse_key is not None:
-            witnessed.append((pattern, bound.ledger))
-        return bound
+def test_attnres_regbase_resident_admission_boundary():
+    h, ub = 1024, 248 * 1024
+    assert hc.attnres_max_resident_rows(h, ub, fuse_add=True) == 96
+    for rows, template in ((96, "resident"), (97, "reload")):
+        op = _op(ATTN, (1, h), capacity=rows, valid_history=rows - 1, fuse_add=True)
+        assert hc.build(op, _geometry(ub=ub)).metadata["selected_template"] == template
 
-    monkeypatch.setattr(RecipeContext, "bind_access", record)
-    m, h, j = 5, 128, 3
-    op = _op(ATTN, (m, h), capacity=6, valid_history=j, cached_rows=cached, physical_capacity_cap=j)
-    first, second = 2 * m * h * j, 2 * m * h * (j - cached)
-    totals = []
-    for l2 in (0, 2**20):
-        witnessed.clear()
-        geom = _geometry(aiv=3, l2=l2)
-        plan = hc.build(op, geom)
-        ctx = _context(op, geom)
-        program = plan.program(ctx)
-        passes = [tuple(stage for stage in program.stages if stage.name.startswith(f"history_pass{n}"))
-                  for n in (1, 2)]
-        for group, size in zip(passes, (first, second), strict=True):
-            assert [stage.placement["mte2_aiv"] for stage in group] == [(0,), (1,), (2,)]
-            assert sum(stage.metadata["logical_bytes"] for stage in group) == size
-        assert len({pattern.reuse_key for pattern, _ in witnessed}) == 1
-        assert [pattern.runs.runs[0].base_byte for pattern, _ in witnessed] == [
-            2 * h * (6 * row + offset) for offset in (0, cached) for row in (0, 2, 4)]
-        vector = {s.name: s.work["vector"] for s in program.stages if "vector" in s.work}
-        assert sum(vector[f"score_softmax_{i}"] for i in range(3)) == m * ((j + 1) * (6 * h + 6) - 1 + 4 * h)
-        assert sum(vector[f"weighted_sum_{i}"] for i in range(3)) == m * 2 * (j + 1) * h
-        assert sum(ledger.dram_bus_transaction_bytes for _, ledger in witnessed[:3]) == first
-        assert sum(ledger.l2_hit_bytes for _, ledger in witnessed[3:]) == (second if l2 else 0)
-        engine, _ = _run(program, ctx)
-        assert _serviced(engine) == pytest.approx(ctx.bind(plan.work))
-        totals.append(engine.serviced["hbm"])
-    assert totals[0] - totals[1] == pytest.approx(second)
+
+@pytest.mark.parametrize("cached", [0, 2])
+@pytest.mark.parametrize("fits", [True, False])
+@pytest.mark.parametrize("backend", ["python", "c"])
+def test_attnres_reload_service_tracks_per_token_live_l2(cached, fits, backend):
+    m, h, j = 3, 1024, 96
+    history = 2 * h * j
+    geom = _geometry(aiv=1, l2=history if fits else history - 2 * h, ub=248 * 1024)
+    op = _op(ATTN, (m, h), capacity=j + 3, valid_history=j, cached_rows=cached)
+    plan, ctx = hc.build(op, geom), _context(op, geom)
+    engine, _ = _run(plan.lower(ctx), ctx, backend=backend)
+    trace = {task["task"].rsplit(":", 1)[-1]: task for task in engine.trace}
+    for i in range(m):
+        names = ("pass1_history", "pass1_score", "softmax", "pass2_history", "pass2_weighted", "output")
+        phases = [trace[f"token_{i}_{name}"] for name in names]
+        assert all(a["end_ms"] <= b["start_ms"] for a, b in zip(phases, phases[1:]))
+        assert phases[0]["placement"]["mte2_aiv"] == phases[3]["placement"]["mte2_aiv"] == (0,)
+        if i + 1 < m:
+            assert phases[-1]["end_ms"] <= trace[f"token_{i + 1}_prefix_input"]["start_ms"]
+    reread = m * 2 * h * (j - cached)
+    assert engine.serviced.get("l2", 0) == pytest.approx(reread if fits else 0)
+    other_hbm = 2 * h * (4 * m + 2)
+    assert engine.serviced["hbm"] == pytest.approx(m * history + other_hbm + (0 if fits else reread))
+    assert _serviced(engine) == pytest.approx(ctx.bind(plan.work))
+    close(engine)
+
+
+def test_attnres_concurrent_history_eviction_on_shared_die():
+    h, j = 128, 3
+    history = 2 * h * j
+    geom = _geometry(aiv=1, l2=history)
+    op = _op(ATTN, (1, h), capacity=j, valid_history=j, physical_capacity_cap=j)
+    plan, ctx = hc.build(op, geom), _context(op, geom)
+    program = plan.lower(ctx)
+    assert _run(program, ctx)[0].serviced["l2"] == pytest.approx(history)
+    engine = _engine(ctx)
+    ready = engine.submit("input", release=7)
+    first = program.start(engine, "first", ready, owner="stream_a")
+    second = program.start(engine, "second", ready, owner="stream_b")
+    engine.advance(until=(first, second))
+    assert not engine.serviced.get("l2")
+    assert engine.serviced["hbm"] == pytest.approx(2 * (plan.work.resources["hbm"] + history))
+    # Finishing both streams retires their working sets for the next token.
+    third = program.start(engine, "third", second)
+    engine.advance(until=(third,))
+    assert engine.serviced["l2"] == pytest.approx(history)
+
 
 @pytest.mark.parametrize("arch", ARCH_IDS)
-@pytest.mark.parametrize("mask,chunk", [((1, 1, 1), 256), ((1, 0, 1), 64), ((0, 0, 0), 64)])
-def test_engram_reductions_gate_and_mask(arch, mask, chunk):
+@pytest.mark.parametrize("mask,chunk,branches", [
+    ((1, 1, 1), 256, 1), ((1, 0, 1), 64, 3), ((0, 0, 0), 64, 3),
+])
+def test_engram_reductions_gate_and_mask(arch, mask, chunk, branches):
     m, h, active = len(mask), 256, sum(mask)
-    op, geom = _op(ENGRAM, (m, h), active_mask=mask, chunk_dim=chunk), _geometry(arch)
+    shape = (m, h) if branches == 1 else (m, branches, h)
+    op, geom = _op(ENGRAM, shape, active_mask=mask, chunk_dim=chunk), _geometry(arch)
     plan = hc.build(op, geom)
     stages = _stages(plan, op, geom)
-    assert plan.metadata["active_tokens"] == active and plan.metadata["sinkhorn_ops"] == 0
-    sums = dict.fromkeys(("x_square_sum", "key_square_sum", "dot_sum"), active * (h - 1))
-    assert plan.metadata["reduction_adds"] == sum(sums.values())
-    if active:
-        reduce, gate = stages["hidden_slice_partial_reductions"], stages["rms_signed_root_sigmoid_mask"]
-        assert reduce.work["vector"] == sum(sums.values()) + active * h * (2 + 3)
-        # Inverse RMS, scaled dot with 1/sqrt(H), signed root, sigmoid, mask.
-        assert gate.work["vector"] == active * (2 * 4 + 3 + 4 + 4 + 1)
-        assert gate.after == (reduce.name,)
-        assert stages["engram_value_and_spilled_x"].metadata["logical_bytes"] == 2 * active * h * (1 + (chunk < h))
-        assert stages["engram_gated_add"].work["vector"] == 2 * active * h
-    else:
-        assert not plan.work.resources.get("vector")
-    if active < m:
-        assert stages["engram_inactive_input"].after == ("token_mask",)
-        assert stages["engram_inactive_output"].metadata["logical_bytes"] == 2 * (m - active) * h
+    rows = m * branches
+    assert plan.metadata["active_tokens"] == active and plan.metadata["sinkhorn_ops"] == 0 and not plan.work.matrix
+    assert plan.metadata["evaluated_rows"] == rows
+    assert plan.metadata["reduction_adds"] == rows * (3 * (h - 1)) == rows * 765
+    reduce, gate = stages["hidden_slice_partial_reductions"], stages["rms_signed_root_sigmoid"]
+    assert reduce.work["vector"] == rows * (765 + h * (2 + 3))
+    assert gate.work["vector"] == rows * (2 * 4 + 3 + 4 + 4)
+    assert gate.after == (reduce.name,)
+    assert stages["token_mask"].after == (gate.name,)
+    assert stages["apply_token_mask"].after == ("token_mask",)
+    value = stages["engram_value_and_spilled_x"]
+    assert value.after == ("apply_token_mask",)
+    assert value.metadata["logical_bytes"] == 2 * rows * h * (1 + (chunk < h))
+    assert stages["engram_gated_add"].work["vector"] == 2 * rows * h
+    assert stages["engram_output"].metadata["logical_bytes"] == 2 * rows * h
+    count_only = hc.build(_op(ENGRAM, shape, active_tokens=active, chunk_dim=chunk), geom)
+    assert count_only.work == plan.work
 
 def test_datapath_exclusive_abi_and_missing_route():
     op = _op(TEXT, (7, 4, 256), rank=64, requested_abi="fusedSmall")
@@ -341,170 +424,81 @@ def test_family_dispatch_descriptor_work_and_engine_replay(hardware, kind, shape
     assert status["native_steps"] > 0 and status["fallback_reason"] is None
     close(native[0])
 
-def _source_op(m, h, profile):
-    pre = profile in (source.PRE_PROFILE, panel_source.PRE_PROFILE, panel_source.COMPACT_PRE_PROFILE)
-    return _op(PRE if pre else POST, (m, 4, h),
-               fusion_tensor_view=dict(tokens=m, hidden=h, hc=4, dtype="bf16", sinkhorn_iters=3),
-               fusion_boundary={"traffic_profile": profile}, fusion_external_outputs=(),
-               fusion_semantic_ids=(), fusion_phases=())
-
 @pytest.mark.parametrize("m", [1, 41, 1025])
-def test_shared_projection_gram_and_owner_tail_service(m):
+def test_projection_precision_and_owner_tail_service(m):
     h, c, cores = 7168, 4, 20
     geom = _geometry(MEMBASE, aic=cores)
-    op = _source_op(m, h, source.PRE_PROFILE)
-    plan = source.selected_plan(op, geom)
-    width = c * h
-    m_parts = ceil(m / 256)
-    m_span = 16 * ceil(m / m_parts / 16)
-    k_span = 256 * ceil(width / (cores // m_parts) / 256)
-    k_parts = ceil(width / k_span)
-    rows = [min(m_span, m - start) for start in range(0, m, m_span)]
-    padded = sum(16 * ceil(count / 16) for count in rows)
-    assert plan.work.matrix == {"hf32": 2 * padded * width * 24, "fp32": 2 * padded * width * 16}
-    assert plan.work.resources["mte2_aic"] == (4 * m + 24 * len(rows) * 4) * width
-    assert plan.work.resources["fixpipe"] == m * k_parts * 40 * 4
+    op = _op(PRE, (m, c, h), split_k=3, mhc_aux_cores=0)
+    plan = hc.build(op, geom)
+    width, mix, split = c * h, c * (c + 2), 3
+    assert plan.work.matrix == {"bf16": 2 * m * width * mix, "fp32": m * (2 * width - split)}
+    assert plan.work.resources["mte2_aic"] == 2 * (m + mix) * width
     ctx = _context(plan.work.apply(op), geom)
     engine, duration = _run(plan.lower(ctx), ctx)
     assert _serviced(engine) == pytest.approx(ctx.bind(plan.work))
-    owners = {owner for task in engine.trace if ":coefficients" in task["task"]
-              for owner in task["placement"].get("vector", ())}
-    n_owners = ceil(m / ceil(m / (2 * cores)))
-    assert owners == set(range(n_owners))
-    assert source.pre_phase_work(dict(op.metadata)["fusion_tensor_view"], geom)["coefficients"].resources["mte2_aiv"] == (
-        n_owners * 24 * 4 + m * (k_parts * 40 + 3) * 4)
+    cube = next(task for task in engine.trace if task["task"].endswith(":split_k_partials"))
+    assert cube["placement"]["cube"] == tuple(range(min(cores, m * split)))
     for dtype in plan.work.matrix:
         slow = replace(ctx, compute_peaks={**PEAKS, dtype: PEAKS[dtype] / 10})
         assert _run(plan.lower(slow), slow)[1] > duration
-    without = replace(geom, resource_units={k: v for k, v in geom.resource_units.items() if k != "fixpipe"})
-    with pytest.raises(ModelingError, match="requires_fixpipe_output"):
-        source.selected_plan(op, without)
 
-@pytest.mark.parametrize("m,h,planner,store_span", [
-    (1, 2048, source, 1), (41, 2112, source, 3), (43, 2112, source, 4), (3, 4128, panel_source, 2),
-])
-def test_post_tail_bytes_private_reads_ub_and_shared_store(m, h, planner, store_span):
-    panel = planner is panel_source
-    geom = _geometry(REGBASE if panel else MEMBASE, aic=20, ub=POOLS["ub"])
+
+@pytest.mark.parametrize("arch", ARCH_IDS)
+@pytest.mark.parametrize("m,h", [(1, 2048), (41, 2112), (43, 4128)])
+def test_post_owner_tail_service_and_shared_store(arch, m, h):
+    geom = _geometry(arch, aic=20, ub=POOLS["ub"])
     geom = replace(geom, resource_units={**geom.resource_units, "mte3": 20})
-    op = _source_op(m, h, planner.POST_PROFILE)
-    plan = planner.selected_plan(op, geom)
+    op = _op(POST, (m, 4, h))
+    plan = hc.build(op, geom)
     read, write = m * (10 * h + 80), m * 8 * h
-    assert plan.work.resources["mte2_aiv"] == read and plan.work.resources["mte3"] == write
-    ub = 213152 if panel else 164640
-    vector_per_row = 56 * h + 4 * 4096 * ceil(h / 4096) if panel else h * (4 * 9 + 9)
-    assert plan.work.resources["vector"] == m * vector_per_row
-    prepared = plan.work.apply(op)
-    ctx = _context(prepared, geom, rates={**dict.fromkeys(geom.resource_units, 1e14), "mte3": 20 * 8 * h})
+    assert plan.work.resources["mte2_aiv"] == 32 * ceil(read / 32)
+    assert plan.work.resources["mte3"] == write
+    assert plan.work.resources["vector"] == m * 4 * h * (2 * 4 + 1)
+    ctx = _context(plan.work.apply(op), geom,
+                   rates={**dict.fromkeys(geom.resource_units, 1e14), "mte3": 20 * 8 * h})
     engine, duration = _run(plan.lower(ctx), ctx)
-    assert duration == pytest.approx(store_span, abs=1e-6)
+    store_units = min(20, ceil(m / 2))
+    assert duration == pytest.approx(m / store_units, abs=1e-6)
     assert _serviced(engine) == pytest.approx(ctx.bind(plan.work))
-    assert set(engine.summary()["peak_allocated_per_unit"].values()) == {ub}
-    with pytest.raises(ModelingError, match="capacity"):
-        planner.selected_plan(op, replace(geom, buffers={**geom.buffers, "ub": ub - 1}))
-    if m == 1:
-        alias = _context(prepared, geom, modes={"mte2_aiv": ("mte2_aic", 1e11)})
-        alias = replace(alias, resource_units={**alias.resource_units, "mte2_aic": 40})
-        aliased, _ = _run(plan.lower(alias), alias)
-        assert aliased.serviced["mte2_aic"] == read and not aliased.serviced["mte2_aiv"]
-        assert {task["placement"]["mte2_aic"] for task in aliased.trace
-                if "mte2_aic" in task["placement"]} == {(0,)}
 
-@pytest.mark.parametrize("m", [257, 512, 513, 4097])
-def test_panel_tiling_compact_equivalence_and_repeated_layer_ir(m):
-    h, cores = 1024, 4
-    geom = _geometry(aic=cores, ub=POOLS["ub"])
-    op = _source_op(m, h, panel_source.PRE_PROFILE)
-    plan = panel_source.selected_plan(op, geom)
-    compact = panel_source.selected_plan(_source_op(m, h, panel_source.COMPACT_PRE_PROFILE), geom)
-    mk = compact.metadata["m_k_tiling"]
-    md = min(cores, ceil(m / 256))
-    kd = cores // md
-    tile = min(256, 16 * ceil(m / md / 16))
-    assert (mk["m_dim"], mk["k_dim"], mk["m_l1"], mk["tiling_key"]) == (md, kd, tile, 1001 if kd == 1 else 1000)
-    assert plan.work.matrix["hf32"] == 2 * sum(16 * ceil(min(tile, m - i) / 16)
-                                                for i in range(0, m, tile)) * 32 * (4 * h)
-    assert plan.work == compact.work
-    assert panel_source.selected_plan(replace(op, op_id="next_layer"), geom).work is plan.work
-    ctx = _context(plan.work.apply(op), geom)
-    detail, packed = plan.program(ctx), compact.program(ctx)
-    assert packed.stages[0] is not compact.program(ctx).stages[0]
-    if kd == 1:
-        assert [s.name for s in packed.stages] == [s.name for s in detail.stages] == ["source_msplit"]
-        first = packed.stages[0].program.programs[0].stages
-        assert first == detail.stages[0].program.programs[0].stages
-        assert any("projection_local" in s.name for s in first)
-        assert any(s.name.startswith("b") and s.work.get("mte3") for s in first)
-    else:
-        assert packed.stages[1] == detail.stages[1] and packed.stages[1].after == ("source_stage1",)
-    with pytest.raises(ModelingError, match="capacity"):
-        panel_source.selected_plan(op, replace(geom, buffers={**geom.buffers, "l1": POOLS["l1"] - 1}))
 
 @pytest.mark.parametrize("slow", ["vector", "mte3", "mte1", "mte2_aiv", "hbm"])
-def test_compact_panel_slots_backpressure_and_terminal_service(slow):
+def test_split_projection_backpressure_and_terminal_service(slow):
     geom = _geometry(aic=32, ub=POOLS["ub"])
-    op = _source_op(128, 32768, panel_source.COMPACT_PRE_PROFILE)
-    g = pre_geometry(dict(op.metadata)["fusion_tensor_view"], geom)
-    phases = pre_owner(g, 0)
+    op = _op(PRE, (128, 4, 1024), split_k=3, mhc_aux_cores=2)
+    plan = hc.build(op, geom)
     ctx = _context(op, geom, rates={slow: 1e6})
-    exact = first_owner(g, phases, ctx)
-    assert exact.stages == phase_program(phases, ctx).stages
-    links = (("p1.v0.c0.read", "p0.v0.c0.cast_rms"),
-             ("p1.v0.c0.transpose", "p0.v0.c0.publish_l1"),
-             ("p2.v0.c0.publish_l1", "p0.k3.operands"), ("p2.weight", "p0.k3.operands"),
-             ("p0.k0.operands", "p0.v1.c1.publish_l1"), ("p0.k2.operands", "p0.k0.cube"))
-    assert "p0.k3.cube" not in next(s.after for s in exact.stages if s.name == "p2.weight")
-    template = finite_owner_template(g, phases, ctx)
-    assert template.phase_objects <= 2 and template.stage_objects <= 110
-    assert template.tiles == 8 and template.dynamic_instances == 16
-    assert {s.name for s in template.drain} == {"projection_out", "rms_out0", "rms_out1"}
-    baseline, slow_span = _run(exact, ctx)
-    fast = replace(ctx, rates={**ctx.rates, slow: 1e8})
-    quicker, fast_span = _run(first_owner(g, phases, fast), fast)
-    assert slow_span > fast_span and quicker.serviced == pytest.approx(baseline.serviced)
+    basis, elapsed = _run(plan.lower(ctx), ctx)
+    faster = replace(ctx, rates={**ctx.rates, slow: 1e8})
+    assert _run(plan.lower(faster), faster)[1] < elapsed
     competitor = ("mte2_aiv", 16384, 0, 0.001)
-    reference, duration = _run(exact, ctx, blocker=competitor)
-    finite, elapsed = _run(PipelineTemplateProgram(template), ctx, blocker=competitor)
-    assert finite.serviced == pytest.approx(reference.serviced)
-    assert finite.serviced["mte2_aiv"] == pytest.approx(baseline.serviced["mte2_aiv"] + competitor[1])
-    assert elapsed == pytest.approx(duration, rel=0.002)
-    trace = {row["task"].removeprefix("point:"): row for row in baseline.trace}
-    assert all(trace[child]["start_ms"] >= trace[parent]["end_ms"] for child, parent in links)
-    last = template.dynamic_instances - 1
-    assert trace["rms_out0"]["start_ms"] >= trace[f"p{last}.v0.c1.publish_l1"]["end_ms"]
-    assert trace["rms_out0"]["end_ms"] < trace["projection_out"]["end_ms"]
-    done = exact.start(baseline, "repeat", baseline.submit("ready_again"))
-    baseline.advance(until=(done,))
-    assert done.time == pytest.approx(7 + 2 * slow_span)
+    contested, _ = _run(plan.lower(ctx), ctx, blocker=competitor)
+    expected = ctx.bind(plan.work)
+    expected["mte2_aiv"] += competitor[1]
+    assert _serviced(contested) == pytest.approx(expected)
+    trace = {row["task"].rsplit(":", 1)[-1]: row for row in basis.trace}
+    assert trace["projection_workspace_write"]["end_ms"] <= trace["projection_workspace_read"]["start_ms"]
+    assert trace["sinkhorn_workspace_write"]["end_ms"] <= trace["sinkhorn_workspace_read"]["start_ms"]
+    ready = basis.submit("ready_again")
+    done = plan.lower(ctx).start(basis, "repeat", ready)
+    basis.advance(until=(done,))
+    assert done.time == pytest.approx(ready.time + elapsed)
 
-def _point(case, tokens, valid, **options):
-    params = dict(prefix_id="prefix", addend_id=None, bank_ids=tuple(map(str, range(8))),
-                  valid_blocks=valid, write_slot=None, output_norm=True, mix=True, materialize=False,
-                  tokens_local=tokens, bank_capacity=8, block_token_stride=8 * case.model.hidden_size)
-    return prefix.attn_res_point({"prefix": "point", "stage": 0, "layer": 0, "model": case.model,
-                                 "tokens": tokens, "mode": "prefill"}, **{**params, **options}).ops[0]
 
-def test_prefix_owner_arithmetic_gamma_cache_and_bypass():
-    case = parse_case(_raw("source-families/attnres-prefix-control.json"))
-    case = replace(case, model=replace(case.model, hidden_size=64))
-    caps = prefix.capabilities()
-    assert tuple(caps[key] for key in ("soc_families", "auto_phases", "dtypes")) == (("A5",), ("decode",), ("bf16",))
-    op = _point(case, 1, 1)
+def test_attnres_owner_arithmetic_gamma_and_empty_history():
+    h = 64
     for aiv in (2, 64):
         geom = _geometry(aiv=aiv)
-        plan = prefix.build(op, geom)
+        op = _op(ATTN, (1, h), capacity=8, valid_history=1, fuse_add=False, output_norm=True)
+        plan = hc.build(op, geom)
         ctx = _context(op, geom, rates={"vector": 1e6, "mte2_aiv": 1e16, "mte3": 1e16, "hbm": 1e16})
         engine, elapsed = _run(plan.lower(ctx), ctx)
         assert engine.serviced["mte2_aiv"] == 640 and not engine.serviced.get("mte2_aic")
         assert elapsed == pytest.approx(plan.work.resources["vector"] * aiv / 1e6)
-        assert plan.work.resources["vector"] >= 2 * (7 * 64 - 2) and not plan.work.matrix
-    cached = _point(case, 129, 0, optimize_prefill=True)
-    metrics = prefix.point_metrics(dict(cached.metadata)["attn_res_view"], MIN_UB, 2)
-    assert metrics["view"]["core_ranges"] == ((0, 65), (65, 64))
-    assert metrics["view"]["output_norm_cached"] and metrics["resources"]["mte2"] == 2 * 64 * (129 + 2)
-    bypass = _point(case, 5, 5, mix=False, output_norm=False)
-    assert bypass.deps == ("prefix",)
-    assert prefix.build(bypass, _geometry()).work.resources["mte2_aiv"] == 2 * 5 * 64
+        assert plan.work.resources["vector"] >= 2 * (7 * h - 2) and not plan.work.matrix
+    empty = hc.build(_op(ATTN, (5, h), capacity=8, valid_history=0, fuse_add=False), _geometry())
+    assert empty.metadata["history_read_bytes"] == empty.metadata["reread_bytes"] == 0
+
 
 def test_prefix_block_transition_caller_scope_and_semantic_rejection():
     selected = parse_case(_raw("source-families/attnres-prefix-control.json"))
@@ -576,7 +570,7 @@ def test_manifest_prepares_source_work_and_preserves_public_consumers(phase):
     raw = _raw("cases/v4f-a3-w8a8-tp8.json")
     raw["machine"]["sku"] = REPRESENTATIVE_SKUS["a3"]
     raw.setdefault("runtime", {}).setdefault("kernels", {}).setdefault("lowerings", {})["native_fusion"] = {
-        "implementation": "declared_native_fusion", "options": {"roles": [PRE], "traffic_profile": source.PRE_PROFILE}}
+        "implementation": "declared_native_fusion", "options": {"roles": [PRE], "traffic_profile": "hc_pre_m_k_split_175ef4d4"}}
     raw["model"]["layers"] = 1
     before, case = json.dumps(raw), parse_case(raw)
     options = dict(phase=phase, tokens=8, scope="body")
@@ -586,9 +580,12 @@ def test_manifest_prepares_source_work_and_preserves_public_consumers(phase):
     groups = export_structure(case, **options)["subgraphs"]
     work = next(group["physical_work"] for group in groups if group["role"] == PRE)
     geom = Geometry.from_devices(case.machine.dies)
-    plan = source.selected_plan(lower_native_fusions(members, case.runtime)[0], geom)
-    assert work["launches"] == 1 and work["matrix_flops"] == plan.work.matrix
-    assert (work["hbm_bytes"], work["vector_ops"]) == (plan.work.resources["hbm"], plan.work.resources["vector"])
+    fused = lower_native_fusions(members, case.runtime)[0]
+    view = dict(fused.metadata)["fusion_tensor_view"]
+    m, c, h = (view[key] for key in ("tokens", "hc", "hidden"))
+    plan = hc.build(replace(fused, recipe=PRE, local_shape=(m, c, h)), geom)
+    assert work["launches"] == 1 and work["matrix_flops"]
+    assert plan.work.matrix["bf16"] == 2 * m * (c * h) * c * (c + 2)
     assert json.dumps(raw) == before
     consumer = replace(_op("consume", (8, 64)), deps=(members[-1].op_id,))
     fused, output = lower_native_fusions((*members, consumer), case.runtime)
@@ -596,5 +593,5 @@ def test_manifest_prepares_source_work_and_preserves_public_consumers(phase):
     affine = next(op for op in members if op.recipe == "hc_normalize_scale_bias_gate")
     fused = lower_native_fusions((*members, replace(consumer, deps=(affine.op_id,))), case.runtime)[0]
     with pytest.raises(ModelingError, match="cannot_export_internal_intermediate"):
-        source.selected_plan(fused, geom)
+        hc.build(replace(fused, recipe=PRE, local_shape=(m, c, h)), geom)
     assert tuple(op.to_dict() for op in members) == before_members

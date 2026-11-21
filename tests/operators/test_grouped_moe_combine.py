@@ -6,98 +6,47 @@
 [Timeouts & Locks] Finite synthetic graphs and bounded lazy-window replay.
 [Side-Effect Policy] In-memory modeling and Engine execution only.
 """
-from collections import Counter
-from dataclasses import asdict, replace
-import math
+from dataclasses import asdict
 
 import numpy as np
 import pytest
 
+from _support.axes import SKUS
+from _support.hardware import machine
+from mindie_sim.schema.operators import OpSpec
+
 from mindie_sim import graph_costs, operator_costs, target_graphs, target_operators
 from mindie_sim.catalog.quant import quant_preset
 from mindie_sim.prediction import deepep
-from mindie_sim.prediction.engine import Engine, Resource
-from mindie_sim.prediction.family_grouped_gemm import lower_op
 from mindie_sim.prediction.implementations import produced_values
 from mindie_sim.prediction.mechanism import Geometry
-from mindie_sim.prediction.moe_callers import LOCAL_EXPERT_REDUCE, LocalBankRouting
-from mindie_sim.prediction.operators import moe_combine as mc
-from mindie_sim.prediction.program import ParallelProgram, PipelineProgram, RecipeContext
+from mindie_sim.prediction.moe_callers import LOCAL_EXPERT_REDUCE
+from mindie_sim.prediction.operators import grouped_moe
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError
 
 pytestmark = pytest.mark.tier0
-ROLES = ("hbm", "mte2", "mte3", "vector")
 
 
-def params(tokens=3, hidden=64, topk=2, *, dtype="bf16", weight_dtype="fp32",
-           **overrides):
-    value = {
-        "tokens": tokens, "hidden": hidden, "topk": topk,
-        "dtype": dtype, "weight_dtype": weight_dtype,
-        "compute_capability": mc.COMPUTE_CAPABILITY,
-        "implementation": mc.IMPLEMENTATION,
-        "apply_router_weight_on_input": False,
-        "has_expert_map": False,
+@pytest.mark.parametrize("hardware", SKUS)
+@pytest.mark.parametrize("tokens,hidden,topk", [(3, 32, 2), (5, 130, 3), (17, 64, 1)])
+def test_combine_reads_routed_values_and_publishes_one_row_per_token(hardware, tokens, hidden, topk):
+    geometry = Geometry.from_devices(machine(hardware).dies[:1])
+    rows = (tokens,) * topk + (0,)
+    n = 64
+    shape = (sum(rows), n, hidden)
+    op = OpSpec("routed", "grouped_moe", "decode", 0, 0, (), shape, shape, shape, shape,
+                dtype="bf16", recipe="mega_moe",
+                metadata=tuple(dict(group_rows=rows, n=n, k=hidden, tokens=tokens, top_k=topk).items()))
+    plan = grouped_moe.build(op, geometry)
+    phase = next(item for item in plan.pipeline_spec.phases if item.phase_id == "combine:local")
+    payload = 2 * tokens * hidden
+    expected_read = topk * payload + 4 * tokens * topk + 8 * len(rows)
+    assert {item.resource: item.amount for item in phase.work} == {
+        "hbm": expected_read + payload, "l2": expected_read + payload,
+        "mte2_aiv": expected_read, "mte3": payload, "vector": 2 * tokens * topk * hidden,
     }
-    value.update(overrides)
-    return value
-
-
-def context_for(op, units=32, *, vector_units=None, copy_roles=True):
-    vector_units = units if vector_units is None else vector_units
-    roles = ROLES if copy_roles else ("hbm", "vector")
-    return RecipeContext(
-        op=op, work={}, resource_names={role: role for role in roles},
-        rates={role: 1.0 for role in roles},
-        core_count=units, resource_units={"vector": vector_units},
-    )
-
-
-def iter_cta_tiles(program):
-    """Yield ``(global_cta_index, stages)`` for a per-owner CTA program.
-
-    This is used only by small oracles.  The huge-token test inspects stream
-    counts without materializing any tile.
-    """
-    owners = len(program.programs)
-    for core, stream in enumerate(program.programs):
-        for local in range(stream.count):
-            yield core + local * owners, stream.tile(local)
-
-
-def reference_work(tokens, hidden, topk, input_bytes, weight_bytes,
-                   block_m, block_k):
-    """Independently enumerate every source CTA and its valid lanes."""
-    m_tiles = (tokens + block_m - 1) // block_m
-    k_tiles = (hidden + block_k - 1) // block_k
-    a_upconvert = 1 if input_bytes < 4 else 0
-    w_upconvert = 1 if weight_bytes < 4 else 0
-    out_downconvert = 1 if input_bytes < 4 else 0
-    per_program = (
-        block_m * block_k
-        + block_m * block_k * topk * (2 + a_upconvert)
-        + block_m * topk * w_upconvert
-        + block_m * block_k * out_downconvert
-    )
-    hbm = mte2 = mte3 = 0
-    for pid_m in range(m_tiles):
-        valid_m = min(block_m, tokens - pid_m * block_m)
-        for pid_k in range(k_tiles):
-            valid_k = min(block_k, hidden - pid_k * block_k)
-            a_bytes = topk * valid_m * valid_k * input_bytes
-            w_bytes = topk * valid_m * weight_bytes
-            stored = valid_m * valid_k * input_bytes
-            hbm += a_bytes + w_bytes + stored
-            mte2 += a_bytes + w_bytes
-            mte3 += stored
-    return {
-        "m_tiles": m_tiles, "k_tiles": k_tiles,
-        "programs": m_tiles * k_tiles,
-        "per_program": per_program,
-        "hbm": hbm, "mte2": mte2, "mte3": mte3,
-        "vector": m_tiles * k_tiles * per_program,
-    }
+    assert phase.after == ("gmm2",)
 
 
 def to_bf16(values):
@@ -119,206 +68,6 @@ def weighted_sum_oracle(inputs, weights):
     for n in range(a.shape[1]):
         acc = acc + a[:, n, :] * b[:, n, None]
     return to_bf16(acc)
-
-
-@pytest.mark.parametrize(
-    "tokens,hidden,expected",
-    [
-        (1, 128, (1, 256, 4, 4)),    # BLOCK_M <= 4; BLOCK_K floor 256
-        (4, 256, (1, 256, 4, 4)),
-        (5, 257, (2, 512, 4, 4)),    # first BLOCK_M step; next pow2 <= 512
-        (32, 512, (2, 512, 4, 4)),
-        (33, 1024, (4, 1024, 16, 2)),  # BLOCK_M step and large-tile stages
-        (128, 1024, (4, 1024, 16, 2)),
-        (129, 1024, (16, 1024, 16, 2)),  # 16-row tile threshold
-        (1024, 1024, (16, 1024, 16, 2)),
-        (1025, 1024, (8, 1024, 16, 2)),  # final BLOCK_M branch
-        (7, 512, (2, 512, 4, 4)),
-        (7, 513, (2, 1024, 8, 4)),
-        (7, 1025, (2, 1024, 8, 4)),   # BLOCK_K ceiling, not next pow2 2048
-        (7, 2049, (2, 1024, 8, 4)),
-    ],
-)
-def test_tile_dispatch_thresholds_follow_the_sm89_heuristic(tokens, hidden, expected):
-    op = mc.make_op(params(tokens=tokens, hidden=hidden))
-    selected = dict(op.metadata)["dispatch"]
-    assert (
-        selected["BLOCK_M"], selected["BLOCK_K"],
-        selected["num_warps"], selected["num_stages"],
-    ) == expected
-    assert selected["is_fp32"] is False
-    assert selected["grid"] == (
-        math.ceil(hidden / expected[1]), math.ceil(tokens / expected[0]),
-    )
-
-
-@pytest.mark.parametrize(
-    "tokens,hidden,expected",
-    [
-        (1, 128, (1, 256, 8, 4)),
-        (5, 100, (2, 256, 8, 4)),
-        (200, 64, (4, 256, 16, 4)),
-    ],
-)
-def test_fp32_io_uses_the_source_fp32_tile_branch(tokens, hidden, expected):
-    op = mc.make_op(params(tokens=tokens, hidden=hidden, dtype="fp32",
-                           weight_dtype="fp32"))
-    selected = dict(op.metadata)["dispatch"]
-    assert (
-        selected["BLOCK_M"], selected["BLOCK_K"],
-        selected["num_warps"], selected["num_stages"],
-    ) == expected
-    assert selected["is_fp32"] is True
-
-
-@pytest.mark.parametrize(
-    "tokens,hidden,topk,dtype,weight_dtype",
-    [
-        (1, 1, 1, "bf16", "fp32"),
-        (5, 130, 3, "bf16", "fp32"),
-        (33, 1024, 2, "bf16", "fp32"),
-        (17, 513, 4, "bf16", "bf16"),
-        (9, 300, 5, "fp16", "fp16"),
-        (7, 64, 2, "fp32", "fp32"),
-        (7, 257, 3, "fp32", "bf16"),
-    ],
-)
-def test_work_and_program_match_an_independent_tile_enumeration(
-    tokens, hidden, topk, dtype, weight_dtype,
-):
-    op = mc.make_op(params(tokens=tokens, hidden=hidden, topk=topk,
-                           dtype=dtype, weight_dtype=weight_dtype))
-    selected = dict(op.metadata)["dispatch"]
-    input_bytes = 4 if dtype == "fp32" else 2
-    weight_bytes = 4 if weight_dtype == "fp32" else 2
-    expected = reference_work(
-        tokens, hidden, topk, input_bytes, weight_bytes,
-        selected["BLOCK_M"], selected["BLOCK_K"],
-    )
-    plan = mc.build(op, Geometry(32, {"vector": 32}, {}))
-    program = plan.program(context_for(op))
-    assert isinstance(program, ParallelProgram)
-    totals = Counter()
-    for index, (load, compute, store) in iter_cta_tiles(program):
-        assert compute.after == (load.name,) and store.after == (compute.name,)
-        assert compute.placement["vector"] == (index % len(program.programs),)
-        for stage in (load, compute, store):
-            totals.update(stage.work)
-    assert plan.work.resources == {
-        "hbm": expected["hbm"], "mte2": expected["mte2"],
-        "mte3": expected["mte3"], "vector": expected["vector"],
-    }
-    assert sum(stream.count for stream in program.programs) == expected["programs"]
-    expected_owners = min(expected["programs"], 32)
-    assert len(program.programs) == expected_owners
-    assert all(isinstance(stream, PipelineProgram)
-               for stream in program.programs)
-    # Every source CTA appears exactly once across the owner streams.
-    indices = [index for index, _ in iter_cta_tiles(program)]
-    assert indices == list(range(expected["programs"]))
-    assert totals == plan.work.resources
-
-
-def test_program_is_lazy_for_a_huge_token_count():
-    tokens, hidden, topk = 10**9, 1024, 2
-    op = mc.make_op(params(tokens=tokens, hidden=hidden, topk=topk))
-    plan = mc.build(op, Geometry(32, {"vector": 64}, {}))
-    program = plan.program(context_for(op))
-    expected_ctas = tokens // 8
-    assert len(program.programs) == 32
-    assert sum(stream.count for stream in program.programs) == expected_ctas
-    assert all(stream.count == expected_ctas // 32
-               for stream in program.programs)
-    assert plan.work.resources["vector"] == expected_ctas * 8 * hidden * (2 + 3 * topk)
-    assert plan.work.resources["hbm"] == tokens * (2 * hidden * (topk + 1) + 4 * topk)
-
-
-def test_execution_keeps_live_cta_state_bounded_and_conserves_work():
-    """Actual execution: at most one resident tile per owner stream."""
-    op = mc.make_op(params(tokens=8192, hidden=1024, topk=1))
-    geometry = Geometry(32, {"vector": 32}, {})
-    plan = mc.build(op, geometry)
-    program = plan.program(context_for(op, copy_roles=False))
-    total_programs = sum(stream.count for stream in program.programs)
-    assert total_programs == 1024
-
-    engine = Engine([
-        Resource("memory", 32e9, "bytes", units=32),
-        Resource("vector", 32e6, "ops", units=32),
-    ])
-    context = RecipeContext(
-        op=op, work={}, resource_names={"hbm": "memory", "vector": "vector"},
-        rates={"memory": 32e9, "vector": 32e6},
-        core_count=32, resource_units={"vector": 32},
-    )
-    ready = engine.submit("ready")
-    complete = plan.lower(context).start(engine, "owned", ready)
-    engine.advance(until=(complete,))
-    summary = engine.summary()
-    assert summary["live_tasks"] == 0 and summary["live_programs"] == 0
-    # 1024 CTAs must not be submitted up front: only the 32 owner windows.
-    assert summary["peak_live_tasks"] < 400
-    assert engine.serviced["vector"] == plan.work.resources["vector"]
-    assert engine.serviced["memory"] == plan.work.resources["hbm"]
-    assert 0 < engine.completed_count <= 3 * total_programs + 64
-
-
-def test_execution_trace_pins_each_cta_to_its_owner():
-    """The running engine sees one owner placement per materialized fma."""
-    op = mc.make_op(params(tokens=5, hidden=130, topk=3))
-    plan = mc.build(op, Geometry(4, {"vector": 4}, {}))
-    context = RecipeContext(
-        op=op, work={}, resource_names={"hbm": "memory", "vector": "vector"},
-        rates={"memory": 4e9, "vector": 4e6},
-        core_count=4, resource_units={"vector": 4},
-    )
-    engine = Engine([
-        Resource("memory", 4e9, "bytes", units=4),
-        Resource("vector", 4e6, "ops", units=4),
-    ], trace_limit=64)
-    ready = engine.submit("ready")
-    complete = plan.lower(context).start(engine, "op", ready)
-    engine.advance(until=(complete,))
-    fma = [entry for entry in engine.trace if entry["task"].endswith(":fma")]
-    assert len(fma) == 3
-    assert sorted(entry["placement"]["vector"] for entry in fma) == [
-        (0,), (1,), (2,),
-    ]
-    assert engine.serviced["vector"] == pytest.approx(
-        plan.work.resources["vector"], rel=1e-12,
-    )
-    assert engine.summary()["live_tasks"] == 0
-
-
-def test_incompatible_physical_unit_partition_is_rejected():
-    op = mc.make_op(params(tokens=1025, hidden=1024, topk=1))
-    plan = mc.build(op, Geometry(32, {"vector": 48}, {}))
-    program = plan.program(context_for(op, vector_units=48))
-    with pytest.raises(ModelingError, match="ownership_geometry_incompatible"):
-        program.programs[0].tile(0)
-
-
-def test_build_rejects_stale_dispatch_metadata():
-    op = mc.make_op(params(tokens=5, hidden=130, topk=3))
-    metadata = dict(op.metadata)
-    metadata["block_m"] = 99
-    stale = replace(op, metadata=tuple(sorted(metadata.items())))
-    with pytest.raises(ModelingError, match="metadata_mismatch:block_m"):
-        mc.build(stale, Geometry(32, {"vector": 64}, {}))
-    metadata = dict(op.metadata)
-    dispatch = dict(metadata["dispatch"])
-    dispatch["BLOCK_K"] = 1
-    metadata["dispatch"] = dispatch
-    stale = replace(op, metadata=tuple(sorted(metadata.items())))
-    with pytest.raises(ModelingError, match="dispatch_mismatch:BLOCK_K"):
-        mc.build(stale, Geometry(32, {"vector": 64}, {}))
-    metadata = dict(op.metadata)
-    dispatch = dict(metadata["dispatch"])
-    dispatch["wrapper"] = "topk_weight_and_reduce"
-    metadata["dispatch"] = dispatch
-    stale = replace(op, metadata=tuple(sorted(metadata.items())))
-    with pytest.raises(ModelingError, match="dispatch_mismatch:wrapper"):
-        mc.build(stale, Geometry(32, {"vector": 64}, {}))
 
 
 def test_numpy_weighted_sum_oracle_keeps_fp32_accumulation():
@@ -345,42 +94,6 @@ def test_numpy_weighted_sum_oracle_keeps_fp32_accumulation():
         bf16_acc = to_bf16(bf16_acc + a[:, n, :] * b[:, n, None])
     assert fp32_result[0, 0] != bf16_acc[0, 0]
     assert float(fp32_result[0, 0]) == pytest.approx(1.0078125)
-
-
-@pytest.mark.parametrize(
-    "overrides,match",
-    [
-        ({"has_expert_map": True}, "expert_map_branch_not_selected"),
-        ({"apply_router_weight_on_input": True},
-         "apply_router_weight_on_input_not_supported"),
-        ({"implementation": "moe_sum"}, "unsupported_implementation"),
-        ({"compute_capability": 90}, "compute_capability_89"),
-        ({"compute_capability": 80}, "compute_capability_89"),
-        ({"compute_capability": 89.0}, "compute_capability_89"),
-        ({"dtype": "fp8"}, "unsupported_dtype:dtype"),
-        ({"weight_dtype": "int8"}, "unsupported_dtype:weight_dtype"),
-        ({"tokens": 0}, "positive_integer:tokens"),
-        ({"tokens": True}, "positive_integer:tokens"),
-        ({"hidden": -1}, "positive_integer:hidden"),
-        ({"topk": 0}, "positive_integer:topk"),
-        ({"has_expert_map": 0}, "requires_explicit_boolean"),
-        ({"apply_router_weight_on_input": 0}, "requires_explicit_boolean"),
-        ({"topk_ids": np.zeros((1, 1), dtype=np.int64)},
-         "unknown_parameters:topk_ids"),
-    ],
-)
-def test_unselected_or_invalid_source_paths_are_rejected(overrides, match):
-    with pytest.raises(ModelingError, match=match):
-        mc.make_op(params(**overrides))
-
-
-def test_missing_and_non_mapping_parameters_are_rejected():
-    with pytest.raises(ModelingError, match="params_must_be_a_mapping"):
-        mc.make_op([])
-    missing = params()
-    del missing["weight_dtype"]
-    with pytest.raises(ModelingError, match="missing_parameters:weight_dtype"):
-        mc.make_op(missing)
 
 
 def moe_case(*, tp=1, dp=1, ep=1, experts=8, tokens=8, top_k=2, shared=0):
@@ -516,19 +229,6 @@ def test_contiguous_expert_banks_preserve_zero_bins_and_physical_ids(counts, ban
         assert m == sum(bank)
         priced = operator_costs(raw, [op])["operators"][0]["operator"]
         assert priced["flops"] == 2 * m * n * k
-
-
-def test_empty_local_bank_is_rejected_at_source_lowering():
-    ops = target_operators(local_case(), phase="prefill", tokens=8)
-    op = next(op for op in ops if op.family == "grouped_gemm")
-    realization = LocalBankRouting(expert_rows=(0,) * 8, local_expert_rows=(0, 0),
-                                   rank_rows=(0,) * 4, representative_rank=0,
-                                   basis="declared_integer_counts", ep=4, parent={})
-    meta = dict(op.metadata, routing_basis="declared_integer_counts",
-                routing_realization=realization.to_dict())
-    empty = replace(op, local_shape=(0, *op.local_shape[1:]), flops=0, metadata=tuple(meta.items()))
-    with pytest.raises(ModelingError, match="local_bank_has_no_valid_rows"):
-        lower_op(empty)
 
 
 @pytest.mark.parametrize("shared,gate", [(0, False), (1, False), (1, True)])

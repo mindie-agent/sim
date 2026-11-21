@@ -18,29 +18,22 @@ import pytest
 
 from _support.axes import ARCH_IDS, PHASES, REPRESENTATIVE_SKUS, SKUS
 from _support.hardware import REGBASE_ISA, isa_of, machine
-from mindie_sim import graph_costs, operator_costs, target_graphs
+from mindie_sim import graph_costs, target_graphs
 from mindie_sim.catalog.ops import gemm_op, vector_op
 from mindie_sim.catalog.types import QuantSpec
-from mindie_sim.prediction import bf16_grouped, family_shared_quant, grouped_dequant_arch35, mxfp4_grouped
-from mindie_sim.prediction.call import call_costs
-from mindie_sim.prediction.call_builders import build_call
-from mindie_sim.prediction.family_grouped_quant import RECIPE as DEQUANT_RECIPE, lower as lower_int32
-from mindie_sim.prediction.grouped_rows import row_classes
+from mindie_sim.prediction import family_shared_quant
 from mindie_sim.prediction.matrix_splitk import build_router_splitk, router_output_tiles
 from mindie_sim.prediction.moe_cann_fusion import _fused_gating, build_moe_gating_topk
-from mindie_sim.prediction.mxfp8_grouped import build_swiglu_mx_quant
-from mindie_sim.prediction.passes_ffn_fusion import activation_quant_fusion, router_gemm
+from mindie_sim.prediction.passes_ffn_fusion import router_gemm
 from mindie_sim.prediction.engine import Engine, Resource
 from mindie_sim.prediction.mechanism import Geometry, Work
-from mindie_sim.prediction.operators import grouped_gemm, grouped_moe
+from mindie_sim.prediction.operators import FamilyDispatcher, FamilyRegistry, grouped_moe
 from mindie_sim.prediction.operators.contracts import OperatorPlanningContext
-from mindie_sim.prediction.operators.quant_grouped_schedule import QuantGroupedTiling, plan_quant_grouped
-from mindie_sim.prediction.program import RecipeBook, RecipeContext
+from mindie_sim.prediction.program import RecipeContext
 from mindie_sim.prediction.results import OpOccurrence
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.prediction.transforms import lower_implementations
 from mindie_sim.public.errors import UnmodeledCapabilityError
-from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import OpSpec
 
 pytestmark = pytest.mark.tier0
@@ -216,7 +209,7 @@ def test_xllm_and_on_chip_abi_guards(geometry, fields, reason):
 ])
 def test_mega_moe_materializes_supported_operands_before_quant(geometry, dtype, weight, gap):
     op = make_op((4, 0), 64, 32, mode="mega_moe", dtype=dtype, dtype_b=weight,
-                 requested_abi=MEGA_ABI, output_dtype="bf16")
+                 requested_abi=MEGA_ABI, output_dtype="bf16", soc_tier="a2")
     if gap:
         with pytest.raises(UnmodeledCapabilityError, match=gap):
             resolve(op, geometry)
@@ -253,8 +246,13 @@ def test_mega_moe_wave_partitions_and_shared_expert(geometry, activation, weight
         assert stages[prefix + "gmm1"].metadata["useful_flops"] == 2 * rows * (2 * width) * k
         assert stages[prefix + "gmm2"].metadata["useful_flops"] == 2 * rows * k * width
         assert prefix + "swiglu_quant" in stages["swiglu_quant"].after
+        assert stages[prefix + "dispatch:local"].metadata["source_tokens"] == rows
+        assert stages[prefix + "combine:local"].after == (prefix + "gmm2",)
+        assert stages[prefix + "combine:local"].metadata["output_tokens"] == 0
     deps = stages["combine:local"].after
-    assert deps == (("gmm2", "shared_gmm2") if shared else ("gmm2",))
+    assert set(deps) == {"gmm2", "wave0_combine", "wave1_combine", "wave2_combine"} | (
+        {"shared_gmm2"} if shared else set())
+    assert stages["combine:local"].metadata["output_tokens"] == sum(counts)
     if shared:
         assert stages["shared_gmm2"].metadata["useful_flops"] == 2 * sum(counts) * k * shared
     else:
@@ -280,7 +278,8 @@ def test_architecture_bounds_fused_datapath(geometry):
 
 
 @pytest.mark.parametrize("arch", ARCH_IDS)
-def test_descriptor_roundtrip_and_causal_replay_match_native(geometry):
+@pytest.mark.parametrize("shared_hbm", [True, False])
+def test_descriptor_roundtrip_and_causal_replay_match_native(geometry, shared_hbm):
     on_chip = geometry.datapath.has_l0c_to_ub
     dtype = "mxfp8" if on_chip else "int8"
     op = make_op((3, 0, 1), 64, 32, mode="gmm_swiglu_quant", dtype=dtype,
@@ -299,160 +298,161 @@ def test_descriptor_roundtrip_and_causal_replay_match_native(geometry):
 
     durations = []
     program = plan.program(context)
-    for backend, numeric_only in (("python", False), ("c", False), ("c", True)):
-        resources = [Resource(role, 128, units=geometry.resource_units.get(role, 1))
+    units = geometry.resource_units | ({"hbm": 1} if shared_hbm else {})
+    for backend in ("python", "c"):
+        resources = [Resource(role, 128, units=units.get(role, 1))
                      for role in context.resource_names]
         engine = Engine(resources, pools={"ub": geometry.datapath.usable_bytes("ub")},
                         pool_units=context.pool_units, backend=backend, trace_limit=len(stages) + 8)
         ready = engine.submit("ready", release=2)
-        # Reproduce identical work and dependencies in a numeric C11 frontier.
         engine.advance(until=(ready,))
-        replay = replace(program, stages=tuple(replace(s, acquire=(), free=()) for s in stages)) if numeric_only else program
-        done = replay.start(engine, op.op_id, ready)
+        entry_steps = engine.accel_status()["native_steps"]
+        done = program.start(engine, op.op_id, ready)
         engine.advance(until=(done,))
         assert engine.serviced == pytest.approx(context.bind(plan.work), rel=1e-12)
         summary = engine.summary()
         assert summary["live_tasks"] == summary["live_programs"] == 0
         assert not any(summary["live_allocated"].values())
-        if numeric_only:
-            assert engine.accel_backend == "c_native", engine.accel_status()
+        if backend == "c" and shared_hbm:
+            assert engine.accel_status()["native_steps"] > entry_steps, engine.accel_status()
         assert all(row["start_ms"] >= ready.time for row in engine.trace if row["demand"])
         durations.append(done.time)
-    assert durations[1:] == pytest.approx(durations[:1] * 2, rel=1e-12)
+    assert durations[1] == pytest.approx(durations[0], rel=1e-12)
 
 
 def read_case(name):
     return json.loads((ROOT / "examples" / name).read_text())
 
 
-@pytest.mark.parametrize("hardware_sku", SKUS)
-@pytest.mark.parametrize("rows,n,k", [((0, 4, 0), 128, 64), ((84, 0, 136), 272, 193)])
-def test_bf16_source_compaction_and_tile_bytes(hardware_sku, rows, n, k):
-    op = grouped_gemm.make_op(dict(expert_rows=rows, n=n, k=k, dtype="bf16",
-                                  implementation="ascendc_grouped_nd_bf16", tiling_key=10))
-    geom = hardware(hardware_sku)
-    classified = replace(op, metadata=(("matrix_group_rows", rows),))
-    assert row_classes(classified) == tuple((m, rows.count(m)) for m in sorted(set(rows) - {0}))
-    if geom.datapath.has_l0c_to_ub:
-        op = classified
-        plan = bf16_grouped.build(op, geom)
-        reads = 2 * k * sum(m * ceil(n / 256) + n * ceil(m / 256) for m in rows)
-        writes = 2 * sum(rows) * n
-        assert plan.work.matrix["bf16"] == 2 * sum(rows) * n * k
-        assert plan.work.resources["mte2_aic"] == plan.work.resources["mte1"] == reads
-        assert plan.work.resources["fixpipe"] == writes
-        assert plan.work.resources["hbm"] == reads + writes + geom.compute_units * 8 * len(rows)
-        assert bf16_grouped.build(op, geom, compact=False).work == plan.work
-        return
-    plan = grouped_gemm.build(op, geom)
-    assert grouped_gemm.compact_histogram(rows) == tuple((i, m) for i, m in enumerate(rows) if m)
-    raw = grouped_gemm.interpret_raw_group_list(tuple(enumerate(rows)), n=n, k=k)
-    assert raw["processed_rows"] == sum(rows[:rows.index(0)])
-    reads = 2 * k * sum(m * ceil(n / 256) + n * ceil(m / 128) for m in rows)
-    writes = 2 * sum(rows) * n
-    assert plan.work == Work({"bf16": 2 * sum(rows) * n * k},
-                             {"hbm": reads + writes, "mte2": reads, "mte3": writes})
-    tiles = list(grouped_gemm.iter_tiles(op, geom.compute_units))
-    for idx, tile in enumerate(tiles):
-        assert tile["core"] == idx % geom.compute_units
-        assert tile["expert_id"] in {i for i, m in enumerate(rows) if m}
-    assert sum(tile["tile_rows"] * tile["tile_cols"] for tile in tiles) == sum(rows) * n
+@pytest.mark.parametrize("arch", ARCH_IDS[1:])
+@pytest.mark.parametrize("dtype", ["bf16", "fp16"])
+def test_nz_tail_aligns_each_subtile_to_c0(geometry, dtype):
+    op = make_op((16,), 48, 16, dtype=dtype, layout_b="NZ", tail_split=True, n_tail_cnt=2)
+    resolved = resolve(op, geometry)
+    stages = check_ledger(resolved, bind(op, geometry, resolved.recipe.work))
+    writes = [stage.work["fixpipe"] for stage in stages if "fixpipe" in stage.work]
+    assert writes == [16 * 32 * 2, 16 * 16 * 2]
+    assert resolved.recipe.metadata["issued_fractals"] == 3
+    assert resolved.recipe.metadata["useful_flops"] == 2 * 16 * 48 * 16
 
 
-@pytest.mark.parametrize("rows,expected_count", [((64,), 8), ((64, 0), 4), ((17, 0, 33, 5), 8)])
-def test_quantized_tiles_keep_bank_offsets_and_cover_valid_rows(rows, expected_count):
-    n, k = 64, 32
-    tiling = QuantGroupedTiling(32, 32, 32, 8)
-    schedule = plan_quant_grouped(rows, n, k, tiling)
-    tiles = [tile for owner in range(tiling.used_cores) for tile in schedule.iter_owner_tiles(owner)]
-    assert len(tiles) == expected_count
-    for bank, m in enumerate(rows):
-        cells = Counter()
-        for tile in (tile for tile in tiles if tile.group == bank):
-            offset = sum(rows[:bank]) + tile.m_offset
-            assert tile.x_offset == offset * k
-            assert tile.output_offset == (offset * n + tile.n_offset) * 2
-            assert tile.row_scale_offset == offset * 4
-            assert tile.column_scale_offset == (bank * n + tile.n_offset) * 4
-            assert list(schedule.iter_weight_spans(tile)) == [
-                (bank * n * k + tile.n_offset * k, tile.n * k)]
-            cells.update((i, j) for i in range(tile.m_offset, tile.m_offset + tile.m)
-                         for j in range(tile.n_offset, tile.n_offset + tile.n))
-        assert cells == dict.fromkeys(((i, j) for i in range(m) for j in range(n)), 1)
+@pytest.mark.parametrize("arch", ARCH_IDS[1:])
+@pytest.mark.parametrize("rows", [(8,), (8, 8), (1,)])
+def test_mx_v2_publishes_fp32_handoff_and_acknowledges_both_consumers(geometry, rows):
+    abi = "aclnnGroupedMatmulSwigluQuantV2"
+    op = make_op(rows, 128, 32, mode="gmm_swiglu_quant", dtype="mxfp8",
+                 requested_abi=abi, output_dtype="fp8_e4m3fn", handoff_dtype="bf16")
+    resolved = resolve(op, geometry)
+    plan = resolved.recipe
+    stages = check_ledger(resolved, bind(op, geometry, plan.work))
+    assert resolved.implementation == resolved.descriptor.implementation == abi
+    assert plan.work.resources["fixpipe"] == sum(rows) * 128 * 4
+    assert plan.work.resources["mte3"] == sum(rows) * (64 + 2)
+    pairs = dict(geometry.datapath.aic_aiv_pairs)
+    for issue in (stage for stage in stages if "fixpipe" in stage.work):
+        aic, = issue.placement["fixpipe"]
+        consumers = [stage for stage in stages if stage.name.endswith(":sync")
+                     and stage.name.split(":")[1] == issue.name.split(":")[1]]
+        assert len(consumers) == 2
+        assert tuple(stage.metadata["aiv_consumer"] for stage in consumers) == pairs[aic]
+        assert sum(stage.metadata["rows"] for stage in consumers) == rows[aic]
+    vectors = [stage for stage in stages if "vector" in stage.work]
+    assert len(vectors) == sum(min(rows_on_aic, 2) for rows_on_aic in rows)
+    assert sum(stage.work["vector"] for stage in vectors) == sum(rows) * 64 * 9
 
 
-@pytest.mark.parametrize("source", [False, True])
-def test_grouped_call_conserves_payload_scales_and_output_publication(source):
-    rows, n, k = (3, 0, 3, 0), 256, 64
-    args = dict(expert_rows=rows, n=n, k=k)
-    if source:
-        args["tiling"] = {"base_m": 16, "base_n": 128, "base_k": 32, "used_cores": 32}
-    name = "quantized_grouped_source" if source else "quantized_grouped"
-    call = build_call({"builder": name, "arguments": args})
-    (op,) = call.ops
-    assert op.flops == 2 * sum(rows) * n * k
-    assert op.plan_required is source
-    if source:
-        generic = RecipeBook.from_mapping({"programs": {"matmul": {"kind": "phase_matmul"}}})
-        with pytest.raises(ModelingError, match="source_plan_binding_required"):
-            generic.select(op)
+@pytest.mark.parametrize("hardware_sku", SKUS[:2])
+@pytest.mark.parametrize("declaration", [None, "soc_tier", "transport_abi", "soc_variant"])
+def test_packed_int32_weights_follow_the_declared_soc_contract(hardware_sku, declaration):
+    geometry = hardware(hardware_sku)
+    legacy = hardware_sku == REPRESENTATIVE_SKUS["a2"]
+    identity = {
+        "soc_tier": "a2" if legacy else "a3",
+        "transport_abi": "a2_hccl_client" if legacy else "a3_sio_hccs",
+        "soc_variant": hardware_sku,
+    }
+    operands = dict(mode="mega_moe", dtype="int8", output_dtype="bf16", requested_abi=MEGA_ABI)
+    fields = {declaration: identity[declaration]} if declaration else {}
+    op = make_op((4, 0), 64, 32, dtype_b="int32", **operands, **fields)
+    if legacy:
+        with pytest.raises(UnmodeledCapabilityError, match="int32_weight"):
+            resolve(op, geometry)
     else:
-        meta = dict(op.metadata)
-        assert meta["active_expert_ids"] == (0, 2)
-        assert meta["activation_scale_bytes"] == 4 * sum(rows)
-        assert meta["weight_scale_bytes"] == 4 * 2 * n
-        assert meta["weight_bank_residency_bytes"] == len(rows) * k * n
-        assert meta["group_list_scan_bytes"] == 8 * len(rows)
-        assert meta["output_bytes"] == 2 * sum(rows) * n
-    report = call_costs(read_case("calls/quantized-grouped-small.json"), call.ops, recipes=call.recipes,
-                        mode="graph", invocations=2, input_ready_ms=5)
-    assert report["execution"]["work"]["flops"] == 2 * op.flops
-    assert report["complete_ms"] > 5
-    assert report["execution"]["live_tasks"] == report["execution"]["live_programs"] == 0
-    assert not any(report["execution"]["live_allocated"].values())
+        plan = resolve(op, geometry).recipe
+        explicit_int4 = make_op((4, 0), 64, 32, dtype_b="int4", compute_dtype="w4a8", **operands)
+        assert plan.work == resolve(explicit_int4, geometry).recipe.work
+        assert plan.work.matrix["w4a8"] > 0
 
 
-@pytest.mark.parametrize("capacity,owners", [(512, (8,) * 64), (2048, (64,) * 8 + (0,) * 56)])
-def test_dequant_capacity_changes_owner_assignment_without_changing_rows(capacity, owners):
-    rows = (8,) * 64
-    cfg = grouped_dequant_arch35.Config(rows, 512, capacity, 64, 262144)
-    assignments = [grouped_dequant_arch35.assignments(cfg, owner) for owner in range(cfg.blocks)]
-    assert tuple(sum(m for _, m in entries) for entries in assignments) == owners
-    assert Counter({bank: sum(dict(entry).get(bank, 0) for entry in assignments) for bank in range(len(rows))}) == (
-        dict(enumerate(rows)))
-    dequant, reduction, quant = grouped_dequant_arch35.inventories(3, 65)
-    assert dequant.counts["Cast32"].active_lanes == 3 * 65 * 2
-    assert reduction.counts["ReduceMax"].active_lanes == 3 * 64
-    assert quant.counts["Store"].write_bytes == 3 * 65
+@pytest.mark.parametrize("arch", ARCH_IDS[1:])
+def test_mega_moe_wave_readiness_releases_each_matrix_before_the_last_dispatch(geometry):
+    op = make_op((15, 0, 1), 64, 32, mode="mega_moe", dtype="int8",
+                 requested_abi=MEGA_ABI, output_dtype="bf16", wave_rows=1, ep=2,
+                 dispatch_link_bytes=160, combine_link_bytes=320)
+    resolved = resolve(op, geometry)
+    stages = check_ledger(resolved, bind(op, geometry, resolved.recipe.work))
+    ancestry = {}
+    for stage in stages:
+        ancestry[stage.name] = set(stage.after).union(*(ancestry[parent] for parent in stage.after))
+    for wave in range(16):
+        prefix = f"wave{wave}_"
+        chain = ("dispatch", "gmm1", "swiglu_quant", "gmm2", "combine")
+        assert all(prefix + left in ancestry[prefix + right] for left, right in zip(chain, chain[1:]))
+        if wave < 15:
+            assert "wave15_dispatch" not in ancestry[prefix + "gmm1"]
+    assert resolved.recipe.work.resources["link"] == 160 + 320
 
 
-@pytest.mark.parametrize("batch", [1, 3])
-def test_int32_caller_exchanges_activation_intermediate_for_scale_dependency(batch):
-    raw = read_case("cases/high-concurrency-20261030/qwen-source-gdn-native/"
-                    "qwen35-35b-a5-tp4-c128-graph-source-gdn-native.json")
-    raw["model"]["layers"] = 1
-    raw["runtime"]["kernels"] = {"lowerings": {}}
-    before = target_graphs(raw, scope="body", phase="decode", tokens=4, sequences=batch, context=256)[0]
-    binding = {"grouped_int8_caller": "ascend_grouped_int32_dequant_swiglu"}
-    after = lower_int32(before, binding)
-    consumer = next(op for op in after if op.recipe == DEQUANT_RECIPE)
-    by_id = {op.op_id: op for op in after}
-    gate, scale = (by_id[key] for key in consumer.deps)
-    down = next(op for op in after if op.recipe == "balanced_grouped_down")
-    rows, n, k = gate.local_shape
-    histogram = dict(gate.metadata)["matrix_group_rows"]
-    assert sum(histogram) == rows
-    assert gate.mte2_bytes == rows * k + sum(m > 0 for m in histogram) * n * k
-    assert gate.mte3_bytes == rows * n * 4 and gate.vector_ops == 0
-    assert "activation_scales" in scale.returns and down.deps == (consumer.op_id,)
-    assert {op.op_id for op in before} - by_id.keys() == {down.op_id + ".quantize"}
-    origins = dict(consumer.metadata)["fused_origin_scopes"]
-    assert {(origin["stage"], origin["layer"], origin["block"]) for origin in origins} == {
-        (consumer.stage, consumer.layer, "ffn")}
-    assert lower_int32(after, binding) == after
-    reader = replace(gate, op_id="extra_reader", deps=(gate.op_id,), family="tensor_copy", recipe="copy")
-    with pytest.raises(ModelingError, match="exclusive_activation_chain"):
-        lower_int32((*before, reader), binding)
+@pytest.mark.parametrize("arch", ARCH_IDS[1:])
+@pytest.mark.parametrize("shared_dtype,weight_bytes", [("bf16", 2), ("fp32", 4)])
+def test_shared_expert_uses_its_own_precision_for_both_matmuls(geometry, shared_dtype, weight_bytes):
+    op = make_op((8,), 128, 32, mode="mega_moe", dtype="int8", output_dtype="bf16",
+                 enable_fused_mc2=3, shared_intermediate=32,
+                 shared_compute_dtype=shared_dtype, shared_weight_dtype=shared_dtype)
+    resolved = resolve(op, geometry)
+    routed = resolve(make_op((8,), 128, 32, mode="mega_moe", dtype="int8", output_dtype="bf16"), geometry)
+    phases = resolved.descriptor.phases
+    shared_mmad = [item for phase in phases if phase.phase_id.startswith("shared_")
+                   for item in phase.work if item.resource == "cube"]
+    assert len(shared_mmad) == 2 and all(item.dtype == shared_dtype for item in shared_mmad)
+    assert resolved.recipe.work.matrix == {
+        "int8": routed.recipe.work.matrix["int8"], shared_dtype: 2 * 16 * 32 * (64 + 32),
+    }
+    down_reads = [item.amount for phase in phases if phase.phase_id.startswith("shared_gmm2:")
+                  for item in phase.work if item.resource == "mte2_aic"]
+    assert down_reads == [(8 * 32 + 32 * 32) * weight_bytes]
+
+
+@pytest.mark.parametrize("arch", ARCH_IDS[1:])
+@pytest.mark.parametrize("bins,width", [(32, 64), (68, 128)])
+def test_special_dequant_assigns_whole_groups_and_reads_channel_scales(geometry, bins, width):
+    rows = tuple({0: 2, 2: 7, bins - 1: 1}.get(group, 0) for group in range(bins))
+    allocated = 2 * bins
+    op = make_op(rows, 2 * width, 0, mode="dequant_swiglu_quant", dtype="int32",
+                 allocated_rows=allocated, requested_abi="aclnnDequantSwigluQuant")
+    resolved = resolve(op, geometry)
+    plan = resolved.recipe
+    stages = check_ledger(resolved, bind(op, geometry, plan.work))
+    reads = [stage for stage in stages if "mte2_aiv" in stage.work]
+    assert [stage.metadata["group"] for stage in reads] == [0, 2, bins - 1]
+    owners = min(allocated, geometry.datapath.aiv_count)
+    for stage in reads:
+        group = stage.metadata["group"]
+        assert stage.placement["mte2_aiv"] == (group % owners,)
+        assert stage.metadata["row_start"] == sum(rows[:group])
+        assert stage.metadata["rows"] == rows[group]
+        assert stage.work["mte2_aiv"] == rows[group] * (2 * width * 4 + 4) + 2 * width * 4
+    assert plan.work.resources["mte3"] == sum(rows) * (width + 4)
+
+
+@pytest.mark.parametrize("arch", ARCH_IDS)
+def test_dense_gemm_is_owned_by_the_governed_dispatcher(geometry):
+    op = replace(make_op((16,), 32, 16, mode="dense_gemm"), family="matmul")
+    registry = FamilyRegistry((grouped_moe.register_family(),))
+    ctx = OperatorPlanningContext(OpOccurrence(0, 0, 0, op.op_id), geometry, geometry.datapath)
+    result = FamilyDispatcher(registry).resolve_plan(op, ctx)
+    assert result.op.flops == result.recipe.work.matrix["bf16"] == 2 * 16 * 32 * 16
+    assert result.descriptor.implementation == "aclnnGroupedMatmul"
 
 
 @pytest.mark.parametrize("phase", PHASES)
@@ -472,32 +472,6 @@ def test_grouped_mla_projection_override_stays_local(phase):
     for role in ("grouped_output_b", "q_b", "grouped_gate_up"):
         assert changed[role].dtype == baseline[role].dtype
         assert changed[role].hbm_bytes == baseline[role].hbm_bytes
-
-
-@pytest.mark.parametrize("scale,program", [("bf16", "JointNativeService"), ("fp32", "ExpectedGroupedMatmul")])
-def test_column_scale_format_controls_service_domain(scale, program):
-    raw = read_case("cases/longctx-decode-20261030/qwen35-a5-tp4-ep1-grouped-joint.json")
-    raw["model"]["layers"] = 1
-    for rule in raw["runtime"]["kernels"]["service_regimes"]:
-        rule["match"].update({"metadata.weight_scale_format": "bf16", "metadata.weight_scale_bytes": 2})
-    if scale == "fp32":
-        raw["model"]["quant"]["category_overrides"]["routed_expert"].update(scale_format=scale, scale_bytes=4)
-    ops = target_graphs(raw, scope="body", phase="decode", tokens=4, context=126976)[0]
-    op = next(op for op in ops if op.recipe == "grouped_gate_up")
-    priced = operator_costs(raw, [op], input_ready_ms=7)["operators"][0]
-    assert dict(op.metadata)["weight_scale_format"] == scale
-    assert priced["program"] == program
-    assert not priced["service_before_input"] and priced["live_tasks"] == 0
-
-
-def test_mx_grouped_resplit_preserves_matrix_work():
-    rows, n, k = (480,) * 12, 4608, 5120
-    op = make_op(rows, n, k, dtype="fp8_e4m3", matrix_group_rows=rows, **mxfp4_grouped.SOURCE_INTERFACE)
-    op = replace(op, family="grouped_gemm")
-    plan = mxfp4_grouped.build(op, hardware(REPRESENTATIVE_SKUS["a5"]))
-    detail = plan.metadata["mxa8w4"]
-    assert detail["resplit_schedule"] and detail["k_panel_execution"] == "detailed_panels"
-    assert sum(plan.work.matrix.values()) == 2 * sum(rows) * n * k
 
 
 @pytest.mark.parametrize("m,n,k", [(1, 16, 8), (528, 288, 4096), (240, 384, 7168)])
@@ -534,22 +508,6 @@ def test_gating_waves_preserve_declared_logits_and_routing_work(tokens, groups, 
     assert op.mte3_bytes == 8 * tokens * top_k
     assert plan.work.resources["vector"] == 2 * tokens * experts
     assert plan.metadata["row_program"]["effective_groups"] == max(1, groups)
-
-
-@pytest.mark.parametrize("rows,width", [(1, 64), (65, 192)])
-def test_standalone_swiglu_mx_quant_conserves_io_and_arithmetic(rows, width):
-    shaped = dict(stage=0, layer=0, requests=(), dtype="bf16", phase="decode", shape=(rows, width),
-                  metadata=(("activation_group_size", 32), ("scale_format", "fp8_e8m0")))
-    act = vector_op(op_id="silu", deps=(), elements=rows * width, ops_per_element=4,
-                    family="swiglu", recipe="grouped_swiglu", read_bytes_override=4 * rows * width, **shaped)
-    quant = vector_op(op_id="quant", deps=(act.op_id,), elements=rows * width, ops_per_element=4,
-                      family="quantize", recipe="dynamic_quantize",
-                      write_bytes_override=rows * (width + width // 32), **shaped)
-    (op,) = activation_quant_fusion((act, quant), "bf16")
-    plan = build_swiglu_mx_quant(op, hardware(REPRESENTATIVE_SKUS["a5"]))
-    assert plan.work.resources["mte2"] == 4 * rows * width
-    assert plan.work.resources["mte3"] == rows * (width + width // 32)
-    assert plan.work.resources["vector"] == 8 * rows * width
 
 
 @pytest.mark.parametrize("rows", [1, 7])

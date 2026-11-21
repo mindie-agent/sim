@@ -8,40 +8,41 @@
 """
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass, field, replace
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, replace
 from numbers import Integral
 
 from mindie_sim.observed_contracts.vocabulary import build_unmodeled_onboarding_hint
 from mindie_sim.public.errors import UnmodeledCapabilityError
-from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.operators import OpSpec
 from ...mechanism import OperatorPlan, Work
-from ...ownership import unit_group
-from ...program import KernelProgram, Program, RecipeContext, Stage
 from ...results import FusedPipelineDescriptor, FusedPipelineSpec, PipelinePhase, WorkItem
-from ...runtime.ring_buffer import RingBuffer
 from ..contracts import OperatorPlanningContext
+from .lowering import (
+    MX_DTYPES, MX_SCALE_GROUP_SIZE, PER_TOKEN_SCALE_BYTES, QUANT_OPS_PER_ELEMENT,
+    GroupedMoeProgram, StageDemand, ceil_div, element_bytes, tensor_bytes,
+)
 
 VLLM_CALLER_SOURCES: tuple[SourceRef, ...] = (
     SourceRef(
         repository="vllm-ascend",
-        revision="0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        revision="7a7ed073c481d5e3a2fc2194c5b879efb2d373c0",
         relative_path="vllm_ascend/ops/fused_moe/fused_moe.py",
-        source_sha256="bd9b0b5612dee143e6aa583d0bc3b44c05cae3131d197ea14bd37298ce737750",
+        source_sha256="0647bf1676132121f738cf0d7c569502b5c67a745558d6107e0a39e9bbd9d6c4",
     ),
     SourceRef(
         repository="vllm-ascend",
-        revision="0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        revision="7a7ed073c481d5e3a2fc2194c5b879efb2d373c0",
         relative_path="vllm_ascend/ops/fused_moe/prepare_finalize.py",
         source_sha256="f42c57c2835494e886bf6deef054362ac1be9faaea7b1220a257210c7e996611",
     ),
     SourceRef(
         repository="vllm-ascend",
-        revision="0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        revision="7a7ed073c481d5e3a2fc2194c5b879efb2d373c0",
         relative_path="vllm_ascend/platform.py",
-        source_sha256="75e8784f57fd5125ee29dd3407dab8b0cf43bf6532104fe5a89540bf7df41ddf",
+        source_sha256="cc0c5a6138c2f76e3d2d371e4a04c0d66e1ad2f9dac316b921e24d40f733689a",
     ),
 )
 
@@ -54,22 +55,17 @@ PACKED_PRECISION_FRACTAL_K = 64
 BLAZE_BASE_M = 128
 BLAZE_BASE_N = 256
 BLAZE_SWIZZLE_WINDOW = 4
-MX_SCALE_GROUP_SIZE = 32
 INT32_HANDOFF_BYTES_PER_ELEM = 4
-ROUTING_INDEX_BYTES = 4
-ROUTING_WEIGHT_BYTES = 4
-PER_TOKEN_SCALE_BYTES = 4
 FUSED_MC2_SHARED_MODE = 3
 SPARSE_GROUP_LIST_TYPE = 2
-GROUP_COUNT_BYTES = 8
 
-MX_DTYPES = frozenset({"mxfp8", "mxfp4"})
 GEMM_MODES = frozenset({"dense_gemm", "grouped_gemm"})
 ROUTED_MODES = frozenset({"mega_moe", "dual_batch_moe"})
 SUPPORTED_MODES = GEMM_MODES | ROUTED_MODES | {"gmm_swiglu_quant", "dequant_swiglu_quant"}
 MODE_ALIASES = {"grouped_moe": "grouped_gemm", "megamoe_arch35": "mega_moe"}
 DTYPE_ALIASES = {
     "float32": "fp32", "float16": "fp16", "bfloat16": "bf16",
+    "fp8_e4m3fn": "fp8_e4m3",
     "mx_fp8": "mxfp8", "mxfp8_e4m3": "mxfp8", "mx_fp4": "mxfp4",
     "mxfp4_e2m1": "mxfp4", "w8a8": "int8",
 }
@@ -77,7 +73,6 @@ ACTIVATION_OPS = {
     "swiglu": 5, "swigluoai": 8, "situglu": 7, "situ": 7,
     "silu": 4, "gelu": 6, "gelu_tanh": 8, "geglu": 7,
 }
-QUANT_OPS_PER_ELEMENT = 4
 GATED_ACTIVATIONS = frozenset({"swiglu", "swigluoai", "situglu", "situ", "geglu"})
 ABI_MODES = {
     "aclnnGroupedMatmul": GEMM_MODES,
@@ -88,12 +83,6 @@ ABI_MODES = {
     "aclnnDequantSwigluQuant": frozenset({"dequant_swiglu_quant"}),
     "aclnnMegaMoe": ROUTED_MODES,
 }
-AIC_ROLES = frozenset({"cube", "mte1", "mte2_aic", "fixpipe"})
-AIV_ROLES = frozenset({"mte2_aiv", "mte3", "vector"})
-
-
-def ceil_div(value: int, divisor: int) -> int:
-    return (value + divisor - 1) // divisor
 
 
 def _integer(value, name: str, minimum: int = 0) -> int:
@@ -112,19 +101,6 @@ def _mapping(value, name: str) -> dict:
 def _dtype(value: str) -> str:
     key = str(value).lower()
     return DTYPE_ALIASES.get(key, key)
-
-
-def element_bytes(elements: int, dtype: str) -> int:
-    if dtype in {"mxfp4", "fp4", "fp4_e2m1", "int4", "w4a8"}:
-        return ceil_div(elements, 2)
-    return elements * (1 if dtype in {"mxfp8", "hif8"} else int(dtype_bytes(dtype)))
-
-
-def tensor_bytes(rows: int, width: int, dtype: str, *, scaled: bool = False) -> int:
-    scale = ceil_div(width, MX_SCALE_GROUP_SIZE) if dtype in MX_DTYPES else (
-        PER_TOKEN_SCALE_BYTES if scaled else 0
-    )
-    return rows * (element_bytes(width, dtype) + scale)
 
 
 def normalize_group_rows(
@@ -365,6 +341,8 @@ class GroupedMoeContract:
     dbo_split: MoECohortSplit | None
     enable_fused_mc2: int
     shared_intermediate: int
+    shared_compute_dtype: str
+    shared_weight_dtype: str
     wave_rows: int
     transport_bytes: tuple[int | None, int | None]
     cohort_transport_bytes: tuple[tuple[int | None, int | None], ...] = ()
@@ -380,6 +358,11 @@ class GroupedMoeContract:
     @property
     def padded_weight(self) -> bool:
         return self.layout_b in {"NZ", "FRACTAL_NZ"}
+
+    @property
+    def matrix_weight_dtype(self) -> str:
+        # The routed INT32 tensor is an ABI container for packed INT4 weights.
+        return "int4" if self.mode in ROUTED_MODES and self.dtype_b == "int32" else self.dtype_b
 
 
 def _contract_rows(fields, mode, m, expected_total):
@@ -405,11 +388,16 @@ def _contract_rows(fields, mode, m, expected_total):
     return result
 
 
-def validate_contract(op: OpSpec, ctx: OperatorPlanningContext) -> GroupedMoeContract:
+def contract_fields(op: OpSpec) -> dict:
     fields = dict(op.metadata)
     for name in ("megamoe_geometry", "grouped_moe_geometry"):
         if name in fields:
             fields.update(_mapping(fields[name], name))
+    return fields
+
+
+def validate_contract(op: OpSpec, ctx: OperatorPlanningContext) -> GroupedMoeContract:
+    fields = contract_fields(op)
     source_mode = fields.get("mode", op.recipe or op.family)
     mode = MODE_ALIASES.get(source_mode, source_mode)
     if mode not in SUPPORTED_MODES and "mode" not in fields:
@@ -459,7 +447,8 @@ def validate_contract(op: OpSpec, ctx: OperatorPlanningContext) -> GroupedMoeCon
     dtype_b = _dtype(fields.get("dtype_b", fields.get("weight_dtype", "int4" if dtype_a == "w4a8" else dtype_a)))
     if dtype_a == "w4a8":
         dtype_a = "int8"
-    compute_dtype = _dtype(fields.get("compute_dtype", fields.get("compute_format", dtype_a)))
+    compute_default = "w4a8" if routed and dtype_a == "int8" and dtype_b == "int32" else dtype_a
+    compute_dtype = _dtype(fields.get("compute_dtype", fields.get("compute_format", compute_default)))
     if mode != "dequant_swiglu_quant":
         fractal_k0(compute_dtype)
     output_dtype = _dtype(fields.get("output_dtype", fields.get("output_format", op.dtype or "bf16")))
@@ -488,6 +477,11 @@ def validate_contract(op: OpSpec, ctx: OperatorPlanningContext) -> GroupedMoeCon
     shared = _integer(fields.get("shared_intermediate", 0), "shared_intermediate")
     if mc2 not in {0, 2, FUSED_MC2_SHARED_MODE} or (mc2 == FUSED_MC2_SHARED_MODE) != (shared > 0):
         raise ModelingError("grouped_moe_invalid_shared_mc2_contract")
+    shared_compute = _dtype(fields.get("shared_compute_dtype", compute_dtype))
+    shared_weight = _dtype(fields.get("shared_weight_dtype", dtype_b))
+    if shared:
+        fractal_k0(shared_compute)
+        element_bytes(1, shared_weight)
     transport_fields = ("dispatch_link_bytes", "combine_link_bytes")
     transfer = tuple(_integer(fields[key], key) if key in fields else None for key in transport_fields)
     cohort_transfer = tuple(
@@ -499,7 +493,7 @@ def validate_contract(op: OpSpec, ctx: OperatorPlanningContext) -> GroupedMoeCon
             raise ModelingError("grouped_moe_invalid_cohort_link_bytes")
         if any(amount is not None and sum(parts) != amount for amount, parts in zip(transfer, zip(*cohort_transfer))):
             raise ModelingError("grouped_moe_dbo_link_work_not_conserved")
-    if (routed and ep > 1 and mc2 and sum(rows) and not cohort_transfer
+    if (routed and ep > 1 and mc2 and (tokens or sum(rows)) and not cohort_transfer
             and None in transfer and not callable(fields.get("cohort_transport_builder"))):
         raise capability_gap(op, ctx, "explicit_dispatch_and_combine_transport")
     return GroupedMoeContract(
@@ -509,7 +503,7 @@ def validate_contract(op: OpSpec, ctx: OperatorPlanningContext) -> GroupedMoeCon
         _integer(fields.get("base_n", BLAZE_BASE_N), "base_n", 1), tail_split,
         _integer(fields.get("m_tail_cnt", 1), "m_tail_cnt", 1),
         _integer(fields.get("n_tail_cnt", 1), "n_tail_cnt", 1),
-        top_k, ep, enable_dbo, split, mc2, shared,
+        top_k, ep, enable_dbo, split, mc2, shared, shared_compute, shared_weight,
         _integer(fields.get("wave_rows", 0), "wave_rows"), transfer, cohort_transfer,
     )
 
@@ -545,63 +539,6 @@ def capability_gap(op: OpSpec, ctx: OperatorPlanningContext, reason: str) -> Unm
             observed_abi_summary={"architecture": arch, "reason": reason, "op_id": op.op_id},
         ),),
     )
-
-
-@dataclass(frozen=True, slots=True)
-class StageDemand:
-    name: str
-    after: tuple[str, ...] = ()
-    work: Work = field(default_factory=Work)
-    kind: str = ""
-    owner: int = 0
-    metadata: tuple[tuple[str, object], ...] = ()
-    ub_acquire: tuple[str, int] | None = None
-    ub_release: tuple[str, int] | None = None
-
-
-def _slot(context: RecipeContext, owner: int, spec: tuple[str, int] | None):
-    if spec is None:
-        return ()
-    label, size = spec
-    units = context.pool_units.get("ub", context.effective_aiv_cores)
-    owners = context.datapath.aiv_count if context.datapath else context.resource_units.get("vector", units)
-    mapped = unit_group(owner, owners, units)
-    return tuple(
-        _ring_slot(context.pool_names["ub"], label, size, index) for index in mapped
-    )
-
-
-def _ring_slot(pool, label, size, owner):
-    ring = RingBuffer(owner=owner, pool=pool, allocation=f"{label}:{owner}", slot_bytes=size, depth=1)
-    ring.initial_credit(0)
-    return ring.to_stages(release_slots_at_end=False)[0].acquire[0]
-
-
-@dataclass(frozen=True, slots=True)
-class GroupedMoeProgram:
-    demands: tuple[StageDemand, ...]
-    aic_count: int
-    aiv_count: int
-
-    def __call__(self, context: RecipeContext) -> Program:
-        stages = []
-        for demand in self.demands:
-            work = context.bind(demand.work)
-            placement = {}
-            if demand.kind:
-                roles = AIC_ROLES if demand.kind == "aic" else AIV_ROLES
-                owners = self.aic_count if demand.kind == "aic" else self.aiv_count
-                placement = {
-                    name: units for name, units in context.owned(demand.owner, owners, roles).items()
-                    if name in work
-                }
-            stages.append(Stage(
-                demand.name, work, after=demand.after, placement=placement, coupled=bool(work),
-                metadata=dict(demand.metadata),
-                acquire=_slot(context, demand.owner, demand.ub_acquire),
-                free=_slot(context, demand.owner, demand.ub_release),
-            ))
-        return KernelProgram(tuple(stages))
 
 
 def make_plan(
@@ -646,7 +583,7 @@ def matrix_schedule(contract, ctx, rows, n, k, *, start_core=0, n_tail_alignment
         base_n=contract.base_n, compute_dtype=contract.compute_dtype,
         tail_split=contract.tail_split, m_tail_cnt=contract.m_tail_cnt,
         n_tail_cnt=contract.n_tail_cnt, start_core=start_core, n_tail_alignment=n_tail_alignment,
-        weight_col_alignment=(FRACTAL_N_DIM if contract.transpose_weight else fractal_k0(contract.dtype_b))
+        weight_col_alignment=(FRACTAL_N_DIM if contract.transpose_weight else fractal_k0(contract.matrix_weight_dtype))
         if contract.padded_weight else 1,
     )
 
@@ -656,14 +593,15 @@ def matrix_stages(
 ):
     dtype = input_dtype or contract.dtype_a
     stages, ends = [], []
-    k_alignment = (fractal_k0(contract.dtype_b) if contract.transpose_weight else FRACTAL_M_DIM) if (
+    weight_dtype = contract.matrix_weight_dtype
+    k_alignment = (fractal_k0(weight_dtype) if contract.transpose_weight else FRACTAL_M_DIM) if (
         contract.padded_weight
     ) else 1
     weight_k = ceil_div(k, k_alignment) * k_alignment
     for owner in schedule.nonempty_owners:
         a_rows, b_cols = schedule.owner_input_rows[owner], schedule.owner_weight_columns[owner]
         a = tensor_bytes(a_rows, k, dtype, scaled=input_scaled)
-        b = tensor_bytes(b_cols, weight_k, contract.dtype_b)
+        b = tensor_bytes(b_cols, weight_k, weight_dtype)
         out = element_bytes(schedule.owner_output_elements[owner], output_dtype)
         read, cube, fix = (f"{name}:{owner}:{step}" for step in ("read", "cube", "fixpipe"))
         stages.extend((
@@ -713,87 +651,3 @@ def activation_stages(name, after, ctx, contract, rows, metadata=()):
         compute=width * (ACTIVATION_OPS[contract.activation] + (QUANT_OPS_PER_ELEMENT if quantized else 0)),
         write=tensor_bytes(1, width, contract.quant_dtype, scaled=quantized), metadata=metadata,
     )
-
-
-TransportBuilder = Callable[[str, tuple[str, ...], int, tuple[tuple[str, object], ...]], Iterable[StageDemand]]
-
-
-@dataclass(frozen=True, slots=True)
-class DualBatchMoEPipeline:
-    split: MoECohortSplit
-
-    def stages(self, contract, ctx, emit, *, transport_builder=None):
-        self.split.validate_experts(contract.group_rows)
-        stages, combines = [], []
-        preceding_dispatch = ()
-        for cohort, (ids, rows) in enumerate((
-            (self.split.cohort0_row_ids, self.split.cohort0_expert_rows),
-            (self.split.cohort1_row_ids, self.split.cohort1_expert_rows),
-        )):
-            if not ids or not any(rows):
-                if any(rows) or (contract.cohort_transport_bytes and any(contract.cohort_transport_bytes[cohort])):
-                    raise ModelingError("grouped_moe_empty_dbo_cohort_has_work")
-                continue
-            prefix = f"c{cohort}_"
-            metadata = (("cohort_id", cohort), ("slot", cohort), ("row_ids", ids),
-                        ("row_start", min(ids)), ("row_end", max(ids) + 1), ("expert_rows", rows))
-            transfers = contract.cohort_transport_bytes[cohort] if contract.cohort_transport_bytes else (
-                tuple(_cohort_bytes(amount, sum(rows), contract.m) for amount in contract.transport_bytes)
-            )
-            sub = replace(contract, m=sum(rows), group_rows=rows, tokens=len(ids), transport_bytes=transfers)
-            branch = emit(sub, prefix, preceding_dispatch, metadata, transport_builder)
-            label = prefix + "routing"
-            capacity = ctx.datapath.usable_bytes("ub")
-            slot = (label, min(capacity // 2, ROUTING_INDEX_BYTES * self.split.top_k))
-            if not slot[1]:
-                raise ModelingError("grouped_moe_dbo_ub_slot_empty")
-            branch[0] = replace(branch[0], ub_acquire=slot)
-            branch[-1] = replace(branch[-1], ub_release=slot)
-            stages.extend(branch)
-            preceding_dispatch = (prefix + "dispatch",)
-            combines.append(prefix + "combine")
-        # Combine writes to original row positions, so restore is a completion fence.
-        stages.append(StageDemand("join_restore", tuple(combines)))
-        return stages
-
-
-def _cohort_bytes(amount, rows, total):
-    if amount is None or total == 0:
-        return amount
-    per_row, remainder = divmod(amount, total)
-    if remainder:
-        raise ModelingError("grouped_moe_dbo_requires_exact_cohort_link_bytes")
-    return per_row * rows
-
-
-def routing_stages(name, after, contract, metadata, builder: TransportBuilder | None):
-    dispatch = name.endswith("dispatch")
-    payload_dtype = contract.dtype_a if dispatch else contract.output_dtype
-    payload = tensor_bytes(contract.m, contract.k, payload_dtype, scaled=payload_dtype == "int8")
-    index_bytes = ROUTING_INDEX_BYTES if dispatch else ROUTING_WEIGHT_BYTES
-    tokens = contract.tokens * element_bytes(contract.k, contract.output_dtype)
-    read, write = (tokens, payload) if dispatch else (payload + tokens * bool(contract.shared_intermediate), tokens)
-    read += contract.tokens * contract.top_k * index_bytes
-    read += len(contract.group_rows) * GROUP_COUNT_BYTES
-    vector = contract.tokens * contract.k * (
-        QUANT_OPS_PER_ELEMENT if dispatch and payload_dtype not in {"bf16", "fp16"} else
-        (1 if dispatch else 2 * contract.top_k + bool(contract.shared_intermediate))
-    )
-    local = StageDemand(name + ":local", after, Work(resources={
-        "hbm": read + write, "l2": read + write, "mte2_aiv": read, "vector": vector, "mte3": write,
-    }), metadata=metadata)
-    amount = contract.transport_bytes[0 if dispatch else 1] or 0
-    remote = name + ":transport"
-    deps = (local.name,) if dispatch else after
-    link = [replace(stage, metadata=tuple({**dict(stage.metadata), **dict(metadata)}.items()))
-            for stage in builder(remote, deps, amount, metadata)] if builder else (
-        [StageDemand(remote, deps, Work(resources={"link": amount}), metadata=metadata)] if amount else []
-    )
-    if contract.transport_bytes[0 if dispatch else 1] is not None and sum(
-        stage.work.resources.get("link", 0) for stage in link
-    ) != amount:
-        raise ModelingError("grouped_moe_transport_link_work_not_conserved")
-    if not dispatch and link:
-        local = replace(local, after=tuple(stage.name for stage in link))
-    stages = [local, *link] if dispatch else [*link, local]
-    return [*stages, StageDemand(name, (local.name, *(stage.name for stage in link)), metadata=metadata)]

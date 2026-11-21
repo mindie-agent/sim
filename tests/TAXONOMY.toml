@@ -216,7 +216,6 @@ owns = [
   "mindie_sim/prediction/family_moe.py",
   "mindie_sim/prediction/moe_callers.py",
   "mindie_sim/prediction/moe_cann_fusion.py",
-  "mindie_sim/prediction/expected_grouped.py",
 ]
 
 [[module]]
@@ -224,13 +223,6 @@ path = "operators/test_grouped_moe_gemm.py"
 tier = "tier0"
 owns = [
   "mindie_sim/prediction/operators/grouped_moe",
-  "mindie_sim/prediction/operators/grouped_gemm.py",
-  "mindie_sim/prediction/operators/megamoe_arch35.py",
-  "mindie_sim/prediction/operators/quant_grouped_schedule.py",
-  "mindie_sim/prediction/grouped_dequant_arch35.py",
-  "mindie_sim/prediction/bf16_grouped.py",
-  "mindie_sim/prediction/family_grouped_gemm.py",
-  "mindie_sim/prediction/family_grouped_quant.py",
 ]
 
 [[module]]
@@ -238,7 +230,6 @@ path = "operators/test_grouped_moe_combine.py"
 tier = "tier0"
 owns = [
   "mindie_sim/prediction/operators/grouped_moe",
-  "mindie_sim/prediction/operators/moe_combine.py",
   "mindie_sim/prediction/moe_transport.py",
 ]
 
@@ -275,12 +266,6 @@ path = "operators/test_hyper_connections.py"
 tier = "tier0"
 owns = [
   "mindie_sim/prediction/operators/hyper_connections",
-  "mindie_sim/prediction/operators/hc_gated_residual_arch35.py",
-  "mindie_sim/prediction/family_hc.py",
-  "mindie_sim/prediction/family_hc_arch35.py",
-  "mindie_sim/prediction/hc_arch35_compact.py",
-  "mindie_sim/prediction/hc_arch35_program.py",
-  "mindie_sim/prediction/family_attnres.py",
 ]
 
 [[module]]
@@ -288,13 +273,6 @@ path = "operators/test_mc2_dispatch_combine.py"
 tier = "tier0"
 owns = [
   "mindie_sim/prediction/operators/mc2",
-  "mindie_sim/prediction/operators/mc2_fullmesh.py",
-  "mindie_sim/prediction/mc2_arch22.py",
-  "mindie_sim/prediction/mc2_graph.py",
-  "mindie_sim/prediction/mc2_phase.py",
-  "mindie_sim/prediction/mc2_program.py",
-  "mindie_sim/prediction/mc2_program_launch.py",
-  "mindie_sim/prediction/mc2_program_state.py",
   "mindie_sim/prediction/moe_token_partition.py",
 ]
 
@@ -303,9 +281,6 @@ path = "operators/test_mc2_quant_and_padding.py"
 tier = "tier0"
 owns = [
   "mindie_sim/prediction/operators/mc2",
-  "mindie_sim/prediction/operators/mc2_mx_quant.py",
-  "mindie_sim/prediction/family_mc2_unfused.py",
-  "mindie_sim/prediction/mc2_instructions.py",
 ]
 
 [[module]]
@@ -495,9 +470,6 @@ path = "operators/test_grouped_moe_align.py"
 tier = "tier0"
 owns = [
   "mindie_sim/prediction/operators/grouped_moe",
-  "mindie_sim/prediction/operators/moe_align.py",
-  "mindie_sim/prediction/operators/moe_align_geometry.py",
-  "mindie_sim/prediction/moe_group_list.py",
   "mindie_sim/prediction/moe_init_mxfp8.py",
   "mindie_sim/prediction/moe_init_instructions.py",
 ]

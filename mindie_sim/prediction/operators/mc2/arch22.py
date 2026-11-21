@@ -21,6 +21,7 @@ from .common import (
     Mc2Contract, PeerRoute, Phase, Transport, build_transport_stages, capability_gap,
     contract_fields, make_plan, topology_hops, validate_contract,
 )
+from .lowering import SIO_HCCS, declared_incoming_routes
 
 _OPS_REVISION = "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946"
 _SKILLS_REVISION = "750045df251d031bf708de9dc1614c2202eed6dd"
@@ -90,7 +91,6 @@ SOURCES: tuple[SourceRef, ...] = (
 
 
 HCCL_CLIENT = "a2_hccl_client"
-SIO_HCCS = "a3_sio_hccs"
 ARCH_TRANSPORTS = frozenset({HCCL_CLIENT, SIO_HCCS})
 SERVER_MODES = frozenset({"server", "aicpu", "aiv", "hccl_server_type_aicpu", "hccl_server_type_aiv"})
 
@@ -130,6 +130,8 @@ def _sio_hccs_hops(contract, fields, group, explicit, op, ctx):
                 path = cross_domain
             elif packages:
                 path = ("SIO",) if packages[peer] == packages[rank] else ("HCCS_SW",)
+            elif (peer, rank) in explicit:
+                path = tuple(reversed(explicit[peer, rank]))
         if not path:
             raise capability_gap(op, ctx, "a3_peer_hops_required")
         routes.append(PeerRoute(rank, peer, path))
@@ -185,7 +187,8 @@ def _transport(contract: Mc2Contract, op: OpSpec, ctx: OperatorPlanningContext) 
         raise capability_gap(op, ctx, "two_chunks_require_independent_buffers_and_handles")
     credits = 1 if algorithm == "ring" else max(1, len(peers))
     return Transport(abi, algorithm, routes, credits=credits,
-                     slot_depth=contract.internal_chunks, peer_limit=len(peers))
+                     slot_depth=contract.internal_chunks, peer_limit=len(peers),
+                     incoming_routes=declared_incoming_routes(contract.rank, peers, hops))
 
 
 @dataclass(frozen=True, slots=True)
