@@ -1,9 +1,10 @@
 """Single internal lowering, causal replay, and projection spine for ``mindie_sim``.
 
 [Role] Unify stack resolution, graph rewrite, governed operator-family plan
-  dispatch, ``runtime.Engine`` replay (including authoritative ``0.80x`` target
-  efficiency scaling), canonical ``graph_id`` structure projection, SLA sizing,
-  and topology/P-D sweeps behind one ``PredictionSpine`` class.
+  dispatch, ``runtime.Engine`` replay, certified primal-dual 5-level ladder
+  optimization (zero ``0.80x`` heuristic scaling), canonical ``graph_id``
+  structure projection, SLA sizing, and topology/P-D sweeps behind one
+  ``PredictionSpine`` class.
 [Invariants] One fixed-step replay creates exactly one ``ExecutionBindings``
   and one ``CostModel`` via ``EvaluationContext.create``. Governed families
   execute directly through ``RecipeBook`` + ``FamilyDispatcher`` with zero
@@ -15,14 +16,12 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from functools import lru_cache
-import math
 from typing import Any
 
 from mindie_sim.schema.case import Case
 from mindie_sim.schema.common import ModelingError
-from mindie_sim.schema.hardware import Device, Hardware, Link
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.stack_registry import (
     LoweringRequest,
@@ -41,7 +40,6 @@ from .operators.registry import (
 )
 from .program import RecipeBook
 from .results import (
-    DEFAULT_TARGET_EFFICIENCY,
     FusedPipelineDescriptor,
     JsonObject,
     OpOccurrence,
@@ -69,7 +67,9 @@ from .rewrite import RewritePipeline, RewrittenStep
 from .streams import MAIN_STREAM, StreamOwners, StreamPlan, bind_stream_owners
 
 MS_PER_SECOND = 1000.0
+NS_PER_MS = 1_000_000.0
 DEFAULT_PD_TOTAL_DIES = 16
+DEFAULT_OPTIMIZE_TRIALS = 16
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,61 +81,6 @@ class PreparedStep:
     operators: tuple[ResolvedOperator, ...]
     graph_id: str
     structure_payload: JsonObject | None = None
-
-
-def _scale_case_efficiency(case: Case, efficiency: float) -> Case:
-    """Derive scalable hardware ceilings once from 1.0x declared peaks * ``efficiency``."""
-    if isinstance(efficiency, bool) or not math.isfinite(efficiency) or not (0.0 < efficiency <= 1.0):
-        raise ModelingError(f"target_efficiency_out_of_range:{efficiency}")
-    scaled_dies: list[Device] = []
-    for die in case.machine.dies:
-        base_rates = dict(die.rates)
-        hbm_peak = float(base_rates.get("hbm", 0.0))
-        peaks = tuple((k, float(v) * efficiency) for k, v in die.compute_peaks)
-        rates = tuple((k, float(v) * efficiency) for k, v in die.rates)
-        modes: list[tuple[str, tuple[str, float]]] = []
-        for name, (role, rate) in die.service_modes:
-            if name.endswith("_dram") and hbm_peak > 0.0:
-                role_peak = float(base_rates.get(role, hbm_peak))
-                base_mode_rate = min(hbm_peak, role_peak)
-            else:
-                base_mode_rate = float(rate)
-            modes.append((name, (role, base_mode_rate * efficiency)))
-        scaled_dies.append(replace(
-            die,
-            compute_peaks=peaks,
-            rates=rates,
-            service_modes=tuple(modes),
-        ))
-    scaled_links: list[Link] = []
-    for link in case.machine.links:
-        base_cap = float(link.effective_peak_capacity_bytes_per_ms)
-        util = float(link.bw_utilization)
-        if link.peak_capacity_bytes_per_ms is None and 0.0 < util < 1.0:
-            base_cap = float(link.capacity_bytes_per_ms) / util
-        endpoints = tuple(
-            (rank, min(float(rate), base_cap) * efficiency)
-            for rank, rate in link.endpoint_rates
-        )
-        scaled_links.append(replace(
-            link,
-            capacity_bytes_per_ms=base_cap * efficiency,
-            peak_capacity_bytes_per_ms=base_cap,
-            bw_utilization=float(efficiency),
-            endpoint_rates=endpoints,
-        ))
-    machine = replace(
-        case.machine,
-        dies=tuple(scaled_dies),
-        links=tuple(scaled_links),
-    )
-    kernels = dict(case.runtime.kernels)
-    if "service_regimes" in kernels or "resource_services" in kernels:
-        kernels.pop("service_regimes", None)
-        kernels.pop("resource_services", None)
-        runtime = replace(case.runtime, kernels=kernels)
-        return replace(case, machine=machine, runtime=runtime)
-    return replace(case, machine=machine)
 
 
 def _work_items(op: OpSpec) -> tuple[WorkItem, ...]:
@@ -399,13 +344,9 @@ class PredictionSpine:
         /,
         *,
         primitives: Any = None,
-        target_efficiency: float | None = None,
     ) -> StepEvaluation:
         """Execute ``step`` once on ``runtime.Engine`` using a single ``EvaluationContext``."""
-        case = (
-            _scale_case_efficiency(step.case, target_efficiency)
-            if target_efficiency is not None else step.case
-        )
+        case = step.case
         book = RecipeBook.from_mapping(
             case.runtime.kernels, family_registry=self.families
         )
@@ -528,43 +469,51 @@ class PredictionSpine:
             native_steps=int(accel.get("native_steps", 0) or 0),
         )
 
+    def optimize_ladder(
+        self,
+        case: Case,
+        request: StepRequest,
+        /,
+        *,
+        replay: ReplayOptions = ReplayOptions(),
+        primitives: Any = None,
+        primitive_table: Any = None,
+        stack_id: str = "cann93_va_main",
+        max_trials: int = DEFAULT_OPTIMIZE_TRIALS,
+    ) -> Any:
+        """Run the certified 5-level primal-dual optimization ladder on ``runtime.Engine``."""
+        from mindie_sim.optimization.ladder import solve_five_level_ladder
+
+        return solve_five_level_ladder(
+            case,
+            request,
+            spine=self,
+            replay=replay,
+            primitives=primitives,
+            primitive_table=primitive_table,
+            stack_id=stack_id,
+            max_trials=max_trials,
+        )
+
     def evaluate_three_tiers(
         self,
         case: Case,
         request: StepRequest,
         /,
         *,
-        target_eff: float = DEFAULT_TARGET_EFFICIENCY,
         replay: ReplayOptions = ReplayOptions(),
         primitives: Any = None,
     ) -> ThreeTierEvaluation:
-        """Evaluate ``unmerge``, ``mainline``, and ``should_achieve`` on ``runtime.Engine``."""
-        unmerge_step = self.lower(
+        """Evaluate ``unmerge``, ``mainline``, and constructive ``should_achieve`` via primal-dual ladder."""
+        report = self.optimize_ladder(
             case,
-            LoweringRequest(
-                step=request, tier="unmerge",
-                apply_body_defaults=False, production_capture=True,
-            ),
+            request,
+            replay=replay,
+            primitives=primitives,
         )
-        mainline_step = self.lower(
-            case,
-            LoweringRequest(
-                step=request, tier="mainline",
-                apply_body_defaults=True, production_capture=True,
-            ),
-        )
-        ideal_step = self.lower(
-            case,
-            LoweringRequest(
-                step=request, tier="should_achieve",
-                apply_body_defaults=True, production_capture=True,
-            ),
-        )
-        unmerge_eval = self.run_step(unmerge_step, replay, primitives=primitives)
-        mainline_eval = self.run_step(mainline_step, replay, primitives=primitives)
-        should_eval = self.run_step(
-            ideal_step, replay, primitives=primitives, target_efficiency=target_eff
-        )
+        unmerge_eval = report.unmerge_eval
+        mainline_eval = report.mainline_eval
+        should_eval = report.dsl_eval
         table = aligned_table_for(
             mainline_eval,
             tier_spans=(
@@ -577,7 +526,7 @@ class PredictionSpine:
             unmerge=unmerge_eval,
             mainline=mainline_eval,
             should_achieve=should_eval,
-            target_efficiency=float(target_eff),
+            certified_lower_bound_ms=float(report.ladder.l_star_lean_ns) / NS_PER_MS,
             aligned_table=table,
         )
 

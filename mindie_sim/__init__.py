@@ -57,8 +57,6 @@ from .prediction.deepep import (
 from .prediction.efficiency import (
     analyze_network_efficiency,
     analyze_operator_row,
-    evaluate_target_efficiency,
-    fit_efficiency_targets,
     scale_case_hardware,
     solve_sla_sizing,
 )
@@ -75,6 +73,7 @@ from .sweep import (
     sweep_topology_grid,
     sweep_topology_grid_iter,
 )
+from .api import optimize_ladder
 from .public import (
     CORE_PROVIDER,
     ENTRY_POINT_GROUP,
@@ -111,7 +110,6 @@ __all__ = [
     "list_custom_hardware_skus", "load_custom_hardware_skus_from_file",
     "resolve_custom_hardware_sku", "compose_custom_case",
     "analyze_network_efficiency", "analyze_operator_row",
-    "evaluate_target_efficiency", "fit_efficiency_targets",
     "scale_case_hardware", "solve_sla_sizing",
     "deepep_group_volume", "deepep_intra_volume", "standard_alltoall_volume",
     "analyze_shared_expert_overlap", "OffloadPolicy",
@@ -134,7 +132,7 @@ __all__ = [
     "list_optimization_mechanisms",
     "RuntimeStackProfile", "StackMechanismBinding",
     "register_runtime_stack", "load_runtime_stack_manifest",
-    "compare_feature_tracks",
+    "compare_feature_tracks", "optimize_ladder",
 ]
 
 _LAZY_SUBMODULES = frozenset({

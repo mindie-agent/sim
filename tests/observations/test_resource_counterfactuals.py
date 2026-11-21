@@ -28,7 +28,6 @@ from mindie_sim.prediction.efficiency import (
     legacy_service_regime_diagnostics,
     evaluate_fixed_plan,
     evaluate_resource_counterfactual,
-    evaluate_target_efficiency,
     extract_hardware_peaks,
     fit_case_roofline_regimes,
     prepare_fixed_plan,
@@ -252,52 +251,6 @@ def test_ready_complete_interval_is_not_published_as_service_busy():
     assert attribution["resource_service"] == []
     assert attribution["service_utilization_by_role"] == {}
     assert attribution["unaccounted_active_gap_ms"] == 0.0
-
-
-def test_serial_hbm_cube_bound_is_not_a_complete_step():
-    case = parse_case(_hybrid_case(layers=1))
-    peaks = extract_hardware_peaks(case)
-    hbm, bf16 = peaks["hbm_peak_bytes_per_s"], peaks["compute_peaks"]["bf16"]
-    operators = {"operators": [
-        {"physical_id": "hbm_stage", "occurrences": 1, "program": "ResourceEnvelope",
-         "duration_ms": 1.0, "total_ms": 1.0,
-         "operator": {"op_id": "stage.hbm", "family": "custom", "recipe": "serial",
-                      "phase": "decode", "stage": 0, "layer": 0, "dtype": "bf16",
-                      "local_shape": [1, 4096], "flops": 0.0, "vector_ops": 0.0,
-                      "hbm_bytes": 1e-3 * hbm, "link_bytes": 0.0}},
-        {"physical_id": "cube_stage", "occurrences": 1, "program": "SteadyMatmul",
-         "duration_ms": 1.0, "total_ms": 1.0,
-         "operator": {"op_id": "stage.cube", "family": "custom", "recipe": "serial",
-                      "phase": "decode", "stage": 0, "layer": 0, "dtype": "bf16",
-                      "local_shape": [16, 4096], "flops": 1e-3 * bf16,
-                      "vector_ops": 0.0, "hbm_bytes": 0.0, "link_bytes": 0.0}},
-    ]}
-    base = analyze_network_efficiency(
-        case, phase="decode", tokens=1, context=1024, sequences=1,
-        operator_report=operators, graph_report={"duration_ms": 2.0})
-    bounded = evaluate_target_efficiency(
-        case, phase="decode", tokens=1, context=1024, sequences=1,
-        target_mbu=1.0, target_cube_mfu=1.0, target_vec_mfu=1.0, baseline_analysis=base)
-    assert bounded["current_step_duration_ms"] == pytest.approx(2.0, rel=1e-12)
-    assert bounded["target_step_duration_ms"] == pytest.approx(1.0, rel=1e-12)
-    assert bounded["target_step_is_lower_bound"] is True
-    isolated_sum_scaling = (bounded["current_step_duration_ms"]
-                            * bounded["target_operator_sum_ms"] / bounded["current_operator_sum_ms"])
-    assert bounded["target_step_duration_ms"] < isolated_sum_scaling
-    assert bounded["target_pipe_totals_ms"]["hbm"] == pytest.approx(1.0, rel=1e-12)
-    assert bounded["target_pipe_totals_ms"]["cube"] == pytest.approx(1.0, rel=1e-12)
-
-    scenario = solve_sla_sizing(
-        _hybrid_case(), sla_ms=1e-6, context=2048, max_sequences_per_dp=2,
-        scenarios=[{"id": "target", "target_mbu": 1.0,
-                    "target_cube_mfu": 1.0, "target_vec_mfu": 1.0}])["scenarios"][0]
-    assert scenario["feasibility_status"] == "target_bound_only_unverified"
-    assert scenario["sla_feasible"] is False
-    assert scenario["b_sla"] == 0 and scenario["b_feasible"] == 0
-    assert scenario["target_bound_is_lower_bound"] is True
-    assert scenario["target_bound_step_ms_at_b1"] is not None
-    assert scenario["step_ms_at_b1"] > 0.0
-    assert scenario["search"]["lower_bound_can_prove_feasibility"] is False
 
 
 def test_prefill_capacity_uses_prompt_window_and_pairs_stages():

@@ -3,13 +3,11 @@
 [Role]
   Evaluate ``(model, hardware, parallel)`` across all four software states
   (``raw_eager`` -> ``merged`` -> ``unmerged_pr`` -> ``expected_ideal``) plus
-  the hardware roofline anchor (``0.8x target`` & ``1.0x physical ideal``) on
-  the realized occurrence DAG critical path.
+  the 1.0x physical roofline from the realized occurrence DAG critical path.
 
 [Invariants]
   * Every level executes through the exact same ``compose_case`` +
-    ``analyze_network_efficiency`` / ``evaluate_target_efficiency(..., mode="exact_target")``
-    pipeline on identical checkpoint quantization.
+    ``analyze_network_efficiency`` pipeline on identical checkpoint quantization.
   * Monotonicity (``raw_eager >= merged >= unmerged_pr >= expected_ideal >= physical_1p0x``)
     is audited explicitly within floating-point tolerance ``1e-5`` ms.
   * PR ablation reports both single-add (``merged + {PR}``) and leave-one-out
@@ -27,18 +25,12 @@ from collections.abc import Mapping
 from typing import Any
 
 from mindie_sim.compose import compose_case
-from mindie_sim.prediction.efficiency import (
-    analyze_network_efficiency,
-    evaluate_target_efficiency,
-)
+from mindie_sim.prediction.efficiency import analyze_network_efficiency
 
 WATERFALL_SCHEMA = "mindie-sim.feature-waterfall/1"
 MONOTONIC_TOLERANCE_MS = 1e-5
 DEFAULT_WATERFALL_CONTEXT = 4096
 DEFAULT_WATERFALL_SEQUENCES = 8
-DEFAULT_ROOFLINE_MBU = 0.80
-DEFAULT_ROOFLINE_CUBE_MFU = 0.75
-DEFAULT_ROOFLINE_VEC_MFU = 0.65
 MS_PRECISION_DIGITS = 6
 PCT_PRECISION_DIGITS = 3
 RATIO_PRECISION_DIGITS = 4
@@ -78,9 +70,6 @@ def compare_feature_tracks(
     context: int = DEFAULT_WATERFALL_CONTEXT,
     sequences: int = DEFAULT_WATERFALL_SEQUENCES,
     scope: str = "body",
-    target_mbu: float = DEFAULT_ROOFLINE_MBU,
-    target_cube_mfu: float = DEFAULT_ROOFLINE_CUBE_MFU,
-    target_vec_mfu: float = DEFAULT_ROOFLINE_VEC_MFU,
     ablate_prs: bool = True,
     **compose_kwargs: Any,
 ) -> dict[str, Any]:
@@ -119,23 +108,15 @@ def compare_feature_tracks(
         sequences=sequences, scope=scope,
     )
 
-    roofline_eval = evaluate_target_efficiency(
-        cases["expected_ideal"],
-        phase=phase, tokens=tokens, context=context,
-        sequences=sequences, scope=scope,
-        target_mbu=target_mbu,
-        target_cube_mfu=target_cube_mfu,
-        target_vec_mfu=target_vec_mfu,
-        mode="exact_target",
-        baseline_analysis=analyses["expected_ideal"],
-    )
-
     eager_ms = float(analyses["raw_eager"]["graph_duration_ms"])
     merged_ms = float(analyses["merged"]["graph_duration_ms"])
     pr_ms = float(analyses["unmerged_pr"]["graph_duration_ms"])
     ideal_ms = float(analyses["expected_ideal"]["graph_duration_ms"])
-    roof_0p8_ms = float(roofline_eval["target_step_duration_ms"])
-    roof_1p0_ms = float(roofline_eval["physical_ideal_ms"])
+    ideal_eff = analyses["expected_ideal"]
+    roof_1p0_ms = max(
+        float(ideal_eff.get("critical_path_roofline_ms") or 0.0),
+        float(ideal_eff.get("physical_resource_cut_ms") or 0.0),
+    ) or float(ideal_eff.get("total_roofline_ideal_ms") or 0.0)
 
     eager_report = cases["raw_eager"]["runtime"]["metadata"]["feature_track_report"]
     merged_report = cases["merged"]["runtime"]["metadata"]["feature_track_report"]
@@ -260,20 +241,12 @@ def compare_feature_tracks(
                 "active_mechanisms": [m["id"] for m in ideal_report["active_mechanisms"]],
             },
             "hardware_roofline": {
-                "critical_path_0p8x_ms": round(roof_0p8_ms, MS_PRECISION_DIGITS),
                 "physical_ideal_1p0x_ms": round(roof_1p0_ms, MS_PRECISION_DIGITS),
-                "remaining_kernel_micro_gap_to_0p8x_ms": round(max(0.0, ideal_ms - roof_0p8_ms), MS_PRECISION_DIGITS),
                 "remaining_kernel_micro_gap_to_1p0x_ms": round(max(0.0, ideal_ms - roof_1p0_ms), MS_PRECISION_DIGITS),
-                "targets": {
-                    "mbu": target_mbu,
-                    "cube_mfu": target_cube_mfu,
-                    "vec_mfu": target_vec_mfu,
-                },
             },
         },
         "efficiency_reference": {
-            "target_step_duration_ms": round(roof_0p8_ms, MS_PRECISION_DIGITS),
             "physical_ideal_ms": round(roof_1p0_ms, MS_PRECISION_DIGITS),
-            "target_step_basis": roofline_eval["target_step_basis"],
+            "basis": "physical_1p0x_critical_path_roofline",
         },
     }

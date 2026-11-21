@@ -31,7 +31,6 @@ from mindie_sim.prediction import frontend as frontend_module
 from mindie_sim.prediction.call_builders import build_aclnn_call
 from mindie_sim.prediction.efficiency import (
     analyze_network_efficiency,
-    evaluate_target_efficiency,
 )
 from mindie_sim.prediction.index_pool import _visited_pool_rows
 from mindie_sim.prediction.structure import parse_case
@@ -199,31 +198,6 @@ def test_visited_pool_rows_honors_pcp_query_ranges_and_noncausal_extent():
         [SimpleNamespace(q_len=2, context=8192, kv_len=16384, prefix_tokens=0,
                          prefix_cache_key="", request_id="r", query_ranges=())],
         noncausal, runtime=shared) == 4096
-
-
-# --------------------------------------------------------------------------- #
-# Finding 7 (P0): exact-target aggregation must retain family overrides.
-# --------------------------------------------------------------------------- #
-def test_exact_target_retains_per_family_hbm_requirement():
-    case = compose_case(
-        "qwen3-32b", hardware="a5", tp=1, ep=1, num_devices=1, layers=4,
-        prompt_tokens=64, output_tokens=2)
-    base = evaluate_target_efficiency(
-        case, phase="decode", tokens=1, context=64, sequences=1,
-        mode="exact_target")
-    slower = evaluate_target_efficiency(
-        case, phase="decode", tokens=1, context=64, sequences=1,
-        mode="exact_target",
-        family_targets={"gate_up_projection": {"target_mbu": 0.1}})
-
-    assert slower["physical_ideal_ms"] == pytest.approx(base["physical_ideal_ms"])
-    assert slower["target_step_duration_ms"] > base["target_step_duration_ms"] * 4.0
-    assert slower["target_step_duration_ms"] == pytest.approx(
-        slower["raw_target_duration_ms"])
-    expected_mbu = (slower["current_network_mbu"]
-                    * slower["current_step_duration_ms"]
-                    / slower["target_step_duration_ms"])
-    assert slower["target_network_mbu"] == pytest.approx(expected_mbu)
 
 
 # --------------------------------------------------------------------------- #

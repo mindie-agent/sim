@@ -202,6 +202,11 @@ def uses_retained_source_plan(op) -> bool:
 
         # The native Chunk32 caller supplies one leaf's layout and work contract.
         return op.recipe in {PREPARE_RECIPE, STATE_RECIPE, OUTPUT_RECIPE}
+    if "mc2_v2_local" in metadata:
+        from .mc2_local_caller import LOCAL
+
+        # Preserve the retained local-caller lower bound for explicit V2 caller graphs.
+        return op.recipe == LOCAL
     return False
 
 

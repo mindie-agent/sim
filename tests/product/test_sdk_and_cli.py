@@ -8,7 +8,7 @@
   ``calibrate record samples.jsonl`` stay unambiguous. ``TimeoutError`` is
   never masked by ``except OSError:``. ``mindie_sim.__all__`` has zero
   duplicate exports.
-[Timeouts & Locks] Fast Tier-1 subprocess + in-memory checks (<5s).
+[Timeouts & Locks] Bounded CLI subprocesses and full-model analytical replay.
 [Side-Effect Policy] Writes only inside pytest ``tmp_path``.
 """
 from __future__ import annotations
@@ -20,13 +20,13 @@ import sys
 
 import pytest
 
-from _support.axes import SKUS
+from _support.axes import REPRESENTATIVE_SKUS, SKUS
 import mindie_sim
 import mindie_sim.api as sdk_api
 import mindie_sim.cli as cli_mod
 from mindie_sim.cli_parser import resolve_route
 from mindie_sim.compose import compose_case as compose_raw_case
-from mindie_sim.prediction.results import DEFAULT_TARGET_EFFICIENCY, StepRequest
+from mindie_sim.prediction.results import StepRequest
 
 pytestmark = pytest.mark.tier1
 
@@ -36,7 +36,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 def test_cli_entrypoint_parity_disambiguation_and_timeout_propagation(tmp_path, monkeypatch):
     raw_case = compose_raw_case(
         model="qwen3-32b",
-        hardware="Ascend910B2",
+        hardware=REPRESENTATIVE_SKUS["a2"],
         dp=1, tp=1, pp=1, layers=1,
     )
     case_path = tmp_path / "case.json"
@@ -105,18 +105,31 @@ def test_cli_entrypoint_parity_disambiguation_and_timeout_propagation(tmp_path, 
     assert bp_canon.path == ("calibrate", "bind-profiler")
     assert bp_canon_rest == ("cat.sqlite", "store.sqlite", "b.jsonl")
 
-    # Canonical three-tier CLI command.
+    # Canonical three-tier & certified optimize CLI commands (zero 0.80x scaling).
     out_tiers = tmp_path / "tiers.json"
     rc_tiers = cli_mod.main([
         "predict", "tiers", str(case_path),
         "--phase", "decode", "--tokens", "1", "--context", "64",
-        "--target-eff", "0.80", "--output", str(out_tiers),
+        "--output", str(out_tiers),
     ])
     assert rc_tiers == 0
     tiers_payload = json.loads(out_tiers.read_text(encoding="utf-8"))
-    assert tiers_payload["target_efficiency"] == pytest.approx(0.80)
+    assert tiers_payload["certified_lower_bound_ms"] >= 0.0
     assert tiers_payload["should_achieve"]["span_ms"] > 0.0
+    assert tiers_payload["should_achieve"]["span_ms"] >= tiers_payload["certified_lower_bound_ms"] - 1e-6
     assert tiers_payload["aligned_table"]["graph_id"] == tiers_payload["mainline"]["graph_id"]
+
+    out_opt = tmp_path / "opt.json"
+    rc_opt = cli_mod.main([
+        "optimize", str(case_path),
+        "--phase", "decode", "--tokens", "1", "--context", "64",
+        "--max-trials", "4", "--output", str(out_opt),
+    ])
+    assert rc_opt == 0
+    opt_payload = json.loads(out_opt.read_text(encoding="utf-8"))
+    assert opt_payload["schema"] == "mindie-sim.five-level-report/1"
+    lad = opt_payload["ladder"]
+    assert 0 <= lad["l_star_lean_ns"] <= lad["a_star_dsl_ns"] <= lad["a_star_framework_ns"] <= min(lad["m_mainline_ns"], lad["u_unmerge_ns"])
 
     # predict step --view operators and --view efficiency (including --primitives :memory: & --include-submission).
     out_ops = tmp_path / "ops_view.json"
@@ -154,42 +167,29 @@ def test_cli_entrypoint_parity_disambiguation_and_timeout_propagation(tmp_path, 
 
 @pytest.mark.parametrize("sku", SKUS)
 def test_typed_sdk_three_tier_evaluation_and_exports(sku):
-    from mindie_sim.prediction.spine import _scale_case_efficiency, default_spine
-    from mindie_sim.stack_registry import LoweringRequest
+    import mindie_sim.prediction.results as results_mod
+    import mindie_sim.prediction.spine as spine_mod
+
+    assert not hasattr(spine_mod, "_scale_case_efficiency")
+    assert not hasattr(results_mod, "DEFAULT_TARGET_EFFICIENCY")
 
     case = sdk_api.compose_case(
         "qwen3-32b", hardware=sku, options={"dp": 1, "tp": 1, "pp": 1, "layers": 1}
     )
     req = StepRequest(phase="decode", tokens=1, context=64, sequences=1, scope="body")
-    tiers = sdk_api.evaluate_three_tiers(case, req, target_eff=DEFAULT_TARGET_EFFICIENCY)
+    tiers = sdk_api.evaluate_three_tiers(case, req)
     assert tiers.unmerge.span_ms > 0.0
     assert tiers.mainline.span_ms > 0.0
     assert tiers.should_achieve.span_ms > 0.0
+    assert 0.0 <= tiers.certified_lower_bound_ms <= tiers.should_achieve.span_ms + 1e-6
+    assert tiers.should_achieve.span_ms <= min(tiers.mainline.span_ms, tiers.unmerge.span_ms) + 1e-6
     assert tiers.aligned_table is not None
     assert tiers.aligned_table.graph_id == tiers.mainline.graph_id
     assert len(tiers.aligned_table.tier_spans_ms) == 3
 
-    # Vol-5 roofline monotonicity: 0 < ideal(1.0x) <= should_achieve(0.80x) without double-derating.
-    spine = default_spine()
-    ideal_step = spine.lower(
-        case, LoweringRequest(step=req, tier="should_achieve", apply_body_defaults=True, production_capture=True)
-    )
-    ideal_eval = spine.run_step(ideal_step, target_efficiency=1.0)
-    assert 0.0 < ideal_eval.span_ms <= tiers.should_achieve.span_ms
-    assert tiers.should_achieve.span_ms <= ideal_eval.span_ms / DEFAULT_TARGET_EFFICIENCY + 1e-6
-
-    if sku == "Ascend950DT_9581":
-        a5_tp8 = sdk_api.compose_case(
-            "qwen3-32b", hardware=sku, options={"dp": 1, "tp": 8, "pp": 1, "num_devices": 8, "layers": 1}
-        )
-        scaled = _scale_case_efficiency(a5_tp8, 0.80)
-        modes = dict(scaled.machine.dies[0].service_modes)
-        hbm_peak = dict(a5_tp8.machine.dies[0].rates)["hbm"]
-        assert modes["mte2_aiv_dram"][1] == pytest.approx(hbm_peak * 0.80)
-        link0 = scaled.machine.links[0]
-        assert link0.capacity_bytes_per_ms == pytest.approx(
-            a5_tp8.machine.links[0].effective_peak_capacity_bytes_per_ms * 0.80
-        )
+    report = sdk_api.optimize_ladder(case, req, max_trials=4)
+    lad = report.ladder
+    assert 0 <= lad.l_star_lean_ns <= lad.a_star_dsl_ns <= lad.a_star_framework_ns <= min(lad.m_mainline_ns, lad.u_unmerge_ns)
 
     assert len(mindie_sim.__all__) == len(set(mindie_sim.__all__))
 
@@ -202,7 +202,7 @@ def test_typed_sdk_service_sla_sweep_and_production_capture_resolution():
 
     case = sdk_api.compose_case(
         "qwen3-32b",
-        hardware="Ascend910B2",
+        hardware=REPRESENTATIVE_SKUS["a2"],
         options={
             "dp": 1, "tp": 1, "pp": 1, "layers": 1,
             "prompt_tokens": 32, "output_tokens": 2, "concurrency": 1,
@@ -265,18 +265,17 @@ def test_typed_sdk_service_sla_sweep_and_production_capture_resolution():
     assert resolved.case.runtime.graph_capture_mode == "full"
     assert resolved.case.runtime.graph_capture_keys == tuple(capture_keys(max(16, int(case.runtime.max_num_seqs or 16)), 2))
 
-    # In-graph predecessor occurrences preserve producer physical rank (not None), and endpoint_rates never inflate.
+    # In-graph predecessor occurrences preserve producer physical rank (not None).
     step_ev = sdk_api.evaluate_step(case, StepRequest(phase="decode", tokens=1, context=64, sequences=1))
     with_preds = [row for row in step_ev.operators if row.predecessors and row.predecessors[0].op_id != "analysis_input"]
     assert with_preds and all(pred.rank == 0 for pred in with_preds[0].predecessors)
 
-    from mindie_sim.prediction.spine import _scale_case_efficiency
-    from mindie_sim.schema.hardware import Link
 
-    ep_link = Link(
-        name="ep_test:0", capacity_bytes_per_ms=40.0, peak_capacity_bytes_per_ms=50.0,
-        bw_utilization=0.80, members=(0, 1), endpoint_rates=((0, 45.0), (1, 45.0)),
-    )
-    ep_case = replace(case, machine=replace(case.machine, links=(ep_link,)))
-    ep_scaled = _scale_case_efficiency(ep_case, 1.0)
-    assert dict(ep_scaled.machine.links[0].endpoint_rates)[0] <= 45.0
+def test_top_level_optimize_ladder_replays_default_routed_schedule():
+    case = compose_raw_case("deepseek-v4-flash", REPRESENTATIVE_SKUS["a5"], tp=4, ep=4)
+    report = mindie_sim.optimize_ladder(case, StepRequest("decode", context=64))
+    ladder = report.ladder
+    assert mindie_sim.optimize_ladder is sdk_api.optimize_ladder
+    assert report.verification.passed and report.verification.scope == "full"
+    assert 0 < ladder.l_star_lean_ns <= ladder.a_star_dsl_ns <= ladder.a_star_framework_ns
+    assert ladder.a_star_framework_ns <= min(ladder.m_mainline_ns, ladder.u_unmerge_ns)

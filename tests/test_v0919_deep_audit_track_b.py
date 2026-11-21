@@ -31,7 +31,6 @@ from mindie_sim.prediction import efficiency as efficiency_module
 from mindie_sim.prediction.efficiency import (
     _lower_and_run_graph,
     analyze_network_efficiency,
-    evaluate_target_efficiency,
     solve_sla_sizing,
 )
 from mindie_sim.prediction.frontend import Frontend
@@ -592,22 +591,10 @@ def test_exact_target_preserves_occurrence_dag_and_never_exceeds_one():
     raw["model"]["layers"] = 1
     baseline = analyze_network_efficiency(
         raw, phase="decode", tokens=1, context=32, sequences=1, scope="model")
-    target = evaluate_target_efficiency(
-        raw, phase="decode", tokens=1, context=32, sequences=1,
-        scope="model", mode="exact_target")
-    unit = evaluate_target_efficiency(
-        raw, phase="decode", tokens=1, context=32, sequences=1,
-        scope="model", mode="exact_target",
-        target_mbu=1.0, target_cube_mfu=1.0,
-        target_vec_mfu=1.0, target_link_util=1.0)
 
     assert len(baseline["critical_path_nodes"]) == 15
     assert baseline["critical_path_roofline_ms"] == pytest.approx(0.033888)
-    assert target["critical_path_nodes"] == baseline["critical_path_nodes"]
-    assert target["target_network_roofline_efficiency"] <= 1.0
-    assert target["target_step_duration_ms"] >= target["physical_ideal_ms"]
-    assert unit["target_step_duration_ms"] == pytest.approx(0.033888)
-    assert unit["target_network_roofline_efficiency"] == pytest.approx(1.0)
+    assert baseline["network_roofline_efficiency"] <= 1.0
 
 
 def test_unmodeled_gate_resolves_layer_override_and_flat_timeline():

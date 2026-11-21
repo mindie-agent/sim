@@ -43,7 +43,7 @@ from mindie_sim.catalog.quant import quant_preset
 from mindie_sim.catalog.weights import cache_row_bytes_by_layer, engram_table_terms
 from mindie_sim.catalog.weights import layer_weight_terms, stage_weight_bytes
 from mindie_sim.model_catalog import ARCHITECTURE_PRESET_CATALOG, load_model
-from mindie_sim.prediction.efficiency import evaluate_target_efficiency, solve_sla_sizing
+from mindie_sim.prediction.efficiency import analyze_network_efficiency, solve_sla_sizing
 from mindie_sim.prediction.gated_activation import gated_activation
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.prediction.topology import Topology
@@ -132,7 +132,7 @@ def test_partial_attention_keeps_projections_and_refuses_fabricated_timing() -> 
         assert raised.value.onboarding_hint["ssot_owner_repo"] == "mindie-sim"
 
 @pytest.mark.parametrize("entry", (
-    "predict", "operator_costs", "evaluate_target_efficiency", "solve_sla_sizing",
+    "predict", "operator_costs", "analyze_network_efficiency", "solve_sla_sizing",
 ))
 def test_timing_entries_refuse_an_unmodeled_attention_core(entry):
     raw = compose_case("qwen3-32b", hardware=SKUS[1], layers=2)
@@ -141,7 +141,7 @@ def test_timing_entries_refuse_an_unmodeled_attention_core(entry):
     calls = {
         "predict": lambda: predict(raw),
         "operator_costs": lambda: operator_costs(raw, target_operators(raw, phase="prefill", tokens=3)),
-        "evaluate_target_efficiency": lambda: evaluate_target_efficiency(raw, phase="prefill", tokens=3),
+        "analyze_network_efficiency": lambda: analyze_network_efficiency(raw, phase="prefill", tokens=3),
         "solve_sla_sizing": lambda: solve_sla_sizing(raw, sla_ms=100),
     }
     with pytest.raises(UnmodeledCapabilityError) as raised:

@@ -25,7 +25,6 @@ import pytest
 from mindie_sim import predict_pd
 from mindie_sim.prediction.efficiency import (
     analyze_network_efficiency,
-    evaluate_target_efficiency,
 )
 from test_prediction_deployment import pd_case
 from test_prediction_system import case as plain_case
@@ -91,25 +90,10 @@ def test_pd_handoff_weights_destination_shards_by_exact_token_rows():
 def test_public_baseline_round_trips_the_occurrence_dag():
     raw = plain_case(prompt=4, output=2)
     raw["model"]["layers"] = 1
-    options = dict(
-        phase="decode", tokens=1, context=32, sequences=1, scope="model",
-        mode="exact_target", target_mbu=1.0, target_cube_mfu=1.0,
-        target_vec_mfu=1.0, target_link_util=1.0, fixed_launch_us=10)
-    direct = evaluate_target_efficiency(raw, **options)
     baseline = analyze_network_efficiency(
         raw, phase="decode", tokens=1, context=32, sequences=1, scope="model")
     assert "occurrence_dag" in baseline
-
     public = json.loads(json.dumps(baseline))
-    repeated = evaluate_target_efficiency(
-        raw, **options, baseline_analysis=public)
-
-    assert len(direct["critical_path_nodes"]) == 15
-    assert repeated["critical_path_nodes"] == direct["critical_path_nodes"]
-    assert repeated["target_step_duration_ms"] == pytest.approx(
-        direct["target_step_duration_ms"])
-    assert repeated["target_step_duration_ms"] == pytest.approx(0.183888)
-    assert repeated["physical_ideal_ms"] == pytest.approx(0.033888)
-    assert repeated["target_network_roofline_efficiency"] == pytest.approx(
-        direct["target_network_roofline_efficiency"])
-    assert repeated["target_network_roofline_efficiency"] <= 1.0
+    assert len(public["critical_path_nodes"]) == 15
+    assert public["critical_path_roofline_ms"] == pytest.approx(0.033888)
+    assert public["network_roofline_efficiency"] <= 1.0

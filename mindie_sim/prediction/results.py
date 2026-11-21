@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields, is_dataclass
+from fractions import Fraction
 import math
 from pathlib import Path
 from typing import Literal, TypeAlias
@@ -37,8 +38,6 @@ JsonObject: TypeAlias = Mapping[str, JsonValue]
 CaseInput: TypeAlias = Case | Mapping[str, object]
 ModelInput: TypeAlias = str | Path | Mapping[str, object]
 HardwareInput: TypeAlias = str | Mapping[str, object]
-
-DEFAULT_TARGET_EFFICIENCY = 0.80
 
 
 class FrozenJsonMapping(Mapping[str, JsonValue]):
@@ -77,6 +76,11 @@ def freeze_json(value: object, /) -> JsonValue:
         if not math.isfinite(value):
             raise ValueError(f"non_finite_json_float:{value!r}")
         return value
+    if isinstance(value, Fraction):
+        return FrozenJsonMapping({
+            "numerator": value.numerator,
+            "denominator": value.denominator,
+        })
     if isinstance(value, Path):
         return str(value)
     if is_dataclass(value) and not isinstance(value, type):
@@ -103,6 +107,11 @@ def json_payload(value: object, /) -> object:
         if not math.isfinite(value):
             raise ValueError(f"non_finite_json_float:{value!r}")
         return value
+    if isinstance(value, Fraction):
+        return {
+            "numerator": value.numerator,
+            "denominator": value.denominator,
+        }
     if isinstance(value, Path):
         return str(value)
     if is_dataclass(value) and not isinstance(value, type):
@@ -266,7 +275,7 @@ class ThreeTierEvaluation:
     unmerge: StepEvaluation
     mainline: StepEvaluation
     should_achieve: StepEvaluation
-    target_efficiency: float
+    certified_lower_bound_ms: float = 0.0
     aligned_table: AlignedSequenceTable | None = None
 
 
@@ -384,7 +393,6 @@ def aligned_table_for(
 __all__ = [
     "AlignedSequenceTable",
     "CaseInput",
-    "DEFAULT_TARGET_EFFICIENCY",
     "FrozenJsonMapping",
     "FusedPipelineDescriptor",
     "FusedPipelineSpec",

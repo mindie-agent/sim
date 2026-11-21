@@ -185,6 +185,8 @@ owns = [
   "mindie_sim/prediction/recover_ssm_work.py",
   "mindie_sim/prediction/collective_startup.py",
   "mindie_sim/prediction/roofline_graph.py",
+  "mindie_sim/optimization/dual_bound.py",
+  "mindie_sim/optimization/reload_bounds.py",
 ]
 
 # ---------------------------------------------------------------- collectives
@@ -530,7 +532,11 @@ reserved = true
 [[module]]
 path = "product/test_three_tier_replay.py"
 tier = "tier0"
-reserved = true
+owns = [
+  "mindie_sim/optimization/ladder.py",
+  "mindie_sim/optimization/contracts.py",
+  "mindie_sim/prediction/efficiency",
+]
 
 [[module]]
 path = "product/test_accuracy_gates.py"
@@ -540,12 +546,19 @@ reserved = true
 [[module]]
 path = "product/test_rewrite_apply.py"
 tier = "tier0"
-reserved = true
+owns = [
+  "mindie_sim/rewrite/schema.py",
+  "mindie_sim/rewrite/apply.py",
+]
 
 [[module]]
 path = "product/test_rewrite_verify_and_oracle.py"
 tier = "tier0"
-reserved = true
+owns = [
+  "mindie_sim/rewrite/verify.py",
+  "mindie_sim/optimization/framework_solver.py",
+  "mindie_sim/optimization/dsl_solver.py",
+]
 
 [[module]]
 path = "product/test_wheel_and_extension_sdk.py"
@@ -586,4 +599,6 @@ owns = ["mindie_sim/prediction/operators/sparse_indexer"]
 [[module]]
 path = "product/test_rewrite_oracle.py"
 tier = "tier0"
-reserved = true
+owns = [
+  "mindie_sim/rewrite/oracle.py",
+]
