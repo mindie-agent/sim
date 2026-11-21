@@ -1,7 +1,7 @@
 {
   "arch_preset": "npu_arch_2201",
   "cann_version": "unmeasured",
-  "envelope_sha256": "8e6ae5272109d122c2b5d8de042b508d2f6288d74e0c8b8f16530d9792706f14",
+  "envelope_sha256": "27f0edb9f9b344bce5973b6b30bcd5036808319c6c335de90daa239bcab4a8a6",
   "primitives": {
     "P01_datacopy": {
       "evidence_id": "",
@@ -24,7 +24,7 @@
         },
         "mte2_aiv_hit_bytes_per_s_per_core": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 96000000000.0
+          "certified_upper_capacity": 48000000000.0
         }
       },
       "modes": {},
@@ -45,7 +45,7 @@
       "metrics": {
         "l1_to_l0a_bytes_per_s_per_aic": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 192000000000.0
+          "certified_upper_capacity": 384000000000.0
         },
         "l1_to_l0b_bytes_per_s_per_aic": {
           "bound_kind": "rate_upper",
@@ -504,7 +504,7 @@
       "metrics": {
         "link_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 224000000000.0
+          "certified_upper_capacity": 24000000000.0
         },
         "startup_ns": {
           "bound_kind": "latency_lower",
@@ -514,7 +514,7 @@
       "modes": {},
       "parameters": {
         "payload_bytes_per_frame": 1024,
-        "short_final_frame_policy": "pad_full_frame",
+        "short_final_frame_policy": "exact_plus_header",
         "wire_bytes_per_frame": 1024
       },
       "status": "unmeasured",
@@ -528,7 +528,7 @@
       "metrics": {
         "peer_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 224000000000.0
+          "certified_upper_capacity": 24000000000.0
         },
         "status_sync_ns": {
           "bound_kind": "latency_lower",
@@ -556,11 +556,19 @@
         },
         "host_d2h_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 64000000000.0
+          "certified_upper_capacity": 31500000000.0
         },
         "host_h2d_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 64000000000.0
+          "certified_upper_capacity": 31500000000.0
+        },
+        "host_rc_d2h_bytes_per_s": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 225000000000.0
+        },
+        "host_rc_h2d_bytes_per_s": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 200000000000.0
         },
         "pageable_dma_startup_ns": {
           "bound_kind": "latency_lower",
@@ -584,9 +592,9 @@
   },
   "provenance": {
     "calibrated": false,
-    "campaign_id": "camp-202611-a2-l0",
-    "capture_uri": "capture://lab-a2-910b4/camp-202611-a2-l0/8c2b5fd88021cf9b9840f549bb2bab4e2a9de6f30263319ef6f7266b0beac6d4",
-    "collected_utc": "2026-11-20T22:19:32Z",
+    "campaign_id": "camp-202611-l0-a2",
+    "capture_uri": "capture://lab-a2-910b4/camp-202611-l0-a2/3508378527b55e7282df79cf6a71e43b3b2273c390cc3cac45bd14c9c85960c9",
+    "collected_utc": "2026-11-21T00:05:44Z",
     "endpoint_alias": "lab-a2-910b4",
     "silicon_fingerprint": {
       "aic_count": 20,

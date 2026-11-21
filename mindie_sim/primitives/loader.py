@@ -81,7 +81,7 @@ def resolve_primitive_rate(
         raise ModelingError(f"primitive_rate_role_invalid:{role}")
     band = cell.band(metric, mode=mode)
     warnings = _simulation_warnings(cell, mode, role, allow_uncalibrated_declaration, band_measured=band.p50 is not None)
-    return band.sim_rate_p50, warnings
+    return band.resolved_sim_rate(allow_uncalibrated_declaration=allow_uncalibrated_declaration), warnings
 
 
 def _nonnegative_int(value: Any, label: str, minimum: int = 0) -> int:
@@ -142,13 +142,14 @@ def _unique_entry(matches: list[Mapping[str, Any]], reason: str) -> Mapping[str,
 def load_primitives(
     sku_or_path: str | Path, *, datapath: DatapathCapabilitySpec | None = None,
     primitives_dir: Path | None = None, allow_uncalibrated_declaration: bool = False,
-    verify_manifest: bool = True, require_calibrated: bool = False,
+    require_calibrated: bool = False,
 ) -> PrimitiveTable:
-    """Read a SKU or a table path, optionally requiring a calibrated campaign."""
+    """Read a SKU or a table path, always verifying against the trusted manifest."""
+    del allow_uncalibrated_declaration
     path = Path(sku_or_path)
     direct = isinstance(sku_or_path, Path) or path.suffix == ".json" or path.parent != Path(".") or path.is_file()
     directory = default_primitives_dir() if primitives_dir is None else Path(primitives_dir)
-    entries = load_manifest(directory)["tables"] if verify_manifest or not direct else {}
+    entries = load_manifest(directory)["tables"]
     entry = None
     if not direct:
         sku = str(sku_or_path)
@@ -158,16 +159,20 @@ def load_primitives(
         ], f"primitive_table_sku_unknown_or_ambiguous:{sku}")
         path = directory / entry["file"]
     raw = _read_json(path, "table")
-    if direct and verify_manifest:
+    if direct:
         entry = _unique_entry([
             value for key, value in entries.items()
             if value["file"] == path.name or raw.get("sku") == value.get("sku", key)
         ], "primitive_table_sha256_mismatch")
-    if verify_manifest and (
+    prov = raw.get("provenance") if isinstance(raw.get("provenance"), Mapping) else {}
+    if (
         raw.get("envelope_sha256") != entry.get("envelope_sha256")
         or compute_envelope_sha256(raw) != entry.get("envelope_sha256")
         or raw.get("sku") != entry.get("sku", raw.get("sku"))
         or raw.get("arch_preset") != entry.get("arch_preset", raw.get("arch_preset"))
+        or raw.get("cann_version") != entry.get("cann_version", raw.get("cann_version"))
+        or prov.get("calibrated") != entry.get("calibrated", prov.get("calibrated"))
+        or prov.get("capture_uri") != entry.get("capture_uri", prov.get("capture_uri"))
     ):
         raise ModelingError("primitive_table_sha256_mismatch")
     table = parse_primitive_table(raw)

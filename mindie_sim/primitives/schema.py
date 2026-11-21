@@ -17,6 +17,7 @@ from dataclasses import dataclass, field, fields
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal
 
+from mindie_sim.prediction.collectives.protocol import frame_wire_bytes as _protocol_frame_wire_bytes
 from mindie_sim.prediction.runtime.memory_physics import (
     DEFAULT_SECTOR_BYTES, AddressRun, AddressRunPlan, burst_turnaround_efficiency,
 )
@@ -111,14 +112,37 @@ class UncertaintyBand:
         quantiles = [value for value in (self.p05, self.p50, self.p95, self.p99) if value is not None]
         if quantiles != sorted(quantiles):
             raise ModelingError("uncertainty_band_quantile_order_invalid")
-        if self.bound_kind == "rate_upper" and self.p99 is not None and self.certified_upper_capacity < self.p99:
-            raise ModelingError("uncertainty_band_upper_below_p99")
-        if self.bound_kind == "latency_lower" and self.p05 is not None and self.certified_upper_capacity > self.p05:
-            raise ModelingError("uncertainty_band_lower_above_p05")
+        has_any_sample_stat = any(v is not None for v in (self.p05, self.p50, self.p95, self.p99, self.cv_pct)) or self.n_samples > 0
+        if has_any_sample_stat:
+            if self.n_samples < 1:
+                raise ModelingError("uncertainty_band_samples_required")
+            if any(v is None for v in (self.p05, self.p50, self.p95, self.p99, self.cv_pct)):
+                raise ModelingError("uncertainty_band_quantiles_required")
+            if self.bound_kind == "rate_upper":
+                if self.p05 <= 0 or self.p50 <= 0:
+                    raise ModelingError("uncertainty_band_rate_nonpositive")
+                if self.certified_upper_capacity < self.p50:
+                    raise ModelingError("uncertainty_band_upper_below_p50")
+                if self.certified_upper_capacity < self.p99:
+                    raise ModelingError("uncertainty_band_upper_below_p99")
+            else:
+                if self.certified_upper_capacity > self.p50:
+                    raise ModelingError("uncertainty_band_lower_above_p50")
+                if self.certified_upper_capacity > self.p05:
+                    raise ModelingError("uncertainty_band_lower_above_p05")
 
     @property
     def sim_rate_p50(self) -> float:
-        return self.certified_upper_capacity if self.p50 is None else self.p50
+        if self.p50 is None:
+            raise ModelingError("primitive_unmeasured_requires_declaration")
+        return self.p50
+
+    def resolved_sim_rate(self, *, allow_uncalibrated_declaration: bool = False) -> float:
+        if self.p50 is not None:
+            return self.p50
+        if not allow_uncalibrated_declaration:
+            raise ModelingError("primitive_unmeasured_requires_declaration")
+        return self.certified_upper_capacity
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any], *, bound_kind: BoundKind = "rate_upper") -> UncertaintyBand:
@@ -309,8 +333,11 @@ class PrimitiveCell:
         return cls(primitive_id, raw.get("status"), raw.get("units", {}), metrics,
                    raw.get("modes", {}), parameters, raw.get("evidence_id", ""))
 
-    def sim_rate_p50(self, metric: str, *, mode: str | None = None) -> float:
-        return self.band(metric, mode=mode).sim_rate_p50
+    def sim_rate_p50(self, metric: str, *, mode: str | None = None,
+                     allow_uncalibrated_declaration: bool = False) -> float:
+        return self.band(metric, mode=mode).resolved_sim_rate(
+            allow_uncalibrated_declaration=allow_uncalibrated_declaration,
+        )
 
     def certified_upper_capacity(self, metric: str, *, mode: str | None = None) -> float:
         return self.band(metric, mode=mode).certified_upper_capacity
@@ -366,8 +393,11 @@ class PrimitiveTable:
         except KeyError:
             raise ModelingError(f"primitive_id_unknown:{primitive_id}") from None
 
-    def sim_rate_p50(self, primitive_id: str, metric: str, *, mode: str | None = None) -> float:
-        return self.cell(primitive_id).sim_rate_p50(metric, mode=mode)
+    def sim_rate_p50(self, primitive_id: str, metric: str, *, mode: str | None = None,
+                     allow_uncalibrated_declaration: bool = False) -> float:
+        return self.cell(primitive_id).sim_rate_p50(
+            metric, mode=mode, allow_uncalibrated_declaration=allow_uncalibrated_declaration,
+        )
 
     def certified_upper_capacity(self, primitive_id: str, metric: str, *, mode: str | None = None) -> float:
         return self.cell(primitive_id).certified_upper_capacity(metric, mode=mode)
@@ -401,28 +431,36 @@ def parse_primitive_table(raw: Mapping[str, Any], *, verify_envelope: bool = Tru
     return table
 
 
-_FRAME_POLICIES = ("pad_full_frame", "exact_plus_header")
-ShortFramePolicy = Literal["pad_full_frame", "exact_plus_header"]
+_FRAME_POLICIES = ("exact_plus_header", "pad_full_frame")
+ShortFramePolicy = Literal["exact_plus_header", "pad_full_frame"]
 
 
 def frame_wire_bytes(
     payload_bytes: int, payload_bytes_per_frame: int, wire_bytes_per_frame: int,
-    short_final_frame_policy: ShortFramePolicy = "pad_full_frame",
+    short_final_frame_policy: ShortFramePolicy = "exact_plus_header",
 ) -> tuple[int, int]:
-    """Return exact wire bytes and frame count, including the short final frame."""
+    """Return exact wire bytes and frame count, sharing production protocol framing."""
     payload, size, wire = payload_bytes, payload_bytes_per_frame, wire_bytes_per_frame
     if any(type(value) is not int for value in (payload, size, wire)) or payload < 0 or not 1 <= size <= wire:
         raise ModelingError("primitive_frame_geometry_invalid")
     if short_final_frame_policy not in _FRAME_POLICIES:
         raise ModelingError("primitive_short_frame_policy_invalid")
+    if payload == 0:
+        return 0, 0
+    if short_final_frame_policy == "exact_plus_header":
+        band = CollectiveBandSpec.from_mapping({
+            "payload_bytes_per_frame": size, "wire_bytes_per_frame": wire,
+            "evidence_id": "frame_wire_bytes",
+        })
+        frames, wire_total = _protocol_frame_wire_bytes(payload, band)
+        return int(round(wire_total)), int(frames)
     frames = (payload + size - 1) // size
-    return (frames * wire if short_final_frame_policy == "pad_full_frame"
-            else payload + frames * (wire - size)), frames
+    return frames * wire, frames
 
 
 @dataclass(frozen=True, slots=True)
 class _FramedCollectiveBand(CollectiveBandSpec):
-    short_final_frame_policy: ShortFramePolicy = "pad_full_frame"
+    short_final_frame_policy: ShortFramePolicy = "exact_plus_header"
 
     def __post_init__(self) -> None:
         CollectiveBandSpec.__post_init__(self)
@@ -432,16 +470,71 @@ class _FramedCollectiveBand(CollectiveBandSpec):
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> _FramedCollectiveBand:
         base = CollectiveBandSpec.from_mapping(raw)
-        return cls(**base.to_dict(), short_final_frame_policy=raw.get("short_final_frame_policy", "pad_full_frame"))
+        return cls(**base.to_dict(), short_final_frame_policy=raw.get("short_final_frame_policy", "exact_plus_header"))
 
     def wire_bytes_for(self, payload_bytes: float) -> tuple[int, int]:
         if isinstance(payload_bytes, float) and payload_bytes.is_integer():
             payload_bytes = int(payload_bytes)
+        if self.short_final_frame_policy == "exact_plus_header":
+            if any(type(v) is not int for v in (payload_bytes, self.payload_bytes_per_frame, self.wire_bytes_per_frame)) or payload_bytes < 0:
+                raise ModelingError("primitive_frame_geometry_invalid")
+            frames, wire_total = _protocol_frame_wire_bytes(payload_bytes, self)
+            return int(round(wire_total)), int(frames)
         return frame_wire_bytes(payload_bytes, self.payload_bytes_per_frame,
                                 self.wire_bytes_per_frame, self.short_final_frame_policy)
 
     def to_dict(self) -> dict[str, Any]:
         return {**CollectiveBandSpec.to_dict(self), "short_final_frame_policy": self.short_final_frame_policy}
+
+
+def _submit_stars_plan(engine, stars_spec, stars_plan, after, name):
+    """Submit a descriptor sequence through production ``StarsDescriptorQueue``."""
+    from mindie_sim.prediction.execution.step_helpers import StarsDescriptorQueue
+
+    die, ns, desc_rows = stars_plan
+    queue = StarsDescriptorQueue(stars_spec, die_id=die, namespace=ns)
+    queue.ensure_engine_resources(engine)
+    prev_host, done_events = tuple(after), []
+    for occ, (replay_id, stream_id, host_ms, work) in enumerate(desc_rows):
+        ready = engine.submit(f"{name}:host_submit:{occ}", after=prev_host, latency=host_ms)
+        prev_host = (ready,)
+        k_done, _ = queue.submit_kernel(
+            engine, replay=replay_id, stream=stream_id, kernel_occurrence=occ,
+            descriptor_ready=ready, work=work, owner=name, die=die,
+        )
+        done_events.append(k_done)
+    return done_events[-1] if len(done_events) == 1 else engine.boundary(f"{name}:complete", after=tuple(done_events))
+
+
+def _stars_plan_span_ms(stars_spec, stars_plan) -> float:
+    from mindie_sim.prediction.runtime.engine import Engine
+
+    scratch = Engine((), backend="python")
+    done = _submit_stars_plan(scratch, stars_spec, stars_plan, (), "stars")
+    scratch.advance(until=(done,))
+    return float(done.time)
+
+
+def _program_span_ms(program: KernelProgram, ctx: Any) -> float:
+    """Derive exact isolated DAG span of a nested ``KernelProgram``."""
+    times: dict[str, float] = {}
+    for stage in program.stages:
+        ready = max((times.get(dep, 0.0) for dep in stage.after), default=0.0)
+        dur = float(stage.latency)
+        for row, amount in stage.work.items():
+            if not amount:
+                continue
+            rate = stage.caps.get(row)
+            if ctx is not None and row in ctx.rates:
+                units = ctx.resource_units.get(row, 1)
+                placed = stage.placement.get(row)
+                phys = float(ctx.rates[row]) * (len(placed) / units if placed else 1.0)
+                rate = min(phys, float(rate)) if rate else phys
+            dur = max(dur, float(amount) / (float(rate) if rate else 1.0))
+        if stage.program is not None:
+            dur = max(dur, _program_span_ms(stage.program, ctx))
+        times[stage.name] = ready + dur
+    return max(times.values(), default=0.0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -460,13 +553,28 @@ class PrimitiveLoweringResult:
     _live_access: tuple[str, MemoryAccessPattern, AdmissionMemoryView | None, HbmBusSpec] | None = field(
         default=None, init=False, repr=False, compare=False,
     )
+    _stars_plan: tuple[int, str, tuple[tuple[int, str, float, dict[str, float]], ...]] | None = field(
+        default=None, init=False, repr=False, compare=False,
+    )
+    _required_resources: tuple[tuple[str, float, str, int], ...] = field(
+        default=(), init=False, repr=False, compare=False,
+    )
 
     def _start_lowered(self, engine, after, memory_state, pattern, name_prefix):
-        """Submit the lowered DAG with live admission at its memory stage."""
+        """Submit the lowered DAG with live admission or STARS descriptor queue."""
         from mindie_sim.prediction.engine import Resource
         from mindie_sim.prediction.program.stages import scope_allocations
 
         name = name_prefix or self.primitive_id
+        missing = [
+            Resource(r_name, r_rate, r_unit, units=r_units)
+            for r_name, r_rate, r_unit, r_units in self._required_resources
+            if r_name not in engine.resources
+        ]
+        if missing:
+            engine.extend(missing)
+        if self.stars_spec is not None and self._stars_plan is not None:
+            return _submit_stars_plan(engine, self.stars_spec, self._stars_plan, after, name)
         if self.bound_access is None:
             return self.program.start(engine, name, engine.boundary(f"{name}:ready", after=after))
         if self._live_access is None:
@@ -475,9 +583,9 @@ class PrimitiveLoweringResult:
         access_name, built_pattern, built_state, bus = self._live_access
         pattern = built_pattern if pattern is None else pattern
         memory_state = built_state if memory_state is None else memory_state
-        missing = [Resource(row, 1.0, "progress") for row in (bus.row_r, bus.row_w) if row not in engine.resources]
-        if missing:
-            engine.extend(missing)
+        missing_bus = [Resource(row, 1.0, "progress") for row in (bus.row_r, bus.row_w) if row not in engine.resources]
+        if missing_bus:
+            engine.extend(missing_bus)
         events, consumed = {}, set()
         for stage in self.stages:
             consumed.update(stage.after)

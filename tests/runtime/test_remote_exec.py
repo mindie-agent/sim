@@ -194,8 +194,8 @@ def test_unattended_dispatch_requires_exact_endpoint_pin(endpoint_paths, spoof):
 
 
 @POSIX_ONLY
-@pytest.mark.parametrize("mode", [0o666, 0o620, 0o602, 0o644])
-def test_unattended_policy_requires_owner_only_write(endpoint_paths, mode):
+@pytest.mark.parametrize("mode", [0o666, 0o620, 0o602, 0o644, 0o600])
+def test_unattended_policy_requires_strict_private_mode(endpoint_paths, mode):
     home, cwd, _ = endpoint_paths
     endpoint = remote._endpoint(ENDPOINT)
     _write_config(cwd / "endpoints.json", {ALIAS: ENDPOINT})
@@ -203,7 +203,7 @@ def test_unattended_policy_requires_owner_only_write(endpoint_paths, mode):
     probe = Mock(return_value=CAPACITY)
     dispatcher = remote.RemoteDispatcher(cwd=cwd, local_c11_ready_fn=lambda: False, probe_fn=probe)
     receipt = dispatcher.resolve_target(1)
-    if mode == 0o644:
+    if mode == 0o600:
         assert receipt.resolved_target == "remote"
         assert receipt.endpoint_id == endpoint.endpoint_id
         probe.assert_called_once()
@@ -259,7 +259,7 @@ def bundle_source(tmp_path):
     module = root / "mindie_sim/example.py"
     module.parent.mkdir(parents=True)
     module.write_bytes(b"VALUE = 1\n")
-    _write_config(root / "data/primitives/manifest.json", {"tables": {}})
+    _write_config(root / "data/primitives/manifest.json", {"schema_version": "mindie-l0-primitives/1", "tables": {}})
     return root
 
 
@@ -333,9 +333,12 @@ def test_cache_byte_quota_protects_active_lease_then_evicts(bundle_source, tmp_p
     assert not (cache / next_digest).exists()
 
     lease.unlink()
+    abandoned = cache / ".incoming-stale"
+    abandoned.mkdir()
+    (abandoned / "junk.bin").write_bytes(b"x" * 64)
     second, _ = _stage(bundle_source, cache, request_id="c" * 32, quota=quota)
     assert remote.verify_staged_manifest(second) == next_digest
-    assert not first.exists()
+    assert not first.exists() and not abandoned.exists()
 
 
 @pytest.mark.parametrize("target", ["auto", "prefer_remote"])
@@ -394,11 +397,13 @@ def test_receipt_only_exports_allowlisted_redacted_fields(alias):
     }
 
 
-@pytest.mark.parametrize("field", ["host", "user", "auth_ref"])
-def test_endpoint_alias_cannot_leak_actual_connection_identity(endpoint_paths, field):
+@pytest.mark.parametrize("field,upper", [("host", False), ("host", True), ("user", False), ("auth_ref", False)])
+def test_endpoint_alias_cannot_leak_actual_connection_identity(endpoint_paths, field, upper):
     home, cwd, _ = endpoint_paths
     config = ENDPOINT | {"auth_ref": "private-login", "identity_file": str(home / "private-key")}
-    alias = config[field]
+    if upper:
+        config["host"] = "Compute.Example.Invalid"
+    alias = f"lab-{config[field].lower()}" if upper else config[field]
     dispatcher = remote.RemoteDispatcher(
         remote.RemoteExecPolicy(target="remote", authorized_aliases=(alias,)), cwd=cwd,
         endpoints_loader=lambda _: {alias: config}, probe_fn=lambda *_: CAPACITY,
@@ -406,10 +411,10 @@ def test_endpoint_alias_cannot_leak_actual_connection_identity(endpoint_paths, f
     receipt = dispatcher.resolve_target(1).to_dict()
     assert receipt["resolved_target"] == "remote"
     assert receipt["alias"] == "redacted"
-    encoded = _wire(receipt).decode()
-    for secret in (*config.values(), str(home), "$HOME"):
+    encoded = _wire(receipt).decode().casefold()
+    for secret in (*config.values(), str(home), "$home"):
         if isinstance(secret, str):
-            assert secret not in encoded
+            assert secret.casefold() not in encoded
 
 
 @pytest.fixture
@@ -454,10 +459,8 @@ def test_batch_parity_preserves_order_counts_and_predicted_spans(
     local_result, local_receipt = local.dispatch_batch(*args, deadline_s=JOB_TIMEOUT_S)
     remote_result, remote_receipt = routed.dispatch_batch(*args, deadline_s=JOB_TIMEOUT_S, local_runner=_unexpected)
 
-    assert local_receipt.resolved_target == "local"
-    assert remote_receipt.resolved_target == "remote"
-    assert remote_receipt.submission_state == "acknowledged"
-    assert remote_receipt.request_id == remote_result["request_id"]
+    assert local_receipt.resolved_target == "local" and remote_receipt.resolved_target == "remote"
+    assert remote_receipt.submission_state == "acknowledged" and remote_receipt.request_id == remote_result["request_id"]
     assert local_result["effective_workers"] == remote_result["effective_workers"] == 1
     stage = cache / remote_receipt.bundle_digest
     native.assert_called_once_with(stage)
@@ -468,20 +471,14 @@ def test_batch_parity_preserves_order_counts_and_predicted_spans(
     for direct, routed_row in zip(local_result["results"], remote_result["results"], strict=True):
         left, right = direct["result"], routed_row["result"]
         context = contexts[direct["candidate_id"]]
-        pairs = [(left, right)] if entrypoint == "run_step" else [
-            (left[tier], right[tier]) for tier in ("unmerge", "mainline", "should_achieve")
-        ]
+        pairs = [(left, right)] if entrypoint == "run_step" else [(left[tier], right[tier]) for tier in ("unmerge", "mainline", "should_achieve")]
         for local_step, remote_step in pairs:
-            assert local_step["graph_id"] == remote_step["graph_id"]
-            assert local_step["request"]["context"] == remote_step["request"]["context"] == context
+            assert local_step["graph_id"] == remote_step["graph_id"] and local_step["request"]["context"] == remote_step["request"]["context"] == context
             assert local_step["native_steps"] == remote_step["native_steps"] == 0
             local_ops, remote_ops = local_step["operators"], remote_step["operators"]
-            assert len(local_ops) == len(remote_ops) > 0
-            assert len(local_step["pipelines"]) == len(remote_step["pipelines"])
-            for operators in (local_ops, remote_ops):
-                assert [op["ordinal"] for op in operators] == list(range(len(operators)))
-            assert local_step["span_ms"] > 0
-            assert abs(local_step["span_ms"] - remote_step["span_ms"]) <= 1e-12
+            assert len(local_ops) == len(remote_ops) > 0 and len(local_step["pipelines"]) == len(remote_step["pipelines"])
+            assert all([op["ordinal"] for op in ops] == list(range(len(ops))) for ops in (local_ops, remote_ops))
+            assert local_step["span_ms"] > 0 and abs(local_step["span_ms"] - remote_step["span_ms"]) <= 1e-12
 
 
 @pytest.mark.tier1
@@ -530,3 +527,67 @@ def test_worker_module_canonical_stdio_and_mock_ssh_round_trip(tmp_path, monkeyp
         "raise SystemExit(main(ready=True))\n"
     )]
     assert remote._exchange(endpoint, ssh_command, request, JOB_TIMEOUT_S, handshake=True) == process.stdout
+
+
+def test_timeout_preserved_remaining_deadline_sent_and_c11_rebuilds_on_miss(
+    endpoint_paths, bundle_source, tmp_path, monkeypatch,
+):
+    _, cwd, _ = endpoint_paths
+    with pytest.raises(TimeoutError):
+        _dispatcher(cwd, "auto", warm=True, probe=Mock(side_effect=TimeoutError("probe"))).resolve_target(4)
+    now, seen = [100.0], []
+    monkeypatch.setattr(remote.time, "monotonic", lambda: now[0])
+    def stage_fn(*_):
+        now[0] += 3.5
+        return f"/stage/{BUNDLE_DIGEST}", BUNDLE_DIGEST
+    def exec_fn(_ep, payload, _digest, _policy):
+        seen.append(payload["deadline_s"])
+        return {"protocol_version": remote.PROTOCOL_VERSION, "request_id": payload["request_id"], "effective_workers": 1, "results": []}
+    _dispatcher(cwd, "remote", stage_fn=stage_fn, exec_fn=exec_fn).dispatch_batch("run_step", {}, [{}], deadline_s=10.0)
+    assert seen == [pytest.approx(6.5)]
+    stage, _ = _stage(bundle_source, tmp_path / "cache")
+    native_root = remote._native_root(stage)
+    remote._private_dir(native_root)
+    (native_root / remote.MANIFEST).write_bytes(b"stale")
+    from mindie_sim.prediction.runtime import accel_build, accel_loader
+    rebuilt = []
+    def fake_build(*, check_only=False):
+        if check_only:
+            return {"library_ready": False, "cache_path": str(native_root / "old.so")}
+        so = accel_build.cache_root() / "lib.so"
+        so.parent.mkdir(parents=True, exist_ok=True); so.write_bytes(b"ok"); rebuilt.append(so)
+        return {"library_ready": True, "cache_path": str(so)}
+    monkeypatch.setattr(accel_build, "build_accel", fake_build)
+    monkeypatch.setattr(accel_loader, "load_accel_cdll", lambda status: status)
+    worker._prepare_native(stage, build=True)
+    assert len(rebuilt) == 1 and remote.verify_staged_manifest(native_root)
+
+
+@POSIX_ONLY
+@pytest.mark.tier1
+def test_multiworker_staged_c11_matches_python_with_positive_native_steps(endpoint_paths, tmp_path, monkeypatch):
+    _, cwd, _ = endpoint_paths
+    case = sku_case(REPRESENTATIVE_SKUS["a2"])
+    cands = [{"candidate_id": f"c{ctx}", "objective_key": 0, "request": LoweringRequest(step=StepRequest(phase="decode", context=ctx))} for ctx in (16, 32)]
+    digest = remote.compute_bundle_digest(REPO_ROOT)
+    stage = remote.stage_bundle_local_dir(remote.build_bundle_archive(REPO_ROOT), tmp_path / "c11_cache", digest, request_id=REQUEST_ID, cache_quota_bytes=CACHE_QUOTA_BYTES, build_c11=True)
+    monkeypatch.setenv("MINDIE_SIM_ACCEL", "python")
+    py_res, _ = _dispatcher(cwd, "local").dispatch_batch("run_step", case, cands, deadline_s=30)
+    monkeypatch.setenv("MINDIE_SIM_ACCEL", "c")
+    rem_res, rem_rec = remote.RemoteDispatcher(
+        remote.RemoteExecPolicy(target="remote", authorized_aliases=(ALIAS,), max_remote_workers=2),
+        cwd=cwd, endpoints_loader=lambda _: {ALIAS: ENDPOINT}, probe_fn=lambda *_: CAPACITY, stage_fn=lambda *_: (str(stage), digest),
+        exec_fn=lambda _ep, payload, _d, pol: json.loads(remote._canonical(worker.execute_worker_request(remote._canonical(payload), max_result_bytes=pol.max_result_bytes))),
+    ).dispatch_batch("run_step", case, cands, deadline_s=30)
+    assert rem_rec.effective_workers == rem_res["effective_workers"] == 2
+    assert all(abs(p["result"]["span_ms"] - c["result"]["span_ms"]) <= 1e-12 for p, c in zip(py_res["results"], rem_res["results"], strict=True))
+    from mindie_sim.prediction.runtime.engine import Engine, Resource
+    with worker._worker_environment(stage):
+        worker._prepare_native(stage)
+        spans, stats = {}, {}
+        for backend in ("python", "c"):
+            eng = Engine([Resource("r0", 10.0, units=2), Resource("r1", 5.0)], backend=backend)
+            eng.advance(until=tuple(eng.submit(f"t{i}", {"r0": 20.0, "r1": 10.0}) for i in range(4)))
+            spans[backend], stats[backend] = eng.now, eng.accel_status()
+        assert stats["c"]["native_steps"] > 0 and stats["python"]["native_steps"] == 0
+        assert Path(stats["c"]["cache_path"]).is_relative_to(remote._native_root(stage)) and abs(spans["c"] - spans["python"]) <= 1e-12

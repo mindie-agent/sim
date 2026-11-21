@@ -58,7 +58,8 @@ REMOTE_CANDIDATE_THRESHOLD = 4
 LEASE_HANDOFF_TIMEOUT = STAGE_TIMEOUT + JOB_GRACE
 PRIVATE_DIR = 0o700
 PRIVATE_FILE = 0o600
-UNSAFE_POLICY_MODE = 0o022
+UNSAFE_POLICY_MODE = 0o077
+UNSAFE_ENDPOINT_MODE = 0o022
 ENDPOINT_ID_LENGTH = 16
 MAX_PORT = 65535
 ALIAS_LIMIT = 64
@@ -209,7 +210,7 @@ def _endpoint(value) -> _Endpoint:
     return ep
 def _user_endpoint_files() -> tuple[Path, Path]:
     return tuple(Path.home() / folder / "endpoints.json" for folder in (".mindie", ".mindie-coordinator"))
-def _read_config(path: Path, *, private=False):
+def _read_config(path: Path, *, private=False, mode_mask: int | None = None):
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     if private:
         flags |= getattr(os, "O_NOFOLLOW", 0)
@@ -217,10 +218,11 @@ def _read_config(path: Path, *, private=False):
         fd = os.open(path, flags)
     except FileNotFoundError:
         return {}
+    mask = UNSAFE_ENDPOINT_MODE if mode_mask is None else mode_mask
     with os.fdopen(fd, "rb") as stream:
         info = os.fstat(stream.fileno())
         if not stat.S_ISREG(info.st_mode) or (private and os.name == "posix" and
-                (info.st_uid != os.getuid() or info.st_mode & UNSAFE_POLICY_MODE)):
+                (info.st_uid != os.getuid() or info.st_mode & mask)):
             raise ValueError("unsafe remote configuration")
         result = json.loads(_bounded_read(stream, CONFIG_LIMIT))
     if isinstance(result, dict):
@@ -242,7 +244,7 @@ def _load_endpoints(cwd: Path):
     return _merge_endpoints((*_user_endpoint_files(), *env, cwd / "endpoints.json", cwd / "endpoints.local.json"))
 def _authorized_pairs(policy: RemoteExecPolicy) -> set[tuple[str, str]]:
     path = policy.policy_path or Path.home() / ".mindie/sim_remote_policy.json"
-    config = _read_config(Path(path).expanduser(), private=True)
+    config = _read_config(Path(path).expanduser(), private=True, mode_mask=UNSAFE_POLICY_MODE)
     rows = config.get("authorized_endpoints", config.get("authorized_aliases", ()))
     if isinstance(rows, dict):
         rows = ({"alias": alias, "endpoint_id": pin} for alias, pin in rows.items())
@@ -477,6 +479,8 @@ def _active_leases(stage, *, request_id=None):
                 continue
         except PermissionError:
             pass
+        except TimeoutError:
+            raise
         except OSError:
             if request == request_id or time.time() - lease.lstat().st_mtime > LEASE_HANDOFF_TIMEOUT:
                 lease.unlink(missing_ok=True)
@@ -487,7 +491,14 @@ def _native_root(stage: Path) -> Path:
     return stage.parent / f".native.{stage.name}"
 def _prune(root, quota, protected):
     def size(tree):
-        return sum(_regular(p).st_size for p in tree.rglob("*") if not p.is_dir())
+        return sum(_regular(p).st_size for p in tree.rglob("*") if not p.is_dir()) if tree.is_dir() else 0
+    for stale in list(root.iterdir()):
+        if stale.is_symlink() or not stale.is_dir():
+            continue
+        if stale.name.startswith(".incoming-"):
+            shutil.rmtree(stale)
+        elif stale.name.startswith(".native.") and not (root / stale.name[len(".native."):]).exists():
+            shutil.rmtree(stale)
     stages = sorted((p for p in root.iterdir() if HEX_DIGEST.fullmatch(p.name)), key=lambda p: p.lstat().st_mtime)
     sizes = {p: size(p) + size(_native_root(p)) for p in stages}
     total = sum(sizes.values())
@@ -651,9 +662,13 @@ class RemoteDispatcher:
         if policy.target == "local":
             return RemoteExecReceipt(), None
         if policy.target == "auto" and policy.local_single_step_if_c11 and count < REMOTE_CANDIDATE_THRESHOLD:
-            with suppress(RuntimeError, OSError):
+            try:
                 if self._local_ready():
                     return RemoteExecReceipt(accel_mode="c11", fallback_reason="warm_local_c11"), None
+            except TimeoutError:
+                raise
+            except (RuntimeError, OSError):
+                pass
         reason, choices = "no_authorized_endpoint", []
         preferred = policy.preferred_alias
         explicit = {*policy.authorized_aliases, preferred}
@@ -661,13 +676,15 @@ class RemoteDispatcher:
             pairs = _authorized_pairs(policy)
             entries = self._load_endpoints(self.cwd)
             trusted = _merge_endpoints(_user_endpoint_files(), private=True) if pairs else {}
+        except TimeoutError:
+            raise
         except (RuntimeError, ValueError, TypeError, KeyError, OSError):
             reason, entries = "endpoint_configuration", {}
         for alias in sorted(entries.keys() if preferred is None else entries.keys() & {preferred}):
             if alias not in explicit and not any(name == alias for name, _ in pairs):
                 continue
             reason = "probe_unavailable"
-            with suppress(RuntimeError, ValueError, TypeError, KeyError, OSError):
+            try:
                 ep = _endpoint(entries[alias])
                 key = alias, ep.endpoint_id
                 if alias not in explicit:
@@ -687,10 +704,16 @@ class RemoteDispatcher:
                     per_worker_mem_mib=policy.per_worker_mem_mib, max_remote_workers=policy.max_remote_workers,
                     force_saturated=alias == preferred)
                 if workers:
-                    public = "redacted" if alias in (ep.host, ep.user, ep.auth_ref) else alias
+                    alias_cf = alias.casefold()
+                    secrets = {v.casefold() for v in (ep.host, ep.user, ep.auth_ref) if isinstance(v, str) and v}
+                    public = "redacted" if (alias_cf in secrets or (ep.host and ep.host.casefold() in alias_cf)) else alias
                     choices.append((workers, alias, pinned, RemoteExecReceipt(
                         alias=public, endpoint_id=key[1], resolved_target="remote", effective_workers=min(count, workers),
                         limiting_factor="candidates" if count < workers else factor, accel_mode="c11")))
+            except TimeoutError:
+                raise
+            except (RuntimeError, ValueError, TypeError, KeyError, OSError):
+                pass
         if choices:
             _, _, endpoint, receipt = min(choices, key=lambda row: (-row[0], row[1]))
             return receipt, endpoint
@@ -713,6 +736,7 @@ class RemoteDispatcher:
         budget = policy.job_timeout_s if deadline_s is None else min(deadline_s, policy.job_timeout_s)
         if not math.isfinite(budget) or budget <= 0:
             raise ValueError("invalid execution deadline")
+        job_deadline = time.monotonic() + budget
         request_id = uuid.uuid4().hex
         payload = dict(protocol_version=PROTOCOL_VERSION, request_id=request_id, deadline_s=budget,
                        entrypoint=entrypoint, base_case=json_payload(base_case.to_dict() if isinstance(base_case, Case) else base_case),
@@ -727,10 +751,13 @@ class RemoteDispatcher:
         if endpoint is not None:
             try:
                 stage, digest = self._stage_fn(endpoint, request_id, policy)
+            except TimeoutError:
+                raise
             except Exception:
                 reason = "stage_unavailable"
             else:
-                remote = payload | dict(stage_root=stage, max_workers=receipt.effective_workers,
+                remaining = _remaining(job_deadline)
+                remote = payload | dict(deadline_s=remaining, stage_root=stage, max_workers=receipt.effective_workers,
                                         primitive_manifest_path="data/primitives/manifest.json")
                 if len(_canonical(remote)) > limit:
                     raise ValueError("request byte limit exceeded")
@@ -748,26 +775,23 @@ class RemoteDispatcher:
                     return result, replace(receipt, effective_workers=count, bundle_digest=digest, submission_state="acknowledged")
             if policy.target == "remote":
                 raise RemoteExecUnavailableError(reason)
-        result = (local_runner(payload) if local_runner else
-                  execute_worker_request(payload, max_result_bytes=policy.max_result_bytes))
+        local_payload = payload | {"deadline_s": _remaining(job_deadline)}
+        result = (local_runner(local_payload) if local_runner else
+                  execute_worker_request(local_payload, max_result_bytes=policy.max_result_bytes))
         count = result.get("effective_workers", 1) if isinstance(result, dict) else 1
         return result, RemoteExecReceipt(effective_workers=count, fallback_reason=reason, request_id=request_id,
                                          accel_mode=receipt.accel_mode if endpoint is None else "auto")
 
-    def run_step(self, case: CaseInput, request: LoweringRequest, *, replay: ReplayOptions | None = None,
-                 deadline_s: float | None = None):
+    def run_step(self, case: CaseInput, request: LoweringRequest, *, replay: ReplayOptions | None = None, deadline_s: float | None = None):
         return self.dispatch_batch("run_step", case, [{"request": request, "replay": replay or {}}], deadline_s=deadline_s)
-
     def evaluate_three_tiers(self, case: CaseInput, request: StepRequest, *, replay: ReplayOptions | None = None,
                              target_eff: float | None = None, deadline_s: float | None = None):
-        candidate = dict(request=request, replay=replay or {}, options={} if target_eff is None else {"target_eff": target_eff})
-        return self.dispatch_batch("evaluate_three_tiers", case, [candidate], deadline_s=deadline_s)
+        opts = {} if target_eff is None else {"target_eff": target_eff}
+        return self.dispatch_batch("evaluate_three_tiers", case, [{"request": request, "replay": replay or {}, "options": opts}], deadline_s=deadline_s)
     def solve_sla(self, case: CaseInput, request: SlaRequest, *, deadline_s: float | None = None):
         return self.dispatch_batch("solve_sla", case, [{"request": request}], deadline_s=deadline_s)
-    def sweep_topology(self, case: CaseInput, request: SweepRequest, *, decode_case: CaseInput | None = None,
-                       deadline_s: float | None = None):
+    def sweep_topology(self, case: CaseInput, request: SweepRequest, *, decode_case: CaseInput | None = None, deadline_s: float | None = None):
         from mindie_sim.schema.case import Case
-        candidate = dict(request=request, decode_case=decode_case.to_dict() if isinstance(decode_case, Case) else decode_case)
-        return self.dispatch_batch("sweep_topology", case, [candidate], deadline_s=deadline_s)
+        return self.dispatch_batch("sweep_topology", case, [{"request": request, "decode_case": decode_case.to_dict() if isinstance(decode_case, Case) else decode_case}], deadline_s=deadline_s)
     def optimize_ladder(self, case: CaseInput, candidates: Sequence[Mapping], *, local_runner=None, deadline_s=None):
         return self.dispatch_batch("optimize_ladder", case, candidates, local_runner=local_runner, deadline_s=deadline_s)

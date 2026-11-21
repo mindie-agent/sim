@@ -1,7 +1,7 @@
 {
   "arch_preset": "npu_arch_2201",
   "cann_version": "9.2.1",
-  "envelope_sha256": "6b4700bdbd1428de882936e8cc4cfb5b1fc0d908909029f2666f3235a5da34be",
+  "envelope_sha256": "73b1738a5e1d27b5c5814a32815274ea0011dfad8344a44714aee9788cbb66da",
   "primitives": {
     "P01_datacopy": {
       "evidence_id": "",
@@ -12,19 +12,11 @@
         },
         "hbm_rw_alpha": {
           "bound_kind": "latency_lower",
-          "certified_upper_capacity": 0.0,
-          "cv_pct": 1.2828,
-          "n_samples": 32,
-          "p05": 1.0,
-          "p50": 1.0,
-          "p95": 1.0,
-          "p99": 1.0,
-          "trimmed_cv_pct": 0.0,
-          "trimmed_mean": 1.0
+          "certified_upper_capacity": 0.0
         },
         "hbm_write_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 1683091036492.102
+          "certified_upper_capacity": 1600000000000.0
         },
         "mte2_aic_hit_bytes_per_s_per_core": {
           "bound_kind": "rate_upper",
@@ -32,22 +24,19 @@
         },
         "mte2_aiv_hit_bytes_per_s_per_core": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 105600000000.0,
-          "cv_pct": 1.1858,
-          "n_samples": 32,
-          "p05": 97957078365.07945,
-          "p50": 99908983060.93129,
-          "p95": 101594917388.7525,
-          "p99": 102244346690.43681,
-          "trimmed_cv_pct": 0.8335,
-          "trimmed_mean": 99773982569.16599
+          "certified_upper_capacity": 52800000000.0
         }
       },
       "modes": {},
       "parameters": {
         "burst_turn_penalty": [],
         "l2_cache_ctl_supported": false,
-        "sector_bytes": 32
+        "sector_bytes": 32,
+        "silicon_profile_conflict": {
+          "observed_aic_count": 24,
+          "observed_aicore_freq_mhz": 1800,
+          "profile_aic_count": 20
+        }
       },
       "status": "unmeasured",
       "units": {
@@ -61,7 +50,7 @@
       "metrics": {
         "l1_to_l0a_bytes_per_s_per_aic": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 211200000000.0
+          "certified_upper_capacity": 422400000000.0
         },
         "l1_to_l0b_bytes_per_s_per_aic": {
           "bound_kind": "rate_upper",
@@ -113,7 +102,7 @@
       }
     },
     "P04_mte3_store": {
-      "evidence_id": "capture://lab-a3-9382/camp-202611-a3-9382-l0/4141b0523ea6d2895b038a93d221978977a91099320a7e15a5ad89b3df9a0d64",
+      "evidence_id": "",
       "metrics": {
         "atomic_contention_ns": {
           "bound_kind": "latency_lower",
@@ -121,27 +110,11 @@
         },
         "atomic_rmw_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 1600000000000.0,
-          "cv_pct": 1.7846,
-          "n_samples": 32,
-          "p05": 3535003712.096908,
-          "p50": 3637132747.128855,
-          "p95": 3753636572.104782,
-          "p99": 3771762433.071017,
-          "trimmed_cv_pct": 1.2084,
-          "trimmed_mean": 3645764347.090576
+          "certified_upper_capacity": 1600000000000.0
         },
         "mte3_store_bytes_per_s_per_aiv": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 105600000000.0,
-          "cv_pct": 2.0967,
-          "n_samples": 32,
-          "p05": 61360264493.62943,
-          "p50": 63340130580.192055,
-          "p95": 64962511718.58054,
-          "p99": 65261058964.779854,
-          "trimmed_cv_pct": 1.7653,
-          "trimmed_mean": 63309950699.42184
+          "certified_upper_capacity": 105600000000.0
         },
         "setup_ns": {
           "bound_kind": "latency_lower",
@@ -150,40 +123,29 @@
       },
       "modes": {},
       "parameters": {
-        "has_ub_to_l1": false
+        "has_ub_to_l1": false,
+        "silicon_profile_conflict": {
+          "observed_aic_count": 24,
+          "observed_aicore_freq_mhz": 1800,
+          "profile_aic_count": 20
+        }
       },
-      "status": "calibrated",
+      "status": "unmeasured",
       "units": {
         "latency": "ns",
         "rate": "bytes_per_s"
       }
     },
     "P05_l2_residency_reuse": {
-      "evidence_id": "capture://lab-a3-9382/camp-202611-a3-9382-l0/a1b2fc0165f8f5fa23adf9f938af24f633cb9bd5e194f6abc13479e6b51e58a6",
+      "evidence_id": "",
       "metrics": {
         "l2_die_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 4224000000000.0,
-          "cv_pct": 1.1858,
-          "n_samples": 32,
-          "p05": 3918283134603.178,
-          "p50": 3996359322437.2515,
-          "p95": 4063796695550.1,
-          "p99": 4089773867617.4727,
-          "trimmed_cv_pct": 0.8335,
-          "trimmed_mean": 3990959302766.6396
+          "certified_upper_capacity": 4224000000000.0
         },
         "l2_effective_fraction": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 1.0,
-          "cv_pct": 0.0,
-          "n_samples": 32,
-          "p05": 1.0,
-          "p50": 1.0,
-          "p95": 1.0,
-          "p99": 1.0,
-          "trimmed_cv_pct": 0.0,
-          "trimmed_mean": 1.0
+          "certified_upper_capacity": 1.0
         }
       },
       "modes": {},
@@ -192,19 +154,24 @@
         "cache_disable_supported": false,
         "granule_bytes": 128,
         "l2_bytes": 201326592,
+        "silicon_profile_conflict": {
+          "observed_aic_count": 24,
+          "observed_aicore_freq_mhz": 1800,
+          "profile_aic_count": 20
+        },
         "ws_sweep_bytes_per_s": {
-          "128MiB": 4845405265544.97,
-          "160MiB": 5194184657190.24,
-          "192MiB": 4682013811249.32,
-          "256MiB": 1231016481102.5,
-          "320MiB": 1257615232082.61,
-          "32MiB": 3305855221917.55,
-          "64MiB": 3946419678664.83,
-          "8MiB": 1459522954568.63,
-          "96MiB": 4534382606221.09
+          "128MiB": 4945386933095.78,
+          "160MiB": 5321033156932.54,
+          "192MiB": 4659265505977.0,
+          "256MiB": 1246334192511.55,
+          "320MiB": 1257096956407.82,
+          "32MiB": 3111237073942.56,
+          "64MiB": 4041486798560.98,
+          "8MiB": 1461564111969.33,
+          "96MiB": 4636725810766.86
         }
       },
-      "status": "calibrated",
+      "status": "unmeasured",
       "units": {
         "capacity": "bytes",
         "fraction": "dimensionless",
@@ -212,7 +179,7 @@
       }
     },
     "P06_mmad": {
-      "evidence_id": "capture://lab-a3-9382/camp-202611-a3-9382-l0/ce99cd065e32ecaa08d31d471dbdebabcd7c2a67ced300b3ef92e0c38bed536c",
+      "evidence_id": "",
       "metrics": {
         "pipe_m_barrier_ns": {
           "bound_kind": "latency_lower",
@@ -223,18 +190,10 @@
         "bf16": {
           "cube_only_rate": {
             "bound_kind": "rate_upper",
-            "certified_upper_capacity": 16171226976931.875,
-            "cv_pct": 0.4025,
-            "n_samples": 32,
-            "p05": 15975090685731.785,
-            "p50": 16032914417890.375,
-            "p95": 16131978277836.89,
-            "p99": 16171226976931.875,
-            "trimmed_cv_pct": 0.2005,
-            "trimmed_mean": 16036948309702.135
+            "certified_upper_capacity": 13516800000000.0
           },
           "m_iss": 16,
-          "status": "calibrated",
+          "status": "unmeasured",
           "tile_k": 16,
           "tile_m": 16,
           "tile_n": 16
@@ -242,18 +201,10 @@
         "fp16": {
           "cube_only_rate": {
             "bound_kind": "rate_upper",
-            "certified_upper_capacity": 16106756994613.258,
-            "cv_pct": 0.3828,
-            "n_samples": 32,
-            "p05": 15938970869575.814,
-            "p50": 16037404503919.662,
-            "p95": 16102191379229.61,
-            "p99": 16106756994613.258,
-            "trimmed_cv_pct": 0.2073,
-            "trimmed_mean": 16035326248773.059
+            "certified_upper_capacity": 13516800000000.0
           },
           "m_iss": 16,
-          "status": "calibrated",
+          "status": "unmeasured",
           "tile_k": 16,
           "tile_m": 16,
           "tile_n": 16
@@ -261,18 +212,10 @@
         "fp32": {
           "cube_only_rate": {
             "bound_kind": "rate_upper",
-            "certified_upper_capacity": 4266484020028.3857,
-            "cv_pct": 0.1957,
-            "n_samples": 32,
-            "p05": 4261291033844.0986,
-            "p50": 4263510682455.8105,
-            "p95": 4266108290852.9385,
-            "p99": 4266484020028.3857,
-            "trimmed_cv_pct": 0.0221,
-            "trimmed_mean": 4263572857617.937
+            "certified_upper_capacity": 3379200000000.0
           },
           "m_iss": 16,
-          "status": "calibrated",
+          "status": "unmeasured",
           "tile_k": 8,
           "tile_m": 16,
           "tile_n": 16
@@ -280,18 +223,10 @@
         "int8": {
           "cube_only_rate": {
             "bound_kind": "rate_upper",
-            "certified_upper_capacity": 27033600000000.0,
-            "cv_pct": 0.4166,
-            "n_samples": 32,
-            "p05": 23434811685318.133,
-            "p50": 23590216139169.92,
-            "p95": 23659132176149.25,
-            "p99": 23686894949656.414,
-            "trimmed_cv_pct": 0.1929,
-            "trimmed_mean": 23577287787818.746
+            "certified_upper_capacity": 27033600000000.0
           },
           "m_iss": 16,
-          "status": "calibrated",
+          "status": "unmeasured",
           "tile_k": 32,
           "tile_m": 16,
           "tile_n": 16
@@ -299,23 +234,28 @@
       },
       "parameters": {
         "pipe_m_barrier_fractal_threshold": 10,
+        "silicon_profile_conflict": {
+          "observed_aic_count": 24,
+          "observed_aicore_freq_mhz": 1800,
+          "profile_aic_count": 20
+        },
         "small_m_bf16_ns": {
-          "1": 19100.0,
-          "128": 24145.0,
-          "16": 19387.5,
-          "256": 44457.5,
-          "32": 23710.0,
-          "64": 20352.5
+          "1": 19110.0,
+          "128": 24165.0,
+          "16": 19347.5,
+          "256": 44500.0,
+          "32": 20107.5,
+          "64": 20342.5
         }
       },
-      "status": "calibrated",
+      "status": "unmeasured",
       "units": {
         "latency": "ns",
         "rate": "flops_per_s_per_aic"
       }
     },
     "P07_vec_alu": {
-      "evidence_id": "capture://lab-a3-9382/camp-202611-a3-9382-l0/3b849dac5babebf98944af5dde2b76d0d8cb9ee7823d79fd33be43f369bc5ac5",
+      "evidence_id": "",
       "metrics": {
         "raw_latency_cycles": {
           "bound_kind": "latency_lower",
@@ -323,30 +263,27 @@
         },
         "vec_alu_ops_per_s_per_aiv": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 105600000000.0,
-          "cv_pct": 1.0488,
-          "n_samples": 32,
-          "p05": 12653075661.616743,
-          "p50": 12867936644.455109,
-          "p95": 13059378163.50288,
-          "p99": 13131581711.805384,
-          "trimmed_cv_pct": 0.7259,
-          "trimmed_mean": 12863580329.746632
+          "certified_upper_capacity": 105600000000.0
         }
       },
       "modes": {},
       "parameters": {
         "bf16_lanes": 128,
         "fp32_lanes": 64,
+        "silicon_profile_conflict": {
+          "observed_aic_count": 24,
+          "observed_aicore_freq_mhz": 1800,
+          "profile_aic_count": 20
+        },
         "vector_width_bytes": 256
       },
-      "status": "calibrated",
+      "status": "unmeasured",
       "units": {
         "rate": "ops_per_s_per_aiv"
       }
     },
     "P08_vec_sfu": {
-      "evidence_id": "capture://lab-a3-9382/camp-202611-a3-9382-l0/ac38fa12cff1ac98c12ba6b6546b6ac0148c9e5a42ceabb354e14c2d4c25f0c5",
+      "evidence_id": "",
       "metrics": {
         "raw_latency_cycles": {
           "bound_kind": "latency_lower",
@@ -354,24 +291,21 @@
         },
         "vec_sfu_ops_per_s_per_aiv": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 52800000000.0,
-          "cv_pct": 1.4046,
-          "n_samples": 32,
-          "p05": 14257617274.290834,
-          "p50": 14591442622.178127,
-          "p95": 14881380231.33262,
-          "p99": 14947134073.696884,
-          "trimmed_cv_pct": 1.085,
-          "trimmed_mean": 14571827325.273695
+          "certified_upper_capacity": 52800000000.0
         }
       },
       "modes": {},
       "parameters": {
         "bf16_lanes": 128,
         "fp32_lanes": 64,
+        "silicon_profile_conflict": {
+          "observed_aic_count": 24,
+          "observed_aicore_freq_mhz": 1800,
+          "profile_aic_count": 20
+        },
         "vector_width_bytes": 256
       },
-      "status": "calibrated",
+      "status": "unmeasured",
       "units": {
         "rate": "ops_per_s_per_aiv"
       }
@@ -381,25 +315,22 @@
       "metrics": {
         "cast_bytes_per_s_per_aiv": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 109794191822.76056
+          "certified_upper_capacity": 52800000000.0
         },
         "vec_reduce_ops_per_s_per_aiv": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 52800000000.0,
-          "cv_pct": 0.5047,
-          "n_samples": 32,
-          "p05": 6646727575.30361,
-          "p50": 6693750268.829832,
-          "p95": 6731835957.929348,
-          "p99": 6752650342.134129,
-          "trimmed_cv_pct": 0.3993,
-          "trimmed_mean": 6694633747.081916
+          "certified_upper_capacity": 52800000000.0
         }
       },
       "modes": {},
       "parameters": {
         "mx_dynamic_quant_supported": false,
-        "mx_scale_group": 32
+        "mx_scale_group": 32,
+        "silicon_profile_conflict": {
+          "observed_aic_count": 24,
+          "observed_aicore_freq_mhz": 1800,
+          "profile_aic_count": 20
+        }
       },
       "status": "unmeasured",
       "units": {
@@ -408,24 +339,21 @@
       }
     },
     "P10_sort_topk": {
-      "evidence_id": "capture://lab-a3-9382/camp-202611-a3-9382-l0/2be6cd4a1d789a07bb6010434c981a9cdee09795219059fd8bfe7426a0bbeb5f",
+      "evidence_id": "",
       "metrics": {
         "sort_elems_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 2112000000000.0,
-          "cv_pct": 1.2704,
-          "n_samples": 32,
-          "p05": 19150499106.9074,
-          "p50": 19512134894.08165,
-          "p95": 19816046753.04953,
-          "p99": 19836222025.358093,
-          "trimmed_cv_pct": 1.1309,
-          "trimmed_mean": 19488617567.211205
+          "certified_upper_capacity": 2112000000000.0
         }
       },
       "modes": {},
       "parameters": {
         "histogram_trunk_elems": 0,
+        "silicon_profile_conflict": {
+          "observed_aic_count": 24,
+          "observed_aicore_freq_mhz": 1800,
+          "profile_aic_count": 20
+        },
         "sort_algorithm": "sort32_mrgsort4",
         "supported_sortall_lengths": [
           64,
@@ -436,7 +364,7 @@
           2048
         ]
       },
-      "status": "calibrated",
+      "status": "unmeasured",
       "units": {
         "rate": "elems_per_s"
       }
@@ -557,15 +485,7 @@
         },
         "host_submit_ns": {
           "bound_kind": "latency_lower",
-          "certified_upper_capacity": 0.0,
-          "cv_pct": 3.0008,
-          "n_samples": 32,
-          "p05": 7907.820312,
-          "p50": 8225.859375,
-          "p95": 8652.09375,
-          "p99": 8850.0,
-          "trimmed_cv_pct": 2.0337,
-          "trimmed_mean": 8236.484375
+          "certified_upper_capacity": 0.0
         },
         "issue_interval_ns": {
           "bound_kind": "latency_lower",
@@ -576,7 +496,12 @@
       "parameters": {
         "lanes": 1,
         "queue_depth": 64,
-        "queue_scope": "die"
+        "queue_scope": "die",
+        "silicon_profile_conflict": {
+          "observed_aic_count": 24,
+          "observed_aicore_freq_mhz": 1800,
+          "profile_aic_count": 20
+        }
       },
       "status": "unmeasured",
       "units": {
@@ -600,7 +525,12 @@
         "modes": [
           "disjoint",
           "shared_cap"
-        ]
+        ],
+        "silicon_profile_conflict": {
+          "observed_aic_count": 24,
+          "observed_aicore_freq_mhz": 1800,
+          "profile_aic_count": 20
+        }
       },
       "status": "unmeasured",
       "units": {
@@ -641,7 +571,7 @@
       "metrics": {
         "link_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 224000000000.0
+          "certified_upper_capacity": 196000000000.0
         },
         "startup_ns": {
           "bound_kind": "latency_lower",
@@ -651,7 +581,7 @@
       "modes": {},
       "parameters": {
         "payload_bytes_per_frame": 1024,
-        "short_final_frame_policy": "pad_full_frame",
+        "short_final_frame_policy": "exact_plus_header",
         "wire_bytes_per_frame": 1024
       },
       "status": "unmeasured",
@@ -665,7 +595,7 @@
       "metrics": {
         "peer_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 224000000000.0
+          "certified_upper_capacity": 196000000000.0
         },
         "status_sync_ns": {
           "bound_kind": "latency_lower",
@@ -685,7 +615,7 @@
       }
     },
     "P20_host_dma_sync": {
-      "evidence_id": "capture://lab-a3-9382/camp-202611-a3-9382-l0/5ed538a3e5a6aff4b9477a51ace8c6ef082562beab5b5360aa07f445c104fabe",
+      "evidence_id": "capture://lab-a3-9382/camp-202611-l0-a3-9382/abbc7ec1573986f0062b647c3151303178b15310dfe96a0968931d73ad5238d6",
       "metrics": {
         "eager_d2h_sync_ns": {
           "bound_kind": "latency_lower",
@@ -693,51 +623,51 @@
         },
         "host_d2h_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 64000000000.0,
-          "cv_pct": 0.882,
+          "certified_upper_capacity": 48000000000.0,
+          "cv_pct": 0.7285,
           "n_samples": 32,
-          "p05": 40210731620.64627,
-          "p50": 40726465167.56253,
-          "p95": 41153411326.3752,
-          "p99": 41213568927.42901,
-          "trimmed_cv_pct": 0.4552,
-          "trimmed_mean": 40721961994.593834
+          "p05": 40526426907.52354,
+          "p50": 40909874812.545166,
+          "p95": 41331893070.916985,
+          "p99": 41563070954.121025,
+          "trimmed_cv_pct": 0.5619,
+          "trimmed_mean": 40874943246.37908
         },
         "host_h2d_bytes_per_s": {
           "bound_kind": "rate_upper",
           "certified_upper_capacity": 64000000000.0,
-          "cv_pct": 0.604,
+          "cv_pct": 0.2436,
           "n_samples": 32,
-          "p05": 55665915447.66371,
-          "p50": 55897618594.65289,
-          "p95": 56119444406.24215,
-          "p99": 56174908521.0152,
-          "trimmed_cv_pct": 0.1689,
-          "trimmed_mean": 55887073969.71083
+          "p05": 55742651143.00846,
+          "p50": 55933492792.28933,
+          "p95": 56146064326.24164,
+          "p99": 56192945172.18085,
+          "trimmed_cv_pct": 0.1828,
+          "trimmed_mean": 55946270885.81634
+        },
+        "host_rc_d2h_bytes_per_s": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 160000000000.0
+        },
+        "host_rc_h2d_bytes_per_s": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 238800000000.0
         },
         "pageable_dma_startup_ns": {
           "bound_kind": "latency_lower",
-          "certified_upper_capacity": 0.0,
-          "cv_pct": 3.9636,
-          "n_samples": 32,
-          "p05": 29331.0,
-          "p50": 29881.25,
-          "p95": 31038.8125,
-          "p99": 34606.975,
-          "trimmed_cv_pct": 0.9028,
-          "trimmed_mean": 29872.980769
+          "certified_upper_capacity": 0.0
         },
         "pinned_dma_startup_ns": {
           "bound_kind": "latency_lower",
           "certified_upper_capacity": 0.0,
-          "cv_pct": 2.8539,
+          "cv_pct": 3.1215,
           "n_samples": 32,
-          "p05": 29059.8125,
-          "p50": 29641.25,
-          "p95": 30639.6875,
-          "p99": 32900.8875,
-          "trimmed_cv_pct": 0.9695,
-          "trimmed_mean": 29697.307692
+          "p05": 28841.375,
+          "p50": 29650.625,
+          "p95": 31364.25,
+          "p99": 32920.9,
+          "trimmed_cv_pct": 1.4851,
+          "trimmed_mean": 29763.75
         }
       },
       "modes": {},
@@ -753,9 +683,9 @@
   },
   "provenance": {
     "calibrated": true,
-    "campaign_id": "camp-202611-a3-9382-l0",
-    "capture_uri": "capture://lab-a3-9382/camp-202611-a3-9382-l0/cac1313bce8156d2680ced7c01d42397f06d27ac41cdc8d0ab8f9afb05af8ae4",
-    "collected_utc": "2026-11-20T22:25:04Z",
+    "campaign_id": "camp-202611-l0-a3-9382",
+    "capture_uri": "capture://lab-a3-9382/camp-202611-l0-a3-9382/abbc7ec1573986f0062b647c3151303178b15310dfe96a0968931d73ad5238d6",
+    "collected_utc": "2026-11-21T00:06:24Z",
     "endpoint_alias": "lab-a3-9382",
     "silicon_fingerprint": {
       "aic_count": 20,

@@ -1,7 +1,7 @@
 {
   "arch_preset": "npu_arch_3510",
   "cann_version": "unmeasured",
-  "envelope_sha256": "66f5723b7f9fb8be0cad6ffc91875b283df32b96eb9d0630cd1a3498bad12aeb",
+  "envelope_sha256": "7210fe2a0945a3ae7576bf3f605b14190e7212d88003925f0c1609a731beb510",
   "primitives": {
     "P01_datacopy": {
       "evidence_id": "",
@@ -24,7 +24,7 @@
         },
         "mte2_aiv_hit_bytes_per_s_per_core": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 204800000000.0
+          "certified_upper_capacity": 102400000000.0
         }
       },
       "modes": {},
@@ -45,11 +45,11 @@
       "metrics": {
         "l1_to_l0a_bytes_per_s_per_aic": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 422400000000.0
+          "certified_upper_capacity": 409600000000.0
         },
         "l1_to_l0b_bytes_per_s_per_aic": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 422400000000.0
+          "certified_upper_capacity": 204800000000.0
         },
         "setup_ns": {
           "bound_kind": "latency_lower",
@@ -105,7 +105,7 @@
         },
         "atomic_rmw_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 1600000000000.0
+          "certified_upper_capacity": 308800000000.0
         },
         "mte3_store_bytes_per_s_per_aiv": {
           "bound_kind": "rate_upper",
@@ -284,7 +284,7 @@
         },
         "vec_sfu_ops_per_s_per_aiv": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 105600000000.0
+          "certified_upper_capacity": 52800000000.0
         }
       },
       "modes": {},
@@ -303,7 +303,7 @@
       "metrics": {
         "cast_bytes_per_s_per_aiv": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 102400000000.0
+          "certified_upper_capacity": 422400000000.0
         },
         "vec_reduce_ops_per_s_per_aiv": {
           "bound_kind": "rate_upper",
@@ -539,7 +539,7 @@
       "metrics": {
         "link_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 400000000000.0
+          "certified_upper_capacity": 56000000000.0
         },
         "startup_ns": {
           "bound_kind": "latency_lower",
@@ -549,7 +549,7 @@
       "modes": {},
       "parameters": {
         "payload_bytes_per_frame": 480,
-        "short_final_frame_policy": "pad_full_frame",
+        "short_final_frame_policy": "exact_plus_header",
         "wire_bytes_per_frame": 512
       },
       "status": "unmeasured",
@@ -563,7 +563,7 @@
       "metrics": {
         "peer_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 400000000000.0
+          "certified_upper_capacity": 56000000000.0
         },
         "status_sync_ns": {
           "bound_kind": "latency_lower",
@@ -591,11 +591,19 @@
         },
         "host_d2h_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 64000000000.0
+          "certified_upper_capacity": 100150000000.0
         },
         "host_h2d_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 64000000000.0
+          "certified_upper_capacity": 100010000000.0
+        },
+        "host_rc_d2h_bytes_per_s": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 400000000000.0
+        },
+        "host_rc_h2d_bytes_per_s": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 400000000000.0
         },
         "pageable_dma_startup_ns": {
           "bound_kind": "latency_lower",
@@ -619,9 +627,9 @@
   },
   "provenance": {
     "calibrated": false,
-    "campaign_id": "camp-202611-a5-pr-l0",
-    "capture_uri": "capture://lab-a5-950pr/camp-202611-a5-pr-l0/8aacfaea0e02a0645b900409dcadb6180595433d5f0879c7878d0272c2690cb2",
-    "collected_utc": "2026-11-20T22:19:33Z",
+    "campaign_id": "camp-202611-l0-a5pr",
+    "capture_uri": "capture://lab-a5-950pr/camp-202611-l0-a5pr/7e9b2da7383afdd9e1678c01f9812162a9b74a3dddf6fe770488727344677e0a",
+    "collected_utc": "2026-11-21T00:05:44Z",
     "endpoint_alias": "lab-a5-950pr",
     "silicon_fingerprint": {
       "aic_count": 32,

@@ -1,7 +1,7 @@
 {
   "arch_preset": "npu_arch_2201",
   "cann_version": "9.3.0",
-  "envelope_sha256": "0fe8cfb9dded3ea1351286ae493efc351448f26b568ec706bf9ed30d61682ef9",
+  "envelope_sha256": "65546eb12398fd551e83e4ddc6eb4177870065c7365efd8603bb6bc14827c267",
   "primitives": {
     "P01_datacopy": {
       "evidence_id": "",
@@ -13,18 +13,18 @@
         "hbm_rw_alpha": {
           "bound_kind": "latency_lower",
           "certified_upper_capacity": 0.0,
-          "cv_pct": 1.3632,
+          "cv_pct": 0.2827,
           "n_samples": 32,
-          "p05": 0.931587,
-          "p50": 0.944555,
-          "p95": 0.967392,
-          "p99": 0.970494,
-          "trimmed_cv_pct": 1.1298,
-          "trimmed_mean": 0.945571
+          "p05": 0.993049,
+          "p50": 1.0,
+          "p95": 1.0,
+          "p99": 1.0,
+          "trimmed_cv_pct": 0.0078,
+          "trimmed_mean": 0.999985
         },
         "hbm_write_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 1465305579722.5142
+          "certified_upper_capacity": 1200000000000.0
         },
         "mte2_aic_hit_bytes_per_s_per_core": {
           "bound_kind": "rate_upper",
@@ -32,15 +32,7 @@
         },
         "mte2_aiv_hit_bytes_per_s_per_core": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 105600000000.0,
-          "cv_pct": 3.1487,
-          "n_samples": 32,
-          "p05": 90487172568.04941,
-          "p50": 91923691654.89783,
-          "p95": 93693502964.96045,
-          "p99": 93788900218.10966,
-          "trimmed_cv_pct": 0.7613,
-          "trimmed_mean": 91934108453.43105
+          "certified_upper_capacity": 52800000000.0
         }
       },
       "modes": {},
@@ -61,7 +53,7 @@
       "metrics": {
         "l1_to_l0a_bytes_per_s_per_aic": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 211200000000.0
+          "certified_upper_capacity": 422400000000.0
         },
         "l1_to_l0b_bytes_per_s_per_aic": {
           "bound_kind": "rate_upper",
@@ -122,14 +114,14 @@
         "atomic_rmw_bytes_per_s": {
           "bound_kind": "rate_upper",
           "certified_upper_capacity": 1200000000000.0,
-          "cv_pct": 2.1554,
+          "cv_pct": 1.6882,
           "n_samples": 32,
-          "p05": 3111040709.778308,
-          "p50": 3222407354.128686,
-          "p95": 3329274405.007235,
-          "p99": 3349067185.083398,
-          "trimmed_cv_pct": 1.3747,
-          "trimmed_mean": 3215324302.087254
+          "p05": 3123481592.662884,
+          "p50": 3236408133.691533,
+          "p95": 3304274734.877486,
+          "p99": 3322293776.145686,
+          "trimmed_cv_pct": 1.1648,
+          "trimmed_mean": 3234552014.724561
         },
         "mte3_store_bytes_per_s_per_aiv": {
           "bound_kind": "rate_upper",
@@ -151,31 +143,15 @@
       }
     },
     "P05_l2_residency_reuse": {
-      "evidence_id": "capture://lab-a3-9362/camp-202611-a3-9362-l0/5a4822b92508d18029db742b92317373ba09a8b006071206e7793e12c310eb0f",
+      "evidence_id": "",
       "metrics": {
         "l2_die_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 4224000000000.0,
-          "cv_pct": 3.1487,
-          "n_samples": 32,
-          "p05": 3619486902721.976,
-          "p50": 3676947666195.9136,
-          "p95": 3747740118598.418,
-          "p99": 3751556008724.3867,
-          "trimmed_cv_pct": 0.7613,
-          "trimmed_mean": 3677364338137.242
+          "certified_upper_capacity": 4224000000000.0
         },
         "l2_effective_fraction": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 1.0,
-          "cv_pct": 0.0,
-          "n_samples": 32,
-          "p05": 0.571429,
-          "p50": 0.571429,
-          "p95": 0.571429,
-          "p99": 0.571429,
-          "trimmed_cv_pct": 0.0,
-          "trimmed_mean": 0.571429
+          "certified_upper_capacity": 1.0
         }
       },
       "modes": {},
@@ -185,18 +161,18 @@
         "granule_bytes": 128,
         "l2_bytes": 176160768,
         "ws_sweep_bytes_per_s": {
-          "128MiB": 1459840407291.0,
-          "160MiB": 1227301789864.45,
-          "192MiB": 1233467638736.73,
-          "256MiB": 1234810501804.4,
-          "320MiB": 1122972990041.38,
-          "32MiB": 2059501753648.21,
-          "64MiB": 3639309186856.83,
-          "8MiB": 156474685341.89,
-          "96MiB": 3375697404514.28
+          "128MiB": 1443511858371.57,
+          "160MiB": 1230903616972.83,
+          "192MiB": 1228350143471.31,
+          "256MiB": 1242526683960.39,
+          "320MiB": 1179583463584.64,
+          "32MiB": 628622533024.51,
+          "64MiB": 3687807383283.92,
+          "8MiB": 134826365761.55,
+          "96MiB": 2407846320389.64
         }
       },
-      "status": "calibrated",
+      "status": "unmeasured",
       "units": {
         "capacity": "bytes",
         "fraction": "dimensionless",
@@ -204,7 +180,7 @@
       }
     },
     "P06_mmad": {
-      "evidence_id": "capture://lab-a3-9362/camp-202611-a3-9362-l0/5f590bec6c72049afbc3acfed199b3d97fe9ba03b3365b8cfd6a0d72e0cad26d",
+      "evidence_id": "capture://lab-a3-9362/camp-202611-l0-a3-9362/e45ac4e414371e0b6f9bef258be3d0b652067b1eccbcdf4a770610b9378581d9",
       "metrics": {
         "pipe_m_barrier_ns": {
           "bound_kind": "latency_lower",
@@ -216,14 +192,14 @@
           "cube_only_rate": {
             "bound_kind": "rate_upper",
             "certified_upper_capacity": 13516800000000.0,
-            "cv_pct": 0.387,
+            "cv_pct": 0.2507,
             "n_samples": 32,
-            "p05": 12374920143684.184,
-            "p50": 12391264810066.15,
-            "p95": 12406745978175.852,
-            "p99": 12413977213740.773,
-            "trimmed_cv_pct": 0.0586,
-            "trimmed_mean": 12391861981649.201
+            "p05": 12309022099234.543,
+            "p50": 12333221456508.363,
+            "p95": 12357120969935.18,
+            "p99": 12365685753898.453,
+            "trimmed_cv_pct": 0.0738,
+            "trimmed_mean": 12333415205233.201
           },
           "m_iss": 16,
           "status": "calibrated",
@@ -235,14 +211,14 @@
           "cube_only_rate": {
             "bound_kind": "rate_upper",
             "certified_upper_capacity": 13516800000000.0,
-            "cv_pct": 0.4705,
+            "cv_pct": 0.2184,
             "n_samples": 32,
-            "p05": 12357517709854.062,
-            "p50": 12391823875458.648,
-            "p95": 12414345240220.105,
-            "p99": 12426162538215.543,
-            "trimmed_cv_pct": 0.1131,
-            "trimmed_mean": 12389424254198.598
+            "p05": 12312715328726.043,
+            "p50": 12331451201980.262,
+            "p95": 12349789878963.857,
+            "p99": 12352386647696.2,
+            "trimmed_cv_pct": 0.0745,
+            "trimmed_mean": 12330989536107.123
           },
           "m_iss": 16,
           "status": "calibrated",
@@ -254,14 +230,14 @@
           "cube_only_rate": {
             "bound_kind": "rate_upper",
             "certified_upper_capacity": 3379200000000.0,
-            "cv_pct": 0.082,
+            "cv_pct": 0.113,
             "n_samples": 32,
-            "p05": 3311816279748.545,
-            "p50": 3312939517833.338,
-            "p95": 3313849440384.367,
-            "p99": 3314001526565.702,
-            "trimmed_cv_pct": 0.0126,
-            "trimmed_mean": 3312985000105.8384
+            "p05": 3312957910164.0317,
+            "p50": 3314041895179.6396,
+            "p95": 3315063546509.3027,
+            "p99": 3315489002456.818,
+            "trimmed_cv_pct": 0.0106,
+            "trimmed_mean": 3314042605180.7993
           },
           "m_iss": 16,
           "status": "calibrated",
@@ -273,14 +249,14 @@
           "cube_only_rate": {
             "bound_kind": "rate_upper",
             "certified_upper_capacity": 27033600000000.0,
-            "cv_pct": 0.47,
+            "cv_pct": 0.6221,
             "n_samples": 32,
-            "p05": 19156965557962.625,
-            "p50": 19244840719293.875,
-            "p95": 19329370613735.523,
-            "p99": 19345334279496.57,
-            "trimmed_cv_pct": 0.1895,
-            "trimmed_mean": 19241425364454.87
+            "p05": 19359938278857.652,
+            "p50": 19441388997462.695,
+            "p95": 19542817438061.043,
+            "p99": 19558837158115.17,
+            "trimmed_cv_pct": 0.206,
+            "trimmed_mean": 19447477844477.17
           },
           "m_iss": 16,
           "status": "calibrated",
@@ -292,12 +268,12 @@
       "parameters": {
         "pipe_m_barrier_fractal_threshold": 10,
         "small_m_bf16_ns": {
-          "1": 20072.5,
+          "1": 120810.0,
           "128": 25550.0,
-          "16": 20275.0,
-          "256": 47302.5,
-          "32": 21012.5,
-          "64": 21127.5
+          "16": 46585.0,
+          "256": 47287.5,
+          "32": 20990.0,
+          "64": 21177.5
         }
       },
       "status": "calibrated",
@@ -307,7 +283,7 @@
       }
     },
     "P07_vec_alu": {
-      "evidence_id": "capture://lab-a3-9362/camp-202611-a3-9362-l0/e3860002c34c7ac752b5f4581d333d98aea46a788e79793c26df21c22449bddb",
+      "evidence_id": "capture://lab-a3-9362/camp-202611-l0-a3-9362/e45ac4e414371e0b6f9bef258be3d0b652067b1eccbcdf4a770610b9378581d9",
       "metrics": {
         "raw_latency_cycles": {
           "bound_kind": "latency_lower",
@@ -316,14 +292,14 @@
         "vec_alu_ops_per_s_per_aiv": {
           "bound_kind": "rate_upper",
           "certified_upper_capacity": 105600000000.0,
-          "cv_pct": 2.2246,
+          "cv_pct": 2.4926,
           "n_samples": 32,
-          "p05": 11438598562.25082,
-          "p50": 11635496712.976067,
-          "p95": 11774644335.412771,
-          "p99": 11781240267.161568,
-          "trimmed_cv_pct": 0.7777,
-          "trimmed_mean": 11631702002.547422
+          "p05": 11434772621.461079,
+          "p50": 11611333423.751537,
+          "p95": 11741104760.906723,
+          "p99": 11758590925.816124,
+          "trimmed_cv_pct": 0.6908,
+          "trimmed_mean": 11620094935.362125
         }
       },
       "modes": {},
@@ -365,19 +341,19 @@
       "metrics": {
         "cast_bytes_per_s_per_aiv": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 101964718810.74493
+          "certified_upper_capacity": 52800000000.0
         },
         "vec_reduce_ops_per_s_per_aiv": {
           "bound_kind": "rate_upper",
           "certified_upper_capacity": 52800000000.0,
-          "cv_pct": 0.7912,
+          "cv_pct": 0.6504,
           "n_samples": 32,
-          "p05": 6004149123.726139,
-          "p50": 6066392639.133844,
-          "p95": 6083748573.118961,
-          "p99": 6096983303.454387,
-          "trimmed_cv_pct": 0.3614,
-          "trimmed_mean": 6051623279.678219
+          "p05": 6066392639.133844,
+          "p50": 6096814942.122423,
+          "p95": 6147301492.445376,
+          "p99": 6148545491.277268,
+          "trimmed_cv_pct": 0.3286,
+          "trimmed_mean": 6102405497.375031
         }
       },
       "modes": {},
@@ -392,19 +368,19 @@
       }
     },
     "P10_sort_topk": {
-      "evidence_id": "capture://lab-a3-9362/camp-202611-a3-9362-l0/ef51f185b05d7e9837bff0c45150c19166427211c8ab1823779165c8a159e117",
+      "evidence_id": "capture://lab-a3-9362/camp-202611-l0-a3-9362/e45ac4e414371e0b6f9bef258be3d0b652067b1eccbcdf4a770610b9378581d9",
       "metrics": {
         "sort_elems_per_s": {
           "bound_kind": "rate_upper",
           "certified_upper_capacity": 2112000000000.0,
-          "cv_pct": 0.8942,
+          "cv_pct": 0.8887,
           "n_samples": 32,
-          "p05": 15522758577.120453,
-          "p50": 15753846466.463642,
-          "p95": 15992499798.0597,
-          "p99": 16078403668.709433,
-          "trimmed_cv_pct": 0.5415,
-          "trimmed_mean": 15736741577.924135
+          "p05": 15723025823.659996,
+          "p50": 15946713951.670391,
+          "p95": 16166262799.257797,
+          "p99": 16206271110.543907,
+          "trimmed_cv_pct": 0.6257,
+          "trimmed_mean": 15954778138.889133
         }
       },
       "modes": {},
@@ -541,15 +517,7 @@
         },
         "host_submit_ns": {
           "bound_kind": "latency_lower",
-          "certified_upper_capacity": 0.0,
-          "cv_pct": 1.8451,
-          "n_samples": 32,
-          "p05": 5532.835938,
-          "p50": 5574.140625,
-          "p95": 5861.671875,
-          "p99": 5933.314063,
-          "trimmed_cv_pct": 0.7817,
-          "trimmed_mean": 5585.252404
+          "certified_upper_capacity": 0.0
         },
         "issue_interval_ns": {
           "bound_kind": "latency_lower",
@@ -625,7 +593,7 @@
       "metrics": {
         "link_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 224000000000.0
+          "certified_upper_capacity": 196000000000.0
         },
         "startup_ns": {
           "bound_kind": "latency_lower",
@@ -635,7 +603,7 @@
       "modes": {},
       "parameters": {
         "payload_bytes_per_frame": 1024,
-        "short_final_frame_policy": "pad_full_frame",
+        "short_final_frame_policy": "exact_plus_header",
         "wire_bytes_per_frame": 1024
       },
       "status": "unmeasured",
@@ -649,7 +617,7 @@
       "metrics": {
         "peer_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 224000000000.0
+          "certified_upper_capacity": 196000000000.0
         },
         "status_sync_ns": {
           "bound_kind": "latency_lower",
@@ -669,7 +637,7 @@
       }
     },
     "P20_host_dma_sync": {
-      "evidence_id": "",
+      "evidence_id": "capture://lab-a3-9362/camp-202611-l0-a3-9362/e45ac4e414371e0b6f9bef258be3d0b652067b1eccbcdf4a770610b9378581d9",
       "metrics": {
         "eager_d2h_sync_ns": {
           "bound_kind": "latency_lower",
@@ -677,19 +645,35 @@
         },
         "host_d2h_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 64000000000.0,
-          "cv_pct": 4.2146,
+          "certified_upper_capacity": 48000000000.0,
+          "cv_pct": 4.0127,
           "n_samples": 32,
-          "p05": 33776638912.01593,
-          "p50": 37714696638.708374,
-          "p95": 39144941140.446655,
-          "p99": 39496898366.584724,
-          "trimmed_cv_pct": 2.2628,
-          "trimmed_mean": 37690338186.4699
+          "p05": 32954175084.943027,
+          "p50": 37211310113.15362,
+          "p95": 38634460831.15808,
+          "p99": 38710143818.622955,
+          "trimmed_cv_pct": 1.6928,
+          "trimmed_mean": 37170175695.82442
         },
         "host_h2d_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 64000000000.0
+          "certified_upper_capacity": 64000000000.0,
+          "cv_pct": 4.8087,
+          "n_samples": 32,
+          "p05": 45904127448.250305,
+          "p50": 51098347971.43324,
+          "p95": 54203587688.91011,
+          "p99": 54634769817.44151,
+          "trimmed_cv_pct": 2.6899,
+          "trimmed_mean": 51091877541.44958
+        },
+        "host_rc_d2h_bytes_per_s": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 160000000000.0
+        },
+        "host_rc_h2d_bytes_per_s": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 238800000000.0
         },
         "pageable_dma_startup_ns": {
           "bound_kind": "latency_lower",
@@ -704,7 +688,7 @@
       "parameters": {
         "contention_scope": "root_complex"
       },
-      "status": "unmeasured",
+      "status": "calibrated",
       "units": {
         "latency": "ns",
         "rate": "bytes_per_s"
@@ -713,9 +697,9 @@
   },
   "provenance": {
     "calibrated": true,
-    "campaign_id": "camp-202611-a3-9362-l0",
-    "capture_uri": "capture://lab-a3-9362/camp-202611-a3-9362-l0/db301a40a93c339f261e9c29390772628c7334eb445252c7406a313935f7955d",
-    "collected_utc": "2026-11-20T22:25:02Z",
+    "campaign_id": "camp-202611-l0-a3-9362",
+    "capture_uri": "capture://lab-a3-9362/camp-202611-l0-a3-9362/e45ac4e414371e0b6f9bef258be3d0b652067b1eccbcdf4a770610b9378581d9",
+    "collected_utc": "2026-11-21T00:06:12Z",
     "endpoint_alias": "lab-a3-9362",
     "silicon_fingerprint": {
       "aic_count": 20,

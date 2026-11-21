@@ -146,10 +146,15 @@ print(json.dumps(dict(_linux_capacity(), compiler=hashlib.sha256(
 """
 def _probe_remote(endpoint, policy):
     deadline = time.monotonic() + policy.probe_timeout_s
-    pinned = _pin(endpoint, deadline)
-    source = (f"MIN_PYTHON={MIN_PYTHON!r}\nMIN_SHM_BYTES={MIN_SHM_BYTES}\n"
-              + inspect.getsource(_linux_capacity) + _PROBE)
-    return pinned, json.loads(_exchange(pinned, _boot(source), b"", _remaining(deadline)))
+    try:
+        pinned = _pin(endpoint, deadline)
+        source = (f"MIN_PYTHON={MIN_PYTHON!r}\nMIN_SHM_BYTES={MIN_SHM_BYTES}\n"
+                  + inspect.getsource(_linux_capacity) + _PROBE)
+        return pinned, json.loads(_exchange(pinned, _boot(source), b"", _remaining(deadline)))
+    except TimeoutError:
+        from mindie_sim.remote_exec import RemoteExecUnavailableError
+
+        raise RemoteExecUnavailableError("probe_unavailable") from None
 def _local_ready():
     from mindie_sim.prediction.runtime.accel_loader import cached_library_ready
     return cached_library_ready()
@@ -178,13 +183,20 @@ def _prepare_native(stage_root, *, build=False):
     with _worker_environment(stage):
         seal = root / MANIFEST
         if seal.exists():
-            _private_dir(root)
-            verify_staged_manifest(root)
-            status = accel_build.build_accel(check_only=True)
-            if not status.get("library_ready") or Path(status["cache_path"]).parent != accel_build.cache_root():
+            try:
+                _private_dir(root)
+                verify_staged_manifest(root)
+                status = accel_build.build_accel(check_only=True)
+                if status.get("library_ready") and Path(status["cache_path"]).parent == accel_build.cache_root():
+                    accel_loader.load_accel_cdll(status)
+                    return
+            except TimeoutError:
+                raise
+            except (OSError, RuntimeError, ValueError):
+                if not build:
+                    raise ValueError("validated native library unavailable") from None
+            if not build:
                 raise ValueError("validated native library unavailable")
-            accel_loader.load_accel_cdll(status)
-            return
         if not build:
             raise RuntimeError("staged native library unavailable")
         if root.exists():
@@ -216,11 +228,14 @@ def _init_worker(stage_root, primitive_manifest_path):
         os.environ.pop("MINDIE_SIM_ACCEL_SO", None)
         _prepare_native(stage)
     if primitive_manifest_path:
+        from mindie_sim.primitives.loader import load_manifest, load_primitives
+
         path = Path(stage_root or Path(__file__).parents[1]) / _safe_path(primitive_manifest_path)
-        with path.open("rb") as stream:
-            manifest = json.loads(_bounded_read(stream, FILE_LIMIT))
-        if path.name != "manifest.json" or not isinstance(manifest.get("tables"), dict):
+        if path.name != "manifest.json":
             raise ValueError("invalid primitive manifest")
+        manifest = load_manifest(path.parent)
+        for sku in manifest["tables"]:
+            load_primitives(sku, primitives_dir=path.parent)
 def _lowering(raw):
     from mindie_sim.prediction.results import StepRequest
     from mindie_sim.schema.operators import OpSpec
@@ -252,7 +267,14 @@ def _candidate(entrypoint, base, candidate, deadline):
         if entrypoint == "run_step":
             result = spine.run_step(spine.lower(case, _lowering(raw)), replay)
         elif entrypoint == "evaluate_three_tiers":
-            result = spine.evaluate_three_tiers(case, StepRequest(**raw), replay=replay, **candidate.get("options", {}))
+            opts = dict(candidate.get("options", {}))
+            if "target_eff" in opts:
+                result = spine.evaluate_three_tiers(case, StepRequest(**raw), replay=replay, **opts)
+            else:
+                try:
+                    result = spine.evaluate_three_tiers(case, StepRequest(**raw), replay=replay, target_eff=1.0, **opts)
+                except TypeError:
+                    result = spine.evaluate_three_tiers(case, StepRequest(**raw), replay=replay, **opts)
         elif entrypoint == "solve_sla":
             result = spine.solve_sla(case, SlaRequest(**(raw | {"step": StepRequest(**raw["step"])})))
         elif entrypoint == "sweep_topology":
@@ -308,8 +330,9 @@ def execute_worker_request(request_payload: Mapping | bytes, *, max_result_bytes
     request = RemoteBatchRequest(**json.loads(raw))
     deadline = time.monotonic() + request.deadline_s
     stage = Path(request.stage_root) if request.stage_root else None
+    cpus = os.cpu_count() or 1
     capacity = _linux_capacity() if sys.platform == "linux" else dict(
-        affinity_cpus=os.cpu_count() or 1, cgroup_cpus=None, loadavg_1m=0, mem_avail_mib=WORKER_MEMORY_MIB,
+        affinity_cpus=cpus, cgroup_cpus=None, loadavg_1m=0, mem_avail_mib=WORKER_MEMORY_MIB * cpus,
         cgroup_mem_remaining_mib=None)
     cap, _ = size_remote_workers(**(capacity | {"loadavg_1m": 0}), per_worker_mem_mib=request.per_worker_mem_mib,
                                  max_remote_workers=request.max_workers)

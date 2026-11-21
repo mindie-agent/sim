@@ -36,7 +36,7 @@ from mindie_sim.schema.device_input import StarsSpec
 from .loader import RateRole, _declared_mode, _nonnegative_int as _int, _optional_rate, _simulation_warnings
 from .schema import (
     PRIMITIVE_IDS, PrimitiveLoweringResult, PrimitiveTable, ShortFramePolicy,
-    _FramedCollectiveBand, _address_plan, frame_wire_bytes,
+    _FramedCollectiveBand, _address_plan, _program_span_ms, _stars_plan_span_ms, frame_wire_bytes,
 )
 
 BYTES_PER_S_TO_MS = 1.0 / 1000.0
@@ -65,6 +65,16 @@ REVERSE_DEPTH = 15
 MAX_MUTEX_IDS = 28
 TOKEN_FRAME_PAYLOAD_BYTES = 480
 TOKEN_FRAME_WIRE_BYTES = 512
+_ROW_FALLBACKS = {
+    "vec_issue": ("vec_issue", "pipe_v_issue", "vector"),
+    "vec_alu": ("vec_alu", "reg_alu_lanes", "vector"),
+    "vec_sfu": ("vec_sfu", "reg_special_lanes", "vector"),
+    "vec_reduce": ("vec_reduce", "reg_reduce_lanes", "vector"),
+    "vbitsort32": ("vbitsort32", "vector"),
+    "vmrgsort4": ("vmrgsort4", "vector"),
+    "vhist256": ("vhist256", "vector"),
+    "simt": ("simt", "vector"),
+}
 def _ceil(value: int, unit: int) -> int:
     return (value + unit - 1) // unit
 
@@ -83,6 +93,8 @@ class _Lowering:
         self.stages, self.times, self.meta, self.extra = [], {}, {}, {}
         self.warnings = list(table.warnings)
         self.live = None
+        self.stars_plan = None
+        self.req_res: dict[str, tuple[str, float, str, int]] = {}
 
     def gap(self, code):
         raise UnmodeledCapabilityError(capability=self.pid, entry="lower_primitive",
@@ -115,7 +127,18 @@ class _Lowering:
         return owner
 
     def row(self, key):
-        return key if self.ctx is None else self.ctx.resource_names.get(key, key)
+        if self.ctx is None:
+            return key
+        for cand in _ROW_FALLBACKS.get(key, (key,)):
+            if cand in self.ctx.resource_names:
+                return self.ctx.resource_names[cand]
+        return key
+
+    def _ctx_owner_rate(self, role: str, row: str, owner: int | None) -> float | None:
+        if self.ctx is None or row not in self.ctx.rates:
+            return None
+        units = self.ctx.resource_units.get(row, self.ctx.resource_units.get(role, 1))
+        return float(self.ctx.rates[row]) / float(units if owner is not None else 1)
 
     def append(self, stage, duration=None):
         ready = max((self.times[key] for key in stage.after), default=0.0)
@@ -127,19 +150,36 @@ class _Lowering:
         duration = self.value(metric, 0, mode=mode) * NS_TO_MS if ms is None else ms
         return self.append(Stage(name, after=after, latency=duration, keep_empty=True, metadata=metadata or {}))
 
-    def work(self, name, rows, after=(), *, owner=None, metadata=None, scale_pipe=False):
-        # Rows declare work and calibrated ceilings in the same native units.
-        active = {self.row(role): (amount, rate) for role, amount, rate in rows if amount}
-        if scale_pipe and self.ctx:
-            for row, (amount, rate) in active.items():
-                nominal = self.ctx.rates[row] / self.ctx.resource_units.get(row, self.ctx.resource_units.get("mte1", 1))
-                active[row] = (amount * nominal / rate, nominal)
+    def work(self, name, rows, after=(), *, owner=None, metadata=None, scale_pipe=True, deliveries=()):
+        """Emit work in production row units while preserving native counters."""
+        work_map: dict[str, float] = {}
+        caps_map: dict[str, float] = {}
+        delivs: list[tuple[str, float]] = list(deliveries)
+        dur = 0.0
+        for role, amount, rate in rows:
+            if not amount:
+                continue
+            row = self.row(role)
+            row_dur = float(amount) / float(rate)
+            dur = max(dur, row_dur)
+            nominal = self._ctx_owner_rate(role, row, owner) if scale_pipe else None
+            if nominal is not None:
+                mapped = row_dur * nominal
+                work_map[row] = max(work_map.get(row, 0.0), mapped)
+                caps_map[row] = nominal
+                if role != "cube":
+                    delivs.append((f"{role}_native", float(amount)))
+            else:
+                work_map[row] = max(work_map.get(row, 0.0), float(amount))
+                caps_map[row] = float(rate)
+                if self.ctx is not None:
+                    self.req_res.setdefault(row, (row, float(rate), "work", 1))
         return self.append(Stage(
-            name, work={key: amount for key, (amount, _) in active.items()}, after=after,
-            placement={key: (owner,) for key in active} if owner is not None else {},
-            caps={key: rate for key, (_, rate) in active.items()}, coupled=len(active) > 1,
-            metadata=metadata or {},
-        ), max((amount / rate for amount, rate in active.values()), default=0.0))
+            name, work=work_map, after=after,
+            placement={key: (owner,) for key in work_map} if owner is not None else {},
+            caps=caps_map, coupled=len(work_map) > 1,
+            deliveries=tuple(delivs), metadata=metadata or {},
+        ), dur)
 
     def route(self, src, dst, owner, *, flag=None):
         if self.dp is not None:
@@ -154,6 +194,8 @@ class _Lowering:
             warnings=tuple(dict.fromkeys(self.warnings)), metadata=tuple(self.meta.items()), **self.extra,
         )
         object.__setattr__(result, "_live_access", self.live)
+        object.__setattr__(result, "_stars_plan", self.stars_plan)
+        object.__setattr__(result, "_required_resources", tuple(self.req_res.values()))
         return result
 
 
@@ -195,6 +237,8 @@ def _memory(b, name, pipe, direction, owner, plan, copy_rate, after=(), *, atomi
                   copy_miss_bytes_per_ms=b.get("copy_miss_bytes_per_ms", copy_rate), l2_bytes_per_ms=l2)
     if b.ctx is not None:
         bound = b.ctx.bind_access(pattern, b.state, **config)
+        if "l2" not in b.ctx.resource_names:
+            b.req_res.setdefault(bound.l2_row_id, (bound.l2_row_id, l2, "bytes", 1))
     else:
         bound = bind_memory_access(pattern, b.state, **config, pipe_row_id=pipe, l2_row_id="l2")
     if atomic_rate is not None:
@@ -347,7 +391,8 @@ def _mmad(b):
     elif prologue:
         b.gap(f"mmad_prologue_unsupported:{prologue}")
     cube = b.work("mmad", (("cube", issued, b.speed("cube_only_rate", mode=mode)),), after,
-                  owner=b.owner("aic"), metadata={"issued_flops": issued})
+                  owner=b.owner("aic"), metadata={"issued_flops": issued},
+                  deliveries=(("cube_flops", float(issued)),))
     if (m // FRACTAL_DIM) * (n // FRACTAL_DIM) < PIPE_M_BARRIER_FRACTALS:
         b.delay("PipeBarrier<PIPE_M>", "pipe_m_barrier_ns", (cube,))
 
@@ -400,9 +445,28 @@ def _vector(b):
         b.gap("vector_clock_required")
     issue = issue or (clock * BYTES_PER_S_TO_MS if clock else max(rates.values(), default=1))
     bound = bind_vector_groups(groups, issue_rate_per_ms=issue, pipe_rates_per_ms=rates,
-                               clock_hz=clock or 1, resource_names={key: b.row(key) for key in (*rates, "vec_issue")})
-    limits = {b.row(key): value for key, value in {**rates, "vec_issue": issue}.items()}
-    stages = tuple(replace(stage, caps={key: limits[key] for key in stage.work}) for stage in bound.stages)
+                               clock_hz=clock or 1, resource_names={key: key for key in (*rates, "vec_issue")})
+    orig_rates = {**rates, "vec_issue": issue}
+    mapped_stages = []
+    for stage in bound.stages:
+        work_map, caps_map, place_map, delivs = {}, {}, {}, list(stage.deliveries)
+        for key, amount in stage.work.items():
+            row = b.row(key)
+            r_own = b._ctx_owner_rate(key, row, owner)
+            if r_own is not None:
+                mapped = (float(amount) / float(orig_rates[key])) * r_own
+                work_map[row] = max(work_map.get(row, 0.0), mapped)
+                caps_map[row] = r_own
+                delivs.append((f"{key}_native", float(amount)))
+            else:
+                work_map[row] = max(work_map.get(row, 0.0), float(amount))
+                caps_map[row] = float(orig_rates[key])
+                if b.ctx is not None:
+                    b.req_res.setdefault(row, (row, float(orig_rates[key]), "ops", 1))
+            if key in stage.placement:
+                place_map[row] = stage.placement[key]
+        mapped_stages.append(replace(stage, work=work_map, caps=caps_map, placement=place_map, deliveries=tuple(delivs)))
+    stages = tuple(mapped_stages)
     b.stages.extend(stages)
     b.times["vector"] = bound.span_ms
     b.extra["bound_vector"] = replace(bound, stages=stages)
@@ -578,7 +642,18 @@ def _stars(b):
                      b.get("release_policy", declared.release_policy if declared else "descriptor_ready"),
                      b.cell.evidence_id or (declared.evidence_id if declared else "undeclared"))
     b.extra["stars_spec"] = spec
-    b.delay("descriptor_issue", ms=max(b.value("host_submit_ns"), interval) * NS_TO_MS)
+    die, ns = b.integer("die"), str(b.get("namespace", ""))
+    default_host_ms = b.value("host_submit_ns", 0) * NS_TO_MS
+    raw_descs = b.get("descriptors", 1)
+    descs = (
+        tuple((0, str(b.get("stream", "main")), default_host_ms, {}) for _ in range(max(1, raw_descs)))
+        if isinstance(raw_descs, int) else
+        tuple((int(d.get("replay", 0)), str(d.get("stream", "main")),
+               float(d.get("host_submit_ns", default_host_ms / NS_TO_MS)) * NS_TO_MS,
+               dict(d.get("work", {}))) for d in raw_descs)
+    )
+    b.stars_plan = (die, ns, descs)
+    b.delay("descriptor_issue", ms=_stars_plan_span_ms(spec, b.stars_plan))
 
 
 def _streams(b):
@@ -603,7 +678,8 @@ def _streams(b):
                 stream_id=b.get("stream_id", "main"),
             )
     if program is not None:
-        b.append(Stage("stream_work", after=after, program=program), b.get("work_ms", 0))
+        span_ms = b.p["work_ms"] if "work_ms" in b.p else _program_span_ms(program, b.ctx)
+        b.append(Stage("stream_work", after=after, program=program), span_ms)
     b.meta["isolation"] = mode
 
 
@@ -652,12 +728,16 @@ def _collective(b):
 def _peer(b):
     tokens = tuple(_int(size, "token_payload_bytes") for size in b.get("token_payload_bytes", ()))
     rank, target = b.integer("die"), b.integer("peer", 1)
-    edges = b.dp.ub_peer_edges if b.dp else ()
-    if edges and (rank, target) not in edges:
+    if target == rank:
+        raise ModelingError("primitive_peer_self_invalid")
+    explicit_edges = b.get("peer_edges")
+    edges = tuple(explicit_edges) if explicit_edges is not None else (b.dp.ub_peer_edges if b.dp is not None else ())
+    if (b.dp is not None or explicit_edges is not None) and (rank, target) not in edges:
         b.gap("direct_peer_edge_required")
     payload_frame = b.integer("token_payload_bytes_per_frame", TOKEN_FRAME_PAYLOAD_BYTES, 1)
     wire_frame = b.integer("token_wire_bytes_per_frame", TOKEN_FRAME_WIRE_BYTES, 1)
-    wire = sum(frame_wire_bytes(size, payload_frame, wire_frame)[0] for size in tokens)
+    policy = b.get("short_final_frame_policy", "pad_full_frame")
+    wire = sum(frame_wire_bytes(size, payload_frame, wire_frame, policy)[0] for size in tokens)
     status = b.integer("status_bytes")
     pack = b.delay("pack", "pack_ns")
     frame = b.delay("per_token_frame", "frame_ns", (pack,), metadata={"wire_bytes": wire})
@@ -697,7 +777,7 @@ def lower_primitive(
     primitive_id: str, params: Mapping[str, Any], table: PrimitiveTable, *,
     datapath: DatapathCapabilitySpec | None = None, context: RecipeContext | None = None,
     memory_state: AdmissionMemoryView | None = None, role: RateRole = "sim",
-    allow_uncalibrated_declaration: bool = True,
+    allow_uncalibrated_declaration: bool = False,
 ) -> PrimitiveLoweringResult:
     """Lower a primitive and return executable stages plus their isolated span."""
     if role not in {"sim", "dual"} or not isinstance(params, Mapping):

@@ -1,46 +1,46 @@
 {
   "arch_preset": "npu_arch_3510",
   "cann_version": "9.2.0",
-  "envelope_sha256": "ed0fb4b73ed4bc9324fc48b82049165dea85db280d7a353e52dbbd47624d4428",
+  "envelope_sha256": "03e866113d61d5c9ec4240b79a3604a9efc0256b6694e1bbaf923e66f8f0e9aa",
   "primitives": {
     "P01_datacopy": {
-      "evidence_id": "capture://lab-a5-950dt/camp-202611-a5-dt-l0/714b68fe62cabc59d55cd134b47dddee489c9519f7a115af5848a7c0876ce4a4",
+      "evidence_id": "capture://lab-a5-950dt/camp-202611-l0-a5dt/bd599ed7b72d4ce48fcd9af0d5ca4b0c630c069f6c1ad2066fa4ef0e51622300",
       "metrics": {
         "hbm_read_bytes_per_s": {
           "bound_kind": "rate_upper",
           "certified_upper_capacity": 4000000000000.0,
-          "cv_pct": 3.878,
+          "cv_pct": 3.8025,
           "n_samples": 32,
-          "p05": 2504922206801.956,
-          "p50": 2639225570165.841,
-          "p95": 2750010391059.4707,
-          "p99": 2763921989846.935,
-          "trimmed_cv_pct": 1.935,
-          "trimmed_mean": 2648236606832.89
+          "p05": 2559623024088.9316,
+          "p50": 2676566149532.7686,
+          "p95": 2754727177004.788,
+          "p99": 2801308826626.3423,
+          "trimmed_cv_pct": 1.7128,
+          "trimmed_mean": 2659022767722.084
         },
         "hbm_rw_alpha": {
           "bound_kind": "latency_lower",
           "certified_upper_capacity": 0.0,
-          "cv_pct": 3.545,
+          "cv_pct": 4.7621,
           "n_samples": 32,
-          "p05": 0.842654,
-          "p50": 0.877782,
-          "p95": 0.902266,
-          "p99": 0.905485,
-          "trimmed_cv_pct": 1.5521,
-          "trimmed_mean": 0.876312
+          "p05": 0.857396,
+          "p50": 0.890203,
+          "p95": 0.927673,
+          "p99": 0.930098,
+          "trimmed_cv_pct": 1.6256,
+          "trimmed_mean": 0.892635
         },
         "hbm_write_bytes_per_s": {
           "bound_kind": "rate_upper",
           "certified_upper_capacity": 4000000000000.0,
-          "cv_pct": 1.7178,
+          "cv_pct": 1.9876,
           "n_samples": 32,
-          "p05": 3281928717282.189,
-          "p50": 3349790533289.1875,
-          "p95": 3417559396370.926,
-          "p99": 3535087355264.4736,
-          "trimmed_cv_pct": 0.8868,
-          "trimmed_mean": 3348987252259.6465
+          "p05": 3277537018696.67,
+          "p50": 3347743680548.21,
+          "p95": 3429449807118.0967,
+          "p99": 3574701498458.5923,
+          "trimmed_cv_pct": 0.9321,
+          "trimmed_mean": 3347516386429.1406
         },
         "mte2_aic_hit_bytes_per_s_per_core": {
           "bound_kind": "rate_upper",
@@ -48,15 +48,15 @@
         },
         "mte2_aiv_hit_bytes_per_s_per_core": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 211200000000.0,
-          "cv_pct": 1.8885,
+          "certified_upper_capacity": 105600000000.0,
+          "cv_pct": 1.8516,
           "n_samples": 32,
-          "p05": 91057979798.43436,
-          "p50": 92285440603.9732,
-          "p95": 93428959567.8153,
-          "p99": 93591034995.31882,
-          "trimmed_cv_pct": 0.5498,
-          "trimmed_mean": 92342825733.57349
+          "p05": 91469896594.10208,
+          "p50": 92400368786.9585,
+          "p95": 93274879336.06458,
+          "p99": 93667803093.49068,
+          "trimmed_cv_pct": 0.4361,
+          "trimmed_mean": 92422590707.493
         }
       },
       "modes": {},
@@ -81,7 +81,7 @@
         },
         "l1_to_l0b_bytes_per_s_per_aic": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 422400000000.0
+          "certified_upper_capacity": 211200000000.0
         },
         "setup_ns": {
           "bound_kind": "latency_lower",
@@ -137,19 +137,11 @@
         },
         "atomic_rmw_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 4000000000000.0
+          "certified_upper_capacity": 772000000000.0
         },
         "mte3_store_bytes_per_s_per_aiv": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 211200000000.0,
-          "cv_pct": 3.6797,
-          "n_samples": 32,
-          "p05": 58257154592.68902,
-          "p50": 60327562119.15524,
-          "p95": 61261625834.44141,
-          "p99": 61442325401.173645,
-          "trimmed_cv_pct": 0.897,
-          "trimmed_mean": 60218473672.619675
+          "certified_upper_capacity": 211200000000.0
         },
         "setup_ns": {
           "bound_kind": "latency_lower",
@@ -167,31 +159,23 @@
       }
     },
     "P05_l2_residency_reuse": {
-      "evidence_id": "capture://lab-a5-950dt/camp-202611-a5-dt-l0/b90f45ba3edd2da8231b4ba7d703522f796e18f1ee5d1d43be99e9f54ba0ddc9",
+      "evidence_id": "",
       "metrics": {
         "l2_die_bytes_per_s": {
           "bound_kind": "rate_upper",
           "certified_upper_capacity": 13516800000000.0,
-          "cv_pct": 1.8885,
+          "cv_pct": 1.8516,
           "n_samples": 32,
-          "p05": 5827710707099.799,
-          "p50": 5906268198654.285,
-          "p95": 5979453412340.18,
-          "p99": 5989826239700.404,
-          "trimmed_cv_pct": 0.5498,
-          "trimmed_mean": 5909940846948.703
+          "p05": 5854073382022.533,
+          "p50": 5913623602365.344,
+          "p95": 5969592277508.133,
+          "p99": 5994739397983.403,
+          "trimmed_cv_pct": 0.4361,
+          "trimmed_mean": 5915045805279.552
         },
         "l2_effective_fraction": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 1.0,
-          "cv_pct": 0.0,
-          "n_samples": 32,
-          "p05": 1.0,
-          "p50": 1.0,
-          "p95": 1.0,
-          "p99": 1.0,
-          "trimmed_cv_pct": 0.0,
-          "trimmed_mean": 1.0
+          "certified_upper_capacity": 1.0
         }
       },
       "modes": {},
@@ -201,18 +185,18 @@
         "granule_bytes": 128,
         "l2_bytes": 134217728,
         "ws_sweep_bytes_per_s": {
-          "128MiB": 7001811683351.87,
-          "160MiB": 4956634264306.08,
-          "192MiB": 3283292841586.99,
-          "256MiB": 3200651577674.0,
-          "320MiB": 3198950522646.23,
-          "32MiB": 4177398582114.13,
-          "64MiB": 5873925505925.88,
-          "8MiB": 1988175233394.29,
-          "96MiB": 6601088275839.55
+          "128MiB": 6968939503190.2,
+          "160MiB": 4983247241095.04,
+          "192MiB": 3284766275211.98,
+          "256MiB": 3196459527776.32,
+          "320MiB": 3187267102056.62,
+          "32MiB": 4131259361281.31,
+          "64MiB": 5878729460445.88,
+          "8MiB": 620815383481.39,
+          "96MiB": 6410864130775.16
         }
       },
-      "status": "calibrated",
+      "status": "unmeasured",
       "units": {
         "capacity": "bytes",
         "fraction": "dimensionless",
@@ -220,7 +204,7 @@
       }
     },
     "P06_mmad": {
-      "evidence_id": "capture://lab-a5-950dt/camp-202611-a5-dt-l0/548b9f577a92bc083447cc75cb2d695a44befc598cb6db91384a9e7b7c36911f",
+      "evidence_id": "capture://lab-a5-950dt/camp-202611-l0-a5dt/bd599ed7b72d4ce48fcd9af0d5ca4b0c630c069f6c1ad2066fa4ef0e51622300",
       "metrics": {
         "pipe_m_barrier_ns": {
           "bound_kind": "latency_lower",
@@ -232,14 +216,14 @@
           "cube_only_rate": {
             "bound_kind": "rate_upper",
             "certified_upper_capacity": 13516800000000.0,
-            "cv_pct": 0.0536,
+            "cv_pct": 0.0509,
             "n_samples": 32,
-            "p05": 13241882225838.293,
-            "p50": 13253689117495.742,
-            "p95": 13263011542045.2,
-            "p99": 13266687132238.795,
-            "trimmed_cv_pct": 0.0294,
-            "trimmed_mean": 13252997361165.562
+            "p05": 13242882374610.473,
+            "p50": 13251603930300.152,
+            "p95": 13261437874478.104,
+            "p99": 13264202309992.098,
+            "trimmed_cv_pct": 0.0343,
+            "trimmed_mean": 13252416577079.188
           },
           "m_iss": 16,
           "status": "calibrated",
@@ -251,14 +235,14 @@
           "cube_only_rate": {
             "bound_kind": "rate_upper",
             "certified_upper_capacity": 13516800000000.0,
-            "cv_pct": 0.0508,
+            "cv_pct": 0.0616,
             "n_samples": 32,
-            "p05": 13235455120329.305,
-            "p50": 13246974625580.38,
-            "p95": 13257390807083.582,
-            "p99": 13260590476017.27,
-            "trimmed_cv_pct": 0.0354,
-            "trimmed_mean": 13246424177361.94
+            "p05": 13232131671623.633,
+            "p50": 13245974396538.62,
+            "p95": 13255712892570.098,
+            "p99": 13258742547582.201,
+            "trimmed_cv_pct": 0.0321,
+            "trimmed_mean": 13246288599945.867
           },
           "m_iss": 16,
           "status": "calibrated",
@@ -270,14 +254,14 @@
           "cube_only_rate": {
             "bound_kind": "rate_upper",
             "certified_upper_capacity": 844800000000.0,
-            "cv_pct": 0.0063,
+            "cv_pct": 0.0061,
             "n_samples": 32,
-            "p05": 843185646185.0518,
-            "p50": 843267005977.2501,
-            "p95": 843351674218.5193,
-            "p99": 843367373346.436,
-            "trimmed_cv_pct": 0.0049,
-            "trimmed_mean": 843270615218.4495
+            "p05": 843240938173.7852,
+            "p50": 843306560691.99,
+            "p95": 843381823753.3171,
+            "p99": 843399525012.2626,
+            "trimmed_cv_pct": 0.0045,
+            "trimmed_mean": 843304749372.3706
           },
           "m_iss": 16,
           "status": "calibrated",
@@ -300,14 +284,14 @@
           "cube_only_rate": {
             "bound_kind": "rate_upper",
             "certified_upper_capacity": 27033600000000.0,
-            "cv_pct": 0.3237,
+            "cv_pct": 0.2838,
             "n_samples": 32,
-            "p05": 24899179480586.92,
-            "p50": 25021401766252.324,
-            "p95": 25161582190319.402,
-            "p99": 25177200389157.07,
-            "trimmed_cv_pct": 0.2405,
-            "trimmed_mean": 25030609226917.047
+            "p05": 24906692166936.957,
+            "p50": 25051684411643.355,
+            "p95": 25144435133560.797,
+            "p99": 25165820867110.316,
+            "trimmed_cv_pct": 0.1904,
+            "trimmed_mean": 25047670020923.223
           },
           "m_iss": 16,
           "status": "calibrated",
@@ -343,12 +327,12 @@
       "parameters": {
         "pipe_m_barrier_fractal_threshold": 10,
         "small_m_bf16_ns": {
-          "1": 11988.62,
-          "128": 17999.25,
-          "16": 12590.5,
-          "256": 30120.75,
-          "32": 13415.25,
-          "64": 14464.5
+          "1": 12158.87,
+          "128": 18002.75,
+          "16": 12696.87,
+          "256": 30183.25,
+          "32": 13154.88,
+          "64": 14503.63
         }
       },
       "status": "calibrated",
@@ -358,7 +342,7 @@
       }
     },
     "P07_vec_alu": {
-      "evidence_id": "capture://lab-a5-950dt/camp-202611-a5-dt-l0/c994f664875c5b0060501f67decec028fadc730b490c31d165b40e4bedc49e70",
+      "evidence_id": "capture://lab-a5-950dt/camp-202611-l0-a5dt/bd599ed7b72d4ce48fcd9af0d5ca4b0c630c069f6c1ad2066fa4ef0e51622300",
       "metrics": {
         "raw_latency_cycles": {
           "bound_kind": "latency_lower",
@@ -367,14 +351,14 @@
         "vec_alu_ops_per_s_per_aiv": {
           "bound_kind": "rate_upper",
           "certified_upper_capacity": 211200000000.0,
-          "cv_pct": 0.9339,
+          "cv_pct": 1.1454,
           "n_samples": 32,
-          "p05": 9965068079.669605,
-          "p50": 10076117106.448818,
-          "p95": 10144991395.076305,
-          "p99": 10161733905.729994,
-          "trimmed_cv_pct": 0.4382,
-          "trimmed_mean": 10067955798.728664
+          "p05": 9936841079.123562,
+          "p50": 10059443140.109928,
+          "p95": 10128953442.831915,
+          "p99": 10189349992.128872,
+          "trimmed_cv_pct": 0.45,
+          "trimmed_mean": 10046699610.16942
         }
       },
       "modes": {},
@@ -397,7 +381,7 @@
         },
         "vec_sfu_ops_per_s_per_aiv": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 105600000000.0
+          "certified_upper_capacity": 52800000000.0
         }
       },
       "modes": {},
@@ -416,7 +400,7 @@
       "metrics": {
         "cast_bytes_per_s_per_aiv": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 105600000000.0
+          "certified_upper_capacity": 422400000000.0
         },
         "vec_reduce_ops_per_s_per_aiv": {
           "bound_kind": "rate_upper",
@@ -435,19 +419,11 @@
       }
     },
     "P10_sort_topk": {
-      "evidence_id": "capture://lab-a5-950dt/camp-202611-a5-dt-l0/e34a555eb1dc4fa0becf4d8c14884a28004c58dfc26d66e8e9269adac3dc44a8",
+      "evidence_id": "",
       "metrics": {
         "sort_elems_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 6758400000000.0,
-          "cv_pct": 2.9571,
-          "n_samples": 32,
-          "p05": 29052538648.69406,
-          "p50": 29880169475.25672,
-          "p95": 31614998544.476963,
-          "p99": 31748413255.801422,
-          "trimmed_cv_pct": 2.3819,
-          "trimmed_mean": 30086721566.1719
+          "certified_upper_capacity": 6758400000000.0
         }
       },
       "modes": {},
@@ -463,7 +439,7 @@
           2048
         ]
       },
-      "status": "calibrated",
+      "status": "unmeasured",
       "units": {
         "rate": "elems_per_s"
       }
@@ -585,14 +561,14 @@
         "host_submit_ns": {
           "bound_kind": "latency_lower",
           "certified_upper_capacity": 0.0,
-          "cv_pct": 1.6004,
+          "cv_pct": 1.7808,
           "n_samples": 32,
-          "p05": 7637.914062,
-          "p50": 7786.171875,
-          "p95": 8022.1875,
-          "p99": 8053.060938,
-          "trimmed_cv_pct": 1.0442,
-          "trimmed_mean": 7791.634615
+          "p05": 8355.78125,
+          "p50": 8504.296875,
+          "p95": 8783.9375,
+          "p99": 8916.457813,
+          "trimmed_cv_pct": 1.2742,
+          "trimmed_mean": 8528.209135
         },
         "issue_interval_ns": {
           "bound_kind": "latency_lower",
@@ -668,7 +644,7 @@
       "metrics": {
         "link_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 400000000000.0
+          "certified_upper_capacity": 56000000000.0
         },
         "startup_ns": {
           "bound_kind": "latency_lower",
@@ -678,7 +654,7 @@
       "modes": {},
       "parameters": {
         "payload_bytes_per_frame": 480,
-        "short_final_frame_policy": "pad_full_frame",
+        "short_final_frame_policy": "exact_plus_header",
         "wire_bytes_per_frame": 512
       },
       "status": "unmeasured",
@@ -692,7 +668,7 @@
       "metrics": {
         "peer_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 400000000000.0
+          "certified_upper_capacity": 56000000000.0
         },
         "status_sync_ns": {
           "bound_kind": "latency_lower",
@@ -720,11 +696,19 @@
         },
         "host_d2h_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 64000000000.0
+          "certified_upper_capacity": 128000000000.0
         },
         "host_h2d_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 64000000000.0
+          "certified_upper_capacity": 128000000000.0
+        },
+        "host_rc_d2h_bytes_per_s": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 400000000000.0
+        },
+        "host_rc_h2d_bytes_per_s": {
+          "bound_kind": "rate_upper",
+          "certified_upper_capacity": 400000000000.0
         },
         "pageable_dma_startup_ns": {
           "bound_kind": "latency_lower",
@@ -748,9 +732,9 @@
   },
   "provenance": {
     "calibrated": true,
-    "campaign_id": "camp-202611-a5-dt-l0",
-    "capture_uri": "capture://lab-a5-950dt/camp-202611-a5-dt-l0/04dbe2d3e18c1cf9abdc4831596ad6dc2229f230d5393a1d495408229f3a64f3",
-    "collected_utc": "2026-11-20T22:25:04Z",
+    "campaign_id": "camp-202611-l0-a5dt",
+    "capture_uri": "capture://lab-a5-950dt/camp-202611-l0-a5dt/bd599ed7b72d4ce48fcd9af0d5ca4b0c630c069f6c1ad2066fa4ef0e51622300",
+    "collected_utc": "2026-11-21T00:05:59Z",
     "endpoint_alias": "lab-a5-950dt",
     "silicon_fingerprint": {
       "aic_count": 32,
