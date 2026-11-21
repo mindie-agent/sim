@@ -64,6 +64,15 @@ tier = "tier0"
 reserved = true
 # L0 micro-primitive schema/loader/lowering (s3a-remote-l0)
 
+[[module]]
+path = "schema/test_l0_primitives.py"
+tier = "tier0"
+owns = [
+  "mindie_sim/primitives",
+  "data/primitives",
+  "tools/bench_l0_primitives.py",
+]
+
 # ---------------------------------------------------------------- runtime (Engine, C11, memory physics)
 [[module]]
 path = "runtime/test_engine_core.py"
@@ -167,6 +176,14 @@ path = "runtime/test_remote_exec.py"
 tier = "tier0"
 reserved = true
 # remote-first CPU execution dispatcher (s3a-remote-l0)
+
+[[module]]
+path = "runtime/test_remote_exec.py"
+tier = "tier0"
+owns = [
+  "mindie_sim/remote_exec.py",
+  "mindie_sim/_remote_worker.py",
+]
 
 [[module]]
 path = "runtime/test_formal_lean_locks.py"

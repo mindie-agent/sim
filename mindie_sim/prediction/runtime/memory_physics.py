@@ -34,6 +34,16 @@ HBM_DIR_READ = 0
 HBM_DIR_WRITE = 1
 VALID_COPY_PIPES = frozenset({"mte2_aic", "mte2_aiv", "mte3", "fixpipe"})
 VALID_VISIBILITY_SCOPES = frozenset({"owner", "die", "device", "host"})
+_L2_CACHE_DISABLE = "disable"
+CACHE_POLICY_NORMAL = "normal"
+CACHE_POLICY_LAST_USE = "last_use"
+CACHE_POLICY_DISABLE = _L2_CACHE_DISABLE
+VALID_CACHE_POLICIES = frozenset({
+    CACHE_POLICY_NORMAL,
+    CACHE_POLICY_LAST_USE,
+    CACHE_POLICY_DISABLE,
+})
+CachePolicy = Literal["normal", "last_use", "disable"]
 
 
 def _ceil_div(numerator: int, denominator: int) -> int:
@@ -259,6 +269,194 @@ class AddressRun:
         return total_sectors * sector_bytes
 
 
+def _run_is_sector_contiguous(run: AddressRun, sec: int) -> bool:
+    """True iff every adjacent row pair touches or overlaps at sector granularity."""
+    if run.rows <= 1 or run.stride_bytes == 0 or run.stride_bytes <= run.row_bytes:
+        return True
+    period = sec // math.gcd(sec, run.stride_bytes)
+    limit = min(run.rows - 1, period)
+    for step in range(limit):
+        cur_end = _ceil_div(run.base_byte + step * run.stride_bytes + run.row_bytes, sec)
+        nxt_start = (run.base_byte + (step + 1) * run.stride_bytes) // sec
+        if nxt_start > cur_end:
+            return False
+    return True
+
+
+@dataclass(frozen=True, slots=True)
+class PeriodicSectorRun:
+    """Exact compact representation of a gapped periodic strided sector set."""
+
+    base_byte: int
+    rows: int
+    row_bytes: int
+    stride_bytes: int
+    sector_bytes: int = DEFAULT_SECTOR_BYTES
+
+    def total_bytes(self) -> int:
+        return AddressRun(
+            self.base_byte, self.rows, self.row_bytes, self.stride_bytes,
+        ).sector_union_bytes(self.sector_bytes)
+
+    def _row_bounds(self, step: int) -> tuple[int, int]:
+        addr = self.base_byte + step * self.stride_bytes
+        return (addr // self.sector_bytes) * self.sector_bytes, _align_up(
+            addr + self.row_bytes, self.sector_bytes,
+        )
+
+    def _period(self) -> int:
+        return self.stride_bytes if self.stride_bytes % self.sector_bytes == 0 else math.lcm(self.stride_bytes, self.sector_bytes)
+
+    def _bounds(self) -> tuple[int, int]:
+        if self.rows <= 0 or self.row_bytes <= 0:
+            return 0, 0
+        return self._row_bounds(0)[0], self._row_bounds(self.rows - 1)[1]
+
+    def canonical(self) -> PeriodicSectorRun:
+        """Canonicalize to sector-aligned origin/span when stride is sector-aligned."""
+        if self.stride_bytes > 0 and self.stride_bytes % self.sector_bytes == 0 and self.rows > 0:
+            s0, e0 = self._row_bounds(0)
+            return PeriodicSectorRun(s0, self.rows, e0 - s0, self.stride_bytes, self.sector_bytes)
+        return self
+
+    def _window_intervals(self, lo: int, hi: int) -> tuple[tuple[int, int], ...]:
+        if hi <= lo or self.rows <= 0 or self.row_bytes <= 0 or self.stride_bytes <= 0:
+            return ()
+        sec, stride = self.sector_bytes, self.stride_bytes
+        num_lo = lo - sec - self.base_byte - self.row_bytes
+        k_lo = 0 if num_lo < 0 else (num_lo // stride) + 1
+        if hi - 1 < self.base_byte:
+            return ()
+        k_hi = min(self.rows - 1, (hi - 1 - self.base_byte) // stride)
+        if k_lo > k_hi:
+            return ()
+        ivs = []
+        for step in range(k_lo, k_hi + 1):
+            s_k, e_k = self._row_bounds(step)
+            c_lo, c_hi = max(lo, s_k), min(hi, e_k)
+            if c_hi > c_lo:
+                ivs.append((c_lo, c_hi))
+        return _merge_byte_intervals(ivs)
+
+    def overlap_with_interval(self, lo: int, hi: int) -> int:
+        """Exact byte overlap between this periodic sector set and ``[lo, hi)``."""
+        r_lo, r_hi = self._bounds()
+        c_lo, c_hi = max(lo, r_lo), min(hi, r_hi)
+        if c_hi <= c_lo or self.stride_bytes <= 0:
+            return 0
+        period = self._period()
+        if (c_hi - c_lo) // self.stride_bytes <= _MAX_EXPLICIT_SECTOR_INTERVALS:
+            return _measure_byte_intervals(self._window_intervals(c_lo, c_hi))
+        in_lo, in_hi = min(c_hi, max(c_lo, r_lo + period)), max(min(c_hi, max(c_lo, r_lo + period)), min(c_hi, r_hi - period))
+        total = _measure_byte_intervals(self._window_intervals(c_lo, in_lo))
+        if in_hi > in_lo:
+            full, rem = divmod(in_hi - in_lo, period)
+            total += (full * _measure_byte_intervals(self._window_intervals(in_lo, in_lo + period)) if full else 0)
+            total += (_measure_byte_intervals(self._window_intervals(in_lo + full * period, in_hi)) if rem else 0)
+        return total + (_measure_byte_intervals(self._window_intervals(in_hi, c_hi)) if c_hi > in_hi else 0)
+
+    def overlap_with_periodic(self, other: PeriodicSectorRun) -> int:
+        """Exact byte overlap between two periodic sector runs."""
+        return _measure_periodic_combo((self,), (other,), intersect=True)
+
+
+def _measure_periodic_combo(
+    left: tuple[PeriodicSectorRun, ...], right: tuple[PeriodicSectorRun, ...], *,
+    intersect: bool, extra_left_ivs: tuple[tuple[int, int], ...] = (),
+    extra_right_ivs: tuple[tuple[int, int], ...] = (),
+) -> int:
+    """Exact byte measure of union (``intersect=False``) or intersection of runs + intervals."""
+    left_c = tuple(dict.fromkeys(r.canonical() for r in left if r.rows > 0 and r.row_bytes > 0))
+    right_c = tuple(dict.fromkeys(r.canonical() for r in right if r.rows > 0 and r.row_bytes > 0))
+    if not intersect and not left_c and not right_c:
+        return _measure_byte_intervals(_merge_byte_intervals((*extra_left_ivs, *extra_right_ivs)))
+    if intersect and ((not left_c and not extra_left_ivs) or (not right_c and not extra_right_ivs)):
+        return 0
+    if not intersect and len(left_c) == 1 and not right_c:
+        r0, ivs = left_c[0], _merge_byte_intervals((*extra_left_ivs, *extra_right_ivs))
+        return _measure_byte_intervals(ivs) + max(0, r0.total_bytes() - sum(r0.overlap_with_interval(a, b) for a, b in ivs))
+    if intersect and len(left_c) == 1 and len(right_c) == 1 and not extra_left_ivs and not extra_right_ivs:
+        a, b = left_c[0], right_c[0]
+        if a == b:
+            return a.total_bytes()
+        if (a.sector_bytes == b.sector_bytes and a.stride_bytes == b.stride_bytes > 0
+                and a.stride_bytes % a.sector_bytes == 0
+                and (a.rows == 1 or a.row_bytes < a.stride_bytes)
+                and (b.rows == 1 or b.row_bytes < b.stride_bytes)):
+            st, w1, w2 = a.stride_bytes, a.row_bytes, b.row_bytes
+            q, rem = divmod(b.base_byte - a.base_byte, st)
+            total = 0
+            for s in range(math.floor((-rem - w2) / st), math.ceil((w1 - rem) / st) + 1):
+                ov_w = min(w1, rem + s * st + w2) - max(0, rem + s * st)
+                k_lo, k_hi = max(0, q - s), min(a.rows - 1, b.rows - 1 + q - s)
+                if ov_w > 0 and k_hi >= k_lo:
+                    total += (k_hi - k_lo + 1) * ov_w
+            return total
+    pts = {x for r in (*left_c, *right_c) for x in r._bounds() if r._bounds()[1] > r._bounds()[0]}
+    pts.update(x for lo, hi in (*extra_left_ivs, *extra_right_ivs) if hi > lo for x in (lo, hi))
+    coords, total = sorted(pts), 0
+    for s_lo, s_hi in zip(coords, coords[1:]):
+        l_cov = any(lo <= s_lo and hi >= s_hi for lo, hi in extra_left_ivs)
+        r_cov = any(lo <= s_lo and hi >= s_hi for lo, hi in extra_right_ivs)
+        l_act = () if l_cov else tuple(r for r in left_c if r._bounds()[0] <= s_lo and r._bounds()[1] >= s_hi)
+        r_act = () if r_cov else tuple(r for r in right_c if r._bounds()[0] <= s_lo and r._bounds()[1] >= s_hi)
+        if not intersect:
+            if l_cov or r_cov:
+                total += s_hi - s_lo
+                continue
+            act = tuple(dict.fromkeys((*l_act, *r_act)))
+            if not act:
+                continue
+            eval_fn = lambda w0, w1, _a=act: _measure_byte_intervals(_merge_byte_intervals([iv for r in _a for iv in r._window_intervals(w0, w1)]))
+        else:
+            if (not l_cov and not l_act) or (not r_cov and not r_act):
+                continue
+            if l_cov and r_cov:
+                total += s_hi - s_lo
+                continue
+            act = tuple(dict.fromkeys((*l_act, *r_act)))
+            eval_fn = lambda w0, w1, _lc=l_cov, _rc=r_cov, _la=l_act, _ra=r_act: _measure_byte_intervals(_intersect_byte_intervals(
+                ((w0, w1),) if _lc else _merge_byte_intervals([iv for r in _la for iv in r._window_intervals(w0, w1)]),
+                ((w0, w1),) if _rc else _merge_byte_intervals([iv for r in _ra for iv in r._window_intervals(w0, w1)]),
+            ))
+        period = math.lcm(*(r._period() for r in act))
+        in_lo = min(s_hi, max(s_lo, max(r._bounds()[0] + period for r in act)))
+        in_hi = max(in_lo, min(s_hi, min(r._bounds()[1] - period for r in act)))
+        total += eval_fn(s_lo, in_lo) if in_lo > s_lo else 0
+        if in_hi > in_lo:
+            full, rem = divmod(in_hi - in_lo, period)
+            total += (full * eval_fn(in_lo, in_lo + period) if full else 0) + (eval_fn(in_lo + full * period, in_hi) if rem else 0)
+        total += eval_fn(in_hi, s_hi) if s_hi > in_hi else 0
+    return total
+
+
+@dataclass(frozen=True, slots=True)
+class SectorCoverage:
+    """Exact sector coverage combining explicit intervals and periodic strided runs."""
+
+    intervals: tuple[tuple[int, int], ...] = ()
+    periodic: tuple[PeriodicSectorRun, ...] = ()
+
+    @property
+    def empty(self) -> bool:
+        return not self.intervals and not self.periodic
+
+    def measure_bytes(self) -> int:
+        return _measure_periodic_combo(self.periodic, (), intersect=False, extra_left_ivs=self.intervals)
+
+    def overlap_bytes(self, other: SectorCoverage) -> int:
+        return 0 if (self.empty or other.empty) else _measure_periodic_combo(
+            self.periodic, other.periodic, intersect=True,
+            extra_left_ivs=self.intervals, extra_right_ivs=other.intervals,
+        )
+
+    def union(self, other: SectorCoverage) -> SectorCoverage:
+        return SectorCoverage(
+            intervals=_merge_byte_intervals((*self.intervals, *other.intervals)),
+            periodic=tuple(dict.fromkeys(r.canonical() for r in (*self.periodic, *other.periodic))),
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class AddressRunPlan:
     """Explicit physical runs, layout alignment, and scale metadata for one access."""
@@ -287,22 +485,16 @@ class AddressRunPlan:
                 rows_eff = 1 if run.stride_bytes == 0 else run.rows
             else:
                 rows_eff = run.rows
-            if run.stride_bytes == run.row_bytes:
-                total += _align_up(rows_eff * run.row_bytes, self.alignment_bytes)
-            else:
-                total += rows_eff * _align_up(run.row_bytes, self.alignment_bytes)
-        if total > 0:
-            total += _align_up(self.scale_bytes, self.alignment_bytes) if self.scale_bytes else 0
-        return total
+            total += (_align_up(rows_eff * run.row_bytes, self.alignment_bytes) if run.stride_bytes == run.row_bytes
+                      else rows_eff * _align_up(run.row_bytes, self.alignment_bytes))
+        return total + (_align_up(self.scale_bytes, self.alignment_bytes) if total > 0 and self.scale_bytes else 0)
 
-    def dram_sector_and_service(
-        self,
-        burst_rules: Sequence[BurstTurnRule] = (),
-    ) -> tuple[int, float]:
+    def dram_sector_and_service(self, burst_rules: Sequence[BurstTurnRule] = ()) -> tuple[int, float]:
         """Exact integer 32 B sector bytes and burst-adjusted DRAM service bytes (D_f)."""
         seen_aliases: set[str] = set()
-        sector_total = 0
-        service_total = 0.0
+        covered = SectorCoverage()
+        sector_total, service_total = 0, 0.0
+        single_run = len(self.runs) == 1
         for run in self.runs:
             if run.rows == 0 or run.row_bytes == 0:
                 continue
@@ -310,10 +502,16 @@ class AddressRunPlan:
                 if run.proven_alias_group in seen_aliases:
                     continue
                 seen_aliases.add(run.proven_alias_group)
-            sec_bytes = run.sector_union_bytes(self.sector_bytes)
-            eta = burst_turnaround_efficiency(run.row_bytes, run.stride_bytes, burst_rules)
-            sector_total += sec_bytes
-            service_total += float(sec_bytes) / eta
+            if single_run:
+                sec_bytes = run.sector_union_bytes(self.sector_bytes)
+            else:
+                run_cov = AddressRunPlan((run,), alignment_bytes=self.alignment_bytes, sector_bytes=self.sector_bytes).sector_coverage()
+                sec_bytes = max(0, run_cov.measure_bytes() - run_cov.overlap_bytes(covered))
+                covered = covered.union(run_cov)
+            if sec_bytes > 0:
+                eta = burst_turnaround_efficiency(run.row_bytes, run.stride_bytes, burst_rules)
+                sector_total += sec_bytes
+                service_total += float(sec_bytes) / eta
         if sector_total > 0 and self.scale_bytes > 0:
             scale_sec = _align_up(self.scale_bytes, self.sector_bytes)
             sector_total += scale_sec
@@ -322,25 +520,32 @@ class AddressRunPlan:
 
     def sector_intervals(self) -> tuple[tuple[int, int], ...]:
         """Return canonical disjoint ``[lo, hi)`` sector-aligned byte intervals."""
-        sec = self.sector_bytes
-        ivs: list[tuple[int, int]] = []
+        sec, ivs = self.sector_bytes, []
         for run in self.runs:
             if run.rows == 0 or run.row_bytes == 0:
                 continue
             s0 = (run.base_byte // sec) * sec
-            if run.rows == 1 or run.stride_bytes == 0:
-                ivs.append((s0, _align_up(run.base_byte + run.row_bytes, sec)))
-            elif run.stride_bytes <= run.row_bytes:
-                end = run.base_byte + (run.rows - 1) * run.stride_bytes + run.row_bytes
+            if _run_is_sector_contiguous(run, sec):
+                end = run.base_byte + run.row_bytes if (run.rows == 1 or run.stride_bytes == 0) else run.base_byte + (run.rows - 1) * run.stride_bytes + run.row_bytes
                 ivs.append((s0, _align_up(end, sec)))
             elif run.rows <= _MAX_EXPLICIT_SECTOR_INTERVALS:
                 for step in range(run.rows):
                     addr = run.base_byte + step * run.stride_bytes
                     ivs.append(((addr // sec) * sec, _align_up(addr + run.row_bytes, sec)))
-            else:
-                end = run.base_byte + (run.rows - 1) * run.stride_bytes + run.row_bytes
-                ivs.append((s0, _align_up(end, sec)))
         return _merge_byte_intervals(ivs)
+
+    def periodic_sector_runs(self) -> tuple[PeriodicSectorRun, ...]:
+        """Return exact compact periodic descriptors for gapped runs with ``rows > 4096``."""
+        sec = self.sector_bytes
+        return tuple(dict.fromkeys(
+            PeriodicSectorRun(run.base_byte, run.rows, run.row_bytes, run.stride_bytes, sec).canonical()
+            for run in self.runs
+            if run.rows > _MAX_EXPLICIT_SECTOR_INTERVALS and run.row_bytes > 0 and not _run_is_sector_contiguous(run, sec)
+        ))
+
+    def sector_coverage(self) -> SectorCoverage:
+        """Exact sector coverage retaining periodic strided sets without gap collapse."""
+        return SectorCoverage(intervals=self.sector_intervals(), periodic=self.periodic_sector_runs())
 
 
 @dataclass(frozen=True, slots=True)
@@ -358,6 +563,7 @@ class MemoryAccessPattern:
     reuse_key: ReuseKey | None = None
     reuse_distance_bytes: int | None = None
     visibility: VisibilityContract = field(default_factory=VisibilityContract)
+    cache_policy: CachePolicy = CACHE_POLICY_NORMAL
 
     def __post_init__(self) -> None:
         if not self.tensor_id:
@@ -378,6 +584,8 @@ class MemoryAccessPattern:
             type(self.reuse_distance_bytes) is not int or self.reuse_distance_bytes < 0
         ):
             raise ModelingError(f"memory_access_reuse_distance_invalid:{self.reuse_distance_bytes!r}")
+        if self.cache_policy not in VALID_CACHE_POLICIES:
+            raise ModelingError(f"memory_access_cache_policy_invalid:{self.cache_policy!r}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -559,6 +767,10 @@ __all__ = [
     "BoundAccess",
     "BurstTurnRule",
     "ByteLedger",
+    "CACHE_POLICY_DISABLE",
+    "CACHE_POLICY_LAST_USE",
+    "CACHE_POLICY_NORMAL",
+    "CachePolicy",
     "ConstraintTerm",
     "CounterTerm",
     "DEFAULT_ALIGN_BYTES",
@@ -569,8 +781,12 @@ __all__ = [
     "HBM_DIR_WRITE",
     "HbmBusSpec",
     "MemoryAccessPattern",
+    "PeriodicSectorRun",
     "ReuseKey",
+    "SectorCoverage",
+    "VALID_CACHE_POLICIES",
     "VisibilityContract",
+    "_L2_CACHE_DISABLE",
     "bind_memory_access",
     "burst_turnaround_efficiency",
 ]

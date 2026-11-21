@@ -25,12 +25,15 @@ from .memory_physics import (
     BoundAccess,
     BurstTurnRule,
     ByteLedger,
+    CACHE_POLICY_LAST_USE,
     ConstraintTerm,
     CounterTerm,
     DEFAULT_L2_GRANULE_BYTES,
     HbmBusSpec,
     MemoryAccessPattern,
     ReuseKey,
+    SectorCoverage,
+    _L2_CACHE_DISABLE,
     _intersect_byte_intervals,
     _measure_byte_intervals,
     _merge_byte_intervals,
@@ -58,7 +61,9 @@ class _ResidentL2Entry:
     private_workspace: bool
     evicted: bool = False
     resident_ranges: tuple[tuple[int, int], ...] = ()
+    resident_coverage: SectorCoverage = SectorCoverage()
     dirty_ranges: tuple[tuple[int, int], ...] = ()
+    dirty_coverage: SectorCoverage = SectorCoverage()
     has_future_reader: bool = True
 
 
@@ -94,10 +99,9 @@ class AdmissionMemoryView:
             self._pending_writebacks[die] = []
 
     def active_stream_count(self, die: int) -> int:
-        keys = self._active_keys.get(die, ())
-        streams = self._active_streams.get(die, ())
-        covered = {k.reuse_stream for k in keys}
-        return len(keys) + sum(1 for s in streams if s not in covered)
+        streams = set(self._active_streams.get(die, ()))
+        streams.update(k.reuse_stream for k in self._active_keys.get(die, ()))
+        return len(streams)
 
     def reserved_bytes(self, die: int) -> int:
         return sum(self._reserved.get(die, {}).values())
@@ -114,20 +118,64 @@ class AdmissionMemoryView:
 
     def _settle_eviction(self, entry: _ResidentL2Entry) -> None:
         if entry.dirty and entry.has_future_reader:
-            wb_bytes = _measure_byte_intervals(entry.dirty_ranges) or entry.working_set_bytes
+            wb_bytes = (
+                entry.dirty_coverage.measure_bytes()
+                or _measure_byte_intervals(entry.dirty_ranges)
+                or entry.working_set_bytes
+            )
             self._pending_writebacks[entry.key.die].append(DirtyWriteback(
                 key=entry.key, die=entry.key.die,
                 bytes=wb_bytes, ranges=entry.dirty_ranges,
             ))
             entry.dirty = False
             entry.dirty_ranges = ()
+            entry.dirty_coverage = SectorCoverage()
         entry.evicted = True
 
-    def _evict_over_capacity(self, die: int) -> None:
-        eff = self.effective_l2_bytes(die)
+    def _touch_resident(self, entry: _ResidentL2Entry) -> None:
+        self._resident.pop(entry.key, None)
+        self._resident[entry.key] = entry
+
+    def _eviction_victims(
+        self, die: int, eff: int, avail: int, *, protect_key: ReuseKey | None = None,
+    ) -> list[_ResidentL2Entry]:
+        """Pure read-only LRU victim list matching exact over-capacity eviction rules."""
+        victims: list[_ResidentL2Entry] = []
+        evicted: set[ReuseKey] = set()
         for entry in self._resident.values():
             if entry.key.die == die and not entry.evicted and entry.working_set_bytes > eff:
-                self._settle_eviction(entry)
+                victims.append(entry)
+                evicted.add(entry.key)
+        by_stream: dict[str, list[_ResidentL2Entry]] = {}
+        for entry in self._resident.values():
+            if entry.key.die == die and not entry.evicted and entry.key not in evicted:
+                by_stream.setdefault(entry.key.reuse_stream, []).append(entry)
+        for entries in by_stream.values():
+            total = sum(e.working_set_bytes for e in entries)
+            for victim in sorted(entries, key=lambda e: e.key == protect_key):
+                if total <= eff:
+                    break
+                victims.append(victim)
+                evicted.add(victim.key)
+                total -= victim.working_set_bytes
+        live = [
+            e for e in self._resident.values()
+            if e.key.die == die and not e.evicted and e.key not in evicted
+        ]
+        total_die = sum(e.working_set_bytes for e in live)
+        for victim in sorted(live, key=lambda e: e.key == protect_key):
+            if total_die <= avail:
+                break
+            victims.append(victim)
+            evicted.add(victim.key)
+            total_die -= victim.working_set_bytes
+        return victims
+
+    def _evict_over_capacity(self, die: int, *, protect_key: ReuseKey | None = None) -> None:
+        eff = self.effective_l2_bytes(die)
+        avail = max(0, self._l2_capacity[die] - self.reserved_bytes(die))
+        for victim in self._eviction_victims(die, eff, avail, protect_key=protect_key):
+            self._settle_eviction(victim)
 
     def pending_writebacks(self, die: int) -> tuple[DirtyWriteback, ...]:
         return tuple(self._pending_writebacks.get(die, ()))
@@ -194,17 +242,17 @@ class AdmissionMemoryView:
         return entry is not None and not entry.evicted
 
     @staticmethod
-    def _range_hit_miss(
-        req_ivs: tuple[tuple[int, int], ...],
-        res_ivs: tuple[tuple[int, int], ...],
+    def _coverage_hit_miss(
+        req_cov: SectorCoverage,
+        res_cov: SectorCoverage,
         aligned_bytes: int,
     ) -> tuple[int, int]:
-        if not req_ivs or not res_ivs:
+        if req_cov.empty or res_cov.empty:
             return 0, aligned_bytes
-        req_b = _measure_byte_intervals(req_ivs)
+        req_b = req_cov.measure_bytes()
         if req_b <= 0:
             return 0, aligned_bytes
-        ov_b = _measure_byte_intervals(_intersect_byte_intervals(req_ivs, res_ivs))
+        ov_b = req_cov.overlap_bytes(res_cov)
         if ov_b <= 0:
             return 0, aligned_bytes
         if ov_b >= req_b:
@@ -212,12 +260,53 @@ class AdmissionMemoryView:
         hit = min(aligned_bytes, int(round(aligned_bytes * (float(ov_b) / float(req_b)))))
         return hit, aligned_bytes - hit
 
+    def _preview_effective_l2(self, key: ReuseKey) -> int:
+        streams = set(self._active_streams.get(key.die, ()))
+        streams.update(k.reuse_stream for k in self._active_keys.get(key.die, ()))
+        streams.add(key.reuse_stream)
+        n_eff = max(1, len(streams))
+        avail = max(0, self._l2_capacity[key.die] - self.reserved_bytes(key.die))
+        return self.granule_bytes * (avail // (self.granule_bytes * n_eff))
+
+    def _classify_access(
+        self,
+        pattern: MemoryAccessPattern,
+        aligned_bytes: int,
+        eff: int,
+        req_cov: SectorCoverage,
+        working_set: int,
+        *,
+        evicted_keys: set[ReuseKey] | frozenset[ReuseKey] = frozenset(),
+    ) -> tuple[int, int]:
+        """Shared read-only hit/miss decision for both preview and commit."""
+        existing = self._resident.get(pattern.reuse_key)
+        is_last_use = pattern.cache_policy == CACHE_POLICY_LAST_USE
+        if pattern.direction == "read":
+            if (
+                existing is not None and not existing.evicted
+                and pattern.reuse_key not in evicted_keys
+                and existing.version == pattern.version
+                and existing.working_set_bytes <= eff and working_set <= eff
+            ):
+                return self._coverage_hit_miss(req_cov, existing.resident_coverage, aligned_bytes)
+            return 0, aligned_bytes
+        if (
+            pattern.visibility.private_workspace
+            and not pattern.visibility.live_out
+            and working_set <= eff
+            and not is_last_use
+        ):
+            return aligned_bytes, 0
+        return 0, aligned_bytes
+
     def preview_access(
         self, pattern: MemoryAccessPattern, aligned_bytes: int,
     ) -> tuple[int, int]:
         """Read-only ``(l2_hit_bytes, dram_miss_copy_bytes)`` with zero state mutation."""
         if aligned_bytes <= 0:
             return 0, 0
+        if pattern.cache_policy == _L2_CACHE_DISABLE:
+            return 0, aligned_bytes
         key = pattern.reuse_key
         if key is None:
             return 0, aligned_bytes
@@ -225,61 +314,52 @@ class AdmissionMemoryView:
             raise ModelingError(f"reuse_key_die_mismatch:{key.die}!={pattern.die}")
         if key.die not in self._l2_capacity:
             raise ModelingError(f"l2_die_undeclared:{key.die}")
-        keys = set(self._active_keys.get(key.die, ()))
-        keys.add(key)
-        streams = self._active_streams.get(key.die, ())
-        covered = {k.reuse_stream for k in keys}
-        n_eff = max(1, len(keys) + sum(1 for s in streams if s not in covered))
+        eff = self._preview_effective_l2(key)
         avail = max(0, self._l2_capacity[key.die] - self.reserved_bytes(key.die))
-        eff = self.granule_bytes * (avail // (self.granule_bytes * n_eff))
-        req_ivs = pattern.runs.sector_intervals()
+        evicted_keys = {e.key for e in self._eviction_victims(key.die, eff, avail)}
+        req_cov = pattern.runs.sector_coverage()
         working_set = max(
             pattern.reuse_distance_bytes
             if pattern.reuse_distance_bytes is not None else aligned_bytes,
-            _measure_byte_intervals(req_ivs),
+            req_cov.measure_bytes(),
         )
-        existing = self._resident.get(key)
-        if pattern.direction == "read":
-            if (
-                existing is not None and not existing.evicted
-                and existing.version == pattern.version
-                and existing.working_set_bytes <= eff and working_set <= eff
-            ):
-                return self._range_hit_miss(req_ivs, existing.resident_ranges, aligned_bytes)
-            return 0, aligned_bytes
-        if pattern.visibility.private_workspace and not pattern.visibility.live_out and working_set <= eff:
-            return aligned_bytes, 0
-        return 0, aligned_bytes
+        return self._classify_access(
+            pattern, aligned_bytes, eff, req_cov, working_set, evicted_keys=evicted_keys,
+        )
 
-    def resident_intervals_for(
+    def resident_coverage_for(
         self, pattern: MemoryAccessPattern, aligned_bytes: int,
-    ) -> tuple[tuple[int, int], ...]:
-        """Return currently resident L2 sector intervals applicable to ``pattern``."""
-        req_ivs = pattern.runs.sector_intervals()
-        if aligned_bytes <= 0 or not req_ivs:
-            return ()
+    ) -> SectorCoverage:
+        """Return currently resident L2 ``SectorCoverage`` applicable to ``pattern``."""
+        if aligned_bytes <= 0 or pattern.cache_policy == _L2_CACHE_DISABLE:
+            return SectorCoverage()
+        req_cov = pattern.runs.sector_coverage()
+        if req_cov.empty:
+            return SectorCoverage()
         key = pattern.reuse_key
         if key is None or key.die != pattern.die or key.die not in self._l2_capacity:
-            return ()
+            return SectorCoverage()
         existing = self._resident.get(key)
         if (
             pattern.direction == "read" and existing is not None
             and not existing.evicted and existing.version == pattern.version
         ):
-            keys = set(self._active_keys.get(key.die, ()))
-            keys.add(key)
-            streams = self._active_streams.get(key.die, ())
-            covered = {k.reuse_stream for k in keys}
-            n_eff = max(1, len(keys) + sum(1 for s in streams if s not in covered))
+            eff = self._preview_effective_l2(key)
             avail = max(0, self._l2_capacity[key.die] - self.reserved_bytes(key.die))
-            eff = self.granule_bytes * (avail // (self.granule_bytes * n_eff))
+            evicted_keys = {e.key for e in self._eviction_victims(key.die, eff, avail)}
             ws = max(
                 pattern.reuse_distance_bytes if pattern.reuse_distance_bytes is not None else aligned_bytes,
-                _measure_byte_intervals(req_ivs),
+                req_cov.measure_bytes(),
             )
-            if existing.working_set_bytes <= eff and ws <= eff:
-                return existing.resident_ranges
-        return ()
+            if key not in evicted_keys and existing.working_set_bytes <= eff and ws <= eff:
+                return existing.resident_coverage
+        return SectorCoverage()
+
+    def resident_intervals_for(
+        self, pattern: MemoryAccessPattern, aligned_bytes: int,
+    ) -> tuple[tuple[int, int], ...]:
+        """Return currently resident L2 sector intervals applicable to ``pattern``."""
+        return self.resident_coverage_for(pattern, aligned_bytes).intervals
 
     def miss_intervals(
         self, pattern: MemoryAccessPattern, aligned_bytes: int,
@@ -297,6 +377,8 @@ class AdmissionMemoryView:
         """Classify ``(l2_hit_bytes, dram_miss_copy_bytes)`` and update L2 state."""
         if aligned_bytes <= 0:
             return 0, 0
+        if pattern.cache_policy == _L2_CACHE_DISABLE:
+            return 0, aligned_bytes
         key = pattern.reuse_key
         if key is None:
             return 0, aligned_bytes
@@ -307,84 +389,113 @@ class AdmissionMemoryView:
         self._active_keys[key.die].add(key)
         self._evict_over_capacity(key.die)
         eff = self.effective_l2_bytes(key.die)
-        req_ivs = pattern.runs.sector_intervals()
-        req_span = _measure_byte_intervals(req_ivs)
+        req_cov = pattern.runs.sector_coverage()
+        req_ivs = req_cov.intervals
+        req_span = req_cov.measure_bytes()
         working_set = max(
             pattern.reuse_distance_bytes if pattern.reuse_distance_bytes is not None else aligned_bytes,
             req_span,
         )
+        hit_b, miss_b = self._classify_access(pattern, aligned_bytes, eff, req_cov, working_set)
         existing = self._resident.get(key)
+        is_last_use = pattern.cache_policy == CACHE_POLICY_LAST_USE
         if pattern.direction == "read":
             if (
                 existing is not None and not existing.evicted
                 and existing.version == pattern.version and working_set <= eff
             ):
-                hit_b, miss_b = self._range_hit_miss(req_ivs, existing.resident_ranges, aligned_bytes)
+                if is_last_use:
+                    if not existing.dirty:
+                        existing.evicted = True
+                    return hit_b, miss_b
                 if miss_b > 0:
-                    merged = _merge_byte_intervals((*existing.resident_ranges, *req_ivs))
-                    merged_b = _measure_byte_intervals(merged)
+                    merged_cov = existing.resident_coverage.union(req_cov)
+                    merged_b = merged_cov.measure_bytes()
                     if max(existing.working_set_bytes, working_set, merged_b) <= eff:
-                        existing.resident_ranges = merged
-                        existing.working_set_bytes = max(existing.working_set_bytes, working_set, merged_b)
+                        existing.resident_coverage = merged_cov
+                        existing.resident_ranges = merged_cov.intervals
+                        existing.working_set_bytes = max(
+                            existing.working_set_bytes, working_set, merged_b,
+                        )
+                        self._touch_resident(existing)
                     else:
                         self._settle_eviction(existing)
-                        self._resident[key] = _ResidentL2Entry(
+                        self._touch_resident(_ResidentL2Entry(
                             key=key, working_set_bytes=working_set, version=pattern.version,
                             dirty=False, private_workspace=pattern.visibility.private_workspace,
-                            evicted=False, resident_ranges=req_ivs,
-                        )
+                            evicted=False, resident_ranges=req_ivs, resident_coverage=req_cov,
+                        ))
+                else:
+                    self._touch_resident(existing)
+                self._evict_over_capacity(key.die, protect_key=key)
                 return hit_b, miss_b
-            if working_set <= eff:
-                self._resident[key] = _ResidentL2Entry(
+            if not is_last_use and working_set <= eff:
+                if existing is not None and not existing.evicted:
+                    self._settle_eviction(existing)
+                self._touch_resident(_ResidentL2Entry(
                     key=key, working_set_bytes=working_set, version=pattern.version,
                     dirty=False, private_workspace=pattern.visibility.private_workspace,
-                    evicted=False, resident_ranges=req_ivs,
-                )
+                    evicted=False, resident_ranges=req_ivs, resident_coverage=req_cov,
+                ))
+                self._evict_over_capacity(key.die, protect_key=key)
             elif existing is not None:
                 self._settle_eviction(existing)
-            return 0, aligned_bytes
-        is_priv = pattern.visibility.private_workspace and not pattern.visibility.live_out
-        if is_priv and working_set <= eff:
+            return hit_b, miss_b
+        if hit_b > 0:
             same = existing is not None and not existing.evicted and existing.version == pattern.version
-            prev_res = existing.resident_ranges if same else ()
+            prev_cov = existing.resident_coverage if same else SectorCoverage()
             prev_dirty = existing.dirty_ranges if same else ()
-            merged = _merge_byte_intervals((*prev_res, *req_ivs))
-            merged_b = _measure_byte_intervals(merged)
+            prev_dirty_cov = existing.dirty_coverage if same else SectorCoverage()
+            merged_cov = prev_cov.union(req_cov)
+            merged_b = merged_cov.measure_bytes()
             if same and max(existing.working_set_bytes, working_set, merged_b) <= eff:
-                res_ivs, dirty_ivs = merged, _merge_byte_intervals((*prev_dirty, *req_ivs))
+                res_cov = merged_cov
+                res_ivs = merged_cov.intervals
+                dirty_ivs = _merge_byte_intervals((*prev_dirty, *req_ivs))
+                dirty_cov = prev_dirty_cov.union(req_cov)
                 ws_new = max(existing.working_set_bytes, working_set, merged_b)
             else:
                 if existing is not None and not existing.evicted:
                     self._settle_eviction(existing)
-                res_ivs, dirty_ivs, ws_new = req_ivs, req_ivs, working_set
-            self._resident[key] = _ResidentL2Entry(
+                res_cov, res_ivs, dirty_ivs, dirty_cov, ws_new = (
+                    req_cov, req_ivs, req_ivs, req_cov, working_set,
+                )
+            self._touch_resident(_ResidentL2Entry(
                 key=key, working_set_bytes=ws_new, version=pattern.version,
                 dirty=True, private_workspace=True, evicted=False,
-                resident_ranges=res_ivs, dirty_ranges=dirty_ivs, has_future_reader=True,
-            )
-            return aligned_bytes, 0
-        if working_set <= eff:
-            self._resident[key] = _ResidentL2Entry(
+                resident_ranges=res_ivs, resident_coverage=res_cov,
+                dirty_ranges=dirty_ivs, dirty_coverage=dirty_cov, has_future_reader=True,
+            ))
+            self._evict_over_capacity(key.die, protect_key=key)
+            return hit_b, miss_b
+        if not is_last_use and working_set <= eff:
+            if existing is not None and not existing.evicted:
+                self._settle_eviction(existing)
+            self._touch_resident(_ResidentL2Entry(
                 key=key, working_set_bytes=working_set, version=pattern.version,
                 dirty=False, private_workspace=False, evicted=False,
-                resident_ranges=req_ivs,
-            )
+                resident_ranges=req_ivs, resident_coverage=req_cov,
+            ))
+            self._evict_over_capacity(key.die, protect_key=key)
         elif existing is not None:
             self._settle_eviction(existing)
-        return 0, aligned_bytes
+        return hit_b, miss_b
 
 
 def _missed_dram_sector_and_service(
     plan: AddressRunPlan,
-    resident_ivs: tuple[tuple[int, int], ...],
+    resident_cov: SectorCoverage | tuple[tuple[int, int], ...],
     burst_rules: Sequence[BurstTurnRule],
 ) -> tuple[int, float]:
-    """Compute exact DRAM sector & burst-adjusted bytes over missed run intervals."""
-    if not resident_ivs:
+    """Compute exact DRAM sector & burst-adjusted bytes over missed sector coverage."""
+    covered = (
+        resident_cov if isinstance(resident_cov, SectorCoverage)
+        else SectorCoverage(intervals=tuple(resident_cov))
+    )
+    if covered.empty:
         return plan.dram_sector_and_service(burst_rules)
     sec = plan.sector_bytes
     seen_aliases: set[str] = set()
-    covered = resident_ivs
     sector_total = 0
     service_total = 0.0
     for run in plan.runs:
@@ -394,24 +505,34 @@ def _missed_dram_sector_and_service(
             if run.proven_alias_group in seen_aliases:
                 continue
             seen_aliases.add(run.proven_alias_group)
-        run_ivs = AddressRunPlan(
+        run_cov = AddressRunPlan(
             (run,), alignment_bytes=plan.alignment_bytes, sector_bytes=sec,
-        ).sector_intervals()
-        missed = _subtract_byte_intervals(run_ivs, covered)
-        if not missed:
+        ).sector_coverage()
+        if run_cov.periodic:
+            missed_b = max(0, run_cov.measure_bytes() - run_cov.overlap_bytes(covered))
+            if missed_b > 0:
+                eta = burst_turnaround_efficiency(run.row_bytes, run.stride_bytes, burst_rules)
+                sector_total += missed_b
+                service_total += float(missed_b) / eta
+            covered = covered.union(run_cov)
             continue
-        for lo, hi in missed:
-            span = hi - lo
-            if run.stride_bytes == 0:
-                stride_eff = 0
-            elif run.stride_bytes > run.row_bytes:
-                stride_eff = run.stride_bytes
-            else:
-                stride_eff = span
-            eta = burst_turnaround_efficiency(span, stride_eff, burst_rules)
-            sector_total += span
-            service_total += float(span) / eta
-        covered = _merge_byte_intervals((*covered, *missed))
+        if not covered.periodic:
+            missed = _subtract_byte_intervals(run_cov.intervals, covered.intervals)
+            for lo, hi in missed:
+                span = hi - lo
+                stride_eff = 0 if run.stride_bytes == 0 else (run.stride_bytes if run.stride_bytes > run.row_bytes else span)
+                eta = burst_turnaround_efficiency(span, stride_eff, burst_rules)
+                sector_total += span
+                service_total += float(span) / eta
+        else:
+            for lo, hi in run_cov.intervals:
+                span = (hi - lo) - SectorCoverage(intervals=((lo, hi),)).overlap_bytes(covered)
+                if span > 0:
+                    stride_eff = 0 if run.stride_bytes == 0 else (run.stride_bytes if run.stride_bytes > run.row_bytes else span)
+                    eta = burst_turnaround_efficiency(span, stride_eff, burst_rules)
+                    sector_total += span
+                    service_total += float(span) / eta
+        covered = covered.union(run_cov)
     if sector_total > 0 and plan.scale_bytes > 0:
         scale_sec = ((plan.scale_bytes + sec - 1) // sec) * sec
         sector_total += scale_sec
@@ -463,7 +584,7 @@ def bind_memory_access(
             bind_config=bind_cfg,
         )
 
-    res_ivs = state.resident_intervals_for(pattern, aligned_bytes) if state is not None else ()
+    res_cov = state.resident_coverage_for(pattern, aligned_bytes) if state is not None else SectorCoverage()
     if state is not None:
         hit_bytes, miss_bytes = (
             state.admit_access(pattern, aligned_bytes)
@@ -473,9 +594,9 @@ def bind_memory_access(
         hit_bytes, miss_bytes = 0, aligned_bytes
 
     if miss_bytes > 0:
-        if hit_bytes > 0 and res_ivs:
+        if hit_bytes > 0 and not res_cov.empty:
             sector_bytes, dram_service_bytes = _missed_dram_sector_and_service(
-                pattern.runs, res_ivs, burst_rules,
+                pattern.runs, res_cov, burst_rules,
             )
         else:
             sector_bytes, dram_service_bytes = pattern.runs.dram_sector_and_service(burst_rules)
