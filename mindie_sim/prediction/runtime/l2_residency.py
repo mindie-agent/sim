@@ -14,6 +14,7 @@ from hashlib import sha256
 import math
 
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.device_input import MemoryAccessSpec
 from .memory_physics import (
     AddressRun, AddressRunPlan,
     BoundAccess, BurstTurnRule, ByteLedger,
@@ -160,6 +161,7 @@ class AdmissionMemoryView:
 
     Curve points are (working set / effective capacity, hit fraction).
     ``ws_sweep`` accepts P05 working-set sizes and sustained bytes per second.
+    Per-die access specs and sweeps override the scalar defaults.
     """
 
     def __init__(
@@ -168,32 +170,30 @@ class AdmissionMemoryView:
         *,
         l2_buffer_units_by_die: Mapping[int, int] | None = None,
         granule_bytes: int | None = None,
-        memory_access=None,
+        memory_access: MemoryAccessSpec | None = None,
+        memory_access_by_die: Mapping[int, MemoryAccessSpec | None] | None = None,
         smooth_knee: bool = False,
         knee_ratio: float = 2,
         knee_curve: Sequence[tuple[float, float]] = (),
         spill_curve: Sequence[tuple[float, float]] = (),
         ws_sweep: Mapping[int | str, float] | None = None,
+        ws_sweep_by_die: Mapping[int, Mapping[int | str, float]] | None = None,
         arch_id: str | None = None,
     ) -> None:
-        if granule_bytes is None:
-            granule_bytes = getattr(memory_access, "l2_sector_bytes", DEFAULT_L2_GRANULE_BYTES)
-        if type(granule_bytes) is not int or granule_bytes < 1:
-            raise ModelingError(f"l2_granule_invalid:{granule_bytes!r}")
-        self.granule_bytes = granule_bytes
-        self.memory_access = memory_access
+        self._memory_access_default = memory_access
+        self._memory_access_by_die = dict(memory_access_by_die or {})
         self.arch_id = arch_id
         if not math.isfinite(knee_ratio) or knee_ratio <= 1:
             raise ModelingError(f"l2_knee_ratio_invalid:{knee_ratio}")
         if knee_curve and spill_curve:
             raise ModelingError("l2_knee_curve_declared_twice")
         curve = tuple(knee_curve or spill_curve)
-        if not curve and ws_sweep:
-            curve = _p05_knee(ws_sweep, max(l2_capacity_by_die.values(), default=0))
         if (any(not math.isfinite(x) or x <= 0 or not 0 <= y <= 1 for x, y in curve)
                 or any(x0 >= x1 or y0 < y1 for (x0, y0), (x1, y1) in zip(curve, curve[1:]))):
             raise ModelingError("l2_knee_curve_invalid")
-        self._knee_curve = curve or (((1.0, 1.0), (knee_ratio, 0.0)) if smooth_knee else ())
+        fallback_curve = ((1.0, 1.0), (knee_ratio, 0.0)) if smooth_knee else ()
+        self._knee_curves_by_die: dict[int, tuple[tuple[float, float], ...]] = {}
+        self._granule_by_die: dict[int, int] = {}
         self._l2_capacity: dict[int, int] = {}
         self._reserved: dict[int, dict[str, int]] = {}
         self._active_streams: dict[int, set[str]] = {}
@@ -203,16 +203,42 @@ class AdmissionMemoryView:
         self._pending_writebacks: dict[int, list[DirtyWriteback]] = {}
         self._last_prior_coverage: SectorCoverage = SectorCoverage()
         units_map = dict(l2_buffer_units_by_die or {})
+        sweeps = ws_sweep_by_die or {}
+        default_sweep = ws_sweep or {}
         for die, cap in l2_capacity_by_die.items():
             if type(die) is not int or die < 0 or type(cap) is not int or cap < 0:
                 raise ModelingError(f"l2_capacity_invalid:{die!r}:{cap!r}")
             if units_map.get(die, 1) != 1:
                 raise ModelingError("shared_l2_buffer_requires_one_die_owner")
+            access = self.memory_access_for(die)
+            self._granule_by_die[die] = (
+                getattr(access, "l2_sector_bytes", DEFAULT_L2_GRANULE_BYTES)
+                if granule_bytes is None else granule_bytes
+            )
+            self._knee_curves_by_die[die] = (
+                curve or _p05_knee(sweeps.get(die, default_sweep), cap) or fallback_curve
+            )
             self._l2_capacity[die] = cap
             self._reserved[die] = {}
             self._active_streams[die] = set()
             self._active_keys[die] = set()
             self._pending_writebacks[die] = []
+        self._default_die = 0 if 0 in self._l2_capacity else next(iter(self._l2_capacity), 0)
+        first_access = self.memory_access_for(self._default_die)
+        self.memory_access = (
+            first_access if all(self.memory_access_for(die) == first_access for die in self._l2_capacity)
+            else memory_access
+        )
+        self.granule_bytes = (
+            getattr(self.memory_access, "l2_sector_bytes", DEFAULT_L2_GRANULE_BYTES)
+            if granule_bytes is None else granule_bytes
+        )
+        if type(self.granule_bytes) is not int or self.granule_bytes < 1:
+            raise ModelingError(f"l2_granule_invalid:{self.granule_bytes!r}")
+        self._knee_curve = next(filter(None, self._knee_curves_by_die.values()), ())
+
+    def memory_access_for(self, die: int) -> MemoryAccessSpec | None:
+        return self._memory_access_by_die.get(die, self._memory_access_default)
 
     def active_stream_count(self, die: int) -> int:
         streams = set(self._active_streams.get(die, ()))
@@ -233,14 +259,16 @@ class AdmissionMemoryView:
             for run in periodic:
                 record("periodic", run)
 
-        record("geometry", self.granule_bytes, self.memory_access, self.arch_id, self._knee_curve)
+        record("arch", self.arch_id)
         for key, users in sorted(self._template_key_users.items(), key=lambda pair: repr(pair[0])):
             if die is None or die == key.die:
                 record("template", key, users)
         for rank, capacity in sorted(self._l2_capacity.items()):
             if die is not None and die != rank:
                 continue
-            record("die", rank, capacity, sorted(self._reserved[rank].items()),
+            record("die", rank, capacity, self._granule_by_die[rank],
+                   self.memory_access_for(rank), self._knee_curves_by_die[rank],
+                   sorted(self._reserved[rank].items()),
                    sorted(self._active_streams[rank]),
                    sorted(map(repr, self._active_keys[rank])))
             for writeback in self._pending_writebacks[rank]:
@@ -272,18 +300,19 @@ class AdmissionMemoryView:
     def effective_l2_bytes(self, die: int) -> int:
         """Return per-stream capacity in strict mode and the shared budget in smooth mode."""
         avail = self.available_l2_bytes(die)
-        n_active = 1 if self._knee_curve else max(1, self.active_stream_count(die))
-        granule = self.granule_bytes
+        n_active = 1 if self._knee_curves_by_die[die] else max(1, self.active_stream_count(die))
+        granule = self._granule_by_die[die]
         return granule * (avail // (granule * n_active))
 
-    def _hit_fraction(self, working_set: int, capacity: int) -> float:
-        if not self._knee_curve or capacity <= 0:
+    def _hit_fraction(self, working_set: int, capacity: int, *, die: int | None = None) -> float:
+        curve = self._knee_curves_by_die.get(self._default_die if die is None else die, ())
+        if not curve or capacity <= 0:
             return float(working_set <= capacity)
         pressure = working_set / capacity
-        x0, y0 = self._knee_curve[0]
+        x0, y0 = curve[0]
         if pressure <= x0:
             return y0
-        for x1, y1 in self._knee_curve[1:]:
+        for x1, y1 in curve[1:]:
             if pressure <= x1:
                 return y0 + (y1 - y0) * (pressure - x0) / (x1 - x0)
             x0, y0 = x1, y1
@@ -317,21 +346,22 @@ class AdmissionMemoryView:
         self, die: int, eff: int, avail: int, *, protect_key: ReuseKey | None = None,
     ) -> list[_ResidentL2Entry]:
         """Pure read-only LRU victim list matching exact over-capacity eviction rules."""
+        smooth = bool(self._knee_curves_by_die[die])
         oversized = False
         total_die = 0
         for entry in self._resident.values():
             if entry.key.die != die or entry.evicted:
                 continue
             if (entry.working_set_bytes > eff
-                    and (entry.dirty or not self._knee_curve
-                         or not self._hit_fraction(entry.working_set_bytes, eff))):
+                    and (entry.dirty or not smooth
+                         or not self._hit_fraction(entry.working_set_bytes, eff, die=die))):
                 oversized = True
                 break
             total_die += (
                 min(entry.working_set_bytes, avail)
-                if self._knee_curve and not entry.dirty else entry.working_set_bytes
+                if smooth and not entry.dirty else entry.working_set_bytes
             )
-        if not oversized and total_die <= (avail if self._knee_curve else min(avail, eff)):
+        if not oversized and total_die <= (avail if smooth else min(avail, eff)):
             return []
 
         victims: list[_ResidentL2Entry] = []
@@ -342,15 +372,15 @@ class AdmissionMemoryView:
 
         def charge(entry):
             return (min(entry.working_set_bytes, avail)
-                    if self._knee_curve and not entry.dirty else entry.working_set_bytes)
+                    if smooth and not entry.dirty else entry.working_set_bytes)
 
         for entry in self._resident.values():
             if (entry.key.die == die and not entry.evicted and entry.working_set_bytes > eff
-                    and (entry.dirty or not self._knee_curve
-                         or not self._hit_fraction(entry.working_set_bytes, eff))):
+                    and (entry.dirty or not smooth
+                         or not self._hit_fraction(entry.working_set_bytes, eff, die=die))):
                 victims.append(entry)
                 evicted.add(entry.key)
-        if not self._knee_curve:
+        if not smooth:
             by_stream: dict[str, list[_ResidentL2Entry]] = {}
             for entry in self._resident.values():
                 if entry.key.die == die and not entry.evicted and entry.key not in evicted:
@@ -522,17 +552,18 @@ class AdmissionMemoryView:
         return hit, aligned_bytes - hit
 
     def _preview_effective_l2(self, key: ReuseKey) -> int:
-        if self._knee_curve:
+        if self._knee_curves_by_die[key.die]:
             return self.effective_l2_bytes(key.die)
         streams = set(self._active_streams.get(key.die, ()))
         streams.update(k.reuse_stream for k in self._active_keys.get(key.die, ()))
         streams.add(key.reuse_stream)
         n_eff = max(1, len(streams))
         avail = max(0, self._l2_capacity[key.die] - self.reserved_bytes(key.die))
-        return self.granule_bytes * (avail // (self.granule_bytes * n_eff))
+        granule = self._granule_by_die[key.die]
+        return granule * (avail // (granule * n_eff))
 
     def _geometry(self, pattern: MemoryAccessPattern, aligned_bytes: int) -> tuple[SectorCoverage, int]:
-        plan = _access_plan(pattern.runs, self.memory_access)
+        plan = _access_plan(pattern.runs, self.memory_access_for(pattern.die))
         # Track residency at DRAM sector granularity so L2 never credits hits
         # for bytes that were never billed to dram_sector_bytes, while charging
         # capacity footprint at the SKU L2 line/sector allocation granule.
@@ -589,7 +620,7 @@ class AdmissionMemoryView:
         """Return ``(hit, miss, overlap_bytes_or_None)`` using one overlap scan."""
         if pattern.direction == "read":
             if entry is not None:
-                fraction = self._hit_fraction(max(working_set, entry.working_set_bytes), eff)
+                fraction = self._hit_fraction(max(working_set, entry.working_set_bytes), eff, die=pattern.die)
                 if fraction:
                     req_b = _merged_bytes(coverage)
                     ov_b = 0 if req_b <= 0 else _entry_overlap_bytes(coverage, entry)
@@ -631,7 +662,9 @@ class AdmissionMemoryView:
             existing = self._existing(pattern, key, eff, preview=True)
             if existing is not None:
                 coverage, working_set = self._geometry(pattern, aligned_bytes)
-                if not coverage.empty and self._hit_fraction(max(working_set, existing.working_set_bytes), eff):
+                if not coverage.empty and self._hit_fraction(
+                    max(working_set, existing.working_set_bytes), eff, die=key.die,
+                ):
                     return existing.coverage_snapshot()
         return SectorCoverage()
 
@@ -660,7 +693,7 @@ class AdmissionMemoryView:
     ) -> bool:
         """Attempt exact merge into ``existing``; returns True if updated in-place."""
         merged_span = existing.resident_bytes + resident_span - overlap
-        spec = self.memory_access
+        spec = self.memory_access_for(pattern.die)
         line = (
             pattern.runs.l2_line_bytes or getattr(spec, "l2_line_bytes", None)
             or pattern.runs.l2_sector_bytes or getattr(spec, "l2_sector_bytes", None)
@@ -682,7 +715,8 @@ class AdmissionMemoryView:
             )
             footprint = merged_span if new_fp is None else new_fp
             merged_ws = max(existing.working_set_bytes, working_set, footprint)
-            if not (self._hit_fraction(merged_ws, eff) if read and not existing.dirty else merged_ws <= eff):
+            if not (self._hit_fraction(merged_ws, eff, die=pattern.die)
+                    if read and not existing.dirty else merged_ws <= eff):
                 return False
             ivs[lo_idx:hi_idx] = merged_mid
             existing.working_set_bytes = merged_ws
@@ -699,7 +733,8 @@ class AdmissionMemoryView:
         merged = base_cov.union(coverage) if line else None
         footprint = self._footprint(merged, line) if merged is not None else merged_span
         merged_ws = max(existing.working_set_bytes, working_set, footprint)
-        if not (self._hit_fraction(merged_ws, eff) if read and not existing.dirty else merged_ws <= eff):
+        if not (self._hit_fraction(merged_ws, eff, die=pattern.die)
+                if read and not existing.dirty else merged_ws <= eff):
             return False
         existing.resident_intervals_mut = None
         existing.resident_coverage = base_cov.union(coverage) if merged is None else merged
@@ -742,7 +777,7 @@ class AdmissionMemoryView:
             return hit, miss, prior_out
 
         previous = self._resident.get(key)
-        if legacy_last or not (self._hit_fraction(working_set, eff) if read else working_set <= eff):
+        if legacy_last or not (self._hit_fraction(working_set, eff, die=key.die) if read else working_set <= eff):
             if previous is not None and not previous.evicted:
                 self._settle_eviction(previous)
             return hit, miss, prior_out
@@ -891,7 +926,8 @@ def bind_memory_access(
 
     # Explicit synthetic views set their own L2 geometry. Bus geometry still
     # applies to DRAM transactions independently of the residency footprint.
-    plan = _access_plan(pattern.runs, state.memory_access if isinstance(state, AdmissionMemoryView) else None)
+    access = state.memory_access_for(pattern.die) if isinstance(state, AdmissionMemoryView) else None
+    plan = _access_plan(pattern.runs, access)
     if plan is not pattern.runs:
         pattern = replace(pattern, runs=plan)
     plan = _access_plan(plan, hbm_bus.memory_access)
@@ -929,7 +965,7 @@ def bind_memory_access(
             sector_bytes, dram_service_bytes = _missed_dram_sector_and_service(
                 plan, res_cov, burst_rules,
             )
-            if isinstance(state, AdmissionMemoryView) and state._knee_curve:
+            if isinstance(state, AdmissionMemoryView) and state._knee_curves_by_die.get(pattern.die):
                 coverage, _ = state._geometry(pattern, aligned_bytes)
                 spatial_hits, _ = state._coverage_hit_miss(coverage, res_cov, aligned_bytes)
                 if spatial_hits > hit_bytes:

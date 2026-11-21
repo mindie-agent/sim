@@ -15,7 +15,9 @@ import math
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.prediction.mechanism import OperatorPlan, Work
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, PipelineProgram, Stage
-from mindie_sim.prediction.operators.matrix.refill_steady import compact_periodic_pipeline
+from mindie_sim.prediction.operators.matrix.refill_steady import (
+    PeriodicPipelineSpec, compact_periodic_peer_group, compact_periodic_pipeline,
+)
 from .paged_mla_dispatch import Dispatch
 from mindie_sim.prediction.operators.paged_mla import paged_mla_host_v2
 
@@ -226,10 +228,6 @@ def _plan(spec, cores):
                     placement[key] = placement[key][:1]
             return Stage(name, ctx.bind(work), placement=placement, **kwargs)
 
-        peer_counts = tuple(
-            job[2] + 1 for local_jobs in by_owner for job in local_jobs if job[2] > 0
-        )
-
         merged = []
         def merge_program(count, owner, heads, aiv=None):
             read, _, write = merge_work(spec, count, heads)
@@ -257,10 +255,9 @@ def _plan(spec, cores):
         allocations = tuple(ctx.allocate(f'{pool}_{owner}', pool, size,
                             tuple(range(2*owner,2*owner+2)) if pool == 'ub' else (owner,))
                             for owner in range(active) for pool, size in BUFFERS.items())
+        producers = _producer_group(ctx, by_owner, spec, stage)
         return KernelProgram((Stage('reserve', acquire=allocations),
-            Stage('producers', after=('reserve',), program=ParallelProgram(tuple(
-            _producer_program(i, by_owner, spec, stage, ctx, peer_counts)
-            for i in range(active)))),
+            Stage('producers', after=('reserve',), program=ParallelProgram(producers)),
             Stage('merge', after=('producers',), program=ParallelProgram(tuple(merged))),
             Stage('release', after=('merge',), free=allocations)))
 
@@ -282,64 +279,81 @@ def _plan(spec, cores):
     })
 
 
-def _producer_program(owner, by_owner, spec, stage, ctx, peer_counts):
-    local = by_owner[owner]
-    def job_program(job):
-        sequence, start, count, _ = job
+def _producer_group(ctx, by_owner, spec, stage):
+    tiles = compact_periodic_peer_group(ctx, (
+        _job_pipeline_spec(owner, job, spec, stage)
+        for owner, jobs in enumerate(by_owner) for job in jobs
+    ), compactor=compact_periodic_pipeline)
+    if tiles and isinstance(tiles[0], KernelProgram):
+        compiled = iter(tiles)
+        return tuple(_producer_program(owner, jobs, spec, stage, tuple(next(compiled) for _ in jobs))
+                     for owner, jobs in enumerate(by_owner))
+    return tuple(_producer_program(owner, jobs, spec, stage) for owner, jobs in enumerate(by_owner))
+
+
+def _producer_program(owner, jobs, spec, stage, tiles=None):
+    def job_program(index):
+        job = jobs[index]
         begin, end = _ends(spec, job)
+        pipe = _job_pipeline_spec(owner, job, spec, stage).literal() if tiles is None else tiles[index]
+        return (Stage('job', program=KernelProgram((
+            stage('query', begin, owner),
+            Stage('tiles', after=('query',), program=pipe),
+            stage('output', end, owner, after=('tiles',)),
+        ))),)
 
-        @lru_cache(maxsize=_CYCLE_TEMPLATE_CACHE_SIZE)
-        def cycle_template(keys, old_keys, first, old_first, old_last, parity):
-            # ExecuteTask issues C1(i), C2(i-1), and independently
-            # V1(i), V2(i-1). Distinct physical pipes may overlap, but
-            # the next driver iteration cannot reorder their MMAs.
-            result = []
-            if keys is not None:
-                work = dict(tile_work(keys, spec.heads, first=first, last=False))
-                result.extend((
-                    stage('load', work['load'], owner, previous=('qk','pv')),
-                    stage('qk_operands', work['qk_operands'], owner, after=('load',)),
-                    stage('qk', work['qk'], owner, after=('qk_operands',)),
-                    stage('scores', work['scores'], owner, after=('qk',),
-                          previous=(f'score_release{parity}',)),
-                    stage('softmax', work['softmax'], owner, after=('scores',),
-                          previous=('update',)),
-                    stage('probability', work['probability'], owner, after=('softmax',)),
-                    Stage(f'score_release{parity}', after=('softmax',)),
-                ))
-            else:
-                # Source flushes C2/V2 of the last valid task without
-                # fabricating a further QK or score/probability tile.
-                result.extend((Stage('qk'), Stage('softmax')))
-            if old_keys is not None:
-                work = dict(tile_work(old_keys, spec.heads, first=old_first,
-                                      last=old_last))
-                result.extend((
-                    stage('pv_operands', work['pv_operands'], owner,
-                          after=('qk',), previous=('probability',)),
-                    stage('pv', work['pv'], owner, after=('pv_operands',)),
-                    stage('partial', work['partial'], owner, after=('pv',),
-                          previous=(f'partial_release{1-parity}',)),
-                    stage('update', work['update'], owner, after=('partial','softmax')),
-                    Stage(f'partial_release{1-parity}', after=('update',)),
-                ))
-            return tuple(result)
+    return PipelineProgram(len(jobs), 1, job_program)
 
-        def cycle(index):
-            # Only prologue, two ring parities and tail/flush differ.
-            # Reuse immutable physical stages; every original event
-            # and dependency still executes in the same order.
-            end = spec.contexts[sequence]+1
-            keys = min(KEY_TILE, end-(start+index)*KEY_TILE) if index < count else None
-            old_keys = min(KEY_TILE, end-(start+index-1)*KEY_TILE) if index else None
-            return cycle_template(keys, old_keys, index == 0, index == 1,
-                                  index == count, index % 2)
-        return KernelProgram((stage('query', begin, owner),
-            Stage('tiles', after=('query',), program=compact_periodic_pipeline(
-                ctx, count + 1, _PIPELINE_SLOTS, cycle, head=_COMPACT_BOUNDARY_CYCLES,
-                tail=_COMPACT_BOUNDARY_CYCLES, peer_counts=peer_counts,
-                peer_tails=(_COMPACT_BOUNDARY_CYCLES,) * len(peer_counts))),
-            stage('output', end, owner, after=('tiles',))))
 
-    return PipelineProgram(len(local), 1,
-        lambda i: (Stage('job', program=job_program(local[i])),))
+def _job_pipeline_spec(owner, job, spec, stage):
+    sequence, start, count, _ = job
+
+    @lru_cache(maxsize=_CYCLE_TEMPLATE_CACHE_SIZE)
+    def cycle_template(keys, old_keys, first, old_first, old_last, parity):
+        # ExecuteTask issues C1(i), C2(i-1), and independently
+        # V1(i), V2(i-1). Distinct physical pipes may overlap, but
+        # the next driver iteration cannot reorder their MMAs.
+        result = []
+        if keys is not None:
+            work = dict(tile_work(keys, spec.heads, first=first, last=False))
+            result.extend((
+                stage('load', work['load'], owner, previous=('qk','pv')),
+                stage('qk_operands', work['qk_operands'], owner, after=('load',)),
+                stage('qk', work['qk'], owner, after=('qk_operands',)),
+                stage('scores', work['scores'], owner, after=('qk',),
+                      previous=(f'score_release{parity}',)),
+                stage('softmax', work['softmax'], owner, after=('scores',),
+                      previous=('update',)),
+                stage('probability', work['probability'], owner, after=('softmax',)),
+                Stage(f'score_release{parity}', after=('softmax',)),
+            ))
+        else:
+            # Source flushes C2/V2 of the last valid task without
+            # fabricating a further QK or score/probability tile.
+            result.extend((Stage('qk'), Stage('softmax')))
+        if old_keys is not None:
+            work = dict(tile_work(old_keys, spec.heads, first=old_first,
+                                  last=old_last))
+            result.extend((
+                stage('pv_operands', work['pv_operands'], owner,
+                      after=('qk',), previous=('probability',)),
+                stage('pv', work['pv'], owner, after=('pv_operands',)),
+                stage('partial', work['partial'], owner, after=('pv',),
+                      previous=(f'partial_release{1-parity}',)),
+                stage('update', work['update'], owner, after=('partial','softmax')),
+                Stage(f'partial_release{1-parity}', after=('update',)),
+            ))
+        return tuple(result)
+
+    def cycle(index):
+        # Only prologue, two ring parities and tail/flush differ.
+        # Reuse immutable physical stages; every original event
+        # and dependency still executes in the same order.
+        end = spec.contexts[sequence]+1
+        keys = min(KEY_TILE, end-(start+index)*KEY_TILE) if index < count else None
+        old_keys = min(KEY_TILE, end-(start+index-1)*KEY_TILE) if index else None
+        return cycle_template(keys, old_keys, index == 0, index == 1,
+                              index == count, index % 2)
+    return PeriodicPipelineSpec(
+        count + 1, _PIPELINE_SLOTS, cycle, head=_COMPACT_BOUNDARY_CYCLES, tail=_COMPACT_BOUNDARY_CYCLES,
+    )

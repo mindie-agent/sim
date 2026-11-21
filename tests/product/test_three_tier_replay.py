@@ -34,6 +34,7 @@ from mindie_sim.prediction.results import OpOccurrence, OperatorSequenceRow, Ste
 from mindie_sim.prediction.roofline_graph import PhysicalWorkGraph, PhysicalWorkNode, RooflineTargets, critical_path_roofline
 from mindie_sim.prediction.runtime.engine import Engine, Resource
 from mindie_sim.prediction.runtime.memory_physics import AddressRun
+from mindie_sim.prediction.spine import PredictionSpine
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.rewrite import (
     CollectiveTransform, Edit, FuseRegion, KernelBoundary, OpRef, PortRef, ScenarioRequest,
@@ -43,16 +44,30 @@ from mindie_sim.primitives import load_primitives
 from mindie_sim.rewrite import oracle
 from mindie_sim.schema.hardware import Device
 from mindie_sim.schema.operators import OpSpec
+from mindie_sim.schema.workload import IterationPlan, RequestView
+from mindie_sim.stack_registry import LoweringRequest
 
 pytestmark = pytest.mark.tier0
 
 MODEL = "qwen3-32b"
 NS_PER_MS = 1_000_000
 
-
 def _case(hardware, **kwargs):
     return compose_case(MODEL, hardware, dp=1, pp=1, layers=1, **kwargs)
 
+@pytest.mark.parametrize("prepare", (True, False))
+def test_mixed_iteration_exports_draft_prefill_when_requested(prepare):
+    case = parse_case(compose_case("deepseek-v4-flash", REPRESENTATIVE_SKUS["a5"],
+                                   tp=4, ep=4, layers=1, mtp_proposal_tokens=1))
+    plan = IterationPlan((RequestView("decode", 1, 64, True, "decode"),
+                          RequestView("prefill", 2, 0, True, "prefill", draft_prepare=prepare)))
+    request = LoweringRequest(iterations=((0, plan),))
+    payload = PredictionSpine().lower(case, request).structure_payload
+    assert payload["execution"]["phase"] == "mixed"
+    assert payload["execution"].get("draft_prepare", False) is prepare
+    draft_nodes = [node for node in payload["nodes"] if node["phase"] == "draft_prefill"]
+    assert bool(draft_nodes) is prepare
+    assert all(node["deps"] for node in draft_nodes)
 
 @pytest.mark.parametrize("hardware", SKUS)
 @pytest.mark.parametrize("phase", PHASES)
@@ -115,7 +130,6 @@ def test_public_replay_matches_certified_integer_ladder(hardware, phase):
         assert all(value >= 0 for value in parts)
         assert sum(parts) - measured == residual and abs(residual) <= 1000
 
-
 def test_parallel_completion_partitions_one_wall_clock():
     rows = tuple(OperatorSequenceRow(
         OpOccurrence(rank, 0, rank, name), rank, "vector", "test", (), stream,
@@ -129,7 +143,6 @@ def test_parallel_completion_partitions_one_wall_clock():
                    predecessors=(rows[1].occurrence,), ready_ms=10, start_ms=11, end_ms=13)
     parts = dict(partition_step_wall_ns(replace(step, span_ms=13, operators=(*rows, tail))))
     assert parts == {"second": 10 * NS_PER_MS, "step:wait": NS_PER_MS, "tail": 2 * NS_PER_MS}
-
 
 def test_shipping_regression_reports_measured_leave_one_out_culprit():
     case, step = _case(REPRESENTATIVE_SKUS["a5"], tp=4), StepRequest("prefill", tokens=64)
@@ -169,7 +182,6 @@ def test_shipping_regression_reports_measured_leave_one_out_culprit():
     assert regression.loo_culprits == ((SHIPPING_OVERLAY, ladder.delta_shipping_ns),)
     assert report.waterfall.loo_impacts == ()
 
-
 def test_mainline_seed_screens_against_its_own_faster_wall():
     case = _case(REPRESENTATIVE_SKUS["a2"], tp=1)
     step = StepRequest("prefill", tokens=16, context=64)
@@ -186,7 +198,6 @@ def test_mainline_seed_screens_against_its_own_faster_wall():
     assert impact.edit_id == SHIPPING_OVERLAY
     assert impact.marginal_delta_ns == dossier.u_wall_ns - dossier.m_wall_ns == 354
 
-
 def test_unmerge_winner_has_empty_leave_one_out_despite_shipping_regression():
     case = _case(REPRESENTATIVE_SKUS["a5"], tp=1)
     step = StepRequest("prefill", tokens=64)
@@ -200,7 +211,6 @@ def test_unmerge_winner_has_empty_leave_one_out_despite_shipping_regression():
     assert report.ladder.delta_shipping_ns == -regression.delta_ns
     assert regression.loo_culprits == ((SHIPPING_OVERLAY, -regression.delta_ns),)
 
-
 def test_target_efficiency_scaling_is_retired():
     retired = ("_scale_case_efficiency", "DEFAULT_TARGET_EFFICIENCY", "evaluate_target_efficiency",
                "fit_efficiency_targets", "target_0.8x_mbu")
@@ -211,7 +221,6 @@ def test_target_efficiency_scaling_is_retired():
     case = _case(REPRESENTATIVE_SKUS["a5"], tp=1)
     with pytest.raises(ValueError, match="^target_efficiency_scaling_retired:"):
         efficiency.solve_sla_sizing(case, scenarios=({"id": "custom", "target_mbu": 0.8},))
-
 
 def test_efficiency_exports_preserve_physical_work_and_five_sla_scenarios():
     case = _case(REPRESENTATIVE_SKUS["a5"], tp=1)
@@ -252,7 +261,6 @@ def test_efficiency_exports_preserve_physical_work_and_five_sla_scenarios():
             1000 * row["total_concurrency"] * row["emitted_tokens_per_seq"] / row["step_ms_at_sla"],
         )
 
-
 def test_feature_waterfall_uses_unit_rate_occurrence_roofline():
     sku = REPRESENTATIVE_SKUS["a5"]
     result = compare_feature_tracks(MODEL, sku, tp=1, dp=1, pp=1, layers=1,
@@ -268,7 +276,6 @@ def test_feature_waterfall_uses_unit_rate_occurrence_roofline():
     floor = result["waterfall"]["hardware_roofline"]
     assert floor["physical_ideal_1p0x_ms"] == reference["physical_ideal_ms"]
     assert 0 < reference["physical_ideal_ms"] <= baseline["graph_duration_ms"]
-
 
 @pytest.mark.parametrize("shared_die", (True, False), ids=("resource-bound", "path-bound"))
 def test_feature_waterfall_checks_both_limits(monkeypatch, shared_die):
@@ -293,7 +300,6 @@ def test_feature_waterfall_checks_both_limits(monkeypatch, shared_die):
     report = compare_feature_tracks(MODEL, REPRESENTATIVE_SKUS["a5"], tp=1, dp=1, layers=1, ablate_prs=False)
     assert report["waterfall"]["hardware_roofline"]["physical_ideal_1p0x_ms"] == 20
 
-
 def test_efficiency_analysis_uses_package_report_and_attribution_hooks(monkeypatch):
     calls = []
     for name in ("_fast_operator_and_graph_reports", "attribute_program"):
@@ -309,7 +315,6 @@ def test_efficiency_analysis_uses_package_report_and_attribution_hooks(monkeypat
     assert calls == ["_fast_operator_and_graph_reports", "attribute_program"]
     assert report["graph_duration_ms"] > 0 and report["operators"]
 
-
 def test_compulsory_cut_unions_disjoint_periodic_runs():
     runs = (AddressRun(1, 4097, 1, 101), AddressRun(33, 4097, 1, 101))
     sectors = [{(run.base_byte + row * run.stride_bytes) // 32 for row in range(run.rows)}
@@ -318,7 +323,6 @@ def test_compulsory_cut_unions_disjoint_periodic_runs():
     read = TensorRangeObligation(0, "interleaved", 0, (), "hbm_cold", "owner", runs)
     summary = SimpleNamespace(read_obligations=(read,), write_obligations=())
     assert compute_compulsory_hbm_cut((summary,))[0].read_bytes == 32 * len(set.union(*sectors)) == 262208
-
 
 @pytest.mark.parametrize("identity_key,allocations,residency,expected_bytes", (
     ("allocation_id", ("shared", "shared"), "hbm_cold", 4096),
@@ -351,7 +355,6 @@ def test_compulsory_cut_counts_physical_weight_allocation_once(identity_key, all
         assert not any(name.startswith("hbm_bus") for name in names)
         assert certificate.l_star_lean_ns <= 1
 
-
 def test_pointwise_nd_shape_and_gate4_rejects_matrix_recipe_downgrade():
     case = _case(REPRESENTATIVE_SKUS["a5"], tp=1)
     case["runtime"].setdefault("kernels", {}).setdefault("recipes", {})["pointwise"] = {
@@ -371,7 +374,6 @@ def test_pointwise_nd_shape_and_gate4_rejects_matrix_recipe_downgrade():
         assert any(g.reason == "WORK_CONSERVATION_MISMATCH" for g in full.verification.gates)
     batch = evaluate_rewrites(dossier.handle, (bad_fuse, bad_select))
     assert all(r.status == "gate_failed" and r.reason == "WORK_CONSERVATION_MISMATCH" for r in batch.results)
-
 
 def test_work_gate_rejects_unary_swiglu_recipe_in_screening_and_replay(monkeypatch):
     case = _case(REPRESENTATIVE_SKUS["a5"], tp=1)
@@ -425,13 +427,11 @@ def test_work_gate_rejects_unary_swiglu_recipe_in_screening_and_replay(monkeypat
     assert not gate.passed and gate.reason == "WORK_CONSERVATION_MISMATCH"
     assert gate.detail == f"{swiglu.op_id}:executed_mte2"
 
-
 def test_strided_run_rounds_to_exact_sector_union():
     run = AddressRun(base_byte=13, rows=4097, row_bytes=39, stride_bytes=101)
     sectors = {address // 32 for row in range(run.rows)
                for address in range(13 + 101 * row, 52 + 101 * row)}
     assert run.sector_union_bytes(32) == 32 * len(sectors) < run.rows * run.stride_bytes
-
 
 def test_integer_lower_bound_has_inward_guard_at_float_precision_boundary():
     for ns in (2**52, 2**53, 2**54):

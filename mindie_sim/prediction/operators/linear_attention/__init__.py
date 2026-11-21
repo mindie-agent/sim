@@ -19,7 +19,7 @@ from ...results import OpOccurrence
 from ..contracts import OperatorFamilySpec, OperatorPlanningContext, ResolvedOperator
 from . import gdn_decode
 from .arch22 import STRATEGY as _ARCH22
-from .arch35 import STRATEGY as _ARCH35
+from .arch35 import STRATEGY as _ARCH35, chunk32_setup_ms as _arch35_chunk32_setup_ms
 from .common import (
     ABI_OPERATIONS,
     CHUNK32_KERNELS,
@@ -52,7 +52,7 @@ _STRATEGIES = {_ARCH22.arch_id: _ARCH22, _ARCH35.arch_id: _ARCH35}
 
 
 def chunk32_timing_policy(
-    geometry: Geometry, context: RecipeContext, step_sync_ms: float,
+    geometry: Geometry, context: RecipeContext, step_sync_ms: float = 0.0,
 ) -> tuple[float, float]:
     """Resolve launch setup and per-step synchronization for the Chunk32 plan."""
     if geometry.datapath is not None:
@@ -66,6 +66,13 @@ def chunk32_timing_policy(
     if strategy is None:
         raise ModelingError(f"linear_attention_arch_unsupported:{arch_id}")
     return strategy.chunk32_timing_policy(context, step_sync_ms)
+
+
+def chunk32_plan_timing(context: RecipeContext, *, recurrence_sync: bool) -> tuple[float, float]:
+    """Resolve Arch35 Chunk32 setup and recurrence sync through the family entrypoint."""
+    if recurrence_sync:
+        return _ARCH35.chunk32_timing_policy(context)
+    return _arch35_chunk32_setup_ms(context), 0.0
 
 
 def resolve_operator_plan(op: OpSpec, ctx: OperatorPlanningContext) -> ResolvedOperator:

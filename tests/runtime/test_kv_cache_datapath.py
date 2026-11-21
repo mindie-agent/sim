@@ -1,26 +1,16 @@
 """Cache-state algebra and physical KV prefix ownership across the runtime.
-[Role]
-  Pin mutable ``CacheState`` laws separately from Engine execution: logical
-  vs GM vs on-chip vs HBM work, writeback conservation, reservation and LRU
-  rollback, compact span arithmetic, shared-prefix footprints, copy-on-write
-  tails, prefix read unions and the shared-prefix capacity window.
-[Invariants]
-  * A hit removes HBM fill traffic but never logical/GM/on-chip service;
-    bypass never fills; direct plus writeback writes conserve every byte once.
-  * Reservations expose capacity or dirty data only after publish; cancel
-    restores the exact resident lines, dirty ranges and LRU rank.
-  * Span helpers equal a finite byte-set oracle; a shared prefix page is
-    charged once per DP replica, distinct keys never pool, and partial prefix; blocks become per-request COW tails.
-  * Recurrent state and draft geometry stay per request; window rows are
-    bounded by live history; prefix reads reuse only a declared recipe.
-[Timeouts & Locks] Pure in-memory state runs; no threads, waits or I/O.
-[Side-Effect Policy] No filesystem, environment or network access; local records only.
+[Role] Exercise byte accounting, cache transactions, prefix reads and die-local residency.
+[Invariants] GM work and writeback bytes are conserved. Cancellation restores LRU order.
+  Shared pages pool per replica and key. Private tails, recurrent state and draft caches are per request.
+[Timeouts & Locks] Bounded CPU simulation with no threads or waits.
+[Side-Effect Policy] Reads packaged profiles and mutates local simulation state.
 """
 from __future__ import annotations
 from dataclasses import replace
 import pytest
 from _support import axes
 from _support.builders import dense_case, dense_model, linear_model, view
+from _support.hardware import machine
 from _support.linear_cases import sku_planning_context, template_context, template_datapath
 from mindie_sim.backends.ascend import profiles
 from mindie_sim.catalog.cache import layer_cache_components
@@ -40,8 +30,10 @@ from mindie_sim.prediction.cache_path import (
 )
 from mindie_sim.prediction.capacity import Memory
 from mindie_sim.prediction.capacity_features import batch_cache_bytes
+from mindie_sim.prediction.cost import CostModel
 from mindie_sim.prediction.efficiency import capacity_window
 from mindie_sim.prediction.engine import Engine
+from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.operators.linear_attention.common import LinearAttentionContract, analyze_state_residency
 from mindie_sim.prediction.runtime.memory_physics import AddressRun, AddressRunPlan, AdmissionMemoryView, MemoryAccessPattern, ReuseKey
 from mindie_sim.primitives import load_primitives
@@ -84,8 +76,8 @@ def test_cold_warm_and_bypass_separate_physical_from_semantic_work():
     assert (cold.logical_bytes, cold.gm_bytes, cold.onchip_bytes) == (128, 128, 128); assert (
         cold.cache_read_bytes, cold.hbm_read_bytes) == (0, 128)
     # The hit still performs GM and on-chip work; only the external fill vanishes.
-    assert (warm.logical_bytes, warm.gm_bytes, warm.onchip_bytes) == (128, 128, 128); assert (
-        warm.cache_read_bytes, warm.hbm_read_bytes, warm.hit_lines) == (128, 0, 1)
+    assert (warm.logical_bytes, warm.gm_bytes, warm.onchip_bytes) == (128, 128, 128)
+    assert (warm.cache_read_bytes, warm.hbm_read_bytes, warm.hit_lines) == (128, 0, 1)
     assert (cache.resident_bytes, cache.dirty_bytes) == (128, 0)
     assert cache.access("kv:layer0:request0", 128, policy=BYPASS).hbm_read_bytes == 128
     cold_cache, warm_cache = state(0), state(); cold_reads, warm_reads = [], []
@@ -108,8 +100,8 @@ def test_stateful_reuse_holds_across_declared_l2_geometries(generation, sku):
     assert cache.geometry.capacity_lines == capacity // LINE
 def test_write_back_streaming_eviction_and_dirty_guard_conserve_bytes():
     cache = state(); cache.access("A", 256, write=True, policy=WRITE_BACK); evicted = cache.access("B", 256, write=True, policy=WRITE_BACK)
-    assert (evicted.evicted_bytes, evicted.writeback_bytes) == (256, 256); assert (
-        evicted.hbm_write_bytes == evicted.direct_write_bytes + evicted.writeback_bytes)
+    assert evicted.evicted_bytes == evicted.writeback_bytes == 256
+    assert evicted.hbm_write_bytes == evicted.direct_write_bytes + evicted.writeback_bytes
     assert cache.flush().bytes == 256 and cache.dirty_bytes == 256
     clean = state(); clean.access("A", 256, write=True)
     assert clean.access("B", 256, write=True).writeback_bytes == 0
@@ -292,8 +284,7 @@ def test_span_algebra_and_async_intersection_match_byte_sets():
     assert got == normalize_spans(pairs)
     assert got == (Span(1, 100000006, 100000006, 1), Span(300000014, 4, 4, 1))
     assert intersect_spans((Span(0, 1, 6, 5),), (Span(1, 1, 10, 3),)) == ()
-    assert oracle_bytes(intersect_spans((Span(0, 1, 6, 5),),
-                                        (Span(4, 1, 10, 3),))) == {24}
+    assert oracle_bytes(intersect_spans((Span(0, 1, 6, 5),), (Span(4, 1, 10, 3),))) == {24}
 def test_access_summary_and_unseen_formats_predict_without_objects():
     cache = state(2048); summary = AccessSummary()
     for index in range(64):
@@ -381,10 +372,9 @@ def test_shared_prefix_footprint_replica_cow_private_window_and_linear_state():
     footprint = batch_cache_footprint(
         case, requests=requests, replica=0, phase="decode", padded=False)
     row = 2 * 2 * 16 * 2
-    assert footprint.shared_once_total == pytest.approx(2 * 128 * row); assert (
-        footprint.private_total) == pytest.approx(2 * 2 * (201 - 128) * row)
-    assert footprint.total == pytest.approx(
-        footprint.shared_once_total + footprint.private_total)
+    assert footprint.shared_once_total == pytest.approx(2 * 128 * row)
+    assert footprint.private_total == pytest.approx(2 * 2 * (201 - 128) * row)
+    assert footprint.total == pytest.approx(footprint.shared_once_total + footprint.private_total)
     duplicate = batch_cache_footprint(
         case, requests=requests, replica=1, phase="decode", padded=False)
     assert duplicate.total == footprint.total
@@ -423,8 +413,7 @@ def test_shared_prefix_footprint_replica_cow_private_window_and_linear_state():
         replica=0, phase="decode", padded=False)
     assert live.private_total <= 2 * 64 * 64 * 2
     linear = replace(dense_case(layers=1), model=linear_model("kda", layers=1))
-    runtime = replace(linear.runtime, recover_ssm=True,
-                      metadata=(("draft_proposal_tokens", 5),))
+    runtime = replace(linear.runtime, recover_ssm=True, metadata=(("draft_proposal_tokens", 5),))
     stateful = batch_cache_footprint(
         replace(linear, runtime=runtime), requests=(view("a", 1, 200, prefix=128),),
         replica=0, phase="decode", padded=False)
@@ -487,8 +476,7 @@ def test_shared_prefix_window_charges_pool_pages_and_releases_owners():
         base, runtime=replace(base.runtime, prefix_cache_mode="shared"),
         workload=WorkloadSpec((RequestSpec("r", 0.0, 128, 2, prefix_tokens=128),)))
     window = capacity_window(
-        case, phase="decode", context=128, tokens_per_seq=1, sequences=2,
-        output_budget=8)
+        case, phase="decode", context=128, tokens_per_seq=1, sequences=2, output_budget=8)
     active = window["window"]["active_tokens_per_sequence"]
     footprint = batch_cache_bytes(
         case, sequences=2, context=128, tokens_per_seq=active - 128,
@@ -498,8 +486,7 @@ def test_shared_prefix_window_charges_pool_pages_and_releases_owners():
     private = capacity_window(
         replace(case, runtime=replace(case.runtime, prefix_cache_mode="private")),
         phase="decode", context=128, tokens_per_seq=1, sequences=2, output_budget=8)
-    assert private["active_kv_bytes"] == pytest.approx(
-        2 * sum(Memory(case).cache_bytes(active)))
+    assert private["active_kv_bytes"] == pytest.approx(2 * sum(Memory(case).cache_bytes(active)))
     memory = Memory(dense_case(layers=1))
     assert memory.retain_shared_pages(0, "owner", (1024.0,), physical_key="p1") is True
     assert memory.retain_shared_pages(0, "owner", (2048.0,), physical_key="p2") is True
@@ -511,17 +498,14 @@ def test_shared_prefix_window_charges_pool_pages_and_releases_owners():
         runtime=replace(dense_case(layers=1).runtime, prefix_cache_mode="shared"),
         workload=WorkloadSpec((RequestSpec("r", 0.0, 128, 1024, prefix_tokens=64),)))
     long = capacity_window(
-        linear, phase="decode", context=128, tokens_per_seq=1, sequences=2,
-        output_budget=1024)
+        linear, phase="decode", context=128, tokens_per_seq=1, sequences=2, output_budget=1024)
     short = capacity_window(
-        linear, phase="decode", context=128, tokens_per_seq=1, sequences=2,
-        output_budget=1)
-    assert long["window"]["active_tokens_per_sequence"] == 128 + 1024; assert (
-        long["active_kv_bytes"]) == pytest.approx(short["active_kv_bytes"])
-    assert long["active_kv_bytes"] == pytest.approx(
-        sum(batch_cache_bytes(
-            linear, sequences=2, context=128, tokens_per_seq=1,
-            prefix_tokens=64, phase="decode", padded=True).total_bytes))
+        linear, phase="decode", context=128, tokens_per_seq=1, sequences=2, output_budget=1)
+    assert long["window"]["active_tokens_per_sequence"] == 128 + 1024
+    assert long["active_kv_bytes"] == pytest.approx(short["active_kv_bytes"])
+    footprint = batch_cache_bytes(linear, sequences=2, context=128, tokens_per_seq=1,
+                                  prefix_tokens=64, phase="decode", padded=True)
+    assert long["active_kv_bytes"] == pytest.approx(sum(footprint.total_bytes))
 def oracle_bytes(spans):
     """Independent finite byte-set expansion of the compact span encoding."""; result = set()
     for item in normalize_spans(spans):
@@ -529,7 +513,6 @@ def oracle_bytes(spans):
             start = item.start + index * item.stride
             result.update(range(start, start + item.width))
     return result
-
 
 def test_admission_epoch_observes_resident_identity_and_eviction_order():
     sector = AddressRunPlan().sector_bytes
@@ -557,6 +540,38 @@ def test_admission_epoch_observes_resident_identity_and_eviction_order():
     warm("b")
     assert engine._memory_epoch() != a_epoch
 
+def test_idle_replica_preserves_the_active_die_knee():
+    active = machine("Ascend950DT_9582")
+    idle = replace(machine("Ascend910_9362").dies[0], rank=1)
+    mixed = replace(active, dies=(*active.dies, idle))
+    size, working_set = 8192, 160 * 1024**2
+    runs = AddressRunPlan((AddressRun(0, 1, size, size),))
+    pattern = MemoryAccessPattern("weights", 0, 0, 0, "read", "mte2_aiv", size, runs,
+                                  ReuseKey(0, "weights", 0), working_set)
+    fingerprints = []
+    for hardware in (active, mixed):
+        case = replace(dense_case(dp=len(hardware.dies)), machine=hardware)
+        admission = Execution(case, CostModel(case)).admission_memory_view
+        assert admission.admit_access(pattern, size) == (0, size)
+        assert admission.preview_access(pattern, size) == (5441, 2751)
+        fingerprints.append(admission.residency_fingerprint(0))
+    assert fingerprints[0] == fingerprints[1]
+    assert admission.memory_access_for(1) == idle.memory_access
+
+def test_reset_engine_rebinds_memory_to_a_cold_capacity_domain():
+    case = replace(dense_case(), machine=machine(axes.REPRESENTATIVE_SKUS["a5"]))
+    memory = Memory(case)
+    execution = Execution(case, CostModel(case), memory=memory)
+    engine, ledger, admission = execution.engine, execution.ledger, execution.admission_memory_view
+    admission.grant_reservation(0, "live", LINE)
+    execution.reset_engine()
+    assert execution.engine is not engine and execution.ledger is not ledger
+    assert execution.engine.admission_memory_view is execution.admission_memory_view is not admission
+    assert execution.admission_memory_view.reserved_bytes(0) == 0
+    assert execution.engine.memory is execution.memory is not memory
+    assert execution.memory.runtime_state is execution.engine and memory.runtime_state is engine
+    assert execution.memory.ledger_domain is not memory.ledger_domain
+    assert execution.memory.rank_capacity == memory.rank_capacity
 
 @pytest.mark.parametrize("sku", ["Ascend910_9362", "Ascend950DT_9582"])
 def test_template_admission_uses_working_set_sweep_at_capacity(sku):
@@ -568,7 +583,6 @@ def test_template_admission_uses_working_set_sweep_at_capacity(sku):
     just_over = view._hit_fraction(capacity + 1, capacity)
     assert at_capacity == 1.0
     assert 0 < view._hit_fraction(capacity + capacity // 8, capacity) < just_over < at_capacity
-
 
 def test_staged_state_residency_sees_live_stream_pressure_on_its_die():
     _, ctx = sku_planning_context(axes.REPRESENTATIVE_SKUS["a5"])

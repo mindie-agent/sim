@@ -607,6 +607,49 @@ def owner_s2_plan(spec, cores: int, *, fd_tolerance: int = DEFAULT_FD_TOLERANCE)
     }
 
 
+def _prefill_task_builder(context, recipe, spec, counts, task_at):
+    """Bind key pipelines together while keeping ineligible task streams lazy."""
+    from dataclasses import replace
+
+    from mindie_sim.prediction.operators.attention.attention_prefill import (
+        NATIVE_S2_PRELOAD, _task_program, compact_periodic_pipeline,
+    )
+    from mindie_sim.prediction.operators.matrix.refill_steady import (
+        compact_periodic_peer_group, peer_group_can_compact,
+    )
+    from mindie_sim.prediction.program import KernelProgram
+
+    def build(core, index):
+        task, partial = task_at(core, index)
+        return _task_program(context, recipe, spec, task, core, partial=partial)
+
+    def literal(core, index):
+        return build(core, index)[0]
+
+    if len(set(spec.requests)) > 1:
+        return literal
+    coords = tuple((core, index) for core, count in enumerate(counts) for index in range(count))
+    fill = NATIVE_S2_PRELOAD if spec.native_fia else 1
+    key_counts = tuple(task_at(*coord)[0].key_tiles for coord in coords)
+    if not peer_group_can_compact(key_counts, spec.s2_preload, head=fill, tail=fill):
+        return literal
+    tasks, pipes = zip(*(build(*coord) for coord in coords))
+    candidates = compact_periodic_peer_group(context, pipes, compactor=compact_periodic_pipeline)
+    if not any(isinstance(candidate, KernelProgram) for candidate in candidates):
+        return literal
+    compacted = {
+        coord: replace(task, stages=tuple(
+            replace(stage, program=pipe) if stage.name == "key_tiles" else stage for stage in task.stages
+        ))
+        for coord, task, pipe in zip(coords, tasks, candidates, strict=True)
+    }
+
+    def compiled(core, index):
+        return compacted[core, index]
+
+    return compiled
+
+
 class _PrefillProgram:
     """Owner pipelines for one prefill op.  FD reduction stays on split rows."""
 
@@ -619,7 +662,7 @@ class _PrefillProgram:
         from dataclasses import replace
 
         from mindie_sim.prediction.operators.attention.attention_prefill import (
-            _FP32_BYTES, _ceil_div, _read_role, _task_at_for, _task_program,
+            _FP32_BYTES, _ceil_div, _read_role, _task_at_for,
         )
         from mindie_sim.prediction.mechanism import Work
         from mindie_sim.prediction.program import PipelineProgram, Stage
@@ -630,19 +673,16 @@ class _PrefillProgram:
         if not self.spec.native_fia:
             # Generic CVDiff/A2/A3 callers keep the historical cyclic owner
             # assignment; the arch35 S2 split is only for the bound FIA path.
-            peer_counts = tuple(
-                _task_at_for(self.spec, ti).key_tiles for ti in range(total)
-            )
-            events = []
-            for core in range(min(total, cores)):
-                count = (total - core + cores - 1) // cores
+            counts = tuple((total - core + cores - 1) // cores for core in range(min(total, cores)))
 
-                def task(index: int, core: int = core, peers=peer_counts):
-                    item = _task_at_for(self.spec, core + index * cores)
-                    return (Stage("task", program=_task_program(
-                        self.context, self.recipe, self.spec, item, core,
-                        peer_counts=peers,
-                    )),)
+            def task_at(core, index):
+                return _task_at_for(self.spec, core + index * cores), False
+
+            build = _prefill_task_builder(self.context, self.recipe, self.spec, counts, task_at)
+            events = []
+            for core, count in enumerate(counts):
+                def task(index, core=core):
+                    return (Stage("task", program=build(core, index)),)
 
                 events.append(PipelineProgram(count, min(2, count), task).start(
                     engine, f"{name}:owner{core}:tasks", ready,
@@ -662,12 +702,15 @@ class _PrefillProgram:
         for core, ranges in enumerate(plan["ranges"]):
             for ti, _key_start, _key_end in ranges:
                 task_owners.setdefault(ti, []).append(core)
-        peer_counts = tuple(
-            key_end - key_start
-            for ranges in plan["ranges"]
-            for _ti, key_start, key_end in ranges
-            if key_end > key_start
-        )
+        def task_at(core, index):
+            ti, key_start, key_end = plan["ranges"][core][index]
+            base = _task_at_for(self.spec, ti)
+            item = replace(base, key_start=key_start, key_tiles=key_end - key_start)
+            return item, key_start > 0 or key_end < base.key_tiles
+
+        if not self.spec.issue_kind:
+            counts = tuple(map(len, plan["ranges"]))
+            build = _prefill_task_builder(self.context, self.recipe, self.spec, counts, task_at)
         for core, ranges in enumerate(plan["ranges"]):
             if not ranges:
                 continue
@@ -684,16 +727,8 @@ class _PrefillProgram:
             else:
                 count = len(ranges)
 
-                def task(index: int, core: int = core, ranges=ranges, peers=peer_counts):
-                    ti, key_start, key_end = ranges[index]
-                    base = _task_at_for(self.spec, ti)
-                    item = replace(base, key_start=key_start,
-                                   key_tiles=key_end - key_start)
-                    partial = key_start > 0 or key_end < base.key_tiles
-                    return (Stage("task", program=_task_program(
-                        self.context, self.recipe, self.spec, item, core,
-                        partial=partial, peer_counts=peers,
-                    )),)
+                def task(index, core=core):
+                    return (Stage("task", program=build(core, index)),)
 
                 event = PipelineProgram(count, min(2, count), task).start(
                     engine, f"{name}:owner{core}:tasks", ready, owner=owner_name)

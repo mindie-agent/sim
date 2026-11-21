@@ -28,8 +28,8 @@ from mindie_sim.schema.operators import OpSpec
 from .attention_pipeline import (
     DECODE_ONLINE_STATE_OPS, DECODE_OUTPUT_UPDATE_OPS_PER_VALUE,
     DECODE_SOFTMAX_OPS_PER_PAIR, _allocation, _allocations,
-    _partial_row_bytes, _placement, _producer_program, _read_role,
-    _rows_per_token, _write_role,
+    _compile_decode_peer_group, _partial_row_bytes, _placement,
+    _producer_program, _read_role, _rows_per_token, _write_role,
 )
 
 IMPLEMENTATION = "staged_gqa_decode"
@@ -599,12 +599,15 @@ class _ProducerTaskProgram:
     core: int
     signal: Callable[[], None] | None = None
     peer_counts: tuple[int, ...] | None = None
+    compiled: KernelProgram | None = None
 
     def start(self, engine, name, ready, *, owner=""):
-        program = _producer_program(
-            self.context, self.recipe, self.spec, self.output,
-            self.contribution, self.core,
-            peer_counts=self.peer_counts,
+        program = (
+            self.compiled if self.compiled is not None else _producer_program(
+                self.context, self.recipe, self.spec, self.output,
+                self.contribution, self.core,
+                peer_counts=self.peer_counts,
+            )
         )
         end = program.start(engine, name, ready, owner=owner)
         if self.signal is None:
@@ -648,6 +651,10 @@ class _GQADecodeProgram:
                 raise ModelingError("attention_decode_mapping_exceeds_hardware_cores")
             streams[core].append((output_index, contribution))
         peer_counts = tuple(c.tile_count for s in streams for _, c in s if c.tile_count > 0)
+        compiled_group = _compile_decode_peer_group(
+            self.context, self.recipe, self.spec, streams,
+            compactor=compact_periodic_pipeline,
+        )
         producer_events = []
         for core, stream in enumerate(streams):
             if not stream:
@@ -661,7 +668,7 @@ class _GQADecodeProgram:
                 return (Stage("task", program=_ProducerTaskProgram(
                     self.context, self.recipe, self.spec,
                     outputs[output_index], contribution, core, callback,
-                    peer_counts=peer_counts,
+                    peer_counts=peer_counts, compiled=compiled_group.get((core, index)),
                 )),)
 
             producer_events.append(PipelineProgram(count, 1, tile).start(

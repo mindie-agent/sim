@@ -16,7 +16,12 @@ from typing import TYPE_CHECKING
 
 from mindie_sim.prediction.engine import Allocation
 from mindie_sim.prediction.mechanism import Work
-from mindie_sim.prediction.operators.matrix.refill_steady import compact_periodic_pipeline
+from mindie_sim.prediction.operators.matrix.refill_steady import (
+    PeriodicPipelineSpec,
+    compact_periodic_peer_group,
+    compact_periodic_pipeline,
+)
+_BASE_COMPACTOR = compact_periodic_pipeline
 from mindie_sim.prediction.ownership import read_role, unit_group
 from mindie_sim.schema.common import ModelingError
 
@@ -44,14 +49,20 @@ ATTENTION_SHAPE_WITH_VALUE_DIM = 5
 
 def _matrix_phase_weights(op) -> tuple[int, int]:
     """The phase allocator normalizes the widths against their sum."""
-    contract = dict(op.metadata).get("attention_contract")
+    metadata = dict(op.metadata)
+    contract = metadata.get("attention_contract")
     if isinstance(contract, AttentionContract):
         return contract.head_dim, contract.v_head_dim
-    if contract is not None:
-        return contract["head_dim"], contract["v_head_dim"]
+    view = metadata.get("attention_tensor_view") or {}
+    for dimensions in (contract, metadata.get("attention_geometry"), view):
+        if dimensions and "head_dim" in dimensions and "v_head_dim" in dimensions:
+            return dimensions["head_dim"], dimensions["v_head_dim"]
     if len(op.local_shape) == ATTENTION_SHAPE_WITH_VALUE_DIM:
         qk_dim, v_dim = op.local_shape[-2:]
         return qk_dim, v_dim
+    query, value = view.get("query_shape"), view.get("value_shape")
+    if query and value:
+        return query[-1], value[-1]
     # Ordinary GQA uses the same width for both matrix products.
     return 1, 1
 
@@ -306,10 +317,25 @@ def _attention_pipeline_template(tile, key_of, count, *, rows, key_tile,
     return _AttentionPipelineTemplate(core, slots, tuple(phases))
 
 
+def _decode_peer_tails(spec: _Spec, recipe: StagedGQADecode) -> tuple[int, ...]:
+    """Compute causal tail counts for all active decode contributions."""
+    return tuple(
+        max(
+            PIPELINE_SLOTS,
+            c.tile_count - max(
+                0,
+                (spec.requests[out.request][1] + out.token_first + 1) // recipe.key_tile - c.tile_start,
+            ),
+        )
+        for out in spec.outputs for c in out.contributions if c.tile_count > 0
+    )
+
+
 def _producer_program(context: RecipeContext, recipe: StagedGQADecode,
                       spec: _Spec, output: _Output,
                       contribution: _Contribution, core: int, *,
-                      peer_counts: tuple[int, ...] | None = None) -> KernelProgram:
+                      peer_counts: tuple[int, ...] | None = None,
+                      periodic_specs: list[PeriodicPipelineSpec] | None = None) -> KernelProgram:
     _query, context_len = spec.requests[output.request]
     dim, rows = spec.head_dim, output.rows
     q_bytes = rows * dim * spec.query_bytes
@@ -398,24 +424,19 @@ def _producer_program(context: RecipeContext, recipe: StagedGQADecode,
     # structural minimum. The compactor verifies convergence before folding.
     min_periodic_tiles = 1 + tail_count + 2 * max(2, recipe.slots)
     if use_compact and contribution.tile_count >= min_periodic_tiles:
-        peer_tails = (
-            tuple(
-                max(
-                    PIPELINE_SLOTS,
-                    c.tile_count - max(
-                        0,
-                        (spec.requests[out.request][1] + out.token_first + 1) // recipe.key_tile
-                        - c.tile_start,
-                    ),
-                )
-                for out in spec.outputs for c in out.contributions if c.tile_count > 0
-            )
-            if peer_counts is not None else None
-        )
-        key_program = compact_periodic_pipeline(
-            context, contribution.tile_count, recipe.slots, tile,
-            head=1, tail=tail_count, threshold=min_periodic_tiles - 1,
-            resident=persistent, peer_counts=peer_counts, peer_tails=peer_tails)
+        if periodic_specs is not None:
+            periodic_specs.append(PeriodicPipelineSpec(
+                contribution.tile_count, recipe.slots, tile,
+                head=1, tail=tail_count, threshold=min_periodic_tiles - 1,
+                resident=persistent,
+            ))
+            key_program = PipelineProgram(contribution.tile_count, recipe.slots, tile)
+        else:
+            peer_tails = _decode_peer_tails(spec, recipe) if peer_counts is not None else None
+            key_program = compact_periodic_pipeline(
+                context, contribution.tile_count, recipe.slots, tile,
+                head=1, tail=tail_count, threshold=min_periodic_tiles - 1,
+                resident=persistent, peer_counts=peer_counts, peer_tails=peer_tails)
     else:
         finite_template = _attention_pipeline_template(
             tile, key_of, contribution.tile_count,
@@ -454,6 +475,49 @@ def _producer_program(context: RecipeContext, recipe: StagedGQADecode,
             placement=_placement(context, core, *copy_out),
         ))
     return KernelProgram(tuple(stages))
+
+
+def _compile_decode_peer_group(
+    context: RecipeContext, recipe: StagedGQADecode, spec: _Spec,
+    streams: list[list[tuple[int, _Contribution]]], *, compactor=None,
+) -> dict[tuple[int, int], KernelProgram]:
+    """Compile uniform multi-peer GQA decode key loops as one atomic group."""
+    if len(set(spec.requests)) > 1:
+        return {}
+    outputs = spec.outputs
+    coords = tuple(
+        (core, index, output_index, contribution)
+        for core, stream in enumerate(streams)
+        for index, (output_index, contribution) in enumerate(stream)
+    )
+    if len(coords) <= 1 or any(len(outputs[out_idx].contributions) != 1 for _, _, out_idx, _ in coords):
+        return {}
+    peer_counts = tuple(c.tile_count for _, _, _, c in coords if c.tile_count > 0)
+    shells, specs = [], []
+    for core, _idx, output_index, contribution in coords:
+        captured: list[PeriodicPipelineSpec] = []
+        shell = _producer_program(
+            context, recipe, spec, outputs[output_index], contribution, core,
+            peer_counts=peer_counts, periodic_specs=captured,
+        )
+        if len(captured) != 1:
+            return {}
+        shells.append(shell)
+        specs.append(captured[0])
+    use_compactor = (
+        compactor if compactor is not None and compactor is not _BASE_COMPACTOR
+        else compact_periodic_pipeline
+    )
+    selected = compact_periodic_peer_group(context, specs, compactor=use_compactor)
+    if not any(isinstance(pipe, KernelProgram) for pipe in selected):
+        return {}
+    return {
+        (core, idx): replace(shell, stages=tuple(
+            replace(stage, program=pipe) if stage.name == "key_tiles" else stage
+            for stage in shell.stages
+        ))
+        for (core, idx, _, _), shell, pipe in zip(coords, shells, selected, strict=True)
+    }
 
 
 def _append_decode_key_load(

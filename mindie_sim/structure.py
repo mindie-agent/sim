@@ -386,13 +386,12 @@ def export_op_structure(ops, *, model, execution, kernels=None, source=None,
         resource_graphs = {replica: lower_native_fusions(operators, runtime)
                            for replica, operators in graphs.items()}
     phase = execution["phase"]
-    draft_prepare = bool(execution.get("draft_prepare", False))
     allowed_phases = {phase}
-    if phase in {"decode", "mixed"}:
-        allowed_phases.add("draft")
     if phase == "mixed":
         allowed_phases.update({"prefill", "decode"})
-    if phase in {"prefill", "mixed"} and draft_prepare:
+    if "decode" in allowed_phases:
+        allowed_phases.add("draft")
+    if "prefill" in allowed_phases and execution.get("draft_prepare", False):
         allowed_phases.update({"draft", "draft_prefill"})
     book = RecipeBook.from_mapping(kernels or {})
     resource_geometries = resource_geometries or {}

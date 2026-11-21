@@ -49,6 +49,8 @@ DOC_LITERAL = re.compile(r"(?i)(\.md|\.rst)$|^(README|CHANGELOG|CONTRIBUTING)\b"
 XFAIL_SOURCE = re.compile(r"(?<![\w/])([\w./-]+\.[A-Za-z][\w]*):([1-9]\d*)\b")
 BROAD_XFAIL_EXCEPTIONS = frozenset({"BaseException", "Exception", "AssertionError"})
 XFAIL_MARK = "pytest.mark.xfail"
+SKIP_MARK = "pytest.mark.skip"
+RESTRICTED_MARKS = {XFAIL_MARK, SKIP_MARK, "pytest.mark.skipif"}
 TIERS = ("tier0", "tier1", "live_npu")
 TIER0_BANNED_IMPORTS = ("subprocess", "multiprocessing", "socket", "venv")
 TIER0_BANNED_CALLS = {("time", "sleep"), ("os", "fork"), ("os", "system")}
@@ -208,8 +210,8 @@ def _cites_source_line(root: Path, reason: ast.AST | None) -> bool:
     return False
 
 
-def _xfail_findings(root: Path, rel: str, tree: ast.Module) -> list[Finding]:
-    """Check xfail constructors, including marks bound to parameter rows."""
+def _pytest_mark_findings(root: Path, rel: str, tree: ast.Module) -> list[Finding]:
+    """Check restricted marks wherever they occur, including legacy root modules."""
     aliases = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -265,12 +267,18 @@ def _xfail_findings(root: Path, rel: str, tree: ast.Module) -> list[Finding]:
     findings = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
-            if resolve(node.func) != XFAIL_MARK:
+            name = resolve(node.func)
+            if name == SKIP_MARK:
+                findings.append(Finding(rel, node.lineno, "TO008", f"{name}() is banned"))
+            if name != XFAIL_MARK:
                 continue
             kw = keywords(node)
-        elif isinstance(node, (ast.Attribute, ast.Name)) and resolve(node) == XFAIL_MARK:
+        elif isinstance(node, (ast.Attribute, ast.Name)) and (name := resolve(node)) in RESTRICTED_MARKS:
             parent = parents[node]
             if isinstance(parent, ast.Call) and parent.func is node:
+                continue
+            if name != XFAIL_MARK:
+                findings.append(Finding(rel, node.lineno, "TO008", f"bare {name} reference is banned"))
                 continue
             kw = {}
         else:
@@ -528,7 +536,7 @@ class Gate:
             except SyntaxError as exc:
                 self.add(rel, exc.lineno or 1, "TO005", f"syntax error: {exc.msg}")
             else:
-                self.findings.extend(_xfail_findings(self.root, rel, tree))
+                self.findings.extend(_pytest_mark_findings(self.root, rel, tree))
             return
         if kind in {"test", "support"}:
             for label, token in name_tokens(path.stem):
@@ -583,7 +591,7 @@ class Gate:
                             is_conftest=kind == "conftest")
         check.visit(tree)
         self.findings.extend(check.findings)
-        self.findings.extend(_xfail_findings(self.root, rel, tree))
+        self.findings.extend(_pytest_mark_findings(self.root, rel, tree))
 
     def _support_imports(self, path: Path, *, in_support: bool) -> set[str]:
         try:

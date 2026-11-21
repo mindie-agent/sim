@@ -27,9 +27,11 @@ from .catlass_catalog import (
     matrix_problem, mx_scale_bytes, packed_bytes, should_elide_l1_reload,
     streamk_partition, swizzle_block_coord, validate_catlass_spec,
 )
-from .contracts import SemanticWorkItem, ceil_div, eligible_matrix_engines, evg_order
+from ._catlass_periodic import supports_exact_periodic_catlass
 from ._catlass_streaming import STREAMING_PANEL_MICRO_THRESHOLD, lower_catlass_streaming
+from .contracts import SemanticWorkItem, ceil_div, eligible_matrix_engines, evg_order
 from .fuse_region import Lowering, ring_credit, solve_template_tile
+from .fuse_region_live import _ReuseLifetimes
 
 _NOMINAL_BUFFER_ALIGNMENT = 32
 _PURE_LOWER_CACHE_SIZE = 512
@@ -620,6 +622,16 @@ def _normal_waves(lowerer, start, stop, after):
     return after
 
 
+def _bind_tile_order(plan):
+    # Ring dependencies govern execution. Static admission follows memory
+    # accesses in emission order, shared with the periodic CATLASS lowerer.
+    lifetimes = _ReuseLifetimes(plan.state, plan.accesses.values())
+    stages, plan.stages = plan.stages, []
+    for stage in stages:
+        pattern = plan.accesses.pop(stage.name, None)
+        plan.add(plan._bind_access(stage, pattern, lifetimes) if pattern is not None else stage)
+
+
 def _split_schedule(lowerer, launch, blocks):
     spec, plan = lowerer.spec, lowerer.plan
     parts = defaultdict(list)
@@ -755,6 +767,8 @@ def _lower_catlass_impl(
         _split_schedule(lowerer, launch, blocks)
     else:
         _normal_waves(lowerer, 0, blocks, (launch,))
+        if supports_exact_periodic_catlass(spec, p, live_admission=live_admission):
+            _bind_tile_order(plan)
     for rings in lowerer.owner_rings.values():
         for ring in rings:
             plan.add_ring(ring, after=(launch,))

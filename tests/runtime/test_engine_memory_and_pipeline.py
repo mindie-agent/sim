@@ -23,7 +23,7 @@ from mindie_sim.prediction.coupled import coupled_rates
 from mindie_sim.prediction.engine import Engine, OccurrenceKey, Resource
 from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.operator_replay import operator_costs
-from mindie_sim.prediction.operators.matrix.refill_steady import compact_periodic_pipeline
+from mindie_sim.prediction.operators.matrix import refill_steady
 from mindie_sim.prediction.ownership import unit_rates
 import mindie_sim.prediction.program as prog_pkg
 from mindie_sim.prediction.program import (
@@ -519,31 +519,35 @@ def test_program_facade_reexports_and_stage_builtin_metadata_guards():
     with pytest.raises(ModelingError, match="stage_cohort_widened_invalid"):
         Stage("bad_w", cohort_widened=(123,))  # type: ignore[arg-type]
 
-@pytest.mark.parametrize("tails,count,load,expected", [((1, 7), 32, 0.25, 32), ((1, 3), 20, 0.365, 29.2)])
-def test_refill_peers_match_literal_service_across_unequal_tails(tails, count, load, expected):
-    context = RecipeContext(None, {}, {"hbm": "hbm"}, {"hbm": 1}, len(tails))
-
-    def tiles(tail):
-        def tile(index):
-            read = Stage("load", {"hbm": load})
-            if index < count - tail:
-                return read, Stage("compute", after=("load",), latency=2 * load)
-            return read, Stage("store", after=("load",), latency=load), Stage("drain", after=("store",), latency=load)
-        return tile
-
-    def run(compact):
-        engine = Engine([Resource("hbm", 1)], backend="python")
-        programs = tuple(
-            compact_periodic_pipeline(context, count, 1, tiles(tail), tail=tail, peer_counts=(count,) * len(tails))
-            if compact else PipelineProgram(count, 1, tiles(tail)) for tail in tails
-        )
-        done = ParallelProgram(programs).start(engine, "refill", engine.submit("ready"))
-        engine.advance(until=(done,))
-        return done.time, engine.serviced["hbm"]
-
-    literal = run(False)
-    assert literal == pytest.approx((expected, 2 * count * load))
-    assert run(True) == literal
+@pytest.mark.parametrize("tails,count,load,latency,expected", [
+    ((1, 7), 32, 0.25, 0, 32), ((1, 3), 20, 0.365, 0, 29.2), ((1, 1), 32, 0.25, 0.125, 32)])
+def test_refill_peers_match_literal_service(tails, count, load, latency, expected):
+    context = RecipeContext(None, {}, {"hbm": "hbm", "cube": "cube"}, {"hbm": 1, "cube": 2}, 2,
+                            resource_units={"cube": 2})
+    def tile(index, peer, tail):
+        read = Stage("load", {"hbm": load}, latency=latency if peer and index == count - 1 else 0)
+        if latency:
+            return read, Stage("compute", {"cube": 0.5}, after=("load",), placement={"cube": (peer,)})
+        if index < count - tail:
+            return read, Stage("compute", after=("load",), latency=2 * load)
+        return read, Stage("store", after=("load",), latency=load), Stage("drain", after=("store",), latency=load)
+    def run(programs):
+        engine = Engine([Resource("hbm", 1), Resource("cube", 2, units=2)], backend="python")
+        ready = engine.submit("ready")
+        ends = tuple(pipe.start(engine, f"peer{idx}", ready) for idx, pipe in enumerate(programs))
+        dependent = engine.submit("dependent", after=(ends[-1],), latency=10)
+        engine.advance(until=(*ends, dependent), first=False)
+        return max(end.time for end in ends), dependent.time, engine.serviced["hbm"]
+    specs = tuple(refill_steady.PeriodicPipelineSpec(count, 1, lambda j, i=i, tail=tail: tile(j, i, tail), tail=tail)
+                  for i, tail in enumerate(tails))
+    literal = run(spec.literal() for spec in specs)
+    assert literal == pytest.approx((expected, expected + 10, 2 * count * load))
+    group = refill_steady.compact_periodic_peer_group(context, specs)
+    individual = tuple(refill_steady.compact_periodic_pipeline(
+        context, count, spec.slots, spec.tile_fn, tail=spec.tail, peer_counts=(count, count), peer_tails=tails,
+    ) for spec in specs)
+    assert group == individual == tuple(spec.literal() for spec in specs)
+    assert run(group) == literal
 
 @pytest.mark.parametrize("sku", P05_SKUS)
 def test_live_admission_uses_sku_curve_past_capacity(sku):
@@ -568,20 +572,16 @@ def test_isolated_read_replay_rebinds_prepared_recipe_to_cold_cache():
     @dataclass
     class Read:
         view: AdmissionMemoryView | None = None
-
         def prepare(self, op, geometry):
             return op, replace(self, view=geometry.admission_memory_view)
-
         def lower(self, context):
             bound = context.bind_access(access, self.view)
-
             def start(engine, name, ready, *, owner=""):
                 engine.add_hbm_bus(bound.bind_config[0])
                 return engine.submit_bound_access(name, bound, after=(ready,), memory_state=self.view, pattern=access,
                                                   on_delivery=lambda ledger, *_: traffic.append(
                                                       (ledger.dram_sector_bytes, ledger.l2_hit_bytes)))
             return SimpleNamespace(start=start)
-
     recipes = RecipeBook({"cache_probe": Read()})
     shape = (size,)
     op = OpSpec("first", "elementwise", "prefill", 0, 0, (), shape, shape, shape, shape,

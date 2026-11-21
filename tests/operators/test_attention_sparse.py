@@ -20,6 +20,7 @@ from _support.hardware import sku_case
 from mindie_sim import compose_case, graph_costs, target_graphs, target_operators
 from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.catalog.weight_terms import WeightTerm, term_bytes
+from mindie_sim.prediction.call_builders import build_aclnn_call
 from mindie_sim.prediction.operators.attention.attention import AttentionPolicy, gqa
 from mindie_sim.prediction.engine import Engine, Resource
 from mindie_sim.prediction.operators.mla.generic_latent_attention import owned_store_rows, sparse_over_parts
@@ -48,6 +49,18 @@ def geometry():
 
 def stages(plan):
     return {p.name: p for p in plan.program.phases}
+
+
+@pytest.mark.parametrize("head_dim,v_head_dim,expected", ((128, 32, (32768, 8192)), (32, 128, (8192, 32768))))
+def test_standalone_fused_attention_conserves_each_matrix_product(head_dim, v_head_dim, expected):
+    call = build_aclnn_call({"api": "aclnnFusedInferAttentionScore", "heads": 4,
+                            "query_tokens": 1, "key_tokens": 32, "head_dim": head_dim, "v_head_dim": v_head_dim})
+    op, = call.ops
+    recipe = call.recipes.select(op)
+    for variant in (op, replace(op, metadata=tuple((k, v) for k, v in op.metadata if k != "attention_geometry"))):
+        ctx = RecipeContext(variant, {"cube": op.flops}, {"cube": "cube"}, {"cube": 1.0}, 1)
+        work = {stage.name: stage.work.get("cube", 0) for stage in recipe.lower(ctx).stages}
+        assert (work["qk"], work["pv"]) == expected and sum(work.values()) == op.flops
 
 
 @pytest.mark.parametrize("mode,row,sector_count", [(1, 656, 21), (5, 656, 21), (3, 386, 13)])
@@ -222,7 +235,6 @@ def test_dense_noncausal_topk_keeps_the_smaller_window_cap():
         ((2, 100),), plan, 128, dense=True, kv_len=102, topk=4)
     assert traffic.total_cache_rows == 2 * 4
 
-
 def test_batched_context_parallel_selection_conserves_rank_local_work():
     case = dense_case()
     plan = replace(case.model.layer_plans[0], window=8, head_dim=8)
@@ -241,7 +253,6 @@ def test_batched_context_parallel_selection_conserves_rank_local_work():
               SimpleNamespace(context=100, phase="decode", q_len=1))
     assert owned_store_rows([8, 1], hybrid, sharded, 1536) == 9
 
-
 def test_sparse_prefill_frontend_accounts_independent_selections_and_resident_kv():
     raw = latent_case(64)
     op = next(op for op in target_operators(raw, phase="prefill", tokens=4096)
@@ -254,7 +265,6 @@ def test_sparse_prefill_frontend_accounts_independent_selections_and_resident_kv
     assert traffic["logical_read_bytes"] == traffic["hbm_read_bytes"] + traffic["l2_hit_bytes"]
     assert traffic["private_refill_bytes"] == rows * 576 * 2
     assert op.mte3_bytes == 4096 * 4 * 512 * 2 and op.flops == 2 * rows * 4 * (576 + 512)
-
 
 def test_paired_sparse_decode_keeps_rank_owned_index_and_lse_pack():
     config = json.loads((REPO_ROOT / "mindie_sim/model_configs/kimi-k3.1.json").read_text())
@@ -327,7 +337,6 @@ def engine_binding(op, geom, trace_limit=128):
                     trace_limit=trace_limit)
     return engine, context
 
-
 def test_admission_rebinds_packed_reads_by_tensor_and_producer_version():
     geom = geometry()
     arguments = dict(op_id="decode", query_tokens=1, num_heads=1, selection_lists=((0,),),
@@ -352,7 +361,6 @@ def test_admission_rebinds_packed_reads_by_tensor_and_producer_version():
     assert [row["demand"].get("l2", 0) for row in reads] == [0, 672, 0, 0, 0]
     assert reads[0]["start_ms"] >= 5 and reads[1]["start_ms"] >= first.time
     assert engine.delivered["mte2_aiv"] == 5 * 672 and engine.delivered["l2"] == 672
-
 
 def test_packed_split_waits_for_each_owners_dma_and_conserves_rows():
     geom = geometry()
@@ -413,7 +421,6 @@ def test_shared_prefix_needs_matching_physical_addresses(selections):
     assert sum(read["hbm"] for read in reads) == 1344
     assert sum(read.get("l2", 0) for read in reads) == 0
 
-
 def test_packed_residency_starts_after_the_dma_completes():
     geom = geometry()
     op = governed.make_kv_quant_sfa_c8_op(
@@ -430,7 +437,6 @@ def test_packed_residency_starts_after_the_dma_completes():
     assert reads[0]["start_ms"] < reads[1]["end_ms"] and reads[1]["start_ms"] < reads[0]["end_ms"]
     assert [row["demand"].get("hbm", 0) for row in reads] == [672, 672, 0, 0]
     assert [row["demand"].get("l2", 0) for row in reads] == [0, 0, 672, 672]
-
 
 def test_packed_read_reuses_shared_die_cache_without_requests():
     die, row_bytes = 1, 672

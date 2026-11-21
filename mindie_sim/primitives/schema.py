@@ -693,7 +693,7 @@ def _address_plan(values, integer, size=None, *, sector_bytes=None):
     return _PrimitiveAddressPlan(
         tuple(run if isinstance(run, AddressRun) else AddressRun(**run) for run in runs),
         integer("alignment_bytes", DEFAULT_SECTOR_BYTES, 1), integer("scale_bytes"),
-        DEFAULT_SECTOR_BYTES if sector_bytes is None else sector_bytes,
+        sector_bytes,
     )
 
 

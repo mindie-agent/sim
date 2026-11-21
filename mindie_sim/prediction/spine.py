@@ -191,8 +191,10 @@ class PredictionSpine:
         die_l2 = {int(die.rank): int(dict(die.buffers).get("l2", 0)) for die in case.machine.dies}
         if 0 not in die_l2 and case.machine.dies:
             die_l2[0] = int(dict(case.machine.dies[0].buffers).get("l2", 0))
-        first_ma = getattr(case.machine.dies[0], "memory_access", None) if case.machine.dies else None
-        return AdmissionMemoryView(die_l2, memory_access=first_ma)
+        memory_access = {int(die.rank): die.memory_access for die in case.machine.dies}
+        if case.machine.dies:
+            memory_access.setdefault(0, case.machine.dies[0].memory_access)
+        return AdmissionMemoryView(die_l2, memory_access_by_die=memory_access)
 
     def _resolve_governed_operators(
         self,
@@ -298,6 +300,12 @@ class PredictionSpine:
             "phase": inferred_phase,
             "scope": req.step.scope if req.step is not None else "declared",
         }
+        draft_prepare = req.step.draft_prepare if req.step is not None else any(
+            view.phase == "prefill" and not view.padding and view.draft_prepare
+            for replica in graphs for view in rewritten.request_views.get(replica, ())
+        )
+        if draft_prepare:
+            exec_meta["draft_prepare"] = True
         if rewritten.streams:
             exec_meta["streams"] = {
                 str(plan.rank): list(plan.lane_ids()) for plan in rewritten.streams

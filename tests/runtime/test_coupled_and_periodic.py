@@ -28,6 +28,7 @@ import pytest
 from _support.linear_cases import enumerate_matrix, run_template, template_context, template_datapath
 from mindie_sim.optimization.reload_bounds import compute_compulsory_hbm_cut
 from mindie_sim.prediction.engine import Allocation, Engine, Resource
+from mindie_sim.prediction.runtime.l2_residency import AdmissionMemoryView
 from mindie_sim.prediction.operators.matrix.matrix_cycle import matrix_cycle, periodic_matrix_cycle
 from mindie_sim.prediction.program import KernelProgram, PipelineProgram, Stage
 from mindie_sim.prediction.operators.matrix.refill import RefillPipeline
@@ -38,8 +39,11 @@ from mindie_sim.templates import _catlass_periodic, catlass_lower
 pytestmark = pytest.mark.tier0
 
 
-@pytest.mark.parametrize("n,k,reads,expect_skip", [(32, 65_632, 8_400_896, True), (512, 4_128, 4_491_264, False)])
-def test_periodic_matrix_conserves_hbm_and_clock(monkeypatch, n, k, reads, expect_skip):
+@pytest.mark.parametrize("n,k,reads,expect_skip,reserved_mib", [
+    (32, 65_632, 8_400_896, True, 0), (512, 4_128, 4_491_264, False, 0),
+    (512, 4_128, 8_257_536, False, 126),
+])
+def test_periodic_matrix_conserves_hbm_and_clock(monkeypatch, n, k, reads, expect_skip, reserved_mib):
     path = template_datapath("Ascend950DT_9582")
     problem = CatlassProblem(32, n, k)
     spec, = enumerate_matrix(
@@ -48,21 +52,33 @@ def test_periodic_matrix_conserves_hbm_and_clock(monkeypatch, n, k, reads, expec
     )
     spec = replace(spec, swizzle_direction="Zn")
     context = template_context(path, problem)
-    accelerated = lower_catlass_spec(spec, problem, path, context=context)
-    default = lower_catlass_spec(spec, problem, path)
+    view = None
+    if reserved_mib:
+        view = AdmissionMemoryView({0: path.usable_bytes("l2")}, memory_access=path.memory_access, smooth_knee=True)
+        assert view.grant_reservation(0, "peer", reserved_mib * 1024**2) == 2 * 1024**2
+    accelerated = lower_catlass_spec(spec, problem, path, context=context, memory_view=view)
+    default = lower_catlass_spec(spec, problem, path, memory_view=view)
     monkeypatch.setattr(catlass_lower, "STREAMING_PANEL_MICRO_THRESHOLD", math.inf)
-    detailed = lower_catlass_spec(spec, problem, path, context=context)
+    detailed = lower_catlass_spec(spec, problem, path, context=context, memory_view=view)
     literal = run_template(path, context, detailed)
     skipped = run_template(path, context, accelerated)
     if expect_skip:
         assert skipped._periodic_detector.stats()["skipped_cycles"] > 0
     for result in (default, accelerated, detailed):
-        cut = compute_compulsory_hbm_cut((result.summary,))[0]
-        assert result.summary.dram_sector_bytes == cut.read_bytes + cut.write_bytes == reads + problem.m * problem.n * 2
+        assert result.summary.dram_sector_bytes == reads + problem.m * problem.n * 2
+        if not reserved_mib:
+            cut = compute_compulsory_hbm_cut((result.summary,))[0]
+            assert result.summary.dram_sector_bytes == cut.read_bytes + cut.write_bytes
         assert result.summary.turnaround_service_bytes == detailed.summary.turnaround_service_bytes
     assert skipped.delivered["hbm:ctr_r"] == pytest.approx(reads, rel=1e-12)
+    assert literal.delivered["hbm:ctr_r"] == pytest.approx(reads, rel=1e-12)
     assert skipped.delivered["hbm:ctr_w"] == literal.delivered["hbm:ctr_w"]
-    assert abs(skipped.now - literal.now) <= math.ulp(literal.now)
+    # Contended cohorts can sum the same service increments in a different order.
+    assert abs(skipped.now - literal.now) <= (4 if reserved_mib else 1) * math.ulp(literal.now)
+    if reserved_mib:
+        rebound = replace(default, program=default.program.with_context(path, context))
+        unbound = run_template(path, context, rebound)
+        assert unbound.now == skipped.now and unbound.delivered == skipped.delivered
 
 
 def test_streaming_panel_encoding_keeps_only_bounded_lookahead(monkeypatch):

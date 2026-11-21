@@ -43,8 +43,12 @@ from .gdn_domain import (
 from mindie_sim.prediction.mechanism import Geometry, OperatorPlan, PlannedRecipe, Work
 from .gdn_prepare import PackedChunks
 from mindie_sim.prediction.operators.vector.mixed_core import phases, require_pair, resident, split_reads
-from mindie_sim.prediction.program import KernelProgram, ParallelProgram, PipelineProgram, Stage
-from mindie_sim.prediction.operators.matrix.refill_steady import compact_periodic_pipeline, peer_group_can_compact
+from mindie_sim.prediction.program import KernelProgram, ParallelProgram, Stage
+from mindie_sim.prediction.operators.matrix.refill_steady import (
+    PeriodicPipelineSpec,
+    compact_periodic_peer_group,
+    compact_periodic_pipeline,
+)
 
 PREPARE_RECIPE = "gdn_prepare_arch35_chunk32"
 STATE_RECIPE = "gdn_state_arch35_chunk32"
@@ -117,7 +121,7 @@ def _build_mixed_plan(
     second_label: str,
     extra_meta: Mapping[str, Any],
 ) -> OperatorPlan:
-    from mindie_sim.prediction.operators.linear_attention import chunk32_timing_policy
+    from mindie_sim.prediction.operators.linear_attention import chunk32_plan_timing
 
     require_pair(geometry)
     buf_sizes = _check_buffers(geometry)
@@ -129,13 +133,9 @@ def _build_mixed_plan(
             total_work += split_reads(aic_w, aic_w.resources["mte2"], geometry.resource_units)
 
     def program(context):
-        setup_ms, sync_ms = chunk32_timing_policy(geometry, context, 0.0)
-        sync_ms = sync_ms if recurrence_sync else 0.0
+        setup_ms, sync_ms = chunk32_plan_timing(context, recurrence_sync=recurrence_sync)
 
-        def per_core(core: int, items: Sequence[Any]):
-            if not items:
-                return KernelProgram(())
-
+        def tile_for(core: int, items: Sequence[Any]):
             def tile(idx: int):
                 aiv_w, aic_w = work_fn(items[idx])
                 half = aiv_w.scaled(0.5)
@@ -155,54 +155,27 @@ def _build_mixed_plan(
                         phases(s1, half, context, core, aiv=1, after=(first_label,)),
                     )
                     tail_after = (s0, s1)
-                if sync_ms > 0.0:
+                if recurrence_sync:
                     return (*base, Stage("recurrence_sync", after=tail_after, latency=sync_ms))
                 return base
+            return tile
 
-            peer_counts = tuple(len(bucket) for bucket in owners if bucket)
-            peer_tails = (COMPACT_TAIL_CHUNKS,) * len(peer_counts)
-            uniform_compact = peer_group_can_compact(
-                peer_counts, slots, head=1, tail=COMPACT_TAIL_CHUNKS,
-                threshold=COMPACT_CHUNK_THRESHOLD, peer_tails=peer_tails,
+        specs = tuple(
+            PeriodicPipelineSpec(
+                len(items), slots, tile_for(core, items),
+                head=1, tail=COMPACT_TAIL_CHUNKS, threshold=COMPACT_CHUNK_THRESHOLD,
             )
-            pipe = (
-                compact_periodic_pipeline(
-                    context, len(items), slots, tile,
-                    head=1, tail=COMPACT_TAIL_CHUNKS, threshold=COMPACT_CHUNK_THRESHOLD,
-                    peer_counts=peer_counts, peer_tails=peer_tails,
-                )
-                if sync_ms <= 0.0 and uniform_compact
-                else PipelineProgram(len(items), slots, tile)
-            )
-            stages = [
+            for core, items in zip(cores, owners, strict=True)
+        )
+        pipes = compact_periodic_peer_group(context, specs, compactor=compact_periodic_pipeline)
+        branches = tuple(
+            resident(context, core, buf_sizes, KernelProgram((
                 Stage("setup", latency=setup_ms, keep_empty=setup_ms <= 0.0),
                 Stage("tiles", after=("setup",), program=pipe),
-            ]
-            if sync_ms > 0.0 and uniform_compact:
-                # Fold serial recurrence steps without instantiating 12,800 sync stages:
-                # run pure work via compact_periodic_pipeline + exact serial barrier span.
-                def pure_tile(idx: int):
-                    aiv_w, aic_w = work_fn(items[idx])
-                    half = aiv_w.scaled(0.5)
-                    s0, s1 = f"{second_label}_0", f"{second_label}_1"
-                    return (
-                        phases(first_label, aic_w, context, core, aiv=None),
-                        phases(s0, half, context, core, aiv=0, after=(first_label,)),
-                        phases(s1, half, context, core, aiv=1, after=(first_label,)),
-                    )
-                compact_pipe = compact_periodic_pipeline(
-                    context, len(items), slots, pure_tile,
-                    head=1, tail=COMPACT_TAIL_CHUNKS, threshold=COMPACT_CHUNK_THRESHOLD,
-                    peer_counts=peer_counts, peer_tails=peer_tails,
-                )
-                stages = [
-                    Stage("setup", latency=setup_ms, keep_empty=setup_ms <= 0.0),
-                    Stage("tiles", after=("setup",), program=compact_pipe),
-                    Stage("recurrence_barriers", after=("tiles",), latency=sync_ms * float(len(items))),
-                ]
-            return resident(context, core, buf_sizes, KernelProgram(tuple(stages)))
-
-        return ParallelProgram(tuple(per_core(core, items) for core, items in zip(cores, owners, strict=True)))
+            ))) if items else KernelProgram(())
+            for core, items, pipe in zip(cores, owners, pipes, strict=True)
+        )
+        return ParallelProgram(branches)
 
     return OperatorPlan(total_work, program, {
         "execution_class": "mixed_aic_aiv",

@@ -38,6 +38,7 @@ from .contracts import (
     ceil_div, eligible_matrix_engines,
 )
 from .fuse_region import Lowering, bind_template_access_ledger
+from .fuse_region_live import _ReuseLifetimes
 
 _PAIR_DEPTH = 2
 _L0C_DEPTH = 1
@@ -547,7 +548,7 @@ def _whole_tensor_obligations(spec, p, die: int, sector: int) -> tuple[list[Any]
 
 def _admit_periodic_access(
     pat: MemoryAccessPattern, plan: Lowering, entry_state, unit_bus: HbmBusSpec,
-    retained_keys: dict[ReuseKey, tuple[ReuseKey, bool]], resource_work: Counter[str],
+    lifetimes: _ReuseLifetimes, resource_work: Counter[str],
     context, die: int, *, track_obligations: bool = True,
 ) -> _AccessRecord:
     pat = replace(pat, runs=_access_plan(pat.runs, plan.state.memory_access))
@@ -563,11 +564,8 @@ def _admit_periodic_access(
             plan.writes.append(entry)
             if len(plan.writes) > _COMPACT_OBLIGATION_THRESHOLD:
                 plan.writes = list(_union_obligations(plan.writes))
-    if pat.reuse_key is not None:
-        if pat.reuse_key not in retained_keys:
-            rk = plan.state.resolve_reuse_key(pat.reuse_key)
-            retained_keys[pat.reuse_key] = (rk, plan.state.retain_template_key(rk))
-        pat = replace(pat, reuse_key=retained_keys[pat.reuse_key][0])
+    declared_key = pat.reuse_key
+    pat = lifetimes.resolve(pat)
     bound = bind_memory_access(
         pat, plan.state, hbm_bus=unit_bus, copy_hit_bytes_per_ms=_UNIT_RATE,
         copy_miss_bytes_per_ms=_UNIT_RATE, l2_bytes_per_ms=_UNIT_RATE,
@@ -579,6 +577,7 @@ def _admit_periodic_access(
         if (lg.l2_hit_bytes and lg.dram_sector_bytes) else SectorCoverage()
     )
     plan._account(lg, pat.runs, res_prior)
+    lifetimes.complete(declared_key)
     evictions = plan.state.drain_writebacks(die)
     wb_bytes = sum(item.bytes for item in evictions) if evictions else 0
     if wb_bytes:
@@ -613,78 +612,48 @@ def _count_wave_compute(tiles, spec, p, datapath, low, plan, resource_work, cube
     return sum(ceil_div(k, low.micro_k) * repetitions for k, repetitions in panels)
 
 
+def _panel_patterns(spec, p, tile, ks, kl, die, sector):
+    bypass_b = spec.l2_cache_hint_b == "disable"
+    gm_a = _make_rect_pattern(
+        spec, p, die, sector, p.a_id, spec.dtype_a, tile.row, ks, tile.m, kl, p.k, tile.owner,
+    )
+    sc_a = (_make_scale_pattern(
+        p, die, sector, p.a_id, tile.row, ks, tile.m, kl, p.k, tile.owner, is_a=True,
+    ) if spec.mx_scale_group else None)
+    gm_b = _make_rect_pattern(
+        spec, p, die, sector, p.b_id, spec.dtype_b, ks, tile.col, kl, tile.n, p.n, tile.owner,
+        bypass=bypass_b,
+    )
+    sc_b = (_make_scale_pattern(
+        p, die, sector, p.b_id, ks, tile.col, kl, tile.n, p.n, tile.owner, is_a=False,
+        bypass=bypass_b,
+    ) if spec.mx_scale_group else None)
+    return gm_a, sc_a, gm_b, sc_b
+
+
 def _lower_periodic_wave(
     tiles: tuple[Any, ...], spec, p, datapath, low, plan: Lowering,
-    admit, admit_shared_a, a_hits, resource_work: Counter[str], cube_dt: str, die: int, has_ctx: bool,
+    admit, resource_work: Counter[str], cube_dt: str, die: int, has_ctx: bool,
 ) -> tuple[tuple[_CohortWaveSpec, ...], int]:
-    """Admit all K-panels for one output wave and group identical cores into cohorts."""
-    bypass_b = spec.l2_cache_hint_b == "disable"
-    use_scale = bool(spec.mx_scale_group)
+    """Bind each tile's panels and output in literal emission order before grouping."""
     periods = _CANDIDATE_PAIR_PERIODS_MC1 if ceil_div(low.tk, low.micro_k) == 1 else _CANDIDATE_PAIR_PERIODS
-    encoders = [_PanelPhases(periods) for _ in tiles]
     total_micros = _count_wave_compute(tiles, spec, p, datapath, low, plan, resource_work, cube_dt)
-    for panel_idx in range(low.gk):
-        a_hits.clear()
-        ks = panel_idx * low.tk
-        kl = min(low.tk, p.k - ks)
-        for tile, encoder in zip(tiles, encoders):
-            gm_a = admit_shared_a(
-                (False, tile.row, tile.m, ks, kl),
-                lambda _t=tile, _ks=ks, _kl=kl: _make_rect_pattern(
-                    spec, p, die, plan.sector, p.a_id, spec.dtype_a,
-                    _t.row, _ks, _t.m, _kl, p.k, _t.owner,
-                ),
+    cohorts = {}
+    for tile in tiles:
+        encoder = _PanelPhases(periods)
+        for ks in range(0, p.k, low.tk):
+            kl = min(low.tk, p.k - ks)
+            records = tuple(
+                admit(pattern) if pattern is not None else None
+                for pattern in _panel_patterns(spec, p, tile, ks, kl, die, plan.sector)
             )
-            sc_a = (admit_shared_a(
-                (True, tile.row, tile.m, ks, kl),
-                lambda _t=tile, _ks=ks, _kl=kl: _make_scale_pattern(
-                    p, die, plan.sector, p.a_id, _t.row, _ks, _t.m, _kl, p.k, _t.owner, is_a=True,
-                ),
-            ) if use_scale else None)
-            gm_b = admit(_make_rect_pattern(
-                spec, p, die, plan.sector, p.b_id, spec.dtype_b,
-                ks, tile.col, kl, tile.n, p.n, tile.owner, bypass=bypass_b,
-            ))
-            sc_b = (admit(_make_scale_pattern(
-                p, die, plan.sector, p.b_id, ks, tile.col, kl, tile.n, p.n, tile.owner,
-                is_a=False, bypass=bypass_b,
-            )) if use_scale else None)
-            encoder.append(_PanelDescriptor(tile.m, tile.n, kl, gm_a, sc_a, gm_b, sc_b))
-
-    cohorts: dict[tuple[Any, ...], list[tuple[int, tuple[_StepPhaseDescriptor, ...], _AccessRecord]]] = {}
-    wave_stages = 0
-    for tile, encoder in zip(tiles, encoders):
-        drain_rec = admit(_make_output_pattern(spec, p, tile, die, plan.sector))
-        wave_stages += _exact_tile_stage_count(spec, low.gk, total_micros, has_ctx)
-        steps, step_sigs = encoder.finish()
-        cohorts.setdefault((step_sigs, _ledger_key(drain_rec)), []).append((tile.owner, steps, drain_rec))
-    wave_specs = tuple(
-        _CohortWaveSpec(tuple(i[0] for i in items), items[0][1], items[0][2])
-        for items in cohorts.values()
-    )
-    return wave_specs, wave_stages
-
-
-def _fast_hit_shared_a(
-    hit_item: tuple[_AccessRecord, ReuseKey, Any],
-    plan: Lowering, resource_work: Counter[str], context, die: int,
-) -> _AccessRecord | None:
-    record, rk, entry = hit_item
-    eff = plan.state.effective_l2_bytes(die)
-    if (plan.state._resident.get(rk) is not entry or entry.evicted or entry.working_set_bytes > eff
-            or plan.state._hit_fraction(entry.working_set_bytes, eff) != _UNIT_RATE):
-        return None
-    plan.state._activate_key(rk)
-    plan.state._touch_resident(entry)
-    aligned = record.ledger.aligned_transfer_bytes
-    plan.logical += record.ledger.logical_tensor_bytes
-    plan.copied += aligned
-    plan.hits += aligned
-    if aligned:
-        resource_work[record.pattern.pipe] += aligned
-        if context is None or "l2" in context.rates:
-            resource_work["l2"] += aligned
-    return record
+            encoder.append(_PanelDescriptor(tile.m, tile.n, kl, *records))
+        drain = admit(_make_output_pattern(spec, p, tile, die, plan.sector))
+        steps, signatures = encoder.finish()
+        owners, _, _ = cohorts.setdefault((signatures, _ledger_key(drain)), ([], steps, drain))
+        owners.append(tile.owner)
+    wave_specs = tuple(_CohortWaveSpec(tuple(owners), steps, drain) for owners, steps, drain in cohorts.values())
+    return wave_specs, len(tiles) * _exact_tile_stage_count(spec, low.gk, total_micros, has_ctx)
 
 
 def lower_catlass_periodic(
@@ -698,10 +667,16 @@ def lower_catlass_periodic(
     entry_state = deepcopy(plan.state)
     low = _MatrixLowerer(plan, spec, p)
     unit_bus = HbmBusSpec(die, _UNIT_RATE, _UNIT_RATE, 0.0, row_r="hbm", row_w="hbm",
-                         memory_access=datapath.memory_access)
+                         memory_access=plan.state.memory_access)
     resource_work, cube_dt = Counter(), _cube_dtype(spec)
     blocks, cores = ceil_div(p.m, low.tm) * ceil_div(p.n, low.tn), spec.aic_budget
-    retained_keys: dict[ReuseKey, tuple[ReuseKey, bool]] = {}
+    lifetimes = _ReuseLifetimes(plan.state, ())
+    # Every tile touches the same operand keys once per panel and drains one output.
+    first_tile = low.tile(0)
+    for pattern in _panel_patterns(spec, p, first_tile, 0, low.tk, die, plan.sector):
+        if pattern is not None and pattern.reuse_key is not None:
+            lifetimes.pending[pattern.reuse_key] += blocks * low.gk
+    lifetimes.pending[_make_output_pattern(spec, p, first_tile, die, plan.sector).reuse_key] += blocks
     entry_empty = not getattr(entry_state, "_resident", None)
     if entry_empty:
         whole_reads, whole_writes = _whole_tensor_obligations(spec, p, die, plan.sector)
@@ -710,40 +685,20 @@ def lower_catlass_periodic(
 
     def admit(pat: MemoryAccessPattern) -> _AccessRecord:
         return _admit_periodic_access(
-            pat, plan, entry_state, unit_bus, retained_keys, resource_work, context, die,
+            pat, plan, entry_state, unit_bus, lifetimes, resource_work, context, die,
             track_obligations=not entry_empty,
         )
-
-    a_hits: dict[tuple[Any, ...], tuple[_AccessRecord, ReuseKey, Any]] = {}
-
-    def admit_shared_a(cache_key: tuple[Any, ...], make_pat) -> _AccessRecord:
-        if entry_empty and (hit_item := a_hits.get(cache_key)) is not None:
-            if (fast := _fast_hit_shared_a(hit_item, plan, resource_work, context, die)) is not None:
-                return fast
-        pat = make_pat()
-        rec = admit(pat)
-        rk_info = retained_keys.get(pat.reuse_key) if (entry_empty and pat.reuse_key is not None) else None
-        if rk_info is not None and (entry := plan.state._resident.get(rk_info[0])) is not None and not entry.evicted:
-            # The emitted stage binds the owner. The cached operand ledger is
-            # identical for every owner that reads these fully resident rows.
-            aligned = rec.ledger.aligned_transfer_bytes
-            hit = _AccessRecord(rec.pattern, ByteLedger(rec.ledger.logical_tensor_bytes, aligned, 0.0, aligned, 0, 0))
-            a_hits[cache_key] = (hit, rk_info[0], entry)
-        return rec
 
     compiled_waves: list[tuple[_CohortWaveSpec, ...]] = []
     total_stages, plan.launches = _LAUNCH_STAGES, 1
     for first in range(0, blocks, cores):
         tiles = tuple(low.tile(i) for i in range(first, min(first + cores, blocks)))
         wave_specs, wave_stages = _lower_periodic_wave(
-            tiles, spec, p, datapath, low, plan, admit, admit_shared_a, a_hits,
+            tiles, spec, p, datapath, low, plan, admit,
             resource_work, cube_dt, die, context is not None,
         )
         compiled_waves.append(wave_specs)
         total_stages += wave_stages
-    for rk, owned in retained_keys.values():
-        if owned:
-            plan.state.release_template_key(rk)
     l1m, l1n, l1k = spec.l1_tile_shape
     l0m, l0n, l0k = spec.l0_tile_shape
     slot_sizes = (

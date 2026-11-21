@@ -46,7 +46,6 @@ pytestmark = pytest.mark.tier0
 
 ADAPTER_FIXTURES = ("observations", "capture_adapters")
 
-
 def test_capture_inventory_counts_source_bound_samples_and_acquisitions():
     protocol = activation_protocol()
     conditions = list(iter_conditions(protocol))
@@ -65,7 +64,6 @@ def test_capture_inventory_counts_source_bound_samples_and_acquisitions():
         assert sample["sample_id"].startswith(sample["run_id"] + ":")
         assert sample["identity"]["implementation"]["producer_sha256"] == protocol["producer"]["sha256"]
 
-
 @pytest.mark.parametrize("source_role", ["producer", "supporting_sources", "captures"])
 def test_capture_identity_rejects_changed_bytes(source_role, tmp_path):
     protocol = activation_protocol()
@@ -76,7 +74,6 @@ def test_capture_identity_rejects_changed_bytes(source_role, tmp_path):
     protocol[source_role] = altered if source_role == "producer" else [altered]
     with pytest.raises(ValueError, match="capture_source_hash_mismatch"):
         list(iter_conditions(protocol))
-
 
 def test_activation_uses_original_events_and_restores_distinct_burst_boundary():
     manifest = activation_protocol()
@@ -98,7 +95,6 @@ def test_activation_uses_original_events_and_restores_distinct_burst_boundary():
     assert len(samples) == 270 and len({sample["run_id"] for sample in samples}) == 2
     assert all(sample["split"] == "unassigned" for sample in samples)
 
-
 def test_grouped_keeps_actual_histogram_and_whole_graph_replay_events():
     manifest = grouped_protocol()
     conditions = list(iter_conditions(manifest))
@@ -114,7 +110,6 @@ def test_grouped_keeps_actual_histogram_and_whole_graph_replay_events():
     assert graph8["identity"]["execution"]["activation_quant"] == "outside_timed_region"
     assert len({s["run_id"] for c in conditions for s in c["samples"]}) == 1
     assert len([s for c in conditions for s in c["samples"]]) == 240
-
 
 def test_grouped_preserves_producer_canary_failure_without_shape(tmp_path):
     manifest = grouped_protocol()
@@ -133,7 +128,6 @@ def test_grouped_preserves_producer_canary_failure_without_shape(tmp_path):
     assert conditions[3]["metadata"]["error"] == "canary_rejected"
     assert conditions[3]["identity"] == {} and conditions[3]["samples"] == []
     assert len([sample for condition in conditions for sample in condition["samples"]]) == 240
-
 
 def test_served_grouped_is_kernel_sum_and_never_includes_contaminated_intervals(profiler_api):
     manifest = served_protocol()
@@ -158,7 +152,6 @@ def test_served_grouped_is_kernel_sum_and_never_includes_contaminated_intervals(
     assert "group_list_tensor_values" in observed["metadata"]["unresolved_semantics"]
     inventory = capture_inventory(manifest)
     assert inventory["timing_conditions"] == 2 and inventory["event_or_kernel_sum_samples"] == 1
-
 
 def test_zero_duration_markers_preserve_intervals_without_entering_kernel_sum(tmp_path, profiler_api):
     from mindie_sim.observations.kernels import kernel_rows
@@ -190,7 +183,6 @@ def test_zero_duration_markers_preserve_intervals_without_entering_kernel_sum(tm
     retained = [row for row in kernel_rows(path, include_zero_duration=True)
                 if row.name == manifest["marker"]]
     assert len(retained) == 3 and all(row.duration_ns == 0 for row in retained)
-
 
 def test_descriptive_residual_does_not_promote_unassigned_samples_to_validation():
     samples = list(iter_observations(grouped_protocol()))
@@ -228,7 +220,6 @@ def test_duplicate_source_cannot_drop_newly_identified_missing_semantics(reinter
             "observations": samples, "tolerances": {"relative": 0.1},
         })
 
-
 def test_served_stream_rejects_unordered_time_instead_of_assigning_the_wrong_interval(tmp_path, profiler_api):
     manifest = served_protocol()
     with (fixture_path(*ADAPTER_FIXTURES, "served_grouped.csv")).open(newline="") as stream:
@@ -244,7 +235,6 @@ def test_served_stream_rejects_unordered_time_instead_of_assigning_the_wrong_int
     with pytest.raises(ValueError, match="capture_csv_start_times_not_monotone"):
         list(iter_observations(manifest))
 
-
 def test_missing_served_route_values_cannot_be_validated_by_relabelling_split(profiler_api):
     sample = next(iter_observations(served_protocol()))
     sample["split"] = "heldout"
@@ -259,7 +249,6 @@ def test_missing_served_route_values_cannot_be_validated_by_relabelling_split(pr
 
 def activation_case():
     return json.loads((REPO_ROOT / "examples/calls/activation-nominal.json").read_text())
-
 
 def test_real_activation_calls_keep_event_span_and_reuse_physical_predictions():
     protocol = activation_protocol()
@@ -286,7 +275,6 @@ def test_real_activation_calls_keep_event_span_and_reuse_physical_predictions():
         sample["duration_ms"] for sample in source["samples"])
     assert all(p["execution"]["live_tasks"] == 0 for p in result["predictions"])
 
-
 def test_event_durations_and_canaries_never_change_predictions(tmp_path):
     protocol = activation_protocol()
     reference = compare_calls(activation_case(), protocol)
@@ -309,7 +297,6 @@ def test_event_durations_and_canaries_never_change_predictions(tmp_path):
         assert after["statistics"]["sample_median_ms"] == pytest.approx(
             before["statistics"]["sample_median_ms"] * 17)
 
-
 def test_actual_grouped_representation_is_not_substituted_with_bf16_nd():
     result = compare_calls(activation_case(), grouped_protocol())
     assert result["status"] == "completed"
@@ -323,7 +310,6 @@ def test_actual_grouped_representation_is_not_substituted_with_bf16_nd():
     assert {row["identity"]["execution"]["invocations"]
             for row in result["conditions"]} == {1, 8}
     assert result["validation"]["strict_pairs"] == 0
-
 
 def test_budget_retains_observations_and_cli_returns_partial_report(tmp_path):
     protocol = tmp_path / "protocol.json"
@@ -343,7 +329,6 @@ def test_real_profiler_csv_remains_readable_with_companion_api(profiler_api):
     rows = list(profiler_rows(fixture_path("observations", "profiler.csv")))
     assert rows and all(row["duration_ms"] > 0 and row["kernel"] for row in rows)
 
-
 def test_profiler_catalogue_exposes_samples_and_variant_extrema():
     with ProfilerCatalogue(fixture_path("observations", "catalogue.sqlite")) as catalogue:
         variants = list(catalogue.variants(limit=5))
@@ -351,7 +336,6 @@ def test_profiler_catalogue_exposes_samples_and_variant_extrema():
     assert samples and all(row["duration_ms"] > 0 and row["source"] for row in samples)
     assert variants[0]["min_ms"] <= min(row["duration_ms"] for row in samples)
     assert variants[0]["max_ms"] >= max(row["duration_ms"] for row in samples)
-
 
 def test_shared_profiler_row_preserves_consumer_projection(profiler_api):
     from dataclasses import replace
@@ -376,7 +360,6 @@ def test_shared_profiler_row_preserves_consumer_projection(profiler_api):
     assert observed_contract(replace(row, output_shapes=None)) is None
     assert observed_contract(replace(row, output_shapes=((16384, 2560), (16384, 1)))) is None
 
-
 def test_missing_or_unrecognized_matrix_dtype_does_not_authorize_a_contract(profiler_api):
     from dataclasses import replace
     from mindie_profiler.normalized import row_from_event
@@ -391,7 +374,6 @@ def test_missing_or_unrecognized_matrix_dtype_does_not_authorize_a_contract(prof
         incomplete = row_from_event(replace(row.event, input_dtypes=descriptors))
         assert incomplete.input_shapes == row.input_shapes
         assert observed_contract(incomplete) is None
-
 
 def test_bound_raw_samples_can_be_calibrated_without_reinterpreting_predictions():
     value = Case.from_mapping(case())
@@ -411,7 +393,6 @@ def test_bound_raw_samples_can_be_calibrated_without_reinterpreting_predictions(
         assert predict(value, lower=linear_work, primitives=store)["metrics"] == predict(
             value, lower=linear_work)["metrics"]
 
-
 def test_train_primitive_changes_duration_without_fabricating_resource_work():
     value = Case.from_mapping(case())
     plan = IterationPlan((RequestView("r", 4, 0, True, "prefill"),))
@@ -426,7 +407,6 @@ def test_train_primitive_changes_duration_without_fabricating_resource_work():
     assert after["execution"]["work"] == before["execution"]["work"]
     assert after["execution"]["serviced"]["matrix@r0:s0"] == before["execution"]["serviced"]["matrix@r0:s0"]
 
-
 def test_service_boundary_mismatch_precludes_calibration_and_acceptance():
     observed = service_observation(fixture_path("observations", "service.json"))
     result = compare(predict(case()), observed, boundary="client_stream")
@@ -434,7 +414,6 @@ def test_service_boundary_mismatch_precludes_calibration_and_acceptance():
     assert result["rows"] and all(row["observed"] > 0 for row in result["rows"])
     with pytest.raises(ValueError, match="boundary_conflicts"):
         compare(predict(case()), observed, boundary="device_token_commit")
-
 
 def test_actual_speculative_capture_uses_tokens_instead_of_sse_chunks_for_tpot():
     raw = fixture_json("observations", "service.json")
@@ -449,7 +428,6 @@ def test_actual_speculative_capture_uses_tokens_instead_of_sse_chunks_for_tpot()
     assert observed["output_tps"] == pytest.approx(
         sum(row["completion_tokens"] for row in requests) / raw["wall_s"])
 
-
 def test_capture_without_usage_does_not_substitute_chunks_or_requested_token_counts(tmp_path):
     raw = fixture_json("observations", "service.json")
     for row in raw["per_request"]:
@@ -462,7 +440,6 @@ def test_capture_without_usage_does_not_substitute_chunks_or_requested_token_cou
     assert observed["reported_metrics"]["tpot_ms"] == raw["tpot_ms"]
     assert observed["ttft_ms"] == raw["ttft_ms"]
 
-
 def test_historical_source_index_preserves_hashes_and_source_roles(tmp_path):
     with ObservationIndex(tmp_path / "observations.sqlite") as index:
         index.scan(fixture_path("observations"))
@@ -470,7 +447,6 @@ def test_historical_source_index_preserves_hashes_and_source_roles(tmp_path):
         rows = index.find_sources("profiler.csv")
         assert rows[0]["kind"] == "profiler" and len(rows[0]["sha256"]) == 64
         assert index.inventory()["profiler_catalogue"]["files"] == 1
-
 
 def test_rate_fit_predicts_independent_measurements():
     root = REPO_ROOT / "data" / "measurements" / "gpu"
@@ -495,7 +471,6 @@ def test_real_matmul_rows_do_not_gain_negative_gaps_from_epoch_float_rounding():
     assert stream["duration_sum_us"] == 50.254
     assert stream["first_start_to_last_end_us"] == 134.746
     assert stream["duration_sum_over_window_span"] == pytest.approx(50.254 / 134.746)
-
 
 def test_real_vector_rows_retain_first_transition_and_device_work_separately():
     report = analyze_window(fixture_path("a5_microbench_20261030", "vector_add_t1.csv"), 4)
@@ -571,11 +546,11 @@ def test_json_capture_filters_unrelated_events_while_streaming(tmp_path, monkeyp
     monkeypatch.setattr(gate, "ijson", None)  # Exercise the stdlib fallback directly.
     path = tmp_path / "trace.json"
     with path.open("w", encoding="utf-8") as capture:
-        capture.write('{"device_ranks":[1],"events":[')
-        for index in range(40_000):
-            capture.write(json.dumps({"name": f"unrelated-{index}", "clock_operator": "busy_union",
-                                      "detail": "x" * 100}) + ",\n")
-        capture.write('{"name":"gemm","clock_operator":"elapsed_span"}]}')
+        capture.write('{"traceEvents":[')
+        for _ in range(40_000):
+            capture.write(json.dumps({"name": "gemm", "ph": "X", "device_id": 999,
+                                      "ts": 1, "dur": 100, "detail": "x" * 100}) + ",\n")
+        capture.write('{"name":"gemm","ph":"X","device_id":1,"ts":1,"dur":60.023}]}')
     tracemalloc.start()
     try:
         _verify_capture(path)
@@ -583,6 +558,32 @@ def test_json_capture_filters_unrelated_events_while_streaming(tmp_path, monkeyp
     finally:
         tracemalloc.stop()
     assert peak < 2 * 1024 * 1024
+
+
+@pytest.mark.parametrize("level", ("L1", "L2", "L3"))
+def test_native_trace_binds_rank_unique_events_and_duration(tmp_path, level):
+    path = tmp_path / "trace_view.json"
+    # Ascend Hardware PIDs encode device IDs. The TID identifies a stream.
+    first = {"ph": "X", "pid": 175552, "tid": 61, "name": "MatMulV3",
+             "ts": "1793296747273951.897", "dur": 1.888, "args": {"Task Id": 38}}
+    last = {**first, "ts": "1793296747273955.897", "dur": 2.814, "args": {"Task Id": 39}}
+    tracks = [{"ph": "M", "pid": pid, "name": "process_name", "args": {"name": "Ascend Hardware"}}
+              for pid in (175552, 175553)]
+    rows = [first, {**first, "pid": 175553, "dur": 100}, last, *tracks]
+    path.write_text(json.dumps({"traceEvents": rows}))
+    _verify_capture(path, level=level, events=("38",), ranks=(0,), measured=1888)
+    _verify_capture(path, level=level, events=("38", "39"), ranks=(0,), measured=6814)
+    _verify_capture(path, level=level, events=("38", "39"), ranks=(0,), measured=4702, operator="busy_union")
+    for changes, cause in (({"ranks": (999,)}, "capture_rank_mismatch"),
+                           ({"events": ("38", "39"), "ranks": (1,)}, "capture_event_mismatch"),
+                           ({"events": ("MatMulV3",)}, "capture_trace_ambiguous_event"),
+                           ({"measured": 100_000}, "capture_duration_mismatch")):
+        claim = {"events": ("38",), "ranks": (0,), "measured": 1888, **changes}
+        with pytest.raises(ModelingError, match=cause):
+            _verify_capture(path, level=level, **claim)
+    path.write_text(json.dumps(rows[:3]))
+    with pytest.raises(ModelingError, match="capture_rank_mismatch"):
+        _verify_capture(path, level=level, events=("38",), ranks=(0,), measured=1888)
 
 
 def test_capture_envelope_clock_reaches_canonical_device_configuration():

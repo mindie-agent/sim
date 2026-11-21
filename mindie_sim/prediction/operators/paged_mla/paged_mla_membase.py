@@ -15,7 +15,9 @@ from functools import lru_cache
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.prediction.mechanism import OperatorPlan, Work
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, PipelineProgram, Stage
-from mindie_sim.prediction.operators.matrix.refill_steady import compact_periodic_pipeline
+from mindie_sim.prediction.operators.matrix.refill_steady import (
+    PeriodicPipelineSpec, compact_periodic_peer_group, compact_periodic_pipeline,
+)
 from .paged_mla_membase_dispatch import Dispatch, KEY_TILE, source_dispatch
 from .paged_mla_membase_matrix import (
     CUBE_ALIGNMENT, LATENT_WIDTH, PAGE_INDEX_BYTES, PV_K_L0, PV_K_L1, PV_N,
@@ -237,11 +239,18 @@ def _plan(spec, cores):
         if spec.retained_kv_rows:
             allocations += (ctx.allocate('retained_kv','l2',
                 2*len(owners)*spec.retained_kv_rows*QK_WIDTH*2,(0,)),)
+        pipelines = tuple(
+            _owner_pipeline_spec(owner, jobs, spec, stage, matrix_steps)
+            for owner, jobs in enumerate(owners)
+        )
+        producers = (
+            compact_periodic_peer_group(ctx, pipelines, compactor=compact_periodic_pipeline)
+            if all(len(jobs) == 1 for jobs in owners)
+            else tuple(pipe.literal() for pipe in pipelines)
+        )
         return KernelProgram((
             Stage('reserve',acquire=allocations),
-            Stage('producers',after=('reserve',),program=ParallelProgram(tuple(
-                _owner_program(owner, owners, spec, stage, matrix_steps, ctx)
-                for owner in range(len(owners))))),
+            Stage('producers',after=('reserve',),program=ParallelProgram(producers)),
             Stage('merge',after=('producers',),program=ParallelProgram(tuple(
                 merge_program(aiv,jobs) for aiv,jobs in enumerate(spec.dispatch.merges)))),
             Stage('release',after=('merge',),free=allocations),
@@ -268,8 +277,7 @@ def _plan(spec, cores):
     })
 
 
-def _owner_program(owner, owners, spec, stage, matrix_steps, ctx):
-    jobs = owners[owner]
+def _owner_pipeline_spec(owner, jobs, spec, stage, matrix_steps):
     prefix = [0]
     for _,_,count,_ in jobs:
         prefix.append(prefix[-1]+count)
@@ -330,14 +338,6 @@ def _owner_program(owner, owners, spec, stage, matrix_steps, ctx):
                           after=('output_write',)),
                 ))
         return tuple(steps)
-    all_single_job = all(len(j_list) == 1 for j_list in owners if j_list)
-    peer_counts = tuple(
-        sum(j[2] for j in j_list) + 2 for j_list in owners if j_list
+    return PeriodicPipelineSpec(
+        count + 2, _PIPELINE_SLOTS, cycle, head=_COMPACT_HEAD_CYCLES, tail=_COMPACT_TAIL_CYCLES,
     )
-    if len(jobs) == 1 and all_single_job:
-        return compact_periodic_pipeline(
-            ctx, count + 2, _PIPELINE_SLOTS, cycle,
-            head=_COMPACT_HEAD_CYCLES, tail=_COMPACT_TAIL_CYCLES,
-            peer_counts=peer_counts,
-            peer_tails=(_COMPACT_TAIL_CYCLES,) * len(peer_counts))
-    return PipelineProgram(count + 2, _PIPELINE_SLOTS, cycle)

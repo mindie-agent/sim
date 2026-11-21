@@ -14,13 +14,16 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from functools import partial, wraps
 import hashlib
+from inspect import isroutine
 import json
-from types import SimpleNamespace
+from types import FunctionType, MethodType, SimpleNamespace
 
 import pytest
 
 from _support.axes import REPRESENTATIVE_SKUS
+from _support.linear_cases import execute_one, gdn_decode_source_case
 from mindie_sim import graph_costs
 from mindie_sim.backends.ascend import apply_observed_aicore_clock
 from mindie_sim.compose import compose_case
@@ -30,7 +33,7 @@ from mindie_sim.observations.accuracy import (
     extract_observed_aicore_freq_mhz,
 )
 from mindie_sim.prediction.execution.context import _ContextMixin
-from mindie_sim.prediction.mechanism import Geometry
+from mindie_sim.prediction.mechanism import Geometry, OperatorPlan
 from mindie_sim.prediction.operators import attention, linear_attention
 from mindie_sim.prediction.operators.attention.attention_pipeline import TiledAttentionRecipe
 from mindie_sim.prediction.operators.attention.common import AttentionContract, sequence_layout_spans
@@ -49,7 +52,9 @@ from mindie_sim.schema.compute_arch import ComputeArchSpec
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.schema.workload import RequestView
 from mindie_sim.stack_registry import LoweringRequest
-from scripts._arch_governance_runtime import _NON_DEVICE_INFRA_RECIPES, _OWNER_MODULE_PREFIXES, _binding_module
+from scripts._arch_governance_runtime import (
+    _NON_DEVICE_INFRA_RECIPES, _OWNER_MODULE_PREFIXES, _binding_module, _is_governed_module,
+)
 
 pytestmark = pytest.mark.tier0
 
@@ -93,6 +98,65 @@ def _is_allowed_recipe_owner(recipe) -> bool:
     return _binding_module(recipe).startswith(_OWNER_MODULE_PREFIXES)
 
 
+def _program_owners(program, probe):
+    pending = [program]
+    seen = set()
+    while pending:
+        callback = pending.pop()
+        if id(callback) in seen:
+            continue
+        seen.add(id(callback))
+        if getattr(callback, "_lock_c_probe", None) is probe:
+            pending.append(callback.__wrapped__)
+            continue
+        if isinstance(callback, partial):
+            pending.append(callback.func)
+            continue
+        if isinstance(callback, MethodType):
+            callback = callback.__func__
+        if not isroutine(callback):
+            callback = type(callback).__call__
+        module = getattr(callback, "__globals__", {}).get(
+            "__name__", getattr(callback, "__module__", type(callback).__module__))
+        yield module
+        wrapped = getattr(callback, "__wrapped__", None)
+        if wrapped is not None:
+            pending.append(wrapped)
+        for cell in getattr(callback, "__closure__", None) or ():
+            try:
+                captured = cell.cell_contents
+            except ValueError:
+                continue
+            if isinstance(captured, partial) or isroutine(captured):
+                pending.append(captured)
+
+
+@pytest.fixture
+def traced_plan_programs(monkeypatch):
+    """Check callbacks at invocation, including plans invoked by another plan."""
+    executed = set()
+    get_attribute = OperatorPlan.__getattribute__
+
+    def traced_get_attribute(self, name):
+        callback = get_attribute(self, name)
+        if name != "program" or getattr(callback, "_lock_c_probe", None) is executed:
+            return callback
+
+        @wraps(callback)
+        def checked(context):
+            outside = [module for module in _program_owners(callback, executed)
+                       if not _is_governed_module(module)]
+            assert not outside, f"OperatorPlan.program outside governed packages: {outside}"
+            executed.add(context.op.family)
+            return callback(context)
+
+        checked._lock_c_probe = executed
+        return checked
+
+    monkeypatch.setattr(OperatorPlan, "__getattribute__", traced_get_attribute)
+    return executed
+
+
 @pytest.mark.parametrize(
     "model_key,sku_alias,parallel,views,layout,padded_tokens",
     [
@@ -105,7 +169,7 @@ def _is_allowed_recipe_owner(recipe) -> bool:
     ],
 )
 def test_single_spine_live_execution_trace_across_architectures(
-    monkeypatch, model_key, sku_alias, parallel, views, layout, padded_tokens,
+    monkeypatch, traced_plan_programs, model_key, sku_alias, parallel, views, layout, padded_tokens,
 ):
     """Lock C: 100% governed operator execution, single per-die L2 view, exact RequestView tuple."""
     case = Case.from_mapping(
@@ -154,6 +218,7 @@ def test_single_spine_live_execution_trace_across_architectures(
 
     assert evaluation.span_ms > 0.0
     assert dispatched_recipes, "expected live operator dispatches during step replay"
+    assert traced_plan_programs, "expected executed OperatorPlan.program callbacks"
     outside = [
         (fam, rec, _binding_module(obj))
         for fam, rec, obj in dispatched_recipes
@@ -170,6 +235,39 @@ def test_single_spine_live_execution_trace_across_architectures(
     for op_id, received in seen_seq_requests:
         assert received == views, f"sequence op {op_id} dropped canonical RequestView tuple"
         assert all(actual is expected for actual, expected in zip(received, views, strict=True))
+
+
+@pytest.mark.parametrize("family", ("short_convolution", "gdn_gating"))
+def test_live_dispatch_rejects_flat_program_callbacks(monkeypatch, traced_plan_programs, family):
+    from mindie_sim.prediction import call_builders_operators
+    from mindie_sim.prediction.operators.linear_attention import _gdn_decode_programs
+
+    case, views, ops = gdn_decode_source_case((1,))
+    op = next(op for op in ops if op.family == family)
+    _, span = execute_one(case, views, op)
+    assert span > 0 and family in traced_plan_programs
+    prepare = RecipeBook.prepare
+
+    def route_to_flat(self, op, geometry):
+        prepared, plan = prepare(self, op, geometry)
+        original = plan.program
+
+        def program(_self, context):
+            return original(context)
+
+        flat = FunctionType(program.__code__, vars(call_builders_operators), closure=program.__closure__)
+        delegate = partial(MethodType(flat, self))
+
+        def governed_closure(context):
+            return delegate(context)
+
+        callback = FunctionType(governed_closure.__code__, vars(_gdn_decode_programs),
+                                closure=governed_closure.__closure__)
+        return prepared, replace(plan, program=callback)
+
+    monkeypatch.setattr(RecipeBook, "prepare", route_to_flat)
+    with pytest.raises(AssertionError, match=r"OperatorPlan\.program.*prediction\.call_builders_operators"):
+        execute_one(case, views, op)
 
 
 def test_addressed_attention_binds_the_live_admission_view(monkeypatch):

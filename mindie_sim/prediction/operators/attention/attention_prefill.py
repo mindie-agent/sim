@@ -35,8 +35,8 @@ from mindie_sim.prediction.operators.attention.attention_prefill_issue import (
     source_issue_operand,
 )
 from mindie_sim.prediction.operators.attention.attention_prefill_nofd import _PrefillProgram, owner_s2_plan
-from mindie_sim.prediction.program import KernelProgram, PipelineProgram, RecipeContext, Stage
-from mindie_sim.prediction.operators.matrix.refill_steady import compact_periodic_pipeline
+from mindie_sim.prediction.program import KernelProgram, RecipeContext, Stage
+from mindie_sim.prediction.operators.matrix.refill_steady import PeriodicPipelineSpec, compact_periodic_pipeline
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.operators import OpSpec
 
@@ -369,8 +369,7 @@ def _allocations(items) -> tuple[Allocation, ...]:
 
 def _task_program(context: RecipeContext, recipe: StagedGQAPrefill,
                   spec: _Spec, task: _Task, core: int,
-                  *, partial: bool = False,
-                  peer_counts: tuple[int, ...] | None = None) -> KernelProgram:
+                  *, partial: bool = False) -> tuple[KernelProgram, PeriodicPipelineSpec]:
     dim, rows = spec.head_dim, task.rows
     q_bytes = rows * dim * spec.query_bytes
     read = _read_role(context)
@@ -443,23 +442,10 @@ def _task_program(context: RecipeContext, recipe: StagedGQAPrefill,
             valid, slot, context, core, spec, cache, rows, dim, outer, max_tile, q_bytes,
             read, write, operand, vector_copy_in)
 
-    use_compact = len(set(spec.requests)) <= 1
-    # Simplified init is the first three taskIds and the drain is three extra
-    # gS1 steps on the last BN.  GQA withholds C2 until PRELOAD_N-1.  Three
-    # covers both without selecting a kernel.
+    # The native FIA key loop has a longer preload and drain than generic GQA.
     fill = NATIVE_S2_PRELOAD if spec.native_fia else 1
-    stages.append(Stage(
-        "key_tiles", after=(key_ready,),
-        program=(
-            compact_periodic_pipeline(
-                context, task.key_tiles, preload, tile,
-                head=fill, tail=fill, resident=persistent,
-                peer_counts=peer_counts,
-                peer_tails=(fill,) * len(peer_counts) if peer_counts is not None else None)
-            if use_compact
-            else PipelineProgram(task.key_tiles, preload, tile)
-        ),
-    ))
+    pipeline = PeriodicPipelineSpec(task.key_tiles, preload, tile, head=fill, tail=fill, resident=persistent)
+    stages.append(Stage("key_tiles", after=(key_ready,), program=pipeline.literal()))
     if page_scale_ub is not None:
         stages.append(Stage("page_scale_release", after=("key_tiles",),
                             free=_allocations((page_scale_ub,))))
@@ -492,7 +478,7 @@ def _task_program(context: RecipeContext, recipe: StagedGQAPrefill,
             placement={**_placement(context, core, *copy_out),
                        **_placement(context, core, *vector)},
         ))
-    return KernelProgram(tuple(stages))
+    return KernelProgram(tuple(stages)), pipeline
 
 
 def _validate_prefill_working_set(context, recipe, spec, task, cache, rows, dim, q_bytes):

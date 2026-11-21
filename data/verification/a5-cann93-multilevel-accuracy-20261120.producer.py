@@ -14,7 +14,7 @@
     across splits fails closed.
   * Level-2 evaluation scores strictly against the matching captured layer or
     subgraph boundary (never full-body prediction or L3 step division).
-  * Every row is scored against the strict relative limit before display
+  * Every row is scored against the shared physical tolerance before display
     rounding or recorded as blocked.
   * Source provenance hashes live ``mindie_sim/prediction/execution/*.py``
     (sorted) and emits strictly ``capture://`` URIs with zero private paths.
@@ -44,6 +44,11 @@ from typing import Any
 
 from mindie_sim import compose_case, graph_costs, parse_case, target_graphs
 from mindie_sim.catalog.ops import comm_op, gemm_op
+from mindie_sim.observations.multilevel_gate import (
+    TIME_UNIT_SCALE_NS,
+    evaluate_vertical_drilldown,
+    exceeds_physical_tolerance,
+)
 from mindie_sim.observations.multilevel_stream import (
     digest_file_streaming,
     normalize_lineage_token,
@@ -67,7 +72,6 @@ from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import OpSpec
 
 ROOT = Path(__file__).resolve().parents[2]
-STRICT_THRESHOLD_PCT = 10.0
 PERCENT_SCALE = 100.0
 TAIL_QUANTILE_P90 = 0.9
 DISPLAY_ROUND_DIGITS = 4
@@ -88,6 +92,10 @@ TRACKED_OPERATOR_PACKAGES = (
 )
 EXECUTION_PACKAGE_REL = Path("mindie_sim") / "prediction" / "execution"
 DEFAULT_SPLIT_MANIFEST_NAMES = ("acquisition_split_manifest.json", "split_manifest.json")
+MODEL_PHASES = (
+    ("decode_B8_S512", "decode", 1, 511, 8, "decode_B8_S512_step_p50_ms", "decode_B8_S512_per_layer_us"),
+    ("prefill_B4_S512", "prefill", 512, 0, 4, "prefill_B4_S512_device_p50_ms", "prefill_B4_S512_per_layer_us"),
+)
 
 
 def _tracked_source_hashes(root: Path = ROOT) -> dict[str, str]:
@@ -245,15 +253,16 @@ def _load_split_manifest(captures_dir: Path, split_manifest: Path | None) -> _Li
     return _LineageSplitResolver(json.loads(target.read_text(encoding="utf-8")))
 
 
-def _timing_fields(predicted: float, measured: float) -> dict[str, Any]:
+def _timing_fields(predicted: float, measured: float, *, unit: str = "us") -> dict[str, Any]:
     if not math.isfinite(measured) or measured <= 0:
         raise ModelingError("measured_duration_invalid")
     if not math.isfinite(predicted) or predicted <= 0:
         raise ModelingError("predicted_duration_invalid")
     ape = abs(predicted - measured) / measured
+    scale = TIME_UNIT_SCALE_NS[unit]
     return {
         "status": "ok", "ape": ape, "ape_pct": round(ape * PERCENT_SCALE, 2),
-        "pointwise_pass": ape * PERCENT_SCALE < STRICT_THRESHOLD_PCT,
+        "pointwise_pass": not exceeds_physical_tolerance(round(predicted * scale), round(measured * scale)),
     }
 
 
@@ -543,22 +552,24 @@ def _display_row(row: Mapping[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in row.items() if key != "ape"}
 
 
+def _capture_duration(raw: Any) -> float:
+    try:
+        duration = float(raw or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return duration if math.isfinite(duration) and duration > 0 else 0.0
+
+
 def _eval_l2_boundary(
     cs, r: Mapping[str, Any], *, ph: str, tok: int, ctx: int, seqs: int,
-    lkey: str, l3_uri: str, l3_acq_root: str, l2_split: str, l2_acq_root: str,
+    measured: float, l3_uri: str, l3_acq_root: str, l2_split: str, l2_acq_root: str,
 ) -> dict[str, Any]:
     """Score L2 strictly against its own independent capture, root, and split."""
     indep_l2_uri = str(r.get("independent_l2_capture_uri") or "").strip()
-    l2_timings = r.get("independent_l2_timings") or r.get("l2_timings") or {}
-    indep_l2_meas = (
-        l2_timings.get(lkey)
-        if isinstance(l2_timings, Mapping) and lkey in l2_timings
-        else r.get("independent_l2_measured_us", r.get("l2_measured_block_us"))
-    )
     if (not indep_l2_uri or indep_l2_uri == l3_uri
             or not l2_acq_root or l2_acq_root == l3_acq_root
             or l2_split not in ("train", "heldout")
-            or indep_l2_meas is None or not math.isfinite(float(indep_l2_meas)) or float(indep_l2_meas) <= 0.0):
+            or measured <= 0):
         return {
             "status": "missing_evidence", "reason": "independent_l2_block_capture_absent",
             "split": l2_split if l2_split in ("train", "heldout") else "",
@@ -594,21 +605,20 @@ def _eval_l2_boundary(
 
     l2_rep = graph_costs(cs_l2, l2_graphs, external_inputs={"analysis_input": 0}, include_submission=False, isolated=False, fast_span_only=True)
     l2_pred_us = float(l2_rep["duration_ms"]) * 1000.0
-    l2_meas_us = float(indep_l2_meas)
     return {
-        **_timing_fields(l2_pred_us, l2_meas_us),
+        **_timing_fields(l2_pred_us, measured),
         "split": l2_split,
         "acquisition_root": l2_acq_root,
         "capture_uri": indep_l2_uri,
         "boundary_kind": str(r.get("l2_boundary_kind") or "periodic_block"),
         "l2_layers": l2_layers,
-        "measured_block_us": round(l2_meas_us, 2),
+        "measured_block_us": round(measured, 2),
         "predicted_block_us": round(l2_pred_us, 2),
     }
 
 
-def _eval_model_run(task: tuple[dict[str, Any], str, str, str, str]) -> dict[str, Any]:
-    r, resolved_split, acq_root, l2_split, l2_acq_root = task
+def _eval_model_run(task: tuple[dict[str, Any], str, str, str, str, str]) -> dict[str, Any]:
+    r, resolved_split, acq_root, l2_split, l2_acq_root, l3_blocked = task
     rid, mod, rung, sku, L = r["run_id"], r["model_id"], r["rung"], r.get("sku", "Ascend950DT_9582"), int(r["num_layers"])
     rc = r.get("resolved_compilation_and_ascend_config") or {}
     pt = rc.get("parallel_topology") or {}
@@ -640,20 +650,20 @@ def _eval_model_run(task: tuple[dict[str, Any], str, str, str, str]) -> dict[str
     cg_max = max(rc.get("cudagraph_capture_sizes") or [8]) if cg_mode != "NONE" else 0
     t, fx_sub = r.get("step_and_layer_timings") or {}, fx.get("num_compiled_fx_subgraphs")
     l3_uri = str(r.get("capture_uri") or f"capture://cann93-a5-vllm-subgraphs/20261119/{rid}")
+    raw_l2_timings = r.get("independent_l2_timings") or r.get("l2_timings")
+    l2_timings = raw_l2_timings if isinstance(raw_l2_timings, Mapping) else {}
+    scalar_l2 = r.get("independent_l2_measured_us", r.get("l2_measured_block_us"))
+    has_l2_capture = bool(r.get("independent_l2_capture_uri"))
 
     phases: dict[str, Any] = {}
-    for ptag, ph, tok, ctx, seqs, mkey, lkey in (
-        ("decode_B8_S512", "decode", 1, 511, 8, "decode_B8_S512_step_p50_ms", "decode_B8_S512_per_layer_us"),
-        ("prefill_B4_S512", "prefill", 512, 0, 4, "prefill_B4_S512_device_p50_ms", "prefill_B4_S512_per_layer_us"),
-    ):
-        meas = t.get(mkey)
-        try:
-            meas = float(meas or 0)
-        except (TypeError, ValueError):
-            meas = 0
-        if not math.isfinite(meas) or meas <= 0:
-            phases[ptag] = {"phase": ph, "status": "blocked", "reason": "step_duration_invalid"}
-            continue
+    for ptag, ph, tok, ctx, seqs, mkey, lkey in MODEL_PHASES:
+        meas = _capture_duration(t.get(mkey))
+        step_reason = l3_blocked or ("step_duration_invalid" if not meas else "")
+        phase_l2_measured = _capture_duration(l2_timings.get(lkey, scalar_l2))
+        if step_reason:
+            phases[ptag] = {"phase": ph, "status": "blocked", "reason": step_reason}
+            if not (has_l2_capture and (lkey in l2_timings or scalar_l2 is not None and (lkey in t or mkey in t))):
+                continue
         sched_toks = tok * seqs
         cap_mode = "piecewise" if (cg_mode == "PIECEWISE" or "piecewise" in rung or sched_toks > cg_max) else "full"
         use_fmoe = mso and is_hybrid_60 and ph == "prefill"
@@ -671,24 +681,46 @@ def _eval_model_run(task: tuple[dict[str, Any], str, str, str, str]) -> dict[str
             raw["runtime"]["mixed_mode"] = "piecewise"
             raw["runtime"]["splitting_ops"] = ["attention", "attention_qk", "attention_pv", "attention_softmax", "attention_merge", "mla", "gdn", "gdn_prepare", "gdn_state", "gdn_output", "recurrent_vector", "kda", "kda_recurrent"]
         cs = parse_case(raw)
-        rep = graph_costs(cs, target_graphs(cs, phase=ph, tokens=tok, context=ctx, sequences=seqs, scope="model"), external_inputs={"analysis_input": 0}, include_submission=True, isolated=False, fast_span_only=True)
-        pred_ms = float(rep["duration_ms"])
-        replays_per_rep = max(1, int(rep["execution"]["submission"]["graph_replays"]) // max(1, dp))
         l2_block = _eval_l2_boundary(
-            cs, r, ph=ph, tok=tok, ctx=ctx, seqs=seqs, lkey=lkey,
+            cs, r, ph=ph, tok=tok, ctx=ctx, seqs=seqs, measured=phase_l2_measured,
             l3_uri=l3_uri, l3_acq_root=acq_root,
             l2_split=l2_split, l2_acq_root=l2_acq_root,
         )
-        phases[ptag] = {
-            "phase": ph, "cap_mode": cap_mode, "measured_ms": round(float(meas), 3), "predicted_ms": round(pred_ms, 3),
-            **_timing_fields(pred_ms, float(meas)),
-            "l2_block": l2_block, "fx_post_split_subgraphs": fx_sub, "predicted_replays": replays_per_rep,
+        phase_result = phases.setdefault(ptag, {"phase": ph})
+        phase_result.update(l2_block=l2_block, fx_post_split_subgraphs=fx_sub, predicted_replays=None)
+        if step_reason:
+            continue
+        try:
+            rep = graph_costs(cs, target_graphs(cs, phase=ph, tokens=tok, context=ctx, sequences=seqs, scope="model"), external_inputs={"analysis_input": 0}, include_submission=True, isolated=False, fast_span_only=True)
+            pred_ms = float(rep["duration_ms"])
+            phase_result.update(_timing_fields(pred_ms, meas, unit="ms"))
+        except ModelingError as exc:
+            phase_result.update(status="blocked", reason=exc.reason)
+            continue
+        scale = TIME_UNIT_SCALE_NS["ms"]
+        # This capture export supplies step timings and independent component
+        # timings. It contains no component census measured inside the step.
+        drilldown = evaluate_vertical_drilldown(round(pred_ms * scale), round(meas * scale), ())
+        phase_result.update(
+            cap_mode=cap_mode, measured_ms=round(meas, 3), predicted_ms=round(pred_ms, 3),
+            predicted_replays=max(1, int(rep["execution"]["submission"]["graph_replays"]) // max(1, dp)),
+            vertical_drilldown=drilldown,
+        )
+    unscoped_l2 = None
+    if has_l2_capture and scalar_l2 is not None and not any("l2_block" in result for result in phases.values()):
+        unscoped_l2 = {
+            "id": f"{rid}:layer_block", "run_id": rid, "model_id": mod, "rung": rung, "phase": None,
+            "acquisition_root": l2_acq_root, "capture_uri": str(r["independent_l2_capture_uri"]),
+            "boundary_kind": str(r.get("l2_boundary_kind") or "periodic_block"), "l2_layers": None,
+            "status": "missing_evidence", "reason": "independent_l2_phase_absent",
+            "measured_block_us": _capture_duration(scalar_l2) or None, "predicted_block_us": None,
+            "ape_pct": None, "pointwise_pass": None,
         }
     return {
         "run_id": rid, "model_id": mod, "rung": rung, "layers": L,
-        "split": resolved_split, "acquisition_root": acq_root,
+        "split": resolved_split, "acquisition_root": acq_root, "l3_blocked": l3_blocked,
         "topology": f"dp{dp}_tp{tp}_ep{ep}_pcp{pcp}_dcp{dcp}",
-        "capture_uri": l3_uri, "phases": phases,
+        "capture_uri": l3_uri, "phases": phases, "unscoped_l2": unscoped_l2, "l2_split": l2_split,
     }
 
 
@@ -700,7 +732,7 @@ def build_report(
     resolver = _load_split_manifest(captures_dir, split_manifest)
     l1 = evaluate_level1(captures_dir, resolver)
     d3 = json.loads((captures_dir / "cann93_model_subgraphs_and_perf.json").read_text(encoding="utf-8"))
-    run_tasks: list[tuple[dict[str, Any], str, str, str, str]] = []
+    run_tasks: list[tuple[dict[str, Any], str, str, str, str, str]] = []
     l2: dict[str, list[dict[str, Any]]] = {split: [] for split in SPLITS}
     l3: dict[str, list[dict[str, Any]]] = {split: [] for split in SPLITS}
     for mv in (d3.get("models") or {}).values():
@@ -717,7 +749,6 @@ def build_report(
                     "id": r["run_id"], "run_id": r["run_id"], "acquisition_root": acq_root,
                     "status": "blocked", "reason": reason,
                 })
-                continue
             l2_probe = {
                 "acquisition_uid": r.get("l2_acquisition_uid"),
                 "acquisition_root": r.get("l2_acquisition_root"),
@@ -726,8 +757,8 @@ def build_report(
                 "split": r.get("l2_split"),
             }
             l2_sp, l2_root = resolver.resolve(l2_probe, file_doc={}, fallback_acq="")
-            if sp in ("train", "heldout"):
-                run_tasks.append((r, sp, acq_root, l2_sp, l2_root))
+            if not reason or r.get("independent_l2_capture_uri"):
+                run_tasks.append((r, sp or "unassigned", acq_root, l2_sp, l2_root, reason))
     if workers > 1 and len(run_tasks) > 1:
         with ProcessPoolExecutor(max_workers=min(workers, len(run_tasks))) as pool:
             run_results = list(pool.map(_eval_model_run, run_tasks))
@@ -737,31 +768,33 @@ def build_report(
     fx_matches = 0
     for rr in run_results:
         sp = rr["split"]
+        if unscoped_l2 := rr["unscoped_l2"]:
+            l2[rr["l2_split"] or "unassigned"].append(unscoped_l2)
         for ptag, pv in rr["phases"].items():
+            if blk := pv.get("l2_block"):
+                l2_bucket = blk["split"] if blk["split"] in ("train", "heldout") else sp
+                l2[l2_bucket].append({
+                    **{key: value for key, value in blk.items() if key != "split"},
+                    "id": f"{rr['run_id']}:{ptag}:layer_block", "run_id": rr["run_id"],
+                    "model_id": rr["model_id"], "rung": rr["rung"], "phase": pv["phase"],
+                    "fx_post_split_subgraphs": pv["fx_post_split_subgraphs"], "predicted_replays": pv["predicted_replays"],
+                    "pointwise_pass": blk.get("pointwise_pass"),
+                })
             if pv["status"] == "blocked":
-                l3[sp].append({**pv, "id": f"{rr['run_id']}:{ptag}", "run_id": rr["run_id"],
-                               "acquisition_root": rr["acquisition_root"], "capture_uri": rr["capture_uri"]})
+                if not rr["l3_blocked"]:
+                    l3[sp].append({"phase": pv["phase"], "status": "blocked", "reason": pv["reason"],
+                                   "id": f"{rr['run_id']}:{ptag}", "run_id": rr["run_id"],
+                                   "acquisition_root": rr["acquisition_root"], "capture_uri": rr["capture_uri"]})
                 continue
-            if pv["cap_mode"] == "piecewise" and pv["fx_post_split_subgraphs"] is not None and int(pv["fx_post_split_subgraphs"]) == int(pv["predicted_replays"]):
+            if pv["cap_mode"] == "piecewise" and pv["fx_post_split_subgraphs"] is not None and int(pv["fx_post_split_subgraphs"]) == pv["predicted_replays"]:
                 fx_matches += 1
-            blk = pv["l2_block"]
-            l2_bucket = blk["split"] if blk.get("split") in ("train", "heldout") else sp
-            l2[l2_bucket].append({
-                "id": f"{rr['run_id']}:{ptag}:layer_block", "run_id": rr["run_id"],
-                "model_id": rr["model_id"], "rung": rr["rung"], "phase": pv["phase"],
-                "acquisition_root": blk.get("acquisition_root") or "", "boundary_kind": blk["boundary_kind"], "l2_layers": blk["l2_layers"],
-                "status": blk["status"], **({"reason": blk["reason"]} if "reason" in blk else {}),
-                "measured_block_us": blk["measured_block_us"], "predicted_block_us": blk["predicted_block_us"],
-                "fx_post_split_subgraphs": pv["fx_post_split_subgraphs"], "predicted_replays": pv["predicted_replays"],
-                "ape_pct": blk["ape_pct"], "ape": blk["ape"], "capture_uri": blk["capture_uri"],
-                "pointwise_pass": blk.get("pointwise_pass"),
-            })
             l3[sp].append({
                 "id": f"{rr['run_id']}:{ptag}", "run_id": rr["run_id"], "model_id": rr["model_id"], "rung": rr["rung"],
                 "acquisition_root": rr["acquisition_root"], "topology": rr["topology"], "layers": rr["layers"],
                 "phase": pv["phase"], "measured_ms": pv["measured_ms"], "predicted_ms": pv["predicted_ms"],
                 "ape_pct": pv["ape_pct"], "ape": pv["ape"], "capture_uri": rr["capture_uri"],
                 "status": pv["status"], "pointwise_pass": pv["pointwise_pass"],
+                "vertical_drilldown": pv["vertical_drilldown"],
             })
 
     acq_overlap = resolver.overlap_count()
@@ -815,8 +848,12 @@ def main(argv: list[str] | None = None) -> int:
         "fx_matches": report["disjoint_split_verification"]["exact_fx_subgraph_matches"], "wall_seconds": report["wall_seconds"],
     }, indent=2))
     levels = (report["level1_operators"], report["level2_subgraphs_and_blocks"], report["level3_model_steps"])
-    return int(any(level["heldout"]["summary"]["status"] != "pass" or level["unassigned"]["summary"]["total"]
-                   for level in levels))
+    return int(
+        any(level["heldout"]["summary"]["status"] != "pass" or level["unassigned"]["summary"]["total"]
+            for level in levels)
+        or any(row.get("vertical_drilldown", {}).get("passed") is not True
+               for row in report["level3_model_steps"]["heldout"]["records"])
+    )
 
 
 if __name__ == "__main__":

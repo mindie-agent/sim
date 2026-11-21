@@ -117,9 +117,10 @@ class _Lowering:
     def integer(self, key, default=0, minimum=0): return _int(self.get(key, default), key, minimum)
 
     def address_plan(self, size=None):
-        memory = getattr(self.dp, "memory_access", None)
-        sector = self.p.get("sector_bytes", getattr(memory, "sector_bytes", self.get("sector_bytes", DEFAULT_SECTOR_BYTES)))
-        sector = _int(sector, "sector_bytes", 1)
+        # The primitive table's DMA granule does not declare the access's DRAM sectors.
+        sector = self.p.get("sector_bytes")
+        if sector is not None:
+            sector = _int(sector, "sector_bytes", 1)
         return _address_plan(self.get, self.integer, size, sector_bytes=sector)
 
     def value(self, metric, default=None, *, mode=None, pid=None):
@@ -428,10 +429,15 @@ def _l2(b):
     bypass = b.get("cache_policy") == CACHE_POLICY_DISABLE
     work = b.integer("working_set_bytes", b.get("bytes", 0))
     pattern = b.get("pattern")
-    hits = b.state.preview_access(pattern, pattern.runs.aligned_copy_bytes())[0] if pattern and b.state else b.integer("hit_bytes")
     samples = b.get("ws_sweep_bytes_per_s", {}) if b.role == "sim" else {}
-    residency = AdmissionMemoryView({die: capacity}, ws_sweep=samples)
-    hit = 0 if bypass else min(hits, math.floor(work * residency._hit_fraction(work, knee)))
+    if bypass:
+        hit = 0
+    elif pattern is not None and b.state is not None:
+        hit, _ = b.state.preview_access(pattern, pattern.runs.aligned_copy_bytes())
+    else:
+        hits = b.integer("hit_bytes")
+        residency = AdmissionMemoryView({die: capacity}, ws_sweep=samples)
+        hit = round(hits * residency._hit_fraction(work, knee, die=die))
     b.meta.update(effective_l2_bytes=knee, cache_bypass=bypass, l2_hit_bytes=hit)
     b.work("l2_reuse", (("l2", hit, b.speed("l2_die_bytes_per_s")),))
     if samples and not bypass and work:

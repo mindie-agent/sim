@@ -626,7 +626,7 @@ def evaluate(
 
     A step declares its L1 and L2 case IDs in payload.component_case_ids.
     The inner cases are debug_cross_level rows from the same raw capture and
-    session. Their events and ranks cover the step's declared capture census.
+    session. Each level covers the step's full rank and event census.
     """
     resolved = stream_manifest(manifest) if isinstance(manifest, (str, Path)) else manifest
     split_index = validate_lineage(
@@ -729,10 +729,14 @@ def _step_census(step: Residual, candidates: Iterable[Residual]) -> tuple[str, l
         return "component_evidence_unavailable", parts
     if {part[0] for part in parts} != set(DRILLDOWN_LEVELS):
         return "component_levels_missing", parts
-    if frozenset().union(*(row.capture_events for row in verified)) != step.capture_events:
-        return "component_events_incomplete", parts
-    if frozenset().union(*(row.capture_ranks for row in verified)) != step.capture_ranks:
-        return "component_ranks_incomplete", parts
+    for level_tag in DRILLDOWN_LEVELS:
+        coverage = {rank: set() for rank in step.capture_ranks}
+        for row in verified:
+            if f"{row.level}_in_L3" == level_tag:
+                for rank in row.capture_ranks:
+                    coverage[rank].update(row.capture_events)
+        if any(events != step.capture_events for events in coverage.values()):
+            return "component_events_incomplete", parts
     return "", parts
 
 

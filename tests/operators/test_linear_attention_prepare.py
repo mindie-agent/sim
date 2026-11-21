@@ -29,7 +29,7 @@ from mindie_sim.prediction.mechanism import Geometry, PlannedRecipe
 from mindie_sim.prediction.operators.linear_attention import gdn_prepare as gdn; from mindie_sim.prediction.operators.kda import kda_prepare
 from mindie_sim.prediction.operators.causal_conv import native_causal_conv_prefill as convolution
 from mindie_sim.prediction.operators.linear_attention import build, compute_wy_chunk_work, resolve_operator_plan
-from mindie_sim.prediction.program import RecipeBook
+from mindie_sim.prediction.program import RecipeBook, RecipeContext
 from mindie_sim.prediction.operators.recurrent.recurrent import linear
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.prediction.verification import verify_operator
@@ -117,7 +117,6 @@ def layout_totals(params, cores=32):
     fix_gm = hv * (len(rows)*BT**2*FP32 + sum(rows)*(BT + (dv if dv > K else 0))*BF16)
     return dict(mte2=reads, mte3=writes-fix_gm+local, hbm=reads+writes, vector=vector,
                 fp32=len(rows)*hv*4*2*BT**3, bf16=len(rows)*2*BT**2*(hk*K+hv*(K+dv)))
-
 @pytest.mark.parametrize("output_a", (False, True))
 def test_prepare_copy_destinations_and_typed_work(output_a):
     cases = json.loads((FIXTURES / "operator_cases/gdn_prepare.json").read_text())["cases"]
@@ -288,7 +287,6 @@ def test_inherited_hardware_reference_reprices_existing_explicit_source_graph():
     before, reused, fresh = gating(raw, ops), gating(changed, ops), gating(changed)
     assert reused["duration_ms"] == fresh["duration_ms"] > before["duration_ms"]
     assert reused["serviced"] == pytest.approx(before["serviced"], rel=1e-12)
-
 @pytest.mark.parametrize("sku", (NEWEST_SKU, OLDER_SKU))
 def test_hardware_without_store_queue_keeps_gate_outputs_on_dma(sku):
     raw = source_case(recurrent_implementation="analytical")
@@ -328,7 +326,6 @@ def recurrent_ops(kind, lengths, selection=None):
         policy=AttentionPolicy(recurrent_chunk=64),
         runtime=Software.from_mapping({"kernels": {"lowerings": {"kda": selection}}}) if selection else None,
     ).ops
-
 @pytest.mark.parametrize("kind,key_products", (("kda", 2), ("gdn", 1)))
 @pytest.mark.parametrize("lengths", ((1,), (64,), (65,), (65, 127)))
 def test_prepare_and_finalize_place_ragged_products(kind, key_products, lengths):
@@ -396,7 +393,6 @@ def plan(value, cores=2, *, split=False):
     if split:
         units.update(mte2_aic=cores, mte2_aiv=2 * cores)
     return kda_prepare.build(op, Geometry(cores, units, {})), op
-
 @pytest.mark.parametrize("lengths,heads", (((64,), 2), ((8192,), 12), ((64, 128), 2)))
 def test_source_interval_work_is_conserved(lengths, heads):
     expected, headchunks = oracle(lengths, heads)
@@ -409,7 +405,6 @@ def test_source_interval_work_is_conserved(lengths, heads):
         copy = ("mte2_aic", "mte2_aiv") if split else ("mte2",)
         for name in (*copy, "mte3", "fixpipe", "mte1", "vector", "reg_special_lanes", "hbm"):
             assert built.work.resources[name] == expected[name]
-
 @pytest.mark.parametrize("lengths,heads,cores,expected_counts", [
     ((64,), 2, 2, (1,)),
     ((8192,), 12, 32, (24,) * 32),
@@ -441,7 +436,6 @@ def local_case(cores=2, *, memory=1e30):
     })
     case["machine"]["device"]["resource_units"]["mte3"] = 2 * cores
     return case
-
 @pytest.mark.parametrize("lengths,heads,cores", [
     ((64,), 2, 2), ((128,), 6, 2), ((64, 128, 64), 2, 2), ((128,), 66, 32),
 ])
@@ -473,7 +467,6 @@ def test_gate_barrier_ready_and_empty_owners_survive_compaction():
 def _wy_op(**metadata):
     return OpSpec("wy", "gdn_prefill", "prefill", 0, 0, ("r",), (), (), (), (), recipe="gdn_prefill", dtype="bf16",
                   metadata=tuple(dict({"lengths": (64,), "dk": 64, "dv": 128}, **metadata).items()))
-
 @pytest.mark.parametrize("sku", SKUS)
 def test_wy_dispatch_conserves_contractions_and_launch_boundaries(sku):
     geometry, ctx = sku_planning_context(sku, "wy")
@@ -489,7 +482,6 @@ def test_wy_dispatch_conserves_contractions_and_launch_boundaries(sku):
         assert tuple(name for name in phases if name.startswith("SyncAll")) == (
             "SyncAll.entry", "SyncAll.prepare", "SyncAll.state", "SyncAll.output")
         return
-
     score, mixed = 2 * 64**2 * 128, 2 * 64 * 128**2
     contractions = {
         "KKT_QKT": 2 * score, "offdiagonal_inverse": 2 * 2 * 32**3,
@@ -503,7 +495,6 @@ def test_wy_dispatch_conserves_contractions_and_launch_boundaries(sku):
         *contractions, "S_next")
     assert phases["delta_L0C_to_UB"].after == ("R32_to_R16_UB_to_L1",)
     assert phases["S_next"].after == ("delta_L0C_to_UB",)
-
 @pytest.mark.parametrize("lengths,dim,streamed,chunked,cube", (
     ((1,), 64, 1, 0, 0), ((65,), 128, 0, 1, 23_330_816), ((65, 1), 64, 1, 1, 23_330_816),
 ))
@@ -548,32 +539,42 @@ def test_direct_isa_rejects_synthetic_datapath_without_routes():
     _, ctx = sku_planning_context(NEWEST_SKU, "wy"); _, staged = sku_planning_context(OLDER_SKU, "wy")
     with pytest.raises(ModelingError, match="L0C to UB and UB to L1"):
         resolve_operator_plan(_wy_op(), replace(ctx, datapath=replace(ctx.datapath, usable_paths=staged.datapath.usable_paths)))
-def test_chunk32_uses_primitive_setup_and_per_chunk_sync():
+def test_chunk32_requires_exact_primitive_for_each_recurrence():
     from _support.hardware import sku_case
     from mindie_sim.primitives import UncertaintyBand, load_primitives
     sku = "Ascend950DT_9582"
     parsed = sku_case(sku)
-    unmeasured = load_primitives(sku)
-    cells = dict(unmeasured.primitives)
-    setup, sync = 100, 140
-    for pid, metric, ns in (("P12_intracore_flag", "flag_ns", setup),
-                            ("P13_crosscore_sync", "mode4_intra_block_ns", sync)):
-        band = UncertaintyBand(0, ns, ns, ns, ns, cv_pct=0, n_samples=1, bound_kind="latency_lower")
-        cells[pid] = replace(cells[pid], metrics={**cells[pid].metrics, metric: band})
-    tokens = 512
-    op = STATE.make_op({"lengths": (tokens,), "heads": 1, "key_heads": 1})
-    durations = []
-    for table in (None, unmeasured, replace(unmeasured, primitives=cells)):
+    shipped = load_primitives(sku)
+    pid, metric = "P13_crosscore_sync", "mode4_intra_block_ns"
+    cells = dict(shipped.primitives)
+    def band(ns):
+        return UncertaintyBand(0, ns, ns, ns, ns, cv_pct=0, n_samples=1, bound_kind="latency_lower")
+    mode2 = replace(cells[pid], status="calibrated", evidence_id="capture://test/sync/" + "0" * 64,
+                    metrics={"mode2_paired_ns": band(424)})
+    flag = cells["P12_intracore_flag"]
+    def run(table, tokens):
+        op = STATE.make_op({"lengths": (tokens,), "heads": 1, "key_heads": 1})
         book = RecipeBook(recipes={op.recipe: PlannedRecipe(STATE.build)})
-        execution = Execution(parsed, CostModel(parsed), recipes=book)
+        execution = Execution(parsed, CostModel(parsed), recipes=book, trace_limit=1024)
         execution.stage_contexts[0, 0] = replace(execution.stage_contexts[0, 0], primitive_table=table)
         work = IterationWork((op,), IterationPlan(()), 1, tokens, tokens, None, "prefill", "test")
         done = execution.add(work, 0, 0).completion
         execution.engine.advance(until=(done,))
-        durations.append(done.time)
-    assert durations[1] == durations[0]
-    assert durations[2] - durations[0] == pytest.approx((setup + tokens // 32 * sync) * 1e-6)
-    assert durations[2] * 1000 == pytest.approx(23.6, abs=0.1)
+        return done.time, execution.engine.trace
+    op = STATE.make_op({"lengths": (512,), "heads": 1, "key_heads": 1})
+    with pytest.raises(ModelingError, match=pid):
+        STATE.build(op, Geometry(1, {"vector": 2})).program(RecipeContext(op, {}, {}, {}, 1))
+    for table in (None, shipped, replace(shipped, primitives={**cells, pid: mode2}),
+                  replace(shipped, primitives={**cells, pid: replace(mode2, metrics={
+                      **mode2.metrics, metric: UncertaintyBand(140, bound_kind="latency_lower")})})):
+        with pytest.raises(ModelingError, match=pid):
+            run(table, 512)
+    cells[pid] = replace(mode2, metrics={**mode2.metrics, metric: band(140)})
+    duration, trace = run(replace(shipped, primitives=cells), 512)
+    waits = [row["end_ms"] - row["start_ms"] for row in trace if row["task"].endswith(":recurrence_sync")]
+    assert waits == pytest.approx([140e-6] * 16)
+    cells["P12_intracore_flag"] = replace(flag, metrics={**flag.metrics, "flag_ns": band(100)})
+    assert run(replace(shipped, primitives=cells), 512)[0] - duration == pytest.approx(100e-6)
 
 def test_replay_lowers_mixed_gdn_and_preserves_ragged_attention_per_replica(monkeypatch):
     from mindie_sim.prediction.spine import PredictionSpine
@@ -593,7 +594,6 @@ def test_replay_lowers_mixed_gdn_and_preserves_ragged_attention_per_replica(monk
         if op.family == "attention":
             seen[geometry.replica] = (geometry.requests, geometry.padded_tokens)
         return prepare(book, op, geometry)
-
     monkeypatch.setattr(RecipeBook, "prepare", record)
     result = spine.run_step(prepared)
     assert result.span_ms > 0 and any(row.family == "gdn_prepare" for row in result.operators)

@@ -292,39 +292,56 @@ class Execution(_ContextMixin, _CohortMixin, _LazySubmitMixin):
                 engine = bound
         if engine is not None:
             engine.extend(resources, pools, pool_units)
-        self._attach_engine(engine if engine is not None else self._new_engine())
+        self._attach_engine(engine if engine is not None else self._new_engine(), self.memory)
 
-    def _attach_engine(self, engine):
-        self.engine = engine
-        if self.memory is not None and not engine.bind_memory(self.memory, pools=("hbm",)):
+    def _attach_engine(self, engine, memory):
+        if memory is not None and not engine.bind_memory(memory, pools=("hbm",)):
             raise ModelingError("execution_memory_ledger_conflict")
         view = engine.admission_memory_view
         if view is None:
-            dies = self.case.machine.dies
-            capacities = {int(die.rank): int(dict(die.buffers).get("l2", 0)) for die in dies}
-            capacities.setdefault(0, capacities[int(dies[0].rank)])
-            profile = next(iter(self.stage_profiles.values()))
-            sweep = primitive_working_set_sweep(profile.primitive_table)
-            if not sweep and profile.dies[0].sku:
-                sweep = _sku_working_set_sweep(profile.dies[0].sku)
-            view = AdmissionMemoryView(capacities, memory_access=profile.datapath.memory_access,
-                                       ws_sweep=sweep)
+            view = self._build_admission_view()
             engine.attach_admission_memory_view(view)
+        self.engine, self.memory = engine, memory
         self.admission_memory_view = view
         self.allocation_versions = engine._allocation_versions
 
+    def _build_admission_view(self) -> AdmissionMemoryView:
+        from mindie_sim.primitives.loader import is_sku_compatible_with_table
+
+        dies = self.case.machine.dies
+        capacities = {int(die.rank): int(dict(die.buffers).get("l2", 0)) for die in dies}
+        access = {int(die.rank): die.memory_access for die in dies}
+        sweeps = {int(die.rank): _sku_working_set_sweep(die.sku) for die in dies if die.sku}
+        for profile in self.stage_profiles.values():
+            sweep = primitive_working_set_sweep(profile.primitive_table)
+            if sweep:
+                sweeps.update((int(die.rank), sweep) for die in profile.dies
+                              if is_sku_compatible_with_table(profile.primitive_table, die.sku))
+        first_rank = int(dies[0].rank)
+        capacities.setdefault(0, capacities[first_rank])
+        access.setdefault(0, access[first_rank])
+        sweeps.setdefault(0, sweeps.get(first_rank, {}))
+        return AdmissionMemoryView(capacities, memory_access_by_die=access, ws_sweep_by_die=sweeps)
+
     def reset_engine(self) -> None:
         """Start the next isolated price with cold memory and fresh bindings."""
+        from ..capacity import Memory
         from ..cost import CostLedger
-        self.ledger = CostLedger()
-        self.cost = _LedgerBoundCost(self.cost_model, self.ledger)
+
+        memory = None if self.memory is None else Memory(self.memory.case, self.memory.policy)
+        ledger = CostLedger()
+        cost = _LedgerBoundCost(self.cost_model, ledger)
+        engine = self._new_engine()
+        engine.ensure_state_ledger(None)
+        self._attach_engine(engine, memory)
+        self.ledger, self.cost = ledger, cost
+        self._offload_memory = None
         self.recipes_used = {}
-        self._attach_engine(self._new_engine())
-        for cache in (self._prepare_cache, self._program_cache, self._lazy_op_cache,
+        for cache in (self.streams, self.hosts, self.prepared, self.schedules,
+                      self._prepare_cache, self._program_cache, self._lazy_op_cache,
                       self._lazy_stage_id_caches, self.fragment_conductors):
             cache.clear()
         self._shared_eval_cache = None
-        self.engine.ensure_state_ledger(None)
         attach_stars_queues(self)
         self.resource_rates = ResourceRates(self.engine.resources)
         self.stage_contexts = {key: self._stage_context(key, dies)

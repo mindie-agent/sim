@@ -417,6 +417,7 @@ def test_hygiene_rejects_producer_shape_filters(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("mark", [
+    "pytest.mark.xfail",
     "pytest.mark.xfail(strict=False, raises=TimingDrift, reason='profile.json:2')",
     "pytest.mark.xfail(strict=True, reason='profile.json:2')",
     "pytest.mark.xfail(strict=True, raises=AssertionError, reason='profile.json:2')",
@@ -443,3 +444,19 @@ def test_law(value):
     checker.check_file(path, "M", "reference")
     only, = checker.findings
     assert only.code == "TO008" and f"{path}::test_law[invalid]" in only.message
+
+
+@pytest.mark.parametrize("mark", ("marks.skip", "marks.skipif", "marks.skip(reason='unavailable')"))
+@pytest.mark.parametrize("folder", ("tests", "tests/schema"))
+def test_gate_rejects_silent_parameter_marks_at_any_test_depth(tmp_path, monkeypatch, mark, folder):
+    path = f"{folder}/test_profiles.py"
+    module = "from pytest import mark as marks\n" + _body(
+        f"@pytest.mark.parametrize('value', [pytest.param(1, marks={mark})])\n"
+        "def test_law(value):\n    assert value\n")
+    root = _tree(tmp_path, {path: module})
+    monkeypatch.setattr(gate, "diff_lines", lambda *_: ([], []))
+    checker = gate.Gate(root, gate.load_manifest(root / "tests"))
+    checker.check_file(path, "M", "reference")
+    finding, = checker.findings
+    assert (finding.path, finding.code) == (path, "TO008")
+    assert mark in module.splitlines()[finding.line - 1]

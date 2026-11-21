@@ -9,9 +9,10 @@
 [Side-Effect Policy] Nominal producer controls use the same Engine in isolation;
   all actual resource service and buffer lifetimes stay on the caller's Engine.
 """
+from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from math import inf
-from dataclasses import replace
 
 from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from .matrix_cycle import periodic_matrix_cycle
@@ -242,11 +243,7 @@ def _can_compact_count(
     """Return True when a single owner's tile count meets the compaction floor."""
     step = max(_TWO_FACTOR, slots)
     eff_tail = tail + ((count - head - tail) % step) if count > head + tail else tail
-    special_count = len({
-        *range(min(head, count)),
-        *range(max(0, count - eff_tail), count),
-    })
-    steady_count = count - special_count
+    steady_count = max(0, count - head - eff_tail)
     return count > threshold and steady_count > _FOUR_TILES + _TWO_FACTOR * step
 
 
@@ -268,17 +265,26 @@ def peer_group_can_compact(
         )
         for idx, c in enumerate(counts) if c > 0
     ]
-    if not active:
-        return False
-    if len(active) > 1:
-        if len({(h, t) for _, h, t in active}) != 1:
-            return False
-        if max(c for c, _, _ in active) - min(c for c, _, _ in active) > _ONE_TILE:
-            return False
-    return all(
+    return _matching_peer_boundaries(active) and all(
         _can_compact_count(c, slots, head=h, tail=t, threshold=threshold)
         for c, h, t in active
     )
+
+
+def _matching_peer_boundaries(active):
+    counts = [count for count, _, _ in active]
+    return bool(counts) and (max(counts) - min(counts) <= _ONE_TILE
+                             and len({(head, tail) for _, head, tail in active}) == 1)
+
+
+def _stage_has_latency(stage):
+    if stage.latency:
+        return True
+    if isinstance(stage.program, KernelProgram):
+        return any(map(_stage_has_latency, stage.program.stages))
+    if isinstance(stage.program, ParallelProgram):
+        return any(_stage_has_latency(child) for program in stage.program.programs for child in program.stages)
+    return False
 
 
 def _encode_periodic_stages(stages, id_map, pool_id):
@@ -343,7 +349,7 @@ def _build_grouped_steady_program(context, by_res, max_groups, span_ms, slot_all
 def compact_periodic_pipeline(
     context, count, slots, tile_fn, *, head=_ONE_TILE, tail=_ONE_TILE,
     threshold=_DEFAULT_THRESHOLD, resident=(), peer_counts=None,
-    peer_heads=None, peer_tails=None,
+    peer_heads=None, peer_tails=None, _peer_group_verified=False,
 ):
     """Compact a periodic PipelineProgram(count, slots, tile_fn) in O(1) time.
 
@@ -351,43 +357,28 @@ def compact_periodic_pipeline(
     identical resource work. The exact period-slots recurrence on an isolated
     unit engine determines the private pipeline supply caps and peak pool
     occupancy, while all total work and buffers contend on the caller's shared
-    Engine as a coupled fluid steady-state approximation. When ``peer_counts``
-    names multiple active peers, callers must supply all peers' tail lengths
-    (``peer_tails``) so the whole group takes one uniform all-or-nothing
-    decision, and shared-resource tiles with serial wall latency retain literal
-    service.
+    Engine as a coupled fluid steady-state approximation. A peer group requires
+    a joint decision by compact_periodic_peer_group before any candidate runs.
     """
-    active_peer_count = 1
-    if peer_counts is not None:
-        active_counts = [int(c) for c in peer_counts if int(c) > 0]
-        active_peer_count = len(active_counts)
-        if active_peer_count > 1 and peer_tails is None:
-            return PipelineProgram(count, slots, tile_fn)
-        if not peer_group_can_compact(
-            peer_counts, slots, head=head, tail=tail, threshold=threshold,
+    counts = () if peer_counts is None else tuple(int(count) for count in peer_counts)
+    active_counts = [count for count in counts if count > 0]
+    shared = len(active_counts) > 1
+    if shared and not _peer_group_verified:
+        return PipelineProgram(count, slots, tile_fn)
+    if peer_counts is not None and not shared:
+        if active_counts != [count] or not peer_group_can_compact(
+            counts, slots, head=head, tail=tail, threshold=threshold,
             peer_heads=peer_heads, peer_tails=peer_tails,
         ):
             return PipelineProgram(count, slots, tile_fn)
-        if active_peer_count == 1 and active_counts[0] != count:
-            return PipelineProgram(count, slots, tile_fn)
+    if not _can_compact_count(count, slots, head=head, tail=tail, threshold=threshold):
+        return PipelineProgram(count, slots, tile_fn)
     step = max(2, slots)
-    if count > head + tail:
-        tail += (count - head - tail) % step
-    special_indices = sorted({
-        *range(min(head, count)),
-        *range(max(0, count - tail), count),
-    })
-    special_set = set(special_indices)
-    steady_count = count - len(special_set)
-    if count <= threshold or steady_count <= _FOUR_TILES + _TWO_FACTOR * step:
-        return PipelineProgram(count, slots, tile_fn)
-    steady_idx = next((i for i in range(head, count - tail) if i not in special_set), None)
-    if steady_idx is None:
-        return PipelineProgram(count, slots, tile_fn)
-
-    head_tiles = [tile_fn(i) for i in special_indices if i < steady_idx]
-    steady_stages = tile_fn(steady_idx)
-    tail_tiles = [tile_fn(i) for i in special_indices if i > steady_idx]
+    tail += (count - head - tail) % step
+    steady_count = count - head - tail
+    head_tiles = [tile_fn(i) for i in range(head)]
+    steady_stages = tile_fn(head)
+    tail_tiles = [tile_fn(i) for i in range(count - tail, count)]
 
     total_work = {}
     all_placement = {}
@@ -407,15 +398,10 @@ def compact_periodic_pipeline(
                 for k, units in lpl.items():
                     all_placement.setdefault(k, set()).update(units)
     all_placement = {k: tuple(sorted(u)) for k, u in all_placement.items() if k in total_work}
-    if active_peer_count > 1:
-        has_unplaced = any(k not in all_placement for k in total_work)
-        has_latency = any(
-            stage.latency > 0.0
-            for group in (*head_tiles, steady_stages, *tail_tiles)
-            for stage in group
-        )
-        if has_unplaced and has_latency:
-            return PipelineProgram(count, slots, tile_fn)
+    if shared and any(not units for _, units in unit_group_work) and any(
+        _stage_has_latency(stage) for group in (*head_tiles, steady_stages, *tail_tiles) for stage in group
+    ):
+        return PipelineProgram(count, slots, tile_fn)
 
     pool_units_by_phys = {}
     for s_stages in (steady_stages, *head_tiles, *tail_tiles):
@@ -473,3 +459,47 @@ def compact_periodic_pipeline(
                   placement=all_placement, coupled=True, free=slot_allocs),
         ))
     return _build_grouped_steady_program(context, by_res, max_groups, span_ms, slot_allocs)
+
+
+@dataclass(frozen=True, slots=True)
+class PeriodicPipelineSpec:
+    """One owner's periodic loop and its finite boundary tiles."""
+
+    count: int
+    slots: int
+    tile_fn: Callable[[int], Sequence[Stage]]
+    head: int = _ONE_TILE
+    tail: int = _ONE_TILE
+    threshold: int = _DEFAULT_THRESHOLD
+    resident: tuple[Allocation, ...] = ()
+
+    def literal(self) -> PipelineProgram:
+        return PipelineProgram(self.count, self.slots, self.tile_fn)
+
+
+def compact_periodic_peer_group(
+    context, specs: Iterable[PeriodicPipelineSpec], *, compactor=compact_periodic_pipeline,
+) -> tuple[KernelProgram | PipelineProgram, ...]:
+    """Compile all active peers or keep every peer's literal execution."""
+    specs = tuple(specs)
+    literal = tuple(spec.literal() for spec in specs)
+    active = tuple(spec for spec in specs if spec.count > 0)
+    boundaries = [(spec.count, spec.head, spec.tail) for spec in active]
+    if not _matching_peer_boundaries(boundaries) or not all(
+        _can_compact_count(spec.count, spec.slots, head=spec.head, tail=spec.tail, threshold=spec.threshold)
+        for spec in active
+    ):
+        return literal
+
+    counts, heads, tails = map(tuple, zip(*boundaries))
+    candidates = tuple(
+        compactor(
+            context, spec.count, spec.slots, spec.tile_fn,
+            head=spec.head, tail=spec.tail, threshold=spec.threshold, resident=spec.resident,
+            peer_counts=counts, peer_heads=heads, peer_tails=tails, _peer_group_verified=True,
+        ) if spec.count > 0 else KernelProgram(())
+        for spec in specs
+    )
+    if all(isinstance(program, KernelProgram) for program in candidates):
+        return candidates
+    return literal
