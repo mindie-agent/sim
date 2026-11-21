@@ -106,12 +106,14 @@ def _configure_sku_stages(parser: argparse.ArgumentParser) -> None:
     p2.add_argument("--outer-timeout-s", type=int, default=None)
     p2.add_argument("--live-bench", action="store_true")
     p2.add_argument("--repo-root", default=None)
+    p2.add_argument("--profiler-root", default=None)
     p2.add_argument("--coordinator-bin", default="")
     p2.add_argument("--output", "-o", default=None)
 
     p3 = stages.add_parser("validate-512-400k", help="score disjoint 2D 512..400K Anchor + Cliff + L1/L2/L3")
     p3.add_argument("--sku", required=True)
     p3.add_argument("--observations-json", default=None)
+    p3.add_argument("--capture-root", default=None)
     p3.add_argument("--train-manifest-json", default=None)
     p3.add_argument("--primitives-json", default=None)
     p3.add_argument("--plan-out", default=None)
@@ -129,6 +131,7 @@ def _configure_sku_stages(parser: argparse.ArgumentParser) -> None:
     p4.add_argument("--sku", required=True)
     p4.add_argument("--validation-report-json", default=None)
     p4.add_argument("--multilevel-manifest-json", default=None)
+    p4.add_argument("--capture-root", default=None)
     p4.add_argument("--fits-json", default=None)
     p4.add_argument("--lean-bounds-json", default=None)
     p4.add_argument("--primitives-json", default=None)
@@ -149,6 +152,7 @@ def _configure_sku_stages(parser: argparse.ArgumentParser) -> None:
     pa.add_argument("--raw-l0-json", default=None)
     pa.add_argument("--raw-fabric-json", default=None)
     pa.add_argument("--observations-json", default=None)
+    pa.add_argument("--capture-root", default=None)
     pa.add_argument("--lean-bounds-json", default=None)
     pa.add_argument("--out-dir", default=None)
     pa.add_argument("--repo-root", default=None)
@@ -323,6 +327,7 @@ def _run_sku_stage(args: argparse.Namespace) -> dict[str, Any]:
             outer_timeout_s=args.outer_timeout_s,
             live_bench=bool(args.live_bench),
             repo_root=args.repo_root,
+            profiler_root=args.profiler_root,
             coordinator_bin=args.coordinator_bin,
         )
     if stage == "validate-512-400k":
@@ -339,6 +344,8 @@ def _run_sku_stage(args: argparse.Namespace) -> dict[str, Any]:
             endpoint_alias=args.endpoint_alias,
             profiler_root=args.profiler_root,
             coordinator_bin=args.coordinator_bin,
+            capture_root=args.capture_root,
+            require_capture_files=args.capture_root is not None,
         )
     if stage == "verify-gates":
         return verify_sku_gates(
@@ -349,6 +356,7 @@ def _run_sku_stage(args: argparse.Namespace) -> dict[str, Any]:
             lean_bounds_json=args.lean_bounds_json,
             primitives_json=args.primitives_json,
             expected_cann_version=args.expected_cann_version,
+            capture_root=args.capture_root,
             repo_root=args.repo_root,
             threshold_pct=args.threshold_pct,
             run_repo_gates=not bool(args.skip_repo_gates),
@@ -377,6 +385,8 @@ def _run_sku_stage(args: argparse.Namespace) -> dict[str, Any]:
             live_profiler=bool(args.live_profiler),
             profiler_root=args.profiler_root,
             coordinator_bin=args.coordinator_bin,
+            capture_root=args.capture_root,
+            require_capture_files=args.capture_root is not None,
         )
     raise ValueError(f"unknown_sku_stage:{stage}")
 

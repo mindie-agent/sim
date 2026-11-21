@@ -1,21 +1,24 @@
-"""True level-specific L1/L2/L3 WhiteboxSpineRunner with streaming busy_union & p50 binding.
+"""True level-specific L1/L2/L3 WhiteboxSpineRunner bound to the real workload Engine.
 
 [Role] Implement ``EvaluationRunner`` for onboarding pipelines by running
   distinct single-operator (L1), bounded subgraph/layer (L2), and full body
-  (L3) evaluations through ``default_spine()`` + ``Execution`` on the real
-  ``runtime.Engine``, binding calibrated ``PrimitiveTable`` ``sim_rate_p50``
-  supplies (including shipped ``cube_only_rate`` / ``vec_alu`` / ``mte3_store``
-  metrics) directly into the evaluated ``Case``, supporting newly scaffolded
-  SKUs via ``profile_override``, honoring planned ``tokens`` /
-  ``parallel_topology`` coordinates, and computing zero-truncation exact
-  ``busy_union`` via a streaming ``WaveRecorder`` observer.
+  (L3) evaluations through ``default_spine()`` + ``Execution`` on ONE real
+  workload ``runtime.Engine``, binding ``EngineRunReceipt`` directly to THAT
+  real workload ``Engine`` and its real boundary ``Event`` handles (zero
+  synthetic second Engine), binding calibrated ``PrimitiveTable`` ``sim_rate_p50``
+  supplies, supporting newly scaffolded SKUs via ``profile_override``, honoring
+  all planned dimensions (``context_len``, ``tokens``, ``batch_size``,
+  ``query_tokens``, ``batch_x_kv_heads``, ``parallel_topology`` with ``dcp->cp``),
+  computing zero-truncation streaming ``busy_union``, and emitting canonical
+  workload ``(program, event_dag)`` digests for Lean non-inversion joining.
 [Invariants]
-  * L1 executes a single operator; L2 executes an exact requested subgraph
-    strictly smaller than L3 (failing closed if any requested ``target_op_ids``
-    are absent); L3 executes full body.
-  * Streaming ``_BusyUnionObserver`` captures EVERY executed service interval
-    and periodic skip in bounded memory with zero trace-limit truncation.
-  * Rejects any ``service_regimes`` crutch and enforces ``table.sku == sku``.
+  * ZERO dummy/second Engine: ``bind_engine_interval`` signs the actual
+    workload ``execution.engine`` UID and boundary events.
+  * L1 enforces ``target_op_id`` / ``target_family`` even for single-op graphs;
+    L2 executes a strict subgraph strictly smaller than L3; L3 executes full body.
+  * Streaming ``_BusyUnionObserver`` captures every active interval per physical
+    row in bounded memory, producing set-inclusion-sound resource lower bounds.
+  * Rejects ``service_regimes`` crutches and enforces ``table.sku == sku``.
 [Timeouts & Locks] Deterministic local Engine replay; zero locks or device
   contexts.
 [Side-Effect Policy] Zero filesystem writes or caller-mapping mutations;
@@ -33,10 +36,10 @@ from mindie_sim.observations.multilevel_gate import (
     GateCase,
     bind_engine_interval,
 )
-from mindie_sim.prediction.runtime.engine import Engine, Resource
 from mindie_sim.primitives.schema import PrimitiveTable
 from mindie_sim.schema.common import ModelingError
 
+from ._lean_and_receipts import program_dag_sha256
 from ._sku_calibration import temporary_scaffold_profile
 from .contracts import (
     DEFAULT_CLOCK_OPERATOR,
@@ -44,12 +47,14 @@ from .contracts import (
     VALID_CLOCK_OPERATORS,
 )
 
-_DEFAULT_ENGINE_START_NS = 100.0
-_ENGINE_TRACE_LIMIT = 32
+_MIN_WORKLOAD_TRACE_LIMIT = 65536
+_TRACE_PER_OP_FACTOR = 256
 _DEFAULT_AIV_PER_AIC_RATIO = 2
 _PERIODIC_BOUNDARY_REPS = 2
 _OBSERVER_COMPACT_THRESHOLD = 4096
+_MAX_DIAG_OP_IDS = 16
 _TOPO_TOKEN_RE = re.compile(r"(tp|pp|dp|ep|pcp|dcp)(\d+)")
+_INTERVAL_HAS_CLOCK_OP = hasattr(EngineInterval, "clock_operator")
 
 
 def check_no_service_regimes(payload: Any, *, path: str = "case") -> None:
@@ -89,11 +94,13 @@ def _coalesce_intervals(intervals: Sequence[tuple[float, float]]) -> list[tuple[
 
 
 class _BusyUnionObserver:
-    """Zero-truncation streaming ``Engine`` observer computing exact active ``busy_union``."""
+    """Zero-truncation streaming ``Engine`` observer computing exact ``busy_union`` & row spans."""
 
     def __init__(self) -> None:
         self._intervals: list[tuple[float, float]] = []
+        self._by_row: dict[str, list[tuple[float, float]]] = {}
         self._periodic_extra_ms = 0.0
+        self._periodic_by_row: dict[str, float] = {}
         self._slot_gen: dict[tuple[str, int], int] = {}
 
     def register_pipe(self, name: str) -> int:
@@ -121,7 +128,7 @@ class _BusyUnionObserver:
     def on_service(
         self,
         _task_id: int,
-        _physical_row: str,
+        physical_row: str,
         _owner: int,
         t0_ms: float,
         t1_ms: float,
@@ -129,9 +136,16 @@ class _BusyUnionObserver:
         *,
         scope_id: int | None = None,
     ) -> None:
+        del scope_id
         if delivered <= 0.0 or t1_ms <= t0_ms:
             return
-        self._intervals.append((float(t0_ms), float(t1_ms)))
+        span = (float(t0_ms), float(t1_ms))
+        self._intervals.append(span)
+        row_key = str(physical_row or "device")
+        bucket = self._by_row.setdefault(row_key, [])
+        bucket.append(span)
+        if len(bucket) >= _OBSERVER_COMPACT_THRESHOLD:
+            self._by_row[row_key] = _coalesce_intervals(bucket)
         if len(self._intervals) >= _OBSERVER_COMPACT_THRESHOLD:
             self._intervals = _coalesce_intervals(self._intervals)
 
@@ -159,17 +173,17 @@ class _BusyUnionObserver:
         period_ms: float,
         repeats: int,
         service_pattern: Sequence[tuple[str, float, float]],
-        _handoff_pattern: Sequence[Any],
+        handoff_pattern: Sequence[Any] = (),
         *_args: Any,
         **_kwargs: Any,
     ) -> None:
+        del handoff_pattern
         if repeats <= 0 or period_ms <= 0.0 or not service_pattern:
             return
         rel = _coalesce_intervals([(float(lo), float(hi)) for _pn, lo, hi in service_pattern])
         if not rel:
             return
-        a_ms = float(anchor_ms)
-        p_ms = float(period_ms)
+        a_ms, p_ms = float(anchor_ms), float(period_ms)
         for lo, hi in rel:
             self._intervals.append((a_ms + lo, a_ms + hi))
         if repeats >= _PERIODIC_BOUNDARY_REPS:
@@ -178,16 +192,31 @@ class _BusyUnionObserver:
                 self._intervals.append((last_base + lo, last_base + hi))
         interior = repeats - _PERIODIC_BOUNDARY_REPS
         if interior > 0:
-            self._periodic_extra_ms += float(interior) * sum(hi - lo for lo, hi in rel)
+            extra = float(interior) * sum(hi - lo for lo, hi in rel)
+            self._periodic_extra_ms += extra
+            self._periodic_by_row["periodic"] = self._periodic_by_row.get("periodic", 0.0) + extra
 
     def total_busy_ms(self) -> float:
         return union_interval_span_ms(self._intervals) + self._periodic_extra_ms
+
+    def row_busy_ns(self, *, cap_ns: int) -> tuple[int, ...]:
+        """Return sorted positive per-physical-row coalesced busy spans bounded by ``cap_ns``."""
+        spans: list[int] = []
+        for row_name in sorted(self._by_row):
+            ms = union_interval_span_ms(self._by_row[row_name]) + self._periodic_by_row.get(row_name, 0.0)
+            ns = min(cap_ns, int(round(ms * NS_PER_MS)))
+            if ns > 0:
+                spans.append(ns)
+        if not spans and cap_ns > 0:
+            spans.append(cap_ns)
+        return tuple(spans)
 
 
 def _parse_parallel_topology(topo: str) -> dict[str, int]:
     parsed: dict[str, int] = {}
     for axis, val_str in _TOPO_TOKEN_RE.findall(str(topo or "").lower()):
-        parsed[axis] = int(val_str)
+        mapped = "cp" if axis == "dcp" else axis
+        parsed[mapped] = int(val_str)
     return parsed
 
 
@@ -258,8 +287,7 @@ def _apply_calibrated_primitive_rates(case: Any, table: PrimitiveTable) -> Any:
                 compute_peaks=tuple(sorted(peaks.items())),
             )
         )
-    new_machine = replace(case.machine, dies=tuple(updated_dies))
-    return replace(case, machine=new_machine)
+    return replace(case, machine=replace(case.machine, dies=tuple(updated_dies)))
 
 
 def _select_level_ops(
@@ -272,21 +300,26 @@ def _select_level_ops(
     if level == "L3":
         return all_ops
     if level == "L1":
-        if len(all_ops) == 1:
-            return (replace(all_ops[0], deps=()),)
         target_op_id = str(payload.get("target_op_id") or "").strip()
         target_family = str(payload.get("target_family") or "").strip()
         if target_op_id:
             matches = [op for op in all_ops if op.op_id == target_op_id]
         elif target_family:
             matches = [op for op in all_ops if op.family == target_family]
+        elif len(all_ops) == 1:
+            matches = [all_ops[0]]
         else:
             raise ModelingError(f"whitebox_l1_requires_single_op_target:{case_id}")
         if not matches:
             raise ModelingError(
                 f"whitebox_l1_target_not_found:{case_id}:{target_op_id or target_family}"
             )
-        return (replace(matches[0], deps=()),)
+        chosen = matches[0]
+        if target_family and chosen.family != target_family:
+            raise ModelingError(
+                f"whitebox_l1_family_mismatch:{case_id}:expected={target_family}:got={chosen.family}"
+            )
+        return (replace(chosen, deps=()),)
 
     if level == "L2":
         target_ids = payload.get("target_op_ids")
@@ -294,8 +327,7 @@ def _select_level_ops(
         if isinstance(target_ids, Sequence) and not isinstance(target_ids, (str, bytes)) and target_ids:
             wanted = {str(x) for x in target_ids}
             chosen = [op for op in all_ops if op.op_id in wanted]
-            found = {op.op_id for op in chosen}
-            missing = sorted(wanted - found)
+            missing = sorted(wanted - {op.op_id for op in chosen})
             if missing:
                 raise ModelingError(
                     f"whitebox_l2_target_op_ids_missing:{case_id}:{','.join(missing)}"
@@ -317,24 +349,40 @@ def _select_level_ops(
     raise ModelingError(f"whitebox_level_unsupported:{level}")
 
 
-def _resolve_step_tokens(payload: Mapping[str, Any]) -> int:
+def _resolve_step_dimensions(payload: Mapping[str, Any]) -> tuple[int, int, int, int | None]:
     q_raw = payload.get("query_tokens")
     t_raw = payload.get("tokens")
     q_val = int(q_raw) if q_raw is not None and not isinstance(q_raw, bool) else None
     t_val = int(t_raw) if t_raw is not None and not isinstance(t_raw, bool) else None
     if t_val is not None and t_val > 0 and (q_val is None or q_val == 1 or str(payload.get("axis") or "") == "tokens"):
-        return t_val
-    if q_val is not None and q_val > 0:
-        return q_val
-    return 1
+        tokens = t_val
+    elif q_val is not None and q_val > 0:
+        tokens = q_val
+    else:
+        tokens = 1
+
+    ctx_raw = payload.get("context_len") if payload.get("context_len") is not None else payload.get("context")
+    context = int(ctx_raw) if ctx_raw is not None and not isinstance(ctx_raw, bool) else 0
+
+    b_raw = payload.get("batch_size") if payload.get("batch_size") is not None else payload.get("sequences")
+    batch = int(b_raw) if b_raw is not None and not isinstance(b_raw, bool) else 1
+
+    bxkv_raw = payload.get("batch_x_kv_heads")
+    if bxkv_raw is None and str(payload.get("axis") or "") == "batch_x_kv_heads":
+        bxkv_raw = payload.get("value")
+    bxkv = int(bxkv_raw) if bxkv_raw is not None and not isinstance(bxkv_raw, bool) else None
+    sequences = max(1, bxkv) if (bxkv is not None and bxkv > 0 and batch == 1) else max(1, batch)
+    return tokens, context, sequences, bxkv
 
 
-def _run_graphs_with_streaming_busy_union(
+def _run_graphs_on_real_engine(
     sim_case: Any,
     graphs: Mapping[int, tuple[Any, ...]],
     *,
+    start_event_name: str,
+    end_event_name: str,
     external_inputs: Mapping[str, float] | None,
-) -> tuple[float, float]:
+) -> tuple[Any, Any, Any, float, float, _BusyUnionObserver]:
     from mindie_sim.prediction.cohort_traffic import bind_cohort_traffic
     from mindie_sim.prediction.cost import CostLedger
     from mindie_sim.prediction.dispatch import cohorts
@@ -353,10 +401,11 @@ def _run_graphs_with_streaming_busy_union(
     external = dict(external_inputs or {})
     groups = cohorts(sim_case.runtime.parallel, sim_case.machine)
     op_count = sum(len(group) for group in expanded.values())
+    trace_limit = max(_MIN_WORKLOAD_TRACE_LIMIT, op_count * _TRACE_PER_OP_FACTOR)
     execution = Execution(
         sim_case, ctx.cost, recipes=book, bindings=ctx.bindings,
         ledger=CostLedger(), include_submission=False,
-        trace_limit=0, evaluation=ctx, accel_eager_attach=op_count >= 1,
+        trace_limit=trace_limit, evaluation=ctx, accel_eager_attach=op_count >= 1,
     )
     execution._compact_step = not execution.legacy_diagnostics
     execution.engine._compact_step = execution._compact_step
@@ -364,14 +413,18 @@ def _run_graphs_with_streaming_busy_union(
     observer = _BusyUnionObserver()
     engine.attach_wave_recorder(observer)
     engine.now = 0.0
-    inputs = {
-        r: {
-            key: engine.submit(_name(r, "input:" + key), release=max(float(val), 0.0))
-            for key, val in external.items()
-            if any(key in op.deps for op in items)
-        }
-        for r, items in expanded.items()
-    }
+    start_ev = engine.submit(start_event_name, release=0.0)
+    inputs: dict[int, dict[str, Any]] = {}
+    for r, items in expanded.items():
+        r_inputs: dict[str, Any] = {}
+        for key, val in external.items():
+            if any(key in op.deps for op in items):
+                r_inputs[key] = (
+                    start_ev
+                    if float(val) <= 0.0
+                    else engine.submit(_name(r, "input:" + key), release=float(val), after=(start_ev,))
+                )
+        inputs[r] = r_inputs
     works = {
         r: IterationWork(
             items, IterationPlan(()), sim_case.runtime.parallel.pp, 0, 0, None,
@@ -388,9 +441,10 @@ def _run_graphs_with_streaming_busy_union(
         elif selected:
             r, work = next(iter(selected.items()))
             steps[r] = execution.add(work, r, 0.0, external_inputs=inputs[r])
-    engine.advance(until=tuple(step.completion for step in steps.values()), first=False)
-    elapsed_ms = max((step.completion.time for step in steps.values()), default=0.0)
-    return float(elapsed_ms), float(observer.total_busy_ms())
+    end_ev = engine.submit(end_event_name, after=tuple(step.completion for step in steps.values()))
+    engine.advance(until=(start_ev, end_ev), first=False)
+    elapsed_ms = float(end_ev.time - start_ev.time) if (end_ev.time is not None and start_ev.time is not None) else 0.0
+    return engine, start_ev, end_ev, elapsed_ms, float(observer.total_busy_ms()), observer
 
 
 class WhiteboxSpineRunner:
@@ -456,11 +510,12 @@ class WhiteboxSpineRunner:
 
         payload = dict(case.payload)
         sim_case = self._materialize_case(case, payload)
+        tokens, context, sequences, bxkv = _resolve_step_dimensions(payload)
         step_req = StepRequest(
             phase=str(payload.get("phase") or case.cohort.phase or "decode"),  # type: ignore[arg-type]
-            tokens=_resolve_step_tokens(payload),
-            context=int(payload.get("context_len") or payload.get("context") or 0),
-            sequences=int(payload.get("batch_size") or payload.get("sequences") or 1),
+            tokens=tokens,
+            context=context,
+            sequences=sequences,
             scope="body",
         )
         spine = default_spine()
@@ -473,8 +528,12 @@ class WhiteboxSpineRunner:
         external_inputs = {"analysis_input": 0.0} if any(
             "analysis_input" in op.deps for ops in graphs.values() for op in ops
         ) else None
-        elapsed_ms, busy_ms = _run_graphs_with_streaming_busy_union(
-            sim_case, graphs, external_inputs=external_inputs
+        engine, start_ev, end_ev, elapsed_ms, busy_ms, observer = _run_graphs_on_real_engine(
+            sim_case,
+            graphs,
+            start_event_name=case.boundary.start_event,
+            end_event_name=case.boundary.end_event,
+            external_inputs=external_inputs,
         )
         elapsed_ns = int(round(elapsed_ms * NS_PER_MS))
         busy_ns = int(round(busy_ms * NS_PER_MS))
@@ -486,24 +545,43 @@ class WhiteboxSpineRunner:
         if case_clock == "busy_union" and busy_ns <= 0:
             raise ModelingError(f"whitebox_busy_union_empty:{case.case_id}")
         target_ns = busy_ns if case_clock == "busy_union" else elapsed_ns
-        eng = Engine([Resource("device", float(NS_PER_MS), "ns", "fifo")], trace_limit=_ENGINE_TRACE_LIMIT)
-        s_ev = eng.submit(case.boundary.start_event, {"device": _DEFAULT_ENGINE_START_NS})
-        e_ev = eng.submit(case.boundary.end_event, {"device": float(target_ns)}, after=(s_ev,))
-        eng.advance(until=(e_ev,))
+        row_ns = observer.row_busy_ns(cap_ns=target_ns)
+        lean_prog = {"num_resources": len(row_ns), "global_work": list(row_ns), "site_modes": []}
+        lean_dag = {"node_quantum_ns": [max(row_ns)], "edges": []}
+        prog_sha = program_dag_sha256(lean_prog, lean_dag)
+        exec_families = sorted({str(op.family) for ops in graphs.values() for op in ops})
+        exec_op_ids = [str(op.op_id) for ops in graphs.values() for op in ops][:_MAX_DIAG_OP_IDS]
+        lowered_dims: dict[str, Any] = {
+            "tokens": step_req.tokens,
+            "context": step_req.context,
+            "sequences": step_req.sequences,
+            "batch_x_kv_heads": bxkv,
+            "topk": payload.get("topk"),
+            "parallel_topology": str(payload.get("parallel_topology") or case.cohort.parallel_topology or "tp1"),
+        }
         diag: list[tuple[str, Any]] = [
             ("clock_operator", case_clock),
             ("busy_union_ns", busy_ns),
             ("elapsed_span_ns", elapsed_ns),
             ("replay_level", expected_level),
             ("op_count", sum(len(v) for v in graphs.values())),
+            ("engine_uid", str(engine.uid)),
+            ("program_dag_sha256", prog_sha),
+            ("lean_program", lean_prog),
+            ("lean_dag", lean_dag),
+            ("executed_op_families", exec_families),
+            ("executed_op_ids", exec_op_ids),
+            ("lowered_dimensions", lowered_dims),
         ]
         if self.primitive_table is not None:
             diag.append(("primitives_envelope_sha256", self.primitive_table.envelope_sha256))
-        return bind_engine_interval(
-            case, eng, s_ev, e_ev,
-            source_level=expected_level,
-            diagnostics=tuple(diag),
-        )
+        bind_kw: dict[str, Any] = {
+            "source_level": expected_level,
+            "diagnostics": tuple(diag),
+        }
+        if _INTERVAL_HAS_CLOCK_OP:
+            bind_kw["clock_operator"] = case_clock
+        return bind_engine_interval(case, engine, start_ev, end_ev, **bind_kw)
 
     def run_l1(self, case: GateCase) -> EngineInterval:
         return self._run_level(case, expected_level="L1")

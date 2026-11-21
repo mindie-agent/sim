@@ -1,0 +1,391 @@
+"""Strict multilevel manifest and Stage-3 validation report verdict engine.
+
+[Role] Evaluate ``run_multilevel_verdict`` for ``verify_sku_gates`` across both
+  the Stage-3 HMAC-verified validation report path AND the direct
+  ``multilevel_manifest_json`` replay path, enforcing the FULL authoritative
+  SKU plan (all 7 train anchors, all 8 off-grid cliffs, 2D batch/MTP/chunked
+  and multi-rank points, ABI rejections, verified raw capture bytes, strict
+  authoritative clock parity, capture-derived ``p99``, and canonical
+  ``(program, event_dag)`` digests).
+[Invariants] Never accepts an incomplete manifest (e.g. 8 heldout rows with
+  missing train anchors, multi-rank cells, ABI rejections, or missing raw
+  capture files); never falls back from ``busy_union`` to ``elapsed_span``;
+  always validates ``validation_doc["sku"] == sku`` even when a manifest is
+  also passed; never lowers the ``<= 10.0%`` release ceiling.
+[Timeouts & Locks] Deterministic in-memory & bounded file verification; zero
+  subprocesses or device contexts.
+[Side-Effect Policy] Strictly read-only over manifest, fits, and capture files.
+"""
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from dataclasses import replace
+from pathlib import Path
+from typing import Any
+
+from mindie_sim.observations.multilevel_gate import (
+    CohortKey,
+    EvaluationRunner,
+    FrozenFitManifest,
+    FrozenFitParameter,
+    GateCase,
+    Manifest,
+    Residual,
+    evaluate as evaluate_multilevel,
+    gate_decision,
+    parse_gate_case,
+    summarize_cohorts,
+    validate_lineage,
+)
+from mindie_sim.primitives.schema import PrimitiveTable
+from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import datapath_for_die
+
+from ._lean_and_receipts import validate_strict_threshold_pct, verify_stage_report
+from ._sku_calibration import materialize_sku_hardware
+from ._whitebox_runner import check_no_service_regimes
+from .contracts import (
+    PERCENT_SCALE,
+    GateCheckOutcome,
+    read_bounded_json,
+)
+
+_ENGINE_RECEIPT_PREFIX = "capture://engine-receipt/"
+_ALLOWED_OK_STATUSES = frozenset({"", "ok", "pass", "passed", "success"})
+
+
+def _parse_fits(fits_json: str | Path | None) -> FrozenFitManifest:
+    if fits_json is None:
+        return FrozenFitManifest("onboard-empty", "mindie-frozen-fits/1", ())
+    raw_fits = read_bounded_json(fits_json)
+    params = tuple(
+        FrozenFitParameter(
+            str(p["parameter_id"]),
+            tuple(str(d) for d in p.get("training_digests", ())),
+            str(p.get("source_uri") or ""),
+        )
+        for p in raw_fits.get("parameters", ())
+    )
+    edges = tuple((str(e[0]), str(e[1])) for e in raw_fits.get("lineage_edges", ()))
+    return FrozenFitManifest(
+        str(raw_fits.get("fit_id") or "onboard-fit"),
+        str(raw_fits.get("schema_version") or "mindie-frozen-fits/1"),
+        params,
+        edges,
+    )
+
+
+def _evaluate_manifest_path(
+    *,
+    sku: str,
+    validation_doc: Mapping[str, Any] | None,
+    multilevel_manifest_json: str | Path,
+    fits_json: str | Path | None,
+    runner: EvaluationRunner | None,
+    primitive_table: PrimitiveTable | None,
+    profile_override: Mapping[str, Any] | None,
+    abi_rejection_results: Sequence[Mapping[str, Any]] | None,
+    capture_root: str | Path | None,
+    capture_files: Mapping[str, str | Path] | None,
+    require_capture_files: bool,
+    cap_threshold: float,
+) -> tuple[GateCheckOutcome, list[dict[str, Any]]]:
+    from ._sealed_scorer import (
+        REQUIRED_MULTILEVEL_LEVELS,
+        ClockParityRunner,
+        _bind_active_runner,
+        _check_no_caller_predictions,
+        _norm_digest,
+        extract_measured_p99_ns,
+        measured_ns_from_row,
+        resolve_authoritative_clock_operator,
+        validate_event_ids_and_ranks,
+        validate_row_matches_plan_point,
+    )
+    from .cliff_planner import evaluate_abi_rejections, synthesize_sku_512_400k_plan
+
+    if validation_doc is not None and (
+        not verify_stage_report("sku_validation", validation_doc)
+        or not validation_doc.get("ok")
+        or str(validation_doc.get("sku") or "") != sku
+    ):
+        return (
+            GateCheckOutcome(
+                "multilevel_gate", False, "fail",
+                "conflicting_failed_unverified_or_wrong_sku_validation_report",
+            ),
+            [],
+        )
+
+    raw_manifest = read_bounded_json(multilevel_manifest_json)
+    if not isinstance(raw_manifest, Mapping) or not isinstance(raw_manifest.get("cases"), list):
+        return GateCheckOutcome("multilevel_gate", False, "fail", "multilevel_manifest_invalid"), []
+
+    hw = materialize_sku_hardware(sku, profile_override=profile_override)
+    die = hw.dies[0]
+    dp = datapath_for_die(die)
+    l2_bytes = max(1, int(dict(die.buffers).get("l2", 0)))
+    auth_plan = synthesize_sku_512_400k_plan(
+        sku=sku, core_count=int(dp.aic_count), l2_bytes=l2_bytes, profile_override=profile_override
+    ).to_dict()
+    held_plan_by_id = {str(pt["point_id"]): pt for pt in auth_plan["heldout_points"]}
+    train_plan_by_id = {str(pt["point_id"]): pt for pt in auth_plan["train_points"]}
+
+    raw_cases: list[Mapping[str, Any]] = [c for c in raw_manifest["cases"] if isinstance(c, Mapping)]
+    parsed_cases: list[GateCase] = []
+    expected_clock: dict[str, str] = {}
+    case_meta: dict[str, dict[str, Any]] = {}
+    plan_by_case: dict[str, Mapping[str, Any]] = {}
+    seen_heldout_ids: set[str] = set()
+    seen_train_ids: set[str] = set()
+    seen_captures: dict[tuple[str, frozenset[str], tuple[int, ...], str], str] = {}
+
+    for idx, row in enumerate(raw_cases):
+        cid = str(row.get("case_id") or f"manifest-{idx}")
+        _check_no_caller_predictions(row, cid)
+        check_no_service_regimes(row, path=cid)
+        row_status = str(row.get("status") or "").strip().lower()
+        if row_status not in _ALLOWED_OK_STATUSES:
+            raise ModelingError(f"observation_status_not_ok:{cid}:status={row_status}")
+        if row.get("validated") is False or row.get("qualified") is False:
+            raise ModelingError(f"observation_unvalidated_or_unqualified:{cid}")
+        clock_op = resolve_authoritative_clock_operator(row, cid)
+        raw_copy = dict(row)
+        payload = dict(raw_copy.get("payload") or {})
+        payload["clock_operator"] = clock_op
+        pid = str(row.get("point_id") or payload.get("point_id") or cid).strip()
+        plan_pt = held_plan_by_id.get(pid) or train_plan_by_id.get(pid)
+        if plan_pt is not None:
+            payload.setdefault("axis", str(plan_pt.get("axis") or ""))
+            payload.setdefault("value", int(plan_pt["value"]))
+        raw_copy["payload"] = payload
+        gc = parse_gate_case(raw_copy)
+        if gc.cohort.sku != sku:
+            return (
+                GateCheckOutcome(
+                    "multilevel_gate", False, "fail",
+                    f"multilevel_manifest_sku_mismatch:expected={sku}:got={gc.cohort.sku}",
+                ),
+                [],
+            )
+        validate_event_ids_and_ranks(gc.boundary.event_ids, gc.boundary.device_ranks, cid)
+        measured_ns_from_row(row, cid, clock_op=clock_op, parsed_measured_ns=gc.measured_ns)
+        if gc.split == "heldout":
+            if pid in seen_heldout_ids:
+                raise ModelingError(f"duplicate_heldout_point_id:{pid}")
+            seen_heldout_ids.add(pid)
+            if pid in held_plan_by_id:
+                validate_row_matches_plan_point(row, held_plan_by_id[pid], sku=sku, pid=pid)
+                plan_by_case[gc.case_id] = held_plan_by_id[pid]
+            cap_key = (
+                _norm_digest(gc.boundary.raw_sha256),
+                frozenset(gc.boundary.event_ids),
+                gc.boundary.device_ranks,
+                gc.boundary.run_uid,
+            )
+            if cap_key in seen_captures:
+                raise ModelingError(f"duplicate_heldout_physical_capture:{pid}:collides_with={seen_captures[cap_key]}")
+            seen_captures[cap_key] = pid
+        elif gc.split == "train":
+            if pid in seen_train_ids:
+                raise ModelingError(f"duplicate_train_point_id:{pid}")
+            seen_train_ids.add(pid)
+            if pid in train_plan_by_id:
+                validate_row_matches_plan_point(row, train_plan_by_id[pid], sku=sku, pid=pid)
+                plan_by_case[gc.case_id] = train_plan_by_id[pid]
+        parsed_cases.append(gc)
+        expected_clock[gc.case_id] = clock_op
+        case_meta[gc.case_id] = {
+            "point_id": pid,
+            "split": gc.split,
+            "measured_p99_ns": extract_measured_p99_ns(row),
+        }
+
+    manifest = Manifest(
+        manifest_id=str(raw_manifest.get("manifest_id") or f"manifest-{sku}"),
+        schema_version=str(raw_manifest.get("schema_version") or "mindie-multilevel-manifest/1"),
+        cases=tuple(parsed_cases),
+        lineage_edges=tuple((str(e[0]), str(e[1])) for e in raw_manifest.get("lineage_edges", ())),
+        strict_three_level_blind=True,
+    )
+    fits = _parse_fits(fits_json)
+    validate_lineage(
+        manifest, fits,
+        capture_root=capture_root, capture_files=capture_files,
+        require_capture_files=require_capture_files,
+    )
+    active_runner = _bind_active_runner(
+        runner, primitive_table=primitive_table, profile_override=profile_override
+    )
+    checked_runner = ClockParityRunner(active_runner, expected_clock, plan_by_case=plan_by_case)
+    raw_residuals = list(
+        evaluate_multilevel(
+            manifest, fits, checked_runner, target_split="all",
+            capture_root=capture_root, capture_files=capture_files,
+            require_capture_files=require_capture_files,
+        )
+    )
+    eff_abi_results = abi_rejection_results
+    if eff_abi_results is None and isinstance(raw_manifest.get("abi_rejection_results"), list):
+        eff_abi_results = list(raw_manifest["abi_rejection_results"])
+    abi_check = evaluate_abi_rejections(auth_plan["abi_rejection_points"], eff_abi_results)
+
+    heldout_res_objs: list[Residual] = []
+    heldout_dicts: list[dict[str, Any]] = []
+    scored_heldout_ids: set[str] = set()
+    scored_train_ids: set[str] = set()
+    pw_fail: list[str] = []
+    for res in raw_residuals:
+        meta = case_meta[res.case_id]
+        clk = checked_runner.engine_clocks.get(res.case_id, {})
+        scored_pred_ns = int(clk.get("scored_predicted_ns", res.predicted_ns))
+        signed_err = (scored_pred_ns - res.measured_ns) / float(res.measured_ns) if res.measured_ns > 0 else res.signed_error
+        ape = abs(signed_err)
+        adj_res = replace(
+            res,
+            predicted_ns=scored_pred_ns,
+            signed_error=signed_err,
+            absolute_percentage_error=ape,
+        )
+        if meta["split"] == "train":
+            if adj_res.status == "ok":
+                scored_train_ids.add(meta["point_id"])
+            continue
+        heldout_res_objs.append(adj_res)
+        if adj_res.status == "ok":
+            scored_heldout_ids.add(meta["point_id"])
+            if ape * PERCENT_SCALE >= cap_threshold:
+                pw_fail.append(adj_res.case_id)
+        heldout_dicts.append({
+            **adj_res.to_dict(),
+            "point_id": meta["point_id"],
+            "split": "heldout",
+            "clock_operator": clk.get("clock_operator", expected_clock[res.case_id]),
+            "measured_p99_ns": meta["measured_p99_ns"],
+            "engine_busy_union_ns": clk.get("busy_union_ns"),
+            "engine_elapsed_span_ns": clk.get("elapsed_span_ns"),
+            "program_dag_sha256": clk.get("program_dag_sha256", ""),
+            "engine_uid": clk.get("engine_uid", ""),
+        })
+
+    missing_heldout = sorted(set(held_plan_by_id) - scored_heldout_ids)
+    missing_train = sorted(set(train_plan_by_id) - scored_train_ids)
+    summaries = summarize_cohorts(heldout_res_objs, threshold_pct=cap_threshold)
+    verdict = gate_decision(summaries, required_levels=REQUIRED_MULTILEVEL_LEVELS, require_disjoint_level_roots=True)
+    missing_any = bool(missing_heldout or missing_train)
+    passed = verdict["status"] == "pass" and not pw_fail and not missing_any and bool(abi_check["ok"])
+    eff_st = (
+        "pass" if passed
+        else ("fail" if (pw_fail or not abi_check["ok"]) else ("insufficient_evidence" if missing_any else verdict["status"]))
+    )
+    return (
+        GateCheckOutcome(
+            name="multilevel_gate",
+            passed=passed,
+            status=eff_st,
+            detail=(
+                f"status={eff_st};levels={verdict['covered_levels']};missing={verdict['missing_levels']}"
+                f";missing_heldout={len(missing_heldout)};missing_train={len(missing_train)}"
+                f";abi_ok={abi_check['ok']};pointwise_failures={len(pw_fail)}"
+            ),
+            metrics=(
+                ("covered_levels", verdict["covered_levels"]),
+                ("missing_levels", verdict["missing_levels"]),
+                ("missing_plan_points", len(missing_heldout)),
+                ("missing_train_points", len(missing_train)),
+                ("abi_ok", bool(abi_check["ok"])),
+                ("overlapping_level_roots", verdict["overlapping_level_roots"]),
+                ("failed_cohorts", verdict["failed_cohorts"]),
+                ("pointwise_failures", sorted(pw_fail)),
+                ("threshold_pct", cap_threshold),
+            ),
+        ),
+        heldout_dicts,
+    )
+
+
+def run_multilevel_verdict(
+    *,
+    sku: str,
+    validation_doc: Mapping[str, Any] | None,
+    multilevel_manifest_json: str | Path | None,
+    fits_json: str | Path | None,
+    runner: EvaluationRunner | None,
+    primitive_table: PrimitiveTable | None = None,
+    profile_override: Mapping[str, Any] | None = None,
+    abi_rejection_results: Sequence[Mapping[str, Any]] | None = None,
+    capture_root: str | Path | None = None,
+    capture_files: Mapping[str, str | Path] | None = None,
+    require_capture_files: bool = True,
+    threshold_pct: float,
+) -> tuple[GateCheckOutcome, list[dict[str, Any]]]:
+    """Evaluate strict pointwise multilevel L1/L2/L3 gate verdict."""
+    from ._sealed_scorer import (
+        REQUIRED_MULTILEVEL_LEVELS,
+        STANDARD_LEVEL_BOUNDARY_KINDS,
+        validate_disjoint_lineage,
+    )
+
+    cap_threshold = validate_strict_threshold_pct(threshold_pct)
+    if multilevel_manifest_json is not None:
+        return _evaluate_manifest_path(
+            sku=sku,
+            validation_doc=validation_doc,
+            multilevel_manifest_json=multilevel_manifest_json,
+            fits_json=fits_json,
+            runner=runner,
+            primitive_table=primitive_table,
+            profile_override=profile_override,
+            abi_rejection_results=abi_rejection_results,
+            capture_root=capture_root,
+            capture_files=capture_files,
+            require_capture_files=require_capture_files,
+            cap_threshold=cap_threshold,
+        )
+
+    if validation_doc is None:
+        return GateCheckOutcome("multilevel_gate", False, "insufficient_evidence", "no validation report or multilevel manifest supplied"), []
+    if not verify_stage_report("sku_validation", validation_doc):
+        return GateCheckOutcome("multilevel_gate", False, "fail", "validation_report_hmac_unverified_or_fabricated"), []
+    if str(validation_doc.get("sku") or "") != sku:
+        return GateCheckOutcome("multilevel_gate", False, "fail", f"validation_report_sku_mismatch:expected={sku}"), []
+
+    heldout_rows = [r for r in (validation_doc.get("residuals") or ()) if str(r.get("split") or "heldout") == "heldout"]
+    missing_plan = list(validation_doc.get("missing_plan_points") or ())
+    missing_train = list(validation_doc.get("missing_train_points") or ())
+    missing_anchors = list(validation_doc.get("missing_anchors") or ())
+    missing_cliffs = list(validation_doc.get("missing_cliffs") or ())
+    abi_ok = bool((validation_doc.get("abi_rejection_check") or {}).get("ok", False))
+    if not heldout_rows:
+        return GateCheckOutcome("multilevel_gate", False, "insufficient_evidence", "validation report contains zero heldout residuals"), []
+    for row in heldout_rows:
+        rcpt = str(row.get("engine_receipt") or "")
+        if not rcpt.startswith(_ENGINE_RECEIPT_PREFIX):
+            return GateCheckOutcome("multilevel_gate", False, "fail", f"unverified_engine_receipt:{row.get('case_id')}"), heldout_rows
+    validate_disjoint_lineage(heldout_rows, require_disjoint_level_roots=True)
+    res_objs: list[Residual] = []
+    pw_fail: list[str] = []
+    for row in heldout_rows:
+        lvl = str(row.get("level") or "L1").upper()
+        c_raw = row.get("cohort") if isinstance(row.get("cohort"), Mapping) else {}
+        cohort = CohortKey(lvl, str(c_raw.get("cohort_name") or "onboarding"), str(c_raw.get("sku") or sku), str(c_raw.get("phase") or "decode"), str(c_raw.get("mode") or "eager"), str(c_raw.get("shape_regime") or "cliff"), str(c_raw.get("parallel_topology") or "tp1"))  # type: ignore[arg-type]
+        ape = float(row.get("absolute_percentage_error", 0.0))
+        if ape * PERCENT_SCALE >= cap_threshold:
+            pw_fail.append(str(row.get("case_id") or ""))
+        res_objs.append(Residual(str(row.get("case_id") or ""), lvl, cohort, str(row.get("acquisition_root") or ""), int(row.get("measured_ns") or 1), int(row.get("predicted_ns") or 1), str(row.get("engine_receipt") or ""), float(row.get("signed_error", 0.0)), ape, "ok", boundary_kind=str(row.get("boundary_kind") or STANDARD_LEVEL_BOUNDARY_KINDS.get(lvl, "device_kernel"))))
+    summaries = summarize_cohorts(res_objs, threshold_pct=cap_threshold)
+    verdict = gate_decision(summaries, required_levels=REQUIRED_MULTILEVEL_LEVELS, require_disjoint_level_roots=True)
+    missing_any = bool(missing_plan or missing_train or missing_anchors or missing_cliffs)
+    passed = bool(validation_doc.get("ok")) and abi_ok and verdict["status"] == "pass" and not pw_fail and not missing_any
+    eff_status = "pass" if passed else ("fail" if (pw_fail or not abi_ok or not validation_doc.get("ok")) else ("insufficient_evidence" if missing_any else verdict["status"]))
+    return (
+        GateCheckOutcome(
+            name="multilevel_gate", passed=passed, status=eff_status,
+            detail=f"status={eff_status};levels={verdict['covered_levels']};missing_levels={verdict['missing_levels']};missing_plan={len(missing_plan)};missing_train={len(missing_train)};pointwise_failures={len(pw_fail)};abi_ok={abi_ok}",
+            metrics=(("covered_levels", verdict["covered_levels"]), ("missing_levels", verdict["missing_levels"]), ("missing_plan_points", len(missing_plan)), ("missing_train_points", len(missing_train)), ("missing_anchors", len(missing_anchors)), ("missing_cliffs", len(missing_cliffs)), ("overlapping_level_roots", verdict["overlapping_level_roots"]), ("failed_cohorts", verdict["failed_cohorts"]), ("pointwise_failures", sorted(pw_fail)), ("abi_ok", abi_ok), ("threshold_pct", cap_threshold)),
+        ),
+        heldout_rows,
+    )
+
+
+__all__ = ["run_multilevel_verdict"]

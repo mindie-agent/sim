@@ -518,38 +518,57 @@ def probe_soc(
         }
 
     ini_parsed = parse_platform_config_ini(str(raw_probe.get("platform_config_ini") or ""))
-    smi_parsed = parse_npu_smi_topology(
-        str(raw_probe.get("npu_smi_common") or ""),
-        str(raw_probe.get("npu_smi_topo") or ""),
-    )
+    smi_common_text = str(raw_probe.get("npu_smi_common") or "")
+    smi_parsed = parse_npu_smi_topology(smi_common_text, str(raw_probe.get("npu_smi_topo") or ""))
+    source_conflicts: list[SiliconProfileConflict] = []
+
+    def _agree(field: str, candidates: tuple[tuple[str, Any], ...]) -> Any:
+        present = [(src, val) for src, val in candidates if val not in (None, "", 0)]
+        if not present:
+            return "" if field in ("soc_name", "arch_preset", "architecture") else 0
+        first_src, first_val = present[0]
+        for other_src, other_val in present[1:]:
+            if other_val != first_val:
+                source_conflicts.append(
+                    SiliconProfileConflict(
+                        field=f"{field}:{other_src}",
+                        observed=other_val,
+                        declared=first_val,
+                        reason=f"silicon_profile_conflict:source_mismatch:{field}:{other_src}={other_val}:{first_src}={first_val}",
+                    )
+                )
+        return first_val
+
     soc_name = str(
-        raw_probe.get("soc_name")
-        or raw_probe.get("aclrt_soc_name")
-        or ini_parsed.get("soc_version")
-        or ""
+        _agree(
+            "soc_name",
+            (
+                ("raw.soc_name", str(raw_probe.get("soc_name") or "").strip()),
+                ("aclrt_soc_name", str(raw_probe.get("aclrt_soc_name") or "").strip()),
+                ("platform_config_ini.soc_version", str(ini_parsed.get("soc_version") or "").strip()),
+            ),
+        )
     ).strip()
     if not soc_name:
         raise ModelingError("probe_soc_name_unresolvable")
 
-    aic = int(raw_probe.get("aic_count") or ini_parsed["aic_count"] or smi_parsed["aic_count"] or 0)
-    aiv = int(raw_probe.get("aiv_count") or ini_parsed["aiv_count"] or 0)
-    freq = int(raw_probe.get("aicore_freq_mhz") or ini_parsed["aicore_freq_mhz"] or smi_parsed["aicore_freq_mhz"] or 0)
-    hbm_bytes = int(raw_probe.get("hbm_bytes") or ini_parsed["hbm_bytes"] or smi_parsed["hbm_bytes"] or 0)
-    l2_bytes = int(raw_probe.get("l2_bytes") or ini_parsed["l2_bytes"] or 0)
-    ub_bytes = int(raw_probe.get("ub_bytes") or ini_parsed["ub_bytes"] or 0)
-    l1_bytes = int(raw_probe.get("l1_bytes") or ini_parsed["l1_bytes"] or 0)
-    l0a_bytes = int(raw_probe.get("l0a_bytes") or ini_parsed["l0a_bytes"] or 0)
-    l0b_bytes = int(raw_probe.get("l0b_bytes") or ini_parsed["l0b_bytes"] or 0)
-    l0c_bytes = int(raw_probe.get("l0c_bytes") or ini_parsed["l0c_bytes"] or 0)
-    dies_pkg = int(raw_probe.get("dies_per_package") or smi_parsed["dies_per_package"] or 1)
+    aic = int(_agree("aic_count", (("raw", int(raw_probe.get("aic_count") or 0)), ("ini", int(ini_parsed["aic_count"] or 0)), ("npu_smi", int(smi_parsed["aic_count"] or 0)))))
+    aiv = int(_agree("aiv_count", (("raw", int(raw_probe.get("aiv_count") or 0)), ("ini", int(ini_parsed["aiv_count"] or 0)))))
+    freq = int(_agree("aicore_freq_mhz", (("raw", int(raw_probe.get("aicore_freq_mhz") or 0)), ("ini", int(ini_parsed["aicore_freq_mhz"] or 0)), ("npu_smi", int(smi_parsed["aicore_freq_mhz"] or 0)))))
+    hbm_bytes = int(_agree("hbm_bytes", (("raw", int(raw_probe.get("hbm_bytes") or 0)), ("ini", int(ini_parsed["hbm_bytes"] or 0)), ("npu_smi", int(smi_parsed["hbm_bytes"] or 0)))))
+    l2_bytes = int(_agree("l2_bytes", (("raw", int(raw_probe.get("l2_bytes") or 0)), ("ini", int(ini_parsed["l2_bytes"] or 0)))))
+    ub_bytes = int(_agree("ub_bytes", (("raw", int(raw_probe.get("ub_bytes") or 0)), ("ini", int(ini_parsed["ub_bytes"] or 0)))))
+    l1_bytes = int(_agree("l1_bytes", (("raw", int(raw_probe.get("l1_bytes") or 0)), ("ini", int(ini_parsed["l1_bytes"] or 0)))))
+    l0a_bytes = int(_agree("l0a_bytes", (("raw", int(raw_probe.get("l0a_bytes") or 0)), ("ini", int(ini_parsed["l0a_bytes"] or 0)))))
+    l0b_bytes = int(_agree("l0b_bytes", (("raw", int(raw_probe.get("l0b_bytes") or 0)), ("ini", int(ini_parsed["l0b_bytes"] or 0)))))
+    l0c_bytes = int(_agree("l0c_bytes", (("raw", int(raw_probe.get("l0c_bytes") or 0)), ("ini", int(ini_parsed["l0c_bytes"] or 0)))))
+    smi_dies = int(smi_parsed["dies_per_package"]) if smi_common_text.strip() else 0
+    dies_pkg = int(_agree("dies_per_package", (("raw", int(raw_probe.get("dies_per_package") or 0)), ("npu_smi", smi_dies))) or 1)
     ranks_node = int(raw_probe.get("ranks_per_node") or smi_parsed["ranks_per_node"] or dies_pkg)
-    arch_preset, architecture = _resolve_explicit_arch(
-        str(raw_probe.get("arch_preset") or ini_parsed["arch_preset"] or ""),
-        str(raw_probe.get("architecture") or ini_parsed.get("architecture") or ""),
-    )
-    resolved_template_sku = str(
-        base_template_sku or raw_probe.get("base_template_sku") or ""
-    ).strip()
+    raw_arch_norm, _ = _resolve_explicit_arch(str(raw_probe.get("arch_preset") or ""), "")
+    arch_preset = str(_agree("arch_preset", (("raw", raw_arch_norm), ("ini", str(ini_parsed["arch_preset"] or "")))))
+    architecture = str(_agree("architecture", (("raw", str(raw_probe.get("architecture") or "").strip()), ("ini", str(ini_parsed.get("architecture") or "").strip()))))
+    resolved_template_sku = str(base_template_sku or raw_probe.get("base_template_sku") or "").strip()
     clean_alias = sanitize_public_alias(
         str(raw_probe.get("endpoint_alias") or endpoint_alias or soc_name),
         soc_name,
@@ -561,77 +580,30 @@ def probe_soc(
         else ()
     )
     sanitized_body = {
-        "schema": SOC_PROBE_SCHEMA,
-        "soc_name": soc_name,
-        "arch_preset": arch_preset,
-        "architecture": architecture,
-        "ini_sha256": ini_parsed["ini_sha256"],
-        "aic_count": aic,
-        "aiv_count": aiv,
-        "aicore_freq_mhz": freq,
-        "hbm_bytes": hbm_bytes,
-        "l2_bytes": l2_bytes,
-        "ub_bytes": ub_bytes,
-        "l1_bytes": l1_bytes,
-        "l0a_bytes": l0a_bytes,
-        "l0b_bytes": l0b_bytes,
-        "l0c_bytes": l0c_bytes,
-        "dies_per_package": dies_pkg,
-        "ranks_per_node": ranks_node,
+        "schema": SOC_PROBE_SCHEMA, "soc_name": soc_name, "arch_preset": arch_preset,
+        "architecture": architecture, "ini_sha256": ini_parsed["ini_sha256"],
+        "aic_count": aic, "aiv_count": aiv, "aicore_freq_mhz": freq,
+        "hbm_bytes": hbm_bytes, "l2_bytes": l2_bytes, "ub_bytes": ub_bytes,
+        "l1_bytes": l1_bytes, "l0a_bytes": l0a_bytes, "l0b_bytes": l0b_bytes, "l0c_bytes": l0c_bytes,
+        "dies_per_package": dies_pkg, "ranks_per_node": ranks_node,
         "cann_version": str(raw_probe.get("cann_version") or "unknown"),
-        "endpoint_alias": clean_alias,
-        "fabric_channels": {k: v for k, v in fabric_channels},
+        "endpoint_alias": clean_alias, "fabric_channels": {k: v for k, v in fabric_channels},
     }
     capture_uri, probe_sha256 = build_capture_uri(
         clean_alias, campaign_id, canonical_json_bytes(sanitized_body)
     )
     probe = SocProbeRecord(
-        soc_name=soc_name,
-        arch_preset=arch_preset,
-        architecture=architecture,
-        aic_count=aic,
-        aiv_count=aiv,
-        aicore_freq_mhz=freq,
-        hbm_bytes=hbm_bytes,
-        l2_bytes=l2_bytes,
-        ub_bytes=ub_bytes,
-        l1_bytes=l1_bytes,
-        l0a_bytes=l0a_bytes,
-        l0b_bytes=l0b_bytes,
-        l0c_bytes=l0c_bytes,
-        dies_per_package=dies_pkg,
-        ranks_per_node=ranks_node,
+        soc_name=soc_name, arch_preset=arch_preset, architecture=architecture,
+        aic_count=aic, aiv_count=aiv, aicore_freq_mhz=freq,
+        hbm_bytes=hbm_bytes, l2_bytes=l2_bytes, ub_bytes=ub_bytes,
+        l1_bytes=l1_bytes, l0a_bytes=l0a_bytes, l0b_bytes=l0b_bytes, l0c_bytes=l0c_bytes,
+        dies_per_package=dies_pkg, ranks_per_node=ranks_node,
         cann_version=str(raw_probe.get("cann_version") or "unknown"),
-        endpoint_alias=clean_alias,
-        capture_uri=capture_uri,
-        probe_sha256=probe_sha256,
-        fabric_channels=fabric_channels,
-        topology_preset=str(raw_probe.get("topology_preset") or ""),
+        endpoint_alias=clean_alias, capture_uri=capture_uri, probe_sha256=probe_sha256,
+        fabric_channels=fabric_channels, topology_preset=str(raw_probe.get("topology_preset") or ""),
     )
 
     all_profiles = read_bounded_json(profiles_path) if profiles_path is not None else ascend_profiles()
-    source_conflicts: list[SiliconProfileConflict] = []
-    ini_soc = str(ini_parsed.get("soc_version") or "").strip()
-    if ini_soc and ini_soc != soc_name:
-        source_conflicts.append(
-            SiliconProfileConflict(
-                field="platform_config_ini.soc_version",
-                observed=ini_soc,
-                declared=soc_name,
-                reason=f"silicon_profile_conflict:ini_soc_mismatch:ini={ini_soc}:probe={soc_name}",
-            )
-        )
-    ini_aic = int(ini_parsed.get("aic_count") or 0)
-    smi_aic = int(smi_parsed.get("aic_count") or 0)
-    if ini_aic > 0 and smi_aic > 0 and ini_aic != smi_aic:
-        source_conflicts.append(
-            SiliconProfileConflict(
-                field="npu_smi.aic_count",
-                observed=smi_aic,
-                declared=ini_aic,
-                reason=f"silicon_profile_conflict:smi_ini_aic_mismatch:smi={smi_aic}:ini={ini_aic}",
-            )
-        )
     probe_cann_raw = str(raw_probe.get("cann_version") or "").strip()
     probe_cann = "" if probe_cann_raw.lower() in {"", "unknown", "unmeasured"} else probe_cann_raw
     if soc_name in all_profiles:

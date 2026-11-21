@@ -37,6 +37,16 @@ from .schema import (
     compute_envelope_sha256,
     parse_primitive_table,
 )
+from .sealer import (
+    SKU_DEFAULT_FILES,
+    build_primitive_table_payload,
+    build_primitive_table_with_diagnostics,
+    canonical_capture_bytes,
+    sanitize_record_alias,
+    summarize_samples,
+    summarize_samples_with_reason,
+    update_manifest,
+)
 
 __all__ = [
     "BYTES_PER_S_TO_MS",
@@ -46,6 +56,7 @@ __all__ = [
     "MAX_CALIBRATED_CV_PCT",
     "PRIMITIVE_IDS",
     "PRIMITIVE_SCHEMA_VERSION",
+    "SKU_DEFAULT_FILES",
     "BoundKind",
     "CellStatus",
     "RateRole",
@@ -56,6 +67,9 @@ __all__ = [
     "PrimitiveCell",
     "PrimitiveTable",
     "PrimitiveLoweringResult",
+    "build_primitive_table_payload",
+    "build_primitive_table_with_diagnostics",
+    "canonical_capture_bytes",
     "compute_envelope_sha256",
     "parse_primitive_table",
     "default_primitives_dir",
@@ -64,5 +78,9 @@ __all__ = [
     "resolve_primitive_rate",
     "frame_wire_bytes",
     "lower_primitive",
+    "sanitize_record_alias",
     "submit_lowered_primitive",
+    "summarize_samples",
+    "summarize_samples_with_reason",
+    "update_manifest",
 ]

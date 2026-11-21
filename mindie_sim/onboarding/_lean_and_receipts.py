@@ -1,12 +1,14 @@
 """Lean 4 OptimalityCertificate non-inversion, stage report HMACs, and receipt sealing.
 
 [Role] Enforce strict ``<= 10.0%`` release threshold ceilings, process-bound
-  HMAC sealing/verification for stage reports (blocking fabricated JSON dicts
-  in ``verify_sku_gates`` / ``certify_operator``), case-joined Lean 4
-  ``OptimalityCertificate`` non-inversion checks (closing witness-free ``L=0``
-  and unrelated-case bypasses), and SHA-256 ``OnboardingReceipt`` sealing.
+  HMAC sealing/verification for stage reports, case-joined & ``(program, dag)``-
+  joined Lean 4 ``OptimalityCertificate`` non-inversion checks requiring
+  capture-derived ``p99`` before certification, and SHA-256
+  ``OnboardingReceipt`` sealing distinguishing ``silicon_certified`` (live
+  verified acquisition) vs ``offline_reverify`` (retained offline evidence).
 [Invariants] Thresholds ``> 10.0%`` fail closed unconditionally. Every Lean
-  witness MUST match a real scored case's ``t_sim_ns``, obey
+  witness MUST match a real scored case's ``t_sim_ns``, capture-derived
+  ``measured_p99_ns``, AND canonical ``(program, event_dag)`` digest, obey
   ``0 < L*_Lean <= min(T_sim, T_silicon_p99)``, and pass
   ``check_optimality_certificate``.
 [Timeouts & Locks] Pure in-memory validation and SHA-256/HMAC hashing; zero
@@ -39,6 +41,7 @@ from mindie_sim.schema.common import ModelingError
 from .contracts import (
     DEFAULT_HELDOUT_APE_THRESHOLD_PCT,
     OPERATOR_ONBOARDING_RECEIPT_SCHEMA,
+    SHORT_DIGEST_LEN,
     SKU_ONBOARDING_RECEIPT_SCHEMA,
     GateCheckOutcome,
     LeanBoundCheckRow,
@@ -58,6 +61,14 @@ _MAX_MISSING_CASES_IN_MSG = 8
 _KEY_FILE_MODE = 0o600
 _MIN_DISTINCT_CASES_FOR_REUSE_CHECK = 2
 _TIMING_TRIPLE_LEN = 3
+_TIMING_QUAD_LEN = 4
+
+
+def program_dag_sha256(program: Mapping[str, Any], dag: Mapping[str, Any]) -> str:
+    """Compute canonical SHA-256 binding a scored execution to its ``(program, event_dag)``."""
+    return hashlib.sha256(
+        canonical_json_bytes({"program": dict(program), "dag": dict(dag)})
+    ).hexdigest()
 
 
 @contextmanager
@@ -179,9 +190,14 @@ def check_lean_non_inversion(
     *,
     require_non_empty: bool = True,
     verify_certificates: bool = True,
-    expected_case_timings: Mapping[str, tuple[int, int] | tuple[int, int, int | None]] | None = None,
+    require_captured_p99: bool = True,
+    require_program_dag_join: bool = True,
+    expected_case_timings: Mapping[
+        str,
+        tuple[int, int] | tuple[int, int, int | None] | tuple[int, int, int | None, str | None],
+    ] | None = None,
 ) -> tuple[bool, tuple[LeanBoundCheckRow, ...], tuple[str, ...]]:
-    """Enforce ``0 < L*_Lean <= min(T_sim, T_silicon_p99)`` joined 1:1 to scored cases."""
+    """Enforce ``0 < L*_Lean <= min(T_sim, T_silicon_p99)`` joined to ``(program, dag)`` & p99."""
     if not rows:
         if require_non_empty:
             return False, (), ("lean_bounds_missing",)
@@ -210,6 +226,7 @@ def check_lean_non_inversion(
         t_p99 = int(round(float(t_p99_raw)))
         cert_checked = False
         cert_valid = l_star > 0 and t_sim > 0 and t_p99 > 0
+        witness_prog_dag_sha = ""
         try:
             witness = _parse_certificate_witness(row)
         except (ModelingError, KeyError, TypeError, ValueError) as exc:
@@ -220,6 +237,7 @@ def check_lean_non_inversion(
             cert_checked = True
             prog, dag, cert = witness
             ok_witness = check_optimality_certificate(prog, dag, cert) and cert.l_star_lean_ns == l_star
+            witness_prog_dag_sha = program_dag_sha256(row["program"], row["dag"])
             cert_digests.add(
                 hashlib.sha256(
                     canonical_json_bytes({"program": row.get("program"), "dag": row.get("dag"), "certificate": row.get("certificate")})
@@ -244,12 +262,20 @@ def check_lean_non_inversion(
                     if len(timing_entry) >= _TIMING_TRIPLE_LEN and timing_entry[2] is not None
                     else None
                 )
+                exp_prog_sha = (
+                    str(timing_entry[3] or "").strip().lower()
+                    if len(timing_entry) >= _TIMING_QUAD_LEN
+                    else ""
+                )
                 if t_sim != exp_sim_ns:
                     cert_valid = False
                     violations.append(
                         f"lean_witness_t_sim_mismatch:{cid}:witness={t_sim}:scored={exp_sim_ns}"
                     )
-                if exp_p99_ns is not None and t_p99 != exp_p99_ns:
+                if require_captured_p99 and (exp_p99_ns is None or exp_p99_ns <= 0):
+                    cert_valid = False
+                    violations.append(f"lean_captured_p99_missing:{cid}")
+                elif exp_p99_ns is not None and t_p99 != exp_p99_ns:
                     cert_valid = False
                     violations.append(
                         f"lean_witness_p99_mismatch:{cid}:witness={t_p99}:captured={exp_p99_ns}"
@@ -259,6 +285,17 @@ def check_lean_non_inversion(
                     violations.append(
                         f"lean_witness_p99_below_measured:{cid}:p99={t_p99}:measured={exp_meas_ns}"
                     )
+                if require_program_dag_join:
+                    if not exp_prog_sha:
+                        cert_valid = False
+                        violations.append(f"lean_scored_program_dag_digest_missing:{cid}")
+                    elif not witness_prog_dag_sha or witness_prog_dag_sha != exp_prog_sha:
+                        cert_valid = False
+                        violations.append(
+                            f"lean_witness_program_dag_mismatch:{cid}"
+                            f":witness={witness_prog_dag_sha[:SHORT_DIGEST_LEN] or 'missing'}"
+                            f":scored={exp_prog_sha[:SHORT_DIGEST_LEN]}"
+                        )
         sim_inv = l_star > t_sim
         sil_inv = l_star > t_p99
         if sim_inv:
@@ -304,6 +341,7 @@ def seal_onboarding_receipt(
     gates: Sequence[GateCheckOutcome],
     artifacts: Mapping[str, str],
     diagnosis_report: Mapping[str, Any] | None = None,
+    acquisition_mode: Literal["live_silicon", "offline_reverify"] = "offline_reverify",
 ) -> OnboardingReceipt:
     """Build, sanitize, and SHA-256-seal an ``OnboardingReceipt``."""
     schema = (
@@ -313,7 +351,11 @@ def seal_onboarding_receipt(
     )
     gate_tuple = tuple(gates)
     all_passed = bool(gate_tuple) and all(g.passed for g in gate_tuple)
-    status: Literal["certified", "failed"] = "certified" if all_passed else "failed"
+    status: Literal["silicon_certified", "offline_reverify", "failed"] = (
+        ("silicon_certified" if acquisition_mode == "live_silicon" else "offline_reverify")
+        if all_passed
+        else "failed"
+    )
     sorted_artifacts = tuple(sorted((str(k), str(v)) for k, v in artifacts.items()))
     created_utc = utc_now_iso()
     draft = {
@@ -322,6 +364,7 @@ def seal_onboarding_receipt(
         "target_id": str(target_id),
         "sku": str(sku),
         "status": status,
+        "acquisition_mode": acquisition_mode,
         "ok": all_passed,
         "created_utc": created_utc,
         "gates": [gate.to_dict() for gate in gate_tuple],
@@ -342,11 +385,13 @@ def seal_onboarding_receipt(
         artifacts=sorted_artifacts,
         diagnosis_report=diagnosis_report,
         receipt_sha256=digest,
+        acquisition_mode=acquisition_mode,
     )
 
 
 __all__ = [
     "check_lean_non_inversion",
+    "program_dag_sha256",
     "seal_onboarding_receipt",
     "sign_stage_report",
     "use_stage_key_file",

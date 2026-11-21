@@ -1,25 +1,30 @@
-"""Bounded repository gate and tail-cluster diagnosis subprocess runners.
+"""Bounded repository gate, HostQueue lease, canonical sealer, and live L0 runners.
 
 [Role] Execute ``check_arch_governance.py``, ``check_test_orthogonality.py``,
-  ``check_template_provenance.py``, and ``diagnose_tail_cluster.py`` in
-  bounded, windowless subprocesses and convert their outputs into typed
-  ``GateCheckOutcome`` / diagnosis payloads.
-[Invariants] Every subprocess enforces an explicit timeout, propagates
-  ``TimeoutError`` before ``OSError``, uses windowless spawn flags on Windows,
-  and cleans up temporary residual files unconditionally. Missing gate scripts
-  fail closed rather than silently passing.
-[Timeouts & Locks] Synchronous bounded subprocesses (default 120s); no locks.
-[Side-Effect Policy] Read-only over repository sources; writes only explicit
-  caller-requested diagnosis output paths and ephemeral temp files cleaned on
-  exit.
+  ``check_template_provenance.py``, ``diagnose_tail_cluster.py``, live
+  ``tools/bench_l0_primitives.py`` (supporting newly scaffolded SKU profiles
+  via ``--profile-json``), and ``mindie-coordinator`` ``HostQueue`` leases in
+  bounded windowless subprocesses; load the single canonical installed sealer
+  ``mindie_sim.primitives.sealer`` cleanly inside wheels without ``tools/``.
+[Invariants]
+  * Every subprocess enforces explicit timeout, propagates ``TimeoutError``
+    before ``OSError``, uses windowless spawn flags on Windows, and cleans up
+    temp files unconditionally.
+  * ``acquire_coordinator_host_queue_lease`` verifies grant state, positive
+    integer ``fence_token > 0``, exact granted device count == ``npu_count``,
+    and ``ttl_seconds >= min_subprocess_timeout_s + cleanup_grace_s``; release
+    failures never silently disappear—they attach ``receipt_unconfirmed=True``
+    and ``receipt_warning`` onto the lease record (Principle 14).
+[Timeouts & Locks] Synchronous bounded subprocesses (default 120s); no local
+  locks.
+[Side-Effect Policy] Read-only over repo sources; writes only explicit
+  caller-requested diagnosis outputs and ephemeral temp files cleaned on exit.
 """
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
-import importlib.util
 import json
-import os
 from pathlib import Path
 import re
 import shutil
@@ -28,9 +33,12 @@ import sys
 import tempfile
 from typing import Any
 
+from mindie_sim.primitives import sealer as _canonical_sealer
 from mindie_sim.schema.common import ModelingError
 
+from ._profiler_dispatch import normalize_profiler_records, run_profiler_bench_subprocess
 from .contracts import (
+    DEFAULT_CLEANUP_GRACE_S,
     DEFAULT_GATE_SUBPROCESS_TIMEOUT_S,
     DEFAULT_HELDOUT_APE_THRESHOLD_PCT,
     GateCheckOutcome,
@@ -43,7 +51,8 @@ _DIAGNOSE_ESCALATED_EXIT = 1
 _PREVIEW_LINES = 8
 _COORDINATOR_LEASE_RPC_TIMEOUT_S = 45
 _DEFAULT_LEASE_TTL_S = 600
-_CANONICAL_SEALER_CACHE: dict[str, Any] = {}
+_VALID_LEASE_OUTCOMES = frozenset({"", "success", "ok"})
+_VALID_LEASE_STATUSES = frozenset({"", "ready", "granted", "acquired", "active", "ok"})
 
 
 def resolve_repo_root(repo_root: str | Path | None = None) -> Path:
@@ -100,12 +109,7 @@ def run_arch_governance_gate(
     root = resolve_repo_root(repo_root)
     script = root / "scripts" / "check_arch_governance.py"
     if not script.is_file():
-        return GateCheckOutcome(
-            name="arch_governance",
-            passed=False,
-            status="script_missing",
-            detail="scripts/check_arch_governance.py not found under repo root",
-        )
+        return GateCheckOutcome("arch_governance", False, "script_missing", "scripts/check_arch_governance.py not found under repo root")
     cli_args = ["--root", str(root)]
     if strict:
         cli_args.append("--strict")
@@ -120,10 +124,7 @@ def run_arch_governance_gate(
     lines = [line for line in combined.splitlines() if line.strip()]
     detail = "; ".join(lines[:_PREVIEW_LINES]) if not passed else "0 violations"
     return GateCheckOutcome(
-        name="arch_governance",
-        passed=passed,
-        status="pass" if passed else "fail",
-        detail=detail,
+        name="arch_governance", passed=passed, status="pass" if passed else "fail", detail=detail,
         metrics=(("violations", count), ("strict", strict), ("returncode", done.returncode)),
     )
 
@@ -139,12 +140,7 @@ def run_test_orthogonality_gate(
     root = resolve_repo_root(repo_root)
     script = root / "scripts" / "check_test_orthogonality.py"
     if not script.is_file():
-        return GateCheckOutcome(
-            name="test_orthogonality",
-            passed=False,
-            status="script_missing",
-            detail="scripts/check_test_orthogonality.py not found under repo root",
-        )
+        return GateCheckOutcome("test_orthogonality", False, "script_missing", "scripts/check_test_orthogonality.py not found under repo root")
     cli_args = ["--root", str(root), "--format", "json"]
     if base is not None:
         cli_args.extend(["--base", str(base)])
@@ -156,36 +152,22 @@ def run_test_orthogonality_gate(
         cli_args.extend(["--base", "HEAD"])
         mode = "--base HEAD"
     done = _run_python_script(script, cli_args, cwd=root, timeout_s=timeout_s)
-    fail_count = 0 if done.returncode == 0 else 1
-    warn_count = 0
-    detail = "0 findings"
+    fail_count, warn_count, detail = (0 if done.returncode == 0 else 1), 0, "0 findings"
     try:
         parsed = json.loads(done.stdout)
         findings = parsed.get("findings") or []
         fails = [f for f in findings if f.get("severity", "fail") == "fail"]
         warns = [f for f in findings if f.get("severity", "fail") != "fail"]
-        fail_count = len(fails)
-        warn_count = len(warns)
+        fail_count, warn_count = len(fails), len(warns)
         if fails:
-            detail = "; ".join(
-                f"{f.get('path')}:{f.get('code')}:{f.get('message')}"
-                for f in fails[:_PREVIEW_LINES]
-            )
+            detail = "; ".join(f"{f.get('path')}:{f.get('code')}:{f.get('message')}" for f in fails[:_PREVIEW_LINES])
     except ValueError:
         if done.returncode != 0:
             detail = (done.stderr or done.stdout or "orthogonality_gate_error").strip()
     passed = done.returncode == 0 and fail_count == 0
     return GateCheckOutcome(
-        name="test_orthogonality",
-        passed=passed,
-        status="pass" if passed else "fail",
-        detail=detail,
-        metrics=(
-            ("findings", fail_count),
-            ("warnings", warn_count),
-            ("mode", mode),
-            ("returncode", done.returncode),
-        ),
+        name="test_orthogonality", passed=passed, status="pass" if passed else "fail", detail=detail,
+        metrics=(("findings", fail_count), ("warnings", warn_count), ("mode", mode), ("returncode", done.returncode)),
     )
 
 
@@ -201,12 +183,7 @@ def run_template_provenance_gate(
     root = resolve_repo_root(repo_root)
     script = root / "scripts" / "check_template_provenance.py"
     if not script.is_file():
-        return GateCheckOutcome(
-            name="template_provenance",
-            passed=False,
-            status="script_missing",
-            detail="scripts/check_template_provenance.py not found under repo root",
-        )
+        return GateCheckOutcome("template_provenance", False, "script_missing", "scripts/check_template_provenance.py not found under repo root")
     cli_args = ["--root", str(root), "--format", "json"]
     if not runtime:
         cli_args.append("--no-runtime")
@@ -215,32 +192,18 @@ def run_template_provenance_gate(
     for name, path_val in sorted((repo_map or {}).items()):
         cli_args.extend(["--repo-map", f"{name}={Path(path_val).resolve()}"])
     done = _run_python_script(script, cli_args, cwd=root, timeout_s=timeout_s)
-    checked = 0
-    violations: list[dict[str, Any]] = []
+    checked, violations = 0, []
     try:
         parsed = json.loads(done.stdout)
         checked = int(parsed.get("checked", 0))
         violations = list(parsed.get("violations") or [])
     except ValueError:
         if done.returncode != 0:
-            return GateCheckOutcome(
-                name="template_provenance",
-                passed=False,
-                status="fail",
-                detail=(done.stderr or done.stdout or "template_provenance_error").strip(),
-                metrics=(("returncode", done.returncode),),
-            )
+            return GateCheckOutcome("template_provenance", False, "fail", (done.stderr or done.stdout or "template_provenance_error").strip(), (("returncode", done.returncode),))
     passed = done.returncode == 0 and not violations
-    detail = (
-        f"0 violations ({checked} refs)"
-        if passed
-        else "; ".join(f"{v.get('location')}:{v.get('reason')}" for v in violations[:_PREVIEW_LINES])
-    )
+    detail = f"0 violations ({checked} refs)" if passed else "; ".join(f"{v.get('location')}:{v.get('reason')}" for v in violations[:_PREVIEW_LINES])
     return GateCheckOutcome(
-        name="template_provenance",
-        passed=passed,
-        status="pass" if passed else "fail",
-        detail=detail,
+        name="template_provenance", passed=passed, status="pass" if passed else "fail", detail=detail,
         metrics=(("checked", checked), ("violations", len(violations))),
     )
 
@@ -258,27 +221,18 @@ def run_tail_cluster_diagnosis(
     """Execute ``scripts/diagnose_tail_cluster.py`` over failing residuals."""
     pkg_root = resolve_repo_root(None)
     candidate_root = resolve_repo_root(repo_root)
-    has_full_pkg = (
-        candidate_root / "mindie_sim" / "observations" / "multilevel_gate.py"
-    ).is_file()
-    exec_root = candidate_root if has_full_pkg else pkg_root
+    exec_root = candidate_root if (candidate_root / "mindie_sim" / "observations" / "multilevel_gate.py").is_file() else pkg_root
     script = exec_root / "scripts" / "diagnose_tail_cluster.py"
     if not script.is_file():
         return {
-            "schema": "mindie-sim.tail-cluster-diagnosis/1",
-            "status": "diagnostic_script_unavailable",
-            "cluster_count": 0,
-            "clusters": [],
-            "detail": "scripts/diagnose_tail_cluster.py not found under repo root",
+            "schema": "mindie-sim.tail-cluster-diagnosis/1", "status": "diagnostic_script_unavailable",
+            "cluster_count": 0, "clusters": [], "detail": "scripts/diagnose_tail_cluster.py not found under repo root",
         }
     with tempfile.TemporaryDirectory(prefix="msim-diag-") as tmp_dir:
         tmp = Path(tmp_dir)
         res_file = tmp / "residuals.json"
         write_atomic_json(res_file, {"residuals": list(residuals)})
-        cli_args = [
-            "--residuals", str(res_file),
-            "--threshold-pct", str(float(threshold_pct)),
-        ]
+        cli_args = ["--residuals", str(res_file), "--threshold-pct", str(float(threshold_pct))]
         if lineage:
             lin_file = tmp / "lineage.json"
             write_atomic_json(lin_file, {"lineage": list(lineage)})
@@ -289,9 +243,7 @@ def run_tail_cluster_diagnosis(
             cli_args.extend(["--engine-receipts", str(rcpt_file)])
         done = _run_python_script(script, cli_args, cwd=exec_root, timeout_s=timeout_s)
     if done.returncode not in (0, _DIAGNOSE_ESCALATED_EXIT) or not (done.stdout or "").strip():
-        raise ModelingError(
-            f"diagnose_tail_cluster_failed:rc={done.returncode}:{(done.stderr or '').strip()}"
-        )
+        raise ModelingError(f"diagnose_tail_cluster_failed:rc={done.returncode}:{(done.stderr or '').strip()}")
     try:
         report = json.loads(done.stdout)
     except ValueError as exc:
@@ -315,6 +267,7 @@ def run_live_l0_bench_subprocess(
     device_id: int = 0,
     visible_devices: Sequence[int] = (),
     dies_per_package: int = 1,
+    profile_override: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Execute ``tools/bench_l0_primitives.py`` as a bounded live subprocess bound to granted devices."""
     if not endpoint_alias.strip():
@@ -325,34 +278,28 @@ def run_live_l0_bench_subprocess(
         raise ModelingError(f"bench_l0_primitives_not_found:{script}")
     granted = [int(d) for d in visible_devices]
     dies_pkg = max(1, int(dies_per_package))
-    if granted:
-        eff_npu_id, eff_chip_id = divmod(granted[0], dies_pkg)
-    else:
-        eff_npu_id, eff_chip_id = int(npu_id), int(chip_id)
+    eff_npu_id, eff_chip_id = divmod(granted[0], dies_pkg) if granted else (int(npu_id), int(chip_id))
     with tempfile.TemporaryDirectory(prefix="msim-l0-bench-") as tmp_dir:
         tmp = Path(tmp_dir)
-        out_table = tmp / "l0_table.json"
-        out_manifest = tmp / "manifest.json"
+        out_table, out_manifest = tmp / "l0_table.json", tmp / "manifest.json"
         cli_args = [
-            "--endpoint-alias", endpoint_alias,
-            "--sku", sku,
-            "--campaign-id", campaign_id,
-            "--cann-version", cann_version,
-            "--npu-id", str(eff_npu_id),
-            "--chip-id", str(eff_chip_id),
+            "--endpoint-alias", endpoint_alias, "--sku", sku,
+            "--campaign-id", campaign_id, "--cann-version", cann_version,
+            "--npu-id", str(eff_npu_id), "--chip-id", str(eff_chip_id),
             "--device-id", str(int(device_id)),
-            "--out", str(out_table),
-            "--manifest", str(out_manifest),
+            "--out", str(out_table), "--manifest", str(out_manifest),
         ]
+        if profile_override is not None:
+            prof_file = tmp / "scaffold_profile.json"
+            write_atomic_json(prof_file, {sku: dict(profile_override)})
+            cli_args.extend(["--profile-json", str(prof_file)])
         if granted:
             cli_args.extend(["--visible-devices", ",".join(str(d) for d in granted)])
         if container:
             cli_args.extend(["--container", container])
         done = _run_python_script(script, cli_args, cwd=root, timeout_s=timeout_s)
         if done.returncode != 0:
-            raise ModelingError(
-                f"bench_l0_primitives_failed:rc={done.returncode}:{(done.stderr or '').strip()}"
-            )
+            raise ModelingError(f"bench_l0_primitives_failed:rc={done.returncode}:{(done.stderr or '').strip()}")
         cap_file = tmp / "captures" / f"{out_table.stem}.capture.json"
         if not cap_file.is_file():
             raise ModelingError("bench_l0_primitives_missing_capture_payload")
@@ -367,56 +314,20 @@ def run_live_l0_bench_subprocess(
 
 
 def load_canonical_l0_sealer(repo_root: str | Path | None = None) -> Any:
-    """Load the single canonical L0 primitive sealer module ``tools/bench_l0_primitives.py``."""
-    root = resolve_repo_root(repo_root)
-    script = root / "tools" / "bench_l0_primitives.py"
-    if not script.is_file():
-        script = resolve_repo_root(None) / "tools" / "bench_l0_primitives.py"
-    if not script.is_file():
-        raise ModelingError(f"canonical_l0_sealer_not_found:{script}")
-    cache_key = str(script.resolve())
-    cached = _CANONICAL_SEALER_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
-    spec = importlib.util.spec_from_file_location("_mindie_canonical_bench_l0", script)
-    if spec is None or spec.loader is None:
-        raise ModelingError(f"canonical_l0_sealer_unimportable:{script}")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    _CANONICAL_SEALER_CACHE[cache_key] = mod
-    return mod
+    """Return the single canonical installed L0 primitive sealer ``mindie_sim.primitives.sealer``."""
+    del repo_root
+    return _canonical_sealer
 
 
 def _run_coordinator_lease_cmd(
-    *,
-    action: str,
-    endpoint_alias: str,
-    payload: Mapping[str, Any],
-    timeout_s: int,
-    coordinator_bin: str = "",
+    *, action: str, endpoint_alias: str, payload: Mapping[str, Any], timeout_s: int, coordinator_bin: str = "",
 ) -> dict[str, Any]:
     exe = coordinator_bin.strip() or shutil.which("mindie-coordinator") or ""
     if not exe:
         raise ModelingError("coordinator_cli_not_found:mindie-coordinator")
-    cmd = [
-        exe,
-        "lease",
-        "--action",
-        action,
-        "--alias",
-        endpoint_alias,
-        "--json",
-        json.dumps(dict(payload), sort_keys=True),
-    ]
+    cmd = [exe, "lease", "--action", action, "--alias", endpoint_alias, "--json", json.dumps(dict(payload), sort_keys=True)]
     try:
-        done = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
-            check=False,
-            **subprocess_window_kwargs(),
-        )
+        done = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s, check=False, **subprocess_window_kwargs())
     except subprocess.TimeoutExpired as exc:
         raise TimeoutError(f"coordinator_lease_{action}_timeout:timeout_s={timeout_s}") from exc
     except TimeoutError:
@@ -424,9 +335,7 @@ def _run_coordinator_lease_cmd(
     except OSError as exc:
         raise ModelingError(f"coordinator_lease_{action}_os_error:{exc}") from exc
     if done.returncode != 0:
-        raise ModelingError(
-            f"coordinator_lease_{action}_failed:rc={done.returncode}:{(done.stderr or done.stdout).strip()}"
-        )
+        raise ModelingError(f"coordinator_lease_{action}_failed:rc={done.returncode}:{(done.stderr or done.stdout).strip()}")
     try:
         parsed = json.loads(done.stdout or "{}")
     except ValueError as exc:
@@ -443,73 +352,88 @@ def acquire_coordinator_host_queue_lease(
     npu_count: int = 1,
     devices: Sequence[int] | None = None,
     ttl_seconds: int = _DEFAULT_LEASE_TTL_S,
+    min_subprocess_timeout_s: int = 0,
+    cleanup_grace_s: int = DEFAULT_CLEANUP_GRACE_S,
     rpc_timeout_s: int = _COORDINATOR_LEASE_RPC_TIMEOUT_S,
     coordinator_bin: str = "",
 ) -> Iterator[dict[str, Any]]:
-    """Acquire and release a real ``mindie-coordinator`` HostQueue lease (``mindie.lease`` schema)."""
+    """Acquire and release a verified ``mindie-coordinator`` HostQueue lease."""
     alias = endpoint_alias.strip()
     if not alias:
         raise ModelingError("host_queue_lease_requires_endpoint_alias")
+    req_npus = int(npu_count)
+    if req_npus < 1:
+        raise ModelingError(f"host_queue_lease_npu_count_invalid:{req_npus}")
+    eff_ttl = int(ttl_seconds)
+    min_required = int(min_subprocess_timeout_s) + int(cleanup_grace_s) if int(min_subprocess_timeout_s) > 0 else 1
+    if eff_ttl < min_required:
+        raise ModelingError(
+            f"host_queue_lease_ttl_below_subprocess_plus_grace:ttl={eff_ttl}:required={min_required}"
+        )
     req_payload: dict[str, Any] = {
-        "npu_count": int(npu_count),
-        "ttl_seconds": int(ttl_seconds),
-        "purpose": "mindie-sim-onboarding",
+        "npu_count": req_npus, "ttl_seconds": eff_ttl, "purpose": "mindie-sim-onboarding",
     }
     if devices:
         req_payload["devices"] = [int(d) for d in devices]
     acquired = _run_coordinator_lease_cmd(
-        action="acquire",
-        endpoint_alias=alias,
-        payload=req_payload,
-        timeout_s=int(rpc_timeout_s),
-        coordinator_bin=coordinator_bin,
+        action="acquire", endpoint_alias=alias, payload=req_payload,
+        timeout_s=int(rpc_timeout_s), coordinator_bin=coordinator_bin,
     )
-    if str(acquired.get("outcome") or "").lower() in ("failed", "blocked", "timeout"):
-        raise ModelingError(f"host_queue_lease_acquire_rejected:{acquired.get('status') or acquired.get('outcome')}")
-    if str(acquired.get("status") or "").lower() in ("failed", "blocked", "timeout", "insufficient_capacity"):
-        raise ModelingError(f"host_queue_lease_acquire_status_failed:{acquired.get('status')}")
+    outcome = str(acquired.get("outcome") or "").strip().lower()
+    if outcome not in _VALID_LEASE_OUTCOMES:
+        raise ModelingError(f"host_queue_lease_acquire_rejected:outcome={outcome}")
+    status = str(acquired.get("status") or "").strip().lower()
+    if status not in _VALID_LEASE_STATUSES:
+        raise ModelingError(f"host_queue_lease_acquire_status_failed:status={status}")
     data = acquired.get("data") if isinstance(acquired.get("data"), Mapping) else acquired
     lease_id = str(data.get("lease_id") or "").strip()
     fence_raw = data.get("fence_token")
-    if not lease_id or fence_raw is None or isinstance(fence_raw, bool):
-        raise ModelingError("host_queue_lease_missing_lease_id_or_fence_token")
-    fence_token = int(fence_raw)
-    granted_devices = [int(d) for d in (data.get("devices") or ()) if not isinstance(d, bool)]
-    lease_record = {
+    if not lease_id or type(fence_raw) is not int or fence_raw <= 0:
+        raise ModelingError("host_queue_lease_missing_lease_id_or_positive_fence_token")
+    raw_devs = data.get("devices")
+    if not isinstance(raw_devs, Sequence) or isinstance(raw_devs, (str, bytes)):
+        raise ModelingError("host_queue_lease_missing_granted_devices")
+    granted_devices: list[int] = []
+    for d in raw_devs:
+        if type(d) is not int or d < 0:
+            raise ModelingError(f"host_queue_lease_device_invalid:{d!r}")
+        granted_devices.append(d)
+    if len(set(granted_devices)) != len(granted_devices) or len(granted_devices) != req_npus:
+        raise ModelingError(
+            f"host_queue_lease_device_count_mismatch:expected={req_npus}:granted={granted_devices}"
+        )
+    lease_record: dict[str, Any] = {
         "lease_mode": "coordinator_host_queue",
         "lease_id": lease_id,
-        "fence_token": fence_token,
+        "fence_token": fence_raw,
         "devices": granted_devices,
+        "ttl_seconds": eff_ttl,
+        "receipt_unconfirmed": False,
+        "receipt_warning": "",
     }
     try:
         yield lease_record
     finally:
         try:
             _run_coordinator_lease_cmd(
-                action="release",
-                endpoint_alias=alias,
-                payload={"lease_id": lease_id, "fence_token": fence_token},
-                timeout_s=int(rpc_timeout_s),
-                coordinator_bin=coordinator_bin,
+                action="release", endpoint_alias=alias,
+                payload={"lease_id": lease_id, "fence_token": fence_raw},
+                timeout_s=int(rpc_timeout_s), coordinator_bin=coordinator_bin,
             )
         except TimeoutError:
             raise
-        except ModelingError:
-            pass
+        except (ModelingError, OSError) as exc:
+            lease_record["receipt_unconfirmed"] = True
+            lease_record["receipt_warning"] = f"host_queue_lease_release_unconfirmed:{exc}"
 
 
 def resolve_profiler_builder_strict(
-    family: str,
-    recipe: str,
-    impl: str,
-    *,
-    dtypes: Sequence[str] = (),
-    meta: Mapping[str, Any] | None = None,
+    family: str, recipe: str, impl: str, *,
+    dtypes: Sequence[str] = (), meta: Mapping[str, Any] | None = None,
     profiler_root: str | Path | None = None,
 ) -> tuple[str, str]:
-    """Resolve ``(builder_name, upstream_abi)`` via canonical ``mindie_profiler.bench.operators.resolve_builder_strict``."""
-    added_path = ""
-    saved_modules: dict[str, Any] = {}
+    """Resolve ``(builder_name, upstream_abi)`` via ``mindie_profiler.bench.operators.resolve_builder_strict``."""
+    added_path, saved_modules = "", {}
     if profiler_root is not None:
         root_str = str(Path(profiler_root).resolve())
         for mod_name in list(sys.modules):
@@ -520,20 +444,11 @@ def resolve_profiler_builder_strict(
             added_path = root_str
     try:
         try:
-            from mindie_profiler.bench.operators import (
-                BenchUnmodeledOperatorError,
-                resolve_builder_strict,
-            )
+            from mindie_profiler.bench.operators import BenchUnmodeledOperatorError, resolve_builder_strict
         except ImportError as exc:
             raise ModelingError(f"profiler_owner_unavailable:{exc}") from exc
         try:
-            builder_name, resolved_abi = resolve_builder_strict(
-                family,
-                recipe,
-                impl,
-                dtypes=tuple(dtypes),
-                meta=meta or {},
-            )
+            builder_name, resolved_abi = resolve_builder_strict(family, recipe, impl, dtypes=tuple(dtypes), meta=meta or {})
         except BenchUnmodeledOperatorError as exc:
             raise ModelingError(f"profiler_builder_unmodeled:{exc}") from exc
         return str(builder_name), str(resolved_abi)
@@ -547,110 +462,10 @@ def resolve_profiler_builder_strict(
             sys.modules.update(saved_modules)
 
 
-def _parse_json_or_jsonl_observations(text: str) -> list[dict[str, Any]]:
-    stripped = text.strip()
-    if not stripped:
-        return []
-    try:
-        raw = json.loads(stripped)
-    except ValueError:
-        rows: list[dict[str, Any]] = []
-        for idx, line in enumerate(stripped.splitlines(), start=1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-            except ValueError as exc:
-                raise ModelingError(f"profiler_bench_invalid_jsonl:line={idx}:{exc}") from exc
-            if not isinstance(rec, Mapping):
-                raise ModelingError(f"profiler_bench_jsonl_record_not_mapping:line={idx}")
-            rows.append(dict(rec))
-        return rows
-    if isinstance(raw, Mapping):
-        rows_raw = raw.get("observations") if raw.get("observations") is not None else raw.get("cases", [])
-    else:
-        rows_raw = raw
-    if not isinstance(rows_raw, list):
-        raise ModelingError("profiler_bench_observations_not_list")
-    return [dict(r) for r in rows_raw if isinstance(r, Mapping)]
-
-
-def run_profiler_bench_subprocess(
-    plan_doc: Mapping[str, Any],
-    *,
-    sku: str,
-    profiler_root: str | Path | None = None,
-    allowed_phy_ids: Sequence[int] = (),
-    domain: int | None = None,
-    dry_run: bool = False,
-    timeout_s: int = DEFAULT_GATE_SUBPROCESS_TIMEOUT_S,
-) -> list[dict[str, Any]]:
-    """Invoke ``python -m mindie_profiler bench sku`` with real CLI flags and parse JSON/JSONL."""
-    del plan_doc
-    if profiler_root is None:
-        raise ModelingError("profiler_bench_requires_profiler_root")
-    prof_root = Path(profiler_root).resolve()
-    mod_file = prof_root / "mindie_profiler" / "bench" / "bench_sku_microbench.py"
-    if not mod_file.is_file():
-        raise ModelingError(f"profiler_bench_script_not_found:{mod_file}")
-    env = dict(os.environ)
-    existing_pp = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = f"{prof_root}{os.pathsep}{existing_pp}" if existing_pp else str(prof_root)
-    with tempfile.TemporaryDirectory(prefix="msim-prof-bench-") as tmp_dir:
-        tmp = Path(tmp_dir)
-        out_file = tmp / "bench_receipt.json"
-        obs_file = tmp / "observations.jsonl"
-        has_pkg_main = (prof_root / "mindie_profiler" / "__main__.py").is_file()
-        cmd = (
-            [sys.executable, "-B", "-m", "mindie_profiler", "bench", "sku"]
-            if has_pkg_main
-            else [
-                sys.executable, "-B", "-c",
-                "import sys; from mindie_profiler.bench.bench_sku_microbench import main; raise SystemExit(main(sys.argv[1:]))",
-            ]
-        )
-        cmd.extend([
-            "--sku", sku,
-            "--out", str(out_file),
-            "--observations", str(obs_file),
-        ])
-        if allowed_phy_ids:
-            cmd.extend(["--allowed-phy-ids", ",".join(str(int(d)) for d in allowed_phy_ids)])
-        if domain is not None:
-            cmd.extend(["--domain", str(int(domain))])
-        if dry_run:
-            cmd.append("--dry-run")
-        try:
-            done = subprocess.run(
-                cmd,
-                cwd=str(prof_root),
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=timeout_s,
-                check=False,
-                **subprocess_window_kwargs(),
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise TimeoutError(f"profiler_bench_timeout:timeout_s={timeout_s}") from exc
-        except TimeoutError:
-            raise
-        except OSError as exc:
-            raise ModelingError(f"profiler_bench_os_error:{exc}") from exc
-        if done.returncode != 0:
-            raise ModelingError(
-                f"profiler_bench_failed:rc={done.returncode}:{(done.stderr or done.stdout).strip()}"
-            )
-        target_file = obs_file if obs_file.is_file() else out_file
-        if not target_file.is_file():
-            raise ModelingError("profiler_bench_missing_output_json")
-        return _parse_json_or_jsonl_observations(target_file.read_text(encoding="utf-8"))
-
-
 __all__ = [
     "acquire_coordinator_host_queue_lease",
     "load_canonical_l0_sealer",
+    "normalize_profiler_records",
     "resolve_profiler_builder_strict",
     "resolve_repo_root",
     "run_arch_governance_gate",

@@ -100,7 +100,9 @@ _EMAIL_OR_USER_HOST_RE = re.compile(
     r"|[A-Za-z_][A-Za-z0-9._-]*@(?:\d{1,3}\.){3}\d{1,3}"
 )
 _HOME_ENV_RE = re.compile(r"\$\{?HOME\}?")
-_GENERIC_ALIASES = frozenset({"a2", "a3", "a5", "host", "default", "root", "user"})
+_OPAQUE_ALIAS_HEX = 12
+_OPAQUE_ALIAS_RE = re.compile(r"^ep-[0-9a-f]{12}$")
+_OPAQUE_LEASE_RE = re.compile(r"^lease-[0-9a-f]{16}$")
 _SUBPROCESS_NO_WINDOW = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
 
@@ -393,13 +395,14 @@ class OnboardingReceipt:
     kind: Literal["sku", "operator"]
     target_id: str
     sku: str
-    status: Literal["certified", "failed"]
+    status: Literal["silicon_certified", "offline_reverify", "failed"]
     ok: bool
     created_utc: str
     gates: tuple[GateCheckOutcome, ...]
     artifacts: tuple[tuple[str, str], ...]
     diagnosis_report: Mapping[str, Any] | None
     receipt_sha256: str
+    acquisition_mode: Literal["live_silicon", "offline_reverify"] = "offline_reverify"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -408,6 +411,7 @@ class OnboardingReceipt:
             "target_id": self.target_id,
             "sku": self.sku,
             "status": self.status,
+            "acquisition_mode": self.acquisition_mode,
             "ok": self.ok,
             "created_utc": self.created_utc,
             "gates": [gate.to_dict() for gate in self.gates],
@@ -449,15 +453,43 @@ def verify_receipt_sha256(
 
 
 def sanitize_public_alias(alias: str, fallback_tag: str) -> str:
-    """Return a clean public alias with zero raw IPv4 quads, paths, or usernames."""
-    cleaned = _IPV4_QUAD_RE.sub("", str(alias or "").lower())
-    cleaned = _EMAIL_OR_USER_HOST_RE.sub("", cleaned)
-    cleaned = _HOME_ENV_RE.sub("", cleaned)
-    cleaned = _SAFE_ALIAS_RE.sub("-", cleaned).strip("._-")
-    if not cleaned or cleaned in _GENERIC_ALIASES:
-        fallback = _SAFE_ALIAS_RE.sub("-", str(fallback_tag or "target").lower()).strip("._-")
-        return f"lab-{fallback or 'target'}"
-    return cleaned
+    """Return an opaque public digest (``ep-<12-hex>``) with zero raw hostnames/IPs/users."""
+    raw = str(alias or "").strip()
+    if _OPAQUE_ALIAS_RE.fullmatch(raw):
+        return raw
+    tag = str(fallback_tag or "target").strip()
+    seed = f"{raw or tag}|{tag}".encode("utf-8")
+    return f"ep-{hashlib.sha256(seed).hexdigest()[:_OPAQUE_ALIAS_HEX]}"
+
+
+def sanitize_lease_for_receipt(lease_info: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Scrub raw coordinator lease IDs and usernames into opaque public digests."""
+    info = dict(lease_info or {})
+    mode = str(info.get("lease_mode") or "unknown").strip()
+    out: dict[str, Any] = {"lease_mode": mode}
+    raw_id = str(info.get("lease_id") or "").strip()
+    if raw_id:
+        if _OPAQUE_LEASE_RE.fullmatch(raw_id):
+            out["lease_digest"] = raw_id
+        else:
+            digest = hashlib.sha256(raw_id.encode("utf-8")).hexdigest()[:SHORT_DIGEST_LEN]
+            out["lease_digest"] = f"lease-{digest}"
+    fence = info.get("fence_token")
+    if fence is not None and not isinstance(fence, bool):
+        out["fence_token"] = int(fence)
+    devices = info.get("devices")
+    if isinstance(devices, (list, tuple)):
+        out["device_count"] = len(devices)
+    if info.get("receipt_unconfirmed"):
+        out["receipt_unconfirmed"] = True
+    warning = str(info.get("receipt_warning") or "").strip()
+    if warning:
+        scrubbed = warning.replace(raw_id, out.get("lease_digest", "lease-redacted")) if raw_id else warning
+        scrubbed = _IPV4_QUAD_RE.sub("redacted", scrubbed)
+        scrubbed = _EMAIL_OR_USER_HOST_RE.sub("redacted", scrubbed)
+        scrubbed = _HOME_ENV_RE.sub("redacted", scrubbed)
+        out["receipt_warning"] = scrubbed
+    return out
 
 
 def build_capture_uri(
@@ -594,6 +626,7 @@ __all__ = [
     "compute_receipt_sha256",
     "default_topk_abi_rule",
     "read_bounded_json",
+    "sanitize_lease_for_receipt",
     "sanitize_public_alias",
     "subprocess_window_kwargs",
     "utc_now_iso",

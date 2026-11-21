@@ -1,18 +1,19 @@
-"""Disjoint 2D cliff-plan synthesis driven by declarative TilingAxes ABI guards.
+"""Disjoint 2D cliff-plan synthesis driven by declarative TilingAxes & ParallelSpec.
 
 [Role] Synthesize strictly disjoint ``train`` + 2D ``(B/q x Context x Parallel)``
-  off-grid cliff ``heldout`` + ``abi_rejection`` benchmark plans driven
-  directly by declared ``TilingAxes`` / ``OperatorCliffParameters``
-  (Prevention Lock 3), enforce mandatory ABI-rejection verification for both
-  SKU and operator pipelines, and re-export sealed scoring helpers.
+  off-grid cliff ``heldout`` + ``abi_rejection`` benchmark plans driven by
+  family-declared / ISA-dispatched ``TilingAxes`` (Prevention Lock 3) and
+  ``ParallelSpec``-validated multi-rank topologies, compute exact required
+  NPU ranks per plan, enforce strict shape/axis/prefix ABI-rejection
+  verification, and re-export sealed scoring helpers.
 [Invariants]
   * ``train`` anchors AND ``heldout`` cliffs are BOTH validated through
-    ``validate_abi``; any shape violating ``axes.abi_divisibility`` routes
-    strictly to ``abi_rejection_points``.
-  * ``axes.batch_axis``, ``axes.query_tokens_axis``, ``axes.phase_thresholds``,
-    and ``axes.core_product_axes`` directly control emitted plan points.
-  * When ``abi_rejection_points`` is non-empty, omitting rejection results or
-    passing ``rejected=False`` or an unrelated error class fails closed.
+    ISA-dispatched ``validate_abi``; any shape violating ``axes.abi_divisibility``
+    routes strictly to ``abi_rejection_points``.
+  * Every emitted ``parallel_topology`` is validated directly against
+    ``ParallelSpec.validate(...)`` (blocking illegal topologies like ``pcp4_dcp2``).
+  * ``evaluate_abi_rejections`` requires exact prefix match, planned axis match,
+    and exact executed shape agreement (closing substring/cross-axis bypasses).
 [Timeouts & Locks] Pure in-memory plan synthesis; zero subprocesses, network
   calls, or device contexts.
 [Side-Effect Policy] Zero filesystem writes or global state mutations.
@@ -20,10 +21,14 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from functools import lru_cache
 import hashlib
+import re
 from typing import Any
 
+from mindie_sim.backends import ascend_profiles
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.parallel import ParallelSpec
 
 from ._sealed_scorer import (
     STANDARD_LEVEL_BOUNDARY_KINDS,
@@ -48,9 +53,10 @@ from .contracts import (
     sanitize_public_alias,
 )
 from .tiling_axes import (
+    ARCH_PRESET_22,
     CROSS_SAMPLE_PARALLEL_CONTEXT_MIN,
     TilingAxes,
-    default_topk_abi_rule,
+    family_default_tiling_axes,
     validate_abi,
 )
 
@@ -60,28 +66,80 @@ _CROSS_MTP_CONTEXTS: tuple[int, ...] = (2049, 24576, 98304)
 _CROSS_CHUNK_CONTEXTS: tuple[int, ...] = (98304, 200000)
 _CROSS_CHUNK_THRESHOLD = 256
 _CROSS_PARALLEL_SPECS: tuple[tuple[int, str], ...] = (
-    (200000, "pcp2_dcp2"),
-    (400000, "pcp4_dcp2"),
+    (200000, "tp2_pcp2_dcp2"),
+    (400000, "tp2_pcp2_dcp4"),
 )
+_TOPO_TOKEN_RE = re.compile(r"(tp|pp|dp|ep|pcp|dcp)(\d+)")
+_PROBE_MODEL_NAME = "deepseek-v2-lite"
 
 
 def _clamp_in_domain(value: int, *, low: int = 1, high: int = CONTEXT_MAX_TOKENS) -> int:
     return max(low, min(high, int(value)))
 
 
-def _resolve_tiling_axes(params: OperatorCliffParameters) -> TilingAxes:
+def _resolve_sku_arch_preset(
+    sku: str,
+    *,
+    arch_preset: str = "",
+    profile_override: Mapping[str, Any] | None = None,
+) -> str:
+    if arch_preset.strip():
+        return arch_preset.strip()
+    prof = profile_override if profile_override is not None else ascend_profiles().get(sku)
+    if isinstance(prof, Mapping):
+        dev = prof.get("device")
+        if isinstance(dev, Mapping):
+            ca = dev.get("compute_arch")
+            if isinstance(ca, Mapping) and ca.get("preset"):
+                return str(ca["preset"]).strip()
+    return ARCH_PRESET_22
+
+
+@lru_cache(maxsize=1)
+def _parallel_probe_model() -> Any:
+    from mindie_sim.model_catalog import load_model
+
+    return load_model(_PROBE_MODEL_NAME)
+
+
+def validate_parallel_topology(topo: str) -> int:
+    """Validate ``topo`` directly through ``ParallelSpec.validate`` and return required ranks."""
+    clean = str(topo or "tp1").strip().lower()
+    parsed = {axis: int(val) for axis, val in _TOPO_TOKEN_RE.findall(clean)}
+    if not parsed:
+        raise ModelingError(f"parallel_topology_invalid:{topo}")
+    spec = ParallelSpec(
+        tp=parsed.get("tp", 1),
+        pp=parsed.get("pp", 1),
+        dp=parsed.get("dp", 1),
+        ep=parsed.get("ep", 1),
+        cp=parsed.get("dcp", 1),
+        pcp=parsed.get("pcp", 1),
+    )
+    spec.validate(_parallel_probe_model())
+    return int(spec.world_size)
+
+
+def required_ranks_for_plan(plan_doc: Mapping[str, Any]) -> int:
+    """Compute the exact maximum physical NPU ranks needed across all points in ``plan_doc``."""
+    max_ranks = 1
+    for split_key in ("train_points", "heldout_points"):
+        for pt in plan_doc.get(split_key) or ():
+            if not isinstance(pt, Mapping):
+                continue
+            topo = str(pt.get("parallel_topology") or "tp1")
+            max_ranks = max(max_ranks, validate_parallel_topology(topo))
+    return max_ranks
+
+
+def _resolve_tiling_axes(params: OperatorCliffParameters, arch_preset: str) -> TilingAxes:
     if params.tiling_axes is not None:
         return params.tiling_axes
-    thresholds: list[tuple[str, int]] = []
-    rules = []
-    if params.topk_threshold is not None:
-        thresholds.append(("topk", int(params.topk_threshold)))
-        rules.append(default_topk_abi_rule(above_threshold=int(params.topk_threshold)))
-    return TilingAxes(
-        tile_dims=(int(params.tile_dim),),
-        core_product_axes=("tokens", "batch_x_kv_heads"),
-        phase_thresholds=tuple(thresholds),
-        abi_divisibility=tuple(rules),
+    return family_default_tiling_axes(
+        params.family,
+        tile_dim=int(params.tile_dim),
+        arch_preset=arch_preset,
+        topk_threshold=params.topk_threshold,
     )
 
 
@@ -130,6 +188,7 @@ def _append_guarded_point(
     seen_reject: set[tuple[str, int, int, int, int | None]],
     train_keys: set[tuple[str, int]],
     axes: TilingAxes,
+    arch_preset: str,
     point_id: str,
     grid_kind: str,
     axis: str,
@@ -143,6 +202,7 @@ def _append_guarded_point(
 ) -> None:
     if value < 1:
         return
+    validate_parallel_topology(parallel_topology)
     probe_shape: dict[str, Any] = {
         "axis": axis,
         "value": value,
@@ -153,7 +213,7 @@ def _append_guarded_point(
         probe_shape["context_len"] = value
     if topk is not None:
         probe_shape["topk"] = topk
-    ok_abi, reject_reason = validate_abi(probe_shape, axes)
+    ok_abi, reject_reason = validate_abi(probe_shape, axes, arch_preset=arch_preset)
     if not ok_abi:
         _record_rejection(
             abi_rejections, seen_reject,
@@ -191,11 +251,16 @@ def synthesize_operator_cliff_plan(
     *,
     sku: str,
     campaign_id: str = "onboard-op",
+    arch_preset: str = "",
+    profile_override: Mapping[str, Any] | None = None,
 ) -> CliffBenchPlan:
     """Synthesize disjoint train + 2D off-grid cliff heldout + ABI-rejection plan."""
     clean_sku = sanitize_public_alias(sku, "sku")
     clean_campaign = sanitize_public_alias(campaign_id, "onboard")
-    axes = _resolve_tiling_axes(params)
+    resolved_arch = _resolve_sku_arch_preset(
+        sku, arch_preset=arch_preset, profile_override=profile_override
+    )
+    axes = _resolve_tiling_axes(params, resolved_arch)
 
     train_points: list[CliffPointSpec] = []
     train_keys: set[tuple[str, int]] = set()
@@ -209,6 +274,7 @@ def synthesize_operator_cliff_plan(
             ok_abi, reject_reason = validate_abi(
                 {"axis": "context_len", "value": ctx, "context_len": ctx, "batch_size": 1, "query_tokens": 1},
                 axes,
+                arch_preset=resolved_arch,
             )
             if ok_abi:
                 train_keys.add(("context_len", ctx))
@@ -235,7 +301,7 @@ def synthesize_operator_cliff_plan(
         _append_guarded_point(
             heldout=heldout, abi_rejections=abi_rejections,
             seen_perf=seen_perf, seen_reject=seen_reject,
-            train_keys=train_keys, axes=axes, **kw,
+            train_keys=train_keys, axes=axes, arch_preset=resolved_arch, **kw,
         )
 
     for ctx in OFF_GRID_CLIFF_HELDOUT_GRID:
@@ -253,13 +319,13 @@ def synthesize_operator_cliff_plan(
                 ok_c, _ = validate_abi(
                     {"axis": "context_len", "value": cand, "context_len": cand, "batch_size": 1, "query_tokens": 1},
                     axes,
+                    arch_preset=resolved_arch,
                 )
                 if ok_c:
                     return cand
         return candidates[idx % len(candidates)]
 
-    batch_vals = [b for b in axes.batch_axis if b > 1]
-    for idx, batch in enumerate(batch_vals):
+    for idx, batch in enumerate(b for b in axes.batch_axis if b > 1):
         ctx = _pick_ctx(_CROSS_BATCH_CONTEXTS, idx)
         if params.context_min <= ctx <= params.context_max:
             _add(
@@ -269,8 +335,7 @@ def synthesize_operator_cliff_plan(
                 batch_size=batch, query_tokens=1,
             )
 
-    mtp_qs = [q for q in axes.query_tokens_axis if 1 < q < _CROSS_CHUNK_THRESHOLD]
-    for idx, q_tok in enumerate(mtp_qs):
+    for idx, q_tok in enumerate(q for q in axes.query_tokens_axis if 1 < q < _CROSS_CHUNK_THRESHOLD):
         ctx = _pick_ctx(_CROSS_MTP_CONTEXTS, idx)
         if params.context_min <= ctx <= params.context_max:
             _add(
@@ -280,8 +345,7 @@ def synthesize_operator_cliff_plan(
                 batch_size=1, query_tokens=q_tok,
             )
 
-    chunk_qs = [q for q in axes.query_tokens_axis if q >= _CROSS_CHUNK_THRESHOLD]
-    for idx, q_tok in enumerate(chunk_qs):
+    for idx, q_tok in enumerate(q for q in axes.query_tokens_axis if q >= _CROSS_CHUNK_THRESHOLD):
         ctx = _pick_ctx(_CROSS_CHUNK_CONTEXTS, idx)
         if params.context_min <= ctx <= params.context_max:
             _add(
@@ -338,8 +402,9 @@ def synthesize_operator_cliff_plan(
                 rationale=f"phase_threshold({pt_axis}={thresh}){delta:+d}",
             )
     for rule in axes.abi_divisibility:
-        if rule.axis == "topk" and rule.above_threshold > 0 and rule.above_threshold not in topk_thresholds:
-            topk_thresholds.append(int(rule.above_threshold))
+        if rule.applies_to(resolved_arch) and rule.axis == "topk":
+            if rule.above_threshold > 0 and rule.above_threshold not in topk_thresholds:
+                topk_thresholds.append(int(rule.above_threshold))
 
     for tk in topk_thresholds:
         _add(
@@ -360,6 +425,17 @@ def synthesize_operator_cliff_plan(
             rationale=f"topk_threshold({tk})+1_abi_alignment_guard",
             topk=tk + 1,
         )
+
+    for rule in axes.abi_divisibility:
+        if rule.applies_to(resolved_arch) and rule.axis == "topk" and rule.max_value is not None:
+            over_max = rule.max_value + rule.divisor
+            _add(
+                point_id=f"topk_over_max_{over_max}", grid_kind="boundary_cliff",
+                axis="context_len", value=min(params.context_max, max(params.context_min, over_max)),
+                regime_tag="topk_over_max_guard",
+                rationale=f"topk_max({rule.max_value})_exceeded_abi_guard",
+                topk=over_max,
+            )
 
     if params.bytes_per_token > 0:
         l2_knee = _clamp_in_domain(params.l2_bytes // params.bytes_per_token, low=2)
@@ -437,6 +513,8 @@ def synthesize_sku_512_400k_plan(
     tile_dim: int = _DEFAULT_SKU_TILE_DIM,
     topk_threshold: int = DEFAULT_SPARSE_TOPK,
     campaign_id: str = "onboard-sku",
+    arch_preset: str = "",
+    profile_override: Mapping[str, Any] | None = None,
 ) -> CliffBenchPlan:
     """Synthesize canonical 512..400K disjoint Anchor + 2D Cliff Heldout plan for a SKU."""
     params = OperatorCliffParameters(
@@ -449,53 +527,76 @@ def synthesize_sku_512_400k_plan(
         context_min=CONTEXT_MIN_TOKENS,
         context_max=CONTEXT_MAX_TOKENS,
     )
-    return synthesize_operator_cliff_plan(params, sku=sku, campaign_id=campaign_id)
+    return synthesize_operator_cliff_plan(
+        params,
+        sku=sku,
+        campaign_id=campaign_id,
+        arch_preset=arch_preset,
+        profile_override=profile_override,
+    )
+
+
+def _check_abi_row_shape(row: Mapping[str, Any], planned_pt: Mapping[str, Any]) -> str:
+    shape_map = row.get("executed_shape") if isinstance(row.get("executed_shape"), Mapping) else {}
+    planned_axis = str(planned_pt.get("axis") or "").strip()
+    planned_val = planned_pt.get("value")
+    checks: list[tuple[str, Any, Any]] = [
+        ("batch_size", planned_pt.get("batch_size", 1), shape_map.get("batch_size", row.get("batch_size"))),
+        ("query_tokens", planned_pt.get("query_tokens", 1), shape_map.get("query_tokens", row.get("query_tokens"))),
+    ]
+    if planned_pt.get("topk") is not None:
+        checks.append(("topk", planned_pt.get("topk"), shape_map.get("topk", row.get("topk"))))
+    if planned_axis:
+        got_axis = shape_map.get(planned_axis, row.get(planned_axis, shape_map.get("value", row.get("value"))))
+        checks.append((planned_axis, planned_val, got_axis))
+    for field, exp, got in checks:
+        if got is not None and (type(got) is not int or got != exp):
+            return f"shape_mismatch:{field}:got={got!r}:expected={exp!r}"
+    if row.get("axis") is not None and planned_axis and str(row.get("axis")) != planned_axis:
+        return f"axis_mismatch:got={row.get('axis')}:expected={planned_axis}"
+    return ""
 
 
 def evaluate_abi_rejections(
     planned_rejections: Sequence[Mapping[str, Any]],
     observed_rejections: Sequence[Mapping[str, Any]] | None,
 ) -> dict[str, Any]:
-    """Fail closed unless every planned illegal ABI shape is rejected with a matching ABI error."""
+    """Fail closed unless every planned illegal ABI shape is rejected with exact rule/axis/shape."""
     planned = {
-        str(pt.get("point_id") or ""): str(pt.get("abi_expected_error") or "")
+        str(pt.get("point_id") or ""): dict(pt)
         for pt in planned_rejections
         if pt.get("point_id")
     }
     if not planned:
         return {
-            "checked": True,
-            "ok": True,
-            "planned_count": 0,
-            "rejected_count": 0,
-            "unexpectedly_accepted": [],
-            "wrong_error_class": [],
-            "missing_rejection_tests": [],
+            "checked": True, "ok": True, "planned_count": 0, "rejected_count": 0,
+            "unexpectedly_accepted": [], "wrong_error_class": [], "missing_rejection_tests": [],
         }
     if observed_rejections is None:
         return {
-            "checked": True,
-            "ok": False,
-            "planned_count": len(planned),
-            "rejected_count": 0,
-            "unexpectedly_accepted": [],
-            "wrong_error_class": [],
-            "missing_rejection_tests": sorted(planned),
+            "checked": True, "ok": False, "planned_count": len(planned), "rejected_count": 0,
+            "unexpectedly_accepted": [], "wrong_error_class": [], "missing_rejection_tests": sorted(planned),
         }
     obs_rows_by_id: dict[str, list[Mapping[str, Any]]] = {}
     for row in observed_rejections:
         key = str(row.get("point_id") or row.get("case_id") or "")
         obs_rows_by_id.setdefault(key, []).append(row)
-    missing: list[str] = []
-    unexpectedly_accepted: list[str] = []
-    wrong_error: list[str] = []
+    missing, unexpectedly_accepted, wrong_error = [], [], []
     rejected_count = 0
-    for pid, expected_err in sorted(planned.items()):
+    for pid, planned_pt in sorted(planned.items()):
         rows_for_pid = obs_rows_by_id.get(pid)
         if not rows_for_pid:
             missing.append(pid)
             continue
-        exp_prefix = expected_err.split(":", 1)[0].strip() if expected_err else "abi_divisibility_violation"
+        expected_err = str(planned_pt.get("abi_expected_error") or "")
+        parts = expected_err.split(":")
+        exp_prefix = parts[0].strip() if parts and parts[0].strip() else "abi_divisibility_violation"
+        exp_axis_tok = parts[1].strip() if len(parts) > 1 and "=" in parts[1] else ""
+        exp_axis = (
+            exp_axis_tok.split("=", 1)[0].strip()
+            if exp_axis_tok
+            else ("topk" if planned_pt.get("topk") is not None else str(planned_pt.get("axis") or ""))
+        )
         pid_accepted = False
         pid_wrong_err = ""
         for row in rows_for_pid:
@@ -503,15 +604,21 @@ def evaluate_abi_rejections(
                 pid_accepted = True
                 break
             err_text = str(row.get("abi_error") or "").strip()
-            if not err_text or exp_prefix not in err_text:
-                pid_wrong_err = f"{pid}:got={err_text or 'empty'}:expected={exp_prefix}"
+            if not err_text or not err_text.startswith(exp_prefix):
+                pid_wrong_err = f"{pid}:got={err_text or 'empty'}:expected_prefix={exp_prefix}"
+                continue
+            if exp_axis and f"{exp_axis}=" not in err_text:
+                pid_wrong_err = f"{pid}:axis_error_mismatch:got={err_text}:expected_axis={exp_axis}"
+                continue
+            shape_err = _check_abi_row_shape(row, planned_pt)
+            if shape_err:
+                pid_wrong_err = f"{pid}:{shape_err}"
         if pid_accepted:
             unexpectedly_accepted.append(pid)
-            continue
-        if pid_wrong_err:
+        elif pid_wrong_err:
             wrong_error.append(pid_wrong_err)
-            continue
-        rejected_count += 1
+        else:
+            rejected_count += 1
     return {
         "checked": True,
         "ok": not missing and not unexpectedly_accepted and not wrong_error,
@@ -527,9 +634,11 @@ __all__ = [
     "STANDARD_LEVEL_BOUNDARY_KINDS",
     "WhiteboxSpineRunner",
     "evaluate_abi_rejections",
+    "required_ranks_for_plan",
     "score_sealed_gate_cases",
     "synthesize_operator_cliff_plan",
     "synthesize_sku_512_400k_plan",
     "validate_disjoint_lineage",
+    "validate_parallel_topology",
     "verify_cliff_plan_integrity",
 ]
