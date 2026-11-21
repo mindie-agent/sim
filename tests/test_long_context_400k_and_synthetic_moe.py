@@ -324,7 +324,7 @@ def test_derive_expert_pruned_preserves_dense_layers_and_sanitizes_router_groups
 
 
 def test_moe_init_mxfp8_supports_topk_2_and_synthetic_expert_counts():
-    from test_moe_init_mxfp8 import case as mxfp8_case, graph as mxfp8_graph
+    from _support.moe_hc_mc2_fixtures import mxfp8_case, mxfp8_graph
 
     raw = mxfp8_case(16)
     raw["model"]["num_experts"] = 16

@@ -268,22 +268,35 @@ reserved = true
 [[module]]
 path = "operators/test_grouped_moe_routing.py"
 tier = "tier0"
-reserved = true
+owns = [
+  "mindie_sim/prediction/operators/grouped_moe",
+  "mindie_sim/prediction/family_moe.py",
+  "mindie_sim/prediction/moe_callers.py",
+  "mindie_sim/prediction/moe_cann_fusion.py",
+]
 
 [[module]]
 path = "operators/test_grouped_moe_gemm.py"
 tier = "tier0"
-reserved = true
+owns = [
+  "mindie_sim/prediction/operators/grouped_moe",
+]
 
 [[module]]
 path = "operators/test_grouped_moe_combine.py"
 tier = "tier0"
-reserved = true
+owns = [
+  "mindie_sim/prediction/operators/grouped_moe",
+  "mindie_sim/prediction/moe_transport.py",
+]
 
 [[module]]
 path = "operators/test_grouped_moe_dbo.py"
 tier = "tier0"
-reserved = true
+owns = [
+  "mindie_sim/prediction/operators/grouped_moe",
+  "mindie_sim/prediction/operators/mc2",
+]
 
 [[module]]
 path = "operators/test_linear_attention_prepare.py"
@@ -308,17 +321,24 @@ reserved = true
 [[module]]
 path = "operators/test_hyper_connections.py"
 tier = "tier0"
-reserved = true
+owns = [
+  "mindie_sim/prediction/operators/hyper_connections",
+]
 
 [[module]]
 path = "operators/test_mc2_dispatch_combine.py"
 tier = "tier0"
-reserved = true
+owns = [
+  "mindie_sim/prediction/operators/mc2",
+  "mindie_sim/prediction/moe_token_partition.py",
+]
 
 [[module]]
 path = "operators/test_mc2_quant_and_padding.py"
 tier = "tier0"
-reserved = true
+owns = [
+  "mindie_sim/prediction/operators/mc2",
+]
 
 [[module]]
 path = "operators/test_matrix_tiling_and_traffic.py"
@@ -519,7 +539,11 @@ owns = ["scripts/check_test_orthogonality.py", ".github/scripts/ci_scope.py", "t
 [[module]]
 path = "operators/test_grouped_moe_align.py"
 tier = "tier0"
-reserved = true
+owns = [
+  "mindie_sim/prediction/operators/grouped_moe",
+  "mindie_sim/prediction/moe_init_mxfp8.py",
+  "mindie_sim/prediction/moe_init_instructions.py",
+]
 
 [[module]]
 path = "operators/test_sparse_indexer_topk.py"

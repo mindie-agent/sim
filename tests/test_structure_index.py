@@ -43,7 +43,7 @@ def test_source_plan_is_omitted_but_native_contract_and_physical_identity_remain
 
 
 def test_mc2_execution_tree_is_removed_after_full_peer_identity_is_computed():
-    from test_mc2_mx_dispatch import case as mc2_case
+    from _support.moe_hc_mc2_fixtures import mc2_case
     raw = mc2_case()
     args = dict(phase='decode', tokens=1, context=128, scope='body', sequences=[1, 3])
     full = export_structure(raw, **args)

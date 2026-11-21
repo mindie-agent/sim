@@ -5,7 +5,7 @@ import pytest
 
 from mindie_sim import graph_costs, operator_costs, predict, predict_pd, target_graphs
 from mindie_sim.prediction.peer_traffic import PeerTraffic
-from test_balanced_experts import balanced_case
+from _support.moe_hc_mc2_fixtures import balanced_case
 
 
 def cohort_case(*, tp=1, dp=8, ep=8):
