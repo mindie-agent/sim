@@ -9,7 +9,7 @@ import pytest
 from mindie_sim import graph_costs, target_graphs
 from test_mc2_per_token_int8 import case as int8_case, graphs
 from test_mc2_mx_dispatch import protocol_only
-from test_joint_collective_execution import wire
+from _support.collective_cases import wire
 
 
 def case():

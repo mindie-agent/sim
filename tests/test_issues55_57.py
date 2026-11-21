@@ -14,8 +14,8 @@ from mindie_sim.prediction.structure import parse_case
 from mindie_sim.prediction.topology import Topology
 from mindie_sim.schema.hardware import Hardware
 from mindie_sim.schema.parallel import ParallelSpec
-from test_communication_topology import exchange
-from test_joint_collective_execution import cohort_case
+from _support.collective_cases import exchange
+from _support.collective_cases import cohort_case
 from _support.hardware import A5, op, sku_case
 
 

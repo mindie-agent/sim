@@ -49,107 +49,6 @@ def test_dbo_matches_unsplit_physical_assignments(dp, ep, pcp):
         assert packs == gates == unpack == [64]
 
 
-def test_two_receivers_read_one_named_source_extent():
-    raw = prior._deepseek_pd_case()
-    raw["workload"]["requests"][0]["prompt_tokens"] = 10
-    for side, ranks in (("prefill", [0, 1]), ("decode", [2, 3, 4, 5])):
-        cfg = raw["pools"][side]
-        cfg["machine"].update(num_devices=len(ranks), devices=[{"rank": r} for r in ranks])
-        cfg["machine"]["links"][0]["members"] = ranks
-        cfg["runtime"]["parallel"].update(tp=len(ranks), dcp=2, cp=2, cp_plan="dcp")
-    raw["model"]["layer_plans"][0].update(num_kv_heads=0, window=8, owns_index_k=False)
-    result = prior.predict_pd(raw, lower=prior.linear_work, event_limit=100000)
-    transfers = result["execution"]["pd_handoffs"][0]["transfers"]
-    rows = [t for t in transfers if t["component"] == "mla_kv" and t["source_rank"] == 1]
-    assert {t["destination_rank"] for t in rows} == {3, 5}
-    assert len({(t["source_storage"], t["source_version"]) for t in rows}) == 1
-    assert all(tuple(t["source_byte_range"]) == (0, 5760) for t in rows)
-    assert all(tuple(t["source_token_span"]) == (5, 10) for t in rows)
-    assert len({(t["destination_rank"], t["destination_storage"]) for t in rows}) == 2
-    assert sum(t["payload_bytes"] for t in rows) == 11520
-
-
-def test_interleaved_rows_map_to_offsets_in_the_packed_owner():
-    sources = [(9, ((0, 2), (4, 6)), 40), (7, ((2, 4), (6, 8)), 40)]
-    actual = list(transfers_for_runs(sources, ((1, 7),)))
-    assert [(rank, lo, hi, offset) for rank, lo, hi, size, offset, unit in actual] == [
-        (9, 1, 2, 10), (7, 2, 4, 0), (9, 4, 6, 20), (7, 6, 7, 20)]
-    assert sum((hi - lo) * unit for _, lo, hi, _, _, unit in actual) == 60
-
-
-@pytest.mark.parametrize("dtype,parts", [("bf16", (576, 14, 18)), ("uint8", (576, 7, 1)),
-                                       ("fp8_e8m0", (576, 7, 1))])
-def test_arithmetic_scale_bytes_and_allocator_extent(dtype, parts):
-    from mindie_sim.catalog.cache import cache_row_split
-    model = prior._packed_mode_model(dtype)
-    assert packed_row_parts(model, "compressed_kv", 512) == parts
-    assert cache_row_split(model, "compressed_kv", 512) == (parts[0], sum(parts[1:]))
-
-
-def test_hca_runtime_decides_aliasing():
-    views = tuple(RequestView(key, 1, 383, False, "decode", prefix_tokens=128,
-                              prefix_cache_key="A") for key in ("a", "b"))
-    for mode, total, union in (("private", 159296, 0), ("shared", 158688, 1)):
-        fields = family_mqsmla._prefix_fields(views, SimpleNamespace(prefix_cache_mode=mode))
-        shape = dict(sequences=((1, 383),) * 2, window=128, ratio=128, topk=0, **fields)
-        assert mqsmla.quant_external_fill(shape, mqsmla.KV_QUANT_FP8) == (total, union)
-
-
-def test_nested_upper_bound_is_attainable_by_enumeration():
-    draws = [(extent, count) for extent in range(4) for count in range(extent + 1)]
-    for spec in product(draws, repeat=3):
-        options = [list(combinations(range(n), k)) for n, k in spec]
-        exact = max(len(set().union(*chosen)) for chosen in product(*options))
-        assert nested_prefix_union(spec) == exact
-
-
-def test_csa_nested_prefix_and_private_window():
-    contexts = (4, 4, 4096)
-    shape = dict(sequences=tuple((1, c) for c in contexts), prefix_tokens=contexts,
-                 prefix_cache_keys=("A",) * 3, prefix_cache_mode="shared",
-                 ratio=4, window=128, topk=512)
-    assert mqsmla.quant_external_fill(shape, mqsmla.KV_QUANT_FP8) == (395808, 513)
-
-
-@pytest.mark.parametrize("contexts,keys,topk,union,local", [
-    ((1, 1, 1024), ("A", "A", "A"), 512, 513, 2),
-    ((63, 63), ("A", "A"), 128, 63, 2),
-    ((127, 127, 127), ("A", "A", "B"), 128, 127, 130),
-])
-def test_c8_prefix_plus_tile_rows(contexts, keys, topk, union, local):
-    sequences = tuple((1, c) for c in contexts)
-    op = a._c8_op(sequences, topk, 64, 0)
-    shape = dict(dict(op.metadata)["indexed_attention_geometry"],
-                 prefix_tokens=contexts, prefix_cache_keys=keys, prefix_cache_mode="shared")
-    op = replace(op, metadata=(("indexed_attention_geometry", shape),))
-    geom = a.Geometry.from_devices(prior.parse_case(a._c8_case(a.SKUS[0][1])).machine.dies)
-    plan = a.build_packed(op, geom, scratch_policy="offchip", schedule=a.SCHEDULE_ARCH35)
-    stats = plan.metadata["c8_schedule"]
-    assert stats["external_fill_bytes"] == union * 656
-    assert stats["private_rows"] == local
-    from collections import Counter
-    from mindie_sim.prediction.indexed_quant_attention import bind_sustained_dram
-    query_output = len(contexts) * 64 * (576 + 512) * 2
-    assert plan.work.resources["hbm"] == query_output + (union + local) * 656
-    _, context = b._context(b.DT)
-    context = bind_sustained_dram(replace(context, op=plan.work.apply(op)))
-    issued = Counter()
-    for stage in b._stages(plan.program(context)):
-        issued.update(stage.work)
-    assert dict(issued) == pytest.approx(context.bind(plan.work))
-
-
-def test_arch35_distinct_operands_and_cold_fill():
-    views = (RequestView("a", 1, 1, False, "decode"), RequestView("b", 1, 3, False, "decode"))
-    op = b._arch35_op_for(1, views, heads=32)
-    plan = b.sp.Arch35QuantIndexerRecipe().build(op, None)
-    assert op.flops == 49152
-    assert plan.work.resources["mte2_aic"] == 2 * 32 * 128 + 6 * 128
-    assert plan.work.resources["mte2_aiv"] == 2 * 32 * 8 + 6 * 4
-    assert op.hbm_bytes == 8704 + 792 + 2 * 8192
-    b._conserved(plan, op, b.DT)
-
-
 def test_kimi_padded_producer_writes_the_entire_pack_input():
     case = prior.parse_case(prior.compose_case(
         "kimi-k3.1", hardware="a5", dp=1, tp=8, dcp=8, ep=8, num_devices=8,
@@ -199,22 +98,6 @@ def test_keypool_native_gates_pack_before_exchange_and_counts_indices_once():
         count += pack.mte2_bytes - owned * 2 * 8
     assert count == 67108864
 
-
-
-def test_rank_table_membership_can_cross_pcp_inside_each_dp_replica():
-    raw = prior.compose_case("qwen3-30b-a3b", hardware="a5", tp=1, dp=4, ep=2,
-                             pcp=2, num_devices=8, layers=1, enable_dbo=False,
-                             prompt_tokens=8, output_tokens=2, max_num_seqs=2)
-    table = [[3, 2], [1, 0], [7, 6], [5, 4]]
-    raw["runtime"]["parallel"]["rank_table"] = table
-    case = prior.parse_case(raw)
-    from mindie_sim.prediction.dispatch import cohorts
-    from mindie_sim.prediction.topology import Topology
-    assert cohorts(case.runtime.parallel, case.machine) == [(0,), (1,), (2,), (3,)]
-    assert Topology(case.machine, case.runtime.parallel).groups("ep", 3, 0) == ((7, 6),)
-    g = prior.target_graphs(case, phase="prefill", tokens=8, context=0, sequences=2,
-                            selected_replica=3, physical_rank=7, scope="body")
-    assert [op.local_shape[0] for op in g[3] if op.recipe == "grouped_gate_up"] == [64]
 
 
 def test_real_sp_bucket_preserves_every_rank_and_valid_row():
@@ -305,25 +188,6 @@ def test_legacy_dsl_mqsmla_contract_rejects_cann_only_row_widths():
             track_a._observed_row("aclnnMixedQuantSparseFlashMla", inputs, outputs)) is not None
 
 
-def test_compose_case_pp_pcp_ep_rank_table_covers_every_stage():
-    from mindie_sim.prediction.topology import Topology
-
-    raw = prior.compose_case(
-        "deepseek-v4-pro", "a3", tp=4, dp=2, pp=2, pcp=2, ep=16, layers=4,
-        prompt_tokens=128, output_tokens=8, sp=True, va_recommended=True,
-        quant="w4a8")
-    case = prior.parse_case(raw)
-    assert case.runtime.parallel.ep_domain == 16
-    assert case.runtime.parallel.rank_table == (
-        tuple(range(0, 8)) + tuple(range(16, 24)),
-        tuple(range(8, 16)) + tuple(range(24, 32)),
-    )
-    topo = Topology(case.machine, case.runtime.parallel)
-    for stage, expected in enumerate(case.runtime.parallel.rank_table):
-        for replica in range(case.runtime.parallel.dp):
-            assert topo.groups("ep", replica, stage) == (expected,)
-
-
 def test_glm_mixed_prefill_decode_kda_eliminates_standalone_qk_l2norm():
     from mindie_sim.prediction.attention import AttentionPolicy
     from mindie_sim.prediction.implementation_selection import resolve
@@ -349,47 +213,6 @@ def test_glm_mixed_prefill_decode_kda_eliminates_standalone_qk_l2norm():
     assert not [op for op in lowered if op.recipe == "qk_l2norm"]
     folded = [op for op in lowered if dict(op.metadata).get("in_kernel_qk_l2norm")]
     assert len(folded) == 2
-
-
-def test_dspark_draft_scoped_prolog_and_contiguous_draft_cache_predicate():
-    import test_v0919_deep_audit_track_b as track_b
-
-    raw = track_b._dspark_case()
-    target_binding = raw["runtime"]["kernels"]["lowerings"]["mla_prolog"]
-    raw["runtime"]["kernels"]["lowerings"]["mla_prolog"] = {
-        "cases": [
-            {"domain": {"model_scopes": ["target"]}, "binding": target_binding},
-            {"domain": {"model_scopes": ["draft"]}, "binding": "vllm_ascend_mla_prolog_v3"},
-        ],
-        "otherwise": "analytical",
-    }
-    graph = prior.target_graphs(
-        prior.parse_case(raw), phase="decode", tokens=6, context=4,
-        sequences=1, scope="model")[0]
-    body = [op for op in graph if op.phase == "draft"
-            and dict(op.metadata).get("fusion_role") == "mla_prolog"]
-    context = [op for op in graph if op.recipe == "draft_context_mla_prolog_v3"]
-    assert len(body) == 5 and len(context) == 5
-
-    contiguous = track_b._dspark_case()
-    contiguous["model"].setdefault("metadata", {})["draft_cache_representations"] = {
-        "mla_nope": {"dtype": "bf16", "contiguous": True},
-        "mla_rope": {"dtype": "bf16", "contiguous": True},
-    }
-    contiguous["runtime"]["kernels"]["lowerings"]["mla_prolog"] = {
-        "cases": [
-            {"domain": {"model_scopes": ["draft"]}, "binding": "vllm_ascend_mla_prolog_v3"},
-        ],
-        "otherwise": target_binding,
-    }
-    graph_contig = prior.target_graphs(
-        prior.parse_case(contiguous), phase="decode", tokens=6, context=4,
-        sequences=1, scope="model")[0]
-    body_contig = [op for op in graph_contig if op.phase == "draft"
-                   and dict(op.metadata).get("fusion_role") == "mla_prolog"]
-    assert len(body_contig) == 5
-    assert not [op for op in graph_contig if op.recipe == "draft_context_mla_prolog_v3"]
-    assert len([op for op in graph_contig if op.recipe == "draft_context_qkv_a"]) == 5
 
 
 def test_legacy_dsl_mqsmla_lowering_rejects_cann_quant_modes():

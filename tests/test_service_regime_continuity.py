@@ -18,7 +18,7 @@ from mindie_sim.prediction.service_regime_domains import (
     compile_service_regime_domains, rules_overlap, validate_service_regime_domains)
 from mindie_sim.schema.common import ModelingError
 from test_mechanism_contract import hardware_case
-from test_resource_services import copy_op
+from _support.kernel_invocation import copy_op
 
 SUPPORT = {"q": {"min": 1, "max": 200}}
 WINDOW = {"q": {"min": 1, "max": 200}, "kv_len": {"min": 1, "max": 200}}
@@ -426,7 +426,7 @@ def test_disjoint_guards_and_large_exterior_distances_are_accepted_and_selected(
         "min": 8192.0, "max": None, "min_inclusive": True, "max_inclusive": True
     }
 
-    from test_joint_native_service import joint_case
+    from _support.collective_cases import joint_case
     base_joint = joint_case()
     execution = base_joint["runtime"]["kernels"]["service_regimes"][0]["execution"]
     j_low = rule("low", 1, 100, response=curve(), execution=execution)

@@ -7,8 +7,8 @@ import pytest
 
 from mindie_sim import graph_costs, operator_costs, study, target_graphs
 from mindie_sim.__main__ import main
-from test_communication_topology import exchange
-from test_joint_collective_execution import cohort_case
+from _support.collective_cases import exchange
+from _support.collective_cases import cohort_case
 
 
 def test_isolated_screening_counts_repeated_joint_cohort_once_per_source():

@@ -13,7 +13,7 @@ from mindie_sim.schema.common import ModelingError
 from mindie_sim.structure import export_structure
 from mindie_sim.study import study
 from test_body_gdn_defaults import case as gdn_case
-from test_cohort_comparison import _captured_report, _norm_case
+from _support.captures import captured_report as _captured_report, norm_case as _norm_case
 from test_prediction_system import case as small_case
 
 

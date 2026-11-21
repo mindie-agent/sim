@@ -13,8 +13,8 @@ import pytest
 from mindie_sim import graph_costs, operator_costs, predict
 from mindie_sim.prediction.response_functions import ResponseFunction
 from mindie_sim.schema.operators import IterationWork
-from test_joint_native_service import joint_case
-from test_resource_services import copy_op
+from _support.collective_cases import joint_case
+from _support.kernel_invocation import copy_op
 
 
 def curve_case(*, outside="analytic", joint=True):

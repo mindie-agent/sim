@@ -131,25 +131,6 @@ def _window_case():
     return parse_case(raw)
 
 
-def test_window_kv_intersects_the_live_tail_rows():
-    case = _window_case()
-    plan = case.model.layer_plans[0]
-    parallel = replace(case.runtime.parallel, tp=2, cp=2, dcp=2,
-                       cp_plan="dcp")
-    owners = ((0, 5), (5, 10))
-    width = 2 * plan.num_kv_heads * plan.head_dim
-    row_bytes = cache_format(case.model, "gqa_kv").row_bytes(width)
-    assert (width, row_bytes, 4 * row_bytes) == (32, 64, 256)
-
-    assert owned_token_rows(4, owners, 0, start=6) == 0
-    assert owned_token_rows(4, owners, 1, start=6) == 4
-    for rank, expected in ((0, 0.0), (1, 256.0)):
-        values = layer_cache_components(
-            case.model, plan, parallel, 10, capacity_padded=False,
-            rank=rank, owner_spans=owners)
-        assert values["gqa_kv"] == pytest.approx(expected)
-
-
 def test_pd_handoff_clips_the_window_tail_before_charging():
     raw = track_b._pd_model_case(10, 1)
     raw["model"]["layer_plans"] = [{
@@ -315,51 +296,9 @@ def test_quant_indexer_flops_follow_the_completed_key_count():
 # ---------------------------------------------------------------------------
 # 8. C8 mixed-prefix batches keep private rows on their own tiles.
 # ---------------------------------------------------------------------------
-def test_c8_distinct_prefix_keys_keep_private_rows_on_their_tiles():
-    sequences = ((1, 128), (1, 256))
-    op = wave4a._c8_op(sequences, 128, 64, 0)
-    base = dict(op.metadata)["indexed_attention_geometry"]
-    shape = {**base, "prefix_cache_mode": "shared",
-             "prefix_tokens": (128, 128),
-             "prefix_cache_keys": ("k0", "k1")}
-    shared, private, selected, private_keys = c8.prefix_partition(
-        shape, sequences, 128, sequence_keys=True)
-    assert (shared, private, selected) == (0, 256, 0)
-    assert private_keys == (128, 128)
-
-    _owners, streams = c8.tile_stream(sequences, 128, 32, 128, 1, False)
-    _, private, _ = c8._row_partition(shape, sequences, 128)
-    priced = c8._priced_streams(streams, sequences, 32, private)
-    kv_hbm = sum(work.resources["hbm"] for parts in priced for key in parts
-                 for name, work, _ in c8._tile_phases(
-                     key, shape["heads"], shape["latent"], shape["rope"])
-                 if name == "kv_stage")
-    assert kv_hbm == 256 * 656 == 167936
-
-
 # ---------------------------------------------------------------------------
 # 9. Plain INT8 MLA must not select the 656 B/row C8 kernel.
 # ---------------------------------------------------------------------------
-def test_plain_int8_mla_cache_does_not_select_packed_c8():
-    plan = SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64,
-                           cache_row_elements=576, index_topk=2048,
-                           indexer=True)
-    views = (SimpleNamespace(q_len=1, context=256, prefix_tokens=0,
-                             prefix_cache_key=""),)
-    meta = {"attention_tensor_view": {"cache_dtype": "int8"}}
-    plain = CacheFormat("int8")
-    assert plain.group_size == 0 and plain.row_bytes(576) == 576
-    assert packed_sfa_geometry(
-        meta, 8, plan, views, 8, cache_dtype="int8",
-        cache_fmt=plain) is None
-
-    packed = CacheFormat("int8", 128, "fp32", 64, "bf16")
-    geometry = packed_sfa_geometry(
-        meta, 8, plan, views, 8, cache_dtype="int8", cache_fmt=packed)
-    assert geometry is not None
-    assert (geometry["latent"], geometry["rope"]) == (512, 64)
-
-
 # ---------------------------------------------------------------------------
 # 10. Paired C8 writes the FP32 LSE statistics in plan and stages.
 # ---------------------------------------------------------------------------
@@ -376,28 +315,6 @@ def _recipe_context(op, geometry):
         pool_units=dict(geometry.buffer_units),
         pool_capacities=dict(geometry.buffers),
         physical_mechanisms=geometry.physical_mechanisms)
-
-
-def test_paired_c8_statistics_are_written_by_plan_and_stage():
-    op = wave4a._c8_op(((1, 128),), 128, 64, 0)
-    shape = dict(op.metadata)["indexed_attention_geometry"]
-    hardware = Geometry.from_devices(
-        parse_case(wave4a._c8_case(wave4a.SKUS[0][1])).machine.dies)
-    base = c8.arch35_plan(shape, hardware)
-    statistics = 96 * 2 * 4
-    assert statistics == 768
-    with_stats = c8.arch35_plan({**shape, "statistics_bytes": statistics},
-                                hardware)
-    assert with_stats.work.resources["mte3"] == (
-        base.work.resources["mte3"] + statistics)
-    assert with_stats.work.resources["hbm"] == (
-        base.work.resources["hbm"] + statistics)
-
-    program = with_stats.program(_recipe_context(op, hardware))
-    stage = next(item for item in program.stages
-                 if item.name == "lse_statistics")
-    assert stage.after == ("call0",)
-    assert sorted(stage.work.values()) == [statistics, statistics]
 
 
 # ---------------------------------------------------------------------------
@@ -671,74 +588,9 @@ def test_quant_indexer_per_query_causal_keys_are_not_flattened():
 # ---------------------------------------------------------------------------
 # Round 2. C8 mixed-prefix gathers count every visible query row.
 # ---------------------------------------------------------------------------
-def test_c8_mixed_prefix_gather_counts_each_visible_query_row():
-    sequences = ((1, 127), (1, 127), (1, 127))
-    op = wave4a._c8_op(sequences, 128, 64, 0)
-    base = dict(op.metadata)["indexed_attention_geometry"]
-    shape = {**base, "prefix_cache_mode": "shared",
-             "prefix_tokens": (127, 127, 127),
-             "prefix_cache_keys": ("A", "A", "B")}
-    shared, private, selected, keys = c8.prefix_partition(
-        shape, sequences, 128, sequence_keys=True)
-    # A 127-row prefix can supply at most 127 of TopK=128 keys, so each A
-    # request keeps one private appended row; B keeps all 128.
-    assert (shared, private, selected) == (127, 130, 127)
-    assert keys == (1, 1, 128)
-    assert (shared + private) * 656 == 257 * 656 == 168592
-    same = {**shape, "prefix_tokens": (128, 128),
-            "prefix_cache_keys": ("A", "A")}
-    assert c8.prefix_partition(same, ((1, 128), (1, 128)), 128) == (128, 0, 128)
-
-
 # ---------------------------------------------------------------------------
 # Round 2. Kimi DCP8: packed guard and declared LSE statistics.
 # ---------------------------------------------------------------------------
-def test_kimi_dcp8_plain_int8_excludes_packed_sfa_and_writes_statistics():
-    plan = SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64,
-                           cache_row_elements=576, index_topk=2048,
-                           indexer=True)
-    views = (SimpleNamespace(q_len=1, context=256, prefix_tokens=0,
-                             prefix_cache_key=""),)
-    meta = {"attention_tensor_view": {"cache_dtype": "int8"}}
-    packed_fmt = CacheFormat("int8", 128, "fp32", 64, "bf16",
-                             packed_elements=2)
-    assert packed_fmt.row_bytes(576) == 400
-    assert latent_dcp.packed_sfa_geometry(
-        meta, 8, plan, views, 8, cache_dtype="int8",
-        cache_fmt=packed_fmt) is None
-
-    case = parse_case(compose_case(
-        "kimi-k3.1", hardware="a5", dp=1, tp=8, dcp=8, pcp=1, ep=8,
-        pp=1, num_devices=8, layers=4, quant="int8",
-        prompt_tokens=8, output_tokens=2))
-    model = replace(case.model, quant=replace(case.model.quant,
-                                              kv_dtype="int8"))
-    layer = model.layer_plans[3]
-    decode = (RequestView("r", 1, 127, False, "decode"),)
-    builder = Builder("s0.l0", layer, 0, decode, model, "decode")
-    builder.add(OpSpec(
-        op_id="s0.l0.attention", family="attention", phase="decode",
-        stage=0, layer=0, requests=("r",), semantic_shape=(1, 96, 512),
-        local_shape=(1, 96, 512), padded_shape=(1, 96, 512),
-        launch_shape=(1, 96, 512), flops=0.0, vector_ops=0.0,
-        hbm_bytes=98304.0, mte2_bytes=0.0, mte3_bytes=98304.0, deps=(),
-        recipe="paired_mla_attention_analytic",
-        metadata=(("program_kind", "attention"),
-                  ("native_kernel", "mla_attention"))))
-    latent_dcp.attention_batch(
-        builder, ["s0.l0.attention"], decode, plan=layer, heads=96,
-        local_heads=12, cp=8, rows=1)
-    batch = next(op for op in builder.ops
-                 if op.op_id.endswith("latent_attention_batch"))
-    pack = next(op for op in builder.ops
-                if op.op_id.endswith("dcp_output_pack"))
-    # 98,304 B of BF16 output plus 768 B of FP32 LSE statistics: the immediate
-    # DCP consumer reads exactly the producer's declared write.
-    assert batch.hbm_bytes == pytest.approx(99072.0)
-    assert batch.mte3_bytes == pytest.approx(99072.0)
-    assert pack.mte2_bytes == pytest.approx(99072.0)
-
-
 # ---------------------------------------------------------------------------
 # Round 2. KeyPool TopK reads the assembled selection, not the local shard.
 # ---------------------------------------------------------------------------

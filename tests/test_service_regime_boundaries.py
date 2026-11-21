@@ -14,13 +14,13 @@ from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import IterationWork
 from mindie_sim.schema.workload import IterationPlan
-from test_communication_topology import exchange
-from test_device_kernel_groups import fork, phase
+from _support.collective_cases import exchange
+from _support.kernel_invocation import fork, phase
 from test_graph_analysis import op
-from test_joint_collective_execution import cohort_case
-from test_kernel_group_buffers import raw_case, group, competitor, recipes
+from _support.collective_cases import cohort_case
+from _support.kernel_invocation import raw_case, group, competitor, recipes
 from test_mechanism_contract import hardware_case
-from test_resource_services import copy_op
+from _support.kernel_invocation import copy_op
 
 
 def install(raw, rule):
@@ -254,7 +254,7 @@ def test_directional_service_mode_scaling_uses_the_declared_mode_rate_not_base_p
 
 def test_inclusive_resource_curve_keeps_real_competing_supply_under_outer_response():
     from mindie_sim.prediction.services import ResourceService
-    from test_resource_services import curve
+    from _support.kernel_invocation import curve
     raw = install(hardware_case(), response(5000, match={'recipe':'copy'}))
     parsed = parse_case(raw)
     book = RecipeBook({'copy': ResourceService(curve(parsed, copy_op(2000)))})

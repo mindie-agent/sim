@@ -7,7 +7,7 @@ import pytest
 from mindie_sim import graph_costs
 from mindie_sim.prediction.services import service_identity
 from mindie_sim.prediction.structure import parse_case
-from test_hccl_source_graph import declared, isolated_calls
+from _support.collective_cases import declared, isolated_calls
 
 
 def source_call():

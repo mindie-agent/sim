@@ -9,7 +9,7 @@ from mindie_sim.observations.captures import iter_conditions
 from mindie_sim.prediction.call import call_costs
 from mindie_sim.prediction.calls_activation import ActivationCallSpec, build_activation_call
 from mindie_sim.schema.common import ModelingError
-from test_capture_adapters import activation_protocol
+from _support.captures import activation_protocol
 from test_prediction_system import case
 
 

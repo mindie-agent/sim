@@ -8,7 +8,7 @@ import pytest
 from mindie_sim.cohort_comparison import compare_cohorts
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.structure import export_structure
-from test_cohort_comparison import _captured_report
+from _support.captures import captured_report as _captured_report
 
 
 ROOT = Path(__file__).resolve().parents[1]
