@@ -676,8 +676,6 @@ def probe_soc(
     scaffolded = _scaffold_sku_profile(probe, all_profiles, base_template_sku=resolved_template_sku)
     profile_conflicts, datapath_summary = _validate_profile_against_probe(probe, scaffolded)
     conflicts = [*source_conflicts, *profile_conflicts]
-    if scaffold_out is not None:
-        write_atomic_json(scaffold_out, {soc_name: scaffolded})
     can_succeed = (allow_scaffold or scaffold_out is not None) and not conflicts
     result = {
         "schema": SOC_PROBE_SCHEMA, "stage": "probe-soc",
@@ -691,6 +689,8 @@ def probe_soc(
         "conflicts": [c.to_dict() for c in conflicts], "scaffold_profile": {soc_name: scaffolded},
     }
     assert_sanitized_payload(result, field_name="probe_soc_result")
+    if scaffold_out is not None:
+        write_atomic_json(scaffold_out, {soc_name: scaffolded})
     return result
 
 

@@ -308,6 +308,7 @@ class CliffBenchPlan:
     tiling_axes: TilingAxes | None = None
     family: str = ""
     campaign_id: str = ""
+    arch_preset: str = ""
 
     def __post_init__(self) -> None:
         if self.schema != CLIFF_PLAN_SCHEMA:
@@ -340,7 +341,7 @@ class CliffBenchPlan:
             raise ModelingError("cliff_plan_sha256_invalid")
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "schema": self.schema,
             "plan_id": self.plan_id,
             "target_id": self.target_id,
@@ -356,6 +357,9 @@ class CliffBenchPlan:
             "tiling_axes": self.tiling_axes.to_dict() if self.tiling_axes is not None else None,
             "plan_sha256": self.plan_sha256,
         }
+        if self.arch_preset:
+            out["arch_preset"] = self.arch_preset
+        return out
 
 
 @dataclass(frozen=True, slots=True)

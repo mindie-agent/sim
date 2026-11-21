@@ -482,6 +482,7 @@ def synthesize_operator_cliff_plan(
         train_points=tuple(train_points), heldout_points=tuple(heldout),
         plan_sha256=plan_sha256, abi_rejection_points=tuple(abi_rejections),
         tiling_axes=axes, family=params.family, campaign_id=clean_campaign,
+        arch_preset=resolved_arch,
     )
     assert_sanitized_payload(plan.to_dict(), field_name="cliff_bench_plan")
     return plan
@@ -509,6 +510,24 @@ def verify_cliff_plan_integrity(plan_doc: Mapping[str, Any]) -> str:
         raise ModelingError(
             f"cliff_plan_sha256_tampered:supplied={supplied[:SHORT_DIGEST_LEN]}:expected={expected[:SHORT_DIGEST_LEN]}"
         )
+    abi_ctxs = {
+        int(pt["value"]) for pt in body["abi_rejection_points"]
+        if isinstance(pt, Mapping) and str(pt.get("axis") or "") == "context_len" and pt.get("value") is not None
+    }
+    train_ctxs = {
+        int(pt["value"]) for pt in body["train_points"]
+        if isinstance(pt, Mapping) and str(pt.get("axis") or "") == "context_len" and pt.get("value") is not None
+    }
+    held_ctxs = {
+        int(pt["value"]) for pt in body["heldout_points"]
+        if isinstance(pt, Mapping) and str(pt.get("axis") or "") == "context_len" and pt.get("value") is not None
+    }
+    missing_anc = [c for c in ANCHOR_CONTEXT_GRID if c not in train_ctxs and c not in abi_ctxs]
+    if missing_anc:
+        raise ModelingError(f"cliff_plan_incomplete_anchor_grid:missing={missing_anc}")
+    missing_off = [c for c in OFF_GRID_CLIFF_HELDOUT_GRID if c not in held_ctxs and c not in abi_ctxs]
+    if missing_off:
+        raise ModelingError(f"cliff_plan_incomplete_offgrid_cliff_grid:missing={missing_off}")
     return expected
 
 

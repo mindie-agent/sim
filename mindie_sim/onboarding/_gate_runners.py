@@ -42,6 +42,7 @@ from .contracts import (
     DEFAULT_GATE_SUBPROCESS_TIMEOUT_S,
     DEFAULT_HELDOUT_APE_THRESHOLD_PCT,
     GateCheckOutcome,
+    assert_sanitized_payload,
     sanitize_public_warning,
     subprocess_window_kwargs,
     write_atomic_json,
@@ -229,18 +230,26 @@ def run_tail_cluster_diagnosis(
             "schema": "mindie-sim.tail-cluster-diagnosis/1", "status": "diagnostic_script_unavailable",
             "cluster_count": 0, "clusters": [], "detail": "scripts/diagnose_tail_cluster.py not found under repo root",
         }
+    res_payload = {"residuals": list(residuals)}
+    assert_sanitized_payload(res_payload, field_name="tail_diagnosis.residuals")
+    lin_payload = {"lineage": list(lineage)} if lineage else None
+    if lin_payload is not None:
+        assert_sanitized_payload(lin_payload, field_name="tail_diagnosis.lineage")
+    rcpt_payload = {"receipts": list(engine_receipts)} if engine_receipts else None
+    if rcpt_payload is not None:
+        assert_sanitized_payload(rcpt_payload, field_name="tail_diagnosis.receipts")
     with tempfile.TemporaryDirectory(prefix="msim-diag-") as tmp_dir:
         tmp = Path(tmp_dir)
         res_file = tmp / "residuals.json"
-        write_atomic_json(res_file, {"residuals": list(residuals)})
+        write_atomic_json(res_file, res_payload)
         cli_args = ["--residuals", str(res_file), "--threshold-pct", str(float(threshold_pct))]
-        if lineage:
+        if lin_payload is not None:
             lin_file = tmp / "lineage.json"
-            write_atomic_json(lin_file, {"lineage": list(lineage)})
+            write_atomic_json(lin_file, lin_payload)
             cli_args.extend(["--lineage", str(lin_file)])
-        if engine_receipts:
+        if rcpt_payload is not None:
             rcpt_file = tmp / "receipts.json"
-            write_atomic_json(rcpt_file, {"receipts": list(engine_receipts)})
+            write_atomic_json(rcpt_file, rcpt_payload)
             cli_args.extend(["--engine-receipts", str(rcpt_file)])
         done = _run_python_script(script, cli_args, cwd=exec_root, timeout_s=timeout_s)
     if done.returncode not in (0, _DIAGNOSE_ESCALATED_EXIT) or not (done.stdout or "").strip():
@@ -249,6 +258,7 @@ def run_tail_cluster_diagnosis(
         report = json.loads(done.stdout)
     except ValueError as exc:
         raise ModelingError(f"diagnose_tail_cluster_invalid_json:{exc}") from exc
+    assert_sanitized_payload(report, field_name="tail_diagnosis.report")
     if output_path is not None:
         write_atomic_json(output_path, report)
     return report
@@ -292,7 +302,9 @@ def run_live_l0_bench_subprocess(
         ]
         if profile_override is not None:
             prof_file = tmp / "scaffold_profile.json"
-            write_atomic_json(prof_file, {sku: dict(profile_override)})
+            prof_payload = {sku: dict(profile_override)}
+            assert_sanitized_payload(prof_payload, field_name="live_l0_profile_override")
+            write_atomic_json(prof_file, prof_payload)
             cli_args.extend(["--profile-json", str(prof_file)])
         if granted:
             cli_args.extend(["--visible-devices", ",".join(str(d) for d in granted)])

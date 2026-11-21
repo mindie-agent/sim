@@ -62,6 +62,7 @@ from .contracts import (
     collect_receipt_warnings,
     sanitize_lease_for_receipt,
     sanitize_public_campaign_id,
+    write_atomic_bytes,
     write_atomic_json,
 )
 
@@ -500,11 +501,12 @@ def calibrate_l0_and_fabric(
     default_rel = f"data/primitives/{arch_prefix}_{clean_sku_slug}.json"
 
     if out_primitives is not None:
+        assert_sanitized_payload(payload, field_name="calibrate_l0_primitives_payload")
+        assert_sanitized_payload(merged_raw, field_name="calibrate_l0_capture_payload")
         out_path = Path(out_primitives)
         write_atomic_json(out_path, payload)
         cap_path = out_path.parent / "captures" / f"{out_path.stem}.capture.json"
-        cap_path.parent.mkdir(parents=True, exist_ok=True)
-        cap_path.write_bytes(sealer.canonical_capture_bytes(sku, merged_raw))
+        write_atomic_bytes(cap_path, sealer.canonical_capture_bytes(sku, merged_raw))
         if manifest_path is not None:
             sealer.update_manifest(Path(manifest_path), out_path, payload)
 
@@ -521,6 +523,7 @@ def calibrate_l0_and_fabric(
         "capture_uri": capture_uri, "calibrated_primitives": calibrated_list,
     }
     if train_manifest_out is not None:
+        assert_sanitized_payload(train_manifest, field_name="calibrate_l0_train_manifest")
         write_atomic_json(train_manifest_out, train_manifest)
 
     public_lease = sanitize_lease_for_receipt(raw_lease_info)

@@ -32,14 +32,10 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Callable, Mapping, Sequence
-import hashlib
-import json
 import os
 from pathlib import Path
-import re
 import shlex
 import socket
-import statistics
 import subprocess
 import sys
 import tempfile
@@ -49,53 +45,33 @@ import uuid
 
 from mindie_sim.schema.common import ModelingError
 
-from ._profiler_plan import (
-    _DEFAULT_SIM_MODEL,
-    assign_plan_point_level,
-    build_profiler_subgraph_plan,
-    derive_writer_clock_operator,
-    extract_abi_attempted_shape,
-    extract_observed_shape,
-    extract_shape_dims,
-    parse_run_id_and_arm,
-    parse_topo_options,
-    quantile_ns,
-    resolve_point_measured_binding,
-    select_mode_candidates,
-    verify_actual_geometry_matches_plan,
+from ._profiler_geometry import extract_abi_attempted_shape
+from ._profiler_normalizer import normalize_profiler_records
+from ._profiler_plan import assign_plan_point_level, build_profiler_subgraph_plan
+from ._profiler_records import (
+    _ABI_REJECT_STATUSES,
+    _ACCEPTED_ABI_STATUSES,
+    _PASSING_RECEIPT_STATUSES,
+    _parse_json_or_jsonl_records,
+    _parse_rank_hint,
 )
 from ._soc_probe import run_ssh_command
 from .contracts import (
     DEFAULT_GATE_SUBPROCESS_TIMEOUT_S,
-    NS_PER_MS,
-    SHORT_DIGEST_LEN,
+    MAX_READ_JSON_BYTES,
+    assert_sanitized_payload,
     canonical_json_bytes,
-    sanitize_public_alias,
-    sanitize_public_run_id,
     subprocess_window_kwargs,
     write_atomic_bytes,
 )
 
-_P99_QUANTILE = 0.99
 _PARTIAL_EXIT_CODE = 2
 _MAX_UNEXPECTED_REPORTED = 8
 _ACQ_ID_HEX_LEN = 12
 _PROC_REAP_GRACE_S = 5.0
 _MIN_POLL_REMAINING_S = 0.05
 _LOCAL_ENDPOINT_ALIASES = frozenset({"", "local", "localhost", "127.0.0.1", "::1"})
-_ABI_REJECT_STATUSES = frozenset({"abi_rejected", "unsupported_binding"})
-_PASSING_RECEIPT_STATUSES = frozenset({"ok", "skipped_stage", "skipped_non_participant"})
-_ACCEPTED_ABI_STATUSES = frozenset({"ok", "unqualified"})
-_OBSERVATION_SCHEMA = "mindie-bench-observation/1"
-_RECEIPT_SCHEMA = "mindie-bench-receipt/1"
-_SUBGRAPH_RUN_SCHEMA = "mindie-bench-subgraph-run/1"
 _REMOTE_RECEIPT_DELIM = "__MINDIE_RECEIPT_JSON__"
-_RANK_FILENAME_RE = re.compile(r"\.rank(\d+)\.(?:json|jsonl)$")
-
-
-def _parse_rank_hint(filename: str) -> int | None:
-    match = _RANK_FILENAME_RE.search(str(filename or ""))
-    return int(match.group(1)) if match else None
 
 
 def _is_remote_endpoint(endpoint_alias: str) -> bool:
@@ -106,671 +82,6 @@ def _pick_free_local_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
-
-
-def _propagate_envelope_fields(
-    item: dict[str, Any],
-    envelope: Mapping[str, Any],
-    *,
-    key: str,
-    rank_hint: int | None,
-) -> dict[str, Any]:
-    for field in ("run_id", "plan_id", "stage", "acquisition_id"):
-        if envelope.get(field) and not item.get(field):
-            item[field] = envelope[field]
-    env_rank = envelope.get("rank")
-    eff_rank = (
-        int(env_rank)
-        if isinstance(env_rank, int) and not isinstance(env_rank, bool)
-        else rank_hint
-    )
-    if eff_rank is not None and item.get("rank") is None:
-        item["rank"] = eff_rank
-    if key != "observations" and not item.get("record_type"):
-        item["record_type"] = "receipt"
-    return item
-
-
-def _parse_json_or_jsonl_records(
-    text: str, *, rank_hint: int | None = None
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    stripped = text.strip()
-    if not stripped:
-        return [], {}
-    try:
-        raw = json.loads(stripped)
-    except ValueError:
-        rows: list[dict[str, Any]] = []
-        for idx, line in enumerate(stripped.splitlines(), start=1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-            except ValueError as exc:
-                raise ModelingError(f"profiler_bench_invalid_jsonl:line={idx}:{exc}") from exc
-            if not isinstance(rec, Mapping):
-                raise ModelingError(f"profiler_bench_jsonl_record_not_mapping:line={idx}")
-            item = dict(rec)
-            if rank_hint is not None and item.get("rank") is None:
-                item["rank"] = rank_hint
-            rows.append(item)
-        return rows, {}
-    if isinstance(raw, Mapping):
-        collected: list[dict[str, Any]] = []
-        for key in ("observations", "records", "cases", "receipts", "abi_rejections"):
-            val = raw.get(key)
-            if isinstance(val, list):
-                collected.extend(
-                    _propagate_envelope_fields(dict(r), raw, key=key, rank_hint=rank_hint)
-                    for r in val
-                    if isinstance(r, Mapping)
-                )
-        if isinstance(raw.get("receipt"), Mapping):
-            sub_env = raw["receipt"]
-            for key in ("cases", "records", "receipts", "abi_rejections"):
-                val = sub_env.get(key)
-                if isinstance(val, list):
-                    collected.extend(
-                        _propagate_envelope_fields(dict(r), sub_env, key=key, rank_hint=rank_hint)
-                        for r in val
-                        if isinstance(r, Mapping)
-                    )
-        if not collected and (raw.get("record_type") or raw.get("case_id")):
-            single = dict(raw)
-            if rank_hint is not None and single.get("rank") is None:
-                single["rank"] = rank_hint
-            if not single.get("record_type") and str(single.get("schema") or "") in {_RECEIPT_SCHEMA, _SUBGRAPH_RUN_SCHEMA}:
-                single["record_type"] = "receipt"
-            collected.append(single)
-        meta = dict(raw)
-        if rank_hint is not None and meta.get("rank") is None:
-            meta["rank"] = rank_hint
-        return collected, meta
-    if not isinstance(raw, list):
-        raise ModelingError("profiler_bench_observations_not_list")
-    return [dict(r) for r in raw if isinstance(r, Mapping)], {}
-
-
-def _extract_ranks_from_bucket(group: Sequence[Mapping[str, Any]], summary: Mapping[str, Any]) -> list[int]:
-    ranks_raw = summary.get("participating_ranks")
-    if isinstance(ranks_raw, Sequence) and not isinstance(ranks_raw, (str, bytes)) and ranks_raw:
-        parsed = sorted({int(r) for r in ranks_raw if not isinstance(r, bool)})
-        if parsed:
-            return parsed
-    obs_ranks = sorted({
-        int(r["rank"]) for r in group
-        if r.get("rank") is not None and not isinstance(r.get("rank"), bool)
-    })
-    return obs_ranks if obs_ranks else [0]
-
-
-def _critical_path_durations_ns(
-    group: Sequence[Mapping[str, Any]], *, expected_ranks: Sequence[int], cid: str
-) -> list[int]:
-    if len(expected_ranks) <= 1:
-        return sorted(
-            int(round(float(r["duration_ms"]) * NS_PER_MS))
-            for r in group
-            if r.get("duration_ms") is not None and float(r["duration_ms"]) > 0.0
-        )
-    expected_set = {int(r) for r in expected_ranks}
-    by_sample_slot: dict[tuple[int, int], dict[int, int]] = {}
-    for row in group:
-        raw_dur = row.get("duration_ms")
-        if raw_dur is None or isinstance(raw_dur, bool) or float(raw_dur) <= 0.0:
-            raise ModelingError(f"multirank_sample_duration_invalid:{cid}")
-        rk = row.get("rank")
-        trial = row.get("trial")
-        rep = row.get("repeat_index")
-        if (
-            rk is None or isinstance(rk, bool) or not isinstance(rk, int)
-            or trial is None or isinstance(trial, bool) or not isinstance(trial, int)
-            or rep is None or isinstance(rep, bool) or not isinstance(rep, int)
-        ):
-            raise ModelingError(f"multirank_sample_coordinates_missing:{cid}")
-        if rk not in expected_set:
-            raise ModelingError(
-                f"multirank_sample_unexpected_rank:{cid}:rank={rk}:expected={sorted(expected_set)}"
-            )
-        slot_key = (trial, rep)
-        slot_ranks = by_sample_slot.setdefault(slot_key, {})
-        if rk in slot_ranks:
-            raise ModelingError(f"multirank_sample_duplicate_rank:{cid}:slot={slot_key}:rank={rk}")
-        slot_ranks[rk] = int(round(float(raw_dur) * NS_PER_MS))
-    if not by_sample_slot:
-        raise ModelingError(f"multirank_incomplete_rank_samples:{cid}:empty")
-    for slot_key, slot_ranks in sorted(by_sample_slot.items()):
-        if set(slot_ranks) != expected_set:
-            missing = sorted(expected_set - set(slot_ranks))
-            raise ModelingError(
-                f"multirank_incomplete_rank_samples:{cid}:slot={slot_key}:missing_ranks={missing}"
-            )
-    return sorted(max(slot_ranks.values()) for slot_ranks in by_sample_slot.values())
-
-
-def _lookup_entry_receipts(
-    receipts_by_key: Mapping[tuple[str, str, int | None], list[Mapping[str, Any]]],
-    *,
-    cid: str,
-    base_rid: str,
-    ranks: Sequence[int],
-) -> tuple[list[Mapping[str, Any]], list[int]]:
-    matched: list[Mapping[str, Any]] = []
-    seen_ids: set[int] = set()
-    covered_ranks: set[int] = set()
-    for rk in ranks:
-        rk_int = int(rk)
-        rk_rcpts = receipts_by_key.get((cid, base_rid, rk_int)) or ()
-        if rk_rcpts:
-            covered_ranks.add(rk_int)
-            for rcpt in rk_rcpts:
-                obj_id = id(rcpt)
-                if obj_id not in seen_ids:
-                    seen_ids.add(obj_id)
-                    matched.append(rcpt)
-    unsuffixed = receipts_by_key.get((cid, base_rid, None)) or ()
-    if unsuffixed:
-        if len(ranks) == 1:
-            covered_ranks.add(int(ranks[0]))
-        for rcpt in unsuffixed:
-            obj_id = id(rcpt)
-            if obj_id not in seen_ids:
-                seen_ids.add(obj_id)
-                matched.append(rcpt)
-    return matched, sorted(covered_ranks)
-
-
-def _join_multirank_obs_entries(
-    raw_entries: list[dict[str, Any]],
-    *,
-    plan_pts_by_id: Mapping[str, Mapping[str, Any]],
-) -> list[dict[str, Any]]:
-    from .cliff_planner import validate_parallel_topology
-
-    passthrough: list[dict[str, Any]] = []
-    grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
-    for entry in raw_entries:
-        cid = entry["cid"]
-        plan_pt = plan_pts_by_id.get(cid)
-        req_ranks = validate_parallel_topology(str((plan_pt or {}).get("parallel_topology") or "tp1"))
-        if req_ranks <= 1:
-            passthrough.append(entry)
-            continue
-        group_key = entry["acq_key"]
-        grouped.setdefault((cid, entry["split"], group_key), []).append(entry)
-
-    joined_out: list[dict[str, Any]] = list(passthrough)
-    for (cid, split, group_key), members in sorted(grouped.items()):
-        if len(members) == 1:
-            joined_out.append(members[0])
-            continue
-        seen_ranks: set[int] = set()
-        disjoint = True
-        for m in members:
-            m_ranks = set(m["ranks"])
-            if seen_ranks & m_ranks:
-                disjoint = False
-                break
-            seen_ranks |= m_ranks
-        if not disjoint:
-            joined_out.extend(members)
-            continue
-        clocks = {m["clock_op"] for m in members}
-        if len(clocks) > 1:
-            raise ModelingError(f"profiler_writer_clock_operator_conflict:{cid}:{sorted(clocks)}")
-        merged_group: list[Mapping[str, Any]] = []
-        merged_receipts: list[Mapping[str, Any]] = []
-        merged_receipt_ranks: set[int] = set()
-        base_rids: list[str] = []
-        for m in members:
-            merged_group.extend(m["group"])
-            merged_receipts.extend(m.get("receipts") or ())
-            merged_receipt_ranks.update(int(r) for r in (m.get("receipt_ranks") or ()))
-            base_rids.append(m["base_rid"])
-        acq_id = next((m["acq_id"] for m in members if m["acq_id"]), "")
-        if acq_id:
-            pub_run_id = sanitize_public_run_id(acq_id)
-        else:
-            digest = hashlib.sha256(
-                canonical_json_bytes([group_key, cid, split, sorted(base_rids)])
-            ).hexdigest()[:SHORT_DIGEST_LEN]
-            pub_run_id = f"mrank-{digest}"
-        joined_out.append({
-            "cid": cid,
-            "base_rid": pub_run_id,
-            "pub_run_id": pub_run_id,
-            "split": split,
-            "clock_op": next(iter(clocks)),
-            "group": merged_group,
-            "receipts": merged_receipts,
-            "receipt_ranks": sorted(merged_receipt_ranks),
-            "comp": members[0]["comp"],
-            "summary": members[0]["summary"],
-            "ranks": sorted(seen_ranks),
-            "acq_id": acq_id,
-            "acq_key": group_key,
-            "multi_rank_joined": True,
-        })
-    return joined_out
-
-
-def _collect_abi_and_buckets(
-    raw_records: Sequence[Mapping[str, Any]],
-    *,
-    planned_abi_by_id: Mapping[str, Mapping[str, Any]],
-) -> tuple[
-    dict[tuple[str, str], Mapping[str, Any]],
-    dict[tuple[str, str, str], dict[tuple[str, str], list[Mapping[str, Any]]]],
-    dict[tuple[str, str, int | None], list[Mapping[str, Any]]],
-    list[dict[str, Any]],
-]:
-    completes: dict[tuple[str, str], Mapping[str, Any]] = {}
-    obs_buckets: dict[tuple[str, str, str], dict[tuple[str, str], list[Mapping[str, Any]]]] = {}
-    receipts_by_key: dict[tuple[str, str, int | None], list[Mapping[str, Any]]] = {}
-    abi_rows: list[dict[str, Any]] = []
-    seen_abi_tuples: set[tuple[str, str, bytes]] = set()
-
-    for rec in raw_records:
-        rtype = str(rec.get("record_type") or "")
-        status = str(rec.get("status") or "ok").strip().lower()
-        cid = str(rec.get("case_id") or rec.get("point_id") or "").strip()
-        raw_run_id = str(rec.get("run_id") or "run-0").strip()
-
-        if cid in planned_abi_by_id and (rtype == "observation" or status in _ACCEPTED_ABI_STATUSES):
-            exp_err = str(planned_abi_by_id[cid].get("abi_expected_error") or "")
-            raise ModelingError(
-                f"profiler_abi_rejection_unexpectedly_accepted:{cid}:expected={exp_err}"
-            )
-        if status in _ABI_REJECT_STATUSES:
-            if cid:
-                err_text = str(rec.get("abi_error") or rec.get("reason") or "").strip()
-                attempted = extract_abi_attempted_shape(rec, planned_abi_by_id.get(cid))
-                shape_sig = canonical_json_bytes(attempted) if attempted is not None else b"null"
-                dedup_key = (cid, err_text, shape_sig)
-                if dedup_key not in seen_abi_tuples:
-                    seen_abi_tuples.add(dedup_key)
-                    abi_rows.append({
-                        "point_id": cid, "rejected": True,
-                        "abi_error": err_text,
-                        "executed_shape": attempted,
-                    })
-            continue
-        if cid in planned_abi_by_id and status not in _PASSING_RECEIPT_STATUSES:
-            abi_rows.append({
-                "point_id": cid, "rejected": True,
-                "abi_error": str(rec.get("abi_error") or rec.get("reason") or status).strip(),
-                "executed_shape": extract_abi_attempted_shape(rec, planned_abi_by_id.get(cid)),
-            })
-            continue
-        if rtype == "case_complete":
-            base_rid, _arm = parse_run_id_and_arm(raw_run_id)
-            completes[(cid, base_rid)] = rec
-        elif rtype == "observation":
-            split = "heldout" if str(rec.get("split") or "") == "heldout" else "train"
-            tmode = str(rec.get("timing_mode") or "default").strip()
-            exec_map = rec.get("execution") if isinstance(rec.get("execution"), Mapping) else {}
-            base_rid, arm = parse_run_id_and_arm(
-                raw_run_id, tmode, rec.get("trial"), str(rec.get("source") or ""), exec_map
-            )
-            obs_buckets.setdefault((cid, base_rid, split), {}).setdefault((arm, tmode), []).append(rec)
-        elif cid:
-            if status not in _PASSING_RECEIPT_STATUSES:
-                raise ModelingError(f"profiler_bench_receipt_failed:{cid}:{status}")
-            if status == "ok":
-                base_rid, _arm = parse_run_id_and_arm(raw_run_id)
-                raw_rk = rec.get("rank")
-                rk_val = int(raw_rk) if isinstance(raw_rk, int) and not isinstance(raw_rk, bool) else None
-                receipts_by_key.setdefault((cid, base_rid, rk_val), []).append(rec)
-    return completes, obs_buckets, receipts_by_key, abi_rows
-
-
-def _norm_timed_op_id(raw_id: str, cid: str) -> str:
-    clean = str(raw_id or "").strip()
-    prefix = f"{cid}:"
-    if clean.startswith(prefix):
-        return clean[len(prefix):]
-    if ":" in clean:
-        return clean.rsplit(":", 1)[1]
-    return clean
-
-
-def _extract_entry_timed_nodes(
-    entry_receipts: Sequence[Mapping[str, Any]],
-    summary: Mapping[str, Any],
-    *,
-    cid: str,
-    level: str,
-    is_planned: bool,
-    expected_timed_ops: Sequence[str] = (),
-) -> list[str]:
-    if level not in {"L2", "L3"}:
-        for src in (*entry_receipts, summary):
-            if isinstance(src, Mapping):
-                tn = src.get("timed_nodes")
-                if isinstance(tn, Sequence) and not isinstance(tn, (str, bytes)) and tn:
-                    return [str(x) for x in tn]
-        return []
-
-    sources: list[Mapping[str, Any]] = list(entry_receipts)
-    if not sources and not is_planned and isinstance(summary, Mapping):
-        sources = [summary]
-    if not sources:
-        raise ModelingError(f"profiler_timed_nodes_missing:{cid}:level={level}")
-
-    parsed_lists: list[list[str]] = []
-    op_sets: list[frozenset[str]] = []
-    for src in sources:
-        tn = src.get("timed_nodes") if isinstance(src, Mapping) else None
-        if not isinstance(tn, Sequence) or isinstance(tn, (str, bytes)) or not tn:
-            rk = src.get("rank") if isinstance(src, Mapping) else None
-            raise ModelingError(f"profiler_timed_nodes_missing:{cid}:level={level}:rank={rk}")
-        items = [str(x) for x in tn if str(x).strip()]
-        if not items:
-            raise ModelingError(f"profiler_timed_nodes_missing:{cid}:level={level}")
-        parsed_lists.append(items)
-        op_sets.append(frozenset(_norm_timed_op_id(x, cid) for x in items))
-
-    first_set = op_sets[0]
-    if any(op_set != first_set for op_set in op_sets[1:]):
-        counts = [len(op_set) for op_set in op_sets]
-        raise ModelingError(f"profiler_timed_nodes_rank_mismatch:{cid}:level={level}:counts={counts}")
-    sum_tn = summary.get("timed_nodes") if isinstance(summary, Mapping) else None
-    if isinstance(sum_tn, Sequence) and not isinstance(sum_tn, (str, bytes)) and sum_tn:
-        sum_set = frozenset(_norm_timed_op_id(str(x), cid) for x in sum_tn if str(x).strip())
-        if sum_set and sum_set != first_set:
-            raise ModelingError(
-                f"profiler_timed_nodes_summary_mismatch:{cid}:level={level}"
-                f":summary={len(sum_set)}:receipt={len(first_set)}"
-            )
-    exp_set = frozenset(_norm_timed_op_id(str(x), cid) for x in expected_timed_ops if str(x).strip())
-    if exp_set and first_set != exp_set:
-        raise ModelingError(
-            f"profiler_timed_nodes_plan_mismatch:{cid}:level={level}"
-            f":got={len(first_set)}:expected={len(exp_set)}"
-        )
-    return parsed_lists[0]
-
-
-def _verify_entry_receipts_and_shape(
-    entry: Mapping[str, Any],
-    *,
-    entry_receipts: Sequence[Mapping[str, Any]],
-    summary: Mapping[str, Any],
-    first: Mapping[str, Any],
-    comp: Mapping[str, Any],
-    plan_pt: Mapping[str, Any] | None,
-    binding_info: Mapping[str, Any] | None,
-    exp_ranks: Sequence[int],
-    cid: str,
-) -> dict[str, Any]:
-    if plan_pt is not None:
-        receipt_ranks = {int(r) for r in (entry.get("receipt_ranks") or ())}
-        if not entry_receipts or not set(exp_ranks).issubset(receipt_ranks):
-            raise ModelingError(
-                f"profiler_bench_receipt_missing:{cid}:expected_ranks={list(exp_ranks)}"
-                f":got_ranks={sorted(receipt_ranks)}"
-            )
-    req_shape = extract_observed_shape(
-        summary, first, comp, receipts=entry_receipts, allow_requested_fallback=(plan_pt is None),
-    )
-    if plan_pt is not None and not req_shape:
-        raise ModelingError(f"profiler_actual_shape_missing:{cid}")
-    if plan_pt is not None and binding_info is not None:
-        verify_actual_geometry_matches_plan(
-            req_shape, plan_pt, expected_shape=binding_info["expected_shape"], cid=cid
-        )
-        for rcpt in entry_receipts:
-            rcpt_shape = extract_observed_shape(
-                {}, {}, {}, receipts=(rcpt,), allow_requested_fallback=False,
-            )
-            if not rcpt_shape:
-                raise ModelingError(f"profiler_actual_shape_missing:{cid}:rank={rcpt.get('rank')}")
-            verify_actual_geometry_matches_plan(
-                rcpt_shape, plan_pt, expected_shape=binding_info["expected_shape"], cid=cid
-            )
-    return req_shape
-
-
-def _seal_normalized_entry(
-    entry: Mapping[str, Any],
-    *,
-    plan_doc: Mapping[str, Any],
-    plan_pt: Mapping[str, Any] | None,
-    sku: str,
-    clean_ep: str,
-    plan_family: str,
-    plan_target_id: str,
-    capture_out_dir: str | Path | None,
-) -> dict[str, Any] | None:
-    from .cliff_planner import validate_parallel_topology
-
-    cid = str(entry["cid"])
-    split = str(entry["split"])
-    clock_op = str(entry["clock_op"])
-    group = entry["group"]
-    entry_receipts = list(entry.get("receipts") or ())
-    comp = entry["comp"]
-    summary = entry["summary"]
-    ranks = list(entry["ranks"])
-    pub_run_id = str(entry["pub_run_id"])
-    acq_id = str(entry.get("acq_id") or "").strip()
-    first = group[0]
-
-    req_ranks = (
-        validate_parallel_topology(str(plan_pt.get("parallel_topology") or "tp1"))
-        if plan_pt is not None
-        else len(ranks)
-    )
-    exp_ranks = list(range(req_ranks)) if req_ranks > 1 else ranks
-    durations_ns = _critical_path_durations_ns(group, expected_ranks=exp_ranks, cid=cid)
-    if not durations_ns:
-        return None
-    p50_ns = int(round(statistics.median(durations_ns)))
-    p99_ns = quantile_ns(durations_ns, _P99_QUANTILE)
-    plan_key = (
-        summary.get("plan_key")
-        if isinstance(summary.get("plan_key"), Mapping)
-        else (first.get("plan_key") if isinstance(first.get("plan_key"), Mapping) else {})
-    )
-    binding_info = (
-        resolve_point_measured_binding(plan_doc, plan_pt, sku=sku)
-        if plan_pt is not None
-        else None
-    )
-    req_shape = _verify_entry_receipts_and_shape(
-        entry,
-        entry_receipts=entry_receipts,
-        summary=summary,
-        first=first,
-        comp=comp,
-        plan_pt=plan_pt,
-        binding_info=binding_info,
-        exp_ranks=exp_ranks,
-        cid=cid,
-    )
-    dims = extract_shape_dims(
-        req_shape,
-        plan_key,
-        plan_pt=plan_pt,
-        expected_shape=binding_info["expected_shape"] if binding_info else None,
-    )
-    ev_ids = sorted({str(r.get("sample_id") or f"{cid}-s{i}") for i, r in enumerate(group)})
-    ident = first.get("identity") if isinstance(first.get("identity"), Mapping) else {}
-    raw_level = str(first.get("level") or ident.get("level") or "").strip().upper()
-    if raw_level in {"L1", "L2", "L3"}:
-        known_level = raw_level
-    elif binding_info is not None:
-        known_level = binding_info["level"]
-    else:
-        known_level = ""
-    expected_timed = (
-        binding_info["measured_binding"].get("timed_op_ids") or ()
-        if binding_info is not None
-        else ()
-    )
-    timed_nodes = _extract_entry_timed_nodes(
-        entry_receipts,
-        summary,
-        cid=cid,
-        level=known_level or "L1",
-        is_planned=(plan_pt is not None),
-        expected_timed_ops=expected_timed,
-    )
-    level = known_level if known_level else ("L1" if len(timed_nodes) <= 1 else "L2")
-
-    cap_payload: dict[str, Any] = {
-        "case_id": cid, "run_id": pub_run_id, "split": split, "sku": str(first.get("sku") or sku),
-        "clock_domain": "device_monotonic", "clock_operator": clock_op,
-        "start_event": "k_start", "end_event": "k_end",
-        "device_ranks": ranks, "event_ids": ev_ids,
-        "samples_ns": durations_ns, "measured_ns": p50_ns, "measured_p99_ns": p99_ns,
-        "busy_union_ns": p50_ns if clock_op == "busy_union" else None,
-        "elapsed_span_ns": p50_ns if clock_op == "elapsed_span" else None,
-        "plan_key": dict(plan_key), "actual_shape": dict(req_shape),
-    }
-    cap_bytes = canonical_json_bytes(cap_payload)
-    raw_sha = hashlib.sha256(cap_bytes).hexdigest()
-    cap_uri = f"capture://{clean_ep}/{pub_run_id}/{raw_sha}.json"
-    if capture_out_dir is not None:
-        write_atomic_bytes(Path(capture_out_dir) / f"{raw_sha}.json", cap_bytes)
-
-    if binding_info is not None:
-        sim_fam, sim_case, row_phase = (
-            binding_info["target_family"], binding_info["sim_case"], binding_info["phase"]
-        )
-    else:
-        sim_fam = str(summary.get("op") or ("" if plan_family == "sku_suite" else plan_family) or "rmsnorm")
-        sim_case = {
-            "compose_model": _DEFAULT_SIM_MODEL, "compose_hardware": sku,
-            "compose_options": parse_topo_options(dims["parallel_topology"]),
-        }
-        row_phase = str(first.get("phase") or ident.get("phase") or "decode")
-
-    acq_root = sanitize_public_run_id(acq_id) if acq_id else f"acq-{split}-{pub_run_id}"
-    row_out: dict[str, Any] = {
-        "case_id": cid, "point_id": cid, "sku": str(first.get("sku") or sku),
-        "split": split, "level": level, "phase": row_phase,
-        "acquisition_root": acq_root, "run_uid": pub_run_id,
-        "raw_sha256": raw_sha, "capture_uri": cap_uri,
-        "clock_domain": "device_monotonic", "start_event": "k_start", "end_event": "k_end",
-        "event_ids": ev_ids, "device_ranks": ranks, "clock_operator": clock_op,
-        "measured_ns": p50_ns, "measured_p99_ns": p99_ns,
-        "busy_union_ns": p50_ns if clock_op == "busy_union" else None,
-        "elapsed_span_ns": p50_ns if clock_op == "elapsed_span" else None,
-        "validated": all(bool(r.get("validated", True)) for r in group),
-        "qualified": all(bool(r.get("qualified", True)) for r in group),
-        "operator_id": plan_target_id,
-        "implementation": str(
-            ident.get("implementation") or (binding_info["implementation"] if binding_info else "") or summary.get("op") or "profiler_bench"
-        ),
-        "upstream_abi": str(plan_key.get("abi") or ident.get("implementation") or ""),
-        "target_family": sim_fam, "sim_case": sim_case,
-        "plan_key": dict(plan_key), "actual_shape": dict(req_shape), **dims,
-    }
-    if timed_nodes:
-        row_out["timed_nodes"] = timed_nodes
-    if binding_info is not None:
-        if binding_info["target_op_id"]:
-            row_out["target_op_id"] = binding_info["target_op_id"]
-        if binding_info["target_op_ids"]:
-            row_out["target_op_ids"] = list(binding_info["target_op_ids"])
-        row_out["measured_binding"] = dict(binding_info["measured_binding"])
-    return row_out
-
-
-def normalize_profiler_records(
-    raw_records: Sequence[Mapping[str, Any]],
-    *,
-    plan_doc: Mapping[str, Any],
-    sku: str,
-    endpoint_alias: str = "",
-    capture_out_dir: str | Path | None = None,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Convert raw ``mindie-profiler`` JSONL/receipt rows into verified onboarding rows & ABI rows."""
-    if not raw_records:
-        return [], []
-    planned_abi_by_id: dict[str, Mapping[str, Any]] = {
-        str(pt["point_id"]): pt
-        for pt in (plan_doc.get("abi_rejection_points") or ())
-        if isinstance(pt, Mapping) and pt.get("point_id")
-    }
-    is_profiler_schema = any(
-        str(r.get("schema") or "") in {_OBSERVATION_SCHEMA, _RECEIPT_SCHEMA, _SUBGRAPH_RUN_SCHEMA}
-        or r.get("record_type") in {"observation", "case_complete", "receipt"}
-        for r in raw_records
-    )
-    if not is_profiler_schema:
-        obs_out = [dict(r) for r in raw_records if str(r.get("status") or "").lower() not in _ABI_REJECT_STATUSES]
-        abi_out = [
-            {
-                "point_id": str(r.get("point_id") or r.get("case_id") or ""),
-                "rejected": True,
-                "abi_error": str(r.get("abi_error") or r.get("reason") or ""),
-                "executed_shape": extract_abi_attempted_shape(
-                    r, planned_abi_by_id.get(str(r.get("point_id") or r.get("case_id") or ""))
-                ),
-            }
-            for r in raw_records
-            if str(r.get("status") or "").lower() in _ABI_REJECT_STATUSES
-        ]
-        return obs_out, abi_out
-
-    clean_ep = sanitize_public_alias(endpoint_alias or sku, sku)
-    plan_family = str(plan_doc.get("family") or "").strip()
-    plan_target_id = str(plan_doc.get("target_id") or "").strip()
-    plan_pts_by_id: dict[str, Mapping[str, Any]] = {}
-    for split_key in ("train_points", "heldout_points"):
-        for pt in plan_doc.get(split_key) or ():
-            if isinstance(pt, Mapping) and pt.get("point_id"):
-                plan_pts_by_id[str(pt["point_id"])] = pt
-
-    completes, obs_buckets, receipts_by_key, abi_rows = _collect_abi_and_buckets(
-        raw_records, planned_abi_by_id=planned_abi_by_id
-    )
-
-    pre_entries: list[dict[str, Any]] = []
-    for (cid, base_rid, split), mode_map in sorted(obs_buckets.items()):
-        comp = completes.get((cid, base_rid)) or {}
-        summary = comp.get("summary") if isinstance(comp.get("summary"), Mapping) else {}
-        plan_pt = plan_pts_by_id.get(cid)
-        candidates = [
-            (arm, tmode, derive_writer_clock_operator(group, summary, cid=cid, tmode=tmode), group)
-            for (arm, tmode), group in sorted(mode_map.items())
-        ]
-        selected = select_mode_candidates(candidates, cid=cid, plan_pt=plan_pt)
-        for _arm, _tmode, clock_op, group in selected:
-            first = group[0]
-            ranks = _extract_ranks_from_bucket(group, summary)
-            acq_id = str(first.get("acquisition_id") or comp.get("acquisition_id") or "").strip()
-            acq_key = acq_id or str(first.get("plan_id") or comp.get("plan_id") or "").strip()
-            matched_rcpts, receipt_ranks = _lookup_entry_receipts(
-                receipts_by_key, cid=cid, base_rid=base_rid, ranks=ranks
-            )
-            pre_entries.append({
-                "cid": cid, "base_rid": base_rid, "pub_run_id": sanitize_public_run_id(base_rid),
-                "split": split, "clock_op": clock_op, "group": list(group),
-                "receipts": matched_rcpts, "receipt_ranks": receipt_ranks,
-                "comp": comp, "summary": summary, "ranks": ranks,
-                "acq_id": acq_id, "acq_key": acq_key, "multi_rank_joined": False,
-            })
-
-    merged_entries = _join_multirank_obs_entries(pre_entries, plan_pts_by_id=plan_pts_by_id)
-    normalized: list[dict[str, Any]] = []
-    for entry in merged_entries:
-        row_out = _seal_normalized_entry(
-            entry,
-            plan_doc=plan_doc,
-            plan_pt=plan_pts_by_id.get(str(entry["cid"])),
-            sku=sku,
-            clean_ep=clean_ep,
-            plan_family=plan_family,
-            plan_target_id=plan_target_id,
-            capture_out_dir=capture_out_dir,
-        )
-        if row_out is not None:
-            normalized.append(row_out)
-    return normalized, abi_rows
 
 
 def _verify_returned_plan_binding(
@@ -812,6 +123,7 @@ def _validate_dispatch_exit(
     err_detail: str,
     *,
     is_remote: bool,
+    dry_run: bool = False,
 ) -> None:
     from .cliff_planner import _check_abi_row_shape, _match_structured_abi_error
 
@@ -821,18 +133,29 @@ def _validate_dispatch_exit(
         st = str(rec.get("status") or "").strip().lower()
         if cid in planned_abi_by_id and st in _ACCEPTED_ABI_STATUSES:
             raise ModelingError(f"profiler_abi_rejection_unexpectedly_accepted:{cid}:status={st}")
-    if any(str(m.get("status") or "ok").strip().lower() not in {"ok", "partial"} for m in receipt_metas):
+    allowed_meta_statuses = {"ok", "partial", "dry_run"} if (dry_run and returncode == 0) else {"ok", "partial"}
+    if any(str(m.get("status") or "").strip().lower() not in allowed_meta_statuses for m in receipt_metas):
         raise ModelingError(f"{prefix}:rc={returncode}:receipt_status_invalid:{err_detail}")
+    is_clean_dry_run = (
+        dry_run
+        and returncode == 0
+        and bool(receipt_metas)
+        and all(str(m.get("status") or "").strip().lower() == "dry_run" for m in receipt_metas)
+    )
     non_passing = [
         r for r in receipt_records
-        if str(r.get("status") or "ok").strip().lower() not in _PASSING_RECEIPT_STATUSES
+        if str(r.get("status") or "").strip().lower() not in _PASSING_RECEIPT_STATUSES
+        and not (
+            is_clean_dry_run
+            and str(r.get("status") or "").strip().lower() in {"", "dry_run"}
+        )
     ]
     violations: list[str] = []
     for rec in non_passing:
         cid = str(rec.get("case_id") or rec.get("point_id") or "unknown").strip()
         st = str(rec.get("status") or "").strip().lower()
         if st not in _ABI_REJECT_STATUSES or cid not in planned_abi_by_id:
-            violations.append(f"{cid}={st}")
+            violations.append(f"{cid}={st or 'missing_status'}")
             continue
         planned_pt = planned_abi_by_id[cid]
         err_text = str(rec.get("abi_error") or rec.get("reason") or "").strip()
@@ -1166,16 +489,35 @@ def _dispatch_remote_acquisition(
             receipt_metas.append(meta)
     _validate_dispatch_exit(
         done.returncode, receipt_metas, rcpt_recs, planned_abi_by_id,
-        (done.stderr or done.stdout).strip(), is_remote=True,
+        (done.stderr or done.stdout).strip(), is_remote=True, dry_run=dry_run,
     )
     raw_records = [*obs_recs, *rcpt_recs]
     _stamp_acquisition_id(raw_records, acq_id)
     if domain is None:
         _verify_returned_plan_binding(sub_plan, receipt_metas, raw_records, split_tag=split_tag)
+    if dry_run:
+        return [], []
     return normalize_profiler_records(
         raw_records, plan_doc=sub_plan, sku=sku,
         endpoint_alias=endpoint_alias, capture_out_dir=capture_out_dir,
     )
+
+
+def _read_bounded_text(path: Path) -> str:
+    try:
+        size = path.stat().st_size
+    except TimeoutError:
+        raise
+    except OSError as exc:
+        raise ModelingError(f"onboarding_file_stat_failed:{path.name}:{exc}") from exc
+    if size > MAX_READ_JSON_BYTES:
+        raise ModelingError(f"onboarding_json_too_large:{path.name}:{size}>{MAX_READ_JSON_BYTES}")
+    try:
+        return path.read_text(encoding="utf-8")
+    except TimeoutError:
+        raise
+    except OSError as exc:
+        raise ModelingError(f"onboarding_file_read_failed:{path.name}:{exc}") from exc
 
 
 def _dispatch_local_acquisition(
@@ -1240,18 +582,18 @@ def _dispatch_local_acquisition(
     obs_recs, rcpt_recs, receipt_metas = [], [], []
     for ofile in obs_files:
         recs, _ = _parse_json_or_jsonl_records(
-            ofile.read_text(encoding="utf-8"), rank_hint=_parse_rank_hint(ofile.name)
+            _read_bounded_text(ofile), rank_hint=_parse_rank_hint(ofile.name)
         )
         obs_recs.extend(recs)
     for rfile in receipt_files:
         recs, meta = _parse_json_or_jsonl_records(
-            rfile.read_text(encoding="utf-8"), rank_hint=_parse_rank_hint(rfile.name)
+            _read_bounded_text(rfile), rank_hint=_parse_rank_hint(rfile.name)
         )
         rcpt_recs.extend(recs)
         if meta:
             receipt_metas.append(meta)
     _validate_dispatch_exit(
-        rc, receipt_metas, rcpt_recs, planned_abi_by_id, err_txt, is_remote=False,
+        rc, receipt_metas, rcpt_recs, planned_abi_by_id, err_txt, is_remote=False, dry_run=dry_run,
     )
     if not obs_files and not receipt_files:
         raise ModelingError("profiler_bench_missing_output_json")
@@ -1259,6 +601,8 @@ def _dispatch_local_acquisition(
     _stamp_acquisition_id(combined_records, acq_id)
     if domain is None:
         _verify_returned_plan_binding(sub_plan, receipt_metas, combined_records, split_tag=split_tag)
+    if dry_run:
+        return [], []
     return normalize_profiler_records(
         combined_records, plan_doc=sub_plan, sku=sku,
         endpoint_alias=endpoint_alias, capture_out_dir=capture_out_dir,
@@ -1296,6 +640,7 @@ def _dispatch_single_acquisition(
         raise ModelingError(
             f"profiler_bench_insufficient_granted_devices:required={world}:granted={len(allowed_phy_ids)}"
         )
+    assert_sanitized_payload(subgraph_plan, field_name="profiler_subgraph_plan")
     plan_bytes = canonical_json_bytes(subgraph_plan)
     planned_abi_by_id: dict[str, Mapping[str, Any]] = {
         str(pt["point_id"]): pt

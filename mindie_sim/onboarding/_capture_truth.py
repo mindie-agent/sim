@@ -53,7 +53,9 @@ from .contracts import (
     NS_PER_MS,
     NS_PER_US,
     VALID_CLOCK_OPERATORS,
+    canonical_json_bytes,
     read_bounded_json,
+    sanitize_public_run_id,
     write_atomic_json,
 )
 
@@ -64,6 +66,7 @@ _PRIVATE_INDEX_MAX_ENTRIES = 8192
 _PRIVATE_INDEX_FILENAME = ".mindie_capture_index.json"
 _PRIVATE_INDEX_SCHEMA = "mindie-private-capture-index/1"
 _OPAQUE_LEASE_DIGEST_RE = re.compile(r"^lease-[0-9a-f]{16}$")
+_ALLOWED_CAPTURE_STATUSES = frozenset({"", "ok", "pass", "passed", "success"})
 _PRIVATE_DIGEST_CACHE: OrderedDict[tuple[str, str], str] = OrderedDict()
 
 
@@ -285,23 +288,149 @@ def _extract_samples_ns(containers: Sequence[Mapping[str, Any]]) -> list[int]:
     return []
 
 
+_SKIP_CONTAINER_KEYS = frozenset({
+    "actual_shape", "executed_shape", "requested_shape", "node_shapes",
+    "measured_binding", "plan_key", "shape", "shapes",
+})
+_MAX_CONTAINER_DEPTH = 6
+
+
+def _walk_capture_mappings(
+    obj: Any, cid: str, out: list[Mapping[str, Any]], *, depth: int = 0
+) -> None:
+    if depth > _MAX_CONTAINER_DEPTH or not isinstance(obj, Mapping):
+        return
+    out.append(obj)
+    for sub_key in ("boundary", "metadata", "payload", "summary"):
+        sub = obj.get(sub_key)
+        if isinstance(sub, Mapping):
+            _walk_capture_mappings(sub, cid, out, depth=depth + 1)
+    for k, v in obj.items():
+        if k in _SKIP_CONTAINER_KEYS or k in {"boundary", "metadata", "payload", "summary"}:
+            continue
+        if isinstance(v, Mapping):
+            _walk_capture_mappings(v, cid, out, depth=depth + 1)
+    for list_key in ("events", "records", "cases"):
+        seq = obj.get(list_key)
+        if isinstance(seq, Sequence) and not isinstance(seq, (str, bytes)):
+            for item in seq:
+                if isinstance(item, Mapping) and str(item.get("case_id") or "") == cid:
+                    _walk_capture_mappings(item, cid, out, depth=depth + 1)
+
+
 def _extract_capture_containers(cap_obj: Any, cid: str) -> list[Mapping[str, Any]]:
     containers: list[Mapping[str, Any]] = []
     if isinstance(cap_obj, Mapping):
-        for cand in (cap_obj, cap_obj.get("boundary"), cap_obj.get("metadata"), cap_obj.get("payload")):
-            if isinstance(cand, Mapping):
-                containers.append(cand)
-        for list_key in ("events", "records", "cases"):
-            seq = cap_obj.get(list_key)
-            if isinstance(seq, Sequence) and not isinstance(seq, (str, bytes)):
-                for item in seq:
-                    if isinstance(item, Mapping) and str(item.get("case_id") or "") == cid:
-                        containers.append(item)
+        _walk_capture_mappings(cap_obj, cid, containers, depth=0)
     elif isinstance(cap_obj, Sequence) and not isinstance(cap_obj, (str, bytes)):
         for item in cap_obj:
             if isinstance(item, Mapping) and str(item.get("case_id") or "") == cid:
-                containers.append(item)
+                _walk_capture_mappings(item, cid, containers, depth=0)
     return containers
+
+
+def _collect_capture_evidence(containers: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    ev: dict[str, Any] = {}
+    for cont in containers:
+        for key in ("case_id", "sku", "target_family", "target_op_id"):
+            if key not in ev and str(cont.get(key) or "").strip():
+                ev[key] = str(cont[key]).strip()
+        if "split" not in ev and str(cont.get("split") or "").strip():
+            ev["split"] = str(cont["split"]).strip().lower()
+        if "run_id" not in ev:
+            rid = str(cont.get("run_id") or cont.get("run_uid") or "").strip()
+            if rid:
+                ev["run_id"] = rid
+        if "status" not in ev and cont.get("status") is not None:
+            ev["status"] = str(cont["status"]).strip().lower()
+        if "level" not in ev:
+            raw_lvl = str(cont.get("level") or "").strip().upper()
+            if raw_lvl in {"L1", "L2", "L3"}:
+                ev["level"] = raw_lvl
+        if "timed_nodes" not in ev:
+            tn = cont.get("timed_nodes")
+            if isinstance(tn, Sequence) and not isinstance(tn, (str, bytes)) and tn:
+                ev["timed_nodes"] = [str(x) for x in tn]
+        if "target_op_ids" not in ev:
+            tids = cont.get("target_op_ids")
+            if isinstance(tids, Sequence) and not isinstance(tids, (str, bytes)) and tids:
+                ev["target_op_ids"] = [str(x) for x in tids]
+        if "measured_binding" not in ev:
+            mb = cont.get("measured_binding")
+            if isinstance(mb, Mapping) and mb:
+                ev["measured_binding"] = dict(mb)
+        if "actual_shape" not in ev:
+            for skey in ("actual_shape", "executed_shape"):
+                sh = cont.get(skey)
+                if isinstance(sh, Mapping) and sh:
+                    ev["actual_shape"] = dict(sh)
+                    break
+        if "plan_key" not in ev:
+            pk = cont.get("plan_key")
+            if isinstance(pk, Mapping) and pk:
+                ev["plan_key"] = dict(pk)
+    return ev
+
+
+def _verify_capture_container_invariants(
+    containers: Sequence[Mapping[str, Any]], *, cid: str, require_identity: bool = False
+) -> dict[str, Any]:
+    ev = _collect_capture_evidence(containers)
+    seen_levels: set[str] = set()
+    seen_cids: set[str] = set()
+    seen_splits: set[str] = set()
+    cap_busy: int | None = None
+    cap_elapsed: int | None = None
+    for cont in containers:
+        raw_lvl = cont.get("level")
+        if raw_lvl is not None and str(raw_lvl).strip():
+            lvl_up = str(raw_lvl).strip().upper()
+            if lvl_up not in {"L1", "L2", "L3"}:
+                raise ModelingError(f"capture_level_invalid:{cid}:level={lvl_up}")
+            seen_levels.add(lvl_up)
+        raw_st = cont.get("status")
+        if raw_st is not None and str(raw_st).strip():
+            st_low = str(raw_st).strip().lower()
+            if st_low not in _ALLOWED_CAPTURE_STATUSES:
+                raise ModelingError(f"capture_status_invalid:{cid}:status={st_low}")
+        if bool(cont.get("debug_cross_level")):
+            raise ModelingError(f"capture_debug_cross_level_forbidden:{cid}")
+        if bool(cont.get("is_counterfactual")):
+            raise ModelingError(f"capture_counterfactual_forbidden:{cid}")
+        if cont.get("validated") is False or cont.get("qualified") is False:
+            raise ModelingError(f"capture_unqualified:{cid}")
+        c_cid = str(cont.get("case_id") or "").strip()
+        if c_cid:
+            seen_cids.add(c_cid)
+        c_sp = str(cont.get("split") or "").strip().lower()
+        if c_sp:
+            seen_splits.add(c_sp)
+        c_busy = _positive_int_ns(cont.get("busy_union_ns"))
+        c_elapsed = _positive_int_ns(cont.get("elapsed_span_ns"))
+        if c_busy is not None and c_elapsed is not None and c_busy > c_elapsed:
+            raise ModelingError(
+                f"capture_busy_union_exceeds_elapsed_span:{cid}:busy={c_busy}:elapsed={c_elapsed}"
+            )
+        if cap_busy is None and c_busy is not None:
+            cap_busy = c_busy
+        if cap_elapsed is None and c_elapsed is not None:
+            cap_elapsed = c_elapsed
+    if len(seen_levels) > 1:
+        raise ModelingError(f"capture_level_conflict:{cid}:{sorted(seen_levels)}")
+    if require_identity and not seen_cids:
+        raise ModelingError(f"capture_case_id_missing:{cid}")
+    foreign_cids = sorted(seen_cids - {cid})
+    if foreign_cids:
+        raise ModelingError(f"capture_case_id_mismatch:{cid}:capture={foreign_cids[0]}")
+    if require_identity and not seen_splits:
+        raise ModelingError(f"capture_split_missing:{cid}")
+    if len(seen_splits) > 1:
+        raise ModelingError(f"capture_split_conflict:{cid}:{sorted(seen_splits)}")
+    if cap_busy is not None and cap_elapsed is not None and cap_busy > cap_elapsed:
+        raise ModelingError(
+            f"capture_busy_union_exceeds_elapsed_span:{cid}:busy={cap_busy}:elapsed={cap_elapsed}"
+        )
+    return ev
 
 
 def resolve_and_verify_capture_truth(
@@ -315,6 +444,7 @@ def resolve_and_verify_capture_truth(
     digest_index: dict[str, Path] | None = None,
     resolved_files: dict[str, str | Path] | None = None,
     private_entries: dict[str, str] | None = None,
+    capture_evidence_out: dict[str, Any] | None = None,
 ) -> tuple[bool, int | None, int | None]:
     """Hash-verify on-disk capture and derive authoritative ``(measured_ns, p99_ns)``."""
     root_path = Path(capture_root) if capture_root is not None else None
@@ -407,6 +537,11 @@ def resolve_and_verify_capture_truth(
 
     if cap_measured_ns is None and require_capture_files:
         raise ModelingError(f"capture_measured_duration_missing:{cid}:{clock_field}")
+    ev = _verify_capture_container_invariants(
+        containers, cid=cid, require_identity=require_capture_files
+    )
+    if capture_evidence_out is not None:
+        capture_evidence_out.update(ev)
     return True, cap_measured_ns, cap_p99_ns
 
 
@@ -450,6 +585,7 @@ def reverify_report_captures(
             unit="ns",
             capture_uri=cap_uri,
         )
+        cap_ev: dict[str, Any] = {}
         verified, cap_ns, cap_p99 = resolve_and_verify_capture_truth(
             boundary,
             cid=cid,
@@ -458,9 +594,19 @@ def reverify_report_captures(
             capture_files=capture_files,
             require_capture_files=True,
             private_entries=private_entries,
+            capture_evidence_out=cap_ev,
         )
         if not verified or cap_ns is None:
             raise ModelingError(f"capture_file_missing:{cid}")
+        row_lvl = str(row.get("level") or "").strip().upper()
+        if cap_ev.get("level") and row_lvl and cap_ev["level"] != row_lvl:
+            raise ModelingError(f"capture_level_mismatch:{cid}:capture={cap_ev['level']}:report={row_lvl}")
+        row_split = str(row.get("split") or "").strip().lower()
+        if cap_ev.get("split") and row_split and cap_ev["split"] != row_split:
+            raise ModelingError(f"capture_split_mismatch:{cid}:capture={cap_ev['split']}:report={row_split}")
+        cap_run = str(cap_ev.get("run_id") or "").strip()
+        if cap_run and cap_run != run_uid and sanitize_public_run_id(cap_run) != run_uid:
+            raise ModelingError(f"capture_run_id_mismatch:{cid}:capture={cap_run}:report={run_uid}")
         row_ns = int(row.get("measured_ns") or 0)
         if row_ns != cap_ns:
             raise ModelingError(
@@ -536,8 +682,9 @@ def verify_capture_and_override_case(
     digest_index: dict[str, Path] | None = None,
     resolved_files: dict[str, str | Path] | None = None,
 ) -> tuple[GateCase, bool, int | None]:
-    """Bind a ``GateCase`` strictly to hash-verified raw capture duration and ``p99``."""
+    """Bind a ``GateCase`` strictly to hash-verified raw capture duration, ``p99``, level, timed nodes, and geometry."""
     del row
+    cap_ev: dict[str, Any] = {}
     verified, cap_ns, cap_p99 = resolve_and_verify_capture_truth(
         gc.boundary,
         cid=gc.case_id,
@@ -547,6 +694,7 @@ def verify_capture_and_override_case(
         require_capture_files=require_capture_files,
         digest_index=digest_index,
         resolved_files=resolved_files,
+        capture_evidence_out=cap_ev,
     )
     if not verified:
         return gc, False, row_p99_ns
@@ -560,6 +708,56 @@ def verify_capture_and_override_case(
         raise ModelingError(
             f"capture_p99_mismatch:{gc.case_id}:capture={cap_p99}:row={int(row_p99_ns)}"
         )
+    if cap_ev.get("level") and str(cap_ev["level"]) != str(gc.level).upper():
+        raise ModelingError(
+            f"capture_level_mismatch:{gc.case_id}:capture={cap_ev['level']}:row={gc.level}"
+        )
+    if cap_ev.get("sku") and str(cap_ev["sku"]) != str(gc.cohort.sku):
+        raise ModelingError(
+            f"capture_sku_mismatch:{gc.case_id}:capture={cap_ev['sku']}:row={gc.cohort.sku}"
+        )
+    if cap_ev.get("split") and str(cap_ev["split"]) != str(gc.split).lower():
+        raise ModelingError(
+            f"capture_split_mismatch:{gc.case_id}:capture={cap_ev['split']}:row={gc.split}"
+        )
+    cap_run = str(cap_ev.get("run_id") or "").strip()
+    if cap_run and cap_run != gc.boundary.run_uid and sanitize_public_run_id(cap_run) != gc.boundary.run_uid:
+        raise ModelingError(
+            f"capture_run_id_mismatch:{gc.case_id}:capture={cap_run}:row={gc.boundary.run_uid}"
+        )
+    payload_map = dict(gc.payload)
+    payload_changed = False
+    for skey in ("target_family", "target_op_id"):
+        cap_val = str(cap_ev.get(skey) or "").strip()
+        if cap_val:
+            row_val = str(payload_map.get(skey) or "").strip()
+            if row_val and row_val != cap_val:
+                raise ModelingError(f"capture_{skey}_mismatch:{gc.case_id}:capture={cap_val}:row={row_val}")
+            payload_map[skey] = cap_val
+            payload_changed = True
+    for lkey in ("timed_nodes", "target_op_ids"):
+        cap_list = cap_ev.get(lkey)
+        if cap_list:
+            row_list = payload_map.get(lkey)
+            if row_list is not None and [str(x) for x in row_list] != list(cap_list):
+                raise ModelingError(f"capture_{lkey}_mismatch:{gc.case_id}")
+            payload_map[lkey] = list(cap_list)
+            payload_changed = True
+    for mkey in ("actual_shape", "measured_binding"):
+        cap_map = cap_ev.get(mkey)
+        if isinstance(cap_map, Mapping) and cap_map:
+            row_map = payload_map.get(mkey)
+            if isinstance(row_map, Mapping) and row_map:
+                if canonical_json_bytes(dict(row_map)) != canonical_json_bytes(dict(cap_map)):
+                    raise ModelingError(f"capture_{mkey}_mismatch:{gc.case_id}")
+            payload_map[mkey] = dict(cap_map)
+            payload_changed = True
+    cap_pk = cap_ev.get("plan_key")
+    if isinstance(cap_pk, Mapping) and cap_pk and not payload_map.get("plan_key"):
+        payload_map["plan_key"] = dict(cap_pk)
+        payload_changed = True
+    if payload_changed:
+        gc = replace(gc, payload=tuple(sorted(payload_map.items())))
     return gc, True, cap_p99
 
 

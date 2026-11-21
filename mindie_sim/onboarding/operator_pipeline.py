@@ -56,11 +56,13 @@ from ._lean_and_receipts import (
     check_lean_non_inversion,
     seal_onboarding_receipt,
     sign_stage_report,
+    validate_strict_atol_ns,
     validate_strict_threshold_pct,
     verify_stage_report,
 )
 from ._operator_contract import validate_operator_contract
 from ._operator_scaffold import scaffold_operator
+from ._profiler_plan import assign_plan_point_level
 from ._sealed_scorer import exceeds_physical_tolerance
 from .cliff_planner import (
     evaluate_abi_rejections,
@@ -295,16 +297,22 @@ def bench_and_score_operator(
                 "heldout_summary": None, "residuals": [],
             }
             plan_only["report_hmac"] = sign_stage_report("operator_score", plan_only)
+            assert_sanitized_payload(plan_only, field_name="bench_and_score_plan_only")
             if out_score is not None:
                 write_atomic_json(out_score, plan_only)
-            assert_sanitized_payload(plan_only, field_name="bench_and_score_plan_only")
             return plan_only
 
+        expected_levels = {
+            str(pt["point_id"]): assign_plan_point_level(plan_doc, pt)
+            for pt in (*expected_train_pts, *expected_heldout_pts)
+            if isinstance(pt, Mapping) and pt.get("point_id")
+        }
         external_train = [str(plan_doc["train_lineage_root"])] if plan_doc.get("train_lineage_root") else []
         scored = score_sealed_gate_cases(
             rows, sku=sku, runner=runner, threshold_pct=cap_threshold,
             external_train_roots=external_train, expected_points=expected_heldout_pts,
             expected_train_points=expected_train_pts, expected_point_ids=expected_heldout_ids,
+            expected_levels=expected_levels,
             expected_family=plan_family, require_disjoint_level_roots=False,
             capture_root=eff_capture_root, capture_files=capture_files,
             require_capture_files=require_capture_files,
@@ -367,6 +375,8 @@ def _check_contract_release_eligibility(c_doc: Mapping[str, Any]) -> list[str]:
         errs.append("contract_tiling_axes_not_declared")
     if c_doc.get("semantic_work_declared") is not True or c_doc.get("tensor_obligations_declared") is not True:
         errs.append("contract_semantic_or_obligations_missing")
+    if c_doc.get("source_blobs_verified") is not True:
+        errs.append("contract_source_blobs_unverified")
     return errs
 
 
@@ -484,7 +494,7 @@ def _evaluate_operator_score_gate(
         and int(r.get("measured_ns") or 0) > 0
         for r in heldout_rows
     )
-    eff_atol_ns = max(0, int(s_doc.get("atol_ns", DEFAULT_PHYSICAL_ATOL_NS)))
+    eff_atol_ns = validate_strict_atol_ns(s_doc.get("atol_ns", DEFAULT_PHYSICAL_ATOL_NS))
     failing_rows = [
         r for r in heldout_rows
         if exceeds_physical_tolerance(

@@ -33,6 +33,7 @@ from ._lean_and_receipts import (
     check_lean_non_inversion,
     program_dag_sha256,
     seal_onboarding_receipt,
+    validate_strict_atol_ns,
     validate_strict_threshold_pct,
     verify_stage_report,
 )
@@ -159,6 +160,7 @@ __all__ = [
     "validate_disjoint_lineage",
     "validate_operator_contract",
     "validate_parallel_topology",
+    "validate_strict_atol_ns",
     "validate_strict_threshold_pct",
     "verify_idle_die_telemetry",
     "verify_receipt_sha256",

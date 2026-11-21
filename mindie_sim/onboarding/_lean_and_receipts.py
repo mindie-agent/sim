@@ -40,6 +40,7 @@ from mindie_sim.schema.common import ModelingError
 
 from .contracts import (
     DEFAULT_HELDOUT_APE_THRESHOLD_PCT,
+    DEFAULT_PHYSICAL_ATOL_NS,
     OPERATOR_ONBOARDING_RECEIPT_SCHEMA,
     SHORT_DIGEST_LEN,
     SKU_ONBOARDING_RECEIPT_SCHEMA,
@@ -128,6 +129,19 @@ def validate_strict_threshold_pct(threshold_pct: float) -> float:
     return val
 
 
+def validate_strict_atol_ns(atol_ns: int) -> int:
+    """Enforce ``0 <= atol_ns <= DEFAULT_PHYSICAL_ATOL_NS`` (2,000 ns)."""
+    if isinstance(atol_ns, bool) or not isinstance(atol_ns, int):
+        raise ModelingError(f"atol_ns_invalid:{atol_ns!r}")
+    if atol_ns < 0:
+        raise ModelingError(f"atol_ns_negative:{atol_ns}")
+    if atol_ns > DEFAULT_PHYSICAL_ATOL_NS:
+        raise ModelingError(
+            f"atol_ns_exceeds_strict_release_cap:got={atol_ns}:max={DEFAULT_PHYSICAL_ATOL_NS}"
+        )
+    return atol_ns
+
+
 def sign_stage_report(kind: str, payload: Mapping[str, Any]) -> str:
     """Compute an HMAC-SHA256 attesting that ``payload`` was minted by onboarding."""
     body = {k: v for k, v in payload.items() if k != _REPORT_HMAC_FIELD}
@@ -144,6 +158,12 @@ def verify_stage_report(kind: str, payload: Mapping[str, Any]) -> bool:
     return hmac.compare_digest(supplied, expected)
 
 
+def _strict_int(val: Any, field: str) -> int:
+    if type(val) is not int:
+        raise ModelingError(f"lean_certificate_non_int:{field}={val!r}")
+    return val
+
+
 def _parse_certificate_witness(
     row: Mapping[str, Any]
 ) -> tuple[ResourceChoiceProgram, EventDagSpec, OptimalityCertificate] | None:
@@ -155,33 +175,38 @@ def _parse_certificate_witness(
     if not (isinstance(prog_raw, Mapping) and isinstance(dag_raw, Mapping) and isinstance(cert_raw, Mapping)):
         raise ModelingError("lean_certificate_witness_incomplete")
     prog = ResourceChoiceProgram(
-        num_resources=int(prog_raw["num_resources"]),
-        global_work=tuple(int(v) for v in prog_raw["global_work"]),
+        num_resources=_strict_int(prog_raw["num_resources"], "num_resources"),
+        global_work=tuple(_strict_int(v, "global_work") for v in prog_raw["global_work"]),
         site_modes=tuple(
-            tuple(tuple(int(x) for x in mode) for mode in site)
+            tuple(tuple(_strict_int(x, "site_modes") for x in mode) for mode in site)
             for site in prog_raw.get("site_modes", ())
         ),
     )
     edges = tuple(
-        DagEdge(int(e["src"]), int(e["dst"]), int(e["wire_ns"]))
+        DagEdge(
+            _strict_int(e["src"], "edge.src"),
+            _strict_int(e["dst"], "edge.dst"),
+            _strict_int(e["wire_ns"], "edge.wire_ns"),
+        )
         for e in dag_raw.get("edges", ())
     )
-    dag = EventDagSpec(
-        node_quantum_ns=tuple(int(v) for v in dag_raw["node_quantum_ns"]),
-        edges=edges,
-    )
+    node_quanta = tuple(_strict_int(v, "node_quantum_ns") for v in dag_raw["node_quantum_ns"])
+    dag = EventDagSpec(node_quantum_ns=node_quanta, edges=edges)
     farkas_raw = cert_raw["farkas"]
     farkas = FarkasCertificate(
-        scale_d=int(farkas_raw["scale_d"]),
-        lambda_num=tuple(int(v) for v in farkas_raw["lambda_num"]),
-        mu_num=tuple(int(v) for v in farkas_raw.get("mu_num", ())),
-        lower_bound_ns=int(farkas_raw["lower_bound_ns"]),
+        scale_d=_strict_int(farkas_raw["scale_d"], "farkas.scale_d"),
+        lambda_num=tuple(_strict_int(v, "farkas.lambda_num") for v in farkas_raw["lambda_num"]),
+        mu_num=tuple(_strict_int(v, "farkas.mu_num") for v in farkas_raw.get("mu_num", ())),
+        lower_bound_ns=_strict_int(farkas_raw["lower_bound_ns"], "farkas.lower_bound_ns"),
     )
+    sink_id = _strict_int(cert_raw["sink_node_id"], "sink_node_id")
+    if sink_id < 0 or sink_id >= len(node_quanta):
+        raise ModelingError(f"lean_certificate_sink_out_of_range:{sink_id}:nodes={len(node_quanta)}")
     cert = OptimalityCertificate(
         farkas=farkas,
-        path_edges=tuple(int(v) for v in cert_raw.get("path_edges", ())),
-        sink_node_id=int(cert_raw["sink_node_id"]),
-        l_star_lean_ns=int(cert_raw["l_star_lean_ns"]),
+        path_edges=tuple(_strict_int(v, "path_edges") for v in cert_raw.get("path_edges", ())),
+        sink_node_id=sink_id,
+        l_star_lean_ns=_strict_int(cert_raw["l_star_lean_ns"], "l_star_lean_ns"),
     )
     return prog, dag, cert
 
@@ -405,6 +430,7 @@ __all__ = [
     "seal_onboarding_receipt",
     "sign_stage_report",
     "use_stage_key_file",
+    "validate_strict_atol_ns",
     "validate_strict_threshold_pct",
     "verify_stage_report",
 ]

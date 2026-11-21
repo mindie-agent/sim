@@ -232,7 +232,7 @@ def _configure_operator_stages(parser: argparse.ArgumentParser) -> None:
     p3.add_argument("--stage-key-file", default=None)
     p3.add_argument("--output", "-o", default=None)
 
-    p4 = stages.add_parser("certify", help="certify pointwise <10% cliff APE, witnessed Lean, strict gates")
+    p4 = stages.add_parser("certify", help="certify pointwise <10%% cliff APE, witnessed Lean, strict gates")
     p4.add_argument("--operator-id", required=True)
     p4.add_argument("--sku", required=True)
     p4.add_argument("--contract-report-json", required=True)

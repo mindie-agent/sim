@@ -45,9 +45,14 @@ from ._capture_truth import (
     reverify_report_captures,
     verify_capture_and_override_case,
 )
-from ._lean_and_receipts import validate_strict_threshold_pct, verify_stage_report
-from ._sku_calibration import materialize_sku_hardware
-from ._whitebox_runner import WhiteboxSpineRunner, check_no_service_regimes
+from ._lean_and_receipts import (
+    validate_strict_atol_ns,
+    validate_strict_threshold_pct,
+    verify_stage_report,
+)
+from ._profiler_plan import assign_plan_point_level
+from ._sku_calibration import materialize_sku_hardware, temporary_scaffold_profile
+from ._whitebox_runner import WhiteboxSpineRunner, check_no_service_regimes, eligible_replay_cases
 from .contracts import (
     DEFAULT_PHYSICAL_ATOL_NS,
     GateCheckOutcome,
@@ -81,12 +86,33 @@ def _parse_fits(fits_json: str | Path | None) -> FrozenFitManifest:
     )
 
 
+def _auth_sku_plan_and_levels(
+    sku: str, profile_override: Mapping[str, Any] | None
+) -> tuple[dict[str, Any], dict[str, str]]:
+    from .cliff_planner import synthesize_sku_512_400k_plan
+
+    hw = materialize_sku_hardware(sku, profile_override=profile_override)
+    die = hw.dies[0]
+    dp = datapath_for_die(die)
+    l2_bytes = max(1, int(dict(die.buffers).get("l2", 0)))
+    auth_plan = synthesize_sku_512_400k_plan(
+        sku=sku, core_count=int(dp.aic_count), l2_bytes=l2_bytes, profile_override=profile_override
+    ).to_dict()
+    expected_levels = {
+        str(pt["point_id"]): assign_plan_point_level(auth_plan, pt)
+        for pt in (*auth_plan["train_points"], *auth_plan["heldout_points"])
+        if isinstance(pt, Mapping) and pt.get("point_id")
+    }
+    return auth_plan, expected_levels
+
+
 def _parse_manifest_cases(
     raw_cases: Sequence[Mapping[str, Any]],
     *,
     sku: str,
     held_plan_by_id: Mapping[str, Mapping[str, Any]],
     train_plan_by_id: Mapping[str, Mapping[str, Any]],
+    expected_levels: Mapping[str, str],
     capture_root: str | Path | None,
     capture_files: Mapping[str, str | Path] | None,
     require_capture_files: bool,
@@ -114,7 +140,7 @@ def _parse_manifest_cases(
     plan_by_case: dict[str, Mapping[str, Any]] = {}
     seen_heldout_ids: set[str] = set()
     seen_train_ids: set[str] = set()
-    seen_captures: dict[tuple[str, frozenset[str], tuple[int, ...], str], str] = {}
+    seen_capture_events: dict[tuple[str, str, tuple[int, ...]], list[tuple[frozenset[str], str]]] = {}
     resolved_files: dict[str, str | Path] = dict(capture_files or {})
 
     for idx, row in enumerate(raw_cases):
@@ -158,24 +184,35 @@ def _parse_manifest_cases(
                 raise ModelingError(f"duplicate_heldout_point_id:{pid}")
             seen_heldout_ids.add(pid)
             if pid in held_plan_by_id:
-                validate_row_matches_plan_point(row, held_plan_by_id[pid], sku=sku, pid=pid, device_ranks=gc.boundary.device_ranks)
+                validate_row_matches_plan_point(
+                    row, held_plan_by_id[pid], sku=sku, pid=pid,
+                    device_ranks=gc.boundary.device_ranks,
+                    expected_level=str(expected_levels.get(pid) or ""),
+                )
                 plan_by_case[gc.case_id] = held_plan_by_id[pid]
-            cap_key = (
-                _norm_digest(gc.boundary.raw_sha256),
-                frozenset(gc.boundary.event_ids),
-                gc.boundary.device_ranks,
-                gc.boundary.run_uid,
-            )
-            if cap_key in seen_captures:
-                raise ModelingError(f"duplicate_heldout_physical_capture:{pid}:collides_with={seen_captures[cap_key]}")
-            seen_captures[cap_key] = pid
+            cap_grp = ("heldout", _norm_digest(gc.boundary.raw_sha256), tuple(sorted(gc.boundary.device_ranks)))
+            ev_set = frozenset(gc.boundary.event_ids)
+            for prev_ev, prev_pid in seen_capture_events.get(cap_grp, ()):
+                if ev_set & prev_ev:
+                    raise ModelingError(f"duplicate_heldout_physical_capture:{pid}:collides_with={prev_pid}")
+            seen_capture_events.setdefault(cap_grp, []).append((ev_set, pid))
         elif gc.split == "train":
             if pid in seen_train_ids:
                 raise ModelingError(f"duplicate_train_point_id:{pid}")
             seen_train_ids.add(pid)
             if pid in train_plan_by_id:
-                validate_row_matches_plan_point(row, train_plan_by_id[pid], sku=sku, pid=pid, device_ranks=gc.boundary.device_ranks)
+                validate_row_matches_plan_point(
+                    row, train_plan_by_id[pid], sku=sku, pid=pid,
+                    device_ranks=gc.boundary.device_ranks,
+                    expected_level=str(expected_levels.get(pid) or ""),
+                )
                 plan_by_case[gc.case_id] = train_plan_by_id[pid]
+            cap_grp = ("train", _norm_digest(gc.boundary.raw_sha256), tuple(sorted(gc.boundary.device_ranks)))
+            ev_set = frozenset(gc.boundary.event_ids)
+            for prev_ev, prev_pid in seen_capture_events.get(cap_grp, ()):
+                if ev_set & prev_ev:
+                    raise ModelingError(f"duplicate_train_physical_capture:{pid}:collides_with={prev_pid}")
+            seen_capture_events.setdefault(cap_grp, []).append((ev_set, pid))
         parsed_cases.append(gc)
         expected_clock[gc.case_id] = clock_op
         case_meta[gc.case_id] = {
@@ -308,8 +345,9 @@ def _evaluate_manifest_path(
     atol_ns: int = DEFAULT_PHYSICAL_ATOL_NS,
 ) -> tuple[GateCheckOutcome, list[dict[str, Any]]]:
     from ._sealed_scorer import ClockParityRunner, _bind_active_runner, _norm_digest
-    from .cliff_planner import evaluate_abi_rejections, synthesize_sku_512_400k_plan
+    from .cliff_planner import evaluate_abi_rejections
 
+    eff_atol_ns = validate_strict_atol_ns(atol_ns)
     if validation_doc is not None and (
         not verify_stage_report("sku_validation", validation_doc)
         or not validation_doc.get("ok")
@@ -327,19 +365,14 @@ def _evaluate_manifest_path(
     if not isinstance(raw_manifest, Mapping) or not isinstance(raw_manifest.get("cases"), list):
         return GateCheckOutcome("multilevel_gate", False, "fail", "multilevel_manifest_invalid"), []
 
-    hw = materialize_sku_hardware(sku, profile_override=profile_override)
-    die = hw.dies[0]
-    dp = datapath_for_die(die)
-    l2_bytes = max(1, int(dict(die.buffers).get("l2", 0)))
-    auth_plan = synthesize_sku_512_400k_plan(
-        sku=sku, core_count=int(dp.aic_count), l2_bytes=l2_bytes, profile_override=profile_override
-    ).to_dict()
+    auth_plan, expected_levels = _auth_sku_plan_and_levels(sku, profile_override)
     held_plan_by_id = {str(pt["point_id"]): pt for pt in auth_plan["heldout_points"]}
     train_plan_by_id = {str(pt["point_id"]): pt for pt in auth_plan["train_points"]}
 
     raw_cases: list[Mapping[str, Any]] = [c for c in raw_manifest["cases"] if isinstance(c, Mapping)]
     err_out, parsed_cases, expected_clock, case_meta, plan_by_case, resolved_files = _parse_manifest_cases(
         raw_cases, sku=sku, held_plan_by_id=held_plan_by_id, train_plan_by_id=train_plan_by_id,
+        expected_levels=expected_levels,
         capture_root=capture_root, capture_files=capture_files, require_capture_files=require_capture_files,
     )
     if err_out is not None:
@@ -375,8 +408,8 @@ def _evaluate_manifest_path(
     active_runner = _bind_active_runner(
         runner, primitive_table=primitive_table, profile_override=profile_override
     )
-    if isinstance(active_runner, WhiteboxSpineRunner) and len(manifest.cases) > 1:
-        active_runner.prefetch_cases(manifest.cases)
+    if isinstance(active_runner, WhiteboxSpineRunner):
+        active_runner.prefetch_cases(eligible_replay_cases(manifest.cases, target_split="all"))
     checked_runner = ClockParityRunner(active_runner, expected_clock, plan_by_case=plan_by_case)
     raw_residuals = list(
         evaluate_multilevel(
@@ -393,8 +426,46 @@ def _evaluate_manifest_path(
         raw_residuals, case_meta=case_meta, expected_clock=expected_clock,
         engine_clocks=checked_runner.engine_clocks, held_plan_by_id=held_plan_by_id,
         train_plan_by_id=train_plan_by_id, abi_check=abi_check,
-        cap_threshold=cap_threshold, atol_ns=atol_ns,
+        cap_threshold=cap_threshold, atol_ns=eff_atol_ns,
     )
+
+
+def _build_report_heldout_residuals(
+    heldout_rows: Sequence[Mapping[str, Any]],
+    *,
+    sku: str,
+    cap_threshold: float,
+    eff_atol_ns: int,
+) -> tuple[list[Residual], list[str], set[str], list[str]]:
+    from ._sealed_scorer import STANDARD_LEVEL_BOUNDARY_KINDS, exceeds_physical_tolerance
+
+    res_objs: list[Residual] = []
+    pw_fail: list[str] = []
+    phys_failed_cohorts: set[str] = set()
+    non_ok_heldout: list[str] = []
+    for row in heldout_rows:
+        cid = str(row.get("case_id") or "")
+        lvl = str(row.get("level") or "L1").upper()
+        row_status = str(row.get("status") or "ok").strip()
+        c_raw = row.get("cohort") if isinstance(row.get("cohort"), Mapping) else {}
+        cohort = CohortKey(lvl, str(c_raw.get("cohort_name") or "onboarding"), str(c_raw.get("sku") or sku), str(c_raw.get("phase") or "decode"), str(c_raw.get("mode") or "eager"), str(c_raw.get("shape_regime") or "cliff"), str(c_raw.get("parallel_topology") or "tp1"))  # type: ignore[arg-type]
+        meas_ns = int(row.get("measured_ns") or 1)
+        pred_ns = int(row.get("predicted_ns") or 1)
+        ape = float(row.get("absolute_percentage_error", 0.0))
+        if row_status != "ok":
+            non_ok_heldout.append(cid)
+        elif exceeds_physical_tolerance(pred_ns, meas_ns, threshold_pct=cap_threshold, atol_ns=eff_atol_ns):
+            pw_fail.append(cid)
+            phys_failed_cohorts.add(cohort.as_id())
+        res_objs.append(
+            Residual(
+                cid, lvl, cohort, str(row.get("acquisition_root") or ""), meas_ns, pred_ns,
+                str(row.get("engine_receipt") or ""), float(row.get("signed_error", 0.0)), ape,
+                row_status, str(row.get("excluded_reason") or ""),  # type: ignore[arg-type]
+                boundary_kind=str(row.get("boundary_kind") or STANDARD_LEVEL_BOUNDARY_KINDS.get(lvl, "device_kernel")),
+            )
+        )
+    return res_objs, pw_fail, phys_failed_cohorts, non_ok_heldout
 
 
 def run_multilevel_verdict(
@@ -415,30 +486,31 @@ def run_multilevel_verdict(
     """Evaluate strict pointwise multilevel L1/L2/L3 gate verdict."""
     from ._sealed_scorer import (
         REQUIRED_MULTILEVEL_LEVELS,
-        STANDARD_LEVEL_BOUNDARY_KINDS,
-        exceeds_physical_tolerance,
+        _norm_digest,
         validate_disjoint_lineage,
     )
 
     cap_threshold = validate_strict_threshold_pct(threshold_pct)
     if not require_capture_files:
         raise ModelingError("release_certification_requires_capture_files")
+    raw_doc_atol = (validation_doc or {}).get("atol_ns", DEFAULT_PHYSICAL_ATOL_NS)
     if multilevel_manifest_json is not None:
-        return _evaluate_manifest_path(
-            sku=sku,
-            validation_doc=validation_doc,
-            multilevel_manifest_json=multilevel_manifest_json,
-            fits_json=fits_json,
-            runner=runner,
-            primitive_table=primitive_table,
-            profile_override=profile_override,
-            abi_rejection_results=abi_rejection_results,
-            capture_root=capture_root,
-            capture_files=capture_files,
-            require_capture_files=True,
-            cap_threshold=cap_threshold,
-            atol_ns=max(0, int((validation_doc or {}).get("atol_ns", DEFAULT_PHYSICAL_ATOL_NS))),
-        )
+        with temporary_scaffold_profile(sku, profile_override):
+            return _evaluate_manifest_path(
+                sku=sku,
+                validation_doc=validation_doc,
+                multilevel_manifest_json=multilevel_manifest_json,
+                fits_json=fits_json,
+                runner=runner,
+                primitive_table=primitive_table,
+                profile_override=profile_override,
+                abi_rejection_results=abi_rejection_results,
+                capture_root=capture_root,
+                capture_files=capture_files,
+                require_capture_files=True,
+                cap_threshold=cap_threshold,
+                atol_ns=validate_strict_atol_ns(raw_doc_atol),
+            )
 
     if validation_doc is None:
         return GateCheckOutcome("multilevel_gate", False, "insufficient_evidence", "no validation report or multilevel manifest supplied"), []
@@ -447,6 +519,8 @@ def run_multilevel_verdict(
     if str(validation_doc.get("sku") or "") != sku:
         return GateCheckOutcome("multilevel_gate", False, "fail", f"validation_report_sku_mismatch:expected={sku}"), []
 
+    eff_atol_ns = validate_strict_atol_ns(raw_doc_atol)
+    _auth_plan, expected_levels = _auth_sku_plan_and_levels(sku, profile_override)
     heldout_rows = [r for r in (validation_doc.get("residuals") or ()) if str(r.get("split") or "heldout") == "heldout"]
     all_report_rows = [r for r in (validation_doc.get("residuals") or ()) if isinstance(r, Mapping)]
     missing_plan = list(validation_doc.get("missing_plan_points") or ())
@@ -464,26 +538,35 @@ def run_multilevel_verdict(
         capture_files=capture_files,
         require_capture_files=True,
     )
+    for row in all_report_rows:
+        pid = str(row.get("point_id") or row.get("case_id") or "").strip()
+        exp_lvl = expected_levels.get(pid)
+        if exp_lvl:
+            got_lvl = str(row.get("level") or "").strip().upper()
+            if got_lvl != exp_lvl:
+                raise ModelingError(
+                    f"observation_plan_level_mismatch:{pid}:expected={exp_lvl}:got={got_lvl}"
+                )
     for row in heldout_rows:
         rcpt = str(row.get("engine_receipt") or "")
         if not rcpt.startswith(_ENGINE_RECEIPT_PREFIX):
             return GateCheckOutcome("multilevel_gate", False, "fail", f"unverified_engine_receipt:{row.get('case_id')}"), heldout_rows
+    if fits_json is not None:
+        fits = _parse_fits(fits_json)
+        held_digests = {_norm_digest(str(r.get("raw_sha256") or "")) for r in heldout_rows if r.get("raw_sha256")}
+        held_uris = {str(r.get("capture_uri") or "").strip() for r in heldout_rows if r.get("capture_uri")}
+        held_roots = {str(r.get("acquisition_root") or "").strip() for r in heldout_rows if r.get("acquisition_root")}
+        for param in fits.parameters:
+            leaked_digs = sorted(
+                d for d in param.training_digests
+                if _norm_digest(d) in held_digests or str(d).strip() in held_roots or str(d).strip() in held_uris
+            )
+            if leaked_digs or (param.source_uri and param.source_uri.strip() in held_uris):
+                raise ModelingError(f"lineage_fit_heldout_leakage:parameter={param.parameter_id}")
     validate_disjoint_lineage(heldout_rows, require_disjoint_level_roots=True)
-    res_objs: list[Residual] = []
-    pw_fail: list[str] = []
-    phys_failed_cohorts: set[str] = set()
-    eff_atol_ns = max(0, int(validation_doc.get("atol_ns", DEFAULT_PHYSICAL_ATOL_NS)))
-    for row in heldout_rows:
-        lvl = str(row.get("level") or "L1").upper()
-        c_raw = row.get("cohort") if isinstance(row.get("cohort"), Mapping) else {}
-        cohort = CohortKey(lvl, str(c_raw.get("cohort_name") or "onboarding"), str(c_raw.get("sku") or sku), str(c_raw.get("phase") or "decode"), str(c_raw.get("mode") or "eager"), str(c_raw.get("shape_regime") or "cliff"), str(c_raw.get("parallel_topology") or "tp1"))  # type: ignore[arg-type]
-        meas_ns = int(row.get("measured_ns") or 1)
-        pred_ns = int(row.get("predicted_ns") or 1)
-        ape = float(row.get("absolute_percentage_error", 0.0))
-        if exceeds_physical_tolerance(pred_ns, meas_ns, threshold_pct=cap_threshold, atol_ns=eff_atol_ns):
-            pw_fail.append(str(row.get("case_id") or ""))
-            phys_failed_cohorts.add(cohort.as_id())
-        res_objs.append(Residual(str(row.get("case_id") or ""), lvl, cohort, str(row.get("acquisition_root") or ""), meas_ns, pred_ns, str(row.get("engine_receipt") or ""), float(row.get("signed_error", 0.0)), ape, "ok", boundary_kind=str(row.get("boundary_kind") or STANDARD_LEVEL_BOUNDARY_KINDS.get(lvl, "device_kernel"))))
+    res_objs, pw_fail, phys_failed_cohorts, non_ok_heldout = _build_report_heldout_residuals(
+        heldout_rows, sku=sku, cap_threshold=cap_threshold, eff_atol_ns=eff_atol_ns,
+    )
     summaries = summarize_cohorts(res_objs, threshold_pct=cap_threshold)
     verdict = gate_decision(summaries, required_levels=REQUIRED_MULTILEVEL_LEVELS, require_disjoint_level_roots=True)
     missing_any = bool(missing_plan or missing_train or missing_anchors or missing_cliffs)
@@ -492,11 +575,16 @@ def run_multilevel_verdict(
         and not verdict["insufficient_cohorts"]
         and not verdict["missing_levels"]
         and not verdict["overlapping_level_roots"]
+        and not non_ok_heldout
     )
     passed = bool(validation_doc.get("ok")) and abi_ok and struct_ok and not pw_fail and not missing_any
     eff_status = (
         "pass" if passed
-        else ("fail" if (pw_fail or verdict["overlapping_level_roots"] or not abi_ok or not validation_doc.get("ok")) else "insufficient_evidence")
+        else (
+            "fail"
+            if (pw_fail or verdict["overlapping_level_roots"] or not abi_ok or not validation_doc.get("ok") or non_ok_heldout)
+            else "insufficient_evidence"
+        )
     )
     return (
         GateCheckOutcome(

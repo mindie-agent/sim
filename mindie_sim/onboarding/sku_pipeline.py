@@ -52,15 +52,21 @@ from ._lean_and_receipts import (
     check_lean_non_inversion,
     seal_onboarding_receipt,
     sign_stage_report,
+    validate_strict_atol_ns,
     validate_strict_threshold_pct,
     verify_stage_report,
 )
+from ._profiler_plan import assign_plan_point_level
 from ._sealed_scorer import (
     REQUIRED_MULTILEVEL_LEVELS,
     exceeds_physical_tolerance,
     run_multilevel_verdict,
 )
-from ._sku_calibration import calibrate_l0_and_fabric, materialize_sku_hardware
+from ._sku_calibration import (
+    calibrate_l0_and_fabric,
+    materialize_sku_hardware,
+    temporary_scaffold_profile,
+)
 from ._soc_probe import (
     parse_npu_smi_topology,
     parse_platform_config_ini,
@@ -242,9 +248,9 @@ def _build_sku_plan_only_report(
         "heldout_summary": None, "residuals": [],
     }
     plan_only["report_hmac"] = sign_stage_report("sku_validation", plan_only)
+    assert_sanitized_payload(plan_only, field_name="validate_512_400k_plan_only")
     if report_out is not None:
         write_atomic_json(report_out, plan_only)
-    assert_sanitized_payload(plan_only, field_name="validate_512_400k_plan_only")
     return plan_only
 
 
@@ -283,6 +289,7 @@ def validate_512_400k(
         campaign_id=campaign_id, profile_override=profile_override,
     )
     plan_doc = plan.to_dict()
+    assert_sanitized_payload(plan_doc, field_name="sku_cliff_plan")
     if plan_out is not None:
         write_atomic_json(plan_out, plan_doc)
 
@@ -302,7 +309,7 @@ def validate_512_400k(
     expected_heldout_ids = [str(pt["point_id"]) for pt in expected_heldout_pts]
     expected_train_ids = [str(pt["point_id"]) for pt in expected_train_pts]
 
-    with temp_cap_ctx as tmp_cap_dir:
+    with temporary_scaffold_profile(sku, profile_override), temp_cap_ctx as tmp_cap_dir:
         if tmp_cap_dir is not None:
             eff_capture_root = Path(tmp_cap_dir)
         obs_rows, abi_rejection_results, lease_public, acquisition_mode = _collect_sku_validation_inputs(
@@ -319,6 +326,11 @@ def validate_512_400k(
                 report_out=report_out,
             )
 
+        expected_levels = {
+            str(pt["point_id"]): assign_plan_point_level(plan_doc, pt)
+            for pt in (*expected_train_pts, *expected_heldout_pts)
+            if isinstance(pt, Mapping) and pt.get("point_id")
+        }
         scored = score_sealed_gate_cases(
             obs_rows, sku=sku, runner=runner, primitive_table=parsed_table,
             profile_override=profile_override, threshold_pct=cap_threshold,
@@ -326,7 +338,8 @@ def validate_512_400k(
             external_train_digests=external_train_digests,
             external_train_uris=external_train_uris,
             expected_points=expected_heldout_pts, expected_train_points=expected_train_pts,
-            expected_point_ids=expected_heldout_ids, require_disjoint_level_roots=True,
+            expected_point_ids=expected_heldout_ids, expected_levels=expected_levels,
+            require_disjoint_level_roots=True,
             capture_root=eff_capture_root, capture_files=capture_files,
             require_capture_files=require_capture_files,
         )
@@ -380,9 +393,9 @@ def validate_512_400k(
         report["receipt_unconfirmed"] = rec_unconf
         report["receipt_warning"] = rec_warn
     report["report_hmac"] = sign_stage_report("sku_validation", report)
+    assert_sanitized_payload(report, field_name="validate_512_400k_report")
     if report_out is not None:
         write_atomic_json(report_out, report)
-    assert_sanitized_payload(report, field_name="validate_512_400k_report")
     return report
 
 
@@ -519,7 +532,7 @@ def verify_sku_gates(
     )
     gates.append(ml_outcome)
 
-    eff_atol_ns = max(0, int((val_doc or {}).get("atol_ns", DEFAULT_PHYSICAL_ATOL_NS)))
+    eff_atol_ns = validate_strict_atol_ns((val_doc or {}).get("atol_ns", DEFAULT_PHYSICAL_ATOL_NS))
     failing_cliffs = [
         r for r in diag_residuals
         if exceeds_physical_tolerance(
