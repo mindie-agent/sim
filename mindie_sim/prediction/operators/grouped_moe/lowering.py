@@ -27,6 +27,8 @@ ROUTING_WEIGHT_BYTES = 4
 GROUP_COUNT_BYTES = 8
 PER_TOKEN_SCALE_BYTES = 4
 MX_SCALE_GROUP_SIZE = 32
+MX_SCALE_PAIR_BYTES = 2
+MX_SCALE_PAIR_WIDTH = MX_SCALE_GROUP_SIZE * MX_SCALE_PAIR_BYTES
 MX_DTYPES = frozenset({"mxfp8", "mxfp4"})
 QUANT_OPS_PER_ELEMENT = 4
 AIC_ROLES = frozenset({"cube", "mte1", "mte2_aic", "fixpipe"})
@@ -43,10 +45,15 @@ def element_bytes(elements: int, dtype: str) -> int:
     return elements * (1 if dtype in {"mxfp8", "hif8"} else int(dtype_bytes(dtype)))
 
 
+def mx_scale_bytes(width: int, *, padded: bool = True) -> int:
+    # CANN stores E8M0 scales as [rows, ceil(width / 64), 2].
+    if padded:
+        return ceil_div(width, MX_SCALE_PAIR_WIDTH) * MX_SCALE_PAIR_BYTES
+    return ceil_div(width, MX_SCALE_GROUP_SIZE)
+
+
 def tensor_bytes(rows: int, width: int, dtype: str, *, scaled: bool = False) -> int:
-    scale = ceil_div(width, MX_SCALE_GROUP_SIZE) if dtype in MX_DTYPES else (
-        PER_TOKEN_SCALE_BYTES if scaled else 0
-    )
+    scale = mx_scale_bytes(width) if dtype in MX_DTYPES else (PER_TOKEN_SCALE_BYTES if scaled else 0)
     return rows * (element_bytes(width, dtype) + scale)
 
 

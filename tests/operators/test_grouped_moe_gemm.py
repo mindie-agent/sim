@@ -21,15 +21,14 @@ from _support.hardware import REGBASE_ISA, isa_of, machine
 from mindie_sim import graph_costs, target_graphs
 from mindie_sim.catalog.ops import gemm_op, vector_op
 from mindie_sim.catalog.types import QuantSpec
-from mindie_sim.prediction import family_shared_quant
-from mindie_sim.prediction.matrix_splitk import build_router_splitk, router_output_tiles
 from mindie_sim.prediction.moe_cann_fusion import _fused_gating, build_moe_gating_topk
 from mindie_sim.prediction.passes_ffn_fusion import router_gemm
 from mindie_sim.prediction.engine import Engine, Resource
 from mindie_sim.prediction.mechanism import Geometry, Work
 from mindie_sim.prediction.operators import FamilyDispatcher, FamilyRegistry, grouped_moe
 from mindie_sim.prediction.operators.contracts import OperatorPlanningContext
-from mindie_sim.prediction.program import RecipeContext
+from mindie_sim.prediction.operators.grouped_moe.lowering import StageDemand
+from mindie_sim.prediction.program import RecipeBook, RecipeContext
 from mindie_sim.prediction.results import OpOccurrence
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.prediction.transforms import lower_implementations
@@ -46,6 +45,12 @@ AIV_PIPES = ("mte2_aiv", "vector", "mte3")
 XLLM_ABI = "aclnnMoeGroupedMatmulSwigluQuant"
 MX_ABI = "aclnnGroupedMatmulSwigluMxQuant"
 MEGA_ABI = "aclnnMegaMoe"
+MX_SCALE_GROUP_WIDTH = 32
+MX_SCALE_PAIR_WIDTH = 64
+ROUTER_TILE_M = 128
+ROUTER_TILE_N = 256
+INT8_DISPATCH_ROW_BYTES = 36
+BF16_COMBINE_ROW_BYTES = 64
 
 
 def hardware(sku):
@@ -155,7 +160,8 @@ def test_fused_swiglu_handoff_matches_physical_datapath(hardware_sku):
     m, n = sum(rows), 2 * width
     abi, compute = (MX_ABI, "mxfp8") if on_chip else (XLLM_ABI, "int8")
     op = make_op(rows, n, k, mode="gmm_swiglu_quant", requested_abi=abi, dtype=compute,
-                 layout_b="ND" if on_chip else "NZ", handoff_dtype="int32", output_dtype="bf16")
+                 layout_b="ND" if on_chip else "NZ", handoff_dtype="int32",
+                 output_dtype="fp8_e4m3" if on_chip else "bf16")
     resolved = resolve(op, geom)
     plan = resolved.recipe
     stages = check_ledger(resolved, bind(op, geom, plan.work))
@@ -232,9 +238,11 @@ def test_mega_moe_materializes_supported_operands_before_quant(geometry, dtype, 
 @pytest.mark.parametrize("shared", [0, 32])
 def test_mega_moe_wave_partitions_and_shared_expert(geometry, activation, weight, specialization, shared):
     counts, width, k = (3, 0, 6), 64, 32
+    shared_compute, shared_weight = ("bf16", "bf16") if activation == "int8" else (activation, weight)
     op = make_op(counts, 2 * width, k, mode="mega_moe", requested_abi=MEGA_ABI,
                  dtype=activation, dtype_b=weight, output_dtype="bf16",
-                 wave_rows=4, enable_fused_mc2=3 if shared else 2, shared_intermediate=shared)
+                 wave_rows=4, enable_fused_mc2=3 if shared else 2, shared_intermediate=shared,
+                 shared_compute_dtype=shared_compute, shared_weight_dtype=shared_weight)
     resolved = resolve(op, geometry)
     plan = resolved.recipe
     stages = {stage.name: stage for stage in check_ledger(resolved, bind(op, geometry, plan.work))}
@@ -283,7 +291,7 @@ def test_descriptor_roundtrip_and_causal_replay_match_native(geometry, shared_hb
     on_chip = geometry.datapath.has_l0c_to_ub
     dtype = "mxfp8" if on_chip else "int8"
     op = make_op((3, 0, 1), 64, 32, mode="gmm_swiglu_quant", dtype=dtype,
-                 absorbed_source_op_ids=("activation",), output_dtype="bf16")
+                 absorbed_source_op_ids=("activation",), output_dtype="fp8_e4m3" if on_chip else "bf16")
     resolved = resolve(op, geometry)
     plan, descriptor = resolved.recipe, resolved.descriptor
     context = bind(op, geometry, plan.work)
@@ -361,6 +369,25 @@ def test_mx_v2_publishes_fp32_handoff_and_acknowledges_both_consumers(geometry, 
     assert sum(stage.work["vector"] for stage in vectors) == sum(rows) * 64 * 9
 
 
+@pytest.mark.parametrize("arch", ARCH_IDS[1:])
+@pytest.mark.parametrize("input_dtype,n,output_dtype,expected_bytes", [
+    ("mxfp4", 128, "fp8_e4m3fn", 528),
+    ("mxfp4", 128, "fp4_e2m1", 272),
+    ("mxfp8", 192, "fp8_e4m3fn", 800),
+])
+@pytest.mark.parametrize("base_n", [MX_SCALE_GROUP_WIDTH, MX_SCALE_PAIR_WIDTH, 2 * MX_SCALE_PAIR_WIDTH])
+def test_mx_quant_stores_declared_payload_and_paired_scales(geometry, input_dtype, n, output_dtype,
+                                                          expected_bytes, base_n):
+    op = make_op((8,), n, MX_SCALE_PAIR_WIDTH, mode="gmm_swiglu_quant", dtype=input_dtype,
+                 output_dtype=output_dtype, requested_abi="aclnnGroupedMatmulSwigluQuantV2", base_n=base_n)
+    resolved = resolve(op, geometry)
+    stages = check_ledger(resolved, bind(op, geometry, resolved.recipe.work))
+    stores = [stage.work["mte3"] for stage in stages if "mte3" in stage.work]
+    assert sum(stores) == expected_bytes
+    if input_dtype == "mxfp8" and base_n == MX_SCALE_GROUP_WIDTH:
+        assert stores == [132, 132, 132, 132, 136, 136]
+
+
 @pytest.mark.parametrize("hardware_sku", SKUS[:2])
 @pytest.mark.parametrize("declaration", [None, "soc_tier", "transport_abi", "soc_variant"])
 def test_packed_int32_weights_follow_the_declared_soc_contract(hardware_sku, declaration):
@@ -386,9 +413,17 @@ def test_packed_int32_weights_follow_the_declared_soc_contract(hardware_sku, dec
 
 @pytest.mark.parametrize("arch", ARCH_IDS[1:])
 def test_mega_moe_wave_readiness_releases_each_matrix_before_the_last_dispatch(geometry):
-    op = make_op((15, 0, 1), 64, 32, mode="mega_moe", dtype="int8",
+    rows = (15, 0, 1)
+    dispatch = sum(rows) * INT8_DISPATCH_ROW_BYTES
+    combine = sum(rows) * BF16_COMBINE_ROW_BYTES
+
+    def transport(name, after, _amount, metadata):
+        row_bytes = BF16_COMBINE_ROW_BYTES if dict(metadata)["transport_direction"] == "combine" else INT8_DISPATCH_ROW_BYTES
+        return (StageDemand(name, after, Work(resources={"link": row_bytes})),)
+
+    op = make_op(rows, 64, 32, mode="mega_moe", dtype="int8",
                  requested_abi=MEGA_ABI, output_dtype="bf16", wave_rows=1, ep=2,
-                 dispatch_link_bytes=160, combine_link_bytes=320)
+                 dispatch_link_bytes=dispatch, combine_link_bytes=combine, cohort_transport_builder=transport)
     resolved = resolve(op, geometry)
     stages = check_ledger(resolved, bind(op, geometry, resolved.recipe.work))
     ancestry = {}
@@ -400,15 +435,21 @@ def test_mega_moe_wave_readiness_releases_each_matrix_before_the_last_dispatch(g
         assert all(prefix + left in ancestry[prefix + right] for left, right in zip(chain, chain[1:]))
         if wave < 15:
             assert "wave15_dispatch" not in ancestry[prefix + "gmm1"]
-    assert resolved.recipe.work.resources["link"] == 160 + 320
+    assert resolved.recipe.work.resources["link"] == dispatch + combine
 
 
 @pytest.mark.parametrize("arch", ARCH_IDS[1:])
-@pytest.mark.parametrize("shared_dtype,weight_bytes", [("bf16", 2), ("fp32", 4)])
-def test_shared_expert_uses_its_own_precision_for_both_matmuls(geometry, shared_dtype, weight_bytes):
+@pytest.mark.parametrize("shared_dtype,shared_weight", [
+    ("bf16", "bf16"), ("fp32", "fp32"), ("fp16", "fp16"), ("fp8_e5m2", "fp4_e2m1"),
+])
+def test_shared_expert_uses_its_own_precision_for_both_matmuls(geometry, shared_dtype, shared_weight):
     op = make_op((8,), 128, 32, mode="mega_moe", dtype="int8", output_dtype="bf16",
                  enable_fused_mc2=3, shared_intermediate=32,
-                 shared_compute_dtype=shared_dtype, shared_weight_dtype=shared_dtype)
+                 shared_compute_dtype=shared_dtype, shared_weight_dtype=shared_weight)
+    if shared_dtype != "bf16":
+        with pytest.raises(ValueError, match=f"unsupported_shared_expert_precision:{shared_dtype}:{shared_weight}"):
+            resolve(op, geometry)
+        return
     resolved = resolve(op, geometry)
     routed = resolve(make_op((8,), 128, 32, mode="mega_moe", dtype="int8", output_dtype="bf16"), geometry)
     phases = resolved.descriptor.phases
@@ -420,7 +461,7 @@ def test_shared_expert_uses_its_own_precision_for_both_matmuls(geometry, shared_
     }
     down_reads = [item.amount for phase in phases if phase.phase_id.startswith("shared_gmm2:")
                   for item in phase.work if item.resource == "mte2_aic"]
-    assert down_reads == [(8 * 32 + 32 * 32) * weight_bytes]
+    assert down_reads == [(8 * 32 + 32 * 32) * 2]
 
 
 @pytest.mark.parametrize("arch", ARCH_IDS[1:])
@@ -481,8 +522,8 @@ def test_router_split_k_preserves_matrix_and_workspace_service(m, n, k):
     model = SimpleNamespace(quant=QuantSpec("mx", weight_format="mxfp8"), activation_dtype="bf16")
     _, op, _, _ = router_gemm(prefix="route", plan=layer, deps=(), stage=0, requests=(),
                               tokens=m, model=model, hidden=k, mode="decode")
-    plan = build_router_splitk(op, hardware(REPRESENTATIVE_SKUS["a5"]))
-    tiles = router_output_tiles(m, n)
+    _, plan = RecipeBook().prepare(op, hardware(REPRESENTATIVE_SKUS["a5"]))
+    tiles = ceil(m / ROUTER_TILE_M) * ceil(n / ROUTER_TILE_N)
     partial = m * n * 4 * plan.metadata["split_k"]
     assert plan.metadata["output_tiles"] == tiles
     assert 1 < plan.metadata["split_k"] <= k
@@ -529,10 +570,10 @@ def test_shared_int32_fusion_keeps_per_row_and_channel_scale_boundaries(rows):
                    category="shared_expert", family="down_projection", recipe="dense_down",
                    metadata=meta("down"), **common)
     runtime = replace(parse_case(read_case("calls/quantized-grouped-small.json")).runtime,
-                      kernels={"lowerings": {"shared_expert": family_shared_quant.BINDING}})
+                      kernels={"lowerings": {"shared_expert": "ascend_shared_gate_up_int32"}})
     ops = lower_implementations((gate, act, down), runtime, "bf16")
-    fused = next(op for op in ops if op.recipe == family_shared_quant.RECIPE)
     by_id = {op.op_id: op for op in ops}
+    fused = by_id[by_id["q"].deps[0]]
     assert by_id["p"].mte3_bytes == 8 * rows * width and by_id["p"].vector_ops == 0
     assert fused.deps[0] == "p" and "activation_scales" in by_id[fused.deps[1]].returns
     assert fused.mte2_bytes == 8 * rows * width + 8 * width + 4 * rows

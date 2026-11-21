@@ -39,11 +39,12 @@ FRAME, DATA, FLAG, ROW = 512, 480, 32, 240
 M, K, N = 24, 32, 48
 CHUNK_SETTINGS = dict(internal_chunks=2, independent_buffers=True, independent_handles=True)
 RELEASE, RATE, FAST = 7, 64000, 1e9
+MESH_PEERS, ROUTING_WIDTH, INJECTION_RATE = 8, 4096, 32000
 ROLES = ("hbm", "l2", "mte2_aic", "mte2_aiv", "mte1", "mte3", "fixpipe", "vector", "link", "cube")
 BASE_SKU, DUAL_SKU, MESH_SKU = REPRESENTATIVE_SKUS.values()
 
-def call(abi, peers, **fields):
-    shape = (M, K, N) if abi in (GATHER, SCATTER) else ()
+def call(abi, peers, *, shape=(), **fields):
+    shape = (M, K, N) if abi in (GATHER, SCATTER) else shape
     return OpSpec("call", "mc2", "decode", 0, 0, (), shape, shape, shape, shape,
                   dtype="bf16", recipe=f"mc2_{abi}",
                   metadata=(("mc2", dict(abi=abi, world_size=peers, **fields)),))
@@ -204,8 +205,9 @@ def test_foreign_transport_is_rejected_at_public_boundary(arch):
         assert failure.value.onboarding_hint["schema"] == "mindie-unmodeled-structure-hint/1"
 
 @pytest.mark.parametrize("backend", ("python", "c"))
-def test_direct_mesh_alignment_and_active_peers_share_injection(backend):
-    peers = 8
+@pytest.mark.parametrize("declare_ports", (False, True))
+def test_direct_mesh_alignment_and_active_peers_share_injection(backend, declare_ports):
+    peers = MESH_PEERS
     geo = geometry(MESH_SKU, peers)
     fields = dict(transport_abi=SHMEM, width=ROW, status_bytes=0)
     binding = {"caller_abi": "shmem", "window_offset_bytes": FRAME}
@@ -215,23 +217,36 @@ def test_direct_mesh_alignment_and_active_peers_share_injection(backend):
     op = call(DISPATCH, peers, **fields, transport_binding=binding)
     with pytest.raises(UnmodeledCapabilityError, match="peer_capability"):
         mc2.build(op, replace(geo, datapath=replace(geo.datapath, ub_peer_edges=())))
-    for active in (1, peers - 1):
+    for active in (1, 2, peers - 1):
         op = call(DISPATCH, peers, **fields, transport_binding=binding,
                   assignment_matrix={(0, peer): 1 for peer in range(1, active + 1)})
-        plan, ctx = lower_plan(op, geo, mc2_injection=("link", RATE * 1000), mc2_peer=("link", RATE * 1000))
-        sends = [stage for stage in plan.program(ctx).stages if stage.work.get("link")]
+        plan, ctx = lower_plan(op, geo, mc2_injection=("link", INJECTION_RATE * 1000),
+                              mc2_peer=("link", RATE * 1000))
+        pairs = [f"link:mesh:pair0>{peer}" for peer in range(1, peers)]
+        injection = "link:mc2_injection:0"
+        if declare_ports:
+            injection = "link:mesh:tx:port0"
+            rates = {**ctx.rates, **dict.fromkeys(pairs, RATE), injection: INJECTION_RATE}
+            ctx = replace(ctx, rates=rates, resource_units=dict.fromkeys(rates, 1),
+                          service_modes={"mc2_peer": ("link", RATE * 1000)})
+        plan = pickle.loads(pickle.dumps(plan))
+        sends = [stage for stage in plan.program(ctx).stages if injection in stage.work]
         assert plan.metadata["window_alignment_bytes"] == FRAME
         assert plan.metadata["peer_credits"] == peers - 1
         assert len(sends) == active
         _, engine = execute(plan.lower(ctx), ctx.rates, ctx.resource_units, backend=backend)
+        if backend == "c" and declare_ports:
+            assert engine.summary()["native_steps"] > 0
         trace = timings(engine)
         assert len({trace[stage.name]["start_ms"] for stage in sends}) == 1
         for stage in sends:
-            assert stage.work == {"link": 2 * FRAME} and stage.caps == {"link": RATE}
+            peer = pairs[stage.metadata["destination_rank"] - 1] if declare_ports else "link"
+            assert stage.work == {peer: 2 * FRAME, injection: 2 * FRAME}
+            assert stage.caps == {peer: RATE}
             assert stage.metadata["window_offset_bytes"] == FRAME
             transfer = trace[stage.name]
-            assert transfer["end_ms"] - transfer["start_ms"] == pytest.approx(active * 2 * FRAME / RATE)
-        assert engine.serviced["link"] == active * 2 * FRAME
+            assert transfer["end_ms"] - transfer["start_ms"] == pytest.approx(active * 2 * FRAME / INJECTION_RATE)
+        assert engine.serviced[injection] == active * 2 * FRAME
     gemm = mc2.build(call(GATHER, peers, transport_abi=SHMEM, transport_binding=binding), geo)
     assert gemm.metadata["peer_payload_bytes"] == (peers - 1) * M * K * 2 / peers
     assert gemm.work.resources["link"] == (peers - 1) * FRAME
@@ -346,25 +361,63 @@ def test_cohort_plan_is_compact_and_rebinds_service_rates():
 @pytest.mark.parametrize("transport", (WINDOW, CCU))
 def test_receive_only_rank_waits_for_incoming_transfer(backend, transport):
     geo = geometry(MESH_SKU, 2)
-    part = mc2.Mc2CohortSlice(3, 0, 0, 0, 2, 0, 0)
-    op = call(DISPATCH, 2, width=4096, transport_abi=transport, cohort_slices=(part,),
-              assignment_matrix=((0, 0), (2, 0)))
+    route = dict(source_rank=1, destination_rank=0, top_k_slot=0, destination_expert=0)
+    routes = tuple(dict(route, source_token_id=token) for token in range(2))
+    fields = dict(transport_abi=transport, source_tokens_by_rank={1: len(routes)}, shape=(0, ROUTING_WIDTH))
+    op = call(DISPATCH, 2, routes=routes, **fields)
+    for token, error in ((-1, "invalid_source_token_id"), (len(routes), "source_token_id_out_of_range")):
+        bad = call(DISPATCH, 2, routes=(dict(route, source_token_id=token),), **fields)
+        with pytest.raises(ModelingError, match=error):
+            mc2.build(bad, geo)
     plan, ctx = lower_plan(op, geo)
     graph = stages(plan.program(ctx))
     _, engine = execute(plan.lower(ctx), ctx.rates, ctx.resource_units, backend=backend)
     if backend == "c":
         assert engine.summary()["native_steps"] > 0
     trace = timings(engine)
-    recv = graph["cohort3_recv_link_1"]
-    payload, status = (2 * 4096 * 2, FRAME) if transport == CCU else (2 * 18 * FRAME, FLAG)
+    recv = graph["cohort0_recv_link_1"]
+    payload, status = (2 * ROUTING_WIDTH * 2, FRAME) if transport == CCU else (2 * 18 * FRAME, FLAG)
     assert plan.metadata["peer_payload_bytes"] == 0
-    assert recv.work["link"] == engine.serviced["link"] == payload + status
+    assert recv.work["link"] == payload + status
+    outgoing = FRAME if transport == CCU else 0
+    assert engine.serviced["link"] == payload + status + outgoing
     assert (recv.metadata["source_rank"], recv.metadata["destination_rank"]) == (1, 0)
     assert (recv.metadata["payload_bytes"], recv.metadata["status_bytes"]) == (payload, status)
-    assert all("_send_" not in name and "_status_" not in name for name in graph)
-    for name in ("cohort3_recv_1_ready", "cohort3_recv_1_consume", "cohort3_unpack"):
+    assert "cohort0_send_1" not in graph
+    for name in ("cohort0_recv_1_ready", "cohort0_recv_1_consume", "cohort0_unpack"):
         assert recv.name in ancestors(graph, name)
         assert trace[name]["start_ms"] >= trace[recv.name]["end_ms"]
+
+def test_zero_payload_dispatch_exchanges_counts_with_each_peer():
+    peers = 3
+    geo = geometry(MESH_SKU, peers)
+    for abi in (DISPATCH, COMBINE):
+        plan, ctx = lower_plan(call(abi, peers, shape=(1, ROW), transport_abi=CCU,
+                                   assignment_matrix={(rank, rank): 1 for rank in range(peers)}), geo)
+        graph = stages(plan.program(ctx))
+        _, engine = execute(plan.lower(ctx), ctx.rates, ctx.resource_units, backend="c")
+        assert engine.serviced["link"] == (2 * (peers - 1) * FRAME if abi == DISPATCH else 0)
+        for peer in range(1, peers):
+            sent, received = f"cohort0_status_{peer}", f"cohort0_recv_link_{peer}"
+            if abi == DISPATCH:
+                assert graph[sent].work == graph[received].work == {"link": FRAME}
+                assert sent in ancestors(graph, "cohort0_slot_release")
+                assert received in graph["cohort0_cross_core_ready"].after
+            else:
+                assert sent not in graph and received not in graph
+
+@pytest.mark.parametrize("use_shape", (False, True))
+def test_combine_returns_one_row_per_local_source_token(use_shape):
+    tokens = (0, 1, 2, 3, 0, 1)
+    count = len(set(tokens))
+    routes = tuple(dict(source_rank=0, destination_rank=1, source_token_id=token,
+                        top_k_slot=index // count, destination_expert=1)
+                   for index, token in enumerate(tokens))
+    fields = (dict(shape=(count, ROUTING_WIDTH), assignment_matrix={(1, 0): len(tokens)})
+              if use_shape else dict(routes=routes))
+    op = call(COMBINE, 2, width=ROUTING_WIDTH, top_k=2, **fields)
+    plan, ctx = lower_plan(op, geometry(MESH_SKU, 2))
+    assert stages(plan.program(ctx))["cohort0_unpack"].work["mte3"] == count * ROUTING_WIDTH * 2
 
 @pytest.mark.parametrize("backend", ("python", "c"))
 def test_interleaved_cohorts_use_exact_rows_and_restore_order(backend):

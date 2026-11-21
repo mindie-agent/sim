@@ -75,7 +75,9 @@ def test_direct_rows_and_full_mesh_frames_use_their_own_wire_layout(abi):
         phases = {p.phase_id: {w.resource: w.amount for w in p.work} for p in plan.pipeline_spec.phases}
         assert plan.metadata["peer_payload_bytes"] == phases["cohort0_send_1"]["link"] == payload
         assert phases.get("cohort0_status_1", {}).get("link", 0) == status
-        assert plan.work.resources["link"] == payload + status
+        incoming_count = status if plan is direct else 0
+        assert phases.get("cohort0_recv_link_1", {}).get("link", 0) == incoming_count
+        assert plan.work.resources["link"] == payload + status + incoming_count
 
 
 @pytest.mark.parametrize("mode,payload_dtype", (("none", "fp8_e4m3"), ("per_token", "int8"), ("mx", "fp8_e4m3")))
@@ -87,7 +89,7 @@ def test_quantized_direct_stride_aligns_payload_and_scales_per_assignment(mode, 
     args = dict(input_dtype=incoming, payload_dtype=payload_dtype, quant_mode=mode, input_scale_bytes=given_scales)
     alignment = MX_ALIGN if mode == "mx" else ROW_ALIGN
     plan = row_plan("dispatch_v2", width, 3, "a5_ccu", **args)
-    assert plan.work.resources["link"] == 3 * align(align(width, alignment) + scales, FRAME) + FRAME
+    assert plan.work.resources["link"] == 3 * align(align(width, alignment) + scales, FRAME) + 2 * FRAME
     if mode != "none":
         with pytest.raises(ModelingError, match="requires_unscaled_float_row"):
             row_plan("dispatch_v2", width, 3, "a5_ccu", **{**args, "input_scale_bytes": scales})

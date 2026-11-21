@@ -38,6 +38,9 @@ from mindie_sim.structure import export_structure
 pytestmark = pytest.mark.tier0
 MEMBASE, REGBASE = (axis.values[0] for axis in ARCH_IDS)
 MIN_UB = 192 * 1024
+ATTNRES_RELOAD_UB = 248 * 1024
+ATTNRES_RELOAD_HISTORY_ROWS = 104
+ATTNRES_UNFUSED_COPY_BYTES, ATTNRES_FUSED_COPY_BYTES = 434_176, 432_128
 POOLS = {"ub": 256 * 1024, "l1": 512 * 1024, "l0a": 65536, "l0b": 65536, "l0c": 262144}
 PEAKS = {"bf16": 1e12, "hf32": 1e12, "fp32": 2e12}
 PRE, PRE_SINK, POST, COLLAPSE = "hc_pre", "hc_pre_sinkhorn", "hc_post", "mhc_post_collapse"
@@ -268,7 +271,6 @@ def _resident_limit_oracle(h, ub, *, regbase, fuse_add, fused_chain=False, need_
         cap = min(cap, max(0, (ub - 32 * 1024 - h * (20 + 2 * fuse_add)) // (2 * h + 4)))
     return cap
 
-
 @pytest.mark.parametrize("arch", ARCH_IDS)
 @pytest.mark.parametrize("h,fuse,chain,backward,physical_cap", [
     (1024, False, False, False, None), (1024, True, False, False, 5),
@@ -288,61 +290,65 @@ def test_attnres_exact_resident_cutoff(arch, h, fuse, chain, backward, physical_
         assert plan.metadata["selected_template"] == template
         assert plan.metadata["reread_bytes"] == (0 if template == "resident" else 2 * h * m * (j - cached))
 
-
 def test_attnres_regbase_resident_admission_boundary():
-    h, ub = 1024, 248 * 1024
+    h, ub = 1024, ATTNRES_RELOAD_UB
     assert hc.attnres_max_resident_rows(h, ub, fuse_add=True) == 96
     for rows, template in ((96, "resident"), (97, "reload")):
         op = _op(ATTN, (1, h), capacity=rows, valid_history=rows - 1, fuse_add=True)
         assert hc.build(op, _geometry(ub=ub)).metadata["selected_template"] == template
 
-
 @pytest.mark.parametrize("cached", [0, 2])
 @pytest.mark.parametrize("fits", [True, False])
 @pytest.mark.parametrize("backend", ["python", "c"])
-def test_attnres_reload_service_tracks_per_token_live_l2(cached, fits, backend):
-    m, h, j = 3, 1024, 96
-    history = 2 * h * j
-    geom = _geometry(aiv=1, l2=history if fits else history - 2 * h, ub=248 * 1024)
-    op = _op(ATTN, (m, h), capacity=j + 3, valid_history=j, cached_rows=cached)
+@pytest.mark.parametrize("m,fuse_add,fused_chain", [(3, True, False), (1, False, True), (1, False, False)])
+def test_attnres_reload_service_tracks_per_token_live_l2(cached, fits, backend, m, fuse_add, fused_chain):
+    h, j = 1024, ATTNRES_RELOAD_HISTORY_ROWS
+    row, unfused = 2 * h, not (fuse_add or fused_chain)
+    working_set = row * (j + unfused)
+    geom = _geometry(aiv=1, l2=working_set if fits else working_set - row, ub=ATTNRES_RELOAD_UB)
+    op = _op(ATTN, (m, h), capacity=j + 1, valid_history=j, cached_rows=cached,
+             fuse_add=fuse_add, fused_chain=fused_chain)
     plan, ctx = hc.build(op, geom), _context(op, geom)
     engine, _ = _run(plan.lower(ctx), ctx, backend=backend)
+    if m == 1 and not cached:
+        copy_bytes = ATTNRES_UNFUSED_COPY_BYTES if unfused else ATTNRES_FUSED_COPY_BYTES
+        assert engine.serviced["mte2_aiv"] == pytest.approx(copy_bytes, rel=1e-12)
     trace = {task["task"].rsplit(":", 1)[-1]: task for task in engine.trace}
+    inputs = "history_and_prefix" if unfused else "history"
+    names = (f"pass1_{inputs}", "pass1_score", "softmax", f"pass2_{inputs}", "pass2_weighted", "output")
     for i in range(m):
-        names = ("pass1_history", "pass1_score", "softmax", "pass2_history", "pass2_weighted", "output")
         phases = [trace[f"token_{i}_{name}"] for name in names]
         assert all(a["end_ms"] <= b["start_ms"] for a, b in zip(phases, phases[1:]))
         assert phases[0]["placement"]["mte2_aiv"] == phases[3]["placement"]["mte2_aiv"] == (0,)
         if i + 1 < m:
             assert phases[-1]["end_ms"] <= trace[f"token_{i + 1}_prefix_input"]["start_ms"]
-    reread = m * 2 * h * (j - cached)
+    reread = m * row * (j - cached + unfused)
     assert engine.serviced.get("l2", 0) == pytest.approx(reread if fits else 0)
-    other_hbm = 2 * h * (4 * m + 2)
-    assert engine.serviced["hbm"] == pytest.approx(m * history + other_hbm + (0 if fits else reread))
+    first_reads_and_writes = row * (2 + m * (j + 2 + 2 * fuse_add))
+    assert engine.serviced["hbm"] == pytest.approx(first_reads_and_writes + (0 if fits else reread))
     assert _serviced(engine) == pytest.approx(ctx.bind(plan.work))
     close(engine)
 
-
-def test_attnres_concurrent_history_eviction_on_shared_die():
+@pytest.mark.parametrize("fuse_add", [True, False])
+def test_attnres_concurrent_reload_eviction_on_shared_die(fuse_add):
     h, j = 128, 3
-    history = 2 * h * j
-    geom = _geometry(aiv=1, l2=history)
-    op = _op(ATTN, (1, h), capacity=j, valid_history=j, physical_capacity_cap=j)
+    working_set = 2 * h * (j + (not fuse_add))
+    geom = _geometry(aiv=1, l2=working_set)
+    op = _op(ATTN, (1, h), capacity=j, valid_history=j, physical_capacity_cap=j, fuse_add=fuse_add)
     plan, ctx = hc.build(op, geom), _context(op, geom)
     program = plan.lower(ctx)
-    assert _run(program, ctx)[0].serviced["l2"] == pytest.approx(history)
+    assert _run(program, ctx)[0].serviced["l2"] == pytest.approx(working_set)
     engine = _engine(ctx)
     ready = engine.submit("input", release=7)
     first = program.start(engine, "first", ready, owner="stream_a")
     second = program.start(engine, "second", ready, owner="stream_b")
     engine.advance(until=(first, second))
     assert not engine.serviced.get("l2")
-    assert engine.serviced["hbm"] == pytest.approx(2 * (plan.work.resources["hbm"] + history))
+    assert engine.serviced["hbm"] == pytest.approx(2 * (plan.work.resources["hbm"] + working_set))
     # Finishing both streams retires their working sets for the next token.
     third = program.start(engine, "third", second)
     engine.advance(until=(third,))
-    assert engine.serviced["l2"] == pytest.approx(history)
-
+    assert engine.serviced["l2"] == pytest.approx(working_set)
 
 @pytest.mark.parametrize("arch", ARCH_IDS)
 @pytest.mark.parametrize("mask,chunk,branches", [
@@ -442,7 +448,6 @@ def test_projection_precision_and_owner_tail_service(m):
         slow = replace(ctx, compute_peaks={**PEAKS, dtype: PEAKS[dtype] / 10})
         assert _run(plan.lower(slow), slow)[1] > duration
 
-
 @pytest.mark.parametrize("arch", ARCH_IDS)
 @pytest.mark.parametrize("m,h", [(1, 2048), (41, 2112), (43, 4128)])
 def test_post_owner_tail_service_and_shared_store(arch, m, h):
@@ -460,7 +465,6 @@ def test_post_owner_tail_service_and_shared_store(arch, m, h):
     store_units = min(20, ceil(m / 2))
     assert duration == pytest.approx(m / store_units, abs=1e-6)
     assert _serviced(engine) == pytest.approx(ctx.bind(plan.work))
-
 
 @pytest.mark.parametrize("slow", ["vector", "mte3", "mte1", "mte2_aiv", "hbm"])
 def test_split_projection_backpressure_and_terminal_service(slow):
@@ -483,7 +487,6 @@ def test_split_projection_backpressure_and_terminal_service(slow):
     done = plan.lower(ctx).start(basis, "repeat", ready)
     basis.advance(until=(done,))
     assert done.time == pytest.approx(ready.time + elapsed)
-
 
 def test_attnres_owner_arithmetic_gamma_and_empty_history():
     h = 64

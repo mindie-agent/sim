@@ -1,7 +1,7 @@
 """Lower hyper-connections phases onto the shared resource engine.
 
 [Role] Build the prepared work ledger and submit owner-local phases.
-[Invariants] History reads rebind at Engine admission on the physical die's
+[Invariants] Reload reads rebind at Engine admission on the physical die's
   shared L2 view. AIV owners issue at most one AttnRes token at a time.
 [Timeouts & Locks] Virtual execution with finite token chains. No locks.
 [Side-Effect Policy] Planning is pure. Admission only updates Engine state.
@@ -48,7 +48,7 @@ class Phase:
     owners: tuple[int, ...]
     work: Work = field(default_factory=Work)
     access: MemoryAccessPattern | None = None
-    final_history_read: bool = False
+    final_reuse_read: bool = False
     metadata: tuple[tuple[str, int | str], ...] = ()
 
     def reference_work(self, l2_capacity: int) -> Work:
@@ -57,7 +57,7 @@ class Phase:
         if access is None:
             return self.work
         aligned = access.runs.aligned_copy_bytes()
-        l2 = aligned if self.final_history_read and access.reuse_distance_bytes <= l2_capacity else 0
+        l2 = aligned if self.final_reuse_read and access.reuse_distance_bytes <= l2_capacity else 0
         dram = 0 if l2 else access.runs.dram_sector_and_service(())[1]
         return self.work + Work(resources={access.pipe: aligned, "hbm": dram, "l2": l2})
 
@@ -75,7 +75,7 @@ def _copy_rates(ctx: RecipeContext, access: MemoryAccessPattern) -> tuple[str, i
 
 @dataclass(frozen=True, slots=True)
 class TokenProgram:
-    """Execute one token per owner, admitting each history access as it starts."""
+    """Execute one token per owner, admitting each reload access as it starts."""
 
     stages: tuple[Stage, ...]
     phases: tuple[Phase, ...]
@@ -132,7 +132,7 @@ class TokenProgram:
                     event = engine.submit_bound_access(
                         task, bound, after=deps, owner=owner, memory_state=memory, pattern=access,
                     )
-                    if phase.final_history_read:
+                    if phase.final_reuse_read:
                         engine.on_complete(event, lambda _, key=key: memory.retire_workspace(key))
                 events[stage.name] = event
             engine.on_complete(event, lambda done: issue(chain, done))
@@ -197,7 +197,7 @@ class PhaseProgram:
                     }))
             stages.append(Stage(phase.name, demand, after=phase.after, placement=placement,
                                 coupled=access is not None, metadata=metadata))
-        if any(phase.final_history_read for phase in self.phases):
+        if any(phase.final_reuse_read for phase in self.phases):
             return TokenProgram(tuple(stages), self.phases, self.token_ranges, ctx, self.l2_capacity, self.l2_units)
         return KernelProgram(tuple(stages))
 
@@ -226,29 +226,29 @@ class PhaseGraph:
         self.token_ranges.append((begin, len(self.phases)))
 
     def add(self, name, after=(), *, work=None, owners=None, aic=False,
-            metadata=(), access=None, final_history_read=False) -> str:
+            metadata=(), access=None, final_reuse_read=False) -> str:
         domain = self.aic if aic else self.aiv
         owners = domain if owners is None else owners
         if not owners:
             kind = "aic" if aic else "aiv"
             raise gap(f"hyper_connections_requires_{kind}_owners", name)
         self.phases.append(Phase(name, after, "aic" if aic else "aiv", owners,
-                                 work or Work(), access, final_history_read, metadata))
+                                 work or Work(), access, final_reuse_read, metadata))
         return name
 
     def transfer(self, name, size, after=(), *, aic=False, write=False, owners=None,
-                 run=None, reuse=None, distance=None, final_history_read=False) -> str:
+                 runs=(), reuse=None, distance=None, final_reuse_read=False) -> str:
         if owners is None:
             owners = self.aic if aic else self.aiv
         pipe = ("fixpipe" if aic else "mte3") if write else ("mte2_aic" if aic else "mte2_aiv")
-        runs = AddressRunPlan((run or AddressRun(0, 1, size, size),), sector_bytes=self.sector)
+        run_plan = AddressRunPlan(runs or (AddressRun(0, 1, size, size),), sector_bytes=self.sector)
         access = MemoryAccessPattern(
             tensor_id=reuse.backing_allocation if reuse else name, version=0,
             die=0, owner=owners[0] if owners else 0, direction="write" if write else "read",
-            pipe=pipe, logical_bytes=size, runs=runs, reuse_key=reuse,
+            pipe=pipe, logical_bytes=size, runs=run_plan, reuse_key=reuse,
             reuse_distance_bytes=distance, visibility=VisibilityContract(live_out=write),
         )
-        return self.add(name, after, owners=owners, aic=aic, access=access, final_history_read=final_history_read)
+        return self.add(name, after, owners=owners, aic=aic, access=access, final_reuse_read=final_reuse_read)
 
     def vector(self, name, amount, after, *, owners=None, metadata=()) -> str:
         return self.add(name, after, work=Work(resources={"vector": amount}),

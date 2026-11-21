@@ -4,7 +4,8 @@
 [Invariants] Ordered physical hops each carry the wire bytes. SHMEM transfers
   share rank injection capacity and keep their declared per-peer rate caps.
 [Timeouts & Locks] Finite phase and peer traversal without locks.
-[Side-Effect Policy] Creates analytical work and stages without I/O.
+[Side-Effect Policy] Binds analytical stages and declares capacity on the
+  caller's engine without I/O.
 """
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ import math
 from typing import TYPE_CHECKING
 
 from mindie_sim.schema.common import ModelingError, align_up, dtype_bytes
+from ...engine import Resource
 from ...mechanism import Work
 from ...program import KernelProgram, RecipeContext, Stage
 
@@ -71,7 +73,8 @@ class Phase:
     metadata: tuple[tuple[str, bool | int | float | str | bytes | None | tuple[int, ...]], ...] = ()
     service_mode: str = ""
     physical_hop: str = ""
-    shared_injection: bool = False
+    shmem: bool = False
+    outgoing: bool = True
 
 
 def read_work(amount: int | float, *, aic: bool = False, l2: bool = False) -> Work:
@@ -85,7 +88,7 @@ def store_work(amount: int | float, *, fixpipe: bool = False, l2: bool = False) 
 
 
 def peer_stages(name: str, after: tuple[str, ...], route: PeerRoute, transport: Transport,
-                amount: int | float, metadata: tuple = ()) -> tuple[Phase, ...]:
+                amount: int | float, metadata: tuple = (), *, outgoing: bool = True) -> tuple[Phase, ...]:
     wire = transport.peer_bytes(amount)
     info = (
         ("source_rank", route.source), ("destination_rank", route.destination),
@@ -95,7 +98,7 @@ def peer_stages(name: str, after: tuple[str, ...], route: PeerRoute, transport: 
     if transport.abi != SIO_HCCS:
         return (Phase(name, after, Work(resources={"link": wire}), metadata=metadata + info,
                       service_mode="mc2_peer_" + "_".join(route.hops).lower(),
-                      shared_injection=transport.abi == SHMEM),)
+                      shmem=transport.abi == SHMEM, outgoing=outgoing),)
     phases = []
     for index, hop in enumerate(route.hops):
         stage = name if index == len(route.hops) - 1 else f"{name}_hop_{index}"
@@ -135,32 +138,35 @@ def cohort_stages(
     ))]
     send_done, recv_done = [], []
     row_bytes, status_bytes, padding_bytes, flag_bytes = framing
+    count_every_peer = transport.ccu and dispatch
     rank = contract.rank
     for route in transport.routes:
         peer = route.destination
         rows = counts.get((rank, peer), 0)
-        if not rows:
+        if not rows and not count_every_peer:
             continue
         payload = rows * row_bytes
         data = prefix + f"send_{peer}"
         credit = (send_done[-transport.credits],) if len(send_done) >= transport.credits else ()
         deps = (pack_name, *credit, *peer_after)
-        window = transport.peer_bytes(payload + status_bytes)
-        if transport.aiv_staging:
-            staged = data + "_stage_ub"
-            phases.append(Phase(staged, deps, Work(resources={"mte3": payload}), "aiv", tag))
-            deps = (staged,)
-        phases.extend(peer_stages(data, deps, route, transport, payload, tag + (
-            ("payload_bytes", payload), ("protocol_padding_bytes", rows * padding_bytes),
-            ("frame_flag_bytes", rows * flag_bytes),
-            ("window_bytes", align_up(math.ceil(window), transport.window_alignment)),
-            ("window_rank", peer), ("window_offset_bytes", transport.window_offset),
-            ("direct_remote_gm", transport.direct_remote_gm),
-            ("transfer", ("write_nbi" if dispatch else "read_nbi") if transport.ccu else "peer_window"),
-        )))
+        if payload:
+            window = transport.peer_bytes(payload + status_bytes)
+            if transport.aiv_staging:
+                staged = data + "_stage_ub"
+                phases.append(Phase(staged, deps, Work(resources={"mte3": payload}), "aiv", tag))
+                deps = (staged,)
+            phases.extend(peer_stages(data, deps, route, transport, payload, tag + (
+                ("payload_bytes", payload), ("protocol_padding_bytes", rows * padding_bytes),
+                ("frame_flag_bytes", rows * flag_bytes),
+                ("window_bytes", align_up(math.ceil(window), transport.window_alignment)),
+                ("window_rank", peer), ("window_offset_bytes", transport.window_offset),
+                ("direct_remote_gm", transport.direct_remote_gm),
+                ("transfer", ("write_nbi" if dispatch else "read_nbi") if transport.ccu else "peer_window"),
+            )))
+            deps = (data,)
         if status_bytes:
             status = prefix + f"status_{peer}"
-            phases.extend(peer_stages(status, (data,), route, transport, status_bytes,
+            phases.extend(peer_stages(status, deps, route, transport, status_bytes,
                                       tag + (("status_bytes", status_bytes),)))
             data = status
         send_done.append(data)
@@ -171,7 +177,7 @@ def cohort_stages(
     incoming_routes.update((route.source, route) for route in transport.incoming_routes)
     for peer, incoming in incoming_routes.items():
         rows = counts.get((peer, rank), 0)
-        if not rows:
+        if not rows and not count_every_peer:
             continue
         receive = rows * row_bytes
         data = prefix + f"recv_link_{peer}"
@@ -179,7 +185,10 @@ def cohort_stages(
         phases.extend(peer_stages(data, (*after, *peer_after, *credit), incoming, transport, receive + status_bytes,
                                   tag + (("payload_bytes", receive), ("status_bytes", status_bytes),
                                          ("protocol_padding_bytes", rows * padding_bytes),
-                                         ("frame_flag_bytes", rows * flag_bytes))))
+                                         ("frame_flag_bytes", rows * flag_bytes)), outgoing=False))
+        if not receive:
+            recv_done.append(data)
+            continue
         visible, consume = prefix + f"recv_{peer}_ready", prefix + f"recv_{peer}_consume"
         phases.append(Phase(visible, (data,), Work(resources={"hbm": receive}), metadata=tag))
         phases.append(Phase(consume, (visible,), read_work(receive), "aiv", tag))
@@ -204,19 +213,16 @@ def cohort_stages(
     return tuple(phases)
 
 
-def _bind_transfer(phase: Phase, context: RecipeContext) -> tuple[dict, dict]:
+def _bind_transfer(phase: Phase, context: RecipeContext, routed_pair: str | None = None) -> tuple[dict, dict]:
     names = context.resource_names
-    if phase.shared_injection:
-        # The bound injection (or rank link) supplies aggregate capacity in the engine.
-        candidates = (context.physical_role("mc2_injection"),)
-    else:
-        candidates = (
-            context.physical_role(phase.physical_hop.lower()),
-            context.physical_role(phase.physical_hop),
-            context.physical_role(phase.service_mode),
-        )
-    candidates += (context.physical_role("link"),)
-    resource = next((names[role] for role in candidates if role and role in names), None)
+    candidates = (
+        context.physical_role(phase.physical_hop.lower()),
+        context.physical_role(phase.physical_hop),
+        context.physical_role(phase.service_mode),
+        context.physical_role("mc2_peer"),
+        context.physical_role("link"),
+    )
+    resource = routed_pair or next((names[role] for role in candidates if role and role in names), None)
     if resource is None:
         routed = set(context.work) - set(names.values())
         if len(routed) != 1:
@@ -225,11 +231,51 @@ def _bind_transfer(phase: Phase, context: RecipeContext) -> tuple[dict, dict]:
     rate = context.service_rate(phase.service_mode)
     if rate is None:
         rate = context.service_rate("mc2_peer")
-    injection = context.service_rate("mc2_injection") if phase.shared_injection else None
-    if injection is not None:
-        rate = injection if rate is None else min(rate, injection)
     caps = {resource: rate / MILLISECONDS_PER_SECOND} if rate is not None else {}
     return {resource: phase.work.resources["link"]}, caps
+
+
+def _shmem_pair(context: RecipeContext, source: int, destination: int) -> str | None:
+    suffix = f":pair{source}>{destination}"
+    candidates = [name for name in context.rates if name.endswith(suffix)]
+    return next((name for name in candidates if name in context.work),
+                candidates[0] if len(candidates) == 1 else None)
+
+
+def _bind_injection(
+    source: int, pair: str | None, context: RecipeContext, extra: dict[str, Resource],
+) -> str | None:
+    role = context.physical_role("mc2_injection")
+    bound = context.resource_names.get(role) if role != "link" else None
+    if bound is None and pair is not None:
+        fabric, _ = pair.rsplit(":pair", 1)
+        port = f"{fabric}:tx:port{source}"
+        if port in context.rates:
+            bound = port
+    rate = context.service_rate("mc2_injection")
+    if rate is None:
+        return bound
+    rate /= MILLISECONDS_PER_SECOND
+    if bound is not None and context.rates[bound] <= rate:
+        return bound
+    # A service mode can cap a faster backing link. The cap must belong to
+    # one fair resource for the source rank, so concurrent peers share it.
+    scope = context.resource_names.get("link", context.resource_names.get("hbm", "link"))
+    name = f"{scope}:mc2_injection:{source}"
+    extra[name] = Resource(name, rate, unit="bytes")
+    return name
+
+
+@dataclass(frozen=True)
+class _ShmemProgram(KernelProgram):
+    injection_resources: tuple[Resource, ...] = ()
+
+    def start(self, engine, name, ready, *, owner=""):
+        missing = tuple(resource for resource in self.injection_resources
+                        if engine.resources.get(resource.name) != resource)
+        if missing:
+            engine.extend(missing)
+        return super().start(engine, name, ready, owner=owner)
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,10 +284,16 @@ class Mc2Program:
 
     def __call__(self, context: RecipeContext) -> KernelProgram:
         stages = []
+        injection_resources = {}
         for phase in self.phases:
             info = dict(phase.metadata)
             if phase.service_mode and phase.work.resources["link"]:
-                demand, caps = _bind_transfer(phase, context)
+                pair = _shmem_pair(context, info["source_rank"], info["destination_rank"]) if phase.shmem else None
+                demand, caps = _bind_transfer(phase, context, pair)
+                if phase.shmem and phase.outgoing:
+                    injection = _bind_injection(info["source_rank"], pair, context, injection_resources)
+                    if injection is not None:
+                        demand[injection] = phase.work.resources["link"]
             else:
                 demand, caps = context.bind(phase.work), {}
             placement = {}
@@ -253,5 +305,8 @@ class Mc2Program:
                 }
                 placement = {name: owners[:units] for name, owners in placement.items()}
             stages.append(Stage(phase.name, demand, phase.after, caps=caps, placement=placement,
+                                coupled=phase.shmem and len(demand) > 1,
                                 metadata=info, keep_empty=True))
+        if injection_resources:
+            return _ShmemProgram(tuple(stages), injection_resources=tuple(injection_resources.values()))
         return KernelProgram(tuple(stages))

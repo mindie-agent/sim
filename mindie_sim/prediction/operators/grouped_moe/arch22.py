@@ -57,6 +57,12 @@ SOURCES: tuple[SourceRef, ...] = (
         source_sha256="db7838ecfb7990418bf92bd555d336e10137d4d5ac519aa0877d924d65e393f7",
     ),
     SourceRef(
+        repository="cann/ops-nn",
+        revision="238f76a06d0cfc5ee90071e2c08310e2b517c3a6",
+        relative_path="quant/dequant_swiglu_quant/op_kernel/dequant_swiglu_quant.h",
+        source_sha256="312142801e5f29ac5d55de15bdeaa480bbf3c064c4285b3eedcf44901da58640",
+    ),
+    SourceRef(
         repository="xllm-ops",
         revision="32717633770e523782460c52db79af7f195ce575",
         relative_path="xllm_ops/moe_grouped_matmul_swiglu_quant/op_host/moe_grouped_matmul_swiglu_quant_tiling.cpp",
@@ -203,7 +209,10 @@ class _Arch22Strategy:
                             gm_handoff_bytes=2 * contract.m * contract.n * INT32_HANDOFF_BYTES_PER_ELEM)
             implementation = contract.abi or "aclnnGroupedMatmulSwigluQuant"
         elif mode == "dequant_swiglu_quant":
-            stages = activation_stages("dequant_swiglu_quant", (), ctx, contract, contract.group_rows)
+            stages = activation_stages(
+                "dequant_swiglu_quant", (), ctx, contract, contract.group_rows,
+                has_activation_scale=contract_fields(op).get("has_activation_scale", True),
+            )
             implementation = "aclnnDequantSwigluQuant"
         else:
             transport_builder = contract_fields(op).get("cohort_transport_builder")

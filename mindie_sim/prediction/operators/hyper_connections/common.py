@@ -536,6 +536,8 @@ def model_attnres(graph: PhaseGraph, t: AttnResContract, ub: int, physical_cap: 
     template = "resident" if resident else "cooperative_reload" if 0 < cached < j else "reload"
     elt = int(dtype_bytes(t.dtype))
     row = elt * h
+    prefix_reload_bytes = row if not (resident or t.fuse_add or t.fused_chain) else 0
+    reload_inputs = "history_and_prefix" if prefix_reload_bytes else "history"
     metadata = {"resident_row_limit": limit, "selected_template": template,
                 "reread_bytes": m * (j - cached) * row, "history_read_bytes": m * j * row}
     if m and not graph.aiv:
@@ -543,36 +545,42 @@ def model_attnres(graph: PhaseGraph, t: AttnResContract, ub: int, physical_cap: 
     if not m:
         return metadata
     stride = elt * t.token_stride
+    # Keep the prefix tensor's sectors disjoint from the history bank in each reuse group.
+    prefix_base = _ceil(m * stride, graph.sector) * graph.sector
     per_owner = _ceil(m, len(graph.aiv))
     for index, start in enumerate(range(0, m, per_owner)):
         owners = (graph.aiv[index],)
         previous = ()
         for token in range(start, min(m, start + per_owner)):
             prefix = f"token_{token}"
-            prefix_bytes = row * (1 + int(t.fuse_add) + (2 if token == start else 0))
-            inp = graph.transfer(f"{prefix}_prefix_input", prefix_bytes, previous, owners=owners)
-            deps = (inp,)
-            reuse = ReuseKey(0, f"attnres_history_{token}", 0) if j > cached else None
-            distance = None
-            if j:
-                history_run = AddressRun(token * stride, 1, j * row, stride)
-                if reuse is not None:
-                    runs = AddressRunPlan((history_run,), sector_bytes=graph.sector)
-                    distance = max(runs.aligned_copy_bytes(), runs.dram_sector_and_service(())[0])
-                history = graph.transfer(f"{prefix}_pass1_history", j * row, (inp,), owners=owners,
-                                         run=history_run, reuse=reuse, distance=distance)
-                deps = (history,)
+            prefix_bytes = row * (1 + int(t.fuse_add) + (2 if token == start else 0)) - prefix_reload_bytes
+            deps = previous
+            if prefix_bytes:
+                deps = (graph.transfer(f"{prefix}_prefix_input", prefix_bytes, deps, owners=owners),)
+            bank_base = token * stride
+            prefix_runs = (AddressRun(prefix_base + token * row, 1, row, row),) if prefix_reload_bytes else ()
+            runs = ((AddressRun(bank_base, 1, j * row, stride),) if j else ()) + prefix_runs
+            reuse = distance = None
+            if j > cached or prefix_reload_bytes:
+                reuse = ReuseKey(0, f"attnres_reload_{token}", 0)
+                access_plan = AddressRunPlan(runs, sector_bytes=graph.sector)
+                distance = max(access_plan.aligned_copy_bytes(), access_plan.dram_sector_and_service(())[0])
+            if runs:
+                inp = graph.transfer(f"{prefix}_pass1_{reload_inputs}", j * row + prefix_reload_bytes, deps,
+                                     owners=owners, runs=runs, reuse=reuse, distance=distance)
+                deps = (inp,)
             score_per_row = 2 * (h - 1) + (2 + 2) * h + RMS_SCALAR_OPS
             fuse = (2 + 2) * h if t.fuse_add else 0
             score = graph.vector(f"{prefix}_pass1_score", (j + 1) * score_per_row + fuse, deps, owners=owners)
             softmax = graph.vector(f"{prefix}_softmax", ATTNRES_SOFTMAX_OPS_PER_ROW * (j + 1) - 1,
                                    (score,), owners=owners)
             deps = (softmax,)
-            if j > cached:
+            if reuse is not None:
                 size = (j - cached) * row
-                reread = graph.transfer(f"{prefix}_pass2_history", size, deps, owners=owners,
-                                        run=AddressRun(token * stride + cached * row, 1, size, stride),
-                                        reuse=reuse, distance=distance, final_history_read=True)
+                runs = ((AddressRun(bank_base + cached * row, 1, size, stride),) if size else ()) + prefix_runs
+                reread = graph.transfer(f"{prefix}_pass2_{reload_inputs}", size + prefix_reload_bytes, deps,
+                                        owners=owners, runs=runs, reuse=reuse, distance=distance,
+                                        final_reuse_read=True)
                 deps = (reread,)
             if t.output_norm:
                 deps += (graph.transfer(f"{prefix}_output_gamma", row, owners=owners),)

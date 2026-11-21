@@ -26,9 +26,21 @@ from .common import (
     matrix_stages, tensor_bytes, validate_contract,
 )
 
-from .lowering import DualBatchMoEPipeline, routing_stages, validate_transport_work
+from .lowering import DualBatchMoEPipeline, mx_scale_bytes, routing_stages, validate_transport_work
 
 SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="af03b86b9c5cf197cef7338a1e750881fcee426b",
+        relative_path="gmm/grouped_matmul_swiglu_quant_v2/op_host/grouped_matmul_swiglu_quant_v2_infershape.cpp",
+        source_sha256="78530fcdc4c9e441127781c3ad0d4941ece3fca8947445d7b708195e048962cd",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="af03b86b9c5cf197cef7338a1e750881fcee426b",
+        relative_path="mc2/mega_moe/op_host/op_tiling/arch35_92/mega_moe_tiling_check.h",
+        source_sha256="2da68d2404d401691b92c8f6af3a1f250c6e40eb10deaa11376b8920cd077237",
+    ),
     SourceRef(
         repository="cann/ops-transformer",
         revision="af03b86b9c5cf197cef7338a1e750881fcee426b",
@@ -91,6 +103,13 @@ MEGA_MOE_WAVE_TILE = 256
 GMM1_WAVE_N_TILES_PER_CORE = 4
 FP4_DTYPES = frozenset({"fp4", "fp4_e2m1", "mxfp4"})
 BYTE_DTYPES = frozenset({"fp8", "fp8_e4m3", "fp8_e5m2", "mxfp8", "int8", "hif8"})
+SHARED_DTYPE_ALIASES = {
+    "fp8": "fp8_e4m3", "mxfp8": "fp8_e4m3", "fp4": "fp4_e2m1", "mxfp4": "fp4_e2m1",
+}
+SHARED_GEMM_PRECISIONS = frozenset({
+    ("bf16", "bf16"), ("fp8_e4m3", "fp8_e4m3"), ("fp8_e5m2", "fp8_e5m2"),
+    ("fp8_e4m3", "fp4_e2m1"), ("fp4_e2m1", "fp4_e2m1"),
+})
 AIV_INPUT_DTYPES = frozenset({"int32", "fp16", "bf16"})
 MX_AIVS_PER_AIC = 2
 MX_ABI = "aclnnGroupedMatmulSwigluMxQuant"
@@ -135,6 +154,11 @@ def _validate(op, ctx, contract):
         raise capability_gap(op, ctx, "l0c_to_ub_fixpipe")
     if mode in ROUTED_MODES:
         _specialization(op, ctx, contract)
+        if contract.shared_intermediate:
+            compute, weight = contract.shared_compute_dtype, contract.shared_weight_dtype
+            dtypes = tuple(SHARED_DTYPE_ALIASES.get(dtype, dtype) for dtype in (compute, weight))
+            if dtypes not in SHARED_GEMM_PRECISIONS:
+                raise ModelingError(f"grouped_moe_unsupported_shared_expert_precision:{compute}:{weight}")
     if mode in ROUTED_MODES | {"gmm_swiglu_quant"}:
         ctx.datapath.route("l0c", "ub")
     if mode == "gmm_swiglu_quant" and (
@@ -154,7 +178,7 @@ def _fit_ub(contract, ctx):
     accum_bytes = element_bytes(contract.activation_divisor, contract.handoff_dtype)
     columns = min(contract.intermediate, contract.base_n)
     # Reduce M before N so independently stored MX scales remain group aligned.
-    if columns < contract.intermediate and contract.quant_dtype in MX_DTYPES:
+    if columns < contract.intermediate and contract.uses_mx_scales:
         columns = columns // MX_SCALE_GROUP_SIZE * MX_SCALE_GROUP_SIZE
     if not columns:
         raise ModelingError("grouped_moe_arch35_ub_tile_width_invalid")
@@ -171,7 +195,7 @@ def _fit_ub(contract, ctx):
 def _gated_stages(contract, ctx, name, after, metadata, *, start_core=0, owner_ready=None):
     """Lower paired MMADs with a UB credit and an AIV acknowledgement per tile."""
     tiled, slot_bytes = _fit_ub(contract, ctx)
-    n_alignment = MX_SCALE_GROUP_SIZE if contract.quant_dtype in MX_DTYPES else 1
+    n_alignment = MX_SCALE_GROUP_SIZE if contract.uses_mx_scales else 1
     schedule = matrix_schedule(tiled, ctx, contract.group_rows, contract.intermediate,
                                contract.k, start_core=start_core, n_tail_alignment=n_alignment)
     gmm, activation = name + "gmm1", name + "swiglu_quant"
@@ -180,7 +204,7 @@ def _gated_stages(contract, ctx, name, after, metadata, *, start_core=0, owner_r
     previous = {} if owner_ready is None else owner_ready
     for group in schedule.groups:
         split_group = group if tiled.tail_split else replace(group, tail_tiles=0)
-        for task, rows, columns in blaze_tasks(
+        for task, rows, columns, column in blaze_tasks(
             split_group, contract.intermediate, tiled.base_m, tiled.base_n,
             tiled.m_tail_cnt, tiled.n_tail_cnt, n_alignment,
         ):
@@ -194,7 +218,7 @@ def _gated_stages(contract, ctx, name, after, metadata, *, start_core=0, owner_r
                 consumers = (paired[0] if paired else owner * ctx.effective_aiv_cores // ctx.effective_aic_cores,)
             key = f"e{group.expert}:t{task}"
             deps = (*after, *previous.get(owner, ()))
-            body, fixpipe, done = _paired_tile(contract, gmm, activation, key, deps, rows, columns,
+            body, fixpipe, done = _paired_tile(contract, gmm, activation, key, deps, rows, columns, column,
                                                owner, consumers, slot_bytes, metadata)
             stages.extend(body)
             gmm_ends.append(fixpipe)
@@ -205,7 +229,7 @@ def _gated_stages(contract, ctx, name, after, metadata, *, start_core=0, owner_r
         ("useful_flops", divisor * schedule.useful_flops), ("issued_fractals", divisor * schedule.issued_fractals),
         ("max_waves", schedule.max_waves), ("wave_tail_imbalance", schedule.wave_tail_imbalance),
     )))
-    if contract.quant_dtype not in MX_DTYPES | FLOAT_EPILOGUE_DTYPES and contract.m:
+    if not contract.uses_mx_scales and contract.quant_dtype not in FLOAT_EPILOGUE_DTYPES and contract.m:
         scale_bytes = contract.m * PER_TOKEN_SCALE_BYTES
         scales = StageDemand(activation + ":scales", tuple(stores), Work(resources={
             "hbm": scale_bytes, "l2": scale_bytes, "mte3": scale_bytes,
@@ -216,7 +240,7 @@ def _gated_stages(contract, ctx, name, after, metadata, *, start_core=0, owner_r
     return stages, schedule
 
 
-def _paired_tile(contract, gmm, activation, key, after, rows, columns,
+def _paired_tile(contract, gmm, activation, key, after, rows, columns, column,
                  owner, consumers, slot_bytes, metadata):
     divisor = contract.activation_divisor
     input_scaled = contract.dtype_a == "int8" and contract.mode in ROUTED_MODES
@@ -236,6 +260,12 @@ def _paired_tile(contract, gmm, activation, key, after, rows, columns,
     ops_per_row = columns * (
         ACTIVATION_OPS[contract.activation] + (QUANT_OPS_PER_ELEMENT if quantized else 0)
     )
+    output_per_row = element_bytes(columns, contract.quant_dtype)
+    if contract.uses_mx_scales:
+        end_column = column + columns
+        # Interior tiles write valid groups; only the last tile writes row padding.
+        output_per_row += mx_scale_bytes(end_column, padded=end_column == contract.intermediate)
+        output_per_row -= mx_scale_bytes(column, padded=False)
     base = f"{gmm}:{key}"
     read, cube, flag = (f"{base}:{phase}" for phase in ("read", "cube", "fixpipe"))
     stages = [
@@ -256,7 +286,7 @@ def _paired_tile(contract, gmm, activation, key, after, rows, columns,
         if active:
             stages.append(StageDemand(credit, after, kind="aiv", owner=aiv, metadata=tag, ub_acquire=slot))
             credits.append(credit)
-            output = tensor_bytes(active, columns, contract.quant_dtype)
+            output = active * output_per_row
             epilogue.extend((
                 StageDemand(vector, (flag,), Work(resources={"vector": active * ops_per_row}), "aiv", aiv, tag),
                 StageDemand(store, (vector,), Work(resources={
@@ -313,6 +343,16 @@ def _routed_stages(ctx, specialization, contract, name, after, metadata, transpo
         return stages + routing_stages(combine, deps, contract, metadata, transport_builder)
     stages, dispatch_ends = [], []
     last_dispatch = after
+    batch_dispatch = batch_combine = 0
+    if wave_count > 1 and not transport_builder:
+        # A batch total has no expert placement. Preserve its complete wire
+        # transfer at the batch boundary until a caller supplies a routed cut.
+        batch_dispatch, batch_combine = contract.transport_bytes
+        if batch_dispatch:
+            stages.extend(routing_stages(dispatch, after, contract, metadata, None))
+    amounts = contract.transport_bytes if wave_count == 1 else (
+        (None, None) if transport_builder else (0, 0)
+    )
     owner_ready = {}
     gmm1_core = gmm2_core = 0
     gmm1_ends, activation_ends, waves = [], [], []
@@ -320,24 +360,19 @@ def _routed_stages(ctx, specialization, contract, name, after, metadata, transpo
     for wave, rows in enumerate(_wave_histograms(contract, ctx.effective_aic_cores)):
         prefix = name if wave_count == 1 else f"{name}wave{wave}_"
         end = offset + sum(rows)
-        amounts = contract.transport_bytes
-        if wave_count > 1:
-            # A directed builder owns the exact per-wave wire cut. An
-            # aggregate byte declaration only provides a batch total.
-            amounts = (None, None) if transport_builder else tuple(
-                None if amount is None else amount * end // contract.m - amount * offset // contract.m
-                for amount in amounts
-            )
         tokens = contract.tokens * end // contract.m - contract.tokens * offset // contract.m
         active = replace(contract, group_rows=rows, m=end - offset, tokens=tokens, transport_bytes=amounts)
         route_metadata = (*metadata, ("wave", wave), ("wave_row_start", offset), ("wave_row_end", end),
                           ("wave_expert_rows", rows))
         offset = end
         ready = prefix + "dispatch"
-        stages.extend(routing_stages(ready, last_dispatch, active, route_metadata, transport_builder,
-                                     read_counts=wave == 0))
-        last_dispatch = (ready,)
-        dispatch_ends.append(ready)
+        if batch_dispatch:
+            stages.append(StageDemand(ready, (dispatch,), metadata=route_metadata))
+        else:
+            stages.extend(routing_stages(ready, last_dispatch, active, route_metadata, transport_builder,
+                                         read_counts=wave == 0))
+            last_dispatch = (ready,)
+            dispatch_ends.append(ready)
         wave_metadata = (*cohort, ("wave", wave))
         body, schedule = _gated_stages(
             active, ctx, prefix, (ready,), wave_metadata, start_core=gmm1_core, owner_ready=owner_ready,
@@ -364,7 +399,7 @@ def _routed_stages(ctx, specialization, contract, name, after, metadata, transpo
             contract.output_dtype, input_dtype=contract.quant_dtype,
             input_scaled=contract.quant_dtype == "int8", metadata=(*cohort, ("wave", wave)),
         ))
-        if wave_count > 1:
+        if wave_count > 1 and not batch_combine:
             wave_combines.append(prefix + "combine")
             stages.extend(routing_stages(wave_combines[-1], (gmm2_ends[-1],), active,
                                          route_metadata, transport_builder,
@@ -374,12 +409,15 @@ def _routed_stages(ctx, specialization, contract, name, after, metadata, transpo
     else:
         if transport_builder:
             validate_transport_work(stages, contract.transport_bytes)
-        for phase, deps in (("dispatch", dispatch_ends), ("gmm1", gmm1_ends),
-                            ("swiglu_quant", activation_ends), ("gmm2", gmm2_ends)):
+        if not batch_dispatch:
+            stages.append(StageDemand(dispatch, tuple(dispatch_ends), metadata=metadata))
+        for phase, deps in (("gmm1", gmm1_ends), ("swiglu_quant", activation_ends), ("gmm2", gmm2_ends)):
             stages.append(StageDemand(name + phase, tuple(deps), metadata=metadata))
         combine_after = (name + "gmm2", *wave_combines)
-        # Reverse each wave's routes before the single local weighted reduction.
-        contract = replace(contract, m=0, transport_bytes=(0, 0))
+        # Wave combines have already read their routed rows. Batch combine
+        # owns those reads when only the aggregate transfer is available.
+        contract = replace(contract, m=contract.m if batch_combine else 0,
+                           transport_bytes=(0, batch_combine))
         transport_builder = None
     if shared:
         combine_after += (_shared_stages(stages, ctx, contract, name, after, cohort),)

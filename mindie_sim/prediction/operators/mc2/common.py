@@ -2,9 +2,9 @@
 
 [Role] Validate caller and routing records and build the phases shared by MC2
   strategies. Keep one typed work ledger for both projection and execution.
-[Invariants] Frame whole rows, omit masked and diagonal routes from peer data,
-  and issue peer status after data visibility. A buffer is reusable only after
-  its consumers finish.
+[Invariants] Frame whole rows and omit masked and diagonal routes from peer
+  data. CCU Dispatch exchanges counts with every peer. A buffer is reusable
+  only after its consumers finish.
 [Timeouts & Locks] Finite planning over declared routes and cohorts; no I/O
   or locks.
 [Side-Effect Policy] Immutable plans and analytical engine declarations only.
@@ -327,12 +327,14 @@ def _matrix_counts(raw, ranks: tuple[int, ...]) -> Counter:
     return +counts
 
 
-def _route_counts(fields: Mapping, ranks: tuple[int, ...], top_k: int, experts: int) -> tuple[Counter, Counter, Counter]:
+def _route_counts(
+    fields: Mapping, contract: Mc2Contract, source_extents: Mapping[int, int],
+) -> tuple[Counter, Counter, Counter, set[int]]:
     """Count validated (source rank, token, top-k slot) entries, including masks."""
     counts, masked, active_tokens = Counter(), Counter(), Counter()
-    preceding = set()
-    tokens = _integer(fields["source_tokens"], "source_tokens") if "source_tokens" in fields else None
-    owner_map, combine = fields.get("expert_ranks"), fields.get("_combine", False)
+    preceding, local_ids = set(), set()
+    ranks, top_k, experts = contract.ranks, contract.top_k, contract.experts
+    owner_map, combine = fields.get("expert_ranks"), contract.abi == COMBINE
     for record in fields.get("routes", ()):
         route = dict(record)
         src, dst = route.get("source_rank"), route.get("destination_rank")
@@ -345,6 +347,7 @@ def _route_counts(fields: Mapping, ranks: tuple[int, ...], top_k: int, experts: 
         if slot >= top_k:
             raise ModelingError("mc2_route_top_k_slot_out_of_range")
         _integer(token, "source_token_id", 0 if active else -1)
+        tokens = source_extents.get(src)
         if active and tokens is not None and token >= tokens:
             raise ModelingError("mc2_source_token_id_out_of_range")
         key = (src, token, slot)
@@ -352,6 +355,8 @@ def _route_counts(fields: Mapping, ranks: tuple[int, ...], top_k: int, experts: 
             raise ModelingError("mc2_duplicate_top_k_slot")
         if token >= 0:
             preceding.add(key)
+            if src == contract.rank and (active or combine):
+                local_ids.add(token)
         if not active:
             masked[cid, src] += 1
             continue
@@ -369,10 +374,10 @@ def _route_counts(fields: Mapping, ranks: tuple[int, ...], top_k: int, experts: 
             raise ModelingError("mc2_invalid_routing_weight")
         active_tokens[cid, src, token] += 1
         counts[(cid, dst, src) if combine else (cid, src, dst)] += 1
-    return counts, masked, active_tokens
+    return counts, masked, active_tokens, local_ids
 
 
-def _routing(fields: Mapping, contract: Mc2Contract) -> Mc2Contract:
+def _routing(fields: Mapping, contract: Mc2Contract, local_shape: tuple[int, ...]) -> Mc2Contract:
     ranks, rank = contract.ranks, contract.rank
     slices = tuple(
         item if isinstance(item, Mc2CohortSlice) else Mc2CohortSlice(**dict(item))
@@ -380,9 +385,18 @@ def _routing(fields: Mapping, contract: Mc2Contract) -> Mc2Contract:
     )
     aggregate = fields.get("assignment_matrix", fields.get("assignments"))
     per_cohort = fields.get("cohort_assignment_matrices")
-    counts, masked, active = _route_counts(
-        {**fields, "_combine": contract.abi == COMBINE}, ranks, contract.top_k, contract.experts,
-    )
+    # A caller can declare token extents for other source ranks in the EP group.
+    source_extents = dict(fields.get("source_tokens_by_rank", ()))
+    for src, extent in source_extents.items():
+        if type(src) is not int or src not in ranks:
+            raise ModelingError("mc2_source_tokens_rank_not_in_group")
+        _integer(extent, "source_tokens")
+    if "source_tokens" in fields:
+        source_extents[rank] = _integer(fields["source_tokens"], "source_tokens")
+    elif not slices and len(local_shape) == 2:
+        source_extents.setdefault(rank, _integer(local_shape[0], "source_tokens"))
+    end = source_extents.get(rank)
+    counts, masked, active, local_ids = _route_counts(fields, contract, source_extents)
     if per_cohort is not None:
         declared = Counter({
             (_integer(cid, "cohort_id"), src, dst): value
@@ -413,27 +427,37 @@ def _routing(fields: Mapping, contract: Mc2Contract) -> Mc2Contract:
         expected[cid][0] += value if src == rank else 0
         expected[cid][1] += value if dst == rank else 0
         expected[cid][2] += value if src == dst == rank else 0
+    explicit_routes = "routes" in fields or aggregate is not None or per_cohort is not None
     if not slices:
-        end = fields.get("source_tokens")
         ids = sorted({*expected, *(cid for cid, src in masked if src == rank)}) or [0]
         if len(ids) > 1:
             raise ModelingError("mc2_cohort_row_ranges_required")
         cid = ids[0]
         send, receive, local = expected[cid]
-        rows = send if contract.abi == DISPATCH else receive
-        last_token = max((token + 1 for cohort, src, token in active if cohort == cid and src == rank), default=0)
-        end = _integer(end, "source_tokens") if end is not None else max(rows, last_token)
+        row_ids = ()
+        if end is None:
+            if contract.abi == DISPATCH:
+                end = max(send, max(local_ids, default=-1) + 1)
+            elif "routes" in fields:
+                end = max(local_ids, default=-1) + 1
+                if len(local_ids) != end:
+                    row_ids = tuple(sorted(local_ids))
+            else:
+                end = receive
+                if not explicit_routes:
+                    end = _integer(fields.get("received_assignments", 0), "received_assignments")
+                if end and contract.top_k > 1:
+                    raise ModelingError("mc2_combine_source_token_extent_required")
         padding = fields.get("masked_padding_rows", masked[cid, rank])
-        if not any(key in fields for key in ("routes", "assignments", "assignment_matrix", "cohort_assignment_matrices")):
+        if not explicit_routes:
             send = _integer(fields.get("source_assignments", end * contract.top_k), "source_assignments")
             receive = _integer(fields.get("received_assignments", send), "received_assignments")
             default_local = send if len(ranks) == 1 else 0
             if "remote_assignments" in fields:
                 default_local = send - _integer(fields["remote_assignments"], "remote_assignments")
             local = _integer(fields.get("local_assignments", default_local), "local_assignments")
-        slices = (Mc2CohortSlice(cid, 0, end, send, receive, send - local, local, padding),)
+        slices = (Mc2CohortSlice(cid, 0, end, send, receive, send - local, local, padding, row_ids),)
 
-    explicit_routes = any(key in fields for key in ("routes", "assignments", "assignment_matrix", "cohort_assignment_matrices"))
     ids = {part.cohort_id for part in slices}
     if len(ids) != len(slices) or set(expected) - ids:
         raise ModelingError("mc2_invalid_cohort_ids")
@@ -528,9 +552,8 @@ def validate_contract(op: OpSpec, ctx: OperatorPlanningContext) -> Mc2Contract:
     if chunks != 1:
         raise ModelingError("mc2_moe_uses_cohorts_instead_of_internal_chunks")
     width = fields.get("width", op.local_shape[-1] if op.local_shape else None)
+    fields.setdefault("source_tokens_by_rank", group.get("source_tokens_by_rank", ()))
     if abi == DISPATCH:
-        if len(op.local_shape) == 2 and not (fields.get("cohort_slices") or fields.get("cohorts")):
-            fields.setdefault("source_tokens", op.local_shape[0])
         incoming = fields.get("input_dtype", op.dtype or "bf16")
         quant = fields.get("quant_mode", "per_token" if fields.get("dispatch_quant") == "per_token_int8" else "none")
         payload = fields.get("payload_dtype", "int8" if quant == "per_token" else incoming)
@@ -542,7 +565,8 @@ def validate_contract(op: OpSpec, ctx: OperatorPlanningContext) -> Mc2Contract:
     experts = _integer(fields.get("experts", 0), "experts")
     top_k = _integer(fields.get("top_k", 1), "top_k", 1)
     status = _integer(fields.get("status_bytes", UB_ALIGN_BYTES if abi == DISPATCH else 0), "status_bytes")
-    return _routing(fields, replace(contract, row_layout=layout, top_k=top_k, experts=experts, status_bytes=status))
+    return _routing(fields, replace(contract, row_layout=layout, top_k=top_k, experts=experts, status_bytes=status),
+                    op.local_shape)
 
 
 def topology_hops(fields: Mapping, group: Mapping) -> dict:

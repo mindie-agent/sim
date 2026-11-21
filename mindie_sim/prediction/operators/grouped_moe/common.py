@@ -210,15 +210,17 @@ def blaze_tasks(group: BlazeGroupSlice, n, base_m, base_n, m_tail_cnt, n_tail_cn
             logical += tail_base
         m_idx, n_idx = _blaze_tile(logical, group.m_tiles, group.n_tiles)
         m = min(base_m, group.rows - m_idx * base_m)
-        width = min(base_n, n - n_idx * base_n)
+        column = n_idx * base_n
+        width = min(base_n, n - column)
         if in_tail:
             m_split = ceil_div(m, m_tail_cnt)
             n_split = ceil_div(width, n_tail_cnt * n_align) * n_align
             n_sub, m_sub = divmod(split, ceil_div(m, m_split))
             m = min(m_split, m - m_sub * m_split)
             width = min(n_split, width - n_sub * n_split)
+            column += n_sub * n_split
         if m > 0 and width > 0:
-            yield task, m, width
+            yield task, m, width, column
 
 
 def schedule_blaze_groups(
@@ -256,7 +258,7 @@ def schedule_blaze_groups(
             start_core, start_core + total,
         )
         groups.append(group)
-        for task, m, n in blaze_tasks(
+        for task, m, n, _ in blaze_tasks(
             replace(group, tail_tiles=subdivided), n_dim, base_m, base_n, m_tail_cnt, n_tail_cnt, n_tail_alignment,
         ):
             owner = (start_core + task) % aic_cores
@@ -356,6 +358,10 @@ class GroupedMoeContract:
         return 2 if self.activation in GATED_ACTIVATIONS else 1
 
     @property
+    def uses_mx_scales(self) -> bool:
+        return self.quant_dtype in MX_DTYPES or (self.mode == "gmm_swiglu_quant" and self.dtype_a in MX_DTYPES)
+
+    @property
     def padded_weight(self) -> bool:
         return self.layout_b in {"NZ", "FRACTAL_NZ"}
 
@@ -453,6 +459,8 @@ def validate_contract(op: OpSpec, ctx: OperatorPlanningContext) -> GroupedMoeCon
         fractal_k0(compute_dtype)
     output_dtype = _dtype(fields.get("output_dtype", fields.get("output_format", op.dtype or "bf16")))
     quant_default = dtype_a if dtype_a in MX_DTYPES or (routed and dtype_a in {"bf16", "fp16"}) else "int8"
+    if mode == "gmm_swiglu_quant" and dtype_a in MX_DTYPES:
+        quant_default = fields.get("output_dtype", fields.get("output_format", quant_default))
     quant_dtype = _dtype(fields.get("quant_dtype", fields.get("quant_output_dtype", quant_default)))
     default_handoff = "int32" if compute_dtype in {"int8", "w4a8"} else output_dtype
     handoff_dtype = _dtype(fields.get("handoff_dtype", dtype_a if mode == "dequant_swiglu_quant" else default_handoff))
@@ -621,16 +629,34 @@ def matrix_stages(
     return stages
 
 
-def vector_stages(name, after, ctx, rows, *, read, compute, write, metadata=()):
-    cores = ctx.effective_aiv_cores
-    quotient, tail = divmod(sum(rows), cores)
+def _vector_owner_loads(rows, cores, group_read):
+    if not group_read:
+        total = sum(rows)
+        quotient, tail = divmod(total, cores)
+        return ((quotient + (owner < tail), 0) for owner in range(min(cores, total)))
+    # Each active group is repartitioned across AIVs. A participating core
+    # keeps that group's channel scales resident while processing its rows.
+    counts, scale_reads = [0] * cores, [0] * cores
+    for group_rows in rows:
+        if not group_rows:
+            continue
+        step = ceil_div(group_rows, cores)
+        for owner, start in enumerate(range(0, group_rows, step)):
+            counts[owner] += min(step, group_rows - start)
+            scale_reads[owner] += group_read
+    return zip(counts, scale_reads)
+
+
+def vector_stages(name, after, ctx, rows, *, read, compute, write, group_read=0, metadata=()):
     stages = []
-    for owner in range(min(cores, sum(rows))):
-        count = quotient + (owner < tail)
+    for owner, (count, scale_read) in enumerate(_vector_owner_loads(rows, ctx.effective_aiv_cores, group_read)):
+        if not count:
+            continue
+        read_bytes = count * read + scale_read
         base = f"{name}:{owner}"
         stages.extend((
             StageDemand(base + ":read", after, Work(resources={
-                "hbm": count * read, "l2": count * read, "mte2_aiv": count * read,
+                "hbm": read_bytes, "l2": read_bytes, "mte2_aiv": read_bytes,
             }), "aiv", owner, metadata),
             StageDemand(base + ":vector", (base + ":read",), Work(resources={"vector": count * compute}),
                         "aiv", owner, metadata),
@@ -642,12 +668,15 @@ def vector_stages(name, after, ctx, rows, *, read, compute, write, metadata=()):
     return stages
 
 
-def activation_stages(name, after, ctx, contract, rows, metadata=()):
+def activation_stages(name, after, ctx, contract, rows, metadata=(), *, has_activation_scale=True):
     width = contract.intermediate
     quantized = contract.quant_dtype not in {"bf16", "fp16"}
-    scale_read = PER_TOKEN_SCALE_BYTES if contract.handoff_dtype == "int32" else 0
+    int32_input = contract.handoff_dtype == "int32"
+    scale_read = PER_TOKEN_SCALE_BYTES if int32_input and has_activation_scale else 0
+    group_read = element_bytes(contract.n, "fp32") if int32_input and contract.mode == "dequant_swiglu_quant" else 0
     return vector_stages(
         name, after, ctx, rows, read=element_bytes(contract.n, contract.handoff_dtype) + scale_read,
         compute=width * (ACTIVATION_OPS[contract.activation] + (QUANT_OPS_PER_ELEMENT if quantized else 0)),
         write=tensor_bytes(1, width, contract.quant_dtype, scaled=quantized), metadata=metadata,
+        group_read=group_read,
     )

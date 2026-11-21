@@ -6,7 +6,7 @@
 [Timeouts & Locks] Finite synthetic graphs and bounded lazy-window replay.
 [Side-Effect Policy] In-memory modeling and Engine execution only.
 """
-from dataclasses import asdict
+from dataclasses import asdict, replace
 
 import numpy as np
 import pytest
@@ -19,13 +19,20 @@ from mindie_sim import graph_costs, operator_costs, target_graphs, target_operat
 from mindie_sim.catalog.quant import quant_preset
 from mindie_sim.prediction import deepep
 from mindie_sim.prediction.implementations import produced_values
-from mindie_sim.prediction.mechanism import Geometry
+from mindie_sim.prediction.mechanism import Geometry, Work
 from mindie_sim.prediction.moe_callers import LOCAL_EXPERT_REDUCE
 from mindie_sim.prediction.operators import grouped_moe
+from mindie_sim.prediction.operators.grouped_moe.lowering import StageDemand
+from mindie_sim.prediction.streams import StreamOwners
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError
 
 pytestmark = pytest.mark.tier0
+WAVE_EXPERTS = 16
+REMOTE_ROW_BYTES = 8192
+WIRE_HIDDEN_WIDTH = 4096
+GATE_UP_WIDTH = 64
+DEQUANT_CHANNELS = 128
 
 
 @pytest.mark.parametrize("hardware", SKUS)
@@ -47,6 +54,55 @@ def test_combine_reads_routed_values_and_publishes_one_row_per_token(hardware, t
         "mte2_aiv": expected_read, "mte3": payload, "vector": 2 * tokens * topk * hidden,
     }
     assert phase.after == ("gmm2",)
+
+
+@pytest.mark.parametrize("hardware", SKUS[2:])
+@pytest.mark.parametrize("remote_expert", [None, 0, WAVE_EXPERTS])
+def test_wave_waits_for_the_whole_remote_row(hardware, remote_expert):
+    geometry = Geometry.from_devices(machine(hardware).dies[:1])
+    experts = 2 * WAVE_EXPERTS
+    shape = (experts, GATE_UP_WIDTH, WIRE_HIDDEN_WIDTH)
+
+    def build_transport(name, after, _amount, metadata):
+        rows = dict(metadata)["wave_expert_rows"][remote_expert]
+        return (StageDemand(name, after, Work(resources={"link": rows * REMOTE_ROW_BYTES})),) if rows else ()
+
+    fields = dict(group_rows=(1,) * experts, n=GATE_UP_WIDTH, k=WIRE_HIDDEN_WIDTH, wave_rows=WAVE_EXPERTS, ep=2,
+                  dispatch_link_bytes=REMOTE_ROW_BYTES, combine_link_bytes=REMOTE_ROW_BYTES)
+    if remote_expert is not None:
+        fields["cohort_transport_builder"] = build_transport
+    op = OpSpec("routed", "grouped_moe", "decode", 0, 0, (), shape, shape, shape, shape,
+                dtype="bf16", recipe="mega_moe", metadata=tuple(fields.items()))
+    plan = grouped_moe.build(op, geometry)
+    phases = {phase.phase_id: phase for phase in plan.pipeline_spec.phases}
+    wire = {name: item.amount for name, phase in phases.items() for item in phase.work if item.resource == "link"}
+    prefix = "" if remote_expert is None else f"wave{remote_expert // WAVE_EXPERTS}_"
+    dispatch, combine = (prefix + f"{direction}:transport" for direction in ("dispatch", "combine"))
+    assert wire == {dispatch: REMOTE_ROW_BYTES, combine: REMOTE_ROW_BYTES}
+    ancestry = {}
+    for name, phase in phases.items():
+        ancestry[name] = set(phase.after).union(*(ancestry[parent] for parent in phase.after))
+    assert prefix + "gmm2" in ancestry[combine]
+    for wave in range(2):
+        gmm1 = f"wave{wave}_gmm1"
+        waits_for_remote = remote_expert is None or wave >= remote_expert // WAVE_EXPERTS
+        assert (dispatch in ancestry[gmm1]) == waits_for_remote
+
+
+@pytest.mark.parametrize("hardware", SKUS[:2])
+@pytest.mark.parametrize("rows,owner_reads", [((1,), (1028,)), ((3, 0, 5), (3604, 2572))])
+def test_int32_dequant_reads_channel_scales_once_per_participating_core_and_group(hardware, rows, owner_reads):
+    geometry = Geometry.from_devices(machine(hardware).dies[:1])
+    geometry = replace(geometry, stream_owners=StreamOwners((), (0, 1), 0, 2))
+    shape = (sum(rows), DEQUANT_CHANNELS)
+    op = OpSpec("dequant", "grouped_moe", "decode", 0, 0, (), shape, shape, shape, shape, dtype="int32",
+                recipe="dequant_swiglu_quant", metadata=(("group_rows", rows),
+                                                         ("requested_abi", "aclnnDequantSwigluQuant")))
+    plan = grouped_moe.build(op, geometry)
+    reads = [{item.resource: item.amount for item in phase.work}
+             for phase in plan.pipeline_spec.phases if phase.phase_id.endswith(":read")]
+    assert reads == [dict.fromkeys(("hbm", "l2", "mte2_aiv"), amount) for amount in owner_reads]
+    assert plan.work.resources["mte2_aiv"] == sum(owner_reads)
 
 
 def to_bf16(values):
