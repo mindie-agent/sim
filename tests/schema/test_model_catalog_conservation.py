@@ -88,39 +88,32 @@ BALANCED_MODELS = ("qwen3.5-35b-a3b", "qwen3.6-27b", "qwen3.8-27b", "glm-5.3",
                    "deepseek-v4-flash-0731", "deepseek-v4-pro-0813",
                    "deepseek-v4.1-flash", "kimi-k3", "minimax-m3")
 
-
 @lru_cache(maxsize=1)
 def _manifest() -> dict:
     return load_manifest(MANIFEST)
-
 
 @lru_cache(maxsize=None)
 def _entry(key: str) -> dict:
     return manifest_models(_manifest())[key]
 
-
 @lru_cache(maxsize=None)
 def _reference(key: str):
     return build_reference(key, ROOT, _entry(key))
 
-
 @lru_cache(maxsize=None)
 def _model(key: str):
     return load_model(key)
-
 
 def _actual_entries(model) -> list[tuple]:
     from mindie_sim.catalog.weights import _body_terms
     return [(term.name, int(term.rows), int(term.cols), int(term.count),
              "source" if term.source_owned else "runtime") for term in _body_terms(model)]
 
-
 def _cache_bytes(model, parallel, tokens: int, padded: bool) -> float:
     from mindie_sim.catalog.cache import layer_cache_decomposition
     return float(sum(float(sum(float(part["total"]) for part in layer_cache_decomposition(
         model, plan, parallel, tokens, capacity_padded=padded).values()))
         for plan in model.layer_plans))
-
 
 def _declared_auxiliary(model) -> dict:
     aux = getattr(model, "auxiliary", None)
@@ -131,7 +124,6 @@ def _declared_auxiliary(model) -> dict:
                     "standalone": bool(aux.standalone_draft)}
     return {}
 
-
 def _representatives(model):
     names = tuple(f.name for f in dataclass_fields(model.layer_plans[0])
                   if any(t in f.name for t in ("expert", "router", "shared", "ffn", "situ"))
@@ -140,7 +132,6 @@ def _representatives(model):
     for layer in model.layer_plans:
         groups.setdefault(tuple(getattr(layer, name) for name in names), []).append(layer)
     return tuple((members[0], tuple(members)) for members in groups.values())
-
 
 @lru_cache(maxsize=None)
 def _balanced_case(name: str):
@@ -152,7 +143,6 @@ def _balanced_case(name: str):
                     "kernels": {"programs": {"matmul": {"kind": "steady_matmul"}}}},
         "workload": {"requests": [{"id": "component", "prompt_tokens": 1, "output_tokens": 1}]}})
 
-
 def _ffn_ops(case, layer, tokens: int) -> tuple:
     routing = (select_realization(case.runtime, layer, phase="decode", tokens=tokens,
                                   valid_tokens=tokens) if layer.ffn == "moe" else None)
@@ -163,10 +153,8 @@ def _ffn_ops(case, layer, tokens: int) -> tuple:
     return lower_implementations(ops, case.runtime, case.model.activation_dtype,
                                  local_tokens=tokens, resource_fusion=False)
 
-
 def _compose(key: str, layers: int) -> dict:
     return compose_case(key, hardware=A5_SKU, layers=layers)
-
 
 def test_manifest_catalog_and_alias_inventory_is_conserved() -> None:
     models = manifest_models(_manifest())
@@ -188,7 +176,6 @@ def test_manifest_catalog_and_alias_inventory_is_conserved() -> None:
         for alias in aliases:
             assert MODEL_ALIASES[alias] == key and load_model(alias) == spec
 
-
 @pytest.mark.parametrize("key", MODELS)
 def test_manifest_parameter_shapes_and_totals_conserve(key: str) -> None:
     comparison = compare_entries(_reference(key), _actual_entries(_model(key)))
@@ -201,6 +188,31 @@ def test_manifest_parameter_shapes_and_totals_conserve(key: str) -> None:
     assert comparison["parameter_delta"] == comparison["runtime_delta"] == 0
     assert comparison["actual_parameters"] == comparison["reference_parameters"] > 0
 
+@pytest.mark.parametrize("overrides,missing,reason", [
+    ({}, "config_sha256", "reference_missing_sha256"),
+    ({"config_sha256": "0" * 64}, None, "reference_sha256_mismatch"),
+    ({}, "cache_layout", "reference_declaration_missing"),
+    ({"parameter_scope": "full_checkpoint"}, None, "reference_scope_unsupported"),
+    ({"config": "mindie_sim/nope.json"}, None, "reference_config_missing"),
+])
+def test_reference_gate_rejects_missing_or_incomplete_declarations(overrides, missing, reason):
+    key = "deepseek-v3"
+    entry = _entry(key) | overrides
+    if missing is not None:
+        del entry[missing]
+    with pytest.raises(ValueError, match=reason):
+        build_reference(key, ROOT, entry)
+
+def test_named_shape_comparison_detects_missing_and_extra_shapes():
+    reference = _reference("qwen3-32b")
+    actual = _actual_entries(_model("qwen3-32b"))
+    assert compare_entries(reference, actual)["complete"]
+    broken = compare_entries(reference, actual[1:])
+    assert not broken["complete"]
+    assert broken["missing_in_actual"] and broken["parameter_delta"] != 0
+    extra = compare_entries(reference, actual + [("bogus", 1, 1, 1, "source")])
+    assert not extra["complete"]
+    assert extra["missing_in_reference"] == [["bogus", 1, 1, 1, "source"]]
 
 @pytest.mark.parametrize("key", MODELS)
 def test_kv_payload_and_allocated_bytes_conserve(key: str) -> None:
@@ -219,7 +231,6 @@ def test_kv_payload_and_allocated_bytes_conserve(key: str) -> None:
                 assert measured - cache_totals(
                     reference.geometry, seq, padded=padded, tp=tp, cp=cp
                 ) == pytest.approx(0.0, abs=1e-6), (key, tp, pp, cp, seq, padded)
-
 
 @pytest.mark.parametrize("key", MODELS)
 def test_auxiliary_quantization_and_layer_declarations_conserve(key: str) -> None:
@@ -243,7 +254,6 @@ def test_auxiliary_quantization_and_layer_declarations_conserve(key: str) -> Non
     assert sharing["k_eq_v_layers"] == [
         plan.index for plan in model.layer_plans if plan.k_eq_v]
 
-
 @pytest.mark.parametrize("key", MODELS)
 def test_catalog_composition_keeps_declared_attention_and_quantization(key: str) -> None:
     case = _compose(key, 2)
@@ -257,7 +267,6 @@ def test_catalog_composition_keeps_declared_attention_and_quantization(key: str)
     kinds = {target_graphs(case, scope="body", phase="decode", tokens=1, context=128,
                            sequences=1).effective_kernels["programs"]["matmul"]["kind"]}
     assert kinds == {"steady_matmul"}, f"{key} still selected {kinds}"
-
 
 def test_partial_catalog_metadata_survives_normalization_and_real_costs() -> None:
     raw = serving_case()
@@ -281,7 +290,6 @@ def test_partial_catalog_metadata_survives_normalization_and_real_costs() -> Non
     assert costs["degraded_submodules"] == ["sparse_attention_analytic"]
     assert costs["operator_sum_ms"] > 0
     assert raw == original
-
 
 @pytest.mark.parametrize("name", BALANCED_MODELS)
 def test_balanced_routing_conserves_expert_rows_and_expert_banks(name: str) -> None:
@@ -328,7 +336,6 @@ def test_balanced_routing_conserves_expert_rows_and_expert_banks(name: str) -> N
         ops = _ffn_ops(case, groups[0][0], 1)
         assert any(op.flops > 0 for op in ops)
         assert not any(op.family == "grouped_gemm" for op in ops)
-
 
 def test_fleet_layer_plan_geometries_match_declared_configs() -> None:
     expected = {"minimax-m3": (60, 128, 4, 3), "minimax-m3.1-flash": (60, 128, 4, 3),
@@ -379,7 +386,6 @@ def test_fleet_layer_plan_geometries_match_declared_configs() -> None:
     assert all((p.num_heads, p.num_kv_heads, p.head_dim, p.q_output_gate) == (64, 4, 192, True)
                for p in step.layer_plans)
 
-
 def test_core_catalog_geometry_and_routed_declarations_are_conserved() -> None:
     for key, (layers, hidden, experts, top_k, dense, gdn, gqa) in CORE_GEOMETRY.items():
         model = load_model(key)
@@ -417,7 +423,6 @@ def test_core_catalog_geometry_and_routed_declarations_are_conserved() -> None:
     assert all(p.ffn == "moe" and p.top_k == 8
                for p in build_model_spec("step5-legacy", step).layer_plans)
 
-
 def test_declared_rope_context_and_native_dtype_reach_frontend_metadata(tmp_path) -> None:
     deepseek = load_model("deepseek-v4.1-flash")
     rope = dict(deepseek.metadata)["rope_parameters"]
@@ -444,7 +449,6 @@ def test_declared_rope_context_and_native_dtype_reach_frontend_metadata(tmp_path
     rooted = load_model("qwen3.5-27b", config_root=tmp_path)
     assert (rooted.activation_dtype, rooted.weight_dtype, rooted.kv_dtype) == ("fp16",) * 3
 
-
 def test_gated_activation_spellings_use_tanh_approximated_geglu_work() -> None:
     plan = load_model("gemma-4-31b").layer_plans[0]
     for activation in ("gelu", "geglu", "gelu_tanh", "gelu_pytorch_tanh"):
@@ -454,7 +458,6 @@ def test_gated_activation_spellings_use_tanh_approximated_geglu_work() -> None:
             recipe="swiglu")
         assert op.family == op.recipe == "geglu" and op.vector_ops == 8 * 2 * 4
         assert op.mte2_bytes == 2 * 8 * 2 and op.mte3_bytes == 8 * 2
-
 
 def test_shared_value_projection_keeps_two_cache_planes_and_qkv_widths() -> None:
     from mindie_sim.catalog.weights import layer_weight_terms
@@ -472,7 +475,6 @@ def test_shared_value_projection_keeps_two_cache_planes_and_qkv_widths() -> None
                       if op.layer == layer and op.recipe == "qkv_projection"}
               for layer in (0, 5)}
     assert widths == {0: {8192}, 5: {9216}}
-
 
 def test_customize_model_spec_conserves_parameters_layers_and_router_groups() -> None:
     from mindie_sim.schema.common import ModelingError
@@ -512,7 +514,6 @@ def test_customize_model_spec_conserves_parameters_layers_and_router_groups() ->
         control = target_operators(raw, phase="decode", tokens=1, context=4)
         assert sum(op.recipe == "route_normalize" for op in control) == 3
 
-
 def test_resolve_role_exclusions_maps_standard_patterns_and_keeps_proxy_gaps() -> None:
     roles, unresolved = resolve_role_exclusions([
         "lm_head", "*lm_head*", "model.embed_tokens*", "*norm*", "*.mlp.gate",
@@ -535,7 +536,6 @@ def test_resolve_role_exclusions_maps_standard_patterns_and_keeps_proxy_gaps() -
     assert "quant_module_exclusions_unresolved" in proxy_gaps
     assert proxied.weight_format == "bf16"
 
-
 def test_engram_quant_override_moves_table_storage_mode() -> None:
     from mindie_sim.catalog.weight_terms import term_bytes
     from mindie_sim.catalog.weights import engram_table_terms
@@ -551,7 +551,6 @@ def test_engram_quant_override_moves_table_storage_mode() -> None:
                  for term in engram_table_terms(case.model))
     assert ledger == pytest.approx(case.model.engram.table_storage_bytes(
         node_rows=case.machine.ranks_per_node))  # per-node sharded table
-
 
 def test_draft_indexer_and_prepared_router_are_resident() -> None:
     from mindie_sim.catalog.draft_weights import draft_terms
@@ -581,7 +580,6 @@ def test_draft_indexer_and_prepared_router_are_resident() -> None:
         pro.model, pro.runtime.parallel, include_draft=True, draft_kind="dspark")
         for term in group]
     assert any(term.name == "draft_router_precast" for term in staged)
-
 
 def test_pp_partition_is_shared_by_capacity_and_catalog_paths() -> None:
     from mindie_sim.catalog.cache import request_cache_breakdown

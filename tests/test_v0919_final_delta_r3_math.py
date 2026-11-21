@@ -49,6 +49,23 @@ def test_dbo_matches_unsplit_physical_assignments(dp, ep, pcp):
         assert packs == gates == unpack == [64]
 
 
+def test_hca_runtime_decides_aliasing():
+    views = tuple(RequestView(key, 1, 383, False, "decode", prefix_tokens=128,
+                              prefix_cache_key="A") for key in ("a", "b"))
+    for mode, total, union in (("private", 159296, 0), ("shared", 158688, 1)):
+        fields = family_mqsmla._prefix_fields(views, SimpleNamespace(prefix_cache_mode=mode))
+        shape = dict(sequences=((1, 383),) * 2, window=128, ratio=128, topk=0, **fields)
+        assert mqsmla.quant_external_fill(shape, mqsmla.KV_QUANT_FP8) == (total, union)
+
+
+def test_csa_nested_prefix_and_private_window():
+    contexts = (4, 4, 4096)
+    shape = dict(sequences=tuple((1, c) for c in contexts), prefix_tokens=contexts,
+                 prefix_cache_keys=("A",) * 3, prefix_cache_mode="shared",
+                 ratio=4, window=128, topk=512)
+    assert mqsmla.quant_external_fill(shape, mqsmla.KV_QUANT_FP8) == (395808, 513)
+
+
 def test_kimi_padded_producer_writes_the_entire_pack_input():
     case = prior.parse_case(prior.compose_case(
         "kimi-k3.1", hardware="a5", dp=1, tp=8, dcp=8, ep=8, num_devices=8,

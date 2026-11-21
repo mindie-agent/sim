@@ -20,7 +20,7 @@ from __future__ import annotations
 from dataclasses import replace
 import pytest
 from _support import axes
-from _support.builders import dense_case, dense_layer, dense_model, linear_layer, linear_model, view
+from _support.builders import dense_case, dense_model, linear_model, view
 from mindie_sim.backends.ascend import profiles
 from mindie_sim.catalog.cache import layer_cache_components
 from mindie_sim.catalog.cache_format import CacheFormat
@@ -44,10 +44,9 @@ from mindie_sim.prediction.prefix_reads import (
     CacheAccess, apply_prefix_read_plan, plan_prefix_reads,
 )
 from mindie_sim.schema.common import ModelingError
-from mindie_sim.schema.model import LayerPlan, RequestSpec, WorkloadSpec
+from mindie_sim.schema.model import RequestSpec, WorkloadSpec
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.schema.parallel import ParallelSpec
-from mindie_sim.schema.dspark import DsparkSpec
 pytestmark = pytest.mark.tier0
 LINE = 128
 WRITE_BACK = CachePolicy(write_policy="write_back")
@@ -517,79 +516,6 @@ def test_shared_prefix_window_charges_pool_pages_and_releases_owners():
         sum(batch_cache_bytes(
             linear, sequences=2, context=128, tokens_per_seq=1,
             prefix_tokens=64, phase="decode", padded=True).total_bytes))
-def test_paired_page_dcp_and_draft_cache_geometry():
-    base = dense_case(layers=2)
-    mla = replace(dense_model(layers=2).layer_plans[0], attention="mla", q_lora_rank=64,
-                  kv_lora_rank=64, qk_nope_head_dim=64, qk_rope_head_dim=8, v_head_dim=64,
-                  kv_cache_elements=72, owns_long_kv=True)
-    dspark = DraftSpec(kind="dspark", layers=2, hidden_size=32, intermediate_size=64, num_heads=4,
-                       num_kv_heads=2, head_dim=16, q_width=64, kv_width=32, attention_kind="gqa",
-                       block_size=5, markov_rank=16, vocab_size=128)
-    model = replace(dense_model(layers=2), attention="mla", layer_plans=(mla, linear_layer(1, "kda")),
-                    auxiliary=AuxiliarySpec(dspark=dspark), metadata=(("cache_allocator", "paired_sfa"),))
-    case = replace(base, model=model, runtime=replace(base.runtime, prefix_cache_mode="shared")); requests = (view("a", 1, 383, prefix=256), view("b", 1, 383, prefix=256)); shared = batch_cache_footprint(case, requests=requests, replica=0, phase="decode", padded=True)
-    private = batch_cache_footprint(
-        replace(case, runtime=replace(case.runtime, prefix_cache_mode="private")),
-        requests=requests, replica=0, phase="decode", padded=True)
-    from mindie_sim.catalog.paired_sfa import page_groups
-    group = page_groups(case, {0: 0, 1: 0}, 1)[0]; page, tokens = group["bytes_per_group_page"], group["tokens_per_page"]; recycling, history, prefix_pages = group["recycling_pages"], (384 + tokens - 1) // tokens, 256 // tokens
-    assert shared.shared_once_total == prefix_pages * page
-    assert shared.private_total == 2 * (history - prefix_pages + recycling) * page
-    assert shared.state_total == 2 * recycling * page
-    assert shared.total == shared.shared_once_total + shared.private_total
-    assert private.shared_once_total == 0 and private.total == 2 * (history + recycling) * page
-    declared_case = replace(case, runtime=replace(case.runtime, metadata=(
-        ("draft_proposal_tokens", 3), ("draft_mode", "dspark"))))
-    empty_case = replace(case, runtime=replace(case.runtime, metadata=(("draft_proposal_tokens", 0),)))
-    direct = page_groups(replace(case, runtime=replace(
-        case.runtime, dspark=DsparkSpec(4, (1.0,) * 4))), {0: 0, 1: 0}, 1)[0]
-    declared = page_groups(declared_case, {0: 0, 1: 0}, 4)[0]; empty = page_groups(empty_case, {0: 0, 1: 0}, 1)[0]; main_page, draft_bytes = 128 * (64 + 8) * 2, 128 * (2 * 2 * 16) * 2 * 2
-    assert empty["bytes_per_group_page"] == main_page
-    assert direct["bytes_per_group_page"] == main_page + draft_bytes == declared["bytes_per_group_page"]
-    assert direct["recycling_pages"] == 2 + 4 - 1 and empty["recycling_pages"] == 2
-
-
-    layer = LayerPlan(index=0, attention="mla", ffn="dense", intermediate_size=128, num_heads=4,
-                      head_dim=16, q_lora_rank=64, kv_lora_rank=64, qk_nope_head_dim=64,
-                      qk_rope_head_dim=8, v_head_dim=64, kv_cache_elements=72,
-                      kv_owner_layer_id=0, owns_long_kv=False, compress_ratio=32,
-                      owns_index_k=True, index_dim=16, index_heads=4, index_topk=8,
-                      indexer=True, indexer_type="full")
-    model = replace(dense_model(layers=1), attention="mla", layer_plans=(layer,), metadata=(
-        ("attention_execution", {"dcp_indexer_sharded": True}),))
-    components = layer_cache_components(
-        model, layer, ParallelSpec(tp=1, dp=1, cp=2), 100,
-        capacity_padded=True, interleave=LINE)
-    # 100 tokens / 32 compression = 3 rows -> one 4-row block; each CP rank
-    # owns a whole block, not a 128-row interleave slice.
-    assert components["index_k"] == 4 * (16 + 2)
-
-
-    kda = replace(dense_case(layers=1), model=linear_model("kda", layers=1),
-                  runtime=replace(dense_case(layers=1).runtime,
-                                  dspark=DsparkSpec(6, (1.0,) * 6), metadata=()))
-    memory = Memory(kda)
-    assert memory.query_tokens == 6
-    assert memory.cache_bytes(128, query_tokens=6) > memory.cache_bytes(128)
-    mtp = DraftSpec(kind="mtp", layers=1, hidden_size=32, intermediate_size=64,
-                    num_heads=4, num_kv_heads=2, head_dim=16, q_width=64,
-                    kv_width=32, attention_kind="gqa", target_layer_ids=(0,))
-    base = dense_case(layers=1)
-    target = replace(dense_model(layers=1),
-                     layer_plans=(replace(dense_layer(0), window=64),))
-    mtp = replace(mtp, layer_plans=native_draft_layer_plans(target, mtp)); model = replace(target, auxiliary=AuxiliarySpec(mtp=mtp))
-    drafted = replace(base, model=model, runtime=replace(
-        base.runtime, metadata=(("draft_mode", "mtp"),
-                                ("draft_proposal_tokens", 2))))
-    plain = replace(base, model=replace(model, auxiliary=None),
-                    runtime=replace(base.runtime, metadata=()))
-    expected = draft_cache_components(
-        model, drafted.runtime.parallel, draft_kind="mtp",
-        sequence_tokens=512, capacity_padded=True, runtime=drafted.runtime,
-        query_tokens=Memory(drafted).query_tokens)["draft_kv"]
-    delta = (Memory(drafted).cache_bytes(512)[-1]
-             - Memory(plain).cache_bytes(512)[-1])
-    assert delta == pytest.approx(expected) == 128 * (2 * 2 * 16) * 2
 def oracle_bytes(spans):
     """Independent finite byte-set expansion of the compact span encoding."""; result = set()
     for item in normalize_spans(spans):

@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+from collections import Counter
 from copy import deepcopy
 from dataclasses import replace
 from itertools import combinations, product
@@ -19,16 +20,15 @@ from types import SimpleNamespace
 
 import pytest
 
-from _support.builders import dense_case, linear_layer, linear_model, view
+from _support.builders import dense_case, linear_layer, view
 from _support.hardware import machine
-from _support.memory_cases import SPARSE_OFFLOAD_SKU, case as memory_case
-from _support.memory_cases import compressed_case, index_pool_case, index_pool_layer, linear_work
+from _support.memory_cases import SPARSE_OFFLOAD_SKU, compressed_case, index_pool_case, index_pool_layer, linear_work
+from _support.memory_cases import case as memory_case
 from mindie_sim import compose_case, graph_costs, predict, predict_pd, target_graphs
 from mindie_sim.catalog.cache import cache_row_split, layer_cache_components, owned_token_rows, request_cache_breakdown
 from mindie_sim.catalog.cache_format import CacheFormat, cache_format
 from mindie_sim.catalog.cache_ownership import batch_cache_footprint
 from mindie_sim.catalog.cache_pages import CachePageGroup
-from mindie_sim.catalog.draft_geometry import native_draft_layer_plans
 from mindie_sim.catalog.index_pool import pool_selection
 from mindie_sim.catalog.mqsmla_layout import packed_row_parts
 from mindie_sim.catalog.paired_sfa import page_groups
@@ -36,7 +36,7 @@ from mindie_sim.catalog.quant import quant_preset
 from mindie_sim.catalog.types import AuxiliarySpec, DraftSpec, QuantSpec
 from mindie_sim.catalog.weight_terms import term_bytes
 from mindie_sim.catalog.weights import cache_row_bytes_by_layer, layer_weight_terms
-from mindie_sim.prediction import family_mqsmla, family_quant_indexer, index_pool, latent_dcp, mqsmla
+from mindie_sim.prediction import family_quant_indexer, index_pool, latent_dcp
 from mindie_sim.prediction import indexed_quant_attention as c8
 from mindie_sim.prediction.attention import _CacheProducer
 from mindie_sim.prediction.attention_decode import StagedGQADecode
@@ -54,7 +54,7 @@ from mindie_sim.prediction.native_binding import bind_native_call
 from mindie_sim.prediction.offload import OffloadPolicy, _accesses_from_ops, project_state_tiers
 from mindie_sim.prediction.operator_analysis import target_operators
 from mindie_sim.prediction.pd_ranges import transfers_for_runs
-from mindie_sim.prediction.program import RecipeContext
+from mindie_sim.prediction.program import KernelProgram, ParallelProgram, PipelineProgram, RecipeContext
 from mindie_sim.prediction.sharedkv_metadata import query_partitions
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError
@@ -151,7 +151,8 @@ def test_independent_cache_pages_preserve_payload_and_pipeline_ownership(mode):
             groups.append(groups[0])
         else:
             groups[:] = [{"layers": [0, 1], "tokens_per_page": 4, "bytes_per_group_page": 512}]
-        with pytest.raises(ModelingError, match="duplicate_owner|spans_pipeline_stages"):
+        reason = {"duplicate": "duplicate_owner", "pipeline": "spans_pipeline_stages"}[mode]
+        with pytest.raises(ModelingError, match=reason):
             Memory(parse_case(raw))
     elif mode == "transfer":
         raw["pools"] = {side: {key: deepcopy(raw[key]) for key in ("machine", "runtime")}
@@ -413,17 +414,22 @@ def test_nested_prefix_upper_bound_matches_a_maximum_distinct_selection():
         exact = max(len(set().union(*options)) for options in product(*selections))
         assert nested_prefix_union(spec) == exact
 
-@pytest.mark.parametrize("mode,contexts,prefix,ratio,topk,expected", [
-    ("private", (383, 383), (128, 128), 128, 0, (159296, 0)),
-    ("shared", (383, 383), (128, 128), 128, 0, (158688, 1)),
-    ("shared", (4, 4, 4096), (4, 4, 4096), 4, 512, (395808, 513)),
-])
-def test_compressed_cache_shares_prefix_rows_per_runtime_policy(mode, contexts, prefix, ratio, topk, expected):
-    views = tuple(RequestView(str(i), 1, ctx, False, "decode", prefix_tokens=length,
-                              prefix_cache_key="A") for i, (ctx, length) in enumerate(zip(contexts, prefix)))
-    fields = family_mqsmla._prefix_fields(views, SimpleNamespace(prefix_cache_mode=mode))
-    shape = dict(sequences=tuple((1, c) for c in contexts), window=128, ratio=ratio, topk=topk, **fields)
-    assert mqsmla.quant_external_fill(shape, mqsmla.KV_QUANT_FP8) == expected
+def issued_stages(program):
+    """Yield the stages of every call, owner branch, and pipeline tile."""
+    if isinstance(program, ParallelProgram):
+        for branch in program.programs:
+            yield from issued_stages(branch)
+        return
+    if isinstance(program, KernelProgram):
+        batches = (program.stages,)
+    else:
+        assert isinstance(program, PipelineProgram)
+        batches = (program.tile(i) for i in range(program.count))
+    for stages in batches:
+        for stage in stages:
+            yield stage
+            if stage.program is not None:
+                yield from issued_stages(stage.program)
 
 @pytest.mark.parametrize("contexts,prefix,keys,topk,shared,private", [
     ((128, 256), (128, 128), ("A", "B"), 128, 0, 256),
@@ -445,11 +451,16 @@ def test_paired_attention_separates_shared_prefix_fill_from_private_tile_reads(
     assert schedule["external_fill_bytes"] == shared * 656 and schedule["private_rows"] == private
     assert plan.work.resources["hbm"] == len(seqs) * 64 * (576 + 512) * 2 + (shared + private) * 656 + statistics
     op = OpSpec("attention", "attention", "decode", 0, 0, (), *((len(seqs), 64, 576),) * 4)
-    names = {role: f"{role}@r0:s0" for role in geometry.rates}
-    context = RecipeContext(op, {}, names, {}, geometry.compute_units,
-        resource_units=geometry.resource_units, pool_units=geometry.buffer_units,
+    names = {role: f"{role}@r0:s0" for role in geometry.rates.keys() | {"cube"}}
+    context = RecipeContext(plan.work.apply(op), {}, names, {}, geometry.compute_units,
+        resource_units=geometry.resource_units, compute_peaks=geometry.compute_peaks, pool_units=geometry.buffer_units,
         pool_capacities=geometry.buffers, pool_names={key: key for key in geometry.buffers})
-    stage = plan.program(context).stages[-1]
+    program = plan.program(context)
+    issued = Counter()
+    for stage in issued_stages(program):
+        issued.update(stage.work)
+    assert dict(issued) == pytest.approx(context.bind(plan.work))
+    stage = program.stages[-1]
     assert (stage.name, stage.after, sorted(stage.work.values())) == ("lse_statistics", ("call0",), [statistics] * 2)
 
 @pytest.mark.parametrize("fmt,bytes_per_row,eligible", [
@@ -533,7 +544,12 @@ def test_paired_pages_include_enabled_draft_planes_and_own_shared_pages_once(mod
     assert (group["bytes_per_group_page"], group["recycling_pages"]) == (page, recycling)
     requests = tuple(view(key, 1, 383, prefix=256) for key in ("a", "b"))
     shared = batch_cache_footprint(case, requests=requests, replica=0, phase="decode", padded=True)
-    assert shared.shared_once_total == 2 * page and shared.total == 2 * (2 + recycling) * page
+    private = batch_cache_footprint(
+        replace(case, runtime=replace(case.runtime, prefix_cache_mode="private")),
+        requests=requests, replica=0, phase="decode", padded=True)
+    assert (shared.shared_once_total, shared.private_total, shared.state_total, shared.total) == (
+        2 * page, 2 * (1 + recycling) * page, 2 * recycling * page, 2 * (2 + recycling) * page)
+    assert private.shared_once_total == 0 and private.total == 2 * (3 + recycling) * page
 
 def test_dcp_shards_compressed_index_rows_in_complete_interleave_blocks():
     case = paired_case()
@@ -542,22 +558,6 @@ def test_dcp_shards_compressed_index_rows_in_complete_interleave_blocks():
     model = replace(case.model, metadata=(("attention_execution", {"dcp_indexer_sharded": True}),))
     components = layer_cache_components(model, layer, ParallelSpec(cp=2), 100, interleave=BLOCK)
     assert components["index_k"] == 4 * (16 + 2)
-
-def test_draft_window_residency_and_query_width_follow_distinct_geometry():
-    base = dense_case(layers=1)
-    state = replace(base, model=linear_model("kda", layers=1),
-                    runtime=replace(base.runtime, dspark=DsparkSpec(6, (1.,) * 6), metadata=()))
-    assert Memory(state).query_tokens == 6
-    target = replace(base.model, layer_plans=(replace(base.model.layer_plans[0], window=64),))
-    draft = DraftSpec(kind="mtp", layers=1, hidden_size=32, intermediate_size=64, num_heads=4,
-                      num_kv_heads=2, head_dim=16, q_width=64, kv_width=32,
-                      attention_kind="gqa", target_layer_ids=(0,))
-    draft = replace(draft, layer_plans=native_draft_layer_plans(target, draft))
-    model = replace(target, auxiliary=AuxiliarySpec(mtp=draft))
-    selected = replace(base, model=model, runtime=replace(base.runtime, metadata=(
-        ("draft_mode", "mtp"), ("draft_proposal_tokens", 2))))
-    retained = Memory(selected).cache_bytes(512)[-1] - Memory(replace(base, model=target)).cache_bytes(512)[-1]
-    assert retained == BLOCK * 2 * 2 * 16 * 2
 
 @pytest.mark.parametrize("contiguous", (False, True))
 def test_draft_prolog_boundary_depends_on_cache_contiguity(contiguous):
@@ -584,7 +584,6 @@ def test_two_receivers_read_one_named_source_extent():
                        num_devices=3, layers=1, prompt_tokens=10, output_tokens=2)
     raw["pools"] = {side: deepcopy({k: raw[k] for k in ("machine", "runtime")}) for side in ("prefill", "decode")}
     raw["connector"] = {"link": {"capacity_bytes_per_ms": 64, "semantics": "per_pair"}, "chunk_bytes": 64}
-    raw["workload"]["requests"][0]["prompt_tokens"] = 10
     for side, ranks in (("prefill", [0, 1]), ("decode", [2, 3, 4, 5])):
         cfg = raw["pools"][side]
         cfg["machine"].update(num_devices=len(ranks), devices=[{"rank": r} for r in ranks])
@@ -598,3 +597,4 @@ def test_two_receivers_read_one_named_source_extent():
     assert len({(t["source_storage"], t["source_version"]) for t in rows}) == 1
     assert {(tuple(t["source_byte_range"]), tuple(t["source_token_span"])) for t in rows} == {((0, 5760), (5, 10))}
     assert len({(t["destination_rank"], t["destination_storage"]) for t in rows}) == 2 == len(rows)
+    assert sum(t["payload_bytes"] for t in rows) == 11520

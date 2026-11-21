@@ -43,6 +43,7 @@ from mindie_sim.catalog.quant import quant_preset
 from mindie_sim.catalog.weights import cache_row_bytes_by_layer, engram_table_terms
 from mindie_sim.catalog.weights import layer_weight_terms, stage_weight_bytes
 from mindie_sim.model_catalog import ARCHITECTURE_PRESET_CATALOG, load_model
+from mindie_sim.prediction.efficiency import evaluate_target_efficiency, solve_sla_sizing
 from mindie_sim.prediction.gated_activation import gated_activation
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.prediction.topology import Topology
@@ -129,6 +130,35 @@ def test_partial_attention_keeps_projections_and_refuses_fabricated_timing() -> 
             entry()
         assert raised.value.result_available is False
         assert raised.value.onboarding_hint["ssot_owner_repo"] == "mindie-sim"
+
+@pytest.mark.parametrize("entry", (
+    "predict", "operator_costs", "evaluate_target_efficiency", "solve_sla_sizing",
+))
+def test_timing_entries_refuse_an_unmodeled_attention_core(entry):
+    raw = compose_case("qwen3-32b", hardware=SKUS[1], layers=2)
+    raw["model"]["layer_plans"][0].update(
+        attention="unmodeled", architecture="synthetic_unmodeled_attention")
+    calls = {
+        "predict": lambda: predict(raw),
+        "operator_costs": lambda: operator_costs(raw, target_operators(raw, phase="prefill", tokens=3)),
+        "evaluate_target_efficiency": lambda: evaluate_target_efficiency(raw, phase="prefill", tokens=3),
+        "solve_sla_sizing": lambda: solve_sla_sizing(raw, sla_ms=100),
+    }
+    with pytest.raises(UnmodeledCapabilityError) as raised:
+        calls[entry]()
+    error = raised.value
+    assert error.kind == "unmodeled_capability"
+    assert error.result_available is False
+    assert error.entry == entry
+    hints = error.unmodeled_structure_onboarding_hints
+    assert hints, error.code
+    for hint in hints:
+        assert hint["schema"] == "mindie-unmodeled-structure-hint/1"
+        assert hint["ssot_owner_repo"] == "mindie-sim"
+        assert hint["onboarding_targets"]
+        assert hint["observed_abi_summary"]["charging_policy"] == "no_timing_fabricated_for_unmodeled_core"
+    assert error.onboarding_hint["schema"] == "mindie-unmodeled-structure-hint/1"
+    assert error.onboarding_hint["ssot_owner_repo"] == "mindie-sim"
 
 @pytest.mark.parametrize("tp", (1, 4))
 @pytest.mark.parametrize("pp", (1, 2))

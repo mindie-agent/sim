@@ -44,7 +44,7 @@ from mindie_sim.prediction.mc2_graph import NETWORK as MC2_NETWORK
 from mindie_sim.prediction.mc2_graph import recipes as mc2_recipes
 from mindie_sim.prediction.mc2_graph import select as mc2_select
 from mindie_sim.prediction.structure import parse_case
-from mindie_sim.prediction.topology import Topology, chunk_sizes
+from mindie_sim.prediction.topology import Topology
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.hardware import Hardware, Link
 from mindie_sim.schema.parallel import ParallelSpec
@@ -451,6 +451,18 @@ def test_transport_plan_bounds_hops_and_receive_credit():
     assert pipelined["span_ms"] < whole["span_ms"]
     assert pipelined["capacity_work_bytes"] == pytest.approx(6000.0)
     assert whole["capacity_work_bytes"] == pytest.approx(6000.0)
+    with pytest.raises(ModelingError, match="transport_chunk_expansion_unbounded"):
+        topology.transport_plan([MessageFlow(0, 2, 8192)], chunk_bytes=1)
+
+    flow = MessageFlow(0, 1, 1)
+    with pytest.raises(ModelingError, match="transport_receive_capacity_zero"):
+        topology.transport_plan([flow], receive_capacity_bytes={1: 0})
+    # Supply an invalid plan directly to exercise the Engine startup guard.
+    zero = replace(topology.transport_plan([flow]), receive_capacity=((1, 0),))
+    engine = Engine(zero.resources())
+    ready = {rank: engine.submit(f"ready{rank}") for rank in zero.ranks}
+    with pytest.raises(ModelingError, match="transport_receive_capacity_zero"):
+        zero.start(engine, "zero", ready)
 
     baseline_full = _h4_plan("shared")
     baseline = _run_plan(replace(baseline_full, flows=(baseline_full.flows[0],)))
@@ -477,20 +489,14 @@ def test_native_lowering_uses_declared_chunks_and_records_unknowns():
                        deps=(), metadata=(("group_axis", "tp"),))
     chunked = replace(baseline, metadata=(("group_axis", "tp"), ("transport_chunk_bytes", 65536)))
     reports, names = {}, {}
-    for label, op in (("whole", baseline), ("chunked", chunked)):
+    for label, op, messages in (("whole", baseline, 12), ("chunked", chunked, 1536)):
         selected = hccl_lower((op,), parsed.runtime, parsed.model.activation_dtype)
         network = next(item for item in selected if item.recipe == HCCL_NETWORK)
         topology = Topology(parsed.machine, parsed.runtime.parallel)
         ledger = topology.accounting(network, 0)
-        expected_wire, expected_messages = 0.0, 0
-        chunk = dict(network.metadata).get("transport_chunk_bytes")
-        for flow, _rounds in topology.messages(network, 0, volume=network.link_bytes):
-            for size in chunk_sizes(flow.payload_bytes, chunk):
-                message = topology.route_message(MessageFlow( flow.source, flow.destination, size, flow.messages))
-                expected_wire += sum(hop.wire_bytes for hop in message.hops)
-                expected_messages += flow.messages
-        assert ledger.physical_wire_bytes == pytest.approx(expected_wire)
-        assert ledger.messages == expected_messages
+        # Four ranks each send an 8 MiB payload to three peers.
+        assert ledger.physical_wire_bytes == 4 * 3 * 8 * 1024 * 1024
+        assert ledger.messages == messages
         reports[label] = graph_costs(raw, selected, input_ready_ms=0, trace_limit=100000)
         names[label] = [row.get("task") or row.get("name") or "" for row in reports[label]["events"]]
     assert not any("chunk" in name for name in names["whole"])

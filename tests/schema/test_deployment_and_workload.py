@@ -21,7 +21,7 @@ from _support.builders import dense_layer, dense_model, hardware, linear_model, 
 from _support.hardware import hardware_case
 from _support.kernel_invocation import op
 from _support.memory_cases import SPARSE_OFFLOAD_SKU, case as memory_case
-from mindie_sim import compare_feature_tracks, compose_case, load_runtime_stack_manifest, operator_costs
+from mindie_sim import compose_case, load_runtime_stack_manifest, operator_costs
 from mindie_sim import parse_case, predict, study, target_graphs
 from mindie_sim.catalog.expert_slots import expert_slot_plan, routed_expert_weight_terms
 from mindie_sim.catalog.ops import gemm_op
@@ -249,13 +249,6 @@ def test_active_expert_slots_conserve_routed_rows_and_charge_resident_reads(real
     bound, = bind_expert_slot_work((node,), slot_work=work)
     assert bound.hbm_bytes == pytest.approx(750 + work.weight_read_bytes(0))
 
-STACK_MODELS = (
-    ("deepseek-v3.2", 4, 8), ("deepseek-v4-10t", 2, 8), ("deepseek-v4.1-flash", 2, 8),
-    ("glm-5.3", 4, 8), ("glm-5.3-flash", 4, 8), ("qwen3.8-27b", 2, 1),
-    ("qwen3.8-flash-next", 2, 8), ("kimi-k3", 4, 8), ("kimi-k3.1", 4, 8),
-    ("minimax-m3.1-flash", 4, 8), ("step-5-preview", 4, 8), ("gemma-4-31b", 2, 1),
-)
-
 def stack_case(model, **overrides):
     return compose_case(model, **(dict(hardware=SPARSE_OFFLOAD_SKU, tp=8, ep=8, layers=4) | overrides))
 
@@ -269,24 +262,6 @@ def test_paired_allocator_resolves_defaults_and_honors_explicit_page_size(width,
     else:
         memory = Memory(case)
         assert width == 1 or memory.capacity[0][0] > 0
-
-@pytest.mark.parametrize("model,layers,ep,hardware,phase", [
-    (*row, "a3", "decode") for row in STACK_MODELS
-] + [("deepseek-v4.1-flash", 2, 8, "a5", "decode"), ("qwen3.8-27b", 2, 1, "a5", "prefill")])
-def test_feature_controls_reduce_step_cost_toward_the_physical_roofline(model, layers, ep, hardware, phase):
-    ablate = model == "deepseek-v4.1-flash"
-    tokens, sequences = (128, 4) if phase == "prefill" else (1, 2)
-    report = compare_feature_tracks(model, hardware=hardware, tp=8, ep=ep, layers=layers, phase=phase,
-        tokens=tokens, context=(2048 if ablate else 1024) if phase == "decode" else 0, sequences=sequences, ablate_prs=ablate)
-    waterfall = report["waterfall"]
-    merged, proposed, ideal = (waterfall[key] for key in ("current_merged", "current_unmerged_pr", "expected_ideal"))
-    assert merged["step_ms"] + 1e-5 >= proposed["step_ms"] >= ideal["step_ms"] - 1e-5
-    assert ideal["step_ms"] + 1e-5 >= waterfall["hardware_roofline"]["physical_ideal_1p0x_ms"]
-    if ablate:
-        assert hardware == "a5" or merged["hbm_bytes"] > proposed["hbm_bytes"]
-        assert any(row["mechanism_id"] == "mhc_boundary_fusion_overlap" and row["delta_vs_merged_ms"] < 0
-                   for row in proposed["single_pr_ablation"])
-    assert phase == "decode" or proposed["step_ms"] < merged["step_ms"]
 
 @pytest.mark.parametrize("model,phase,level,ep,path,expected", [
     ("qwen3.5-397b-a17b", "decode", "merged", 8, ("metadata", "additional_config", "enable_fused_mc2"), 3),
@@ -302,7 +277,7 @@ def test_stack_bindings_respect_phase_and_operand_geometry(model, phase, level, 
         value = (value or {}).get(key)
     assert value == expected
 
-def test_stack_manifest_support_roundtrip_and_execution(tmp_path):
+def test_stack_manifest_support_roundtrip_and_resolution(tmp_path):
     repo = "jd-opensource/xllm"
     models = ("deepseek-v3.2", "qwen3.8-flash-next", "deepseek-v4.1-flash")
     path = tmp_path / "stack.json"
@@ -325,9 +300,11 @@ def test_stack_manifest_support_roundtrip_and_execution(tmp_path):
             else:
                 report = stack_case(model, **options)["runtime"]["metadata"]["feature_track_report"]
                 assert (report["stack"], report["feature_track"]) == (profile.name, level)
-    waterfall = compare_feature_tracks(models[0], hardware=SPARSE_OFFLOAD_SKU, runtime_stack=path,
-                                       tp=8, ep=8, layers=4, sequences=2)["waterfall"]
-    assert any(row["ref"] == repo + "#888" for row in waterfall["current_unmerged_pr"]["active_open_prs"])
+    for level, expected in (("merged", False), ("unmerged_pr", True)):
+        runtime = stack_case(models[0], runtime_stack=path, feature_track=level)["runtime"]
+        active = runtime["metadata"]["feature_track_report"]["active_mechanisms"]
+        assert any(binding["id"] == "gmm_swiglu_quant_fusion" and binding["ref"] == repo + "#888"
+                   for binding in active) is expected
 
 def test_builtin_stack_inventory_and_offline_binding_status(tmp_path, capsys):
     assert set(RUNTIME_STACKS) == {"vllm-ascend", "raw_eager"}

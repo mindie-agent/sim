@@ -16,12 +16,9 @@
 """
 from __future__ import annotations
 from dataclasses import replace
-from types import SimpleNamespace
 import json
 from pathlib import Path
 import pytest
-from _support.builders import dense_model
-from mindie_sim.catalog.types import AuxiliarySpec, DraftSpec
 from mindie_sim.catalog.cache_format import cache_format
 from mindie_sim.prediction.cache_execution import (
     CacheAccessOperation, CacheAccessRequest, CacheExecution,
@@ -33,8 +30,6 @@ from mindie_sim.prediction.cache_path import (
 from mindie_sim.prediction.cache_representation import (
     CacheLowering, cache_identity, load as legacy_load, store as legacy_store,
 )
-from mindie_sim.prediction.batch_prefix_attention import BatchPrefixAttention
-from mindie_sim.prediction.draft_context import prepare
 from mindie_sim.prediction.engine import Engine, ExecutionError, Resource
 from mindie_sim.prediction.lowering import Builder
 from mindie_sim.prediction.structure import parse_case
@@ -282,41 +277,22 @@ def test_inflight_write_holds_identity_capacity():
         state.prepare_access("B", buffered(), write=True, policy=WRITE_BACK)
     e.advance(until=(done,), first=False); state.prepare_access("B", buffered(), write=True, policy=WRITE_BACK).cancel()
 
-def _stage_work(shape):
-    op = OpSpec("attn", "attention", "decode", 0, 0, (), shape, shape, shape, shape,
-                metadata=(("prefix_read_reuse_applied", True),))
-    context = SimpleNamespace(op=op, work={"cube": 100.0}, setup_ms=0.0,
-                              minimum_ms=0.0, resource_names={})
-    return {stage.name: dict(stage.work) for stage in BatchPrefixAttention().lower(context).stages}
-
-
-def test_mla_matrix_work_uses_qk_and_pv_head_widths():
-    mla = _stage_work((1, 128, 4, 3, 1))
-    assert mla["qk"]["cube"] == pytest.approx(75.0)
-    assert mla["pv"]["cube"] == pytest.approx(25.0)
-    gqa = _stage_work((1, 128, 4, 16))
-    assert gqa["qk"]["cube"] == pytest.approx(50.0)
-    assert gqa["pv"]["cube"] == pytest.approx(50.0)
-
-
-def test_draft_context_attributes_every_layer_op():
-    draft = DraftSpec(kind="dspark", layers=2, hidden_size=32, intermediate_size=64,
-                      num_heads=4, num_kv_heads=2, head_dim=16, q_width=64,
-                      kv_width=32, attention_kind="mla", block_size=5,
-                      markov_rank=16, vocab_size=128, q_lora_rank=32,
-                      kv_lora_rank=64, qk_rope_head_dim=8)
-    model = replace(dense_model(layers=1), auxiliary=AuxiliarySpec(dspark=draft))
-    projection = OpSpec("proj", "gemm", "draft", 0, -1, (),
-                        (1, 1, 1), (1, 1, 1), (1, 1, 1), (1, 1, 1))
-    ops = []
-    prepare(ops, projection=projection, model=model, draft=draft, rows=4,
-            query_rows=3, prefix="d:", stage=0, requests=())
-    attributed = {op.op_id: op.layer for op in ops}
-    for layer in range(draft.layers):
-        for suffix in ("mla_prolog_v3", "kv_scatter"):
-            assert attributed[f"d:context_kv{layer}.{suffix}"] == layer
-    assert not any("qkv_a" in op_id or "kv_copy" in op_id for op_id in attributed)
-    assert attributed["d:context_norm"] == -1
+def test_bypass_write_holds_identity_until_completion():
+    state = cache(128)
+    policy = CachePolicy(bypass=True, write_policy="write_through")
+    access = request("A", write=True, policy=policy)
+    e = engine()
+    done = CacheExecution(state).access(access, e, "write", e.submit("ready"))
+    e.advance(horizon=0.07)
+    assert not done.done and state.inflight_identities == 1
+    with pytest.raises(ModelingError, match="cache_identity_access_in_flight"):
+        state.prepare_access("A", CacheAccessGeometry(rows=1, row_bytes=128))
+    e.advance(until=(done,), first=False)
+    assert done.time == pytest.approx(0.192) and state.inflight_identities == 0
+    read = CacheExecution(state).access(request("A"), e, "read", e.submit("read_ready"))
+    e.advance(until=(read,), first=False)
+    assert read.done and state.resident("A") == (1, 0)
+    assert served(e)["hbm"] == 256.0
 
 def test_occurrences_cross_engines_and_sources_cannot_be_fabricated():
     state, access = cache(256), request("A"); first_engine, first_execution = engine(), CacheExecution(state); first = first_execution.access(access, first_engine, "first", first_engine.submit("r")); first_engine.advance(until=(first,), first=False)

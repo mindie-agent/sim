@@ -8,12 +8,12 @@ from __future__ import annotations
 
 import csv
 from copy import deepcopy
+from dataclasses import asdict
 from hashlib import sha256
 import json
-
 import pytest
 from _support.captures import REPO_ROOT, fixture_json, fixture_path
-
+from _support.memory_cases import draft_case
 from mindie_sim.coverage import comparison_coverage, inventory_coverage, record_linkage
 from mindie_sim.observations.scoreboard import gap, model_scoreboard, prediction_from_probe, render_markdown
 from mindie_sim.observations.scoreboard_accuracy import (
@@ -25,11 +25,9 @@ pytestmark = pytest.mark.tier0
 
 RECURRENT_CASE = "kimi-k3-a5.json"
 
-
 def prefill_entry():
     entries = fixture_json("verification", "scoreboard-input.json")["entries"]
     return next(entry for entry in entries if entry["id"] == "glm53_a3")
-
 
 def test_prefill_gap_uses_step_span_with_overlapping_activity():
     entry = prefill_entry()
@@ -44,7 +42,6 @@ def test_prefill_gap_uses_step_span_with_overlapping_activity():
     rendered = render_markdown(campaign)
     assert f"Cross-domain intersection: {audit['native_aicpu_intersection_ms']:.6f} ms" in rendered
 
-
 @pytest.mark.parametrize("field, value, reason", [
     ("context", None, "unknown_condition:context"),
     ("branch", "speculative_verify_and_draft", "condition_mismatch:branch"),
@@ -57,7 +54,6 @@ def test_step_accuracy_requires_matching_capture_conditions(field, value, reason
     assert pair["absolute_gap_ms"] is None
     assert reason in pair["reasons"]
 
-
 def descriptor(identity, observed_us, predicted_us, count):
     observed, predicted = observed_us / 1000, predicted_us / 1000
     return {
@@ -67,7 +63,6 @@ def descriptor(identity, observed_us, predicted_us, count):
         "predicted_sum_ms": predicted * count,
         "sum_error": gap(predicted * count, observed * count),
     }
-
 
 def mixed_report():
     rows = [descriptor("small", 10, 24, 1000), descriptor("large", 100, 80, 700)]
@@ -81,7 +76,6 @@ def mixed_report():
         }],
         "grouped_reference_domains": [],
     }
-
 
 def test_mixed_descriptor_mean_cannot_hide_large_failure_or_cumulative_cancellation():
     original = mixed_report()
@@ -101,7 +95,6 @@ def test_mixed_descriptor_mean_cannot_hide_large_failure_or_cumulative_cancellat
     rendered = render_kimi_markdown(report)
     assert "outside_tolerance" in rendered and "0.000000 / 28.000000" in rendered
 
-
 def test_unresolved_native_phase_has_no_per_call_pair_or_zero_residual():
     original = mixed_report()
     row = original["rows"][0]
@@ -114,7 +107,6 @@ def test_unresolved_native_phase_has_no_per_call_pair_or_zero_residual():
     assert report["rows"][0]["predicted_per_call_us"] is None
     assert report["rows"][0]["descriptive_tier"] is None
     assert report["family_totals"][0]["descriptor_diagnostics"]["signed_cumulative_gap_ms"] is None
-
 
 @pytest.mark.parametrize("lowering", [None, "vllm_ascend_kda_chunk_state"])
 def test_recurrent_prediction_inputs_exclude_observed_counts_and_times(lowering):
@@ -139,7 +131,6 @@ def test_recurrent_prediction_inputs_exclude_observed_counts_and_times(lowering)
         row["predicted_ms"])
     assert all(stage["observed_stage_ms"] is None for stage in stages)
 
-
 def test_retained_family_mapping_conserves_all_costs(monkeypatch):
     monkeypatch.syspath_prepend(str(REPO_ROOT / "tools"))
     from refresh_model_scoreboard import family_mapping
@@ -154,7 +145,6 @@ def test_retained_family_mapping_conserves_all_costs(monkeypatch):
     assert by_recipe["flash_attention"] == "attention"
     assert by_recipe["recurrent_scan0"] == "gdn"
     assert by_recipe["linear_qkvz"] == "matmul"
-
 
 def test_compact_publication_preserves_failed_latest_and_archived_selection(monkeypatch, tmp_path):
     monkeypatch.syspath_prepend(str(REPO_ROOT / "tools"))
@@ -182,7 +172,6 @@ def test_compact_publication_preserves_failed_latest_and_archived_selection(monk
     with pytest.raises(ValueError, match="identity_mismatch"):
         retain(path)
 
-
 def test_scheduled_scoreboard_prices_draft_sampling_and_commit(monkeypatch):
     monkeypatch.syspath_prepend(str(REPO_ROOT / "tools"))
     from model_scoreboard import execution_identity, scheduled_probe
@@ -201,6 +190,28 @@ def test_scheduled_scoreboard_prices_draft_sampling_and_commit(monkeypatch):
     conditions = execution_identity(spec, probe)["conditions"]
     assert conditions["tokens"] == 2 and conditions["branch"] == "full_speculative_step"
 
+def test_scheduled_prefill_runs_draft_preparation_to_completion(monkeypatch):
+    monkeypatch.syspath_prepend(str(REPO_ROOT / "tools"))
+    from model_scoreboard import execution_identity, scheduled_probe
+
+    parsed = draft_case()
+    case = parsed.to_dict()
+    case["model"]["auxiliary"] = asdict(parsed.model.auxiliary)
+    spec = {
+        "case": case, "driver": "scheduled_prefill", "proposal_tokens": 0, "draft_layers": 1,
+        "geometry": {"phase": "prefill", "tokens": 4, "context": 0, "sequences": 1, "scope": "model"},
+        "max_operators": 1000, "top": 5,
+    }
+    probe = scheduled_probe(spec)
+    assert probe["iteration"]["phase_occurrences"]["draft_prefill"] > 0
+    assert probe["iteration"]["plans"][0]["requests"][0]["draft_prepare"] is True
+    assert "acceptance" not in probe["iteration"]["families"]
+    assert probe["graph"]["live_tasks"] == probe["graph"]["live_programs"] == 0
+    conditions = execution_identity(spec, probe)["conditions"]
+    assert conditions["branch"] == "target_plus_mtp_prefill" and conditions["tokens"] == 4
+    spec["draft_layers"] = 3
+    with pytest.raises(ValueError, match="draft_layer_count_mismatch"):
+        scheduled_probe(spec)
 
 def step_entry():
     # Raw pf4k_b1.csv.gz: 2,392 positive tasks, one p4096/o1/c1 request.
@@ -229,7 +240,6 @@ def step_entry():
         },
         "assumptions": ["Balanced routing and serial matrix phases are explicit approximations."],
     }
-
 
 def test_group_sum_mean_or_occurrence_scope_mismatch_is_not_a_residual():
     entry = step_entry()
@@ -262,7 +272,6 @@ def test_group_sum_mean_or_occurrence_scope_mismatch_is_not_a_residual():
     group, = model_scoreboard([entry])["models"][0]["group_comparisons"]
     assert group["status"] == "unavailable" and group["predicted"] is None
 
-
 def test_executed_probe_identity_cannot_be_relabelled_to_different_geometry(monkeypatch):
     root = REPO_ROOT
     monkeypatch.syspath_prepend(str(root / "tools"))
@@ -293,7 +302,6 @@ def test_executed_probe_identity_cannot_be_relabelled_to_different_geometry(monk
     missing = prediction_from_probe(
         probe, conditions=actual, comparison_scope="single_prefill_iteration")
     assert missing["identity_issues"] == ["prediction_execution_identity_not_retained"]
-
 
 def test_family_ranges_keep_native_grouping_and_failed_endpoint_coverage():
     entry = step_entry()
@@ -355,7 +363,6 @@ def test_family_ranges_keep_native_grouping_and_failed_endpoint_coverage():
     assert all(row["signed_gap_ms"] is None
                for row in partial["models"][0]["group_comparisons"])
 
-
 @pytest.mark.parametrize("observed_us,predicted_us,status", [
     (50, 65, "within_launch_floor_tolerance"),
     (50, 65.001, "outside_tolerance"),
@@ -389,7 +396,6 @@ def test_homogeneous_group_uses_real_sum_count_and_shared_threshold(
     markdown = render_markdown(report)
     assert status in markdown and "outside_tolerance" in markdown
 
-
 def test_small_call_allowance_does_not_change_whole_step_or_endpoint_criterion():
     entry = step_entry()
     entry["observed"]["step"]["duration_ms"] = 0.04
@@ -411,7 +417,6 @@ def test_small_call_allowance_does_not_change_whole_step_or_endpoint_criterion()
     })
     assert ranged["step_accuracy_pass"] is False
     assert [row["step_accuracy_pass"] for row in ranged["step_accuracy_endpoints"]] == [True, False]
-
 
 def test_missing_count_and_coarse_native_program_mismatch_do_not_invent_per_call():
     row = annotate_call({
@@ -441,14 +446,12 @@ def test_missing_count_and_coarse_native_program_mismatch_do_not_invent_per_call
     assert group["descriptive_tier"] is None
     assert group["per_call_ineligible_reason"] == "native_and_program_grouping_not_equivalent"
 
-
 def write_csv(path, columns, rows):
     with path.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.writer(stream)
         writer.writerow(columns.split())
         writer.writerows(rows)
     return path
-
 
 def test_inventory_reconciles_capture_manifest_with_record_recovery(tmp_path):
     summary = tmp_path / "inventory.json"
@@ -493,7 +496,6 @@ def test_inventory_reconciles_capture_manifest_with_record_recovery(tmp_path):
     with pytest.raises(ValueError, match="inventory_ledger_row_count_mismatch"):
         inventory_coverage({**inventory, "ledger_total_records": 4}, ledger=scope)
 
-
 @pytest.fixture
 def linkage_inputs(tmp_path):
     raw, alias, indexed, sidecar = (str(tmp_path / label) for label in ("raw", "alias", "indexed", "sidecar"))
@@ -525,7 +527,6 @@ def linkage_inputs(tmp_path):
         [("capture-0", indexed, '["A5"]', 2), ("capture-1", "", '["A5"]', 1)])
     return (dict(dispositions=dispositions, record_sources=record_sources, source_registry=registry,
                  captures_index=capture_index, captures_manifest={"capture_count": 2}), alias, indexed)
-
 
 @pytest.mark.parametrize("reference, status, reason", [
     ("observation", "matched", None),
@@ -572,7 +573,6 @@ def test_record_linkage_uses_actual_edges_without_changing_duration_denominator(
         assert evidence["native_case_ids"] == ["native"]
     else:
         assert evidence["matched_audit_records"] == evidence["independent_capture_count"] == 0
-
 
 def test_source_phase_calls_and_reference_do_not_replace_missing_step():
     entry = step_entry()
