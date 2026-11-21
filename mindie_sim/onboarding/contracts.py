@@ -288,6 +288,8 @@ class CliffBenchPlan:
     plan_sha256: str
     abi_rejection_points: tuple[CliffPointSpec, ...] = ()
     tiling_axes: TilingAxes | None = None
+    family: str = ""
+    campaign_id: str = ""
 
     def __post_init__(self) -> None:
         if self.schema != CLIFF_PLAN_SCHEMA:
@@ -324,7 +326,9 @@ class CliffBenchPlan:
             "schema": self.schema,
             "plan_id": self.plan_id,
             "target_id": self.target_id,
+            "family": self.family,
             "sku": self.sku,
+            "campaign_id": self.campaign_id,
             "train_lineage_root": self.train_lineage_root,
             "heldout_lineage_root": self.heldout_lineage_root,
             "cold_ring_l2_multiplier": self.cold_ring_l2_multiplier,

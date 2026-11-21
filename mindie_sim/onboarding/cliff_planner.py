@@ -23,6 +23,8 @@ from collections.abc import Mapping, Sequence
 import hashlib
 from typing import Any
 
+from mindie_sim.schema.common import ModelingError
+
 from ._sealed_scorer import (
     STANDARD_LEVEL_BOUNDARY_KINDS,
     WhiteboxSpineRunner,
@@ -317,8 +319,13 @@ def synthesize_operator_cliff_plan(
                     rationale=f"cores({params.core_count})*tile({tile}){delta:+d}_on_{axis_key}",
                 )
 
+    topk_thresholds: list[int] = []
+    if params.topk_threshold is not None:
+        topk_thresholds.append(int(params.topk_threshold))
     for pt_axis, thresh in axes.phase_thresholds:
         if pt_axis == "topk":
+            if int(thresh) not in topk_thresholds:
+                topk_thresholds.append(int(thresh))
             continue
         for delta, tag in ((-1, "minus1"), (0, "exact"), (1, "plus1")):
             val = thresh + delta
@@ -330,9 +337,11 @@ def synthesize_operator_cliff_plan(
                 axis=pt_axis, value=val, regime_tag="declared_phase_threshold",
                 rationale=f"phase_threshold({pt_axis}={thresh}){delta:+d}",
             )
+    for rule in axes.abi_divisibility:
+        if rule.axis == "topk" and rule.above_threshold > 0 and rule.above_threshold not in topk_thresholds:
+            topk_thresholds.append(int(rule.above_threshold))
 
-    if params.topk_threshold is not None:
-        tk = int(params.topk_threshold)
+    for tk in topk_thresholds:
         _add(
             point_id=f"topk_ctx_{tk + 1}_k_{tk}", grid_kind="boundary_cliff",
             axis="context_len", value=tk + 1, regime_tag="topk_perf_cliff",
@@ -364,6 +373,7 @@ def synthesize_operator_cliff_plan(
     body = {
         "schema": CLIFF_PLAN_SCHEMA,
         "target_id": params.operator_id,
+        "family": params.family,
         "sku": sku,
         "campaign_id": clean_campaign,
         "cold_ring_l2_multiplier": COLD_RING_L2_MULTIPLIER,
@@ -387,9 +397,36 @@ def synthesize_operator_cliff_plan(
         plan_sha256=plan_sha256,
         abi_rejection_points=tuple(abi_rejections),
         tiling_axes=axes,
+        family=params.family,
+        campaign_id=clean_campaign,
     )
     assert_sanitized_payload(plan.to_dict(), field_name="cliff_bench_plan")
     return plan
+
+
+def verify_cliff_plan_integrity(plan_doc: Mapping[str, Any]) -> str:
+    """Recompute and verify ``plan_sha256`` so shortened/tampered plans fail closed."""
+    supplied = str(plan_doc.get("plan_sha256") or "").strip().lower()
+    if not supplied:
+        raise ModelingError("cliff_plan_sha256_missing")
+    body = {
+        "schema": plan_doc.get("schema"),
+        "target_id": plan_doc.get("target_id"),
+        "family": plan_doc.get("family", ""),
+        "sku": plan_doc.get("sku"),
+        "campaign_id": plan_doc.get("campaign_id", ""),
+        "cold_ring_l2_multiplier": plan_doc.get("cold_ring_l2_multiplier"),
+        "train_points": list(plan_doc.get("train_points") or ()),
+        "heldout_points": list(plan_doc.get("heldout_points") or ()),
+        "abi_rejection_points": list(plan_doc.get("abi_rejection_points") or ()),
+        "tiling_axes": plan_doc.get("tiling_axes"),
+    }
+    expected = hashlib.sha256(canonical_json_bytes(body)).hexdigest()
+    if supplied != expected:
+        raise ModelingError(
+            f"cliff_plan_sha256_tampered:supplied={supplied[:SHORT_DIGEST_LEN]}:expected={expected[:SHORT_DIGEST_LEN]}"
+        )
+    return expected
 
 
 def synthesize_sku_512_400k_plan(
@@ -445,26 +482,34 @@ def evaluate_abi_rejections(
             "wrong_error_class": [],
             "missing_rejection_tests": sorted(planned),
         }
-    obs_by_id = {
-        str(row.get("point_id") or row.get("case_id") or ""): row
-        for row in observed_rejections
-    }
+    obs_rows_by_id: dict[str, list[Mapping[str, Any]]] = {}
+    for row in observed_rejections:
+        key = str(row.get("point_id") or row.get("case_id") or "")
+        obs_rows_by_id.setdefault(key, []).append(row)
     missing: list[str] = []
     unexpectedly_accepted: list[str] = []
     wrong_error: list[str] = []
     rejected_count = 0
     for pid, expected_err in sorted(planned.items()):
-        row = obs_by_id.get(pid)
-        if row is None:
+        rows_for_pid = obs_rows_by_id.get(pid)
+        if not rows_for_pid:
             missing.append(pid)
             continue
-        if row.get("rejected") is not True:
+        exp_prefix = expected_err.split(":", 1)[0].strip() if expected_err else "abi_divisibility_violation"
+        pid_accepted = False
+        pid_wrong_err = ""
+        for row in rows_for_pid:
+            if row.get("rejected") is not True:
+                pid_accepted = True
+                break
+            err_text = str(row.get("abi_error") or "").strip()
+            if not err_text or exp_prefix not in err_text:
+                pid_wrong_err = f"{pid}:got={err_text or 'empty'}:expected={exp_prefix}"
+        if pid_accepted:
             unexpectedly_accepted.append(pid)
             continue
-        err_text = str(row.get("abi_error") or "").strip()
-        exp_prefix = expected_err.split(":", 1)[0] if expected_err else "abi_"
-        if not err_text or (exp_prefix not in err_text and "abi" not in err_text.lower()):
-            wrong_error.append(f"{pid}:got={err_text or 'empty'}:expected={exp_prefix}")
+        if pid_wrong_err:
+            wrong_error.append(pid_wrong_err)
             continue
         rejected_count += 1
     return {
@@ -486,4 +531,5 @@ __all__ = [
     "synthesize_operator_cliff_plan",
     "synthesize_sku_512_400k_plan",
     "validate_disjoint_lineage",
+    "verify_cliff_plan_integrity",
 ]

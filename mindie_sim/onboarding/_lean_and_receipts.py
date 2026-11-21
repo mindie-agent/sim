@@ -15,11 +15,14 @@
 """
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 import hashlib
 import hmac
 import math
 import os
+from pathlib import Path
 import secrets
 from typing import Any, Literal
 
@@ -49,11 +52,50 @@ from .contracts import (
 _REPORT_HMAC_KEY_BYTES = 32
 _REPORT_HMAC_ENV_VAR = "MINDIE_ONBOARDING_HMAC_KEY"
 _PROCESS_HMAC_KEY = secrets.token_bytes(_REPORT_HMAC_KEY_BYTES)
+_ACTIVE_KEY_OVERRIDE: ContextVar[bytes | None] = ContextVar("_ACTIVE_KEY_OVERRIDE", default=None)
 _REPORT_HMAC_FIELD = "report_hmac"
 _MAX_MISSING_CASES_IN_MSG = 8
+_KEY_FILE_MODE = 0o600
+_MIN_DISTINCT_CASES_FOR_REUSE_CHECK = 2
+_TIMING_TRIPLE_LEN = 3
+
+
+@contextmanager
+def use_stage_key_file(
+    key_file: str | Path | None,
+    *,
+    create_if_missing: bool = False,
+) -> Iterator[None]:
+    """Bind a file-backed HMAC key for multi-process CLI handoff without host pollution."""
+    if key_file is None:
+        yield
+        return
+    path = Path(key_file)
+    if path.is_file():
+        raw = path.read_text(encoding="utf-8").strip()
+        if not raw:
+            raise ModelingError(f"stage_key_file_empty:{path.name}")
+    elif create_if_missing:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        raw = secrets.token_hex(_REPORT_HMAC_KEY_BYTES)
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, _KEY_FILE_MODE)
+        try:
+            os.write(fd, (raw + "\n").encode("utf-8"))
+        finally:
+            os.close(fd)
+    else:
+        raise ModelingError(f"stage_key_file_missing:{path.name}")
+    token = _ACTIVE_KEY_OVERRIDE.set(hashlib.sha256(raw.encode("utf-8")).digest())
+    try:
+        yield
+    finally:
+        _ACTIVE_KEY_OVERRIDE.reset(token)
 
 
 def _active_hmac_key() -> bytes:
+    ctx_key = _ACTIVE_KEY_OVERRIDE.get()
+    if ctx_key is not None:
+        return ctx_key
     override = os.environ.get(_REPORT_HMAC_ENV_VAR, "").strip()
     if override:
         return hashlib.sha256(override.encode("utf-8")).digest()
@@ -137,7 +179,7 @@ def check_lean_non_inversion(
     *,
     require_non_empty: bool = True,
     verify_certificates: bool = True,
-    expected_case_timings: Mapping[str, tuple[int, int]] | None = None,
+    expected_case_timings: Mapping[str, tuple[int, int] | tuple[int, int, int | None]] | None = None,
 ) -> tuple[bool, tuple[LeanBoundCheckRow, ...], tuple[str, ...]]:
     """Enforce ``0 < L*_Lean <= min(T_sim, T_silicon_p99)`` joined 1:1 to scored cases."""
     if not rows:
@@ -147,6 +189,7 @@ def check_lean_non_inversion(
     checked: list[LeanBoundCheckRow] = []
     violations: list[str] = []
     seen_case_ids: set[str] = set()
+    cert_digests: set[str] = set()
     for idx, row in enumerate(rows):
         cid = str(row.get("case_id") or f"case-{idx}")
         if cid in seen_case_ids:
@@ -177,6 +220,11 @@ def check_lean_non_inversion(
             cert_checked = True
             prog, dag, cert = witness
             ok_witness = check_optimality_certificate(prog, dag, cert) and cert.l_star_lean_ns == l_star
+            cert_digests.add(
+                hashlib.sha256(
+                    canonical_json_bytes({"program": row.get("program"), "dag": row.get("dag"), "certificate": row.get("certificate")})
+                ).hexdigest()
+            )
             if not ok_witness:
                 cert_valid = False
                 violations.append(f"lean_certificate_invalid:{cid}")
@@ -188,13 +236,25 @@ def check_lean_non_inversion(
                 cert_valid = False
                 violations.append(f"lean_witness_unrelated_case_id:{cid}")
             else:
-                exp_sim_ns, exp_meas_ns = expected_case_timings[cid]
-                if t_sim != int(exp_sim_ns):
+                timing_entry = expected_case_timings[cid]
+                exp_sim_ns = int(timing_entry[0])
+                exp_meas_ns = int(timing_entry[1])
+                exp_p99_ns = (
+                    int(timing_entry[2])
+                    if len(timing_entry) >= _TIMING_TRIPLE_LEN and timing_entry[2] is not None
+                    else None
+                )
+                if t_sim != exp_sim_ns:
                     cert_valid = False
                     violations.append(
                         f"lean_witness_t_sim_mismatch:{cid}:witness={t_sim}:scored={exp_sim_ns}"
                     )
-                if t_p99 < int(exp_meas_ns):
+                if exp_p99_ns is not None and t_p99 != exp_p99_ns:
+                    cert_valid = False
+                    violations.append(
+                        f"lean_witness_p99_mismatch:{cid}:witness={t_p99}:captured={exp_p99_ns}"
+                    )
+                if t_p99 < exp_meas_ns:
                     cert_valid = False
                     violations.append(
                         f"lean_witness_p99_below_measured:{cid}:p99={t_p99}:measured={exp_meas_ns}"
@@ -223,6 +283,15 @@ def check_lean_non_inversion(
         if missing_cases:
             violations.append(
                 f"lean_witness_missing_for_cases:{','.join(missing_cases[:_MAX_MISSING_CASES_IN_MSG])}"
+            )
+        distinct_sims = {int(entry[0]) for entry in expected_case_timings.values()}
+        if (
+            len(checked) >= _MIN_DISTINCT_CASES_FOR_REUSE_CHECK
+            and len(distinct_sims) >= _MIN_DISTINCT_CASES_FOR_REUSE_CHECK
+            and len(cert_digests) == 1
+        ):
+            violations.append(
+                f"lean_witness_degenerate_constant_certificate_reuse:cases={len(checked)}:distinct_sims={len(distinct_sims)}"
             )
     return not violations, tuple(checked), tuple(violations)
 
@@ -280,6 +349,7 @@ __all__ = [
     "check_lean_non_inversion",
     "seal_onboarding_receipt",
     "sign_stage_report",
+    "use_stage_key_file",
     "validate_strict_threshold_pct",
     "verify_stage_report",
 ]

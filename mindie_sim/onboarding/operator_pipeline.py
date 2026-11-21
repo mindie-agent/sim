@@ -57,6 +57,7 @@ from .cliff_planner import (
     evaluate_abi_rejections,
     score_sealed_gate_cases,
     synthesize_operator_cliff_plan,
+    verify_cliff_plan_integrity,
 )
 from .contracts import (
     CONTEXT_MAX_TOKENS,
@@ -143,7 +144,9 @@ def bench_and_score_operator(
     cap_threshold = validate_strict_threshold_pct(threshold_pct)
     plan_raw = read_bounded_json(cliff_plan) if isinstance(cliff_plan, (str, Path)) else dict(cliff_plan)
     plan_doc = dict(plan_raw["plan"]) if isinstance(plan_raw, Mapping) and "plan" in plan_raw else dict(plan_raw)
+    verified_plan_sha = verify_cliff_plan_integrity(plan_doc)
     expected_heldout_pts = list(plan_doc.get("heldout_points", ()))
+    expected_train_pts = list(plan_doc.get("train_points", ()))
     expected_heldout_ids = [str(pt["point_id"]) for pt in expected_heldout_pts]
 
     rows: list[Mapping[str, Any]] | None = None
@@ -183,7 +186,8 @@ def bench_and_score_operator(
             "error": "bench_and_score_plan_only_no_observations",
             "sku": sku,
             "target_id": str(plan_doc.get("target_id") or ""),
-            "plan_sha256": str(plan_doc.get("plan_sha256") or ""),
+            "family": str(plan_doc.get("family") or ""),
+            "plan_sha256": verified_plan_sha,
             "missing_heldout_points": sorted(expected_heldout_ids),
             "abi_rejection_check": evaluate_abi_rejections(plan_doc.get("abi_rejection_points") or (), None),
             "heldout_summary": None,
@@ -203,6 +207,7 @@ def bench_and_score_operator(
         threshold_pct=cap_threshold,
         external_train_roots=external_train,
         expected_points=expected_heldout_pts,
+        expected_train_points=expected_train_pts,
         expected_point_ids=expected_heldout_ids,
         require_disjoint_level_roots=False,
     )
@@ -226,7 +231,8 @@ def bench_and_score_operator(
         "sku": sku,
         "threshold_pct": cap_threshold,
         "target_id": str(plan_doc.get("target_id") or ""),
-        "plan_sha256": str(plan_doc.get("plan_sha256") or ""),
+        "family": str(plan_doc.get("family") or ""),
+        "plan_sha256": verified_plan_sha,
         "missing_heldout_points": missing_points,
         "over_budget_points": list(scored["over_budget_points"]),
         "failing_cases": list(scored["failing_cases"]),
@@ -265,10 +271,22 @@ def certify_operator(
 
     gates: list[GateCheckOutcome] = []
     c_hmac_ok = verify_stage_report("operator_contract", c_doc)
-    contract_ok = c_hmac_ok and bool(c_doc.get("ok"))
+    c_family = str(c_doc.get("family") or "").strip()
+    s_family = str(s_doc.get("family") or "").strip()
+    s_target_id = str(s_doc.get("target_id") or "").strip()
+    op_prefix = operator_id.split(":", 1)[0].strip() if ":" in operator_id else operator_id.strip()
+    identity_violations: list[str] = []
+    if s_target_id != operator_id:
+        identity_violations.append(f"score_report_operator_id_mismatch:expected={operator_id}:got={s_target_id or 'missing'}")
+    if c_family and s_family and c_family != s_family:
+        identity_violations.append(f"contract_score_family_mismatch:contract={c_family}:score={s_family}")
+    if c_family and op_prefix and c_family != op_prefix:
+        identity_violations.append(f"contract_operator_id_mismatch:contract_family={c_family}:operator_id={operator_id}")
+    contract_ok = c_hmac_ok and bool(c_doc.get("ok")) and not identity_violations
     c_violations = list(c_doc.get("violations") or ())
     if not c_hmac_ok:
         c_violations.append("contract_report_hmac_unverified_or_fabricated")
+    c_violations.extend(identity_violations)
     gates.append(
         GateCheckOutcome(
             name="operator_contract",
@@ -278,6 +296,7 @@ def certify_operator(
             metrics=(
                 ("source_refs_checked", int(c_doc.get("source_refs_checked", 0))),
                 ("hmac_verified", c_hmac_ok),
+                ("identity_bound", not identity_violations),
                 ("violations", len(c_violations)),
             ),
         )
@@ -285,6 +304,7 @@ def certify_operator(
 
     s_hmac_ok = verify_stage_report("operator_score", s_doc)
     sku_match = str(s_doc.get("sku") or "") == sku
+    target_match = s_target_id == operator_id
     heldout_rows = [r for r in s_doc.get("residuals", ()) if r.get("split", "heldout") == "heldout"]
     receipts_ok = bool(heldout_rows) and all(
         str(r.get("engine_receipt") or "").startswith(_ENGINE_RECEIPT_PREFIX)
@@ -303,6 +323,7 @@ def certify_operator(
     cliff_ok = (
         s_hmac_ok
         and sku_match
+        and target_match
         and bool(s_doc.get("ok"))
         and receipts_ok
         and not failing_rows
@@ -317,9 +338,10 @@ def certify_operator(
         else (
             "score_report_hmac_unverified_or_fabricated" if not s_hmac_ok
             else ("score_report_sku_mismatch" if not sku_match
-                  else ("unverified_engine_receipt" if not receipts_ok
-                        else ("score_report_ok_false" if not s_doc.get("ok")
-                              else f"failing={len(failing_rows)};missing={len(missing_pts)};abi_ok={abi_ok}")))
+                  else ("score_report_operator_id_mismatch" if not target_match
+                        else ("unverified_engine_receipt" if not receipts_ok
+                              else ("score_report_ok_false" if not s_doc.get("ok")
+                                    else f"failing={len(failing_rows)};missing={len(missing_pts)};abi_ok={abi_ok}"))))
         )
     )
     gates.append(
@@ -350,7 +372,11 @@ def certify_operator(
         )
 
     expected_timings = {
-        str(r["case_id"]): (int(r["predicted_ns"]), int(r["measured_ns"]))
+        str(r["case_id"]): (
+            int(r["predicted_ns"]),
+            int(r["measured_ns"]),
+            int(r["measured_p99_ns"]) if r.get("measured_p99_ns") is not None else None,
+        )
         for r in heldout_rows
         if r.get("case_id") and r.get("predicted_ns") and r.get("measured_ns")
     }

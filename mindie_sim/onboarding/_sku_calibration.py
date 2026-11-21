@@ -26,6 +26,7 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from copy import deepcopy
 import hashlib
+import json
 from pathlib import Path
 import re
 from typing import Any
@@ -46,15 +47,44 @@ from .contracts import (
     DEFAULT_CLEANUP_GRACE_S,
     DEFAULT_FABRIC_BUDGET_S,
     DEFAULT_L0_BUDGET_S,
+    MAX_READ_JSON_BYTES,
     SHORT_DIGEST_LEN,
     TRAIN_OBSERVATION_MANIFEST_SCHEMA,
     TimeoutBudget,
     assert_sanitized_payload,
-    read_bounded_json,
     write_atomic_json,
 )
 
 _SAFE_TOKEN_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _read_bounded_json_and_sha256(path: Path) -> tuple[Any, str]:
+    """Enforce the 50 MiB file limit BEFORE reading bytes, returning ``(data, sha256)``."""
+    try:
+        size = path.stat().st_size
+    except TimeoutError:
+        raise
+    except OSError as exc:
+        raise ModelingError(f"onboarding_json_stat_failed:{path.name}:{exc}") from exc
+    if size > MAX_READ_JSON_BYTES:
+        raise ModelingError(
+            f"onboarding_json_exceeds_50mib_limit:{path.name}:size={size}:limit={MAX_READ_JSON_BYTES}"
+        )
+    try:
+        raw_bytes = path.read_bytes()
+    except TimeoutError:
+        raise
+    except OSError as exc:
+        raise ModelingError(f"onboarding_json_read_failed:{path.name}:{exc}") from exc
+    if len(raw_bytes) > MAX_READ_JSON_BYTES:
+        raise ModelingError(
+            f"onboarding_json_exceeds_50mib_limit:{path.name}:size={len(raw_bytes)}:limit={MAX_READ_JSON_BYTES}"
+        )
+    try:
+        parsed = json.loads(raw_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ModelingError(f"onboarding_json_parse_failed:{path.name}:{exc}") from exc
+    return parsed, hashlib.sha256(raw_bytes).hexdigest()
 
 
 @contextmanager
@@ -124,22 +154,39 @@ def _merge_l0_and_fabric_measurements(
     return merged
 
 
+def _extract_cann_version(raw: Mapping[str, Any] | None) -> str:
+    if not isinstance(raw, Mapping):
+        return ""
+    val = str(raw.get("cann_version") or "").strip()
+    if not val and isinstance(raw.get("observed_silicon"), Mapping):
+        val = str(raw["observed_silicon"].get("cann_version") or "").strip()
+    if val == "unmeasured":
+        return ""
+    return val
+
+
 def check_cann_version_consistency(
     raw_l0: Mapping[str, Any] | None,
     requested_cann: str,
+    *,
+    raw_fabric: Mapping[str, Any] | None = None,
+    probe_cann: str = "",
 ) -> str:
-    """Reject requested CANN version strings that contradict captured silicon metadata."""
-    obs_cann = ""
-    if isinstance(raw_l0, Mapping):
-        obs_cann = str(raw_l0.get("cann_version") or "").strip()
-        if not obs_cann and isinstance(raw_l0.get("observed_silicon"), Mapping):
-            obs_cann = str(raw_l0["observed_silicon"].get("cann_version") or "").strip()
-    req = str(requested_cann or "unmeasured").strip()
-    if obs_cann and req and req != "unmeasured" and obs_cann != req:
-        raise ModelingError(
-            f"cann_version_provenance_conflict:observed={obs_cann}:requested={req}"
-        )
-    return obs_cann or req or "unmeasured"
+    """Reject CANN version contradictions across probe, L0 capture, fabric capture, and request."""
+    sources: list[tuple[str, str]] = []
+    for label, val in (
+        ("probe", str(probe_cann or "").strip()),
+        ("l0_capture", _extract_cann_version(raw_l0)),
+        ("fabric_capture", _extract_cann_version(raw_fabric)),
+        ("requested", str(requested_cann or "").strip()),
+    ):
+        if val and val != "unmeasured":
+            sources.append((label, val))
+    distinct = {v for _lbl, v in sources}
+    if len(distinct) > 1:
+        detail = ":".join(f"{lbl}={val}" for lbl, val in sources)
+        raise ModelingError(f"cann_version_provenance_conflict:{detail}")
+    return sources[0][1] if sources else "unmeasured"
 
 
 def calibrate_l0_and_fabric(
@@ -165,6 +212,7 @@ def calibrate_l0_and_fabric(
     repo_root: str | Path | None = None,
     coordinator_bin: str = "",
     profile_override: Mapping[str, Any] | None = None,
+    probe_cann_version: str = "",
 ) -> dict[str, Any]:
     """Stage 2: Acquire HostQueue lease, run L0+fabric calibration, seal via canonical sealer."""
     resolved_outer = (
@@ -221,12 +269,14 @@ def calibrate_l0_and_fabric(
             raise ModelingError("live_calibration_requires_host_queue_lease_id_and_fence_token")
         if raw_l0_json is not None:
             raw_path = Path(raw_l0_json)
-            if raw_path.is_file():
-                extra_train_digests.append(hashlib.sha256(raw_path.read_bytes()).hexdigest())
-            raw_l0 = unwrap_capture_envelope(read_bounded_json(raw_path))
+            parsed_l0, l0_sha = _read_bounded_json_and_sha256(raw_path)
+            extra_train_digests.append(l0_sha)
+            raw_l0 = unwrap_capture_envelope(parsed_l0)
         elif l0_runner is not None:
             raw_l0 = unwrap_capture_envelope(dict(l0_runner(sku, int(l0_budget_s))))
         elif live_bench:
+            prof_entry = profile_override if profile_override is not None else ascend_profiles().get(sku)
+            dies_per_pkg = max(1, int((prof_entry or {}).get("dies_per_package", 1)))
             raw_l0 = run_live_l0_bench_subprocess(
                 sku=sku,
                 endpoint_alias=endpoint_alias,
@@ -235,20 +285,23 @@ def calibrate_l0_and_fabric(
                 repo_root=repo_root,
                 timeout_s=int(l0_budget_s),
                 visible_devices=granted_devices,
+                dies_per_package=dies_per_pkg,
             )
         else:
             raw_l0 = None
         if raw_fabric_json is not None:
             fab_path = Path(raw_fabric_json)
-            if fab_path.is_file():
-                extra_train_digests.append(hashlib.sha256(fab_path.read_bytes()).hexdigest())
-            raw_fabric = unwrap_capture_envelope(read_bounded_json(fab_path))
+            parsed_fab, fab_sha = _read_bounded_json_and_sha256(fab_path)
+            extra_train_digests.append(fab_sha)
+            raw_fabric = unwrap_capture_envelope(parsed_fab)
         elif fabric_runner is not None:
             raw_fabric = unwrap_capture_envelope(dict(fabric_runner(sku, int(fabric_budget_s))))
         else:
             raw_fabric = None
 
-    effective_cann = check_cann_version_consistency(raw_l0, cann_version)
+    effective_cann = check_cann_version_consistency(
+        raw_l0, cann_version, raw_fabric=raw_fabric, probe_cann=probe_cann_version
+    )
     sealer = load_canonical_l0_sealer(repo_root)
     merged_raw = _merge_l0_and_fabric_measurements(raw_l0, raw_fabric)
     rec_alias = sealer.sanitize_record_alias(endpoint_alias or sku, sku)

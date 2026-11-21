@@ -185,7 +185,7 @@ def _plan_fixture_bundle(
         pid, meas = str(pt["point_id"]), 10_000 + idx * 100
         sha = hashlib.sha256(f"train:{sku}:{pid}:{idx}".encode()).hexdigest()
         preds[pid] = int(round(meas * scale))
-        rows.append({
+        row = {
             "case_id": pid, "point_id": pid, "sku": sku, "split": "train", "level": "L1",
             "acquisition_root": "acq-train-src", "run_uid": f"run-tr-{idx}", "raw_sha256": sha,
             "capture_uri": f"capture://train/{sha}", "event_ids": [f"tr-s-{idx}", f"tr-e-{idx}"], "device_ranks": [0],
@@ -193,15 +193,19 @@ def _plan_fixture_bundle(
             "tokens": pt["value"] if pt["axis"] == "tokens" else None,
             "batch_size": pt["batch_size"], "query_tokens": pt["query_tokens"],
             "parallel_topology": pt["parallel_topology"], "topk": pt["topk"],
-            "measured_ns": meas, "clock_operator": clock_op,
+            "measured_ns": meas, "measured_p99_ns": int(meas * 1.05), "clock_operator": clock_op,
             "busy_union_ns": meas if clock_op == "busy_union" else meas - 500,
             "elapsed_span_ns": meas if clock_op == "elapsed_span" else meas + 500,
-        })
+        }
+        if pt["axis"] not in {"context_len", "tokens"}:
+            row[str(pt["axis"])] = pt["value"]
+        rows.append(row)
     for idx, pt in enumerate(plan["heldout_points"]):
         pid, lvl, meas = str(pt["point_id"]), levels[idx % len(levels)], 20_000 + idx * 250
         sha, pred = hashlib.sha256(f"held:{sku}:{pid}:{lvl}:{idx}".encode()).hexdigest(), int(round(meas * scale))
         preds[pid] = pred
-        rows.append({
+        p99 = int(meas * 1.05)
+        row = {
             "case_id": pid, "point_id": pid, "sku": sku, "split": "heldout", "level": lvl,
             "acquisition_root": f"acq-held-{lvl.lower()}", "run_uid": f"run-h-{lvl.lower()}-{idx}",
             "raw_sha256": sha, "capture_uri": f"capture://held/{lvl.lower()}/{sha}",
@@ -210,11 +214,14 @@ def _plan_fixture_bundle(
             "tokens": pt["value"] if pt["axis"] == "tokens" else None,
             "batch_size": pt["batch_size"], "query_tokens": pt["query_tokens"],
             "parallel_topology": pt["parallel_topology"], "topk": pt["topk"],
-            "measured_ns": meas, "clock_operator": clock_op,
+            "measured_ns": meas, "measured_p99_ns": p99, "clock_operator": clock_op,
             "busy_union_ns": meas if clock_op == "busy_union" else meas - 500,
             "elapsed_span_ns": meas if clock_op == "elapsed_span" else meas + 500,
-        })
-        lean_rows.append(_lean_witness_row(pid, int(meas * 0.7), sim_ns=pred, p99_ns=int(meas * 1.05)))
+        }
+        if pt["axis"] not in {"context_len", "tokens"}:
+            row[str(pt["axis"])] = pt["value"]
+        rows.append(row)
+        lean_rows.append(_lean_witness_row(pid, int(meas * 0.7), sim_ns=pred, p99_ns=p99))
     abi_rows = [{"point_id": pt["point_id"], "rejected": True, "abi_error": pt["abi_expected_error"]} for pt in plan["abi_rejection_points"]]
     return rows, preds, lean_rows, abi_rows
 
@@ -254,6 +261,14 @@ def test_probe_soc_strict_ini_conflict_and_new_sku_run_all(tmp_path):
     assert res_ok["ok"] is True and res_ok["mode"] == "validated_existing"
     assert res_ok["probe"]["capture_uri"].startswith("capture://") and len(res_ok["ini_sha256"]) == 64
     assert synthetic_ip not in json.dumps(res_ok)
+
+    # Contradictory silicon sources (INI vs smi, fabric peak mismatch) fail Stage 1!
+    bad_smi = tmp_path / "bad_smi.json"
+    bad_smi.write_text(json.dumps({**_a2_probe_payload(), "npu_smi_common": "Chip ID : 0\nAicore Count : 1\n"}), encoding="utf-8")
+    assert probe_soc(probe_json=bad_smi)["error"] == "silicon_profile_conflict"
+    bad_fab = tmp_path / "bad_fab.json"
+    bad_fab.write_text(json.dumps({**_a2_probe_payload(), "fabric_channels": {"d2d_intra_node": 1.0}}), encoding="utf-8")
+    assert probe_soc(probe_json=bad_fab)["error"] == "silicon_profile_conflict"
 
     # Finding #13: existing SKU without platform_config_ini OR with dies conflict MUST fail closed!
     no_ini = tmp_path / "no_ini.json"
@@ -314,9 +329,12 @@ def test_canonical_sealer_capture_unwrap_cann_and_sku_mismatch(tmp_path):
     val = validate_512_400k(sku=A2_SKU, profiler_runner=lambda _p: obs, abi_rejection_results=abis, runner=_independent_engine_runner(preds))
     assert val["ok"] is True
     assert verify_sku_gates(sku=A2_SKU, validation_report_json=val, lean_bounds_json=leans, repo_root=syn)["ok"] is False
-    assert verify_sku_gates(sku=A2_SKU, validation_report_json=val, lean_bounds_json=leans, primitives_json=cal_cap["primitives_payload"], repo_root=syn)["ok"] is False
+    # Stage-3 empty or mismatched primitives_envelope_sha256 fails Stage 4!
     cal_a2 = calibrate_l0_and_fabric(sku=A2_SKU, raw_l0_json=raw_l0, cann_version="9.2.0")
-    assert verify_sku_gates(sku=A2_SKU, validation_report_json=val, lean_bounds_json=leans, primitives_json=cal_a2["primitives_payload"], expected_cann_version="9.3.0", repo_root=syn)["ok"] is False
+    assert verify_sku_gates(sku=A2_SKU, validation_report_json=val, lean_bounds_json=leans, primitives_json=cal_a2["primitives_payload"], repo_root=syn)["ok"] is False
+    val_bound = validate_512_400k(sku=A2_SKU, primitives_json=cal_a2["primitives_payload"], profiler_runner=lambda _p: obs, abi_rejection_results=abis, runner=_independent_engine_runner(preds))
+    assert verify_sku_gates(sku=A2_SKU, validation_report_json=val_bound, lean_bounds_json=leans, primitives_json=cal_cap["primitives_payload"], repo_root=syn)["ok"] is False
+    assert verify_sku_gates(sku=A2_SKU, validation_report_json=val_bound, lean_bounds_json=leans, primitives_json=cal_a2["primitives_payload"], expected_cann_version="9.3.0", repo_root=syn)["ok"] is False
 
     def _timeout_runner(_sku: str, _budget: int) -> dict[str, Any]:
         raise TimeoutError("l0_timeout")
@@ -351,11 +369,11 @@ def test_lock3_tiling_axes_controls_grid_and_abi_rejection():
     assert {12344, 12345, 12346}.intersection({pt.value for pt in plan.heldout_points if pt.axis == "context_len"}) == {12345}
     assert {12344, 12346}.issubset({pt.value for pt in plan.abi_rejection_points})
 
-    # Finding #21: evaluate_abi_rejections fails closed on missing, rejected=False, or wrong error class!
+    # Finding #21: evaluate_abi_rejections fails closed on missing, rejected=False, wrong error, or retry masking!
     rejs = plan.to_dict()["abi_rejection_points"]
     assert evaluate_abi_rejections(rejs, None)["ok"] is False
-    assert evaluate_abi_rejections(rejs, [{"point_id": pt["point_id"], "rejected": True, "abi_error": "no_memory"} for pt in rejs])["ok"] is False
-    assert evaluate_abi_rejections(rejs, [{"point_id": pt["point_id"], "rejected": False, "abi_error": pt["abi_expected_error"]} for pt in rejs])["ok"] is False
+    assert evaluate_abi_rejections(rejs, [{"point_id": pt["point_id"], "rejected": True, "abi_error": "ABI driver version mismatch"} for pt in rejs])["ok"] is False
+    assert evaluate_abi_rejections(rejs, [{"point_id": rejs[0]["point_id"], "rejected": False, "abi_error": ""}, *[{"point_id": pt["point_id"], "rejected": True, "abi_error": pt["abi_expected_error"]} for pt in rejs]])["ok"] is False
 
 
 def test_lock2_sealed_scorer_adversarial_hardening(tmp_path):
@@ -449,14 +467,16 @@ def test_operator_pipeline_strict_owners_abi_crosscheck_and_certify(tmp_path):
     def _good_resolve(op: OpSpec, ctx) -> ResolvedOperator:
         return ResolvedOperator(occurrence=ctx.occurrence, op=op, implementation="aclnnDemoOpV1", recipe=OperatorPlan(work=Work(resources={"vector": 4096.0}), program=lambda *_a, **_kw: (), pipeline_spec={"stage": "v"}, metadata={"implementation": "aclnnDemoOpV1"}))
 
-    def _empty_resolve(op: OpSpec, ctx) -> ResolvedOperator:
-        return ResolvedOperator(occurrence=ctx.occurrence, op=op, implementation="aclnnDemoOpV1", recipe=OperatorPlan(work=Work(resources={"vector": 4096.0}), program=lambda *_a, **_kw: ()))
+    def _broken_resolve(op: OpSpec, ctx) -> ResolvedOperator:
+        def _boom(*_a, **_kw):
+            raise NotImplementedError("unimplemented_lower")
+        return ResolvedOperator(occurrence=ctx.occurrence, op=op, implementation="aclnnDemoOpV1", recipe=OperatorPlan(work=Work(resources={"vector": 4096.0}), program=_boom, pipeline_spec={"stage": "v"}))
 
     reg_ok = FamilyRegistry([OperatorFamilySpec("demo_op", frozenset({"demo_op"}), frozenset({"demo_op"}), _good_resolve)])
-    reg_empty = FamilyRegistry([OperatorFamilySpec("demo_op", frozenset({"demo_op"}), frozenset({"demo_op"}), _empty_resolve)])
+    reg_broken = FamilyRegistry([OperatorFamilySpec("demo_op", frozenset({"demo_op"}), frozenset({"demo_op"}), _broken_resolve)])
 
-    # Findings #17, #18, #19:
-    assert validate_operator_contract(target_path=target_rel, repo_root=syn, refs_root=repo_dir.parent, profiler_root=prof_ok, family_registry=reg_empty)["ok"] is False
+    # Findings #17, #18, #19: broken lower, wrong ISA/profiler ABI, unmounted refs, tampered plan, cross-op certify!
+    assert validate_operator_contract(target_path=target_rel, repo_root=syn, refs_root=repo_dir.parent, profiler_root=prof_ok, family_registry=reg_broken)["ok"] is False
     bad_abi = validate_operator_contract(target_path=target_rel, repo_root=syn, refs_root=repo_dir.parent, profiler_root=prof_bad, family_registry=reg_ok)
     assert bad_abi["ok"] is False and any("profiler_abi_mismatch" in v for v in bad_abi["violations"])
     unmounted = validate_operator_contract(target_path=target_rel, repo_root=syn, refs_root=tmp_path / "empty_refs", profiler_root=prof_ok, family_registry=reg_ok)
@@ -473,6 +493,10 @@ def test_operator_pipeline_strict_owners_abi_crosscheck_and_certify(tmp_path):
         family_registry=reg_ok, runner=_independent_engine_runner(op_preds), out_dir=tmp_path / "op_out",
     )
     assert op_run["ok"] is True and op_run["status"] == "certified" and verify_receipt_sha256(op_run["stages"]["certify"]["receipt"]) is True
+    # Tampered shortened plan & cross-operator certify mismatch fail closed!
+    with pytest.raises(ModelingError, match="cliff_plan_sha256_tampered"):
+        bench_and_score_operator(cliff_plan={**plan_doc, "heldout_points": plan_doc["heldout_points"][:1]}, sku=A2_SKU, captured_json=op_obs[:1], runner=_independent_engine_runner(op_preds))
+    assert certify_operator(operator_id="other_op:v9", sku=A2_SKU, contract_report=op_run["stages"]["validate-contract"], score_report=op_run["stages"]["bench-and-score"], lean_bounds_json=op_leans, repo_root=syn)["ok"] is False
     inv_leans = [dict(op_leans[0], l_star_lean_ns=op_leans[0]["t_sim_ns"] + 5000), *op_leans[1:]]
     assert certify_operator(operator_id="demo_op:v1", sku=A2_SKU, contract_report=op_run["stages"]["validate-contract"], score_report=op_run["stages"]["bench-and-score"], lean_bounds_json=inv_leans, repo_root=syn)["ok"] is False
 
@@ -505,12 +529,14 @@ def test_live_coordinator_schema_device_forwarding_and_profiler_module(tmp_path)
     pkg = fake_prof / "mindie_profiler/bench"
     pkg.mkdir(parents=True)
     (fake_prof / "mindie_profiler/__init__.py").write_text("", encoding="utf-8")
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-    (pkg / "bench_sku_microbench.py").write_text(
-        f"import json, sys\nfrom pathlib import Path\nargs = sys.argv[1:]\nPath({str(prof_argv_log)!r}).write_text(json.dumps(args), encoding='utf-8')\n"
-        "Path(args[args.index('--observations') + 1]).write_text(json.dumps({'observations': []}), encoding='utf-8')\n",
+    (fake_prof / "mindie_profiler/__main__.py").write_text(
+        f"import json, sys\nfrom pathlib import Path\nargs = sys.argv[1:]\nassert args[:2] == ['bench', 'sku']\n"
+        f"Path({str(prof_argv_log)!r}).write_text(json.dumps(args), encoding='utf-8')\n"
+        "Path(args[args.index('--observations') + 1]).write_text('', encoding='utf-8')\n",
         encoding="utf-8",
     )
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "bench_sku_microbench.py").write_text("def main(argv=None): return 0\n", encoding="utf-8")
     plan_doc = generate_operator_cliff_plan(operator_id="live:v1", family="live", sku=A2_SKU, tile_dim=128, core_count=20, l2_bytes=A2_ORACLE["l2"])["plan"]
     bench_and_score_operator(cliff_plan=plan_doc, sku=A2_SKU, live_profiler=True, endpoint_alias="lab-a2", profiler_root=fake_prof, coordinator_bin=str(fake_coord))
     argv_seen = json.loads(prof_argv_log.read_text(encoding="utf-8"))
@@ -543,34 +569,31 @@ def test_whitebox_spine_runner_l1_l2_l3_separation_and_p50_threading(tmp_path):
     p_half = score_sealed_gate_cases([base_rows[2]], sku=A2_SKU, primitive_table=tbl_half)["residuals"][0]["predicted_ns"]
     assert p_half > p_full
 
-    # Finding #8: verify_sku_gates(multilevel_manifest_json=..., runner=None) replays via default WhiteboxSpineRunner!
+    # Finding #8: verify_sku_gates(multilevel_manifest_json=..., runner=None) replays via default WhiteboxSpineRunner & rejects incomplete grid!
+    cal_full = calibrate_l0_and_fabric(sku=A2_SKU, raw_l0_json=raw_full)["primitives_payload"]
+    ml_case_spec = {"compose_model": "qwen3-32b", "compose_hardware": A2_SKU, "compose_options": {"tp": 1}}
+    ml_cases, ml_leans = [], []
+    for idx, ctx in enumerate(OFF_GRID_CLIFF_HELDOUT_GRID):
+        r = base_rows[idx % len(base_rows)]
+        cid = f"ml-{r['level'].lower()}-{ctx}"
+        sha = hashlib.sha256(cid.encode()).hexdigest()
+        row_copy = {**r, "case_id": cid, "point_id": cid, "raw_sha256": sha, "context_len": ctx, "sim_case": ml_case_spec}
+        if r["level"] == "L1":
+            row_copy["target_family"] = "rmsnorm_quant"
+        pred_ns = score_sealed_gate_cases([row_copy], sku=A2_SKU, primitive_table=tbl_full)["residuals"][0]["predicted_ns"]
+        ml_cases.append({
+            "case_id": cid, "level": r["level"], "split": "heldout",
+            "boundary": {"raw_sha256": sha, "acquisition_uid": f"acq-ml-{r['level'].lower()}", "run_uid": f"r-{idx}", "parent_digests": [], "event_ids": [f"s{idx}", f"e{idx}"], "device_ranks": [0], "clock_domain": "device_ns", "start_event": "start", "end_event": "end", "boundary_kind": {"L1": "device_kernel", "L2": "fx_region", "L3": "model_step"}[r["level"]], "unit": "ns", "capture_uri": f"capture://ml/{sha}"},
+            "input_digest": sha, "stack_digest": hashlib.sha256(b"st").hexdigest(), "implementation": "whitebox",
+            "cohort": {"level": r["level"], "cohort_name": "wb", "sku": A2_SKU, "phase": "decode", "mode": "eager", "shape_regime": "cliff", "parallel_topology": "tp1"},
+            "measured_ns": pred_ns,
+            "payload": {k: v for k, v in row_copy.items() if k in {"clock_operator", "phase", "context_len", "query_tokens", "batch_size", "target_family", "target_layer", "sim_case"}},
+        })
+        ml_leans.append(_lean_witness_row(cid, max(1, pred_ns // 2), sim_ns=pred_ns, p99_ns=pred_ns + 10))
     manifest_f = tmp_path / "ml_manifest.json"
-    manifest_f.write_text(json.dumps({
-        "manifest_id": "m-live-replay", "schema_version": "mindie-multilevel-manifest/1",
-        "cases": [
-            {
-                "case_id": r["case_id"], "level": r["level"], "split": "heldout",
-                "boundary": {
-                    "raw_sha256": r["raw_sha256"], "acquisition_uid": r["acquisition_root"],
-                    "run_uid": r["run_uid"], "parent_digests": [], "event_ids": r["event_ids"],
-                    "device_ranks": r["device_ranks"], "clock_domain": "device_ns",
-                    "start_event": "start", "end_event": "end",
-                    "boundary_kind": {"L1": "device_kernel", "L2": "fx_region", "L3": "model_step"}[r["level"]],
-                    "unit": "ns", "capture_uri": f"capture://ml/{r['raw_sha256']}",
-                },
-                "input_digest": r["raw_sha256"], "stack_digest": hashlib.sha256(b"st").hexdigest(),
-                "implementation": "whitebox",
-                "cohort": {"level": r["level"], "cohort_name": "wb", "sku": A2_SKU, "phase": "decode", "mode": "eager", "shape_regime": "cliff", "parallel_topology": "tp1"},
-                "measured_ns": by_lvl[r["level"]]["predicted_ns"],
-                "payload": {k: v for k, v in r.items() if k in {"clock_operator", "phase", "context_len", "query_tokens", "batch_size", "target_family", "target_layer", "sim_case"}},
-            }
-            for r in base_rows
-        ],
-    }), encoding="utf-8")
-    ml_leans = [_lean_witness_row(r["case_id"], max(1, by_lvl[r["level"]]["predicted_ns"] // 2), sim_ns=by_lvl[r["level"]]["predicted_ns"], p99_ns=by_lvl[r["level"]]["predicted_ns"] + 10) for r in base_rows]
-    ml_gate = verify_sku_gates(
-        sku=A2_SKU, multilevel_manifest_json=manifest_f, runner=None,
-        primitives_json=calibrate_l0_and_fabric(sku=A2_SKU, raw_l0_json=raw_full)["primitives_payload"],
-        lean_bounds_json=ml_leans, repo_root=_synthetic_repo(tmp_path, family="ml_live"),
-    )
+    manifest_f.write_text(json.dumps({"manifest_id": "m-live-replay", "schema_version": "mindie-multilevel-manifest/1", "cases": ml_cases}), encoding="utf-8")
+    ml_gate = verify_sku_gates(sku=A2_SKU, multilevel_manifest_json=manifest_f, runner=None, primitives_json=cal_full, lean_bounds_json=ml_leans, repo_root=_synthetic_repo(tmp_path, family="ml_live"))
     assert ml_gate["ok"] is True and ml_gate["status"] == "certified"
+    bad_ml = tmp_path / "ml_incomplete.json"
+    bad_ml.write_text(json.dumps({"manifest_id": "m-inc", "schema_version": "mindie-multilevel-manifest/1", "cases": ml_cases[:3]}), encoding="utf-8")
+    assert verify_sku_gates(sku=A2_SKU, multilevel_manifest_json=bad_ml, runner=None, primitives_json=cal_full, lean_bounds_json=ml_leans[:3], repo_root=_synthetic_repo(tmp_path, family="ml_bad"))["ok"] is False

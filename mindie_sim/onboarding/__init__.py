@@ -30,7 +30,6 @@ from .cliff_planner import (
 from ._lean_and_receipts import (
     check_lean_non_inversion,
     seal_onboarding_receipt,
-    sign_stage_report,
     validate_strict_threshold_pct,
     verify_stage_report,
 )
@@ -144,7 +143,6 @@ __all__ = [
     "scaffold_operator",
     "score_sealed_gate_cases",
     "seal_onboarding_receipt",
-    "sign_stage_report",
     "synthesize_operator_cliff_plan",
     "synthesize_sku_512_400k_plan",
     "validate_512_400k",

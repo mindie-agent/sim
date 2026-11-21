@@ -50,6 +50,7 @@ from ._lean_and_receipts import (
     seal_onboarding_receipt,
     sign_stage_report,
     validate_strict_threshold_pct,
+    verify_stage_report,
 )
 from ._sealed_scorer import REQUIRED_MULTILEVEL_LEVELS, run_multilevel_verdict
 from ._sku_calibration import calibrate_l0_and_fabric, materialize_sku_hardware
@@ -119,13 +120,22 @@ def validate_512_400k(
         write_atomic_json(plan_out, plan_doc)
 
     parsed_table: PrimitiveTable | None = None
-    if primitives_json is not None:
-        p_doc = read_bounded_json(primitives_json) if isinstance(primitives_json, (str, Path)) else dict(primitives_json)
-        parsed_table = parse_primitive_table(p_doc, verify_envelope=True)
-
     external_train_roots: list[str] = [plan.train_lineage_root]
     external_train_digests: list[str] = []
     external_train_uris: list[str] = []
+    if primitives_json is not None:
+        p_doc = read_bounded_json(primitives_json) if isinstance(primitives_json, (str, Path)) else dict(primitives_json)
+        parsed_table = parse_primitive_table(p_doc, verify_envelope=True)
+        external_train_digests.append(parsed_table.envelope_sha256)
+        prim_uri = str(parsed_table.provenance.capture_uri or "").strip()
+        if prim_uri:
+            external_train_uris.append(prim_uri)
+            external_train_digests.append(prim_uri.rsplit("/", 1)[-1])
+        for cell in parsed_table.primitives.values():
+            ev_id = str(cell.evidence_id or "").strip()
+            if ev_id:
+                external_train_uris.append(ev_id)
+                external_train_digests.append(ev_id.rsplit("/", 1)[-1])
     if train_manifest_json is not None:
         t_doc = read_bounded_json(train_manifest_json) if isinstance(train_manifest_json, (str, Path)) else dict(train_manifest_json)
         if t_doc.get("train_lineage_root"):
@@ -197,11 +207,13 @@ def validate_512_400k(
         sku=sku,
         runner=runner,
         primitive_table=parsed_table,
+        profile_override=profile_override,
         threshold_pct=cap_threshold,
         external_train_roots=external_train_roots,
         external_train_digests=external_train_digests,
         external_train_uris=external_train_uris,
         expected_points=expected_heldout_pts,
+        expected_train_points=list(plan_doc["train_points"]),
         expected_point_ids=expected_heldout_ids,
         require_disjoint_level_roots=True,
         capture_root=capture_root,
@@ -209,19 +221,17 @@ def validate_512_400k(
         require_capture_files=require_capture_files,
     )
     abi_check = evaluate_abi_rejections(plan_doc["abi_rejection_points"], abi_rejection_results)
+    train_plan_by_id = {str(pt["point_id"]): int(pt["value"]) for pt in plan_doc["train_points"] if pt.get("axis") == "context_len"}
+    held_plan_by_id = {str(pt["point_id"]): int(pt["value"]) for pt in expected_heldout_pts if pt.get("axis") == "context_len"}
     train_ctxs = {
-        int(row["context_len"])
-        for row in obs_rows
-        if str(row.get("split") or "heldout") == "train"
-        and row.get("context_len") is not None
-        and str(row.get("status") or "").lower() != "over_budget"
+        train_plan_by_id[str(r["point_id"])]
+        for r in scored["residuals"]
+        if r.get("split") == "train" and r.get("status") == "ok" and str(r.get("point_id")) in train_plan_by_id
     }
     heldout_ctxs = {
-        int(row["context_len"])
-        for row in obs_rows
-        if str(row.get("split") or "heldout") == "heldout"
-        and row.get("context_len") is not None
-        and str(row.get("status") or "").lower() != "over_budget"
+        held_plan_by_id[str(r["point_id"])]
+        for r in scored["residuals"]
+        if r.get("split") == "heldout" and r.get("status") == "ok" and str(r.get("point_id")) in held_plan_by_id
     }
     missing_anchors = [c for c in ANCHOR_CONTEXT_GRID if c not in train_ctxs]
     missing_cliffs = [c for c in OFF_GRID_CLIFF_HELDOUT_GRID if c not in heldout_ctxs]
@@ -325,12 +335,20 @@ def verify_sku_gates(
             cal_cnt = sum(1 for cell in table.primitives.values() if cell.status == "calibrated")
             sku_match = table.sku == sku
             cann_match = (not expected_cann_version) or (table.cann_version == expected_cann_version)
-            prim_ok = cal_cnt > 0 and sku_match and cann_match
+            stage3_env = str((val_doc or {}).get("primitives_envelope_sha256") or "").strip()
+            env_match = (
+                True
+                if multilevel_manifest_json is not None or val_doc is None
+                else (bool(stage3_env) and stage3_env == table.envelope_sha256)
+            )
+            prim_ok = cal_cnt > 0 and sku_match and cann_match and env_match
             reasons: list[str] = []
             if not sku_match:
                 reasons.append(f"primitives_sku_mismatch:table={table.sku}:target={sku}")
             if not cann_match:
                 reasons.append(f"primitives_cann_mismatch:table={table.cann_version}:expected={expected_cann_version}")
+            if not env_match:
+                reasons.append(f"primitives_stage3_stage4_envelope_mismatch:stage3={stage3_env or 'missing'}:stage4={table.envelope_sha256[:SHORT_DIGEST_LEN]}")
             if cal_cnt == 0:
                 reasons.append("l0_calibration_zero_calibrated_primitives")
             gates.append(
@@ -343,7 +361,7 @@ def verify_sku_gates(
                         if prim_ok
                         else "; ".join(reasons)
                     ),
-                    metrics=(("calibrated_count", cal_cnt), ("total_primitives", len(table.primitives)), ("sku_match", sku_match), ("cann_match", cann_match)),
+                    metrics=(("calibrated_count", cal_cnt), ("total_primitives", len(table.primitives)), ("sku_match", sku_match), ("cann_match", cann_match), ("stage3_envelope_match", env_match)),
                 )
             )
             artifacts["primitives_envelope_sha256"] = table.envelope_sha256
@@ -375,7 +393,11 @@ def verify_sku_gates(
         )
 
     expected_timings = {
-        str(r["case_id"]): (int(r["predicted_ns"]), int(r["measured_ns"]))
+        str(r["case_id"]): (
+            int(r["predicted_ns"]),
+            int(r["measured_ns"]),
+            int(r["measured_p99_ns"]) if r.get("measured_p99_ns") is not None else None,
+        )
         for r in diag_residuals
         if r.get("case_id") and r.get("predicted_ns") and r.get("measured_ns")
     }
@@ -413,12 +435,13 @@ def verify_sku_gates(
             )
         )
 
-    if val_doc and val_doc.get("plan_sha256"):
-        artifacts["plan_sha256"] = str(val_doc["plan_sha256"])
-    if val_doc and isinstance(val_doc.get("heldout_summary"), Mapping):
-        max_ape = val_doc["heldout_summary"].get("max_ape_pct")
-        if max_ape is not None:
-            artifacts["heldout_max_ape_pct"] = str(round(float(max_ape), DISPLAY_ROUND_DIGITS))
+    if val_doc and verify_stage_report("sku_validation", val_doc) and val_doc.get("ok"):
+        if val_doc.get("plan_sha256"):
+            artifacts["plan_sha256"] = str(val_doc["plan_sha256"])
+        if isinstance(val_doc.get("heldout_summary"), Mapping):
+            max_ape = val_doc["heldout_summary"].get("max_ape_pct")
+            if max_ape is not None:
+                artifacts["heldout_max_ape_pct"] = str(round(float(max_ape), DISPLAY_ROUND_DIGITS))
 
     receipt = seal_onboarding_receipt(
         kind="sku",
@@ -481,7 +504,17 @@ def run_sku_onboarding(
         base_template_sku=base_template_sku,
         scaffold_out=(base_out / "scaffold_profile.json") if (base_out and allow_scaffold) else None,
     )
-    resolved_sku = str(sku or stage1["sku"])
+    probed_sku = str(stage1.get("sku") or "")
+    resolved_sku = str(sku or probed_sku)
+    if sku and probed_sku and str(sku) != probed_sku:
+        return {
+            "stage": "run-all",
+            "sku": resolved_sku,
+            "ok": False,
+            "status": "failed_at_probe_soc",
+            "error": f"probe_sku_mismatch:requested={sku}:probed={probed_sku}",
+            "stages": {"probe-soc": stage1},
+        }
     if not stage1["ok"]:
         return {
             "stage": "run-all",
@@ -491,6 +524,7 @@ def run_sku_onboarding(
             "stages": {"probe-soc": stage1},
         }
 
+    probe_cann = str(stage1.get("probe_cann_version") or "").strip()
     profile_override = (
         stage1["scaffold_profile"][resolved_sku]
         if isinstance(stage1.get("scaffold_profile"), Mapping)
@@ -506,6 +540,7 @@ def run_sku_onboarding(
         manifest_path=(base_out / "primitives_manifest.json") if base_out else None,
         train_manifest_out=(base_out / "train_manifest.json") if base_out else None,
         cann_version=cann_version,
+        probe_cann_version=probe_cann,
         lease_acquirer=lease_acquirer,
         l0_runner=l0_runner,
         fabric_runner=fabric_runner,

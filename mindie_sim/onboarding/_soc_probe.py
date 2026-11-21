@@ -350,6 +350,10 @@ def _scaffold_sku_profile(
     return base
 
 
+_FABRIC_BW_MIN_RATIO = 0.5
+_FABRIC_BW_MAX_RATIO = 1.25
+
+
 def _validate_profile_against_probe(
     probe: SocProbeRecord,
     profile_entry: Mapping[str, Any],
@@ -403,6 +407,37 @@ def _validate_profile_against_probe(
                     reason=f"silicon_profile_conflict:fabric_channel_undeclared:{chan_name}",
                 )
             )
+            continue
+        chan_spec = declared_channels[chan_name]
+        if isinstance(chan_spec, Mapping):
+            uni_peak = chan_spec.get("uni_peak_bw_gbps")
+            eff_bw = chan_spec.get("effective_uni_bw_gbps") or uni_peak
+            bi_peak = chan_spec.get("bi_peak_bw_gbps")
+            if uni_peak is None and eff_bw is None:
+                if obs_bw > 0.0:
+                    conflicts.append(
+                        SiliconProfileConflict(
+                            field=f"fabric_channels.{chan_name}",
+                            observed=obs_bw,
+                            declared=0.0,
+                            reason=f"silicon_profile_conflict:fabric_channel_unavailable:{chan_name}",
+                        )
+                    )
+            else:
+                lo_ref = float(eff_bw if eff_bw is not None else uni_peak) * _FABRIC_BW_MIN_RATIO
+                hi_ref = float(max(v for v in (uni_peak, eff_bw, bi_peak) if v is not None)) * _FABRIC_BW_MAX_RATIO
+                if obs_bw <= 0.0 or obs_bw < lo_ref or obs_bw > hi_ref:
+                    conflicts.append(
+                        SiliconProfileConflict(
+                            field=f"fabric_channels.{chan_name}",
+                            observed=obs_bw,
+                            declared=float(uni_peak if uni_peak is not None else eff_bw),
+                            reason=(
+                                f"silicon_profile_conflict:fabric_channel_bw_mismatch:{chan_name}"
+                                f":observed={obs_bw}:declared_peak={uni_peak if uni_peak is not None else eff_bw}"
+                            ),
+                        )
+                    )
     if int(buf_units.get("l2", 0)) != 1:
         conflicts.append(
             SiliconProfileConflict(
@@ -575,8 +610,33 @@ def probe_soc(
     )
 
     all_profiles = read_bounded_json(profiles_path) if profiles_path is not None else ascend_profiles()
+    source_conflicts: list[SiliconProfileConflict] = []
+    ini_soc = str(ini_parsed.get("soc_version") or "").strip()
+    if ini_soc and ini_soc != soc_name:
+        source_conflicts.append(
+            SiliconProfileConflict(
+                field="platform_config_ini.soc_version",
+                observed=ini_soc,
+                declared=soc_name,
+                reason=f"silicon_profile_conflict:ini_soc_mismatch:ini={ini_soc}:probe={soc_name}",
+            )
+        )
+    ini_aic = int(ini_parsed.get("aic_count") or 0)
+    smi_aic = int(smi_parsed.get("aic_count") or 0)
+    if ini_aic > 0 and smi_aic > 0 and ini_aic != smi_aic:
+        source_conflicts.append(
+            SiliconProfileConflict(
+                field="npu_smi.aic_count",
+                observed=smi_aic,
+                declared=ini_aic,
+                reason=f"silicon_profile_conflict:smi_ini_aic_mismatch:smi={smi_aic}:ini={ini_aic}",
+            )
+        )
+    probe_cann_raw = str(raw_probe.get("cann_version") or "").strip()
+    probe_cann = "" if probe_cann_raw.lower() in {"", "unknown", "unmeasured"} else probe_cann_raw
     if soc_name in all_profiles:
-        conflicts, datapath_summary = _validate_profile_against_probe(probe, all_profiles[soc_name])
+        profile_conflicts, datapath_summary = _validate_profile_against_probe(probe, all_profiles[soc_name])
+        conflicts = [*source_conflicts, *profile_conflicts]
         missing_evidence: list[str] = []
         if not ini_parsed["ini_sha256"]:
             missing_evidence.append("platform_config_ini")
@@ -597,6 +657,7 @@ def probe_soc(
             "stage": "probe-soc",
             "mode": "validated_existing",
             "sku": soc_name,
+            "probe_cann_version": probe_cann,
             "ok": ok,
             "status": "ok" if ok else "failed",
             "error": err_code,
@@ -617,13 +678,14 @@ def probe_soc(
             "stage": "probe-soc",
             "mode": "capabilities_incomplete",
             "sku": soc_name,
+            "probe_cann_version": probe_cann,
             "ok": False,
             "status": "failed",
             "error": "silicon_capabilities_incomplete",
             "missing_capabilities": missing_caps,
             "ini_sha256": ini_parsed["ini_sha256"],
             "probe": probe.to_dict(),
-            "conflicts": [],
+            "conflicts": [c.to_dict() for c in source_conflicts],
         }
         assert_sanitized_payload(result, field_name="probe_soc_result")
         return result
@@ -633,7 +695,8 @@ def probe_soc(
         all_profiles,
         base_template_sku=resolved_template_sku,
     )
-    conflicts, datapath_summary = _validate_profile_against_probe(probe, scaffolded)
+    profile_conflicts, datapath_summary = _validate_profile_against_probe(probe, scaffolded)
+    conflicts = [*source_conflicts, *profile_conflicts]
     if scaffold_out is not None:
         write_atomic_json(scaffold_out, {soc_name: scaffolded})
     can_succeed = (allow_scaffold or scaffold_out is not None) and not conflicts
@@ -642,6 +705,7 @@ def probe_soc(
         "stage": "probe-soc",
         "mode": "scaffolded_new" if can_succeed else "profile_missing",
         "sku": soc_name,
+        "probe_cann_version": probe_cann,
         "ok": can_succeed,
         "status": "scaffolded" if can_succeed else "failed",
         "error": "" if can_succeed else ("silicon_profile_conflict" if conflicts else "sku_profile_missing"),

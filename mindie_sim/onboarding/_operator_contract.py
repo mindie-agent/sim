@@ -293,6 +293,23 @@ def _verify_resolved_operator_dual_bound(
             return False, 0, "resolved_operator_plan_missing_callable_program"
         if recipe.pipeline_spec is None and getattr(resolved, "descriptor", None) is None:
             return False, 0, "resolved_operator_missing_pipeline_spec_or_descriptor"
+        from mindie_sim.prediction.program.binding import RecipeContext
+
+        r_ctx = RecipeContext(
+            op=getattr(resolved, "op", None),
+            work=dict(recipe.work.resources),
+            resource_names={str(k): str(k) for k in dict(ctx.geometry.rates)},
+            rates=dict(ctx.geometry.rates),
+            core_count=max(1, int(ctx.geometry.compute_units)),
+            resource_units=dict(ctx.geometry.resource_units),
+            compute_peaks=dict(ctx.geometry.compute_peaks),
+        )
+        try:
+            recipe.lower(r_ctx)
+        except TimeoutError:
+            raise
+        except Exception as exc:
+            return False, 0, f"resolved_operator_program_lower_failed:{type(exc).__name__}:{exc}"
     recipe_work = getattr(recipe, "work", None)
     arch = ctx.geometry.compute_arch
     if recipe_work is not None and hasattr(recipe_work, "matrix"):
@@ -605,10 +622,11 @@ def validate_operator_contract(
             profiler_check["error"] = str(exc)
             violations.append(str(exc))
         else:
-            allowed_abis = set(abis.values())
             sim_impl = str(sim_owner_detail.get("resolved_implementation") or "").strip()
-            if sim_impl:
-                allowed_abis.add(sim_impl)
+            if sim_impl and (sim_impl in abis.values() or sim_impl.startswith("aclnn")):
+                allowed_abis = {sim_impl}
+            else:
+                allowed_abis = set(abis.values()) | ({sim_impl} if sim_impl else set())
             if allowed_abis and b_abi not in allowed_abis:
                 err = f"profiler_abi_mismatch:resolved={b_abi}:declared={sorted(allowed_abis)}"
                 profiler_check["resolved_builder"] = b_name

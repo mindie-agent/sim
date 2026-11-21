@@ -311,8 +311,10 @@ def run_live_l0_bench_subprocess(
     timeout_s: int = DEFAULT_GATE_SUBPROCESS_TIMEOUT_S,
     container: str = "",
     npu_id: int = 0,
+    chip_id: int = 0,
     device_id: int = 0,
     visible_devices: Sequence[int] = (),
+    dies_per_package: int = 1,
 ) -> dict[str, Any]:
     """Execute ``tools/bench_l0_primitives.py`` as a bounded live subprocess bound to granted devices."""
     if not endpoint_alias.strip():
@@ -322,7 +324,11 @@ def run_live_l0_bench_subprocess(
     if not script.is_file():
         raise ModelingError(f"bench_l0_primitives_not_found:{script}")
     granted = [int(d) for d in visible_devices]
-    eff_npu_id = granted[0] if granted else int(npu_id)
+    dies_pkg = max(1, int(dies_per_package))
+    if granted:
+        eff_npu_id, eff_chip_id = divmod(granted[0], dies_pkg)
+    else:
+        eff_npu_id, eff_chip_id = int(npu_id), int(chip_id)
     with tempfile.TemporaryDirectory(prefix="msim-l0-bench-") as tmp_dir:
         tmp = Path(tmp_dir)
         out_table = tmp / "l0_table.json"
@@ -333,6 +339,7 @@ def run_live_l0_bench_subprocess(
             "--campaign-id", campaign_id,
             "--cann-version", cann_version,
             "--npu-id", str(eff_npu_id),
+            "--chip-id", str(eff_chip_id),
             "--device-id", str(int(device_id)),
             "--out", str(out_table),
             "--manifest", str(out_manifest),
@@ -540,6 +547,35 @@ def resolve_profiler_builder_strict(
             sys.modules.update(saved_modules)
 
 
+def _parse_json_or_jsonl_observations(text: str) -> list[dict[str, Any]]:
+    stripped = text.strip()
+    if not stripped:
+        return []
+    try:
+        raw = json.loads(stripped)
+    except ValueError:
+        rows: list[dict[str, Any]] = []
+        for idx, line in enumerate(stripped.splitlines(), start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError as exc:
+                raise ModelingError(f"profiler_bench_invalid_jsonl:line={idx}:{exc}") from exc
+            if not isinstance(rec, Mapping):
+                raise ModelingError(f"profiler_bench_jsonl_record_not_mapping:line={idx}")
+            rows.append(dict(rec))
+        return rows
+    if isinstance(raw, Mapping):
+        rows_raw = raw.get("observations") if raw.get("observations") is not None else raw.get("cases", [])
+    else:
+        rows_raw = raw
+    if not isinstance(rows_raw, list):
+        raise ModelingError("profiler_bench_observations_not_list")
+    return [dict(r) for r in rows_raw if isinstance(r, Mapping)]
+
+
 def run_profiler_bench_subprocess(
     plan_doc: Mapping[str, Any],
     *,
@@ -550,7 +586,7 @@ def run_profiler_bench_subprocess(
     dry_run: bool = False,
     timeout_s: int = DEFAULT_GATE_SUBPROCESS_TIMEOUT_S,
 ) -> list[dict[str, Any]]:
-    """Invoke ``python -m mindie_profiler.bench.bench_sku_microbench`` with real CLI flags."""
+    """Invoke ``python -m mindie_profiler bench sku`` with real CLI flags and parse JSON/JSONL."""
     del plan_doc
     if profiler_root is None:
         raise ModelingError("profiler_bench_requires_profiler_root")
@@ -564,13 +600,21 @@ def run_profiler_bench_subprocess(
     with tempfile.TemporaryDirectory(prefix="msim-prof-bench-") as tmp_dir:
         tmp = Path(tmp_dir)
         out_file = tmp / "bench_receipt.json"
-        obs_file = tmp / "observations.json"
-        cmd = [
-            sys.executable, "-B", "-m", "mindie_profiler.bench.bench_sku_microbench",
+        obs_file = tmp / "observations.jsonl"
+        has_pkg_main = (prof_root / "mindie_profiler" / "__main__.py").is_file()
+        cmd = (
+            [sys.executable, "-B", "-m", "mindie_profiler", "bench", "sku"]
+            if has_pkg_main
+            else [
+                sys.executable, "-B", "-c",
+                "import sys; from mindie_profiler.bench.bench_sku_microbench import main; raise SystemExit(main(sys.argv[1:]))",
+            ]
+        )
+        cmd.extend([
             "--sku", sku,
             "--out", str(out_file),
             "--observations", str(obs_file),
-        ]
+        ])
         if allowed_phy_ids:
             cmd.extend(["--allowed-phy-ids", ",".join(str(int(d)) for d in allowed_phy_ids)])
         if domain is not None:
@@ -601,17 +645,7 @@ def run_profiler_bench_subprocess(
         target_file = obs_file if obs_file.is_file() else out_file
         if not target_file.is_file():
             raise ModelingError("profiler_bench_missing_output_json")
-        try:
-            raw = json.loads(target_file.read_text(encoding="utf-8"))
-        except ValueError as exc:
-            raise ModelingError(f"profiler_bench_invalid_json:{exc}") from exc
-    if isinstance(raw, Mapping):
-        rows = raw.get("observations") if raw.get("observations") is not None else raw.get("cases", [])
-    else:
-        rows = raw
-    if not isinstance(rows, list):
-        raise ModelingError("profiler_bench_observations_not_list")
-    return [dict(r) for r in rows if isinstance(r, Mapping)]
+        return _parse_json_or_jsonl_observations(target_file.read_text(encoding="utf-8"))
 
 
 __all__ = [

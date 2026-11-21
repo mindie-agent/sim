@@ -57,6 +57,7 @@ from .contracts import (
     FORBIDDEN_CALLER_PREDICTION_KEYS,
     NS_PER_MS,
     NS_PER_US,
+    OFF_GRID_CLIFF_HELDOUT_GRID,
     PERCENT_SCALE,
     VALID_CLOCK_OPERATORS,
     GateCheckOutcome,
@@ -73,6 +74,7 @@ STANDARD_LEVEL_BOUNDARY_KINDS: Mapping[str, str] = {
 REQUIRED_MULTILEVEL_LEVELS = ("L1", "L2", "L3")
 _P90_QUANTILE = 0.90
 _ENGINE_RECEIPT_PREFIX = "capture://engine-receipt/"
+_ALLOWED_OK_STATUSES = frozenset({"", "ok", "pass", "passed", "success"})
 
 
 def _norm_digest(token: str) -> str:
@@ -178,11 +180,19 @@ def _resolve_clock_operator(row: Mapping[str, Any], cid: str) -> str:
     return op
 
 
-def _measured_ns_from_row(row: Mapping[str, Any], cid: str, *, clock_op: str) -> int:
+def _measured_ns_from_row(
+    row: Mapping[str, Any],
+    cid: str,
+    *,
+    clock_op: str,
+    parsed_measured_ns: int | None = None,
+) -> int:
     busy_raw = row.get("busy_union_ns")
     elapsed_raw = row.get("elapsed_span_ns")
     expected_from_clock = busy_raw if clock_op == "busy_union" else elapsed_raw
-    if row.get("measured_ns") is not None:
+    if parsed_measured_ns is not None:
+        val = float(parsed_measured_ns)
+    elif row.get("measured_ns") is not None:
         val = float(row["measured_ns"])
     elif row.get("measured_us") is not None:
         val = float(row["measured_us"]) * NS_PER_US
@@ -205,6 +215,22 @@ def _measured_ns_from_row(row: Mapping[str, Any], cid: str, *, clock_op: str) ->
     return measured_int
 
 
+def _validate_event_ids_and_ranks(raw_events: Any, raw_ranks: Any, cid: str) -> tuple[tuple[str, ...], tuple[int, ...]]:
+    if not isinstance(raw_events, Sequence) or isinstance(raw_events, (str, bytes)) or not raw_events:
+        raise ModelingError(f"observation_event_ids_missing:{cid}")
+    cleaned_events = tuple(str(e).strip() for e in raw_events)
+    if any(not e for e in cleaned_events):
+        raise ModelingError(f"observation_event_id_blank:{cid}")
+    if not isinstance(raw_ranks, Sequence) or isinstance(raw_ranks, (str, bytes)) or not raw_ranks:
+        raise ModelingError(f"observation_device_ranks_missing:{cid}")
+    cleaned_ranks: list[int] = []
+    for r in raw_ranks:
+        if isinstance(r, bool) or not isinstance(r, int) or r < 0:
+            raise ModelingError(f"observation_device_rank_invalid:{cid}:{r!r}")
+        cleaned_ranks.append(r)
+    return cleaned_events, tuple(cleaned_ranks)
+
+
 def _validate_row_matches_plan_point(
     row: Mapping[str, Any],
     plan_pt: Mapping[str, Any],
@@ -212,67 +238,91 @@ def _validate_row_matches_plan_point(
     sku: str,
     pid: str,
 ) -> None:
-    row_sku = str(row.get("sku") or "").strip()
+    cohort = row.get("cohort") if isinstance(row.get("cohort"), Mapping) else {}
+    payload = row.get("payload") if isinstance(row.get("payload"), Mapping) else {}
+    row_sku = str(row.get("sku") or cohort.get("sku") or "").strip()
     if row_sku and row_sku != sku:
         raise ModelingError(f"observation_sku_mismatch:{pid}:expected={sku}:got={row_sku}")
-    axis = str(plan_pt.get("axis") or "")
+    axis = str(plan_pt.get("axis") or "").strip()
     expected_val = int(plan_pt["value"])
-    if axis == "context_len":
-        got_ctx = row.get("context_len")
-        if got_ctx is None or int(got_ctx) != expected_val:
+    if axis:
+        got_axis = row.get(axis)
+        if got_axis is None and axis in payload:
+            got_axis = payload.get(axis)
+        if got_axis is None or isinstance(got_axis, bool) or int(got_axis) != expected_val:
             raise ModelingError(
-                f"observation_plan_coordinate_mismatch:{pid}:context_len:expected={expected_val}:got={got_ctx}"
+                f"observation_plan_coordinate_mismatch:{pid}:{axis}:expected={expected_val}:got={got_axis}"
             )
-    elif axis == "tokens":
-        got_tok = row.get("tokens")
-        if got_tok is None or int(got_tok) != expected_val:
-            raise ModelingError(
-                f"observation_plan_coordinate_mismatch:{pid}:tokens:expected={expected_val}:got={got_tok}"
-            )
+        if axis == "context_len":
+            for pkey in ("context_len", "context"):
+                if payload.get(pkey) is not None and int(payload[pkey]) != expected_val:
+                    raise ModelingError(
+                        f"observation_payload_coordinate_mismatch:{pid}:{pkey}:expected={expected_val}:got={payload[pkey]}"
+                    )
     exp_batch = int(plan_pt.get("batch_size", 1))
-    got_batch = row.get("batch_size")
-    if got_batch is None or int(got_batch) != exp_batch:
+    got_batch = row.get("batch_size") if row.get("batch_size") is not None else payload.get("batch_size")
+    if got_batch is None or isinstance(got_batch, bool) or int(got_batch) != exp_batch:
         raise ModelingError(
             f"observation_plan_coordinate_mismatch:{pid}:batch_size:expected={exp_batch}:got={got_batch}"
         )
     exp_q = int(plan_pt.get("query_tokens", 1))
-    got_q = row.get("query_tokens")
-    if got_q is None or int(got_q) != exp_q:
+    got_q = row.get("query_tokens") if row.get("query_tokens") is not None else payload.get("query_tokens")
+    if got_q is None or isinstance(got_q, bool) or int(got_q) != exp_q:
         raise ModelingError(
             f"observation_plan_coordinate_mismatch:{pid}:query_tokens:expected={exp_q}:got={got_q}"
         )
     exp_topo = str(plan_pt.get("parallel_topology") or "tp1")
-    got_topo = str(row.get("parallel_topology") or "").strip()
+    got_topo = str(
+        row.get("parallel_topology") or cohort.get("parallel_topology") or payload.get("parallel_topology") or ""
+    ).strip()
     if got_topo != exp_topo:
         raise ModelingError(
             f"observation_plan_coordinate_mismatch:{pid}:parallel_topology:expected={exp_topo}:got={got_topo}"
         )
     exp_topk = plan_pt.get("topk")
     if exp_topk is not None:
-        got_topk = row.get("topk")
-        if got_topk is None or int(got_topk) != int(exp_topk):
+        got_topk = row.get("topk") if row.get("topk") is not None else payload.get("topk")
+        if got_topk is None or isinstance(got_topk, bool) or int(got_topk) != int(exp_topk):
             raise ModelingError(
                 f"observation_plan_coordinate_mismatch:{pid}:topk:expected={exp_topk}:got={got_topk}"
             )
 
 
-def _row_to_gate_case(row: Mapping[str, Any], *, sku: str, idx: int) -> GateCase:
+def _row_to_gate_case(row: Mapping[str, Any], *, sku: str, idx: int, plan_axis: str = "") -> GateCase:
     cid = str(row.get("case_id") or row.get("point_id") or f"obs-{idx}")
     _check_no_caller_predictions(row, cid)
     check_no_service_regimes(row, path=cid)
+    row_status = str(row.get("status") or "").strip().lower()
+    if row_status not in _ALLOWED_OK_STATUSES:
+        raise ModelingError(f"observation_status_not_ok:{cid}:status={row_status}")
+    if row.get("validated") is False or row.get("qualified") is False:
+        raise ModelingError(f"observation_unvalidated_or_unqualified:{cid}")
     clock_op = _resolve_clock_operator(row, cid)
     if isinstance(row.get("boundary"), Mapping) and isinstance(row.get("cohort"), Mapping):
         raw_copy = dict(row)
         payload = dict(raw_copy.get("payload") or {})
         payload["clock_operator"] = clock_op
-        for extra in ("sim_case", "target_op_id", "target_family", "target_layer", "target_op_ids"):
+        if plan_axis:
+            payload.setdefault("axis", plan_axis)
+        for extra in (
+            "sim_case", "target_op_id", "target_family", "target_layer", "target_op_ids",
+            "context_len", "tokens", "batch_size", "query_tokens", "parallel_topology", "topk",
+        ):
             if row.get(extra) is not None:
+                if extra in payload and payload[extra] != row[extra]:
+                    raise ModelingError(f"observation_payload_coordinate_mismatch:{cid}:{extra}")
                 payload[extra] = row[extra]
         raw_copy["payload"] = payload
         gc = parse_gate_case(raw_copy)
-        _measured_ns_from_row(row, cid, clock_op=clock_op)
+        if gc.cohort.sku != sku:
+            raise ModelingError(f"observation_sku_mismatch:{cid}:expected={sku}:got={gc.cohort.sku}")
+        _validate_event_ids_and_ranks(gc.boundary.event_ids, gc.boundary.device_ranks, cid)
+        _measured_ns_from_row(row, cid, clock_op=clock_op, parsed_measured_ns=gc.measured_ns)
         return gc
 
+    row_sku = str(row.get("sku") or "").strip()
+    if row_sku and row_sku != sku:
+        raise ModelingError(f"observation_sku_mismatch:{cid}:expected={sku}:got={row_sku}")
     level = str(row.get("level") or "L1").strip().upper()
     if level not in STANDARD_LEVEL_BOUNDARY_KINDS:
         raise ModelingError(f"observation_level_invalid:{cid}:{level}")
@@ -280,23 +330,20 @@ def _row_to_gate_case(row: Mapping[str, Any], *, sku: str, idx: int) -> GateCase
     acq = str(row.get("acquisition_uid") or row.get("acquisition_root") or "").strip()
     run_uid = str(row.get("run_uid") or "").strip()
     raw_sha = str(row.get("raw_sha256") or "").strip()
-    raw_events = row.get("event_ids")
-    raw_ranks = row.get("device_ranks")
     if not acq:
         raise ModelingError(f"observation_acquisition_root_missing:{cid}")
     if not run_uid:
         raise ModelingError(f"observation_run_uid_missing:{cid}")
     if not raw_sha:
         raise ModelingError(f"observation_raw_sha256_missing:{cid}")
-    if not isinstance(raw_events, Sequence) or isinstance(raw_events, (str, bytes)) or not raw_events:
-        raise ModelingError(f"observation_event_ids_missing:{cid}")
-    if not isinstance(raw_ranks, Sequence) or isinstance(raw_ranks, (str, bytes)) or not raw_ranks:
-        raise ModelingError(f"observation_device_ranks_missing:{cid}")
+    cleaned_events, cleaned_ranks = _validate_event_ids_and_ranks(row.get("event_ids"), row.get("device_ranks"), cid)
     measured_ns = _measured_ns_from_row(row, cid, clock_op=clock_op)
     payload_dict: dict[str, Any] = {"clock_operator": clock_op, "point_id": str(row.get("point_id") or cid)}
+    if plan_axis:
+        payload_dict["axis"] = plan_axis
     for extra in (
         "sim_case", "phase", "tokens", "context_len", "sequences",
-        "batch_size", "query_tokens", "topk",
+        "batch_size", "query_tokens", "topk", "parallel_topology",
         "target_op_id", "target_family", "target_layer", "target_op_ids",
     ):
         if row.get(extra) is not None:
@@ -306,8 +353,8 @@ def _row_to_gate_case(row: Mapping[str, Any], *, sku: str, idx: int) -> GateCase
         acquisition_uid=acq,
         run_uid=run_uid,
         parent_digests=tuple(str(p) for p in (row.get("parent_digests") or ())),
-        event_ids=tuple(str(e) for e in raw_events),
-        device_ranks=tuple(int(r) for r in raw_ranks),
+        event_ids=cleaned_events,
+        device_ranks=cleaned_ranks,
         clock_domain=str(row.get("clock_domain") or "device_monotonic"),
         start_event=str(row.get("start_event") or "k_start"),
         end_event=str(row.get("end_event") or "k_end"),
@@ -338,7 +385,7 @@ def _row_to_gate_case(row: Mapping[str, Any], *, sku: str, idx: int) -> GateCase
 
 
 class _ClockParityRunner:
-    """Wrapper enforcing identical clock operator and HMAC EngineRunReceipt."""
+    """Wrapper enforcing identical clock operator, value parity, and HMAC EngineRunReceipt."""
 
     def __init__(self, inner: EvaluationRunner, expected_clock: Mapping[str, str]) -> None:
         self._inner = inner
@@ -355,6 +402,14 @@ class _ClockParityRunner:
             raise ModelingError(f"clock_operator_mismatch:{case.case_id}:silicon={sil_op}:engine={eng_op}")
         if interval.run_receipt is None:
             raise ModelingError(f"engine_run_receipt_missing:{case.case_id}")
+        diag_clock_val = diag.get("busy_union_ns") if eng_op == "busy_union" else diag.get("elapsed_span_ns")
+        if diag_clock_val is not None:
+            diag_int = int(round(float(diag_clock_val)))
+            if diag_int != int(interval.predicted_ns):
+                raise ModelingError(
+                    f"engine_clock_operator_value_mismatch:{case.case_id}:op={eng_op}"
+                    f":predicted_ns={interval.predicted_ns}:diag={diag_int}"
+                )
         self.engine_clocks[case.case_id] = {
             "clock_operator": eng_op,
             "busy_union_ns": diag.get("busy_union_ns"),
@@ -388,11 +443,13 @@ def score_sealed_gate_cases(
     sku: str,
     runner: EvaluationRunner | None = None,
     primitive_table: PrimitiveTable | None = None,
+    profile_override: Mapping[str, Any] | None = None,
     threshold_pct: float = DEFAULT_HELDOUT_APE_THRESHOLD_PCT,
     external_train_roots: Sequence[str] = (),
     external_train_digests: Sequence[str] = (),
     external_train_uris: Sequence[str] = (),
     expected_points: Sequence[Mapping[str, Any]] = (),
+    expected_train_points: Sequence[Mapping[str, Any]] = (),
     expected_point_ids: Sequence[str] = (),
     require_disjoint_level_roots: bool = True,
     capture_root: str | Path | None = None,
@@ -403,6 +460,9 @@ def score_sealed_gate_cases(
     cap_threshold = validate_strict_threshold_pct(threshold_pct)
     plan_by_id: dict[str, Mapping[str, Any]] = {
         str(pt["point_id"]): pt for pt in expected_points if isinstance(pt, Mapping) and pt.get("point_id")
+    }
+    train_plan_by_id: dict[str, Mapping[str, Any]] = {
+        str(pt["point_id"]): pt for pt in expected_train_points if isinstance(pt, Mapping) and pt.get("point_id")
     }
     all_expected_ids = sorted(set(expected_point_ids) | set(plan_by_id))
     if not observations:
@@ -436,8 +496,11 @@ def score_sealed_gate_cases(
     expected_clock: dict[str, str] = {}
     case_meta: dict[str, dict[str, Any]] = {}
     seen_point_ids: set[str] = set()
+    seen_heldout_captures: dict[tuple[str, tuple[str, ...], tuple[int, ...], str], str] = {}
     for idx, row in enumerate(scorable_rows):
-        gc = _row_to_gate_case(row, sku=sku, idx=idx)
+        raw_pid = str(row.get("point_id") or row.get("case_id") or f"obs-{idx}").strip()
+        plan_pt = plan_by_id.get(raw_pid) or train_plan_by_id.get(raw_pid)
+        gc = _row_to_gate_case(row, sku=sku, idx=idx, plan_axis=str(plan_pt.get("axis") or "") if plan_pt else "")
         pid = str(row.get("point_id") or gc.case_id).strip()
         if gc.split == "heldout":
             if pid in seen_point_ids:
@@ -447,11 +510,31 @@ def score_sealed_gate_cases(
                 raise ModelingError(f"conflicting_case_and_point_id:{gc.case_id}:{pid}")
             if pid in plan_by_id:
                 _validate_row_matches_plan_point(row, plan_by_id[pid], sku=sku, pid=pid)
+            cap_key = (
+                _norm_digest(gc.boundary.raw_sha256),
+                gc.boundary.event_ids,
+                gc.boundary.device_ranks,
+                gc.boundary.run_uid,
+            )
+            if cap_key in seen_heldout_captures:
+                raise ModelingError(
+                    f"duplicate_heldout_physical_capture:{pid}:collides_with={seen_heldout_captures[cap_key]}"
+                )
+            seen_heldout_captures[cap_key] = pid
+        elif gc.split == "train" and pid in train_plan_by_id:
+            _validate_row_matches_plan_point(row, train_plan_by_id[pid], sku=sku, pid=pid)
+        p99_raw = row.get("measured_p99_ns")
+        if p99_raw is None:
+            p99_raw = row.get("silicon_p99_ns")
+        if p99_raw is None:
+            p99_raw = row.get("p99_ns")
         cases.append(gc)
         expected_clock[gc.case_id] = str(dict(gc.payload).get("clock_operator", DEFAULT_CLOCK_OPERATOR))
         case_meta[gc.case_id] = {
             "point_id": pid, "split": gc.split,
-            "silicon_busy_union_ns": row.get("busy_union_ns"), "silicon_elapsed_span_ns": row.get("elapsed_span_ns"),
+            "silicon_busy_union_ns": row.get("busy_union_ns"),
+            "silicon_elapsed_span_ns": row.get("elapsed_span_ns"),
+            "measured_p99_ns": int(round(float(p99_raw))) if p99_raw is not None and not isinstance(p99_raw, bool) else None,
         }
 
     manifest = Manifest(
@@ -473,7 +556,9 @@ def score_sealed_gate_cases(
         require_capture_files=require_capture_files,
     )
     active_runner = (
-        runner if runner is not None else WhiteboxSpineRunner(primitive_table=primitive_table)
+        runner
+        if runner is not None
+        else WhiteboxSpineRunner(primitive_table=primitive_table, profile_override=profile_override)
     )
     checked_runner = _ClockParityRunner(active_runner, expected_clock)
     raw_residuals = list(
@@ -498,6 +583,7 @@ def score_sealed_gate_cases(
             "clock_operator": clk.get("clock_operator", expected_clock[res.case_id]),
             "silicon_busy_union_ns": meta["silicon_busy_union_ns"],
             "silicon_elapsed_span_ns": meta["silicon_elapsed_span_ns"],
+            "measured_p99_ns": meta["measured_p99_ns"],
             "engine_busy_union_ns": clk.get("busy_union_ns"),
             "engine_elapsed_span_ns": clk.get("elapsed_span_ns"),
         })
@@ -543,7 +629,15 @@ def run_multilevel_verdict(
     """Evaluate strict pointwise multilevel L1/L2/L3 gate verdict."""
     cap_threshold = validate_strict_threshold_pct(threshold_pct)
     if multilevel_manifest_json is not None:
+        if validation_doc is not None and (
+            not verify_stage_report("sku_validation", validation_doc)
+            or not validation_doc.get("ok")
+        ):
+            return GateCheckOutcome("multilevel_gate", False, "fail", "conflicting_failed_or_unverified_validation_report"), []
         manifest = stream_manifest(multilevel_manifest_json)
+        wrong_skus = sorted({c.cohort.sku for c in manifest.cases if c.split == "heldout" and c.cohort.sku != sku})
+        if wrong_skus:
+            return GateCheckOutcome("multilevel_gate", False, "fail", f"multilevel_manifest_sku_mismatch:expected={sku}:got={','.join(wrong_skus)}"), []
         if fits_json is not None:
             raw_fits = read_bounded_json(fits_json)
             params = tuple(
@@ -558,18 +652,25 @@ def run_multilevel_verdict(
             c.case_id: str(dict(c.payload).get("clock_operator") or DEFAULT_CLOCK_OPERATOR)
             for c in manifest.cases
         }
+        heldout_ctxs = {
+            int(dict(c.payload).get("context_len"))
+            for c in manifest.cases
+            if c.split == "heldout" and dict(c.payload).get("context_len") is not None
+        }
+        missing_cliffs = [ctx for ctx in OFF_GRID_CLIFF_HELDOUT_GRID if ctx not in heldout_ctxs]
         active_runner = runner if runner is not None else WhiteboxSpineRunner(primitive_table=primitive_table)
         checked_runner = _ClockParityRunner(active_runner, expected_clock)
         residuals = list(evaluate_multilevel(manifest, fits, checked_runner, target_split="heldout"))
         summaries = summarize_cohorts(residuals, threshold_pct=cap_threshold)
         verdict = gate_decision(summaries, required_levels=REQUIRED_MULTILEVEL_LEVELS, require_disjoint_level_roots=True)
         pw_fail = sorted(r.case_id for r in residuals if r.status == "ok" and r.absolute_percentage_error * PERCENT_SCALE >= cap_threshold)
-        passed = verdict["status"] == "pass" and not pw_fail
+        passed = verdict["status"] == "pass" and not pw_fail and not missing_cliffs
+        eff_st = "pass" if passed else ("fail" if pw_fail else ("insufficient_evidence" if missing_cliffs else verdict["status"]))
         return (
             GateCheckOutcome(
-                name="multilevel_gate", passed=passed, status="pass" if passed else ("fail" if pw_fail else verdict["status"]),
-                detail=f"status={verdict['status']};levels={verdict['covered_levels']};missing={verdict['missing_levels']};pointwise_failures={len(pw_fail)}",
-                metrics=(("covered_levels", verdict["covered_levels"]), ("missing_levels", verdict["missing_levels"]), ("overlapping_level_roots", verdict["overlapping_level_roots"]), ("failed_cohorts", verdict["failed_cohorts"]), ("pointwise_failures", pw_fail), ("threshold_pct", cap_threshold)),
+                name="multilevel_gate", passed=passed, status=eff_st,
+                detail=f"status={eff_st};levels={verdict['covered_levels']};missing={verdict['missing_levels']};missing_cliffs={len(missing_cliffs)};pointwise_failures={len(pw_fail)}",
+                metrics=(("covered_levels", verdict["covered_levels"]), ("missing_levels", verdict["missing_levels"]), ("missing_cliffs", missing_cliffs), ("overlapping_level_roots", verdict["overlapping_level_roots"]), ("failed_cohorts", verdict["failed_cohorts"]), ("pointwise_failures", pw_fail), ("threshold_pct", cap_threshold)),
             ),
             [r.to_dict() for r in residuals],
         )
