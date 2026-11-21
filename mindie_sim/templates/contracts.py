@@ -8,13 +8,14 @@
 from __future__ import annotations
 
 import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from fractions import Fraction
 from graphlib import CycleError, TopologicalSorter
 from math import isfinite
 from typing import Iterable, Literal
 
 from mindie_sim.prediction.program.stages import KernelProgram
+from mindie_sim.prediction.runtime.memory_physics import _merge_byte_intervals, _subtract_byte_intervals
 from mindie_sim.prediction.runtime.tile_solver import AlgorithmKind, TileSolution
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import SourceRef
@@ -23,6 +24,8 @@ COMMIT_HEX_LENGTH = 40
 SHA256_HEX_LENGTH = 64
 LEGACY_MATRIX_ARCH_IDS = frozenset({"npu_arch_2201", "arch22"})
 DIRECT_MATRIX_ARCH_IDS = frozenset({"npu_arch_3510", "arch35"})
+FULL_LOAD_A_MAX_K = 2048
+FP16_ELEMENTS_PER_BLOCK = 16
 
 EvgKind = Literal[
     "acc_load", "aux_load", "row_broadcast", "col_broadcast", "exp", "relu",
@@ -368,9 +371,25 @@ class SemanticWorkItem:
             raise ModelingError(f"template_semantic_work_invalid:{self.work_id}")
 
 
+def _indexed_fp16(problem) -> bool:
+    return (not problem.has_bias and not problem.groups
+            and {dtype.lower() for dtype in (problem.dtype_a, problem.dtype_b, problem.dtype_c)} <= {"fp16", "float16"}
+            and problem.dtype_acc.lower() in {"fp32", "float32"})
+
+
+def full_load_a_eligible(problem, datapath) -> bool:
+    return (datapath.arch_id in DIRECT_MATRIX_ARCH_IDS and datapath.has_l0c_to_ub and datapath.aiv_count > 0
+            and _indexed_fp16(problem)
+            and problem.k <= FULL_LOAD_A_MAX_K and problem.k % FP16_ELEMENTS_PER_BLOCK == 0)
+
+
 def eligible_matrix_engines(problem, datapath) -> tuple[str, ...]:
     if problem.indices is not None or problem.physical_m is not None:
-        return ("aiv_simt",)
+        engines = ("cube",) if full_load_a_eligible(problem, datapath) else ()
+        if (datapath.arch_id in DIRECT_MATRIX_ARCH_IDS and datapath.simt_ub_carveout_bytes > 0
+                and _indexed_fp16(problem)):
+            engines += ("aiv_simt",)
+        return engines
     fp16 = {"fp16", "float16"}
     if (datapath.arch_id in DIRECT_MATRIX_ARCH_IDS and datapath.simt_ub_carveout_bytes > 0
             and not problem.has_bias and not problem.groups
@@ -401,6 +420,20 @@ class FusedRegionSummary:
     spec: CatlassKernelSpec | DslKernelSpec | FuseRegionSpec | None
     # A live program publishes the latest completed invocation's delivery.
     realized_hbm_bytes: float | None = field(default=None, compare=False)
+    realized_l2_miss_bytes: int = field(default=0, compare=False)
+
+    @property
+    def l2_hit_bytes(self) -> int:
+        return self.realized_l2_hit_bytes
+
+    @property
+    def l2_miss_bytes(self) -> int:
+        return self.realized_l2_miss_bytes
+
+    def _record_delivery(self, delivered):
+        for name in ("logical_transfer_bytes", "issued_copy_bytes", "dram_sector_bytes", "turnaround_service_bytes",
+                     "realized_l2_hit_bytes", "realized_l2_miss_bytes", "realized_hbm_bytes"):
+            object.__setattr__(self, name, delivered[name])
 
 
 @dataclass(frozen=True, slots=True)
@@ -408,8 +441,14 @@ class TemplateLoweringResult:
     program: KernelProgram
     summary: FusedRegionSummary
     stages_count: int
-    l2_hit_bytes: int
-    dram_miss_bytes: int
+
+    @property
+    def l2_hit_bytes(self) -> int:
+        return self.summary.l2_hit_bytes
+
+    @property
+    def dram_miss_bytes(self) -> int:
+        return self.summary.l2_miss_bytes
 
 
 def _union_obligations(
@@ -455,17 +494,27 @@ def compose_step_obligations(
     summaries: Iterable[FusedRegionSummary],
 ) -> tuple[tuple[TensorRangeObligation, ...], tuple[TensorRangeObligation, ...]]:
     """Return canonical compulsory step reads and live-out writes, respectively."""
-    summaries = tuple(summaries)
-    return (
-        _union_obligations(
-            entry for summary in summaries for entry in summary.read_obligations
-            if entry.initial_residency == "hbm_cold"
-        ),
-        _union_obligations(
-            entry for summary in summaries for entry in summary.write_obligations
-            if entry.required_final_visibility in {"device", "host"}
-        ),
-    )
+    produced, reads, writes = {}, [], []
+    for summary in summaries:
+        reads.extend(entry for entry in _external_reads(summary.read_obligations, produced)
+                     if entry.initial_residency == "hbm_cold")
+        _record_produced(produced, summary.write_obligations)
+        writes.extend(entry for entry in summary.write_obligations if entry.required_final_visibility in {"device", "host"})
+    return _union_obligations(reads), _union_obligations(writes)
+
+
+def _external_reads(reads, produced):
+    for entry in reads:
+        key = entry.die, entry.allocation_id, entry.tensor_version
+        ranges = _subtract_byte_intervals(entry.ranges, produced.get(key, ()))
+        if ranges:
+            yield replace(entry, ranges=ranges)
+
+
+def _record_produced(produced, writes):
+    for entry in writes:
+        key = entry.die, entry.allocation_id, entry.tensor_version
+        produced[key] = _merge_byte_intervals((*produced.get(key, ()), *entry.ranges))
 
 
 def _topological(parents, message):

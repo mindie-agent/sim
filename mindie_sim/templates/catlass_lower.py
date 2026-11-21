@@ -21,6 +21,7 @@ from mindie_sim.prediction.runtime.tile_solver import (
 from mindie_sim.schema.common import ModelingError
 
 from .catlass_catalog import (
+    GATHER_SCATTER_AIV_MAX_K, GATHER_SCATTER_FULL_LOAD_A, GATHER_SCATTER_POLICIES, GATHER_SCATTER_SIMT_UB_BYTES,
     MX_SCALE_GROUP, STREAMK_PARTIAL_SLOTS_PER_CORE, _workspace_bytes, dtype_name, grouped_start_cores,
     matrix_problem, mx_scale_bytes, packed_bytes, should_elide_l1_reload,
     streamk_partition, swizzle_block_coord, validate_catlass_spec,
@@ -31,6 +32,7 @@ from .fuse_region import Lowering, ring_credit, solve_template_tile
 _NOMINAL_BUFFER_ALIGNMENT = 32
 A8W4_PROLOGUE_SUBBLOCK_ALIGNMENT = 32
 A8W4_PROLOGUE_UB_SLOT_BYTES = 2 * 32 * 1024
+GATHER_SCATTER_FULL_LOAD_UB_BYTES = 216 * 1024
 _SFU_NODES = {"exp": 1, "sqrt": 1, "rsqrt_fast": 1, "silu": 1}
 _ALU_NODES = {"relu": 1, "leaky_relu": 2, "silu": 2, "cast": 1, "mul": 1, "muls": 1, "add": 1}
 
@@ -130,8 +132,17 @@ def solve_catlass_tile(spec, problem, datapath, *, memory_view=None, die=0):
         buffers += (LiveBufferSpec("gate_up", "ub", peak, 0, 1, owner_kind="aiv", slots=2),)
     if simt:
         threads = prod(spec.simt_thread_block_dim)
-        ub_bytes = packed_bytes(threads, spec.dtype_acc)
-        buffers += (LiveBufferSpec("simt_accumulator", "ub", ub_bytes, 0, 1, owner_kind="aiv"),)
+        pinned = spec.dispatch_policy == "MatmulGatherScatterSimt"
+        ub_bytes = GATHER_SCATTER_SIMT_UB_BYTES if pinned else packed_bytes(threads, spec.dtype_acc)
+        buffers += (LiveBufferSpec("simt_kernel_ub", "ub", ub_bytes, 0, 1, owner_kind="aiv"),)
+    if spec.dispatch_policy == GATHER_SCATTER_FULL_LOAD_A:
+        buffers += (LiveBufferSpec("full_load_gather_scatter", "ub", GATHER_SCATTER_FULL_LOAD_UB_BYTES,
+                                   0, 1, owner_kind="aiv"),)
+        for core in range(min(spec.aic_budget, g_m * g_n)):
+            lane = _paired_aiv(spec, datapath, core)
+            datapath.route("l0c", "ub", spec.dtype_acc, (core, lane), (tm, tn))
+            if p.k <= GATHER_SCATTER_AIV_MAX_K:
+                datapath.route("ub", "l1", spec.dtype_a, (lane, core))
     if spec.epilogue_kind in {"evg_ub", "grouped_swiglu_mx_quant"}:
         owners = min(spec.aic_budget, g_m * (g_n // 2 if spec.epilogue_kind == "grouped_swiglu_mx_quant" else g_n))
         for aic in range(owners):
@@ -226,6 +237,19 @@ class _MatrixLowerer:
         if elide:
             return deps
         self.resident[*lane, slot] = location
+        if a and s.dispatch_policy == GATHER_SCATTER_FULL_LOAD_A:
+            vector = self._aiv(tile, direct=True)
+            indices = self._index_read(f"{name}:gather", tile, deps, vector)
+            aiv_gather = p.k <= GATHER_SCATTER_AIV_MAX_K
+            stride = packed_bytes(k_len, dtype)
+            read = self.plan.access(
+                f"{name}:gm_a", tensor, tile.m * stride, after=(indices,),
+                owner=vector if aiv_gather else core, pipe="mte2_aiv" if aiv_gather else "mte2_aic",
+                runs=tuple(AddressRun(i * stride, 1, stride, stride) for i in self._physical_rows(tile)),
+            )
+            if aiv_gather:
+                read = self.plan.work(f"{name}:gather_to_l1", "mte3", tile.m * stride, after=(read,), owner=vector)
+            return (read,)
         if not a and s.prologue_b == "DecompressFp4ToFp8":
             deps = self._expand_b(name, tile, row, rows, allocation, deps, cache_bypass)
         else:
@@ -380,6 +404,13 @@ class _MatrixLowerer:
     def finish(self, tile, name, ready):
         s, p, plan = self.spec, self.p, self.plan
         epilogue = s.epilogue_kind
+        if s.dispatch_policy == GATHER_SCATTER_FULL_LOAD_A:
+            aiv = self._aiv(tile, direct=True)
+            local = plan.work(name + ":fixpipe_ub", "fixpipe", packed_bytes(tile.m * tile.n, s.dtype_acc),
+                              after=(ready,), owner=tile.owner)
+            self._consume(name, local)
+            return self._write_output(name + ":scatter", tile, (local,), pipe="mte3", owner=aiv,
+                                      physical_rows=self._physical_rows(tile))
         if epilogue == "none":
             after = (ready,)
             if s.dispatch_policy == "MmadPingpongMutex" and tile.owner in self.fixpipe_tail:
@@ -488,12 +519,8 @@ class _MatrixLowerer:
         indexed = s.dispatch_policy == "MatmulGatherScatterSimt"
         physical_rows = None
         if indexed:
-            index_bytes = packed_bytes(1, "int32")
-            index = plan.access(name + ":indices", p.indices_id, tile.m * index_bytes, owner=owner,
-                                after=after, offset=tile.row * index_bytes,
-                                obligation=p.indices is not None or p.physical_m is not None)
-            physical_rows = (p.indices[tile.row:tile.row + tile.m] if p.indices is not None
-                             else range(tile.row, tile.row + tile.m))
+            index = self._index_read(name, tile, after, owner)
+            physical_rows = self._physical_rows(tile)
             stride = packed_bytes(p.k, s.dtype_a)
             a = plan.access(name + ":gather", p.a_id, tile.m * stride, owner=owner, after=(index,),
                             runs=tuple(AddressRun(row * stride, 1, stride, stride) for row in physical_rows))
@@ -506,6 +533,17 @@ class _MatrixLowerer:
                          owner=owner, after=(a, b), metadata={"thread_block_dim": s.simt_thread_block_dim})
         return self._write_output(name + ":scatter", tile, (simt,), pipe="mte3", owner=owner,
                                   physical_rows=physical_rows)
+
+    def _physical_rows(self, tile):
+        indices = self.p.indices
+        return range(tile.row, tile.row + tile.m) if indices is None else indices[tile.row:tile.row + tile.m]
+
+    def _index_read(self, name, tile, after, owner):
+        p = self.p
+        index_bytes = packed_bytes(1, "int32")
+        return self.plan.access(name + ":indices", p.indices_id, tile.m * index_bytes, owner=owner,
+                                after=after, offset=tile.row * index_bytes,
+                                obligation=p.indices is not None or p.physical_m is not None)
 
     def zero_destination(self, launch):
         p, s, plan = self.p, self.spec, self.plan
@@ -631,7 +669,7 @@ def lower_catlass_spec(
     plan = Lowering(datapath, context=context, memory_view=memory_view, die=die, live_admission=live_admission)
     lowerer = _MatrixLowerer(plan, spec, p)
     launch = plan.launch()
-    if spec.dispatch_policy == "MatmulGatherScatterSimt":
+    if spec.dispatch_policy in GATHER_SCATTER_POLICIES:
         launch = lowerer.zero_destination(launch)
     blocks = ceil_div(p.m, lowerer.tm) * ceil_div(p.n, lowerer.tn)
     if spec.scheduler == "grouped_slice_m":

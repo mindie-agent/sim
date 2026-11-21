@@ -21,7 +21,7 @@ from mindie_sim.prediction.program.stages import KernelProgram, Stage
 from mindie_sim.prediction.runtime.memory_physics import (
     AddressRun, AddressRunPlan, AdmissionMemoryView, BoundAccess, BurstTurnRule, HbmBusSpec,
     MemoryAccessPattern, ReuseKey, VisibilityContract, bind_memory_access,
-    _merge_byte_intervals, _subtract_byte_intervals,
+    _intersect_byte_intervals, _merge_byte_intervals, _subtract_byte_intervals,
 )
 from mindie_sim.prediction.runtime.ring_buffer import RingBuffer, lower_generation
 from mindie_sim.prediction.runtime.tile_solver import (
@@ -33,7 +33,8 @@ from mindie_sim.schema.hardware import NATIVE_WORK_UNITS
 
 from .contracts import (
     EdgeRouteBinding, FuseRegionSpec, FusedRegionSummary, SemanticWorkItem,
-    TemplateLoweringResult, TensorRangeObligation, _region_order, _topological, _union_obligations, ceil_div,
+    TemplateLoweringResult, TensorRangeObligation, _external_reads, _record_produced,
+    _region_order, _topological, _union_obligations, ceil_div,
 )
 
 _VECTOR_PIPES = {"vector", "vec_alu", "vec_sfu", "vec_reduce", "aiv_simt", "sort_topk"}
@@ -129,8 +130,7 @@ class _BoundTemplateProgram(KernelProgram):
         def finalize(_event):
             if reservation is not None:
                 state.release_reservation(die, key)
-            total = delivered[bus.ctr_r] + delivered[bus.ctr_w]
-            object.__setattr__(self.summary, "realized_hbm_bytes", total)
+            self.summary._record_delivery(delivered)
 
         engine.on_complete(done, finalize)
         return done
@@ -148,16 +148,16 @@ class _LiveAccess:
 
         def admit(event):
             bus, hit, miss, l2, copy_row, l2_row, rules, nominal = self.bound.bind_config
+            plan = self.pattern.runs
+            resident = self.state.resident_intervals_for(self.pattern, plan.aligned_copy_bytes())
             bound = bind_memory_access(
                 self.pattern, self.state, hbm_bus=bus, copy_hit_bytes_per_ms=hit, copy_miss_bytes_per_ms=miss,
                 l2_bytes_per_ms=l2, pipe_row_id=copy_row, l2_row_id=l2_row, burst_rules=rules,
                 nominal_pipe_bytes_per_ms=nominal, commit=True,
             )
             access = engine.submit_bound_access(name, bound, after=(event,), owner=owner)
-            deliveries = [(term.counter_id, term.work_per_progress) for term in bound.deliveries]
             dirty = sum(item.bytes for item in self.state.drain_writebacks(bus.die))
             if dirty:
-                deliveries.append((bus.ctr_w, dirty))
                 work = {term.row_id: term.ms_per_progress for term in bus.terms_for("write", dirty)
                         if term.ms_per_progress}
                 access = engine.submit(name + ":dirty_writeback", work, after=(access,), owner=owner,
@@ -165,8 +165,19 @@ class _LiveAccess:
 
             def record(_event):
                 if self.delivered is not None:
-                    for counter, amount in deliveries:
-                        self.delivered[counter] += amount
+                    ledger = bound.ledger
+                    self.delivered.update({
+                        "logical_transfer_bytes": ledger.logical_tensor_bytes,
+                        "issued_copy_bytes": ledger.aligned_transfer_bytes,
+                        "dram_sector_bytes": ledger.dram_sector_bytes + dirty,
+                        "turnaround_service_bytes": dirty + (
+                            _rational_service(plan, resident if ledger.l2_hit_bytes else (), rules)
+                            if ledger.dram_sector_bytes else 0
+                        ),
+                        "realized_l2_hit_bytes": ledger.l2_hit_bytes,
+                        "realized_l2_miss_bytes": ledger.dram_miss_copy_bytes,
+                        "realized_hbm_bytes": ledger.dram_bus_transaction_bytes + dirty,
+                    })
                 engine.resolve(done)
 
             engine.on_complete(access, record)
@@ -331,12 +342,16 @@ class Lowering:
         )
         self.accesses[name] = pattern
         if not private and obligation:
-            ranges = plan.sector_intervals()
+            ranges = _exact_sector_intervals(plan)
             if ranges:
                 entry = TensorRangeObligation(
                     self.die, tensor, version, ranges, "hbm_cold", visibility.scope,
                 )
-                (self.reads if direction == "read" else self.writes).append(entry)
+                if direction == "read":
+                    resident = self.state.resident_intervals_for(pattern, plan.aligned_copy_bytes())
+                    self.reads.extend(_split_entry_residency(entry, resident))
+                else:
+                    self.writes.append(entry)
         return self.add(Stage(name, after=after))
 
     def _bind_access(self, placeholder, pattern):
@@ -379,14 +394,38 @@ class Lowering:
             tuple(sorted(self.vector.items())), _union_obligations(self.reads), _union_obligations(self.writes),
             self.logical, self.copied, self.sectors, self.service, self.hits, tuple(comm), launches,
             self.metadata_ms, tuple((peak.pool, peak.peak_bytes) for peak in solution.pool_peaks), spec,
-            None if self.live_state is not None else float(self.service),
+            None if self.live_state is not None else float(self.service), self.misses,
         )
         program = (
             _BoundTemplateProgram(stages, hbm_bus=self.hbm_bus, live_state=self.live_state,
                                   l2_reservation=self.l2_reservation, summary=summary)
             if self.hbm_bus is not None else KernelProgram(stages)
         )
-        return TemplateLoweringResult(program, summary, len(stages), self.hits, self.misses)
+        return TemplateLoweringResult(program, summary, len(stages))
+
+
+def _exact_sector_intervals(plan):
+    sector = plan.sector_bytes
+    ranges = []
+    for run in plan.runs:
+        if not run.rows or not run.row_bytes:
+            continue
+        base, stride, width = run.base_byte, run.stride_bytes, run.row_bytes
+        if stride < width + sector:
+            ranges.append((base // sector * sector, ceil_div(base + (run.rows - 1) * stride + width, sector) * sector))
+        else:
+            ranges.extend((row // sector * sector, ceil_div(row + width, sector) * sector)
+                          for row in range(base, base + run.rows * stride, stride))
+    return _merge_byte_intervals(ranges)
+
+
+def _split_entry_residency(entry, resident):
+    cold = _subtract_byte_intervals(entry.ranges, resident)
+    warm = _intersect_byte_intervals(entry.ranges, resident)
+    if cold:
+        yield replace(entry, ranges=cold)
+    if warm:
+        yield replace(entry, ranges=warm, initial_residency="l2_warm")
 
 
 def _rational_service(plan, resident, rules):
@@ -556,7 +595,11 @@ def compile_fuse_region(
     writes = dict(writes_by_op) if writes_by_op is not None else {order[-1]: live_out_obligations}
     if not (reads.keys() | writes.keys()) <= set(order):
         raise ModelingError("fuse_region_memory_op_outside")
-    read_ranges = _union_obligations((*live_in_obligations, *(entry for rows in reads.values() for entry in rows)))
+    produced, external = {}, list(live_in_obligations)
+    for op in order:
+        external.extend(_external_reads(reads.get(op, ()), produced))
+        _record_produced(produced, writes.get(op, ()))
+    read_ranges = _union_obligations(external)
     write_ranges = _union_obligations((*live_out_obligations, *(entry for rows in writes.values() for entry in rows)))
     spec = FuseRegionSpec(region_id, order, read_ranges, write_ranges, edges, reduction_class, solution, backend)
     plan = Lowering(datapath, context=context, memory_view=memory_view, die=die, live_admission=live_admission)

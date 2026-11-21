@@ -24,7 +24,7 @@ from .dsl_catalog import (
     QSLI_PACKED_D, QSLI_SCALE_ROW_BYTES, QSLI_STAGING_DEPTH, QSLI_TILE_M, QSLI_TILE_N,
     QSLI_TRUNK, QkvQuantMode, commit_rows, describe_dsl_kernel,
     dsl_problem, flash_kda_lane_tasks, mega_workspace_sizes,
-    mla_workspaces, qsli_workspace_sizes, replay_pool_capacity,
+    mla_workspaces, qsli_workspace_sizes, replay_pool_capacity, replay_pool_strides,
 )
 from .fuse_region import Lowering, ring_credit
 
@@ -33,6 +33,7 @@ KDA_INPUT_VECTORS = 4
 KDA_STATE_UPDATE_OPS = 3
 KDA_RECURRENT_STATE_OPS = 7
 KDA_CONV_TAPS = 3
+MLA_CACHE_INDEX_BYTES = 8
 ATTN_RES_MERGE_OPS = 5
 ATTN_RES_NORM_OPS = 4
 ATTN_RES_SCORE_OPS = 5
@@ -52,13 +53,13 @@ class _DslLowering:
         return self.plan.add(Stage(name, after=tuple(after), metadata=metadata))
 
     def access(self, name, tensor, amount, *, after=(), owner=0, write=False, private=False,
-               cube=False, offset=0, working_set=None, bypass=False, version=None, runs=None):
+               cube=False, offset=0, working_set=None, bypass=False, version=None, runs=None, obligation=True):
         pipe = ("fixpipe" if cube else "mte3") if write else ("mte2_aic" if cube else "mte2_aiv")
         allocation = f"{self.region_id}:{tensor}" if private else tensor
         return self.plan.access(
             name, allocation, amount, pipe=pipe, after=after, owner=owner, offset=offset,
             direction="write" if write else "read", private=private, working_set=working_set,
-            bypass=bypass, version=version, runs=runs,
+            bypass=bypass, version=version, runs=runs, obligation=obligation,
         )
 
     def spill(self, name, tensor, size, after, *, owner=0, src_owner=None, dst_owner=None,
@@ -142,10 +143,12 @@ def _lower_flash(lower, p, ready):
     staged = spec.template_variant == "staged"
     buffers, lane_last, lane_generation, prior_chunk = {}, {}, Counter(), {}
     previous_round = (ready,)
-    token_base = [0]
+    token_base, chunk_base = [0], [0]
     for length in p.lengths:
         token_base.append(token_base[-1] + length)
+        chunk_base.append(chunk_base[-1] + ceil_div(length, KDA_CHUNK))
     for round_tasks in flash_kda_lane_tasks(p, spec):
+        scheduled = {(batch, head, chunk) for batch, head, chunk, _, _ in round_tasks} if staged else set()
         for batch, head, chunk, core, slot in round_tasks:
             vector = lower.paired(core)[0]
             name = f"kda:{batch}:{head}:{chunk}"
@@ -157,6 +160,9 @@ def _lower_flash(lower, p, ready):
             lane_generation[core] += 1
             seq = (batch, head)
             state_offset = (batch * p.value_heads + head) * state_bytes
+            h_offset = (chunk_base[batch] + chunk) * state_bytes
+            h_tensor = f"kda:h:{head}"
+            private_h = not p.save_chunk_states
             tail = min(KDA_CHUNK, p.lengths[batch] - chunk * KDA_CHUNK)
             row = token_base[batch] + chunk * KDA_CHUNK
             deps = tuple(dict.fromkeys((*previous_round, lane_last.get(core, ready))))
@@ -193,9 +199,14 @@ def _lower_flash(lower, p, ready):
                         after=(wy,), offset=row * d * element, owner=vector, write=True, bypass=True,
                     ))
             entry = prior_chunk.get(seq, ready)
+            continued = staged and chunk > 0 and (*seq, chunk - 1) not in scheduled
             if chunk == 0 and p.has_initial_state:
                 entry = lower.access(name + ":initial_state", "kda:initial_state", state_bytes,
                                      owner=vector, after=deps, offset=state_offset)
+            elif continued:
+                entry = lower.access(name + ":reload_h", h_tensor, state_bytes, owner=vector, after=deps,
+                                     offset=h_offset, version=int(not private_h), private=private_h,
+                                     bypass=True, obligation=False)
             if staged:
                 q_size = tail * d * BF16_BYTES
                 gamma_size = d * FP32_BYTES
@@ -210,7 +221,7 @@ def _lower_flash(lower, p, ready):
                 if p.save_matrices:
                     aqk = lower.access(
                         name + ":Aqk:read", f"kda:Aqk:{head}", matrix_bytes, after=(saved[1],),
-                        owner=core, cube=True, offset=matrix_offset, version=1,
+                        owner=core, cube=True, offset=matrix_offset, version=1, obligation=False,
                     )
                 else:
                     aqk = lower.spill(name + ":Aqk", f"Aqk:{head}", matrix_bytes, (wy,), owner=core,
@@ -225,10 +236,10 @@ def _lower_flash(lower, p, ready):
             delta = lower.cube(name + ":delta", 2 * tail * d * d, (inter,), core)
             delta_ub = lower.local(name + ":delta_to_ub", "fixpipe", state_bytes, (delta,), core)
             update_deps = (delta_ub,)
-            if p.save_chunk_states:
-                h_offset = (sum(ceil_div(length, KDA_CHUNK) for length in p.lengths[:batch]) + chunk) * state_bytes
-                update_deps += (lower.access(name + ":save_h", f"kda:h:{head}", state_bytes,
-                                             after=(state,), owner=vector, offset=h_offset, write=True, bypass=True),)
+            if (staged or p.save_chunk_states) and not continued:
+                update_deps += (lower.access(name + ":save_h", h_tensor, state_bytes,
+                                             after=(state,), owner=vector, offset=h_offset, write=True, bypass=True,
+                                             private=private_h),)
             update = lower.vector(name + ":fp32_state_update", d * d * 2, update_deps, vector)
             intra = lower.cube(name + ":intra", 2 * tail * tail * d, (inter,), core)
             output = lower.access(name + ":output", f"kda:head:{head}:output", tail * d * BF16_BYTES,
@@ -238,9 +249,9 @@ def _lower_flash(lower, p, ready):
             if final and p.return_final_state:
                 epilogue += (lower.access(name + ":final_state", "kda:final_state", state_bytes,
                                           after=(update,), owner=vector, offset=state_offset, write=True),)
-            elif staged and not final:
-                update = lower.spill(name + ":stage_state", "staged_state", state_bytes, (update,),
-                                     owner=vector, offset=state_offset, working_set=state_bytes * p.value_heads)
+            elif staged and not final and (*seq, chunk + 1) not in scheduled:
+                update = lower.access(name + ":carry_h", h_tensor, state_bytes, after=(update,), owner=vector,
+                                      offset=h_offset + state_bytes, private=private_h, write=True, bypass=True)
                 epilogue += (update,)
             prior_chunk[seq] = update
             lane_last[core] = lower.stage(name + ":done", epilogue)
@@ -256,6 +267,7 @@ def _lower_mega(lower, p, ready):
     d, batch = KDA_HEAD_DIM, p.batch * p.tp
     workspaces = mega_workspace_sizes(p)
     capacity = replay_pool_capacity(p.replay_capacity, p.sequence)
+    u_stride, k_stride, decay_stride, checkpoint_stride = replay_pool_strides(p, h, capacity)
     if not p.unfused_launches or len(set(p.unfused_launches)) != len(p.unfused_launches):
         raise ModelingError("mega_kda_unfused_launch_baseline_invalid")
     ready = lower.stage("mega:unfused_baseline", (ready,), saved_launches=len(p.unfused_launches) - 1)
@@ -307,15 +319,15 @@ def _lower_mega(lower, p, ready):
         indices = lower.access(name + ":state_index", "state_indices", INT32_BYTES,
                                owner=vector, after=prior, offset=tile * INT32_BYTES)
         state = lower.access(name + ":state_read", "checkpoint", state_size,
-                             owner=vector, after=(indices,), offset=slot * state_size)
+                             owner=vector, after=(indices,), offset=slot * checkpoint_stride * FP32_BYTES)
         rec = lower.vector(name + ":recurrent", p.sequence * h * (d * d * KDA_RECURRENT_STATE_OPS + 2 * d),
                            (state, *(dep for tensor, dep in projected.items() if tensor != "output_gate")), vector)
         records = []
-        for tensor, element in _REPLAY_DTYPES:
+        for (tensor, element), pool_stride in zip(_REPLAY_DTYPES, (u_stride, k_stride, decay_stride), strict=True):
             row_bytes = d * element
             stride = capacity * row_bytes
             for token in range(p.sequence):
-                offset = slot * h * stride + token * row_bytes
+                offset = slot * pool_stride * element + token * row_bytes
                 records.append(lower.access(f"{name}:{tensor}:{token}:write", tensor, h * row_bytes, after=(rec,),
                                             owner=vector, write=True, runs=(AddressRun(offset, h, row_bytes, stride),)))
         gated = lower.vector(name + ":gate", p.sequence * h * d, (rec, projected["output_gate"]), vector)
@@ -341,6 +353,7 @@ _REPLAY_DTYPES = (("replay_u", FP32_BYTES), ("replay_k", BF16_BYTES), ("replay_d
 def _lower_commit(lower, p, ready):
     d = KDA_HEAD_DIM
     capacity = replay_pool_capacity(p.replay_capacity, max(p.accepted, default=0))
+    u_stride, k_stride, decay_stride, checkpoint_stride = replay_pool_strides(p, p.heads, capacity)
     for lane, items in enumerate(commit_rows(p, lower.spec.aiv_budget)):
         previous = ready
         for item, row, rows in items:
@@ -352,8 +365,7 @@ def _lower_commit(lower, p, ready):
             if not accepted:
                 continue
             slot = p.state_indices[batch] if p.state_indices else batch
-            state_head = slot * p.heads + head
-            state_offset = (state_head * d + row) * d * FP32_BYTES
+            state_offset = (slot * checkpoint_stride + (head * d + row) * d) * FP32_BYTES
             state_size = rows * d * FP32_BYTES
             item_ready = lower.access(name + ":state_index", "state_indices", INT32_BYTES, owner=lane,
                                       after=(previous,), offset=batch * INT32_BYTES)
@@ -367,10 +379,10 @@ def _lower_commit(lower, p, ready):
             for token in range(accepted):
                 updated = f"{name}:token{token}:update"
                 publish = []
-                for ring, (tensor, element), payload, col in zip(
-                    rings, _REPLAY_DTYPES, (rows, d, d), (row, 0, 0),
+                for ring, (tensor, element), pool_stride, payload, col in zip(
+                    rings, _REPLAY_DTYPES, (u_stride, k_stride, decay_stride), (rows, d, d), (row, 0, 0), strict=True,
                 ):
-                    offset = ((state_head * capacity + token) * d + col) * element
+                    offset = (slot * pool_stride + (head * capacity + token) * d + col) * element
                     read = lower.access(
                         f"{name}:token{token}:{tensor}:read", tensor,
                         payload * element, owner=lane, after=(item_ready, ring_credit(ring, token)), offset=offset, version=1,
@@ -429,19 +441,24 @@ def _lower_mla(lower, p, ready):
             norm = lower.access(name + ":qr", "mla:qr", qa_bytes, after=(norm,), owner=vector,
                                 write=True, offset=start * p.q_lora * BF16_BYTES)
             norm = lower.access(name + ":qr_for_wqb", "mla:qr", qa_bytes, after=(norm,), owner=core,
-                                cube=True, offset=start * p.q_lora * BF16_BYTES, version=1)
+                                cube=True, offset=start * p.q_lora * BF16_BYTES, version=1, obligation=False)
         elif workspace["ws_qb_aux"]:
             norm = lower.spill(name + ":ws_qb_aux", "ws_qb_aux", qa_bytes, (norm,), src_owner=vector,
                                dst_owner=core, cube_dst=True, working_set=workspace["ws_qb_aux"])
         kv_norm = lower.vector(name + ":kv_norm_rope", rows * p.kvr * ATTN_RES_NORM_OPS, (kval,), vector)
+        index = lower.access(name + ":cache_index", "mla:cache_index", rows * MLA_CACHE_INDEX_BYTES,
+                             after=(kv_norm,), owner=vector, offset=start * MLA_CACHE_INDEX_BYTES)
+        slots = range(start, start + rows) if p.cache_index is None else p.cache_index[start:start + rows]
+        slots = tuple(slot for slot in slots if slot >= 0)
         lane = MLA_CACHE_NZ_LANE_BYTES
-        runs = None if p.cache_layout == "PA_BSND" else tuple(
-            AddressRun(page * p.cache_page_size * cache_row + row * lane, cache_row // lane,
-                       lane, p.cache_page_size * lane)
-            for page, row in (divmod(pos, p.cache_page_size) for pos in range(start, start + rows))
-        )
-        cache = lower.access(name + ":kv_cache", "mla:kv_cache", rows * cache_row, after=(kv_norm,), owner=vector,
-                             write=True, offset=start * cache_row, runs=runs)
+        if p.cache_layout == "PA_BSND":
+            runs = tuple(AddressRun(slot * cache_row, 1, cache_row, cache_row) for slot in slots)
+        else:
+            runs = tuple(AddressRun(page * p.cache_page_size * cache_row + row * lane, cache_row // lane,
+                                    lane, p.cache_page_size * lane)
+                         for page, row in (divmod(slot, p.cache_page_size) for slot in slots))
+        cache = (lower.access(name + ":kv_cache", "mla:kv_cache", len(slots) * cache_row,
+                              after=(index,), owner=vector, write=True, runs=runs) if slots else index)
         qb = project(name + ":wqb", "wqb", rows, (norm, cache), core)
         proj = lower.spill(name + ":ws_q_proj", "ws_q_proj", workspace["ws_q_proj"], (qb,),
                            owner=core, cube_src=True, cube_dst=True, working_set=workspace["ws_q_proj"])
@@ -656,7 +673,7 @@ def _lower_mqsmla(lower, p, ready):
     )
     deferred = []
     partial_publications = []
-    table = p.page_table or p.block_table
+    ori_table, cmp_table = p.block_tables
     for query in range(p.queries):
         sparse = p.sparse_rows(query)
         start, partials = 0, []
@@ -666,10 +683,7 @@ def _lower_mqsmla(lower, p, ready):
             name = f"mqsmla:{query}:{part}"
             q = lower.access(name + ":q", "mqsmla:q", h * d * BF16_BYTES, after=(ready,), owner=core, cube=True,
                              offset=query * h * d * BF16_BYTES)
-            state = (q,)
-            if p.has_sink or p.sink_size:
-                state += (lower.access(name + ":sink", "mqsmla:sink", (p.sink_size or h) * FP32_BYTES,
-                                       after=(ready,), owner=vector),)
+            state = (q, lower.access(name + ":sink", "mqsmla:sink", h * FP32_BYTES, after=(ready,), owner=vector))
             ring = RingBuffer(die=lower.plan.die, owner=core, pool="l1", allocation=name + ":kv_l1", depth=MQSMLA_KV_DEPTH)
             for i, pos in enumerate(range(start, start + size, MQSMLA_KV_TILE)):
                 n = f"{name}:kv:{i}"
@@ -677,8 +691,9 @@ def _lower_mqsmla(lower, p, ready):
                 rows = end - pos
                 ori, cmp = max(0, min(end, p.n_ori) - pos), max(0, end - max(pos, p.n_ori))
                 reads = []
-                for bank, count, base, width in (
-                    ("ori", ori, pos, KV_ROW_BYTES_ORI), ("cmp", cmp, max(pos, p.n_ori), KV_ROW_BYTES_CMP),
+                for bank, count, base, width, table in (
+                    ("ori", ori, pos, KV_ROW_BYTES_ORI, ori_table),
+                    ("cmp", cmp, max(pos, p.n_ori), KV_ROW_BYTES_CMP, cmp_table),
                 ):
                     if not count:
                         continue
@@ -687,11 +702,10 @@ def _lower_mqsmla(lower, p, ready):
                     deps = (lower.access(f"{n}:{bank}:indices", f"mqsmla:{bank}:indices", count * INT32_BYTES,
                                          owner=vector, after=(ready,), offset=(query * total + base) * INT32_BYTES),)
                     pages = tuple(divmod(index, p.page_size) for index in indices)
-                    if table:
-                        words = tuple(AddressRun(page * INT32_BYTES, 1, INT32_BYTES, INT32_BYTES)
-                                      for page in dict.fromkeys(page for page, _ in pages))
-                        deps = (lower.access(f"{n}:{bank}:block_table", f"mqsmla:{bank}:block_table",
-                                             len(words) * INT32_BYTES, after=deps, owner=vector, runs=words),)
+                    words = tuple(AddressRun(page * INT32_BYTES, 1, INT32_BYTES, INT32_BYTES)
+                                  for page in dict.fromkeys(page for page, _ in pages))
+                    deps = (lower.access(f"{n}:{bank}:block_table", f"mqsmla:{bank}:block_table",
+                                         len(words) * INT32_BYTES, after=deps, owner=vector, runs=words),)
                     runs = tuple(AddressRun(((table[page] if table else page) * p.page_size + row) * width,
                                             1, width, width) for page, row in pages)
                     indexed = lower.vector(f"{n}:{bank}:pa_addresses", count, deps, vector)

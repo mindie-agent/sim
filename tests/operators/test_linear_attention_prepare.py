@@ -568,8 +568,11 @@ def test_wy_chunk_width_requires_pinned_source_abi():
             assert result.recipe.metadata["launch_count"] == 1
             assert result.recipe.metadata["launch_boundaries"] == (abi,)
             assert [ref.to_dict() for ref in result.sources] == [PR22147_SOURCE]
-        with pytest.raises(ModelingError, match="head"):
-            resolve_operator_plan(_wy_op(bt=32, abi=abi, hv=8, hk=1), ctx)
+        for field in ("key_heads", "hk", "num_k_heads", "q_heads"):
+            with pytest.raises(ModelingError, match="unsupported_value_to_key_head_ratio"):
+                resolve_operator_plan(_wy_op(bt=32, abi=abi, heads=8, **{field: 1}), ctx)
+    output = _wy_op(abi="gdn_output_arch35_chunk32", lengths=(32,), heads=1, key_heads=1, dk=128)
+    assert resolve_operator_plan(output, ctx).recipe.work.matrix == {"bf16": 1_572_864}
 
 
 @pytest.mark.parametrize("metadata", (

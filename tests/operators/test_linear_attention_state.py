@@ -12,7 +12,9 @@ import pytest
 
 from _support.axes import REPRESENTATIVE_SKUS
 from _support.linear_cases import (
-    execute_one, gdn_decode_source_case as source_case, kda_hardware_case, recipe_context, sku_planning_context,
+    execute_one, flash_kda_op, gdn_decode_source_case as source_case, kda_hardware_case,
+    lower_reference as _reference, recipe_context, sku_planning_context,
+    stage_bytes as _bytes, stages_by_name as _stages,
 )
 from mindie_sim.model_catalog import load_model
 from mindie_sim.prediction.attention import AttentionPolicy
@@ -38,6 +40,7 @@ from mindie_sim.schema.case import Software
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import IterationWork, OpSpec
 from mindie_sim.schema.parallel import ParallelSpec
+from mindie_sim.templates import dsl_catalog as dsl
 from mindie_sim.schema.workload import IterationPlan, RequestView
 from mindie_sim.structure_subgraphs import subgraph_contract
 
@@ -48,7 +51,6 @@ CHUNK = 64
 WIDTH = (2 * 2 + 6) * K
 PREFILL = "gdn_prefill_arch35"
 
-
 def params(lengths=(64,), heads=48, key_heads=16, **overrides):
     value = {
         "lengths": list(lengths), "heads": heads, "key_heads": key_heads,
@@ -57,13 +59,11 @@ def params(lengths=(64,), heads=48, key_heads=16, **overrides):
     value.update(overrides)
     return value
 
-
 def brute_force_owner(lengths, heads, cores):
     """Assign each flattened head task to a core with the contiguous ceiling."""
     total = len(lengths) * heads
     per_core = (total + cores - 1) // cores
     return [min(index // per_core, cores - 1) for index in range(total)]
-
 
 def oracle_units(lengths, heads, cores):
     """Reconstruct contiguous units from the flattened head-to-core map."""
@@ -73,7 +73,6 @@ def oracle_units(lengths, heads, cores):
         local = [index % heads for index, _ in group]
         units.extend((core, seq, local[i], tuple(local[i:i+4])) for i in range(0, len(local), 4))
     return units
-
 
 def oracle_work(value, cores):
     """Enumerate every head/chunk task and derive the physical ledger."""
@@ -151,11 +150,9 @@ def oracle_work(value, cores):
         "local_mte2": local_mte2, "vector": vector,
     }
 
-
 def plan_ledger(value, cores=32):
     op = gdn_state.make_op(value)
     return gdn_state.build(op, Geometry(cores, {"vector": 2 * cores}, {})), op
-
 
 def assert_work_matches(plan, expected):
     matrix = expected.pop("matrix")
@@ -180,7 +177,6 @@ def test_gdn_state_ownership_and_enumerated_ledger(lengths, heads, key_heads, co
     value = params(lengths, heads, key_heads, **flags)
     assert_work_matches(plan_ledger(value, cores)[0], oracle_work(value, cores))
 
-
 def test_gdn_contiguous_ceiling_changes_only_shared_key_loads():
     plans = [plan_ledger(params(), cores)[0].work for cores in (16, 32, 48)]
     groups = gdn_state.head_ownership([64], 48, 32)
@@ -193,7 +189,6 @@ def test_gdn_contiguous_ceiling_changes_only_shared_key_loads():
         assert {role: count for role, count in delta.items() if count} == {
             "hbm": 16 * CHUNK * K * 2, "mte2": 16 * CHUNK * K * 2}
 
-
 def selected(lengths, stride, *, padded_tokens=None):
     parsed, views, _ = source_case(lengths=lengths)
     kernels = {"lowerings": {"gdn_decode": {
@@ -202,7 +197,6 @@ def selected(lengths, stride, *, padded_tokens=None):
     parsed = replace(parsed, runtime=replace(parsed.runtime, kernels=kernels))
     ops, _ = Frontend().body(parsed.model, parsed.runtime, views, mode="decode", tokens=padded_tokens)
     return parsed, views, ops
-
 
 @pytest.mark.parametrize("lengths,padding", (((4,) * 4, 32), ((1,) * 4, 16), ((4, 2, 3, 4), 32)))
 def test_first_column_reads_only_one_int32_per_request(lengths, padding):
@@ -221,26 +215,21 @@ def test_first_column_reads_only_one_int32_per_request(lengths, padding):
     assert engine.serviced["memory@r0:s0"] == 32
     assert engine.serviced["mte2@r0:s0"] + engine.serviced["mte2_aiv@r0:s0"] == 16
 
-
 @pytest.mark.parametrize("lengths,stride", (((4,) * 4, 1), ((4,), 4), ((1,), 4)))
 def test_contiguous_or_singleton_index_view_needs_no_materialization(lengths, stride):
     _, _, ops = selected(lengths, stride)
     assert not any(op.recipe == "state_indices_contiguous" for op in ops)
-
 
 def _ops(parsed, views, mode, tokens):
     ops, _ = Frontend().body(parsed.model, parsed.runtime, views, mode=mode,
                              tokens=tokens)
     return ops
 
-
 def _by_recipe(ops, recipe):
     return next(op for op in ops if op.recipe == recipe)
 
-
 def _by_family(ops, family):
     return next(op for op in ops if op.family == family)
-
 
 def test_conv_skips_null_slot_compute_and_keeps_only_active_work():
     parsed, _, _ = source_case(lengths=(1,), keys=2, heads=6)
@@ -267,7 +256,6 @@ def test_conv_skips_null_slot_compute_and_keeps_only_active_work():
     assert dict(pad_plan.metadata)["empty_active_sequences"] is True
     assert pad_plan.work.resources == {}
     assert pad_conv.local_shape == (0, WIDTH)
-
 
 def test_mixed_prefill_and_pad_decode_charge_no_pad_recurrence():
     parsed, _, _ = source_case((1,), keys=2, heads=6)
@@ -316,7 +304,6 @@ def test_gdn_state_checkpoints_follow_request_acceptance(length, advance, paddin
         if length == 1:
             assert contract["commit_policy"] == "token_commit"
 
-
 def exact(lengths=(2, 4), accepted=(1, 4), *, packed=False):
     rows = [[17, 4, -1, -1], [31, 11, 27, 2]]
     return {"kind": "exact", "prefix": list(accumulate(lengths, initial=0)),
@@ -324,7 +311,6 @@ def exact(lengths=(2, 4), accepted=(1, 4), *, packed=False):
             "index_row_stride": 0 if packed else 4,
             "state_indices": [17, 4, 31, 11, 27, 2] if packed else rows,
             "accepted_tokens": accepted, "state_capacity": 32}
-
 
 @pytest.mark.parametrize("packed", (False, True))
 def test_initial_state_uses_previous_acceptance_but_checkpoints_cover_all_current_queries(packed):
@@ -335,7 +321,6 @@ def test_initial_state_uses_previous_acceptance_but_checkpoints_cover_all_curren
     assert before["checkpoint_slots"] == after["checkpoint_slots"] == ((17, 4), (31, 11, 27, 2))
     assert -1 not in {slot for row in before["checkpoint_slots"] for slot in row}
 
-
 def test_exact_duplicate_slot_is_ordered_within_sequence_but_cross_sequence_alias_is_not():
     declaration = exact()
     declaration["state_indices"][0] = [17, 17, -1, -1]
@@ -343,7 +328,6 @@ def test_exact_duplicate_slot_is_ordered_within_sequence_but_cross_sequence_alia
     declaration["state_indices"][1][0] = 17
     with pytest.raises(ModelingError, match="cross_sequence_state_alias"):
         resolve(declaration, (2, 4))
-
 
 def test_old_accepted_count_cannot_exceed_current_q_even_when_index_table_has_spare_columns():
     declaration = {"kind": "exact", "prefix": [0, 1], "index_layout": "speculative",
@@ -387,7 +371,6 @@ def test_kda_plan_conserves_verification_and_exposes_pending_or_committed_versio
     assert conductor.state.committed_version(target) == (4098 if acceptance else 4096)
     assert (4100 in conductor.state.live_versions(target)) is (acceptance is None)
 
-
 def decode_ops(selection, tokens):
     model = load_model("kimi-k3")
     plan = next(layer for layer in model.layer_plans if layer.attention == "kda")
@@ -401,13 +384,11 @@ def decode_ops(selection, tokens):
         runtime=Software.from_mapping({"kernels": {"lowerings": lowerings}}),
     ).ops
 
-
 def declaration(ops):
     return next(
         group for op in ops
         for group in dict(op.metadata).get("structure_subgraphs", ())
         if group["role"] == "kda_recurrent")
-
 
 @pytest.mark.parametrize("tokens", [1, 2, 4])
 def test_prefill_state_selection_preserves_decode_work_without_native_contract(tokens):
@@ -420,13 +401,11 @@ def test_prefill_state_selection_preserves_decode_work_without_native_contract(t
     assert subgraph_contract(group) is None
     assert all(not op.source_boundary for op in selected)
 
-
 def test_explicit_decode_gate_selection_keeps_its_declared_contract():
     group = declaration(decode_ops(GATES, 1))
     assert group["tensor_view"]["in_kernel_gate_source"]
     assert group["implementation"]["selection"] == GATES
     assert subgraph_contract(group) is not None
-
 
 def kda_params(lengths=(64,), heads=2, **overrides):
     value = {
@@ -573,12 +552,34 @@ def test_flash_kda_metadata_controls_route_and_saved_output_cache(planning_conte
     plan = resolve_operator_plan(op, planning_context).recipe
     assert plan.metadata["template"] == selected
     assert plan.metadata["persistent_ub_resident"] is (selected == "persistent")
-    assert plan.metadata["saved_entry_state_bytes"] == sum((n + 63)//64 for n in lengths) * 2*64*128*2
+    element = 4 if selected == "staged" else 2
+    assert plan.metadata["saved_entry_state_bytes"] == sum((n + 63)//64 for n in lengths) * 2*64*128*element
     assert plan.metadata.get("saved_outputs_l2_cache_disabled", False) is (selected == "staged")
     phases = {p.phase_id: p.after for p in plan.pipeline_spec.phases}
     update, save = ("state_and_output_group", "save_entry_state_uncached") if selected == "staged" else ("R_O_inter", "save_entry_state")
     assert save in phases[update]
 
+
+@pytest.mark.parametrize("heads,route", ((1, "persistent"), (32, "staged")))
+def test_flash_kda_bnsd_routes_by_head_count_and_binds_state_flags(heads, route):
+    _, ctx = sku_planning_context(REPRESENTATIVE_SKUS["a5"], "kda")
+    direct = ctx.datapath
+    name, state = "Ascend950DT", heads * 128**2 * 4
+    p = dsl.FlashKdaProblem((1,), heads, heads, device_name=name, has_initial_state=True, return_final_state=False)
+    spec, result = _reference(dsl.FLASH_KDA, p, direct, aic_budget=32, aiv_budget=64)
+    assert spec.template_variant == route and ctx.effective_aic_cores == 32
+    stages = _stages(result)
+    assert _bytes(stages, ":initial_state", "mte2_aiv") == state and not _bytes(stages, ":final_state", "mte3")
+    plan = resolve_operator_plan(flash_kda_op(p), ctx).recipe
+    phases = {p.phase_id: {w.resource: w.amount for w in p.work} for p in plan.pipeline_spec.phases}
+    load, store = ("state_begin", "state_end") if route == "persistent" else ("load_state_group", "store_state_group")
+    assert plan.metadata["template"] == route and phases[load]["hbm"] == state and not phases[store].get("hbm")
+
+    staged_bytes = 2_097_152 if route == "staged" else 0
+    assert not p.save_chunk_states and _bytes(stages, ":save_h", "hbm") == staged_bytes
+    assert plan.metadata["saved_entry_state_bytes"] == 0
+    if staged_bytes:
+        assert phases["save_entry_state_uncached"]["mte3"] == plan.metadata["chunk_state_bank"] == staged_bytes
 
 @pytest.mark.parametrize("length", (512, 4096, 32768))
 def test_cann_gdn_reuses_final_state_slot_while_fla_stores_each_chunk(length):

@@ -10,13 +10,16 @@ from dataclasses import replace
 import json
 import math
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
 from _support.axes import REPRESENTATIVE_SKUS, SKUS
 from _support.builders import linear_model, view
-from _support.linear_cases import caller, execute_one, gdn_decode_source_case, kda_hardware_case, packed_roles, recipe_context, sku_planning_context
+from _support.linear_cases import (
+    caller, execute_one, gdn_decode_source_case, kda_hardware_case, lower_reference as _reference, packed_roles,
+    recipe_context, recurrent_scan_context, sku_planning_context, stage_ancestors as _ancestors, stage_bytes as _bytes,
+    stages_by_name as _stages, template_datapath,
+)
 from mindie_sim import graph_costs
 from mindie_sim.catalog.speculative_state import MODE_CHECKPOINT, MODE_REPLAY, MODE_SINGLE, speculative_state_plan
 from mindie_sim.prediction.call_gdn import make_call
@@ -42,6 +45,7 @@ from mindie_sim.schema.operators import OpSpec
 from mindie_sim.schema.parallel import ParallelSpec
 from mindie_sim.schema.workload import RequestView
 from mindie_sim.structure_subgraphs import subgraph_contract
+from mindie_sim.templates import dsl_catalog as dsl, enumerate_dsl_specs
 from tools.kimi_kda_alignment import compare
 from tools.model_scoreboard_kimi import prediction_packet, predict_worker
 
@@ -50,12 +54,10 @@ pytestmark = pytest.mark.tier0
 ROOT = Path(__file__).resolve().parents[2]
 BT, K, V = 64, 128, 128
 
-
 def params(lengths=(64,), heads=12, key_heads=4, **overrides):
     return {"lengths": lengths, "heads": heads, "key_heads": key_heads,
             "dtype": "bf16", "gate_dtype": "fp32", "state_v_first": True,
             "use_exp2": True, "output_token_first": True, **overrides}
-
 
 def transfer_oracle(values):
     """Enumerate grouped Q/K loads and disjoint output intervals."""
@@ -86,7 +88,6 @@ def transfer_oracle(values):
     return dict(mte2=traffic["mte2"], mte3=2 * offset + traffic["l1_write"],
                 hbm=traffic["mte2"] + 2 * offset, fixpipe=traffic["fixpipe"])
 
-
 @pytest.mark.parametrize("rows", (1, 15, 16, 17, 32, 33, 48, 63, 64))
 def test_av_requested_tail_is_distinct_from_physical_bf16_fractal_work(rows):
     op = gdn_output.make_op(params(lengths=(rows,), heads=3, key_heads=1))
@@ -112,7 +113,6 @@ def test_output_gm_tails_and_group_reuse_match_address_walk(lengths, heads, keys
         assert built.work.resources[resource] == amount
     raw = kda_hardware_case(units=4, rates={"read": 1e12, "write": 1e12})
     assert verify_operator(raw, op, gdn_output.build)["status"] == "passed"
-
 
 def _scan(lengths, *, heads=3, dk=128, dv=128, units=4, compact=True, module=None,
           rates=None, contender=None, state_dtype="fp32", **flags):
@@ -147,7 +147,6 @@ def _scan(lengths, *, heads=3, dk=128, dv=128, units=4, compact=True, module=Non
     assert engine.serviced["mte2_aic"] == engine.serviced["mte2"] == 0
     return plan, engine, done.time - 3
 
-
 @pytest.mark.parametrize("lengths,dk,dv,units", (
     ((1,), 16, 16, 1), ((4, 3), 128, 65, 4), ((2, 4, 3), 129, 97, 8), ((4, 4), 256, 129, 4),
 ))
@@ -166,7 +165,6 @@ def test_gdn_recurrent_payload_uses_real_values_and_padded_compute(lengths, dk, 
         "hbm": incoming + outgoing + tokens * (4 + 2 * len(tiles))}
     assert all(row["start_ms"] >= 3 for row in engine.trace if row["demand"])
 
-
 @pytest.mark.parametrize("module", (None, kda_recurrent, kda_recurrent_arch22), ids=("gdn", "kda", "staged-kda"))
 @pytest.mark.parametrize("lengths,units,contender", (((4, 4), 1, None), ((4, 4, 1, 4), 4, {"mte3": 10000})))
 def test_recurrent_compaction_conserves_owner_work(module, lengths, units, contender):
@@ -183,7 +181,6 @@ def test_recurrent_compaction_conserves_owner_work(module, lengths, units, conte
     runs = (length for assignment in head_ownership(lengths, 3, units)
             for length, count in head_runs(lengths, assignment) for _ in range(count))
     assert list(runs) == [n for n in lengths for _ in range(3)]
-
 
 @pytest.mark.parametrize("lengths,heads,units,dv,state", (
     ((1,), 4, 1, 128, "fp32"), ((4, 1), 7, 4, 256, "bf16"),
@@ -204,7 +201,6 @@ def test_kda_state_payload_and_owner_sequence_beta_reuse(lengths, heads, units, 
     assert new.work.resources["vector"] - old.work.resources["vector"] == tokens * 128 * dv - casts
     assert engine.peak_allocated["ub"] == new.metadata["kda_recurrent_schedule"]["ub_bytes_per_owner"]
 
-
 @pytest.mark.parametrize("role", ("mte2_aiv", "mte3", "vector"))
 def test_recurrent_service_changes_only_with_active_pipe_supply(role):
     results = [_scan((4,), module=kda_recurrent, heads=1, units=1, rates={role: rate})
@@ -212,7 +208,6 @@ def test_recurrent_service_changes_only_with_active_pipe_supply(role):
     assert results[0][2] > results[1][2]
     assert results[0][0].work == results[1][0].work
     assert results[0][1].serviced == pytest.approx(results[1][1].serviced)
-
 
 def test_recurrent_output_queues_respect_ownership_and_dependency_order():
     _, engine, _ = _scan((4,), module=kda_recurrent, heads=1, units=1,
@@ -225,7 +220,6 @@ def test_recurrent_output_queues_respect_ownership_and_dependency_order():
         assert event(first)["end_ms"] <= event(second)["start_ms"]
     load, compute = event("state_load1"), event("recur0_0")
     assert max(load["start_ms"], compute["start_ms"]) < min(load["end_ms"], compute["end_ms"])
-
 
 @pytest.mark.parametrize("dv", (128, 256))
 @pytest.mark.parametrize("internal_beta", (False, True))
@@ -251,7 +245,6 @@ def test_source_replaces_fused_members_once_and_keeps_actual_producers(dv, inter
         assert set(op.deps) <= available
         available.add(op.op_id)
 
-
 def test_physical_projection_padding_does_not_invent_recurrent_state_updates():
     case, ops = caller((1, 4), padded=16)
     by_recipe = {op.recipe: op for op in ops}
@@ -264,7 +257,6 @@ def test_physical_projection_padding_does_not_invent_recurrent_state_updates():
     graph = graph_costs(case, ops, input_ready_ms=7, isolated=False, external_inputs={"input": 7})
     call = next(row for row in graph["timeline"] if row["recipe"] == native.recipe)
     assert call["ready_ms"] >= 7 and call["program"] == "OperatorPlan"
-
 
 @pytest.mark.parametrize("lengths,logical", (((1,), 1), ((4, 3), 2), ((8,) * 65, 4)))
 def test_decode_source_binds_normalization_and_conserves_repeated_gate_work(lengths, logical):
@@ -287,7 +279,6 @@ def test_decode_source_binds_normalization_and_conserves_repeated_gate_work(leng
     assert engine.serviced["vector@r0:s0"] == pytest.approx(work["vector"]) == tiles * (13 * 64 * 8 + 2 * 8)
     assert by_recipe["ascend_recurrent_gdn_fp32_state"].local_shape[0] == sum(lengths)
 
-
 def test_serving_prefill_orders_state_gather_scan_and_publish():
     parsed, _, _ = gdn_decode_source_case((1,), keys=1, heads=3)
     runtime = replace(parsed.runtime, kernels={"lowerings": {"gdn_prefill": "gdn_prefill_arch35"}})
@@ -298,7 +289,6 @@ def test_serving_prefill_orders_state_gather_scan_and_publish():
     assert by["gdn_state"].op_id in by["state_scatter"].deps
     assert dict(by["gdn_prepare"].metadata)["dispatch"]["use_qk_l2norm_in_kernel"]
     assert not any(op.recipe.startswith("decode_") for op in ops)
-
 
 @pytest.mark.parametrize("rows,keys,heads", ((1, 1, 3), (65, 2, 6)))
 def test_scan_call_exports_real_rows_and_executes_three_source_launches(rows, keys, heads):
@@ -315,7 +305,6 @@ def test_scan_call_exports_real_rows_and_executes_three_source_launches(rows, ke
     graph = graph_costs(raw, call.ops, recipes=call.recipes, input_ready_ms=7)
     for row in graph["isolated"]["operators"]:
         assert row["declared_service"] == pytest.approx(row["serviced"])
-
 
 def inputs():
     data = ROOT / "tests/fixtures/verification"
@@ -338,7 +327,6 @@ def test_closed_native_calls_reconcile_stage_sums_and_reject_missing_neighbors()
     blocks["runs"][0]["semantic_boundary_anchors"]["following_output_projection"] = False
     assert compare(blocks, prediction)["coverage"] == {"observed_runs": 2, "matched": 1, "unpaired": 1}
 
-
 def intent(owner="layer0", version="v0", requests=("r0", "r1")):
     return OpSpec(
         "verify", "recurrent_scan", "decode", 0, 0, requests,
@@ -350,7 +338,6 @@ def intent(owner="layer0", version="v0", requests=("r0", "r1")):
             ("dv", 8), ("state_dtype", "fp32"),
             ("record_kg_dtype", "bf16"), ("record_bytes_per_token", 48.0),
         ))
-
 
 def test_integer_commits_sum_and_publish_after_acceptance():
     ops = (intent(),)
@@ -369,7 +356,6 @@ def test_integer_commits_sum_and_publish_after_acceptance():
     assert commit.mte2_bytes == pytest.approx(2 * state + 7 * 48.0)
     assert commit.mte3_bytes == pytest.approx(2 * state)
 
-
 def test_missing_acceptance_duplicate_owner_and_ambiguous_mean_fail():
     views = (view("r0", 6, advanced=3),)
     with pytest.raises(ModelingError, match="requires_acceptance_event"):
@@ -386,7 +372,6 @@ def test_missing_acceptance_duplicate_owner_and_ambiguous_mean_fail():
     assert commit_tokens_for_view(ambiguous, Software()) == 6
     assert commit_tokens_for_view(view("r0", 1), Software(
         mtp_acceptance_length=3.5)) == 1
-
 
 def test_pending_commit_is_rebound_without_duplication():
     pending = OpSpec(
@@ -408,30 +393,14 @@ def test_pending_commit_is_rebound_without_duplication():
     with pytest.raises(ModelingError, match="resolved_integer_advancement"):
         bind_declared_body_commits((op,), views=(view("r0", 6),))
 
-
-def context(tokens=10, chunk=4, *, setup=0, minimum=0):
-    chunks = (tokens + chunk - 1) // chunk
-    op = OpSpec("scan", "recurrent_scan", "prefill", 0, 0, (), (tokens,),
-                (tokens,), (tokens,), (tokens,), metadata=(
-                    ("chunks", chunks), ("chunk", chunk), ("tokens", tokens),
-                    ("heads", 4), ("chunk_vector_ops", 100.0)))
-    return SimpleNamespace(
-        op=op, work={"cube": 1000.0, "vector": 500.0, "hbm": 300.0},
-        resource_names={"cube": "cube", "vector": "vector"},
-        rates={"cube": 1000.0, "vector": 1000.0}, core_count=4,
-        minimum_ms=minimum, setup_ms=setup, minimum_provenance={},
-        native_work={}, service_identity={},
-    )
-
-
 def test_indexed_template_is_constant_time_and_binds_setup_correctly():
-    ctx = context(tokens=6554, chunk=64, setup=0.25, minimum=0.5)
+    ctx = recurrent_scan_context(tokens=6554, chunk=64, setup=0.25, minimum=0.5)
     program = lower_recurrent_scan(ctx)
     template = program.template
     assert template.indexed_panels == 103
     assert (template.setup_ms, template.minimum_ms) == (0.25, 0.5)
     assert template.tile_factory_calls <= 2
-    full, tail = recurrent_scan_classes(context())
+    full, tail = recurrent_scan_classes(recurrent_scan_context())
     assert tail.stages[-1].work["cube"] * 2 == pytest.approx(full.stages[-1].work["cube"])
     assert [stage.after for stage in tail.stages[1:]] == [("c1",), ("delta",)]
     tail_start = 6554 // 64
@@ -439,7 +408,6 @@ def test_indexed_template_is_constant_time_and_binds_setup_correctly():
     assert template.index_of(tail_start) == (1, 103, 0, tail_start, 0)
     with pytest.raises(ModelingError, match="index_out_of_range"):
         template.index_of(103)
-
 
 def test_closed_form_sums_match_the_small_finite_loop():
     for tokens in (0, 1, 3, 64, 65, 6554):
@@ -449,12 +417,10 @@ def test_closed_form_sums_match_the_small_finite_loop():
                                for offset in range(0, tokens, chunk))
                 assert _sum_valid_powers(tokens, chunk, power) == expected
 
-
 def _governed_op(recipe, lengths, **metadata):
     return OpSpec("scan", recipe, "decode", 0, 0, (), (), (), (), (), recipe=recipe, dtype="bf16",
                   metadata=tuple(dict({"lengths": lengths, "hv": 2, "dk": 32, "dv": 64,
                                        "bv": 32, "bk": 16}, **metadata).items()))
-
 
 @pytest.mark.parametrize("sku", SKUS)
 @pytest.mark.parametrize("kind,gate_width", (("gdn", 1), ("kda", 32)))
@@ -469,26 +435,30 @@ def test_governed_decode_conserves_state_contractions_and_fp32_tile(sku, kind, g
     assert plan.work.resources["vector"] == 2 * contraction + tokens * (3 * dk * dv + gate_width + 2 * dv)
     state = 2 * 2 * 4 * dk * dv
     payload = tokens * ((2 * dk + dv) * 2 + gate_width * 4 + 2)
-    checkpoint = tokens * dk * dv * 4 if sku == REPRESENTATIVE_SKUS["a5"] and kind == "kda" else state
+    checkpoint = tokens * dk * dv * 4 if kind == "kda" else state
     assert plan.work.resources["hbm"] == state + checkpoint + payload + tokens * 2 * dv
     assert build_governed(op, geom).work == plan.work
 
-
-def test_recurrent_kda_gates_before_key_dot_and_checkpoints_each_valid_token():
-    geometry, ctx = sku_planning_context(REPRESENTATIVE_SKUS["a5"], "scan")
-    op = _governed_op("kda_recurrent", (1, 3), hv=1, dk=128, dv=128)
+@pytest.mark.parametrize("sku", SKUS)
+@pytest.mark.parametrize("state_dtype,element,total", (("fp32", 4, 262_144), ("bf16", 2, 131_072)))
+@pytest.mark.parametrize("lengths,active_heads", (((1, 3), (2, 1, 1)), ((4,), (1, 1, 1, 1))))
+def test_recurrent_kda_checkpoints_each_valid_token(sku, state_dtype, element, total, lengths, active_heads):
+    geometry, ctx = sku_planning_context(sku, "scan")
+    op = _governed_op("kda_recurrent", lengths, hv=1, dk=128, dv=128, state_dtype=state_dtype)
     plan = resolve_operator_plan(op, ctx).recipe
     tokens = next(stage.program for stage in plan.program(recipe_context(geometry, op)).stages if stage.name == "tokens")
     stored = 0
-    for i, active in enumerate((2, 1, 1)):
+    for i, active in enumerate(active_heads):
         stages = {stage.name: stage for stage in tokens.tile(i)}
-        assert stages["key_dot"].after == ("decay",)
+        transition = "key_dot_rank1_update_query_dot"
+        if "key_dot" in stages:
+            assert stages["key_dot"].after == ("decay",)
+            transition = "query_dot"
         checkpoint = stages["publish_token_state"]
-        assert checkpoint.after == ("query_dot",) and checkpoint.metadata["token_index"] == i
-        assert checkpoint.work["mte3"] == active * 128**2 * 4
+        assert checkpoint.after == (transition,) and checkpoint.metadata["token_index"] == i
+        assert checkpoint.work["mte3"] == active * 128**2 * element
         stored += checkpoint.work["mte3"]
-    assert plan.metadata["token_state_slots"] == 4 and plan.metadata["token_state_bytes"] == stored == 262_144
-
+    assert plan.metadata["token_state_slots"] == 4 and plan.metadata["token_state_bytes"] == stored == total
 
 DK, DV = 32, 64
 FACTORS = {"B": (DK,), "dt": (), "A_diag": (DK,), "C_proj": (DK,)}
@@ -503,7 +473,6 @@ ABI_WIDTHS = (
     ("mamba", False, (4*DV, 4*DK, 4, 0)),
     ("mamba", True, (4*DV, 2*DK, 2, 2*DK)),
 )
-
 
 @pytest.mark.parametrize("family,gated,widths", ABI_WIDTHS)
 def test_recover_verification_and_commit_cover_exact_abi_prefix(family, gated, widths):
@@ -554,12 +523,10 @@ def test_recover_verification_and_commit_cover_exact_abi_prefix(family, gated, w
             else:
                 assert not phases and replay.metadata["launch_count"] == 0
 
-
 @pytest.mark.parametrize("accept", (1.0, 1.5, True, -1, 5))
 def test_recover_commit_requires_bounded_integer_acceptance(accept):
     with pytest.raises(ModelingError, match="requires_integer_acceptance"):
         build_recover_ssm_commit("gdn", DK, DV, q=4, a=accept)
-
 
 def test_recover_selective_factors_and_boundary_checkpoints_are_validated():
     with pytest.raises(ModelingError, match="selective_rank_one_factors"):
@@ -568,16 +535,46 @@ def test_recover_selective_factors_and_boundary_checkpoints_are_validated():
         with pytest.raises(ModelingError, match="boundary_checkpoints_invalid"):
             build_recover_ssm_commit("kda", DK, DV, q=4, a=2, boundary_checkpoints=checkpoints)
 
-
-def test_partitioned_kda_commit_reloads_key_decay_pair_for_each_value_tile():
+@pytest.mark.parametrize("accepted", (0, 3))
+def test_partitioned_kda_commit_reloads_key_decay_pair_for_each_value_tile(accepted):
     _, ctx = sku_planning_context(REPRESENTATIVE_SKUS["a5"], "scan")
-    dim, partitions, accepted = 128, 4, 3
+    dim, partitions = 128, 4
     op = _governed_op("recover_ssm_commit", (4,), abi="commit_recurrent_kda", hv=1,
                       q=4, a=accepted, dk=dim, dv=dim, row_partitions=partitions)
     plan = resolve_operator_plan(op, ctx).recipe
     assert plan.metadata["physical_record_read_bytes"] == accepted * (4 * dim + 6 * partitions * dim)
-    assert plan.work.resources["vector"] == 4 * accepted * dim**2
+    assert plan.work.resources.get("vector", 0) == 4 * accepted * dim**2
+    assert plan.metadata["launch_count"] == 1
+    phases = plan.pipeline_spec.phases
+    assert phases[0].phase_id == "read_acceptance"
+    assert sum(item.amount for item in phases[0].work if item.resource == "hbm") == 4
+    if not accepted:
+        assert len(phases) == 1 and plan.work.resources["hbm"] == 4
 
+@pytest.mark.parametrize("partitions", (1, 2))
+def test_commit_zero_accept_and_partitioned_replay_bytes(partitions):
+    direct = template_datapath(REPRESENTATIVE_SKUS["a5"])
+    p = dsl.CommitRecurrentKdaProblem((0, 2), row_partitions=partitions, state_indices=(6, 7),
+                                      replay_capacity=4, k_stride0=640)
+    _, result = _reference(dsl.COMMIT_KDA, p, direct)
+    stages = _stages(result)
+    assert {name for name in stages if name.startswith("commit:0:")} == {
+        f"commit:0:{row}:accepted_read" for row in range(0, 128, 128 // partitions)
+    }
+    assert "commit:1:0:accepted_read" in _ancestors(stages, "commit:1:0:checkpoint_read")
+    assert _bytes(stages, ":checkpoint_read", "mte2_aiv") == _bytes(stages, ":checkpoint_write", "mte3") == 4 * 128**2
+    replay = 4 * 128 + 6 * partitions * 128
+    assert sum(_bytes(stages, f":replay_{tensor}:read", "mte2_aiv") for tensor in ("u", "k", "decay")) == 2 * replay
+    assert dsl.commit_replay_bytes(partitions) == replay
+    k, = (entry for entry in result.summary.read_obligations if entry.allocation_id == "replay_k")
+    assert k.ranges == ((8960, 8960 + 2 * 128 * 2),)
+    _, empty = _reference(dsl.COMMIT_KDA, replace(p, accepted=(0, 0)), direct)
+    assert empty.summary.logical_transfer_bytes == 2 * partitions * 4
+    assert {entry.allocation_id for entry in empty.summary.read_obligations} == {"accepted"}
+    assert not empty.summary.write_obligations
+    for budget, quota in ((8, 8), (23, 8), (24, 24), (27, 24), (28, 28), (31, 28), (32, 32)):
+        spec, = enumerate_dsl_specs(dsl.COMMIT_KDA, p, direct, aic_budget=budget)
+        assert (spec.aic_budget, spec.aiv_budget) == (quota, 2 * quota)
 
 @pytest.mark.parametrize("family", RECOVER_SSM_FAMILIES)
 def test_capacity_uses_single_checkpoint_or_full_verify_window(family):

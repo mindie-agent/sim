@@ -17,7 +17,8 @@ from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.datapath import DatapathCapabilitySpec
 
 from .contracts import (
-    DIRECT_MATRIX_ARCH_IDS, LEGACY_MATRIX_ARCH_IDS, CatlassKernelSpec, EvgVisitorNode, TemplateSourceRef, ceil_div,
+    DIRECT_MATRIX_ARCH_IDS, LEGACY_MATRIX_ARCH_IDS, CatlassKernelSpec, EvgVisitorNode, TemplateSourceRef,
+    ceil_div, full_load_a_eligible,
 )
 
 CATLASS_REPOSITORY = "Ascend/catlass"
@@ -71,6 +72,8 @@ CATLASS_SOURCE_REFS = (
         "16a7bbdeb90ed3cd3e62dbcf80172decef0c88cd788a0f672cd7791bb242b324", "thread_block_dim", (8064, 8128)),
     TemplateSourceRef(CATLASS_REPOSITORY, CATLASS_REVISION, "include/catlass/gemm/kernel/matmul_gather_scatter_simt.hpp",
         "c95d5a3d1e7591d3289e42ea26c850b5b0081a9d687eea89cbdda542ef8c5040", "RunMatmulGatherScatterSimt", (80, 140)),
+    TemplateSourceRef(CATLASS_REPOSITORY, CATLASS_REVISION, "include/catlass/gemm/kernel/matmul_gather_scatter_full_load.hpp",
+        "0495ecca9fd3be283b4e9abcc625daaafbfb8ff647b936d54a8cd6e134d23d3d", "MatmulGatherScatterFullLoadKernelBase", (81, 138)),
     TemplateSourceRef(CATLASS_REPOSITORY, CATLASS_REVISION, "include/catlass/gemm/kernel/grouped_mx_matmul_finalize_routing_tla.hpp",
         "14541031fe54e63ce441777442a70024b9b53dba357ca0d551966e4a99f69757", "GetWorkspaceSize", (150, 165)),
 )
@@ -85,6 +88,7 @@ _CATLASS_SYMBOLS = {
     "catlass.grouped_mx_swiglu_mx_quant": ("GroupedMatmulSliceM", "GroupedMxMatmulSliceMSwigluMxQuantTla", "L1_SCALE_FACTOR_K"),
     "catlass.mx_matmul": ("L1_SCALE_FACTOR_K", "BlockMmadA8W4Mx", "ElementPrologueB"),
     "catlass.a5_simt": ("SIMT_WARP_SIZE", "thread_block_dim", "RunMatmulGatherScatterSimt", "GetWorkspaceSize"),
+    "catlass.full_load_a_gather_scatter": ("MatmulGatherScatterFullLoadKernelBase",),
 }
 CATLASS_TEMPLATE_IDS = tuple(_CATLASS_SYMBOLS)
 MAX_MUTEX_IDS = 28
@@ -92,6 +96,10 @@ MX_SCALE_GROUP = 32
 A8W4_L1_SCALE_FACTOR_K = 16
 SIMT_TLA_MAX_THREADS = 2048
 SIMT_CATLASS_MAX_THREADS = 1024
+GATHER_SCATTER_SIMT_UB_BYTES = 64 * 1024
+GATHER_SCATTER_FULL_LOAD_A = "MatmulGatherScatterFullLoadA"
+GATHER_SCATTER_POLICIES = frozenset({"MatmulGatherScatterSimt", GATHER_SCATTER_FULL_LOAD_A})
+GATHER_SCATTER_AIV_MAX_K = 768
 STREAMK_TLA_MIN_WORKSPACE = 2 * 1024 * 1024
 STREAMK_PARTIAL_SLOTS_PER_CORE = 2
 DEFAULT_L1_TILES = ((128, 128, 128), (64, 128, 128), (64, 64, 64))
@@ -258,11 +266,26 @@ def validate_catlass_spec(spec: CatlassKernelSpec, p: CatlassProblem, datapath: 
         "MatmulGatherScatterSimt", "tla_dsl", "GroupedMxMatmulFinalizeRoutingTla",
     }):
         raise ModelingError("catlass_simt_dispatch_policy_required")
-    if (p.indices is not None or p.physical_m is not None) and (
-        spec.dispatch_policy != "MatmulGatherScatterSimt"
-        or (spec.layout_a, spec.layout_b, spec.layout_c) != ("RowMajor",) * _MATRIX_SHAPE_RANK
-    ):
+    indexed = spec.dispatch_policy in GATHER_SCATTER_POLICIES
+    if (p.indices is not None or p.physical_m is not None) and not indexed:
         raise ModelingError("catlass_indexed_operands_require_gather_scatter")
+    if indexed:
+        if p.has_bias or spec.has_bias or p.groups:
+            raise ModelingError("catlass_gather_scatter_requires_single_unbiased_product")
+        for operands in (p, spec):
+            if any(dtype_name(dtype) != "fp16" for dtype in (operands.dtype_a, operands.dtype_b, operands.dtype_c)):
+                raise ModelingError("catlass_gather_scatter_requires_fp16")
+            if dtype_name(operands.dtype_acc) != "fp32":
+                raise ModelingError("catlass_gather_scatter_requires_fp32_accumulator")
+        if (spec.layout_a, spec.layout_b, spec.layout_c) != ("RowMajor",) * _MATRIX_SHAPE_RANK:
+            raise ModelingError("catlass_gather_scatter_requires_row_major")
+    if spec.dispatch_policy == GATHER_SCATTER_FULL_LOAD_A and (
+        name != "catlass.full_load_a_gather_scatter" or spec.simt_thread_block_dim is not None
+        or not full_load_a_eligible(p, datapath) or spec.l1_tile_shape[-1] != p.k or not spec.aiv_budget
+    ):
+        raise ModelingError("catlass_full_load_a_geometry_invalid")
+    if spec.dispatch_policy == "MatmulGatherScatterSimt" and name != "catlass.a5_simt":
+        raise ModelingError("catlass_simt_dispatch_policy_required")
     if spec.template_id in {"catlass.mx_matmul", "catlass.grouped_mx_swiglu_mx_quant"} and not spec.mx_scale_group:
         raise ModelingError("catlass_scale_specialization_required")
     if spec.enable_unit_flag and spec.stages[-1] != 1:
@@ -369,6 +392,7 @@ def enumerate_catlass_specs(
         swizzles = tuple(product(("Zn", "Nz"), swizzle_offsets)) if name == "catlass.swizzle" else (("Zn", 1),)
         simt = name == "catlass.a5_simt"
         policies = simt_variants if simt else ({
+            "catlass.full_load_a_gather_scatter": GATHER_SCATTER_FULL_LOAD_A,
             "catlass.mutex_block_mmad": "MmadPingpongMutex",
             "catlass.streamk": "StreamkMatmulTla" if modern else "MmadAtlasA2Streamk",
             "catlass.mx_matmul": "MmadA8W4Mx" if p.mx_mode == "a8w4_mx" else "MmadMx",
@@ -382,6 +406,9 @@ def enumerate_catlass_specs(
             tm, tn, tk = l1
             if min(l1) < 1:
                 raise ModelingError("catlass_tile_shape_invalid")
+            if policy == GATHER_SCATTER_FULL_LOAD_A:
+                tk = p.k
+                l1 = (tm, tn, tk)
             micro_tiles = l0_tiles if l0_tiles is not None else ((tm, tn, min(tk, DEFAULT_L0_PANEL_K)),)
             splits = range(2, min(aic, ceil_div(p.k, tk)) + 1) if scheduler == "multi_core_splitk" else (1,)
             epilogues = {
@@ -389,6 +416,8 @@ def enumerate_catlass_specs(
                 "catlass.grouped_mx_swiglu_mx_quant": ("grouped_swiglu_mx_quant",),
             }.get(name, ("finalize_routing",) if policy == "GroupedMxMatmulFinalizeRoutingTla" else ("none",))
             stages = raw_stages
+            if policy == GATHER_SCATTER_FULL_LOAD_A:
+                stages = (1, *raw_stages[1:])
             if name == "catlass.basic_pingpong":
                 depth = min(raw_stages[:-1])
                 stages = (depth, depth, depth, depth, 1)

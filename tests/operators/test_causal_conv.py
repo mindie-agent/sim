@@ -207,7 +207,7 @@ def test_governed_convolution_conserves_work_and_waits_for_inputs(
 def test_speculative_history_uses_accepted_offset_and_physical_capacity(planning, state_len, accepted, written):
     _, _, ctx = planning
     op = _governed_op(mode="incremental", lengths=(4,), channels=256, q=4,
-                      history_shape=(1, state_len, 256), accepted_tokens=(accepted,))
+                      history_shape=(8, state_len, 256), cache_index=(7,), accepted_tokens=(accepted,))
     plan = resolve_operator_plan(op, ctx).recipe
     assert (plan.metadata["state_len"], plan.metadata["state_offsets"]) == (state_len, (accepted - 1,))
     assert plan.metadata["speculative_width"] == 4 and plan.metadata["history_rows"] == 3
@@ -221,6 +221,8 @@ def test_speculative_history_uses_accepted_offset_and_physical_capacity(planning
     ({"history_shape": (4, 32)}, "weight_or_history_shape_mismatch"),
     ({"history_shape": (2, 16)}, "state_len_unsupported"),
     ({"history_shape": (1, 6, 16)}, "weight_or_history_shape_mismatch"),
+    ({"history_shape": (8, 6, 16), "cache_index": (7, 8)}, "cache_index_out_of_bounds"),
+    ({"history_shape": (8, 6, 16), "cache_index": (-1, 7)}, "cache_index_out_of_bounds"),
     ({"state_len": 6, "state_offset": (0, 4)}, "state_offset_out_of_bounds"),
     ({"accepted_tokens": (-1, 1)}, "invalid_accepted_tokens"),
     ({"lengths": (0, 2)}, "positive_integer_geometry"),

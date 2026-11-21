@@ -213,12 +213,22 @@ def validate_contract(op: OpSpec, ctx: OperatorPlanningContext) -> LinearAttenti
             raise ModelingError("causal_conv1d_weight_or_history_shape_mismatch")
         state_len = metadata.get("state_len", metadata.get("state_history_slots"))
         history = metadata.get("history_shape")
+        indices = metadata.get("cache_index", metadata.get("cache_indices"))
         if history is not None:
             if (not isinstance(history, (tuple, list)) or len(history) not in (2, 3)
-                    or history[-1] != channels or (len(history) == 3 and history[0] != len(lengths))
+                    or history[-1] != channels
+                    or (len(history) == 3 and (type(history[0]) is not int or history[0] < 1))
+                    or (len(history) == 3 and indices is None and history[0] < len(lengths))
                     or (state_len is not None and history[-2] != state_len)):
                 raise ModelingError("causal_conv1d_weight_or_history_shape_mismatch")
             state_len = history[-2]
+        if indices is not None:
+            indices = indices if isinstance(indices, (tuple, list)) else (indices,)
+            cache_rows = history[0] if history is not None and len(history) == 3 else len(lengths)
+            if len(indices) != len(lengths) or any(
+                i is not None and (type(i) is not int or not 0 <= i < cache_rows) for i in indices
+            ):
+                raise ModelingError("causal_conv1d_cache_index_out_of_bounds")
         accepted = metadata.get("accepted_tokens")
         offsets = metadata.get("state_offset", accepted if accepted is not None else 0)
         offsets = tuple(offsets) if isinstance(offsets, (tuple, list)) else (offsets,) * len(lengths)
@@ -239,6 +249,8 @@ def validate_contract(op: OpSpec, ctx: OperatorPlanningContext) -> LinearAttenti
 
     pinned = abi in CHUNK32_ABIS or metadata.get("chunk32") is True
     hv = metadata.get("hv", metadata.get("heads", 1))
+    hq = metadata.get("hq", metadata.get("q_heads", hv))
+    hk = next((metadata[key] for key in ("key_heads", "hk", "num_k_heads", "q_heads") if key in metadata), hv)
     dk = metadata.get("dk", metadata.get("head_dim", DEFAULT_VALUE_TILE))
     dv = metadata.get("dv", metadata.get("value_dim", dk))
     fields = {key: metadata[key] for key in (
@@ -247,12 +259,13 @@ def validate_contract(op: OpSpec, ctx: OperatorPlanningContext) -> LinearAttenti
         "kda_template_request", "l2_capacity_bytes", "active_l2_streams",
     ) if key in metadata}
     if operation == "kda_prefill":
-        for alias, field_name in (("has_initial_state", "use_initial_state"), ("return_final_state", "output_final_state")):
+        for alias, field_name in (("has_initial_state", "use_initial_state"), ("return_final_state", "output_final_state"),
+                                  ("save_chunk_states", "save_intermediate_state")):
             if alias in metadata:
                 fields[field_name] = metadata[alias]
     bt = metadata.get("bt", metadata.get("chunk_size", DIAG_BLOCK_WIDTH if pinned else GDN_CHUNK64_TOKENS))
     return LinearAttentionContract(
-        operation, lengths, metadata.get("hq", hv), metadata.get("hk", hv), hv, dk, dv, bt,
+        operation, lengths, hq, hk, hv, dk, dv, bt,
         metadata.get("bv", DEFAULT_VALUE_TILE), metadata.get("bk", DEFAULT_KEY_TILE),
         dtype, abi=abi, metadata=metadata, **fields,
     )
@@ -707,15 +720,17 @@ def build_recover_ssm_plan(contract: LinearAttentionContract, ctx: OperatorPlann
         )
         record_read = replay_bytes(commit) if replay_bytes and commit.record_read_bytes else commit.record_read_bytes
         phases = []
+        if c.abi == "commit_recurrent_kda" or q == 1 and commit.a:
+            phases.append(Phase("read_acceptance", transfer(ctx, read=len(c.lengths) * ACCEPTANCE_WORD_BYTES)))
+        accepted_after = ("read_acceptance",) if phases else ()
         if q == 1 and commit.a:
             phases.extend((
-                Phase("read_acceptance", transfer(ctx, read=len(c.lengths) * ACCEPTANCE_WORD_BYTES)),
-                Phase("read_checkpoint", transfer(ctx, read=commit.state_read_bytes), ("read_acceptance",)),
+                Phase("read_checkpoint", transfer(ctx, read=commit.state_read_bytes), accepted_after),
                 Phase("publish", transfer(ctx, write=commit.state_write_bytes), ("read_checkpoint",)),
             ))
         elif commit.a:
-            phases.extend((Phase("read_base_state", transfer(ctx, read=commit.state_read_bytes)),
-                           Phase("read_records", transfer(ctx, read=record_read))))
+            phases.extend((Phase("read_base_state", transfer(ctx, read=commit.state_read_bytes), accepted_after),
+                           Phase("read_records", transfer(ctx, read=record_read), accepted_after)))
             after, previous = ("read_base_state", "read_records"), 0
             for end in dict.fromkeys((*commit.boundary_checkpoints, commit.a)):
                 name = f"replay_to_{end}" if commit.boundary_checkpoints else "replay"

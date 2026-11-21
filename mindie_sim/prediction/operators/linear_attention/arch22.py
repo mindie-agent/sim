@@ -292,24 +292,60 @@ def _build_recurrent(c: LinearAttentionContract, ctx: OperatorPlanningContext) -
     inputs = count * ((2 * c.dk + c.dv) * size + gate_width * element_bytes(c.gate_dtype)
                       + element_bytes(c.beta_dtype))
     outputs = count * c.dv * size
-    state = len(c.lengths) * c.hv * c.dk * c.dv * element_bytes(c.state_dtype)
+    slot_bytes = c.dk * c.dv * element_bytes(c.state_dtype)
+    state = len(c.lengths) * c.hv * slot_bytes
     report = analyze_state_residency(c, ctx, persistent=True)
     contraction = 2 * count * c.dk * c.dv
     # Key and query each contract over the full state. The update decays each
     # element and applies the outer product after forming beta * (V - S @ K).
     update = STATE_UPDATE_OPS_PER_ELEMENT * count * c.dk * c.dv + count * (gate_width + 2 * c.dv)
-    phases = (
-        Phase("load_state_and_tokens", transfer(ctx, read=inputs + c.use_initial_state * state)),
-        Phase("key_dot_rank1_update_query_dot", Work(resources={"vector": 2 * contraction + update}),
-              ("load_state_and_tokens",)),
-        Phase("publish", transfer(ctx, write=outputs + c.output_final_state * state),
-              ("key_dot_rank1_update_query_dot",)),
-    )
+    owners = len(c.lengths) * c.hv * ceil_div(c.dv, c.bv)
+    save_tokens = kda and (c.output_final_state or c.save_intermediate_state)
+    state_read = Phase("load_initial_state", transfer(ctx, read=c.use_initial_state * state))
+    if save_tokens:
+        ctx.datapath.route("ub", "gm", c.state_dtype)
+        sequence_lengths = tuple(sorted(c.lengths))
+
+        def token_phases(active):
+            return (
+                Phase("load_tokens", transfer(ctx, read=inputs // count * active)),
+                Phase("key_dot_rank1_update_query_dot", Work(resources={"vector": (2 * contraction + update) // count * active}),
+                      ("load_tokens",)),
+                Phase("publish_output", transfer(ctx, write=outputs // count * active), ("key_dot_rank1_update_query_dot",)),
+                Phase("publish_token_state", transfer(ctx, write=slot_bytes * active), ("key_dot_rank1_update_query_dot",)),
+            )
+
+        def lower(rc):
+            aics, aivs = (units[:owners] for units in owner_units(ctx))
+
+            def tile(index):
+                active = (len(sequence_lengths) - bisect_right(sequence_lengths, index)) * c.hv
+                stages = tuple(bind_phase(p, rc, ctx, aics, aivs) for p in token_phases(active))
+                return (*stages[:-1], replace(stages[-1], metadata={**stages[-1].metadata, "token_index": index}))
+
+            return KernelProgram((
+                bind_phase(state_read, rc, ctx, aics, aivs),
+                Stage("tokens", after=(state_read.name,), program=PipelineProgram(sequence_lengths[-1], 1, tile)),
+            ))
+
+        load, *rest = token_phases(count)
+        phases = (state_read, replace(load, after=(state_read.name,)), *rest)
+    else:
+        lower = None
+        phases = (
+            Phase("load_state_and_tokens", transfer(ctx, read=inputs + c.use_initial_state * state)),
+            Phase("key_dot_rank1_update_query_dot", Work(resources={"vector": 2 * contraction + update}),
+                  ("load_state_and_tokens",)),
+            Phase("publish", transfer(ctx, write=outputs + c.output_final_state * state),
+                  ("key_dot_rank1_update_query_dot",)),
+        )
     return make_plan(ctx, "fused_recurrent_kda" if kda else "gdn_recurrent", phases,
                      sources=SOURCES[-1:] if kda else (),
-                     owners=len(c.lengths) * c.hv * ceil_div(c.dv, c.bv),
+                     owners=owners, program=lower,
                      metadata={"state_tile_bytes": report.state_tile_bytes, "owner_ub_bytes": report.owner_ub_bytes,
-                               "state_contraction_ops": contraction, "persistent_ub_resident": True})
+                               "state_contraction_ops": contraction, "persistent_ub_resident": True,
+                               "token_state_slots": count if save_tokens else 0,
+                               "token_state_bytes": count * slot_bytes if save_tokens else 0})
 
 
 class Arch22LinearAttentionStrategy:

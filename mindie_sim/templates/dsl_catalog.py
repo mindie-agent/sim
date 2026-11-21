@@ -187,6 +187,10 @@ class MegaRecurrentKdaProblem:
     )
     state_indices: tuple[int, ...] = ()
     replay_capacity: int | None = None
+    u_stride0: int | None = None
+    k_stride0: int | None = None
+    decay_stride0: int | None = None
+    checkpoint_stride0: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,6 +200,10 @@ class CommitRecurrentKdaProblem:
     row_partitions: int | None = None
     state_indices: tuple[int, ...] = ()
     replay_capacity: int | None = None
+    u_stride0: int | None = None
+    k_stride0: int | None = None
+    decay_stride0: int | None = None
+    checkpoint_stride0: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -212,6 +220,7 @@ class MlaPrologProblem:
     return_qr: bool = True
     cache_layout: str = "PA_BSND"
     cache_page_size: int = MLA_CACHE_PAGE_SIZE
+    cache_index: tuple[int, ...] | None = None
 
     @property
     def quant_mode(self) -> QkvQuantMode:
@@ -263,8 +272,14 @@ class MixedQuantSparseMlaProblem:
     page_table: tuple[int, ...] = ()
     block_table: tuple[int, ...] = ()
     page_size: int = MQSMLA_KV_TILE
-    has_sink: bool = False
+    has_sink: bool = True
     sink_size: int = 0
+    ori_block_table: tuple[int, ...] = ()
+    cmp_block_table: tuple[int, ...] = ()
+
+    @property
+    def block_tables(self):
+        return self.ori_block_table or self.page_table or self.block_table, self.cmp_block_table
 
     def sparse_rows(self, query):
         if self.topk_indices and isinstance(self.topk_indices[0], (tuple, list)):
@@ -501,7 +516,7 @@ def _flash(p, aic, aiv, datapath, variant):
         policy_names.extend(("Akk", "Aqk"))
     if p.save_kernel_caches:
         policy_names.extend(("qg", "g_cumsum"))
-    if p.save_chunk_states:
+    if route == "staged" or p.save_chunk_states:
         policy_names.append("h")
     if route == "persistent":
         sizes += (_buf("state_fp32", "ub", KDA_HEAD_DIM * KDA_STATE_HALF * FP32_BYTES),
@@ -573,6 +588,19 @@ def _validate_kda_slots(p, batch, required):
         len(slots) != batch or len(set(slots)) != batch or any(type(i) is not int or i < 0 for i in slots)
     )):
         raise ModelingError("recurrent_kda_paged_state_geometry_invalid")
+    heads = p.heads if isinstance(p, CommitRecurrentKdaProblem) else KDA_MODEL_HEADS // p.tp
+    replay_pool_strides(p, heads, capacity)
+
+
+def replay_pool_strides(p, heads, capacity):
+    dense = heads * capacity * KDA_HEAD_DIM
+    checkpoint = heads * KDA_HEAD_DIM**2
+    strides = (p.u_stride0, p.k_stride0, p.decay_stride0, p.checkpoint_stride0)
+    widths = (dense, dense, dense, checkpoint)
+    if any(stride is not None and (type(stride) is not int or stride < width)
+           for stride, width in zip(strides, widths, strict=True)):
+        raise ModelingError("recurrent_kda_pool_stride_invalid")
+    return tuple(width if stride is None else stride for stride, width in zip(strides, widths, strict=True))
 
 
 def replay_pool_capacity(requested, required):
@@ -583,6 +611,11 @@ def _mla(p, aic, aiv, datapath, variant):
     if (min(p.tokens, p.dim, p.q_lora, p.heads, p.q_nope, p.cache_page_size) < 1 or not 0 <= p.rope < p.kvr
             or p.weight_format not in {"nd", "nz"} or p.cache_layout not in {"PA_BSND", "PA_NZ"}):
         raise ModelingError("mla_prolog_problem_invalid")
+    if p.cache_index is not None and (
+        not isinstance(p.cache_index, (tuple, list)) or len(p.cache_index) != p.tokens
+        or any(type(i) is not int for i in p.cache_index)
+    ):
+        raise ModelingError("mla_prolog_cache_index_invalid")
     mode = p.quant_mode
     if mode == QkvQuantMode.FP8 and p.cache_layout != "PA_BSND":
         raise ModelingError("mla_prolog_group_fp8_requires_pa_bsnd")
@@ -652,9 +685,10 @@ def _mqsmla(p, aic, aiv, datapath, variant):
         raise ModelingError("mqsmla_fixed_head_geometry_required")
     if min(p.n_ori, p.n_cmp) < 0 or p.queries < 1 or not 1 <= p.split_parts <= aic:
         raise ModelingError("mqsmla_problem_invalid")
-    table = p.page_table or p.block_table
-    if (p.page_table and p.block_table or p.page_size < 1 or p.sink_size < 0
-            or any(type(page) is not int or page < 0 for page in table)):
+    tables = p.block_tables
+    if (sum(map(bool, (p.ori_block_table, p.page_table, p.block_table))) > 1 or p.page_size < 1
+            or not p.has_sink or p.sink_size not in (0, p.heads)
+            or any(type(page) is not int or page < 0 for table in tables for page in table)):
         raise ModelingError("mqsmla_paged_operand_invalid")
     total = p.n_ori + p.n_cmp
     if p.topk_indices:
@@ -662,10 +696,12 @@ def _mqsmla(p, aic, aiv, datapath, variant):
         if batched and len(p.topk_indices) != p.queries:
             raise ModelingError("mqsmla_sparse_indices_invalid")
         for row in p.topk_indices if batched else (p.topk_indices,):
-            if (not isinstance(row, (tuple, list)) or len(row) != total
-                    or any(type(i) is not int or i < 0 or (table and i // p.page_size >= len(table)) for i in row)):
+            if not isinstance(row, (tuple, list)) or len(row) != total or any(
+                type(i) is not int or i < 0 or (table and i // p.page_size >= len(table))
+                for table, indices in zip(tables, (row[:p.n_ori], row[p.n_ori:]), strict=True) for i in indices
+            ):
                 raise ModelingError("mqsmla_sparse_indices_invalid")
-    elif table and max(p.n_ori, p.n_cmp) > len(table) * p.page_size:
+    elif any(table and rows > len(table) * p.page_size for table, rows in zip(tables, (p.n_ori, p.n_cmp), strict=True)):
         raise ModelingError("mqsmla_paged_operand_invalid")
     if p.split_parts > 1 and p.queries * p.split_parts > 2 * aic:
         raise ModelingError("mqsmla_fd_partial_slots_exhausted")

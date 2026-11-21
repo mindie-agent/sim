@@ -13,6 +13,7 @@ from dataclasses import asdict, dataclass
 import hashlib
 import importlib
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -179,21 +180,29 @@ def _load_blob(repo_dir, revision, path):
 
     def read(*args):
         return subprocess.run(
-            ["git", "-C", str(repo_dir), "--no-replace-objects", "cat-file", *args],
+            ["git", "-C", str(repo_dir), "--no-replace-objects", *args],
             capture_output=True, timeout=_GIT_TIMEOUT_SECONDS, check=False,
         )
 
     try:
-        commit = read("-t", revision)
+        mount = repo_dir.resolve()
+        bare = read("rev-parse", "--is-bare-repository")
+        if bare.returncode:
+            return "source_repository_not_mount_root", None
+        root = read("rev-parse", "--path-format=absolute",
+                    "--git-dir" if bare.stdout.strip() == b"true" else "--show-toplevel")
+        if root.returncode or Path(os.fsdecode(root.stdout.rstrip(b"\n"))).resolve() != mount:
+            return "source_repository_not_mount_root", None
+        commit = read("cat-file", "-t", revision)
         if commit.returncode or commit.stdout.strip() != b"commit":
             return "source_revision_not_commit", None
         object_name = f"{revision}:{path}"
-        blob_type = read("-t", object_name)
+        blob_type = read("cat-file", "-t", object_name)
         if blob_type.returncode:
             return "source_blob_missing", None
         if blob_type.stdout.strip() != b"blob":
             return "source_path_not_blob", None
-        result = read("blob", object_name)
+        result = read("cat-file", "blob", object_name)
     except TimeoutError:
         raise
     except OSError:

@@ -350,9 +350,19 @@ def _staged_work(c: LinearAttentionContract, ctx: OperatorPlanningContext, *, kd
                      "offdiagonal_inverse", "Kcd_U"):
             prepare += by_name[name]
         if not kda:
-            for name in ("R_O_inter", "R32_to_R16_UB_to_L1", "delta_L0C_to_UB", "S_next"):
+            # The output kernel recomputes QK and owns QH. The state kernel only needs WH.
+            dtype = c.dtype
+            inter = by_name["R_O_inter"]
+            recurrence += Work({dtype: inter.matrix[dtype] - 2 * rows * c.dk * c.dv * count},
+                               {**inter.resources, "mte1": rows * c.dk * size * count})
+            for name in ("R32_to_R16_UB_to_L1", "delta_L0C_to_UB", "S_next"):
                 recurrence += by_name[name]
-            output += by_name["O_L0C_to_GM"]
+            qk_operands = 2 * c.bt * c.dk
+            qh_operands = (c.bt + c.dv) * c.dk
+            output += by_name["O_L0C_to_GM"] + Work(
+                {dtype: 2 * c.bt * (c.bt + c.dv) * c.dk * count + 2 * rows * (c.bt - rows) * c.dv * count},
+                {"mte1": (qk_operands + qh_operands + rows * (c.bt - rows)) * size * count},
+            ) + transfer(ctx, read=2 * rows * c.dk * size * count, aiv=False)
         offdiag += sum(by_name["offdiagonal_inverse"].matrix.values())
         score_bytes += rows * c.bt * size * count
 
@@ -372,7 +382,7 @@ def _staged_work(c: LinearAttentionContract, ctx: OperatorPlanningContext, *, kd
             Phase("SyncAll.workspace", Work(), ("prepare_workspace_group",)),
         )
         # Stage 2 writes H_c before mutating its UB state, including staging at group boundaries.
-        bank_bytes = report.total_chunks * c.hv * c.dk * c.dv * element_bytes(c.stored_chunk_state_dtype)
+        bank_bytes = report.total_chunks * c.hv * c.dk * c.dv * FP32_BYTES
         return phases, {"offdiag_inv_flops": offdiag, "total_chunks": report.total_chunks,
                         "chunk_state_bank": bank_bytes,
                         "saved_entry_state_bytes": bank_bytes * c.save_intermediate_state}
@@ -402,7 +412,7 @@ def _flash_kda_state_wave(c: LinearAttentionContract, ctx: OperatorPlanningConte
                           sizes: Counter[int], save_entry: bool) -> tuple[Phase, ...]:
     size = element_bytes(c.dtype)
     head_chunks = sum(sizes.values()) * c.hv
-    state_bytes = c.dk * c.dv * element_bytes(c.stored_chunk_state_dtype)
+    state_bytes = c.dk * c.dv * FP32_BYTES
     work = Work()
     for rows, count in sizes.items():
         selected = {"R_O_inter", "R32_to_R16_UB_to_L1", "delta_L0C_to_UB", "S_next", "O_L0C_to_GM"}
@@ -421,7 +431,7 @@ def _flash_kda_state_wave(c: LinearAttentionContract, ctx: OperatorPlanningConte
 def _flash_kda_state_group(c: LinearAttentionContract, ctx: OperatorPlanningContext,
                            loads: int, finals: int, continued: bool, carry: int):
     elements = c.hv * c.dk * c.dv
-    entry = elements * element_bytes(c.stored_chunk_state_dtype)
+    entry = elements * FP32_BYTES
     state = elements * element_bytes(c.state_dtype)
     load = Phase("load_state_group", transfer(ctx, read=loads * (entry if continued else state))
                  + Work(resources={"vector": (2 * len(c.lengths) - loads) * elements,
@@ -549,7 +559,7 @@ def _recurrent_work(c: LinearAttentionContract, ctx: OperatorPlanningContext, to
         Phase("rank1_update", Work(resources={"vector": 2 * state + 2 * tokens * c.dv}), ("key_dot",)),
         Phase("query_dot", Work(resources={"vector": contraction}), ("rank1_update",)),
         Phase("publish_output", transfer(ctx, write=tokens * c.dv * elem), ("query_dot",)),
-        Phase("publish_token_state", transfer(ctx, write=state * FP32_BYTES * save_tokens), ("query_dot",)),
+        Phase("publish_token_state", transfer(ctx, write=state * element_bytes(c.state_dtype) * save_tokens), ("query_dot",)),
     )
 
 
@@ -559,7 +569,7 @@ def _build_recurrent(c: LinearAttentionContract, ctx: OperatorPlanningContext, *
     save_tokens = kda and (c.output_final_state or c.save_intermediate_state)
     nheads = len(c.lengths) * c.hv
     ctx.datapath.route("gm", "ub", c.dtype)
-    ctx.datapath.route("ub", "gm", "fp32" if save_tokens else c.state_dtype)
+    ctx.datapath.route("ub", "gm", c.state_dtype)
     report = analyze_state_residency(c, ctx, persistent=True)
     sequences = tuple(sorted(c.lengths))
     tokens = sum(sequences) * c.hv
@@ -601,7 +611,7 @@ def _build_recurrent(c: LinearAttentionContract, ctx: OperatorPlanningContext, *
         "owner_ub_bytes": report.owner_ub_bytes, "state_tile_bytes": report.state_tile_bytes,
         "state_contraction_ops": 2 * tokens * c.dk * c.dv, "persistent_ub_resident": True,
         "token_state_slots": tokens if save_tokens else 0,
-        "token_state_bytes": tokens * c.dk * c.dv * FP32_BYTES if save_tokens else 0,
+        "token_state_bytes": tokens * c.dk * c.dv * element_bytes(c.state_dtype) if save_tokens else 0,
     })
 
 

@@ -18,6 +18,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 from typing import Any
 
 from .hardware import machine
@@ -422,7 +423,7 @@ def template_context(dp, p, **extra_rates):
     units.update(dict.fromkeys(extra_rates.keys() - units.keys(), dp.aiv_count))
     rates = dict.fromkeys(units, 10**6) | extra_rates
     return RecipeContext(p, {}, dict(zip(units, units)), rates, dp.aic_count, resource_units=units,
-                         compute_peaks={"bf16": 1000 * rates["cube"]},
+                         compute_peaks=dict.fromkeys(("bf16", "fp16"), 1000 * rates["cube"]),
                          pool_names={pool: pool for pool, _ in dp.buffers})
 
 def run_template(dp, context, result, *, trace_limit=0):
@@ -467,9 +468,11 @@ def provenance_git_fixture(root, relative_path, blob, symbol, line_range):
     git("add", "--", relative_path)
     git("-c", "user.name=Provenance Test", "-c", "user.email=fixture@example.test",
         "commit", "--quiet", "--no-gpg-sign", "-m", "Source fixture")
+    bare = root / "bare.git"
+    git("clone", "--quiet", "--bare", str(repo), str(bare))
     ref = TemplateSourceRef("test/upstream", git("rev-parse", "HEAD"), relative_path,
                             sha256(blob).hexdigest(), symbol, line_range)
-    return repo, ref, git("rev-parse", "HEAD^{tree}")
+    return repo, bare, ref, git("rev-parse", "HEAD^{tree}")
 
 
 def verify_template_declaration(audit, root, ref, repo=None):
@@ -516,7 +519,7 @@ def serpentine(major, minor):
 def flash_kda_op(problem):
     metadata = dict(lengths=problem.lengths, hv=problem.value_heads, hq=problem.query_heads,
                     device_name=problem.device_name, has_initial_state=problem.has_initial_state,
-                    return_final_state=problem.return_final_state)
+                    return_final_state=problem.return_final_state, save_chunk_states=problem.save_chunk_states)
     return OpSpec("kda", "kda_prefill", "prefill", 0, 0, (), (), (), (), (), dtype="bf16", layout="BNSD",
                   recipe="kda_prefill", metadata=tuple(metadata.items()))
 
@@ -534,3 +537,18 @@ def mounted_catalog_sources(root, refs):
     repositories = {ref.repository.split("/")[-1] for ref in refs}
     candidates = (parent / "refs" for parent in root.parents)
     return next((path for path in candidates if all((path / repo).is_dir() for repo in repositories)), None)
+
+
+def recurrent_scan_context(tokens=10, chunk=4, *, setup=0, minimum=0):
+    chunks = (tokens + chunk - 1) // chunk
+    op = OpSpec("scan", "recurrent_scan", "prefill", 0, 0, (), (tokens,),
+                (tokens,), (tokens,), (tokens,), metadata=(
+                    ("chunks", chunks), ("chunk", chunk), ("tokens", tokens),
+                    ("heads", 4), ("chunk_vector_ops", 100.0)))
+    return SimpleNamespace(
+        op=op, work={"cube": 1000.0, "vector": 500.0, "hbm": 300.0},
+        resource_names={"cube": "cube", "vector": "vector"},
+        rates={"cube": 1000.0, "vector": 1000.0}, core_count=4,
+        minimum_ms=minimum, setup_ms=setup, minimum_provenance={},
+        native_work={}, service_identity={},
+    )

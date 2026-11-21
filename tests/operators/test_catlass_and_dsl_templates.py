@@ -14,16 +14,15 @@ import pytest
 from _support.axes import ARCH_IDS, REPRESENTATIVE_SKUS, SKUS
 from _support.hardware import machine
 from _support.linear_cases import (
-    REPO_ROOT as ROOT, compile_tile_region as _region, enumerate_matrix as _matrix, flash_kda_op,
+    REPO_ROOT as ROOT, compile_tile_region as _region, enumerate_matrix as _matrix,
     load_template_provenance, lower_reference as _reference, mounted_catalog_sources,
-    provenance_git_fixture, run_template as _run, sku_planning_context, stage_ancestors as _ancestors,
+    provenance_git_fixture, run_template as _run, stage_ancestors as _ancestors,
     stage_bytes as _bytes, stages_by_name as _stages, template_context as _context,
     serpentine, template_datapath as _datapath, template_live_bindings, tile_edge as _edge,
     verify_template_declaration, visitor_graph, with_mx_modes,
 )
-from mindie_sim.prediction.operators.linear_attention import resolve_operator_plan
 from mindie_sim.prediction.program import Allocation, Stage
-from mindie_sim.prediction.runtime.memory_physics import AdmissionMemoryView
+from mindie_sim.prediction.runtime.memory_physics import AddressRun, AdmissionMemoryView
 from mindie_sim.prediction.runtime.tile_solver import LiveBufferSpec, TileInfeasibleError
 from mindie_sim.public.errors import UnmodeledCapabilityError
 from mindie_sim.schema.common import ModelingError
@@ -35,7 +34,7 @@ from mindie_sim.templates import (
 from mindie_sim.templates import catlass_catalog as cat, dsl_catalog as dsl
 from mindie_sim.templates.catlass_lower import solve_catlass_tile
 from mindie_sim.templates.contracts import evg_order
-from mindie_sim.templates.fuse_region import validate_live_buffer_owners
+from mindie_sim.templates.fuse_region import Lowering, validate_live_buffer_owners
 
 pytestmark = pytest.mark.tier0
 
@@ -149,6 +148,10 @@ def test_splitk_uses_ceil_grid_and_rebinds_workspace_under_pressure(direct):
         delivered = _run(direct, context, result).delivered
         assert result.summary.realized_hbm_bytes == pytest.approx(delivered["hbm:ctr_r"] + delivered["hbm:ctr_w"])
         assert result.summary.realized_hbm_bytes == (43_008 if pressured else inputs + output)
+        assert result.summary.dram_sector_bytes == result.summary.turnaround_service_bytes == result.summary.realized_hbm_bytes
+        assert result.summary.l2_hit_bytes == result.l2_hit_bytes == (0 if pressured else 16_384)
+        assert result.summary.l2_miss_bytes == result.dram_miss_bytes == result.summary.dram_sector_bytes
+        assert result.summary.l2_hit_bytes + result.summary.l2_miss_bytes == result.summary.issued_copy_bytes
         assert delivered["hbm:ctr_r"] == pytest.approx(inputs + pressured * spec.workspace_bytes)
         assert delivered["hbm:ctr_w"] == pytest.approx(output + pressured * spec.workspace_bytes)
     wide = replace(p, n=2 * p.n, dtype_a="fp16", dtype_b="fp16")
@@ -257,7 +260,7 @@ def test_mx_scale_storage_and_decompression_follow_declared_mode(mx_datapath, di
 def test_simt_thread_ceilings_carveout_and_routing_workspace(datapaths, policy, threads):
     indirect, direct = datapaths
     indexed = policy == "MatmulGatherScatterSimt"
-    p = CatlassProblem(1, 32, 32, indices=[7], physical_m=8) if indexed else CatlassProblem(32, 32, 32)
+    p = CatlassProblem(1, 32, 32, "fp16", "fp16", "fp16", indices=(7,), physical_m=8) if indexed else CatlassProblem(32, 32, 32)
     options = dict(simt_variants=(policy,), simt_thread_blocks=((32, threads // 32, 1),))
     spec, = _matrix("a5_simt", p, direct, **options)
     assert direct.usable_bytes("ub") == 248 * KIB and direct.usable_bytes("ub", kernel=True) == 232 * KIB
@@ -272,11 +275,11 @@ def test_simt_thread_ceilings_carveout_and_routing_workspace(datapaths, policy, 
         assert _bytes(stages, ":routing_read", "mte2_aiv") == _bytes(stages, ":routing_write", "fixpipe") == p.m * p.n * 2
     else:
         assert lowered.summary.semantic_work == (SemanticWorkItem(
-            "catlass.a5_simt:matrix", "matrix_mac", "bf16", 2 * p.m * p.n * p.k,
-            ("aiv_simt",) if indexed else ("cube",), ("dataparallel",),
+            "catlass.a5_simt:matrix", "matrix_mac", p.dtype_a, 2 * p.m * p.n * p.k,
+            ("cube", "aiv_simt") if indexed else ("cube",), ("dataparallel",),
         ),)
         ub, = solve_catlass_tile(spec, p, direct).pool_peaks
-        assert (ub.peak_bytes, ub.capacity_bytes) == (threads * 4, 232 * KIB)
+        assert (ub.peak_bytes, ub.capacity_bytes) == (64 * KIB if indexed else threads * 4, 232 * KIB)
         assert stages["simt:0:simt_mac"].metadata["thread_block_dim"] == options["simt_thread_blocks"][0]
     if indexed:
         reads = {entry.allocation_id: entry.ranges for entry in lowered.summary.read_obligations}
@@ -287,6 +290,15 @@ def test_simt_thread_ceilings_carveout_and_routing_workspace(datapaths, policy, 
         assert sum(s.work["mte3"] for n, s in stages.items() if n.startswith("simt:zero_output:") and s.work) == 8 * 32 * 2
         live = lower_catlass_spec(spec, p, direct, **template_live_bindings(direct, p, aiv_simt=10**6))
         assert _stages(live)["simt:0:scatter"].program.pattern.runs.sector_intervals() == row
+        small = replace(direct, buffers=tuple((key, 16 * KIB if key == "ub" else size) for key, size in direct.buffers))
+        with pytest.raises(TileInfeasibleError):
+            solve_catlass_tile(spec, p, small)
+        with pytest.raises(ModelingError, match="gather_scatter_requires_fp16"):
+            solve_catlass_tile(spec, replace(p, dtype_a="fp32"), direct)
+        cube_spec, = _matrix("full_load_a_gather_scatter", p, direct)
+        cube = lower_catlass_spec(cube_spec, p, direct, **template_live_bindings(direct, p))
+        assert dict(cube.summary.issued_cube_flops_by_dtype)["fp16"] >= 2 * p.m * p.n * p.k
+        assert _stages(cube)["tile:0:scatter"].program.pattern.runs.sector_intervals() == row
 
 @pytest.mark.parametrize("arch_id", ARCH_IDS)
 def test_reference_admission_follows_declared_isa(datapaths, arch_id):
@@ -311,7 +323,7 @@ def test_flash_kda_cost_threshold_and_saved_output_visibility(direct):
         expected = "persistent" if persistent < staged - staged * margin // 1_000_000 else "staged"
         assert dsl.select_flash_kda_template((192, 64, 128), 2, cost_coefficients=costs, workspace_slots=3) == expected
     p = dsl.FlashKdaProblem((65,), metadata_ms=0.1, eager_d2h_bytes=256, save_matrices=True,
-                            save_kernel_caches=True, save_chunk_states=True, requested_template="staged")
+                            save_kernel_caches=True, save_chunk_states=True, requested_template="staged", max_chunk_group=1)
     spec, result = _reference(dsl.FLASH_KDA, p, direct)
     assert spec.template_variant == "staged" and spec.uses_aicpu_metadata and spec.has_eager_d2h_readback
     assert result.summary.stars_launch_count == 2 and result.summary.aicpu_metadata_ms == Fraction(1, 10)
@@ -321,32 +333,22 @@ def test_flash_kda_cost_threshold_and_saved_output_visibility(direct):
     for tensor, size in {"Akk": 65 * 64 * 2, "Aqk": 65 * 64 * 2, "qg": 65 * 128 * 2,
                          "g_cumsum": 65 * 128 * 4, "h": 2 * 128**2 * 4}.items():
         assert dict(spec.l2_cache_policies)[tensor] == "disable"
-        assert _bytes(stages, f":save_{tensor}", "hbm") == size
+        carry = _bytes(stages, ":carry_h", "hbm") if tensor == "h" else 0
+        assert _bytes(stages, f":save_{tensor}", "hbm") + carry == size
     assert "kda:0:0:0:save_h" in _ancestors(stages, "kda:0:0:0:fp32_state_update")
+    reload = stages["kda:0:0:1:reload_h"]
+    assert reload.work["hbm"] == 128**2 * 4 and "kda:0:0:0:carry_h" in _ancestors(stages, reload.name)
     _, persistent_result = _reference(dsl.FLASH_KDA, replace(p, requested_template="persistent"), direct)
     assert _bytes(stages, ":q_decayed:read", "mte2_aic") == 65 * 128 * 2
     assert _bytes(_stages(persistent_result), ":q_decayed:read", "mte2_aic") == 0
 
-@pytest.mark.parametrize("heads,route", ((1, "persistent"), (32, "staged")))
-def test_flash_kda_bnsd_routes_by_head_count_and_binds_state_flags(direct, heads, route):
-    _, ctx = sku_planning_context(REPRESENTATIVE_SKUS["a5"], "kda")
-    name, state = "Ascend950DT", heads * 128**2 * 4
-    p = dsl.FlashKdaProblem((1,), heads, heads, device_name=name, has_initial_state=True, return_final_state=False)
-    spec, result = _reference(dsl.FLASH_KDA, p, direct, aic_budget=32, aiv_budget=64)
-    assert spec.template_variant == route and ctx.effective_aic_cores == 32
-    stages = _stages(result)
-    assert _bytes(stages, ":initial_state", "mte2_aiv") == state and not _bytes(stages, ":final_state", "mte3")
-    plan = resolve_operator_plan(flash_kda_op(p), ctx).recipe
-    phases = {p.phase_id: {w.resource: w.amount for w in p.work} for p in plan.pipeline_spec.phases}
-    load, store = ("state_begin", "state_end") if route == "persistent" else ("load_state_group", "store_state_group")
-    assert plan.metadata["template"] == route and phases[load]["hbm"] == state and not phases[store].get("hbm")
-
 @pytest.mark.parametrize("tp,sequence", tuple(product((4, 8, 16), (4, 8))))
 def test_mega_recurrent_variant_workspace_reads_and_launch_savings(direct, tp, sequence):
-    slots, capacity = tuple(range(7, 7 + tp)), sequence + 1
-    p = dsl.MegaRecurrentKdaProblem(1, tp, sequence, state_indices=slots, replay_capacity=capacity)
+    slots, capacity, heads = tuple(range(7, 7 + tp)), sequence + 1, 96 // tp
+    stride = heads * capacity * 128 + 128
+    p = dsl.MegaRecurrentKdaProblem(1, tp, sequence, state_indices=slots, replay_capacity=capacity, k_stride0=stride)
     spec, result = _reference(dsl.MEGA_KDA, p, direct)
-    stages, heads = _stages(result), 96 // tp
+    stages = _stages(result)
     assert spec.template_variant == f"tp{tp}_s{sequence}"
     for tensor, width in (("Q", 128), ("K", 128), ("V", 128), ("decay", 128), ("beta", 1), ("output_gate", 128)):
         payload = SECTOR * ceil(sequence * heads * width * 2 / SECTOR)
@@ -358,31 +360,9 @@ def test_mega_recurrent_variant_workspace_reads_and_launch_savings(direct, tp, s
     obligations = {entry.allocation_id: entry.ranges for entry in result.summary.write_obligations}
     assert "checkpoint" not in obligations
     for tensor, element in (("replay_u", 4), ("replay_k", 2), ("replay_decay", 4)):
-        assert obligations[tensor] == tuple(
-            (head * capacity * 128 * element, (head * capacity + sequence) * 128 * element)
-            for head in range(slots[0] * heads, (slots[-1] + 1) * heads)
-        )
-
-@pytest.mark.parametrize("partitions", (1, 2))
-def test_commit_zero_accept_and_partitioned_replay_bytes(direct, partitions):
-    p = dsl.CommitRecurrentKdaProblem((0, 2), row_partitions=partitions)
-    _, result = _reference(dsl.COMMIT_KDA, p, direct)
-    stages = _stages(result)
-    assert {name for name in stages if name.startswith("commit:0:")} == {
-        f"commit:0:{row}:accepted_read" for row in range(0, 128, 128 // partitions)
-    }
-    assert "commit:1:0:accepted_read" in _ancestors(stages, "commit:1:0:checkpoint_read")
-    assert _bytes(stages, ":checkpoint_read", "mte2_aiv") == _bytes(stages, ":checkpoint_write", "mte3") == 4 * 128**2
-    replay = 4 * 128 + 6 * partitions * 128
-    assert sum(_bytes(stages, f":replay_{tensor}:read", "mte2_aiv") for tensor in ("u", "k", "decay")) == 2 * replay
-    assert dsl.commit_replay_bytes(partitions) == replay
-    _, empty = _reference(dsl.COMMIT_KDA, replace(p, accepted=(0, 0)), direct)
-    assert empty.summary.logical_transfer_bytes == 2 * partitions * 4
-    assert {entry.allocation_id for entry in empty.summary.read_obligations} == {"accepted"}
-    assert not empty.summary.write_obligations
-    for budget, quota in ((8, 8), (23, 8), (24, 24), (27, 24), (28, 28), (31, 28), (32, 32)):
-        spec, = enumerate_dsl_specs(dsl.COMMIT_KDA, p, direct, aic_budget=budget)
-        assert (spec.aic_budget, spec.aiv_budget) == (quota, 2 * quota)
+        pitch = stride if tensor == "replay_k" else heads * capacity * 128
+        bases = ((slot * pitch + head * capacity * 128) * element for slot in slots for head in range(heads))
+        assert obligations[tensor] == tuple((base, base + sequence * 128 * element) for base in bases)
 
 @pytest.mark.parametrize("mode", tuple(dsl.QkvQuantMode))
 def test_mla_four_products_workspace_and_quantization_barrier(direct, mode):
@@ -407,9 +387,15 @@ def test_mla_four_products_workspace_and_quantization_barrier(direct, mode):
     width = 1 if mode in {dsl.QkvQuantMode.FP8_TENSOR, dsl.QkvQuantMode.HiF8} else 2
     assert all(stages[f"mla:0:{matrix}:l0{bank}"].work["mte1"] > 0 for matrix, bank in product(widths, "ab"))
     if mode == dsl.QkvQuantMode.FP8:
-        packed = replace(p, tokens=1, kvr=576, mode=1)
+        packed = replace(p, tokens=2, kvr=576, mode=1, cache_index=(7, -1))
         _, live = _reference(dsl.MLA_PROLOG, packed, direct, live_rates={"vec_alu": 10**6})
-        assert _stages(live)["mla:0:kv_cache"].program.pattern.logical_bytes == 656
+        indexed = _stages(live)
+        cache = indexed["mla:0:kv_cache"]
+        assert cache.after == ("mla:0:cache_index",) and indexed["mla:0:cache_index"].program.pattern.logical_bytes == 16
+        assert cache.program.pattern.logical_bytes == 656 and cache.program.pattern.runs.runs[0].base_byte == 7 * 656
+        qr, = (entry for entry in live.summary.write_obligations if entry.allocation_id == "mla:qr")
+        reads, _ = compose_step_obligations((live.summary, replace(live.summary, read_obligations=(qr,))))
+        assert all(entry.allocation_id != "mla:qr" for entry in reads)
         with pytest.raises(ModelingError, match="group_fp8_requires_pa_bsnd"):
             enumerate_dsl_specs(dsl.MLA_PROLOG, replace(packed, cache_layout="PA_NZ"), direct)
 
@@ -472,6 +458,7 @@ def test_mixed_sparse_mla_bank_bytes_and_split_row_reduction(direct, splits):
     spec, result = _reference(dsl.MQSMLA, p, direct)
     stages = _stages(result)
     assert (_bytes(stages, ":ori", "mte2_aiv"), _bytes(stages, ":cmp", "mte2_aiv")) == (544 * p.n_ori, 320 * p.n_cmp)
+    assert _bytes(stages, ":sink", "mte2_aiv") == splits * 256
     slot = (64 * 512 + 2 * 64) * 4
     assert spec.workspace_bytes_total == 2 * slot * spec.aic_budget == 263_168 * spec.aic_budget
     writes = {name for name in stages if name.endswith(":fd_partial_write")}
@@ -485,10 +472,12 @@ def test_mixed_sparse_mla_bank_bytes_and_split_row_reduction(direct, splits):
         assert stages["mqsmla:0:output"].after == (reduce,)
     else:
         assert barrier not in stages and reduce not in stages
-        p = replace(p, n_ori=2, n_cmp=0, topk_indices=(0, 7), has_sink=True)
+        p = replace(p, n_ori=1, n_cmp=1, topk_indices=(0, 7), ori_block_table=(1,), cmp_block_table=(3,))
         _, indexed = _reference(dsl.MQSMLA, p, direct)
         reads = {entry.allocation_id: entry.ranges for entry in indexed.summary.read_obligations}
-        assert reads["mqsmla:ori"] == ((0, 544), (7 * 544, 8 * 544))
+        assert reads["mqsmla:ori"] == ((128 * 544, 129 * 544),)
+        assert reads["mqsmla:cmp"] == ((391 * 320, 392 * 320),)
+        assert {name for name in reads if name.endswith(":block_table")} == {"mqsmla:ori:block_table", "mqsmla:cmp:block_table"}
         assert _bytes(_stages(indexed), ":sink", "mte2_aiv") == p.heads * 4
 
 def test_region_rejects_invalid_graph_and_unread_alias(direct):
@@ -568,6 +557,17 @@ def test_region_compiler_preserves_coupling_metadata_and_step_obligations(direct
     _, mixed = _region(dp, _edge(), live_in_obligations=(cold, warm))
     assert mixed.summary.read_obligations == (cold, warm)
     assert compose_step_obligations((mixed.summary,)) == ((cold,), ())
+    priming = Lowering(dp)
+    priming.access("warm", "shared", SECTOR, offset=SECTOR)
+    priming.result("K3", "prime", (), spec, (), spec.tile_solution)
+    lowering = Lowering(dp, memory_view=priming.state)
+    lowering.access("partial", "shared", 2 * SECTOR)
+    rows, stride = 4097, 2 * SECTOR
+    lowering.access("strided", "strided", rows * SECTOR, runs=(AddressRun(0, rows, SECTOR, stride),))
+    summary = lowering.result("K3", "read", (), spec, (), spec.tile_solution).summary
+    (shared, strided), _ = compose_step_obligations((summary,))
+    assert shared == cold and warm in summary.read_obligations
+    assert strided.ranges == tuple((i * stride, i * stride + SECTOR) for i in range(rows))
     for invalid in ((True, 2), {"inner": 1}, Fraction(1, 8)):
         with pytest.raises(ModelingError, match="stage_metadata_invalid"):
             replace(stage, metadata={"nested": invalid})
@@ -575,18 +575,19 @@ def test_region_compiler_preserves_coupling_metadata_and_step_obligations(direct
 def test_catalog_provenance_validates_mounted_catalog(monkeypatch):
     catalog = builtin_template_catalog()
     refs = catalog.all_template_source_refs()
-    assert catalog.ids("K1") and len(catalog.ids("K2")) == 10 and len(catalog.ids("K3")) == 8
+    assert catalog.ids("K1") and len(catalog.ids("K2")) == 11 and len(catalog.ids("K3")) == 8
     mounted = mounted_catalog_sources(ROOT, refs)
     checked, findings = load_template_provenance(monkeypatch).verify(ROOT, refs_root=mounted)
-    assert checked == len(refs) == len(set(refs)) == 35
+    assert checked == len(refs) == len(set(refs)) == 36
     assert [f.reason.split(":")[0] for f in findings] == ["source_repository_missing"] * (len(refs) if mounted is None else 0)
 
 def test_catalog_provenance_rejects_invalid_sources(monkeypatch, tmp_path):
     audit = load_template_provenance(monkeypatch)
     blob = b"// prefix\nconstexpr int TOTAL_MUTEX_IDS = 28;\n// suffix\n"
-    repo, ref, tree = provenance_git_fixture(tmp_path, "fixture.hpp", blob, "TOTAL_MUTEX_IDS", (2, 2))
+    repo, bare, ref, tree = provenance_git_fixture(tmp_path, "include/fixture.hpp", blob, "TOTAL_MUTEX_IDS", (2, 2))
     for mounted, changes, reason in (
         (repo, {}, None), (None, {}, "source_repository_missing"),
+        (bare, {}, None), (repo / "include", {}, "source_repository_not_mount_root"),
         (None, {"source_sha256": "0" * 64}, "source_repository_missing"),
         (repo, {"revision": tree}, "source_revision_not_commit"),
         (repo, {"symbol": "OTAL_MUTEX_ID"}, "symbol_missing_from_range"),
