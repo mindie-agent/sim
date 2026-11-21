@@ -70,9 +70,9 @@ def _main(argv: Sequence[str], /, *, prog: str = "mindie-sim") -> int:
         ):
             return 2
         if (
-            args.command == "build-accel"
+            args.command in {"build-accel", "onboard-sku", "onboard-operator"}
             and isinstance(result, dict)
-            and not result.get("ok")
+            and result.get("ok") is False
         ):
             return 2
     except TimeoutError:

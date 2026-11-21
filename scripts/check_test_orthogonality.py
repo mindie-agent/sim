@@ -29,8 +29,8 @@ from pathlib import Path
 
 GIT_TIMEOUT_S = 60
 HARD_MAX_LINES = 800
-#: Hard ceiling on manifest modules: 74 legacy-consolidation slots + new-mechanism headroom.
-MODULE_CEILING = 96
+#: Hard ceiling on manifest modules: 74 legacy-consolidation slots + Stage-3A..3D new-mechanism headroom.
+MODULE_CEILING = 104
 LITERAL_ENUM_MIN = 8
 PROCESS = re.compile(
     r"^(issues?\d*|gh\d+|pr\d+|open|r\d+|round\d+|pass\d+|fix\d+|finding\d+|iter\d+"

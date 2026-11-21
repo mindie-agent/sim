@@ -1,12 +1,12 @@
 # Product-orthogonal test taxonomy (Vol 6 §2). Consumed by scripts/check_test_orthogonality.py.
 # Every tests/<domain>/test_*.py must be listed here; `reserved = true` marks modules planned for a
-# later shard (may be absent until `--strict`). max_modules = 96: 74 legacy-consolidation slots plus
-# headroom for genuinely new mechanisms (Stage-2 physics, Stage-3A L0/remote/templates, Stage-3B).
+# later shard (may be absent until `--strict`). max_modules = 104: 74 legacy-consolidation slots plus
+# headroom for genuinely new mechanisms (Stage-2 physics, Stage-3A/3B, Stage-3D onboarding).
 schema_version = 1
 domains = ["schema", "runtime", "collectives", "operators", "spine", "serving", "observations", "product", "hygiene"]
 support_dirs = ["_support", "_oracles", "fixtures", "runtime/native"]
 max_lines = 600
-max_modules = 96
+max_modules = 104
 
 # ---------------------------------------------------------------- schema (hardware, datapath, catalog)
 [[module]]
@@ -601,4 +601,14 @@ path = "product/test_rewrite_oracle.py"
 tier = "tier0"
 owns = [
   "mindie_sim/rewrite/oracle.py",
+]
+
+[[module]]
+path = "product/test_onboarding_pipelines.py"
+tier = "tier1"
+owns = [
+  "mindie_sim/onboarding",
+  "mindie_sim/cli_onboarding.py",
+  "tools/onboard_sku.py",
+  "tools/onboard_operator.py",
 ]
