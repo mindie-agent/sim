@@ -757,6 +757,8 @@ def score_sealed_gate_cases(
     active_runner = _bind_active_runner(
         runner, primitive_table=primitive_table, profile_override=profile_override
     )
+    if isinstance(active_runner, WhiteboxSpineRunner) and len(manifest.cases) > 1:
+        active_runner.prefetch_cases(manifest.cases)
     checked_runner = ClockParityRunner(
         active_runner, expected_clock, expected_family=exp_fam, plan_by_case=plan_by_case
     )

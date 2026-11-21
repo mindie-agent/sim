@@ -119,14 +119,18 @@ def _independent_engine_runner(pred_by_id: dict[str, int], *, default_ns: int = 
     return _Runner()
 
 
-def _plan_fixture_bundle(plan: dict[str, Any], *, levels: tuple[str, ...] = ("L1", "L2", "L3"), clock_op: str = "elapsed_span", scale: float = 1.02, impl: str = "whitebox_spine", capture_dir: Path | None = None, omit_capture_p99: bool = False) -> tuple[list[dict[str, Any]], dict[str, int], list[dict[str, Any]], list[dict[str, Any]], dict[str, str]]:
-    rows, preds, lean_rows, prog_shas = [], {}, [], {}
+def _plan_fixture_bundle(plan: dict[str, Any], *, levels: tuple[str, ...] = ("L1", "L2", "L3"), clock_op: str = "elapsed_span", scale: float = 1.02, impl: str = "whitebox_spine", capture_dir: Path | None = None, omit_capture_p99: bool = False, overrides: dict[str, tuple[int, int]] | None = None) -> tuple[list[dict[str, Any]], dict[str, int], list[dict[str, Any]], list[dict[str, Any]], dict[str, str]]:
+    rows, preds, lean_rows, prog_shas, ov_map = [], {}, [], {}, dict(overrides or {})
     sku, family, target_id = str(plan["sku"]), str(plan.get("family") or ""), str(plan.get("target_id") or "")
     for split, pts in (("train", plan["train_points"]), ("heldout", plan["heldout_points"])):
         for idx, pt in enumerate(pts):
             pid, lvl = str(pt["point_id"]), ("L1" if split == "train" else levels[idx % len(levels)])
-            meas = (10_000 + idx * 100) if split == "train" else (20_000 + idx * 250)
-            pred, p99 = int(round(meas * scale)), int(meas * 1.05)
+            if pid in ov_map:
+                meas, pred = ov_map[pid]
+            else:
+                meas = (10_000 + idx * 100) if split == "train" else (20_000 + idx * 250)
+                pred = int(round(meas * scale))
+            p99 = int(meas * 1.05)
             ranks, ev_ids = list(range(validate_parallel_topology(str(pt.get("parallel_topology") or "tp1")))), [f"{split[0]}-s-{idx}", f"{split[0]}-e-{idx}"]
             cap_obj: dict[str, Any] = {"case_id": pid, "sku": sku, "split": split, "level": lvl, "idx": idx, "start_event": "start", "end_event": "end", "clock_domain": "device_ns", "device_ranks": ranks, "clock_operator": clock_op, "event_ids": ev_ids, "measured_ns": meas, "busy_union_ns": meas if clock_op == "busy_union" else None, "elapsed_span_ns": meas if clock_op == "elapsed_span" else None}
             if not omit_capture_p99:
@@ -436,11 +440,26 @@ def test_host_queue_unified_grant_cleanup_and_profiler_roundtrip(tmp_path):
     assert b4_by_id["anchor_ctx_512"]["shape"]["seq_len"] == 513 and b4_by_id["anchor_ctx_512"]["shape"]["page_count"] == 5 and b4_by_id["anchor_ctx_512"]["shape"]["query_layout"] == "BNSD"
     assert b4_by_id["cross_b16_ctx_4097"]["level"] == "L2" and b4_by_id["cross_b16_ctx_4097"]["nodes"][1]["builder"] == "grouped_matmul" and b4_by_id["cross_b16_ctx_4097"]["nodes"][1]["shape"]["e"] == 16
     assert b4_by_id["cores_wave_batch_x_kv_heads_128_minus1_2559"]["shape"]["sequences"] == 2559 and len(b4_by_id["offgrid_ctx_200000"]["nodes"]) == 15 and len(b4_by_id["cross_tp2_pcp2_dcp4_ctx_400000"]["nodes"]) == 19
+    n200 = {n["op_id"]: n for n in b4_by_id["offgrid_ctx_200000"]["nodes"]}
+    n400 = {n["op_id"]: n for n in b4_by_id["cross_tp2_pcp2_dcp4_ctx_400000"]["nodes"]}
+    assert n200["s0.l0.kv_store"]["shape"]["width"] == 576 and n400["s0.l0.dcp_merge"]["nbytes"] == 4104 and n400["s0.l0.dcp_merge"]["group_size"] == 4 and n400["s0.l0.output_reduce"]["nbytes"] == 4096 and n400["s0.l0.dcp_update"]["dtype"] == "fp32" and n400["s0.l0.dcp_update"]["shape"]["partial_count"] == 4
     assert b4_by_id["abi_reject_topk_attr_2049"]["shape"]["top_k"] == 2049 and b4_by_id["abi_reject_topk_attr_2049"]["shape"]["enforce_exact_topk"] is True
     b4_splits = _split_disjoint_acquisitions(b4_plan, domain=None, dry_run=False)
     assert [t for t, _, _ in b4_splits] == ["train", "heldout-l1", "heldout-l2", "heldout-l3-w1", "heldout-l3-w4"] and b4_splits[3][2] == b4_splits[4][2] and len({s[2] for s in b4_splits[:4]}) == 4
     with pytest.raises(ModelingError, match="profiler_actual_geometry_mismatch"):
         normalize_profiler_records([{"schema": "mindie-bench-observation/1", "record_type": "observation", "case_id": "cross_b16_ctx_4097", "run_id": "r1.base.eager.t0", "trial": 0, "rank": 0, "split": "heldout", "boundary": "fx_region", "timing_mode": "eager", "duration_ms": 0.25, "sample_id": "s0", "sku": A2_SKU, "validated": True, "qualified": True}, {"schema": "mindie-bench-subgraph-run/1", "record_type": "receipt", "case_id": "cross_b16_ctx_4097", "run_id": "r1", "rank": 0, "status": "ok", "actual_shape": {"sequences": 1, "q_len": 16, "tokens": 16, "seq_len": 4098, "kv_heads": 1, "heads": 16, "head_dim": 512}}], plan_doc=b4_plan, sku=A2_SKU)
+    # R6 #1, #2, #4: Missing/mismatched receipt, missing actual_shape (no requested_shape fallback), L3 rank timed_nodes divergence, L2 timed_nodes subset, page_count vs block_table conflict!
+    with pytest.raises(ModelingError, match="profiler_bench_receipt_missing"):
+        normalize_profiler_records([{"schema": "mindie-bench-observation/1", "record_type": "observation", "case_id": "anchor_ctx_512", "run_id": "r1.base.eager.t0", "trial": 0, "rank": 0, "split": "train", "boundary": "device_kernel", "timing_mode": "eager", "duration_ms": 0.05, "sample_id": "s0", "sku": A2_SKU, "validated": True, "qualified": True, "requested_shape": b4_by_id["anchor_ctx_512"]["shape"]}, {"schema": "mindie-bench-subgraph-run/1", "record_type": "receipt", "case_id": "anchor_ctx_512", "run_id": "r_other", "rank": 0, "status": "ok", "actual_shape": b4_by_id["anchor_ctx_512"]["shape"]}], plan_doc=b4_plan, sku=A2_SKU)
+    with pytest.raises(ModelingError, match="profiler_actual_shape_missing"):
+        normalize_profiler_records([{"schema": "mindie-bench-observation/1", "record_type": "observation", "case_id": "anchor_ctx_512", "run_id": "r1.base.eager.t0", "trial": 0, "rank": 0, "split": "train", "boundary": "device_kernel", "timing_mode": "eager", "duration_ms": 0.05, "sample_id": "s0", "sku": A2_SKU, "validated": True, "qualified": True, "requested_shape": b4_by_id["anchor_ctx_512"]["shape"]}, {"schema": "mindie-bench-subgraph-run/1", "record_type": "receipt", "case_id": "anchor_ctx_512", "run_id": "r1", "rank": 0, "status": "ok", "requested_shape": b4_by_id["anchor_ctx_512"]["shape"]}], plan_doc=b4_plan, sku=A2_SKU)
+    with pytest.raises(ModelingError, match="page_count_block_table_conflict"):
+        normalize_profiler_records([{"schema": "mindie-bench-observation/1", "record_type": "observation", "case_id": "anchor_ctx_512", "run_id": "r1.base.eager.t0", "trial": 0, "rank": 0, "split": "train", "boundary": "device_kernel", "timing_mode": "eager", "duration_ms": 0.05, "sample_id": "s0", "sku": A2_SKU, "validated": True, "qualified": True}, {"schema": "mindie-bench-subgraph-run/1", "record_type": "receipt", "case_id": "anchor_ctx_512", "run_id": "r1", "rank": 0, "status": "ok", "actual_shape": {**b4_by_id["anchor_ctx_512"]["shape"], "page_count": 5, "block_table": [1, 4]}}], plan_doc=b4_plan, sku=A2_SKU)
+    with pytest.raises(ModelingError, match="profiler_timed_nodes_plan_mismatch"):
+        normalize_profiler_records([{"schema": "mindie-bench-observation/1", "record_type": "observation", "case_id": "cross_b16_ctx_4097", "run_id": "r1.base.eager.t0", "trial": 0, "rank": 0, "split": "heldout", "boundary": "fx_region", "timing_mode": "eager", "duration_ms": 0.25, "sample_id": "s0", "sku": A2_SKU, "validated": True, "qualified": True}, {"schema": "mindie-bench-subgraph-run/1", "record_type": "receipt", "case_id": "cross_b16_ctx_4097", "run_id": "r1", "rank": 0, "status": "ok", "actual_shape": b4_by_id["cross_b16_ctx_4097"]["shape"], "timed_nodes": ["cross_b16_ctx_4097:s0.l0.paged_mla_decode"]}], plan_doc=b4_plan, sku=A2_SKU)
+    l3_tn = [n["node_id"] for n in b4_by_id["cross_tp2_pcp2_dcp4_ctx_400000"]["nodes"]]
+    with pytest.raises(ModelingError, match="profiler_timed_nodes_rank_mismatch"):
+        normalize_profiler_records([r for rk in range(4) for r in ({"schema": "mindie-bench-observation/1", "record_type": "observation", "case_id": "cross_tp2_pcp2_dcp4_ctx_400000", "run_id": f"mr{rk}.base.eager.t0", "acquisition_id": "acq-mr", "trial": 0, "repeat_index": 0, "rank": rk, "split": "heldout", "boundary": "model_step", "timing_mode": "eager", "duration_ms": 0.1, "sample_id": f"s-{rk}", "sku": A2_SKU, "validated": True, "qualified": True}, {"schema": "mindie-bench-subgraph-run/1", "record_type": "receipt", "case_id": "cross_tp2_pcp2_dcp4_ctx_400000", "run_id": f"mr{rk}", "rank": rk, "status": "ok", "actual_shape": b4_by_id["cross_tp2_pcp2_dcp4_ctx_400000"]["shape"], "timed_nodes": l3_tn if rk < 3 else l3_tn[:5]})], plan_doc=b4_plan, sku=A2_SKU)
     with pytest.raises(ModelingError, match="multirank_incomplete_rank_samples"):
         normalize_profiler_records([{"schema": "mindie-bench-observation/1", "record_type": "observation", "case_id": "cross_tp2_pcp2_dcp4_ctx_400000", "run_id": f"mr{rk}.base.eager.t0", "acquisition_id": "acq-mr", "trial": 0, "repeat_index": rep, "rank": rk, "split": "heldout", "boundary": "model_step", "timing_mode": "eager", "duration_ms": 0.03 + 0.01 * (rk == 3), "sample_id": f"s-{rk}-{rep}", "sku": A2_SKU, "validated": True, "qualified": True} for rk in range(4) for rep in (range(4) if rk < 3 else range(1))], plan_doc=b4_plan, sku=A2_SKU)
     with pytest.raises(ModelingError, match="profiler_abi_rejection_unexpectedly_accepted"):
@@ -448,24 +467,19 @@ def test_host_queue_unified_grant_cleanup_and_profiler_roundtrip(tmp_path):
     with pytest.raises(ModelingError, match="clock_operator_plan_mismatch"):
         normalize_profiler_records([{"schema": "mindie-bench-observation/1", "record_type": "observation", "case_id": "offgrid_ctx_768", "run_id": "r1.base.stream_saturated.t0", "trial": 0, "split": "heldout", "boundary": "device_kernel", "timing_mode": "stream_saturated", "duration_ms": 0.0075, "sample_id": "s0", "sku": A2_SKU, "validated": True, "qualified": True}], plan_doc=plan_doc, sku=A2_SKU)
     cap_out = tmp_path / "prof_caps"
-    norm_obs, norm_abi = normalize_profiler_records(
-        [
-            {"schema": "mindie-bench-observation/1", "record_type": "observation", "case_id": "offgrid_ctx_768", "run_id": "run001.base.eager.t0", "trial": 0, "split": "heldout", "boundary": "device_kernel", "timing_mode": "eager", "duration_ms": 0.020, "sample_id": "obs-0", "rank": None, "sku": A2_SKU, "validated": True, "qualified": True, "identity": {"level": "operator", "implementation": "aclnnLive"}},
-            {"schema": "mindie-bench-observation/1", "record_type": "observation", "case_id": "offgrid_ctx_768", "run_id": "run001.base.stream_saturated.t0", "trial": 0, "split": "heldout", "boundary": "device_kernel", "timing_mode": "stream_saturated", "duration_ms": 0.0075, "sample_id": "obs-1", "rank": None, "sku": A2_SKU, "validated": True, "qualified": True, "identity": {"level": "operator", "implementation": "aclnnLive"}},
-            {"schema": "mindie-bench-observation/1", "record_type": "case_complete", "case_id": "offgrid_ctx_768", "run_id": "run001", "split": "heldout", "status": "ok", "summary": {"op": "live", "actual_shape": {"context_len": 768, "batch_size": 1, "query_tokens": 1}, "participating_ranks": [2]}},
-            {"schema": "mindie-bench-receipt/1", "case_id": "abi_1", "status": "unsupported_binding", "reason": "abi_divisibility_violation:topk=2049", "executed_shape": {"context_len": 2049, "topk": 2049, "batch_size": 1, "query_tokens": 1}},
-            {"schema": "mindie-bench-receipt/1", "case_id": "abi_1", "status": "unsupported_binding", "reason": "kernel_symbol_missing", "executed_shape": {"context_len": 2049, "topk": 2049, "batch_size": 1, "query_tokens": 1}},
-        ],
-        plan_doc=plan_doc, sku=A2_SKU, endpoint_alias="audit-node.internal.example", capture_out_dir=cap_out,
-    )
-    assert len(norm_obs) == 1 and norm_obs[0]["device_ranks"] == [2] and norm_obs[0]["context_len"] == 768 and norm_obs[0]["clock_operator"] == "elapsed_span" and "sim_case" in norm_obs[0] and len(norm_abi) == 2
-    assert "audit-node" not in json.dumps(norm_obs) and norm_obs[0]["run_uid"].startswith("run-")
+    norm_obs, norm_abi = normalize_profiler_records([
+        {"schema": "mindie-bench-observation/1", "record_type": "observation", "case_id": "offgrid_ctx_768", "run_id": "run001.base.eager.t0", "trial": 0, "split": "heldout", "boundary": "device_kernel", "timing_mode": "eager", "duration_ms": 0.020, "sample_id": "obs-0", "rank": None, "sku": A2_SKU, "validated": True, "qualified": True, "identity": {"level": "operator", "implementation": "aclnnLive"}},
+        {"schema": "mindie-bench-observation/1", "record_type": "observation", "case_id": "offgrid_ctx_768", "run_id": "run001.base.stream_saturated.t0", "trial": 0, "split": "heldout", "boundary": "device_kernel", "timing_mode": "stream_saturated", "duration_ms": 0.0075, "sample_id": "obs-1", "rank": None, "sku": A2_SKU, "validated": True, "qualified": True, "identity": {"level": "operator", "implementation": "aclnnLive"}},
+        {"schema": "mindie-bench-observation/1", "record_type": "case_complete", "case_id": "offgrid_ctx_768", "run_id": "run001", "split": "heldout", "status": "ok", "summary": {"op": "live", "actual_shape": {"context_len": 768, "batch_size": 1, "query_tokens": 1}, "participating_ranks": [2]}},
+        {"schema": "mindie-bench-subgraph-run/1", "record_type": "receipt", "case_id": "offgrid_ctx_768", "run_id": "run001", "status": "ok", "actual_shape": {"context_len": 768, "batch_size": 1, "query_tokens": 1}},
+        {"schema": "mindie-bench-receipt/1", "case_id": "abi_1", "status": "unsupported_binding", "reason": "abi_divisibility_violation:topk=2049", "executed_shape": {"context_len": 2049, "topk": 2049, "batch_size": 1, "query_tokens": 1}},
+        {"schema": "mindie-bench-receipt/1", "case_id": "abi_1", "status": "unsupported_binding", "reason": "kernel_symbol_missing", "executed_shape": {"context_len": 2049, "topk": 2049, "batch_size": 1, "query_tokens": 1}},
+    ], plan_doc=plan_doc, sku=A2_SKU, endpoint_alias="audit-node.internal.example", capture_out_dir=cap_out)
+    assert len(norm_obs) == 1 and norm_obs[0]["device_ranks"] == [2] and norm_obs[0]["context_len"] == 768 and norm_obs[0]["clock_operator"] == "elapsed_span" and "sim_case" in norm_obs[0] and len(norm_abi) == 2 and "audit-node" not in json.dumps(norm_obs) and norm_obs[0]["run_uid"].startswith("run-")
     verify_capture_file_consistency("offgrid_ctx_768", CaptureBoundary(norm_obs[0]["raw_sha256"], norm_obs[0]["acquisition_root"], norm_obs[0]["run_uid"], (), tuple(norm_obs[0]["event_ids"]), tuple(norm_obs[0]["device_ranks"]), "device_monotonic", "k_start", "k_end", "device_kernel", "ns", norm_obs[0]["capture_uri"]), cap_out / f"{norm_obs[0]['raw_sha256']}.json")
-
     abi_plan = synthesize_operator_cliff_plan(OperatorCliffParameters("sp:v2", "sparse_indexer", 128, 20, A2_ORACLE["l2"]), sku=A2_SKU).to_dict()
     abi_pt = abi_plan["abi_rejection_points"][0]
-    abi_pid, abi_err = abi_pt["point_id"], abi_pt["abi_expected_error"]
-    abi_by_id = {abi_pid: abi_pt}
+    abi_pid, abi_err, abi_by_id = abi_pt["point_id"], abi_pt["abi_expected_error"], {abi_pt["point_id"]: abi_pt}
     for rc_v, bad_recs in (
         (2, [{"case_id": abi_pid, "status": "unsupported_binding", "reason": abi_err, "requested_shape": {"batch_size": 1, "query_tokens": 1, "context_len": abi_pt["value"], "topk": abi_pt["topk"]}}]),
         (2, [{"case_id": abi_pid, "status": "unsupported_binding", "reason": abi_err, "executed_shape": {"batch_size": 1, "query_tokens": 1, "context_len": abi_pt["value"], "topk": abi_pt["topk"], "sparse_count": abi_pt["topk"] - 1}}]),
@@ -486,19 +500,16 @@ def test_host_queue_unified_grant_cleanup_and_profiler_roundtrip(tmp_path):
         "c0 = next(c for c in plan['cases'] if c['split'] != 'abi_rejection')\n"
         "cid, sp, rid = c0['case_id'], c0['split'], f\"{plan['plan_id']}_u{rk}\"\n"
         "obs_p.write_text(json.dumps({'schema':'mindie-bench-observation/1','record_type':'observation','plan_id':plan['plan_id'],'case_id':cid,'run_id':f'{rid}.base.eager.t0','trial':0,'repeat_index':0,'rank':rk,'split':sp,'timing_mode':'eager','duration_ms':0.02 + 0.001*rk,'sample_id':f's{rk}','sku':plan['sku'],'validated':True,'qualified':True}) + '\\n', encoding='utf-8')\n"
-        f"recs = [{{'case_id': cid, 'status': 'ok'}}] + ([{{'case_id': {abi_pid!r}, 'status': 'unsupported_binding', 'reason': {abi_err!r}, 'executed_shape': {{'batch_size': 1, 'query_tokens': 1, 'context_len': {abi_pt['value']}, 'topk': {abi_pt['topk']}}}}}] if has_abi else [])\n"
+        f"recs = [{{'case_id': cid, 'status': 'ok', 'actual_shape': c0.get('shape') or {{}}, 'timed_nodes': [n['node_id'] for n in c0['nodes']]}}] + ([{{'case_id': {abi_pid!r}, 'status': 'unsupported_binding', 'reason': {abi_err!r}, 'executed_shape': {{'batch_size': 1, 'query_tokens': 1, 'context_len': {abi_pt['value']}, 'topk': {abi_pt['topk']}}}}}] if has_abi else [])\n"
         "Path(f'{out_p}.rank{rk}.json' if ws > 1 else str(out_p)).write_text(json.dumps({'schema':'mindie-bench-subgraph-run/1','status':'partial' if has_abi else 'ok','plan_id':plan['plan_id'],'run_id':rid,'records':recs}), encoding='utf-8')\n"
-        "sys.exit(2 if has_abi else 0)\n",
-        encoding="utf-8",
+        "sys.exit(2 if has_abi else 0)\n", encoding="utf-8",
     )
     obs_l, abi_l = run_profiler_bench_subprocess(abi_plan, sku=A2_SKU, profiler_root=fake_prof, allowed_phy_ids=[0, 1, 2, 3], fence_token=7)
-    ho_mr = next(o for o in obs_l if o["case_id"] == "cross_tp2_pcp2_dcp2_ctx_200000")
-    ho_w1 = next(o for o in obs_l if o["split"] == "heldout" and o["device_ranks"] == [0])
+    ho_mr, ho_w1 = next(o for o in obs_l if o["case_id"] == "cross_tp2_pcp2_dcp2_ctx_200000"), next(o for o in obs_l if o["split"] == "heldout" and o["device_ranks"] == [0])
     assert ho_mr["device_ranks"] == [0, 1, 2, 3] and ho_mr["acquisition_root"] == ho_w1["acquisition_root"] and len(abi_l) == 1 and abi_l[0]["point_id"] == abi_pid
-    with pytest.raises(ModelingError, match="onboarding_endpoint_unknown|onboarding_json_read_failed"):
-        validate_512_400k(sku=A2_SKU, live_profiler=True, endpoint_alias="audit-node.internal.example", profiler_root=fake_prof, lease_acquirer=lambda _s, _t: _bad_acq([0, 1, 2, 3], 600))
-    with pytest.raises(ModelingError, match="onboarding_endpoint_unknown|onboarding_json_read_failed"):
-        bench_and_score_operator(cliff_plan=plan_doc, sku=A2_SKU, live_profiler=True, endpoint_alias="audit-node.internal.example", profiler_root=fake_prof, lease_acquirer=lambda _s, _t: _bad_acq([0, 1, 2, 3], 900))
+    for fn_call in (lambda: validate_512_400k(sku=A2_SKU, live_profiler=True, endpoint_alias="audit-node.internal.example", profiler_root=fake_prof, lease_acquirer=lambda _s, _t: _bad_acq([0, 1, 2, 3], 600)), lambda: bench_and_score_operator(cliff_plan=plan_doc, sku=A2_SKU, live_profiler=True, endpoint_alias="audit-node.internal.example", profiler_root=fake_prof, lease_acquirer=lambda _s, _t: _bad_acq([0, 1, 2, 3], 900))):
+        with pytest.raises(ModelingError, match="onboarding_endpoint_unknown|onboarding_json_read_failed"):
+            fn_call()
 
 
 def test_whitebox_sku_check_2d_kv_heads_dcp_compose_and_real_dag(tmp_path):
@@ -525,13 +536,19 @@ def test_whitebox_sku_check_2d_kv_heads_dcp_compose_and_real_dag(tmp_path):
         {"measured_binding": {"builder": "fused_infer_attention", "family": "attention", "recipe": "fused_infer_attention", "paged": False, "heads": 16, "kv_heads": 2, "head_dim": 128}},
         {"measured_binding": {"builder": "absorbed_mla", "family": "attention", "recipe": "ascend_paged_mla_decode_arch22", "target_op_id": "s0.l0.paged_mla_decode", "query_layout": "TND"}},
         {"measured_binding": {"builder": "absorbed_mla", "family": "attention", "recipe": "ascend_paged_mla_decode_arch22", "target_op_id": "s0.l0.paged_mla_decode", "kv_len": 512, "page_count": 4}},
+        {"actual_shape": {"page_count": 5, "block_table": [1, 4]}, "measured_binding": {"builder": "absorbed_mla", "family": "attention", "recipe": "ascend_paged_mla_decode_arch22", "target_op_id": "s0.l0.paged_mla_decode"}},
     ):
         with pytest.raises(ModelingError, match="whitebox_measured_binding_mismatch"):
             score_sealed_gate_cases([{**attn_l1, **bad_bind}], sku=A2_SKU, runner=WhiteboxSpineRunner(clock_operator="busy_union"))
-    with pytest.raises(ModelingError, match="matrix_groups"):
-        score_sealed_gate_cases([{**base_l1, "case_id": "l2-mg", "point_id": "l2-mg", "level": "L2", "context_len": 4097, "batch_size": 16, "target_family": None, "target_op_ids": ["s0.l0.paged_mla_decode", "s0.l0.v_expand"], "measured_binding": {"node_bindings": [{"op_id": "s0.l0.v_expand", "matrix_groups": 1}]}}], sku=A2_SKU, runner=WhiteboxSpineRunner(clock_operator="busy_union"))
-    with pytest.raises(ModelingError, match="l3_op_set_mismatch"):
-        score_sealed_gate_cases([{**base_l1, "case_id": "l3-sub", "point_id": "l3-sub", "level": "L3", "target_family": None, "timed_nodes": ["l3-sub:s0.l0.norm1", "l3-sub:s0.l0.paged_mla_decode"], "sim_case": {**b4_case, "model_overrides": {"layers": 1}}}], sku=A2_SKU, runner=WhiteboxSpineRunner(clock_operator="busy_union"))
+    # R6 #2, #3, #5: L2 timed_nodes subset, L2 v_expand actual_shape weight_n mutation, L3 dcp_update dtype/partial_count mismatch!
+    l2_b16 = {**base_l1, "case_id": "l2-mg", "point_id": "l2-mg", "level": "L2", "context_len": 4097, "batch_size": 16, "target_family": None, "target_op_ids": ["s0.l0.paged_mla_decode", "s0.l0.v_expand"]}
+    for pat, patch in (("matrix_groups", {"measured_binding": {"node_bindings": [{"op_id": "s0.l0.v_expand", "matrix_groups": 1}]}}), ("l2_op_set_mismatch", {"timed_nodes": ["l2-mg:s0.l0.paged_mla_decode"]}), ("gemm_n_conflict|weight_n", {"actual_shape": {"m": 256, "n": 64, "k": 512, "e": 16, "matrix_groups": 16}, "measured_binding": {"node_bindings": [{"op_id": "s0.l0.v_expand", "m": 256, "n": 128, "k": 512, "matrix_groups": 16}]}})):
+        with pytest.raises(ModelingError, match=pat):
+            score_sealed_gate_cases([{**l2_b16, **patch}], sku=A2_SKU, runner=WhiteboxSpineRunner(clock_operator="busy_union"))
+    l3_base = {"compose_model": "deepseek-v2-lite", "compose_hardware": A2_SKU, "model_overrides": {"layers": 1}}
+    for pat, patch in (("l3_op_set_mismatch", {"timed_nodes": ["l3-sub:s0.l0.norm1", "l3-sub:s0.l0.paged_mla_decode"]}), ("dtype", {"parallel_topology": "tp2_pcp2_dcp4", "device_ranks": [0, 1, 2, 3], "actual_shape": {"dtype": "bf16", "partial_count": 4}}), ("partial_count", {"parallel_topology": "tp2_pcp2_dcp4", "device_ranks": [0, 1, 2, 3], "actual_shape": {"dtype": "fp32", "partial_count": 2}})):
+        with pytest.raises(ModelingError, match=pat):
+            score_sealed_gate_cases([{**base_l1, "case_id": "l3-sub", "point_id": "l3-sub", "level": "L3", "target_family": None, "sim_case": l3_base, **patch}], sku=A2_SKU, runner=WhiteboxSpineRunner(clock_operator="busy_union"))
     idx_row = {**base_l1, "case_id": "idx-2048", "point_id": "idx-2048", "context_len": 2049, "topk": 2048, "target_family": "indexer", "target_op_id": "s0.l2.index_quant_lightning", "measured_binding": {"target_op_id": "s0.l2.index_quant_lightning", "family": "indexer", "heads": 32, "head_dim": 128, "kv_heads": 1, "sparse_count": 2048, "query_dtype": "bf16", "cache_dtype": "bf16", "kv_len": 2050}}
     with pytest.raises(ModelingError, match="topk|query_dtype"):
         score_sealed_gate_cases([{**idx_row, "sim_case": {"compose_model": "deepseek-v4.1-flash", "compose_hardware": A2_SKU}}], sku=A2_SKU, runner=WhiteboxSpineRunner(clock_operator="busy_union"))
@@ -554,20 +571,25 @@ def test_whitebox_sku_check_2d_kv_heads_dcp_compose_and_real_dag(tmp_path):
     lean_ok, _, lean_v = check_lean_non_inversion([{"case_id": "l2-dep", "l_star_lean_ns": d_cert.l_star_lean_ns, "t_sim_ns": dep_diag["busy_union_ns"], "t_silicon_p99_ns": max(dep_diag["busy_union_ns"], 2600), "program": lp, "dag": ld, "certificate": {"farkas": {"scale_d": d_cert.farkas.scale_d, "lambda_num": list(d_cert.farkas.lambda_num), "mu_num": list(d_cert.farkas.mu_num), "lower_bound_ns": d_cert.farkas.lower_bound_ns}, "path_edges": list(d_cert.path_edges), "sink_node_id": d_cert.sink_node_id, "l_star_lean_ns": d_cert.l_star_lean_ns}}], expected_case_timings={"l2-dep": (dep_diag["busy_union_ns"], 2500, max(dep_diag["busy_union_ns"], 2600), dep_diag["program_dag_sha256"])})
     assert lean_ok is True and not lean_v
 
-    # Full manifest gate rejects partial/missing captures & cross-run live report spoofing, passes verified full manifest!
+    # Full manifest gate rejects partial/missing captures & cross-run live report spoofing, passes verified full manifest & R6 #6 Stage-4 physical 2.0 us tolerance (5000 vs 6900 ns)!
     raw_full = tmp_path / "full.json"
     raw_full.write_text(json.dumps(_raw_l0_samples(A2_SKU)), encoding="utf-8")
     cal_full = calibrate_l0_and_fabric(sku=A2_SKU, raw_l0_json=raw_full)["primitives_payload"]
     full_plan = synthesize_sku_512_400k_plan(sku=A2_SKU, core_count=A2_ORACLE["aic"], l2_bytes=A2_ORACLE["l2"]).to_dict()
     cap_dir, cap_dir_a = tmp_path / "captures", tmp_path / "captures_a"
-    m_rows, m_preds, m_leans, m_abis, m_shas = _plan_fixture_bundle(full_plan, capture_dir=cap_dir)
+    l1_atol_ov = {str(pt["point_id"]): (5000, 6900) for idx, pt in enumerate(full_plan["heldout_points"]) if idx % 3 == 0}
+    m_rows, m_preds, m_leans, m_abis, m_shas = _plan_fixture_bundle(full_plan, capture_dir=cap_dir, overrides=l1_atol_ov)
     ml_cases = [{"case_id": r["case_id"], "point_id": r["point_id"], "level": r["level"], "split": r["split"], "boundary": {"raw_sha256": r["raw_sha256"], "acquisition_uid": r["acquisition_root"], "run_uid": r["run_uid"], "parent_digests": [], "event_ids": r["event_ids"], "device_ranks": r["device_ranks"], "clock_domain": "device_ns", "start_event": "start", "end_event": "end", "boundary_kind": {"L1": "device_kernel", "L2": "fx_region", "L3": "model_step"}[r["level"]], "unit": "ns", "capture_uri": r["capture_uri"]}, "input_digest": r["raw_sha256"], "stack_digest": hashlib.sha256(b"st").hexdigest(), "implementation": "whitebox", "cohort": {"level": r["level"], "cohort_name": "wb", "sku": A2_SKU, "phase": "decode", "mode": "eager", "shape_regime": "cliff", "parallel_topology": r["parallel_topology"]}, "measured_ns": r["measured_ns"], "measured_p99_ns": r["measured_p99_ns"], "clock_operator": r["clock_operator"], "payload": {k: r[k] for k in ("context_len", "tokens", "batch_size", "query_tokens", "parallel_topology", "topk", "batch_x_kv_heads") if r.get(k) is not None}} for r in m_rows]
     full_f = tmp_path / "ml_full.json"
     full_f.write_text(json.dumps({"manifest_id": "m-full", "schema_version": "mindie-multilevel-manifest/1", "cases": ml_cases, "abi_rejection_results": m_abis}), encoding="utf-8")
     with pytest.raises(ModelingError, match="capture_file_missing"):
         verify_sku_gates(sku=A2_SKU, multilevel_manifest_json=full_f, runner=_independent_engine_runner(m_preds, prog_sha_by_id=m_shas), primitives_json=cal_full, lean_bounds_json=m_leans, repo_root=_synthetic_repo(tmp_path, family="ml_nocap"))
-    full_ok = verify_sku_gates(sku=A2_SKU, multilevel_manifest_json=full_f, capture_root=cap_dir, runner=_independent_engine_runner(m_preds, prog_sha_by_id=m_shas), primitives_json=cal_full, lean_bounds_json=m_leans, repo_root=_synthetic_repo(tmp_path, family="ml_ok"))
-    assert full_ok["ok"] is True and full_ok["status"] == "offline_reverify"
+    syn_ok = _synthetic_repo(tmp_path, family="ml_ok")
+    val_atol = validate_512_400k(sku=A2_SKU, primitives_json=cal_full, profiler_runner=lambda _p: m_rows, abi_rejection_results=m_abis, capture_root=cap_dir, runner=_independent_engine_runner(m_preds, prog_sha_by_id=m_shas))
+    rep_ok = verify_sku_gates(sku=A2_SKU, validation_report_json=val_atol, capture_root=cap_dir, primitives_json=cal_full, lean_bounds_json=m_leans, repo_root=syn_ok)
+    full_ok = verify_sku_gates(sku=A2_SKU, multilevel_manifest_json=full_f, capture_root=cap_dir, runner=_independent_engine_runner(m_preds, prog_sha_by_id=m_shas), primitives_json=cal_full, lean_bounds_json=m_leans, repo_root=syn_ok)
+    assert val_atol["ok"] is True and rep_ok["ok"] is True and full_ok["ok"] is True and full_ok["status"] == "offline_reverify"
+    assert verify_sku_gates(sku=A2_SKU, multilevel_manifest_json=full_f, capture_root=cap_dir, runner=_independent_engine_runner({**m_preds, next(iter(l1_atol_ov)): 7500}, prog_sha_by_id=m_shas), primitives_json=cal_full, lean_bounds_json=m_leans, repo_root=syn_ok)["ok"] is False
     raw_a = tmp_path / "raw_a.json"
     raw_a.write_text(json.dumps(_raw_l0_samples(A2_SKU, scale=1.01)), encoding="utf-8")
     cal_a = calibrate_l0_and_fabric(sku=A2_SKU, raw_l0_json=raw_a)["primitives_payload"]

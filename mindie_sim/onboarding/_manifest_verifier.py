@@ -47,7 +47,7 @@ from ._capture_truth import (
 )
 from ._lean_and_receipts import validate_strict_threshold_pct, verify_stage_report
 from ._sku_calibration import materialize_sku_hardware
-from ._whitebox_runner import check_no_service_regimes
+from ._whitebox_runner import WhiteboxSpineRunner, check_no_service_regimes
 from .contracts import (
     DEFAULT_PHYSICAL_ATOL_NS,
     GateCheckOutcome,
@@ -206,6 +206,8 @@ def _summarize_manifest_residuals(
     scored_heldout_ids: set[str] = set()
     scored_train_ids: set[str] = set()
     pw_fail: list[str] = []
+    phys_failed_cohorts: set[str] = set()
+    non_ok_heldout: list[str] = []
     for res in raw_residuals:
         meta = case_meta[res.case_id]
         clk = engine_clocks.get(res.case_id, {})
@@ -227,6 +229,9 @@ def _summarize_manifest_residuals(
             scored_heldout_ids.add(meta["point_id"])
             if exceeds:
                 pw_fail.append(adj_res.case_id)
+                phys_failed_cohorts.add(adj_res.cohort.as_id())
+        else:
+            non_ok_heldout.append(adj_res.case_id)
         heldout_dicts.append({
             **adj_res.to_dict(),
             "abs_error_ns": abs(scored_pred_ns - int(adj_res.measured_ns)),
@@ -244,10 +249,21 @@ def _summarize_manifest_residuals(
     summaries = summarize_cohorts(heldout_res_objs, threshold_pct=cap_threshold)
     verdict = gate_decision(summaries, required_levels=REQUIRED_MULTILEVEL_LEVELS, require_disjoint_level_roots=True)
     missing_any = bool(missing_heldout or missing_train)
-    passed = verdict["status"] == "pass" and not pw_fail and not missing_any and bool(abi_check["ok"])
+    struct_ok = (
+        bool(summaries)
+        and not verdict["insufficient_cohorts"]
+        and not verdict["missing_levels"]
+        and not verdict["overlapping_level_roots"]
+        and not non_ok_heldout
+    )
+    passed = struct_ok and not pw_fail and not missing_any and bool(abi_check["ok"])
     eff_st = (
         "pass" if passed
-        else ("fail" if (pw_fail or not abi_check["ok"]) else ("insufficient_evidence" if missing_any else verdict["status"]))
+        else (
+            "fail"
+            if (pw_fail or verdict["overlapping_level_roots"] or not abi_check["ok"] or non_ok_heldout)
+            else "insufficient_evidence"
+        )
     )
     return (
         GateCheckOutcome(
@@ -264,7 +280,8 @@ def _summarize_manifest_residuals(
                 ("missing_train_points", len(missing_train)),
                 ("abi_ok", bool(abi_check["ok"])),
                 ("overlapping_level_roots", verdict["overlapping_level_roots"]),
-                ("failed_cohorts", verdict["failed_cohorts"]),
+                ("failed_cohorts", sorted(phys_failed_cohorts)),
+                ("raw_pct_failed_cohorts", verdict["failed_cohorts"]),
                 ("pointwise_failures", sorted(pw_fail)),
                 ("threshold_pct", cap_threshold),
                 ("atol_ns", atol_ns),
@@ -358,6 +375,8 @@ def _evaluate_manifest_path(
     active_runner = _bind_active_runner(
         runner, primitive_table=primitive_table, profile_override=profile_override
     )
+    if isinstance(active_runner, WhiteboxSpineRunner) and len(manifest.cases) > 1:
+        active_runner.prefetch_cases(manifest.cases)
     checked_runner = ClockParityRunner(active_runner, expected_clock, plan_by_case=plan_by_case)
     raw_residuals = list(
         evaluate_multilevel(
@@ -418,6 +437,7 @@ def run_multilevel_verdict(
             capture_files=capture_files,
             require_capture_files=True,
             cap_threshold=cap_threshold,
+            atol_ns=max(0, int((validation_doc or {}).get("atol_ns", DEFAULT_PHYSICAL_ATOL_NS))),
         )
 
     if validation_doc is None:
@@ -451,6 +471,7 @@ def run_multilevel_verdict(
     validate_disjoint_lineage(heldout_rows, require_disjoint_level_roots=True)
     res_objs: list[Residual] = []
     pw_fail: list[str] = []
+    phys_failed_cohorts: set[str] = set()
     eff_atol_ns = max(0, int(validation_doc.get("atol_ns", DEFAULT_PHYSICAL_ATOL_NS)))
     for row in heldout_rows:
         lvl = str(row.get("level") or "L1").upper()
@@ -461,17 +482,41 @@ def run_multilevel_verdict(
         ape = float(row.get("absolute_percentage_error", 0.0))
         if exceeds_physical_tolerance(pred_ns, meas_ns, threshold_pct=cap_threshold, atol_ns=eff_atol_ns):
             pw_fail.append(str(row.get("case_id") or ""))
+            phys_failed_cohorts.add(cohort.as_id())
         res_objs.append(Residual(str(row.get("case_id") or ""), lvl, cohort, str(row.get("acquisition_root") or ""), meas_ns, pred_ns, str(row.get("engine_receipt") or ""), float(row.get("signed_error", 0.0)), ape, "ok", boundary_kind=str(row.get("boundary_kind") or STANDARD_LEVEL_BOUNDARY_KINDS.get(lvl, "device_kernel"))))
     summaries = summarize_cohorts(res_objs, threshold_pct=cap_threshold)
     verdict = gate_decision(summaries, required_levels=REQUIRED_MULTILEVEL_LEVELS, require_disjoint_level_roots=True)
     missing_any = bool(missing_plan or missing_train or missing_anchors or missing_cliffs)
-    passed = bool(validation_doc.get("ok")) and abi_ok and verdict["status"] == "pass" and not pw_fail and not missing_any
-    eff_status = "pass" if passed else ("fail" if (pw_fail or not abi_ok or not validation_doc.get("ok")) else ("insufficient_evidence" if missing_any else verdict["status"]))
+    struct_ok = (
+        bool(summaries)
+        and not verdict["insufficient_cohorts"]
+        and not verdict["missing_levels"]
+        and not verdict["overlapping_level_roots"]
+    )
+    passed = bool(validation_doc.get("ok")) and abi_ok and struct_ok and not pw_fail and not missing_any
+    eff_status = (
+        "pass" if passed
+        else ("fail" if (pw_fail or verdict["overlapping_level_roots"] or not abi_ok or not validation_doc.get("ok")) else "insufficient_evidence")
+    )
     return (
         GateCheckOutcome(
             name="multilevel_gate", passed=passed, status=eff_status,
             detail=f"status={eff_status};levels={verdict['covered_levels']};missing_levels={verdict['missing_levels']};missing_plan={len(missing_plan)};missing_train={len(missing_train)};pointwise_failures={len(pw_fail)};abi_ok={abi_ok}",
-            metrics=(("covered_levels", verdict["covered_levels"]), ("missing_levels", verdict["missing_levels"]), ("missing_plan_points", len(missing_plan)), ("missing_train_points", len(missing_train)), ("missing_anchors", len(missing_anchors)), ("missing_cliffs", len(missing_cliffs)), ("overlapping_level_roots", verdict["overlapping_level_roots"]), ("failed_cohorts", verdict["failed_cohorts"]), ("pointwise_failures", sorted(pw_fail)), ("abi_ok", abi_ok), ("threshold_pct", cap_threshold), ("atol_ns", eff_atol_ns)),
+            metrics=(
+                ("covered_levels", verdict["covered_levels"]),
+                ("missing_levels", verdict["missing_levels"]),
+                ("missing_plan_points", len(missing_plan)),
+                ("missing_train_points", len(missing_train)),
+                ("missing_anchors", len(missing_anchors)),
+                ("missing_cliffs", len(missing_cliffs)),
+                ("overlapping_level_roots", verdict["overlapping_level_roots"]),
+                ("failed_cohorts", sorted(phys_failed_cohorts)),
+                ("raw_pct_failed_cohorts", verdict["failed_cohorts"]),
+                ("pointwise_failures", sorted(pw_fail)),
+                ("abi_ok", abi_ok),
+                ("threshold_pct", cap_threshold),
+                ("atol_ns", eff_atol_ns),
+            ),
         ),
         heldout_rows,
     )

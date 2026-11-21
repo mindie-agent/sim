@@ -51,10 +51,21 @@ _L2_CONTEXT_MIN = 24576
 _L3_CONTEXT_MIN = 200000
 _MIN_COLLECTIVE_BYTES = 4
 _DEFAULT_COLLECTIVE_BYTES = 4096
+_RING_ALLREDUCE_FACTOR = 2
+_MIN_DCP_PARTIALS = 2
 _MIN_GEMM_SHAPE_RANK = 3
 _MIN_2D_SHAPE_RANK = 2
 _BLOCK_TABLE_PAIR_LEN = 2
 _LOWER_CACHE_MAXSIZE = 64
+_DTYPE_ELEMENT_BYTES: Mapping[str, int] = {
+    "fp32": 4, "float32": 4, "int32": 4,
+    "bf16": 2, "fp16": 2, "float16": 2,
+    "int8": 1, "uint8": 1, "fp8_e4m3": 1, "mxfp8": 1,
+}
+
+
+def _dtype_element_bytes(dtype: str) -> int:
+    return int(_DTYPE_ELEMENT_BYTES.get(str(dtype or "bf16").strip().lower(), _MLA_BF16_BYTES))
 _ARCH35_SKU_MARKER = "950"
 _ARCH35_PRESET_MARKER = "35"
 _DEFAULT_SIM_MODEL = "deepseek-v2-lite"
@@ -473,45 +484,66 @@ def _lowered_op_to_profiler_node(
 
     if fam == "kv_compress_epilog":
         toks = int(loc[0]) if len(loc) >= _MIN_2D_SHAPE_RANK else total_tokens
-        width = int(loc[-1]) if loc else (_MLA_LATENT_DIM + _MLA_ROPE_DIM) * _MLA_BF16_BYTES
+        op_dt = str(op_rec["dtype"] or "bf16").strip().lower()
+        elem_b = _dtype_element_bytes(op_dt)
+        byte_width = int(loc[-1]) if loc else (_MLA_LATENT_DIM + _MLA_ROPE_DIM) * _MLA_BF16_BYTES
+        elem_width = max(1, byte_width // elem_b)
         node = {
             "node_id": nid, "op_id": op_id, "kind": "operator", "op": "kv_compress_epilog", "builder": "kv_compress_epilog",
-            "family": "kv_compress_epilog", "recipe": rec, "implementation": "aclnnKvCompressEpilog", "dtype": "bf16",
-            "shape": {"tokens": toks, "width": width},
+            "family": "kv_compress_epilog", "recipe": rec, "implementation": "aclnnKvCompressEpilog", "dtype": op_dt,
+            "shape": {"tokens": toks, "width": elem_width, "byte_width": byte_width},
         }
-        return node, {"op_id": op_id, "family": fam, "recipe": rec, "builder": "kv_compress_epilog"}
+        return node, {"op_id": op_id, "family": fam, "recipe": rec, "builder": "kv_compress_epilog", "dtype": op_dt, "width": elem_width, "byte_width": byte_width}
 
     if fam == "dcp_allgather":
-        nbytes = max(_MIN_COLLECTIVE_BYTES, int(op_rec["link_bytes"]) or _DEFAULT_COLLECTIVE_BYTES)
+        raw_link = int(op_rec["link_bytes"])
+        send_nbytes = max(
+            _MIN_COLLECTIVE_BYTES,
+            (raw_link // max(1, dcp - 1)) if raw_link > 0 else _DEFAULT_COLLECTIVE_BYTES,
+        )
         node = {
             "node_id": nid, "op_id": op_id, "kind": "collective", "op": "all_gather", "builder": "all_gather",
             "family": "dcp_allgather", "recipe": rec, "implementation": "hcclAllGather", "dtype": "bf16",
-            "group": "dcp", "group_size": dcp, "nbytes": nbytes,
-            "shape": {"tokens": total_tokens, "width": _MLA_LATENT_DIM + 1, "nbytes": nbytes},
+            "group": "dcp", "group_size": dcp, "nbytes": send_nbytes,
+            "shape": {"tokens": total_tokens, "width": _MLA_LATENT_DIM + 1, "nbytes": send_nbytes, "link_bytes": raw_link},
         }
-        return node, {"op_id": op_id, "family": fam, "recipe": rec, "builder": "all_gather"}
+        return node, {"op_id": op_id, "family": fam, "recipe": rec, "builder": "all_gather", "nbytes": send_nbytes, "group_size": dcp}
 
     if fam == "attention_merge":
         toks = int(loc[0]) if len(loc) >= _MIN_GEMM_SHAPE_RANK else total_tokens
         heads = int(loc[1]) if len(loc) >= _MIN_GEMM_SHAPE_RANK else local_heads
         hdim = int(loc[2]) if len(loc) >= _MIN_GEMM_SHAPE_RANK else _MLA_LATENT_DIM
+        merge_dt = str(op_rec["dtype"] or "fp32").strip().lower()
+        partials = max(_MIN_DCP_PARTIALS, dcp)
         node = {
             "node_id": nid, "op_id": op_id, "kind": "operator", "op": "dcp_lse_attention_merge",
             "builder": "dcp_lse_attention_merge", "family": "attention_merge", "recipe": rec,
-            "implementation": "aclnnRingAttentionUpdate", "dtype": "bf16",
-            "shape": {"tokens": toks, "heads": heads, "kv_heads": 1, "head_dim": hdim, "width": hdim},
+            "implementation": "aclnnRingAttentionUpdate", "dtype": merge_dt,
+            "shape": {"tokens": toks, "heads": heads, "kv_heads": 1, "head_dim": hdim, "width": hdim, "partial_count": partials},
         }
-        return node, {"op_id": op_id, "family": fam, "recipe": rec, "builder": "dcp_lse_attention_merge"}
+        return node, {
+            "op_id": op_id, "family": fam, "recipe": rec, "builder": "dcp_lse_attention_merge",
+            "dtype": merge_dt, "partial_count": partials,
+        }
 
     if fam == "allreduce":
-        nbytes = max(_MIN_COLLECTIVE_BYTES, int(op_rec["link_bytes"]) or _DEFAULT_COLLECTIVE_BYTES)
+        grp_axis = op_rec["group_axis"] or "tp"
+        grp_sz = dcp if grp_axis == "cp" else tp
+        raw_link = int(op_rec["link_bytes"])
+        if raw_link > 0 and grp_sz > 1:
+            payload_nbytes = max(
+                _MIN_COLLECTIVE_BYTES,
+                (raw_link * grp_sz) // max(1, _RING_ALLREDUCE_FACTOR * (grp_sz - 1)),
+            )
+        else:
+            payload_nbytes = max(_MIN_COLLECTIVE_BYTES, raw_link or _DEFAULT_COLLECTIVE_BYTES)
         node = {
             "node_id": nid, "op_id": op_id, "kind": "collective", "op": "all_reduce", "builder": "all_reduce",
             "family": "allreduce", "recipe": rec, "implementation": "hcclAllReduce", "dtype": "bf16",
-            "group": op_rec["group_axis"] or "tp", "group_size": tp, "nbytes": nbytes,
-            "shape": {"tokens": total_tokens, "width": _MLA_HIDDEN_WIDTH, "nbytes": nbytes},
+            "group": grp_axis, "group_size": grp_sz, "nbytes": payload_nbytes,
+            "shape": {"tokens": total_tokens, "width": _MLA_HIDDEN_WIDTH, "nbytes": payload_nbytes, "link_bytes": raw_link},
         }
-        return node, {"op_id": op_id, "family": fam, "recipe": rec, "builder": "all_reduce"}
+        return node, {"op_id": op_id, "family": fam, "recipe": rec, "builder": "all_reduce", "nbytes": payload_nbytes, "group_size": grp_sz}
 
     width = int(loc[-1]) if loc else _MLA_HIDDEN_WIDTH
     node = {
@@ -932,13 +964,22 @@ def verify_actual_geometry_matches_plan(
             raise ModelingError(f"profiler_actual_geometry_mismatch:{cid}:context_len:expected={exp_val}:actual={got_ctx}")
 
     exp_pages = _int_from(expected_shape, "page_count")
+    explicit_pages = _int_from(actual_shape, "page_count")
     bt = actual_shape.get("block_table")
-    got_pages = _int_from(actual_shape, "page_count")
-    if got_pages is None and isinstance(bt, Sequence) and not isinstance(bt, (str, bytes)) and len(bt) >= _BLOCK_TABLE_PAIR_LEN:
+    bt_pages: int | None = None
+    if isinstance(bt, Sequence) and not isinstance(bt, (str, bytes)) and len(bt) >= _BLOCK_TABLE_PAIR_LEN:
         if not isinstance(bt[1], bool) and isinstance(bt[1], int):
-            got_pages = int(bt[1])
-    if exp_pages is not None and got_pages is not None and got_pages != exp_pages:
-        raise ModelingError(f"profiler_actual_geometry_mismatch:{cid}:page_count:expected={exp_pages}:actual={got_pages}")
+            bt_pages = int(bt[1])
+    if explicit_pages is not None and bt_pages is not None and explicit_pages != bt_pages:
+        raise ModelingError(
+            f"profiler_actual_geometry_mismatch:{cid}:page_count_block_table_conflict"
+            f":page_count={explicit_pages}:block_table_pages={bt_pages}"
+        )
+    for got_pages in (explicit_pages, bt_pages):
+        if exp_pages is not None and got_pages is not None and got_pages != exp_pages:
+            raise ModelingError(
+                f"profiler_actual_geometry_mismatch:{cid}:page_count:expected={exp_pages}:actual={got_pages}"
+            )
 
     if axis == "batch_x_kv_heads":
         got_bxkv = _int_from(actual_shape, "batch_x_kv_heads")
@@ -1005,6 +1046,8 @@ def extract_observed_shape(
     first: Mapping[str, Any],
     comp: Mapping[str, Any] | None = None,
     receipts: Sequence[Mapping[str, Any]] = (),
+    *,
+    allow_requested_fallback: bool = True,
 ) -> dict[str, Any]:
     """Return the richest non-placeholder receipt/builder-reported executed shape."""
     for rcpt in receipts:
@@ -1013,15 +1056,19 @@ def extract_observed_shape(
                 cand = rcpt.get(key)
                 if isinstance(cand, Mapping) and cand and dict(cand) != {"declared": True}:
                     return dict(cand)
-    ident = first.get("identity") if isinstance(first.get("identity"), Mapping) else {}
-    key_map = first.get("key") if isinstance(first.get("key"), Mapping) else {}
     comp_map = comp if isinstance(comp, Mapping) else {}
-    for cand in (
+    writer_cands: list[Any] = [
         comp_map.get("actual_shape"), summary.get("actual_shape"), first.get("actual_shape"),
         comp_map.get("executed_shape"), summary.get("executed_shape"), first.get("executed_shape"),
-        summary.get("requested_shape"), first.get("requested_shape"),
-        ident.get("shape"), key_map.get("shape"),
-    ):
+    ]
+    if allow_requested_fallback:
+        ident = first.get("identity") if isinstance(first.get("identity"), Mapping) else {}
+        key_map = first.get("key") if isinstance(first.get("key"), Mapping) else {}
+        writer_cands.extend([
+            summary.get("requested_shape"), first.get("requested_shape"),
+            ident.get("shape"), key_map.get("shape"),
+        ])
+    for cand in writer_cands:
         if isinstance(cand, Mapping) and cand and dict(cand) != {"declared": True}:
             return dict(cand)
     return {}

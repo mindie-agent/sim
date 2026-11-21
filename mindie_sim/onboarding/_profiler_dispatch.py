@@ -255,18 +255,30 @@ def _lookup_entry_receipts(
     cid: str,
     base_rid: str,
     ranks: Sequence[int],
-) -> list[Mapping[str, Any]]:
+) -> tuple[list[Mapping[str, Any]], list[int]]:
     matched: list[Mapping[str, Any]] = []
     seen_ids: set[int] = set()
-    keys: list[tuple[str, str, int | None]] = [(cid, base_rid, int(rk)) for rk in ranks]
-    keys.append((cid, base_rid, None))
-    for key in keys:
-        for rcpt in receipts_by_key.get(key) or ():
+    covered_ranks: set[int] = set()
+    for rk in ranks:
+        rk_int = int(rk)
+        rk_rcpts = receipts_by_key.get((cid, base_rid, rk_int)) or ()
+        if rk_rcpts:
+            covered_ranks.add(rk_int)
+            for rcpt in rk_rcpts:
+                obj_id = id(rcpt)
+                if obj_id not in seen_ids:
+                    seen_ids.add(obj_id)
+                    matched.append(rcpt)
+    unsuffixed = receipts_by_key.get((cid, base_rid, None)) or ()
+    if unsuffixed:
+        if len(ranks) == 1:
+            covered_ranks.add(int(ranks[0]))
+        for rcpt in unsuffixed:
             obj_id = id(rcpt)
             if obj_id not in seen_ids:
                 seen_ids.add(obj_id)
                 matched.append(rcpt)
-    return matched
+    return matched, sorted(covered_ranks)
 
 
 def _join_multirank_obs_entries(
@@ -309,10 +321,12 @@ def _join_multirank_obs_entries(
             raise ModelingError(f"profiler_writer_clock_operator_conflict:{cid}:{sorted(clocks)}")
         merged_group: list[Mapping[str, Any]] = []
         merged_receipts: list[Mapping[str, Any]] = []
+        merged_receipt_ranks: set[int] = set()
         base_rids: list[str] = []
         for m in members:
             merged_group.extend(m["group"])
             merged_receipts.extend(m.get("receipts") or ())
+            merged_receipt_ranks.update(int(r) for r in (m.get("receipt_ranks") or ()))
             base_rids.append(m["base_rid"])
         acq_id = next((m["acq_id"] for m in members if m["acq_id"]), "")
         if acq_id:
@@ -330,6 +344,7 @@ def _join_multirank_obs_entries(
             "clock_op": next(iter(clocks)),
             "group": merged_group,
             "receipts": merged_receipts,
+            "receipt_ranks": sorted(merged_receipt_ranks),
             "comp": members[0]["comp"],
             "summary": members[0]["summary"],
             "ranks": sorted(seen_ranks),
@@ -402,22 +417,119 @@ def _collect_abi_and_buckets(
         elif cid:
             if status not in _PASSING_RECEIPT_STATUSES:
                 raise ModelingError(f"profiler_bench_receipt_failed:{cid}:{status}")
-            base_rid, _arm = parse_run_id_and_arm(raw_run_id)
-            raw_rk = rec.get("rank")
-            rk_val = int(raw_rk) if isinstance(raw_rk, int) and not isinstance(raw_rk, bool) else None
-            receipts_by_key.setdefault((cid, base_rid, rk_val), []).append(rec)
+            if status == "ok":
+                base_rid, _arm = parse_run_id_and_arm(raw_run_id)
+                raw_rk = rec.get("rank")
+                rk_val = int(raw_rk) if isinstance(raw_rk, int) and not isinstance(raw_rk, bool) else None
+                receipts_by_key.setdefault((cid, base_rid, rk_val), []).append(rec)
     return completes, obs_buckets, receipts_by_key, abi_rows
 
 
+def _norm_timed_op_id(raw_id: str, cid: str) -> str:
+    clean = str(raw_id or "").strip()
+    prefix = f"{cid}:"
+    if clean.startswith(prefix):
+        return clean[len(prefix):]
+    if ":" in clean:
+        return clean.rsplit(":", 1)[1]
+    return clean
+
+
 def _extract_entry_timed_nodes(
-    entry_receipts: Sequence[Mapping[str, Any]], summary: Mapping[str, Any]
+    entry_receipts: Sequence[Mapping[str, Any]],
+    summary: Mapping[str, Any],
+    *,
+    cid: str,
+    level: str,
+    is_planned: bool,
+    expected_timed_ops: Sequence[str] = (),
 ) -> list[str]:
-    for src in (*entry_receipts, summary):
-        if isinstance(src, Mapping):
-            tn = src.get("timed_nodes")
-            if isinstance(tn, Sequence) and not isinstance(tn, (str, bytes)) and tn:
-                return [str(x) for x in tn]
-    return []
+    if level not in {"L2", "L3"}:
+        for src in (*entry_receipts, summary):
+            if isinstance(src, Mapping):
+                tn = src.get("timed_nodes")
+                if isinstance(tn, Sequence) and not isinstance(tn, (str, bytes)) and tn:
+                    return [str(x) for x in tn]
+        return []
+
+    sources: list[Mapping[str, Any]] = list(entry_receipts)
+    if not sources and not is_planned and isinstance(summary, Mapping):
+        sources = [summary]
+    if not sources:
+        raise ModelingError(f"profiler_timed_nodes_missing:{cid}:level={level}")
+
+    parsed_lists: list[list[str]] = []
+    op_sets: list[frozenset[str]] = []
+    for src in sources:
+        tn = src.get("timed_nodes") if isinstance(src, Mapping) else None
+        if not isinstance(tn, Sequence) or isinstance(tn, (str, bytes)) or not tn:
+            rk = src.get("rank") if isinstance(src, Mapping) else None
+            raise ModelingError(f"profiler_timed_nodes_missing:{cid}:level={level}:rank={rk}")
+        items = [str(x) for x in tn if str(x).strip()]
+        if not items:
+            raise ModelingError(f"profiler_timed_nodes_missing:{cid}:level={level}")
+        parsed_lists.append(items)
+        op_sets.append(frozenset(_norm_timed_op_id(x, cid) for x in items))
+
+    first_set = op_sets[0]
+    if any(op_set != first_set for op_set in op_sets[1:]):
+        counts = [len(op_set) for op_set in op_sets]
+        raise ModelingError(f"profiler_timed_nodes_rank_mismatch:{cid}:level={level}:counts={counts}")
+    sum_tn = summary.get("timed_nodes") if isinstance(summary, Mapping) else None
+    if isinstance(sum_tn, Sequence) and not isinstance(sum_tn, (str, bytes)) and sum_tn:
+        sum_set = frozenset(_norm_timed_op_id(str(x), cid) for x in sum_tn if str(x).strip())
+        if sum_set and sum_set != first_set:
+            raise ModelingError(
+                f"profiler_timed_nodes_summary_mismatch:{cid}:level={level}"
+                f":summary={len(sum_set)}:receipt={len(first_set)}"
+            )
+    exp_set = frozenset(_norm_timed_op_id(str(x), cid) for x in expected_timed_ops if str(x).strip())
+    if exp_set and first_set != exp_set:
+        raise ModelingError(
+            f"profiler_timed_nodes_plan_mismatch:{cid}:level={level}"
+            f":got={len(first_set)}:expected={len(exp_set)}"
+        )
+    return parsed_lists[0]
+
+
+def _verify_entry_receipts_and_shape(
+    entry: Mapping[str, Any],
+    *,
+    entry_receipts: Sequence[Mapping[str, Any]],
+    summary: Mapping[str, Any],
+    first: Mapping[str, Any],
+    comp: Mapping[str, Any],
+    plan_pt: Mapping[str, Any] | None,
+    binding_info: Mapping[str, Any] | None,
+    exp_ranks: Sequence[int],
+    cid: str,
+) -> dict[str, Any]:
+    if plan_pt is not None:
+        receipt_ranks = {int(r) for r in (entry.get("receipt_ranks") or ())}
+        if not entry_receipts or not set(exp_ranks).issubset(receipt_ranks):
+            raise ModelingError(
+                f"profiler_bench_receipt_missing:{cid}:expected_ranks={list(exp_ranks)}"
+                f":got_ranks={sorted(receipt_ranks)}"
+            )
+    req_shape = extract_observed_shape(
+        summary, first, comp, receipts=entry_receipts, allow_requested_fallback=(plan_pt is None),
+    )
+    if plan_pt is not None and not req_shape:
+        raise ModelingError(f"profiler_actual_shape_missing:{cid}")
+    if plan_pt is not None and binding_info is not None:
+        verify_actual_geometry_matches_plan(
+            req_shape, plan_pt, expected_shape=binding_info["expected_shape"], cid=cid
+        )
+        for rcpt in entry_receipts:
+            rcpt_shape = extract_observed_shape(
+                {}, {}, {}, receipts=(rcpt,), allow_requested_fallback=False,
+            )
+            if not rcpt_shape:
+                raise ModelingError(f"profiler_actual_shape_missing:{cid}:rank={rcpt.get('rank')}")
+            verify_actual_geometry_matches_plan(
+                rcpt_shape, plan_pt, expected_shape=binding_info["expected_shape"], cid=cid
+            )
+    return req_shape
 
 
 def _seal_normalized_entry(
@@ -461,22 +573,22 @@ def _seal_normalized_entry(
         if isinstance(summary.get("plan_key"), Mapping)
         else (first.get("plan_key") if isinstance(first.get("plan_key"), Mapping) else {})
     )
-    req_shape = extract_observed_shape(summary, first, comp, receipts=entry_receipts)
     binding_info = (
         resolve_point_measured_binding(plan_doc, plan_pt, sku=sku)
         if plan_pt is not None
         else None
     )
-    if plan_pt is not None and binding_info is not None:
-        verify_actual_geometry_matches_plan(
-            req_shape, plan_pt, expected_shape=binding_info["expected_shape"], cid=cid
-        )
-        for rcpt in entry_receipts:
-            rcpt_shape = extract_observed_shape({}, {}, {}, receipts=(rcpt,))
-            if rcpt_shape:
-                verify_actual_geometry_matches_plan(
-                    rcpt_shape, plan_pt, expected_shape=binding_info["expected_shape"], cid=cid
-                )
+    req_shape = _verify_entry_receipts_and_shape(
+        entry,
+        entry_receipts=entry_receipts,
+        summary=summary,
+        first=first,
+        comp=comp,
+        plan_pt=plan_pt,
+        binding_info=binding_info,
+        exp_ranks=exp_ranks,
+        cid=cid,
+    )
     dims = extract_shape_dims(
         req_shape,
         plan_key,
@@ -484,7 +596,28 @@ def _seal_normalized_entry(
         expected_shape=binding_info["expected_shape"] if binding_info else None,
     )
     ev_ids = sorted({str(r.get("sample_id") or f"{cid}-s{i}") for i, r in enumerate(group)})
-    timed_nodes = _extract_entry_timed_nodes(entry_receipts, summary)
+    ident = first.get("identity") if isinstance(first.get("identity"), Mapping) else {}
+    raw_level = str(first.get("level") or ident.get("level") or "").strip().upper()
+    if raw_level in {"L1", "L2", "L3"}:
+        known_level = raw_level
+    elif binding_info is not None:
+        known_level = binding_info["level"]
+    else:
+        known_level = ""
+    expected_timed = (
+        binding_info["measured_binding"].get("timed_op_ids") or ()
+        if binding_info is not None
+        else ()
+    )
+    timed_nodes = _extract_entry_timed_nodes(
+        entry_receipts,
+        summary,
+        cid=cid,
+        level=known_level or "L1",
+        is_planned=(plan_pt is not None),
+        expected_timed_ops=expected_timed,
+    )
+    level = known_level if known_level else ("L1" if len(timed_nodes) <= 1 else "L2")
 
     cap_payload: dict[str, Any] = {
         "case_id": cid, "run_id": pub_run_id, "split": split, "sku": str(first.get("sku") or sku),
@@ -501,15 +634,6 @@ def _seal_normalized_entry(
     cap_uri = f"capture://{clean_ep}/{pub_run_id}/{raw_sha}.json"
     if capture_out_dir is not None:
         write_atomic_bytes(Path(capture_out_dir) / f"{raw_sha}.json", cap_bytes)
-
-    ident = first.get("identity") if isinstance(first.get("identity"), Mapping) else {}
-    raw_level = str(first.get("level") or ident.get("level") or "").strip().upper()
-    if raw_level in {"L1", "L2", "L3"}:
-        level = raw_level
-    elif binding_info is not None:
-        level = binding_info["level"]
-    else:
-        level = "L1" if len(timed_nodes) <= 1 else "L2"
 
     if binding_info is not None:
         sim_fam, sim_case, row_phase = (
@@ -620,13 +744,14 @@ def normalize_profiler_records(
             ranks = _extract_ranks_from_bucket(group, summary)
             acq_id = str(first.get("acquisition_id") or comp.get("acquisition_id") or "").strip()
             acq_key = acq_id or str(first.get("plan_id") or comp.get("plan_id") or "").strip()
-            matched_rcpts = _lookup_entry_receipts(
+            matched_rcpts, receipt_ranks = _lookup_entry_receipts(
                 receipts_by_key, cid=cid, base_rid=base_rid, ranks=ranks
             )
             pre_entries.append({
                 "cid": cid, "base_rid": base_rid, "pub_run_id": sanitize_public_run_id(base_rid),
                 "split": split, "clock_op": clock_op, "group": list(group),
-                "receipts": matched_rcpts, "comp": comp, "summary": summary, "ranks": ranks,
+                "receipts": matched_rcpts, "receipt_ranks": receipt_ranks,
+                "comp": comp, "summary": summary, "ranks": ranks,
                 "acq_id": acq_id, "acq_key": acq_key, "multi_rank_joined": False,
             })
 

@@ -27,8 +27,12 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import concurrent.futures
 from dataclasses import replace
+import multiprocessing
+import os
 import re
+import threading
 from typing import Any
 
 from mindie_sim.observations.multilevel_gate import (
@@ -61,6 +65,9 @@ _MAX_DIAG_OP_IDS = 16
 _INDEXER_SHAPE_MIN_RANK = 3
 _GEMM_SHAPE_MIN_RANK = 3
 _BLOCK_TABLE_PAIR_LEN = 2
+_MIN_DCP_PARTIALS = 2
+_MAX_REPLAY_WORKERS = 16
+_MIN_PARALLEL_CASES = 2
 _ALLOWED_MODEL_OVERRIDES = frozenset({"layers", "index_topk", "index_dtype"})
 _GEMM_FAMILIES = frozenset({"gemm", "gate_up_projection", "down_projection"})
 _TOPO_TOKEN_RE = re.compile(r"(tp|pp|dp|ep|pcp|dcp)(\d+)")
@@ -484,7 +491,18 @@ def _verify_attention_op_binding(
         or binding.get("query_layout") or binding.get("input_layout") or ""
     ).strip().upper()
     meas_kv_len = _opt_pos_int(actual.get("seq_len"), actual.get("kv_len"), binding.get("kv_len"))
-    meas_pages = _opt_pos_int(actual.get("page_count"), _extract_block_table_pages(actual), binding.get("page_count"))
+    actual_explicit_pages = _opt_pos_int(actual.get("page_count"))
+    actual_bt_pages = _extract_block_table_pages(actual)
+    binding_pages = _opt_pos_int(binding.get("page_count"))
+    if (
+        actual_explicit_pages is not None
+        and actual_bt_pages is not None
+        and actual_explicit_pages != actual_bt_pages
+    ):
+        raise ModelingError(
+            f"whitebox_measured_binding_mismatch:{case_id}:page_count_block_table_conflict"
+            f":page_count={actual_explicit_pages}:block_table_pages={actual_bt_pages}"
+        )
     if meas_kv is not None and meas_kv != lowered_kv:
         raise ModelingError(
             f"whitebox_measured_binding_mismatch:{case_id}:kv_heads:measured={meas_kv}:lowered={lowered_kv}"
@@ -509,10 +527,11 @@ def _verify_attention_op_binding(
         raise ModelingError(
             f"whitebox_measured_binding_mismatch:{case_id}:kv_len:measured={meas_kv_len}:lowered={lowered_kv_len}"
         )
-    if meas_pages is not None and lowered_pages > 0 and meas_pages != lowered_pages:
-        raise ModelingError(
-            f"whitebox_measured_binding_mismatch:{case_id}:page_count:measured={meas_pages}:lowered={lowered_pages}"
-        )
+    for meas_pages in (actual_explicit_pages, actual_bt_pages, binding_pages):
+        if meas_pages is not None and lowered_pages > 0 and meas_pages != lowered_pages:
+            raise ModelingError(
+                f"whitebox_measured_binding_mismatch:{case_id}:page_count:measured={meas_pages}:lowered={lowered_pages}"
+            )
 
 
 def _verify_indexer_op_binding(
@@ -584,6 +603,83 @@ def _normalize_timed_op_id(raw_id: str, case_id: str) -> str:
     return clean
 
 
+def _verify_gemm_node_binding(
+    op: Any,
+    nb: Mapping[str, Any],
+    n_actual: Mapping[str, Any],
+    *,
+    case_id: str,
+    op_id: str,
+    is_per_node_actual: bool,
+    is_last_grouped_gemm: bool,
+    is_sole_gemm: bool = False,
+) -> None:
+    meta = dict(getattr(op, "metadata", ()) or ())
+    lowered_mg = max(1, int(meta.get("matrix_groups") or 1))
+    use_case_mg = is_per_node_actual or lowered_mg > 1 or is_sole_gemm
+    meas_mg = _opt_pos_int(
+        n_actual.get("matrix_groups") if use_case_mg else None,
+        n_actual.get("e") if use_case_mg else None,
+        nb.get("matrix_groups"),
+        nb.get("e"),
+    )
+    if meas_mg is not None and meas_mg != lowered_mg:
+        raise ModelingError(
+            f"whitebox_measured_binding_mismatch:{case_id}:matrix_groups:{op_id}:measured={meas_mg}:lowered={lowered_mg}"
+        )
+    loc = tuple(getattr(op, "local_shape", ()) or ())
+    if len(loc) < _GEMM_SHAPE_MIN_RANK:
+        return
+    use_actual_dims = is_per_node_actual or (lowered_mg > 1 and is_last_grouped_gemm) or is_sole_gemm
+    for dim_idx, dim_key in enumerate(("m", "n", "k")):
+        act_d = _opt_pos_int(n_actual.get(dim_key)) if use_actual_dims else None
+        nb_d = _opt_pos_int(nb.get(dim_key))
+        if act_d is not None and nb_d is not None and act_d != nb_d:
+            raise ModelingError(
+                f"whitebox_measured_binding_mismatch:{case_id}:gemm_{dim_key}_conflict:{op_id}:actual={act_d}:planned={nb_d}"
+            )
+        meas_d = act_d if act_d is not None else nb_d
+        if meas_d is not None and meas_d != int(loc[dim_idx]):
+            raise ModelingError(
+                f"whitebox_measured_binding_mismatch:{case_id}:weight_{dim_key}:{op_id}:measured={meas_d}:lowered={loc[dim_idx]}"
+            )
+
+
+def _verify_attention_merge_node_binding(
+    op: Any,
+    sim_case: Any,
+    nb: Mapping[str, Any],
+    n_actual: Mapping[str, Any],
+    *,
+    case_id: str,
+    op_id: str,
+) -> None:
+    lowered_dt = str(getattr(op, "dtype", "") or "").strip().lower()
+    act_dt = str(n_actual.get("dtype") or "").strip().lower()
+    nb_dt = str(nb.get("dtype") or "").strip().lower()
+    if act_dt and nb_dt and act_dt != nb_dt:
+        raise ModelingError(
+            f"whitebox_measured_binding_mismatch:{case_id}:dtype_conflict:{op_id}:actual={act_dt}:planned={nb_dt}"
+        )
+    meas_dt = act_dt or nb_dt
+    if meas_dt and lowered_dt and meas_dt != lowered_dt:
+        raise ModelingError(
+            f"whitebox_measured_binding_mismatch:{case_id}:dtype:{op_id}:measured={meas_dt}:lowered={lowered_dt}"
+        )
+    lowered_partials = max(_MIN_DCP_PARTIALS, int(getattr(sim_case.runtime.parallel, "cp", 1) or 1))
+    act_partials = _opt_pos_int(n_actual.get("partial_count"))
+    nb_partials = _opt_pos_int(nb.get("partial_count"))
+    if act_partials is not None and nb_partials is not None and act_partials != nb_partials:
+        raise ModelingError(
+            f"whitebox_measured_binding_mismatch:{case_id}:partial_count_conflict:{op_id}:actual={act_partials}:planned={nb_partials}"
+        )
+    meas_partials = act_partials if act_partials is not None else nb_partials
+    if meas_partials is not None and meas_partials != lowered_partials:
+        raise ModelingError(
+            f"whitebox_measured_binding_mismatch:{case_id}:partial_count:{op_id}:measured={meas_partials}:lowered={lowered_partials}"
+        )
+
+
 def _verify_node_bindings(
     chosen_ops: tuple[Any, ...],
     sim_case: Any,
@@ -596,64 +692,67 @@ def _verify_node_bindings(
     case_id: str,
 ) -> None:
     ops_by_id = {str(op.op_id): op for op in chosen_ops}
-    raw_timed = payload.get("timed_nodes")
-    if not (isinstance(raw_timed, Sequence) and not isinstance(raw_timed, (str, bytes)) and raw_timed):
-        raw_timed = binding.get("timed_op_ids")
-    if expected_level == "L3" and isinstance(raw_timed, Sequence) and not isinstance(raw_timed, (str, bytes)) and raw_timed:
-        timed_set = {_normalize_timed_op_id(str(x), case_id) for x in raw_timed if str(x).strip()}
-        replayed_set = set(ops_by_id)
-        if timed_set != replayed_set:
-            raise ModelingError(
-                f"whitebox_measured_binding_mismatch:{case_id}:l3_op_set_mismatch:timed={len(timed_set)}:replayed={len(replayed_set)}"
-            )
+    has_payload_timed = "timed_nodes" in payload and payload.get("timed_nodes") is not None
+    raw_timed = payload.get("timed_nodes") if has_payload_timed else binding.get("timed_op_ids")
+    if expected_level in {"L2", "L3"} and isinstance(raw_timed, Sequence) and not isinstance(raw_timed, (str, bytes)):
+        if has_payload_timed or raw_timed:
+            timed_set = {_normalize_timed_op_id(str(x), case_id) for x in raw_timed if str(x).strip()}
+            replayed_set = set(ops_by_id)
+            if timed_set != replayed_set:
+                raise ModelingError(
+                    f"whitebox_measured_binding_mismatch:{case_id}:{expected_level.lower()}_op_set_mismatch"
+                    f":timed={len(timed_set)}:replayed={len(replayed_set)}"
+                )
 
-    node_bindings = binding.get("node_bindings")
-    if not isinstance(node_bindings, Sequence) or isinstance(node_bindings, (str, bytes)):
+    raw_node_bindings = binding.get("node_bindings")
+    if isinstance(raw_node_bindings, Sequence) and not isinstance(raw_node_bindings, (str, bytes)) and raw_node_bindings:
+        node_bindings: Sequence[Mapping[str, Any]] = [nb for nb in raw_node_bindings if isinstance(nb, Mapping)]
+    elif expected_level in {"L2", "L3"} and actual:
+        node_bindings = [{"op_id": oid} for oid in ops_by_id]
+    else:
         return
     node_shapes = actual.get("node_shapes") if isinstance(actual.get("node_shapes"), Mapping) else {}
+    all_gemm_ids = [
+        str(nb.get("op_id") or "").strip()
+        for nb in node_bindings
+        if str(nb.get("op_id") or "").strip() in ops_by_id
+        and ops_by_id[str(nb.get("op_id") or "").strip()].family in _GEMM_FAMILIES
+    ]
+    grouped_gemm_ids = [
+        oid for oid in all_gemm_ids
+        if int(dict(getattr(ops_by_id[oid], "metadata", ()) or ()).get("matrix_groups") or 1) > 1
+    ]
+    last_grouped_id = grouped_gemm_ids[-1] if grouped_gemm_ids else ""
+    sole_gemm_id = all_gemm_ids[0] if len(all_gemm_ids) == 1 else ""
     for nb in node_bindings:
-        if not isinstance(nb, Mapping):
-            continue
         op_id = str(nb.get("op_id") or "").strip()
         if not op_id:
             continue
         op = ops_by_id.get(op_id)
         if op is None:
             raise ModelingError(f"whitebox_measured_binding_mismatch:{case_id}:node_op_id_missing:{op_id}")
-        n_actual = node_shapes.get(op_id) if isinstance(node_shapes.get(op_id), Mapping) else actual
+        per_node = node_shapes.get(op_id)
+        is_per_node = isinstance(per_node, Mapping)
+        n_actual = per_node if is_per_node else actual
         if op.family == "attention":
             _verify_attention_op_binding(
                 op, sim_case, nb, n_actual, {}, local_kv_heads=local_kv_heads, case_id=case_id
             )
         elif op.family in _GEMM_FAMILIES:
-            meta = dict(getattr(op, "metadata", ()) or ())
-            lowered_mg = max(1, int(meta.get("matrix_groups") or 1))
-            use_case_mg = n_actual is not actual or lowered_mg > 1
-            meas_mg = _opt_pos_int(
-                n_actual.get("matrix_groups") if use_case_mg else None,
-                n_actual.get("e") if use_case_mg else None,
-                nb.get("matrix_groups"),
-                nb.get("e"),
+            _verify_gemm_node_binding(
+                op, nb, n_actual, case_id=case_id, op_id=op_id,
+                is_per_node_actual=is_per_node,
+                is_last_grouped_gemm=(op_id == last_grouped_id),
+                is_sole_gemm=(op_id == sole_gemm_id),
             )
-            if meas_mg is not None and meas_mg != lowered_mg:
-                raise ModelingError(
-                    f"whitebox_measured_binding_mismatch:{case_id}:matrix_groups:{op_id}:measured={meas_mg}:lowered={lowered_mg}"
-                )
-            loc = tuple(getattr(op, "local_shape", ()) or ())
-            if len(loc) >= _GEMM_SHAPE_MIN_RANK:
-                meas_n, meas_k = _opt_pos_int(nb.get("n")), _opt_pos_int(nb.get("k"))
-                if meas_n is not None and meas_n != int(loc[1]):
-                    raise ModelingError(
-                        f"whitebox_measured_binding_mismatch:{case_id}:weight_n:{op_id}:measured={meas_n}:lowered={loc[1]}"
-                    )
-                if meas_k is not None and meas_k != int(loc[2]):
-                    raise ModelingError(
-                        f"whitebox_measured_binding_mismatch:{case_id}:weight_k:{op_id}:measured={meas_k}:lowered={loc[2]}"
-                    )
+        elif op.family == "attention_merge":
+            _verify_attention_merge_node_binding(
+                op, sim_case, nb, n_actual, case_id=case_id, op_id=op_id,
+            )
         elif op.family == "rmsnorm":
             loc = getattr(op, "local_shape", None)
             lowered_w = int(loc[-1]) if isinstance(loc, Sequence) and loc else 0
-            meas_w = _opt_pos_int(nb.get("width"))
+            meas_w = _opt_pos_int(n_actual.get("width") if is_per_node else None, nb.get("width"))
             if meas_w is not None and lowered_w > 0 and meas_w != lowered_w:
                 raise ModelingError(
                     f"whitebox_measured_binding_mismatch:{case_id}:width:{op_id}:measured={meas_w}:lowered={lowered_w}"
@@ -719,6 +818,15 @@ def _verify_measured_binding(
             )
     elif target_op.family == "indexer":
         _verify_indexer_op_binding(target_op, binding, actual, payload, case_id=case_id)
+    elif target_op.family in _GEMM_FAMILIES:
+        _verify_gemm_node_binding(
+            target_op, binding, actual, case_id=case_id, op_id=str(target_op.op_id),
+            is_per_node_actual=True, is_last_grouped_gemm=True, is_sole_gemm=True,
+        )
+    elif target_op.family == "attention_merge":
+        _verify_attention_merge_node_binding(
+            target_op, sim_case, binding, actual, case_id=case_id, op_id=str(target_op.op_id),
+        )
 
 
 def _apply_model_overrides(
@@ -957,6 +1065,26 @@ def _run_graphs_on_real_engine(
     return engine, start_ev, end_ev, elapsed_ms, float(observer.total_busy_ms()), observer
 
 
+def _case_replay_work_key(case: GateCase) -> int:
+    payload = dict(case.payload)
+    ctx = max(1, int(payload.get("context_len") or payload.get("context") or 1))
+    seq = max(1, int(payload.get("batch_size") or payload.get("sequences") or payload.get("batch_x_kv_heads") or 1))
+    return ctx * seq
+
+
+def _replay_whitebox_case_worker(
+    args: tuple[GateCase, str, str, PrimitiveTable | None, dict[str, Any] | None],
+) -> tuple[str, str, EngineInterval]:
+    case, expected_level, clock_operator, primitive_table, profile_override = args
+    runner = WhiteboxSpineRunner(
+        clock_operator=clock_operator,
+        primitive_table=primitive_table,
+        profile_override=profile_override,
+        max_workers=1,
+    )
+    return case.case_id, expected_level, runner._run_level(case, expected_level=expected_level)
+
+
 class WhiteboxSpineRunner:
     """Sealed ``EvaluationRunner`` executing true level-specific L1/L2/L3 Engine replays."""
 
@@ -966,12 +1094,67 @@ class WhiteboxSpineRunner:
         clock_operator: str = DEFAULT_CLOCK_OPERATOR,
         primitive_table: PrimitiveTable | None = None,
         profile_override: Mapping[str, Any] | None = None,
+        max_workers: int | None = None,
     ) -> None:
         if clock_operator not in VALID_CLOCK_OPERATORS:
             raise ModelingError(f"whitebox_runner_clock_operator_invalid:{clock_operator}")
         self.clock_operator = clock_operator
         self.primitive_table = primitive_table
         self.profile_override = dict(profile_override) if profile_override is not None else None
+        self.max_workers = max_workers
+        self._prefetched: dict[tuple[str, str], EngineInterval] = {}
+
+    def _resolve_workers(self, case_count: int) -> int:
+        if case_count < _MIN_PARALLEL_CASES:
+            return 1
+        if self.max_workers is not None:
+            return max(1, min(case_count, int(self.max_workers)))
+        env_raw = os.environ.get("MINDIE_SIM_REPLAY_WORKERS", "").strip()
+        if env_raw:
+            try:
+                return max(1, min(case_count, int(env_raw)))
+            except ValueError:
+                pass
+        return max(1, min(case_count, os.cpu_count() or 1, _MAX_REPLAY_WORKERS))
+
+    def prefetch_cases(self, cases: Sequence[GateCase]) -> int:
+        """Execute independent GateCase replays concurrently via bounded ProcessPoolExecutor."""
+        workers = self._resolve_workers(len(cases))
+        if (
+            workers <= 1
+            or "fork" not in multiprocessing.get_all_start_methods()
+            or threading.active_count() > 1
+        ):
+            return 0
+        indexed = [
+            (
+                idx,
+                _case_replay_work_key(case),
+                (
+                    case,
+                    str(case.level).upper(),
+                    self.clock_operator,
+                    self.primitive_table,
+                    self.profile_override,
+                ),
+            )
+            for idx, case in enumerate(cases)
+        ]
+        try:
+            ctx = multiprocessing.get_context("fork")
+            pool = concurrent.futures.ProcessPoolExecutor(max_workers=workers, mp_context=ctx)
+        except TimeoutError:
+            raise
+        except (PermissionError, OSError):
+            return 0
+        with pool:
+            futures_by_idx: dict[int, concurrent.futures.Future[tuple[str, str, EngineInterval]]] = {}
+            for idx, _work, task in sorted(indexed, key=lambda item: item[1], reverse=True):
+                futures_by_idx[idx] = pool.submit(_replay_whitebox_case_worker, task)
+            for idx in range(len(indexed)):
+                cid, lvl, interval = futures_by_idx[idx].result()
+                self._prefetched[(cid, lvl)] = interval
+        return len(indexed)
 
     def _materialize_case(self, case: GateCase, payload: Mapping[str, Any]) -> Any:
         from mindie_sim.api import compose_case
@@ -1134,13 +1317,16 @@ class WhiteboxSpineRunner:
         return bind_engine_interval(case, engine, start_ev, end_ev, **bind_kw)
 
     def run_l1(self, case: GateCase) -> EngineInterval:
-        return self._run_level(case, expected_level="L1")
+        cached = self._prefetched.pop((case.case_id, "L1"), None)
+        return cached if cached is not None else self._run_level(case, expected_level="L1")
 
     def run_l2(self, case: GateCase) -> EngineInterval:
-        return self._run_level(case, expected_level="L2")
+        cached = self._prefetched.pop((case.case_id, "L2"), None)
+        return cached if cached is not None else self._run_level(case, expected_level="L2")
 
     def run_l3(self, case: GateCase) -> EngineInterval:
-        return self._run_level(case, expected_level="L3")
+        cached = self._prefetched.pop((case.case_id, "L3"), None)
+        return cached if cached is not None else self._run_level(case, expected_level="L3")
 
 
 __all__ = [
