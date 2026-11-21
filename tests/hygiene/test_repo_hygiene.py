@@ -250,6 +250,15 @@ def test_to008_inspects_param_marks_citations_raises_and_legacy_root_without_byp
         'def test_law():\n    assert MARK\n',
         'MARK = pytest.mark.xfail(strict=True, raises=RuntimeError, reason="mindie_sim/schema/hardware.py:1")\n'
         'def test_law():\n    assert MARK\n',
+        'import builtins\nMARK = pytest.mark.xfail(strict=True, raises=builtins.AssertionError, reason="mindie_sim/schema/hardware.py:1")\n'
+        'def test_law():\n    assert MARK\n',
+        'class _Err(AssertionError):\n    pass\n\n'
+        'MARK = pytest.mark.xfail(strict=True, run=False, raises=_Err, reason="mindie_sim/schema/hardware.py:1")\n'
+        'def test_law():\n    assert MARK\n',
+        '@pytest.mark.parametrize("x", [pytest.param(1, marks=pytest.mark.xfail)])\n'
+        'def test_law(x):\n    assert x\n',
+        '@pytest.mark.parametrize("x", [pytest.param(1, marks=pytest.mark.skip(reason="skip"))])\n'
+        'def test_law(x):\n    assert x\n',
     )
     for idx, body in enumerate(bad_cases):
         root = _tree(tmp_path / f"c{idx}", {"tests/schema/test_profiles.py": _body(body), "data.json": "{\n}\n"})

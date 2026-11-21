@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import pytest
@@ -399,18 +400,19 @@ def test_heldout_real_npu_body_p50(relative, case_id):
     measured = row["comparison"]["observed_ms"]["p50"]
     case = _apply_captured_parallel(case, geometry)
     live = predict(case, scope="body", phase=geometry["phase"], tokens=geometry["tokens_per_sequence"],
-        context=geometry["context_tokens"], sequences=geometry["sequences_per_replica"],)
-    assert live["scope"] == "body"
-    if _rel(live["duration_ms"], measured) > REL_TOL:
-        raise _HeldoutTimingMismatch(
-            f"{relative}: live {live['duration_ms']:.6f} ms vs measured {measured:.6f} ms")
+                   context=geometry["context_tokens"], sequences=geometry["sequences_per_replica"])
+    dur = live["duration_ms"]
+    assert live["scope"] == "body" and math.isfinite(dur) and dur > 0 and math.isfinite(measured) and measured > 0
+    if _rel(dur, measured) > REL_TOL:
+        raise _HeldoutTimingMismatch(f"{relative}: live {dur:.6f} ms vs measured {measured:.6f} ms")
 
+def test_heldout_cases_preserve_unique_ids_and_unmarked_glm_c16():
+    assert HELDOUT_IDS == ["a3_v41_w8a8_tp4_dp4_ep16_dspark7_c32", "glm53flash-a3-tp16-c4", "a3_glm53flash_tp16_aclgraph_c16"]
+    assert len(HELDOUT_CASES) == 3 and HELDOUT_CASES[2].marks == ()
 def test_missing_evaluation_provenance_is_unknown():
-    assert _evaluation_relation({}, {}) == "unknown"
-    assert _evaluation_relation({}, {"calibration_origin": None}) == "unknown"
+    assert _evaluation_relation({}, {}) == _evaluation_relation({}, {"calibration_origin": None}) == "unknown"
     assert _evaluation_relation({}, {"calibration_origin": "observed"}) == "heldout_capture_not_in_sample"
-    assert _evaluation_relation(
-        {}, {"calibration_origin": "retained_operator_service_in_sample"}) == "in_sample"
+    assert _evaluation_relation({}, {"calibration_origin": "retained_operator_service_in_sample"}) == "in_sample"
 
 @pytest.mark.parametrize("marker", ("heldout_engine_20261030", "glm5_3_flash_w8a8_heldout"))
 def test_named_heldout_campaign_marker_is_explicit(marker):

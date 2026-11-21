@@ -177,11 +177,13 @@ def test_invalid_norm_declarations_are_rejected(kind, match):
     with pytest.raises(ModelingError, match=match):
         family_ascend_norm.lower_op(_bad_norm(kind), **kwargs)
     if kind == "beta":
-        caller_beta = _norm("add_rmsnorm_quant", 2, 3584, quant="mx")
-        with pytest.raises(ModelingError, match="mx_quant_beta_not_in_declared_abi"):
-            family_ascend_norm.lower_op(caller_beta, has_bias=True)
-        assert dict(_selected(caller_beta).metadata)["native_norm_kind"] == (
-            "AddRmsNormDynamicMxQuant")
+        for family, native_kind in (("rmsnorm_quant", "RmsNormDynamicMxQuant"), ("add_rmsnorm_quant", "AddRmsNormDynamicMxQuant")):
+            with pytest.raises(ModelingError, match="mx_quant_beta_not_in_declared_abi"):
+                family_ascend_norm.lower_op(_norm(family, 2, 3584, quant="mx", bias=True))
+            caller_beta = _norm(family, 2, 3584, quant="mx")
+            with pytest.raises(ModelingError, match="mx_quant_beta_not_in_declared_abi"):
+                family_ascend_norm.lower_op(caller_beta, has_bias=True)
+            assert dict(_selected(caller_beta).metadata)["native_norm_kind"] == native_kind
     if kind == "plain":
         with pytest.raises(ModelingError, match="positive_width"):
             mx_dynamic_quant.producer_contract(0)

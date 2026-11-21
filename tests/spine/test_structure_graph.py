@@ -179,13 +179,13 @@ def test_matrix_entry_and_quantize_ports(declared_report):
     activation = next(value for value in values["inputs"] if value["name"] == "activation")
     weight = next(value for value in values["inputs"] if value["name"] == "weight")
     output, (m, n, k) = values["outputs"][0], node["contract"][1]
-    _same((values["basis"], activation["layout"], activation["producer"]),
-          ("contract", "strided", "s0.l0.linear_qkvz.quantize"))
+    _same((values["basis"], activation["layout"], activation["producer"]), ("contract", "strided", "s0.l0.linear_qkvz.quantize"))
     _same((activation["shape"], weight["shape"], output["shape"]), ([m, k], [n, k], [m, n]))
-    _same((activation["quant"], output["dtype"], weight["layout"], output["layout"]),
-          ("int8", "bf16", None, None))
-    _same([candidate["native"] for candidate in node["native_candidates"]],
-          ["QuantBatchMatmulV3", "QuantBatchMatmulV4"])
+    _same((activation["quant"], output["dtype"], weight["layout"], output["layout"]), ("int8", "bf16", None, None))
+    scales, w_scale = values["quantization"]["scales"], next(v for v in values["declared"] if v["name"] == "weight_scale")
+    _same((scales["activation"]["format"], scales["weight"]["format"], scales["weight"]["storage_format"]), ("fp32", "bf16", "fp32"))
+    _same((w_scale["role"], w_scale["dtype"], w_scale["attrs"]["storage_format"], w_scale["attrs"]["association"]), ("scale", "bf16", "fp32", "weight"))
+    _same([candidate["native"] for candidate in node["native_candidates"]], ["QuantBatchMatmulV3", "QuantBatchMatmulV4"])
     quant = _nodes(declared_report)["rank:0/s0.l0.linear_qkvz.quantize"]
     outputs = {value["output"]: value for value in quant["values"]["outputs"]}
     _same((outputs["payload"]["dtype"], outputs["activation_scales"]["bytes"]), ("int8", 4.0))
@@ -514,24 +514,25 @@ def test_down_source_program_removes_only_its_implemented_epilogue_gap(profiler_
     structure = export_structure(case, phase="decode", tokens=1, scope="body")
     recipe = "ascend_w4a8_msd_grouped_down" if source_down else "grouped_down"
     down = next(row for row in structure["nodes"] if row["recipe"] == recipe)
-    mapping, events = captured_report(case, "a3_glm53_decode.csv", "GroupedMatmul",
-                                      structure=structure, repeat=1)
+    mapping, events = captured_report(case, "a3_glm53_decode.csv", "GroupedMatmul", structure=structure, repeat=1)
     row = compare_cohorts(case, mapping)["windows"][0]["cohorts"][0]
     assert down["physical_work"]["launches"] == 1
-    _same((row["target_kind"], row["observed"]["activity_sum_ns"]), ("node",
-                                                                    events[0].duration_ns))
+    _same((row["target_kind"], row["observed"]["activity_sum_ns"]), ("node", events[0].duration_ns))
     if source_down:
-        assert row["status"] == "compared"
-        assert down["contract_scope"]["implemented_quantized_epilogue"]["program"] == recipe
+        assert row["status"] == "compared" and down["contract_scope"]["implemented_quantized_epilogue"]["program"] == recipe
         assert down["physical_work"]["matrix_flops"] == {"int4": 4 * 8 * 6144 * 256}
     else:
-        _same((row["status"], row["reason"], row["comparison"]),
-              ("reference_only", "quantized_epilogue_unmodeled", None))
+        _same((row["status"], row["reason"], row["comparison"]), ("reference_only", "quantized_epilogue_unmodeled", None))
 
 def test_typed_state_and_matrix_representations_keep_their_gaps(declared_report):
     fused = next(node for node in export_structure(_tiny_ops()[0], phase="prefill", tokens=8, scope="body")["nodes"] if node["family"] == "add_rmsnorm")
     outputs = {value["name"]: value for value in fused["values"]["outputs"]}
     _same((fused["values"]["basis"], outputs["residual"]["role"], fused["values"]["selection"]), ("typed_records", "residual", {"basis": "selected_software_plan", "kind": "residual_norm"}))
+    nmap = _nodes(declared_report); cout = nmap["rank:0/s0.l0.qkv_concatenate"]["values"]["outputs"]
+    _same([(v["name"], v["shape"], v["dtype"], v["bytes"]) for v in cout], [("output", [2048], "bf16", 4096.0)])
+    rin = {v["name"]: v for v in nmap["rank:0/s0.l0.decode_recurrent_scan"]["values"]["inputs"] if v["name"] in {"query", "key"}}
+    for view, off in ((rin["query"], 0), (rin["key"], 512)):
+        _same((view["producer"], view["output"], view["shape"], view["bytes"], view["storage_shape"], view["storage_bytes"], view["offset"], view["attrs"]["root_storage_shape"], view["attrs"]["root_storage_bytes"]), ("s0.l0.qkv_concatenate", "output", [1, 1, 4, 128], 1024.0, [2048], 4096.0, off, [2048], 4096.0))
     node = next(node for node in declared_report["nodes"] if node["family"] == "recurrent_vector")
     inputs = {value["name"]: value for value in node["values"]["inputs"]}
     _same((inputs["state"]["dtype"], inputs["state"]["shape"], inputs["state"]["storage_shape"], inputs["state"]["storage_bytes"], "state_capacity_not_declared" in {gap["code"] for gap in node["values"]["gaps"]}, [effect["action"] for effect in node["values"]["state_effects"]]), ("fp32", [1, 8, 128, 128], None, None, True, ["read", "write", "commit"]))

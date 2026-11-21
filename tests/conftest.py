@@ -190,3 +190,13 @@ def isolated_runtime(_worker_runtime_root, monkeypatch):
 def profiler_api():
     if not _profiler_available():
         _missing(PROFILER_API_REQUIREMENT)
+
+
+@pytest.fixture
+def lean_binary() -> str:
+    elan = Path("/tmp/elan-mindie-s3b/bin/lean")
+    lean = shutil.which("lean") or (str(elan) if elan.is_file() else None)
+    if not lean:
+        _missing("Lean toolchain unavailable")
+    assert lean is not None
+    return lean

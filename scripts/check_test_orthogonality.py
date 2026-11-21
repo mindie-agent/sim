@@ -217,6 +217,8 @@ class ModuleCheck(ast.NodeVisitor):
         self.aliases: dict[str, str] = {}
         self.module_consts: dict[str, ast.AST] = {}
         self.seen_xfail_params: set[tuple[str, str]] = set()
+        self.call_funcs: set[int] = set()
+        self.attr_values: set[int] = set()
 
     def resolve(self, node: ast.AST) -> str:
         raw = dotted(node)
@@ -225,6 +227,8 @@ class ModuleCheck(ast.NodeVisitor):
         return f"{mapped}{sep}{tail}" if mapped else raw
 
     def visit_Module(self, node: ast.Module) -> None:
+        self.call_funcs = {id(n.func) for n in ast.walk(node) if isinstance(n, ast.Call)}
+        self.attr_values = {id(n.value) for n in ast.walk(node) if isinstance(n, ast.Attribute)}
         for stmt in node.body:
             if isinstance(stmt, ast.Assign):
                 targets, value = stmt.targets, stmt.value
@@ -244,8 +248,8 @@ class ModuleCheck(ast.NodeVisitor):
                 [stmt.target] if isinstance(stmt, ast.AnnAssign) and stmt.value is not None else [])
             val = getattr(stmt, "value", None)
             if val is not None and any(isinstance(t, ast.Name) and t.id == "pytestmark" for t in targets):
-                if self._contains_xfail(val):
-                    self.add(stmt, "TO008", "module-level pytestmark xfail is banned")
+                if self._contains_mark(val, {"pytest.mark.xfail", "pytest.mark.skip"}):
+                    self.add(stmt, "TO008", "module-level pytestmark xfail/skip is banned")
 
     def visit_BinOp(self, node: ast.BinOp) -> None:
         left = node
@@ -328,7 +332,7 @@ class ModuleCheck(ast.NodeVisitor):
 
     visit_FunctionDef = visit_AsyncFunctionDef = visit_ClassDef = _scoped
 
-    def _contains_xfail(self, expr: ast.AST) -> bool:
+    def _contains_mark(self, expr: ast.AST, targets: set[str]) -> bool:
         roots = [expr]
         seen: set[str] = set()
         for root in roots:
@@ -336,7 +340,9 @@ class ModuleCheck(ast.NodeVisitor):
                 if isinstance(sub, ast.Name) and sub.id in self.module_consts and sub.id not in seen:
                     seen.add(sub.id)
                     roots.append(self.module_consts[sub.id])
-                if isinstance(sub, ast.Call) and self.resolve(sub.func) == "pytest.mark.xfail":
+                if isinstance(sub, ast.Call) and self.resolve(sub.func) in targets:
+                    return True
+                if isinstance(sub, (ast.Attribute, ast.Name)) and self.resolve(sub) in targets:
                     return True
         return False
 
@@ -357,15 +363,36 @@ class ModuleCheck(ast.NodeVisitor):
                 return False
         return True
 
+    def _exc_leaves(self, expr: ast.AST | None, seen: set[str] | None = None) -> list[str] | None:
+        if expr is None:
+            return None
+        visited = set() if seen is None else seen
+        if isinstance(expr, ast.Name):
+            if expr.id in self.module_consts and expr.id not in visited:
+                return self._exc_leaves(self.module_consts[expr.id], visited | {expr.id})
+            return [self.resolve(expr).split(".")[-1]]
+        if isinstance(expr, ast.Attribute):
+            return [expr.attr]
+        if isinstance(expr, ast.Tuple) and expr.elts:
+            out: list[str] = []
+            for elt in expr.elts:
+                sub = self._exc_leaves(elt, visited)
+                if not sub:
+                    return None
+                out.extend(sub)
+            return out
+        return None
+
     def _check_xfail_call(self, node: ast.Call) -> None:
         kw = {k.arg: k.value for k in node.keywords}
-        strict, reason, raises = kw.get("strict"), kw.get("reason"), kw.get("raises")
-        exc_names = [n.id for n in ast.walk(raises) if isinstance(n, ast.Name)] if raises is not None else []
-        ok_raises = bool(exc_names) and not any(name in BROAD_XFAIL_RAISES for name in exc_names)
-        if not (isinstance(strict, ast.Constant) and strict.value is True and ok_raises
+        strict, reason, raises, run_kw = kw.get("strict"), kw.get("reason"), kw.get("raises"), kw.get("run")
+        leaves = self._exc_leaves(raises)
+        ok_raises = bool(leaves) and not any(name in BROAD_XFAIL_RAISES for name in leaves)
+        ok_run = run_kw is None or (isinstance(run_kw, ast.Constant) and run_kw.value is True)
+        if not (isinstance(strict, ast.Constant) and strict.value is True and ok_raises and ok_run
                 and isinstance(reason, ast.Constant) and isinstance(reason.value, str)
                 and self._valid_xfail_citation(reason.value)):
-            self.add(node, "TO008", "xfail requires strict=True, specific raises=..., and verified file:line citation")
+            self.add(node, "TO008", "xfail requires strict=True, run=True, specific raises=..., and verified file:line")
 
     def _check_skipif_call(self, node: ast.Call) -> None:
         kw = {k.arg: k.value for k in node.keywords}
@@ -377,7 +404,11 @@ class ModuleCheck(ast.NodeVisitor):
     def _check_param_marks(self, node: ast.Call) -> None:
         kw = {k.arg: k.value for k in node.keywords}
         marks_kw = kw.get("marks")
-        if marks_kw is None or not self._contains_xfail(marks_kw):
+        if marks_kw is None:
+            return
+        if self._contains_mark(marks_kw, {"pytest.mark.skip"}):
+            self.add(node, "TO008", "pytest.param skip mark is banned")
+        if not self._contains_mark(marks_kw, {"pytest.mark.xfail"}):
             return
         str_args = [a.value for a in node.args if isinstance(a, ast.Constant) and isinstance(a.value, str)]
         id_kw = kw.get("id")
@@ -391,8 +422,8 @@ class ModuleCheck(ast.NodeVisitor):
 
     def _decorator(self, deco: ast.AST) -> None:
         if not isinstance(deco, ast.Call) or self.resolve(deco.func) != "pytest.mark.parametrize":
-            if self._contains_xfail(deco):
-                self.add(deco, "TO008", "unapproved test-level xfail decorator")
+            if self._contains_mark(deco, {"pytest.mark.xfail", "pytest.mark.skip"}):
+                self.add(deco, "TO008", "unapproved test-level xfail/skip decorator")
             return
         roots = [deco]
         seen: set[str] = set()
@@ -460,7 +491,7 @@ class ModuleCheck(ast.NodeVisitor):
             self.add(node, "TO007", f"{name}(): use tmp_path or _support.tempdirs")
         if name in {"Path.home", "pathlib.Path.home", "os.path.expanduser"} and not self.is_tempdirs:
             self.add(node, "TO007", f"{name}(): never resolve the real user home in tests")
-        if name in {"pytest.skip", "pytest.importorskip", "pytest.xfail"} and not self.is_conftest:
+        if name in {"pytest.skip", "pytest.importorskip", "pytest.xfail", "pytest.mark.skip"} and not self.is_conftest:
             self.add(node, "TO008", f"silent {name}(): use requires_profiler / requires_capture_mount markers")
         if name == "pytest.mark.xfail" and not self.is_conftest:
             self._check_xfail_call(node)
@@ -481,14 +512,24 @@ class ModuleCheck(ast.NodeVisitor):
             self.add(node, "TO011", "inspect.signature point test: assert behaviour instead")
         self.generic_visit(node)
 
+    def _check_bare_mark(self, node: ast.AST) -> None:
+        if self.is_conftest or id(node) in self.call_funcs or id(node) in self.attr_values:
+            return
+        resolved = self.resolve(node)
+        if resolved in {"pytest.mark.xfail", "pytest.mark.skip", "pytest.mark.skipif",
+                        "pytest.skip", "pytest.xfail", "pytest.importorskip"}:
+            self.add(node, "TO008", f"bare {resolved} reference is banned")
+
     def visit_Attribute(self, node: ast.Attribute) -> None:
         if node.attr in FIELD_ENUM and not self.allow_fields:
             self.add(node, "TO011", f"{node.attr} enumeration is reserved for the profiler SSOT module")
+        self._check_bare_mark(node)
         self.generic_visit(node)
 
     def visit_Name(self, node: ast.Name) -> None:
         if node.id in FIELD_ENUM and not self.allow_fields:
             self.add(node, "TO011", f"{node.id} enumeration is reserved for the profiler SSOT module")
+        self._check_bare_mark(node)
 
     def visit_Constant(self, node: ast.Constant) -> None:
         if isinstance(node.value, str) and self.is_test:

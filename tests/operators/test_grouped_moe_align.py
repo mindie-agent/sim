@@ -557,11 +557,16 @@ def test_mx_source_fifo_slots_and_l1_operand_reuse_ordering():
                         pool_names={k: k for k in pools}, compute_peaks={"fp8_e4m3": 1e6},
                         service_modes={"reg_issue_slots": ("vector", roles["vector"] * 1000 / 32)})
     done = plan.lower(ctx).start(eng, "source", eng.submit("input", release=7))
+    eng.advance(horizon=6)
+    assert not any(eng.serviced.values())
     eng.advance(until=(done,))
     events = list(eng.trace)
     matches = lambda panel, suffix: [e for e in events if f":panel{panel}:" in e["task"] and e["task"].endswith(suffix)]
     for panel in range(4):
         published = max(matches(panel, f":publish{sub}")[0]["end_ms"] for sub in (0, 1))
         assert min(e["start_ms"] for e in matches(panel, ":operand")) >= published
+        for sub in (0, 1):
+            assert matches(panel, f":packed_read{sub}")[0]["end_ms"] <= matches(panel, f":widen{sub}")[0]["start_ms"]
         if panel >= 2:
             assert matches(panel, ":packed_read0")[0]["start_ms"] >= max(e["end_ms"] for e in matches(panel - 2, ":cube"))
+    assert not eng._tasks and not eng.allocations

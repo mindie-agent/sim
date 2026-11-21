@@ -539,11 +539,9 @@ def test_certificate_requires_acyclic_graph_and_simple_path(dag, path, sink, bou
     assert check_optimality_certificate(program, dag, cert) is acyclic
 
 @pytest.mark.tier1
-@pytest.mark.parametrize("lean", (LEAN,) if LEAN else (
-    pytest.param(None, marks=pytest.mark.skip(reason="Lean toolchain unavailable")),
-))
-def test_lean_certificate_agrees_on_cycles_and_valid_path(tmp_path, lean):
+def test_lean_certificate_agrees_on_cycles_and_valid_path(tmp_path, lean_binary):
     from subprocess import run
+    lean = lean_binary
     declarations = ["open MindIESimSpec.OptimalityCertificate"]
     for i, (dag, path, sink, bound, path_ns, acyclic) in enumerate(DAG_CASES):
         edges = ", ".join(f"⟨{e.src}, {e.dst}, {e.wire_ns}⟩" for e in dag.edges)

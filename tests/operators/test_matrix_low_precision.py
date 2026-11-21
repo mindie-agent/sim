@@ -29,7 +29,7 @@ from mindie_sim.prediction.operators.mx_quant_matrix.mxfp4_panels import compile
 from mindie_sim.prediction.operators.mx_quant_matrix.mxfp4_pipeline import Dependencies, Panel, Slots, SourcePipeline, pipeline_cycle
 from mindie_sim.prediction.operators.mx_quant_matrix.mxfp4_source_refill import source_panel
 from mindie_sim.prediction.operators.hyper_connections.native_fusion import _groups, lower_native_fusions
-from mindie_sim.prediction.program import RecipeBook
+from mindie_sim.prediction.program import RecipeBook, RecipeContext
 from mindie_sim.prediction.operators.matrix.refill_steady import compact_refill
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError
@@ -158,64 +158,53 @@ def test_cube_issue_and_register_work_conserve_exact_payloads(mx4_source):
     directional = mx4(raw, grouped_op(gate, (1, 0), 128, 64), mte1_mode="directional")
     assert service(directional, "mte1") == (16 + 2*128)*66 and service(directional, "hbm") == pytest.approx(service(a, "hbm"))
 def panel_args(context, k=5120, m=1, n=160, repeat=1, owner=0, share=1, directional=False):
-    return dict(k=k, m=m, n=n, repeat=repeat, owner=owner, cores=32, aivs=64,
-                directional=directional, shared_clients={context.resource_names["hbm"]: share})
+    return dict(k=k, m=m, n=n, repeat=repeat, owner=owner, cores=32, aivs=64, directional=directional, shared_clients={context.resource_names["hbm"]: share})
 def uncached(context, options):
-    k, m, n = (options[key] for key in ("k", "m", "n"))
-    kb, ka, _ = panel_sizes(m, n)
-    panels, period = ceil(k / kb), lcm(ka, 4096) // kb
-    count = panels // period - (panels % period == 0 and k % kb != 0)
+    k, m, n = (options[key] for key in ("k", "m", "n")); kb, ka, _ = panel_sizes(m, n)
+    panels, period = ceil(k / kb), lcm(ka, 4096) // kb; count = panels // period - (panels % period == 0 and k % kb != 0)
     args = {key: value for key, value in options.items() if key != "shared_clients"}
     parts = [panel_parts(context, index=i, **args) for i in range(panels)]
-    return compact_refill(context, tuple(parts[:period]) if count else (), count,
-                          tuple(parts[count * period:]), shared_clients=options["shared_clients"])
-
+    return compact_refill(context, tuple(parts[:period]) if count else (), count, tuple(parts[count * period:]), shared_clients=options["shared_clients"])
 @pytest.fixture(scope="module")
 def panel_context(mx4_source):
-    raw, (gate, _), _ = mx4_source
-    contexts = []
+    raw, (gate, _), _ = mx4_source; contexts = []
     def capture(op, geometry):
         plan = mxfp4_grouped.build(op, geometry)
         return replace(plan, program=lambda ctx: contexts.append(ctx) or plan.program(ctx))
     price(raw, grouped_op(gate, (1,), 160, 320), book(PlannedRecipe(capture)))
     return contexts[0]
-def engine_for(context):
+def engine_for(context, trace_limit=200):
     units = {name: context.resource_units.get(role, 1) for role, name in context.resource_names.items()}
-    return Engine([Resource(n, rate, units=units.get(n, 1)) for n, rate in context.rates.items()], trace_limit=200)
+    return Engine([Resource(n, rate, units=units.get(n, 1)) for n, rate in context.rates.items()], trace_limit=trace_limit)
 def execute(program, context, copies=1):
-    engine = engine_for(context)
-    ready = engine.submit("input", release=7)
+    engine = engine_for(context, trace_limit=2000); ready = engine.submit("input", release=7)
     done = tuple(program.start(engine, f"copy{i}", ready, owner=f"caller{i}") for i in range(copies))
     engine.advance(until=done)
     return tuple(e.time for e in done), dict(engine.serviced), engine.completed_count, list(engine.trace)
 def compare_ir(context, args, copies=1):
     cached, original = compiled_panels(context, **args), uncached(context, args)
-    assert cached == original and execute(cached, context, copies) == execute(original, context, copies)
+    out = execute(cached, context, copies); assert cached == original and out == execute(original, context, copies)
+    by_task = {e["task"]: e for e in out[3]}; assert any(t.endswith(":packed_read0") for t in by_task)
+    for t, e in by_task.items():
+        if t.endswith((":widen0", ":widen1")) and (rp := by_task.get(t.replace(":widen", ":packed_read"))): assert rp["end_ms"] <= e["start_ms"]
     return cached
 
 @pytest.mark.parametrize("k,m,repeat", [(64, 1, 1), (320, 3, 1), (4096, 1, 1), (5120, 17, 1), (24576, 1, 1), (320, 1, 2)])
 def test_panel_ir_matches_source_and_has_independent_events(panel_context, k, m, repeat):
     cached = compare_ir(panel_context, panel_args(panel_context, k=k, m=m, repeat=repeat), copies=2)
     for stage in cached.stages:
-        with pytest.raises(TypeError):
-            stage.work["injected"] = 1
-    with pytest.raises(TypeError):
-        cached.stages[0].program.stages[0].placement["injected"] = (0,)
+        with pytest.raises(TypeError): stage.work["injected"] = 1
+    with pytest.raises(TypeError): cached.stages[0].program.stages[0].placement["injected"] = (0,)
 
 def test_panel_cache_keys_and_lifetimes(panel_context):
     ctx = replace(panel_context, op=replace(panel_context.op), service_modes={**panel_context.service_modes, **DIRECTIONAL})
-    args = panel_args(ctx, directional=True)
-    base = compiled_panels(ctx, **args)
+    args = panel_args(ctx, directional=True); base = compiled_panels(ctx, **args)
     assert compare_ir(ctx, dict(args, owner=1, repeat=2)) is not base
-    refs = weakref.ref(ctx), weakref.ref(ctx.op)
-    del ctx
-    gc.collect()
+    refs = weakref.ref(ctx), weakref.ref(ctx.op); del ctx; gc.collect()
     assert all(ref() is None for ref in refs)
     compiled_panels.cache_clear()
-    args = panel_args(panel_context, k=64)
-    first = compiled_panels(panel_context, **args)
-    for repeat in range(2, 1026):
-        compiled_panels(panel_context, **dict(args, repeat=repeat))
+    args = panel_args(panel_context, k=64); first = compiled_panels(panel_context, **args)
+    for repeat in range(2, 1026): compiled_panels(panel_context, **dict(args, repeat=repeat))
     assert (compiled_panels.cache_info().currsize, compiled_panels.template_cache_info().currsize) == (1024, 128)
     assert compiled_panels(panel_context, **args) == first and compiled_panels(panel_context, **args) is not first
 
@@ -234,23 +223,43 @@ def test_panel_templates_rebind_real_units(panel_context):
         compare_ir(ctx, panel_args(ctx, k=320, m=3, repeat=2, owner=owner, share=3))
 def test_dynamic_slots_select_distinct_templates_and_match_eager_schedule(panel_context, mx4_source):
     compiled_panels.cache_clear()
-    args = panel_args(panel_context)
-    dynamic = dict(args, producer_mode="dynamic_buffer4")
+    args = panel_args(panel_context); dynamic = dict(args, producer_mode="dynamic_buffer4")
     plans = [compiled_panels(panel_context, **opts) for opts in (args, dynamic, dict(dynamic, producer_slots=Slots(1, 1, 1, 1, 1)))]
     assert len({id(plan) for plan in plans}) == compiled_panels.template_cache_info().misses == 3
     def panel(i):
         return source_panel(panel_context, k=32768, m=1, n=128, repeat=1, index=i, owner=0, cores=32, aivs=64, directional=False)
-    engine = engine_for(panel_context)
+    engine = engine_for(panel_context, trace_limit=2000)
     state = Dependencies(engine.submit("input", release=7), Slots())
     for i in range(64):
         done = state.advance(panel(i), lambda label, stage, deps: stage.submit(engine, f"panel{i}:{label}", deps, lambda n: n, ""))
     engine.advance(until=(done,))
+    matches = lambda p, pfx: [e for e in list(engine.trace) if e["task"].startswith(f"panel{p}:{pfx}")]
+    for p in range(6):
+        pub = max(matches(p, f"publish{s}")[0]["end_ms"] for s in (0, 1))
+        assert min(e["start_ms"] for e in matches(p, "operand")) >= pub
+        for s in (0, 1): assert matches(p, f"packed_read{s}")[0]["end_ms"] <= matches(p, f"widen{s}")[0]["start_ms"]
+        if p >= 2: assert matches(p, "operand0")[0]["start_ms"] >= matches(p - 2, "cube0")[0]["end_ms"]
+        if p >= 4: assert matches(p, "packed_read0")[0]["start_ms"] >= matches(p - 4, "widen0")[0]["end_ms"]
     times, work, _, _ = execute(SourcePipeline(64, panel, activation_panels=4, scale_panels=8), panel_context)
     assert times == pytest.approx((done.time,), rel=1e-12) and work == pytest.approx(engine.serviced, rel=1e-12, abs=1e-12)
     raw, (gate, _), _ = mx4_source
     empty = mx4(raw, grouped_op(gate, (0, 0), 32, 64), producer_mode="dynamic_buffer4", compact_panels=False)
-    assert [service(empty, r) for r in ("hbm", "mte2_aiv", "matrix")] == pytest.approx([64 * 256, 64 * 256, 0])
-    drained(empty)
+    assert [service(empty, r) for r in ("hbm", "mte2_aiv", "matrix")] == pytest.approx([64 * 256, 64 * 256, 0]); drained(empty)
+    reg_roles = ("reg_data_writes", "reg_ub_accesses", "reg_ub_stores", "reg_shuffle_lanes")
+    roles = {r: (1 if r == "cube" else 1e9) for r in ("hbm", "mte1", "mte2_aic", "mte2_aiv", "mte3", "vector", "fixpipe", "cube", *reg_roles)}
+    units = {r: (2 if r in ("vector", "mte2_aiv", "mte3", *reg_roles) else 1) for r in roles}
+    pools = {"ub": 256 * 1024, "l1": 512 * 1024, "l0a": 64 * 1024, "l0b": 64 * 1024, "l0c": 256 * 1024}
+    geom = Geometry(1, units, pools, {k: (2 if k == "ub" else 1) for k in pools}); op4 = grouped_op(gate, (1,), 128, 2048)
+    plan4 = mxfp4_grouped.build(op4, geom, compact=False, compact_panels=False)
+    eng4 = Engine([Resource(r, v, units=units[r]) for r, v in roles.items()], pools=pools, pool_units=geom.buffer_units, trace_limit=1000)
+    ctx4 = RecipeContext(plan4.work.apply(op4), {}, {r: r for r in roles}, roles, 1, resource_units=units, pool_names={k: k for k in pools}, compute_peaks={"fp8_e4m3": 1e6}, service_modes={"reg_issue_slots": ("vector", roles["vector"] * 1000 / 32)})
+    done4 = plan4.lower(ctx4).start(eng4, "source", eng4.submit("input", release=7)); eng4.advance(horizon=6); assert not any(eng4.serviced.values()); eng4.advance(until=(done4,))
+    ev4 = list(eng4.trace); m4 = lambda p, sfx: [e for e in ev4 if f":panel{p}:" in e["task"] and e["task"].endswith(sfx)]
+    for p in range(4):
+        assert min(e["start_ms"] for e in m4(p, ":operand")) >= max(m4(p, f":publish{s}")[0]["end_ms"] for s in (0, 1))
+        for s in (0, 1): assert m4(p, f":packed_read{s}")[0]["end_ms"] <= m4(p, f":widen{s}")[0]["start_ms"]
+        if p >= 2: assert m4(p, ":packed_read0")[0]["start_ms"] >= max(e["end_ms"] for e in m4(p - 2, ":cube"))
+    assert not eng4._tasks and not eng4.allocations
 
 @pytest.fixture(scope="module")
 def mx8_source():
@@ -538,47 +547,35 @@ def test_geometry_cache_bounds_and_immutable_work():
     cfg = Config(320, 320, (1, 0, 2))
     saved = geometry_ledger(cfg, 32)
     counts = saved.inventory.to_dict()["instructions"]
-    mutations = ((saved.work.resources, "hbm"), (saved.work.matrix, "fp8_e4m3"), (saved.inventory.counts, next(iter(counts))))
-    for mapping, key in mutations:
-        with pytest.raises(TypeError):
-            mapping[key] = 0
-    for i in range(1, 130):
-        geometry_ledger(Config(i*64, 32, (0, 0)), 2)
-    assert geometry_ledger.cache_info().currsize == 128
-    assert geometry_ledger(cfg, 32) == saved and geometry_ledger(cfg, 32) is not saved
+    for mapping, key in ((saved.work.resources, "hbm"), (saved.work.matrix, "fp8_e4m3"), (saved.inventory.counts, next(iter(counts)))):
+        with pytest.raises(TypeError): mapping[key] = 0
+    for i in range(1, 130): geometry_ledger(Config(i*64, 32, (0, 0)), 2)
+    assert geometry_ledger.cache_info().currsize == 128 and geometry_ledger(cfg, 32) == saved and geometry_ledger(cfg, 32) is not saved
     cfg = Config(5120, 4608, (1, 0, 2)+(0,)*45)
-    assert [n for _, n in columns(cfg, 32)] == [128]*16+[160]*16
-    assert Counter(t[0] for o in range(32) for t in owner_tiles(cfg, o, 32)) == {0:32, 2:32}
+    assert [n for _, n in columns(cfg, 32)] == [128]*16+[160]*16 and Counter(t[0] for o in range(32) for t in owner_tiles(cfg, o, 32)) == {0:32, 2:32}
     assert effective_l2_bytes(Geometry(1, {}, {"l2":1024}, {})) == 768
 
 def test_source_pipeline_cadence_slots_and_cycle_jump():
     p = Panel(None, None, ((0, 0, 0, 3, 4, 2), (0, 0, 0, 0, 0, 0)), (False, False), ((0, 0),))
     assert [pipeline_cycle((p,), n).span_ms for n in (1, 2, 3)] == [9, 13, 17]
     tail = replace(p, activation=100, activation_scale=17, vectors=((8, 4, 3, 2, 1, 5), p.vectors[1]), scales=(True, False))
-    for n in (1, 3, 5, 31, 100):
-        assert pipeline_cycle((p,), n, tail=(tail,)).span_ms == max(117, 4*n+15)
+    for n in (1, 3, 5, 31, 100): assert pipeline_cycle((p,), n, tail=(tail,)).span_ms == max(117, 4*n+15)
     large = pipeline_cycle((p,), 100000)
     assert large.span_ms == 400005 and large.stepped_panels < 100 and large.jumped_panels > 99000
 
 @pytest.mark.parametrize("kind", ("buffers", "minimum", "alias"))
 def test_situ_runtime_keeps_owners_buffer_reuse_and_kernel_minimum(situ_case, kind):
-    recipe = family_situ_mx.recipe_book()
-    m, n = (3, 256) if kind == "buffers" else (1, 768)
+    recipe = family_situ_mx.recipe_book(); m, n = (3, 256) if kind == "buffers" else (1, 768)
     op = family_situ_mx.make_op(family_situ_mx.Config(m, n, "fp8_e4m3", 4., 25. if kind=="minimum" else None))
     def hardware(d):
         units, rates = dict(d.resource_units), dict(d.rates)
         if kind == "buffers":
             units.update(vector=1, mte2_aiv=1, mte3=1)
-            return replace(d, resource_units=tuple(units.items()), buffers=tuple(dict(d.buffers, ub=6656).items()),
-                           buffer_units=tuple(dict(d.buffer_units, ub=1).items()))
-        if kind == "minimum":
-            return replace(d, launch_us=7, kernel_invocations=(("vector", InvocationTiming(minimum_ms=.01)),))
-        for pipe in ("mte2", "mte2_aic", "mte2_aiv", "mte3"):
-            units.pop(pipe, None)
-            rates.pop(pipe, None)
+            return replace(d, resource_units=tuple(units.items()), buffers=tuple(dict(d.buffers, ub=6656).items()), buffer_units=tuple(dict(d.buffer_units, ub=1).items()))
+        if kind == "minimum": return replace(d, launch_us=7, kernel_invocations=(("vector", InvocationTiming(minimum_ms=.01)),))
+        for pipe in ("mte2", "mte2_aic", "mte2_aiv", "mte3"): units.pop(pipe, None); rates.pop(pipe, None)
         modes = dict(d.service_modes, mte2=("dma", 4e12), mte3=("dma", 4e12))
-        return replace(d, rates=tuple(dict(rates, dma=4e12).items()), resource_units=tuple(dict(units, dma=128).items()),
-                       service_modes=tuple(modes.items()))
+        return replace(d, rates=tuple(dict(rates, dma=4e12).items()), resource_units=tuple(dict(units, dma=128).items()), service_modes=tuple(modes.items()))
     def run(case, submit=False):
         return graph_costs(case, (op,), recipes=recipe, isolated=False, trace_limit=200, include_submission=submit)
     case = change_dies(situ_case, hardware)
