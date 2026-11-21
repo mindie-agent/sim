@@ -180,36 +180,36 @@ def family_default_tiling_axes(
 
     if clean_family in _SPARSE_INDEXER_FAMILIES:
         tk = int(topk_threshold) if topk_threshold is not None else LIGHTNING_TOPK_ABOVE_THRESHOLD
+        bounds_rule = default_topk_abi_rule(
+            above_threshold=tk,
+            divisor=1,
+            max_value=LIGHTNING_TOPK_MAX_VALUE,
+            arch_presets=(),
+        )
+        dav22_div_rule = default_topk_abi_rule(
+            above_threshold=tk,
+            divisor=LIGHTNING_TOPK_DIVISOR,
+            max_value=LIGHTNING_TOPK_MAX_VALUE,
+            arch_presets=(ARCH_PRESET_22,),
+        )
         if arch_preset == ARCH_PRESET_35:
             thresholds: tuple[tuple[str, int], ...] = (
                 (("topk", tk), ("topk", QLI_SMALL_M_TOPK_THRESHOLD))
                 if tk != QLI_SMALL_M_TOPK_THRESHOLD
                 else (("topk", tk),)
             )
-            rule = default_topk_abi_rule(
-                above_threshold=tk,
-                max_value=LIGHTNING_TOPK_MAX_VALUE,
-                arch_presets=(ARCH_PRESET_35,),
-            )
             return TilingAxes(
                 tile_dims=(int(tile_dim),),
                 core_product_axes=("tokens", "batch_x_kv_heads"),
                 phase_thresholds=thresholds,
-                abi_divisibility=(rule,),
+                abi_divisibility=(bounds_rule, dav22_div_rule),
                 enforce_topk_le_context_archs=(),
             )
-        arch_scope = (ARCH_PRESET_22,) if arch_preset == ARCH_PRESET_22 else ()
         return TilingAxes(
             tile_dims=(int(tile_dim),),
             core_product_axes=("tokens", "batch_x_kv_heads"),
             phase_thresholds=(("topk", tk),),
-            abi_divisibility=(
-                default_topk_abi_rule(
-                    above_threshold=tk,
-                    max_value=LIGHTNING_TOPK_MAX_VALUE,
-                    arch_presets=arch_scope,
-                ),
-            ),
+            abi_divisibility=(bounds_rule, dav22_div_rule),
             enforce_topk_le_context_archs=(),
         )
 
@@ -221,7 +221,17 @@ def family_default_tiling_axes(
         rules.append(
             default_topk_abi_rule(
                 above_threshold=tk_val,
+                divisor=1,
                 max_value=LIGHTNING_TOPK_MAX_VALUE,
+                arch_presets=(),
+            )
+        )
+        rules.append(
+            default_topk_abi_rule(
+                above_threshold=tk_val,
+                divisor=LIGHTNING_TOPK_DIVISOR,
+                max_value=LIGHTNING_TOPK_MAX_VALUE,
+                arch_presets=(ARCH_PRESET_22,),
             )
         )
     return TilingAxes(

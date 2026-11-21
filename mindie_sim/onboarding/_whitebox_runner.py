@@ -38,6 +38,7 @@ from mindie_sim.observations.multilevel_gate import (
 )
 from mindie_sim.primitives.schema import PrimitiveTable
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.parallel import local_kv_heads as compute_local_kv_heads
 
 from ._lean_and_receipts import program_dag_sha256
 from ._sku_calibration import temporary_scaffold_profile
@@ -99,6 +100,8 @@ class _BusyUnionObserver:
     def __init__(self) -> None:
         self._intervals: list[tuple[float, float]] = []
         self._by_row: dict[str, list[tuple[float, float]]] = {}
+        self._by_op: dict[tuple[int, str], list[tuple[float, float]]] = {}
+        self._task_op: dict[int, tuple[int, str]] = {}
         self._periodic_extra_ms = 0.0
         self._periodic_by_row: dict[str, float] = {}
         self._slot_gen: dict[tuple[str, int], int] = {}
@@ -106,8 +109,22 @@ class _BusyUnionObserver:
     def register_pipe(self, name: str) -> int:
         return 0
 
-    def on_submit(self, *_args: Any, **_kwargs: Any) -> None:
-        return
+    def on_submit(
+        self,
+        task_id: int = 0,
+        _stage_id: str = "",
+        _aliases: Sequence[str] = (),
+        _predecessors: Sequence[int] = (),
+        _signals: Sequence[str] = (),
+        occurrence: Any = None,
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> None:
+        if occurrence is not None:
+            op_id = str(getattr(occurrence, "op_id", "") or "").strip()
+            if op_id:
+                replica = int(getattr(occurrence, "replica", 0) or 0)
+                self._task_op[int(task_id)] = (replica, op_id)
 
     def on_admit(self, *_args: Any, **_kwargs: Any) -> None:
         return
@@ -127,7 +144,7 @@ class _BusyUnionObserver:
 
     def on_service(
         self,
-        _task_id: int,
+        task_id: int,
         physical_row: str,
         _owner: int,
         t0_ms: float,
@@ -146,6 +163,12 @@ class _BusyUnionObserver:
         bucket.append(span)
         if len(bucket) >= _OBSERVER_COMPACT_THRESHOLD:
             self._by_row[row_key] = _coalesce_intervals(bucket)
+        op_key = self._task_op.get(int(task_id))
+        if op_key is not None:
+            op_bucket = self._by_op.setdefault(op_key, [])
+            op_bucket.append(span)
+            if len(op_bucket) >= _OBSERVER_COMPACT_THRESHOLD:
+                self._by_op[op_key] = _coalesce_intervals(op_bucket)
         if len(self._intervals) >= _OBSERVER_COMPACT_THRESHOLD:
             self._intervals = _coalesce_intervals(self._intervals)
 
@@ -212,12 +235,52 @@ class _BusyUnionObserver:
         return tuple(spans)
 
 
+    def op_busy_ns(self, op_key: tuple[int, str], *, cap_ns: int) -> int:
+        """Return coalesced busy duration in ns observed for one executed op."""
+        intervals = self._by_op.get(op_key)
+        if not intervals:
+            return 0
+        return min(cap_ns, int(round(union_interval_span_ms(intervals) * NS_PER_MS)))
+
+
 def _parse_parallel_topology(topo: str) -> dict[str, int]:
-    parsed: dict[str, int] = {}
-    for axis, val_str in _TOPO_TOKEN_RE.findall(str(topo or "").lower()):
-        mapped = "cp" if axis == "dcp" else axis
-        parsed[mapped] = int(val_str)
-    return parsed
+    return {
+        axis: int(val_str)
+        for axis, val_str in _TOPO_TOKEN_RE.findall(str(topo or "").lower())
+    }
+
+
+def _build_executed_witness_program_dag(
+    graphs: Mapping[int, tuple[Any, ...]],
+    observer: _BusyUnionObserver,
+    *,
+    target_ns: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build exact Lean ``(program, dag)`` from executed graph ops, deps, and row work."""
+    row_ns = observer.row_busy_ns(cap_ns=target_ns)
+    lean_prog = {"num_resources": len(row_ns), "global_work": list(row_ns), "site_modes": []}
+    node_idx: dict[tuple[int, str], int] = {}
+    node_quanta: list[int] = []
+    ordered_nodes: list[tuple[int, Any]] = []
+    for replica in sorted(graphs):
+        for op in graphs[replica]:
+            key = (int(replica), str(op.op_id))
+            if key in node_idx:
+                continue
+            node_idx[key] = len(ordered_nodes)
+            ordered_nodes.append((int(replica), op))
+            q_ns = observer.op_busy_ns(key, cap_ns=target_ns)
+            node_quanta.append(q_ns if q_ns > 0 else (1 if target_ns > 0 else 0))
+    edges: list[dict[str, int]] = []
+    for dst_idx, (replica, op) in enumerate(ordered_nodes):
+        for dep in getattr(op, "deps", ()) or ():
+            src_idx = node_idx.get((replica, str(dep)))
+            if src_idx is not None and src_idx != dst_idx:
+                edges.append({"src": src_idx, "dst": dst_idx, "lag_ns": 0})
+    if not node_quanta:
+        node_quanta = [max(row_ns)]
+    lean_dag = {"node_quantum_ns": node_quanta, "edges": edges}
+    return lean_prog, lean_dag
 
 
 def _apply_calibrated_primitive_rates(case: Any, table: PrimitiveTable) -> Any:
@@ -349,7 +412,12 @@ def _select_level_ops(
     raise ModelingError(f"whitebox_level_unsupported:{level}")
 
 
-def _resolve_step_dimensions(payload: Mapping[str, Any]) -> tuple[int, int, int, int | None]:
+def _resolve_step_dimensions(
+    payload: Mapping[str, Any],
+    *,
+    local_kv_heads: int,
+    case_id: str,
+) -> tuple[int, int, int, int]:
     q_raw = payload.get("query_tokens")
     t_raw = payload.get("tokens")
     q_val = int(q_raw) if q_raw is not None and not isinstance(q_raw, bool) else None
@@ -371,8 +439,22 @@ def _resolve_step_dimensions(payload: Mapping[str, Any]) -> tuple[int, int, int,
     if bxkv_raw is None and str(payload.get("axis") or "") == "batch_x_kv_heads":
         bxkv_raw = payload.get("value")
     bxkv = int(bxkv_raw) if bxkv_raw is not None and not isinstance(bxkv_raw, bool) else None
-    sequences = max(1, bxkv) if (bxkv is not None and bxkv > 0 and batch == 1) else max(1, batch)
-    return tokens, context, sequences, bxkv
+    kv_per_rank = max(1, int(local_kv_heads))
+    if bxkv is not None:
+        if bxkv < 1 or bxkv % kv_per_rank != 0:
+            raise ModelingError(
+                f"whitebox_batch_x_kv_heads_indivisible:{case_id}:target={bxkv}:local_kv_heads={kv_per_rank}"
+            )
+        derived_seqs = bxkv // kv_per_rank
+        if batch > 1 and batch * kv_per_rank != bxkv:
+            raise ModelingError(
+                f"whitebox_batch_x_kv_heads_conflict:{case_id}:batch={batch}:local_kv_heads={kv_per_rank}:target={bxkv}"
+            )
+        sequences = max(1, derived_seqs)
+    else:
+        sequences = max(1, batch)
+    actual_bxkv = int(sequences) * kv_per_rank
+    return tokens, context, sequences, actual_bxkv
 
 
 def _run_graphs_on_real_engine(
@@ -492,6 +574,11 @@ class WhiteboxSpineRunner:
                     sim_case = parse_case(dict(raw_case))
             else:
                 raise ModelingError(f"whitebox_case_invalid_type:{case.case_id}")
+        mat_sku = str(getattr(sim_case.machine, "sku", "") or "").strip()
+        if mat_sku != str(case.cohort.sku).strip():
+            raise ModelingError(
+                f"whitebox_materialized_sku_mismatch:{case.case_id}:expected={case.cohort.sku}:materialized={mat_sku}"
+            )
         par = sim_case.runtime.parallel
         for axis, req_val in topo_req.items():
             actual_val = int(getattr(par, axis, 1))
@@ -510,7 +597,15 @@ class WhiteboxSpineRunner:
 
         payload = dict(case.payload)
         sim_case = self._materialize_case(case, payload)
-        tokens, context, sequences, bxkv = _resolve_step_dimensions(payload)
+        local_kv = int(
+            compute_local_kv_heads(
+                int(getattr(sim_case.model, "num_kv_heads", 1) or 1),
+                max(1, int(getattr(sim_case.runtime.parallel, "tp", 1) or 1)),
+            )
+        )
+        tokens, context, sequences, actual_bxkv = _resolve_step_dimensions(
+            payload, local_kv_heads=local_kv, case_id=case.case_id
+        )
         step_req = StepRequest(
             phase=str(payload.get("phase") or case.cohort.phase or "decode"),  # type: ignore[arg-type]
             tokens=tokens,
@@ -545,17 +640,19 @@ class WhiteboxSpineRunner:
         if case_clock == "busy_union" and busy_ns <= 0:
             raise ModelingError(f"whitebox_busy_union_empty:{case.case_id}")
         target_ns = busy_ns if case_clock == "busy_union" else elapsed_ns
-        row_ns = observer.row_busy_ns(cap_ns=target_ns)
-        lean_prog = {"num_resources": len(row_ns), "global_work": list(row_ns), "site_modes": []}
-        lean_dag = {"node_quantum_ns": [max(row_ns)], "edges": []}
+        lean_prog, lean_dag = _build_executed_witness_program_dag(
+            graphs, observer, target_ns=target_ns
+        )
         prog_sha = program_dag_sha256(lean_prog, lean_dag)
         exec_families = sorted({str(op.family) for ops in graphs.values() for op in ops})
         exec_op_ids = [str(op.op_id) for ops in graphs.values() for op in ops][:_MAX_DIAG_OP_IDS]
         lowered_dims: dict[str, Any] = {
+            "materialized_sku": str(sim_case.machine.sku),
             "tokens": step_req.tokens,
             "context": step_req.context,
             "sequences": step_req.sequences,
-            "batch_x_kv_heads": bxkv,
+            "local_kv_heads": local_kv,
+            "batch_x_kv_heads": actual_bxkv,
             "topk": payload.get("topk"),
             "parallel_topology": str(payload.get("parallel_topology") or case.cohort.parallel_topology or "tp1"),
         }

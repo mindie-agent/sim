@@ -27,8 +27,9 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
+import tempfile
 from typing import Any, Literal
 
 from mindie_sim.backends import ascend_profiles
@@ -37,6 +38,7 @@ from mindie_sim.primitives.schema import PrimitiveTable, parse_primitive_table
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import datapath_for_die
 
+from ._capture_truth import verify_live_silicon_evidence
 from ._gate_runners import (
     acquire_coordinator_host_queue_lease,
     resolve_repo_root,
@@ -44,6 +46,7 @@ from ._gate_runners import (
     run_profiler_bench_subprocess,
     run_tail_cluster_diagnosis,
     run_test_orthogonality_gate,
+    validate_host_queue_grant,
 )
 from ._lean_and_receipts import (
     check_lean_non_inversion,
@@ -104,7 +107,7 @@ def validate_512_400k(
     profile_override: Mapping[str, Any] | None = None,
     capture_root: str | Path | None = None,
     capture_files: Mapping[str, str | Path] | None = None,
-    require_capture_files: bool = False,
+    require_capture_files: bool = True,
 ) -> dict[str, Any]:
     """Stage 3: Orchestrate and score disjoint 2D Anchor + Cliff 512..400K + L1/L2/L3."""
     cap_threshold = validate_strict_threshold_pct(threshold_pct)
@@ -154,95 +157,107 @@ def validate_512_400k(
     obs_rows: list[Mapping[str, Any]] | None = None
     lease_public: dict[str, Any] = {"lease_mode": "offline_replay"}
     acquisition_mode: Literal["live_silicon", "offline_reverify"] = "offline_reverify"
-    if observations_json is not None:
-        raw_obs = read_bounded_json(observations_json)
-        if isinstance(raw_obs, Mapping):
-            obs_rows = list(raw_obs.get("observations") or raw_obs.get("cases") or ())
-            if abi_rejection_results is None and raw_obs.get("abi_rejection_results") is not None:
-                abi_rejection_results = list(raw_obs["abi_rejection_results"])
-        elif isinstance(raw_obs, list):
-            obs_rows = list(raw_obs)
-        else:
-            raise ModelingError("validate_512_400k_observations_invalid")
-    elif profiler_runner is not None:
-        obs_rows = list(profiler_runner(plan_doc))
-    elif live_profiler:
-        req_npus = required_ranks_for_plan(plan_doc)
-        lease_ttl_s = DEFAULT_L0_BUDGET_S + DEFAULT_CLEANUP_GRACE_S
-        lease_ctx = (
-            lease_acquirer(sku, lease_ttl_s)
-            if lease_acquirer is not None
-            else acquire_coordinator_host_queue_lease(
-                endpoint_alias,
-                npu_count=req_npus,
-                ttl_seconds=lease_ttl_s,
-                min_subprocess_timeout_s=DEFAULT_L0_BUDGET_S,
-                cleanup_grace_s=DEFAULT_CLEANUP_GRACE_S,
-                coordinator_bin=coordinator_bin,
-            )
-        )
-        raw_lease: Mapping[str, Any] = {}
-        with lease_ctx as lease_info:
-            raw_lease = lease_info if isinstance(lease_info, Mapping) else {}
-            fence = raw_lease.get("fence_token")
-            if not raw_lease.get("lease_id") or type(fence) is not int or fence <= 0:
-                raise ModelingError("live_profiler_requires_valid_host_queue_lease_and_positive_fence")
-            granted = [int(d) for d in (raw_lease.get("devices") or ()) if not isinstance(d, bool)]
-            if len(granted) < req_npus:
-                raise ModelingError(f"live_profiler_insufficient_devices:required={req_npus}:granted={len(granted)}")
-            obs_rows, live_abi = run_profiler_bench_subprocess(
-                plan_doc,
-                sku=sku,
-                profiler_root=profiler_root,
-                endpoint_alias=endpoint_alias,
-                allowed_phy_ids=granted,
-                fence_token=fence,
-                timeout_s=DEFAULT_L0_BUDGET_S,
-            )
-            if abi_rejection_results is None and live_abi:
-                abi_rejection_results = live_abi
-        lease_public = sanitize_lease_for_receipt(raw_lease)
-        if lease_public.get("lease_mode") == "coordinator_host_queue":
-            acquisition_mode = "live_silicon"
-
-    expected_heldout_pts = list(plan_doc["heldout_points"])
-    expected_train_pts = list(plan_doc["train_points"])
-    expected_heldout_ids = [str(pt["point_id"]) for pt in expected_heldout_pts]
-    expected_train_ids = [str(pt["point_id"]) for pt in expected_train_pts]
-    if obs_rows is None:
-        plan_only: dict[str, Any] = {
-            "stage": "validate-512-400k", "sku": sku, "ok": False,
-            "status": "plan_only", "verdict": "insufficient_evidence",
-            "error": "validate_512_400k_plan_only_no_observations",
-            "plan_sha256": plan.plan_sha256, "plan": plan_doc,
-            "required_ranks": required_ranks_for_plan(plan_doc),
-            "acquisition_mode": acquisition_mode, "lease": lease_public,
-            "missing_plan_points": sorted(expected_heldout_ids),
-            "missing_train_points": sorted(expected_train_ids),
-            "missing_anchors": list(ANCHOR_CONTEXT_GRID),
-            "missing_cliffs": list(OFF_GRID_CLIFF_HELDOUT_GRID),
-            "abi_rejection_check": evaluate_abi_rejections(plan_doc["abi_rejection_points"], None),
-            "heldout_summary": None, "residuals": [],
-        }
-        plan_only["report_hmac"] = sign_stage_report("sku_validation", plan_only)
+    eff_capture_root: str | Path | None = capture_root
+    temp_cap_ctx: AbstractContextManager[str | None] = nullcontext(None)
+    if live_profiler and observations_json is None and profiler_runner is None and eff_capture_root is None:
         if report_out is not None:
-            write_atomic_json(report_out, plan_only)
-        assert_sanitized_payload(plan_only, field_name="validate_512_400k_plan_only")
-        return plan_only
+            eff_capture_root = Path(report_out).parent / "captures"
+        else:
+            temp_cap_ctx = tempfile.TemporaryDirectory(prefix="msim-sku-cap-")
 
-    scored = score_sealed_gate_cases(
-        obs_rows, sku=sku, runner=runner, primitive_table=parsed_table,
-        profile_override=profile_override, threshold_pct=cap_threshold,
-        external_train_roots=external_train_roots,
-        external_train_digests=external_train_digests,
-        external_train_uris=external_train_uris,
-        expected_points=expected_heldout_pts,
-        expected_train_points=expected_train_pts,
-        expected_point_ids=expected_heldout_ids,
-        require_disjoint_level_roots=True,
-        capture_root=capture_root, capture_files=capture_files,
-        require_capture_files=require_capture_files,
-    )
+    with temp_cap_ctx as tmp_cap_dir:
+        if tmp_cap_dir is not None:
+            eff_capture_root = Path(tmp_cap_dir)
+        if observations_json is not None:
+            raw_obs = read_bounded_json(observations_json)
+            if isinstance(raw_obs, Mapping):
+                obs_rows = list(raw_obs.get("observations") or raw_obs.get("cases") or ())
+                if abi_rejection_results is None and raw_obs.get("abi_rejection_results") is not None:
+                    abi_rejection_results = list(raw_obs["abi_rejection_results"])
+            elif isinstance(raw_obs, list):
+                obs_rows = list(raw_obs)
+            else:
+                raise ModelingError("validate_512_400k_observations_invalid")
+        elif profiler_runner is not None:
+            obs_rows = list(profiler_runner(plan_doc))
+        elif live_profiler:
+            req_npus = required_ranks_for_plan(plan_doc)
+            lease_ttl_s = DEFAULT_L0_BUDGET_S + DEFAULT_CLEANUP_GRACE_S
+            lease_ctx = (
+                lease_acquirer(sku, lease_ttl_s)
+                if lease_acquirer is not None
+                else acquire_coordinator_host_queue_lease(
+                    endpoint_alias,
+                    npu_count=req_npus,
+                    ttl_seconds=lease_ttl_s,
+                    min_subprocess_timeout_s=DEFAULT_L0_BUDGET_S,
+                    cleanup_grace_s=DEFAULT_CLEANUP_GRACE_S,
+                    coordinator_bin=coordinator_bin,
+                )
+            )
+            raw_lease: Mapping[str, Any] = {}
+            with lease_ctx as lease_info:
+                raw_lease = lease_info if isinstance(lease_info, Mapping) else {}
+                _, fence, granted, _ = validate_host_queue_grant(
+                    raw_lease, required_devices=req_npus, min_ttl_seconds=lease_ttl_s
+                )
+                obs_rows, live_abi = run_profiler_bench_subprocess(
+                    plan_doc,
+                    sku=sku,
+                    profiler_root=profiler_root,
+                    endpoint_alias=endpoint_alias,
+                    allowed_phy_ids=granted,
+                    fence_token=fence,
+                    timeout_s=DEFAULT_L0_BUDGET_S,
+                    capture_out_dir=eff_capture_root,
+                )
+                if abi_rejection_results is None and live_abi:
+                    abi_rejection_results = live_abi
+            lease_public = sanitize_lease_for_receipt(raw_lease)
+            if lease_public.get("lease_mode") == "coordinator_host_queue":
+                acquisition_mode = "live_silicon"
+
+        expected_heldout_pts = list(plan_doc["heldout_points"])
+        expected_train_pts = list(plan_doc["train_points"])
+        expected_heldout_ids = [str(pt["point_id"]) for pt in expected_heldout_pts]
+        expected_train_ids = [str(pt["point_id"]) for pt in expected_train_pts]
+        if obs_rows is None:
+            plan_only: dict[str, Any] = {
+                "stage": "validate-512-400k", "sku": sku, "ok": False,
+                "status": "plan_only", "verdict": "insufficient_evidence",
+                "error": "validate_512_400k_plan_only_no_observations",
+                "plan_sha256": plan.plan_sha256, "plan": plan_doc,
+                "required_ranks": required_ranks_for_plan(plan_doc),
+                "acquisition_mode": "offline_reverify", "capture_files_verified": False,
+                "lease": lease_public,
+                "missing_plan_points": sorted(expected_heldout_ids),
+                "missing_train_points": sorted(expected_train_ids),
+                "missing_anchors": list(ANCHOR_CONTEXT_GRID),
+                "missing_cliffs": list(OFF_GRID_CLIFF_HELDOUT_GRID),
+                "abi_rejection_check": evaluate_abi_rejections(plan_doc["abi_rejection_points"], None),
+                "heldout_summary": None, "residuals": [],
+            }
+            plan_only["report_hmac"] = sign_stage_report("sku_validation", plan_only)
+            if report_out is not None:
+                write_atomic_json(report_out, plan_only)
+            assert_sanitized_payload(plan_only, field_name="validate_512_400k_plan_only")
+            return plan_only
+
+        scored = score_sealed_gate_cases(
+            obs_rows, sku=sku, runner=runner, primitive_table=parsed_table,
+            profile_override=profile_override, threshold_pct=cap_threshold,
+            external_train_roots=external_train_roots,
+            external_train_digests=external_train_digests,
+            external_train_uris=external_train_uris,
+            expected_points=expected_heldout_pts,
+            expected_train_points=expected_train_pts,
+            expected_point_ids=expected_heldout_ids,
+            require_disjoint_level_roots=True,
+            capture_root=eff_capture_root, capture_files=capture_files,
+            require_capture_files=require_capture_files,
+        )
+    if not scored.get("capture_files_verified"):
+        acquisition_mode = "offline_reverify"
     abi_check = evaluate_abi_rejections(plan_doc["abi_rejection_points"], abi_rejection_results)
     train_plan_by_id = {str(pt["point_id"]): int(pt["value"]) for pt in expected_train_pts if pt.get("axis") == "context_len"}
     held_plan_by_id = {str(pt["point_id"]): int(pt["value"]) for pt in expected_heldout_pts if pt.get("axis") == "context_len"}
@@ -273,7 +288,9 @@ def validate_512_400k(
         "status": final_status, "verdict": final_status,
         "threshold_pct": cap_threshold, "plan_sha256": plan.plan_sha256,
         "required_ranks": required_ranks_for_plan(plan_doc),
-        "acquisition_mode": acquisition_mode, "lease": lease_public,
+        "acquisition_mode": acquisition_mode,
+        "capture_files_verified": bool(scored.get("capture_files_verified", False)),
+        "lease": lease_public,
         "primitives_envelope_sha256": parsed_table.envelope_sha256 if parsed_table is not None else "",
         "anchor_grid": list(ANCHOR_CONTEXT_GRID), "off_grid_cliff_grid": list(OFF_GRID_CLIFF_HELDOUT_GRID),
         "missing_plan_points": missing_plan_points, "missing_train_points": missing_train_points,
@@ -316,6 +333,7 @@ def verify_sku_gates(
     out_receipt: str | Path | None = None,
     diagnosis_out: str | Path | None = None,
     acquisition_mode: Literal["live_silicon", "offline_reverify"] | None = None,
+    stage2_lease: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Stage 4: Execute multilevel, mandatory SKU/CANN primitives, joined Lean, repo gates, receipt."""
     cap_threshold = validate_strict_threshold_pct(threshold_pct)
@@ -438,10 +456,17 @@ def verify_sku_gates(
             if max_ape is not None:
                 artifacts["heldout_max_ape_pct"] = str(round(float(max_ape), DISPLAY_ROUND_DIGITS))
 
+    val_hmac_ok = val_doc is not None and verify_stage_report("sku_validation", val_doc)
+    live_verified = val_hmac_ok and verify_live_silicon_evidence(val_doc, stage2_lease=stage2_lease)
+    if acquisition_mode == "live_silicon" and not live_verified:
+        gates.append(
+            GateCheckOutcome(
+                name="acquisition_mode_evidence", passed=False, status="fail",
+                detail="live_silicon_claim_unverified_by_host_queue_and_captures",
+            )
+        )
     eff_mode: Literal["live_silicon", "offline_reverify"] = (
-        acquisition_mode
-        if acquisition_mode is not None
-        else ("live_silicon" if (val_doc or {}).get("acquisition_mode") == "live_silicon" else "offline_reverify")
+        "live_silicon" if (live_verified and acquisition_mode != "offline_reverify") else "offline_reverify"
     )
     receipt = seal_onboarding_receipt(
         kind="sku", target_id=sku, sku=sku, gates=gates, artifacts=artifacts,
@@ -489,7 +514,7 @@ def run_sku_onboarding(
     coordinator_bin: str = "",
     capture_root: str | Path | None = None,
     capture_files: Mapping[str, str | Path] | None = None,
-    require_capture_files: bool = False,
+    require_capture_files: bool = True,
 ) -> dict[str, Any]:
     """Execute all 4 New-SKU onboarding stages end-to-end with real owners and fail-closed gating."""
     cap_threshold = validate_strict_threshold_pct(threshold_pct)
@@ -536,6 +561,7 @@ def run_sku_onboarding(
             "stages": {"probe-soc": stage1, "calibrate-l0-and-fabric": stage2},
         }
 
+    eff_cap_root = capture_root if capture_root is not None else ((base_out / "captures") if (live_profiler and base_out) else None)
     stage3 = validate_512_400k(
         sku=resolved_sku, observations_json=observations_json,
         abi_rejection_results=abi_rejection_results,
@@ -547,23 +573,20 @@ def run_sku_onboarding(
         live_profiler=live_profiler, endpoint_alias=endpoint_alias,
         profiler_root=profiler_root, lease_acquirer=lease_acquirer,
         coordinator_bin=coordinator_bin, profile_override=profile_override,
-        capture_root=capture_root, capture_files=capture_files,
+        capture_root=eff_cap_root, capture_files=capture_files,
         require_capture_files=require_capture_files,
-    )
-    s2_live = (stage2.get("lease") or {}).get("lease_mode") == "coordinator_host_queue"
-    s3_live = stage3.get("acquisition_mode") == "live_silicon"
-    eff_mode: Literal["live_silicon", "offline_reverify"] = (
-        "live_silicon" if (live_bench and live_profiler and s2_live and s3_live) else "offline_reverify"
     )
     stage4 = verify_sku_gates(
         sku=resolved_sku, validation_report_json=stage3,
         lean_bounds_json=lean_bounds_json, primitives_json=stage2["primitives_payload"],
         expected_cann_version=stage2["cann_version"], profile_override=profile_override,
+        capture_root=eff_cap_root, capture_files=capture_files,
+        require_capture_files=require_capture_files,
         repo_root=repo_root, threshold_pct=cap_threshold,
         run_repo_gates=run_repo_gates, orthogonality_base=orthogonality_base,
         out_receipt=(base_out / "sku_onboarding_receipt.json") if base_out else None,
         diagnosis_out=(base_out / "tail_cluster_diagnosis.json") if base_out else None,
-        acquisition_mode=eff_mode,
+        stage2_lease=stage2.get("lease"),
     )
     all_ok = bool(stage1["ok"] and stage2["ok"] and stage3["ok"] and stage4["ok"])
     return {

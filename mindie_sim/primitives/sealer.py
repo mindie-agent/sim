@@ -91,6 +91,7 @@ PRIVATE_CAPTURE_RE = re.compile(
     r"(?<![\d.])(?:\d{1,3}[._-]){3}\d{1,3}(?![\d.])|/(?:Users|home|root)/[^\s\"']*|[^\s\"']*@[^\s\"']+|\$\{?HOME\}?"
 )
 _OPAQUE_ALIAS_RE = re.compile(r"^ep-[0-9a-f]{12}$")
+_OPAQUE_CAMPAIGN_RE = re.compile(r"^camp-[0-9a-f]{12}$")
 
 SKU_DEFAULT_FILES = {
     "Ascend910B4": "arch22_a2_910b4.json",
@@ -108,6 +109,15 @@ def sanitize_record_alias(alias: str, sku: str) -> str:
         return raw
     seed = f"{raw or sku}|{sku}".encode("utf-8")
     return f"ep-{hashlib.sha256(seed).hexdigest()[:_OPAQUE_ALIAS_HEX]}"
+
+
+def sanitize_record_campaign(campaign_id: str) -> str:
+    """Return an opaque, deterministic public campaign digest (zero raw usernames/leases)."""
+    raw = str(campaign_id or "").strip()
+    if _OPAQUE_CAMPAIGN_RE.fullmatch(raw):
+        return raw
+    seed = (raw or "campaign").encode("utf-8")
+    return f"camp-{hashlib.sha256(seed).hexdigest()[:_OPAQUE_ALIAS_HEX]}"
 
 
 def _quantile(sorted_vals: Sequence[float], q: float) -> float:
@@ -307,6 +317,7 @@ def build_primitive_table_with_diagnostics(
     """Assemble sealed ``mindie-l0-primitives/1`` table plus explicit per-metric conflicts & coverage."""
     spec = load_sku_hardware_spec(sku)
     alias = sanitize_record_alias(endpoint_alias, sku)
+    clean_campaign = sanitize_record_campaign(campaign_id)
     aic, aiv = max(_DEFAULT_UNIT_ONE, spec["aic_count"]), max(_DEFAULT_UNIT_ONE, spec["aiv_count"])
     is_arch35 = spec["arch_preset"] == _ARCH_PRESET_35
     raw = dict(raw_measurements or {})
@@ -323,7 +334,7 @@ def build_primitive_table_with_diagnostics(
         }} if core_mismatch else {}
     )
     cap_bytes = canonical_capture_bytes(sku, raw_measurements)
-    top_capture = f"capture://{alias}/{campaign_id}/{hashlib.sha256(cap_bytes).hexdigest()}"
+    top_capture = f"capture://{alias}/{clean_campaign}/{hashlib.sha256(cap_bytes).hexdigest()}"
     metric_conflicts: list[dict[str, Any]] = []
     coverage_rows: list[dict[str, Any]] = []
 
@@ -475,7 +486,7 @@ def build_primitive_table_with_diagnostics(
         "sku": sku,
         "cann_version": cann_version,
         "provenance": {
-            "campaign_id": campaign_id,
+            "campaign_id": clean_campaign,
             "endpoint_alias": alias,
             "capture_uri": top_capture,
             "calibrated": any(c["status"] == "calibrated" for c in p.values()),
@@ -538,6 +549,7 @@ __all__ = [
     "compute_envelope_sha256",
     "load_sku_hardware_spec",
     "sanitize_record_alias",
+    "sanitize_record_campaign",
     "summarize_samples",
     "summarize_samples_with_reason",
     "update_manifest",

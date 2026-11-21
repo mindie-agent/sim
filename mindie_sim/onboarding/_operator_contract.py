@@ -31,17 +31,14 @@ import math
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tomllib
 from typing import Any
 
 from mindie_sim.backends import ascend
 from mindie_sim.observations.multilevel_stream import SHA256_HEX_LENGTH
 from mindie_sim.optimization.dual_bound import (
-    DagEdge,
-    EventDagSpec,
-    ResourceChoiceProgram,
-    certify_lower_bound,
-    check_optimality_certificate,
+    DagEdge, EventDagSpec, ResourceChoiceProgram, certify_lower_bound, check_optimality_certificate,
 )
 from mindie_sim.prediction.mechanism import Geometry, OperatorPlan
 from mindie_sim.prediction.operators.contracts import OperatorPlanningContext
@@ -53,20 +50,19 @@ from mindie_sim.schema.hardware import Hardware
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.templates.registry import TemplateCatalog, builtin_template_catalog
 
-from ._gate_runners import (
-    resolve_profiler_builder_strict,
-    resolve_repo_root,
-    run_template_provenance_gate,
-)
+from ._gate_runners import resolve_profiler_builder_strict, resolve_repo_root, run_template_provenance_gate
 from ._lean_and_receipts import sign_stage_report
-from .contracts import (
-    HEX_COMMIT_LEN,
-    NS_PER_MS,
-    assert_sanitized_payload,
-    subprocess_window_kwargs,
+from ._operator_ast import (
+    extract_declared_template_ids,
+    extract_module_str_constants,
+    extract_source_refs,
+    extract_symbol_mentions,
+    extract_top_level_names,
+    extract_upstream_abi,
+    find_unimplemented_stubs,
 )
+from .contracts import HEX_COMMIT_LEN, NS_PER_MS, assert_sanitized_payload, subprocess_window_kwargs
 
-_UPSTREAM_ABI_LINE_RE = re.compile(r"^\s*Upstream-ABI\s*:\s*([A-Za-z_][A-Za-z0-9_:.<>/-]*)\s*$")
 _HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
 _GIT_CAT_TIMEOUT_S = 15
 _NS_PER_SECOND = 1_000_000_000.0
@@ -75,122 +71,14 @@ _DEFAULT_PROBE_SKU = "Ascend910B2"
 _DEFAULT_PROBE_SKU_A5 = "Ascend950DT_9582"
 _DEFAULT_PROBE_SHAPE = (1, 128)
 _DEFAULT_TEMPLATE_DIM = 128
-_TEMPLATE_ID_CONST_NAMES = frozenset({"TEMPLATE_ID", "TEMPLATE_IDS", "CATLASS_TEMPLATE_IDS", "DSL_KERNEL_IDS"})
 _MAX_STAGE_WALK_DEPTH = 16
 
 
-def _extract_upstream_abi(tree: ast.AST) -> str:
-    doc = ast.get_docstring(tree) or ""
-    for line in doc.splitlines():
-        match = _UPSTREAM_ABI_LINE_RE.match(line)
-        if match:
-            return match.group(1).strip()
-    return ""
+def _template_owner_files(tier: str) -> set[Path]:
+    from mindie_sim.templates import catlass_catalog, catlass_lower, dsl_catalog, dsl_lower
 
-
-def _eval_str_expr(node: ast.AST | None, constants: Mapping[str, str]) -> str | None:
-    if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        return node.value
-    if isinstance(node, ast.Name) and node.id in constants:
-        return constants[node.id]
-    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-        left, right = _eval_str_expr(node.left, constants), _eval_str_expr(node.right, constants)
-        if left is not None and right is not None:
-            return left + right
-    return None
-
-
-def _extract_module_str_constants(tree: ast.Module) -> dict[str, str]:
-    constants: dict[str, str] = {}
-    for stmt in tree.body:
-        if isinstance(stmt, ast.Assign):
-            val = _eval_str_expr(stmt.value, constants)
-            if val is not None:
-                for target in stmt.targets:
-                    if isinstance(target, ast.Name):
-                        constants[target.id] = val
-        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name) and stmt.value is not None:
-            val = _eval_str_expr(stmt.value, constants)
-            if val is not None:
-                constants[stmt.target.id] = val
-    return constants
-
-
-def _extract_declared_template_ids(tree: ast.Module, constants: Mapping[str, str]) -> set[str]:
-    found: set[str] = set()
-    for stmt in tree.body:
-        names: list[str] = []
-        val_node: ast.AST | None = None
-        if isinstance(stmt, ast.Assign):
-            names = [t.id for t in stmt.targets if isinstance(t, ast.Name)]
-            val_node = stmt.value
-        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
-            names = [stmt.target.id]
-            val_node = stmt.value
-        if not any(n in _TEMPLATE_ID_CONST_NAMES for n in names) or val_node is None:
-            continue
-        single = _eval_str_expr(val_node, constants)
-        if single:
-            found.add(single)
-        elif isinstance(val_node, (ast.Tuple, ast.List, ast.Set)):
-            for elt in val_node.elts:
-                item = _eval_str_expr(elt, constants)
-                if item:
-                    found.add(item)
-        elif isinstance(val_node, ast.Dict):
-            for key in val_node.keys:
-                item = _eval_str_expr(key, constants)
-                if item:
-                    found.add(item)
-    return found
-
-
-def _extract_source_refs(tree: ast.Module, path: Path, constants: Mapping[str, str]) -> list[dict[str, str]]:
-    refs: list[dict[str, str]] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        func = node.func
-        fname = func.id if isinstance(func, ast.Name) else (func.attr if isinstance(func, ast.Attribute) else "")
-        if fname not in ("SourceRef", "TemplateSourceRef"):
-            continue
-        pos = [_eval_str_expr(arg, constants) for arg in node.args]
-        kw = {str(k.arg): _eval_str_expr(k.value, constants) for k in node.keywords if k.arg}
-        refs.append({
-            "file": path.name,
-            "repository": kw.get("repository") or (pos[0] if len(pos) > 0 else None) or "",
-            "revision": kw.get("revision") or (pos[1] if len(pos) > 1 else None) or "",
-            "relative_path": kw.get("relative_path") or (pos[2] if len(pos) > 2 else None) or "",
-            "source_sha256": kw.get("source_sha256") or (pos[3] if len(pos) > 3 else None) or "",
-        })
-    return refs
-
-
-def _extract_symbol_mentions(tree: ast.AST) -> set[str]:
-    names: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Name):
-            names.add(node.id)
-        elif isinstance(node, ast.Attribute):
-            names.add(node.attr)
-        elif isinstance(node, ast.ImportFrom):
-            for alias in node.names:
-                names.add(alias.name)
-    return names
-
-
-def _extract_top_level_names(tree: ast.Module) -> set[str]:
-    names: set[str] = set()
-    for stmt in tree.body:
-        if isinstance(stmt, ast.Assign):
-            for target in stmt.targets:
-                if isinstance(target, ast.Name):
-                    names.add(target.id)
-        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
-            names.add(stmt.target.id)
-        elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            names.add(stmt.name)
-    return names
+    mods = (catlass_catalog, catlass_lower) if tier == "K2" else (dsl_catalog, dsl_lower)
+    return {Path(m.__file__).resolve() for m in mods if getattr(m, "__file__", None)}
 
 
 def _verify_git_blob_sha256(
@@ -454,6 +342,7 @@ def _lower_and_verify_template(cat: TemplateCatalog, tier: str, matched_id: str)
 def _verify_sim_owner_dispatch(
     *,
     is_family_pkg: bool,
+    target_path: Path,
     family: str,
     template_id: str,
     declared_template_ids: set[str],
@@ -489,10 +378,18 @@ def _verify_sim_owner_dispatch(
         if matched is None or sample_op is None:
             violations.append(f"sim_registry_unmatched:{family}")
             return False, {"owner": "builtin_family_registry", "matched": False, "lowered": False}, violations
+        if family_registry is None:
+            mod_obj = sys.modules.get(getattr(matched.resolve, "__module__", ""))
+            mod_file = getattr(mod_obj, "__file__", "") if mod_obj is not None else ""
+            src_file = Path(mod_file).resolve() if mod_file else Path("")
+            if not mod_file or not src_file.is_relative_to(target_path):
+                violations.append(f"sim_owner_borrowed_from_other_package:{family}:owner={src_file.name or 'unknown'}")
+                return False, {"owner": "builtin_family_registry", "matched": False, "lowered": False}, violations
         ctx = planning_context if planning_context is not None else _build_default_planning_context(sample_op)
         detail: dict[str, Any] = {
             "owner": "builtin_family_registry", "matched": True, "spec_name": matched.name,
             "owned_recipe_count": len(matched.owned_recipe_ids),
+            "owned_recipe_ids": sorted(str(x) for x in matched.owned_recipe_ids),
             "resolved": False, "lowered": False, "lean_lower_bound_ns": 0,
         }
         try:
@@ -515,15 +412,22 @@ def _verify_sim_owner_dispatch(
     k2_ids, k3_ids = set(cat.ids("K2")), set(cat.ids("K3"))
     all_ids = k2_ids | k3_ids
     requested_id = template_id.strip() or family
-    allowed_for_target = set(declared_template_ids) | {family}
-    if requested_id not in allowed_for_target and requested_id.rsplit(".", 1)[-1] != family:
-        violations.append(f"template_id_unrelated_to_target:requested={requested_id}:target={family}")
-        return False, {"owner": "builtin_template_catalog", "matched": False, "lowered": False}, violations
     matched_id = requested_id if requested_id in all_ids else ""
     if not matched_id:
-        violations.append(f"template_catalog_unregistered:{requested_id}")
+        allowed_for_target = set(declared_template_ids) | {family}
+        if requested_id not in allowed_for_target and requested_id.rsplit(".", 1)[-1] != family:
+            violations.append(f"template_id_unrelated_to_target:requested={requested_id}:target={family}")
+        else:
+            violations.append(f"template_catalog_unregistered:{requested_id}")
         return False, {"owner": "builtin_template_catalog", "matched": False, "lowered": False}, violations
     tier = "K2" if matched_id in k2_ids else "K3"
+    if template_catalog is None:
+        if target_path not in _template_owner_files(tier):
+            violations.append(f"template_id_not_owned_by_target:requested={matched_id}:target={target_path.name}")
+            return False, {"owner": "builtin_template_catalog", "matched": False, "lowered": False}, violations
+    elif not (matched_id == family or matched_id.startswith(f"{family}.") or matched_id.rsplit(".", 1)[-1] == family):
+        violations.append(f"template_id_unrelated_to_target:requested={matched_id}:target={family}")
+        return False, {"owner": "builtin_template_catalog", "matched": False, "lowered": False}, violations
     lower_ok, l_star, stage_cnt, reason = _lower_and_verify_template(cat, tier, matched_id)
     detail = {
         "owner": "builtin_template_catalog", "matched": True, "tier": tier,
@@ -594,15 +498,15 @@ def validate_operator_contract(
     for py_file in files:
         tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
         parsed_files.append((py_file, tree))
-        shared_constants.update(_extract_module_str_constants(tree))
+        shared_constants.update(extract_module_str_constants(tree))
     for py_file, tree in parsed_files:
-        top_names = _extract_top_level_names(tree)
-        symbols |= _extract_symbol_mentions(tree)
-        file_consts = {**shared_constants, **_extract_module_str_constants(tree)}
-        declared_template_ids |= _extract_declared_template_ids(tree, file_consts)
-        file_refs = _extract_source_refs(tree, py_file, file_consts)
+        top_names = extract_top_level_names(tree)
+        symbols |= extract_symbol_mentions(tree)
+        file_consts = {**shared_constants, **extract_module_str_constants(tree)}
+        declared_template_ids |= extract_declared_template_ids(tree, file_consts)
+        file_refs = extract_source_refs(tree, py_file, file_consts)
         all_refs.extend(file_refs)
-        abi = _extract_upstream_abi(tree)
+        abi = extract_upstream_abi(tree)
         if py_file.name in ("arch22.py", "arch35.py") or not is_family_pkg:
             if not abi:
                 violations.append(f"missing_upstream_abi_header:{py_file.name}")
@@ -614,6 +518,7 @@ def validate_operator_contract(
                 violations.append(f"missing_sources_declaration:{py_file.name}")
         if not declared_builder and "PROFILER_BENCH_BUILDER" in file_consts:
             declared_builder = file_consts["PROFILER_BENCH_BUILDER"]
+        violations.extend(find_unimplemented_stubs(tree, py_file))
 
     if is_family_pkg and len(abis) >= 2 and len(set(abis.values())) < len(abis):
         violations.append("duplicate_upstream_abi_across_arch_leaves")
@@ -668,7 +573,7 @@ def validate_operator_contract(
     sim_owner_detail: dict[str, Any] = {"checked": False, "matched": False, "lowered": False}
     if require_sim_owner:
         _, sim_owner_detail, sim_violations = _verify_sim_owner_dispatch(
-            is_family_pkg=is_family_pkg, family=family, template_id=template_id,
+            is_family_pkg=is_family_pkg, target_path=target, family=family, template_id=template_id,
             declared_template_ids=declared_template_ids,
             family_registry=family_registry, template_catalog=template_catalog,
             sample_op=sample_op, planning_context=planning_context,
@@ -680,9 +585,15 @@ def validate_operator_contract(
     if require_taxonomy and not taxonomy_ok:
         violations.append(taxonomy_detail)
 
-    allowed_prof_families = {x for x in (family, declared_builder) if x}
+    builder_belongs = bool(
+        declared_builder
+        and (declared_builder == family or declared_builder.startswith(f"{family}_") or declared_builder.startswith(f"{family}."))
+    )
+    allowed_prof_families = {family} | ({declared_builder} if builder_belongs else set())
     req_prof_family = profiler_family.strip()
-    eff_prof_family = (req_prof_family or declared_builder or family).strip()
+    if declared_builder and not builder_belongs and not req_prof_family:
+        violations.append(f"profiler_builder_unrelated_to_target:declared={declared_builder}:family={family}")
+    eff_prof_family = (req_prof_family or (declared_builder if builder_belongs else "") or family).strip()
     eff_prof_recipe = (profiler_recipe or eff_prof_family).strip()
     eff_prof_impl = (profiler_impl or next(iter(abis.values()), "")).strip()
     profiler_check: dict[str, Any] = {

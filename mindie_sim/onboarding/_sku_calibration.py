@@ -46,6 +46,7 @@ from ._gate_runners import (
     resolve_repo_root,
     run_live_l0_bench_subprocess,
     run_profiler_bench_subprocess,
+    validate_host_queue_grant,
 )
 from ._soc_probe import ARCH_PRESET_35, verify_idle_die_telemetry
 from .contracts import (
@@ -59,6 +60,7 @@ from .contracts import (
     TimeoutBudget,
     assert_sanitized_payload,
     sanitize_lease_for_receipt,
+    sanitize_public_campaign_id,
     write_atomic_json,
 )
 
@@ -382,10 +384,15 @@ def calibrate_l0_and_fabric(
     fabric_coverage = "not_provided"
     with lease_ctx as acquired:
         raw_lease_info = acquired if isinstance(acquired, Mapping) else {}
-        granted_devices = [int(d) for d in (raw_lease_info.get("devices") or ()) if not isinstance(d, bool)]
-        fence_val = raw_lease_info.get("fence_token")
-        if use_live and (not raw_lease_info.get("lease_id") or type(fence_val) is not int or fence_val <= 0):
-            raise ModelingError("live_calibration_requires_valid_host_queue_lease_and_positive_fence")
+        if use_live:
+            _, fence_val, granted_devices, _ = validate_host_queue_grant(
+                raw_lease_info,
+                required_devices=1,
+                min_ttl_seconds=budget.total_inner_s + budget.cleanup_grace_s,
+            )
+        else:
+            granted_devices = [int(d) for d in (raw_lease_info.get("devices") or ()) if not isinstance(d, bool)]
+            fence_val = raw_lease_info.get("fence_token")
         if raw_l0_json is not None:
             parsed_l0, l0_sha = _read_bounded_json_and_sha256(Path(raw_l0_json))
             extra_train_digests.append(l0_sha)
@@ -441,10 +448,11 @@ def calibrate_l0_and_fabric(
     )
 
     rec_alias = sealer.sanitize_record_alias(endpoint_alias or sku, sku)
+    pub_campaign = sanitize_public_campaign_id(campaign_id)
     with temporary_scaffold_profile(sku, profile_override):
         payload, metric_conflicts, coverage_matrix = sealer.build_primitive_table_with_diagnostics(
             sku=sku, cann_version=effective_cann, endpoint_alias=rec_alias,
-            campaign_id=campaign_id, raw_measurements=merged_raw,
+            campaign_id=pub_campaign, raw_measurements=merged_raw,
         )
     parse_primitive_table(payload, verify_envelope=True)
     capture_uri = str(payload["provenance"]["capture_uri"])
@@ -468,7 +476,7 @@ def calibrate_l0_and_fabric(
     train_digests = sorted({capture_sha, payload["envelope_sha256"], *extra_train_digests})
     train_manifest = {
         "schema": TRAIN_OBSERVATION_MANIFEST_SCHEMA,
-        "sku": sku, "cann_version": effective_cann, "split": "train", "campaign_id": campaign_id,
+        "sku": sku, "cann_version": effective_cann, "split": "train", "campaign_id": pub_campaign,
         "train_lineage_root": train_root, "train_digests": train_digests,
         "train_capture_uris": [capture_uri], "cold_ring_l2_multiplier": COLD_RING_L2_MULTIPLIER,
         "primitives_envelope_sha256": payload["envelope_sha256"],

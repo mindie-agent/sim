@@ -25,34 +25,20 @@ import statistics
 from typing import Any
 
 from mindie_sim.observations.multilevel_gate import (
-    CaptureBoundary,
-    CohortKey,
-    EngineInterval,
-    EvaluationRunner,
-    FrozenFitManifest,
-    FrozenFitParameter,
-    GateCase,
-    Manifest,
-    evaluate as evaluate_multilevel,
-    parse_gate_case,
-    validate_lineage,
+    CaptureBoundary, CohortKey, EngineInterval, EvaluationRunner,
+    FrozenFitManifest, FrozenFitParameter, GateCase, Manifest,
+    evaluate as evaluate_multilevel, parse_gate_case, validate_lineage,
 )
 from mindie_sim.primitives.schema import PrimitiveTable
 from mindie_sim.schema.common import ModelingError
 
+from ._capture_truth import verify_capture_and_override_case
 from ._lean_and_receipts import validate_strict_threshold_pct
 from ._whitebox_runner import WhiteboxSpineRunner, check_no_service_regimes
 from .contracts import (
-    DEFAULT_CLOCK_OPERATOR,
-    DEFAULT_HELDOUT_APE_THRESHOLD_PCT,
-    DISPLAY_ROUND_DIGITS,
-    FORBIDDEN_CALLER_PREDICTION_KEYS,
-    NS_PER_MS,
-    NS_PER_US,
-    PERCENT_SCALE,
-    VALID_CLOCK_OPERATORS,
-    assert_sanitized_payload,
-    sanitize_public_alias,
+    DEFAULT_CLOCK_OPERATOR, DEFAULT_HELDOUT_APE_THRESHOLD_PCT, DISPLAY_ROUND_DIGITS,
+    FORBIDDEN_CALLER_PREDICTION_KEYS, NS_PER_MS, NS_PER_US, PERCENT_SCALE,
+    VALID_CLOCK_OPERATORS, assert_sanitized_payload, sanitize_public_alias,
 )
 
 STANDARD_LEVEL_BOUNDARY_KINDS: Mapping[str, str] = {
@@ -158,10 +144,15 @@ def _check_no_caller_predictions(row: Mapping[str, Any], cid: str) -> None:
             raise ModelingError(f"caller_predicted_duration_forbidden:{cid}:{key}")
 
 
-def resolve_authoritative_clock_operator(row: Mapping[str, Any], cid: str) -> str:
-    """Resolve one authoritative clock operator, rejecting missing or conflicting labels."""
+def resolve_authoritative_clock_operator(
+    row: Mapping[str, Any], cid: str, *, plan_pt: Mapping[str, Any] | None = None
+) -> str:
+    """Resolve one authoritative clock operator, enforcing plan agreement and rejecting conflicts."""
     boundary = row.get("boundary") if isinstance(row.get("boundary"), Mapping) else {}
     payload = row.get("payload") if isinstance(row.get("payload"), Mapping) else {}
+    plan_clk = str((plan_pt or {}).get("clock_operator") or "").strip()
+    if plan_clk and plan_clk not in VALID_CLOCK_OPERATORS:
+        raise ModelingError(f"clock_operator_invalid:{cid}:plan={plan_clk}")
     found: list[tuple[str, str]] = []
     for src, raw in (
         ("row", row.get("clock_operator")),
@@ -174,12 +165,17 @@ def resolve_authoritative_clock_operator(row: Mapping[str, Any], cid: str) -> st
                 raise ModelingError(f"clock_operator_invalid:{cid}:{src}={val}")
             found.append((src, val))
     if not found:
+        if plan_clk:
+            return plan_clk
         raise ModelingError(f"clock_operator_missing:{cid}")
     distinct = {val for _src, val in found}
     if len(distinct) > 1:
         detail = ",".join(f"{src}={val}" for src, val in found)
         raise ModelingError(f"clock_operator_conflict:{cid}:{detail}")
-    return found[0][1]
+    chosen = found[0][1]
+    if plan_clk and chosen != plan_clk:
+        raise ModelingError(f"clock_operator_plan_mismatch:{cid}:plan={plan_clk}:got={chosen}")
+    return chosen
 
 
 def extract_measured_p99_ns(row: Mapping[str, Any]) -> int | None:
@@ -249,8 +245,12 @@ def validate_event_ids_and_ranks(raw_events: Any, raw_ranks: Any, cid: str) -> t
     return cleaned_events, tuple(cleaned_ranks)
 
 
-def validate_row_matches_plan_point(row: Mapping[str, Any], plan_pt: Mapping[str, Any], *, sku: str, pid: str) -> None:
-    """Verify every planned coordinate matches the observation row and payload."""
+def validate_row_matches_plan_point(
+    row: Mapping[str, Any], plan_pt: Mapping[str, Any], *, sku: str, pid: str, device_ranks: Sequence[int] = ()
+) -> None:
+    """Verify every planned coordinate & multi-rank participation matches the observation."""
+    from .cliff_planner import validate_parallel_topology
+
     cohort = row.get("cohort") if isinstance(row.get("cohort"), Mapping) else {}
     payload = row.get("payload") if isinstance(row.get("payload"), Mapping) else {}
     row_sku = str(row.get("sku") or cohort.get("sku") or "").strip()
@@ -274,14 +274,23 @@ def validate_row_matches_plan_point(row: Mapping[str, Any], plan_pt: Mapping[str
     got_topo = str(row.get("parallel_topology") or cohort.get("parallel_topology") or payload.get("parallel_topology") or "").strip()
     if got_topo != exp_topo:
         raise ModelingError(f"observation_plan_coordinate_mismatch:{pid}:parallel_topology:expected={exp_topo}:got={got_topo}")
+    exp_ranks = validate_parallel_topology(exp_topo)
+    if exp_ranks > 1 and device_ranks:
+        unique_ranks = set(int(r) for r in device_ranks)
+        if len(unique_ranks) != exp_ranks or len(device_ranks) != exp_ranks:
+            raise ModelingError(
+                f"observation_participating_ranks_mismatch:{pid}:topology={exp_topo}:expected_ranks={exp_ranks}:got={list(device_ranks)}"
+            )
     if plan_pt.get("topk") is not None:
         got_topk = row.get("topk") if row.get("topk") is not None else payload.get("topk")
         if got_topk is None or isinstance(got_topk, bool) or int(got_topk) != int(plan_pt["topk"]):
             raise ModelingError(f"observation_plan_coordinate_mismatch:{pid}:topk:expected={plan_pt['topk']}:got={got_topk}")
 
 
-def _row_to_gate_case(row: Mapping[str, Any], *, sku: str, idx: int, plan_axis: str = "", plan_value: int | None = None) -> GateCase:
+def _row_to_gate_case(row: Mapping[str, Any], *, sku: str, idx: int, plan_pt: Mapping[str, Any] | None = None) -> GateCase:
     cid = str(row.get("case_id") or row.get("point_id") or f"obs-{idx}")
+    plan_axis = str(plan_pt.get("axis") or "") if plan_pt else ""
+    plan_value = int(plan_pt["value"]) if plan_pt and plan_pt.get("value") is not None else None
     _check_no_caller_predictions(row, cid)
     check_no_service_regimes(row, path=cid)
     row_status = str(row.get("status") or "").strip().lower()
@@ -289,7 +298,7 @@ def _row_to_gate_case(row: Mapping[str, Any], *, sku: str, idx: int, plan_axis: 
         raise ModelingError(f"observation_status_not_ok:{cid}:status={row_status}")
     if row.get("validated") is False or row.get("qualified") is False:
         raise ModelingError(f"observation_unvalidated_or_unqualified:{cid}")
-    clock_op = resolve_authoritative_clock_operator(row, cid)
+    clock_op = resolve_authoritative_clock_operator(row, cid, plan_pt=plan_pt)
     coord_keys = (
         "sim_case", "target_op_id", "target_family", "target_layer", "target_op_ids",
         "context_len", "tokens", "batch_size", "query_tokens", "batch_x_kv_heads", "parallel_topology", "topk",
@@ -429,18 +438,18 @@ class ClockParityRunner:
 
         lowered = diag.get("lowered_dimensions")
         plan_pt = self._plan_by_case.get(case.case_id)
-        if plan_pt is not None and isinstance(lowered, Mapping):
-            axis = str(plan_pt.get("axis") or "")
-            if axis == "batch_x_kv_heads" and lowered.get("batch_x_kv_heads") != int(plan_pt["value"]):
-                raise ModelingError(
-                    f"whitebox_dimension_collapse:{case.case_id}:batch_x_kv_heads"
-                    f":expected={plan_pt['value']}:lowered={lowered.get('batch_x_kv_heads')}"
-                )
-            if axis == "tokens" and lowered.get("tokens") != int(plan_pt["value"]):
-                raise ModelingError(
-                    f"whitebox_dimension_collapse:{case.case_id}:tokens"
-                    f":expected={plan_pt['value']}:lowered={lowered.get('tokens')}"
-                )
+        if isinstance(lowered, Mapping):
+            mat_sku = str(lowered.get("materialized_sku") or "").strip()
+            if mat_sku and mat_sku != case.cohort.sku:
+                raise ModelingError(f"whitebox_materialized_sku_mismatch:{case.case_id}:expected={case.cohort.sku}:materialized={mat_sku}")
+            if plan_pt is not None:
+                axis = str(plan_pt.get("axis") or "")
+                if axis == "batch_x_kv_heads" and lowered.get("batch_x_kv_heads") != int(plan_pt["value"]):
+                    raise ModelingError(f"whitebox_dimension_collapse:{case.case_id}:batch_x_kv_heads:expected={plan_pt['value']}:lowered={lowered.get('batch_x_kv_heads')}")
+                if axis == "tokens" and lowered.get("tokens") != int(plan_pt["value"]):
+                    raise ModelingError(f"whitebox_dimension_collapse:{case.case_id}:tokens:expected={plan_pt['value']}:lowered={lowered.get('tokens')}")
+                if axis != "batch_x_kv_heads" and lowered.get("sequences") is not None and int(lowered["sequences"]) != int(plan_pt.get("batch_size", 1)):
+                    raise ModelingError(f"whitebox_dimension_collapse:{case.case_id}:sequences:expected={plan_pt.get('batch_size', 1)}:lowered={lowered.get('sequences')}")
 
         self.engine_clocks[case.case_id] = {
             "clock_operator": eng_op,
@@ -562,17 +571,22 @@ def score_sealed_gate_cases(
     seen_heldout_ids: set[str] = set()
     seen_train_ids: set[str] = set()
     seen_heldout_captures: dict[tuple[str, frozenset[str], tuple[int, ...], str], str] = {}
+    captures_verified_flags: list[bool] = []
 
     for idx, row in enumerate(scorable_rows):
         raw_pid = str(row.get("point_id") or row.get("case_id") or f"obs-{idx}").strip()
         plan_pt = plan_by_id.get(raw_pid) or train_plan_by_id.get(raw_pid)
-        gc = _row_to_gate_case(
-            row, sku=sku, idx=idx,
-            plan_axis=str(plan_pt.get("axis") or "") if plan_pt else "",
-            plan_value=int(plan_pt["value"]) if plan_pt and plan_pt.get("value") is not None else None,
-        )
+        gc = _row_to_gate_case(row, sku=sku, idx=idx, plan_pt=plan_pt)
         pid = str(row.get("point_id") or gc.case_id).strip()
         payload_map = dict(gc.payload)
+        clock_op = str(payload_map.get("clock_operator", DEFAULT_CLOCK_OPERATOR))
+        gc, cap_verified, auth_p99 = verify_capture_and_override_case(
+            gc, row, clock_op=clock_op,
+            capture_root=capture_root, capture_files=capture_files,
+            require_capture_files=require_capture_files,
+            row_p99_ns=extract_measured_p99_ns(row),
+        )
+        captures_verified_flags.append(cap_verified)
         row_fam = str(row.get("target_family") or payload_map.get("target_family") or row.get("op_family") or "").strip()
         if exp_fam and row_fam and row_fam != exp_fam:
             raise ModelingError(f"operator_family_replay_mismatch:{pid}:expected={exp_fam}:got={row_fam}")
@@ -585,36 +599,30 @@ def score_sealed_gate_cases(
             if gc.case_id != pid and gc.case_id in plan_by_id and pid in plan_by_id:
                 raise ModelingError(f"conflicting_case_and_point_id:{gc.case_id}:{pid}")
             if pid in plan_by_id:
-                validate_row_matches_plan_point(row, plan_by_id[pid], sku=sku, pid=pid)
+                validate_row_matches_plan_point(row, plan_by_id[pid], sku=sku, pid=pid, device_ranks=gc.boundary.device_ranks)
                 plan_by_case[gc.case_id] = plan_by_id[pid]
-            cap_key = (
-                _norm_digest(gc.boundary.raw_sha256),
-                frozenset(gc.boundary.event_ids),
-                gc.boundary.device_ranks,
-                gc.boundary.run_uid,
-            )
+            cap_key = (_norm_digest(gc.boundary.raw_sha256), frozenset(gc.boundary.event_ids), gc.boundary.device_ranks, gc.boundary.run_uid)
             if cap_key in seen_heldout_captures:
-                raise ModelingError(
-                    f"duplicate_heldout_physical_capture:{pid}:collides_with={seen_heldout_captures[cap_key]}"
-                )
+                raise ModelingError(f"duplicate_heldout_physical_capture:{pid}:collides_with={seen_heldout_captures[cap_key]}")
             seen_heldout_captures[cap_key] = pid
         elif gc.split == "train":
             if pid in seen_train_ids:
                 raise ModelingError(f"duplicate_train_point_id:{pid}")
             seen_train_ids.add(pid)
             if pid in train_plan_by_id:
-                validate_row_matches_plan_point(row, train_plan_by_id[pid], sku=sku, pid=pid)
+                validate_row_matches_plan_point(row, train_plan_by_id[pid], sku=sku, pid=pid, device_ranks=gc.boundary.device_ranks)
                 plan_by_case[gc.case_id] = train_plan_by_id[pid]
         cases.append(gc)
-        expected_clock[gc.case_id] = str(payload_map.get("clock_operator", DEFAULT_CLOCK_OPERATOR))
+        expected_clock[gc.case_id] = clock_op
         case_meta[gc.case_id] = {
-            "point_id": pid,
-            "split": gc.split,
-            "target_family": row_fam,
-            "implementation": gc.implementation,
-            "silicon_busy_union_ns": row.get("busy_union_ns"),
-            "silicon_elapsed_span_ns": row.get("elapsed_span_ns"),
-            "measured_p99_ns": extract_measured_p99_ns(row),
+            "point_id": pid, "split": gc.split, "target_family": row_fam, "implementation": gc.implementation,
+            "operator_id": str(row.get("operator_id") or payload_map.get("operator_id") or "").strip(),
+            "upstream_abi": str(row.get("upstream_abi") or row.get("abi") or "").strip(),
+            "silicon_busy_union_ns": row.get("busy_union_ns"), "silicon_elapsed_span_ns": row.get("elapsed_span_ns"),
+            "measured_p99_ns": auth_p99, "raw_sha256": gc.boundary.raw_sha256, "capture_uri": gc.boundary.capture_uri,
+            "run_uid": gc.boundary.run_uid, "event_ids": list(gc.boundary.event_ids), "device_ranks": list(gc.boundary.device_ranks),
+            "start_event": gc.boundary.start_event, "end_event": gc.boundary.end_event,
+            "clock_domain": gc.boundary.clock_domain, "parent_digests": list(gc.boundary.parent_digests),
         }
 
     manifest = Manifest(
@@ -664,22 +672,20 @@ def score_sealed_gate_cases(
         signed_pct = signed_err * PERCENT_SCALE
         row_dict = {
             **res.to_dict(),
-            "predicted_ns": scored_pred_ns,
-            "signed_error": signed_err,
-            "absolute_percentage_error": ape,
-            "point_id": meta["point_id"],
-            "split": meta["split"],
-            "target_family": meta["target_family"],
-            "implementation": meta["implementation"],
+            "predicted_ns": scored_pred_ns, "signed_error": signed_err, "absolute_percentage_error": ape,
+            "point_id": meta["point_id"], "split": meta["split"],
+            "target_family": meta["target_family"], "implementation": meta["implementation"],
+            "operator_id": meta["operator_id"], "upstream_abi": meta["upstream_abi"],
             "clock_operator": clk.get("clock_operator", expected_clock[res.case_id]),
-            "silicon_busy_union_ns": meta["silicon_busy_union_ns"],
-            "silicon_elapsed_span_ns": meta["silicon_elapsed_span_ns"],
+            "silicon_busy_union_ns": meta["silicon_busy_union_ns"], "silicon_elapsed_span_ns": meta["silicon_elapsed_span_ns"],
             "measured_p99_ns": meta["measured_p99_ns"],
-            "engine_busy_union_ns": clk.get("busy_union_ns"),
-            "engine_elapsed_span_ns": clk.get("elapsed_span_ns"),
+            "engine_busy_union_ns": clk.get("busy_union_ns"), "engine_elapsed_span_ns": clk.get("elapsed_span_ns"),
             "program_dag_sha256": clk.get("program_dag_sha256", ""),
-            "executed_op_families": clk.get("executed_op_families", []),
-            "engine_uid": clk.get("engine_uid", ""),
+            "executed_op_families": clk.get("executed_op_families", []), "engine_uid": clk.get("engine_uid", ""),
+            "raw_sha256": meta["raw_sha256"], "capture_uri": meta["capture_uri"], "run_uid": meta["run_uid"],
+            "event_ids": meta["event_ids"], "device_ranks": meta["device_ranks"],
+            "start_event": meta["start_event"], "end_event": meta["end_event"],
+            "clock_domain": meta["clock_domain"], "parent_digests": meta["parent_digests"],
         }
         residual_dicts.append(row_dict)
         if meta["split"] == "heldout" and res.status == "ok":
@@ -704,6 +710,7 @@ def score_sealed_gate_cases(
 
     result = {
         "ok": ok, "status": status, "sku": sku, "threshold_pct": cap_threshold,
+        "capture_files_verified": bool(captures_verified_flags) and all(captures_verified_flags),
         "lineage": lineage,
         "heldout_summary": _summarize_apes(heldout_apes, heldout_signed),
         "train_summary": _summarize_apes(train_apes, train_signed),

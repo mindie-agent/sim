@@ -228,6 +228,7 @@ def _configure_operator_stages(parser: argparse.ArgumentParser) -> None:
     p3.add_argument("--coordinator-bin", default="")
     p3.add_argument("--threshold-pct", type=float, default=DEFAULT_HELDOUT_APE_THRESHOLD_PCT)
     p3.add_argument("--out-score", default=None)
+    p3.add_argument("--capture-root", default=None)
     p3.add_argument("--stage-key-file", default=None)
     p3.add_argument("--output", "-o", default=None)
 
@@ -237,6 +238,7 @@ def _configure_operator_stages(parser: argparse.ArgumentParser) -> None:
     p4.add_argument("--contract-report-json", required=True)
     p4.add_argument("--score-report-json", required=True)
     p4.add_argument("--lean-bounds-json", required=True)
+    p4.add_argument("--capture-root", default=None)
     p4.add_argument("--repo-root", default=None)
     p4.add_argument("--threshold-pct", type=float, default=DEFAULT_HELDOUT_APE_THRESHOLD_PCT)
     p4.add_argument("--skip-repo-gates", action="store_true")
@@ -275,6 +277,7 @@ def _configure_operator_stages(parser: argparse.ArgumentParser) -> None:
     pa.add_argument("--no-require-tiling-axes", dest="require_tiling_axes", action="store_false")
     pa.add_argument("--require-mounted-refs", action="store_true")
     pa.add_argument("--out-dir", default=None)
+    pa.add_argument("--capture-root", default=None)
     pa.add_argument("--skip-repo-gates", action="store_true")
     pa.add_argument("--orthogonality-base", default=None)
     pa.add_argument("--threshold-pct", type=float, default=DEFAULT_HELDOUT_APE_THRESHOLD_PCT)
@@ -345,7 +348,7 @@ def _run_sku_stage(args: argparse.Namespace) -> dict[str, Any]:
             profiler_root=args.profiler_root,
             coordinator_bin=args.coordinator_bin,
             capture_root=args.capture_root,
-            require_capture_files=args.capture_root is not None,
+            require_capture_files=True,
         )
     if stage == "verify-gates":
         return verify_sku_gates(
@@ -357,6 +360,7 @@ def _run_sku_stage(args: argparse.Namespace) -> dict[str, Any]:
             primitives_json=args.primitives_json,
             expected_cann_version=args.expected_cann_version,
             capture_root=args.capture_root,
+            require_capture_files=True,
             repo_root=args.repo_root,
             threshold_pct=args.threshold_pct,
             run_repo_gates=not bool(args.skip_repo_gates),
@@ -386,7 +390,7 @@ def _run_sku_stage(args: argparse.Namespace) -> dict[str, Any]:
             profiler_root=args.profiler_root,
             coordinator_bin=args.coordinator_bin,
             capture_root=args.capture_root,
-            require_capture_files=args.capture_root is not None,
+            require_capture_files=True,
         )
     raise ValueError(f"unknown_sku_stage:{stage}")
 
@@ -451,6 +455,8 @@ def _run_operator_stage(args: argparse.Namespace) -> dict[str, Any]:
             coordinator_bin=args.coordinator_bin,
             threshold_pct=args.threshold_pct,
             out_score=args.out_score,
+            capture_root=args.capture_root,
+            require_capture_files=True,
         )
     if stage == "certify":
         return certify_operator(
@@ -459,6 +465,8 @@ def _run_operator_stage(args: argparse.Namespace) -> dict[str, Any]:
             contract_report=args.contract_report_json,
             score_report=args.score_report_json,
             lean_bounds_json=args.lean_bounds_json,
+            capture_root=args.capture_root,
+            require_capture_files=True,
             repo_root=args.repo_root,
             threshold_pct=args.threshold_pct,
             run_repo_gates=not bool(args.skip_repo_gates),
@@ -500,6 +508,8 @@ def _run_operator_stage(args: argparse.Namespace) -> dict[str, Any]:
             live_profiler=bool(args.live_profiler),
             endpoint_alias=args.endpoint_alias,
             coordinator_bin=args.coordinator_bin,
+            capture_root=args.capture_root,
+            require_capture_files=True,
         )
     raise ValueError(f"unknown_operator_stage:{stage}")
 

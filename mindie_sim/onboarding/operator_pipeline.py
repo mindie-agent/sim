@@ -30,8 +30,9 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
+import tempfile
 from typing import Any, Literal
 
 from mindie_sim.observations.multilevel_gate import EvaluationRunner
@@ -41,6 +42,7 @@ from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.templates.registry import TemplateCatalog
 
+from ._capture_truth import reverify_report_captures, verify_live_silicon_evidence
 from ._gate_runners import (
     acquire_coordinator_host_queue_lease,
     resolve_repo_root,
@@ -48,6 +50,7 @@ from ._gate_runners import (
     run_profiler_bench_subprocess,
     run_tail_cluster_diagnosis,
     run_test_orthogonality_gate,
+    validate_host_queue_grant,
 )
 from ._lean_and_receipts import (
     check_lean_non_inversion,
@@ -150,7 +153,7 @@ def bench_and_score_operator(
     timeout_s: int = DEFAULT_OUTER_TIMEOUT_S,
     capture_root: str | Path | None = None,
     capture_files: Mapping[str, str | Path] | None = None,
-    require_capture_files: bool = False,
+    require_capture_files: bool = True,
 ) -> dict[str, Any]:
     """Stage 3: Dispatch bench plan (under exact-rank HostQueue lease if live) and score."""
     cap_threshold = validate_strict_threshold_pct(threshold_pct)
@@ -169,86 +172,98 @@ def bench_and_score_operator(
     rows: list[Mapping[str, Any]] | None = None
     lease_public: dict[str, Any] = {"lease_mode": "offline_replay"}
     acquisition_mode: Literal["live_silicon", "offline_reverify"] = "offline_reverify"
-    if captured_json is not None:
-        if isinstance(captured_json, (str, Path)):
-            raw_cap = read_bounded_json(captured_json)
-            rows = list(raw_cap.get("observations", raw_cap) if isinstance(raw_cap, Mapping) else raw_cap)
-            if abi_rejection_results is None and isinstance(raw_cap, Mapping) and raw_cap.get("abi_rejection_results") is not None:
-                abi_rejection_results = list(raw_cap["abi_rejection_results"])
-        else:
-            rows = list(captured_json)
-    elif bench_dispatcher is not None:
-        rows = list(bench_dispatcher(plan_doc, int(timeout_s)))
-    elif live_profiler:
-        req_npus = required_ranks_for_plan(plan_doc)
-        lease_ttl_s = int(timeout_s) + DEFAULT_CLEANUP_GRACE_S
-        lease_ctx = (
-            lease_acquirer(sku, lease_ttl_s)
-            if lease_acquirer is not None
-            else acquire_coordinator_host_queue_lease(
-                endpoint_alias,
-                npu_count=req_npus,
-                ttl_seconds=lease_ttl_s,
-                min_subprocess_timeout_s=int(timeout_s),
-                cleanup_grace_s=DEFAULT_CLEANUP_GRACE_S,
-                coordinator_bin=coordinator_bin,
-            )
-        )
-        raw_lease: Mapping[str, Any] = {}
-        with lease_ctx as lease_info:
-            raw_lease = lease_info if isinstance(lease_info, Mapping) else {}
-            fence = raw_lease.get("fence_token")
-            if not raw_lease.get("lease_id") or type(fence) is not int or fence <= 0:
-                raise ModelingError("live_profiler_requires_valid_host_queue_lease_and_positive_fence")
-            granted = [int(d) for d in (raw_lease.get("devices") or ()) if not isinstance(d, bool)]
-            if len(granted) < req_npus:
-                raise ModelingError(f"live_profiler_insufficient_devices:required={req_npus}:granted={len(granted)}")
-            rows, live_abi = run_profiler_bench_subprocess(
-                plan_doc,
-                sku=sku,
-                profiler_root=profiler_root,
-                endpoint_alias=endpoint_alias,
-                allowed_phy_ids=granted,
-                fence_token=fence,
-                timeout_s=int(timeout_s),
-            )
-            if abi_rejection_results is None and live_abi:
-                abi_rejection_results = live_abi
-        lease_public = sanitize_lease_for_receipt(raw_lease)
-        if lease_public.get("lease_mode") == "coordinator_host_queue":
-            acquisition_mode = "live_silicon"
-
-    if rows is None:
-        plan_only: dict[str, Any] = {
-            "stage": "bench-and-score", "ok": False, "status": "plan_only",
-            "verdict": "insufficient_evidence",
-            "error": "bench_and_score_plan_only_no_observations",
-            "sku": sku, "target_id": str(plan_doc.get("target_id") or ""),
-            "family": plan_family, "plan_sha256": verified_plan_sha,
-            "acquisition_mode": acquisition_mode, "lease": lease_public,
-            "missing_heldout_points": sorted(expected_heldout_ids),
-            "missing_train_points": sorted(expected_train_ids),
-            "abi_rejection_check": evaluate_abi_rejections(plan_doc.get("abi_rejection_points") or (), None),
-            "heldout_summary": None, "residuals": [],
-        }
-        plan_only["report_hmac"] = sign_stage_report("operator_score", plan_only)
+    req_npus = required_ranks_for_plan(plan_doc)
+    eff_capture_root: str | Path | None = capture_root
+    temp_cap_ctx: AbstractContextManager[str | None] = nullcontext(None)
+    if live_profiler and captured_json is None and bench_dispatcher is None and eff_capture_root is None:
         if out_score is not None:
-            write_atomic_json(out_score, plan_only)
-        assert_sanitized_payload(plan_only, field_name="bench_and_score_plan_only")
-        return plan_only
+            eff_capture_root = Path(out_score).parent / "captures"
+        else:
+            temp_cap_ctx = tempfile.TemporaryDirectory(prefix="msim-op-cap-")
 
-    external_train = [str(plan_doc["train_lineage_root"])] if plan_doc.get("train_lineage_root") else []
-    scored = score_sealed_gate_cases(
-        rows, sku=sku, runner=runner, threshold_pct=cap_threshold,
-        external_train_roots=external_train,
-        expected_points=expected_heldout_pts,
-        expected_train_points=expected_train_pts,
-        expected_point_ids=expected_heldout_ids,
-        expected_family=plan_family,
-        require_disjoint_level_roots=False,
-        capture_root=capture_root, capture_files=capture_files,
-        require_capture_files=require_capture_files,
-    )
+    with temp_cap_ctx as tmp_cap_dir:
+        if tmp_cap_dir is not None:
+            eff_capture_root = Path(tmp_cap_dir)
+        if captured_json is not None:
+            if isinstance(captured_json, (str, Path)):
+                raw_cap = read_bounded_json(captured_json)
+                rows = list(raw_cap.get("observations", raw_cap) if isinstance(raw_cap, Mapping) else raw_cap)
+                if abi_rejection_results is None and isinstance(raw_cap, Mapping) and raw_cap.get("abi_rejection_results") is not None:
+                    abi_rejection_results = list(raw_cap["abi_rejection_results"])
+            else:
+                rows = list(captured_json)
+        elif bench_dispatcher is not None:
+            rows = list(bench_dispatcher(plan_doc, int(timeout_s)))
+        elif live_profiler:
+            lease_ttl_s = int(timeout_s) + DEFAULT_CLEANUP_GRACE_S
+            lease_ctx = (
+                lease_acquirer(sku, lease_ttl_s)
+                if lease_acquirer is not None
+                else acquire_coordinator_host_queue_lease(
+                    endpoint_alias,
+                    npu_count=req_npus,
+                    ttl_seconds=lease_ttl_s,
+                    min_subprocess_timeout_s=int(timeout_s),
+                    cleanup_grace_s=DEFAULT_CLEANUP_GRACE_S,
+                    coordinator_bin=coordinator_bin,
+                )
+            )
+            raw_lease: Mapping[str, Any] = {}
+            with lease_ctx as lease_info:
+                raw_lease = lease_info if isinstance(lease_info, Mapping) else {}
+                _, fence, granted, _ = validate_host_queue_grant(
+                    raw_lease, required_devices=req_npus, min_ttl_seconds=lease_ttl_s
+                )
+                rows, live_abi = run_profiler_bench_subprocess(
+                    plan_doc,
+                    sku=sku,
+                    profiler_root=profiler_root,
+                    endpoint_alias=endpoint_alias,
+                    allowed_phy_ids=granted,
+                    fence_token=fence,
+                    timeout_s=int(timeout_s),
+                    capture_out_dir=eff_capture_root,
+                )
+                if abi_rejection_results is None and live_abi:
+                    abi_rejection_results = live_abi
+            lease_public = sanitize_lease_for_receipt(raw_lease)
+            if lease_public.get("lease_mode") == "coordinator_host_queue":
+                acquisition_mode = "live_silicon"
+
+        if rows is None:
+            plan_only: dict[str, Any] = {
+                "stage": "bench-and-score", "ok": False, "status": "plan_only",
+                "verdict": "insufficient_evidence",
+                "error": "bench_and_score_plan_only_no_observations",
+                "sku": sku, "target_id": str(plan_doc.get("target_id") or ""),
+                "family": plan_family, "plan_sha256": verified_plan_sha,
+                "required_ranks": req_npus, "acquisition_mode": "offline_reverify",
+                "capture_files_verified": False, "lease": lease_public,
+                "missing_heldout_points": sorted(expected_heldout_ids),
+                "missing_train_points": sorted(expected_train_ids),
+                "abi_rejection_check": evaluate_abi_rejections(plan_doc.get("abi_rejection_points") or (), None),
+                "heldout_summary": None, "residuals": [],
+            }
+            plan_only["report_hmac"] = sign_stage_report("operator_score", plan_only)
+            if out_score is not None:
+                write_atomic_json(out_score, plan_only)
+            assert_sanitized_payload(plan_only, field_name="bench_and_score_plan_only")
+            return plan_only
+
+        external_train = [str(plan_doc["train_lineage_root"])] if plan_doc.get("train_lineage_root") else []
+        scored = score_sealed_gate_cases(
+            rows, sku=sku, runner=runner, threshold_pct=cap_threshold,
+            external_train_roots=external_train,
+            expected_points=expected_heldout_pts,
+            expected_train_points=expected_train_pts,
+            expected_point_ids=expected_heldout_ids,
+            expected_family=plan_family,
+            require_disjoint_level_roots=False,
+            capture_root=eff_capture_root, capture_files=capture_files,
+            require_capture_files=require_capture_files,
+        )
+    if not scored.get("capture_files_verified"):
+        acquisition_mode = "offline_reverify"
     abi_check = evaluate_abi_rejections(list(plan_doc.get("abi_rejection_points") or ()), abi_rejection_results)
     missing_heldout = list(scored["missing_plan_points"])
     missing_train = list(scored["missing_train_points"])
@@ -263,8 +278,10 @@ def bench_and_score_operator(
         "stage": "bench-and-score", "ok": final_ok, "status": final_status, "verdict": final_status,
         "sku": sku, "threshold_pct": cap_threshold,
         "target_id": str(plan_doc.get("target_id") or ""), "family": plan_family,
-        "plan_sha256": verified_plan_sha,
-        "acquisition_mode": acquisition_mode, "lease": lease_public,
+        "plan_sha256": verified_plan_sha, "required_ranks": req_npus,
+        "acquisition_mode": acquisition_mode,
+        "capture_files_verified": bool(scored.get("capture_files_verified", False)),
+        "lease": lease_public,
         "missing_heldout_points": missing_heldout, "missing_train_points": missing_train,
         "over_budget_points": list(scored["over_budget_points"]),
         "failing_cases": list(scored["failing_cases"]),
@@ -318,9 +335,12 @@ def certify_operator(
     orthogonality_base: str | None = None,
     out_receipt: str | Path | None = None,
     diagnosis_out: str | Path | None = None,
+    capture_root: str | Path | None = None,
+    capture_files: Mapping[str, str | Path] | None = None,
+    require_capture_files: bool = True,
     acquisition_mode: Literal["live_silicon", "offline_reverify"] | None = None,
 ) -> dict[str, Any]:
-    """Stage 4: Enforce complete contract, bound receipts, pointwise <10%, joined Lean."""
+    """Stage 4: Enforce complete contract, bound receipts, verified captures, pointwise <10%, joined Lean."""
     cap_threshold = validate_strict_threshold_pct(threshold_pct)
     root = resolve_repo_root(repo_root)
     c_doc = read_bounded_json(contract_report) if isinstance(contract_report, (str, Path)) else dict(contract_report)
@@ -331,7 +351,10 @@ def certify_operator(
     c_family = str(c_doc.get("family") or "").strip()
     s_family = str(s_doc.get("family") or "").strip()
     s_target_id = str(s_doc.get("target_id") or "").strip()
-    op_prefix = operator_id.split(":", 1)[0].strip() if ":" in operator_id else operator_id.strip()
+    op_prefix, op_variant = (operator_id.split(":", 1)[0].strip(), operator_id.split(":", 1)[1].strip()) if ":" in operator_id else (operator_id.strip(), "")
+    sim_disp = c_doc.get("sim_owner_dispatch") if isinstance(c_doc.get("sim_owner_dispatch"), Mapping) else {}
+    prof_disp = c_doc.get("profiler_builder") if isinstance(c_doc.get("profiler_builder"), Mapping) else {}
+    declared_abis = {str(v).strip() for v in (c_doc.get("upstream_abis") or {}).values() if str(v or "").strip()}
     identity_violations = _check_contract_release_eligibility(c_doc)
     if s_target_id != operator_id:
         identity_violations.append(f"score_report_operator_id_mismatch:expected={operator_id}:got={s_target_id or 'missing'}")
@@ -339,6 +362,23 @@ def certify_operator(
         identity_violations.append(f"contract_score_family_mismatch:contract={c_family}:score={s_family}")
     if c_family and op_prefix and c_family != op_prefix:
         identity_violations.append(f"contract_operator_id_mismatch:contract_family={c_family}:operator_id={operator_id}")
+    if sim_disp.get("owner") == "builtin_template_catalog":
+        tid = str(sim_disp.get("template_id") or "").strip()
+        if tid and operator_id != tid and op_variant != tid:
+            identity_violations.append(f"contract_template_operator_id_mismatch:template={tid}:operator_id={operator_id}")
+    elif op_variant:
+        allowed_variants = {
+            str(v).strip()
+            for v in (
+                *(sim_disp.get("owned_recipe_ids") or ()),
+                sim_disp.get("resolved_implementation"),
+                prof_disp.get("resolved_abi"),
+                *declared_abis,
+            )
+            if str(v or "").strip()
+        }
+        if allowed_variants and operator_id not in allowed_variants and op_variant not in allowed_variants:
+            identity_violations.append(f"contract_operator_variant_unowned:operator_id={operator_id}:owned={sorted(allowed_variants)}")
     contract_ok = c_hmac_ok and bool(c_doc.get("ok")) and not identity_violations
     c_violations = list(c_doc.get("violations") or ())
     if not c_hmac_ok:
@@ -359,19 +399,28 @@ def certify_operator(
     s_hmac_ok = verify_stage_report("operator_score", s_doc)
     sku_match = str(s_doc.get("sku") or "") == sku
     target_match = s_target_id == operator_id
-    heldout_rows = [r for r in s_doc.get("residuals", ()) if r.get("split", "heldout") == "heldout"]
+    all_score_rows = [r for r in s_doc.get("residuals", ()) if isinstance(r, Mapping)]
+    heldout_rows = [r for r in all_score_rows if r.get("split", "heldout") == "heldout"]
+    captures_ok = True
+    capture_err = ""
+    if heldout_rows:
+        if capture_root is not None or capture_files is not None:
+            reverify_report_captures(
+                all_score_rows, capture_root=capture_root, capture_files=capture_files, require_capture_files=True
+            )
+        elif require_capture_files and s_doc.get("capture_files_verified") is not True:
+            captures_ok, capture_err = False, "capture_files_unverified_for_release"
 
-    sim_disp = c_doc.get("sim_owner_dispatch") if isinstance(c_doc.get("sim_owner_dispatch"), Mapping) else {}
-    prof_disp = c_doc.get("profiler_builder") if isinstance(c_doc.get("profiler_builder"), Mapping) else {}
     allowed_impls = {
         str(v).strip()
         for v in (
             sim_disp.get("resolved_implementation"),
             prof_disp.get("resolved_abi"),
-            *(c_doc.get("upstream_abis") or {}).values(),
+            *declared_abis,
         )
         if str(v or "").strip()
     }
+    prof_abi = str(prof_disp.get("resolved_abi") or "").strip()
     receipt_identity_errs: list[str] = []
     for r in heldout_rows:
         cid = str(r.get("case_id") or "")
@@ -379,13 +428,19 @@ def certify_operator(
         if exec_fams and c_family and c_family not in exec_fams:
             receipt_identity_errs.append(f"receipt_family_mismatch:{cid}:executed={exec_fams}:expected={c_family}")
         row_fam = str(r.get("target_family") or "").strip()
-        if row_fam and c_family and row_fam != c_family:
-            receipt_identity_errs.append(f"receipt_target_family_mismatch:{cid}:got={row_fam}:expected={c_family}")
+        if not row_fam or (c_family and row_fam != c_family):
+            receipt_identity_errs.append(f"receipt_target_family_mismatch:{cid}:got={row_fam or 'missing'}:expected={c_family}")
+        row_op_id = str(r.get("operator_id") or "").strip()
+        if row_op_id and row_op_id != operator_id:
+            receipt_identity_errs.append(f"receipt_operator_id_mismatch:{cid}:got={row_op_id}:expected={operator_id}")
         row_impl = str(r.get("implementation") or "").strip()
-        if allowed_impls and row_impl and row_impl not in allowed_impls:
-            receipt_identity_errs.append(f"receipt_implementation_mismatch:{cid}:got={row_impl}")
+        if not row_impl or (allowed_impls and row_impl not in allowed_impls):
+            receipt_identity_errs.append(f"receipt_implementation_mismatch:{cid}:got={row_impl or 'missing'}")
+        row_abi = str(r.get("upstream_abi") or "").strip()
+        if row_abi and ((declared_abis and row_abi not in declared_abis) or (prof_abi and row_abi != prof_abi)):
+            receipt_identity_errs.append(f"receipt_abi_mismatch:{cid}:got={row_abi}")
 
-    receipts_ok = bool(heldout_rows) and not receipt_identity_errs and all(
+    receipts_ok = bool(heldout_rows) and captures_ok and not receipt_identity_errs and all(
         str(r.get("engine_receipt") or "").startswith(_ENGINE_RECEIPT_PREFIX)
         and int(r.get("predicted_ns") or 0) > 0
         and int(r.get("measured_ns") or 0) > 0
@@ -412,6 +467,8 @@ def certify_operator(
         cliff_detail = "score_report_sku_mismatch"
     elif not target_match:
         cliff_detail = "score_report_operator_id_mismatch"
+    elif capture_err:
+        cliff_detail = capture_err
     elif receipt_identity_errs:
         cliff_detail = "; ".join(receipt_identity_errs[:4])
     elif not receipts_ok:
@@ -484,10 +541,16 @@ def certify_operator(
     if c_doc.get("target"):
         artifacts["operator_target"] = str(c_doc["target"])
 
+    live_verified = s_hmac_ok and verify_live_silicon_evidence(s_doc)
+    if acquisition_mode == "live_silicon" and not live_verified:
+        gates.append(
+            GateCheckOutcome(
+                name="acquisition_mode_evidence", passed=False, status="fail",
+                detail="live_silicon_claim_unverified_by_host_queue_and_captures",
+            )
+        )
     eff_mode: Literal["live_silicon", "offline_reverify"] = (
-        acquisition_mode
-        if acquisition_mode is not None
-        else ("live_silicon" if s_doc.get("acquisition_mode") == "live_silicon" else "offline_reverify")
+        "live_silicon" if (live_verified and acquisition_mode != "offline_reverify") else "offline_reverify"
     )
     receipt = seal_onboarding_receipt(
         kind="operator", target_id=operator_id, sku=sku,
@@ -551,7 +614,7 @@ def run_operator_onboarding(
     runner: EvaluationRunner | None = None,
     capture_root: str | Path | None = None,
     capture_files: Mapping[str, str | Path] | None = None,
-    require_capture_files: bool = False,
+    require_capture_files: bool = True,
 ) -> dict[str, Any]:
     """Execute all 4 New-Operator onboarding stages end-to-end."""
     cap_threshold = validate_strict_threshold_pct(threshold_pct)
@@ -572,6 +635,7 @@ def run_operator_onboarding(
         bytes_per_token=bytes_per_token, topk_threshold=topk_threshold, tiling_axes=tiling_axes,
         plan_out=(base_out / "operator_cliff_plan.json") if base_out else None,
     )
+    eff_cap_root = capture_root if capture_root is not None else ((base_out / "captures") if (live_profiler and base_out) else None)
     stage3 = bench_and_score_operator(
         cliff_plan=stage2["plan"], sku=sku, captured_json=captured_json,
         abi_rejection_results=abi_rejection_results, bench_dispatcher=bench_dispatcher,
@@ -579,13 +643,15 @@ def run_operator_onboarding(
         lease_acquirer=lease_acquirer, coordinator_bin=coordinator_bin, runner=runner,
         threshold_pct=cap_threshold,
         out_score=(base_out / "operator_score_report.json") if base_out else None,
-        capture_root=capture_root, capture_files=capture_files,
+        capture_root=eff_cap_root, capture_files=capture_files,
         require_capture_files=require_capture_files,
     )
     stage4 = certify_operator(
         operator_id=operator_id, sku=sku, contract_report=stage1, score_report=stage3,
         lean_bounds_json=lean_bounds_json, repo_root=repo_root, threshold_pct=cap_threshold,
         run_repo_gates=run_repo_gates, orthogonality_base=orthogonality_base,
+        capture_root=eff_cap_root, capture_files=capture_files,
+        require_capture_files=require_capture_files,
         out_receipt=(base_out / "operator_onboarding_receipt.json") if base_out else None,
         diagnosis_out=(base_out / "operator_tail_diagnosis.json") if base_out else None,
     )

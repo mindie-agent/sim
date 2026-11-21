@@ -102,7 +102,10 @@ _EMAIL_OR_USER_HOST_RE = re.compile(
 _HOME_ENV_RE = re.compile(r"\$\{?HOME\}?")
 _OPAQUE_ALIAS_HEX = 12
 _OPAQUE_ALIAS_RE = re.compile(r"^ep-[0-9a-f]{12}$")
+_OPAQUE_CAMPAIGN_RE = re.compile(r"^camp-[0-9a-f]{12}$")
+_OPAQUE_RUN_RE = re.compile(r"^run-[0-9a-f]{12}$")
 _OPAQUE_LEASE_RE = re.compile(r"^lease-[0-9a-f]{16}$")
+_OPAQUE_WARNING_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
 _SUBPROCESS_NO_WINDOW = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
 
@@ -462,8 +465,42 @@ def sanitize_public_alias(alias: str, fallback_tag: str) -> str:
     return f"ep-{hashlib.sha256(seed).hexdigest()[:_OPAQUE_ALIAS_HEX]}"
 
 
+def sanitize_public_campaign_id(campaign_id: str) -> str:
+    """Return an opaque public campaign digest (``camp-<12-hex>``) with zero raw tokens."""
+    raw = str(campaign_id or "").strip()
+    if _OPAQUE_CAMPAIGN_RE.fullmatch(raw):
+        return raw
+    seed = (raw or "onboard").encode("utf-8")
+    return f"camp-{hashlib.sha256(seed).hexdigest()[:_OPAQUE_ALIAS_HEX]}"
+
+
+def sanitize_public_run_id(run_id: str) -> str:
+    """Return an opaque public run digest (``run-<12-hex>``) with zero raw tokens."""
+    raw = str(run_id or "").strip()
+    if _OPAQUE_RUN_RE.fullmatch(raw):
+        return raw
+    seed = (raw or "run").encode("utf-8")
+    return f"run-{hashlib.sha256(seed).hexdigest()[:_OPAQUE_ALIAS_HEX]}"
+
+
+def sanitize_public_warning(warning: str) -> str:
+    """Reduce any free-form warning into a structured opaque code + digest ref."""
+    raw = str(warning or "").strip()
+    if not raw:
+        return ""
+    parts = [p.strip().lower() for p in raw.split(":") if p.strip()]
+    primary = parts[0] if parts and _OPAQUE_WARNING_CODE_RE.fullmatch(parts[0]) else "receipt_warning"
+    secondary = parts[1] if len(parts) > 1 and _OPAQUE_WARNING_CODE_RE.fullmatch(parts[1]) else ""
+    if len(parts) == 1 and _OPAQUE_WARNING_CODE_RE.fullmatch(parts[0]):
+        return primary
+    if len(parts) == 2 and secondary:
+        return f"{primary}:{secondary}"
+    ref = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:_OPAQUE_ALIAS_HEX]
+    return f"{primary}:{secondary}:ref={ref}" if secondary else f"{primary}:ref={ref}"
+
+
 def sanitize_lease_for_receipt(lease_info: Mapping[str, Any] | None) -> dict[str, Any]:
-    """Scrub raw coordinator lease IDs and usernames into opaque public digests."""
+    """Scrub raw coordinator lease IDs, warnings, and usernames into opaque public digests."""
     info = dict(lease_info or {})
     mode = str(info.get("lease_mode") or "unknown").strip()
     out: dict[str, Any] = {"lease_mode": mode}
@@ -480,15 +517,14 @@ def sanitize_lease_for_receipt(lease_info: Mapping[str, Any] | None) -> dict[str
     devices = info.get("devices")
     if isinstance(devices, (list, tuple)):
         out["device_count"] = len(devices)
+    ttl = info.get("ttl_seconds")
+    if ttl is not None and not isinstance(ttl, bool):
+        out["ttl_seconds"] = int(ttl)
     if info.get("receipt_unconfirmed"):
         out["receipt_unconfirmed"] = True
     warning = str(info.get("receipt_warning") or "").strip()
     if warning:
-        scrubbed = warning.replace(raw_id, out.get("lease_digest", "lease-redacted")) if raw_id else warning
-        scrubbed = _IPV4_QUAD_RE.sub("redacted", scrubbed)
-        scrubbed = _EMAIL_OR_USER_HOST_RE.sub("redacted", scrubbed)
-        scrubbed = _HOME_ENV_RE.sub("redacted", scrubbed)
-        out["receipt_warning"] = scrubbed
+        out["receipt_warning"] = sanitize_public_warning(warning)
     return out
 
 
@@ -497,8 +533,7 @@ def build_capture_uri(
 ) -> tuple[str, str]:
     """Build a sanitized ``capture://<alias>/<campaign>/<sha256>`` URI and hex digest."""
     clean_alias = sanitize_public_alias(alias, "capture")
-    clean_campaign = _SAFE_ALIAS_RE.sub("-", str(campaign_id or "onboard").lower()).strip("._-")
-    clean_campaign = clean_campaign or "onboard"
+    clean_campaign = sanitize_public_campaign_id(campaign_id)
     digest = hashlib.sha256(content_bytes).hexdigest()
     uri = sanitize_capture_uri(f"capture://{clean_alias}/{clean_campaign}/{digest}")
     return uri, digest
@@ -539,13 +574,10 @@ def read_bounded_json(path: str | Path) -> Any:
         raise ModelingError(f"onboarding_json_invalid:{target.name}:{exc}") from exc
 
 
-def write_atomic_json(path: str | Path, payload: Mapping[str, Any]) -> None:
-    """Write formatted UTF-8/LF JSON atomically via sibling temp file and ``os.replace``."""
+def write_atomic_bytes(path: str | Path, data: bytes) -> None:
+    """Write exact ``data`` bytes atomically via sibling temp file and ``os.replace``."""
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    rendered = (
-        json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False) + "\n"
-    ).encode("utf-8")
     tmp_path: Path | None = None
     try:
         fd, raw_name = tempfile.mkstemp(
@@ -553,7 +585,7 @@ def write_atomic_json(path: str | Path, payload: Mapping[str, Any]) -> None:
         )
         tmp_path = Path(raw_name)
         try:
-            os.write(fd, rendered)
+            os.write(fd, data)
         finally:
             os.close(fd)
         os.replace(tmp_path, target)
@@ -568,6 +600,14 @@ def write_atomic_json(path: str | Path, payload: Mapping[str, Any]) -> None:
                 tmp_path.unlink()
             except OSError:
                 pass
+
+
+def write_atomic_json(path: str | Path, payload: Mapping[str, Any]) -> None:
+    """Write formatted UTF-8/LF JSON atomically via sibling temp file and ``os.replace``."""
+    rendered = (
+        json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False) + "\n"
+    ).encode("utf-8")
+    write_atomic_bytes(path, rendered)
 
 
 def subprocess_window_kwargs() -> dict[str, Any]:
@@ -628,9 +668,13 @@ __all__ = [
     "read_bounded_json",
     "sanitize_lease_for_receipt",
     "sanitize_public_alias",
+    "sanitize_public_campaign_id",
+    "sanitize_public_run_id",
+    "sanitize_public_warning",
     "subprocess_window_kwargs",
     "utc_now_iso",
     "validate_abi",
     "verify_receipt_sha256",
+    "write_atomic_bytes",
     "write_atomic_json",
 ]

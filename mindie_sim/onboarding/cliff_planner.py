@@ -51,6 +51,7 @@ from .contracts import (
     assert_sanitized_payload,
     canonical_json_bytes,
     sanitize_public_alias,
+    sanitize_public_campaign_id,
 )
 from .tiling_axes import (
     ARCH_PRESET_22,
@@ -256,7 +257,7 @@ def synthesize_operator_cliff_plan(
 ) -> CliffBenchPlan:
     """Synthesize disjoint train + 2D off-grid cliff heldout + ABI-rejection plan."""
     clean_sku = sanitize_public_alias(sku, "sku")
-    clean_campaign = sanitize_public_alias(campaign_id, "onboard")
+    clean_campaign = sanitize_public_campaign_id(campaign_id)
     resolved_arch = _resolve_sku_arch_preset(
         sku, arch_preset=arch_preset, profile_override=profile_override
     )
@@ -426,9 +427,13 @@ def synthesize_operator_cliff_plan(
             topk=tk + 1,
         )
 
+    seen_over_max_axes: set[str] = set()
     for rule in axes.abi_divisibility:
         if rule.applies_to(resolved_arch) and rule.axis == "topk" and rule.max_value is not None:
-            over_max = rule.max_value + rule.divisor
+            if rule.axis in seen_over_max_axes:
+                continue
+            seen_over_max_axes.add(rule.axis)
+            over_max = rule.max_value + 1
             _add(
                 point_id=f"topk_over_max_{over_max}", grid_kind="boundary_cliff",
                 axis="context_len", value=min(params.context_max, max(params.context_min, over_max)),
@@ -537,23 +542,46 @@ def synthesize_sku_512_400k_plan(
 
 
 def _check_abi_row_shape(row: Mapping[str, Any], planned_pt: Mapping[str, Any]) -> str:
-    shape_map = row.get("executed_shape") if isinstance(row.get("executed_shape"), Mapping) else {}
+    shape_raw = row.get("executed_shape")
+    if not isinstance(shape_raw, Mapping) or not shape_raw:
+        return "executed_shape_missing"
+    shape_map = dict(shape_raw)
     planned_axis = str(planned_pt.get("axis") or "").strip()
     planned_val = planned_pt.get("value")
     checks: list[tuple[str, Any, Any]] = [
-        ("batch_size", planned_pt.get("batch_size", 1), shape_map.get("batch_size", row.get("batch_size"))),
-        ("query_tokens", planned_pt.get("query_tokens", 1), shape_map.get("query_tokens", row.get("query_tokens"))),
+        ("batch_size", planned_pt.get("batch_size", 1), shape_map.get("batch_size")),
+        ("query_tokens", planned_pt.get("query_tokens", 1), shape_map.get("query_tokens")),
     ]
     if planned_pt.get("topk") is not None:
-        checks.append(("topk", planned_pt.get("topk"), shape_map.get("topk", row.get("topk"))))
+        checks.append(("topk", planned_pt.get("topk"), shape_map.get("topk")))
     if planned_axis:
-        got_axis = shape_map.get(planned_axis, row.get(planned_axis, shape_map.get("value", row.get("value"))))
+        got_axis = shape_map.get(planned_axis)
         checks.append((planned_axis, planned_val, got_axis))
     for field, exp, got in checks:
-        if got is not None and (type(got) is not int or got != exp):
+        if got is None or type(got) is not int or got != exp:
             return f"shape_mismatch:{field}:got={got!r}:expected={exp!r}"
     if row.get("axis") is not None and planned_axis and str(row.get("axis")) != planned_axis:
         return f"axis_mismatch:got={row.get('axis')}:expected={planned_axis}"
+    return ""
+
+
+def _match_structured_abi_error(err_text: str, expected_err: str, pid: str) -> str:
+    if not err_text:
+        return f"{pid}:abi_error_empty"
+    exp_parts = [p.strip() for p in expected_err.split(":") if p.strip()]
+    got_parts = [p.strip() for p in err_text.split(":") if p.strip()]
+    if not exp_parts:
+        return ""
+    if not got_parts or got_parts[0] != exp_parts[0]:
+        return f"{pid}:rule_class_mismatch:got={got_parts[0] if got_parts else 'empty'}:expected={exp_parts[0]}"
+    if len(exp_parts) >= 2:
+        if len(got_parts) < 2 or got_parts[1] != exp_parts[1]:
+            return f"{pid}:primary_axis_value_mismatch:got={got_parts[1] if len(got_parts) >= 2 else 'missing'}:expected={exp_parts[1]}"
+    if len(exp_parts) > 2:
+        got_rest = set(got_parts[2:])
+        for clause in exp_parts[2:]:
+            if clause not in got_rest:
+                return f"{pid}:rule_clause_mismatch:missing={clause}:got={err_text}"
     return ""
 
 
@@ -561,7 +589,7 @@ def evaluate_abi_rejections(
     planned_rejections: Sequence[Mapping[str, Any]],
     observed_rejections: Sequence[Mapping[str, Any]] | None,
 ) -> dict[str, Any]:
-    """Fail closed unless every planned illegal ABI shape is rejected with exact rule/axis/shape."""
+    """Fail closed unless every planned illegal ABI shape is rejected with exact rule/axis/value/shape."""
     planned = {
         str(pt.get("point_id") or ""): dict(pt)
         for pt in planned_rejections
@@ -588,15 +616,7 @@ def evaluate_abi_rejections(
         if not rows_for_pid:
             missing.append(pid)
             continue
-        expected_err = str(planned_pt.get("abi_expected_error") or "")
-        parts = expected_err.split(":")
-        exp_prefix = parts[0].strip() if parts and parts[0].strip() else "abi_divisibility_violation"
-        exp_axis_tok = parts[1].strip() if len(parts) > 1 and "=" in parts[1] else ""
-        exp_axis = (
-            exp_axis_tok.split("=", 1)[0].strip()
-            if exp_axis_tok
-            else ("topk" if planned_pt.get("topk") is not None else str(planned_pt.get("axis") or ""))
-        )
+        expected_err = str(planned_pt.get("abi_expected_error") or "").strip()
         pid_accepted = False
         pid_wrong_err = ""
         for row in rows_for_pid:
@@ -604,11 +624,9 @@ def evaluate_abi_rejections(
                 pid_accepted = True
                 break
             err_text = str(row.get("abi_error") or "").strip()
-            if not err_text or not err_text.startswith(exp_prefix):
-                pid_wrong_err = f"{pid}:got={err_text or 'empty'}:expected_prefix={exp_prefix}"
-                continue
-            if exp_axis and f"{exp_axis}=" not in err_text:
-                pid_wrong_err = f"{pid}:axis_error_mismatch:got={err_text}:expected_axis={exp_axis}"
+            err_mismatch = _match_structured_abi_error(err_text, expected_err, pid)
+            if err_mismatch:
+                pid_wrong_err = err_mismatch
                 continue
             shape_err = _check_abi_row_shape(row, planned_pt)
             if shape_err:

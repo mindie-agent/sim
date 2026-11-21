@@ -41,6 +41,7 @@ from mindie_sim.primitives.schema import PrimitiveTable
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import datapath_for_die
 
+from ._capture_truth import reverify_report_captures, verify_capture_and_override_case
 from ._lean_and_receipts import validate_strict_threshold_pct, verify_stage_report
 from ._sku_calibration import materialize_sku_hardware
 from ._whitebox_runner import check_no_service_regimes
@@ -149,12 +150,12 @@ def _evaluate_manifest_path(
             raise ModelingError(f"observation_status_not_ok:{cid}:status={row_status}")
         if row.get("validated") is False or row.get("qualified") is False:
             raise ModelingError(f"observation_unvalidated_or_unqualified:{cid}")
-        clock_op = resolve_authoritative_clock_operator(row, cid)
         raw_copy = dict(row)
         payload = dict(raw_copy.get("payload") or {})
-        payload["clock_operator"] = clock_op
         pid = str(row.get("point_id") or payload.get("point_id") or cid).strip()
         plan_pt = held_plan_by_id.get(pid) or train_plan_by_id.get(pid)
+        clock_op = resolve_authoritative_clock_operator(row, cid, plan_pt=plan_pt)
+        payload["clock_operator"] = clock_op
         if plan_pt is not None:
             payload.setdefault("axis", str(plan_pt.get("axis") or ""))
             payload.setdefault("value", int(plan_pt["value"]))
@@ -170,12 +171,18 @@ def _evaluate_manifest_path(
             )
         validate_event_ids_and_ranks(gc.boundary.event_ids, gc.boundary.device_ranks, cid)
         measured_ns_from_row(row, cid, clock_op=clock_op, parsed_measured_ns=gc.measured_ns)
+        gc, _cap_ok, auth_p99 = verify_capture_and_override_case(
+            gc, row, clock_op=clock_op,
+            capture_root=capture_root, capture_files=capture_files,
+            require_capture_files=require_capture_files,
+            row_p99_ns=extract_measured_p99_ns(row),
+        )
         if gc.split == "heldout":
             if pid in seen_heldout_ids:
                 raise ModelingError(f"duplicate_heldout_point_id:{pid}")
             seen_heldout_ids.add(pid)
             if pid in held_plan_by_id:
-                validate_row_matches_plan_point(row, held_plan_by_id[pid], sku=sku, pid=pid)
+                validate_row_matches_plan_point(row, held_plan_by_id[pid], sku=sku, pid=pid, device_ranks=gc.boundary.device_ranks)
                 plan_by_case[gc.case_id] = held_plan_by_id[pid]
             cap_key = (
                 _norm_digest(gc.boundary.raw_sha256),
@@ -191,14 +198,14 @@ def _evaluate_manifest_path(
                 raise ModelingError(f"duplicate_train_point_id:{pid}")
             seen_train_ids.add(pid)
             if pid in train_plan_by_id:
-                validate_row_matches_plan_point(row, train_plan_by_id[pid], sku=sku, pid=pid)
+                validate_row_matches_plan_point(row, train_plan_by_id[pid], sku=sku, pid=pid, device_ranks=gc.boundary.device_ranks)
                 plan_by_case[gc.case_id] = train_plan_by_id[pid]
         parsed_cases.append(gc)
         expected_clock[gc.case_id] = clock_op
         case_meta[gc.case_id] = {
             "point_id": pid,
             "split": gc.split,
-            "measured_p99_ns": extract_measured_p99_ns(row),
+            "measured_p99_ns": auth_p99,
         }
 
     manifest = Manifest(
@@ -351,6 +358,7 @@ def run_multilevel_verdict(
         return GateCheckOutcome("multilevel_gate", False, "fail", f"validation_report_sku_mismatch:expected={sku}"), []
 
     heldout_rows = [r for r in (validation_doc.get("residuals") or ()) if str(r.get("split") or "heldout") == "heldout"]
+    all_report_rows = [r for r in (validation_doc.get("residuals") or ()) if isinstance(r, Mapping)]
     missing_plan = list(validation_doc.get("missing_plan_points") or ())
     missing_train = list(validation_doc.get("missing_train_points") or ())
     missing_anchors = list(validation_doc.get("missing_anchors") or ())
@@ -358,6 +366,15 @@ def run_multilevel_verdict(
     abi_ok = bool((validation_doc.get("abi_rejection_check") or {}).get("ok", False))
     if not heldout_rows:
         return GateCheckOutcome("multilevel_gate", False, "insufficient_evidence", "validation report contains zero heldout residuals"), []
+    if capture_root is not None or capture_files is not None:
+        reverify_report_captures(
+            all_report_rows,
+            capture_root=capture_root,
+            capture_files=capture_files,
+            require_capture_files=True,
+        )
+    elif require_capture_files and validation_doc.get("capture_files_verified") is not True:
+        return GateCheckOutcome("multilevel_gate", False, "fail", "capture_files_unverified_for_release"), heldout_rows
     for row in heldout_rows:
         rcpt = str(row.get("engine_receipt") or "")
         if not rcpt.startswith(_ENGINE_RECEIPT_PREFIX):

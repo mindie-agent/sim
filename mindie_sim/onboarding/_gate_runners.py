@@ -42,6 +42,7 @@ from .contracts import (
     DEFAULT_GATE_SUBPROCESS_TIMEOUT_S,
     DEFAULT_HELDOUT_APE_THRESHOLD_PCT,
     GateCheckOutcome,
+    sanitize_public_warning,
     subprocess_window_kwargs,
     write_atomic_json,
 )
@@ -345,6 +346,42 @@ def _run_coordinator_lease_cmd(
     return dict(parsed)
 
 
+def validate_host_queue_grant(
+    lease_info: Mapping[str, Any] | None,
+    *,
+    required_devices: int,
+    min_ttl_seconds: int,
+) -> tuple[str, int, list[int], int]:
+    """Validate lease_id, positive fence_token, exact device count, and minimum TTL."""
+    req_npus = int(required_devices)
+    if req_npus < 1:
+        raise ModelingError(f"host_queue_lease_npu_count_invalid:{req_npus}")
+    info = dict(lease_info or {})
+    lease_id = str(info.get("lease_id") or "").strip()
+    fence_raw = info.get("fence_token")
+    if not lease_id or type(fence_raw) is not int or fence_raw <= 0:
+        raise ModelingError("host_queue_lease_missing_lease_id_or_positive_fence_token")
+    raw_devs = info.get("devices")
+    if not isinstance(raw_devs, Sequence) or isinstance(raw_devs, (str, bytes)):
+        raise ModelingError("host_queue_lease_missing_granted_devices")
+    granted_devices: list[int] = []
+    for dev in raw_devs:
+        if type(dev) is not int or dev < 0:
+            raise ModelingError(f"host_queue_lease_device_invalid:{dev!r}")
+        granted_devices.append(dev)
+    if len(set(granted_devices)) != len(granted_devices) or len(granted_devices) != req_npus:
+        raise ModelingError(
+            f"host_queue_lease_device_count_mismatch:expected={req_npus}:granted={granted_devices}"
+        )
+    ttl_raw = info.get("ttl_seconds")
+    min_ttl = max(1, int(min_ttl_seconds))
+    if type(ttl_raw) is not int or ttl_raw < min_ttl:
+        raise ModelingError(
+            f"host_queue_lease_ttl_below_subprocess_plus_grace:ttl={ttl_raw!r}:required={min_ttl}"
+        )
+    return lease_id, fence_raw, granted_devices, ttl_raw
+
+
 @contextmanager
 def acquire_coordinator_host_queue_lease(
     endpoint_alias: str,
@@ -380,51 +417,59 @@ def acquire_coordinator_host_queue_lease(
         timeout_s=int(rpc_timeout_s), coordinator_bin=coordinator_bin,
     )
     outcome = str(acquired.get("outcome") or "").strip().lower()
-    if outcome not in _VALID_LEASE_OUTCOMES:
-        raise ModelingError(f"host_queue_lease_acquire_rejected:outcome={outcome}")
     status = str(acquired.get("status") or "").strip().lower()
-    if status not in _VALID_LEASE_STATUSES:
-        raise ModelingError(f"host_queue_lease_acquire_status_failed:status={status}")
     data = acquired.get("data") if isinstance(acquired.get("data"), Mapping) else acquired
     lease_id = str(data.get("lease_id") or "").strip()
     fence_raw = data.get("fence_token")
-    if not lease_id or type(fence_raw) is not int or fence_raw <= 0:
-        raise ModelingError("host_queue_lease_missing_lease_id_or_positive_fence_token")
-    raw_devs = data.get("devices")
-    if not isinstance(raw_devs, Sequence) or isinstance(raw_devs, (str, bytes)):
-        raise ModelingError("host_queue_lease_missing_granted_devices")
-    granted_devices: list[int] = []
-    for d in raw_devs:
-        if type(d) is not int or d < 0:
-            raise ModelingError(f"host_queue_lease_device_invalid:{d!r}")
-        granted_devices.append(d)
-    if len(set(granted_devices)) != len(granted_devices) or len(granted_devices) != req_npus:
-        raise ModelingError(
-            f"host_queue_lease_device_count_mismatch:expected={req_npus}:granted={granted_devices}"
-        )
+    has_fenced_lease = bool(lease_id and type(fence_raw) is int and fence_raw > 0)
     lease_record: dict[str, Any] = {
         "lease_mode": "coordinator_host_queue",
         "lease_id": lease_id,
-        "fence_token": fence_raw,
-        "devices": granted_devices,
+        "fence_token": fence_raw if type(fence_raw) is int else 0,
+        "devices": [],
         "ttl_seconds": eff_ttl,
         "receipt_unconfirmed": False,
         "receipt_warning": "",
     }
     try:
+        if outcome not in _VALID_LEASE_OUTCOMES:
+            raise ModelingError(f"host_queue_lease_acquire_rejected:outcome={outcome}")
+        if status not in _VALID_LEASE_STATUSES:
+            raise ModelingError(f"host_queue_lease_acquire_status_failed:status={status}")
+        granted_ttl = data.get("ttl_seconds", eff_ttl)
+        _, _, granted_devices, validated_ttl = validate_host_queue_grant(
+            {**dict(data), "lease_id": lease_id, "fence_token": fence_raw, "ttl_seconds": granted_ttl},
+            required_devices=req_npus,
+            min_ttl_seconds=min_required,
+        )
+        lease_record["devices"] = granted_devices
+        lease_record["ttl_seconds"] = validated_ttl
         yield lease_record
     finally:
-        try:
-            _run_coordinator_lease_cmd(
-                action="release", endpoint_alias=alias,
-                payload={"lease_id": lease_id, "fence_token": fence_raw},
-                timeout_s=int(rpc_timeout_s), coordinator_bin=coordinator_bin,
-            )
-        except TimeoutError:
-            raise
-        except (ModelingError, OSError) as exc:
-            lease_record["receipt_unconfirmed"] = True
-            lease_record["receipt_warning"] = f"host_queue_lease_release_unconfirmed:{exc}"
+        if has_fenced_lease:
+            try:
+                rel_resp = _run_coordinator_lease_cmd(
+                    action="release", endpoint_alias=alias,
+                    payload={"lease_id": lease_id, "fence_token": fence_raw},
+                    timeout_s=int(rpc_timeout_s), coordinator_bin=coordinator_bin,
+                )
+                rel_data = rel_resp.get("data") if isinstance(rel_resp.get("data"), Mapping) else {}
+                rel_outcome = str(rel_resp.get("outcome") or "success").strip().lower()
+                rel_status = str(rel_resp.get("status") or "ok").strip().lower()
+                rel_unconf = bool(rel_resp.get("receipt_unconfirmed") or rel_data.get("receipt_unconfirmed"))
+                rel_warn = str(rel_resp.get("receipt_warning") or rel_data.get("receipt_warning") or "").strip()
+                if rel_unconf or rel_warn or rel_outcome not in _VALID_LEASE_OUTCOMES or rel_status not in _VALID_LEASE_STATUSES:
+                    lease_record["receipt_unconfirmed"] = True
+                    lease_record["receipt_warning"] = sanitize_public_warning(
+                        rel_warn or f"host_queue_lease_release_unconfirmed:{rel_status or rel_outcome}"
+                    )
+            except TimeoutError:
+                raise
+            except (ModelingError, OSError) as exc:
+                lease_record["receipt_unconfirmed"] = True
+                lease_record["receipt_warning"] = sanitize_public_warning(
+                    f"host_queue_lease_release_unconfirmed:{exc}"
+                )
 
 
 def resolve_profiler_builder_strict(
@@ -474,4 +519,5 @@ __all__ = [
     "run_tail_cluster_diagnosis",
     "run_template_provenance_gate",
     "run_test_orthogonality_gate",
+    "validate_host_queue_grant",
 ]
