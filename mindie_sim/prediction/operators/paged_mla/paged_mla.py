@@ -43,6 +43,7 @@ _FP32_BYTES = 4
 _PAGE_INDEX_BYTES = 4
 _SPLIT_STATS_BYTES = 2 * _FP32_BYTES
 _SOFTMAX_OPS_PER_SCORE = 8
+_COMPACT_BOUNDARY_CYCLES = 2
 _SOFTMAX_FIRST_OPS_PER_HEAD = 26
 _SOFTMAX_NEXT_OPS_PER_HEAD = 32
 _LATER_UPDATE_OPS_PER_ELEM = 3
@@ -335,8 +336,9 @@ def _producer_program(owner, by_owner, spec, stage, ctx, peer_counts):
                                   index == count, index % 2)
         return KernelProgram((stage('query', begin, owner),
             Stage('tiles', after=('query',), program=compact_periodic_pipeline(
-                ctx, count + 1, _PIPELINE_SLOTS, cycle, head=2, tail=2,
-                peer_counts=peer_counts)),
+                ctx, count + 1, _PIPELINE_SLOTS, cycle, head=_COMPACT_BOUNDARY_CYCLES,
+                tail=_COMPACT_BOUNDARY_CYCLES, peer_counts=peer_counts,
+                peer_tails=(_COMPACT_BOUNDARY_CYCLES,) * len(peer_counts))),
             stage('output', end, owner, after=('tiles',))))
 
     return PipelineProgram(len(local), 1,

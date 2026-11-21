@@ -23,7 +23,6 @@ from typing import Any
 from mindie_sim.schema.case import Case
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import OpSpec
-from mindie_sim.schema.workload import RequestView
 from mindie_sim.stack_registry import (
     LoweringRequest,
     SoftwareStackRegistry,
@@ -67,7 +66,7 @@ from .results import (
     coerce_stream,
     freeze_json,
 )
-from .rewrite import RewritePipeline, RewrittenStep
+from .rewrite import ReplayRecipeBook, RewritePipeline, RewrittenStep
 from .streams import MAIN_STREAM, StreamOwners, StreamPlan, bind_stream_owners
 
 MS_PER_SECOND = 1000.0
@@ -195,52 +194,6 @@ class PredictionSpine:
         first_ma = getattr(case.machine.dies[0], "memory_access", None) if case.machine.dies else None
         return AdmissionMemoryView(die_l2, memory_access=first_ma)
 
-    @staticmethod
-    def _request_frame_for(
-        rewritten: RewrittenStep, op: OpSpec, meta: Mapping[str, Any],
-    ) -> tuple[tuple[RequestView, ...], int, str]:
-        """Extract canonical ``RequestView`` tuple, outer ``padded_tokens``, and layout."""
-        step = getattr(getattr(getattr(rewritten, "base", None), "request", None), "step", None)
-        layout = str(
-            meta.get("sequence_layout")
-            or (getattr(step, "layout", "") if step is not None else "")
-            or getattr(op, "layout", "")
-            or ""
-        )
-        padded_tokens = int(
-            meta.get("padded_tokens")
-            or (getattr(step, "padded_tokens", 0) if step is not None else 0)
-            or 0
-        )
-        raw_views = meta.get("request_views")
-        if raw_views:
-            views = tuple(
-                v if isinstance(v, RequestView) else RequestView(**dict(v))
-                for v in raw_views
-            )
-            return views, padded_tokens, layout
-        if step is not None and getattr(step, "requests", ()):
-            return tuple(step.requests), padded_tokens, layout
-        tg_views = getattr(getattr(rewritten, "target_graphs", None), "request_views", None)
-        if isinstance(tg_views, Mapping) and tg_views:
-            first_views = next(iter(tg_views.values()), ())
-            if first_views:
-                return tuple(first_views), padded_tokens, layout
-        plan = getattr(getattr(getattr(rewritten, "base", None), "request", None), "plan", None)
-        if plan is not None and getattr(plan, "requests", ()):
-            return tuple(plan.requests), padded_tokens, layout
-        if step is not None:
-            seqs = step.sequences
-            if isinstance(seqs, tuple) and seqs:
-                return tuple(
-                    RequestView(
-                        request_id=f"r{idx}", q_len=int(q), context=int(step.context),
-                        samples=False, phase=str(step.phase),
-                    )
-                    for idx, q in enumerate(seqs)
-                ), padded_tokens, layout
-        return (), padded_tokens, layout
-
     def _resolve_governed_operators(
         self,
         case: Case,
@@ -274,7 +227,6 @@ class PredictionSpine:
                 owners = owners_lookup.get(
                     (rank_ops.replica, int(op.stage), op.stream or MAIN_STREAM)
                 )
-                req_views, padded_tokens, layout = self._request_frame_for(rewritten, op, meta)
                 ctx = OperatorPlanningContext(
                     occurrence=OpOccurrence(
                         replica=rank_ops.replica,
@@ -288,9 +240,7 @@ class PredictionSpine:
                     requested_abi=str(req_abi) if req_abi else None,
                     stream_owners=owners,
                     admission_memory_view=admission_view,
-                    requests=req_views,
-                    padded_tokens=padded_tokens,
-                    layout=layout,
+                    **rewritten.sequence_context(rank_ops.replica, op),
                 )
                 resolved.append(self.dispatcher.resolve_plan(op, ctx))
         return tuple(resolved)
@@ -340,13 +290,9 @@ class PredictionSpine:
         graphs = {entry.replica: entry.ops for entry in rewritten.executable}
         if replicas is not None:
             graphs = {r: graphs[r] for r in replicas if r in graphs}
-        inferred_phase = (
-            req.step.phase
-            if req.step is not None
-            else next(
-                (op.phase for ops in graphs.values() for op in ops if op.phase),
-                "decode",
-            )
+        phases = {ops[0].phase for ops in graphs.values() if ops and ops[0].phase}
+        inferred_phase = req.step.phase if req.step is not None else (
+            phases.pop() if len(phases) == 1 else "mixed" if phases else "decode"
         )
         exec_meta: dict[str, Any] = {
             "phase": inferred_phase,
@@ -412,9 +358,10 @@ class PredictionSpine:
     ) -> StepEvaluation:
         """Execute ``step`` once on ``runtime.Engine`` using a single ``EvaluationContext``."""
         case = step.case
-        book = RecipeBook.from_mapping(
+        book = ReplayRecipeBook.from_mapping(
             case.runtime.kernels, family_registry=self.families
         )
+        book.graph = step.graph
         evaluation = EvaluationContext.create(
             case, book, primitives, primitive_table=primitive_table
         )
@@ -430,10 +377,6 @@ class PredictionSpine:
 
         token = ACTIVE_DEADLINE_MONO.set(replay.deadline_mono)
         try:
-            tg = step.graph.target_graphs
-            req_views = getattr(tg, "request_views", None)
-            if req_views is None and step_req.requests:
-                req_views = step_req.requests
             report = graph_costs(
                 case,
                 graphs,
@@ -445,9 +388,9 @@ class PredictionSpine:
                 trace_limit=replay.event_limit,
                 evaluation=evaluation,
                 stream_plans=step.graph.streams or None,
-                request_views=req_views,
-                padded_tokens=step_req.padded_tokens or int(getattr(tg, "padded_tokens", 0) or 0),
-                sequence_layout=step_req.layout or str(getattr(tg, "sequence_layout", "") or ""),
+                request_views=step.graph.request_views,
+                padded_tokens=step_req.padded_tokens,
+                sequence_layout=step_req.layout,
             )
         finally:
             ACTIVE_DEADLINE_MONO.reset(token)

@@ -2,7 +2,7 @@
 
 [Role] Resolve optional local capture files from capture URIs or source
   references and verify streaming SHA-256 digests, device ranks, clock
-  domains/operators, and boundary event identifiers across JSON and JSONL.
+  domains/operators, and boundary event identifiers across JSON, JSONL, and native profiler CSV.
 [Invariants] Fails closed with ``ModelingError`` on unsafe capture URI paths,
   digest mismatches, rank mismatches, or clock/event mismatches on either
   header metadata or matched event rows; never loads whole large files.
@@ -12,7 +12,10 @@
 """
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+import csv
+from decimal import Decimal, InvalidOperation
+import gzip
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -21,10 +24,15 @@ from mindie_sim.schema.common import ModelingError
 CAPTURE_URI_SCHEME = "capture://"
 _JSON_SUFFIXES = frozenset({".json", ".jsonl", ".ndjson"})
 _JSONL_SUFFIXES = frozenset({".jsonl", ".ndjson"})
+_CAPTURE_EVENT_KEYS = frozenset({"events", "event_ids", "traceEvents"})
+_CAPTURE_CONTAINERS = frozenset({"boundary", "metadata", "payload"})
+_NS_PER_US = 1000
+_NS_PER_MS = 1000 * _NS_PER_US
+_CSV_TIME_SCALE = {"ns": 1, "us": _NS_PER_US, "ms": _NS_PER_MS}
+_CAPTURE_ROUNDING_NS = 1
 _CAPTURE_META_KEYS = frozenset({
     "device_ranks", "ranks", "profiled_ranks", "device_rank", "rank",
-    "clock_domain", "clock_operator", "start_event", "end_event", "event_ids", "events",
-    "boundary", "metadata",
+    "clock_domain", "clock_operator", "start_event", "end_event",
 })
 
 
@@ -104,11 +112,70 @@ def _row_event_and_clock_info(
     return ev_names, row_clocks, item_clocks, has_boundary
 
 
-def _append_unique_clock(bucket: list[Any], value: Any) -> None:
-    for existing in bucket:
-        if type(existing) is type(value) and existing == value:
-            return
-    bucket.append(value)
+def _iter_capture_rows(
+    events: Iterator[tuple[str, Any]], first: tuple[str, Any], *,
+    read_value: Callable[..., Any], skip_value: Callable[..., Any],
+) -> Iterator[Mapping[str, Any]]:
+    """Yield individual trace rows and compact headers from the streaming parser."""
+    if first[0] == "start_array":
+        while (item := next(events))[0] != "end_array":
+            row = read_value(events, item)
+            if isinstance(row, Mapping):
+                yield row
+            elif isinstance(row, str):
+                yield {"event_id": row}
+        return
+    if first[0] != "start_map":
+        raise ModelingError("capture_json_requires_object_or_array")
+    header = {}
+    while (entry := next(events))[0] != "end_map":
+        key, item = str(entry[1]), next(events)
+        if key in _CAPTURE_META_KEYS or key in {"event_id", "id", "name"}:
+            header[key] = read_value(events, item)
+        elif key in _CAPTURE_EVENT_KEYS and item[0] == "start_array":
+            yield from _iter_capture_rows(events, item, read_value=read_value, skip_value=skip_value)
+        elif key in _CAPTURE_CONTAINERS and item[0] == "start_map":
+            yield from _iter_capture_rows(events, item, read_value=read_value, skip_value=skip_value)
+        else:
+            skip_value(events, item)
+    if header:
+        yield header
+
+
+def _capture_metadata(
+    rows: Iterator[Mapping[str, Any]], target_events: frozenset[str] | None,
+    expected_clock_operator: str | None,
+) -> dict[str, Any]:
+    meta: dict[str, Any] = {}
+    found: set[str] = set()
+    rank_columns: set[int] = set()
+    for row in rows:
+        ev_names, row_clocks, item_clocks, has_boundary = _row_event_and_clock_info(row)
+        matched = ev_names if target_events is None else ev_names & target_events
+        is_header = has_boundary or not any(key in row for key in ("event_id", "id", "name"))
+        if not (is_header or matched):
+            continue
+        found.update(matched)
+        if expected_clock_operator is not None and any(
+            clock != expected_clock_operator
+            for clock in (*row_clocks, *(clock for ev in matched for clock in item_clocks.get(ev, ())))
+        ):
+            meta["_clock_mismatch"] = True
+        if is_header:
+            for key in _CAPTURE_META_KEYS & row.keys():
+                if key in meta and meta[key] != row[key] and key != "clock_operator":
+                    kind = {"start_event": "event", "end_event": "event", "clock_domain": "clock_domain"}.get(key, "rank")
+                    raise ModelingError(f"capture_{kind}_mismatch:header_conflict:{key}")
+                meta.setdefault(key, row[key])
+            for key in ("boundary", "metadata"):
+                if key in row:
+                    meta.setdefault(key, row[key])
+        elif (ranks := _capture_ranks(row)) is not None:
+            rank_columns.update(ranks)
+    if rank_columns and _capture_ranks(meta) is None:
+        meta["device_ranks"] = sorted(rank_columns)
+    meta["event_ids"] = sorted(found)
+    return meta
 
 
 def _extract_capture_meta(
@@ -121,80 +188,11 @@ def _extract_capture_meta(
     expected_clock_operator: str | None = None,
 ) -> dict[str, Any]:
     if path.suffix.lower() in _JSONL_SUFFIXES:
-        merged: dict[str, Any] = {}
-        events_found: set[str] = set()
-        event_clocks: dict[str, list[Any]] = {}
-        boundary_clocks: list[Any] = []
-        clock_mismatch = False
-        meta_keys = _CAPTURE_META_KEYS - {"events", "event_ids"}
-        for row in stream_jsonl_fn(path):
-            for key in meta_keys:
-                if key in row and key not in merged:
-                    merged[key] = row[key]
-            row_events, row_clocks, item_clocks, has_boundary = _row_event_and_clock_info(row)
-            if target_events is not None:
-                matched_row = row_events & target_events
-                if matched_row:
-                    events_found |= matched_row
-                if expected_clock_operator is not None:
-                    if row_clocks and (has_boundary or not row_events or matched_row):
-                        if any(clk != expected_clock_operator for clk in row_clocks):
-                            clock_mismatch = True
-                            break
-                    for ev, clocks in item_clocks.items():
-                        if ev in target_events and any(clk != expected_clock_operator for clk in clocks):
-                            clock_mismatch = True
-                            break
-                    if clock_mismatch:
-                        break
-                    continue
-                if row_clocks:
-                    for ev in matched_row:
-                        bucket = event_clocks.setdefault(ev, [])
-                        for clk in row_clocks:
-                            _append_unique_clock(bucket, clk)
-                    if has_boundary or not row_events:
-                        for clk in row_clocks:
-                            _append_unique_clock(boundary_clocks, clk)
-                for ev, clocks in item_clocks.items():
-                    if ev in target_events:
-                        bucket = event_clocks.setdefault(ev, [])
-                        for clk in clocks:
-                            _append_unique_clock(bucket, clk)
-            else:
-                events_found |= row_events
-                if row_clocks:
-                    for ev in row_events:
-                        bucket = event_clocks.setdefault(ev, [])
-                        for clk in row_clocks:
-                            _append_unique_clock(bucket, clk)
-                    if has_boundary or not row_events:
-                        for clk in row_clocks:
-                            _append_unique_clock(boundary_clocks, clk)
-                for ev, clocks in item_clocks.items():
-                    bucket = event_clocks.setdefault(ev, [])
-                    for clk in clocks:
-                        _append_unique_clock(bucket, clk)
-        if events_found:
-            merged["event_ids"] = sorted(events_found)
-        if event_clocks:
-            merged["_event_clocks"] = event_clocks
-        if boundary_clocks:
-            merged["_boundary_clocks"] = boundary_clocks
-        if clock_mismatch:
-            merged["_clock_mismatch"] = True
-        return merged
-    meta: dict[str, Any] = {}
+        return _capture_metadata(stream_jsonl_fn(path), target_events, expected_clock_operator)
     with path.open("rb") as handle:
         events = iter_json_events_fn(handle, ijson_mod=ijson_mod)
-        if next(events)[0] != "start_map":
-            return meta
-        while (entry := next(events))[0] != "end_map":
-            key = str(entry[1])
-            meta[key] = read_value_fn(events) if key in _CAPTURE_META_KEYS else skip_value_fn(events)
-            if key not in _CAPTURE_META_KEYS:
-                meta.pop(key, None)
-    return meta
+        rows = _iter_capture_rows(events, next(events), read_value=read_value_fn, skip_value=skip_value_fn)
+        return _capture_metadata(rows, target_events, expected_clock_operator)
 
 
 def _capture_ranks(meta: Mapping[str, Any]) -> set[int] | None:
@@ -213,13 +211,139 @@ def _capture_ranks(meta: Mapping[str, Any]) -> set[int] | None:
     return None
 
 
+def _csv_time_field(fields: Mapping[str, str], kinds: tuple[str, ...]) -> tuple[str, int] | None:
+    for kind in kinds:
+        for unit, scale in _CSV_TIME_SCALE.items():
+            for label in (f"{kind}({unit})", f"{kind}{unit}"):
+                if label in fields:
+                    return fields[label], scale
+    return None
+
+
+def _csv_time_ns(row: Mapping[str, str], field: tuple[str, int]) -> Decimal:
+    column, scale = field
+    value = Decimal(row[column].strip()) * scale
+    if not value.is_finite():
+        raise ValueError("non_finite_csv_time")
+    return value
+
+
+def _csv_capture_rows(
+    path: Path, case_id: str, ranks: set[int], target_events: frozenset[str],
+) -> Iterator[tuple[int, frozenset[str], Decimal | None, Decimal]]:
+    open_csv = gzip.open if path.suffix.lower() == ".gz" else Path.open
+    with open_csv(path, "rt", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle, strict=True)
+        fields = {"".join(c for c in label.lower() if c.isalnum() or c in "()"): label
+                  for label in reader.fieldnames or ()}
+        rank_col = next((fields[key] for key in ("rankid", "rank", "devicerank", "deviceid", "device")
+                         if key in fields), None)
+        event_cols = [fields[key] for key in ("eventid", "event", "eventname", "name", "opname", "kernelname", "taskid", "optype", "id")
+                      if key in fields]
+        start_col = _csv_time_field(fields, ("starttime", "taskstarttime", "timestamp", "start"))
+        end_col = _csv_time_field(fields, ("endtime", "taskendtime", "end"))
+        duration_col = _csv_time_field(fields, ("duration", "durationtime", "taskduration"))
+        total_col = _csv_time_field(fields, ("totaltime",))
+        if not rank_col:
+            raise ModelingError(f"capture_rank_mismatch:{case_id}:rank_column_absent")
+        if not event_cols or not (
+            start_col and (duration_col or end_col) or total_col and "count" in fields
+        ):
+            raise ModelingError(f"capture_csv_schema_unsupported:{case_id}")
+        seen_ranks = set()
+        for record, row in enumerate(reader, start=1):
+            rank = int(row[rank_col].strip())
+            if rank not in ranks:
+                continue
+            seen_ranks.add(rank)
+            row_id = f"row={record}"
+            names = target_events.intersection(row[col].strip() for col in event_cols)
+            if row_id in target_events:
+                names = names | {row_id}
+            if not names:
+                continue
+            if not start_col:
+                if int(row[fields["count"]]) != 1 or total_col is None:
+                    raise ModelingError(f"capture_csv_aggregate_event:{case_id}")
+                yield rank, names, None, _csv_time_ns(row, total_col)
+                continue
+            start = _csv_time_ns(row, start_col)
+            end = _csv_time_ns(row, end_col) if end_col else start + _csv_time_ns(row, duration_col)
+            if duration_col and abs(end - start - _csv_time_ns(row, duration_col)) > _CAPTURE_ROUNDING_NS:
+                raise ModelingError(f"capture_csv_interval_inconsistent:{case_id}")
+            yield rank, names, start, end
+        if ranks - seen_ranks:
+            raise ModelingError(f"capture_rank_mismatch:{case_id}:missing={sorted(ranks - seen_ranks)}")
+
+
+def _csv_capture_duration(
+    case_id: str, boundary: Any, path: Path, target_events: frozenset[str],
+) -> int:
+    start_name, end_name = boundary.start_event.strip(), boundary.end_event.strip()
+    ranks = set(boundary.device_ranks)
+    if not ranks:
+        raise ModelingError(f"capture_rank_mismatch:{case_id}:requested_ranks_absent")
+    timed = {rank: [] for rank in ranks}
+    untimed = []
+    found: dict[int, set[str]] = {rank: set() for rank in ranks}
+    endpoint_counts: set[tuple[int, str]] = set()
+    for rank, names, start, end in _csv_capture_rows(path, case_id, ranks, target_events):
+        if start is None:
+            untimed.append(end)
+        else:
+            timed[rank].append((names, start, end))
+        if end <= (start if start is not None else 0):
+            raise ModelingError(f"capture_csv_nonpositive_duration:{case_id}")
+        found[rank].update(names)
+        for name in names & {start_name, end_name}:
+            key = (rank, name)
+            if key in endpoint_counts:
+                raise ModelingError(f"capture_csv_ambiguous_endpoint:{case_id}:{name}")
+            endpoint_counts.add(key)
+    for rank, names in found.items():
+        if missing := target_events - names:
+            raise ModelingError(f"capture_event_mismatch:{case_id}:rank={rank}:missing={','.join(sorted(missing))}")
+    if untimed:
+        if len(untimed) != 1 or len(target_events) != 1 or any(timed.values()):
+            raise ModelingError(f"capture_csv_timestamps_absent:{case_id}")
+        return round(untimed[0])
+
+    return round(max(_csv_rank_duration(case_id, boundary.clock_operator, start_name, end_name, rows)
+                     for rows in timed.values()))
+
+
+def _csv_rank_duration(
+    case_id: str, clock_operator: str, start_name: str, end_name: str,
+    rows: list[tuple[frozenset[str], Decimal, Decimal]],
+) -> Decimal:
+    left = next(start for names, start, _ in rows if start_name in names)
+    right = next(end for names, _, end in rows if end_name in names)
+    if any(start < left or end > right for _, start, end in rows) or right <= left:
+        raise ModelingError(f"capture_csv_event_outside_boundary:{case_id}")
+    if clock_operator == "elapsed_span":
+        return right - left
+    if clock_operator != "busy_union":
+        raise ModelingError(f"capture_csv_clock_unsupported:{case_id}")
+    busy, cursor = Decimal(0), left
+    for start, end in sorted((start, end) for _, start, end in rows):
+        busy += max(0, end - max(start, cursor))
+        cursor = max(cursor, end)
+    return busy
+
+
 def verify_capture_file_consistency(
     case_id: str, boundary: Any, path: Path, *, ijson_mod: Any = None,
     digest_fn: Callable[[Path], str],
     stream_chunk_bytes: int,
     extract_meta_fn: Callable[..., dict[str, Any]],
+    measured_ns: int | None = None,
 ) -> None:
-    """Fail closed when an on-disk capture file mismatches digest, rank, clock, or events."""
+    """Verify the linked raw capture before scoring the declared observation.
+
+    CSV timing is compared at nanosecond precision. A row=N event selects
+    the Nth data record when native task names or IDs repeat. For multiple
+    ranks, the longest verified local window represents the capture duration.
+    """
     try:
         actual_sha = digest_fn(path)
     except TimeoutError:
@@ -229,15 +353,21 @@ def verify_capture_file_consistency(
     expected_sha = str(boundary.raw_sha256).strip().lower()
     if actual_sha != expected_sha:
         raise ModelingError(f"capture_digest_mismatch:{case_id}:expected={expected_sha}:actual={actual_sha}")
-    is_json_file = path.suffix.lower() in _JSON_SUFFIXES
-    if not is_json_file:
-        with path.open("rb") as handle:
-            is_json_file = handle.read(stream_chunk_bytes).lstrip().startswith((b"{", b"["))
-    if not is_json_file:
-        return
     start_name, end_name = str(boundary.start_event).strip(), str(boundary.end_event).strip()
     target_events = frozenset({start_name, end_name, *(ev.strip() for ev in boundary.event_ids if ev.strip())})
+    read_errors = (OSError, EOFError, StopIteration, ValueError, InvalidOperation, csv.Error, AttributeError, KeyError)
+    if json_error := getattr(ijson_mod, "JSONError", None):
+        read_errors += (json_error,)
     try:
+        if path.name.lower().endswith((".csv", ".csv.gz")):
+            duration = _csv_capture_duration(case_id, boundary, path, target_events)
+            if measured_ns is None or abs(duration - measured_ns) > _CAPTURE_ROUNDING_NS:
+                raise ModelingError(f"capture_duration_mismatch:{case_id}:declared={measured_ns}:actual={duration}")
+            return
+        if path.suffix.lower() not in _JSON_SUFFIXES:
+            with path.open("rb") as handle:
+                if not handle.read(stream_chunk_bytes).lstrip().startswith((b"{", b"[")):
+                    raise ModelingError(f"capture_format_unsupported:{case_id}")
         meta = extract_meta_fn(
             path, ijson_mod=ijson_mod,
             target_events=target_events,
@@ -245,9 +375,9 @@ def verify_capture_file_consistency(
         )
     except TimeoutError:
         raise
-    except ModelingError as exc:
-        raise ModelingError(f"capture_file_unreadable:{case_id}:{exc.reason}") from exc
-    except (OSError, StopIteration) as exc:
+    except ModelingError:
+        raise
+    except read_errors as exc:
         raise ModelingError(f"capture_file_unreadable:{case_id}") from exc
     if meta.get("_clock_mismatch"):
         raise ModelingError(f"capture_clock_operator_mismatch:{case_id}:expected={boundary.clock_operator}")
@@ -255,10 +385,6 @@ def verify_capture_file_consistency(
     if cap_ranks is not None and cap_ranks != set(boundary.device_ranks):
         raise ModelingError(f"capture_rank_mismatch:{case_id}:expected={sorted(boundary.device_ranks)}:actual={sorted(cap_ranks)}")
     cap_events, matched_start, matched_end = set(), False, False
-    ev_clocks = meta.get("_event_clocks") or {}
-    for clk in (*meta.get("_boundary_clocks", ()), *(c for ev in target_events for c in ev_clocks.get(ev, ()))):
-        if clk != boundary.clock_operator:
-            raise ModelingError(f"capture_clock_operator_mismatch:{case_id}:expected={boundary.clock_operator}")
     for container in (meta, meta.get("boundary"), meta.get("metadata")):
         if not isinstance(container, Mapping):
             continue

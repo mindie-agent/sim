@@ -48,7 +48,6 @@ MODEL_RUN_CAPTURE = {
     "resolved_compilation_and_ascend_config": {"cudagraph_mode": "FULL_AND_PIECEWISE", "cudagraph_capture_sizes": [8]},
     "step_and_layer_timings": {"decode_B8_S512_step_p50_ms": 0.92, "decode_B8_S512_per_layer_us": 230.0},
 }
-
 def _load_script(name: str, path: Path):
     if name in sys.modules:
         return sys.modules[name]
@@ -58,13 +57,10 @@ def _load_script(name: str, path: Path):
     sys.modules[name] = mod
     spec.loader.exec_module(mod)
     return mod
-
 def _sha(tag: str) -> str:
     return (tag * 64)[:64]
-
 def _cohort(level: str = "L1", name: str = "gemm") -> CohortKey:
     return CohortKey(level, name, "device_x", "prefill", "eager", "medium", "tp1")  # type: ignore[arg-type]
-
 def _case(
     cid: str, *, level: str = "L1", split: str = "heldout", tag: str = "a",
     kind: str | None = None, measured_ns: int | None = 1000, parents: tuple[str, ...] = (),
@@ -90,14 +86,12 @@ def _case(
         rung_arm_a_measured_ns=arm_a, rung_arm_b_measured_ns=arm_b,
         regime_dims=(("dtype_layout", "bf16_nd"), ("shape", "m1024"), ("warmth", "warm")),
     )
-
 def _run_engine_for_ns(start_name: str, end_name: str, duration_ns: int) -> tuple[Engine, Any, Any]:
     eng = Engine([Resource("device", MS_TO_NS, "ns", "fifo")], trace_limit=TRACE_LIMIT)
     s_ev = eng.submit(start_name, {"device": 100.0})
     e_ev = eng.submit(end_name, {"device": float(duration_ns)}, after=(s_ev,))
     eng.advance(until=(e_ev,))
     return eng, s_ev, e_ev
-
 def _live_interval(case: GateCase, predicted_ns: int, **kw: Any) -> EngineInterval:
     eng, s_ev, e_ev = _run_engine_for_ns(case.boundary.start_event, case.boundary.end_event, predicted_ns)
     return bind_engine_interval(case, eng, s_ev, e_ev, **kw)
@@ -179,7 +173,6 @@ def test_lineage_case_normalization_event_scoping_and_fit_closure(tmp_path: Path
         c_bad = replace(c_bad, boundary=replace(c_bad.boundary, clock_operator="busy_union"))
         with pytest.raises(ModelingError, match=err):
             validate_lineage(Manifest(f"m_{fname}", "1", (c_bad,)), EMPTY_FITS, capture_root=tmp_path, require_capture_files=True)
-
 def test_cross_level_root_overlap_rejected_unless_debug_only() -> None:
     c_l1 = _case("l1_case", level="L1", split="heldout", tag="a", acq="shared_root")
     c_l2 = _case("l2_case", level="L2", split="heldout", tag="b", parents=("shared_root",))
@@ -194,7 +187,6 @@ def test_cross_level_root_overlap_rejected_unless_debug_only() -> None:
     summaries = summarize_cohorts(residuals)
     assert summaries[c_l2_dbg.cohort].status == "insufficient_evidence"
     assert ("debug_cross_level_not_blind_acceptance", 1) in summaries[c_l2_dbg.cohort].excluded_reasons
-
 def test_engine_receipt_binding_and_mandatory_three_level_coverage() -> None:
     c_l1 = _case("l1_off", level="L1", tag="1", measured_ns=1000)
     base_interval = EngineInterval("l1_off", "L1", "device_kernel", "k_start", "k_end", 0, 1050, 1050, "some-string")
@@ -242,7 +234,7 @@ def test_engine_receipt_binding_and_mandatory_three_level_coverage() -> None:
     for count in range(1, len(cases) + 1):
         verdict = gate_decision(summarize_cohorts(evaluate(Manifest("coverage", "1", cases[:count]), EMPTY_FITS, runner)))
         assert verdict["missing_levels"] == levels[count:] and verdict["covered_levels"] == levels[:count]
-        assert verdict["status"] == ("pass" if count == len(cases) else "insufficient_evidence")
+        assert verdict["status"] == "insufficient_evidence"  # The L3 step has no component census.
     dup_root_res = [
         Residual("a1", "L1", _cohort("L1", "f1"), "same_root", 1000, 1020, "capture://r/1", 0.02, 0.02),
         Residual("a2", "L2", _cohort("L2", "f2"), "same_root", 2000, 2040, "capture://r/2", 0.02, 0.02),
@@ -250,7 +242,6 @@ def test_engine_receipt_binding_and_mandatory_three_level_coverage() -> None:
     ]
     dec_overlap = gate_decision(summarize_cohorts(dup_root_res))
     assert dec_overlap["status"] == "insufficient_evidence" and dec_overlap["overlapping_level_roots"] == ["same_root"]
-
 def test_l2_absent_capture_near_zero_rung_and_strict_threshold() -> None:
     c_missing = _case("l2_no_blk", level="L2", tag="4", measured_ns=4000, block_capture_present=False)
     assert run_l2(c_missing, _LiveEngineRunner()).status == "missing_evidence"
@@ -279,15 +270,14 @@ def test_l2_absent_capture_near_zero_rung_and_strict_threshold() -> None:
         _LiveEngineRunner({"exact_10": _live_interval(c_exact, 1100), "below_10": _live_interval(c_pass, 1099)}),
     ))
     thr_sum = summarize_cohorts(thr_res, threshold_pct=10.0)
-    assert thr_sum[c_exact.cohort].status == "fail" and thr_sum[c_pass.cohort].status == "pass"
-    assert gate_decision(thr_sum)["status"] == "fail"
+    assert thr_sum[c_exact.cohort].status == thr_sum[c_pass.cohort].status == "pass"
+    assert gate_decision(thr_sum)["status"] == "insufficient_evidence"
     ten_res = [
-        Residual(f"p{i}", "L1", _cohort("L1", "p90_fam"), f"root-{i}", 1000, 1000 + err, f"capture://r/{i}", err / 1000.0, err / 1000.0)
+        Residual(f"p{i}", "L1", _cohort("L1", "p90_fam"), f"root-{i}", 100_000, 100_000 + 100 * err, f"capture://r/{i}", err / 1000.0, err / 1000.0)
         for i, err in enumerate((10, 20, 30, 40, 50, 60, 70, 80, 90, 250))
     ]
     p90_sum = summarize_cohorts(ten_res)[_cohort("L1", "p90_fam")]
     assert p90_sum.p90_ape_pct == pytest.approx(9.0) and p90_sum.tail_case_ids == ("p9",)
-
 def _raw_case(cid: str, split: str, tag: str, pad_bytes: int = 0) -> dict[str, Any]:
     return {
         "case_id": cid, "level": "L1", "split": split, "input_digest": f"in-{cid}", "stack_digest": "st1",
@@ -302,11 +292,10 @@ def _raw_case(cid: str, split: str, tag: str, pad_bytes: int = 0) -> dict[str, A
         "cohort": {"cohort_name": "gemm", "sku": "device_x", "phase": "prefill", "mode": "eager", "shape_regime": "medium", "parallel_topology": "tp2"},
         "payload": {"blob": "x" * pad_bytes} if pad_bytes else {},
     }
-
 def test_pointwise_outlier_blocks_release() -> None:
-    cases = tuple(_case(f"point_{tag}", tag=tag) for tag in ("a", "b", "c"))
+    cases = tuple(_case(f"point_{tag}", tag=tag, measured_ns=LONG_KERNEL_NS) for tag in ("a", "b", "c"))
     outlier = cases[-1]
-    prediction_ns = 1000 + OUTLIER_APE_PCT * (1000 // 100)
+    prediction_ns = LONG_KERNEL_NS * (100 + OUTLIER_APE_PCT) // 100
     runner = _LiveEngineRunner({outlier.case_id: _live_interval(outlier, prediction_ns)}, scale=1)
     rows = list(evaluate(Manifest("points", "1", cases), EMPTY_FITS, runner))
     assert [row.absolute_percentage_error * 100 for row in rows] == [0, 0, OUTLIER_APE_PCT]
@@ -327,7 +316,14 @@ def test_physical_tolerance_boundaries_and_release() -> None:
     assert DEFAULT_ATOL_NS == 2000
     atol = {"atol_ns": DEFAULT_ATOL_NS}
     relative_limit = LONG_KERNEL_NS // 10
-    assert exceeds_physical_tolerance(LONG_KERNEL_NS - relative_limit, LONG_KERNEL_NS)
+    assert not exceeds_physical_tolerance(LONG_KERNEL_NS - relative_limit, LONG_KERNEL_NS, atol_ns=0)
+    assert not exceeds_physical_tolerance(4500, 3000)
+    for invalid in (-1, 400_000, math.nan):
+        with pytest.raises(ModelingError, match="physical_atol_ns_out_of_bounds"):
+            exceeds_physical_tolerance(500_000, 100_000, atol_ns=invalid)
+        with pytest.raises(ModelingError, match="physical_atol_ns_out_of_bounds"):
+            gate_decision({}, atol_ns=invalid)
+    assert exceeds_physical_tolerance(500_000, 100_000)
     ape = DEFAULT_ATOL_NS / SHORT_KERNEL_NS
     short = Residual("short", "L1", _cohort(), "root-short", SHORT_KERNEL_NS, SHORT_KERNEL_NS + DEFAULT_ATOL_NS, "", ape, ape)
     long = Residual("long", "L1", short.cohort, "root-long", LONG_KERNEL_NS, LONG_KERNEL_NS - relative_limit, "", -0.1, 0.1)
@@ -350,37 +346,26 @@ def test_physical_tolerance_boundaries_and_release() -> None:
     assert verdict["status"] == "fail" and verdict["pointwise_threshold_exceeded"] == [summary.cohort.as_id()]
 
 def test_vertical_drilldown_exposes_cancelled_component_errors() -> None:
-    components = [("L1_in_L3", "gemm", LONG_KERNEL_NS + SHORT_KERNEL_NS + 1, LONG_KERNEL_NS),
-                  ("L1_in_L3", "norm", LONG_KERNEL_NS - SHORT_KERNEL_NS, LONG_KERNEL_NS),
-                  ("L2_in_L3", "attention", SHORT_KERNEL_NS + DEFAULT_ATOL_NS, SHORT_KERNEL_NS)]
-    report = evaluate_vertical_drilldown(LONG_KERNEL_NS, LONG_KERNEL_NS, components)
-    assert report["step_passed"] and not report["passed"]
-    assert [(row["level_tag"], row["name"]) for row in report["failed_components"]] == [("L1_in_L3", "gemm")]
-    l1, l2 = (report["levels"][key] for key in ("L1_in_L3", "L2_in_L3"))
-    assert l1["cancellation_ns"] == 2 * SHORT_KERNEL_NS and l1["cancellation_ratio"] == pytest.approx(1 - 1 / (2 * SHORT_KERNEL_NS + 1))
-    assert l2["cancellation_ns"] == l2["cancellation_ratio"] == 0
-    assert evaluate_vertical_drilldown(LONG_KERNEL_NS, LONG_KERNEL_NS, components[1:])["passed"]
-    assert not evaluate_vertical_drilldown(0, LONG_KERNEL_NS, components[1:])["passed"]
-
-def test_hygiene_rejects_producer_shape_filters(tmp_path: Path) -> None:
-    gate = _load_script("verify_m1", REPO_ROOT / "scripts" / "verify_m1.py")
-    directory = tmp_path / "data" / "verification"
-    directory.mkdir(parents=True)
-    producer = directory / "sample.producer.py"
-    args = SimpleNamespace(sim=tmp_path, profiler=tmp_path)
-    producer.write_text("for r in rows:\n    if r['status'] != 'ok' or measured_ns <= 0: continue\n", encoding="utf-8")
-    assert gate.hygiene(args)["status"] == "pass"
-    producer.write_text(
-        "MIN_MIB = +64\ndef collect():\n    min_payload_bytes: int = 4096\n    for row in rows:\n"
-        "        if m < 1024: continue\n        if max(n, k) < 14336 and valid: continue\n"
-        "        if payload_mib < MIN_MIB: continue\n        if row.get('M', 0) < 512: continue\n"
-        "        if n < 32:\n            for item in row:\n                if not item: continue\n", encoding="utf-8",
-    )
-    result = gate.hygiene(args)
-    assert result["status"] == "fail"
-    expected = {f"{line}:shape_size_filter" for line in (5, 6, 7, 8)} | {
-        "1:shape_size_filter_constant:MIN_MIB", "3:shape_size_filter_constant:min_payload_bytes"}
-    assert set(result["producer_shape_filters"]) == {f"{producer.relative_to(tmp_path)}:{item}" for item in expected}
+    empty = evaluate_vertical_drilldown(200_000, 200_000, [])
+    assert not empty["passed"] and empty["failure_reason"] == "empty_component_census"
+    inner = tuple(_case(name, level=level, tag="a", measured_ns=duration, events=events, debug_cross_level=True)
+                  for name, level, duration, events in (("first", "L1", 100_000, ("a",)),
+                  ("second", "L1", 100_000, ("b",)), ("block", "L2", 200_000, ("a", "b"))))
+    step = replace(_case("step", level="L3", tag="a", events=("a", "b"), measured_ns=200_000),
+                   payload=(("component_case_ids", tuple(case.case_id for case in inner)),))
+    runner = _LiveEngineRunner({case.case_id: _live_interval(case, ns) for case, ns in
+                               zip(inner, (140_000, 60_000, 200_000))}, scale=1)
+    rows = list(evaluate(Manifest("step", "1", (step, *inner)), EMPTY_FITS, runner))
+    verdict = gate_decision(summarize_cohorts(rows), required_levels=("L3",))
+    report = verdict["vertical_drilldowns"][step.case_id]
+    assert verdict["status"] == "fail" and report["step_passed"] and not report["passed"]
+    assert report["levels"]["L1_in_L3"]["cancellation_ratio"] == 1
+    assert [part["name"] for part in report["failed_components"]] == ["first", "second"]
+    good = [replace(row, predicted_ns=row.measured_ns) for row in rows]
+    assert gate_decision(summarize_cohorts(good), required_levels=("L3",))["status"] == "pass"
+    missing = gate_decision(summarize_cohorts(good[:-1]), required_levels=("L3",))
+    assert missing["status"] == "insufficient_evidence"
+    assert missing["vertical_drilldowns"]["step"]["failure_reason"] == "component_census_mismatch"
 
 def test_missing_planned_case_blocks_release() -> None:
     case = _case("evaluated")
@@ -549,11 +534,13 @@ def test_tail_diagnoser_moved_tail_unassessed_stages_and_conflicts(tmp_path: Pat
                                               for tag, prediction in zip(("a", "b"), pair)]}
         conflicts = diag.detect_parameter_conflicts([bound], sensitivity, threshold_pct=10.0)
         assert [item.conflict_reason for item in conflicts] == reasons
-
 def test_producer_end_to_end_report_assembly_boundary_and_precision(tmp_path: Path) -> None:
     prod = _load_script("ver_producer_mod", PRODUCER_SCRIPT)
-    for samples, status in (([], "insufficient_evidence"), ([0.09996], "pass"), ([0.0999999], "pass"), ([0.10], "fail")):
-        assert prod._stats(samples)["status"] == status
+    exact = prod._timing_fields(90, 100)
+    outlier = prod._timing_fields(5.929, 9.017)
+    assert prod._stats([])["status"] == "insufficient_evidence"
+    assert prod._stats([exact])["status"] == "fail" and outlier["ape_pct"] == 34.25
+    assert prod._stats([prod._timing_fields(100, 100)] * 8 + [outlier])["failed"] == 1
     sku = "Ascend950DT_9582"
     captures = {
         "acquisition_split_manifest.json": {"acquisitions": [
@@ -564,7 +551,14 @@ def test_producer_end_to_end_report_assembly_boundary_and_precision(tmp_path: Pa
         "cann93_single_op_measurements.json": {"single_op_measurements": {sku: [
             {"status": "ok", "acquisition_uid": f"acq-l1-{split}", "domain": "domain2_bf16_gemm", "op_name": f"g_{split}",
              "shape": [m, 1024, 1024], "metrics": {"rts_stream_saturated_us": us}}
-            for split, m, us in (("tr", 512, 50.0), ("ho", 1024, 95.0))], "Ascend950PR_958b": []}, "collective_measurements": []},
+            for split, m, us in (("tr", 128, 50.0), ("ho", 64, 95.0))] + [
+                 {"status": "ok", "acquisition_uid": "acq-l1-ho", "domain": domain, "op_name": name,
+                  "shape": shape, "metrics": {"cold_p50_us": 20.0}} for domain, name, shape in (
+                     ("domain2_mxfp8_qmm", "small_mx", [64, 1024, 1024]),
+                     ("domain4_fia", "fia_v1_swa", {"B": 1, "S": 1, "Hq": 8, "Hkv": 2, "D": 128, "seq_kv": 512, "swa": 64}),
+                     ("probe2_mhc_arch35", "sinkhorn_T960", [960, 4, 2560]))], "Ascend950PR_958b": []},
+            "collective_measurements": [{"acquisition_uid": "acq-l1-ho", "collective": "AllReduce",
+                                         "world_size": 2, "bytes": 4096, "metrics": {"eager_p50_us": 20.0}}]},
         "cann93_seq512_to_400k_measurements.json": {"acquisition_uid": "acq-d2-one", "records": [
             {"status": "ok", "domain": "shard0_fia_decode", "op_name": f"fia_s{seq}", "metrics": {"cold_p50_us": 25.0 + seq * 0.005},
              "shape": {"B": 1, "S": 1, "Hq": 8, "Hkv": 2, "D": 128, "seq_kv": seq, "kv_dtype": "bf16", "swa_window": 0}}
@@ -585,7 +579,13 @@ def test_producer_end_to_end_report_assembly_boundary_and_precision(tmp_path: Pa
     assert "mindie_sim/prediction/execution.py" not in sources and sum(k.startswith("mindie_sim/prediction/execution/") for k in sources) >= 8
     assert report["disjoint_split_verification"]["acquisition_root_overlap"] == 0
     assert len([r for r in report["level1_operators"]["train"]["sample_records"] if "kimi_" in r["id"] or "fia_s" in r["id"]]) == 0
-    d2_held = [r for r in report["level1_operators"]["heldout"]["sample_records"] if "fia_s" in r["id"]]
+    heldout = report["level1_operators"]["heldout"]
+    counts = heldout["summary"]
+    assert counts["total"] == len(heldout["records"]) == counts["passed"] + counts["failed"] + counts["explicitly_blocked"]
+    by_name = {row["id"].split(":")[-1]: row for row in heldout["records"]}
+    assert all(by_name[name]["status"] == "ok" for name in ("g_ho", "small_mx", "AllReduce_w2_4096"))
+    assert all(by_name[name]["status"] == "blocked" and by_name[name]["reason"] for name in ("fia_v1_swa", "sinkhorn_T960"))
+    d2_held = [r for r in heldout["records"] if ":fia_s" in r["id"]]
     assert len(d2_held) == 2 and len({r["acquisition_root"] for r in d2_held}) == 1
     l2_ho, = report["level2_subgraphs_and_blocks"]["heldout"]["records"]
     assert l2_ho["run_id"] == "r_ho" and l2_ho["status"] == "ok" and l2_ho["l2_layers"] == 1

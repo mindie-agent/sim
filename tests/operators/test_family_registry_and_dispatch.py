@@ -571,7 +571,7 @@ def test_final_normalization_obeys_selected_row_scope_and_partial_prefill():
     assert len(partial) == 1 and partial[0].local_shape[0] == 8
 def test_tail_copy_supply_tracks_active_owners_and_scalar_store_masks_rows():
     from mindie_sim.prediction.operators.matrix.matrix import TiledMatmul
-    from mindie_sim.prediction.pointwise import TiledPointwise
+    from mindie_sim.prediction.operators.vector import TiledPointwise
     op = _matrix("tile", (), m=1, n=4, k=2)
     rates, times = dict(cube=10000, hbm=100000, mte2=100, mte3=100), []
     for distributed in (False, True):

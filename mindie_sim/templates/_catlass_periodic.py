@@ -24,10 +24,9 @@ from mindie_sim.prediction.program import (
     KernelProgram, ParallelProgram, PipelinePhase, PipelineTemplate,
     PipelineTemplateProgram, Stage,
 )
-from mindie_sim.prediction.runtime.l2_residency import bind_memory_access, cache_policy_for_arch
+from mindie_sim.prediction.runtime.l2_residency import _access_plan, bind_memory_access
 from mindie_sim.prediction.runtime.memory_physics import (
-    AddressRun, AddressRunPlan, BoundAccess, ByteLedger, ConstraintTerm,
-    CounterTerm, HbmBusSpec, MemoryAccessPattern, ReuseKey, SectorCoverage,
+    AddressRun, AddressRunPlan, ByteLedger, HbmBusSpec, MemoryAccessPattern, ReuseKey, SectorCoverage,
     VisibilityContract,
 )
 from mindie_sim.schema.common import ModelingError
@@ -38,7 +37,7 @@ from .contracts import (
     _logical_obligation, _split_entry_residency, _union_obligations,
     ceil_div, eligible_matrix_engines,
 )
-from .fuse_region import Lowering
+from .fuse_region import Lowering, bind_template_access_ledger
 
 _PAIR_DEPTH = 2
 _L0C_DEPTH = 1
@@ -148,86 +147,17 @@ def _writeback_stage(
     return Stage(name, work, after=after, previous=previous, coupled=len(work) > 1, deliveries=deliveries)
 
 
-def _rebind_access_stage(
-    rec: _AccessRecord, owner: int, context, hbm_bus: HbmBusSpec | None,
-    die: int, name: str, *, after: tuple[str, ...] = (), previous: tuple[str, ...] = (),
-    acquire: tuple[Any, ...] = (), free: tuple[Any, ...] = (),
-) -> Stage:
-    """Materialize a ``Stage`` from a pre-admitted ``_AccessRecord`` on ``context`` or unit rates."""
-    pattern, ledger = rec.pattern, rec.ledger
-    aligned = ledger.aligned_transfer_bytes
-    if aligned == 0:
-        return Stage(name, after=after, previous=previous, acquire=acquire, free=free)
-    hit, miss = ledger.l2_hit_bytes, ledger.dram_miss_copy_bytes
-    sectors, service = ledger.dram_sector_bytes, ledger.dram_bus_transaction_bytes
-    if context is not None:
-        pipe_role = pattern.pipe
-        if pipe_role not in context.resource_names and pipe_role.startswith("mte2"):
-            pipe_role = "mte2"
-        if pipe_role not in context.resource_names:
-            raise ModelingError(f"bind_access_pipe_missing:{pattern.pipe}")
-        pipe_row = context.resource_names[pipe_role]
-        pipe_units = context._units_for(pattern.pipe, pipe_row, context._units_for(pipe_role, pipe_row, 1))
-        nom_pipe = float(context.rates[pipe_row]) / float(pipe_units)
-        prim = context._datacopy_cell()
-        hit_rate = context._copy_rate(pattern.pipe, "hit", pipe_units, nom_pipe, prim)
-        miss_rate = context._copy_rate(pattern.pipe, "miss", pipe_units, nom_pipe, prim)
-        arch = getattr(context.datapath, "arch_id", "generic")
-        if arch != "generic":
-            cache_policy_for_arch(arch, pattern.cache_policy)
-        l2_row = context.resource_names.get("l2", "l2")
-        l2_rate = float(context.rates[l2_row]) if l2_row in context.rates else hit_rate
-        if hbm_bus is None:
-            raise ModelingError("bind_access_hbm_rate_missing")
-        memory = getattr(context.datapath, "memory_access", None)
-        bus = replace(hbm_bus, memory_access=memory) if (memory is not None and hbm_bus.memory_access is None) else hbm_bus
-    else:
-        pipe_row, l2_row = pattern.pipe, "l2"
-        nom_pipe = hit_rate = miss_rate = l2_rate = _UNIT_RATE
-        bus = HbmBusSpec(die, _UNIT_RATE, _UNIT_RATE, 0.0, row_r="hbm", row_w="hbm")
-
-    constraints: list[ConstraintTerm] = []
-    row_rates: dict[str, float] = {}
-    pipe_ms = float(hit) / hit_rate + float(miss) / miss_rate
-    if pipe_ms > 0.0:
-        constraints.append(ConstraintTerm(pipe_row, pipe_ms))
-        row_rates[pipe_row] = nom_pipe
-    if hit > 0 and (context is None or l2_row in context.rates):
-        constraints.append(ConstraintTerm(l2_row, float(hit) / l2_rate))
-        row_rates[l2_row] = l2_rate
-    deliveries: list[CounterTerm] = [CounterTerm(pipe_row, float(aligned))]
-    if hit > 0:
-        deliveries.append(CounterTerm(l2_row, float(hit)))
-    if service > 0.0:
-        term_r, term_w = bus.terms_for(pattern.direction, service)
-        if term_r.ms_per_progress > 0.0:
-            constraints.append(term_r)
-        if term_w.ms_per_progress > 0.0:
-            constraints.append(term_w)
-        ctr_id = bus.ctr_r if pattern.direction == "read" else bus.ctr_w
-        if sectors:
-            deliveries.append(CounterTerm(ctr_id, float(sectors)))
-    bound = BoundAccess(
-        ledger=ledger, constraints=tuple(constraints), deliveries=tuple(deliveries),
-        after=after, owner=owner, pipe_row_id=pipe_row, l2_row_id=l2_row, row_rates=row_rates,
-    )
-    stage = bound.to_stage(name, after=after)
-    if previous or acquire or free:
-        stage = replace(stage, previous=previous, acquire=acquire, free=free)
-    return stage
-
-
 def _append_access_stages(
     stages: list[Stage], rec: _AccessRecord, owner: int, context, hbm_bus: HbmBusSpec | None,
-    die: int, name: str, *, after: tuple[str, ...] = (), previous: tuple[str, ...] = (),
+    name: str, *, after: tuple[str, ...] = (), previous: tuple[str, ...] = (),
     acquire: tuple[Any, ...] = (), free: tuple[Any, ...] = (),
 ) -> None:
     if rec.writeback_bytes > 0:
         wb_name = f"{name}_wb"
         stages.append(_writeback_stage(wb_name, rec.writeback_bytes, hbm_bus, after=after, previous=previous))
         after, previous = (wb_name,), ()
-    stages.append(_rebind_access_stage(
-        rec, owner, context, hbm_bus, die, name,
+    stages.append(bind_template_access_ledger(
+        rec.pattern, rec.ledger, owner, context, hbm_bus, name,
         after=after, previous=previous, acquire=acquire, free=free,
     ))
 
@@ -331,7 +261,7 @@ def _append_panel_micro_stages(
 
 def _build_step_stages(
     panels: tuple[_PanelDescriptor, ...], spec, datapath, context, hbm_bus: HbmBusSpec | None,
-    die: int, owner: int, slot_sizes: tuple[int, int, int, int],
+    owner: int, slot_sizes: tuple[int, int, int, int],
 ) -> tuple[Stage, ...]:
     """Build exact multi-panel (even period) or trailing single-panel stages for ``PipelinePhase``."""
     l1a_sz, l1b_sz, l0a_sz, l0b_sz = slot_sizes
@@ -349,24 +279,24 @@ def _build_step_stages(
             prev2 = _panel_tag(s_idx - _PAIR_DEPTH, total_panels)
             gm_after, gm_prev = (f"loaded_{full_last}_{prev2}",), ()
         _append_access_stages(
-            stages, panel.gm_a, owner, context, hbm_bus, die, f"gm_a_{cur}",
+            stages, panel.gm_a, owner, context, hbm_bus, f"gm_a_{cur}",
             after=gm_after, previous=gm_prev, acquire=l1a_alloc,
         )
         a_ready = f"gm_a_{cur}"
         if panel.scale_a is not None:
             a_ready = f"scale_a_{cur}"
             _append_access_stages(
-                stages, panel.scale_a, owner, context, hbm_bus, die, a_ready, after=(f"gm_a_{cur}",),
+                stages, panel.scale_a, owner, context, hbm_bus, a_ready, after=(f"gm_a_{cur}",),
             )
         _append_access_stages(
-            stages, panel.gm_b, owner, context, hbm_bus, die, f"gm_b_{cur}",
+            stages, panel.gm_b, owner, context, hbm_bus, f"gm_b_{cur}",
             after=gm_after, previous=gm_prev, acquire=l1b_alloc,
         )
         b_ready = f"gm_b_{cur}"
         if panel.scale_b is not None:
             b_ready = f"scale_b_{cur}"
             _append_access_stages(
-                stages, panel.scale_b, owner, context, hbm_bus, die, b_ready, after=(f"gm_b_{cur}",),
+                stages, panel.scale_b, owner, context, hbm_bus, b_ready, after=(f"gm_b_{cur}",),
             )
         _append_panel_micro_stages(
             stages, panel, s_idx, total_panels, full_mc, a_ready, b_ready, l1a_alloc + l1b_alloc,
@@ -438,7 +368,7 @@ class _PeriodicCatlassProgram:
                             _widen_stage(st, cohort.cores)
                             for st in _build_step_stages(
                                 ph.panels, self.spec, self.datapath, self.context,
-                                self.hbm_bus, self.die, c0, l1_l0_sizes,
+                                self.hbm_bus, c0, l1_l0_sizes,
                             )
                         ),
                         ph.count,
@@ -447,7 +377,7 @@ class _PeriodicCatlassProgram:
                 )
                 drain_stages: list[Stage] = []
                 _append_access_stages(
-                    drain_stages, cohort.drain, c0, self.context, self.hbm_bus, self.die,
+                    drain_stages, cohort.drain, c0, self.context, self.hbm_bus,
                     "fixpipe", free=l0c_alloc,
                 )
                 drain = tuple(_widen_stage(st, cohort.cores) for st in drain_stages)
@@ -524,41 +454,66 @@ def _exact_tile_stage_count(spec, gk: int, total_micros: int, has_ctx: bool) -> 
     return fills_per_panel * gk + _MICRO_WORK_STAGES * total_micros + _TILE_FINISH_STAGES + ring_stages
 
 
-def _encode_panel_phases(
-    panels: list[_PanelDescriptor],
-    *,
-    periods: tuple[int, ...] = _CANDIDATE_PAIR_PERIODS,
-) -> tuple[tuple[_StepPhaseDescriptor, ...], tuple[Any, ...]]:
-    """Run-length encode repeating 2/4/8/16-panel periods (and optional trailing panel) into phases."""
-    pair_end = (len(panels) // _PAIR_DEPTH) * _PAIR_DEPTH
-    pairs = [(panels[i], panels[i + 1]) for i in range(0, pair_end, _PAIR_DEPTH)]
-    sigs = [(_panel_key(p0), _panel_key(p1)) for p0, p1 in pairs]
-    steps: list[_StepPhaseDescriptor] = []
-    step_sigs: list[tuple[Any, ...]] = []
-    pos, total = 0, len(pairs)
-    while pos < total:
-        best_p, best_rep, best_cov = 1, 1, 1
-        for period in periods:
-            if pos + period > total:
+class _PanelPhases:
+    """Encode pair periods with bounded lookahead, retaining only emitted phases."""
+
+    def __init__(self, periods):
+        self.periods = periods
+        self.window = _MIN_MULTI_PAIR_REPEATS * max(periods)
+        self.pending = []
+        self.phases = []
+        self.keys = []
+        self.repeat = False
+        self.tail = None
+
+    def append(self, panel):
+        if self.tail is None:
+            self.tail = panel
+            return
+        pair = (self.tail, panel)
+        self.tail = None
+        key = tuple(map(_panel_key, pair))
+        self.pending.append((pair, key))
+        if self.repeat:
+            keys, count = self.keys[-1]
+            if key == keys[len(self.pending) - 1]:
+                if len(self.pending) == len(keys):
+                    self.phases[-1] = replace(self.phases[-1], count=count + 1)
+                    self.keys[-1] = (keys, count + 1)
+                    self.pending.clear()
+                return
+            self.repeat = False
+        if len(self.pending) == self.window:
+            self._emit(allow_repeat=True)
+
+    def _emit(self, *, allow_repeat=False):
+        sigs = [key for _, key in self.pending]
+        best_period, best_count, covered = 1, 1, 1
+        for period in self.periods:
+            if period > len(sigs):
                 break
-            pat = sigs[pos:pos + period]
-            rep = 1
-            while pos + (rep + 1) * period <= total and sigs[pos + rep * period:pos + (rep + 1) * period] == pat:
-                rep += 1
-            min_rep = 1 if period == 1 else _MIN_MULTI_PAIR_REPEATS
-            cov = period * rep
-            if rep >= min_rep and cov > best_cov:
-                best_p, best_rep, best_cov = period, rep, cov
-        flat = tuple(pd for pair_t in pairs[pos:pos + best_p] for pd in pair_t)
-        flat_sig = tuple(sigs[pos:pos + best_p])
-        steps.append(_StepPhaseDescriptor(flat, best_rep))
-        step_sigs.append((flat_sig, best_rep))
-        pos += best_cov
-    if pair_end < len(panels):
-        tail_t = (panels[pair_end],)
-        steps.append(_StepPhaseDescriptor(tail_t, 1))
-        step_sigs.append(((_panel_key(tail_t[0]),), 1))
-    return tuple(steps), tuple(step_sigs)
+            key, count = sigs[:period], 1
+            for start in range(period, len(sigs) - period + 1, period):
+                if sigs[start:start + period] != key:
+                    break
+                count += 1
+            if count >= (1 if period == 1 else _MIN_MULTI_PAIR_REPEATS) and period * count > covered:
+                best_period, best_count, covered = period, count, period * count
+        panels = tuple(panel for pair, _ in self.pending[:best_period] for panel in pair)
+        self.phases.append(_StepPhaseDescriptor(panels, best_count))
+        self.keys.append((tuple(sigs[:best_period]), best_count))
+        # The candidate periods divide one another and the lookahead window.
+        # A period covering the window is the first to reach a future mismatch.
+        self.repeat = allow_repeat and covered == self.window
+        del self.pending[:covered]
+
+    def finish(self):
+        while self.pending:
+            self._emit()
+        if self.tail is not None:
+            self.phases.append(_StepPhaseDescriptor((self.tail,), 1))
+            self.keys.append(((_panel_key(self.tail),), 1))
+        return tuple(self.phases), tuple(self.keys)
 
 
 def _whole_tensor_obligations(spec, p, die: int, sector: int) -> tuple[list[Any], list[Any]]:
@@ -595,6 +550,7 @@ def _admit_periodic_access(
     retained_keys: dict[ReuseKey, tuple[ReuseKey, bool]], resource_work: Counter[str],
     context, die: int, *, track_obligations: bool = True,
 ) -> _AccessRecord:
+    pat = replace(pat, runs=_access_plan(pat.runs, plan.state.memory_access))
     if track_obligations and (entry := _logical_obligation(pat)):
         if pat.direction == "read":
             ent_pat = (replace(pat, reuse_key=entry_state.resolve_reuse_key(pat.reuse_key))
@@ -638,29 +594,49 @@ def _admit_periodic_access(
     return _AccessRecord(pat, lg, wb_bytes)
 
 
-def _lower_periodic_wave(
-    tiles: tuple[Any, ...], spec, p, datapath, low, plan: Lowering,
-    admit, admit_shared_a, resource_work: Counter[str], cube_dt: str, die: int, has_ctx: bool,
-) -> tuple[tuple[_CohortWaveSpec, ...], int]:
-    """Admit all K-panels for one output wave and group identical cores into cohorts."""
+def _count_wave_compute(tiles, spec, p, datapath, low, plan, resource_work, cube_dt) -> int:
     from .catlass_lower import _compute_b, _issued_ops, _scale
 
+    full, tail = divmod(p.k, low.tk)
+    panels = ((low.tk, full), (tail, 1))
+    for (m, n), owners in Counter((tile.m, tile.n) for tile in tiles).items():
+        for k, repetitions in panels:
+            repeats = owners * repetitions
+            if not repeats:
+                continue
+            for start in range(0, k, low.micro_k):
+                micro = min(k - start, low.micro_k)
+                a = packed_bytes(m * micro, spec.dtype_a) + _scale(spec, m * micro)
+                b = packed_bytes(n * micro, _compute_b(spec)) + _scale(spec, n * micro)
+                resource_work["mte1"] += (a + b) * repeats
+                plan.cube[cube_dt] += _issued_ops(m, n, micro, spec, datapath) * repeats
+    return sum(ceil_div(k, low.micro_k) * repetitions for k, repetitions in panels)
+
+
+def _lower_periodic_wave(
+    tiles: tuple[Any, ...], spec, p, datapath, low, plan: Lowering,
+    admit, admit_shared_a, a_hits, resource_work: Counter[str], cube_dt: str, die: int, has_ctx: bool,
+) -> tuple[tuple[_CohortWaveSpec, ...], int]:
+    """Admit all K-panels for one output wave and group identical cores into cohorts."""
     bypass_b = spec.l2_cache_hint_b == "disable"
     use_scale = bool(spec.mx_scale_group)
-    per_tile_panels: list[list[_PanelDescriptor]] = [[] for _ in tiles]
+    periods = _CANDIDATE_PAIR_PERIODS_MC1 if ceil_div(low.tk, low.micro_k) == 1 else _CANDIDATE_PAIR_PERIODS
+    encoders = [_PanelPhases(periods) for _ in tiles]
+    total_micros = _count_wave_compute(tiles, spec, p, datapath, low, plan, resource_work, cube_dt)
     for panel_idx in range(low.gk):
+        a_hits.clear()
         ks = panel_idx * low.tk
         kl = min(low.tk, p.k - ks)
-        for t_i, tile in enumerate(tiles):
+        for tile, encoder in zip(tiles, encoders):
             gm_a = admit_shared_a(
-                (False, tile.row, tile.m, ks, kl), tile.owner,
+                (False, tile.row, tile.m, ks, kl),
                 lambda _t=tile, _ks=ks, _kl=kl: _make_rect_pattern(
                     spec, p, die, plan.sector, p.a_id, spec.dtype_a,
                     _t.row, _ks, _t.m, _kl, p.k, _t.owner,
                 ),
             )
             sc_a = (admit_shared_a(
-                (True, tile.row, tile.m, ks, kl), tile.owner,
+                (True, tile.row, tile.m, ks, kl),
                 lambda _t=tile, _ks=ks, _kl=kl: _make_scale_pattern(
                     p, die, plan.sector, p.a_id, _t.row, _ks, _t.m, _kl, p.k, _t.owner, is_a=True,
                 ),
@@ -673,23 +649,14 @@ def _lower_periodic_wave(
                 p, die, plan.sector, p.b_id, ks, tile.col, kl, tile.n, p.n, tile.owner,
                 is_a=False, bypass=bypass_b,
             )) if use_scale else None)
-            per_tile_panels[t_i].append(_PanelDescriptor(tile.m, tile.n, kl, gm_a, sc_a, gm_b, sc_b))
-            for start in range(0, kl, low.micro_k):
-                micro = min(kl - start, low.micro_k)
-                ma = packed_bytes(tile.m * micro, spec.dtype_a) + _scale(spec, tile.m * micro)
-                mb = packed_bytes(tile.n * micro, _compute_b(spec)) + _scale(spec, tile.n * micro)
-                resource_work["mte1"] += ma + mb
-                plan.cube[cube_dt] += _issued_ops(tile.m, tile.n, micro, spec, datapath)
+            encoder.append(_PanelDescriptor(tile.m, tile.n, kl, gm_a, sc_a, gm_b, sc_b))
 
-    periods = _CANDIDATE_PAIR_PERIODS_MC1 if ceil_div(low.tk, low.micro_k) == 1 else _CANDIDATE_PAIR_PERIODS
     cohorts: dict[tuple[Any, ...], list[tuple[int, tuple[_StepPhaseDescriptor, ...], _AccessRecord]]] = {}
     wave_stages = 0
-    for t_i, tile in enumerate(tiles):
+    for tile, encoder in zip(tiles, encoders):
         drain_rec = admit(_make_output_pattern(spec, p, tile, die, plan.sector))
-        p_list = per_tile_panels[t_i]
-        total_micros = sum(ceil_div(pd.k_len, low.micro_k) for pd in p_list)
         wave_stages += _exact_tile_stage_count(spec, low.gk, total_micros, has_ctx)
-        steps, step_sigs = _encode_panel_phases(p_list, periods=periods)
+        steps, step_sigs = encoder.finish()
         cohorts.setdefault((step_sigs, _ledger_key(drain_rec)), []).append((tile.owner, steps, drain_rec))
     wave_specs = tuple(
         _CohortWaveSpec(tuple(i[0] for i in items), items[0][1], items[0][2])
@@ -699,26 +666,25 @@ def _lower_periodic_wave(
 
 
 def _fast_hit_shared_a(
-    hit_item: tuple[_AccessRecord, ReuseKey, Any], owner: int,
+    hit_item: tuple[_AccessRecord, ReuseKey, Any],
     plan: Lowering, resource_work: Counter[str], context, die: int,
 ) -> _AccessRecord | None:
-    base_rec, rk, entry = hit_item
+    record, rk, entry = hit_item
     eff = plan.state.effective_l2_bytes(die)
     if (plan.state._resident.get(rk) is not entry or entry.evicted or entry.working_set_bytes > eff
             or plan.state._hit_fraction(entry.working_set_bytes, eff) != _UNIT_RATE):
         return None
     plan.state._activate_key(rk)
     plan.state._touch_resident(entry)
-    aligned = base_rec.ledger.aligned_transfer_bytes
-    lg = ByteLedger(base_rec.ledger.logical_tensor_bytes, aligned, 0.0, aligned, 0, 0)
-    plan.logical += lg.logical_tensor_bytes
+    aligned = record.ledger.aligned_transfer_bytes
+    plan.logical += record.ledger.logical_tensor_bytes
     plan.copied += aligned
     plan.hits += aligned
     if aligned:
-        resource_work[base_rec.pattern.pipe] += aligned
+        resource_work[record.pattern.pipe] += aligned
         if context is None or "l2" in context.rates:
             resource_work["l2"] += aligned
-    return _AccessRecord(replace(base_rec.pattern, owner=owner), lg, 0)
+    return record
 
 
 def lower_catlass_periodic(
@@ -730,7 +696,9 @@ def lower_catlass_periodic(
 
     plan = Lowering(datapath, context=context, memory_view=memory_view, die=die, live_admission=False)
     entry_state = deepcopy(plan.state)
-    low, unit_bus = _MatrixLowerer(plan, spec, p), HbmBusSpec(die, _UNIT_RATE, _UNIT_RATE, 0.0, row_r="hbm", row_w="hbm")
+    low = _MatrixLowerer(plan, spec, p)
+    unit_bus = HbmBusSpec(die, _UNIT_RATE, _UNIT_RATE, 0.0, row_r="hbm", row_w="hbm",
+                         memory_access=datapath.memory_access)
     resource_work, cube_dt = Counter(), _cube_dtype(spec)
     blocks, cores = ceil_div(p.m, low.tm) * ceil_div(p.n, low.tn), spec.aic_budget
     retained_keys: dict[ReuseKey, tuple[ReuseKey, bool]] = {}
@@ -748,15 +716,19 @@ def lower_catlass_periodic(
 
     a_hits: dict[tuple[Any, ...], tuple[_AccessRecord, ReuseKey, Any]] = {}
 
-    def admit_shared_a(cache_key: tuple[Any, ...], owner: int, make_pat) -> _AccessRecord:
+    def admit_shared_a(cache_key: tuple[Any, ...], make_pat) -> _AccessRecord:
         if entry_empty and (hit_item := a_hits.get(cache_key)) is not None:
-            if (fast := _fast_hit_shared_a(hit_item, owner, plan, resource_work, context, die)) is not None:
+            if (fast := _fast_hit_shared_a(hit_item, plan, resource_work, context, die)) is not None:
                 return fast
         pat = make_pat()
         rec = admit(pat)
         rk_info = retained_keys.get(pat.reuse_key) if (entry_empty and pat.reuse_key is not None) else None
         if rk_info is not None and (entry := plan.state._resident.get(rk_info[0])) is not None and not entry.evicted:
-            a_hits[cache_key] = (rec, rk_info[0], entry)
+            # The emitted stage binds the owner. The cached operand ledger is
+            # identical for every owner that reads these fully resident rows.
+            aligned = rec.ledger.aligned_transfer_bytes
+            hit = _AccessRecord(rec.pattern, ByteLedger(rec.ledger.logical_tensor_bytes, aligned, 0.0, aligned, 0, 0))
+            a_hits[cache_key] = (hit, rk_info[0], entry)
         return rec
 
     compiled_waves: list[tuple[_CohortWaveSpec, ...]] = []
@@ -764,7 +736,8 @@ def lower_catlass_periodic(
     for first in range(0, blocks, cores):
         tiles = tuple(low.tile(i) for i in range(first, min(first + cores, blocks)))
         wave_specs, wave_stages = _lower_periodic_wave(
-            tiles, spec, p, datapath, low, plan, admit, admit_shared_a, resource_work, cube_dt, die, context is not None,
+            tiles, spec, p, datapath, low, plan, admit, admit_shared_a, a_hits,
+            resource_work, cube_dt, die, context is not None,
         )
         compiled_waves.append(wave_specs)
         total_stages += wave_stages

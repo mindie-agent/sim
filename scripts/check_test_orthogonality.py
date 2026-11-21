@@ -46,7 +46,9 @@ SHADOW_STEM = re.compile(r"_(legacy|old|backup|copy|fallback)$")
 SKU_LITERAL = re.compile(r"^(Ascend\d+\w*|910[BC]\w*|950\w*|arch22|arch35)$")
 ABS_HOME = re.compile(r"^(/(Users|home|root)/|[A-Za-z]:\\Users\\)")
 DOC_LITERAL = re.compile(r"(?i)(\.md|\.rst)$|^(README|CHANGELOG|CONTRIBUTING)\b")
-XFAIL_REASON = re.compile(r"://|\w\.\w+:\d+")
+XFAIL_SOURCE = re.compile(r"(?<![\w/])([\w./-]+\.[A-Za-z][\w]*):([1-9]\d*)\b")
+BROAD_XFAIL_EXCEPTIONS = frozenset({"BaseException", "Exception", "AssertionError"})
+XFAIL_MARK = "pytest.mark.xfail"
 TIERS = ("tier0", "tier1", "live_npu")
 TIER0_BANNED_IMPORTS = ("subprocess", "multiprocessing", "socket", "venv")
 TIER0_BANNED_CALLS = {("time", "sleep"), ("os", "fork"), ("os", "system")}
@@ -182,6 +184,126 @@ def name_tokens(stem: str) -> list[tuple[str, str]]:
     return out
 
 
+def _cites_source_line(root: Path, reason: ast.AST | None) -> bool:
+    if not isinstance(reason, ast.Constant) or not isinstance(reason.value, str):
+        return False
+    for filename, line in XFAIL_SOURCE.findall(reason.value):
+        path = (root / filename).resolve()
+        if not path.is_relative_to(root):
+            continue
+        if not path.is_file() and Path(filename).name == filename:
+            matches = [p for p in (root / "mindie_sim").rglob(filename) if p.is_file()]
+            if len(matches) == 1:
+                path = matches[0].resolve()
+        if not path.is_file() or not path.is_relative_to(root):
+            continue
+        try:
+            with path.open(encoding="utf-8") as source:
+                cited = next((text.strip() for number, text in enumerate(source, 1)
+                              if number == int(line)), "")
+        except (OSError, UnicodeError):
+            continue
+        if not cited.startswith(("#", "//", "/*", "*")) and re.search(r"[\w]", cited):
+            return True
+    return False
+
+
+def _xfail_findings(root: Path, rel: str, tree: ast.Module) -> list[Finding]:
+    """Check xfail constructors, including marks bound to parameter rows."""
+    aliases = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            aliases.update((entry.asname, entry.name) for entry in node.names if entry.asname)
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            aliases.update((entry.asname or entry.name, f"{node.module}.{entry.name}") for entry in node.names)
+
+    def resolve(expr: ast.AST) -> str:
+        head, sep, tail = dotted(expr).partition(".")
+        return f"{aliases.get(head, head)}{sep}{tail}"
+
+    bindings = {target.id: node.value for node in tree.body if isinstance(node, ast.Assign)
+                for target in node.targets if isinstance(target, ast.Name)}
+
+    def unbound(expr: ast.AST) -> ast.AST:
+        seen = set()
+        while isinstance(expr, ast.Name) and expr.id in bindings and expr.id not in seen:
+            seen.add(expr.id)
+            expr = bindings[expr.id]
+        return expr
+
+    def keywords(call: ast.Call) -> dict:
+        return {kw.arg: kw.value for kw in call.keywords}
+
+    def mark_nodes(expr: ast.AST):
+        expr = unbound(expr)
+        if isinstance(expr, (ast.List, ast.Tuple)):
+            for mark in expr.elts:
+                yield from mark_nodes(mark)
+        elif resolve(expr.func if isinstance(expr, ast.Call) else expr) == XFAIL_MARK:
+            yield expr
+
+    owners = {}
+    for name, deco in _test_decorators(tree):
+        for mark in mark_nodes(deco):
+            owners.setdefault(mark, set()).add(f"{rel}::{name}")
+        if not isinstance(deco, ast.Call) or resolve(deco.func) != "pytest.mark.parametrize":
+            continue
+        values = deco.args[1] if len(deco.args) > 1 else keywords(deco).get("argvalues")
+        rows = unbound(values)
+        if not isinstance(rows, (ast.Tuple, ast.List)):
+            continue
+        for row in rows.elts:
+            if not isinstance(row, ast.Call) or resolve(row.func) != "pytest.param":
+                continue
+            kw = keywords(row)
+            row_id = kw.get("id")
+            if isinstance(row_id, ast.Constant) and isinstance(row_id.value, str):
+                for mark in mark_nodes(kw.get("marks")):
+                    owners.setdefault(mark, set()).add(f"{rel}::{name}[{row_id.value}]")
+
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    findings = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            if resolve(node.func) != XFAIL_MARK:
+                continue
+            kw = keywords(node)
+        elif isinstance(node, (ast.Attribute, ast.Name)) and resolve(node) == XFAIL_MARK:
+            parent = parents[node]
+            if isinstance(parent, ast.Call) and parent.func is node:
+                continue
+            kw = {}
+        else:
+            continue
+        raises = unbound(kw.get("raises"))
+        exceptions = raises.elts if isinstance(raises, ast.Tuple) else [raises]
+        narrowed = exceptions and all(
+            (kind := resolve(unbound(exc))) and kind.rsplit(".", 1)[-1] not in BROAD_XFAIL_EXCEPTIONS
+            for exc in exceptions
+        )
+        strict = kw.get("strict")
+        run_arg = kw.get("run")
+        run_ok = run_arg is None or (isinstance(run_arg, ast.Constant) and run_arg.value is True)
+        if isinstance(strict, ast.Constant) and strict.value is True and run_ok and narrowed and _cites_source_line(root, kw.get("reason")):
+            continue
+        for owner in sorted(owners.get(node, {rel})):
+            findings.append(Finding(
+                rel, node.lineno, "TO008",
+                f"{owner}: xfail needs strict=True, a specific raises type and a valid source file:line",
+            ))
+    return findings
+
+
+def _test_decorators(tree: ast.Module):
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            yield from ((node.name, deco) for deco in node.decorator_list)
+        elif isinstance(node, ast.ClassDef):
+            for item in node.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    yield from ((f"{node.name}::{item.name}", deco) for deco in item.decorator_list)
+
+
 class ModuleCheck(ast.NodeVisitor):
     """AST rules TO005..TO012 for one test or support module."""
 
@@ -242,13 +364,7 @@ class ModuleCheck(ast.NodeVisitor):
             return
         name = dotted(deco.func)
         kw = {k.arg: k.value for k in deco.keywords}
-        if name == "pytest.mark.xfail":
-            strict = kw.get("strict")
-            reason = kw.get("reason")
-            if not (isinstance(strict, ast.Constant) and strict.value is True and isinstance(reason, ast.Constant)
-                    and XFAIL_REASON.search(str(reason.value))):
-                self.add(deco, "TO008", "xfail needs strict=True and a reason citing upstream file:line or URL")
-        elif name == "pytest.mark.skipif":
+        if name == "pytest.mark.skipif":
             cond = deco.args[0] if deco.args else kw.get("condition")
             text = ast.unparse(cond) if cond is not None else ""
             if not re.search(r"sys\.platform|os\.name|platform\.system", text):
@@ -407,6 +523,12 @@ class Gate:
         legacy_root = kind == "test" and len(parts) == 1
         if legacy_root:
             self.legacy_root(rel, status, base)
+            try:
+                tree = ast.parse(path.read_text(encoding="utf-8"), filename=rel)
+            except SyntaxError as exc:
+                self.add(rel, exc.lineno or 1, "TO005", f"syntax error: {exc.msg}")
+            else:
+                self.findings.extend(_xfail_findings(self.root, rel, tree))
             return
         if kind in {"test", "support"}:
             for label, token in name_tokens(path.stem):
@@ -461,6 +583,7 @@ class Gate:
                             is_conftest=kind == "conftest")
         check.visit(tree)
         self.findings.extend(check.findings)
+        self.findings.extend(_xfail_findings(self.root, rel, tree))
 
     def _support_imports(self, path: Path, *, in_support: bool) -> set[str]:
         try:

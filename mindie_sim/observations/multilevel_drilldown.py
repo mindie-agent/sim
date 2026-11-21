@@ -42,17 +42,29 @@ def score_vertical_drilldown(
 ) -> dict[str, Any]:
     audits = {level: _CancellationAudit() for level in DRILLDOWN_LEVELS}
     failed_components = []
+    seen = set()
+    duplicate = False
     for level, name, predicted_ns, measured_ns in components:
         if level not in audits:
             raise ModelingError(f"invalid_drilldown_level:{level}")
+        duplicate |= (level, name) in seen
+        seen.add((level, name))
         audits[level].add(predicted_ns - measured_ns)
-        if exceeds_tolerance(predicted_ns, measured_ns):
+        if measured_ns <= 0 or predicted_ns <= 0 or exceeds_tolerance(predicted_ns, measured_ns):
             failed_components.append({
                 "level_tag": level, "name": name, "predicted_ns": predicted_ns, "measured_ns": measured_ns,
             })
-    step_passed = not exceeds_tolerance(step_predicted_ns, step_measured_ns)
+    step_passed = min(step_predicted_ns, step_measured_ns) > 0 and not exceeds_tolerance(step_predicted_ns, step_measured_ns)
+    missing_levels = [level for level, audit in audits.items() if not audit.component_count]
+    reason = ("empty_component_census" if not components else
+              "duplicate_component" if duplicate else
+              "component_levels_missing" if missing_levels else
+              "component_pointwise_failure" if failed_components else
+              "step_pointwise_failure" if not step_passed else "")
     return {
-        "passed": step_passed and not failed_components,
+        "passed": not reason,
+        "failure_reason": reason,
+        "missing_levels": missing_levels,
         "step_passed": step_passed,
         "failed_components": failed_components,
         "levels": {level: audit.to_dict() for level, audit in audits.items()},

@@ -10,41 +10,22 @@
 from __future__ import annotations
 
 from collections.abc import Mapping as _AbcMapping
-import hashlib
 import math
 
 from .engine_types import ExecutionError, _structural_value
 
-_L2_DIGEST_BYTES = 8
 _PERIODIC_EPOCH_MISS_MULTIPLIER = 2
 _PERIODIC_COLD_ISSUE_MULTIPLIER = 2
 
 
 def _admission_l2_digest(view) -> str:
     """Return a deterministic digest of live L2 residency, reservations, and dirty state."""
-    if view is None:
-        return ""
-    h = hashlib.blake2b(digest_size=_L2_DIGEST_BYTES)
-    caps = getattr(view, "_l2_capacity", None) or {}
-    resv = getattr(view, "_reserved", None) or {}
-    resident = getattr(view, "_resident", None) or {}
-    dirty = getattr(view, "_pending_writebacks", None) or {}
-    for die in sorted(caps):
-        h.update(f"d{die}:{caps[die]}:".encode("utf-8"))
-        for rkey, rval in sorted(resv.get(die, {}).items()):
-            h.update(f"r{rkey}={rval};".encode("utf-8"))
-        entries = resident.get(die)
-        if entries:
-            for rkey, entry in entries.items():
-                cov = getattr(entry, "coverage", None)
-                cbytes = getattr(cov, "total_bytes", 0) if cov is not None else 0
-                dbytes = getattr(entry, "dirty_bytes", 0)
-                h.update(f"e{rkey.allocation_id}:{rkey.version}:{cbytes}:{dbytes};".encode("utf-8"))
-        wb = dirty.get(die)
-        if wb:
-            for item in wb:
-                h.update(f"w{item.bytes};".encode("utf-8"))
-    return h.hexdigest()
+    fingerprint = getattr(view, "residency_fingerprint", None)
+    return fingerprint() if callable(fingerprint) else ""
+
+
+def _counter_delta(current, previous):
+    return {key: delta for key, value in current.items() if (delta := value - previous.get(key, 0.0))}
 
 
 class _EnginePeriodicMixin:
@@ -82,7 +63,7 @@ class _EnginePeriodicMixin:
         self._periodic_alloc_cache = (version, allocations, pools, grants)
         return allocations, pools, grants
 
-    def _periodic_state(self) -> tuple:
+    def _periodic_state(self, epoch: str | None = None) -> tuple:
         """Tile-index-independent exact structural view for the detector."""
         def task_key(task):
             metadata = self._periodic_tasks.get(task.event.sequence)
@@ -119,7 +100,7 @@ class _EnginePeriodicMixin:
         # the static task template. Memory budget/grants are structural too,
         # so they ride in the pool part rather than changing the outer arity.
         pools = (*pools, ("@memory", 0.0,
-                          ((self._memory_epoch(), 0.0,
+                          (((self._memory_epoch() if epoch is None else epoch), 0.0,
                             (("grants", grants),))),))
         return (tasks, runs, allocations, pools, releases)
 
@@ -196,6 +177,18 @@ class _EnginePeriodicMixin:
             if bool(task.remaining) or bool(task.acquire) or bool(task.free):
                 return True
         return False
+
+    def _periodic_stop(self, horizon: float) -> float:
+        if self._releases:
+            horizon = min(horizon, self._releases[0][0])
+        for key in self._latency_active:
+            if key in self._periodic_tasks:
+                continue
+            task = self._tasks[key]
+            anchor = task.first_service if task.latency_from_first_service else task.start
+            if anchor is not None and anchor + task.latency > self.now:
+                horizon = min(horizon, anchor + task.latency)
+        return horizon
 
     def _periodic_epoch_stalled(self, detector) -> bool:
         """Return True once the active periodic epoch cannot match within ``max_lag``."""
@@ -284,18 +277,35 @@ class _EnginePeriodicMixin:
             # can never become evidence.  Skipping the observation is a sound
             # O(1) rejection, not a lost proof.
             return None
+        previous = self._periodic_last
+        stop_at = self._periodic_stop(stop_at)
+        landmark = (self._periodic_stall_epoch, self._periodic_last_next_sum)
+        clock_steps = None
+        if previous is not None:
+            clock_steps = previous["clock_steps"]
+            clock = self._periodic_clock_step
+            if (clock_steps is not None and len(clock_steps) < detector.max_lag
+                    and clock is not None and clock[0] == self.advance_steps == previous["advance_steps"] + 1
+                    and not self._crossed_external_or_opaque(previous, stop_at)):
+                clock_steps.append(clock[1])
+            else:
+                clock_steps = None
+            # A valid cycle must issue tiles. Observe full structural evidence
+            # at issue landmarks and retain the arithmetic of intermediate steps.
+            if landmark == previous["landmark"]:
+                previous["clock_steps"] = clock_steps
+                previous["advance_steps"] = self.advance_steps
+                return None
         from ..engine_periodic import Cursor, IntervalDelta, SettledFrontier
-        state = self._periodic_state()
+        epoch = self._memory_epoch()
+        state = self._periodic_state(epoch)
         cursors = tuple(
             Cursor(run_id, run.get("phase_ordinal", 0),
                    run.get("phase_end", 0), run.get("next", 0),
                    run.get("finished", 0), tuple(run.get("slots", ())))
             for run_id, run in sorted(self._periodic_runs.items()))
-        if self._releases:
-            stop_at = min(stop_at, self._releases[0][0])
         interval = None
-        if self._periodic_last is not None:
-            previous = self._periodic_last
+        if clock_steps:
             issued = {
                 run_id: (run.get("next", 0) - previous["runs"].get(
                     run_id, (0, 0))[0],
@@ -307,23 +317,21 @@ class _EnginePeriodicMixin:
                 dt=max(0.0, self.now - previous["now"]),
                 issued_retired_by_run=issued,
                 sequence_count=max(0, self._sequence - previous["sequence"]),
-                service_by_resource={
-                    key: max(0.0, value - previous["serviced"].get(key, 0.0))
-                    for key, value in self.serviced.items()},
-                busy_by_resource={
-                    key: max(0.0, value - previous["busy"].get(key, 0.0))
-                    for key, value in self.busy_ms.items()},
+                service_by_resource=_counter_delta(self.serviced, previous["serviced"]),
+                busy_by_resource=_counter_delta(self.busy_ms, previous["busy"]),
+                deliveries_by_counter=_counter_delta(self.delivered, previous["delivered"]),
+                hbm_accounting=_counter_delta(self._hbm_accounting_serviced, previous["hbm_accounting"]),
+                clock_steps=tuple(clock_steps),
                 allocation_event_count=max(
                     0, self.allocation_event_count
                     - previous["allocation_event_count"]),
                 per_unit_peaks=dict(self.peak_allocated),
                 logical_completions=max(
                     0, self.completed_count - previous["completed"]),
-                crossed_external_or_opaque=self._crossed_external_or_opaque(
-                    previous, stop_at),
+                crossed_external_or_opaque=False,
             )
         frame = SettledFrontier(
-            now=self.now, epoch=self._memory_epoch(), normalized_state=state,
+            now=self.now, epoch=epoch, normalized_state=state,
             cursors=cursors, sequence=self._sequence)
         skip = self._periodic_detector.observe(
             frame, interval, stop_at=stop_at)
@@ -336,6 +344,8 @@ class _EnginePeriodicMixin:
         self._periodic_last = {
             "now": self.now, "sequence": self._sequence,
             "serviced": dict(self.serviced), "busy": dict(self.busy_ms),
+            "delivered": dict(self.delivered), "hbm_accounting": dict(self._hbm_accounting_serviced),
+            "advance_steps": self.advance_steps, "clock_steps": [], "landmark": landmark,
             "allocation_event_count": self.allocation_event_count,
             "completed": self.completed_count,
             "external_completions": self._external_completions,
@@ -358,7 +368,12 @@ class _EnginePeriodicMixin:
         if dt < 0 or not math.isfinite(dt):
             raise ExecutionError("periodic_skip_period_invalid")
         start_before = self.now
-        self.now += dt
+        from ..engine_periodic.frontier import _advance_periodic_clock
+        if skip.delta.clock_steps:
+            self.now = _advance_periodic_clock(self.now, skip.delta.clock_steps, skip.cycles)
+            dt = self.now - start_before
+        else:
+            self.now += dt
         wave_rec = getattr(self, "_wave_recorder", None)
         if wave_rec is not None:
             per_cycle = getattr(skip, "delta", None)
@@ -389,6 +404,10 @@ class _EnginePeriodicMixin:
         for resource, amount in dict(total.busy_by_resource).items():
             if resource in self.busy_ms:
                 self.busy_ms[resource] += float(amount)
+        for counters, delta in ((self.delivered, total.deliveries_by_counter),
+                                (self._hbm_accounting_serviced, total.hbm_accounting)):
+            for name, amount in delta.items():
+                counters[name] = counters.get(name, 0.0) + amount
         for pool, peak in dict(total.per_unit_peaks).items():
             self.peak_allocated[pool] = max(
                 self.peak_allocated.get(pool, 0.0), float(peak))
@@ -417,8 +436,13 @@ class _EnginePeriodicMixin:
             if correspondence is not None:
                 self._periodic_tasks[sequence] = (
                     run_id, tile + correspondence.tile_offset, ordinal, kind)
-        for task in self._tasks.values():
+        for key in self._periodic_tasks:
+            task = self._tasks[key]
             if task.start is not None:
                 task.start += dt
-            task.release += dt
+                task.event.started = task.start
+            if task.first_service is not None:
+                task.first_service += dt
+            if task.ready_at is not None:
+                task.ready_at += dt
         self._periodic_last = None

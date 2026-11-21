@@ -11,8 +11,11 @@ from dataclasses import dataclass
 from collections import Counter
 import math
 
-from .program import KernelProgram, ParallelProgram, PipelineProgram, Stage
-from .transactions import QueuedStore
+from ...program import KernelProgram, ParallelProgram, PipelineProgram, Stage
+from ...transactions import QueuedStore
+
+DEFAULT_POINTWISE_TILE_ROWS = 64
+DEFAULT_POINTWISE_TILE_COLS = 8
 
 
 @dataclass(frozen=True)
@@ -20,8 +23,8 @@ class TiledPointwise:
     input_bytes_per_element: float
     outputs: tuple[dict, ...]
     parameter_bytes_per_col: float = 0
-    tile_rows: int = 64
-    tile_cols: int = 8
+    tile_rows: int = DEFAULT_POINTWISE_TILE_ROWS
+    tile_cols: int = DEFAULT_POINTWISE_TILE_COLS
     unit_role: str = "vector"
 
     def lower(self, context):

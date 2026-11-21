@@ -14,12 +14,15 @@ from copy import deepcopy
 from dataclasses import replace
 from fractions import Fraction
 from types import SimpleNamespace
+from typing import Any
 
 from mindie_sim.prediction.mechanism import Work
 from mindie_sim.prediction.program.binding import RecipeContext
 from mindie_sim.prediction.program.stages import KernelProgram, Stage
+from mindie_sim.prediction.runtime.l2_residency import _access_plan, cache_policy_for_arch, primitive_working_set_sweep
 from mindie_sim.prediction.runtime.memory_physics import (
-    AddressRun, AddressRunPlan, AdmissionMemoryView, BurstTurnRule, HbmBusSpec,
+    AddressRun, AddressRunPlan, AdmissionMemoryView, BoundAccess, BurstTurnRule, ByteLedger,
+    ConstraintTerm, CounterTerm, HbmBusSpec,
     MemoryAccessPattern, ReuseKey, SectorCoverage, VisibilityContract, bind_memory_access,
 )
 from mindie_sim.prediction.runtime.ring_buffer import RingBuffer, lower_generation
@@ -90,6 +93,73 @@ def ring_credit(ring, generation):
     return ring.initial_credit(ring.slot(generation)) if generation < ring.depth else ring.last_use(generation - ring.depth)
 
 
+def bind_template_access_ledger(
+    pattern: MemoryAccessPattern, ledger: ByteLedger, owner: int, context, hbm_bus: HbmBusSpec | None,
+    name: str, *, after: tuple[str, ...] = (), previous: tuple[str, ...] = (),
+    acquire: tuple[Any, ...] = (), free: tuple[Any, ...] = (),
+) -> Stage:
+    """Bind a frozen byte ledger to the supplied resource rates."""
+    aligned = ledger.aligned_transfer_bytes
+    if aligned == 0:
+        return Stage(name, after=after, previous=previous, acquire=acquire, free=free)
+    hit, miss = ledger.l2_hit_bytes, ledger.dram_miss_copy_bytes
+    sectors, service = ledger.dram_sector_bytes, ledger.dram_bus_transaction_bytes
+    if context is not None:
+        pipe_role = pattern.pipe
+        if pipe_role not in context.resource_names and pipe_role.startswith("mte2"):
+            pipe_role = "mte2"
+        if pipe_role not in context.resource_names:
+            raise ModelingError(f"bind_access_pipe_missing:{pattern.pipe}")
+        pipe_row = context.resource_names[pipe_role]
+        pipe_units = context._units_for(pattern.pipe, pipe_row, context._units_for(pipe_role, pipe_row, 1))
+        nom_pipe = float(context.rates[pipe_row]) / float(pipe_units)
+        prim = context._datacopy_cell()
+        hit_rate = context._copy_rate(pattern.pipe, "hit", pipe_units, nom_pipe, prim)
+        miss_rate = context._copy_rate(pattern.pipe, "miss", pipe_units, nom_pipe, prim)
+        arch = getattr(context.datapath, "arch_id", "generic")
+        if arch != "generic":
+            cache_policy_for_arch(arch, pattern.cache_policy)
+        l2_row = context.resource_names.get("l2", "l2")
+        l2_rate = float(context.rates[l2_row]) if l2_row in context.rates else hit_rate
+        if hbm_bus is None:
+            raise ModelingError("bind_access_hbm_rate_missing")
+        bus = hbm_bus
+    else:
+        pipe_row, l2_row = pattern.pipe, "l2"
+        nom_pipe = hit_rate = miss_rate = l2_rate = 1.0
+        bus = HbmBusSpec(pattern.die, 1.0, 1.0, 0.0, row_r="hbm", row_w="hbm")
+
+    constraints: list[ConstraintTerm] = []
+    row_rates: dict[str, float] = {}
+    pipe_ms = float(hit) / hit_rate + float(miss) / miss_rate
+    if pipe_ms > 0.0:
+        constraints.append(ConstraintTerm(pipe_row, pipe_ms))
+        row_rates[pipe_row] = nom_pipe
+    if hit > 0 and (context is None or l2_row in context.rates):
+        constraints.append(ConstraintTerm(l2_row, float(hit) / l2_rate))
+        row_rates[l2_row] = l2_rate
+    deliveries: list[CounterTerm] = [CounterTerm(pipe_row, float(aligned))]
+    if hit > 0:
+        deliveries.append(CounterTerm(l2_row, float(hit)))
+    if service > 0.0:
+        term_r, term_w = bus.terms_for(pattern.direction, service)
+        if term_r.ms_per_progress > 0.0:
+            constraints.append(term_r)
+        if term_w.ms_per_progress > 0.0:
+            constraints.append(term_w)
+        ctr_id = bus.ctr_r if pattern.direction == "read" else bus.ctr_w
+        if sectors:
+            deliveries.append(CounterTerm(ctr_id, float(sectors)))
+    bound = BoundAccess(
+        ledger=ledger, constraints=tuple(constraints), deliveries=tuple(deliveries),
+        after=after, owner=owner, pipe_row_id=pipe_row, l2_row_id=l2_row, row_rates=row_rates,
+    )
+    stage = bound.to_stage(name, after=after)
+    if previous or acquire or free:
+        stage = replace(stage, previous=previous, acquire=acquire, free=free)
+    return stage
+
+
 class Lowering:
     """Shared stage and byte ledger construction for the catalog lowerers."""
 
@@ -101,22 +171,26 @@ class Lowering:
         self.datapath = datapath
         self.context = context
         self.die = die
+        memory = datapath.memory_access
+        self.state = deepcopy(memory_view) if memory_view is not None else AdmissionMemoryView(
+            {die: dict(datapath.buffers).get("l2", 0)}, memory_access=memory,
+            ws_sweep=primitive_working_set_sweep(getattr(context, "primitive_table", None)),
+        )
+        bus_memory = self.state.memory_access
         self.hbm_bus = None
         if context is not None and "hbm" in context.resource_names:
             hbm = context.resource_names["hbm"]
             rate = context.rates[hbm]
             self.hbm_bus = HbmBusSpec(
-                die, datapath.hbm_read_bytes_per_s / 1000 or rate,
-                datapath.hbm_write_bytes_per_s / 1000 or rate, datapath.hbm_rw_alpha,
+                die, min(rate, datapath.hbm_read_bytes_per_s / 1000 or rate),
+                min(rate, datapath.hbm_write_bytes_per_s / 1000 or rate), datapath.hbm_rw_alpha,
                 row_r=hbm + ":r", row_w=hbm + ":w",
                 ctr_r=hbm + ":ctr_r", ctr_w=hbm + ":ctr_w",
+                memory_access=bus_memory,
             )
         if live_admission and (self.hbm_bus is None or memory_view is None):
             raise ModelingError("template_live_admission_requires_context_and_view")
         self.live_state = memory_view if live_admission else None
-        self.state = deepcopy(memory_view) if memory_view is not None else AdmissionMemoryView({
-            die: dict(datapath.buffers).get("l2", 0),
-        })
         self.state.drain_writebacks(die)
         self.stages: list[Stage] = []
         self.accesses: dict[str, MemoryAccessPattern] = {}
@@ -130,7 +204,6 @@ class Lowering:
         self.metadata_ms = Fraction()
         self.launches = 0
         self.l2_reservation = None
-        memory = datapath.memory_access
         self.sector = memory.sector_bytes if memory is not None else AddressRunPlan().sector_bytes
         self.burst_rules = tuple(
             BurstTurnRule(0, None, rule.min_stride_bytes, rule.max_stride_bytes,
@@ -204,11 +277,13 @@ class Lowering:
         self.hits += ledger.l2_hit_bytes
         self.misses += ledger.dram_miss_copy_bytes
         if ledger.dram_sector_bytes:
-            if not self.burst_rules and (not ledger.l2_hit_bytes or resident.empty):
+            if ledger.dram_bus_transaction_bytes == ledger.dram_sector_bytes:
                 self.service += ledger.dram_sector_bytes
-            else:
+            elif self.burst_rules and not self.state._knee_curve:
                 resident = resident if ledger.l2_hit_bytes else SectorCoverage()
                 self.service += _rational_service(address_plan, resident, self.burst_rules)
+            else:
+                self.service += Fraction(ledger.dram_bus_transaction_bytes)
 
     def _writebacks(self, name, after):
         evictions = self.state.drain_writebacks(self.die)
@@ -241,10 +316,8 @@ class Lowering:
             scope="die" if private else "device",
             live_out=direction == "write" and not private, private_workspace=private,
         )
-        plan = AddressRunPlan(
-            tuple(runs) if runs is not None else (AddressRun(offset, 1, amount, amount),),
-            sector_bytes=self.sector,
-        )
+        runs = tuple(runs) if runs is not None else (AddressRun(offset, 1, amount, amount),)
+        plan = _access_plan(AddressRunPlan(runs, sector_bytes=self.sector), self.state.memory_access)
         pattern = MemoryAccessPattern(
             tensor, version, self.die, owner, direction, pipe, amount, plan, key,
             working_set, visibility,
@@ -277,7 +350,8 @@ class Lowering:
         else:
             # Unit-rate normalization recovers native byte work independently
             # of hardware service rates. An Engine supplies real rates later.
-            bus = HbmBusSpec(self.die, 1, 1, 0, row_r="hbm", row_w="hbm")
+            bus = HbmBusSpec(self.die, 1, 1, 0, row_r="hbm", row_w="hbm",
+                             memory_access=self.state.memory_access)
             bound = bind_memory_access(
                 pattern, self.state, hbm_bus=bus, copy_hit_bytes_per_ms=1,
                 copy_miss_bytes_per_ms=1, l2_bytes_per_ms=1, pipe_row_id=pattern.pipe,

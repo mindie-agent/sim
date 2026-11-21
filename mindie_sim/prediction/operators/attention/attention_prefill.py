@@ -454,7 +454,8 @@ def _task_program(context: RecipeContext, recipe: StagedGQAPrefill,
             compact_periodic_pipeline(
                 context, task.key_tiles, preload, tile,
                 head=fill, tail=fill, resident=persistent,
-                peer_counts=peer_counts)
+                peer_counts=peer_counts,
+                peer_tails=(fill,) * len(peer_counts) if peer_counts is not None else None)
             if use_compact
             else PipelineProgram(task.key_tiles, preload, tile)
         ),

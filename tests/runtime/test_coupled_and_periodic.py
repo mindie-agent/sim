@@ -20,17 +20,79 @@ from __future__ import annotations
 from dataclasses import replace
 from fractions import Fraction
 from itertools import product
+import math
 import weakref
 
 import pytest
 
+from _support.linear_cases import enumerate_matrix, run_template, template_context, template_datapath
+from mindie_sim.optimization.reload_bounds import compute_compulsory_hbm_cut
 from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.operators.matrix.matrix_cycle import matrix_cycle, periodic_matrix_cycle
 from mindie_sim.prediction.program import KernelProgram, PipelineProgram, Stage
 from mindie_sim.prediction.operators.matrix.refill import RefillPipeline
 from mindie_sim.prediction.operators.matrix.steady_pipeline import SteadyPipeline
+from mindie_sim.templates import CatlassProblem, lower_catlass_spec
+from mindie_sim.templates import _catlass_periodic, catlass_lower
 
 pytestmark = pytest.mark.tier0
+
+
+@pytest.mark.parametrize("n,k,reads,expect_skip", [(32, 65_632, 8_400_896, True), (512, 4_128, 4_491_264, False)])
+def test_periodic_matrix_conserves_hbm_and_clock(monkeypatch, n, k, reads, expect_skip):
+    path = template_datapath("Ascend950DT_9582")
+    problem = CatlassProblem(32, n, k)
+    spec, = enumerate_matrix(
+        "basic_pingpong", problem, path, tile=(32, 32, 32), aic_budget=path.aic_count,
+        l0_tiles=((32, 32, 32),), stage_options=((2, 2, 2, 2, 1),),
+    )
+    spec = replace(spec, swizzle_direction="Zn")
+    context = template_context(path, problem)
+    accelerated = lower_catlass_spec(spec, problem, path, context=context)
+    default = lower_catlass_spec(spec, problem, path)
+    monkeypatch.setattr(catlass_lower, "STREAMING_PANEL_MICRO_THRESHOLD", math.inf)
+    detailed = lower_catlass_spec(spec, problem, path, context=context)
+    literal = run_template(path, context, detailed)
+    skipped = run_template(path, context, accelerated)
+    if expect_skip:
+        assert skipped._periodic_detector.stats()["skipped_cycles"] > 0
+    for result in (default, accelerated, detailed):
+        cut = compute_compulsory_hbm_cut((result.summary,))[0]
+        assert result.summary.dram_sector_bytes == cut.read_bytes + cut.write_bytes == reads + problem.m * problem.n * 2
+        assert result.summary.turnaround_service_bytes == detailed.summary.turnaround_service_bytes
+    assert skipped.delivered["hbm:ctr_r"] == pytest.approx(reads, rel=1e-12)
+    assert skipped.delivered["hbm:ctr_w"] == literal.delivered["hbm:ctr_w"]
+    assert abs(skipped.now - literal.now) <= math.ulp(literal.now)
+
+
+def test_streaming_panel_encoding_keeps_only_bounded_lookahead(monkeypatch):
+    monkeypatch.setattr(_catlass_periodic, "_panel_key", str)
+    periods = (1, 2, 4, 8)
+    encoder = _catlass_periodic._PanelPhases(periods)
+    motif = tuple(range(2 * max(periods)))
+    panels = (17, 18) + motif * 4096 + (19,)
+    for panel in panels:
+        encoder.append(panel)
+        assert len(encoder.pending) < 3 * max(periods)
+    phases, _ = encoder.finish()
+    assert len(phases) == 3
+    assert tuple(panel for phase in phases for panel in phase.panels * phase.count) == panels
+
+
+def test_cascading_cohort_overlap_settles_before_the_timer():
+    engine = Engine([Resource("read", 2, units=2), Resource("copy", 2, units=2)], backend="python")
+    members = ((0,), (1,))
+    both = (0, 1)
+    slow = engine.submit("slow", {"read": 4, "copy": 4}, coupled=True, cohort_size=2,
+                         placement={"read": both, "copy": both}, cohort_widened=("read", "copy"),
+                         cohort_members={"read": members, "copy": members})
+    fast = engine.submit("fast", {"read": 4}, cohort_size=2, placement={"read": both},
+                         cohort_widened=("read",), cohort_members={"read": members})
+    engine.submit("blocker", {"copy": 2}, placement={"copy": (0,)})
+    engine.advance(horizon=1)
+    slow_members, fast_members = (engine._tasks[event.sequence].split_children for event in (slow, fast))
+    assert len(slow_members) == len(fast_members) == 2
+    assert engine.serviced == {"read": 2, "copy": 1.5}
 
 
 # --- Coupled flows: backpressure and owner-scoped arbitration --------------

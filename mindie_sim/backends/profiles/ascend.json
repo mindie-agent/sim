@@ -3364,8 +3364,8 @@
         "split_host_service": "host"
       },
       "hbm_rw_alpha": 1.0,
-      "hbm_read_bytes_per_s": 1600000000000.0,
-      "hbm_write_bytes_per_s": 1600000000000.0,
+      "hbm_read_bytes_per_s": 800000000000.0,
+      "hbm_write_bytes_per_s": 800000000000.0,
       "memory_access": {
         "sector_bytes": 32,
         "burst_turn_penalty": [],

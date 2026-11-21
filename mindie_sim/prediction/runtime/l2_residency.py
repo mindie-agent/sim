@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
+from hashlib import sha256
 import math
 
 from mindie_sim.schema.common import ModelingError
@@ -66,21 +67,35 @@ def _p05_knee(ws_sweep: Mapping[int | str, float], capacity: int) -> tuple[tuple
         return ()
     if any(size <= 0 or not math.isfinite(rate) or rate <= 0 for size, rate in rates):
         raise ModelingError("l2_ws_sweep_invalid")
-    peak = max(range(len(rates)), key=lambda index: rates[index][1])
-    warm = rates[peak][1]
-    cold = min(rate for _, rate in rates[peak:])
+    fitting = [rate for size, rate in rates if size <= capacity]
+    spill = [(size, rate) for size, rate in rates if size > capacity]
+    if not fitting or not spill:
+        return ()
+    warm, cold = max(fitting), min(rate for _, rate in spill)
     if not 0 < cold < warm:
         return ()
-    points = []
+    points = [(1.0, 1.0)]
     fraction = 1.0
-    for size, rate in rates[peak:]:
+    for size, rate in spill:
         fraction = min(fraction, (1 / cold - 1 / rate) / (1 / cold - 1 / warm))
         points.append((size / capacity, fraction))
     return tuple(points)
 
 
+def primitive_working_set_sweep(table) -> Mapping[int | str, float]:
+    """Read the working-set sweep from the declared primitive table."""
+    cell = getattr(table, "cell", None)
+    if cell is None:
+        return {}
+    return cell("P05_l2_residency_reuse").parameters.get("ws_sweep_bytes_per_s", {})
+
+
 def _access_plan(plan: AddressRunPlan, spec) -> AddressRunPlan:
-    if spec is None:
+    if spec is None or (
+        not plan._default_sector and plan.l2_line_bytes and plan.l2_sector_bytes
+        and plan.hbm_burst_granule_bytes
+        and (plan.hbm_scatter_row_open_bytes or not getattr(spec, "hbm_scatter_row_open_bytes", 0))
+    ):
         return plan
     return replace(
         plan, sector_bytes=None if plan._default_sector else plan.sector_bytes,
@@ -204,15 +219,59 @@ class AdmissionMemoryView:
         streams.update(k.reuse_stream for k in self._active_keys.get(die, ()))
         return len(streams)
 
+    def residency_fingerprint(self, die: int | None = None) -> str:
+        """Fingerprint the admission state, including the order of LRU entries."""
+        digest = sha256()
+
+        def record(*fields):
+            digest.update(repr(fields).encode())
+            digest.update(b"\n")
+
+        def coverage(intervals, periodic):
+            for interval in intervals:
+                record("interval", interval)
+            for run in periodic:
+                record("periodic", run)
+
+        record("geometry", self.granule_bytes, self.memory_access, self.arch_id, self._knee_curve)
+        for key, users in sorted(self._template_key_users.items(), key=lambda pair: repr(pair[0])):
+            if die is None or die == key.die:
+                record("template", key, users)
+        for rank, capacity in sorted(self._l2_capacity.items()):
+            if die is not None and die != rank:
+                continue
+            record("die", rank, capacity, sorted(self._reserved[rank].items()),
+                   sorted(self._active_streams[rank]),
+                   sorted(map(repr, self._active_keys[rank])))
+            for writeback in self._pending_writebacks[rank]:
+                record("writeback", writeback.key, writeback.bytes)
+                coverage(writeback.coverage.intervals or writeback.ranges, writeback.coverage.periodic)
+        for key, entry in self._resident.items():
+            if die is not None and die != key.die:
+                continue
+            record("resident", key, entry.version, entry.cache_policy, entry.working_set_bytes, entry.resident_bytes,
+                   entry.evicted, entry.dirty, entry.has_future_reader, entry.private_workspace,
+                   entry.line_footprint_bytes)
+            intervals = entry.resident_intervals_mut
+            coverage(entry.resident_coverage.intervals if intervals is None else intervals,
+                     entry.resident_coverage.periodic if intervals is None else ())
+            record("dirty")
+            coverage(entry.dirty_coverage.intervals or entry.dirty_ranges, entry.dirty_coverage.periodic)
+        return digest.hexdigest()
+
     def reserved_bytes(self, die: int) -> int:
         return sum(self._reserved.get(die, {}).values())
 
-    def effective_l2_bytes(self, die: int) -> int:
-        """Return per-stream capacity in strict mode and the shared budget in smooth mode."""
+    def available_l2_bytes(self, die: int) -> int:
+        """Physical capacity minus live reservations, before stream sharing."""
         cap = self._l2_capacity.get(die)
         if cap is None:
             raise ModelingError(f"l2_die_undeclared:{die}")
-        avail = max(0, cap - self.reserved_bytes(die))
+        return max(0, cap - self.reserved_bytes(die))
+
+    def effective_l2_bytes(self, die: int) -> int:
+        """Return per-stream capacity in strict mode and the shared budget in smooth mode."""
+        avail = self.available_l2_bytes(die)
         n_active = 1 if self._knee_curve else max(1, self.active_stream_count(die))
         granule = self.granule_bytes
         return granule * (avail // (granule * n_active))
@@ -324,8 +383,10 @@ class AdmissionMemoryView:
             self._settle_eviction(victim)
 
     def _activate_key(self, key: ReuseKey) -> None:
-        self._active_keys[key.die].add(key)
-        self._evict_over_capacity(key.die)
+        keys = self._active_keys[key.die]
+        if key not in keys:
+            keys.add(key)
+            self._evict_over_capacity(key.die)
 
     def pending_writebacks(self, die: int) -> tuple[DirtyWriteback, ...]:
         return tuple(self._pending_writebacks.get(die, ()))
@@ -472,14 +533,15 @@ class AdmissionMemoryView:
 
     def _geometry(self, pattern: MemoryAccessPattern, aligned_bytes: int) -> tuple[SectorCoverage, int]:
         plan = _access_plan(pattern.runs, self.memory_access)
-        sector = plan.l2_sector_bytes or plan.sector_bytes
-        sectors = plan if sector == plan.sector_bytes else replace(plan, sector_bytes=sector)
-        coverage = sectors.sector_coverage()
-        line = plan.l2_line_bytes
-        if line and line != sector:
+        # Track residency at DRAM sector granularity so L2 never credits hits
+        # for bytes that were never billed to dram_sector_bytes, while charging
+        # capacity footprint at the SKU L2 line/sector allocation granule.
+        coverage = plan.sector_coverage()
+        alloc_granule = plan.l2_line_bytes or plan.l2_sector_bytes
+        if alloc_granule and alloc_granule != plan.sector_bytes:
             span = (
-                plan.runs[0].sector_union_bytes(line) if len(plan.runs) == 1
-                else _merged_bytes(replace(plan, sector_bytes=line).sector_coverage())
+                plan.runs[0].sector_union_bytes(alloc_granule) if len(plan.runs) == 1
+                else _merged_bytes(replace(plan, sector_bytes=alloc_granule).sector_coverage())
             )
         else:
             span = _merged_bytes(coverage)
@@ -515,7 +577,7 @@ class AdmissionMemoryView:
         entry = self._resident.get(key)
         if entry is None or entry.evicted or entry.version != pattern.version:
             return None
-        if preview:
+        if preview and key not in self._active_keys[key.die]:
             avail = max(0, self._l2_capacity[key.die] - self.reserved_bytes(key.die))
             if any(entry is victim for victim in self._eviction_victims(key.die, eff, avail)):
                 return None
@@ -599,9 +661,11 @@ class AdmissionMemoryView:
         """Attempt exact merge into ``existing``; returns True if updated in-place."""
         merged_span = existing.resident_bytes + resident_span - overlap
         spec = self.memory_access
-        line = pattern.runs.l2_line_bytes or getattr(spec, "l2_line_bytes", None)
-        sector = pattern.runs.l2_sector_bytes or getattr(spec, "l2_sector_bytes", None)
-        if line == (sector or pattern.runs.sector_bytes):
+        line = (
+            pattern.runs.l2_line_bytes or getattr(spec, "l2_line_bytes", None)
+            or pattern.runs.l2_sector_bytes or getattr(spec, "l2_sector_bytes", None)
+        )
+        if line == pattern.runs.sector_bytes:
             line = None
         can_list_merge = (
             not coverage.periodic
@@ -825,10 +889,12 @@ def bind_memory_access(
         float(l2_bytes_per_ms), pipe_row_id, l2_row_id, tuple(burst_rules), nom_pipe,
     )
 
+    # Explicit synthetic views set their own L2 geometry. Bus geometry still
+    # applies to DRAM transactions independently of the residency footprint.
     plan = _access_plan(pattern.runs, state.memory_access if isinstance(state, AdmissionMemoryView) else None)
-    plan = _access_plan(plan, hbm_bus.memory_access)
     if plan is not pattern.runs:
         pattern = replace(pattern, runs=plan)
+    plan = _access_plan(plan, hbm_bus.memory_access)
     aligned_bytes = plan.aligned_copy_bytes()
     if aligned_bytes == 0:
         ledger = ByteLedger(

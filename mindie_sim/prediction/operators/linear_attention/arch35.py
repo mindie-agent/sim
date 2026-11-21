@@ -108,7 +108,6 @@ GDN_CUBE_FLOPS_PER_CHUNK = 2 * (
 )
 GDN_SOURCES = (SOURCES[0], SOURCES[-3])
 CHUNK32_SOURCES = (SourceRef(**PR22147_SOURCE),)
-KERNEL_LAUNCH_SETUP_MS = 0.0022
 
 
 def _pairs(ctx: OperatorPlanningContext, c: LinearAttentionContract) -> tuple[tuple[int, tuple[int, ...]], ...]:
@@ -669,8 +668,24 @@ class Arch35LinearAttentionStrategy:
     def chunk32_timing_policy(
         self, context: RecipeContext, step_sync_ms: float,
     ) -> tuple[float, float]:
-        del context
-        return KERNEL_LAUNCH_SETUP_MS, step_sync_ms
+        from mindie_sim.primitives import NS_TO_MS
+
+        table = context.primitive_table
+        if table is None:
+            return 0.0, step_sync_ms
+
+        def latency(*metrics):
+            for primitive, metric in metrics:
+                cell = table.cell(primitive)
+                band = cell.metrics.get(metric) if cell.supported else None
+                if band is not None and band.p50 is not None:
+                    return band.p50 * NS_TO_MS
+            return None
+
+        setup = latency(("P12_intracore_flag", "flag_ns"))
+        sync = latency(("P13_crosscore_sync", "mode4_intra_block_ns"),
+                       ("P13_crosscore_sync", "mode2_paired_ns"))
+        return setup or 0.0, step_sync_ms if sync is None else sync
 
     def accepts(self, op: OpSpec, ctx: OperatorPlanningContext, /) -> bool:
         if ctx.compute_arch.arch_id != self.arch_id:

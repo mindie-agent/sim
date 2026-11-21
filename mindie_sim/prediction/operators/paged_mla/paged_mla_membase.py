@@ -338,5 +338,6 @@ def _owner_program(owner, owners, spec, stage, matrix_steps, ctx):
         return compact_periodic_pipeline(
             ctx, count + 2, _PIPELINE_SLOTS, cycle,
             head=_COMPACT_HEAD_CYCLES, tail=_COMPACT_TAIL_CYCLES,
-            peer_counts=peer_counts)
+            peer_counts=peer_counts,
+            peer_tails=(_COMPACT_TAIL_CYCLES,) * len(peer_counts))
     return PipelineProgram(count + 2, _PIPELINE_SLOTS, cycle)

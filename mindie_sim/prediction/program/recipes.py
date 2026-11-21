@@ -283,41 +283,30 @@ class RecipeBook:
             self._prev_expand = (ops, one_to_one, out)
         return out
 
-    @classmethod
-    def from_mapping(cls, raw, *, family_registry: Any = None):
-        from mindie_sim.prediction.operators.attention.attention_decode import StagedGQADecode
-        from mindie_sim.prediction.operators.attention.attention_prefill import StagedGQAPrefill
+    @staticmethod
+    def _mapping_factories():
+        """Return the active constructors for all declarative binding kinds."""
         from mindie_sim.prediction.operators.attention.batch_prefix_attention import BatchPrefixAttention
         from mindie_sim.prediction.operators.sparse_indexer.batch_prefix_indexer import BatchPrefixIndexer
         from mindie_sim.prediction.operators.grouped_moe.bf16_grouped import recipe as bf16_grouped
         from ..collectives import PairwiseCollective, RingCollective
         from mindie_sim.prediction.operators.collectives.direct_peer import DirectPeerCollective
-        from mindie_sim.prediction.operators.kda.family_kda_recurrent import recipes as kda_recurrent_recipes
-        from mindie_sim.prediction.operators.collectives.hccl_graph import recipes as hccl_recipes
-        from ..implementations import recipes as implementation_recipes
         from mindie_sim.prediction.operators.paged_mla.indexed_attention import recipe as indexed_attention
         from mindie_sim.prediction.operators.paged_mla.indexed_quant_attention import recipe as indexed_quant_attention
-        from mindie_sim.prediction.operators.mla.latent_dcp import recipes as latent_dcp_recipes
         from mindie_sim.prediction.operators.matrix.matrix import HierarchicalMatmul, TiledMatmul
         from mindie_sim.prediction.operators.matrix.matrix_mapping import MappedMatmul
         from mindie_sim.prediction.operators.matrix.matrix_phase import PhaseMatmul
         from mindie_sim.prediction.operators.matrix.matrix_steady import SteadyMatmul
-        from mindie_sim.prediction.operators.mc2.mc2_graph import recipes as native_moe_recipes
-        from ..mechanism import OperatorPlan, PlannedRecipe
         from mindie_sim.prediction.operators.mx_quant_matrix.mxfp4_grouped import recipe as mxa8w4_nznk
         from mindie_sim.prediction.operators.mx_quant_matrix.mxfp8_grouped import recipe as mxfp8_grouped
-        from ..operators import grouped_moe, hyper_connections, linear_attention, mc2
-        from ..operators.linear_attention.common import CHUNK32_KERNELS
-        from ..pointwise import TiledPointwise
+        from ..operators.vector import TiledPointwise
         from ..services import ResourceService
-        from mindie_sim.prediction.operators.sparse_indexer.sparse_kv_offload import recipes as sparse_kv_offload_recipes
         from mindie_sim.prediction.operators.recurrent.state_program import RecurrentVector
         from mindie_sim.prediction.operators.vector.tensor_copy import recipe as aiv_tensor_copy
-
         from mindie_sim.prediction.operators.attention.attention_decode import staged_gqa_decode
         from mindie_sim.prediction.operators.attention.attention_prefill import staged_gqa_prefill
 
-        factories = {
+        return {
             "tiled_matmul": TiledMatmul, "hierarchical_matmul": HierarchicalMatmul,
             "mapped_matmul": MappedMatmul, "phase_matmul": PhaseMatmul,
             "steady_matmul": SteadyMatmul,
@@ -335,6 +324,20 @@ class RecipeBook:
             "pairwise_collective": PairwiseCollective,
             "direct_peer_collective": DirectPeerCollective,
         }
+
+    @classmethod
+    def from_mapping(cls, raw, *, family_registry: Any = None):
+        from mindie_sim.prediction.operators.kda.family_kda_recurrent import recipes as kda_recurrent_recipes
+        from mindie_sim.prediction.operators.collectives.hccl_graph import recipes as hccl_recipes
+        from ..implementations import recipes as implementation_recipes
+        from mindie_sim.prediction.operators.mla.latent_dcp import recipes as latent_dcp_recipes
+        from mindie_sim.prediction.operators.mc2.mc2_graph import recipes as native_moe_recipes
+        from ..operators import grouped_moe, hyper_connections, linear_attention, mc2
+        from ..operators.linear_attention.common import CHUNK32_KERNELS
+        from mindie_sim.prediction.operators.sparse_indexer.sparse_kv_offload import recipes as sparse_kv_offload_recipes
+        from ..mechanism import PlannedRecipe
+
+        factories = cls._mapping_factories()
 
         def build(values):
             return {

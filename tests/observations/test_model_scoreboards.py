@@ -24,7 +24,6 @@ from tools.model_scoreboard_kimi import comparison_row, prediction_packet, predi
 pytestmark = pytest.mark.tier0
 
 RECURRENT_CASE = "kimi-k3-a5.json"
-
 def prefill_entry():
     entries = fixture_json("verification", "scoreboard-input.json")["entries"]
     return next(entry for entry in entries if entry["id"] == "glm53_a3")
@@ -171,25 +170,28 @@ def test_compact_publication_preserves_failed_latest_and_archived_selection(monk
     archive.write_bytes(full + b" ")
     with pytest.raises(ValueError, match="identity_mismatch"):
         retain(path)
-
 def test_scheduled_scoreboard_prices_draft_sampling_and_commit(monkeypatch):
     monkeypatch.syspath_prepend(str(REPO_ROOT / "tools"))
     from model_scoreboard import execution_identity, scheduled_probe
 
     case = json.loads((REPO_ROOT / "examples/cases/qwen35-a3-tp4.json").read_text())
-    case["model"]["layers"] = 4
+    from mindie_sim.schema.workload import RequestView
+    active, padding = 48, 16
+    case["model"]["layers"] = 1
     case["runtime"].setdefault("kernels", {}).setdefault("programs", {})["matmul"] = {"kind": "phase_matmul"}
-    spec = {
-        "case": case, "driver": "scheduled_iteration", "proposal_tokens": 1,
-        "geometry": {"phase": "decode", "tokens": 1, "context": 16, "sequences": 1, "scope": "model"},
-        "max_operators": 30_000, "top": 5,
-    }
+    views = [RequestView(f"slot:{index}", 1, 16, index < active, "decode", padding=index >= active,
+                         draft_proposal_tokens=int(index < active), draft_prepare=False)
+             for index in range(active + padding)]
+    spec = {"case": case, "driver": "scheduled_iteration", "proposal_tokens": 1,
+            "geometry": {"phase": "decode", "tokens": 1, "context": 16, "sequences": active + padding},
+            "request_views": {"0": [view.to_dict() for view in views]}, "max_operators": 30_000, "top": 5}
     probe = scheduled_probe(spec)
     assert {"sampling", "acceptance", "token_commit"} <= set(probe["iteration"]["families"])
     assert probe["graph"]["live_tasks"] == probe["graph"]["live_programs"] == 0
     conditions = execution_identity(spec, probe)["conditions"]
     assert conditions["tokens"] == 2 and conditions["branch"] == "full_speculative_step"
-
+    assert (conditions["active_sequences"], conditions["padding_sequences"]) == (active, padding)
+    assert probe["iteration"]["plans"][0]["requests"] == [view.to_dict() for view in views]
 def test_scheduled_prefill_runs_draft_preparation_to_completion(monkeypatch):
     monkeypatch.syspath_prepend(str(REPO_ROOT / "tools"))
     from model_scoreboard import execution_identity, scheduled_probe
@@ -212,7 +214,6 @@ def test_scheduled_prefill_runs_draft_preparation_to_completion(monkeypatch):
     spec["draft_layers"] = 3
     with pytest.raises(ValueError, match="draft_layer_count_mismatch"):
         scheduled_probe(spec)
-
 def step_entry():
     # Raw pf4k_b1.csv.gz: 2,392 positive tasks, one p4096/o1/c1 request.
     # The graph value is the independently executed phase probe retained with
@@ -271,7 +272,6 @@ def test_group_sum_mean_or_occurrence_scope_mismatch_is_not_a_residual():
     entry["predicted"]["groups"] = []
     group, = model_scoreboard([entry])["models"][0]["group_comparisons"]
     assert group["status"] == "unavailable" and group["predicted"] is None
-
 def test_executed_probe_identity_cannot_be_relabelled_to_different_geometry(monkeypatch):
     root = REPO_ROOT
     monkeypatch.syspath_prepend(str(root / "tools"))

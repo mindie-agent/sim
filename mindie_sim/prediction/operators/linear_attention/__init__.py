@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import GENERIC_ARCH_ID, ArchId
 from mindie_sim.schema.operators import OpSpec
 from ...mechanism import Geometry, OperatorPlan
@@ -59,9 +60,11 @@ def chunk32_timing_policy(
     else:
         spec = geometry.compute_arch
         arch_id = ArchId(spec.preset) if spec is not None and spec.preset else GENERIC_ARCH_ID
+    if arch_id == GENERIC_ARCH_ID and not getattr(geometry.compute_arch, "preset", ""):
+        return 0.0, 0.0
     strategy = _STRATEGIES.get(arch_id)
     if strategy is None:
-        return 0.0, 0.0
+        raise ModelingError(f"linear_attention_arch_unsupported:{arch_id}")
     return strategy.chunk32_timing_policy(context, step_sync_ms)
 
 

@@ -21,6 +21,7 @@ from dataclasses import replace
 import pytest
 from _support import axes
 from _support.builders import dense_case, dense_model, linear_model, view
+from _support.linear_cases import sku_planning_context, template_context, template_datapath
 from mindie_sim.backends.ascend import profiles
 from mindie_sim.catalog.cache import layer_cache_components
 from mindie_sim.catalog.cache_format import CacheFormat
@@ -40,6 +41,11 @@ from mindie_sim.prediction.cache_path import (
 from mindie_sim.prediction.capacity import Memory
 from mindie_sim.prediction.capacity_features import batch_cache_bytes
 from mindie_sim.prediction.efficiency import capacity_window
+from mindie_sim.prediction.engine import Engine
+from mindie_sim.prediction.operators.linear_attention.common import LinearAttentionContract, analyze_state_residency
+from mindie_sim.prediction.runtime.memory_physics import AddressRun, AddressRunPlan, AdmissionMemoryView, MemoryAccessPattern, ReuseKey
+from mindie_sim.primitives import load_primitives
+from mindie_sim.templates.fuse_region import Lowering
 from mindie_sim.prediction.prefix_reads import (
     CacheAccess, apply_prefix_read_plan, plan_prefix_reads,
 )
@@ -523,3 +529,58 @@ def oracle_bytes(spans):
             start = item.start + index * item.stride
             result.update(range(start, start + item.width))
     return result
+
+
+def test_admission_epoch_observes_resident_identity_and_eviction_order():
+    sector = AddressRunPlan().sector_bytes
+    view = AdmissionMemoryView({0: 4 * sector, 1: 4 * sector})
+    engine = Engine([])
+    engine.attach_admission_memory_view(view)
+
+    def warm(name):
+        key = ReuseKey(0, name, 0)
+        pattern = MemoryAccessPattern(name, 0, 0, 0, "read", "mte2_aic", sector,
+                                      AddressRunPlan((AddressRun(0, 1, sector, sector),)), key)
+        view.admit_access(pattern, sector)
+
+    other_die = view.residency_fingerprint(1)
+    warm("a")
+    a_epoch = engine._memory_epoch()
+    warm("b")
+    both = engine._memory_epoch()
+    warm("a")
+    assert engine._memory_epoch() != both
+    assert view.residency_fingerprint(1) == other_die
+    other = AdmissionMemoryView({0: 4 * sector, 1: 4 * sector})
+    engine.attach_admission_memory_view(other)
+    view = other
+    warm("b")
+    assert engine._memory_epoch() != a_epoch
+
+
+@pytest.mark.parametrize("sku", ["Ascend910_9362", "Ascend950DT_9582"])
+def test_template_admission_uses_working_set_sweep_at_capacity(sku):
+    path = template_datapath(sku)
+    context = replace(template_context(path, None), primitive_table=load_primitives(sku))
+    view = Lowering(path, context=context).state
+    capacity = view.effective_l2_bytes(0)
+    at_capacity = view._hit_fraction(capacity, capacity)
+    just_over = view._hit_fraction(capacity + 1, capacity)
+    assert at_capacity == 1.0
+    assert 0 < view._hit_fraction(capacity + capacity // 8, capacity) < just_over < at_capacity
+
+
+def test_staged_state_residency_sees_live_stream_pressure_on_its_die():
+    _, ctx = sku_planning_context(axes.REPRESENTATIVE_SKUS["a5"])
+    die = 1
+    contract = LinearAttentionContract("gdn_prefill", (64,), 1, 1, 1, 64, 64)
+    capacity = 12 * 1024
+    view = AdmissionMemoryView({die: capacity})
+    ctx = replace(ctx, occurrence=replace(ctx.occurrence, rank=die), admission_memory_view=view)
+    free = analyze_state_residency(contract, ctx)
+    view.enter_stream(die, "weights")
+    before = view.residency_fingerprint()
+    shared = analyze_state_residency(contract, ctx)
+    assert free.reload_bytes == 0
+    assert shared.reload_bytes == shared.chunk_bank_bytes > 0
+    assert view.residency_fingerprint() == before

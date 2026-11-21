@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Produce 3-level CANN 9.3.0 A5 silicon calibration & heldout accuracy report.
 
-[Role]
+[Role] The cohesive producer owns report assembly from capture census to verdict.
   Evaluate ``mindie_sim`` across disjoint ``train`` and ``heldout`` CANN 9.3.0
   silicon captures on ``Ascend950DT_9582`` and ``Ascend950PR_958b`` across
   Level 1 (single operators & 2P/8P UB-Mesh collectives), Level 2 (matching
@@ -14,8 +14,8 @@
     across splits fails closed.
   * Level-2 evaluation scores strictly against the matching captured layer or
     subgraph boundary (never full-body prediction or L3 step division).
-  * Strict ``< 10.0%`` acceptance is evaluated in full float precision BEFORE
-    display rounding (e.g. 9.996% passes; 10.0% fails).
+  * Every row is scored against the strict relative limit before display
+    rounding or recorded as blocked.
   * Source provenance hashes live ``mindie_sim/prediction/execution/*.py``
     (sorted) and emits strictly ``capture://`` URIs with zero private paths.
 
@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor
+from functools import partial
 from dataclasses import replace
 import json
 import math
@@ -46,6 +47,7 @@ from mindie_sim.catalog.ops import comm_op, gemm_op
 from mindie_sim.observations.multilevel_stream import (
     digest_file_streaming,
     normalize_lineage_token,
+    sanitize_capture_uri,
 )
 from mindie_sim.prediction.api import RecipeBook
 from mindie_sim.prediction.call_builders import build_aclnn_call
@@ -65,11 +67,12 @@ from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import OpSpec
 
 ROOT = Path(__file__).resolve().parents[2]
-STEADY_COLL_MIN_BYTES = 16777216
 STRICT_THRESHOLD_PCT = 10.0
 PERCENT_SCALE = 100.0
 TAIL_QUANTILE_P90 = 0.9
 DISPLAY_ROUND_DIGITS = 4
+SAMPLE_RECORD_LIMIT = 40
+SPLITS = ("train", "heldout", "unassigned")
 STATIC_TRACKED_FILES = (
     "mindie_sim/backends/profiles/ascend.json",
     "mindie_sim/prediction/operators/attention/attention_decode.py",
@@ -242,29 +245,58 @@ def _load_split_manifest(captures_dir: Path, split_manifest: Path | None) -> _Li
     return _LineageSplitResolver(json.loads(target.read_text(encoding="utf-8")))
 
 
-def _stats(apes: list[float]) -> dict[str, Any]:
-    """Compute cohort summary checking strict ``< 10.0%`` BEFORE display rounding."""
-    if not apes:
-        return {
-            "status": "insufficient_evidence",
-            "count": 0,
-            "mape_pct": None,
-            "medape_pct": None,
-            "p90_ape_pct": None,
-        }
-    s = sorted(apes)
-    mape_exact = statistics.fmean(s) * PERCENT_SCALE
-    medape_exact = statistics.median(s) * PERCENT_SCALE
-    p90_idx = min(len(s) - 1, max(0, math.ceil(TAIL_QUANTILE_P90 * len(s)) - 1))
-    p90_exact = s[p90_idx] * PERCENT_SCALE
-    passed = mape_exact < STRICT_THRESHOLD_PCT and medape_exact < STRICT_THRESHOLD_PCT
+def _timing_fields(predicted: float, measured: float) -> dict[str, Any]:
+    if not math.isfinite(measured) or measured <= 0:
+        raise ModelingError("measured_duration_invalid")
+    if not math.isfinite(predicted) or predicted <= 0:
+        raise ModelingError("predicted_duration_invalid")
+    ape = abs(predicted - measured) / measured
     return {
-        "status": "pass" if passed else "fail",
-        "count": len(s),
-        "mape_pct": round(mape_exact, DISPLAY_ROUND_DIGITS),
-        "medape_pct": round(medape_exact, DISPLAY_ROUND_DIGITS),
-        "p90_ape_pct": round(p90_exact, DISPLAY_ROUND_DIGITS),
+        "status": "ok", "ape": ape, "ape_pct": round(ape * PERCENT_SCALE, 2),
+        "pointwise_pass": ape * PERCENT_SCALE < STRICT_THRESHOLD_PCT,
     }
+
+
+def _stats(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Summarize every row and determine status from individual timing checks."""
+    apes = sorted(row["ape"] for row in rows if row["status"] == "ok")
+    passed = sum(row["pointwise_pass"] for row in rows if row["status"] == "ok")
+    failed, blocked = len(apes) - passed, len(rows) - len(apes)
+    p90_idx = math.ceil(TAIL_QUANTILE_P90 * len(apes)) - 1
+    return {
+        "status": "fail" if failed else ("insufficient_evidence" if blocked or not apes else "pass"),
+        "total": len(rows), "count": len(apes), "passed": passed, "failed": failed, "explicitly_blocked": blocked,
+        "mape_pct": round(statistics.fmean(apes) * PERCENT_SCALE, DISPLAY_ROUND_DIGITS) if apes else None,
+        "medape_pct": round(statistics.median(apes) * PERCENT_SCALE, DISPLAY_ROUND_DIGITS) if apes else None,
+        "p90_ape_pct": round(apes[p90_idx] * PERCENT_SCALE, DISPLAY_ROUND_DIGITS) if apes else None,
+    }
+
+
+def _record_status(record: Mapping[str, Any], measured: float, split: str) -> str:
+    if split not in ("train", "heldout"):
+        return "acquisition_split_unassigned"
+    if record.get("status", "ok") != "ok":
+        return "capture_row_unsuccessful"
+    if not math.isfinite(measured) or measured <= 0:
+        return "measured_duration_invalid"
+    return ""
+
+
+def _operator_row(resolver, r, doc, *, sku, name, family, fallback, uri, measured, predict):
+    split, root = resolver.resolve(r, file_doc=doc, fallback_acq=fallback)
+    row = {"id": f"{sku}:{name}", "family": family, "sku": sku, "acquisition_root": root,
+           "capture_uri": uri, "measured_us": round(measured, 3) if math.isfinite(measured) else None}
+    reason = _record_status(r, measured, split)
+    if not reason:
+        try:
+            resolved_family, predicted = predict()
+            row.update(_timing_fields(predicted, measured))
+            return split, {**row, "family": resolved_family, "predicted_us": round(predicted, 3)}
+        except ModelingError as exc:
+            reason = exc.reason
+        except (KeyError, IndexError, TypeError, ValueError):
+            reason = "unsupported_capture_geometry"
+    return split or "unassigned", {**row, "status": "blocked", "reason": reason, "predicted_us": None}
 
 
 def _eval_collective(cs_comm, coll: str, world_size: int, payload_bytes: int) -> float:
@@ -322,11 +354,11 @@ def _make_hc_op(
     )
 
 
-def _eval_fia(cs, B: int, S: int, Hq: int, Hkv: int, D: int, seq_kv: int) -> float:
+def _eval_fia(cs, B: int, S: int, Hq: int, Hkv: int, D: int, seq_kv: int, *, window: int = 0) -> float:
     gqa_meta = {
         "requests": tuple((S, max(0, seq_kv - S)) for _ in range(B)),
         "query_heads": Hq, "kv_heads": Hkv, "head_dim": D,
-        "query_dtype": "bf16", "kv_dtype": "bf16", "causal": True, "window": 0, "cp": 1,
+        "query_dtype": "bf16", "kv_dtype": "bf16", "causal": True, "window": window, "cp": 1,
     }
     shape = (B * S, seq_kv, Hq, D)
     op = OpSpec(
@@ -349,6 +381,112 @@ def _eval_gdn_chunk32(cs, T: int, Hk: int, Hv: int, K: int, V: int) -> float:
     return float(graph_costs(cs, {0: [p_op, s_op, o_op]}, recipes=rb, include_submission=False, isolated=False, fast_span_only=True)["duration_ms"]) * 1000.0
 
 
+def _single_operator(cs_bf, cs_mx, gmm_rb, dom, name, sh) -> tuple[str, float]:
+    if cs_bf is None or cs_mx is None:
+        raise ModelingError("single_operator_sku_unsupported")
+    if dom == "domain2_bf16_gemm":
+        cd = build_aclnn_call({"api": "aclnnMatmul", "dtype": "bf16", "m": sh[0], "n": sh[1], "k": sh[2]})
+        return "gemm_qmm", float(graph_costs(cs_bf, {0: cd.ops}, recipes=cd.recipes, include_submission=False, isolated=False, fast_span_only=True)["duration_ms"]) * 1000.0
+    if dom == "domain2_mxfp8_qmm":
+        op = gemm_op(op_id=name, deps=(), stage=0, layer=0, requests=("r0",), m=sh[0], n=sh[1], k=sh[2], quant=cs_mx.model.quant, category="linear_param", phase="prefill")
+        return "gemm_qmm", float(graph_costs(cs_mx, {0: [op]}, include_submission=False, isolated=False, fast_span_only=True)["duration_ms"]) * 1000.0
+    if dom == "domain3_moe_gmm" and ("uniform" in name or "zero_tail" in name):
+        act_e = sh["E_local"] // 2 if "zero_tail" in name else sh["E_local"]
+        q_spec = replace(cs_mx.model.quant.for_category("expert"), weight_format="mxfp4") if "MXFP4" in name else cs_mx.model.quant
+        meta = (("compute_format", "fp8_e4m3"), ("matrix_mapping_domain", "aggregate_experts"), ("routing_basis", "probability_moments"), ("expected_active_experts", float(act_e)), ("expected_rows", float(sh["M_total"])), ("matrix_groups", act_e))
+        op = gemm_op(op_id=name, deps=(), stage=0, layer=0, requests=("r0",), m=sh["M_total"], n=sh["N"], k=sh["K"], quant=q_spec, category="expert", phase="prefill", recipe="aclnn_grouped_matmul", family="grouped_gemm", activation_dtype="fp8_e4m3", weight_count=act_e, metadata=meta)
+        return "moe_gmm", float(graph_costs(cs_mx, {0: [op]}, recipes=gmm_rb, include_submission=False, isolated=False, fast_span_only=True)["duration_ms"]) * 1000.0
+    if dom == "domain4_fia" and "fia_v1" in name:
+        return "fia_decode", _eval_fia(cs_bf, sh["B"], sh["S"], sh["Hq"], sh["Hkv"], sh["D"], sh["seq_kv"], window=sh.get("swa", 0))
+    if dom == "probe1_c8_sfa":
+        op = bsa.make_kv_quant_sfa_c8_op(op_id=name, query_tokens=sh["B"] * sh["S"], num_heads=sh["H_q"], kv_lora_rank=512, rope_dim=64, selected_tokens=sh["topk"], batch_size=sh["B"], shared_prefix=("shared" in name or sh.get("idx_mode") == "s6_same_idx"))
+        return "c8_kv_quant_sfa", _eval_planned(cs_bf, op, bsa.build)
+    if dom == "domain4_gbsa":
+        blk = sh["block_shape"][-1]
+        op = bsa.make_gbsa_op(op_id=name, query_tokens=sh["B"] * sh["S_q"], num_heads=sh["Hq"], num_kv_heads=sh["Hkv"], head_dim=sh["hd"], selected_tokens=blk * sh["topk_blocks"], block_size=blk, batch_size=sh["B"], shared_prefix=False)
+        return "gbsa", _eval_planned(cs_bf, op, bsa.build)
+    if dom == "domain4_gbsa_sparse_gqa":
+        B, S, Hq, Hkv, hd, blk, nblk = sh
+        op = bsa.make_gbsa_op(op_id=name, query_tokens=B * S, num_heads=Hq, num_kv_heads=Hkv, head_dim=hd, selected_tokens=blk * nblk, block_size=blk, batch_size=B, shared_prefix=True)
+        return "gbsa", _eval_planned(cs_bf, op, bsa.build)
+    if dom == "domain4_indexer":
+        op = scorer.make_step5_region_score_op(op_id=name, query_tokens=sh["B"], context_tokens=sh["ctx"], index_heads=sh["H"], index_dim=sh["D"], region_block_size=sh["region_size"], topk_regions=sh["topk"], batch_size=sh["B"]) if "step5" in name else scorer.make_msa_index_score_op(op_id=name, query_tokens=sh["B"], context_tokens=sh["ctx"], index_heads=sh["Hq"], index_dim=sh["D"], return_choice=0, batch_size=sh["B"])
+        return "sparse_index_scorer", _eval_planned(cs_bf, op, scorer.build)
+    if dom in ("probe2_mhc_arch35", "probe2_mhc", "probe2_qwen4exp_hc"):
+        if "sinkhorn" in name.lower():
+            raise ModelingError("standalone_sinkhorn_geometry_unsupported")
+        M, S_hc, C, lr = (sh[0], sh[1], sh[2], 16) if isinstance(sh, list) else (sh["M"], sh.get("hc_mult", sh.get("channels", 4)), sh.get("C", sh.get("H", 2560)), sh.get("low_rank", 16))
+        var = "text_gated_residual" if "text_gated" in name else ("hc_post" if "post" in name else "hc_pre_v3")
+        return "mhc_and_gated_residual", _eval_planned(cs_bf, _make_hc_op(variant=var, op_id=name, rows=M, hidden_size=C, hc_mult=S_hc, hc_lowrank=lr), hc.build)
+    if dom == "probe3_mla_prolog":
+        M, D_hid, ql, H = sh
+        return "mla_prolog_v3_v4", _eval_planned(cs_bf, prolog4.make_op(op_id=name, tokens=M, hidden_size=D_hid, num_heads=H, q_lora_rank=ql, weight_quant_mode=0, kv_cache_quant_mode=0), prolog4.build)
+    if dom == "domain5_gdn_chunks" and "chunk32" in name:
+        return "gdn_chunk32", _eval_gdn_chunk32(cs_bf, sh["T"], sh["Hk"], sh["Hv"], sh["K"], sh["V"])
+    raise ModelingError("single_operator_variant_unsupported")
+
+
+def _sequence_operator(cs_dt, dom, name, sh) -> tuple[str, float]:
+    if dom == "shard0_fia_decode" and sh.get("kv_dtype", "bf16") == "bf16":
+        return "fia_decode", _eval_fia(cs_dt, sh["B"], sh["S"], sh["Hq"], sh["Hkv"], sh["D"], sh["seq_kv"], window=sh.get("swa_window", 0))
+    if dom == "shard1_c8_sfa":
+        return "c8_kv_quant_sfa", _eval_planned(cs_dt, bsa.make_kv_quant_sfa_c8_op(op_id=name, query_tokens=sh["B"] * sh["S"], num_heads=sh["Hq"], kv_lora_rank=512, rope_dim=64, selected_tokens=sh["topk"], batch_size=sh["B"], shared_prefix=False), bsa.build)
+    if dom == "shard2_minimax_msa":
+        return "sparse_index_scorer", _eval_planned(cs_dt, scorer.make_msa_index_score_op(op_id=name, query_tokens=sh["B"] * sh["S"], context_tokens=sh["seq_kv"], index_heads=sh["Hq"], index_dim=sh["D"], return_choice=1, batch_size=sh["B"]), scorer.build)
+    if dom == "shard2_step5_region_score":
+        return "sparse_index_scorer", _eval_planned(cs_dt, scorer.make_step5_region_score_op(op_id=name, query_tokens=sh["B"], context_tokens=sh["seq_kv"], index_heads=sh["H"], index_dim=sh["D"], region_block_size=sh["region_size"], topk_regions=sh["topk"], batch_size=sh["B"]), scorer.build)
+    if dom == "shard3_gdn_chunk32":
+        return "gdn_chunk32", _eval_gdn_chunk32(cs_dt, sh["T"], sh["Hk"], sh["Hv"], sh["D"], sh["D"])
+    if dom == "shard3_mhc":
+        return "mhc_and_gated_residual", _eval_planned(cs_dt, _make_hc_op(variant="hc_post" if "post" in name else "hc_pre_v3", op_id=name, rows=sh["M"], hidden_size=sh["C"], hc_mult=sh["hc_mult"]), hc.build)
+    if dom in ("shard3_mla_prolog_v3", "shard3_mla_prolog_v4"):
+        return "mla_prolog_v3_v4", _eval_planned(cs_dt, prolog4.make_op(op_id=name, tokens=sh["M"], hidden_size=sh["D_hid"], num_heads=sh["H"], q_lora_rank=sh["q_lora"], weight_quant_mode=3 if "v4" in dom else 0, kv_cache_quant_mode=1 if "v4" in dom else 0), prolog4.build)
+    if dom == "shard3_text_gated_residual":
+        return "mhc_and_gated_residual", _eval_planned(cs_dt, _make_hc_op(variant="text_gated_residual", op_id=name, rows=sh["M"], hidden_size=sh["H"], hc_mult=sh["channels"], hc_lowrank=sh["low_rank"]), hc.build)
+    raise ModelingError("sequence_operator_variant_unsupported")
+
+
+def _hotspot_operator(cs, record, name, shape) -> tuple[str, float]:
+    if record.get("group") != "Roofline_Cube" or "bf16" not in name:
+        raise ModelingError("hotspot_operator_variant_unsupported")
+    call = build_aclnn_call({"api": "aclnnMatmul", "dtype": "bf16", "m": shape["M"], "n": shape.get("N", 4096), "k": shape.get("K", 4096)})
+    report = graph_costs(cs, {0: call.ops}, recipes=call.recipes, include_submission=False,
+                         isolated=False, fast_span_only=True)
+    return "gemm_qmm", float(report["duration_ms"]) * 1000.0
+
+
+def _collect_collective_rows(doc, collect):
+    comm_cases = {}
+
+    def predict(sku, coll, world_size, payload):
+        if payload <= 0 or coll not in ("AllReduce", "AllToAll"):
+            raise ModelingError("collective_geometry_unsupported")
+        key = sku, world_size
+        if key not in comm_cases:
+            comm_cases[key] = parse_case(compose_case("qwen3.8-27b", hardware=sku, tp=world_size, ep=1,
+                                                    num_devices=world_size, layers=1, quant="none"))
+        return "ub_mesh_collectives", _eval_collective(comm_cases[key], coll, world_size, payload)
+
+    for row in doc.get("collective_measurements", ()):
+        payload, coll = int(row.get("bytes", 0)), row.get("collective", "")
+        world_size, sku = int(row.get("world_size", 2)), row.get("sku", "Ascend950DT_9582")
+        name = f"{coll}_w{world_size}_{payload}"
+        capture = row.get("source_ref")
+        uri = (sanitize_capture_uri(capture) if isinstance(capture, str) and capture.startswith("capture://")
+               else f"capture://cann93-a5-microbench/{sku}/ub_mesh/{name}")
+        collect(row, doc, sku=sku, name=name, family="ub_mesh_collectives", fallback=f"d1:comm:{sku}:{name}",
+                uri=uri,
+                measured=_measurement(row, "eager_p50_us", "eager_p50_us"), predict=partial(predict, sku, coll, world_size, payload))
+
+
+def _measurement(row: Mapping[str, Any], field: str, fallback: str = "cold_p50_us") -> float:
+    metrics = row.get("metrics") or {}
+    try:
+        return float(metrics.get(field) or metrics.get(fallback) or 0)
+    except (TypeError, ValueError):
+        return math.nan
+
+
 def evaluate_level1(captures_dir: Path, resolver: _LineageSplitResolver) -> dict[str, Any]:
     skus = ("Ascend950DT_9582", "Ascend950PR_958b")
     cases_bf = {s: parse_case(compose_case("qwen3.8-27b", hardware=s, tp=1, ep=1, num_devices=1, layers=1, quant="none")) for s in skus}
@@ -357,140 +495,52 @@ def evaluate_level1(captures_dir: Path, resolver: _LineageSplitResolver) -> dict
     d1 = json.loads((captures_dir / "cann93_single_op_measurements.json").read_text(encoding="utf-8"))
     d2 = json.loads((captures_dir / "cann93_seq512_to_400k_measurements.json").read_text(encoding="utf-8"))
     d4 = json.loads((captures_dir / "task1_kimi_k31_silicon_hotspots.json").read_text(encoding="utf-8"))
-    records: dict[str, list[dict[str, Any]]] = {"train": [], "heldout": []}
+    records: dict[str, list[dict[str, Any]]] = {split: [] for split in SPLITS}
 
-    def add(split: str, fam: str, sku: str, rec_id: str, meas: float, pred: float, uri: str, acq_root: str) -> None:
-        ape = abs(pred - meas) / meas
-        records[split].append({
-            "id": f"{sku}:{rec_id}", "family": fam, "sku": sku, "acquisition_root": acq_root,
-            "measured_us": round(meas, 3), "predicted_us": round(pred, 3),
-            "ape_pct": round(ape * PERCENT_SCALE, 2), "ape": ape, "capture_uri": uri,
-        })
+    def collect(*args, **kwargs):
+        split, row = _operator_row(resolver, *args, **kwargs)
+        records[split].append(row)
 
-    for sku in skus:
-        cs_bf, cs_mx = cases_bf[sku], cases_mx[sku]
-        for r in (d1.get("single_op_measurements") or {}).get(sku, ()):
-            if r.get("status") != "ok":
-                continue
-            dom, name, sh = r.get("domain", ""), r["op_name"], r.get("shape")
-            sp, acq_root = resolver.resolve(r, file_doc=d1, fallback_acq=f"d1:{sku}:{dom}:{name}")
-            if sp not in ("train", "heldout"):
-                continue
-            m_dict = r.get("metrics") or {}
-            meas = float((m_dict.get("rts_stream_saturated_us") if dom in ("domain2_bf16_gemm", "domain2_mxfp8_qmm", "domain3_moe_gmm") else None) or m_dict.get("cold_p50_us") or 0.0)
-            if meas <= 0.0:
-                continue
-            uri = f"capture://cann93-a5-microbench/{sku}/{dom}/{name}"
-            if dom == "domain2_bf16_gemm" and sh[0] >= 512:
-                cd = build_aclnn_call({"api": "aclnnMatmul", "dtype": "bf16", "m": sh[0], "n": sh[1], "k": sh[2]})
-                add(sp, "gemm_qmm", sku, name, meas, float(graph_costs(cs_bf, {0: cd.ops}, recipes=cd.recipes, include_submission=False, isolated=False, fast_span_only=True)["duration_ms"]) * 1000.0, uri, acq_root)
-            elif dom == "domain2_mxfp8_qmm" and sh[0] >= 256:
-                op = gemm_op(op_id=name, deps=(), stage=0, layer=0, requests=("r0",), m=sh[0], n=sh[1], k=sh[2], quant=cs_mx.model.quant, category="linear_param", phase="prefill")
-                add(sp, "gemm_qmm", sku, name, meas, float(graph_costs(cs_mx, {0: [op]}, include_submission=False, isolated=False, fast_span_only=True)["duration_ms"]) * 1000.0, uri, acq_root)
-            elif dom == "domain3_moe_gmm" and ("uniform" in name or "zero_tail" in name):
-                act_e = sh["E_local"] // 2 if "zero_tail" in name else sh["E_local"]
-                q_spec = replace(cs_mx.model.quant.for_category("expert"), weight_format="mxfp4") if "MXFP4" in name else cs_mx.model.quant
-                meta = (("compute_format", "fp8_e4m3"), ("matrix_mapping_domain", "aggregate_experts"), ("routing_basis", "probability_moments"), ("expected_active_experts", float(act_e)), ("expected_rows", float(sh["M_total"])), ("matrix_groups", act_e))
-                op = gemm_op(op_id=name, deps=(), stage=0, layer=0, requests=("r0",), m=sh["M_total"], n=sh["N"], k=sh["K"], quant=q_spec, category="expert", phase="prefill", recipe="aclnn_grouped_matmul", family="grouped_gemm", activation_dtype="fp8_e4m3", weight_count=act_e, metadata=meta)
-                add(sp, "moe_gmm", sku, name, meas, float(graph_costs(cs_mx, {0: [op]}, recipes=gmm_rb, include_submission=False, isolated=False, fast_span_only=True)["duration_ms"]) * 1000.0, uri, acq_root)
-            elif dom == "domain4_fia" and "fia_v1" in name and sh.get("swa", 0) == 0:
-                add(sp, "fia_decode", sku, name, meas, _eval_fia(cs_bf, sh["B"], sh["S"], sh["Hq"], sh["Hkv"], sh["D"], sh["seq_kv"]), uri, acq_root)
-            elif dom == "probe1_c8_sfa":
-                op = bsa.make_kv_quant_sfa_c8_op(op_id=name, query_tokens=sh["B"] * sh["S"], num_heads=sh["H_q"], kv_lora_rank=512, rope_dim=64, selected_tokens=sh["topk"], batch_size=sh["B"], shared_prefix=("shared" in name or sh.get("idx_mode") == "s6_same_idx"))
-                add(sp, "c8_kv_quant_sfa", sku, name, meas, _eval_planned(cs_bf, op, bsa.build), uri, acq_root)
-            elif dom == "domain4_gbsa":
-                blk = sh["block_shape"][-1]
-                op = bsa.make_gbsa_op(op_id=name, query_tokens=sh["B"] * sh["S_q"], num_heads=sh["Hq"], num_kv_heads=sh["Hkv"], head_dim=sh["hd"], selected_tokens=blk * sh["topk_blocks"], block_size=blk, batch_size=sh["B"], shared_prefix=False)
-                add(sp, "gbsa", sku, name, meas, _eval_planned(cs_bf, op, bsa.build), uri, acq_root)
-            elif dom == "domain4_gbsa_sparse_gqa":
-                B, S, Hq, Hkv, hd, blk, nblk = sh
-                op = bsa.make_gbsa_op(op_id=name, query_tokens=B * S, num_heads=Hq, num_kv_heads=Hkv, head_dim=hd, selected_tokens=blk * nblk, block_size=blk, batch_size=B, shared_prefix=True)
-                add(sp, "gbsa", sku, name, meas, _eval_planned(cs_bf, op, bsa.build), uri, acq_root)
-            elif dom == "domain4_indexer":
-                op = scorer.make_step5_region_score_op(op_id=name, query_tokens=sh["B"], context_tokens=sh["ctx"], index_heads=sh["H"], index_dim=sh["D"], region_block_size=sh["region_size"], topk_regions=sh["topk"], batch_size=sh["B"]) if "step5" in name else scorer.make_msa_index_score_op(op_id=name, query_tokens=sh["B"], context_tokens=sh["ctx"], index_heads=sh["Hq"], index_dim=sh["D"], return_choice=0, batch_size=sh["B"])
-                add(sp, "sparse_index_scorer", sku, name, meas, _eval_planned(cs_bf, op, scorer.build), uri, acq_root)
-            elif dom in ("probe2_mhc_arch35", "probe2_mhc", "probe2_qwen4exp_hc") and "sinkhorn_T960" not in name:
-                M, S_hc, C, lr = (sh[0], sh[1], sh[2], 16) if isinstance(sh, list) else (sh["M"], sh.get("hc_mult", sh.get("channels", 4)), sh.get("C", sh.get("H", 2560)), sh.get("low_rank", 16))
-                var = "text_gated_residual" if "text_gated" in name else ("hc_post" if "post" in name else "hc_pre_v3")
-                add(sp, "mhc_and_gated_residual", sku, name, meas, _eval_planned(cs_bf, _make_hc_op(variant=var, op_id=name, rows=M, hidden_size=C, hc_mult=S_hc, hc_lowrank=lr), hc.build), uri, acq_root)
-            elif dom == "probe3_mla_prolog":
-                M, D_hid, ql, H = sh
-                add(sp, "mla_prolog_v3_v4", sku, name, meas, _eval_planned(cs_bf, prolog4.make_op(op_id=name, tokens=M, hidden_size=D_hid, num_heads=H, q_lora_rank=ql, weight_quant_mode=0, kv_cache_quant_mode=0), prolog4.build), uri, acq_root)
-            elif dom == "domain5_gdn_chunks" and "chunk32" in name:
-                add(sp, "gdn_chunk32", sku, name, meas, _eval_gdn_chunk32(cs_bf, sh["T"], sh["Hk"], sh["Hv"], sh["K"], sh["V"]), uri, acq_root)
+    for sku, rows in (d1.get("single_op_measurements") or {}).items():
+        for index, row in enumerate(rows):
+            dom, name, shape = row.get("domain", ""), row.get("op_name") or f"row-{index}", row.get("shape")
+            field = "rts_stream_saturated_us" if dom in ("domain2_bf16_gemm", "domain2_mxfp8_qmm", "domain3_moe_gmm") else "cold_p50_us"
+            collect(row, d1, sku=sku, name=name, family=dom, fallback=f"d1:{sku}:{dom}:{name}",
+                    uri=f"capture://cann93-a5-microbench/{sku}/{dom}/{name}", measured=_measurement(row, field),
+                    predict=partial(_single_operator, cases_bf.get(sku), cases_mx.get(sku), gmm_rb, dom, name, shape))
+    _collect_collective_rows(d1, collect)
 
-    comm_cases: dict[tuple[str, int], Any] = {}
-    for r in d1.get("collective_measurements", ()):
-        b, coll, w, sku = int(r.get("bytes", 0)), r.get("collective", ""), int(r.get("world_size", 2)), r.get("sku", "Ascend950DT_9582")
-        sp, acq_root = resolver.resolve(r, file_doc=d1, fallback_acq=f"d1:comm:{sku}:{coll}:w{w}:{b}")
-        meas = float((r.get("metrics") or {}).get("eager_p50_us") or 0.0)
-        if sp in ("train", "heldout") and b >= STEADY_COLL_MIN_BYTES and meas > 0.0 and coll in ("AllReduce", "AllToAll"):
-            cs_comm = comm_cases.get((sku, w))
-            if cs_comm is None:
-                cs_comm = parse_case(compose_case("qwen3.8-27b", hardware=sku, tp=w, ep=1, num_devices=w, layers=1, quant="none"))
-                comm_cases[(sku, w)] = cs_comm
-            pred = _eval_collective(cs_comm, coll, w, b)
-            add(sp, "ub_mesh_collectives", sku, f"{coll}_w{w}_{b}", meas, pred, str(r.get("source_ref") or f"capture://cann93-a5-microbench/{sku}/ub_mesh/{coll}_{b}"), acq_root)
+    sku = skus[0]
+    cs_dt = cases_bf[sku]
+    sequence_root = str(d2.get("acquisition_uid") or d2.get("run_uid")
+                        or "d2:" + digest_file_streaming(captures_dir / "cann93_seq512_to_400k_measurements.json"))
+    for index, row in enumerate(d2.get("records", ())):
+        dom, name, shape = row.get("domain", ""), row.get("op_name") or f"row-{index}", row.get("shape")
+        collect(row, d2, sku=sku, name=name, family=dom, fallback=sequence_root,
+                uri=f"capture://cann93-a5-seq512-400k/{sku}/{dom}/{name}", measured=_measurement(row, "cold_p50_us"),
+                predict=partial(_sequence_operator, cs_dt, dom, name, shape))
+    for index, row in enumerate(d4.get("records", ())):
+        name, shape = row.get("op_name") or f"row-{index}", row.get("shape") or {}
+        collect(row, d4, sku=sku, name=f"kimi_{name}", family="gemm_qmm", fallback="d4:kimi_hotspots",
+                uri=f"capture://cann93-a5-kimi-k31-hotspots/{sku}/Roofline_Cube/{name}", measured=_measurement(row, "cold_p50_us"),
+                predict=partial(_hotspot_operator, cs_dt, row, name, shape))
 
-    cs_dt = cases_bf["Ascend950DT_9582"]
-    d2_fallback_acq = str(
-        d2.get("acquisition_uid")
-        or d2.get("run_uid")
-        or f"d2:{digest_file_streaming(captures_dir / 'cann93_seq512_to_400k_measurements.json')[:16]}"
-    )
-    for r in d2.get("records", ()):
-        if r.get("status") != "ok":
-            continue
-        sh, dom, name = r["shape"], r["domain"], r["op_name"]
-        sp, acq_root = resolver.resolve(r, file_doc=d2, fallback_acq=d2_fallback_acq)
-        meas = float((r.get("metrics") or {}).get("cold_p50_us") or 0.0)
-        if sp not in ("train", "heldout") or meas <= 0.0:
-            continue
-        uri = f"capture://cann93-a5-seq512-400k/Ascend950DT_9582/{dom}/{name}"
-        if dom == "shard0_fia_decode" and sh.get("kv_dtype", "bf16") == "bf16" and sh.get("swa_window", 0) == 0:
-            add(sp, "fia_decode", "Ascend950DT_9582", name, meas, _eval_fia(cs_dt, sh["B"], sh["S"], sh["Hq"], sh["Hkv"], sh["D"], sh["seq_kv"]), uri, acq_root)
-        elif dom == "shard1_c8_sfa":
-            add(sp, "c8_kv_quant_sfa", "Ascend950DT_9582", name, meas, _eval_planned(cs_dt, bsa.make_kv_quant_sfa_c8_op(op_id=name, query_tokens=sh["B"] * sh["S"], num_heads=sh["Hq"], kv_lora_rank=512, rope_dim=64, selected_tokens=sh["topk"], batch_size=sh["B"], shared_prefix=False), bsa.build), uri, acq_root)
-        elif dom == "shard2_minimax_msa":
-            add(sp, "sparse_index_scorer", "Ascend950DT_9582", name, meas, _eval_planned(cs_dt, scorer.make_msa_index_score_op(op_id=name, query_tokens=sh["B"] * sh["S"], context_tokens=sh["seq_kv"], index_heads=sh["Hq"], index_dim=sh["D"], return_choice=1, batch_size=sh["B"]), scorer.build), uri, acq_root)
-        elif dom == "shard2_step5_region_score":
-            add(sp, "sparse_index_scorer", "Ascend950DT_9582", name, meas, _eval_planned(cs_dt, scorer.make_step5_region_score_op(op_id=name, query_tokens=sh["B"], context_tokens=sh["seq_kv"], index_heads=sh["H"], index_dim=sh["D"], region_block_size=sh["region_size"], topk_regions=sh["topk"], batch_size=sh["B"]), scorer.build), uri, acq_root)
-        elif dom == "shard3_gdn_chunk32":
-            add(sp, "gdn_chunk32", "Ascend950DT_9582", name, meas, _eval_gdn_chunk32(cs_dt, sh["T"], sh["Hk"], sh["Hv"], sh["D"], sh["D"]), uri, acq_root)
-        elif dom == "shard3_mhc":
-            add(sp, "mhc_and_gated_residual", "Ascend950DT_9582", name, meas, _eval_planned(cs_dt, _make_hc_op(variant="hc_post" if "post" in name else "hc_pre_v3", op_id=name, rows=sh["M"], hidden_size=sh["C"], hc_mult=sh["hc_mult"]), hc.build), uri, acq_root)
-        elif dom in ("shard3_mla_prolog_v3", "shard3_mla_prolog_v4"):
-            add(sp, "mla_prolog_v3_v4", "Ascend950DT_9582", name, meas, _eval_planned(cs_dt, prolog4.make_op(op_id=name, tokens=sh["M"], hidden_size=sh["D_hid"], num_heads=sh["H"], q_lora_rank=sh["q_lora"], weight_quant_mode=3 if "v4" in dom else 0, kv_cache_quant_mode=1 if "v4" in dom else 0), prolog4.build), uri, acq_root)
-        elif dom == "shard3_text_gated_residual":
-            add(sp, "mhc_and_gated_residual", "Ascend950DT_9582", name, meas, _eval_planned(cs_dt, _make_hc_op(variant="text_gated_residual", op_id=name, rows=sh["M"], hidden_size=sh["H"], hc_mult=sh["channels"], hc_lowrank=sh["low_rank"]), hc.build), uri, acq_root)
-
-    # Kimi hotspot records strictly follow frozen acquisition manifest lineage (never index order!).
-    for r in d4.get("records", ()):
-        sh = r.get("shape") or {}
-        meas = float((r.get("metrics") or {}).get("cold_p50_us") or 0.0)
-        if r.get("status") != "ok" or r.get("group") != "Roofline_Cube" or "bf16" not in r["op_name"] or meas <= 0.0:
-            continue
-        sp, acq_root = resolver.resolve(r, file_doc=d4, fallback_acq=str(d4.get("acquisition_uid") or "d4:kimi_hotspots"))
-        if sp not in ("train", "heldout"):
-            continue
-        name = r["op_name"]
-        cd = build_aclnn_call({"api": "aclnnMatmul", "dtype": "bf16", "m": sh["M"], "n": sh.get("N", 4096), "k": sh.get("K", 4096)})
-        pred = float(graph_costs(cs_dt, {0: cd.ops}, recipes=cd.recipes, include_submission=False, isolated=False, fast_span_only=True)["duration_ms"]) * 1000.0
-        add(sp, "gemm_qmm", "Ascend950DT_9582", f"kimi_{name}", meas, pred, f"capture://cann93-a5-kimi-k31-hotspots/Ascend950DT_9582/Roofline_Cube/{name}", acq_root)
-
-    out: dict[str, Any] = {}
-    for sp in ("train", "heldout"):
-        rows = records[sp]
-        by_fam: dict[str, list[float]] = {}
-        for x in rows:
-            by_fam.setdefault(x["family"], []).append(x["ape"])
-        out[sp] = {
-            "summary": _stats([x["ape"] for x in rows]),
-            "families": {f: _stats(v) for f, v in sorted(by_fam.items())},
-            "ids": [x["id"] for x in rows],
-            "sample_records": [{k: v for k, v in x.items() if k != "ape"} for x in rows[:40]],
+    out = {}
+    for split, rows in records.items():
+        by_family = {}
+        for row in rows:
+            by_family.setdefault(row["family"], []).append(row)
+        report_rows = [_display_row(row) for row in rows]
+        out[split] = {
+            "summary": _stats(rows), "families": {f: _stats(v) for f, v in sorted(by_family.items())},
+            "ids": [row["id"] for row in rows], "records": report_rows,
+            "sample_records": report_rows[:SAMPLE_RECORD_LIMIT],
         }
     return out
+
+
+def _display_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in row.items() if key != "ape"}
 
 
 def _eval_l2_boundary(
@@ -508,7 +558,7 @@ def _eval_l2_boundary(
     if (not indep_l2_uri or indep_l2_uri == l3_uri
             or not l2_acq_root or l2_acq_root == l3_acq_root
             or l2_split not in ("train", "heldout")
-            or indep_l2_meas is None or float(indep_l2_meas) <= 0.0):
+            or indep_l2_meas is None or not math.isfinite(float(indep_l2_meas)) or float(indep_l2_meas) <= 0.0):
         return {
             "status": "missing_evidence", "reason": "independent_l2_block_capture_absent",
             "split": l2_split if l2_split in ("train", "heldout") else "",
@@ -545,9 +595,8 @@ def _eval_l2_boundary(
     l2_rep = graph_costs(cs_l2, l2_graphs, external_inputs={"analysis_input": 0}, include_submission=False, isolated=False, fast_span_only=True)
     l2_pred_us = float(l2_rep["duration_ms"]) * 1000.0
     l2_meas_us = float(indep_l2_meas)
-    l2_ape = abs(l2_pred_us - l2_meas_us) / l2_meas_us
     return {
-        "status": "ok",
+        **_timing_fields(l2_pred_us, l2_meas_us),
         "split": l2_split,
         "acquisition_root": l2_acq_root,
         "capture_uri": indep_l2_uri,
@@ -555,8 +604,6 @@ def _eval_l2_boundary(
         "l2_layers": l2_layers,
         "measured_block_us": round(l2_meas_us, 2),
         "predicted_block_us": round(l2_pred_us, 2),
-        "ape": l2_ape,
-        "ape_pct": round(l2_ape * PERCENT_SCALE, 2),
     }
 
 
@@ -600,7 +647,12 @@ def _eval_model_run(task: tuple[dict[str, Any], str, str, str, str]) -> dict[str
         ("prefill_B4_S512", "prefill", 512, 0, 4, "prefill_B4_S512_device_p50_ms", "prefill_B4_S512_per_layer_us"),
     ):
         meas = t.get(mkey)
-        if not meas:
+        try:
+            meas = float(meas or 0)
+        except (TypeError, ValueError):
+            meas = 0
+        if not math.isfinite(meas) or meas <= 0:
+            phases[ptag] = {"phase": ph, "status": "blocked", "reason": "step_duration_invalid"}
             continue
         sched_toks = tok * seqs
         cap_mode = "piecewise" if (cg_mode == "PIECEWISE" or "piecewise" in rung or sched_toks > cg_max) else "full"
@@ -621,7 +673,6 @@ def _eval_model_run(task: tuple[dict[str, Any], str, str, str, str]) -> dict[str
         cs = parse_case(raw)
         rep = graph_costs(cs, target_graphs(cs, phase=ph, tokens=tok, context=ctx, sequences=seqs, scope="model"), external_inputs={"analysis_input": 0}, include_submission=True, isolated=False, fast_span_only=True)
         pred_ms = float(rep["duration_ms"])
-        ape = abs(pred_ms - float(meas)) / float(meas)
         replays_per_rep = max(1, int(rep["execution"]["submission"]["graph_replays"]) // max(1, dp))
         l2_block = _eval_l2_boundary(
             cs, r, ph=ph, tok=tok, ctx=ctx, seqs=seqs, lkey=lkey,
@@ -630,7 +681,7 @@ def _eval_model_run(task: tuple[dict[str, Any], str, str, str, str]) -> dict[str
         )
         phases[ptag] = {
             "phase": ph, "cap_mode": cap_mode, "measured_ms": round(float(meas), 3), "predicted_ms": round(pred_ms, 3),
-            "ape": ape, "ape_pct": round(ape * PERCENT_SCALE, 2),
+            **_timing_fields(pred_ms, float(meas)),
             "l2_block": l2_block, "fx_post_split_subgraphs": fx_sub, "predicted_replays": replays_per_rep,
         }
     return {
@@ -650,11 +701,23 @@ def build_report(
     l1 = evaluate_level1(captures_dir, resolver)
     d3 = json.loads((captures_dir / "cann93_model_subgraphs_and_perf.json").read_text(encoding="utf-8"))
     run_tasks: list[tuple[dict[str, Any], str, str, str, str]] = []
+    l2: dict[str, list[dict[str, Any]]] = {split: [] for split in SPLITS}
+    l3: dict[str, list[dict[str, Any]]] = {split: [] for split in SPLITS}
     for mv in (d3.get("models") or {}).values():
         for r in (mv.get("runs") or {}).values():
-            if r.get("status") != "ok" or r.get("rung") == "raw_eager":
-                continue
             sp, acq_root = resolver.resolve(r, file_doc=d3, fallback_acq=str(r.get("acquisition_uid") or r["run_id"]))
+            reason = _record_status(r, 1, sp)
+            if not reason:
+                if r.get("status") != "ok":
+                    reason = "capture_row_unsuccessful"
+                elif r.get("rung") == "raw_eager":
+                    reason = "raw_eager_step_boundary_unsupported"
+            if reason:
+                l3[sp or "unassigned"].append({
+                    "id": r["run_id"], "run_id": r["run_id"], "acquisition_root": acq_root,
+                    "status": "blocked", "reason": reason,
+                })
+                continue
             l2_probe = {
                 "acquisition_uid": r.get("l2_acquisition_uid"),
                 "acquisition_root": r.get("l2_acquisition_root"),
@@ -671,12 +734,14 @@ def build_report(
     else:
         run_results = [_eval_model_run(task) for task in run_tasks]
 
-    l2: dict[str, list[dict[str, Any]]] = {"train": [], "heldout": []}
-    l3: dict[str, list[dict[str, Any]]] = {"train": [], "heldout": []}
     fx_matches = 0
     for rr in run_results:
         sp = rr["split"]
         for ptag, pv in rr["phases"].items():
+            if pv["status"] == "blocked":
+                l3[sp].append({**pv, "id": f"{rr['run_id']}:{ptag}", "run_id": rr["run_id"],
+                               "acquisition_root": rr["acquisition_root"], "capture_uri": rr["capture_uri"]})
+                continue
             if pv["cap_mode"] == "piecewise" and pv["fx_post_split_subgraphs"] is not None and int(pv["fx_post_split_subgraphs"]) == int(pv["predicted_replays"]):
                 fx_matches += 1
             blk = pv["l2_block"]
@@ -689,12 +754,14 @@ def build_report(
                 "measured_block_us": blk["measured_block_us"], "predicted_block_us": blk["predicted_block_us"],
                 "fx_post_split_subgraphs": pv["fx_post_split_subgraphs"], "predicted_replays": pv["predicted_replays"],
                 "ape_pct": blk["ape_pct"], "ape": blk["ape"], "capture_uri": blk["capture_uri"],
+                "pointwise_pass": blk.get("pointwise_pass"),
             })
             l3[sp].append({
                 "id": f"{rr['run_id']}:{ptag}", "run_id": rr["run_id"], "model_id": rr["model_id"], "rung": rr["rung"],
                 "acquisition_root": rr["acquisition_root"], "topology": rr["topology"], "layers": rr["layers"],
                 "phase": pv["phase"], "measured_ms": pv["measured_ms"], "predicted_ms": pv["predicted_ms"],
                 "ape_pct": pv["ape_pct"], "ape": pv["ape"], "capture_uri": rr["capture_uri"],
+                "status": pv["status"], "pointwise_pass": pv["pointwise_pass"],
             })
 
     acq_overlap = resolver.overlap_count()
@@ -711,20 +778,20 @@ def build_report(
             "acquisition_root_overlap": acq_overlap,
             "exact_fx_subgraph_matches": fx_matches,
         },
-        "level1_operators": {sp: {k: v for k, v in l1[sp].items() if k != "ids"} for sp in ("train", "heldout")},
+        "level1_operators": {sp: {k: v for k, v in l1[sp].items() if k != "ids"} for sp in SPLITS},
         "level2_subgraphs_and_blocks": {
             sp: {
                 "summary": {
-                    **_stats([x["ape"] for x in l2[sp] if x.get("status") == "ok" and x.get("ape") is not None]),
+                    **_stats(l2[sp]),
                     "missing_evidence": sum(1 for x in l2[sp] if x.get("status") == "missing_evidence"),
                 },
                 "records": [{k: v for k, v in x.items() if k != "ape"} for x in l2[sp]],
             }
-            for sp in ("train", "heldout")
+            for sp in SPLITS
         },
         "level3_model_steps": {
-            sp: {"summary": _stats([x["ape"] for x in l3[sp]]), "records": [{k: v for k, v in x.items() if k != "ape"} for x in l3[sp]]}
-            for sp in ("train", "heldout")
+            sp: {"summary": _stats(l3[sp]), "records": [{k: v for k, v in x.items() if k != "ape"} for x in l3[sp]]}
+            for sp in SPLITS
         },
         "wall_seconds": round(time.perf_counter() - t0, 2),
     }
@@ -747,7 +814,9 @@ def main(argv: list[str] | None = None) -> int:
         "l3_train": report["level3_model_steps"]["train"]["summary"], "l3_heldout": report["level3_model_steps"]["heldout"]["summary"],
         "fx_matches": report["disjoint_split_verification"]["exact_fx_subgraph_matches"], "wall_seconds": report["wall_seconds"],
     }, indent=2))
-    return 0
+    levels = (report["level1_operators"], report["level2_subgraphs_and_blocks"], report["level3_model_steps"])
+    return int(any(level["heldout"]["summary"]["status"] != "pass" or level["unassigned"]["summary"]["total"]
+                   for level in levels))
 
 
 if __name__ == "__main__":

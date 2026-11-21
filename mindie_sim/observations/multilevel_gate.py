@@ -4,15 +4,17 @@
   and score independent L1/L2/L3 release evidence.
 [Invariants] Normalize digests and scope events by acquisition root and session.
   Reject capture mismatches and require HMAC-bound Engine receipts with zero offset.
-  Release requires independent coverage, all planned cases and pointwise tolerance.
+  Release requires independent coverage, complete same-capture step censuses,
+  all planned cases and pointwise tolerance. This cohesive module owns
+  capture/case admission through scoring and the final release verdict.
 [Timeouts & Locks] Two-pass 64 KiB streaming and compact tuples. No locks or devices.
 [Side-Effect Policy] Read-only over manifests, captures, and frozen fits.
 """
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Iterable, Iterator, Mapping, Sequence
-from dataclasses import asdict, dataclass
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from dataclasses import asdict, dataclass, field
 from functools import partial
 import math
 from pathlib import Path, PurePosixPath
@@ -20,15 +22,15 @@ import statistics
 from types import MappingProxyType
 from typing import Any, Literal, Protocol, overload, runtime_checkable
 
-from mindie_sim.observations.multilevel_drilldown import score_vertical_drilldown
+from mindie_sim.observations._capture_verify import verify_capture_file_consistency as _verify_capture
+from mindie_sim.observations.multilevel_drilldown import DRILLDOWN_LEVELS, score_vertical_drilldown
 from mindie_sim.observations.multilevel_stream import (
     CAPTURE_URI_SCHEME, MS_TO_NS, SHA256_HEX_LENGTH, SOURCE_REF_KEYS, STREAM_CHUNK_BYTES,
     STREAM_WHOLE_READ_LIMIT_BYTES, TIME_UNIT_SCALE_NS, VALID_CLOCK_OPERATORS,
-    EngineInterval, EngineRunReceipt, _req_sha256, _req_str, _validate_clock_operator,
+    EngineInterval, EngineRunReceipt, _extract_capture_meta, _req_sha256, _req_str, _validate_clock_operator,
     bind_engine_interval, bind_engine_rung_interval, digest_file_streaming, iter_manifest_json_cases,
     normalize_lineage_token, resolve_capture_file, sanitize_capture_uri, sanitize_source_ref,
     scan_manifest_json_pass1, stream_jsonl, validate_engine_interval, validate_provenance_text,
-    verify_capture_file_consistency,
 )
 from mindie_sim.schema.common import ModelingError
 
@@ -139,11 +141,17 @@ class Residual:
     clock_operator: str = "elapsed_span"
     elapsed_span_ns: int | None = None
     busy_union_ns: int | None = None
+    capture_scope: tuple[str, ...] = ()
+    capture_events: frozenset[str] = frozenset()
+    capture_ranks: frozenset[int] = frozenset()
+    expected_components: tuple[str, ...] = ()
     def to_dict(self) -> dict[str, Any]:
         out = asdict(self)
         out["signed_error"] = None if math.isnan(self.signed_error) else self.signed_error
         out["absolute_percentage_error"] = None if math.isnan(self.absolute_percentage_error) else self.absolute_percentage_error
         out["regime_dims"] = dict(self.regime_dims)
+        out["capture_events"] = sorted(self.capture_events)
+        out["capture_ranks"] = sorted(self.capture_ranks)
         return out
 
 
@@ -204,16 +212,17 @@ class CohortSummary:
     tail_case_ids: tuple[str, ...] = ()
     acquisition_roots: tuple[str, ...] = ()
     evaluated_ok_case_ids: tuple[str, ...] = ()
-    atol_ns: float = 0.0
+    atol_ns: float = DEFAULT_ATOL_NS
     pointwise_failed_count: int = 0
+    complete_drilldowns: int = 0
+    drilldowns: tuple[tuple[str, dict[str, Any]], ...] = ()
+    diagnostic_only: bool = False
     @property
     def passed(self) -> bool:
         return self.status == "pass"
     @property
     def tail_exceeded(self) -> bool:
-        if self.atol_ns > 0.0:
-            return self.pointwise_failed_count > 0
-        return bool(self.tail_case_ids) or (self.p90_ape_pct is not None and self.p90_ape_pct >= self.threshold_pct)
+        return self.pointwise_failed_count > 0
 
 
 @runtime_checkable
@@ -433,6 +442,14 @@ def stream_manifest(
     )
 
 
+def _verify_case_capture(case: GateCase, path: Path) -> None:
+    _verify_capture(
+        case.case_id, case.boundary, path, measured_ns=case.measured_ns, ijson_mod=ijson,
+        digest_fn=digest_file_streaming, stream_chunk_bytes=STREAM_CHUNK_BYTES,
+        extract_meta_fn=_extract_capture_meta,
+    )
+
+
 def validate_lineage(
     manifest: Manifest | str | Path, fits: FrozenFitManifest, *,
     capture_root: str | Path | None = None,
@@ -463,7 +480,7 @@ def validate_lineage(
                 if require_capture_files:
                     raise ModelingError(f"capture_file_missing:{case.case_id}")
             else:
-                verify_capture_file_consistency(case.case_id, b, cap_path, ijson_mod=ijson)
+                _verify_case_capture(case, cap_path)
             if cap_root is not None and b.source_ref:
                 ref_map = dict(b.source_ref)
                 ref_path = cap_root / PurePosixPath(ref_map["relative_path"])
@@ -578,12 +595,22 @@ def _make_residual(
     excluded_reason: str = "", signed_delta_ns: int | None = None,
     arm_a_err: float | None = None, arm_b_err: float | None = None,
 ) -> Residual:
+    scope, events, ranks, expected = (), frozenset(), frozenset(), ()
+    if case.level == "L3" or case.debug_cross_level:
+        b = case.boundary
+        scope = (case.split, b.raw_sha256.lower(), b.acquisition_uid, b.run_uid,
+                 b.session_id or b.run_uid, b.clock_domain)
+        events, ranks = frozenset(b.event_ids), frozenset(b.device_ranks)
+    if case.level == "L3":
+        expected = _parse_str_tuple(dict(case.payload).get("component_case_ids"),
+                                    f"invalid_drilldown_component_ids:{case.case_id}")
     return Residual(
         case.case_id, case.level, case.cohort, root, measured_ns,
         interval.predicted_ns if interval else 0, interval.engine_receipt if interval else "",
         signed_error, math.nan if math.isnan(signed_error) else abs(signed_error),
         status, excluded_reason, case.boundary.boundary_kind, signed_delta_ns, arm_a_err, arm_b_err, case.regime_dims,
         case.boundary.clock_operator, interval.elapsed_span_ns if interval else None, interval.busy_union_ns if interval else None,
+        scope, events, ranks, expected,
     )
 
 
@@ -595,7 +622,12 @@ def evaluate(
     capture_files: Mapping[str, str | Path] | None = None,
     require_capture_files: bool = False,
 ) -> Iterator[Residual]:
-    """Two-pass streaming gate: Pass 1 lineage/capture verification, Pass 2 Engine scoring."""
+    """Verify lineage and captures, then score each case on the Engine.
+
+    A step declares its L1 and L2 case IDs in payload.component_case_ids.
+    The inner cases are debug_cross_level rows from the same raw capture and
+    session. Their events and ranks cover the step's declared capture census.
+    """
     resolved = stream_manifest(manifest) if isinstance(manifest, (str, Path)) else manifest
     split_index = validate_lineage(
         resolved, fits, capture_root=capture_root,
@@ -606,7 +638,8 @@ def evaluate(
     for case in resolved.cases:
         if target_split != "all" and case.split != target_split:
             continue
-        root, is_debug = split_index.root_for(case.case_id), case.case_id in split_index.debug_only_cases
+        root = split_index.root_for(case.case_id)
+        is_debug = case.debug_cross_level or case.case_id in split_index.debug_only_cases
         if case.is_counterfactual and not case.has_matched_capture:
             yield _make_residual(case, root, measured_ns=int(case.measured_ns or 0), status="counterfactual_excluded", excluded_reason="counterfactual_without_matched_capture")
             continue
@@ -651,17 +684,20 @@ def evaluate(
             )
 
 
-def _physical_tolerance_ns(measured_ns: int, threshold_pct: float, atol_ns: float) -> float:
-    return max(threshold_pct / PERCENT_SCALE * abs(measured_ns), atol_ns)
+def _validate_tolerance(threshold_pct: float, atol_ns: float) -> None:
+    if type(atol_ns) not in (int, float) or not 0 <= atol_ns <= DEFAULT_ATOL_NS:
+        raise ModelingError("physical_atol_ns_out_of_bounds")
+    if type(threshold_pct) not in (int, float) or not 0 < threshold_pct <= DEFAULT_THRESHOLD_PCT:
+        raise ModelingError("physical_threshold_pct_out_of_bounds")
 
 
 def exceeds_physical_tolerance(
-    predicted_ns: int, measured_ns: int, *, threshold_pct: float = DEFAULT_THRESHOLD_PCT, atol_ns: float = 0.0,
+    predicted_ns: int | float, measured_ns: int | float, *, threshold_pct: float = DEFAULT_THRESHOLD_PCT,
+    atol_ns: float = DEFAULT_ATOL_NS,
 ) -> bool:
-    """Check the combined tolerance, with equality allowed when a noise floor is enabled."""
-    limit = _physical_tolerance_ns(measured_ns, threshold_pct, atol_ns)
-    error = abs(predicted_ns - measured_ns)
-    return error > limit if atol_ns > 0.0 else error >= limit
+    """Check pointwise error against the relative tolerance and capped timer floor."""
+    _validate_tolerance(threshold_pct, atol_ns)
+    return abs(predicted_ns - measured_ns) > max(threshold_pct / PERCENT_SCALE * abs(measured_ns), atol_ns)
 
 
 def evaluate_vertical_drilldown(
@@ -673,59 +709,111 @@ def evaluate_vertical_drilldown(
     return score_vertical_drilldown(step_predicted_ns, step_measured_ns, components, exceeds)
 
 
+def _step_census(step: Residual, candidates: Iterable[Residual]) -> tuple[str, list[tuple[str, str, int, int]]]:
+    expected = set(step.expected_components)
+    if not expected or len(expected) != len(step.expected_components) or not step.capture_events:
+        return "missing_or_invalid_component_census", []
+    inner = [row for row in candidates if row.case_id in expected
+             or row.capture_events and row.capture_events <= step.capture_events]
+    in_step = [
+        row for row in inner if row.capture_events and row.capture_events <= step.capture_events
+        and row.capture_ranks and row.capture_ranks <= step.capture_ranks
+    ]
+    verified = [row for row in in_step if row.status == "debug_only" and row.engine_receipt and row.measured_ns > 0]
+    parts = [(f"{row.level}_in_L3", row.case_id, row.predicted_ns, row.measured_ns) for row in verified]
+    if {row.case_id for row in inner} != expected or len(inner) != len(expected):
+        return "component_census_mismatch", parts
+    if len(in_step) != len(inner):
+        return "component_events_or_ranks_outside_step", parts
+    if len(verified) != len(inner):
+        return "component_evidence_unavailable", parts
+    if {part[0] for part in parts} != set(DRILLDOWN_LEVELS):
+        return "component_levels_missing", parts
+    if frozenset().union(*(row.capture_events for row in verified)) != step.capture_events:
+        return "component_events_incomplete", parts
+    if frozenset().union(*(row.capture_ranks for row in verified)) != step.capture_ranks:
+        return "component_ranks_incomplete", parts
+    return "", parts
+
+
+def _score_step_censuses(
+    steps: Iterable[Residual], inner: Mapping[tuple[str, ...], list[Residual]],
+    exceeds: Callable[[int, int], bool],
+) -> tuple[int, tuple[tuple[str, dict[str, Any]], ...]]:
+    reports, complete = [], 0
+    for step in steps:
+        reason, components = _step_census(step, inner.get(step.capture_scope, ()))
+        report = score_vertical_drilldown(step.predicted_ns, step.measured_ns, components, exceeds)
+        if reason:
+            report.update(passed=False, failure_reason=reason)
+        else:
+            complete += 1
+        reports.append((step.case_id, report))
+    return complete, tuple(reports)
+
+
+@dataclass(slots=True)
+class _CohortRows:
+    apes: list[float] = field(default_factory=list)
+    signed: list[float] = field(default_factory=list)
+    roots: set[str] = field(default_factory=set)
+    tails: list[str] = field(default_factory=list)
+    evaluated: set[str] = field(default_factory=set)
+    excluded: Counter[str] = field(default_factory=Counter)
+    steps: list[Residual] = field(default_factory=list)
+    missing: int = 0
+    independent: int = 0
+
+
 def summarize_cohorts(
     residuals: Iterable[Residual], *, threshold_pct: float = DEFAULT_THRESHOLD_PCT,
-    strict_pointwise: bool = True, atol_ns: float = 0.0,
+    strict_pointwise: bool = True, atol_ns: float = DEFAULT_ATOL_NS,
 ) -> dict[CohortKey, CohortSummary]:
-    """Report raw percentages. With a noise floor, gate on fractions of each row's tolerance."""
-    physical = atol_ns > 0.0
-    buckets: dict[CohortKey, list[Any]] = {}
+    """Report descriptive percentages and score pointwise evidence at each level."""
+    _validate_tolerance(threshold_pct, atol_ns)
+    exceeds = partial(exceeds_physical_tolerance, threshold_pct=threshold_pct, atol_ns=atol_ns)
+    buckets: dict[CohortKey, _CohortRows] = {}
+    inner: dict[tuple[str, ...], list[Residual]] = {}
     for row in residuals:
+        diagnostic = row.level in {"L1", "L2"} and bool(row.capture_scope)
+        if diagnostic:
+            inner.setdefault(row.capture_scope, []).append(row)
         bucket = buckets.get(row.cohort)
         if bucket is None:
-            bucket = [[], [], set(), [], set(), Counter(), [], 0]
-            buckets[row.cohort] = bucket
-        apes, signed, roots, tails, evaluated_ok, excluded, tolerance_ratios, _ = bucket
-        ape_pct = row.absolute_percentage_error * PERCENT_SCALE
-        if row.status == "ok" and math.isfinite(ape_pct):
-            apes.append(ape_pct)
-            signed.append(row.signed_error * PERCENT_SCALE)
-            roots.add(row.acquisition_root)
-            evaluated_ok.add(row.case_id)
-            if physical:
-                limit = _physical_tolerance_ns(row.measured_ns, threshold_pct, atol_ns)
-                tolerance_ratios.append(abs(row.predicted_ns - row.measured_ns) / limit)
-            exceeded = (exceeds_physical_tolerance(
-                row.predicted_ns, row.measured_ns, threshold_pct=threshold_pct, atol_ns=atol_ns,
-            ) if physical else ape_pct >= threshold_pct)
-            if exceeded:
-                tails.append(row.case_id)
+            bucket = buckets[row.cohort] = _CohortRows()
+        bucket.independent += not diagnostic
+        if not diagnostic and row.status == "ok" and math.isfinite(row.absolute_percentage_error):
+            bucket.apes.append(row.absolute_percentage_error * PERCENT_SCALE)
+            bucket.signed.append(row.signed_error * PERCENT_SCALE)
+            bucket.roots.add(row.acquisition_root)
+            bucket.evaluated.add(row.case_id)
+            if exceeds(row.predicted_ns, row.measured_ns):
+                bucket.tails.append(row.case_id)
+            if row.level == "L3":
+                bucket.steps.append(row)
         else:
-            excluded[row.excluded_reason or row.status] += 1
-            bucket[-1] += int(row.status == "missing_evidence")
+            bucket.excluded[row.excluded_reason or row.status] += 1
+            bucket.missing += not diagnostic and row.status in {"missing_evidence", "invalid_evidence"}
+
     summaries: dict[CohortKey, CohortSummary] = {}
-    for cohort_key, (apes, signed, roots, tails, evaluated_ok, excluded, ratios, missing) in buckets.items():
-        excluded_tuple = tuple(sorted(excluded.items()))
-        if not apes:
-            summaries[cohort_key] = CohortSummary(
-                cohort_key, "insufficient_evidence", 0, 0, None, None, None, None, None,
-                missing, excluded_tuple, threshold_pct, ("insufficient_evidence",), atol_ns=atol_ns,
-            )
-            continue
-        apes.sort()
-        mape_pct, medape_pct = float(statistics.fmean(apes)), float(statistics.median(apes))
-        p90_idx = min(len(apes) - 1, max(0, math.ceil(TAIL_QUANTILE_P90 * len(apes)) - 1))
-        scores = (statistics.fmean(ratios), statistics.median(ratios)) if physical else (mape_pct, medape_pct)
-        failed = tuple(name for name, score in zip(("mape_pct", "medape_pct"), scores)
-                       if (score > 1.0 if physical else score >= threshold_pct))
-        if strict_pointwise and tails:
-            failed += ("max_ape_pct",)
-        status: CohortStatus = "fail" if failed else ("insufficient_evidence" if missing else "pass")
-        summaries[cohort_key] = CohortSummary(
-            cohort_key, status, len(roots), len(apes),
-            mape_pct, medape_pct, float(statistics.median(signed)), float(apes[p90_idx]), float(apes[-1]),
-            missing, excluded_tuple, threshold_pct, failed, tuple(tails), tuple(sorted(roots)), tuple(sorted(evaluated_ok)),
-            atol_ns=atol_ns, pointwise_failed_count=len(tails),
+    for key, bucket in buckets.items():
+        complete, drilldowns = _score_step_censuses(bucket.steps, inner, exceeds)
+        failed = (("max_ape_pct",) if strict_pointwise and bucket.tails else ())
+        if any(report["failed_components"] for _, report in drilldowns):
+            failed += ("vertical_drilldown",)
+        apes = sorted(bucket.apes)
+        status: CohortStatus = "fail" if failed else (
+            "insufficient_evidence" if not apes or bucket.missing or complete != len(bucket.steps) else "pass"
+        )
+        p90_idx = math.ceil(TAIL_QUANTILE_P90 * len(apes)) - 1
+        summaries[key] = CohortSummary(
+            key, status, len(bucket.roots), len(apes), statistics.fmean(apes) if apes else None,
+            statistics.median(apes) if apes else None, statistics.median(bucket.signed) if apes else None,
+            apes[p90_idx] if apes else None, apes[-1] if apes else None,
+            bucket.missing, tuple(sorted(bucket.excluded.items())), threshold_pct, failed,
+            tuple(bucket.tails), tuple(sorted(bucket.roots)), tuple(sorted(bucket.evaluated)),
+            atol_ns=atol_ns, pointwise_failed_count=len(bucket.tails), complete_drilldowns=complete,
+            drilldowns=drilldowns, diagnostic_only=not bucket.independent,
         )
     return summaries
 
@@ -733,7 +821,7 @@ def summarize_cohorts(
 def gate_decision(
     summaries: Mapping[CohortKey, CohortSummary], *,
     threshold_pct: float = DEFAULT_THRESHOLD_PCT,
-    atol_ns: float = 0.0,
+    atol_ns: float = DEFAULT_ATOL_NS,
     required_levels: Sequence[Level] = REQUIRED_LEVELS,
     require_disjoint_level_roots: bool = True,
     expected_case_ids: Iterable[str] | None = None,
@@ -747,8 +835,8 @@ def gate_decision(
     evaluated_case_ids argument is retained for caller compatibility. Physical
     tolerance settings must match those used to score the cohorts.
     """
-    if any((atol_ns > 0.0 or v.atol_ns > 0.0) and (atol_ns != v.atol_ns or threshold_pct != v.threshold_pct)
-           for v in summaries.values()):
+    _validate_tolerance(threshold_pct, atol_ns)
+    if any(atol_ns != v.atol_ns or threshold_pct != v.threshold_pct for v in summaries.values()):
         raise ModelingError("cohort_physical_tolerance_mismatch")
     missing_planned_cases = []
     if expected_case_ids is not None:
@@ -756,10 +844,14 @@ def gate_decision(
         missing_planned_cases = sorted(set(expected_case_ids) - evaluated)
     pointwise_failures = {
         k.as_id() for k, v in summaries.items()
-        if (v.pointwise_failed_count > 0 if atol_ns > 0.0 else v.max_ape_pct is not None and v.max_ape_pct >= threshold_pct)
+        if v.pointwise_failed_count > 0
     }
     failed = sorted(pointwise_failures | {k.as_id() for k, v in summaries.items() if v.status == "fail"})
-    insufficient = sorted(k.as_id() for k, v in summaries.items() if v.status == "insufficient_evidence")
+    insufficient = sorted(
+        k.as_id() for k, v in summaries.items()
+        if not v.diagnostic_only and (v.status == "insufficient_evidence"
+                                     or k.level == "L3" and v.complete_drilldowns != v.n_rows)
+    )
     tail_warnings = sorted(k.as_id() for k, v in summaries.items() if v.tail_exceeded)
     covered_levels: set[str] = set()
     root_levels: dict[str, set[str]] = {}
@@ -771,7 +863,7 @@ def gate_decision(
     missing_levels = sorted(lvl for lvl in required_levels if lvl not in covered_levels)
     overlapping_roots = sorted(r for r, lvls in root_levels.items() if len(lvls) > 1)
     incomplete = (
-        not summaries or insufficient or missing_levels or missing_planned_cases
+        not covered_levels or insufficient or missing_levels or missing_planned_cases
         or (require_disjoint_level_roots and overlapping_roots)
         or plan_only or (calibrated_count is not None and calibrated_count <= 0)
     )
@@ -782,6 +874,7 @@ def gate_decision(
         "overlapping_level_roots": overlapping_roots,
         "failed_cohorts": failed, "insufficient_cohorts": insufficient, "tail_warning_cohorts": tail_warnings,
         "pointwise_threshold_exceeded": sorted(pointwise_failures),
+        "vertical_drilldowns": {case_id: report for summary in summaries.values() for case_id, report in summary.drilldowns},
         "missing_planned_cases": missing_planned_cases, "plan_only": plan_only, "calibrated_count": calibrated_count,
     }
 

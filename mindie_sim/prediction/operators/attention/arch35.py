@@ -173,24 +173,49 @@ GBSA_HEAD_GROUP_ROWS = 16
 class _C8Read:
     pattern: MemoryAccessPattern
     bound: BoundAccess
-    admission: _C8Admission
+    admission: AdmissionMemoryView | _C8Admission
+    duplicate: bool = False
 
     def start(self, engine, name, ready, *, owner=""):
+        if self.duplicate and isinstance(self.admission, AdmissionMemoryView):
+            return self._start_duplicate(engine, name, ready, owner)
         return engine.submit_bound_access(
             name, self.bound, after=(ready,), owner=owner, memory_state=self.admission, pattern=self.pattern,
         )
 
+    def _start_duplicate(self, engine, name, ready, owner):
+        """Issue an independent gather whose matching sibling publishes the fill."""
+        from ...runtime.engine_submit import _rebind_access
+
+        done = engine.future(name)
+
+        def issue(event):
+            view, pattern = self.admission, self.pattern
+            identity = (view, pattern.die, pattern.tensor_id, pattern.version)
+            dirty = view.pending_writebacks(pattern.die) or getattr(engine, "_inflight_writebacks", {}).get(identity)
+            if dirty:
+                transfer = engine.submit_bound_access(
+                    name, self.bound, after=(event,), owner=owner, memory_state=view, pattern=pattern,
+                )
+            else:
+                live = _rebind_access(self.bound, pattern, view, commit=False)
+                transfer = engine.submit_bound_access(name, live, after=(event,), owner=owner)
+            engine.on_complete(transfer, lambda _: engine.resolve(done))
+
+        engine.submit(name + ":admit", after=(ready,), owner=owner, on_complete=issue, native_hook=True)
+        return done
+
 
 @dataclass(frozen=True, slots=True)
 class _C8Query:
-    program: Callable[[_C8Admission], KernelProgram]
+    program: Callable[[AdmissionMemoryView | _C8Admission], KernelProgram]
     hbm: str
     key: ReuseKey
     capacity: int
     ctx: OperatorPlanningContext
 
     def start(self, engine, name, ready, *, owner=""):
-        view = self.ctx.admission_memory_view if self.ctx.requests else None
+        view = self.ctx.admission_memory_view or engine.admission_memory_view
         legacy = view is None
         admission = _C8Admission(_c8_memory(engine, self.hbm, self.key.die, self.capacity)) if legacy else view
         program = self.program(admission)
@@ -309,7 +334,7 @@ class _C8Gather:
     row_bytes: int
     key: ReuseKey
 
-    def lower(self, context, aiv, aiv_count, admission):
+    def lower(self, context, aiv, aiv_count, admission, issued_runs):
         hbm = context.resource_names["hbm"]
         pipe_role = "mte2_aiv" if "mte2_aiv" in context.resource_names else "mte2"
         pipe_units = context.resource_units.get(pipe_role, 1)
@@ -327,8 +352,10 @@ class _C8Gather:
             )
             bound = context.bind_access(pattern, hbm_bus=bus, copy_hit_bytes_per_ms=pipe_rate,
                                         copy_miss_bytes_per_ms=pipe_rate)
+            duplicate = runs in issued_runs
+            issued_runs.add(runs)
             stages.append(Stage("read" if index == 0 else f"read-{index}",
-                                program=_C8Read(pattern, bound, admission)))
+                                program=_C8Read(pattern, bound, admission, duplicate)))
         return KernelProgram(tuple(stages))
 
 
@@ -338,7 +365,7 @@ def _l2_capacity(ctx: OperatorPlanningContext) -> int:
         raise unmodeled("attention_l2_owner", "Bind one shared L2 allocation owner per die")
     if not (geometry.rates.get("l2") or geometry.resource_units.get("l2")):
         return 0
-    if ctx.requests and ctx.admission_memory_view is not None:
+    if ctx.admission_memory_view is not None:
         return ctx.admission_memory_view.effective_l2_bytes(geometry.rank or 0)
     return geometry.buffers.get("l2", dict(ctx.datapath.buffers).get("l2", 0))
 
@@ -429,6 +456,7 @@ class _PackedAttention:
 
         def query(index, core, admission=None):
             intervals = tuple(self.intervals(self.counts[index]))
+            issued_runs = set()
             branches = []
             for split, (start, end) in enumerate(intervals):
                 owner = core + split if self.ctx.requests else (core + split) % owner_count
@@ -438,7 +466,7 @@ class _PackedAttention:
                     if phase.memory is None:
                         stages.append(_stage(context, phase, places[owner]))
                     else:
-                        gather = phase.memory.lower(context, aiv, datapath.aiv_count, admission)
+                        gather = phase.memory.lower(context, aiv, datapath.aiv_count, admission, issued_runs)
                         stages.append(Stage(phase.name, after=phase.after, program=gather))
                 branches.append(KernelProgram(tuple(stages)))
             stages = [Stage("splits", program=ParallelProgram(tuple(branches)))]

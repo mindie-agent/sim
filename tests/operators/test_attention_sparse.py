@@ -28,7 +28,7 @@ from mindie_sim.prediction.local_projection_tp import _local_dimension, _packed_
 from mindie_sim.prediction.mechanism import Geometry
 from mindie_sim.prediction.operators import attention as governed
 from mindie_sim.prediction.operators.attention.common import MINDIE_V1_ABI, MINDIE_V2_ABI, MINDIE_V3_ABI
-from mindie_sim.prediction.program import RecipeContext
+from mindie_sim.prediction.program import AddressRun, AddressRunPlan, AdmissionMemoryView, MemoryAccessPattern, RecipeContext, ReuseKey
 from mindie_sim.prediction.operators.sparse_indexer.sparse_mla_metadata import IMPLEMENTATION as METADATA_RECIPE, NATIVE
 from mindie_sim.prediction.verification import verify_operator
 from mindie_sim.public.errors import UnmodeledCapabilityError
@@ -430,6 +430,46 @@ def test_packed_residency_starts_after_the_dma_completes():
     assert reads[0]["start_ms"] < reads[1]["end_ms"] and reads[1]["start_ms"] < reads[0]["end_ms"]
     assert [row["demand"].get("hbm", 0) for row in reads] == [672, 672, 0, 0]
     assert [row["demand"].get("l2", 0) for row in reads] == [0, 0, 672, 672]
+
+
+def test_packed_read_reuses_shared_die_cache_without_requests():
+    die, row_bytes = 1, 672
+    view = AdmissionMemoryView({die: 4 * row_bytes})
+    geom = replace(geometry(), rank=die, admission_memory_view=view)
+    key = ReuseKey(die, "layer-cache", 0)
+    pattern = MemoryAccessPattern("layer-cache", 0, die, 0, "read", "mte2_aiv", row_bytes,
+                                  AddressRunPlan((AddressRun(0, 1, row_bytes, row_bytes),)), key)
+    assert view.admit_access(pattern, row_bytes) == (0, row_bytes)
+    op = governed.make_kv_quant_sfa_c8_op(
+        op_id="decode", query_tokens=1, num_heads=1, selection_lists=((0,),), kv_tensor_id="layer-cache",
+    )
+    engine, context = engine_binding(op, geom)
+    done = governed.build(op, geom).lower(context).start(engine, "decode", engine.submit("input"))
+    engine.advance(until=(done,))
+    assert engine.delivered["l2"] == row_bytes and engine.delivered.get("hbm", 0) == 0
+
+
+@pytest.mark.parametrize("known_page", [False, True])
+def test_paged_attention_reuses_only_proven_backing_addresses(known_page):
+    view = AdmissionMemoryView({0: 1024**2})
+    geom = Geometry.from_devices(sku_case(VECTOR_SKU).machine.dies)
+    geom = replace(geom, admission_memory_view=view, rates={**geom.rates, "l2": geom.rates["hbm"]},
+                   resource_units={**geom.resource_units, "l2": 1})
+    contract = governed.AttentionContract(1, 1, 1, 128, 128, selected_tokens=32, kv_layout="PA_BLK_BSND",
+                                          kv_tensor_id="layer-cache", block_table=((0,),) if known_page else ())
+    op = governed.make_attention_op(contract, op_id="decode")
+    engine, context = engine_binding(op, geom)
+    ready = engine.submit("input")
+    for name in ("first", "second"):
+        request_geom = replace(geom, requests=(RequestView(name, 1, 31, True, "decode"),))
+        ready = governed.build(op, request_geom).lower(context).start(engine, name, ready)
+        engine.advance(until=(ready,))
+    reads = [row["demand"] for row in engine.trace if ":k_panel_" in row["task"] and row["demand"]]
+    assert len(reads) == 2 and reads[0]["hbm"] > 0
+    if known_page:
+        assert reads[1].get("l2", 0) > 0 and reads[1].get("hbm", 0) == 0
+    else:
+        assert reads[1] == reads[0]
 
 
 @pytest.mark.parametrize("distinct_allocations", [False, True])

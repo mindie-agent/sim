@@ -18,10 +18,12 @@ import resource
 import subprocess
 import time
 
+from mindie_sim.prediction.operators.hyper_connections import GovernedAttnResRecipe, build
 from mindie_sim.prediction.operators.hyper_connections.family_attnres import (
-    AttnResPrefixState, IMPLEMENTATION, SOURCE, attn_res_point,
+    AttnResPrefixState, IMPLEMENTATION, RECIPE, SOURCE, attn_res_point,
 )
 from mindie_sim.prediction.operator_analysis import operator_costs
+from mindie_sim.prediction.program import RecipeBook
 from mindie_sim.prediction.structure import parse_case
 
 
@@ -49,6 +51,8 @@ def caller_points(case, tokens, phase, optimize_prefill):
 
 def evaluate(case, tokens, phase, optimize_prefill):
     points = caller_points(case, tokens, phase, optimize_prefill)
+    # The report consumes the physical per-owner view published by prepare().
+    book = RecipeBook({RECIPE: GovernedAttnResRecipe(build)})
     counts, representatives = Counter(), {}
     for point in points:
         view = dict(point.metadata)["attn_res_view"]
@@ -84,7 +88,7 @@ def evaluate(case, tokens, phase, optimize_prefill):
     candidates = []
     for index, (key, point) in enumerate(representatives.items()):
         count = counts[key]
-        row = operator_costs(case, [point], input_ready_ms=3)["operators"][0]
+        row = operator_costs(case, [point], recipes=book, input_ready_ms=3)["operators"][0]
         operator = row["operator"]
         view = operator["metadata"]["attn_res_view"]
         candidates.append({

@@ -407,9 +407,9 @@ def operator_costs(case, ops, *, recipes=None, primitives=None, replay_scope=Non
                 isolated_replica=int(replica), evaluation=ctx,
                 stream_plans=stream_plans)
             execution._compact_step = not execution.legacy_diagnostics
-            execution.engine._compact_step = execution._compact_step
         else:
             execution.reset_engine()
+        execution.engine._compact_step = execution._compact_step
         op, recipe = execution.prepare(op, replica)
         if requires_collective_cohort(case, op, recipe):
             raise ValueError(

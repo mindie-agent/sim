@@ -10,23 +10,26 @@ from __future__ import annotations
 
 import ctypes
 import math
-import tracemalloc
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from fractions import Fraction
 from types import SimpleNamespace
 
 import pytest
 
-from _support.axes import REPRESENTATIVE_SKUS
-from _support.linear_cases import template_context, template_datapath
+from _support.axes import ALL_SKUS
+from mindie_sim import compose_case
+from mindie_sim.prediction.cost import CostModel
 from mindie_sim.prediction.coupled import coupled_rates
 from mindie_sim.prediction.engine import Engine, OccurrenceKey, Resource
+from mindie_sim.prediction.execution import Execution
+from mindie_sim.prediction.operator_replay import operator_costs
+from mindie_sim.prediction.operators.matrix.refill_steady import compact_periodic_pipeline
 from mindie_sim.prediction.ownership import unit_rates
 import mindie_sim.prediction.program as prog_pkg
 from mindie_sim.prediction.program import (
     AddressRun, AddressRunPlan, AdmissionMemoryView, Allocation, BurstTurnRule,
     DirtyWriteback, HbmBusSpec, KernelProgram, MemoryAccessPattern, ParallelProgram,
-    RecipeContext, ReuseKey, Stage, VectorInstructionGroup, VisibilityContract,
+    PipelineProgram, RecipeBook, RecipeContext, ReuseKey, Stage, VectorInstructionGroup, VisibilityContract,
     coalesce_execution_program, merge_programs, proportional_coupled_placement,
 )
 from mindie_sim.prediction.runtime.accel_tables import pure_task
@@ -44,12 +47,12 @@ from mindie_sim.prediction.runtime.tile_solver import (
     TilePipelineSpec, TileShape, solve as solve_tiles,
 )
 from mindie_sim.prediction.runtime.wave_recorder import RecordedPipelineSpec, WaveRecorder
-from mindie_sim.primitives import UncertaintyBand, load_primitives, lower_primitive, submit_lowered_primitive
+from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError
-from mindie_sim.templates.contracts import TensorRangeObligation, _split_entry_residency
-from mindie_sim.templates.fuse_region import Lowering
+from mindie_sim.schema.operators import OpSpec
 
 pytestmark = pytest.mark.tier0
+P05_SKUS = tuple(p for p in ALL_SKUS if p.id in {"Ascend910_9362", "Ascend950DT_9582"})
 
 def _ulp_distance(a: float, b: float) -> int:
     return 0 if a == b else int(round(abs(a - b) / max(math.ulp(a), math.ulp(b))))
@@ -516,85 +519,82 @@ def test_program_facade_reexports_and_stage_builtin_metadata_guards():
     with pytest.raises(ModelingError, match="stage_cohort_widened_invalid"):
         Stage("bad_w", cohort_widened=(123,))  # type: ignore[arg-type]
 
-@pytest.mark.parametrize("live,backend", ((False, "python"), (True, "python"), (True, "c")))
-def test_template_l2_fill_visibility_and_dirty_writeback_delivery(live, backend):
-    sector, capacity = AddressRunPlan().sector_bytes, 1024
-    dp = replace(template_datapath(REPRESENTATIVE_SKUS["a5"]), hbm_read_bytes_per_s=sector * 1000)
-    context = template_context(dp, None, mte2_aiv=sector / 0.002 * dp.aiv_count, l2=sector / 0.002)
-    view = AdmissionMemoryView({0: capacity}, granule_bytes=sector)
-    scratch = MemoryAccessPattern("scratch", 0, 0, 0, "write", "mte3", capacity,
-                                  AddressRunPlan((AddressRun(0, 1, capacity, capacity),)),
-                                  ReuseKey(0, "scratch", 0, "scratch"), visibility=VisibilityContract(private_workspace=True))
-    assert view.admit_access(scratch, capacity) == (capacity, 0)
-    plan = Lowering(dp, context=context, memory_view=view, live_admission=live)
-    plan.access("first", "shared", sector)
-    plan.access("second", "shared", sector)
-    result = plan.result("K3", "readers", (), None, (), SimpleNamespace(pool_peaks=()))
-    engine = Engine([Resource(name, rate, units=context.resource_units[name]) for name, rate in context.rates.items()],
-                    backend=backend, trace_limit=32)
-    done = result.program.start(engine, "readers", engine.submit("arrived", release=1.0))
-    engine.advance(until=(done,))
-    if live:
-        trace = {row["task"]: row for row in engine.trace}
-        first, second = (trace[f"readers:{reader}:program"] for reader in ("first", "second"))
-        assert (first["start_ms"], first["end_ms"]) == pytest.approx((1, 2))
-        assert second["start_ms"] >= first["end_ms"] and second["end_ms"] == pytest.approx(2.002)
-    assert result.l2_hit_bytes == engine.delivered["l2"] == engine.delivered["hbm:ctr_r"] == sector
-    assert (engine.delivered["hbm:ctr_w"], result.summary.dram_sector_bytes) == (pytest.approx(capacity), sector + capacity)
+@pytest.mark.parametrize("tails,count,load,expected", [((1, 7), 32, 0.25, 32), ((1, 3), 20, 0.365, 29.2)])
+def test_refill_peers_match_literal_service_across_unequal_tails(tails, count, load, expected):
+    context = RecipeContext(None, {}, {"hbm": "hbm"}, {"hbm": 1}, len(tails))
 
-@pytest.mark.parametrize("backend", ("python", "c"))
-def test_datacopy_concurrent_readers_wait_until_the_fill_delivers(backend):
-    sku, pid, sector = "Ascend950DT_9582", "P01_datacopy", AddressRunPlan().sector_bytes
-    dp = template_datapath(sku)
-    table, view = load_primitives(sku, datapath=dp), AdmissionMemoryView({0: sector}, granule_bytes=sector)
-    cell = table.cell(pid)
-    hit_ms = 0.002048
-    metrics = dict(cell.metrics, mte2_aiv_hit_bytes_per_s_per_core=UncertaintyBand(1000 * sector / hit_ms))
-    table = replace(table, primitives={**table.primitives, pid: replace(cell, metrics=metrics)})
-    key = ReuseKey(0, "shared", 0)
-    lowered = lower_primitive(pid, {"reuse_key": key, "copy_miss_bytes_per_ms": sector,
-                                   "runs": (AddressRun(0, 1, sector, sector),)},
-                              table, datapath=dp, memory_state=view, allow_uncalibrated_declaration=True)
-    engine = Engine([Resource("mte2_aiv", sector / hit_ms), Resource("l2", sector / hit_ms)], backend=backend)
-    ready = (engine.submit("ready", release=1),)
-    first, second = (submit_lowered_primitive(engine, lowered, after=ready, name_prefix=name) for name in ("first", "second"))
-    engine.advance(horizon=1.5)
-    assert not view.is_resident(key) and not (first.done or second.done)
-    engine.advance(until=(first, second), first=False)
-    assert (first.time, second.time) == pytest.approx((2, 2 + hit_ms))
-    assert engine.delivered["hbm_read@d0"] == engine.delivered["l2"] == sector
-    assert backend != "c" or engine.accel_status()["native_steps"] > 0
-@pytest.mark.parametrize("backend", ("python", "c"))
-def test_reservation_during_private_write_flushes_before_dependent_read(backend):
-    size = 2 * AddressRunPlan().sector_bytes
-    dp = replace(template_datapath(REPRESENTATIVE_SKUS["a5"]), hbm_write_bytes_per_s=size * 1000)
-    context = template_context(dp, None, mte3=size * dp.aiv_count, l2=size)
-    view = AdmissionMemoryView({0: size}, granule_bytes=size)
-    plan = Lowering(dp, context=context, memory_view=view, live_admission=True)
-    write = plan.access("write", "scratch", size, direction="write", pipe="mte3", private=True)
-    plan.access("read", "scratch", size, after=(write,), private=True)
-    result = plan.result("K3", "private", (), None, (), SimpleNamespace(pool_peaks=()))
-    engine = Engine([Resource(role, context.rates[role], units=units)
-                     for role, units in context.resource_units.items()], backend=backend, trace_limit=16)
-    done = result.program.start(engine, "private", engine.submit("ready", release=1))
-    engine.advance(horizon=1.5)
-    assert engine.delivered["l2"] == size / 2 and not engine.delivered.get("hbm:ctr_w")
-    view.grant_reservation(0, "intervening", size)
-    engine.advance(until=(done,))
-    assert engine.delivered["hbm:ctr_r"] == engine.delivered["hbm:ctr_w"] == size
-    trace = {row["task"]: row for row in engine.trace}
-    assert trace["private:write:program:dirty_writeback"]["end_ms"] <= trace["private:read:program"]["start_ms"]
-    assert result.summary.dram_sector_bytes == 2 * size
-def test_coprime_stride_residency_partitions_exact_bytes_with_bounded_memory():
-    rows, stride, sparse, sector = 4_194_304, 4097, 4_194_336, AddressRunPlan().sector_bytes
-    mask = AddressRun(0, rows, sector, sparse)
-    entry = TensorRangeObligation(0, "rows", 0, (), "hbm_cold", "device", (AddressRun(0, rows, sector, stride),))
-    tracemalloc.start()
-    try:
-        split = tuple(_split_entry_residency(entry, AddressRunPlan((mask,)).sector_coverage()))
-        assert tracemalloc.get_traced_memory()[1] < 8 * 1024**2
-    finally:
-        tracemalloc.stop()
-    counts = {item.initial_residency: sum(hi - lo for lo, hi in item.ranges)
-              + sum(run.rows * run.row_bytes for run in item.address_runs) for item in split}
-    assert counts == {"l2_warm": sector**2, "hbm_cold": (rows - sector) * sector}  # One visit per stride residue.
+    def tiles(tail):
+        def tile(index):
+            read = Stage("load", {"hbm": load})
+            if index < count - tail:
+                return read, Stage("compute", after=("load",), latency=2 * load)
+            return read, Stage("store", after=("load",), latency=load), Stage("drain", after=("store",), latency=load)
+        return tile
+
+    def run(compact):
+        engine = Engine([Resource("hbm", 1)], backend="python")
+        programs = tuple(
+            compact_periodic_pipeline(context, count, 1, tiles(tail), tail=tail, peer_counts=(count,) * len(tails))
+            if compact else PipelineProgram(count, 1, tiles(tail)) for tail in tails
+        )
+        done = ParallelProgram(programs).start(engine, "refill", engine.submit("ready"))
+        engine.advance(until=(done,))
+        return done.time, engine.serviced["hbm"]
+
+    literal = run(False)
+    assert literal == pytest.approx((expected, 2 * count * load))
+    assert run(True) == literal
+
+@pytest.mark.parametrize("sku", P05_SKUS)
+def test_live_admission_uses_sku_curve_past_capacity(sku):
+    case = parse_case(compose_case("qwen3-32b", sku, tp=1, dp=1, pp=1, layers=1))
+    execution = Execution(case, CostModel(case))
+    view = execution.engine.admission_memory_view
+    capacity = view.effective_l2_bytes(0)
+    assert view._hit_fraction(capacity, capacity) == 1
+    assert 0.99 < view._hit_fraction(capacity + 1, capacity) < 1
+    execution.reset_engine()
+    assert execution.engine.admission_memory_view is execution.admission_memory_view is not view
+    assert execution.admission_memory_view.residency_fingerprint() == view.residency_fingerprint()
+    assert AdmissionMemoryView({0: capacity})._hit_fraction(capacity + 1, capacity) == 0
+
+def test_isolated_read_replay_rebinds_prepared_recipe_to_cold_cache():
+    case = parse_case(compose_case("qwen3-32b", "Ascend950DT_9582", tp=1, dp=1, pp=1, layers=1))
+    size, sector = 672, 32
+    runs = AddressRunPlan((AddressRun(0, 1, size, size),), sector_bytes=sector,
+                          l2_line_bytes=sector, l2_sector_bytes=sector, hbm_burst_granule_bytes=sector)
+    access = MemoryAccessPattern("copy", 0, 0, 0, "read", "mte2_aiv", size, runs, ReuseKey(0, "copy", 0))
+    traffic = []
+    @dataclass
+    class Read:
+        view: AdmissionMemoryView | None = None
+
+        def prepare(self, op, geometry):
+            return op, replace(self, view=geometry.admission_memory_view)
+
+        def lower(self, context):
+            bound = context.bind_access(access, self.view)
+
+            def start(engine, name, ready, *, owner=""):
+                engine.add_hbm_bus(bound.bind_config[0])
+                return engine.submit_bound_access(name, bound, after=(ready,), memory_state=self.view, pattern=access,
+                                                  on_delivery=lambda ledger, *_: traffic.append(
+                                                      (ledger.dram_sector_bytes, ledger.l2_hit_bytes)))
+            return SimpleNamespace(start=start)
+
+    recipes = RecipeBook({"cache_probe": Read()})
+    shape = (size,)
+    op = OpSpec("first", "elementwise", "prefill", 0, 0, (), shape, shape, shape, shape,
+                recipe="cache_probe", hbm_bytes=size)
+    execution = Execution(case, CostModel(case), recipes=recipes)
+    for reset in (False, False, True):
+        if reset:
+            execution.reset_engine()
+        prepared, recipe = execution.prepare(op)
+        program = execution.lower_program(execution._context(prepared, 0, "none", recipe=recipe), recipe)
+        engine = execution.engine
+        engine.advance(until=(program.start(engine, "probe", engine.submit("ready")),))
+    assert traffic == [(672, 0), (0, 672), (672, 0)]
+    traffic.clear()
+    operator_costs(case, (op, replace(op, op_id="second", hbm_bytes=size + 1)), recipes=recipes)
+    assert traffic == [(672, 0), (672, 0)]

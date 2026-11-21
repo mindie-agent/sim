@@ -418,8 +418,10 @@ def extract_observed_aicore_freq_mhz(envelope: Mapping | None) -> float | None:
     """Extract observed AICore clock (MHz) from a silicon capture or msprof envelope."""
     if not isinstance(envelope, Mapping):
         return None
-    containers = [envelope]
-    for sub in ("device", "hardware", "metadata", "boundary", "telemetry", "clock"):
+    payload = envelope.get("payload")
+    silicon = payload.get("observed_silicon") if isinstance(payload, Mapping) else None
+    containers = [container for container in (silicon, envelope, payload) if isinstance(container, Mapping)]
+    for sub in ("observed_silicon", "device", "hardware", "metadata", "boundary", "telemetry", "clock"):
         nested = envelope.get(sub)
         if isinstance(nested, Mapping):
             containers.append(nested)
@@ -428,7 +430,10 @@ def extract_observed_aicore_freq_mhz(envelope: Mapping | None) -> float | None:
             raw = container.get(key)
             if raw is None or isinstance(raw, bool):
                 continue
-            val = float(raw)
+            try:
+                val = float(raw)
+            except (TypeError, ValueError, OverflowError):
+                continue
             if math.isfinite(val) and val > 0.0:
                 return val
     return None

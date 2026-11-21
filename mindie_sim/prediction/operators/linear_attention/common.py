@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import InitVar, dataclass, field, replace
 from types import MappingProxyType, SimpleNamespace
 from typing import Any, Literal
@@ -415,19 +416,21 @@ def analyze_state_residency(
     size = chunks * chunk_bytes
     capacity = (path.usable_bytes("l2") if contract.l2_capacity_bytes is None else contract.l2_capacity_bytes)
     admission = ctx.admission_memory_view if ctx is not None else None
-    if admission is not None:
-        die = ctx.occurrence.rank if ctx.occurrence.rank is not None else 0
-        capacity = min(capacity, admission.effective_l2_bytes(die))
+    die = (ctx.occurrence.rank or 0) if ctx is not None else 0
     units = ctx.geometry.buffer_units.get("l2", 1) if ctx else 1
-    # Predict the synthetic bank's write/read without modifying live admission.
-    view = AdmissionMemoryView({0: capacity}, l2_buffer_units_by_die={0: units},
-                               granule_bytes=admission.granule_bytes if admission is not None else None)
-    if admission is None:
+    allocation = "chunk_state_bank" if ctx is None else f"{ctx.occurrence.op_id}:chunk_state_bank"
+    if admission is not None:
+        # Predict the bank's write/read against the current shared occupancy.
+        view = deepcopy(admission)
+        if (excess := view.available_l2_bytes(die) - capacity) > 0:
+            view.grant_reservation(die, f"{allocation}:capacity_limit", excess)
+    else:
+        view = AdmissionMemoryView({die: capacity}, l2_buffer_units_by_die={die: units})
         for stream in range(contract.active_l2_streams):
-            view.enter_stream(0, str(stream))
-    key = ReuseKey(0, "chunk_state_bank", 0, "0")
+            view.enter_stream(die, str(stream))
+    key = ReuseKey(die, allocation, 0, "0")
     runs = AddressRunPlan((AddressRun(0, chunks * contract.hv, head_bytes, head_bytes),))
-    read = MemoryAccessPattern("chunk_state_bank", 0, 0, 0, "read", "mte2_aic", size, runs, key)
+    read = MemoryAccessPattern(allocation, 0, die, 0, "read", "mte2_aic", size, runs, key)
     write = replace(read, direction="write", pipe="mte3",
                     visibility=VisibilityContract(live_out=True))
     aligned = runs.aligned_copy_bytes()

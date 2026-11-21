@@ -26,7 +26,8 @@ from mindie_sim.optimization import (
     select_catlass_candidates,
     select_dsl_candidates,
 )
-from mindie_sim.prediction.program import Stage
+from mindie_sim.prediction.operators.vector import TiledPointwise
+from mindie_sim.prediction.program import RecipeBook, Stage
 from mindie_sim.prediction.results import StepRequest
 from mindie_sim.prediction.runtime.engine import Engine
 from mindie_sim.prediction.runtime.engine_types import Allocation, Resource
@@ -54,6 +55,8 @@ from mindie_sim.templates.catlass_catalog import CatlassProblem, enumerate_catla
 from _support.axes import REPRESENTATIVE_SKUS
 from _support.collective_cases import case as col_case, exchange
 from _support.linear_cases import recipe_context, sku_planning_context
+from scripts._arch_governance_runtime import verify_ag006_ownership
+from scripts.check_arch_governance import scan_repository
 
 pytestmark = pytest.mark.tier0
 
@@ -73,6 +76,47 @@ LINK_BYTES = 10**6
 COPY_BYTES = 10**6
 MEM_CAPACITY = 16 * 1024 * 1024
 PREFETCH_BYTES = 1024
+
+
+def test_recipe_ownership_checks_factories_and_shipped_selections(monkeypatch):
+    class FlatRecipe:
+        def lower(self, context):
+            raise AssertionError("The ownership gate should need only selection")
+
+    original_factories = RecipeBook._mapping_factories
+    with monkeypatch.context() as patch:
+        patch.setattr(RecipeBook, "_mapping_factories", staticmethod(
+            lambda: {**original_factories(), "tiled_pointwise": FlatRecipe},
+        ))
+        assert any(v.fingerprint == "AG006:factory:tiled_pointwise"
+                   for v in verify_ag006_ownership())
+
+    original_select = RecipeBook.select
+
+    def select(self, op):
+        binding = original_select(self, op)
+        return FlatRecipe() if isinstance(binding, TiledPointwise) else binding
+
+    monkeypatch.setattr(RecipeBook, "select", select)
+    findings = verify_ag006_ownership()
+    assert {v.path.as_posix() for v in findings} == {"examples/cases/qwen38-a5.json"}
+    assert {v.fingerprint.split(":")[2] for v in findings} == {"prefill", "decode"}
+
+
+def test_primitive_concepts_reject_sibling_module_definitions(tmp_path):
+    primitives = tmp_path / "mindie_sim" / "primitives"
+    primitives.mkdir(parents=True)
+    concepts = {"loader": "CalibratedRateOverlay", "schema": "PrimitiveTable"}
+    for module, name in concepts.items():
+        (primitives / f"{module}.py").write_text(f"class {name}:\n    pass\n")
+    assert scan_repository(tmp_path) == ()
+
+    shadow = primitives / "shadow.py"
+    shadow.write_text("".join(f"class {name}:\n    pass\n" for name in concepts.values()))
+    assert {v.fingerprint for v in scan_repository(tmp_path)} == {
+        f"AG008:duplicate_concept:mindie_sim/primitives/shadow.py:{name}"
+        for name in concepts.values()
+    }
 
 
 def _resigned_table(base_table, *, p50_scale: float = 1.0, cap_scale: float = 1.0):

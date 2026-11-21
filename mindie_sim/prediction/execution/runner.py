@@ -1,32 +1,20 @@
 """Main Execution runner compiling iteration DAGs onto the shared Engine.
 
-[Role]
-  Coordinate stage profiles, topology, host submission, device-boundary STARS
-  descriptor queues, lazy-frontier and detailed DAG submission, and execution
-  summaries on one shared ``Engine`` instance.
-
-[Invariants]
-  * Preserves ``CostModel.__init__ == 1`` and ``ExecutionBindings.create == 1``
-    per evaluation.
-  * Registers one shared ``(node, root_complex_id, direction)`` host bus
-    resource per unique root complex across all stages without collapsing
-    distinct nodes onto ``dies[0].node``.
-  * Device-boundary STARS queues execute for real kernels whenever configured
-    (``issue_interval_us > 0`` or ``first_issue_us > 0``), even when
-    ``include_submission=False``, while skipping zero-kernel views and adding
-    zero step-end ``N * gap`` floors.
-
-[Timeouts & Locks]
-  Finite virtual time; bounded per-Execution caches; no I/O or locks.
-
-[Side-Effect Policy]
-  Mutates only the simulation ``Engine``, ``CostLedger``, and bounded caches.
+[Role] Coordinate stage topology, host and STARS submission, iteration DAGs,
+  and summaries on one shared Engine.
+[Invariants] Reuse one CostModel and ExecutionBindings per evaluation. Host
+  bus resources are unique per node, root complex and direction. Configured
+  STARS queues run at real kernel boundaries, including without host
+  submission, skipping empty views and avoiding step-end launch floors.
+[Timeouts & Locks] Finite virtual time, bounded caches, no locks.
+[Side-Effect Policy] Reads SKU calibration and updates simulation state and caches.
 """
 from __future__ import annotations
 
-from collections.abc import Mapping as _AbcMapping
+from collections.abc import Mapping
 from dataclasses import replace
-from typing import Any, Mapping
+from functools import lru_cache, partial
+from typing import Any
 
 from mindie_sim.schema.case import Case as CaseSpec
 from mindie_sim.schema.common import ModelingError
@@ -38,6 +26,7 @@ from ..engine import Engine, Event, Resource
 from ..execution_state import memory_bindings_for
 from ..mechanism import Geometry
 from ..program import RecipeBook
+from ..runtime.l2_residency import AdmissionMemoryView, primitive_working_set_sweep
 from ..serving_io import ServingIO
 from ..step_metrics import StepSummary
 from .cohort import CollectiveParticipant, _CohortMixin
@@ -83,6 +72,16 @@ HOST_LOOKAHEAD_DEFAULT = 8
 FRAGMENT_CACHE_LIMIT_DEFAULT = 64
 
 
+@lru_cache
+def _sku_working_set_sweep(sku):
+    from mindie_sim.primitives.loader import load_manifest, load_primitives
+
+    for key, entry in load_manifest()["tables"].items():
+        if sku in (key, entry.get("sku"), *entry.get("compatible_skus", ())):
+            return primitive_working_set_sweep(load_primitives(sku))
+    return {}
+
+
 class Execution(_ContextMixin, _CohortMixin, _LazySubmitMixin):
     schedule_replay = False
     _isolated_scripts: dict = {}
@@ -121,7 +120,7 @@ class Execution(_ContextMixin, _CohortMixin, _LazySubmitMixin):
         self._active_padded_tokens: int = 0
         self._active_layout: str = ""
         metadata = getattr(case.runtime, "metadata", {}) or {}
-        if not isinstance(metadata, _AbcMapping):
+        if not isinstance(metadata, Mapping):
             metadata = dict(metadata)
         if legacy_diagnostics is None:
             legacy_diagnostics = bool(
@@ -154,7 +153,7 @@ class Execution(_ContextMixin, _CohortMixin, _LazySubmitMixin):
 
         resources, pools, pool_units = self._build_engine_resources(
             case, bindings, namespace, isolated_replica, stream_plans)
-        self._bind_engine(case, engine, trace_limit, resources, pools, pool_units)
+        self._bind_engine(engine, trace_limit, resources, pools, pool_units)
 
         attach_stars_queues(self)
 
@@ -214,10 +213,9 @@ class Execution(_ContextMixin, _CohortMixin, _LazySubmitMixin):
         self.state_accesses = None
         self.scheduled_accesses = None
         self.resource_services = {}
-        profile_svc = metadata.get("resource_service_profile") if isinstance(
-            metadata, Mapping) else None
+        profile_svc = metadata.get("resource_service_profile")
         for record in (dict(profile_svc or {}).get("services", ())
-                       if isinstance(profile_svc, _AbcMapping) else ()):
+                       if isinstance(profile_svc, Mapping) else ()):
             service = normalize_resource_service(record)
             self.resource_services[service.service_id] = service
 
@@ -284,52 +282,48 @@ class Execution(_ContextMixin, _CohortMixin, _LazySubmitMixin):
 
         return resources, pools, pool_units
 
-    def _bind_engine(self, case, engine, trace_limit, resources, pools, pool_units):
+    def _bind_engine(self, engine, trace_limit, resources, pools, pool_units):
+        self._new_engine = partial(Engine, tuple(resources), pools=dict(pools),
+                                   pool_units=dict(pool_units), trace_limit=int(trace_limit),
+                                   accel_eager_attach=self.accel_eager_attach)
         if engine is None and self.memory is not None:
             bound = getattr(self.memory, "runtime_state", None)
             if isinstance(bound, Engine):
                 engine = bound
-        self._engine_resource_templates = tuple(resources)
-        self._engine_pool_templates = dict(pools)
-        self._engine_pool_unit_templates = dict(pool_units)
-        self._engine_trace_limit = int(trace_limit)
         if engine is not None:
             engine.extend(resources, pools, pool_units)
-        self.engine = engine if engine is not None else Engine(
-            resources, pools=pools, pool_units=pool_units, trace_limit=trace_limit,
-            accel_eager_attach=self.accel_eager_attach)
-        if self.memory is not None:
-            if not self.engine.bind_memory(self.memory, pools=("hbm",)):
-                raise ModelingError("execution_memory_ledger_conflict")
-        from ..runtime.l2_residency import AdmissionMemoryView
-        die_l2 = {int(die.rank): int(dict(die.buffers).get("l2", 0)) for die in case.machine.dies}
-        if 0 not in die_l2 and case.machine.dies:
-            die_l2[0] = int(dict(case.machine.dies[0].buffers).get("l2", 0))
-        first_profile = next(iter(self.stage_profiles.values()), None)
-        first_ma = getattr(getattr(first_profile, "datapath", None), "memory_access", None)
-        self.admission_memory_view = (
-            self.engine.admission_memory_view
-            if self.engine.admission_memory_view is not None
-            else AdmissionMemoryView(die_l2, memory_access=first_ma)
-        )
-        self.engine.attach_admission_memory_view(self.admission_memory_view)
-        self.allocation_versions: dict[str, int] = self.engine._allocation_versions
+        self._attach_engine(engine if engine is not None else self._new_engine())
+
+    def _attach_engine(self, engine):
+        self.engine = engine
+        if self.memory is not None and not engine.bind_memory(self.memory, pools=("hbm",)):
+            raise ModelingError("execution_memory_ledger_conflict")
+        view = engine.admission_memory_view
+        if view is None:
+            dies = self.case.machine.dies
+            capacities = {int(die.rank): int(dict(die.buffers).get("l2", 0)) for die in dies}
+            capacities.setdefault(0, capacities[int(dies[0].rank)])
+            profile = next(iter(self.stage_profiles.values()))
+            sweep = primitive_working_set_sweep(profile.primitive_table)
+            if not sweep and profile.dies[0].sku:
+                sweep = _sku_working_set_sweep(profile.dies[0].sku)
+            view = AdmissionMemoryView(capacities, memory_access=profile.datapath.memory_access,
+                                       ws_sweep=sweep)
+            engine.attach_admission_memory_view(view)
+        self.admission_memory_view = view
+        self.allocation_versions = engine._allocation_versions
 
     def reset_engine(self) -> None:
-        """Renew only the mutable Engine root for the next isolated price."""
+        """Start the next isolated price with cold memory and fresh bindings."""
         from ..cost import CostLedger
         self.ledger = CostLedger()
         self.cost = _LedgerBoundCost(self.cost_model, self.ledger)
         self.recipes_used = {}
-        self.engine = Engine(
-            list(self._engine_resource_templates),
-            pools=dict(self._engine_pool_templates),
-            pool_units=dict(self._engine_pool_unit_templates),
-            trace_limit=self._engine_trace_limit,
-            accel_eager_attach=self.accel_eager_attach)
-        if self.memory is not None:
-            if not self.engine.bind_memory(self.memory, pools=("hbm",)):
-                raise ModelingError("execution_memory_ledger_conflict")
+        self._attach_engine(self._new_engine())
+        for cache in (self._prepare_cache, self._program_cache, self._lazy_op_cache,
+                      self._lazy_stage_id_caches, self.fragment_conductors):
+            cache.clear()
+        self._shared_eval_cache = None
         self.engine.ensure_state_ledger(None)
         attach_stars_queues(self)
         self.resource_rates = ResourceRates(self.engine.resources)

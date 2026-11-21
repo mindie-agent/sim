@@ -17,12 +17,12 @@ from typing import Any
 
 from mindie_sim.prediction.collectives.ports import RootComplexKey
 from mindie_sim.prediction.collectives.transport import DEFAULT_MAX_PHYSICAL_CHUNKS
-from mindie_sim.prediction.program.binding import RecipeContext
+from mindie_sim.prediction.program.binding import RecipeContext, _burst_rule
 from mindie_sim.prediction.program.stages import PIPELINE_UNROLL_LIMIT, KernelProgram, Stage
 from mindie_sim.prediction.runtime.l2_residency import AdmissionMemoryView, bind_memory_access
 from mindie_sim.prediction.runtime.memory_physics import (
     CACHE_POLICY_DISABLE, CACHE_POLICY_NORMAL, DEFAULT_L2_GRANULE_BYTES, DEFAULT_SECTOR_BYTES,
-    AddressRun, AddressRunPlan, BurstTurnRule, ConstraintTerm, CounterTerm,
+    AddressRun, AddressRunPlan, ConstraintTerm, CounterTerm,
     HbmBusSpec, MemoryAccessPattern, ReuseKey, VisibilityContract,
 )
 from mindie_sim.prediction.runtime.prepared_terms import VectorInstructionGroup, bind_vector_groups
@@ -115,6 +115,12 @@ class _Lowering:
     def get(self, key, default=None): return self.p.get(key, self.cell.parameters.get(key, default))
 
     def integer(self, key, default=0, minimum=0): return _int(self.get(key, default), key, minimum)
+
+    def address_plan(self, size=None):
+        memory = getattr(self.dp, "memory_access", None)
+        sector = self.p.get("sector_bytes", getattr(memory, "sector_bytes", self.get("sector_bytes", DEFAULT_SECTOR_BYTES)))
+        sector = _int(sector, "sector_bytes", 1)
+        return _address_plan(self.get, self.integer, size, sector_bytes=sector)
 
     def value(self, metric, default=None, *, mode=None, pid=None):
         if mode is None and (pid is None or pid == self.pid):
@@ -237,17 +243,11 @@ def _memory(b, name, pipe, direction, owner, plan, copy_rate, after=(), *,
     hbm = b.row("hbm")
     bus = HbmBusSpec(die, read, write, alpha, *((
         f"{hbm}:r", f"{hbm}:w", f"{hbm}:ctr_r", f"{hbm}:ctr_w",
-    ) if hbm != "hbm" else ()))
+    ) if hbm != "hbm" else ()), memory_access=getattr(b.dp, "memory_access", None))
     l2 = b.speed("l2_die_bytes_per_s", pid="P05_l2_residency_reuse")
-    rules = b.get("burst_turn_penalty", b.table.cell("P01_datacopy").parameters.get("burst_turn_penalty", ()))
-    rules = () if b.role == "dual" else tuple(
-        rule if isinstance(rule, BurstTurnRule) else
-        BurstTurnRule(**{key: value for key, value in rule.items() if key != "domain"})
-        if "min_row_bytes" in rule else
-        BurstTurnRule(0, rule.get("max_row_bytes"), rule.get("min_stride_bytes", 0), rule.get("max_stride_bytes"),
-                      rule["penalty_bytes"], rule.get("evidence_id", ""))
-        for rule in rules
-    )
+    profile_rules = getattr(bus.memory_access, "burst_turn_penalty", ())
+    rules = b.p.get("burst_turn_penalty", profile_rules or b.table.cell("P01_datacopy").parameters.get("burst_turn_penalty", ()))
+    rules = () if b.role == "dual" else tuple(map(_burst_rule, rules))
     config = dict(hbm_bus=bus, burst_rules=rules, copy_hit_bytes_per_ms=copy_rate,
                   copy_miss_bytes_per_ms=b.get("copy_miss_bytes_per_ms", copy_rate), l2_bytes_per_ms=l2)
     if b.ctx is not None and pipe == access_pipe:
@@ -304,7 +304,7 @@ def _datacopy(b):
     owner = b.owner(owner_kind)
     if src is not None and dst is not None:
         b.route(src, dst, owner)
-    _memory(b, "datacopy", pipe, direction, owner, _address_plan(b.get, b.integer), rate,
+    _memory(b, "datacopy", pipe, direction, owner, b.address_plan(), rate,
             pipe_units=getattr(b.dp or b.table.provenance.silicon_fingerprint, f"{owner_kind}_count"))
 
 
@@ -337,7 +337,7 @@ def _load_data(b):
         if scale_bytes and not b.arch35:
             b.gap("load_data_mx_requires_dav_3510")
         rate_operand = "a" if b.arch35 else operand
-        trans_metric = f"l1_to_l0{rate_operand}_transpose_bytes_per_s_per_aic"
+        trans_metric = f"l1_to_l0{operand}_transpose_bytes_per_s_per_aic"
         if transposed and trans_metric in b.cell.metrics:
             eff_rate = b.speed(trans_metric)
         else:
@@ -386,7 +386,7 @@ def _fixpipe(b):
     b.meta.update(n_eff=n_eff, output_bytes=out, input_l0c_bytes=inp)
     after = (b.delay("fixpipe:setup", "setup_ns"),)
     if dst == "gm":
-        plan = _address_plan(b.get, b.integer, out)
+        plan = b.address_plan(out)
         effective_rate = min(out_rate, plan.aligned_copy_bytes() * in_rate / inp)
         _memory(b, "fixpipe", "fixpipe", "write", owner, plan, effective_rate, after)
     else:
@@ -395,7 +395,7 @@ def _fixpipe(b):
 
 def _mte3(b):
     dst, owner = b.get("dst", "gm"), b.owner("aiv")
-    plan = _address_plan(b.get, b.integer)
+    plan = b.address_plan()
     rate = b.speed("mte3_store_bytes_per_s_per_aiv")
     after = (b.delay("mte3:setup", "setup_ns"),)
     atomic = b.get("atomic", False)
@@ -429,14 +429,14 @@ def _l2(b):
     work = b.integer("working_set_bytes", b.get("bytes", 0))
     pattern = b.get("pattern")
     hits = b.state.preview_access(pattern, pattern.runs.aligned_copy_bytes())[0] if pattern and b.state else b.integer("hit_bytes")
-    hit = 0 if bypass or work > knee else min(work, hits)
+    samples = b.get("ws_sweep_bytes_per_s", {}) if b.role == "sim" else {}
+    residency = AdmissionMemoryView({die: capacity}, ws_sweep=samples)
+    hit = 0 if bypass else min(hits, math.floor(work * residency._hit_fraction(work, knee)))
     b.meta.update(effective_l2_bytes=knee, cache_bypass=bypass, l2_hit_bytes=hit)
     b.work("l2_reuse", (("l2", hit, b.speed("l2_die_bytes_per_s")),))
-    if b.role == "sim" and not bypass and work:
-        samples = b.get("ws_sweep_bytes_per_s", {})
-        unit = "MiB"
-        points = sorted((int(key.removesuffix(unit)) * MIB if isinstance(key, str) and key.endswith(unit)
-                         else int(key), float(value)) for key, value in samples.items())
+    if samples and not bypass and work:
+        points = sorted((int(key[:-len("MiB")]) * MIB if str(key).endswith("MiB") else int(key),
+                         float(value)) for key, value in samples.items())
         pos = bisect_left(points, (work,))
         rate = None
         if pos < len(points) and points[pos][0] == work:
@@ -446,8 +446,6 @@ def _l2(b):
             hi, high_rate = points[pos]
             rate = (low_rate + (work - lo) / (hi - lo) * (high_rate - low_rate)) * BYTES_PER_S_TO_MS
         if rate is not None:
-            if not math.isfinite(rate) or rate <= 0:
-                raise ModelingError("primitive_l2_working_set_rate_invalid")
             # The working-set sweep times the whole copy, including cold misses.
             b.delay("working_set_sweep", ms=work / rate)
 
@@ -461,7 +459,7 @@ def _mmad(b):
     data = b.cell.modes[mode]
     wave = next((item for item in b.dp.subtile_wave if item.native_mode == mode), None) if b.dp is not None else None
     declared = b.dp.compute_arch.declared if b.dp is not None else None
-    native = b.get("native_mode", conversions.get(requested, requested))
+    native = b.get("native_mode", requested if requested == "fp8_e5m2" else conversions.get(requested, requested))
     if declared is not None and not declared.supports_native("matrix", native):
         b.gap(f"native_matrix_mode_required:{native}")
     defaults = (
@@ -473,7 +471,7 @@ def _mmad(b):
                            for dim, key, default in zip(dims, ("m_iss", "n_iss", "k_iss"), defaults))
     b.meta.update(issued_flops=issued, logical_flops=2 * m * n * k)
     after = ()
-    prologue = b.get("prologue", requested if requested in conversions else "")
+    prologue = b.get("prologue", requested if requested in {"w4a8", "a8w4_mx"} else "")
     if prologue == "w4a8":
         owner = b.owner("aiv")
         packed = _ceil(n * k, 2)
@@ -494,7 +492,7 @@ def _mmad(b):
             after = (b.work("mx:decompress_b", (("mte1", scales, _mx_scale_rate(b)),), (load,), owner=owner),)
         else:
             after = (b.work("mx:decompress_b", (("mte1", n * k, rate),), owner=owner),)
-    elif prologue:
+    elif prologue and not (b.arch35 and requested == prologue == "fp8_e5m2"):
         b.gap(f"mmad_prologue_unsupported:{prologue}")
     cube = b.work("mmad", (("cube", issued, b.speed("cube_only_rate", mode=mode)),), after,
                   owner=b.owner("aic"), metadata={"issued_flops": issued},
@@ -835,6 +833,9 @@ def _crosscore(b):
                 or (reverse and reverse_id // PAIRED_EVENT_IDS != event_subblock)):
             raise ModelingError("primitive_crosscore_subblock_invalid")
         subblock = event_subblock
+    latency = b.value(metric)
+    if mode == INTRA_BLOCK_MODE and b.role == "sim" and latency <= 0:
+        b.gap(f"positive_latency_required:{metric}")
     previous, credit = (), {}
     for index in range(first, first + b.integer("notifications", 1, 1)):
         group = max(0, index // REVERSE_DEPTH - 1)
@@ -845,15 +846,14 @@ def _crosscore(b):
                         pipe=b.get("pipe", "PIPE_S"))
             if subblock is not None:
                 meta["aiv_subblock"] = subblock
-        latency_default = 0 if mode == INTRA_BLOCK_MODE else None
         previous = (b.delay(f"crosscore:{index}", after=deps, metadata=meta,
-                            ms=b.value(metric, latency_default) * NS_TO_MS),)
+                            ms=latency * NS_TO_MS),)
         if reverse and (index + 1) % REVERSE_DEPTH == 0:
             reverse_meta = {**meta, "event_id": reverse_id}
             if mode == INTRA_BLOCK_MODE:
                 reverse_meta["local_event_id"] = reverse_id % PAIRED_EVENT_IDS
             credit[index // REVERSE_DEPTH] = b.delay(f"reverse_credit:{index}", after=previous,
-                                                     ms=b.value("reverse_ns", b.value(metric, latency_default)) * NS_TO_MS,
+                                                     ms=b.value("reverse_ns", latency) * NS_TO_MS,
                                                      metadata=reverse_meta)
     b.meta.update(event_id=event, reverse_depth=REVERSE_DEPTH if reverse else 0)
 

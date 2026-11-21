@@ -29,7 +29,7 @@ from mindie_sim.optimization.ladder import (
 )
 from mindie_sim.prediction import efficiency
 from mindie_sim.prediction.efficiency import analysis, peaks, sla
-from mindie_sim.prediction.pointwise import TiledPointwise
+from mindie_sim.prediction.operators.vector import TiledPointwise
 from mindie_sim.prediction.results import OpOccurrence, OperatorSequenceRow, StepEvaluation, StepRequest
 from mindie_sim.prediction.roofline_graph import PhysicalWorkGraph, PhysicalWorkNode, RooflineTargets, critical_path_roofline
 from mindie_sim.prediction.runtime.engine import Engine, Resource

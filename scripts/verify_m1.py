@@ -32,6 +32,7 @@ import gc
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import statistics
 import subprocess
@@ -68,11 +69,11 @@ PRIVATE_PREFIX = "/Users" + "/maoxx241"
 IMAGE_MARKERS = ("docker" + ".io/", "swr" + ".cn-", "@sha" + "256:")
 PRODUCER_FILTER_NAMES = frozenset({
     "min_mib", "min_size_mib", "min_payload_mib", "min_m", "min_n", "min_k",
-    "min_bytes", "min_payload_bytes", "min_tokens", "skip_small_shapes",
+    "min_bytes", "min_payload_bytes", "min_tokens", "skip_small_shapes", "steady_coll_min_bytes",
 })
 PRODUCER_SHAPE_NAMES = PRODUCER_FILTER_NAMES | frozenset({
     "m", "n", "k", "tokens", "seq_len", "batch", "batch_size", "payload_bytes",
-    "mib", "size_mib", "payload_mib",
+    "mib", "size_mib", "payload_mib", "swa", "swa_window", "bytes", "shape", "sh",
 })
 
 
@@ -152,13 +153,37 @@ def _has_shape_cutoff(test: ast.expr) -> bool:
     for comparison in ast.walk(test):
         if not isinstance(comparison, ast.Compare):
             continue
-        for left, right in zip((comparison.left, *comparison.comparators), comparison.comparators):
-            left_names, right_names = _shape_operand_names(left), _shape_operand_names(right)
-            if left_names & PRODUCER_SHAPE_NAMES and (_numeric_literal(right) is not None or right_names & PRODUCER_FILTER_NAMES):
+        for left, op, right in zip(
+            (comparison.left, *comparison.comparators), comparison.ops, comparison.comparators,
+        ):
+            if isinstance(op, (ast.In, ast.NotIn)) and isinstance(left, ast.Constant):
+                if isinstance(left.value, str) and re.search(r"_[A-Za-z]\d+$", left.value):
+                    return True
+            if (_shape_operand_names(left) | _shape_operand_names(right)) & PRODUCER_FILTER_NAMES:
                 return True
-            if right_names & PRODUCER_SHAPE_NAMES and (_numeric_literal(left) is not None or left_names & PRODUCER_FILTER_NAMES):
+            if any(_shape_operand_names(shape) & PRODUCER_SHAPE_NAMES and _numeric_literal(limit) is not None
+                   for shape, limit in ((left, right), (right, left))):
                 return True
     return False
+
+
+def _producer_filter_tests(tree: ast.Module):
+    for guard in _producer_continue_guards(tree):
+        yield guard.test
+    for node in ast.walk(tree):
+        if isinstance(node, ast.comprehension):
+            yield from node.ifs
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "filter":
+            if node.args and isinstance(predicate := node.args[0], ast.Lambda):
+                yield predicate.body
+        elif isinstance(node, ast.If):
+            for stmt in node.body:
+                if not isinstance(stmt, ast.Expr) or not isinstance(stmt.value, ast.Call):
+                    continue
+                name = getattr(stmt.value.func, "id", "") or getattr(stmt.value.func, "attr", "")
+                if name in {"add", "append", "extend", "collect", "score", "evaluate"}:
+                    yield node.test
+                    break
 
 
 def _producer_continue_guards(tree: ast.Module) -> set[ast.If]:
@@ -196,9 +221,8 @@ def _producer_shape_filters(root: Path) -> list[str]:
             location = f":{error.lineno}" if isinstance(error, SyntaxError) else ""
             findings.append(f"{relative}{location}:producer_source_{type(error).__name__}")
             continue
-        for guard in sorted(_producer_continue_guards(tree), key=lambda node: node.lineno):
-            if _has_shape_cutoff(guard.test):
-                findings.append(f"{relative}:{guard.lineno}:shape_size_filter")
+        lines = {test.lineno for test in _producer_filter_tests(tree) if _has_shape_cutoff(test)}
+        findings.extend(f"{relative}:{line}:shape_size_filter" for line in sorted(lines))
         for node in ast.walk(tree):
             if not isinstance(node, (ast.Assign, ast.AnnAssign)) or node.value is None:
                 continue

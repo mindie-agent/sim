@@ -31,7 +31,7 @@ from mindie_sim.prediction.cost import CostModel
 from mindie_sim.prediction.engine import Allocation, Engine, ExecutionError, Resource
 from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.ownership import unit_rates
-from mindie_sim.prediction.pointwise import TiledPointwise
+from mindie_sim.prediction.operators.vector import TiledPointwise
 from mindie_sim.prediction.program import KernelProgram, PipelineProgram, RecipeContext, Stage
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.prediction.transactions import QueuedStore

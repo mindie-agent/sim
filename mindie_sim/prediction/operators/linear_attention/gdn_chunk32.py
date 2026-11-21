@@ -64,7 +64,6 @@ PIPELINE_WINDOW_SLOTS = 2
 RECURRENCE_SERIAL_SLOTS = 1
 COMPACT_CHUNK_THRESHOLD = 16
 COMPACT_TAIL_CHUNKS = 2
-RECURRENCE_SYNC_MS = 0.00095
 L2NORM_OPS_PER_ELEM = 5
 SIGMOID_SCALE_OPS_PER_ELEM = 6
 GATE_CUMSUM_OPS_PER_ROW = 4
@@ -113,7 +112,7 @@ def _build_mixed_plan(
     *,
     aiv_first: bool,
     slots: int,
-    step_sync_ms: float = 0.0,
+    recurrence_sync: bool = False,
     first_label: str,
     second_label: str,
     extra_meta: Mapping[str, Any],
@@ -130,7 +129,8 @@ def _build_mixed_plan(
             total_work += split_reads(aic_w, aic_w.resources["mte2"], geometry.resource_units)
 
     def program(context):
-        setup_ms, sync_ms = chunk32_timing_policy(geometry, context, step_sync_ms)
+        setup_ms, sync_ms = chunk32_timing_policy(geometry, context, 0.0)
+        sync_ms = sync_ms if recurrence_sync else 0.0
 
         def per_core(core: int, items: Sequence[Any]):
             if not items:
@@ -160,15 +160,16 @@ def _build_mixed_plan(
                 return base
 
             peer_counts = tuple(len(bucket) for bucket in owners if bucket)
+            peer_tails = (COMPACT_TAIL_CHUNKS,) * len(peer_counts)
             uniform_compact = peer_group_can_compact(
                 peer_counts, slots, head=1, tail=COMPACT_TAIL_CHUNKS,
-                threshold=COMPACT_CHUNK_THRESHOLD,
+                threshold=COMPACT_CHUNK_THRESHOLD, peer_tails=peer_tails,
             )
             pipe = (
                 compact_periodic_pipeline(
                     context, len(items), slots, tile,
                     head=1, tail=COMPACT_TAIL_CHUNKS, threshold=COMPACT_CHUNK_THRESHOLD,
-                    peer_counts=peer_counts,
+                    peer_counts=peer_counts, peer_tails=peer_tails,
                 )
                 if sync_ms <= 0.0 and uniform_compact
                 else PipelineProgram(len(items), slots, tile)
@@ -192,7 +193,7 @@ def _build_mixed_plan(
                 compact_pipe = compact_periodic_pipeline(
                     context, len(items), slots, pure_tile,
                     head=1, tail=COMPACT_TAIL_CHUNKS, threshold=COMPACT_CHUNK_THRESHOLD,
-                    peer_counts=peer_counts,
+                    peer_counts=peer_counts, peer_tails=peer_tails,
                 )
                 stages = [
                     Stage("setup", latency=setup_ms, keep_empty=setup_ms <= 0.0),
@@ -381,7 +382,7 @@ def build_state(op: OpSpec, geometry: Geometry, *, ctx: OperatorPlanningContext 
         geometry, cores, tuple(state_tiles(span) for span in _tile_spans(cores, len(lengths) * chains_per_sequence)),
         group_work,
         aiv_first=False, slots=RECURRENCE_SERIAL_SLOTS,
-        step_sync_ms=RECURRENCE_SYNC_MS,
+        recurrence_sync=True,
         first_label="state_aic", second_label="state_aiv", extra_meta={"task_group_size": group},
     )
 

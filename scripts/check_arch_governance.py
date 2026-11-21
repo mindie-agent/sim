@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Architecture governance gate (AG001..AG007) for ``mindie_sim``.
+"""Architecture governance gate (AG001..AG008) for ``mindie_sim``.
 
 [Role] Enforce governed ``mindie_sim/prediction/operators/<family>/`` package
   boundaries, forbid flat ISA/CANN filename sprawl under ``mindie_sim/**/*.py``,
@@ -29,9 +29,19 @@ import sys
 from types import MappingProxyType
 
 if __package__:
-    from ._arch_governance_runtime import Violation, scan_runtime, verify_ag007_discrimination
+    from ._arch_governance_runtime import (
+        DOCSTRING_HEADER_MAX_LINE, FAMILY_PKG_DEPTH, GOVERNED_PATH_DEPTH,
+        MAX_FLAT_PREDICTION_MODULES, MAX_OPERATOR_PACKAGE_FILES, OPERATORS_PARTS, Violation,
+        _check_ag006_flat_prediction, _check_ag007, _check_ag008_module, _check_ag008_repo_bounds,
+        _is_governed_family_path, scan_runtime, verify_ag007_discrimination,
+    )
 else:
-    from _arch_governance_runtime import Violation, scan_runtime, verify_ag007_discrimination
+    from _arch_governance_runtime import (
+        DOCSTRING_HEADER_MAX_LINE, FAMILY_PKG_DEPTH, GOVERNED_PATH_DEPTH,
+        MAX_FLAT_PREDICTION_MODULES, MAX_OPERATOR_PACKAGE_FILES, OPERATORS_PARTS, Violation,
+        _check_ag006_flat_prediction, _check_ag007, _check_ag008_module, _check_ag008_repo_bounds,
+        _is_governed_family_path, scan_runtime, verify_ag007_discrimination,
+    )
 
 SIM_PACKAGE_ROOT = "mindie_sim"
 GOVERNED_LEAF_NAMES = frozenset({"arch22.py", "arch35.py"})
@@ -41,19 +51,10 @@ AG001_STEM_RE = re.compile(
     re.IGNORECASE,
 )
 UPSTREAM_ABI_RE = re.compile(r"^\s*Upstream-ABI:\s*(\S+)", re.MULTILINE)
-HEURISTIC_IDENTIFIER_RE = re.compile(
-    r"(?:^|_)(?:fudge|discount|overlap_decay|heuristic_factor|latency_multiplier)(?:_|$)",
-    re.IGNORECASE,
-)
-CAMEL_CASE_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 HEX_REVISION_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
-DOCSTRING_HEADER_MAX_LINE = 30
 FINGERPRINT_HEX_LEN = 16
 PREVIEW_SHA_LEN = 12
-GOVERNED_PATH_DEPTH = 5
-FAMILY_PKG_DEPTH = 4
-OPERATORS_PARTS = ("mindie_sim", "prediction", "operators")
 SOURCE_REF_FIELDS = ("repository", "revision", "relative_path", "source_sha256")
 EXIT_OK = 0
 EXIT_VIOLATIONS = 1
@@ -79,62 +80,22 @@ _CP_INFRA_FILES = _SM_INFRA_FILES | frozenset({
 # strict mode requires zero allowlist entries.
 LEGACY_ALLOWLIST: dict[str, frozenset[str]] = {}
 
-#: Lock B downward ratchet on flat top-level ``mindie_sim/prediction/*.py`` files
-#: (reduced from 304 -> 120; any new flat file under mindie_sim/prediction/ fails AG008).
-MAX_FLAT_PREDICTION_MODULES = 120
-#: Bounded package directory fan-out ceiling for governed ``operators/<family>/`` packages.
-MAX_OPERATOR_PACKAGE_FILES = 20
-#: Cohesion-First readability ceilings (watched monotonically by Hub Lock-6 ratchet).
-COHESIVE_SOFT_MAX_LINES = 1800
-MAX_FUNCTION_LINES = 150
-MAX_NESTING_DEPTH = 6
-
 #: Canonical single-owner concept table enforced by AG008.
 CANONICAL_CONCEPT_OWNERS: Mapping[str, tuple[str, ...]] = MappingProxyType({
     "RequestView": ("mindie_sim/schema/workload.py",),
     "IterationPlan": ("mindie_sim/schema/workload.py",),
+    "bind_memory_access": ("mindie_sim/prediction/runtime/l2_residency.py",),
     "AdmissionMemoryView": ("mindie_sim/prediction/runtime/l2_residency.py",),
     "ByteLedger": ("mindie_sim/prediction/runtime/memory_physics.py",),
     "AddressRunPlan": ("mindie_sim/prediction/runtime/memory_physics.py",),
     "MemoryAccessPattern": ("mindie_sim/prediction/runtime/memory_physics.py",),
-    "PrimitiveTable": ("mindie_sim/primitives/",),
-    "CalibratedRateOverlay": ("mindie_sim/primitives/",),
+    "PrimitiveTable": ("mindie_sim/primitives/schema.py",),
+    "CalibratedRateOverlay": ("mindie_sim/primitives/loader.py",),
+    "FamilyRegistry": ("mindie_sim/prediction/operators/registry.py",),
+    "certify_lower_bound": ("mindie_sim/optimization/dual_bound.py",),
     "OperatorPlanningContext": ("mindie_sim/prediction/operators/contracts.py",),
     "OptimalityCertificate": ("mindie_sim/optimization/dual_bound.py",),
 })
-PARALLEL_CONCEPT_CLASS_RE = re.compile(
-    r"^(?:Ragged\w*Batch|SequenceBatch|StepBatch|RequestBatch"
-    r"|L2CacheView|MemoryCacheView|AdmissionCacheView"
-    r"|RateOverlay|PrimitiveOverlay)$"
-)
-BANNED_BYPASS_KWARGS = frozenset({"ragged_batch", "l2_view", "admission_view"})
-OPERATOR_BANNED_BYPASS_KWARGS = frozenset({"memory_view"})
-SHARD_FILENAME_RE = re.compile(r"(?:_helpers|_mixin|_part\d+)$")
-_LEGACY_SHARD_FILES = frozenset({
-    "mindie_sim/prediction/execution/step_helpers.py",
-    "mindie_sim/prediction/runtime/engine_periodic_mixin.py",
-})
-_FLAT_PLAN_INFRA_FILES = frozenset({
-    "mindie_sim/prediction/fusion_bridge.py",
-    "mindie_sim/prediction/fusion_recipe.py",
-    "mindie_sim/prediction/implementation_registry.py",
-    "mindie_sim/prediction/mechanism.py",
-    "mindie_sim/prediction/native_binding.py",
-    "mindie_sim/prediction/native_coverage.py",
-    "mindie_sim/prediction/physical_recipe_base.py",
-    "mindie_sim/prediction/results.py",
-    "mindie_sim/prediction/spine.py",
-    "mindie_sim/prediction/verification.py",
-})
-_FLAT_PREDICTION_DEPTH = 3
-
-
-def _is_governed_family_path(rel: PurePosixPath) -> tuple[bool, str | None, str]:
-    parts = rel.parts
-    if len(parts) >= GOVERNED_PATH_DEPTH and parts[: len(OPERATORS_PARTS)] == OPERATORS_PARTS:
-        return True, parts[len(OPERATORS_PARTS)], rel.name
-    return False, None, rel.name
-
 
 def _is_allowed_isa_leaf(rel: PurePosixPath) -> bool:
     in_pkg, family, filename = _is_governed_family_path(rel)
@@ -690,222 +651,6 @@ def _check_ag005(
     return violations
 
 
-def _check_ag007(rel: PurePosixPath, tree: ast.Module) -> list[Violation]:
-    if not _is_governed_family_path(rel)[0]:
-        return []
-    violations = []
-    seen = set()
-    for node in ast.walk(tree):
-        for field, value in ast.iter_fields(node):
-            if field not in {"id", "name", "asname", "attr", "arg", "rest", "value"}:
-                continue
-            if not isinstance(value, str) or not value.isidentifier():
-                continue
-            key = (node.lineno, value)
-            spelling = CAMEL_CASE_BOUNDARY_RE.sub("_", value)
-            if key not in seen and HEURISTIC_IDENTIFIER_RE.search(spelling):
-                seen.add(key)
-                violations.append(Violation(
-                    "AG007", rel, node.lineno, f"AG007:{rel.as_posix()}:{value}",
-                    f"ad hoc heuristic identifier {value!r} in an operator family",
-                ))
-    return violations
-
-
-def _check_ag006_flat_prediction(rel: PurePosixPath, tree: ast.Module) -> list[Violation]:
-    """Forbid OperatorPlan/kernel PlannedRecipe builders in flat mindie_sim/prediction/*.py."""
-    pos = rel.as_posix()
-    if (
-        len(rel.parts) != _FLAT_PREDICTION_DEPTH
-        or rel.parts[:2] != ("mindie_sim", "prediction")
-        or pos in _FLAT_PLAN_INFRA_FILES
-    ):
-        return []
-    violations: list[Violation] = []
-    for stmt in tree.body:
-        if isinstance(stmt, ast.FunctionDef) and stmt.name in {"recipes", "build"}:
-            violations.append(Violation(
-                "AG006", rel, stmt.lineno, f"AG006:flat_builder:{pos}:{stmt.name}",
-                f"flat prediction module must not define kernel builder {stmt.name}(); "
-                "move into mindie_sim/prediction/operators/<family>/",
-            ))
-        elif isinstance(stmt, ast.ClassDef):
-            for base in stmt.bases:
-                bname = base.id if isinstance(base, ast.Name) else (
-                    base.attr if isinstance(base, ast.Attribute) else ""
-                )
-                if bname in {"Recipe", "PlannedRecipe"}:
-                    violations.append(Violation(
-                        "AG006", rel, stmt.lineno, f"AG006:flat_recipe:{pos}:{stmt.name}",
-                        f"flat prediction module must not subclass {bname} ({stmt.name}); "
-                        "move into mindie_sim/prediction/operators/<family>/",
-                    ))
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call):
-            fname = node.func.id if isinstance(node.func, ast.Name) else (
-                node.func.attr if isinstance(node.func, ast.Attribute) else ""
-            )
-            if fname in {"OperatorPlan", "PlannedRecipe"}:
-                violations.append(Violation(
-                    "AG006", rel, getattr(node, "lineno", 1),
-                    f"AG006:flat_plan_call:{pos}:{fname}",
-                    f"flat prediction module must not construct {fname}(...); "
-                    "move into mindie_sim/prediction/operators/<family>/",
-                ))
-                break
-    return violations
-
-
-def _owner_matches(pos: str, allowed_owners: tuple[str, ...]) -> bool:
-    return any(
-        pos.startswith(owner) if owner.endswith("/") else pos == owner
-        for owner in allowed_owners
-    )
-
-
-_NON_DECLARATIVE_EXPR = (
-    ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp,
-    ast.NamedExpr, ast.IfExp, ast.Await, ast.Yield, ast.YieldFrom,
-)
-_NESTING_STMTS = (ast.For, ast.AsyncFor, ast.While, ast.Try, ast.TryStar, ast.With, ast.AsyncWith, ast.Match)
-
-
-def _declarative_extra_lines(node: ast.AST) -> int:
-    if isinstance(node, (ast.Dict, ast.List, ast.Tuple, ast.Set)) and node.lineno and node.end_lineno:
-        span = node.end_lineno - node.lineno + 1
-        if span > 1 and not any(isinstance(sub, _NON_DECLARATIVE_EXPR) for sub in ast.walk(node)):
-            return span - 1
-    return sum(
-        _declarative_extra_lines(child) for child in ast.iter_child_nodes(node)
-        if not isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-    )
-
-
-def _max_nesting_depth(node: ast.AST, depth: int = 0) -> int:
-    if isinstance(node, ast.If):
-        best = depth + 1
-        for stmt in node.body:
-            best = max(best, _max_nesting_depth(stmt, depth + 1))
-        if len(node.orelse) == 1 and isinstance(node.orelse[0], ast.If):
-            best = max(best, _max_nesting_depth(node.orelse[0], depth))
-        else:
-            for stmt in node.orelse:
-                best = max(best, _max_nesting_depth(stmt, depth + 1))
-        return best
-    if isinstance(node, _NESTING_STMTS):
-        next_depth = depth + 1
-        return max((next_depth, *(
-            _max_nesting_depth(child, next_depth) for child in ast.iter_child_nodes(node)
-            if not isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-        )))
-    return max((depth, *(
-        _max_nesting_depth(child, depth) for child in ast.iter_child_nodes(node)
-        if not isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-    )))
-
-
-def _check_cohesive_readability(rel: PurePosixPath, text: str, tree: ast.Module) -> list[Violation]:
-    """Enforce [Role] header and function readability budgets on cohesive >1,800L modules."""
-    line_count = len(text.splitlines())
-    if line_count <= COHESIVE_SOFT_MAX_LINES:
-        return []
-    pos = rel.as_posix()
-    violations: list[Violation] = []
-    if "[Role]" not in "\n".join(text.splitlines()[:DOCSTRING_HEADER_MAX_LINE]):
-        violations.append(Violation(
-            "AG008", rel, 1, f"AG008:cohesive_role:{pos}",
-            f"cohesive module ({line_count}L > {COHESIVE_SOFT_MAX_LINES}L) requires top-{DOCSTRING_HEADER_MAX_LINE} [Role] header",
-        ))
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            end_line = node.end_lineno or node.lineno
-            eff = max(1, (end_line - node.lineno + 1) - _declarative_extra_lines(node))
-            depth = max((0, *(_max_nesting_depth(stmt, 0) for stmt in node.body)))
-            if eff > MAX_FUNCTION_LINES:
-                violations.append(Violation(
-                    "AG008", rel, node.lineno, f"AG008:fn_lines:{pos}:{node.name}",
-                    f"function {node.name} has {eff} non-table lines (limit {MAX_FUNCTION_LINES})",
-                ))
-            if depth > MAX_NESTING_DEPTH:
-                violations.append(Violation(
-                    "AG008", rel, node.lineno, f"AG008:fn_depth:{pos}:{node.name}",
-                    f"function {node.name} has nesting depth {depth} (limit {MAX_NESTING_DEPTH})",
-                ))
-    return violations
-
-
-def _check_ag008_module(rel: PurePosixPath, text: str, tree: ast.Module) -> list[Violation]:
-    """Enforce canonical concept singletons, bypass-kwarg bans, and anti-shard governance."""
-    violations = _check_cohesive_readability(rel, text, tree)
-    pos = rel.as_posix()
-    in_ops = rel.parts[: len(OPERATORS_PARTS)] == OPERATORS_PARTS
-
-    if SHARD_FILENAME_RE.search(rel.stem) and pos not in _LEGACY_SHARD_FILES:
-        violations.append(Violation(
-            "AG008", rel, 1, f"AG008:shard_file:{pos}",
-            f"artificial shard filename {rel.name!r} is banned; keep cohesive domain logic together",
-        ))
-
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ClassDef):
-            owners = CANONICAL_CONCEPT_OWNERS.get(node.name)
-            if owners is not None and not _owner_matches(pos, owners):
-                violations.append(Violation(
-                    "AG008", rel, node.lineno, f"AG008:duplicate_concept:{pos}:{node.name}",
-                    f"canonical concept {node.name!r} belongs exclusively to {owners}",
-                ))
-            elif PARALLEL_CONCEPT_CLASS_RE.match(node.name):
-                violations.append(Violation(
-                    "AG008", rel, node.lineno, f"AG008:parallel_concept:{pos}:{node.name}",
-                    f"parallel batch/cache/overlay class {node.name!r} is banned; reuse canonical schema owners",
-                ))
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            all_args = (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs)
-            for arg in all_args:
-                if arg.arg in BANNED_BYPASS_KWARGS:
-                    violations.append(Violation(
-                        "AG008", rel, node.lineno, f"AG008:bypass_arg:{pos}:{node.name}:{arg.arg}",
-                        f"ad-hoc bypass parameter {arg.arg!r} is banned; pass canonical context state",
-                    ))
-                elif in_ops and arg.arg in OPERATOR_BANNED_BYPASS_KWARGS:
-                    violations.append(Violation(
-                        "AG008", rel, node.lineno, f"AG008:op_bypass_arg:{pos}:{node.name}:{arg.arg}",
-                        f"operator parameter {arg.arg!r} bypasses OperatorPlanningContext.admission_memory_view",
-                    ))
-    return violations
-
-
-def _check_ag008_repo_bounds(rels: Sequence[PurePosixPath]) -> list[Violation]:
-    """Enforce downward ratchet on flat prediction/*.py count and operator package fan-out."""
-    violations: list[Violation] = []
-    flat_pred = [
-        rel for rel in rels
-        if len(rel.parts) == _FLAT_PREDICTION_DEPTH
-        and rel.parts[:2] == ("mindie_sim", "prediction")
-    ]
-    if len(flat_pred) > MAX_FLAT_PREDICTION_MODULES:
-        violations.append(Violation(
-            "AG008", PurePosixPath("mindie_sim/prediction"), 1,
-            "AG008:flat_prediction_ratchet",
-            f"flat mindie_sim/prediction/*.py count {len(flat_pred)} exceeds ratchet ceiling "
-            f"{MAX_FLAT_PREDICTION_MODULES}; consolidate operator modules into prediction/operators/<family>/",
-        ))
-    by_pkg: dict[str, int] = {}
-    for rel in rels:
-        in_pkg, fam, _fname = _is_governed_family_path(rel)
-        if in_pkg and fam is not None and len(rel.parts) == GOVERNED_PATH_DEPTH:
-            by_pkg[fam] = by_pkg.get(fam, 0) + 1
-    for fam, count in sorted(by_pkg.items()):
-        if count > MAX_OPERATOR_PACKAGE_FILES:
-            violations.append(Violation(
-                "AG008", PurePosixPath(*OPERATORS_PARTS, fam), 1,
-                f"AG008:package_fanout:{fam}",
-                f"operator package {fam!r} has {count} peer .py files exceeding ceiling "
-                f"{MAX_OPERATOR_PACKAGE_FILES}",
-            ))
-    return violations
-
-
 def scan_repository(
     root: Path, /, *, revision: str | None = None,
     refs_root: Path | None = None, repo_map: Mapping[str, Path] | None = None,
@@ -929,7 +674,7 @@ def scan_repository(
         violations.extend(_check_ag005(rel, text, tree, refs_root=refs_root, repo_map=repo_map))
         violations.extend(_check_ag006_flat_prediction(rel, tree))
         violations.extend(_check_ag007(rel, tree))
-        violations.extend(_check_ag008_module(rel, text, tree))
+        violations.extend(_check_ag008_module(rel, text, tree, CANONICAL_CONCEPT_OWNERS))
     violations.extend(_check_ag008_repo_bounds([rel for rel, _ in files]))
     violations.sort(key=lambda v: (v.path.as_posix(), v.line, v.rule, v.message))
     return tuple(violations)

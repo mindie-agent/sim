@@ -2,6 +2,9 @@
 
 [Role] Governed operator package owning ``vector`` device kernel recipes.
 [Invariants] Single-owner operator package; no hardware capability sniffing.
-[Timeouts & Locks] Pure namespace package; no I/O or locks.
+[Timeouts & Locks] Local recipe imports; no I/O or locks.
 [Side-Effect Policy] Zero import side effects.
 """
+from .pointwise import TiledPointwise
+
+__all__ = ["TiledPointwise"]

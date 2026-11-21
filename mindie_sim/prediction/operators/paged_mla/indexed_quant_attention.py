@@ -189,11 +189,9 @@ def build(op, geometry, *, scratch_policy, compact=True, operand_modes=True,
             or geometry.buffers.get("ub", 0) < VECTOR_BUFFER_BYTES):
         raise ModelingError("packed_int8_indexed_attention_requires_declared_vector_scratch")
     if schedule == SCHEDULE_ARCH35:
-        arch_id = getattr(getattr(geometry, "compute_arch", None), "arch_id", None)
-        if arch_id is None and getattr(geometry, "datapath", None) is not None:
-            arch_id = getattr(getattr(geometry.datapath, "compute_arch", None), "arch_id", None)
-        if arch_id is not None and str(arch_id) not in {"npu_arch_3510", "DAV_3510"}:
-            raise ModelingError(f"packed_int8_indexed_attention_arch35_unsupported_on_{arch_id}")
+        preset = geometry.compute_arch.preset if geometry.compute_arch is not None else None
+        if preset != "npu_arch_3510":
+            raise ModelingError(f"packed_int8_indexed_attention_arch35_unsupported_on_{preset}")
         return arch35_plan(shape, geometry, tile_size=tile_size, slots=slots)
     if schedule != SCHEDULE_ARCH22:
         raise ModelingError("packed_int8_indexed_attention_schedule_unknown")

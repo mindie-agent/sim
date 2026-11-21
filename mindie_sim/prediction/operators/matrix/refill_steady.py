@@ -252,13 +252,32 @@ def _can_compact_count(
 
 def peer_group_can_compact(
     peer_counts, slots: int, *, head: int = _ONE_TILE, tail: int = _ONE_TILE,
-    threshold: int = _DEFAULT_THRESHOLD,
+    threshold: int = _DEFAULT_THRESHOLD, peer_heads=None, peer_tails=None,
 ) -> bool:
-    """Enforce uniform all-or-nothing compaction across peer cores sharing die HBM."""
-    active = [int(c) for c in peer_counts if int(c) > 0]
-    return bool(active) and all(
-        _can_compact_count(c, slots, head=head, tail=tail, threshold=threshold)
-        for c in active
+    """Enforce one group-wide compaction decision across active peer pipelines."""
+    counts = [int(c) for c in peer_counts]
+    if peer_heads is not None and len(peer_heads) != len(counts):
+        return False
+    if peer_tails is not None and len(peer_tails) != len(counts):
+        return False
+    active = [
+        (
+            c,
+            int(peer_heads[idx]) if peer_heads is not None else int(head),
+            int(peer_tails[idx]) if peer_tails is not None else int(tail),
+        )
+        for idx, c in enumerate(counts) if c > 0
+    ]
+    if not active:
+        return False
+    if len(active) > 1:
+        if len({(h, t) for _, h, t in active}) != 1:
+            return False
+        if max(c for c, _, _ in active) - min(c for c, _, _ in active) > _ONE_TILE:
+            return False
+    return all(
+        _can_compact_count(c, slots, head=h, tail=t, threshold=threshold)
+        for c, h, t in active
     )
 
 
@@ -286,9 +305,45 @@ def _encode_periodic_stages(stages, id_map, pool_id):
     return tuple(encoded)
 
 
+def _build_grouped_steady_program(context, by_res, max_groups, span_ms, slot_allocs):
+    """Build multi-group steady pipeline stages preserving distinct unit placements."""
+    steady_stages_out = []
+    steady_names = []
+    for idx in range(max_groups):
+        g_work = {}
+        g_pl = {}
+        g_caps = {}
+        for k, groups in by_res.items():
+            groups_sorted = sorted(groups, key=lambda x: x[0])
+            if len(groups_sorted) == 1:
+                units, val = groups_sorted[0]
+                share = val / max_groups
+            elif idx < len(groups_sorted):
+                units, share = groups_sorted[idx]
+            else:
+                continue
+            if share > 0:
+                g_work[k] = share
+                if units:
+                    g_pl[k] = units
+                if span_ms > 0:
+                    g_caps[k] = share / span_ms
+        name = f"steady_pipeline_{idx}"
+        steady_names.append(name)
+        steady_stages_out.append(Stage(
+            name, g_work, after=("setup",), caps=g_caps, placement=g_pl, coupled=True,
+        ))
+    return KernelProgram((
+        Stage("setup", latency=context.setup_ms, acquire=slot_allocs),
+        *steady_stages_out,
+        Stage("steady_release", after=tuple(steady_names), free=slot_allocs),
+    ))
+
+
 def compact_periodic_pipeline(
     context, count, slots, tile_fn, *, head=_ONE_TILE, tail=_ONE_TILE,
     threshold=_DEFAULT_THRESHOLD, resident=(), peer_counts=None,
+    peer_heads=None, peer_tails=None,
 ):
     """Compact a periodic PipelineProgram(count, slots, tile_fn) in O(1) time.
 
@@ -297,14 +352,24 @@ def compact_periodic_pipeline(
     unit engine determines the private pipeline supply caps and peak pool
     occupancy, while all total work and buffers contend on the caller's shared
     Engine as a coupled fluid steady-state approximation. When ``peer_counts``
-    is supplied, all active peer cores sharing die HBM take a uniform
-    all-or-nothing compaction decision so uncompacted peers never steal 2x HBM
-    fair-share from compacted peers.
+    names multiple active peers, callers must supply all peers' tail lengths
+    (``peer_tails``) so the whole group takes one uniform all-or-nothing
+    decision, and shared-resource tiles with serial wall latency retain literal
+    service.
     """
-    if peer_counts is not None and not peer_group_can_compact(
-        peer_counts, slots, head=head, tail=tail, threshold=threshold,
-    ):
-        return PipelineProgram(count, slots, tile_fn)
+    active_peer_count = 1
+    if peer_counts is not None:
+        active_counts = [int(c) for c in peer_counts if int(c) > 0]
+        active_peer_count = len(active_counts)
+        if active_peer_count > 1 and peer_tails is None:
+            return PipelineProgram(count, slots, tile_fn)
+        if not peer_group_can_compact(
+            peer_counts, slots, head=head, tail=tail, threshold=threshold,
+            peer_heads=peer_heads, peer_tails=peer_tails,
+        ):
+            return PipelineProgram(count, slots, tile_fn)
+        if active_peer_count == 1 and active_counts[0] != count:
+            return PipelineProgram(count, slots, tile_fn)
     step = max(2, slots)
     if count > head + tail:
         tail += (count - head - tail) % step
@@ -342,6 +407,15 @@ def compact_periodic_pipeline(
                 for k, units in lpl.items():
                     all_placement.setdefault(k, set()).update(units)
     all_placement = {k: tuple(sorted(u)) for k, u in all_placement.items() if k in total_work}
+    if active_peer_count > 1:
+        has_unplaced = any(k not in all_placement for k in total_work)
+        has_latency = any(
+            stage.latency > 0.0
+            for group in (*head_tiles, steady_stages, *tail_tiles)
+            for stage in group
+        )
+        if has_unplaced and has_latency:
+            return PipelineProgram(count, slots, tile_fn)
 
     pool_units_by_phys = {}
     for s_stages in (steady_stages, *head_tiles, *tail_tiles):
@@ -398,35 +472,4 @@ def compact_periodic_pipeline(
             Stage("steady_pipeline", total_work, after=("setup",), caps=caps,
                   placement=all_placement, coupled=True, free=slot_allocs),
         ))
-
-    steady_stages_out = []
-    steady_names = []
-    for idx in range(max_groups):
-        g_work = {}
-        g_pl = {}
-        g_caps = {}
-        for k, groups in by_res.items():
-            groups_sorted = sorted(groups, key=lambda x: x[0])
-            if len(groups_sorted) == 1:
-                units, val = groups_sorted[0]
-                share = val / max_groups
-            elif idx < len(groups_sorted):
-                units, share = groups_sorted[idx]
-            else:
-                continue
-            if share > 0:
-                g_work[k] = share
-                if units:
-                    g_pl[k] = units
-                if span_ms > 0:
-                    g_caps[k] = share / span_ms
-        name = f"steady_pipeline_{idx}"
-        steady_names.append(name)
-        steady_stages_out.append(Stage(
-            name, g_work, after=("setup",), caps=g_caps, placement=g_pl, coupled=True,
-        ))
-    return KernelProgram((
-        Stage("setup", latency=context.setup_ms, acquire=slot_allocs),
-        *steady_stages_out,
-        Stage("steady_release", after=tuple(steady_names), free=slot_allocs),
-    ))
+    return _build_grouped_steady_program(context, by_res, max_groups, span_ms, slot_allocs)

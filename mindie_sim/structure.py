@@ -253,6 +253,109 @@ def _node(op, replica, *, source_call=None, block=None, role=None, structure=Non
     return _json_value(payload)
 
 
+def _export_resource_operators(resource_graphs, resource_geometries, subgraphs, by_id, kernels, book):
+    """Project selected resource boundaries and their covered semantic nodes."""
+    if resource_graphs is None:
+        return []
+    resource_operators = []
+    groups = {group["subgraph_id"]: group for group in subgraphs}
+    subgraph_member_sets = {id(other): set(other["node_ids"]) for other in subgraphs}
+    subgraphs_by_first_member = defaultdict(list)
+    for other in subgraphs:
+        if other["node_ids"]:
+            subgraphs_by_first_member[other["node_ids"][0]].append(other)
+    for replica, operators in sorted(resource_graphs.items()):
+        outputs_by_id, metadata_by_id = {}, {}
+        for op in operators:
+            meta = dict(op.metadata)
+            if "fusion_group_key" not in meta or not isinstance(meta.get("fusion_boundary"), Mapping):
+                continue
+            key = f"rank:{replica}/subgraph:{meta['fusion_group_key']}"
+            group = groups[key]
+            resource = _node(op, replica, block=group["block"], role=group["role"],
+                             structure=group["structure"], kernels=kernels, book=book,
+                             geometry=resource_geometries.get((replica, op.stage)),
+                             semantic_refs=group["semantic_refs"],
+                             outputs_by_id=outputs_by_id,
+                             metadata_by_id=metadata_by_id)
+            resource_operators.append(resource)
+            boundary = {**meta["fusion_boundary"],
+                        "operator_ids": [resource["node_id"]],
+                        "kind": "selected_native_fusion"}
+            group["resource_boundary"] = boundary
+            group.update({field: resource[field]
+                          for field in ("physical_work", "physical_signature")})
+            group["contract_scope"] = subgraph_comparison_scope(
+                group["role"], [by_id[key] for key in group["node_ids"]], resource=resource)
+            # The region owns one physical boundary.  A native name is a
+            # correspondence; only a selection fact may mark it chosen.
+            candidates = [dict(candidate)
+                          for candidate in resource["native_candidates"]]
+            selected = (resource["native_execution"] or {}).get("selected")
+            selected_candidate = None
+            if selected and selected.get("native"):
+                selected_candidate = next(
+                    (candidate for candidate in candidates
+                     if candidate["native"] == selected["native"]), None)
+                if selected_candidate is not None:
+                    selected_candidate.update(selected=True,
+                                              status="selected_declared")
+                fusion_execution = {
+                    "kind": "selected_native_fusion",
+                    "selection_state": "selected_declared",
+                    "selected": {
+                        **selected,
+                        "candidate_id": (selected_candidate or {}).get(
+                            "candidate_id")},
+                    "observed": False,
+                    "reason": "one selected region boundary covers every semantic member",
+                }
+            elif selected:
+                fusion_execution = {
+                    "kind": "selected_native_fusion_boundary",
+                    "selection_state": "selected_declared",
+                    "selected": {**selected, "candidate_id": None},
+                    "observed": False,
+                    "reason": "a plan is selected but its native API is not unique",
+                }
+            else:
+                fusion_execution = {
+                    "kind": "selected_native_fusion_boundary",
+                    "selection_state": ("multiple_compatible_unselected"
+                                        if candidates else "unresolved"),
+                    "selected": None,
+                    "observed": False,
+                    "reason": "fusion boundary is replaced but no native API is selected",
+                }
+            group["native_candidates"] = candidates
+            group["native_execution"] = fusion_execution
+            region_gaps = list(group.get("representation_gaps") or ())
+            if selected and selected.get("native") and selected_candidate is None:
+                region_gaps.append({
+                    "code": "selected_native_not_in_candidates",
+                    "detail": {"selected": selected["native"]}})
+            group["representation_gaps"] = region_gaps
+            members = set(group["node_ids"])
+            internal = {"kind": "internal_to_selected_native_fusion",
+                        "subgraph_id": key, "operator_ids": [resource["node_id"]]}
+            covered = {
+                "kind": "covered_by_fused_region",
+                "selection_state": "covered",
+                "selected": None,
+                "observed": False,
+                "region": key,
+                "reason": "member work belongs to the region's selected native boundary",
+            }
+            for member in members:
+                by_id[member].update(event_matchable=False, resource_boundary=internal,
+                                     native_execution=covered)
+                for other in subgraphs_by_first_member.get(member, ()):
+                    if other is not group and subgraph_member_sets[id(other)] <= members:
+                        other.update(event_matchable=False, resource_boundary=internal,
+                                     native_execution=covered)
+    return resource_operators
+
+
 def export_op_structure(ops, *, model, execution, kernels=None, source=None,
                         expand_calls=True, resource_graphs=None, resource_geometries=None,
                         native_evidence=False):
@@ -285,9 +388,11 @@ def export_op_structure(ops, *, model, execution, kernels=None, source=None,
     phase = execution["phase"]
     draft_prepare = bool(execution.get("draft_prepare", False))
     allowed_phases = {phase}
-    if phase == "decode":
+    if phase in {"decode", "mixed"}:
         allowed_phases.add("draft")
-    elif phase == "prefill" and draft_prepare:
+    if phase == "mixed":
+        allowed_phases.update({"prefill", "decode"})
+    if phase in {"prefill", "mixed"} and draft_prepare:
         allowed_phases.update({"draft", "draft_prefill"})
     book = RecipeBook.from_mapping(kernels or {})
     resource_geometries = resource_geometries or {}
@@ -363,103 +468,8 @@ def export_op_structure(ops, *, model, execution, kernels=None, source=None,
                                       region_id=group["subgraph_id"],
                                       semantic_refs=member_refs))
         group.setdefault("representation_gaps", [])
-    resource_operators = []
-    if resource_graphs is not None:
-        groups = {group["subgraph_id"]: group for group in subgraphs}
-        subgraph_member_sets = {id(other): set(other["node_ids"]) for other in subgraphs}
-        subgraphs_by_first_member = defaultdict(list)
-        for other in subgraphs:
-            if other["node_ids"]:
-                subgraphs_by_first_member[other["node_ids"][0]].append(other)
-        for replica, operators in sorted(resource_graphs.items()):
-            outputs_by_id, metadata_by_id = {}, {}
-            for op in operators:
-                meta = dict(op.metadata)
-                if "fusion_group_key" not in meta or not isinstance(meta.get("fusion_boundary"), Mapping):
-                    continue
-                key = f"rank:{replica}/subgraph:{meta['fusion_group_key']}"
-                group = groups[key]
-                resource = _node(op, replica, block=group["block"], role=group["role"],
-                                 structure=group["structure"], kernels=kernels, book=book,
-                                 geometry=resource_geometries.get((replica, op.stage)),
-                                 semantic_refs=group["semantic_refs"],
-                                 outputs_by_id=outputs_by_id,
-                                 metadata_by_id=metadata_by_id)
-                resource_operators.append(resource)
-                boundary = {**meta["fusion_boundary"],
-                            "operator_ids": [resource["node_id"]],
-                            "kind": "selected_native_fusion"}
-                group["resource_boundary"] = boundary
-                group.update({field: resource[field]
-                              for field in ("physical_work", "physical_signature")})
-                group["contract_scope"] = subgraph_comparison_scope(
-                    group["role"], [by_id[key] for key in group["node_ids"]], resource=resource)
-                # The region owns one physical boundary.  A native name is a
-                # correspondence; only a selection fact may mark it chosen.
-                candidates = [dict(candidate)
-                              for candidate in resource["native_candidates"]]
-                selected = (resource["native_execution"] or {}).get("selected")
-                selected_candidate = None
-                if selected and selected.get("native"):
-                    selected_candidate = next(
-                        (candidate for candidate in candidates
-                         if candidate["native"] == selected["native"]), None)
-                    if selected_candidate is not None:
-                        selected_candidate.update(selected=True,
-                                                  status="selected_declared")
-                    fusion_execution = {
-                        "kind": "selected_native_fusion",
-                        "selection_state": "selected_declared",
-                        "selected": {
-                            **selected,
-                            "candidate_id": (selected_candidate or {}).get(
-                                "candidate_id")},
-                        "observed": False,
-                        "reason": "one selected region boundary covers every semantic member",
-                    }
-                elif selected:
-                    fusion_execution = {
-                        "kind": "selected_native_fusion_boundary",
-                        "selection_state": "selected_declared",
-                        "selected": {**selected, "candidate_id": None},
-                        "observed": False,
-                        "reason": "a plan is selected but its native API is not unique",
-                    }
-                else:
-                    fusion_execution = {
-                        "kind": "selected_native_fusion_boundary",
-                        "selection_state": ("multiple_compatible_unselected"
-                                            if candidates else "unresolved"),
-                        "selected": None,
-                        "observed": False,
-                        "reason": "fusion boundary is replaced but no native API is selected",
-                    }
-                group["native_candidates"] = candidates
-                group["native_execution"] = fusion_execution
-                region_gaps = list(group.get("representation_gaps") or ())
-                if selected and selected.get("native") and selected_candidate is None:
-                    region_gaps.append({
-                        "code": "selected_native_not_in_candidates",
-                        "detail": {"selected": selected["native"]}})
-                group["representation_gaps"] = region_gaps
-                members = set(group["node_ids"])
-                internal = {"kind": "internal_to_selected_native_fusion",
-                            "subgraph_id": key, "operator_ids": [resource["node_id"]]}
-                covered = {
-                    "kind": "covered_by_fused_region",
-                    "selection_state": "covered",
-                    "selected": None,
-                    "observed": False,
-                    "region": key,
-                    "reason": "member work belongs to the region's selected native boundary",
-                }
-                for member in members:
-                    by_id[member].update(event_matchable=False, resource_boundary=internal,
-                                         native_execution=covered)
-                    for other in subgraphs_by_first_member.get(member, ()):
-                        if other is not group and subgraph_member_sets[id(other)] <= members:
-                            other.update(event_matchable=False, resource_boundary=internal,
-                                         native_execution=covered)
+    resource_operators = _export_resource_operators(
+        resource_graphs, resource_geometries, subgraphs, by_id, kernels, book)
     # Normalize each owned record separately. A whole-payload JSON round trip
     # retained the DAG, its encoded string and a second DAG at the same time.
     payload = {

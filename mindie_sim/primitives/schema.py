@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from mindie_sim.prediction.collectives.protocol import frame_wire_bytes as _protocol_frame_wire_bytes
 from mindie_sim.prediction.runtime.memory_physics import (
-    DEFAULT_SECTOR_BYTES, AddressRun, AddressRunPlan, burst_turnaround_efficiency,
+    DEFAULT_SECTOR_BYTES, AddressRun, AddressRunPlan, _burst_service_bytes,
 )
 from mindie_sim.schema.common import ModelingError, align_up
 from mindie_sim.schema.hardware_links import CollectiveBandSpec
@@ -653,7 +653,8 @@ class _PrimitiveAddressPlan(AddressRunPlan):
                 intervals = ((addr // sec * sec, align_up(addr + run.row_bytes, sec))
                              for addr in range(run.base_byte, run.base_byte + run.rows * run.stride_bytes,
                                                run.stride_bytes))
-            weight = 1.0 / burst_turnaround_efficiency(run.row_bytes, run.stride_bytes, burst_rules)
+            wire = run.sector_union_bytes(sec)
+            weight = _burst_service_bytes(self, wire, run, burst_rules) / wire
             end = None
             for lo, hi in intervals:
                 if end is None or lo > end:
@@ -680,18 +681,19 @@ class _PrimitiveAddressPlan(AddressRunPlan):
         return sector_bytes + scale, service + scale
 
 
-def _address_plan(values, integer, size=None):
+def _address_plan(values, integer, size=None, *, sector_bytes=None):
     runs = values("runs")
     if isinstance(runs, AddressRunPlan):
-        return _PrimitiveAddressPlan(runs.runs, runs.alignment_bytes, runs.scale_bytes,
-                                     runs.sector_bytes, runs.expanded_queries)
+        return _PrimitiveAddressPlan(**{
+            item.name: getattr(runs, item.name) for item in fields(AddressRunPlan) if item.init
+        } | {"sector_bytes": sector_bytes if runs._default_sector else runs.sector_bytes})
     if runs is None:
         row = integer("row_bytes", size if size is not None else values("payload_bytes", values("bytes", 0)))
         runs = (AddressRun(integer("base_byte"), integer("rows", 1), row, integer("stride_bytes", row)),)
     return _PrimitiveAddressPlan(
         tuple(run if isinstance(run, AddressRun) else AddressRun(**run) for run in runs),
         integer("alignment_bytes", DEFAULT_SECTOR_BYTES, 1), integer("scale_bytes"),
-        integer("sector_bytes", DEFAULT_SECTOR_BYTES, 1),
+        DEFAULT_SECTOR_BYTES if sector_bytes is None else sector_bytes,
     )
 
 

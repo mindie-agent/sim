@@ -580,7 +580,7 @@ tier = "tier1"   # temporary git repositories for ci_scope + ratchet self-tests
 owns = ["scripts/check_test_orthogonality.py", ".github/scripts/ci_scope.py", "tests/_support/tempdirs.py"]
 
 [[module]]
-path = "hygiene/test_spine_prevention_locks.py"
+path = "hygiene/test_spine_bounds_and_wiring_locks.py"
 tier = "tier0"
 owns = [
   "mindie_sim/primitives/loader.py",

@@ -162,6 +162,7 @@ class Engine(
         self._hbm_bus_epoch: int = 0
         self._hbm_acct_live: int = 0
         self._hbm_accounting_serviced: dict[str, float] = {}
+        self._periodic_clock_step: tuple[int, float] | None = None
         self._pending_hbm_retrofits: dict[str, tuple[Any, bool]] = {}
         self._discover_hbm_bus_aliases()
         if self._accel is not None and getattr(self._accel, "mode", "") == "c":
@@ -465,7 +466,7 @@ class Engine(
             if max_steps is not None and steps >= max_steps:
                 raise ExecutionError("execution_step_budget_exhausted")
             if self._placed_active or self._fifo_live:
-                self._split_asymmetric_cohorts()
+                self._settle_asymmetric_cohorts()
             if self._periodic_runs:
                 skipped = self._periodic_observe(horizon)
                 if skipped is not None:
@@ -688,6 +689,7 @@ class Engine(
     ) -> float:
         rates = self._rates()
         dt = _stop_window(now, horizon, releases, latency_active, tasks)
+        stop_dt = dt
         for name, consumers in rates.items():
             for key, rate in consumers.items():
                 if rate == 0.0:
@@ -698,6 +700,8 @@ class Engine(
         if not math.isfinite(dt):
             names = ",".join(task.event.name for task in tasks.values())
             raise ExecutionError(f"execution_stalled:{names[:_STALL_NAME_LIMIT]}")
+        if self._periodic_runs:
+            self._periodic_clock_step = (self.advance_steps + 1, dt) if dt < stop_dt else None
         next_time = now + dt
         if dt > 0 and next_time == now:
             next_time = math.nextafter(now, math.inf)

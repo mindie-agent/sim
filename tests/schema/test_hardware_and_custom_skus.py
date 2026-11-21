@@ -34,7 +34,7 @@ from mindie_sim.prediction.efficiency import analyze_network_efficiency, extract
 from mindie_sim.prediction.engine import Engine
 from mindie_sim.prediction.graph_analysis import graph_costs
 from mindie_sim.prediction.operator_analysis import operator_costs
-from mindie_sim.prediction.pointwise import TiledPointwise
+from mindie_sim.prediction.operators.vector import TiledPointwise
 from mindie_sim.prediction.program import RecipeBook
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.prediction.topology import Topology

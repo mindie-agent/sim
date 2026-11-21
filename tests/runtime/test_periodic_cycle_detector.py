@@ -60,7 +60,7 @@ def frame(now, *, state=STATE, cursors=None, sequence=100, epoch=7):
 
 
 def delta(dt=1.0, *, issued=None, sequence_count=4, service=None, busy=None, peaks=None,
-          crossed=False, logical_completions=1, allocation_grants=0, allocation_last_uses=0):
+          crossed=False, logical_completions=1, allocation_grants=0, allocation_last_uses=0, **accounting):
     return IntervalDelta(
         dt=dt, issued_retired_by_run=issued or {1: (1, 1)}, sequence_count=sequence_count,
         service_by_resource={"mte2": 8.0, "cube": 16.0} if service is None else service,
@@ -68,7 +68,7 @@ def delta(dt=1.0, *, issued=None, sequence_count=4, service=None, busy=None, pea
         allocation_event_count=2, logical_completions=logical_completions,
         per_unit_peaks={("l1", 0): 4.0, ("l0c", 0): 8.0} if peaks is None else peaks,
         crossed_external_or_opaque=crossed, allocation_grants=allocation_grants,
-        allocation_last_uses=allocation_last_uses)
+        allocation_last_uses=allocation_last_uses, **accounting)
 
 
 def engine_state(*, remaining=8.0, caps=(("cube", 1.0),), tasks=1, placement=()):
@@ -93,7 +93,8 @@ def run_frames(states, *, run_id=1000, slots=(0, 1), detector=None, phase_end=67
 
 
 def test_two_equal_intervals_return_a_bounded_exact_skip_with_scaled_totals():
-    _, _, results = run_frames([STATE] * 3, run_id=1, allocation_grants=2, allocation_last_uses=1)
+    _, _, results = run_frames([STATE] * 3, run_id=1, allocation_grants=2, allocation_last_uses=1,
+                              deliveries_by_counter={"read": 32, "write": 64}, hbm_accounting={"hbm": 96})
     assert results[:2] == [None, None]
     skip = results[2]
     assert (skip.cycles, skip.period, skip.seq_stride) == (63, 1.0, 4)  # 67 - next_issue(4)
@@ -110,6 +111,8 @@ def test_two_equal_intervals_return_a_bounded_exact_skip_with_scaled_totals():
     assert total.service_by_resource["mte2"] == 504.0 and total.busy_by_resource["cube"] == 63.0
     assert total.per_unit_peaks == skip.delta.per_unit_peaks
     assert (total.allocation_grants, total.allocation_last_uses) == (126, 63)
+    assert total.deliveries_by_counter == {"read": 63 * 32, "write": 63 * 64}
+    assert total.hbm_accounting == {"hbm": 63 * 96}
 
 
 DEEP = STATE[:3] + (("tasks", (("run", 1, "tile@0", "load", (("mte2", 8.0000001),), 0, ()),)

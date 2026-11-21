@@ -21,6 +21,8 @@ from .frontier import (
     RunCorrespondence,
     SettledFrontier,
     WindowTile,
+    _ADDITIVE_COUNTERS,
+    _advance_periodic_clock,
     _state_difference,
     _state_equal,
 )
@@ -103,9 +105,9 @@ def _interval_retained_bytes(
     owned = _INTERVAL_OVERHEAD
     for name in (
         "issued_retired_by_run",
-        "service_by_resource",
-        "busy_by_resource",
+        *_ADDITIVE_COUNTERS,
         "per_unit_peaks",
+        "clock_steps",
     ):
         owned += _measure_retained(getattr(interval, name), seen=seen)
     return owned
@@ -497,13 +499,16 @@ class CycleDetector:
         if not any(issued.values()) or seq_stride == 0:
             return None
 
-        service: dict[str, list[float]] = {}
-        busy: dict[str, list[float]] = {}
-        for part in parts:
-            for name, amount in part.service_by_resource.items():
-                service.setdefault(name, []).append(amount)
-            for name, amount in part.busy_by_resource.items():
-                busy.setdefault(name, []).append(amount)
+        counters = {}
+        for field in _ADDITIVE_COUNTERS:
+            amounts: dict[str, list[float]] = {}
+            for part in parts:
+                for name, amount in getattr(part, field).items():
+                    amounts.setdefault(name, []).append(amount)
+            counters[field] = {name: math.fsum(values) for name, values in amounts.items()}
+        clock_steps = tuple(dt for part in parts for dt in part.clock_steps)
+        if clock_steps and _advance_periodic_clock(start.now, clock_steps, 1) != end.now:
+            return None
         peaks: dict[Any, float] = {}
         for part in parts:
             for key, value in part.per_unit_peaks.items():
@@ -512,14 +517,14 @@ class CycleDetector:
             dt=period,
             issued_retired_by_run={run_id: (issued[run_id], retired[run_id]) for run_id in issued},
             sequence_count=seq_stride,
-            service_by_resource={name: math.fsum(values) for name, values in service.items()},
-            busy_by_resource={name: math.fsum(values) for name, values in busy.items()},
             allocation_event_count=sum(part.allocation_event_count for part in parts),
             per_unit_peaks=peaks,
             logical_completions=sum(part.logical_completions for part in parts),
             crossed_external_or_opaque=False,
             allocation_grants=sum(part.allocation_grants for part in parts),
             allocation_last_uses=sum(part.allocation_last_uses for part in parts),
+            clock_steps=clock_steps,
+            **counters,
         )
         return _CycleEvidence(
             period=period,
@@ -559,20 +564,11 @@ class CycleDetector:
             return False
         if left.crossed_external_or_opaque or right.crossed_external_or_opaque:
             return False
-        if set(left.service_by_resource) != set(right.service_by_resource):
+        if left.clock_steps != right.clock_steps:
             return False
-        if set(left.busy_by_resource) != set(right.busy_by_resource):
-            return False
-        if set(left.per_unit_peaks) != set(right.per_unit_peaks):
-            return False
-        for name in left.service_by_resource:
-            if not _numeric_close(left.service_by_resource[name], right.service_by_resource[name]):
-                return False
-        for name in left.busy_by_resource:
-            if not _numeric_close(left.busy_by_resource[name], right.busy_by_resource[name]):
-                return False
-        for key in left.per_unit_peaks:
-            if not _numeric_close(left.per_unit_peaks[key], right.per_unit_peaks[key]):
+        for field in (*_ADDITIVE_COUNTERS, "per_unit_peaks"):
+            a, b = getattr(left, field), getattr(right, field)
+            if a.keys() != b.keys() or any(not _numeric_close(a[key], b[key]) for key in a):
                 return False
         return True
 
@@ -605,6 +601,16 @@ class CycleDetector:
             cycles = min(cycles, remaining // stride)
         if not math.isfinite(cycles):
             return 0
+        steps = evidence.delta.clock_steps
+        if steps and math.isfinite(stop_at) and _advance_periodic_clock(frame.now, steps, cycles) >= stop_at:
+            low, high = 0, cycles
+            while high - low > 1:
+                mid = (low + high) // 2
+                if _advance_periodic_clock(frame.now, steps, mid) < stop_at:
+                    low = mid
+                else:
+                    high = mid
+            cycles = low
         return int(cycles)
 
     @staticmethod

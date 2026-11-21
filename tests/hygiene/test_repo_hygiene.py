@@ -13,6 +13,8 @@
 """
 from __future__ import annotations
 
+import argparse
+
 import importlib.util
 import json
 import os
@@ -386,3 +388,58 @@ def test_support_oracles_builders_and_captures_contracts():
         "activation-call", ("activation_a.json",), "activation_producer.py.txt"
     )
     assert len(manifest["captures"][0]["sha256"]) == 64
+
+
+def test_hygiene_rejects_producer_shape_filters(tmp_path: Path) -> None:
+    verifier = _load_script("verify_m1", REPO_ROOT / "scripts" / "verify_m1.py")
+    directory = tmp_path / "data" / "verification"
+    directory.mkdir(parents=True)
+    producer = directory / "sample.producer.py"
+    args = argparse.Namespace(sim=tmp_path, profiler=tmp_path)
+    producer.write_text("for r in rows:\n    if r['status'] != 'ok' or measured_ns <= 0: continue\n", encoding="utf-8")
+    assert verifier.hygiene(args)["status"] == "pass"
+    producer.write_text(
+        "MIN_MIB = +64\ndef collect():\n    min_payload_bytes: int = 4096\n    for row in rows:\n"
+        "        if m < 1024: continue\n        if max(n, k) < 14336 and valid: continue\n"
+        "        if payload_mib < MIN_MIB: continue\n        if row.get('M', 0) < 512: continue\n"
+        "        if n < 32:\n            for item in row:\n                if not item: continue\n"
+        "        if sh.get('swa', 0) != 0: continue\n"
+        "        if sh[0] >= 512: add(row)\n"
+        "        if 'sinkhorn_T960' not in name: add(row)\n"
+        "        if b >= STEADY_COLL_MIN_BYTES: out.append(row)\n"
+        "    return [row for row in rows if m >= 256]\n", encoding="utf-8",
+    )
+    result = verifier.hygiene(args)
+    assert result["status"] == "fail"
+    expected = {f"{line}:shape_size_filter" for line in (5, 6, 7, 8, 12, 13, 14, 15, 16)} | {
+        "1:shape_size_filter_constant:MIN_MIB", "3:shape_size_filter_constant:min_payload_bytes"}
+    assert set(result["producer_shape_filters"]) == {f"{producer.relative_to(tmp_path)}:{item}" for item in expected}
+
+
+@pytest.mark.parametrize("mark", [
+    "pytest.mark.xfail(strict=False, raises=TimingDrift, reason='profile.json:2')",
+    "pytest.mark.xfail(strict=True, reason='profile.json:2')",
+    "pytest.mark.xfail(strict=True, raises=AssertionError, reason='profile.json:2')",
+    "pytest.mark.xfail(strict=True, raises=TimingDrift, reason='profile.json:1')",
+    "pytest.mark.xfail(strict=True, raises=TimingDrift, reason='missing.py:2')",
+])
+def test_xfail_checker_rejects_invalid_exact_parameter_marks_in_legacy_root(tmp_path, monkeypatch, mark):
+    path = "tests/test_profiles.py"
+    module = f"""import pytest
+class TimingDrift(AssertionError):
+    pass
+narrow = pytest.mark.xfail(strict=True, raises=TimingDrift, reason="profile.json:2")
+cases = [
+    pytest.param(1, marks=narrow, id="valid"),
+    pytest.param(2, marks=[pytest.mark.tier1, {mark}], id="invalid"),
+]
+@pytest.mark.parametrize("value", cases)
+def test_law(value):
+    assert value
+"""
+    root = _tree(tmp_path, {path: module, "profile.json": '{\n  "rate": 1000\n}\n'})
+    monkeypatch.setattr(gate, "diff_lines", lambda *_: ([], []))
+    checker = gate.Gate(root, gate.load_manifest(root / "tests"))
+    checker.check_file(path, "M", "reference")
+    only, = checker.findings
+    assert only.code == "TO008" and f"{path}::test_law[invalid]" in only.message

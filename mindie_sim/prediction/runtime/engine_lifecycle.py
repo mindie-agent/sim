@@ -684,6 +684,15 @@ class _EngineLifecycleMixin:
             if self._settle_rounds > self.zero_progress_limit:
                 raise ExecutionError("execution_zero_progress")
 
+    def _settle_asymmetric_cohorts(self) -> None:
+        # Each successful pass replaces at least one active cohort with
+        # singleton members. No pass creates a new cohort.
+        remaining = len(self._tasks)
+        while self._split_asymmetric_cohorts():
+            remaining -= 1
+            if remaining < 0:
+                raise ExecutionError("asymmetric_cohort_split_did_not_converge")
+
     def _split_asymmetric_cohorts(self) -> bool:
         """Split active cohorts on FIFO resources or asymmetric peer unit overlap."""
         if not self._active or (self._placed_active == 0 and self._fifo_live == 0):

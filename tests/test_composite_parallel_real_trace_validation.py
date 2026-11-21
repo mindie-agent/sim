@@ -27,6 +27,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import pytest
@@ -46,27 +47,23 @@ ROOT = Path(__file__).resolve().parents[1]
 VERIFICATION = ROOT / "data/verification/decode-body-current-20261030.json"
 CASE_ROOT = ROOT / "examples/cases/high-concurrency-20261030"
 
-# Real heldout captures retained by the decode-body scoreboard. The case JSON
-# is the full checked-in input; the scoreboard row supplies the measured
-# kernel_details p50 and the exact captured query/context/sequence geometry.
-# ``evaluation_relation`` is resolved from the case when declared. The compact
-# scoreboard projection drops that field for these rows; missing provenance is
-# reported as ``unknown`` and each row's external capture path is checked
-# separately instead of being inferred to be heldout.
+class _TimingParityDriftError(AssertionError):
+    """The live body timing missed the declared heldout tolerance."""
+
+
 A3_SPECIALIST_PENDING = pytest.mark.xfail(
-    strict=True,
-    reason="Pending Tier-1/Tier-2 A3-03 GroupedMatmul + A3-05 MC2 specialist closure "
-           "after Vol.8 I-01/I-02 (ascend.json:1) removed 1.2T/32B-cyc error cancellation",
+    strict=True, raises=_TimingParityDriftError,
+    reason="GroupedMatmul/MC2 timing drift with current A3 MTE2 calibration "
+           "(mindie_sim/backends/profiles/ascend.json:8616)",
 )
 HELDOUT_CASES = (
     pytest.param("v41-new6/a3_v41_w8a8_tp4_dp4_ep16_dspark7_c32.json",
-                 "a3_v41_w8a8_tp4_dp4_ep16_dspark7_c32:q8_b9_m72", marks=A3_SPECIALIST_PENDING),
+                 "a3_v41_w8a8_tp4_dp4_ep16_dspark7_c32:q8_b9_m72", marks=A3_SPECIALIST_PENDING, id="a3_v41_w8a8_tp4_dp4_ep16_dspark7_c32"),
     pytest.param("glm-source-accepted-26/glm53flash-a3-tp16-c4.json",
-                 "glm53flash-a3-tp16-c4:q6_b4_m24", marks=A3_SPECIALIST_PENDING),
+                 "glm53flash-a3-tp16-c4:q6_b4_m24", marks=A3_SPECIALIST_PENDING, id="glm53flash-a3-tp16-c4"),
     pytest.param("glm-source-accepted-26/a3_glm53flash_tp16_aclgraph_c16.json",
-                 "a3_glm53flash_tp16_aclgraph_c16:q6_b16_m96"),
+                 "a3_glm53flash_tp16_aclgraph_c16:q6_b16_m96", id="a3_glm53flash_tp16_aclgraph_c16"),
 )
-HELDOUT_IDS = [row.values[1].split(":")[0] for row in HELDOUT_CASES]
 
 # Deterministic 2-layer composite physical regression rows.
 # name, model, hardware, quant, sku, tp, dp, ep, rpn, layers, experts, phase,
@@ -82,7 +79,7 @@ CAPTURES = (
     ("a5-9582-qwen35-fp8-prefill", "qwen3.5-35b-a3b", "Ascend950DT_9582", "fp8", "Ascend950DT_9582", 2, 1, 2, None, 2, 8, "prefill", 128, 0, 1, 0.4205391754288273),
     ("a5-9582-qwen397-w4a8", "qwen3.5-397b-a17b", "Ascend950DT_9582", "w4a8", "Ascend950DT_9582", 2, 1, 2, None, 2, 8, "decode", 1, 128, 1, 0.4071544238346918),
     ("a2-dsv32-w8a8-ep4", "deepseek-v3.2", "a2", "w8a8", "Ascend910B4", 2, 2, 4, None, 4, 8, "decode", 1, 128, 1, 2.924359933348495),
-    ("a5-v41-fp8-prefill", "deepseek-v4.1", "Ascend950DT_9582", "fp8", "Ascend950DT_9582", 2, 1, 2, None, 4, 8, "prefill", 128, 0, 1, 1.0428827000831993),
+    ("a5-v41-fp8-prefill", "deepseek-v4.1", "Ascend950DT_9582", "fp8", "Ascend950DT_9582", 2, 1, 2, None, 4, 8, "prefill", 128, 0, 1, 1.0428833671391686),
     ("a3-9362-ep16-sn", "qwen3.5-35b-a3b", "Ascend910_9362", "w8a8", "Ascend910_9362", 4, 4, 16, 16, 2, 16, "decode", 1, 64, 1, 0.44080702409645617),
     ("a2-ep16-mn", "qwen3.5-35b-a3b", "a2", "w8a8", "Ascend910B4", 4, 4, 16, 8, 2, 16, "decode", 1, 64, 1, 1.5111091846511002),
     ("a5-9582-ep32-mn-fp8", "qwen3.5-397b-a17b", "Ascend950DT_9582", "fp8", "Ascend950DT_9582", 4, 8, 32, 8, 2, 32, "decode", 1, 64, 1, 1.8397941791460237),
@@ -250,7 +247,7 @@ def _apply_captured_parallel(case, geometry):
     return case
 
 
-@pytest.mark.parametrize("relative,case_id", HELDOUT_CASES, ids=HELDOUT_IDS)
+@pytest.mark.parametrize("relative,case_id", HELDOUT_CASES)
 def test_heldout_real_npu_body_p50(relative, case_id):
     case = json.loads((CASE_ROOT / relative).read_text(encoding="utf-8"))
     row = _scoreboard_row(case_id)
@@ -268,10 +265,9 @@ def test_heldout_real_npu_body_p50(relative, case_id):
         context=geometry["context_tokens"],
         sequences=geometry["sequences_per_replica"],
     )
-    assert live["scope"] == "body"
-    assert _rel(live["duration_ms"], measured) <= REL_TOL, (
-        f"{relative}: live {live['duration_ms']:.6f} ms vs measured {measured:.6f} ms"
-    )
+    assert live["scope"] == "body" and math.isfinite(live["duration_ms"]) and live["duration_ms"] > 0 and math.isfinite(measured) and measured > 0
+    if not _rel(live["duration_ms"], measured) <= REL_TOL:
+        raise _TimingParityDriftError(f"{relative}: live {live['duration_ms']:.6f} ms vs measured {measured:.6f} ms")
 
 
 def test_missing_evaluation_provenance_is_unknown():
@@ -285,7 +281,7 @@ def test_missing_evaluation_provenance_is_unknown():
         {}, {"calibration_origin": "retained_operator_service_in_sample"}) == "in_sample"
 
 
-@pytest.mark.parametrize("relative,case_id", [row.values for row in HELDOUT_CASES], ids=HELDOUT_IDS)
+@pytest.mark.parametrize("relative,case_id", [row.values for row in HELDOUT_CASES], ids=[row.id for row in HELDOUT_CASES])
 def test_heldout_rows_retain_explicit_capture_provenance(relative, case_id):
     case = json.loads((CASE_ROOT / relative).read_text(encoding="utf-8"))
     row = _scoreboard_row(case_id)

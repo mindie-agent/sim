@@ -173,7 +173,9 @@ class _FiaLoop:
         rules = (BurstTurnRule(row_bytes, row_bytes + 1, row_bytes + 1, None,
                                self.burst_bytes - row_bytes),) if row_bytes < self.burst_bytes else ()
         hbm = plan.dram_sector_and_service(rules)[1]
-        memory = (plan, rules, tensor) if c.kv_tensor_id and (c.block_table or self.ctx.requests) else None
+        # Physical page identity comes from the block table.
+        known_addresses = c.block_table or (c.kv_layout not in PAGED_LAYOUTS and self.kv_offsets)
+        memory = (plan, rules, tensor) if c.kv_tensor_id and known_addresses else None
         return read_work(self.ctx, plan.aligned_copy_bytes(), hbm=hbm), memory
 
     def s2_phases(self, rect, tile):

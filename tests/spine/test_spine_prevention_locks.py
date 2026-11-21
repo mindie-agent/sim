@@ -16,10 +16,12 @@ from __future__ import annotations
 from dataclasses import replace
 import hashlib
 import json
+from types import SimpleNamespace
 
 import pytest
 
 from _support.axes import REPRESENTATIVE_SKUS
+from mindie_sim import graph_costs
 from mindie_sim.backends.ascend import apply_observed_aicore_clock
 from mindie_sim.compose import compose_case
 from mindie_sim.observations.multilevel_stream import verify_capture_file_consistency
@@ -29,23 +31,25 @@ from mindie_sim.observations.accuracy import (
 )
 from mindie_sim.prediction.execution.context import _ContextMixin
 from mindie_sim.prediction.mechanism import Geometry
-from mindie_sim.prediction.operators.attention.common import sequence_layout_spans
+from mindie_sim.prediction.operators import attention, linear_attention
+from mindie_sim.prediction.operators.attention.attention_pipeline import TiledAttentionRecipe
+from mindie_sim.prediction.operators.attention.common import AttentionContract, sequence_layout_spans
 from mindie_sim.prediction.operators.matrix.refill_steady import peer_group_can_compact
 from mindie_sim.prediction.operators.paged_mla import indexed_quant_attention
-from mindie_sim.prediction.program.recipes import RecipeBook
+from mindie_sim.prediction.program import RecipeBook, RecipeContext
 from mindie_sim.prediction.results import ReplayOptions, StepRequest
-from mindie_sim.prediction.runtime import l2_residency
+from mindie_sim.prediction.runtime import engine_submit, l2_residency
 from mindie_sim.prediction.runtime.engine import Engine
 from mindie_sim.prediction.runtime.engine_types import Resource
 from mindie_sim.prediction.runtime.memory_physics import HbmBusSpec
 from mindie_sim.prediction.spine import PredictionSpine
 from mindie_sim.schema.case import Case
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.compute_arch import ComputeArchSpec
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.schema.workload import RequestView
 from mindie_sim.stack_registry import LoweringRequest
 from scripts._arch_governance_runtime import _NON_DEVICE_INFRA_RECIPES, _OWNER_MODULE_PREFIXES, _binding_module
-from types import SimpleNamespace
 
 pytestmark = pytest.mark.tier0
 
@@ -119,44 +123,33 @@ def test_single_spine_live_execution_trace_across_architectures(
     )
 
     dispatched_recipes: list[tuple[str, str, object]] = []
-    seen_prepare_views: set[int] = set()
-    seen_context_views: set[int] = set()
-    seen_bind_views: set[int] = set()
+    seen_prepare_views = []
+    seen_context_views = []
     seen_seq_requests: list[tuple[str, tuple[RequestView, ...]]] = []
 
     orig_prepare = RecipeBook.prepare
     orig_context = _ContextMixin._context
-    orig_bind = l2_residency.bind_memory_access
 
     def traced_prepare(self, op, geometry):
         selected = self.select(op)
         prepared, recipe = orig_prepare(self, op, geometry)
         dispatched_recipes.append((op.family, op.recipe, selected))
-        if getattr(geometry, "admission_memory_view", None) is not None:
-            seen_prepare_views.add(id(geometry.admission_memory_view))
-        if op.family in SEQUENCE_FAMILIES and getattr(geometry, "requests", ()):
-            seen_seq_requests.append((op.op_id, tuple(geometry.requests)))
+        seen_prepare_views.append(geometry.admission_memory_view)
+        if op.family in SEQUENCE_FAMILIES:
+            seen_seq_requests.append((op.op_id, geometry.requests))
         return prepared, recipe
 
     def traced_context(self, op, replica, scope, *, recipe=None):
         ctx = orig_context(self, op, replica, scope, recipe=recipe)
-        if ctx.admission_memory_view is not None:
-            seen_context_views.add(id(ctx.admission_memory_view))
+        seen_context_views.append(ctx.admission_memory_view)
         if op.family in SEQUENCE_FAMILIES:
             seen_seq_requests.append((op.op_id, tuple(ctx.requests)))
         return ctx
 
-    def traced_bind(pattern, state, *args, **kwargs):
-        if state is not None:
-            seen_bind_views.add(id(state))
-        return orig_bind(pattern, state, *args, **kwargs)
-
-    monkeypatch.setattr(RecipeBook, "prepare", traced_prepare)
-    monkeypatch.setattr(_ContextMixin, "_context", traced_context)
-    monkeypatch.setattr(l2_residency, "bind_memory_access", traced_bind)
-
     spine = PredictionSpine()
     prepared = spine.lower(case, LoweringRequest(step=step_req, tier="mainline"))
+    monkeypatch.setattr(RecipeBook, "prepare", traced_prepare)
+    monkeypatch.setattr(_ContextMixin, "_context", traced_context)
     evaluation = spine.run_step(prepared, ReplayOptions(isolated=False))
 
     assert evaluation.span_ms > 0.0
@@ -167,14 +160,73 @@ def test_single_spine_live_execution_trace_across_architectures(
         if not _is_allowed_recipe_owner(obj)
     ]
     assert outside == [], f"executed device operators outside governed packages: {outside}"
-    assert len(seen_context_views) == 1, f"expected 1 shared AdmissionMemoryView, got {len(seen_context_views)}"
-    if seen_prepare_views:
-        assert seen_prepare_views == seen_context_views
-    if seen_bind_views:
-        assert seen_bind_views.issubset(seen_context_views)
+    assert seen_context_views, "expected live execution contexts"
+    shared = seen_context_views[0]
+    assert isinstance(shared, l2_residency.AdmissionMemoryView)
+    assert all(view is shared for view in seen_context_views)
+    assert seen_prepare_views, "expected live preparation contexts"
+    assert all(view is shared for view in seen_prepare_views)
     assert seen_seq_requests, "expected sequence operators during step replay"
     for op_id, received in seen_seq_requests:
         assert received == views, f"sequence op {op_id} dropped canonical RequestView tuple"
+        assert all(actual is expected for actual, expected in zip(received, views, strict=True))
+
+
+def test_addressed_attention_binds_the_live_admission_view(monkeypatch):
+    """Replay addressed KV reads through the engine's live memory binder."""
+    case = compose_case("qwen3-32b", hardware=REPRESENTATIVE_SKUS["a5"], layers=1)
+    request = RAGGED_TND_VIEWS[0]
+    contract = AttentionContract(
+        request.q_len, 1, 1, 128, 128, sequences=((request.q_len, request.kv_len),),
+        kv_layout="PA_BLK_BSND", kv_tensor_id="lock-c-kv", block_table=((0, 2),),
+    )
+    op = attention.make_attention_op(contract, op_id="addressed_attention", requests=(request.request_id,))
+    seen_plans = []
+    seen_bind_views = []
+    orig_prepare = RecipeBook.prepare
+    orig_bind = engine_submit.bind_memory_access
+
+    def traced_prepare(self, op, geometry):
+        seen_plans.append((geometry.requests, geometry.admission_memory_view))
+        return orig_prepare(self, op, geometry)
+
+    def traced_bind(pattern, state, *args, **kwargs):
+        seen_bind_views.append(state)
+        return orig_bind(pattern, state, *args, **kwargs)
+
+    monkeypatch.setattr(RecipeBook, "prepare", traced_prepare)
+    monkeypatch.setattr(engine_submit, "bind_memory_access", traced_bind)
+    report = graph_costs(case, (op,), isolated=False, request_views=(request,))
+
+    assert report["duration_ms"] > 0.0
+    assert seen_plans, "expected live FIA preparation"
+    shared = seen_plans[0][1]
+    assert isinstance(shared, l2_residency.AdmissionMemoryView)
+    for requests, view in seen_plans:
+        assert len(requests) == 1 and requests[0] is request
+        assert view is shared
+    assert seen_bind_views, "expected live memory binder callbacks for addressed KV"
+    assert all(view is shared for view in seen_bind_views)
+
+
+@pytest.mark.parametrize("qk_dim,v_dim", ((128, 32), (32, 128)))
+def test_attention_matrix_phases_preserve_asymmetric_tensor_work(qk_dim, v_dim):
+    heads, keys = 4, 32
+    contract = AttentionContract(1, heads, heads, qk_dim, v_dim, sequences=((1, keys),))
+    op = attention.make_attention_op(contract, op_id="asymmetric_attention")
+    ctx = RecipeContext(op, {"cube": op.flops}, {"cube": "cube"}, {"cube": 1.0}, 1)
+    recipe = TiledAttentionRecipe()
+    for program in (recipe.lower(ctx), recipe.lower_single(ctx)):
+        work = {stage.name: stage.work.get("cube", 0) for stage in program.stages}
+        assert work["qk"] == 2 * heads * keys * qk_dim
+        assert work["pv"] == 2 * heads * keys * v_dim
+        assert sum(work.values()) == op.flops
+
+
+def test_chunk_timing_rejects_an_unrecognized_declared_isa():
+    geometry = Geometry(1, compute_arch=ComputeArchSpec(preset="unrecognized"))
+    with pytest.raises(ModelingError, match="linear_attention_arch_unsupported:unrecognized"):
+        linear_attention.chunk32_timing_policy(geometry, None, 0)
 
 
 def test_ragged_and_padding_request_views_preserve_zero_macs_and_layout_strides():
@@ -284,27 +336,35 @@ def test_mixed_hbm_accounting_asymmetric_cohort_split_and_streaming_capture_guar
         verify_capture_file_consistency("case0", boundary, cap_path)
 
 
-def test_uniform_peer_compaction_and_arch22_packed_quant_rejection():
-    """Verify I-09 uniform peer compaction and A3-02 DAV_2201 rejection on arch35 packed schedule."""
+def test_peer_compaction_requires_uniform_groups():
     assert peer_group_can_compact((16, 16, 16), slots=2, threshold=8) is True
     assert peer_group_can_compact((16, 4, 16), slots=2, threshold=8) is False
-    a3_case = Case.from_mapping(
-        compose_case("deepseek-v4-flash", hardware=REPRESENTATIVE_SKUS["a3"], layers=1, tp=1)
+
+
+@pytest.mark.parametrize("sku_alias,supported", (("a3", False), ("a5", True)))
+def test_packed_schedule_checks_declared_isa_without_datapath(sku_alias, supported):
+    case = Case.from_mapping(
+        compose_case("deepseek-v4-flash", hardware=REPRESENTATIVE_SKUS[sku_alias], layers=1, tp=1)
     )
-    geom_a3 = Geometry.from_devices(a3_case.machine.dies)
+    geometry = replace(Geometry.from_devices(case.machine.dies), datapath=None)
     op = OpSpec(
-        "sfa_a3", "mla", "decode", 0, 0, ("r0",), (1, 16, 512), (1, 16, 512), (1, 16, 512), (1, 16, 512),
+        "packed_attention", "mla", "decode", 0, 0, ("r0",),
+        (1, 16, 512), (1, 16, 512), (1, 16, 512), (1, 16, 512),
         dtype="bf16", recipe="indexed_attention_packed_int8",
         metadata=((
             "indexed_attention_geometry",
             {
                 "query_dtype": "bf16", "cache_dtype": "int8", "latent": 512, "rope": 64,
                 "window": 0, "compression_ratio": 1, "cp": 1, "heads": 16,
-                "requests": ((1, 128),),
+                "sequences": ((1, 128),), "topk": 128,
             },
         ),),
     )
-    with pytest.raises(ModelingError, match="arch35_unsupported"):
-        indexed_quant_attention.build(
-            op, geom_a3, scratch_policy="offchip", schedule=indexed_quant_attention.SCHEDULE_ARCH35,
-        )
+    schedule = indexed_quant_attention.SCHEDULE_ARCH35
+    if supported:
+        plan = indexed_quant_attention.build(op, geometry, scratch_policy="offchip", schedule=schedule)
+        assert plan.metadata["kernel_schedule"] == schedule
+        assert plan.work.matrix["bf16"] == 2 * 16 * 128 * (512 + 64 + 512)
+    else:
+        with pytest.raises(ModelingError, match=f"arch35_unsupported_on_{geometry.compute_arch.preset}"):
+            indexed_quant_attention.build(op, geometry, scratch_policy="offchip", schedule=schedule)

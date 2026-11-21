@@ -1,8 +1,9 @@
 """Isolated complete SituMxQuant call on the shared engine.
 
-The example is deliberately standalone: it builds one BF16-to-FP8/E8M0 source
-call, prices it on an existing hardware case, and prints only the device work
-and bounded buffer state. It does not read measurements or run hardware.
+[Role] Price an isolated BF16-to-FP8/E8M0 source call on existing A5 geometry.
+[Invariants] Uses the complete declared tensor and source recipe.
+[Timeouts & Locks] One bounded simulated invocation; no devices or locks.
+[Side-Effect Policy] Reads a case declaration and prints the resulting work.
 
 Run:
 
@@ -12,7 +13,7 @@ import json
 from pathlib import Path
 
 from mindie_sim.prediction.call import call_costs
-from mindie_sim.prediction.family_situ_mx import Config, make_op, recipe_book
+from mindie_sim.prediction.operators.mx_quant_matrix.family_situ_mx import Config, make_op, recipe_book
 from mindie_sim.prediction.structure import parse_case
 
 

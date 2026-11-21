@@ -3,13 +3,15 @@
 [Role] Define the input evidence and output records for periodic detection.
 [Invariants] Cursor positions and phase bounds are explicit. Structural match
   is exact and intervals retain the caller’s measured totals.
-[Timeouts & Locks] Validation is bounded by active runs and interval entries. No locks or I/O.
+[Timeouts & Locks] Bounded validation and slot cache. No I/O.
 [Side-Effect Policy] Freezes evidence without changing Engine state.
 """
 from __future__ import annotations
 
 from collections.abc import Hashable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import lru_cache
+import math
 import sys
 from types import MappingProxyType
 
@@ -32,6 +34,16 @@ from .snapshots import (
     _require_run_id,
     _structural_equal,
 )
+
+_ADDITIVE_COUNTERS = (
+    "service_by_resource", "busy_by_resource", "deliveries_by_counter", "hbm_accounting",
+)
+_CURSOR_SLOT_CACHE_ENTRIES = 128
+
+
+@lru_cache(maxsize=_CURSOR_SLOT_CACHE_ENTRIES)
+def _freeze_pair_slots(slots: tuple[int, ...]) -> tuple:
+    return ("tuple", tuple(("int", value) for value in slots))
 
 
 def _state_equal(first: SettledFrontier, second: SettledFrontier) -> bool:
@@ -111,6 +123,8 @@ class Cursor:
             raise PeriodicContractError("periodic_cursor_slots_must_be_int_or_tuple")
         if isinstance(self.slots, int):
             _require_int("cursor_slots", self.slots, minimum=1)
+        elif type(self.slots) is tuple and len(self.slots) <= 2 and all(type(slot) is int for slot in self.slots):
+            object.__setattr__(self, "slots", _freeze_pair_slots(self.slots))
         else:
             _check_structural(self.slots, path=f"cursor[{self.run_id}].slots")
             object.__setattr__(
@@ -219,6 +233,8 @@ class IntervalDelta:
     ``issued_retired_by_run`` maps every active ``run_id`` to
     ``(issued_tiles, retired_tiles)`` in this interval.  ``service_by_resource``
     and ``busy_by_resource`` are real resource-unit / millisecond amounts.
+    Deliveries and directional HBM accounting accumulate independently.
+    Clock steps retain the increments before rounding at each landmark.
     ``per_unit_peaks`` maps a caller-defined pool/unit identity to the peak
     occupancy observed in the interval.  Nothing here is fabricated by the
     detector: the adapter must measure it from the Engine.
@@ -235,6 +251,9 @@ class IntervalDelta:
     crossed_external_or_opaque: bool
     allocation_grants: int = 0
     allocation_last_uses: int = 0
+    deliveries_by_counter: Mapping[str, float] = field(default_factory=dict)
+    hbm_accounting: Mapping[str, float] = field(default_factory=dict)
+    clock_steps: tuple[float, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "dt", _require_float("interval_dt", self.dt))
@@ -265,20 +284,11 @@ class IntervalDelta:
                 raise PeriodicContractError(f"periodic_interval_resource_invalid:{key!r}")
             return _require_float("interval_amount", value)
 
-        object.__setattr__(
-            self,
-            "service_by_resource",
-            _freeze_map(
-                "service_by_resource",
-                self.service_by_resource,
-                value_check=amount_check,
-            ),
-        )
-        object.__setattr__(
-            self,
-            "busy_by_resource",
-            _freeze_map("busy_by_resource", self.busy_by_resource, value_check=amount_check),
-        )
+        for name in _ADDITIVE_COUNTERS:
+            object.__setattr__(self, name, _freeze_map(name, getattr(self, name), value_check=amount_check))
+        object.__setattr__(self, "clock_steps", tuple(_require_float("clock_step", dt) for dt in self.clock_steps))
+        if any(dt < 0 for dt in self.clock_steps):
+            raise PeriodicContractError("periodic_clock_step_negative")
 
         def peak_check(key, value):
             _check_structural(key, path="interval_peak_key")
@@ -465,12 +475,21 @@ class CycleSkip:
             dt=self.period * scale,
             issued_retired_by_run=issued,
             sequence_count=self.seq_stride * scale,
-            service_by_resource={name: amount * scale for name, amount in self.delta.service_by_resource.items()},
-            busy_by_resource={name: amount * scale for name, amount in self.delta.busy_by_resource.items()},
             allocation_event_count=self.delta.allocation_event_count * scale,
             per_unit_peaks=dict(self.delta.per_unit_peaks),
             logical_completions=self.delta.logical_completions * scale,
             crossed_external_or_opaque=False,
             allocation_grants=self.delta.allocation_grants * scale,
             allocation_last_uses=self.delta.allocation_last_uses * scale,
+            **{field: {name: amount * scale for name, amount in getattr(self.delta, field).items()}
+               for field in _ADDITIVE_COUNTERS},
         )
+
+
+def _advance_periodic_clock(now: float, steps: tuple[float, ...], cycles: int) -> float:
+    """Repeat the engine's rounded additions without replaying resource tasks."""
+    for _ in range(cycles):
+        for dt in steps:
+            after = now + dt
+            now = math.nextafter(now, math.inf) if dt > 0.0 and after == now else after
+    return now

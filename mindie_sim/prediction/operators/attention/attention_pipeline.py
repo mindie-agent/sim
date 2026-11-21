@@ -20,24 +20,40 @@ from mindie_sim.prediction.operators.matrix.refill_steady import compact_periodi
 from mindie_sim.prediction.ownership import read_role, unit_group
 from mindie_sim.schema.common import ModelingError
 
-from mindie_sim.prediction.physical_recipe_base import (COMPUTE_CATEGORIES, IO_HBM_CATEGORY, Phase,
-                                   build_plan, io_weight, tiled_phased_program)
+from mindie_sim.prediction.physical_recipe_base import (
+    IO_HBM_CATEGORY, Phase, build_plan, io_weight, tiled_phased_program,
+)
 from mindie_sim.prediction.program import (
     KernelProgram, PipelinePhase, PipelineProgram, PipelineTemplate,
     PipelineTemplateProgram, RecipeContext, Stage,
 )
+
+from .common import AttentionContract
 
 if TYPE_CHECKING:
     from .attention_decode import StagedGQADecode, _Contribution, _Output, _Spec
 
 Q_LOAD_SHARE = 0.25
 KV_LOAD_SHARE = 0.75
-QK_SHARE = 0.55
-PV_SHARE = 0.45
 SOFTMAX_SHARE = 0.35
 NORMALIZE_SHARE = 0.65
 PIPELINE_SLOTS = 2
 ATTENTION_TILE_CAP = 64
+ATTENTION_SHAPE_WITH_VALUE_DIM = 5
+
+
+def _matrix_phase_weights(op) -> tuple[int, int]:
+    """The phase allocator normalizes the widths against their sum."""
+    contract = dict(op.metadata).get("attention_contract")
+    if isinstance(contract, AttentionContract):
+        return contract.head_dim, contract.v_head_dim
+    if contract is not None:
+        return contract["head_dim"], contract["v_head_dim"]
+    if len(op.local_shape) == ATTENTION_SHAPE_WITH_VALUE_DIM:
+        qk_dim, v_dim = op.local_shape[-2:]
+        return qk_dim, v_dim
+    # Ordinary GQA uses the same width for both matrix products.
+    return 1, 1
 
 
 @dataclass(frozen=True)
@@ -54,14 +70,15 @@ class TiledFlashAndPagedAttentionRecipe:
     def lower(self, context):
         read_share = io_weight(context, "hbm")
         write_share = io_weight(context, "hbm_write")
+        qk_weight, pv_weight = _matrix_phase_weights(context.op)
         phases = (
             Phase("q_load", {IO_HBM_CATEGORY: Q_LOAD_SHARE * read_share,
                              "mte2": Q_LOAD_SHARE}),
             Phase("kv_load", {IO_HBM_CATEGORY: KV_LOAD_SHARE * read_share,
                               "mte2": KV_LOAD_SHARE}),
-            Phase("qk", {"cube": QK_SHARE}, after=("q_load", "kv_load")),
+            Phase("qk", {"cube": qk_weight}, after=("q_load", "kv_load")),
             Phase("online_softmax", {"vector": SOFTMAX_SHARE}, after=("qk",)),
-            Phase("pv", {"cube": PV_SHARE}, after=("online_softmax",)),
+            Phase("pv", {"cube": pv_weight}, after=("online_softmax",)),
             Phase("normalize_store", {
                 "vector": NORMALIZE_SHARE,
                 IO_HBM_CATEGORY: write_share,
@@ -73,12 +90,13 @@ class TiledFlashAndPagedAttentionRecipe:
 
     def lower_single(self, context) -> KernelProgram:
         """Diagnostic single-tile lowering retaining the same phase DAG."""
+        qk_weight, pv_weight = _matrix_phase_weights(context.op)
         return tiled_phased_program(context, (
             Phase("q_load", {IO_HBM_CATEGORY: 1.0, "mte2": 1.0}),
             Phase("kv_load", {}),
-            Phase("qk", {"cube": QK_SHARE}, after=("q_load", "kv_load")),
+            Phase("qk", {"cube": qk_weight}, after=("q_load", "kv_load")),
             Phase("online_softmax", {"vector": SOFTMAX_SHARE}, after=("qk",)),
-            Phase("pv", {"cube": PV_SHARE}, after=("online_softmax",)),
+            Phase("pv", {"cube": pv_weight}, after=("online_softmax",)),
             Phase("normalize_store", {"vector": NORMALIZE_SHARE,
                                       "mte3": 1.0}, after=("pv",)),
         ), slots=self.slots, cap=max(1, context.core_count))
@@ -380,10 +398,24 @@ def _producer_program(context: RecipeContext, recipe: StagedGQADecode,
     # structural minimum. The compactor verifies convergence before folding.
     min_periodic_tiles = 1 + tail_count + 2 * max(2, recipe.slots)
     if use_compact and contribution.tile_count >= min_periodic_tiles:
+        peer_tails = (
+            tuple(
+                max(
+                    PIPELINE_SLOTS,
+                    c.tile_count - max(
+                        0,
+                        (spec.requests[out.request][1] + out.token_first + 1) // recipe.key_tile
+                        - c.tile_start,
+                    ),
+                )
+                for out in spec.outputs for c in out.contributions if c.tile_count > 0
+            )
+            if peer_counts is not None else None
+        )
         key_program = compact_periodic_pipeline(
             context, contribution.tile_count, recipe.slots, tile,
             head=1, tail=tail_count, threshold=min_periodic_tiles - 1,
-            resident=persistent, peer_counts=peer_counts)
+            resident=persistent, peer_counts=peer_counts, peer_tails=peer_tails)
     else:
         finite_template = _attention_pipeline_template(
             tile, key_of, contribution.tile_count,
