@@ -118,6 +118,7 @@ def resolve_point_binding_and_shape(
     pt: Mapping[str, Any],
     *,
     sku: str,
+    profile_override: Mapping[str, Any] | None = None,
 ) -> tuple[str, str, str, str, str, dict[str, Any], dict[str, Any]]:
     """Return ``(prof_fam, prof_recipe, prof_builder, impl, sim_fam, shape, sim_case)``."""
     plan_family = str(plan_doc.get("family") or "").strip() or "rmsnorm"
@@ -133,7 +134,7 @@ def resolve_point_binding_and_shape(
     dcp = max(1, int(topo_opts.get("dcp", 1)))
     pcp = max(1, int(topo_opts.get("pcp", 1)))
     local_mla_heads = max(1, _DEFAULT_ATTENTION_HEADS // tp)
-    decode_mla_rec = _decode_mla_recipe_for_sku(sku, plan_doc=plan_doc)
+    decode_mla_rec = _decode_mla_recipe_for_sku(sku, plan_doc=plan_doc, profile_override=profile_override)
     level = assign_plan_point_level(plan_doc, pt)
     custom_sim = pt.get("sim_case") or plan_doc.get("sim_case")
     is_default_mla_model = not (
@@ -174,7 +175,10 @@ def resolve_point_binding_and_shape(
         total_tokens = max(1, seqs * q_tok)
         kv_len = ctx_len + q_tok
         if dcp > 1:
-            lowered = _lower_one_layer_step_ops(sku, topo, "prefill" if q_tok > 1 else "decode", q_tok, ctx_len, seqs)
+            lowered = _lower_one_layer_step_ops(
+                sku, topo, "prefill" if q_tok > 1 else "decode", q_tok, ctx_len, seqs,
+                profile_override=profile_override,
+            )
             la_op = next((o for o in lowered if o["family"] == "attention"), None)
             if la_op and len(la_op["local_shape"]) >= _MIN_2D_SHAPE_RANK:
                 kv_len = int(la_op["local_shape"][1])
@@ -306,7 +310,7 @@ def _build_case_nodes_edges_and_bindings(
             "dtype": "bf16", "group_list": [total_tokens] * local_heads, "group_list_type": 1,
             "shape": {
                 "m": v_exp_m, "n": _MLA_HEAD_DIM, "k": _MLA_LATENT_DIM,
-                "e": local_heads, "matrix_groups": local_heads,
+                "e": local_heads, "matrix_groups": local_heads, "dtype": "bf16",
             },
         }
         edges = [{"from": f"{pid}:{attn_op_id}", "to": f"{pid}:s0.l0.v_expand", "kind": "data"}]
@@ -320,8 +324,9 @@ def _build_case_nodes_edges_and_bindings(
             },
             {
                 "op_id": "s0.l0.v_expand", "family": "gemm", "recipe": "v_expand",
-                "builder": "grouped_matmul", "m": v_exp_m, "n": _MLA_HEAD_DIM,
-                "k": _MLA_LATENT_DIM, "matrix_groups": local_heads,
+                "builder": "grouped_matmul", "dtype": "bf16", "quant_mode": "none",
+                "m": v_exp_m, "n": _MLA_HEAD_DIM, "k": _MLA_LATENT_DIM,
+                "matrix_groups": local_heads,
             },
         ]
         return [attn_node, v_exp_node], edges, node_bindings, [attn_op_id, "s0.l0.v_expand"]
@@ -356,30 +361,34 @@ def resolve_point_measured_binding(
     pt: Mapping[str, Any],
     *,
     sku: str,
+    profile_override: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build exact 1:1 replay target & per-node measured-operator binding metadata for ``pt``."""
-    pfam, prec, pbld, impl, sim_fam, shape, sim_case = resolve_point_binding_and_shape(
-        plan_doc, pt, sku=sku
-    )
-    level = assign_plan_point_level(plan_doc, pt)
-    topo_opts = parse_topo_options(str(pt.get("parallel_topology") or "tp1"))
-    pid = str(pt.get("point_id") or "pt")
-    if sim_fam == "attention":
-        target_op_id = (
-            "s0.l0.paged_mla_decode"
-            if prec in {"ascend_paged_mla_decode_arch22", "ascend_paged_mla_decode_arch35"}
-            else "s0.l0.latent_attention0"
+    from ._sku_calibration import temporary_scaffold_profile
+
+    with temporary_scaffold_profile(sku, profile_override):
+        pfam, prec, pbld, impl, sim_fam, shape, sim_case = resolve_point_binding_and_shape(
+            plan_doc, pt, sku=sku, profile_override=profile_override
         )
-    elif sim_fam == "rmsnorm":
-        target_op_id = "s0.l0.norm1"
-    elif sim_fam == "indexer":
-        target_op_id = "s0.l2.index_quant_lightning"
-    else:
-        target_op_id = ""
-    _nodes, _edges, node_bindings, timed_op_ids = _build_case_nodes_edges_and_bindings(
-        pid, sku=sku, pt=pt, level=level, pfam=pfam, prec=prec, pbld=pbld, impl=impl,
-        shape=shape, topo_opts=topo_opts,
-    )
+        level = assign_plan_point_level(plan_doc, pt)
+        topo_opts = parse_topo_options(str(pt.get("parallel_topology") or "tp1"))
+        pid = str(pt.get("point_id") or "pt")
+        if sim_fam == "attention":
+            target_op_id = (
+                "s0.l0.paged_mla_decode"
+                if prec in {"ascend_paged_mla_decode_arch22", "ascend_paged_mla_decode_arch35"}
+                else "s0.l0.latent_attention0"
+            )
+        elif sim_fam == "rmsnorm":
+            target_op_id = "s0.l0.norm1"
+        elif sim_fam == "indexer":
+            target_op_id = "s0.l2.index_quant_lightning"
+        else:
+            target_op_id = ""
+        _nodes, _edges, node_bindings, timed_op_ids = _build_case_nodes_edges_and_bindings(
+            pid, sku=sku, pt=pt, level=level, pfam=pfam, prec=prec, pbld=pbld, impl=impl,
+            shape=shape, topo_opts=topo_opts,
+        )
     target_op_ids = list(timed_op_ids) if level == "L2" else []
     binding: dict[str, Any] = {
         "builder": pbld, "family": sim_fam, "recipe": prec, "implementation": impl,
@@ -419,9 +428,15 @@ def resolve_point_measured_binding(
 
 
 def build_profiler_subgraph_plan(
-    plan_doc: Mapping[str, Any], *, sku: str, split_tag: str = "", acquisition_id: str = ""
+    plan_doc: Mapping[str, Any],
+    *,
+    sku: str,
+    split_tag: str = "",
+    acquisition_id: str = "",
+    profile_override: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Translate an onboarding cliff/SKU plan into executable L1/L2/L3 ``mindie-bench-subgraph-plan/1``."""
+    from ._sku_calibration import temporary_scaffold_profile
     from .cliff_planner import required_ranks_for_plan, validate_parallel_topology
 
     if str(plan_doc.get("schema") or "") == _SUBGRAPH_PLAN_SCHEMA:
@@ -437,48 +452,49 @@ def build_profiler_subgraph_plan(
     plan_sha = str(plan_doc["plan_sha256"])
     plan_id = f"{plan_sha}:{split_tag}" if split_tag else plan_sha
     cases: list[dict[str, Any]] = []
-    for split_key in ("train_points", "heldout_points", "abi_rejection_points"):
-        for pt in plan_doc.get(split_key) or ():
-            if not isinstance(pt, Mapping) or not pt.get("point_id"):
-                continue
-            pid = str(pt["point_id"])
-            axis = str(pt.get("axis") or "context_len").strip()
-            topo = str(pt.get("parallel_topology") or "tp1")
-            pt_ranks = validate_parallel_topology(topo)
-            topo_opts = parse_topo_options(topo)
-            pfam, prec, pbld, impl, _sim_fam, shape, _sim_case = resolve_point_binding_and_shape(
-                plan_doc, pt, sku=sku
-            )
-            level = assign_plan_point_level(plan_doc, pt)
-            nodes, edges, _nb, _tids = _build_case_nodes_edges_and_bindings(
-                pid, sku=sku, pt=pt, level=level, pfam=pfam, prec=prec, pbld=pbld, impl=impl,
-                shape=shape, topo_opts=topo_opts,
-            )
-            case_entry: dict[str, Any] = {
-                "case_id": pid, "split": str(pt.get("split") or "heldout"),
-                "level": level, "boundary": _LEVEL_BOUNDARY_KINDS[level],
-                "phase": "prefill" if int(pt.get("query_tokens", 1)) > 1 else "decode",
-                "archetype": str(pt.get("regime_tag") or "onboarding"),
-                "stage": "s1_joint" if pt_ranks > 1 else "s0_local",
-                "clock_operator": str(pt.get("clock_operator") or "elapsed_span"),
-                "implementation": impl, "dtype": "bf16", "shape": dict(shape),
-                "batch": int(shape.get("sequences", pt.get("batch_size", 1))),
-                "plan_key": {
-                    "point_id": pid, "axis": axis, "family": pfam, "recipe": prec,
-                    "abi": impl, "parallel_topology": topo, "level": level,
-                    "batch_size": int(pt.get("batch_size", 1)),
-                },
-                "nodes": nodes, "edges": edges,
-            }
-            if pbld in {"absorbed_mla", "fused_infer_attention"}:
-                case_entry["paged"] = True
-            if shape.get("query_layout"):
-                case_entry["layout"] = str(shape["query_layout"])
-            if world > 1:
-                case_entry["group_ranks"] = list(range(pt_ranks))
-            if pt_ranks > 1:
-                case_entry["parallel"] = topo_opts
-            cases.append(case_entry)
+    with temporary_scaffold_profile(sku, profile_override):
+        for split_key in ("train_points", "heldout_points", "abi_rejection_points"):
+            for pt in plan_doc.get(split_key) or ():
+                if not isinstance(pt, Mapping) or not pt.get("point_id"):
+                    continue
+                pid = str(pt["point_id"])
+                axis = str(pt.get("axis") or "context_len").strip()
+                topo = str(pt.get("parallel_topology") or "tp1")
+                pt_ranks = validate_parallel_topology(topo)
+                topo_opts = parse_topo_options(topo)
+                pfam, prec, pbld, impl, _sim_fam, shape, _sim_case = resolve_point_binding_and_shape(
+                    plan_doc, pt, sku=sku, profile_override=profile_override
+                )
+                level = assign_plan_point_level(plan_doc, pt)
+                nodes, edges, _nb, _tids = _build_case_nodes_edges_and_bindings(
+                    pid, sku=sku, pt=pt, level=level, pfam=pfam, prec=prec, pbld=pbld, impl=impl,
+                    shape=shape, topo_opts=topo_opts,
+                )
+                case_entry: dict[str, Any] = {
+                    "case_id": pid, "split": str(pt.get("split") or "heldout"),
+                    "level": level, "boundary": _LEVEL_BOUNDARY_KINDS[level],
+                    "phase": "prefill" if int(pt.get("query_tokens", 1)) > 1 else "decode",
+                    "archetype": str(pt.get("regime_tag") or "onboarding"),
+                    "stage": "s1_joint" if pt_ranks > 1 else "s0_local",
+                    "clock_operator": str(pt.get("clock_operator") or "elapsed_span"),
+                    "implementation": impl, "dtype": "bf16", "shape": dict(shape),
+                    "batch": int(shape.get("sequences", pt.get("batch_size", 1))),
+                    "plan_key": {
+                        "point_id": pid, "axis": axis, "family": pfam, "recipe": prec,
+                        "abi": impl, "parallel_topology": topo, "level": level,
+                        "batch_size": int(pt.get("batch_size", 1)),
+                    },
+                    "nodes": nodes, "edges": edges,
+                }
+                if pbld in {"absorbed_mla", "fused_infer_attention"}:
+                    case_entry["paged"] = True
+                if shape.get("query_layout"):
+                    case_entry["layout"] = str(shape["query_layout"])
+                if world > 1:
+                    case_entry["group_ranks"] = list(range(pt_ranks))
+                if pt_ranks > 1:
+                    case_entry["parallel"] = topo_opts
+                cases.append(case_entry)
     plan_out: dict[str, Any] = {
         "schema": _SUBGRAPH_PLAN_SCHEMA, "plan_id": plan_id, "plan_sha256": plan_sha,
         "target_id": str(plan_doc.get("target_id") or ""), "sku": sku,

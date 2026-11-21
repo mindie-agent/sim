@@ -305,6 +305,25 @@ def _verify_gemm_node_binding(
             raise ModelingError(
                 f"whitebox_measured_binding_mismatch:{case_id}:weight_{dim_key}:{op_id}:measured={meas_d}:lowered={loc[dim_idx]}"
             )
+    lowered_dt = str(getattr(op, "dtype", "") or "bf16").strip().lower()
+    lowered_q = str(meta.get("quant_mode") or meta.get("quantization") or "none").strip().lower()
+    act_dt = str(n_actual.get("dtype") or n_actual.get("input_dtype") or "").strip().lower() if use_actual_dims else ""
+    act_wdt = str(n_actual.get("weight_dtype") or "").strip().lower() if use_actual_dims else ""
+    act_q = str(n_actual.get("quant_mode") or n_actual.get("quantization") or "").strip().lower() if use_actual_dims else ""
+    nb_dt = str(nb.get("dtype") or "").strip().lower()
+    if require_act_dims and not act_dt:
+        raise ModelingError(f"whitebox_measured_binding_mismatch:{case_id}:gemm_dtype_missing:{op_id}")
+    if act_dt and nb_dt and act_dt != nb_dt:
+        raise ModelingError(f"whitebox_measured_binding_mismatch:{case_id}:gemm_dtype_conflict:{op_id}:actual={act_dt}:planned={nb_dt}")
+    eff_dt = act_dt or nb_dt
+    if eff_dt and lowered_dt and eff_dt != lowered_dt:
+        raise ModelingError(f"whitebox_measured_binding_mismatch:{case_id}:dtype:{op_id}:measured={eff_dt}:lowered={lowered_dt}")
+    if act_wdt and lowered_dt and act_wdt != lowered_dt:
+        raise ModelingError(f"whitebox_measured_binding_mismatch:{case_id}:weight_dtype:{op_id}:measured={act_wdt}:lowered={lowered_dt}")
+    if act_q and act_q not in {"", "none", "dense", lowered_q, lowered_dt}:
+        raise ModelingError(f"whitebox_measured_binding_mismatch:{case_id}:quant_mode:{op_id}:measured={act_q}:lowered={lowered_q}")
+    if use_actual_dims and (n_actual.get("has_scales") is True or str(n_actual.get("scale_dtype") or "").strip()) and lowered_q in {"", "none", "dense"}:
+        raise ModelingError(f"whitebox_measured_binding_mismatch:{case_id}:unexpected_quant_scales:{op_id}")
 
 
 def _verify_attention_merge_node_binding(
@@ -480,7 +499,13 @@ def _verify_measured_binding(
     binding = payload.get("measured_binding") if isinstance(payload.get("measured_binding"), Mapping) else {}
     actual = payload.get("actual_shape") if isinstance(payload.get("actual_shape"), Mapping) else {}
     plan_key = payload.get("plan_key") if isinstance(payload.get("plan_key"), Mapping) else {}
-    if not binding and not actual and not plan_key and not payload.get("timed_nodes"):
+    is_planned_multi = expected_level in {"L2", "L3"} and bool(payload.get("is_planned") or payload.get("axis"))
+    if is_planned_multi:
+        if not payload.get("timed_nodes"):
+            raise ModelingError(f"whitebox_measured_binding_mismatch:{case_id}:{expected_level.lower()}_timed_nodes_missing")
+        if not actual:
+            raise ModelingError(f"whitebox_measured_binding_mismatch:{case_id}:{expected_level.lower()}_actual_shape_missing")
+    elif not binding and not actual and not plan_key and not payload.get("timed_nodes"):
         return
 
     _verify_node_bindings(

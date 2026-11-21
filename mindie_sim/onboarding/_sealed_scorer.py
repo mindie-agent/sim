@@ -83,6 +83,8 @@ def _row_to_gate_case(row: Mapping[str, Any], *, sku: str, idx: int, plan_pt: Ma
         raw_copy = dict(row)
         payload = dict(raw_copy.get("payload") or {})
         payload["clock_operator"] = clock_op
+        if plan_pt is not None:
+            payload["is_planned"] = True
         if plan_axis:
             payload.setdefault("axis", plan_axis)
         if plan_value is not None:
@@ -119,6 +121,8 @@ def _row_to_gate_case(row: Mapping[str, Any], *, sku: str, idx: int, plan_pt: Ma
     cleaned_events, cleaned_ranks = validate_event_ids_and_ranks(row.get("event_ids"), row.get("device_ranks"), cid)
     measured_ns = measured_ns_from_row(row, cid, clock_op=clock_op)
     payload_dict: dict[str, Any] = {"clock_operator": clock_op, "point_id": str(row.get("point_id") or cid)}
+    if plan_pt is not None:
+        payload_dict["is_planned"] = True
     if plan_axis:
         payload_dict["axis"] = plan_axis
     if plan_value is not None:

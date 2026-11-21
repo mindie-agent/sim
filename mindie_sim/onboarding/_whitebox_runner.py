@@ -244,6 +244,10 @@ def eligible_replay_cases(
             continue
         if case.is_counterfactual and not case.has_matched_capture:
             continue
+        if case.level == "L2" and (
+            not case.block_capture_present or case.boundary.boundary_kind == "missing_block_capture"
+        ):
+            continue
         is_rung = case.boundary.boundary_kind == "paired_rung_delta"
         arm_a, arm_b = case.rung_arm_a_measured_ns, case.rung_arm_b_measured_ns
         if is_rung and (arm_a is None or arm_b is None or arm_a <= 0 or arm_b <= 0):

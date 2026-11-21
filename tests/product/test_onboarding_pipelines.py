@@ -13,11 +13,12 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-import hashlib, json, subprocess, sys
+import copy, hashlib, json, subprocess, sys, threading
 from pathlib import Path
 from typing import Any
 import pytest
 
+from mindie_sim.backends import ascend_profiles
 from mindie_sim.cli import main as mindie_sim_main
 from mindie_sim.observations.multilevel_gate import CaptureBoundary, CohortKey, EngineInterval, GateCase, bind_engine_interval
 from mindie_sim.observations.multilevel_stream import verify_capture_file_consistency
@@ -32,10 +33,11 @@ from mindie_sim.onboarding._gate_runners import acquire_coordinator_host_queue_l
 from mindie_sim.onboarding._lean_and_receipts import check_lean_non_inversion
 from mindie_sim.onboarding._operator_contract import _build_default_planning_context, _verify_resolved_operator_dual_bound
 from mindie_sim.onboarding._profiler_dispatch import _parse_json_or_jsonl_records, _split_disjoint_acquisitions, _validate_dispatch_exit, build_profiler_subgraph_plan
-from mindie_sim.onboarding._profiler_plan import assign_plan_point_level
+from mindie_sim.onboarding._profiler_plan import assign_plan_point_level, resolve_point_measured_binding
+from mindie_sim.onboarding._sku_calibration import temporary_scaffold_profile
 from mindie_sim.onboarding._whitebox_runner import eligible_replay_cases
+from mindie_sim.onboarding.cliff_planner import verify_cliff_plan_integrity
 from mindie_sim.onboarding.contracts import sanitize_public_warning
-from mindie_sim.primitives.schema import parse_primitive_table
 from mindie_sim.onboarding.tiling_axes import ARCH_PRESET_22, ARCH_PRESET_35
 from mindie_sim.optimization.dual_bound import DagEdge, EventDagSpec, ResourceChoiceProgram, certify_lower_bound
 from mindie_sim.prediction.mechanism import OperatorPlan, Work
@@ -43,6 +45,7 @@ from mindie_sim.prediction.operators.contracts import OperatorFamilySpec, Resolv
 from mindie_sim.prediction.operators.registry import FamilyRegistry
 from mindie_sim.prediction.program.stages import KernelProgram, Stage
 from mindie_sim.prediction.runtime.engine import Engine, Resource
+from mindie_sim.primitives.schema import parse_primitive_table
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import OpSpec
 from _support.axes import REPRESENTATIVE_SKUS
@@ -78,20 +81,19 @@ def _synthetic_repo(tmp_path: Path, *, family: str = "demo_op") -> Path:
     syn = tmp_path / f"syn_repo_{family}"
     for sub in ("scripts", "mindie_sim", "tests/operators"):
         (syn / sub).mkdir(parents=True)
-    (syn / "mindie_sim/__init__.py").write_text('"""Stub."""\n', encoding="utf-8")
-    (syn / "scripts/check_arch_governance.py").write_text("print('arch governance violations: 0')\n", encoding="utf-8")
-    (syn / "scripts/check_test_orthogonality.py").write_text("print('summary: 0 findings (none); mode=--strict; modules=1/96')\n", encoding="utf-8")
-    (syn / "scripts/check_template_provenance.py").write_text("print('template provenance violations: 0')\n", encoding="utf-8")
-    (syn / f"tests/operators/test_{family}.py").write_text('"""Test."""\nimport pytest\npytestmark = pytest.mark.tier0\n', encoding="utf-8")
-    (syn / "tests/TAXONOMY.toml").write_text(f'schema_version = 1\ndomains = ["operators"]\nmax_lines = 600\nmax_modules = 8\n[[module]]\npath = "operators/test_{family}.py"\ntier = "tier0"\nowns = ["mindie_sim/prediction/operators/{family}", "mindie_sim/templates/{family}_spec.py"]\n', encoding="utf-8")
+    for rel, txt in (
+        ("mindie_sim/__init__.py", '"""Stub."""\n'), ("scripts/check_arch_governance.py", "print('arch governance violations: 0')\n"),
+        ("scripts/check_test_orthogonality.py", "print('summary: 0 findings (none); mode=--strict; modules=1/96')\n"), ("scripts/check_template_provenance.py", "print('template provenance violations: 0')\n"),
+        (f"tests/operators/test_{family}.py", '"""Test."""\nimport pytest\npytestmark = pytest.mark.tier0\n'),
+        ("tests/TAXONOMY.toml", f'schema_version = 1\ndomains = ["operators"]\nmax_lines = 600\nmax_modules = 8\n[[module]]\npath = "operators/test_{family}.py"\ntier = "tier0"\nowns = ["mindie_sim/prediction/operators/{family}", "mindie_sim/templates/{family}_spec.py"]\n'),
+    ):
+        (syn / rel).write_text(txt, encoding="utf-8")
     return syn
 
 
 def _synthetic_profiler_root(tmp_path: Path, supported: tuple[str, ...] = ("demo_op",), *, abi: str = "aclnnDemoOpV1", tag: str = "main") -> Path:
     prof, pkg = tmp_path / f"syn_profiler_{tag}", tmp_path / f"syn_profiler_{tag}" / "mindie_profiler/bench"
-    pkg.mkdir(parents=True, exist_ok=True)
-    (prof / "mindie_profiler/__init__.py").write_text("", encoding="utf-8")
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    pkg.mkdir(parents=True, exist_ok=True); (prof / "mindie_profiler/__init__.py").write_text("", encoding="utf-8"); (pkg / "__init__.py").write_text("", encoding="utf-8")
     (pkg / "operators.py").write_text(f"class BenchUnmodeledOperatorError(RuntimeError):\n    pass\nSUPPORTED = {set(supported)!r}\nABI = {abi!r}\ndef resolve_builder_strict(family, recipe, impl, dtypes=(), meta=None):\n    if family in SUPPORTED or recipe in SUPPORTED:\n        return (f'{{family}}_builder', ABI)\n    raise BenchUnmodeledOperatorError(f'unmodeled:{{family}}:{{recipe}}')\n", encoding="utf-8")
     return prof
 
@@ -132,16 +134,17 @@ def _plan_fixture_bundle(plan: dict[str, Any], *, levels: tuple[str, ...] | None
             meas, pred = ov_map[pid] if pid in ov_map else ((10_000 + idx * 100 if split == "train" else 20_000 + idx * 250), int(round((10_000 + idx * 100 if split == "train" else 20_000 + idx * 250) * scale)))
             p99 = int(meas * 1.05)
             ranks, ev_ids = list(range(validate_parallel_topology(str(pt.get("parallel_topology") or "tp1")))), [f"{split[0]}-s-{idx}", f"{split[0]}-e-{idx}"]
-            cap_obj: dict[str, Any] = {"case_id": pid, "sku": sku, "split": split, "level": lvl, "idx": idx, "start_event": "start", "end_event": "end", "clock_domain": "device_ns", "device_ranks": ranks, "clock_operator": clock_op, "event_ids": ev_ids, "measured_ns": meas, "busy_union_ns": meas if clock_op == "busy_union" else None, "elapsed_span_ns": meas if clock_op == "elapsed_span" else None}
+            acq = "acq-train-src" if split == "train" else f"acq-held-{lvl.lower()}"
+            cap_obj: dict[str, Any] = {"case_id": pid, "sku": sku, "split": split, "level": lvl, "acquisition_root": acq, "idx": idx, "start_event": "start", "end_event": "end", "clock_domain": "device_ns", "device_ranks": ranks, "clock_operator": clock_op, "event_ids": ev_ids, "measured_ns": meas, "busy_union_ns": meas if clock_op == "busy_union" else None, "elapsed_span_ns": meas if clock_op == "elapsed_span" else None}
+            if lvl in {"L2", "L3"}:
+                cap_obj["timed_nodes"], cap_obj["actual_shape"] = [f"{pid}:op0", f"{pid}:op1"], {pt["axis"]: pt["value"], "batch_size": pt["batch_size"], "query_tokens": pt["query_tokens"]}
             if not omit_capture_p99:
                 cap_obj["measured_p99_ns"] = p99
             cap_bytes = json.dumps(cap_obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
             sha = hashlib.sha256(cap_bytes).hexdigest()
             if capture_dir is not None:
-                capture_dir.mkdir(parents=True, exist_ok=True)
-                (capture_dir / f"{sha}.json").write_bytes(cap_bytes)
+                capture_dir.mkdir(parents=True, exist_ok=True); (capture_dir / f"{sha}.json").write_bytes(cap_bytes)
             preds[pid] = pred
-            acq = "acq-train-src" if split == "train" else f"acq-held-{lvl.lower()}"
             row: dict[str, Any] = {
                 "case_id": pid, "point_id": pid, "sku": sku, "split": split, "level": lvl, "acquisition_root": acq, "run_uid": f"run-{split[0]}-{lvl.lower()}-{idx}", "raw_sha256": sha, "capture_uri": f"capture://{split}/{lvl.lower()}/{sha}.json",
                 "start_event": "start", "end_event": "end", "clock_domain": "device_ns", "event_ids": ev_ids, "device_ranks": ranks,
@@ -184,7 +187,8 @@ def test_probe_soc_conflicts_capture_gate_and_unspoofable_status(tmp_path):
         assert probe_soc(probe_json=p)["error"] == "silicon_profile_conflict", bad_name
     new_sku, full_probe = "AscendFuture_9999", tmp_path / "probe_new.json"
     full_probe.write_text(json.dumps({"aclrt_soc_name": new_sku, "arch_preset": A2_ORACLE["arch_id"], "architecture": "A2", "aic_count": 28, "aiv_count": 56, "hbm_bytes": 64 * 1024**3, "l2_bytes": 200 * 1024**2, "ub_bytes": 196_608, "dies_per_package": 1, "ranks_per_node": 8}), encoding="utf-8")
-    new_plan, cap_dir, raw_l0 = synthesize_sku_512_400k_plan(sku=new_sku, core_count=28, l2_bytes=200 * 1024**2).to_dict(), tmp_path / "new_caps", tmp_path / "new_l0.json"
+    prof_scaf = probe_soc(probe_json=full_probe, allow_scaffold=True, base_template_sku=A2_SKU)["scaffold_profile"][new_sku]
+    new_plan, cap_dir, raw_l0 = synthesize_sku_512_400k_plan(sku=new_sku, core_count=28, l2_bytes=200 * 1024**2, profile_override=prof_scaf).to_dict(), tmp_path / "new_caps", tmp_path / "new_l0.json"
     obs, preds, leans, abis, pshas = _plan_fixture_bundle(new_plan, capture_dir=cap_dir)
     raw_l0.write_text(json.dumps(_raw_l0_samples(new_sku)), encoding="utf-8")
     with pytest.raises(ModelingError, match="capture_file_missing"):
@@ -200,9 +204,7 @@ def test_probe_soc_conflicts_capture_gate_and_unspoofable_status(tmp_path):
     for j in range(4100):
         (decoy_dir / f"d_{j:04d}.json").write_bytes(b"{}")
     nested_f = cap_dir / "audit-node.internal.example/lease-audituser/trial-001.json"
-    nested_f.parent.mkdir(parents=True, exist_ok=True)
-    nested_f.write_bytes(saved_cap_bytes)
-    orig_cap_path.unlink()
+    nested_f.parent.mkdir(parents=True, exist_ok=True); nested_f.write_bytes(saved_cap_bytes); orig_cap_path.unlink()
     off768_row["capture_uri"] = "capture://audit-node.internal.example/lease-audituser/trial-001.json"
     prim_new, prof_new = run_new["stages"]["calibrate-l0-and-fabric"]["primitives_payload"], run_new["stages"]["probe-soc"]["scaffold_profile"][new_sku]
     val_nested = validate_512_400k(sku=new_sku, primitives_json=prim_new, profiler_runner=lambda _p: obs, abi_rejection_results=abis, profile_override=prof_new, capture_root=cap_dir, runner=_independent_engine_runner(preds, prog_sha_by_id=pshas))
@@ -211,9 +213,7 @@ def test_probe_soc_conflicts_capture_gate_and_unspoofable_status(tmp_path):
     nested_f.unlink()
     with pytest.raises(ModelingError, match="capture_file_missing"):
         verify_sku_gates(sku=new_sku, validation_report_json=val_nested, primitives_json=prim_new, lean_bounds_json=leans, profile_override=prof_new, capture_root=cap_dir, repo_root=_synthetic_repo(tmp_path, family="nested_del"))
-    orig_cap_path.write_bytes(saved_cap_bytes)
-    empty_caps, empty_repo = tmp_path / "empty_caps", _synthetic_repo(tmp_path, family="empty_c")
-    empty_caps.mkdir()
+    orig_cap_path.write_bytes(saved_cap_bytes); empty_caps, empty_repo = tmp_path / "empty_caps", _synthetic_repo(tmp_path, family="empty_c"); empty_caps.mkdir()
     for cap_arg in (empty_caps, None):
         with pytest.raises(ModelingError, match="capture_file_missing"):
             verify_sku_gates(sku=new_sku, validation_report_json=run_new["stages"]["validate-512-400k"], primitives_json=prim_new, lean_bounds_json=leans, profile_override=prof_new, capture_root=cap_arg, repo_root=empty_repo)
@@ -264,7 +264,7 @@ def test_lock3_dav2201_vs_dav3510_lightning_abi_and_strict_rejections():
 def test_capture_duration_override_clock_plan_ranks_and_capture_p99(tmp_path):
     plan, cap_dir = synthesize_sku_512_400k_plan(sku=A2_SKU, core_count=A2_ORACLE["aic"], l2_bytes=A2_ORACLE["l2"]).to_dict(), tmp_path / "caps"
     obs, preds, leans, abis, pshas = _plan_fixture_bundle(plan, capture_dir=cap_dir)
-    cap75 = {"case_id": "clk-75", "sku": A2_SKU, "split": "heldout", "start_event": "start", "end_event": "end", "clock_domain": "device_ns", "device_ranks": [0], "clock_operator": "busy_union", "event_ids": ["s0", "e0"], "busy_union_ns": 7500, "samples_ns": [7500] * 12}
+    cap75 = {"case_id": "clk-75", "sku": A2_SKU, "split": "heldout", "acquisition_root": "acq-held-l1", "start_event": "start", "end_event": "end", "clock_domain": "device_ns", "device_ranks": [0], "clock_operator": "busy_union", "event_ids": ["s0", "e0"], "busy_union_ns": 7500, "samples_ns": [7500] * 12}
     cap75_b = json.dumps(cap75, sort_keys=True, separators=(",", ":")).encode("utf-8")
     cap75_sha = hashlib.sha256(cap75_b).hexdigest()
     (cap_dir / f"{cap75_sha}.json").write_bytes(cap75_b)
@@ -375,7 +375,7 @@ def test_host_queue_unified_grant_cleanup_and_profiler_roundtrip(tmp_path):
     assert b4_by_id["abi_reject_topk_attr_2049"]["shape"]["top_k"] == 2049 and b4_by_id["abi_reject_topk_attr_2049"]["shape"]["enforce_exact_topk"] is True
     b4_splits = _split_disjoint_acquisitions(b4_plan, domain=None, dry_run=False)
     assert [t for t, _, _ in b4_splits] == ["train", "heldout-l1", "heldout-l2", "heldout-l3-w1", "heldout-l3-w4"] and b4_splits[3][2] == b4_splits[4][2] and len({s[2] for s in b4_splits[:4]}) == 4
-    b16_full = {**b4_by_id["cross_b16_ctx_4097"]["shape"], "m": 256, "n": 128, "k": 512, "e": 16, "matrix_groups": 16}
+    b16_full = {**b4_by_id["cross_b16_ctx_4097"]["shape"], "m": 256, "n": 128, "k": 512, "e": 16, "matrix_groups": 16, "dtype": "bf16"}
     l3_ns400 = {n["node_id"]: n["shape"] for n in b4_by_id["cross_tp2_pcp2_dcp4_ctx_400000"]["nodes"]}
     l3_full = {**b4_by_id["cross_tp2_pcp2_dcp4_ctx_400000"]["shape"], "dtype": "fp32", "partial_count": 4, "node_shapes": l3_ns400}
     l3_tn = [n["node_id"] for n in b4_by_id["cross_tp2_pcp2_dcp4_ctx_400000"]["nodes"]]
@@ -423,24 +423,45 @@ def test_capture_invariants_and_profiler_dispatch_roundtrip(tmp_path):
     rms127_norm, _ = normalize_profiler_records([{"schema": "mindie-bench-observation/1", "record_type": "observation", "case_id": "tile_128_minus1_127", "run_id": "r3.base.eager.t0", "trial": 0, "rank": 0, "split": "heldout", "boundary": "device_kernel", "timing_mode": "eager", "duration_ms": 0.02, "sample_id": "s0", "sku": A2_SKU, "validated": True, "qualified": True}, {"schema": "mindie-bench-subgraph-run/1", "record_type": "receipt", "case_id": "tile_128_minus1_127", "run_id": "r3", "rank": 0, "status": "ok", "actual_shape": {"tokens": 127, "width": 2048}, "timed_nodes": ["tile_128_minus1_127:op0"]}], plan_doc=b4_plan, sku=A2_SKU, capture_out_dir=l2_cap)
     assert l2_norm[0]["clock_operator"] == "elapsed_span" and rms127_norm[0]["tokens"] == 127
     stripped_l2 = {k: v for k, v in l2_norm[0].items() if k not in {"timed_nodes", "actual_shape", "measured_binding", "plan_key"}}
-    for bad_cap_row, pat in (({**stripped_l2, "target_op_ids": ["s0.l0.norm1"]}, "capture_target_op_ids_mismatch|l2_op_set_mismatch"), ({**rms127_norm[0], "target_family": "attention", "target_op_id": "s0.l0.paged_mla_decode", "measured_binding": {}}, "capture_target_family_mismatch|l1_plan_target_mismatch"), ({**rms127_norm[0], "debug_cross_level": True}, "observation_debug_cross_level_forbidden"), ({**rms127_norm[0], "busy_union_ns": 999_999, "elapsed_span_ns": 20_000}, "observation_busy_union_exceeds_elapsed_span")):
+    for bad_cap_row, pat in (({**stripped_l2, "target_op_ids": ["s0.l0.norm1"]}, "capture_target_op_ids_mismatch|l2_op_set_mismatch"), ({**rms127_norm[0], "acquisition_root": "acq-forged"}, "capture_acquisition_root_mismatch"), ({**rms127_norm[0], "target_family": "attention", "target_op_id": "s0.l0.paged_mla_decode", "measured_binding": {}}, "capture_target_family_mismatch|l1_plan_target_mismatch"), ({**rms127_norm[0], "debug_cross_level": True}, "observation_debug_cross_level_forbidden"), ({**rms127_norm[0], "busy_union_ns": 999_999, "elapsed_span_ns": 20_000}, "observation_busy_union_exceeds_elapsed_span")):
         with pytest.raises(ModelingError, match=pat):
             score_sealed_gate_cases([bad_cap_row], sku=A2_SKU, capture_root=l2_cap, require_capture_files=True, runner=WhiteboxSpineRunner(clock_operator="elapsed_span"))
+    with pytest.raises(ModelingError, match="l2_timed_nodes_missing"):
+        score_sealed_gate_cases([stripped_l2], sku=A2_SKU, expected_points=b4_plan["heldout_points"], runner=WhiteboxSpineRunner(clock_operator="elapsed_span"))
+    with pytest.raises(ModelingError, match="profiler_actual_geometry_mismatch.*dtype|profiler_actual_geometry_missing.*dtype"):
+        normalize_profiler_records([{"schema": "mindie-bench-observation/1", "record_type": "observation", "case_id": "cross_b16_ctx_4097", "run_id": "r4.base.eager.t0", "trial": 0, "rank": 0, "split": "heldout", "boundary": "fx_region", "timing_mode": "eager", "duration_ms": 0.25, "sample_id": "s0", "sku": A2_SKU, "validated": True, "qualified": True}, {"schema": "mindie-bench-subgraph-run/1", "record_type": "receipt", "case_id": "cross_b16_ctx_4097", "run_id": "r4", "rank": 0, "status": "ok", "actual_shape": b4_by_id["cross_b16_ctx_4097"]["shape"], "node_shapes": {**b16_ns, b16_tn[1]: {**b16_ns[b16_tn[1]], "dtype": "int8"}}, "timed_nodes": b16_tn}], plan_doc=b4_plan, sku=A2_SKU)
     with pytest.raises(ModelingError, match="duplicate_heldout_physical_capture"):
         score_sealed_gate_cases([{**rms127_norm[0], "case_id": "d1", "point_id": "d1", "run_uid": "u1", "event_ids": ["a", "b"]}, {**rms127_norm[0], "case_id": "d2", "point_id": "d2", "run_uid": "u2", "event_ids": ["a"]}], sku=A2_SKU, runner=_independent_engine_runner({"d1": 20_000, "d2": 20_000}))
     with pytest.raises(ModelingError, match="duplicate_train_physical_capture"):
         score_sealed_gate_cases([{**rms127_norm[0], "case_id": "t1", "point_id": "t1", "split": "train", "run_uid": "u1"}, {**rms127_norm[0], "case_id": "t2", "point_id": "t2", "split": "train", "run_uid": "u2"}], sku=A2_SKU, runner=_independent_engine_runner({"t1": 20_000, "t2": 20_000}))
-    for bad_cap_obj, pat in (({"clock_operator": "elapsed_span", "elapsed_span_ns": 10000, "start_event": "s", "end_event": "e", "device_ranks": [0], "event_ids": ["s", "e"]}, "capture_case_id_missing"), ({"case_id": "c_l4", "split": "heldout", "level": "L4", "clock_operator": "elapsed_span", "elapsed_span_ns": 10000, "start_event": "s", "end_event": "e", "device_ranks": [0], "event_ids": ["s", "e"]}, "capture_level_invalid"), ({"case_id": "c_dbg", "split": "heldout", "level": "L1", "debug_cross_level": True, "clock_operator": "elapsed_span", "elapsed_span_ns": 10000, "start_event": "s", "end_event": "e", "device_ranks": [0], "event_ids": ["s", "e"]}, "capture_debug_cross_level_forbidden"), ({"case_id": "c_st", "split": "heldout", "level": "L1", "status": "ok", "metadata": {"status": "failed"}, "clock_operator": "elapsed_span", "elapsed_span_ns": 10000, "start_event": "s", "end_event": "e", "device_ranks": [0], "event_ids": ["s", "e"]}, "capture_status_invalid")):
+    for bad_cap_obj, pat in (({"clock_operator": "elapsed_span", "elapsed_span_ns": 10000, "start_event": "s", "end_event": "e", "device_ranks": [0], "event_ids": ["s", "e"]}, "capture_case_id_missing"), ({"case_id": "c_l4", "split": "heldout", "level": "L4", "acquisition_root": "acq-x", "clock_operator": "elapsed_span", "elapsed_span_ns": 10000, "start_event": "s", "end_event": "e", "device_ranks": [0], "event_ids": ["s", "e"]}, "capture_level_invalid"), ({"case_id": "c_dbg", "split": "heldout", "level": "L1", "acquisition_root": "acq-x", "debug_cross_level": True, "clock_operator": "elapsed_span", "elapsed_span_ns": 10000, "start_event": "s", "end_event": "e", "device_ranks": [0], "event_ids": ["s", "e"]}, "capture_debug_cross_level_forbidden"), ({"case_id": "c_st", "split": "heldout", "level": "L1", "acquisition_root": "acq-x", "status": "ok", "metadata": {"status": "failed"}, "clock_operator": "elapsed_span", "elapsed_span_ns": 10000, "start_event": "s", "end_event": "e", "device_ranks": [0], "event_ids": ["s", "e"]}, "capture_status_invalid"), ({"case_id": "c_notn", "split": "heldout", "level": "L2", "acquisition_root": "acq-x", "clock_operator": "elapsed_span", "elapsed_span_ns": 10000, "start_event": "s", "end_event": "e", "device_ranks": [0], "event_ids": ["s", "e"]}, "capture_timed_nodes_missing")):
         cb = json.dumps(bad_cap_obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
         csha = hashlib.sha256(cb).hexdigest()
         (l2_cap / f"{csha}.json").write_bytes(cb)
         cid_b = str(bad_cap_obj.get("case_id") or "c_noid")
         with pytest.raises(ModelingError, match=pat):
-            score_sealed_gate_cases([{**rms127_norm[0], "case_id": cid_b, "point_id": cid_b, "raw_sha256": csha, "capture_uri": f"capture://x/{csha}.json", "event_ids": ["s", "e"], "device_ranks": [0], "start_event": "s", "end_event": "e", "measured_ns": 10000, "elapsed_span_ns": 10000, "busy_union_ns": 9000}], sku=A2_SKU, capture_root=l2_cap, require_capture_files=True, runner=_independent_engine_runner({cid_b: 10000}))
-    _validate_dispatch_exit(0, [{"status": "dry_run"}], [], {}, "", is_remote=False, dry_run=True)
-    _validate_dispatch_exit(0, [{"status": "dry_run"}], [], {}, "", is_remote=True, dry_run=True)
-    lw_bad = _lean_witness_row("w-bad", 1000, sim_ns=2000, p99_ns=2000)
-    lw_bad["certificate"]["sink_node_id"] = -0.5
+            score_sealed_gate_cases([{**rms127_norm[0], "case_id": cid_b, "point_id": cid_b, "level": str(bad_cap_obj.get("level") or "L1") if str(bad_cap_obj.get("level") or "L1") in {"L1", "L2", "L3"} else "L1", "acquisition_root": "acq-x", "raw_sha256": csha, "capture_uri": f"capture://x/{csha}.json", "event_ids": ["s", "e"], "device_ranks": [0], "start_event": "s", "end_event": "e", "measured_ns": 10000, "elapsed_span_ns": 10000, "busy_union_ns": 9000}], sku=A2_SKU, capture_root=l2_cap, require_capture_files=True, runner=_independent_engine_runner({cid_b: 10000}))
+    bar, seen_rec, prof22, prof35 = threading.Barrier(2), {}, copy.deepcopy(ascend_profiles()[A2_SKU]), copy.deepcopy(ascend_profiles()[A5_SKU])
+    def _t_iso(tag: str, pr: dict[str, Any], fail_early: bool) -> None:
+        try:
+            with temporary_scaffold_profile("AuditScaffold", pr):
+                bar.wait(timeout=5)
+                if fail_early:
+                    raise RuntimeError("boom")
+                bar.wait(timeout=5)
+                pl = synthesize_sku_512_400k_plan(sku="AuditScaffold", core_count=20, l2_bytes=A2_ORACLE["l2"]).to_dict()
+                seen_rec[tag] = resolve_point_measured_binding(pl, pl["train_points"][0], sku="AuditScaffold")["measured_binding"]["recipe"]
+        except RuntimeError:
+            bar.wait(timeout=5)
+    t1, t2 = threading.Thread(target=_t_iso, args=("a5", prof35, True)), threading.Thread(target=_t_iso, args=("a2", prof22, False))
+    t1.start(); t2.start(); t1.join(timeout=10); t2.join(timeout=10)
+    p950 = synthesize_sku_512_400k_plan(sku="Audit950Scaffold", core_count=20, l2_bytes=A2_ORACLE["l2"], profile_override=prof22).to_dict()
+    assert seen_rec.get("a2") == "ascend_paged_mla_decode_arch22" and "AuditScaffold" not in ascend_profiles() and resolve_point_measured_binding(p950, p950["train_points"][0], sku="Audit950Scaffold", profile_override=prof22)["measured_binding"]["recipe"] == "ascend_paged_mla_decode_arch22"
+    for pat, bad_fn in (("cliff_plan_sha256_tampered", lambda: verify_cliff_plan_integrity({**b4_plan, "arch_preset": ARCH_PRESET_35})), ("unknown_sku_profile", lambda: synthesize_sku_512_400k_plan(sku="NoSuchSKU", core_count=20, l2_bytes=A2_ORACLE["l2"]))):
+        with pytest.raises(ModelingError, match=pat):
+            bad_fn()
+    _validate_dispatch_exit(0, [{"status": "dry_run"}], [], {}, "", is_remote=False, dry_run=True); _validate_dispatch_exit(0, [{"status": "dry_run"}], [], {}, "", is_remote=True, dry_run=True)
+    lw_bad = _lean_witness_row("w-bad", 1000, sim_ns=2000, p99_ns=2000); lw_bad["certificate"]["sink_node_id"] = -0.5
     assert check_lean_non_inversion([lw_bad], expected_case_timings={"w-bad": (2000, 1500, 2000, lw_bad["program_dag_sha256"])})[0] is False
     with pytest.raises(ModelingError, match="private_host_path_rejected"):
         validate_512_400k(sku=A2_SKU, profiler_runner=lambda _: [], abi_rejection_results=[{"point_id": "abi_reject_topk_attr_2049", "rejected": True, "abi_error": "/".join(("", "Users", "audituser", "p.json"))}], report_out=leak_rep)
@@ -448,30 +469,15 @@ def test_capture_invariants_and_profiler_dispatch_roundtrip(tmp_path):
     with pytest.raises(ModelingError, match="clock_operator_plan_mismatch"):
         normalize_profiler_records([{"schema": "mindie-bench-observation/1", "record_type": "observation", "case_id": "offgrid_ctx_768", "run_id": "r1.base.stream_saturated.t0", "trial": 0, "split": "heldout", "boundary": "device_kernel", "timing_mode": "stream_saturated", "duration_ms": 0.0075, "sample_id": "s0", "sku": A2_SKU, "validated": True, "qualified": True}], plan_doc=plan_doc, sku=A2_SKU)
     cap_out = tmp_path / "prof_caps"
-    norm_obs, norm_abi = normalize_profiler_records([
-        {"schema": "mindie-bench-observation/1", "record_type": "observation", "case_id": "offgrid_ctx_768", "run_id": "run001.base.eager.t0", "trial": 0, "split": "heldout", "boundary": "device_kernel", "timing_mode": "eager", "duration_ms": 0.020, "sample_id": "obs-0", "rank": None, "sku": A2_SKU, "validated": True, "qualified": True, "identity": {"level": "operator", "implementation": "aclnnLive"}},
-        {"schema": "mindie-bench-observation/1", "record_type": "observation", "case_id": "offgrid_ctx_768", "run_id": "run001.base.stream_saturated.t0", "trial": 0, "split": "heldout", "boundary": "device_kernel", "timing_mode": "stream_saturated", "duration_ms": 0.0075, "sample_id": "obs-1", "rank": None, "sku": A2_SKU, "validated": True, "qualified": True, "identity": {"level": "operator", "implementation": "aclnnLive"}},
-        {"schema": "mindie-bench-observation/1", "record_type": "case_complete", "case_id": "offgrid_ctx_768", "run_id": "run001", "split": "heldout", "status": "ok", "summary": {"op": "live", "actual_shape": {"context_len": 768, "batch_size": 1, "query_tokens": 1}, "participating_ranks": [2]}},
-        {"schema": "mindie-bench-subgraph-run/1", "record_type": "receipt", "case_id": "offgrid_ctx_768", "run_id": "run001", "status": "ok", "actual_shape": {"context_len": 768, "batch_size": 1, "query_tokens": 1}, "timed_nodes": ["offgrid_ctx_768:op0"]},
-        {"schema": "mindie-bench-receipt/1", "case_id": "abi_1", "status": "unsupported_binding", "reason": "abi_divisibility_violation:topk=2049", "executed_shape": {"context_len": 2049, "topk": 2049, "batch_size": 1, "query_tokens": 1}},
-        {"schema": "mindie-bench-receipt/1", "case_id": "abi_1", "status": "unsupported_binding", "reason": "kernel_symbol_missing", "executed_shape": {"context_len": 2049, "topk": 2049, "batch_size": 1, "query_tokens": 1}},
-    ], plan_doc=plan_doc, sku=A2_SKU, endpoint_alias="audit-node.internal.example", capture_out_dir=cap_out)
+    norm_obs, norm_abi = normalize_profiler_records([{"schema": "mindie-bench-observation/1", "record_type": "observation", "case_id": "offgrid_ctx_768", "run_id": "run001.base.eager.t0", "trial": 0, "split": "heldout", "boundary": "device_kernel", "timing_mode": "eager", "duration_ms": 0.020, "sample_id": "obs-0", "rank": None, "sku": A2_SKU, "validated": True, "qualified": True, "identity": {"level": "operator", "implementation": "aclnnLive"}}, {"schema": "mindie-bench-observation/1", "record_type": "observation", "case_id": "offgrid_ctx_768", "run_id": "run001.base.stream_saturated.t0", "trial": 0, "split": "heldout", "boundary": "device_kernel", "timing_mode": "stream_saturated", "duration_ms": 0.0075, "sample_id": "obs-1", "rank": None, "sku": A2_SKU, "validated": True, "qualified": True, "identity": {"level": "operator", "implementation": "aclnnLive"}}, {"schema": "mindie-bench-observation/1", "record_type": "case_complete", "case_id": "offgrid_ctx_768", "run_id": "run001", "split": "heldout", "status": "ok", "summary": {"op": "live", "actual_shape": {"context_len": 768, "batch_size": 1, "query_tokens": 1}, "participating_ranks": [2]}}, {"schema": "mindie-bench-subgraph-run/1", "record_type": "receipt", "case_id": "offgrid_ctx_768", "run_id": "run001", "status": "ok", "actual_shape": {"context_len": 768, "batch_size": 1, "query_tokens": 1}, "timed_nodes": ["offgrid_ctx_768:op0"]}, {"schema": "mindie-bench-receipt/1", "case_id": "abi_1", "status": "unsupported_binding", "reason": "abi_divisibility_violation:topk=2049", "executed_shape": {"context_len": 2049, "topk": 2049, "batch_size": 1, "query_tokens": 1}}, {"schema": "mindie-bench-receipt/1", "case_id": "abi_1", "status": "unsupported_binding", "reason": "kernel_symbol_missing", "executed_shape": {"context_len": 2049, "topk": 2049, "batch_size": 1, "query_tokens": 1}}], plan_doc=plan_doc, sku=A2_SKU, endpoint_alias="audit-node.internal.example", capture_out_dir=cap_out)
     assert len(norm_obs) == 1 and norm_obs[0]["device_ranks"] == [2] and norm_obs[0]["context_len"] == 768 and norm_obs[0]["clock_operator"] == "elapsed_span" and "sim_case" in norm_obs[0] and len(norm_abi) == 2 and "audit-node" not in json.dumps(norm_obs) and norm_obs[0]["run_uid"].startswith("run-")
     verify_capture_file_consistency("offgrid_ctx_768", CaptureBoundary(norm_obs[0]["raw_sha256"], norm_obs[0]["acquisition_root"], norm_obs[0]["run_uid"], (), tuple(norm_obs[0]["event_ids"]), tuple(norm_obs[0]["device_ranks"]), "device_monotonic", "k_start", "k_end", "device_kernel", "ns", norm_obs[0]["capture_uri"]), cap_out / f"{norm_obs[0]['raw_sha256']}.json")
     abi_plan = synthesize_operator_cliff_plan(OperatorCliffParameters("sp:v2", "sparse_indexer", 128, 20, A2_ORACLE["l2"]), sku=A2_SKU).to_dict()
-    abi_pt = abi_plan["abi_rejection_points"][0]
-    abi_pid, abi_err, abi_by_id = abi_pt["point_id"], abi_pt["abi_expected_error"], {abi_pt["point_id"]: abi_pt}
-    for rc_v, bad_recs in (
-        (2, [{"case_id": abi_pid, "status": "unsupported_binding", "reason": abi_err, "requested_shape": {"batch_size": 1, "query_tokens": 1, "context_len": abi_pt["value"], "topk": abi_pt["topk"]}}]),
-        (2, [{"case_id": abi_pid, "status": "unsupported_binding", "reason": abi_err, "executed_shape": {"batch_size": 1, "query_tokens": 1, "context_len": abi_pt["value"], "topk": abi_pt["topk"], "sparse_count": abi_pt["topk"] - 1}}]),
-        (0, [{"case_id": "offgrid_ctx_768", "status": "failed", "reason": "kernel_symbol_missing"}]),
-        (2, [{"case_id": abi_pid, "status": "unsupported_binding", "reason": abi_err, "executed_shape": {"batch_size": 1, "query_tokens": 1, "context_len": abi_pt["value"], "topk": abi_pt["topk"]}}, {"case_id": abi_pid, "status": "unsupported_binding", "reason": "kernel_symbol_missing", "executed_shape": {"batch_size": 1, "query_tokens": 1, "context_len": abi_pt["value"], "topk": abi_pt["topk"]}}]),
-    ):
+    abi_pt = abi_plan["abi_rejection_points"][0]; abi_pid, abi_err, abi_by_id = abi_pt["point_id"], abi_pt["abi_expected_error"], {abi_pt["point_id"]: abi_pt}
+    for rc_v, bad_recs in ((2, [{"case_id": abi_pid, "status": "unsupported_binding", "reason": abi_err, "requested_shape": {"batch_size": 1, "query_tokens": 1, "context_len": abi_pt["value"], "topk": abi_pt["topk"]}}]), (2, [{"case_id": abi_pid, "status": "unsupported_binding", "reason": abi_err, "executed_shape": {"batch_size": 1, "query_tokens": 1, "context_len": abi_pt["value"], "topk": abi_pt["topk"], "sparse_count": abi_pt["topk"] - 1}}]), (0, [{"case_id": "offgrid_ctx_768", "status": "failed", "reason": "kernel_symbol_missing"}]), (2, [{"case_id": abi_pid, "status": "unsupported_binding", "reason": abi_err, "executed_shape": {"batch_size": 1, "query_tokens": 1, "context_len": abi_pt["value"], "topk": abi_pt["topk"]}}, {"case_id": abi_pid, "status": "unsupported_binding", "reason": "kernel_symbol_missing", "executed_shape": {"batch_size": 1, "query_tokens": 1, "context_len": abi_pt["value"], "topk": abi_pt["topk"]}}])):
         with pytest.raises(ModelingError, match="profiler_bench_unexpected_partial_failure|profiler_shape_alias_conflict"):
             _validate_dispatch_exit(rc_v, [{"status": "ok" if rc_v == 0 else "partial"}], bad_recs, abi_by_id, "", is_remote=False)
-    fake_prof = tmp_path / "fake_prof_sub"
-    (fake_prof / "mindie_profiler/bench").mkdir(parents=True)
-    (fake_prof / "mindie_profiler/__init__.py").write_text("", encoding="utf-8")
+    fake_prof = tmp_path / "fake_prof_sub"; (fake_prof / "mindie_profiler/bench").mkdir(parents=True); (fake_prof / "mindie_profiler/__init__.py").write_text("", encoding="utf-8")
     (fake_prof / "mindie_profiler/__main__.py").write_text(
         "import json, os, sys\nfrom pathlib import Path\nargs = sys.argv[1:]\nassert args[:2] == ['bench', 'subgraph']\n"
         "plan = json.loads(Path(args[args.index('--plan') + 1]).read_text(encoding='utf-8'))\n"
@@ -507,16 +513,11 @@ def test_whitebox_sku_check_2d_kv_heads_dcp_compose_and_real_dag(tmp_path):
         score_sealed_gate_cases([{**base_l1, "case_id": "bx-odd", "point_id": "bx-odd", "batch_x_kv_heads": 2559, "sim_case": gqa_case}], sku=A2_SKU, runner=WhiteboxSpineRunner(clock_operator="busy_union"))
     assert score_sealed_gate_cases([{**base_l1, "case_id": "bx-1kv", "point_id": "bx-1kv", "batch_x_kv_heads": 2559}], sku=A2_SKU, runner=WhiteboxSpineRunner(clock_operator="busy_union"))["residuals"][0]["predicted_ns"] > 0
     attn_l1 = {**base_l1, "case_id": "wb-attn", "point_id": "wb-attn", "context_len": 512, "target_family": "attention", "target_op_id": "s0.l0.paged_mla_decode"}
-    for bad_bind in (
-        {"measured_binding": {"builder": "fused_infer_attention", "family": "attention", "recipe": "fused_infer_attention", "paged": False, "heads": 16, "kv_heads": 2, "head_dim": 128}},
-        {"measured_binding": {"builder": "absorbed_mla", "family": "attention", "recipe": "ascend_paged_mla_decode_arch22", "target_op_id": "s0.l0.paged_mla_decode", "query_layout": "TND"}},
-        {"measured_binding": {"builder": "absorbed_mla", "family": "attention", "recipe": "ascend_paged_mla_decode_arch22", "target_op_id": "s0.l0.paged_mla_decode", "kv_len": 512, "page_count": 4}},
-        {"actual_shape": {"page_count": 5, "block_table": [1, 4]}, "measured_binding": {"builder": "absorbed_mla", "family": "attention", "recipe": "ascend_paged_mla_decode_arch22", "target_op_id": "s0.l0.paged_mla_decode"}},
-    ):
+    for bad_bind in ({"measured_binding": {"builder": "fused_infer_attention", "family": "attention", "recipe": "fused_infer_attention", "paged": False, "heads": 16, "kv_heads": 2, "head_dim": 128}}, {"measured_binding": {"builder": "absorbed_mla", "family": "attention", "recipe": "ascend_paged_mla_decode_arch22", "target_op_id": "s0.l0.paged_mla_decode", "query_layout": "TND"}}, {"measured_binding": {"builder": "absorbed_mla", "family": "attention", "recipe": "ascend_paged_mla_decode_arch22", "target_op_id": "s0.l0.paged_mla_decode", "kv_len": 512, "page_count": 4}}, {"actual_shape": {"page_count": 5, "block_table": [1, 4]}, "measured_binding": {"builder": "absorbed_mla", "family": "attention", "recipe": "ascend_paged_mla_decode_arch22", "target_op_id": "s0.l0.paged_mla_decode"}}):
         with pytest.raises(ModelingError, match="whitebox_measured_binding_mismatch"):
             score_sealed_gate_cases([{**attn_l1, **bad_bind}], sku=A2_SKU, runner=WhiteboxSpineRunner(clock_operator="busy_union"))
     l2_b16 = {**base_l1, "case_id": "l2-mg", "point_id": "l2-mg", "level": "L2", "context_len": 4097, "batch_size": 16, "target_family": None, "target_op_ids": ["s0.l0.paged_mla_decode", "s0.l0.v_expand"]}
-    for pat, patch in (("matrix_groups", {"measured_binding": {"node_bindings": [{"op_id": "s0.l0.v_expand", "matrix_groups": 1}]}}), ("l2_op_set_mismatch", {"timed_nodes": ["l2-mg:s0.l0.paged_mla_decode"]}), ("order_violation", {"timed_nodes": ["l2-mg:s0.l0.v_expand", "l2-mg:s0.l0.paged_mla_decode"]}), ("l2_timed_nodes_missing", {"actual_shape": {"m": 256, "n": 128, "k": 512, "e": 16, "matrix_groups": 16}}), ("gemm_n_conflict|weight_n", {"actual_shape": {"m": 256, "n": 64, "k": 512, "e": 16, "matrix_groups": 16}, "measured_binding": {"node_bindings": [{"op_id": "s0.l0.v_expand", "m": 256, "n": 128, "k": 512, "matrix_groups": 16}]}})):
+    for pat, patch in (("matrix_groups", {"measured_binding": {"node_bindings": [{"op_id": "s0.l0.v_expand", "matrix_groups": 1}]}}), ("l2_op_set_mismatch", {"timed_nodes": ["l2-mg:s0.l0.paged_mla_decode"]}), ("order_violation", {"timed_nodes": ["l2-mg:s0.l0.v_expand", "l2-mg:s0.l0.paged_mla_decode"]}), ("l2_timed_nodes_missing", {"actual_shape": {"m": 256, "n": 128, "k": 512, "e": 16, "matrix_groups": 16, "dtype": "bf16"}}), ("gemm_n_conflict|weight_n", {"actual_shape": {"m": 256, "n": 64, "k": 512, "e": 16, "matrix_groups": 16, "dtype": "bf16"}, "measured_binding": {"node_bindings": [{"op_id": "s0.l0.v_expand", "m": 256, "n": 128, "k": 512, "matrix_groups": 16, "dtype": "bf16"}]}}), ("dtype", {"actual_shape": {"m": 256, "n": 128, "k": 512, "e": 16, "matrix_groups": 16, "dtype": "int8"}, "timed_nodes": ["l2-mg:s0.l0.paged_mla_decode", "l2-mg:s0.l0.v_expand"]})):
         with pytest.raises(ModelingError, match=pat):
             score_sealed_gate_cases([{**l2_b16, **patch}], sku=A2_SKU, runner=WhiteboxSpineRunner(clock_operator="busy_union"))
     l3_base = {"compose_model": "deepseek-v2-lite", "compose_hardware": A2_SKU, "model_overrides": {"layers": 1}}
@@ -546,17 +547,16 @@ def test_whitebox_sku_check_2d_kv_heads_dcp_compose_and_real_dag(tmp_path):
     d_cert, _ = certify_lower_bound(ResourceChoiceProgram(lp["num_resources"], tuple(lp["global_work"]), ()), EventDagSpec(tuple(ld["node_quantum_ns"]), tuple(DagEdge(e["src"], e["dst"], e["wire_ns"]) for e in ld["edges"])))
     lean_ok, _, lean_v = check_lean_non_inversion([{"case_id": "l2-dep", "l_star_lean_ns": d_cert.l_star_lean_ns, "t_sim_ns": dep_diag["busy_union_ns"], "t_silicon_p99_ns": max(dep_diag["busy_union_ns"], 2600), "program": lp, "dag": ld, "certificate": {"farkas": {"scale_d": d_cert.farkas.scale_d, "lambda_num": list(d_cert.farkas.lambda_num), "mu_num": list(d_cert.farkas.mu_num), "lower_bound_ns": d_cert.farkas.lower_bound_ns}, "path_edges": list(d_cert.path_edges), "sink_node_id": d_cert.sink_node_id, "l_star_lean_ns": d_cert.l_star_lean_ns}}], expected_case_timings={"l2-dep": (dep_diag["busy_union_ns"], 2500, max(dep_diag["busy_union_ns"], 2600), dep_diag["program_dag_sha256"])})
     assert lean_ok is True and not lean_v
-    raw_full = tmp_path / "full.json"
-    raw_full.write_text(json.dumps(_raw_l0_samples(A2_SKU)), encoding="utf-8")
+    raw_full = tmp_path / "full.json"; raw_full.write_text(json.dumps(_raw_l0_samples(A2_SKU)), encoding="utf-8")
     cal_full = calibrate_l0_and_fabric(sku=A2_SKU, raw_l0_json=raw_full)["primitives_payload"]
-    pt_obj = parse_primitive_table(cal_full)
-    par_r = WhiteboxSpineRunner(clock_operator="busy_union", primitive_table=pt_obj, max_workers=2)
+    par_r = WhiteboxSpineRunner(clock_operator="busy_union", primitive_table=parse_primitive_table(cal_full), max_workers=2)
     par_batch = score_sealed_gate_cases([{**base_l1, "case_id": "p0", "point_id": "p0", "raw_sha256": hashlib.sha256(b"p0").hexdigest()}, {**base_l1, "case_id": "p1", "point_id": "p1", "context_len": 128, "raw_sha256": hashlib.sha256(b"p1").hexdigest()}], sku=A2_SKU, runner=par_r)
     assert len(par_batch["residuals"]) == 2 and all(r["predicted_ns"] > 0 for r in par_batch["residuals"])
     gc64 = GateCase("stale-x", "L1", "heldout", CaptureBoundary(hashlib.sha256(b"s64").hexdigest(), "acq-s", "r1", (), ("s1", "e1"), (0,), "device_ns", "s1", "e1", "device_kernel", "ns", "capture://s/64.json"), "i", "s", "w", CohortKey("L1", "c", A2_SKU, "decode", "eager", "cliff", "tp1"), 2500, payload=(("clock_operator", "busy_union"), ("context_len", 64), ("phase", "decode"), ("target_family", "attention"), ("sim_case", b4_case)))
     gc1024 = GateCase("stale-x", "L1", "heldout", CaptureBoundary(hashlib.sha256(b"s1024").hexdigest(), "acq-s", "r2", (), ("s1", "e1"), (0,), "device_ns", "s1", "e1", "device_kernel", "ns", "capture://s/1024.json"), "i", "s", "w", CohortKey("L1", "c", A2_SKU, "decode", "eager", "cliff", "tp1"), 2500, payload=(("clock_operator", "busy_union"), ("context_len", 1024), ("phase", "decode"), ("target_family", "attention"), ("sim_case", b4_case)))
     gc_cf = GateCase("cf-drop", "L1", "train", gc64.boundary, "i", "s", "w", gc64.cohort, 0, is_counterfactual=True, has_matched_capture=False)
-    assert eligible_replay_cases([gc64, gc_cf]) == [gc64]
+    gc_l2_nb = GateCase("l2-nb", "L2", "heldout", dep_gc.boundary, "i", "s", "w", dep_gc.cohort, 2500, block_capture_present=False)
+    assert eligible_replay_cases([gc64, gc_cf, gc_l2_nb]) == [gc64]
     par_r.prefetch_cases([gc64, dep_gc])
     assert par_r.run_l1(gc1024).predicted_ns > par_r.run_l1(gc64).predicted_ns
     with pytest.raises(ModelingError, match="whitebox_duplicate_prefetch_case"):
@@ -590,8 +590,7 @@ def test_whitebox_sku_check_2d_kv_heads_dcp_compose_and_real_dag(tmp_path):
     with pytest.raises(ModelingError, match="atol_ns_exceeds_strict_release_cap"):
         verify_sku_gates(sku=A2_SKU, validation_report_json=bad_atol_val, capture_root=cap_dir, primitives_json=cal_full, lean_bounds_json=m_leans, repo_root=syn_ok)
     assert verify_sku_gates(sku=A2_SKU, multilevel_manifest_json=full_f, capture_root=cap_dir, runner=_independent_engine_runner({**m_preds, next(iter(l1_atol_ov)): 7500}, prog_sha_by_id=m_shas), primitives_json=cal_full, lean_bounds_json=m_leans, repo_root=syn_ok)["ok"] is False
-    raw_a = tmp_path / "raw_a.json"
-    raw_a.write_text(json.dumps(_raw_l0_samples(A2_SKU, scale=1.01)), encoding="utf-8")
+    raw_a = tmp_path / "raw_a.json"; raw_a.write_text(json.dumps(_raw_l0_samples(A2_SKU, scale=1.01)), encoding="utf-8")
     cal_a = calibrate_l0_and_fabric(sku=A2_SKU, raw_l0_json=raw_a)["primitives_payload"]
     a_rows, a_preds, _, a_abis, a_shas = _plan_fixture_bundle(full_plan, scale=1.01, capture_dir=cap_dir_a)
     val_a = validate_512_400k(sku=A2_SKU, primitives_json=cal_a, profiler_runner=lambda _p: a_rows, abi_rejection_results=a_abis, capture_root=cap_dir_a, runner=_independent_engine_runner(a_preds, prog_sha_by_id=a_shas))

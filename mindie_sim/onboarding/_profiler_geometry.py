@@ -345,6 +345,21 @@ def _verify_node_bindings_actual_geometry(
                     raise ModelingError(
                         f"profiler_actual_geometry_mismatch:{cid}:matrix_groups:{oid}:expected={exp_mg}:actual={got_mg}"
                     )
+            exp_dt = str(nb.get("dtype") or "").strip().lower()
+            exp_q = str(nb.get("quant_mode") or "none").strip().lower()
+            got_dt = str(n_act.get("dtype") or n_act.get("input_dtype") or "").strip().lower()
+            got_wdt = str(n_act.get("weight_dtype") or "").strip().lower()
+            got_q = str(n_act.get("quant_mode") or n_act.get("quantization") or "").strip().lower()
+            if exp_dt and not got_dt:
+                raise ModelingError(f"profiler_actual_geometry_missing:{cid}:dtype:{oid}")
+            if exp_dt and got_dt != exp_dt:
+                raise ModelingError(f"profiler_actual_geometry_mismatch:{cid}:dtype:{oid}:expected={exp_dt}:actual={got_dt}")
+            if exp_dt and got_wdt and got_wdt != exp_dt:
+                raise ModelingError(f"profiler_actual_geometry_mismatch:{cid}:weight_dtype:{oid}:expected={exp_dt}:actual={got_wdt}")
+            if got_q and got_q not in {"", "none", "dense", exp_q, exp_dt}:
+                raise ModelingError(f"profiler_actual_geometry_mismatch:{cid}:quant_mode:{oid}:expected={exp_q}:actual={got_q}")
+            if (n_act.get("has_scales") is True or str(n_act.get("scale_dtype") or "").strip()) and exp_q in {"", "none", "dense"}:
+                raise ModelingError(f"profiler_actual_geometry_mismatch:{cid}:unexpected_quant_scales:{oid}")
         elif fam in _COLLECTIVE_BINDING_FAMILIES and is_per_node:
             exp_dt = str(nb.get("dtype") or "").strip().lower()
             got_dt = str(n_act.get("dtype") or "").strip().lower()

@@ -23,7 +23,6 @@ import hashlib
 import re
 from typing import Any
 
-from mindie_sim.backends import ascend_profiles
 from mindie_sim.schema.common import ModelingError
 
 from .contracts import canonical_json_bytes
@@ -40,7 +39,6 @@ _MIN_DCP_PARTIALS = 2
 _MIN_GEMM_SHAPE_RANK = 3
 _MIN_2D_SHAPE_RANK = 2
 _LOWER_CACHE_MAXSIZE = 64
-_ARCH35_SKU_MARKER = "950"
 _ARCH35_PRESET_MARKER = "35"
 _DEFAULT_SIM_MODEL = "deepseek-v2-lite"
 _TOPO_TOKEN_RE = re.compile(r"(tp|pp|dp|ep|pcp|dcp)(\d+)")
@@ -77,12 +75,21 @@ def _decode_mla_recipe_for_sku(
     plan_doc: Mapping[str, Any] | None = None,
     profile_override: Mapping[str, Any] | None = None,
 ) -> str:
-    preset = _preset_from_profile(profile_override)
-    if not preset and isinstance(plan_doc, Mapping) and plan_doc.get("arch_preset"):
-        preset = str(plan_doc["arch_preset"]).strip()
-    if not preset:
-        preset = _preset_from_profile(ascend_profiles().get(sku))
-    if _ARCH35_PRESET_MARKER in preset or _ARCH35_SKU_MARKER in str(sku).lower():
+    from ._sku_calibration import resolve_sku_profile
+
+    prof = resolve_sku_profile(sku, profile_override)
+    if prof is None:
+        raise ModelingError(f"unknown_sku_profile_for_lowering:{sku}")
+    prof_preset = _preset_from_profile(prof)
+    if not prof_preset:
+        raise ModelingError(f"sku_profile_missing_arch_preset:{sku}")
+    if isinstance(plan_doc, Mapping):
+        plan_preset = str(plan_doc.get("arch_preset") or "").strip()
+        if plan_preset and plan_preset != prof_preset:
+            raise ModelingError(
+                f"plan_arch_preset_profile_conflict:{sku}:plan={plan_preset}:profile={prof_preset}"
+            )
+    if _ARCH35_PRESET_MARKER in prof_preset:
         return "ascend_paged_mla_decode_arch35"
     return "ascend_paged_mla_decode_arch22"
 
@@ -133,6 +140,7 @@ def _lower_one_layer_step_ops_cached(
             "family": str(op.family),
             "recipe": str(op.recipe),
             "dtype": str(op.dtype or "bf16"),
+            "quant_mode": str(meta.get("quant_mode") or meta.get("quantization") or "none").strip().lower(),
             "local_shape": tuple(int(x) if isinstance(x, (int, float)) else x for x in (op.local_shape or ())),
             "deps": tuple(str(d) for d in (op.deps or ())),
             "link_bytes": int(round(float(op.link_bytes or 0.0))),
@@ -158,10 +166,10 @@ def _lower_one_layer_step_ops(
     profile_override: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], ...]:
     """Lower a 1-layer step against the exact SKU profile (never silently substituting B4)."""
-    from ._sku_calibration import temporary_scaffold_profile
+    from ._sku_calibration import resolve_sku_profile, temporary_scaffold_profile
 
     with temporary_scaffold_profile(sku, profile_override):
-        prof = ascend_profiles().get(sku)
+        prof = resolve_sku_profile(sku, profile_override)
         if not isinstance(prof, Mapping):
             raise ModelingError(f"unknown_sku_profile_for_lowering:{sku}")
         prof_sha = hashlib.sha256(canonical_json_bytes(prof)).hexdigest()
@@ -212,27 +220,31 @@ def _lowered_attn_or_gemm_node(
 
     if fam in {"gemm", "gate_up_projection", "down_projection"} and len(loc) >= _MIN_GEMM_SHAPE_RANK:
         m_dim, n_dim, k_dim = int(loc[0]), int(loc[1]), int(loc[2])
+        op_dtype = str(op_rec.get("dtype") or "bf16").strip().lower()
+        op_quant = str(op_rec.get("quant_mode") or "none").strip().lower()
         if mg > 1:
             per_grp = max(1, m_dim // mg)
             node = {
                 "node_id": nid, "op_id": op_id, "kind": "operator",
                 "op": "grouped_matmul", "builder": "grouped_matmul", "family": "grouped_gemm",
                 "recipe": "grouped_matmul", "implementation": "aclnnGroupedMatmulV5",
-                "dtype": "bf16", "group_list": [per_grp] * mg, "group_list_type": 1,
-                "shape": {"m": m_dim, "n": n_dim, "k": k_dim, "e": mg, "matrix_groups": mg},
+                "dtype": op_dtype, "group_list": [per_grp] * mg, "group_list_type": 1,
+                "shape": {"m": m_dim, "n": n_dim, "k": k_dim, "e": mg, "matrix_groups": mg, "dtype": op_dtype},
             }
             return node, {
                 "op_id": op_id, "family": fam, "recipe": rec, "builder": "grouped_matmul",
+                "dtype": op_dtype, "quant_mode": op_quant,
                 "m": m_dim, "n": n_dim, "k": k_dim, "matrix_groups": mg,
             }
         node = {
             "node_id": nid, "op_id": op_id, "kind": "operator",
             "op": "matmul", "builder": "matmul", "family": fam, "recipe": rec,
-            "implementation": "aclnnMatmul", "dtype": "bf16",
-            "shape": {"m": m_dim, "n": n_dim, "k": k_dim, "matrix_groups": 1},
+            "implementation": "aclnnMatmul", "dtype": op_dtype,
+            "shape": {"m": m_dim, "n": n_dim, "k": k_dim, "matrix_groups": 1, "dtype": op_dtype},
         }
         return node, {
             "op_id": op_id, "family": fam, "recipe": rec, "builder": "matmul",
+            "dtype": op_dtype, "quant_mode": op_quant,
             "m": m_dim, "n": n_dim, "k": k_dim, "matrix_groups": 1,
         }
     return None

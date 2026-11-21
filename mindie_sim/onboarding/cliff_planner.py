@@ -26,7 +26,6 @@ import hashlib
 import re
 from typing import Any
 
-from mindie_sim.backends import ascend_profiles
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.parallel import ParallelSpec
 
@@ -54,7 +53,6 @@ from .contracts import (
     sanitize_public_campaign_id,
 )
 from .tiling_axes import (
-    ARCH_PRESET_22,
     CROSS_SAMPLE_PARALLEL_CONTEXT_MIN,
     TilingAxes,
     family_default_tiling_axes,
@@ -84,16 +82,25 @@ def _resolve_sku_arch_preset(
     arch_preset: str = "",
     profile_override: Mapping[str, Any] | None = None,
 ) -> str:
-    if arch_preset.strip():
-        return arch_preset.strip()
-    prof = profile_override if profile_override is not None else ascend_profiles().get(sku)
-    if isinstance(prof, Mapping):
-        dev = prof.get("device")
-        if isinstance(dev, Mapping):
-            ca = dev.get("compute_arch")
-            if isinstance(ca, Mapping) and ca.get("preset"):
-                return str(ca["preset"]).strip()
-    return ARCH_PRESET_22
+    from ._sku_calibration import resolve_sku_profile
+
+    prof = resolve_sku_profile(sku, profile_override)
+    if prof is None:
+        raise ModelingError(f"unknown_sku_profile:{sku}")
+    dev = prof.get("device")
+    prof_preset = ""
+    if isinstance(dev, Mapping):
+        ca = dev.get("compute_arch")
+        if isinstance(ca, Mapping) and ca.get("preset"):
+            prof_preset = str(ca["preset"]).strip()
+    if not prof_preset:
+        raise ModelingError(f"sku_profile_missing_arch_preset:{sku}")
+    req = arch_preset.strip()
+    if req and req != prof_preset:
+        raise ModelingError(
+            f"plan_arch_preset_profile_conflict:{sku}:requested={req}:profile={prof_preset}"
+        )
+    return prof_preset
 
 
 @lru_cache(maxsize=1)
@@ -466,7 +473,8 @@ def synthesize_operator_cliff_plan(
 
     body = {
         "schema": CLIFF_PLAN_SCHEMA, "target_id": params.operator_id, "family": params.family,
-        "sku": sku, "campaign_id": clean_campaign, "cold_ring_l2_multiplier": COLD_RING_L2_MULTIPLIER,
+        "sku": sku, "arch_preset": resolved_arch, "campaign_id": clean_campaign,
+        "cold_ring_l2_multiplier": COLD_RING_L2_MULTIPLIER,
         "train_points": [pt.to_dict() for pt in train_points],
         "heldout_points": [pt.to_dict() for pt in heldout],
         "abi_rejection_points": [pt.to_dict() for pt in abi_rejections],
@@ -498,6 +506,7 @@ def verify_cliff_plan_integrity(plan_doc: Mapping[str, Any]) -> str:
         "target_id": plan_doc.get("target_id"),
         "family": plan_doc.get("family", ""),
         "sku": plan_doc.get("sku"),
+        "arch_preset": str(plan_doc.get("arch_preset") or ""),
         "campaign_id": plan_doc.get("campaign_id", ""),
         "cold_ring_l2_multiplier": plan_doc.get("cold_ring_l2_multiplier"),
         "train_points": list(plan_doc.get("train_points") or ()),

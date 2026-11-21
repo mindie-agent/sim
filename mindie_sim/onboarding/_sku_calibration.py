@@ -27,15 +27,22 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
+from contextvars import ContextVar
 from copy import deepcopy
 import hashlib
+import importlib
 import json
 from pathlib import Path
 import re
+import threading
 from typing import Any
 
-from mindie_sim.backends import ascend, ascend_profiles
+import mindie_sim.backends as _backends_pkg
+from mindie_sim.backends import ascend
+import mindie_sim.compose_inputs as _compose_inputs_mod
 from mindie_sim.primitives.loader import default_primitives_dir
+
+_ascend_mod = importlib.import_module("mindie_sim.backends.ascend")
 from mindie_sim.primitives.schema import parse_primitive_table
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.hardware import Hardware
@@ -100,24 +107,71 @@ def _read_bounded_json_and_sha256(path: Path) -> tuple[Any, str]:
     return parsed, hashlib.sha256(raw_bytes).hexdigest()
 
 
+_BASE_ASCEND_PROFILES = _ascend_mod.profiles
+_SCOPED_SCAFFOLD_PROFILES: ContextVar[tuple[tuple[str, Mapping[str, Any]], ...]] = ContextVar(
+    "mindie_sim_onboarding_scoped_scaffold_profiles", default=()
+)
+_PROFILE_HOOK_LOCK = threading.Lock()
+_PROFILE_HOOK_INSTALLED = False
+
+
+def _scoped_ascend_profiles() -> dict[str, Any]:
+    """Return immutable base profiles overlaid with current execution context's scaffolds."""
+    base = _BASE_ASCEND_PROFILES()
+    scoped = _SCOPED_SCAFFOLD_PROFILES.get()
+    if not scoped:
+        return base
+    merged = dict(base)
+    for sku_key, prof_val in scoped:
+        merged[sku_key] = prof_val
+    return merged
+
+
+def _ensure_scoped_profiles_hook() -> None:
+    global _PROFILE_HOOK_INSTALLED
+    if _PROFILE_HOOK_INSTALLED:
+        return
+    with _PROFILE_HOOK_LOCK:
+        if _PROFILE_HOOK_INSTALLED:
+            return
+        _ascend_mod.profiles = _scoped_ascend_profiles
+        _backends_pkg.ascend_profiles = _scoped_ascend_profiles
+        _compose_inputs_mod.ascend_profiles = _scoped_ascend_profiles
+        _PROFILE_HOOK_INSTALLED = True
+
+
+def resolve_sku_profile(
+    sku: str,
+    profile_override: Mapping[str, Any] | None = None,
+) -> Mapping[str, Any] | None:
+    """Resolve ``sku`` from explicit override, current context scaffold, or base ``ascend.json``."""
+    if profile_override is not None:
+        return profile_override
+    for sku_key, prof_val in reversed(_SCOPED_SCAFFOLD_PROFILES.get()):
+        if sku_key == sku:
+            return prof_val
+    base = _BASE_ASCEND_PROFILES()
+    found = base.get(sku)
+    return found if isinstance(found, Mapping) else None
+
+
 @contextmanager
 def temporary_scaffold_profile(
     sku: str,
     profile_override: Mapping[str, Any] | None,
 ) -> Iterator[None]:
-    """Temporarily expose a scaffolded new-SKU profile to the canonical sealer."""
+    """Expose a scaffolded SKU profile strictly within the current execution context (zero global mutation)."""
     if profile_override is None:
         yield
         return
-    reg = ascend_profiles()
-    already_present = sku in reg
-    if not already_present:
-        reg[sku] = deepcopy(dict(profile_override))
+    _ensure_scoped_profiles_hook()
+    snapshot = deepcopy(dict(profile_override))
+    prev = _SCOPED_SCAFFOLD_PROFILES.get()
+    token = _SCOPED_SCAFFOLD_PROFILES.set((*prev, (sku, snapshot)))
     try:
         yield
     finally:
-        if not already_present:
-            reg.pop(sku, None)
+        _SCOPED_SCAFFOLD_PROFILES.reset(token)
 
 
 def materialize_sku_hardware(
@@ -375,7 +429,7 @@ def _collect_l0_and_fabric_under_lease(
         elif l0_runner is not None:
             raw_l0 = unwrap_capture_envelope(dict(l0_runner(sku, int(l0_budget_s))))
         elif live_bench:
-            prof_entry = profile_override if profile_override is not None else ascend_profiles().get(sku)
+            prof_entry = resolve_sku_profile(sku, profile_override)
             dies_per_pkg = max(1, int((prof_entry or {}).get("dies_per_package", 1)))
             raw_l0 = run_live_l0_bench_subprocess(
                 sku=sku, endpoint_alias=endpoint_alias, campaign_id=campaign_id,
@@ -547,10 +601,13 @@ def calibrate_l0_and_fabric(
     return result
 
 
+_ensure_scoped_profiles_hook()
+
 __all__ = [
     "calibrate_l0_and_fabric",
     "check_cann_version_consistency",
     "materialize_sku_hardware",
+    "resolve_sku_profile",
     "temporary_scaffold_profile",
     "unwrap_capture_envelope",
 ]

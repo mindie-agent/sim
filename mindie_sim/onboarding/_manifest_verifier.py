@@ -159,6 +159,7 @@ def _parse_manifest_cases(
         clock_op = resolve_authoritative_clock_operator(row, cid, plan_pt=plan_pt)
         payload["clock_operator"] = clock_op
         if plan_pt is not None:
+            payload["is_planned"] = True
             payload.setdefault("axis", str(plan_pt.get("axis") or ""))
             payload.setdefault("value", int(plan_pt["value"]))
         raw_copy["payload"] = payload

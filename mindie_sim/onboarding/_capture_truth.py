@@ -341,6 +341,10 @@ def _collect_capture_evidence(containers: Sequence[Mapping[str, Any]]) -> dict[s
             rid = str(cont.get("run_id") or cont.get("run_uid") or "").strip()
             if rid:
                 ev["run_id"] = rid
+        if "acquisition_root" not in ev:
+            acq = str(cont.get("acquisition_root") or cont.get("acquisition_uid") or "").strip()
+            if acq:
+                ev["acquisition_root"] = acq
         if "status" not in ev and cont.get("status") is not None:
             ev["status"] = str(cont["status"]).strip().lower()
         if "level" not in ev:
@@ -379,6 +383,7 @@ def _verify_capture_container_invariants(
     seen_levels: set[str] = set()
     seen_cids: set[str] = set()
     seen_splits: set[str] = set()
+    seen_acqs: set[str] = set()
     cap_busy: int | None = None
     cap_elapsed: int | None = None
     for cont in containers:
@@ -405,6 +410,9 @@ def _verify_capture_container_invariants(
         c_sp = str(cont.get("split") or "").strip().lower()
         if c_sp:
             seen_splits.add(c_sp)
+        c_acq = str(cont.get("acquisition_root") or cont.get("acquisition_uid") or "").strip()
+        if c_acq:
+            seen_acqs.add(c_acq)
         c_busy = _positive_int_ns(cont.get("busy_union_ns"))
         c_elapsed = _positive_int_ns(cont.get("elapsed_span_ns"))
         if c_busy is not None and c_elapsed is not None and c_busy > c_elapsed:
@@ -426,6 +434,10 @@ def _verify_capture_container_invariants(
         raise ModelingError(f"capture_split_missing:{cid}")
     if len(seen_splits) > 1:
         raise ModelingError(f"capture_split_conflict:{cid}:{sorted(seen_splits)}")
+    if require_identity and not seen_acqs:
+        raise ModelingError(f"capture_acquisition_root_missing:{cid}")
+    if len(seen_acqs) > 1:
+        raise ModelingError(f"capture_acquisition_root_conflict:{cid}:{sorted(seen_acqs)}")
     if cap_busy is not None and cap_elapsed is not None and cap_busy > cap_elapsed:
         raise ModelingError(
             f"capture_busy_union_exceeds_elapsed_span:{cid}:busy={cap_busy}:elapsed={cap_elapsed}"
@@ -607,6 +619,14 @@ def reverify_report_captures(
         cap_run = str(cap_ev.get("run_id") or "").strip()
         if cap_run and cap_run != run_uid and sanitize_public_run_id(cap_run) != run_uid:
             raise ModelingError(f"capture_run_id_mismatch:{cid}:capture={cap_run}:report={run_uid}")
+        cap_acq = str(cap_ev.get("acquisition_root") or "").strip()
+        if cap_acq and cap_acq != acq:
+            raise ModelingError(f"capture_acquisition_root_mismatch:{cid}:capture={cap_acq}:report={acq}")
+        if row_lvl in {"L2", "L3"}:
+            if not cap_ev.get("timed_nodes"):
+                raise ModelingError(f"capture_timed_nodes_missing:{cid}:level={row_lvl}")
+            if not isinstance(cap_ev.get("actual_shape"), Mapping) or not cap_ev.get("actual_shape"):
+                raise ModelingError(f"capture_actual_shape_missing:{cid}:level={row_lvl}")
         row_ns = int(row.get("measured_ns") or 0)
         if row_ns != cap_ns:
             raise ModelingError(
@@ -700,31 +720,27 @@ def verify_capture_and_override_case(
         return gc, False, row_p99_ns
     if cap_ns is not None:
         if int(gc.measured_ns) != cap_ns:
-            raise ModelingError(
-                f"capture_measured_duration_mismatch:{gc.case_id}:capture={cap_ns}:row={gc.measured_ns}"
-            )
+            raise ModelingError(f"capture_measured_duration_mismatch:{gc.case_id}:capture={cap_ns}:row={gc.measured_ns}")
         gc = replace(gc, measured_ns=cap_ns)
     if cap_p99 is not None and row_p99_ns is not None and int(row_p99_ns) != cap_p99:
-        raise ModelingError(
-            f"capture_p99_mismatch:{gc.case_id}:capture={cap_p99}:row={int(row_p99_ns)}"
-        )
+        raise ModelingError(f"capture_p99_mismatch:{gc.case_id}:capture={cap_p99}:row={int(row_p99_ns)}")
     if cap_ev.get("level") and str(cap_ev["level"]) != str(gc.level).upper():
-        raise ModelingError(
-            f"capture_level_mismatch:{gc.case_id}:capture={cap_ev['level']}:row={gc.level}"
-        )
+        raise ModelingError(f"capture_level_mismatch:{gc.case_id}:capture={cap_ev['level']}:row={gc.level}")
     if cap_ev.get("sku") and str(cap_ev["sku"]) != str(gc.cohort.sku):
-        raise ModelingError(
-            f"capture_sku_mismatch:{gc.case_id}:capture={cap_ev['sku']}:row={gc.cohort.sku}"
-        )
+        raise ModelingError(f"capture_sku_mismatch:{gc.case_id}:capture={cap_ev['sku']}:row={gc.cohort.sku}")
     if cap_ev.get("split") and str(cap_ev["split"]) != str(gc.split).lower():
-        raise ModelingError(
-            f"capture_split_mismatch:{gc.case_id}:capture={cap_ev['split']}:row={gc.split}"
-        )
+        raise ModelingError(f"capture_split_mismatch:{gc.case_id}:capture={cap_ev['split']}:row={gc.split}")
     cap_run = str(cap_ev.get("run_id") or "").strip()
     if cap_run and cap_run != gc.boundary.run_uid and sanitize_public_run_id(cap_run) != gc.boundary.run_uid:
-        raise ModelingError(
-            f"capture_run_id_mismatch:{gc.case_id}:capture={cap_run}:row={gc.boundary.run_uid}"
-        )
+        raise ModelingError(f"capture_run_id_mismatch:{gc.case_id}:capture={cap_run}:row={gc.boundary.run_uid}")
+    cap_acq = str(cap_ev.get("acquisition_root") or "").strip()
+    if cap_acq and cap_acq != gc.boundary.acquisition_uid:
+        raise ModelingError(f"capture_acquisition_root_mismatch:{gc.case_id}:capture={cap_acq}:row={gc.boundary.acquisition_uid}")
+    if require_capture_files and str(gc.level).upper() in {"L2", "L3"}:
+        if not cap_ev.get("timed_nodes"):
+            raise ModelingError(f"capture_timed_nodes_missing:{gc.case_id}:level={gc.level}")
+        if not isinstance(cap_ev.get("actual_shape"), Mapping) or not cap_ev.get("actual_shape"):
+            raise ModelingError(f"capture_actual_shape_missing:{gc.case_id}:level={gc.level}")
     payload_map = dict(gc.payload)
     payload_changed = False
     for skey in ("target_family", "target_op_id"):

@@ -316,8 +316,10 @@ def _seal_normalized_entry(
         }
         row_phase = str(first.get("phase") or ident.get("phase") or "decode")
 
+    acq_root = sanitize_public_run_id(acq_id) if acq_id else f"acq-{split}-{pub_run_id}"
     cap_payload: dict[str, Any] = {
-        "case_id": cid, "run_id": pub_run_id, "split": split, "level": level,
+        "case_id": cid, "run_id": pub_run_id, "acquisition_root": acq_root,
+        "split": split, "level": level,
         "sku": str(first.get("sku") or sku),
         "clock_domain": "device_monotonic", "clock_operator": clock_op,
         "start_event": "k_start", "end_event": "k_end",
@@ -341,7 +343,6 @@ def _seal_normalized_entry(
     if capture_out_dir is not None:
         write_atomic_bytes(Path(capture_out_dir) / f"{raw_sha}.json", cap_bytes)
 
-    acq_root = sanitize_public_run_id(acq_id) if acq_id else f"acq-{split}-{pub_run_id}"
     row_out: dict[str, Any] = {
         "case_id": cid, "point_id": cid, "sku": str(first.get("sku") or sku),
         "split": split, "level": level, "phase": row_phase,

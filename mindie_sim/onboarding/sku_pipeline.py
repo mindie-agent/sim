@@ -32,7 +32,6 @@ from pathlib import Path
 import tempfile
 from typing import Any, Literal
 
-from mindie_sim.backends import ascend_profiles
 from mindie_sim.observations.multilevel_gate import EvaluationRunner
 from mindie_sim.primitives.schema import PrimitiveTable, parse_primitive_table
 from mindie_sim.schema.common import ModelingError
@@ -65,6 +64,7 @@ from ._sealed_scorer import (
 from ._sku_calibration import (
     calibrate_l0_and_fabric,
     materialize_sku_hardware,
+    resolve_sku_profile,
     temporary_scaffold_profile,
 )
 from ._soc_probe import (
@@ -507,7 +507,7 @@ def verify_sku_gates(
     gates: list[GateCheckOutcome] = []
     artifacts: dict[str, str] = {}
 
-    sku_registered = sku in ascend_profiles() or profile_override is not None
+    sku_registered = resolve_sku_profile(sku, profile_override) is not None
     gates.append(
         GateCheckOutcome(
             name="sku_profile_registered", passed=sku_registered,
