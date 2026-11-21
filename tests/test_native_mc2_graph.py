@@ -6,7 +6,7 @@ import pytest
 
 from mindie_sim import graph_costs, predict, target_graphs
 from mindie_sim.prediction.mc2_phase import contract
-from test_joint_collective_execution import cohort_case, wire
+from _support.collective_cases import cohort_case, wire
 
 
 def case(window=8):

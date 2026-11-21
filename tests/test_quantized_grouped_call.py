@@ -22,7 +22,7 @@ from mindie_sim.prediction.engine import Engine, Resource
 from mindie_sim.prediction.mechanism import Work
 from mindie_sim.prediction.program import RecipeContext
 from mindie_sim.schema.common import ModelingError
-from test_capture_adapters import grouped_protocol
+from _support.captures import grouped_protocol
 
 
 ROOT = Path(__file__).resolve().parents[1]

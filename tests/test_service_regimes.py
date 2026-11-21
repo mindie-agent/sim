@@ -7,11 +7,11 @@ import pytest
 from mindie_sim import graph_costs, operator_costs, predict
 from mindie_sim.prediction.mechanism import OperatorPlan, PlannedRecipe, Work
 from mindie_sim.prediction.program import KernelProgram, RecipeBook, Stage
-from test_device_kernel_groups import fork
+from _support.kernel_invocation import fork
 from test_graph_analysis import op
-from test_invocation_binding import lower_copy
+from _support.kernel_invocation import lower_copy
 from test_mechanism_contract import hardware_case
-from test_resource_services import copy_op
+from _support.kernel_invocation import copy_op
 
 
 def declared(rule, raw=None):

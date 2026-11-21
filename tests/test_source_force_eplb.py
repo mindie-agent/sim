@@ -10,7 +10,7 @@ from mindie_sim import graph_costs, target_graphs
 from mindie_sim.prediction.mc2_graph import NETWORK
 from mindie_sim.prediction.mc2_phase import contract
 from mindie_sim.prediction.source_force_eplb import ledger
-from test_joint_collective_execution import wire
+from _support.collective_cases import wire
 
 ROOT = Path(__file__).resolve().parents[1]
 

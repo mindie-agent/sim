@@ -126,7 +126,7 @@ def test_context_changes_actual_kv_traffic_and_supply_bottleneck_without_refitti
 
 
 def test_two_instruction_modes_on_one_pipe_add_before_overlapping_other_resources():
-    from test_resource_services import copy_op
+    from _support.kernel_invocation import copy_op
 
     raw = geometry_case(1)
     raw["machine"]["device"]["service_modes"] = {

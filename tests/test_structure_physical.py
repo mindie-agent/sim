@@ -104,7 +104,7 @@ def test_family_service_identity_still_distinguishes_kernel_recipe_names():
     from mindie_sim.prediction.services import service_identity
     from mindie_sim.prediction.structure import parse_case
     from test_mechanism_contract import hardware_case
-    from test_resource_services import copy_op, curve
+    from _support.kernel_invocation import copy_op, curve
 
     case = parse_case(hardware_case())
     first = copy_op()

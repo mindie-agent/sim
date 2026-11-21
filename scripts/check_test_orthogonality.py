@@ -29,6 +29,8 @@ from pathlib import Path
 
 GIT_TIMEOUT_S = 60
 HARD_MAX_LINES = 800
+#: Hard ceiling on manifest modules: 74 legacy-consolidation slots + new-mechanism headroom.
+MODULE_CEILING = 96
 LITERAL_ENUM_MIN = 8
 PROCESS = re.compile(
     r"^(issues?\d*|gh\d+|pr\d+|open|r\d+|round\d+|pass\d+|fix\d+|finding\d+|iter\d+"
@@ -91,11 +93,11 @@ def load_manifest(tests: Path) -> dict:
     if data.get("schema_version") != 1:
         raise ManifestError(f"{path}: schema_version must be 1, got {data.get('schema_version')!r}")
     max_lines = _pos_int(data.get("max_lines", 600), "max_lines")
-    max_modules = _pos_int(data.get("max_modules", 80), "max_modules")
+    max_modules = _pos_int(data.get("max_modules", MODULE_CEILING), "max_modules")
     if max_lines >= HARD_MAX_LINES:
         raise ManifestError(f"max_lines ({max_lines}) must be < {HARD_MAX_LINES}")
-    if max_modules > 80:
-        raise ManifestError(f"max_modules ({max_modules}) must be <= 80")
+    if max_modules > MODULE_CEILING:
+        raise ManifestError(f"max_modules ({max_modules}) must be <= {MODULE_CEILING}")
     modules = {}
     for entry in data.get("module", []):
         if not isinstance(entry, dict):

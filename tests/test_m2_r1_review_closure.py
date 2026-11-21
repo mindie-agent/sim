@@ -141,60 +141,9 @@ def test_pooled_indexer_cold_scan_charges_visited_pool_rows():
 # --------------------------------------------------------------------------- #
 # [P1 #3] Shared-prefix replacement keeps query/output traffic.
 # --------------------------------------------------------------------------- #
-def test_shared_prefix_component_replacement_preserves_query_output():
-    views = tuple(
-        SimpleNamespace(
-            request_id=str(index), q_len=QUERY_ROWS, context=SHARED_PREFIX_ROWS,
-            prefix_tokens=SHARED_PREFIX_ROWS, prefix_key="shared",
-            kv_len=SHARED_PREFIX_ROWS + QUERY_ROWS, phase="prefill")
-        for index in range(2))
-    q_read = QO_BYTES // 2
-    out_write = QO_BYTES // 2
-    kv_precharged = 2 * (SHARED_PREFIX_ROWS + QUERY_ROWS) * SHARED_ROW_BYTES
-    op = OpSpec(
-        "attention", "attention", "prefill", 0, 0, ("r",),
-        (QUERY_ROWS, SHARED_PREFIX_ROWS + QUERY_ROWS, 1, 1),
-        (QUERY_ROWS, SHARED_PREFIX_ROWS + QUERY_ROWS, 1, 1),
-        (QUERY_ROWS, SHARED_PREFIX_ROWS + QUERY_ROWS, 1, 1),
-        (QUERY_ROWS, SHARED_PREFIX_ROWS + QUERY_ROWS, 1, 1),
-        hbm_bytes=kv_precharged + QO_BYTES,
-        mte2_bytes=kv_precharged + q_read, mte3_bytes=out_write,
-        recipe="flash_attention")
-    runtime = SimpleNamespace(prefix_cache_mode="shared", prefix_read_mode="auto")
-    updated = apply_attention_prefix_reads(
-        op, views=views, sweeps_by_view=(SHARED_PREFIX_ROWS + QUERY_ROWS,) * 2,
-        shared_sweeps_by_view=(SHARED_PREFIX_ROWS,) * 2,
-        row_bytes=SHARED_ROW_BYTES, layer_index=0, runtime=runtime,
-        kernel_reuse="tile", allow_recipe_rebind=False,
-        kv_hbm_bytes=kv_precharged, kv_mte2_bytes=kv_precharged)
-    cold_kv = (SHARED_PREFIX_ROWS + 2 * QUERY_ROWS) * SHARED_ROW_BYTES
-    assert updated.hbm_bytes == pytest.approx(cold_kv + QO_BYTES)
-    assert updated.hbm_bytes - cold_kv == pytest.approx(QO_BYTES)
-    assert updated.mte3_bytes == pytest.approx(out_write)
-    # MTE2 keeps every per-tile refill; only the external HBM fill unions.
-    assert updated.mte2_bytes == pytest.approx(kv_precharged + q_read)
-
-
 # --------------------------------------------------------------------------- #
 # [P1 #4] Private refills survive in MTE2 and split pipes are bound.
 # --------------------------------------------------------------------------- #
-def test_split_mte2_pipes_receive_private_refill_service():
-    case = _a5_case(
-        "deepseek-v3.2", tp=8, ep=1, dp=1, pp=1, layers=1,
-        prompt_tokens=512, output_tokens=2, concurrency=1)
-    ops = target_operators(
-        case, phase="decode", tokens=1, context=4096, sequences=1, scope="body")
-    attention = next(op for op in ops if op.family == "attention")
-    traffic = dict(dict(attention.metadata)["attention_traffic_plan"])
-    assert attention.mte2_bytes >= traffic["private_refill_bytes"]
-    row = operator_costs(case, (attention,), input_ready_ms=7)["operators"][0]
-    assert row["serviced"]["mte2_aic@r0:s0"] == pytest.approx(
-        attention.mte2_bytes)
-    norm = next(op for op in ops if op.family in {"rmsnorm", "add_rmsnorm"})
-    norm_row = operator_costs(case, (norm,), input_ready_ms=7)["operators"][0]
-    assert norm_row["serviced"].get("mte2_aiv@r0:s0", 0.0) > 0.0
-
-
 # --------------------------------------------------------------------------- #
 # [P1 #5] The native PoolKeyIndexer declares its own score algebra.
 # --------------------------------------------------------------------------- #
@@ -241,23 +190,6 @@ def test_sampling_and_acceptance_are_vector_families_and_control_rejects_work():
 # --------------------------------------------------------------------------- #
 # [P1 #7] Each physical resource conserves its own work across phases.
 # --------------------------------------------------------------------------- #
-def test_asymmetric_link_work_is_not_redistributed_between_resources():
-    op = OpSpec("collective", "allreduce", "decode", 0, 0, (), (), (), (), ())
-    context = SimpleNamespace(
-        op=op,
-        work={"link:a": 9_000_000.0, "link:b": 1_000_000.0},
-        resource_names={"link": "link"},
-    )
-    phases = (Phase("first", {"link": 0.5}), Phase("second", {"link": 0.5}))
-    amounts = _phase_amounts(context, phases)
-    assert amounts[0]["link:a"] == pytest.approx(4_500_000.0)
-    assert amounts[1]["link:a"] == pytest.approx(4_500_000.0)
-    assert amounts[0]["link:b"] == pytest.approx(500_000.0)
-    assert amounts[1]["link:b"] == pytest.approx(500_000.0)
-    assert sum(row.get("link:a", 0.0) for row in amounts) == pytest.approx(9e6)
-    assert sum(row.get("link:b", 0.0) for row in amounts) == pytest.approx(1e6)
-
-
 # --------------------------------------------------------------------------- #
 # [P1 #8] Split-K executes each FLOP once and charges GM partials.
 # --------------------------------------------------------------------------- #
@@ -359,43 +291,9 @@ def test_public_link_utilization_uses_matching_physical_capacity(world_size):
 # --------------------------------------------------------------------------- #
 # [P1 #11] Occurrence critical path keeps serial chains and multiplicity.
 # --------------------------------------------------------------------------- #
-def test_serial_hbm_then_cube_critical_path_is_thirty_ms():
-    graph = graph_from_occurrences((
-        {"id": "load", "hbm_ms": 10.0, "predecessors": ()},
-        {"id": "compute", "cube_ms": 20.0, "predecessors": ("load",)},
-    ))
-    result = critical_path_roofline(
-        graph, RooflineTargets(cube=1.0, vector=1.0, hbm=1.0, link=1.0))
-    assert result.critical_path_ideal_ms == pytest.approx(30.0)
-    assert result.physical_ideal_ms == pytest.approx(30.0)
-
-
-def test_repeated_occurrences_keep_full_multiplicity():
-    graph = graph_from_occurrences(tuple(
-        {"id": f"copy{index}", "hbm_ms": 1.0,
-         "predecessors": (() if index == 0 else (f"copy{index - 1}",))}
-        for index in range(3)))
-    result = critical_path_roofline(
-        graph, RooflineTargets(cube=1.0, vector=1.0, hbm=1.0, link=1.0))
-    assert result.critical_path_ideal_ms == pytest.approx(3.0)
-    assert result.resource_totals["hbm"] == pytest.approx(3.0)
-
-
 # --------------------------------------------------------------------------- #
 # [P1 #12] Four-clock attribution keeps serial cube and memory time.
 # --------------------------------------------------------------------------- #
-def test_serial_cube_and_memory_service_are_both_reported():
-    graph = graph_from_occurrences((
-        {"id": "cube", "cube_ms": 1.0, "predecessors": ()},
-        {"id": "memory", "hbm_ms": 1.0, "predecessors": ("cube",)},
-    ))
-    attribution = attribute_stage_dag(graph, duration_ms=2.0)
-    assert attribution["available"] is True
-    assert attribution["buckets"]["cube"]["exposed_ms"] == pytest.approx(1.0)
-    assert attribution["buckets"]["hbm"]["exposed_ms"] == pytest.approx(1.0)
-    assert attribution["terminal_clocks"].all_ms == pytest.approx(2.0)
-
-
 # --------------------------------------------------------------------------- #
 # [P1 #13] Locked sweeps retain the complete baseline plan.
 # --------------------------------------------------------------------------- #

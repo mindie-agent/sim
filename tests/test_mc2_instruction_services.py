@@ -132,7 +132,7 @@ def test_public_device_services_reach_real_joint_groups_once_and_preserve_wire()
     from dataclasses import replace
     from mindie_sim import target_graphs,graph_costs
     from test_native_mc2_graph import case
-    from test_joint_collective_execution import wire
+    from _support.collective_cases import wire
     results=[]
     for factor in (.5,1,2):
         raw=case()

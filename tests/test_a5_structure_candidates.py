@@ -617,7 +617,7 @@ def test_a5_quantize_produces_payload_scale_and_consumer_binds_real_ports(a5_rep
 
 def test_operator_accounting_consumes_selected_transport_options():
     from mindie_sim.prediction.operator_analysis import operator_costs
-    from test_a5_topology_communication_slice import case as topology_case, exchange
+    from _support.collective_cases import case as topology_case, exchange
 
     raw = topology_case(tp=2, dp=1)
     raw["machine"]["links"][0].update(

@@ -6,7 +6,7 @@ import pytest
 
 from mindie_sim.prediction.moe_init_instructions import source_operations
 from test_moe_init_mxfp8 import case, graph, RECIPE
-from test_source_scalar_services import execute
+from _support.kernel_invocation import execute
 
 
 def declared(raw, intervals):

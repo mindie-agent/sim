@@ -8,7 +8,7 @@ from mindie_sim.prediction.index_pool import selection
 from mindie_sim.prediction.lowering import Builder
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.workload import RequestView
-from test_index_pool import case as pool_case
+from _support.memory_cases import index_pool_case as pool_case
 from test_prediction_system import case
 
 

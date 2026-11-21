@@ -11,7 +11,7 @@ from mindie_sim.prediction.operators.mc2_mx_quant import mx32_work
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError
 from test_native_mc2_graph import case as base_case
-from test_joint_collective_execution import wire
+from _support.collective_cases import wire
 
 
 def case(quant="mx", width=512):

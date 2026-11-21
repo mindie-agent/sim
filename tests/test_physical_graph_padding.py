@@ -1,7 +1,7 @@
 """Idle graph rows are physical capture rows, not logical requests."""
 from __future__ import annotations
 
-from tests.test_joint_collective_observation import cohort_case
+from _support.collective_cases import cohort_case
 from mindie_sim.prediction.operator_analysis import target_graphs
 
 

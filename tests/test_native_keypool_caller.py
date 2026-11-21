@@ -9,7 +9,7 @@ from mindie_sim.catalog.weights import layer_weight_terms
 from mindie_sim.catalog.weight_terms import term_bytes
 from mindie_sim.prediction.index_pool_native import IMPLEMENTATION
 from mindie_sim.prediction.structure import parse_case
-from test_index_pool import case, layer
+from _support.memory_cases import index_pool_case as case, index_pool_layer as layer
 
 
 def native_case(tail_capacity=9):

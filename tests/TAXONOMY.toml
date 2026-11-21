@@ -1,11 +1,12 @@
 # Product-orthogonal test taxonomy (Vol 6 §2). Consumed by scripts/check_test_orthogonality.py.
 # Every tests/<domain>/test_*.py must be listed here; `reserved = true` marks modules planned for a
-# later shard (may be absent until `--strict`). max_modules is a hard ceiling (74 required + overflow).
+# later shard (may be absent until `--strict`). max_modules = 96: 74 legacy-consolidation slots plus
+# headroom for genuinely new mechanisms (Stage-2 physics, Stage-3A L0/remote/templates, Stage-3B).
 schema_version = 1
 domains = ["schema", "runtime", "collectives", "operators", "spine", "serving", "observations", "product", "hygiene"]
 support_dirs = ["_support", "_oracles", "fixtures", "runtime/native"]
 max_lines = 600
-max_modules = 80
+max_modules = 96
 
 # ---------------------------------------------------------------- schema (hardware, datapath, catalog)
 [[module]]
@@ -32,24 +33,36 @@ owns = [
 ]
 
 [[module]]
+path = "schema/test_model_catalog_conservation.py"
+tier = "tier0"
+# 39-model independent conservation vs tests/_oracles, fleet catalog, HF role exclusion (S2b remainder)
+
+[[module]]
 path = "schema/test_hf_config_adapters.py"
 tier = "tier0"
-reserved = true
+
+[[module]]
+path = "schema/test_hf_standard_families.py"
+tier = "tier0"
+# standard Qwen/Kimi/DeepSeek/GLM HF adapters vs independent config oracles (S2b split of HF adapters)
 
 [[module]]
 path = "schema/test_kv_cache_geometry.py"
 tier = "tier0"
-reserved = true
 
 [[module]]
 path = "schema/test_quantization_contracts.py"
 tier = "tier0"
-reserved = true
 
 [[module]]
 path = "schema/test_deployment_and_workload.py"
 tier = "tier0"
+
+[[module]]
+path = "schema/test_l0_primitives.py"
+tier = "tier0"
 reserved = true
+# L0 micro-primitive schema/loader/lowering (s3a-remote-l0)
 
 # ---------------------------------------------------------------- runtime (Engine, C11, memory physics)
 [[module]]
@@ -106,22 +119,54 @@ owns = ["mindie_sim/prediction/matrix.py", "mindie_sim/prediction/scheduling.py"
 [[module]]
 path = "runtime/test_memory_ledger_and_capacity.py"
 tier = "tier0"
-reserved = true
+
+[[module]]
+path = "runtime/test_capacity_allocation_geometry.py"
+tier = "tier0"
+# allocation-vs-valid-vs-access geometry, KVPageAllocation, AllocationPlan joint peak, admission (S2d)
+
+[[module]]
+path = "runtime/test_async_memory_retention.py"
+tier = "tier0"
+# async-consumer holds/retirement, delayed release, async_scheduling headroom, staging residency (S2d)
 
 [[module]]
 path = "runtime/test_kv_cache_datapath.py"
 tier = "tier0"
-reserved = true
+
+[[module]]
+path = "runtime/test_kv_cache_execution.py"
+tier = "tier0"
+# Engine-bound CacheExecution/CacheAccessProgram/CacheLowering DAG, ports, Builder row ABI (S2d)
 
 [[module]]
 path = "runtime/test_offload_tiers.py"
 tier = "tier0"
-reserved = true
 
 [[module]]
 path = "runtime/test_invocation_boundary.py"
 tier = "tier0"
+
+[[module]]
+path = "runtime/test_resource_services_and_exposed_time.py"
+tier = "tier0"
+# shared-capacity services, private/shared traffic, roofline, four-clock exposed attribution (S2d)
+
+[[module]]
+path = "runtime/test_kernel_groups_and_transfers.py"
+tier = "tier0"
+# kernel-group buffers/phase DAGs, finite transfers, pipeline-program reference (S2d)
+
+[[module]]
+path = "runtime/test_fragment_executor.py"
+tier = "tier0"
+# common fragment executor, event ports/preflight, state visibility ledger, stage conductors (S2d)
+
+[[module]]
+path = "runtime/test_remote_exec.py"
+tier = "tier0"
 reserved = true
+# remote-first CPU execution dispatcher (s3a-remote-l0)
 
 [[module]]
 path = "runtime/test_formal_lean_locks.py"
@@ -150,17 +195,29 @@ owns = [
 [[module]]
 path = "collectives/test_collective_startup_and_bands.py"
 tier = "tier0"
-reserved = true
 
 [[module]]
 path = "collectives/test_hccl_algorithms.py"
 tier = "tier0"
-reserved = true
 
 [[module]]
 path = "collectives/test_collective_volume_conservation.py"
 tier = "tier0"
-reserved = true
+
+[[module]]
+path = "collectives/test_network_links_and_fabric.py"
+tier = "tier0"
+# physical links, switch fabric incast, configurable multi-tier network, die/package topology (S2e)
+
+[[module]]
+path = "collectives/test_hccl_expansion_templates.py"
+tier = "tier0"
+# on-device AIV/CCU/AICPU expansion templates, group buffers, observed call (S2e split of HCCL)
+
+[[module]]
+path = "collectives/test_joint_cohort_execution.py"
+tier = "tier0"
+# joint cross-DP plans, pairwise cohort schedule, rendezvous/observation, joint native service (S2e)
 
 # ---------------------------------------------------------------- operators (1-to-1 with operators/<family>/)
 [[module]]
@@ -288,6 +345,12 @@ path = "operators/test_custom_op_libraries.py"
 tier = "tier0"
 reserved = true
 
+[[module]]
+path = "operators/test_catlass_and_dsl_templates.py"
+tier = "tier0"
+reserved = true
+# CATLASS K2 + cannbot-dsl K3 template catalog (s3a-linear-templates)
+
 # ---------------------------------------------------------------- spine (PredictionSpine)
 [[module]]
 path = "spine/test_stream_plan.py"
@@ -355,6 +418,12 @@ path = "serving/test_sku_and_candidate_studies.py"
 tier = "tier0"
 reserved = true
 
+[[module]]
+path = "serving/test_primal_dual_optimality.py"
+tier = "tier0"
+reserved = true
+# Stage-3B primal-dual / optimality certificate
+
 # ---------------------------------------------------------------- observations
 [[module]]
 path = "observations/test_multilevel_gate.py"
@@ -368,7 +437,6 @@ owns = [
 [[module]]
 path = "observations/test_capture_ingestion.py"
 tier = "tier0"
-reserved = true
 
 [[module]]
 path = "observations/test_communication_observations.py"
@@ -379,12 +447,20 @@ owns = ["mindie_sim/observations/communication"]
 [[module]]
 path = "observations/test_resource_phase_calibration.py"
 tier = "tier0"
-reserved = true
+
+[[module]]
+path = "observations/test_resource_counterfactuals.py"
+tier = "tier0"
+# fixed-plan rate/capacity counterfactuals, pipe roofline bounds, candidate/SLA feedback (S2f)
 
 [[module]]
 path = "observations/test_scoreboards_and_cohorts.py"
 tier = "tier0"
-reserved = true
+
+[[module]]
+path = "observations/test_model_scoreboards.py"
+tier = "tier0"
+# model scoreboards, scoreboard accuracy/refresh, and coverage inventory contracts (S2f split)
 
 # ---------------------------------------------------------------- product
 [[module]]
@@ -440,11 +516,6 @@ tier = "tier1"   # temporary git repositories for ci_scope + ratchet self-tests
 owns = ["scripts/check_test_orthogonality.py", ".github/scripts/ci_scope.py", "tests/_support/tempdirs.py"]
 
 # ---------------------------------------------------------------- pre-declared overflow splits (Vol 6 §2.6)
-[[module]]
-path = "operators/test_linear_attention_state_versions.py"
-tier = "tier0"
-reserved = true
-
 [[module]]
 path = "operators/test_grouped_moe_align.py"
 tier = "tier0"

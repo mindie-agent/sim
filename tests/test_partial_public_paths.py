@@ -7,7 +7,7 @@ import pytest
 from mindie_sim import predict, study
 from mindie_sim.model_catalog import CONFIG_DIR
 from mindie_sim.schema.model import ModelSpec
-from test_composable_models import config, run_case
+from _support.hf_configs import config, run_case
 from test_prediction_deployment import pd_case
 from test_study import PROBES
 
