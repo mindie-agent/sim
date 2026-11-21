@@ -460,6 +460,7 @@ def test_datacopy_concurrent_readers_wait_until_the_fill_delivers(backend):
     table = replace(table, primitives={**table.primitives, pid: replace(cell, metrics=metrics)})
     key = ReuseKey(0, "shared", 0)
     lowered = lower_primitive(pid, {"reuse_key": key, "copy_miss_bytes_per_ms": sector,
+                                   "sector_bytes": sector,
                                    "runs": (AddressRun(0, 1, sector, sector),)},
                               table, datapath=dp, memory_state=view, allow_uncalibrated_declaration=True)
     engine = Engine([Resource("mte2_aiv", sector / hit_ms), Resource("l2", sector / hit_ms)], backend=backend)
