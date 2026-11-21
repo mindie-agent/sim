@@ -12,6 +12,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from graphlib import CycleError, TopologicalSorter
+from heapq import merge
 from itertools import combinations
 from math import fsum, isclose, isfinite
 from typing import Literal
@@ -29,16 +30,17 @@ from mindie_sim.schema.common import ModelingError
 from .apply import (
     AppliedPlan, ResolvedScenario, SIMT_UB_CARVEOUT_BYTES, _check_stream, _convex, _die, _path, _solve_tiles, _successors, _topological,
 )
-from .schema import FuseRegion, HoistOrDeduplicate, QuantizeContract, SelectTemplate, _flat
+from .schema import FuseRegion, HoistOrDeduplicate, QuantizeContract, SelectTemplate, WeightPrefetch, _flat
 
 FAKE_OVERLAP_THRESHOLD_PCT = 5.0
 SHIPPING_REGRESSION_TOLERANCE_NS = 1000
 NS_PER_MS = 1_000_000
-SERVICE_CONSERVATION_REL_TOL = 1e-6
-SERVICE_CONSERVATION_ABS_TOL = 1e-12
+SERVICE_CONSERVATION_REL_TOL = 1e-12
+SERVICE_CONSERVATION_ABS_TOL = 1e-6
 _CAPACITY_POOLS = frozenset({"ub", "l1", "l0a", "l0b", "l0c", "l2", "hbm"})
 _NON_MATRIX_IMPLEMENTATIONS = frozenset({"TiledPointwise", "RingCollective", "PairwiseCollective"})
 _MATRIX_SERVICE_PREFIXES = ("matrix@", "cube@", "simt@")
+_COHORT_PREFIX = "rewrite_cohort"
 
 
 class SoundnessInversionError(ModelingError):
@@ -145,7 +147,7 @@ def _structure(scenario, applied):
                 raise ModelingError(f"NON_CONVEX_REGION:{region}")
             claimed.update(atoms)
             seen.add(region)
-        original_users = _successors(originals)
+        original_users = _successors(originals) if applied.in_place_aliases else {}
         replacements = {atom: region for region, atoms in regions.items()
                         if region in by_id for atom in atoms}
         for source, writer in applied.in_place_aliases:
@@ -183,6 +185,14 @@ def _capacity(die, pool, simt, path):
 class _ReplayEvaluation(StepEvaluation):
     execution_evidence: dict = field(default_factory=dict, repr=False)
     service_intervals: dict = field(default_factory=dict, repr=False)
+    cohort_intervals: dict = field(default_factory=dict, repr=False)
+    cohort_replicas: dict = field(default_factory=dict, repr=False)
+
+
+def _representative_cohorts(cohorts):
+    return {op_id: cohorts[replica, op_id] for replica, op_id in sorted(cohorts, reverse=True)}
+
+
 def _evaluation(scenario, graphs, report, graph_id, tier, prepared=None):
     index = {(replica, op.op_id): op for replica, ops in graphs.items() for op in ops}
     rows, occurrences = [], {}
@@ -190,7 +200,7 @@ def _evaluation(scenario, graphs, report, graph_id, tier, prepared=None):
         replica, op_id, stage = row["replica"], row["op_id"], row["stage"]
         rank = _die(scenario, replica, stage).rank
         occurrences[row["id"]] = OpOccurrence(replica, stage, rank, op_id)
-    service = defaultdict(list)
+    service, cohorts = defaultdict(list), defaultdict(lambda: defaultdict(list))
     for event in report.get("events", ()):
         if not event.get("serviced"):
             continue
@@ -203,7 +213,14 @@ def _evaluation(scenario, graphs, report, graph_id, tier, prepared=None):
         for count in range(len(keys), 0, -1):
             node = (int(replica[1:]), ":".join(keys[:count])) if replica[1:].isdigit() else None
             if node in index:
-                service[node].append((event["start_ms"], event["end_ms"]))
+                span = (event["start_ms"], event["end_ms"])
+                service[node].append(span)
+                suffix = keys[count:]
+                if suffix and suffix[0] == "body":
+                    suffix = suffix[1:]
+                prefix, _, cohort = (suffix[0] if suffix else "").rpartition("_")
+                if prefix == _COHORT_PREFIX and cohort in {"0", "1"}:
+                    cohorts[node][int(cohort)].append(span)
                 break
     for ordinal, row in enumerate(report["timeline"]):
         occ = occurrences[row["id"]]
@@ -222,23 +239,37 @@ def _evaluation(scenario, graphs, report, graph_id, tier, prepared=None):
     pipelines = tuple(item.descriptor for item in prepared.operators
                       if item.descriptor is not None) if prepared is not None else ()
     evidence = report.get("execution", {})
+    cohort_replicas = {node: {cohort: tuple(spans) for cohort, spans in groups.items()}
+                       for node, groups in cohorts.items()}
     return _ReplayEvaluation(
         graph_id, scenario.step, tier, report["duration_ms"], tuple(rows), pipelines,
         _wave_breakdown_from_report(report), report.get("engine_backend") or "",
         int(evidence.get("native_steps", 0)), evidence, dict(service),
+        _representative_cohorts(cohort_replicas), cohort_replicas,
     )
 
 def _combine_replays(rows):
     if not rows:
         return None
     offset, operators, service = 0.0, [], {}
+    cohorts, serviced, peaks = {}, defaultdict(float), defaultdict(float)
     for row in rows:
         operators.extend(replace(op, start_ms=op.start_ms + offset, end_ms=op.end_ms + offset)
                          for op in row.operators)
         service.update({key: tuple((start + offset, end + offset) for start, end in intervals)
                         for key, intervals in row.service_intervals.items()})
+        cohorts.update({node: {cohort: tuple((start + offset, end + offset) for start, end in spans)
+                               for cohort, spans in groups.items()}
+                        for node, groups in row.cohort_replicas.items()})
+        for key, amount in row.execution_evidence.get("serviced", {}).items():
+            serviced[key] += amount
+        for key, amount in row.execution_evidence.get("peak_allocated_per_unit", {}).items():
+            peaks[key] = max(peaks[key], amount)
         offset += row.span_ms
-    return replace(rows[0], operators=tuple(operators), span_ms=offset, service_intervals=service)
+    evidence = {**rows[0].execution_evidence, "serviced": dict(serviced), "peak_allocated_per_unit": dict(peaks)}
+    return replace(rows[0], operators=tuple(operators), span_ms=offset, service_intervals=service,
+                   cohort_intervals=_representative_cohorts(cohorts), cohort_replicas=cohorts,
+                   execution_evidence=evidence)
 
 def _execution_evidence(step_eval):
     return getattr(step_eval, "execution_evidence", {}) or {}
@@ -427,10 +458,14 @@ def _core_and_overlap(scenario, applied, step_eval):
         if len(stream.lanes) > 1:
             percentages.append(max(stage_results) if stage_results else None)
     cohort_intervals = getattr(step_eval, "cohort_intervals", {}) or {}
+    cohort_replicas = getattr(step_eval, "cohort_replicas", None)
     for tile in applied.tile_bindings:
         if tile.cohort_split == "dbo_2cohort":
-            groups = cohort_intervals.get(tile.target_op, {})
-            percentages.append(compute_overlap_pct(groups.get(0, ()), groups.get(1, ())))
+            intervals = ([cohort_replicas.get((replica, tile.target_op), {}) for replica, ops in by_rank.items()
+                          if any(op.op_id == tile.target_op for op in ops)]
+                         if cohort_replicas is not None else [cohort_intervals.get(tile.target_op, {})])
+            percentages.extend(compute_overlap_pct(groups.get(0, ()), groups.get(1, ()))
+                               for groups in intervals or ({},))
     if any(value is None for value in percentages):
         raise ModelingError("UNPROVED_OVERLAP")
     overlap = min(percentages) if percentages else None
@@ -450,7 +485,7 @@ def _work_totals(ops):
     return {key: fsum(values) for key, values in work.items() if any(values)}
 
 
-def _executed_service_conservation(scenario, applied, step_eval, scope):
+def _executed_service_conservation(scenario, applied, step_eval, baseline_eval):
     if step_eval is None:
         return
     edits = applied.plan.edits
@@ -466,26 +501,59 @@ def _executed_service_conservation(scenario, applied, step_eval, scope):
             raise ModelingError(f"WORK_CONSERVATION_MISMATCH:recipe_drops_matrix:{op.op_id}:{row.implementation}")
         if op.link_bytes > 0 and row.implementation == "TiledPointwise":
             raise ModelingError(f"WORK_CONSERVATION_MISMATCH:recipe_drops_link:{op.op_id}:{row.implementation}")
-    if scope != "full":
-        return
-    got_serviced = (getattr(step_eval, "execution_evidence", None) or {}).get("serviced")
-    base_step = getattr(scenario, "atomic_step", None)
-    base_serviced = (getattr(base_step, "execution_evidence", None) or {}).get("serviced")
+    got_serviced = _execution_evidence(step_eval).get("serviced")
+    base_serviced = _execution_evidence(baseline_eval or scenario.atomic_step).get("serviced")
     if not isinstance(got_serviced, dict) or not isinstance(base_serviced, dict):
+        raise ModelingError("WORK_CONSERVATION_MISMATCH:missing_executed_service")
+    kinds = {type(edit.operation) for edit in edits}
+    checks = {"link": ("link:",)}
+    if not kinds & {QuantizeContract, HoistOrDeduplicate}:
+        checks["matrix"] = _MATRIX_SERVICE_PREFIXES
+    if SelectTemplate in kinds and FuseRegion not in kinds:
+        checks["vector"] = ("vector@",)
+        if not kinds & {QuantizeContract, HoistOrDeduplicate, WeightPrefetch}:
+            checks["mte2"] = ("mte2_aic@", "mte2_aiv@")
+            checks["memory"] = ("memory@",)
+    for name, prefixes in checks.items():
+        expected = fsum(v for k, v in base_serviced.items() if k.startswith(prefixes))
+        actual = fsum(v for k, v in got_serviced.items() if k.startswith(prefixes))
+        if actual + SERVICE_CONSERVATION_ABS_TOL < expected * (1 - SERVICE_CONSERVATION_REL_TOL):
+            raise ModelingError(f"WORK_CONSERVATION_MISMATCH:executed_{name}_service_dropped")
+
+
+def _run_ranges(run):
+    if not run.rows or not run.row_bytes:
         return
-    alters_matrix = any(isinstance(edit.operation, (QuantizeContract, HoistOrDeduplicate)) for edit in edits)
-    if not alters_matrix:
-        base_m = fsum(float(v) for k, v in base_serviced.items() if k.startswith(_MATRIX_SERVICE_PREFIXES))
-        got_m = fsum(float(v) for k, v in got_serviced.items() if k.startswith(_MATRIX_SERVICE_PREFIXES))
-        if base_m > 0.0 and got_m + SERVICE_CONSERVATION_ABS_TOL < base_m * (1.0 - SERVICE_CONSERVATION_REL_TOL):
-            raise ModelingError("WORK_CONSERVATION_MISMATCH:executed_matrix_service_dropped")
-        base_l = fsum(float(v) for k, v in base_serviced.items() if k.startswith("link:"))
-        got_l = fsum(float(v) for k, v in got_serviced.items() if k.startswith("link:"))
-        if base_l > 0.0 and got_l + SERVICE_CONSERVATION_ABS_TOL < base_l * (1.0 - SERVICE_CONSERVATION_REL_TOL):
-            raise ModelingError("WORK_CONSERVATION_MISMATCH:executed_link_service_dropped")
+    if run.stride_bytes <= run.row_bytes:
+        yield run.base_byte, run.base_byte + (run.rows - 1) * run.stride_bytes + run.row_bytes
+    else:
+        for row in range(run.rows):
+            start = run.base_byte + row * run.stride_bytes
+            yield start, start + run.row_bytes
 
 
-def _conservation(scenario, applied, summaries, step_eval=None, scope="full"):
+def _logical_bytes(obligations):
+    ranges, runs = defaultdict(list), defaultdict(set)
+    for obligation in obligations:
+        key = obligation.die, obligation.allocation_id, obligation.tensor_version
+        ranges[key].extend(obligation.ranges)
+        runs[key].update(obligation.address_runs)
+    total = 0
+    for key, spans in ranges.items():
+        strided = runs[key]
+        if not spans and len(strided) == 1:
+            run, = strided
+            if run.rows and run.row_bytes:
+                total += run.row_bytes + (run.rows - 1) * min(run.row_bytes, run.stride_bytes)
+            continue
+        end = 0
+        for left, right in merge(sorted(spans), *(_run_ranges(run) for run in strided)):
+            total += max(0, right - max(end, left))
+            end = max(end, right)
+    return total
+
+
+def _conservation(scenario, applied, summaries, step_eval=None, baseline_eval=None, baseline_work=None):
     hoists = set(applied.hoisted_load_time)
     cse = {edit.edit_id for edit in applied.plan.edits
            if isinstance(edit.operation, HoistOrDeduplicate) and edit.operation.scope == "intra_step"}
@@ -497,14 +565,17 @@ def _conservation(scenario, applied, summaries, step_eval=None, scope="full"):
         raise ModelingError("WORK_CONSERVATION_MISMATCH:replica_domain")
     for entry in scenario.atomic_ops:
         after = retained.get(entry.replica, ())
-        retained_ids = {op.op_id for op in after}
-        expected = _work_totals(op for op in entry.ops
-                                if op.op_id not in hoists or op.op_id in retained_ids)
+        if baseline_work is not None and not hoists:
+            expected = baseline_work[entry.replica]
+        else:
+            retained_ids = {op.op_id for op in after}
+            expected = _work_totals(op for op in entry.ops
+                                    if op.op_id not in hoists or op.op_id in retained_ids)
         actual = _work_totals(after)
         for key in expected.keys() | actual.keys():
             if not isclose(expected.get(key, 0), actual.get(key, 0), rel_tol=1e-12, abs_tol=1e-9):
                 raise ModelingError(f"WORK_CONSERVATION_MISMATCH:{entry.replica}:{key}")
-    atomic_by_id = {op.op_id: op for entry in scenario.atomic_ops for op in entry.ops}
+    atomic_by_id = {op.op_id: op for entry in scenario.atomic_ops for op in entry.ops} if summaries else {}
     for summary in summaries:
         logical, issued, dram, turnaround, hits = (
             summary.logical_transfer_bytes, summary.issued_copy_bytes, summary.dram_sector_bytes,
@@ -532,15 +603,15 @@ def _conservation(scenario, applied, summaries, step_eval=None, scope="full"):
                     exp_vec, got_vec, rel_tol=1e-12, abs_tol=1e-9
                 ):
                     raise ModelingError(f"WORK_CONSERVATION_MISMATCH:{summary.region_id}:semantic_work")
-        ranges = defaultdict(list)
-        for direction, obligations in (("r", summary.read_obligations), ("w", summary.write_obligations)):
-            for obligation in obligations:
-                key = direction, obligation.die, obligation.allocation_id, obligation.tensor_version
-                ranges[key].extend(obligation.ranges)
-        required = sum(end - start for spans in ranges.values() for start, end in _interval_union(spans))
+        from mindie_sim.optimization.reload_bounds import compute_compulsory_hbm_cut
+
+        cut = compute_compulsory_hbm_cut((summary,))
+        if sum(item.read_bytes + item.write_bytes for item in cut.values()) > dram:
+            raise ModelingError(f"LEDGER_RECONCILIATION_ERROR:{summary.region_id}:dram_sector_bytes")
+        required = _logical_bytes(summary.read_obligations) + _logical_bytes(summary.write_obligations)
         if logical < required:
             raise ModelingError(f"LEDGER_RECONCILIATION_ERROR:{summary.region_id}:logical_bytes")
-    _executed_service_conservation(scenario, applied, step_eval, scope)
+    _executed_service_conservation(scenario, applied, step_eval, baseline_eval)
 
 
 def _capture(name, check, *args):
@@ -553,25 +624,24 @@ def _capture(name, check, *args):
 
 
 def _bound(certificate, program, dag, wall, u, m, framework, dsl):
-    l_star = None
-    supplied = sum(value is not None for value in (certificate, program, dag))
-    if supplied:
-        if certificate is None or program is None or dag is None:
-            raise ModelingError("LEAN_CERTIFICATE_INVALID:incomplete_certificate")
-        from mindie_sim.optimization.dual_bound import check_optimality_certificate
+    if certificate is None or program is None or dag is None:
+        raise ModelingError("LEAN_CERTIFICATE_INVALID:missing_certificate")
+    from mindie_sim.optimization.dual_bound import check_optimality_certificate
 
-        if not check_optimality_certificate(program, dag, certificate):
-            raise ModelingError("LEAN_CERTIFICATE_INVALID")
-        l_star = certificate.l_star_lean_ns
-        if l_star < 0 or wall is None:
-            raise ModelingError("LEAN_CERTIFICATE_INVALID:missing_or_invalid_bound_evidence")
-        if wall < l_star:
-            raise SoundnessInversionError(
-                f"SOUNDNESS_BUG_LOWER_BOUND_INVERTED:wall_ns={wall}<l_star_ns={l_star}")
-    values = (wall, u, m, framework, dsl)
-    if any(value is not None and (type(value) is not int or value < 0) for value in values):
+    if not check_optimality_certificate(program, dag, certificate):
+        raise ModelingError("LEAN_CERTIFICATE_INVALID")
+    l_star = certificate.l_star_lean_ns
+    if l_star < 0 or wall is None:
+        raise ModelingError("LEAN_CERTIFICATE_INVALID:missing_or_invalid_bound_evidence")
+    if any(value is not None and type(value) is not int for value in (wall, u, m, framework, dsl)):
         raise ModelingError("LADDER_MONOTONICITY_VIOLATION:invalid_wall_time")
-    chain = [value for value in (dsl, framework) if value is not None]
+    for name, value in (("wall", wall), ("dsl", dsl), ("framework", framework)):
+        if value is not None and value < l_star:
+            raise SoundnessInversionError(
+                f"SOUNDNESS_BUG_LOWER_BOUND_INVERTED:{name}_ns={value}<l_star_ns={l_star}")
+    if any(value is not None and value < 0 for value in (u, m)):
+        raise ModelingError("LADDER_MONOTONICITY_VIOLATION:invalid_wall_time")
+    chain = [value for value in (l_star, dsl, framework) if value is not None]
     baselines = [value for value in (u, m) if value is not None]
     if baselines:
         chain.append(min(baselines))
@@ -584,6 +654,7 @@ def verify_plan(
     scenario: ResolvedScenario, applied: AppliedPlan, *, step_eval=None, wall_ns=None,
     dual_certificate=None, dual_program=None, event_dag=None, baseline_u_ns=None,
     baseline_m_ns=None, framework_ns=None, dsl_ns=None, region_summaries=(), scope="full",
+    baseline_eval=None, baseline_work=None,
 ) -> VerificationReceipt:
     """Run structural and replay gates for the stated occurrence coverage."""
     if scope not in {"archetype", "full"}:
@@ -604,7 +675,7 @@ def verify_plan(
         reason, _, detail = str(error).partition(":")
         gates.append(GateReceipt(name, False, reason, detail))
     gates.append(_capture("work_conservation_and_ledgers", _conservation,
-                          scenario, applied, region_summaries, step_eval, scope))
+                          scenario, applied, region_summaries, step_eval, baseline_eval, baseline_work))
     l_star = regression = None
     if scope == "full":
         name = "lean_bound_and_monotonicity"

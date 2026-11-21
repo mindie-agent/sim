@@ -20,7 +20,7 @@ from .dual_bound import (
     build_dual_inputs_from_scenario, certify_lower_bound,
 )
 from .framework_solver import (
-    _TrialSearch, _field, _resolved, _seed_plans, _step, _verification, _wall,
+    _TrialSearch, _field, _resolved, _step, _verification,
     solve_framework,
 )
 
@@ -32,6 +32,7 @@ FIVE_LEVEL_REPORT_SCHEMA = "mindie-sim.five-level-report/1"
 SHIPPING_REGRESSION_TOLERANCE_NS = 1000
 DEFAULT_LADDER_TRIALS = 16
 STEP_WAIT_REGION = "step:wait"
+SHIPPING_OVERLAY = "shipping_overlay"
 
 __all__ = (
     "FIVE_LEVEL_REPORT_SCHEMA", "FiveLevelLadderMetrics", "RegionWallAttribution",
@@ -247,25 +248,20 @@ def _ordered_telescope(mainline_ns, framework, dsl):
     return tuple(ordered)
 
 
-def _shipping_regression(dossier, verification, delta, search):
+def _shipping_regression(verification, u, m):
     from mindie_sim.rewrite.verify import ShippingRegression
 
+    delta = m - u
     if delta <= SHIPPING_REGRESSION_TOLERANCE_NS:
         return None
-    mainline_eval = _field(dossier, "mainline_eval", "mainline")
-    regression = next((record.shipping_regression
-                       for record in (verification, dossier, mainline_eval)
-                       if getattr(record, "shipping_regression", None) is not None), None)
+    regression = getattr(verification, "shipping_regression", None)
     if regression is not None and regression.loo_culprits:
         return regression
-    _, shipping = _seed_plans(dossier)
-    mainline_ns = _wall(mainline_eval)
-    impacts = search.loo(shipping, mainline_ns, search.remaining)
-    culprits = tuple((edit_id, -delta_ns) for edit_id, delta_ns in impacts if delta_ns < 0)
+    culprits = ((SHIPPING_OVERLAY, delta),)
     if regression is not None:
         return replace(regression, loo_culprits=culprits)
     return ShippingRegression(delta_ns=delta, loo_culprits=culprits,
-                              baseline_u_ns=mainline_ns - delta, baseline_m_ns=mainline_ns)
+                              baseline_u_ns=u, baseline_m_ns=m)
 
 
 def solve_five_level_ladder(
@@ -327,13 +323,18 @@ def solve_five_level_ladder(
     search = _TrialSearch(dossier, max_trials, dual_program=program, event_dag=dag,
                           dual_certificate=certificate)
     search.seed(dsl.best_plan, dsl.best_eval)
-    regression = _shipping_regression(dossier, verification, m - u, search)
+    regression = _shipping_regression(verification, u, m)
+    if regression is not None and verification is not None:
+        verification = replace(verification, shipping_regression=regression)
     impacts = (framework.loo_impacts if dsl.best_plan == framework.best_plan
                else search.loo(dsl.best_plan, a_dsl, search.remaining))
     opcodes = {edit.edit_id: type(edit.operation).__name__ for edit in dsl.best_plan.edits}
+    loo = tuple(LooMarginalImpact(edit_id, opcodes[edit_id], impact) for edit_id, impact in impacts)
+    if m != u:
+        loo += (LooMarginalImpact(SHIPPING_OVERLAY, "ShippingOverlay", m - u),)
     waterfall = FiveLevelWaterfall(
         _ordered_telescope(m, framework, dsl),
-        tuple(LooMarginalImpact(edit_id, opcodes[edit_id], impact) for edit_id, impact in impacts),
+        loo,
         regions, reconciliation, regression,
     )
     digest = getattr(dossier, "scenario_digest", None)

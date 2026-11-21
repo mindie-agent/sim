@@ -17,24 +17,34 @@ from threading import Lock
 from time import monotonic
 from typing import Any, Literal
 
+from mindie_sim.catalog.ops import comm_op
 from mindie_sim.prediction.collectives.ring_pairwise import PairwiseCollective, RingCollective
 from mindie_sim.prediction.evaluation import ACTIVE_DEADLINE_MONO, EvaluationContext
+from mindie_sim.prediction.execution.split_barrier import DEFAULT_SPLIT_DTYPE_BYTES
+from mindie_sim.prediction.execution.step_helpers import EAGER_MOE_DISPATCH_RECIPES
+from mindie_sim.prediction.expected_grouped import ExpectedGroupedMatmul
 from mindie_sim.prediction.fusion_bridge import (
     CanonicalPlan, _canonical_hardware, add_prefetch, apply_prefetch_rewrite, settle_prefetch_rewrite,
 )
 from mindie_sim.prediction.fusion_pool import register_recipe
 from mindie_sim.prediction.graph_analysis import graph_costs
-from mindie_sim.prediction.program import RecipeBook
+from mindie_sim.prediction.mechanism import Work
+from mindie_sim.prediction.primitives import PrimitiveStore
+from mindie_sim.prediction.program import KernelProgram, RecipeBook, Stage
 from mindie_sim.prediction.results import ReplayOptions, StepEvaluation, StepRequest
 from mindie_sim.prediction.runtime.tile_solver import TilePipelineSpec
 from mindie_sim.prediction.weight_prefetch import PrefetchDecision
 from mindie_sim.schema.case import Case
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import OpSpec
+from mindie_sim.stack_registry import RankOps
 
 from .apply import AppliedPlan, DEFAULT_STACK_ID, ResolvedScenario, _solve_tiles, apply_plan, resolve_scenario
-from .schema import FuseRegion, RewritePlan, SelectTemplate, _digest_default, _json_digest, empty_plan, plan_sha256
-from .verify import NS_PER_MS, VerificationReceipt, _combine_replays, _evaluation, verify_plan
+from .schema import (
+    FuseRegion, PipelineTiles, QuantizeContract, RewritePlan, SelectTemplate, _digest_default,
+    _json_digest, _references, empty_plan, plan_sha256,
+)
+from .verify import NS_PER_MS, VerificationReceipt, _COHORT_PREFIX, _combine_replays, _evaluation, _work_totals, verify_plan
 
 DEFAULT_MAX_CANDIDATES = 8
 PREFETCH_PRIORITY = 10
@@ -43,7 +53,8 @@ DEFAULT_CACHE_ENTRIES = 16
 MAX_RETAINED_OPERATORS = 16000
 MAX_OVERLAP_TRACE_EVENTS = 8192
 MAX_BOTTLENECK_OPS = 16
-MAX_LAYER_CACHE_ENTRIES = 256
+MAX_SCREEN_CACHE_ENTRIES = 256
+GROUPED_MATRIX_RANK = 3
 
 @dataclass(frozen=True, slots=True)
 class ScenarioRequest:
@@ -69,6 +80,20 @@ class StepArchetype:
     structural_key: str
     ops: tuple[OpSpec, ...]
 @dataclass(frozen=True, slots=True)
+class _Seed:
+    scenario: ResolvedScenario
+    book: RecipeBook
+    evaluation: StepEvaluation
+    archetypes: tuple[StepArchetype, ...]
+    layers: dict
+    sites: dict
+    work: dict
+    layer_work: dict
+    reference: dict
+    total_ns: int
+
+
+@dataclass(frozen=True, slots=True)
 class ScenarioHandle:
     scenario_digest: str
     scenario: ResolvedScenario
@@ -80,13 +105,13 @@ class ScenarioHandle:
     archetype_u_ns: int
     full_u_ns: int
     full_m_ns: int
-    _representative_ns: tuple[int, ...] = field(default=(), repr=False)
-    _replay: ReplayOptions = field(default_factory=ReplayOptions, repr=False)
-    _mainline_book: RecipeBook | None = field(default=None, repr=False)
-    _mainline_digest: str = field(default="", repr=False)
-    _layer_cache: OrderedDict[str, tuple[int, StepEvaluation | None]] = field(
-        default_factory=OrderedDict, repr=False, compare=False,
-    )
+    _unmerge: _Seed = field(repr=False)
+    _mainline: _Seed = field(repr=False)
+    _replay: ReplayOptions = field(repr=False)
+    _layer_cache: OrderedDict = field(default_factory=OrderedDict, repr=False, compare=False)
+    _candidates: OrderedDict = field(default_factory=OrderedDict, repr=False, compare=False)
+    _certificate: list = field(default_factory=list, repr=False, compare=False)
+    _cache_lock: Lock = field(default_factory=Lock, repr=False, compare=False)
 @dataclass(frozen=True, slots=True)
 class _OptimizationScenario:
     scenario: ResolvedScenario
@@ -120,8 +145,8 @@ class ScenarioDossier:
 
     @property
     def mainline_plan(self):
-        return empty_plan(self.handle._mainline_digest or self.unmerge_plan.base_graph_sha256,
-                          self.unmerge_plan.framing_sha256)
+        scenario = self.handle._mainline.scenario
+        return empty_plan(scenario.base_graph_sha256, scenario.framing_sha256)
 @dataclass(frozen=True, slots=True)
 class CandidateEvaluation:
     plan_sha256: str
@@ -174,6 +199,8 @@ class OracleCache:
             return entry[0]
 
     def put(self, handle: ScenarioHandle, *, request_key: str = "") -> None:
+        if isinstance(handle.evaluation_context.cost.primitives, PrimitiveStore):
+            return
         operators = len(handle.u_eval.operators) + len(handle.m_eval.operators)
         if operators > MAX_RETAINED_OPERATORS:
             return
@@ -262,20 +289,18 @@ def _cut_layer_key(graph, book, streams, need_eval):
                 op.op_id if need_eval else "", op.family, op.recipe, recipe_sig, op.dtype,
                 op.local_shape, op.stage, op.phase, op.stream, op.flops, op.vector_ops,
                 op.mte2_bytes, op.mte3_bytes, op.hbm_bytes, op.link_bytes, op.link_scope,
-                op.matrix_flops, tuple(sorted(op.metadata)),
+                op.matrix_flops, op.layout, op.source_boundary, op.returns,
+                tuple(sorted(op.metadata, key=lambda pair: pair[0])),
                 tuple(ordinals.get(dep, -1) for dep in op.deps),
             ))
         ranks.append((rank, tuple(op_sigs)))
-    stream_sigs = tuple(
-        (plan.rank, plan.lanes, plan.budgets, plan.assignments, plan.events) for plan in streams
-    )
-    return _json_digest((tuple(ranks), stream_sigs, bool(need_eval)), default=_digest_default)
+    return _json_digest((tuple(ranks), streams, bool(need_eval)), default=_digest_default)
 
 
-def _cache_layer_put(cache, key, value):
+def _memo_put(cache, key, value):
     cache[key] = value
     cache.move_to_end(key)
-    while len(cache) > MAX_LAYER_CACHE_ENTRIES:
+    while len(cache) > MAX_SCREEN_CACHE_ENTRIES:
         cache.popitem(last=False)
 
 
@@ -292,14 +317,15 @@ def _dossier(handle):
     return ScenarioDossier(handle.scenario_digest, handle, handle.archetypes,
                            handle.full_u_ns, handle.full_m_ns, _coverage(handle), tuple(bottlenecks))
 def _coverage(handle):
-    covered = {layer for item in handle.archetypes for layer in item.layer_indices}
-    all_layers = {op.layer for entry in handle.scenario.atomic_ops for op in entry.ops}
-    return len(covered) / len(all_layers) if all_layers else 1.0
+    seed = handle._unmerge
+    return len(seed.reference) / len(seed.layers) if seed.layers else 1.0
 def prepare_scenario(request: ScenarioRequest, *, budget: EvalBudget = EvalBudget(),
                      cache=None, spine=None, primitives=None) -> ScenarioDossier:
     deadline = _deadline(budget, request.replay)
     _check_budget(budget, deadline)
     case = Case.from_mapping(request.case)
+    if isinstance(primitives, PrimitiveStore):
+        cache = None
     replay_frame = asdict(replace(request.replay, deadline_mono=None))
     if cache is not None and spine is None:
         request_key = _json_digest((case.to_dict(), asdict(request.step), request.stack_id,
@@ -314,48 +340,54 @@ def prepare_scenario(request: ScenarioRequest, *, budget: EvalBudget = EvalBudge
     book_m = (book if mainline.case.runtime.kernels == atomic.case.runtime.kernels
               else RecipeBook.from_mapping(mainline.case.runtime.kernels))
 
-    def evaluate(prepared, recipes, tier):
+    def prepare_seed(resolved, recipes, tier):
+        prepared = resolved.atomic_step
         _check_budget(budget, deadline)
         graphs = {entry.replica: entry.ops for entry in prepared.graph.executable}
         report = _report(prepared.case, graphs, context, recipes, request.replay, deadline=deadline,
-                         streams=prepared.graph.streams)
-        return _evaluation(scenario, graphs, report, prepared.graph_id, tier, prepared)
+                         streams=prepared.graph.streams,
+                         trace_limit=MAX_OVERLAP_TRACE_EVENTS if prepared.graph.streams else 0)
+        evaluation = _evaluation(resolved, graphs, report, prepared.graph_id, tier, prepared)
+        archetypes = intern_step_archetypes(next(iter(graphs.values()), ()))
+        layers, sites, reference = {}, defaultdict(set), {}
+        for replica, ops in graphs.items():
+            for layer, members in _layers(ops).items():
+                layers.setdefault(layer, dict.fromkeys(graphs, ()))[replica] = tuple(members)
+            for op in ops:
+                meta = dict(op.metadata)
+                for key in (op.op_id, op.family, meta.get("model_scope"), meta.get("quant_scope")):
+                    if key is not None:
+                        sites[key].add(op.layer)
+        for item in archetypes:
+            _check_budget(budget, deadline)
+            cut = layers[item.representative_layer]
+            streams = _cut_plans(cut, resolved.stream_plans)
+            report = _report(prepared.case, cut, context, recipes, request.replay, deadline=deadline,
+                             fast=True, cut=True, streams=streams)
+            reference.update(dict.fromkeys(item.layer_indices, round(report["duration_ms"] * NS_PER_MS)))
+        return _Seed(resolved, recipes, evaluation, archetypes, layers, dict(sites),
+                     {rank: _work_totals(ops) for rank, ops in graphs.items()},
+                     {layer: {rank: _work_totals(ops) for rank, ops in cut.items()} for layer, cut in layers.items()},
+                     reference, sum(reference.values()))
 
-    u_eval = evaluate(atomic, book, "unmerge")
-    m_eval = evaluate(mainline, book_m, "mainline")
-    archetypes = intern_step_archetypes(scenario.atomic_ops[0].ops if scenario.atomic_ops else ())
-    per_rank = {entry.replica: _layers(entry.ops) for entry in scenario.atomic_ops}
-    spans = []
-    layer_cache: OrderedDict[str, tuple[int, StepEvaluation | None]] = OrderedDict()
-    for item in archetypes:
-        _check_budget(budget, deadline)
-        graphs = {rep: tuple(layers.get(item.representative_layer, ())) for rep, layers in per_rank.items()}
-        report = _report(atomic.case, graphs, context, book, request.replay, deadline=deadline, fast=True, cut=True)
-        span_ns = round(report["duration_ms"] * NS_PER_MS)
-        spans.append(span_ns)
-        _cache_layer_put(layer_cache, _cut_layer_key(graphs, book, (), False), (span_ns, None))
     digest = _json_digest((scenario.scenario_sha256, replay_frame))
     mainline_digest = _json_digest(("mainline", mainline.graph.executable, mainline.case.runtime.to_dict()),
                                    default=_digest_default)
-    handle = ScenarioHandle(
-        digest, scenario, archetypes, context, book, u_eval, m_eval,
-        sum(span * item.multiplicity for span, item in zip(spans, archetypes)),
-        round(u_eval.span_ms * NS_PER_MS), round(m_eval.span_ms * NS_PER_MS),
-        tuple(spans), replace(request.replay, deadline_mono=None), book_m, mainline_digest, layer_cache,
-    )
+    u = prepare_seed(scenario, book, "unmerge")
+    resolved_m = replace(scenario, base_graph_sha256=mainline_digest,
+                         atomic_step=mainline, atomic_ops=mainline.graph.executable,
+                         stream_plans=mainline.graph.streams)
+    m = prepare_seed(resolved_m, book_m, "mainline")
+    handle = ScenarioHandle(digest, scenario, u.archetypes, context, book, u.evaluation, m.evaluation,
+                            u.total_ns, round(u.evaluation.span_ms * NS_PER_MS),
+                            round(m.evaluation.span_ms * NS_PER_MS), u, m,
+                            replace(request.replay, deadline_mono=None))
     if cache is not None and spine is None:
         cache.put(handle, request_key=request_key)
     return _dossier(handle)
 def _baseline(handle, plan):
-    scenario = handle.scenario
-    if (plan.base_graph_sha256 != scenario.base_graph_sha256
-            and plan.base_graph_sha256 == handle._mainline_digest and scenario.mainline_step):
-        step = scenario.mainline_step
-        scenario = replace(scenario, base_graph_sha256=handle._mainline_digest,
-                           atomic_step=step, atomic_ops=step.graph.executable,
-                           stream_plans=step.graph.streams)
-        return scenario, handle._mainline_book or handle.recipe_book, handle.m_eval
-    return scenario, handle.recipe_book, handle.u_eval
+    return (handle._mainline if plan.base_graph_sha256 == handle._mainline.scenario.base_graph_sha256
+            else handle._unmerge)
 def _bind_prefetch(case, replica, ops, book, leases):
     if not leases:
         return ops, book
@@ -391,48 +423,139 @@ def _bind_prefetch(case, replica, ops, book, leases):
     return tuple(replace(op, recipe=f"{op.recipe}:r{replica}") if op.recipe in generated
                  else op for op in plan.ops), book
 
-def _bind_replay(scenario, applied, book):
+@dataclass(frozen=True)
+class _DboGrouped:
+    recipe: ExpectedGroupedMatmul
+
+    def lower(self, context):
+        op = context.op
+        meta = dict(op.metadata)
+        rows, n, k = op.local_shape
+        left = rows // 2
+        work = Work(dict(op.matrix_flops or ((op.dtype, op.flops),)),
+                    {k: v for k, v in context.native_work.items() if k != "cube"})
+        stages = []
+        for cohort, size in enumerate((left, rows - left)):
+            share = size / rows
+            name = f"{_COHORT_PREFIX}_{cohort}"
+            phase = context.for_phase(work.scaled(share), kernel=name)
+            values = dict(phase.op.metadata)
+            for key in ("expected_rows", "expected_active_experts", "weight_bytes", "packed_weight_bytes",
+                        "weight_payload_bytes", "activation_scale_bytes", "routed_weight_read_bytes"):
+                if key in meta:
+                    values[key] = meta[key] * share
+            child = replace(phase.op, local_shape=(size, n, k), metadata=tuple(values.items()))
+            program = self.recipe.lower(replace(phase, op=child, record_mapping=None))
+            stages.append(Stage(name, program=program))
+        return KernelProgram(tuple(stages), minimum_ms=context.minimum_ms)
+
+
+def _device_counts(ops, targets, book, case, include_submission):
+    targets = set(targets)
+    producers = {}
+    supported = {"grouped_gemm", "grouped_moe", "mc2_protocol", "alltoall", "alltoallv"}
+    updated = []
+    known = {op.op_id for op in ops}
+    for op in ops:
+        domain = op.stage, op.layer
+        meta = dict(op.metadata)
+        if (op.op_id in targets or meta.get("device_group_list") is True
+                or any(producers.get(dep) == domain for dep in op.deps)):
+            producers[op.op_id] = domain
+        if op.op_id in producers and (
+            op.family in supported or op.recipe in EAGER_MOE_DISPATCH_RECIPES
+        ):
+            meta.update(device_group_list=True, requires_host_split_sizes=False, eager_d2h_sync=False)
+            if op.recipe in EAGER_MOE_DISPATCH_RECIPES:
+                # The existing dispatch recipe consumes device counts. Its eager
+                # entry-point ID otherwise inserts a host split-size rendezvous.
+                identifier = f"rewrite_device_counts:{op.recipe}"
+                book = register_recipe(book, identifier, book.select(op))
+                op = replace(op, recipe=identifier)
+                ep = int(meta.get("moe_ep_size") or case.runtime.parallel.ep)
+                if (include_submission and op.phase == "prefill" and ep > 1
+                        and meta.get("graph_replay_scope", "none") == "none"
+                        and case.machine.host_solo_bw_gbps("d2h")):
+                    # Keep the device rendezvous that the implicit host barrier
+                    # previously scheduled before it performed the D2H copy.
+                    gather = op.op_id.rsplit(".", 1)[0] + ".moe_histogram_gather"
+                    if gather not in known:
+                        size = int(meta.get("split_dtype_bytes") or DEFAULT_SPLIT_DTYPE_BYTES)
+                        updated.append(comm_op(
+                            op_id=gather, deps=op.deps, stage=op.stage, layer=op.layer,
+                            requests=op.requests, family="allgather", phase=op.phase, recipe="ring_allgather",
+                            link_bytes=(ep - 1) * ep * size, shape=(ep, ep), metadata=(("group_axis", "ep"),),
+                        ))
+                    op = replace(op, deps=tuple(dict.fromkeys((*op.deps, gather))))
+            op = replace(op, metadata=tuple(meta.items()))
+        updated.append(op)
+    return tuple(updated), book
+
+
+def _bind_replay(scenario, applied, book, topology, include_submission=False):
     """Resolve only variants actually implemented by the installed recipe book."""
-    if applied.elided_d2h_ops:
-        raise ModelingError("rewrite_device_group_list_recipe_unbound")
     if applied.prefetch_leases and applied.streams:
         raise ModelingError("rewrite_prefetch_stream_events_unbound")
-    templates = {binding.target_op: binding for binding in applied.template_bindings}
-    tiles = {binding.target_op: binding.tile_spec for binding in applied.tile_bindings}
+    templates = {}
+    for binding in applied.template_bindings:
+        if binding.template_id not in book.recipes:
+            raise ModelingError(f"rewrite_template_recipe_unbound:{binding.target_op}:{binding.template_id}")
+        templates[binding.target_op] = binding.template_id
+    tiles = {binding.target_op: binding for binding in applied.tile_bindings}
     streams = {stream.rank: stream for stream in applied.streams}
     registered, graphs = {}, {}
     collective = {binding.target_op: binding for binding in applied.collective_rewrites}
     for entry in applied.executable:
         bound = []
-        for op in entry.ops:
+        ops, book = (_device_counts(entry.ops, applied.elided_d2h_ops, book,
+                                    scenario.atomic_step.case, include_submission)
+                     if applied.elided_d2h_ops else (entry.ops, book))
+        for op in ops:
+            if op.op_id in templates:
+                op = replace(op, recipe=templates[op.op_id])
             if (binding := collective.get(op.op_id)) is not None:
                 recipes = {"ring": RingCollective, "pairwise": PairwiseCollective}
-                links = scenario.case.machine.links
-                if len(links) != 1 or links[0].name != binding.topology_route or binding.mode not in recipes:
+                meta = dict(op.metadata)
+                groups = topology.groups(meta.get("group_axis", "tp"), entry.replica,
+                                         meta.get("source_stage", op.stage), metadata=meta)
+                pairs = ((a, b) for group in groups for a, b in (
+                    zip(group, group[1:] + group[:1]) if binding.mode == "ring"
+                    else ((a, b) for a in group for b in group)) if a != b)
+                if (binding.mode not in recipes or binding.topology_route not in topology.links
+                        or any(not any(name == binding.topology_route for name, _, _ in topology.route(a, b))
+                               for a, b in pairs)):
                     raise ModelingError(f"rewrite_collective_route_recipe_unbound:{op.op_id}")
                 identifier = f"rewrite_collective:{op.op_id}"
                 registered[identifier] = recipes[binding.mode]()
                 op = replace(op, recipe=identifier)
-            if op.op_id in templates and templates[op.op_id].template_id in book.recipes:
-                op = replace(op, recipe=templates[op.op_id].template_id)
             if op.family == "rewrite_fused" and (len(next(
                     edit.operation.kernel_boundaries for edit in applied.plan.edits
                     if op.op_id == f"rewrite:{edit.edit_id}")) != 1 or op.recipe not in book.recipes):
                 raise ModelingError(f"rewrite_fusion_recipe_unbound:{op.op_id}:{op.recipe}")
-            tile = tiles.get(op.op_id)
+            binding = tiles.get(op.op_id)
+            tile = binding.tile_spec if binding else None
+            if binding is None:
+                bound.append(op)
+                continue
+            recipe = registered.get(op.recipe) or book.select(op)
             if isinstance(tile, TilePipelineSpec):
-                recipe = book.select(op)
                 shape = _solve_tiles(scenario, entry.replica, op, tile, streams.get(entry.replica))
-                if all(hasattr(recipe, name) for name in ("tile_m", "tile_n", "tile_k", "slots")):
-                    m, n, k = shape.tile_shape.m, shape.tile_shape.n, shape.tile_shape.k
-                    identifier = f"rewrite_tile:{entry.replica}:{op.op_id}"
-                    registered[identifier] = replace(recipe, tile_m=m, tile_n=n, tile_k=k, slots=shape.depth)
-                    op = replace(op, recipe=identifier)
-                else:
+                matrix = recipe.matrix if isinstance(recipe, ExpectedGroupedMatmul) else recipe
+                if not all(hasattr(matrix, name) for name in ("tile_m", "tile_n", "tile_k", "slots")):
                     raise ModelingError(f"rewrite_tile_recipe_unbound:{op.op_id}")
-            elif op.op_id in templates and templates[op.op_id].template_id not in book.recipes:
-                raise ModelingError(f"rewrite_template_recipe_unbound:{op.op_id}")
-            bound.append(op)
+                m, n, k = shape.tile_shape.m, shape.tile_shape.n, shape.tile_shape.k
+                matrix = replace(matrix, tile_m=m, tile_n=n, tile_k=k, slots=shape.depth)
+                recipe = replace(recipe, matrix=matrix) if isinstance(recipe, ExpectedGroupedMatmul) else matrix
+            if binding.cohort_split == "dbo_2cohort":
+                meta = dict(op.metadata)
+                if (not isinstance(recipe, ExpectedGroupedMatmul) or len(op.local_shape) != GROUPED_MATRIX_RANK
+                        or op.local_shape[0] < 2 or meta.get("expert_rows") or meta.get("rows_by_expert")):
+                    raise ModelingError(f"rewrite_dbo_recipe_unbound:{op.op_id}")
+                recipe = _DboGrouped(recipe)
+            identifier = f"rewrite_tile:{entry.replica}:{op.op_id}"
+            # Register the base matrix; selection will apply its grouped adapter once.
+            registered[identifier] = recipe.matrix if isinstance(recipe, ExpectedGroupedMatmul) else recipe
+            bound.append(replace(op, recipe=identifier))
         graphs[entry.replica] = tuple(bound)
     for identifier, recipe in registered.items():
         book = register_recipe(book, identifier, recipe)
@@ -452,52 +575,88 @@ def _cut_plans(graphs, streams):
         plans.append(replace(plan, assignments=tuple(pair for pair in plan.assignments if pair[0] in ids),
                              events=tuple(events)))
     return tuple(plans)
-def _estimate(handle, scenario, applied, book, baseline, budget, deadline):
+def _screen_scenario(seed, plan):
+    scenario = seed.scenario
+    if scenario.stream_plans or not plan.edits:
+        return scenario, seed.work
+    layers = set()
+    for edit in plan.edits:
+        operation = edit.operation
+        if isinstance(operation, QuantizeContract):
+            for site in set(operation.scope) - set(operation.exclusions):
+                layers.update(seed.sites.get(site, ()))
+        elif isinstance(operation, (SelectTemplate, PipelineTiles)):
+            for ref in _references(operation):
+                if ref.kind != "atom":
+                    return scenario, seed.work
+                layers.update(seed.sites.get(ref.id, ()))
+        else:
+            return scenario, seed.work
+    ranks = tuple(RankOps(entry.replica, tuple(
+        op for layer in sorted(layers) for op in seed.layers[layer][entry.replica]
+    )) for entry in scenario.atomic_ops)
+    work = seed.layer_work[next(iter(layers))] if len(layers) == 1 else None
+    return replace(scenario, atomic_ops=ranks), work
+
+
+def _replay_cut(handle, seed, graph, book, streams, need_eval, trace, deadline):
+    key = (seed.scenario.base_graph_sha256, _cut_layer_key(graph, book, streams, need_eval), trace)
+    with handle._cache_lock:
+        cached = handle._layer_cache.get(key)
+        if cached is not None:
+            handle._layer_cache.move_to_end(key)
+            return cached
+    scenario = seed.scenario
+    report = _report(scenario.atomic_step.case, graph, handle.evaluation_context, book, handle._replay,
+                     deadline=deadline, fast=not need_eval, trace_limit=trace, streams=streams, cut=True)
+    span = round(report["duration_ms"] * NS_PER_MS)
+    evaluation = _evaluation(scenario, graph, report, key[1], "should_achieve") if need_eval else None
+    with handle._cache_lock:
+        _memo_put(handle._layer_cache, key, (span, evaluation))
+    return span, evaluation
+
+
+def _estimate(handle, seed, scenario, applied, budget, deadline):
+    baseline = seed.evaluation
     baseline_ns = round(baseline.span_ms * NS_PER_MS)
-    if all(receipt.status == "noop" for receipt in applied.edit_receipts):
-        return baseline_ns, handle.archetype_u_ns, baseline
-    if baseline is handle.m_eval and baseline is not handle.u_eval:
-        raise ModelingError("rewrite_archetypes_require_atomic_base")
-    graphs, book = _bind_replay(scenario, applied, book)
+    # Quantization declarations are compatibility assertions against the
+    # prepared representation. Their annotations leave the physical bound intact.
+    if (all(receipt.status == "noop" for receipt in applied.edit_receipts)
+            or all(isinstance(edit.operation, QuantizeContract) for edit in applied.plan.edits)):
+        return baseline_ns, seed.total_ns, baseline, baseline
+    graphs, book = _bind_replay(scenario, applied, seed.book, handle.evaluation_context.bindings.topology,
+                               handle._replay.include_submission)
     layers = {replica: _layers(ops) for replica, ops in graphs.items()}
-    original = {entry.replica: _layers(entry.ops) for entry in scenario.atomic_ops}
-    changed = sorted({layer for rank, by_layer in layers.items()
-                      for layer in by_layer.keys() | original[rank].keys()
-                      if by_layer.get(layer, ()) != original[rank].get(layer, ())}
-                     | {op.layer for plan in applied.streams if plan not in scenario.stream_plans
-                        for op in graphs[plan.rank]})
-    reference = {layer: span for item, span in zip(handle.archetypes, handle._representative_ns)
-                 for layer in item.layer_indices}
-    archetype_ns = handle.archetype_u_ns
-    rows = []
-    overlap = any(len(plan.lanes) > 1 for plan in applied.streams)
+    domain = {op.layer for rank in scenario.atomic_ops for op in rank.ops}
+    changed_streams = {plan.rank for plan in applied.streams if plan not in scenario.stream_plans}
+    changed = sorted(layer for layer in domain if changed_streams or any(
+        tuple(by_layer.get(layer, ())) != seed.layers[layer][rank] for rank, by_layer in layers.items()
+    ))
+    archetype_ns = seed.total_ns
+    rows, comparisons = [], []
+    overlap = any(len(plan.lanes) > 1 for plan in applied.streams) or any(
+        tile.cohort_split == "dbo_2cohort" for tile in applied.tile_bindings)
     rebind = any(isinstance(edit.operation, (FuseRegion, SelectTemplate)) for edit in applied.plan.edits)
     need_eval = overlap or rebind
     for layer in changed:
         _check_budget(budget, deadline)
-        if layer not in reference:
+        if layer not in seed.reference:
             raise ModelingError("rewrite_edited_layer_outside_archetype_coverage")
         graph = {rank: tuple(by_layer.get(layer, ())) for rank, by_layer in layers.items()}
-        cut_streams = _cut_plans(graph, applied.streams)
-        key = _cut_layer_key(graph, book, cut_streams, need_eval)
-        cached = handle._layer_cache.get(key)
-        if cached is not None:
-            handle._layer_cache.move_to_end(key)
-            span_ns, row_eval = cached
-        else:
-            report = _report(scenario.atomic_step.case, graph, handle.evaluation_context,
-                             book, handle._replay, deadline=deadline, fast=not need_eval,
-                             trace_limit=MAX_OVERLAP_TRACE_EVENTS if overlap else 0,
-                             streams=cut_streams, cut=True)
-            span_ns = round(report["duration_ms"] * NS_PER_MS)
-            row_eval = (_evaluation(scenario, graph, report, applied.plan_sha256, "should_achieve")
-                        if need_eval else None)
-            _cache_layer_put(handle._layer_cache, key, (span_ns, row_eval))
-        archetype_ns += span_ns - reference[layer]
-        if row_eval is not None:
-            rows.append(row_eval)
-    evidence = _combine_replays(rows) if need_eval else baseline
-    return max(0, baseline_ns + archetype_ns - handle.archetype_u_ns), archetype_ns, evidence
+        span, row = _replay_cut(handle, seed, graph, book, _cut_plans(graph, applied.streams),
+                                need_eval, MAX_OVERLAP_TRACE_EVENTS if overlap else 0, deadline)
+        reference = seed.reference[layer]
+        if rebind:
+            original = seed.layers[layer]
+            reference, comparison = _replay_cut(handle, seed, original, seed.book,
+                _cut_plans(original, scenario.stream_plans), True, 0, deadline)
+            comparisons.append(comparison)
+        archetype_ns += span - reference
+        if row is not None:
+            rows.append(row)
+    evidence = _combine_replays(rows) if rows else baseline
+    comparison = _combine_replays(comparisons) if comparisons else baseline
+    return max(0, baseline_ns + archetype_ns - seed.total_ns), archetype_ns, evidence, comparison
 
 def evaluate_rewrites(
     scenario: ScenarioHandle, candidates: Sequence[RewritePlan], *, budget: EvalBudget = EvalBudget(),
@@ -506,29 +665,38 @@ def evaluate_rewrites(
     deadline = _deadline(budget, scenario._replay)
     coverage = _coverage(scenario)
     results = []
-    seen = {}
     for plan in islice(candidates, budget.max_candidates):
         digest = ""
         try:
             digest = plan_sha256(plan)
             _check_budget(budget, deadline)
-            if digest in seen:
-                results.append(seen[digest])
+            with scenario._cache_lock:
+                hit = scenario._candidates.get(digest)
+                if hit is not None:
+                    scenario._candidates.move_to_end(digest)
+            if hit is not None:
+                _check_budget(budget, deadline)
+                results.append(hit)
                 continue
-            resolved, book, baseline = _baseline(scenario, plan)
+            seed = _baseline(scenario, plan)
+            resolved, work = _screen_scenario(seed, plan)
             applied = apply_plan(plan, resolved)
-            wall, archetype_wall, evidence = _estimate(scenario, resolved, applied, book,
-                                                       baseline, budget, deadline)
-            verification = verify_plan(resolved, applied, step_eval=evidence, wall_ns=wall, scope="archetype")
+            wall, archetype_wall, evidence, comparison = _estimate(
+                scenario, seed, resolved, applied, budget, deadline)
+            verification = verify_plan(resolved, applied, step_eval=evidence, wall_ns=wall,
+                scope="archetype", baseline_eval=comparison, baseline_work=work)
             _check_budget(budget, deadline)
             failure = next((gate.reason for gate in verification.gates if not gate.passed), "")
+            coverage = len(seed.reference) / len(seed.layers) if seed.layers else 1.0
             result = CandidateEvaluation(digest, "gate_failed" if failure else "ok", "archetype",
                                          wall, archetype_wall, coverage, verification, failure)
-            seen[digest] = result
         except TimeoutError as error:
             result = CandidateEvaluation(digest, "cancelled", "archetype", None, None, coverage, None, str(error))
         except (ValueError, TypeError) as error:
             result = CandidateEvaluation(digest, "invalid", "archetype", None, None, coverage, None, str(error))
+        if digest and result.status != "cancelled":
+            with scenario._cache_lock:
+                _memo_put(scenario._candidates, digest, result)
         results.append(result)
     return BatchEvaluation(scenario.scenario_digest, "archetype", tuple(results), (monotonic() - started) * 1000)
 
@@ -539,20 +707,35 @@ def finalize_plan(
     started = monotonic()
     deadline = _deadline(budget, scenario._replay)
     _check_budget(budget, deadline)
-    resolved, book, baseline = _baseline(scenario, plan)
+    seed = _baseline(scenario, plan)
+    resolved, baseline = seed.scenario, seed.evaluation
     applied = apply_plan(plan, resolved)
-    graphs, book = _bind_replay(resolved, applied, book)
-    overlap = any(len(stream.lanes) > 1 for stream in applied.streams)
+    graphs, book = _bind_replay(resolved, applied, seed.book, scenario.evaluation_context.bindings.topology,
+                               scenario._replay.include_submission)
+    overlap = any(len(stream.lanes) > 1 for stream in applied.streams) or any(
+        tile.cohort_split == "dbo_2cohort" for tile in applied.tile_bindings)
     report = _report(resolved.atomic_step.case, graphs, scenario.evaluation_context, book, scenario._replay,
                      deadline=deadline, streams=applied.streams,
                      trace_limit=MAX_OVERLAP_TRACE_EVENTS if overlap else 0)
     step = _evaluation(resolved, graphs, report, applied.plan_sha256, baseline.tier if not plan.edits
                        else "should_achieve", resolved.atomic_step if not plan.edits else None)
     wall = round(step.span_ms * NS_PER_MS)
+    if dual_certificate is None and dual_program is None and event_dag is None:
+        from mindie_sim.optimization.dual_bound import build_dual_inputs_from_scenario, certify_lower_bound
+
+        if not scenario._certificate:
+            program, dag, _ = build_dual_inputs_from_scenario(scenario.scenario)
+            certificate, _ = certify_lower_bound(program, dag)
+            with scenario._cache_lock:
+                if not scenario._certificate:
+                    scenario._certificate.extend((program, dag, certificate))
+        dual_program, event_dag, dual_certificate = scenario._certificate
+    _check_budget(budget, deadline)
     verification = verify_plan(resolved, applied, step_eval=step, wall_ns=wall,
                                dual_certificate=dual_certificate, dual_program=dual_program,
                                event_dag=event_dag, baseline_u_ns=scenario.full_u_ns,
-                               baseline_m_ns=scenario.full_m_ns)
+                               baseline_m_ns=scenario.full_m_ns, baseline_eval=baseline,
+                               baseline_work=seed.work)
     return FullPlanEvaluation(scenario.scenario_digest, applied.plan_sha256, "full", step, wall,
                               verification, applied, (monotonic() - started) * 1000)
 

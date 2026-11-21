@@ -2,13 +2,14 @@
 
 [Role] Exercise interning, context reuse, bounded batches, and final replay.
 [Invariants] Each layer is counted once and full replay has its own receipt.
-[Timeouts & Locks] Monotonic deadlines and a warmed, bounded four-plan batch.
-[Side-Effect Policy] Analytical replay with an in-memory oracle cache.
+[Timeouts & Locks] Monotonic deadlines and bounded cold and warm candidate batches.
+[Side-Effect Policy] Analytical replay and a temporary SQLite store.
 """
 from __future__ import annotations
 
 from collections import Counter
 from dataclasses import replace
+import sqlite3
 from time import monotonic
 
 import pytest
@@ -18,6 +19,7 @@ from mindie_sim.compose import compose_case
 from mindie_sim.optimization import build_dual_inputs_from_scenario, certify_lower_bound
 from mindie_sim.prediction.cost import CostModel
 from mindie_sim.prediction.evaluation import EvaluationContext, ExecutionBindings
+from mindie_sim.prediction.primitives import PrimitiveStore
 from mindie_sim.prediction.results import StepRequest
 from mindie_sim.prediction.spine import PredictionSpine
 from mindie_sim.rewrite import (
@@ -43,10 +45,14 @@ def dossier(request_inputs):
 
 @pytest.fixture(scope="module")
 def candidates(dossier):
+    return _candidate_plans(dossier, {0, 1, 3, 5})
+
+
+def _candidate_plans(dossier, layers):
     scenario = dossier.handle.scenario
     quant = scenario.case.model.quant
     targets = sorted((op for op in scenario.atomic_ops[0].ops
-                      if op.layer in {0, 1, 3, 5} and op.family in {"qkv_projection", "output_projection"}),
+                      if op.layer in layers and op.family in {"qkv_projection", "output_projection"}),
                      key=lambda op: (op.family, op.layer))
     return tuple(replace(dossier.unmerge_plan, edits=(Edit(
         f"quantize-{i}",
@@ -127,15 +133,18 @@ def test_prepare_reuses_one_context_and_evicts_digest_and_request_alias(request_
     assert len(contexts) == len(bindings) == len(models) == 4
 
 
-def test_warm_batch_screens_distinct_changed_archetype_plans(dossier, candidates):
-    plans = candidates[:4]
+@pytest.mark.parametrize("size", (4, 8))
+def test_warm_batch_screens_distinct_changed_archetype_plans(size):
+    case = compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a5"], tp=1, dp=1, layers=64)
+    dossier = prepare_scenario(ScenarioRequest(case, StepRequest("decode", context=64)))
+    plans = _candidate_plans(dossier, {0, 1, 31, 63})[:size]
+    assert len(plans) == size
+    assert sum(archetype.multiplicity for archetype in dossier.archetypes) == 64
     warmup = evaluate_rewrites(dossier.handle, plans)
-    started = monotonic()
     result = evaluate_rewrites(dossier.handle, plans)
-    elapsed_ms = (monotonic() - started) * 1000
-    print(f"Warm four-plan rewrite batch {elapsed_ms:.3f} ms")
-    assert elapsed_ms < 250, f"warm four-plan batch took {elapsed_ms:.3f} ms"
-    assert 0 <= result.elapsed_ms <= elapsed_ms
+    print(f"{size}-plan batch: cold {warmup.elapsed_ms:.3f} ms, warm {result.elapsed_ms:.3f} ms")
+    assert warmup.elapsed_ms < 50, f"cold {size}-plan batch took {warmup.elapsed_ms:.3f} ms"
+    assert result.elapsed_ms < 50, f"warm {size}-plan batch took {result.elapsed_ms:.3f} ms"
     assert result.scenario_digest == dossier.scenario_digest and result.scope == "archetype"
     assert result.results == warmup.results
     assert len({item.plan_sha256 for item in result.results}) == len(plans)
@@ -215,3 +224,24 @@ def test_finalize_replays_every_occurrence_and_matches_spine(dossier, candidates
         scenario, result.applied, step_eval=result.step_eval,
         baseline_u_ns=handle.full_u_ns, baseline_m_ns=handle.full_m_ns, **options,
     )
+
+
+def test_reopening_primitive_store_does_not_reuse_closed_context(tmp_path, request_inputs):
+    path = tmp_path / "primitives.sqlite"
+    with PrimitiveStore(path, writable=True):
+        pass
+    cache = OracleCache()
+    with PrimitiveStore(path) as initial:
+        first = prepare_scenario(request_inputs, cache=cache, primitives=initial)
+        first_result = finalize_plan(first.handle, first.unmerge_plan)
+        assert first_result.verification.passed
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        initial.connection.execute("SELECT 1")
+
+    with PrimitiveStore(path) as reopened:
+        second = prepare_scenario(request_inputs, cache=cache, primitives=reopened)
+        assert second.scenario_digest == first.scenario_digest
+        assert second.handle is not first.handle
+        assert second.handle.evaluation_context.cost.primitives is reopened
+        result = finalize_plan(second.handle, second.unmerge_plan)
+        assert result.verification.passed and result.wall_ns == first_result.wall_ns

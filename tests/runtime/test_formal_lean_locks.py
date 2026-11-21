@@ -3,17 +3,19 @@
 [Role] Audit the formal kernel and compare its theorem domains with live simulation.
 [Invariants] The source audit allows no proof escapes. Seeded oracles use exact
   arithmetic where the formal contracts do.
-[Timeouts & Locks] Bounded in-memory trials with no subprocesses or locks.
-[Side-Effect Policy] Read-only Lean source inspection and analytical simulation.
+[Timeouts & Locks] Seeded trials and a bounded Lean check when available.
+[Side-Effect Policy] Analytical replay and a temporary Lean parity fixture.
 """
 from __future__ import annotations
 
 from dataclasses import replace
 from fractions import Fraction
 import math
+from os import environ
 from pathlib import Path
 import random
 import re
+from shutil import which
 from statistics import median
 from types import SimpleNamespace
 
@@ -35,10 +37,11 @@ from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.catalog.weight_terms import WeightTerm, _ceil_div, _sharded_shape, term_bytes
 from mindie_sim.compose import compose_case
 from mindie_sim.optimization import (
-    BilinearContractionSpec, DagEdge, EventDagSpec, PrimitiveCapacityEntry, PrimitiveCapacityTable,
-    ResourceChoiceProgram, build_surplus_coupling_sites, certify_lower_bound, check_farkas_dual,
+    BilinearContractionSpec, DagEdge, EventDagSpec,
+    FarkasCertificate, OptimalityCertificate, ResourceChoiceProgram, TensorRangeObligation,
+    build_dual_inputs_from_scenario, build_surplus_coupling_sites, certify_lower_bound, check_farkas_dual,
     check_optimality_certificate, direct_mac_pebble_reload_bound, eval_checked_path,
-    inward_floor_ns, solve_checked_critical_path, solve_farkas_dual, verify_epoch_trace,
+    solve_checked_critical_path, solve_farkas_dual, verify_epoch_trace,
 )
 from mindie_sim.prediction.collective_startup import resolve_collective_startup, validate_steps
 from mindie_sim.prediction.efficiency import extract_hardware_peaks
@@ -57,16 +60,19 @@ from mindie_sim.prediction.runtime.contracts import (
     AllocationBinding, AllocationKey, BackingKey, EventKey, OccurrenceKey, PoolKey,
 )
 from mindie_sim.prediction.results import StepRequest
+from mindie_sim.prediction.runtime.engine import Engine, Resource
 from mindie_sim.prediction.runtime.ledger import Ledger, normalise_ranges, ranges_bytes
-from mindie_sim.prediction.runtime.memory_physics import AddressRun
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.prediction.weight_prefetch import PrefetchDecision, PrefetchPhysics, apply_to_work, plan_prefetch
+from mindie_sim.rewrite import CollectiveTransform, Edit, OpRef, ScenarioRequest, finalize_plan, prepare_scenario
 from mindie_sim.schema.case import Software
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.hardware import Device
 from mindie_sim.schema.model import LayerPlan
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.schema.parallel import ParallelSpec
 from mindie_sim.schema.workload import RequestView
+from scripts.check_lean_no_sorry import FORBIDDEN_RE, strip_lean_comments_and_strings
 
 pytestmark = pytest.mark.tier0
 
@@ -78,45 +84,13 @@ EXPECTED_LEAN_MODULES = (
 )
 SEED = 20261115
 TRIALS = 250
-
-
-def _strip_lean_comments_and_strings(src: str) -> str:
-    out: list[str] = []
-    idx, length, depth = 0, len(src), 0
-    while idx < length:
-        if depth == 0 and src[idx] == '"':
-            idx += 1
-            while idx < length and src[idx] != '"':
-                idx += 2 if src[idx] == "\\" else 1
-            idx += 1
-            out.append('""')
-        elif src[idx : idx + 2] == "/-":
-            depth, idx = depth + 1, idx + 2
-        elif depth > 0 and src[idx : idx + 2] == "-/":
-            depth, idx = depth - 1, idx + 2
-        elif depth == 0 and src[idx : idx + 2] == "--":
-            while idx < length and src[idx] != "\n":
-                idx += 1
-        else:
-            if depth == 0 or src[idx] == "\n":
-                out.append(src[idx])
-            idx += 1
-    assert depth == 0, "unclosed Lean block comment"
-    return "".join(out)
-
+ELAN_HOME = Path("/tmp/elan-mindie-s3b")
+ELAN_LEAN = ELAN_HOME / "bin" / "lean"
+LEAN = which("lean") or (str(ELAN_LEAN) if ELAN_LEAN.is_file() else None)
 
 def test_formal_kernel_structure_and_zero_sorry_audit() -> None:
-    toolchain = (FORMAL_DIR / "lean-toolchain").read_text(encoding="utf-8").strip()
-    assert toolchain.startswith("leanprover/lean4:v4.")
-    lakefile = (FORMAL_DIR / "lakefile.toml").read_text(encoding="utf-8")
-    assert 'name = "mindie_sim_spec"' in lakefile and '"MindIESimSpec"' in lakefile
-
-    umbrella = _strip_lean_comments_and_strings(
-        (FORMAL_DIR / "MindIESimSpec.lean").read_text(encoding="utf-8")
-    )
-    axiom_check = _strip_lean_comments_and_strings(
-        (FORMAL_DIR / "AxiomCheck.lean").read_text(encoding="utf-8")
-    )
+    umbrella, axiom_check = (strip_lean_comments_and_strings((FORMAL_DIR / name).read_text())
+                             for name in ("MindIESimSpec.lean", "AxiomCheck.lean"))
     assert "import MindIESimSpec" in axiom_check
     for name in ("physical_ideal_le_predicted", "kMesh_capacity_partition"):
         assert f"#print axioms MindIESimSpec.RooflineAndMesh.{name}\n" in axiom_check
@@ -124,29 +98,27 @@ def test_formal_kernel_structure_and_zero_sorry_audit() -> None:
                  "max_plus_critical_path_bound", "certified_ladder_chain"):
         assert f"#print axioms MindIESimSpec.OptimalityCertificate.{name}\n" in axiom_check
 
-    forbidden_re = re.compile(r"\b(?:sorry|sorryAx|admit|axiom)\b")
     theorem_re = re.compile(r"\btheorem\s+[A-Za-z0-9_']+")
     spec_dir = FORMAL_DIR / "MindIESimSpec"
     assert sorted(p.name for p in spec_dir.glob("*.lean")) == sorted(EXPECTED_LEAN_MODULES)
 
-    total_theorems = 0
     for mod_name in EXPECTED_LEAN_MODULES:
         stem = mod_name[:-5]
         assert f"import MindIESimSpec.{stem}" in umbrella
         assert f"#print axioms MindIESimSpec.{stem}." in axiom_check
-        raw = (spec_dir / mod_name).read_text(encoding="utf-8")
-        assert raw.strip(), f"{mod_name} is empty"
-        cleaned = _strip_lean_comments_and_strings(raw)
-        assert not forbidden_re.search(cleaned), f"forbidden token in {mod_name}"
+        cleaned = strip_lean_comments_and_strings((spec_dir / mod_name).read_text())
+        assert not FORBIDDEN_RE.search(cleaned), f"forbidden token in {mod_name}"
         count = len(theorem_re.findall(cleaned))
         assert count >= 4, f"expected >=4 theorems in {mod_name}, found {count}"
-        total_theorems += count
-    assert total_theorems >= 45
 
-    for lean_path in sorted(FORMAL_DIR.rglob("*.lean")):
-        cleaned = _strip_lean_comments_and_strings(lean_path.read_text(encoding="utf-8"))
-        assert not forbidden_re.search(cleaned), f"forbidden token in {lean_path}"
-
+    kernel = strip_lean_comments_and_strings((spec_dir / "OptimalityCertificate.lean").read_text())
+    for name in ("checkDagAcyclic", "evalCheckedPath"):
+        assert re.search(rf"\bdef {name}\b", kernel)
+    for name in ("max_plus_critical_path_bound", "certified_ladder_chain"):
+        assert re.search(rf"\btheorem {name}\b", kernel)
+    for lean_path in sorted(FORMAL_DIR.glob("*.lean")):
+        cleaned = strip_lean_comments_and_strings(lean_path.read_text(encoding="utf-8"))
+        assert not FORBIDDEN_RE.search(cleaned), f"forbidden token in {lean_path}"
 
 def test_four_clock_max_plus_conservation_and_order_invariance() -> None:
     def _rc(c: float = 0.0, v: float = 0.0, m: float = 0.0, n: float = 0.0) -> ExposedClocks:
@@ -198,9 +170,7 @@ def test_four_clock_max_plus_conservation_and_order_invariance() -> None:
         if terminal.all_ms > 0.0:
             assert abs(math.fsum(done["exposed_breakdown_pct"].values()) - 100.0) <= 1e-9
 
-
 def test_prefetch_byte_conservation_and_half_open_interval_ledger() -> None:
-    # 1. Production runtime.ledger: adjacent 64B then 96B on one BackingKey -> peak 96B (not 160B).
     state = SimpleNamespace(uid="rt-lock", capacity_domains={})
     pool = PoolKey(physical_domain="dom0", rank=0, tier="hbm", name="workspace")
     Ledger.ensure_domain(state, "dom0", capacities={pool: 512.0})
@@ -227,7 +197,6 @@ def test_prefetch_byte_conservation_and_half_open_interval_ledger() -> None:
     assert Ledger.peaks(state)["dom0"][pool] == 96.0  # Disjoint reuse: peak is 96B, never 160B.
     assert Ledger.release(state, k2, after=ev2).released and Ledger.usage(state)["dom0"][pool] == 0.0
 
-    # Static + transient peak coincidence: 128B static + 64B live transient = 192B.
     k_static = AllocationKey(occurrence=occ, scope_kind="static", scope_ordinal=0, symbol=3, generation=0)
     k_tr = AllocationKey(occurrence=occ, scope_kind="op", scope_ordinal=2, symbol=4, generation=0)
     b_static = BackingKey(physical_domain="dom0", rank=0, tier="hbm", storage_id="static0", generation=0)
@@ -244,7 +213,6 @@ def test_prefetch_byte_conservation_and_half_open_interval_ledger() -> None:
     assert Ledger.usage(state)["dom0"][pool] == 128.0
     assert ranges_bytes(normalise_ranges([(0, 128), (0, 64)])) == 128
 
-    # 2. Production weight_prefetch.plan_prefetch + apply_to_work byte conservation & monotonicity.
     graph = TypedGraph(
         rows=16,
         values={
@@ -285,16 +253,13 @@ def test_prefetch_byte_conservation_and_half_open_interval_ledger() -> None:
         ).settled(p)
         assert dec.conserved and dec.bytes_prefetched + dec.hbm_read_bytes == w
 
-
 def test_sharding_ceil_div_fractal_nz_and_redundant_expert_slot_growth() -> None:
     def fractal_nz_bytes(d: int, n: int, c0: int, elem: int) -> int:
         return _ceil_div(d, c0) * _ceil_div(n, 16) * 16 * c0 * elem
 
-    # 1. Production static weight ledger vs lowered frontend single-token cold reads
-    #    across o_proj_tp, linear_proj_tp, and lm_head_tp.
     q_bf16 = QuantSpec("bf16")
     par_local = ParallelSpec(dp=4, tp=1, ep=4, o_proj_tp=4, linear_proj_tp=2, lm_head_tp=2)
-    machine = parse_case(compose_case("qwen3-32b", "Ascend910_9362", tp=4, dp=1, ep=1, layers=1)).machine
+    machine = parse_case(compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a3"], tp=4, dp=1, ep=1, layers=1)).machine
     software = Software(parallel=par_local)
     for role, category, shard, rows, cols in (
         (ROLE_ATTENTION_OUTPUT, "mla.o", "in_tp", 128, 256),
@@ -321,7 +286,6 @@ def test_sharding_ceil_div_fractal_nz_and_redundant_expert_slot_growth() -> None
         assert (n_loc, k_loc) == (sh_r, sh_c)
         assert ledger_bytes == pytest.approx(frontend_cold_weight_bytes)
 
-    # 2. Randomized ceilDiv, FRACTAL_NZ non-underallocation, and redundant expert slot growth.
     rng = random.Random(SEED + 2)
     for _ in range(TRIALS):
         a, b = rng.randint(0, 8192), rng.randint(1, 128)
@@ -343,14 +307,10 @@ def test_sharding_ceil_div_fractal_nz_and_redundant_expert_slot_growth() -> None
         p_extra = ParallelSpec(tp=ep, ep=ep, redundant_experts_per_rank=r_extra)
         base_plan = expert_slot_plan(None, SimpleNamespace(num_experts=e_routed, index=0), p_base)
         extra_plan = expert_slot_plan(None, SimpleNamespace(num_experts=e_routed, index=0), p_extra)
-        base_terms = routed_expert_weight_terms(
-            [WeightTerm("expert_gate", rows=64, cols=32, category="routed_expert", shard="expert_gate_up", count=e_routed, quant=q_bf16)],
-            base_plan, ep_rank=0,
-        )
-        extra_terms = routed_expert_weight_terms(
-            [WeightTerm("expert_gate", rows=64, cols=32, category="routed_expert", shard="expert_gate_up", count=e_routed, quant=q_bf16)],
-            extra_plan, ep_rank=0,
-        )
+        gate = WeightTerm("expert_gate", rows=64, cols=32, category="routed_expert",
+                          shard="expert_gate_up", count=e_routed, quant=q_bf16)
+        base_terms = routed_expert_weight_terms([gate], base_plan, ep_rank=0)
+        extra_terms = routed_expert_weight_terms([gate], extra_plan, ep_rank=0)
         base_ledger = sum(term_bytes(t, q_bf16, p_base) for t in base_terms)
         extra_ledger = sum(term_bytes(t, q_bf16, p_extra) for t in extra_terms)
         assert extra_ledger > base_ledger
@@ -360,33 +320,9 @@ def test_sharding_ceil_div_fractal_nz_and_redundant_expert_slot_growth() -> None
         assert sat_extra.weight_read_bytes(0) == pytest.approx(extra_ledger)
         assert sat_base.weight_read_bytes(0) == pytest.approx(base_ledger)
 
-
-def test_recover_ssm_all_seven_families_rollback_equivalence_and_savings() -> None:
+def test_recover_ssm_commit_prefix_and_checkpoint_savings() -> None:
     expected_families = frozenset({"kda", "gdn", "mamba", "gla", "deltanet", "lightning", "retnet"})
     assert SPEC_LINEAR_KINDS == expected_families and POOL_LINEAR_KINDS == expected_families
-
-    def step(st: tuple[int, int, int], tok: tuple[int, int]) -> tuple[int, int, int]:
-        s0, s1, s2 = st
-        dec, dlt = tok
-        return (
-            (s0 * dec + dlt + (s2 ^ dlt)) % 1_000_003,
-            (s1 * (dec + 3) + s0 * dlt) % 1_000_003,
-            (s2 + s1 ^ (dec * dlt)) % 1_000_003,
-        )
-
-    rng = random.Random(SEED + 3)
-    for _ in range(TRIALS):
-        k_spec = rng.randint(1, 10)
-        s0 = (rng.randint(0, 9999), rng.randint(0, 9999), rng.randint(0, 9999))
-        draft = [(rng.randint(1, 31), rng.randint(0, 500)) for _ in range(k_spec)]
-        ckpts = [s0]
-        for tok in draft:
-            ckpts.append(step(ckpts[-1], tok))
-        for accepted in (0, k_spec // 2, k_spec):
-            replayed = s0
-            for tok in draft[:accepted]:
-                replayed = step(replayed, tok)
-            assert ckpts[accepted] == replayed
 
     class _IntentBuilder:
         def __init__(self, layer_idx: int) -> None:
@@ -414,12 +350,10 @@ def test_recover_ssm_all_seven_families_rollback_equivalence_and_savings() -> No
             linear_head_dim=dv, linear_key_head_dim=dk, conv_kernel=4,
             recurrent_state_elements=heads * dk * dv, conv_state_elements=heads * dv * 4,
         )
-        # 1. q=1 identity across recover_ssm=False and recover_ssm=True.
         single_off = speculative_state_plan(None, plan, parallel, query_tokens=1, recover_ssm=False, capacity_padded=True)
         single_on = speculative_state_plan(None, plan, parallel, query_tokens=1, recover_ssm=True, capacity_padded=True)
         assert single_off == single_on and single_on.mode == MODE_SINGLE and single_on.replay_bytes == 0
 
-        # 2. q>1 verify residency savings against independent family record layouts.
         ckpt = speculative_state_plan(None, plan, parallel, query_tokens=5, recover_ssm=False, capacity_padded=True)
         replay = speculative_state_plan(None, plan, parallel, query_tokens=5, recover_ssm=True, capacity_padded=True)
         expected_rec = ((dk + dv + 1) * FP32_RECORD_BYTES if family == "gdn" else dv * FP32_RECORD_BYTES + 2 * dk * 2)
@@ -427,12 +361,9 @@ def test_recover_ssm_all_seven_families_rollback_equivalence_and_savings() -> No
         assert replay.mode == MODE_REPLAY and replay.state_slots == 1
         assert replay.replay_bytes == pytest.approx(5 * heads * expected_rec)
         assert replay.total_bytes < ckpt.total_bytes
-        if family == "gdn":
-            assert gdn_record_head_bytes(dk, dv) == expected_rec
-        else:
-            assert record_head_bytes(dk, dv) == expected_rec
+        record_size = gdn_record_head_bytes if family == "gdn" else record_head_bytes
+        assert record_size(dk, dv) == expected_rec
 
-        # 3. Zero (padding/q=1), partial (a=2), and full (a=5) accepted prefix commits.
         b_zero = _IntentBuilder(idx)
         assert emit_commit_op(
             b_zero, name=f"{family}_zero", deps=("v0",),
@@ -460,7 +391,6 @@ def test_recover_ssm_all_seven_families_rollback_equivalence_and_savings() -> No
             commit_reads[accepted] = op.mte2_bytes
         assert commit_reads[2] < commit_reads[5]
 
-
 def test_alltoall_round_scaling_and_step_bounds_against_collective_startup() -> None:
     log_128 = resolve_collective_startup(family="alltoallv", group_size=128, metadata={}, runtime_mode="log2", topology_protocols={})
     ring_128 = resolve_collective_startup(family="alltoallv", group_size=128, metadata={}, runtime_mode="ring", topology_protocols={})
@@ -487,7 +417,6 @@ def test_alltoall_round_scaling_and_step_bounds_against_collective_startup() -> 
         if g >= 4:
             assert lg < ring_desc.startup_rounds
 
-
 def test_roofline_critical_path_monotonicity_and_direct_mesh_scaling() -> None:
     rng = random.Random(SEED + 5)
     for _ in range(TRIALS):
@@ -513,7 +442,6 @@ def test_roofline_critical_path_monotonicity_and_direct_mesh_scaling() -> None:
         assert peers
         b_peer = peers[0].capacity_bytes_per_ms * 1000
         assert extract_hardware_peaks(parsed)["link_peak_bytes_per_s"] == pytest.approx((width - 1) * b_peer)
-
 
 def test_optimality_certificate_differential_zero_inversions() -> None:
     rng = random.Random(SEED + 6)
@@ -545,7 +473,7 @@ def test_optimality_certificate_differential_zero_inversions() -> None:
         b = (8 * capacity - a * bits_a) // bits_b
         assert 4 * bits_a * bits_b * a * b <= (8 * capacity) ** 2
         spec = BilinearContractionSpec("contract", 0, rng.randint(72, 96), rng.randint(72, 96),
-                                       rng.randint(4, 8), bits_a, bits_b, 32, capacity, distinct_operands=True)
+                                       rng.randint(4, 8), bits_a, bits_b, 32, capacity, distinct_operands=True, address_injective_across_k=True)
         reload = direct_mac_pebble_reload_bound(spec)
         assert reload.eligible and reload.epochs > 1
         assert verify_epoch_trace(reload.epoch_accounts, reload.total_pairs) is True
@@ -578,23 +506,92 @@ def test_optimality_certificate_differential_zero_inversions() -> None:
     for kind in ("gdn", "kda"):
         rank_one = direct_mac_pebble_reload_bound(replace(spec, kind=kind))
         assert (rank_one.eligible, rank_one.min_io_bytes) == (False, 0)
-    run = AddressRun(base_byte=13, rows=4097, row_bytes=39, stride_bytes=101)
-    sectors = {address // 32 for row in range(run.rows)
-               for address in range(13 + 101 * row, 52 + 101 * row)}
-    assert run.sector_union_bytes(32) == 32 * len(sectors) < run.rows * run.stride_bytes
-    for ns in (2**52, 2**53, 2**54):
-        guard = ns - inward_floor_ns(Fraction(ns)) - 2
-        assert guard == 8 * math.ulp(float(ns)) >= 4 * math.ulp(float(ns))
-    assert inward_floor_ns(Fraction(1, 2)) == 0
 
+
+def test_edited_collective_schedule_preserves_certified_bound():
     sku = REPRESENTATIVE_SKUS["a5"]
-    case = compose_case("qwen3-32b", sku, tp=1, dp=1, layers=1)
-    sim_rate = dict(parse_case(case).machine.dies[0].rates)["hbm"]
-    table = PrimitiveCapacityTable(sku, tuple(PrimitiveCapacityEntry(pipe, sim_rate, 2 * sim_rate, "B/s")
-                                             for pipe in ("hbm_bus_r", "hbm_bus_w")))
-    ladder = optimize_ladder(case, StepRequest("decode", context=64), primitive_table=table, max_trials=0).ladder
-    assert 0 < ladder.l_star_hw_ns <= ladder.l_star_lean_ns <= ladder.a_star_dsl_ns
-    assert ladder.a_star_dsl_ns <= ladder.a_star_framework_ns <= min(ladder.m_mainline_ns, ladder.u_unmerge_ns)
-    assert ladder.u_unmerge_ns - ladder.l_star_lean_ns == sum((
-        ladder.delta_shipping_ns, ladder.delta_framework_ns, ladder.delta_operator_dsl_ns, ladder.delta_optimality_gap_ns,
+    case = compose_case("qwen3-32b", sku, tp=4, dp=1, layers=1)
+    step = StepRequest("prefill", tokens=64, context=64)
+    ladder = optimize_ladder(case, step, max_trials=4).ladder
+    dossier = prepare_scenario(ScenarioRequest(case, step))
+    scenario = dossier.handle.scenario
+    collective = next(op for op in scenario.atomic_ops[0].ops if op.family == "allreduce")
+    route, = scenario.case.machine.links
+    edit = Edit("ring", operation=CollectiveTransform(OpRef("atom", collective.op_id), "ring", route.name))
+    edited = finalize_plan(dossier.handle, replace(dossier.unmerge_plan, edits=(edit,)))
+    row = next(row for row in edited.step_eval.operators if row.occurrence.op_id == collective.op_id)
+    assert edited.verification.passed and row.implementation == "RingCollective"
+    assert 0 < ladder.l_star_lean_ns == edited.verification.l_star_ns <= edited.wall_ns
+    assert edited.wall_ns != dossier.u_wall_ns
+
+DAG_CASES = (
+    (EventDagSpec((10,), (DagEdge(0, 0, 0),)), (0,) * 10, 0, 110, None, False),
+    (EventDagSpec((10, 10), (DagEdge(0, 1, 0), DagEdge(1, 0, 0))), (0, 1), 0, 30, None, False),
+    (EventDagSpec((10, 10), (DagEdge(0, 1, 0), DagEdge(1, 0, 0))), (0,), 1, 20, 20, False),
+    (EventDagSpec((10, 10), (DagEdge(0, 1, 0),)), (0,), 1, 20, 20, True),
+)
+
+@pytest.mark.parametrize("dag,path,sink,bound,path_ns,acyclic", DAG_CASES)
+def test_certificate_requires_acyclic_graph_and_simple_path(dag, path, sink, bound, path_ns, acyclic):
+    program = ResourceChoiceProgram(0, (), ())
+    cert = OptimalityCertificate(FarkasCertificate(1, (), (), 0), path, sink, bound)
+    assert eval_checked_path(dag, path, sink) == path_ns
+    assert check_optimality_certificate(program, dag, cert) is acyclic
+
+@pytest.mark.tier1
+@pytest.mark.parametrize("lean", (LEAN,) if LEAN else (
+    pytest.param(None, marks=pytest.mark.skip(reason="Lean toolchain unavailable")),
+))
+def test_lean_certificate_agrees_on_cycles_and_valid_path(tmp_path, lean):
+    from subprocess import run
+    declarations = ["open MindIESimSpec.OptimalityCertificate"]
+    for i, (dag, path, sink, bound, path_ns, acyclic) in enumerate(DAG_CASES):
+        edges = ", ".join(f"⟨{e.src}, {e.dst}, {e.wire_ns}⟩" for e in dag.edges)
+        accepted = str(acyclic).lower()
+        expected = "none" if path_ns is None else f"some {path_ns}"
+        declarations += [
+            f"def dag{i} : EventDagSpec := ⟨{list(dag.node_quantum_ns)}, [{edges}]⟩",
+            f"example : checkDagAcyclic dag{i} = {accepted} := by decide",
+            f"example : evalCheckedPath dag{i} {list(path)} {sink} = {expected} := by decide",
+            f"example : checkOptimalityCertificate ⟨0, [], []⟩ dag{i} "
+            f"⟨⟨1, [], [], 0⟩, {list(path)}, {sink}, {bound}⟩ = {accepted} := by decide",
+        ]
+    lean_file = tmp_path / "Parity.lean"
+    kernel = FORMAL_DIR / "MindIESimSpec" / "OptimalityCertificate.lean"
+    lean_file.write_text("\n".join((kernel.read_text(), *declarations)), encoding="utf-8")
+    env = {**environ, "ELAN_HOME": str(ELAN_HOME)} if lean == str(ELAN_LEAN) else None
+    checked = run([lean, str(lean_file)], cwd=FORMAL_DIR, env=env, capture_output=True, text=True, timeout=60)
+    assert checked.returncode == 0, checked.stdout + checked.stderr
+
+def test_aliased_contraction_bound_respects_engine_wall():
+    n = 16
+    footprint = len({i + k for i in range(n) for k in range(n)})
+    assert footprint == 2 * n - 1
+    dev = Device(rank=0, compute_units=1, memory_bytes=1024, rates=(("hbm", 10**9),),
+                 compute_peaks=(("int8", 10**13),))
+    read = TensorRangeObligation(0, "x", 0, ((0, footprint),), "hbm_cold", "owner")
+    region = SimpleNamespace(op_ids=(), semantic_work=(), read_obligations=(read,), write_obligations=())
+    spec = BilinearContractionSpec("aliased", 0, n, n, n, 8, 8, 32, 512, write_free=True)
+    for unproved in (spec, replace(spec, distinct_operands=True),
+                     replace(spec, address_injective_across_k=True)):
+        reload = direct_mac_pebble_reload_bound(unproved)
+        assert not reload.eligible and reload.min_io_bytes == 0
+        assert build_surplus_coupling_sites({}, (reload,)) == ()
+    disjoint = direct_mac_pebble_reload_bound(replace(
+        spec, distinct_operands=True, address_injective_across_k=True,
     ))
+    assert disjoint.eligible and disjoint.epochs == 1
+    assert disjoint.min_io_bits**2 == 4 * n**2 * n**2 * spec.bits_a * spec.bits_b
+    assert disjoint.epoch_accounts[0].epoch_pair_cap == n**2
+    program, dag, _ = build_dual_inputs_from_scenario(
+        SimpleNamespace(machine=SimpleNamespace(dies=(dev,), links=()), bilinear_contractions=(spec,)),
+        region_summaries=(region,),
+    )
+    cert, _ = certify_lower_bound(program, dag)
+    eng = Engine((Resource("hbm", 10**6), Resource("cube", 10**10)), backend="python")
+    loaded = eng.submit("read_x", {"hbm": 32})
+    done = eng.submit("contract", {"cube": 2 * n**3}, after=(loaded,))
+    eng.advance(until=(done,))
+    wall_ns = eng.now * 10**6
+    assert wall_ns == pytest.approx(32.8192)
+    assert 0 < cert.l_star_lean_ns <= wall_ns

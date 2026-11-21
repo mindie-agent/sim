@@ -16,14 +16,16 @@ import pytest
 
 from _support.axes import REPRESENTATIVE_SKUS
 from mindie_sim.compose import compose_case
-from mindie_sim.prediction.results import StepRequest
+from mindie_sim.prediction.fusion_ports import declared_control_order
+from mindie_sim.prediction.results import ReplayOptions, StepRequest
 from mindie_sim.prediction.runtime.tile_solver import LiveBufferSpec, TileCandidate, TileShape
 from mindie_sim.prediction.streams import bind_stream_owners
 from mindie_sim.rewrite import (
     CollectiveTransform, Edit, FuseRegion, HoistOrDeduplicate, KernelBoundary, OpRef,
     PipelineTiles, PortRef, QuantizeContract, RewritePlan, SelectTemplate, StreamCoreBudget,
-    StreamEvent, StreamLane, StreamSchedule, TilePipelineSpec, WeightPrefetch, apply_plan,
-    decode_rewrite_plan, empty_plan, encode_rewrite_plan, plan_sha256, resolve_scenario,
+    ScenarioRequest, StreamEvent, StreamLane, StreamSchedule, TilePipelineSpec, WeightPrefetch, apply_plan,
+    compute_overlap_pct, decode_rewrite_plan, empty_plan, encode_rewrite_plan, finalize_plan, plan_sha256,
+    prepare_scenario, resolve_scenario,
 )
 from mindie_sim.schema.common import ModelingError
 
@@ -266,6 +268,11 @@ def test_prefetch_clamps_to_l1_and_conserves_bytes(dense):
     assert target.hbm_bytes == qkv.hbm_bytes == meta["weight_prefetch_foreground_bytes"] + capacity
     assert meta["weight_prefetch_bytes"] == capacity
 
+    noop = replace(edit, operation=replace(edit.operation, max_bytes=0))
+    zero = apply_plan(_plan(dense, noop), dense)
+    assert not zero.prefetch_leases and not zero.edit_receipts[0].affected_ops
+    assert zero.executable == apply_plan(_plan(dense), dense).executable
+
 
 def test_quantization_projection_respects_exclusions_and_checkpoint(dense):
     qkv = next(op for op in dense.atomic_ops[0].ops if op.family == "qkv_projection")
@@ -318,3 +325,123 @@ def test_group_list_elision_replaces_host_sync_contract(routed):
     assert meta["elide_d2h"] is meta["device_group_list"] is True
     assert meta["eager_d2h_sync"] is meta["requires_host_split_sizes"] is False
     assert (updated.deps, updated.flops) == (router.deps, router.flops)
+
+
+def test_fusion_redirects_control_and_typed_edges_without_flattening_ports(dense):
+    rank, = dense.atomic_ops
+    norm, matmul, user, *_ = rank.ops
+    release = replace(norm, op_id="release", family="release", deps=(), metadata=())
+    producer = replace(norm, op_id="producer", deps=(), metadata=())
+    operand = {"producer": producer.op_id, "port": "output", "version": 2}
+    a = replace(norm, op_id="a", deps=(), metadata=(
+        ("control_deps", (release.op_id,)), ("typed_inputs", (operand,)),
+    ))
+    b = replace(matmul, op_id="b", deps=(a.op_id,))
+    typed = {"producer": b.op_id, "port": "output", "version": 1}
+    user = replace(user, op_id="user", deps=(), metadata=(
+        ("control_deps", (b.op_id,)), ("typed_inputs", (typed,)),
+    ))
+    scenario = replace(dense, atomic_ops=(replace(rank, ops=(release, producer, a, b, user)),))
+    plan = _plan(scenario, Edit("region", operation=_fuse(a.op_id, b.op_id, preserve=(b.op_id,))))
+    result = apply_plan(plan, scenario)
+    release_after, producer_after, region, user_after = result.executable[0].ops
+    assert (release_after, producer_after) == (release, producer)
+    assert set(region.deps) == {release.op_id, producer.op_id}
+    assert declared_control_order(region.metadata) == (release.op_id,)
+    assert dict(region.metadata)["typed_inputs"] == (operand,)
+    assert user_after.deps == declared_control_order(user_after.metadata) == (region.op_id,)
+    assert dict(user_after.metadata)["typed_inputs"] == ({**typed, "producer": region.op_id},)
+
+
+def test_deduplication_requires_equal_constant_values(dense):
+    rank, = dense.atomic_ops
+    prototype, consumer, *_ = rank.ops
+    constants = tuple(replace(prototype, op_id=f"constant-{i}", deps=(),
+                              metadata=(("pure", True), ("constant_value", i))) for i in (1, 2))
+    ids = tuple(op.op_id for op in constants)
+    scenario = replace(dense, atomic_ops=(replace(rank, ops=(
+        *constants, replace(consumer, deps=ids),
+    )),))
+    edit = Edit("dedup", operation=HoistOrDeduplicate(tuple(map(_atom, ids)), "intra_step"))
+    with pytest.raises(ModelingError, match="rewrite_cse_signature_mismatch"):
+        apply_plan(_plan(scenario, edit), scenario)
+    original = apply_plan(_plan(scenario), scenario).executable[0].ops
+    assert original[:2] == constants and original[-1].deps == ids
+
+
+def test_pipeline_rejects_aic_buffer_in_aiv_ub(dense):
+    target = next(op for op in dense.atomic_ops[0].ops if op.family == "qkv_projection")
+    pipeline = _pipeline(target.family)
+    tile, = pipeline.candidates
+    illegal = replace(tile.buffers[0], bytes_per_owner=4 * 1024**3, owner_kind="aic")
+    pipeline = replace(pipeline, candidates=(replace(tile, buffers=(illegal,)),))
+    edit = Edit("oversized", operation=PipelineTiles(_atom(target.op_id), pipeline))
+    with pytest.raises(ModelingError, match=r"MULTI_POOL_CAPACITY:.*:ub:owner"):
+        apply_plan(_plan(dense, edit), dense)
+
+
+def test_pipeline_replay_rejects_unregistered_template():
+    case = compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a5"], tp=1, dp=1, layers=1)
+    dossier = prepare_scenario(ScenarioRequest(case, StepRequest("decode", context=64)))
+    target = next(op for op in dossier.handle.scenario.atomic_ops[0].ops if op.family == "qkv_projection")
+    select = Edit("choose", operation=SelectTemplate(_atom(target.op_id), "K2", "missing_kernel"))
+    tile = Edit("pipeline", (select.edit_id,), PipelineTiles(
+        OpRef("result_of", select.edit_id), _pipeline(target.family),
+    ))
+    plan = replace(dossier.unmerge_plan, edits=(select, tile))
+    with pytest.raises(ModelingError, match=r"rewrite_template_recipe_unbound:.*:missing_kernel"):
+        finalize_plan(dossier.handle, plan)
+
+
+def test_ring_replay_uses_the_intra_package_link():
+    case = compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a3"], tp=2, dp=1, layers=1)
+    dossier = prepare_scenario(ScenarioRequest(case, StepRequest("decode", context=64)))
+    scenario = dossier.handle.scenario
+    collective = next(op for op in scenario.atomic_ops[0].ops if op.family == "allreduce")
+    route = next(link.name for link in scenario.case.machine.links if "intra_package" in link.name)
+    edit = Edit("ring", operation=CollectiveTransform(_atom(collective.op_id), "ring", route))
+    report = finalize_plan(dossier.handle, replace(dossier.unmerge_plan, edits=(edit,)))
+    assert report.verification.passed
+    row = next(row for row in report.step_eval.operators if row.occurrence.op_id == collective.op_id)
+    assert row.implementation == "RingCollective"
+    link_work = report.step_eval.execution_evidence["serviced"]
+    assert any(name.startswith(f"link:{route}") and size > 0 for name, size in link_work.items())
+
+
+def test_two_cohort_replay_records_positive_intervals_on_each_half():
+    case = compose_case("deepseek-v4-flash", REPRESENTATIVE_SKUS["a5"], tp=4, ep=4, layers=1)
+    dossier = prepare_scenario(ScenarioRequest(case, StepRequest("decode", sequences=8, context=64)))
+    grouped = next(op for op in dossier.handle.scenario.atomic_ops[0].ops if op.family == "grouped_gemm")
+    assert grouped.local_shape[0] == 12
+    edit = Edit("split", operation=PipelineTiles(_atom(grouped.op_id), None, "dbo_2cohort"))
+    baseline = finalize_plan(dossier.handle, dossier.unmerge_plan)
+    replayed = finalize_plan(dossier.handle, replace(dossier.unmerge_plan, edits=(edit,)))
+    assert not baseline.step_eval.cohort_intervals
+    assert replayed.verification.passed and replayed.verification.l_star_ns <= replayed.wall_ns
+    intervals = replayed.step_eval.cohort_intervals[grouped.op_id]
+    assert set(intervals) == {0, 1}
+    row = next(row for row in replayed.step_eval.operators if row.occurrence.op_id == grouped.op_id)
+    for cohort in intervals.values():
+        assert cohort and all(row.start_ms <= start < end <= row.end_ms for start, end in cohort)
+    assert replayed.verification.overlap_pct == compute_overlap_pct(intervals[0], intervals[1]) > 5
+
+
+def test_host_split_elision_replays_with_device_count_rendezvous():
+    case = compose_case("qwen3-30b-a3b", REPRESENTATIVE_SKUS["a3"], tp=2, ep=2, dp=1, layers=1,
+                        feature_track="merged", _stack_phase="prefill")
+    request = ScenarioRequest(case, StepRequest("prefill", tokens=12, context=64),
+                              replay=ReplayOptions(include_submission=True))
+    dossier = prepare_scenario(request)
+    router = next(op for op in dossier.handle.scenario.atomic_ops[0].ops if op.family == "router")
+    edit = Edit("elide", operation=HoistOrDeduplicate((_atom(router.op_id),), "device_group_list_elide_d2h"))
+    baseline = finalize_plan(dossier.handle, dossier.unmerge_plan)
+    edited = finalize_plan(dossier.handle, replace(dossier.unmerge_plan, edits=(edit,)))
+    barrier, = baseline.step_eval.execution_evidence["eager_split_barriers"]
+    assert baseline.verification.passed and barrier["total_d2h_bytes"] > 0
+    assert edited.verification.passed and edited.applied.elided_d2h_ops == (router.op_id,)
+    assert not edited.step_eval.execution_evidence.get("eager_split_barriers")
+    rows = {row.occurrence.op_id: row for row in edited.step_eval.operators}
+    gather = next(row for key, row in rows.items() if key.endswith(".moe_histogram_gather"))
+    dispatch = rows[barrier["op_id"]]
+    assert gather.occurrence in dispatch.predecessors and gather.end_ms <= dispatch.start_ms
+    assert dispatch.implementation == "TopologyCollectiveRecipe"

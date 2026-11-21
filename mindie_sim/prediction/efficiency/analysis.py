@@ -172,6 +172,16 @@ def analyze_network_efficiency(
     from ..unmodeled_gate import assert_report_supported, assert_timing_supported
     from .attribution import _fast_operator_and_graph_reports, attribute_program
 
+    pkg = sys.modules.get(__package__ or "")
+    fast_reports_fn = (
+        getattr(pkg, "_fast_operator_and_graph_reports", _fast_operator_and_graph_reports)
+        if pkg is not None else _fast_operator_and_graph_reports
+    )
+    attribute_fn = (
+        getattr(pkg, "attribute_program", attribute_program)
+        if pkg is not None else attribute_program
+    )
+
     assert_timing_supported(parsed, entry="analyze_network_efficiency")
     assert_report_supported(operator_report, entry="analyze_network_efficiency")
     assert_report_supported(graph_report, entry="analyze_network_efficiency")
@@ -179,7 +189,7 @@ def analyze_network_efficiency(
     if operator_report is None:
         from ..evaluation import EvaluationContext
         evaluation = EvaluationContext.create(parsed)
-        operator_report, auto_graph = _fast_operator_and_graph_reports(
+        operator_report, auto_graph = fast_reports_fn(
             parsed, phase=phase, tokens=tokens, context=context,
             sequences=sequences, scope=scope, run_graph=run_graph,
             precomputed_graph=_precomputed_graph,
@@ -240,7 +250,7 @@ def analyze_network_efficiency(
         kind_g[x["operator_kind"]].append(x)
 
     occurrence_graph = occurrence_work_graph(graph_report, analyzed_ops)
-    attribution = attribute_program(
+    attribution = attribute_fn(
         graph_report, analyzed_ops, occurrence_graph=occurrence_graph)
     occurrence_roofline = occurrence_critical_path(
         graph_report, analyzed_ops, graph=occurrence_graph)

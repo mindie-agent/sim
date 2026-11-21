@@ -21,7 +21,6 @@ BITS_PER_BYTE = 8
 MAX_EXPLICIT_STRIDED_ROWS = 4096
 MAX_EXPLICIT_EPOCH_ACCOUNTS = 65536
 BILINEAR_PRODUCT_FACTOR = 4
-BILINEAR_ALIASED_FACTOR = 1
 RANK_ONE_KINDS = frozenset({
     "gdn", "kda", "linear_attention", "mamba", "gla", "deltanet", "lightning", "retnet",
 })
@@ -179,6 +178,9 @@ def _full_epoch(capacity: int, resident: int, denom: int, bits_acc: int) -> Epoc
 
 def direct_mac_pebble_reload_bound(spec: BilinearContractionSpec) -> PebbleReloadResult:
     pairs = spec.m * spec.n
+    if not (spec.distinct_operands and spec.address_injective_across_k):
+        return PebbleReloadResult(spec.contraction_id, spec.die, False,
+                                  "operand_address_multiplicity_unproved", max(0, pairs), 0, 0, 0, ())
     reasons = (
         (spec.crosses_cut, "boundary_crossing_unproved"),
         (spec.pair_injective and spec.kind.lower() not in RANK_ONE_KINDS, "pair_injectivity_unproved"),
@@ -192,8 +194,7 @@ def direct_mac_pebble_reload_bound(spec: BilinearContractionSpec) -> PebbleReloa
                                       max(0, pairs), 0, 0, 0, ())
 
     capacity = BITS_PER_BYTE * spec.pool_capacity_bytes
-    product_factor = BILINEAR_PRODUCT_FACTOR if spec.distinct_operands else BILINEAR_ALIASED_FACTOR
-    denom = product_factor * spec.k_red**2 * spec.bits_a * spec.bits_b
+    denom = BILINEAR_PRODUCT_FACTOR * spec.k_red**2 * spec.bits_a * spec.bits_b
     entry = 0 if spec.cold_entry else capacity
     target_square = pairs * denom
     root = isqrt(target_square)

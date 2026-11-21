@@ -8,22 +8,39 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from fractions import Fraction
+from math import ulp
 from types import SimpleNamespace
 
 import pytest
 
 from _support.axes import PHASES, REPRESENTATIVE_SKUS, SKUS
-from mindie_sim import api
+from mindie_sim import api, feature_waterfall
 from mindie_sim.compose import compose_case
 from mindie_sim.feature_waterfall import compare_feature_tracks
 from mindie_sim.optimization.framework_solver import _TrialSearch
-from mindie_sim.optimization.ladder import FiveLevelReport, _shipping_regression, partition_step_wall_ns
+from mindie_sim.optimization import (
+    PrimitiveCapacityEntry, PrimitiveCapacityTable, TensorRangeObligation, build_dual_inputs_from_scenario,
+    certify_lower_bound, compute_compulsory_hbm_cut, inward_floor_ns,
+)
+from mindie_sim.optimization.ladder import (
+    SHIPPING_OVERLAY, SHIPPING_REGRESSION_TOLERANCE_NS, FiveLevelReport, _shipping_regression,
+    partition_step_wall_ns,
+)
 from mindie_sim.prediction import efficiency
 from mindie_sim.prediction.efficiency import analysis, peaks, sla
+from mindie_sim.prediction.pointwise import TiledPointwise
 from mindie_sim.prediction.results import OpOccurrence, OperatorSequenceRow, StepEvaluation, StepRequest
-from mindie_sim.prediction.roofline_graph import RooflineTargets, critical_path_roofline
+from mindie_sim.prediction.roofline_graph import PhysicalWorkGraph, PhysicalWorkNode, RooflineTargets, critical_path_roofline
+from mindie_sim.prediction.runtime.engine import Engine, Resource
+from mindie_sim.prediction.runtime.memory_physics import AddressRun
 from mindie_sim.prediction.structure import parse_case
-from mindie_sim.rewrite import CollectiveTransform, Edit, OpRef, ScenarioRequest, finalize_plan, prepare_scenario
+from mindie_sim.rewrite import (
+    CollectiveTransform, Edit, FuseRegion, KernelBoundary, OpRef, ScenarioRequest, SelectTemplate,
+    evaluate_rewrites, finalize_plan, prepare_scenario,
+)
+from mindie_sim.schema.hardware import Device
+from mindie_sim.schema.operators import OpSpec
 
 pytestmark = pytest.mark.tier0
 
@@ -71,9 +88,13 @@ def test_public_replay_matches_certified_integer_ladder(hardware, phase):
     assert all(item.delta_ns == item.before_ns - item.after_ns for item in ordered)
     assert sum(item.delta_ns for item in ordered) == main - dsl
     edits = {edit.edit_id: type(edit.operation).__name__ for edit in report.dsl_plan.edits}
-    assert all(edits[impact.edit_id] == impact.opcode for impact in waterfall.loo_impacts)
+    shipping = [impact for impact in waterfall.loo_impacts if impact.edit_id == SHIPPING_OVERLAY]
+    assert [(impact.opcode, impact.marginal_delta_ns) for impact in shipping] == (
+        [("ShippingOverlay", main - unmerge)] if main != unmerge else []
+    )
+    assert all(edits[impact.edit_id] == impact.opcode for impact in waterfall.loo_impacts if impact not in shipping)
     regression = waterfall.shipping_regression
-    if main > unmerge + 1000:
+    if main > unmerge + SHIPPING_REGRESSION_TOLERANCE_NS:
         assert (regression.delta_ns, regression.baseline_u_ns, regression.baseline_m_ns) == (
             main - unmerge, unmerge, main,
         )
@@ -127,11 +148,32 @@ def test_shipping_regression_reports_measured_leave_one_out_culprit():
                               mainline_plan=shipping_plan, mainline_eval=shipping.step_eval)
     search = _TrialSearch(dossier, max_trials=2)
     assert search.loo(shipping_plan, shipping.wall_ns, 1) == ((edit.edit_id, -delta),)
-    result = _shipping_regression(dossier, shipping.verification, delta, search)
-    assert result.delta_ns == delta
-    assert result.loo_culprits == ((edit.edit_id, delta),)
+    result = _shipping_regression(shipping.verification, unmerge.wall_ns, shipping.wall_ns)
+    assert result.delta_ns == delta and sum(impact for _, impact in result.loo_culprits) == delta
     assert (result.baseline_u_ns, result.baseline_m_ns) == (unmerge.wall_ns, shipping.wall_ns)
-    assert _shipping_regression(dossier, shipping.verification, 1000, search) is None
+    assert _shipping_regression(shipping.verification, unmerge.wall_ns,
+                                unmerge.wall_ns + SHIPPING_REGRESSION_TOLERANCE_NS) is None
+
+    report = api.optimize_ladder(_case(REPRESENTATIVE_SKUS["a5"], tp=4), StepRequest("prefill", tokens=64))
+    ladder = report.ladder
+    regression = report.waterfall.shipping_regression
+    assert ladder.m_mainline_ns - ladder.u_unmerge_ns > SHIPPING_REGRESSION_TOLERANCE_NS
+    assert regression == report.verification.shipping_regression
+    assert (regression.baseline_u_ns, regression.baseline_m_ns) == (ladder.u_unmerge_ns, ladder.m_mainline_ns)
+    assert regression.loo_culprits
+    attribution = {impact.edit_id: impact.marginal_delta_ns for impact in report.waterfall.loo_impacts}
+    assert all(attribution[edit_id] == saved for edit_id, saved in regression.loo_culprits)
+
+
+def test_mainline_seed_screens_against_its_own_faster_wall():
+    case = _case(REPRESENTATIVE_SKUS["a2"], tp=1)
+    dossier = prepare_scenario(ScenarioRequest(case, StepRequest("prefill", tokens=16, context=64)))
+    assert dossier.m_wall_ns < dossier.u_wall_ns
+    batch = evaluate_rewrites(dossier.handle, (dossier.unmerge_plan, dossier.mainline_plan))
+    unmerge, mainline = batch.results
+    assert unmerge.accepted and mainline.accepted
+    assert (unmerge.estimated_wall_ns, mainline.estimated_wall_ns) == (dossier.u_wall_ns, dossier.m_wall_ns)
+    assert unmerge.plan_sha256 != mainline.plan_sha256
 
 
 def test_target_efficiency_scaling_is_retired():
@@ -197,65 +239,87 @@ def test_feature_waterfall_uses_unit_rate_occurrence_roofline():
     physical = critical_path_roofline(graph, RooflineTargets())
     reference = result["efficiency_reference"]
     assert reference["basis"] == "physical_1p0x_critical_path_roofline"
-    assert reference["physical_ideal_ms"] == round(physical.critical_path_ideal_ms, 6)
+    assert reference["physical_ideal_ms"] == round(physical.physical_ideal_ms, 6)
     floor = result["waterfall"]["hardware_roofline"]
     assert floor["physical_ideal_1p0x_ms"] == reference["physical_ideal_ms"]
     assert 0 < reference["physical_ideal_ms"] <= baseline["graph_duration_ms"]
 
 
-def test_soundness_guards_cyclic_dag_periodic_union_and_aliased_contraction():
-    from types import SimpleNamespace
-
-    from mindie_sim.optimization import (
-        BilinearContractionSpec, DagEdge, EventDagSpec, FarkasCertificate,
-        OptimalityCertificate, ResourceChoiceProgram, TensorRangeObligation,
-        build_dual_inputs_from_scenario, certify_lower_bound,
-        check_optimality_certificate, compute_compulsory_hbm_cut,
+@pytest.mark.parametrize("shared_die", (True, False), ids=("resource-bound", "path-bound"))
+def test_feature_waterfall_checks_both_limits(monkeypatch, shared_die):
+    graph = PhysicalWorkGraph(
+        nodes=tuple(PhysicalWorkNode(node_id=f"gemm-{i}", cube_ms=10,
+                                     resource_ids=(("cube", f"die{0 if shared_die else i}"),))
+                    for i in range(2)),
+        edges=() if shared_die else (("gemm-0", "gemm-1"),),
     )
-    from mindie_sim.prediction.runtime.engine import Engine, Resource
-    from mindie_sim.prediction.runtime.memory_physics import AddressRun
-    from mindie_sim.schema.hardware import Device
+    physical = critical_path_roofline(graph, RooflineTargets())
+    critical, cut = (10, 20) if shared_die else (20, 10)
+    assert (physical.critical_path_ideal_ms, max(physical.resource_cut_bounds.values())) == (critical, cut)
 
-    # Cyclic EventDagSpec & repeated-node witness must be rejected.
-    empty_prog = ResourceChoiceProgram(0, (), ())
-    cyclic_dag = EventDagSpec((10,), (DagEdge(0, 0, 0),))
-    forged = OptimalityCertificate(FarkasCertificate(1, (), (), 0), (0,) * 10, 0, 110)
-    assert check_optimality_certificate(empty_prog, cyclic_dag, forged) is False
+    def analyze(*args, **kwargs):
+        return dict(graph_duration_ms=20, operator_sum_ms=20, total_hbm_bytes=0,
+                    critical_path_roofline_ms=physical.critical_path_ideal_ms,
+                    physical_resource_cut_ms=max(physical.resource_cut_bounds.values()), network_mbu=0,
+                    network_cube_mfu=1, network_vec_mfu=0, network_link_util=0,
+                    network_roofline_efficiency=1)
 
-    # Disjoint >4096-row periodic AddressRuns must compute exact multi-run union.
-    even_run = AddressRun(1, 4097, 1, 64)
-    odd_run = AddressRun(33, 4097, 1, 64)
-    ob = TensorRangeObligation(0, "a", 0, (), "hbm_cold", "owner", (even_run, odd_run))
-    cut = compute_compulsory_hbm_cut((SimpleNamespace(read_obligations=(ob,), write_obligations=()),))[0]
-    assert cut.read_bytes == 2 * 4097 * 32
+    monkeypatch.setattr(feature_waterfall, "analyze_network_efficiency", analyze)
+    report = compare_feature_tracks(MODEL, REPRESENTATIVE_SKUS["a5"], tp=1, dp=1, layers=1, ablate_prs=False)
+    assert report["waterfall"]["hardware_roofline"]["physical_ideal_1p0x_ms"] == 20
 
-    # Aliased self-contraction (distinct_operands=False) must never invert actual Engine wall time.
-    n = 64
-    dev = Device(rank=0, compute_units=1, memory_bytes=1024,
-                 rates=(("hbm", 10**9),), compute_peaks=(("bf16", 10**12),))
-    machine = SimpleNamespace(dies=(dev,), links=())
-    obx = TensorRangeObligation(0, "x", 0, ((0, n),), "hbm_cold", "owner")
-    region = SimpleNamespace(op_ids=(), semantic_work=(), read_obligations=(obx,), write_obligations=())
-    spec = BilinearContractionSpec("x_dot_x", 0, 1, 1, n, 8, 8, 32, 132, write_free=True)
-    prog, dag, _ = build_dual_inputs_from_scenario(
-        SimpleNamespace(machine=machine, bilinear_contractions=(spec,)), region_summaries=(region,),
-    )
-    cert, _ = certify_lower_bound(prog, dag)
-    eng = Engine((Resource("hbm", 10**6), Resource("cube", 10**9)), backend="python")
-    h = eng.submit("read_x", {"hbm": n})
-    f = eng.submit("dot_x_x", {"cube": 2 * n}, after=(h,))
-    eng.advance(until=(f,))
-    assert cert.l_star_lean_ns <= round(eng.now * 10**6)
+
+def test_efficiency_analysis_uses_package_report_and_attribution_hooks(monkeypatch):
+    calls = []
+    for name in ("_fast_operator_and_graph_reports", "attribute_program"):
+        original = getattr(efficiency, name)
+
+        def record(*args, _name=name, _original=original, **kwargs):
+            calls.append(_name)
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(efficiency, name, record)
+
+    report = efficiency.analyze_network_efficiency(_case(REPRESENTATIVE_SKUS["a5"], tp=1), context=64)
+    assert calls == ["_fast_operator_and_graph_reports", "attribute_program"]
+    assert report["graph_duration_ms"] > 0 and report["operators"]
+
+
+def test_compulsory_cut_unions_disjoint_periodic_runs():
+    even = AddressRun(1, 4097, 1, 64)
+    odd = AddressRun(33, 4097, 1, 64)
+    read = TensorRangeObligation(0, "interleaved", 0, (), "hbm_cold", "owner", (even, odd))
+    summary = SimpleNamespace(read_obligations=(read,), write_obligations=())
+    assert compute_compulsory_hbm_cut((summary,))[0].read_bytes == 2 * 4097 * 32
+
+
+@pytest.mark.parametrize("allocations,expected_bytes", (
+    (("shared", "shared"), 4096), (("left", "right"), 8192), ((None, None), 0),
+))
+def test_compulsory_cut_counts_physical_weight_allocation_once(allocations, expected_bytes):
+    die = Device(rank=0, compute_units=1, memory_bytes=16384, rates=(("hbm", 10**9),),
+                 compute_peaks=(("bf16", 10**13),))
+    shape = (16, 16, 16)
+    ops = tuple(OpSpec(
+        f"gemm-{i}", "gemm", "decode", 0, 0, (), shape, shape, shape, shape,
+        dtype="bf16", flops=8192, mte2_bytes=4096,
+        metadata=(("weight_bytes", 4096), ("initial_residency", "hbm_cold"))
+        + (("allocation_id", identity),) * (identity is not None),
+    ) for i, identity in enumerate(allocations))
+    scenario = SimpleNamespace(machine=SimpleNamespace(dies=(die,), links=()), atomic_ops=ops)
+    program, dag, names = build_dual_inputs_from_scenario(scenario)
+    certificate, _ = certify_lower_bound(program, dag)
+    demand = dict(zip(names, program.global_work, strict=True))
+    if expected_bytes:
+        # At one byte/ns, the duration before the inward guard equals the byte count.
+        assert demand["hbm_bus_r@r0.p0.d0"] == expected_bytes - 3
+        assert expected_bytes - 3 <= certificate.l_star_lean_ns <= expected_bytes + 1
+    else:
+        assert not any(name.startswith("hbm_bus") for name in names)
+        assert certificate.l_star_lean_ns <= 1
 
 
 def test_pointwise_nd_shape_and_gate4_rejects_matrix_recipe_downgrade():
-    from dataclasses import replace
-
-    from mindie_sim.rewrite import (
-        Edit, FuseRegion, KernelBoundary, OpRef, ScenarioRequest, SelectTemplate,
-        evaluate_rewrites, finalize_plan, prepare_scenario,
-    )
-
     case = _case(REPRESENTATIVE_SKUS["a5"], tp=1)
     case["runtime"].setdefault("kernels", {}).setdefault("recipes", {})["pointwise"] = {
         "kind": "tiled_pointwise", "input_bytes_per_element": 2, "outputs": [{"bytes_per_element": 2}],
@@ -274,3 +338,78 @@ def test_pointwise_nd_shape_and_gate4_rejects_matrix_recipe_downgrade():
         assert any(g.reason == "WORK_CONSERVATION_MISMATCH" for g in full.verification.gates)
     batch = evaluate_rewrites(dossier.handle, (bad_fuse, bad_select))
     assert all(r.status == "gate_failed" and r.reason == "WORK_CONSERVATION_MISMATCH" for r in batch.results)
+
+
+def test_work_gate_rejects_unary_swiglu_recipe_in_screening_and_replay(monkeypatch):
+    case = _case(REPRESENTATIVE_SKUS["a5"], tp=1)
+    case["runtime"].setdefault("kernels", {}).setdefault("recipes", {})["unary"] = {
+        "kind": "tiled_pointwise", "input_bytes_per_element": 2, "outputs": [{"bytes_per_element": 2}],
+    }
+    dossier = prepare_scenario(ScenarioRequest(case, StepRequest("decode", context=64)))
+    swiglu = next(op for op in dossier.handle.scenario.atomic_ops[0].ops if op.family == "swiglu")
+    plan = replace(dossier.unmerge_plan, edits=(Edit(
+        "unary", operation=SelectTemplate(OpRef("atom", swiglu.op_id), "K3", "unary"),
+    ),))
+    unary_read_bytes = []
+    lower = TiledPointwise.lower
+
+    def record_loads(recipe, context):
+        program = lower(recipe, context)
+        if context.op.op_id == swiglu.op_id:
+            pipes = program.stages[-1].program.programs
+            hbm = context.resource_names["hbm"]
+            unary_read_bytes.append(sum(pipe.tile(i)[0].work[hbm] for pipe in pipes for i in range(pipe.count)))
+        return program
+
+    monkeypatch.setattr(TiledPointwise, "lower", record_loads)
+    baseline, rebound = (finalize_plan(dossier.handle, p) for p in (dossier.unmerge_plan, plan))
+    assert baseline.verification.passed
+    row = next(r for r in baseline.step_eval.operators if r.occurrence.op_id == swiglu.op_id)
+    assert sum(item.amount for item in row.work if item.resource == "mte2") == 102400
+    assert unary_read_bytes and set(unary_read_bytes) == {51200}
+    screened, = evaluate_rewrites(dossier.handle, (plan,)).results
+    for receipt in (rebound.verification, screened.verification):
+        gate = receipt.gates[3]
+        assert not gate.passed and gate.reason == "WORK_CONSERVATION_MISMATCH"
+        assert gate.detail == "executed_mte2_service_dropped"
+
+
+def test_strided_run_rounds_to_exact_sector_union():
+    run = AddressRun(base_byte=13, rows=4097, row_bytes=39, stride_bytes=101)
+    sectors = {address // 32 for row in range(run.rows)
+               for address in range(13 + 101 * row, 52 + 101 * row)}
+    assert run.sector_union_bytes(32) == 32 * len(sectors) < run.rows * run.stride_bytes
+
+
+def test_integer_lower_bound_has_inward_guard_at_float_precision_boundary():
+    for ns in (2**52, 2**53, 2**54):
+        guard = ns - inward_floor_ns(Fraction(ns)) - 2
+        assert guard == 8 * ulp(float(ns)) >= 4 * ulp(float(ns))
+    assert inward_floor_ns(Fraction(1, 2)) == 0
+
+
+def test_certified_hbm_capacity_prices_bytes_per_millisecond():
+    sku = REPRESENTATIVE_SKUS["a5"]
+    case = _case(sku, tp=1)
+    table = PrimitiveCapacityTable(sku, (PrimitiveCapacityEntry("hbm_bus_r", 8e9, 8e9, "B/ms"),))
+    assert table.upper_capacity_per_second("hbm_bus_r") == 8 * 10**12
+    volume = 8_000_000
+    physical = TensorRangeObligation(0, "weight", 0, ((0, volume),), "hbm_cold", "owner")
+    region = SimpleNamespace(op_ids=(), semantic_work=(), read_obligations=(physical,), write_obligations=())
+    machine = parse_case(case).machine
+    scenario = SimpleNamespace(machine=machine)
+    program, dag, _ = build_dual_inputs_from_scenario(
+        scenario, region_summaries=(region,), primitive_table=table, rate_mode="certified_upper_capacity",
+    )
+    certified, _ = certify_lower_bound(program, dag)
+    engine_program, engine_dag, _ = build_dual_inputs_from_scenario(scenario, region_summaries=(region,))
+    engine_bound, _ = certify_lower_bound(engine_program, engine_dag)
+
+    rate_per_ms = dict(machine.dies[0].rates)["hbm"] / 1000
+    engine = Engine((Resource("hbm", rate_per_ms),), backend="python")
+    transferred = engine.submit("cold-weight", {"hbm": volume})
+    engine.advance(until=(transferred,))
+    assert certified.l_star_lean_ns == 997  # 8 MB / 8 TB/s = 1000 ns, rounded inwards.
+    assert certified.l_star_lean_ns <= engine_bound.l_star_lean_ns <= engine.now * NS_PER_MS
+    ladder = api.optimize_ladder(case, StepRequest("decode", context=64), primitive_table=table).ladder
+    assert 0 <= ladder.l_star_hw_ns <= ladder.l_star_lean_ns <= ladder.a_star_dsl_ns

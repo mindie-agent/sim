@@ -292,6 +292,28 @@ structure EventDagSpec where
   edges         : List DagEdge
   deriving DecidableEq, Repr
 
+private def peelDag (outgoing : Array (List Nat)) : Nat → List Nat → Array Nat → Bool
+  | 0, _, _ => true
+  | _ + 1, [], _ => false
+  | fuel + 1, src :: ready, indegree =>
+      let (ready, indegree) := outgoing[src]!.foldl (fun (todo, counts) dst =>
+        let remaining := counts[dst]! - 1
+        (if remaining = 0 then dst :: todo else todo, counts.set! dst remaining)) (ready, indegree)
+      peelDag outgoing fuel ready indegree
+
+/-- Check graph geometry, then peel one zero-indegree node per step. -/
+def checkDagAcyclic (dag : EventDagSpec) : Bool := Id.run do
+  let n := dag.nodeQuantumNs.length
+  if n = 0 || dag.nodeQuantumNs.any (fun q => q < 0) then return false
+  let mut outgoing : Array (List Nat) := Array.mkArray n []
+  let mut indegree := Array.mkArray n 0
+  for e in dag.edges do
+    if e.src ≥ n || e.dst ≥ n || e.src = e.dst || e.wireNs < 0 then return false
+    outgoing := outgoing.modify e.src (e.dst :: ·)
+    indegree := indegree.modify e.dst (· + 1)
+  let ready := (List.range n).filter (fun i => indegree[i]! = 0)
+  return peelDag outgoing n ready indegree
+
 def lookupFloor (xs : List Int) (idx : Nat) : Option Int :=
   xs[idx]?
 
@@ -306,22 +328,25 @@ def nextHeadMatches (dag : EventDagSpec) (dst : Nat) (rest : List Nat) (sinkId :
       | some eNext => decide (dst = eNext.src)
       | none => false
 
-/-- Recompute certified critical-path floor directly from `dag` (forbids forged floors!). -/
-def evalCheckedPath (dag : EventDagSpec) : List Nat → Nat → Option Int
-  | [], sinkId =>
+private def evalPath (dag : EventDagSpec) (sinkId : Nat) : List Nat → List Nat → Option Int
+  | [], visited =>
       match lookupFloor dag.nodeQuantumNs sinkId with
-      | some q => if 0 ≤ q then some q else none
+      | some q => if !visited.contains sinkId && decide (0 ≤ q) then some q else none
       | none => none
-  | eIdx :: rest, sinkId =>
+  | eIdx :: rest, visited =>
       match lookupEdge dag.edges eIdx with
       | none => none
       | some e =>
-          match lookupFloor dag.nodeQuantumNs e.src, evalCheckedPath dag rest sinkId with
-          | some qSrc, some tailNs =>
-              if decide (0 ≤ qSrc) && decide (0 ≤ e.wireNs) && nextHeadMatches dag e.dst rest sinkId then
-                some (qSrc + e.wireNs + tailNs)
-              else none
+        if !visited.contains e.src && decide (e.src ≠ e.dst) &&
+           decide (0 ≤ e.wireNs) && nextHeadMatches dag e.dst rest sinkId then
+          match lookupFloor dag.nodeQuantumNs e.src, evalPath dag sinkId rest (e.src :: visited) with
+          | some qSrc, some tailNs => if 0 ≤ qSrc then some (qSrc + e.wireNs + tailNs) else none
           | _, _ => none
+        else none
+
+/-- Recompute the critical-path floor for a connected, nonrepeating path. -/
+def evalCheckedPath (dag : EventDagSpec) (edgeIdxs : List Nat) (sinkId : Nat) : Option Int :=
+  evalPath dag sinkId edgeIdxs []
 
 def ValidDagSchedule (dag : EventDagSpec) (startNs : Nat → Int) (wallNs : Int) : Prop :=
   (∀ i q, lookupFloor dag.nodeQuantumNs i = some q → 0 ≤ startNs i ∧ startNs i + q ≤ wallNs) ∧
@@ -337,17 +362,15 @@ def pathHeadNode (dag : EventDagSpec) (edgeIdxs : List Nat) (sinkId : Nat) : Nat
       | some e => e.src
       | none => sinkId
 
-/-- Core Theorem 3: Any `ValidDagSchedule` on `dag` has `wallNs ≥ floorNs` for every
-    `evalCheckedPath`-verified edge sequence. -/
-theorem max_plus_critical_path_bound
-    (dag : EventDagSpec) (startNs : Nat → Int) (wallNs : Int)
+private theorem evalPath_bound
+    (dag : EventDagSpec) (startNs : Nat → Int) (wallNs : Int) (sinkId : Nat)
     (hsched : ValidDagSchedule dag startNs wallNs) :
-    ∀ (edgeIdxs : List Nat) (sinkId : Nat) (floorNs : Int),
-      evalCheckedPath dag edgeIdxs sinkId = some floorNs →
+    ∀ (edgeIdxs visited : List Nat) (floorNs : Int),
+      evalPath dag sinkId edgeIdxs visited = some floorNs →
       0 ≤ startNs (pathHeadNode dag edgeIdxs sinkId) ∧
       startNs (pathHeadNode dag edgeIdxs sinkId) + floorNs ≤ wallNs
-  | [], sinkId, floorNs, heval => by
-    simp only [evalCheckedPath] at heval
+  | [], _, floorNs, heval => by
+    simp only [evalPath] at heval
     cases hq : lookupFloor dag.nodeQuantumNs sinkId with
     | none => simp [hq] at heval
     | some q =>
@@ -357,43 +380,55 @@ theorem max_plus_critical_path_bound
         subst hEq
         exact hsched.1 sinkId q hq
       · contradiction
-  | eIdx :: rest, sinkId, floorNs, heval => by
-    simp only [evalCheckedPath] at heval
+  | eIdx :: rest, visited, floorNs, heval => by
+    simp only [evalPath] at heval
     cases he : lookupEdge dag.edges eIdx with
     | none => simp [he] at heval
     | some e =>
-      simp only [he] at heval
-      cases hq : lookupFloor dag.nodeQuantumNs e.src with
-      | none => simp [hq] at heval
-      | some qSrc =>
-        cases htl : evalCheckedPath dag rest sinkId with
-        | none => simp [hq, htl] at heval
-        | some tailNs =>
-          simp only [hq, htl, Bool.and_eq_true, decide_eq_true_eq] at heval
-          split at heval
-          · rename_i hcond
-            rcases hcond with ⟨⟨_, _⟩, hlink⟩
-            injection heval with hEq
-            subst hEq
-            have ⟨h0Src, _⟩ := hsched.1 e.src qSrc hq
-            have hedge := hsched.2 eIdx e qSrc he hq
-            have ⟨_, ihBound⟩ := max_plus_critical_path_bound dag startNs wallNs hsched rest sinkId tailNs htl
-            have hheadEq : pathHeadNode dag rest sinkId = e.dst := by
-              cases rest with
-              | nil =>
-                simp only [nextHeadMatches, decide_eq_true_eq] at hlink
-                simp [pathHeadNode, hlink]
-              | cons nextIdx _ =>
-                simp only [nextHeadMatches] at hlink
-                cases hnext : lookupEdge dag.edges nextIdx with
-                | none => simp [hnext] at hlink
-                | some eNext =>
-                  simp only [hnext, decide_eq_true_eq] at hlink
-                  simp [pathHeadNode, hnext, hlink]
-            rw [hheadEq] at ihBound
-            simp only [pathHeadNode, he]
-            omega
-          · contradiction
+      simp only [he, Bool.and_eq_true, decide_eq_true_eq] at heval
+      split at heval
+      · rename_i hcond
+        have hlink := hcond.2
+        cases hq : lookupFloor dag.nodeQuantumNs e.src with
+        | none => simp [hq] at heval
+        | some qSrc =>
+          cases htl : evalPath dag sinkId rest (e.src :: visited) with
+          | none => simp [hq, htl] at heval
+          | some tailNs =>
+            simp only [hq, htl] at heval
+            split at heval
+            · injection heval with hEq
+              subst hEq
+              have ⟨h0Src, _⟩ := hsched.1 e.src qSrc hq
+              have hedge := hsched.2 eIdx e qSrc he hq
+              have ⟨_, ihBound⟩ := evalPath_bound dag startNs wallNs sinkId hsched rest (e.src :: visited) tailNs htl
+              have hheadEq : pathHeadNode dag rest sinkId = e.dst := by
+                cases rest with
+                | nil =>
+                  simp only [nextHeadMatches, decide_eq_true_eq] at hlink
+                  simp [pathHeadNode, hlink]
+                | cons nextIdx _ =>
+                  simp only [nextHeadMatches] at hlink
+                  cases hnext : lookupEdge dag.edges nextIdx with
+                  | none => simp [hnext] at hlink
+                  | some eNext =>
+                    simp only [hnext, decide_eq_true_eq] at hlink
+                    simp [pathHeadNode, hnext, hlink]
+              rw [hheadEq] at ihBound
+              simp only [pathHeadNode, he]
+              omega
+            · contradiction
+      · contradiction
+
+/-- Core Theorem 3: Every checked path bounds the wall time of a valid schedule. -/
+theorem max_plus_critical_path_bound
+    (dag : EventDagSpec) (startNs : Nat → Int) (wallNs : Int)
+    (hsched : ValidDagSchedule dag startNs wallNs)
+    (edgeIdxs : List Nat) (sinkId : Nat) (floorNs : Int)
+    (heval : evalCheckedPath dag edgeIdxs sinkId = some floorNs) :
+    0 ≤ startNs (pathHeadNode dag edgeIdxs sinkId) ∧
+    startNs (pathHeadNode dag edgeIdxs sinkId) + floorNs ≤ wallNs :=
+  evalPath_bound dag startNs wallNs sinkId hsched edgeIdxs [] floorNs heval
 
 /-! ### Part 4: Unified 5-Level Certified Performance Ladder -/
 
@@ -406,12 +441,13 @@ structure OptimalityCertificate where
 
 def checkOptimalityCertificate
     (prog : ResourceChoiceProgram) (dag : EventDagSpec) (cert : OptimalityCertificate) : Bool :=
-  match evalCheckedPath dag cert.pathEdges cert.sinkNodeId with
-  | none => false
-  | some pathNs =>
-      checkFarkasDual prog cert.farkas &&
-      decide (0 ≤ cert.lStarLeanNs) &&
-      decide (cert.lStarLeanNs = max cert.farkas.lowerBoundNs pathNs)
+  checkDagAcyclic dag &&
+    match evalCheckedPath dag cert.pathEdges cert.sinkNodeId with
+    | none => false
+    | some pathNs =>
+        checkFarkasDual prog cert.farkas &&
+        decide (0 ≤ cert.lStarLeanNs) &&
+        decide (cert.lStarLeanNs = max cert.farkas.lowerBoundNs pathNs)
 
 structure FiveLevelLadder where
   lStarLean      : Int
@@ -442,12 +478,13 @@ theorem certified_ladder_chain
       (ladder.mMainline - ladder.aStarFramework) +
       (ladder.aStarFramework - ladder.aStarDsl) +
       (ladder.aStarDsl - ladder.lStarLean) := by
-  simp only [checkOptimalityCertificate] at hchk
+  simp only [checkOptimalityCertificate, Bool.and_eq_true] at hchk
+  have hpath := hchk.2
   cases hp : evalCheckedPath dag cert.pathEdges cert.sinkNodeId with
-  | none => simp [hp] at hchk
+  | none => simp [hp] at hpath
   | some pathNs =>
-    simp only [hp, Bool.and_eq_true, decide_eq_true_eq] at hchk
-    rcases hchk with ⟨⟨hfChk, hlPos⟩, hlEq⟩
+    simp only [hp, Bool.and_eq_true, decide_eq_true_eq] at hpath
+    rcases hpath with ⟨⟨hfChk, hlPos⟩, hlEq⟩
     have hfBound : cert.farkas.lowerBoundNs ≤ ladder.aStarDsl :=
       farkas_dual_le_any_feasible_schedule prog cert.farkas dslLoads ladder.aStarDsl hfChk hfeasDsl
     have ⟨h0Head, hpSum⟩ :=

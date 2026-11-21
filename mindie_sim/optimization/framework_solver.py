@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass, fields, is_dataclass, replace
-from itertools import islice
+from itertools import islice, zip_longest
 from math import gcd
 from typing import TYPE_CHECKING, Literal
 
@@ -195,6 +195,7 @@ class _TrialSearch:
         self.tried = 0
         self.history = []
         self.seen = set()
+        self.frontier = {}
 
     def finalize(self, plan):
         from mindie_sim.rewrite.oracle import finalize_plan
@@ -207,6 +208,7 @@ class _TrialSearch:
 
         self.best_plan, self.best_eval = plan, evaluation
         self.seen.add(plan_sha256(plan))
+        self.frontier[plan.base_graph_sha256] = (plan, evaluation)
 
     def try_finalize(self, plan):
         from mindie_sim.rewrite.verify import SoundnessInversionError
@@ -252,8 +254,13 @@ class _TrialSearch:
                 ranked.append((estimated_wall, plan_sha256(plan), plan))
             for _, _, plan in sorted(ranked):
                 result = self.try_finalize(plan)
-                if result is not None and _accepted(result) and _wall(result) < _wall(self.best_eval):
-                    self.seed(plan, result)
+                if result is not None and _accepted(result):
+                    key = plan.base_graph_sha256
+                    previous = self.frontier.get(key)
+                    if previous is None or _wall(result) < _wall(previous[1]):
+                        self.frontier[key] = (plan, result)
+                    if _wall(result) < _wall(self.best_eval):
+                        self.seed(plan, result)
 
     def stage(self, stage_id, plans, limit):
         from mindie_sim.rewrite.schema import plan_sha256
@@ -283,6 +290,24 @@ def _seed_plans(dossier):
         unmerge = empty_plan(base_graph_sha256=mainline.base_graph_sha256,
                              framing_sha256=mainline.framing_sha256)
     return unmerge, mainline
+
+
+def _search_bases(dossier, search):
+    from mindie_sim.rewrite.oracle import ScenarioHandle, _baseline
+
+    seen = []
+    for seed in (search.best_plan, *_seed_plans(dossier)):
+        plan, _ = search.frontier.get(seed.base_graph_sha256, (seed, None))
+        if plan in seen:
+            continue
+        seen.append(plan)
+        scenario = (_baseline(search.handle, plan).scenario
+                    if isinstance(search.handle, ScenarioHandle) else _resolved(dossier))
+        yield plan, scenario
+
+
+def _interleave(proposals):
+    return (plan for wave in zip_longest(*proposals) for plan in wave if plan is not None)
 
 def _local_operations(scenario, ops, mainline):
     from mindie_sim.rewrite.schema import HoistOrDeduplicate, OpRef
@@ -323,7 +348,7 @@ def _collective_operations(ops, dual_report):
             by_priority.append((route not in links, op.op_id, mode, route,
                                 CollectiveTransform(ref, mode, route)))
         tile = meta.get("dbo_tile_spec", meta.get("tile_pipeline_spec"))
-        if op.family in {"grouped_moe", "mc2"}:
+        if op.family in {"grouped_gemm", "grouped_moe", "mc2"}:
             dbo.append(PipelineTiles(ref, tile, cohort_split="dbo_2cohort"))
     ranked = sorted(by_priority, key=lambda entry: entry[:-1])
     yield from (entry[-1] for entry in ranked if not entry[0])
@@ -487,22 +512,31 @@ def solve_framework(
     if full is None or not _accepted(full) or _wall(full) > min(m_ns, u_ns):
         raise SoundnessInversionError("no fully verified plan meets the fastest baseline")
     search.seed(seed, full)
+    alternate = unmerge if seed == mainline else mainline
+    if alternate != seed:
+        other = search.try_finalize(alternate)
+        if other is not None and _accepted(other):
+            if _wall(other) < _wall(full):
+                search.seed(alternate, other)
+            else:
+                search.frontier[alternate.base_graph_sha256] = (alternate, other)
 
-    scenario = _resolved(dossier)
-    ops = _atomic_ops(scenario)
     loo_quota = search.remaining // (len(FRAMEWORK_STAGES) + 1)
     quota = (search.remaining - loo_quota + len(FRAMEWORK_STAGES) - 1) // len(FRAMEWORK_STAGES)
     before = search.remaining
     search.loo(mainline, m_ns, quota // 2, consider=True)
-    for index, (stage, proposals) in enumerate(zip(FRAMEWORK_STAGES, (
-        _local_operations(scenario, ops, mainline), _collective_operations(ops, dual_report),
-        _stream_candidates(scenario, ops), _prefetch_operations(scenario, ops),
-    ))):
-        best = search.best_plan
+    def proposals(base, scenario, stage):
+        ops = _atomic_ops(scenario)
         if stage == "F3_stream_core":
-            plans = (_stream_plan(best, stage, operation) for operation in proposals)
-        else:
-            plans = (_with_operations(best, stage, (operation,)) for operation in proposals)
+            yield from (_stream_plan(base, stage, op) for op in _stream_candidates(scenario, ops))
+            return
+        operations = (_local_operations(scenario, ops, mainline) if stage == "F1_local_k1"
+                      else _collective_operations(ops, dual_report) if stage == "F2_collective_dbo"
+                      else _prefetch_operations(scenario, ops))
+        yield from (_with_operations(base, stage, (op,)) for op in operations)
+
+    for index, stage in enumerate(FRAMEWORK_STAGES):
+        plans = _interleave(proposals(base, scenario, stage) for base, scenario in _search_bases(dossier, search))
         limit = (search.remaining - loo_quota) // (len(FRAMEWORK_STAGES) - index)
         if index == 0:
             limit = max(0, quota - (before - search.remaining))

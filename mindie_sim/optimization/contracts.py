@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from fractions import Fraction
 from typing import Literal, Protocol
@@ -19,7 +20,7 @@ __all__ = (
     "TensorRangeObligation", "SemanticWorkItem", "EvgVisitorNode",
     "CatlassKernelSpec", "DslKernelSpec", "EdgeRouteBinding", "FuseRegionSpec",
     "FusedRegionSummary", "BilinearContractionSpec", "PrimitiveCapacityEntry",
-    "PrimitiveCapacityTable", "UpperCapacityProvider",
+    "PrimitiveCapacityTable", "UpperCapacityProvider", "normalize_capacity_per_second",
 )
 
 
@@ -192,6 +193,32 @@ class BilinearContractionSpec:
     replica: int = 0
     pp_stage: int = 0
     distinct_operands: bool = False
+    # The full (i, k) and (j, k) index sets map injectively within A and B.
+    address_injective_across_k: bool = False
+
+
+_GIGA = 1_000_000_000
+_GIBI = 1024 * 1024 * 1024
+_CAPACITY_UNIT_SCALE = {
+    **dict.fromkeys(("b/s", "byte/s", "bytes/s", "flop/s", "flops/s", "ops/s", "elements/s"), 1),
+    **dict.fromkeys(("b/ms", "byte/ms", "bytes/ms", "flop/ms", "flops/ms", "ops/ms",
+                     "elements/ms", "kb/s"), 1000),
+    **dict.fromkeys(("gb/s", "gflop/s", "gops/s"), _GIGA),
+    **dict.fromkeys(("tb/s", "tflop/s", "tops/s"), 1000 * _GIGA),
+    "mb/s": 1000 * 1000,
+    "kib/s": 1024,
+    "mib/s": 1024 * 1024,
+    "gib/s": _GIBI,
+    "tib/s": 1024 * _GIBI,
+}
+
+
+def normalize_capacity_per_second(value: float, unit: str) -> Fraction:
+    """Convert a byte or operation rate to its base unit per second."""
+    scale = _CAPACITY_UNIT_SCALE.get(unit.strip().lower())
+    if scale is None:
+        raise ValueError(f"unknown primitive capacity unit: {unit!r}")
+    return Fraction(str(value)) * scale
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,10 +234,29 @@ class PrimitiveCapacityEntry:
 
 
 class UpperCapacityProvider(Protocol):
+    """Raw capacities need units from `unit()` or entries, unless a per-second lookup is supplied."""
+
     @property
     def sku(self) -> str: ...
 
     def upper_capacity(self, primitive_id: str) -> float | None: ...
+
+
+def _provider_capacity_per_second(table: UpperCapacityProvider, primitive_id: str) -> Fraction | None:
+    normalized = getattr(table, "upper_capacity_per_second", None)
+    if callable(normalized):
+        return normalized(primitive_id)
+    capacity = table.upper_capacity(primitive_id)
+    if capacity is None:
+        return None
+    unit_lookup = getattr(table, "unit", None)
+    unit = unit_lookup(primitive_id) if callable(unit_lookup) else None
+    if unit is None:
+        entries = getattr(table, "entries", ())
+        if isinstance(entries, Mapping):
+            entries = entries.values()
+        unit = next((entry.unit for entry in entries if entry.primitive_id == primitive_id), None)
+    return normalize_capacity_per_second(capacity, unit) if unit is not None else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,3 +271,7 @@ class PrimitiveCapacityTable:
     def upper_capacity(self, primitive_id: str) -> float | None:
         return next((entry.certified_upper_capacity for entry in self.entries
                      if entry.primitive_id == primitive_id), None)
+
+    def upper_capacity_per_second(self, primitive_id: str) -> Fraction | None:
+        return next((normalize_capacity_per_second(entry.certified_upper_capacity, entry.unit)
+                     for entry in self.entries if entry.primitive_id == primitive_id), None)

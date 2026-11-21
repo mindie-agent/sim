@@ -112,11 +112,11 @@ def compare_feature_tracks(
     merged_ms = float(analyses["merged"]["graph_duration_ms"])
     pr_ms = float(analyses["unmerged_pr"]["graph_duration_ms"])
     ideal_ms = float(analyses["expected_ideal"]["graph_duration_ms"])
-    roof_1p0_ms = float(
-        analyses["expected_ideal"].get("critical_path_roofline_ms")
-        or analyses["expected_ideal"].get("total_roofline_ideal_ms")
-        or 0.0
-    )
+    ideal_eff = analyses["expected_ideal"]
+    roof_1p0_ms = max(
+        float(ideal_eff.get("critical_path_roofline_ms") or 0.0),
+        float(ideal_eff.get("physical_resource_cut_ms") or 0.0),
+    ) or float(ideal_eff.get("total_roofline_ideal_ms") or 0.0)
 
     eager_report = cases["raw_eager"]["runtime"]["metadata"]["feature_track_report"]
     merged_report = cases["merged"]["runtime"]["metadata"]["feature_track_report"]

@@ -23,6 +23,7 @@ from mindie_sim.optimization import (
     select_dsl_candidates, solve_dsl, solve_framework, streamk_crossing_partials,
 )
 from mindie_sim.prediction.results import OpOccurrence, OperatorSequenceRow, StepEvaluation, StepRequest
+from mindie_sim.prediction.runtime.memory_physics import AddressRun
 from mindie_sim.prediction.runtime.tile_solver import LiveBufferSpec, TileCandidate, TilePipelineSpec, TileShape
 from mindie_sim.prediction.streams import StreamPlan, bind_stream_owners, proportional_coupled_placement
 from mindie_sim.rewrite import (
@@ -53,6 +54,11 @@ def _reason(receipt, index):
     gate = receipt.gates[index]
     assert not gate.passed
     return gate.reason
+
+
+def _certificate_evidence(program, dag):
+    cert, _ = certify_lower_bound(program, dag)
+    return dict(dual_program=program, event_dag=dag, dual_certificate=cert)
 
 
 def _with_die(scenario, die):
@@ -192,8 +198,10 @@ def test_core_gate_binds_exact_coupled_group_and_pure_lanes(lane_graph, shared):
     assert owners["csa"].aic_limit == owners["comm"].aic_limit == owners["comm"].aiv_limit == 0
     assert set(aiv).isdisjoint(owners["csa"].aiv)
     step = _timeline(scenario, ((0, 10), (4, 14), (6, 16)))
-    receipt = verify_plan(scenario, replace(applied, streams=(plan,)), step_eval=step)
-    assert receipt.passed and receipt.overlap_pct == 60
+    quantum_ns = round((step.operators[0].end_ms - step.operators[0].start_ms) * 1_000_000)
+    evidence = _certificate_evidence(ResourceChoiceProgram(0, (), ()), EventDagSpec((quantum_ns,), ()))
+    receipt = verify_plan(scenario, replace(applied, streams=(plan,)), step_eval=step, **evidence)
+    assert receipt.passed and receipt.overlap_pct == 60 and receipt.l_star_ns == quantum_ns
 
     over = (5, 3, "shared_cap") if shared else (2, 4)
     bad = replace(applied, streams=(_streams(over, (0, 3), (0, 0)),))
@@ -341,6 +349,28 @@ def test_ledger_gate_rejects_inconsistent_transfer_evidence(real_graph, mutation
     assert _reason(receipt, 3) == "LEDGER_RECONCILIATION_ERROR"
 
 
+def test_ledger_gate_requires_strided_cold_sectors(real_graph):
+    scenario, _ = real_graph
+    applied, summary = _fused_summary(scenario)
+    run = AddressRun(base_byte=0, rows=4, row_bytes=1, stride_bytes=64)
+    read = replace(summary.read_obligations[0], ranges=(), address_runs=(run,))
+    sectors = len({(run.base_byte + row * run.stride_bytes) // 32 for row in range(run.rows)})
+    valid = replace(summary, read_obligations=(read,), write_obligations=(),
+                    logical_transfer_bytes=4, issued_copy_bytes=128,
+                    dram_sector_bytes=sectors * 32, turnaround_service_bytes=Fraction(128))
+    assert valid.dram_sector_bytes == 128
+    assert verify_plan(scenario, applied, region_summaries=(valid,)).gates[3].passed
+    for changes, detail in (
+        (dict(logical_transfer_bytes=0, issued_copy_bytes=0, dram_sector_bytes=0,
+              turnaround_service_bytes=Fraction(0)), "dram_sector_bytes"),
+        (dict(logical_transfer_bytes=0), "logical_bytes"),
+    ):
+        gate = verify_plan(scenario, applied, region_summaries=(replace(valid, **changes),)).gates[3]
+        assert (gate.passed, gate.reason, gate.detail) == (
+            False, "LEDGER_RECONCILIATION_ERROR", f"{summary.region_id}:{detail}",
+        )
+
+
 def test_bound_gate_checks_certificate_and_shipping_threshold(real_graph):
     scenario, applied = real_graph
     program = ResourceChoiceProgram(2, (23, 19), (((4, 0), (0, 2)),))
@@ -357,6 +387,11 @@ def test_bound_gate_checks_certificate_and_shipping_threshold(real_graph):
         assert _reason(receipt, 4) == "LEAN_CERTIFICATE_INVALID"
     receipt = verify_plan(scenario, applied, wall_ns=100, dual_certificate=cert)
     assert _reason(receipt, 4) == "LEAN_CERTIFICATE_INVALID"
+    missing = verify_plan(scenario, applied, wall_ns=100, scope="full")
+    assert _reason(missing, 4) == "LEAN_CERTIFICATE_INVALID"
+    stronger = _certificate_evidence(program, EventDagSpec((100,), ()))
+    with pytest.raises(SoundnessInversionError, match="dsl_ns=50<l_star_ns=100"):
+        verify_plan(scenario, applied, wall_ns=200, framework_ns=150, dsl_ns=50, **stronger)
     inverted = verify_plan(scenario, applied, wall_ns=100, framework_ns=80, dsl_ns=81, **evidence)
     assert _reason(inverted, 4) == "LADDER_MONOTONICITY_VIOLATION"
 

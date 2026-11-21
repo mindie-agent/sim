@@ -19,10 +19,11 @@ from typing import TYPE_CHECKING
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import datapath_for_die
 
+from .contracts import FusedRegionSummary, SemanticWorkItem, TensorRangeObligation, _provider_capacity_per_second
+
 if TYPE_CHECKING:
     from mindie_sim.rewrite.apply import ResolvedScenario
-
-    from .contracts import FusedRegionSummary, UpperCapacityProvider
+    from .contracts import UpperCapacityProvider
 
 BINARY64_ULP_SHIFT = 52
 C11_ULP_GUARD_FACTOR = 8
@@ -401,13 +402,18 @@ def _unique_ops(entries):
     return tuple(by_id.values())
 
 
-def _atomic_ops(scenario):
-    ops = getattr(scenario, "atomic_ops", None)
-    if ops is None:
+def _scenario_rank_ops(scenario):
+    entries = getattr(scenario, "atomic_ops", None)
+    if entries is None:
         graph = getattr(scenario, "atomic_graph", ())
-        ops = getattr(graph, "op_specs", getattr(graph, "ops", graph))
-    return _unique_ops(ops.values() if isinstance(ops, Mapping) else (ops or ()))
+        entries = getattr(graph, "op_specs", getattr(graph, "ops", graph))
+    for entry in entries.values() if isinstance(entries, Mapping) else (entries or ()):
+        for op in getattr(entry, "ops", (entry,)):
+            if hasattr(op, "metadata"):
+                yield int(getattr(entry, "replica", 0)), op
 
+def _atomic_ops(scenario):
+    return _unique_ops(op for _, op in _scenario_rank_ops(scenario))
 
 def _op_contract_key(op, metadata):
     if (metadata.get("pure") is not True or metadata.get("load_time")
@@ -445,9 +451,9 @@ def _machine(scenario):
 
 class _Demands:
     def __init__(self, scenario, primitive_table, rate_mode):
-        if rate_mode not in {"engine_ceiling", "certified_upper_capacity"}:
+        if rate_mode not in {"engine_ceiling", "certified_upper", "certified_upper_capacity"}:
             raise ValueError(f"unknown lower-bound rate mode {rate_mode}")
-        self.certified = rate_mode == "certified_upper_capacity"
+        self.certified = rate_mode != "engine_ceiling"
         self.table = primitive_table
         machine = _machine(scenario)
         self.devices = {device.rank: device for device in getattr(machine, "dies", ())}
@@ -457,19 +463,27 @@ class _Demands:
         self.sites = []
 
     def rate(self, scope, pipe, dtype=""):
+        engine = self.engine_rate(scope, pipe, dtype)
+        # A silicon constraint can only relax service already priced by simulation.
+        if not self.certified or engine <= 0:
+            return engine
         device = self.devices.get(scope[-1])
-        if self.certified:
-            if self.table is None or (device is not None and self.table.sku
-                                      and device.sku and self.table.sku != device.sku):
-                return 0
-            primitive = f"{pipe}:{dtype}" if dtype else pipe
-            capacity = self.table.upper_capacity(primitive)
-            if capacity is None:
-                capacity = self.table.upper_capacity(pipe)
-            return capacity or 0
+        if self.table is None or (device and self.table.sku and device.sku and self.table.sku != device.sku):
+            return 0
+        candidates = ([f"{pipe}:{dtype}"] if dtype else []) + [pipe]
+        if pipe == "hbm_bus_r":
+            candidates.append("P01_hbm_read")
+        for primitive in candidates:
+            capacity = _provider_capacity_per_second(self.table, primitive)
+            if capacity is not None:
+                return max(capacity, engine)
+        return 0
+
+    def engine_rate(self, scope, pipe, dtype):
         if pipe.startswith("link:"):
             link = self.links.get(pipe.removeprefix("link:"))
             return 1000 * Fraction(link.effective_peak_capacity_bytes_per_ms) if link else 0
+        device = self.devices.get(scope[-1])
         if device is None:
             return 0
         path = self.paths[scope[-1]]
@@ -581,95 +595,81 @@ def _memory_demands(demands, scenario, summaries, placements, contractions):
             demands.add_site(modes)
 
 _COLD_WEIGHT_FAMILIES = frozenset({
-    "gemm",
-    "qkv_projection",
-    "output_projection",
-    "gate_up_projection",
-    "down_projection",
-    "projection",
-    "lm_head",
-    "logits",
+    "gemm", "linear", "qkv_projection", "output_projection", "gate_up_projection",
+    "down_projection", "projection", "lm_head", "logits",
 })
+_WEIGHT_ID_KEYS = ("weight_allocation_id", "allocation_id", "weight_tensor_id", "parameter_name", "weight_key")
 
+def _cold_weight_read(op, meta, die):
+    mte2_bytes = getattr(op, "mte2_bytes", 0)
+    if mte2_bytes <= 0 or op.family not in _COLD_WEIGHT_FAMILIES:
+        return None
+    identity = next((value for key in _WEIGHT_ID_KEYS
+                     if isinstance(value := meta.get(key), str) and value.strip()), None)
+    if identity is None or meta.get("initial_residency") not in (None, "hbm_cold"):
+        return None
+    ranges = meta.get("weight_ranges", meta.get("ranges"))
+    if ranges is None:
+        # A declared allocation can describe its contiguous payload by size.
+        size = meta.get("weight_payload_bytes") or meta.get("weight_bytes") or meta.get("local_weight_bytes")
+        if not isinstance(size, (int, float)):
+            return None
+        touched = min(size, mte2_bytes)
+        if not touched >= 1:
+            return None
+        ranges = ((0, int(touched)),)
+    version = meta.get("weight_tensor_version", meta.get("tensor_version", 0))
+    return TensorRangeObligation(die, identity, version, tuple(ranges), "hbm_cold", "owner")
 
-def _scenario_rank_ops(scenario):
-    raw = getattr(scenario, "atomic_ops", None)
-    if not raw:
-        return ()
-    out = []
-    for entry in raw:
-        rep = int(getattr(entry, "replica", 0))
-        for op in getattr(entry, "ops", ()):
-            out.append((rep, op))
-    return tuple(out)
-
-
-def _derive_default_obligations(scenario, demands, aliases):
-    from .contracts import FusedRegionSummary, SemanticWorkItem, TensorRangeObligation
-
+def _derive_default_obligations(scenario, demands, aliases, *, infer_work=True):
     atomic = getattr(scenario, "atomic_step", None)
     case = getattr(atomic, "case", None) or getattr(scenario, "case", None)
-    machine = _machine(scenario)
-    dies = getattr(machine, "dies", ()) if machine is not None else ()
+    dies = tuple(demands.devices)
     parallel = getattr(getattr(case, "runtime", None), "parallel", None)
     tp_width = (int(parallel.tp) * int(parallel.pcp)) if parallel is not None else 1
     pp_stages = int(parallel.pp) if parallel is not None else 1
     default_dt = str(getattr(getattr(case, "model", None), "compute_dtype", "") or "bf16")
 
-    work_items = []
-    read_obs = []
-    placements = {}
+    matrix_work = defaultdict(int)
+    read_obs, write_obs = [], []
+    placements, seen = {}, set()
     for replica, op in _scenario_rank_ops(scenario):
         if op.op_id in aliases:
             continue
         meta = dict(op.metadata)
-        if meta.get("load_time"):
-            continue
         stage = int(getattr(op, "stage", 0))
         die_idx = (replica * pp_stages + stage) * tp_width
-        die = int(dies[die_idx].rank) if 0 <= die_idx < len(dies) else 0
+        die = dies[die_idx] if 0 <= die_idx < len(dies) else 0
         placements.setdefault(die, (replica, stage))
-        path = demands.paths.get(die)
-        engines = ("cube", "aiv_simt") if (path is not None and path.simt_ub_carveout_bytes) else ("cube",)
-        pairs = op.matrix_flops if getattr(op, "matrix_flops", ()) else (
-            ((op.dtype or default_dt, op.flops),) if getattr(op, "flops", 0.0) > 0.0 else ()
-        )
-        for dt, fl in pairs:
-            if fl > 0.0 and demands.rate((replica, stage, die), "cube", str(dt)) > 0:
-                work_items.append(SemanticWorkItem(
-                    f"mac:{op.op_id}:{dt}", "matrix_mac", str(dt), int(fl), engines,
-                    die=die, replica=replica, pp_stage=stage,
-                ))
-        if op.family in _COLD_WEIGHT_FAMILIES and getattr(op, "mte2_bytes", 0.0) > 0.0:
-            raw_w = meta.get("weight_payload_bytes") or meta.get("weight_bytes") or meta.get("local_weight_bytes")
-            if isinstance(raw_w, (int, float)) and raw_w > 0.0:
-                w_bytes = int(min(float(raw_w), float(op.mte2_bytes)))
-                if w_bytes > 0:
-                    read_obs.append(TensorRangeObligation(
-                        die, f"weight:r{replica}.s{stage}.{op.op_id}", 0, ((0, w_bytes),), "hbm_cold", "owner",
-                    ))
-    if not work_items and not read_obs:
+        key = replica, stage, op.op_id
+        if infer_work and key not in seen:
+            seen.add(key)
+            dtype = getattr(op, "dtype", "") or default_dt
+            pairs = getattr(op, "matrix_flops", ()) or ((dtype, getattr(op, "flops", 0)),)
+            for dt, flops in pairs:
+                if flops > 0:
+                    matrix_work[replica, stage, die, str(dt)] += int(flops)
+        if "read_obligations" in meta:
+            read_obs.extend(meta["read_obligations"])
+        elif (read := _cold_weight_read(op, meta, die)) is not None:
+            read_obs.append(read)
+        write_obs.extend(meta.get("write_obligations", ()))
+    if not (matrix_work or read_obs or write_obs):
         return (), placements
-    total_read = sum(r[1] - r[0] for ob in read_obs for r in ob.ranges)
+    # These modes have identical rates per FLOP. Combine them before inward rounding.
+    work_items = []
+    for (replica, stage, die, dt), flops in matrix_work.items():
+        path = demands.paths.get(die)
+        engines = ("cube", "aiv_simt") if path and path.simt_ub_carveout_bytes else ("cube",)
+        work_items.append(SemanticWorkItem(f"mac:r{replica}.p{stage}.d{die}:{dt}", "matrix_mac",
+                                           dt, flops, engines, die=die, replica=replica, pp_stage=stage))
     return (FusedRegionSummary(
-        tier="K1",
-        region_id="scenario_compulsory_floor",
-        op_ids=(),
-        semantic_work=tuple(work_items),
-        issued_cube_flops_by_dtype=(),
-        vector_ops_by_pipe=(),
-        read_obligations=tuple(read_obs),
-        write_obligations=(),
-        logical_transfer_bytes=total_read,
-        issued_copy_bytes=total_read,
-        dram_sector_bytes=total_read,
-        turnaround_service_bytes=Fraction(total_read),
-        realized_l2_hit_bytes=0,
-        comm_wire_bytes_by_link=(),
-        stars_launch_count=0,
-        aicpu_metadata_ms=Fraction(0),
-        sram_peaks_bytes=(),
-        spec=None,
+        tier="K1", region_id="scenario_compulsory_floor", op_ids=(), semantic_work=tuple(work_items),
+        issued_cube_flops_by_dtype=(), vector_ops_by_pipe=(),
+        read_obligations=tuple(read_obs), write_obligations=tuple(write_obs),
+        logical_transfer_bytes=0, issued_copy_bytes=0, dram_sector_bytes=0, turnaround_service_bytes=Fraction(),
+        realized_l2_hit_bytes=0, comm_wire_bytes_by_link=(), stars_launch_count=0,
+        aicpu_metadata_ms=Fraction(), sram_peaks_bytes=(), spec=None,
     ),), placements
 
 
@@ -685,8 +685,9 @@ def build_dual_inputs_from_scenario(
                       if not any(op_id in aliases for op_id in summary.op_ids))
     contractions = getattr(scenario, "bilinear_contractions", ())
     placements = dict(getattr(scenario, "die_placements", ()))
-    if not summaries and not any(meta.get("semantic_work") for _, meta in operations):
-        summaries, derived_places = _derive_default_obligations(scenario, demands, aliases)
+    if not summaries:
+        infer_work = not any(meta.get("semantic_work") for _, meta in operations)
+        summaries, derived_places = _derive_default_obligations(scenario, demands, aliases, infer_work=infer_work)
         for die, coord in derived_places.items():
             placements.setdefault(die, coord)
     seen = set()
@@ -719,8 +720,10 @@ def build_dual_inputs_from_scenario(
 
         # Stage latency and tile-level service may overlap. Demand a proof of
         # the mandatory quantum and mandatory event edges before charging them.
-        field = "certified_" if demands.certified else ""
-        quantum = meta.get(f"{field}mandatory_event_quantum_ns")
+        quantum = meta.get("mandatory_event_quantum_ns")
+        if demands.certified and quantum is not None:
+            certified = meta.get("certified_mandatory_event_quantum_ns")
+            quantum = min(quantum, certified) if certified is not None else None
         if quantum is not None and not meta.get("independent_prefetch"):
             event_ids[op.op_id] = len(quanta)
             quanta.append(inward_floor_ns(Fraction(quantum)))
@@ -729,8 +732,11 @@ def build_dual_inputs_from_scenario(
     for op, meta in operations:
         if op.op_id not in event_ids:
             continue
-        field = "certified_" if demands.certified else ""
-        for predecessor, wire_ns in meta.get(f"{field}mandatory_event_deps", ()):
+        deps = meta.get("mandatory_event_deps", ())
+        if demands.certified:
+            certified_deps = dict(meta.get("certified_mandatory_event_deps", ()))
+            deps = ((pred, min(wire, certified_deps[pred])) for pred, wire in deps if pred in certified_deps)
+        for predecessor, wire_ns in deps:
             source = aliases.get(predecessor, predecessor)
             if source in event_ids and source != op.op_id:
                 edges.append(DagEdge(event_ids[source], event_ids[op.op_id],

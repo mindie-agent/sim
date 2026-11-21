@@ -27,7 +27,7 @@ from .contracts import CatlassKernelSpec, DslKernelSpec, FuseRegionSpec
 from .dual_bound import _unique_ops
 from .framework_solver import (
     DEFAULT_MAX_TRIALS, FrameworkSolveResult, _TrialSearch, _atomic_ops, _machine,
-    _resolved, _stream_candidates, _stream_plan, _wall, _with_operations,
+    _interleave, _search_bases, _stream_candidates, _stream_plan, _wall, _with_operations,
 )
 from .reload_bounds import BITS_PER_BYTE
 
@@ -519,15 +519,14 @@ def solve_dsl(
     search = _TrialSearch(dossier, max_trials, dual_program=dual_program, event_dag=event_dag,
                           dual_certificate=dual_certificate)
     search.seed(fw_result.best_plan, fw_result.best_eval)
-    scenario = _resolved(dossier)
-    ops = _atomic_ops(scenario)
-    paths = tuple(datapath_for_die(device) for device in getattr(_machine(scenario), "dies", ()))
     specs_by_edit = {}
-    for index, stage in enumerate(DSL_STAGES):
-        base = search.best_plan
-        limit = search.remaining // (len(DSL_STAGES) - index)
+
+    def candidates(base, scenario, index, stage):
+        ops = _atomic_ops(scenario)
+        paths = tuple(datapath_for_die(device) for device in getattr(_machine(scenario), "dies", ()))
         if index == len(DSL_STAGES) - 1:
-            applied = getattr(search.best_eval, "applied_plan", getattr(search.best_eval, "applied", None))
+            _, evaluation = search.frontier.get(base.base_graph_sha256, (base, None))
+            applied = getattr(evaluation, "applied_plan", getattr(evaluation, "applied", None))
             placed_ops = _unique_ops(applied.executable) if applied is not None else ops
             atomic_ids = {op.op_id for op in ops}
             handles = ()
@@ -536,31 +535,37 @@ def solve_dsl(
                 handles = tuple((op_id, OpRef("result_of", edit_id))
                                 for edit_id, output in applied.handles
                                 for op_id in output if len(output) == 1 and op_id not in atomic_ids)
-            search.stage(stage, (_stream_plan(base, stage, operation)
-                                 for operation in _stream_candidates(scenario, placed_ops, handles)), limit)
+            yield from (_stream_plan(base, stage, operation)
+                        for operation in _stream_candidates(scenario, placed_ops, handles))
         elif paths:
             path = paths[0]
             aic, aiv = min(p.aic_count for p in paths), min(p.aiv_count for p in paths)
             if index == 0:
                 proposals = _dsl_proposals(ops, path, aic, aiv)
             else:
-                book = getattr(search.handle, "recipe_book", None)
+                from mindie_sim.rewrite.oracle import ScenarioHandle, _baseline
+
+                book = (_baseline(search.handle, base).book if isinstance(search.handle, ScenarioHandle)
+                        else getattr(search.handle, "recipe_book", None))
                 bottlenecks = dict(getattr(dossier, "bottleneck_ops", ()))
                 sites = sorted(ops, key=lambda op: -bottlenecks.get(op.op_id, 0))
                 proposals = _catlass_proposals(sites, path, aic, aiv,
                                                registered=getattr(book, "recipes", None))
 
-            def plans():
-                for operations, spec in proposals:
-                    candidate = _with_operations(base, stage, operations)
-                    specs_by_edit[plan_sha256(candidate)] = spec
-                    yield candidate
+            for operations, spec in proposals:
+                candidate = _with_operations(base, stage, operations)
+                specs_by_edit[plan_sha256(candidate)] = (candidate, spec)
+                yield candidate
 
-            search.stage(stage, plans(), limit)
-        else:
-            search.stage(stage, (), limit)
-    specs = tuple(specs_by_edit[digest] for _, _, digest in search.history if digest in specs_by_edit)
-    specs = tuple(dict.fromkeys(specs))
+    for index, stage in enumerate(DSL_STAGES):
+        limit = search.remaining // (len(DSL_STAGES) - index)
+        bases = tuple(_search_bases(dossier, search))
+        search.stage(stage, _interleave(candidates(base, scenario, index, stage)
+                                        for base, scenario in bases), limit)
+    best = search.best_plan
+    specs = tuple(dict.fromkeys(spec for plan, spec in specs_by_edit.values()
+                                if plan.base_graph_sha256 == best.base_graph_sha256
+                                and all(edit in best.edits for edit in plan.edits)))
     return DslSolveResult(search.best_plan, search.best_eval, _wall(search.best_eval),
                           tuple(s for s in specs if isinstance(s, CatlassKernelSpec)),
                           tuple(s for s in specs if isinstance(s, DslKernelSpec)),

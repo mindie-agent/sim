@@ -8,7 +8,7 @@
   ``calibrate record samples.jsonl`` stay unambiguous. ``TimeoutError`` is
   never masked by ``except OSError:``. ``mindie_sim.__all__`` has zero
   duplicate exports.
-[Timeouts & Locks] Fast Tier-1 subprocess + in-memory checks (<5s).
+[Timeouts & Locks] Bounded CLI subprocesses and full-model analytical replay.
 [Side-Effect Policy] Writes only inside pytest ``tmp_path``.
 """
 from __future__ import annotations
@@ -20,7 +20,7 @@ import sys
 
 import pytest
 
-from _support.axes import SKUS
+from _support.axes import REPRESENTATIVE_SKUS, SKUS
 import mindie_sim
 import mindie_sim.api as sdk_api
 import mindie_sim.cli as cli_mod
@@ -36,7 +36,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 def test_cli_entrypoint_parity_disambiguation_and_timeout_propagation(tmp_path, monkeypatch):
     raw_case = compose_raw_case(
         model="qwen3-32b",
-        hardware="Ascend910B2",
+        hardware=REPRESENTATIVE_SKUS["a2"],
         dp=1, tp=1, pp=1, layers=1,
     )
     case_path = tmp_path / "case.json"
@@ -202,7 +202,7 @@ def test_typed_sdk_service_sla_sweep_and_production_capture_resolution():
 
     case = sdk_api.compose_case(
         "qwen3-32b",
-        hardware="Ascend910B2",
+        hardware=REPRESENTATIVE_SKUS["a2"],
         options={
             "dp": 1, "tp": 1, "pp": 1, "layers": 1,
             "prompt_tokens": 32, "output_tokens": 2, "concurrency": 1,
@@ -269,3 +269,13 @@ def test_typed_sdk_service_sla_sweep_and_production_capture_resolution():
     step_ev = sdk_api.evaluate_step(case, StepRequest(phase="decode", tokens=1, context=64, sequences=1))
     with_preds = [row for row in step_ev.operators if row.predecessors and row.predecessors[0].op_id != "analysis_input"]
     assert with_preds and all(pred.rank == 0 for pred in with_preds[0].predecessors)
+
+
+def test_top_level_optimize_ladder_replays_default_routed_schedule():
+    case = compose_raw_case("deepseek-v4-flash", REPRESENTATIVE_SKUS["a5"], tp=4, ep=4)
+    report = mindie_sim.optimize_ladder(case, StepRequest("decode", context=64))
+    ladder = report.ladder
+    assert mindie_sim.optimize_ladder is sdk_api.optimize_ladder
+    assert report.verification.passed and report.verification.scope == "full"
+    assert 0 < ladder.l_star_lean_ns <= ladder.a_star_dsl_ns <= ladder.a_star_framework_ns
+    assert ladder.a_star_framework_ns <= min(ladder.m_mainline_ns, ladder.u_unmerge_ns)

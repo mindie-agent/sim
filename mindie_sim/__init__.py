@@ -73,6 +73,7 @@ from .sweep import (
     sweep_topology_grid,
     sweep_topology_grid_iter,
 )
+from .api import optimize_ladder
 from .public import (
     CORE_PROVIDER,
     ENTRY_POINT_GROUP,
@@ -131,7 +132,7 @@ __all__ = [
     "list_optimization_mechanisms",
     "RuntimeStackProfile", "StackMechanismBinding",
     "register_runtime_stack", "load_runtime_stack_manifest",
-    "compare_feature_tracks",
+    "compare_feature_tracks", "optimize_ladder",
 ]
 
 _LAZY_SUBMODULES = frozenset({
