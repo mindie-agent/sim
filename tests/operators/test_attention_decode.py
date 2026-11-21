@@ -10,24 +10,37 @@ from dataclasses import replace
 from itertools import islice
 import json
 import pickle
+from types import SimpleNamespace
 
 import pytest
 
+from _support import operator_calibration_helpers as source_cases
 from _support.axes import ARCH_IDS, REPRESENTATIVE_SKUS, SKUS
-from _support.builders import dense_case
+from _support.builders import dense_case, dense_model
 from _support.captures import REPO_ROOT, fixture_json
 from _support.hardware import isa_of, sku_case
-from mindie_sim import compose_case, graph_costs, operator_costs, target_operators
+from mindie_sim import compose_case, graph_costs, operator_costs, target_graphs, target_operators
+from mindie_sim.catalog.cache import cache_row_split, packed_region_row_bytes
+from mindie_sim.catalog.cache_format import cache_format
+from mindie_sim.catalog.types import AuxiliarySpec, DraftSpec
+from mindie_sim.observed_contracts.attention_contracts import observed_attention_contract
+from mindie_sim.prediction.operators.paged_mla import family_mqsmla, mqsmla; from mindie_sim.prediction.operators.mla import latent_dcp
 from mindie_sim.prediction.operators.sharedkv import sharedkv_attention as scfa
 from mindie_sim.prediction.operators.attention.attention import AttentionPolicy
-from mindie_sim.prediction.engine import Engine, Resource
+from mindie_sim.prediction.operators.attention.batch_prefix_attention import BatchPrefixAttention
+from mindie_sim.prediction.cache_path import CacheGeometry, CacheState
+from mindie_sim.prediction.cache_representation import CacheLowering, cache_identity, store
+from mindie_sim.prediction.operators.mla_prolog.draft_context import prepare
+from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.frontend import Frontend
+from mindie_sim.prediction.lowering import Builder
 from mindie_sim.prediction.mechanism import Geometry
+from mindie_sim.prediction.operators.mla.mla_epilogs import KV_COMPRESS_EPILOG_FAMILY, kv_cache_epilog
 from mindie_sim.prediction.operators import attention as governed
 from mindie_sim.prediction.operators.attention._cp_tiling import HISTORY_DECODE_SITE, VLLM_REVISION
 from mindie_sim.prediction.program import RecipeBook, RecipeContext
 from mindie_sim.prediction.streams import StreamOwners
-from mindie_sim.prediction.verification import verify_operator
+from mindie_sim.prediction.structure import parse_case
 from mindie_sim.public.errors import UnmodeledCapabilityError
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import OpSpec
@@ -35,6 +48,9 @@ from mindie_sim.schema.workload import RequestView
 from mindie_sim.structure_contracts import predicted_contract
 
 KIB = 1024
+PACKED_MLA_CASE = REPO_ROOT / "examples/cases/longctx-decode-20261030/v41-a5-tp1-dp8-ep8.json"
+MODE1_ROW_BYTES = 608
+MODE2_ROW_BYTES = 584
 
 pytestmark = pytest.mark.tier0
 
@@ -142,7 +158,7 @@ def _run(op, *, ready_at=0, cores=4, policy="resident", trace_limit=0):
 
 
 @pytest.mark.parametrize("query,context,topk", [(3, 0, 512), (3, 4096, 512), (3, 8192, 1024)])
-def test_sharedkv_scratch_and_output_follow_combined_window_and_selection(query, context, topk):
+def test_sharedkv_workspace_and_output_follow_combined_window_and_selection(query, context, topk):
     op = _op(query=query, context=context, topk=topk)
     resident, engine, bind, done, ready = _run(op, ready_at=7, trace_limit=2000)
     offchip, *_ = _run(op, policy="offchip")
@@ -322,3 +338,195 @@ def test_frontend_preserves_ragged_decode_requests_across_batching():
         attention = [op for op in ops if op.family == "attention" and op.layer == 0]
         assert len(attention) == (1 if fused else 2)
         assert sum(op.flops for op in attention) == 2 * (8 + 12 + 13 + 14) * 4 * (16 + 16)
+
+
+def test_draft_context_attributes_every_layer_op():
+    draft = DraftSpec(
+        kind="dspark", layers=2, hidden_size=32, intermediate_size=64,
+        num_heads=4, num_kv_heads=2, head_dim=16, q_width=64, kv_width=32,
+        attention_kind="mla", block_size=5, markov_rank=16, vocab_size=128,
+        q_lora_rank=32, kv_lora_rank=64, qk_rope_head_dim=8)
+    model = replace(dense_model(layers=1), auxiliary=AuxiliarySpec(dspark=draft))
+    projection = OpSpec("proj", "gemm", "draft", 0, -1, (),
+                        (1, 1, 1), (1, 1, 1), (1, 1, 1), (1, 1, 1))
+    ops = []
+    prepare(ops, projection=projection, model=model, draft=draft, rows=4,
+            query_rows=3, prefix="d:", stage=0, requests=())
+    attributed = {op.op_id: op.layer for op in ops}
+    for layer in range(draft.layers):
+        for suffix in ("mla_prolog_v3", "kv_scatter"):
+            assert attributed[f"d:context_kv{layer}.{suffix}"] == layer
+    assert not any("qkv_a" in op_id or "kv_copy" in op_id for op_id in attributed)
+    assert attributed["d:context_norm"] == -1
+
+
+@pytest.mark.parametrize("shape,qk,pv", [((1, 128, 4, 3, 1), 75, 25), ((1, 128, 4, 16), 50, 50)])
+def test_prefix_attention_matrix_work_uses_qk_and_pv_head_widths(shape, qk, pv):
+    op = OpSpec("attn", "attention", "decode", 0, 0, (), shape, shape, shape, shape,
+                metadata=(("prefix_read_reuse_applied", True),))
+    context = SimpleNamespace(op=op, work={"cube": 100.0}, setup_ms=0.0,
+                              minimum_ms=0.0, resource_names={})
+    work = {stage.name: stage.work for stage in BatchPrefixAttention().lower(context).stages}
+    assert work["qk"]["cube"] == pytest.approx(qk)
+    assert work["pv"]["cube"] == pytest.approx(pv)
+
+
+def _packed_mode_model(scale_dtype):
+    case = parse_case(json.loads(PACKED_MLA_CASE.read_text(encoding="utf-8")))
+    metadata = dict(case.model.metadata)
+    regions = dict(metadata.get("cache_representations", {}))
+    region = {"dtype": "fp8_e4m3", "group_size": 32, "scale_dtype": scale_dtype}
+    regions.update(window=dict(region), compressed_kv=dict(region))
+    return replace(case.model, metadata=tuple({**metadata, "cache_representations": regions}.items()))
+
+
+def _packed_cache_builder(model, context):
+    views = (RequestView("r0", 1, context, False, "decode"),)
+    builder = Builder("l0", model.layer_plans[0], 0, views, model, "decode")
+    geometry = CacheGeometry(capacity_bytes=1 << 20, line_bytes=1, transfer_bytes=1, staging_lines=1)
+    return builder, geometry
+
+
+@pytest.mark.parametrize("scale_dtype,row_bytes", [("bf16", MODE1_ROW_BYTES), ("uint8", MODE2_ROW_BYTES)])
+def test_mqsmla_window_and_compressed_writers_use_packed_row_extents(scale_dtype, row_bytes):
+    model = _packed_mode_model(scale_dtype)
+    width = model.layer_plans[0].cache_row_elements
+    assert width == 512
+    assert packed_region_row_bytes(model, "window", width) == row_bytes
+    builder, geometry = _packed_cache_builder(model, 100)
+    store(builder, "window", ("src",), 3, width, "window", state=CacheState(geometry),
+          geometry=geometry, identity=cache_identity("window", layer=0, request="r0"))
+    window = builder.ops[-1]
+    assert window.mte3_bytes == pytest.approx(3 * row_bytes)
+    assert dict(window.metadata)["cache_row_bytes"] == row_bytes
+    assert dict(window.metadata)["cache_representation"]["row_bytes"] == row_bytes
+
+    builder, geometry = _packed_cache_builder(model, 127)
+    store(builder, "compressed", ("src",), 1, 512, "compressed_kv", state=CacheState(geometry),
+          geometry=geometry, identity=cache_identity("compressed_kv", layer=2, request="r0"))
+    compressed = builder.ops[-1]
+    assert compressed.mte2_bytes == pytest.approx(1024.0)
+    assert compressed.mte3_bytes == pytest.approx(row_bytes)
+    assert dict(compressed.metadata)["cache_row_bytes"] == row_bytes
+
+
+def test_mqsmla_epilog_prefers_the_declared_cache_row_width():
+    fmt = cache_format(_packed_mode_model("bf16"), "window")
+    op = replace(source_cases._c8_op(((1, 128),), 128, 64, 0), dtype="bf16",
+                 local_shape=(3, 512), metadata=(("cache_row_bytes", MODE1_ROW_BYTES),))
+    epilog = kv_cache_epilog(op, fmt, "window", native=True)
+    assert epilog.family == KV_COMPRESS_EPILOG_FAMILY
+    assert dict(epilog.metadata)["cache_epilog"]["row_bytes"] == MODE1_ROW_BYTES
+
+
+def test_mqsmla_byte_scale_lowering_splits_payload_and_padding():
+    model = _packed_mode_model("uint8")
+    builder, geometry = _packed_cache_builder(model, 127)
+    lowering = CacheLowering(builder, CacheState(geometry))
+    lowering.store("compressed", ("src",), 1, 512, "compressed_kv", identity="compressed_kv:l2:r0")
+    view = lowering.requests[-1][1].view
+    assert cache_row_split(model, "compressed_kv", 512) == (576.0, 8.0)
+    assert (view.payload_bytes, view.scale_bytes, view.padding_bytes) == (576, 7, 1)
+    assert sum((view.payload_bytes, view.scale_bytes, view.padding_bytes)) == MODE2_ROW_BYTES
+
+
+def test_mqsmla_window_union_advances_across_query_rows():
+    shape = {"sequences": ((6, 131072),), "window": 128, "ratio": 0, "topk": 0}
+    external, shared = mqsmla.quant_external_fill(shape, mqsmla.KV_QUANT_FP8)
+    assert shared == 0
+    assert external == 133 * mqsmla.quant_row_bytes(mqsmla.KV_QUANT_FP8)
+    assert external == 80864
+
+
+@pytest.mark.parametrize("mode,keys,topk,rows,external_bytes,shared", [
+    ("private", ("A", "A"), 0, 262, 159296, 0),
+    ("shared", ("A", "A"), 0, 261, 158688, 1),
+    ("shared", ("k0", "k1"), 512, 262, 159296, 0),
+])
+def test_hca_runtime_and_cache_keys_control_prefix_aliasing(mode, keys, topk, rows, external_bytes, shared):
+    views = tuple(RequestView(request, 1, 383, False, "decode", prefix_tokens=128, prefix_cache_key=key)
+                  for request, key in zip(("a", "b"), keys))
+    fields = family_mqsmla._prefix_fields(views, SimpleNamespace(prefix_cache_mode=mode))
+    if mode == "shared":
+        assert fields["prefix_tokens"] == (128, 128)
+        assert fields["prefix_cache_keys"] == keys
+    shape = dict(sequences=((1, 383),) * 2, window=128, ratio=128, topk=topk, **fields)
+    assert mqsmla.quant_external_fill(shape, mqsmla.KV_QUANT_FP8) == (external_bytes, shared)
+    assert external_bytes == rows * MODE1_ROW_BYTES
+
+
+@pytest.mark.parametrize("contexts,prefixes,keys,ratio,topk,rows,external_bytes,shared", [
+    ((191, 191), (64, 64), ("k", "k"), 128, 0, 258, 156864, 0),
+    ((511, 767, 767), (256, 256, 0), ("k", "k", ""), 4, 512, 832, 505856, 64),
+])
+def test_mqsmla_shares_only_completed_prefix_rows(contexts, prefixes, keys, ratio, topk,
+                                                 rows, external_bytes, shared):
+    shape = dict(sequences=tuple((1, context) for context in contexts), window=128, ratio=ratio,
+                 topk=topk, prefix_cache_mode="shared", prefix_tokens=prefixes, prefix_cache_keys=keys)
+    assert mqsmla.quant_external_fill(shape, mqsmla.KV_QUANT_FP8) == (external_bytes, shared)
+    assert external_bytes == rows * MODE1_ROW_BYTES
+
+
+@pytest.mark.parametrize("row_width", (MODE1_ROW_BYTES, MODE2_ROW_BYTES))
+def test_dsl_mqsmla_contract_rejects_native_only_row_widths(row_width):
+    query = ((4, 64, 512), "bf16", "ND")
+    empty = ((), None, None)
+    inputs = (query, empty, ((16, 1, 1, row_width), "uint8", "ND"),
+              ((1, 16), "int32", "ND"), empty, empty, empty)
+    input_shapes, input_dtypes, input_formats = zip(*inputs)
+    output_shapes, output_dtypes, output_formats = zip(query, empty)
+    row = SimpleNamespace(input_shapes=input_shapes, input_dtypes=input_dtypes, input_formats=input_formats,
+                          output_shapes=output_shapes, output_dtypes=output_dtypes, output_formats=output_formats,
+                          kind="MqsmlaKernel___call__")
+    assert observed_attention_contract(row) is None
+    row.kind = "aclnnMixedQuantSparseFlashMla"
+    assert observed_attention_contract(row) is not None
+
+
+@pytest.mark.parametrize("scale_dtype", ("bf16", "fp8_e8m0"))
+def test_dsl_mqsmla_lowering_rejects_native_quant_modes(scale_dtype):
+    raw = compose_case(
+        "deepseek-v4.1-flash", hardware="a5", tp=4, dp=2, ep=8, num_devices=8,
+        layers=4, quant="w8a8", prompt_tokens=16, output_tokens=2)
+    packed = {"dtype": "fp8_e4m3", "group_size": 64, "scale_dtype": scale_dtype}
+    raw["model"].setdefault("metadata", {})["cache_representations"] = {
+        "window": dict(packed), "compressed_kv": dict(packed),
+    }
+    parsed = parse_case(raw)
+    decode = dict(phase="decode", tokens=1, context=128, sequences=1, scope="body")
+    graph = target_graphs(parsed, **decode)[0]
+    native = next(op for op in graph if op.recipe == "aclnn_mixed_quant_sparse_flash_mla")
+    metadata = dict(native.metadata)
+    geometry = dict(metadata["mqsmla_geometry"])
+    geometry.pop("implementation", None)
+    metadata["mqsmla_geometry"] = geometry
+    metadata.pop("native_kind", None)
+    crafted = replace(native, recipe="cannbot_mixed_quant_sparse_flash_mla", metadata=tuple(metadata.items()))
+    with pytest.raises(ModelingError, match=r"^mqsmla_legacy_dsl_requires_mixed_fp8_fp4_cache$"):
+        operator_costs(parsed, (crafted,), input_ready_ms=0)
+
+    raw["runtime"].setdefault("metadata", {}).pop("automatic_lowerings", None)
+    raw["runtime"].setdefault("kernels", {}).setdefault("lowerings", {})[
+        "mqsmla_attention"] = "cannbot_mixed_quant_sparse_flash_mla"
+    with pytest.raises(ModelingError, match=r"^mqsmla_cache_representation_contract_required:window$"):
+        target_graphs(parse_case(raw), **decode, apply_body_defaults=False)
+
+
+def test_padded_latent_attention_producer_writes_the_entire_pack_input():
+    case = parse_case(compose_case(
+        "kimi-k3.1", hardware="a5", dp=1, tp=8, dcp=8, ep=8, num_devices=8,
+        layers=4, quant="int8", prompt_tokens=8, output_tokens=2))
+    model = replace(case.model, quant=replace(case.model.quant, kv_dtype="int8"))
+    layer = model.layer_plans[3]
+    views = (RequestView("r", 1, 127, False, "decode"),)
+    builder = Builder("p", layer, 0, views, model, "decode")
+    member = replace(source_cases._c8_op(((1, 127),), 128, 96, 0), recipe="paired_mla_attention_analytic",
+                     mte3_bytes=98304, hbm_bytes=98304, metadata=())
+    builder.add(member)
+    latent_dcp.attention_batch(builder, [member.op_id], views, plan=layer,
+                               heads=96, local_heads=12, cp=8, rows=8)
+    ops = {op.op_id.rsplit(".", 1)[-1]: op for op in builder.ops}
+    assert ops["latent_attention_batch"].mte3_bytes == ops["dcp_output_pack"].mte2_bytes == 792576
+    assert ops["dcp_output_pack"].mte3_bytes == ops["dcp_lse_merge"].mte2_bytes == 792576
+    assert ops["dcp_output_alltoall"].link_bytes == 693504
+    assert ops["dcp_lse_merge"].mte3_bytes == 98304

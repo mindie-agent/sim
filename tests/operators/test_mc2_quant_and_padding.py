@@ -21,7 +21,7 @@ from mindie_sim import graph_costs, target_graphs
 from mindie_sim.catalog.quant import quant_preset
 from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.prediction.cohort_traffic import bind_cohort_traffic
-from mindie_sim.prediction.engine import Engine, Resource
+from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.frontend import Frontend
 from mindie_sim.prediction.instructions import cal_token_send_expert_work, get_sff_value_u64_i64_work
 from mindie_sim.prediction.mechanism import Geometry

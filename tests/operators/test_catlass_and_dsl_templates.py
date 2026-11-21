@@ -25,7 +25,7 @@ from _support.linear_cases import (
     verify_template_declaration, visitor_graph, with_mx_modes,
 )
 from mindie_sim.optimization.reload_bounds import compute_compulsory_hbm_cut
-from mindie_sim.prediction.engine import Engine, Resource
+from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.program import Allocation, Stage
 from mindie_sim.prediction.runtime.memory_physics import AddressRun, AddressRunPlan, AdmissionMemoryView, MemoryAccessPattern, ReuseKey
 from mindie_sim.prediction.runtime.tile_solver import LiveBufferSpec, TileInfeasibleError

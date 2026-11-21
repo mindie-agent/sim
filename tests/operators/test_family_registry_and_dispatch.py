@@ -25,7 +25,7 @@ from mindie_sim.observations.historical import call_inventory, call_observations
 from mindie_sim.observations.kernels import kernel_rows
 from mindie_sim.prediction.blocks import norm
 from mindie_sim.prediction.cost import CostModel
-from mindie_sim.prediction.engine import Engine, Resource
+from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.frontend import Frontend
 from mindie_sim.prediction.mechanism import Geometry, OperatorPlan, PlannedRecipe, Work

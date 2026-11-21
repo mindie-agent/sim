@@ -558,7 +558,7 @@ def test_split_periodic_residency_runs_stay_memory_bounded():
     from mindie_sim.prediction.runtime.memory_physics import AddressRun, AddressRunPlan
     from mindie_sim.templates.contracts import TensorRangeObligation, _split_entry_residency
 
-    rows, half, stride, sparse, sector = 4_194_304, 2_097_152, 4097, 4_194_336, 32
+    half, stride, sparse, sector = 2_097_152, 4097, 4_194_336, 32
     cov = AddressRunPlan((AddressRun(0, half, sector, sparse), AddressRun(half * sparse, half, sector, sparse))).sector_coverage()
     r_a = AddressRun(0, half, sector, stride)
     cases = (

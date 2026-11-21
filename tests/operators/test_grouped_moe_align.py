@@ -16,20 +16,24 @@ import pytest
 
 from _support.axes import SKUS
 from _support.hardware import hardware_case, machine
+from _support.moe_hc_mc2_fixtures import router_splitk
 from mindie_sim.prediction.mechanism import Geometry
 from mindie_sim.prediction.operators import grouped_moe
 from mindie_sim.schema.operators import OpSpec
 
-from mindie_sim import graph_costs, operator_costs, target_graphs, target_operators
+from mindie_sim import compose_case, graph_costs, operator_costs, target_graphs, target_operators
 from mindie_sim.catalog.quant import quant_preset
 from mindie_sim.prediction.cost import CostModel
 from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.operators.moe_routing.family_moe_init import apply, capabilities
+from mindie_sim.prediction.operators.matrix.matrix_splitk import build_router_splitk
 from mindie_sim.prediction.operators.moe_routing.moe_gating_fusion import absorb_init_routing
 from mindie_sim.prediction.operators.moe_routing.moe_init_instructions import source_operations
 from mindie_sim.prediction.operators.moe_routing.moe_init_mxfp8 import RECIPE, row_runs
 from mindie_sim.prediction.program import RecipeBook
+from mindie_sim.prediction.source_force_eplb import ledger
 from mindie_sim.prediction.structure import parse_case
+from mindie_sim.public.errors import UnmodeledCapabilityError
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.structure_contracts import predicted_contract
 
@@ -311,3 +315,253 @@ def test_balanced_capture_separates_logical_rows_from_issued_pack_and_scale_rows
     assert ops["moe_transport_quantize"].mte3_bytes == issued * (32 + INDEX_BYTES)
     assert gate["activation_scale_bytes"] == issued * INDEX_BYTES
     assert tuple(ops[key].link_bytes for key in ("moe_payload_dispatch", "moe_scale_dispatch")) == (issued * 16, issued * 2)
+
+
+def test_absorbed_init_routing_writes_the_inverse_index_once():
+    raw = compose_case(
+        "glm-5.3-flash", hardware="a5", tp=8, dp=1, ep=8, num_devices=8,
+        layers=4, prompt_tokens=64, output_tokens=2, max_num_batched_tokens=256,
+        exclude_optimizations=("cann_megamoe_fusion",))
+    graph = target_graphs(parse_case(raw), phase="decode", tokens=64, context=0,
+                          sequences=1, scope="body")[0]
+    pack = next(op for op in graph if op.recipe == "moe_init_routing_v3")
+    unpack = next(op for op in graph if op.recipe == "route_unpack")
+    assignments = int(pack.local_shape[0]) * int(pack.local_shape[1])
+    inverse_bytes = assignments * INDEX_BYTES
+
+    assert assignments == 64
+    assert inverse_bytes == 256
+    assert dict(pack.metadata)["inverse_index_bytes"] == inverse_bytes
+    assert dict(pack.metadata)["moe_init_routing"]["write_bytes"] == (
+        pytest.approx(pack.mte3_bytes))
+    # The quantized payload is 270,336 B; adding the inverse map again
+    # would produce 270,848 B.
+    assert pack.mte3_bytes == pytest.approx(270336 + inverse_bytes)
+    assert pack.mte3_bytes == 270592
+    assert pack.hbm_bytes == pytest.approx(pack.mte2_bytes + pack.mte3_bytes)
+    assert dict(unpack.metadata)["inverse_index_bytes"] == inverse_bytes
+    assert unpack.mte2_bytes == pytest.approx(524544 + inverse_bytes)
+
+
+@pytest.mark.parametrize(("shape", "expected"), [
+    ((528, 288, 4096), 24772608),
+    ((240, 384, 7168), 42663936),
+    ((512, 896, 7168), 102760448),
+])
+def test_router_operand_traffic_uses_the_executed_tile(shape, expected):
+    raw = router_splitk._case(router_splitk.V41, router_splitk.DT)
+    op = router_splitk._router(*shape)
+    plan = build_router_splitk(op, router_splitk._geometry(raw))
+    context = router_splitk._bound_context(raw, plan, op)
+    expected_work = context.bind(plan.work)
+    issued = router_splitk._stage_work(plan.program(context))
+
+    assert plan.work.resources["mte2"] == expected
+    assert expected_work[context.resource_names["mte2_aic"]] == expected
+    assert issued[context.resource_names["mte2_aic"]] == pytest.approx(expected, rel=1e-12)
+
+
+@pytest.mark.parametrize("dp,ep,pcp,phase,sequences", [
+    pytest.param(2, 2, 1, "decode", [4, 3], id="uneven-cohort"),
+    pytest.param(4, 4, 2, "prefill", 2, id="data-and-expert-parallel"),
+    pytest.param(1, 2, 2, "prefill", 2, id="explicit-rank-table"),
+    pytest.param(1, 1, 2, "prefill", 2, id="context-parallel"),
+])
+def test_in_operator_dbo_rejects_cohort_and_context_shards(dp, ep, pcp, phase, sequences):
+    decode = phase == "decode"
+    raw = compose_case(
+        "qwen3-30b-a3b", hardware="a5", tp=1, dp=dp, ep=ep, pcp=pcp,
+        num_devices=dp * pcp, layers=1, enable_dbo=True, prompt_tokens=8,
+        output_tokens=2, max_num_seqs=4 if decode else 2)
+    if ep > dp:
+        raw["runtime"]["parallel"]["rank_table"] = [[0, 1]]
+
+    def graph():
+        return target_graphs(parse_case(raw), phase=phase, tokens=1 if decode else 8,
+                             context=32 if decode else 0, sequences=sequences, scope="body")
+
+    code = "unmodeled_in_op_dbo_pending_stage3"
+    with pytest.raises(UnmodeledCapabilityError, match=code) as raised:
+        graph()
+    assert raised.value.code == code
+    if decode:
+        return
+    raw["runtime"]["enable_dbo"] = False
+    for ops in graph().values():
+        assert not [op for op in ops if op.op_id.startswith("dbo")]
+        packs = [op.local_shape[0] * op.local_shape[1] for op in ops if op.recipe == "route_pack"]
+        gates = [op.local_shape[0] for op in ops if op.recipe == "grouped_gate_up"]
+        unpack = [op.local_shape[0] * op.local_shape[1] for op in ops if op.recipe == "route_unpack"]
+        assert packs == gates == unpack == [64]
+
+
+def test_forced_mask_marginals_match_inverse_and_expert_banks():
+    valid, allocated = (2, 2, 2, 1), (2, 2, 3, 3)
+    result = ledger(32, 4, 8, 2, 7, 2, valid, allocated, 1)
+    assert tuple(map(sum, result.peer_assignments)) == (16, 16, 16, 8)
+    assert tuple(map(sum, zip(*result.peer_assignments))) == tuple(map(sum, result.rank_expert_rows))
+    assert sum(result.expert_rows) == 56
+
+
+def _aswt_block_index_oracle(rows, n, tile, cores):
+    owners = [[] for _ in range(cores)]
+    end = cores - 1
+    for bank, m in enumerate(rows):
+        if not m:
+            continue
+        bm = ((m + ((m + tile.m - 1) // tile.m) - 1) // ((m + tile.m - 1) // tile.m) + 15) // 16 * 16
+        nm, nn = (m + bm - 1) // bm, (n + tile.n - 1) // tile.n
+        total = nm * nn
+        mtail, ntail = m - (nm - 1) * bm, n - (nn - 1) * tile.n
+        main = min(4, nm)
+        mainrow = nm // main - 1
+        tw = nm - main * mainrow
+        start = (end + 1) % cores
+        end = (start + total - 1) % cores
+        oldend, count = end, min(end + 1, total)
+        ms = ns = 1
+        if bank == len(rows) - 1 and end + 1 <= cores // 2:
+            remain = (cores - end - 1) // count + 1
+            ms, ns = min((mtail + 15) // 16, remain), min((ntail + 127) // 128, remain)
+            while ms * ns > remain:
+                if ms >= ns:
+                    ms -= 1
+                else:
+                    ns -= 1
+        split = ms * ns
+        newend = end + count * (split - 1)
+        base = end + 1 - count if split > 1 else 0
+        for owner in range(cores):
+            rounds = (total + cores - 1) // cores
+            if (start > end and end < owner < start) or (start <= end and (owner > end or owner < start)):
+                rounds -= 1
+            if oldend < owner <= newend:
+                rounds += 1
+            local_split = split if owner <= newend else 1
+            for step in range(rounds):
+                mapped = (base + ((owner - base) // local_split) * local_split) // local_split if step == rounds - 1 and local_split > 1 else owner
+                index = mapped + step * cores
+                if owner < start:
+                    index += cores - start
+                elif local_split > 1 and newend + 1 >= local_split * total:
+                    index -= (base + ((start - base) // local_split) * local_split) // local_split
+                else:
+                    index -= start
+                window = index // nn // main
+                if window < mainrow:
+                    mi, ni = window * main + index % main, (index // main) % nn
+                else:
+                    window = mainrow
+                    j = index - mainrow * main * nn
+                    mi, ni = mainrow * main + j % tw, (j // tw) % nn
+                if window % 2:
+                    ni = nn - 1 - ni
+                mm, width = (bm if mi != nm - 1 else mtail), (tile.n if ni != nn - 1 else ntail)
+                mo = no = 0
+                if local_split > 1 and step == rounds - 1:
+                    sm, sn = (mm + ms - 1) // ms, ((width + ns - 1) // ns + 127) // 128 * 128
+                    mo, no = ((owner % local_split) % ms) * sm, ((owner % local_split) // ms) * sn
+                    if mo >= mm or no >= width:
+                        continue
+                    mm, width = min(mm - mo, sm), min(width - no, sn)
+                owners[owner].append((bank, mm, width, mi * bm + mo, ni * tile.n + no))
+        end = newend
+    return tuple(tuple(v) for v in owners)
+
+
+def test_rolling_aswt_matches_literal_source_block_index_oracle():
+    from mindie_sim.prediction.operators.mx_quant_matrix.mxfp8_grouped import Mapping, build as build_mx8, owner_tiles
+
+    tile = Mapping(256, 256, 128, 256, 1)
+    rolling = owner_tiles((1, 1, 1, 1), 4096, tile, 32)
+    assert all([t[0] for t in owner] == ([0, 2] if idx < 16 else [1, 3]) for idx, owner in enumerate(rolling))
+    for rows in ((1, 3), (257, 9), (0, 31, 0), (17, 515, 23), (1031, 17, 3), (9, 19, 29, 49)):
+        for n in (32, 160, 384, 768, 1280):
+            for cores in (3, 7, 16, 32):
+                assert owner_tiles(rows, n, tile, cores) == _aswt_block_index_oracle(rows, n, tile, cores)
+
+    raw = json.loads((ROOT / "examples/cases/high-concurrency-20261030/glm-flash-ws9/a5_glm53flash_tp8_c32_p4k.json").read_text())
+    actual = next(o for o in target_graphs(raw, phase="decode", tokens=4, context=4096, sequences=32, scope="body")[0] if o.op_id.endswith(".expert_down"))
+    geom = Geometry.from_devices(parse_case(raw).machine.dies)
+    plans = [
+        build_mx8(
+            replace(actual, local_shape=(2, 2 * m, 4096, 256), metadata=tuple({
+                **dict(actual.metadata), "matrix_group_rows": (m, m), "matrix_groups": 2,
+                "matrix_weight_bank_groups": 2, "activation_scale_shape": (2 * m, 4, 2),
+            }.items())),
+            geom,
+        )
+        for m in (1, 7)
+    ]
+    assert plans[0].work.resources["mte1"] == plans[1].work.resources["mte1"]
+    assert plans[1].work.matrix["fp8_e4m3"] == 7 * plans[0].work.matrix["fp8_e4m3"]
+    assert plans[1].work.resources["fixpipe"] == 7 * plans[0].work.resources["fixpipe"]
+
+
+def test_mx_source_fifo_slots_and_l1_operand_reuse_ordering():
+    from mindie_sim.prediction.engine import Allocation, Engine, Resource
+    from mindie_sim.prediction.operators.mx_quant_matrix.mxfp4_grouped import build as build_mx4
+    from mindie_sim.prediction.operators.mx_quant_matrix.mxfp4_pipeline import Panel, Slots, SourcePipeline, pipeline_cycle
+    from mindie_sim.prediction.program import RecipeContext, Stage
+
+    def run_fifo(panels, slots=Slots()):
+        resources = ("a", "r0", "v0", "p0", "r1", "v1", "p1", "operand", "cube")
+        engine = Engine([Resource(name, 1) for name in resources], trace_limit=10000)
+
+        def convert(p):
+            st = lambda name, work: Stage(name, {name: work} if work else {})
+            return Panel(
+                st("a", p.activation) if p.activation is not None else None,
+                st("a", p.activation_scale) if p.activation_scale is not None else None,
+                tuple(tuple(st(f"{role}{sub}", work) for role, work in zip(("r", "v", "p", "r", "v", "p"), stages)) for sub, stages in enumerate(p.vectors)),
+                p.scales, tuple((st("operand", a), st("cube", b)) for a, b in p.micros),
+            )
+
+        end = SourcePipeline(len(panels), lambda idx: convert(panels[idx]), slots).start(engine, "source", engine.submit("input", release=0))
+        engine.advance(until=(end,))
+        return end.time, {x["task"]: (x["start_ms"], x["end_ms"]) for x in engine.trace}
+
+    p = Panel(None, None, ((0, 0, 0, 3, 4, 2), (0, 0, 0, 0, 0, 0)), (False, False), ((1, 10),))
+    span, times = run_fifo([p] * 3, Slots(l1=1))
+    assert times["source:panel0:operand0"] == (9, 10) and times["source:panel0:cube0"] == (10, 20)
+    assert times["source:panel1:publish0"] == (11, 13) and span == pipeline_cycle((p,), 3, slots=Slots(l1=1)).span_ms
+
+    for width in (1, 2, 4):
+        q = Panel(None, None, ((0, 0, 0, 1, 2, 10), (0, 0, 0, 0, 0, 0)), (False, False), ((1, 20),))
+        _, slot_times = run_fifo([q] * 8, Slots(input=width, widened=width, l1=2))
+        for idx in range(width, 8):
+            assert slot_times[f"source:panel{idx}:packed_read0"][0] >= slot_times[f"source:panel{idx - width}:widen0"][1]
+            assert slot_times[f"source:panel{idx}:widen0"][0] >= slot_times[f"source:panel{idx - width}:publish0"][1]
+
+    base_p = Panel(None, None, ((0, 0, 0, 1, 4, 2), (0, 0, 0, 0, 0, 0)), (False, False), ((0, 0),))
+    scale_p = replace(base_p, vectors=((5, 6, 7, 1, 4, 2), base_p.vectors[1]), scales=(True, False))
+    ring_span, ring_times = run_fifo([scale_p, base_p, base_p, base_p, scale_p, base_p, base_p], Slots(input=4))
+    assert ring_times["source:panel3:packed_read0"][0] >= ring_times["source:panel0:scale_transpose0"][1]
+    assert ring_times["source:panel4:scale_read0"][0] >= ring_times["source:panel0:widen0"][1]
+    assert pipeline_cycle((scale_p, base_p, base_p, base_p), 1, tail=(scale_p, base_p, base_p)).span_ms == ring_span
+
+    raw = json.loads((ROOT / "examples/cases/v41-a5-dp4-body-current.json").read_text())
+    raw["runtime"]["routing"] = {"policy": "balanced"}
+    raw["runtime"].setdefault("kernels", {}).setdefault("families", {})["grouped_gemm"] = {"kind": "ascend_mxa8w4_nznk"}
+    gate = next(op for op in target_graphs(raw, scope="body", phase="decode", tokens=1, context=8, sequences=1)[0] if op.family == "grouped_gemm")
+    op = replace(gate, local_shape=(1, 128, 2048), semantic_shape=(1, 128, 2048), launch_shape=(1, 128, 2048),
+                 metadata=tuple({**dict(gate.metadata), "matrix_group_rows": (1,), "matrix_weight_bank_groups": 1, "matrix_groups": 1}.items()))
+    reg_roles = ("reg_data_writes", "reg_ub_accesses", "reg_ub_stores", "reg_shuffle_lanes")
+    roles = {role: (1 if role == "cube" else 1e9) for role in ("hbm", "mte1", "mte2_aic", "mte2_aiv", "mte3", "vector", "fixpipe", "cube", *reg_roles)}
+    units = {role: (2 if role in ("vector", "mte2_aiv", "mte3", *reg_roles) else 1) for role in roles}
+    pools = {"ub": 256 * 1024, "l1": 512 * 1024, "l0a": 64 * 1024, "l0b": 64 * 1024, "l0c": 256 * 1024}
+    geom = Geometry(1, units, pools, {k: (2 if k == "ub" else 1) for k in pools})
+    plan = build_mx4(op, geom, compact=False, compact_panels=False)
+    eng = Engine([Resource(role, rate, units=units[role]) for role, rate in roles.items()], pools=pools, pool_units=geom.buffer_units, trace_limit=1000)
+    ctx = RecipeContext(plan.work.apply(op), {}, {r: r for r in roles}, roles, 1, resource_units=units,
+                        pool_names={k: k for k in pools}, compute_peaks={"fp8_e4m3": 1e6},
+                        service_modes={"reg_issue_slots": ("vector", roles["vector"] * 1000 / 32)})
+    done = plan.lower(ctx).start(eng, "source", eng.submit("input", release=7))
+    eng.advance(until=(done,))
+    events = list(eng.trace)
+    matches = lambda panel, suffix: [e for e in events if f":panel{panel}:" in e["task"] and e["task"].endswith(suffix)]
+    for panel in range(4):
+        published = max(matches(panel, f":publish{sub}")[0]["end_ms"] for sub in (0, 1))
+        assert min(e["start_ms"] for e in matches(panel, ":operand")) >= published
+        if panel >= 2:
+            assert matches(panel, ":packed_read0")[0]["start_ms"] >= max(e["end_ms"] for e in matches(panel - 2, ":cube"))

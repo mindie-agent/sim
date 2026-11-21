@@ -17,7 +17,7 @@ from _support.collective_cases import (
 )
 
 from mindie_sim import graph_costs, target_graphs
-from mindie_sim.prediction.engine import Engine, Resource
+from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.operators.collectives.hccl_aicpu import contract as aicpu_contract
 from mindie_sim.prediction.operators.collectives.hccl_alltoallv import AlltoAllVGroup, bind_local_work, peer_schedule
 from mindie_sim.prediction.operators.collectives.hccl_alltoallv import contract as alltoallv_contract

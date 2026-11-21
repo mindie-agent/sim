@@ -41,7 +41,7 @@ from mindie_sim.observations.service_fitting import (
     fit_resource_service_from_role_records,
 )
 from mindie_sim.prediction.cost import CostModel, primitive_key
-from mindie_sim.prediction.engine import Engine, Resource
+from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.primitives import PrimitiveStore
 from mindie_sim.prediction.program import KernelProgram, Stage

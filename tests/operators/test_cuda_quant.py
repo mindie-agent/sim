@@ -1,4 +1,12 @@
-"""Independent source execution, address and resource controls for CUDA quant."""
+"""Independent source execution, address and resource controls for CUDA quant.
+
+[Role] Verify CUDA quantization operator plans against independent CPU reference
+  execution, byte-address spans, and shared-memory/vector resource service.
+[Invariants] Never executes CUDA; every byte count and work total is checked
+  against an independent analytical/reference formula.
+[Timeouts & Locks] Pure in-memory execution and fixture JSON reads; no locks.
+[Side-Effect Policy] Read-only fixture access; zero global mutation.
+"""
 from collections import Counter
 from dataclasses import replace
 import json

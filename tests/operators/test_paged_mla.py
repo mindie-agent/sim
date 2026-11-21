@@ -18,7 +18,7 @@ import pytest
 from _support.axes import REPRESENTATIVE_SKUS, SKUS
 from _support.hardware import sku_case
 from mindie_sim import target_graphs
-from mindie_sim.prediction.engine import Engine, Resource
+from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.mechanism import Geometry
 from mindie_sim.prediction.operators import paged_mla as governed
 from mindie_sim.prediction.operators.contracts import OperatorPlanningContext

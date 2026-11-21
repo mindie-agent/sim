@@ -19,6 +19,8 @@ from pathlib import Path
 
 import pytest
 
+from _support.axes import STREAM_CORE_CASES
+
 import mindie_sim.api as sdk_api
 import mindie_sim.prediction.body_defaults as body_defaults_mod
 from mindie_sim.prediction.cost import CostModel
@@ -102,11 +104,7 @@ def test_graph_level_dbo_removed_destructively():
 
 @pytest.mark.parametrize(
     "sku,aic_total,aiv_total,main_aic,main_aiv,csa_aiv",
-    (
-        ("Ascend910B2", 24, 48, 16, 32, 16),
-        ("Ascend910_9382", 24, 48, 16, 32, 16),
-        ("Ascend950DT_9581", 32, 64, 24, 48, 16),
-    ),
+    STREAM_CORE_CASES,
 )
 def test_three_stream_core_control_binding_and_transitive_events(
     sku, aic_total, aiv_total, main_aic, main_aiv, csa_aiv

@@ -52,7 +52,7 @@ from tools.deployment_generalization import compare_sweep, plan_scheme, scaled_c
 pytestmark = pytest.mark.tier0
 
 ROOT = Path(__file__).resolve().parents[2]
-DUAL_DIE_SKU = "Ascend910_9362"
+from _support.axes import DUAL_DIE_SKU
 DEPLOYMENT_SKUS = (DUAL_DIE_SKU, SPARSE_OFFLOAD_SKU)
 DRAM_SERVICE_SCALE = 1 / .8316
 BF16 = {"weight_format": "bf16", "activation_format": "bf16"}

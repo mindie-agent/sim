@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from _support import axes
 from mindie_sim import Case
 from mindie_sim.catalog.draft_geometry import native_draft_layer_plans
 from mindie_sim.catalog.types import AuxiliarySpec, DraftSpec
@@ -22,7 +23,7 @@ from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.operators import IterationWork, OpSpec
 
 #: Packaged sparse-KV-offload capable SKU (HiSparse / MemFabric D2H path).
-SPARSE_OFFLOAD_SKU = "Ascend950DT_9582"
+SPARSE_OFFLOAD_SKU = axes.GEN5_DT_SKU
 
 
 def case(*, dp=1, tp=1, pp=1, ep=1, prompt=4, output=3, requests=None) -> dict:

@@ -23,7 +23,7 @@ from _support.linear_cases import (
 from mindie_sim import graph_costs
 from mindie_sim.catalog.speculative_state import MODE_CHECKPOINT, MODE_REPLAY, MODE_SINGLE, speculative_state_plan
 from mindie_sim.prediction.operators.linear_attention.call_gdn import make_call
-from mindie_sim.prediction.engine import Engine, Resource
+from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.frontend import Frontend
 from mindie_sim.prediction.operators.linear_attention._gdn_decode_programs import CONV, GATING, gating_plan
 from mindie_sim.prediction.operators.linear_attention.gdn_recurrent import (

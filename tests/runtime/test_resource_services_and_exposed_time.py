@@ -34,7 +34,7 @@ from mindie_sim.compose import compose_case
 from mindie_sim.observations.service_fitting import fit_service_curve
 from mindie_sim.prediction.operators.attention.batch_prefix_attention import apply_attention_prefix_reads
 from mindie_sim.prediction.cost import CostModel
-from mindie_sim.prediction.engine import Engine, Resource
+from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction import (
     exposed_breakdown as eb, exposed_program as exposed, memory_traffic as traffic,
     resource_attribution as attribution, roofline_graph as roof)

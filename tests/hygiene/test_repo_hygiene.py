@@ -1,6 +1,6 @@
 """Repository hygiene: orthogonality gate, CI scope, temp ownership, host portability.
 
-[Role] Prove that ``scripts/check_test_orthogonality.py`` (TO001..TO013) flags
+[Role] Prove that ``scripts/check_test_orthogonality.py`` (TO001..TO014) flags
   each banned pattern and accepts a clean tree, that ``tests/TAXONOMY.toml``
   itself only names product-orthogonal modules, that ``.github/scripts/
   ci_scope.py`` fails closed for non-documentation changes, that test temp
@@ -50,16 +50,17 @@ MANIFEST = """schema_version = 1
 domains = ["schema", "runtime"]
 support_dirs = ["_support", "_oracles", "fixtures"]
 max_lines = 600
-max_modules = 4
 
 [[module]]
 path = "schema/test_profiles.py"
 tier = "tier0"
+owns = ["mindie_sim/schema/hardware.py"]
 
 [[module]]
 path = "runtime/test_engine_core.py"
 tier = "tier0"
 reserved = true
+owns = ["mindie_sim/prediction/engine.py"]
 """
 CLEAN = '"""Clean module."""\nimport pytest\n\npytestmark = pytest.mark.tier0\n\n\ndef test_law():\n    assert 1 + 1 == 2\n'
 
@@ -72,7 +73,8 @@ def _git(repo: Path, *args: str) -> str:
 
 
 def _tree(root: Path, files: dict[str, str]) -> Path:
-    for rel, text in {"tests/TAXONOMY.toml": MANIFEST, "scripts/.keep": "", **files}.items():
+    defaults = {"tests/TAXONOMY.toml": MANIFEST, "scripts/.keep": "", "mindie_sim/schema/hardware.py": "# stub\n"}
+    for rel, text in {**defaults, **files}.items():
         path = root / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8")
@@ -97,6 +99,8 @@ VIOLATIONS = [
     pytest.param({"tests/schema/test_unlisted.py": CLEAN}, "TO003", id="unlisted"),
     pytest.param({}, "TO003", id="listed-missing"),
     pytest.param({"tests/schema/test_profiles.py": CLEAN + "\n" * 600}, "TO004", id="oversize"),
+    pytest.param({"tests/schema/test_profiles.py": CLEAN, "tests/_oracles/meta.py": "VALUE = 1\n" * 601},
+                 "TO004", id="oversize-oracle"),
     pytest.param({"tests/schema/test_profiles.py": CLEAN.replace("pytestmark = pytest.mark.tier0\n", "")},
                  "TO005", id="no-tier"),
     pytest.param({"tests/schema/test_profiles.py": "import subprocess\n" + CLEAN}, "TO005", id="tier0-subprocess"),
@@ -173,28 +177,96 @@ def test_gate_ratchet_lets_legacy_root_tests_shrink_or_swap_imports_but_never_gr
 
 
 def test_gate_ratchet_catches_deleted_manifest_module_and_bad_manifests_exit_2(tmp_path):
-    root = _tree(tmp_path, {"tests/schema/test_profiles.py": CLEAN})
+    root = _tree(tmp_path, {"tests/schema/test_profiles.py": CLEAN, "tests/schema/test_unlisted.py": CLEAN})
     _git(root, "init", "-q")
     _git(root, "add", ".")
     _git(root, "-c", "user.email=ci@example.com", "-c", "user.name=CI", "commit", "-qm", "base")
     base = _git(root, "rev-parse", "HEAD")
+    assert "TO003" in _codes(root, base=base)
+    (root / "tests/schema/test_unlisted.py").unlink()
+    assert _codes(root, base=base) == set()
     (root / "tests/schema/test_profiles.py").unlink()
     assert "TO003" in _codes(root, base=base)
-    for bad in ("schema_version = 2\n", MANIFEST.replace("max_modules = 4", f"max_modules = {gate.MODULE_CEILING + 1}"),
+    for bad in ("schema_version = 2\n",
+                MANIFEST.replace('owns = ["mindie_sim/schema/hardware.py"]\n', ""),
+                MANIFEST.replace('owns = ["mindie_sim/schema/hardware.py"]', "owns = []"),
+                MANIFEST.replace('owns = ["mindie_sim/schema/hardware.py"]', 'owns = ["/"]'),
+                MANIFEST.replace('owns = ["mindie_sim/schema/hardware.py"]', 'owns = ["../escape.py"]'),
+                MANIFEST.replace('owns = ["mindie_sim/schema/hardware.py"]', 'owns = ["mindie_sim/absent.py"]'),
+                MANIFEST.replace("max_lines = 600", "max_lines = 601"),
+                MANIFEST.replace('tier = "tier0"\nowns', 'tier = "tier0"\nmax_lines = 601\nowns'),
                 MANIFEST.replace("max_lines = 600", 'max_lines = "bad"')):
         (root / "tests/TAXONOMY.toml").write_text(bad, encoding="utf-8")
         assert gate.main(["--root", str(root), "--strict"]) == 2
 
 
-def test_manifest_names_only_orthogonal_modules_within_the_ceiling():
+def test_manifest_names_only_orthogonal_modules_with_business_ownership():
     manifest = gate.load_manifest(REPO_ROOT / "tests")
     data = tomllib.loads((REPO_ROOT / "tests" / "TAXONOMY.toml").read_text(encoding="utf-8"))
-    assert len(manifest["modules"]) == len(data["module"]) <= manifest["max_modules"]
+    assert "max_modules" not in data and not hasattr(gate, "MODULE_CEILING")
+    assert len(manifest["modules"]) == len(data["module"])
     for rel, entry in manifest["modules"].items():
         domain, _, name = rel.partition("/")
         assert domain in manifest["domains"] and name.startswith("test_") and "/" not in name, rel
         assert gate.name_tokens(Path(name).stem) == [], rel
-        assert int(entry.get("max_lines", manifest["max_lines"])) < gate.HARD_MAX_LINES, rel
+        assert int(entry.get("max_lines", manifest["max_lines"])) <= gate.MAX_LINES, rel
+        assert entry["owns"] and all(isinstance(p, str) and p.strip() for p in entry["owns"]), rel
+        if not entry.get("reserved"):
+            assert all((REPO_ROOT / p).exists() for p in entry["owns"]), (rel, entry["owns"])
+
+
+def test_to012_catches_module_local_sku_constants_in_parametrize(tmp_path):
+    for decl in ('LOCAL_SKUS = ("Ascend910B2", "Ascend950DT_9581")',
+                 'LOCAL_SKUS: tuple = ("Ascend910B2", "Ascend950DT_9581")'):
+        sneaky = (
+            '"""Sneaky SKU constant."""\nimport pytest\n\npytestmark = pytest.mark.tier0\n'
+            f'{decl}\n\n@pytest.mark.parametrize("sku", LOCAL_SKUS)\ndef test_law(sku):\n    assert sku\n'
+        )
+        root = _tree(tmp_path / ("ann" if ":" in decl else "assign"), {"tests/schema/test_profiles.py": sneaky})
+        g = gate.Gate(root, gate.load_manifest(root / "tests"))
+        g.run(None, True)
+        assert any(f.code == "TO012" and f.severity == "warn" for f in g.findings)
+
+
+def test_to014_catches_discarded_local_result_in_test_function(tmp_path):
+    discarded = (
+        '"""Discarded result."""\nimport pytest\n\npytestmark = pytest.mark.tier0\n\n'
+        'def test_law():\n    result = 1 + 1\n    assert True\n'
+    )
+    root = _tree(tmp_path, {"tests/schema/test_profiles.py": discarded})
+    assert "TO014" in _codes(root)
+
+
+def test_to008_inspects_param_marks_citations_raises_and_legacy_root_without_bypass(tmp_path):
+    bad_cases = (
+        '@pytest.mark.parametrize("x", [pytest.param(1, marks=pytest.mark.xfail(strict=False, reason="https://x"))])\n'
+        'def test_law(x):\n    assert x\n',
+        'class _Err(AssertionError):\n    pass\n\n'
+        'MARK = pytest.mark.xfail(strict=True, raises=_Err, reason="mindie_sim/schema/hardware.py:1")\n'
+        '@pytest.mark.parametrize("x", [pytest.param("unapproved_id", marks=MARK)])\n'
+        'def test_law(x):\n    assert x\n',
+        'class _Err(AssertionError):\n    pass\n\n'
+        'MARK = pytest.mark.xfail(strict=True, raises=_Err, reason="data.json:1")\n'
+        'def test_law():\n    assert MARK\n',
+        'MARK = pytest.mark.xfail(strict=True, raises=RuntimeError, reason="mindie_sim/schema/hardware.py:1")\n'
+        'def test_law():\n    assert MARK\n',
+    )
+    for idx, body in enumerate(bad_cases):
+        root = _tree(tmp_path / f"c{idx}", {"tests/schema/test_profiles.py": _body(body), "data.json": "{\n}\n"})
+        assert "TO008" in _codes(root), idx
+    legacy_root = _tree(tmp_path / "legacy", {
+        "tests/schema/test_profiles.py": CLEAN,
+        "tests/test_legacy.py": "# 1\n# 2\n# 3\n# 4\nimport pytest\n\ndef test_old():\n    assert 1\n",
+    })
+    _git(legacy_root, "init", "-q")
+    _git(legacy_root, "add", ".")
+    _git(legacy_root, "-c", "user.email=ci@example.com", "-c", "user.name=CI", "commit", "-qm", "base")
+    base = _git(legacy_root, "rev-parse", "HEAD")
+    (legacy_root / "tests/test_legacy.py").write_text(
+        "import pytest\nM = pytest.mark.xfail(strict=False, reason='https://x')\n\ndef test_old():\n    assert M\n",
+        encoding="utf-8",
+    )
+    assert "TO008" in _codes(legacy_root, base=base)
 
 
 def _commit_repo(root: Path, files: dict[str, str], message: str) -> str:

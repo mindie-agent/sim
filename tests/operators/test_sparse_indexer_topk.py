@@ -7,27 +7,46 @@
 """
 from collections import Counter
 from dataclasses import replace
+from itertools import product
+from types import SimpleNamespace
 
 import pytest
 
+from _support import operator_calibration_helpers as source_cases
 from _support.axes import REPRESENTATIVE_SKUS
 from _support.hardware import run, sku_case
+from _support.operator_cases import mqsmla_case
+from mindie_sim import compose_case, target_graphs
+from mindie_sim.catalog.cache import index_row_bytes
+from mindie_sim.model_catalog import load_model
+from mindie_sim.prediction.operators.sparse_indexer import family_quant_indexer as quant_indexer
+from mindie_sim.prediction.operators.sparse_indexer import sparse_indexer_pipeline
 from mindie_sim.prediction.cost import CostModel
 from mindie_sim.prediction.execution import Execution
+from mindie_sim.prediction.operators.mla.generic_latent_attention import (
+    index_key_window, semantic_index_selection, unique_index_key_rows,
+)
+from mindie_sim.prediction.operators.sparse_indexer.index_pool import _visited_pool_rows
+from mindie_sim.prediction.lowering import Builder
 from mindie_sim.prediction.mechanism import Geometry
 from mindie_sim.prediction.operators import sparse_indexer
 from mindie_sim.prediction.program import RecipeBook, RecipeContext
+from mindie_sim.prediction.structure import parse_case
 from mindie_sim.prediction.verification import verify_operator
 from mindie_sim.public.errors import UnmodeledCapabilityError
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.compute_arch import NativeComputeMode
 from mindie_sim.schema.operators import IterationWork
-from mindie_sim.schema.workload import IterationPlan
+from mindie_sim.schema.parallel import ParallelSpec
+from mindie_sim.schema.workload import IterationPlan, RequestView
 
 pytestmark = pytest.mark.tier0
 
 MEMBASE = REPRESENTATIVE_SKUS["a3"]
 REGBASE = REPRESENTATIVE_SKUS["a5"]
+POOL_CONTEXT = 32768
+POOL_SIZE = 4
+POOL_ROW_BYTES = 256
 
 
 def _context(op, geometry):
@@ -221,7 +240,7 @@ def test_score_workspace_and_vector_work_match_independent_per_head_oracle(queri
     _verified(op, REGBASE)
 
 
-def test_region_mask_and_final_index_order_preserve_selection_extent():
+def test_region_mask_and_retained_index_order_preserve_selection_extent():
     op = sparse_indexer.make_step5_region_score_op(op_id="regions", query_tokens=1, context_tokens=65,
                                                    region_block_size=8, topk_regions=16)
     plan, program = _program(op, REGBASE)
@@ -309,7 +328,7 @@ def test_shared_prefix_reuse_only_changes_where_keys_are_serviced():
     _verified(shared, REGBASE)
 
 
-def test_long_s2_owner_lists_scale_with_queries_and_owner_splits():
+def test_long_score_owner_lists_scale_with_queries_and_owner_splits():
     short, many, wide = (_membase(rows, query_tokens=q, s2_splits=splits)[1].work
                          for q, rows, splits in ((2, 32768, 2), (8, 32768, 2), (8, 65536, 4)))
     pair_list = 2048 * 8 + 128
@@ -415,3 +434,148 @@ def test_plan_requires_declared_hardware_routes():
     datapath = replace(geometry.datapath, usable_paths=())
     with pytest.raises(UnmodeledCapabilityError, match="datapath_route_unsupported"):
         sparse_indexer.build(_make(513), replace(geometry, datapath=datapath))
+
+
+@pytest.mark.parametrize("context,ratio,completed,flops", [(1023, 1, 1024, 8388608), (5, 4, 1, 8192)])
+def test_quant_indexer_completed_causal_keys_determine_flops(context, ratio, completed, flops):
+    view = SimpleNamespace(context=context, q_len=1)
+    assert quant_indexer._view_completed_keys(view, ratio) == completed
+    assert quant_indexer._candidate_keys((view,), ratio)[0] == completed
+    ledger = {
+        "query_rows": 1, "wave_rows": 32, "waves": 1, "blocks": 1,
+        "heads": 32, "width": 128, "keys": 1024, "completed_keys": completed,
+        "payload_keys": completed, "key_row_bytes": 256, "output_bytes": 0.0,
+    }
+    work = sparse_indexer_pipeline.arch35_indexer_work(ledger)
+    assert work.matrix["fp8_e4m3"] == 2 * completed * 32 * 128 == flops
+
+
+def test_quant_indexer_empty_selection_still_stores_indices():
+    op = source_cases._arch35_op_for(4, (RequestView("r", 1, 0, False, "decode"),))
+    ledger = dict(op.metadata)[quant_indexer.QUANT_LEDGER]
+    assert ledger["completed_keys"] == ledger["blocks"] == ledger["keys"] == 0
+    assert ledger["row_completed_keys"] == ((1, 0),)
+    assert op.flops == 0
+    assert op.mte3_bytes == 8192
+    plan = quant_indexer.Arch35QuantIndexerRecipe().build(op, None)
+    program = source_cases._conserved(plan, op, source_cases.DT)
+    names = [stage.name for stage in source_cases._stages(program)]
+    assert "blocks" not in names
+    assert "indices" in names
+
+
+@pytest.mark.parametrize("views,ratio,heads,expected,flops", [
+    pytest.param((RequestView("p", 2, 0, False, "prefill", query_ranges=((0, 1), (3, 4)),
+                              global_q_len=4),), 4, 64, ((1, 0), (1, 1)), 16384, id="query-ranges"),
+    pytest.param((RequestView("a", 1, 1, False, "decode"), RequestView("b", 1, 3, False, "decode")),
+                 1, 32, ((1, 2), (1, 4)), 49152, id="unequal-contexts"),
+])
+def test_quant_indexer_preserves_causal_keys_per_query(views, ratio, heads, expected, flops):
+    op = source_cases._arch35_op_for(ratio, views, heads=heads)
+    ledger = dict(op.metadata)[quant_indexer.QUANT_LEDGER]
+    assert ledger["row_completed_keys"] == expected
+    assert ledger["completed_keys"] == max(keys for _, keys in expected)
+    completed = sum(rows * keys for rows, keys in expected)
+    assert op.flops == 2 * completed * heads * 128 == flops
+
+
+@pytest.mark.parametrize("compression,cp,query,noncausal", tuple(product(
+    (1, 2, 4, 128), (1, 8), (1, 6, 128, 129), (False, True),
+)))
+def test_compressed_cp_index_reads_are_per_query_tile(compression, cp, query, noncausal):
+    owned = []
+    for end in (*range(128, query, 128), query):
+        horizon = 4096 + (query if noncausal else end)
+        counts = [0] * cp
+        for row in range(horizon // compression):
+            counts[(row // max(1, 128 // compression)) % cp] += 1
+        owned.append(max(counts))
+    assert index_key_window(((query, 4096),), cp=cp, compression=compression,
+                            noncausal=noncausal, kv_len=4096 + query) == (max(owned), sum(owned))
+
+
+def _shared_prefix_views():
+    return tuple(RequestView(str(i), 6, 256, True, "decode",
+                             prefix_tokens=128, prefix_cache_key="shared") for i in range(2))
+
+
+@pytest.mark.parametrize("options,same_key,unique", [({}, True, 98),
+                                                      ({"share_prefix": False}, True, 130),
+                                                      ({}, False, 130)])
+def test_compressed_key_union_respects_sharing_and_cache_identity(options, same_key, unique):
+    views = _shared_prefix_views()
+    if not same_key:
+        views = (views[0], replace(views[1], prefix_cache_key="other"))
+    assert unique_index_key_rows(views, compression=4, **options) == (unique, 130)
+
+
+@pytest.mark.parametrize("mode,key_rows", [("batch_shared", 98), ("per_sequence", 130)])
+def test_generic_indexer_precharge_deduplicates_only_external_keys(mode, key_rows):
+    model = load_model("deepseek-v4-pro-0813")
+    plan = next(p for p in model.layer_plans if p.indexer)
+    views = _shared_prefix_views()
+    parallel = ParallelSpec()
+    row = index_row_bytes(model, plan.index_dim)
+    score_rows = 2 * sum((256 + i) // 4 for i in range(1, 7))
+    runtime = replace(mqsmla_case().runtime, parallel=parallel, kernels={},
+                      prefix_cache_mode="shared", prefix_read_mode=mode, kv_block_size=128)
+    builder = Builder("s0.l1", plan, 0, views, model, "decode")
+    semantic_index_selection(
+        builder, deps=("input",), views=views, plan=plan, model=model, quant=model.quant,
+        parallel=parallel, shard=1, prefix="s0.l1", padded_tokens=12, runtime=runtime)
+    scores = next(op for op in builder.ops if op.family == "indexer")
+    assert scores.flops == 2 * score_rows * plan.index_heads * plan.index_dim
+    assert scores.mte2_bytes == 130 * row
+    assert scores.hbm_bytes == key_rows * row + scores.mte3_bytes
+    assert not any(op.recipe in {"index_scores", "index_topk"} for op in builder.ops)
+    assert scores.mte3_bytes == 12 * plan.index_topk * 4
+
+
+def _pool_view(index, key, ranges=()):
+    return SimpleNamespace(
+        q_len=2, context=8192, kv_len=8192, prefix_tokens=4096,
+        prefix_cache_key=key, request_id=f"req-{index}", query_ranges=ranges)
+
+
+@pytest.mark.parametrize("mode,second_key,expected", [("private", "b", 4096),
+                                                      ("shared", "b", 4096), ("shared", "a", 3072)])
+def test_visited_pool_rows_counts_private_suffixes_and_prefix_union(mode, second_key, expected):
+    plan = SimpleNamespace(index_kpool=4, noncausal_attention=False)
+    runtime = SimpleNamespace(prefix_cache_mode=mode, prefix_read_mode="auto")
+    assert _visited_pool_rows([_pool_view(0, "a"), _pool_view(1, second_key)],
+                              plan, runtime=runtime) == expected
+
+
+def test_visited_pool_rows_honors_pcp_query_ranges_and_noncausal_extent():
+    causal = SimpleNamespace(index_kpool=4, noncausal_attention=False)
+    noncausal = SimpleNamespace(index_kpool=4, noncausal_attention=True)
+    shared = SimpleNamespace(prefix_cache_mode="shared", prefix_read_mode="auto")
+    lates = _pool_view(0, "a", ((4000, 4100),))
+    base = _pool_view(0, "a")
+    assert _visited_pool_rows([lates], causal, runtime=shared) > _visited_pool_rows(
+        [base], causal, runtime=shared)
+    exposed = SimpleNamespace(q_len=2, context=8192, kv_len=16384, prefix_tokens=0,
+                              prefix_cache_key="", request_id="r", query_ranges=())
+    assert _visited_pool_rows([exposed], noncausal, runtime=shared) == 4096
+
+
+def test_native_pool_indexer_charges_cold_scan_and_fused_score_work():
+    case = parse_case(compose_case(
+        "glm-5.3-flash", hardware="a5", tp=8, ep=8, num_devices=8,
+        ranks_per_node=8, prompt_tokens=POOL_CONTEXT, output_tokens=2, concurrency=1))
+    ops = target_graphs(case, phase="decode", tokens=1, context=POOL_CONTEXT,
+                       sequences=1, scope="body")[0]
+    scores = next(op for op in ops if op.recipe == "cann_pool_key_indexer")
+    metadata = dict(scores.metadata)
+    assert metadata["scanned_pools"] == POOL_CONTEXT // POOL_SIZE
+    assert metadata["pool_row_bytes"] == POOL_ROW_BYTES
+    scanned = metadata["safe_reference_scanned_pools"]
+    pool_read = scanned * POOL_ROW_BYTES
+    assert scores.mte2_bytes >= pool_read
+    assert scores.hbm_bytes - scores.mte3_bytes >= pool_read
+    plan = next(p for p in case.model.layer_plans if p.index_topk)
+    assert scores.flops == pytest.approx(2 * scanned * plan.index_heads * plan.index_dim)
+    assert scores.vector_ops > 0.0
+    assert not any(op.recipe in {"index_pool_scores", "index_pool_topk"} for op in ops)
+    topk = next(op for op in ops if op.recipe == "index_topk")
+    assert topk.mte2_bytes > 0.0

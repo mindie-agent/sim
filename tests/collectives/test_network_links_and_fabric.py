@@ -52,6 +52,7 @@ from mindie_sim.sweep_resize import (
     _first_link_by_channel, materialize_machine_for_devices, project_transfer_channel_input,
 )
 
+from _support.axes import GEN2_SKU, GEN3_SKU, GEN5_DT_SKU, GEN5_DT_SMALL_SKU, GEN5_PR_SKU
 from _support.collective_cases import case as declared_case
 from _support.collective_cases import declared, exchange
 from _support.collective_cases import topology as build_topology
@@ -60,11 +61,6 @@ pytestmark = pytest.mark.tier0
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-GEN2_SKU = "Ascend910B4"
-GEN3_SKU = "Ascend910_9392"
-GEN5_PR_SKU = "Ascend950PR_9579"
-GEN5_DT_SKU = "Ascend950DT_9582"
-GEN5_DT_SMALL_SKU = "Ascend950DT_9581"
 TINY_MODEL = "qwen3.5-35b-a3b"
 GENERIC_MODEL = "deepseek-v3"
 

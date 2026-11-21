@@ -25,7 +25,7 @@ from mindie_sim import graph_costs, operator_costs, predict, target_graphs
 from mindie_sim.prediction.body import body_forward
 from mindie_sim.prediction.collectives import PairwiseCollective
 from mindie_sim.prediction.cost import primitive_key
-from mindie_sim.prediction.engine import Engine, Resource
+from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.execution import Execution, launch_native_cohort
 from mindie_sim.prediction.operators.mc2.mc2_program import Mc2LaunchView
 from mindie_sim.prediction.participant_profile import normalise, select_call

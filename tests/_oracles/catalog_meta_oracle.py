@@ -32,7 +32,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 from .cache_meta_oracle import (
     REFERENCE_PINS, RefLayer, _i,

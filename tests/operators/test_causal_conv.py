@@ -6,25 +6,39 @@
 [Side-Effect Policy] Read-only fixture inputs and in-memory simulation.
 """
 from copy import deepcopy
+from dataclasses import replace
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from _support.axes import REPRESENTATIVE_SKUS, SKUS
+from _support.builders import dense_case, dense_layer, dense_model, linear_model
 from _support.hardware import sku_case
 from _support.linear_cases import (
     CONV, case, conv_graph as graph, execute_one, gdn_decode_source_case as source_case,
     kda_hardware_case, sku_planning_context,
 )
-from mindie_sim import operator_costs, target_graphs
+from mindie_sim import compose_case, operator_costs, target_graphs
+from mindie_sim.catalog.cache_ownership import draft_cache_components
+from mindie_sim.catalog.draft_geometry import native_draft_layer_plans
+from mindie_sim.catalog.types import AuxiliarySpec, DraftSpec
 from mindie_sim.catalog.weights import stage_weight_bytes, stage_weight_terms
+from mindie_sim.feature_mechanisms import _apply_recover_ssm
+from mindie_sim.prediction.operators.attention.attention import AttentionPolicy
+from mindie_sim.prediction.capacity import Memory
 from mindie_sim.prediction.frontend import Frontend
+from mindie_sim.prediction.implementation_selection import resolve
 from mindie_sim.prediction.operators.linear_attention import build, register_family, resolve_operator_plan
+from mindie_sim.prediction.operators.recurrent.recurrent import linear
 from mindie_sim.prediction.structure import parse_case
+from mindie_sim.prediction.transforms import lower_implementations
 from mindie_sim.prediction.verification import verify_operator
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.dspark import DsparkSpec
 from mindie_sim.schema.operators import OpSpec
+from mindie_sim.schema.workload import RequestView
 from mindie_sim.structure import export_structure
 from mindie_sim.structure_contracts import short_conv_active_contract
 
@@ -32,6 +46,7 @@ pytestmark = pytest.mark.tier0
 
 ROOT = Path(__file__).resolve().parents[2]
 COPY_RECIPE = "triton_noncontiguous_conv_state_copy"
+DRAFT_PAGE_ROWS = 128
 
 
 @pytest.mark.parametrize("batch", (1, 4))
@@ -264,3 +279,107 @@ def test_strided_state_copies_bracket_the_original_convolution():
         assert op.local_shape == (16, 6, 3072) and meta["state_strides"] == (1, 6)
         conv = convs[op.layer]
         assert (op.op_id in conv.deps if meta["direction"] == "gather" else op.deps == (conv.op_id,))
+
+
+
+def test_capacity_query_width_and_windowed_mtp_draft_geometry():
+    base = dense_case(layers=1)
+    kda = replace(
+        base, model=linear_model("kda", layers=1),
+        runtime=replace(base.runtime,
+                        dspark=DsparkSpec(6, (1.0,) * 6), metadata=()))
+    memory = Memory(kda)
+    assert memory.query_tokens == 6
+    assert memory.cache_bytes(128, query_tokens=6) > memory.cache_bytes(128)
+
+    mtp = DraftSpec(
+        kind="mtp", layers=1, hidden_size=32, intermediate_size=64,
+        num_heads=4, num_kv_heads=2, head_dim=16, q_width=64, kv_width=32,
+        attention_kind="gqa", target_layer_ids=(0,))
+    plans = (replace(dense_layer(0), window=64),)
+    target = replace(dense_model(layers=1), layer_plans=plans)
+    mtp = replace(mtp, layer_plans=native_draft_layer_plans(target, mtp))
+    model = replace(target, auxiliary=AuxiliarySpec(mtp=mtp))
+    drafted = replace(
+        base, model=model, runtime=replace(
+            base.runtime,
+            metadata=(("draft_mode", "mtp"), ("draft_proposal_tokens", 2))))
+    plain = replace(
+        base, model=replace(model, auxiliary=None),
+        runtime=replace(base.runtime, metadata=()))
+    expected = draft_cache_components(
+        model, drafted.runtime.parallel, draft_kind="mtp",
+        sequence_tokens=512, capacity_padded=True, runtime=drafted.runtime,
+        query_tokens=Memory(drafted).query_tokens)["draft_kv"]
+    delta = (Memory(drafted).cache_bytes(512)[-1]
+             - Memory(plain).cache_bytes(512)[-1])
+    assert delta == pytest.approx(expected)
+    assert delta == DRAFT_PAGE_ROWS * (2 * 2 * 16) * 2
+
+
+def _kda_norm_case():
+    raw = compose_case(
+        "glm-5.3-flash", hardware="a5", tp=1, dp=1, ep=1, num_devices=1,
+        layers=4, prompt_tokens=64, output_tokens=2, max_num_seqs=2)
+    raw["runtime"]["lowering_passes"] = ["kda_in_kernel_l2norm"]
+    return parse_case(raw)
+
+
+def test_multi_request_chunk_kda_folds_in_kernel_qk_l2norm():
+    case = _kda_norm_case()
+    ops = target_graphs(case, phase="prefill", tokens=64, context=0,
+                              sequences=2, scope="body")[0]
+    assert not [op for op in ops if op.recipe == "qk_l2norm"]
+    assert [op for op in ops if dict(op.metadata).get("in_kernel_qk_l2norm")]
+
+
+def test_mixed_prefill_decode_kda_eliminates_standalone_qk_l2norm():
+    case = _kda_norm_case()
+    plan = next(lp for lp in case.model.layer_plans if lp.attention == "kda")
+    views = (RequestView("p", 64, 0, True, "prefill"),
+             RequestView("d", 1, 128, True, "decode"))
+    resolved_rt, _ = resolve(case.runtime, views, padded_tokens=65, replay_scope="none")
+    res = linear(
+        prefix="s0.l0", plan=plan, views=views, stage=0, deps="in",
+        model=case.model, parallel=resolved_rt.parallel,
+        quant=case.model.quant, mode="prefill",
+        policy=AttentionPolicy(recurrent_chunk=64), runtime=resolved_rt,
+        padded_tokens=65)
+    lowered = lower_implementations(res.ops, resolved_rt, case.model.activation_dtype)
+    assert not [op for op in lowered if op.recipe == "qk_l2norm"]
+    folded = [op for op in lowered if dict(op.metadata).get("in_kernel_qk_l2norm")]
+    assert len(folded) == 2
+
+
+def test_recover_ssm_keeps_native_kda_and_accounts_replay_separately():
+    config = json.loads((ROOT / "mindie_sim/model_configs/kimi-k3.json").read_text(encoding="utf-8"))
+    text = config["text_config"]
+    text["model_type"] = "kimi_k31"
+    text["dsa_config"] = {
+        "dsa_layers": text["linear_attn_config"]["full_attn_layers"],
+        "index_num_heads": 32, "index_head_dim": 128,
+        "index_topk": 2048, "index_rope_dim": 0,
+    }
+    text.update(dspark_attention_kind="mla", dspark_block_size=5)
+    c = parse_case(compose_case(
+        config, hardware="a5", tp=8, dp=4, ep=32, dcp=8, num_devices=32,
+        block_size=1536, max_model_len=140000, graph_capture_mode="none",
+        quant={"name": "k31_fp8_cache", "weight_format": "bf16", "activation_format": "bf16",
+               "expert_weight_format": "bf16", "kv_dtype": "fp8_e4m3",
+               "index_dtype": "fp8_e4m3", "index_scale_dtype": "fp16"},
+        mtp_proposal_tokens=3, mtp_acceptance_length=2,
+        prompt_tokens=131072, output_tokens=1024))
+    rt = {"metadata": {"draft_proposal_tokens": 3}}
+    _apply_recover_ssm(rt, SimpleNamespace(caller_explicit=set(), model=c.model))
+    assert rt["recover_ssm"]
+    recovered = replace(c, runtime=replace(c.runtime, recover_ssm=True))
+    before, after = Memory(c), Memory(recovered)
+    records = 69 * 12 * (128 * 4 + 2 * 128 * 2) * 4
+    page = before.pages.groups[0].bytes_per_group_page
+    assert before.cache_bytes(131584)[0] - after.cache_bytes(131584)[0] == 3 * 3 * page - records
+    assert all("replay_records" not in names for names in after.pages.covered.values())
+    ops = target_graphs(recovered, phase="decode", tokens=4, context=4096,
+                        scope="body", resource_fusion=False)[0]
+    native = [op for op in ops if op.recipe == "vllm_ascend_recurrent_kda_arch35"]
+    assert len(native) == 69
+    assert all(dict(op.metadata)["recover_ssm"] for op in native)

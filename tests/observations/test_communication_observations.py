@@ -31,7 +31,7 @@ from mindie_sim.observations.communication import (
     binding as comm_bind, ingest as comm_ing, recipes as comm_rec, streaming as comm_str)
 from mindie_sim.observations.resource_services import (
     RESOURCE_SERVICE_PROFILE_SCHEMA, RESOURCE_SERVICE_SCHEMA, normalize_resource_service)
-from mindie_sim.prediction.engine import Engine, Resource
+from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.operator_analysis import operator_costs
 from mindie_sim.prediction.program import RecipeBook, RecipeContext
 from mindie_sim.prediction.services import ResourceService, service_identity

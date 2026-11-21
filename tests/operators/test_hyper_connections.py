@@ -18,7 +18,7 @@ import pytest
 from _support.accel import close
 from _support.axes import ARCH_IDS, PHASES, REPRESENTATIVE_SKUS, SKUS
 from mindie_sim import graph_costs, operator_costs, target_graphs, target_operators
-from mindie_sim.prediction.engine import Engine, Resource
+from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.frontend import Frontend
 from mindie_sim.prediction.mechanism import Geometry
 from mindie_sim.prediction.operators.hyper_connections.native_fusion import _groups, lower_native_fusions
