@@ -21,10 +21,18 @@ from __future__ import annotations
 from .cliff_planner import (
     STANDARD_LEVEL_BOUNDARY_KINDS,
     WhiteboxSpineRunner,
+    evaluate_abi_rejections,
     score_sealed_gate_cases,
     synthesize_operator_cliff_plan,
     synthesize_sku_512_400k_plan,
     validate_disjoint_lineage,
+)
+from ._lean_and_receipts import (
+    check_lean_non_inversion,
+    seal_onboarding_receipt,
+    sign_stage_report,
+    validate_strict_threshold_pct,
+    verify_stage_report,
 )
 from .contracts import (
     ANCHOR_CONTEXT_GRID,
@@ -59,11 +67,9 @@ from .contracts import (
     TimeoutBudget,
     assert_sanitized_payload,
     build_capture_uri,
-    check_lean_non_inversion,
     compute_receipt_sha256,
     default_topk_abi_rule,
     sanitize_public_alias,
-    seal_onboarding_receipt,
     validate_abi,
     verify_receipt_sha256,
 )
@@ -127,6 +133,7 @@ __all__ = [
     "check_lean_non_inversion",
     "compute_receipt_sha256",
     "default_topk_abi_rule",
+    "evaluate_abi_rejections",
     "generate_operator_cliff_plan",
     "parse_npu_smi_topology",
     "parse_platform_config_ini",
@@ -137,13 +144,16 @@ __all__ = [
     "scaffold_operator",
     "score_sealed_gate_cases",
     "seal_onboarding_receipt",
+    "sign_stage_report",
     "synthesize_operator_cliff_plan",
     "synthesize_sku_512_400k_plan",
     "validate_512_400k",
     "validate_abi",
     "validate_disjoint_lineage",
     "validate_operator_contract",
+    "validate_strict_threshold_pct",
     "verify_idle_die_telemetry",
     "verify_receipt_sha256",
     "verify_sku_gates",
+    "verify_stage_report",
 ]

@@ -4,21 +4,19 @@
   (``mindie_sim/prediction/operators/<family>/``) or template
   (``mindie_sim/templates/<name>.py``) against five concrete gates:
   (a) AST-grounded ``Upstream-ABI:`` declarations;
-  (b) verified ``SourceRef`` / ``TemplateSourceRef`` provenance (including Git
-      blob SHA-256 verification and ``check_template_provenance.py`` when
-      upstream refs are mounted);
-  (c) real Sim owner dispatch via ``builtin_family_registry().match(op)`` or
-      ``builtin_template_catalog()`` plus actual operator resolution and
-      non-degenerate Lean 4 lower-bound verification derived from the resolved
-      operator's own work (zero synthetic dummy vector proofs!);
-  (d) real Profiler owner dispatch via
-      ``mindie_profiler.bench.operators.resolve_builder_strict`` (zero loose
-      dictionary scans; fails closed when Profiler owner is missing or rejects
-      the triple!); and
-  (e) ``tests/TAXONOMY.toml`` registration on disk.
-[Invariants] Strictly read-only over target files; zero synthetic proofs;
-  ``TimeoutError`` always propagates before ``OSError``; fails closed on any
-  missing owner, unimplemented scaffold stub, or provenance mismatch.
+  (b) verified ``SourceRef`` / ``TemplateSourceRef`` provenance resolving
+      module-level string constants (e.g. ``OPS_TRANSFORMER_REVISION``) and
+      verifying Git blob SHA-256 hashes (failing closed if mounted repo is
+      absent or ``require_mounted_refs=True``);
+  (c) real Sim owner dispatch via ``builtin_family_registry().match(op)`` +
+      live resolution + rate-converted nanosecond Lean 4 lower-bound
+      verification (converting physical work through ``Geometry.rates`` and
+      ``compute_peaks``, never bytes-as-nanoseconds, zero soft bypasses);
+  (d) real Profiler owner dispatch via ``resolve_builder_strict`` cross-checked
+      against declared leaf ``Upstream-ABI:`` / Sim implementation; and
+  (e) ``tests/TAXONOMY.toml`` registration on disk + ``TILING_AXES`` check.
+[Invariants] Strictly read-only over target files; signs contract reports with
+  in-process HMAC; ``TimeoutError`` propagates before ``OSError``.
 [Timeouts & Locks] Bounded local ``git cat-file`` and provenance subprocesses;
   zero locks or device contexts.
 [Side-Effect Policy] Zero filesystem writes.
@@ -28,6 +26,7 @@ from __future__ import annotations
 import ast
 from collections.abc import Mapping, Sequence
 import hashlib
+import math
 from pathlib import Path
 import re
 import subprocess
@@ -42,7 +41,7 @@ from mindie_sim.optimization.dual_bound import (
     certify_lower_bound,
     check_optimality_certificate,
 )
-from mindie_sim.prediction.mechanism import Geometry
+from mindie_sim.prediction.mechanism import Geometry, OperatorPlan
 from mindie_sim.prediction.operators.contracts import OperatorPlanningContext
 from mindie_sim.prediction.operators.registry import FamilyRegistry, builtin_family_registry
 from mindie_sim.prediction.results import OpOccurrence
@@ -57,6 +56,7 @@ from ._gate_runners import (
     resolve_repo_root,
     run_template_provenance_gate,
 )
+from ._lean_and_receipts import sign_stage_report
 from .contracts import (
     HEX_COMMIT_LEN,
     assert_sanitized_payload,
@@ -66,6 +66,7 @@ from .contracts import (
 _UPSTREAM_ABI_LINE_RE = re.compile(r"^\s*Upstream-ABI\s*:\s*([A-Za-z_][A-Za-z0-9_:.<>/-]*)\s*$")
 _HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
 _GIT_CAT_TIMEOUT_S = 15
+_NS_PER_SECOND = 1_000_000_000.0
 _REQUIRED_FAMILY_FILES = ("__init__.py", "common.py", "arch22.py", "arch35.py")
 _DEFAULT_PROBE_SKU = "Ascend910B2"
 _DEFAULT_PROBE_SHAPE = (1, 128)
@@ -80,13 +81,36 @@ def _extract_upstream_abi(tree: ast.AST) -> str:
     return ""
 
 
-def _const_str(node: ast.AST | None) -> str | None:
+def _extract_module_str_constants(tree: ast.Module) -> dict[str, str]:
+    constants: dict[str, str] = {}
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Assign):
+            val = _eval_str_expr(stmt.value, constants)
+            if val is not None:
+                for target in stmt.targets:
+                    if isinstance(target, ast.Name):
+                        constants[target.id] = val
+        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name) and stmt.value is not None:
+            val = _eval_str_expr(stmt.value, constants)
+            if val is not None:
+                constants[stmt.target.id] = val
+    return constants
+
+
+def _eval_str_expr(node: ast.AST | None, constants: Mapping[str, str]) -> str | None:
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return node.value
+    if isinstance(node, ast.Name) and node.id in constants:
+        return constants[node.id]
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _eval_str_expr(node.left, constants)
+        right = _eval_str_expr(node.right, constants)
+        if left is not None and right is not None:
+            return left + right
     return None
 
 
-def _extract_source_refs(tree: ast.AST, path: Path) -> list[dict[str, str]]:
+def _extract_source_refs(tree: ast.Module, path: Path, constants: Mapping[str, str]) -> list[dict[str, str]]:
     refs: list[dict[str, str]] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
@@ -95,8 +119,8 @@ def _extract_source_refs(tree: ast.AST, path: Path) -> list[dict[str, str]]:
         fname = func.id if isinstance(func, ast.Name) else (func.attr if isinstance(func, ast.Attribute) else "")
         if fname not in ("SourceRef", "TemplateSourceRef"):
             continue
-        pos = [_const_str(arg) for arg in node.args]
-        kw = {str(k.arg): _const_str(k.value) for k in node.keywords if k.arg}
+        pos = [_eval_str_expr(arg, constants) for arg in node.args]
+        kw = {str(k.arg): _eval_str_expr(k.value, constants) for k in node.keywords if k.arg}
         repo = kw.get("repository") or (pos[0] if len(pos) > 0 else None) or ""
         rev = kw.get("revision") or (pos[1] if len(pos) > 1 else None) or ""
         rel = kw.get("relative_path") or (pos[2] if len(pos) > 2 else None) or ""
@@ -140,38 +164,29 @@ def _extract_top_level_names(tree: ast.Module) -> set[str]:
     return names
 
 
-def _extract_string_constant(tree: ast.Module, name: str) -> str:
-    for stmt in tree.body:
-        if isinstance(stmt, ast.Assign):
-            for target in stmt.targets:
-                if isinstance(target, ast.Name) and target.id == name:
-                    val = _const_str(stmt.value)
-                    if val is not None:
-                        return val
-        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name) and stmt.target.id == name:
-            val = _const_str(stmt.value)
-            if val is not None:
-                return val
-    return ""
-
-
 def _verify_git_blob_sha256(
     ref: Mapping[str, str],
     *,
     refs_root: Path | None,
     repo_map: Mapping[str, Path],
-) -> tuple[bool, str]:
+    require_mounted_refs: bool,
+) -> tuple[bool, bool, str]:
+    """Return ``(ok, blob_actually_verified, status)``."""
     repo = ref["repository"]
     rev = ref["revision"]
     rel = ref["relative_path"]
     expected = ref["source_sha256"].lower()
-    repo_dir = repo_map.get(repo)
+    repo_dir = repo_map.get(repo) or repo_map.get(repo.rsplit("/", 1)[-1])
     if repo_dir is None and refs_root is not None:
-        candidate = refs_root / repo
-        if candidate.exists():
-            repo_dir = candidate
+        for cand_name in (repo, repo.rsplit("/", 1)[-1]):
+            candidate = refs_root / cand_name
+            if candidate.exists():
+                repo_dir = candidate
+                break
     if repo_dir is None:
-        return True, "unverified_repo_not_mounted"
+        if refs_root is not None or repo_map or require_mounted_refs:
+            return False, False, f"source_repo_not_mounted:{repo}"
+        return True, False, "unverified_no_refs_mounted"
     try:
         done = subprocess.run(
             ["git", "-C", str(repo_dir), "cat-file", "-p", f"{rev}:{rel}"],
@@ -185,13 +200,13 @@ def _verify_git_blob_sha256(
     except TimeoutError:
         raise
     except OSError as exc:
-        return False, f"git_cat_file_os_error:{repo}:{exc}"
+        return False, False, f"git_cat_file_os_error:{repo}:{exc}"
     if done.returncode != 0:
-        return False, f"git_blob_missing:{repo}:{rev}:{rel}"
+        return False, False, f"git_blob_missing:{repo}:{rev}:{rel}"
     actual = hashlib.sha256(done.stdout).hexdigest().lower()
     if actual != expected:
-        return False, f"source_sha256_mismatch:{repo}:{rel}:expected={expected[:12]}:actual={actual[:12]}"
-    return True, "verified"
+        return False, False, f"source_sha256_mismatch:{repo}:{rel}:expected={expected[:12]}:actual={actual[:12]}"
+    return True, True, "verified"
 
 
 def _check_taxonomy_registration(
@@ -249,27 +264,77 @@ def _build_default_planning_context(
     return OperatorPlanningContext(occurrence=occurrence, geometry=geom, datapath=dp)
 
 
-def _verify_resolved_operator_dual_bound(resolved: Any) -> tuple[bool, int, str]:
-    """Derive a genuine Lean 4 dual lower bound directly from ``resolved.op`` / ``resolved.recipe``."""
-    work_map: dict[str, float] = {}
-    recipe_work = getattr(getattr(resolved, "recipe", None), "work", None)
+def _resource_rate_per_s(resource_name: str, geom: Geometry) -> float:
+    rates = dict(geom.rates)
+    if resource_name in rates and float(rates[resource_name]) > 0.0:
+        return float(rates[resource_name])
+    aliases = {
+        "hbm_bytes": "hbm",
+        "mte2_bytes": "mte2_aiv",
+        "mte2": "mte2_aiv",
+        "mte3_bytes": "mte3",
+        "vector_ops": "vector",
+    }
+    mapped = aliases.get(resource_name, "")
+    if mapped and mapped in rates and float(rates[mapped]) > 0.0:
+        return float(rates[mapped])
+    return 0.0
+
+
+def _verify_resolved_operator_dual_bound(
+    resolved: Any,
+    ctx: OperatorPlanningContext,
+) -> tuple[bool, int, str]:
+    """Convert resolved physical work via ``ctx.geometry`` rates/peaks to ns and certify Lean bound."""
+    ns_terms: list[int] = []
+    recipe = getattr(resolved, "recipe", None)
+    if isinstance(recipe, OperatorPlan):
+        if not callable(recipe.program):
+            return False, 0, "resolved_operator_plan_missing_callable_program"
+        if recipe.pipeline_spec is None and getattr(resolved, "descriptor", None) is None:
+            return False, 0, "resolved_operator_missing_pipeline_spec_or_descriptor"
+    recipe_work = getattr(recipe, "work", None)
+    arch = ctx.geometry.compute_arch
+    if recipe_work is not None and hasattr(recipe_work, "matrix"):
+        for dtype_key, flops in dict(recipe_work.matrix).items():
+            amt = float(flops)
+            if amt <= 0.0:
+                continue
+            dtype_str = str(dtype_key)
+            if arch is not None and arch.has_native_modes() and not arch.supports_native("matrix", dtype_str):
+                return False, 0, f"resolved_matrix_mode_unsupported:{dtype_str}"
+            try:
+                rate_val = float(dict(ctx.geometry.compute_peaks)[dtype_str])
+                ns_terms.append(max(1, math.ceil(amt / rate_val * _NS_PER_SECOND)))
+            except (KeyError, ZeroDivisionError, ValueError):
+                return False, 0, f"resolved_matrix_peak_missing:{dtype_str}"
     if recipe_work is not None and hasattr(recipe_work, "resources"):
-        work_map = {str(k): float(v) for k, v in dict(recipe_work.resources).items()}
-    if not work_map:
+        for res_name, amt_raw in dict(recipe_work.resources).items():
+            amt = float(amt_raw)
+            if amt <= 0.0:
+                continue
+            rate = _resource_rate_per_s(str(res_name), ctx.geometry)
+            if rate <= 0.0:
+                return False, 0, f"resolved_resource_rate_missing:{res_name}"
+            ns_terms.append(max(1, math.ceil(amt / rate * _NS_PER_SECOND)))
+    if not ns_terms:
         op_obj = getattr(resolved, "op", None)
-        for field_name in ("flops", "hbm_bytes", "mte2_bytes", "mte3_bytes", "vector_ops", "link_bytes"):
-            val = float(getattr(op_obj, field_name, 0.0) or 0.0)
-            if val > 0.0:
-                work_map[field_name] = val
-    positive_terms = [max(1, int(round(float(v)))) for v in work_map.values() if float(v) > 0.0]
-    if not positive_terms:
+        for field_name in ("hbm_bytes", "mte2_bytes", "mte3_bytes", "vector_ops"):
+            amt = float(getattr(op_obj, field_name, 0.0) or 0.0)
+            if amt <= 0.0:
+                continue
+            rate = _resource_rate_per_s(field_name, ctx.geometry)
+            if rate <= 0.0:
+                return False, 0, f"resolved_resource_rate_missing:{field_name}"
+            ns_terms.append(max(1, math.ceil(amt / rate * _NS_PER_SECOND)))
+    if not ns_terms:
         return False, 0, "resolved_operator_emitted_zero_positive_work"
     prog = ResourceChoiceProgram(
-        num_resources=len(positive_terms),
-        global_work=tuple(positive_terms),
+        num_resources=len(ns_terms),
+        global_work=tuple(ns_terms),
         site_modes=(),
     )
-    dag = EventDagSpec(node_quantum_ns=(positive_terms[0],), edges=())
+    dag = EventDagSpec(node_quantum_ns=(max(ns_terms),), edges=())
     cert, _ = certify_lower_bound(prog, dag)
     if not check_optimality_certificate(prog, dag, cert):
         return False, int(cert.l_star_lean_ns), "lean_optimality_certificate_rejected"
@@ -319,9 +384,10 @@ def _verify_sim_owner_dispatch(
             matched = reg.match(sample_op)
         else:
             matched = None
-        if matched is None:
+        if matched is None or sample_op is None:
             violations.append(f"sim_registry_unmatched:{family}")
             return False, {"owner": "builtin_family_registry", "matched": False}, violations
+        ctx = planning_context if planning_context is not None else _build_default_planning_context(sample_op)
         detail: dict[str, Any] = {
             "owner": "builtin_family_registry",
             "matched": True,
@@ -330,40 +396,19 @@ def _verify_sim_owner_dispatch(
             "resolved": False,
             "lean_lower_bound_ns": 0,
         }
-        if sample_op is not None and planning_context is not None:
-            try:
-                resolved = matched.resolve(sample_op, planning_context)
-            except (ModelingError, NotImplementedError, RuntimeError, ValueError) as exc:
-                violations.append(f"sim_owner_resolve_failed:{family}:{exc}")
-                return False, detail, violations
-            lean_ok, l_star, lean_reason = _verify_resolved_operator_dual_bound(resolved)
-            detail["resolved"] = True
-            detail["resolved_implementation"] = str(getattr(resolved, "implementation", ""))
-            detail["lean_lower_bound_ns"] = l_star
-            detail["lean_status"] = lean_reason
-            if not lean_ok:
-                violations.append(f"sim_owner_dual_bound_failed:{family}:{lean_reason}")
-                return False, detail, violations
-        elif sample_op is not None:
-            # Attempt default context resolution only if the family accepts a minimal probe;
-            # NotImplementedError (e.g. unimplemented scaffold) ALWAYS fails closed.
-            try:
-                ctx = _build_default_planning_context(sample_op)
-                resolved = matched.resolve(sample_op, ctx)
-            except NotImplementedError as exc:
-                violations.append(f"sim_owner_unimplemented_scaffold:{family}:{exc}")
-                return False, detail, violations
-            except (ModelingError, KeyError, TypeError, ValueError):
-                detail["resolve_note"] = "requires_operator_specific_planning_context"
-            else:
-                lean_ok, l_star, lean_reason = _verify_resolved_operator_dual_bound(resolved)
-                detail["resolved"] = True
-                detail["resolved_implementation"] = str(getattr(resolved, "implementation", ""))
-                detail["lean_lower_bound_ns"] = l_star
-                detail["lean_status"] = lean_reason
-                if not lean_ok:
-                    violations.append(f"sim_owner_dual_bound_failed:{family}:{lean_reason}")
-                    return False, detail, violations
+        try:
+            resolved = matched.resolve(sample_op, ctx)
+        except (ModelingError, NotImplementedError, KeyError, RuntimeError, TypeError, ValueError) as exc:
+            violations.append(f"sim_owner_resolve_failed:{family}:{exc}")
+            return False, detail, violations
+        lean_ok, l_star, lean_reason = _verify_resolved_operator_dual_bound(resolved, ctx)
+        detail["resolved"] = True
+        detail["resolved_implementation"] = str(getattr(resolved, "implementation", ""))
+        detail["lean_lower_bound_ns"] = l_star
+        detail["lean_status"] = lean_reason
+        if not lean_ok:
+            violations.append(f"sim_owner_dual_bound_failed:{family}:{lean_reason}")
+            return False, detail, violations
         return True, detail, violations
 
     cat = template_catalog if template_catalog is not None else builtin_template_catalog()
@@ -398,7 +443,8 @@ def validate_operator_contract(
     require_sim_owner: bool = True,
     require_taxonomy: bool = True,
     require_profiler_builder: bool = True,
-    require_tiling_axes: bool = False,
+    require_tiling_axes: bool = True,
+    require_mounted_refs: bool = False,
 ) -> dict[str, Any]:
     """Stage 1B: Validate governed operator/template contract against real Sim & Profiler owners."""
     root = resolve_repo_root(repo_root)
@@ -430,12 +476,18 @@ def validate_operator_contract(
     all_refs: list[dict[str, str]] = []
     symbols: set[str] = set()
     declared_builder = ""
+    shared_constants: dict[str, str] = {}
+    parsed_files: list[tuple[Path, ast.Module]] = []
     for py_file in files:
-        source_text = py_file.read_text(encoding="utf-8")
-        tree = ast.parse(source_text, filename=str(py_file))
+        tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
+        parsed_files.append((py_file, tree))
+        shared_constants.update(_extract_module_str_constants(tree))
+    for py_file, tree in parsed_files:
         top_names = _extract_top_level_names(tree)
         symbols |= _extract_symbol_mentions(tree)
-        all_refs.extend(_extract_source_refs(tree, py_file))
+        file_consts = {**shared_constants, **_extract_module_str_constants(tree)}
+        file_refs = _extract_source_refs(tree, py_file, file_consts)
+        all_refs.extend(file_refs)
         abi = _extract_upstream_abi(tree)
         if py_file.name in ("arch22.py", "arch35.py") or not is_family_pkg:
             if not abi:
@@ -444,10 +496,10 @@ def validate_operator_contract(
                 abis[py_file.name] = abi
             if is_family_pkg and "STRATEGY" not in top_names:
                 violations.append(f"missing_strategy_export:{py_file.name}")
-            if "SOURCES" not in top_names and not _extract_source_refs(tree, py_file):
+            if "SOURCES" not in top_names and not file_refs:
                 violations.append(f"missing_sources_declaration:{py_file.name}")
-        if not declared_builder:
-            declared_builder = _extract_string_constant(tree, "PROFILER_BENCH_BUILDER")
+        if not declared_builder and "PROFILER_BENCH_BUILDER" in file_consts:
+            declared_builder = file_consts["PROFILER_BENCH_BUILDER"]
 
     if is_family_pkg and len(abis) >= 2 and len(set(abis.values())) < len(abis):
         violations.append("duplicate_upstream_abi_across_arch_leaves")
@@ -457,6 +509,7 @@ def validate_operator_contract(
     if not all_refs:
         violations.append("source_ref_missing")
     source_checks: list[dict[str, Any]] = []
+    all_blobs_verified = bool(all_refs)
     for ref in all_refs:
         ref_errors: list[str] = []
         if not ref["repository"]:
@@ -468,15 +521,21 @@ def validate_operator_contract(
         if len(ref["source_sha256"]) != SHA256_HEX_LENGTH or not _HEX_RE.fullmatch(ref["source_sha256"]):
             ref_errors.append("source_sha256_invalid")
         blob_status = "skipped_invalid_ref"
+        blob_verified = False
         if not ref_errors:
-            ok_blob, blob_status = _verify_git_blob_sha256(
-                ref, refs_root=resolved_refs_root, repo_map=resolved_repo_map
+            ok_blob, blob_verified, blob_status = _verify_git_blob_sha256(
+                ref,
+                refs_root=resolved_refs_root,
+                repo_map=resolved_repo_map,
+                require_mounted_refs=require_mounted_refs,
             )
             if not ok_blob:
                 ref_errors.append(blob_status)
+        if not blob_verified:
+            all_blobs_verified = False
         if ref_errors:
             violations.append(f"source_ref_invalid:{ref['file']}:{','.join(ref_errors)}")
-        source_checks.append({**ref, "status": blob_status, "errors": ref_errors})
+        source_checks.append({**ref, "status": blob_status, "blob_verified": blob_verified, "errors": ref_errors})
 
     provenance_gate_outcome = None
     if (
@@ -522,10 +581,7 @@ def validate_operator_contract(
 
     eff_prof_family = (profiler_family or declared_builder or family).strip()
     eff_prof_recipe = (profiler_recipe or eff_prof_family).strip()
-    eff_prof_impl = (
-        profiler_impl
-        or next(iter(abis.values()), "")
-    ).strip()
+    eff_prof_impl = (profiler_impl or next(iter(abis.values()), "")).strip()
     profiler_check: dict[str, Any] = {
         "checked": bool(require_profiler_builder),
         "verified": False,
@@ -549,11 +605,22 @@ def validate_operator_contract(
             profiler_check["error"] = str(exc)
             violations.append(str(exc))
         else:
-            profiler_check["verified"] = True
-            profiler_check["resolved_builder"] = b_name
-            profiler_check["resolved_abi"] = b_abi
+            allowed_abis = set(abis.values())
+            sim_impl = str(sim_owner_detail.get("resolved_implementation") or "").strip()
+            if sim_impl:
+                allowed_abis.add(sim_impl)
+            if allowed_abis and b_abi not in allowed_abis:
+                err = f"profiler_abi_mismatch:resolved={b_abi}:declared={sorted(allowed_abis)}"
+                profiler_check["resolved_builder"] = b_name
+                profiler_check["resolved_abi"] = b_abi
+                profiler_check["error"] = err
+                violations.append(err)
+            else:
+                profiler_check["verified"] = True
+                profiler_check["resolved_builder"] = b_name
+                profiler_check["resolved_abi"] = b_abi
 
-    result = {
+    result: dict[str, Any] = {
         "stage": "validate-contract",
         "ok": not violations,
         "status": "pass" if not violations else "fail",
@@ -561,6 +628,7 @@ def validate_operator_contract(
         "family": family,
         "upstream_abis": abis,
         "source_refs_checked": len(source_checks),
+        "source_blobs_verified": all_blobs_verified,
         "source_refs": source_checks,
         "template_provenance_gate": (
             provenance_gate_outcome.to_dict() if provenance_gate_outcome is not None else None
@@ -573,6 +641,7 @@ def validate_operator_contract(
         "profiler_builder": profiler_check,
         "violations": violations,
     }
+    result["report_hmac"] = sign_stage_report("operator_contract", result)
     assert_sanitized_payload(result, field_name="operator_contract_validation")
     return result
 

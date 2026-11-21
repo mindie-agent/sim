@@ -1,19 +1,26 @@
-"""Lean 4 OptimalityCertificate non-inversion checks and SHA-256 receipt sealing.
+"""Lean 4 OptimalityCertificate non-inversion, stage report HMACs, and receipt sealing.
 
-[Role] Enforce ``0 < L*_Lean <= min(T_sim, T_silicon_p99)`` with mandatory
-  verified ``OptimalityCertificate`` witnesses (closing witness-free ``L=0``
-  bypasses) and build/seal sanitized SHA-256 ``OnboardingReceipt`` records.
-[Invariants] Witness-free rows and ``L*_Lean == 0`` on positive simulated time
-  fail closed unconditionally. Every sealed receipt passes sanitization before
-  digest calculation.
-[Timeouts & Locks] Pure in-memory validation and SHA-256 hashing; zero I/O,
-  locks, or device contexts.
+[Role] Enforce strict ``<= 10.0%`` release threshold ceilings, process-bound
+  HMAC sealing/verification for stage reports (blocking fabricated JSON dicts
+  in ``verify_sku_gates`` / ``certify_operator``), case-joined Lean 4
+  ``OptimalityCertificate`` non-inversion checks (closing witness-free ``L=0``
+  and unrelated-case bypasses), and SHA-256 ``OnboardingReceipt`` sealing.
+[Invariants] Thresholds ``> 10.0%`` fail closed unconditionally. Every Lean
+  witness MUST match a real scored case's ``t_sim_ns``, obey
+  ``0 < L*_Lean <= min(T_sim, T_silicon_p99)``, and pass
+  ``check_optimality_certificate``.
+[Timeouts & Locks] Pure in-memory validation and SHA-256/HMAC hashing; zero
+  I/O, locks, or device contexts.
 [Side-Effect Policy] Zero filesystem writes or global state mutations.
 """
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import hashlib
+import hmac
 import math
+import os
+import secrets
 from typing import Any, Literal
 
 from mindie_sim.optimization.dual_bound import (
@@ -27,15 +34,60 @@ from mindie_sim.optimization.dual_bound import (
 from mindie_sim.schema.common import ModelingError
 
 from .contracts import (
+    DEFAULT_HELDOUT_APE_THRESHOLD_PCT,
     OPERATOR_ONBOARDING_RECEIPT_SCHEMA,
     SKU_ONBOARDING_RECEIPT_SCHEMA,
     GateCheckOutcome,
     LeanBoundCheckRow,
     OnboardingReceipt,
     assert_sanitized_payload,
+    canonical_json_bytes,
     compute_receipt_sha256,
     utc_now_iso,
 )
+
+_REPORT_HMAC_KEY_BYTES = 32
+_REPORT_HMAC_ENV_VAR = "MINDIE_ONBOARDING_HMAC_KEY"
+_PROCESS_HMAC_KEY = secrets.token_bytes(_REPORT_HMAC_KEY_BYTES)
+_REPORT_HMAC_FIELD = "report_hmac"
+_MAX_MISSING_CASES_IN_MSG = 8
+
+
+def _active_hmac_key() -> bytes:
+    override = os.environ.get(_REPORT_HMAC_ENV_VAR, "").strip()
+    if override:
+        return hashlib.sha256(override.encode("utf-8")).digest()
+    return _PROCESS_HMAC_KEY
+
+
+def validate_strict_threshold_pct(threshold_pct: float) -> float:
+    """Enforce ``0 < threshold_pct <= DEFAULT_HELDOUT_APE_THRESHOLD_PCT`` (10.0%)."""
+    if isinstance(threshold_pct, bool) or not isinstance(threshold_pct, (int, float)):
+        raise ModelingError(f"threshold_pct_invalid:{threshold_pct!r}")
+    val = float(threshold_pct)
+    if not math.isfinite(val) or val <= 0.0:
+        raise ModelingError(f"threshold_pct_nonpositive:{val}")
+    if val > DEFAULT_HELDOUT_APE_THRESHOLD_PCT:
+        raise ModelingError(
+            f"threshold_pct_exceeds_strict_release_cap:got={val}:max={DEFAULT_HELDOUT_APE_THRESHOLD_PCT}"
+        )
+    return val
+
+
+def sign_stage_report(kind: str, payload: Mapping[str, Any]) -> str:
+    """Compute an HMAC-SHA256 attesting that ``payload`` was minted by onboarding."""
+    body = {k: v for k, v in payload.items() if k != _REPORT_HMAC_FIELD}
+    raw = f"{kind}|".encode("utf-8") + canonical_json_bytes(body)
+    return hmac.new(_active_hmac_key(), raw, "sha256").hexdigest()
+
+
+def verify_stage_report(kind: str, payload: Mapping[str, Any]) -> bool:
+    """Return True iff ``payload`` carries an intact in-process HMAC for ``kind``."""
+    supplied = payload.get(_REPORT_HMAC_FIELD)
+    if not isinstance(supplied, str) or not supplied:
+        return False
+    expected = sign_stage_report(kind, payload)
+    return hmac.compare_digest(supplied, expected)
 
 
 def _parse_certificate_witness(
@@ -85,16 +137,21 @@ def check_lean_non_inversion(
     *,
     require_non_empty: bool = True,
     verify_certificates: bool = True,
+    expected_case_timings: Mapping[str, tuple[int, int]] | None = None,
 ) -> tuple[bool, tuple[LeanBoundCheckRow, ...], tuple[str, ...]]:
-    """Enforce ``0 < L*_Lean <= min(T_sim, T_silicon_p99)`` with mandatory witness verification."""
+    """Enforce ``0 < L*_Lean <= min(T_sim, T_silicon_p99)`` joined 1:1 to scored cases."""
     if not rows:
         if require_non_empty:
             return False, (), ("lean_bounds_missing",)
         return True, (), ()
     checked: list[LeanBoundCheckRow] = []
     violations: list[str] = []
+    seen_case_ids: set[str] = set()
     for idx, row in enumerate(rows):
         cid = str(row.get("case_id") or f"case-{idx}")
+        if cid in seen_case_ids:
+            violations.append(f"lean_witness_duplicate_case_id:{cid}")
+        seen_case_ids.add(cid)
         l_star_raw = row.get("l_star_lean_ns")
         t_sim_raw = row.get("t_sim_ns")
         t_p99_raw = row.get("t_silicon_p99_ns")
@@ -126,6 +183,22 @@ def check_lean_non_inversion(
         elif verify_certificates:
             cert_valid = False
             violations.append(f"lean_certificate_missing:{cid}")
+        if expected_case_timings is not None:
+            if cid not in expected_case_timings:
+                cert_valid = False
+                violations.append(f"lean_witness_unrelated_case_id:{cid}")
+            else:
+                exp_sim_ns, exp_meas_ns = expected_case_timings[cid]
+                if t_sim != int(exp_sim_ns):
+                    cert_valid = False
+                    violations.append(
+                        f"lean_witness_t_sim_mismatch:{cid}:witness={t_sim}:scored={exp_sim_ns}"
+                    )
+                if t_p99 < int(exp_meas_ns):
+                    cert_valid = False
+                    violations.append(
+                        f"lean_witness_p99_below_measured:{cid}:p99={t_p99}:measured={exp_meas_ns}"
+                    )
         sim_inv = l_star > t_sim
         sil_inv = l_star > t_p99
         if sim_inv:
@@ -145,6 +218,12 @@ def check_lean_non_inversion(
                 sim_inverted=sim_inv, silicon_inverted=sil_inv,
             )
         )
+    if expected_case_timings is not None:
+        missing_cases = sorted(set(expected_case_timings) - seen_case_ids)
+        if missing_cases:
+            violations.append(
+                f"lean_witness_missing_for_cases:{','.join(missing_cases[:_MAX_MISSING_CASES_IN_MSG])}"
+            )
     return not violations, tuple(checked), tuple(violations)
 
 
@@ -197,4 +276,10 @@ def seal_onboarding_receipt(
     )
 
 
-__all__ = ["check_lean_non_inversion", "seal_onboarding_receipt"]
+__all__ = [
+    "check_lean_non_inversion",
+    "seal_onboarding_receipt",
+    "sign_stage_report",
+    "validate_strict_threshold_pct",
+    "verify_stage_report",
+]

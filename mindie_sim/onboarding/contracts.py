@@ -539,12 +539,6 @@ def subprocess_window_kwargs() -> dict[str, Any]:
     return {"creationflags": _SUBPROCESS_NO_WINDOW} if _SUBPROCESS_NO_WINDOW else {}
 
 
-from ._lean_and_receipts import (  # noqa: E402
-    check_lean_non_inversion,
-    seal_onboarding_receipt,
-)
-
-
 __all__ = [
     "ANCHOR_CONTEXT_GRID",
     "CLIFF_PLAN_SCHEMA",
@@ -593,12 +587,10 @@ __all__ = [
     "assert_sanitized_payload",
     "build_capture_uri",
     "canonical_json_bytes",
-    "check_lean_non_inversion",
     "compute_receipt_sha256",
     "default_topk_abi_rule",
     "read_bounded_json",
     "sanitize_public_alias",
-    "seal_onboarding_receipt",
     "subprocess_window_kwargs",
     "utc_now_iso",
     "validate_abi",

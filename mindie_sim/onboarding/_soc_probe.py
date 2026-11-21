@@ -122,6 +122,7 @@ def parse_platform_config_ini(ini_text: str) -> dict[str, Any]:
     return {
         "soc_version": soc_ver,
         "arch_preset": arch_preset,
+        "architecture": _first("architecture", "soc_family", "product_family"),
         "ini_sha256": ini_sha256,
         "aic_count": _int_of("ai_core_cnt", "aic_count", "cube_core_cnt"),
         "aiv_count": _int_of("vector_core_cnt", "aiv_count", "ai_vector_core_cnt"),
@@ -383,6 +384,7 @@ def _validate_profile_against_probe(
     _cmp("arch_preset", probe.arch_preset, str(dp.arch_id))
     _cmp("aic_count", probe.aic_count, int(dp.aic_count))
     _cmp("aiv_count", probe.aiv_count, int(dp.aiv_count))
+    _cmp("dies_per_package", probe.dies_per_package, int(profile_entry["dies_per_package"]))
     _cmp("hbm_bytes", probe.hbm_bytes, int(die.memory_bytes))
     _cmp("l2_bytes", probe.l2_bytes, int(bufs.get("l2", 0)))
     _cmp("ub_bytes", probe.ub_bytes, int(bufs.get("ub", 0)))
@@ -390,6 +392,17 @@ def _validate_profile_against_probe(
     _cmp("l0a_bytes", probe.l0a_bytes, int(bufs.get("l0a", 0)))
     _cmp("l0b_bytes", probe.l0b_bytes, int(bufs.get("l0b", 0)))
     _cmp("l0c_bytes", probe.l0c_bytes, int(bufs.get("l0c", 0)))
+    declared_channels = dict(profile_entry.get("transfer_channels") or {})
+    for chan_name, obs_bw in probe.fabric_channels:
+        if chan_name not in declared_channels:
+            conflicts.append(
+                SiliconProfileConflict(
+                    field=f"fabric_channels.{chan_name}",
+                    observed=obs_bw,
+                    declared="absent",
+                    reason=f"silicon_profile_conflict:fabric_channel_undeclared:{chan_name}",
+                )
+            )
     if int(buf_units.get("l2", 0)) != 1:
         conflicts.append(
             SiliconProfileConflict(
@@ -497,7 +510,7 @@ def probe_soc(
     ranks_node = int(raw_probe.get("ranks_per_node") or smi_parsed["ranks_per_node"] or dies_pkg)
     arch_preset, architecture = _resolve_explicit_arch(
         str(raw_probe.get("arch_preset") or ini_parsed["arch_preset"] or ""),
-        str(raw_probe.get("architecture") or ""),
+        str(raw_probe.get("architecture") or ini_parsed.get("architecture") or ""),
     )
     resolved_template_sku = str(
         base_template_sku or raw_probe.get("base_template_sku") or ""
@@ -564,7 +577,21 @@ def probe_soc(
     all_profiles = read_bounded_json(profiles_path) if profiles_path is not None else ascend_profiles()
     if soc_name in all_profiles:
         conflicts, datapath_summary = _validate_profile_against_probe(probe, all_profiles[soc_name])
-        ok = not conflicts
+        missing_evidence: list[str] = []
+        if not ini_parsed["ini_sha256"]:
+            missing_evidence.append("platform_config_ini")
+        if probe.aiv_count < 1:
+            missing_evidence.append("aiv_count")
+        if probe.l2_bytes < 1:
+            missing_evidence.append("l2_bytes")
+        if probe.ub_bytes < 1:
+            missing_evidence.append("ub_bytes")
+        ok = not conflicts and not missing_evidence
+        err_code = (
+            ""
+            if ok
+            else ("silicon_profile_conflict" if conflicts else "silicon_probe_incomplete")
+        )
         result: dict[str, Any] = {
             "schema": SOC_PROBE_SCHEMA,
             "stage": "probe-soc",
@@ -572,7 +599,8 @@ def probe_soc(
             "sku": soc_name,
             "ok": ok,
             "status": "ok" if ok else "failed",
-            "error": "" if ok else "silicon_profile_conflict",
+            "error": err_code,
+            "missing_probe_fields": missing_evidence,
             "ini_sha256": ini_parsed["ini_sha256"],
             "probe": probe.to_dict(),
             "datapath_summary": datapath_summary,

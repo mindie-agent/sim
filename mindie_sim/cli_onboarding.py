@@ -55,7 +55,8 @@ ONBOARDING_BOOLEAN_FLAGS = frozenset({
     "--no-require-sim-owner",
     "--no-require-taxonomy",
     "--no-require-profiler-builder",
-    "--require-tiling-axes",
+    "--no-require-tiling-axes",
+    "--require-mounted-refs",
 })
 DEFAULT_TILE_DIM = 128
 CLI_FAILURE_EXIT = 2
@@ -111,6 +112,7 @@ def _configure_sku_stages(parser: argparse.ArgumentParser) -> None:
     p3.add_argument("--sku", required=True)
     p3.add_argument("--observations-json", default=None)
     p3.add_argument("--train-manifest-json", default=None)
+    p3.add_argument("--primitives-json", default=None)
     p3.add_argument("--plan-out", default=None)
     p3.add_argument("--report-out", default=None)
     p3.add_argument("--threshold-pct", type=float, default=DEFAULT_HELDOUT_APE_THRESHOLD_PCT)
@@ -118,6 +120,7 @@ def _configure_sku_stages(parser: argparse.ArgumentParser) -> None:
     p3.add_argument("--live-profiler", action="store_true")
     p3.add_argument("--endpoint-alias", default="")
     p3.add_argument("--profiler-root", default=None)
+    p3.add_argument("--coordinator-bin", default="")
     p3.add_argument("--output", "-o", default=None)
 
     p4 = stages.add_parser("verify-gates", help="verify pointwise multilevel, witnessed Lean, governance, orthogonality")
@@ -127,6 +130,7 @@ def _configure_sku_stages(parser: argparse.ArgumentParser) -> None:
     p4.add_argument("--fits-json", default=None)
     p4.add_argument("--lean-bounds-json", default=None)
     p4.add_argument("--primitives-json", default=None)
+    p4.add_argument("--expected-cann-version", default="")
     p4.add_argument("--repo-root", default=None)
     p4.add_argument("--threshold-pct", type=float, default=DEFAULT_HELDOUT_APE_THRESHOLD_PCT)
     p4.add_argument("--skip-repo-gates", action="store_true")
@@ -187,7 +191,8 @@ def _configure_operator_stages(parser: argparse.ArgumentParser) -> None:
     p1b.add_argument("--no-require-sim-owner", dest="require_sim_owner", action="store_false")
     p1b.add_argument("--no-require-taxonomy", dest="require_taxonomy", action="store_false")
     p1b.add_argument("--no-require-profiler-builder", dest="require_profiler_builder", action="store_false")
-    p1b.add_argument("--require-tiling-axes", action="store_true")
+    p1b.add_argument("--no-require-tiling-axes", dest="require_tiling_axes", action="store_false")
+    p1b.add_argument("--require-mounted-refs", action="store_true")
     p1b.add_argument("--output", "-o", default=None)
 
     p2 = stages.add_parser("generate-cliff-plan", help="synthesize disjoint 2D cliff + ABI-rejection plan")
@@ -212,6 +217,7 @@ def _configure_operator_stages(parser: argparse.ArgumentParser) -> None:
     p3.add_argument("--live-profiler", action="store_true")
     p3.add_argument("--endpoint-alias", default="")
     p3.add_argument("--profiler-root", default=None)
+    p3.add_argument("--coordinator-bin", default="")
     p3.add_argument("--threshold-pct", type=float, default=DEFAULT_HELDOUT_APE_THRESHOLD_PCT)
     p3.add_argument("--out-score", default=None)
     p3.add_argument("--output", "-o", default=None)
@@ -251,10 +257,13 @@ def _configure_operator_stages(parser: argparse.ArgumentParser) -> None:
     pa.add_argument("--profiler-impl", default="")
     pa.add_argument("--template-id", default="")
     pa.add_argument("--endpoint-alias", default="")
+    pa.add_argument("--coordinator-bin", default="")
     pa.add_argument("--live-profiler", action="store_true")
     pa.add_argument("--no-require-sim-owner", dest="require_sim_owner", action="store_false")
     pa.add_argument("--no-require-taxonomy", dest="require_taxonomy", action="store_false")
     pa.add_argument("--no-require-profiler-builder", dest="require_profiler_builder", action="store_false")
+    pa.add_argument("--no-require-tiling-axes", dest="require_tiling_axes", action="store_false")
+    pa.add_argument("--require-mounted-refs", action="store_true")
     pa.add_argument("--out-dir", default=None)
     pa.add_argument("--skip-repo-gates", action="store_true")
     pa.add_argument("--orthogonality-base", default=None)
@@ -315,6 +324,7 @@ def _run_sku_stage(args: argparse.Namespace) -> dict[str, Any]:
             sku=args.sku,
             observations_json=args.observations_json,
             train_manifest_json=args.train_manifest_json,
+            primitives_json=args.primitives_json,
             plan_out=args.plan_out,
             report_out=args.report_out,
             threshold_pct=args.threshold_pct,
@@ -322,6 +332,7 @@ def _run_sku_stage(args: argparse.Namespace) -> dict[str, Any]:
             live_profiler=bool(args.live_profiler),
             endpoint_alias=args.endpoint_alias,
             profiler_root=args.profiler_root,
+            coordinator_bin=args.coordinator_bin,
         )
     if stage == "verify-gates":
         return verify_sku_gates(
@@ -331,6 +342,7 @@ def _run_sku_stage(args: argparse.Namespace) -> dict[str, Any]:
             fits_json=args.fits_json,
             lean_bounds_json=args.lean_bounds_json,
             primitives_json=args.primitives_json,
+            expected_cann_version=args.expected_cann_version,
             repo_root=args.repo_root,
             threshold_pct=args.threshold_pct,
             run_repo_gates=not bool(args.skip_repo_gates),
@@ -395,6 +407,7 @@ def _run_operator_stage(args: argparse.Namespace) -> dict[str, Any]:
             require_taxonomy=bool(args.require_taxonomy),
             require_profiler_builder=bool(args.require_profiler_builder),
             require_tiling_axes=bool(args.require_tiling_axes),
+            require_mounted_refs=bool(args.require_mounted_refs),
         )
     if stage == "generate-cliff-plan":
         return generate_operator_cliff_plan(
@@ -419,6 +432,7 @@ def _run_operator_stage(args: argparse.Namespace) -> dict[str, Any]:
             live_profiler=bool(args.live_profiler),
             endpoint_alias=args.endpoint_alias,
             profiler_root=args.profiler_root,
+            coordinator_bin=args.coordinator_bin,
             threshold_pct=args.threshold_pct,
             out_score=args.out_score,
         )
@@ -461,12 +475,15 @@ def _run_operator_stage(args: argparse.Namespace) -> dict[str, Any]:
             require_sim_owner=bool(args.require_sim_owner),
             require_taxonomy=bool(args.require_taxonomy),
             require_profiler_builder=bool(args.require_profiler_builder),
+            require_tiling_axes=bool(args.require_tiling_axes),
+            require_mounted_refs=bool(args.require_mounted_refs),
             out_dir=args.out_dir,
             run_repo_gates=not bool(args.skip_repo_gates),
             orthogonality_base=args.orthogonality_base,
             threshold_pct=args.threshold_pct,
             live_profiler=bool(args.live_profiler),
             endpoint_alias=args.endpoint_alias,
+            coordinator_bin=args.coordinator_bin,
         )
     raise ValueError(f"unknown_operator_stage:{stage}")
 

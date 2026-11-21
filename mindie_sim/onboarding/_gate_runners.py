@@ -19,6 +19,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 import importlib.util
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -311,14 +312,17 @@ def run_live_l0_bench_subprocess(
     container: str = "",
     npu_id: int = 0,
     device_id: int = 0,
+    visible_devices: Sequence[int] = (),
 ) -> dict[str, Any]:
-    """Execute ``tools/bench_l0_primitives.py`` as a bounded live subprocess."""
+    """Execute ``tools/bench_l0_primitives.py`` as a bounded live subprocess bound to granted devices."""
     if not endpoint_alias.strip():
         raise ModelingError("live_l0_bench_requires_endpoint_alias")
     root = resolve_repo_root(repo_root)
     script = root / "tools" / "bench_l0_primitives.py"
     if not script.is_file():
         raise ModelingError(f"bench_l0_primitives_not_found:{script}")
+    granted = [int(d) for d in visible_devices]
+    eff_npu_id = granted[0] if granted else int(npu_id)
     with tempfile.TemporaryDirectory(prefix="msim-l0-bench-") as tmp_dir:
         tmp = Path(tmp_dir)
         out_table = tmp / "l0_table.json"
@@ -328,11 +332,13 @@ def run_live_l0_bench_subprocess(
             "--sku", sku,
             "--campaign-id", campaign_id,
             "--cann-version", cann_version,
-            "--npu-id", str(int(npu_id)),
+            "--npu-id", str(eff_npu_id),
             "--device-id", str(int(device_id)),
             "--out", str(out_table),
             "--manifest", str(out_manifest),
         ]
+        if granted:
+            cli_args.extend(["--visible-devices", ",".join(str(d) for d in granted)])
         if container:
             cli_args.extend(["--container", container])
         done = _run_python_script(script, cli_args, cwd=root, timeout_s=timeout_s)
@@ -427,32 +433,46 @@ def _run_coordinator_lease_cmd(
 def acquire_coordinator_host_queue_lease(
     endpoint_alias: str,
     *,
-    devices: int = 1,
-    ttl_s: int = _DEFAULT_LEASE_TTL_S,
+    npu_count: int = 1,
+    devices: Sequence[int] | None = None,
+    ttl_seconds: int = _DEFAULT_LEASE_TTL_S,
     rpc_timeout_s: int = _COORDINATOR_LEASE_RPC_TIMEOUT_S,
     coordinator_bin: str = "",
 ) -> Iterator[dict[str, Any]]:
-    """Acquire and unconditionally release a real ``HostQueue`` lease (``lease_id`` + ``fence_token``)."""
+    """Acquire and release a real ``mindie-coordinator`` HostQueue lease (``mindie.lease`` schema)."""
     alias = endpoint_alias.strip()
     if not alias:
         raise ModelingError("host_queue_lease_requires_endpoint_alias")
+    req_payload: dict[str, Any] = {
+        "npu_count": int(npu_count),
+        "ttl_seconds": int(ttl_seconds),
+        "purpose": "mindie-sim-onboarding",
+    }
+    if devices:
+        req_payload["devices"] = [int(d) for d in devices]
     acquired = _run_coordinator_lease_cmd(
         action="acquire",
         endpoint_alias=alias,
-        payload={"devices": int(devices), "ttl_s": int(ttl_s)},
+        payload=req_payload,
         timeout_s=int(rpc_timeout_s),
         coordinator_bin=coordinator_bin,
     )
-    lease_id = str(acquired.get("lease_id") or "").strip()
-    fence_raw = acquired.get("fence_token")
+    if str(acquired.get("outcome") or "").lower() in ("failed", "blocked", "timeout"):
+        raise ModelingError(f"host_queue_lease_acquire_rejected:{acquired.get('status') or acquired.get('outcome')}")
+    if str(acquired.get("status") or "").lower() in ("failed", "blocked", "timeout", "insufficient_capacity"):
+        raise ModelingError(f"host_queue_lease_acquire_status_failed:{acquired.get('status')}")
+    data = acquired.get("data") if isinstance(acquired.get("data"), Mapping) else acquired
+    lease_id = str(data.get("lease_id") or "").strip()
+    fence_raw = data.get("fence_token")
     if not lease_id or fence_raw is None or isinstance(fence_raw, bool):
         raise ModelingError("host_queue_lease_missing_lease_id_or_fence_token")
     fence_token = int(fence_raw)
+    granted_devices = [int(d) for d in (data.get("devices") or ()) if not isinstance(d, bool)]
     lease_record = {
         "lease_mode": "coordinator_host_queue",
         "lease_id": lease_id,
         "fence_token": fence_token,
-        "devices": list(acquired.get("devices") or ()),
+        "devices": granted_devices,
     }
     try:
         yield lease_record
@@ -524,41 +544,71 @@ def run_profiler_bench_subprocess(
     plan_doc: Mapping[str, Any],
     *,
     sku: str,
-    endpoint_alias: str,
     profiler_root: str | Path | None = None,
+    allowed_phy_ids: Sequence[int] = (),
+    domain: int | None = None,
+    dry_run: bool = False,
     timeout_s: int = DEFAULT_GATE_SUBPROCESS_TIMEOUT_S,
 ) -> list[dict[str, Any]]:
-    """Invoke canonical ``mindie_profiler.bench.bench_sku_microbench`` over a serialized plan."""
-    if not endpoint_alias.strip():
-        raise ModelingError("profiler_bench_requires_endpoint_alias")
+    """Invoke ``python -m mindie_profiler.bench.bench_sku_microbench`` with real CLI flags."""
+    del plan_doc
     if profiler_root is None:
         raise ModelingError("profiler_bench_requires_profiler_root")
-    script = Path(profiler_root).resolve() / "mindie_profiler" / "bench" / "bench_sku_microbench.py"
-    if not script.is_file():
-        raise ModelingError(f"profiler_bench_script_not_found:{script}")
+    prof_root = Path(profiler_root).resolve()
+    mod_file = prof_root / "mindie_profiler" / "bench" / "bench_sku_microbench.py"
+    if not mod_file.is_file():
+        raise ModelingError(f"profiler_bench_script_not_found:{mod_file}")
+    env = dict(os.environ)
+    existing_pp = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = f"{prof_root}{os.pathsep}{existing_pp}" if existing_pp else str(prof_root)
     with tempfile.TemporaryDirectory(prefix="msim-prof-bench-") as tmp_dir:
         tmp = Path(tmp_dir)
-        plan_file = tmp / "cliff_plan.json"
-        out_file = tmp / "observations.json"
-        write_atomic_json(plan_file, dict(plan_doc))
-        cli_args = [
+        out_file = tmp / "bench_receipt.json"
+        obs_file = tmp / "observations.json"
+        cmd = [
+            sys.executable, "-B", "-m", "mindie_profiler.bench.bench_sku_microbench",
             "--sku", sku,
-            "--endpoint-alias", endpoint_alias,
-            "--plan-json", str(plan_file),
             "--out", str(out_file),
+            "--observations", str(obs_file),
         ]
-        done = _run_python_script(script, cli_args, cwd=Path(profiler_root).resolve(), timeout_s=timeout_s)
+        if allowed_phy_ids:
+            cmd.extend(["--allowed-phy-ids", ",".join(str(int(d)) for d in allowed_phy_ids)])
+        if domain is not None:
+            cmd.extend(["--domain", str(int(domain))])
+        if dry_run:
+            cmd.append("--dry-run")
+        try:
+            done = subprocess.run(
+                cmd,
+                cwd=str(prof_root),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=timeout_s,
+                check=False,
+                **subprocess_window_kwargs(),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise TimeoutError(f"profiler_bench_timeout:timeout_s={timeout_s}") from exc
+        except TimeoutError:
+            raise
+        except OSError as exc:
+            raise ModelingError(f"profiler_bench_os_error:{exc}") from exc
         if done.returncode != 0:
             raise ModelingError(
                 f"profiler_bench_failed:rc={done.returncode}:{(done.stderr or done.stdout).strip()}"
             )
-        if not out_file.is_file():
+        target_file = obs_file if obs_file.is_file() else out_file
+        if not target_file.is_file():
             raise ModelingError("profiler_bench_missing_output_json")
         try:
-            raw = json.loads(out_file.read_text(encoding="utf-8"))
+            raw = json.loads(target_file.read_text(encoding="utf-8"))
         except ValueError as exc:
             raise ModelingError(f"profiler_bench_invalid_json:{exc}") from exc
-    rows = raw.get("observations", raw) if isinstance(raw, Mapping) else raw
+    if isinstance(raw, Mapping):
+        rows = raw.get("observations") if raw.get("observations") is not None else raw.get("cases", [])
+    else:
+        rows = raw
     if not isinstance(rows, list):
         raise ModelingError("profiler_bench_observations_not_list")
     return [dict(r) for r in rows if isinstance(r, Mapping)]

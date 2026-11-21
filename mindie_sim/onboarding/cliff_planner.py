@@ -1,23 +1,25 @@
-"""Disjoint 2D cliff-plan synthesis with declarative TilingAxes ABI guards.
+"""Disjoint 2D cliff-plan synthesis driven by declarative TilingAxes ABI guards.
 
 [Role] Synthesize strictly disjoint ``train`` + 2D ``(B/q x Context x Parallel)``
-  off-grid cliff ``heldout`` + ``abi_rejection`` benchmark plans from declared
-  ``TilingAxes`` / ``OperatorCliffParameters`` (Prevention Lock 3), and
-  re-export sealed ``GateCase -> EvaluationRunner -> EngineRunReceipt`` scoring
-  from ``_sealed_scorer``.
+  off-grid cliff ``heldout`` + ``abi_rejection`` benchmark plans driven
+  directly by declared ``TilingAxes`` / ``OperatorCliffParameters``
+  (Prevention Lock 3), enforce mandatory ABI-rejection verification for both
+  SKU and operator pipelines, and re-export sealed scoring helpers.
 [Invariants]
-  * ``train`` vs ``heldout`` contexts, point coordinates, and acquisition
-    lineage roots are strictly disjoint; ``262144`` is ``train`` and
-    ``400000`` (``heldout``) is distinct from ``409600`` (``train``).
-  * All candidate cliffs are filtered through ``validate_abi``; illegal ABI
-    shapes (e.g., ``topk=2049``) route to ``abi_rejection_points`` while legal
-    performance cliffs (e.g., ``context=2049, topk=2048``) stay in ``heldout``.
+  * ``train`` anchors AND ``heldout`` cliffs are BOTH validated through
+    ``validate_abi``; any shape violating ``axes.abi_divisibility`` routes
+    strictly to ``abi_rejection_points``.
+  * ``axes.batch_axis``, ``axes.query_tokens_axis``, ``axes.phase_thresholds``,
+    and ``axes.core_product_axes`` directly control emitted plan points.
+  * When ``abi_rejection_points`` is non-empty, omitting rejection results or
+    passing ``rejected=False`` or an unrelated error class fails closed.
 [Timeouts & Locks] Pure in-memory plan synthesis; zero subprocesses, network
   calls, or device contexts.
 [Side-Effect Policy] Zero filesystem writes or global state mutations.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 import hashlib
 from typing import Any
 
@@ -44,9 +46,6 @@ from .contracts import (
     sanitize_public_alias,
 )
 from .tiling_axes import (
-    CROSS_SAMPLE_BATCH_SIZES,
-    CROSS_SAMPLE_CHUNK_Q,
-    CROSS_SAMPLE_MTP_Q,
     CROSS_SAMPLE_PARALLEL_CONTEXT_MIN,
     TilingAxes,
     default_topk_abi_rule,
@@ -57,6 +56,7 @@ _DEFAULT_SKU_TILE_DIM = 128
 _CROSS_BATCH_CONTEXTS: tuple[int, ...] = (4097, 24576, 98304)
 _CROSS_MTP_CONTEXTS: tuple[int, ...] = (2049, 24576, 98304)
 _CROSS_CHUNK_CONTEXTS: tuple[int, ...] = (98304, 200000)
+_CROSS_CHUNK_THRESHOLD = 256
 _CROSS_PARALLEL_SPECS: tuple[tuple[int, str], ...] = (
     (200000, "pcp2_dcp2"),
     (400000, "pcp4_dcp2"),
@@ -83,12 +83,49 @@ def _resolve_tiling_axes(params: OperatorCliffParameters) -> TilingAxes:
     )
 
 
+def _record_rejection(
+    abi_rejections: list[CliffPointSpec],
+    seen_reject: set[tuple[str, int, int, int, int | None]],
+    *,
+    point_id: str,
+    axis: str,
+    value: int,
+    regime_tag: str,
+    rationale: str,
+    reject_reason: str,
+    batch_size: int = 1,
+    query_tokens: int = 1,
+    topk: int | None = None,
+    parallel_topology: str = "tp1",
+) -> None:
+    rkey = (axis, value, batch_size, query_tokens, topk)
+    if rkey in seen_reject:
+        return
+    seen_reject.add(rkey)
+    abi_rejections.append(
+        CliffPointSpec(
+            point_id=f"abi_reject_{point_id}",
+            split="abi_rejection",
+            grid_kind="abi_rejection",
+            axis=axis,
+            value=value,
+            regime_tag=f"abi_reject_{regime_tag}",
+            rationale=rationale,
+            batch_size=batch_size,
+            query_tokens=query_tokens,
+            topk=topk,
+            parallel_topology=parallel_topology,
+            abi_expected_error=reject_reason,
+        )
+    )
+
+
 def _append_guarded_point(
     *,
     heldout: list[CliffPointSpec],
     abi_rejections: list[CliffPointSpec],
     seen_perf: set[tuple[str, int, int, int, int | None, str]],
-    seen_reject: set[tuple[str, int, int | None]],
+    seen_reject: set[tuple[str, int, int, int, int | None]],
     train_keys: set[tuple[str, int]],
     axes: TilingAxes,
     point_id: str,
@@ -116,25 +153,13 @@ def _append_guarded_point(
         probe_shape["topk"] = topk
     ok_abi, reject_reason = validate_abi(probe_shape, axes)
     if not ok_abi:
-        rkey = (axis, value, topk)
-        if rkey not in seen_reject:
-            seen_reject.add(rkey)
-            abi_rejections.append(
-                CliffPointSpec(
-                    point_id=f"abi_reject_{point_id}",
-                    split="abi_rejection",
-                    grid_kind="abi_rejection",
-                    axis=axis,
-                    value=value,
-                    regime_tag=f"abi_reject_{regime_tag}",
-                    rationale=rationale,
-                    batch_size=batch_size,
-                    query_tokens=query_tokens,
-                    topk=topk,
-                    parallel_topology=parallel_topology,
-                    abi_expected_error=reject_reason,
-                )
-            )
+        _record_rejection(
+            abi_rejections, seen_reject,
+            point_id=point_id, axis=axis, value=value, regime_tag=regime_tag,
+            rationale=rationale, reject_reason=reject_reason,
+            batch_size=batch_size, query_tokens=query_tokens,
+            topk=topk, parallel_topology=parallel_topology,
+        )
         return
     if (axis, value) in train_keys:
         return
@@ -172,38 +197,37 @@ def synthesize_operator_cliff_plan(
 
     train_points: list[CliffPointSpec] = []
     train_keys: set[tuple[str, int]] = set()
-    for ctx in ANCHOR_CONTEXT_GRID:
-        if params.context_min <= ctx <= params.context_max:
-            train_keys.add(("context_len", ctx))
-            train_points.append(
-                CliffPointSpec(
-                    point_id=f"anchor_ctx_{ctx}",
-                    split="train",
-                    grid_kind="anchor",
-                    axis="context_len",
-                    value=ctx,
-                    regime_tag="anchor_train",
-                    rationale="canonical_anchor_context_grid_512_to_409600",
-                )
-            )
-    if not train_points:
-        train_keys.add(("context_len", params.context_min))
-        train_points.append(
-            CliffPointSpec(
-                point_id=f"anchor_ctx_{params.context_min}",
-                split="train",
-                grid_kind="anchor",
-                axis="context_len",
-                value=params.context_min,
-                regime_tag="anchor_train",
-                rationale="domain_min_anchor",
-            )
-        )
-
     heldout: list[CliffPointSpec] = []
     abi_rejections: list[CliffPointSpec] = []
     seen_perf: set[tuple[str, int, int, int, int | None, str]] = set()
-    seen_reject: set[tuple[str, int, int | None]] = set()
+    seen_reject: set[tuple[str, int, int, int, int | None]] = set()
+
+    for ctx in ANCHOR_CONTEXT_GRID:
+        if params.context_min <= ctx <= params.context_max:
+            ok_abi, reject_reason = validate_abi(
+                {"axis": "context_len", "value": ctx, "context_len": ctx, "batch_size": 1, "query_tokens": 1},
+                axes,
+            )
+            if ok_abi:
+                train_keys.add(("context_len", ctx))
+                train_points.append(
+                    CliffPointSpec(
+                        point_id=f"anchor_ctx_{ctx}",
+                        split="train",
+                        grid_kind="anchor",
+                        axis="context_len",
+                        value=ctx,
+                        regime_tag="anchor_train",
+                        rationale="canonical_anchor_context_grid_512_to_409600",
+                    )
+                )
+            else:
+                _record_rejection(
+                    abi_rejections, seen_reject,
+                    point_id=f"anchor_ctx_{ctx}", axis="context_len", value=ctx,
+                    regime_tag="anchor_abi_guard", rationale="anchor_violates_declared_abi_rule",
+                    reject_reason=reject_reason,
+                )
 
     def _add(**kw: Any) -> None:
         _append_guarded_point(
@@ -220,7 +244,21 @@ def synthesize_operator_cliff_plan(
                 rationale="canonical_off_grid_cliff_heldout_grid",
             )
 
-    for batch, ctx in zip(CROSS_SAMPLE_BATCH_SIZES, _CROSS_BATCH_CONTEXTS):
+    def _pick_ctx(candidates: tuple[int, ...], idx: int) -> int:
+        rotated = [candidates[(idx + offset) % len(candidates)] for offset in range(len(candidates))]
+        for cand in (*rotated, *OFF_GRID_CLIFF_HELDOUT_GRID):
+            if params.context_min <= cand <= params.context_max:
+                ok_c, _ = validate_abi(
+                    {"axis": "context_len", "value": cand, "context_len": cand, "batch_size": 1, "query_tokens": 1},
+                    axes,
+                )
+                if ok_c:
+                    return cand
+        return candidates[idx % len(candidates)]
+
+    batch_vals = [b for b in axes.batch_axis if b > 1]
+    for idx, batch in enumerate(batch_vals):
+        ctx = _pick_ctx(_CROSS_BATCH_CONTEXTS, idx)
         if params.context_min <= ctx <= params.context_max:
             _add(
                 point_id=f"cross_b{batch}_ctx_{ctx}", grid_kind="cross_sample_2d",
@@ -229,7 +267,9 @@ def synthesize_operator_cliff_plan(
                 batch_size=batch, query_tokens=1,
             )
 
-    for q_tok, ctx in zip(CROSS_SAMPLE_MTP_Q, _CROSS_MTP_CONTEXTS):
+    mtp_qs = [q for q in axes.query_tokens_axis if 1 < q < _CROSS_CHUNK_THRESHOLD]
+    for idx, q_tok in enumerate(mtp_qs):
+        ctx = _pick_ctx(_CROSS_MTP_CONTEXTS, idx)
         if params.context_min <= ctx <= params.context_max:
             _add(
                 point_id=f"cross_mtp_q{q_tok}_ctx_{ctx}", grid_kind="cross_sample_2d",
@@ -238,7 +278,9 @@ def synthesize_operator_cliff_plan(
                 batch_size=1, query_tokens=q_tok,
             )
 
-    for q_tok, ctx in zip(CROSS_SAMPLE_CHUNK_Q, _CROSS_CHUNK_CONTEXTS):
+    chunk_qs = [q for q in axes.query_tokens_axis if q >= _CROSS_CHUNK_THRESHOLD]
+    for idx, q_tok in enumerate(chunk_qs):
+        ctx = _pick_ctx(_CROSS_CHUNK_CONTEXTS, idx)
         if params.context_min <= ctx <= params.context_max:
             _add(
                 point_id=f"cross_chunk_q{q_tok}_ctx_{ctx}", grid_kind="cross_sample_2d",
@@ -256,6 +298,7 @@ def synthesize_operator_cliff_plan(
                 batch_size=1, query_tokens=1, parallel_topology=topo,
             )
 
+    core_axes = tuple(axes.core_product_axes) or ("tokens",)
     for tile in axes.tile_dims:
         for delta, tag in ((-1, "minus1"), (0, "exact"), (1, "plus1")):
             _add(
@@ -264,11 +307,28 @@ def synthesize_operator_cliff_plan(
                 rationale=f"tile_dim({tile}){delta:+d}_tail_wave_boundary",
             )
         full_wave = params.core_count * tile
-        for delta, tag in ((-1, "minus1"), (1, "plus1")):
+        for c_axis in core_axes:
+            axis_key = "tokens" if c_axis == "tokens" else c_axis
+            for delta, tag in ((-1, "minus1"), (1, "plus1")):
+                _add(
+                    point_id=f"cores_wave_{axis_key}_{tile}_{tag}_{full_wave + delta}",
+                    grid_kind="boundary_cliff",
+                    axis=axis_key, value=full_wave + delta, regime_tag="core_wave_cliff",
+                    rationale=f"cores({params.core_count})*tile({tile}){delta:+d}_on_{axis_key}",
+                )
+
+    for pt_axis, thresh in axes.phase_thresholds:
+        if pt_axis == "topk":
+            continue
+        for delta, tag in ((-1, "minus1"), (0, "exact"), (1, "plus1")):
+            val = thresh + delta
+            if pt_axis == "context_len" and not (params.context_min <= val <= params.context_max):
+                continue
             _add(
-                point_id=f"cores_wave_{tile}_{tag}_{full_wave + delta}", grid_kind="boundary_cliff",
-                axis="tokens", value=full_wave + delta, regime_tag="core_wave_cliff",
-                rationale=f"cores({params.core_count})*tile({tile}){delta:+d}_wave_step_cliff",
+                point_id=f"phase_{pt_axis}_{thresh}_{tag}_{val}",
+                grid_kind="boundary_cliff",
+                axis=pt_axis, value=val, regime_tag="declared_phase_threshold",
+                rationale=f"phase_threshold({pt_axis}={thresh}){delta:+d}",
             )
 
     if params.topk_threshold is not None:
@@ -355,9 +415,73 @@ def synthesize_sku_512_400k_plan(
     return synthesize_operator_cliff_plan(params, sku=sku, campaign_id=campaign_id)
 
 
+def evaluate_abi_rejections(
+    planned_rejections: Sequence[Mapping[str, Any]],
+    observed_rejections: Sequence[Mapping[str, Any]] | None,
+) -> dict[str, Any]:
+    """Fail closed unless every planned illegal ABI shape is rejected with a matching ABI error."""
+    planned = {
+        str(pt.get("point_id") or ""): str(pt.get("abi_expected_error") or "")
+        for pt in planned_rejections
+        if pt.get("point_id")
+    }
+    if not planned:
+        return {
+            "checked": True,
+            "ok": True,
+            "planned_count": 0,
+            "rejected_count": 0,
+            "unexpectedly_accepted": [],
+            "wrong_error_class": [],
+            "missing_rejection_tests": [],
+        }
+    if observed_rejections is None:
+        return {
+            "checked": True,
+            "ok": False,
+            "planned_count": len(planned),
+            "rejected_count": 0,
+            "unexpectedly_accepted": [],
+            "wrong_error_class": [],
+            "missing_rejection_tests": sorted(planned),
+        }
+    obs_by_id = {
+        str(row.get("point_id") or row.get("case_id") or ""): row
+        for row in observed_rejections
+    }
+    missing: list[str] = []
+    unexpectedly_accepted: list[str] = []
+    wrong_error: list[str] = []
+    rejected_count = 0
+    for pid, expected_err in sorted(planned.items()):
+        row = obs_by_id.get(pid)
+        if row is None:
+            missing.append(pid)
+            continue
+        if row.get("rejected") is not True:
+            unexpectedly_accepted.append(pid)
+            continue
+        err_text = str(row.get("abi_error") or "").strip()
+        exp_prefix = expected_err.split(":", 1)[0] if expected_err else "abi_"
+        if not err_text or (exp_prefix not in err_text and "abi" not in err_text.lower()):
+            wrong_error.append(f"{pid}:got={err_text or 'empty'}:expected={exp_prefix}")
+            continue
+        rejected_count += 1
+    return {
+        "checked": True,
+        "ok": not missing and not unexpectedly_accepted and not wrong_error,
+        "planned_count": len(planned),
+        "rejected_count": rejected_count,
+        "unexpectedly_accepted": sorted(unexpectedly_accepted),
+        "wrong_error_class": sorted(wrong_error),
+        "missing_rejection_tests": sorted(missing),
+    }
+
+
 __all__ = [
     "STANDARD_LEVEL_BOUNDARY_KINDS",
     "WhiteboxSpineRunner",
+    "evaluate_abi_rejections",
     "score_sealed_gate_cases",
     "synthesize_operator_cliff_plan",
     "synthesize_sku_512_400k_plan",

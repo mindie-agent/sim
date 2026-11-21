@@ -3,19 +3,20 @@
 [Role] Orchestrate deterministic, repeatable onboarding of a new governed
   operator family or template across four stages plus ``run-all``:
   (1) ``scaffold`` / ``validate-contract`` (real ``builtin_family_registry`` /
-      ``builtin_template_catalog`` + ``mindie_profiler.bench.operators.resolve_builder_strict``),
-  (2) ``generate-cliff-plan`` (Lock-3 ``TilingAxes`` + ``validate_abi`` producing
-      disjoint ``train``, 2D ``heldout`` cliffs, and ``abi_rejection`` points),
-  (3) ``bench-and-score`` (sealed ``GateCase -> EvaluationRunner -> EngineRunReceipt``
-      scoring with clock-operator parity and zero caller ``predicted_*``), and
-  (4) ``certify`` (pointwise ``< 10.0%`` heldout APE across all cliffs, ``0``
-      missing grid cells, witnessed non-degenerate Lean 4 non-inversion, ``0``
-      strict governance/orthogonality violations, automatic
-      ``diagnose_tail_cluster`` on failure, and SHA-256 onboarding receipt).
-[Invariants] Fails closed on missing Sim/Profiler owners, unimplemented
-  scaffolds, ``plan_only``, ``train==heldout`` lineage leakage, caller
-  ``predicted_*``, ``service_regimes`` crutches, clock-operator mismatch,
-  ``>= 10.0%`` cliff APE, or witness-free/inverted Lean bounds.
+      ``builtin_template_catalog`` + ``resolve_builder_strict`` ABI cross-check),
+  (2) ``generate-cliff-plan`` (Lock-3 ``TilingAxes`` + ``validate_abi``),
+  (3) ``bench-and-score`` (sealed ``GateCase -> EvaluationRunner ->
+      EngineRunReceipt`` scoring with ``HostQueue`` lease on live path and
+      mandatory ABI-rejection enforcement), and
+  (4) ``certify`` (HMAC-verified contract/score reports, pointwise
+      ``< threshold_pct <= 10.0%``, 1:1 case-joined witnessed Lean 4
+      non-inversion, strict repo gates, automatic ``diagnose_tail_cluster``,
+      and SHA-256 onboarding receipt).
+[Invariants] Fails closed on fabricated reports, ``ok=False`` score reports,
+  thresholds ``> 10.0%``, missing ABI-rejection checks, missing owners,
+  ``plan_only``, ``train==heldout`` leakage, caller ``predicted_*``,
+  ``service_regimes`` crutches, clock mismatch, or unrelated/inverted Lean
+  witnesses.
 [Timeouts & Locks] Bounded execution budgets and subprocess gates;
   ``TimeoutError`` propagates before ``OSError``. Zero device contexts.
 [Side-Effect Policy] Writes only caller-requested output paths via atomic
@@ -24,25 +25,36 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Any
 
 from mindie_sim.observations.multilevel_gate import EvaluationRunner
 from mindie_sim.prediction.operators.contracts import OperatorPlanningContext
 from mindie_sim.prediction.operators.registry import FamilyRegistry
+from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.templates.registry import TemplateCatalog
 
 from ._gate_runners import (
+    acquire_coordinator_host_queue_lease,
     resolve_repo_root,
     run_arch_governance_gate,
     run_profiler_bench_subprocess,
     run_tail_cluster_diagnosis,
     run_test_orthogonality_gate,
 )
+from ._lean_and_receipts import (
+    check_lean_non_inversion,
+    seal_onboarding_receipt,
+    sign_stage_report,
+    validate_strict_threshold_pct,
+    verify_stage_report,
+)
 from ._operator_contract import validate_operator_contract
 from ._operator_scaffold import scaffold_operator
 from .cliff_planner import (
+    evaluate_abi_rejections,
     score_sealed_gate_cases,
     synthesize_operator_cliff_plan,
 )
@@ -57,11 +69,11 @@ from .contracts import (
     OperatorCliffParameters,
     TilingAxes,
     assert_sanitized_payload,
-    check_lean_non_inversion,
     read_bounded_json,
-    seal_onboarding_receipt,
     write_atomic_json,
 )
+
+_ENGINE_RECEIPT_PREFIX = "capture://engine-receipt/"
 
 
 def generate_operator_cliff_plan(
@@ -110,45 +122,6 @@ def generate_operator_cliff_plan(
     }
 
 
-def _evaluate_abi_rejections(
-    planned_rejections: Sequence[Mapping[str, Any]],
-    observed_rejections: Sequence[Mapping[str, Any]] | None,
-) -> dict[str, Any]:
-    planned_ids = [str(pt.get("point_id") or "") for pt in planned_rejections if pt.get("point_id")]
-    if not planned_ids or observed_rejections is None:
-        return {
-            "checked": False,
-            "ok": True,
-            "planned_count": len(planned_ids),
-            "rejected_count": 0,
-            "unexpectedly_accepted": [],
-            "missing_rejection_tests": [],
-        }
-    obs_by_id = {
-        str(row.get("point_id") or row.get("case_id") or ""): row
-        for row in observed_rejections
-    }
-    missing: list[str] = []
-    unexpectedly_accepted: list[str] = []
-    rejected_count = 0
-    for pid in planned_ids:
-        row = obs_by_id.get(pid)
-        if row is None:
-            missing.append(pid)
-        elif bool(row.get("rejected")) or bool(str(row.get("abi_error") or "").strip()):
-            rejected_count += 1
-        else:
-            unexpectedly_accepted.append(pid)
-    return {
-        "checked": True,
-        "ok": not missing and not unexpectedly_accepted,
-        "planned_count": len(planned_ids),
-        "rejected_count": rejected_count,
-        "unexpectedly_accepted": sorted(unexpectedly_accepted),
-        "missing_rejection_tests": sorted(missing),
-    }
-
-
 def bench_and_score_operator(
     *,
     cliff_plan: str | Path | Mapping[str, Any],
@@ -159,15 +132,19 @@ def bench_and_score_operator(
     live_profiler: bool = False,
     endpoint_alias: str = "",
     profiler_root: str | Path | None = None,
+    lease_acquirer: Callable[[str, int], AbstractContextManager[Mapping[str, Any]]] | None = None,
+    coordinator_bin: str = "",
     runner: EvaluationRunner | None = None,
     threshold_pct: float = DEFAULT_HELDOUT_APE_THRESHOLD_PCT,
     out_score: str | Path | None = None,
     timeout_s: int = DEFAULT_OUTER_TIMEOUT_S,
 ) -> dict[str, Any]:
-    """Stage 3: Dispatch bench plan or load captured silicon JSON and score via sealed runner."""
+    """Stage 3: Dispatch bench plan (under HostQueue lease if live) and score via sealed runner."""
+    cap_threshold = validate_strict_threshold_pct(threshold_pct)
     plan_raw = read_bounded_json(cliff_plan) if isinstance(cliff_plan, (str, Path)) else dict(cliff_plan)
     plan_doc = dict(plan_raw["plan"]) if isinstance(plan_raw, Mapping) and "plan" in plan_raw else dict(plan_raw)
-    expected_heldout_ids = [str(pt["point_id"]) for pt in plan_doc.get("heldout_points", ())]
+    expected_heldout_pts = list(plan_doc.get("heldout_points", ()))
+    expected_heldout_ids = [str(pt["point_id"]) for pt in expected_heldout_pts]
 
     rows: list[Mapping[str, Any]] | None = None
     if captured_json is not None:
@@ -181,27 +158,38 @@ def bench_and_score_operator(
     elif bench_dispatcher is not None:
         rows = list(bench_dispatcher(plan_doc, int(timeout_s)))
     elif live_profiler:
-        rows = run_profiler_bench_subprocess(
-            plan_doc,
-            sku=sku,
-            endpoint_alias=endpoint_alias,
-            profiler_root=profiler_root,
-            timeout_s=int(timeout_s),
+        lease_ctx = (
+            lease_acquirer(sku, int(timeout_s))
+            if lease_acquirer is not None
+            else acquire_coordinator_host_queue_lease(
+                endpoint_alias, npu_count=1, ttl_seconds=int(timeout_s), coordinator_bin=coordinator_bin,
+            )
         )
+        with lease_ctx as lease_info:
+            info = dict(lease_info or {})
+            if not info.get("lease_id") or info.get("fence_token") is None:
+                raise ModelingError("live_profiler_requires_host_queue_lease_id_and_fence_token")
+            granted = [int(d) for d in (info.get("devices") or ()) if not isinstance(d, bool)]
+            rows = run_profiler_bench_subprocess(
+                plan_doc, sku=sku, profiler_root=profiler_root, allowed_phy_ids=granted, timeout_s=int(timeout_s),
+            )
 
     if rows is None:
-        plan_only = {
+        plan_only: dict[str, Any] = {
             "stage": "bench-and-score",
             "ok": False,
             "status": "plan_only",
             "verdict": "insufficient_evidence",
             "error": "bench_and_score_plan_only_no_observations",
+            "sku": sku,
             "target_id": str(plan_doc.get("target_id") or ""),
             "plan_sha256": str(plan_doc.get("plan_sha256") or ""),
             "missing_heldout_points": sorted(expected_heldout_ids),
+            "abi_rejection_check": evaluate_abi_rejections(plan_doc.get("abi_rejection_points") or (), None),
             "heldout_summary": None,
             "residuals": [],
         }
+        plan_only["report_hmac"] = sign_stage_report("operator_score", plan_only)
         if out_score is not None:
             write_atomic_json(out_score, plan_only)
         assert_sanitized_payload(plan_only, field_name="bench_and_score_plan_only")
@@ -212,12 +200,13 @@ def bench_and_score_operator(
         rows,
         sku=sku,
         runner=runner,
-        threshold_pct=threshold_pct,
+        threshold_pct=cap_threshold,
         external_train_roots=external_train,
+        expected_points=expected_heldout_pts,
         expected_point_ids=expected_heldout_ids,
         require_disjoint_level_roots=False,
     )
-    abi_check = _evaluate_abi_rejections(
+    abi_check = evaluate_abi_rejections(
         list(plan_doc.get("abi_rejection_points") or ()),
         abi_rejection_results,
     )
@@ -229,13 +218,13 @@ def bench_and_score_operator(
     else:
         final_ok, final_status = True, "pass"
 
-    report = {
+    report: dict[str, Any] = {
         "stage": "bench-and-score",
         "ok": final_ok,
         "status": final_status,
         "verdict": final_status,
         "sku": sku,
-        "threshold_pct": float(threshold_pct),
+        "threshold_pct": cap_threshold,
         "target_id": str(plan_doc.get("target_id") or ""),
         "plan_sha256": str(plan_doc.get("plan_sha256") or ""),
         "missing_heldout_points": missing_points,
@@ -247,6 +236,7 @@ def bench_and_score_operator(
         "train_summary": scored["train_summary"],
         "residuals": scored["residuals"],
     }
+    report["report_hmac"] = sign_stage_report("operator_score", report)
     assert_sanitized_payload(report, field_name="bench_and_score_report")
     if out_score is not None:
         write_atomic_json(out_score, report)
@@ -267,14 +257,18 @@ def certify_operator(
     out_receipt: str | Path | None = None,
     diagnosis_out: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Stage 4: Enforce pointwise <10% cliff APE, witnessed Lean non-inversion, strict gates."""
+    """Stage 4: Enforce HMAC-verified reports, pointwise <10%, joined Lean, strict gates."""
+    cap_threshold = validate_strict_threshold_pct(threshold_pct)
     root = resolve_repo_root(repo_root)
     c_doc = read_bounded_json(contract_report) if isinstance(contract_report, (str, Path)) else dict(contract_report)
     s_doc = read_bounded_json(score_report) if isinstance(score_report, (str, Path)) else dict(score_report)
 
     gates: list[GateCheckOutcome] = []
-    contract_ok = bool(c_doc.get("ok"))
+    c_hmac_ok = verify_stage_report("operator_contract", c_doc)
+    contract_ok = c_hmac_ok and bool(c_doc.get("ok"))
     c_violations = list(c_doc.get("violations") or ())
+    if not c_hmac_ok:
+        c_violations.append("contract_report_hmac_unverified_or_fabricated")
     gates.append(
         GateCheckOutcome(
             name="operator_contract",
@@ -283,45 +277,65 @@ def certify_operator(
             detail="0 violations" if contract_ok else "; ".join(str(v) for v in c_violations),
             metrics=(
                 ("source_refs_checked", int(c_doc.get("source_refs_checked", 0))),
+                ("hmac_verified", c_hmac_ok),
                 ("violations", len(c_violations)),
             ),
         )
     )
 
+    s_hmac_ok = verify_stage_report("operator_score", s_doc)
+    sku_match = str(s_doc.get("sku") or "") == sku
     heldout_rows = [r for r in s_doc.get("residuals", ()) if r.get("split", "heldout") == "heldout"]
+    receipts_ok = bool(heldout_rows) and all(
+        str(r.get("engine_receipt") or "").startswith(_ENGINE_RECEIPT_PREFIX)
+        and int(r.get("predicted_ns") or 0) > 0
+        and int(r.get("measured_ns") or 0) > 0
+        for r in heldout_rows
+    )
     failing_rows = [
         r for r in heldout_rows
-        if float(r.get("absolute_percentage_error", 0.0)) * PERCENT_SCALE >= threshold_pct
+        if float(r.get("absolute_percentage_error", 0.0)) * PERCENT_SCALE >= cap_threshold
     ]
     missing_pts = list(s_doc.get("missing_heldout_points") or ())
     max_ape = (s_doc.get("heldout_summary") or {}).get("max_ape_pct")
     abi_check = s_doc.get("abi_rejection_check") or {}
-    abi_ok = bool(abi_check.get("ok", True))
+    abi_ok = bool(abi_check.get("ok", False))
     cliff_ok = (
-        bool(heldout_rows)
+        s_hmac_ok
+        and sku_match
+        and bool(s_doc.get("ok"))
+        and receipts_ok
         and not failing_rows
         and not missing_pts
         and abi_ok
         and max_ape is not None
-        and float(max_ape) < threshold_pct
+        and float(max_ape) < cap_threshold
+    )
+    cliff_detail = (
+        f"max_ape_pct={round(float(max_ape), DISPLAY_ROUND_DIGITS)};abi_ok={abi_ok}"
+        if cliff_ok and max_ape is not None
+        else (
+            "score_report_hmac_unverified_or_fabricated" if not s_hmac_ok
+            else ("score_report_sku_mismatch" if not sku_match
+                  else ("unverified_engine_receipt" if not receipts_ok
+                        else ("score_report_ok_false" if not s_doc.get("ok")
+                              else f"failing={len(failing_rows)};missing={len(missing_pts)};abi_ok={abi_ok}")))
+        )
     )
     gates.append(
         GateCheckOutcome(
             name="heldout_cliff_accuracy",
             passed=cliff_ok,
-            status="pass" if cliff_ok else ("insufficient_evidence" if (not heldout_rows or missing_pts) else "fail"),
-            detail=(
-                f"max_ape_pct={round(float(max_ape), DISPLAY_ROUND_DIGITS)};abi_ok={abi_ok}"
-                if max_ape is not None
-                else "missing_heldout_observations"
-            ),
+            status="pass" if cliff_ok else ("insufficient_evidence" if (s_hmac_ok and (not heldout_rows or missing_pts)) else "fail"),
+            detail=cliff_detail,
             metrics=(
                 ("heldout_count", len(heldout_rows)),
+                ("hmac_verified", s_hmac_ok),
                 ("failing_cliffs", len(failing_rows)),
                 ("missing_heldout_points", len(missing_pts)),
                 ("abi_rejection_ok", abi_ok),
                 ("max_ape_pct", max_ape),
-                ("threshold_pct", threshold_pct),
+                ("threshold_pct", cap_threshold),
             ),
         )
     )
@@ -331,10 +345,15 @@ def certify_operator(
         diagnosis_report = run_tail_cluster_diagnosis(
             heldout_rows,
             repo_root=root,
-            threshold_pct=threshold_pct,
+            threshold_pct=cap_threshold,
             output_path=diagnosis_out,
         )
 
+    expected_timings = {
+        str(r["case_id"]): (int(r["predicted_ns"]), int(r["measured_ns"]))
+        for r in heldout_rows
+        if r.get("case_id") and r.get("predicted_ns") and r.get("measured_ns")
+    }
     if isinstance(lean_bounds_json, (str, Path)):
         raw_lean = read_bounded_json(lean_bounds_json)
         lean_rows = raw_lean.get("bounds", raw_lean) if isinstance(raw_lean, Mapping) else raw_lean
@@ -344,13 +363,17 @@ def certify_operator(
         lean_rows,
         require_non_empty=True,
         verify_certificates=True,
+        expected_case_timings=expected_timings if expected_timings else None,
     )
+    if not expected_timings:
+        lean_ok = False
+        lean_violations = (*lean_violations, "lean_no_scored_heldout_cases_to_join")
     gates.append(
         GateCheckOutcome(
             name="lean_optimality_non_inversion",
             passed=lean_ok,
             status="pass" if lean_ok else "fail",
-            detail="0 inversions (witness verified)" if lean_ok else "; ".join(lean_violations),
+            detail="0 inversions (witness joined & verified)" if lean_ok else "; ".join(lean_violations),
             metrics=(("cases_checked", len(lean_checked)), ("violations", len(lean_violations))),
         )
     )
@@ -427,6 +450,8 @@ def run_operator_onboarding(
     require_sim_owner: bool = True,
     require_taxonomy: bool = True,
     require_profiler_builder: bool = True,
+    require_tiling_axes: bool = True,
+    require_mounted_refs: bool = False,
     run_repo_gates: bool = True,
     orthogonality_base: str | None = None,
     threshold_pct: float = DEFAULT_HELDOUT_APE_THRESHOLD_PCT,
@@ -434,9 +459,12 @@ def run_operator_onboarding(
     bench_dispatcher: Callable[[Mapping[str, Any], int], Sequence[Mapping[str, Any]]] | None = None,
     live_profiler: bool = False,
     endpoint_alias: str = "",
+    lease_acquirer: Callable[[str, int], AbstractContextManager[Mapping[str, Any]]] | None = None,
+    coordinator_bin: str = "",
     runner: EvaluationRunner | None = None,
 ) -> dict[str, Any]:
     """Execute all 4 New-Operator onboarding stages end-to-end."""
+    cap_threshold = validate_strict_threshold_pct(threshold_pct)
     base_out = Path(out_dir) if out_dir is not None else None
     stage1 = validate_operator_contract(
         target_path=target_path,
@@ -455,6 +483,8 @@ def run_operator_onboarding(
         require_sim_owner=require_sim_owner,
         require_taxonomy=require_taxonomy,
         require_profiler_builder=require_profiler_builder,
+        require_tiling_axes=require_tiling_axes,
+        require_mounted_refs=require_mounted_refs,
     )
     stage2 = generate_operator_cliff_plan(
         operator_id=operator_id,
@@ -477,8 +507,10 @@ def run_operator_onboarding(
         live_profiler=live_profiler,
         endpoint_alias=endpoint_alias,
         profiler_root=profiler_root,
+        lease_acquirer=lease_acquirer,
+        coordinator_bin=coordinator_bin,
         runner=runner,
-        threshold_pct=threshold_pct,
+        threshold_pct=cap_threshold,
         out_score=(base_out / "operator_score_report.json") if base_out else None,
     )
     stage4 = certify_operator(
@@ -488,7 +520,7 @@ def run_operator_onboarding(
         score_report=stage3,
         lean_bounds_json=lean_bounds_json,
         repo_root=repo_root,
-        threshold_pct=threshold_pct,
+        threshold_pct=cap_threshold,
         run_repo_gates=run_repo_gates,
         orthogonality_base=orthogonality_base,
         out_receipt=(base_out / "operator_onboarding_receipt.json") if base_out else None,
