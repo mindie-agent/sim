@@ -29,9 +29,6 @@ from .prediction.structure import parse_case
 MIB_BYTES = 1024 * 1024
 MAX_CLI_JSON_BYTES = 50 * MIB_BYTES
 DEFAULT_PD_DIES = 16
-DEFAULT_FIT_MBU = 0.80
-DEFAULT_FIT_CUBE_MFU = 0.75
-DEFAULT_FIT_VEC_MFU = 0.65
 
 
 class CliUsageError(RuntimeError):
@@ -275,8 +272,29 @@ def _dispatch_sdk(args: argparse.Namespace) -> object | None:
         )
         with PrimitiveStore(args.primitives) if args.primitives else nullcontext(None) as store:
             result = sdk_api.evaluate_three_tiers(
-                raw, req, target_eff=float(args.target_eff),
+                raw, req,
                 replay=replay, primitives=store,
+            )
+        return json_payload(result)
+    if cmd == "optimize":
+        raw = _case_with_supply(args)
+        req = StepRequest(
+            phase=args.phase,
+            tokens=args.tokens,
+            context=args.context,
+            sequences=args.sequences,
+            scope=args.scope,
+        )
+        replay = ReplayOptions(
+            isolated=bool(args.isolated),
+            event_limit=int(args.event_limit),
+        )
+        with PrimitiveStore(args.primitives) if args.primitives else nullcontext(None) as store:
+            result = sdk_api.optimize_ladder(
+                raw, req,
+                replay=replay, primitives=store,
+                stack_id=str(args.stack),
+                max_trials=int(args.max_trials),
             )
         return json_payload(result)
     return None
@@ -400,9 +418,6 @@ def _dispatch_sla(args: argparse.Namespace) -> object:
         phase=args.phase,
         scope=args.scope,
         output_budget=args.output_budget,
-        target_mbu=args.target_mbu,
-        target_cube_mfu=args.target_cube_mfu,
-        target_vec_mfu=args.target_vec_mfu,
         scenarios=scenarios,
         sensitivity=args.sensitivity,
         jobs=jobs,
@@ -592,31 +607,20 @@ def dispatch(args: argparse.Namespace, /) -> object:
     if cmd == "sweep":
         return _dispatch_sweep(args)
     if cmd == "efficiency":
-        from .prediction.efficiency import analyze_network_efficiency, fit_efficiency_targets
+        from .prediction.efficiency import analyze_network_efficiency, fit_case_roofline_regimes
         case_data = read_json(args.case)
-        if args.fit_targets or any(
-            v is not None for v in (
-                args.target_mbu, args.target_cube_mfu,
-                args.target_vec_mfu, args.target_link_util,
-            )
-        ):
-            fit_res = fit_efficiency_targets(
+        if args.fit_targets:
+            base = analyze_network_efficiency(
                 case_data, phase=args.phase, tokens=args.tokens,
                 context=args.context, sequences=args.sequences, scope=args.scope,
-                target_mbu=DEFAULT_FIT_MBU if args.target_mbu is None else args.target_mbu,
-                target_cube_mfu=(
-                    DEFAULT_FIT_CUBE_MFU if args.target_cube_mfu is None
-                    else args.target_cube_mfu
-                ),
-                target_vec_mfu=(
-                    DEFAULT_FIT_VEC_MFU if args.target_vec_mfu is None
-                    else args.target_vec_mfu
-                ),
-                target_link_util=args.target_link_util,
-                fixed_launch_us=args.fixed_launch_us,
-                mode=args.mode,
             )
-            return {**fit_res["baseline_analysis"], **fit_res, "schema": "mindie-sim.efficiency/1"}
+            regimes = fit_case_roofline_regimes(case_data, baseline_analysis=base)
+            return {
+                **base,
+                "baseline_analysis": base,
+                "fitted_roofline_regimes": regimes["fitted_regimes"],
+                "schema": "mindie-sim.efficiency/1",
+            }
         return analyze_network_efficiency(
             case_data, phase=args.phase, tokens=args.tokens,
             context=args.context, sequences=args.sequences, scope=args.scope,

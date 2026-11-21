@@ -23,7 +23,6 @@ from mindie_sim.compose import compose_case as _compose_case_dict
 from mindie_sim.prediction.primitives import PrimitiveStore
 from mindie_sim.prediction.results import (
     CaseInput,
-    DEFAULT_TARGET_EFFICIENCY,
     HardwareInput,
     ModelInput,
     ReplayOptions,
@@ -38,7 +37,7 @@ from mindie_sim.prediction.results import (
     ThreeTierEvaluation,
     TopologySweepResult,
 )
-from mindie_sim.prediction.spine import default_spine
+from mindie_sim.prediction.spine import DEFAULT_OPTIMIZE_TRIALS, default_spine
 from mindie_sim.prediction.streams import StreamPlan
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.case import Case
@@ -100,17 +99,38 @@ def evaluate_three_tiers(
     request: StepRequest,
     /,
     *,
-    target_eff: float = DEFAULT_TARGET_EFFICIENCY,
     replay: ReplayOptions = ReplayOptions(),
     primitives: PrimitiveStore | None = None,
 ) -> ThreeTierEvaluation:
-    """Evaluate ``unmerge``, ``mainline``, and ``should_achieve`` on ``runtime.Engine``."""
+    """Evaluate ``unmerge``, ``mainline``, and constructive ``should_achieve`` on ``runtime.Engine``."""
     return default_spine().evaluate_three_tiers(
         _to_case(case),
         request,
-        target_eff=target_eff,
         replay=replay,
         primitives=primitives,
+    )
+
+
+def optimize_ladder(
+    case: CaseInput,
+    request: StepRequest,
+    /,
+    *,
+    replay: ReplayOptions = ReplayOptions(),
+    primitives: PrimitiveStore | None = None,
+    primitive_table: Any = None,
+    stack_id: str = "cann93_va_main",
+    max_trials: int = DEFAULT_OPTIMIZE_TRIALS,
+) -> Any:
+    """Solve the certified 5-level primal-dual performance ladder for one step."""
+    return default_spine().optimize_ladder(
+        _to_case(case),
+        request,
+        replay=replay,
+        primitives=primitives,
+        primitive_table=primitive_table,
+        stack_id=stack_id,
+        max_trials=max_trials,
     )
 
 
@@ -163,6 +183,7 @@ __all__ = [
     "evaluate_step",
     "evaluate_three_tiers",
     "export_structure",
+    "optimize_ladder",
     "solve_sla",
     "sweep_topology",
 ]

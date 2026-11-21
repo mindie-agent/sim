@@ -1,8 +1,8 @@
 /-
   MindIESimSpec.RooflineAndMesh
-  Formal verification of Milestone M2 invariants:
-    1. Critical-path roofline monotonicity:
-       `0 ≤ Physical_Ideal_1x ≤ Target_Roofline_Eta ≤ Predicted`.
+  Formal verification of pure physical roofline & direct UB mesh invariants:
+    1. Critical-path roofline monotonicity (zero 0.80x target heuristic):
+       `0 ≤ Physical_Ideal_1x ≤ Predicted`.
     2. Direct `K_W` point-to-point UB mesh scaling:
        per-rank aggregate egress capacity equals `(W - 1) * bPeer`.
 -/
@@ -53,27 +53,23 @@ theorem criticalPath_mono (w₁ w₂ : Nat → Int) (hle : ∀ i, w₁ i ≤ w�
 def stepRooflineBound (cp pipeBound : Int) : Int :=
   max cp pipeBound
 
-/-- Core M2 Theorem 1: the target roofline lies between the 1.0x ideal and the
-    physical prediction whenever per-node and whole-device pipe bounds are
-    monotone. -/
-theorem ideal_le_target_le_predicted
-    (wIdeal wTarget wPred : Nat → Int)
-    (pipeIdeal pipeTarget tPred : Int)
+/-- Core physical roofline theorem: the 1.0x ideal roofline lower-bounds the
+    predicted step latency whenever per-node ideal bounds are nonnegative and
+    dominated by predicted weights and the whole-device pipe cut is dominated
+    by the predicted span. -/
+theorem physical_ideal_le_predicted
+    (wIdeal wPred : Nat → Int)
+    (pipeIdeal tPred : Int)
     (g : DagExpr)
     (hNonneg : ∀ i, 0 ≤ wIdeal i)
-    (hNode1  : ∀ i, wIdeal i ≤ wTarget i)
-    (hNode2  : ∀ i, wTarget i ≤ wPred i)
-    (hPipe1  : pipeIdeal ≤ pipeTarget)
-    (hPipe2  : pipeIdeal ≤ tPred)
+    (hNode   : ∀ i, wIdeal i ≤ wPred i)
+    (hPipe   : pipeIdeal ≤ tPred)
     (hPredCP : criticalPath wPred g ≤ tPred) :
-    let ideal1x   := stepRooflineBound (criticalPath wIdeal g) pipeIdeal
-    let targetEta := min tPred (stepRooflineBound (criticalPath wTarget g) pipeTarget)
-    0 ≤ ideal1x ∧ ideal1x ≤ targetEta ∧ targetEta ≤ tPred := by
+    let ideal1x := stepRooflineBound (criticalPath wIdeal g) pipeIdeal
+    0 ≤ ideal1x ∧ ideal1x ≤ tPred := by
   have hcp0 : 0 ≤ criticalPath wIdeal g := criticalPath_nonneg wIdeal hNonneg g
-  have hcp1 : criticalPath wIdeal g ≤ criticalPath wTarget g :=
-    criticalPath_mono wIdeal wTarget hNode1 g
-  have hcp2 : criticalPath wTarget g ≤ criticalPath wPred g :=
-    criticalPath_mono wTarget wPred hNode2 g
+  have hcp1 : criticalPath wIdeal g ≤ criticalPath wPred g :=
+    criticalPath_mono wIdeal wPred hNode g
   dsimp [stepRooflineBound]
   omega
 

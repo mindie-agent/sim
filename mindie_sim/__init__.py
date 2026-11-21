@@ -57,8 +57,6 @@ from .prediction.deepep import (
 from .prediction.efficiency import (
     analyze_network_efficiency,
     analyze_operator_row,
-    evaluate_target_efficiency,
-    fit_efficiency_targets,
     scale_case_hardware,
     solve_sla_sizing,
 )
@@ -111,7 +109,6 @@ __all__ = [
     "list_custom_hardware_skus", "load_custom_hardware_skus_from_file",
     "resolve_custom_hardware_sku", "compose_custom_case",
     "analyze_network_efficiency", "analyze_operator_row",
-    "evaluate_target_efficiency", "fit_efficiency_targets",
     "scale_case_hardware", "solve_sla_sizing",
     "deepep_group_volume", "deepep_intra_volume", "standard_alltoall_volume",
     "analyze_shared_expert_overlap", "OffloadPolicy",

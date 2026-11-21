@@ -25,7 +25,10 @@ class TiledPointwise:
     unit_role: str = "vector"
 
     def lower(self, context):
-        rows, cols = context.op.local_shape
+        shape = tuple(int(dim) for dim in context.op.local_shape)
+        if not shape:
+            raise ValueError("tiled_pointwise_empty_local_shape")
+        rows, cols = math.prod(shape[:-1]), shape[-1]
         names, rates = context.resource_names, context.rates
         units = context.resource_units.get(self.unit_role, context.core_count)
         row_iterations = math.ceil(rows / (units * self.tile_rows))

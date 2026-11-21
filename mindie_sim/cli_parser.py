@@ -20,7 +20,6 @@ from dataclasses import dataclass
 from .cli_options import add_runtime_arguments
 from .cli_sku import add_sku_commands
 from .feature_waterfall import DEFAULT_WATERFALL_CONTEXT, DEFAULT_WATERFALL_SEQUENCES
-from .prediction.results import DEFAULT_TARGET_EFFICIENCY
 
 DEFAULT_TRACE_LIMIT = 2
 DEFAULT_EVENT_LIMIT = 256
@@ -36,9 +35,7 @@ DEFAULT_OUTPUT_BUDGET = 1024
 DEFAULT_SWEEP_MAX_SEQUENCES = 256
 DEFAULT_EFF_CONTEXT = 4096
 DEFAULT_SLA_CONTEXT = 126000
-DEFAULT_TARGET_MBU = 0.80
-DEFAULT_TARGET_CUBE_MFU = 0.75
-DEFAULT_TARGET_VEC_MFU = 0.65
+DEFAULT_OPTIMIZE_MAX_TRIALS = 16
 BIND_PROFILER_MIN_POSITIONALS = 3
 
 _BOOLEAN_FLAGS = frozenset({
@@ -226,7 +223,7 @@ def _add_sdk_step_parsers(sub) -> None:
 
     pred_tiers = sub.add_parser(
         "predict-tiers",
-        help="evaluate unmerge / mainline / should_achieve via PredictionSpine",
+        help="evaluate unmerge / mainline / constructive should_achieve via PredictionSpine",
     )
     pred_tiers.add_argument("case")
     pred_tiers.add_argument("--phase", choices=("prefill", "decode"), default="decode")
@@ -234,12 +231,29 @@ def _add_sdk_step_parsers(sub) -> None:
     pred_tiers.add_argument("--context", type=int, default=0)
     pred_tiers.add_argument("--sequences", type=int, default=1)
     pred_tiers.add_argument("--scope", choices=("body", "model"), default="body")
-    pred_tiers.add_argument("--target-eff", type=float, default=DEFAULT_TARGET_EFFICIENCY)
     pred_tiers.add_argument("--isolated", action="store_true")
     pred_tiers.add_argument("--event-limit", type=int, default=0)
     pred_tiers.add_argument("--primitives")
     _add_supply_arguments(pred_tiers)
     pred_tiers.add_argument("--output", "-o")
+
+    opt = sub.add_parser(
+        "optimize",
+        help="solve the certified 5-level primal-dual optimization ladder",
+    )
+    opt.add_argument("case")
+    opt.add_argument("--phase", choices=("prefill", "decode"), default="decode")
+    opt.add_argument("--tokens", type=int, default=1)
+    opt.add_argument("--context", type=int, default=0)
+    opt.add_argument("--sequences", type=int, default=1)
+    opt.add_argument("--scope", choices=("body", "model"), default="body")
+    opt.add_argument("--stack", default="cann93_va_main")
+    opt.add_argument("--max-trials", type=int, default=DEFAULT_OPTIMIZE_MAX_TRIALS)
+    opt.add_argument("--isolated", action="store_true")
+    opt.add_argument("--event-limit", type=int, default=0)
+    opt.add_argument("--primitives")
+    _add_supply_arguments(opt)
+    opt.add_argument("--output", "-o")
 
 
 def build_parser(*, prog: str = "mindie-sim") -> argparse.ArgumentParser:
@@ -475,17 +489,13 @@ def build_parser(*, prog: str = "mindie-sim") -> argparse.ArgumentParser:
     sweep.add_argument("--hardware-derivations", default=None,
                        help="JSON file with named derivation records")
 
-    eff = sub.add_parser("efficiency", help="operator-level MBU/MFU decomposition and roofline target evaluation")
+    eff = sub.add_parser("efficiency", help="operator-level MBU/MFU decomposition and physical roofline analysis")
     eff.add_argument("case")
     eff.add_argument("--phase", choices=("decode", "prefill"), default="decode")
     eff.add_argument("--tokens", type=int, default=1)
     eff.add_argument("--context", type=int, default=DEFAULT_EFF_CONTEXT)
     eff.add_argument("--sequences", type=int, default=1)
     eff.add_argument("--scope", choices=("body", "model"), default="body")
-    for flag in ("--target-mbu", "--target-cube-mfu", "--target-vec-mfu",
-                 "--target-link-util", "--fixed-launch-us"):
-        eff.add_argument(flag, type=float)
-    eff.add_argument("--mode", choices=("clamp_to_target", "exact_target"), default="clamp_to_target")
     eff.add_argument("--fit-targets", action="store_true")
     eff.add_argument("--observed-durations")
     eff.add_argument("--pmu")
@@ -502,9 +512,6 @@ def build_parser(*, prog: str = "mindie-sim") -> argparse.ArgumentParser:
     sla.add_argument("--emitted-tokens-per-seq", type=float)
     sla.add_argument("--max-sequences-per-dp", type=int, default=DEFAULT_SWEEP_MAX_SEQUENCES)
     sla.add_argument("--output-budget", type=int, default=DEFAULT_OUTPUT_BUDGET)
-    sla.add_argument("--target-mbu", type=float, default=DEFAULT_TARGET_MBU)
-    sla.add_argument("--target-cube-mfu", type=float, default=DEFAULT_TARGET_CUBE_MFU)
-    sla.add_argument("--target-vec-mfu", type=float, default=DEFAULT_TARGET_VEC_MFU)
     for flag in ("--hbm-bw-scale", "--cube-flops-scale", "--vector-ops-scale",
                  "--link-bw-scale", "--hbm-capacity-scale"):
         sla.add_argument(flag, type=float)

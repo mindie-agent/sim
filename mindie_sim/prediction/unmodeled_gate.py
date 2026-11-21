@@ -26,7 +26,7 @@ ONBOARDING_SCHEMA = "mindie-unmodeled-structure-hint/1"
 HINT_KEYS = "unmodeled_structure_onboarding_hints"
 TIMING_ENTRIES = (
     "predict", "operator_costs", "graph_costs", "execution_prepare",
-    "evaluate_target_efficiency", "analyze_network_efficiency",
+    "analyze_network_efficiency",
     "solve_sla_sizing", "sweep_topologies", "sweep_engine",
 )
 _AGENT_DIRECTIVE = (
@@ -226,7 +226,7 @@ def _affected_results(entry: str) -> tuple[str, ...]:
         return ("latency", "throughput", "metrics")
     if entry in {"operator_costs", "graph_costs"}:
         return ("latency", "operator_timeline")
-    if entry in {"evaluate_target_efficiency", "analyze_network_efficiency"}:
+    if entry == "analyze_network_efficiency":
         return ("mbu", "mfu", "efficiency", "roofline")
     if entry == "solve_sla_sizing":
         return ("sla_concurrency", "throughput")

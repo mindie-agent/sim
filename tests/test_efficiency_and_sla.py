@@ -21,10 +21,8 @@ from mindie_sim.prediction.efficiency import (
     _vram_max_sequences_per_dp,
     analyze_network_efficiency,
     analyze_operator_row,
-    evaluate_target_efficiency,
     extract_hardware_peaks,
     fit_case_roofline_regimes,
-    fit_efficiency_targets,
     scale_case_hardware,
     solve_sla_sizing,
 )
@@ -267,74 +265,6 @@ def test_heterogeneous_dies_and_undeclared_precision_error():
         analyze_operator_row(bad_dtype_row, het_case, peaks=peaks)
 
 
-def test_inclusive_target_efficiency_and_minimum_ms_floor():
-    """Verify 0.80 target MBU solves for inclusive 0.80 MBU and respects kernel minimum_ms floor."""
-    case = parse_case(_make_representative_moe_case())
-    peaks = extract_hardware_peaks(case)
-    hbm_peak = peaks["hbm_peak_bytes_per_s"]
-
-    # Operator with 8ms ideal HBM, 2ms startup, 16ms actual duration -> at 0.80 target MBU, target_duration_ms == 10.0ms
-    op_report = {
-        "operators": [
-            {
-                "physical_id": "op_mem_8ms",
-                "occurrences": 1,
-                "program": "ResourceEnvelope",
-                "duration_ms": 16.0,
-                "total_ms": 16.0,
-                "basis": {"invocation_models": [{"startup_ms": 2.0, "minimum_ms": 0.0}]},
-                "operator": {
-                    "op_id": "l0.mem_heavy",
-                    "family": "attention",
-                    "recipe": "paged_attention",
-                    "phase": "decode",
-                    "stage": 0,
-                    "layer": 0,
-                    "dtype": "bf16",
-                    "flops": 0.0,
-                    "vector_ops": 0.0,
-                    "hbm_bytes": 8.0 * 1e-3 * hbm_peak,
-                    "link_bytes": 0.0,
-                },
-            },
-            {
-                "physical_id": "op_min_floor",
-                "occurrences": 1,
-                "program": "ResourceEnvelope",
-                "duration_ms": 12.0,
-                "total_ms": 12.0,
-                "basis": {"invocation_models": [{"startup_ms": 0.1, "minimum_ms": 10.0}]},
-                "operator": {
-                    "op_id": "l0.min_bounded",
-                    "family": "norm",
-                    "recipe": "rmsnorm",
-                    "phase": "decode",
-                    "stage": 0,
-                    "layer": 0,
-                    "dtype": "bf16",
-                    "flops": 0.0,
-                    "vector_ops": 0.0,
-                    "hbm_bytes": 0.5 * 1e-3 * hbm_peak,
-                    "link_bytes": 0.0,
-                },
-            },
-        ]
-    }
-    base = analyze_network_efficiency(
-        case, phase="decode", tokens=1, context=4096, sequences=1,
-        operator_report=op_report, graph_report={"duration_ms": 28.0},
-    )
-    ev = evaluate_target_efficiency(
-        case, phase="decode", tokens=1, context=4096, sequences=1,
-        target_mbu=0.80, baseline_analysis=base,
-    )
-    by_id = {o["op_id"]: o for o in ev["operators"]}
-    assert math.isclose(by_id["l0.mem_heavy"]["target_duration_ms"], 10.0, rel_tol=1e-9)
-    assert math.isclose(by_id["l0.mem_heavy"]["target_mbu"], 0.80, rel_tol=1e-9)
-    assert math.isclose(by_id["l0.mem_heavy"]["service_only_target_mbu"], 1.0, rel_tol=1e-9)
-    assert math.isclose(by_id["l0.min_bounded"]["target_duration_ms"], 10.0, rel_tol=1e-9)
-
-
 def test_parallel_graph_roofline_efficiency_and_fit_signature_distinctness():
     """Verify stage-capacity network_roofline_efficiency <= 1.0 on parallel branches and distinct fit keys."""
     case = parse_case(_make_representative_moe_case())
@@ -493,7 +423,6 @@ def test_sla_solver_exact_threshold_and_speculative_tokens():
             {"id": "2x_hbm", "label": "2x HBM", "hbm_bw_scale": 2.0},
             {"id": "baseline", "label": "1x Baseline", "hbm_bw_scale": 1.0},
             {"id": "2x_compute", "label": "2x Compute", "cube_flops_scale": 2.0, "vector_ops_scale": 2.0},
-            {"id": "target_0.8x_mbu", "label": "Target 0.8x MBU", "target_mbu": 0.80},
         ],
     )
     by_id = {row["scenario_id"]: row for row in sla_report["scenarios"]}
@@ -545,7 +474,5 @@ def test_sla_solver_exact_threshold_and_speculative_tokens():
         solve_sla_sizing(case_ml, sla_ms=0.0)
     with pytest.raises(ValueError):
         scale_case_hardware(case_ml, hbm_bw_scale=-1.0)
-    with pytest.raises(ValueError):
-        evaluate_target_efficiency(case_ml, target_mbu=1.5)
     with pytest.raises(ValueError):
         analyze_network_efficiency(case_ml, tokens=0)

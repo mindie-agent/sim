@@ -27,7 +27,7 @@ import pytest
 from mindie_sim import compose_case, operator_costs, predict, target_graphs, target_operators
 from mindie_sim.model_catalog import list_models
 from mindie_sim.prediction.efficiency import (
-    evaluate_target_efficiency, solve_sla_sizing,
+    analyze_network_efficiency, solve_sla_sizing,
 )
 from mindie_sim.prediction.matrix_steady import SteadyMatmul
 from mindie_sim.prediction.physical_key import physical_key
@@ -124,7 +124,7 @@ def _synthetic_unmodeled_case() -> dict:
 
 
 @pytest.mark.parametrize("entry", [
-    "predict", "operator_costs", "evaluate_target_efficiency", "solve_sla_sizing",
+    "predict", "operator_costs", "analyze_network_efficiency", "solve_sla_sizing",
 ])
 def test_timing_entries_refuse_an_unmodeled_attention_core(entry):
     raw = _synthetic_unmodeled_case()
@@ -132,7 +132,7 @@ def test_timing_entries_refuse_an_unmodeled_attention_core(entry):
         "predict": lambda: predict(raw),
         "operator_costs": lambda: operator_costs(
             raw, target_operators(raw, phase="prefill", tokens=3)),
-        "evaluate_target_efficiency": lambda: evaluate_target_efficiency(
+        "analyze_network_efficiency": lambda: analyze_network_efficiency(
             raw, phase="prefill", tokens=3),
         "solve_sla_sizing": lambda: solve_sla_sizing(raw, sla_ms=100),
     }

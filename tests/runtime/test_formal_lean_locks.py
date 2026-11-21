@@ -1,96 +1,66 @@
-"""Tier-0 live correspondence locks for all 6 Lean 4 formal specification modules.
+"""Differential locks for the seven Lean specification modules.
 
-[Role]
-  Audit the Lean 4 formal verification kernel (`formal/MindIESimSpec/*.lean`
-  and `formal/AxiomCheck.lean`) for 6-module coverage and zero escape tokens
-  (`sorry`, `sorryAx`, `admit`, custom `axiom`), and differentially lock all
-  six formal theorem modules directly against live `mindie_sim` runtime,
-  catalog, collective, roofline, and interconnect modules.
-
-[Invariants]
-  * Pure in-memory Tier-0 execution (`< 2.0s`); never spawns `lake`, never
-    mutates host env vars, and uses zero mocks.
-  * Covers all 6 `.lean` modules: `FourClock`, `PrefetchAndLedger`,
-    `ShardingAndLayout`, `RecoverSSM` (all 7 linear families),
-    `AllToAllRounds`, and `RooflineAndMesh`.
-
-[Timeouts & Locks]
-  Deterministic seeded PRNG; zero locks.
-
-[Side-Effect Policy]
-  Read-only inspection of `formal/` files and pure in-memory module calls;
-  zero filesystem or environment mutation.
+[Role] Audit the formal kernel and compare its theorem domains with live simulation.
+[Invariants] The source audit allows no proof escapes. Seeded oracles use exact
+  arithmetic where the formal contracts do.
+[Timeouts & Locks] Bounded in-memory trials with no subprocesses or locks.
+[Side-Effect Policy] Read-only Lean source inspection and analytical simulation.
 """
 from __future__ import annotations
 
+from dataclasses import replace
+from fractions import Fraction
 import math
 from pathlib import Path
 import random
 import re
+from statistics import median
 from types import SimpleNamespace
 
 import pytest
 
+from _support.axes import REPRESENTATIVE_SKUS
+from mindie_sim.api import optimize_ladder
 from mindie_sim.catalog.cache_pools import LINEAR_ATTENTION_KINDS as POOL_LINEAR_KINDS
 from mindie_sim.catalog.expert_slots import expert_slot_plan, routed_expert_weight_terms
 from mindie_sim.catalog.ops import gemm_op
 from mindie_sim.catalog.projection_placement import (
-    ROLE_ATTENTION_OUTPUT,
-    ROLE_LINEAR_INPUT,
-    ROLE_LOGITS,
-    placed_weight_shape,
+    ROLE_ATTENTION_OUTPUT, ROLE_LINEAR_INPUT, ROLE_LOGITS, placed_weight_shape,
 )
 from mindie_sim.catalog.speculative_state import (
-    LINEAR_ATTENTION_KINDS as SPEC_LINEAR_KINDS,
-    MODE_CHECKPOINT,
-    MODE_REPLAY,
-    MODE_SINGLE,
-    record_head_bytes,
-    speculative_state_plan,
+    LINEAR_ATTENTION_KINDS as SPEC_LINEAR_KINDS, MODE_CHECKPOINT, MODE_REPLAY, MODE_SINGLE,
+    record_head_bytes, speculative_state_plan,
 )
 from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.catalog.weight_terms import WeightTerm, _ceil_div, _sharded_shape, term_bytes
 from mindie_sim.compose import compose_case
+from mindie_sim.optimization import (
+    BilinearContractionSpec, DagEdge, EventDagSpec, PrimitiveCapacityEntry, PrimitiveCapacityTable,
+    ResourceChoiceProgram, build_surplus_coupling_sites, certify_lower_bound, check_farkas_dual,
+    check_optimality_certificate, direct_mac_pebble_reload_bound, eval_checked_path,
+    inward_floor_ns, solve_checked_critical_path, solve_farkas_dual, verify_epoch_trace,
+)
 from mindie_sim.prediction.collective_startup import resolve_collective_startup, validate_steps
-from mindie_sim.prediction.efficiency import evaluate_target_efficiency, extract_hardware_peaks
+from mindie_sim.prediction.efficiency import extract_hardware_peaks
 from mindie_sim.prediction.expert_slot_work import physical_slot_work
 from mindie_sim.prediction.exposed_breakdown import (
-    ExposedClocks,
-    advance_clocks,
-    finish_breakdown,
-    join_clocks as prod_join_clocks,
-    roofline_clocks,
+    ExposedClocks, advance_clocks, finish_breakdown, join_clocks as prod_join_clocks, roofline_clocks,
 )
 from mindie_sim.prediction.fusion_graph import OpNode, TensorValue, TypedGraph
 from mindie_sim.prediction.local_projection_tp import lower_local_projection_tp
 from mindie_sim.prediction.recover_ssm_commit import bind_recover_ssm_commits
-from mindie_sim.prediction.recover_ssm_work import (
-    FP32_RECORD_BYTES,
-    emit_commit_op,
-    gdn_record_head_bytes,
-)
+from mindie_sim.prediction.recover_ssm_work import FP32_RECORD_BYTES, emit_commit_op, gdn_record_head_bytes
 from mindie_sim.prediction.roofline_graph import (
-    PhysicalWorkGraph,
-    PhysicalWorkNode,
-    RooflineTargets,
-    critical_path_roofline,
+    PhysicalWorkGraph, PhysicalWorkNode, RooflineTargets, critical_path_roofline,
 )
 from mindie_sim.prediction.runtime.contracts import (
-    AllocationBinding,
-    AllocationKey,
-    BackingKey,
-    EventKey,
-    OccurrenceKey,
-    PoolKey,
+    AllocationBinding, AllocationKey, BackingKey, EventKey, OccurrenceKey, PoolKey,
 )
+from mindie_sim.prediction.results import StepRequest
 from mindie_sim.prediction.runtime.ledger import Ledger, normalise_ranges, ranges_bytes
+from mindie_sim.prediction.runtime.memory_physics import AddressRun
 from mindie_sim.prediction.structure import parse_case
-from mindie_sim.prediction.weight_prefetch import (
-    PrefetchDecision,
-    PrefetchPhysics,
-    apply_to_work,
-    plan_prefetch,
-)
+from mindie_sim.prediction.weight_prefetch import PrefetchDecision, PrefetchPhysics, apply_to_work, plan_prefetch
 from mindie_sim.schema.case import Software
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.model import LayerPlan
@@ -103,15 +73,11 @@ pytestmark = pytest.mark.tier0
 REPO_ROOT = Path(__file__).resolve().parents[2]
 FORMAL_DIR = REPO_ROOT / "formal"
 EXPECTED_LEAN_MODULES = (
-    "FourClock.lean",
-    "PrefetchAndLedger.lean",
-    "ShardingAndLayout.lean",
-    "RecoverSSM.lean",
-    "AllToAllRounds.lean",
-    "RooflineAndMesh.lean",
+    "FourClock.lean", "PrefetchAndLedger.lean", "ShardingAndLayout.lean",
+    "RecoverSSM.lean", "AllToAllRounds.lean", "RooflineAndMesh.lean", "OptimalityCertificate.lean",
 )
 SEED = 20261115
-TRIALS = 200
+TRIALS = 250
 
 
 def _strip_lean_comments_and_strings(src: str) -> str:
@@ -152,8 +118,11 @@ def test_formal_kernel_structure_and_zero_sorry_audit() -> None:
         (FORMAL_DIR / "AxiomCheck.lean").read_text(encoding="utf-8")
     )
     assert "import MindIESimSpec" in axiom_check
-    assert "MindIESimSpec.RooflineAndMesh.ideal_le_target_le_predicted" in axiom_check
-    assert "MindIESimSpec.RooflineAndMesh.kMesh_capacity_partition" in axiom_check
+    for name in ("physical_ideal_le_predicted", "kMesh_capacity_partition"):
+        assert f"#print axioms MindIESimSpec.RooflineAndMesh.{name}\n" in axiom_check
+    for name in ("farkas_dual_le_any_feasible_schedule", "epoch_bilinear_pair_cap", "capacity_reload_trace_bound",
+                 "max_plus_critical_path_bound", "certified_ladder_chain"):
+        assert f"#print axioms MindIESimSpec.OptimalityCertificate.{name}\n" in axiom_check
 
     forbidden_re = re.compile(r"\b(?:sorry|sorryAx|admit|axiom)\b")
     theorem_re = re.compile(r"\btheorem\s+[A-Za-z0-9_']+")
@@ -172,7 +141,7 @@ def test_formal_kernel_structure_and_zero_sorry_audit() -> None:
         count = len(theorem_re.findall(cleaned))
         assert count >= 4, f"expected >=4 theorems in {mod_name}, found {count}"
         total_theorems += count
-    assert total_theorems >= 35
+    assert total_theorems >= 45
 
     for lean_path in sorted(FORMAL_DIR.rglob("*.lean")):
         cleaned = _strip_lean_comments_and_strings(lean_path.read_text(encoding="utf-8"))
@@ -520,46 +489,6 @@ def test_alltoall_round_scaling_and_step_bounds_against_collective_startup() -> 
 
 
 def test_roofline_critical_path_monotonicity_and_direct_mesh_scaling() -> None:
-    # 1. Production efficiency.evaluate_target_efficiency clamp_to_target lock:
-    #    ideal=4, pred=6, raw_target=8 -> bounded target=6 (0 <= ideal <= target <= predicted).
-    case = parse_case(compose_case("qwen3-32b", "Ascend910_9362", tp=4, dp=1, ep=1, layers=1))
-    synthetic_base = {
-        "schema": "mindie-sim.efficiency/1",
-        "geometry": {"phase": "decode", "tokens": 1, "context": 64, "sequences": 1, "scope": "body"},
-        "operator_sum_ms": 6.0, "graph_duration_ms": 6.0,
-        "total_hbm_ideal_ms": 4.0, "total_cube_ideal_ms": 0.0,
-        "total_vec_ideal_ms": 0.0, "total_roofline_ideal_ms": 4.0,
-        "network_mbu": 4.0 / 6.0, "network_cube_mfu": 0.0, "network_vec_mfu": 0.0,
-        "network_link_util": 0.0, "network_roofline_efficiency": 4.0 / 6.0,
-        "operators": [{
-            "op_id": "op0", "physical_id": "op0", "family": "gemm", "recipe": "matmul",
-            "operator_kind": "compute", "occurrences": 1,
-            "flops": 0.0, "vector_ops": 0.0, "hbm_bytes": 4.0e9, "link_bytes": 0.0,
-            "t_cube_ideal_ms": 0.0, "t_vec_ideal_ms": 0.0, "t_hbm_ideal_ms": 4.0, "t_link_ideal_ms": 0.0,
-            "roofline_ideal_ms": 4.0, "fixed_ms": 0.0, "minimum_ms": 0.0,
-            "duration_ms": 6.0, "total_ms": 6.0,
-            "mbu": 4.0 / 6.0, "cube_mfu": 0.0, "vec_mfu": 0.0,
-        }],
-    }
-    clamped = evaluate_target_efficiency(
-        case, phase="decode", tokens=1, context=64, sequences=1, scope="body",
-        target_mbu=0.5, mode="clamp_to_target", baseline_analysis=synthetic_base,
-    )
-    assert clamped["physical_ideal_ms"] == pytest.approx(4.0)
-    assert clamped["raw_target_duration_ms"] == pytest.approx(8.0)
-    assert clamped["target_step_duration_ms"] == pytest.approx(6.0)
-    assert clamped["operators"][0]["raw_target_duration_ms"] == pytest.approx(8.0)
-    assert clamped["operators"][0]["target_duration_ms"] == pytest.approx(6.0)
-    assert 0.0 <= clamped["physical_ideal_ms"] <= clamped["target_step_duration_ms"] <= clamped["current_step_duration_ms"]
-
-    interior = evaluate_target_efficiency(
-        case, phase="decode", tokens=1, context=64, sequences=1, scope="body",
-        target_mbu=0.8, mode="clamp_to_target", baseline_analysis=synthetic_base,
-    )
-    assert interior["target_step_duration_ms"] == pytest.approx(5.0)
-    assert 0.0 <= interior["physical_ideal_ms"] <= interior["target_step_duration_ms"] <= interior["current_step_duration_ms"]
-
-    # 2. Randomized DAG critical-path roofline monotonicity.
     rng = random.Random(SEED + 5)
     for _ in range(TRIALS):
         n_nodes = rng.randint(2, 10)
@@ -573,22 +502,99 @@ def test_roofline_critical_path_monotonicity_and_direct_mesh_scaling() -> None:
             for idx in range(n_nodes)
         )
         graph = PhysicalWorkGraph(nodes=nodes)
-        lo = RooflineTargets(cube=rng.uniform(0.35, 0.70), vector=rng.uniform(0.35, 0.70), hbm=rng.uniform(0.35, 0.70), link=rng.uniform(0.35, 0.70))
-        hi = RooflineTargets(cube=min(1.0, lo.cube + 0.25), vector=min(1.0, lo.vector + 0.25), hbm=min(1.0, lo.hbm + 0.25), link=min(1.0, lo.link + 0.25))
-        res_hi, res_lo = critical_path_roofline(graph, hi), critical_path_roofline(graph, lo)
-        assert 0.0 <= res_hi.physical_ideal_ms <= res_hi.target_duration_ms <= res_lo.target_duration_ms + 1e-9
+        result = critical_path_roofline(graph, RooflineTargets())
+        predicted = sum(max(n.cube_ms, n.vector_ms, n.hbm_ms, n.link_ms) for n in nodes)
+        assert 0 <= result.physical_ideal_ms == result.target_duration_ms <= predicted
 
-    # 3. Direct K_W mesh scaling on calibrated per_pair UB fabric: (W - 1) * b_peer.
-    mesh_sku = "Ascend950DT_9581"
-    b_peer_per_rank: dict[int, float] = {}
     for width in (2, 4, 8):
-        parsed = parse_case(compose_case("qwen3-32b", mesh_sku, tp=width, dp=1, ep=1, layers=1))
-        peaks = extract_hardware_peaks(parsed)
-        intra_links = [lnk for lnk in parsed.machine.links if lnk.semantics == "per_pair"]
-        assert intra_links
-        b_peer = intra_links[0].capacity_bytes_per_ms * 1000.0
-        expected_per_rank = (width - 1) * b_peer
-        assert peaks["link_peak_bytes_per_s"] == pytest.approx(expected_per_rank, rel=1e-9)
-        assert width * (width - 1) * b_peer == pytest.approx(width * expected_per_rank, rel=1e-9)
-        b_peer_per_rank[width] = expected_per_rank / b_peer
-    assert b_peer_per_rank == {2: pytest.approx(1.0), 4: pytest.approx(3.0), 8: pytest.approx(7.0)}
+        case = compose_case("qwen3-32b", REPRESENTATIVE_SKUS["a5"], tp=width, dp=1, ep=1, layers=1)
+        parsed = parse_case(case)
+        peers = [link for link in parsed.machine.links if link.semantics == "per_pair"]
+        assert peers
+        b_peer = peers[0].capacity_bytes_per_ms * 1000
+        assert extract_hardware_peaks(parsed)["link_peak_bytes_per_s"] == pytest.approx((width - 1) * b_peer)
+
+
+def test_optimality_certificate_differential_zero_inversions() -> None:
+    rng = random.Random(SEED + 6)
+    solve_ms = []
+    for trial in range(TRIALS):
+        dimensions = rng.randint(1, 4)
+        def work():
+            return tuple(rng.randint(0, 50) for _ in range(dimensions))
+        sites = tuple(tuple(work() for _ in range(rng.randint(2, 4))) for _ in range(rng.randint(1, 5)))
+        zero = (0,) * dimensions
+        program = (ResourceChoiceProgram(dimensions, zero, tuple((zero, *modes) for modes in sites))
+                   if trial % 25 == 0 else ResourceChoiceProgram(dimensions, work(), sites))
+        farkas, report = solve_farkas_dual(program)
+        solve_ms.append(report.solve_ms)
+        assert check_farkas_dual(program, farkas) is True
+        if trial % 25 == 0:
+            assert farkas.lower_bound_ns == report.lp_optimum_ns == 0
+        mixtures = []
+        for modes in program.site_modes:
+            weights = [rng.randint(1, 8) for _ in modes]
+            mixtures.append(tuple(Fraction(sum(a * b for a, b in zip(weights, column)), sum(weights))
+                                  for column in zip(*modes)))
+        mixture_wall_ns = max(map(sum, zip(program.global_work, *mixtures)))
+        assert farkas.lower_bound_ns <= mixture_wall_ns, trial
+
+        bits_a, bits_b = rng.choice((4, 8, 16)), rng.choice((4, 8, 16))
+        capacity = rng.randint(128, 256)
+        a = rng.randint(0, 8 * capacity // bits_a)
+        b = (8 * capacity - a * bits_a) // bits_b
+        assert 4 * bits_a * bits_b * a * b <= (8 * capacity) ** 2
+        spec = BilinearContractionSpec("contract", 0, rng.randint(72, 96), rng.randint(72, 96),
+                                       rng.randint(4, 8), bits_a, bits_b, 32, capacity, distinct_operands=True)
+        reload = direct_mac_pebble_reload_bound(spec)
+        assert reload.eligible and reload.epochs > 1
+        assert verify_epoch_trace(reload.epoch_accounts, reload.total_pairs) is True
+        assert reload.total_pairs == spec.m * spec.n
+        assert 0 < reload.min_io_bits <= spec.m * spec.n * (spec.k_red * (bits_a + bits_b) + 32)
+        site, = build_surplus_coupling_sites({}, (reload,), alpha_rw=Fraction(1, 2))
+        size = Fraction(reload.min_io_bytes)
+        assert dict(site.modes) == {
+            "mode_surplus_read": (("hbm_bus_r@d0", size), ("hbm_bus_w@d0", size / 2), ("mte2_total@d0", size)),
+            "mode_surplus_write": (("hbm_bus_r@d0", size / 2), ("hbm_bus_w@d0", size), ("write_total@d0", size)),
+        }
+
+        quanta = tuple(rng.randint(1, 50) for _ in range(rng.randint(3, 9)))
+        edges = [DagEdge(i, j, rng.randint(0, 20)) for j in range(1, len(quanta))
+                 for i in range(j) if i == j - 1 or rng.random() < 0.4]
+        rng.shuffle(edges)
+        dag = EventDagSpec(quanta, tuple(edges))
+        expected = []
+        for j, quantum in enumerate(quanta):
+            expected.append(quantum + max((expected[e.src] + e.wire_ns for e in edges if e.dst == j), default=0))
+        path, sink, longest = solve_checked_critical_path(dag)
+        assert eval_checked_path(dag, path, sink) == longest == max(expected)
+        assert eval_checked_path(dag, (*path, len(edges)), sink) is None
+        assert eval_checked_path(dag, (path[-1], path[-1]), sink) is None
+        cert, _ = certify_lower_bound(program, dag)
+        assert check_optimality_certificate(program, dag, cert) is True
+        assert cert.l_star_lean_ns == max(farkas.lower_bound_ns, longest)
+    assert median(solve_ms) < 5.0
+
+    for kind in ("gdn", "kda"):
+        rank_one = direct_mac_pebble_reload_bound(replace(spec, kind=kind))
+        assert (rank_one.eligible, rank_one.min_io_bytes) == (False, 0)
+    run = AddressRun(base_byte=13, rows=4097, row_bytes=39, stride_bytes=101)
+    sectors = {address // 32 for row in range(run.rows)
+               for address in range(13 + 101 * row, 52 + 101 * row)}
+    assert run.sector_union_bytes(32) == 32 * len(sectors) < run.rows * run.stride_bytes
+    for ns in (2**52, 2**53, 2**54):
+        guard = ns - inward_floor_ns(Fraction(ns)) - 2
+        assert guard == 8 * math.ulp(float(ns)) >= 4 * math.ulp(float(ns))
+    assert inward_floor_ns(Fraction(1, 2)) == 0
+
+    sku = REPRESENTATIVE_SKUS["a5"]
+    case = compose_case("qwen3-32b", sku, tp=1, dp=1, layers=1)
+    sim_rate = dict(parse_case(case).machine.dies[0].rates)["hbm"]
+    table = PrimitiveCapacityTable(sku, tuple(PrimitiveCapacityEntry(pipe, sim_rate, 2 * sim_rate, "B/s")
+                                             for pipe in ("hbm_bus_r", "hbm_bus_w")))
+    ladder = optimize_ladder(case, StepRequest("decode", context=64), primitive_table=table, max_trials=0).ladder
+    assert 0 < ladder.l_star_hw_ns <= ladder.l_star_lean_ns <= ladder.a_star_dsl_ns
+    assert ladder.a_star_dsl_ns <= ladder.a_star_framework_ns <= min(ladder.m_mainline_ns, ladder.u_unmerge_ns)
+    assert ladder.u_unmerge_ns - ladder.l_star_lean_ns == sum((
+        ladder.delta_shipping_ns, ladder.delta_framework_ns, ladder.delta_operator_dsl_ns, ladder.delta_optimality_gap_ns,
+    ))
