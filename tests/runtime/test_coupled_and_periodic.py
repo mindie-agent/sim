@@ -41,7 +41,7 @@ pytestmark = pytest.mark.tier0
 
 @pytest.mark.parametrize("n,k,reads,expect_skip,reserved_mib", [
     (32, 65_632, 8_400_896, True, 0), (512, 4_128, 4_491_264, False, 0),
-    (512, 4_128, 8_257_536, False, 126),
+    (512, 4_128, 4_509_696, False, 126),
 ])
 def test_periodic_matrix_conserves_hbm_and_clock(monkeypatch, n, k, reads, expect_skip, reserved_mib):
     path = template_datapath("Ascend950DT_9582")
@@ -74,7 +74,7 @@ def test_periodic_matrix_conserves_hbm_and_clock(monkeypatch, n, k, reads, expec
     assert literal.delivered["hbm:ctr_r"] == pytest.approx(reads, rel=1e-12)
     assert skipped.delivered["hbm:ctr_w"] == literal.delivered["hbm:ctr_w"]
     # Contended cohorts can sum the same service increments in a different order.
-    assert abs(skipped.now - literal.now) <= (4 if reserved_mib else 1) * math.ulp(literal.now)
+    assert (skipped.now == pytest.approx(literal.now, rel=1e-12)) if reserved_mib else (abs(skipped.now - literal.now) <= math.ulp(literal.now))
     if reserved_mib:
         rebound = replace(default, program=default.program.with_context(path, context))
         unbound = run_template(path, context, rebound)

@@ -635,19 +635,23 @@ def _lower_periodic_wave(
     tiles: tuple[Any, ...], spec, p, datapath, low, plan: Lowering,
     admit, resource_work: Counter[str], cube_dt: str, die: int, has_ctx: bool,
 ) -> tuple[tuple[_CohortWaveSpec, ...], int]:
-    """Bind each tile's panels and output in literal emission order before grouping."""
+    """Bind each wave's panels in canonical topological ring-depth order before grouping."""
     periods = _CANDIDATE_PAIR_PERIODS_MC1 if ceil_div(low.tk, low.micro_k) == 1 else _CANDIDATE_PAIR_PERIODS
     total_micros = _count_wave_compute(tiles, spec, p, datapath, low, plan, resource_work, cube_dt)
+    encoders = [_PanelPhases(periods) for _ in tiles]
+    for group_start in range(0, low.gk, _PAIR_DEPTH):
+        group_end = min(group_start + _PAIR_DEPTH, low.gk)
+        for tile, encoder in zip(tiles, encoders):
+            for panel_idx in range(group_start, group_end):
+                ks = panel_idx * low.tk
+                kl = min(low.tk, p.k - ks)
+                records = tuple(
+                    admit(pattern) if pattern is not None else None
+                    for pattern in _panel_patterns(spec, p, tile, ks, kl, die, plan.sector)
+                )
+                encoder.append(_PanelDescriptor(tile.m, tile.n, kl, *records))
     cohorts = {}
-    for tile in tiles:
-        encoder = _PanelPhases(periods)
-        for ks in range(0, p.k, low.tk):
-            kl = min(low.tk, p.k - ks)
-            records = tuple(
-                admit(pattern) if pattern is not None else None
-                for pattern in _panel_patterns(spec, p, tile, ks, kl, die, plan.sector)
-            )
-            encoder.append(_PanelDescriptor(tile.m, tile.n, kl, *records))
+    for tile, encoder in zip(tiles, encoders):
         drain = admit(_make_output_pattern(spec, p, tile, die, plan.sector))
         steps, signatures = encoder.finish()
         owners, _, _ = cohorts.setdefault((signatures, _ledger_key(drain)), ([], steps, drain))
