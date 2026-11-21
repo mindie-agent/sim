@@ -33,7 +33,7 @@ import pytest
 from mindie_sim.catalog.expert_slots import expert_slot_plan
 from mindie_sim.compose import compose_case
 from mindie_sim.prediction.cohort_reuse import prepare_cohort_graphs
-from mindie_sim.prediction.expert_slot_work import (
+from mindie_sim.prediction.operators.moe_routing.expert_slot_work import (
     bind_expert_slot_work, physical_slot_work,
 )
 from mindie_sim.prediction.exposed_program import _role_times
@@ -43,11 +43,11 @@ from mindie_sim.prediction.lowering import Builder
 from mindie_sim.prediction.operator_analysis import (
     target_graphs, target_operators,
 )
-from mindie_sim.prediction.recover_ssm_commit import (
+from mindie_sim.prediction.operators.recurrent.recover_ssm_commit import (
     bind_recover_ssm_commits, is_recover_ssm_intent,
 )
-from mindie_sim.prediction.recover_ssm_work import emit_commit_op
-from mindie_sim.prediction.recurrent import serial_context_parallel
+from mindie_sim.prediction.operators.recurrent.recover_ssm_work import emit_commit_op
+from mindie_sim.prediction.operators.recurrent.recurrent import serial_context_parallel
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import OpSpec

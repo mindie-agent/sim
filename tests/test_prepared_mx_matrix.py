@@ -9,7 +9,7 @@ import pytest
 from mindie_sim import target_graphs, operator_costs
 from mindie_sim.catalog.weights import layer_weight_terms
 from mindie_sim.catalog.weight_terms import term_bytes
-from mindie_sim.prediction.family_mx_matrix import PROFILE
+from mindie_sim.prediction.operators.mx_quant_matrix.family_mx_matrix import PROFILE
 from mindie_sim.prediction.structure import parse_case
 
 ROOT = Path(__file__).resolve().parents[1]

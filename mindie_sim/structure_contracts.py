@@ -311,18 +311,18 @@ def predicted_contract(op):
     if family == "short_convolution":
         return short_conv_active_contract(op)
     if family == "moe_init_routing":
-        from .prediction.family_moe_init import tensor_contract
+        from mindie_sim.prediction.operators.moe_routing.family_moe_init import tensor_contract
         return tensor_contract(op)
     if meta.get("program_kind") == "matmul":
         return matrix_contract(op)
     if family in {"quantize", "add_rmsnorm_quant", "rmsnorm_quant"}:
         return quant_contract(op)
     if family == "dequant_swiglu_quant":
-        from .prediction.family_grouped_quant import tensor_contract as grouped_contract
+        from mindie_sim.prediction.operators.grouped_moe.family_grouped_quant import tensor_contract as grouped_contract
         grouped = grouped_contract(op)
         if grouped is not None:
             return grouped
-        from .prediction.family_shared_quant import tensor_contract
+        from mindie_sim.prediction.operators.mx_quant_matrix.family_shared_quant import tensor_contract
         return tensor_contract(op)
     if op["family"] == "gdn_gating":
         return ("gdn_gating", shape)

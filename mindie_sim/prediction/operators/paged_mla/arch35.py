@@ -321,6 +321,9 @@ class _DirectStrategy:
         if c.abi == DSL_MQS_ABI:
             max_extent = max((max(c.bank_counts(seq, query)) for seq in range(len(c.sequences))
                               for query, repeat in c.query_runs(seq) if repeat), default=0)
+        elif c.mixed_quant:
+            max_extent = max((sum(c.bank_counts(seq, query)) for seq in range(len(c.sequences))
+                              for query, _ in c.query_runs(seq)), default=0)
         else:
             max_extent = max((kv for q, kv in c.sequences if q), default=0)
         keys = min(key_tile, max_extent)

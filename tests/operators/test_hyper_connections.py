@@ -21,7 +21,7 @@ from mindie_sim import graph_costs, operator_costs, target_graphs, target_operat
 from mindie_sim.prediction.engine import Engine, Resource
 from mindie_sim.prediction.frontend import Frontend
 from mindie_sim.prediction.mechanism import Geometry
-from mindie_sim.prediction.native_fusion import _groups, lower_native_fusions
+from mindie_sim.prediction.operators.hyper_connections.native_fusion import _groups, lower_native_fusions
 from mindie_sim.prediction.operators import FamilyDispatcher, FamilyRegistry, OperatorPlanningContext
 from mindie_sim.prediction.operators import hyper_connections as hc
 from mindie_sim.prediction.program import RecipeContext

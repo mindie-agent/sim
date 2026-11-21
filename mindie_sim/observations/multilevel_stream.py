@@ -377,13 +377,19 @@ def digest_file_streaming(path: Path) -> str:
     return hasher.hexdigest().lower()
 
 
-def _extract_capture_meta(path: Path, *, ijson_mod: Any = None) -> dict[str, Any]:
+def _extract_capture_meta(
+    path: Path, *, ijson_mod: Any = None,
+    target_events: frozenset[str] | None = None,
+    expected_clock_operator: str | None = None,
+) -> dict[str, Any]:
     return _extract_capture_meta_impl(
         path, ijson_mod=ijson_mod,
         stream_jsonl_fn=stream_jsonl,
         iter_json_events_fn=_iter_json_events,
         read_value_fn=_read_value,
         skip_value_fn=_skip_value,
+        target_events=target_events,
+        expected_clock_operator=expected_clock_operator,
     )
 
 

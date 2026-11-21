@@ -28,6 +28,9 @@ from .engine_types import (
 )
 
 
+_STAGE_PREPARATION_CACHE_LIMIT = 16384
+
+
 def _normalize_cohort_symmetry(
     name: str,
     placement: dict[str, tuple[int, ...]],
@@ -134,7 +137,7 @@ class _EnginePrepareMixin:
                 and cohort_size == 1 and not cohort_widened and not cohort_members
                 and not latency_from_first_service):
             return _EMPTY_TASK
-        hbm_accounting: tuple[tuple[str, float, float, float | None, str, float, str, float], ...] = ()
+        hbm_accounting: tuple[tuple[str, float, float, float, float | None, str, float, str, float, str], ...] = ()
         if work and self._hbm_bus_aliases:
             work, caps, hbm_accounting = _expand_hbm_bus_work(self._hbm_bus_aliases, name, work, caps)
         if (work is not None and work.__class__ is dict and not caps
@@ -142,44 +145,7 @@ class _EnginePrepareMixin:
                 and not coupled and latency == 0.0 and not priority
                 and cohort_size == 1 and not cohort_widened and not cohort_members
                 and not latency_from_first_service):
-            # Ordinary finite work on declared resources: the same checks as
-            # the general path, without building the four unused structures.
-            resources = self.resources
-            demands = {}
-            s_rates = {}
-            u_res_info = {}
-            for key, value in work.items():
-                if not value:
-                    continue
-                value = float(value)
-                res = resources.get(key)
-                if res is None:
-                    raise ExecutionError(f"resource_missing:{key}")
-                if value < 0 or not math.isfinite(value):
-                    raise ExecutionError(f"invalid_work:{name}:{key}")
-                demands[key] = value
-                r_rate = res.rate
-                s_rates[key] = r_rate
-                u_cap = r_rate / res.units
-                scale_u = value / r_rate
-                if scale_u > 0.0 and math.isfinite(scale_u):
-                    amt_u = value / scale_u
-                    pu_u = amt_u if res.units == 1 else amt_u / res.units
-                    c_lim_u = (u_cap / pu_u) if pu_u else math.inf
-                    fu_u = c_lim_u if 0.0 < c_lim_u < math.inf else 0.0
-                    if u_res_info is not None:
-                        u_res_info[key] = (
-                            value, amt_u, pu_u, math.inf, amt_u * fu_u, None,
-                        )
-                else:
-                    u_res_info = None
-            return _PreparedTask(
-                demands, 0.0, _EMPTY_CAPS, (), (),
-                _EMPTY_PLACEMENT, False, (), 0, 1,
-                solo_rates=s_rates or None,
-                uncoupled_res_info=u_res_info or None,
-                hbm_bus_epoch=self._hbm_bus_epoch,
-                hbm_accounting=hbm_accounting)
+            return self._prepare_plain_work(name, work, hbm_accounting)
         demands = {key: float(value) for key, value in (work or {}).items() if value}
         for key, value in demands.items():
             if key not in self.resources:
@@ -243,51 +209,8 @@ class _EnginePrepareMixin:
         u_res_info = None
         if (coupled and demands
                 and all(self.resources[k].policy != "fifo" for k in demands)):
-            scale0 = 0.0
-            for k, d in demands.items():
-                res = self.resources[k]
-                decl = placement.get(k) if placement else None
-                n_u = res.units if decl is None else len(decl)
-                denom = (res.rate / res.units) * n_u
-                if cohort_size > 1 and k not in norm_widened:
-                    denom *= cohort_size
-                s_k = d / denom if denom > 0.0 else math.inf
-                if s_k > scale0:
-                    scale0 = s_k
-            if scale0 > 0.0 and math.isfinite(scale0):
-                c_demand = {k: d / scale0 for k, d in demands.items()}
-                if limits:
-                    for k, amt in c_demand.items():
-                        cap_val = limits.get(k)
-                        if cap_val is not None and amt:
-                            cl = cap_val / amt
-                            if cl < c_cap_limit:
-                                c_cap_limit = cl
-                c_info_dict = {}
-                c_solo_limit = c_cap_limit
-                for k, amt in c_demand.items():
-                    res = self.resources[k]
-                    u_cap = res.rate / res.units
-                    uk = placement.get(k) if placement else None
-                    u_cnt = res.units if uk is None else len(uk)
-                    pu = amt if u_cnt == 1 else amt / u_cnt
-                    cl = (u_cap / pu) if pu else math.inf
-                    c_info_dict[k] = (amt, u_cap, pu, cl, uk)
-                    if cl < c_solo_limit:
-                        c_solo_limit = cl
-                c_items_tuple = tuple(c_demand.items())
-                c_excl_dict = {}
-                for s_k in c_demand:
-                    ex_lim = c_cap_limit
-                    for o_k, (_, _, _, cl_o, _) in c_info_dict.items():
-                        if o_k != s_k and cl_o < ex_lim:
-                            ex_lim = cl_o
-                    c_excl_dict[s_k] = ex_lim
-                c_res_info = (c_info_dict, c_items_tuple, c_excl_dict)
-                if 0.0 < c_solo_limit < math.inf:
-                    c_solo_rates = tuple(
-                        (k, amt * c_solo_limit) for k, amt in c_items_tuple
-                    )
+            c_demand, c_cap_limit, c_solo_rates, c_res_info = self._prepare_coupled_service(
+                demands, placement, limits, cohort_size, norm_widened)
         elif not coupled and demands:
             s_rates = {}
             u_res_info = {}
@@ -335,6 +258,98 @@ class _EnginePrepareMixin:
             _compute_pool_unit_masks(acq_t), norm_widened, norm_members,
             bool(latency_from_first_service), self._hbm_bus_epoch, hbm_accounting)
 
+    def _prepare_plain_work(self, name, work, hbm_accounting) -> _PreparedTask:
+        # Ordinary finite work on declared resources: the same checks as
+        # the general path, without building the four unused structures.
+        resources = self.resources
+        demands = {}
+        s_rates = {}
+        u_res_info = {}
+        for key, value in work.items():
+            if not value:
+                continue
+            value = float(value)
+            res = resources.get(key)
+            if res is None:
+                raise ExecutionError(f"resource_missing:{key}")
+            if value < 0 or not math.isfinite(value):
+                raise ExecutionError(f"invalid_work:{name}:{key}")
+            demands[key] = value
+            r_rate = res.rate
+            s_rates[key] = r_rate
+            u_cap = r_rate / res.units
+            scale_u = value / r_rate
+            if scale_u > 0.0 and math.isfinite(scale_u):
+                amt_u = value / scale_u
+                pu_u = amt_u if res.units == 1 else amt_u / res.units
+                c_lim_u = (u_cap / pu_u) if pu_u else math.inf
+                fu_u = c_lim_u if 0.0 < c_lim_u < math.inf else 0.0
+                if u_res_info is not None:
+                    u_res_info[key] = (
+                        value, amt_u, pu_u, math.inf, amt_u * fu_u, None,
+                    )
+            else:
+                u_res_info = None
+        return _PreparedTask(
+            demands, 0.0, _EMPTY_CAPS, (), (),
+            _EMPTY_PLACEMENT, False, (), 0, 1,
+            solo_rates=s_rates or None,
+            uncoupled_res_info=u_res_info or None,
+            hbm_bus_epoch=self._hbm_bus_epoch,
+            hbm_accounting=hbm_accounting)
+
+    def _prepare_coupled_service(self, demands, placement, limits, cohort_size, norm_widened):
+        c_demand = None
+        c_cap_limit = math.inf
+        c_solo_rates = None
+        c_res_info = None
+        scale0 = 0.0
+        for k, d in demands.items():
+            res = self.resources[k]
+            decl = placement.get(k) if placement else None
+            n_u = res.units if decl is None else len(decl)
+            denom = (res.rate / res.units) * n_u
+            if cohort_size > 1 and k not in norm_widened:
+                denom *= cohort_size
+            s_k = d / denom if denom > 0.0 else math.inf
+            if s_k > scale0:
+                scale0 = s_k
+        if scale0 > 0.0 and math.isfinite(scale0):
+            c_demand = {k: d / scale0 for k, d in demands.items()}
+            if limits:
+                for k, amt in c_demand.items():
+                    cap_val = limits.get(k)
+                    if cap_val is not None and amt:
+                        cl = cap_val / amt
+                        if cl < c_cap_limit:
+                            c_cap_limit = cl
+            c_info_dict = {}
+            c_solo_limit = c_cap_limit
+            for k, amt in c_demand.items():
+                res = self.resources[k]
+                u_cap = res.rate / res.units
+                uk = placement.get(k) if placement else None
+                u_cnt = res.units if uk is None else len(uk)
+                pu = amt if u_cnt == 1 else amt / u_cnt
+                cl = (u_cap / pu) if pu else math.inf
+                c_info_dict[k] = (amt, u_cap, pu, cl, uk)
+                if cl < c_solo_limit:
+                    c_solo_limit = cl
+            c_items_tuple = tuple(c_demand.items())
+            c_excl_dict = {}
+            for s_k in c_demand:
+                ex_lim = c_cap_limit
+                for o_k, (_, _, _, cl_o, _) in c_info_dict.items():
+                    if o_k != s_k and cl_o < ex_lim:
+                        ex_lim = cl_o
+                c_excl_dict[s_k] = ex_lim
+            c_res_info = (c_info_dict, c_items_tuple, c_excl_dict)
+            if 0.0 < c_solo_limit < math.inf:
+                c_solo_rates = tuple(
+                    (k, amt * c_solo_limit) for k, amt in c_items_tuple
+                )
+        return c_demand, c_cap_limit, c_solo_rates, c_res_info
+
     @staticmethod
     def clone_prepared_scoped(static: _PreparedTask,
                               acquire: tuple[Allocation, ...],
@@ -370,94 +385,7 @@ class _EnginePrepareMixin:
         if hit is not None and hit[0]() is lookup_stage:
             static = hit[1]
         else:
-            cohort_size = getattr(lookup_stage, "cohort_size", 1)
-            cohort_widened = getattr(lookup_stage, "cohort_widened", ())
-            raw_members = getattr(lookup_stage, "cohort_members", ())
-            members_sig = (
-                tuple(sorted(raw_members.items()))
-                if isinstance(raw_members, Mapping) else tuple(raw_members)
-            )
-            stg_acq = lookup_stage.acquire
-            if not stg_acq:
-                acq_sig = ()
-            elif len(stg_acq) == 1:
-                a0 = stg_acq[0]
-                acq_sig = ((a0.pool, a0.size, a0.units),)
-            elif len({a.name for a in stg_acq}) == len(stg_acq):
-                acq_sig = tuple((a.pool, a.size, a.units) for a in stg_acq)
-            else:
-                acq_sig = tuple((a.name, a.pool, a.size, a.units)
-                                for a in stg_acq)
-            stg_free = lookup_stage.free
-            free_sig = (tuple((a.pool, a.size, a.units) for a in stg_free)
-                        if stg_free else ())
-            lffs = bool(getattr(lookup_stage, "latency_from_first_service", False))
-            proto_cache = self._stage_proto_prepared
-            proto_key = (id(lookup_stage.work), id(lookup_stage.caps),
-                         id(lookup_stage.placement),
-                         lookup_stage.name, lookup_stage.latency,
-                         lookup_stage.coupled, lookup_stage.priority,
-                         cohort_size, cohort_widened, members_sig,
-                         acq_sig, free_sig, lffs)
-            phit = proto_cache.get(proto_key)
-            if (phit is not None and phit[0] is lookup_stage.work
-                    and phit[1] is lookup_stage.caps
-                    and phit[2] is lookup_stage.placement):
-                static_base = phit[3]
-            else:
-                key = (lookup_stage.name, tuple(lookup_stage.work.items()),
-                       lookup_stage.latency, tuple(lookup_stage.caps.items()),
-                       tuple((name, units)
-                             for name, units in lookup_stage.placement.items()),
-                       lookup_stage.coupled, lookup_stage.priority, cohort_size,
-                       cohort_widened, members_sig, acq_sig, free_sig, lffs)
-                cache = self._stage_prepared
-                static_base = cache.get(key)
-                if static_base is None:
-                    static_base = self._prepare(
-                        lookup_stage.name, lookup_stage.work,
-                        latency=lookup_stage.latency, caps=lookup_stage.caps,
-                        acquire=stg_acq, free=stg_free,
-                        placement=lookup_stage.placement,
-                        coupled=lookup_stage.coupled,
-                        priority=lookup_stage.priority,
-                        cohort_size=cohort_size,
-                        cohort_widened=cohort_widened or None,
-                        cohort_members=raw_members or None,
-                        latency_from_first_service=lffs)
-                    object.__setattr__(static_base, "static_id", id(static_base))
-                    if len(cache) >= 16384:
-                        cache.clear()
-                    cache[key] = static_base
-                if len(proto_cache) >= 16384:
-                    proto_cache.clear()
-                proto_cache[proto_key] = (
-                    lookup_stage.work, lookup_stage.caps,
-                    lookup_stage.placement, static_base)
-            if (stg_acq is static_base.acquire
-                    and stg_free is static_base.free):
-                static = static_base
-            else:
-                static = _PreparedTask(
-                    static_base.demand, static_base.latency, static_base.caps,
-                    stg_acq, stg_free, static_base.placement,
-                    static_base.coupled, static_base.allocation_demands,
-                    static_base.priority, static_base.cohort_size,
-                    static_base.acquire_assigns, static_base.free_pairs,
-                    static_base.acquire_pools, static_base.static_id,
-                    static_base.fits_empty_pools, static_base.coupled_demand,
-                    static_base.coupled_cap_limit,
-                    static_base.coupled_solo_rates,
-                    static_base.demand_keys, static_base.solo_rates,
-                    static_base.coupled_res_info,
-                    static_base.uncoupled_res_info,
-                    static_base.pool_unit_masks,
-                    static_base.cohort_widened, static_base.cohort_members,
-                    static_base.latency_from_first_service,
-                    static_base.hbm_bus_epoch, static_base.hbm_accounting)
-            if len(id_cache) >= 16384:
-                id_cache.clear()
-            id_cache[id(lookup_stage)] = (weakref.ref(lookup_stage), static)
+            static = self._prepare_static_stage(lookup_stage)
         if acquire is static.acquire and free is static.free:
             return static
         if not acquire and not free:
@@ -519,40 +447,7 @@ class _EnginePrepareMixin:
                 if same_shape and len({a.name for a in acquire}) == n_acq:
                     return self.clone_prepared_scoped(static, acquire, free)
         if n_acq == 1:
-            allocation = acquire[0]
-            size = allocation.size
-            if size < 0 or not math.isfinite(size):
-                raise ExecutionError(f"invalid_allocation:{allocation.name}")
-            pool = allocation.pool
-            pools = self.pools
-            if pool not in pools:
-                raise ExecutionError(f"pool_missing:{pool}")
-            if size > pools[pool]:
-                raise ExecutionError(f"allocation_exceeds_capacity:{allocation.name}")
-            units = allocation.units
-            pu = self.pool_units[pool]
-            if len(units) == 1:
-                u0 = units[0]
-                if u0 < 0 or u0 >= pu:
-                    raise ExecutionError(f"buffer_unit_out_of_range:{pool}")
-                demands_tuple = (((pool, u0), size),)
-            else:
-                if (not units or len(set(units)) != len(units)
-                        or any(unit < 0 or unit >= pu for unit in units)):
-                    raise ExecutionError(f"buffer_unit_out_of_range:{pool}")
-                demands_tuple = tuple(((pool, unit), size) for unit in units)
-            p_masks_1 = (((pool, _units_to_mask(units)),)
-                         if size > 0 else None)
-            return _PreparedTask(
-                static.demand, static.latency, static.caps, acquire, free,
-                static.placement, static.coupled, demands_tuple,
-                static.priority, static.cohort_size, (), (),
-                frozenset((pool,)), 0, True, static.coupled_demand,
-                static.coupled_cap_limit, static.coupled_solo_rates,
-                frozenset(k for k, _ in demands_tuple), static.solo_rates,
-                static.coupled_res_info, static.uncoupled_res_info,
-                p_masks_1, static.cohort_widened, static.cohort_members,
-                static.latency_from_first_service)
+            return self._prepare_stage_single_allocation(static, acquire, free)
         pools = self.pools
         pool_units = self.pool_units
         demands = {}
@@ -594,6 +489,134 @@ class _EnginePrepareMixin:
             static.latency_from_first_service,
             hbm_bus_epoch=static.hbm_bus_epoch,
             hbm_accounting=static.hbm_accounting)
+
+    def _prepare_stage_single_allocation(self, static, acquire, free) -> _PreparedTask:
+        allocation = acquire[0]
+        size = allocation.size
+        if size < 0 or not math.isfinite(size):
+            raise ExecutionError(f"invalid_allocation:{allocation.name}")
+        pool = allocation.pool
+        pools = self.pools
+        if pool not in pools:
+            raise ExecutionError(f"pool_missing:{pool}")
+        if size > pools[pool]:
+            raise ExecutionError(f"allocation_exceeds_capacity:{allocation.name}")
+        units = allocation.units
+        pu = self.pool_units[pool]
+        if len(units) == 1:
+            u0 = units[0]
+            if u0 < 0 or u0 >= pu:
+                raise ExecutionError(f"buffer_unit_out_of_range:{pool}")
+            demands_tuple = (((pool, u0), size),)
+        else:
+            if (not units or len(set(units)) != len(units)
+                    or any(unit < 0 or unit >= pu for unit in units)):
+                raise ExecutionError(f"buffer_unit_out_of_range:{pool}")
+            demands_tuple = tuple(((pool, unit), size) for unit in units)
+        p_masks_1 = (((pool, _units_to_mask(units)),)
+                     if size > 0 else None)
+        return _PreparedTask(
+            static.demand, static.latency, static.caps, acquire, free,
+            static.placement, static.coupled, demands_tuple,
+            static.priority, static.cohort_size, (), (),
+            frozenset((pool,)), 0, True, static.coupled_demand,
+            static.coupled_cap_limit, static.coupled_solo_rates,
+            frozenset(k for k, _ in demands_tuple), static.solo_rates,
+            static.coupled_res_info, static.uncoupled_res_info,
+            p_masks_1, static.cohort_widened, static.cohort_members,
+            static.latency_from_first_service)
+
+    def _prepare_static_stage(self, lookup_stage) -> _PreparedTask:
+        id_cache = self._stage_id_prepared
+        cohort_size = getattr(lookup_stage, "cohort_size", 1)
+        cohort_widened = getattr(lookup_stage, "cohort_widened", ())
+        raw_members = getattr(lookup_stage, "cohort_members", ())
+        members_sig = (
+            tuple(sorted(raw_members.items()))
+            if isinstance(raw_members, Mapping) else tuple(raw_members)
+        )
+        stg_acq = lookup_stage.acquire
+        if not stg_acq:
+            acq_sig = ()
+        elif len(stg_acq) == 1:
+            a0 = stg_acq[0]
+            acq_sig = ((a0.pool, a0.size, a0.units),)
+        elif len({a.name for a in stg_acq}) == len(stg_acq):
+            acq_sig = tuple((a.pool, a.size, a.units) for a in stg_acq)
+        else:
+            acq_sig = tuple((a.name, a.pool, a.size, a.units)
+                            for a in stg_acq)
+        stg_free = lookup_stage.free
+        free_sig = (tuple((a.pool, a.size, a.units) for a in stg_free)
+                    if stg_free else ())
+        lffs = bool(getattr(lookup_stage, "latency_from_first_service", False))
+        proto_cache = self._stage_proto_prepared
+        proto_key = (id(lookup_stage.work), id(lookup_stage.caps),
+                     id(lookup_stage.placement),
+                     lookup_stage.latency,
+                     lookup_stage.coupled, lookup_stage.priority,
+                     cohort_size, cohort_widened, members_sig,
+                     acq_sig, free_sig, lffs)
+        phit = proto_cache.get(proto_key)
+        if (phit is not None and phit[0] is lookup_stage.work
+                and phit[1] is lookup_stage.caps
+                and phit[2] is lookup_stage.placement):
+            static_base = phit[3]
+        else:
+            key = (tuple(lookup_stage.work.items()),
+                   lookup_stage.latency, tuple(lookup_stage.caps.items()),
+                   tuple((name, units)
+                         for name, units in lookup_stage.placement.items()),
+                   lookup_stage.coupled, lookup_stage.priority, cohort_size,
+                   cohort_widened, members_sig, acq_sig, free_sig, lffs)
+            cache = self._stage_prepared
+            static_base = cache.get(key)
+            if static_base is None:
+                static_base = self._prepare(
+                    lookup_stage.name, lookup_stage.work,
+                    latency=lookup_stage.latency, caps=lookup_stage.caps,
+                    acquire=stg_acq, free=stg_free,
+                    placement=lookup_stage.placement,
+                    coupled=lookup_stage.coupled,
+                    priority=lookup_stage.priority,
+                    cohort_size=cohort_size,
+                    cohort_widened=cohort_widened or None,
+                    cohort_members=raw_members or None,
+                    latency_from_first_service=lffs)
+                object.__setattr__(static_base, "static_id", id(static_base))
+                if len(cache) >= _STAGE_PREPARATION_CACHE_LIMIT:
+                    cache.clear()
+                cache[key] = static_base
+            if len(proto_cache) >= _STAGE_PREPARATION_CACHE_LIMIT:
+                proto_cache.clear()
+            proto_cache[proto_key] = (
+                lookup_stage.work, lookup_stage.caps,
+                lookup_stage.placement, static_base)
+        if (stg_acq is static_base.acquire
+                and stg_free is static_base.free):
+            static = static_base
+        else:
+            static = _PreparedTask(
+                static_base.demand, static_base.latency, static_base.caps,
+                stg_acq, stg_free, static_base.placement,
+                static_base.coupled, static_base.allocation_demands,
+                static_base.priority, static_base.cohort_size,
+                static_base.acquire_assigns, static_base.free_pairs,
+                static_base.acquire_pools, static_base.static_id,
+                static_base.fits_empty_pools, static_base.coupled_demand,
+                static_base.coupled_cap_limit,
+                static_base.coupled_solo_rates,
+                static_base.demand_keys, static_base.solo_rates,
+                static_base.coupled_res_info,
+                static_base.uncoupled_res_info,
+                static_base.pool_unit_masks,
+                static_base.cohort_widened, static_base.cohort_members,
+                static_base.latency_from_first_service,
+                static_base.hbm_bus_epoch, static_base.hbm_accounting)
+        if len(id_cache) >= _STAGE_PREPARATION_CACHE_LIMIT:
+            id_cache.clear()
+        id_cache[id(lookup_stage)] = (weakref.ref(lookup_stage), static)
+        return static
 
     def prepare_stage(self, name, work=None, *, latency=0.0, caps=None,
                       acquire=(), free=(), placement=None, coupled=False,

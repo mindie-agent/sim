@@ -87,8 +87,8 @@ class _FiaStrategy:
         if ctx.compute_arch.arch_id != self.arch_id or c.abi != self.abi:
             raise capability_gap("paged_mla_unsupported_abi", c.abi, ctx.compute_arch.arch_id)
         elem = int(dtype_bytes(op.dtype or "bf16"))
-        heads = min(HEAD_TILE, c.physical_heads)
         keys = min(c.s2_base_size, max((kv for q, kv in c.sequences if q), default=0))
+        heads = min(HEAD_TILE, c.physical_heads) if keys or not ctx.requests else 0
         workspace_regions = (
             ("mm1", WORKSPACE_DEPTH, heads * keys * FP32_BYTES),
             ("vec1", WORKSPACE_DEPTH, heads * keys * elem),

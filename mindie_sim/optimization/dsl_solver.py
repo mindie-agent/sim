@@ -516,15 +516,24 @@ def bind_catalog_recipe(op, members, datapath, *, tier, identifier, params, limi
     roles = {"mte2_aic": "mte2", "mte2_aiv": "mte2",
              "vec_alu": "vector", "vec_reduce": "vector", "vec_sfu": "vector", "sort_topk": "vector",
              "aiv_simt": "vector"}
-    for stage in result.program.stages:
-        for role, amount in stage.work.items():
+    if hasattr(result.program, "resource_work"):
+        for role, amount in result.program.resource_work:
             if role != "cube":
                 resources[roles.get(role, role)] += amount
+    else:
+        for stage in result.program.stages:
+            for role, amount in stage.work.items():
+                if role != "cube":
+                    resources[roles.get(role, role)] += amount
     work = Work(dict(summary.issued_cube_flops_by_dtype), resources)
 
     def build(_op, _geometry):
         def program(context):
-            bound = lower(context.datapath or datapath, context=context, die=die, region_id=op.op_id).program
+            dp = context.datapath or datapath
+            if hasattr(result.program, "with_context"):
+                bound = result.program.with_context(dp, context)
+            else:
+                bound = lower(dp, context=context, die=die, region_id=op.op_id).program
             return _CatalogReplayProgram(bound) if getattr(bound, "hbm_bus", None) is not None else bound
         return OperatorPlan(work, program)
 

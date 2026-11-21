@@ -12,14 +12,24 @@
 """
 from __future__ import annotations
 
+from .device_input import SubtileWaveSpec
 
 _NIBBLE_FORMAT_BITS = 4
 _BYTE_BITS = 8
 _HALFWORD_FORMAT_BITS = 16
 _WORD_FORMAT_BITS = 32
+_CUBE_DIM = 16
+_NIBBLE_CUBE_K = 64
+_BYTE_CUBE_K = 32
+_HF32_CUBE_K = 8
+_DAV_2201_FP32_CUBE_K = 4
+_DAV_3510_FP32_CUBE_K = 1
+_BIAS_FIXPIPE_BYTES_PER_CYCLE = 32
+_DAV_3510_UB_COPY_BYTES_PER_CYCLE = 256
 
 _DIRECT_ROUTE_ALIGNMENT = {
     "gm": 1, "l1": 32, "l0a": 512, "l0b": 512, "l0c": 64, "ub": 32,
+    "bt": 32, "fb": 64,
 }
 
 
@@ -68,6 +78,13 @@ def _storage_representations(architecture, source, *, fp8_operand,
                              "matrix is a separate declared mode")
                             if not fp8_operand else "native FP8 operand",
                             source)}
+    if fp8_operand:
+        for name, bits in (("fp4_e2m1", _NIBBLE_FORMAT_BITS), ("mxfp4", _NIBBLE_FORMAT_BITS),
+                           ("hifloat8", _BYTE_BITS), ("mxfp8", _BYTE_BITS)):
+            result[name] = {
+                "bits": bits, "roles": list(fp8_roles), "alignment_bytes": 1,
+                "provenance": _prov("payload_format", architecture, "native Cube operand", source),
+            }
     return result
 
 
@@ -81,6 +98,8 @@ def _native_machine_modes(architecture, source, *, fp8, int4_operand):
         # arch2201 converts INT4 k64; arch3510 storage-only INT4 (S4 is not a
         # native Cube operand) must not become a Cube mode through a peak.
         formats.append(("int4", "int32"))
+    if fp8:
+        formats.extend((operand, "fp32") for operand in ("fp4_e2m1", "mxfp4", "hifloat8", "mxfp8"))
     for operand, accumulator in formats:
         name = f"{operand}_x_{operand}_acc_{accumulator}"
         modes[name] = {"kind": "matrix", "operands": [operand],
@@ -120,10 +139,12 @@ def _casts(architecture, source_ref):
     }
 
 
-def _path(name, source, target, roles, *, unit="", executor="", reach=(),
-          buffer="", sync="pipe", alignment=1, representation_provenance=None):
+def _path(source, target, roles, *, unit="", executor="", reach=(),
+          buffer="", sync="pipe", representation_provenance=None):
+    source_alignment = _DIRECT_ROUTE_ALIGNMENT[source]
+    target_alignment = _DIRECT_ROUTE_ALIGNMENT[target]
     item = {"source": source, "target": target, "roles": list(roles),
-            "sync": sync, "alignment_bytes": alignment}
+            "sync": sync, "alignment_bytes": max(source_alignment, target_alignment)}
     if unit:
         item["unit"] = unit
     if executor:
@@ -132,7 +153,10 @@ def _path(name, source, target, roles, *, unit="", executor="", reach=(),
         item["reach"] = list(reach)
     if buffer:
         item["buffer"] = buffer
-    item["provenance"] = representation_provenance
+    item["provenance"] = {
+        **representation_provenance,
+        "source_alignment_bytes": source_alignment, "target_alignment_bytes": target_alignment,
+    }
     return item
 
 
@@ -140,29 +164,28 @@ def _paths_2201():
     source = _prov("directional_data_path", "npu_arch_2201",
                    "registration of the legacy direct-route set", _2201_SOURCE)
     paths = {}
-    for name, src, dst, roles, unit, executor, reach, buffer, align in (
+    for name, src, dst, roles, unit, executor, reach, buffer in (
         ("gm->l1", "gm", "l1", ("storage", "transfer"),
-         "mte2_aic", "aic", ("aic",), "l1", 1),
+         "mte2_aic", "aic", ("aic",), "l1"),
         ("gm->ub", "gm", "ub", ("storage", "transfer"),
-         "mte2_aiv", "aiv", ("aiv",), "ub", 1),
+         "mte2_aiv", "aiv", ("aiv",), "ub"),
         ("ub->gm", "ub", "gm", ("storage", "transfer"),
-         "mte3", "aiv", ("aiv",), "", 1),
-        ("l1->l0a", "l1", "l0a", ("operand",), "mte1", "aic", ("aic",), "l0a", 1),
-        ("l1->l0b", "l1", "l0b", ("operand",), "mte1", "aic", ("aic",), "l0b", 1),
+         "mte3", "aiv", ("aiv",), ""),
+        ("l1->l0a", "l1", "l0a", ("operand",), "mte1", "aic", ("aic",), "l0a"),
+        ("l1->l0b", "l1", "l0b", ("operand",), "mte1", "aic", ("aic",), "l0b"),
         ("l0c->gm", "l0c", "gm", ("accumulator",),
-         "fixpipe", "aic", ("aic",), "", 1),
+         "fixpipe", "aic", ("aic",), ""),
         ("l0c->l1", "l0c", "l1", ("accumulator",),
-         "fixpipe", "aic", ("aic",), "l1", 1),
+         "fixpipe", "aic", ("aic",), "l1"),
         # 2201 expresses C/V exchange through GM; these direct routes exist.
         ("gm->l0a", "gm", "l0a", ("operand",),
-         "mte2_aic", "aic", ("aic",), "l0a", 1),
+         "mte2_aic", "aic", ("aic",), "l0a"),
         ("gm->l0b", "gm", "l0b", ("operand",),
-         "mte2_aic", "aic", ("aic",), "l0b", 1),
-        # Existence is declared; this legacy route has no registered service.
-        ("l1->gm", "l1", "gm", ("storage", "transfer"), "", "", (), "", 1),
+         "mte2_aic", "aic", ("aic",), "l0b"),
+        ("l1->gm", "l1", "gm", ("storage", "transfer"), "mte3", "aic", ("aic",), ""),
     ):
-        paths[name] = _path(name, src, dst, roles, unit=unit, executor=executor,
-                            reach=reach, buffer=buffer, alignment=align,
+        paths[name] = _path(src, dst, roles, unit=unit, executor=executor,
+                            reach=reach, buffer=buffer,
                             representation_provenance=source)
     return paths
 
@@ -197,16 +220,46 @@ def _paths_3510():
          "mte3", "aiv", ("aic", "aiv"), "l1", "event"),
     ):
         paths[name] = _path(
-            name, src, dst, roles, unit=unit, executor=executor, reach=reach,
+            src, dst, roles, unit=unit, executor=executor, reach=reach,
             buffer=buffer, sync=sync,
-            alignment=max(_DIRECT_ROUTE_ALIGNMENT[src],
-                          _DIRECT_ROUTE_ALIGNMENT[dst]),
             representation_provenance=source)
-    paths["l1->ub"]["provenance"] = _prov(
-        "directional_data_path", "npu_arch_3510",
+    paths["l1->ub"]["provenance"]["basis"] = (
         "sourced L1->UB PIPE_MTE1 128 B/cycle route; profile binds shared "
-        "MTE1 mode mte1_l1_ub; final owner/sync/capacity remains T07", _3510_SOURCE)
+        "MTE1 mode mte1_l1_ub; final owner/sync/capacity remains T07")
     return paths
+
+
+def _local_copy_paths(architecture, source, *, ub_rate):
+    # The compute-arch interchange schema describes movement between distinct
+    # storage domains. Datapath adds local copies and the dedicated BT/FB ports.
+    paths = {}
+    for src, dst, unit, executor, pipe, rate in (
+        ("ub", "ub", "vector" if ub_rate is None else "ub_copy", "aiv", "PIPE_V", ub_rate),
+        ("l1", "bt", "mte1", "aic", "PIPE_MTE1", _BIAS_FIXPIPE_BYTES_PER_CYCLE),
+        ("l1", "fb", "fixpipe", "aic", "PIPE_FIX", _BIAS_FIXPIPE_BYTES_PER_CYCLE),
+    ):
+        name = f"{src}->{dst}"
+        provenance = _prov("directional_data_path", architecture, pipe, source)
+        if rate is not None:
+            provenance["bytes_per_cycle"] = rate
+        paths[name] = _path(src, dst, ("storage", "transfer"), unit=unit,
+                            executor=executor, reach=(executor,), buffer=dst,
+                            representation_provenance=provenance)
+    return paths
+
+
+def _subtile_waves(*, fp32_cube_k, extra):
+    sizes = {"bf16": _CUBE_DIM, "fp16": _CUBE_DIM, "int8": _BYTE_CUBE_K,
+             "hf32": _HF32_CUBE_K, **extra}
+    sizes["fp32"] = _HF32_CUBE_K
+    return tuple(
+        SubtileWaveSpec.from_mapping({
+            "native_mode": mode, "tile_m": _CUBE_DIM, "tile_n": _CUBE_DIM, "tile_k": tile_k,
+            "independently_issuable_m": _CUBE_DIM, "owner_groups": 1,
+            "cube_k": fp32_cube_k if mode == "fp32" else tile_k,
+        })
+        for mode, tile_k in sizes.items()
+    )
 
 
 CAPABILITY_PRESETS: dict[str, dict] = {
@@ -218,6 +271,8 @@ CAPABILITY_PRESETS: dict[str, dict] = {
             "npu_arch_2201", _2201_SOURCE, fp8=False, int4_operand=True),
         "casts": _casts("npu_arch_2201", _2201_SOURCE),
         "paths": _paths_2201(),
+        "local_copy_paths": _local_copy_paths("npu_arch_2201", _2201_SOURCE, ub_rate=None),
+        "subtile_waves": _subtile_waves(fp32_cube_k=_DAV_2201_FP32_CUBE_K, extra={"int4": _NIBBLE_CUBE_K}),
     },
     "npu_arch_3510": {
         "representations": _storage_representations(
@@ -227,5 +282,30 @@ CAPABILITY_PRESETS: dict[str, dict] = {
             "npu_arch_3510", _3510_SOURCE, fp8=True, int4_operand=False),
         "casts": _casts("npu_arch_3510", _3510_SOURCE),
         "paths": _paths_3510(),
+        "local_copy_paths": _local_copy_paths(
+            "npu_arch_3510", _3510_SOURCE, ub_rate=_DAV_3510_UB_COPY_BYTES_PER_CYCLE),
+        "subtile_waves": _subtile_waves(fp32_cube_k=_DAV_3510_FP32_CUBE_K, extra={
+            "fp4_e2m1": _NIBBLE_CUBE_K, "mxfp4": _NIBBLE_CUBE_K, "hifloat8": _BYTE_CUBE_K,
+            "mxfp8": _BYTE_CUBE_K, "fp8_e4m3": _BYTE_CUBE_K, "fp8_e5m2": _BYTE_CUBE_K,
+        }),
     },
 }
+
+
+def preset_datapath_parts(preset_name, declared_waves):
+    """Resolve the preset's local paths and fill omitted wave geometry."""
+    from .compute_arch import DataPath
+
+    preset = CAPABILITY_PRESETS.get(preset_name, {})
+    paths = tuple(
+        DataPath(name, **{**path, "roles": tuple(path["roles"]), "reach": tuple(path["reach"])})
+        for name, path in preset.get("local_copy_paths", {}).items()
+    )
+    waves = {wave.native_mode: wave for wave in preset.get("subtile_waves", ())}
+    for wave in declared_waves:
+        cube_k = getattr(waves.get(wave.native_mode), "cube_k", None)
+        if (getattr(wave, "cube_k", None) is None and cube_k is not None
+                and wave.tile_k % cube_k == 0):
+            wave = SubtileWaveSpec.from_mapping({**wave.to_dict(), "cube_k": cube_k})
+        waves[wave.native_mode] = wave
+    return paths, tuple(waves.values())

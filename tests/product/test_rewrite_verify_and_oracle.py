@@ -124,7 +124,7 @@ def test_capacity_gate_accounts_for_simt_carveout_and_die_owned_l2(real_graph):
         OpRef("atom", target.op_id), "K3", "vector", (("uses_simt", True),),
     )),))
     simt = apply_plan(plan, scenario)
-    carveout = 16 * 1024
+    carveout = 32 * 1024
     assert scenario.datapath.simt_ub_carveout_bytes == carveout
     capacity = dict(die.buffers)["ub"] - carveout
 

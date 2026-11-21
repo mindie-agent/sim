@@ -10,6 +10,32 @@ from __future__ import annotations
 from collections.abc import Iterator
 from dataclasses import dataclass
 
+from ...program import KernelProgram, PipelineProgram, Program, Stage
+
+
+@dataclass(frozen=True, slots=True)
+class _DisjointOwnerProgram:
+    """Execute the stages with physical IDs already bound by the planner."""
+
+    placed: Program
+
+    def start(self, engine, name, ready, *, owner=""):
+        return self.placed.start(engine, name, ready, owner=owner)
+
+
+def request_program(builders, waves, context):
+    def wave(index):
+        first, last = waves[index]
+        return tuple(Stage(f"request{j}", program=builders[j](context)) for j in range(first, last))
+
+    placed = PipelineProgram(len(waves), 1, wave) if waves else KernelProgram(())
+    return _DisjointOwnerProgram(placed) if context.stream_owners and context.stream_owners.isolation == "disjoint" else placed
+
+
+def sort_ops(items: int) -> int:
+    """Pair compare/exchange work for a comparison-based sort."""
+    return items * (max(1, items) - 1).bit_length()
+
 
 def ceil_div(n: int, d: int) -> int:
     return (n + d - 1) // d
@@ -77,9 +103,12 @@ class S2Partition:
 
     def owner_rows(self, split: int) -> int:
         base, extra = divmod(self.tiles, self.owners)
-        begin = (split * base + min(split, extra)) * self.tile_size
         count = base + (split < extra)
-        return min(count * self.tile_size, self.rows - begin)
+        return min(count * self.tile_size, self.rows - self.owner_start(split))
+
+    def owner_start(self, split: int) -> int:
+        base, extra = divmod(self.tiles, self.owners)
+        return (split * base + min(split, extra)) * self.tile_size
 
     def variants(self) -> Iterator[tuple[int, int, bool]]:
         """Distinct owner row counts with multiplicities, independent of S2."""

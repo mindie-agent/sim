@@ -51,6 +51,42 @@ def _plane(rows: int, width: int, *, stride: int | None = None, offset: int = 0)
     return AddressRun(offset, rows, width, width if stride is None else stride)
 
 
+def _token_chunks(spans, start: int, rows: int, tile: int):
+    """Keep the host's logical step batch while forming physical X runs."""
+    logical = 0
+    runs = []
+    for q, _, physical, _, _ in spans:
+        if q:
+            if runs and runs[-1][2] + logical - runs[-1][0] == physical:
+                begin, _, physical = runs.pop()
+            else:
+                begin = logical
+            runs.append((begin, logical + q, physical))
+            logical += q
+    stop = start + rows
+    cursor = 0
+    while start < stop:
+        size = min(stop - start, tile)
+        while runs[cursor][1] <= start:
+            cursor += 1
+        begin, end, physical = runs[cursor]
+        if end >= start + size:
+            repeats = max(1, (min(end, stop) - start) // tile)
+            addresses = ((physical + start - begin, size),)
+        else:
+            repeats = 1
+            addresses = []
+            for index in range(cursor, len(runs)):
+                lo, hi, base = runs[index]
+                if lo >= start + size:
+                    break
+                first = max(start, lo)
+                addresses.append((base + first - lo, min(start + size, hi) - first))
+            addresses = tuple(addresses)
+        yield size, repeats, addresses
+        start += size * repeats
+
+
 def _parts(size: int, count: int) -> tuple[int, ...]:
     base, large = divmod(size, count)
     return tuple(base + (owner < large) for owner in range(count))

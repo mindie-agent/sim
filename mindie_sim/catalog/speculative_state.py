@@ -169,7 +169,7 @@ def speculative_state_plan(
     if kind == "gdn":
         # Qwen GDN keeps ``(Dk + Dv + 1)`` FP32 elements per head, distinct
         # from the KDA correction+kg record.
-        from mindie_sim.prediction.recover_ssm_work import gdn_record_head_bytes
+        from mindie_sim.prediction.operators.recurrent.recover_ssm_work import gdn_record_head_bytes
         record = gdn_record_head_bytes(dk, dv) * float(heads)
     else:
         record = record_head_bytes(dk, dv, kg_dtype) * float(heads)

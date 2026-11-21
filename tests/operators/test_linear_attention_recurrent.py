@@ -22,7 +22,7 @@ from _support.linear_cases import (
 )
 from mindie_sim import graph_costs
 from mindie_sim.catalog.speculative_state import MODE_CHECKPOINT, MODE_REPLAY, MODE_SINGLE, speculative_state_plan
-from mindie_sim.prediction.call_gdn import make_call
+from mindie_sim.prediction.operators.linear_attention.call_gdn import make_call
 from mindie_sim.prediction.engine import Engine, Resource
 from mindie_sim.prediction.frontend import Frontend
 from mindie_sim.prediction.operators.linear_attention._gdn_decode_programs import CONV, GATING, gating_plan
@@ -30,16 +30,17 @@ from mindie_sim.prediction.operators.linear_attention.gdn_recurrent import (
     build as build_gdn, head_ownership, head_runs,
 )
 from mindie_sim.prediction.mechanism import Geometry
-from mindie_sim.prediction.operators import gdn_output, kda_recurrent, kda_recurrent_membase
+from mindie_sim.prediction.operators.linear_attention import gdn_output
+from mindie_sim.prediction.operators.kda import kda_recurrent, kda_recurrent_membase
 from mindie_sim.prediction.operators.linear_attention import (
     RECOVER_SSM_FAMILIES, build as build_governed, build_recover_ssm_commit, build_recover_ssm_verify,
     rank_one_transition, resolve_operator_plan,
 )
 from mindie_sim.prediction.program import RecipeContext
-from mindie_sim.prediction.recover_ssm_commit import bind_declared_body_commits, bind_recover_ssm_commits
-from mindie_sim.prediction.recover_ssm_work import commit_tokens_for_view
-from mindie_sim.prediction.recurrent import _sum_valid_powers
-from mindie_sim.prediction.recurrent_template import lower_recurrent_scan, recurrent_scan_classes
+from mindie_sim.prediction.operators.recurrent.recover_ssm_commit import bind_declared_body_commits, bind_recover_ssm_commits
+from mindie_sim.prediction.operators.recurrent.recover_ssm_work import commit_tokens_for_view
+from mindie_sim.prediction.operators.recurrent.recurrent import _sum_valid_powers
+from mindie_sim.prediction.operators.recurrent.recurrent_template import lower_recurrent_scan, recurrent_scan_classes
 from mindie_sim.prediction.verification import verify_operator
 from mindie_sim.schema.case import Software
 from mindie_sim.schema.common import ModelingError

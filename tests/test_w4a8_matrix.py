@@ -7,8 +7,8 @@ from mindie_sim.catalog.ops import gemm_op
 from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.prediction.engine import Engine, Resource
 from mindie_sim.prediction.program import RecipeContext
-from mindie_sim.prediction.w4a8_matrix import matrix_program, owner_rectangles
-from mindie_sim.prediction.w4a8_schedule import down_schedule, gate_schedule, total_work
+from mindie_sim.prediction.operators.mx_quant_matrix.w4a8_matrix import matrix_program, owner_rectangles
+from mindie_sim.prediction.operators.mx_quant_matrix.w4a8_schedule import down_schedule, gate_schedule, total_work
 
 
 def _schedule(rows=(1, 0, 3), n=320, k=640, cores=1, down=False):

@@ -21,10 +21,12 @@ from mindie_sim.schema.operators import OpSpec
 from ...mechanism import OperatorPlan, Work
 from ...runtime.memory_physics import AddressRunPlan
 from ..contracts import OperatorPlanningContext
+from ..attention.common import planning_sequence_spans, sequence_layout_metadata
 from ._lowering import (
     BF16_BYTES, FP32_BYTES, FRACTAL_K_BF16, FRACTAL_K_BYTE, FRACTAL_MN, MX_GROUP_SIZE,
     _Chunk, _Demand, _GenericTiling, _Phase, _PrologProgramBuilder, _ResidentTiling,
-    _activation, _align, _dual_rows, _generic_projection, _parts, _plane, _repeat_demand, _summarize, _transfer, _weight,
+    _activation, _align, _dual_rows, _generic_projection, _parts, _plane, _repeat_demand, _summarize, _token_chunks,
+    _transfer, _weight,
     ceil_div, fractal_issues,
 )
 
@@ -158,7 +160,9 @@ def _integer(value, name: str, minimum: int = 0) -> int:
     return number
 
 
-def validate_contract(op: OpSpec, requested_abi: str | None = None) -> PrologContract:
+def validate_contract(
+    op: OpSpec, requested_abi: str | None = None, *, ctx: OperatorPlanningContext | None = None,
+) -> PrologContract:
     metadata = dict(op.metadata)
     shape = op.local_shape or op.semantic_shape
     raw = {**metadata, **dict(metadata.get("prolog_v4_geometry") or {}),
@@ -208,6 +212,9 @@ def validate_contract(op: OpSpec, requested_abi: str | None = None) -> PrologCon
         raise ModelingError(f"mla_prolog_unsupported_cache_mode:{mode}")
     batch_seq_fused = bool(raw.get("batch_seq_fused", False))
     actual = raw.get("actual_seq_len")
+    if ctx is not None and ctx.requests:
+        actual = tuple(span[0] for span in planning_sequence_spans(ctx, "TND" if batch_seq_fused else "BSH"))
+        dims["tokens"] = sum(actual)
     if actual is not None:
         try:
             actual = tuple(_integer(v, "actual_seq_len") for v in actual)
@@ -222,6 +229,10 @@ def validate_contract(op: OpSpec, requested_abi: str | None = None) -> PrologCon
         tile_size=tile_size,
         emit_query_norm_out=bool(raw.get("emit_query_norm_out", True)), dsl_d_width=dsl_width,
     )
+
+
+def contract_for(op: OpSpec, ctx: OperatorPlanningContext) -> PrologContract:
+    return validate_contract(op, ctx.requested_abi, ctx=ctx)
 
 
 def _products(c: PrologContract) -> tuple[tuple[str, int, int, int, str], ...]:
@@ -306,6 +317,7 @@ class _ChunkGraph:
     fixpipe_alignment: int | None
     phases: list[_Phase]
     cq_scale_slot_rows: int = 0
+    token_runs: tuple[tuple[int, int], ...] = ()
 
     def add(self, name: str, after: tuple[str, ...], demands) -> str:
         self.phases.append(_Phase(name, after, tuple(demands)))
@@ -334,7 +346,10 @@ class _ChunkGraph:
 
         reads, operands, cubes, publish = [], [], [], []
         for owner, (cols, start, batches) in zip(self.aics, slices, strict=False):
-            activation = (_plane(rows, _activation(k, dtype)),)
+            width = _activation(k, dtype)
+            activation = (_plane(rows, width),)
+            if self.token_runs and name in {"mm1_cq", "mm2_ckv_kr"}:
+                activation = tuple(_plane(count, width, offset=offset * width) for offset, count in self.token_runs)
             weight = _weight(cols, k, dtype, k0)
             if name == "mm4_w_uk":
                 head_width = k if c.weight_quant_mode != WEIGHT_QUANT_BF16 else k + c.qk_rope_head_dim
@@ -701,9 +716,11 @@ def build_plan(
         raise ModelingError("mla_prolog_requires_aic_and_aiv_owners")
     dsl_tiling = resident or generic
     chunk_size = dsl_tiling.token_tile if dsl_tiling else step_batch(c)
-    if not c.is_dsl and c.tokens and ctx.datapath.usable_paths:
+    if fixpipe_alignment is None and not c.is_dsl and c.tokens and ctx.datapath.usable_paths:
         fixpipe_alignment = ctx.datapath.route("l0c", "gm").path.alignment_bytes
     l2 = "l2" in ctx.geometry.rates or "l2" in ctx.geometry.resource_units
+    if l2 and ctx.requests and ctx.admission_memory_view is not None:
+        l2 = ctx.admission_memory_view.effective_l2_bytes(ctx.geometry.rank or 0) > 0
     groups = []
     if c.tokens and not c.is_dsl:
         if split_m:
@@ -723,13 +740,18 @@ def build_plan(
         elif generic:
             gm_alignment = ctx.datapath.route("l0c", "gm").path.alignment_bytes
             programs.append((graph.lower_generic(generic, pairs, gm_alignment),))
+    spans = planning_sequence_spans(ctx, "TND" if c.batch_seq_fused else "BSH")
+    token_start = 0
     for rows, aics, aivs in groups:
         full, tail = divmod(rows, chunk_size)
+        chunks = (_token_chunks(spans, token_start, rows, chunk_size) if spans else
+                  ((chunk_size, full, ()), (tail, int(bool(tail)), ())))
         programs.append(tuple(
             _ChunkGraph(c, size, aics, aivs, l2, fixpipe_alignment, [],
-                        cq_scale_slot_rows=chunk_size if cq_scale else 0).lower(count)
-            for size, count in ((chunk_size, full), (tail, int(bool(tail)))) if count
+                        cq_scale_slot_rows=chunk_size if cq_scale else 0, token_runs=addresses).lower(count)
+            for size, count, addresses in chunks if count
         ))
+        token_start += rows
     program = _PrologProgramBuilder(tuple(programs), ctx.datapath.aic_count, ctx.datapath.aiv_count,
                                     ctx.stream_owners if c.is_dsl else None)
     work, spec = _summarize(program, FAMILY, c.abi, sources)
@@ -746,4 +768,5 @@ def build_plan(
         "do_rope": c.do_rope, "logical_flops": c.logical_flops, "source_program": sources[0].to_dict(),
         "issued_flops": sum(work.matrix.values()),
         "workspace_slot_bytes": sum(max(chunk.workspace_bytes for chunk in group) for group in programs),
+        **sequence_layout_metadata(ctx, "TND" if c.batch_seq_fused else "BSH"),
     }, pipeline_spec=spec)

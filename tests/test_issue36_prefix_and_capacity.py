@@ -28,9 +28,9 @@ from _support.builders import dense_case, dense_layer, dense_model, linear_model
 from mindie_sim.catalog.cache_ownership import draft_cache_components
 from mindie_sim.catalog.draft_geometry import native_draft_layer_plans
 from mindie_sim.catalog.types import AuxiliarySpec, DraftSpec
-from mindie_sim.prediction.batch_prefix_attention import BatchPrefixAttention
+from mindie_sim.prediction.operators.attention.batch_prefix_attention import BatchPrefixAttention
 from mindie_sim.prediction.capacity import Memory
-from mindie_sim.prediction.draft_context import prepare
+from mindie_sim.prediction.operators.mla_prolog.draft_context import prepare
 from mindie_sim.schema.dspark import DsparkSpec
 from mindie_sim.schema.operators import OpSpec
 

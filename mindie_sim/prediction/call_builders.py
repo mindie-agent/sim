@@ -80,20 +80,20 @@ def _activation(arguments):
 
 
 def _gdn(arguments):
-    from .call_gdn import make_call
+    from mindie_sim.prediction.operators.linear_attention.call_gdn import make_call
     call = make_call(arguments["role"], {key: value for key, value in arguments.items()
                                         if key != "role"})
     return CallDefinition(call.ops, call.recipes, call.ledger, call.limitations)
 
 
 def _quantized_grouped(arguments):
-    from .call_grouped import build_quantized_grouped_call
+    from mindie_sim.prediction.operators.grouped_moe.call_grouped import build_quantized_grouped_call
     call = build_quantized_grouped_call(arguments)
     return CallDefinition(call.ops, call.recipes, call.ledger, call.limitations)
 
 
 def _quantized_grouped_source(arguments):
-    from .call_grouped_source import build_quantized_grouped_source_call
+    from mindie_sim.prediction.operators.grouped_moe.call_grouped_source import build_quantized_grouped_source_call
     return build_quantized_grouped_source_call(arguments)
 
 
@@ -194,11 +194,11 @@ def _attach_abi(op, arguments, symbol, kind):
 
 
 def _recipes(kind, recipe):
-    from .attention_pipeline import TiledFlashAndPagedAttentionRecipe
-    from .expected_grouped import ExpectedGroupedMatmul
-    from .matrix_steady import SteadyMatmul
+    from mindie_sim.prediction.operators.attention.attention_pipeline import TiledFlashAndPagedAttentionRecipe
+    from mindie_sim.prediction.operators.grouped_moe.expected_grouped import ExpectedGroupedMatmul
+    from mindie_sim.prediction.operators.matrix.matrix_steady import SteadyMatmul
     from .program import RecipeBook
-    from .vector_pipeline import AIVTiledVectorAndGatherRecipe
+    from mindie_sim.prediction.operators.vector.vector_pipeline import AIVTiledVectorAndGatherRecipe
     if kind == ACLNN_MATRIX_KIND:
         selected = SteadyMatmul()
     elif kind == ACLNN_GROUPED_KIND:

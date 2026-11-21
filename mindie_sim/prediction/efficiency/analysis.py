@@ -381,7 +381,8 @@ def scale_case_hardware(case: CaseSpec | Mapping[str, Any], *, hbm_bw_scale: flo
                 dev_dict[key] = float(dev_dict[key]) * hbm_bw_scale
         for m_name, m_spec in dev_dict.get("service_modes", {}).items():
             if m_spec.get("rate") is not None:
-                m_spec["rate"] = float(m_spec["rate"]) * _role_scale_factor(str(m_spec.get("resource") or svc_role.get(m_name) or mode_to_role.get(m_name, m_name)), **kw)
+                m_role = "hbm" if m_name in {"mte2_aic_dram", "mte2_aiv_dram"} else str(m_spec.get("resource") or svc_role.get(m_name) or mode_to_role.get(m_name, m_name))
+                m_spec["rate"] = float(m_spec["rate"]) * _role_scale_factor(m_role, **kw)
         for svc_name, svc_spec in ins_map.items():
             if not svc_spec.get("scale_with"):
                 sf = _role_scale_factor(svc_role[svc_name], **kw)

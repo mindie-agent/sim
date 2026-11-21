@@ -577,11 +577,10 @@ def test_feature_superposition_pp_pcp_mc2_dspark_mtp_sp() -> None:
     eff_no = analyze_network_efficiency(
         glm53_no, phase="prefill", tokens=tokens, context=0, sequences=1,
         scope="body", run_graph=False)
-    # M2 prices the SP allgather/reduce_scatter pair and the distributed norm
-    # quantization explicitly; superposition is cost-neutral at the operator
-    # sum rather than unconditionally cheaper, while SP adds PCP gather wire.
-    assert eff_sp["operator_sum_ms"] == pytest.approx(
-        eff_no["operator_sum_ms"], rel=0.01)
+    # Separate SP quantization adds 17.5 us and the net extra gather adds
+    # 1.606 us at 122 GB/s effective SIO. Router service offsets 0.761 us.
+    assert eff_sp["operator_sum_ms"] - eff_no["operator_sum_ms"] == pytest.approx(
+        0.0183449315728843, abs=1e-8)
     assert eff_sp["total_link_bytes"] > eff_no["total_link_bytes"]
 
     # PP x DSpark, with AttnRes state crossing stages: layer FLOPs and HBM

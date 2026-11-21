@@ -549,7 +549,7 @@ def _kda_default(case, phase, tokens, kernels):
                 else "vllm_ascend_recurrent_kda_arch22")
         options = {}
         if case.machine.arch_family == "A5":
-            from .kda_source import resolve as resolve_kda_source
+            from mindie_sim.prediction.operators.kda.kda_source import resolve as resolve_kda_source
             bounds = {getattr(p, "kda_gate_lower_bound", None) for p in layers}
             if len(bounds) != 1:
                 reason = "kda_gate_lower_bound_not_uniform_across_layers"
@@ -576,7 +576,7 @@ def _attnres_default(case, phase, kernels):
     # Fusing the block would delete these independently declared member
     # programs, so an explicit residual recipe/family keeps the unfused
     # boundary.  Generic matmul/service declarations are not residual choices.
-    from . import family_attnres
+    from mindie_sim.prediction.operators.hyper_connections import family_attnres
     recipes = {"attn_res_fwd", "residual_values_fp32", "rmsnorm",
                "attention_residual_scores", "attention_residual_softmax",
                "attention_residual_mix", "attention_residual_output_cast"}
@@ -663,7 +663,7 @@ def attention_defaults(case, phase, *, tokens=1):
             else:
                 packed = case.model.quant.kv_dtype == "int8"
                 if packed:
-                    from .indexed_quant_attention import VECTOR_BUFFER_BYTES
+                    from mindie_sim.prediction.operators.paged_mla.indexed_quant_attention import VECTOR_BUFFER_BYTES
                     if any(d.pool_units("ub") != d.compute_units * 2
                            or dict(d.buffers).get("ub", 0) < VECTOR_BUFFER_BYTES
                            or any(d.units(role) != d.compute_units * ratio for role, ratio in (
@@ -684,7 +684,7 @@ def attention_defaults(case, phase, *, tokens=1):
         records.append({"family": family, "selection": "preserved" if reason else "default_installed",
                         "reason": reason or "supported_tensor_and_resource_geometry"})
     if dense_mla:
-        from . import paged_mla, paged_mla_membase
+        from mindie_sim.prediction.operators.paged_mla import paged_mla, paged_mla_membase
         explicit = ("attention" in kernels.get("families", {}) or "mla_attention" in recipes
                     or any(k in lowerings for k in ("paged_mla_attention", "mla_decode")))
         arch_family = case.machine.arch_family

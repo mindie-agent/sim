@@ -5,12 +5,12 @@ from pathlib import Path
 
 import pytest
 
-from mindie_sim.prediction.family_situ_mx import (
+from mindie_sim.prediction.operators.mx_quant_matrix.family_situ_mx import (
     Config, PROFILE, config_from_group, make_op, owner_rows, recipe_book, tiling_for,
 )
 from mindie_sim.prediction.graph_analysis import graph_costs
 from mindie_sim.prediction.mechanism import Geometry
-from mindie_sim.prediction.native_fusion import _groups, lower_native_fusions
+from mindie_sim.prediction.operators.hyper_connections.native_fusion import _groups, lower_native_fusions
 from mindie_sim.prediction.operator_analysis import operator_costs, target_operators
 from mindie_sim.prediction.program import RecipeBook
 from mindie_sim.prediction.structure import parse_case

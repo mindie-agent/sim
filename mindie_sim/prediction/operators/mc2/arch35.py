@@ -17,12 +17,12 @@ from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import ArchId, SourceRef
 from mindie_sim.schema.operators import OpSpec
 from . import megamoe as mc2_megamoe
-from ...mc2_phase import RECIPE, build as build_fullmesh, contract
+from mindie_sim.prediction.operators.mc2.mc2_phase import RECIPE, build as build_fullmesh, contract
 from ...mechanism import OperatorPlan, PlannedRecipe, Work
-from ...moe_comm_selection import FUSED_MC2
+from mindie_sim.prediction.operators.mc2.moe_comm_selection import FUSED_MC2
 from ..contracts import ArchStrategy, OperatorPlanningContext
-from ..mc2_fullmesh import SOURCE, combine_layout, dispatch_layout
-from ..mc2_mx_quant import mx32_work
+from mindie_sim.prediction.operators.mc2.mc2_fullmesh import SOURCE, combine_layout, dispatch_layout
+from mindie_sim.prediction.operators.mc2.mc2_mx_quant import mx32_work
 from .common import (
     COLLECTIVES, COMBINE, FLOAT_ROWS, MMRS, Mc2Contract, PeerRoute, Transport, build_transport_stages, capability_gap,
     contract_fields, make_plan, native_protocol_peer_transport, topology_hops,
@@ -327,6 +327,55 @@ def lower_native_protocol(
             valid_source_tokens = (valid_tokens / source_partitions
                                    if valid_tokens is not None else tokens)
     send = valid_source_tokens * top_k
+    quant, absorbed = _dispatch_quant_mode(selected, pack, pack_quant, by_id, prefix, dispatch, width)
+    parallel_cfg = getattr(runtime, "parallel", None)
+    has_redundant_slots = int(getattr(parallel_cfg, "redundant_experts_per_rank", 0) or 0) > 0
+    if (selected.get("selected_method") == FUSED_MC2
+            and received_assignments
+            and not has_redundant_slots):
+        megamoe = _try_lower_megamoe(
+            ops, by_id, selected, prefix, tokens, width, top_k, received_assignments,
+            ep, dtype, pack, dispatch, combine, unpack, pack_quant,
+        )
+        if megamoe is not None:
+            return megamoe
+    received_quant = None
+    if pack_quant is not None and quant == "none" and received_assignments:
+        gate = by_id.get(prefix + ".expert_up")
+        if gate is None or gate.deps != (dispatch.op_id,):
+            raise ModelingError("mc2_received_quantizer_requires_direct_expert")
+        received_quant, by_id[gate.op_id] = _received_quantizer(
+            pack_quant, gate, dispatch.op_id, received_assignments, width)
+    payload_dtype = {"mx": "fp8_e4m3", "per_token_int8": "int8"}.get(quant, dtype)
+    quant_mode = "per_token" if quant == "per_token_int8" else quant
+    layouts = (dispatch_layout(width, input_dtype=dtype, payload_dtype=payload_dtype,
+                               quant_mode=quant_mode),
+               combine_layout(width, dtype=dtype))
+    if quant in {"mx", "per_token_int8"}:
+        _bind_quantized_expert_input(
+            by_id, prefix, dispatch, received_assignments, width, dtype,
+            quant, payload_dtype, layouts,
+        )
+    row_format = {"forward_bytes": layouts[0].packet_bytes,
+                  "reverse_bytes": layouts[1].packet_bytes}
+    forward_raw, backward_raw, payload_basis, source_key = _routing_contracts(
+        source_routing, source_rows_by_replica, destination_rows_by_rank,
+        ep, width, dtype, tokens, valid_source_tokens, top_k, experts,
+        quant, quant_mode, payload_dtype, layouts, send, received_assignments,
+    )
+    dispatch_op, combine_op = _native_dispatch_combine(
+        pack, dispatch, combine, unpack, prefix, dtype, width, ep, selected,
+        quant, payload_dtype, layouts, received_assignments, absorbed,
+        forward_raw, backward_raw, source_routing, source_key, source_metadata,
+        row_format, source_partitions, payload_basis,
+    )
+    return _replace_protocol_ops(
+        ops, by_id, pack, dispatch, combine, unpack, pack_quant,
+        dispatch_op, combine_op, received_quant,
+    )
+
+
+def _dispatch_quant_mode(selected, pack, pack_quant, by_id, prefix, dispatch, width):
     quant = selected.get("dispatch_quant", "none")
     # ``aclnnMoeInitRoutingV3`` may own the dispatch-input quantization
     # (``quant_mode=1``) instead of a separate ``pack.quantize`` node.  The
@@ -361,166 +410,171 @@ def lower_native_protocol(
                   and pmeta.get("activation_scale_format") == "fp32"
                   and gmeta.get("activation_format") == "int8"):
                 quant = "per_token_int8"
-    parallel_cfg = getattr(runtime, "parallel", None)
-    has_redundant_slots = int(getattr(parallel_cfg, "redundant_experts_per_rank", 0) or 0) > 0
-    if (selected.get("selected_method") == FUSED_MC2
-            and received_assignments
-            and not has_redundant_slots):
-        e_up = by_id.get(prefix + ".expert_up")
-        e_act = by_id.get(prefix + ".expert_act")
-        e_down = by_id.get(prefix + ".expert_down")
-        up_meta = dict(e_up.metadata) if e_up is not None else {}
-        e_comp = str(up_meta.get("compute_format") or "").lower()
-        e_wfmt = str(up_meta.get("weight_format") or "").lower()
-        mx_act = (
-            up_meta.get("activation_group_size") == MX_DISPATCH_GROUP
-            and up_meta.get("activation_scale_format") in {"fp8_e8m0", "e8m0"}
-        )
-        mxfp_eligible = mx_act and (
-            e_comp in {"fp8_e4m3", "mxfp4", "fp4_e2m1"}
-            or e_wfmt in {"mxfp8", "mxfp4", "fp8_e4m3", "fp4_e2m1"}
-        )
-        if (e_up is not None and e_act is not None and e_down is not None
-                and e_up.deps == (dispatch.op_id,)
-                and e_act.deps == (e_up.op_id,)
-                and e_down.deps == (e_act.op_id,)
-                and combine.deps == (e_down.op_id,)
-                and mxfp_eligible):
-            act_meta = dict(e_act.metadata)
-            act_kind = str(act_meta.get("activation_kind") or e_act.family or "swiglu").lower()
-            if act_kind in mc2_megamoe.SUPPORTED_ACTIVATIONS:
-                fused_lvl = int(selected.get("fused_mc2_level") or FUSED_MC2_ROUTED_MODE)
-                fused_lvl = FUSED_MC2_SHARED_MODE if fused_lvl >= FUSED_MC2_SHARED_MODE else FUSED_MC2_ROUTED_MODE
-                moe_inter = int(e_down.local_shape[-1])
-                down_meta = dict(e_down.metadata)
-                w13_b = float(up_meta.get("packed_weight_bytes") or max(0.0, e_up.mte2_bytes - received_assignments * width))
-                w2_b = float(down_meta.get("packed_weight_bytes") or max(0.0, e_down.mte2_bytes - received_assignments * moe_inter))
-                sh_ops = [item for item in ops if item.op_id.startswith(prefix + ".shared.")]
-                join_op = by_id.get(prefix + ".join")
-                sh_up = by_id.get(prefix + ".shared.gate_up")
-                sh_down = by_id.get(prefix + ".shared.down")
-                fuse_shared = (
-                    fused_lvl == FUSED_MC2_SHARED_MODE
-                    and bool(sh_ops) and sh_up is not None
-                    and sh_down is not None and join_op is not None
-                    and len(join_op.deps) == 2 and unpack.op_id in join_op.deps
-                    and any(dep.startswith(prefix + ".shared.") for dep in join_op.deps)
-                )
-                sh_inter = int(sh_up.local_shape[1] // 2) if fuse_shared else 0
-                sh_w13 = float(dict(sh_up.metadata).get("packed_weight_bytes") or 0.0) if fuse_shared else 0.0
-                sh_w2 = float(dict(sh_down.metadata).get("packed_weight_bytes") or 0.0) if fuse_shared else 0.0
-                removed_ids = {
-                    pack.op_id, dispatch.op_id, e_up.op_id, e_act.op_id,
-                    e_down.op_id, combine.op_id, unpack.op_id,
-                }
-                if pack_quant is not None:
-                    removed_ids.add(pack_quant.op_id)
-                target_id = unpack.op_id
-                mega_deps = list(pack.deps)
-                for dep in unpack.deps:
-                    if dep not in removed_ids and dep not in mega_deps:
-                        mega_deps.append(dep)
-                if fuse_shared:
-                    sh_ids = {item.op_id for item in sh_ops}
-                    removed_ids.update(sh_ids)
-                    removed_ids.add(join_op.op_id)
-                    target_id = join_op.op_id
-                    for item in sh_ops:
-                        for dep in item.deps:
-                            if dep not in removed_ids and dep not in mega_deps:
-                                mega_deps.append(dep)
-                if not any(
-                    dep in removed_ids and dep != target_id
-                    for item in ops if item.op_id not in removed_ids
-                    for dep in item.deps
-                ):
-                    mega_op = mc2_megamoe.make_op(
-                        op_id=target_id, deps=tuple(mega_deps),
-                        stage=unpack.stage, layer=unpack.layer,
-                        requests=unpack.requests, phase=unpack.phase,
-                        tokens=int(tokens), hidden=int(width),
-                        moe_inter=moe_inter, top_k=int(top_k),
-                        routed_rows=float(received_assignments),
-                        w13_bytes=w13_b, w2_bytes=w2_b,
-                        enable_fused_mc2=fused_lvl if fuse_shared else FUSED_MC2_ROUTED_MODE,
-                        ep=int(ep), activation=act_kind,
-                        compute_dtype="fp8_e4m3", output_dtype=dtype,
-                        dispatch_link_bytes=float(dispatch.link_bytes),
-                        combine_link_bytes=float(combine.link_bytes),
-                        shared_inter=sh_inter, shared_w13_bytes=sh_w13,
-                        shared_w2_bytes=sh_w2,
-                        extra_metadata=(
-                            ("device_kernel_group", {
-                                "id": prefix + ".megamoe",
-                                "entry": True,
-                                "exit": True,
-                                "kernel": mc2_megamoe.NATIVE_KIND,
-                            }),
-                        ),
-                    )
-                    rebuilt = []
-                    inserted = False
-                    for item in ops:
-                        if item.op_id == target_id:
-                            rebuilt.append(mega_op)
-                            inserted = True
-                        elif item.op_id in removed_ids:
-                            continue
-                        else:
-                            rebuilt.append(item)
-                    if inserted:
-                        return rebuilt
-    received_quant = None
-    if pack_quant is not None and quant == "none" and received_assignments:
-        gate = by_id.get(prefix + ".expert_up")
-        if gate is None or gate.deps != (dispatch.op_id,):
-            raise ModelingError("mc2_received_quantizer_requires_direct_expert")
-        received_quant, by_id[gate.op_id] = _received_quantizer(
-            pack_quant, gate, dispatch.op_id, received_assignments, width)
-    payload_dtype = {"mx": "fp8_e4m3", "per_token_int8": "int8"}.get(quant, dtype)
-    quant_mode = "per_token" if quant == "per_token_int8" else quant
-    layouts = (dispatch_layout(width, input_dtype=dtype, payload_dtype=payload_dtype,
-                               quant_mode=quant_mode),
-               combine_layout(width, dtype=dtype))
-    if quant in {"mx", "per_token_int8"}:
-        if quant == "mx":
-            mx32_work(width, dtype, payload_dtype)
-        gate = by_id.get(prefix + ".expert_up")
-        if gate is None:
-            if received_assignments:
-                raise ModelingError("mc2_quantized_requires_direct_expert_input_consumer")
+    return quant, absorbed
+
+
+def _try_lower_megamoe(
+    ops, by_id, selected, prefix, tokens, width, top_k, received_assignments,
+    ep, dtype, pack, dispatch, combine, unpack, pack_quant,
+):
+    e_up = by_id.get(prefix + ".expert_up")
+    e_act = by_id.get(prefix + ".expert_act")
+    e_down = by_id.get(prefix + ".expert_down")
+    up_meta = dict(e_up.metadata) if e_up is not None else {}
+    e_comp = str(up_meta.get("compute_format") or "").lower()
+    e_wfmt = str(up_meta.get("weight_format") or "").lower()
+    mx_act = (
+        up_meta.get("activation_group_size") == MX_DISPATCH_GROUP
+        and up_meta.get("activation_scale_format") in {"fp8_e8m0", "e8m0"}
+    )
+    mxfp_eligible = mx_act and (
+        e_comp in {"fp8_e4m3", "mxfp4", "fp4_e2m1"}
+        or e_wfmt in {"mxfp8", "mxfp4", "fp8_e4m3", "fp4_e2m1"}
+    )
+    if not (e_up is not None and e_act is not None and e_down is not None
+            and e_up.deps == (dispatch.op_id,)
+            and e_act.deps == (e_up.op_id,)
+            and e_down.deps == (e_act.op_id,)
+            and combine.deps == (e_down.op_id,)
+            and mxfp_eligible):
+        return None
+    act_meta = dict(e_act.metadata)
+    act_kind = str(act_meta.get("activation_kind") or e_act.family or "swiglu").lower()
+    if act_kind not in mc2_megamoe.SUPPORTED_ACTIVATIONS:
+        return None
+
+    fused_lvl = int(selected.get("fused_mc2_level") or FUSED_MC2_ROUTED_MODE)
+    fused_lvl = FUSED_MC2_SHARED_MODE if fused_lvl >= FUSED_MC2_SHARED_MODE else FUSED_MC2_ROUTED_MODE
+    moe_inter = int(e_down.local_shape[-1])
+    down_meta = dict(e_down.metadata)
+    w13_b = float(up_meta.get("packed_weight_bytes") or max(0.0, e_up.mte2_bytes - received_assignments * width))
+    w2_b = float(down_meta.get("packed_weight_bytes") or max(0.0, e_down.mte2_bytes - received_assignments * moe_inter))
+    sh_ops = [item for item in ops if item.op_id.startswith(prefix + ".shared.")]
+    join_op = by_id.get(prefix + ".join")
+    sh_up = by_id.get(prefix + ".shared.gate_up")
+    sh_down = by_id.get(prefix + ".shared.down")
+    fuse_shared = (
+        fused_lvl == FUSED_MC2_SHARED_MODE
+        and bool(sh_ops) and sh_up is not None
+        and sh_down is not None and join_op is not None
+        and len(join_op.deps) == 2 and unpack.op_id in join_op.deps
+        and any(dep.startswith(prefix + ".shared.") for dep in join_op.deps)
+    )
+    sh_inter = int(sh_up.local_shape[1] // 2) if fuse_shared else 0
+    sh_w13 = float(dict(sh_up.metadata).get("packed_weight_bytes") or 0.0) if fuse_shared else 0.0
+    sh_w2 = float(dict(sh_down.metadata).get("packed_weight_bytes") or 0.0) if fuse_shared else 0.0
+    removed_ids = {
+        pack.op_id, dispatch.op_id, e_up.op_id, e_act.op_id,
+        e_down.op_id, combine.op_id, unpack.op_id,
+    }
+    if pack_quant is not None:
+        removed_ids.add(pack_quant.op_id)
+    target_id = unpack.op_id
+    mega_deps = list(pack.deps)
+    for dep in unpack.deps:
+        if dep not in removed_ids and dep not in mega_deps:
+            mega_deps.append(dep)
+    if fuse_shared:
+        sh_ids = {item.op_id for item in sh_ops}
+        removed_ids.update(sh_ids)
+        removed_ids.add(join_op.op_id)
+        target_id = join_op.op_id
+        for item in sh_ops:
+            for dep in item.deps:
+                if dep not in removed_ids and dep not in mega_deps:
+                    mega_deps.append(dep)
+    if any(
+        dep in removed_ids and dep != target_id
+        for item in ops if item.op_id not in removed_ids
+        for dep in item.deps
+    ):
+        return None
+
+    mega_op = mc2_megamoe.make_op(
+        op_id=target_id, deps=tuple(mega_deps),
+        stage=unpack.stage, layer=unpack.layer,
+        requests=unpack.requests, phase=unpack.phase,
+        tokens=int(tokens), hidden=int(width),
+        moe_inter=moe_inter, top_k=int(top_k),
+        routed_rows=float(received_assignments),
+        w13_bytes=w13_b, w2_bytes=w2_b,
+        enable_fused_mc2=fused_lvl if fuse_shared else FUSED_MC2_ROUTED_MODE,
+        ep=int(ep), activation=act_kind,
+        compute_dtype="fp8_e4m3", output_dtype=dtype,
+        dispatch_link_bytes=float(dispatch.link_bytes),
+        combine_link_bytes=float(combine.link_bytes),
+        shared_inter=sh_inter, shared_w13_bytes=sh_w13,
+        shared_w2_bytes=sh_w2,
+        extra_metadata=(
+            ("device_kernel_group", {
+                "id": prefix + ".megamoe",
+                "entry": True,
+                "exit": True,
+                "kernel": mc2_megamoe.NATIVE_KIND,
+            }),
+        ),
+    )
+    rebuilt = []
+    inserted = False
+    for item in ops:
+        if item.op_id == target_id:
+            rebuilt.append(mega_op)
+            inserted = True
+        elif item.op_id in removed_ids:
+            continue
         else:
-            meta = dict(gate.metadata)
-            # This dispatch owns exactly this consumer's input representation.
-            # A transport selection cannot suppress an unrelated conversion.
-            direct = (gate.deps == (dispatch.op_id,) and gate.local_shape[-1] == width
-                      and meta.get("activation_format") == payload_dtype)
-            if quant == "mx":
-                matched = (meta.get("activation_group_size") == MX_DISPATCH_GROUP
-                           and meta.get("activation_scale_format") == "fp8_e8m0"
-                           and tuple(meta.get("activation_scale_shape", ()))[1:] == (width // (2 * MX_DISPATCH_GROUP), 2))
-                requirement = "matching_e4m3_e8m0_group32"
-            else:
-                matched = (meta.get("activation_group_size") == width
-                           and meta.get("activation_scale_format") == "fp32"
-                           and tuple(meta.get("activation_scale_shape", ())) == (math.ceil(received_assignments),))
-                requirement = "matching_int8_fp32_per_row"
-            if (not direct or not matched
-                    or meta.get("activation_scale_bytes") != received_assignments * layouts[0].scale_bytes):
-                raise ModelingError(f"mc2_{quant}_expert_input_requires_{requirement}_producer")
-            # The fused dispatch owns the absorbed init-routing quantization,
-            # so it publishes both the quantized payload and its scales.
-            meta.update(activation_producer="explicit_transport_quantization",
-                        activation_payload_producer=dispatch.op_id,
-                        activation_scale_producer=dispatch.op_id,
-                        moe_transport_kind=("arch35_fullmesh_mx32" if quant == "mx"
-                                            else "arch35_fullmesh_per_token_int8"))
-            by_id[gate.op_id] = replace(gate, metadata=tuple(meta.items()))
-        down = by_id.get(prefix + ".expert_down")
-        if down is not None and dict(down.metadata).get("output_format") != dtype:
-            raise ModelingError("mc2_quantized_combine_requires_declared_float_expert_return")
-    row_format = {"forward_bytes": layouts[0].packet_bytes,
-                  "reverse_bytes": layouts[1].packet_bytes}
+            rebuilt.append(item)
+    if inserted:
+        return rebuilt
+
+
+def _bind_quantized_expert_input(
+    by_id, prefix, dispatch, received_assignments, width, dtype,
+    quant, payload_dtype, layouts,
+):
+    if quant == "mx":
+        mx32_work(width, dtype, payload_dtype)
+    gate = by_id.get(prefix + ".expert_up")
+    if gate is None:
+        if received_assignments:
+            raise ModelingError("mc2_quantized_requires_direct_expert_input_consumer")
+    else:
+        meta = dict(gate.metadata)
+        # This dispatch owns exactly this consumer's input representation.
+        # A transport selection cannot suppress an unrelated conversion.
+        direct = (gate.deps == (dispatch.op_id,) and gate.local_shape[-1] == width
+                  and meta.get("activation_format") == payload_dtype)
+        if quant == "mx":
+            matched = (meta.get("activation_group_size") == MX_DISPATCH_GROUP
+                       and meta.get("activation_scale_format") == "fp8_e8m0"
+                       and tuple(meta.get("activation_scale_shape", ()))[1:] == (width // (2 * MX_DISPATCH_GROUP), 2))
+            requirement = "matching_e4m3_e8m0_group32"
+        else:
+            matched = (meta.get("activation_group_size") == width
+                       and meta.get("activation_scale_format") == "fp32"
+                       and tuple(meta.get("activation_scale_shape", ())) == (math.ceil(received_assignments),))
+            requirement = "matching_int8_fp32_per_row"
+        if (not direct or not matched
+                or meta.get("activation_scale_bytes") != received_assignments * layouts[0].scale_bytes):
+            raise ModelingError(f"mc2_{quant}_expert_input_requires_{requirement}_producer")
+        # The fused dispatch owns the absorbed init-routing quantization,
+        # so it publishes both the quantized payload and its scales.
+        meta.update(activation_producer="explicit_transport_quantization",
+                    activation_payload_producer=dispatch.op_id,
+                    activation_scale_producer=dispatch.op_id,
+                    moe_transport_kind=("arch35_fullmesh_mx32" if quant == "mx"
+                                        else "arch35_fullmesh_per_token_int8"))
+        by_id[gate.op_id] = replace(gate, metadata=tuple(meta.items()))
+    down = by_id.get(prefix + ".expert_down")
+    if down is not None and dict(down.metadata).get("output_format") != dtype:
+        raise ModelingError("mc2_quantized_combine_requires_declared_float_expert_return")
+
+
+def _routing_contracts(
+    source_routing, source_rows_by_replica, destination_rows_by_rank,
+    ep, width, dtype, tokens, valid_source_tokens, top_k, experts,
+    quant, quant_mode, payload_dtype, layouts, send, received_assignments,
+):
     # An exact source force-EPLB ledger is a whole routed-row matrix.  It is
     # never synthesized from a statistical destination expectation.
     peer_matrix = None
@@ -626,6 +680,15 @@ def lower_native_protocol(
 
     forward_raw = raw_contract("dispatch", send, received_assignments)
     backward_raw = raw_contract("combine", received_assignments, send)
+    return forward_raw, backward_raw, payload_basis, source_key
+
+
+def _native_dispatch_combine(
+    pack, dispatch, combine, unpack, prefix, dtype, width, ep, selected,
+    quant, payload_dtype, layouts, received_assignments, absorbed,
+    forward_raw, backward_raw, source_routing, source_key, source_metadata,
+    row_format, source_partitions, payload_basis,
+):
     phase_names = {
         "dispatch": tuple(p.name for p in contract(forward_raw, 2).phases),
         "combine": tuple(p.name for p in contract(backward_raw, 2).phases),
@@ -715,6 +778,13 @@ def lower_native_protocol(
         metadata=native_metadata(
             "combine", backward_raw, "MoeDistributeCombineV3",
             prefix + ".mc2_combine")))
+    return dispatch_op, combine_op
+
+
+def _replace_protocol_ops(
+    ops, by_id, pack, dispatch, combine, unpack, pack_quant,
+    dispatch_op, combine_op, received_quant,
+):
     # One native call replaces its semantic phase operators; the original
     # pack/dispatch/combine/unpack aliases remain connected through the entry
     # and exit ids, never through duplicated scheduling.

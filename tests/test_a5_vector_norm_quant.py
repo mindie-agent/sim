@@ -18,10 +18,10 @@ import pytest
 
 from mindie_sim.catalog.ops import gemm_op, vector_op
 from mindie_sim.prediction.blocks import norm
-from mindie_sim.prediction.family_ascend_norm import lower_op
+from mindie_sim.prediction.operators.vector.family_ascend_norm import lower_op
 from mindie_sim.prediction.transforms import lower_implementations
-from mindie_sim.prediction.dynamic_quant_schedule import quant_timeline
-from mindie_sim.prediction.mx_dynamic_quant import group32_work, producer_contract
+from mindie_sim.prediction.operators.vector.dynamic_quant_schedule import quant_timeline
+from mindie_sim.prediction.operators.vector.mx_dynamic_quant import group32_work, producer_contract
 from mindie_sim.prediction.operator_analysis import target_operators
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError

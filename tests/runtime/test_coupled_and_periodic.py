@@ -25,10 +25,10 @@ import weakref
 import pytest
 
 from mindie_sim.prediction.engine import Allocation, Engine, Resource
-from mindie_sim.prediction.matrix_cycle import matrix_cycle, periodic_matrix_cycle
+from mindie_sim.prediction.operators.matrix.matrix_cycle import matrix_cycle, periodic_matrix_cycle
 from mindie_sim.prediction.program import KernelProgram, PipelineProgram, Stage
-from mindie_sim.prediction.refill import RefillPipeline
-from mindie_sim.prediction.steady_pipeline import SteadyPipeline
+from mindie_sim.prediction.operators.matrix.refill import RefillPipeline
+from mindie_sim.prediction.operators.matrix.steady_pipeline import SteadyPipeline
 
 pytestmark = pytest.mark.tier0
 

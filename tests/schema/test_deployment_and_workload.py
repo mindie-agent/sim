@@ -33,7 +33,7 @@ from mindie_sim.compose import assemble
 from mindie_sim.model_catalog import load_model
 from mindie_sim.prediction.capacity import Memory
 from mindie_sim.prediction.dispatch import cohorts
-from mindie_sim.prediction.expert_slot_work import bind_expert_slot_work, physical_slot_work
+from mindie_sim.prediction.operators.moe_routing.expert_slot_work import bind_expert_slot_work, physical_slot_work
 from mindie_sim.prediction.local_projection_tp import lower_local_projection_tp
 from mindie_sim.prediction.lowering import Builder
 from mindie_sim.prediction.projections import kda_projections

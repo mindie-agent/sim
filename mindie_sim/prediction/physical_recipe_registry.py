@@ -16,12 +16,12 @@ from dataclasses import dataclass
 import re
 
 from mindie_sim.schema.common import ModelingError
-from .attention_pipeline import TiledFlashAndPagedAttentionRecipe
-from .linear_attention_pipeline import ChunkedLinearAttentionRecipe
+from mindie_sim.prediction.operators.attention.attention_pipeline import TiledFlashAndPagedAttentionRecipe
+from mindie_sim.prediction.operators.recurrent.linear_attention_pipeline import ChunkedLinearAttentionRecipe
 from .program import KernelProgram, Stage
-from .sparse_indexer_pipeline import TiledSparseIndexerRecipe
-from .topology_collective import TopologyCollectiveRecipe
-from .vector_pipeline import AIVTiledVectorAndGatherRecipe
+from mindie_sim.prediction.operators.sparse_indexer.sparse_indexer_pipeline import TiledSparseIndexerRecipe
+from mindie_sim.prediction.operators.collectives.topology_collective import TopologyCollectiveRecipe
+from mindie_sim.prediction.operators.vector.vector_pipeline import AIVTiledVectorAndGatherRecipe
 
 
 
@@ -183,7 +183,7 @@ def uses_retained_source_plan(op) -> bool:
     if metadata.get("requested_abi") or metadata.get("abi"):
         return False
     if op.family == "attn_res_prefix" and "attn_res_view" in metadata:
-        from .family_attnres import RECIPE
+        from mindie_sim.prediction.operators.hyper_connections.family_attnres import RECIPE
 
         # Preserve the caller's per-owner service and prepared tensor view.
         return op.recipe == RECIPE
@@ -198,12 +198,12 @@ def uses_retained_source_plan(op) -> bool:
     if metadata.get("implementation") == op.recipe and {
         "chunk", "lengths", "head_dim_k", "head_dim_v",
     }.issubset(metadata):
-        from .gdn_chunk32 import OUTPUT_RECIPE, PREPARE_RECIPE, STATE_RECIPE
+        from mindie_sim.prediction.operators.linear_attention.gdn_chunk32 import OUTPUT_RECIPE, PREPARE_RECIPE, STATE_RECIPE
 
         # The native Chunk32 caller supplies one leaf's layout and work contract.
         return op.recipe in {PREPARE_RECIPE, STATE_RECIPE, OUTPUT_RECIPE}
     if "mc2_v2_local" in metadata:
-        from .mc2_local_caller import LOCAL
+        from mindie_sim.prediction.operators.mc2.mc2_local_caller import LOCAL
 
         # Preserve the retained local-caller lower bound for explicit V2 caller graphs.
         return op.recipe == LOCAL
@@ -217,13 +217,13 @@ def physical_recipe_bindings() -> dict[str, object]:
     These bindings also provide the legacy Chunk32 and aggregate MegaMoE
     source contracts and the attention call expanders.
     """
-    from .gdn_chunk32 import recipes as chunk32_recipes
-    from .index_cache_writer import recipes as cache_writer_recipes
-    from .lowrank_hc_vector import recipes as lowrank_hc_recipes
-    from .matrix_splitk import (ScopedRouterRecipe, build_router_splitk)
+    from mindie_sim.prediction.operators.linear_attention.gdn_chunk32 import recipes as chunk32_recipes
+    from mindie_sim.prediction.operators.sparse_indexer.index_cache_writer import recipes as cache_writer_recipes
+    from mindie_sim.prediction.operators.hyper_connections.lowrank_hc_vector import recipes as lowrank_hc_recipes
+    from mindie_sim.prediction.operators.matrix.matrix_splitk import (ScopedRouterRecipe, build_router_splitk)
     from .operators.mc2.megamoe import recipes as megamoe_recipes
-    from .moe_gating_fusion import ScopedGatingRecipe, build_moe_gating_topk
-    from .mxfp8_grouped import ScopedSwigluRecipe, build_swiglu_mx_quant
+    from mindie_sim.prediction.operators.moe_routing.moe_gating_fusion import ScopedGatingRecipe, build_moe_gating_topk
+    from mindie_sim.prediction.operators.mx_quant_matrix.mxfp8_grouped import ScopedSwigluRecipe, build_swiglu_mx_quant
     from .operators.attention import recipes as bsa_recipes
     from .operators.mla_prolog import recipes as prolog_v4_recipes
     from .operators.sparse_indexer import recipes as scorer_recipes

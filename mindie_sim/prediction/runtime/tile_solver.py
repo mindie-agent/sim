@@ -37,8 +37,10 @@ ALGORITHM_LADDER_RANK: Mapping[str, int] = {
 DEFAULT_POOL_GRANULE_BYTES = 32
 DEFAULT_INST_BLOCK_DIM = 16
 DEFAULT_L2_GRANULE_BYTES = 128
-CHECKED_POOLS = ("ub", "l1", "l0a", "l0b", "l0c", "l2")
-AIC_POOLS = frozenset({"l1", "l0a", "l0b", "l0c"})
+CHECKED_POOLS = ("ub", "l1", "l0a", "l0b", "l0c", "l2", "bt", "fb", "ssbuffer")
+_POOL_ALIASES = {"bias_table": "bt", "fixpipe_buffer": "fb"}
+_FIXPIPE_BUFFER_ALIGNMENT_BYTES = 64
+AIC_POOLS = frozenset({"l1", "l0a", "l0b", "l0c", "bt", "fb", *_POOL_ALIASES})
 AIV_POOLS = frozenset({"ub"})
 
 
@@ -172,7 +174,7 @@ class TilePipelineSpec:
     pool_granules: Mapping[str, int] = field(default_factory=dict)
     active_l2_streams: int = 1
     l2_reserved_bytes: int = 0
-    l2_granule_bytes: int = DEFAULT_L2_GRANULE_BYTES
+    l2_granule_bytes: int | None = None
 
     def __post_init__(self) -> None:
         if not self.family:
@@ -256,7 +258,7 @@ def _pool_peak_bytes(
     """Compute exact ``max_t sum_{live at t} align(bytes, g_p)`` with alias folding."""
     matching = [
         buf for buf in buffers
-        if buf.pool == pool and (buf.owner_kind == owner_kind or pool == "l2")
+        if _POOL_ALIASES.get(buf.pool, buf.pool) == pool and (buf.owner_kind == owner_kind or pool == "l2")
     ]
     if not matching:
         return 0
@@ -295,8 +297,9 @@ def _available_pool_capacity(
     spec: TilePipelineSpec,
     *,
     uses_simt: bool,
+    buffers: Mapping[str, int],
+    l2_granule: int,
 ) -> int:
-    buffers = dict(getattr(hw, "buffers", {}) or {})
     if pool not in buffers:
         return 0
     raw_cap = int(buffers[pool])
@@ -305,7 +308,7 @@ def _available_pool_capacity(
         if buf_units.get("l2", 1) != 1:
             raise ModelingError("shared_l2_buffer_requires_one_die_owner")
         avail = max(0, raw_cap - spec.l2_reserved_bytes)
-        g = max(1, spec.l2_granule_bytes)
+        g = max(1, l2_granule)
         return g * (avail // (g * max(1, spec.active_l2_streams)))
     if pool == "ub" and uses_simt:
         return max(0, raw_cap - spec.simt_ub_carveout_bytes)
@@ -316,9 +319,10 @@ def _effective_owners(hw: Any, axis: Literal["aic", "aiv"]) -> int:
     stream_owners = getattr(hw, "stream_owners", None)
     if stream_owners is not None:
         return int(stream_owners.aic_limit if axis == "aic" else stream_owners.aiv_limit)
-    datapath = getattr(hw, "datapath", None)
-    if datapath is not None:
-        return int(datapath.aic_count if axis == "aic" else datapath.aiv_count)
+    datapath = getattr(hw, "datapath", None) or hw
+    declared = getattr(datapath, f"{axis}_count", None)
+    if declared is not None:
+        return int(declared)
     if axis == "aic":
         return max(1, int(getattr(hw, "compute_units", 1)))
     res_units = dict(getattr(hw, "resource_units", {}) or {})
@@ -370,7 +374,18 @@ def solve(spec: TilePipelineSpec, op: Any, hw: Any) -> TileSolution:
     if not spec.candidates:
         raise TileInfeasibleError(spec.family, ())
 
-    subtile_by_mode = {sw.native_mode: sw for sw in spec.subtile_waves}
+    datapath = getattr(hw, "datapath", None) or hw
+    buffers = {
+        _POOL_ALIASES.get(pool, pool): size
+        for source in (datapath, hw)
+        for pool, size in dict(getattr(source, "buffers", {}) or {}).items()
+    }
+    memory = getattr(datapath, "memory_access", None)
+    pool_granules = {_POOL_ALIASES.get(pool, pool): size for pool, size in spec.pool_granules.items()}
+    l2_granule = (spec.l2_granule_bytes if spec.l2_granule_bytes is not None
+                  else getattr(memory, "l2_sector_bytes", DEFAULT_L2_GRANULE_BYTES))
+    subtile_by_mode = {sw.native_mode: sw for sw in getattr(datapath, "subtile_wave", ())}
+    subtile_by_mode.update((sw.native_mode, sw) for sw in spec.subtile_waves)
     rejections: list[TileRejection] = []
     ordered_candidates = sorted(
         spec.candidates, key=lambda c: ALGORITHM_LADDER_RANK[c.algorithm],
@@ -415,12 +430,16 @@ def solve(spec: TilePipelineSpec, op: Any, hw: Any) -> TileSolution:
 
         peaks: list[OwnerPoolPeak] = []
         overflow: TileRejection | None = None
-        for pool in CHECKED_POOLS:
-            owner_kind = (
-                "die" if pool == "l2"
-                else ("aiv" if pool in AIV_POOLS else "aic")
-            )
-            granule = int(spec.pool_granules.get(pool, DEFAULT_POOL_GRANULE_BYTES))
+        pool_owners = [
+            (pool, "die" if pool == "l2" else "aiv" if pool in AIV_POOLS else "aic")
+            for pool in CHECKED_POOLS if pool != "ssbuffer"
+        ]
+        pool_owners.extend(("ssbuffer", kind) for kind in dict.fromkeys(
+            buf.owner_kind for buf in candidate.buffers if buf.pool == "ssbuffer"
+        ))
+        for pool, owner_kind in pool_owners:
+            default_granule = _FIXPIPE_BUFFER_ALIGNMENT_BYTES if pool == "fb" else DEFAULT_POOL_GRANULE_BYTES
+            granule = int(pool_granules.get(pool, default_granule))
             peak = _pool_peak_bytes(
                 candidate.buffers,
                 owner_kind,
@@ -431,7 +450,7 @@ def solve(spec: TilePipelineSpec, op: Any, hw: Any) -> TileSolution:
             if peak <= 0:
                 continue
             cap = _available_pool_capacity(
-                pool, hw, spec, uses_simt=candidate.uses_simt,
+                pool, hw, spec, uses_simt=candidate.uses_simt, buffers=buffers, l2_granule=l2_granule,
             )
             peaks.append(OwnerPoolPeak(
                 owner_kind=owner_kind,
@@ -446,7 +465,8 @@ def solve(spec: TilePipelineSpec, op: Any, hw: Any) -> TileSolution:
                     owner_kind=owner_kind,
                     required_bytes=peak,
                     available_bytes=cap,
-                    source_guard=candidate.source_guard,
+                    source_guard=("ssbuffer_capacity_open_limit" if pool == "ssbuffer" and pool not in buffers
+                                  else candidate.source_guard),
                 )
                 break
 

@@ -48,12 +48,8 @@ from mindie_sim.observations.multilevel_stream import (
     normalize_lineage_token,
 )
 from mindie_sim.prediction.api import RecipeBook
-from mindie_sim.prediction.attention_decode import RECIPE_ID, StagedGQADecode
 from mindie_sim.prediction.call_builders import build_aclnn_call
 from mindie_sim.prediction.efficiency import capacity_feedback
-from mindie_sim.prediction.expected_grouped import ExpectedGroupedMatmul
-from mindie_sim.prediction.gdn_chunk32 import OUTPUT, PREPARE, STATE
-from mindie_sim.prediction.matrix_steady import SteadyMatmul
 from mindie_sim.prediction.mechanism import PlannedRecipe
 from mindie_sim.prediction.operators import (
     attention as bsa,
@@ -61,6 +57,10 @@ from mindie_sim.prediction.operators import (
     mla_prolog as prolog4,
     sparse_indexer as scorer,
 )
+from mindie_sim.prediction.operators.attention.attention_decode import RECIPE_ID, StagedGQADecode
+from mindie_sim.prediction.operators.grouped_moe.expected_grouped import ExpectedGroupedMatmul
+from mindie_sim.prediction.operators.linear_attention.gdn_chunk32 import OUTPUT, PREPARE, STATE
+from mindie_sim.prediction.operators.matrix.matrix_steady import SteadyMatmul
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import OpSpec
 
@@ -72,9 +72,9 @@ TAIL_QUANTILE_P90 = 0.9
 DISPLAY_ROUND_DIGITS = 4
 STATIC_TRACKED_FILES = (
     "mindie_sim/backends/profiles/ascend.json",
-    "mindie_sim/prediction/attention_decode.py",
-    "mindie_sim/prediction/expected_grouped.py",
-    "mindie_sim/prediction/gdn_chunk32.py",
+    "mindie_sim/prediction/operators/attention/attention_decode.py",
+    "mindie_sim/prediction/operators/grouped_moe/expected_grouped.py",
+    "mindie_sim/prediction/operators/linear_attention/gdn_chunk32.py",
 )
 TRACKED_OPERATOR_PACKAGES = (
     Path("mindie_sim") / "prediction" / "operators" / "attention",
@@ -468,7 +468,7 @@ def evaluate_level1(captures_dir: Path, resolver: _LineageSplitResolver) -> dict
     for r in d4.get("records", ()):
         sh = r.get("shape") or {}
         meas = float((r.get("metrics") or {}).get("cold_p50_us") or 0.0)
-        if r.get("status") != "ok" or r.get("group") != "Roofline_Cube" or sh.get("M", 0) < 512 or "bf16" not in r["op_name"] or meas <= 0.0:
+        if r.get("status") != "ok" or r.get("group") != "Roofline_Cube" or "bf16" not in r["op_name"] or meas <= 0.0:
             continue
         sp, acq_root = resolver.resolve(r, file_doc=d4, fallback_acq=str(d4.get("acquisition_uid") or "d4:kimi_hotspots"))
         if sp not in ("train", "heldout"):

@@ -13,7 +13,7 @@ from ._bf16_access import (
     _panel_selection_ops, _tile_sentinel, _weighted_vector_ops,
 )
 from ...mechanism import OperatorPlan, Work
-from ..mixed_core import read_role
+from mindie_sim.prediction.operators.vector.mixed_core import read_role
 from ...ownership import unit_group
 from ...program import KernelProgram, Stage
 
@@ -158,7 +158,28 @@ def _build(op, geometry):
         "mte1": int(access["key_logical_bytes"]) + query,
         "fixpipe": fixpipe, **loads,
     }
+    stage_defs, addresses, allocations = _index_stage_definitions(
+        access, ledger, metadata_bytes, heads, q_row_bytes, key_row_bytes,
+        compression, read, split, weight_cast_ops, kv_heads, width, topk)
+
+    def program(context):
+        return _lower_index_program(
+            context, access, owner, aiv_per_aic, read, split, stage_defs, addresses)
+
+    work = Work(dict(op.matrix_flops), resources)
+    return OperatorPlan(work, program, _index_plan_metadata(
+        access, geometry, ledger, owner, read, split, aiv_per_aic, l1_capacity,
+        declared_l2, l2_capacity, query, allocations, lists, kv_heads, merge_ops,
+        exchange_bytes))
+
+
+def _index_stage_definitions(
+    access, ledger, metadata_bytes, heads, q_row_bytes, key_row_bytes, compression, read, split,
+    weight_cast_ops, kv_heads, width, topk,
+):
     stage_defs = []
+    addresses = {}
+    sequence_spans = ledger.get("sequence_layout_spans", ())
     allocations = bool(access["l1_allocation_bytes"] or access["l2_allocation_bytes"]
                        or access["workspace_bytes"]
                        or (access["exchange_gm_bytes"]
@@ -178,6 +199,9 @@ def _build(op, geometry):
         metadata_tile = metadata_left if tile_index == 0 else 0
         metadata_left -= metadata_tile
         q_stage = f"query_load_{tile_index}"
+        if sequence_spans:
+            _, _, q_offset, kv_offset, _ = sequence_spans[tile["request"]]
+            addresses[q_stage] = (q_offset + tile["q_start"]) * q_row_bytes
         q_work = {
             "hbm": tile["q_bytes"] + weight_tile_bytes + metadata_tile,
             read: tile["q_bytes"] + metadata_tile,
@@ -190,6 +214,8 @@ def _build(op, geometry):
         previous = q_stage
         for panel_index, panel in enumerate(tile["panels"]):
             load_name = f"key_load_{tile_index}_{panel_index}"
+            if sequence_spans:
+                addresses[load_name] = (kv_offset // compression + panel["key_start"]) * key_row_bytes
             stage_defs.append((load_name, {
                 "hbm": panel["hbm_bytes"], read: panel["gm_bytes"],
             }, (previous,), None))
@@ -245,64 +271,72 @@ def _build(op, geometry):
     release = "index_release" if allocations else None
     if release:
         stage_defs.append((release, {}, (previous,), "free"))
+    return stage_defs, addresses, allocations
 
-    def program(context):
-        names = getattr(context, "resource_names", {})
-        if names and read not in names:
-            raise ModelingError(f"bf16_lightning_indexer_requires_read_port:{read}")
-        allocations = _resident_allocations(context, access)
-        core = max(1, int(getattr(context, "core_count", 1) or 1))
-        aic_roles = ["cube", "mte1", "fixpipe"]
-        if read != "mte2_aiv":
-            aic_roles.append(read)
-        aiv_roles = ["vector", "mte3"]
-        if split:
-            aiv_roles.append("mte2_aiv")
-        aic_place = _placement(context, owner, tuple(aic_roles), core_count=core)
-        aiv_place = _placement(context, owner, tuple(aiv_roles),
-                               core_count=core, aiv_per_aic=aiv_per_aic, aiv=True)
-        generic_mte2_place = ({}
-                              if split else
-                              _placement(context, owner, ("mte2",),
-                                         core_count=core))
-        stages = []
-        for name, amounts, after, action in stage_defs:
-            values = dict(amounts)
-            matrix = {"bf16": values.pop("matrix_bf16", 0)}
-            work = Work({key: value for key, value in matrix.items() if value},
-                        {key: value for key, value in values.items() if value})
-            kwargs = {}
-            if action == "acquire":
-                kwargs["acquire"] = allocations
-            elif action == "free":
-                kwargs["free"] = allocations
-            if name.startswith("key_load"):
-                kwargs["placement"] = aic_place
-            elif name.startswith("query_load"):
-                kwargs["placement"] = ({**aic_place, **aiv_place}
-                                       if split else aic_place)
-            elif name.startswith("qk_weighted_reduce"):
-                kwargs["placement"] = {**aic_place, **aiv_place}
-            elif name.startswith("exchange_write"):
-                kwargs["placement"] = aiv_place
-            elif name.startswith("exchange_read"):
-                kwargs["placement"] = (aiv_place if split
-                                       else generic_mte2_place)
-            elif name.startswith("topk_update"):
-                kwargs["placement"] = {**aiv_place, **generic_mte2_place}
-            elif name.startswith(("topk_merge", "output_store")):
-                kwargs["placement"] = aiv_place
-            stages.append(Stage(name, context.bind(work), after=after, **kwargs))
-        return KernelProgram(tuple(stages))
 
-    work = Work(dict(op.matrix_flops), resources)
+def _lower_index_program(context, access, owner, aiv_per_aic, read, split, stage_defs, addresses):
+    names = getattr(context, "resource_names", {})
+    if names and read not in names:
+        raise ModelingError(f"bf16_lightning_indexer_requires_read_port:{read}")
+    allocations = _resident_allocations(context, access)
+    core = max(1, int(getattr(context, "core_count", 1) or 1))
+    aic_roles = ["cube", "mte1", "fixpipe"]
+    if read != "mte2_aiv":
+        aic_roles.append(read)
+    aiv_roles = ["vector", "mte3"]
+    if split:
+        aiv_roles.append("mte2_aiv")
+    aic_place = _placement(context, owner, tuple(aic_roles), core_count=core)
+    aiv_place = _placement(context, owner, tuple(aiv_roles),
+                           core_count=core, aiv_per_aic=aiv_per_aic, aiv=True)
+    generic_mte2_place = ({}
+                          if split else
+                          _placement(context, owner, ("mte2",),
+                                     core_count=core))
+    stages = []
+    for name, amounts, after, action in stage_defs:
+        values = dict(amounts)
+        matrix = {"bf16": values.pop("matrix_bf16", 0)}
+        work = Work({key: value for key, value in matrix.items() if value},
+                    {key: value for key, value in values.items() if value})
+        kwargs = {}
+        if name in addresses:
+            kwargs["metadata"] = {"gm_base_byte": addresses[name]}
+        if action == "acquire":
+            kwargs["acquire"] = allocations
+        elif action == "free":
+            kwargs["free"] = allocations
+        if name.startswith("key_load"):
+            kwargs["placement"] = aic_place
+        elif name.startswith("query_load"):
+            kwargs["placement"] = ({**aic_place, **aiv_place}
+                                   if split else aic_place)
+        elif name.startswith("qk_weighted_reduce"):
+            kwargs["placement"] = {**aic_place, **aiv_place}
+        elif name.startswith("exchange_write"):
+            kwargs["placement"] = aiv_place
+        elif name.startswith("exchange_read"):
+            kwargs["placement"] = (aiv_place if split
+                                   else generic_mte2_place)
+        elif name.startswith("topk_update"):
+            kwargs["placement"] = {**aiv_place, **generic_mte2_place}
+        elif name.startswith(("topk_merge", "output_store")):
+            kwargs["placement"] = aiv_place
+        stages.append(Stage(name, context.bind(work), after=after, **kwargs))
+    return KernelProgram(tuple(stages))
+
+
+def _index_plan_metadata(
+    access, geometry, ledger, owner, read, split, aiv_per_aic, l1_capacity, declared_l2,
+    l2_capacity, query, allocations, lists, kv_heads, merge_ops, exchange_bytes,
+):
     exchange_grant_name = (
         "none" if not exchange_bytes else
         access["exchange_grant"] or
         ("index_exchange_gm"
          if access["exchange_gm_bytes"] and "gm" in geometry.buffers
          else "external_gm_grant"))
-    return OperatorPlan(work, program, {
+    return {
         "execution_abstraction": "mechanism_phase_program",
         "native_dispatch_reconstructed": False,
         "internal_cache_reload_and_topk_exchange": "modeled",
@@ -433,4 +467,4 @@ def _build(op, geometry):
                              "Q/K panel residency and ordered K panels are "
                              "explicit mechanisms"),
         },
-    })
+    }

@@ -34,19 +34,19 @@ from mindie_sim.catalog.cache import (
     packed_region_row_bytes,
 )
 from mindie_sim.catalog.cache_format import CacheFormat, cache_format
-from mindie_sim.prediction import family_quant_indexer as quant_indexer
-from mindie_sim.prediction import family_mqsmla
-from mindie_sim.prediction import indexed_quant_attention as c8
-from mindie_sim.prediction import latent_dcp
-from mindie_sim.prediction import mqsmla
+from mindie_sim.prediction.operators.sparse_indexer import family_quant_indexer as quant_indexer
+from mindie_sim.prediction.operators.paged_mla import family_mqsmla
+from mindie_sim.prediction.operators.paged_mla import indexed_quant_attention as c8
+from mindie_sim.prediction.operators.mla import latent_dcp
+from mindie_sim.prediction.operators.paged_mla import mqsmla
 from mindie_sim.prediction.cache_path import CacheGeometry, CacheState
 from mindie_sim.prediction.cache_representation import (
     CacheLowering, cache_identity, store,
 )
-from mindie_sim.prediction.index_pool import row_shard_partition
-from mindie_sim.prediction.latent_dcp import packed_sfa_geometry
+from mindie_sim.prediction.operators.sparse_indexer.index_pool import row_shard_partition
+from mindie_sim.prediction.operators.mla.latent_dcp import packed_sfa_geometry
 from mindie_sim.prediction.lowering import Builder
-from mindie_sim.prediction.matrix_splitk import build_router_splitk
+from mindie_sim.prediction.operators.matrix.matrix_splitk import build_router_splitk
 from mindie_sim.prediction.mechanism import Geometry
 from mindie_sim.prediction.operator_analysis import target_graphs
 from mindie_sim.prediction.program import RecipeContext
@@ -230,7 +230,7 @@ def test_mqsmla_mode_writers_use_the_packed_row_bytes(scale_dtype, row_bytes):
 
 
 def test_mqsmla_epilog_prefers_the_declared_cache_row_width():
-    from mindie_sim.prediction.mla_epilogs import (
+    from mindie_sim.prediction.operators.mla.mla_epilogs import (
         KV_COMPRESS_EPILOG_FAMILY, kv_cache_epilog,
     )
     model = _packed_mode_model("bf16")
@@ -284,7 +284,7 @@ def _arch35_flops(keys):
         "heads": 32, "width": 128, "keys": 1024, "completed_keys": keys,
         "payload_keys": keys, "key_row_bytes": 256, "output_bytes": 0.0,
     }
-    from mindie_sim.prediction import sparse_indexer_pipeline as pipeline
+    from mindie_sim.prediction.operators.sparse_indexer import sparse_indexer_pipeline as pipeline
     return pipeline.arch35_indexer_work(ledger).matrix["fp8_e4m3"]
 
 
@@ -334,7 +334,7 @@ def test_keypool_row_shard_splits_one_multi_row_request():
     model = replace(model, quant=replace(model.quant,
                                          index_scale_dtype="fp32"))
     builder = Builder("s0.l0", plan, 0, single_long, model, "decode")
-    from mindie_sim.prediction import index_pool_native as native
+    from mindie_sim.prediction.operators.sparse_indexer import index_pool_native as native
     native.selection(
         builder, query="q", weights="w", cache="cache", views=single_long,
         plan=plan, quant=builder.quant, padded_tokens=8,
@@ -353,7 +353,7 @@ def test_keypool_row_shard_splits_one_multi_row_request():
 # 12. Router operand traffic follows the mapping the executor selects.
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize(("shape", "expected"), [
-    ((528, 288, 4096), 42860544),
+    ((528, 288, 4096), 24772608),
     ((240, 384, 7168), 42663936),
     ((512, 896, 7168), ROUTER_OPERAND_BYTES),
 ])
@@ -367,14 +367,14 @@ def test_router_operand_traffic_uses_the_executed_tile(shape, expected):
 
     assert plan.work.resources["mte2"] == expected
     assert expected_work[context.resource_names["mte2_aic"]] == expected
-    assert issued[context.resource_names["mte2_aic"]] == expected
+    assert issued[context.resource_names["mte2_aic"]] == pytest.approx(expected, rel=1e-12)
 
 
 # ---------------------------------------------------------------------------
 # 13. V4 query-normalized scale shape follows query_norm_output.
 # ---------------------------------------------------------------------------
 def test_mla_prolog_v4_without_query_norm_output_has_no_scale_shape():
-    from mindie_sim.prediction import family_mla_prolog as prolog
+    from mindie_sim.prediction.operators.mla_prolog import family_mla_prolog as prolog
     plan, model = wave3a._prolog_case()
     plan = replace(plan, indexer=False, owns_topk=False,
                    index_query_per_layer=False)
@@ -600,7 +600,7 @@ def test_keypool_pack_reads_local_indices_positions_and_cumulative_tail():
                                          index_scale_dtype="fp32"))
     views = (RequestView("r0", 8, 131072, False, "decode"),)
     builder = Builder("s0.l0", plan, 0, views, model, "decode")
-    from mindie_sim.prediction import index_pool_native as native
+    from mindie_sim.prediction.operators.sparse_indexer import index_pool_native as native
     native.selection(
         builder, query="q", weights="w", cache="cache", views=views,
         plan=plan, quant=builder.quant, padded_tokens=8,

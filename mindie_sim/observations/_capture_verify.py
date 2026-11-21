@@ -104,37 +104,85 @@ def _row_event_and_clock_info(
     return ev_names, row_clocks, item_clocks, has_boundary
 
 
+def _append_unique_clock(bucket: list[Any], value: Any) -> None:
+    for existing in bucket:
+        if type(existing) is type(value) and existing == value:
+            return
+    bucket.append(value)
+
+
 def _extract_capture_meta(
     path: Path, *, ijson_mod: Any = None,
     stream_jsonl_fn: Callable[[Path], Any],
     iter_json_events_fn: Callable[..., Any],
     read_value_fn: Callable[..., Any],
     skip_value_fn: Callable[..., Any],
+    target_events: frozenset[str] | None = None,
+    expected_clock_operator: str | None = None,
 ) -> dict[str, Any]:
     if path.suffix.lower() in _JSONL_SUFFIXES:
         merged: dict[str, Any] = {}
         events_found: set[str] = set()
         event_clocks: dict[str, list[Any]] = {}
         boundary_clocks: list[Any] = []
+        clock_mismatch = False
+        meta_keys = _CAPTURE_META_KEYS - {"events", "event_ids"}
         for row in stream_jsonl_fn(path):
-            for key in _CAPTURE_META_KEYS - {"events", "event_ids"}:
-                if key in row:
-                    merged.setdefault(key, row[key])
+            for key in meta_keys:
+                if key in row and key not in merged:
+                    merged[key] = row[key]
             row_events, row_clocks, item_clocks, has_boundary = _row_event_and_clock_info(row)
-            events_found |= row_events
-            if row_clocks:
-                for ev in row_events:
-                    event_clocks.setdefault(ev, []).extend(row_clocks)
-                if has_boundary or not row_events:
-                    boundary_clocks.extend(row_clocks)
-            for ev, clocks in item_clocks.items():
-                event_clocks.setdefault(ev, []).extend(clocks)
+            if target_events is not None:
+                matched_row = row_events & target_events
+                if matched_row:
+                    events_found |= matched_row
+                if expected_clock_operator is not None:
+                    if row_clocks and (has_boundary or not row_events or matched_row):
+                        if any(clk != expected_clock_operator for clk in row_clocks):
+                            clock_mismatch = True
+                            break
+                    for ev, clocks in item_clocks.items():
+                        if ev in target_events and any(clk != expected_clock_operator for clk in clocks):
+                            clock_mismatch = True
+                            break
+                    if clock_mismatch:
+                        break
+                    continue
+                if row_clocks:
+                    for ev in matched_row:
+                        bucket = event_clocks.setdefault(ev, [])
+                        for clk in row_clocks:
+                            _append_unique_clock(bucket, clk)
+                    if has_boundary or not row_events:
+                        for clk in row_clocks:
+                            _append_unique_clock(boundary_clocks, clk)
+                for ev, clocks in item_clocks.items():
+                    if ev in target_events:
+                        bucket = event_clocks.setdefault(ev, [])
+                        for clk in clocks:
+                            _append_unique_clock(bucket, clk)
+            else:
+                events_found |= row_events
+                if row_clocks:
+                    for ev in row_events:
+                        bucket = event_clocks.setdefault(ev, [])
+                        for clk in row_clocks:
+                            _append_unique_clock(bucket, clk)
+                    if has_boundary or not row_events:
+                        for clk in row_clocks:
+                            _append_unique_clock(boundary_clocks, clk)
+                for ev, clocks in item_clocks.items():
+                    bucket = event_clocks.setdefault(ev, [])
+                    for clk in clocks:
+                        _append_unique_clock(bucket, clk)
         if events_found:
             merged["event_ids"] = sorted(events_found)
         if event_clocks:
             merged["_event_clocks"] = event_clocks
         if boundary_clocks:
             merged["_boundary_clocks"] = boundary_clocks
+        if clock_mismatch:
+            merged["_clock_mismatch"] = True
         return merged
     meta: dict[str, Any] = {}
     with path.open("rb") as handle:
@@ -187,20 +235,26 @@ def verify_capture_file_consistency(
             is_json_file = handle.read(stream_chunk_bytes).lstrip().startswith((b"{", b"["))
     if not is_json_file:
         return
+    start_name, end_name = str(boundary.start_event).strip(), str(boundary.end_event).strip()
+    target_events = frozenset({start_name, end_name, *(ev.strip() for ev in boundary.event_ids if ev.strip())})
     try:
-        meta = extract_meta_fn(path, ijson_mod=ijson_mod)
+        meta = extract_meta_fn(
+            path, ijson_mod=ijson_mod,
+            target_events=target_events,
+            expected_clock_operator=boundary.clock_operator,
+        )
     except TimeoutError:
         raise
     except ModelingError as exc:
         raise ModelingError(f"capture_file_unreadable:{case_id}:{exc.reason}") from exc
     except (OSError, StopIteration) as exc:
         raise ModelingError(f"capture_file_unreadable:{case_id}") from exc
+    if meta.get("_clock_mismatch"):
+        raise ModelingError(f"capture_clock_operator_mismatch:{case_id}:expected={boundary.clock_operator}")
     cap_ranks = _capture_ranks(meta)
     if cap_ranks is not None and cap_ranks != set(boundary.device_ranks):
         raise ModelingError(f"capture_rank_mismatch:{case_id}:expected={sorted(boundary.device_ranks)}:actual={sorted(cap_ranks)}")
     cap_events, matched_start, matched_end = set(), False, False
-    start_name, end_name = str(boundary.start_event).strip(), str(boundary.end_event).strip()
-    target_events = {start_name, end_name, *(ev.strip() for ev in boundary.event_ids if ev.strip())}
     ev_clocks = meta.get("_event_clocks") or {}
     for clk in (*meta.get("_boundary_clocks", ()), *(c for ev in target_events for c in ev_clocks.get(ev, ()))):
         if clk != boundary.clock_operator:

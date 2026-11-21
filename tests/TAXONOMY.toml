@@ -115,7 +115,7 @@ owns = [
 [[module]]
 path = "runtime/test_indexed_pipeline_templates.py"
 tier = "tier0"
-owns = ["mindie_sim/prediction/matrix.py", "mindie_sim/prediction/scheduling"]
+owns = ["mindie_sim/prediction/operators/matrix/matrix.py", "mindie_sim/prediction/scheduling"]
 # TiledMatmul finite indexed catalog; R7 remainder (kernel groups, transfers, fragment executor)
 # folds into test_engine_memory_and_pipeline / test_invocation_boundary in S2d.
 
@@ -182,7 +182,7 @@ owns = [
   "mindie_sim/prediction/exposed_breakdown.py",
   "mindie_sim/prediction/weight_prefetch.py",
   "mindie_sim/prediction/local_projection_tp.py",
-  "mindie_sim/prediction/recover_ssm_work.py",
+  "mindie_sim/prediction/operators/recurrent/recover_ssm_work.py",
   "mindie_sim/prediction/collective_startup.py",
   "mindie_sim/prediction/roofline_graph.py",
   "mindie_sim/optimization/dual_bound.py",
@@ -281,9 +281,8 @@ path = "operators/test_grouped_moe_routing.py"
 tier = "tier0"
 owns = [
   "mindie_sim/prediction/operators/grouped_moe",
-  "mindie_sim/prediction/family_moe.py",
-  "mindie_sim/prediction/moe_callers.py",
-  "mindie_sim/prediction/moe_gating_fusion.py",
+  "mindie_sim/prediction/operators/moe_routing",
+  "mindie_sim/prediction/operators/moe_transport",
 ]
 
 [[module]]
@@ -298,7 +297,7 @@ path = "operators/test_grouped_moe_combine.py"
 tier = "tier0"
 owns = [
   "mindie_sim/prediction/operators/grouped_moe",
-  "mindie_sim/prediction/moe_transport.py",
+  "mindie_sim/prediction/operators/moe_transport",
 ]
 
 [[module]]
@@ -314,9 +313,7 @@ path = "operators/test_linear_attention_prepare.py"
 tier = "tier0"
 owns = [
   "mindie_sim/prediction/operators/linear_attention",
-  "mindie_sim/prediction/operators/gdn_prepare.py",
-  "mindie_sim/prediction/operators/kda_prepare.py",
-  "mindie_sim/prediction/operators/kda_prepare_compact.py",
+  "mindie_sim/prediction/operators/kda",
 ]
 
 [[module]]
@@ -324,9 +321,7 @@ path = "operators/test_linear_attention_state.py"
 tier = "tier0"
 owns = [
   "mindie_sim/prediction/operators/linear_attention",
-  "mindie_sim/prediction/operators/gdn_state.py",
-  "mindie_sim/prediction/operators/kda_state.py",
-  "mindie_sim/prediction/operators/kda_state_selection.py",
+  "mindie_sim/prediction/operators/kda",
 ]
 
 [[module]]
@@ -334,21 +329,15 @@ path = "operators/test_linear_attention_recurrent.py"
 tier = "tier0"
 owns = [
   "mindie_sim/prediction/operators/linear_attention",
-  "mindie_sim/prediction/operators/gdn_output.py",
-  "mindie_sim/prediction/operators/kda_recurrent.py",
-  "mindie_sim/prediction/recover_ssm_work.py",
-  "mindie_sim/prediction/recover_ssm_commit.py",
+  "mindie_sim/prediction/operators/kda",
+  "mindie_sim/prediction/operators/recurrent",
 ]
 
 [[module]]
 path = "operators/test_causal_conv.py"
 tier = "tier0"
 owns = [
-  "mindie_sim/prediction/operators/linear_attention",
-  "mindie_sim/prediction/operators/native_causal_conv_prefill.py",
-  "mindie_sim/prediction/operators/native_causal_conv_spec.py",
-  "mindie_sim/prediction/family_causal_conv.py",
-  "mindie_sim/prediction/conv_state_copy.py",
+  "mindie_sim/prediction/operators/causal_conv",
 ]
 
 [[module]]
@@ -371,7 +360,7 @@ path = "operators/test_mc2_dispatch_combine.py"
 tier = "tier0"
 owns = [
   "mindie_sim/prediction/operators/mc2",
-  "mindie_sim/prediction/moe_token_partition.py",
+  "mindie_sim/prediction/operators/moe_routing",
 ]
 
 [[module]]
@@ -399,14 +388,23 @@ reserved = true
 [[module]]
 path = "operators/test_cuda_norm.py"
 tier = "tier0"
-owns = ["mindie_sim/prediction/operators/cuda_norm.py"]
+owns = ["mindie_sim/prediction/operators/vector/cuda_norm.py"]
 
 [[module]]
 path = "operators/test_cuda_quant.py"
 tier = "tier0"
-owns = ["mindie_sim/prediction/operators/cuda_quant.py"]
+owns = ["mindie_sim/prediction/operators/vector/cuda_quant.py"]
 
 # ---------------------------------------------------------------- spine (PredictionSpine)
+[[module]]
+path = "spine/test_spine_prevention_locks.py"
+tier = "tier0"
+owns = [
+  "mindie_sim/prediction/spine.py",
+  "mindie_sim/prediction/implementation_registry.py",
+  "mindie_sim/prediction/physical_recipe_registry.py",
+  "mindie_sim/schema/workload.py",
+]
 [[module]]
 path = "spine/test_stream_plan.py"
 tier = "tier0"
@@ -596,8 +594,7 @@ path = "operators/test_grouped_moe_align.py"
 tier = "tier0"
 owns = [
   "mindie_sim/prediction/operators/grouped_moe",
-  "mindie_sim/prediction/moe_init_mxfp8.py",
-  "mindie_sim/prediction/moe_init_instructions.py",
+  "mindie_sim/prediction/operators/moe_routing",
 ]
 
 [[module]]

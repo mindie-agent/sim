@@ -195,6 +195,90 @@ def make_op(
     )
 
 
+def _gmm_stage(
+    context, name, after, placement, share, compute_dtype, flops,
+    aic_pipe, gm_read_bytes, total_read_bytes, operand_bytes, fixpipe_bytes, l2_hit,
+):
+    resources = {
+        "hbm": gm_read_bytes * 0.5 * share,
+        aic_pipe: total_read_bytes * 0.5 * share,
+        "mte1": operand_bytes * share,
+        "fixpipe": fixpipe_bytes * share,
+    }
+    if l2_hit > 0.0:
+        resources["l2"] = l2_hit * 0.5 * share
+    return Stage(
+        name,
+        context.bind(Work(
+            matrix={compute_dtype: flops * share} if flops > 0.0 else {},
+            resources=resources,
+        )),
+        after=(after,), placement=placement,
+    )
+
+
+def _build_megamoe_program(
+    context, *, cores: int, aiv_units: int, buf_sizes: dict[str, int],
+    in_aiv_bytes: float, out_aiv_bytes: float, pack_vec_ops: float,
+    act_vec_ops: float, comb_vec_ops: float, disp_link: float, comb_link: float,
+    comp_dt: str, gmm1_flops: float, gmm2_flops: float, aic_gm_read: float,
+    aic_read_total: float, l0_gmm1: float, l0_gmm2: float, fix_gmm1: float,
+    fix_gmm2: float, l2_hit: float,
+):
+    c_aic_pipe = read_role(context.resource_names, aiv=None)
+    c_aiv_pipe = read_role(context.resource_names, aiv=0)
+    share = 1.0 / float(cores)
+
+    def per_core(core: int):
+        aiv_idx = min(aiv_units - 1, 2 * core if aiv_units >= 2 * cores else core)
+        aic_owned = context.owned(core, cores, ("cube", "mte1", "fixpipe", c_aic_pipe))
+        aiv_owned = context.owned(aiv_idx, aiv_units, ("vector", c_aiv_pipe, "mte3"))
+        allocs = tuple(
+            context.allocate(
+                f"megamoe_{core}_{pool}", pool, size,
+                unit_group(core, cores, context.pool_units.get(pool, cores)),
+            )
+            for pool, size in buf_sizes.items() if pool in context.pool_names
+        )
+        disp_res: dict[str, float] = {
+            "hbm": in_aiv_bytes * share,
+            c_aiv_pipe: in_aiv_bytes * share,
+            "vector": pack_vec_ops * share,
+        }
+        if disp_link > 0.0 and "link" in context.resource_names:
+            disp_res["link"] = disp_link * share
+        s_disp = Stage("dispatch_mx", context.bind(Work(resources=disp_res)),
+                       acquire=allocs, placement=aiv_owned)
+        s_gmm1 = _gmm_stage(
+            context, "gmm1_gate_up", "dispatch_mx", aic_owned, share, comp_dt, gmm1_flops,
+            c_aic_pipe, aic_gm_read, aic_read_total, l0_gmm1, fix_gmm1, l2_hit,
+        )
+        s_act = Stage(
+            "act_mx_quant",
+            context.bind(Work(resources={"vector": act_vec_ops * share})),
+            after=("gmm1_gate_up",), placement=aiv_owned,
+        )
+        s_gmm2 = _gmm_stage(
+            context, "gmm2_down", "act_mx_quant", aic_owned, share, comp_dt, gmm2_flops,
+            c_aic_pipe, aic_gm_read, aic_read_total, l0_gmm2, fix_gmm2, l2_hit,
+        )
+        comb_res: dict[str, float] = {
+            "vector": comb_vec_ops * share,
+            "hbm": out_aiv_bytes * share,
+            "mte3": out_aiv_bytes * share,
+        }
+        if comb_link > 0.0 and "link" in context.resource_names:
+            comb_res["link"] = comb_link * share
+        s_comb = Stage(
+            "combine_store",
+            context.bind(Work(resources=comb_res)),
+            after=("gmm2_down",), free=allocs, placement=aiv_owned,
+        )
+        return KernelProgram((s_disp, s_gmm1, s_act, s_gmm2, s_comb))
+
+    return ParallelProgram(tuple(per_core(c) for c in range(cores)))
+
+
 def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
     """Build a work-conserving per-core AIC+AIV(+Link) program for ``MegaMoE``."""
     buf_sizes = _check_buffers(geometry)
@@ -292,83 +376,15 @@ def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
     total_work = Work(matrix=matrix_map, resources={k: v for k, v in plan_res.items() if v > 0.0})
 
     def program(context):
-        c_aic_pipe = read_role(context.resource_names, aiv=None)
-        c_aiv_pipe = read_role(context.resource_names, aiv=0)
-        share = 1.0 / float(cores)
-
-        def per_core(core: int):
-            aiv_idx = min(aiv_units - 1, 2 * core if aiv_units >= 2 * cores else core)
-            aic_owned = context.owned(core, cores, ("cube", "mte1", "fixpipe", c_aic_pipe))
-            aiv_owned = context.owned(aiv_idx, aiv_units, ("vector", c_aiv_pipe, "mte3"))
-            allocs = tuple(
-                context.allocate(
-                    f"megamoe_{core}_{pool}", pool, size,
-                    unit_group(core, cores, context.pool_units.get(pool, cores)),
-                )
-                for pool, size in buf_sizes.items() if pool in context.pool_names
-            )
-            disp_res: dict[str, float] = {
-                "hbm": in_aiv_bytes * share,
-                c_aiv_pipe: in_aiv_bytes * share,
-                "vector": pack_vec_ops * share,
-            }
-            if disp_link > 0.0 and "link" in context.resource_names:
-                disp_res["link"] = disp_link * share
-            s_disp = Stage("dispatch_mx", context.bind(Work(resources=disp_res)),
-                           acquire=allocs, placement=aiv_owned)
-
-            gmm1_res: dict[str, float] = {
-                "hbm": aic_gm_read * 0.5 * share,
-                c_aic_pipe: aic_read_total * 0.5 * share,
-                "mte1": l0_gmm1 * share,
-                "fixpipe": fix_gmm1 * share,
-            }
-            if l2_hit > 0.0:
-                gmm1_res["l2"] = l2_hit * 0.5 * share
-            s_gmm1 = Stage(
-                "gmm1_gate_up",
-                context.bind(Work(
-                    matrix={comp_dt: gmm1_flops * share} if gmm1_flops > 0.0 else {},
-                    resources=gmm1_res,
-                )),
-                after=("dispatch_mx",), placement=aic_owned,
-            )
-            s_act = Stage(
-                "act_mx_quant",
-                context.bind(Work(resources={"vector": act_vec_ops * share})),
-                after=("gmm1_gate_up",), placement=aiv_owned,
-            )
-            gmm2_res: dict[str, float] = {
-                "hbm": aic_gm_read * 0.5 * share,
-                c_aic_pipe: aic_read_total * 0.5 * share,
-                "mte1": l0_gmm2 * share,
-                "fixpipe": fix_gmm2 * share,
-            }
-            if l2_hit > 0.0:
-                gmm2_res["l2"] = l2_hit * 0.5 * share
-            s_gmm2 = Stage(
-                "gmm2_down",
-                context.bind(Work(
-                    matrix={comp_dt: gmm2_flops * share} if gmm2_flops > 0.0 else {},
-                    resources=gmm2_res,
-                )),
-                after=("act_mx_quant",), placement=aic_owned,
-            )
-            comb_res: dict[str, float] = {
-                "vector": comb_vec_ops * share,
-                "hbm": out_aiv_bytes * share,
-                "mte3": out_aiv_bytes * share,
-            }
-            if comb_link > 0.0 and "link" in context.resource_names:
-                comb_res["link"] = comb_link * share
-            s_comb = Stage(
-                "combine_store",
-                context.bind(Work(resources=comb_res)),
-                after=("gmm2_down",), free=allocs, placement=aiv_owned,
-            )
-            return KernelProgram((s_disp, s_gmm1, s_act, s_gmm2, s_comb))
-
-        return ParallelProgram(tuple(per_core(c) for c in range(cores)))
+        return _build_megamoe_program(
+            context, cores=cores, aiv_units=aiv_units, buf_sizes=buf_sizes,
+            in_aiv_bytes=in_aiv_bytes, out_aiv_bytes=out_aiv_bytes,
+            pack_vec_ops=pack_vec_ops, act_vec_ops=act_vec_ops, comb_vec_ops=comb_vec_ops,
+            disp_link=disp_link, comb_link=comb_link, comp_dt=comp_dt,
+            gmm1_flops=gmm1_flops, gmm2_flops=gmm2_flops, aic_gm_read=aic_gm_read,
+            aic_read_total=aic_read_total, l0_gmm1=l0_gmm1, l0_gmm2=l0_gmm2,
+            fix_gmm1=fix_gmm1, fix_gmm2=fix_gmm2, l2_hit=l2_hit,
+        )
 
     return OperatorPlan(total_work, program, {
         "execution_class": "mixed_aic_aiv_mc2",

@@ -128,7 +128,7 @@ class _CohortNativeMixin:
                            intra_latency_ms=None, inter_latency_ms=None,
                            resource_names=None):
         """Immutable per-launch rank/topology view; cached program untouched."""
-        from ..mc2_program import Mc2LaunchView
+        from mindie_sim.prediction.operators.mc2.mc2_program import Mc2LaunchView
         peer_count = int(getattr(inner, "peer_count", 0) or 0)
         if peer_count <= 0 or rank_index is None:
             return None

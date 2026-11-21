@@ -24,6 +24,7 @@ from mindie_sim.schema.datapath import (
     SourceRef,
 )
 from mindie_sim.schema.operators import OpSpec
+from mindie_sim.schema.workload import RequestView
 from ..mechanism import Geometry, OperatorPlan
 from ..program import Recipe, RecipeBook
 from ..results import FusedPipelineDescriptor, OpOccurrence
@@ -40,6 +41,11 @@ class OperatorPlanningContext:
     recipe_book: RecipeBook | None = None
     requested_abi: str | None = None
     stream_owners: StreamOwners | None = None
+    admission_memory_view: Any = None
+    allocation_versions: tuple[tuple[str, int], ...] = ()
+    requests: tuple[RequestView, ...] = ()
+    padded_tokens: int = 0
+    layout: str = ""
 
     @property
     def compute_arch(self) -> ComputeArchIdentity:

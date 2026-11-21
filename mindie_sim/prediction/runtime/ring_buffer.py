@@ -138,6 +138,8 @@ class RingBuffer:
         self._node_ids: dict[str, int] = {}
         self._generations: dict[int, GenerationEvents] = {}
         self._initial_credits: dict[int, str] = {}
+        self._drained_slot_allocs: dict[int, Any] = {}
+        self._drained_last_use_by_slot: dict[int, str] = {}
         self._current_k: int = 0
 
     def slot(self, k: int) -> int:
@@ -379,6 +381,53 @@ class RingBuffer:
                     free=(alloc,),
                     keep_empty=True,
                 ))
+        return tuple(stages)
+
+    def drain_stages(self, *, release_slots: bool = False) -> tuple[Any, ...]:
+        """Emit pending ring stages and retire records outside the active distance-d window."""
+        from ..program.stages import Stage
+        from .engine_types import Allocation
+
+        stages: list[Stage] = []
+        for ev in self._generations.values():
+            self._drained_last_use_by_slot[ev.slot_gen.slot] = ev.last_use
+        for node in self._nodes:
+            acq: tuple[Allocation, ...] = ()
+            if node.acquire_slot and node.slot is not None and self.slot_bytes > 0:
+                alloc = Allocation(
+                    name=f"{self.allocation}:slot{node.slot}",
+                    pool=self.pool,
+                    size=float(self.slot_bytes),
+                    units=(self.owner,),
+                )
+                self._drained_slot_allocs[node.slot] = alloc
+                acq = (alloc,)
+            stages.append(Stage(
+                name=node.name,
+                work=node.work,
+                after=node.after,
+                latency=node.latency_ms,
+                acquire=acq,
+                placement=node.placement,
+                coupled=node.coupled,
+                keep_empty=bool(acq),
+            ))
+        self._nodes.clear()
+        self._node_ids.clear()
+        if self._generations:
+            cutoff = max(self._generations) - self.depth
+            for old_k in [k for k in self._generations if k < cutoff]:
+                del self._generations[old_k]
+        if release_slots and self._drained_slot_allocs:
+            for slot, alloc in sorted(self._drained_slot_allocs.items()):
+                after_ev = self._drained_last_use_by_slot.get(slot, self._initial_credits[slot])
+                stages.append(Stage(
+                    name=f"{self.allocation}:slot{slot}:release",
+                    after=(after_ev,),
+                    free=(alloc,),
+                    keep_empty=True,
+                ))
+            self._drained_slot_allocs.clear()
         return tuple(stages)
 
 

@@ -7,7 +7,7 @@ import pytest
 from mindie_sim import graph_costs
 from mindie_sim.catalog.ops import gemm_op
 from mindie_sim.catalog.types import QuantSpec
-from mindie_sim.prediction.matrix_mapping import DEFAULT_CANDIDATES, UNDERFILLED_CANDIDATES, owner_tiles
+from mindie_sim.prediction.operators.matrix.matrix_mapping import DEFAULT_CANDIDATES, UNDERFILLED_CANDIDATES, owner_tiles
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -113,7 +113,7 @@ def test_low_precision_default_applies_automatic_subtiles_and_explicit_domain_is
 
 def test_equal_hbm_bounds_do_not_add_another_serial_owner_wave():
     from mindie_sim.prediction.engine import Engine, Resource
-    from mindie_sim.prediction.matrix_steady import SteadyMatmul
+    from mindie_sim.prediction.operators.matrix.matrix_steady import SteadyMatmul
     from mindie_sim.prediction.program import RecipeContext
     op = gemm_op(op_id='groups', deps=(), stage=0, layer=0, requests=(),
                  m=258, n=33, k=4096, weight_count=2,

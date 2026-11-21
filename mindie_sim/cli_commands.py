@@ -119,7 +119,7 @@ def _export_structure_sidecar(args: argparse.Namespace, case, *, phase, tokens, 
 
 
 def _inspect_case(raw_case) -> dict:
-    from .prediction.attention import AttentionPolicy
+    from mindie_sim.prediction.operators.attention.attention import AttentionPolicy
     from .prediction.body_defaults import effective_body_declaration
     from .prediction.capacity import Memory
     from .prediction.frontend import Frontend

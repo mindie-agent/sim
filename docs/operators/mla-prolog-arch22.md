@@ -16,7 +16,7 @@ runtime:
 
 `mla_prolog` remains the semantic frontend. The selected native-fusion role
 replaces only the complete `mla_prolog` group with the source phase plan in
-`mindie_sim/prediction/native_fusion_mla_membase.py`. The public operator, graph and
+`mindie_sim/prediction/operators/hyper_connections/native_fusion_mla_membase.py`. The public operator, graph and
 cohort paths bind the same `PlannedRecipe`; the profile is not an export-only
 annotation. Other roles and all unselected/default cases keep their existing
 recipes and traffic behaviour.

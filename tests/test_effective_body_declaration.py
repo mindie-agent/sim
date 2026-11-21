@@ -7,7 +7,7 @@ from mindie_sim import predict
 from mindie_sim.cohort_comparison import compare_cohorts
 from mindie_sim.prediction.graph_analysis import graph_costs
 from mindie_sim.prediction.operator_analysis import operator_costs, target_graphs, target_operators
-from mindie_sim.prediction.attention_pipeline import TiledFlashAndPagedAttentionRecipe
+from mindie_sim.prediction.operators.attention.attention_pipeline import TiledFlashAndPagedAttentionRecipe
 from mindie_sim.prediction.program import RecipeBook
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.structure import export_structure

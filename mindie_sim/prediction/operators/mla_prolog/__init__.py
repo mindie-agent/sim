@@ -14,6 +14,7 @@ from mindie_sim.schema.operators import OpSpec
 from ...mechanism import Geometry, OperatorPlan, PlannedRecipe
 from ...results import FusedPipelineDescriptor, OpOccurrence
 from ..contracts import OperatorFamilySpec, OperatorPlanningContext, ResolvedOperator
+from ..attention.common import with_sequence_context
 from . import arch22 as _arch22, arch35 as _arch35
 from .common import (
     BF16_BYTES,
@@ -67,6 +68,7 @@ def _planning_context(op: OpSpec, geometry: Geometry) -> OperatorPlanningContext
 def build(op: OpSpec, geometry_or_ctx: Geometry | OperatorPlanningContext) -> OperatorPlan:
     ctx = (_planning_context(op, geometry_or_ctx)
            if isinstance(geometry_or_ctx, Geometry) else geometry_or_ctx)
+    ctx = with_sequence_context(op, ctx)
     strategy = _STRATEGIES.get(ctx.compute_arch.arch_id)
     if strategy is None:
         raise unsupported(op, ctx, "unsupported_architecture")

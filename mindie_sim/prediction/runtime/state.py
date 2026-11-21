@@ -251,6 +251,10 @@ class RuntimeState:
         self._periodic_tasks: dict[int, tuple] = {}
         self._periodic_detector = None
         self._periodic_last = None
+        self._periodic_stall_epoch: tuple | None = None
+        self._periodic_stall_obs = 0
+        self._periodic_last_next_sum = -1
+        self._periodic_no_issue_streak = 0
         #: Monotone mutation counter for the allocation/grant frontier.  Every
         #: acquire/release of a live buffer or memory grant bumps it, so the
         #: periodic observer can reuse its previous structural view instead of
@@ -267,6 +271,7 @@ class RuntimeState:
         self._trace_dq = self._trace_view._dq
         self._trace_maxlen = 0 if trace_limit is None else int(trace_limit)
         self.trace_dropped = 0
+        self._evicted_service_spans: dict[str, list[tuple[float, float]]] = {}
         # One authoritative typed state ledger. FragmentConductor and
         # Execution hold views of this object, never a second version map.
         self.state_ledger = None

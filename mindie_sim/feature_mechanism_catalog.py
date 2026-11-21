@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from mindie_sim.prediction.gdn_domain import (
+from mindie_sim.prediction.operators.linear_attention.gdn_domain import (
     GDN_CHUNK32_TOKENS,
     model_supports_gdn_chunk32,
 )

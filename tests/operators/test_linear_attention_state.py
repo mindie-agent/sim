@@ -17,22 +17,22 @@ from _support.linear_cases import (
     stage_bytes as _bytes, stages_by_name as _stages,
 )
 from mindie_sim.model_catalog import load_model
-from mindie_sim.prediction.attention import AttentionPolicy
+from mindie_sim.prediction.operators.attention.attention import AttentionPolicy
 from mindie_sim.prediction.cost import CostModel
 from mindie_sim.prediction.engine import Engine
 from mindie_sim.prediction.execution import Execution
-from mindie_sim.prediction.family_kda import IMPLEMENTATION as GATES
-from mindie_sim.prediction.family_kda_state import IMPLEMENTATION as STATE
+from mindie_sim.prediction.operators.kda.family_kda import IMPLEMENTATION as GATES
+from mindie_sim.prediction.operators.kda.family_kda_state import IMPLEMENTATION as STATE
 from mindie_sim.prediction.frontend import Frontend
 from mindie_sim.prediction.operators.linear_attention._gdn_decode_programs import CONV, conv_plan
 from mindie_sim.prediction.mechanism import Geometry, PlannedRecipe
-from mindie_sim.prediction.operators import gdn_state, kda_recurrent, kda_recurrent_membase, kda_state
-from mindie_sim.prediction.operators.kda_state_selection import resolve
+from mindie_sim.prediction.operators.linear_attention import gdn_state; from mindie_sim.prediction.operators.kda import kda_recurrent, kda_recurrent_membase, kda_state
+from mindie_sim.prediction.operators.kda.kda_state_selection import resolve
 from mindie_sim.prediction.operators.linear_attention import (
     LinearAttentionContract, analyze_state_residency, resolve_operator_plan, select_flash_kda_template,
 )
 from mindie_sim.prediction.program import RecipeBook
-from mindie_sim.prediction.recurrent import linear
+from mindie_sim.prediction.operators.recurrent.recurrent import linear
 from mindie_sim.prediction.scheduling import FragmentConductor
 from mindie_sim.prediction.runtime.tile_solver import TileInfeasibleError
 from mindie_sim.prediction.structure import parse_case

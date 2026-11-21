@@ -332,11 +332,12 @@ def test_piecewise_collective_band_boundaries_and_overlap_rejection():
     b_zero = select_band("allreduce", group, topo, 0)
     b_64k = select_band("allreduce", group, topo, 65536)
     b_64k_plus = select_band("allreduce", group, topo, 65537)
+    b_512k = select_band("allreduce", group, topo, 524288)
     b_2m_minus = select_band("allreduce", group, topo, 2097151)
     b_2m = select_band("allreduce", group, topo, 2097152)
 
     assert b_zero == b_64k and b_zero.payload_max_exclusive == 65537
-    assert b_64k_plus == b_2m_minus and b_64k_plus.payload_max_exclusive == 2097152
+    assert b_64k_plus == b_512k and b_64k_plus.payload_max_exclusive == 2097152 and b_2m_minus.algorithm == "nhr"
     assert b_2m.payload_min_inclusive == 2097152 and b_2m.payload_max_exclusive is None
 
     overlap_a = CollectiveBandSpec(

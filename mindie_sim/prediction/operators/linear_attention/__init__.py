@@ -8,6 +8,8 @@
 """
 from __future__ import annotations
 
+from dataclasses import replace
+
 from mindie_sim.schema.datapath import GENERIC_ARCH_ID, ArchId
 from mindie_sim.schema.operators import OpSpec
 from ...mechanism import Geometry, OperatorPlan
@@ -36,8 +38,11 @@ from .common import (
     build_recover_ssm_verify,
     compute_wy_chunk_work,
     describe,
+    make_plan,
     missing,
     rank_one_transition,
+    request_layout_metadata,
+    request_lengths,
     select_flash_kda_template,
     validate_contract,
 )
@@ -54,22 +59,34 @@ def chunk32_timing_policy(
     else:
         spec = geometry.compute_arch
         arch_id = ArchId(spec.preset) if spec is not None and spec.preset else GENERIC_ARCH_ID
-    # The direct Chunk32 planner already binds its native ABI. Synthetic
-    # geometries without a known ISA still use that ABI's service defaults.
-    return _STRATEGIES.get(arch_id, _ARCH35).chunk32_timing_policy(context, step_sync_ms)
+    strategy = _STRATEGIES.get(arch_id)
+    if strategy is None:
+        return 0.0, 0.0
+    return strategy.chunk32_timing_policy(context, step_sync_ms)
 
 
 def resolve_operator_plan(op: OpSpec, ctx: OperatorPlanningContext) -> ResolvedOperator:
     """Bind a governed operation to its executable plan and source descriptor."""
+    if ctx.requests and not ctx.layout:
+        ctx = replace(ctx, layout=op.layout)
     if op.recipe in gdn_decode.RECIPE_IDS:
-        plan = gdn_decode.build(op, ctx.geometry)
+        plan = gdn_decode.build(op, ctx.geometry, ctx=ctx)
         return ResolvedOperator(ctx.occurrence, op, plan, op.recipe)
     if op.recipe in CHUNK32_KERNELS:
-        from ...gdn_chunk32 import recipes
+        from . import gdn_chunk32
         from ...physical_recipe_registry import uses_retained_source_plan
 
         if uses_retained_source_plan(op):
-            plan = recipes()[op.recipe].build(op, ctx.geometry)
+            source_op = op
+            if ctx.requests:
+                lengths = tuple(length for length in request_lengths(ctx.requests) if length)
+                if not lengths:
+                    plan = make_plan(ctx, op.recipe, (), metadata={"total_chunks": 0})
+                    return ResolvedOperator(ctx.occurrence, op, plan, op.recipe)
+                source_op = replace(op, metadata=tuple({**dict(op.metadata), "lengths": lengths}.items()))
+            plan = gdn_chunk32.build(source_op, ctx.geometry, ctx=ctx)
+            if ctx.requests:
+                plan = replace(plan, metadata={**plan.metadata, **request_layout_metadata(ctx)})
             return ResolvedOperator(ctx.occurrence, op, plan, op.recipe)
     strategy = _STRATEGIES.get(ctx.compute_arch.arch_id)
     if strategy is None:

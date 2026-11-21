@@ -22,10 +22,10 @@ from mindie_sim.catalog.weight_terms import term_bytes
 from mindie_sim.catalog.weights import layer_weight_terms
 from mindie_sim.compose import compose_case
 from mindie_sim.prediction.body_defaults import TargetGraphSet
-from mindie_sim.prediction.direct_peer import DirectPeerCollective
+from mindie_sim.prediction.operators.collectives.direct_peer import DirectPeerCollective
 from mindie_sim.prediction.mechanism import Geometry
-from mindie_sim.prediction.moe_callers import LOCAL_EXPERT_REDUCE, local_expert_reduce_recipe
-from mindie_sim.prediction.moe_gating_fusion import (
+from mindie_sim.prediction.operators.moe_transport.moe_callers import LOCAL_EXPERT_REDUCE, local_expert_reduce_recipe
+from mindie_sim.prediction.operators.moe_routing.moe_gating_fusion import (
     HASH_NATIVE_KIND, INIT_ROUTING_NATIVE_KIND, SOFTMAX_NATIVE_KIND, build_selection, cann_native_active)
 from mindie_sim.prediction.operators import grouped_moe, mc2
 from mindie_sim.prediction.operators.contracts import OperatorPlanningContext

@@ -23,6 +23,7 @@ from typing import Literal, TypeAlias
 
 from mindie_sim.schema.case import Case
 from mindie_sim.schema.datapath import SourceRef
+from mindie_sim.schema.workload import RequestView
 from .streams import MAIN_STREAM, StreamId, validate_stream_id
 
 Phase = Literal["prefill", "decode"]
@@ -139,6 +140,13 @@ class StepRequest:
     scope: Scope = "body"
     media_tokens_per_sequence: int | None = None
     draft_prepare: bool = False
+    requests: tuple[RequestView, ...] = ()
+    padded_tokens: int = 0
+    layout: str = ""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.requests, tuple):
+            object.__setattr__(self, "requests", tuple(self.requests))
 
 
 @dataclass(frozen=True, slots=True)

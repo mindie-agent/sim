@@ -111,7 +111,7 @@ def _resolve_va_lowerings(
                        else "vllm_ascend_recurrent_kda_arch22")
         kda_options = {}
         if is_a5:
-            from mindie_sim.prediction.kda_source import resolve as resolve_kda_source
+            from mindie_sim.prediction.operators.kda.kda_source import resolve as resolve_kda_source
             bounds = {getattr(p, "kda_gate_lower_bound", None) for p in kda_layers}
             if len(bounds) == 1:
                 kda_options = resolve_kda_source(
@@ -145,11 +145,11 @@ def _resolve_va_lowerings(
                   if p.attention == "mla" and p.q_lora_rank > 0
                   and p.mla_variant != "latent_mqa"]
     if mla_layers:
-        from mindie_sim.prediction.family_mla_prolog import validate as validate_mla_prolog
+        from mindie_sim.prediction.operators.mla_prolog.family_mla_prolog import validate as validate_mla_prolog
         prolog_options: dict[str, Any] = {}
         quant = model_spec.quant
         if is_a5 and quant is not None and quant.kv_dtype == "int8":
-            from mindie_sim.prediction.mla_prolog_packed import LAYOUT
+            from mindie_sim.prediction.operators.mla_prolog.mla_prolog_packed import LAYOUT
             prolog_options["cache_layout"] = LAYOUT
         try:
             for plan in mla_layers:

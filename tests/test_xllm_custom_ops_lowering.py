@@ -5,13 +5,13 @@ from dataclasses import replace
 
 import pytest
 
-from mindie_sim.prediction.diffusion_ops import (
+from mindie_sim.prediction.operators.diffusion import (
     MINDIE_SD_CUSTOM_OPS,
     compute_mindie_sd_effective_denoising_steps,
     lower_mindie_sd_custom_op,
 )
-from mindie_sim.prediction.diffusion_ops import lower_op as sd_lower_op
-from mindie_sim.prediction.custom_framework_ops import XLLM_CUSTOM_OPS, XLLM_VENDOR, lower_op
+from mindie_sim.prediction.operators.diffusion import lower_op as sd_lower_op
+from mindie_sim.prediction.operators.custom_framework import XLLM_CUSTOM_OPS, XLLM_VENDOR, lower_op
 from mindie_sim.prediction.implementations import IMPLEMENTATIONS, lower_operators, select
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import OpSpec
@@ -298,13 +298,13 @@ def test_mindie_sd_custom_ops_lowering_and_denoising_step_cache():
 
 
 def test_xllm_capability_registry_matches_registered_selectors_and_gates_generic_families():
-    from mindie_sim.prediction.custom_framework_ops import capabilities
+    from mindie_sim.prediction.operators.custom_framework import capabilities
     from mindie_sim.prediction.implementations import IMPLEMENTATIONS
 
     caps = capabilities()
     assert set(caps["operators"]) == set(XLLM_CUSTOM_OPS)
     registered = {name for name, item in IMPLEMENTATIONS.items()
-                  if item.module == "mindie_sim.prediction.custom_framework_ops"}
+                  if item.module == "mindie_sim.prediction.operators.custom_framework"}
     assert set(caps["implementations"]) == registered
     for name, spec in caps["operators"].items():
         assert spec["native_kind"] == XLLM_CUSTOM_OPS[name]["native_kind"]
@@ -356,13 +356,13 @@ def test_real_a5_paged_cache_write_uses_the_declared_occurrence():
 
 
 def test_mindie_sd_capability_registry_and_explicit_declarations():
-    from mindie_sim.prediction.diffusion_ops import capabilities
+    from mindie_sim.prediction.operators.diffusion import capabilities
     from mindie_sim.prediction.implementations import IMPLEMENTATIONS
 
     caps = capabilities()
     assert set(caps["operators"]) == set(MINDIE_SD_CUSTOM_OPS)
     registered = {name for name, item in IMPLEMENTATIONS.items()
-                  if item.module == "mindie_sim.prediction.diffusion_ops"}
+                  if item.module == "mindie_sim.prediction.operators.diffusion"}
     assert set(caps["implementations"]) == registered
     for name, spec in caps["operators"].items():
         assert spec["native_kind"] == MINDIE_SD_CUSTOM_OPS[name]["native_kind"]
@@ -476,7 +476,7 @@ def _fused_members():
 
 
 def test_fused_grouped_plan_and_region_share_int8_contract_with_zero_group():
-    from mindie_sim.prediction.custom_framework_ops import (
+    from mindie_sim.prediction.operators.custom_framework import (
         fused_region_contract, recipes)
     from mindie_sim.prediction.mechanism import Geometry
 
@@ -556,7 +556,7 @@ def test_fused_grouped_plan_and_region_share_int8_contract_with_zero_group():
 
 
 def test_norm_rope_concat_keeps_all_three_materialized_outputs():
-    from mindie_sim.prediction.diffusion_ops import recipes as sd_recipes
+    from mindie_sim.prediction.operators.diffusion import recipes as sd_recipes
     from mindie_sim.prediction.mechanism import Geometry
 
     op = replace(
@@ -610,7 +610,7 @@ def test_norm_rope_concat_keeps_all_three_materialized_outputs():
 
 
 def test_eagle_ffn_has_two_matrix_products_and_no_intermediate_hbm():
-    from mindie_sim.prediction.diffusion_ops import recipes as sd_recipes
+    from mindie_sim.prediction.operators.diffusion import recipes as sd_recipes
     from mindie_sim.prediction.mechanism import Geometry
 
     op = replace(
@@ -669,7 +669,7 @@ def test_sparse_roles_keep_mask_scale_and_output_separate():
 
 
 def test_mega_gdn_decode_consumes_f_state_recurrence_and_two_states():
-    from mindie_sim.prediction.custom_framework_ops import recipes
+    from mindie_sim.prediction.operators.custom_framework import recipes
     from mindie_sim.prediction.mechanism import Geometry
 
     op = replace(
@@ -746,7 +746,7 @@ def test_cache_write_completion_orders_the_next_attention_consumer():
 
 
 def test_fused_grouped_epilogue_competes_on_the_shared_vector_resource():
-    from mindie_sim.prediction.custom_framework_ops import recipes
+    from mindie_sim.prediction.operators.custom_framework import recipes
     from mindie_sim.prediction.mechanism import Geometry
     from mindie_sim.prediction.program import RecipeContext
     from mindie_sim.prediction.engine import Engine, Resource
@@ -832,7 +832,7 @@ def test_sparse_batch_tail_tnd_and_independent_scales():
 
 
 def test_norm_rope_and_ffn_contracts_build_producer_consumer_edges():
-    from mindie_sim.prediction.diffusion_ops import recipes
+    from mindie_sim.prediction.operators.diffusion import recipes
     from mindie_sim.prediction.mechanism import Geometry
     from mindie_sim.prediction.program import RecipeContext
 
@@ -915,7 +915,7 @@ def test_fused_workspace_split_reuse_boundary_is_explicit():
 
 
 def test_adalayernorm_laurel_and_mxfp4_contracts_have_values_and_sources():
-    from mindie_sim.prediction.diffusion_ops import recipes as sd_recipes
+    from mindie_sim.prediction.operators.diffusion import recipes as sd_recipes
     from mindie_sim.prediction.mechanism import Geometry
 
     adaln = replace(
@@ -1024,7 +1024,7 @@ def test_smla_sparse_lse_and_onerec_have_typed_ports_and_work():
 
 
 def test_fused_workspace_windows_reuse_two_buffers_at_crossing_geometry():
-    from mindie_sim.prediction.custom_framework_ops import recipes
+    from mindie_sim.prediction.operators.custom_framework import recipes
     from mindie_sim.prediction.mechanism import Geometry
 
     op = replace(
@@ -1129,7 +1129,7 @@ def test_sparse_tnd_is_equivalent_to_bnsd_control():
 
 def test_mega_gdn_read7_write2_state_versions_are_actual_slots():
     from mindie_sim.prediction.mechanism import Geometry
-    from mindie_sim.prediction.custom_framework_ops import recipes
+    from mindie_sim.prediction.operators.custom_framework import recipes
     op = replace(
         _make_op("mega_gdn_decode", local_shape=(1, 768), dtype="bf16"),
         metadata=(("qkv_shape", (1, 768)), ("z_shape", (1, 2, 128)),
@@ -1179,7 +1179,7 @@ def test_mega_gdn_read7_write2_state_versions_are_actual_slots():
 
 def test_ffn_hidden_grant_is_capacity_checked_and_released_after_read():
     from mindie_sim.prediction.engine import Engine, ExecutionError, Resource
-    from mindie_sim.prediction.diffusion_ops import recipes
+    from mindie_sim.prediction.operators.diffusion import recipes
     from mindie_sim.prediction.mechanism import Geometry
     from mindie_sim.prediction.program import RecipeContext
 
@@ -1222,7 +1222,7 @@ def test_ffn_hidden_grant_is_capacity_checked_and_released_after_read():
 
 def test_ffn_operand_ready_events_gate_both_matrix_stages():
     from mindie_sim.prediction.engine import Engine, Resource
-    from mindie_sim.prediction.diffusion_ops import recipes
+    from mindie_sim.prediction.operators.diffusion import recipes
     from mindie_sim.prediction.mechanism import Geometry
     from mindie_sim.prediction.program import RecipeContext
 
@@ -1254,7 +1254,7 @@ def test_ffn_operand_ready_events_gate_both_matrix_stages():
 
 def test_fused_workspace_window_program_reuses_two_buffers_in_engine():
     from mindie_sim.prediction.engine import Engine, Resource
-    from mindie_sim.prediction.custom_framework_ops import recipes
+    from mindie_sim.prediction.operators.custom_framework import recipes
     from mindie_sim.prediction.mechanism import Geometry
     from mindie_sim.prediction.program import RecipeContext
 
@@ -1312,7 +1312,7 @@ def test_sparse_per_head_mask_uses_head_arithmetic_but_shared_kv_load():
 
 def test_ffn_hidden_waits_for_non_gm_memory_holder_until_10us():
     from mindie_sim.prediction.engine import Allocation, Engine, Resource
-    from mindie_sim.prediction.diffusion_ops import recipes
+    from mindie_sim.prediction.operators.diffusion import recipes
     from mindie_sim.prediction.mechanism import Geometry
     from mindie_sim.prediction.program import RecipeContext
 
@@ -1349,7 +1349,7 @@ def test_ffn_hidden_waits_for_non_gm_memory_holder_until_10us():
 
 
 def test_cache_recipe_reads_index_once_then_masked_write_and_publish():
-    from mindie_sim.prediction.custom_framework_ops import recipes
+    from mindie_sim.prediction.operators.custom_framework import recipes
     from mindie_sim.prediction.mechanism import Geometry
 
     known = replace(

@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import ArchId, SourceRef
 from mindie_sim.schema.operators import OpSpec
-from ... import mc2_local_caller
+from mindie_sim.prediction.operators.mc2 import mc2_local_caller
 from ...mechanism import OperatorPlan, Work
 from ..contracts import ArchStrategy, OperatorPlanningContext
 from .common import (

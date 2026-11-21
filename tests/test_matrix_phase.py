@@ -7,9 +7,9 @@ import pytest
 from mindie_sim.catalog.ops import gemm_op
 from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.prediction.engine import Engine, Resource
-from mindie_sim.prediction.matrix import HierarchicalMatmul
-from mindie_sim.prediction.matrix_mapping import mapping_bound
-from mindie_sim.prediction.matrix_phase import PhaseMatmul
+from mindie_sim.prediction.operators.matrix.matrix import HierarchicalMatmul
+from mindie_sim.prediction.operators.matrix.matrix_mapping import mapping_bound
+from mindie_sim.prediction.operators.matrix.matrix_phase import PhaseMatmul
 from mindie_sim.prediction.program import RecipeBook
 from test_matrix_epilogue import quantized_context
 from test_matrix_mapping import setup

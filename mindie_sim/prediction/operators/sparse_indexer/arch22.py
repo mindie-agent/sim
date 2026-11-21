@@ -23,7 +23,7 @@ from .common import (
     ARCH22_FLUSH_BLOCKS, ARCH22_SMALL_QUERY_MAX, ARCH22_TOPK_LIMIT, BF16_BYTES, DEFAULT_S2_TILE,
     FP32_BYTES, LIGHTNING_V2_ABI, MERGE_FAN_IN, PAIR_BYTES, QSA_ABI, QSA_OVERLAY_SOURCE, SORT_GROUP,
     Lowering, PhaseWork, SparseIndexerContract,
-    _integer, align, build_plan, ceil_div, indexer_contract,
+    _integer, align, build_plan, ceil_div, indexer_contract, request_contracts,
     owner_pairs, pair_merge, sort_ops, unsupported, vector,
 )
 
@@ -267,9 +267,10 @@ class _Arch22Strategy:
             sources = (QSA_SOURCE,) if contract.has_head_weights else (QSA_OVERLAY_SOURCE,)
         # Align score blocks so local maxima are disjoint across S2 owners.
         tile_size = align(contract.s2_tile_size, SORT_GROUP * contract.block_size)
+        host = max(request_contracts(contract, ctx), key=lambda c: c.query_tokens, default=contract)
         lowering = Lowering(
             contract.abi, "membase_s2_tiles", tile_size, _SCORE_ROUTE,
-            tile_selection=_select_tile, flush_period=_flush_period(contract),
+            tile_selection=_select_tile, flush_period=_flush_period(host),
             score_align=SORT_GROUP, head_weight_item_bytes=FP32_BYTES if qsa else BF16_BYTES,
         )
         return build_plan(op, ctx, contract, lowering, owners, sources)

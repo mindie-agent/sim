@@ -208,6 +208,17 @@ def _evaluation(scenario, graphs, report, graph_id, tier, prepared=None):
         rank = _die(scenario, replica, stage).rank
         occurrences[row["id"]] = OpOccurrence(replica, stage, rank, op_id)
     service, cohorts = defaultdict(list), defaultdict(lambda: defaultdict(list))
+    for ev_name, spans in (report.get("evicted_service_spans") or {}).items():
+        replica, _, tail = str(ev_name).partition(":")
+        if not replica.startswith("r") or not replica[1:].isdigit():
+            continue
+        _, _, tail = tail.partition(":")
+        keys = tail.split(":")
+        for count in range(len(keys), 0, -1):
+            node = (int(replica[1:]), ":".join(keys[:count]))
+            if node in index:
+                service[node].extend(spans)
+                break
     for event in report.get("events", ()):
         if not event.get("serviced"):
             continue

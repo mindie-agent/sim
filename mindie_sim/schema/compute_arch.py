@@ -33,6 +33,7 @@ STORAGE_DOMAINS = frozenset({
 _FORMAT_ALIASES = {
     "bfloat16": "bf16", "float16": "fp16", "float32": "fp32",
     "float8_e4m3": "fp8_e4m3", "float8_e5m2": "fp8_e5m2",
+    "hif8": "hifloat8",
 }
 _CAPABILITY_MAP_FIELDS = (
     "instruction_services", "representations", "native_compute", "casts",

@@ -21,12 +21,12 @@ from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.catalog.expert_slots import expert_slot_plan
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.runtime_features import split_routing_features
-from .expert_slot_work import bind_expert_slot_work, physical_slot_work
-from .gated_activation import SITU_SOURCE
+from mindie_sim.prediction.operators.moe_routing.expert_slot_work import bind_expert_slot_work, physical_slot_work
+from mindie_sim.prediction.operators.vector.gated_activation import SITU_SOURCE
 from .implementations import (
     append_audit, attach_quantized_ports, rewire_replacements,
 )
-from .mxfp8_grouped import (SWIGLU_MX_AIV_UNITS, SWIGLU_MX_GROUP,
+from mindie_sim.prediction.operators.mx_quant_matrix.mxfp8_grouped import (SWIGLU_MX_AIV_UNITS, SWIGLU_MX_GROUP,
                             SWIGLU_MX_STAGES)
 from .rewrite_mhc_rules import merge_meta, users_map
 from .structure_groups import declare_group, source_reference

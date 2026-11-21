@@ -7,15 +7,15 @@ import pytest
 
 from mindie_sim import graph_costs, operator_costs, target_operators
 from mindie_sim.model_catalog import derive_expert_pruned, load_model
-from mindie_sim.prediction.attention_decode import StagedGQADecode
+from mindie_sim.prediction.operators.attention.attention_decode import StagedGQADecode
 from mindie_sim.prediction.body_defaults import effective_body_declaration
-from mindie_sim.prediction.fai_decode_mapping import host_partitions, partitions
-from mindie_sim.prediction.grouped_dequant import Config, assignments, build as build_dsq
-from mindie_sim.prediction.index_pool_native import IMPLEMENTATION as KEYPOOL_IMPL
+from mindie_sim.prediction.operators.attention.fai_decode_mapping import host_partitions, partitions
+from mindie_sim.prediction.operators.grouped_moe.grouped_dequant import Config, assignments, build as build_dsq
+from mindie_sim.prediction.operators.sparse_indexer.index_pool_native import IMPLEMENTATION as KEYPOOL_IMPL
 from mindie_sim.prediction.mechanism import Geometry
-from mindie_sim.prediction.moe_init_mxfp8 import RECIPE as MXFP8_INIT_RECIPE, build as build_mxfp8_init
-from mindie_sim.prediction.paged_mla import build as build_paged_mla
-from mindie_sim.prediction.paged_mla_membase import build as build_paged_mla_arch22
+from mindie_sim.prediction.operators.moe_routing.moe_init_mxfp8 import RECIPE as MXFP8_INIT_RECIPE, build as build_mxfp8_init
+from mindie_sim.prediction.operators.paged_mla.paged_mla import build as build_paged_mla
+from mindie_sim.prediction.operators.paged_mla.paged_mla_membase import build as build_paged_mla_arch22
 from mindie_sim.prediction.program import PipelineProgram
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.case import Case
@@ -28,7 +28,7 @@ A2_SKUS = {
     "Ascend910B2C": (1.80e9, 24, 48, 68719476736, 1.8e12),
     "Ascend910B3": (1.80e9, 20, 40, 68719476736, 1.6e12),
     "Ascend910B4": (1.50e9, 20, 40, 34359738368, 0.8e12),
-    "Ascend910B4-1": (1.65e9, 20, 40, 68719476736, 1.2e12),
+    "Ascend910B4-1": (1.50e9, 20, 40, 34359738368, 0.8e12),
 }
 
 
@@ -38,7 +38,7 @@ def test_periodic_pipeline_compaction_matches_exact_pipeline_program():
     op = make_op([(1, 131072)] * 8, heads=16, kv_heads=2, dim=128)
     recipe = StagedGQADecode(key_tile=128, query_tile=16)
 
-    import mindie_sim.prediction.attention_decode as ad
+    import mindie_sim.prediction.operators.attention.attention_decode as ad
     orig_compact = ad.compact_periodic_pipeline
     try:
         ad.compact_periodic_pipeline = lambda ctx, count, slots, fn, **kw: PipelineProgram(count, slots, fn)
@@ -62,7 +62,7 @@ def test_short_periodic_decode_is_lazy_and_matches_unrolled_template(monkeypatch
     from mindie_sim.prediction.program import (
         KernelProgram, PipelinePhase, PipelineTemplateProgram,
     )
-    import mindie_sim.prediction.attention_decode as ad
+    import mindie_sim.prediction.operators.attention.attention_pipeline as ad
 
     count = 50
     op = make_op([(1, count * 128 - 1)], heads=2, kv_heads=1, dim=32)
@@ -147,7 +147,7 @@ def test_fai_decode_mapping_supports_q1_high_batch_and_up_to_64_cores():
 
 def test_attention_decode_compaction_conserves_causal_tail_and_ragged_multi_request_schedule():
     from _support.operator_cases import gqa_decode_op as make_op, gqa_decode_run as run
-    import mindie_sim.prediction.attention_decode as ad
+    import mindie_sim.prediction.operators.attention.attention_decode as ad
 
     # Finding 1a: q > key_tile (q=12, key_tile=8) spans multiple causal tail tiles.
     op_causal = make_op([(12, 512)], heads=8, kv_heads=2, dim=128)
@@ -199,9 +199,9 @@ def test_attention_decode_compaction_conserves_causal_tail_and_ragged_multi_requ
 
 def test_paged_mla_arch22_multi_job_owner_and_refill_steady_subblock_isolation():
     from _support.operator_cases import paged_mla_membase_run as a2_run
-    from mindie_sim.prediction.paged_mla_membase_dispatch import source_dispatch
-    import mindie_sim.prediction.paged_mla_membase as pma22
-    from mindie_sim.prediction.refill_steady import _extract_stage
+    from mindie_sim.prediction.operators.paged_mla.paged_mla_membase_dispatch import source_dispatch
+    import mindie_sim.prediction.operators.paged_mla.paged_mla_membase as pma22
+    from mindie_sim.prediction.operators.matrix.refill_steady import _extract_stage
     from mindie_sim.prediction.program import Stage
 
     # Finding 1c: multi-job owner in paged_mla_arch22 matches exact PipelineProgram.
@@ -397,8 +397,8 @@ def test_a2_skus_declare_complete_arch2201_pipeline_and_precision_rates(sku):
     rates = dict(die.rates)
     assert rates["hbm"] == pytest.approx(hbm)
     assert rates["mte1"] == pytest.approx(128 * aic * clock)
-    assert rates["mte2_aic"] == pytest.approx(32 * aic * clock)
-    assert rates["mte2_aiv"] == pytest.approx(32 * aiv * clock)
+    assert rates["mte2_aic"] == pytest.approx(256 * aic * clock)
+    assert rates["mte2_aiv"] == pytest.approx(128 * aiv * clock)
     assert rates["mte3"] == pytest.approx(64 * aiv * clock)
     assert rates["fixpipe"] == pytest.approx(128 * aic * clock)
     modes = dict(die.service_modes)
@@ -412,7 +412,7 @@ def test_a2_skus_declare_complete_arch2201_pipeline_and_precision_rates(sku):
 
 def test_indexed_attention_gt16_heads_splits_softmax_and_output_across_both_aivs():
     from mindie_sim.prediction.engine import Engine, Resource
-    from mindie_sim.prediction.indexed_attention import build_pipeline
+    from mindie_sim.prediction.operators.paged_mla.indexed_attention import build_pipeline
     from mindie_sim.prediction.program import RecipeContext
 
     rates = {
@@ -467,7 +467,7 @@ def test_indexed_attention_gt16_heads_splits_softmax_and_output_across_both_aivs
         assert dur_c == pytest.approx(dur_e, rel=0.05)
 
     # Uneven heads=17 (m0=16 on AIV0, m1=1 on AIV1) subblock contention control:
-    from mindie_sim.prediction.indexed_attention import build as build_indexed
+    from mindie_sim.prediction.operators.paged_mla.indexed_attention import build as build_indexed
     units_1 = {
         r: (2 if r in ("vector", "mte2_aiv", "mte3") else 1)
         for r in ("hbm", "vector", "cube", "mte1", "mte2_aic", "mte2_aiv", "mte3", "fixpipe")

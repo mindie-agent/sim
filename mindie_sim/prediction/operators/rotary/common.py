@@ -29,7 +29,7 @@ from ...results import (
     PipelinePhase,
     WorkItem,
 )
-from ...vector_pipeline import AIVTiledVectorAndGatherRecipe
+from mindie_sim.prediction.operators.vector.vector_pipeline import AIVTiledVectorAndGatherRecipe
 from ..contracts import OperatorPlanningContext
 
 IMPLEMENTATION = "rotary_position_embedding"

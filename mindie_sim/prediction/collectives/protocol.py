@@ -1,43 +1,22 @@
 """Piecewise HCCL protocol-band selection and collective phase lowering.
 
-[Role]
-  Implement ``select_band`` over declared ``CollectiveBandSpec`` intervals
-  with explicit ``expansion_mode`` disambiguation, exact API-convention byte
-  lowering (AllReduce, ReduceScatter, AllGather, AllToAll, AllToAllV), declared
-  ``band.algorithm`` dispatch, per-hop sequential pipelining with finite
-  ``credit_bytes`` backpressure, and Engine submission.
-
-[Invariants]
-  * Payload intervals under a fixed selector are disjoint; missing coverage or
-    ambiguous matches raise explicit ``ModelingError``.
-  * Collective API byte conventions are exact:
-    - AllReduce(P, B): ``2*(P-1)*B/P`` sent per rank.
-    - ReduceScatter(P, B): ``(P-1)*B/P`` sent per rank.
-    - AllGather(P, B): input ``B``/rank -> ``(P-1)*B`` sent per rank.
-    - AllToAll(P, B): total send buffer ``B`` -> ``B/P`` self-copy +
-      ``(P-1)*B/P`` external wire per rank.
-    - AllToAllV(P, B, matrix, send_splits, recv_splits): validates exact per-rank
-      row/col splits and consistency with ``B`` BEFORE band selection; isolates
-      diagonal self-copies from external wire flows.
-  * Multi-hop transfers execute hop-by-hop in physical path order, charging
-    ``hop`` startup per traversed hop and honoring ``band.credit_bytes`` receive
-    credits via chunked Engine pool acquire/free.
-
-[Timeouts & Locks]
-  Bounded group/chunk loops and in-memory band lookup; no I/O or locks.
-
-[Side-Effect Policy]
-  Pure planning helpers plus Engine task/pool submission on caller Engines.
+[Role] Select protocol bands and lower collective executors onto physical links.
+[Invariants] Band selection is unique. Preserve API byte conventions, self
+  copies and algorithm-specific wire work. Each hop follows its predecessor
+  and shares the declared receive credit pool.
+[Timeouts & Locks] Bounded group/chunk loops and in-memory band lookup.
+[Side-Effect Policy] Pure planning plus task/pool submission on caller Engines.
 """
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.hardware_links import CollectiveBandSpec
 from ..engine import Allocation
+from mindie_sim.prediction.operators.collectives.hccl_nhr import rounds as nhr_rounds
 from .ports import PairKey, PortKey, link_pair_key, link_port_key
 from .transport import DEFAULT_MAX_PHYSICAL_CHUNKS, chunk_sizes
 
@@ -45,13 +24,33 @@ MS_PER_S = 1000.0
 SMALL_BAND_UPPER_EXCLUSIVE = 65537
 MID_BAND_UPPER_EXCLUSIVE = 2097152
 TWO_RANKS = 2
+KIB = 1024
+MIB = KIB ** 2
+K8_RANKS = 8
+A3_NODE_RANKS = 2 * K8_RANKS
+A2_SMALL_COUNT_BYTES = 16 * MIB
+A3_AIV_NODE_BYTES = 512 * KIB
+A3_AIV_POD_BYTES = 8 * MIB
+A3_RS_MESH_BYTES = 512 * KIB
+A3_RS_LARGE_MESH_BYTES = 1 * MIB
+A5_CCU_ONE_SHOT_SHARD_BYTES = 16 * KIB
+A5_AICPU_ONE_SHOT_BYTES = 8 * MIB
+A5_AICPU_ALLREDUCE_CHUNK_BYTES = 16 * MIB
+A5_AICPU_RS_CHUNK_BYTES = 32 * MIB
+_HCOMM_EXPANSIONS = {
+    "aiv": "aiv", "ccu_ms": "ccu_ms", "ai_cpu": "aicpu", "aicpu": "aicpu", "aicpu_ts": "aicpu", "nhr": "nhr",
+}
+_PHYSICAL_BAND_LIMITS = {"hccs_k8": K8_RANKS, "ub_mesh": K8_RANKS, "hccs_sw": A3_NODE_RANKS, "sio": TWO_RANKS}
+_MESH_ALGORITHMS = frozenset({
+    "direct", "direct_mesh", "pairwise", "mesh", "small_count_mesh", "one_shot_mesh",
+    "two_shot_mesh", "chunked_two_shot_mesh", "chunked_mesh",
+})
 SUPPORTED_COLLECTIVES = frozenset({
     "allreduce", "reduce_scatter", "allgather", "alltoall", "alltoallv",
 })
 SUPPORTED_BAND_ALGORITHMS = frozenset({
-    "ring", "direct", "direct_mesh", "pairwise",
-    "halving_doubling", "recursive_halving_doubling", "tree",
-})
+    "ring", "nhr", "halving_doubling", "recursive_halving_doubling", "tree",
+}) | _MESH_ALGORITHMS
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,6 +219,40 @@ def _candidate_bands(group: tuple[int, ...], topology, scope: str) -> tuple[Coll
     return tuple(collected)
 
 
+def _hcomm_algorithm(fabric, collective, ranks, size, expansion):
+    """Select the modeled HCOMM Op-Base SUM paths from the vol. 8 source revision."""
+    if fabric == "hccs_k8" and collective == "allreduce" and expansion in (None, "aiv"):
+        return "small_count_mesh" if size < A2_SMALL_COUNT_BYTES else "mesh"
+    if fabric in {"hccs_sw", "hccs_optical"}:
+        if expansion == "nhr":
+            return "nhr"
+        if collective == "allreduce" and expansion in (None, "aiv", "aicpu"):
+            aiv = size <= A3_AIV_NODE_BYTES if ranks <= K8_RANKS else size < A3_AIV_POD_BYTES
+            if aiv and expansion != "aicpu":
+                return "one_shot_mesh"
+            return "mesh" if ranks & (ranks - 1) else "nhr"
+        if fabric == "hccs_sw" and collective == "reduce_scatter" and expansion in (None, "aicpu"):
+            if size <= A3_RS_MESH_BYTES:
+                return "mesh"
+            if size <= A3_RS_LARGE_MESH_BYTES:
+                return "chunked_mesh"
+            return "ring"
+    if fabric == "ub_mesh":
+        if collective == "allreduce":
+            if expansion in (None, "ccu_ms"):
+                return "one_shot_mesh" if size <= ranks * A5_CCU_ONE_SHOT_SHARD_BYTES else "mesh"
+            if expansion == "aicpu":
+                if size <= A5_AICPU_ONE_SHOT_BYTES:
+                    return "one_shot_mesh"
+                if size * K8_RANKS > A5_AICPU_ALLREDUCE_CHUNK_BYTES * ranks ** 2:
+                    return "chunked_two_shot_mesh"
+                return "two_shot_mesh"
+        if collective == "reduce_scatter" and expansion == "aicpu":
+            return ("chunked_mesh" if size * K8_RANKS ** 2 > A5_AICPU_RS_CHUNK_BYTES * ranks ** 2
+                    else "mesh")
+    return None
+
+
 def select_band(
     call,
     actual_group: Sequence[int],
@@ -245,6 +278,7 @@ def select_band(
     candidates = _candidate_bands(group, topology, scope)
 
     matches: list[tuple[tuple[int, int, int, int], CollectiveBandSpec]] = []
+    physical_limit = None
     for band in candidates:
         if band.collective not in (collective, "all"):
             continue
@@ -252,11 +286,21 @@ def select_band(
             continue
         if band.topology_scope not in (scope, "any"):
             continue
-        if exp_key is not None and band.expansion_mode != exp_key:
-            continue
-        if not (band.group_min <= len(group) <= band.group_max):
-            continue
         if not band.matches_payload(payload):
+            continue
+        fabric = band.protocol.rsplit("_", 1)[0]
+        algorithm = None
+        if band.algorithm == "ring" and band.stack_id == "default" and (exp_key is None or exp_key in _HCOMM_EXPANSIONS):
+            algorithm = _hcomm_algorithm(fabric, collective, len(group), payload, _HCOMM_EXPANSIONS.get(exp_key))
+        explicit_executor = exp_key in _HCOMM_EXPANSIONS and algorithm is not None
+        if exp_key is not None and band.expansion_mode != exp_key and not explicit_executor:
+            continue
+        limit = _PHYSICAL_BAND_LIMITS.get(fabric)
+        if limit is not None and len(group) > limit:
+            physical_limit = limit
+            continue
+        group_max = min(band.group_max, limit) if limit is not None else band.group_max
+        if not band.group_min <= len(group) <= group_max:
             continue
         specificity = (
             1 if band.collective == collective else 0,
@@ -264,9 +308,14 @@ def select_band(
             1 if band.topology_scope == scope else 0,
             1 if (exp_key is not None and band.expansion_mode == exp_key) else 0,
         )
+        if group_max != band.group_max or algorithm is not None:
+            band = replace(band, group_max=group_max, algorithm=algorithm or band.algorithm,
+                           expansion_mode=exp_key if explicit_executor else band.expansion_mode)
         matches.append((specificity, band))
 
     if not matches:
+        if physical_limit is not None:
+            raise ModelingError(f"collective_band_group_exceeds_physical_topology:{len(group)}>{physical_limit}")
         raise ModelingError(
             f"collective_band_missing:{collective}:scope={scope}:"
             f"group={len(group)}:bytes={int(payload)}:stack={stack_key}"
@@ -407,47 +456,41 @@ def _lower_ring_or_alg(
     alg = str(band.algorithm).strip().lower()
     if alg not in SUPPORTED_BAND_ALGORITHMS:
         raise ModelingError(f"collective_band_algorithm_unsupported:{band.algorithm}")
-    if alg == "direct":
-        if collective == "allreduce" and count == TWO_RANKS:
-            transfers = []
-            for idx, src in enumerate(group):
-                dst = group[1 - idx]
-                per_rank_payload[src] += api_bytes
-                transfers.append(_build_transfer("direct", 0, src, dst, api_bytes, band, topology))
-            return (LoweredPhase("direct", 1, tuple(transfers), phase_startup),)
-        phase_names = (("reduce_scatter", "all_gather")
-                       if collective == "allreduce" else (collective,))
-        per_peer = api_bytes if collective == "allgather" else api_bytes / float(count)
-        phases: list[LoweredPhase] = []
+    phase_names = ("reduce_scatter", "all_gather") if collective == "allreduce" else (collective,)
+    shard = api_bytes if collective == "allgather" else api_bytes / count
+    if alg in _MESH_ALGORITHMS:
+        single_exchange = collective == "allreduce" and (
+            alg in {"one_shot_mesh", "small_count_mesh"} or (alg == "direct" and count == TWO_RANKS)
+        )
+        if single_exchange:
+            phase_names = ("direct" if alg == "direct" else "all_exchange",)
+            shard = api_bytes
+        phases = []
         for pname in phase_names:
-            transfers = []
-            for src in group:
-                for dst in group:
-                    if src == dst:
-                        continue
-                    per_rank_payload[src] += per_peer
-                    transfers.append(_build_transfer(pname, 0, src, dst, per_peer, band, topology))
-            phases.append(LoweredPhase(pname, 1, tuple(transfers), phase_startup))
+            rounds = count - 1 if pname == "reduce_scatter" and alg.startswith("chunked_") else 1
+            amount = shard / rounds
+            transfers = tuple(_build_transfer(pname, step, src, dst, amount, band, topology)
+                              for step in range(rounds) for src in group for dst in group if src != dst)
+            for transfer in transfers:
+                per_rank_payload[transfer.source] += transfer.payload_bytes
+            phases.append(LoweredPhase(pname, rounds, transfers, phase_startup))
         return tuple(phases)
-    if alg in {"direct_mesh", "pairwise"}:
-        phase_names = (("reduce_scatter", "all_gather")
-                       if collective == "allreduce" else (collective,))
-        per_peer = api_bytes if collective == "allgather" else api_bytes / float(count)
+    if alg == "nhr":
+        if count & (count - 1):
+            raise ModelingError("collective_nhr_requires_power_of_two_ranks")
         phases = []
         for pname in phase_names:
             transfers = []
-            for src in group:
-                for dst in group:
-                    if src == dst:
-                        continue
-                    per_rank_payload[src] += per_peer
-                    transfers.append(_build_transfer(pname, 0, src, dst, per_peer, band, topology))
-            phases.append(LoweredPhase(pname, 1, tuple(transfers), phase_startup))
+            for index, src in enumerate(group):
+                schedule = nhr_rounds(count, index, pname)
+                for step, exchange in enumerate(schedule):
+                    amount = shard * len(exchange.send_slices)
+                    per_rank_payload[src] += amount
+                    transfers.append(_build_transfer(pname, step, src, group[exchange.send_to], amount, band, topology))
+            phases.append(LoweredPhase(pname, (count - 1).bit_length(), tuple(transfers), phase_startup))
         return tuple(phases)
     if alg in {"halving_doubling", "recursive_halving_doubling"}:
         rounds = max(1, math.ceil(math.log2(count)))
-        phase_names = (("reduce_scatter", "all_gather")
-                       if collective == "allreduce" else (collective,))
         phases = []
         for pname in phase_names:
             transfers = []
@@ -502,18 +545,15 @@ def _lower_ring_or_alg(
             phases.append(LoweredPhase(pname, rounds, tuple(transfers), phase_startup))
         return tuple(phases)
     # Default: ring
-    phase_names = (("reduce_scatter", "all_gather")
-                   if collective == "allreduce" else (collective,))
     rounds = count - 1
-    chunk_payload = api_bytes if collective == "allgather" else api_bytes / float(count)
     phases = []
     for pname in phase_names:
         transfers = []
         for r_idx in range(rounds):
             for idx, src in enumerate(group):
                 dst = group[(idx + 1) % count]
-                per_rank_payload[src] += chunk_payload
-                transfers.append(_build_transfer(pname, r_idx, src, dst, chunk_payload, band, topology))
+                per_rank_payload[src] += shard
+                transfers.append(_build_transfer(pname, r_idx, src, dst, shard, band, topology))
         phases.append(LoweredPhase(pname, rounds, tuple(transfers), phase_startup))
     return tuple(phases)
 
@@ -579,8 +619,9 @@ def lower_collective(
         phases = _lower_ring_or_alg(
             collective, group, api_bytes, band, topology, phase_startup, per_rank_payload
         )
-        if collective == "allreduce" and band.algorithm in {"ring", "direct", "direct_mesh", "pairwise"}:
-            expected = 2.0 * (count - 1) * api_bytes / float(count)
+        if collective == "allreduce" and (band.algorithm in _MESH_ALGORITHMS or band.algorithm in {"ring", "nhr"}):
+            one_shot = band.algorithm in {"one_shot_mesh", "small_count_mesh"}
+            expected = (count - 1) * api_bytes * (1 if one_shot else 2 / count)
             for rank in group:
                 if not math.isclose(per_rank_payload[rank], expected, rel_tol=1e-12, abs_tol=1e-9):
                     raise ModelingError(f"ring_allreduce_payload_conservation_failed:{rank}")

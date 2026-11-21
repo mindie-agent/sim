@@ -304,7 +304,7 @@ class _TopologyPlansMixin:
             startup = self.startup_descriptor(
                 op, len(next(iter(unique_groups))))
         if algorithm == "direct_mesh":
-            from ..direct_peer import DirectMeshGroup, DirectMeshPhase, DirectMeshPlan
+            from mindie_sim.prediction.operators.collectives.direct_peer import DirectMeshGroup, DirectMeshPhase, DirectMeshPlan
 
             if family not in DIRECT_MESH_FAMILIES:
                 raise ModelingError(
@@ -433,7 +433,7 @@ class _TopologyPlansMixin:
             else:
                 totals = [(rank, volume_by_rank[rank]) for rank in ranks]
             if algorithm == "direct_peer":
-                from ..direct_peer import DirectPeerGroup
+                from mindie_sim.prediction.operators.collectives.direct_peer import DirectPeerGroup
                 groups.append(DirectPeerGroup(
                     ranks, tuple(totals), rounds, self, peer_traffic=peer,
                     max_inflight_per_rank=max_inflight_per_rank,
@@ -501,7 +501,7 @@ class _TopologyPlansMixin:
         if mesh is not None:
             return self._work_with_capacity(mesh.accounting())
         if transport is None and recipe is not None:
-            from ..direct_peer import resolve_transport_options
+            from mindie_sim.prediction.operators.collectives.direct_peer import resolve_transport_options
             transport = resolve_transport_options(recipe, op)
         if transport is None:
             transport = self._transport_bindings.get(id(op))

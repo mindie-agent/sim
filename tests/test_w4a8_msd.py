@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from mindie_sim import graph_costs, predict
-from mindie_sim.prediction.native_fusion import _groups, lower_native_fusions
+from mindie_sim.prediction.operators.hyper_connections.native_fusion import _groups, lower_native_fusions
 from mindie_sim.prediction.operator_analysis import target_operators
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError

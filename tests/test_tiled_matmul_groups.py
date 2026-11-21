@@ -13,7 +13,7 @@ from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.prediction.cost import CostModel
 from mindie_sim.prediction.engine import Engine, Resource
 from mindie_sim.prediction.execution import Execution
-from mindie_sim.prediction.matrix import TiledMatmul
+from mindie_sim.prediction.operators.matrix.matrix import TiledMatmul
 from mindie_sim.prediction.program import RecipeContext
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import dtype_bytes

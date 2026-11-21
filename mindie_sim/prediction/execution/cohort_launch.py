@@ -94,7 +94,7 @@ def _bind_native_resource_view(program, resource_names, engine):
 def launch_native_cohort(engine, launches, *, name_prefix="native_cohort",
                          owner="native_cohort", defer=False):
     """Two-phase launch of native peer programs on one shared Engine."""
-    from ..mc2_program import Mc2LaunchView
+    from mindie_sim.prediction.operators.mc2.mc2_program import Mc2LaunchView
     from ..program import NativeProgram
 
     def field(raw, key, default=None):

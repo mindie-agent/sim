@@ -227,43 +227,7 @@ def _precedence_bound(rows, external, start):
     }
 
 
-def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=None,
-                input_ready_ms=ZERO, include_submission=False, replay_scope=None,
-                isolated=True, trace_limit=ZERO, compact=False,
-                audit_allocations=False, evaluation=None,
-                fast_span_only=False, stream_plans=None):
-    """Run a declared DAG or replica->DAG mapping without a request scheduler.
-
-    External input keys are operator dependency names and values are absolute
-    virtual ready times, shared across selected replicas. A sequence selects
-    replica 0. Cross-DP expert collectives require their complete cohort mapping.
-
-    ``compact=True`` is additive: it omits the per-event ``timeline`` and
-    ``events`` lists and returns the same duration, operator events and
-    readiness/completion boundaries as bounded ``profile``/``event_profile``
-    reductions. No synthetic time histogram is built; each replica's declared
-    identity and source ready/complete boundaries are retained.
-
-    This is the generic execution-graph entry: sampling, token commit and
-    acceptance are ordinary declared nodes here. A pure-model business entry
-    excludes them by selecting an assembly scope, never by a family blacklist.
-    """
-    from .body_defaults import consume_target_declaration
-    from .implementation_selection import graph_selections
-    case = consume_target_declaration(parse_case(case), ops)
-    if input_ready_ms < 0 or not math.isfinite(input_ready_ms):
-        raise ValueError("graph_input_ready_time_must_be_finite_and_nonnegative")
-    # A cut dependency is a declared input, never an implicit body default.
-    # Callers that intentionally cut a body graph provide the boundary
-    # explicitly (efficiency/body entry points pass ``{"analysis_input": 0}``);
-    # an undeclared cut raises ``graph_dependency_unavailable`` below.
-    external = {} if external_inputs is None else dict(external_inputs)
-    if any(value < 0 or not math.isfinite(value) for value in external.values()):
-        raise ValueError("graph_external_input_time_must_be_finite_and_nonnegative")
-    from .evaluation import EvaluationContext, context_for
-    ctx = (context_for(case, evaluation, recipes) if evaluation is not None
-           else EvaluationContext.create(case, recipes, primitives))
-    book = recipes or RecipeBook.from_mapping(case.runtime.kernels)
+def _prepare_graphs(case, ops, book, replay_scope, external):
     graphs = {r: tuple(book.expand(items)) for r, items in
               (ops.items() if isinstance(ops, Mapping) else ((0, ops),))}
     graphs = bind_cohort_traffic(case, graphs)
@@ -295,9 +259,15 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
             dict(op.metadata).get("group_axis") == "local_tp" for op in items
         ) and set(group_for[r]) - graphs.keys():
             raise ValueError("graph_local_tp_collective_requires_complete_cohort")
+    return graphs, scopes, replay_scope, groups, group_for
+
+
+def _run_graph(
+    case, ops, graphs, scopes, groups, ctx, book, external, input_ready_ms, *,
+    include_submission, trace_limit, fast_span_only, stream_plans, request_views,
+    padded_tokens, sequence_layout,
+):
     records, streams = [], {}
-    external_times = {_name(r, key): max(value, input_ready_ms)
-                      for r in graphs for key, value in external.items()}
 
     def observe(op, replica, program, ready, complete):
         key = _name(replica, op.op_id)
@@ -317,6 +287,7 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
         from .streams import validate_stream_plan_ranks
         stream_plans = validate_stream_plan_ranks(stream_plans, set(graphs))
     from .cost import CostLedger
+    from .implementation_selection import graph_selections
     cost = ctx.cost
     op_count = (sum(len(group) for group in ops.values())
                 if isinstance(ops, Mapping) else len(ops))
@@ -330,14 +301,30 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
     # keeps the uncoalesced per-tile shape.
     execution._compact_step = not execution.legacy_diagnostics
     execution.engine._compact_step = execution._compact_step
+    views_source = request_views if request_views is not None else getattr(ops, "request_views", None)
+    eff_padded = int(padded_tokens or getattr(ops, "padded_tokens", 0) or 0)
+    eff_layout = str(sequence_layout or getattr(ops, "sequence_layout", "") or "")
+    execution._active_padded_tokens = eff_padded
+    execution._active_layout = eff_layout
     engine = execution.engine
     engine.now = input_ready_ms
     inputs = {r: {key: engine.submit(
         _name(r, "input:" + key), release=max(value, input_ready_ms),
     ) for key, value in external.items()
         if any(key in op.deps for op in items)} for r, items in graphs.items()}
+
+    def _views_for(replica: int) -> tuple:
+        if isinstance(views_source, Mapping):
+            return tuple(views_source.get(replica, ()))
+        if views_source:
+            return tuple(views_source)
+        return ()
+
     works = {r: IterationWork(
-        items, IterationPlan(()), case.runtime.parallel.pp, 0, 0, None,
+        items, IterationPlan(_views_for(r)), case.runtime.parallel.pp,
+        sum(v.logical_q_len for v in _views_for(r)),
+        eff_padded or sum(v.q_len for v in _views_for(r)),
+        None,
         "graph", "declared_graph", replay_scope=scopes[r],
         implementation_selections=graph_selections(items),
     ) for r, items in graphs.items()}
@@ -350,25 +337,12 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
             r, work = next(iter(selected.items()))
             steps[r] = execution.add(work, r, input_ready_ms, external_inputs=inputs[r])
     engine.advance(until=tuple(step.completion for step in steps.values()), first=False)
-    end = max((step.completion.time for step in steps.values()), default=input_ready_ms)
-    duration = end - input_ready_ms
-    if fast_span_only:
-        # Same Engine, same declared work, same virtual timestamps: only the
-        # per-operator timeline and the isolated pricing pass are omitted.
-        summary = execution.summary()
-        return {
-            "schema": "mindie-sim.graph/1", **model_coverage(case.model),
-            "boundary": ("submitted_device_graph" if include_submission
-                         else "device_graph"),
-            "input_ready_ms": input_ready_ms, "complete_ms": end,
-            "duration_ms": duration, "replicas": list(graphs),
-            "replay_scope": replay_scope,
-            "operator_occurrences": 0, "resources": [],
-            "execution": summary,
-            "engine_backend": summary.get("accel_backend"),
-            "accel_status": accel_status(engine.accel_status()),
-            "fast_span_only": True,
-        }
+    return execution, engine, records, steps, stream_plans
+
+
+def _bind_collective_readiness(case, records, group_for, execution):
+    from .local_tp_groups import local_tp_spans_dp
+
     # Aggregate recipes retain their rendezvous. Causal transport plans retain
     # rank entry and round dependencies instead of one all-cohort ready gate.
     joins = {}
@@ -401,44 +375,51 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
             item["predecessors"] = dependencies
             item["collective_ready_ms"] = ready_ms
 
-    costs, durations, isolated_sum, cohort_cache = [], {}, 0.0, {}
-    if isolated:
-        for participants in joins.values():
-            if not participants[0].get("joint_collective"):
-                continue
-            signature = tuple((item["replica"], item["op"].stage, physical_id(item["op"]))
-                              for item in participants)
-            if signature not in cohort_cache:
-                report = cohort_operator_costs(
-                    case, {item["replica"]: item["op"] for item in participants},
-                    recipes=book, primitives=primitives, replay_scope=scopes,
-                    evaluation=ctx, stream_plans=stream_plans)
-                report["id"] = f"cohort{len(cohort_cache)}"
-                report["occurrences"] = 0
-                for row in report["operators"]:
-                    row.update(cohort_id=report["id"], occurrences=0, total_ms=0)
-                    costs.append(row)
-                cohort_cache[signature] = report
-            report = cohort_cache[signature]
-            report["occurrences"] += 1
-            for item, row in zip(participants, report["operators"]):
-                row["occurrences"] += 1
-                row["total_ms"] += row["duration_ms"]
-                item["joint_isolated_ms"] = row["duration_ms"]
-                item["cohort_id"] = report["id"]
-        joint_nodes = {(item["replica"], item["op"].op_id)
-                       for members in joins.values() for item in members
-                       if item.get("joint_collective")}
-        for r, items in graphs.items():
-            local = tuple(op for op in items if (r, op.op_id) not in joint_nodes)
-            report = operator_costs(case, local, recipes=book, primitives=primitives,
-                                    replay_scope=scopes[r], replica=r,
-                                    evaluation=ctx, stream_plans=stream_plans)
+    return joins
+
+
+def _price_isolated_graph(case, graphs, joins, scopes, book, primitives, ctx, stream_plans):
+    costs, durations, cohort_cache = [], {}, {}
+    for participants in joins.values():
+        if not participants[0].get("joint_collective"):
+            continue
+        signature = tuple((item["replica"], item["op"].stage, physical_id(item["op"]))
+                          for item in participants)
+        if signature not in cohort_cache:
+            report = cohort_operator_costs(
+                case, {item["replica"]: item["op"] for item in participants},
+                recipes=book, primitives=primitives, replay_scope=scopes,
+                evaluation=ctx, stream_plans=stream_plans)
+            report["id"] = f"cohort{len(cohort_cache)}"
+            report["occurrences"] = 0
             for row in report["operators"]:
-                costs.append({"replica": r, **row})
-                row_stream = (row["operator"].get("stream") or "main") if stream_plans else ""
-                durations[r, row["operator"]["stage"], row["physical_id"], row_stream] = row["duration_ms"]
-        isolated_sum = sum(row["total_ms"] for row in costs)
+                row.update(cohort_id=report["id"], occurrences=0, total_ms=0)
+                costs.append(row)
+            cohort_cache[signature] = report
+        report = cohort_cache[signature]
+        report["occurrences"] += 1
+        for item, row in zip(participants, report["operators"]):
+            row["occurrences"] += 1
+            row["total_ms"] += row["duration_ms"]
+            item["joint_isolated_ms"] = row["duration_ms"]
+            item["cohort_id"] = report["id"]
+    joint_nodes = {(item["replica"], item["op"].op_id)
+                   for members in joins.values() for item in members
+                   if item.get("joint_collective")}
+    for r, items in graphs.items():
+        local = tuple(op for op in items if (r, op.op_id) not in joint_nodes)
+        report = operator_costs(case, local, recipes=book, primitives=primitives,
+                                replay_scope=scopes[r], replica=r,
+                                evaluation=ctx, stream_plans=stream_plans)
+        for row in report["operators"]:
+            costs.append({"replica": r, **row})
+            row_stream = (row["operator"].get("stream") or "main") if stream_plans else ""
+            durations[r, row["operator"]["stage"], row["physical_id"], row_stream] = row["duration_ms"]
+    isolated_sum = sum(row["total_ms"] for row in costs)
+    return costs, durations, isolated_sum, cohort_cache
+
+
+def _graph_operator_rows(records, duration, compact, isolated, durations, stream_plans):
     profile = None
     if compact:
         profile = {
@@ -591,29 +572,192 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
                 row["isolated_ms"] = (0 if op.family == "barrier"
                                       else durations[r, op.stage, physical_id(op), op_stream])
         rows.append(row)
+    return rows, profile
+
+
+def _isolated_operator_profile(costs, isolated_sum):
+    isolated_profile = {
+        "operator_sum_ms": isolated_sum,
+        "by_family": {}, "by_operator": {},
+    }
+    for row in costs:
+        operator = row["operator"]
+        replica = row.get("replica")
+        key = (f"r{replica}:{operator['op_id']}" if replica is not None
+               else f"{row.get('cohort_id', 'cohort')}:{operator['op_id']}")
+        item = isolated_profile["by_operator"].setdefault(key, {
+            "replica": replica, "op_id": operator["op_id"],
+            "family": operator["family"], "stage": operator["stage"],
+            "layer": operator["layer"], "physical_id": row["physical_id"],
+            "occurrences": 0, "total_ms": 0.0,
+        })
+        item["occurrences"] += row["occurrences"]
+        item["total_ms"] += row["total_ms"]
+        family = isolated_profile["by_family"].setdefault(
+            operator["family"], {"occurrences": 0, "total_ms": 0.0})
+        family["occurrences"] += row["occurrences"]
+        family["total_ms"] += row["total_ms"]
+    return isolated_profile
+
+
+def _record_native_bridge(case, records, execution_summary, profile):
+    native_records = [
+        record for record in records
+        if (record["op"].family in {"mc2_transport", "mc2_protocol"}
+            or "mc2_phase" in dict(record["op"].metadata))
+    ]
+    native_groups = list(execution_summary.get("native_groups", ()) or ())
+    if native_records:
+        launched_ids = {group["op_id"] for group in native_groups}
+        launched = [record for record in native_records
+                    if record["op"].op_id in launched_ids]
+        protocol = [record for record in native_records
+                    if record["op"].op_id not in launched_ids]
+        bases = sorted({
+            str(basis) for group in native_groups
+            for basis in (group.get("payload_basis") or {}).values()})
+        source_basis = next(
+            (basis for basis in bases if "source_force_eplb" in basis),
+            next((basis for basis in bases if basis != "actual_zero"),
+                 bases[0] if bases else "unknown"))
+        for record in native_records:
+            if source_basis != "unknown":
+                break
+            meta = dict(record["op"].metadata)
+            for key in ("source_force_eplb", "source_token_mask"):
+                source = meta.get(key)
+                if isinstance(source, Mapping) and source.get("basis"):
+                    source_basis = str(source["basis"])
+                    break
+        exact = bool(native_groups) and all(
+            basis.startswith("source_force_eplb") or basis == "actual_zero"
+            for group in native_groups
+            for basis in (group.get("payload_basis") or {}).values())
+        expectation = any(
+            basis not in {"actual_zero"} and
+            not basis.startswith("source_force_eplb")
+            for group in native_groups
+            for basis in (group.get("payload_basis") or {}).values())
+        directed = sum(int(group.get("directed_edges", 0))
+                       for group in native_groups)
+        tp = int(case.runtime.parallel.tp)
+        bridge_status = "actual" if launched else "partial"
+        bridge_reason = ("" if launched else
+                         "ordinary_frontend_native_group_not_materialized")
+        profile["native_bridge"] = {
+            "status": bridge_status,
+            "reason": bridge_reason,
+            "source_basis": source_basis,
+            "known_vs_expected": (
+                "not_materialized" if not launched else
+                "declared_destination_expectation" if expectation else
+                "exact_directed_source_frames" if exact and directed else
+                "exact_zero_source_frames" if exact else "unknown"),
+            "physical_tp_scope": ("resolved" if tp == 1 else
+                                  "unresolved_tp_rank_mapping"),
+            "native_operators": len(launched),
+            "native_launch_groups": len(native_groups),
+            "native_kernel_calls": len(native_groups),
+            "launch_modes": sorted({
+                str(group.get("launch_mode", ""))
+                for group in native_groups if group.get("launch_mode")}),
+            "protocol_operators": len(protocol),
+            "directed_edges": directed,
+            "directed_frames": sum(int(group.get("directed_frames", 0))
+                                   for group in native_groups),
+            "transport_tx_bytes": sum(float(group.get(
+                "transport_tx_bytes", 0.0)) for group in native_groups),
+            "transport_rx_bytes": sum(float(group.get(
+                "transport_rx_bytes", 0.0)) for group in native_groups),
+            "transport_frames": sum(int(group.get(
+                "transport_frames", 0)) for group in native_groups),
+            "transport_edges": sum(int(group.get(
+                "transport_edges", 0)) for group in native_groups),
+            "total_edges": sum(int(group.get(
+                "total_edges", 0)) for group in native_groups),
+            "payload_edges": sum(int(group.get(
+                "payload_edges", 0)) for group in native_groups),
+            "count_edges": sum(int(group.get(
+                "count_edges", 0)) for group in native_groups),
+            "operators": native_groups,
+        }
+
+
+def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=None,
+                input_ready_ms=ZERO, include_submission=False, replay_scope=None,
+                isolated=True, trace_limit=ZERO, compact=False,
+                audit_allocations=False, evaluation=None,
+                fast_span_only=False, stream_plans=None,
+                request_views=None, padded_tokens=0, sequence_layout=""):
+    """Run a declared DAG or replica->DAG mapping without a request scheduler.
+
+    External input keys are operator dependency names and values are absolute
+    virtual ready times, shared across selected replicas. A sequence selects
+    replica 0. Cross-DP expert collectives require their complete cohort mapping.
+
+    ``compact=True`` is additive: it omits the per-event ``timeline`` and
+    ``events`` lists and returns the same duration, operator events and
+    readiness/completion boundaries as bounded ``profile``/``event_profile``
+    reductions. No synthetic time histogram is built; each replica's declared
+    identity and source ready/complete boundaries are retained.
+
+    This is the generic execution-graph entry: sampling, token commit and
+    acceptance are ordinary declared nodes here. A pure-model business entry
+    excludes them by selecting an assembly scope, never by a family blacklist.
+    """
+    from .body_defaults import consume_target_declaration
+    case = consume_target_declaration(parse_case(case), ops)
+    if input_ready_ms < 0 or not math.isfinite(input_ready_ms):
+        raise ValueError("graph_input_ready_time_must_be_finite_and_nonnegative")
+    # A cut dependency is a declared input, never an implicit body default.
+    # Callers that intentionally cut a body graph provide the boundary
+    # explicitly (efficiency/body entry points pass ``{"analysis_input": 0}``);
+    # an undeclared cut raises ``graph_dependency_unavailable`` below.
+    external = {} if external_inputs is None else dict(external_inputs)
+    if any(value < 0 or not math.isfinite(value) for value in external.values()):
+        raise ValueError("graph_external_input_time_must_be_finite_and_nonnegative")
+    from .evaluation import EvaluationContext, context_for
+    ctx = (context_for(case, evaluation, recipes) if evaluation is not None
+           else EvaluationContext.create(case, recipes, primitives))
+    book = recipes or RecipeBook.from_mapping(case.runtime.kernels)
+    graphs, scopes, replay_scope, groups, group_for = _prepare_graphs(
+        case, ops, book, replay_scope, external)
+    external_times = {_name(r, key): max(value, input_ready_ms)
+                      for r in graphs for key, value in external.items()}
+    execution, engine, records, steps, stream_plans = _run_graph(
+        case, ops, graphs, scopes, groups, ctx, book, external, input_ready_ms,
+        include_submission=include_submission, trace_limit=trace_limit,
+        fast_span_only=fast_span_only, stream_plans=stream_plans,
+        request_views=request_views, padded_tokens=padded_tokens, sequence_layout=sequence_layout)
+    end = max((step.completion.time for step in steps.values()), default=input_ready_ms)
+    duration = end - input_ready_ms
+    if fast_span_only:
+        # Same Engine, same declared work, same virtual timestamps: only the
+        # per-operator timeline and the isolated pricing pass are omitted.
+        summary = execution.summary()
+        return {
+            "schema": "mindie-sim.graph/1", **model_coverage(case.model),
+            "boundary": ("submitted_device_graph" if include_submission
+                         else "device_graph"),
+            "input_ready_ms": input_ready_ms, "complete_ms": end,
+            "duration_ms": duration, "replicas": list(graphs),
+            "replay_scope": replay_scope,
+            "operator_occurrences": 0, "resources": [],
+            "execution": summary,
+            "engine_backend": summary.get("accel_backend"),
+            "accel_status": accel_status(engine.accel_status()),
+            "fast_span_only": True,
+        }
+    joins = _bind_collective_readiness(case, records, group_for, execution)
+    costs, durations, isolated_sum, cohort_cache = [], {}, 0.0, {}
+    if isolated:
+        costs, durations, isolated_sum, cohort_cache = _price_isolated_graph(
+            case, graphs, joins, scopes, book, primitives, ctx, stream_plans)
+    rows, profile = _graph_operator_rows(
+        records, duration, compact, isolated, durations, stream_plans)
     isolated_profile = None
     if compact and isolated:
-        isolated_profile = {
-            "operator_sum_ms": isolated_sum,
-            "by_family": {}, "by_operator": {},
-        }
-        for row in costs:
-            operator = row["operator"]
-            replica = row.get("replica")
-            key = (f"r{replica}:{operator['op_id']}" if replica is not None
-                   else f"{row.get('cohort_id', 'cohort')}:{operator['op_id']}")
-            item = isolated_profile["by_operator"].setdefault(key, {
-                "replica": replica, "op_id": operator["op_id"],
-                "family": operator["family"], "stage": operator["stage"],
-                "layer": operator["layer"], "physical_id": row["physical_id"],
-                "occurrences": 0, "total_ms": 0.0,
-            })
-            item["occurrences"] += row["occurrences"]
-            item["total_ms"] += row["total_ms"]
-            family = isolated_profile["by_family"].setdefault(
-                operator["family"], {"occurrences": 0, "total_ms": 0.0})
-            family["occurrences"] += row["occurrences"]
-            family["total_ms"] += row["total_ms"]
+        isolated_profile = _isolated_operator_profile(costs, isolated_sum)
         costs = []
     resources = [{
         "resource": name, "work": amount, "unit": engine.resources[name].unit,
@@ -652,86 +796,7 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
             }
             for replica, step in steps.items()
         }
-        native_records = [
-            record for record in records
-            if (record["op"].family in {"mc2_transport", "mc2_protocol"}
-                or "mc2_phase" in dict(record["op"].metadata))
-        ]
-        native_groups = list(execution_summary.get("native_groups", ()) or ())
-        if native_records:
-            launched_ids = {group["op_id"] for group in native_groups}
-            launched = [record for record in native_records
-                        if record["op"].op_id in launched_ids]
-            protocol = [record for record in native_records
-                        if record["op"].op_id not in launched_ids]
-            bases = sorted({
-                str(basis) for group in native_groups
-                for basis in (group.get("payload_basis") or {}).values()})
-            source_basis = next(
-                (basis for basis in bases if "source_force_eplb" in basis),
-                next((basis for basis in bases if basis != "actual_zero"),
-                     bases[0] if bases else "unknown"))
-            for record in native_records:
-                if source_basis != "unknown":
-                    break
-                meta = dict(record["op"].metadata)
-                for key in ("source_force_eplb", "source_token_mask"):
-                    source = meta.get(key)
-                    if isinstance(source, Mapping) and source.get("basis"):
-                        source_basis = str(source["basis"])
-                        break
-            exact = bool(native_groups) and all(
-                basis.startswith("source_force_eplb") or basis == "actual_zero"
-                for group in native_groups
-                for basis in (group.get("payload_basis") or {}).values())
-            expectation = any(
-                basis not in {"actual_zero"} and
-                not basis.startswith("source_force_eplb")
-                for group in native_groups
-                for basis in (group.get("payload_basis") or {}).values())
-            directed = sum(int(group.get("directed_edges", 0))
-                           for group in native_groups)
-            tp = int(case.runtime.parallel.tp)
-            bridge_status = "actual" if launched else "partial"
-            bridge_reason = ("" if launched else
-                             "ordinary_frontend_native_group_not_materialized")
-            profile["native_bridge"] = {
-                "status": bridge_status,
-                "reason": bridge_reason,
-                "source_basis": source_basis,
-                "known_vs_expected": (
-                    "not_materialized" if not launched else
-                    "declared_destination_expectation" if expectation else
-                    "exact_directed_source_frames" if exact and directed else
-                    "exact_zero_source_frames" if exact else "unknown"),
-                "physical_tp_scope": ("resolved" if tp == 1 else
-                                      "unresolved_tp_rank_mapping"),
-                "native_operators": len(launched),
-                "native_launch_groups": len(native_groups),
-                "native_kernel_calls": len(native_groups),
-                "launch_modes": sorted({
-                    str(group.get("launch_mode", ""))
-                    for group in native_groups if group.get("launch_mode")}),
-                "protocol_operators": len(protocol),
-                "directed_edges": directed,
-                "directed_frames": sum(int(group.get("directed_frames", 0))
-                                       for group in native_groups),
-                "transport_tx_bytes": sum(float(group.get(
-                    "transport_tx_bytes", 0.0)) for group in native_groups),
-                "transport_rx_bytes": sum(float(group.get(
-                    "transport_rx_bytes", 0.0)) for group in native_groups),
-                "transport_frames": sum(int(group.get(
-                    "transport_frames", 0)) for group in native_groups),
-                "transport_edges": sum(int(group.get(
-                    "transport_edges", 0)) for group in native_groups),
-                "total_edges": sum(int(group.get(
-                    "total_edges", 0)) for group in native_groups),
-                "payload_edges": sum(int(group.get(
-                    "payload_edges", 0)) for group in native_groups),
-                "count_edges": sum(int(group.get(
-                    "count_edges", 0)) for group in native_groups),
-                "operators": native_groups,
-            }
+        _record_native_bridge(case, records, execution_summary, profile)
         result.update(
             result_mode="compact", profile=profile,
             event_profile=bounded_event_profile(engine),
@@ -744,6 +809,11 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
             "execution": execution_summary, "parameters": parameter_summary,
             "events": list(engine.trace),
         }
+        evicted_spans = getattr(engine, "_evicted_service_spans", None)
+        if evicted_spans:
+            result["evicted_service_spans"] = {
+                key: tuple(spans) for key, spans in evicted_spans.items()
+            }
     if graphs:
         result.update(_exposed_breakdown(
             records, duration, input_ready_ms, min(graphs)))

@@ -18,7 +18,7 @@ from typing import Mapping
 from mindie_sim.schema.common import ModelingError, align_up, dtype_bytes
 from mindie_sim.schema.operators import StateEffect
 from ...engine import Allocation
-from ...gdn_recurrent_contracts import (
+from mindie_sim.prediction.operators.linear_attention.gdn_recurrent_contracts import (
     STATE_DIRECTIONS, STATE_TARGET_KINDS, _SLOT_PUBLISH, _SLOT_SCOPES,
     _TARGET_FIELD, _slot_ports, _state_effect, _state_target, bind_state_ports,
     state_contract, tensor_port,
@@ -26,6 +26,8 @@ from ...gdn_recurrent_contracts import (
 from ...mechanism import OperatorPlan, Work
 from ...ownership import read_role, unit_group
 from ...program import KernelProgram, ParallelProgram, PipelineProgram, Stage
+from ..contracts import OperatorPlanningContext
+from .common import owner_units, request_layout_metadata, request_lengths
 
 IMPLEMENTATION = "ascend_recurrent_gdn_fp32_state"
 STATE_CONTRACT_KEY = "gdn_state_contract"
@@ -45,11 +47,11 @@ UB_BYTES = 247808
 _MAX_HEAD_DIM = 512
 _MAX_VALUE_HEADS = 256
 _MAX_QUERY_ROWS = 8
-_VECTOR_LANE_ALIGNMENT = 16
+VECTOR_LANE_ALIGNMENT = 16
 _RESIDENT_QKV_BYTES = 16384
 _STATE_TILE_ELEMENTS = 8192
 _VALUE_TILE_COLUMN_LIMIT = 256
-_QK_CAST_SCALE_OPS_PER_LANE = 3
+QK_CAST_SCALE_OPS_PER_LANE = 3
 
 
 def head_ownership(lengths, heads, blocks):
@@ -58,6 +60,8 @@ def head_ownership(lengths, heads, blocks):
     owners = [[] for _ in range(blocks)]
     owner, load = 0, 0
     for seq, q in enumerate(lengths):
+        if q == 0:
+            continue
         remaining = heads
         while remaining:
             count = min(remaining, math.ceil((target - load) / q))
@@ -246,24 +250,48 @@ def _state_plan_meta(meta):
     return result
 
 
-def build(op, geometry, *, compact=True):
+def recurrent_lengths(op, ctx: OperatorPlanningContext | None) -> tuple[int, ...]:
+    if ctx is not None and ctx.requests:
+        return request_lengths(ctx.requests)
+    return tuple(dict(op.metadata)["sequence_tokens"])
+
+
+def state_value_step(aligned_key: int) -> int:
+    columns = _STATE_TILE_ELEMENTS // aligned_key
+    if columns > _VALUE_TILE_COLUMN_LIMIT:
+        columns = _VALUE_TILE_COLUMN_LIMIT - 1
+    return columns // VECTOR_LANE_ALIGNMENT * VECTOR_LANE_ALIGNMENT
+
+
+def token_vector_ops(aligned_key: int, aligned_value: int, dv: int) -> int:
+    dot_ops = 2 * (2 * aligned_key - 1)
+    state_ops = aligned_key + 2 * aligned_key + aligned_key  # Decay, rank-one update, state copy.
+    value_ops = dot_ops + state_ops + 2 + 1  # Delta and output cast.
+    key_ops = (1 + 2 + QK_CAST_SCALE_OPS_PER_LANE) * aligned_key
+    return value_ops * dv + key_ops + aligned_value
+
+
+def build(op, geometry, *, compact=True, ctx: OperatorPlanningContext | None = None):
     meta = dict(op.metadata)
-    lengths = tuple(meta["sequence_tokens"])
+    lengths = recurrent_lengths(op, ctx)
+    plan_meta = _state_plan_meta(meta)
+    if ctx is not None and ctx.requests:
+        plan_meta.update(request_layout_metadata(ctx))
+        plan_meta["state_contraction_ops"] = 0
     if not any(length > 0 for length in lengths):
         # A graph-padded step can own physical rows without an active sequence.
         # Its host grid and buffers remain, but the source recurrence performs
         # no state work; keep an explicit empty program rather than inventing a
         # token or falling back to a different implementation.
         return OperatorPlan(Work(), lambda context: KernelProgram(()),
-                            metadata={"empty_active_sequences": True,
-                                      **_state_plan_meta(meta)})
+                            metadata={"empty_active_sequences": True, **plan_meta})
     heads, dk, dv = (int(meta[key]) for key in ("heads", "dk", "dv"))
     keys = int(meta["key_heads"])
     if not (1 <= dk <= _MAX_HEAD_DIM and 1 <= dv <= _MAX_HEAD_DIM
             and 1 <= heads <= _MAX_VALUE_HEADS
             and keys > 0 and heads % keys == 0):
         raise ValueError("source_recurrent_gdn_head_dimensions_outside_host_domain")
-    ak, av = align_up(dk, _VECTOR_LANE_ALIGNMENT), align_up(dv, _VECTOR_LANE_ALIGNMENT)
+    ak, av = align_up(dk, VECTOR_LANE_ALIGNMENT), align_up(dv, VECTOR_LANE_ALIGNMENT)
     max_query = max(lengths)
     if op.dtype != "bf16" or meta["state_dtype"] != "fp32" or max_query > _MAX_QUERY_ROWS:
         raise ValueError("source_recurrent_gdn_requires_bf16_fp32_state_q_le8")
@@ -271,33 +299,29 @@ def build(op, geometry, *, compact=True):
     input_bytes = int(dtype_bytes(op.dtype))
     if max_query * max(ak, av) * state_bytes > _RESIDENT_QKV_BYTES:
         raise ValueError("source_recurrent_gdn_resident_qkv_exceeds_16k_buffer")
-    columns = _STATE_TILE_ELEMENTS // ak
-    if columns > _VALUE_TILE_COLUMN_LIMIT:
-        columns = _VALUE_TILE_COLUMN_LIMIT - 1
-    value_step = columns // _VECTOR_LANE_ALIGNMENT * _VECTOR_LANE_ALIGNMENT
+    value_step = state_value_step(ak)
     if not value_step:
         raise ValueError("source_recurrent_gdn_state_tile_exceeds_32k_buffer")
     parts = math.ceil(dv / value_step)
-    units = geometry.resource_units.get("vector", geometry.compute_units)
-    blocks = min(units, len(lengths) * heads)
+    units, core_ids = recurrent_owners(geometry, ctx)
+    active_heads = sum(length > 0 for length in lengths) * heads
+    blocks = min(len(core_ids), active_heads)
+    if not blocks:
+        raise ModelingError("source_recurrent_gdn_requires_active_vector_owners")
     ownership = head_ownership(lengths, heads, blocks)
     run_counts = tuple(sum(1 for _ in head_runs(lengths, segments, compact=compact))
                        for segments in ownership)
     read = read_role(geometry.resource_units, aiv=0)
     total = sum(lengths) * heads
-    tensor_reads = len(lengths) * heads * dk * dv * state_bytes + total * (2 * dk + dv) * input_bytes
+    tensor_reads = active_heads * dk * dv * state_bytes + total * (2 * dk + dv) * input_bytes
     scalar_payload = total * (state_bytes + input_bytes * parts)
     writes = total * (dk * dv * state_bytes + dv * input_bytes)
-    dot_ops = 2 * (2 * ak - 1)
-    state_ops = ak + 2 * ak + ak  # Decay, rank-one update, state copy.
-    value_ops = dot_ops + state_ops + 2 + 1  # Delta and output cast.
-    key_ops = (1 + 2 + _QK_CAST_SCALE_OPS_PER_LANE) * ak  # Gamma zero, gamma, Q/K cast and scale.
-    vector = len(lengths) * heads * ak * dv + total * (value_ops * dv + key_ops + av)
+    vector = active_heads * ak * dv + total * token_vector_ops(ak, av, dv)
     work = Work(resources={"hbm": tensor_reads + scalar_payload + writes,
                            read: tensor_reads, "mte3": writes, "vector": vector})
 
     def program(context):
-        def owner_program(owner, segments):
+        def owner_program(owner, segments, run_count):
             owned = context.owned(owner, units, ("vector", read, "mte3"))
             def head(q, repeat):
                 # This scales real repeated work, including each distinct
@@ -328,7 +352,7 @@ def build(op, geometry, *, compact=True):
                         if first:
                             stages.append(Stage("qk_load", memory(q * 2 * dk * input_bytes, read),
                                                 after=(prev,), placement=owned))
-                            stages.append(Stage("qk_cast_scale", v(q * _QK_CAST_SCALE_OPS_PER_LANE * ak),
+                            stages.append(Stage("qk_cast_scale", v(q * QK_CAST_SCALE_OPS_PER_LANE * ak),
                                                 after=("qk_load",), placement=owned))
                             prev = "qk_cast_scale"
                         stages.append(Stage("key_dot", v((2 * ak - 1) * n), after=(prev,), placement=owned))
@@ -359,7 +383,7 @@ def build(op, geometry, *, compact=True):
                 return (Stage("gamma_zero", v(q * ak), placement=owned),
                         Stage("value_tiles", after=("gamma_zero",), program=PipelineProgram(parts, 1, part)))
             pending = tuple(head_runs(lengths, segments, compact=compact))
-            heads_program = PipelineProgram(run_counts[owner], 1,
+            heads_program = PipelineProgram(run_count, 1,
                                             lambda index, pending=pending: head(*pending[index]))
             pool = context.pool_names.get("ub")
             if pool is None:
@@ -373,14 +397,23 @@ def build(op, geometry, *, compact=True):
         # requires every demand-carrying task of this operator to keep its own
         # single physical unit, which a summed-work cohort placement would
         # widen.  Only the boundary encoding is collapsed (see program.py).
-        return ParallelProgram(tuple(owner_program(owner, segments)
-                                     for owner, segments in enumerate(ownership)))
-    return OperatorPlan(work, program, metadata={**_state_plan_meta(meta),
+        return ParallelProgram(tuple(owner_program(owner, segments, count)
+                                     for owner, segments, count in zip(core_ids, ownership, run_counts)))
+    if ctx is not None and ctx.requests:
+        plan_meta["state_contraction_ops"] = 2 * total * dk * dv
+    return OperatorPlan(work, program, metadata={**plan_meta,
         "recurrent_head_schedule": {
-        "compact": compact, "logical_heads": len(lengths) * heads,
+        "compact": compact, "logical_heads": active_heads,
         "resource_cycles": sum(run_counts),
         "owner_heads": tuple(sum(count for _, count in segments) for segments in ownership),
         "owner_cycles": run_counts,
         "handoff": "conservative_serial_head_and_DV_tile_retirement",
         "contention_approximation": "serial_cycle_fluid_rephasing" if compact else "none",
     }})
+
+
+def recurrent_owners(geometry, ctx: OperatorPlanningContext | None) -> tuple[int, range | tuple[int, ...]]:
+    if ctx is not None and ctx.requests:
+        return ctx.datapath.aiv_count, owner_units(ctx)[1]
+    units = geometry.resource_units.get("vector", geometry.compute_units)
+    return units, range(units)

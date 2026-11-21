@@ -38,7 +38,7 @@ from mindie_sim.sweep_engine import SCREEN_BATCH
 # #51-(1a)/(4): shared-prefix compressed index-K accounting.
 # --------------------------------------------------------------------------- #
 def test_index_key_window_counts_physical_compressed_rows():
-    from mindie_sim.prediction.generic_latent_attention import index_key_window
+    from mindie_sim.prediction.operators.mla.generic_latent_attention import index_key_window
 
     rows, refills = index_key_window(((4, 128),), compression=32)
     assert (rows, refills) == (132 // 32, 132 // 32)
@@ -48,7 +48,7 @@ def test_index_key_window_counts_physical_compressed_rows():
 
 
 def test_unique_index_key_rows_deduplicates_only_the_shared_prefix():
-    from mindie_sim.prediction.generic_latent_attention import unique_index_key_rows
+    from mindie_sim.prediction.operators.mla.generic_latent_attention import unique_index_key_rows
     from mindie_sim.schema.workload import RequestView
 
     views = tuple(
@@ -114,7 +114,7 @@ def _prefix_views(context, prefix_tokens):
 
 
 def test_apply_indexer_prefix_reads_compresses_declared_prefix_tokens():
-    from mindie_sim.prediction.batch_prefix_indexer import (
+    from mindie_sim.prediction.operators.sparse_indexer.batch_prefix_indexer import (
         apply_indexer_prefix_reads,
     )
 
@@ -137,7 +137,7 @@ def test_apply_indexer_prefix_reads_compresses_declared_prefix_tokens():
 
 
 def test_apply_indexer_prefix_reads_rejects_excess_components():
-    from mindie_sim.prediction.batch_prefix_indexer import (
+    from mindie_sim.prediction.operators.sparse_indexer.batch_prefix_indexer import (
         apply_indexer_prefix_reads,
     )
     from mindie_sim.schema.common import ModelingError
@@ -433,7 +433,7 @@ def test_qk_norm_does_not_block_residual_normalization():
 # #51-(5): MC2 speculative capacity and the orphan pack quantizer.
 # --------------------------------------------------------------------------- #
 def test_mc2_capacity_defaults_to_one_plus_draft_proposal_tokens():
-    from mindie_sim.prediction.moe_comm_selection import MoeCommConfig
+    from mindie_sim.prediction.operators.mc2.moe_comm_selection import MoeCommConfig
 
     features = SimpleNamespace(tp=1, graph_buckets=(), metadata=(
         ("moe_comm_mode", "dynamic"), ("max_num_seqs", 2),
@@ -524,7 +524,7 @@ def _mc2_graph(activation_format="int8", scale_shape=(math.ceil(RECEIVED),),
 
 
 def _mc2_lower(ops, prefix, **options):
-    from mindie_sim.prediction.mc2_graph import lower
+    from mindie_sim.prediction.operators.mc2.mc2_graph import lower
 
     runtime = SimpleNamespace(
         kernels={"native_moe_protocol": {"kind": "arch35_fullmesh",
@@ -582,7 +582,7 @@ def test_mc2_rejects_an_external_pack_quantizer_consumer():
 
 
 def test_mc2_non_mc2_selection_falls_through_without_raising():
-    from mindie_sim.prediction.mc2_graph import select_common
+    from mindie_sim.prediction.operators.mc2.mc2_graph import select_common
 
     runtime = SimpleNamespace(
         kernels={}, metadata={"moe_comm_mode": "dynamic"},
@@ -642,7 +642,7 @@ def test_model_scope_routes_verification_rows_without_double_expansion():
 # #52.2: pure SWA MQSMLA geometry.
 # --------------------------------------------------------------------------- #
 def test_mqsmla_pure_swa_has_zero_compressed_rows():
-    from mindie_sim.prediction.family_mqsmla import query_rows, query_shape
+    from mindie_sim.prediction.operators.paged_mla.family_mqsmla import query_rows, query_shape
     from mindie_sim.schema.workload import RequestView
 
     case = parse_case(compose_case("deepseek-v4.1-flash", hardware="a5",
@@ -667,7 +667,7 @@ def test_mqsmla_pure_swa_has_zero_compressed_rows():
 
 
 def test_mqsmla_rejects_padded_views_and_keeps_padded_tokens():
-    from mindie_sim.prediction.family_mqsmla import unsupported_reason
+    from mindie_sim.prediction.operators.paged_mla.family_mqsmla import unsupported_reason
     from mindie_sim.schema.workload import RequestView
 
     raw = compose_case("deepseek-v4.1-flash", hardware="a5", tp=8, ep=8,

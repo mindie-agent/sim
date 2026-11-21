@@ -45,7 +45,7 @@ from mindie_sim.prediction.offload import (
 )
 from mindie_sim.prediction.operator_analysis import target_graphs
 from mindie_sim.prediction.scheduler import Scheduler
-from mindie_sim.prediction.sparse_kv_offload import copy_sfa_pool_capacity
+from mindie_sim.prediction.operators.sparse_indexer.sparse_kv_offload import copy_sfa_pool_capacity
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.schema.workload import IterationPlan, RequestView
@@ -150,8 +150,9 @@ def test_kvc_ratio_scales_resize_and_capacity_is_bounded():
     capacity = with_kvc.capacity[0][0]
     assert raw[0] > capacity and scaled[0] * 0.5 <= capacity; assert no_kvc.resize(0, "req", context) is False; assert with_kvc.resize(0, "req", context) is True; assert with_kvc.live[0][0] == pytest.approx(raw[0] * 0.5)
 def test_link_effective_and_peak_bandwidth_helpers():
-    parsed = parse_case(catalog_case()); effective = min(link.capacity_bytes_per_ms for link in parsed.machine.links)
-    assert _resolve_link_bw_bytes_per_ms(parsed, "body") == pytest.approx(effective); assert _resolve_link_peak_bw_bytes_per_ms(parsed, "model") == pytest.approx(effective)
+    parsed = parse_case(catalog_case())
+    assert _resolve_link_bw_bytes_per_ms(parsed, "body") == pytest.approx(122e6)
+    assert _resolve_link_peak_bw_bytes_per_ms(parsed, "model") == pytest.approx(196e6)
     synthetic = replace(parsed, machine=replace(parsed.machine, links=(
         SimpleNamespace(capacity_bytes_per_ms=100.0, effective_peak_capacity_bytes_per_ms=250.0),
         SimpleNamespace(capacity_bytes_per_ms=150.0, effective_peak_capacity_bytes_per_ms=300.0))))

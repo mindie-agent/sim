@@ -46,7 +46,7 @@ from mindie_sim.catalog.types import AuxiliarySpec, DraftSpec, QuantSpec
 from mindie_sim.catalog.weight_layer_terms import layer_weight_terms
 from mindie_sim.compose import compose_case
 from mindie_sim.model_catalog import CATALOG, MODEL_ALIASES, load_model
-from mindie_sim.prediction.expert_slot_work import physical_slot_work
+from mindie_sim.prediction.operators.moe_routing.expert_slot_work import physical_slot_work
 from mindie_sim.prediction.local_tp_groups import collective_requires_cohort, expert_tp_groups, local_tp_groups
 from mindie_sim.prediction.operator_analysis import synchronize_moe_allgather_cohort
 from mindie_sim.prediction.structure import parse_case

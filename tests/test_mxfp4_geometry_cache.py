@@ -7,8 +7,8 @@ import pytest
 from mindie_sim import operator_costs
 from mindie_sim.prediction.instructions import InstructionInventory
 from mindie_sim.prediction.mechanism import PlannedRecipe, Work
-from mindie_sim.prediction.mxfp4_geometry import Config, geometry_ledger, owner_tiles, tile_work, tile_inventory
-from mindie_sim.prediction.mxfp4_grouped import build
+from mindie_sim.prediction.operators.mx_quant_matrix.mxfp4_geometry import Config, geometry_ledger, owner_tiles, tile_work, tile_inventory
+from mindie_sim.prediction.operators.mx_quant_matrix.mxfp4_grouped import build
 from mindie_sim.prediction.program import RecipeBook
 from test_mxfp4_grouped import source_case, gate, physical_op
 

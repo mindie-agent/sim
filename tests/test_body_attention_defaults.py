@@ -90,6 +90,8 @@ def test_rope_free_indexed_body_defaults_execute_declared_cache_representation(s
     raw["model"]["layers"] = 4
     raw["model"]["quant"]["kv_dtype"] = kv_dtype
     raw["machine"]["sku"] = sku
+    if sku == "Ascend950DT_9582":
+        raw["machine"]["ranks_per_node"] = 8
     raw["runtime"]["kernels"]["programs"].pop("indexed_attention")
     result = predict(raw, scope="body", tokens=4, context=128, sequences=3)
     kind = "indexed_attention_packed_int8" if kv_dtype == "int8" else "indexed_attention_pipeline"
@@ -110,7 +112,6 @@ def test_dense_mla_body_default_respects_kernel_head_domain(model, sku):
     from mindie_sim.compose import compose_case
     from mindie_sim.prediction.operator_analysis import operator_costs, target_graphs
     from mindie_sim.prediction.structure import parse_case
-
     raw = compose_case(model, hardware=sku, tp=8, dp=1, num_devices=8, layers=4)
     parsed = parse_case(raw)
     report = operator_costs(parsed, target_graphs(
@@ -124,10 +125,9 @@ def test_dense_mla_body_default_respects_kernel_head_domain(model, sku):
 ))
 def test_kimi_body_defaults_install_kda_and_attention_residual(sku, expected_kda):
     from mindie_sim.compose import compose_case
-    from mindie_sim.prediction import family_attnres
+    from mindie_sim.prediction.operators.hyper_connections import family_attnres
     from mindie_sim.prediction.body_defaults import attention_defaults
     from mindie_sim.prediction.structure import parse_case
-
     raw = compose_case("kimi-k3", hardware=sku, tp=8, dp=1, ep=8, num_devices=8, quant="w4a8", layers=8)
     raw.setdefault("runtime", {}).setdefault("metadata", {})["image_id"] = family_attnres.SOURCE["image_id"]
     # Compose records the catalog's source choices; this test exercises the

@@ -9,8 +9,8 @@ import pytest
 
 from mindie_sim import target_graphs, operator_costs, graph_costs
 from mindie_sim.prediction.mechanism import Geometry
-from mindie_sim.prediction.mxfp8_grouped import Mapping
-from mindie_sim.prediction.mxfp8_swiglu import PROFILE, ROLE, build, owner_tiles, vector_work
+from mindie_sim.prediction.operators.mx_quant_matrix.mxfp8_grouped import Mapping
+from mindie_sim.prediction.operators.mx_quant_matrix.mxfp8_swiglu import PROFILE, ROLE, build, owner_tiles, vector_work
 from mindie_sim.prediction.structure import parse_case
 
 ROOT=Path(__file__).resolve().parents[1]
@@ -143,8 +143,8 @@ def test_real_resource_scaling_is_monotone_without_changing_work(sample):
 
 
 def test_extra_materialization_cannot_disappear_inside_selected_three_node_program(sample):
-    from mindie_sim.prediction.family_mxfp8_swiglu import bind
-    from mindie_sim.prediction.native_fusion import _groups
+    from mindie_sim.prediction.operators.mx_quant_matrix.family_mxfp8_swiglu import bind
+    from mindie_sim.prediction.operators.hyper_connections.native_fusion import _groups
     from mindie_sim.prediction.implementations import select
     from mindie_sim.schema.common import ModelingError
     raw,_,_=sample
@@ -159,7 +159,7 @@ def test_extra_materialization_cannot_disappear_inside_selected_three_node_progr
 
 
 def test_mxfp8_swiglu_capability_registry_and_option_gates():
-    from mindie_sim.prediction.family_mxfp8_swiglu import bind, capabilities
+    from mindie_sim.prediction.operators.mx_quant_matrix.family_mxfp8_swiglu import bind, capabilities
     from mindie_sim.schema.common import ModelingError
     from mindie_sim.schema.operators import OpSpec
 

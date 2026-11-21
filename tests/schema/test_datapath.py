@@ -35,10 +35,10 @@ from mindie_sim.prediction.graph_analysis import graph_costs
 from mindie_sim.prediction.instructions import (
     CONTROL_INSTRUCTIONS, InstructionCount, InstructionInventory, PrimitiveInventory,
 )
-from mindie_sim.prediction.matrix import HierarchicalMatmul, TiledMatmul
-from mindie_sim.prediction.matrix_mapping import MappedMatmul, mapping_bound
-from mindie_sim.prediction.matrix_phase import PhaseMatmul
-from mindie_sim.prediction.matrix_steady import SteadyMatmul
+from mindie_sim.prediction.operators.matrix.matrix import HierarchicalMatmul, TiledMatmul
+from mindie_sim.prediction.operators.matrix.matrix_mapping import MappedMatmul, mapping_bound
+from mindie_sim.prediction.operators.matrix.matrix_phase import PhaseMatmul
+from mindie_sim.prediction.operators.matrix.matrix_steady import SteadyMatmul
 from mindie_sim.prediction.mechanism import Geometry, Work
 from mindie_sim.prediction.program import KernelProgram, RecipeBook, RecipeContext, Stage
 from mindie_sim.prediction.structure import parse_case
@@ -187,7 +187,8 @@ def test_regbase_skus_share_arch_capability_with_distinct_memory_capacities():
     dies = [machine(sku).dies[0] for sku in REGBASE_SKUS]
     ref = dies[0]
     for die in dies[1:]:
-        assert dict(die.compute_peaks) == dict(ref.compute_peaks)
+        assert dict(die.compute_peaks) == pytest.approx({
+            dtype: rate * die.aic_count / ref.aic_count for dtype, rate in ref.compute_peaks})
         assert (die.capability.representations, die.capability.native_modes, die.capability.paths) == (
             ref.capability.representations, ref.capability.native_modes, ref.capability.paths)
     assert len({die.memory_bytes for die in dies}) == len(dies)
@@ -417,15 +418,15 @@ def test_heterogeneous_instruction_preset_clock_disable_and_nested_owner_scaling
             assert dict(die.service_modes)["vbitsort32"] == dict(alone.service_modes)["vbitsort32"]
             assert dict(die.work_units)["vbitsort32"] == "blocks32" and dict(die.rates) == dict(alone.rates)
         assert Hardware.from_mapping(hw.to_dict()) == hw
-    base_sort = dict(_mixed_preset(REG_SKU, REG_PR_SKU).dies[0].service_modes)["vbitsort32"][1]
-    assert all(dict(d.service_modes)["vbitsort32"] == ("vector", pytest.approx(2 * base_sort))
+    base_sort = 1.6e9 / 16
+    assert all(dict(d.service_modes)["vbitsort32"] == ("vector", pytest.approx(2 * base_sort * d.units("vector")))
                for d in _mixed_preset(REG_SKU, REG_PR_SKU, clock=3.2e9).dies)
     assert all("vbitsort32" not in dict(d.service_modes) for d in _mixed_preset(REG_SKU, REG_PR_SKU, presets=()).dies)
     explicit = _mixed_preset(REG_SKU, REG_PR_SKU, service={"vbitsort32": {"per_owner_rate": 2e8}})
     assert Hardware.from_mapping(explicit.to_dict()) == explicit
     assert dict(explicit.dies[1].service_modes)["vbitsort32"] == ("vector", pytest.approx(2e8 * explicit.dies[1].units("vector")))
     local_clk = _mixed_preset(REG_SKU, REG_PR_SKU, other_extra={"device": {"compute_arch": {"clock_hz": 3.2e9}}})
-    assert dict(local_clk.dies[1].service_modes)["vbitsort32"][1] == pytest.approx(2 * base_sort)
+    assert dict(local_clk.dies[1].service_modes)["vbitsort32"][1] == pytest.approx(2 * base_sort * local_clk.dies[1].units("vector"))
     local_off = _mixed_preset(REG_SKU, REG_PR_SKU, other_extra={"device": {"compute_arch": {"presets": []}}})
     assert "vbitsort32" in dict(local_off.dies[0].service_modes) and "vbitsort32" not in dict(local_off.dies[1].service_modes)
     base_pr = machine(REG_PR_SKU).dies[0]
@@ -436,7 +437,7 @@ def test_heterogeneous_instruction_preset_clock_disable_and_nested_owner_scaling
         dict(pr_f.rates), dict(pr_f.resource_units), dict(pr_f.buffer_units), dict(pr_f.service_modes))
     assert pr_n.units("vector") == pr_n.units("mte2_aiv") == pr_n.pool_units("ub") == half_aiv
     assert pr_n.owner_rate("vector") == pytest.approx(base_pr.owner_rate("vector"))
-    assert dict(pr_n.service_modes)["vbitsort32"][1] == pytest.approx(base_sort / 2)
+    assert dict(pr_n.service_modes)["vbitsort32"][1] == pytest.approx(base_sort * half_aiv)
     tuned = _mixed_preset(REG_SKU, REG_PR_SKU, other_extra={"device": {
         "compute_units": 16, "aiv_count": half_aiv, "compute_peaks": {"bf16": 1e12}, "rates": {"vector": 1e12},
         "buffer_units": {"ub": 17}, "buffers": {"ub": 1000},
@@ -445,8 +446,8 @@ def test_heterogeneous_instruction_preset_clock_disable_and_nested_owner_scaling
     assert (pr_t.compute_units, pr_t.units("vector"), pr_t.pool_units("ub"), pr_t.pool_capacity("ub")) == (16, half_aiv, 17, 1000)
     assert (pr_t.peak("bf16"), dict(pr_t.rates)["vector"], dict(pr_t.service_modes)["explicit_mode"]) == (
         pytest.approx(1e12), pytest.approx(1e12), ("vector", 123.0))
-    assert pr_t.units("mte1") == 16 and dict(pr_t.rates)["mte1"] == pytest.approx(dict(base_pr.rates)["mte1"] / 2)
-    assert dict(pr_t.service_modes)["mte1_l1_ub"] == ("mte1", pytest.approx(dict(base_pr.rates)["mte1"] / 4))
+    assert pr_t.units("mte1") == 16 and dict(pr_t.rates)["mte1"] == pytest.approx(base_pr.owner_rate("mte1") * pr_t.aic_count)
+    assert dict(pr_t.service_modes)["mte1_l1_ub"] == ("mte1", pytest.approx(dict(pr_t.rates)["mte1"] / 2))
     assert Hardware.from_mapping(tuned.to_dict()) == tuned
     expected = 1600 * 16 / 1.6e9 * 1000
     assert _execute_sort32(pr_t) == pytest.approx(expected)

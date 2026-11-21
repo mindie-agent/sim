@@ -17,10 +17,10 @@ from mindie_sim.schema.operators import OpSpec
 
 from mindie_sim import graph_costs, operator_costs, target_graphs, target_operators
 from mindie_sim.catalog.quant import quant_preset
-from mindie_sim.prediction import deepep
+from mindie_sim.prediction.operators.moe_transport import deepep
 from mindie_sim.prediction.implementations import produced_values
 from mindie_sim.prediction.mechanism import Geometry, Work
-from mindie_sim.prediction.moe_callers import LOCAL_EXPERT_REDUCE
+from mindie_sim.prediction.operators.moe_transport.moe_callers import LOCAL_EXPERT_REDUCE
 from mindie_sim.prediction.operators import grouped_moe
 from mindie_sim.prediction.operators.grouped_moe.lowering import StageDemand
 from mindie_sim.prediction.streams import StreamOwners

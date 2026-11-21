@@ -24,7 +24,7 @@ from typing import Any, Mapping, Sequence
 from ..coupled import coupled_rates, _coupled_pair_fast
 from ..ownership import unit_rates
 from .arbiter import component_rates, _fast_eligible_task
-from ._engine_hbm_bus import _hbm_rem_fraction, _sync_task_hbm_accounting
+from ._engine_hbm_bus import _hbm_entry_done_since_bind, _sync_task_hbm_accounting
 from .contracts import (
     AllocationBinding, AllocationKey, BindingFrame, EventKey, OccurrenceKey,
     PortBinding, Submission,
@@ -72,10 +72,38 @@ def _stop_window(now: float, horizon: float, releases, latency_active, tasks) ->
     return dt
 
 
+def _completed_targets(until_tuple, until_two_0, until_two_1, first):
+    if until_two_0 is not None:
+        d0 = until_two_0.time is not None
+        d1 = until_two_1.time is not None
+        if d0 and d1:
+            return until_tuple, True
+        if d0 or d1:
+            complete = (until_two_0,) if d0 else (until_two_1,)
+            if first:
+                return complete, True
+        else:
+            complete = ()
+    elif first:
+        complete = ()
+        for event in until_tuple:
+            if event.time is not None:
+                return tuple(ev for ev in until_tuple if ev.time is not None), True
+    else:
+        complete = tuple(ev for ev in until_tuple if ev.time is not None)
+        if len(complete) == len(until_tuple):
+            return complete, True
+    return complete, False
+
+
 DEADLINE_POLL_MASK = 255
 _CACHED_MIXED_PLAN_KIND = 3
 _CACHED_MIXED_REM_IDX = 6
 _TRIPLE_ACTIVE_COUNT = 3
+
+_NATIVE_EPOCH_STEP_LIMIT = 1 << 20
+_STALL_NAME_LIMIT = 300
+_SERVICE_ROUNDING_ULPS = 4
 
 #: Default no-progress guard of one Engine advance (structural, not physics).
 DEFAULT_ZERO_PROGRESS_LIMIT = 100_000
@@ -128,6 +156,8 @@ class Engine(
         self._native_active = 0
         self._native_seeded = False
         self._wave_recorder = None
+        self._admission_memory_view = None
+        self._allocation_versions: dict[str, int] = {}
         self._hbm_bus_aliases: dict[str, Any] = {}
         self._hbm_bus_epoch: int = 0
         self._hbm_acct_live: int = 0
@@ -149,6 +179,22 @@ class Engine(
         recorder = self._wave_recorder
         self._wave_recorder = None
         return recorder
+
+    @property
+    def admission_memory_view(self):
+        """Return the canonical per-die ``AdmissionMemoryView`` attached to this Engine."""
+        return self._admission_memory_view
+
+    def attach_admission_memory_view(self, view) -> None:
+        """Attach the canonical per-die ``AdmissionMemoryView`` for L2 state tracking."""
+        self._admission_memory_view = view
+
+    def bump_allocation_version(self, allocation_id: str) -> int:
+        """Advance and return the monotonic version counter for ``allocation_id``."""
+        key = str(allocation_id)
+        ver = self._allocation_versions.get(key, 0) + 1
+        self._allocation_versions[key] = ver
+        return ver
 
     @property
     def accel_backend(self) -> str:
@@ -389,15 +435,7 @@ class Engine(
         resources = self.resources
         pair_cache = self._pair_rate_cache
         _settle = self._settle
-        _step_pair_fast = self._step_pair_fast
-        _step_cached_pair = self._step_cached_pair
-        _cache_pair_plan = self._cache_pair_plan
         _step_solo_fast = self._step_solo_fast
-        _isfinite = math.isfinite
-        _ulp = math.ulp
-        _nextafter = math.nextafter
-        _heappush = heapq.heappush
-        _inf = math.inf
         while True:
             if (steps & DEADLINE_POLL_MASK) == 0:
                 from ..evaluation import ACTIVE_DEADLINE_MONO, check_active_deadline
@@ -412,25 +450,10 @@ class Engine(
                 if until_one.time is not None:
                     return until_tuple
                 complete = ()
-            elif until_two_0 is not None:
-                d0 = until_two_0.time is not None
-                d1 = until_two_1.time is not None
-                if d0 and d1:
-                    return until_tuple
-                if d0 or d1:
-                    complete = (until_two_0,) if d0 else (until_two_1,)
-                    if first:
-                        return complete
-                else:
-                    complete = ()
-            elif first and n_until:
-                complete = ()
-                for event in until_tuple:
-                    if event.time is not None:
-                        return tuple(ev for ev in until_tuple if ev.time is not None)
             elif n_until:
-                complete = tuple(ev for ev in until_tuple if ev.time is not None)
-                if len(complete) == n_until:
+                complete, reached = _completed_targets(
+                    until_tuple, until_two_0, until_two_1, first)
+                if reached:
                     return complete
             else:
                 complete = ()
@@ -454,7 +477,7 @@ class Engine(
                                       or accel.made_progress):
                 consumed = accel.advance_epoch(
                     self, horizon,
-                    (max_steps - steps) if max_steps is not None else (1 << 20),
+                    (max_steps - steps) if max_steps is not None else _NATIVE_EPOCH_STEP_LIMIT,
                     until_tuple)
                 if consumed:
                     steps += consumed
@@ -469,12 +492,12 @@ class Engine(
                         rel_dt = releases[0][0] - now
                         if rel_dt < dt:
                             dt = rel_dt
-                    if not _isfinite(dt):
+                    if not math.isfinite(dt):
                         names = ",".join(t.event.name for t in tasks.values())
-                        raise ExecutionError(f"execution_stalled:{names[:300]}")
+                        raise ExecutionError(f"execution_stalled:{names[:_STALL_NAME_LIMIT]}")
                     next_time = now + dt
                     if dt > 0 and next_time == now:
-                        next_time = _nextafter(now, _inf)
+                        next_time = math.nextafter(now, math.inf)
                     self.advance_steps += 1
                     steps += 1
                     self.now = next_time
@@ -497,132 +520,23 @@ class Engine(
                     elif (t0.priority == t1.priority
                           and _fast_eligible_task(resources, t0)
                           and _fast_eligible_task(resources, t1)):
-                        p0, p1 = t0.prepared, t1.prepared
-                        if (p0 is not None and p1 is not None
-                                and not t0.service and not t1.service
-                                and len(rem0) == len(p0.demand)
-                                and len(rem1) == len(p1.demand)):
-                            hit = pair_cache.get((id(p0), id(p1)))
-                            if hit is not None and hit[0] is p0 and hit[1] is p1:
-                                cplan = hit[2]
-                                if cplan.__class__ is tuple:
-                                    if (cplan[0] != _CACHED_MIXED_PLAN_KIND
-                                            or (rem1[cplan[_CACHED_MIXED_PLAN_KIND]] if cplan[1] else rem0[cplan[_CACHED_MIXED_PLAN_KIND]]) == cplan[_CACHED_MIXED_REM_IDX]):
-                                        dt = _stop_window(now, horizon, releases, latency_active, tasks)
-                                        watched = (
-                                            ((k0, t0, dict(t0.service)), (k1, t1, dict(t1.service)))
-                                            if (wave_rec is not None or t0.deliveries or t1.deliveries
-                                                or t0.hbm_accounting or t1.hbm_accounting) else ()
-                                        )
-                                        next_time = _step_cached_pair(cplan, k0, t0, k1, t1, now, dt)
-                                        if watched:
-                                            self._emit_fast_step_observers(wave_rec, watched, now, next_time)
-                                        self.advance_steps += 1
-                                        steps += 1
-                                        self.now = next_time
-                                        continue
-                                    cp_fast = _coupled_pair_fast(resources, k0, t0, k1, t1)
-                                elif cplan is False:
-                                    cp_fast = _coupled_pair_fast(resources, k0, t0, k1, t1)
-                                else:
-                                    cp_fast = None
-                            else:
-                                cp_fast = _coupled_pair_fast(resources, k0, t0, k1, t1)
-                                _cache_pair_plan(p0, p1, t0, cp_fast)
-                        else:
-                            cp_fast = _coupled_pair_fast(resources, k0, t0, k1, t1)
-                        if cp_fast is not None:
-                            dt = _stop_window(now, horizon, releases, latency_active, tasks)
-                            watched = (
-                                ((k0, t0, dict(t0.service)), (k1, t1, dict(t1.service)))
-                                if (wave_rec is not None or t0.deliveries or t1.deliveries
-                                    or t0.hbm_accounting or t1.hbm_accounting) else ()
-                            )
-                            next_time = _step_pair_fast(cp_fast, now, dt)
-                            if watched:
-                                self._emit_fast_step_observers(wave_rec, watched, now, next_time)
+                        next_pair = self._step_active_pair(
+                            k0, t0, k1, t1, now, horizon, releases, latency_active,
+                            tasks, resources, pair_cache, wave_rec)
+                        if next_pair is not None:
                             self.advance_steps += 1
                             steps += 1
-                            self.now = next_time
+                            self.now = next_pair
                             continue
                 elif n_act == _TRIPLE_ACTIVE_COUNT:
-                    it_a = iter(active)
-                    k0, k1, k2 = next(it_a), next(it_a), next(it_a)
-                    t0, t1, t2 = tasks[k0], tasks[k1], tasks[k2]
-                    rem0, rem1, rem2 = t0.remaining, t1.remaining, t2.remaining
-                    if (t0.priority == t1.priority == t2.priority
-                            and _fast_eligible_task(resources, t0)
-                            and _fast_eligible_task(resources, t1)
-                            and _fast_eligible_task(resources, t2)):
-                        if not rem0 or not rem1 or not rem2:
-                            if not rem0:
-                                ka, ta, kb, tb = k1, t1, k2, t2
-                            elif not rem1:
-                                ka, ta, kb, tb = k0, t0, k2, t2
-                            else:
-                                ka, ta, kb, tb = k0, t0, k1, t1
-                            cp_fast = _coupled_pair_fast(resources, ka, ta, kb, tb)
-                            if cp_fast is not None:
-                                dt = _stop_window(now, horizon, releases, latency_active, tasks)
-                                watched = (
-                                    ((ka, ta, dict(ta.service)), (kb, tb, dict(tb.service)))
-                                    if (wave_rec is not None or ta.deliveries or tb.deliveries
-                                        or ta.hbm_accounting or tb.hbm_accounting) else ()
-                                )
-                                next_time = _step_pair_fast(cp_fast, now, dt)
-                                if watched:
-                                    self._emit_fast_step_observers(wave_rec, watched, now, next_time)
-                                self.advance_steps += 1
-                                steps += 1
-                                self.now = next_time
-                                continue
-                        else:
-                            ks, ts = 0, None
-                            if not t0.coupled and len(rem0) == 1:
-                                rcand = next(iter(rem0))
-                                if rcand not in rem1 and rcand not in rem2:
-                                    ks, ts, rs = k0, t0, rcand
-                                    ka, ta, kb, tb = k1, t1, k2, t2
-                            if ts is None and not t1.coupled and len(rem1) == 1:
-                                rcand = next(iter(rem1))
-                                if rcand not in rem0 and rcand not in rem2:
-                                    ks, ts, rs = k1, t1, rcand
-                                    ka, ta, kb, tb = k0, t0, k2, t2
-                            if ts is None and not t2.coupled and len(rem2) == 1:
-                                rcand = next(iter(rem2))
-                                if rcand not in rem0 and rcand not in rem1:
-                                    ks, ts, rs = k2, t2, rcand
-                                    ka, ta, kb, tb = k0, t0, k1, t1
-                            if ts is not None:
-                                cp_fast = _coupled_pair_fast(resources, ka, ta, kb, tb)
-                                if cp_fast is not None:
-                                    prep_s = ts.prepared
-                                    if prep_s is not None and prep_s.solo_rates is not None:
-                                        rate_s = prep_s.solo_rates[rs]
-                                    else:
-                                        res_s = resources[rs]
-                                        if res_s.policy == "fifo":
-                                            rate_s = res_s.rate
-                                        elif ts.placement and rs in ts.placement:
-                                            rate_s = res_s.rate / res_s.units * len(ts.placement[rs])
-                                        else:
-                                            rate_s = res_s.rate
-                                        if ts.caps and rs in ts.caps and ts.caps[rs] < rate_s:
-                                            rate_s = ts.caps[rs]
-                                    dt = _stop_window(now, horizon, releases, latency_active, tasks)
-                                    watched = (
-                                        ((ka, ta, dict(ta.service)), (kb, tb, dict(tb.service)),
-                                         (ks, ts, dict(ts.service)))
-                                        if (wave_rec is not None or ta.deliveries or tb.deliveries or ts.deliveries
-                                            or ta.hbm_accounting or tb.hbm_accounting or ts.hbm_accounting) else ()
-                                    )
-                                    next_time = _step_pair_fast(cp_fast, now, dt, ks, ts, rs, rate_s)
-                                    if watched:
-                                        self._emit_fast_step_observers(wave_rec, watched, now, next_time)
-                                    self.advance_steps += 1
-                                    steps += 1
-                                    self.now = next_time
-                                    continue
+                    next_triple = self._step_active_triple(
+                        active, now, horizon, releases, latency_active, tasks,
+                        resources, wave_rec)
+                    if next_triple is not None:
+                        self.advance_steps += 1
+                        steps += 1
+                        self.now = next_triple
+                        continue
                 if solo_task is not None and _fast_eligible_task(resources, solo_task):
                     next_solo = _step_solo_fast(solo_key, solo_task, now, horizon, max_steps)
                     if next_solo is not None:
@@ -634,59 +548,195 @@ class Engine(
                         steps += 1
                         self.now = next_solo
                         continue
-            rates = self._rates()
-            dt = _stop_window(now, horizon, releases, latency_active, tasks)
-            for name, consumers in rates.items():
-                for key, rate in consumers.items():
-                    if rate == 0.0:
-                        raise ExecutionError(f"service_rate_underflow:{name}")
-                    work_dt = tasks[key].remaining[name] / rate
-                    if work_dt < dt:
-                        dt = work_dt
-            if not _isfinite(dt):
-                names = ",".join(task.event.name for task in tasks.values())
-                raise ExecutionError(f"execution_stalled:{names[:300]}")
-            next_time = now + dt
-            if dt > 0 and next_time == now:
-                next_time = _nextafter(now, _inf)
-            wave_rec = self._wave_recorder
-            for name, consumers in rates.items():
-                busy_ms[name] += dt
-                for key, rate in consumers.items():
-                    task = tasks[key]
-                    remaining = task.remaining[name]
-                    scaled = dt * rate
-                    if scaled >= remaining:
-                        used, residual = remaining, 0.0
-                    else:
-                        residual = remaining - scaled
-                        if residual <= 4 * _ulp(remaining):
-                            used, residual = remaining, 0.0
-                        else:
-                            used = scaled
-                    if task.first_service is None and used > 0.0:
-                        task.first_service = now
-                    service = task.service
-                    service[name] = service.get(name, 0.0) + used
-                    serviced[name] += used
-                    if wave_rec is not None and dt > 0.0:
-                        pl_units = task.placement.get(name) if task.placement else None
-                        owner_u = pl_units[0] if pl_units else 0
-                        wave_rec.on_service(key, name, owner_u, now, next_time, used)
-                    if residual:
-                        task.remaining[name] = residual
-                    else:
-                        del task.remaining[name]
-                        if not task.remaining and task.latency <= 0.0:
-                            completable_seen.add(key)
-                            _heappush(completable, key)
-                    if task.hbm_accounting:
-                        _sync_task_hbm_accounting(self, task)
-                    if task.deliveries:
-                        self._update_task_deliveries(task)
+            next_time = self._step_shared_service(
+                now, horizon, releases, latency_active, tasks, busy_ms, serviced,
+                completable, completable_seen)
             self.advance_steps += 1
             steps += 1
             self.now = next_time
+
+    def _step_active_pair(
+        self, k0, t0, k1, t1, now, horizon, releases, latency_active,
+        tasks, resources, pair_cache, wave_rec,
+    ) -> float | None:
+        rem0, rem1 = t0.remaining, t1.remaining
+        p0, p1 = t0.prepared, t1.prepared
+        if (p0 is not None and p1 is not None
+                and not t0.service and not t1.service
+                and len(rem0) == len(p0.demand)
+                and len(rem1) == len(p1.demand)):
+            hit = pair_cache.get((id(p0), id(p1)))
+            if hit is not None and hit[0] is p0 and hit[1] is p1:
+                cplan = hit[2]
+                if cplan.__class__ is tuple:
+                    if (cplan[0] != _CACHED_MIXED_PLAN_KIND
+                            or (rem1 if cplan[1] else rem0)[cplan[_CACHED_MIXED_PLAN_KIND]]
+                            == cplan[_CACHED_MIXED_REM_IDX]):
+                        dt = _stop_window(now, horizon, releases, latency_active, tasks)
+                        watched = (
+                            ((k0, t0, dict(t0.service)), (k1, t1, dict(t1.service)))
+                            if (wave_rec is not None or t0.deliveries or t1.deliveries
+                                or t0.hbm_accounting or t1.hbm_accounting) else ()
+                        )
+                        next_time = self._step_cached_pair(cplan, k0, t0, k1, t1, now, dt)
+                        if watched:
+                            self._emit_fast_step_observers(wave_rec, watched, now, next_time)
+                        return next_time
+                    cp_fast = _coupled_pair_fast(resources, k0, t0, k1, t1)
+                elif cplan is False:
+                    cp_fast = _coupled_pair_fast(resources, k0, t0, k1, t1)
+                else:
+                    cp_fast = None
+            else:
+                cp_fast = _coupled_pair_fast(resources, k0, t0, k1, t1)
+                self._cache_pair_plan(p0, p1, t0, cp_fast)
+        else:
+            cp_fast = _coupled_pair_fast(resources, k0, t0, k1, t1)
+        if cp_fast is not None:
+            dt = _stop_window(now, horizon, releases, latency_active, tasks)
+            watched = (
+                ((k0, t0, dict(t0.service)), (k1, t1, dict(t1.service)))
+                if (wave_rec is not None or t0.deliveries or t1.deliveries
+                    or t0.hbm_accounting or t1.hbm_accounting) else ()
+            )
+            next_time = self._step_pair_fast(cp_fast, now, dt)
+            if watched:
+                self._emit_fast_step_observers(wave_rec, watched, now, next_time)
+            return next_time
+        return None
+
+    def _step_active_triple(
+        self, active, now, horizon, releases, latency_active, tasks, resources, wave_rec,
+    ) -> float | None:
+        it_a = iter(active)
+        k0, k1, k2 = next(it_a), next(it_a), next(it_a)
+        t0, t1, t2 = tasks[k0], tasks[k1], tasks[k2]
+        rem0, rem1, rem2 = t0.remaining, t1.remaining, t2.remaining
+        if not (t0.priority == t1.priority == t2.priority
+                    and _fast_eligible_task(resources, t0)
+                    and _fast_eligible_task(resources, t1)
+                    and _fast_eligible_task(resources, t2)):
+            return None
+        if not rem0 or not rem1 or not rem2:
+            if not rem0:
+                ka, ta, kb, tb = k1, t1, k2, t2
+            elif not rem1:
+                ka, ta, kb, tb = k0, t0, k2, t2
+            else:
+                ka, ta, kb, tb = k0, t0, k1, t1
+            cp_fast = _coupled_pair_fast(resources, ka, ta, kb, tb)
+            if cp_fast is not None:
+                dt = _stop_window(now, horizon, releases, latency_active, tasks)
+                watched = (
+                    ((ka, ta, dict(ta.service)), (kb, tb, dict(tb.service)))
+                    if (wave_rec is not None or ta.deliveries or tb.deliveries
+                        or ta.hbm_accounting or tb.hbm_accounting) else ()
+                )
+                next_time = self._step_pair_fast(cp_fast, now, dt)
+                if watched:
+                    self._emit_fast_step_observers(wave_rec, watched, now, next_time)
+                return next_time
+            return None
+        ks, ts = 0, None
+        if not t0.coupled and len(rem0) == 1:
+            rcand = next(iter(rem0))
+            if rcand not in rem1 and rcand not in rem2:
+                ks, ts, rs = k0, t0, rcand
+                ka, ta, kb, tb = k1, t1, k2, t2
+        if ts is None and not t1.coupled and len(rem1) == 1:
+            rcand = next(iter(rem1))
+            if rcand not in rem0 and rcand not in rem2:
+                ks, ts, rs = k1, t1, rcand
+                ka, ta, kb, tb = k0, t0, k2, t2
+        if ts is None and not t2.coupled and len(rem2) == 1:
+            rcand = next(iter(rem2))
+            if rcand not in rem0 and rcand not in rem1:
+                ks, ts, rs = k2, t2, rcand
+                ka, ta, kb, tb = k0, t0, k1, t1
+        if ts is not None:
+            cp_fast = _coupled_pair_fast(resources, ka, ta, kb, tb)
+            if cp_fast is not None:
+                prep_s = ts.prepared
+                if prep_s is not None and prep_s.solo_rates is not None:
+                    rate_s = prep_s.solo_rates[rs]
+                else:
+                    res_s = resources[rs]
+                    if res_s.policy == "fifo":
+                        rate_s = res_s.rate
+                    elif ts.placement and rs in ts.placement:
+                        rate_s = res_s.rate / res_s.units * len(ts.placement[rs])
+                    else:
+                        rate_s = res_s.rate
+                    if ts.caps and rs in ts.caps and ts.caps[rs] < rate_s:
+                        rate_s = ts.caps[rs]
+                dt = _stop_window(now, horizon, releases, latency_active, tasks)
+                watched = (
+                    ((ka, ta, dict(ta.service)), (kb, tb, dict(tb.service)),
+                     (ks, ts, dict(ts.service)))
+                    if (wave_rec is not None or ta.deliveries or tb.deliveries or ts.deliveries
+                        or ta.hbm_accounting or tb.hbm_accounting or ts.hbm_accounting) else ()
+                )
+                next_time = self._step_pair_fast(cp_fast, now, dt, ks, ts, rs, rate_s)
+                if watched:
+                    self._emit_fast_step_observers(wave_rec, watched, now, next_time)
+                return next_time
+        return None
+
+    def _step_shared_service(
+        self, now, horizon, releases, latency_active, tasks, busy_ms, serviced,
+        completable, completable_seen,
+    ) -> float:
+        rates = self._rates()
+        dt = _stop_window(now, horizon, releases, latency_active, tasks)
+        for name, consumers in rates.items():
+            for key, rate in consumers.items():
+                if rate == 0.0:
+                    raise ExecutionError(f"service_rate_underflow:{name}")
+                work_dt = tasks[key].remaining[name] / rate
+                if work_dt < dt:
+                    dt = work_dt
+        if not math.isfinite(dt):
+            names = ",".join(task.event.name for task in tasks.values())
+            raise ExecutionError(f"execution_stalled:{names[:_STALL_NAME_LIMIT]}")
+        next_time = now + dt
+        if dt > 0 and next_time == now:
+            next_time = math.nextafter(now, math.inf)
+        wave_rec = self._wave_recorder
+        for name, consumers in rates.items():
+            busy_ms[name] += dt
+            for key, rate in consumers.items():
+                task = tasks[key]
+                remaining = task.remaining[name]
+                scaled = dt * rate
+                if scaled >= remaining:
+                    used, residual = remaining, 0.0
+                else:
+                    residual = remaining - scaled
+                    if residual <= _SERVICE_ROUNDING_ULPS * math.ulp(remaining):
+                        used, residual = remaining, 0.0
+                    else:
+                        used = scaled
+                if task.first_service is None and used > 0.0:
+                    task.first_service = now
+                service = task.service
+                service[name] = service.get(name, 0.0) + used
+                serviced[name] += used
+                if wave_rec is not None and dt > 0.0:
+                    pl_units = task.placement.get(name) if task.placement else None
+                    owner_u = pl_units[0] if pl_units else 0
+                    wave_rec.on_service(key, name, owner_u, now, next_time, used)
+                if residual:
+                    task.remaining[name] = residual
+                else:
+                    del task.remaining[name]
+                    if not task.remaining and task.latency <= 0.0:
+                        completable_seen.add(key)
+                        heapq.heappush(completable, key)
+                if task.hbm_accounting:
+                    _sync_task_hbm_accounting(self, task)
+                if task.deliveries:
+                    self._update_task_deliveries(task)
+        return next_time
 
     def service_of(self, event: Event) -> dict[str, float]:
         """Read-only per-task service; live native slots export accrued work."""
@@ -709,12 +759,18 @@ class Engine(
                     credited = task.hbm_credited or {}
                     for entry in task.hbm_accounting:
                         base = entry[0]
-                        done_since = entry[2] * (1.0 - _hbm_rem_fraction(live_rem, entry))
+                        done_since = _hbm_entry_done_since_bind(live_rem, entry)
                         delta = done_since - credited.get(base, 0.0)
                         if delta > 0.0:
                             merged[base] = merged.get(base, 0.0) + delta
                 return merged
-        return dict(task.service)
+        merged = dict(task.service)
+        if task.split_children:
+            for child_ev in task.split_children:
+                if not child_ev.done:
+                    for rn, amt in self.service_of(child_ev).items():
+                        merged[rn] = merged.get(rn, 0.0) + amt
+        return merged
 
     def _accel_coverage(self) -> tuple[int, int, str | None]:
         if self._accel is not None:

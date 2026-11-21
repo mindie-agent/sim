@@ -17,6 +17,7 @@ from mindie_sim.schema.operators import OpSpec
 from ...mechanism import Geometry, OperatorPlan, PlannedRecipe
 from ...results import OpOccurrence
 from ..contracts import OperatorFamilySpec, OperatorPlanningContext, ResolvedOperator
+from ..attention.common import with_sequence_context
 from . import arch22 as _arch22, arch35 as _arch35
 from . import bf16_lightning
 from .common import (
@@ -47,8 +48,7 @@ trace_arch22_topk_flushes = _arch22.trace_arch22_topk_flushes
 def build(op: OpSpec, geometry_or_ctx: Geometry | OperatorPlanningContext) -> OperatorPlan:
     """Build from the governed context or directly from physical geometry."""
     if op.recipe == bf16_lightning.RECIPE:
-        geometry = geometry_or_ctx if isinstance(geometry_or_ctx, Geometry) else geometry_or_ctx.geometry
-        return bf16_lightning._build(op, geometry)
+        return bf16_lightning._build(op, geometry_or_ctx)
     if isinstance(geometry_or_ctx, Geometry):
         geometry = geometry_or_ctx
         if geometry.datapath is None:
@@ -59,6 +59,7 @@ def build(op: OpSpec, geometry_or_ctx: Geometry | OperatorPlanningContext) -> Op
         )
     else:
         ctx = geometry_or_ctx
+    ctx = with_sequence_context(op, ctx)
     strategy = _STRATEGIES.get(ctx.compute_arch.arch_id)
     if strategy is None:
         raise unsupported("architecture", f"No sparse indexer lowering for {ctx.compute_arch.arch_id}")

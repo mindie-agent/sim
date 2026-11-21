@@ -581,7 +581,7 @@ def test_tensor_padding_masks_empty_tail_ranks_from_source_realization():
 
 def test_native_protocol_delegates_selection_recipes_and_lowering():
     from types import SimpleNamespace
-    from mindie_sim.prediction import mc2_graph
+    from mindie_sim.prediction.operators.mc2 import mc2_graph
     from mindie_sim.prediction.mechanism import Geometry
     from mindie_sim.schema.operators import OpSpec
     for kind, quant, native_r, net_r in (

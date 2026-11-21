@@ -9,12 +9,12 @@ import gc
 import pytest
 
 from mindie_sim import operator_costs
-from mindie_sim.prediction import mxfp4_grouped
+from mindie_sim.prediction.operators.mx_quant_matrix import mxfp4_grouped
 from mindie_sim.prediction.engine import Engine, Resource
-from mindie_sim.prediction.mxfp4_panels import compiled_panels, panel_parts
-from mindie_sim.prediction.mxfp4_geometry import panel_sizes, tile_runs
+from mindie_sim.prediction.operators.mx_quant_matrix.mxfp4_panels import compiled_panels, panel_parts
+from mindie_sim.prediction.operators.mx_quant_matrix.mxfp4_geometry import panel_sizes, tile_runs
 from mindie_sim.prediction.mechanism import PlannedRecipe
-from mindie_sim.prediction.refill_steady import compact_refill
+from mindie_sim.prediction.operators.matrix.refill_steady import compact_refill
 from mindie_sim.prediction.program import RecipeBook
 from test_mxfp4_grouped import source_case, gate, physical_op
 

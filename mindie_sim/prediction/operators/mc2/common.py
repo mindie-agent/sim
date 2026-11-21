@@ -22,7 +22,7 @@ from mindie_sim.public.errors import UnmodeledCapabilityError
 from mindie_sim.schema.common import ModelingError, align_up, dtype_bytes
 from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.operators import OpSpec
-from ...direct_peer import DirectPeerCollective
+from mindie_sim.prediction.operators.collectives.direct_peer import DirectPeerCollective
 from ...mechanism import OperatorPlan, Work
 from ...results import FusedPipelineDescriptor, FusedPipelineSpec, PipelinePhase, WorkItem
 from ...runtime.ring_buffer import RingBuffer, lower_generation

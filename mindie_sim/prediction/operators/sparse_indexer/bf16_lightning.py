@@ -30,12 +30,14 @@ from ._bf16_access import (
     _tile_sentinel as _tile_sentinel, _weighted_vector_ops,
 )
 from ._bf16_program import (
-    _build, _placement as _placement,
+    _build as _build_program, _placement as _placement,
     _resident_allocations as _resident_allocations, _split_loads as _split_loads,
 )
-from mindie_sim.prediction.indexer_source import select_indexer_source
-from ...mechanism import OperatorPlan as OperatorPlan, PlannedRecipe, Work as Work
-from ..mixed_core import read_role as read_role
+from mindie_sim.prediction.operators.sparse_indexer.indexer_source import select_indexer_source
+from ...mechanism import Geometry, OperatorPlan as OperatorPlan, PlannedRecipe, Work as Work
+from ..attention.common import RECTANGULAR_SEQUENCE_LAYOUTS, sequence_layout_spans, with_sequence_context
+from ..contracts import OperatorPlanningContext
+from mindie_sim.prediction.operators.vector.mixed_core import read_role as read_role
 from ...ownership import unit_group as unit_group
 from ...program import KernelProgram as KernelProgram, Stage as Stage
 
@@ -69,6 +71,51 @@ NATIVE_OUTPUTS = ("indices",)
 
 def recipes():
     return {RECIPE: PlannedRecipe(_build)}
+
+
+def _build(op, context: Geometry | OperatorPlanningContext):
+    if isinstance(context, OperatorPlanningContext):
+        context = with_sequence_context(op, context)
+        geometry = context.geometry
+    else:
+        geometry = context
+    if not context.requests:
+        return _build_program(op, geometry)
+
+    layout = context.layout or "TND"
+    spans = sequence_layout_spans(context.requests, padded_tokens=context.padded_tokens, layout=layout)
+    padded_rows = (sum(request.physical_q_len for request in context.requests)
+                   if layout.upper() in RECTANGULAR_SEQUENCE_LAYOUTS else sum(span[0] for span in spans))
+    metadata = dict(op.metadata)
+    if (raw := metadata.get("lightning_indexer_work")) is None:
+        return _build_program(op, geometry)
+    ledger = dict(raw)
+    compression = ledger["compression"]
+    lengths = tuple((q, kv - q) for q, kv, _, _, _ in spans)
+    queries = sum(q for q, _ in lengths)
+    pairs = sum(causal_pairs(q, c, compression) for q, c in lengths if q)
+    heads, kv_heads = ledger["heads"], ledger["kv_heads"]
+    flops = 2 * pairs * heads * ledger["head_dim"]
+    view = context.admission_memory_view
+    if view is not None and "l2" in geometry.buffers:
+        capacity = view.effective_l2_bytes(geometry.rank or 0)
+        declared = ledger.get("l2_capacity_bytes")
+        ledger["l2_capacity_bytes"] = capacity if declared is None else min(declared, capacity)
+    ledger.update(
+        sequence_partition=lengths, query_rows=queries,
+        weighted_head_reduce_ops=_weighted_vector_ops(pairs, heads, kv_heads),
+        unique_key_bytes=sum((q + c) // compression for q, c in lengths)
+        * kv_heads * ledger["head_dim"] * dtype_bytes("bf16"),
+        head_weight_bytes=queries * heads * dtype_bytes(ledger["weight_dtype"]),
+        metadata_read_bytes=len(spans) * (2 + ledger["block_table_columns"]) * _INDEX_ELEMENT_BYTES if queries else 0,
+        selection_output_bytes=queries * kv_heads * ledger["topk"] * _INDEX_ELEMENT_BYTES,
+        sequence_layout_spans=spans,
+    )
+    metadata["lightning_indexer_work"] = ledger
+    bound = replace(op, matrix_flops=(("bf16", flops),), metadata=tuple(metadata.items()))
+    plan = _build_program(bound, geometry)
+    return replace(plan, metadata={**plan.metadata, "sequence_layout_spans": spans,
+                                   "layout": layout, "padded_tokens": max(context.padded_tokens, padded_rows)})
 
 
 def _integer(value, name, *, minimum=0):

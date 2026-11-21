@@ -295,16 +295,25 @@ class _ContextMixin:
         stage_key = (replica, op.stage)
         geom = self.stage_geometry[stage_key]
         stream_owners = self.stream_owners.get((replica, op.stage, op.stream or "main"))
-        if stream_owners is not None or geom.replica != int(replica):
-            geom = replace(geom, replica=int(replica), stream_owners=stream_owners)
+        active_reqs = tuple(getattr(self, "_active_requests", ()) or ())
+        active_padded = int(getattr(self, "_active_padded_tokens", 0) or 0)
+        active_layout = str(getattr(self, "_active_layout", "") or "")
+        admission_view = getattr(self, "admission_memory_view", None)
+        if (stream_owners is not None or geom.replica != int(replica)
+                or admission_view is not None or active_reqs or active_padded or active_layout):
+            geom = replace(
+                geom, replica=int(replica), stream_owners=stream_owners,
+                admission_memory_view=admission_view,
+                requests=active_reqs, padded_tokens=active_padded, layout=active_layout,
+            )
         geom_keys = getattr(self, "_stage_geom_keys", None)
         if geom_keys is None:
             geom_keys = {}
             self._stage_geom_keys = geom_keys
-        gcache_key = (stage_key, stream_owners)
+        gcache_key = (stage_key, stream_owners, active_reqs, active_padded, active_layout)
         frozen_geom = geom_keys.get(gcache_key)
         if frozen_geom is None:
-            frozen_geom = _freeze_key(geom)
+            frozen_geom = _freeze_key(replace(geom, admission_memory_view=None))
             geom_keys[gcache_key] = frozen_geom
         startup_mode = self.case.runtime.collective_startup_mode
         prep_key = (
@@ -334,7 +343,7 @@ class _ContextMixin:
         recipe = startup_waves_recipe(res_op, recipe, startup_mode)
         stage_dies = self.stage_dies.get((replica, res_op.stage))
         if stage_dies:
-            from ..matrix_precision import resolve_matrix_precision
+            from mindie_sim.prediction.operators.matrix.matrix_precision import resolve_matrix_precision
             res_op = resolve_matrix_precision(
                 res_op, devices=stage_dies,
                 policy=self.case.runtime.matrix_compute_policy, recipe=recipe)
@@ -388,6 +397,8 @@ class _ContextMixin:
                 physical_mechanisms=dies[0].physical_mechanisms,
                 compute_arch=compute_arch,
                 datapath=datapath,
+                admission_memory_view=getattr(self, "admission_memory_view", None),
+                allocation_versions=getattr(self, "allocation_versions", {}),
             )
         return RecipeContext(
             None, {}, profile.names, self.resource_rates,
@@ -408,13 +419,14 @@ class _ContextMixin:
             datapath=profile.datapath,
             primitive_table=profile.primitive_table,
             primitive_coverage_gaps=profile.primitive_coverage_gaps,
+            admission_memory_view=getattr(self, "admission_memory_view", None),
+            allocation_versions=getattr(self, "allocation_versions", {}),
         )
 
     def _context(self, op: Any, replica: int, scope: str, *, recipe=None) -> RecipeContext:
         from ..collective_waves import startup_waves_recipe
-        from ..direct_peer import resolve_transport_options
-        from ..matrix_precision import execution_compute_peaks, resolve_matrix_precision
-        from ..services import service_identity
+        from mindie_sim.prediction.operators.collectives.direct_peer import resolve_transport_options
+        from mindie_sim.prediction.operators.matrix.matrix_precision import execution_compute_peaks, resolve_matrix_precision
 
         recipe = startup_waves_recipe(
             op, recipe, self.case.runtime.collective_startup_mode)
@@ -429,92 +441,22 @@ class _ContextMixin:
         self._transport_options[(str(scope), op.op_id, replica)] = transport_options
         peaks = execution_compute_peaks(
             op, devices=dies, base_peaks=template.compute_peaks)
-        meta = _metadata_dict(op)
-        device = dies[0]
-        units_key = _DEVICE_UNITS_CACHE.get(id(device))
-        if units_key is None or units_key[0] is not device:
-            units_key = (device, _freeze_key(dict(device.resource_units)))
-            if len(_DEVICE_UNITS_CACHE) >= DEVICE_UNITS_CACHE_LIMIT:
-                _DEVICE_UNITS_CACHE.clear()
-            _DEVICE_UNITS_CACHE[id(device)] = units_key
-        sid_key = (
-            replica, op.stage, device.rank, device.compute_units,
-            units_key[1],
-            op.family, op.recipe, op.dtype, op.layout, scope,
-            meta.get("kernel"), meta.get("kernel_name"),
-            _freeze_key(meta.get("implementation")),
-            _freeze_key(meta.get("service_axes")),
-            bool(meta.get("hccl_selection")),
-            self._op_key(op),
-        )
-        sid = self._service_identity_cache.get(sid_key)
-        if sid is None:
-            sid = service_identity(self.case, op, scope, device=dies[0])
-            if len(self._service_identity_cache) >= SERVICE_IDENTITY_CACHE_LIMIT:
-                self._service_identity_cache.pop(next(iter(self._service_identity_cache)))
-            self._service_identity_cache[sid_key] = sid
+        sid = self._cached_service_identity(op, replica, scope, dies[0])
         declared = _declaration_of(op)
         stream_owners = self.stream_owners.get((replica, op.stage, op.stream or "main"))
         context = replace(
             template, op=op, native_work=cost.work, compute_peaks=peaks,
             service_identity=sid,
             service_boundary="resource_phase" if declared else "device_kernel",
-            stream_owners=stream_owners)
+            stream_owners=stream_owners,
+            requests=tuple(getattr(self, "_active_requests", ()) or ()),
+            padded_tokens=int(getattr(self, "_active_padded_tokens", 0) or 0),
+            layout=str(getattr(self, "_active_layout", "") or ""))
         bind_context = getattr(recipe, "bind_context", None)
         if bind_context is not None:
             context = bind_context(context)
-        algorithm = getattr(recipe, "algorithm", "ring")
-        if (algorithm == "ring" and getattr(recipe, "mesh_capable", False)
-                and self.topology.declares_direct_mesh(op, replica)):
-            algorithm = "direct_mesh"
-        band_plan = None
-        link_vol = cost.work.get("link", 0)
-        if algorithm == "direct_mesh":
-            plan = self.topology.joint_plan(
-                op, {replica: link_vol},
-                algorithm=algorithm, transport=transport_options)
-            self.topology.bind_direct_mesh(op, replica, plan)
-            plan_binding = _CollectivePlanBinding(algorithm, plan=plan)
-        else:
-            if link_vol and algorithm in {"ring", "pairwise"}:
-                try:
-                    band_plan = self.topology.band_collective_plan(
-                        op, {replica: link_vol}, algorithm=algorithm,
-                        transport=transport_options,
-                    )
-                except ModelingError as exc:
-                    if not str(exc).startswith("joint_collective_group_membership"):
-                        raise
-            if band_plan is not None:
-                plan_binding = _CollectivePlanBinding(algorithm, plan=band_plan)
-            else:
-                plan_binding = _CollectivePlanBinding(
-                    algorithm,
-                    factory=lambda: self.topology.joint_plan(
-                        op, {replica: link_vol},
-                        algorithm=algorithm, transport=transport_options))
-        demands, frames, setup = {}, {}, 0.0
-        if "peer_traffic" in dict(op.metadata) and not link_vol:
-            self.topology.accounting(op, replica, volume=link_vol)
-        for resource, amount in cost.work.items():
-            if resource == "link":
-                routed = (
-                    band_plan.accounting()
-                    if band_plan is not None
-                    else self.topology.accounting(
-                        op, replica, volume=amount, transport=transport_options)
-                )
-                demands.update(routed.wire_by_resource)
-                frames.update(routed.transaction_frames)
-                setup = routed.setup_ms
-                continue
-            if resource == "cube":
-                portions = op.matrix_flops or ((op.dtype or self.case.model.compute_dtype, amount),)
-                bound = context.bind(Work(matrix=dict(portions)))
-            else:
-                bound = context.bind(Work(resources={resource: amount}))
-            for name, value in bound.items():
-                demands[name] = demands.get(name, 0) + value
+        demands, frames, setup, plan_binding = self._bind_context_work(
+            context, op, replica, recipe, cost.work, transport_options)
         diagnostic = (self.cost.lookup_diagnostic(op, scope)
                       if self.legacy_diagnostics else None)
         diagnostic_timing = (diagnostic or {}).get("timing")
@@ -545,52 +487,7 @@ class _ContextMixin:
                            invocation_timing=None, joint_native_service=declaration)
         if (response is not None and response.mode == "mac_service"
                 and self.legacy_diagnostics):
-            matrix_role = str(response.execution.get("resource") or "cube")
-            matrix_name = context.resource_names.get(matrix_role)
-            if (not matrix_name or response.issued_work is None
-                    or response.rate_flops_per_s is None
-                    or not response.active_owners):
-                raise ModelingError("mac_service_requires_bound_cube_work_and_rate")
-            issued = float(response.issued_work)
-            owners = int(response.active_owners)
-            mac_work_ms = float(response.duration_ms)
-            dtype_rate = float(context.compute_peaks.get(context.op.dtype, 0.0))
-            try:
-                physical_ms = issued / (dtype_rate / MS_PER_S)
-            except ZeroDivisionError:
-                physical_ms = None
-            work = dict(context.work)
-            work[matrix_name] = mac_work_ms
-            declaration = {
-                **response.execution, **response.diagnostics(),
-                "stage": "mac", "resource_name": matrix_name,
-                "issued_work": issued,
-                "logical_work": float(cost.work.get("cube", 0.0)),
-                "rate_flops_per_s": float(response.rate_flops_per_s),
-                "active_owners": owners,
-                "measured_mac_per_owner_ms": mac_work_ms,
-                "mac_work_ms_total": mac_work_ms,
-                "physical_mac_ms_at_peak": physical_ms,
-                "reference_program": type(recipe).__name__,
-            }
-            program_recipe = None
-            from ..matrix import TiledMatmul
-            if isinstance(recipe, TiledMatmul):
-                source = TiledMatmul(
-                    tile_m=int(response.execution["tile_m"]),
-                    tile_n=int(response.execution["tile_n"]),
-                    tile_k=int(response.execution["tile_k"]),
-                    slots=int(response.execution["slots"]),
-                )
-                if source != recipe:
-                    program_recipe = source
-                    declaration = {**declaration,
-                                   "source_selected_tiling": {
-                                       "tile_m": source.tile_m, "tile_n": source.tile_n,
-                                       "tile_k": source.tile_k, "slots": source.slots}}
-            context = replace(context, work=work, mac_caps={},
-                              mac_service=declaration,
-                              program_recipe=program_recipe)
+            context = self._bind_mac_service(context, recipe, cost, response)
         self.conflicts += int(bool(measured and measured < physical))
         self._last_invocation_record = None
         selected = (None if getattr(recipe, "native", False)
@@ -618,6 +515,136 @@ class _ContextMixin:
                     service_regime=response.diagnostics(),
                 )
         return context
+
+    def _cached_service_identity(self, op, replica, scope, device):
+        from ..services import service_identity
+
+        meta = _metadata_dict(op)
+        units_key = _DEVICE_UNITS_CACHE.get(id(device))
+        if units_key is None or units_key[0] is not device:
+            units_key = (device, _freeze_key(dict(device.resource_units)))
+            if len(_DEVICE_UNITS_CACHE) >= DEVICE_UNITS_CACHE_LIMIT:
+                _DEVICE_UNITS_CACHE.clear()
+            _DEVICE_UNITS_CACHE[id(device)] = units_key
+        sid_key = (
+            replica, op.stage, device.rank, device.compute_units,
+            units_key[1],
+            op.family, op.recipe, op.dtype, op.layout, scope,
+            meta.get("kernel"), meta.get("kernel_name"),
+            _freeze_key(meta.get("implementation")),
+            _freeze_key(meta.get("service_axes")),
+            bool(meta.get("hccl_selection")),
+            self._op_key(op),
+        )
+        sid = self._service_identity_cache.get(sid_key)
+        if sid is None:
+            sid = service_identity(self.case, op, scope, device=device)
+            if len(self._service_identity_cache) >= SERVICE_IDENTITY_CACHE_LIMIT:
+                self._service_identity_cache.pop(next(iter(self._service_identity_cache)))
+            self._service_identity_cache[sid_key] = sid
+        return sid
+
+    def _bind_context_work(self, context, op, replica, recipe, work, transport_options):
+        algorithm = getattr(recipe, "algorithm", "ring")
+        if (algorithm == "ring" and getattr(recipe, "mesh_capable", False)
+                and self.topology.declares_direct_mesh(op, replica)):
+            algorithm = "direct_mesh"
+        band_plan = None
+        link_vol = work.get("link", 0)
+        if algorithm == "direct_mesh":
+            plan = self.topology.joint_plan(
+                op, {replica: link_vol},
+                algorithm=algorithm, transport=transport_options)
+            self.topology.bind_direct_mesh(op, replica, plan)
+            plan_binding = _CollectivePlanBinding(algorithm, plan=plan)
+        else:
+            if link_vol and algorithm in {"ring", "pairwise"}:
+                try:
+                    band_plan = self.topology.band_collective_plan(
+                        op, {replica: link_vol}, algorithm=algorithm,
+                        transport=transport_options,
+                    )
+                except ModelingError as exc:
+                    if not str(exc).startswith("joint_collective_group_membership"):
+                        raise
+            if band_plan is not None:
+                plan_binding = _CollectivePlanBinding(algorithm, plan=band_plan)
+            else:
+                plan_binding = _CollectivePlanBinding(
+                    algorithm,
+                    factory=lambda: self.topology.joint_plan(
+                        op, {replica: link_vol},
+                        algorithm=algorithm, transport=transport_options))
+        demands, frames, setup = {}, {}, 0.0
+        if "peer_traffic" in dict(op.metadata) and not link_vol:
+            self.topology.accounting(op, replica, volume=link_vol)
+        for resource, amount in work.items():
+            if resource == "link":
+                routed = (
+                    band_plan.accounting()
+                    if band_plan is not None
+                    else self.topology.accounting(
+                        op, replica, volume=amount, transport=transport_options)
+                )
+                demands.update(routed.wire_by_resource)
+                frames.update(routed.transaction_frames)
+                setup = routed.setup_ms
+                continue
+            if resource == "cube":
+                portions = op.matrix_flops or ((op.dtype or self.case.model.compute_dtype, amount),)
+                bound = context.bind(Work(matrix=dict(portions)))
+            else:
+                bound = context.bind(Work(resources={resource: amount}))
+            for name, value in bound.items():
+                demands[name] = demands.get(name, 0) + value
+        return demands, frames, setup, plan_binding
+
+    def _bind_mac_service(self, context, recipe, cost, response):
+        matrix_role = str(response.execution.get("resource") or "cube")
+        matrix_name = context.resource_names.get(matrix_role)
+        if (not matrix_name or response.issued_work is None
+                or response.rate_flops_per_s is None
+                or not response.active_owners):
+            raise ModelingError("mac_service_requires_bound_cube_work_and_rate")
+        issued = float(response.issued_work)
+        owners = int(response.active_owners)
+        mac_work_ms = float(response.duration_ms)
+        dtype_rate = float(context.compute_peaks.get(context.op.dtype, 0.0))
+        try:
+            physical_ms = issued / (dtype_rate / MS_PER_S)
+        except ZeroDivisionError:
+            physical_ms = None
+        work = dict(context.work)
+        work[matrix_name] = mac_work_ms
+        declaration = {
+            **response.execution, **response.diagnostics(),
+            "stage": "mac", "resource_name": matrix_name,
+            "issued_work": issued,
+            "logical_work": float(cost.work.get("cube", 0.0)),
+            "rate_flops_per_s": float(response.rate_flops_per_s),
+            "active_owners": owners,
+            "measured_mac_per_owner_ms": mac_work_ms,
+            "mac_work_ms_total": mac_work_ms,
+            "physical_mac_ms_at_peak": physical_ms,
+            "reference_program": type(recipe).__name__,
+        }
+        program_recipe = None
+        from mindie_sim.prediction.operators.matrix.matrix import TiledMatmul
+        if isinstance(recipe, TiledMatmul):
+            source = TiledMatmul(
+                tile_m=int(response.execution["tile_m"]),
+                tile_n=int(response.execution["tile_n"]),
+                tile_k=int(response.execution["tile_k"]),
+                slots=int(response.execution["slots"]),
+            )
+            if source != recipe:
+                program_recipe = source
+                declaration = {**declaration,
+                               "source_selected_tiling": {
+                                   "tile_m": source.tile_m, "tile_n": source.tile_n,
+                                   "tile_k": source.tile_k, "slots": source.slots}}
+        return replace(context, work=work, mac_caps={},
+                       mac_service=declaration, program_recipe=program_recipe)
 
     def _program_inputs(self, context, recipe, engine, replica, op, owner):
         """Virtual-time-free lowering inputs of one operator occurrence."""

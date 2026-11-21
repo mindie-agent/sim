@@ -25,6 +25,9 @@ from .common import ModelingError, _positive_float
 
 BYTES_PER_GIB = 1024 * 1024 * 1024
 ASCEND_SECTOR_BYTES = 32
+DEFAULT_L2_LINE_BYTES = 512
+DEFAULT_L2_SECTOR_BYTES = 128
+DEFAULT_HBM_BURST_GRANULE_BYTES = 512
 
 STARS_RELEASE_POLICIES = frozenset({
     "descriptor_ready",
@@ -59,7 +62,7 @@ _CAPABILITY_MAP_FIELDS = (
 _DATAPATH_DEVICE_FIELDS = (
     "simt_ub_carveout_bytes", "subtile_wave", "dispatch_sync",
     "hbm_rw_alpha", "hbm_read_bytes_per_s", "hbm_write_bytes_per_s",
-    "memory_access", "root_complex_id",
+    "memory_access", "root_complex_id", "observed_aicore_freq_mhz",
 )
 
 
@@ -100,6 +103,7 @@ class SubtileWaveSpec:
     tile_k: int
     independently_issuable_m: int
     owner_groups: int
+    cube_k: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "native_mode", _req_nonempty_str(self.native_mode, "subtile_wave.native_mode"))
@@ -112,6 +116,10 @@ class SubtileWaveSpec:
             _req_pos_int(self.independently_issuable_m, "subtile_wave.independently_issuable_m"),
         )
         object.__setattr__(self, "owner_groups", _req_pos_int(self.owner_groups, "subtile_wave.owner_groups"))
+        if self.cube_k is not None:
+            cube_k = _req_pos_int(self.cube_k, "subtile_wave.cube_k")
+            if self.tile_k % cube_k:
+                raise ModelingError("subtile_wave_cube_k_must_divide_tile_k")
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> SubtileWaveSpec:
@@ -124,6 +132,7 @@ class SubtileWaveSpec:
             tile_k=raw.get("tile_k"),
             independently_issuable_m=raw.get("independently_issuable_m"),
             owner_groups=raw.get("owner_groups"),
+            cube_k=raw.get("cube_k"),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -134,6 +143,7 @@ class SubtileWaveSpec:
             "tile_k": self.tile_k,
             "independently_issuable_m": self.independently_issuable_m,
             "owner_groups": self.owner_groups,
+            **({"cube_k": self.cube_k} if self.cube_k is not None else {}),
         }
 
 
@@ -275,13 +285,22 @@ class MemoryAccessBurstPenalty:
 
 @dataclass(frozen=True, slots=True)
 class MemoryAccessSpec:
-    """DRAM sector granularity and burst-turnaround penalty table."""
+    """DMA granularity, L2 geometry and HBM burst/row-open parameters."""
 
     sector_bytes: int = ASCEND_SECTOR_BYTES
     burst_turn_penalty: tuple[MemoryAccessBurstPenalty, ...] = ()
+    l2_line_bytes: int = DEFAULT_L2_LINE_BYTES
+    l2_sector_bytes: int = DEFAULT_L2_SECTOR_BYTES
+    hbm_burst_granule_bytes: int = DEFAULT_HBM_BURST_GRANULE_BYTES
+    hbm_scatter_row_open_bytes: int = 0
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "sector_bytes", _req_pos_int(self.sector_bytes, "memory_access.sector_bytes"))
+        for name in ("sector_bytes", "l2_line_bytes", "l2_sector_bytes",
+                     "hbm_burst_granule_bytes"):
+            _req_pos_int(getattr(self, name), f"memory_access.{name}")
+        _req_nonneg_int(self.hbm_scatter_row_open_bytes, "memory_access.hbm_scatter_row_open_bytes")
+        if self.l2_line_bytes % self.l2_sector_bytes:
+            raise ModelingError("memory_access_l2_sector_must_divide_line")
         penalties = tuple(
             item if isinstance(item, MemoryAccessBurstPenalty) else MemoryAccessBurstPenalty.from_mapping(item)
             for item in self.burst_turn_penalty
@@ -301,12 +320,20 @@ class MemoryAccessSpec:
         return cls(
             sector_bytes=raw.get("sector_bytes", ASCEND_SECTOR_BYTES),
             burst_turn_penalty=tuple(raw.get("burst_turn_penalty") or ()),
+            l2_line_bytes=raw.get("l2_line_bytes", DEFAULT_L2_LINE_BYTES),
+            l2_sector_bytes=raw.get("l2_sector_bytes", DEFAULT_L2_SECTOR_BYTES),
+            hbm_burst_granule_bytes=raw.get("hbm_burst_granule_bytes", DEFAULT_HBM_BURST_GRANULE_BYTES),
+            hbm_scatter_row_open_bytes=raw.get("hbm_scatter_row_open_bytes", 0),
         )
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "sector_bytes": self.sector_bytes,
             "burst_turn_penalty": [item.to_dict() for item in self.burst_turn_penalty],
+            "l2_line_bytes": self.l2_line_bytes,
+            "l2_sector_bytes": self.l2_sector_bytes,
+            "hbm_burst_granule_bytes": self.hbm_burst_granule_bytes,
+            "hbm_scatter_row_open_bytes": self.hbm_scatter_row_open_bytes,
         }
 
 
@@ -513,11 +540,10 @@ def merge_device_inputs(*declarations):
         if "physical_mechanisms" in data and data["physical_mechanisms"] is None:
             if result.get("physical_mechanisms") is not None:
                 data.pop("physical_mechanisms")
-        if "dispatch_sync" in data and isinstance(data["dispatch_sync"], Mapping):
-            if isinstance(result.get("dispatch_sync"), Mapping):
-                data["dispatch_sync"] = _deep_merge(
-                    result["dispatch_sync"], data["dispatch_sync"]
-                )
+        for field_name in ("dispatch_sync", "memory_access"):
+            if (isinstance(data.get(field_name), Mapping)
+                    and isinstance(result.get(field_name), Mapping)):
+                data[field_name] = _deep_merge(result[field_name], data[field_name])
         previous = result.get("rates", {})
         ratios = {}
         for role, new_rate in data.get("rates", {}).items():

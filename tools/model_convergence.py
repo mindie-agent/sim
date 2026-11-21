@@ -219,7 +219,7 @@ def _runtime_identity():
     return {
         "import_path": str(root), "version": mindie_sim.__version__,
         "package_content_sha256": digest.hexdigest(), "hashed_files": len(files),
-        "matrix_sha256": file_hash(root / "prediction/matrix.py"),
+        "matrix_sha256": file_hash(root / "prediction/operators/matrix/matrix.py"),
     }
 
 

@@ -17,12 +17,12 @@ import pytest
 A5_DRAM_SERVICE_SCALE = 1 / 0.8316
 
 from mindie_sim import graph_costs, operator_costs, target_graphs
-from mindie_sim.prediction.matrix_epilogue import (
+from mindie_sim.prediction.operators.matrix.matrix_epilogue import (
     MatrixEpilogue, plan_matrix_epilogue, reconcile_native_scale_storage,
     reconcile_scale_storage,
 )
-from mindie_sim.prediction.matrix import TiledMatmul
-from mindie_sim.prediction.matrix_steady import SteadyMatmul
+from mindie_sim.prediction.operators.matrix.matrix import TiledMatmul
+from mindie_sim.prediction.operators.matrix.matrix_steady import SteadyMatmul
 from mindie_sim.prediction.native_binding import bind_native_call, declare_native_call
 from mindie_sim.prediction.program import RecipeBook
 from mindie_sim.schema.common import ModelingError

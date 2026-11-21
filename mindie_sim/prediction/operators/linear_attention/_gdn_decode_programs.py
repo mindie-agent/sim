@@ -149,6 +149,28 @@ def conv_schedule(lengths, dim, units, *, width, bias, speculative, compact=True
     }
 
 
+def _conv_work(lengths, has_state, width, dim, bias, speculative, read):
+    # Source reloads weights per (sequence, channel tile), and recasts each
+    # window tap before the multiply/add. SiLU is neg/exp/add/div/multiply.
+    traffic = [_conv_traffic(q, width, bias, speculative, own)
+               for q, own in zip(lengths, has_state) if q > 0 and own]
+    reads = sum(amount for amount, _ in traffic) * dim * 2
+    writes = sum(amount for _, amount in traffic) * dim * 2
+    # Externally observed envelope of `causal_conv1d_update` on the paired
+    # `#62` SKUs: `q` current tokens plus `kernel_width - 1` history rows are
+    # streamed in, and the same two windows are written back. The `width`
+    # weight taps stay L2-resident across the per-sequence repetitions, and the
+    # speculative reload window re-reads the retained positions and the current
+    # inputs from UB, so neither adds an off-chip descriptor.
+    external = sum(2 * (q + width - 1) * dim * 2
+                   for q, own in zip(lengths, has_state) if q > 0 and own)
+    token_ops = CONV_TOKEN_TAP_OPS * width + CONV_TOKEN_FIXED_OPS + CONV_TOKEN_BIAS_OPS * int(bias)
+    vector = sum((width + 1 + q * token_ops) * dim
+                 for q, own in zip(lengths, has_state) if q > 0 and own)
+    work = Work(resources={"hbm": external, read: reads, "mte3": writes, "vector": vector})
+    return work, token_ops
+
+
 def conv_plan(op, geometry, *, compact=True):
     meta = dict(op.metadata)
     lengths = tuple(meta.get("physical_sequence_tokens", meta["sequence_tokens"]))
@@ -187,24 +209,7 @@ def conv_plan(op, geometry, *, compact=True):
                           compact=compact, has_state=has_state)
     run_counts = schedule["owner_cycles"]
     read = read_role(geometry.resource_units, aiv=0)
-    # Source reloads weights per (sequence, channel tile), and recasts each
-    # window tap before the multiply/add. SiLU is neg/exp/add/div/multiply.
-    traffic = [_conv_traffic(q, width, bias, speculative, own)
-               for q, own in zip(lengths, has_state) if q > 0 and own]
-    reads = sum(amount for amount, _ in traffic) * dim * 2
-    writes = sum(amount for _, amount in traffic) * dim * 2
-    # Externally observed envelope of `causal_conv1d_update` on the paired
-    # `#62` SKUs: `q` current tokens plus `kernel_width - 1` history rows are
-    # streamed in, and the same two windows are written back. The `width`
-    # weight taps stay L2-resident across the per-sequence repetitions, and the
-    # speculative reload window re-reads the retained positions and the current
-    # inputs from UB, so neither adds an off-chip descriptor.
-    external = sum(2 * (q + width - 1) * dim * 2
-                   for q, own in zip(lengths, has_state) if q > 0 and own)
-    token_ops = CONV_TOKEN_TAP_OPS * width + CONV_TOKEN_FIXED_OPS + CONV_TOKEN_BIAS_OPS * int(bias)
-    vector = sum((width + 1 + q * token_ops) * dim
-                 for q, own in zip(lengths, has_state) if q > 0 and own)
-    work = Work(resources={"hbm": external, read: reads, "mte3": writes, "vector": vector})
+    work, token_ops = _conv_work(lengths, has_state, width, dim, bias, speculative, read)
 
     def program(context):
         def task(q, n, repeat, owns_state, owner):

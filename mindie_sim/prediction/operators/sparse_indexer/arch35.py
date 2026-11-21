@@ -22,7 +22,7 @@ from ..contracts import OperatorPlanningContext
 from .common import (
     BF16_BYTES, DSL_QSLI_ABI, FP32_BYTES, INT32_BYTES, MSA_ABIS, PAIR_BYTES,
     QSA_ABI, QSA_OVERLAY_SOURCE, QUANT_ABIS, REGION_ABI, SCORE_SLOTS, VLLM_QLI_ABIS, Lowering, PhaseWork,
-    SparseIndexerContract, align, build_plan, ceil_div, indexer_contract,
+    SparseIndexerContract, align, build_plan, ceil_div, indexer_contract, request_contracts,
     owner_pairs, pair_merge, sort_ops, unsupported, vector,
 )
 
@@ -313,12 +313,16 @@ class _Arch35Strategy:
         elif contract.abi in QUANT_ABIS and contract.cache_dtype == "int8":
             representation = "int32"
         transfer = 0
-        if contract.scanned_rows and contract.query_tokens:
+        if ctx.requests:
+            rectangles = tuple((c.query_tokens, c.scanned_rows) for c in request_contracts(contract, ctx))
+        else:
+            rectangles = ((ceil_div(contract.query_tokens, contract.batch_size), contract.scanned_rows),)
+        if any(q and kv for q, kv in rectangles):
             route = ctx.datapath.route("l0c", "ub", representation)
             lowering = replace(lowering, handoff_alignment=route.path.alignment_bytes)
-            queries = min(lowering.query_block_size, ceil_div(contract.query_tokens, contract.batch_size))
-            transfer = lowering.handoff_bytes(min(contract.scanned_rows, lowering.tile_size),
-                                              contract.index_heads, queries) // needed
+            transfer = max(lowering.handoff_bytes(min(kv, lowering.tile_size), contract.index_heads,
+                                                  min(q, lowering.query_block_size))
+                           for q, kv in rectangles if q and kv) // needed
             slot_bytes = lowering.score_slot_bytes or transfer
             if (transfer > slot_bytes or ("ub" in dict(ctx.datapath.buffers)
                     and slot_bytes * lowering.slots > ctx.datapath.usable_bytes("ub"))):

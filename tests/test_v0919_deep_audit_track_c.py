@@ -292,8 +292,8 @@ def test_qkv_norm_rope_writes_every_declared_output_and_names_ports():
 
 
 def test_kda_l2norm_is_retained_for_a_second_sequence_or_phase():
-    from mindie_sim.prediction.attention import AttentionPolicy
-    from mindie_sim.prediction.recurrent import linear
+    from mindie_sim.prediction.operators.attention.attention import AttentionPolicy
+    from mindie_sim.prediction.operators.recurrent.recurrent import linear
     from mindie_sim.prediction.transforms import lower_implementations
     from mindie_sim.schema.workload import RequestView
 
@@ -351,7 +351,7 @@ def _kimi_situ_case():
 
 
 def test_generic_activation_quant_leaves_the_selected_native_group_intact():
-    from mindie_sim.prediction.native_fusion import _groups
+    from mindie_sim.prediction.operators.hyper_connections.native_fusion import _groups
     case = _kimi_situ_case()
     ops = _ops(case, phase="decode", tokens=1, context=16,
                resource_fusion=False)
@@ -445,7 +445,7 @@ def _native_pool_case(scale="fp32", layers=4, **kwargs):
 
 
 def test_native_keypool_binds_bf16_pool_projections_and_requires_fp32_scales():
-    from mindie_sim.prediction.index_pool_native import (
+    from mindie_sim.prediction.operators.sparse_indexer.index_pool_native import (
         POOL_PROJECTION_CATEGORIES, supported,
     )
     case = _native_pool_case("fp32")
@@ -472,7 +472,7 @@ def test_native_keypool_binds_bf16_pool_projections_and_requires_fp32_scales():
 
 
 def test_native_keypool_preserves_an_explicit_caller_category_override():
-    from mindie_sim.prediction.index_pool_native import prepare_model
+    from mindie_sim.prediction.operators.sparse_indexer.index_pool_native import prepare_model
     from mindie_sim.prediction.implementations import select
     case = _native_pool_case("fp32")
     explicit = replace(case.model.quant, category_overrides=(
@@ -525,7 +525,7 @@ def test_shared_prefix_keypool_plan_matches_the_published_op_bytes():
 
 
 def test_row_shard_option_accepts_the_generic_alias():
-    from mindie_sim.prediction.index_pool import row_shard_tp
+    from mindie_sim.prediction.operators.sparse_indexer.index_pool import row_shard_tp
     runtime = type("Runtime", (), {
         "metadata": {"row_shard_tp": 4},
         "parallel": type("Parallel", (), {"o_proj_tp": 8,
@@ -574,7 +574,7 @@ def test_packed_compressor_feeds_the_indexer_from_its_latent_port():
 
 
 def test_pcp_group_completions_follow_owned_query_ranges():
-    from mindie_sim.prediction.generic_latent_attention import owned_completed_rows
+    from mindie_sim.prediction.operators.mla.generic_latent_attention import owned_completed_rows
     split = type("View", (), {
         "context": 0, "q_len": 2, "query_ranges": ((0, 1), (3, 4))})()
     assert owned_completed_rows(split, 4) == 1
@@ -606,7 +606,7 @@ def test_pcp_kv_gather_uses_the_region_row_format():
 
 
 def test_arch22_prolog_rejects_nope_and_sharded_cache_ownership():
-    from mindie_sim.prediction.native_fusion_mla_membase import validate_declared_view
+    from mindie_sim.prediction.operators.hyper_connections.native_fusion_mla_membase import validate_declared_view
     from mindie_sim.schema.common import ModelingError
     view = {
         "token_dtype": "int8", "projection_weight_dtypes": ("int8",) * 3,
@@ -624,7 +624,7 @@ def test_arch22_prolog_rejects_nope_and_sharded_cache_ownership():
 
 
 def test_shared_prefix_union_merges_absolute_disjoint_swa_intervals():
-    from mindie_sim.prediction.attention import AttentionPolicy, _memory_hierarchy, gqa
+    from mindie_sim.prediction.operators.attention.attention import AttentionPolicy, _memory_hierarchy, gqa
     from mindie_sim.prediction.prefix_reads import CacheAccess, plan_prefix_reads
     from mindie_sim.schema.workload import RequestView
 
@@ -667,7 +667,7 @@ def test_shared_prefix_union_merges_absolute_disjoint_swa_intervals():
 
 
 def test_causal_window_tile_span_covers_every_query_in_the_tile():
-    from mindie_sim.prediction.generic_latent_attention import window_tile_rows
+    from mindie_sim.prediction.operators.mla.generic_latent_attention import window_tile_rows
     plan = type("Plan", (), {"window": 128, "noncausal_attention": False})()
     assert window_tile_rows(plan, context=128, query=128, start=0,
                             query_tile=128, kv_len=256) == 255
@@ -696,7 +696,7 @@ def test_windowed_mla_charges_the_full_tile_window_span():
 def test_lightning_indexer_charges_query_and_head_weight_operands():
     from mindie_sim.catalog.cache import index_row_bytes
     from mindie_sim.model_catalog import load_model
-    from mindie_sim.prediction.generic_latent_attention import (
+    from mindie_sim.prediction.operators.mla.generic_latent_attention import (
         semantic_index_selection, unique_index_key_rows,
     )
     from mindie_sim.prediction.lowering import Builder

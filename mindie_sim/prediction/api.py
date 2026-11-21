@@ -28,7 +28,7 @@ from .primitives import PrimitiveStore
 from .program import RecipeBook
 from .scheduler import Scheduler
 from .frontend import Frontend
-from .attention import AttentionPolicy
+from mindie_sim.prediction.operators.attention.attention import AttentionPolicy
 from .structure import parse_case
 from mindie_sim.coverage import model_coverage
 

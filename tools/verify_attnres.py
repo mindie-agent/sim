@@ -18,7 +18,7 @@ import resource
 import subprocess
 import time
 
-from mindie_sim.prediction.family_attnres import (
+from mindie_sim.prediction.operators.hyper_connections.family_attnres import (
     AttnResPrefixState, IMPLEMENTATION, SOURCE, attn_res_point,
 )
 from mindie_sim.prediction.operator_analysis import operator_costs

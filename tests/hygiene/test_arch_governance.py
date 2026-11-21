@@ -465,3 +465,45 @@ def test_decode_kernel_requires_explicit_binding_then_uses_the_linear_attention_
     assert plan.work == expected.work
     assert plan.metadata == expected.metadata
     assert plan.work.resources["hbm"] > 0
+
+
+def test_ag006_and_ag008_block_flat_builders_parallel_concepts_shards_and_bypass_kwargs(tmp_path):
+    proj = tmp_path / "repo"
+    pred = proj / "mindie_sim" / "prediction"
+    ops = pred / "operators" / "demo"
+    ops.mkdir(parents=True)
+    (pred / "__init__.py").write_text("", encoding="utf-8")
+    (pred / "shadow_op.py").write_text(
+        "class RaggedSequenceBatch:\n    pass\n"
+        "def build(op, geom, ragged_batch=None):\n"
+        "    return OperatorPlan(op, geom)\n",
+        encoding="utf-8",
+    )
+    (pred / "demo_helpers.py").write_text("class RequestView:\n    pass\n", encoding="utf-8")
+    (ops / "__init__.py").write_text("", encoding="utf-8")
+    (ops / "core.py").write_text("def plan(op, *, memory_view=None):\n    return op\n", encoding="utf-8")
+
+    findings = arch_gov.scan_repository(proj)
+    by_rule = {(item.rule, item.fingerprint) for item in findings}
+    assert any(rule == "AG006" and "flat_builder" in fp for rule, fp in by_rule)
+    assert any(rule == "AG006" and "flat_plan_call" in fp for rule, fp in by_rule)
+    assert any(rule == "AG008" and "parallel_concept" in fp for rule, fp in by_rule)
+    assert any(rule == "AG008" and "duplicate_concept" in fp for rule, fp in by_rule)
+    assert any(rule == "AG008" and "shard_file" in fp for rule, fp in by_rule)
+    assert any(rule == "AG008" and "bypass_arg" in fp for rule, fp in by_rule)
+    assert any(rule == "AG008" and "op_bypass_arg" in fp for rule, fp in by_rule)
+
+
+def test_ag008_flat_prediction_ratchet_and_operator_package_fanout(tmp_path):
+    proj = tmp_path / "repo"
+    pred = proj / "mindie_sim" / "prediction"
+    ops = pred / "operators" / "bloated"
+    ops.mkdir(parents=True)
+    for idx in range(arch_gov.MAX_FLAT_PREDICTION_MODULES + 1):
+        (pred / f"mod_{idx}.py").write_text("", encoding="utf-8")
+    for idx in range(arch_gov.MAX_OPERATOR_PACKAGE_FILES + 1):
+        (ops / f"op_{idx}.py").write_text("", encoding="utf-8")
+    findings = arch_gov.scan_repository(proj)
+    fps = {item.fingerprint for item in findings if item.rule == "AG008"}
+    assert "AG008:flat_prediction_ratchet" in fps
+    assert "AG008:package_fanout:bloated" in fps

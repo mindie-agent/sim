@@ -23,6 +23,7 @@ from typing import Any
 from mindie_sim.schema.case import Case
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import OpSpec
+from mindie_sim.schema.workload import RequestView
 from mindie_sim.stack_registry import (
     LoweringRequest,
     SoftwareStackRegistry,
@@ -32,7 +33,10 @@ from .body_defaults import consume_target_declaration
 from .evaluation import ACTIVE_DEADLINE_MONO, EvaluationContext
 from .graph_analysis import graph_costs
 from .mechanism import Geometry
-from .operators.contracts import OperatorPlanningContext, ResolvedOperator
+from .operators.contracts import (
+    OperatorPlanningContext,
+    ResolvedOperator,
+)
 from .operators.registry import (
     FamilyDispatcher,
     FamilyRegistry,
@@ -183,6 +187,60 @@ class PredictionSpine:
                     bound[(rep, stage, stream_id)] = owners
         return bound
 
+    def _admission_memory_view(self, case: Case) -> Any:
+        from .runtime.l2_residency import AdmissionMemoryView
+        die_l2 = {int(die.rank): int(dict(die.buffers).get("l2", 0)) for die in case.machine.dies}
+        if 0 not in die_l2 and case.machine.dies:
+            die_l2[0] = int(dict(case.machine.dies[0].buffers).get("l2", 0))
+        first_ma = getattr(case.machine.dies[0], "memory_access", None) if case.machine.dies else None
+        return AdmissionMemoryView(die_l2, memory_access=first_ma)
+
+    @staticmethod
+    def _request_frame_for(
+        rewritten: RewrittenStep, op: OpSpec, meta: Mapping[str, Any],
+    ) -> tuple[tuple[RequestView, ...], int, str]:
+        """Extract canonical ``RequestView`` tuple, outer ``padded_tokens``, and layout."""
+        step = getattr(getattr(getattr(rewritten, "base", None), "request", None), "step", None)
+        layout = str(
+            meta.get("sequence_layout")
+            or (getattr(step, "layout", "") if step is not None else "")
+            or getattr(op, "layout", "")
+            or ""
+        )
+        padded_tokens = int(
+            meta.get("padded_tokens")
+            or (getattr(step, "padded_tokens", 0) if step is not None else 0)
+            or 0
+        )
+        raw_views = meta.get("request_views")
+        if raw_views:
+            views = tuple(
+                v if isinstance(v, RequestView) else RequestView(**dict(v))
+                for v in raw_views
+            )
+            return views, padded_tokens, layout
+        if step is not None and getattr(step, "requests", ()):
+            return tuple(step.requests), padded_tokens, layout
+        tg_views = getattr(getattr(rewritten, "target_graphs", None), "request_views", None)
+        if isinstance(tg_views, Mapping) and tg_views:
+            first_views = next(iter(tg_views.values()), ())
+            if first_views:
+                return tuple(first_views), padded_tokens, layout
+        plan = getattr(getattr(getattr(rewritten, "base", None), "request", None), "plan", None)
+        if plan is not None and getattr(plan, "requests", ()):
+            return tuple(plan.requests), padded_tokens, layout
+        if step is not None:
+            seqs = step.sequences
+            if isinstance(seqs, tuple) and seqs:
+                return tuple(
+                    RequestView(
+                        request_id=f"r{idx}", q_len=int(q), context=int(step.context),
+                        samples=False, phase=str(step.phase),
+                    )
+                    for idx, q in enumerate(seqs)
+                ), padded_tokens, layout
+        return (), padded_tokens, layout
+
     def _resolve_governed_operators(
         self,
         case: Case,
@@ -195,6 +253,7 @@ class PredictionSpine:
         p = case.runtime.parallel
         width = p.tp * p.pcp
         owners_lookup = dict(stream_owners) if stream_owners else {}
+        admission_view = self._admission_memory_view(case)
         for rank_ops in rewritten.executable:
             for op in rank_ops.ops:
                 spec = self.families.match(op)
@@ -215,6 +274,7 @@ class PredictionSpine:
                 owners = owners_lookup.get(
                     (rank_ops.replica, int(op.stage), op.stream or MAIN_STREAM)
                 )
+                req_views, padded_tokens, layout = self._request_frame_for(rewritten, op, meta)
                 ctx = OperatorPlanningContext(
                     occurrence=OpOccurrence(
                         replica=rank_ops.replica,
@@ -227,6 +287,10 @@ class PredictionSpine:
                     recipe_book=book,
                     requested_abi=str(req_abi) if req_abi else None,
                     stream_owners=owners,
+                    admission_memory_view=admission_view,
+                    requests=req_views,
+                    padded_tokens=padded_tokens,
+                    layout=layout,
                 )
                 resolved.append(self.dispatcher.resolve_plan(op, ctx))
         return tuple(resolved)
@@ -366,6 +430,10 @@ class PredictionSpine:
 
         token = ACTIVE_DEADLINE_MONO.set(replay.deadline_mono)
         try:
+            tg = step.graph.target_graphs
+            req_views = getattr(tg, "request_views", None)
+            if req_views is None and step_req.requests:
+                req_views = step_req.requests
             report = graph_costs(
                 case,
                 graphs,
@@ -377,6 +445,9 @@ class PredictionSpine:
                 trace_limit=replay.event_limit,
                 evaluation=evaluation,
                 stream_plans=step.graph.streams or None,
+                request_views=req_views,
+                padded_tokens=step_req.padded_tokens or int(getattr(tg, "padded_tokens", 0) or 0),
+                sequence_layout=step_req.layout or str(getattr(tg, "sequence_layout", "") or ""),
             )
         finally:
             ACTIVE_DEADLINE_MONO.reset(token)

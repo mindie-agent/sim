@@ -4,9 +4,9 @@ from itertools import product
 import pytest
 
 from mindie_sim.prediction.engine import Engine, Resource
-from mindie_sim.prediction.matrix_cycle import matrix_cycle
+from mindie_sim.prediction.operators.matrix.matrix_cycle import matrix_cycle
 from mindie_sim.prediction.program import Stage
-from mindie_sim.prediction.refill import RefillPipeline
+from mindie_sim.prediction.operators.matrix.refill import RefillPipeline
 from mindie_sim.schema.common import ModelingError
 
 

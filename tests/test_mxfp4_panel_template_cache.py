@@ -4,9 +4,9 @@ from math import lcm
 
 import pytest
 
-from mindie_sim.prediction.mxfp4_panels import compiled_panels, panel_parts
-from mindie_sim.prediction.mxfp4_geometry import panel_sizes
-from mindie_sim.prediction.refill_steady import compact_refill
+from mindie_sim.prediction.operators.mx_quant_matrix.mxfp4_panels import compiled_panels, panel_parts
+from mindie_sim.prediction.operators.mx_quant_matrix.mxfp4_geometry import panel_sizes
+from mindie_sim.prediction.operators.matrix.refill_steady import compact_refill
 from test_mxfp4_grouped import source_case, gate, physical_op
 from test_mxfp4_panel_ir_cache import source_ir, execute
 

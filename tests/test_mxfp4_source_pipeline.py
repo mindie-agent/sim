@@ -5,7 +5,7 @@ import random
 import pytest
 
 from mindie_sim.prediction.engine import Engine, Resource
-from mindie_sim.prediction.mxfp4_pipeline import Panel, Slots, SourcePipeline, pipeline_cycle
+from mindie_sim.prediction.operators.mx_quant_matrix.mxfp4_pipeline import Panel, Slots, SourcePipeline, pipeline_cycle
 from mindie_sim.prediction.program import Stage
 
 

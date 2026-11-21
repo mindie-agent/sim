@@ -38,7 +38,7 @@ from .rewrite_mhc_rules import (
     mhc_boundary_fusion_overlap,
     qkv_norm_rope_fusion,
 )
-from .transform_norm_quant import (
+from mindie_sim.prediction.operators.vector.transform_norm_quant import (
     _norm_quant_domain,
     norm_quant,
     residual_norm,
@@ -81,7 +81,7 @@ def _native_group_members(ops, roles):
     """Members of declared native groups whose role is explicitly selected."""
     if not roles:
         return frozenset()
-    from .native_fusion import _groups
+    from mindie_sim.prediction.operators.hyper_connections.native_fusion import _groups
     members = set()
     for declaration, group in _groups(ops):
         if declaration.get("role") in roles:
@@ -346,11 +346,11 @@ def lower_implementations(ops, runtime, source_dtype, *, passes=None, resource_f
     from .implementations import capture_partition, lower_operators, select
 
     bindings = runtime.kernels.get("lowerings", {})
-    from .family_shared_quant import lower_shared_experts
+    from mindie_sim.prediction.operators.mx_quant_matrix.family_shared_quant import lower_shared_experts
     # Bind explicitly selected kernels before generic fusion can erase them.
     # A fused-family selection binds after that family is actually produced.
     ops = lower_operators(ops, bindings)
-    from .family_moe_init import apply as apply_moe_init
+    from mindie_sim.prediction.operators.moe_routing.family_moe_init import apply as apply_moe_init
     ops = apply_moe_init(ops, bindings, runtime)
     consumers, external_output = _norm_quant_domain(runtime.kernels)
     registry = {**LOWERING_PASSES, "norm_quant": partial(
@@ -408,7 +408,7 @@ def lower_implementations(ops, runtime, source_dtype, *, passes=None, resource_f
     grouped_int8 = select(bindings, "grouped_int8_caller")
     if grouped_int8:
         ops = grouped_int8.module.lower(ops, bindings)
-    from .moe_group_list import lower as lower_group_list
+    from mindie_sim.prediction.operators.moe_routing.moe_group_list import lower as lower_group_list
     ops = lower_group_list(ops, bindings)
     wrapper = select(bindings, "matrix_wrapper")
     if wrapper:
@@ -417,10 +417,10 @@ def lower_implementations(ops, runtime, source_dtype, *, passes=None, resource_f
     mx_matrix = select(bindings, "mx_matrix")
     if mx_matrix:
         ops = mx_matrix.module.apply(ops, mx_matrix, local_tokens=local_tokens)
-    from .hccl_graph import lower as lower_hccl
+    from mindie_sim.prediction.operators.collectives.hccl_graph import lower as lower_hccl
     ops = lower_hccl(ops, runtime, source_dtype)
     if resource_fusion:
-        from .native_fusion import lower_native_fusions
+        from mindie_sim.prediction.operators.hyper_connections.native_fusion import lower_native_fusions
         ops = lower_native_fusions(ops, runtime, local_tokens=local_tokens)
     return tuple(ops)
 

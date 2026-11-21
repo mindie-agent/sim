@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from mindie_sim.prediction.implementations import Selection
-from mindie_sim.prediction import matrix_wrappers
+from mindie_sim.prediction.operators.matrix import matrix_wrappers
 from mindie_sim.prediction.operator_analysis import target_operators
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError

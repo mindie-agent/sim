@@ -37,7 +37,7 @@ _STRATEGIES = {
 def resolve_operator_plan(op: OpSpec, ctx: OperatorPlanningContext) -> ResolvedOperator:
     """Resolve one occurrence against an explicitly declared device datapath."""
     if op.family == "attn_res_prefix" and "attn_res_view" in dict(op.metadata):
-        from ...family_attnres import IMPLEMENTATION as PREFIX_IMPL, SOURCE as PREFIX_SOURCE, build as build_prefix
+        from mindie_sim.prediction.operators.hyper_connections.family_attnres import IMPLEMENTATION as PREFIX_IMPL, SOURCE as PREFIX_SOURCE, build as build_prefix
 
         plan = build_prefix(op, ctx.geometry)
         return ResolvedOperator(ctx.occurrence, op, plan, PREFIX_IMPL, (PREFIX_SOURCE,), None)
@@ -63,7 +63,7 @@ def resolve_operator_plan(op: OpSpec, ctx: OperatorPlanningContext) -> ResolvedO
 def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
     """Build a plan through the same resolver used by the family registry."""
     if op.family == "attn_res_prefix" and "attn_res_view" in dict(op.metadata):
-        from ...family_attnres import build as build_prefix
+        from mindie_sim.prediction.operators.hyper_connections.family_attnres import build as build_prefix
 
         return build_prefix(op, geometry)
     if geometry.datapath is None:
@@ -83,7 +83,7 @@ class GovernedAttnResRecipe(PlannedRecipe):
 
     def prepare(self, op: OpSpec, geometry: Geometry):
         if op.family == "attn_res_prefix" and "attn_res_view" in dict(op.metadata):
-            from ...family_attnres import AttnResRecipe, build as build_prefix
+            from mindie_sim.prediction.operators.hyper_connections.family_attnres import AttnResRecipe, build as build_prefix
 
             return AttnResRecipe(build_prefix).prepare(op, geometry)
         return super().prepare(op, geometry)

@@ -30,7 +30,7 @@ from .common import (
     QUANT_MODE_MINDIE_FP8, QUANT_MODE_MXFP4_CX, QUANT_MODE_MXFP4_OCP, QUANT_MODE_MXFP8, QUANT_MODE_TQ4,
     SUPPORTED_QUANT_MODES, AttentionContract, ContextParallelPlan,
     FiaPanelPlan, bsh_kv_access_plan, c8_gather_accounting, describe, lower_cp_collectives,
-    shipping_fia_panel_plan, solve_wide_head_tiling, unmodeled,
+    shipping_fia_panel_plan, solve_wide_head_tiling, unmodeled, with_sequence_context,
 )
 
 FIA_RECIPE = "fused_infer_attention_score"
@@ -136,6 +136,7 @@ def build(op: OpSpec, ctx: OperatorPlanningContext | Geometry, /) -> OperatorPla
     """Build the source-bound attention kernel at either planning entrypoint."""
     if isinstance(ctx, Geometry):
         ctx = _planning_context(op, ctx)
+    ctx = with_sequence_context(op, ctx)
     contract = _contract(op, ctx.requested_abi)
     strategy = STRATEGIES.get(ctx.compute_arch.arch_id)
     if strategy is None:

@@ -32,7 +32,7 @@
    - 每个 AIV 私有：**`UB = 192 KiB`（`196,608 B`）**，单周期向量执行宽度 `128 B/cycle/AIV`（`32` FP32 lane-ops/cycle）；
    - **分块铁律**：FP32 累加下 `256 × 256 × 4 B = 262,144 B` **超出 A2 的 `128 KiB` `L0C` 上限**！因此 A2 稠密/分组矩阵 `base_tiles` 只能使用 `[128, 128]`、`[128, 256]`、`[256, 128]` 及更小分块，切勿照搬 A5 的 `[256, 256]`。
 2. **原生矩阵计算精度（支持 W8A8 / W4A8 / W4A16，严禁原生 FP8 Cube）**：
-   - [`mindie_sim/schema/compute_arch.py`](../../mindie_sim/schema/compute_arch.py) 为 `npu_arch_2201` 固定声明 `fp8=False, int4_operand=True`：原生支持 `bf16` / `fp16`（`cubek16`）、`fp32`（`cubek4`）、`hf32`（`cubek8`）、`int8`（`cubek32`，`npu_quant_matmul` W8A8）及 **`int4`（`cubek64`，[`w4a8.py`](../../mindie_sim/prediction/w4a8.py) MSD / `npu_weight_quant_batchmatmul` W4A16）**；
+   - [`mindie_sim/schema/compute_arch.py`](../../mindie_sim/schema/compute_arch.py) 为 `npu_arch_2201` 固定声明 `fp8=False, int4_operand=True`：原生支持 `bf16` / `fp16`（`cubek16`）、`fp32`（`cubek4`）、`hf32`（`cubek8`）、`int8`（`cubek32`，`npu_quant_matmul` W8A8）及 **`int4`（`cubek64`，[`w4a8.py`](../../mindie_sim/prediction/operators/mx_quant_matrix/w4a8.py) MSD / `npu_weight_quant_batchmatmul` W4A16）**；
    - **严禁向 A2 的 `compute_peaks` 添加 `fp8` / `fp8_e4m3` / `fp8_e5m2`**，否则触发 `ModelingError("native_compute_mode_unsupported:matrix:fp8...")`。
 3. **AIC <-> AIV 核间数据通路（无片上 `l0c->ub` 直连）**：
    - 在 `npu_arch_2201`（`_paths_2201`）中，独立的 AIC 与 AIV 核**必须经由 GM（共享 L2 或 HBM）交换中间张量**（`l0c->gm` 经 `fixpipe`，`gm->ub` 经 `mte2_aiv`，`ub->gm` 经 `mte3`）；

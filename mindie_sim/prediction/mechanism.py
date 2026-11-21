@@ -78,6 +78,10 @@ class Geometry:
     replica: int = 0
     rank: int | None = None
     stream_owners: object = None
+    admission_memory_view: object = None
+    requests: tuple = ()
+    padded_tokens: int = 0
+    layout: str = ""
 
     @classmethod
     def from_devices(cls, devices, *, links=(), transfer_channels=()):

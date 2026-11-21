@@ -138,7 +138,7 @@ def draft_program(frontend, model, runtime, views, ready, *, global_views=None, 
     )
     context_prolog_v3 = True
     if external_context:
-        from .draft_context import draft_cache_requires_prolog_v3
+        from mindie_sim.prediction.operators.mla_prolog.draft_context import draft_cache_requires_prolog_v3
         draft_kv_dtype = str(getattr(draft_model.quant, "kv_dtype", "") or "bf16")
         if draft.attention_kind == "mla":
             context_prolog_v3 = draft_cache_requires_prolog_v3(
@@ -289,7 +289,7 @@ def draft_program(frontend, model, runtime, views, ready, *, global_views=None, 
                 global_tokens=global_total, global_views=global_proposals)
         body_ready = projection.op_id if rows else previous
         if external_context and rows:
-            from .draft_context import prepare
+            from mindie_sim.prediction.operators.mla_prolog.draft_context import prepare
             body_ready = prepare(
                 ops, projection=projection, model=draft_model, draft=draft,
                 rows=feature_rows, query_rows=rows, prefix=prefix,

@@ -44,7 +44,7 @@ from mindie_sim.catalog.weights import cache_row_bytes_by_layer, engram_table_te
 from mindie_sim.catalog.weights import layer_weight_terms, stage_weight_bytes
 from mindie_sim.model_catalog import ARCHITECTURE_PRESET_CATALOG, load_model
 from mindie_sim.prediction.efficiency import analyze_network_efficiency, solve_sla_sizing
-from mindie_sim.prediction.gated_activation import gated_activation
+from mindie_sim.prediction.operators.vector.gated_activation import gated_activation
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.prediction.topology import Topology
 from mindie_sim.public.errors import UnmodeledCapabilityError

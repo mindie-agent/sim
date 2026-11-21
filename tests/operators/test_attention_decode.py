@@ -18,8 +18,8 @@ from _support.builders import dense_case
 from _support.captures import REPO_ROOT, fixture_json
 from _support.hardware import isa_of, sku_case
 from mindie_sim import compose_case, graph_costs, operator_costs, target_operators
-from mindie_sim.prediction import sharedkv_attention as scfa
-from mindie_sim.prediction.attention import AttentionPolicy
+from mindie_sim.prediction.operators.sharedkv import sharedkv_attention as scfa
+from mindie_sim.prediction.operators.attention.attention import AttentionPolicy
 from mindie_sim.prediction.engine import Engine, Resource
 from mindie_sim.prediction.frontend import Frontend
 from mindie_sim.prediction.mechanism import Geometry

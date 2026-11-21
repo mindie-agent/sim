@@ -307,13 +307,13 @@ def kda_stage_predictions(case, ops, recipes, ledger):
 
 def semantic_prediction(case, group, quant, *, mode, context, kda_tokens, matrix_recipe,
                         kda_implementation=None):
-    from mindie_sim.prediction.attention import AttentionPolicy
+    from mindie_sim.prediction.operators.attention.attention import AttentionPolicy
     from mindie_sim.prediction.graph_analysis import graph_costs
-    from mindie_sim.prediction.mla import mla
-    from mindie_sim.prediction.native_fusion import _groups
+    from mindie_sim.prediction.operators.mla.mla import mla
+    from mindie_sim.prediction.operators.hyper_connections.native_fusion import _groups
     from mindie_sim.prediction.operator_analysis import operator_costs
     from mindie_sim.prediction.program import RecipeBook
-    from mindie_sim.prediction.recurrent import linear
+    from mindie_sim.prediction.operators.recurrent.recurrent import linear
     from mindie_sim.prediction.transforms import lower_implementations
     from mindie_sim.schema.workload import RequestView
 

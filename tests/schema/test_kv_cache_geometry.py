@@ -36,11 +36,11 @@ from mindie_sim.catalog.quant import quant_preset
 from mindie_sim.catalog.types import AuxiliarySpec, DraftSpec, QuantSpec
 from mindie_sim.catalog.weight_terms import term_bytes
 from mindie_sim.catalog.weights import cache_row_bytes_by_layer, layer_weight_terms
-from mindie_sim.prediction import family_quant_indexer, index_pool, latent_dcp
-from mindie_sim.prediction import indexed_quant_attention as c8
-from mindie_sim.prediction.attention import _CacheProducer
-from mindie_sim.prediction.attention_decode import StagedGQADecode
-from mindie_sim.prediction.batch_prefix_attention import nested_prefix_union
+from mindie_sim.prediction.operators.sparse_indexer import family_quant_indexer, index_pool; from mindie_sim.prediction.operators.mla import latent_dcp
+from mindie_sim.prediction.operators.paged_mla import indexed_quant_attention as c8
+from mindie_sim.prediction.operators.attention.attention import _CacheProducer
+from mindie_sim.prediction.operators.attention.attention_decode import StagedGQADecode
+from mindie_sim.prediction.operators.attention.batch_prefix_attention import nested_prefix_union
 from mindie_sim.prediction.body_defaults import effective_body_declaration
 from mindie_sim.prediction.cache_representation import store
 from mindie_sim.prediction.capacity import Memory
@@ -55,7 +55,7 @@ from mindie_sim.prediction.offload import OffloadPolicy, _accesses_from_ops, pro
 from mindie_sim.prediction.operator_analysis import target_operators
 from mindie_sim.prediction.pd_ranges import transfers_for_runs
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, PipelineProgram, RecipeContext
-from mindie_sim.prediction.sharedkv_metadata import query_partitions
+from mindie_sim.prediction.operators.sharedkv.sharedkv_metadata import query_partitions
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.dspark import DsparkSpec

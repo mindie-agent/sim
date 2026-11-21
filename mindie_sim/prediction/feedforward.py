@@ -14,13 +14,13 @@ import math
 
 from mindie_sim.catalog.ops import gemm_op, vector_op, comm_op, barrier_op
 from mindie_sim.schema.common import ModelingError, dtype_bytes
-from .gated_activation import gated_activation, declare_situ_quant
-from .deepep import (deepep_exchange_factor, resolve_exchange_options,
+from mindie_sim.prediction.operators.vector.gated_activation import gated_activation, declare_situ_quant
+from mindie_sim.prediction.operators.moe_transport.deepep import (deepep_exchange_factor, resolve_exchange_options,
                      scale_exchange_operator, split_deepep_combine_overlap,
                      split_deepep_dispatch_overlap, split_deepep_down_overlap,
                      split_deepep_up_overlap)
-from .moe_callers import RoutingPolicy, local_expert_reduce_recipe, tp_join_reduce
-from .moe_gating_fusion import (
+from mindie_sim.prediction.operators.moe_transport.moe_callers import RoutingPolicy, local_expert_reduce_recipe, tp_join_reduce
+from mindie_sim.prediction.operators.moe_routing.moe_gating_fusion import (
     absorb_init_routing, build_selection, cann_native_active,
     dispatch_quantizes_internally,
 )
@@ -28,7 +28,8 @@ from .rewrite_ffn_rules import (
     bind_expert_slots, bind_transport_gate, declare_gate_up_fusion_group,
     routed_expert_work, router_gemm,
 )
-from . import deepep, moe_transport, moe_token_partition
+from mindie_sim.prediction.operators.moe_transport import deepep, moe_transport
+from mindie_sim.prediction.operators.moe_routing import moe_token_partition
 
 ZERO = 0
 ONE = 1
@@ -689,7 +690,7 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
             group_tokens=group_tokens, expert_width=expert_width, latent=latent)
     if overlap_shared:
         ops = reorder_overlapped_shared(ops)
-    from .mc2_graph import lower as lower_native_mc2
+    from mindie_sim.prediction.operators.mc2.mc2_graph import lower as lower_native_mc2
     ops = lower_native_mc2(
         ops, runtime=runtime, prefix=prefix, tokens=routed_tokens, top_k=plan.top_k,
         width=latent, experts=plan.num_experts, ep=parallel.ep,

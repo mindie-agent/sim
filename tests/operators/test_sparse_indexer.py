@@ -20,7 +20,7 @@ from mindie_sim.prediction import scheduling
 from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.frontend import Frontend
 from mindie_sim.prediction.implementations import produced_values
-from mindie_sim.prediction.matrix import TiledMatmul
+from mindie_sim.prediction.operators.matrix.matrix import TiledMatmul
 from mindie_sim.prediction.mechanism import Geometry
 from mindie_sim.prediction.operators import mla_prolog, sparse_indexer as scorer
 from mindie_sim.prediction.program import (

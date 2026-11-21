@@ -1,7 +1,7 @@
 {
   "arch_preset": "npu_arch_2201",
   "cann_version": "9.2.1",
-  "envelope_sha256": "e260f807806451da2e4a942b289e2dd38edc0eefe6abf67f196af36dd050b1d1",
+  "envelope_sha256": "8bf24ef9011e3e254620f16271e66f8f449d16b91d72c71c158939aff41f4684",
   "primitives": {
     "P01_datacopy": {
       "evidence_id": "",
@@ -669,8 +669,8 @@
     "collected_utc": "2026-11-21T01:05:25Z",
     "endpoint_alias": "lab-a3-9382",
     "silicon_fingerprint": {
-      "aic_count": 20,
-      "aiv_count": 40,
+      "aic_count": 24,
+      "aiv_count": 48,
       "hbm_gib": 64,
       "l0a_bytes": 65536,
       "l0b_bytes": 65536,

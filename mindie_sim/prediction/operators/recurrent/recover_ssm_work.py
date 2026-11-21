@@ -1,0 +1,267 @@
+"""Family-agnostic RecoverSSM trajectory-record and single-commit lowering.
+
+[Role] Share compact rank-1 trajectory-record and post-verify single-commit work
+  across all associative linear-attention families (KDA, GDN, Mamba, GLA,
+  DeltaNet, Lightning, RetNet).
+[Invariants] Every rank-1 recurrence ``S_t = decay_t * S_{t-1} + k_t @ c_t^T``
+  reduces speculative Verify state writes from ``q * O(Dk * Dv)`` full state
+  checkpoints to ``q * O(Dk + Dv)`` compact trajectory records plus one final
+  ``O(Dk * Dv)`` committed state write. Non-speculative decode (``q == 1``) and
+  disabled ``recover_ssm`` preserve standard per-query checkpoint semantics.
+[Timeouts & Locks] Pure O(sequences * owner cycles) arithmetic; no I/O or locks.
+[Side-Effect Policy] Constructs immutable operators and physical plans only.
+"""
+from __future__ import annotations
+
+from dataclasses import replace
+import math
+from typing import Any, Sequence
+
+from mindie_sim.prediction.engine import Allocation
+from mindie_sim.prediction.mechanism import OperatorPlan, Work
+from mindie_sim.prediction.ownership import read_role, unit_group
+from mindie_sim.prediction.program import KernelProgram, ParallelProgram, PipelineProgram, Stage
+from mindie_sim.schema.common import ModelingError, align_up, dtype_bytes
+from ..contracts import OperatorPlanningContext
+
+GDN_ARCH35_RECOVER_SSM_RECIPE = "vllm_ascend_recurrent_gated_delta_rule_arch35_fp32_recover_ssm"
+COMMIT_INTENT_STAGE = "commit_intent"
+FP32_RECORD_BYTES = 4
+
+
+def recover_ssm_enabled(runtime: Any) -> bool:
+    if runtime is None:
+        return False
+    if bool(getattr(runtime, "recover_ssm", False)):
+        return True
+    return bool(dict(getattr(runtime, "metadata", ()) or ()).get("recover_ssm", False))
+
+
+def record_head_bytes(dk: int, dv: int, kg_dtype: str = "bf16") -> int:
+    """Per-token per-head compact trajectory record (FP32 correction + k/g)."""
+    return int(dv) * FP32_RECORD_BYTES + 2 * int(dk) * int(dtype_bytes(kg_dtype))
+
+
+def gdn_record_head_bytes(dk: int, dv: int) -> int:
+    """Qwen GDN compact record: ``(Dk + Dv + 1)`` FP32 elements per token/head."""
+    return (int(dk) + int(dv) + 1) * FP32_RECORD_BYTES
+
+
+def gdn_record_slice_bytes(dk: int, slice_width: int, part_index: int) -> int:
+    """Value-tile slice of the GDN record; ``Dk + 1`` is emitted at tile 0."""
+    return (int(slice_width) * FP32_RECORD_BYTES
+            + ((int(dk) + 1) * FP32_RECORD_BYTES if int(part_index) == 0 else 0))
+
+
+def record_slice_bytes(dk: int, slice_width: int, part_index: int, kg_dtype: str = "bf16") -> int:
+    """Value-tile slice of the trajectory record; k/g is emitted once at tile 0."""
+    kg = 2 * int(dk) * int(dtype_bytes(kg_dtype)) if int(part_index) == 0 else 0
+    return int(slice_width) * FP32_RECORD_BYTES + kg
+
+
+def commit_tokens_for_view(view: Any, runtime: Any = None) -> int:
+    """Integer commitment only; a configured mean is never rounded here."""
+    q = max(1, int(getattr(view, "q_len", 1)))
+    advanced = int(getattr(view, "draft_advanced_tokens", 0) or 0)
+    if advanced > 0:
+        return min(q, advanced)
+    accept = float(getattr(runtime, "mtp_acceptance_length", 1) or 1)
+    if q > 1 and accept > 1.0:
+        raise ModelingError(
+            "recover_ssm_commit_requires_resolved_integer_advancement:"
+            + str(getattr(view, "request_id", "")))
+    return q
+
+
+def emit_commit_op(b: Any, *, name: str, deps: Sequence[str], views: Sequence[Any],
+                   heads: int, dk: int, dv: int, state_dtype: str, kg_dtype: str = "bf16",
+                   runtime: Any = None, attention_kind: str = "kda") -> str | None:
+    """Emit an uncharged deferred commit intent for speculative decode views.
+
+    Integer advancement is accepted only after sampling/acceptance; resolving
+    it here would make a pure body assembly depend on a service event.  The
+    intent therefore carries geometry and remains explicitly pending, and
+    ``recover_ssm_commit`` materializes the physical work at the acceptance
+    boundary.
+    """
+    del runtime
+    spec_views = tuple(
+        view for view in views
+        if getattr(view, "phase", "") == "decode"
+        and int(getattr(view, "q_len", 0) or 0) > 1
+        and not bool(getattr(view, "padding", False)))
+    if not spec_views:
+        return None
+    plan = getattr(b, "plan", None)
+    gdn = str(attention_kind) == "gdn"
+    record_head = (gdn_record_head_bytes(dk, dv) if gdn
+                   else record_head_bytes(dk, dv, kg_dtype))
+    geometry = {
+        "heads": int(heads), "dk": int(dk), "dv": int(dv),
+        "state_dtype": str(state_dtype), "kg_dtype": str(kg_dtype),
+        "record_bytes_per_token": int(heads) * record_head,
+        "scope": str(getattr(plan, "scope", "target")),
+        "layer": int(getattr(plan, "index", 0)),
+    }
+    request_ids = tuple(str(view.request_id) for view in spec_views)
+    op_id = b.work(
+        name, tuple(deps), (len(spec_views), int(heads), int(dk), int(dv)),
+        flops=0, vector=0, read=0, write=0, family="elementwise",
+        metadata=(
+            ("recover_ssm", True), ("recover_ssm_intent", True),
+            ("recover_ssm_stage", COMMIT_INTENT_STAGE),
+            ("recover_ssm_pending_acceptance", True),
+            ("recover_ssm_geometry", geometry),
+            ("record_bytes_per_token", int(heads) * record_head),
+            ("recurrent_attention_kind", str(attention_kind)),
+            ("requests", request_ids),
+        ),
+    )
+    b.ops[-1] = replace(b.ops[-1], requests=request_ids)
+    return op_id
+
+
+def rewrite_gdn_analytical_scan(scan: Any, *, active_views: Sequence[Any], heads: int,
+                                dk: int, dv: int, state_dtype: str = "fp32",
+                                kg_dtype: str = "bf16",
+                                attention_kind: str = "kda") -> Any:
+    spec_tokens = sum(int(v.q_len) for v in active_views if int(v.q_len) > 1)
+    if spec_tokens <= 0:
+        return scan
+    state_bytes = int(heads) * int(dk) * int(dv) * int(dtype_bytes(state_dtype))
+    rec_head = (gdn_record_head_bytes(dk, dv) if attention_kind == "gdn"
+                else record_head_bytes(dk, dv, kg_dtype))
+    rec_bytes = int(heads) * rec_head
+    saved_writes = spec_tokens * (state_bytes - rec_bytes)
+    meta = {
+        **dict(scan.metadata), "recover_ssm": True,
+        "recover_ssm_stage": "verify_compact_record",
+        "recurrent_attention_kind": str(attention_kind),
+        "record_kg_dtype": str(kg_dtype),
+        "record_bytes_per_token": rec_bytes,
+        "state_checkpoints": sum(1 for v in active_views if int(v.q_len) == 1),
+    }
+    return replace(scan, mte3_bytes=max(0.0, float(scan.mte3_bytes) - saved_writes),
+                   hbm_bytes=max(0.0, float(scan.hbm_bytes) - saved_writes),
+                   metadata=tuple(meta.items()))
+
+
+def build_gdn_arch35_recover_ssm(
+    op: Any, geometry: Any, *, compact: bool = True, ctx: OperatorPlanningContext | None = None,
+) -> OperatorPlan:
+    """GDN arch35_fp32 decode plan writing compact records for speculative q > 1."""
+    from mindie_sim.prediction.operators.linear_attention import gdn_recurrent
+
+    base = gdn_recurrent.build(op, geometry, compact=compact, ctx=ctx)
+    meta = dict(op.metadata)
+    lengths = tuple(int(v) for v in gdn_recurrent.recurrent_lengths(op, ctx))
+    if not any(q > 1 for q in lengths):
+        return base
+    heads, dk, dv = (int(meta[k]) for k in ("heads", "dk", "dv"))
+    alignment = gdn_recurrent.VECTOR_LANE_ALIGNMENT
+    ak, av = align_up(dk, alignment), align_up(dv, alignment)
+    value_step = gdn_recurrent.state_value_step(ak)
+    parts = math.ceil(dv / value_step)
+    units, core_ids = gdn_recurrent.recurrent_owners(geometry, ctx)
+    active_heads = sum(length > 0 for length in lengths) * heads
+    blocks = min(len(core_ids), active_heads)
+    ownership = gdn_recurrent.head_ownership(lengths, heads, blocks)
+    run_counts = tuple(sum(1 for _ in gdn_recurrent.head_runs(lengths, segs, compact=compact))
+                       for segs in ownership)
+    read = read_role(geometry.resource_units, aiv=0)
+    total = sum(lengths) * heads
+    input_bytes = int(dtype_bytes(op.dtype))
+    state_bytes = int(dtype_bytes(meta["state_dtype"]))
+    tensor_reads = active_heads * dk * dv * state_bytes + total * (2 * dk + dv) * input_bytes
+    scalar_payload = total * (state_bytes + input_bytes * parts)
+    gdn = str(dict(op.metadata).get("recurrent_attention_kind", "")) == "gdn" or (
+        "gdn" in str(op.recipe))
+    rec_head = (gdn_record_head_bytes(dk, dv) if gdn
+                else record_head_bytes(dk, dv, op.dtype))
+    slice_bytes = (
+        (lambda n, part: gdn_record_slice_bytes(dk, n, part)) if gdn else
+        (lambda n, part: record_slice_bytes(dk, n, part, op.dtype)))
+    writes = sum(
+        q * heads * ((rec_head if q > 1 else dk * dv * state_bytes) + dv * input_bytes)
+        for q in lengths
+    )
+    vector = active_heads * ak * dv + total * gdn_recurrent.token_vector_ops(ak, av, dv)
+    work = Work(resources={"hbm": tensor_reads + scalar_payload + writes,
+                           read: tensor_reads, "mte3": writes, "vector": vector})
+
+    def program(context):
+        def owner_program(owner, segments, run_count):
+            owned = context.owned(owner, units, ("vector", read, "mte3"))
+
+            def head(q, repeat):
+                v = lambda amt: context.bind(Work(resources={"vector": amt}).scaled(repeat))
+                mem = lambda amt, role: context.bind(Work(resources={"hbm": amt, role: amt}).scaled(repeat))
+
+                def part(part_index):
+                    n = min(value_step, dv - part_index * value_step)
+                    out_state = (slice_bytes(n, part_index) if q > 1
+                                 else dk * n * state_bytes)
+
+                    def token(t):
+                        first = part_index == 0 and t == 0
+                        scalar = input_bytes + (state_bytes if part_index == 0 else 0)
+                        stages = [Stage("scalar_inputs", context.bind(Work(resources={"hbm": scalar}).scaled(repeat)),
+                                        previous=("attention_cast",))]
+                        prev = "scalar_inputs"
+                        if part_index == 0:
+                            stages.append(Stage("gamma", v(2 * ak), after=(prev,), placement=owned))
+                            prev = "gamma"
+                        stages.append(Stage("decay", v(ak * n), after=(prev,), placement=owned))
+                        prev = "decay"
+                        if first:
+                            stages.extend((
+                                Stage("qk_load", mem(q * 2 * dk * input_bytes, read), after=(prev,), placement=owned),
+                                Stage("qk_cast_scale", v(q * gdn_recurrent.QK_CAST_SCALE_OPS_PER_LANE * ak), after=("qk_load",), placement=owned),
+                            ))
+                            prev = "qk_cast_scale"
+                        stages.append(Stage("key_dot", v((2 * ak - 1) * n), after=(prev,), placement=owned))
+                        prev = "key_dot"
+                        if first:
+                            stages.extend((
+                                Stage("v_load", mem(q * dv * input_bytes, read), after=(prev,), placement=owned),
+                                Stage("v_cast", v(q * av), after=("v_load",), placement=owned),
+                            ))
+                            prev = "v_cast"
+                        stages.extend((
+                            Stage("delta", v(2 * n), after=(prev,), placement=owned),
+                            Stage("rank_one_update", v(2 * ak * n), after=("delta",), placement=owned),
+                            Stage("state_copy", v(ak * n), after=("rank_one_update",), previous=("state_write",), placement=owned),
+                            Stage("state_write", mem(out_state, "mte3"), after=("state_copy",), previous=("attention_write",), placement=owned),
+                            Stage("query_dot", v((2 * ak - 1) * n), after=("state_copy",), placement=owned),
+                            Stage("attention_cast", v(n), after=("query_dot",), previous=("attention_write",), placement=owned),
+                            Stage("attention_write", mem(n * input_bytes, "mte3"), after=("attention_cast", "state_write"), placement=owned),
+                        ))
+                        return tuple(stages)
+
+                    return (Stage("state_load", mem(dk * n * state_bytes, read), placement=owned),
+                            Stage("state_resident_copy", v(ak * n), after=("state_load",), placement=owned),
+                            Stage("tokens", after=("state_resident_copy",), program=PipelineProgram(q, 2, token)))
+
+                return (Stage("gamma_zero", v(q * ak), placement=owned),
+                        Stage("value_tiles", after=("gamma_zero",), program=PipelineProgram(parts, 1, part)))
+
+            pending = tuple(gdn_recurrent.head_runs(lengths, segments, compact=compact))
+            heads_prog = PipelineProgram(run_count, 1, lambda idx, pending=pending: head(*pending[idx]))
+            pool = context.pool_names.get("ub")
+            if pool is None:
+                return heads_prog
+            alloc = (Allocation("recurrent_buffers", pool, gdn_recurrent.UB_BYTES,
+                                unit_group(owner, units, context.pool_units.get("ub", units))),)
+            return KernelProgram((Stage("buffers", acquire=alloc),
+                                  Stage("heads", after=("buffers",), program=heads_prog),
+                                  Stage("release", after=("heads",), free=alloc)))
+
+        return ParallelProgram(tuple(owner_program(owner, segments, count)
+                                     for owner, segments, count in zip(core_ids, ownership, run_counts)))
+
+    meta_out = dict(base.metadata)
+    sched = dict(meta_out.get("gdn_recurrent_schedule", {}))
+    sched["state_residency"] = "one_initial_load_per_head;recover_ssm_compact_record_then_single_commit"
+    meta_out["gdn_recurrent_schedule"] = sched
+    meta_out["recover_ssm"] = True
+    return OperatorPlan(work, program, metadata=meta_out)

@@ -29,6 +29,7 @@ from ..runtime.memory_physics import (
     HbmBusSpec,
     MemoryAccessPattern,
     bind_memory_access,
+    cache_policy_for_arch,
 )
 from ..runtime.prepared_terms import (
     BoundVectorOp,
@@ -39,6 +40,19 @@ from .stages import KernelProgram, ParallelProgram, Program, Stage
 
 _MS_PER_SECOND = 1000.0
 _DEFAULT_VECTOR_CLOCK_HZ = 1_000_000_000.0
+_DATACOPY_PRIMITIVE = "P01_datacopy"
+
+
+def _burst_rule(item) -> BurstTurnRule:
+    if isinstance(item, BurstTurnRule):
+        return item
+    if not isinstance(item, Mapping):
+        item = item.to_dict()
+    return BurstTurnRule(
+        item.get("min_row_bytes", 0), item.get("max_row_bytes"),
+        item.get("min_stride_bytes", 0), item.get("max_stride_bytes"),
+        item["penalty_bytes"], item.get("evidence_id", ""),
+    )
 
 
 def proportional_coupled_placement(
@@ -142,6 +156,11 @@ class RecipeContext:
     stream_owners: object = None
     primitive_table: object = None
     primitive_coverage_gaps: tuple[str, ...] = ()
+    admission_memory_view: object = None
+    allocation_versions: Mapping[str, int] = field(default_factory=dict)
+    requests: tuple[Any, ...] = ()
+    padded_tokens: int = 0
+    layout: str = ""
 
     @property
     def effective_aic_cores(self) -> int:
@@ -342,13 +361,33 @@ class RecipeContext:
         )
         return {aic_name: aic_sub, aiv_name: aiv_sub}
 
+    def _datacopy_cell(self):
+        cell = getattr(self.primitive_table, "cell", None)
+        if cell is not None:
+            try:
+                return cell(_DATACOPY_PRIMITIVE)
+            except ModelingError:
+                pass
+        return None
+
+    def _copy_rate(self, pipe, phase, count, nominal, primitive):
+        measured = None
+        if primitive is not None and primitive.supported:
+            band = primitive.metrics.get(f"{pipe}_{phase}_bytes_per_s_per_core")
+            measured = band.p50 if band is not None else None
+        if measured is not None and measured > 0:
+            return float(measured) / _MS_PER_SECOND
+        mode = f"{pipe}_{'l2' if phase == 'hit' else 'dram'}"
+        rate = self.service_rate(mode)
+        return nominal if rate is None else rate / count / _MS_PER_SECOND
+
     def bind_access(
         self,
         pattern: MemoryAccessPattern,
         state: AdmissionMemoryView | None = None,
         *,
         hbm_bus: HbmBusSpec | None = None,
-        burst_rules: Sequence[BurstTurnRule] = (),
+        burst_rules: Sequence[BurstTurnRule] | None = None,
         copy_hit_bytes_per_ms: float | None = None,
         copy_miss_bytes_per_ms: float | None = None,
         l2_bytes_per_ms: float | None = None,
@@ -363,8 +402,20 @@ class RecipeContext:
         pipe_row = self.resource_names[pipe_role]
         pipe_units = self._units_for(pattern.pipe, pipe_row, self._units_for(pipe_role, pipe_row, 1))
         pipe_rate = float(self.rates[pipe_row]) / float(pipe_units)
-        hit_rate = pipe_rate if copy_hit_bytes_per_ms is None else float(copy_hit_bytes_per_ms)
-        miss_rate = pipe_rate if copy_miss_bytes_per_ms is None else float(copy_miss_bytes_per_ms)
+        primitive = self._datacopy_cell()
+        hit_rate = (self._copy_rate(pattern.pipe, "hit", pipe_units, pipe_rate, primitive)
+                    if copy_hit_bytes_per_ms is None else float(copy_hit_bytes_per_ms))
+        miss_rate = (self._copy_rate(pattern.pipe, "miss", pipe_units, pipe_rate, primitive)
+                     if copy_miss_bytes_per_ms is None else float(copy_miss_bytes_per_ms))
+        memory = getattr(self.datapath, "memory_access", None)
+        if burst_rules is None:
+            rules = getattr(memory, "burst_turn_penalty", ())
+            if not rules and primitive is not None and primitive.supported:
+                rules = primitive.parameters.get("burst_turn_penalty", ())
+            burst_rules = tuple(_burst_rule(item) for item in rules)
+        arch = getattr(self.datapath, "arch_id", "generic")
+        if arch != "generic":
+            cache_policy_for_arch(arch, pattern.cache_policy)
         l2_row = self.resource_names.get("l2", "l2")
         if l2_bytes_per_ms is not None:
             l2_rate = float(l2_bytes_per_ms)
@@ -378,17 +429,24 @@ class RecipeContext:
                 raise ModelingError("bind_access_hbm_rate_missing")
             hbm_name = self.resource_names["hbm"]
             hbm_rate = float(self.rates[hbm_name])
-            alpha_rw = float(getattr(self.physical_mechanisms, "hbm_alpha_rw", 0.0) or 0.0)
+            alpha = getattr(self.physical_mechanisms, "hbm_rw_alpha", None)
+            if alpha is None:
+                alpha = getattr(self.datapath, "hbm_rw_alpha", 0.0)
+                if not alpha and primitive is not None and primitive.supported:
+                    band = primitive.metrics.get("hbm_rw_alpha")
+                    alpha = band.p50 if band is not None else alpha
             bus = HbmBusSpec(
                 die=pattern.die,
                 read_bytes_per_ms=hbm_rate,
                 write_bytes_per_ms=hbm_rate,
-                alpha_rw=alpha_rw,
+                alpha_rw=float(alpha or 0.0),
                 row_r=f"{hbm_name}:r",
                 row_w=f"{hbm_name}:w",
                 ctr_r=f"{hbm_name}:ctr_r",
                 ctr_w=f"{hbm_name}:ctr_w",
             )
+        if memory is not None and bus.memory_access is None:
+            bus = replace(bus, memory_access=memory)
         return bind_memory_access(
             pattern,
             state=state,

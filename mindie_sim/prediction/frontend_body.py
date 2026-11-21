@@ -347,7 +347,7 @@ class _FrontendBody:
                     width=model.hidden_size, dtype=model.activation_dtype)
                 ops.append(trimmed)
                 previous = trimmed.op_id
-        from .sparse_mla_metadata import before_forward
+        from mindie_sim.prediction.operators.sparse_indexer.sparse_mla_metadata import before_forward
         ops = before_forward(ops, ready)
         if not include_recover_commits:
             ops = _frontend._strip_recover_intents(ops)

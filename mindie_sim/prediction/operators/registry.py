@@ -133,8 +133,62 @@ def builtin_family_registry() -> FamilyRegistry:
     return FamilyRegistry(load_builtin_families())
 
 
+def make_governed_recipe(spec: OperatorFamilySpec, book: Any, dispatcher: FamilyDispatcher) -> Any:
+    """Build a ``PlannedRecipe`` bound inside ``operators/`` for a governed family."""
+    from mindie_sim.schema.datapath import (
+        ArchId, ComputeArchIdentity, DatapathCapabilitySpec, GENERIC_ARCH_ID,
+    )
+    from ..mechanism import PlannedRecipe
+    from ..ownership import unit_group
+    from ..results import OpOccurrence
+
+    def _build(op, geometry):
+        datapath = getattr(geometry, "datapath", None)
+        if datapath is None and spec.name == "attention":
+            from .attention import _planning_context
+
+            geometry = _planning_context(op, geometry).geometry
+            datapath = geometry.datapath
+        if datapath is None:
+            arch = getattr(geometry, "compute_arch", None)
+            arch_id = ArchId(arch.preset) if arch is not None and arch.preset else GENERIC_ARCH_ID
+            paths = arch.paths if arch is not None else ()
+            aics = geometry.compute_units
+            aivs = geometry.resource_units.get("vector", aics if arch is not None else 0)
+            pairs = (
+                tuple((aic, unit_group(aic, aics, aivs)) for aic in range(aics))
+                if aics > 0 and aivs > 0 and aivs % aics == 0 else ()
+            )
+            datapath = DatapathCapabilitySpec(
+                compute_arch=ComputeArchIdentity(arch_id, arch),
+                aic_count=aics, aiv_count=aivs, aic_aiv_pairs=pairs, usable_paths=paths,
+                matrix_output_paths=frozenset(path.target for path in paths if path.source == "l0c"),
+                ub_peer_edges=(), stars=None, buffers=tuple(geometry.buffers.items()),
+            )
+        requested_abi = dict(op.metadata or ()).get("requested_abi")
+        ctx = OperatorPlanningContext(
+            occurrence=OpOccurrence(
+                int(getattr(geometry, "replica", 0)),
+                int(getattr(op, "stage", 0)),
+                getattr(geometry, "rank", None),
+                str(op.op_id),
+            ),
+            geometry=geometry, datapath=datapath, recipe_book=book,
+            requested_abi=str(requested_abi) if requested_abi else None,
+            stream_owners=getattr(geometry, "stream_owners", None),
+            admission_memory_view=getattr(geometry, "admission_memory_view", None),
+            requests=tuple(getattr(geometry, "requests", ()) or ()),
+            padded_tokens=int(getattr(geometry, "padded_tokens", 0) or 0),
+            layout=str(getattr(geometry, "layout", "") or ""),
+        )
+        return dispatcher.resolve_plan(op, ctx).recipe
+
+    return PlannedRecipe(_build, traffic_rewrite_capable=bool(spec.traffic_rewrite_capable))
+
+
 __all__ = [
     "FamilyDispatcher",
     "FamilyRegistry",
     "builtin_family_registry",
+    "make_governed_recipe",
 ]

@@ -25,17 +25,17 @@ from .hardware import machine
 from mindie_sim import target_graphs
 from mindie_sim.catalog.quant import quant_preset
 from mindie_sim.model_catalog import load_model
-from mindie_sim.prediction.attention import AttentionPolicy
+from mindie_sim.prediction.operators.attention.attention import AttentionPolicy
 from mindie_sim.prediction.cost import CostModel
 from mindie_sim.prediction.engine import Engine, Resource
 from mindie_sim.prediction.execution import Execution
-from mindie_sim.prediction.family_kda_recurrent import IMPLEMENTATION as KDA_REC_IMPL
+from mindie_sim.prediction.operators.kda.family_kda_recurrent import IMPLEMENTATION as KDA_REC_IMPL
 from mindie_sim.prediction.frontend import Frontend
 from mindie_sim.prediction.operators.linear_attention._gdn_decode_programs import CONV, GATING
 from mindie_sim.prediction.mechanism import Geometry
 from mindie_sim.prediction.operators.contracts import OperatorPlanningContext
 from mindie_sim.prediction.program import RecipeContext, Stage
-from mindie_sim.prediction.recurrent import linear
+from mindie_sim.prediction.operators.recurrent.recurrent import linear
 from mindie_sim.prediction.results import OpOccurrence
 from mindie_sim.prediction.runtime.memory_physics import AdmissionMemoryView
 from mindie_sim.prediction.structure import parse_case

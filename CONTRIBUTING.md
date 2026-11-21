@@ -57,7 +57,7 @@ flowchart LR
 | **红线 4** | **严禁容器镜像 SHA 分发与私有开发机/内网路径泄漏**<br/>源码与配置中严禁出现宿主机个人家目录绝对路径（如 macOS/Linux `$HOME/...` 本地绝对路径）、实验室内网 IP 或按容器镜像 Digest（`docker.io/`、`swr.cn-`、`@sha256:`）做分支路由。 | [`scripts/verify_m1.py`](scripts/verify_m1.py) 自动扫描阻断；源码溯源统一使用 `{repository, revision, relative_path, source_sha256}`，抓包引用统一使用 `capture://<capture-id>/<member>`。 |
 | **红线 5** | **`buffer_units.l2 = 1` 共享 L2 容量归属不变量**<br/>只要在 `device.buffers` 中声明了 `"l2"` 容量，`device.buffer_units.l2` **必须且只能等于 `1`**（每颗物理 Die 共享唯一 L2 池，绝不能按 AIC/AIV 核数倍乘）。 | [`mindie_sim/schema/hardware.py`](mindie_sim/schema/hardware.py) 在解析硬件声明时强校验：若 `buffer_units.l2 != 1` 直接抛出 `ModelingError("shared_l2_buffer_requires_one_die_owner")`。 |
 | **红线 6** | **增量数字与假常量门禁（Differential Numeric-Literal Gate）**<br/>自然数学与结构索引（`0`、`1`、`2`、`0.5`、`100`、`1000`、`1024`、`1e-6..1e-12`、下标/切片/`len` 比较）直接写字面量，**严禁定义 `ZERO = 0`、`ONE = 1`、`SIXTY_FOUR = 64`、`THREE_FLOAT = 3.0` 等同义数字英文假常量**；非平凡协议/代数常数提取为含真实领域名词的模块/类级 `UPPER_SNAKE_CASE` 常量，硬件常数写入 `ascend.json`。 | [`scripts/check_no_magic_numbers.py`](scripts/check_no_magic_numbers.py) 通过 AST 结构掩码比对 `--base` 提交，拦截未命名的非自然数字字面量及一切数字英文同义词假常量（退出码 `1`）。 |
-| **红线 7** | **Agent-Native 模块边界与 Unix `LF` 行尾**<br/>核心 Python 模块必须保持 `< 800` 行，文件前 30 行内必须包含 `[Role]`、`[Invariants]`、`[Timeouts & Locks]`、`[Side-Effect Policy]` 四段式契约文档头；全仓非二进制文件强制使用 Unix `LF`（`\n`）。 | [`.github/scripts/check_lf_eol.py`](.github/scripts/check_lf_eol.py) 扫描 `.gitattributes`、`.editorconfig` 及工作区全量文件，发现任何 `\r\n` 直接阻断。 |
+| **红线 7** | **内聚优先结构治理、单一真源归属与 Unix `LF` 行尾**<br/>保持单一内聚物理域完整落在同一模块内（`~1,800` 行仅为软性评审参考而非硬性截断上限，内聚合理且函数精炼允许超出），严禁为了凑行数强拆 `*_helpers.py` / `*_mixin.py` / `*_part*.py` 碎片；单函数保持可读（目标 `<= 150` 行、控制流嵌套 `<= 6` 层，声明式数据表除外），包内平铺文件数受控（目标 `<= 20`）且 `mindie_sim/prediction/*.py` 平铺文件数只减不增；所有设备算子配方统一归口至 `mindie_sim/prediction/operators/<family>/` 并复用唯一规范契约（`RequestView` / `AdmissionMemoryView` / `PrimitiveTable`）；文件前 30 行必须包含四段式契约文档头，全仓非二进制文件强制 Unix `LF`（`\n`）。 | [`scripts/check_arch_governance.py`](scripts/check_arch_governance.py)（`AG001..AG008`）与 [`.github/scripts/check_lf_eol.py`](.github/scripts/check_lf_eol.py) 自动阻断第二套平行系统、人工碎片拆文件、平铺算子回流及 `\r\n` 行尾。 |
 
 ---
 
@@ -254,7 +254,7 @@ def measure_rts_stream_saturated_us(fn, blocker_pair: tuple[torch.Tensor, torch.
    - **Class C**（`ChunkedLinearAttentionRecipe`）：GDN / KDA 分块线性注意力与块三角求逆；
    - **Class D**（`AIVTiledVectorAndGatherRecipe`）：AIV 向量、RMSNorm、动态量化、Gather、原子累加与短卷积；
    - **Class E**（`TopologyCollectiveRecipe`）：拓扑感知集合通信（AllReduce / ReduceScatter / AllGather / AllToAll）。
-2. **源码级精确规划器（`PlannedRecipe`）**：针对已审阅内核源码的关键算子（如 A2/A3 的 [`operators/paged_mla/`](mindie_sim/prediction/operators/paged_mla/__init__.py)、[`w4a8.py`](mindie_sim/prediction/w4a8.py) 或 A5 的 `paged_mla.py`、`gdn_recurrent.py`），通过 [`mindie_sim/prediction/mechanism.py`](mindie_sim/prediction/mechanism.py) 中的 `PlannedRecipe(build)` 提供 `build(op: OpSpec, geometry: Geometry) -> OperatorPlan` 与 `lower(context: RecipeContext) -> Program`。
+2. **源码级精确规划器（`PlannedRecipe`）**：针对已审阅内核源码的关键算子（如 A2/A3 的 [`operators/paged_mla/`](mindie_sim/prediction/operators/paged_mla/__init__.py)、[`w4a8.py`](mindie_sim/prediction/operators/mx_quant_matrix/w4a8.py) 或 A5 的 `paged_mla.py`、`gdn_recurrent.py`），通过 [`mindie_sim/prediction/mechanism.py`](mindie_sim/prediction/mechanism.py) 中的 `PlannedRecipe(build)` 提供 `build(op: OpSpec, geometry: Geometry) -> OperatorPlan` 与 `lower(context: RecipeContext) -> Program`。
 
 ### 3.2 工作量守恒定律与分裂读写管道（`mte2_aic` vs `mte2_aiv`）分配准则
 
@@ -390,7 +390,7 @@ def build(op, geometry: Geometry) -> OperatorPlan:
 `mindie-sim` **绝不将 Attention 锁死在 CANN 内置的 `IFA` / `FIA` 上**。面对自研 AscendC 算子、Triton-Ascend 内核、TileLang 算子或 ATB / XLLM / SGLang 中的 FlashMLA / 块稀疏 / 混合窗口变体，请按变更深度由轻到重选择以下 **三级渐进扩展路径（Tiers 1–3）**：
 
 #### Tier 1 — 参数化复用（仅分块 / 页大小 / Split-K 不同，核内流水拓扑不变）
-如果自定义内核仍遵循标准的 `Q 加载 -> KV 重填 -> QK Cube -> Online Softmax -> PV Cube -> 归一化写回` 流水，仅调整了 `(B_q, B_k)` 分块大小、KV 页块粒度或双缓冲槽位数，**无需编写任何 Python 代码**，直接在 Profile 的 `physical_mechanisms.attention` 或 `Case` 的 `runtime` 中覆写参数即可（[`mindie_sim/prediction/program/`](mindie_sim/prediction/program/) 中调用方显式 `recipes` 拥有最高选择优先级，其余自动回落至 [`mindie_sim/prediction/attention_pipeline.py`](mindie_sim/prediction/attention_pipeline.py) 的 `Class A` `TiledFlashAndPagedAttentionRecipe`）：
+如果自定义内核仍遵循标准的 `Q 加载 -> KV 重填 -> QK Cube -> Online Softmax -> PV Cube -> 归一化写回` 流水，仅调整了 `(B_q, B_k)` 分块大小、KV 页块粒度或双缓冲槽位数，**无需编写任何 Python 代码**，直接在 Profile 的 `physical_mechanisms.attention` 或 `Case` 的 `runtime` 中覆写参数即可（[`mindie_sim/prediction/program/`](mindie_sim/prediction/program/) 中调用方显式 `recipes` 拥有最高选择优先级，其余自动回落至 [`mindie_sim/prediction/operators/attention/attention_pipeline.py`](mindie_sim/prediction/operators/attention/attention_pipeline.py) 的 `Class A` `TiledFlashAndPagedAttentionRecipe`）：
 
 ```json
 {
@@ -593,7 +593,7 @@ CUSTOM_ATTN_RECIPE = PlannedRecipe(build)
 ```
 
 #### Tier 3 — 自定义访存几何（新稀疏掩码 / 新压缩 KV 格式 / 混合窗口注意力）
-当自定义 Attention 算子引入了新的**全局访存几何**（例如块稀疏选择、新型低秩/低比特压缩 KV 行格式、或局部滑动窗口 + 全局 Sink 混合掩码），但核内流水仍可复用 Tier 1（`Class A`）或 Tier 2（`PlannedRecipe`）时，应在 `Frontend`（[`mindie_sim/prediction/attention.py`](mindie_sim/prediction/attention.py) 或自定义前端模块）中通过 [`mindie_sim/prediction/memory_traffic.py`](mindie_sim/prediction/memory_traffic.py) 的 `AttentionAccessSpec` + `plan_attention_traffic()` 先完成**冷 HBM 唯一行并集 vs L2/MTE2 私用重填**的严格守恒规划，再写回 `OpSpec`：
+当自定义 Attention 算子引入了新的**全局访存几何**（例如块稀疏选择、新型低秩/低比特压缩 KV 行格式、或局部滑动窗口 + 全局 Sink 混合掩码），但核内流水仍可复用 Tier 1（`Class A`）或 Tier 2（`PlannedRecipe`）时，应在 `Frontend`（[`mindie_sim/prediction/operators/attention/attention.py`](mindie_sim/prediction/operators/attention/attention.py) 或自定义前端模块）中通过 [`mindie_sim/prediction/memory_traffic.py`](mindie_sim/prediction/memory_traffic.py) 的 `AttentionAccessSpec` + `plan_attention_traffic()` 先完成**冷 HBM 唯一行并集 vs L2/MTE2 私用重填**的严格守恒规划，再写回 `OpSpec`：
 
 ```python
 from mindie_sim.prediction.memory_traffic import (

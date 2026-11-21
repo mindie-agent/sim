@@ -25,14 +25,15 @@ from mindie_sim.schema.subgraphs import (
     TensorPortSpec,
 )
 from mindie_sim.schema.workload import selected_mode
-from .attention import ATTENTION_BUILDERS, AttentionPolicy
+from mindie_sim.prediction.operators.attention.attention import ATTENTION_BUILDERS, AttentionPolicy
 from .blocks import RESIDUAL_BUILDERS, lowrank_hyper_final_mixer, norm
 from .feedforward import FFN_BUILDERS, RoutingPolicy
 from .frontend_features import FeatureConfig
 from .graph import GraphPolicy, annotate_geometry
 from .routing_realizations import RoutingRealization, select_realization
 from .structure import normalize_model, stage_map
-from . import family_attnres, sequence_parallel
+from mindie_sim.prediction.operators.hyper_connections import family_attnres
+from mindie_sim.prediction import sequence_parallel
 from .implementation_selection import (
     resolve as resolve_implementations,
     LoweringRegion,
@@ -40,9 +41,9 @@ from .implementation_selection import (
     selection_delivery,
     annotate as annotate_selections,
 )
-from .recover_ssm_commit import bind_recover_ssm_commits, is_recover_ssm_intent
-from .recover_ssm_work import recover_ssm_enabled
-from .recurrent_kda_helpers import strip_excluded_native_kda
+from mindie_sim.prediction.operators.recurrent.recover_ssm_commit import bind_recover_ssm_commits, is_recover_ssm_intent
+from mindie_sim.prediction.operators.recurrent.recover_ssm_work import recover_ssm_enabled
+from mindie_sim.prediction.operators.kda.kda_source import strip_excluded_native_kda
 from .frontend_body import _FrontendBody, _scope, _strip_recover_intents
 from .frontend_iteration import (
     ANALYTICAL_SELECTIONS,

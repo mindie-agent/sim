@@ -32,20 +32,20 @@ from mindie_sim.catalog.quant import quant_preset
 from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.compose import compose_case
 from mindie_sim.observations.service_fitting import fit_service_curve
-from mindie_sim.prediction.batch_prefix_attention import apply_attention_prefix_reads
+from mindie_sim.prediction.operators.attention.batch_prefix_attention import apply_attention_prefix_reads
 from mindie_sim.prediction.cost import CostModel
 from mindie_sim.prediction.engine import Engine, Resource
 from mindie_sim.prediction import (
     exposed_breakdown as eb, exposed_program as exposed, memory_traffic as traffic,
     resource_attribution as attribution, roofline_graph as roof)
 from mindie_sim.prediction.execution import Execution
-from mindie_sim.prediction.matrix import TiledMatmul
-from mindie_sim.prediction.matrix_traffic import (
+from mindie_sim.prediction.operators.matrix.matrix import TiledMatmul
+from mindie_sim.prediction.operators.matrix.matrix_traffic import (
     MatrixGeometry, MatrixSchedule, plan_matrix_traffic)
 from mindie_sim.prediction.mechanism import (
     Geometry as PlanGeometry, OperatorPlan, PlannedRecipe, Work)
 from mindie_sim.prediction.operator_analysis import target_operators
-from mindie_sim.prediction.operators.kda_recurrent import Params, summarize_work
+from mindie_sim.prediction.operators.kda.kda_recurrent import Params, summarize_work
 from mindie_sim.prediction.physical_recipe_base import Phase, _phase_amounts
 from mindie_sim.prediction.program import KernelProgram, RecipeBook, RecipeContext, Stage
 from mindie_sim.prediction.runtime import exposed_intervals as intervals

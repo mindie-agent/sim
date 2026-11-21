@@ -8,7 +8,7 @@ import pytest
 from mindie_sim import graph_costs, predict
 from mindie_sim.prediction.operator_analysis import target_operators
 from mindie_sim.prediction.structure import parse_case
-from mindie_sim.prediction.w4a8_schedule import (
+from mindie_sim.prediction.operators.mx_quant_matrix.w4a8_schedule import (
     down_schedule, gate_schedule, source_row_partition, strided_rows, total_work,
 )
 

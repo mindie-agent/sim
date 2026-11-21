@@ -50,48 +50,7 @@ class _EngineSubmitMixin:
         pending_one = None
         pending = None
         if after:
-            acls = after.__class__
-            if acls is Event:
-                moment = after.time
-                if moment is not None:
-                    if release is None or moment > release:
-                        release = moment
-                else:
-                    s0 = after.sequence
-                    if s0 not in tasks and s0 not in self._promises:
-                        raise ExecutionError(f"dependency_not_submitted:{name}")
-                    pending_one = after
-            elif (acls is tuple or acls is list) and len(after) == 1:
-                p0 = after[0]
-                moment = p0.time
-                if moment is not None:
-                    if release is None or moment > release:
-                        release = moment
-                else:
-                    s0 = p0.sequence
-                    if s0 not in tasks and s0 not in self._promises:
-                        raise ExecutionError(f"dependency_not_submitted:{name}")
-                    pending_one = p0
-            else:
-                dependencies = after if acls is tuple else tuple(after)
-                if len(dependencies) > 1:
-                    dependencies = tuple(dict.fromkeys(dependencies))
-                for predecessor in dependencies:
-                    moment = predecessor.time
-                    if moment is not None:
-                        if release is None or moment > release:
-                            release = moment
-                    else:
-                        sequence = predecessor.sequence
-                        if sequence not in tasks and sequence not in self._promises:
-                            raise ExecutionError(f"dependency_not_submitted:{name}")
-                        if pending_one is None and pending is None:
-                            pending_one = predecessor
-                        elif pending is None:
-                            pending = [pending_one, predecessor]
-                            pending_one = None
-                        else:
-                            pending.append(predecessor)
+            pending_one, pending, release = self._pending_predecessors(name, after, release, tasks)
         if release is None or release < now:
             release = now
         fast_ctx = self._memory_context_fast
@@ -113,53 +72,8 @@ class _EngineSubmitMixin:
                 bindings = None
                 memory_replica = memory_stage = 0
         else:
-            context = self._memory_context
-            the_metadata = dict(metadata) if metadata else {}
-            if (context is None and memory is None and memory_pools is None
-                    and memory_bindings is None and not self.memory_pools
-                    and not the_metadata):
-                ledger = self.memory
-                pools = _EMPTY_FROZENSET
-                bindings = None
-                memory_replica = memory_stage = 0
-            else:
-                if memory is None and context is not None:
-                    memory = context.get("memory")
-                if memory_pools is None:
-                    memory_pools = (context.get("pools") if context is not None
-                                    else the_metadata.get("memory_pools"))
-                if memory_bindings is None and context is not None:
-                    memory_bindings = context.get("bindings")
-                if memory_bindings is None:
-                    declared_bindings = the_metadata.get("memory_bindings")
-                    if declared_bindings.__class__ is dict or isinstance(
-                            declared_bindings, _AbcMapping):
-                        memory_bindings = declared_bindings
-                ledger = memory if memory is not None else self.memory
-                if ledger is not None:
-                    self._memory_ledgers[id(ledger)] = ledger
-                if memory_pools is None:
-                    pools = self._memory_pools_frozen
-                elif memory_pools.__class__ is frozenset:
-                    pools = memory_pools
-                elif memory_pools:
-                    if isinstance(memory_pools, str):
-                        memory_pools = (memory_pools,)
-                    pools = frozenset(str(pool) for pool in memory_pools)
-                else:
-                    pools = _EMPTY_FROZENSET
-                if not memory_bindings:
-                    bindings = None
-                elif (context is not None
-                      and memory_bindings is context.get("bindings")):
-                    bindings = memory_bindings
-                else:
-                    bindings = {str(key): dict(value)
-                                for key, value in memory_bindings.items()}
-                memory_replica = int(the_metadata.get(
-                    "memory_replica", context.get("replica", 0) if context else 0))
-                memory_stage = int(the_metadata.get(
-                    "memory_stage", context.get("stage", 0) if context else 0))
+            the_metadata, ledger, pools, bindings, memory_replica, memory_stage = (
+                self._resolve_task_memory(metadata, memory, memory_pools, memory_bindings))
         acq = prepared.acquire if acquire_override is None else acquire_override
         fr = prepared.free if free_override is None else free_override
         alloc_demands = prepared.allocation_demands
@@ -271,6 +185,103 @@ class _EngineSubmitMixin:
         if len(tasks) > self.peak_tasks:
             self.peak_tasks = len(tasks)
         return event
+
+    def _pending_predecessors(self, name, after, release, tasks):
+        pending_one = None
+        pending = None
+        acls = after.__class__
+        if acls is Event:
+            moment = after.time
+            if moment is not None:
+                if release is None or moment > release:
+                    release = moment
+            else:
+                s0 = after.sequence
+                if s0 not in tasks and s0 not in self._promises:
+                    raise ExecutionError(f"dependency_not_submitted:{name}")
+                pending_one = after
+        elif (acls is tuple or acls is list) and len(after) == 1:
+            p0 = after[0]
+            moment = p0.time
+            if moment is not None:
+                if release is None or moment > release:
+                    release = moment
+            else:
+                s0 = p0.sequence
+                if s0 not in tasks and s0 not in self._promises:
+                    raise ExecutionError(f"dependency_not_submitted:{name}")
+                pending_one = p0
+        else:
+            dependencies = after if acls is tuple else tuple(after)
+            if len(dependencies) > 1:
+                dependencies = tuple(dict.fromkeys(dependencies))
+            for predecessor in dependencies:
+                moment = predecessor.time
+                if moment is not None:
+                    if release is None or moment > release:
+                        release = moment
+                else:
+                    sequence = predecessor.sequence
+                    if sequence not in tasks and sequence not in self._promises:
+                        raise ExecutionError(f"dependency_not_submitted:{name}")
+                    if pending_one is None and pending is None:
+                        pending_one = predecessor
+                    elif pending is None:
+                        pending = [pending_one, predecessor]
+                        pending_one = None
+                    else:
+                        pending.append(predecessor)
+        return pending_one, pending, release
+
+    def _resolve_task_memory(self, metadata, memory, memory_pools, memory_bindings):
+        context = self._memory_context
+        the_metadata = dict(metadata) if metadata else {}
+        if (context is None and memory is None and memory_pools is None
+                and memory_bindings is None and not self.memory_pools
+                and not the_metadata):
+            ledger = self.memory
+            pools = _EMPTY_FROZENSET
+            bindings = None
+            memory_replica = memory_stage = 0
+        else:
+            if memory is None and context is not None:
+                memory = context.get("memory")
+            if memory_pools is None:
+                memory_pools = (context.get("pools") if context is not None
+                                else the_metadata.get("memory_pools"))
+            if memory_bindings is None and context is not None:
+                memory_bindings = context.get("bindings")
+            if memory_bindings is None:
+                declared_bindings = the_metadata.get("memory_bindings")
+                if declared_bindings.__class__ is dict or isinstance(
+                        declared_bindings, _AbcMapping):
+                    memory_bindings = declared_bindings
+            ledger = memory if memory is not None else self.memory
+            if ledger is not None:
+                self._memory_ledgers[id(ledger)] = ledger
+            if memory_pools is None:
+                pools = self._memory_pools_frozen
+            elif memory_pools.__class__ is frozenset:
+                pools = memory_pools
+            elif memory_pools:
+                if isinstance(memory_pools, str):
+                    memory_pools = (memory_pools,)
+                pools = frozenset(str(pool) for pool in memory_pools)
+            else:
+                pools = _EMPTY_FROZENSET
+            if not memory_bindings:
+                bindings = None
+            elif (context is not None
+                  and memory_bindings is context.get("bindings")):
+                bindings = memory_bindings
+            else:
+                bindings = {str(key): dict(value)
+                            for key, value in memory_bindings.items()}
+            memory_replica = int(the_metadata.get(
+                "memory_replica", context.get("replica", 0) if context else 0))
+            memory_stage = int(the_metadata.get(
+                "memory_stage", context.get("stage", 0) if context else 0))
+        return the_metadata, ledger, pools, bindings, memory_replica, memory_stage
 
     def _submit_host_launch(
         self, prepared, name: str, obs_name: str, after, owner: str = "",
@@ -534,38 +545,6 @@ class _EngineSubmitMixin:
         bus = bound.bind_config[0]
         admit_extra = 0
 
-        def launch_writebacks(tag, entries, after_events, on_done=None):
-            total = sum(amt for _, _, _, _, amt in entries)
-            wb_done = self.future(tag + ":done")
-            wbs = getattr(self, "_inflight_writebacks", None)
-            if wbs is None:
-                wbs = self._inflight_writebacks = {}
-            registered = []
-            for die, alloc, version, cov, _ in entries:
-                ident = memory_state, die, alloc, version
-                bucket = wbs.setdefault(ident, {})
-                bucket[wb_done] = bucket[wb_done].union(cov) if wb_done in bucket else cov
-                registered.append(ident)
-            registered = tuple(dict.fromkeys(registered))
-
-            def finish(_ev):
-                for ident in registered:
-                    bucket = wbs.get(ident)
-                    if bucket is not None:
-                        bucket.pop(wb_done, None)
-                        if not bucket:
-                            del wbs[ident]
-                self.resolve(wb_done)
-                if on_done is not None:
-                    on_done()
-
-            work = {term.row_id: term.ms_per_progress for term in bus.terms_for("write", total)
-                    if term.ms_per_progress}
-            self.submit(tag, work, after=after_events, owner=owner, priority=priority,
-                        coupled=len(work) > 1, deliveries=((bus.ctr_w, total),),
-                        on_complete=finish, native_hook=True)
-            return wb_done
-
         def admit(event, pat=None):
             nonlocal admit_extra
             if pat is None:
@@ -583,7 +562,9 @@ class _EngineSubmitMixin:
                         for item in pending_wbs
                     )
                     admit_extra += sum(item.bytes for item in pending_wbs)
-                    launch_writebacks(name + ":dirty_writeback", wb_entries, (event,))
+                    self._launch_access_writebacks(
+                        name + ":dirty_writeback", wb_entries, (event,),
+                        memory_state, bus, owner, priority)
                 wbs = getattr(self, "_inflight_writebacks", None)
                 wb_pending = wbs.get((memory_state, wb_die, wb_alloc, wb_ver)) if wbs else None
                 wb_waits = _overlapping_writebacks(wb_pending, coverage, resident) if wb_pending else ()
@@ -663,8 +644,10 @@ class _EngineSubmitMixin:
                                     item_cov, item.bytes))
                 extra = sum(amt for _, _, _, _, amt in entries)
                 if entries:
-                    launch_writebacks(name + ":dirty_writeback", entries, (transfer,),
-                                      on_done=lambda: publish(admit_extra + extra))
+                    self._launch_access_writebacks(
+                        name + ":dirty_writeback", entries, (transfer,),
+                        memory_state, bus, owner, priority,
+                        on_done=lambda: publish(admit_extra + extra))
                 else:
                     publish(admit_extra)
 
@@ -674,6 +657,40 @@ class _EngineSubmitMixin:
         self.submit(name + ":admit", {}, after=after, release=release, owner=owner, priority=priority,
                     on_complete=admit, native_hook=True)
         return done
+
+    def _launch_access_writebacks(
+        self, tag, entries, after_events, memory_state, bus, owner, priority, on_done=None,
+    ):
+        total = sum(amt for _, _, _, _, amt in entries)
+        wb_done = self.future(tag + ":done")
+        wbs = getattr(self, "_inflight_writebacks", None)
+        if wbs is None:
+            wbs = self._inflight_writebacks = {}
+        registered = []
+        for die, alloc, version, cov, _ in entries:
+            ident = memory_state, die, alloc, version
+            bucket = wbs.setdefault(ident, {})
+            bucket[wb_done] = bucket[wb_done].union(cov) if wb_done in bucket else cov
+            registered.append(ident)
+        registered = tuple(dict.fromkeys(registered))
+
+        def finish(_ev):
+            for ident in registered:
+                bucket = wbs.get(ident)
+                if bucket is not None:
+                    bucket.pop(wb_done, None)
+                    if not bucket:
+                        del wbs[ident]
+            self.resolve(wb_done)
+            if on_done is not None:
+                on_done()
+
+        work = {term.row_id: term.ms_per_progress for term in bus.terms_for("write", total)
+                if term.ms_per_progress}
+        self.submit(tag, work, after=after_events, owner=owner, priority=priority,
+                    coupled=len(work) > 1, deliveries=((bus.ctr_w, total),),
+                    on_complete=finish, native_hook=True)
+        return wb_done
 
     def _submit_custom_access(self, name, bound, state, pattern, after, release, owner, priority):
         """Keep caller-owned admission protocols at their original start boundary."""

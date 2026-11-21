@@ -5,13 +5,13 @@ import pytest
 
 from mindie_sim.catalog.quant import quant_preset
 from mindie_sim.prediction import predict
-from mindie_sim.prediction.attention import AttentionPolicy
+from mindie_sim.prediction.operators.attention.attention import AttentionPolicy
 from mindie_sim.prediction.cost import CostModel
 from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.frontend import Frontend
 from mindie_sim.prediction.operator_analysis import operator_costs, target_operators
-from mindie_sim.prediction.operators import attention_online, cuda_norm
-from mindie_sim.prediction.attention_pipeline import TiledFlashAndPagedAttentionRecipe
+from mindie_sim.prediction.operators.attention import attention_online; from mindie_sim.prediction.operators.vector import cuda_norm
+from mindie_sim.prediction.operators.attention.attention_pipeline import TiledFlashAndPagedAttentionRecipe
 from mindie_sim.prediction.program import RecipeBook
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError

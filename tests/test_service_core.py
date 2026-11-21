@@ -33,7 +33,7 @@ import pytest
 
 from mindie_sim import predict
 from mindie_sim.compose import compose_case
-from mindie_sim.prediction.attention import AttentionPolicy
+from mindie_sim.prediction.operators.attention.attention import AttentionPolicy
 from mindie_sim.prediction.capacity import Memory, MemoryPolicy
 from mindie_sim.prediction.cost import CostModel
 from mindie_sim.prediction.execution import Execution

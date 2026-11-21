@@ -24,12 +24,12 @@ from mindie_sim.catalog.quant import quant_preset
 from mindie_sim.catalog.types import EngramSpec, EngramTableSpec, QuantSpec
 from mindie_sim.catalog.weight_terms import WeightTerm, term_bytes, term_payload_bytes
 from mindie_sim.catalog.weights import layer_weight_terms, stage_weight_bytes, stage_weight_decomposition
-from mindie_sim.prediction.attention import gqa
+from mindie_sim.prediction.operators.attention.attention import gqa
 from mindie_sim.prediction.capacity import Memory
-from mindie_sim.prediction.matrix_epilogue import MatrixEpilogue
-from mindie_sim.prediction.matrix_precision import execution_compute_peaks, resolve_matrix_precision
+from mindie_sim.prediction.operators.matrix.matrix_epilogue import MatrixEpilogue
+from mindie_sim.prediction.operators.matrix.matrix_precision import execution_compute_peaks, resolve_matrix_precision
 from mindie_sim.prediction.operator_analysis import target_operators
-from mindie_sim.prediction.partial_attention import projection_only
+from mindie_sim.prediction.operators.attention.partial_attention import projection_only
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.prediction.transforms import activation_quantization
 from mindie_sim.schema.common import ModelingError

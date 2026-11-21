@@ -26,9 +26,20 @@ _GOVERNED_FAMILIES = frozenset({
     "sparse_indexer", "linear_attention", "attention", "paged_mla", "mla_prolog",
     "rotary", "grouped_moe", "hyper_connections", "mc2",
 })
-_GOVERNED_BLOCK_SELECTORS = frozenset({"lightning_indexer", "gdn_decode"})
+_STRICT_OWNED_RECIPE_MODULES = frozenset({
+    "mindie_sim.prediction.operators.sparse_indexer.bf16_lightning",
+    "mindie_sim.prediction.operators.linear_attention.gdn_decode",
+})
 _OWNER_MODULE_PREFIXES = ("mindie_sim.prediction.operators.", "mindie_sim.templates.")
+_NON_DEVICE_INFRA_RECIPES = frozenset({
+    ("mindie_sim.prediction.physical_recipe_registry", "ControlSyncRecipe"),
+    ("mindie_sim.prediction.program.binding", "TransferRecipe"),
+    ("mindie_sim.prediction.program.recipes", "HostStaging"),
+    ("mindie_sim.prediction.program.recipes", "RecurrentScan"),
+    ("mindie_sim.prediction.collectives.ring_pairwise", "PairwiseCollective"),
+})
 _RECIPE_BOOK_PATH = PurePosixPath("mindie_sim/prediction/program/recipes.py")
+_PHYSICAL_REGISTRY_PATH = PurePosixPath("mindie_sim/prediction/physical_recipe_registry.py")
 _IMPLEMENTATION_PATH = PurePosixPath("mindie_sim/prediction/implementation_registry.py")
 _GATE_PATH = PurePosixPath("scripts/check_arch_governance.py")
 
@@ -63,10 +74,14 @@ def _binding_module(recipe) -> str:
 
 
 def verify_ag006_ownership() -> tuple[Violation, ...]:
-    """Check active recipe bindings, dispatcher tables and live kernel selection."""
+    """Check 100% of active recipe bindings, IMPLEMENTATIONS, RecipeBook, and live dispatch."""
     from mindie_sim.prediction.implementation_registry import IMPLEMENTATIONS
     from mindie_sim.prediction.operators.registry import builtin_family_registry
     from mindie_sim.prediction.operators.linear_attention import gdn_decode
+    from mindie_sim.prediction.physical_recipe_registry import (
+        physical_family_bindings,
+        physical_recipe_bindings,
+    )
     from mindie_sim.prediction.program import RecipeBook
 
     specs = tuple(spec for spec in builtin_family_registry().specs()
@@ -75,7 +90,13 @@ def verify_ag006_ownership() -> tuple[Violation, ...]:
     book = RecipeBook.from_mapping({})
     violations = []
 
-    def check(binding, path, fingerprint, description):
+    def is_allowed_infra(binding) -> bool:
+        cls = binding if isinstance(binding, type) else type(binding)
+        return (cls.__module__, cls.__name__) in _NON_DEVICE_INFRA_RECIPES
+
+    def check(binding, path, fingerprint, description, *, allow_infra: bool = False):
+        if allow_infra and is_allowed_infra(binding):
+            return
         module = _binding_module(binding)
         if not module.startswith(_OWNER_MODULE_PREFIXES):
             violations.append(Violation(
@@ -83,6 +104,7 @@ def verify_ag006_ownership() -> tuple[Violation, ...]:
                 f"{description} uses builder outside governed packages: {module}",
             ))
 
+    checked_book_recipes: set[str] = set()
     for spec in specs:
         owner = import_module(_OWNER_MODULE_PREFIXES[0] + spec.name)
         path = PurePosixPath(*owner.__name__.split("."), "__init__.py")
@@ -94,6 +116,7 @@ def verify_ag006_ownership() -> tuple[Violation, ...]:
                 check(binding, path, f"dispatcher:{spec.name}:{table_name}:{key}",
                       f"{spec.name} dispatcher entry {key!r}")
         for recipe_id in sorted(spec.owned_recipe_ids & book.recipes.keys()):
+            checked_book_recipes.add(recipe_id)
             check(book.recipes[recipe_id], _RECIPE_BOOK_PATH, f"recipe:{recipe_id}",
                   f"{spec.name} recipe {recipe_id!r}")
 
@@ -102,35 +125,55 @@ def verify_ag006_ownership() -> tuple[Violation, ...]:
         check(builder, path, f"dispatcher:gdn_decode:{recipe_id}",
               f"GDN decode dispatcher entry {recipe_id!r}")
 
-    # Operator replacement selectors can share block names while addressing
-    # different contracts, such as an imported xLLM custom operation.
+    # Full-table Lock A: enforce 100% of RecipeBook (recipes, families, programs)
+    # and physical_recipe_registry bindings resolve to governed operator packages.
+    for recipe_id, binding in sorted(book.recipes.items()):
+        if recipe_id not in checked_book_recipes:
+            check(binding, _RECIPE_BOOK_PATH, f"book_recipe:{recipe_id}",
+                  f"RecipeBook recipe {recipe_id!r}", allow_infra=True)
+    for fam_id, binding in sorted(book.families.items()):
+        check(binding, _RECIPE_BOOK_PATH, f"book_family:{fam_id}",
+              f"RecipeBook family {fam_id!r}", allow_infra=True)
+    for prog_id, binding in sorted(book.programs.items()):
+        check(binding, _RECIPE_BOOK_PATH, f"book_program:{prog_id}",
+              f"RecipeBook program {prog_id!r}", allow_infra=True)
+    for fam_id, binding in sorted(physical_family_bindings().items()):
+        check(binding, _PHYSICAL_REGISTRY_PATH, f"physical_family:{fam_id}",
+              f"physical_recipe_registry family {fam_id!r}", allow_infra=True)
+    for rec_id, binding in sorted(physical_recipe_bindings().items()):
+        check(binding, _PHYSICAL_REGISTRY_PATH, f"physical_recipe:{rec_id}",
+              f"physical_recipe_registry recipe {rec_id!r}", allow_infra=True)
+
+    # Full-table Lock A: enforce 100% of IMPLEMENTATIONS (zero selector loophole!).
+    checked_modules: dict[str, dict] = {}
     for name, implementation in sorted(IMPLEMENTATIONS.items()):
-        if _GOVERNED_BLOCK_SELECTORS.isdisjoint(implementation.blocks):
-            continue
         module = implementation.module
         if not module.startswith(_OWNER_MODULE_PREFIXES):
             violations.append(Violation(
                 "AG006", _IMPLEMENTATION_PATH, 1, f"AG006:implementation:{name}",
-                f"migrated implementation {name!r} points outside governed packages: {module}",
+                f"implementation {name!r} points outside governed packages: {module}",
             ))
             continue
-        try:
-            recipes = import_module(module).recipes()
-        except (ImportError, AttributeError) as exc:
-            violations.append(Violation(
-                "AG006", _IMPLEMENTATION_PATH, 1, f"AG006:implementation:{name}:recipes",
-                f"migrated implementation {name!r} cannot expose its recipes: {exc}",
-            ))
-            continue
+        if module not in checked_modules:
+            try:
+                checked_modules[module] = import_module(module).recipes()
+            except (ImportError, AttributeError) as exc:
+                violations.append(Violation(
+                    "AG006", _IMPLEMENTATION_PATH, 1, f"AG006:implementation:{name}:recipes",
+                    f"implementation {name!r} cannot expose its recipes: {exc}",
+                ))
+                continue
+        recipes = checked_modules[module]
+        strict_owned = module in _STRICT_OWNED_RECIPE_MODULES
         for recipe_id, recipe in sorted(recipes.items()):
             fingerprint = f"implementation:{name}:{recipe_id}"
-            description = f"migrated implementation {name!r} recipe {recipe_id!r}"
-            if recipe_id not in owned:
+            description = f"implementation {name!r} recipe {recipe_id!r}"
+            if strict_owned and recipe_id not in owned:
                 violations.append(Violation(
                     "AG006", _IMPLEMENTATION_PATH, 1, f"AG006:{fingerprint}",
                     f"migrated implementation {name!r} exposes unowned recipe {recipe_id!r}",
                 ))
-            check(recipe, _IMPLEMENTATION_PATH, f"{fingerprint}:builder", description)
+            check(recipe, _IMPLEMENTATION_PATH, f"{fingerprint}:builder", description, allow_infra=True)
     return tuple(violations) if violations else _verify_live_dispatch(book)
 
 

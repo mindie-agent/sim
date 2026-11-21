@@ -17,12 +17,13 @@ from mindie_sim.schema.operators import OpSpec
 from ...mechanism import OperatorPlan
 from ..contracts import ArchStrategy, OperatorPlanningContext
 from .common import (
-    ACLNN_V3_ABIS, GROUP_COMPUTE_MIN_HEADS, WEIGHT_QUANT_INT8, WEIGHT_QUANT_MXFP8,
-    build_plan, unsupported, validate_contract,
+    ACLNN_V3_ABIS, GROUP_COMPUTE_MIN_HEADS, WEIGHT_QUANT_BF16, WEIGHT_QUANT_INT8, WEIGHT_QUANT_MXFP8,
+    build_plan, contract_for, unsupported,
 )
 
 ARCH_ID = ArchId("npu_arch_2201")
 UPSTREAM_ABI = "aclnnMlaPrologV3WeightNz"
+BF16_ND_OUTPUT_BLOCK_BYTES = 32
 SOURCES: tuple[SourceRef, ...] = (
     SourceRef(
         repository="cann/ops-transformer",
@@ -76,16 +77,19 @@ class _SplitNStrategy:
     sources: tuple[SourceRef, ...] = SOURCES
 
     def accepts(self, op: OpSpec, ctx: OperatorPlanningContext, /) -> bool:
-        c = validate_contract(op, ctx.requested_abi)
+        c = contract_for(op, ctx)
         return c.abi in ACLNN_V3_ABIS and c.weight_quant_mode != WEIGHT_QUANT_MXFP8
 
     def build(self, op: OpSpec, ctx: OperatorPlanningContext, /) -> OperatorPlan:
-        c = validate_contract(op, ctx.requested_abi)
+        c = contract_for(op, ctx)
         if c.abi not in ACLNN_V3_ABIS or c.weight_quant_mode == WEIGHT_QUANT_MXFP8:
             raise unsupported(op, ctx, f"unsupported_abi_or_weight_mode:{c.abi}:{c.weight_quant_mode}")
         # The other host dequant modes and the partial-quant group mode are outside this ABI binding.
         cq_scale = c.weight_quant_mode == WEIGHT_QUANT_INT8 and c.num_heads >= GROUP_COMPUTE_MIN_HEADS
-        return build_plan(c, ctx, sources=self.sources, mode="split_n", cq_scale=cq_scale)
+        # The V3 split-N host tiler rounds ND output columns to BLOCK_SIZE / sizeof(T).
+        alignment = BF16_ND_OUTPUT_BLOCK_BYTES if c.weight_quant_mode == WEIGHT_QUANT_BF16 else None
+        return build_plan(c, ctx, sources=self.sources, mode="split_n", cq_scale=cq_scale,
+                          fixpipe_alignment=alignment)
 
 
 STRATEGY: ArchStrategy = _SplitNStrategy()

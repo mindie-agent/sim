@@ -54,16 +54,16 @@ pytestmark = pytest.mark.tier0
 AIC_ROLES = {"mte1", "mte2_aic", "fixpipe"}
 ISA = {
     "npu_arch_2201": {
-        "pipes": {"mte1": 128, "mte2_aic": 32, "mte2_aiv": 32, "mte3": 64, "fixpipe": 128, "vector": 32},
-        "modes": {"mte1_l0a": 256, "mte1_l0b": 128}, "mte2_split": 1,
+        "pipes": {"mte1": 128, "mte2_aic": 256, "mte2_aiv": 128, "mte3": 64, "fixpipe": 128, "vector": 32},
+        "modes": {"mte1_l0a": 256, "mte1_l0b": 128}, "mte1_split": 2, "mte2_split": 2,
         "peaks": {"int4": 4, "fp32": 1 / 4, "hf32": 1 / 2},
         "buffers": {"l1": 524288, "l0a": 65536, "l0b": 65536, "l0c": 131072, "ub": 196608},
     },
     "npu_arch_3510": {
-        "pipes": {"mte1": 256, "mte3": 128, "fixpipe": 128, "vector": 64, "reg_data_writes": 2,
+        "pipes": {"mte1": 256, "mte3": 80, "fixpipe": 128, "vector": 64, "reg_data_writes": 2,
                   "reg_ub_accesses": 2, "reg_ub_stores": 1, "reg_alu_lanes": 128,
-                  "reg_special_lanes": 32, "reg_reduce_lanes": 64, "reg_shuffle_lanes": 64},
-        "modes": {"mte1_l1_ub": 128, "ub_copy": 256, "reg_issue_slots": 2}, "mte2_split": 4,
+                  "reg_special_lanes": 64, "reg_reduce_lanes": 64, "reg_shuffle_lanes": 64},
+        "modes": {"mte1_l1_ub": 128, "ub_copy": 256, "reg_issue_slots": 2}, "mte1_split": 1, "mte2_split": 1,
         "peaks": {"fp32": 1 / 16, "hf32": 1 / 2},
         "buffers": {"l1": 524288, "l0a": 65536, "l0b": 65536, "l0c": 262144, "ub": 253952},
     },
@@ -111,7 +111,7 @@ def test_profile_declaration_materializes_owners_buffers_supply_precision_and_li
         assert modes[mode] == (base, pytest.approx(per_cycle * _owners(mode, aic, aiv) * clock))
     for capped in (rates["mte2_aic"], modes["mte1_l0a"][1]):
         assert capped <= 256 * aic * clock * (1 + 1e-12)
-    assert modes["mte1_l0a"][1] == pytest.approx(2 * modes["mte1_l0b"][1])
+    assert modes["mte1_l0a"][1] == pytest.approx(isa["mte1_split"] * modes["mte1_l0b"][1])
     assert rates["mte2_aic"] / aic == pytest.approx(isa["mte2_split"] * rates["mte2_aiv"] / aiv)
     for dtype, ratio in isa["peaks"].items():
         assert peaks[dtype] == pytest.approx(peaks["bf16"] * ratio)
@@ -561,8 +561,8 @@ def test_core_scaling_touches_only_owned_supplies_and_roundtrips():
     assert (dict(die.buffer_units)["l1"], dict(die.buffers)) == (half, dict(die0.buffers))
     assert [(l.name, l.capacity_bytes_per_ms) for l in derived.links] == [
         (l.name, l.capacity_bytes_per_ms) for l in base.links]
-    assert dict(die.compute_peak_aliases)["mxfp4"] == "fp8_e4m3"
-    assert die.peak("mxfp4") == pytest.approx(die.peak("fp8_e4m3"))
+    assert die.capability.supports_native("matrix", "mxfp4", "fp32")
+    assert die.peak("mxfp4") == pytest.approx(2 * die.peak("fp8_e4m3"))
     narrow = derive_hardware_sku(base, sku="X", aic_count=16, aiv_count=16)
     nd = narrow.dies[0]
     assert (nd.compute_units, dict(nd.resource_units)["vector"], dict(nd.buffer_units)["ub"]) == (16, 16, 16)

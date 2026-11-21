@@ -21,10 +21,10 @@ from mindie_sim.prediction.implementations import (add_input_ports,
                                                     preserve_graph,
                                                     produced_values,
                                                     producer_input_values)
-from mindie_sim.prediction.native_fusion import lower_native_fusions
+from mindie_sim.prediction.operators.hyper_connections.native_fusion import lower_native_fusions
 from mindie_sim.prediction.operator_analysis import target_operators
-from mindie_sim.prediction.native_fusion_traffic import apply_traffic_profile
-from mindie_sim.prediction.operators import cuda_quant
+from mindie_sim.prediction.operators.hyper_connections.native_fusion_traffic import apply_traffic_profile
+from mindie_sim.prediction.operators.vector import cuda_quant
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.prediction.transforms import (activation_quantization,
                                               norm_quant, residual_norm)

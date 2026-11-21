@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass, field, fields, replace
+from functools import partial
 
 from mindie_sim.public.errors import UnmodeledCapabilityError
 from mindie_sim.schema.common import ModelingError
@@ -24,8 +25,9 @@ from ...ownership import read_role
 from ...program import KernelProgram, ParallelProgram, PipelineProgram, RecipeContext, Stage
 from ...results import FusedPipelineDescriptor, FusedPipelineSpec, PipelinePhase, WorkItem
 from ...runtime.ring_buffer import RingBuffer
+from ..attention.common import planning_sequence_spans, sequence_layout_metadata
 from ..contracts import OperatorPlanningContext
-from ._lowering import S1Partition, S2Partition, align, ceil_div
+from ._lowering import S1Partition, S2Partition, _DisjointOwnerProgram, align, ceil_div, request_program, sort_ops
 
 FAMILY = "sparse_indexer"
 
@@ -241,6 +243,13 @@ def indexer_contract(op: OpSpec, ctx: OperatorPlanningContext, default_abi: str)
     return contract
 
 
+def request_contracts(contract: SparseIndexerContract, ctx: OperatorPlanningContext):
+    for q, kv, _, _, padding in planning_sequence_spans(ctx, "TND"):
+        if not padding:
+            yield replace(contract, query_tokens=q, batch_size=1,
+                          scanned_rows=min(contract.scanned_rows, kv // contract.compress_ratio))
+
+
 def make_op(
     contract: SparseIndexerContract, *, op_id: str, deps: tuple[str, ...] = (),
     stage: int = 0, layer: int = 0, requests: tuple[str, ...] = (),
@@ -326,16 +335,6 @@ def owner_pairs(ctx: OperatorPlanningContext, aivs_per_aic: int) -> tuple[tuple[
 
 
 @dataclass(frozen=True, slots=True)
-class _DisjointOwnerProgram:
-    """Execute the stages with the physical IDs already bound by the planner."""
-
-    placed: ParallelProgram
-
-    def start(self, engine, name, ready, *, owner=""):
-        return self.placed.start(engine, name, ready, owner=owner)
-
-
-@dataclass(frozen=True, slots=True)
 class _SparseIndexerProgramBuilder:
     contract: SparseIndexerContract
     lowering: Lowering
@@ -345,6 +344,7 @@ class _SparseIndexerProgramBuilder:
     aiv_read: str
     aic_count: int
     aiv_count: int
+    gm_offsets: tuple[int, int] | None = None
 
     @property
     def partition(self) -> S2Partition:
@@ -600,9 +600,13 @@ class _SparseIndexerProgramBuilder:
         return tuple(stages)
 
     def _tile_stages(self, ctx: RecipeContext, owner, rows: int, index: int,
-                     reuse: bool, ring: RingBuffer | None, final_owner: bool, queries: int) -> tuple[Stage, ...]:
+                     reuse: bool, ring: RingBuffer | None, final_owner: bool, queries: int,
+                     key_start: int | None = None) -> tuple[Stage, ...]:
         phases = self.tile(rows, index, reuse=reuse, final_owner=final_owner, queries=queries)
         stages = self._stages(ctx, owner, phases)
+        if key_start is not None:
+            first, *rest = stages
+            stages = (replace(first, metadata={**first.metadata, "key_gm_row": key_start + index * self.lowering.tile_size}), *rest)
         if ring is None:
             return stages
         slot = ring.slot(index)
@@ -643,15 +647,21 @@ class _SparseIndexerProgramBuilder:
             bound.append(stage)
         return tuple(bound)
 
-    def _owner_program(self, ctx: RecipeContext, owner, split: int, reuse: bool, queries: int) -> KernelProgram:
+    def _owner_program(self, ctx: RecipeContext, owner, split: int, reuse: bool, queries: int, block: int) -> KernelProgram:
         rows = self.partition.owner_rows(split)
         g = self.lowering
         ring = RingBuffer(depth=g.slots, allocation=SCORE_SLOT_NAME) if g.aivs_per_aic > 1 else None
         entry = self._stages(ctx, owner, self.owner_entry(), queries)
+        key_start = None
+        if self.gm_offsets is not None:
+            q_offset, kv_offset = self.gm_offsets
+            q_offset += block * g.query_block_size
+            entry = tuple(replace(stage, metadata={**stage.metadata, "query_gm_row": q_offset}) for stage in entry)
+            key_start = kv_offset // self.contract.compress_ratio + self.partition.owner_start(split)
         tiles = PipelineProgram(
             ceil_div(rows, g.tile_size), ring.depth if ring is not None else g.slots,
             lambda index: self._tile_stages(ctx, owner, rows, index, reuse, ring,
-                                            split == self.partition.owners - 1, queries),
+                                            split == self.partition.owners - 1, queries, key_start),
         )
         body = Stage("score_tiles", after=(entry[-1].name,), program=tiles)
         selection_owner = (owner[0], owner[1][:1]) if g.gm_key_staging else owner
@@ -666,13 +676,12 @@ class _SparseIndexerProgramBuilder:
         queries = self.query_blocks.live_rows(block)
         reuse = self.l2_reuse and block > 0
         streams = []
-        for lane in range(concurrent):
-            owner = self.owners[(owner_index + lane) % len(self.owners)]
+        for lane, owner in enumerate(self.owners[owner_index:owner_index + concurrent]):
             streams.append(PipelineProgram(
                 ceil_div(split_count - lane, concurrent), 1,
                 lambda index, lane=lane, owner=owner: (
                     Stage("s2_owner", program=self._owner_program(ctx, owner, index * concurrent + lane,
-                                                                reuse, queries)),
+                                                                reuse, queries, block)),
                 ),
             ))
         aic, aivs = self.owners[owner_index]
@@ -706,12 +715,6 @@ class _SparseIndexerProgramBuilder:
         return placed
 
 
-def sort_ops(items: int) -> int:
-    """Pair compare/exchange work for a comparison-based sort."""
-    levels = (max(1, items) - 1).bit_length()
-    return items * levels
-
-
 def build_plan(
     op: OpSpec, ctx: OperatorPlanningContext, contract: SparseIndexerContract,
     lowering: Lowering, owners: tuple[tuple[int, tuple[int, ...]], ...],
@@ -722,37 +725,66 @@ def build_plan(
     geometry = ctx.geometry
     hierarchy = getattr(geometry.physical_mechanisms, "memory_hierarchy", None)
     l2_capacity = getattr(hierarchy, "effective_l2_bytes", geometry.buffers.get("l2", 0))
-    l2_reuse = (
-        contract.shared_prefix and contract.query_tokens > 1 and contract.scanned_rows > 0
-        and "l2" in geometry.resource_units
-        and contract.scanned_rows * contract.cache_row_bytes <= l2_capacity
-    )
-    builder = _SparseIndexerProgramBuilder(
-        contract, lowering, owners, l2_reuse, read_role(geometry.resource_units),
-        read_role(geometry.resource_units, aiv=0), ctx.datapath.aic_count, ctx.datapath.aiv_count,
-    )
+    if ctx.requests and ctx.admission_memory_view is not None and "l2" in geometry.resource_units:
+        l2_capacity = ctx.admission_memory_view.effective_l2_bytes(geometry.rank or 0)
+
+    def bind(request, owners_, offsets=None):
+        reuse = (request.shared_prefix and request.query_tokens > 1 and request.scanned_rows > 0
+                 and "l2" in geometry.resource_units
+                 and request.scanned_rows * request.cache_row_bytes <= l2_capacity)
+        return _SparseIndexerProgramBuilder(
+            request, lowering, owners_, reuse, read_role(geometry.resource_units),
+            read_role(geometry.resource_units, aiv=0), ctx.datapath.aic_count, ctx.datapath.aiv_count, offsets,
+        )
+
+    if ctx.requests:
+        builders, waves = [], []
+        start = wave_start = 0
+        spans = (span[2:4] for span in planning_sequence_spans(ctx, "TND") if not span[-1])
+        for request, offsets in zip(request_contracts(contract, ctx), spans, strict=True):
+            lanes = min(len(owners), max(1, S2Partition(
+                request.scanned_rows, lowering.tile_size, request.s2_splits,
+            ).owners))
+            if start + lanes > len(owners):
+                waves.append((wave_start, len(builders)))
+                wave_start, start = len(builders), 0
+            builders.append(bind(request, owners[start:start + lanes], offsets))
+            start += lanes
+        if wave_start < len(builders):
+            waves.append((wave_start, len(builders)))
+
+        program = partial(request_program, tuple(builders), tuple(waves))
+    else:
+        program = bind(contract, owners)
+        builders = (program,)
+
+    totals = {}
+    for builder in builders:
+        for name, work in builder.phase_totals().items():
+            totals[name] = totals.get(name, Work()) + work
     phases = []
     total = Work()
-    for name, work in builder.phase_totals().items():
+    for name, work in totals.items():
         total += work
         items = tuple(WorkItem("cube", "flop", n, dtype) for dtype, n in work.matrix.items() if n)
         items += tuple(WorkItem(role, "op" if role == "vector" else "bytes", n)
                        for role, n in work.resources.items() if n)
         phases.append(PipelinePhase(name, (phases[-1].phase_id,) if phases else (), items))
     return OperatorPlan(
-        work=total, program=builder,
+        work=total, program=program,
         metadata={
             "implementation": lowering.implementation, "abi": contract.abi,
             "arch_id": ctx.compute_arch.arch_id, "tiling": lowering.tiling,
             "s2_tile_size": lowering.tile_size, "score_path": lowering.score_path,
             "fused_topk": contract.fused_topk, "cache_row_bytes": contract.cache_row_bytes,
-            "s2_splits": builder.partition.owners, "causal": contract.causal,
-            "useful_flops": contract.matrix_flops,
+            "s2_splits": max((b.partition.owners for b in builders), default=0), "causal": contract.causal,
+            "useful_flops": sum(b.contract.matrix_flops for b in builders),
+            **sequence_layout_metadata(ctx, "TND"),
             **({"compress_ratio": contract.compress_ratio, "residual_tokens": contract.residual_tokens,
                 "packed_index_items": contract.packed_index_items} if contract.abi == QSA_ABI else {}),
             **({"score_stride": contract.msa_score_stride,
-                "score_workspace_bytes": contract.msa_score_heads * contract.query_tokens
-                * contract.msa_score_stride * FP32_BYTES} if contract.abi in MSA_ABIS
+                "score_workspace_bytes": sum(b.contract.msa_score_heads * b.contract.query_tokens
+                * b.contract.msa_score_stride * FP32_BYTES for b in builders)} if contract.abi in MSA_ABIS
                 and contract.fused_topk else {}),
         },
         pipeline_spec=FusedPipelineSpec(FAMILY, lowering.implementation, tuple(phases), sources),

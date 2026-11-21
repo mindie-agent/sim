@@ -23,7 +23,7 @@ from mindie_sim.prediction.engine import Engine, Resource
 from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.mechanism import Geometry
 from mindie_sim.prediction.program import RecipeBook, RecipeContext
-from mindie_sim.prediction.sparse_mla_metadata import IMPLEMENTATION as SPARSE_META_IMPL
+from mindie_sim.prediction.operators.sparse_indexer.sparse_mla_metadata import IMPLEMENTATION as SPARSE_META_IMPL
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.operators import OpSpec
 

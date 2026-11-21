@@ -47,7 +47,7 @@ from mindie_sim.model_catalog import MODEL_ALIASES, body_parameter_count, body_w
 from mindie_sim.model_catalog import build_model_spec, customize_model_spec, load_model, model_value_formats
 from mindie_sim.prediction.feedforward import alltoall, dense
 from mindie_sim.prediction.frontend_features import FeatureConfig
-from mindie_sim.prediction.gated_activation import gated_activation
+from mindie_sim.prediction.operators.vector.gated_activation import gated_activation
 from mindie_sim.prediction.routing_realizations import select_realization
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.prediction.transforms import lower_implementations

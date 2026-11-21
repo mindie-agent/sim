@@ -125,7 +125,7 @@ def execution_identity(spec, report):
 def scheduled_probe(spec):
     """Execute a complete fixed iteration without request-admission inference."""
     from mindie_sim import operator_costs
-    from mindie_sim.prediction.attention import AttentionPolicy
+    from mindie_sim.prediction.operators.attention.attention import AttentionPolicy
     from mindie_sim.prediction.cost import CostModel
     from mindie_sim.prediction.dispatch import cohorts
     from mindie_sim.prediction.execution import Execution

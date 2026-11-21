@@ -103,7 +103,7 @@ class Execution(_ContextMixin, _CohortMixin, _LazySubmitMixin):
     ):
         from ..cost import CostLedger
         from ..invocation_binding import InvocationPolicy
-        from ..offload import offload_resources, resolve_case_offload_policy
+        from ..offload import resolve_case_offload_policy
         from ..participant_profile import normalise as _normalise_profile
         from ..service_regimes import RegimePolicy
         from mindie_sim.observations.resource_services import normalize_resource_service
@@ -117,6 +117,9 @@ class Execution(_ContextMixin, _CohortMixin, _LazySubmitMixin):
         self.cost = _LedgerBoundCost(cost, self.ledger)
         self.namespace = namespace
         self.memory = memory
+        self._active_requests: tuple = ()
+        self._active_padded_tokens: int = 0
+        self._active_layout: str = ""
         metadata = getattr(case.runtime, "metadata", {}) or {}
         if not isinstance(metadata, _AbcMapping):
             metadata = dict(metadata)
@@ -149,78 +152,9 @@ class Execution(_ContextMixin, _CohortMixin, _LazySubmitMixin):
         self.prepared = {}
         self.schedules = {}
 
-        resources, pools, pool_units = [], {}, {}
-        resources.extend(self.serving_io.resources())
-        resources.extend(offload_resources(
-            self.offload_policy, namespace, case.runtime.parallel.dp, case.runtime.parallel.pp))
-        p = case.runtime.parallel
-        selected_replica = None if isolated_replica is None else int(isolated_replica)
-        self.stage_profiles: dict[tuple[int, int], StageProfile] = {}
-        profiles = None
-        if (bindings is not None and not namespace
-                and getattr(bindings, "stage_profiles", ())):
-            profiles = tuple(
-                profile for profile in bindings.stage_profiles
-                if selected_replica is None or profile.replica == selected_replica)
-        if not profiles:
-            profiles = build_stage_profiles(
-                case, namespace,
-                replicas=(None if selected_replica is None else (selected_replica,)),
-                primitive_table=getattr(bindings, "primitive_table", None))
-        if selected_replica is not None and not profiles:
-            raise ModelingError("isolated_replica_out_of_range")
-
-        active_ranks: set[int] = set()
-        scheduler_replicas: set[int] = set()
-        seen_host_rc: set[str] = set()
-        for profile in profiles:
-            replica, stage = profile.replica, profile.stage
-            if replica not in scheduler_replicas:
-                resources.append(Resource(
-                    f"{namespace}scheduler@r{replica}", 1, "ms", "fifo"))
-                scheduler_replicas.add(replica)
-            self.stage_dies[replica, stage] = profile.dies
-            self.stage_names[replica, stage] = profile.names
-            self.stage_pools[replica, stage] = profile.stage_pools
-            self.stage_profiles[replica, stage] = profile
-            resources.extend(profile.resources)
-            for rc_res in getattr(profile, "host_rc_resources", ()):
-                if rc_res.name not in seen_host_rc:
-                    seen_host_rc.add(rc_res.name)
-                    resources.append(rc_res)
-            pools.update(profile.pools)
-            pool_units.update(profile.pool_units)
-            active_ranks.update(int(die.rank) for die in profile.dies)
-
-        self.stream_owners, self.stream_quota_by_res, stream_res = bind_stream_plans(
-            stream_plans, self.stage_profiles, self.namespace)
-        resources.extend(stream_res)
-        self.topology = (
-            bindings.topology
-            if bindings is not None and bindings.topology is not None and not namespace
-            else Topology(case.machine, p, namespace,
-                          collective_startup_mode=case.runtime.collective_startup_mode))
-        if selected_replica is None:
-            resources.extend(self.topology.resources())
-        else:
-            resources.extend(self.topology.resources_for_ranks(active_ranks))
-
-        if engine is None and self.memory is not None:
-            bound = getattr(self.memory, "runtime_state", None)
-            if isinstance(bound, Engine):
-                engine = bound
-        self._engine_resource_templates = tuple(resources)
-        self._engine_pool_templates = dict(pools)
-        self._engine_pool_unit_templates = dict(pool_units)
-        self._engine_trace_limit = int(trace_limit)
-        if engine is not None:
-            engine.extend(resources, pools, pool_units)
-        self.engine = engine if engine is not None else Engine(
-            resources, pools=pools, pool_units=pool_units, trace_limit=trace_limit,
-            accel_eager_attach=self.accel_eager_attach)
-        if self.memory is not None:
-            if not self.engine.bind_memory(self.memory, pools=("hbm",)):
-                raise ModelingError("execution_memory_ledger_conflict")
+        resources, pools, pool_units = self._build_engine_resources(
+            case, bindings, namespace, isolated_replica, stream_plans)
+        self._bind_engine(case, engine, trace_limit, resources, pools, pool_units)
 
         attach_stars_queues(self)
 
@@ -286,6 +220,100 @@ class Execution(_ContextMixin, _CohortMixin, _LazySubmitMixin):
                        if isinstance(profile_svc, _AbcMapping) else ()):
             service = normalize_resource_service(record)
             self.resource_services[service.service_id] = service
+
+    def _build_engine_resources(
+        self, case, bindings, namespace, isolated_replica, stream_plans,
+    ):
+        from ..offload import offload_resources
+
+        resources, pools, pool_units = [], {}, {}
+        resources.extend(self.serving_io.resources())
+        resources.extend(offload_resources(
+            self.offload_policy, namespace, case.runtime.parallel.dp, case.runtime.parallel.pp))
+        p = case.runtime.parallel
+        selected_replica = None if isolated_replica is None else int(isolated_replica)
+        self.stage_profiles: dict[tuple[int, int], StageProfile] = {}
+        profiles = None
+        if (bindings is not None and not namespace
+                and getattr(bindings, "stage_profiles", ())):
+            profiles = tuple(
+                profile for profile in bindings.stage_profiles
+                if selected_replica is None or profile.replica == selected_replica)
+        if not profiles:
+            profiles = build_stage_profiles(
+                case, namespace,
+                replicas=(None if selected_replica is None else (selected_replica,)),
+                primitive_table=getattr(bindings, "primitive_table", None))
+        if selected_replica is not None and not profiles:
+            raise ModelingError("isolated_replica_out_of_range")
+
+        active_ranks: set[int] = set()
+        scheduler_replicas: set[int] = set()
+        seen_host_rc: set[str] = set()
+        for profile in profiles:
+            replica, stage = profile.replica, profile.stage
+            if replica not in scheduler_replicas:
+                resources.append(Resource(
+                    f"{namespace}scheduler@r{replica}", 1, "ms", "fifo"))
+                scheduler_replicas.add(replica)
+            self.stage_dies[replica, stage] = profile.dies
+            self.stage_names[replica, stage] = profile.names
+            self.stage_pools[replica, stage] = profile.stage_pools
+            self.stage_profiles[replica, stage] = profile
+            resources.extend(profile.resources)
+            for rc_res in getattr(profile, "host_rc_resources", ()):
+                if rc_res.name not in seen_host_rc:
+                    seen_host_rc.add(rc_res.name)
+                    resources.append(rc_res)
+            pools.update(profile.pools)
+            pool_units.update(profile.pool_units)
+            active_ranks.update(int(die.rank) for die in profile.dies)
+
+        self.stream_owners, self.stream_quota_by_res, stream_res = bind_stream_plans(
+            stream_plans, self.stage_profiles, self.namespace)
+        resources.extend(stream_res)
+        self.topology = (
+            bindings.topology
+            if bindings is not None and bindings.topology is not None and not namespace
+            else Topology(case.machine, p, namespace,
+                          collective_startup_mode=case.runtime.collective_startup_mode))
+        if selected_replica is None:
+            resources.extend(self.topology.resources())
+        else:
+            resources.extend(self.topology.resources_for_ranks(active_ranks))
+
+        return resources, pools, pool_units
+
+    def _bind_engine(self, case, engine, trace_limit, resources, pools, pool_units):
+        if engine is None and self.memory is not None:
+            bound = getattr(self.memory, "runtime_state", None)
+            if isinstance(bound, Engine):
+                engine = bound
+        self._engine_resource_templates = tuple(resources)
+        self._engine_pool_templates = dict(pools)
+        self._engine_pool_unit_templates = dict(pool_units)
+        self._engine_trace_limit = int(trace_limit)
+        if engine is not None:
+            engine.extend(resources, pools, pool_units)
+        self.engine = engine if engine is not None else Engine(
+            resources, pools=pools, pool_units=pool_units, trace_limit=trace_limit,
+            accel_eager_attach=self.accel_eager_attach)
+        if self.memory is not None:
+            if not self.engine.bind_memory(self.memory, pools=("hbm",)):
+                raise ModelingError("execution_memory_ledger_conflict")
+        from ..runtime.l2_residency import AdmissionMemoryView
+        die_l2 = {int(die.rank): int(dict(die.buffers).get("l2", 0)) for die in case.machine.dies}
+        if 0 not in die_l2 and case.machine.dies:
+            die_l2[0] = int(dict(case.machine.dies[0].buffers).get("l2", 0))
+        first_profile = next(iter(self.stage_profiles.values()), None)
+        first_ma = getattr(getattr(first_profile, "datapath", None), "memory_access", None)
+        self.admission_memory_view = (
+            self.engine.admission_memory_view
+            if self.engine.admission_memory_view is not None
+            else AdmissionMemoryView(die_l2, memory_access=first_ma)
+        )
+        self.engine.attach_admission_memory_view(self.admission_memory_view)
+        self.allocation_versions: dict[str, int] = self.engine._allocation_versions
 
     def reset_engine(self) -> None:
         """Renew only the mutable Engine root for the next isolated price."""
@@ -539,17 +567,7 @@ class Execution(_ContextMixin, _CohortMixin, _LazySubmitMixin):
     def add(self, work: IterationWork, replica: int, release_ms: float, *,
             external_inputs=None, emitted_tokens=None,
             memory_bindings=None, state_accesses=None) -> ScheduledIteration:
-        if self._collectives is None:
-            if _NO_REV_OPS_CACHE.get(id(work.ops)) is not work.ops:
-                has_rev = any(
-                    op.metadata and meta_scan_flags(op.metadata)[1]
-                    for op in work.ops)
-                if has_rev:
-                    work = replace(work, ops=bind_cohort_traffic(
-                        self.case, {replica: work.ops})[replica])
-                else:
-                    mark_no_rev_collective(work.ops)
-        work = self._lower_local_tp_work(work, replica)
+        work = self._prepare_iteration_work(work, replica)
         engine = self.engine
         prefix = f"{self.namespace}r{replica}:i{work.plan.iteration}"
         ids: dict[str, Event] = dict(external_inputs or {})
@@ -613,54 +631,21 @@ class Execution(_ContextMixin, _CohortMixin, _LazySubmitMixin):
             owner = f"replica:{replica}"
             captured = scope == "full" or (
                 scope == "piecewise" and bool(dict(op.metadata).get("graph_captured")))
-            capture_key = op.stage, dict(op.metadata).get("graph_segment", 0) if scope == "piecewise" else 0
+            capture_key = (
+                op.stage, dict(op.metadata).get("graph_segment", 0) if scope == "piecewise" else 0)
             kernel_group = declaration(op)
             submit = (bool(kernel_group.get("entry")) if kernel_group else
                       bool(context.work or getattr(recipe, "algorithm", None)))
             host_launch = None
             if submit and self.include_submission:
-                if captured and capture_key in graph_launch:
-                    host_launch, _start = graph_launch[capture_key]
-                else:
-                    dies = self.stage_dies[stage_key]
-                    duration = self.submission.launch_ms(dies, captured=captured)
-                    host_deps = (prepared,) + ((self.hosts[stage_key],) if stage_key in self.hosts else ())
-                    if captured and scope == "piecewise" and self.submission.piecewise_sync_ms > 0.0:
-                        if deps:
-                            host_deps = tuple(deps) + host_deps
-                        if self.submission_counts["graph_replays"] > 0:
-                            duration += float(self.submission.piecewise_sync_ms)
-                    host_launch = engine.submit(name + ":submit", {names["host"]: duration},
-                                                after=host_deps, owner=owner)
-                    self.hosts[stage_key] = host_launch
-                    self.submission_counts["graph_replays" if captured else "eager_invocations"] += 1
-                    start = engine.start_boundary(host_launch, name + ":host_submit")
-                    if captured:
-                        graph_launch[capture_key] = (host_launch, start)
-                    host_submits.append((replica, op.stage, start))
+                host_launch = self._submit_eager_host_launch(
+                    engine, stage_key, name, names, owner, prepared, deps,
+                    captured, capture_key, scope, graph_launch, host_submits)
                 deps.append(host_launch)
 
-            stage_stars = self.stars_queues.get(stage_key, ())
-            stars_issued: list[tuple[Any, Any, Any]] = []
-            if stage_stars and submit and not is_zero_kernel_view(op):
-                replay_slot = (
-                    (stage_key, "graph", capture_key)
-                    if captured else (stage_key, "eager", op.op_id)
-                )
-                if replay_slot not in step_replay_ids:
-                    rep_id = self._stars_replay_seq.get(stage_key, 0)
-                    self._stars_replay_seq[stage_key] = rep_id + 1
-                    step_replay_ids[replay_slot] = rep_id
-                self._stars_occ_seq += 1
-                desc_ready = host_launch if host_launch is not None else prepared
-                for die_rank, s_queue in stage_stars:
-                    s_rec, s_alloc = s_queue.issue_descriptor(
-                        engine, replay=step_replay_ids[replay_slot],
-                        stream=op.stream or "main",
-                        kernel_occurrence=self._stars_occ_seq,
-                        descriptor_ready=desc_ready, owner=owner, die=die_rank)
-                    stars_issued.append((s_queue, s_rec, s_alloc))
-                    deps.append(s_rec.issue_done_event)
+            stars_issued = self._issue_eager_descriptors(
+                engine, op, stage_key, owner, submit, captured, capture_key,
+                host_launch, prepared, deps, step_replay_ids)
 
             barrier_entry = schedule_eager_moe_split_barrier(
                 self, op, replica, scope, name, deps, ids
@@ -729,6 +714,78 @@ class Execution(_ContextMixin, _CohortMixin, _LazySubmitMixin):
             kv_layer_events=kv_layer_events,
             kv_writeback_events=kv_writeback_events,
             emitted_tokens=emitted_tokens)
+
+    def _prepare_iteration_work(self, work: IterationWork, replica: int) -> IterationWork:
+        if self._collectives is None:
+            if _NO_REV_OPS_CACHE.get(id(work.ops)) is not work.ops:
+                has_rev = any(
+                    op.metadata and meta_scan_flags(op.metadata)[1]
+                    for op in work.ops)
+                if has_rev:
+                    work = replace(work, ops=bind_cohort_traffic(
+                        self.case, {replica: work.ops})[replica])
+                else:
+                    mark_no_rev_collective(work.ops)
+        work = self._lower_local_tp_work(work, replica)
+        if (getattr(work, "recipe", None) != "source"
+                and getattr(work, "plan", None) is not None
+                and getattr(work.plan, "requests", ())):
+            self._active_requests = tuple(work.plan.requests)
+        if getattr(work, "padded_tokens", 0):
+            self._active_padded_tokens = int(work.padded_tokens)
+        return work
+
+    def _submit_eager_host_launch(
+        self, engine, stage_key, name, names, owner, prepared, deps,
+        captured, capture_key, scope, graph_launch, host_submits,
+    ):
+        if captured and capture_key in graph_launch:
+            host_launch, _start = graph_launch[capture_key]
+        else:
+            dies = self.stage_dies[stage_key]
+            duration = self.submission.launch_ms(dies, captured=captured)
+            host_deps = (prepared,) + ((self.hosts[stage_key],) if stage_key in self.hosts else ())
+            if captured and scope == "piecewise" and self.submission.piecewise_sync_ms > 0.0:
+                if deps:
+                    host_deps = tuple(deps) + host_deps
+                if self.submission_counts["graph_replays"] > 0:
+                    duration += float(self.submission.piecewise_sync_ms)
+            host_launch = engine.submit(name + ":submit", {names["host"]: duration},
+                                        after=host_deps, owner=owner)
+            self.hosts[stage_key] = host_launch
+            self.submission_counts["graph_replays" if captured else "eager_invocations"] += 1
+            start = engine.start_boundary(host_launch, name + ":host_submit")
+            if captured:
+                graph_launch[capture_key] = (host_launch, start)
+            host_submits.append((*stage_key, start))
+        return host_launch
+
+    def _issue_eager_descriptors(
+        self, engine, op, stage_key, owner, submit, captured, capture_key,
+        host_launch, prepared, deps, step_replay_ids,
+    ):
+        stage_stars = self.stars_queues.get(stage_key, ())
+        stars_issued: list[tuple[Any, Any, Any]] = []
+        if stage_stars and submit and not is_zero_kernel_view(op):
+            replay_slot = (
+                (stage_key, "graph", capture_key)
+                if captured else (stage_key, "eager", op.op_id)
+            )
+            if replay_slot not in step_replay_ids:
+                rep_id = self._stars_replay_seq.get(stage_key, 0)
+                self._stars_replay_seq[stage_key] = rep_id + 1
+                step_replay_ids[replay_slot] = rep_id
+            self._stars_occ_seq += 1
+            desc_ready = host_launch if host_launch is not None else prepared
+            for die_rank, s_queue in stage_stars:
+                s_rec, s_alloc = s_queue.issue_descriptor(
+                    engine, replay=step_replay_ids[replay_slot],
+                    stream=op.stream or "main",
+                    kernel_occurrence=self._stars_occ_seq,
+                    descriptor_ready=desc_ready, owner=owner, die=die_rank)
+                stars_issued.append((s_queue, s_rec, s_alloc))
+                deps.append(s_rec.issue_done_event)
+        return stars_issued
 
     def prepare_next(self, replica):
         if self.include_submission and self.case.runtime.async_scheduling:

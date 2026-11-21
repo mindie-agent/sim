@@ -192,7 +192,9 @@ def _build_staged(c: LinearAttentionContract, ctx: OperatorPlanningContext) -> O
     groups = 0
     counts: Counter[tuple[int, bool, bool]] = Counter()
     spans: list[tuple[int, tuple[int, bool, bool], int]] = []
-    for sequence, length in enumerate(c.lengths):
+    active_slots = (tuple(i for i, view in enumerate(ctx.requests) if not view.padding)
+                    if ctx.requests else range(len(c.lengths)))
+    for sequence, length in zip(active_slots, c.lengths, strict=True):
         first = min(length, group_rows)
         if length == first:
             series = ((1, (first, c.use_initial_state, c.output_final_state)),)
@@ -279,7 +281,8 @@ def _build_staged(c: LinearAttentionContract, ctx: OperatorPlanningContext) -> O
                   "launch_boundaries": ("ChunkGatedDeltaRule::Process",) if gdn else ("flash_kda_staged",),
                   "total_chunks": sum(ceil_div(length, c.bt) for length in c.lengths),
                   "persistent_ub_resident": False, "rolling_state_slot_bytes": rolling_slot,
-                  "rolling_state_gm_bytes": rolling_slot * len(c.lengths) * c.hv, **workspace},
+                  "rolling_state_gm_bytes": rolling_slot * (len(ctx.requests) or len(c.lengths)) * c.hv,
+                  **workspace},
         program=lower,
     )
 
@@ -379,6 +382,9 @@ class Arch22LinearAttentionStrategy:
         if not self.accepts(op, ctx) or isinstance(c, CausalConvContract):
             raise missing("linear_attention_arch22_abi_unsupported",
                           "The requested ABI or data route is unavailable on Arch22")
+        if not c.lengths:
+            return make_plan(ctx, c.abi or c.operation, (),
+                             metadata={"total_chunks": 0, "state_contraction_ops": 0})
         if c.operation.endswith("_prefill"):
             return _build_staged(c, ctx)
         return _build_recurrent(c, ctx)

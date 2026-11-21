@@ -20,7 +20,7 @@ from _support.captures import REPO_ROOT
 from _support.hardware import sku_case
 from mindie_sim import compose_case, graph_costs
 from mindie_sim.catalog.attention_common import dcp_partial_merge_ops
-from mindie_sim.prediction.attention import gqa
+from mindie_sim.prediction.operators.attention.attention import gqa
 from mindie_sim.prediction.engine import Engine, Resource
 from mindie_sim.prediction.frontend import Frontend
 from mindie_sim.prediction.mechanism import Geometry

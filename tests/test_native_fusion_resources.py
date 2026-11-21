@@ -6,8 +6,8 @@ from pathlib import Path
 import pytest
 
 from mindie_sim import graph_costs
-from mindie_sim.prediction.native_fusion import _groups, lower_native_fusions
-from mindie_sim.prediction.native_fusion_traffic import apply_traffic_profile
+from mindie_sim.prediction.operators.hyper_connections.native_fusion import _groups, lower_native_fusions
+from mindie_sim.prediction.operators.hyper_connections.native_fusion_traffic import apply_traffic_profile
 from mindie_sim.prediction.operator_analysis import target_graphs, target_operators
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.structure_physical import node_physical
@@ -65,7 +65,7 @@ def test_receive_only_kimi_rank_preserves_expert_fusion_without_local_situ():
 
 
 def test_hc_fusion_runs_one_launch_with_source_gram_and_external_outputs():
-    from mindie_sim.prediction.family_hc import pre_phase_work
+    from mindie_sim.prediction.operators.hyper_connections.family_hc import pre_phase_work
     from mindie_sim.prediction.mechanism import Geometry
 
     # Explicit test supply for the source's HF32 projection phase; not an A3
@@ -143,8 +143,8 @@ def test_extended_resource_demand_adds_to_existing_phase_work():
     physical = lower_native_fusions(members, case.runtime)
     reference = graph_costs(case, members, external_inputs=_external(members), isolated=False)
     selected = graph_costs(case, physical, external_inputs=_external(members), isolated=False)
-    assert selected["execution"]["serviced"]["vector@r0:s0"] == (
-        reference["execution"]["serviced"]["vector@r0:s0"])
+    assert selected["execution"]["serviced"]["vector@r0:s0"] == pytest.approx(
+        reference["execution"]["serviced"]["vector@r0:s0"], rel=1e-12)
     assert physical[0].vector_ops == sum(op.vector_ops for op in members) + 1000
 
 

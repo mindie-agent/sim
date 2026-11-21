@@ -64,13 +64,13 @@ def test_a5_resize_preserves_declared_link_semantics(sku):
 
 @pytest.mark.parametrize("sku", ["Ascend910B1", "Ascend910_9362"])
 def test_a2_a3_resize_preserves_per_port_semantics(sku):
-    case = _case("deepseek-v3.2", sku, tp=2, dp=2, ep=2, layers=4,
-                 num_devices=4)
-    parsed = parse_case(case)
-    machine = materialize_machine_for_devices(parsed, case, 8)
+    case = _case("deepseek-v3.2", sku, tp=2, dp=2, ep=2, layers=4, num_devices=4)
+    machine = materialize_machine_for_devices(parse_case(case), case, 8)
     assert len(machine.dies) == 8
     intra = [link for link in machine.links if link.channel == "d2d_intra_node"]
-    assert intra and all(link.semantics == "per_port" for link in intra)
+    semantics, rates = ("per_pair", (18.2e6, 24e6)) if sku == "Ascend910B1" else ("per_port", (196e6, 196e6))
+    assert intra and all(link.semantics == semantics for link in intra)
+    assert all((link.capacity_bytes_per_ms, link.effective_peak_capacity_bytes_per_ms) == pytest.approx(rates) for link in intra)
 
 
 def test_resize_8_to_2_4_16_64_and_legacy_channel_roundtrip():

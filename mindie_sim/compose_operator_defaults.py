@@ -24,7 +24,7 @@ from mindie_sim.prediction.implementation_selection import (
     selected_note,
     with_automatic_lowering,
 )
-from mindie_sim.prediction.family_mqsmla import (
+from mindie_sim.prediction.operators.paged_mla.family_mqsmla import (
     FORMATS as MQSMLA_CACHE_FORMATS,
     NATIVE_KIND as MQSMLA_NATIVE,
     RECIPE as MQSMLA_RECIPE,
@@ -291,7 +291,7 @@ def mqsmla_default(case, kernels):
     layers = v41_cached_layers(case)
     if not layers or not any(p.compressor_kind == "gated_ring" for p in layers):
         return None
-    from mindie_sim.prediction.mla_epilogs import raw_eager_requested
+    from mindie_sim.prediction.operators.mla.mla_epilogs import raw_eager_requested
     if raw_eager_requested(case.runtime):
         return {"family": MQSMLA_FAMILY, "selection": "preserved",
                 "reason": "raw_eager_requested", "degraded": True, "installed": False}
@@ -342,7 +342,7 @@ def lightning_indexer_reason(case, layers):
     declared layer is probed at the smallest and the largest reachable decode
     row count; both bounds are real iteration geometries.
     """
-    from mindie_sim.prediction.generic_latent_attention import index_cache_format
+    from mindie_sim.prediction.operators.mla.generic_latent_attention import index_cache_format
     from mindie_sim.prediction.operators.sparse_indexer import bf16_lightning as li
     from mindie_sim.prediction.mechanism import Geometry
     fmt = index_cache_format(case.model)
@@ -402,7 +402,7 @@ def lightning_indexer_default(case, kernels):
     layers = [p for p in case.model.layer_plans if p.indexer and p.index_kpool == 1]
     if not layers:
         return None
-    from mindie_sim.prediction.mla_epilogs import raw_eager_requested
+    from mindie_sim.prediction.operators.mla.mla_epilogs import raw_eager_requested
     if raw_eager_requested(case.runtime):
         return {"family": LIGHTNING_INDEXER_FAMILY, "selection": "preserved",
                 "reason": "raw_eager_requested", "degraded": True}

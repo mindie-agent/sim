@@ -5,8 +5,8 @@
   sync, directional HBM bus specs and upstream source citations strictly from
   declared ``ComputeArchSpec`` and ``Device`` records.
 [Invariants] Zero SKU-name, ``arch_family``, ``compute_peaks`` or
-  ``service_modes`` capability sniffing. Direct routes (``l0c->ub``,
-  ``ub->l1``) exist only when explicitly declared on ``ComputeArchSpec.paths``;
+  ``service_modes`` capability sniffing. Direct routes come from the
+  declared architecture and its registered local copy paths;
   missing physical routes raise ``UnmodeledCapabilityError``. Representative
   multi-die stages require homogeneous ``compute_arch`` and datapath signatures.
 [Timeouts & Locks] Pure metadata derivation over finite device tuples; no I/O
@@ -21,6 +21,7 @@ from typing import Any, NewType
 
 from .common import ModelingError
 from .compute_arch import ComputeArchSpec, DataPath
+from .compute_arch_presets import preset_datapath_parts
 from .device_input import (
     DeviceInput,
     DispatchSyncSpec,
@@ -40,6 +41,7 @@ BITS_PER_BYTE = 8
 DEFAULT_ELEMENT_BITS = 16
 PAIR_ARITY = 2
 TILE_3D_ARITY = 3
+DAV_2201_FUSED_L1_RESERVE_BYTES = 256
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,49 +168,43 @@ class DatapathCapabilitySpec:
         )
 
     def _validate_route_owner(self, path: DataPath, src: str, dst: str, owner_group: Any) -> None:
-        aic_to_aivs = {int(aic): frozenset(int(a) for a in aivs) for aic, aivs in self.aic_aiv_pairs}
-        named_pair: tuple[int, int] | None = None
-        if isinstance(owner_group, Mapping):
-            if "aic" in owner_group or "aiv" in owner_group:
-                named_pair = (owner_group.get("aic"), owner_group.get("aiv"))
-                pair = named_pair
-            else:
-                src_v, dst_v = owner_group.get("src"), owner_group.get("dst")
-                pair = (src_v, dst_v)
-        elif isinstance(owner_group, (tuple, list)):
-            pair = tuple(owner_group)
-        elif isinstance(owner_group, int) and not isinstance(owner_group, bool):
-            limit = self.aic_count if path.executor == "aic" else self.aiv_count
-            if not (0 <= owner_group < limit):
-                raise self._route_err(
-                    f"datapath_route_owner_unreachable:{src}->{dst}:{owner_group}",
-                    f"owner {owner_group} outside [0, {limit}) for {path.executor}",
-                )
-            return
-        else:
-            raise self._route_err(f"datapath_route_owner_invalid:{src}->{dst}", f"invalid owner_group {owner_group!r}")
-        if set(path.reach) == {"aic", "aiv"}:
-            if len(pair) != PAIR_ARITY or any(isinstance(v, bool) or not isinstance(v, int) for v in pair):
-                raise self._route_err(
-                    f"datapath_route_owner_invalid:{src}->{dst}",
-                    f"cross-core path {src}->{dst} requires (src_core, dst_core) ints",
-                )
-            if named_pair is not None:
-                aic_id, aiv_id = named_pair
-            else:
-                aic_id, aiv_id = (pair[1], pair[0]) if src == "ub" else (pair[0], pair[1])
-            if not (0 <= aic_id < self.aic_count and aiv_id in aic_to_aivs.get(aic_id, frozenset())):
-                raise self._route_err(
-                    f"datapath_route_owner_unreachable:{src}->{dst}:{aic_id}->{aiv_id}",
-                    f"arch {self.arch_id} AIC {aic_id} cannot reach AIV {aiv_id}",
-                )
-            return
+        cross_core = set(path.reach) == {"aic", "aiv"}
         limit = self.aic_count if path.executor == "aic" else self.aiv_count
-        if not pair or any(isinstance(v, bool) or not isinstance(v, int) or not (0 <= v < limit) for v in pair):
-            raise self._route_err(
-                f"datapath_route_owner_unreachable:{src}->{dst}",
-                f"owner_group {pair!r} outside [0, {limit}) for {path.executor}",
-            )
+
+        def valid(owner, count):
+            return type(owner) is int and 0 <= owner < count
+
+        if type(owner_group) is int:
+            if valid(owner_group, limit) and (
+                not cross_core or any(
+                    valid(aic, self.aic_count) and valid(aiv, self.aiv_count)
+                    and owner_group == (aic if path.executor == "aic" else aiv)
+                    for aic, aivs in self.aic_aiv_pairs for aiv in aivs
+                )
+            ):
+                return
+        else:
+            if isinstance(owner_group, Mapping):
+                named = "aic" in owner_group or "aiv" in owner_group
+                pair = tuple(owner_group.get(key) for key in (("aic", "aiv") if named else ("src", "dst")))
+            else:
+                named = False
+                pair = tuple(owner_group) if isinstance(owner_group, (tuple, list)) else ()
+            if cross_core:
+                if len(pair) != PAIR_ARITY or any(type(owner) is not int for owner in pair):
+                    raise self._route_err(f"datapath_route_owner_invalid:{src}->{dst}",
+                                          "cross-core paths require two integer owners")
+                aic, aiv = pair[::-1] if src == "ub" and not named else pair
+                if (valid(aic, self.aic_count) and valid(aiv, self.aiv_count)
+                        and any(aic == core and aiv in lanes for core, lanes in self.aic_aiv_pairs)):
+                    return
+            elif (pair and all(valid(owner, limit) for owner in pair)
+                  and (src != dst or len(set(pair)) == 1)):
+                return
+        raise self._route_err(
+            f"datapath_route_owner_unreachable:{src}->{dst}:{owner_group}",
+            f"owner {owner_group!r} cannot reach {src}->{dst} on {self.arch_id}",
+        )
 
     def _validate_route_tile(
         self, path: DataPath, src: str, dst: str, rep: str, elem_bits: int, tile: Any
@@ -227,8 +223,11 @@ class DatapathCapabilitySpec:
                     f"datapath_route_tile_invalid:{src}->{dst}",
                     f"tile dimensions {tile!r} must be positive integers",
                 )
-            if (src == "l0c" or dst == "l0c") and self.subtile_wave:
-                wave = next((w for w in self.subtile_wave if w.native_mode == rep), self.subtile_wave[0])
+            if src == "l0c" or dst == "l0c":
+                wave = next((w for w in self.subtile_wave if w.native_mode == rep), None)
+                if wave is None:
+                    raise self._route_err(f"datapath_subtile_wave_undeclared:{rep}",
+                                          f"arch {self.arch_id} has no native wave for {rep!r}")
                 if (len(tile) < PAIR_ARITY
                         or tile[0] % wave.independently_issuable_m != 0
                         or tile[1] % wave.tile_n != 0
@@ -302,26 +301,25 @@ class DatapathCapabilitySpec:
         owner: Any = None,
         kernel: Any = None,
     ) -> int:
-        """Return usable per-owner bytes for ``pool`` after SIMT UB carveout."""
+        """Return per-owner capacity after any kernel ABI reservation."""
         del owner
         pool_key = str(pool).strip().lower()
         capacity = dict(self.buffers).get(pool_key)
         if capacity is None:
             raise ModelingError(f"datapath_buffer_pool_undeclared:{pool_key}")
-        is_simt = False
-        if isinstance(kernel, bool):
-            is_simt = kernel
-        elif isinstance(kernel, str):
-            is_simt = "simt" in kernel.lower()
-        elif isinstance(kernel, Mapping):
-            is_simt = bool(kernel.get("simt")) or "simt" in str(kernel.get("abi") or "").lower()
-        elif kernel is not None:
-            is_simt = bool(getattr(kernel, "simt", False)) or "simt" in str(
-                getattr(kernel, "abi", "") or getattr(kernel, "name", "")
-            ).lower()
-        if pool_key == "ub" and is_simt and self.simt_ub_carveout_bytes > 0:
-            return max(0, int(capacity) - int(self.simt_ub_carveout_bytes))
-        return max(0, int(capacity))
+        if isinstance(kernel, Mapping):
+            flag, abi = kernel.get, str(kernel.get("abi") or kernel.get("mode") or "").lower()
+        else:
+            flag = lambda key: getattr(kernel, key, False)
+            abi = (kernel if isinstance(kernel, str) else
+                   str(getattr(kernel, "abi", "") or getattr(kernel, "name", ""))).lower()
+        reserve = 0
+        if pool_key == "ub" and (kernel is True or flag("simt") or "simt" in abi):
+            reserve = self.simt_ub_carveout_bytes
+        elif (pool_key == "l1" and self.arch_id == "npu_arch_2201"
+              and (flag("fused") or "fused" in abi)):
+            reserve = DAV_2201_FUSED_L1_RESERVE_BYTES
+        return max(0, int(capacity) - reserve)
 
     @property
     def stars_spec(self) -> StarsSpec | None:
@@ -336,7 +334,7 @@ class DatapathCapabilitySpec:
             self.aic_count,
             self.aiv_count,
             self.aic_aiv_pairs,
-            tuple((p.name, p.source, p.target, p.unit, p.executor, p.sync)
+            tuple((p.name, p.source, p.target, p.unit, p.executor, p.sync, p.alignment_bytes)
                   for p in self.usable_paths),
             tuple(sorted(self.matrix_output_paths)),
             self.ub_peer_edges,
@@ -421,7 +419,8 @@ def datapath_for_die(
     identity = _arch_identity(spec)
     aic_count = int(die.compute_units)
     aiv_count = _aiv_count(die)
-    usable_paths = tuple(spec.paths)
+    local_paths, waves = preset_datapath_parts(spec.preset, die.subtile_wave)
+    usable_paths = (*spec.paths, *local_paths)
     hbm_rate = float(dict(die.rates).get("hbm", 0.0) or 0.0)
     hbm_read = float(die.hbm_read_bytes_per_s) if die.hbm_read_bytes_per_s is not None else hbm_rate
     hbm_write = float(die.hbm_write_bytes_per_s) if die.hbm_write_bytes_per_s is not None else hbm_rate
@@ -435,7 +434,7 @@ def datapath_for_die(
         ub_peer_edges=tuple(ub_peer_edges),
         stars=_stars_queue(die, usable_paths),
         simt_ub_carveout_bytes=int(die.simt_ub_carveout_bytes),
-        subtile_wave=tuple(die.subtile_wave),
+        subtile_wave=waves,
         dispatch_sync=die.dispatch_sync,
         hbm_rw_alpha=float(die.hbm_rw_alpha),
         hbm_read_bytes_per_s=hbm_read,
@@ -566,7 +565,7 @@ def _homogeneity_key(
         spec.aic_count,
         spec.aiv_count,
         spec.aic_aiv_pairs,
-        tuple((p.name, p.source, p.target, p.unit, p.executor, p.sync)
+        tuple((p.name, p.source, p.target, p.unit, p.executor, p.sync, p.alignment_bytes)
               for p in spec.usable_paths),
         tuple(sorted(spec.matrix_output_paths)),
         _ub_relative_connectivity(rank, spec.ub_peer_edges, stage_ranks),

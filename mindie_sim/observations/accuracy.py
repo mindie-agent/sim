@@ -405,3 +405,61 @@ def accuracy_report(campaign):
         "provenance": campaign.get("provenance", {}),
         "limits": campaign.get("limits", []),
     }
+
+
+_CLOCK_TELEMETRY_KEYS = (
+    "observed_aicore_freq_mhz",
+    "aicore_freq_mhz",
+    "device_aicore_freq_mhz",
+)
+
+
+def extract_observed_aicore_freq_mhz(envelope: Mapping | None) -> float | None:
+    """Extract observed AICore clock (MHz) from a silicon capture or msprof envelope."""
+    if not isinstance(envelope, Mapping):
+        return None
+    containers = [envelope]
+    for sub in ("device", "hardware", "metadata", "boundary", "telemetry", "clock"):
+        nested = envelope.get(sub)
+        if isinstance(nested, Mapping):
+            containers.append(nested)
+    for container in containers:
+        for key in _CLOCK_TELEMETRY_KEYS:
+            raw = container.get(key)
+            if raw is None or isinstance(raw, bool):
+                continue
+            val = float(raw)
+            if math.isfinite(val) and val > 0.0:
+                return val
+    return None
+
+
+def apply_capture_observed_clock(
+    case_dict: Mapping, envelope: Mapping | None,
+) -> dict:
+    """Return a copy of ``case_dict`` aligned with any capture-observed AICore clock."""
+    out = deepcopy(dict(case_dict))
+    observed = extract_observed_aicore_freq_mhz(envelope)
+    if observed is None:
+        return out
+    from mindie_sim.backends.ascend import apply_observed_aicore_clock, profiles
+
+    known = profiles()
+    for section_key in ("machine", "hardware"):
+        section = out.get(section_key)
+        if not isinstance(section, dict):
+            continue
+        device = section.setdefault("device", {})
+        if not isinstance(device, dict) or "observed_aicore_freq_mhz" in device:
+            return out
+        sku = section.get("sku")
+        if sku in known and ("compute_peaks" in device or "rates" in device):
+            section["device"] = apply_observed_aicore_clock(
+                {**device, "observed_aicore_freq_mhz": observed}, known[sku],
+            )
+        else:
+            device["observed_aicore_freq_mhz"] = observed
+        return out
+    if isinstance(out.get("device"), dict) and "observed_aicore_freq_mhz" not in out["device"]:
+        out["device"]["observed_aicore_freq_mhz"] = observed
+    return out

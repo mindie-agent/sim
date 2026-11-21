@@ -22,7 +22,7 @@ pytestmark = pytest.mark.tier0
 from mindie_sim.prediction.engine import Engine, Resource
 from mindie_sim.prediction.mechanism import Geometry
 from mindie_sim.prediction.operator_analysis import operator_costs
-from mindie_sim.prediction.operators import cuda_norm
+from mindie_sim.prediction.operators.vector import cuda_norm
 from mindie_sim.prediction.program import RecipeBook, RecipeContext
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.prediction.verification import verify_operator

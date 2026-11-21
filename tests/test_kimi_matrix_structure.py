@@ -78,7 +78,7 @@ def test_grouped_situ_declares_source_boundary_without_claiming_observed_routing
 
 
 def test_grouped_situ_contract_requires_native_precision_and_scale_domain():
-    from mindie_sim.prediction.native_fusion import _groups
+    from mindie_sim.prediction.operators.hyper_connections.native_fusion import _groups
     from mindie_sim.prediction.operator_analysis import target_operators
 
     declaration, _ = next(

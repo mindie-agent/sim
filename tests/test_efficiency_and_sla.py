@@ -209,10 +209,9 @@ def test_operator_four_dimensional_classification_pmu_and_executed_service():
     assert math.isclose(res_serv["t_hbm_ideal_ms"], 0.10, rel_tol=1e-9)
     assert math.isclose(res_serv["t_vec_ideal_ms"], 0.04, rel_tol=1e-9)
     assert math.isclose(res_serv["t_cube_ideal_ms"], 0.05, rel_tol=1e-9)
-    # M2 resolves an operator without a declared group axis against the
-    # slowest configured per-rank link (196 GB/s), not the machine-wide peak.
-    assert math.isclose(res_serv["t_link_ideal_ms"], 0.045714285714285714,
-                        rel_tol=1e-9)
+    # The configured HCCS_SW per-rank peak is 196 GB/s (Vol. 8 I-05).
+    assert link_peak == 196e9
+    assert math.isclose(res_serv["t_link_ideal_ms"], 0.02, rel_tol=1e-9)
 
     jn_row = {
         **serviced_row,

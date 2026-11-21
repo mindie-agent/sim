@@ -28,7 +28,7 @@ from mindie_sim.prediction.call import call_costs
 from mindie_sim.prediction.cost import CostModel, primitive_key
 from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.execution import Execution, SubmissionPolicy
-from mindie_sim.prediction.grouped_dequant import build as build_grouped_dequant
+from mindie_sim.prediction.operators.grouped_moe.grouped_dequant import build as build_grouped_dequant
 from mindie_sim.prediction.instructions import (
     CONTROL_INSTRUCTIONS, InstructionClass, InstructionCount, InstructionInventory,
     PrimitiveInventory)

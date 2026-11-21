@@ -219,7 +219,7 @@ def _normalize_parsed_case(case: Case) -> Case:
         model, runtime = sparse_offload.module.prepare_case(
             model, runtime, case.machine, case.workload, sparse_offload)
     elif "sparse_kv_offload" in dict(model.metadata) or "sparse_kv_offload" in dict(runtime.metadata):
-        from .sparse_kv_offload import strip_case
+        from mindie_sim.prediction.operators.sparse_indexer.sparse_kv_offload import strip_case
         model, runtime = strip_case(model, runtime)
     for index, layer in enumerate(model.layer_plans):
         if layer.index != index:

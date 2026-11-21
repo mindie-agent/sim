@@ -2,7 +2,7 @@
 
 This report covers the selected non-transposed BF16 ND no-quant branch of
 `moe_grouped_matmul` (`GMM_CUBE_IMP(false)`). The implementation is
-`mindie_sim/prediction/operators/grouped_gemm.py`; independent checks are in
+`mindie_sim/prediction/operators/grouped_moe/grouped_gemm.py`; independent checks are in
 `tests/operators/test_grouped_gemm.py`; the coordinator control report is
 `data/verification/operators/grouped_gemm.json`.
 

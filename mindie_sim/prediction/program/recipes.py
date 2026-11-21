@@ -19,90 +19,6 @@ from .stages import KernelProgram, Stage
 GENERIC_MATRIX_PROGRAM = "matmul"
 _SELECT_CACHE_LIMIT = 4096
 _EXPAND_CACHE_LIMIT = 16384
-_FP32_BYTES = 4
-_ONLINE_META_BYTES = 8
-
-
-def _build_decode_contract(spec) -> dict[str, Any]:
-    cache, slots = spec.kv_cache, spec.slots
-    outputs = tuple(spec.outputs)
-    rows = max((item.rows for item in outputs), default=0)
-    horizon = max((item.horizon for item in outputs), default=0)
-    full = min(spec.key_tile, max(1, horizon))
-    q_bytes = rows * spec.head_dim * spec.query_bytes
-    online = rows * (spec.head_dim * _FP32_BYTES + _ONLINE_META_BYTES)
-    scores = rows * full * _FP32_BYTES
-    p_l0a = rows * full * spec.query_bytes
-    pv_acc = rows * spec.head_dim * _FP32_BYTES
-    key = full * cache.key_payload_row
-    value = full * cache.value_payload_row
-    key_op = full * cache.key_operand_row if cache.needs_conversion else key
-    val_op = full * cache.value_operand_row if cache.needs_conversion else value
-    k_scale = full * cache.key_scale_row if cache.scale_scope == "row" else 0
-    v_scale = full * cache.value_scale_row if cache.scale_scope == "row" else 0
-    pages = cache.pages(0, horizon) if cache.paged else 0
-    page_scale = pages * cache.page_scale_bytes if cache.scale_scope == "page" else 0
-    k_conv = key_op if cache.needs_conversion else 0
-    v_conv = val_op if cache.needs_conversion else 0
-    cap = {
-        "l1": q_bytes + slots * (key + value),
-        "l0a": q_bytes + slots * p_l0a,
-        "l0b": slots * (key_op + val_op),
-        "l0c": slots * (scores + pv_acc),
-        "ub": online + page_scale + slots * (scores + k_conv + v_conv + k_scale + v_scale),
-    }
-    cap["total"] = sum(cap.values())
-    sl = "0..slots-1"
-    rows_spec = [
-        ("q_l1", "l1", q_bytes, "persistent", "q_load", "final"),
-        ("q_l0a", "l0a", q_bytes, "persistent", "q_load", "final"),
-        ("online_state", "ub", online, "persistent", "q_load", "final"),
-        ("scores", "l0c", scores, sl, "qk", "softmax"),
-        ("probs", "ub", scores, sl, "softmax", "online_update"),
-        ("p_l0a", "l0a", p_l0a, sl, "probability_operand", "pv"),
-        ("pv_acc", "l0c", pv_acc, sl, "v_load", "pv"),
-        ("k_l1", "l1", key, sl, "k_load", "dequant_k" if cache.needs_conversion else "qk"),
-        ("v_l1", "l1", value, sl, "v_load", "dequant_v" if cache.needs_conversion else "pv"),
-        ("k_l0b", "l0b", key_op, sl, "operand_k", "qk"),
-        ("v_l0b", "l0b", val_op, sl, "operand_v", "pv"),
-    ]
-    if cache.needs_conversion:
-        rows_spec.extend((
-            ("k_conv", "ub", k_conv, sl, "dequant_k", "operand_k"),
-            ("v_conv", "ub", v_conv, sl, "dequant_v", "operand_v"),
-        ))
-    if k_scale:
-        rows_spec.append(("k_scale", "ub", k_scale, sl, "k_scale_load", "dequant_k"))
-    if v_scale:
-        rows_spec.append(("v_scale", "ub", v_scale, sl, "v_scale_load", "dequant_v"))
-    if page_scale:
-        rows_spec.append(("page_scale", "ub", page_scale, "persistent", "page_access", "page_scale_release"))
-    buffers = tuple(
-        {"name": n, "pool": p, "bytes": b, "slot": s, "acquire": a, "free": f}
-        for n, p, b, s, a, f in rows_spec
-    )
-    rep = cache.report()
-    return {
-        "kv_cache_access": rep,
-        "conversion": {
-            "needs_conversion": cache.needs_conversion,
-            "query_dtype": cache.query_dtype,
-            "key_format": rep["key_format"],
-            "value_format": rep["value_format"],
-            "dequant_ops_per_element": cache.dequant_ops_per_element,
-            "elements_per_valid_row": (
-                (cache.head_dim - cache.key_suffix) + (cache.head_dim - cache.value_suffix)
-            ),
-            "operand_copy_pipe": "mte1" if cache.needs_conversion else "",
-            "scope": "on_chip_operand_materialization_no_hbm_writeback",
-        },
-        "workspace": {
-            "owner_slots": slots, "rows_per_owner": rows, "horizon": horizon,
-            "full_tile_rows": full, "capacity_bytes": cap,
-            "basis": "max declared output rows/tile per owner; slots reused",
-        },
-        "buffer_lifecycle": buffers,
-    }
 
 
 class RecipeBook:
@@ -117,15 +33,15 @@ class RecipeBook:
         programs: Mapping[str, Recipe] | None = None,
         family_registry: Any = None,
     ):
-        from ..batch_prefix_attention import RECIPE as _batch_prefix_attn
-        from ..batch_prefix_indexer import RECIPE as _batch_prefix_idx
-        from ..generic_latent_attention import build as _generic_latent_build
-        from ..matrix_mapping import MappedMatmul
-        from ..matrix_steady import SteadyMatmul
+        from mindie_sim.prediction.operators.attention.batch_prefix_attention import RECIPE as _batch_prefix_attn
+        from mindie_sim.prediction.operators.sparse_indexer.batch_prefix_indexer import RECIPE as _batch_prefix_idx
+        from mindie_sim.prediction.operators.mla.generic_latent_attention import build as _generic_latent_build
+        from mindie_sim.prediction.operators.matrix.matrix_mapping import MappedMatmul
+        from mindie_sim.prediction.operators.matrix.matrix_steady import SteadyMatmul
         from ..mechanism import PlannedRecipe as _PlannedRecipe
         from ..operators.registry import FamilyDispatcher, builtin_family_registry
         from ..physical_recipe_registry import physical_family_bindings, physical_recipe_bindings
-        from ..state_program import RecurrentVector
+        from mindie_sim.prediction.operators.recurrent.state_program import RecurrentVector
 
         generic_grouped = (programs or {}).get("matmul", MappedMatmul())
         self._generic_grouped = generic_grouped
@@ -175,60 +91,12 @@ class RecipeBook:
         return recipe
 
     def _governed_recipe(self, spec: Any, op):
-        from ..mechanism import PlannedRecipe
-
         cached = self._governed_recipes.get(spec.name)
         if cached is not None:
             return cached
-        from mindie_sim.schema.datapath import (
-            ArchId, ComputeArchIdentity, DatapathCapabilitySpec, GENERIC_ARCH_ID,
-        )
-        from ..operators.contracts import OperatorPlanningContext
-        from ..ownership import unit_group
-        from ..results import OpOccurrence
+        from ..operators.registry import make_governed_recipe
 
-        book, dispatcher = self, self._family_dispatcher
-
-        def _build(op, geometry):
-            datapath = getattr(geometry, "datapath", None)
-            if datapath is None and spec.name == "attention":
-                from ..operators.attention import _planning_context
-
-                geometry = _planning_context(op, geometry).geometry
-                datapath = geometry.datapath
-            if datapath is None:
-                arch = getattr(geometry, "compute_arch", None)
-                arch_id = ArchId(arch.preset) if arch is not None and arch.preset else GENERIC_ARCH_ID
-                paths = arch.paths if arch is not None else ()
-                aics = geometry.compute_units
-                aivs = geometry.resource_units.get("vector", aics if arch is not None else 0)
-                pairs = (
-                    tuple((aic, unit_group(aic, aics, aivs)) for aic in range(aics))
-                    if aics > 0 and aivs > 0 and aivs % aics == 0 else ()
-                )
-                datapath = DatapathCapabilitySpec(
-                    compute_arch=ComputeArchIdentity(arch_id, arch),
-                    aic_count=aics, aiv_count=aivs, aic_aiv_pairs=pairs, usable_paths=paths,
-                    matrix_output_paths=frozenset(path.target for path in paths if path.source == "l0c"),
-                    ub_peer_edges=(), stars=None, buffers=tuple(geometry.buffers.items()),
-                )
-            requested_abi = dict(op.metadata or ()).get("requested_abi")
-            ctx = OperatorPlanningContext(
-                occurrence=OpOccurrence(
-                    int(getattr(geometry, "replica", 0)),
-                    int(getattr(op, "stage", 0)),
-                    getattr(geometry, "rank", None),
-                    str(op.op_id),
-                ),
-                geometry=geometry, datapath=datapath, recipe_book=book,
-                requested_abi=str(requested_abi) if requested_abi else None,
-                stream_owners=getattr(geometry, "stream_owners", None),
-            )
-            return dispatcher.resolve_plan(op, ctx).recipe
-
-        planned = PlannedRecipe(
-            _build, traffic_rewrite_capable=bool(spec.traffic_rewrite_capable)
-        )
+        planned = make_governed_recipe(spec, self, self._family_dispatcher)
         self._governed_recipes[spec.name] = planned
         return planned
 
@@ -290,7 +158,7 @@ class RecipeBook:
         elif family_name in self._explicit_families and family_name != "grouped_gemm":
             recipe = self.families[op.family]
         elif family_name in {"gate_up_projection", "down_projection"}:
-            from ..shared_w4a8 import (
+            from mindie_sim.prediction.operators.mx_quant_matrix.shared_w4a8 import (
                 config_from_op as _shared_config,
                 matches_source_interface as _shared_match,
                 recipe as _shared_recipe,
@@ -309,7 +177,7 @@ class RecipeBook:
         ):
             recipe = self.families["grouped_gemm"]
             if self._family_kinds.get("grouped_gemm") == "ascend_mxa8w4_nznk":
-                from ..mxfp4_grouped import (
+                from mindie_sim.prediction.operators.mx_quant_matrix.mxfp4_grouped import (
                     config_from_op as _mxfp4_config, matches_source_interface,
                 )
                 if not matches_source_interface(op):
@@ -344,10 +212,10 @@ class RecipeBook:
             else:
                 recipe = resolve_physical_recipe(op)
         if "matrix_group_rows" in meta:
-            from ..grouped_rows import adapt
+            from mindie_sim.prediction.operators.grouped_moe.grouped_rows import adapt
             recipe = adapt(recipe, op)
         else:
-            from ..expected_grouped import adapt
+            from mindie_sim.prediction.operators.grouped_moe.expected_grouped import adapt
             recipe = adapt(recipe, op)
         return self._cache_select(op, recipe)
 
@@ -417,64 +285,37 @@ class RecipeBook:
 
     @classmethod
     def from_mapping(cls, raw, *, family_registry: Any = None):
-        from ..attention_decode import StagedGQADecode
-        from ..attention_prefill import StagedGQAPrefill
-        from ..batch_prefix_attention import BatchPrefixAttention
-        from ..batch_prefix_indexer import BatchPrefixIndexer
-        from ..bf16_grouped import recipe as bf16_grouped
+        from mindie_sim.prediction.operators.attention.attention_decode import StagedGQADecode
+        from mindie_sim.prediction.operators.attention.attention_prefill import StagedGQAPrefill
+        from mindie_sim.prediction.operators.attention.batch_prefix_attention import BatchPrefixAttention
+        from mindie_sim.prediction.operators.sparse_indexer.batch_prefix_indexer import BatchPrefixIndexer
+        from mindie_sim.prediction.operators.grouped_moe.bf16_grouped import recipe as bf16_grouped
         from ..collectives import PairwiseCollective, RingCollective
-        from ..direct_peer import DirectPeerCollective
-        from ..family_kda_recurrent import recipes as kda_recurrent_recipes
-        from ..hccl_graph import recipes as hccl_recipes
+        from mindie_sim.prediction.operators.collectives.direct_peer import DirectPeerCollective
+        from mindie_sim.prediction.operators.kda.family_kda_recurrent import recipes as kda_recurrent_recipes
+        from mindie_sim.prediction.operators.collectives.hccl_graph import recipes as hccl_recipes
         from ..implementations import recipes as implementation_recipes
-        from ..indexed_attention import recipe as indexed_attention
-        from ..indexed_quant_attention import recipe as indexed_quant_attention
-        from ..latent_dcp import recipes as latent_dcp_recipes
-        from ..matrix import HierarchicalMatmul, TiledMatmul
-        from ..matrix_mapping import MappedMatmul
-        from ..matrix_phase import PhaseMatmul
-        from ..matrix_steady import SteadyMatmul
-        from ..mc2_graph import recipes as native_moe_recipes
+        from mindie_sim.prediction.operators.paged_mla.indexed_attention import recipe as indexed_attention
+        from mindie_sim.prediction.operators.paged_mla.indexed_quant_attention import recipe as indexed_quant_attention
+        from mindie_sim.prediction.operators.mla.latent_dcp import recipes as latent_dcp_recipes
+        from mindie_sim.prediction.operators.matrix.matrix import HierarchicalMatmul, TiledMatmul
+        from mindie_sim.prediction.operators.matrix.matrix_mapping import MappedMatmul
+        from mindie_sim.prediction.operators.matrix.matrix_phase import PhaseMatmul
+        from mindie_sim.prediction.operators.matrix.matrix_steady import SteadyMatmul
+        from mindie_sim.prediction.operators.mc2.mc2_graph import recipes as native_moe_recipes
         from ..mechanism import OperatorPlan, PlannedRecipe
-        from ..mxfp4_grouped import recipe as mxa8w4_nznk
-        from ..mxfp8_grouped import recipe as mxfp8_grouped
+        from mindie_sim.prediction.operators.mx_quant_matrix.mxfp4_grouped import recipe as mxa8w4_nznk
+        from mindie_sim.prediction.operators.mx_quant_matrix.mxfp8_grouped import recipe as mxfp8_grouped
         from ..operators import grouped_moe, hyper_connections, linear_attention, mc2
         from ..operators.linear_attention.common import CHUNK32_KERNELS
         from ..pointwise import TiledPointwise
         from ..services import ResourceService
-        from ..sparse_kv_offload import recipes as sparse_kv_offload_recipes
-        from ..state_program import RecurrentVector
-        from ..tensor_copy import recipe as aiv_tensor_copy
+        from mindie_sim.prediction.operators.sparse_indexer.sparse_kv_offload import recipes as sparse_kv_offload_recipes
+        from mindie_sim.prediction.operators.recurrent.state_program import RecurrentVector
+        from mindie_sim.prediction.operators.vector.tensor_copy import recipe as aiv_tensor_copy
 
-        class _StagedGQADecodePlan(OperatorPlan):
-            """OperatorPlan adapter whose public program name stays recipe-like."""
-
-        _StagedGQADecodePlan.__name__ = "StagedGQADecode"
-
-        class _StagedGQAPrefillPlan(OperatorPlan):
-            """Prefill wrapper preserving the public recipe program name."""
-
-        _StagedGQAPrefillPlan.__name__ = "StagedGQAPrefill"
-
-        def staged_gqa_decode(**options):
-            source = StagedGQADecode(**options)
-
-            def build(op, geometry):
-                plan = source.build(op, geometry)
-                metadata = dict(plan.metadata)
-                metadata["decode_physical_contract"] = _build_decode_contract(source.spec(op))
-                return _StagedGQADecodePlan(plan.work, plan.program, metadata, plan.native)
-
-            return PlannedRecipe(build)
-
-        def staged_gqa_prefill(**options):
-            source = StagedGQAPrefill(**options)
-
-            def build(op, geometry):
-                plan = source.build(op, geometry)
-                return _StagedGQAPrefillPlan(plan.work, plan.program, plan.metadata, plan.native)
-
-            return PlannedRecipe(build)
+        from mindie_sim.prediction.operators.attention.attention_decode import staged_gqa_decode
+        from mindie_sim.prediction.operators.attention.attention_prefill import staged_gqa_prefill
 
         factories = {
             "tiled_matmul": TiledMatmul, "hierarchical_matmul": HierarchicalMatmul,
@@ -554,5 +395,5 @@ class RecurrentScan:
     """C1 -> vector delta -> C2 -> state update for each dependent chunk."""
 
     def lower(self, context: RecipeContext):
-        from ..recurrent_template import lower_recurrent_scan
+        from mindie_sim.prediction.operators.recurrent.recurrent_template import lower_recurrent_scan
         return lower_recurrent_scan(context)

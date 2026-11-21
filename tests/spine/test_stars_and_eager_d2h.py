@@ -107,8 +107,8 @@ def test_datapath_capabilities_and_route_argument_validation():
     dp_legacy = datapath_for_die(_make_machine(LEGACY_ARCH_SKU).dies[0])
     dp_next = datapath_for_die(_make_machine(NEXTGEN_ARCH_SKU).dies[0])
     assert dp_legacy.simt_ub_carveout_bytes == 0
-    assert dp_next.simt_ub_carveout_bytes == 16384
-    assert dp_next.usable_bytes("ub") - dp_next.usable_bytes("ub", kernel="simt") == 16384
+    assert dp_next.simt_ub_carveout_bytes == 32768
+    assert dp_next.usable_bytes("ub") - dp_next.usable_bytes("ub", kernel="simt") == 32768
 
     route_ok = dp_next.route(
         "l0c", "ub", representation="fp32", owner_group=(0, 1), tile=(16, 16)
@@ -121,7 +121,7 @@ def test_datapath_capabilities_and_route_argument_validation():
     with pytest.raises(UnmodeledCapabilityError, match="datapath_route_owner_unreachable"):
         dp_next.route("l0c", "ub", owner_group=(0, 47))
     with pytest.raises(UnmodeledCapabilityError, match="datapath_route_tile"):
-        dp_next.route("l0c", "ub", tile=(1, 1))
+        dp_next.route("l0c", "ub", representation="fp32", tile=(1, 1))
     # ub->l1 normalizes named owners once & validates BOTH src and dst buffer capacities (#7)
     assert dp_next.route("ub", "l1", owner_group={"aic": 1, "aiv": 2}).path.source == "ub"
     with pytest.raises(UnmodeledCapabilityError, match="datapath_route_owner_unreachable"):

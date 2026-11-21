@@ -18,6 +18,7 @@ from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.operators import OpSpec
 
 from ..contracts import OperatorPlanningContext
+from ..attention.common import planning_sequence_spans
 
 FAMILY = "paged_mla"
 CONTRACT_KEY = "paged_mla_contract"
@@ -119,6 +120,8 @@ class PagedMlaContract:
     def query_runs(self, seq: int) -> Iterator[tuple[int, int]]:
         """Yield the first query and number of queries sharing its inputs."""
         queries = self.sequences[seq][0]
+        if not queries:
+            return
         if any(_per_query(rows[seq], indices=indices) for rows, indices in (
             (self.n_ori, False), (self.n_cmp, False), (self.ori_indices, True), (self.cmp_indices, True),
         ) if isinstance(rows, tuple) and rows):
@@ -224,7 +227,7 @@ def _validate_bank_rows(c: PagedMlaContract, name: str, *, indices: bool = False
             _extent(name, value)
     return rows
 
-def _validate_mixed(c: PagedMlaContract) -> PagedMlaContract:
+def _validate_mixed(c: PagedMlaContract, *, capacity_extents: bool = False) -> PagedMlaContract:
     c = replace(c, **{
         name: _validate_bank_rows(c, name, indices=name.endswith("_indices"))
         for name in ("n_ori", "n_cmp", "ori_indices", "cmp_indices")
@@ -276,7 +279,7 @@ def _validate_mixed(c: PagedMlaContract) -> PagedMlaContract:
                                for rows in (c.n_ori, c.n_cmp))
         for query, _ in c.query_runs(seq):
             ori, cmp = c.bank_counts(seq, query)
-            if ori + cmp > kv or (not per_query_counts and ori + cmp != kv):
+            if ori + cmp > kv or (not capacity_extents and not per_query_counts and ori + cmp != kv):
                 raise ModelingError(f"paged_mla_sparse_pair_coverage:{seq}:{query}:{ori}+{cmp}:{kv}")
             for branch, count, indices, table in (
                 ("ori", ori, c.ori_indices, c.ori_block_table),
@@ -293,7 +296,7 @@ def _validate_mixed(c: PagedMlaContract) -> PagedMlaContract:
                     raise ModelingError(f"paged_mla_{branch}_block_table_len:{seq}:{query}")
     return c
 
-def validate_contract(c: PagedMlaContract) -> PagedMlaContract:
+def validate_contract(c: PagedMlaContract, *, capacity_extents: bool = False) -> PagedMlaContract:
     """Check shape, declared address coverage, and branch-local MQS attributes."""
     for name in ("logical_heads", "physical_heads", "latent_dim", "page_size", "s2_base_size", "splits"):
         _extent(name, getattr(c, name), 1)
@@ -321,7 +324,7 @@ def validate_contract(c: PagedMlaContract) -> PagedMlaContract:
     if c.mixed_quant:
         if c.block_table:
             raise ModelingError("paged_mla_mqsmla_requires_branch_local_block_tables")
-        c = _validate_mixed(c)
+        c = _validate_mixed(c, capacity_extents=capacity_extents)
     else:
         if c.kv_layout not in ("PA_BLK_BSND", "PA_BLK_NZ", "NZ_LATENT"):
             raise ModelingError(f"paged_mla_invalid_kv_layout:{c.kv_layout}")
@@ -384,7 +387,20 @@ def contract_for(op: OpSpec, ctx: OperatorPlanningContext) -> PagedMlaContract:
     requested = ctx.requested_abi or metadata.get("requested_abi")
     if requested and "abi" in raw and requested != raw["abi"]:
         raise capability_gap("paged_mla_abi_conflict", requested, ctx.compute_arch.arch_id)
-    return validate_contract(_from_mapping({**raw, **({"abi": requested} if requested else {})}))
+    c = _from_mapping({**raw, **({"abi": requested} if requested else {})})
+    spans = planning_sequence_spans(ctx, c.kv_layout or "PA_BLK_BSND")
+    if not spans:
+        return validate_contract(c)
+    sequences = tuple((q, kv) for q, kv, _, _, _ in spans)
+    active = sum(not span[-1] for span in spans)
+    padded_fields = {}
+    for name in ("block_table", "ori_block_table", "cmp_block_table", "ori_indices", "cmp_indices", "n_ori", "n_cmp"):
+        rows = getattr(c, name)
+        if isinstance(rows, tuple) and rows and len(rows) == active and active < len(spans):
+            values = iter(rows)
+            fill = 0 if name in {"n_ori", "n_cmp"} else ()
+            padded_fields[name] = tuple(fill if span[-1] else next(values) for span in spans)
+    return validate_contract(replace(c, sequences=sequences, **padded_fields), capacity_extents=True)
 
 def make_op(
     contract: PagedMlaContract | Mapping | None = None, *,

@@ -15,10 +15,10 @@ import test_v0919_final_delta_math as prior
 import _support.operator_calibration_helpers as a
 import _support.operator_calibration_helpers as b
 from mindie_sim.catalog.mqsmla_layout import packed_row_parts
-from mindie_sim.prediction import family_mqsmla, index_pool_native, latent_dcp, mqsmla
-from mindie_sim.prediction.batch_prefix_attention import nested_prefix_union
+from mindie_sim.prediction.operators.paged_mla import family_mqsmla, mqsmla; from mindie_sim.prediction.operators.sparse_indexer import index_pool_native; from mindie_sim.prediction.operators.mla import latent_dcp
+from mindie_sim.prediction.operators.attention.batch_prefix_attention import nested_prefix_union
 from mindie_sim.prediction.rank_ledger import rank_ledger_for
-from mindie_sim.prediction.index_pool import native_shard_sizes
+from mindie_sim.prediction.operators.sparse_indexer.index_pool import native_shard_sizes
 from mindie_sim.prediction.lowering import Builder
 from mindie_sim.prediction.pd_ranges import transfers_for_runs
 from mindie_sim.schema.workload import RequestView
@@ -206,9 +206,9 @@ def test_legacy_dsl_mqsmla_contract_rejects_cann_only_row_widths():
 
 
 def test_glm_mixed_prefill_decode_kda_eliminates_standalone_qk_l2norm():
-    from mindie_sim.prediction.attention import AttentionPolicy
+    from mindie_sim.prediction.operators.attention.attention import AttentionPolicy
     from mindie_sim.prediction.implementation_selection import resolve
-    from mindie_sim.prediction.recurrent import linear
+    from mindie_sim.prediction.operators.recurrent.recurrent import linear
     from mindie_sim.prediction.transforms import lower_implementations
 
     raw = prior.compose_case(

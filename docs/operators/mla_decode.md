@@ -410,7 +410,7 @@ SHA256 of the delivered machine-readable/code files:
 
 | File | SHA256 |
 |---|---|
-| `mindie_sim/prediction/operators/mla_decode.py` | `51d6b0adc140ab1f78da4f300213f16bd82acf9e8f9a9428e1a6f37619f4a180` |
+| `mindie_sim/prediction/operators/mla/mla_decode.py` | `51d6b0adc140ab1f78da4f300213f16bd82acf9e8f9a9428e1a6f37619f4a180` |
 | `tests/operators/test_mla_decode.py` | `d0a424a4c1f693b24819dde7fab0fa2672c8ebf6beeb4979f1eda227c38d2ca7` |
 
 `data/verification/operators/mla_decode.json` is the unmodified runner's

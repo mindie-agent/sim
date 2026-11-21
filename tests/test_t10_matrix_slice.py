@@ -31,12 +31,12 @@ import pytest
 from mindie_sim.catalog.ops import gemm_op
 from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.prediction.engine import Engine, ExecutionError, Resource
-from mindie_sim.prediction.matrix import HierarchicalMatmul
-from mindie_sim.prediction.matrix_mapping import (
+from mindie_sim.prediction.operators.matrix.matrix import HierarchicalMatmul
+from mindie_sim.prediction.operators.matrix.matrix_mapping import (
     MappedMatmul, MatrixGeometry, grouped_owner_rectangles, grouped_owner_tiles,
     matrix_geometry, owner_tiles, physical_owner_rate, simulate_matrix_operator,
 )
-from mindie_sim.prediction.matrix_steady import SteadyMatmul
+from mindie_sim.prediction.operators.matrix.matrix_steady import SteadyMatmul
 from mindie_sim.prediction.mechanism import Work
 from mindie_sim.prediction.program import RecipeContext
 from mindie_sim.prediction.services import (

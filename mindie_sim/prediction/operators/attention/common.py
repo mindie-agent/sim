@@ -20,12 +20,13 @@ from mindie_sim.public.errors import UnmodeledCapabilityError
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.operators import OpSpec
+from mindie_sim.schema.workload import RequestView
 from ...mechanism import Geometry, OperatorPlan, Work
 from ...ownership import read_role, unit_group
-from ...program import KernelProgram, ParallelProgram, RecipeContext, Stage
+from ...program import KernelProgram, ParallelProgram, PipelineProgram, RecipeContext, Stage
 from ...results import FusedPipelineDescriptor, FusedPipelineSpec, PipelinePhase, WorkItem
 from ...runtime.l2_residency import AdmissionMemoryView, bind_memory_access
-from ...runtime.memory_physics import AddressRun, AddressRunPlan, HbmBusSpec, MemoryAccessPattern, ReuseKey
+from ...runtime.memory_physics import AddressRun, AddressRunPlan, BoundAccess, HbmBusSpec, MemoryAccessPattern, ReuseKey
 from ...runtime.tile_solver import LiveBufferSpec, TileCandidate, TilePipelineSpec, TileShape, TileSolution, solve
 from ..contracts import OperatorPlanningContext
 from ._cp_tiling import (
@@ -61,9 +62,10 @@ C8_MODES = frozenset({QUANT_MODE_INT8_C8, QUANT_MODE_TQ4, QUANT_MODE_FP8_C8})
 MINDIE_V3_MODES = frozenset({
     QUANT_MODE_BF16, QUANT_MODE_MINDIE_FP8, QUANT_MODE_MXFP4_OCP, QUANT_MODE_MXFP4_CX,
 })
-TOKEN_MAJOR_LAYOUTS = frozenset({"BSH", "PA_BLK_BSND", "TND"})
+TOKEN_MAJOR_LAYOUTS = frozenset({"BSH", "BSND", "PA_BLK_BSND", "TND"})
 PAGED_LAYOUTS = frozenset({"PA_BLK_BSND", "PA_BLK_BHSD"})
 KV_LAYOUTS = TOKEN_MAJOR_LAYOUTS | {"BNSD", "PA_BLK_BHSD"}
+RECTANGULAR_SEQUENCE_LAYOUTS = frozenset({"BSND", "BNSD", "BSH", "PA_BLK_BSND"})
 FIA_TILE = 128
 FIA_PROBABILITY_SLOTS = 3
 WIDE_PANEL = 256
@@ -73,6 +75,94 @@ PROBABILITY_READY = 3
 PV_COMPLETE = 4
 BF16_BYTES = 2
 FP32_BYTES = 4
+
+
+def sequence_layout_spans(
+    requests: tuple[RequestView, ...], *, padded_tokens: int = 0, layout: str = "",
+) -> tuple[tuple[int, int, int, int, bool], ...]:
+    """Return logical lengths and physical GM token offsets in batch order.
+
+    The aggregate padded extent can reserve a tail beyond the request rows.
+    Only the per-request strides determine the start of the next request.
+    """
+    if padded_tokens < 0:
+        raise ModelingError("attention_negative_padded_tokens")
+    rectangular = layout.upper() in RECTANGULAR_SEQUENCE_LAYOUTS
+    q_offset = kv_offset = 0
+    spans = []
+    for request in requests:
+        q, kv = request.logical_q_len, request.kv_len
+        if not request.padding and (q <= 0 or kv <= 0):
+            raise ModelingError("attention_nonpositive_length")
+        spans.append((q, kv, q_offset, kv_offset, request.padding))
+        q_offset += request.physical_q_len if rectangular else q
+        kv_offset += request.physical_kv_len if rectangular else kv
+    return tuple(spans)
+
+
+def with_sequence_context(op: OpSpec, ctx: OperatorPlanningContext) -> OperatorPlanningContext:
+    """Carry the iteration's request views through the Geometry entrypoint."""
+    geometry = ctx.geometry
+    requests = ctx.requests or geometry.requests
+    if op.requests and requests:
+        ids = frozenset(op.requests)
+        if any(request.request_id in ids for request in requests):
+            requests = tuple(request for request in requests if request.padding or request.request_id in ids)
+    return replace(
+        ctx, requests=requests, padded_tokens=ctx.padded_tokens or geometry.padded_tokens,
+        layout=ctx.layout or geometry.layout,
+        admission_memory_view=(ctx.admission_memory_view if ctx.admission_memory_view is not None
+                               else geometry.admission_memory_view),
+    )
+
+
+def planning_sequence_spans(ctx: OperatorPlanningContext, default_layout: str = ""):
+    return sequence_layout_spans(ctx.requests, padded_tokens=ctx.padded_tokens, layout=ctx.layout or default_layout)
+
+
+def sequence_layout_metadata(ctx: OperatorPlanningContext, default_layout: str = "") -> dict:
+    if not ctx.requests:
+        return {}
+    layout = ctx.layout or default_layout
+    rectangular = layout.upper() in RECTANGULAR_SEQUENCE_LAYOUTS
+    spans = planning_sequence_spans(ctx, default_layout)
+    q_extent = sum(request.physical_q_len if rectangular else span[0]
+                   for request, span in zip(ctx.requests, spans, strict=True))
+    return {"sequence_layout_spans": spans, "layout": layout,
+            "padded_tokens": max(ctx.padded_tokens, q_extent)}
+
+
+def attention_owner_waves(items: int, owners: int, splits: int, launch) -> PipelineProgram:
+    """Allocate adjacent owners for each head/query tile's KV splits."""
+    groups = owners // splits
+    return PipelineProgram(ceil(items / groups), 1, lambda wave: tuple(
+        launch(index, group * splits, f"tile{group}")
+        for group, index in enumerate(range(wave * groups, min(items, (wave + 1) * groups)))
+    ))
+
+
+@dataclass(frozen=True, slots=True)
+class AttentionMemoryRead:
+    pattern: MemoryAccessPattern
+    bound: BoundAccess
+    capacity: int
+    hbm: str
+    ctx: OperatorPlanningContext
+
+    def start(self, engine, name, ready, *, owner=""):
+        view = self.ctx.admission_memory_view
+        if view is None:
+            views = getattr(engine, "_fia_admission", None)
+            if views is None:
+                views = engine._fia_admission = {}
+            die = self.pattern.die
+            key = (self.hbm, die)
+            view = views.get(key)
+            if view is None:
+                view = views[key] = AdmissionMemoryView({die: self.capacity})
+        return engine.submit_bound_access(
+            name, self.bound, after=(ready,), owner=owner, memory_state=view, pattern=self.pattern,
+        )
 INDEX_BYTES = 4
 SCALE_ADDRESS_BYTES = 8
 SOFTMAX_OPS = 5
@@ -132,12 +222,16 @@ class AttentionContract:
     kv_version: int = 0
     query_block_size: int | None = None
     dst_type_max: float = 0.0
+    block_table: tuple[tuple[int, ...], ...] = ()
 
     def __post_init__(self) -> None:
         if any(type(value) is not int or value < 1 for value in (
-            self.query_tokens, self.num_heads, self.num_kv_heads, self.head_dim, self.v_head_dim,
+            self.num_heads, self.num_kv_heads, self.head_dim, self.v_head_dim,
             self.block_size, self.splits, self.batch_size,
         )):
+            raise ModelingError("attention_positive_integer_geometry_required")
+        if (type(self.query_tokens) is not int or self.query_tokens < 0
+                or (not self.query_tokens and not self.sequences)):
             raise ModelingError("attention_positive_integer_geometry_required")
         if self.num_heads % self.num_kv_heads != 0:
             raise ModelingError("attention_head_group_divisibility_required")
@@ -154,6 +248,17 @@ class AttentionContract:
             raise ModelingError("attention_invalid_storage_contract")
         sequences = tuple(tuple(pair) for pair in self.sequences)
         object.__setattr__(self, "sequences", sequences)
+        table = tuple(self.block_table or ())
+        if table and type(table[0]) is int:
+            table = (table,)
+        try:
+            table = tuple(tuple(row) for row in table)
+        except TypeError as exc:
+            raise ModelingError("attention_fia_block_table_invalid") from exc
+        if table and (self.abi != FIA_ABI or self.kv_layout not in PAGED_LAYOUTS
+                      or any(type(block) is not int or block < 0 for row in table for block in row)):
+            raise ModelingError("attention_fia_block_table_invalid")
+        object.__setattr__(self, "block_table", table)
         if sequences and (
             any(len(pair) != 2 or any(type(n) is not int or n < 0 for n in pair) for pair in sequences)
             or any(self.causal and q > kv for q, kv in sequences)
@@ -189,6 +294,41 @@ class AttentionContract:
     @property
     def useful_flops(self) -> int:
         return 2 * self.num_heads * sum(self.row_counts()) * (self.head_dim + self.v_head_dim)
+
+
+def contract_for_requests(contract: AttentionContract, ctx: OperatorPlanningContext) -> AttentionContract:
+    spans = planning_sequence_spans(ctx, contract.kv_layout)
+    if not spans:
+        return contract
+    sequences = tuple((q, kv) for q, kv, _, _, _ in spans)
+    tokens = sum(q for q, _ in sequences)
+    lists = contract.selection_lists
+    if lists and len(lists) != tokens:
+        lists = tuple(row[:kv] for q, kv, offset, _, _ in spans for row in lists[offset:offset + q])
+        if len(lists) != tokens:
+            raise ModelingError("attention_selection_list_geometry_invalid")
+    elif lists:
+        lengths = (kv for q, kv, _, _, _ in spans for _ in range(q))
+        lists = tuple(row[:kv] for row, kv in zip(lists, lengths, strict=True))
+    table = contract.block_table
+    if table and len(table) == sum(not span[-1] for span in spans) < len(spans):
+        rows = iter(table)
+        table = tuple(() if span[-1] else next(rows) for span in spans)
+    return replace(contract, query_tokens=tokens, sequences=sequences, batch_size=len(spans),
+                   selection_lists=lists, block_table=table)
+
+
+def sparse_kv_extents(contract: AttentionContract, ctx: OperatorPlanningContext):
+    """Pair each visible KV count with its batch base and head stride."""
+    counts = contract.row_counts()
+    spans = planning_sequence_spans(ctx, contract.kv_layout)
+    if not spans:
+        yield from ((rows, 0, None) for rows in counts)
+        return
+    for request, (q, _, _, base, _) in zip(ctx.requests, spans, strict=True):
+        stride = request.physical_kv_len if contract.kv_layout == "BNSD" else None
+        for rows in islice(counts, q):
+            yield rows, base, stride
 
 
 def bsh_kv_access_plan(
@@ -269,7 +409,7 @@ def _selection_runs(addresses: Iterable[int], row_bytes: int) -> AddressRunPlan:
 def c8_gather_accounting(
     selection_lists: Iterable[Iterable[int] | AddressRunPlan] | None = None, *,
     quant_mode: int = QUANT_MODE_INT8_C8, query_tokens: int = 1, selected_tokens: int = 0,
-    memory_view: AdmissionMemoryView | None = None, l2_capacity_bytes: int = 0,
+    ctx: OperatorPlanningContext | None = None, l2_capacity_bytes: int = 0,
     tensor_id: str = "kv", die: int = 0, owner: int = 0,
 ) -> GatherAccounting:
     """Replay byte-address selections in query order through admission memory.
@@ -285,7 +425,7 @@ def c8_gather_accounting(
     if selection_lists is None:
         run = AddressRun(0, selected_tokens, row_bytes, stride)
         selection_lists = (AddressRunPlan((run,), alignment_bytes=SECTOR_BYTES) for _ in range(query_tokens))
-    view = memory_view if proven_addresses else None
+    view = ctx.admission_memory_view if proven_addresses and ctx is not None else None
     if proven_addresses and view is None and l2_capacity_bytes:
         view = AdmissionMemoryView({die: l2_capacity_bytes})
     key = ReuseKey(die, tensor_id, 0)
@@ -494,7 +634,10 @@ def make_plan(
     phases: tuple[AttentionPhase, ...], sources: tuple[SourceRef, ...], *,
     metadata: dict | None = None, work_items: int | None = None, program=None,
 ) -> OperatorPlan:
-    if program is None:
+    if not contract.query_tokens:
+        program = lambda _: KernelProgram(())
+        phases = ()
+    elif program is None:
         if work_items is None:
             work_items = contract.query_tokens * contract.num_kv_heads * contract.splits
         program = _AttentionProgramBuilder(
@@ -514,6 +657,7 @@ def make_plan(
         program,
         {"implementation": implementation, "abi": contract.abi, "execution_class": "mixed_aic_aiv",
          "arch_id": str(ctx.compute_arch.arch_id), "useful_flops": contract.useful_flops,
+         **sequence_layout_metadata(ctx, contract.kv_layout),
          **(metadata or {})},
         pipeline_spec=FusedPipelineSpec("attention", implementation, tuple(projection), sources),
     )

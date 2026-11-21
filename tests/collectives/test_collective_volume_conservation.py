@@ -32,13 +32,13 @@ from mindie_sim import (
 )
 from mindie_sim.prediction.cohort_traffic import bind_cohort_traffic
 from mindie_sim.prediction.collectives import PairwiseCollective
-from mindie_sim.prediction.direct_peer import DirectPeerGroup
+from mindie_sim.prediction.operators.collectives.direct_peer import DirectPeerGroup
 from mindie_sim.prediction.engine import Engine, Resource
-from mindie_sim.prediction.hccl_alltoallv import AlltoAllVGroup
-from mindie_sim.prediction.hccl_ccu_two_die import TEMPLATE
-from mindie_sim.prediction.hccl_contracts import select as hccl_select
-from mindie_sim.prediction.hccl_graph import lower as hccl_lower
-from mindie_sim.prediction.moe_token_partition import ALLTOALL_KIND
+from mindie_sim.prediction.operators.collectives.hccl_alltoallv import AlltoAllVGroup
+from mindie_sim.prediction.operators.collectives.hccl_ccu_two_die import TEMPLATE
+from mindie_sim.prediction.operators.collectives.hccl_contracts import select as hccl_select
+from mindie_sim.prediction.operators.collectives.hccl_graph import lower as hccl_lower
+from mindie_sim.prediction.operators.moe_routing.moe_token_partition import ALLTOALL_KIND
 from mindie_sim.prediction.pd_connector import PDConnector, PDHandoff, PDTransfer
 from mindie_sim.prediction.peer_traffic import PeerTraffic
 from mindie_sim.prediction.program import RecipeBook, RecipeContext

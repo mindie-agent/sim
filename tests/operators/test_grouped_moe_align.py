@@ -24,10 +24,10 @@ from mindie_sim import graph_costs, operator_costs, target_graphs, target_operat
 from mindie_sim.catalog.quant import quant_preset
 from mindie_sim.prediction.cost import CostModel
 from mindie_sim.prediction.execution import Execution
-from mindie_sim.prediction.family_moe_init import apply, capabilities
-from mindie_sim.prediction.moe_gating_fusion import absorb_init_routing
-from mindie_sim.prediction.moe_init_instructions import source_operations
-from mindie_sim.prediction.moe_init_mxfp8 import RECIPE, row_runs
+from mindie_sim.prediction.operators.moe_routing.family_moe_init import apply, capabilities
+from mindie_sim.prediction.operators.moe_routing.moe_gating_fusion import absorb_init_routing
+from mindie_sim.prediction.operators.moe_routing.moe_init_instructions import source_operations
+from mindie_sim.prediction.operators.moe_routing.moe_init_mxfp8 import RECIPE, row_runs
 from mindie_sim.prediction.program import RecipeBook
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError

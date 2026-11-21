@@ -7,14 +7,14 @@ from pathlib import Path
 import pytest
 
 from mindie_sim import operator_costs, target_graphs
-from mindie_sim.prediction.mxfp4_geometry import (
+from mindie_sim.prediction.operators.mx_quant_matrix.mxfp4_geometry import (
     Config, activation_l2_fraction, columns, effective_l2_bytes, owner_tiles,
     tile_work, weight_l2_fraction,
 )
 from mindie_sim.prediction.mechanism import Geometry
 from mindie_sim.prediction.structure import parse_case
-from mindie_sim.prediction.matrix import TiledMatmul
-from mindie_sim.prediction.mxfp4_grouped import UB_BYTES, recipe
+from mindie_sim.prediction.operators.matrix.matrix import TiledMatmul
+from mindie_sim.prediction.operators.mx_quant_matrix.mxfp4_grouped import UB_BYTES, recipe
 from mindie_sim.prediction.program import RecipeBook
 from mindie_sim.schema.common import ModelingError
 
@@ -188,7 +188,7 @@ def test_detailed_and_compressed_owner_work_and_no_double_floor(source_case, gat
 def test_l1_reuse_waits_for_cube_and_cube_waits_for_aiv_publish(gate):
     from mindie_sim.prediction.engine import Engine, Resource
     from mindie_sim.prediction.mechanism import Geometry
-    from mindie_sim.prediction.mxfp4_grouped import build
+    from mindie_sim.prediction.operators.mx_quant_matrix.mxfp4_grouped import build
     from mindie_sim.prediction.program import RecipeContext
     op = physical_op(gate, (1,), 128, 2048)
     register_roles = ("reg_data_writes", "reg_ub_accesses", "reg_ub_stores",

@@ -4,7 +4,7 @@ from copy import deepcopy
 import pytest
 
 from mindie_sim import operator_costs
-from mindie_sim.prediction.mxfp4_grouped import recipe
+from mindie_sim.prediction.operators.mx_quant_matrix.mxfp4_grouped import recipe
 from mindie_sim.prediction.program import RecipeBook
 from test_mxfp4_grouped import source_case, gate, physical_op
 

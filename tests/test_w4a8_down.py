@@ -8,7 +8,7 @@ import pytest
 from mindie_sim import graph_costs, predict
 from mindie_sim.prediction.operator_analysis import target_graphs, target_operators
 from mindie_sim.prediction.structure import parse_case
-from mindie_sim.prediction.w4a8_down import RECIPE, lower_op
+from mindie_sim.prediction.operators.mx_quant_matrix.w4a8_down import RECIPE, lower_op
 from mindie_sim.schema.common import ModelingError
 
 

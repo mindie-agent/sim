@@ -18,17 +18,17 @@ from _support.collective_cases import (
 
 from mindie_sim import graph_costs, target_graphs
 from mindie_sim.prediction.engine import Engine, Resource
-from mindie_sim.prediction.hccl_aicpu import contract as aicpu_contract
-from mindie_sim.prediction.hccl_alltoallv import AlltoAllVGroup, bind_local_work, peer_schedule
-from mindie_sim.prediction.hccl_alltoallv import contract as alltoallv_contract
-from mindie_sim.prediction.hccl_analytic_hierarchy import contract as analytic_contract
-from mindie_sim.prediction.hccl_analytic_hierarchy import groups, stages
-from mindie_sim.prediction.hccl_analytic_hierarchy import select as select_analytic
-from mindie_sim.prediction.hccl_contracts import select
-from mindie_sim.prediction.hccl_graph import lower
-from mindie_sim.prediction.hccl_hierarchy import contract as hierarchical_contract
-from mindie_sim.prediction.hccl_nhr import rounds
-from mindie_sim.prediction.hccl_source_shapes import rs_chunks, slice_sizes
+from mindie_sim.prediction.operators.collectives.hccl_aicpu import contract as aicpu_contract
+from mindie_sim.prediction.operators.collectives.hccl_alltoallv import AlltoAllVGroup, bind_local_work, peer_schedule
+from mindie_sim.prediction.operators.collectives.hccl_alltoallv import contract as alltoallv_contract
+from mindie_sim.prediction.operators.collectives.hccl_analytic_hierarchy import contract as analytic_contract
+from mindie_sim.prediction.operators.collectives.hccl_analytic_hierarchy import groups, stages
+from mindie_sim.prediction.operators.collectives.hccl_analytic_hierarchy import select as select_analytic
+from mindie_sim.prediction.operators.collectives.hccl_contracts import select
+from mindie_sim.prediction.operators.collectives.hccl_graph import lower
+from mindie_sim.prediction.operators.collectives.hccl_hierarchy import contract as hierarchical_contract
+from mindie_sim.prediction.operators.collectives.hccl_nhr import rounds
+from mindie_sim.prediction.operators.collectives.hccl_source_shapes import rs_chunks, slice_sizes
 from mindie_sim.prediction.program import RecipeContext
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError

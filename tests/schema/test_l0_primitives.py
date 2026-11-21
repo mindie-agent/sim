@@ -390,8 +390,11 @@ def test_production_stage_profile_engine_preserves_units_and_native_counters(reg
 
 def test_mmad_weight_conversion_prologues_finish_before_cube(register_device):
     table, dp = register_device
+    dec = dp.compute_arch.declared
+    no_mx = replace(dp, compute_arch=replace(dp.compute_arch, declared=replace(
+        dec, native_modes=tuple(m for m in dec.native_modes if "mxfp8" not in m.operands))))
     with pytest.raises(UnmodeledCapabilityError, match="native_matrix_mode_required:mxfp8"):
-        _lower("P06_mmad", dict(m=16, n=5, k=13, mode="a8w4_mx"), table, datapath=dp)
+        _lower("P06_mmad", dict(m=16, n=5, k=13, mode="a8w4_mx"), table, datapath=no_mx)
     for mode, end, expected in (("w4a8", "unpack:workspace_write", {"mte2_aiv": 33, "vec_alu": 130, "mte3": 65}),
                                 ("a8w4_mx", "mx:decompress_b", {"mte1": 75})):
         native = {"native_mode": "fp8_e4m3"} if mode == "a8w4_mx" else {}
@@ -594,5 +597,4 @@ def test_bench_idle_npu_parser_rejects_prefix_match_and_die_mismatch(register_de
     assert not PRIVATE_SOURCE.search(canonical_capture_bytes(CALIBRATED_REGISTER_SKU, {"meta": "192.0.2.7 /home" + "/u user@h"}).decode())
     with pytest.raises(ValueError, match="bench_sample_sku_mismatch"):
         build_primitive_table_payload(sku=CALIBRATED_REGISTER_SKU, cann_version="9", endpoint_alias="lab", campaign_id="c", raw_measurements={"device_name": REPRESENTATIVE_SKUS["a5"]})
-    assert register_device[0].cell("P20_host_dma_sync").band("host_h2d_bytes_per_s").certified_upper_capacity == pytest.approx(100.01e9)
-    assert not load_primitives("Ascend910_9382", datapath=_datapath("Ascend910_9382")).provenance.calibrated
+    assert register_device[0].cell("P20_host_dma_sync").band("host_h2d_bytes_per_s").certified_upper_capacity == pytest.approx(100.01e9) and not load_primitives("Ascend910_9382", datapath=_datapath("Ascend910_9382")).provenance.calibrated

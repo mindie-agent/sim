@@ -118,6 +118,7 @@ class Device:
     hbm_read_bytes_per_s: float | None = None
     hbm_write_bytes_per_s: float | None = None
     memory_access: MemoryAccessSpec | None = None
+    observed_aicore_freq_mhz: float | None = None
 
     @property
     def capability(self) -> ComputeArchSpec:
@@ -156,7 +157,8 @@ class Device:
                 self.physical_mechanisms.signature,
                 self.simt_ub_carveout_bytes, self.subtile_wave, self.dispatch_sync,
                 self.hbm_rw_alpha, self.hbm_read_bytes_per_s,
-                self.hbm_write_bytes_per_s, self.memory_access)
+                self.hbm_write_bytes_per_s, self.memory_access,
+                self.observed_aicore_freq_mhz)
 
     @property
     def hbm_bytes(self):
@@ -174,7 +176,7 @@ class Device:
         peaks = dict(self.compute_peaks)
         supply = dict(self.compute_peak_aliases)
         aliases = {"bfloat16": "bf16", "float16": "fp16", "float32": "fp32",
-                   "fp8_e4m3": "fp8", "fp8_e5m2": "fp8"}
+                   "fp8_e4m3": "fp8", "fp8_e5m2": "fp8", "hif8": "hifloat8"}
         native = (resolve_compute_peak_name(dtype, peaks, supply)
                   if supply else dtype)
         name = native if native in peaks else aliases.get(native, native)
@@ -275,6 +277,10 @@ class Device:
             result["hbm_write_bytes_per_s"] = self.hbm_write_bytes_per_s
         if self.memory_access is not None:
             result["memory_access"] = self.memory_access.to_dict()
+        if self.observed_aicore_freq_mhz is not None:
+            result["observed_aicore_freq_mhz"] = self.observed_aicore_freq_mhz
+            # The serialized supplies already use this clock.
+            result["aicore_freq_mhz"] = self.observed_aicore_freq_mhz
         return result
 
 
@@ -440,6 +446,8 @@ class Hardware:
             "device_arch_family": device.arch_family,
             "memory_bytes": device.memory_bytes,
             "compute_units": device.compute_units,
+            **({"observed_aicore_freq_mhz": device.observed_aicore_freq_mhz}
+               if device.observed_aicore_freq_mhz is not None else {}),
             "compute_peaks": dict(device.compute_peaks),
             "compute_peak_aliases": dict(device.compute_peak_aliases),
             "rates": dict(device.rates),
@@ -469,20 +477,7 @@ class Hardware:
         backend = raw_in.get("backend")
         raw_records = list(raw_in.get("devices", raw_in.get("dies", ())) or ())
         raw = materialize(raw_in)
-        allowed_semantics = {
-            "shared", "per_port", "per_pair", "direct", "fully_connected",
-            "mesh", "switched", "unknown", "none",
-        }
-        for name, channel in (raw.get("transfer_channels") or {}).items():
-            if not isinstance(channel, Mapping):
-                continue
-            for field_name in ("channel_semantics", "semantics"):
-                if field_name in channel and channel[field_name] not in allowed_semantics:
-                    raise ModelingError(
-                        f"transfer_channel_semantics_unsupported:{name}:{channel[field_name]}")
-            if "scope" in channel and channel["scope"] is not None:
-                from .hardware_links import normalize_link_scope
-                normalize_link_scope(channel["scope"])
+        _validate_transfer_channels(raw)
         count = int(raw.get("num_devices", len(raw.get("devices", raw.get("dies", ()))) or 1))
         ranks_per_node = int(raw.get("ranks_per_node", count))
         package = int(raw.get("dies_per_package", 1))
@@ -500,160 +495,8 @@ class Hardware:
             explicit_record = (raw_records[index]
                                if index < len(raw_records)
                                and isinstance(raw_records[index], Mapping) else {})
-            record_fields = {
-                key: value for key, value in explicit_record.items()
-                if key not in ("rank", "node", "package", "devices", "dies",
-                               "sku", "backend")
-            }
-            record_device = record_fields.pop("device", {})
-            explicit_decl = merge_device_inputs(
-                machine_explicit, record_fields, record_device)
-            record_backend = explicit_record.get("backend", backend)
-            record_sku = (explicit_record.get("sku")
-                          or raw_in.get("sku") or raw.get("sku", ""))
-            rec_base_aic = rec_base_aiv = 0
-            if backend:
-                local = materialize({
-                    "backend": record_backend, "sku": record_sku,
-                    "num_devices": 1, "device": explicit_decl,
-                })
-                data = dict(local.get("device", {}))
-                if not data:
-                    raise ModelingError(
-                        f"hardware_placement_sku_unmaterialized:{record_sku}")
-                if _has_core_override(explicit_decl):
-                    bare = dict(materialize({
-                        "backend": record_backend, "sku": record_sku,
-                        "num_devices": 1}).get("device", {}))
-                    rec_base_aic = int(bare.get("compute_units", 0) or 0)
-                    rec_base_aiv = int((bare.get("resource_units") or {}).get(
-                        "vector", rec_base_aic * 2) or (rec_base_aic * 2))
-                arch_family_local = str(local.get(
-                    "architecture", data.get("arch_family", "")))
-            else:
-                data = dict(explicit_decl)
-                arch_family_local = str(data.get("arch_family") or "generic")
-            for key in ("rank", "node", "package", "root_complex_id"):
-                value = explicit_record.get(key)
-                if value is not None:
-                    data[key] = value
-            data["sku"] = str(record_sku or data.get("sku", ""))
-            data["arch_family"] = arch_family_local
-            raw_cu = data.get("compute_units")
-            if raw_cu is not None and (isinstance(raw_cu, bool) or int(raw_cu) < 1):
-                raise ModelingError("compute_units_must_be_positive")
-            new_aic = int(raw_cu or 1)
-            if rec_base_aic > 0:
-                _scale_explicit_placement_device(
-                    data, explicit_decl, new_aic, rec_base_aic, rec_base_aiv)
-            arch_family = str(data.get("arch_family")
-                              or raw.get("architecture") or "generic")
-            arch = _resolve_device_compute_arch(data, raw, arch_family)
-            peaks = dict(data.get("compute_peaks", {}))
-            if arch.has_capabilities() and peaks and not arch.has_native_modes():
-                raise ModelingError(
-                    "compute_peaks_without_native_capability:"
-                    f"{data.get('sku', arch_family)}")
-            raw_aliases = data.get("compute_peak_aliases")
-            if raw_aliases is None:
-                raw_aliases = (explicit_record.get("compute_peak_aliases")
-                               or raw_in.get("compute_peak_aliases") or {})
-            aliases = dict(raw_aliases) if isinstance(raw_aliases, Mapping) else raw_aliases
-            validate_compute_peak_aliases(peaks, aliases, arch)
-            if arch.has_native_modes():
-                arch.validate_peaks(peaks, aliases=aliases)
-            arch_rates, arch_units, arch_work_units, arch_modes = arch.supplies(
-                int(data.get("compute_units", 1)), data.get("resource_units", {}),
-                data.get("rates", {}))
-            memory = int(data.get("memory_bytes", 0))
-            rates = {key: float(value)
-                     for key, value in {**arch_rates, **data.get("rates", {})}.items()}
-            if memory <= 0 or not peaks or "hbm" not in rates or "vector" not in rates:
-                raise ModelingError("device_requires_memory_compute_vector_and_memory_rates")
-            if any(not math.isfinite(value) or value <= 0
-                   for value in (*peaks.values(), *rates.values())):
-                raise ModelingError("device_rates_must_be_positive")
-            buffers = dict(data.get("buffers", {}))
-            units = {**arch_units, **data.get("resource_units", {})}
-            if any(value < 1 for value in units.values()):
-                raise ModelingError("resource_units_must_be_positive")
-            buffer_units = dict(data.get("buffer_units", {}))
-            if "l2" in buffers:
-                declared_l2_units = buffer_units.get("l2")
-                if declared_l2_units is not None and int(declared_l2_units) != 1:
-                    raise ModelingError("shared_l2_buffer_requires_one_die_owner")
-                buffer_units["l2"] = 1
-            modes = {**arch_modes, **{
-                name: {**arch_modes.get(name, {}), **mode}
-                for name, mode in data.get("service_modes", {}).items()}}
-            for name, mode in modes.items():
-                if (name in rates or mode["resource"] not in rates
-                        or not math.isfinite(mode["rate"]) or mode["rate"] <= 0):
-                    raise ModelingError(f"invalid_physical_service_mode:{name}")
-            work_units = {**arch_work_units, **data.get("work_units", {})}
-            for role, unit in work_units.items():
-                if role in NATIVE_WORK_UNITS and unit != NATIVE_WORK_UNITS[role]:
-                    raise ModelingError(f"native_work_unit_conflict:{role}")
-            mechanisms = parse_physical_mechanisms(
-                data.get("physical_mechanisms"),
-                fallback_l2_bytes=int(buffers.get("l2", 0)),
-                compute_arch=arch, buffer_units=buffer_units)
-            simt_carveout = int(data.get("simt_ub_carveout_bytes", 0) or 0)
-            if simt_carveout < 0:
-                raise ModelingError(f"simt_ub_carveout_bytes_negative:{simt_carveout}")
-            subtile_wave = parse_subtile_waves(data.get("subtile_wave"))
-            dispatch_sync = parse_dispatch_sync(data.get("dispatch_sync"))
-            hbm_rw_alpha = validate_hbm_rw_alpha(data.get("hbm_rw_alpha", 0.0))
-            hbm_read = _optional_pos_rate(data.get("hbm_read_bytes_per_s"), "hbm_read_bytes_per_s")
-            hbm_write = _optional_pos_rate(data.get("hbm_write_bytes_per_s"), "hbm_write_bytes_per_s")
-            memory_access = parse_memory_access(data.get("memory_access"))
-            rank, node, package_id = placements[index]
-            devices.append(Device(
-                rank=int(data.get("rank", rank)), memory_bytes=memory,
-                compute_peaks=tuple(sorted(peaks.items())),
-                rates=tuple(sorted(rates.items())),
-                buffers=tuple(sorted(buffers.items())),
-                compute_units=int(data.get("compute_units", 1) or 1),
-                launch_us=float(data.get("launch_us", 0)),
-                node=int(data.get("node", node)),
-                package=int(data.get("package", package_id)),
-                resource_units=tuple(sorted(units.items())),
-                buffer_units=tuple(sorted(buffer_units.items())),
-                service_modes=tuple(sorted((name, (mode["resource"], float(mode["rate"])))
-                                           for name, mode in modes.items())),
-                work_units=tuple(sorted(work_units.items())),
-                kernel_invocations=tuple(sorted(
-                    (key, InvocationTiming.from_mapping(value))
-                    for key, value in data.get("kernel_invocations", {}).items())),
-                store_queues=tuple(sorted((name, tuple(sorted(queue.items())))
-                                          for name, queue in data.get("store_queues", {}).items())),
-                compute_arch=arch,
-                compute_peak_aliases=tuple(sorted(dict(
-                    raw_aliases if isinstance(raw_aliases, Mapping) else
-                    tuple(raw_aliases or ())).items())),
-                linked_rate_overrides=tuple(sorted(
-                    s.name for s in arch.instruction_services
-                    if (s.scale_with or s.clock_hz is not None)
-                    and s.name in data.get("rates", {}))),
-                instruction_mode_overrides=tuple(sorted(
-                    s.name for s in arch.instruction_services
-                    if s.resource and "rate" in data.get("service_modes", {}).get(s.name, {}))),
-                instruction_unit_overrides=tuple(sorted(
-                    s.name for s in arch.instruction_services
-                    if (s.scale_with or s.clock_hz is not None)
-                    and s.name in data.get("resource_units", {}))),
-                sku=str(data.get("sku", "")),
-                arch_family=arch_family,
-                physical_mechanisms=mechanisms,
-                root_complex_id=str(data.get("root_complex_id") or DEFAULT_ROOT_COMPLEX_ID),
-                simt_ub_carveout_bytes=simt_carveout,
-                subtile_wave=subtile_wave,
-                dispatch_sync=dispatch_sync,
-                hbm_rw_alpha=hbm_rw_alpha,
-                hbm_read_bytes_per_s=hbm_read,
-                hbm_write_bytes_per_s=hbm_write,
-                memory_access=memory_access,
-            ))
+            devices.append(_parse_placement_device(
+                raw, raw_in, backend, machine_explicit, explicit_record, placements[index]))
         links = tuple(Link.from_mapping(link, default_members=range(len(devices)))
                       for link in raw.get("links", ()))
         if not backend or _network_override_keys(raw):
@@ -720,6 +563,214 @@ from .datapath import (
     resolve_device_compute_arch as _resolve_device_compute_arch,
     scale_explicit_placement_device as _scale_explicit_placement_device,
 )
+
+
+def _validate_transfer_channels(raw):
+    allowed_semantics = {
+        "shared", "per_port", "per_pair", "direct", "fully_connected",
+        "mesh", "switched", "unknown", "none",
+    }
+    for name, channel in (raw.get("transfer_channels") or {}).items():
+        if not isinstance(channel, Mapping):
+            continue
+        solo = _optional_pos_rate(channel.get("solo_effective_uni_bw_gbps"),
+                                  f"transfer_channel_solo_bw:{name}")
+        if solo is not None:
+            peak = _optional_pos_rate(channel.get("uni_peak_bw_gbps"),
+                                      f"transfer_channel_uni_peak_bw:{name}")
+            if peak is not None and solo > peak:
+                raise ModelingError(f"transfer_channel_solo_exceeds_uni_peak:{name}")
+        for field_name in ("channel_semantics", "semantics"):
+            if field_name in channel and channel[field_name] not in allowed_semantics:
+                raise ModelingError(
+                    f"transfer_channel_semantics_unsupported:{name}:{channel[field_name]}")
+        if "scope" in channel and channel["scope"] is not None:
+            from .hardware_links import normalize_link_scope
+            normalize_link_scope(channel["scope"])
+
+
+def _materialize_placement_device(raw, raw_in, backend, machine_explicit, explicit_record):
+    from mindie_sim.backends import materialize
+
+    record_fields = {
+        key: value for key, value in explicit_record.items()
+        if key not in ("rank", "node", "package", "devices", "dies",
+                       "sku", "backend")
+    }
+    record_device = record_fields.pop("device", {})
+    explicit_decl = merge_device_inputs(
+        machine_explicit, record_fields, record_device)
+    record_backend = explicit_record.get("backend", backend)
+    record_sku = (explicit_record.get("sku")
+                  or raw_in.get("sku") or raw.get("sku", ""))
+    rec_base_aic = rec_base_aiv = 0
+    if backend:
+        local = materialize({
+            "backend": record_backend, "sku": record_sku,
+            "num_devices": 1, "device": explicit_decl,
+        })
+        data = dict(local.get("device", {}))
+        if not data:
+            raise ModelingError(
+                f"hardware_placement_sku_unmaterialized:{record_sku}")
+        if _has_core_override(explicit_decl):
+            bare = dict(materialize({
+                "backend": record_backend, "sku": record_sku,
+                "num_devices": 1}).get("device", {}))
+            rec_base_aic = int(bare.get("compute_units", 0) or 0)
+            rec_base_aiv = int((bare.get("resource_units") or {}).get(
+                "vector", rec_base_aic * 2) or (rec_base_aic * 2))
+        arch_family_local = str(local.get(
+            "architecture", data.get("arch_family", "")))
+    else:
+        data = dict(explicit_decl)
+        arch_family_local = str(data.get("arch_family") or "generic")
+        if data.get("observed_aicore_freq_mhz") is not None:
+            from mindie_sim.backends.ascend import apply_observed_aicore_clock, profiles
+            profile = profiles().get(record_sku)
+            if profile is not None and profile["architecture"] == arch_family_local:
+                declaration = (raw.get("source") or {}).get("declaration", {})
+                reference_mhz = (declaration.get("configured_clock_mhz")
+                                 if record_sku == raw.get("sku") else None)
+                data = apply_observed_aicore_clock(
+                    data, profile, reference_mhz=reference_mhz)
+    for key in ("rank", "node", "package", "root_complex_id"):
+        value = explicit_record.get(key)
+        if value is not None:
+            data[key] = value
+    data["sku"] = str(record_sku or data.get("sku", ""))
+    data["arch_family"] = arch_family_local
+    raw_cu = data.get("compute_units")
+    if raw_cu is not None and (isinstance(raw_cu, bool) or int(raw_cu) < 1):
+        raise ModelingError("compute_units_must_be_positive")
+    new_aic = int(raw_cu or 1)
+    if rec_base_aic > 0:
+        _scale_explicit_placement_device(
+            data, explicit_decl, new_aic, rec_base_aic, rec_base_aiv)
+    arch_family = str(data.get("arch_family")
+                      or raw.get("architecture") or "generic")
+    arch_input = data.get("compute_arch") or {}
+    if (not backend and arch_family == "A5" and isinstance(arch_input, Mapping)
+            and not arch_input.get("native_compute")):
+        from mindie_sim.backends.ascend import registered_matrix_capability
+        capability = registered_matrix_capability(record_sku, arch_family, arch_input)
+        if capability:
+            data = merge_device_inputs({"compute_arch": capability}, data)
+    return data, arch_family
+
+
+def _parse_placement_device(raw, raw_in, backend, machine_explicit, explicit_record, placement):
+    data, arch_family = _materialize_placement_device(
+        raw, raw_in, backend, machine_explicit, explicit_record)
+    arch = _resolve_device_compute_arch(data, raw, arch_family)
+    peaks = dict(data.get("compute_peaks", {}))
+    if arch.has_capabilities() and peaks and not arch.has_native_modes():
+        raise ModelingError(
+            "compute_peaks_without_native_capability:"
+            f"{data.get('sku', arch_family)}")
+    raw_aliases = data.get("compute_peak_aliases")
+    if raw_aliases is None:
+        raw_aliases = (explicit_record.get("compute_peak_aliases")
+                       or raw_in.get("compute_peak_aliases") or {})
+    aliases = dict(raw_aliases) if isinstance(raw_aliases, Mapping) else raw_aliases
+    validate_compute_peak_aliases(peaks, aliases, arch)
+    if arch.has_native_modes():
+        arch.validate_peaks(peaks, aliases=aliases)
+    arch_rates, arch_units, arch_work_units, arch_modes = arch.supplies(
+        int(data.get("compute_units", 1)), data.get("resource_units", {}),
+        data.get("rates", {}))
+    memory = int(data.get("memory_bytes", 0))
+    rates = {key: float(value)
+             for key, value in {**arch_rates, **data.get("rates", {})}.items()}
+    if memory <= 0 or not peaks or "hbm" not in rates or "vector" not in rates:
+        raise ModelingError("device_requires_memory_compute_vector_and_memory_rates")
+    if any(not math.isfinite(value) or value <= 0
+           for value in (*peaks.values(), *rates.values())):
+        raise ModelingError("device_rates_must_be_positive")
+    buffers = dict(data.get("buffers", {}))
+    units = {**arch_units, **data.get("resource_units", {})}
+    if any(value < 1 for value in units.values()):
+        raise ModelingError("resource_units_must_be_positive")
+    buffer_units = dict(data.get("buffer_units", {}))
+    if "l2" in buffers:
+        declared_l2_units = buffer_units.get("l2")
+        if declared_l2_units is not None and int(declared_l2_units) != 1:
+            raise ModelingError("shared_l2_buffer_requires_one_die_owner")
+        buffer_units["l2"] = 1
+    modes = {**arch_modes, **{
+        name: {**arch_modes.get(name, {}), **mode}
+        for name, mode in data.get("service_modes", {}).items()}}
+    for name, mode in modes.items():
+        if (name in rates or mode["resource"] not in rates
+                or not math.isfinite(mode["rate"]) or mode["rate"] <= 0):
+            raise ModelingError(f"invalid_physical_service_mode:{name}")
+    work_units = {**arch_work_units, **data.get("work_units", {})}
+    for role, unit in work_units.items():
+        if role in NATIVE_WORK_UNITS and unit != NATIVE_WORK_UNITS[role]:
+            raise ModelingError(f"native_work_unit_conflict:{role}")
+    mechanisms = parse_physical_mechanisms(
+        data.get("physical_mechanisms"),
+        fallback_l2_bytes=int(buffers.get("l2", 0)),
+        compute_arch=arch, buffer_units=buffer_units)
+    simt_carveout = int(data.get("simt_ub_carveout_bytes", 0) or 0)
+    if simt_carveout < 0:
+        raise ModelingError(f"simt_ub_carveout_bytes_negative:{simt_carveout}")
+    subtile_wave = parse_subtile_waves(data.get("subtile_wave"))
+    dispatch_sync = parse_dispatch_sync(data.get("dispatch_sync"))
+    hbm_rw_alpha = validate_hbm_rw_alpha(data.get("hbm_rw_alpha", 0.0))
+    hbm_read = _optional_pos_rate(data.get("hbm_read_bytes_per_s"), "hbm_read_bytes_per_s")
+    hbm_write = _optional_pos_rate(data.get("hbm_write_bytes_per_s"), "hbm_write_bytes_per_s")
+    memory_access = parse_memory_access(data.get("memory_access"))
+    observed_freq = _optional_pos_rate(data.get("observed_aicore_freq_mhz"),
+                                       "observed_aicore_freq_mhz")
+    rank, node, package_id = placement
+    return Device(
+        rank=int(data.get("rank", rank)), memory_bytes=memory,
+        compute_peaks=tuple(sorted(peaks.items())),
+        rates=tuple(sorted(rates.items())),
+        buffers=tuple(sorted(buffers.items())),
+        compute_units=int(data.get("compute_units", 1) or 1),
+        launch_us=float(data.get("launch_us", 0)),
+        node=int(data.get("node", node)),
+        package=int(data.get("package", package_id)),
+        resource_units=tuple(sorted(units.items())),
+        buffer_units=tuple(sorted(buffer_units.items())),
+        service_modes=tuple(sorted((name, (mode["resource"], float(mode["rate"])))
+                                   for name, mode in modes.items())),
+        work_units=tuple(sorted(work_units.items())),
+        kernel_invocations=tuple(sorted(
+            (key, InvocationTiming.from_mapping(value))
+            for key, value in data.get("kernel_invocations", {}).items())),
+        store_queues=tuple(sorted((name, tuple(sorted(queue.items())))
+                                  for name, queue in data.get("store_queues", {}).items())),
+        compute_arch=arch,
+        compute_peak_aliases=tuple(sorted(dict(
+            raw_aliases if isinstance(raw_aliases, Mapping) else
+            tuple(raw_aliases or ())).items())),
+        linked_rate_overrides=tuple(sorted(
+            s.name for s in arch.instruction_services
+            if (s.scale_with or s.clock_hz is not None)
+            and s.name in data.get("rates", {}))),
+        instruction_mode_overrides=tuple(sorted(
+            s.name for s in arch.instruction_services
+            if s.resource and "rate" in data.get("service_modes", {}).get(s.name, {}))),
+        instruction_unit_overrides=tuple(sorted(
+            s.name for s in arch.instruction_services
+            if (s.scale_with or s.clock_hz is not None)
+            and s.name in data.get("resource_units", {}))),
+        sku=str(data.get("sku", "")),
+        arch_family=arch_family,
+        physical_mechanisms=mechanisms,
+        root_complex_id=str(data.get("root_complex_id") or DEFAULT_ROOT_COMPLEX_ID),
+        simt_ub_carveout_bytes=simt_carveout,
+        subtile_wave=subtile_wave,
+        dispatch_sync=dispatch_sync,
+        hbm_rw_alpha=hbm_rw_alpha,
+        hbm_read_bytes_per_s=hbm_read,
+        hbm_write_bytes_per_s=hbm_write,
+        memory_access=memory_access,
+        observed_aicore_freq_mhz=observed_freq,
+    )
 
 
 def parse_hardware(raw: Mapping) -> Hardware:

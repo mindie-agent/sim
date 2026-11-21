@@ -12,7 +12,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass
 
-from mindie_sim.prediction.call_grouped import (
+from mindie_sim.prediction.operators.grouped_moe.call_grouped import (
     API, NZ_LAYOUT, PRODUCER_SHA256, QuantizedGroupedCall,
     build_quantized_grouped_call,
 )

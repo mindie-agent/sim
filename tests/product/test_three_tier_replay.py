@@ -132,9 +132,9 @@ def test_parallel_completion_partitions_one_wall_clock():
 
 
 def test_shipping_regression_reports_measured_leave_one_out_culprit():
-    real = prepare_scenario(ScenarioRequest(
-        _case(REPRESENTATIVE_SKUS["a5"], tp=4), StepRequest("prefill", tokens=64),
-    ))
+    case, step = _case(REPRESENTATIVE_SKUS["a5"], tp=4), StepRequest("prefill", tokens=64)
+    case["machine"]["transfer_channels"]["d2d_intra_node"]["alpha_us"] = 24.0  # Exercise a slower ring.
+    real = prepare_scenario(ScenarioRequest(case, step))
     handle = real.handle
     rank = handle.scenario.atomic_ops[0]
     collective = next(op for op in rank.ops if op.link_bytes)
@@ -147,7 +147,7 @@ def test_shipping_regression_reports_measured_leave_one_out_culprit():
     shipping = finalize_plan(handle, shipping_plan)
     assert unmerge.verification.passed and shipping.verification.passed
     delta = shipping.wall_ns - unmerge.wall_ns
-    assert delta > 1000
+    assert delta > SHIPPING_REGRESSION_TOLERANCE_NS
     handle = replace(handle, full_u_ns=unmerge.wall_ns, full_m_ns=shipping.wall_ns)
     shipping = finalize_plan(handle, shipping_plan)
     dossier = SimpleNamespace(handle=handle, unmerge_plan=real.unmerge_plan,
@@ -160,7 +160,7 @@ def test_shipping_regression_reports_measured_leave_one_out_culprit():
     assert _shipping_regression(shipping.verification, unmerge.wall_ns,
                                 unmerge.wall_ns + SHIPPING_REGRESSION_TOLERANCE_NS) is None
 
-    report = api.optimize_ladder(_case(REPRESENTATIVE_SKUS["a5"], tp=4), StepRequest("prefill", tokens=64))
+    report = api.optimize_ladder(_case(REPRESENTATIVE_SKUS["a5"], tp=4), step, max_trials=2)
     ladder = report.ladder
     regression = report.waterfall.shipping_regression
     assert ladder.m_mainline_ns - ladder.u_unmerge_ns > SHIPPING_REGRESSION_TOLERANCE_NS
@@ -184,19 +184,19 @@ def test_mainline_seed_screens_against_its_own_faster_wall():
     assert report.dsl_plan == dossier.mainline_plan
     impact, = report.waterfall.loo_impacts
     assert impact.edit_id == SHIPPING_OVERLAY
-    assert impact.marginal_delta_ns == dossier.u_wall_ns - dossier.m_wall_ns == 466
+    assert impact.marginal_delta_ns == dossier.u_wall_ns - dossier.m_wall_ns == 354
 
 
 def test_unmerge_winner_has_empty_leave_one_out_despite_shipping_regression():
     case = _case(REPRESENTATIVE_SKUS["a5"], tp=1)
-    step = StepRequest("prefill", tokens=16, context=64)
+    step = StepRequest("prefill", tokens=64)
     dossier = prepare_scenario(ScenarioRequest(case, step))
     report = api.optimize_ladder(case, step)
     assert report.dsl_plan == dossier.unmerge_plan and not report.dsl_plan.edits
     assert report.waterfall.loo_impacts == ()
     regression = report.waterfall.shipping_regression
     assert regression == report.verification.shipping_regression
-    assert regression.delta_ns == dossier.m_wall_ns - dossier.u_wall_ns == 1754
+    assert regression.delta_ns == dossier.m_wall_ns - dossier.u_wall_ns == 8658
     assert report.ladder.delta_shipping_ns == -regression.delta_ns
     assert regression.loo_culprits == ((SHIPPING_OVERLAY, -regression.delta_ns),)
 

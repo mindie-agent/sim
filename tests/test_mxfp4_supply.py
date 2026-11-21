@@ -6,10 +6,10 @@ from pathlib import Path
 import pytest
 
 from mindie_sim import operator_costs, target_graphs
-from mindie_sim.prediction.mxfp4_supply import (
+from mindie_sim.prediction.operators.mx_quant_matrix.mxfp4_supply import (
     Config, UB_BYTES, config_from_group, ledger, make_op, recipe_book, tiles,
 )
-from mindie_sim.prediction.native_fusion import _groups
+from mindie_sim.prediction.operators.hyper_connections.native_fusion import _groups
 
 ROOT = Path(__file__).resolve().parents[1]
 

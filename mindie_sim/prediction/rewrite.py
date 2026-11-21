@@ -83,7 +83,7 @@ class RewritePipeline:
 
         if request.step is not None:
             from .body_defaults import consume_target_declaration
-            from .native_fusion import lower_native_fusions
+            from mindie_sim.prediction.operators.hyper_connections.native_fusion import lower_native_fusions
             from .operator_analysis import target_graphs
 
             step = request.step
@@ -98,6 +98,9 @@ class RewritePipeline:
                 resource_fusion=False,
                 draft_prepare=step.draft_prepare,
                 apply_body_defaults=request.apply_body_defaults,
+                requests=step.requests,
+                padded_tokens=step.padded_tokens,
+                layout=step.layout,
             )
             effective_case = consume_target_declaration(base.case, graphs)
             logical = tuple(
@@ -151,7 +154,7 @@ class RewritePipeline:
                 streams=tuple(streams),
             )
 
-        from .attention import AttentionPolicy
+        from mindie_sim.prediction.operators.attention.attention import AttentionPolicy
         from .frontend import Frontend
 
         frontend = Frontend(

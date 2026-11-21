@@ -277,7 +277,7 @@ def export_op_structure(ops, *, model, execution, kernels=None, source=None,
     graphs = {replica: tuple(operators) for replica, operators in graphs.items()}
     if (resource_graphs is None
             and (kernels or {}).get("lowerings", {}).get("native_fusion")):
-        from .prediction.native_fusion import lower_native_fusions
+        from mindie_sim.prediction.operators.hyper_connections.native_fusion import lower_native_fusions
 
         runtime = SimpleNamespace(kernels=kernels)
         resource_graphs = {replica: lower_native_fusions(operators, runtime)
@@ -549,7 +549,7 @@ def structure_inputs_from_graphs(
             },
         }
         graphs = {replica: graphs[replica] for replica in chosen}
-    from .prediction.native_fusion import lower_native_fusions
+    from mindie_sim.prediction.operators.hyper_connections.native_fusion import lower_native_fusions
     from .prediction.mechanism import Geometry
 
     if physical_graphs is None:

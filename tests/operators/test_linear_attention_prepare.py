@@ -15,22 +15,22 @@ import pytest
 from _support.axes import REPRESENTATIVE_SKUS, SKUS
 from _support.builders import linear_layer, linear_model
 from _support.linear_cases import kda_hardware_case, sku_planning_context
-from mindie_sim.prediction.gdn_chunk32 import PR22147_SOURCE
+from mindie_sim.prediction.operators.linear_attention.gdn_chunk32 import PR22147_SOURCE
 from mindie_sim import graph_costs, operator_costs, predict, target_graphs, target_operators
 from mindie_sim.observations.gdn_binding import bind_observation
 from mindie_sim.observations.historical import call_observations
-from mindie_sim.prediction.attention import AttentionPolicy
-from mindie_sim.prediction.family_kda_prepare import IMPLEMENTATION as KDA_PREPARE
+from mindie_sim.prediction.operators.attention.attention import AttentionPolicy
+from mindie_sim.prediction.operators.kda.family_kda_prepare import IMPLEMENTATION as KDA_PREPARE
 from mindie_sim.prediction.body_defaults import consume_target_declaration
-from mindie_sim.prediction.call_gdn import make_call, _gating_plan
+from mindie_sim.prediction.operators.linear_attention.call_gdn import make_call, _gating_plan
 from mindie_sim.prediction.cost import CostModel
 from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.mechanism import Geometry, PlannedRecipe
-from mindie_sim.prediction.operators import gdn_prepare as gdn, kda_prepare
-from mindie_sim.prediction.operators import native_causal_conv_prefill as convolution
+from mindie_sim.prediction.operators.linear_attention import gdn_prepare as gdn; from mindie_sim.prediction.operators.kda import kda_prepare
+from mindie_sim.prediction.operators.causal_conv import native_causal_conv_prefill as convolution
 from mindie_sim.prediction.operators.linear_attention import build, compute_wy_chunk_work, resolve_operator_plan
 from mindie_sim.prediction.program import RecipeBook
-from mindie_sim.prediction.recurrent import linear
+from mindie_sim.prediction.operators.recurrent.recurrent import linear
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.prediction.verification import verify_operator
 from mindie_sim.schema.case import Software
@@ -590,7 +590,7 @@ def test_direct_isa_rejects_synthetic_datapath_without_routes():
 def test_chunk32_timing_policy_delegates_to_linear_attention_strategies():
     from _support.hardware import machine
     from _support.linear_cases import recipe_context
-    from mindie_sim.prediction.gdn_chunk32 import STATE
+    from mindie_sim.prediction.operators.linear_attention.gdn_chunk32 import STATE
     from mindie_sim.prediction.mechanism import Geometry
     from mindie_sim.prediction.operators import linear_attention
     op = STATE.make_op({"lengths": (64,), "heads": 1, "key_heads": 1})

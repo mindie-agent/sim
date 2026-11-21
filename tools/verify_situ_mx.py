@@ -16,12 +16,12 @@ from pathlib import Path
 import resource
 import time
 
-from mindie_sim.prediction.family_situ_mx import (
+from mindie_sim.prediction.operators.mx_quant_matrix.family_situ_mx import (
     Config, PROFILE, SOURCE, make_op, recipe_book, tiling_for,
 )
 from mindie_sim.prediction.graph_analysis import graph_costs
 from mindie_sim.prediction.mechanism import Geometry
-from mindie_sim.prediction.native_fusion import _groups, lower_native_fusions
+from mindie_sim.prediction.operators.hyper_connections.native_fusion import _groups, lower_native_fusions
 from mindie_sim.prediction.operator_analysis import target_operators
 from mindie_sim.prediction.structure import parse_case
 

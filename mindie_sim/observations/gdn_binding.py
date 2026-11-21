@@ -6,7 +6,7 @@
 [Timeouts & Locks] One condition at a time; no locks, subprocesses or device work.
 [Side-Effect Policy] Returns declarations only; never relabels measured boundaries.
 """
-from mindie_sim.prediction.call_gdn import make_call
+from mindie_sim.prediction.operators.linear_attention.call_gdn import make_call
 
 
 _PRODUCER_SHA256 = "1662a58957250fed9043593b62a9c5b558783850c1016f66367cb5737cb43063"

@@ -6,10 +6,10 @@ import pytest
 
 from mindie_sim import operator_costs
 from mindie_sim.prediction.engine import Engine, Resource
-from mindie_sim.prediction.mxfp4_grouped import recipe
-from mindie_sim.prediction.mxfp4_panels import compiled_panels
-from mindie_sim.prediction.mxfp4_source_refill import source_panel
-from mindie_sim.prediction.mxfp4_pipeline import SourcePipeline, Dependencies, Slots
+from mindie_sim.prediction.operators.mx_quant_matrix.mxfp4_grouped import recipe
+from mindie_sim.prediction.operators.mx_quant_matrix.mxfp4_panels import compiled_panels
+from mindie_sim.prediction.operators.mx_quant_matrix.mxfp4_source_refill import source_panel
+from mindie_sim.prediction.operators.mx_quant_matrix.mxfp4_pipeline import SourcePipeline, Dependencies, Slots
 from mindie_sim.prediction.program import RecipeBook
 from test_mxfp4_grouped import source_case, gate, physical_op
 from test_mxfp4_panel_ir_cache import source_ir

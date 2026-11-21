@@ -21,6 +21,7 @@ from __future__ import annotations
 from bisect import bisect_left
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from functools import lru_cache
 import math
 from typing import Any, Literal
 
@@ -31,6 +32,7 @@ DEFAULT_ALIGN_BYTES = 32
 DEFAULT_L2_GRANULE_BYTES = 128
 BINARY64_EXACT_INT_LIMIT = 1 << 53
 _MAX_EXPLICIT_SECTOR_INTERVALS = 4096
+_SECTOR_INTERVAL_CACHE_LIMIT = 4096
 _BISECT_OVERLAP_RATIO = 16
 HBM_DIR_READ = 0
 HBM_DIR_WRITE = 1
@@ -40,12 +42,11 @@ _L2_CACHE_DISABLE = "disable"
 CACHE_POLICY_NORMAL = "normal"
 CACHE_POLICY_LAST_USE = "last_use"
 CACHE_POLICY_DISABLE = _L2_CACHE_DISABLE
+CachePolicy = Literal["normal", "last_use", "disable", "persistent"]
+CACHE_POLICY_PERSISTENT = "persistent"
 VALID_CACHE_POLICIES = frozenset({
-    CACHE_POLICY_NORMAL,
-    CACHE_POLICY_LAST_USE,
-    CACHE_POLICY_DISABLE,
+    CACHE_POLICY_NORMAL, CACHE_POLICY_LAST_USE, CACHE_POLICY_DISABLE, CACHE_POLICY_PERSISTENT,
 })
-CachePolicy = Literal["normal", "last_use", "disable"]
 
 
 def _ceil_div(numerator: int, denominator: int) -> int:
@@ -236,6 +237,12 @@ class AddressRun:
         if self.base_byte < 0 or self.rows < 0 or self.row_bytes < 0 or self.stride_bytes < 0:
             raise ModelingError("address_run_negative_geometry")
 
+    @classmethod
+    def from_gm_gap(cls, base_byte: int, rows: int, row_bytes: int, gap_bytes: int, *,
+                    layout: str = "contiguous", proven_alias_group: str | None = None) -> AddressRun:
+        """Convert a signed DataCopyPad GM gap into a byte stride."""
+        return cls(base_byte, rows, row_bytes, row_bytes + gap_bytes, layout, proven_alias_group)
+
     def sector_union_bytes(self, sector_bytes: int = DEFAULT_SECTOR_BYTES) -> int:
         """Exact 32 B sector union bytes in O(min(rows, sector_bytes)) integer arithmetic."""
         if self.rows == 0 or self.row_bytes == 0:
@@ -248,12 +255,8 @@ class AddressRun:
         s0 = base // sector_bytes
         e0 = _ceil_div(base + width, sector_bytes)
         first_sectors = e0 - s0
-        if self.rows == 1:
+        if self.rows == 1 or stride == 0:
             return first_sectors * sector_bytes
-        if stride == 0:
-            if self.proven_alias_group is not None:
-                return first_sectors * sector_bytes
-            return self.rows * first_sectors * sector_bytes
         if stride == width:
             total_end = _ceil_div(base + self.rows * width, sector_bytes)
             return (total_end - s0) * sector_bytes
@@ -391,17 +394,24 @@ class SectorCoverage:
     intervals: tuple[tuple[int, int], ...] = ()
     periodic: tuple[PeriodicSectorRun, ...] = ()
     _canonical: bool = field(default=False, repr=False, compare=False)
+    _bytes: int | None = field(default=None, repr=False, compare=False)
 
     @property
     def empty(self) -> bool:
         return not self.intervals and not self.periodic
 
     def measure_bytes(self) -> int:
+        if self._bytes is not None:
+            return self._bytes
         if not self.periodic:
-            if self._canonical:
-                return _measure_byte_intervals(self.intervals)
-            return _measure_byte_intervals(_merge_byte_intervals(self.intervals))
-        return _measure_periodic_combo(self.periodic, (), intersect=False, extra_left_ivs=self.intervals)
+            val = (
+                _measure_byte_intervals(self.intervals) if self._canonical
+                else _measure_byte_intervals(_merge_byte_intervals(self.intervals))
+            )
+        else:
+            val = _measure_periodic_combo(self.periodic, (), intersect=False, extra_left_ivs=self.intervals)
+        object.__setattr__(self, "_bytes", val)
+        return val
 
     def overlap_bytes(self, other: SectorCoverage) -> int:
         if self.empty or other.empty:
@@ -441,11 +451,21 @@ class AddressRunPlan:
     runs: tuple[AddressRun, ...] = ()
     alignment_bytes: int = DEFAULT_ALIGN_BYTES
     scale_bytes: int = 0
-    sector_bytes: int = DEFAULT_SECTOR_BYTES
+    sector_bytes: int | None = None
     expanded_queries: bool = True
+    l2_line_bytes: int | None = None
+    l2_sector_bytes: int | None = None
+    hbm_burst_granule_bytes: int = 0
+    hbm_scatter_row_open_bytes: int = 0
+    _default_sector: bool = field(init=False, compare=False, repr=False)
 
     def __post_init__(self) -> None:
-        if self.alignment_bytes < 1 or self.sector_bytes < 1 or self.scale_bytes < 0:
+        object.__setattr__(self, "_default_sector", self.sector_bytes is None)
+        if self.sector_bytes is None:
+            object.__setattr__(self, "sector_bytes", self.l2_sector_bytes or DEFAULT_SECTOR_BYTES)
+        if (self.alignment_bytes < 1 or self.sector_bytes < 1 or self.scale_bytes < 0
+                or any(g is not None and g < 1 for g in (self.l2_line_bytes, self.l2_sector_bytes))
+                or min(self.hbm_burst_granule_bytes, self.hbm_scatter_row_open_bytes) < 0):
             raise ModelingError("address_run_plan_invalid_parameters")
 
     def aligned_copy_bytes(self) -> int:
@@ -486,9 +506,8 @@ class AddressRunPlan:
                 sec_bytes = max(0, run_cov.measure_bytes() - run_cov.overlap_bytes(covered))
                 covered = covered.union(run_cov)
             if sec_bytes > 0:
-                eta = burst_turnaround_efficiency(run.row_bytes, run.stride_bytes, burst_rules)
                 sector_total += sec_bytes
-                service_total += float(sec_bytes) / eta
+                service_total += _burst_service_bytes(self, sec_bytes, run, burst_rules)
         if sector_total > 0 and self.scale_bytes > 0:
             scale_sec = _align_up(self.scale_bytes, self.sector_bytes)
             sector_total += scale_sec
@@ -497,19 +516,7 @@ class AddressRunPlan:
 
     def sector_intervals(self) -> tuple[tuple[int, int], ...]:
         """Return canonical disjoint ``[lo, hi)`` sector-aligned byte intervals."""
-        sec, ivs = self.sector_bytes, []
-        for run in self.runs:
-            if run.rows == 0 or run.row_bytes == 0:
-                continue
-            s0 = (run.base_byte // sec) * sec
-            if _run_is_sector_contiguous(run, sec):
-                end = run.base_byte + run.row_bytes if (run.rows == 1 or run.stride_bytes == 0) else run.base_byte + (run.rows - 1) * run.stride_bytes + run.row_bytes
-                ivs.append((s0, _align_up(end, sec)))
-            elif run.rows <= _MAX_EXPLICIT_SECTOR_INTERVALS:
-                for step in range(run.rows):
-                    addr = run.base_byte + step * run.stride_bytes
-                    ivs.append(((addr // sec) * sec, _align_up(addr + run.row_bytes, sec)))
-        return _merge_byte_intervals(ivs)
+        return _cached_sector_intervals(self.runs, self.sector_bytes)
 
     def periodic_sector_runs(self) -> tuple[PeriodicSectorRun, ...]:
         """Return exact compact periodic descriptors for gapped runs with ``rows > 4096``."""
@@ -522,7 +529,56 @@ class AddressRunPlan:
 
     def sector_coverage(self) -> SectorCoverage:
         """Exact sector coverage retaining periodic strided sets without gap collapse."""
-        return SectorCoverage(intervals=self.sector_intervals(), periodic=self.periodic_sector_runs(), _canonical=True)
+        known_bytes = self.runs[0].sector_union_bytes(self.sector_bytes) if len(self.runs) == 1 else None
+        return SectorCoverage(
+            intervals=self.sector_intervals(),
+            periodic=self.periodic_sector_runs(),
+            _canonical=True,
+            _bytes=known_bytes,
+        )
+
+
+@lru_cache(maxsize=_SECTOR_INTERVAL_CACHE_LIMIT)
+def _cached_sector_intervals(
+    runs: tuple[AddressRun, ...], sec: int,
+) -> tuple[tuple[int, int], ...]:
+    if len(runs) == 1:
+        run = runs[0]
+        if run.rows == 0 or run.row_bytes == 0:
+            return ()
+        s0 = (run.base_byte // sec) * sec
+        if _run_is_sector_contiguous(run, sec):
+            end = (
+                run.base_byte + run.row_bytes
+                if (run.rows == 1 or run.stride_bytes == 0)
+                else run.base_byte + (run.rows - 1) * run.stride_bytes + run.row_bytes
+            )
+            return ((s0, _align_up(end, sec)),)
+        if run.rows <= _MAX_EXPLICIT_SECTOR_INTERVALS:
+            base, stride, width, rows = run.base_byte, run.stride_bytes, run.row_bytes, run.rows
+            # Strictly positive stride larger than aligned row width+sector guarantees
+            # sorted, pairwise-disjoint sector intervals with no merge pass needed.
+            if stride >= ((width + sec - 1) // sec + 1) * sec:
+                if base % sec == 0 and stride % sec == 0:
+                    w_aligned = ((width + sec - 1) // sec) * sec
+                    return tuple((addr, addr + w_aligned) for addr in range(base, base + rows * stride, stride))
+                return tuple(
+                    (((addr := base + step * stride) // sec) * sec, _align_up(addr + width, sec))
+                    for step in range(rows)
+                )
+    ivs: list[tuple[int, int]] = []
+    for run in runs:
+        if run.rows == 0 or run.row_bytes == 0:
+            continue
+        s0 = (run.base_byte // sec) * sec
+        if _run_is_sector_contiguous(run, sec):
+            end = run.base_byte + run.row_bytes if (run.rows == 1 or run.stride_bytes == 0) else run.base_byte + (run.rows - 1) * run.stride_bytes + run.row_bytes
+            ivs.append((s0, _align_up(end, sec)))
+        elif run.rows <= _MAX_EXPLICIT_SECTOR_INTERVALS:
+            for step in range(run.rows):
+                addr = run.base_byte + step * run.stride_bytes
+                ivs.append(((addr // sec) * sec, _align_up(addr + run.row_bytes, sec)))
+    return _merge_byte_intervals(ivs)
 
 
 @dataclass(frozen=True, slots=True)
@@ -575,6 +631,10 @@ class ByteLedger:
     l2_hit_bytes: int
     dram_miss_copy_bytes: int
     dram_sector_bytes: int
+
+    @property
+    def dram_service_bytes(self) -> float:
+        return self.dram_bus_transaction_bytes
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -692,6 +752,7 @@ class HbmBusSpec:
     row_w: str = ""
     ctr_r: str = ""
     ctr_w: str = ""
+    memory_access: Any = field(default=None, compare=False, repr=False, kw_only=True)
 
     def __post_init__(self) -> None:
         if type(self.die) is not int or self.die < 0:
@@ -733,37 +794,19 @@ class HbmBusSpec:
         )
 
 
-from .l2_residency import AdmissionMemoryView, DirtyWriteback, bind_memory_access
+from .l2_residency import (
+    AdmissionMemoryView, DirtyWriteback, _burst_service_bytes, bind_memory_access, cache_policy_for_arch,
+)
 
 
 __all__ = [
-    "AdmissionMemoryView",
-    "AddressRun",
-    "AddressRunPlan",
-    "BINARY64_EXACT_INT_LIMIT",
-    "BoundAccess",
-    "BurstTurnRule",
-    "ByteLedger",
-    "CACHE_POLICY_DISABLE",
-    "CACHE_POLICY_LAST_USE",
-    "CACHE_POLICY_NORMAL",
-    "CachePolicy",
-    "ConstraintTerm",
-    "CounterTerm",
-    "DEFAULT_ALIGN_BYTES",
-    "DEFAULT_L2_GRANULE_BYTES",
-    "DEFAULT_SECTOR_BYTES",
-    "DirtyWriteback",
-    "HBM_DIR_READ",
-    "HBM_DIR_WRITE",
-    "HbmBusSpec",
-    "MemoryAccessPattern",
-    "PeriodicSectorRun",
-    "ReuseKey",
-    "SectorCoverage",
-    "VALID_CACHE_POLICIES",
-    "VisibilityContract",
-    "_L2_CACHE_DISABLE",
-    "bind_memory_access",
-    "burst_turnaround_efficiency",
+    "AdmissionMemoryView", "AddressRun", "AddressRunPlan", "BINARY64_EXACT_INT_LIMIT",
+    "BoundAccess", "BurstTurnRule", "ByteLedger", "CachePolicy", "ConstraintTerm",
+    "CounterTerm", "DirtyWriteback", "HbmBusSpec", "MemoryAccessPattern",
+    "PeriodicSectorRun", "ReuseKey", "SectorCoverage", "VisibilityContract",
+    "CACHE_POLICY_DISABLE", "CACHE_POLICY_LAST_USE", "CACHE_POLICY_NORMAL",
+    "CACHE_POLICY_PERSISTENT", "VALID_CACHE_POLICIES", "_L2_CACHE_DISABLE",
+    "DEFAULT_ALIGN_BYTES", "DEFAULT_L2_GRANULE_BYTES", "DEFAULT_SECTOR_BYTES",
+    "HBM_DIR_READ", "HBM_DIR_WRITE", "bind_memory_access", "burst_turnaround_efficiency",
+    "cache_policy_for_arch",
 ]

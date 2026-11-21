@@ -435,9 +435,11 @@ def test_cold_weight_and_catalog_operand_share_one_allocation(allocation_key):
         handle.scenario, applied=full.applied, region_summaries=full.region_summaries,
     )
     read_ns = next(work for name, work in zip(names, program.global_work) if name.startswith("hbm_bus_r@"))
-    read_bytes = 2 * (width * width + width)
-    rate = handle.scenario.datapath.hbm_read_bytes_per_s
-    assert read_ns == inward_floor_ns(Fraction(read_bytes * NS_PER_SECOND, int(rate)))
+    path = handle.scenario.datapath
+    assert path.hbm_rw_alpha == 1
+    read_bytes, write_bytes = 2 * (width * width + width), 2 * width
+    read_service_ns = Fraction((read_bytes + write_bytes) * NS_PER_SECOND, int(path.hbm_read_bytes_per_s))
+    assert read_ns == inward_floor_ns(read_service_ns)
     bound, _ = certify_lower_bound(program, dag)
     assert bound.l_star_lean_ns == full.verification.l_star_ns <= full.wall_ns
 
@@ -469,7 +471,11 @@ def test_catalog_replay_preserves_directional_hbm_service(alpha):
     engine.advance(until=(done,))
     assert full.step_eval.span_ms == pytest.approx(done.time, abs=1e-12)
     if alpha == 0:
-        assert full.step_eval.span_ms == pytest.approx(6.1875, abs=2e-5)
+        # The critical tile follows the contiguous A read and strided B read.
+        # Its B load and C store each pay 256 B per strided row.
+        a_bytes = 2 * problem.m * problem.k
+        strided_tile_bytes = 256 * tile_width
+        assert full.step_eval.span_ms == pytest.approx((a_bytes + 2 * strided_tile_bytes) / (rate / 1000), abs=2e-5)
     bus = direct.program.hbm_bus
     evidence = full.step_eval.execution_evidence
     assert evidence["serviced"][bound_context.resource_names["hbm"]] == 0

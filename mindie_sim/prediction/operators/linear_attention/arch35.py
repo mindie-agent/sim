@@ -19,7 +19,7 @@ from itertools import chain
 from mindie_sim.schema.common import ModelingError, align_up
 from mindie_sim.schema.datapath import ArchId, SourceRef
 from mindie_sim.schema.operators import OpSpec
-from ...gdn_chunk32 import PR22147_SOURCE
+from mindie_sim.prediction.operators.linear_attention.gdn_chunk32 import PR22147_SOURCE
 from ...mechanism import OperatorPlan, Work
 from ...ownership import unit_group
 from ...program import KernelProgram, ParallelProgram, PipelineProgram, RecipeContext, Stage
@@ -669,8 +669,7 @@ class Arch35LinearAttentionStrategy:
     def chunk32_timing_policy(
         self, context: RecipeContext, step_sync_ms: float,
     ) -> tuple[float, float]:
-        if context.service_rate("mte2_aic_dram") is None:
-            return 0.0, 0.0
+        del context
         return KERNEL_LAUNCH_SETUP_MS, step_sync_ms
 
     def accepts(self, op: OpSpec, ctx: OperatorPlanningContext, /) -> bool:
@@ -695,6 +694,9 @@ class Arch35LinearAttentionStrategy:
             )
         if c.operation == "recover_ssm_commit":
             return _build_commit(c, ctx)
+        if not c.lengths:
+            return make_plan(ctx, c.abi or c.operation, (),
+                             metadata={"total_chunks": 0, "state_contraction_ops": 0})
         if c.operation.endswith("_recurrent"):
             return _build_recurrent(c, ctx)
         if c.operation == "gdn_prefill" and c.bt != DIAG_BLOCK_WIDTH:
@@ -708,13 +710,19 @@ class Arch35LinearAttentionStrategy:
         pairs = pairs[:KDA_MAX_AIC_CORES]
         request = FLASH_KDA_TEMPLATE_BY_ABI.get(c.abi, c.kda_template_request)
         m = c.metadata
-        layout = m.get("layout_kind", int(op.layout.upper() in {"BSND", "TND"}))
+        sequence_layout = ctx.layout.upper() if ctx.requests else ""
+        if sequence_layout in {"BSND", "BNSD", "BSH", "TND"}:
+            layout, has_cu = 1, sequence_layout == "TND"
+        else:
+            legacy_layout = op.layout.upper()
+            layout = m.get("layout_kind", int(legacy_layout in {"BSND", "TND"}))
+            has_cu = m.get("has_cu", legacy_layout == "TND")
         slots = m.get("workspace_slots", KDA_WORKSPACE_SLOTS)
         selected, group = resolve_flash_kda_route(
             c.lengths, c.hv, len(pairs), requested_template=request, device_name=m.get("device_name", ""),
             route_coefficients=m.get("route_coefficients", ()), layout_kind=layout, workspace_slots=slots,
             max_chunk_group=m.get("max_chunk_group"), metadata_word_capacity=m.get("metadata_word_capacity"),
-            has_cu=m.get("has_cu", op.layout.upper() == "TND"),
+            has_cu=has_cu,
             calibration_enabled=m.get("calibration_enabled", True), enable_grad=m.get("enable_grad", False),
             query_heads=c.hq,
         )

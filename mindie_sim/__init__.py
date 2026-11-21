@@ -48,7 +48,7 @@ from .custom_hardware import (
     unregister_custom_hardware_sku,
 )
 from .model_catalog import customize_model_spec
-from .prediction.deepep import (
+from mindie_sim.prediction.operators.moe_transport.deepep import (
     analyze_shared_expert_overlap,
     deepep_group_volume,
     deepep_intra_volume,

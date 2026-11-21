@@ -45,14 +45,14 @@ from mindie_sim.optimization import (
 )
 from mindie_sim.prediction.collective_startup import resolve_collective_startup, validate_steps
 from mindie_sim.prediction.efficiency import extract_hardware_peaks
-from mindie_sim.prediction.expert_slot_work import physical_slot_work
+from mindie_sim.prediction.operators.moe_routing.expert_slot_work import physical_slot_work
 from mindie_sim.prediction.exposed_breakdown import (
     ExposedClocks, advance_clocks, finish_breakdown, join_clocks as prod_join_clocks, roofline_clocks,
 )
 from mindie_sim.prediction.fusion_graph import OpNode, TensorValue, TypedGraph
 from mindie_sim.prediction.local_projection_tp import lower_local_projection_tp
-from mindie_sim.prediction.recover_ssm_commit import bind_recover_ssm_commits
-from mindie_sim.prediction.recover_ssm_work import FP32_RECORD_BYTES, emit_commit_op, gdn_record_head_bytes
+from mindie_sim.prediction.operators.recurrent.recover_ssm_commit import bind_recover_ssm_commits
+from mindie_sim.prediction.operators.recurrent.recover_ssm_work import FP32_RECORD_BYTES, emit_commit_op, gdn_record_head_bytes
 from mindie_sim.prediction.roofline_graph import (
     PhysicalWorkGraph, PhysicalWorkNode, RooflineTargets, critical_path_roofline,
 )

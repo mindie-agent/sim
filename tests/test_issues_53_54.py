@@ -15,12 +15,12 @@ from mindie_sim.model_catalog import load_model
 from mindie_sim.prediction.body_defaults import (
     effective_body_declaration, service_program_defaults,
 )
-from mindie_sim.prediction.family_mqsmla import FORMATS, RECIPE, lower_attention, validate
-from mindie_sim.prediction.generic_latent_attention import (
+from mindie_sim.prediction.operators.paged_mla.family_mqsmla import FORMATS, RECIPE, lower_attention, validate
+from mindie_sim.prediction.operators.mla.generic_latent_attention import (
     index_key_window, unique_index_key_rows,
 )
 from mindie_sim.prediction.mechanism import Geometry, Work
-from mindie_sim.prediction import mqsmla
+from mindie_sim.prediction.operators.paged_mla import mqsmla
 from mindie_sim.prediction.operator_analysis import operator_costs
 from mindie_sim.prediction.physical_key import physical_key
 from mindie_sim.prediction.structure import parse_case
@@ -102,7 +102,7 @@ def test_hca_swa_and_local_head_groups_conserve_source_work():
                 for _, work in mqsmla.tile_phases(*stream.key(index), heads=heads):
                     expected += work
         assert mqsmla.build(ops[0], geometry).work == expected
-    from mindie_sim.prediction.family_mqsmla import query_shape
+    from mindie_sim.prediction.operators.paged_mla.family_mqsmla import query_shape
     swa = next(p for p in c.model.layer_plans if not p.owns_long_kv and not p.owns_topk)
     assert query_shape((view,), swa)["ratio"] == 0
     for heads in (8, 16, 32, 48, 64, 80, 96, 128):
@@ -165,7 +165,7 @@ def test_compressed_cp_index_reads_are_per_query_tile():
 
 def test_generic_indexer_precharge_is_not_deduplicated_twice():
     from mindie_sim.catalog.cache import index_row_bytes
-    from mindie_sim.prediction.generic_latent_attention import semantic_index_selection
+    from mindie_sim.prediction.operators.mla.generic_latent_attention import semantic_index_selection
     from mindie_sim.prediction.lowering import Builder
     c, _ = mq_case()
     model = load_model("deepseek-v4-pro-0813")

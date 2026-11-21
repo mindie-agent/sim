@@ -19,8 +19,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from mindie_sim.prediction.hccl_aicpu import contract  # noqa: E402
-from mindie_sim.prediction.hccl_contracts import select  # noqa: E402
+from mindie_sim.prediction.operators.collectives.hccl_aicpu import contract  # noqa: E402
+from mindie_sim.prediction.operators.collectives.hccl_contracts import select  # noqa: E402
 from mindie_sim.schema.common import ModelingError  # noqa: E402
 
 

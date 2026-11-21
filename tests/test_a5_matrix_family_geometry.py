@@ -16,13 +16,13 @@ import pytest
 from mindie_sim import operator_costs, target_graphs, target_operators
 from mindie_sim.catalog.ops import gemm_op
 from mindie_sim.catalog.types import QuantSpec
-from mindie_sim.prediction import family_gate_up_situ_mxfp4 as gate_situ
-from mindie_sim.prediction import family_grouped_gemm
-from mindie_sim.prediction import family_mx_matrix
-from mindie_sim.prediction import shared_w4a8
-from mindie_sim.prediction.gmmsq_quant_typed import work as gmmsq_work
+from mindie_sim.prediction.operators.mx_quant_matrix import family_gate_up_situ_mxfp4 as gate_situ
+from mindie_sim.prediction.operators.grouped_moe import family_grouped_gemm
+from mindie_sim.prediction.operators.mx_quant_matrix import family_mx_matrix
+from mindie_sim.prediction.operators.mx_quant_matrix import shared_w4a8
+from mindie_sim.prediction.operators.grouped_moe.gmmsq_quant_typed import work as gmmsq_work
 from mindie_sim.prediction.mechanism import Geometry, PlannedRecipe
-from mindie_sim.prediction.mxfp4_geometry import Config, align, owner_tiles
+from mindie_sim.prediction.operators.mx_quant_matrix.mxfp4_geometry import Config, align, owner_tiles
 from mindie_sim.prediction.program import RecipeBook
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError

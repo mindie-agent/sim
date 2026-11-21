@@ -25,7 +25,7 @@ from mindie_sim.catalog.ops import gemm_op
 from mindie_sim.catalog.quant import quant_preset
 from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.prediction.engine import Allocation, Engine, Resource
-from mindie_sim.prediction.matrix import TiledMatmul
+from mindie_sim.prediction.operators.matrix.matrix import TiledMatmul
 from mindie_sim.prediction.program import (
     PipelinePhase, PipelineTemplate, PipelineTemplateProgram, RecipeContext, Stage,
     indexed_pipeline_consumer_available,

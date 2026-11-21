@@ -94,8 +94,8 @@ def test_sparse_decode_metadata_is_explicitly_excluded_from_prefill():
 
 def test_prefill_kda_chooses_its_chunk_source_without_decode_source_in_mixed_batch():
     from _support.linear_cases import caller
-    from mindie_sim.prediction.family_kda_recurrent_membase import IMPLEMENTATION as DECODE
-    from mindie_sim.prediction.family_kda_state import IMPLEMENTATION as PREFILL
+    from mindie_sim.prediction.operators.kda.family_kda_recurrent_membase import IMPLEMENTATION as DECODE
+    from mindie_sim.prediction.operators.kda.family_kda_state import IMPLEMENTATION as PREFILL
 
     parsed, _ = caller((1,))
     plan = replace(parsed.model.layer_plans[0], linear_key_heads=2)
@@ -209,7 +209,7 @@ def test_draft_calls_select_their_own_phase_and_q1_geometry_before_target_verifi
 
 def test_target_mxfp8_routing_does_not_rewrite_explicit_analytical_bf16_draft():
     from _support.moe_hc_mc2_fixtures import mxfp8_case as glm_case
-    from mindie_sim.prediction.moe_init_mxfp8 import RECIPE
+    from mindie_sim.prediction.operators.moe_routing.moe_init_mxfp8 import RECIPE
 
     parsed = parse_case(glm_case(16))
     # Keep the real target MoE and draft quantization contracts while limiting

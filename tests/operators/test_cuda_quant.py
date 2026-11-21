@@ -13,7 +13,7 @@ pytestmark = pytest.mark.tier0
 from mindie_sim.prediction.cost import CostModel
 from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.mechanism import PlannedRecipe
-from mindie_sim.prediction.operators import cuda_quant
+from mindie_sim.prediction.operators.vector import cuda_quant
 from mindie_sim.prediction.program import RecipeBook
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.prediction.verification import verify_operator

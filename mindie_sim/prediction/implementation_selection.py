@@ -468,7 +468,7 @@ def lower_regions(regions, *, graph, replay_scope, runtime, prefix=(),
                   resource_fusion=True, public_outputs=()):
     """Insert representations, then partition the actual prefix+region DAG once."""
     from .transforms import insert_representations, lower_implementations
-    from .native_fusion import lower_native_fusions, _ordered
+    from mindie_sim.prediction.operators.hyper_connections.native_fusion import lower_native_fusions, _ordered
 
     prefix_ops = tuple(prefix)
     inserted_regions = []

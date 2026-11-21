@@ -22,11 +22,11 @@ from mindie_sim.prediction.cost import CostModel, primitive_key
 from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.instructions import REGISTER_RESOURCES
-from mindie_sim.prediction.matrix import TiledMatmul
+from mindie_sim.prediction.operators.matrix.matrix import TiledMatmul
 from mindie_sim.prediction.mechanism import OperatorPlan, PlannedRecipe, Work
 from mindie_sim.prediction.operator_analysis import target_operators
-from mindie_sim.prediction.operators import gdn_output, gdn_prepare, gdn_state
-from mindie_sim.prediction.operators.mixed_core import phase_stages
+from mindie_sim.prediction.operators.linear_attention import gdn_output, gdn_prepare, gdn_state
+from mindie_sim.prediction.operators.vector.mixed_core import phase_stages
 from mindie_sim.prediction.primitives import PrimitiveStore
 from mindie_sim.prediction.program import (
     KernelProgram, PipelinePhase, PipelineProgram, PipelineTemplate,

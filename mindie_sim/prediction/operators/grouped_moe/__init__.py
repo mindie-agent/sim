@@ -85,6 +85,7 @@ def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
     ctx = OperatorPlanningContext(
         OpOccurrence(geometry.replica, op.stage, geometry.rank, op.op_id),
         geometry, datapath, requested_abi=abi, stream_owners=geometry.stream_owners,
+        admission_memory_view=geometry.admission_memory_view,
     )
     return resolve_operator_plan(op, ctx).recipe
 

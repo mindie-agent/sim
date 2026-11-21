@@ -37,8 +37,9 @@ from .common import (
     NOPE_ABI, PAGED_LAYOUTS, QUANT_MODE_BF16, QUANT_MODE_FP8_C8, QUANT_MODE_INT8_C8,
     QUANT_MODE_MINDIE_FP8, QUANT_MODE_MXFP4_CX, QUANT_MODE_MXFP4_OCP, QUANT_MODE_MXFP8,
     QUANT_MODE_TQ4, SCALE_ADDRESS_BYTES, SECTOR_BYTES, SOFTMAX_OPS, SUPPORTED_ABIS, TQ4_ROW_BYTES,
-    AttentionContract, AttentionPhase, _placement, _stage, bsh_kv_access_plan, make_plan, output_phases,
-    owner_pairs, packed_gather_run_plans, packed_selection_runs, read_work, unmodeled,
+    AttentionContract, AttentionPhase, _placement, _stage, attention_owner_waves, bsh_kv_access_plan, contract_for_requests,
+    make_plan, output_phases,
+    owner_pairs, packed_gather_run_plans, packed_selection_runs, read_work, sparse_kv_extents, unmodeled,
 )
 
 UPSTREAM_ABI = "aclnnGenericBlockSparseAttention"
@@ -186,14 +187,17 @@ class _C8Query:
     hbm: str
     key: ReuseKey
     capacity: int
+    ctx: OperatorPlanningContext
 
     def start(self, engine, name, ready, *, owner=""):
-        view = _c8_memory(engine, self.hbm, self.key.die, self.capacity)
-        admission = _C8Admission(view)
+        view = self.ctx.admission_memory_view if self.ctx.requests else None
+        legacy = view is None
+        admission = _C8Admission(_c8_memory(engine, self.hbm, self.key.die, self.capacity)) if legacy else view
         program = self.program(admission)
         done = program.start(engine, name, ready, owner=owner)
         _discard_query_programs(engine._compiled_programs, program)
-        engine.on_complete(done, lambda _: admission.fill(self.key))
+        if legacy:
+            engine.on_complete(done, lambda _: admission.fill(self.key))
         return done
 
 
@@ -309,6 +313,7 @@ class _C8Gather:
         hbm = context.resource_names["hbm"]
         pipe_role = "mte2_aiv" if "mte2_aiv" in context.resource_names else "mte2"
         pipe_units = context.resource_units.get(pipe_role, 1)
+        pipe_rate = context.rates[context.resource_names[pipe_role]] / pipe_units
         # The shared HBM resource measures bytes. Directional bus rows
         # otherwise represent occupancy at a unit service rate.
         key = self.key
@@ -320,7 +325,8 @@ class _C8Gather:
                 key.backing_allocation, key.tensor_version, key.die, owner, "read", "mte2_aiv",
                 runs.runs[0].rows * self.row_bytes, runs, reuse_key=key,
             )
-            bound = context.bind_access(pattern, hbm_bus=bus)
+            bound = context.bind_access(pattern, hbm_bus=bus, copy_hit_bytes_per_ms=pipe_rate,
+                                        copy_miss_bytes_per_ms=pipe_rate)
             stages.append(Stage("read" if index == 0 else f"read-{index}",
                                 program=_C8Read(pattern, bound, admission)))
         return KernelProgram(tuple(stages))
@@ -332,6 +338,8 @@ def _l2_capacity(ctx: OperatorPlanningContext) -> int:
         raise unmodeled("attention_l2_owner", "Bind one shared L2 allocation owner per die")
     if not (geometry.rates.get("l2") or geometry.resource_units.get("l2")):
         return 0
+    if ctx.requests and ctx.admission_memory_view is not None:
+        return ctx.admission_memory_view.effective_l2_bytes(geometry.rank or 0)
     return geometry.buffers.get("l2", dict(ctx.datapath.buffers).get("l2", 0))
 
 
@@ -349,6 +357,8 @@ class _PackedAttention:
 
     def intervals(self, rows):
         splits = min(self.contract.splits, max(1, rows))
+        if self.ctx.requests:
+            splits = min(splits, len(self.owners))
         base, extra = divmod(rows, splits)
         for index in range(splits):
             start = index * base + min(index, extra)
@@ -421,7 +431,7 @@ class _PackedAttention:
             intervals = tuple(self.intervals(self.counts[index]))
             branches = []
             for split, (start, end) in enumerate(intervals):
-                owner = (core + split) % owner_count
+                owner = core + split if self.ctx.requests else (core + split) % owner_count
                 aiv = self.owners[owner][1][0]
                 stages = []
                 for phase in self.split_phases(index, start, end, len(intervals)):
@@ -436,13 +446,17 @@ class _PackedAttention:
                 stages.append(_stage(context, replace(phase, after=(stages[-1].name,)), places[core]))
             return KernelProgram(tuple(stages))
 
-        def tile(index, core):
-            program = (_C8Query(partial(query, index, core), context.resource_names["hbm"], self.key, self.capacity)
+        def tile(index, core, name="query"):
+            program = (_C8Query(partial(query, index, core), context.resource_names["hbm"], self.key,
+                                self.capacity, self.ctx)
                        if self.key else query(index, core))
-            return (Stage("query", program=program),)
+            return Stage(name, program=program)
 
+        if self.ctx.requests:
+            splits = min(owner_count, self.contract.splits, max(1, max(self.counts)))
+            return attention_owner_waves(len(self.counts), owner_count, splits, tile)
         return ParallelProgram(tuple(
-            PipelineProgram(len(indices), 1, lambda i, core=core, indices=indices: tile(indices[i], core))
+            PipelineProgram(len(indices), 1, lambda i, core=core, indices=indices: (tile(indices[i], core),))
             for core in range(owner_count) if (indices := range(core, len(self.counts), owner_count))
         ))
 
@@ -504,16 +518,18 @@ def _sparse_kv_load(
     else:
         scale_bytes = ceil(dim / MXFP8_SCALE_GROUP) if mode == QUANT_MODE_MXFP8 else 0
     hbm = copied = hit = 0
+    row_bytes = contract.num_kv_heads * dim * elem
     if shared_l2 is not None and not scale_bytes:
         # The two prefix tensors have independent backing allocations.
         key = ReuseKey(0, tensor, 0, reuse_stream=tensor)
         bus = HbmBusSpec(0, 1, 1, 0)
-        for rows in contract.row_counts():
+        for rows, base, stride in sparse_kv_extents(contract, ctx):
             runs = tuple(
                 run for owner in range(contract.num_kv_heads)
                 for run in bsh_kv_access_plan(
                     contract.num_kv_heads, dim, elem, contract.kv_layout,
                     rows=rows, first_head=owner, block_size=contract.block_size,
+                    base_byte=base * row_bytes, tokens_per_head=stride,
                 ).runs
             )
             plan = AddressRunPlan(runs)
@@ -531,7 +547,7 @@ def _sparse_kv_load(
             hit += ledger.l2_hit_bytes
         return read_work(ctx, copied, hbm=hbm, l2=hit)
 
-    for rows in contract.row_counts():
+    for rows, base, stride in sparse_kv_extents(contract, ctx):
         block = contract.block_size
         full, tail = divmod(rows, block)
         for count, repeats in ((block, full), (tail, 1)):
@@ -539,7 +555,8 @@ def _sparse_kv_load(
                 continue
             for owner in range(contract.num_kv_heads):
                 plan = bsh_kv_access_plan(contract.num_kv_heads, dim, elem, contract.kv_layout,
-                                          rows=count, first_head=owner, block_size=block)
+                                          rows=count, first_head=owner, block_size=block,
+                                          base_byte=base * row_bytes, tokens_per_head=stride)
                 plan = AddressRunPlan(plan.runs, scale_bytes=count * scale_bytes)
                 pattern = MemoryAccessPattern(tensor, 0, 0, owner, "read", "mte2_aic",
                                               count * (dim * elem + scale_bytes), plan)
@@ -764,9 +781,12 @@ class _Strategy:
         contract: AttentionContract = dict(op.metadata)["attention_contract"]
         if not self.accepts(op, ctx):
             raise unmodeled("attention_arch35_abi", "Bind a supported Arch35 attention ABI")
+        contract = contract_for_requests(contract, ctx)
+        sources = SOURCES_BY_ABI[contract.abi]
+        if not contract.query_tokens:
+            return make_plan(op, contract, ctx, (), sources)
         ctx.datapath.route("l0c", "ub")
         ctx.datapath.route("ub", "l1")
-        sources = SOURCES_BY_ABI[contract.abi]
         if contract.abi == FIA_ABI:
             return dense_fia(op, contract, ctx, sources, gm_workspace=False)
         if contract.abi == C8_ABI:

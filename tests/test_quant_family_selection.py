@@ -6,7 +6,7 @@ import pytest
 from mindie_sim import graph_costs, predict, target_graphs
 from mindie_sim.catalog.quant import quant_preset
 from mindie_sim.prediction.operator_analysis import operator_costs, target_operators
-from mindie_sim.prediction.operators import cuda_quant
+from mindie_sim.prediction.operators.vector import cuda_quant
 from mindie_sim.schema.common import ModelingError
 from test_prediction_system import case
 

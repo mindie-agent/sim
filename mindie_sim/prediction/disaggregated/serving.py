@@ -13,7 +13,7 @@ from collections import defaultdict
 from mindie_sim.coverage import combine_coverage
 from mindie_sim.schema.common import ModelingError
 
-from ..attention import AttentionPolicy
+from mindie_sim.prediction.operators.attention.attention import AttentionPolicy
 from ..capacity import Memory
 from ..cost import CostModel
 from ..dispatch import cohorts, submit_batch

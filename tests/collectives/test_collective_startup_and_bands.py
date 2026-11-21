@@ -44,7 +44,7 @@ from mindie_sim.prediction.collectives import RingCollective, RingGroup
 from mindie_sim.prediction.communication import MessageFlow, RoutedHop, RoutedMessage
 from mindie_sim.prediction.engine import Engine, Resource
 from mindie_sim.prediction.execution import _collective_native_basis
-from mindie_sim.prediction.hccl_signals import SignalGroup
+from mindie_sim.prediction.operators.collectives.hccl_signals import SignalGroup
 from mindie_sim.prediction.peer_traffic import PeerTraffic
 from mindie_sim.prediction.program import RecipeBook
 from mindie_sim.prediction.structure import parse_case

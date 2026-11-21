@@ -23,7 +23,7 @@ from ._lowering import (
     _GenericTiling, _ResidentTiling, _align, ceil_div,
 )
 from .common import (
-    WEIGHT_QUANT_MXFP8, PrologContract, build_plan, unsupported, uses_split_m, validate_contract,
+    WEIGHT_QUANT_MXFP8, PrologContract, build_plan, contract_for, unsupported, uses_split_m,
 )
 
 ARCH_ID = ArchId("npu_arch_3510")
@@ -378,10 +378,10 @@ class _Arch35Strategy:
     sources: tuple[SourceRef, ...] = SOURCES
 
     def accepts(self, op: OpSpec, ctx: OperatorPlanningContext, /) -> bool:
-        return _supports(validate_contract(op, ctx.requested_abi))
+        return _supports(contract_for(op, ctx))
 
     def build(self, op: OpSpec, ctx: OperatorPlanningContext, /) -> OperatorPlan:
-        c = validate_contract(op, ctx.requested_abi)
+        c = contract_for(op, ctx)
         if not _supports(c):
             raise unsupported(op, ctx, f"unsupported_abi_or_quant_mode:{c.abi}:{c.weight_quant_mode}")
         if c.is_dsl:

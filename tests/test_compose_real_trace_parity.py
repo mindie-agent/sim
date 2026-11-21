@@ -19,8 +19,8 @@ from mindie_sim.compose import compose_case
 from mindie_sim.model_catalog import list_models
 from mindie_sim.prediction import predict
 from mindie_sim.prediction.body_defaults import effective_body_declaration
-from mindie_sim.prediction.family_mqsmla import FORMATS as MQSMLA_FORMATS
-from mindie_sim.prediction.family_mqsmla import RECIPE as MQSMLA_RECIPE
+from mindie_sim.prediction.operators.paged_mla.family_mqsmla import FORMATS as MQSMLA_FORMATS
+from mindie_sim.prediction.operators.paged_mla.family_mqsmla import RECIPE as MQSMLA_RECIPE
 from mindie_sim.prediction.operator_analysis import target_graphs
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.structure import export_structure

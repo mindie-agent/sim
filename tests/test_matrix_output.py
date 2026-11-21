@@ -4,8 +4,8 @@ from dataclasses import replace
 import pytest
 
 from mindie_sim.prediction.engine import Engine, Resource
-from mindie_sim.prediction.matrix import HierarchicalMatmul
-from mindie_sim.prediction.matrix_output import PartitionedMatrixOutput
+from mindie_sim.prediction.operators.matrix.matrix import HierarchicalMatmul
+from mindie_sim.prediction.operators.matrix.matrix_output import PartitionedMatrixOutput
 from test_matrix_epilogue import quantized_context
 
 

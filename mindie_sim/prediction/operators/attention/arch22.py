@@ -17,7 +17,7 @@ from mindie_sim.schema.operators import OpSpec
 from ...mechanism import OperatorPlan
 from ..contracts import OperatorPlanningContext
 from ._fia import dense_fia
-from .common import ARCH22, AttentionContract, unmodeled
+from .common import ARCH22, AttentionContract, contract_for_requests, unmodeled
 
 UPSTREAM_ABI = "aclnnFusedInferAttentionScore"
 OPS_TRANSFORMER_REVISION = "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946"
@@ -46,7 +46,7 @@ class _Strategy:
             raise unmodeled("attention_arch22_abi", f"Arch22 attention requires {self.abi}")
         for src, dst in (("l0c", "gm"), ("gm", "ub"), ("ub", "gm"), ("gm", "l1")):
             ctx.datapath.route(src, dst)
-        return dense_fia(op, contract, ctx, self.sources, gm_workspace=True)
+        return dense_fia(op, contract_for_requests(contract, ctx), ctx, self.sources, gm_workspace=True)
 
 
 STRATEGY = _Strategy()

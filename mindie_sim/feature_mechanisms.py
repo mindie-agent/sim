@@ -183,7 +183,7 @@ def _apply_norm_quant_materialize_all(rt: dict[str, Any], ctx: MechanismContext)
 
 
 def _apply_mla_prolog(rt: dict[str, Any], ctx: MechanismContext) -> None:
-    from mindie_sim.prediction.family_mla_prolog import validate as validate_mla_prolog
+    from mindie_sim.prediction.operators.mla_prolog.family_mla_prolog import validate as validate_mla_prolog
     from mindie_sim.schema.parallel import ParallelSpec
     mla_layers = [p for p in ctx.model.layer_plans if p.attention == "mla" and p.q_lora_rank > 0]
     if not mla_layers:
@@ -198,7 +198,7 @@ def _apply_mla_prolog(rt: dict[str, Any], ctx: MechanismContext) -> None:
     options: dict[str, Any] = {}
     quant = ctx.model.quant
     if ctx.arch == "a5" and quant is not None and quant.kv_dtype == "int8":
-        from mindie_sim.prediction.mla_prolog_packed import LAYOUT
+        from mindie_sim.prediction.operators.mla_prolog.mla_prolog_packed import LAYOUT
         options["cache_layout"] = LAYOUT
     try:
         for plan in mla_layers:
@@ -227,7 +227,7 @@ def _apply_recurrent_decode(rt: dict[str, Any], ctx: MechanismContext) -> None:
                  or execution(ctx.model).get("recurrent_context_sharded") is False)):
         kda_options = {}
         if is_a5:
-            from mindie_sim.prediction.kda_source import resolve as resolve_kda_source
+            from mindie_sim.prediction.operators.kda.kda_source import resolve as resolve_kda_source
             bounds = {getattr(p, "kda_gate_lower_bound", None) for p in kda_layers}
             if len(bounds) == 1:
                 kda_options = resolve_kda_source(
@@ -275,7 +275,7 @@ def _apply_packed_proj_zero_copy(rt: dict[str, Any], _ctx: MechanismContext) -> 
 
 
 def _apply_gdn_chunk64(rt: dict[str, Any], ctx: MechanismContext) -> None:
-    from mindie_sim.prediction.gdn_domain import model_supports_gdn_chunk64
+    from mindie_sim.prediction.operators.linear_attention.gdn_domain import model_supports_gdn_chunk64
 
     tp = int(ctx.parallel.get("tp", 1))
     policy = dict(rt.get("attention_policy") or {})

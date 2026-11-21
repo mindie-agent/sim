@@ -32,7 +32,7 @@ from mindie_sim.prediction.call_builders import build_aclnn_call
 from mindie_sim.prediction.efficiency import (
     analyze_network_efficiency,
 )
-from mindie_sim.prediction.index_pool import _visited_pool_rows
+from mindie_sim.prediction.operators.sparse_indexer.index_pool import _visited_pool_rows
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.hardware import Hardware

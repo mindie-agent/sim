@@ -36,13 +36,13 @@ from mindie_sim.backends.ascend import materialize as ascend_materialize
 from mindie_sim.backends.nvidia import materialize as nvidia_materialize
 from mindie_sim.backends.nvidia import profiles as nvidia_profiles
 from mindie_sim.prediction.communication import MessageFlow
-from mindie_sim.prediction.direct_peer import DirectPeerCollective
+from mindie_sim.prediction.operators.collectives.direct_peer import DirectPeerCollective
 from mindie_sim.prediction.engine import Engine
-from mindie_sim.prediction.hccl_graph import NETWORK as HCCL_NETWORK
-from mindie_sim.prediction.hccl_graph import lower as hccl_lower
-from mindie_sim.prediction.mc2_graph import NETWORK as MC2_NETWORK
-from mindie_sim.prediction.mc2_graph import recipes as mc2_recipes
-from mindie_sim.prediction.mc2_graph import select as mc2_select
+from mindie_sim.prediction.operators.collectives.hccl_graph import NETWORK as HCCL_NETWORK
+from mindie_sim.prediction.operators.collectives.hccl_graph import lower as hccl_lower
+from mindie_sim.prediction.operators.mc2.mc2_graph import NETWORK as MC2_NETWORK
+from mindie_sim.prediction.operators.mc2.mc2_graph import recipes as mc2_recipes
+from mindie_sim.prediction.operators.mc2.mc2_graph import select as mc2_select
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.prediction.topology import Topology
 from mindie_sim.schema.common import ModelingError
@@ -73,17 +73,17 @@ GPU_SKUS = ("NVIDIA_H20", "NVIDIA_H800", "NVIDIA_H200", "NVIDIA_B300")
 #: ``(sku, preset, devices, ranks_per_node, tiers, routes)`` where each tier is
 #: ``(channel, member_count, service_bytes_per_ms, latency_us)``.
 TIER_LADDERS = ( (GEN2_SKU, "a2_standard", 16, None,
-     (("d2d_intra_node", 8, 196e6 * 0.70, 2.0), ("d2d_inter_node", 16, 25e6 * 0.80, 10.0)), ()),
+     (("d2d_intra_node", 8, 18.2e6, 16.0), ("d2d_inter_node", 16, 25e6 * 0.80, 10.0)), ()),
     (GEN5_PR_SKU, "a5_pcie_16p", 32, None,
      (("d2d_intra_4p", 4, 288e6 * 0.85, None), ("d2d_intra_8p", 8, 128e6 * 0.85, None),
       ("d2d_intra_node", 16, 116e6 * 0.85, None), ("d2d_inter_node", 32, 50e6 * 0.80, None)),
      ((0, 2, "d2d_intra_4p:0"), (0, 6, "d2d_intra_8p:0"), (0, 12, "d2d_intra_node:0"), (0, 20, "d2d_inter_node:0"))),
     (GEN5_DT_SKU, "a5_pod", 128, 64,
      (("d2d_intra_node", 64, 800e6 * 0.85, None), ("d2d_inter_node", 128, 800e6 * 0.80, 4.5)), ()),
-    (GEN3_SKU, "a3_superpod", 768, None,
-     (("d2d_intra_node", 16, 392e6 * 0.80, None), ("d2d_inter_node", 384, 392e6 * 0.70, 3.5),
-      ("d2d_inter_pod", 768, 50e6 * 0.70, 10.0)),
-     ((0, 8, "d2d_intra_node:0"), (0, 100, "d2d_inter_node:0"), (0, 500, "d2d_inter_pod:0"))),
+    (GEN3_SKU, "a3_superpod", 784, None,
+     (("d2d_intra_node", 16, 196e6 * 0.80, None), ("d2d_inter_node", 768, 196e6 * 0.70, 3.5),
+      ("d2d_inter_pod", 784, 25e6 * 0.70, 10.0)),
+     ((0, 8, "d2d_intra_node:0"), (0, 500, "d2d_inter_node:0"), (0, 768, "d2d_inter_pod:0"))),
 )
 
 def _machine(sku: str, *, devices: int = 16, ranks_per_node: int = 8, **extra) -> Hardware:

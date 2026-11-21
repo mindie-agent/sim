@@ -112,6 +112,118 @@ def _key_access_plan(spans, *, compression, key_row_bytes, q_row_bytes,
                     else min(total_visible, k_capacity))
     panel_rows = (max(1, k_allocation // key_row_bytes)
                   if k_allocation >= key_row_bytes else 0)
+    list_bytes, panel_rows = _score_panel_layout(
+        spans, compression, topk, q_tile_rows, kv_heads, ub_capacity, score_row_limit,
+        panel_rows)
+    l2_retained = (l2_capacity is not None and l2_capacity > 0
+                   and total_visible <= l2_capacity)
+    l1_state = (CacheState(CacheGeometry(k_allocation, line, transfer, 1))
+                if retained and k_allocation > 0 else None)
+    l2_state = (CacheState(CacheGeometry(l2_capacity, line, transfer, 1))
+                if l2_capacity is not None and l2_capacity > 0 else None)
+    (tiles, score_bytes, key_gm, key_hbm, key_logical, q_bytes_total,
+     pairs_total, panels_total) = _key_tiles(
+        spans, identity_prefix, q_tile_rows, q_row_bytes, compression, panel_rows,
+        key_row_bytes, retained, l1_state, l2_state, l2_retained, line,
+        aiv_units, topk, kv_heads)
+    exchange_total = sum(tile["exchange_bytes"] for tile in tiles)
+    exchange_per_tile = max((tile["exchange_bytes"] for tile in tiles), default=0)
+    receive_required = (topk * LOCAL_LIST_ELEMENT_BYTES if exchange_total else 0)
+    receive_bytes = 0
+    receive_alias = "none"
+    receive_chunks = 0
+    if receive_required:
+        if receive_required <= score_bytes:
+            # The score slot is dead after the last panel's local update, so
+            # the exchange receive slot can reuse it without another buffer.
+            receive_alias = "score_slot"
+            receive_chunks = 1
+        else:
+            spare = (max(0, int(ub_capacity) - list_bytes - score_bytes)
+                     if ub_capacity else receive_required)
+            receive_bytes = min(receive_required, spare)
+            if receive_bytes <= 0:
+                # The first score panel used the whole residual UB.  Re-solve
+                # with a panel small enough to reserve the real receive slot.
+                if score_row_limit is None and ub_capacity:
+                    spare_rows = ((int(ub_capacity) - list_bytes
+                                   - receive_required)
+                                  // max(1, q_tile_rows * SCORE_ELEMENT_BYTES))
+                    if spare_rows >= 1:
+                        return _key_access_plan(
+                            spans, compression=compression,
+                            key_row_bytes=key_row_bytes,
+                            q_row_bytes=q_row_bytes, q_tile_rows=q_tile_rows,
+                            topk=topk, kv_heads=kv_heads, aiv_units=aiv_units,
+                            ub_capacity=ub_capacity, l1_capacity=l1_capacity,
+                            l2_capacity=l2_capacity, owner=owner,
+                            identity_prefix=identity_prefix,
+                            gm_capacity=gm_capacity,
+                            exchange_grant=exchange_grant,
+                            score_row_limit=spare_rows)
+                raise ModelingError(
+                    "bf16_lightning_indexer_exchange_receive_has_no_ub")
+            receive_alias = "dedicated"
+            receive_chunks = _ceil_div(receive_required, receive_bytes)
+    workspace = (list_bytes + score_bytes
+                 + (receive_bytes if receive_alias == "dedicated" else 0))
+    if ub_capacity and workspace > ub_capacity:
+        raise ModelingError("bf16_lightning_indexer_ub_workspace_exceeds_capacity")
+    grant_name, grant_bytes = _exchange_grant(exchange_grant, exchange_per_tile, gm_capacity)
+    return {
+        "owner": int(owner),
+        "aiv_units": int(aiv_units),
+        "line_bytes": line, "transfer_bytes": transfer,
+        "q_tile_rows": q_tile_rows, "q_row_bytes": q_row_bytes,
+        "q_allocation_bytes": q_allocation,
+        "k_allocation_bytes": k_allocation,
+        "l1_allocation_bytes": q_allocation + k_allocation,
+        "l2_allocation_bytes": (min(total_visible, l2_capacity)
+                                if l2_capacity is not None and l2_capacity > 0
+                                else 0),
+        "l1_capacity_bytes": l1_capacity,
+        "l2_capacity_bytes": l2_capacity,
+        "l1_policy": ("retain_prefix" if retained else
+                      "stream_panels" if l1_capacity > 0 else "no_l1"),
+        "l2_policy": ("retain_prefix" if l2_retained else
+                      "stream_panels" if l2_capacity is not None and l2_capacity > 0
+                      else "no_l2"),
+        "retained": retained, "l2_retained": l2_retained,
+        "panel_rows": panel_rows,
+        "score_bytes": score_bytes,
+        "list_bytes": list_bytes,
+        "exchange_receive_bytes": int(receive_required),
+        "exchange_receive_additional_bytes": int(receive_bytes),
+        "exchange_receive_alias": receive_alias,
+        "exchange_receive_chunks": int(receive_chunks),
+        "workspace_bytes": workspace,
+        "exchange_total_bytes": int(exchange_total),
+        "exchange_per_tile_bytes": int(exchange_per_tile),
+        "exchange_gm_bytes": int(exchange_per_tile if grant_name is None else 0),
+        "exchange_gm_capacity_bytes": gm_capacity,
+        "exchange_gm_fits": (gm_capacity is None
+                             or gm_capacity >= exchange_per_tile),
+        "exchange_grant": grant_name,
+        "exchange_grant_bytes": grant_bytes,
+        "exchange_grant_reused": grant_name is not None,
+        "exchange_hbm_bytes": 2 * int(exchange_total),
+        "full_scores_bytes": pairs_total * SCORE_ELEMENT_BYTES,
+        "full_lists_bytes": (sum(q for q, _ in spans) * topk * kv_heads
+                             * aiv_units * LOCAL_LIST_ELEMENT_BYTES),
+        "total_visible_bytes": total_visible,
+        "key_logical_bytes": key_logical,
+        "key_gm_bytes": key_gm,
+        "key_hbm_bytes": key_hbm,
+        "q_bytes": q_bytes_total,
+        "pairs": pairs_total,
+        "panels": panels_total,
+        "tiles": tiles,
+    }
+
+
+def _score_panel_layout(
+    spans, compression, topk, q_tile_rows, kv_heads, ub_capacity, score_row_limit, panel_rows,
+):
     # Per-AIV destination buffers: one 16-row score panel and one local-list
     # slot.  They are reused across panels/tiles; the score slot is also the
     # exchange staging slot after its panel is consumed.
@@ -131,14 +243,15 @@ def _key_access_plan(spans, *, compression, key_row_bytes, q_row_bytes,
     elif score_row_limit is not None:
         panel_rows = max(1, min(panel_rows or int(score_row_limit),
                                 int(score_row_limit)))
-    score_bytes = 0
-    l2_retained = (l2_capacity is not None and l2_capacity > 0
-                   and total_visible <= l2_capacity)
-    l1_state = (CacheState(CacheGeometry(k_allocation, line, transfer, 1))
-                if retained and k_allocation > 0 else None)
-    l2_state = (CacheState(CacheGeometry(l2_capacity, line, transfer, 1))
-                if l2_capacity is not None and l2_capacity > 0 else None)
+    return list_bytes, panel_rows
+
+
+def _key_tiles(
+    spans, identity_prefix, q_tile_rows, q_row_bytes, compression, panel_rows, key_row_bytes,
+    retained, l1_state, l2_state, l2_retained, line, aiv_units, topk, kv_heads,
+):
     tiles = []
+    score_bytes = 0
     key_gm = key_hbm = key_logical = q_bytes_total = pairs_total = 0
     panels_total = 0
     for request, (q_len, context) in enumerate(spans):
@@ -211,49 +324,10 @@ def _key_access_plan(spans, *, compression, key_row_bytes, q_row_bytes,
                 "panel_merge_ops": panel_merge_ops,
                 "output_bytes": ((q_end - q_start) * kv_heads * topk * INDEX_ELEMENT_BYTES),
             })
-    exchange_total = sum(tile["exchange_bytes"] for tile in tiles)
-    exchange_per_tile = max((tile["exchange_bytes"] for tile in tiles), default=0)
-    receive_required = (topk * LOCAL_LIST_ELEMENT_BYTES if exchange_total else 0)
-    receive_bytes = 0
-    receive_alias = "none"
-    receive_chunks = 0
-    if receive_required:
-        if receive_required <= score_bytes:
-            # The score slot is dead after the last panel's local update, so
-            # the exchange receive slot can reuse it without another buffer.
-            receive_alias = "score_slot"
-            receive_chunks = 1
-        else:
-            spare = (max(0, int(ub_capacity) - list_bytes - score_bytes)
-                     if ub_capacity else receive_required)
-            receive_bytes = min(receive_required, spare)
-            if receive_bytes <= 0:
-                # The first score panel used the whole residual UB.  Re-solve
-                # with a panel small enough to reserve the real receive slot.
-                if score_row_limit is None and ub_capacity:
-                    spare_rows = ((int(ub_capacity) - list_bytes
-                                   - receive_required)
-                                  // max(1, q_tile_rows * SCORE_ELEMENT_BYTES))
-                    if spare_rows >= 1:
-                        return _key_access_plan(
-                            spans, compression=compression,
-                            key_row_bytes=key_row_bytes,
-                            q_row_bytes=q_row_bytes, q_tile_rows=q_tile_rows,
-                            topk=topk, kv_heads=kv_heads, aiv_units=aiv_units,
-                            ub_capacity=ub_capacity, l1_capacity=l1_capacity,
-                            l2_capacity=l2_capacity, owner=owner,
-                            identity_prefix=identity_prefix,
-                            gm_capacity=gm_capacity,
-                            exchange_grant=exchange_grant,
-                            score_row_limit=spare_rows)
-                raise ModelingError(
-                    "bf16_lightning_indexer_exchange_receive_has_no_ub")
-            receive_alias = "dedicated"
-            receive_chunks = _ceil_div(receive_required, receive_bytes)
-    workspace = (list_bytes + score_bytes
-                 + (receive_bytes if receive_alias == "dedicated" else 0))
-    if ub_capacity and workspace > ub_capacity:
-        raise ModelingError("bf16_lightning_indexer_ub_workspace_exceeds_capacity")
+    return tiles, score_bytes, key_gm, key_hbm, key_logical, q_bytes_total, pairs_total, panels_total
+
+
+def _exchange_grant(exchange_grant, exchange_per_tile, gm_capacity):
     grant_name = None
     grant_bytes = None
     if exchange_grant is not None:
@@ -272,52 +346,4 @@ def _key_access_plan(spans, *, compression, key_row_bytes, q_row_bytes,
                     "bf16_lightning_indexer_exchange_grant_too_small")
     if gm_capacity is not None and gm_capacity < exchange_per_tile:
         raise ModelingError("bf16_lightning_indexer_exchange_gm_capacity")
-    return {
-        "owner": int(owner),
-        "aiv_units": int(aiv_units),
-        "line_bytes": line, "transfer_bytes": transfer,
-        "q_tile_rows": q_tile_rows, "q_row_bytes": q_row_bytes,
-        "q_allocation_bytes": q_allocation,
-        "k_allocation_bytes": k_allocation,
-        "l1_allocation_bytes": q_allocation + k_allocation,
-        "l2_allocation_bytes": (min(total_visible, l2_capacity)
-                                if l2_capacity is not None and l2_capacity > 0
-                                else 0),
-        "l1_capacity_bytes": l1_capacity,
-        "l2_capacity_bytes": l2_capacity,
-        "l1_policy": ("retain_prefix" if retained else
-                      "stream_panels" if l1_capacity > 0 else "no_l1"),
-        "l2_policy": ("retain_prefix" if l2_retained else
-                      "stream_panels" if l2_capacity is not None and l2_capacity > 0
-                      else "no_l2"),
-        "retained": retained, "l2_retained": l2_retained,
-        "panel_rows": panel_rows,
-        "score_bytes": score_bytes,
-        "list_bytes": list_bytes,
-        "exchange_receive_bytes": int(receive_required),
-        "exchange_receive_additional_bytes": int(receive_bytes),
-        "exchange_receive_alias": receive_alias,
-        "exchange_receive_chunks": int(receive_chunks),
-        "workspace_bytes": workspace,
-        "exchange_total_bytes": int(exchange_total),
-        "exchange_per_tile_bytes": int(exchange_per_tile),
-        "exchange_gm_bytes": int(exchange_per_tile if grant_name is None else 0),
-        "exchange_gm_capacity_bytes": gm_capacity,
-        "exchange_gm_fits": (gm_capacity is None
-                             or gm_capacity >= exchange_per_tile),
-        "exchange_grant": grant_name,
-        "exchange_grant_bytes": grant_bytes,
-        "exchange_grant_reused": grant_name is not None,
-        "exchange_hbm_bytes": 2 * int(exchange_total),
-        "full_scores_bytes": pairs_total * SCORE_ELEMENT_BYTES,
-        "full_lists_bytes": (sum(q for q, _ in spans) * topk * kv_heads
-                             * aiv_units * LOCAL_LIST_ELEMENT_BYTES),
-        "total_visible_bytes": total_visible,
-        "key_logical_bytes": key_logical,
-        "key_gm_bytes": key_gm,
-        "key_hbm_bytes": key_hbm,
-        "q_bytes": q_bytes_total,
-        "pairs": pairs_total,
-        "panels": panels_total,
-        "tiles": tiles,
-    }
+    return grant_name, grant_bytes

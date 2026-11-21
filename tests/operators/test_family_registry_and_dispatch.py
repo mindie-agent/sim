@@ -321,12 +321,12 @@ def test_coupling_retains_both_resources_and_ties_follow_submission_order():
         assert [row["task"] for row in list(engine.trace)[:3]] == ["first", "second", "join"]
         assert engine.serviced == {"a": 30, "b": 10} and done.time == 3
         assert engine.busy_ms == {"a": 3, "b": 3 if coupled else 1}
-EXTENSIONS = ("cuda_norm", "cuda_quant", "attention", "grouped_gemm", "moe_align",
-              "moe_combine", "gdn_prepare", "gdn_state")
+EXTENSIONS = ("cuda_norm", "cuda_quant", "attention", "grouped_gemm", "moe_align", "moe_combine", "gdn_prepare", "gdn_state")
+_EXT_MOD = {"cuda_norm": "vector", "cuda_quant": "vector", "grouped_gemm": "grouped_moe", "moe_align": "moe_routing", "moe_combine": "moe_routing", "gdn_prepare": "linear_attention", "gdn_state": "linear_attention"}
 def _source_case(name):
     if name == "attention":
         return attention, replace(OPS[attention.register_family()], requests=("r",)), sku_case(REPRESENTATIVE_SKUS["a5"])
-    module = importlib.import_module("mindie_sim.prediction.operators." + name)
+    module = importlib.import_module(f"mindie_sim.prediction.operators.{_EXT_MOD[name]}.{name}")
     params = json.loads((FIXTURES / "operator_cases" / f"{name}.json").read_text())["cases"][0]["params"]
     op = replace(module.make_op(params), requests=("r",))
     return module, op, parse_case(control_case(units=4, service_roles=getattr(module, "SERVICE_ROLES", {})))
@@ -570,7 +570,7 @@ def test_final_normalization_obeys_selected_row_scope_and_partial_prefill():
     partial, _ = Frontend().logits(case.model, case.runtime, (replace(views[0], samples=False),), "body", mode="prefill")
     assert len(partial) == 1 and partial[0].local_shape[0] == 8
 def test_tail_copy_supply_tracks_active_owners_and_scalar_store_masks_rows():
-    from mindie_sim.prediction.matrix import TiledMatmul
+    from mindie_sim.prediction.operators.matrix.matrix import TiledMatmul
     from mindie_sim.prediction.pointwise import TiledPointwise
     op = _matrix("tile", (), m=1, n=4, k=2)
     rates, times = dict(cube=10000, hbm=100000, mte2=100, mte3=100), []

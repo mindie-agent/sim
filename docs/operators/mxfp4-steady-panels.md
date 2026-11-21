@@ -45,9 +45,9 @@ to the source's GM destination remains an explicit profile approximation.
 
 Sources and reproducible controls:
 
-- [Source program](../../mindie_sim/prediction/mxfp4_grouped.py),
-  [period recurrence](../../mindie_sim/prediction/matrix_cycle.py), and
-  [producer/interior composition](../../mindie_sim/prediction/refill_steady.py).
+- [Source program](../../mindie_sim/prediction/operators/mx_quant_matrix/mxfp4_grouped.py),
+  [period recurrence](../../mindie_sim/prediction/operators/matrix/matrix_cycle.py), and
+  [producer/interior composition](../../mindie_sim/prediction/operators/matrix/refill_steady.py).
 - Independent A5 scans
   and mechanism/pressure controls.
 - The retained official table is

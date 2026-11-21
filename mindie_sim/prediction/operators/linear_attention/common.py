@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import InitVar, dataclass, field, replace
 from types import MappingProxyType, SimpleNamespace
 from typing import Any, Literal
 
@@ -17,24 +17,21 @@ from mindie_sim.public.errors import UnmodeledCapabilityError
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.datapath import DatapathCapabilitySpec, SourceRef
 from mindie_sim.schema.operators import OpSpec
+from mindie_sim.schema.workload import RequestView
 from mindie_sim.templates.dsl_catalog import KDA_AIC_CORE_LIMIT as KDA_MAX_AIC_CORES
 from mindie_sim.templates.dsl_catalog import KDA_DEFAULT_WORKSPACE_SLOTS as KDA_WORKSPACE_SLOTS
-from ...gdn_domain import GDN_CHUNK64_GQA_RATIOS
 from ...mechanism import OperatorPlan, Work
 from ...ownership import unit_group
 from ...program import KernelProgram, Program, RecipeContext, Stage
 from ...results import FusedPipelineDescriptor, FusedPipelineSpec, PipelinePhase, WorkItem
 from ...runtime.l2_residency import AdmissionMemoryView
-from ...runtime.memory_physics import (
-    AddressRun, AddressRunPlan, MemoryAccessPattern, ReuseKey, VisibilityContract,
-)
+from ...runtime.memory_physics import AddressRun, AddressRunPlan, MemoryAccessPattern, ReuseKey, VisibilityContract
 from ...runtime.tile_solver import LiveBufferSpec, TileCandidate, TilePipelineSpec, TileShape, solve
 from ..contracts import OperatorPlanningContext
+from .gdn_domain import GDN_CHUNK32_TOKENS, GDN_CHUNK64_GQA_RATIOS, GDN_CHUNK64_TOKENS
 
 FP32_BYTES = 4
 MASK_OPS_PER_PAIR = 4
-GDN_CHUNK32_TOKENS = 32
-GDN_CHUNK64_TOKENS = 64
 DIAG_BLOCK_WIDTH = GDN_CHUNK32_TOKENS
 DEFAULT_VALUE_TILE = 128
 DEFAULT_KEY_TILE = 64
@@ -69,6 +66,7 @@ OPERATIONS = frozenset({
     "causal_conv1d", "recover_ssm_verify", "recover_ssm_commit",
 })
 RECOVER_SSM_FAMILIES = ("kda", "gdn", "deltanet", "gla", "lightning", "retnet", "mamba")
+RECTANGULAR_LAYOUTS = frozenset({"BSND", "BNSD", "BSH"})
 
 def ceil_div(value: int, width: int) -> int:
     return (value + width - 1) // width
@@ -82,6 +80,41 @@ def _lengths(lengths: Sequence[int]) -> tuple[int, ...]:
         raise ModelingError("linear_attention_requires_sequence_lengths")
     _positive(*lengths)
     return tuple(lengths)
+
+def request_lengths(requests: tuple[RequestView, ...]) -> tuple[int, ...]:
+    for view in requests:
+        if not view.padding:
+            _positive(view.logical_q_len, view.kv_len)
+    return tuple(view.logical_q_len for view in requests)
+
+
+def request_layout_metadata(ctx: OperatorPlanningContext) -> dict[str, Any]:
+    """Project the GM bases in each tensor's row units from the request views."""
+    if not ctx.requests:
+        return {}
+    rectangular = ctx.layout.upper() in RECTANGULAR_LAYOUTS
+    q_sizes, kv_sizes, kv_offsets, q_ranges = [], [], [], []
+    q_base = kv_base = 0
+    for view in ctx.requests:
+        q_len = view.logical_q_len
+        q_size = view.physical_q_len if rectangular else q_len
+        kv_size = view.physical_kv_len if rectangular else q_len
+        if not view.padding:
+            kv_offsets.append(kv_base)
+            q_ranges.append((q_base, q_base + q_len))
+        q_sizes.append(q_size)
+        kv_sizes.append(kv_size)
+        q_base += q_size
+        kv_base += kv_size
+    return {
+        "sequence_layout": ctx.layout,
+        "logical_sequence_tokens": tuple(view.logical_q_len for view in ctx.requests),
+        "physical_query_rows": max(ctx.padded_tokens, q_base), "physical_kv_rows": kv_base,
+        "physical_sequence_tokens": tuple(q_sizes), "physical_sequence_kv_tokens": tuple(kv_sizes),
+        "sequence_kv_lengths": tuple(view.kv_len for view in ctx.requests),
+        "physical_row_offsets": tuple(start for start, _ in q_ranges),
+        "physical_kv_row_offsets": tuple(kv_offsets), "input_row_ranges": tuple(q_ranges),
+    }
 
 def element_bytes(dtype: str) -> int:
     width = dtype_bytes(dtype)
@@ -120,9 +153,11 @@ class LinearAttentionContract:
     l2_capacity_bytes: int | None = None
     active_l2_streams: int = 1
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    allow_empty: InitVar[bool] = False
 
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "lengths", _lengths(self.lengths))
+    def __post_init__(self, allow_empty: bool) -> None:
+        if self.lengths or not allow_empty:
+            object.__setattr__(self, "lengths", _lengths(self.lengths))
         object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
         _positive(self.hq, self.hk, self.hv, self.dk, self.dv, self.bt, self.bv, self.bk,
                   self.active_l2_streams)
@@ -203,7 +238,12 @@ def validate_contract(op: OpSpec, ctx: OperatorPlanningContext) -> LinearAttenti
     ):
         raise ModelingError(f"linear_attention_abi_operation_mismatch:{abi}:{operation}")
 
-    lengths = _lengths(metadata.get("lengths", metadata.get("sequence_lengths", metadata.get("sequence_tokens", ()))))
+    use_requests = bool(ctx.requests) and (operation.endswith(("_prefill", "_recurrent"))
+                                          or operation == "gdn_chunk32")
+    if use_requests:
+        lengths = tuple(length for length in request_lengths(ctx.requests) if length)
+    else:
+        lengths = _lengths(metadata.get("lengths", metadata.get("sequence_lengths", metadata.get("sequence_tokens", ()))))
     dtype = metadata.get("dtype", op.dtype or "bf16")
     if operation == "causal_conv1d":
         channels, width = metadata.get("channels"), metadata.get("width", metadata.get("taps"))
@@ -267,7 +307,7 @@ def validate_contract(op: OpSpec, ctx: OperatorPlanningContext) -> LinearAttenti
     return LinearAttentionContract(
         operation, lengths, hq, hk, hv, dk, dv, bt,
         metadata.get("bv", DEFAULT_VALUE_TILE), metadata.get("bk", DEFAULT_KEY_TILE),
-        dtype, abi=abi, metadata=metadata, **fields,
+        dtype, abi=abi, metadata=metadata, allow_empty=use_requests, **fields,
     )
 
 
@@ -373,12 +413,18 @@ def analyze_state_residency(
     head_bytes = contract.dv * contract.dk * element_bytes(contract.stored_chunk_state_dtype)
     chunk_bytes = contract.hv * head_bytes
     size = chunks * chunk_bytes
-    capacity = contract.l2_capacity_bytes
+    capacity = (path.usable_bytes("l2") if contract.l2_capacity_bytes is None else contract.l2_capacity_bytes)
+    admission = ctx.admission_memory_view if ctx is not None else None
+    if admission is not None:
+        die = ctx.occurrence.rank if ctx.occurrence.rank is not None else 0
+        capacity = min(capacity, admission.effective_l2_bytes(die))
     units = ctx.geometry.buffer_units.get("l2", 1) if ctx else 1
-    view = AdmissionMemoryView({0: path.usable_bytes("l2") if capacity is None else capacity},
-                               l2_buffer_units_by_die={0: units})
-    for stream in range(contract.active_l2_streams):
-        view.enter_stream(0, str(stream))
+    # Predict the synthetic bank's write/read without modifying live admission.
+    view = AdmissionMemoryView({0: capacity}, l2_buffer_units_by_die={0: units},
+                               granule_bytes=admission.granule_bytes if admission is not None else None)
+    if admission is None:
+        for stream in range(contract.active_l2_streams):
+            view.enter_stream(0, str(stream))
     key = ReuseKey(0, "chunk_state_bank", 0, "0")
     runs = AddressRunPlan((AddressRun(0, chunks * contract.hv, head_bytes, head_bytes),))
     read = MemoryAccessPattern("chunk_state_bank", 0, 0, 0, "read", "mte2_aic", size, runs, key)
@@ -622,7 +668,7 @@ def make_plan(ctx: OperatorPlanningContext, implementation: str, phases: Sequenc
 
     return OperatorPlan(work, program or lower, {
         "implementation": implementation, "arch_id": str(ctx.compute_arch.arch_id),
-        "launch_count": launch_count, **(metadata or {}),
+        "launch_count": launch_count, **(metadata or {}), **request_layout_metadata(ctx),
     }, pipeline_spec=make_pipeline_spec(implementation, phases, sources, family=family))
 
 def transfer(ctx: OperatorPlanningContext, *, read: int = 0, write: int = 0,

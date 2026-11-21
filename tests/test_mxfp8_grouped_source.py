@@ -8,7 +8,7 @@ import pytest
 
 from mindie_sim import operator_costs, target_graphs
 from mindie_sim.prediction.mechanism import Geometry
-from mindie_sim.prediction.mxfp8_grouped import Mapping, build, owner_tiles, panel_work, recipe
+from mindie_sim.prediction.operators.mx_quant_matrix.mxfp8_grouped import Mapping, build, owner_tiles, panel_work, recipe
 from mindie_sim.prediction.program import RecipeBook
 from mindie_sim.prediction.structure import parse_case
 

@@ -33,6 +33,9 @@ class RequestView:
     query_ranges: tuple[tuple[int, int], ...] = ()
     #: Physical prefix-pool identity of the request's immutable prefix.
     prefix_cache_key: str = ""
+    #: Optional outer physical tensor padding lengths for rectangular BSND/BNSD/BSH layouts.
+    padded_q_len: int = 0
+    padded_seq_len: int = 0
 
     def __post_init__(self) -> None:
         if not self.semantic_phase:
@@ -55,8 +58,18 @@ class RequestView:
             return 0
         return self.context + (self.global_q_len or self.q_len)
 
+    @property
+    def physical_q_len(self) -> int:
+        """Outer physical query stride (``padded_q_len`` for BSND/BNSD/BSH, else ``q_len``)."""
+        return max(int(self.q_len), int(self.padded_q_len))
+
+    @property
+    def physical_kv_len(self) -> int:
+        """Outer physical KV stride (``padded_seq_len`` for BSND/BNSD/BSH, else ``kv_len``)."""
+        return max(int(self.kv_len), int(self.padded_seq_len))
+
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "request_id": self.request_id, "q_len": self.q_len,
             "context": self.context, "kv_len": self.kv_len,
             "samples": self.samples, "phase": self.phase,
@@ -80,6 +93,11 @@ class RequestView:
             "query_ranges": self.query_ranges,
             "prefix_cache_key": self.prefix_cache_key,
         }
+        if self.padded_q_len:
+            payload["padded_q_len"] = self.padded_q_len
+        if self.padded_seq_len:
+            payload["padded_seq_len"] = self.padded_seq_len
+        return payload
 
 @dataclass(frozen=True)
 class IterationPlan:

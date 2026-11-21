@@ -6,8 +6,9 @@ from pathlib import Path
 import pytest
 
 from mindie_sim import graph_costs, operator_costs, predict, target_graphs, target_operators
+from mindie_sim.prediction.body_defaults import DEFAULT_MATMUL_CANDIDATES
 from mindie_sim.prediction.program import RecipeBook
-from mindie_sim.prediction.matrix import TiledMatmul
+from mindie_sim.prediction.operators.matrix.matrix import TiledMatmul
 from mindie_sim.structure import export_structure
 from test_prediction_system import case
 from _support.moe_hc_mc2_fixtures import grouped_case
@@ -47,8 +48,6 @@ def test_body_matrix_default_is_shared_by_predict_graph_operators_and_structure(
     program = structure["execution"]["software"]["kernels"]["programs"]["matmul"]
     assert program["kind"] == "steady_matmul"
     assert program["owner_cohorts"] is True
-    # M2 declares the full ordered candidate grid; the historical coarse pair
-    # remains part of that same default, not a second selection path.
     assert [128, 128, 128] in program["candidates"]
     assert [128, 128, 64] in program["candidates"]
     assert structure["execution"]["default_mechanisms"] == body["default_mechanisms"]
@@ -126,7 +125,7 @@ def test_serving_default_remains_the_explicit_tiled_control():
     steady = deepcopy(raw)
     steady["runtime"]["kernels"] = {
         "programs": {"matmul": {"kind": "steady_matmul", "owner_cohorts": True,
-                                "candidates": [[128, 128, 128], [128, 128, 64]]}},
+                                "candidates": [list(tile) for tile in DEFAULT_MATMUL_CANDIDATES]}},
         "families": {"grouped_gemm": {"kind": "steady_matmul", "owner_cohorts": True}},
     }
     steady_report = predict(steady)
@@ -138,7 +137,8 @@ def test_serving_default_remains_the_explicit_tiled_control():
     explicit["runtime"]["kernels"] = {"programs": {"matmul": {"kind": "tiled_matmul"}}}
     control = predict(explicit)
     assert control["execution"]["work"] == automatic["execution"]["work"]
-    assert control["execution"]["allocation_events"] > automatic["execution"]["allocation_events"]
+    # The default candidate grid selects smaller output tiles for this case.
+    assert automatic["execution"]["allocation_events"] > control["execution"]["allocation_events"]
 
 
 def test_default_keeps_tier4_router_owner_grid_and_grouped_mapping_domain():

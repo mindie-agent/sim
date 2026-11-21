@@ -12,6 +12,7 @@ from mindie_sim.schema.operators import OpSpec
 from ...mechanism import Geometry, OperatorPlan
 from ...results import OpOccurrence
 from ..contracts import OperatorFamilySpec, OperatorPlanningContext, ResolvedOperator
+from ..attention.common import with_sequence_context
 from . import arch22, arch35
 from ._lowering import describe
 from .common import (
@@ -41,6 +42,7 @@ def build(op: OpSpec, geometry_or_ctx: Geometry | OperatorPlanningContext, /) ->
             OpOccurrence(geo.replica, op.stage, geo.rank, op.op_id), geo, geo.datapath,
             requested_abi=dict(op.metadata).get("requested_abi"), stream_owners=geo.stream_owners,
         )
+    ctx = with_sequence_context(op, ctx)
     arch_id = ctx.compute_arch.arch_id
     strategy = _STRATEGIES.get(arch_id)
     if strategy is None:

@@ -20,15 +20,15 @@ from _support.collective_cases import case, declared, isolated_calls
 from _support.kernel_invocation import op as make_op
 
 from mindie_sim import graph_costs, operator_costs, predict, target_graphs
-from mindie_sim.prediction import hccl_aiv, hccl_aiv_gather, hccl_ccu, hccl_ccu_two_die
+from mindie_sim.prediction.operators.collectives import hccl_aiv, hccl_aiv_gather, hccl_ccu, hccl_ccu_two_die
 from mindie_sim.prediction.engine import Engine, Resource
-from mindie_sim.prediction.hccl_aicpu import build as build_aicpu
-from mindie_sim.prediction.hccl_aicpu import contract as aicpu_contract
-from mindie_sim.prediction.hccl_aiv import UB_BATCH, UB_RESIDENCY
-from mindie_sim.prediction.hccl_aiv_gather import DATA_LIMIT, FLAG_BYTES
-from mindie_sim.prediction.hccl_ccu_two_die import SERVICES, TEMPLATE
-from mindie_sim.prediction.hccl_contracts import legacy_mesh_candidate, select
-from mindie_sim.prediction.hccl_graph import lower
+from mindie_sim.prediction.operators.collectives.hccl_aicpu import build as build_aicpu
+from mindie_sim.prediction.operators.collectives.hccl_aicpu import contract as aicpu_contract
+from mindie_sim.prediction.operators.collectives.hccl_aiv import UB_BATCH, UB_RESIDENCY
+from mindie_sim.prediction.operators.collectives.hccl_aiv_gather import DATA_LIMIT, FLAG_BYTES
+from mindie_sim.prediction.operators.collectives.hccl_ccu_two_die import SERVICES, TEMPLATE
+from mindie_sim.prediction.operators.collectives.hccl_contracts import legacy_mesh_candidate, select
+from mindie_sim.prediction.operators.collectives.hccl_graph import lower
 from mindie_sim.prediction.mechanism import Geometry, OperatorPlan, PlannedRecipe, Work
 from mindie_sim.prediction.native_binding import bind_native_call, validate_invocation
 from mindie_sim.prediction.program import (

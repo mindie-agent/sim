@@ -33,7 +33,7 @@ import math
 
 from mindie_sim.catalog.ops import activation_scales, gemm_op
 from mindie_sim.catalog.types import QuantSpec
-from mindie_sim.prediction.gated_activation import gated_activation
+from mindie_sim.prediction.operators.vector.gated_activation import gated_activation
 from mindie_sim.prediction.program import RecipeBook
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.prediction.transforms import activation_quantization

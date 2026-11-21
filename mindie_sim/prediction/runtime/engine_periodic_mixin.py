@@ -10,9 +10,41 @@
 from __future__ import annotations
 
 from collections.abc import Mapping as _AbcMapping
+import hashlib
 import math
 
 from .engine_types import ExecutionError, _structural_value
+
+_L2_DIGEST_BYTES = 8
+_PERIODIC_EPOCH_MISS_MULTIPLIER = 2
+_PERIODIC_COLD_ISSUE_MULTIPLIER = 2
+
+
+def _admission_l2_digest(view) -> str:
+    """Return a deterministic digest of live L2 residency, reservations, and dirty state."""
+    if view is None:
+        return ""
+    h = hashlib.blake2b(digest_size=_L2_DIGEST_BYTES)
+    caps = getattr(view, "_l2_capacity", None) or {}
+    resv = getattr(view, "_reserved", None) or {}
+    resident = getattr(view, "_resident", None) or {}
+    dirty = getattr(view, "_pending_writebacks", None) or {}
+    for die in sorted(caps):
+        h.update(f"d{die}:{caps[die]}:".encode("utf-8"))
+        for rkey, rval in sorted(resv.get(die, {}).items()):
+            h.update(f"r{rkey}={rval};".encode("utf-8"))
+        entries = resident.get(die)
+        if entries:
+            for rkey, entry in entries.items():
+                cov = getattr(entry, "coverage", None)
+                cbytes = getattr(cov, "total_bytes", 0) if cov is not None else 0
+                dbytes = getattr(entry, "dirty_bytes", 0)
+                h.update(f"e{rkey.allocation_id}:{rkey.version}:{cbytes}:{dbytes};".encode("utf-8"))
+        wb = dirty.get(die)
+        if wb:
+            for item in wb:
+                h.update(f"w{item.bytes};".encode("utf-8"))
+    return h.hexdigest()
 
 
 class _EnginePeriodicMixin:
@@ -113,7 +145,9 @@ class _EnginePeriodicMixin:
             return 0
 
         parts = sorted(str(version(ledger)) for ledger in ledgers.values())
-        return "mem:" + ":".join(parts or ("0",))
+        base = "mem:" + ":".join(parts or ("0",))
+        l2_dig = _admission_l2_digest(getattr(self, "_admission_memory_view", None))
+        return f"{base}|l2:{l2_dig}" if l2_dig else base
 
     def _progressable_periodic_run(self, periods: int) -> bool:
         """Cheap necessary condition for any further periodic evidence.
@@ -125,8 +159,11 @@ class _EnginePeriodicMixin:
         the observer must not pay a full structural validation for it.
         """
         for run in self._periodic_runs.values():
-            window = len(tuple(run.get("slots", ()))) or 1
-            if int(run.get("total", 0)) - int(run.get("next", 0)) > periods * window:
+            slots = tuple(run.get("slots", ()))
+            if not slots:
+                continue
+            end = int(run.get("phase_end", run.get("total", 0)))
+            if end - int(run.get("next", 0)) > periods * len(slots):
                 return True
         return False
 
@@ -160,6 +197,47 @@ class _EnginePeriodicMixin:
                 return True
         return False
 
+    def _periodic_epoch_stalled(self, detector) -> bool:
+        """Return True once the active periodic epoch cannot match within ``max_lag``."""
+        epoch_key = tuple(
+            (run_id, run.get("phase_ordinal", 0), run.get("phase_end", 0))
+            for run_id, run in sorted(self._periodic_runs.items())
+            if run.get("slots")
+        )
+        miss_budget = _PERIODIC_EPOCH_MISS_MULTIPLIER * detector.history_limit
+        any_retired = any(
+            int(run.get("finished", 0)) > 0
+            for run in self._periodic_runs.values()
+            if run.get("slots")
+        )
+        issue_limit = (
+            detector.max_lag
+            if any_retired
+            else _PERIODIC_COLD_ISSUE_MULTIPLIER * detector.max_lag
+        )
+        if epoch_key != self._periodic_stall_epoch:
+            if (self._periodic_stall_obs >= miss_budget
+                    or self._periodic_no_issue_streak > issue_limit):
+                self._periodic_last = None
+            self._periodic_stall_epoch = epoch_key
+            self._periodic_stall_obs = 0
+            self._periodic_last_next_sum = -1
+            self._periodic_no_issue_streak = 0
+        if (self._periodic_stall_obs >= miss_budget
+                or self._periodic_no_issue_streak > issue_limit):
+            return True
+        next_sum = sum(
+            int(run.get("next", 0))
+            for run in self._periodic_runs.values()
+            if run.get("slots")
+        )
+        if next_sum == self._periodic_last_next_sum:
+            self._periodic_no_issue_streak += 1
+            return self._periodic_no_issue_streak > issue_limit
+        self._periodic_last_next_sum = next_sum
+        self._periodic_no_issue_streak = 0
+        return False
+
     def _periodic_observe(self, stop_at: float):
         """Read-only periodic frontier observation on the settled Engine."""
         if not self._periodic_runs:
@@ -182,17 +260,20 @@ class _EnginePeriodicMixin:
                 or sum(len(tuple(run.get("slots", ())))
                        for run in self._periodic_runs.values()) > 128):
             return None
-        try:
-            from ..engine_periodic import CycleDetector, SettledFrontier, Cursor
-        except ImportError:
-            return None
-        if self._periodic_detector is None:
-            self._periodic_detector = CycleDetector()
-        if not self._progressable_periodic_run(
-                self._periodic_detector.evidence_periods):
+        detector = self._periodic_detector
+        if detector is None:
+            try:
+                from ..engine_periodic import CycleDetector
+            except ImportError:
+                return None
+            detector = CycleDetector()
+            self._periodic_detector = detector
+        if not self._progressable_periodic_run(detector.evidence_periods):
             # No run can reach the next comparable period, so no skip is
             # possible here.  Keep the measured interval baseline: the next
             # real observation then aggregates this whole span exactly.
+            return None
+        if self._periodic_epoch_stalled(detector):
             return None
         if (self._periodic_last is not None
                 and self._external_completions
@@ -203,6 +284,7 @@ class _EnginePeriodicMixin:
             # can never become evidence.  Skipping the observation is a sound
             # O(1) rejection, not a lost proof.
             return None
+        from ..engine_periodic import Cursor, IntervalDelta, SettledFrontier
         state = self._periodic_state()
         cursors = tuple(
             Cursor(run_id, run.get("phase_ordinal", 0),
@@ -211,7 +293,6 @@ class _EnginePeriodicMixin:
             for run_id, run in sorted(self._periodic_runs.items()))
         if self._releases:
             stop_at = min(stop_at, self._releases[0][0])
-        from ..engine_periodic import IntervalDelta
         interval = None
         if self._periodic_last is not None:
             previous = self._periodic_last
@@ -246,6 +327,12 @@ class _EnginePeriodicMixin:
             cursors=cursors, sequence=self._sequence)
         skip = self._periodic_detector.observe(
             frame, interval, stop_at=stop_at)
+        if skip is not None:
+            self._periodic_stall_obs = 0
+            self._periodic_last_next_sum = -1
+            self._periodic_no_issue_streak = 0
+        else:
+            self._periodic_stall_obs += 1
         self._periodic_last = {
             "now": self.now, "sequence": self._sequence,
             "serviced": dict(self.serviced), "busy": dict(self.busy_ms),

@@ -1,7 +1,7 @@
 {
   "arch_preset": "npu_arch_3510",
   "cann_version": "unmeasured",
-  "envelope_sha256": "fea871ba428734e6c7f307812082ffc4686a820146026115de5bcc367bf2a997",
+  "envelope_sha256": "8995e5120a9c8c21c87038001c6794b8c52df8c1676dd540e49ddfef482f8c57",
   "primitives": {
     "P01_datacopy": {
       "evidence_id": "",
@@ -45,11 +45,11 @@
       "metrics": {
         "l1_to_l0a_bytes_per_s_per_aic": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 409600000000.0
+          "certified_upper_capacity": 422400000000.0
         },
         "l1_to_l0b_bytes_per_s_per_aic": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 204800000000.0
+          "certified_upper_capacity": 422400000000.0
         },
         "setup_ns": {
           "bound_kind": "latency_lower",
@@ -632,9 +632,9 @@
     "collected_utc": "2026-11-21T01:05:25Z",
     "endpoint_alias": "lab-a5-950pr",
     "silicon_fingerprint": {
-      "aic_count": 32,
-      "aiv_count": 64,
-      "hbm_gib": 64,
+      "aic_count": 28,
+      "aiv_count": 56,
+      "hbm_gib": 128,
       "l0a_bytes": 65536,
       "l0b_bytes": 65536,
       "l0c_bytes": 262144,

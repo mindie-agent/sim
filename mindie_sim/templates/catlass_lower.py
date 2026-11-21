@@ -28,10 +28,11 @@ from .catlass_catalog import (
     streamk_partition, swizzle_block_coord, validate_catlass_spec,
 )
 from .contracts import SemanticWorkItem, ceil_div, eligible_matrix_engines, evg_order
+from ._catlass_streaming import STREAMING_PANEL_MICRO_THRESHOLD, lower_catlass_streaming
 from .fuse_region import Lowering, ring_credit, solve_template_tile
 
 _NOMINAL_BUFFER_ALIGNMENT = 32
-_PURE_LOWER_CACHE_SIZE = 64
+_PURE_LOWER_CACHE_SIZE = 512
 A8W4_PROLOGUE_SUBBLOCK_ALIGNMENT = 32
 A8W4_PROLOGUE_UB_SLOT_BYTES = 2 * 32 * 1024
 GATHER_SCATTER_FULL_LOAD_UB_BYTES = 216 * 1024
@@ -663,10 +664,34 @@ def _split_schedule(lowerer, launch, blocks):
     _reduce_partials(lowerer, parts, signal)
 
 
-@lru_cache(maxsize=_PURE_LOWER_CACHE_SIZE)
-def _lower_catlass_pure_cached(spec, p, datapath, die: int, region_id):
-    return _lower_catlass_impl(spec, p, datapath, context=None, memory_view=None, die=die,
-                               live_admission=False, region_id=region_id)
+def _estimated_panel_micros(spec, p) -> int:
+    """Estimate total unrolled K-panel micro steps for streaming threshold selection."""
+    tm, tn, tk = spec.l1_tile_shape
+    l0k = spec.l0_tile_shape[-1]
+    n_cols = p.n // 2 if spec.epilogue_kind == "grouped_swiglu_mx_quant" else p.n
+    if p.groups:
+        blocks = sum(ceil_div(rows, tm) for rows in p.groups) * ceil_div(n_cols, tn)
+    else:
+        blocks = ceil_div(p.m, tm) * ceil_div(n_cols, tn)
+    return blocks * ceil_div(p.k, tk) * ceil_div(tk, l0k)
+
+
+_PURE_LOWER_CACHE: dict[object, object] = {}
+
+
+def _datapath_cache_key(datapath) -> object:
+    arch = getattr(datapath, "compute_arch", None)
+    return (
+        getattr(arch, "arch_id", None),
+        getattr(datapath, "aic_count", 0),
+        getattr(datapath, "aiv_count", 0),
+        getattr(datapath, "buffers", ()),
+        getattr(datapath, "compute_peaks", ()),
+        getattr(datapath, "memory_access", None),
+        getattr(datapath, "hbm_read_bytes_per_s", None),
+        getattr(datapath, "hbm_write_bytes_per_s", None),
+        getattr(datapath, "hbm_rw_alpha", None),
+    )
 
 
 def lower_catlass_spec(
@@ -675,12 +700,21 @@ def lower_catlass_spec(
     """Lower a concrete specialization and return its executable audit record."""
     p = matrix_problem(problem)
     if context is None and memory_view is None and not live_admission:
+        key = (spec, p, _datapath_cache_key(datapath), die, region_id)
         try:
-            hash((spec, p, datapath, die, region_id))
+            cached = _PURE_LOWER_CACHE.get(key)
         except TypeError:
-            return _lower_catlass_impl(spec, p, datapath, context=None, memory_view=None, die=die,
-                                       live_admission=False, region_id=region_id)
-        return _lower_catlass_pure_cached(spec, p, datapath, die, region_id)
+            cached = None
+            key = None
+        if cached is not None:
+            return cached
+        result = _lower_catlass_impl(spec, p, datapath, context=None, memory_view=None, die=die,
+                                     live_admission=False, region_id=region_id)
+        if key is not None:
+            if len(_PURE_LOWER_CACHE) >= _PURE_LOWER_CACHE_SIZE:
+                _PURE_LOWER_CACHE.pop(next(iter(_PURE_LOWER_CACHE)))
+            _PURE_LOWER_CACHE[key] = result
+        return result
     return _lower_catlass_impl(spec, p, datapath, context=context, memory_view=memory_view, die=die,
                                live_admission=live_admission, region_id=region_id)
 
@@ -693,6 +727,12 @@ def _lower_catlass_impl(
                                 spec.splitk_factor, spec.dispatch_policy, spec.epilogue_kind)
     if spec.workspace_bytes != expected:
         raise ModelingError(f"catlass_workspace_mismatch:{spec.workspace_bytes}:{expected}")
+    if _estimated_panel_micros(spec, p) > STREAMING_PANEL_MICRO_THRESHOLD:
+        return lower_catlass_streaming(
+            spec, p, datapath, solution,
+            context=context, memory_view=memory_view, die=die,
+            live_admission=live_admission, region_id=region_id,
+        )
     plan = Lowering(datapath, context=context, memory_view=memory_view, die=die, live_admission=live_admission)
     lowerer = _MatrixLowerer(plan, spec, p)
     launch = plan.launch()

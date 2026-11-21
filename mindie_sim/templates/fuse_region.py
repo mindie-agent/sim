@@ -204,8 +204,11 @@ class Lowering:
         self.hits += ledger.l2_hit_bytes
         self.misses += ledger.dram_miss_copy_bytes
         if ledger.dram_sector_bytes:
-            resident = resident if ledger.l2_hit_bytes else SectorCoverage()
-            self.service += _rational_service(address_plan, resident, self.burst_rules)
+            if not self.burst_rules and (not ledger.l2_hit_bytes or resident.empty):
+                self.service += ledger.dram_sector_bytes
+            else:
+                resident = resident if ledger.l2_hit_bytes else SectorCoverage()
+                self.service += _rational_service(address_plan, resident, self.burst_rules)
 
     def _writebacks(self, name, after):
         evictions = self.state.drain_writebacks(self.die)
@@ -262,7 +265,6 @@ class Lowering:
         name, after = placeholder.name, placeholder.after
         pattern = lifetimes.resolve(declared)
         plan = pattern.runs
-        resident = self.state.resident_coverage_for(pattern, plan.aligned_copy_bytes())
         if self.context is not None:
             bound = self.context.bind_access(
                 pattern, self.state, hbm_bus=self.hbm_bus, burst_rules=self.burst_rules, commit=True,
@@ -282,6 +284,11 @@ class Lowering:
                 l2_row_id="l2", burst_rules=self.burst_rules, commit=True,
             )
             stage = bound.to_stage(name, after=after)
+        resident = (
+            getattr(self.state, "_last_prior_coverage", SectorCoverage())
+            if (bound.ledger.l2_hit_bytes and bound.ledger.dram_sector_bytes)
+            else SectorCoverage()
+        )
         self._account(bound.ledger, plan, resident)
         lifetimes.complete(declared.reuse_key)
         return replace(stage, after=self._writebacks(name, stage.after))

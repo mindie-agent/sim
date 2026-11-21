@@ -27,6 +27,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import gc
 import hashlib
 import json
@@ -65,6 +66,14 @@ FORBIDDEN_MODULES = ("opflow", "op_formulas", "prediction.piecewise",
                      "prediction.subgraphs")
 PRIVATE_PREFIX = "/Users" + "/maoxx241"
 IMAGE_MARKERS = ("docker" + ".io/", "swr" + ".cn-", "@sha" + "256:")
+PRODUCER_FILTER_NAMES = frozenset({
+    "min_mib", "min_size_mib", "min_payload_mib", "min_m", "min_n", "min_k",
+    "min_bytes", "min_payload_bytes", "min_tokens", "skip_small_shapes",
+})
+PRODUCER_SHAPE_NAMES = PRODUCER_FILTER_NAMES | frozenset({
+    "m", "n", "k", "tokens", "seq_len", "batch", "batch_size", "payload_bytes",
+    "mib", "size_mib", "payload_mib",
+})
 
 
 def _output(path: str | None, payload: dict) -> None:
@@ -110,6 +119,98 @@ def _python_files(root: Path):
             except OSError:
                 continue
             yield path
+
+
+def _numeric_literal(node: ast.expr) -> int | float | None:
+    sign = 1
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        sign = -1 if isinstance(node.op, ast.USub) else 1
+        node = node.operand
+    if isinstance(node, ast.Constant) and type(node.value) in (int, float):
+        return sign * node.value
+    return None
+
+
+def _shape_operand_names(operand: ast.expr) -> set[str]:
+    names = set()
+    for node in ast.walk(operand):
+        if isinstance(node, ast.Name):
+            names.add(node.id.lower())
+        elif isinstance(node, ast.Attribute):
+            names.add(node.attr.lower())
+        elif isinstance(node, ast.Subscript):
+            if isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, str):
+                names.add(node.slice.value.lower())
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "get" and node.args:
+            key = node.args[0]
+            if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                names.add(key.value.lower())
+    return names
+
+
+def _has_shape_cutoff(test: ast.expr) -> bool:
+    for comparison in ast.walk(test):
+        if not isinstance(comparison, ast.Compare):
+            continue
+        for left, right in zip((comparison.left, *comparison.comparators), comparison.comparators):
+            left_names, right_names = _shape_operand_names(left), _shape_operand_names(right)
+            if left_names & PRODUCER_SHAPE_NAMES and (_numeric_literal(right) is not None or right_names & PRODUCER_FILTER_NAMES):
+                return True
+            if right_names & PRODUCER_SHAPE_NAMES and (_numeric_literal(left) is not None or left_names & PRODUCER_FILTER_NAMES):
+                return True
+    return False
+
+
+def _producer_continue_guards(tree: ast.Module) -> set[ast.If]:
+    """Find if statements guarding a continue in the same loop body."""
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    guards: set[ast.If] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Continue):
+            continue
+        branch: ast.AST = node
+        enclosing = []
+        while (parent := parents.get(branch)) is not None:
+            if isinstance(parent, (ast.For, ast.AsyncFor, ast.While)) and branch in parent.body:
+                guards.update(enclosing)
+                break
+            if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                break
+            if isinstance(parent, ast.If):
+                enclosing.append(parent)
+            branch = parent
+    return guards
+
+
+def _producer_shape_filters(root: Path) -> list[str]:
+    """Inspect verification producers without importing or executing their code."""
+    findings = []
+    for path in sorted((root / "data" / "verification").glob("*.producer.py")):
+        relative = path.relative_to(root).as_posix()
+        try:
+            if path.stat().st_size > STREAM_LIMIT:
+                findings.append(f"{relative}:producer_source_too_large")
+                continue
+            tree = ast.parse(path.read_bytes(), filename=relative)
+        except (OSError, SyntaxError, ValueError) as error:
+            location = f":{error.lineno}" if isinstance(error, SyntaxError) else ""
+            findings.append(f"{relative}{location}:producer_source_{type(error).__name__}")
+            continue
+        for guard in sorted(_producer_continue_guards(tree), key=lambda node: node.lineno):
+            if _has_shape_cutoff(guard.test):
+                findings.append(f"{relative}:{guard.lineno}:shape_size_filter")
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)) or node.value is None:
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            value = _numeric_literal(node.value)
+            for target in targets:
+                if not isinstance(target, ast.Name) or target.id.lower() not in PRODUCER_FILTER_NAMES:
+                    continue
+                enabled = target.id.lower() == "skip_small_shapes" and isinstance(node.value, ast.Constant) and node.value.value is True
+                if enabled or (value is not None and value > 0):
+                    findings.append(f"{relative}:{node.lineno}:shape_size_filter_constant:{target.id}")
+    return findings
 
 
 def hygiene(args) -> dict:
@@ -183,6 +284,7 @@ def hygiene(args) -> dict:
     import mindie_sim.templates.registry as templates_registry
 
     default_cube_peak_present = hasattr(templates_registry, "default_cube_peak")
+    producer_shape_filters = _producer_shape_filters(sim)
     metrics = {
         "deleted_paths_present": present,
         "sidecar_imports": sidecar_imports,
@@ -193,9 +295,10 @@ def hygiene(args) -> dict:
         "arch_governance_violations": gov_list,
         "arch_governance_ok": not gov_list,
         "default_cube_peak_removed": not default_cube_peak_present,
+        "producer_shape_filters": producer_shape_filters,
     }
     if (present or sidecar_imports or private_paths or image_literals
-            or not imports_ok or gov_list or default_cube_peak_present):
+            or not imports_ok or gov_list or default_cube_peak_present or producer_shape_filters):
         return _fail("hygiene", "hygiene_violation", **metrics)
     return _pass("hygiene", **metrics)
 

@@ -171,6 +171,29 @@ class TemplateRef:
         _STATE_METRICS["template_nodes"] += nodes
         return obj
 
+    @classmethod
+    def _from_internal_frozen(
+        cls,
+        template_id: int,
+        generation: Hashable,
+        fingerprint: int,
+        snapshot: tuple,
+        nodes: int,
+    ) -> "TemplateRef":
+        """Build a ref directly from an internal ``_freeze_snapshot`` result."""
+        retained_bytes = _template_cost(snapshot, "")
+        obj = object.__new__(cls)
+        object.__setattr__(obj, "template_id", template_id)
+        object.__setattr__(obj, "generation", generation)
+        object.__setattr__(obj, "fingerprint", fingerprint)
+        object.__setattr__(obj, "template", snapshot)
+        object.__setattr__(obj, "template_repr", "")
+        object.__setattr__(obj, "nodes", nodes)
+        object.__setattr__(obj, "retained_bytes", retained_bytes)
+        _STATE_METRICS["template_validations"] += 1
+        _STATE_METRICS["template_nodes"] += nodes
+        return obj
+
 
 class StateInterner:
     """Bounded exact-structure interner for immutable invariant fragments.
@@ -368,9 +391,9 @@ class StateInterner:
             static, path="template", counter=build_counter)
         _STATE_METRICS["template_builds"] += 1
         _STATE_METRICS["template_build_nodes"] += build_counter[0]
-        ref = TemplateRef.from_validated(
-            self._next_id, generation, fingerprint, snapshot,
-            "", build_counter[0])
+        ref = TemplateRef._from_internal_frozen(
+            self._next_id, generation, fingerprint, snapshot, build_counter[0],
+        )
         self._next_id += 1
         try:
             self._live.add(ref)

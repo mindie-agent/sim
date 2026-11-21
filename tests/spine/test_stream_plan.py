@@ -22,12 +22,16 @@ import pytest
 import mindie_sim.api as sdk_api
 import mindie_sim.prediction.body_defaults as body_defaults_mod
 from mindie_sim.prediction.cost import CostModel
-from mindie_sim.prediction.engine import Engine, Resource
+from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.evaluation import ExecutionBindings
 from mindie_sim.prediction.frontend import Frontend
 import mindie_sim.prediction.operator_analysis as op_analysis_mod
-from mindie_sim.prediction.program import KernelProgram, RecipeContext, Stage
-from mindie_sim.prediction.results import StepRequest, StructureRequest
+from mindie_sim.prediction.operators.matrix.matrix import TiledMatmul, _TiledGeometry
+from mindie_sim.prediction.program import (
+    KernelProgram, ParallelProgram, PipelinePhase, PipelineTemplate,
+    PipelineTemplateProgram, RecipeContext, Stage,
+)
+from mindie_sim.prediction.results import ReplayOptions, StepRequest, StructureRequest
 from mindie_sim.prediction.runtime.accel_build import build_accel
 from mindie_sim.prediction.spine import PredictionSpine
 from mindie_sim.prediction.streams import (
@@ -36,10 +40,12 @@ from mindie_sim.prediction.streams import (
     StreamEvent,
     StreamLane,
     StreamPlan,
+    apply_stream_owners_to_program,
     bind_stage_to_stream,
     bind_stream_owners,
     lower_stream_edges,
     proportional_coupled_placement,
+    stream_quota_resources,
 )
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import datapath_for_die
@@ -50,31 +56,33 @@ import mindie_sim.structure as structure_mod
 pytestmark = pytest.mark.tier0
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+CORE_NAMES = {"cube": "cube@0", "vector": "vector@0"}
+CORE_RATES = {"cube@0": 24.0, "vector@0": 48.0}
+CORE_UNITS = {"cube": 24, "vector": 48}
+CORE_BINDING = dict(resource_names=CORE_NAMES, rates=CORE_RATES, resource_units=CORE_UNITS)
+SHARED_PLAN = StreamPlan(rank=0, lanes=(
+    StreamLane(MAIN_STREAM, StreamCoreBudget(aic=12, aiv=24, isolation="shared_cap")),
+    StreamLane("aux", StreamCoreBudget(aic=12, aiv=24, isolation="shared_cap")),
+))
 
 
-def _case_for(sku: str = "Ascend910B2", *, layers: int = 1):
+def _case_for(sku: str = "Ascend910B2", *, layers: int = 1, tp: int = 1, dp: int = 1):
     return sdk_api.compose_case(
-        "qwen3-32b", hardware=sku, options={"dp": 1, "tp": 1, "pp": 1, "layers": layers}
+        "qwen3-32b", hardware=sku, options={"dp": dp, "tp": tp, "pp": 1, "layers": layers}
     )
+
+
+def _main_quotas(owners, datapath):
+    resources, names = stream_quota_resources(owners, datapath, resource_names=CORE_NAMES, rates=CORE_RATES)
+    return resources, {physical: quota for (stream, physical), quota in names.items() if stream == MAIN_STREAM}
 
 
 def _rotary_op(op_id: str, *, deps: tuple[str, ...] = ()) -> OpSpec:
     shape = (8, 16, 64)
     return OpSpec(
-        op_id=op_id,
-        layer=0,
-        stage=0,
-        family="rotary",
-        recipe="rotary_position_embedding",
-        phase="decode",
-        requests=("r0",),
-        dtype="bf16",
-        local_shape=shape,
-        semantic_shape=shape,
-        padded_shape=shape,
-        launch_shape=shape,
-        deps=deps,
-        stream=MAIN_STREAM,
+        op_id=op_id, layer=0, stage=0, family="rotary", recipe="rotary_position_embedding",
+        phase="decode", requests=("r0",), dtype="bf16", deps=deps, stream=MAIN_STREAM,
+        local_shape=shape, semantic_shape=shape, padded_shape=shape, launch_shape=shape,
     )
 
 
@@ -96,7 +104,7 @@ def test_graph_level_dbo_removed_destructively():
     "sku,aic_total,aiv_total,main_aic,main_aiv,csa_aiv",
     (
         ("Ascend910B2", 24, 48, 16, 32, 16),
-        ("Ascend910_9382", 20, 40, 12, 24, 16),
+        ("Ascend910_9382", 24, 48, 16, 32, 16),
         ("Ascend950DT_9581", 32, 64, 24, 48, 16),
     ),
 )
@@ -162,23 +170,15 @@ def test_three_stream_core_control_binding_and_transitive_events(
         lower_stream_edges((op_main, op_csa, op_comm), replace(plan_3, events=(plan_3.events[0],)))
 
     # Reverse 3-stream cycle rejected.
-    plan_cycle = replace(
-        plan_3,
-        events=(
-            *plan_3.events,
-            StreamEvent("ev_back", "comm", "op_comm", MAIN_STREAM, ("op_main",)),
-        ),
-    )
+    back_event = StreamEvent("ev_back", "comm", "op_comm", MAIN_STREAM, ("op_main",))
+    plan_cycle = replace(plan_3, events=(*plan_3.events, back_event))
     with pytest.raises(ModelingError, match="stream_event_cycle"):
         lower_stream_edges((op_main, op_csa, op_comm), plan_cycle)
 
     # Live 3-stream execution through PredictionSpine preserves all 3 stream IDs.
     spine = PredictionSpine()
-    step = spine.lower(
-        case,
-        LoweringRequest(declared_ops=(RankOps(0, (op_main, op_csa, op_comm)),)),
-        streams=(plan_3,),
-    )
+    request = LoweringRequest(declared_ops=(RankOps(0, (op_main, op_csa, op_comm)),))
+    step = spine.lower(case, request, streams=(plan_3,))
     ev = spine.run_step(step)
     assert ev.span_ms > 0.0
     streams_seen = {row.occurrence.op_id: row.stream for row in ev.operators}
@@ -192,11 +192,7 @@ def test_three_stream_core_control_binding_and_transitive_events(
         assignments=(("op_main", "csa"), ("op_csa", "csa"), ("op_comm", "comm")),
         events=(StreamEvent("ev_c", "csa", "op_csa", "comm", ("op_comm",)),),
     )
-    step_bad = spine.lower(
-        case,
-        LoweringRequest(declared_ops=(RankOps(0, (op_main, op_csa, op_comm)),)),
-        streams=(bad_assign,),
-    )
+    step_bad = spine.lower(case, request, streams=(bad_assign,))
     with pytest.raises(ModelingError, match="stream_zero_aic_budget"):
         spine.run_step(step_bad)
 
@@ -231,15 +227,8 @@ def test_coupled_placement_c11_proportionality_and_shared_cap_wave_quantization(
         backend="c",
     )
     coupled_stage = Stage("coupled_cv", work={"cube@0": 12.0, "vector@0": 24.0}, coupled=True)
-    bound_stage = bind_stage_to_stream(
-        coupled_stage,
-        owners[MAIN_STREAM],
-        dp22,
-        resource_names={"cube": "cube@0", "vector": "vector@0"},
-        resource_units={"cube": 24, "vector": 48},
-        rates={"cube@0": 24.0, "vector@0": 48.0},
-        stream_id=MAIN_STREAM,
-    )
+    bound_stage = bind_stage_to_stream(coupled_stage, owners[MAIN_STREAM], dp22,
+                                       stream_id=MAIN_STREAM, **CORE_BINDING)
     assert len(bound_stage.placement["cube@0"]) == 12
     assert len(bound_stage.placement["vector@0"]) == 24
     start_ev = engine.submit("start")
@@ -269,15 +258,9 @@ def test_coupled_placement_c11_proportionality_and_shared_cap_wave_quantization(
     )
     shared_owners = bind_stream_owners(shared_plan, dp22)
     assert shared_owners[MAIN_STREAM].aic == () and shared_owners[MAIN_STREAM].aic_limit == 12
-    shared_stage = bind_stage_to_stream(
-        Stage("shared_cube", work={"cube@0": 12.0}),
-        shared_owners[MAIN_STREAM],
-        dp22,
-        resource_names={"cube": "cube@0", "vector": "vector@0"},
-        resource_units={"cube": 24, "vector": 48},
-        rates={"cube@0": 24.0, "vector@0": 48.0},
-        stream_id=MAIN_STREAM,
-    )
+    shared_stage = bind_stage_to_stream(Stage("shared_cube", work={"cube@0": 12.0}),
+                                        shared_owners[MAIN_STREAM], dp22,
+                                        stream_id=MAIN_STREAM, **CORE_BINDING)
     assert shared_stage.caps["cube@0"] == pytest.approx(12.0)
 
 
@@ -328,20 +311,7 @@ def test_spine_single_pass_construction_and_structure_graph_id_parity(monkeypatc
 
 def test_stream_pipeline_template_shared_quota_narrow_tile_and_pp_fifo():
     import pickle
-    from mindie_sim.prediction.engine import Allocation
-    from mindie_sim.prediction.matrix import TiledMatmul, _TiledGeometry
     from mindie_sim.prediction.physical_recipe_base import _tile_count
-    from mindie_sim.prediction.program import (
-        ParallelProgram,
-        PipelinePhase,
-        PipelineTemplate,
-        PipelineTemplateProgram,
-    )
-    from mindie_sim.prediction.results import ReplayOptions
-    from mindie_sim.prediction.streams import (
-        apply_stream_owners_to_program,
-        stream_quota_resources,
-    )
     from mindie_sim.public.errors import UnmodeledCapabilityError
 
     build = build_accel()
@@ -373,13 +343,7 @@ def test_stream_pipeline_template_shared_quota_narrow_tile_and_pp_fifo():
         slots=2,
     )
     bound_tmpl_prog = apply_stream_owners_to_program(
-        PipelineTemplateProgram(tmpl),
-        disjoint_owners["tail"],
-        dp22,
-        resource_names={"cube": "cube@0", "vector": "vector@0"},
-        resource_units={"cube": 24, "vector": 48},
-        rates={"cube@0": 24.0, "vector@0": 48.0},
-        stream_id="tail",
+        PipelineTemplateProgram(tmpl), disjoint_owners["tail"], dp22, stream_id="tail", **CORE_BINDING,
     )
     assert isinstance(bound_tmpl_prog, PipelineTemplateProgram)
     assert set(bound_tmpl_prog.template.setup[0].placement["cube@0"]).issubset(set(disjoint_owners["tail"].aic))
@@ -388,36 +352,17 @@ def test_stream_pipeline_template_shared_quota_narrow_tile_and_pp_fifo():
     assert len(bound_tmpl_prog.template.phases[0].stages[0].placement["cube@0"]) == 2
 
     # 2. shared_cap aggregate quota caps 2 parallel children on a 12-of-24 lane to >= 2.0 ms on C11.
-    shared_plan = StreamPlan(
-        rank=0,
-        lanes=(
-            StreamLane(MAIN_STREAM, StreamCoreBudget(aic=12, aiv=24, isolation="shared_cap")),
-            StreamLane("aux", StreamCoreBudget(aic=12, aiv=24, isolation="shared_cap")),
-        ),
-    )
-    shared_owners = bind_stream_owners(shared_plan, dp22)
-    q_res, q_map = stream_quota_resources(
-        shared_owners, dp22,
-        resource_names={"cube": "cube@0", "vector": "vector@0"},
-        rates={"cube@0": 24.0, "vector@0": 48.0},
-        replica=0, stage=0,
-    )
-    q_for_main = {phys: qname for (sid, phys), qname in q_map.items() if sid == MAIN_STREAM}
+    shared_owners = bind_stream_owners(SHARED_PLAN, dp22)
+    q_res, q_for_main = _main_quotas(shared_owners, dp22)
     two_par = ParallelProgram((
         KernelProgram((Stage("child0", work={"cube@0": 12.0}),)),
         KernelProgram((Stage("child1", work={"cube@0": 12.0}),)),
     ))
     bound_par = apply_stream_owners_to_program(
         two_par, shared_owners[MAIN_STREAM], dp22,
-        resource_names={"cube": "cube@0", "vector": "vector@0"},
-        resource_units={"cube": 24, "vector": 48},
-        rates={"cube@0": 24.0, "vector@0": 48.0},
-        stream_id=MAIN_STREAM, quota_resources=q_for_main,
+        stream_id=MAIN_STREAM, quota_resources=q_for_main, **CORE_BINDING,
     )
-    eng_q = Engine(
-        [Resource("cube@0", 24.0, "ms", "fair", units=24), *q_res],
-        backend="c",
-    )
+    eng_q = Engine([Resource("cube@0", 24.0, "ms", "fair", units=24), *q_res], backend="c")
     ev_q0 = eng_q.submit("start")
     ev_q1 = bound_par.start(eng_q, "two_shared", ev_q0)
     eng_q.advance(until=(ev_q1,))
@@ -435,12 +380,10 @@ def test_stream_pipeline_template_shared_quota_narrow_tile_and_pp_fifo():
     )
     bound_narrow = bind_stage_to_stream(
         narrow_stage, disjoint_owners["tail"], dp22,
-        resource_names={"cube": "cube@0", "vector": "vector@0"},
-        resource_units={"cube": 24, "vector": 48},
-        rates={"cube@0": 24.0, "vector@0": 48.0},
         stream_id="tail",
         pool_names={"l1": "l1@0", "ub": "ub@0"},
         pool_units={"l1": 24, "ub": 48},
+        **CORE_BINDING,
     )
     assert len(bound_narrow.placement["cube@0"]) == 1
     assert len(bound_narrow.placement["vector@0"]) == 2
@@ -457,9 +400,9 @@ def test_stream_pipeline_template_shared_quota_narrow_tile_and_pp_fifo():
     )
     bound_unit = bind_stage_to_stream(
         unit_coupled, disjoint_owners["tail"], dp22,
-        resource_names={"cube": "cube@0", "vector": "vector@0", "l2": "l2@0"},
-        resource_units={"cube": 24, "vector": 48, "l2": 1},
-        rates={"cube@0": 24.0, "vector@0": 48.0, "l2@0": 100.0},
+        resource_names=dict(CORE_NAMES, l2="l2@0"),
+        resource_units=dict(CORE_UNITS, l2=1),
+        rates={**CORE_RATES, "l2@0": 100.0},
         stream_id="tail",
     )
     assert "cube@0" not in bound_unit.placement and "vector@0" not in bound_unit.placement
@@ -480,10 +423,7 @@ def test_stream_pipeline_template_shared_quota_narrow_tile_and_pp_fifo():
     assert eng_u.accel_status()["native_steps"] > 0
 
     # 4. Unmatched StreamPlan.rank under tp=2, dp=1 must raise ModelingError.
-    tp2_case = sdk_api.compose_case(
-        "qwen3-32b", hardware="Ascend910B2",
-        options={"dp": 1, "tp": 2, "pp": 1, "num_devices": 2, "layers": 1},
-    )
+    tp2_case = _case_for(tp=2)
     bad_rank_plan = StreamPlan(rank=1, lanes=(StreamLane(MAIN_STREAM),))
     spine = PredictionSpine()
     with pytest.raises(ModelingError, match="stream_plan_unmatched_rank"):
@@ -516,8 +456,9 @@ def test_stream_pipeline_template_shared_quota_narrow_tile_and_pp_fifo():
             StreamLane("rest", StreamCoreBudget(aic=12, aiv=36)),
         ),
     )
-    step_full = spine.lower(case22, LoweringRequest(declared_ops=(RankOps(0, (op_r,)),)), streams=(plan_full,))
-    step_qtr = spine.lower(case22, LoweringRequest(declared_ops=(RankOps(0, (op_r,)),)), streams=(plan_quarter,))
+    request = LoweringRequest(declared_ops=(RankOps(0, (op_r,)),))
+    step_full = spine.lower(case22, request, streams=(plan_full,))
+    step_qtr = spine.lower(case22, request, streams=(plan_quarter,))
     ev_full = spine.run_step(step_full, ReplayOptions(isolated=True))
     ev_qtr = spine.run_step(step_qtr, ReplayOptions(isolated=True))
     assert ev_qtr.operators[0].isolated_ms is not None and ev_full.operators[0].isolated_ms is not None
@@ -533,20 +474,12 @@ def test_stream_pipeline_template_shared_quota_narrow_tile_and_pp_fifo():
     )
     assert _tile_count(ctx_aiv_cap) <= 16
     matmul = TiledMatmul()
-    layout_full = _TiledGeometry(
-        matmul,
-        RecipeContext(
-            op=cube_op, work={}, resource_names={"hbm": "hbm@0", "mte2": "mte2@0", "mte3": "mte3@0"},
-            rates={}, core_count=24, datapath=dp22, stream_owners=None,
-        ),
+    matrix_context = RecipeContext(
+        op=cube_op, work={}, resource_names={"hbm": "hbm@0", "mte2": "mte2@0", "mte3": "mte3@0"},
+        rates={}, core_count=24, datapath=dp22, stream_owners=None,
     )
-    layout_tail = _TiledGeometry(
-        matmul,
-        RecipeContext(
-            op=cube_op, work={}, resource_names={"hbm": "hbm@0", "mte2": "mte2@0", "mte3": "mte3@0"},
-            rates={}, core_count=24, datapath=dp22, stream_owners=disjoint_owners["tail"],
-        ),
-    )
+    layout_full = _TiledGeometry(matmul, matrix_context)
+    layout_tail = _TiledGeometry(matmul, replace(matrix_context, stream_owners=disjoint_owners["tail"]))
     assert layout_full.cores == 24 and layout_tail.cores == 8
 
     # 8. Explicit enable_dbo=True fails loudly with UnmodeledCapabilityError until Stage 3 in-op DBO.
@@ -556,14 +489,8 @@ def test_stream_pipeline_template_shared_quota_narrow_tile_and_pp_fifo():
 
 
 def test_stream_equal_budget_parallelism_nondividing_matrix_quota_and_validation():
-    from mindie_sim.prediction.engine import Allocation
     from mindie_sim.prediction.graph_analysis import graph_costs
-    from mindie_sim.prediction.matrix import TiledMatmul
     from mindie_sim.prediction.operator_replay import operator_costs
-    from mindie_sim.prediction.streams import (
-        apply_stream_owners_to_program,
-        stream_quota_resources,
-    )
 
     build = build_accel()
     assert build["ok"] is True and build["backend"] == "c_native"
@@ -577,14 +504,7 @@ def test_stream_equal_budget_parallelism_nondividing_matrix_quota_and_validation
         hbm_bytes=0.0, mte2_bytes=0.0, mte3_bytes=0.0, vector_ops=4e10, stream=MAIN_STREAM,
     )
     op_b = replace(op_a, op_id="rope_b", stream="aux")
-    eq_plan = StreamPlan(
-        rank=0,
-        lanes=(
-            StreamLane(MAIN_STREAM, StreamCoreBudget(aic=12, aiv=24, isolation="shared_cap")),
-            StreamLane("aux", StreamCoreBudget(aic=12, aiv=24, isolation="shared_cap")),
-        ),
-        assignments=(("rope_a", MAIN_STREAM), ("rope_b", "aux")),
-    )
+    eq_plan = replace(SHARED_PLAN, assignments=(("rope_a", MAIN_STREAM), ("rope_b", "aux")))
     single_rep = graph_costs(case22, (op_a,), stream_plans=(eq_plan,), isolated=True)
     pair_rep = graph_costs(case22, (op_a, op_b), stream_plans=(eq_plan,), isolated=True)
     assert pair_rep["duration_ms"] == pytest.approx(single_rep["duration_ms"], rel=0.05)
@@ -619,27 +539,12 @@ def test_stream_equal_budget_parallelism_nondividing_matrix_quota_and_validation
     assert lowered_5 is not None
 
     # 3. Pure shared_cap narrow 1-core tile preserves 1-core rate (12 ms, not 1 ms) on C11.
-    shared_12 = StreamPlan(
-        rank=0,
-        lanes=(
-            StreamLane(MAIN_STREAM, StreamCoreBudget(aic=12, aiv=24, isolation="shared_cap")),
-            StreamLane("aux", StreamCoreBudget(aic=12, aiv=24, isolation="shared_cap")),
-        ),
-    )
-    sh_owners = bind_stream_owners(shared_12, dp22)
-    q_res, q_map = stream_quota_resources(
-        sh_owners, dp22,
-        resource_names={"cube": "cube@0", "vector": "vector@0"},
-        rates={"cube@0": 24.0, "vector@0": 48.0},
-    )
-    q_main = {phys: qn for (sid, phys), qn in q_map.items() if sid == MAIN_STREAM}
+    sh_owners = bind_stream_owners(SHARED_PLAN, dp22)
+    q_res, q_main = _main_quotas(sh_owners, dp22)
     narrow_1core = Stage("tile_1c", work={"cube@0": 12.0}, placement={"cube@0": (0,)})
     bound_1core = bind_stage_to_stream(
         narrow_1core, sh_owners[MAIN_STREAM], dp22,
-        resource_names={"cube": "cube@0", "vector": "vector@0"},
-        resource_units={"cube": 24, "vector": 48},
-        rates={"cube@0": 24.0, "vector@0": 48.0},
-        stream_id=MAIN_STREAM, quota_resources=q_main,
+        stream_id=MAIN_STREAM, quota_resources=q_main, **CORE_BINDING,
     )
     eng_n = Engine([Resource("cube@0", 24.0, "ms", "fair", units=24), *q_res], backend="c")
     n0 = eng_n.submit("start")
@@ -657,12 +562,7 @@ def test_stream_equal_budget_parallelism_nondividing_matrix_quota_and_validation
         ),
     )
     mix_owners = bind_stream_owners(mixed_plan, dp22)
-    mq_res, mq_map = stream_quota_resources(
-        mix_owners, dp22,
-        resource_names={"cube": "cube@0", "vector": "vector@0"},
-        rates={"cube@0": 24.0, "vector@0": 48.0},
-    )
-    mq_main = {phys: qn for (sid, phys), qn in mq_map.items() if sid == MAIN_STREAM}
+    mq_res, mq_main = _main_quotas(mix_owners, dp22)
     nested_stage = Stage(
         "split_seq",
         work={"cube@0": 8.0, "vector@0": 24.0},
@@ -672,11 +572,9 @@ def test_stream_equal_budget_parallelism_nondividing_matrix_quota_and_validation
     )
     bound_mix = bind_stage_to_stream(
         nested_stage, mix_owners[MAIN_STREAM], dp22,
-        resource_names={"cube": "cube@0", "vector": "vector@0"},
-        resource_units={"cube": 24, "vector": 48},
-        rates={"cube@0": 24.0, "vector@0": 48.0},
         stream_id=MAIN_STREAM, quota_resources=mq_main,
         pool_names={"l1": "l1@0"}, pool_units={"l1": 24},
+        **CORE_BINDING,
     )
     assert set(bound_mix.acquire[0].units).issubset(set(mix_owners[MAIN_STREAM].pool_aic))
     assert isinstance(bound_mix.program, KernelProgram)
@@ -695,9 +593,6 @@ def test_stream_equal_budget_parallelism_nondividing_matrix_quota_and_validation
     bad_plan = StreamPlan(rank=1, lanes=(StreamLane(MAIN_STREAM),))
     with pytest.raises(ModelingError, match="stream_plan_unmatched_rank:1"):
         operator_costs(case22, (op_a,), replica=0, stream_plans=(bad_plan,))
-    dp2_case = sdk_api.compose_case(
-        "qwen3-32b", hardware="Ascend910B2",
-        options={"dp": 2, "tp": 1, "pp": 1, "num_devices": 2, "layers": 1},
-    )
+    dp2_case = _case_for(dp=2)
     with pytest.raises(ModelingError, match="stream_plan_unmatched_rank:1"):
         graph_costs(dp2_case, {0: (op_a,)}, stream_plans=(bad_plan,))

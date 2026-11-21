@@ -12,14 +12,14 @@ from mindie_sim.backends.ascend import materialize
 from mindie_sim.catalog.ops import gemm_op, vector_op
 from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.compose import compose_case
-from mindie_sim.prediction.batch_prefix_attention import apply_attention_prefix_reads
+from mindie_sim.prediction.operators.attention.batch_prefix_attention import apply_attention_prefix_reads
 from mindie_sim.prediction.call_builders import build_call
 from mindie_sim.prediction.engine import Engine, Resource
 from mindie_sim.prediction.efficiency import analyze_network_efficiency
 from mindie_sim.prediction.frontend import Frontend
-from mindie_sim.prediction.matrix_mapping import matrix_geometry
-from mindie_sim.prediction.matrix_splitk import splitk_program
-from mindie_sim.prediction.matrix_steady import SteadyMatmul
+from mindie_sim.prediction.operators.matrix.matrix_mapping import matrix_geometry
+from mindie_sim.prediction.operators.matrix.matrix_splitk import splitk_program
+from mindie_sim.prediction.operators.matrix.matrix_steady import SteadyMatmul
 from mindie_sim.prediction.operator_analysis import target_graphs, target_operators
 from mindie_sim.prediction.physical_recipe_base import Phase, _phase_amounts
 from mindie_sim.prediction.physical_recipe_registry import (

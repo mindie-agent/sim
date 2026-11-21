@@ -1,7 +1,7 @@
 # Staged analytic GQA decode
 
 `StagedGQADecode` is an explicit decode recipe in
-`mindie_sim/prediction/attention_decode.py`.  It consumes the frontend
+`mindie_sim/prediction/operators/attention/attention_decode.py`.  It consumes the frontend
 metadata contract below and emits a finite program on the ordinary
 `Engine`, using `Stage`, `KernelProgram` and `PipelineProgram`.  It is a
 practical phase/tile model, not a reconstruction of a vendor kernel,

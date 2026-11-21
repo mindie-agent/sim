@@ -7,8 +7,8 @@ import pytest
 from mindie_sim.catalog.ops import gemm_op
 from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.prediction.engine import Engine, Resource
-from mindie_sim.prediction.matrix import HierarchicalMatmul
-from mindie_sim.prediction.matrix_mapping import MappedMatmul, owner_tiles
+from mindie_sim.prediction.operators.matrix.matrix import HierarchicalMatmul
+from mindie_sim.prediction.operators.matrix.matrix_mapping import MappedMatmul, owner_tiles
 from mindie_sim.prediction.program import RecipeContext
 
 
