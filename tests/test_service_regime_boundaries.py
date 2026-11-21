@@ -19,7 +19,7 @@ from _support.kernel_invocation import fork, phase
 from test_graph_analysis import op
 from _support.collective_cases import cohort_case
 from _support.kernel_invocation import raw_case, group, competitor, recipes
-from test_mechanism_contract import hardware_case
+from _support.operator_cases import hardware_case
 from _support.kernel_invocation import copy_op
 
 

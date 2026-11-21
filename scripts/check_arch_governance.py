@@ -18,7 +18,7 @@ from __future__ import annotations
 import argparse
 import ast
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import hashlib
 import keyword
@@ -577,18 +577,46 @@ def _docstring_has_upstream_abi(tree: ast.Module) -> bool:
     return bool(UPSTREAM_ABI_RE.search(snippet))
 
 
+def _parse_repo_map(entries: Sequence[str] | None) -> dict[str, Path]:
+    mapping: dict[str, Path] = {}
+    for raw in entries or ():
+        name, sep, path_str = raw.partition("=")
+        name, path_str = name.strip(), path_str.strip()
+        if not sep or not name or not path_str:
+            raise RuntimeError(f"invalid --repo-map entry {raw!r}; expected <name>=<path>")
+        mapping[name] = Path(path_str).resolve()
+    return mapping
+
+
+def _resolve_repo_dir(
+    repo: str, *, refs_root: Path | None, repo_map: Mapping[str, Path] | None
+) -> Path | None:
+    basename = repo.split("/")[-1]
+    if repo_map:
+        return repo_map.get(repo) or repo_map.get(basename) or (
+            refs_root / basename if refs_root is not None else None
+        )
+    return refs_root / basename if refs_root is not None else None
+
+
 def _check_ag005(
-    rel: PurePosixPath, text: str, tree: ast.Module, *, refs_root: Path | None = None
+    rel: PurePosixPath,
+    text: str,
+    tree: ast.Module,
+    *,
+    refs_root: Path | None = None,
+    repo_map: Mapping[str, Path] | None = None,
 ) -> list[Violation]:
     del text
     if not _is_allowed_isa_leaf(rel):
         return []
     violations: list[Violation] = []
+    pos = rel.as_posix()
+    def add_v(line: int, key: str, msg: str) -> None:
+        violations.append(Violation("AG005", rel, line, f"AG005:{pos}:{key}", msg))
+
     if not _docstring_has_upstream_abi(tree):
-        violations.append(Violation(
-            "AG005", rel, 1, f"AG005:{rel.as_posix()}:missing_upstream_abi",
-            "ISA leaf module docstring top 30 lines must declare 'Upstream-ABI: <symbol>'",
-        ))
+        add_v(1, "missing_upstream_abi", "ISA leaf module docstring top 30 lines must declare 'Upstream-ABI: <symbol>'")
     str_consts = _module_string_constants(tree)
     sources_node: ast.AST | None = None
     has_strategy = False
@@ -604,32 +632,17 @@ def _check_ag005(
                 elif target.id == "STRATEGY":
                     has_strategy = True
     if not has_strategy:
-        violations.append(Violation(
-            "AG005", rel, 1, f"AG005:{rel.as_posix()}:missing_strategy",
-            "ISA leaf must define module-level STRATEGY",
-        ))
+        add_v(1, "missing_strategy", "ISA leaf must define module-level STRATEGY")
     if not isinstance(sources_node, ast.Tuple) or not sources_node.elts:
-        violations.append(Violation(
-            "AG005", rel, getattr(sources_node, "lineno", 1),
-            f"AG005:{rel.as_posix()}:missing_sources",
-            "ISA leaf must define non-empty SOURCES: tuple[SourceRef, ...]",
-        ))
+        add_v(getattr(sources_node, "lineno", 1), "missing_sources", "ISA leaf must define non-empty SOURCES: tuple[SourceRef, ...]")
         return violations
     for elt in sources_node.elts:
         if not isinstance(elt, ast.Call):
-            violations.append(Violation(
-                "AG005", rel, getattr(elt, "lineno", 1),
-                f"AG005:{rel.as_posix()}:invalid_source_entry",
-                "SOURCES entries must be SourceRef(...) calls",
-            ))
+            add_v(getattr(elt, "lineno", 1), "invalid_source_entry", "SOURCES entries must be SourceRef(...) calls")
             continue
         fields = _extract_source_ref_fields(elt, str_consts)
         if fields is None or len(fields) < len(SOURCE_REF_FIELDS):
-            violations.append(Violation(
-                "AG005", rel, elt.lineno,
-                f"AG005:{rel.as_posix()}:incomplete_source_ref:{elt.lineno}",
-                "SourceRef must statically specify repository, revision, relative_path, source_sha256",
-            ))
+            add_v(elt.lineno, f"incomplete_source_ref:{elt.lineno}", "SourceRef must statically specify repository, revision, relative_path, source_sha256")
             continue
         repo, rev, rpath, sha = (fields[k].strip() for k in SOURCE_REF_FIELDS)
         if (
@@ -637,44 +650,42 @@ def _check_ag005(
             or rpath.startswith("/") or ".." in PurePosixPath(rpath).parts
             or not SHA256_HEX_RE.match(sha)
         ):
-            violations.append(Violation(
-                "AG005", rel, elt.lineno,
-                f"AG005:{rel.as_posix()}:malformed_source_ref:{rpath}",
-                f"malformed SourceRef(repo={repo!r}, rev={rev!r}, path={rpath!r}, sha256={sha[:PREVIEW_SHA_LEN]!r}...)",
-            ))
+            add_v(elt.lineno, f"malformed_source_ref:{rpath}", f"malformed SourceRef(repo={repo!r}, rev={rev!r}, path={rpath!r}, sha256={sha[:PREVIEW_SHA_LEN]!r}...)")
             continue
-        if refs_root is not None:
-            repo_dir = refs_root / repo.split("/")[-1]
-            if not repo_dir.is_dir():
-                violations.append(Violation(
-                    "AG005", rel, elt.lineno,
-                    f"AG005:{rel.as_posix()}:refs_repo_missing:{repo}",
-                    f"upstream refs repo directory not found: {repo_dir}",
-                ))
+        if refs_root is not None or repo_map:
+            repo_dir = _resolve_repo_dir(repo, refs_root=refs_root, repo_map=repo_map)
+            if repo_dir is None or not repo_dir.is_dir():
+                add_v(elt.lineno, f"refs_repo_missing:{repo}", f"upstream refs repo directory not found: {repo_dir or repo}")
             else:
-                blob = subprocess.run(
-                    ["git", "-C", str(repo_dir), "show", f"{rev}:{rpath}"],
-                    check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                rev_type = subprocess.run(
+                    ["git", "-C", str(repo_dir), "cat-file", "-t", rev],
+                    check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 )
-                if blob.returncode != 0:
-                    violations.append(Violation(
-                        "AG005", rel, elt.lineno,
-                        f"AG005:{rel.as_posix()}:source_missing:{rpath}",
-                        f"upstream source {repo}@{rev}:{rpath} not found",
-                    ))
+                obj_type = subprocess.run(
+                    ["git", "-C", str(repo_dir), "cat-file", "-t", f"{rev}:{rpath}"],
+                    check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                )
+                if rev_type.returncode != 0 or rev_type.stdout.strip() != "commit":
+                    add_v(elt.lineno, f"invalid_commit:{rev}", f"upstream revision {repo}@{rev} is not a git commit")
+                elif obj_type.returncode != 0 or obj_type.stdout.strip() != "blob":
+                    add_v(elt.lineno, f"source_missing:{rpath}", f"upstream source {repo}@{rev}:{rpath} is not a git blob")
                 else:
-                    actual_sha = hashlib.sha256(blob.stdout).hexdigest()
-                    if actual_sha != sha:
-                        violations.append(Violation(
-                            "AG005", rel, elt.lineno,
-                            f"AG005:{rel.as_posix()}:sha_mismatch:{rpath}",
-                            f"SHA-256 mismatch for {rpath}: expected {sha}, got {actual_sha}",
-                        ))
+                    blob = subprocess.run(
+                        ["git", "-C", str(repo_dir), "cat-file", "blob", f"{rev}:{rpath}"],
+                        check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    )
+                    if blob.returncode != 0:
+                        add_v(elt.lineno, f"source_missing:{rpath}", f"upstream source {repo}@{rev}:{rpath} not found")
+                    else:
+                        actual_sha = hashlib.sha256(blob.stdout).hexdigest()
+                        if actual_sha != sha:
+                            add_v(elt.lineno, f"sha_mismatch:{rpath}", f"SHA-256 mismatch for {rpath}: expected {sha}, got {actual_sha}")
     return violations
 
 
 def scan_repository(
-    root: Path, /, *, revision: str | None = None, refs_root: Path | None = None
+    root: Path, /, *, revision: str | None = None,
+    refs_root: Path | None = None, repo_map: Mapping[str, Path] | None = None,
 ) -> tuple[Violation, ...]:
     """Scan ``mindie_sim/**/*.py`` and return all sorted ``AG001..AG005`` violations."""
     violations: list[Violation] = []
@@ -691,7 +702,7 @@ def scan_repository(
         parents = _parents(tree)
         violations.extend(_check_ag002(rel, tree, parents))
         violations.extend(_check_ag003_ag004(rel, tree, parents))
-        violations.extend(_check_ag005(rel, text, tree, refs_root=refs_root))
+        violations.extend(_check_ag005(rel, text, tree, refs_root=refs_root, repo_map=repo_map))
     violations.sort(key=lambda v: (v.path.as_posix(), v.line, v.rule, v.message))
     return tuple(violations)
 
@@ -733,11 +744,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--base", default=None, help="git base ref for differential scan")
     parser.add_argument("--strict", action="store_true", help="ignore legacy allowlist")
     parser.add_argument("--refs-root", default=None, help="local upstream repos root for SHA-256 check")
+    parser.add_argument(
+        "--repo-map",
+        action="append",
+        default=[],
+        metavar="NAME=PATH",
+        help="explicit upstream repo mapping overriding --refs-root (repeatable)",
+    )
     args = parser.parse_args(argv)
     root = Path(args.root).resolve()
     refs_root = Path(args.refs_root).resolve() if args.refs_root else None
     try:
-        current = scan_repository(root, refs_root=refs_root)
+        repo_map = _parse_repo_map(args.repo_map)
+        current = scan_repository(root, refs_root=refs_root, repo_map=repo_map or None)
         if args.base is not None:
             active = new_violations(current, scan_repository(root, revision=args.base))
         elif args.strict:

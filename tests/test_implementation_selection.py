@@ -12,7 +12,7 @@ from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.workload import IterationPlan, RequestView
 from test_prediction_system import case
 from test_family_selection import declared_case
-from test_sparse_mla_metadata import raw_case as sparse_case
+from _support.operator_cases import sparse_mla_metadata_raw_case as sparse_case
 
 
 def policy(binding, domain=None, *, otherwise="error"):

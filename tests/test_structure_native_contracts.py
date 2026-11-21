@@ -10,7 +10,7 @@ from mindie_sim.prediction.operator_analysis import target_operators
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.structure import export_structure
 from mindie_sim.structure_contracts import comparison_scope, predicted_contract
-from test_mla_family_selection import mla_case
+from _support.operator_cases import mla_case
 
 
 ROOT = Path(__file__).resolve().parents[1]

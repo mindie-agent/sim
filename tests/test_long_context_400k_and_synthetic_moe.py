@@ -33,7 +33,7 @@ A2_SKUS = {
 
 
 def test_periodic_pipeline_compaction_matches_exact_pipeline_program():
-    from test_attention_decode import make_op, run
+    from _support.operator_cases import gqa_decode_op as make_op, gqa_decode_run as run
 
     op = make_op([(1, 131072)] * 8, heads=16, kv_heads=2, dim=128)
     recipe = StagedGQADecode(key_tile=128, query_tile=16)
@@ -58,7 +58,7 @@ def test_periodic_pipeline_compaction_matches_exact_pipeline_program():
 
 @pytest.mark.parametrize("slots", (1, 2, 3))
 def test_short_periodic_decode_is_lazy_and_matches_unrolled_template(monkeypatch, slots):
-    from test_attention_decode import make_op, run
+    from _support.operator_cases import gqa_decode_op as make_op, gqa_decode_run as run
     from mindie_sim.prediction.program import (
         KernelProgram, PipelinePhase, PipelineTemplateProgram,
     )
@@ -104,8 +104,8 @@ def test_short_periodic_decode_is_lazy_and_matches_unrolled_template(monkeypatch
 
 @pytest.mark.parametrize("context_len", (409600, 1048576))
 def test_ultra_long_context_400k_and_1m_gqa_and_paged_mla_execute_in_o1_time(context_len):
-    from test_attention_decode import make_op, run
-    from test_paged_mla import attention as mla_attention, case as mla_case, execute as mla_execute
+    from _support.operator_cases import gqa_decode_op as make_op, gqa_decode_run as run
+    from _support.operator_cases import paged_mla_attention as mla_attention, paged_mla_case as mla_case, paged_mla_execute as mla_execute
 
     t0 = time.perf_counter()
     op = make_op([(1, context_len)] * 8, heads=16, kv_heads=2, dim=128)
@@ -146,7 +146,7 @@ def test_fai_decode_mapping_supports_q1_high_batch_and_up_to_64_cores():
 
 
 def test_attention_decode_compaction_conserves_causal_tail_and_ragged_multi_request_schedule():
-    from test_attention_decode import make_op, run
+    from _support.operator_cases import gqa_decode_op as make_op, gqa_decode_run as run
     import mindie_sim.prediction.attention_decode as ad
 
     # Finding 1a: q > key_tile (q=12, key_tile=8) spans multiple causal tail tiles.
@@ -176,8 +176,8 @@ def test_attention_decode_compaction_conserves_causal_tail_and_ragged_multi_requ
     assert eng_comp_r.peak_allocated == pytest.approx(eng_exact_r.peak_allocated, rel=1e-12)
 
     # 3-point periodic convergence control under slow mte1/mte3 regime (warm-up > 24 tiles):
-    import test_attention_decode as td
-    raw_slow = td.hardware(units=1)
+    from _support import operator_cases as td
+    raw_slow = td.gqa_decode_hardware(units=1)
     raw_slow["machine"]["device"]["rates"] = {
         "memory": 15e9, "vector": 26e6, "mte1": 4.5e6, "mte2": 31e6, "mte3": 1.5e6,
     }
@@ -198,7 +198,7 @@ def test_attention_decode_compaction_conserves_causal_tail_and_ragged_multi_requ
 
 
 def test_paged_mla_arch22_multi_job_owner_and_refill_steady_subblock_isolation():
-    from test_paged_mla_arch22 import run as a2_run
+    from _support.operator_cases import paged_mla_membase_run as a2_run
     from mindie_sim.prediction.paged_mla_arch22_dispatch import source_dispatch
     import mindie_sim.prediction.paged_mla_arch22 as pma22
     from mindie_sim.prediction.refill_steady import _extract_stage
@@ -223,8 +223,8 @@ def test_paged_mla_arch22_multi_job_owner_and_refill_steady_subblock_isolation()
     with pytest.raises(ValueError, match="unsupported_nested_stage_program:PipelineProgram"):
         _extract_stage(nested)
 
-    from test_paged_mla import (
-        BUFFERS as MLA_BUFFERS,
+    from _support.operator_cases import (
+        PAGED_MLA_BUFFERS as MLA_BUFFERS,
         Geometry as MlaGeometry,
         OpSpec as MlaOpSpec,
         RecipeContext as MlaRecipeContext,

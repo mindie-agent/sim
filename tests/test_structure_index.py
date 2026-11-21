@@ -25,7 +25,7 @@ def test_index_preserves_peer_bound_work_and_detects_projected_record_changes():
 
 
 def test_source_plan_is_omitted_but_native_contract_and_physical_identity_remain():
-    from test_mla_family_selection import mla_case
+    from _support.operator_cases import mla_case
     raw = mla_case()
     raw['runtime']['kernels']['lowerings'] = {'mla_decode': {
         'implementation': 'vllm_triton_mla_decode_tuple', 'options': {'num_kv_splits': 2}}}

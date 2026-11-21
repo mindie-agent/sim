@@ -30,7 +30,7 @@ from mindie_sim.prediction.transforms import (activation_quantization,
                                               norm_quant, residual_norm)
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.structure_physical import node_physical
-from test_mechanism_contract import hardware_case
+from _support.operator_cases import hardware_case
 
 
 def _parsed(quant="mxfp8"):

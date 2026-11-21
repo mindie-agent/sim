@@ -164,3 +164,88 @@ def test_arch_governance_tightened_loopholes(tmp_path):
         v.rule == "AG005" and "refs repo directory not found" in v.message
         for v in refs_found
     )
+
+
+def test_arch_governance_repo_map_overrides_refs_root_and_validates_sha(tmp_path, monkeypatch):
+    import hashlib
+    from types import SimpleNamespace
+
+    repo_dir = tmp_path / "custom-sibling"
+    repo_dir.mkdir(parents=True)
+    payload = b"def kernel():\n    return 42\n"
+    rev = "c" * 40
+    sha = hashlib.sha256(payload).hexdigest()
+    seen_dirs: list[str] = []
+
+    def fake_run(cmd, **_kwargs):
+        seen_dirs.append(cmd[2])
+        if cmd[2] != str(repo_dir.resolve()):
+            return SimpleNamespace(returncode=1, stdout="", stderr="missing")
+        if cmd[3:5] == ["cat-file", "-t"]:
+            target = cmd[5]
+            if target == rev:
+                return SimpleNamespace(returncode=0, stdout="commit\n", stderr="")
+            if target == "e" * 40:
+                return SimpleNamespace(returncode=0, stdout="tree\n", stderr="")
+            if target == f"{rev}:pkg/kernel.py":
+                return SimpleNamespace(returncode=0, stdout="blob\n", stderr="")
+            if target == f"{rev}:pkg":
+                return SimpleNamespace(returncode=0, stdout="tree\n", stderr="")
+            return SimpleNamespace(returncode=1, stdout="", stderr="missing")
+        if cmd[3:5] == ["cat-file", "blob"] and cmd[5] == f"{rev}:pkg/kernel.py":
+            return SimpleNamespace(returncode=0, stdout=payload, stderr=b"")
+        return SimpleNamespace(returncode=1, stdout=b"", stderr=b"missing")
+
+    monkeypatch.setattr(arch_gov.subprocess, "run", fake_run)
+
+    proj = tmp_path / "proj"
+    fam = proj / "mindie_sim" / "prediction" / "operators" / "demo"
+    fam.mkdir(parents=True)
+    (fam / "arch35.py").write_text(
+        '"""Demo leaf.\n\nUpstream-ABI: aclnnDemo\n"""\n'
+        "from mindie_sim.schema.datapath import SourceRef\n"
+        "STRATEGY = object()\n"
+        f"SOURCES = (SourceRef('org/custom-sibling', '{rev}', 'pkg/kernel.py', '{sha}'),)\n",
+        encoding="utf-8",
+    )
+    empty_refs = tmp_path / "empty_refs"
+    empty_refs.mkdir()
+
+    assert arch_gov.scan_repository(
+        proj, refs_root=empty_refs, repo_map={"custom-sibling": repo_dir}
+    ) == ()
+    assert str(repo_dir.resolve()) in seen_dirs
+    assert arch_gov.main([
+        "--root", str(proj),
+        "--refs-root", str(empty_refs),
+        "--repo-map", f"org/custom-sibling={repo_dir}",
+    ]) == arch_gov.EXIT_OK
+    assert arch_gov.main(["--root", str(proj), "--repo-map", "broken_entry"]) == arch_gov.EXIT_USAGE
+
+    bad_sha = "d" * 64
+    (fam / "arch35.py").write_text(
+        '"""Demo leaf.\n\nUpstream-ABI: aclnnDemo\n"""\n'
+        "from mindie_sim.schema.datapath import SourceRef\n"
+        "STRATEGY = object()\n"
+        f"SOURCES = (SourceRef('org/custom-sibling', '{rev}', 'pkg/kernel.py', '{bad_sha}'),)\n",
+        encoding="utf-8",
+    )
+    mismatch = arch_gov.scan_repository(
+        proj, refs_root=empty_refs, repo_map={"custom-sibling": repo_dir}
+    )
+    assert any(v.rule == "AG005" and "SHA-256 mismatch" in v.message for v in mismatch)
+
+    tree_rev = "e" * 40
+    (fam / "arch35.py").write_text(
+        '"""Demo leaf.\n\nUpstream-ABI: aclnnDemo\n"""\n'
+        "from mindie_sim.schema.datapath import SourceRef\n"
+        "STRATEGY = object()\n"
+        f"SOURCES = (SourceRef('org/custom-sibling', '{tree_rev}', 'pkg/kernel.py', '{sha}'),"
+        f" SourceRef('org/custom-sibling', '{rev}', 'pkg', '{sha}'))\n",
+        encoding="utf-8",
+    )
+    bad_types = arch_gov.scan_repository(
+        proj, refs_root=empty_refs, repo_map={"custom-sibling": repo_dir}
+    )
+    assert any(v.rule == "AG005" and "not a git commit" in v.message for v in bad_types)
+    assert any(v.rule == "AG005" and "not a git blob" in v.message for v in bad_types)

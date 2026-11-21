@@ -55,9 +55,9 @@ from mindie_sim.schema.workload import RequestView
 from mindie_sim.schema.operators import OpSpec
 
 import test_v0919_deep_audit_track_b as track_b
-import test_wave3a_cann921_mla_keypool_prolog as wave3a
-import test_wave4a_c8sfa_mqsmla_calibration as wave4a
-import test_wave4b_indexer_conv1d_calibration as wave4b
+import _support.operator_calibration_helpers as wave3a
+import _support.operator_calibration_helpers as wave4a
+import _support.operator_calibration_helpers as wave4b
 from _support.moe_hc_mc2_fixtures import router_splitk as wave4c
 from test_prediction_system import linear_work
 

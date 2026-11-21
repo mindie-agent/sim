@@ -7,7 +7,7 @@ import json
 from mindie_sim.catalog.ops import gemm_op, vector_op
 from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.structure import export_op_structure, export_structure, main
-from test_mla_family_selection import mla_case
+from _support.operator_cases import mla_case
 from test_prediction_system import case
 
 

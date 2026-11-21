@@ -103,7 +103,7 @@ def test_semantic_recipe_labels_share_fallback_but_explicit_invocations_do_not()
 def test_family_service_identity_still_distinguishes_kernel_recipe_names():
     from mindie_sim.prediction.services import service_identity
     from mindie_sim.prediction.structure import parse_case
-    from test_mechanism_contract import hardware_case
+    from _support.operator_cases import hardware_case
     from _support.kernel_invocation import copy_op, curve
 
     case = parse_case(hardware_case())

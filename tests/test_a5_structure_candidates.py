@@ -297,7 +297,7 @@ def test_real_lower_fusion_covers_multiple_members_with_one_boundary():
 
 
 def test_source_call_expansion_keeps_one_call_identity_across_kernels():
-    from test_mla_family_selection import mla_case
+    from _support.operator_cases import mla_case
 
     raw = mla_case()
     report = export_structure(raw, phase="decode", tokens=1, context=16,

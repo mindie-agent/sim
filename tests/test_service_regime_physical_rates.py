@@ -6,7 +6,7 @@ import pytest
 
 from mindie_sim import operator_costs, target_graphs
 from mindie_sim.prediction.structure import parse_case
-from test_attention_decode import hardware
+from _support.operator_cases import gqa_decode_hardware as hardware
 
 
 def attention_case():

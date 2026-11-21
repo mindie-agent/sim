@@ -17,7 +17,7 @@ from mindie_sim.prediction.response_functions import (
 from mindie_sim.prediction.service_regime_domains import (
     compile_service_regime_domains, rules_overlap, validate_service_regime_domains)
 from mindie_sim.schema.common import ModelingError
-from test_mechanism_contract import hardware_case
+from _support.operator_cases import hardware_case
 from _support.kernel_invocation import copy_op
 
 SUPPORT = {"q": {"min": 1, "max": 200}}
