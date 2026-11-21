@@ -301,22 +301,53 @@ owns = [
 [[module]]
 path = "operators/test_linear_attention_prepare.py"
 tier = "tier0"
-reserved = true
+owns = [
+  "mindie_sim/prediction/operators/linear_attention",
+  "mindie_sim/prediction/operators/gdn_prepare.py",
+  "mindie_sim/prediction/operators/kda_prepare.py",
+  "mindie_sim/prediction/operators/kda_prepare_compact.py",
+]
 
 [[module]]
 path = "operators/test_linear_attention_state.py"
 tier = "tier0"
-reserved = true
+owns = [
+  "mindie_sim/prediction/operators/linear_attention",
+  "mindie_sim/prediction/operators/gdn_state.py",
+  "mindie_sim/prediction/operators/kda_state.py",
+  "mindie_sim/prediction/operators/kda_state_selection.py",
+]
 
 [[module]]
 path = "operators/test_linear_attention_recurrent.py"
 tier = "tier0"
-reserved = true
+owns = [
+  "mindie_sim/prediction/operators/linear_attention",
+  "mindie_sim/prediction/operators/gdn_output.py",
+  "mindie_sim/prediction/operators/kda_recurrent.py",
+  "mindie_sim/prediction/recover_ssm_work.py",
+  "mindie_sim/prediction/recover_ssm_commit.py",
+]
 
 [[module]]
 path = "operators/test_causal_conv.py"
 tier = "tier0"
-reserved = true
+owns = [
+  "mindie_sim/prediction/operators/linear_attention",
+  "mindie_sim/prediction/operators/causal_conv_prefill.py",
+  "mindie_sim/prediction/operators/native_causal_conv_prefill.py",
+  "mindie_sim/prediction/operators/native_causal_conv_spec.py",
+  "mindie_sim/prediction/family_causal_conv.py",
+  "mindie_sim/prediction/conv_state_copy.py",
+]
+
+[[module]]
+path = "operators/test_catlass_and_dsl_templates.py"
+tier = "tier0"
+owns = [
+  "mindie_sim/templates",
+  "scripts/check_template_provenance.py",
+]
 
 [[module]]
 path = "operators/test_hyper_connections.py"

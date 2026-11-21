@@ -93,7 +93,7 @@ def test_sparse_decode_metadata_is_explicitly_excluded_from_prefill():
 
 
 def test_prefill_kda_chooses_its_chunk_source_without_decode_source_in_mixed_batch():
-    from test_kda_decode_family import caller
+    from _support.linear_cases import caller
     from mindie_sim.prediction.family_kda_recurrent_arch22 import IMPLEMENTATION as DECODE
     from mindie_sim.prediction.family_kda_state import IMPLEMENTATION as PREFILL
 
@@ -144,7 +144,7 @@ def test_hc_prefill_geometry_selects_source_only_inside_its_declared_row_domain(
 def test_optional_prepared_weights_stay_resident_when_mixed_calls_select_analytical():
     from mindie_sim.catalog.weights import stage_weight_bytes
     from mindie_sim.prediction.gdn_decode_programs import CONV
-    from test_causal_conv_update_family import case as kimi_case
+    from _support.linear_cases import case as kimi_case
 
     original = parse_case(kimi_case(1))
     model = replace(original.model, layers=4, body_layers=4,

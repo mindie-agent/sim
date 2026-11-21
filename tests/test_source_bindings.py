@@ -30,7 +30,7 @@ EXTENSIONS = (
     "index_topk",
     "mla_decode",
     "moe_combine",
-    "causal_conv_prefill",
+    "mindie_sim.prediction.operators.causal_conv_prefill".rsplit(".", 1)[-1],
     "gdn_prepare",
     "gdn_state",
     "gdn_output",
