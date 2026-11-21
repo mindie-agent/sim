@@ -12,7 +12,7 @@ from dataclasses import replace
 from mindie_sim.catalog.attention_common import AttentionResult
 from mindie_sim.schema.common import dtype_bytes, ModelingError
 from mindie_sim.schema.tensors import TensorLayout, TensorValue
-from . import gdn_recurrent
+from .operators.linear_attention import gdn_recurrent
 from .operators import kda_state_selection as pcp_state_selection
 from .lowering import Builder
 from .tensors import TensorLowering

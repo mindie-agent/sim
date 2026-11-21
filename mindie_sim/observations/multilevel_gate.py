@@ -235,6 +235,7 @@ class CohortSummary:
     failed_metrics: tuple[str, ...] = ()
     tail_case_ids: tuple[str, ...] = ()
     acquisition_roots: tuple[str, ...] = ()
+    evaluated_ok_case_ids: tuple[str, ...] = ()
     @property
     def passed(self) -> bool:
         return self.status == "pass"
@@ -686,20 +687,22 @@ def summarize_cohorts(
     for row in residuals:
         bucket = buckets.get(row.cohort)
         if bucket is None:
-            bucket = [[], [], set(), [], Counter(), 0]
+            bucket = [[], [], set(), [], set(), Counter(), 0]
             buckets[row.cohort] = bucket
-        if row.status == "ok" and math.isfinite(row.absolute_percentage_error):
-            ape_pct = row.absolute_percentage_error * PERCENT_SCALE
-            bucket[0].append(ape_pct)
-            bucket[1].append(row.signed_error * PERCENT_SCALE)
-            bucket[2].add(row.acquisition_root)
+        apes, signed, roots, tails, evaluated_ok, excluded, _ = bucket
+        ape_pct = row.absolute_percentage_error * PERCENT_SCALE
+        if row.status == "ok" and math.isfinite(ape_pct):
+            apes.append(ape_pct)
+            signed.append(row.signed_error * PERCENT_SCALE)
+            roots.add(row.acquisition_root)
+            evaluated_ok.add(row.case_id)
             if ape_pct >= threshold_pct:
-                bucket[3].append(row.case_id)
+                tails.append(row.case_id)
         else:
-            bucket[4][row.excluded_reason or row.status] += 1
-            bucket[5] += int(row.status == "missing_evidence")
+            excluded[row.excluded_reason or row.status] += 1
+            bucket[-1] += int(row.status == "missing_evidence")
     summaries: dict[CohortKey, CohortSummary] = {}
-    for cohort_key, (apes, signed, roots, tails, excluded, missing) in buckets.items():
+    for cohort_key, (apes, signed, roots, tails, evaluated_ok, excluded, missing) in buckets.items():
         excluded_tuple = tuple(sorted(excluded.items()))
         if not apes:
             summaries[cohort_key] = CohortSummary(
@@ -717,13 +720,14 @@ def summarize_cohorts(
         summaries[cohort_key] = CohortSummary(
             cohort_key, status, len(roots), len(apes),
             mape_pct, medape_pct, float(statistics.median(signed)), float(apes[p90_idx]), float(apes[-1]),
-            missing, excluded_tuple, threshold_pct, failed, tuple(tails), tuple(sorted(roots)),
+            missing, excluded_tuple, threshold_pct, failed, tuple(tails), tuple(sorted(roots)), tuple(sorted(evaluated_ok)),
         )
     return summaries
 
 
 def gate_decision(
     summaries: Mapping[CohortKey, CohortSummary], *,
+    threshold_pct: float = DEFAULT_THRESHOLD_PCT,
     required_levels: Sequence[Level] = REQUIRED_LEVELS,
     require_disjoint_level_roots: bool = True,
     expected_case_ids: Iterable[str] | None = None,
@@ -733,16 +737,17 @@ def gate_decision(
 ) -> dict[str, Any]:
     """Compute the release verdict from cohort results and optional planned coverage.
 
-    Pass case IDs or residuals as evaluated_case_ids. Only ok residuals count.
+    Coverage comes from scored residuals recorded in summaries. The
+    evaluated_case_ids argument is retained for caller compatibility.
     """
     missing_planned_cases = []
     if expected_case_ids is not None:
-        evaluated = {
-            row if isinstance(row, str) else row.case_id
-            for row in (evaluated_case_ids or ()) if isinstance(row, str) or row.status == "ok"
-        }
+        evaluated = {case_id for summary in summaries.values() for case_id in summary.evaluated_ok_case_ids}
         missing_planned_cases = sorted(set(expected_case_ids) - evaluated)
-    failed = sorted(k.as_id() for k, v in summaries.items() if v.status == "fail")
+    pointwise_failures = {
+        k.as_id() for k, v in summaries.items() if v.max_ape_pct is not None and v.max_ape_pct >= threshold_pct
+    }
+    failed = sorted(pointwise_failures | {k.as_id() for k, v in summaries.items() if v.status == "fail"})
     insufficient = sorted(k.as_id() for k, v in summaries.items() if v.status == "insufficient_evidence")
     tail_warnings = sorted(k.as_id() for k, v in summaries.items() if v.tail_exceeded)
     covered_levels: set[str] = set()
@@ -765,6 +770,7 @@ def gate_decision(
         "covered_levels": sorted(covered_levels), "missing_levels": missing_levels,
         "overlapping_level_roots": overlapping_roots,
         "failed_cohorts": failed, "insufficient_cohorts": insufficient, "tail_warning_cohorts": tail_warnings,
+        "pointwise_threshold_exceeded": sorted(pointwise_failures),
         "missing_planned_cases": missing_planned_cases, "plan_only": plan_only, "calibrated_count": calibrated_count,
     }
 

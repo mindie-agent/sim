@@ -129,6 +129,7 @@ class Engine(
         self._wave_recorder = None
         self._hbm_bus_aliases: dict[str, Any] = {}
         self._hbm_bus_epoch: int = 0
+        self._hbm_accounting_serviced: dict[str, float] = {}
         self._pending_hbm_retrofits: dict[str, tuple[Any, bool]] = {}
         self._discover_hbm_bus_aliases()
         if self._accel is not None and getattr(self._accel, "mode", "") == "c":

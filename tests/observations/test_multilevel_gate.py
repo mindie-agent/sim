@@ -46,7 +46,6 @@ MODEL_RUN_CAPTURE = {
     "step_and_layer_timings": {"decode_B8_S512_step_p50_ms": 0.92, "decode_B8_S512_per_layer_us": 230.0},
 }
 
-
 def _load_script(name: str, path: Path):
     if name in sys.modules:
         return sys.modules[name]
@@ -57,17 +56,11 @@ def _load_script(name: str, path: Path):
     spec.loader.exec_module(mod)
     return mod
 
-
 def _sha(tag: str) -> str:
     return (tag * 64)[:64]
 
-
 def _cohort(level: str = "L1", name: str = "gemm") -> CohortKey:
-    return CohortKey(
-        level=level, cohort_name=name, sku="device_x", phase="prefill",  # type: ignore[arg-type]
-        mode="eager", shape_regime="medium", parallel_topology="tp1",
-    )
-
+    return CohortKey(level, name, "device_x", "prefill", "eager", "medium", "tp1")  # type: ignore[arg-type]
 
 def _boundary(
     tag: str, *, kind: str = "device_kernel", parents: tuple[str, ...] = (),
@@ -80,7 +73,6 @@ def _boundary(
         clock_domain="device_monotonic", start_event="k_start", end_event="k_end",
         boundary_kind=kind, unit=unit, capture_uri=uri or f"capture://suite/{tag}", session_id=session_id,
     )
-
 
 def _case(
     cid: str, *, level: str = "L1", split: str = "heldout", tag: str = "a",
@@ -106,7 +98,6 @@ def _case(
         regime_dims=(("dtype_layout", "bf16_nd"), ("shape", "m1024"), ("warmth", "warm")),
     )
 
-
 def _run_engine_for_ns(start_name: str, end_name: str, duration_ns: int) -> tuple[Engine, Any, Any]:
     eng = Engine([Resource("device", MS_TO_NS, "ns", "fifo")], trace_limit=TRACE_LIMIT)
     s_ev = eng.submit(start_name, {"device": 100.0})
@@ -114,11 +105,9 @@ def _run_engine_for_ns(start_name: str, end_name: str, duration_ns: int) -> tupl
     eng.advance(until=(e_ev,))
     return eng, s_ev, e_ev
 
-
 def _live_interval(case: GateCase, predicted_ns: int, **kw: Any) -> EngineInterval:
     eng, s_ev, e_ev = _run_engine_for_ns(case.boundary.start_event, case.boundary.end_event, predicted_ns)
     return bind_engine_interval(case, eng, s_ev, e_ev, **kw)
-
 
 class _LiveEngineRunner:
     def __init__(self, overrides: dict[str, EngineInterval] | None = None, scale: float = 1.05) -> None:
@@ -139,7 +128,6 @@ class _LiveEngineRunner:
         return _live_interval(case, max(1, int(round((case.measured_ns or 1000) * self._scale))))
 
     run_l1 = run_l2 = run_l3 = _run
-
 
 def test_lineage_case_normalization_event_scoping_and_fit_closure(tmp_path: Path) -> None:
     fits = FrozenFitManifest("f1", "1", ())
@@ -185,6 +173,8 @@ def test_lineage_case_normalization_event_scoping_and_fit_closure(tmp_path: Path
     for fname, bad_payload, err in (
         ("bad_rank.json", {**cap_doc, "device_ranks": [1]}, "capture_rank_mismatch"),
         ("bad_clk.json", {**cap_doc, "clock_domain": "host_wall"}, "capture_clock_domain_mismatch"),
+        ("bad_clock_top.json", {**cap_doc, "clock_operator": "elapsed_span"}, "capture_clock_operator_mismatch"),
+        ("bad_clock_boundary.json", {**cap_doc, "boundary": {"clock_operator": "elapsed_span"}}, "capture_clock_operator_mismatch"),
         ("bad_ev.json", {**cap_doc, "event_ids": ["other_ev"]}, "capture_event_mismatch"),
         ("bad_se.json", {**cap_doc, "start_event": "wrong_start"}, "capture_event_mismatch"),
         ("unrel.json", {"summary": "unrelated_without_events"}, "capture_event_mismatch"),
@@ -192,9 +182,9 @@ def test_lineage_case_normalization_event_scoping_and_fit_closure(tmp_path: Path
         fp = cap_dir / fname
         fp.write_text(json.dumps(bad_payload), encoding="utf-8")
         c_bad = _case(fname, tag="5", raw_sha=hashlib.sha256(fp.read_bytes()).hexdigest(), events=("ev-ok",), uri=f"capture://suite/{fname}")
+        c_bad = replace(c_bad, boundary=replace(c_bad.boundary, clock_operator="busy_union"))
         with pytest.raises(ModelingError, match=err):
-            validate_lineage(Manifest(f"m_{fname}", "1", (c_bad,)), fits, capture_root=tmp_path)
-
+            validate_lineage(Manifest(f"m_{fname}", "1", (c_bad,)), fits, capture_root=tmp_path, require_capture_files=True)
 
 def test_cross_level_root_overlap_rejected_unless_debug_only() -> None:
     c_l1 = _case("l1_case", level="L1", split="heldout", tag="a", acq="shared_root")
@@ -212,7 +202,6 @@ def test_cross_level_root_overlap_rejected_unless_debug_only() -> None:
     summaries = summarize_cohorts(residuals)
     assert summaries[c_l2_dbg.cohort].status == "insufficient_evidence"
     assert ("debug_cross_level_not_blind_acceptance", 1) in summaries[c_l2_dbg.cohort].excluded_reasons
-
 
 def test_engine_receipt_binding_and_mandatory_three_level_coverage() -> None:
     c_l1 = _case("l1_off", level="L1", tag="1", measured_ns=1000)
@@ -243,7 +232,6 @@ def test_engine_receipt_binding_and_mandatory_three_level_coverage() -> None:
         run_l2(c_l2, _LiveEngineRunner({"l2_clone": _live_interval(c_l2, 5000, derived_from_step_division=True)}))
     with pytest.raises(ModelingError, match="l2_cloned_or_divided_from_l3_forbidden"):
         run_l2(c_l2, _LiveEngineRunner({"l2_clone": _live_interval(c_l2, 5000, source_level="L3")}))
-
     c_l3 = _case("l3_step", level="L3", tag="3", measured_ns=50_000)
     shared_eng, shared_s, shared_e = _run_engine_for_ns("k_start", "k_end", 5000)
     iv_l2 = bind_engine_interval(c_l2, shared_eng, shared_s, shared_e)
@@ -262,7 +250,6 @@ def test_engine_receipt_binding_and_mandatory_three_level_coverage() -> None:
         bind_engine_interval(c_l1, twin_eng, shared_s, shared_e)
     with pytest.raises(ModelingError, match="engine_event_not_owned_by_engine:.*trace_required"):
         bind_engine_interval(c_l1, untraced_eng, us, ue)
-
     fits, runner = FrozenFitManifest("f", "1", ()), _LiveEngineRunner(scale=1.03)
     dec_l1 = gate_decision(summarize_cohorts(list(evaluate(Manifest("m_l1", "1", (c_l1,)), fits, runner))))
     assert dec_l1["status"] == "insufficient_evidence" and dec_l1["missing_levels"] == ["L2", "L3"]
@@ -270,7 +257,6 @@ def test_engine_receipt_binding_and_mandatory_three_level_coverage() -> None:
     assert dec_l12["status"] == "insufficient_evidence" and dec_l12["missing_levels"] == ["L3"]
     dec_all = gate_decision(summarize_cohorts(list(evaluate(Manifest("m_all", "1", (c_l1, c_l2, c_l3)), fits, runner))))
     assert dec_all["status"] == "pass" and dec_all["missing_levels"] == [] and dec_all["covered_levels"] == ["L1", "L2", "L3"]
-
     dup_root_res = [
         Residual("a1", "L1", _cohort("L1", "f1"), "same_root", 1000, 1020, "capture://r/1", 0.02, 0.02),
         Residual("a2", "L2", _cohort("L2", "f2"), "same_root", 2000, 2040, "capture://r/2", 0.02, 0.02),
@@ -278,7 +264,6 @@ def test_engine_receipt_binding_and_mandatory_three_level_coverage() -> None:
     ]
     dec_overlap = gate_decision(summarize_cohorts(dup_root_res))
     assert dec_overlap["status"] == "insufficient_evidence" and dec_overlap["overlapping_level_roots"] == ["same_root"]
-
 
 def test_l2_absent_capture_near_zero_rung_and_strict_threshold() -> None:
     fits = FrozenFitManifest("f", "1", ())
@@ -297,7 +282,6 @@ def test_l2_absent_capture_near_zero_rung_and_strict_threshold() -> None:
     assert rung_res["rung_near"].status == "near_zero_delta" and rung_res["rung_near"].signed_delta_ns == 150
     assert rung_res["rung_near"].arm_a_signed_error == pytest.approx(0.01)
     assert rung_res["rung_wide"].status == "ok" and rung_res["rung_wide"].absolute_percentage_error == pytest.approx(0.05)
-
     assert summarize_cohorts([]) == {} and gate_decision({})["status"] == "insufficient_evidence"
     c_zero = _case("zero_dur", level="L1", tag="7", measured_ns=0)
     c_cf = _case("cf_only", level="L3", tag="8", measured_ns=9000, is_counterfactual=True, has_matched_capture=False)
@@ -319,7 +303,6 @@ def test_l2_absent_capture_near_zero_rung_and_strict_threshold() -> None:
     p90_sum = summarize_cohorts(ten_res)[_cohort("L1", "p90_fam")]
     assert p90_sum.p90_ape_pct == pytest.approx(9.0) and p90_sum.tail_case_ids == ("p9",)
 
-
 def _raw_case(cid: str, split: str, tag: str, pad_bytes: int = 0) -> dict[str, Any]:
     return {
         "case_id": cid, "level": "L1", "split": split, "input_digest": f"in-{cid}",
@@ -336,7 +319,6 @@ def _raw_case(cid: str, split: str, tag: str, pad_bytes: int = 0) -> dict[str, A
         "payload": {"blob": "x" * pad_bytes} if pad_bytes else {},
     }
 
-
 def test_pointwise_outlier_blocks_release() -> None:
     cases = tuple(_case(f"point_{tag}", tag=tag) for tag in ("a", "b", "c"))
     outlier = cases[-1]
@@ -347,9 +329,16 @@ def test_pointwise_outlier_blocks_release() -> None:
     summaries = summarize_cohorts(rows)
     assert summaries[outlier.cohort].status == "fail"
     assert summaries[outlier.cohort].failed_metrics == ("max_ape_pct",)
-    assert summarize_cohorts(rows, strict_pointwise=False)[outlier.cohort].status == "pass"
+    relaxed = summarize_cohorts(rows, strict_pointwise=False)
+    assert relaxed[outlier.cohort].status == "pass" and relaxed[outlier.cohort].max_ape_pct == OUTLIER_APE_PCT
+    verdict = gate_decision(relaxed, required_levels=("L1",))
+    assert verdict["status"] == "fail" and verdict["failed_cohorts"] == [outlier.cohort.as_id()]
+    assert verdict["pointwise_threshold_exceeded"] == [outlier.cohort.as_id()]
     assert gate_decision(summaries, plan_only=True, calibrated_count=0)["status"] == "fail"
-
+    planned = tuple(case.case_id for case in cases)
+    omitted = gate_decision(summarize_cohorts(rows[:-1]), required_levels=("L1",),
+                            expected_case_ids=planned, evaluated_case_ids=planned)
+    assert omitted["status"] == "insufficient_evidence" and omitted["missing_planned_cases"] == [outlier.case_id]
 
 def test_missing_planned_case_blocks_release() -> None:
     case = _case("evaluated")
@@ -363,18 +352,21 @@ def test_missing_planned_case_blocks_release() -> None:
     assert verdict["status"] == "insufficient_evidence" and verdict["missing_planned_cases"] == ["missing_cell"]
     assert summarize_cohorts([*rows, missing])[case.cohort].status == "insufficient_evidence"
 
-
 def test_busy_union_clock_matches_capture_and_merges_clipped_trace() -> None:
     case = _case("clock")
-    eng = Engine([Resource(name, MS_TO_NS, "ns", "fifo") for name in ("device", "aux")], trace_limit=TRACE_LIMIT)
+    eng = Engine([Resource(name, MS_TO_NS, "ns", "fifo") for name in ("device", "aux", "host@r0:s0")], trace_limit=TRACE_LIMIT)
     start = eng.submit("k_start", {"device": 100})
     eng.submit("left_crossing", {"aux": 2 * 100})
     eng.submit("overlap", {"device": 2 * 100}, release=(100 + 100 / 2) / MS_TO_NS)
+    eng.submit("host_work", {"host@r0:s0": 100}, release=(1000 / 2) / MS_TO_NS)
     stop_ns = 1000 + 100
     end = eng.submit("k_end", release=stop_ns / MS_TO_NS)
     late = eng.submit("right_crossing", {"aux": 2 * 100}, release=(stop_ns - 100 / 2) / MS_TO_NS)
-    eng.advance(until=(late,))
     busy_case = replace(case, boundary=replace(case.boundary, clock_operator="busy_union"), measured_ns=CLOCK_MERGED_BUSY_NS)
+    eng.advance(until=(end,))
+    with pytest.raises(ModelingError, match="busy_union_trace_incomplete:clock"):
+        bind_engine_interval(busy_case, eng, start, end)
+    eng.advance(until=(late,))
     elapsed = bind_engine_interval(busy_case, eng, start, end, clock_operator="elapsed_span")
     with pytest.raises(ModelingError, match="clock_operator_mismatch:clock:busy_union:elapsed_span"):
         run_l1(busy_case, _LiveEngineRunner({"clock": elapsed}))
@@ -390,6 +382,22 @@ def test_busy_union_clock_matches_capture_and_merges_clipped_trace() -> None:
     with pytest.raises(ModelingError, match="engine_receipt_signature_invalid:clock"):
         run_l1(busy_case, _LiveEngineRunner({"clock": forged}))
 
+@pytest.mark.parametrize("trace_limit", (0, 1, TRACE_LIMIT))
+def test_busy_union_idle_markers_require_complete_trace(trace_limit: int) -> None:
+    case = _case("idle_clock")
+    case = replace(case, boundary=replace(case.boundary, clock_operator="busy_union"))
+    eng = Engine([], trace_limit=trace_limit)
+    start = eng.submit(case.boundary.start_event)
+    end = eng.submit(case.boundary.end_event, release=1000 / MS_TO_NS)
+    eng.advance(until=(end,))
+    if trace_limit < 2:
+        with pytest.raises(ModelingError, match="busy_union_trace_incomplete:idle_clock"):
+            bind_engine_interval(case, eng, start, end)
+        return
+    interval = bind_engine_interval(case, eng, start, end)
+    assert (interval.busy_union_ns, interval.predicted_ns, interval.elapsed_span_ns) == (0, 0, 1000)
+    with pytest.raises(ModelingError, match="interval_span_or_duration_invalid:idle_clock"):
+        run_l1(case, _LiveEngineRunner({case.case_id: interval}))
 
 def test_caller_predictions_and_uncalibrated_plans_cannot_pass() -> None:
     raw = _raw_case("caller", "heldout", "c")
@@ -407,11 +415,9 @@ def test_caller_predictions_and_uncalibrated_plans_cannot_pass() -> None:
         assert verdict["status"] == "insufficient_evidence"
         assert (verdict["calibrated_count"], verdict["plan_only"]) == (count, plan_only)
 
-
 def test_two_pass_streaming_past_64k_header_and_provenance(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import mindie_sim.observations.multilevel_gate as mg
     import mindie_sim.observations.multilevel_stream as ms
-
     big_doc = {
         "cases": [_raw_case(f"tr_{i}", "train", f"{i:x}"[-1] or "1", pad_bytes=9000) for i in range(10)]
         + [_raw_case("ho_leak", "heldout", "f")],
@@ -432,7 +438,6 @@ def test_two_pass_streaming_past_64k_header_and_provenance(tmp_path: Path, monke
     assert m_streamed.lineage_edges == (("acq-1", "acq-f"),)
     with pytest.raises(ModelingError, match="lineage_split_leakage"):
         validate_lineage(m_streamed, FrozenFitManifest("f", "1", ()))
-
     jsonl_path = tmp_path / "manifest.jsonl"
     jsonl_path.write_text(
         json.dumps({"record_type": "manifest_header", "manifest_id": "stream_m", "source_uri": "capture://campaign/m"}) + "\n"
@@ -445,7 +450,6 @@ def test_two_pass_streaming_past_64k_header_and_provenance(tmp_path: Path, monke
     assert m_jsonl.cases[0].measured_ns == 12_500 and m_jsonl.lineage_edges == (("p_root", "acq-c"),)
     ev_rows = list(evaluate(jsonl_path, FrozenFitManifest("f", "1", ()), _LiveEngineRunner(scale=1.02)))
     assert len(ev_rows) == 1 and ev_rows[0].status == "ok"
-
     base_case = _raw_case("bad", "heldout", "c")
     with pytest.raises(ModelingError, match="raw_sha256_invalid"):
         parse_gate_case({**base_case, "boundary": {**base_case["boundary"], "raw_sha256": "not_a_sha"}})
@@ -463,7 +467,6 @@ def test_two_pass_streaming_past_64k_header_and_provenance(tmp_path: Path, monke
     with pytest.raises(ModelingError, match="source_ref_relative_path_unsafe"):
         sanitize_source_ref({"repository": "r", "revision": "1", "relative_path": "../secret.py", "source_sha256": _sha("e")})
     assert ms.normalize_lineage_token("SHA256:" + _sha("a").upper()) == _sha("a")
-
 
 def test_tail_diagnoser_moved_tail_unassessed_stages_and_conflicts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     diag = _load_script("diagnose_tail_cluster", DIAG_SCRIPT)
@@ -487,7 +490,6 @@ def test_tail_diagnoser_moved_tail_unassessed_stages_and_conflicts(tmp_path: Pat
     assert stages_missing[1] == "issue_found"
     assert stages_missing[2] == "unassessed" and stages_missing[3] == "unassessed" and stages_missing[4] == "unassessed"
     assert stages_missing[5] == "action_required"
-
     ref_wrong_bnd = [{"case_id": "op_b", "acquisition_root": "acq-rep-2", "boundary_kind": "model_step", "absolute_percentage_error": 0.15}]
     assert "persistent_tail_across_independent_repeat" not in diag.diagnose_tail_clusters([row_a, row_b], reference_run=ref_wrong_bnd, threshold_pct=10.0)["clusters"][0]["escalation_reasons"]
     same_acq_rep = diag.diagnose_tail_clusters([row_a, row_b], reference_run=[row_a, row_b], threshold_pct=10.0)
@@ -531,14 +533,12 @@ def test_tail_diagnoser_moved_tail_unassessed_stages_and_conflicts(tmp_path: Pat
     ]}
     assert diag.detect_parameter_conflicts([bound], sens_ok, threshold_pct=10.0) == []
 
-
 def test_producer_end_to_end_report_assembly_boundary_and_precision(tmp_path: Path) -> None:
     prod = _load_script("ver_producer_mod", PRODUCER_SCRIPT)
     assert prod._stats([])["status"] == "insufficient_evidence"
     assert prod._stats([0.09996])["status"] == "pass"
     assert prod._stats([0.0999999])["status"] == "pass"
     assert prod._stats([0.10])["status"] == "fail"
-
     sku = "Ascend950DT_9582"
     (tmp_path / "acquisition_split_manifest.json").write_text(json.dumps({
         "acquisitions": [{"acquisition_uid": uid, "split": split} for split, uids in (

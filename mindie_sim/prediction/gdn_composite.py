@@ -16,7 +16,7 @@ from mindie_sim.schema.common import dtype_bytes
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.schema.tensors import TensorLayout, TensorValue
 from .mechanism import PlannedRecipe
-from . import gdn_chunk32, gdn_recurrent
+from . import gdn_chunk32
 from .gdn_domain import (
     GDN_CHUNK32_HEAD_DIM_V,
     GDN_CHUNK32_TOKENS,
@@ -24,6 +24,7 @@ from .gdn_domain import (
     GDN_HEAD_DIM_K,
 )
 from .operators import gdn_output, gdn_prepare, gdn_state
+from .operators.linear_attention import gdn_recurrent
 
 
 def recipes():

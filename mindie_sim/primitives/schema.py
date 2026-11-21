@@ -413,7 +413,16 @@ class PrimitiveTable:
         }
 
     def canonical_envelope_sha256(self) -> str:
-        return compute_envelope_sha256(self.to_envelope_dict())
+        base = _json_value(self._envelope) if self._envelope is not None else {}
+        base.update({
+            "schema_version": self.schema_version,
+            "arch_preset": self.arch_preset,
+            "sku": self.sku,
+            "cann_version": self.cann_version,
+            "provenance": self.provenance.to_dict(),
+            "primitives": {key: cell.to_dict() for key, cell in self.primitives.items()},
+        })
+        return compute_envelope_sha256(base)
 
 
 def parse_primitive_table(raw: Mapping[str, Any], *, verify_envelope: bool = True) -> PrimitiveTable:

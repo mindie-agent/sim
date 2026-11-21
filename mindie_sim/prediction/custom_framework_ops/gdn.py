@@ -150,7 +150,7 @@ def _build_mega_gdn_decode(op: OpSpec, geometry):
         "hbm": gate_read, "mte2": gate_read,
         "vector": float(batch * (2 * k_heads + v_heads) * dim * _QKV_NORM_OPS_PER_ELEMENT
                         + batch * (v_heads + v_heads) * 2)})
-    from ..gdn_recurrent import build as build_recurrent
+    from ..operators.linear_attention.gdn_recurrent import build as build_recurrent
     recurrent_op = OpSpec(
         op_id=op.op_id + ".recurrent",
         family="recurrent_vector", phase="decode", stage=op.stage,

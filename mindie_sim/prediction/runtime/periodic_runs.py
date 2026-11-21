@@ -9,13 +9,16 @@
 """
 from __future__ import annotations
 
-from collections import Counter
+from bisect import bisect_left, bisect_right
+from collections import Counter, defaultdict
 from dataclasses import replace
 from heapq import merge
 from itertools import groupby
 import math
 from math import gcd, lcm
 from typing import Any
+
+from ._periodic_stream import _stream_intersect_bytes, _stream_union_bytes
 
 from .memory_physics import (
     AddressRun,
@@ -225,16 +228,88 @@ def _periodic_subrun(sub, sup) -> bool:
 
 
 def _prune_periodic_subruns(runs: tuple) -> tuple:
-    """Drop periodic descriptors completely covered by another run in ``runs``."""
+    """Drop periodic descriptors completely covered by another run in O(N log N)."""
     unique = tuple(dict.fromkeys(runs))
     if len(unique) <= 1:
         return unique
-    kept = []
-    for idx, run in enumerate(unique):
-        if any(j != idx and _periodic_subrun(run, other) for j, other in enumerate(unique)):
+    groups: dict[tuple[int, int, int, int], list] = defaultdict(list)
+    kept: set = set()
+    for run in unique:
+        if run.stride_bytes <= 0:
+            kept.add(run)
+        else:
+            key = (run.stride_bytes, run.row_bytes, run.sector_bytes, run.base_byte % run.stride_bytes)
+            groups[key].append(run)
+    for grp in groups.values():
+        if len(grp) == 1:
+            kept.add(grp[0])
             continue
-        kept.append(run)
-    return tuple(kept)
+        grp.sort(key=lambda r: (r.base_byte, -r.rows))
+        max_end = -1
+        for run in grp:
+            end = run.base_byte + run.rows * run.stride_bytes
+            if end > max_end:
+                kept.add(run)
+                max_end = end
+    return tuple(run for run in unique if run in kept)
+
+
+def _all_covered_by(subs: tuple, sups: tuple) -> bool:
+    """True when every run in ``subs`` is a subrun of some run in ``sups`` in O(N log M)."""
+    sup_set = set(sups)
+    groups: dict[tuple[int, int, int, int], list] = defaultdict(list)
+    for sup in sups:
+        if sup.stride_bytes > 0:
+            key = (sup.stride_bytes, sup.row_bytes, sup.sector_bytes, sup.base_byte % sup.stride_bytes)
+            groups[key].append(sup)
+    indexed: dict[tuple[int, int, int, int], tuple[list[int], list[int]]] = {}
+    for key, grp in groups.items():
+        grp.sort(key=lambda r: (r.base_byte, -r.rows))
+        bases: list[int] = []
+        prefix_ends: list[int] = []
+        best = -1
+        for r in grp:
+            bases.append(r.base_byte)
+            end = r.base_byte + r.rows * r.stride_bytes
+            if end > best:
+                best = end
+            prefix_ends.append(best)
+        indexed[key] = (bases, prefix_ends)
+    for sub in subs:
+        if sub in sup_set:
+            continue
+        if sub.stride_bytes <= 0:
+            return False
+        key = (sub.stride_bytes, sub.row_bytes, sub.sector_bytes, sub.base_byte % sub.stride_bytes)
+        table = indexed.get(key)
+        if table is None:
+            return False
+        bases, prefix_ends = table
+        pos = bisect_right(bases, sub.base_byte) - 1
+        if pos < 0 or prefix_ends[pos] < sub.base_byte + sub.rows * sub.stride_bytes:
+            return False
+    return True
+
+
+def _intersecting_bounds(a_runs: tuple, b_runs: tuple) -> tuple:
+    """Return runs in ``a_runs`` whose bounding box overlaps any run in ``b_runs`` in O(N log M)."""
+    if not a_runs or not b_runs:
+        return ()
+    b_bounds = sorted((r._bounds() for r in b_runs), key=lambda pair: pair[0])
+    b_los = [pair[0] for pair in b_bounds]
+    prefix_his: list[int] = []
+    max_hi = -1
+    for _, hi in b_bounds:
+        if hi > max_hi:
+            max_hi = hi
+        prefix_his.append(max_hi)
+    out = []
+    for run in a_runs:
+        a_lo, a_hi = run._bounds()
+        pos = bisect_left(b_los, a_hi) - 1
+        if pos >= 0 and prefix_his[pos] > a_lo:
+            out.append(run)
+    return tuple(out)
 
 
 def _coverage_overlap(left: SectorCoverage, right: SectorCoverage) -> int:
@@ -242,21 +317,15 @@ def _coverage_overlap(left: SectorCoverage, right: SectorCoverage) -> int:
         return 0
     left_c = _prune_periodic_subruns(_coalesce_periodic_runs(left.periodic)) if left.periodic else ()
     right_c = _prune_periodic_subruns(_coalesce_periodic_runs(right.periodic)) if right.periodic else ()
-    if not left.intervals and left_c and all(any(_periodic_subrun(l, r) for r in right_c) for l in left_c):
+    if not left.intervals and left_c and _all_covered_by(left_c, right_c):
         return _merged_bytes(SectorCoverage((), left_c))
-    if not right.intervals and right_c and all(any(_periodic_subrun(r, l) for l in left_c) for r in right_c):
+    if not right.intervals and right_c and _all_covered_by(right_c, left_c):
         return _merged_bytes(SectorCoverage((), right_c))
     if not left.intervals and not right.intervals and left_c and right_c:
-        left_p = tuple(
-            l for l in left_c
-            if any(l._bounds()[0] < r._bounds()[1] and r._bounds()[0] < l._bounds()[1] for r in right_c)
-        )
+        left_p = _intersecting_bounds(left_c, right_c)
         if not left_p:
             return 0
-        right_p = tuple(
-            r for r in right_c
-            if any(l._bounds()[0] < r._bounds()[1] and r._bounds()[0] < l._bounds()[1] for l in left_p)
-        )
+        right_p = _intersecting_bounds(right_c, left_p)
         if not right_p:
             return 0
         if len(left_p) == 1 and len(right_p) == 1:
@@ -458,18 +527,18 @@ def _measure_periodic_combo(
                 if l_cov or r_cov:
                     total += s_hi - s_lo
                 elif act := tuple(dict.fromkeys((*l_act, *r_act))):
-                    total += _periodic_seg(act, s_lo, s_hi, lambda w0, w1, _a=act: _measure_byte_intervals(
-                        _merge_byte_intervals([iv for r in _a for iv in r._window_intervals(w0, w1)])
-                    ))
+                    total += _periodic_seg(act, s_lo, s_hi, lambda w0, w1, _a=act: _stream_union_bytes(_a, w0, w1))
             elif (l_cov or l_act) and (r_cov or r_act):
                 if l_cov and r_cov:
                     total += s_hi - s_lo
                 else:
                     act = tuple(dict.fromkeys((*l_act, *r_act)))
-                    total += _periodic_seg(act, s_lo, s_hi, lambda w0, w1, _lc=l_cov, _rc=r_cov, _la=l_act, _ra=r_act: _measure_byte_intervals(_intersect_byte_intervals(
-                        ((w0, w1),) if _lc else _merge_byte_intervals([iv for r in _la for iv in r._window_intervals(w0, w1)]),
-                        ((w0, w1),) if _rc else _merge_byte_intervals([iv for r in _ra for iv in r._window_intervals(w0, w1)]),
-                    )))
+                    total += _periodic_seg(
+                        act, s_lo, s_hi,
+                        lambda w0, w1, _lc=l_cov, _rc=r_cov, _la=l_act, _ra=r_act: _stream_intersect_bytes(
+                            _lc, _la, _rc, _ra, w0, w1,
+                        ),
+                    )
         while idx < n_ev and events[idx][0] == cur_x:
             _, delta, kind, obj = events[idx]
             if kind == "li":

@@ -4,8 +4,8 @@
 [Role] Enforce governed ``mindie_sim/prediction/operators/<family>/`` package
   boundaries, forbid flat ISA/CANN filename sprawl under ``mindie_sim/**/*.py``,
   block direct leaf imports, block ``service_modes`` / ``compute_peaks``
-  capability sniffing, verify ISA provenance, and enforce recipe ownership and
-  physical discrimination.
+  capability sniffing, verify ISA provenance, and check dispatched recipe
+  ownership and physical work conservation.
 [Invariants] ``AG001`` scans strictly ``mindie_sim/**/*.py`` so model catalog
   JSON files (e.g. ``qwen3.5-35b-a3b.json``) are never flagged. Governed
   ``operators/<family>/**`` modules allow zero violations in every mode.

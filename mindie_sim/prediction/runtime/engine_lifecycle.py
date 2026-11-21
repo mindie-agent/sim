@@ -279,6 +279,12 @@ class _EngineLifecycleMixin:
                         acc[ctr_id] = total_amt
             if self._delivery_live > 0:
                 self._delivery_live -= 1
+        if task.hbm_accounting:
+            acct_serviced = self._hbm_accounting_serviced
+            for base, amt, _ in task.hbm_accounting:
+                task.service[base] = task.service.get(base, 0.0) + amt
+                self.serviced[base] = self.serviced.get(base, 0.0) + amt
+                acct_serviced[base] = acct_serviced.get(base, 0.0) + amt
         if not task.is_split_child and task.metadata:
             occurrence = task.metadata.get("occurrence")
             if isinstance(occurrence, OccurrenceKey):

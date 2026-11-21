@@ -462,6 +462,11 @@ class _Demands:
         self.devices = {device.rank: device for device in getattr(machine, "dies", ())}
         self.paths = {die: datapath_for_die(device) for die, device in self.devices.items()}
         self.links = {link.name: link for link in getattr(machine, "links", ())}
+        if self.certified and self.table is not None:
+            from mindie_sim.primitives.loader import validate_table_sku_compatibility
+            for device in self.devices.values():
+                if getattr(device, "sku", ""):
+                    validate_table_sku_compatibility(self.table, device.sku)
         self.fixed = defaultdict(Fraction)
         self.sites = []
 
@@ -471,8 +476,11 @@ class _Demands:
         if not self.certified or engine <= 0:
             return engine
         device = self.devices.get(scope[-1])
-        if self.table is None or (device and self.table.sku and device.sku and self.table.sku != device.sku):
+        if self.table is None:
             return 0
+        if device and getattr(device, "sku", ""):
+            from mindie_sim.primitives.loader import validate_table_sku_compatibility
+            validate_table_sku_compatibility(self.table, device.sku)
         capacity = certified_capacity_per_second(self.table, pipe, dtype, self.paths.get(scope[-1]))
         return max(capacity, engine) if capacity is not None else 0
 
@@ -481,9 +489,23 @@ class _Demands:
             die = scope[-1]
             total = Fraction(0)
             for link in self.links.values():
-                if die in link.members or not link.members:
-                    ep = max((r for rank, r in link.endpoint_rates if rank == die), default=0.0)
-                    total += 1000 * Fraction(max(link.effective_peak_capacity_bytes_per_ms, ep))
+                if die not in link.members and link.members:
+                    continue
+                base_bpms = Fraction(link.effective_peak_capacity_bytes_per_ms)
+                ep_rates = [Fraction(r) for rank, r in link.endpoint_rates if rank == die]
+                if link.semantics == "per_pair":
+                    peers = (
+                        sum(1 for rank in link.members if rank != die)
+                        if link.members else max(1, len(self.devices) - 1)
+                    )
+                    egress_bpms = base_bpms * max(1, peers)
+                    if ep_rates:
+                        egress_bpms = min(egress_bpms, max(ep_rates))
+                else:
+                    egress_bpms = max((base_bpms, *ep_rates))
+                if link.switch_capacity_bytes_per_ms is not None:
+                    egress_bpms = min(egress_bpms, Fraction(link.switch_capacity_bytes_per_ms))
+                total += 1000 * egress_bpms
             return total
         if pipe.startswith("link:"):
             link = self.links.get(pipe.removeprefix("link:"))
@@ -499,21 +521,16 @@ class _Demands:
             except ModelingError:
                 return 0
         if pipe == "vector":
-            return max((
-                rates.get("vector", 0),
-                *(rate for _, (role, rate) in device.service_modes if role == "vector"),
-            ))
+            return rates.get("vector", 0)
         if pipe == "simt":
-            return max((
-                rates.get("simt", rates.get("vector", 0)),
-                *(rate for _, (role, rate) in device.service_modes if role in {"simt", "vector"}),
-            ))
+            return rates.get("simt", rates.get("vector", 0))
         if pipe == "hbm_bus_r":
             return max(Fraction(path.hbm_read_bytes_per_s), Fraction(rates.get("hbm", 0)))
         if pipe == "hbm_bus_w":
             return max(Fraction(path.hbm_write_bytes_per_s), Fraction(rates.get("hbm", 0)))
         if pipe == "mte2_total":
-            return sum(Fraction(rates.get(key, 0)) for key in ("mte2_aic", "mte2_aiv"))
+            split = sum(Fraction(rates.get(key, 0)) for key in ("mte2_aic", "mte2_aiv"))
+            return split if split > 0 else Fraction(rates.get("mte2", 0))
         if pipe == "write_total":
             return sum(Fraction(rates.get(key, 0)) for key in ("fixpipe", "mte3"))
         return rates.get(pipe, rates.get("l2", 0) if pipe == "l2_bw" else 0)

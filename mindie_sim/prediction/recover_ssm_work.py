@@ -152,7 +152,7 @@ def rewrite_gdn_analytical_scan(scan: Any, *, active_views: Sequence[Any], heads
 
 def build_gdn_arch35_recover_ssm(op: Any, geometry: Any, *, compact: bool = True) -> OperatorPlan:
     """GDN arch35_fp32 decode plan writing compact records for speculative q > 1."""
-    from . import gdn_recurrent
+    from .operators.linear_attention import gdn_recurrent
 
     base = gdn_recurrent.build(op, geometry, compact=compact)
     meta = dict(op.metadata)

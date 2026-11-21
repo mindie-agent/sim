@@ -393,9 +393,10 @@ class NativeBackend:
         if self.arena is None:
             return
         busy, serv = self.arena.counters()
+        acct = engine._hbm_accounting_serviced
         for i, name in enumerate(self.res_names):
             engine.busy_ms[name] = busy[i]
-            engine.serviced[name] = serv[i]
+            engine.serviced[name] = serv[i] + acct.get(name, 0.0)
         if engine._delivery_live:
             from .accel_terms import sync_native_deliveries
             sync_native_deliveries(self, engine)
@@ -504,8 +505,9 @@ class NativeBackend:
                 self._handback_mixed(engine)
                 return
             if not self.seeded:
+                acct = engine._hbm_accounting_serviced
                 self.arena.seed([engine.busy_ms[n] for n in self.res_names],
-                                [engine.serviced[n] for n in self.res_names])
+                                [engine.serviced[n] - acct.get(n, 0.0) for n in self.res_names])
                 self.seeded = True
             self.needs_settle = False  # consume the previous round's hold.
             try:
@@ -572,7 +574,9 @@ class NativeBackend:
             self.made_progress = True
             return 0
         if not self.seeded:
-            self.arena.seed([engine.busy_ms[n] for n in self.res_names], [engine.serviced[n] for n in self.res_names])
+            acct = engine._hbm_accounting_serviced
+            self.arena.seed([engine.busy_ms[n] for n in self.res_names],
+                            [engine.serviced[n] - acct.get(n, 0.0) for n in self.res_names])
             self.seeded = True
         stop = _at.stop_slots_for_epoch(engine, until)
         if stop:

@@ -198,6 +198,7 @@ class _EngineSubmitMixin:
             "publish" if pending_one is not None else "",
             None, prepared.latency_from_first_service, None,
             list(pending) if (wave_rec is not None and pending is not None) else None,
+            prepared.hbm_accounting,
         )
         tasks[event.sequence] = task
         if deliv_tuple:
@@ -351,6 +352,7 @@ class _EngineSubmitMixin:
             memory_stage, pools,
             bindings, (), prepared.cohort_size, prepared, obs, False,
             prepared.cohort_widened, prepared.cohort_members,
+            hbm_accounting=prepared.hbm_accounting,
         )
         tasks[seq_launch] = task
         wave_rec = self._wave_recorder

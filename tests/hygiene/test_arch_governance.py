@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from functools import wraps
 from pathlib import Path, PurePosixPath
 
 import pytest
@@ -21,7 +22,7 @@ from _support.linear_cases import gdn_decode_source_case
 from mindie_sim.prediction import implementation_registry
 from mindie_sim.prediction.mechanism import Geometry, PlannedRecipe
 from mindie_sim.prediction.operators import builtin_family_registry
-from mindie_sim.prediction.operators.linear_attention import gdn_decode
+from mindie_sim.prediction.operators.linear_attention import gdn_decode, gdn_recurrent
 from mindie_sim.prediction.operators.sparse_indexer import bf16_lightning
 from mindie_sim.prediction.program import RecipeBook
 from mindie_sim.schema.common import ModelingError
@@ -288,6 +289,68 @@ def test_governance_checks_live_recipe_and_implementation_ownership(monkeypatch)
     }
 
 
+def test_composed_decode_dispatches_recurrence_inside_linear_attention():
+    book, graph, geometry = runtime_checks._gdn_decode_probe()
+    op, = (op for op in graph if op.recipe == gdn_recurrent.IMPLEMENTATION)
+    modules = runtime_checks._dispatched_builder_modules(book, op, geometry, gdn_decode.build)
+    assert len(modules) == 1
+    assert modules[0].startswith("mindie_sim.prediction.operators.linear_attention.")
+
+
+def test_governance_rejects_external_gdn_dispatch_callback(monkeypatch):
+    book, graph, geometry = runtime_checks._gdn_decode_probe()
+    op, = (op for op in graph if op.recipe == gdn_decode.GATING)
+    original = gdn_decode._BUILDERS[op.recipe]
+    calls = []
+
+    @wraps(original)
+    def external_builder(op, geometry):
+        calls.append(op.op_id)
+        return original(op, geometry)
+
+    monkeypatch.setitem(gdn_decode._BUILDERS, op.recipe, external_builder)
+    book.prepare(op, geometry)
+    assert calls == [op.op_id]
+    findings = runtime_checks.verify_ag006_ownership()
+    assert any(
+        item.rule == "AG006" and item.fingerprint == f"AG006:dispatcher:gdn_decode:{op.recipe}"
+        and __name__ in item.message
+        for item in findings
+    )
+
+
+def test_governance_rejects_external_implementation_recipe_builder(monkeypatch):
+    def external_builder(op, geometry):
+        return bf16_lightning._build(op, geometry)
+
+    monkeypatch.setattr(bf16_lightning, "recipes", lambda: {
+        bf16_lightning.RECIPE: PlannedRecipe(external_builder),
+    })
+    findings = runtime_checks.verify_ag006_ownership()
+    assert any(
+        item.rule == "AG006" and item.fingerprint ==
+        f"AG006:implementation:{bf16_lightning.IMPLEMENTATION}:{bf16_lightning.RECIPE}:builder"
+        for item in findings
+    )
+
+
+def test_governance_observes_indexer_builder_used_by_dispatch(monkeypatch):
+    published = bf16_lightning.recipes()
+    original = bf16_lightning._build
+
+    def external_builder(op, geometry):
+        return original(op, geometry)
+
+    monkeypatch.setattr(bf16_lightning, "recipes", lambda: published)
+    monkeypatch.setattr(bf16_lightning, "_build", external_builder)
+    findings = runtime_checks.verify_ag006_ownership()
+    assert any(
+        item.rule == "AG006" and item.fingerprint == f"AG006:dispatch:{bf16_lightning.RECIPE}"
+        and __name__ in item.message
+        for item in findings
+    )
+
+
 def test_strict_gate_checks_runtime_with_and_without_differential_base(monkeypatch):
     monkeypatch.setattr(arch_gov, "scan_repository", lambda *args, **kwargs: ())
     monkeypatch.setattr(arch_gov, "scan_runtime", lambda root: (
@@ -327,6 +390,7 @@ def test_governance_rejects_heuristic_identifiers_in_nested_operator_modules(tmp
 
 def test_discrimination_checks_fixed_context_and_real_cache_byte_ledgers(monkeypatch):
     assert arch_gov.verify_ag007_discrimination() == ()
+    assert arch_gov.verify_ag007_discrimination(context_tokens=1022, multi_query_tokens=3) == ()
 
     cold, warm = runtime_checks._cache_ledgers(None)
     assert cold.logical_tensor_bytes == warm.logical_tensor_bytes < warm.aligned_transfer_bytes
@@ -353,6 +417,23 @@ def test_discrimination_checks_fixed_context_and_real_cache_byte_ledgers(monkeyp
     assert arch_gov.verify_ag007_discrimination() == (
         "cold and warm L2 reads changed logical or aligned bytes",
     )
+
+
+def test_discrimination_rejects_uniform_indexer_qk_flop_discount(monkeypatch):
+    original = bf16_lightning.make_op
+
+    def discounted_op(**kwargs):
+        op = original(**kwargs)
+        flops = 0.5 * op.flops
+        return replace(op, flops=flops, matrix_flops=(("bf16", flops),))
+
+    monkeypatch.setattr(bf16_lightning, "make_op", discounted_op)
+    assert arch_gov.verify_ag007_discrimination() == (
+        "BF16 indexer QK FLOPs for q=1, context=1024 must be 262144, got 131072",
+        "BF16 indexer QK FLOPs for q=2, context=1024 must be 524288, got 262144",
+    )
+    findings = runtime_checks.scan_runtime(REPO_ROOT)
+    assert [item.rule for item in findings] == ["AG007", "AG007"]
 
 
 def test_lightning_defaults_execute_through_the_sparse_indexer_owner():

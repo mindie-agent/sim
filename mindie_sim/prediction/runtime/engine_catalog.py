@@ -62,8 +62,9 @@ class _EngineCatalogMixin:
             return
         replacing = prev is not None
         needs_retrofit = any(
-            task.remaining.get(base, 0.0) > 0.0
-            and (replacing or (bus.row_r not in task.remaining and bus.row_w not in task.remaining))
+            (task.remaining.get(base, 0.0) > 0.0
+             and (replacing or (bus.row_r not in task.remaining and bus.row_w not in task.remaining)))
+            or (replacing and any(item[0] == base for item in task.hbm_accounting))
             for task in self._tasks.values()
         )
         if needs_retrofit and self._accel is not None and self._accel.enabled:

@@ -59,24 +59,32 @@ def _cold_weight_read(op, meta: Mapping[str, object], die: int) -> TensorRangeOb
 
 def _pure_copy_boundary(op, meta: Mapping[str, object], die: int, replica: int, stage: int,
                         consumed: set[tuple[int, str]]):
-    if meta.get("initial_residency") == "l2_warm":
-        return None, None
+    """Return (read_hbm_ob, write_hbm_ob, mte2_copy_bytes, write_copy_bytes) for an unfused copy."""
     hbm = int(getattr(op, "hbm_bytes", 0) or 0)
     mte2 = int(getattr(op, "mte2_bytes", 0) or 0)
     mte3 = int(getattr(op, "mte3_bytes", 0) or 0)
+    warm = meta.get("initial_residency") == "l2_warm"
+    read_ob = write_ob = None
+    mte2_copy = write_copy = 0
     if not getattr(op, "deps", ()):
-        read_sz = min(mte2, hbm) if (mte2 > 0 and hbm > 0) else (mte2 or hbm)
-        if read_sz > 0:
-            return TensorRangeObligation(
-                die, f"boundary_in:r{replica}.p{stage}:{op.op_id}", 0, ((0, read_sz),), "hbm_cold", "owner",
-            ), None
+        if mte2 > 0:
+            mte2_copy = mte2
+        if hbm > 0 and not warm:
+            read_sz = min(mte2, hbm) if mte2 > 0 else hbm
+            if read_sz > 0:
+                read_ob = TensorRangeObligation(
+                    die, f"boundary_in:r{replica}.p{stage}:{op.op_id}", 0, ((0, read_sz),), "hbm_cold", "owner",
+                )
     if (replica, op.op_id) not in consumed:
-        write_sz = min(mte3, hbm) if (mte3 > 0 and hbm > 0) else (mte3 or hbm)
-        if write_sz > 0:
-            return None, TensorRangeObligation(
-                die, f"boundary_out:r{replica}.p{stage}:{op.op_id}", 0, ((0, write_sz),), "onchip_resident", "device",
-            )
-    return None, None
+        if mte3 > 0:
+            write_copy = mte3
+        if hbm > 0 and not warm and read_ob is None:
+            write_sz = min(mte3, hbm) if mte3 > 0 else hbm
+            if write_sz > 0:
+                write_ob = TensorRangeObligation(
+                    die, f"boundary_out:r{replica}.p{stage}:{op.op_id}", 0, ((0, write_sz),), "onchip_resident", "device",
+                )
+    return read_ob, write_ob, mte2_copy, write_copy
 
 
 def derive_default_obligations(scenario, demands, aliases, covered, rank_ops_fn):
@@ -96,6 +104,8 @@ def derive_default_obligations(scenario, demands, aliases, covered, rank_ops_fn)
     matrix_work: dict[tuple[int, int, int, str], int] = defaultdict(int)
     vector_work: dict[tuple[int, int, int], int] = defaultdict(int)
     link_work: dict[tuple[int, int, int], int] = defaultdict(int)
+    mte2_copy_work: dict[tuple[int, int, int], int] = defaultdict(int)
+    write_copy_work: dict[tuple[int, int, int], int] = defaultdict(int)
     read_obs: list[TensorRangeObligation] = []
     write_obs: list[TensorRangeObligation] = []
     placements: dict[int, tuple[int, int]] = {}
@@ -143,14 +153,22 @@ def derive_default_obligations(scenario, demands, aliases, covered, rank_ops_fn)
         write_obs.extend(meta.get("write_obligations", ()))
 
         if not (has_explicit_work or has_explicit_mem or has_matrix or has_vector or has_link) and key not in covered:
-            b_read, b_write = _pure_copy_boundary(op, meta, die, replica, stage, consumed)
+            b_read, b_write, b_mte2, b_mte3 = _pure_copy_boundary(op, meta, die, replica, stage, consumed)
             if b_read is not None:
                 read_obs.append(b_read)
             if b_write is not None:
                 write_obs.append(b_write)
+            if b_mte2 > 0:
+                mte2_copy_work[replica, stage, die] += b_mte2
+            if b_mte3 > 0:
+                write_copy_work[replica, stage, die] += b_mte3
 
     for (replica, stage, die), byte_count in link_work.items():
         demands.charge((replica, stage, die), "link_egress", byte_count)
+    for (replica, stage, die), byte_count in mte2_copy_work.items():
+        demands.charge((replica, stage, die), "mte2_total", byte_count)
+    for (replica, stage, die), byte_count in write_copy_work.items():
+        demands.charge((replica, stage, die), "write_total", byte_count)
 
     work_items: list[SemanticWorkItem] = []
     for (replica, stage, die, dt), flops in matrix_work.items():

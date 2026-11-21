@@ -465,7 +465,7 @@ def _gdn_default(case, phase, tokens, kernels):
     if not reason:
         # arch35's resident-state kernel has a stricter UB/query domain than
         # the shared caller. Keep the caller useful outside that kernel domain.
-        from .gdn_recurrent import UB_BYTES
+        from .operators.linear_attention.gdn_recurrent import UB_BYTES
         native = (case.machine.arch_family == "A5" and tokens <= _GDN_RESIDENT_MAX_TOKENS
                   and all(dict(d.buffers).get("ub", 0) >= UB_BYTES for d in case.machine.dies)
                   and all(1 <= (p.linear_key_head_dim or p.linear_head_dim) <= _GDN_RESIDENT_MAX_HEAD_DIM

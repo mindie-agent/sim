@@ -48,7 +48,7 @@ _JSON_SUFFIXES = frozenset({".json", ".jsonl", ".ndjson"})
 _JSONL_SUFFIXES = frozenset({".jsonl", ".ndjson"})
 _CAPTURE_META_KEYS = frozenset({
     "device_ranks", "ranks", "profiled_ranks", "device_rank", "rank",
-    "clock_domain", "start_event", "end_event", "event_ids", "events",
+    "clock_domain", "clock_operator", "start_event", "end_event", "event_ids", "events",
     "boundary", "metadata",
 })
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -491,12 +491,14 @@ def verify_capture_file_consistency(case_id: str, boundary: Any, path: Path, *, 
     cap_ranks = _capture_ranks(meta)
     if cap_ranks is not None and cap_ranks != set(boundary.device_ranks):
         raise ModelingError(f"capture_rank_mismatch:{case_id}:expected={sorted(boundary.device_ranks)}:actual={sorted(cap_ranks)}")
-    cap_events, has_events = set(), False
+    cap_events: set[str] = set()
     matched_start = False
     matched_end = False
     for container in (meta, meta.get("boundary"), meta.get("metadata")):
         if not isinstance(container, Mapping):
             continue
+        if "clock_operator" in container and container["clock_operator"] != boundary.clock_operator:
+            raise ModelingError(f"capture_clock_operator_mismatch:{case_id}:expected={boundary.clock_operator}")
         if (cap_clock := container.get("clock_domain")) is not None and str(cap_clock).strip() != str(boundary.clock_domain).strip():
             raise ModelingError(f"capture_clock_domain_mismatch:{case_id}:expected={boundary.clock_domain}:actual={cap_clock}")
         if (cap_start := container.get("start_event")) is not None:
@@ -508,9 +510,7 @@ def verify_capture_file_consistency(case_id: str, boundary: Any, path: Path, *, 
                 raise ModelingError(f"capture_event_mismatch:{case_id}:end_event")
             matched_end = True
         for key in ("event_ids", "events"):
-            if key in container and container[key] is not None:
-                has_events = True
-                cap_events |= _collect_event_names(container[key])
+            cap_events |= _collect_event_names(container.get(key))
     start_name = str(boundary.start_event).strip()
     end_name = str(boundary.end_event).strip()
     if not matched_start and start_name not in cap_events:
@@ -598,9 +598,6 @@ _EVENT_OWNER_REGISTRY: OrderedDict[int, tuple[Any, str]] = OrderedDict()
 
 def _trace_owns_event(engine: Any, event: Any) -> bool:
     """Verify ``engine`` actually recorded a settled task/boundary matching ``event``."""
-    trace_maxlen = int(getattr(engine, "_trace_maxlen", 0) or 0)
-    if trace_maxlen <= 0:
-        return False
     ev_name = str(event.name)
     ev_time = float(event.time)
     ev_started = getattr(event, "started", None)
@@ -618,7 +615,9 @@ def _trace_owns_event(engine: Any, event: Any) -> bool:
     return False
 
 
-def _validate_live_engine_events(case: Any, engine: Any, start_event: Any, end_event: Any) -> tuple[str, int, int, int]:
+def _validate_live_engine_events(
+    case: Any, engine: Any, start_event: Any, end_event: Any, clock_op: str,
+) -> tuple[str, int, int, int, int | None]:
     from mindie_sim.prediction.runtime.engine import Engine, Event
 
     if not isinstance(engine, Engine):
@@ -635,8 +634,11 @@ def _validate_live_engine_events(case: Any, engine: Any, start_event: Any, end_e
     if start_event.time < -_CLOCK_EPS_MS or end_event.time > engine.now + _CLOCK_EPS_MS or end_event.time < start_event.time:
         raise ModelingError(f"engine_event_clock_bounds_invalid:{case.case_id}")
     uid = _req_str(getattr(engine, "uid", ""), f"engine_uid_missing:{case.case_id}")
-    if int(getattr(engine, "_trace_maxlen", 0) or 0) <= 0:
+    if engine._trace_maxlen <= 0 and clock_op == "elapsed_span":
         raise ModelingError(f"engine_event_not_owned_by_engine:{case.case_id}:trace_required")
+    busy_ns = _busy_union_ns(engine, start_event.time, end_event.time)
+    if clock_op == "busy_union" and busy_ns is None:
+        raise ModelingError(f"busy_union_trace_incomplete:{case.case_id}")
     if not (_trace_owns_event(engine, start_event) and _trace_owns_event(engine, end_event)):
         raise ModelingError(f"engine_event_not_owned_by_engine:{case.case_id}")
     for ev in (start_event, end_event):
@@ -651,7 +653,7 @@ def _validate_live_engine_events(case: Any, engine: Any, start_event: Any, end_e
     start_ns, end_ns = int(round(start_event.time * MS_TO_NS)), int(round(end_event.time * MS_TO_NS))
     if (elapsed_span_ns := end_ns - start_ns) <= 0:
         raise ModelingError(f"interval_span_or_duration_invalid:{case.case_id}")
-    return uid, start_ns, end_ns, elapsed_span_ns
+    return uid, start_ns, end_ns, elapsed_span_ns, busy_ns
 
 
 def _validate_clock_operator(value: Any, case_id: str) -> Literal["elapsed_span", "busy_union"]:
@@ -660,18 +662,29 @@ def _validate_clock_operator(value: Any, case_id: str) -> Literal["elapsed_span"
     return cast(Literal["elapsed_span", "busy_union"], value)
 
 
-def _busy_union_ns(engine: Any, start_ms: float, end_ms: float, elapsed_span_ns: int) -> int:
-    """Union settled task spans at the same nanosecond resolution as the event bounds."""
+def _busy_union_ns(engine: Any, start_ms: float, end_ms: float) -> int | None:
+    """Union settled device work spans when the trace can account for the interval."""
     from mindie_sim.prediction.execution.submission import interval_union_ns
 
+    if (engine._trace_maxlen <= 0 or engine.trace_dropped or len(engine.trace) != engine.completed_count
+            or any(task.start is not None and task.start < end_ms for task in engine._tasks.values())):
+        return None
+    host_resources = {
+        name for name in engine.resources
+        if any(part == "host" or part.startswith(("host@", "scheduler@")) for part in name.split(":"))
+    }
     spans = []
     for row in engine.trace:
+        if (demand := row.get("demand")) is None:
+            return None
+        if not any(amount > 0 and resource not in host_resources for resource, amount in demand.items()):
+            continue
         start, end = row.get("start_ms"), row.get("end_ms")
-        if start is not None and end is not None:
-            start, end = max(start_ms, start), min(end_ms, end)
-            if start < end:
-                spans.append((start, end))
-    return interval_union_ns(spans) if spans else elapsed_span_ns
+        if start is None or end is None:
+            return None
+        if (start := max(start_ms, start)) < (end := min(end_ms, end)):
+            spans.append((start, end))
+    return interval_union_ns(spans)
 
 
 def bind_engine_interval(
@@ -683,9 +696,9 @@ def bind_engine_interval(
 ) -> EngineInterval:
     """Bind one ``EngineInterval`` strictly to a live ``Engine`` run and named ``Event`` handles."""
     clock_op = _validate_clock_operator(case.boundary.clock_operator if clock_operator is None else clock_operator, case.case_id)
-    uid, s_ns, e_ns, elapsed_span_ns = _validate_live_engine_events(case, engine, start_event, end_event)
-    busy_union_ns = _busy_union_ns(engine, start_event.time, end_event.time, elapsed_span_ns)
+    uid, s_ns, e_ns, elapsed_span_ns, busy_union_ns = _validate_live_engine_events(case, engine, start_event, end_event, clock_op)
     pred_ns = busy_union_ns if clock_op == "busy_union" else elapsed_span_ns
+    assert pred_ns is not None
     rid = validate_provenance_text(
         f"{CAPTURE_URI_SCHEME}engine-receipt/{uid}/{case.level}/{case.case_id}/{start_event.sequence}-{end_event.sequence}",
         field_name="engine_receipt",
@@ -712,14 +725,14 @@ def bind_engine_rung_interval(
         raise ModelingError(f"rung_binding_requires_l2_paired_rung_delta:{case.case_id}")
     (eng_a, s_a, e_a), (eng_b, s_b, e_b) = arm_a, arm_b
     clock_op = _validate_clock_operator(case.boundary.clock_operator, case.case_id)
-    uid_a, _, _, elapsed_a = _validate_live_engine_events(case, eng_a, s_a, e_a)
-    uid_b, _, _, elapsed_b = _validate_live_engine_events(case, eng_b, s_b, e_b)
+    uid_a, _, _, elapsed_a, busy_a = _validate_live_engine_events(case, eng_a, s_a, e_a, clock_op)
+    uid_b, _, _, elapsed_b, busy_b = _validate_live_engine_events(case, eng_b, s_b, e_b, clock_op)
     if (uid_a, s_a.sequence, e_a.sequence) == (uid_b, s_b.sequence, e_b.sequence):
         raise ModelingError(f"rung_arms_must_be_distinct_runs:{case.case_id}")
-    busy_a = _busy_union_ns(eng_a, s_a.time, e_a.time, elapsed_a)
-    busy_b = _busy_union_ns(eng_b, s_b.time, e_b.time, elapsed_b)
     pred_a, pred_b = (busy_a, busy_b) if clock_op == "busy_union" else (elapsed_a, elapsed_b)
-    elapsed_delta, busy_delta = elapsed_b - elapsed_a, busy_b - busy_a
+    assert pred_a is not None and pred_b is not None
+    elapsed_delta = elapsed_b - elapsed_a
+    busy_delta = busy_b - busy_a if busy_a is not None and busy_b is not None else None
     a_id = f"{CAPTURE_URI_SCHEME}engine-receipt/{uid_a}/L2/{case.case_id}/arm_a/{s_a.sequence}-{e_a.sequence}"
     b_id = f"{CAPTURE_URI_SCHEME}engine-receipt/{uid_b}/L2/{case.case_id}/arm_b/{s_b.sequence}-{e_b.sequence}"
     delta_ns, uid = pred_b - pred_a, f"{uid_a}+{uid_b}"

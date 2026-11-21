@@ -19,7 +19,7 @@ import math
 from mindie_sim.catalog.attention_common import AttentionResult
 from mindie_sim.schema.common import dtype_bytes
 from mindie_sim.schema.tensors import TensorLayout, TensorValue
-from . import gdn_composite, gdn_recurrent
+from . import gdn_composite
 from .gdn_prefill_phases import (
     lower_conv_stage,
     state_slot_inputs as _state_slot_inputs,
@@ -28,6 +28,7 @@ from .lowering import Builder
 from .mechanism import PlannedRecipe
 from .operators import native_causal_conv_prefill
 from .operators import kda_state_selection as pcp_state_selection
+from .operators.linear_attention import gdn_recurrent
 from .tensors import TensorLowering
 
 

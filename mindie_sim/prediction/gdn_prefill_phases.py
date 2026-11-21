@@ -23,8 +23,8 @@ from types import SimpleNamespace
 from typing import Any
 
 from mindie_sim.schema.tensors import TensorLayout, TensorValue
-from . import gdn_recurrent
 from .operators import native_causal_conv_prefill
+from .operators.linear_attention import gdn_recurrent
 
 
 def state_slot_inputs(runtime: Any, ordered: tuple[Any, ...]):

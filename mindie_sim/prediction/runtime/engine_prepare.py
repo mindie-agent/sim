@@ -11,204 +11,21 @@
 from __future__ import annotations
 
 import math
-import re
 from typing import Callable, Mapping, Sequence
 import weakref
 
+from ._engine_hbm_bus import (
+    _discover_hbm_bus_aliases,
+    _expand_hbm_bus_work,
+    _hbm_bus_alias_terms,
+    _refresh_prepared_for_hbm_bus,
+    _retrofit_hbm_bus_tasks,
+)
 from .engine_types import (
     Allocation, Event, ExecutionError, _EMPTY_CAPS, _EMPTY_FROZENSET,
     _EMPTY_PLACEMENT, _EMPTY_TASK, _PreparedTask, _compute_pool_unit_masks,
     _units_to_mask,
 )
-from .memory_physics import HbmBusSpec
-
-_READ_PIPE_PREFIXES = frozenset({"mte2", "mte2_aic", "mte2_aiv"})
-_WRITE_PIPE_PREFIXES = frozenset({"mte3", "fixpipe"})
-_READ_NAME_TOKENS = frozenset({
-    "read", "load", "fetch", "prefetch", "gather", "reload", "in", "input", "counts",
-})
-_WRITE_NAME_TOKENS = frozenset({
-    "write", "store", "spill", "writeback", "evict", "scatter", "out", "output",
-})
-_NAME_SPLIT_RE = re.compile(r"[^a-z0-9]+")
-
-
-def _hbm_bus_alias_terms(
-    bus, base: str, name: str, work: Mapping[str, float], amount: float,
-) -> tuple[float, float]:
-    """Resolve directional ``(row_r, row_w)`` work via ``bus.terms_for``."""
-    suffix = "@" + base.split("@", 1)[1] if "@" in base else ""
-    read_pipe = 0.0
-    write_pipe = 0.0
-    for key, value in work.items():
-        if not value or key == base:
-            continue
-        if suffix and "@" in key and not key.endswith(suffix):
-            continue
-        prefix = key.split("@", 1)[0]
-        if prefix in _READ_PIPE_PREFIXES:
-            read_pipe += float(value)
-        elif prefix in _WRITE_PIPE_PREFIXES:
-            write_pipe += float(value)
-    if read_pipe > 0.0 and write_pipe > 0.0:
-        share = read_pipe / (read_pipe + write_pipe)
-        tr_r, tr_w = bus.terms_for("read", amount * share)
-        tw_r, tw_w = bus.terms_for("write", amount * (1.0 - share))
-        return (
-            tr_r.ms_per_progress + tw_r.ms_per_progress,
-            tr_w.ms_per_progress + tw_w.ms_per_progress,
-        )
-    if read_pipe > 0.0:
-        tr_r, tr_w = bus.terms_for("read", amount)
-        return tr_r.ms_per_progress, tr_w.ms_per_progress
-    if write_pipe > 0.0:
-        tw_r, tw_w = bus.terms_for("write", amount)
-        return tw_r.ms_per_progress, tw_w.ms_per_progress
-    tokens = {tok for tok in _NAME_SPLIT_RE.split(name.lower()) if tok}
-    has_r = bool(tokens & _READ_NAME_TOKENS)
-    has_w = bool(tokens & _WRITE_NAME_TOKENS)
-    if has_r and not has_w:
-        tr_r, tr_w = bus.terms_for("read", amount)
-        return tr_r.ms_per_progress, tr_w.ms_per_progress
-    if has_w and not has_r:
-        tw_r, tw_w = bus.terms_for("write", amount)
-        return tw_r.ms_per_progress, tw_w.ms_per_progress
-    tr_r, tr_w = bus.terms_for("read", amount)
-    tw_r, tw_w = bus.terms_for("write", amount)
-    return (
-        max(tr_r.ms_per_progress, tw_r.ms_per_progress),
-        max(tr_w.ms_per_progress, tw_w.ms_per_progress),
-    )
-
-
-def _expand_hbm_bus_work(
-    aliases: Mapping[str, object], name: str,
-    work: Mapping[str, float], caps: Mapping[str, float] | None,
-) -> tuple[Mapping[str, float], Mapping[str, float] | None]:
-    """Mirror shipping scalar HBM demands onto bound directional bus rows."""
-    if not any(base in work and work[base] for base in aliases):
-        return work, caps
-    expanded = dict(work)
-    expanded_caps = dict(caps) if caps else None
-    for base, bus in aliases.items():
-        amount = expanded.get(base)
-        if not amount or bus.row_r in expanded or bus.row_w in expanded:
-            continue
-        amt = float(amount)
-        if amt <= 0.0 or not math.isfinite(amt):
-            continue
-        t_r, t_w = _hbm_bus_alias_terms(bus, base, name, expanded, amt)
-        if t_r > 0.0:
-            expanded[bus.row_r] = t_r
-        if t_w > 0.0:
-            expanded[bus.row_w] = t_w
-        if expanded_caps is not None and base in expanded_caps:
-            cap_val = float(expanded_caps[base])
-            if cap_val > 0.0 and math.isfinite(cap_val):
-                if t_r > 0.0:
-                    expanded_caps.setdefault(bus.row_r, t_r * cap_val / amt)
-                if t_w > 0.0:
-                    expanded_caps.setdefault(bus.row_w, t_w * cap_val / amt)
-    return expanded, expanded_caps
-
-
-def _discover_hbm_bus_aliases(resources: Mapping, aliases: dict) -> bool:
-    """Register default symmetric bus aliases for pre-existing ``:r``/``:w`` rows."""
-    discovered = False
-    for name, res_r in resources.items():
-        if not name.endswith(":r") or res_r.rate != 1.0:
-            continue
-        base = name[:-2]
-        row_w = base + ":w"
-        if base in aliases or base not in resources or row_w not in resources:
-            continue
-        base_res = resources[base]
-        res_w = resources[row_w]
-        if base_res.rate <= 0.0 or res_w.rate != 1.0:
-            continue
-        aliases[base] = HbmBusSpec(
-            0, float(base_res.rate), float(base_res.rate), 0.0,
-            row_r=name, row_w=row_w,
-        )
-        discovered = True
-    return discovered
-
-
-def _retrofit_hbm_bus_tasks(
-    tasks: Mapping, native_slots: Mapping, base: str, bus, *,
-    replacing: bool = False, include_native: bool = False,
-) -> bool:
-    """Bind already-submitted shipping HBM tasks onto ``bus`` directional rows."""
-    deferred = False
-    for seq, task in tasks.items():
-        rem = task.remaining.get(base, 0.0)
-        if rem <= 0.0:
-            continue
-        if not replacing and (bus.row_r in task.remaining or bus.row_w in task.remaining):
-            continue
-        if not include_native and seq in native_slots:
-            deferred = True
-            continue
-        dem = task.demand.get(base, rem)
-        t_r, t_w = _hbm_bus_alias_terms(bus, base, task.event.name, task.demand, rem)
-        d_r, d_w = _hbm_bus_alias_terms(bus, base, task.event.name, task.demand, dem)
-        new_demand = {k: v for k, v in task.demand.items() if k not in (bus.row_r, bus.row_w)}
-        if d_r > 0.0:
-            new_demand[bus.row_r] = d_r
-        if d_w > 0.0:
-            new_demand[bus.row_w] = d_w
-        task.demand = new_demand
-        if t_r > 0.0:
-            task.remaining[bus.row_r] = t_r
-        else:
-            task.remaining.pop(bus.row_r, None)
-        if t_w > 0.0:
-            task.remaining[bus.row_w] = t_w
-        else:
-            task.remaining.pop(bus.row_w, None)
-        if base in task.caps:
-            cap_val = float(task.caps[base])
-            new_caps = {k: v for k, v in task.caps.items() if k not in (bus.row_r, bus.row_w)}
-            if cap_val > 0.0 and math.isfinite(cap_val):
-                if t_r > 0.0:
-                    new_caps[bus.row_r] = t_r * cap_val / rem
-                if t_w > 0.0:
-                    new_caps[bus.row_w] = t_w * cap_val / rem
-            task.caps = new_caps
-        task.prepared = None
-    return deferred
-
-
-def _refresh_prepared_for_hbm_bus(engine, prepared: _PreparedTask, name: str) -> _PreparedTask:
-    """Re-prepare cached shipping tasks whenever HBM directional bindings changed."""
-    aliases = engine._hbm_bus_aliases
-    if not aliases or prepared.hbm_bus_epoch == engine._hbm_bus_epoch or not prepared.demand:
-        return prepared
-    if not any(base in prepared.demand for base in aliases):
-        return prepared
-    drop = {
-        row for base, bus in aliases.items()
-        if base in prepared.demand for row in (bus.row_r, bus.row_w)
-    }
-    raw_demand = {k: v for k, v in prepared.demand.items() if k not in drop}
-    raw_caps = (
-        {k: v for k, v in prepared.caps.items() if k not in drop}
-        if prepared.caps else None
-    )
-    return engine._prepare(
-        name, raw_demand,
-        latency=prepared.latency,
-        caps=raw_caps,
-        acquire=prepared.acquire,
-        free=prepared.free,
-        placement=prepared.placement or None,
-        coupled=prepared.coupled,
-        priority=prepared.priority,
-        cohort_size=prepared.cohort_size,
-        cohort_widened=prepared.cohort_widened or None,
-        cohort_members=dict(prepared.cohort_members) if prepared.cohort_members else None,
-        latency_from_first_service=prepared.latency_from_first_service,
-    )
 
 
 def _normalize_cohort_symmetry(
@@ -317,8 +134,9 @@ class _EnginePrepareMixin:
                 and cohort_size == 1 and not cohort_widened and not cohort_members
                 and not latency_from_first_service):
             return _EMPTY_TASK
+        hbm_accounting: tuple[tuple[str, float, float | None], ...] = ()
         if work and self._hbm_bus_aliases:
-            work, caps = _expand_hbm_bus_work(self._hbm_bus_aliases, name, work, caps)
+            work, caps, hbm_accounting = _expand_hbm_bus_work(self._hbm_bus_aliases, name, work, caps)
         if (work is not None and work.__class__ is dict and not caps
                 and not acquire and not free and placement is None
                 and not coupled and latency == 0.0 and not priority
@@ -360,7 +178,8 @@ class _EnginePrepareMixin:
                 _EMPTY_PLACEMENT, False, (), 0, 1,
                 solo_rates=s_rates or None,
                 uncoupled_res_info=u_res_info or None,
-                hbm_bus_epoch=self._hbm_bus_epoch)
+                hbm_bus_epoch=self._hbm_bus_epoch,
+                hbm_accounting=hbm_accounting)
         demands = {key: float(value) for key, value in (work or {}).items() if value}
         for key, value in demands.items():
             if key not in self.resources:
@@ -514,7 +333,7 @@ class _EnginePrepareMixin:
             c_demand, c_cap_limit, c_solo_rates, demand_keys,
             s_rates, c_res_info, u_res_info,
             _compute_pool_unit_masks(acq_t), norm_widened, norm_members,
-            bool(latency_from_first_service), self._hbm_bus_epoch)
+            bool(latency_from_first_service), self._hbm_bus_epoch, hbm_accounting)
 
     @staticmethod
     def clone_prepared_scoped(static: _PreparedTask,
@@ -531,7 +350,8 @@ class _EnginePrepareMixin:
             static.demand_keys, static.solo_rates,
             static.coupled_res_info, static.uncoupled_res_info,
             static.pool_unit_masks, static.cohort_widened, static.cohort_members,
-            static.latency_from_first_service, static.hbm_bus_epoch)
+            static.latency_from_first_service, static.hbm_bus_epoch,
+            static.hbm_accounting)
 
     def prepared_stage(self, stage, acquire=(), free=()):
         """Validate one immutable Stage declaration, caching its static part.
@@ -633,7 +453,8 @@ class _EnginePrepareMixin:
                     static_base.uncoupled_res_info,
                     static_base.pool_unit_masks,
                     static_base.cohort_widened, static_base.cohort_members,
-                    static_base.latency_from_first_service)
+                    static_base.latency_from_first_service,
+                    static_base.hbm_bus_epoch, static_base.hbm_accounting)
             if len(id_cache) >= 16384:
                 id_cache.clear()
             id_cache[id(lookup_stage)] = (weakref.ref(lookup_stage), static)
@@ -651,7 +472,8 @@ class _EnginePrepareMixin:
                 _EMPTY_FROZENSET, static.solo_rates,
                 static.coupled_res_info, static.uncoupled_res_info, (),
                 static.cohort_widened, static.cohort_members,
-                static.latency_from_first_service)
+                static.latency_from_first_service,
+                static.hbm_bus_epoch, static.hbm_accounting)
         if acquire.__class__ is not tuple:
             acquire = tuple(acquire)
         if free.__class__ is not tuple:
@@ -666,7 +488,8 @@ class _EnginePrepareMixin:
                 _EMPTY_FROZENSET, static.solo_rates,
                 static.coupled_res_info, static.uncoupled_res_info, (),
                 static.cohort_widened, static.cohort_members,
-                static.latency_from_first_service)
+                static.latency_from_first_service,
+                static.hbm_bus_epoch, static.hbm_accounting)
         static_acq = static.acquire
         n_acq = len(acquire)
         if n_acq == len(static_acq):
@@ -769,7 +592,8 @@ class _EnginePrepareMixin:
             _compute_pool_unit_masks(acquire),
             static.cohort_widened, static.cohort_members,
             static.latency_from_first_service,
-            hbm_bus_epoch=static.hbm_bus_epoch)
+            hbm_bus_epoch=static.hbm_bus_epoch,
+            hbm_accounting=static.hbm_accounting)
 
     def prepare_stage(self, name, work=None, *, latency=0.0, caps=None,
                       acquire=(), free=(), placement=None, coupled=False,

@@ -13,10 +13,11 @@ import math
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.schema.tensors import TensorLayout, TensorValue
-from . import gdn_composite, gdn_recurrent
+from . import gdn_composite
 from .lowering import Builder
 from .mechanism import OperatorPlan, PlannedRecipe, Work
 from .operators import native_causal_conv_prefill
+from .operators.linear_attention import gdn_recurrent
 from .operators.mixed_core import read_role
 from .program import ParallelProgram, PipelineProgram, RecipeBook, Stage
 from .tensors import TensorLowering

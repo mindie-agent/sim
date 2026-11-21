@@ -2,9 +2,10 @@
 
 [Role] Inspect active registry bindings and exercise bounded physical probes.
 [Invariants] Cache comparisons keep the access constant. Query comparisons keep
-  the context and geometry constant and vary only the number of query rows.
+  the context and geometry constant and verify causal QK FLOP conservation.
 [Timeouts & Locks] Finite registry lookups and local planning without locks.
-[Side-Effect Policy] Uses private simulation state and reads no measurements.
+[Side-Effect Policy] Uses private simulation state and restores the thread's
+  profiler after observing dispatch. Reads no measurements.
 """
 from __future__ import annotations
 
@@ -44,32 +45,63 @@ class Violation:
 
 
 def _binding_module(recipe) -> str:
-    builder = unwrap(getattr(recipe, "build", type(recipe)))
+    def module_of(builder):
+        # functools.wraps copies __module__ even when the wrapper runs elsewhere.
+        return getattr(builder, "__globals__", {}).get(
+            "__name__", getattr(builder, "__module__", type(builder).__module__),
+        )
+
+    def outside_owner(builder):
+        return not isinstance(builder, partial) and not module_of(builder).startswith(
+            _OWNER_MODULE_PREFIXES
+        )
+
+    builder = unwrap(getattr(recipe, "build", getattr(recipe, "lower", recipe)), stop=outside_owner)
     while isinstance(builder, partial):
-        builder = unwrap(builder.func)
-    return getattr(builder, "__module__", type(builder).__module__)
+        builder = unwrap(builder.func, stop=outside_owner)
+    return module_of(builder)
 
 
 def verify_ag006_ownership() -> tuple[Violation, ...]:
-    """Check the actual default book and migrated block lowering registry."""
+    """Check active recipe bindings, dispatcher tables and live kernel selection."""
     from mindie_sim.prediction.implementation_registry import IMPLEMENTATIONS
     from mindie_sim.prediction.operators.registry import builtin_family_registry
+    from mindie_sim.prediction.operators.linear_attention import gdn_decode
     from mindie_sim.prediction.program import RecipeBook
 
-    specs = builtin_family_registry().specs()
+    specs = tuple(spec for spec in builtin_family_registry().specs()
+                  if spec.name in _GOVERNED_FAMILIES)
     owned = {recipe_id for spec in specs for recipe_id in spec.owned_recipe_ids}
     book = RecipeBook.from_mapping({})
     violations = []
+
+    def check(binding, path, fingerprint, description):
+        module = _binding_module(binding)
+        if not module.startswith(_OWNER_MODULE_PREFIXES):
+            violations.append(Violation(
+                "AG006", path, 1, f"AG006:{fingerprint}",
+                f"{description} uses builder outside governed packages: {module}",
+            ))
+
     for spec in specs:
-        if spec.name not in _GOVERNED_FAMILIES:
-            continue
+        owner = import_module(_OWNER_MODULE_PREFIXES[0] + spec.name)
+        path = PurePosixPath(*owner.__name__.split("."), "__init__.py")
+        check(spec.resolve, path, f"resolver:{spec.name}", f"{spec.name} resolver")
+        if hasattr(owner, "build"):
+            check(owner.build, path, f"builder:{spec.name}", f"{spec.name} builder")
+        for table_name in ("_STRATEGIES", "STRATEGIES", "_BUILDERS"):
+            for key, binding in sorted(getattr(owner, table_name, {}).items()):
+                check(binding, path, f"dispatcher:{spec.name}:{table_name}:{key}",
+                      f"{spec.name} dispatcher entry {key!r}")
         for recipe_id in sorted(spec.owned_recipe_ids & book.recipes.keys()):
-            module = _binding_module(book.recipes[recipe_id])
-            if not module.startswith(_OWNER_MODULE_PREFIXES):
-                violations.append(Violation(
-                    "AG006", _RECIPE_BOOK_PATH, 1, f"AG006:recipe:{recipe_id}",
-                    f"{spec.name} recipe {recipe_id!r} uses builder outside governed packages: {module}",
-                ))
+            check(book.recipes[recipe_id], _RECIPE_BOOK_PATH, f"recipe:{recipe_id}",
+                  f"{spec.name} recipe {recipe_id!r}")
+
+    path = PurePosixPath(*gdn_decode.__name__.split(".")).with_suffix(".py")
+    for recipe_id, builder in sorted(gdn_decode._BUILDERS.items()):
+        check(builder, path, f"dispatcher:gdn_decode:{recipe_id}",
+              f"GDN decode dispatcher entry {recipe_id!r}")
+
     # Operator replacement selectors can share block names while addressing
     # different contracts, such as an imported xLLM custom operation.
     for name, implementation in sorted(IMPLEMENTATIONS.items()):
@@ -81,18 +113,82 @@ def verify_ag006_ownership() -> tuple[Violation, ...]:
                 "AG006", _IMPLEMENTATION_PATH, 1, f"AG006:implementation:{name}",
                 f"migrated implementation {name!r} points outside governed packages: {module}",
             ))
+            continue
         try:
-            recipe_ids = import_module(module).recipes().keys()
+            recipes = import_module(module).recipes()
         except (ImportError, AttributeError) as exc:
             violations.append(Violation(
                 "AG006", _IMPLEMENTATION_PATH, 1, f"AG006:implementation:{name}:recipes",
                 f"migrated implementation {name!r} cannot expose its recipes: {exc}",
             ))
             continue
-        for recipe_id in sorted(recipe_ids - owned):
+        for recipe_id, recipe in sorted(recipes.items()):
+            fingerprint = f"implementation:{name}:{recipe_id}"
+            description = f"migrated implementation {name!r} recipe {recipe_id!r}"
+            if recipe_id not in owned:
+                violations.append(Violation(
+                    "AG006", _IMPLEMENTATION_PATH, 1, f"AG006:{fingerprint}",
+                    f"migrated implementation {name!r} exposes unowned recipe {recipe_id!r}",
+                ))
+            check(recipe, _IMPLEMENTATION_PATH, f"{fingerprint}:builder", description)
+    return tuple(violations) if violations else _verify_live_dispatch(book)
+
+
+def _dispatched_builder_modules(book, op, geometry, dispatcher) -> tuple[str, ...]:
+    """Observe the callbacks that return the prepared plan to the dispatcher."""
+    previous = sys.getprofile()
+    returns = []
+
+    def observe(frame, event, result):
+        caller = frame.f_back
+        if event == "return" and caller is not None and caller.f_code is dispatcher.__code__:
+            returns.append((result, frame.f_globals["__name__"]))
+
+    try:
+        sys.setprofile(observe)
+        _, plan = book.prepare(op, geometry)
+    finally:
+        if previous is None or callable(previous):
+            sys.setprofile(previous)
+        else:
+            previous.enable()
+    return tuple(module for result, module in returns if result is plan)
+
+
+def _gdn_decode_probe():
+    from mindie_sim import compose_case, target_graphs
+    from mindie_sim.prediction.mechanism import Geometry
+    from mindie_sim.prediction.program import RecipeBook
+    from mindie_sim.prediction.structure import parse_case
+
+    case = compose_case("qwen3.5-35b-a3b", "a5", layers=1, concurrency=1,
+                        prompt_tokens=1, output_tokens=1)
+    graph = target_graphs(case, scope="body", phase="decode", tokens=1, context=1024, sequences=1)[0]
+    geometry = Geometry.from_devices(parse_case(case).machine.dies)
+    return RecipeBook.from_mapping(graph.effective_kernels), graph, geometry
+
+
+def _verify_live_dispatch(default_book) -> tuple[Violation, ...]:
+    from mindie_sim.prediction.mechanism import Geometry
+    from mindie_sim.prediction.operators import sparse_indexer
+    from mindie_sim.prediction.operators.linear_attention import gdn_decode, gdn_recurrent
+
+    gdn_book, graph, gdn_geometry = _gdn_decode_probe()
+    gdn_ops = {op.recipe: op for op in graph}
+    indexer_op = sparse_indexer.bf16_lightning.make_op(query_rows=1, context=1024, phase="decode")
+    probes = [
+        (recipe_id, gdn_book, gdn_ops.get(recipe_id), gdn_geometry, gdn_decode.build)
+        for recipe_id in (gdn_decode.GATING, gdn_decode.CONV, gdn_recurrent.IMPLEMENTATION)
+    ]
+    probes.append((indexer_op.recipe, default_book, indexer_op,
+                   Geometry(1, {"vector": 2}), sparse_indexer.build))
+    violations = []
+    for recipe_id, book, op, geometry, dispatcher in probes:
+        modules = () if op is None else _dispatched_builder_modules(book, op, geometry, dispatcher)
+        if not modules or any(not module.startswith(_OWNER_MODULE_PREFIXES) for module in modules):
             violations.append(Violation(
-                "AG006", _IMPLEMENTATION_PATH, 1, f"AG006:implementation:{name}:{recipe_id}",
-                f"migrated implementation {name!r} exposes unowned recipe {recipe_id!r}",
+                "AG006", _RECIPE_BOOK_PATH, 1, f"AG006:dispatch:{recipe_id}",
+                f"live recipe {recipe_id!r} must dispatch to a governed builder; observed {modules}",
             ))
     return tuple(violations)
 
@@ -141,6 +237,15 @@ def _indexer_query_probe() -> Callable[[int, int], float]:
     return physical_flops
 
 
+def _expected_indexer_qk_flops(query_tokens: int, context_tokens: int) -> int:
+    from mindie_sim.prediction.operators.sparse_indexer import bf16_lightning
+
+    # Each query sees complete compressed key groups through its own token.
+    pairs = sum((context_tokens + row + 1) // bf16_lightning._DEFAULT_COMPRESSION
+                for row in range(query_tokens))
+    return 2 * pairs * bf16_lightning._DEFAULT_QUERY_HEADS * bf16_lightning._DEFAULT_HEAD_DIM
+
+
 def verify_ag007_discrimination(
     query_work: Callable[[int, int], float] | None = None,
     *,
@@ -148,7 +253,7 @@ def verify_ag007_discrimination(
     multi_query_tokens: int = 2,
     pattern: MemoryAccessPattern | None = None,
 ) -> tuple[str, ...]:
-    """Return failed physical checks, using BF16 indexer FLOPs by default.
+    """Return failed physical checks, verifying exact BF16 QK FLOPs by default.
 
     A custom query probe takes (query_tokens, context_tokens) and returns a
     physical work counter expected to increase with query tokens. A custom
@@ -174,6 +279,14 @@ def verify_ag007_discrimination(
     multiple = probe(multi_query_tokens, context_tokens)
     if not (isfinite(single) and isfinite(multiple) and 0 <= single < multiple):
         failures.append("same-context multi-query plan must increase physical work")
+    if query_work is None:
+        for query_tokens, actual in ((1, single), (multi_query_tokens, multiple)):
+            expected = _expected_indexer_qk_flops(query_tokens, context_tokens)
+            if actual != expected:
+                failures.append(
+                    f"BF16 indexer QK FLOPs for q={query_tokens}, context={context_tokens} "
+                    f"must be {expected}, got {actual:g}"
+                )
     return tuple(failures)
 
 

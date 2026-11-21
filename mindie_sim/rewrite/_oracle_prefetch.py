@@ -122,7 +122,10 @@ def die_placements_for_case(case) -> tuple[tuple[int, tuple[int, int]], ...]:
 
 
 def primitive_table_digest_token(primitive_table):
-    """Return a deterministic digest token for ``primitive_table`` or ``None``."""
+    """Return a deterministic content digest token for ``primitive_table`` or ``None``."""
     if primitive_table is None:
         return None
+    canonical = getattr(primitive_table, "canonical_envelope_sha256", None)
+    if callable(canonical):
+        return canonical()
     return getattr(primitive_table, "envelope_sha256", None) or getattr(primitive_table, "entries", None)

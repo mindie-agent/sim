@@ -15,17 +15,17 @@
 import math
 from typing import Mapping
 
-from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.common import ModelingError, align_up, dtype_bytes
 from mindie_sim.schema.operators import StateEffect
-from .engine import Allocation
-from .gdn_recurrent_contracts import (
+from ...engine import Allocation
+from ...gdn_recurrent_contracts import (
     STATE_DIRECTIONS, STATE_TARGET_KINDS, _SLOT_PUBLISH, _SLOT_SCOPES,
     _TARGET_FIELD, _slot_ports, _state_effect, _state_target, bind_state_ports,
     state_contract, tensor_port,
 )
-from .mechanism import OperatorPlan, Work
-from .ownership import read_role, unit_group
-from .program import KernelProgram, ParallelProgram, PipelineProgram, Stage
+from ...mechanism import OperatorPlan, Work
+from ...ownership import read_role, unit_group
+from ...program import KernelProgram, ParallelProgram, PipelineProgram, Stage
 
 IMPLEMENTATION = "ascend_recurrent_gdn_fp32_state"
 STATE_CONTRACT_KEY = "gdn_state_contract"
@@ -42,6 +42,14 @@ SOURCE = {
     },
 }
 UB_BYTES = 247808
+_MAX_HEAD_DIM = 512
+_MAX_VALUE_HEADS = 256
+_MAX_QUERY_ROWS = 8
+_VECTOR_LANE_ALIGNMENT = 16
+_RESIDENT_QKV_BYTES = 16384
+_STATE_TILE_ELEMENTS = 8192
+_VALUE_TILE_COLUMN_LIMIT = 256
+_QK_CAST_SCALE_OPS_PER_LANE = 3
 
 
 def head_ownership(lengths, heads, blocks):
@@ -251,16 +259,22 @@ def build(op, geometry, *, compact=True):
                                       **_state_plan_meta(meta)})
     heads, dk, dv = (int(meta[key]) for key in ("heads", "dk", "dv"))
     keys = int(meta["key_heads"])
-    if not (1 <= dk <= 512 and 1 <= dv <= 512 and 1 <= heads <= 256
+    if not (1 <= dk <= _MAX_HEAD_DIM and 1 <= dv <= _MAX_HEAD_DIM
+            and 1 <= heads <= _MAX_VALUE_HEADS
             and keys > 0 and heads % keys == 0):
         raise ValueError("source_recurrent_gdn_head_dimensions_outside_host_domain")
-    ak, av = math.ceil(dk / 16) * 16, math.ceil(dv / 16) * 16
-    if op.dtype != "bf16" or meta["state_dtype"] != "fp32" or max(lengths) > 8:
+    ak, av = align_up(dk, _VECTOR_LANE_ALIGNMENT), align_up(dv, _VECTOR_LANE_ALIGNMENT)
+    max_query = max(lengths)
+    if op.dtype != "bf16" or meta["state_dtype"] != "fp32" or max_query > _MAX_QUERY_ROWS:
         raise ValueError("source_recurrent_gdn_requires_bf16_fp32_state_q_le8")
-    if max(lengths) * max(ak, av) * 4 > 16384:
+    state_bytes = int(dtype_bytes(meta["state_dtype"]))
+    input_bytes = int(dtype_bytes(op.dtype))
+    if max_query * max(ak, av) * state_bytes > _RESIDENT_QKV_BYTES:
         raise ValueError("source_recurrent_gdn_resident_qkv_exceeds_16k_buffer")
-    value_step = 8192 // ak
-    value_step = (255 if value_step > 256 else value_step) // 16 * 16
+    columns = _STATE_TILE_ELEMENTS // ak
+    if columns > _VALUE_TILE_COLUMN_LIMIT:
+        columns = _VALUE_TILE_COLUMN_LIMIT - 1
+    value_step = columns // _VECTOR_LANE_ALIGNMENT * _VECTOR_LANE_ALIGNMENT
     if not value_step:
         raise ValueError("source_recurrent_gdn_state_tile_exceeds_32k_buffer")
     parts = math.ceil(dv / value_step)
@@ -271,10 +285,14 @@ def build(op, geometry, *, compact=True):
                        for segments in ownership)
     read = read_role(geometry.resource_units, aiv=0)
     total = sum(lengths) * heads
-    tensor_reads = len(lengths) * heads * dk * dv * 4 + total * (2 * dk + dv) * 2
-    scalar_payload = total * (4 + 2 * parts)
-    writes = total * (dk * dv * 4 + dv * 2)
-    vector = len(lengths) * heads * ak * dv + total * (8 * ak * dv + dv + 6 * ak + av)
+    tensor_reads = len(lengths) * heads * dk * dv * state_bytes + total * (2 * dk + dv) * input_bytes
+    scalar_payload = total * (state_bytes + input_bytes * parts)
+    writes = total * (dk * dv * state_bytes + dv * input_bytes)
+    dot_ops = 2 * (2 * ak - 1)
+    state_ops = ak + 2 * ak + ak  # Decay, rank-one update, state copy.
+    value_ops = dot_ops + state_ops + 2 + 1  # Delta and output cast.
+    key_ops = (1 + 2 + _QK_CAST_SCALE_OPS_PER_LANE) * ak  # Gamma zero, gamma, Q/K cast and scale.
+    vector = len(lengths) * heads * ak * dv + total * (value_ops * dv + key_ops + av)
     work = Work(resources={"hbm": tensor_reads + scalar_payload + writes,
                            read: tensor_reads, "mte3": writes, "vector": vector})
 
@@ -296,7 +314,7 @@ def build(op, geometry, *, compact=True):
                         # Scalar GetValue payload is not an MTE2 instruction.
                         # Its issue/cache latency needs a separate hardware
                         # declaration; no PMU counter becomes a stage delay.
-                        scalar = 2 + (4 if part_index == 0 else 0)
+                        scalar = input_bytes + (state_bytes if part_index == 0 else 0)
                         stages = [
                             Stage("scalar_inputs", context.bind(Work(resources={"hbm": scalar}).scaled(repeat)),
                                   previous=("attention_cast",)),
@@ -308,15 +326,15 @@ def build(op, geometry, *, compact=True):
                         stages.append(Stage("decay", v(ak * n), after=(prev,), placement=owned))
                         prev = "decay"
                         if first:
-                            stages.append(Stage("qk_load", memory(q * 2 * dk * 2, read),
+                            stages.append(Stage("qk_load", memory(q * 2 * dk * input_bytes, read),
                                                 after=(prev,), placement=owned))
-                            stages.append(Stage("qk_cast_scale", v(q * 3 * ak),
+                            stages.append(Stage("qk_cast_scale", v(q * _QK_CAST_SCALE_OPS_PER_LANE * ak),
                                                 after=("qk_load",), placement=owned))
                             prev = "qk_cast_scale"
                         stages.append(Stage("key_dot", v((2 * ak - 1) * n), after=(prev,), placement=owned))
                         prev = "key_dot"
                         if first:
-                            stages.append(Stage("v_load", memory(q * dv * 2, read),
+                            stages.append(Stage("v_load", memory(q * dv * input_bytes, read),
                                                 after=(prev,), placement=owned))
                             stages.append(Stage("v_cast", v(q * av),
                                                 after=("v_load",), placement=owned))
@@ -326,16 +344,16 @@ def build(op, geometry, *, compact=True):
                             Stage("rank_one_update", v(2 * ak * n), after=("delta",), placement=owned),
                             Stage("state_copy", v(ak * n), after=("rank_one_update",),
                                   previous=("state_write",), placement=owned),
-                            Stage("state_write", memory(dk * n * 4, "mte3"), after=("state_copy",),
+                            Stage("state_write", memory(dk * n * state_bytes, "mte3"), after=("state_copy",),
                                   previous=("attention_write",), placement=owned),
                             Stage("query_dot", v((2 * ak - 1) * n), after=("state_copy",), placement=owned),
                             Stage("attention_cast", v(n), after=("query_dot",),
                                   previous=("attention_write",), placement=owned),
-                            Stage("attention_write", memory(n * 2, "mte3"),
+                            Stage("attention_write", memory(n * input_bytes, "mte3"),
                                   after=("attention_cast", "state_write"), placement=owned),
                         ))
                         return tuple(stages)
-                    return (Stage("state_load", memory(dk * n * 4, read), placement=owned),
+                    return (Stage("state_load", memory(dk * n * state_bytes, read), placement=owned),
                             Stage("state_resident_copy", v(ak * n), after=("state_load",), placement=owned),
                             Stage("tokens", after=("state_resident_copy",), program=PipelineProgram(q, 2, token)))
                 return (Stage("gamma_zero", v(q * ak), placement=owned),

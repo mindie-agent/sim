@@ -118,12 +118,22 @@ class DatapathCapabilitySpec:
 
     def cube_peak(self, dtype: str) -> float:
         """Return the declared matrix peak (FLOP/s) for ``dtype`` without profile guessing."""
-        arch = self.compute_arch.declared
-        if arch is None or not arch.supports_native("matrix", dtype):
-            raise ModelingError(f"fuse_region_matrix_precision_unsupported:{dtype}")
-        aliases = dict(self.compute_peak_aliases)
+        from .compute_peak_aliases import resolve_compute_peak_name
+
         peaks = dict(self.compute_peaks)
-        name = aliases.get(dtype, dtype)
+        supply = dict(self.compute_peak_aliases)
+        dtype_aliases = {
+            "bfloat16": "bf16", "float16": "fp16", "float32": "fp32",
+            "fp8_e4m3": "fp8", "fp8_e5m2": "fp8",
+        }
+        canonical = dtype_aliases.get(dtype, dtype)
+        arch = self.compute_arch.declared
+        if arch is None or not (
+            arch.supports_native("matrix", dtype) or arch.supports_native("matrix", canonical)
+        ):
+            raise ModelingError(f"fuse_region_matrix_precision_unsupported:{dtype}")
+        native = resolve_compute_peak_name(dtype, peaks, supply) if supply else dtype
+        name = native if native in peaks else dtype_aliases.get(native, canonical)
         if name in peaks and peaks[name] > 0.0:
             return float(peaks[name])
         raise ModelingError(f"fuse_region_compute_precision_requires_context:{dtype}")

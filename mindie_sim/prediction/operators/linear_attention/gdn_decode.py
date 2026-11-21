@@ -17,18 +17,16 @@ import math
 from mindie_sim.catalog.attention_common import AttentionResult
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.tensors import TensorLayout, TensorValue
-from ...call_gdn import GATING_SOURCE
-from ... import gdn_recurrent
-from ._gdn_decode_programs import CONV, GATING, CONV_SOURCE, conv_plan, gating_plan
-from ...gdn_prefill import decode_core, rearrange_qkv
 from ...graph import GraphPolicy
 from ...lowering import Builder
 from ...mechanism import PlannedRecipe
 from ...recover_ssm_work import (
-    GDN_ARCH35_RECOVER_SSM_RECIPE, build_gdn_arch35_recover_ssm,
+    GDN_ARCH35_RECOVER_SSM_RECIPE,
     emit_commit_op, recover_ssm_enabled, rewrite_gdn_analytical_scan,
 )
 from ...tensors import TensorLowering
+from . import gdn_recurrent
+from ._gdn_decode_programs import CONV, GATING, CONV_SOURCE, conv_plan, gating_plan
 
 SOURCE = {"path": "data/observations/sources/gdn-image-c3d00a196905/gdn.py.txt",
           "sha256": "e9ed210b4ca4431ee40916f06f0272e5e781eb04b61b084bacea216799fbca98",
@@ -45,11 +43,19 @@ def _build_conv(op, geometry):
     return conv_plan(op, geometry)
 
 
+def _build_recover_ssm(op, geometry):
+    from ...recover_ssm_work import build_gdn_arch35_recover_ssm
+
+    if any(int(rows) > 1 for rows in dict(op.metadata)["sequence_tokens"]):
+        return build_gdn_arch35_recover_ssm(op, geometry)
+    return gdn_recurrent.build(op, geometry)
+
+
 _BUILDERS = {
     CONV: _build_conv,
     GATING: gating_plan,
     gdn_recurrent.IMPLEMENTATION: gdn_recurrent.build,
-    GDN_ARCH35_RECOVER_SSM_RECIPE: build_gdn_arch35_recover_ssm,
+    GDN_ARCH35_RECOVER_SSM_RECIPE: _build_recover_ssm,
 }
 RECIPE_IDS = frozenset(_BUILDERS)
 
@@ -66,6 +72,9 @@ def recipes():
 def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
           padded_tokens, policy, runtime, gating_beta_store=None, gating_programs=None,
           recurrent_implementation="analytical", cache_index_row_stride=1):
+    from ...call_gdn import GATING_SOURCE
+    from ...gdn_prefill import decode_core, rearrange_qkv
+
     if not views or any(view.phase != "decode" for view in views):
         raise ModelingError("gdn_decode_selected_caller_requires_decode_only")
     if model.activation_dtype != "bf16" or plan.recurrent_state_dtype != "fp32":

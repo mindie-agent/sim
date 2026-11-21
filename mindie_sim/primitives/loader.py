@@ -276,10 +276,40 @@ def _cap_cube_peak(datapath: DatapathCapabilitySpec, dtype: str, peak: float) ->
     return min(peak, arch_peak) if arch_peak > 0.0 else peak
 
 
+def is_sku_compatible_with_table(
+    table: Any, sku: str, *, primitives_dir: Path | None = None,
+) -> bool:
+    """True when ``sku`` is explicitly compatible with ``table`` per shipped manifest."""
+    table_sku = str(getattr(table, "sku", "") or "")
+    target_sku = str(sku or "")
+    if not table_sku or not target_sku or table_sku == target_sku:
+        return True
+    try:
+        entries = load_manifest(default_primitives_dir() if primitives_dir is None else Path(primitives_dir))["tables"]
+    except ModelingError:
+        return False
+    entry = entries.get(table_sku) or next(
+        (v for v in entries.values() if v.get("sku") == table_sku), None,
+    )
+    if entry is None:
+        return False
+    return target_sku in (table_sku, *entry.get("compatible_skus", ()))
+
+
+def validate_table_sku_compatibility(
+    table: Any, sku: str, *, primitives_dir: Path | None = None,
+) -> None:
+    """Fail closed when ``table`` is not manifest-compatible with ``sku``."""
+    if not is_sku_compatible_with_table(table, sku, primitives_dir=primitives_dir):
+        raise ModelingError(f"primitive_table_sku_mismatch:{getattr(table, 'sku', '')}:{sku}")
+
+
 def resolve_sim_rate_overlay(
     table: Any, datapath: DatapathCapabilitySpec, *, sku: str = "",
 ) -> CalibratedRateOverlay:
     """Bind calibrated ``sim_rate_p50`` supply from ``table`` for one die's datapath."""
+    if sku:
+        validate_table_sku_compatibility(table, sku)
     if not isinstance(table, PrimitiveTable):
         from mindie_sim.optimization.contracts import normalize_capacity_per_second
         entries = getattr(table, "entries", ())
@@ -365,7 +395,7 @@ def resolve_sim_rate_overlay(
     return CalibratedRateOverlay(
         sku=table.sku,
         cann_version=table.cann_version,
-        envelope_sha256=table.envelope_sha256,
+        envelope_sha256=table.canonical_envelope_sha256(),
         rates=tuple(sorted(rates_map.items())),
         compute_peaks=tuple(sorted(peaks_map.items())),
         hbm_read_bytes_per_s=hbm_r,
@@ -377,5 +407,6 @@ def resolve_sim_rate_overlay(
 
 __all__ = [
     "CalibratedRateOverlay", "RateRole", "default_primitives_dir",
-    "load_manifest", "load_primitives", "resolve_primitive_rate", "resolve_sim_rate_overlay",
+    "is_sku_compatible_with_table", "load_manifest", "load_primitives",
+    "resolve_primitive_rate", "resolve_sim_rate_overlay", "validate_table_sku_compatibility",
 ]

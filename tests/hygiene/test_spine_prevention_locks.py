@@ -26,21 +26,34 @@ from mindie_sim.optimization import (
     select_catlass_candidates,
     select_dsl_candidates,
 )
+from mindie_sim.prediction.program import Stage
 from mindie_sim.prediction.results import StepRequest
-from mindie_sim.prediction.runtime.memory_physics import _measure_periodic_combo
+from mindie_sim.prediction.runtime.engine import Engine
+from mindie_sim.prediction.runtime.engine_types import Resource
+from mindie_sim.prediction.runtime.memory_physics import (
+    AddressRun, AddressRunPlan, AdmissionMemoryView, HbmBusSpec, PeriodicSectorRun, SectorCoverage,
+    _measure_periodic_combo,
+)
+from mindie_sim.prediction.runtime.periodic_runs import _coverage_overlap, _prune_periodic_subruns
 from mindie_sim.prediction.spine import PredictionSpine
 from mindie_sim.prediction.streams import MAIN_STREAM, StreamCoreBudget, StreamLane
-from mindie_sim.primitives.loader import load_primitives
+from mindie_sim.prediction.structure import parse_case
+from mindie_sim.primitives.loader import load_primitives, resolve_sim_rate_overlay
 from mindie_sim.primitives.schema import compute_envelope_sha256, parse_primitive_table
-from mindie_sim.rewrite.oracle import ScenarioRequest, finalize_plan, prepare_scenario
+from mindie_sim.rewrite.oracle import OracleCache, ScenarioRequest, finalize_plan, graph_costs, prepare_scenario
 from mindie_sim.rewrite.schema import Edit, OpRef, PortRef, StreamSchedule, WeightPrefetch
 from mindie_sim.schema.case import Case
+from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import datapath_for_die
 from mindie_sim.schema.hardware import Device
 from mindie_sim.schema.hardware_links import Link
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.stack_registry import LoweringRequest
-from mindie_sim.templates import registry as templates_registry
+from mindie_sim.templates import _catlass_coalesced as catlass_coalesced
+from mindie_sim.templates import catlass_lower, compile_fuse_region, registry as templates_registry
+from mindie_sim.templates.catlass_catalog import CatlassProblem, enumerate_catlass_specs
+from _support.axes import REPRESENTATIVE_SKUS
+from _support.collective_cases import case as col_case, exchange
 
 pytestmark = pytest.mark.tier0
 
@@ -143,12 +156,12 @@ def test_lock1_default_cube_peak_geometry_guessing_is_deleted():
 def test_lock5_dual_bound_nonzero_across_all_work_classes_and_partial_annotations():
     die0 = Device(
         rank=0, compute_units=1, memory_bytes=MEM_CAPACITY,
-        rates=(("hbm", UNIT_RATE_PER_S), ("vector", UNIT_RATE_PER_S)),
+        rates=(("hbm", UNIT_RATE_PER_S), ("mte2", UNIT_RATE_PER_S), ("vector", UNIT_RATE_PER_S)),
         compute_peaks=(("bf16", UNIT_PEAK_FLOPS),),
     )
     die1 = Device(
         rank=1, compute_units=1, memory_bytes=MEM_CAPACITY,
-        rates=(("hbm", UNIT_RATE_PER_S), ("vector", UNIT_RATE_PER_S)),
+        rates=(("hbm", UNIT_RATE_PER_S), ("mte2", UNIT_RATE_PER_S), ("vector", UNIT_RATE_PER_S)),
         compute_peaks=(("bf16", UNIT_PEAK_FLOPS),),
     )
     link = Link(name="fabric", capacity_bytes_per_ms=UNIT_LINK_BPMS, members=(0, 1))
@@ -183,12 +196,14 @@ def test_lock5_dual_bound_nonzero_across_all_work_classes_and_partial_annotation
 
 def test_lock5_k2_k3_autogeneration_and_search_stats_disclosure():
     base_table = load_primitives(SKU_A5)
-    case_qwen = compose_case("qwen3-32b", hardware=SKU_A5, tp=1, layers=1)
+    case_qwen = compose_case("qwen3-32b", hardware=SKU_A5, tp=4, layers=1, quant="bf16")
     report = api.optimize_ladder(case_qwen, StepRequest("decode", context=DECODE_CTX),
-                                 primitive_table=base_table, max_trials=6)
+                                 primitive_table=base_table, max_trials=2)
     assert isinstance(report.search_stats, CandidateSearchStats)
     assert report.search_stats.eligible_sites > 0
     assert report.search_stats.generated_candidates > 0
+    assert report.search_stats.replayed_candidates > 0
+    assert report.search_stats.rejected_candidates == 0
     assert isinstance(report.primitive_coverage_gaps, tuple) and report.primitive_coverage_gaps
 
     spine = PredictionSpine()
@@ -235,3 +250,136 @@ def test_lock5_prefetch_and_streams_compose_and_periodic_sweep_is_fast():
     elapsed = perf_counter() - t0
     assert measured == SWEEP_INTERVAL_COUNT * SWEEP_WIDTH
     assert elapsed < SWEEP_MAX_SECONDS
+
+
+def test_rc14_dual_bound_soundness_for_onchip_copy_per_pair_link_and_pure_vector():
+    c_dt = compose_case("qwen3-32b", hardware=SKU_A5, tp=1, layers=1)
+    dos_a5 = prepare_scenario(ScenarioRequest(c_dt, StepRequest("decode", context=1)))
+    base_g = dos_a5.handle.scenario.atomic_ops[0]
+    for res_mode in ("hbm_cold", "l2_warm"):
+        op_copy = OpSpec("copy0", "tensor_copy", "decode", 0, 0, (), (1, 16), (1, 16), (1, 16), (1, 16),
+                         dtype="bf16", mte2_bytes=131072, hbm_bytes=0, vector_ops=0, flops=0,
+                         metadata=(("initial_residency", res_mode),))
+        sc1 = replace(dos_a5.handle.scenario, atomic_ops=(replace(base_g, ops=(op_copy,)),))
+        cert1, _ = certify_lower_bound(*build_dual_inputs_from_scenario(sc1)[:2])
+        wall1_ns = round(graph_costs(sc1.case, {0: (op_copy,)})["duration_ms"] * 1_000_000)
+        assert 0 < cert1.l_star_lean_ns <= wall1_ns
+
+    op_vec = OpSpec("vec0", "elementwise", "decode", 0, 0, (), (1, 16), (1, 16), (1, 16), (1, 16),
+                    dtype="bf16", vector_ops=65536, hbm_bytes=0, mte2_bytes=0, mte3_bytes=0, flops=0)
+    sc3 = replace(dos_a5.handle.scenario, atomic_ops=(replace(base_g, ops=(op_vec,)),))
+    cert3, _ = certify_lower_bound(*build_dual_inputs_from_scenario(sc3)[:2])
+    wall3_ns = round(graph_costs(sc3.case, {0: (op_vec,)})["duration_ms"] * 1_000_000)
+    assert 0 < cert3.l_star_lean_ns <= wall3_ns
+
+    raw_pp = col_case(tp=4)
+    raw_pp["machine"]["links"][0].update(semantics="per_pair", capacity_bytes_per_ms=1000, latency_us=0)
+    case_pp = parse_case(raw_pp)
+    ex = exchange(30)
+    sc2 = SimpleNamespace(machine=case_pp.machine, atomic_ops=(replace(base_g, replica=0, ops=(ex,)),))
+    cert2, _ = certify_lower_bound(*build_dual_inputs_from_scenario(sc2)[:2])
+    wall2_ns = round(graph_costs(case_pp, {0: (ex,)})["duration_ms"] * 1_000_000)
+    assert 0 < cert2.l_star_lean_ns <= wall2_ns
+
+
+def test_rc14_catlass_coalescing_parity_splitk_and_small_l2_guards():
+    dp = datapath_for_die(parse_case(compose_case("qwen3-32b", hardware=SKU_A5, tp=1, layers=1)).machine.dies[0])
+    p1 = CatlassProblem(m=1, n=1024, k=512, dtype_a="bf16", dtype_b="bf16", dtype_c="bf16", dtype_acc="fp32")
+    s1 = next(s for s in enumerate_catlass_specs(p1, dp)
+              if s.scheduler == "dataparallel" and s.epilogue_kind == "none"
+              and not s.mx_scale_group and s.dispatch_policy != "MmadPingpongMutex")
+    orig_t = catlass_coalesced.COALESCED_PANEL_THRESHOLD
+    try:
+        catlass_coalesced.COALESCED_PANEL_THRESHOLD = 10**9
+        ru = catlass_lower.lower_catlass_spec(s1, p1, dp)
+        catlass_coalesced.COALESCED_PANEL_THRESHOLD = 1
+        rc = catlass_lower.lower_catlass_spec(s1, p1, dp)
+        assert (ru.l2_hit_bytes, ru.dram_miss_bytes, ru.summary.dram_sector_bytes, ru.summary.semantic_work) == (
+            rc.l2_hit_bytes, rc.dram_miss_bytes, rc.summary.dram_sector_bytes, rc.summary.semantic_work,
+        )
+        p3 = CatlassProblem(m=64, n=288, k=512, dtype_a="bf16", dtype_b="bf16", dtype_c="bf16", dtype_acc="fp32")
+        s3 = next(s for s in enumerate_catlass_specs(p3, dp, l1_tiles=((32, 32, 32),), l0_tiles=((32, 32, 32),))
+                  if s.scheduler == "dataparallel" and s.epilogue_kind == "none" and s.dispatch_policy == "MmadPingpong")
+        low3 = catlass_lower._MatrixLowerer(catlass_lower.Lowering(dp, memory_view=AdmissionMemoryView({0: 8192}, granule_bytes=32)), s3, p3)
+        assert not catlass_coalesced.can_coalesce(low3, 18)
+    finally:
+        catlass_coalesced.COALESCED_PANEL_THRESHOLD = orig_t
+
+    p2 = CatlassProblem(m=32, n=32, k=8224, dtype_a="bf16", dtype_b="bf16", dtype_c="bf16", dtype_acc="fp32")
+    s2_sk = next(s for s in enumerate_catlass_specs(p2, dp, l1_tiles=((32, 32, 32),), l0_tiles=((32, 32, 32),), aic_budget=2, aiv_budget=2)
+                 if s.scheduler == "multi_core_splitk" and s.epilogue_kind == "none" and s.splitk_factor == 2)
+    assert not catlass_coalesced.can_coalesce(catlass_lower._MatrixLowerer(catlass_lower.Lowering(dp), s2_sk, p2), 1)
+    r_sk = catlass_lower.lower_catlass_spec(s2_sk, p2, dp)
+    assert sum(st.work.get("vec_reduce", 0) for st in r_sk.program.stages) == 1024
+
+
+def test_rc14_full_duplex_hbm_shipping_stages_python_and_c11():
+    bus = HbmBusSpec(0, 1024.0, 1024.0, 0.0, row_r="hbm:r", row_w="hbm:w")
+    for backend in ("python", "c"):
+        eng = Engine([Resource("hbm", 1024.0), Resource("mte2_aic", 8192.0), Resource("mte3", 8192.0)], backend=backend)
+        eng.add_hbm_bus(bus)
+        ev_r = eng.submit("ship_read", {"hbm": 8192.0, "mte2_aic": 8192.0})
+        ev_w = eng.submit("ship_write", {"hbm": 8192.0, "mte3": 8192.0})
+        eng.advance(until=(ev_r, ev_w), first=False)
+        assert eng.now == pytest.approx(8.0) and eng.serviced["hbm"] == pytest.approx(16384.0)
+        ev_r2 = eng.submit("ship_read_2", {"hbm": 4096.0, "mte2_aic": 4096.0}, after=(ev_r, ev_w))
+        ev_w2 = eng.submit("ship_write_2", {"hbm": 4096.0, "mte3": 4096.0}, after=(ev_r, ev_w))
+        eng.advance(until=(ev_r2, ev_w2), first=False)
+        assert eng.now == pytest.approx(12.0) and eng.serviced["hbm"] == pytest.approx(24576.0)
+        eng_ret = Engine([Resource("hbm", 1024.0), Resource("mte2_aic", 8192.0), Resource("mte3", 8192.0)], backend=backend)
+        r_ret = eng_ret.submit("ship_read", {"hbm": 8192.0, "mte2_aic": 8192.0})
+        w_ret = eng_ret.submit("ship_write", {"hbm": 8192.0, "mte3": 8192.0})
+        eng_ret.advance(horizon=2.0)
+        eng_ret.add_hbm_bus(bus)
+        eng_ret.advance(until=(r_ret, w_ret), first=False)
+        assert eng_ret.now == pytest.approx(9.0) and eng_ret.serviced["hbm"] == pytest.approx(16384.0)
+
+
+def test_rc14_periodic_streaming_coprime_and_disjoint_pruning():
+    plan = AddressRunPlan(tuple(AddressRun(0, 2**22, 32, stride) for stride in (4097, 4099, 4103)))
+    t0 = perf_counter()
+    measured = plan.sector_coverage().measure_bytes()
+    assert measured == 780_607_488 and (perf_counter() - t0) < 5.0
+    disjoint = tuple(PeriodicSectorRun(i * 10**8, 8192, 32, 4097, 32) for i in range(SWEEP_INTERVAL_COUNT))
+    t1 = perf_counter()
+    assert len(_prune_periodic_subruns(disjoint)) == SWEEP_INTERVAL_COUNT
+    assert _coverage_overlap(SectorCoverage((), disjoint[:1000]), SectorCoverage((), disjoint[1000:])) == 0
+    assert (perf_counter() - t1) < SWEEP_MAX_SECONDS
+
+
+def test_rc14_primitive_cache_isolation_sku_compatibility_and_dtype_aliases():
+    dt_table = load_primitives(SKU_A5)
+    raw_slow = deepcopy(dt_table.to_envelope_dict())
+    band = raw_slow["primitives"]["P01_datacopy"]["metrics"]["hbm_read_bytes_per_s"]
+    for key in ("p05", "p50", "p95", "p99", "trimmed_mean"):
+        if band.get(key) is not None:
+            band[key] = float(band[key]) * 0.125
+    raw_slow["envelope_sha256"] = compute_envelope_sha256(raw_slow)
+    mutated = replace(dt_table, primitives=parse_primitive_table(raw_slow).primitives)
+    c_dt = compose_case("qwen3-32b", hardware=SKU_A5, tp=1, layers=1)
+    cache = OracleCache()
+    d_base = prepare_scenario(ScenarioRequest(c_dt, StepRequest("decode", context=DECODE_CTX), primitive_table=dt_table), cache=cache)
+    d_mut = prepare_scenario(ScenarioRequest(c_dt, StepRequest("decode", context=DECODE_CTX), primitive_table=mutated), cache=cache)
+    d_fresh = prepare_scenario(ScenarioRequest(c_dt, StepRequest("decode", context=DECODE_CTX), primitive_table=mutated))
+    assert d_mut.mainline_eval.span_ms > d_base.mainline_eval.span_ms
+    assert d_mut.mainline_eval.span_ms == pytest.approx(d_fresh.mainline_eval.span_ms)
+
+    c_pr = compose_case("qwen3-32b", hardware="Ascend950PR_9579", tp=1, layers=1)
+    dev_pr = parse_case(c_pr).machine.dies[0]
+    with pytest.raises(ModelingError, match="primitive_table_sku_mismatch"):
+        resolve_sim_rate_overlay(dt_table, datapath_for_die(dev_pr), sku=dev_pr.sku)
+    with pytest.raises(ModelingError, match="primitive_table_sku_mismatch"):
+        prepare_scenario(ScenarioRequest(c_pr, StepRequest("decode", context=DECODE_CTX), primitive_table=dt_table))
+
+    for gen in ("a2", "a3", "a5"):
+        dev = parse_case(compose_case("qwen3-32b", hardware=REPRESENTATIVE_SKUS[gen], tp=1, layers=1)).machine.dies[0]
+        dp = datapath_for_die(dev)
+        for dt in ("bf16", "bfloat16", "fp16", "float16", "fp32", "float32"):
+            assert dp.cube_peak(dt) == pytest.approx(dev.peak(dt))
+        for dt in ("bf16", "bfloat16", "float16", "float32"):
+            _, res = compile_fuse_region(
+                "fused", ("compute",), dp, dependencies={"compute": ()},
+                op_stages={"compute": Stage("compute", {"cube": 2 * 64 * 64 * 64}, metadata={"cube_dtype": dt})},
+                edge_routes=(), edge_bytes={},
+            )
+            assert res.stages_count > 0

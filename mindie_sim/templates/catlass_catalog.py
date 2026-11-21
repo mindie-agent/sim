@@ -390,7 +390,8 @@ def enumerate_catlass_specs(
             raise ModelingError(f"catlass_template_unknown:{name}")
         grouped = name.startswith("catlass.grouped_")
         mx = name in {"catlass.mx_matmul", "catlass.grouped_mx_swiglu_mx_quant"}
-        if bool(p.groups) != grouped or (name == "catlass.evg" and not evg_tree) or (mx and not p.mx_mode and not dtype_name(p.dtype_a).startswith(("mxfp", "mx_fp"))):
+        is_mx_problem = bool(p.mx_mode) or dtype_name(p.dtype_a).startswith(("mxfp", "mx_fp"))
+        if bool(p.groups) != grouped or (name == "catlass.evg" and not evg_tree) or (mx != is_mx_problem):
             continue
         scheduler = name.removeprefix("catlass.") if name in {"catlass.streamk", "catlass.multi_core_splitk"} else (
             "grouped_slice_m" if grouped else "dataparallel"
