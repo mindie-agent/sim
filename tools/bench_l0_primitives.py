@@ -56,6 +56,9 @@ GIB = 1024 * 1024 * 1024
 SSH_CONNECT_TIMEOUT_S = 8
 REMOTE_BENCH_TIMEOUT_S = 360
 IPV4_QUAD_RE = re.compile(r"(?<!\d)\d{1,3}(?:[._-]\d{1,3}){3}(?!\d)")
+PRIVATE_CAPTURE_RE = re.compile(
+    r"(?<![\d.])(?:\d{1,3}[._-]){3}\d{1,3}(?![\d.])|/(?:Users|home|root)/[^\s\"']*|[^\s\"']*@[^\s\"']+|\$\{?HOME\}?"
+)
 SAFE_ALIAS_RE = re.compile(r"[^a-z0-9._-]+")
 SAFE_CONTAINER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 SAFE_VISIBLE_RE = re.compile(r"^[0-9]+(?:,[0-9]+)*$")
@@ -131,8 +134,8 @@ def _load_sku_hardware_spec(sku: str) -> dict[str, Any]:
     bufs, rates, sm = dict(die.buffers), dict(die.rates), dict(die.service_modes)
     tc = {k: dict(v) for k, v in hw.transfer_channels}
     h2d, d2h, d2d = tc.get("h2d", {}), tc.get("d2h", {}), tc.get("d2d_intra_node", {})
-    h2d_solo = max(float(h2d.get("uni_peak_bw_gbps") or 0.0), float(h2d.get("solo_effective_uni_bw_gbps") or 0.0)) * 1e9
-    d2h_solo = max(float(d2h.get("uni_peak_bw_gbps") or 0.0), float(d2h.get("solo_effective_uni_bw_gbps") or 0.0)) * 1e9
+    h2d_solo = float(h2d.get("solo_effective_uni_bw_gbps") or h2d.get("uni_peak_bw_gbps") or 0.0) * 1e9
+    d2h_solo = float(d2h.get("solo_effective_uni_bw_gbps") or d2h.get("uni_peak_bw_gbps") or 0.0) * 1e9
     h2d_rc = float(h2d.get("node_peak_bw_gbps") or 0.0) * 1e9 or h2d_solo
     d2h_rc = float(d2h.get("node_peak_bw_gbps") or 0.0) * 1e9 or d2h_solo
     link_uni = float(d2d.get("uni_peak_bw_gbps") or d2d.get("effective_uni_bw_gbps") or 0.0) * 1e9
@@ -429,9 +432,20 @@ def _clean_band(b: dict[str, Any]) -> dict[str, Any]:
     return {"certified_upper_capacity": b["certified_upper_capacity"], "bound_kind": b.get("bound_kind", "rate_upper")}
 
 
+def _sanitize_capture_obj(obj: Any) -> Any:
+    if isinstance(obj, str):
+        return PRIVATE_CAPTURE_RE.sub("redacted", obj)
+    if isinstance(obj, dict):
+        return {PRIVATE_CAPTURE_RE.sub("redacted", str(k)): _sanitize_capture_obj(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_capture_obj(v) for v in obj]
+    return obj
+
+
 def canonical_capture_bytes(sku: str, raw_measurements: dict[str, Any] | None) -> bytes:
     """Serialize sanitized raw calibration samples/summary to canonical JSON bytes."""
-    body = {"tag": "campaign", "payload": raw_measurements if raw_measurements else {"sku": sku, "status": "unmeasured"}}
+    payload = _sanitize_capture_obj(raw_measurements) if raw_measurements else {"sku": sku, "status": "unmeasured"}
+    body = {"tag": "campaign", "payload": payload}
     return (json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n").encode("utf-8")
 
 
@@ -449,6 +463,9 @@ def build_primitive_table_payload(
     aic, aiv = max(1, spec["aic_count"]), max(1, spec["aiv_count"])
     is_arch35 = spec["arch_preset"] == "npu_arch_3510"
     raw = raw_measurements or {}
+    sample_dev = str(raw.get("device_name") or "").strip()
+    if sample_dev and sample_dev != sku:
+        raise ValueError(f"bench_sample_sku_mismatch:expected={sku}:got={sample_dev}")
     obs = raw.get("observed_silicon") if isinstance(raw.get("observed_silicon"), dict) else {}
     obs_aic = obs.get("observed_aic_count")
     core_mismatch = isinstance(obs_aic, int) and obs_aic > 0 and obs_aic != aic
@@ -549,13 +566,13 @@ def build_primitive_table_payload(
     p["P18_hccl_collective_band"] = _make_cell("P18_hccl_collective_band", {"rate": "bytes_per_s", "latency": "ns"}, {"payload_bytes_per_frame": 480 if is_arch35 else 1024, "wire_bytes_per_frame": 512 if is_arch35 else 1024, "short_final_frame_policy": "exact_plus_header"}, {}, {"link_bytes_per_s": _bound_only(spec["link_bytes_per_s"]), "startup_ns": _bound_only(0.0, "latency_lower")}, status_override="unmeasured")
     p["P19_direct_peer_window"] = _make_cell("P19_direct_peer_window", {"rate": "bytes_per_s", "latency": "ns"}, {"transport": "a5_ub_shmem_mte" if is_arch35 else "a3_sio_hccs", "token_payload_bytes_per_frame": 480, "token_wire_bytes_per_frame": 512}, {}, {"peer_bytes_per_s": _bound_only(spec["link_bytes_per_s"]), "status_sync_ns": _bound_only(0.0, "latency_lower")}, status_override="unmeasured")
     p["P20_host_dma_sync"] = _make_cell(
-        "P20_host_dma_sync", {"rate": "bytes_per_s", "latency": "ns"}, {"contention_scope": "root_complex"},
-        {"host_h2d_bytes_per_s": _band(p20r.get("host_h2d_bytes_per_s"), spec["host_h2d_bytes_per_s"]),
-         "host_d2h_bytes_per_s": _band(p20r.get("host_d2h_bytes_per_s"), spec["host_d2h_bytes_per_s"])},
+        "P20_host_dma_sync", {"rate": "bytes_per_s", "latency": "ns"}, {"contention_scope": "root_complex", **conflict_meta},
+        {"host_h2d_bytes_per_s": _band(p20r.get("host_h2d_bytes_per_s"), spec["host_h2d_bytes_per_s"], allow_meas=allow),
+         "host_d2h_bytes_per_s": _band(p20r.get("host_d2h_bytes_per_s"), spec["host_d2h_bytes_per_s"], allow_meas=allow)},
         {"host_rc_h2d_bytes_per_s": _bound_only(spec["host_rc_h2d_bytes_per_s"]), "host_rc_d2h_bytes_per_s": _bound_only(spec["host_rc_d2h_bytes_per_s"]),
-         "pinned_dma_startup_ns": _band(p20r.get("pinned_dma_startup_ns"), 0.0, kind="latency_lower"),
-         "pageable_dma_startup_ns": _band(p20r.get("pageable_dma_startup_ns"), 0.0, kind="latency_lower"),
-         "eager_d2h_sync_ns": _band(p20r.get("eager_d2h_sync_ns"), 0.0, kind="latency_lower")},
+         "pinned_dma_startup_ns": _band(p20r.get("pinned_dma_startup_ns"), 0.0, kind="latency_lower", allow_meas=allow),
+         "pageable_dma_startup_ns": _band(p20r.get("pageable_dma_startup_ns"), 0.0, kind="latency_lower", allow_meas=allow),
+         "eager_d2h_sync_ns": _band(p20r.get("eager_d2h_sync_ns"), 0.0, kind="latency_lower", allow_meas=allow)},
     )
 
     payload: dict[str, Any] = {
@@ -592,7 +609,10 @@ def _ssh_run(ep: dict[str, Any], remote_cmd: str, *, stdin_text: str | None = No
     if ep.get("identity_file"):
         cmd.extend(["-i", str(ep["identity_file"])])
     cmd.extend(["-l", str(ep.get("user", "root")), "--", str(ep["host"]), remote_cmd])
-    return subprocess.run(cmd, input=stdin_text, capture_output=True, text=True, timeout=timeout, check=False)
+    try:
+        return subprocess.run(cmd, input=stdin_text, capture_output=True, text=True, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired:
+        raise TimeoutError(f"bench_ssh_timeout:timeout_s={timeout}") from None
 
 
 def parse_npu_smi_idle_die(
@@ -611,6 +631,8 @@ def parse_npu_smi_idle_die(
             if int(cols[0]) == npu_id and int(cols[c_idx]) == chip_id:
                 logic_id = int(cols[l_idx])
                 break
+    if logic_id is None:
+        raise ValueError(f"bench_npu_mapping_missing:npu={npu_id}:chip={chip_id}")
     if visible_devices:
         if not SAFE_VISIBLE_RE.fullmatch(visible_devices):
             raise ValueError("bench_visible_devices_invalid")
@@ -620,32 +642,32 @@ def parse_npu_smi_idle_die(
         target_logic = vis_list[device_id]
     else:
         target_logic = device_id
-    if logic_id is not None and target_logic != logic_id:
+    if target_logic != logic_id:
         raise ValueError(f"bench_npu_die_mismatch:expected_logic={logic_id}:got={target_logic}")
-    # Extract target chip block (or whole block on single-chip A5).
     block = common_text
-    if f"Chip ID" in common_text:
+    if "Chip ID" in common_text:
         parts = re.split(r"(?m)^\s*Chip ID\s*:\s*", common_text)
         matched = [part for part in parts[1:] if re.match(rf"^{chip_id}(?!\d)", part.strip())]
-        if matched:
-            block = matched[0]
+        if not matched:
+            raise ValueError(f"bench_npu_common_missing:chip={chip_id}")
+        block = matched[0]
     def _int_field(label: str) -> int | None:
         m = re.search(rf"{re.escape(label)}\s*:\s*(\d+)", block)
         return int(m.group(1)) if m else None
-    aic_util = _int_field("Aicore Usage Rate(%)")
-    hbm_util = _int_field("HBM Usage Rate(%)")
-    aic_cnt = _int_field("Aicore Count")
-    aic_freq = _int_field("Aicore Freq(MHZ)")
-    cur_freq = _int_field("Aicore curFreq(MHZ)")
-    if aic_util is not None and aic_util > MAX_IDLE_AICORE_UTIL_PCT:
+    aic_util, hbm_util = _int_field("Aicore Usage Rate(%)"), _int_field("HBM Usage Rate(%)")
+    aic_cnt, aic_freq, cur_freq = _int_field("Aicore Count"), _int_field("Aicore Freq(MHZ)"), _int_field("Aicore curFreq(MHZ)")
+    if aic_util is None or hbm_util is None:
+        raise RuntimeError("bench_npu_telemetry_missing")
+    if aic_cnt is None or aic_cnt <= 0 or aic_freq is None or aic_freq <= 0:
+        raise RuntimeError("bench_npu_clock_missing")
+    if aic_util > MAX_IDLE_AICORE_UTIL_PCT:
         raise RuntimeError(f"bench_npu_busy:aicore_util={aic_util}")
-    if hbm_util is not None and hbm_util > MAX_IDLE_HBM_UTIL_PCT:
+    if hbm_util > MAX_IDLE_HBM_UTIL_PCT:
         raise RuntimeError(f"bench_npu_busy:hbm_util={hbm_util}")
     return {
         "npu_id": npu_id, "chip_id": chip_id, "chip_logic_id": target_logic,
         "aicore_util_pct": aic_util, "hbm_util_pct": hbm_util,
-        "observed_aic_count": aic_cnt, "observed_aicore_freq_mhz": aic_freq,
-        "observed_cur_freq_mhz": cur_freq,
+        "observed_aic_count": aic_cnt, "observed_aicore_freq_mhz": aic_freq, "observed_cur_freq_mhz": cur_freq,
     }
 
 

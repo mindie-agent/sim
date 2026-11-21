@@ -1,7 +1,7 @@
 {
   "arch_preset": "npu_arch_3510",
   "cann_version": "9.2.0",
-  "envelope_sha256": "03e866113d61d5c9ec4240b79a3604a9efc0256b6694e1bbaf923e66f8f0e9aa",
+  "envelope_sha256": "b64ccfa8797d19579a1582cf1281dcf728c5df591f6c972cc6cd10efbff324d4",
   "primitives": {
     "P01_datacopy": {
       "evidence_id": "capture://lab-a5-950dt/camp-202611-l0-a5dt/bd599ed7b72d4ce48fcd9af0d5ca4b0c630c069f6c1ad2066fa4ef0e51622300",
@@ -696,11 +696,11 @@
         },
         "host_d2h_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 128000000000.0
+          "certified_upper_capacity": 100150000000.0
         },
         "host_h2d_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 128000000000.0
+          "certified_upper_capacity": 100010000000.0
         },
         "host_rc_d2h_bytes_per_s": {
           "bound_kind": "rate_upper",
@@ -734,7 +734,7 @@
     "calibrated": true,
     "campaign_id": "camp-202611-l0-a5dt",
     "capture_uri": "capture://lab-a5-950dt/camp-202611-l0-a5dt/bd599ed7b72d4ce48fcd9af0d5ca4b0c630c069f6c1ad2066fa4ef0e51622300",
-    "collected_utc": "2026-11-21T00:05:59Z",
+    "collected_utc": "2026-11-21T01:05:25Z",
     "endpoint_alias": "lab-a5-950dt",
     "silicon_fingerprint": {
       "aic_count": 32,

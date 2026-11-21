@@ -136,32 +136,46 @@ class AdmissionMemoryView:
         self._resident.pop(entry.key, None)
         self._resident[entry.key] = entry
 
-    def _evict_over_capacity(self, die: int, *, protect_key: ReuseKey | None = None) -> None:
-        eff = self.effective_l2_bytes(die)
-        avail = max(0, self._l2_capacity[die] - self.reserved_bytes(die))
-        for entry in list(self._resident.values()):
+    def _eviction_victims(
+        self, die: int, eff: int, avail: int, *, protect_key: ReuseKey | None = None,
+    ) -> list[_ResidentL2Entry]:
+        """Pure read-only LRU victim list matching exact over-capacity eviction rules."""
+        victims: list[_ResidentL2Entry] = []
+        evicted: set[ReuseKey] = set()
+        for entry in self._resident.values():
             if entry.key.die == die and not entry.evicted and entry.working_set_bytes > eff:
-                self._settle_eviction(entry)
-        # Enforce aggregate per-stream budget <= eff (LRU eviction).
+                victims.append(entry)
+                evicted.add(entry.key)
         by_stream: dict[str, list[_ResidentL2Entry]] = {}
         for entry in self._resident.values():
-            if entry.key.die == die and not entry.evicted:
+            if entry.key.die == die and not entry.evicted and entry.key not in evicted:
                 by_stream.setdefault(entry.key.reuse_stream, []).append(entry)
         for entries in by_stream.values():
             total = sum(e.working_set_bytes for e in entries)
             for victim in sorted(entries, key=lambda e: e.key == protect_key):
                 if total <= eff:
                     break
-                self._settle_eviction(victim)
+                victims.append(victim)
+                evicted.add(victim.key)
                 total -= victim.working_set_bytes
-        # Enforce aggregate per-die budget <= avail (LRU eviction).
-        live = [e for e in self._resident.values() if e.key.die == die and not e.evicted]
+        live = [
+            e for e in self._resident.values()
+            if e.key.die == die and not e.evicted and e.key not in evicted
+        ]
         total_die = sum(e.working_set_bytes for e in live)
         for victim in sorted(live, key=lambda e: e.key == protect_key):
             if total_die <= avail:
                 break
-            self._settle_eviction(victim)
+            victims.append(victim)
+            evicted.add(victim.key)
             total_die -= victim.working_set_bytes
+        return victims
+
+    def _evict_over_capacity(self, die: int, *, protect_key: ReuseKey | None = None) -> None:
+        eff = self.effective_l2_bytes(die)
+        avail = max(0, self._l2_capacity[die] - self.reserved_bytes(die))
+        for victim in self._eviction_victims(die, eff, avail, protect_key=protect_key):
+            self._settle_eviction(victim)
 
     def pending_writebacks(self, die: int) -> tuple[DirtyWriteback, ...]:
         return tuple(self._pending_writebacks.get(die, ()))
@@ -261,6 +275,8 @@ class AdmissionMemoryView:
         eff: int,
         req_cov: SectorCoverage,
         working_set: int,
+        *,
+        evicted_keys: set[ReuseKey] | frozenset[ReuseKey] = frozenset(),
     ) -> tuple[int, int]:
         """Shared read-only hit/miss decision for both preview and commit."""
         existing = self._resident.get(pattern.reuse_key)
@@ -268,6 +284,7 @@ class AdmissionMemoryView:
         if pattern.direction == "read":
             if (
                 existing is not None and not existing.evicted
+                and pattern.reuse_key not in evicted_keys
                 and existing.version == pattern.version
                 and existing.working_set_bytes <= eff and working_set <= eff
             ):
@@ -298,13 +315,17 @@ class AdmissionMemoryView:
         if key.die not in self._l2_capacity:
             raise ModelingError(f"l2_die_undeclared:{key.die}")
         eff = self._preview_effective_l2(key)
+        avail = max(0, self._l2_capacity[key.die] - self.reserved_bytes(key.die))
+        evicted_keys = {e.key for e in self._eviction_victims(key.die, eff, avail)}
         req_cov = pattern.runs.sector_coverage()
         working_set = max(
             pattern.reuse_distance_bytes
             if pattern.reuse_distance_bytes is not None else aligned_bytes,
             req_cov.measure_bytes(),
         )
-        return self._classify_access(pattern, aligned_bytes, eff, req_cov, working_set)
+        return self._classify_access(
+            pattern, aligned_bytes, eff, req_cov, working_set, evicted_keys=evicted_keys,
+        )
 
     def resident_coverage_for(
         self, pattern: MemoryAccessPattern, aligned_bytes: int,
@@ -324,11 +345,13 @@ class AdmissionMemoryView:
             and not existing.evicted and existing.version == pattern.version
         ):
             eff = self._preview_effective_l2(key)
+            avail = max(0, self._l2_capacity[key.die] - self.reserved_bytes(key.die))
+            evicted_keys = {e.key for e in self._eviction_victims(key.die, eff, avail)}
             ws = max(
                 pattern.reuse_distance_bytes if pattern.reuse_distance_bytes is not None else aligned_bytes,
                 req_cov.measure_bytes(),
             )
-            if existing.working_set_bytes <= eff and ws <= eff:
+            if key not in evicted_keys and existing.working_set_bytes <= eff and ws <= eff:
                 return existing.resident_coverage
         return SectorCoverage()
 
@@ -407,6 +430,8 @@ class AdmissionMemoryView:
                 self._evict_over_capacity(key.die, protect_key=key)
                 return hit_b, miss_b
             if not is_last_use and working_set <= eff:
+                if existing is not None and not existing.evicted:
+                    self._settle_eviction(existing)
                 self._touch_resident(_ResidentL2Entry(
                     key=key, working_set_bytes=working_set, version=pattern.version,
                     dirty=False, private_workspace=pattern.visibility.private_workspace,
@@ -444,6 +469,8 @@ class AdmissionMemoryView:
             self._evict_over_capacity(key.die, protect_key=key)
             return hit_b, miss_b
         if not is_last_use and working_set <= eff:
+            if existing is not None and not existing.evicted:
+                self._settle_eviction(existing)
             self._touch_resident(_ResidentL2Entry(
                 key=key, working_set_bytes=working_set, version=pattern.version,
                 dirty=False, private_workspace=False, evicted=False,

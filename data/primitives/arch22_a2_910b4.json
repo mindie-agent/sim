@@ -1,7 +1,7 @@
 {
   "arch_preset": "npu_arch_2201",
   "cann_version": "unmeasured",
-  "envelope_sha256": "27f0edb9f9b344bce5973b6b30bcd5036808319c6c335de90daa239bcab4a8a6",
+  "envelope_sha256": "d82df0311a8c907887fd9486139d2aa8e02fbf5d49fefd623bb9d9322f7bc008",
   "primitives": {
     "P01_datacopy": {
       "evidence_id": "",
@@ -556,11 +556,11 @@
         },
         "host_d2h_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 31500000000.0
+          "certified_upper_capacity": 28700000000.0
         },
         "host_h2d_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 31500000000.0
+          "certified_upper_capacity": 25500000000.0
         },
         "host_rc_d2h_bytes_per_s": {
           "bound_kind": "rate_upper",
@@ -594,7 +594,7 @@
     "calibrated": false,
     "campaign_id": "camp-202611-l0-a2",
     "capture_uri": "capture://lab-a2-910b4/camp-202611-l0-a2/3508378527b55e7282df79cf6a71e43b3b2273c390cc3cac45bd14c9c85960c9",
-    "collected_utc": "2026-11-21T00:05:44Z",
+    "collected_utc": "2026-11-21T01:05:25Z",
     "endpoint_alias": "lab-a2-910b4",
     "silicon_fingerprint": {
       "aic_count": 20,

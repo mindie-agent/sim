@@ -1,7 +1,7 @@
 {
   "arch_preset": "npu_arch_3510",
   "cann_version": "unmeasured",
-  "envelope_sha256": "7210fe2a0945a3ae7576bf3f605b14190e7212d88003925f0c1609a731beb510",
+  "envelope_sha256": "fea871ba428734e6c7f307812082ffc4686a820146026115de5bcc367bf2a997",
   "primitives": {
     "P01_datacopy": {
       "evidence_id": "",
@@ -629,7 +629,7 @@
     "calibrated": false,
     "campaign_id": "camp-202611-l0-a5pr",
     "capture_uri": "capture://lab-a5-950pr/camp-202611-l0-a5pr/7e9b2da7383afdd9e1678c01f9812162a9b74a3dddf6fe770488727344677e0a",
-    "collected_utc": "2026-11-21T00:05:44Z",
+    "collected_utc": "2026-11-21T01:05:25Z",
     "endpoint_alias": "lab-a5-950pr",
     "silicon_fingerprint": {
       "aic_count": 32,

@@ -10,7 +10,7 @@
       "compatible_skus": [
         "Ascend910B4"
       ],
-      "envelope_sha256": "27f0edb9f9b344bce5973b6b30bcd5036808319c6c335de90daa239bcab4a8a6",
+      "envelope_sha256": "d82df0311a8c907887fd9486139d2aa8e02fbf5d49fefd623bb9d9322f7bc008",
       "file": "arch22_a2_910b4.json",
       "sku": "Ascend910B4",
       "total_primitives": 20
@@ -24,21 +24,21 @@
       "compatible_skus": [
         "Ascend910_9362"
       ],
-      "envelope_sha256": "65546eb12398fd551e83e4ddc6eb4177870065c7365efd8603bb6bc14827c267",
+      "envelope_sha256": "f3e9e2180ddd2e6afaa9396b89e493d0892389406ed595603e9e197f43ccc880",
       "file": "arch22_a3_9362.json",
       "sku": "Ascend910_9362",
       "total_primitives": 20
     },
     "Ascend910_9382": {
       "arch_preset": "npu_arch_2201",
-      "calibrated": true,
-      "calibrated_primitive_count": 1,
+      "calibrated": false,
+      "calibrated_primitive_count": 0,
       "cann_version": "9.2.1",
       "capture_uri": "capture://lab-a3-9382/camp-202611-l0-a3-9382/abbc7ec1573986f0062b647c3151303178b15310dfe96a0968931d73ad5238d6",
       "compatible_skus": [
         "Ascend910_9382"
       ],
-      "envelope_sha256": "73b1738a5e1d27b5c5814a32815274ea0011dfad8344a44714aee9788cbb66da",
+      "envelope_sha256": "e260f807806451da2e4a942b289e2dd38edc0eefe6abf67f196af36dd050b1d1",
       "file": "arch22_a3_9382.json",
       "sku": "Ascend910_9382",
       "total_primitives": 20
@@ -52,7 +52,7 @@
       "compatible_skus": [
         "Ascend950DT_9582"
       ],
-      "envelope_sha256": "03e866113d61d5c9ec4240b79a3604a9efc0256b6694e1bbaf923e66f8f0e9aa",
+      "envelope_sha256": "b64ccfa8797d19579a1582cf1281dcf728c5df591f6c972cc6cd10efbff324d4",
       "file": "arch35_a5_950dt.json",
       "sku": "Ascend950DT_9582",
       "total_primitives": 20
@@ -66,7 +66,7 @@
       "compatible_skus": [
         "Ascend950PR_9579"
       ],
-      "envelope_sha256": "7210fe2a0945a3ae7576bf3f605b14190e7212d88003925f0c1609a731beb510",
+      "envelope_sha256": "fea871ba428734e6c7f307812082ffc4686a820146026115de5bcc367bf2a997",
       "file": "arch35_a5_950pr.json",
       "sku": "Ascend950PR_9579",
       "total_primitives": 20

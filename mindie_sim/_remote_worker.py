@@ -22,11 +22,12 @@ import os
 from pathlib import Path
 import shutil
 import sys
+import tempfile
 import threading
 import time
 
 from mindie_sim.remote_exec import (
-    ENTRYPOINTS, FILE_LIMIT, MANIFEST, PROTOCOL_VERSION, READY, REQUEST_LIMIT,
+    ENTRYPOINTS, FILE_LIMIT, MANIFEST, PRIVATE_DIR, PROTOCOL_VERSION, READY, REQUEST_LIMIT,
     RESULT_LIMIT, UUID_TOKEN, WORKER_MEMORY_MIB, _active_leases,
     _boot, _bounded_read, _exchange, _pin,
     _canonical, _create_lease, _digest_lock, _lock, _manifest, _native_root,
@@ -36,6 +37,7 @@ from mindie_sim.remote_exec import (
 WINDOWS_POOL_LIMIT = 61  # Windows WaitForMultipleObjects capacity in concurrent.futures.
 MIN_SHM_BYTES = 256 * 1024 * 1024
 MIN_PYTHON = (3, 11)
+DEFAULT_PRIMITIVE_MANIFEST = "data/primitives/manifest.json"
 ENV_LOCK = threading.RLock()
 
 @dataclass(frozen=True, slots=True)
@@ -146,15 +148,10 @@ print(json.dumps(dict(_linux_capacity(), compiler=hashlib.sha256(
 """
 def _probe_remote(endpoint, policy):
     deadline = time.monotonic() + policy.probe_timeout_s
-    try:
-        pinned = _pin(endpoint, deadline)
-        source = (f"MIN_PYTHON={MIN_PYTHON!r}\nMIN_SHM_BYTES={MIN_SHM_BYTES}\n"
-                  + inspect.getsource(_linux_capacity) + _PROBE)
-        return pinned, json.loads(_exchange(pinned, _boot(source), b"", _remaining(deadline)))
-    except TimeoutError:
-        from mindie_sim.remote_exec import RemoteExecUnavailableError
-
-        raise RemoteExecUnavailableError("probe_unavailable") from None
+    pinned = _pin(endpoint, deadline)
+    source = (f"MIN_PYTHON={MIN_PYTHON!r}\nMIN_SHM_BYTES={MIN_SHM_BYTES}\n"
+              + inspect.getsource(_linux_capacity) + _PROBE)
+    return pinned, json.loads(_exchange(pinned, _boot(source), b"", _remaining(deadline)))
 def _local_ready():
     from mindie_sim.prediction.runtime.accel_loader import cached_library_ready
     return cached_library_ready()
@@ -199,13 +196,41 @@ def _prepare_native(stage_root, *, build=False):
                 raise ValueError("validated native library unavailable")
         if not build:
             raise RuntimeError("staged native library unavailable")
-        if root.exists():
-            _private_dir(root)
-            shutil.rmtree(root)
-        _private_dir(root)
-        status = accel_build.build_accel()
-        accel_loader.load_accel_cdll(status)
-        seal.write_bytes(_manifest(root, sorted(p for p in root.rglob("*") if p.is_file())))
+        tmp_root = Path(tempfile.mkdtemp(dir=stage.parent, prefix=f".native.{stage.name}.build-"))
+        old_root: Path | None = None
+        try:
+            if os.name == "posix":
+                os.chmod(tmp_root, PRIVATE_DIR)
+            os.environ["MINDIE_CACHE_HOME"] = str(tmp_root)
+            status = accel_build.build_accel()
+            accel_loader.load_accel_cdll(status)
+            tmp_res = tmp_root.resolve()
+            for sidecar in tmp_root.rglob("*.json"):
+                meta = json.loads(sidecar.read_text(encoding="utf-8"))
+                if isinstance(meta, dict) and isinstance(meta.get("library"), str):
+                    lib = Path(meta["library"]).resolve()
+                    if lib.is_relative_to(tmp_res):
+                        meta["library"] = str(root / lib.relative_to(tmp_res))
+                        sidecar.write_text(json.dumps(meta, sort_keys=True), encoding="utf-8")
+            (tmp_root / MANIFEST).write_bytes(_manifest(tmp_root, sorted(p for p in tmp_root.rglob("*") if p.is_file())))
+            if root.exists():
+                old_root = Path(tempfile.mkdtemp(dir=stage.parent, prefix=f".native.{stage.name}.old-"))
+                root.rename(old_root / "prev")
+            tmp_root.rename(root)
+            tmp_root = None
+            os.environ["MINDIE_CACHE_HOME"] = str(root)
+            if old_root is not None:
+                shutil.rmtree(old_root, ignore_errors=True)
+                old_root = None
+        except BaseException:
+            if old_root is not None and not root.exists() and (old_root / "prev").exists():
+                (old_root / "prev").rename(root)
+            if old_root is not None:
+                shutil.rmtree(old_root, ignore_errors=True)
+            if tmp_root is not None:
+                shutil.rmtree(tmp_root, ignore_errors=True)
+            os.environ["MINDIE_CACHE_HOME"] = str(root)
+            raise
 
 @contextmanager
 def _job_lease(stage, request_id):
@@ -227,15 +252,19 @@ def _init_worker(stage_root, primitive_manifest_path):
         os.environ["MINDIE_CACHE_HOME"] = str(_native_root(stage))
         os.environ.pop("MINDIE_SIM_ACCEL_SO", None)
         _prepare_native(stage)
-    if primitive_manifest_path:
-        from mindie_sim.primitives.loader import load_manifest, load_primitives
+    from mindie_sim.primitives.loader import load_manifest, load_primitives
 
-        path = Path(stage_root or Path(__file__).parents[1]) / _safe_path(primitive_manifest_path)
-        if path.name != "manifest.json":
-            raise ValueError("invalid primitive manifest")
-        manifest = load_manifest(path.parent)
-        for sku in manifest["tables"]:
-            load_primitives(sku, primitives_dir=path.parent)
+    rel = primitive_manifest_path or DEFAULT_PRIMITIVE_MANIFEST
+    path = Path(stage_root or Path(__file__).parents[1]) / _safe_path(rel)
+    if path.name != "manifest.json":
+        raise ValueError("invalid primitive manifest")
+    manifest = load_manifest(path.parent)
+    for sku in manifest["tables"]:
+        load_primitives(sku, primitives_dir=path.parent)
+def _thaw(value):
+    return tuple(_thaw(item) for item in value) if isinstance(value, list) else value
+
+
 def _lowering(raw):
     from mindie_sim.prediction.results import StepRequest
     from mindie_sim.schema.operators import OpSpec
@@ -248,8 +277,10 @@ def _lowering(raw):
     fields["iterations"] = tuple((rank, IterationPlan(**{
         **plan, "requests": tuple(RequestView(**view) for view in plan["requests"]),
     })) for rank, plan in fields.get("iterations", ()))
-    fields["declared_ops"] = tuple(RankOps(row["replica"], tuple(OpSpec(**op) for op in row["ops"]))
-                                   for row in fields.get("declared_ops", ()))
+    fields["declared_ops"] = tuple(
+        RankOps(row["replica"], tuple(OpSpec(**{k: _thaw(v) for k, v in op.items()}) for op in row["ops"]))
+        for row in fields.get("declared_ops", ())
+    )
     return LoweringRequest(**fields)
 def _candidate(entrypoint, base, candidate, deadline):
     from mindie_sim.prediction.evaluation import ACTIVE_DEADLINE_MONO, check_active_deadline

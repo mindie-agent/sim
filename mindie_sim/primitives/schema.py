@@ -506,35 +506,59 @@ def _submit_stars_plan(engine, stars_spec, stars_plan, after, name):
     return done_events[-1] if len(done_events) == 1 else engine.boundary(f"{name}:complete", after=tuple(done_events))
 
 
-def _stars_plan_span_ms(stars_spec, stars_plan) -> float:
+def _scratch_resources(rows, ctx, caps=None):
+    from mindie_sim.prediction.runtime.engine import Resource
+
+    role_by_row = {v: k for k, v in getattr(ctx, "resource_names", {}).items()} if ctx is not None else {}
+    rates = getattr(ctx, "rates", {}) if ctx is not None else {}
+    units_map = getattr(ctx, "resource_units", {}) if ctx is not None else {}
+    caps = caps or {}
+    out = []
+    for row in dict.fromkeys(rows):
+        if row in rates:
+            role = role_by_row.get(row, row)
+            units = units_map.get(row, units_map.get(role, 1))
+            out.append(Resource(row, float(rates[row]), units=int(units)))
+        else:
+            out.append(Resource(row, float(caps.get(row, 1.0))))
+    return out
+
+
+def _stars_plan_span_ms(stars_spec, stars_plan, *, ctx=None) -> float:
     from mindie_sim.prediction.runtime.engine import Engine
 
-    scratch = Engine((), backend="python")
+    needed = [row for _, _, _, work in stars_plan[2] for row in work]
+    scratch = Engine(_scratch_resources(needed, ctx), backend="python")
     done = _submit_stars_plan(scratch, stars_spec, stars_plan, (), "stars")
     scratch.advance(until=(done,))
     return float(done.time)
 
 
 def _program_span_ms(program: KernelProgram, ctx: Any) -> float:
-    """Derive exact isolated DAG span of a nested ``KernelProgram``."""
-    times: dict[str, float] = {}
-    for stage in program.stages:
-        ready = max((times.get(dep, 0.0) for dep in stage.after), default=0.0)
-        dur = float(stage.latency)
-        for row, amount in stage.work.items():
-            if not amount:
-                continue
-            rate = stage.caps.get(row)
-            if ctx is not None and row in ctx.rates:
-                units = ctx.resource_units.get(row, 1)
-                placed = stage.placement.get(row)
-                phys = float(ctx.rates[row]) * (len(placed) / units if placed else 1.0)
-                rate = min(phys, float(rate)) if rate else phys
-            dur = max(dur, float(amount) / (float(rate) if rate else 1.0))
-        if stage.program is not None:
-            dur = max(dur, _program_span_ms(stage.program, ctx))
-        times[stage.name] = ready + dur
-    return max(times.values(), default=0.0)
+    """Derive exact isolated span of a nested ``KernelProgram`` via ``Engine``."""
+    from mindie_sim.prediction.runtime.engine import Engine
+
+    rows, caps, pools = [], {}, {}
+    def _walk(prog):
+        for st in prog.stages:
+            for row in st.work:
+                rows.append(row)
+                if row in st.caps:
+                    caps[row] = max(caps.get(row, 0.0), float(st.caps[row]))
+            for pool, sz in getattr(st, "acquire", ()):
+                pools[pool] = pools.get(pool, 0.0) + float(sz)
+            if st.program is not None:
+                _walk(st.program)
+    _walk(program)
+    if ctx is not None and getattr(ctx, "pool_names", None) and getattr(ctx, "pool_capacities", None):
+        for role, cap in ctx.pool_capacities.items():
+            pname = ctx.pool_names.get(role)
+            if pname:
+                pools[pname] = float(cap)
+    scratch = Engine(_scratch_resources(rows, ctx, caps), backend="python", pools=pools or None)
+    done = program.start(scratch, "span", scratch.submit("span:start"))
+    scratch.advance(until=(done,))
+    return float(done.time)
 
 
 @dataclass(frozen=True, slots=True)

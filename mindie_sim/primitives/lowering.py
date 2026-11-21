@@ -66,17 +66,12 @@ MAX_MUTEX_IDS = 28
 TOKEN_FRAME_PAYLOAD_BYTES = 480
 TOKEN_FRAME_WIRE_BYTES = 512
 _ROW_FALLBACKS = {
-    "vec_issue": ("vec_issue", "pipe_v_issue", "vector"),
-    "vec_alu": ("vec_alu", "reg_alu_lanes", "vector"),
-    "vec_sfu": ("vec_sfu", "reg_special_lanes", "vector"),
-    "vec_reduce": ("vec_reduce", "reg_reduce_lanes", "vector"),
-    "vbitsort32": ("vbitsort32", "vector"),
-    "vmrgsort4": ("vmrgsort4", "vector"),
-    "vhist256": ("vhist256", "vector"),
-    "simt": ("simt", "vector"),
+    "vec_issue": ("vec_issue", "pipe_v_issue", "vector"), "vec_alu": ("vec_alu", "reg_alu_lanes", "vector"),
+    "vec_sfu": ("vec_sfu", "reg_special_lanes", "vector"), "vec_reduce": ("vec_reduce", "reg_reduce_lanes", "vector"),
+    "vbitsort32": ("vbitsort32", "vector"), "vmrgsort4": ("vmrgsort4", "vector"),
+    "vhist256": ("vhist256", "vector"), "simt": ("simt", "vector"),
 }
-def _ceil(value: int, unit: int) -> int:
-    return (value + unit - 1) // unit
+def _ceil(value: int, unit: int) -> int: return (value + unit - 1) // unit
 
 
 def submit_lowered_primitive(engine, result, *, after=(), memory_state=None, pattern=None, name_prefix=""):
@@ -87,24 +82,18 @@ def submit_lowered_primitive(engine, result, *, after=(), memory_state=None, pat
 class _Lowering:
     def __init__(self, primitive_id, params, table, datapath, context, memory_state, role, allow):
         self.pid, self.p, self.table = primitive_id, params, table
-        self.dp, self.ctx, self.state = datapath, context, memory_state
-        self.role, self.allow = role, allow
+        self.dp, self.ctx, self.state, self.role, self.allow = datapath, context, memory_state, role, allow
         self.cell = table.cell(primitive_id)
         self.stages, self.times, self.meta, self.extra = [], {}, {}, {}
-        self.warnings = list(table.warnings)
-        self.live = None
-        self.stars_plan = None
+        self.warnings, self.live, self.stars_plan = list(table.warnings), None, None
         self.req_res: dict[str, tuple[str, float, str, int]] = {}
 
     def gap(self, code):
-        raise UnmodeledCapabilityError(capability=self.pid, entry="lower_primitive",
-                                       code=code, message=f"{self.pid} requires {code}")
+        raise UnmodeledCapabilityError(capability=self.pid, entry="lower_primitive", code=code, message=f"{self.pid} requires {code}")
 
-    def get(self, key, default=None):
-        return self.p.get(key, self.cell.parameters.get(key, default))
+    def get(self, key, default=None): return self.p.get(key, self.cell.parameters.get(key, default))
 
-    def integer(self, key, default=0, minimum=0):
-        return _int(self.get(key, default), key, minimum)
+    def integer(self, key, default=0, minimum=0): return _int(self.get(key, default), key, minimum)
 
     def value(self, metric, default=None, *, mode=None, pid=None):
         if mode is None and (pid is None or pid == self.pid):
@@ -115,29 +104,30 @@ class _Lowering:
 
     def speed(self, metric, **kwargs):
         rate = self.value(metric, **kwargs) * BYTES_PER_S_TO_MS
-        if rate <= 0:
-            self.gap(f"positive_rate_required:{metric}")
+        if rate <= 0: self.gap(f"positive_rate_required:{metric}")
         return rate
 
     def owner(self, kind):
         owner = self.integer(f"{kind}_id", self.get("owner", 0))
-        count = getattr(self.dp or self.table.provenance.silicon_fingerprint, f"{kind}_count")
-        if owner >= count:
+        if owner >= getattr(self.dp or self.table.provenance.silicon_fingerprint, f"{kind}_count"):
             raise ModelingError(f"primitive_owner_out_of_range:{kind}:{owner}")
         return owner
 
-    def row(self, key):
+    def _resolve_row(self, key):
         if self.ctx is None:
-            return key
+            return key, key
         for cand in _ROW_FALLBACKS.get(key, (key,)):
             if cand in self.ctx.resource_names:
-                return self.ctx.resource_names[cand]
-        return key
+                return cand, self.ctx.resource_names[cand]
+        return key, key
+
+    def row(self, key): return self._resolve_row(key)[1]
 
     def _ctx_owner_rate(self, role: str, row: str, owner: int | None) -> float | None:
         if self.ctx is None or row not in self.ctx.rates:
             return None
-        units = self.ctx.resource_units.get(row, self.ctx.resource_units.get(role, 1))
+        phys, _ = self._resolve_row(role)
+        units = self.ctx.resource_units.get(row, self.ctx.resource_units.get(phys, self.ctx.resource_units.get(role, 1)))
         return float(self.ctx.rates[row]) / float(units if owner is not None else 1)
 
     def append(self, stage, duration=None):
@@ -465,6 +455,8 @@ def _vector(b):
                     b.req_res.setdefault(row, (row, float(orig_rates[key]), "ops", 1))
             if key in stage.placement:
                 place_map[row] = stage.placement[key]
+            elif owner is not None:
+                place_map[row] = (owner,)
         mapped_stages.append(replace(stage, work=work_map, caps=caps_map, placement=place_map, deliveries=tuple(delivs)))
     stages = tuple(mapped_stages)
     b.stages.extend(stages)
@@ -653,7 +645,11 @@ def _stars(b):
                dict(d.get("work", {}))) for d in raw_descs)
     )
     b.stars_plan = (die, ns, descs)
-    b.delay("descriptor_issue", ms=_stars_plan_span_ms(spec, b.stars_plan))
+    for _, _, _, work in descs:
+        for row in work:
+            if b.ctx is None or row not in b.ctx.rates:
+                b.req_res.setdefault(row, (row, 1.0, "work", 1))
+    b.delay("descriptor_issue", ms=_stars_plan_span_ms(spec, b.stars_plan, ctx=b.ctx))
 
 
 def _streams(b):
@@ -728,27 +724,27 @@ def _collective(b):
 def _peer(b):
     tokens = tuple(_int(size, "token_payload_bytes") for size in b.get("token_payload_bytes", ()))
     rank, target = b.integer("die"), b.integer("peer", 1)
-    if target == rank:
-        raise ModelingError("primitive_peer_self_invalid")
-    explicit_edges = b.get("peer_edges")
-    edges = tuple(explicit_edges) if explicit_edges is not None else (b.dp.ub_peer_edges if b.dp is not None else ())
-    if (b.dp is not None or explicit_edges is not None) and (rank, target) not in edges:
+    if target == rank: raise ModelingError("primitive_peer_self_invalid")
+    explicit_edges, dp_edges = b.get("peer_edges"), (b.dp.ub_peer_edges if b.dp is not None else None)
+    if explicit_edges is not None:
+        edges = tuple((int(u), int(v)) for u, v in explicit_edges)
+        if dp_edges is not None and not set(edges).issubset(set(dp_edges)): b.gap("direct_peer_edge_required")
+    else:
+        edges = dp_edges or ()
+    if (dp_edges is not None or explicit_edges is not None) and (rank, target) not in edges:
         b.gap("direct_peer_edge_required")
     payload_frame = b.integer("token_payload_bytes_per_frame", TOKEN_FRAME_PAYLOAD_BYTES, 1)
     wire_frame = b.integer("token_wire_bytes_per_frame", TOKEN_FRAME_WIRE_BYTES, 1)
     policy = b.get("short_final_frame_policy", "pad_full_frame")
     wire = sum(frame_wire_bytes(size, payload_frame, wire_frame, policy)[0] for size in tokens)
     status = b.integer("status_bytes")
-    pack = b.delay("pack", "pack_ns")
-    frame = b.delay("per_token_frame", "frame_ns", (pack,), metadata={"wire_bytes": wire})
+    frame = b.delay("per_token_frame", "frame_ns", (b.delay("pack", "pack_ns"),), metadata={"wire_bytes": wire})
     rate = b.speed("peer_bytes_per_s")
     rows = (b.get("peer_resource", f"peer:{rank}->{target}"), b.get("endpoint_resource", f"peer_egress:d{rank}"))
-    fanout = sum(src == rank for src, _ in edges)
-    endpoint_rate = b.speed("endpoint_bytes_per_s", default=rate * MS_PER_SECOND * b.integer("fanout", max(1, fanout), 1))
+    endpoint_rate = b.speed("endpoint_bytes_per_s", default=rate * MS_PER_SECOND * b.integer("fanout", max(1, sum(src == rank for src, _ in edges)), 1))
     transfer = b.work("transfer", ((rows[0], wire, rate), (rows[1], wire, endpoint_rate)), (frame,))
     sent = b.work("status", ((rows[0], status, rate), (rows[1], status, endpoint_rate)), (transfer,))
-    synced = b.delay("status_sync", "status_sync_ns", (sent,))
-    b.delay("unpack", "unpack_ns", (synced,))
+    b.delay("unpack", "unpack_ns", (b.delay("status_sync", "status_sync_ns", (sent,)),))
     b.meta.update(wire_bytes=wire + status, token_wire_bytes=wire)
 
 

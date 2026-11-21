@@ -41,7 +41,7 @@ from mindie_sim.schema.hardware_links import UNCALIBRATED_SKU_WARNING
 pytestmark = pytest.mark.tier0
 
 PRIMITIVES_DIR = default_primitives_dir()
-HOST_DMA_SKU = "Ascend910_9382"
+HOST_DMA_SKU = "Ascend910_9362"
 CALIBRATED_REGISTER_SKU = "Ascend950DT_9582"
 PRIVATE_SOURCE = re.compile(r'(?<![\d.])(?:\d{1,3}[._-]){3}\d{1,3}(?![\d.])'
                             r'|@|/(?:Users|home|root)/|\$\{?HOME\b|\b(?:username|user_name)\b')
@@ -152,15 +152,23 @@ def test_cache_policy_bypass_preserves_residency_and_last_use_retires_it():
     assert state.preview_access(priv, 32) == state.admit_access(priv, 32) == (0, 32)
     cap_state = AdmissionMemoryView({0: 512})
     k1, k2 = ReuseKey(0, "a", 0, "main"), ReuseKey(0, "b", 0, "main")
-    cap_state.admit_access(_read(k1, AddressRun(0, 1, 384, 384)), 384)
-    cap_state.admit_access(_read(k2, AddressRun(0, 1, 384, 384)), 384)
-    assert not cap_state.is_resident(k1) and cap_state.is_resident(k2)
+    r1, r2 = _read(k1, AddressRun(0, 1, 192, 192)), _read(k2, AddressRun(0, 1, 192, 192))
+    cap_state.admit_access(r1, 192); cap_state.admit_access(r2, 192)
+    cap_state.exit_stream(0, "main"); cap_state.enter_stream(0, "aux")
+    assert cap_state.preview_access(r1, 192) == cap_state.admit_access(r1, 192) == (0, 192) and cap_state.is_resident(k1) and not cap_state.is_resident(k2)
+    wt_state, kw = AdmissionMemoryView({0: 512}), ReuseKey(0, "w", 0, "main")
+    assert wt_state.admit_access(MemoryAccessPattern("w", 0, 0, 0, "write", "mte3", 32, AddressRunPlan((AddressRun(0, 1, 32, 32),)), kw, visibility=vis), 32) == (32, 0)
+    assert wt_state.admit_access(MemoryAccessPattern("w", 0, 0, 0, "write", "mte3", 32, AddressRunPlan((AddressRun(32, 1, 32, 32),)), kw, visibility=VisibilityContract(private_workspace=False, live_out=True)), 32) == (0, 32)
+    assert [wb.bytes for wb in wt_state.drain_writebacks(0)] == [32]
 
 
 def test_periodic_sector_coverage_excludes_stride_gaps_and_hits_identical_reads():
     key, amount = ReuseKey(0, "strided", 0), 5000 * 32
     c0, c1 = (AddressRunPlan((AddressRun(b, 5000, 1, 64),)).sector_coverage() for b in (0, 1))
     assert c0.overlap_bytes(c1) == c0.union(c1).measure_bytes() == amount
+    assert AddressRunPlan((AddressRun(0, 5000, 64, 96),)).sector_coverage().overlap_bytes(
+        AddressRunPlan((AddressRun(160, 5000, 64, 96),)).sector_coverage()) == 159936
+    assert AddressRunPlan((AddressRun(0, 5000, 1, 64), AddressRun(1, 5000, 1, 64))).dram_sector_and_service() == (amount, float(amount))
     read, gap = _read(key, AddressRun(0, 5000, 32, 64)), _read(key, AddressRun(32, 1, 32, 32))
     assert read.runs.sector_intervals() != ((0, 320000),) and read.runs.sector_coverage().measure_bytes() == amount
     state = AdmissionMemoryView({0: 256 * 1024})
@@ -315,31 +323,27 @@ def test_mte3_direct_l1_route_and_one_read_modify_write_charge(memory_device, re
     old_table, old_dp = memory_device
     table, dp = register_device
     pid, params = "P04_mte3_store", {"dst": "l1", "bytes": 33}
-    with pytest.raises(UnmodeledCapabilityError, match="datapath_route_unsupported:ub->l1"):
-        _lower(pid, params, old_table, datapath=old_dp)
+    with pytest.raises(UnmodeledCapabilityError, match="datapath_route_unsupported:ub->l1"): _lower(pid, params, old_table, datapath=old_dp)
     engine = _run(_lower(pid, params, table, datapath=dp))
     assert engine.serviced["mte3"] == pytest.approx(64) and not engine.delivered
     atomic = _lower(pid, {"bytes": 33, "atomic": True}, table, datapath=dp)
     assert atomic.bound_access.ledger.dram_sector_bytes == 2 * 64
     engine = _run(atomic)
-    for row in ("mte3", "hbm_read@d0", "hbm_write@d0"):
-        assert engine.delivered[row] == pytest.approx(64)
+    assert all(engine.delivered[row] == pytest.approx(64) for row in ("mte3", "hbm_read@d0", "hbm_write@d0"))
 
 
 def test_l2_knee_counts_distinct_streams_and_bypass_removes_l2_work(register_device):
     table, dp = register_device
     state = AdmissionMemoryView({0: 512})
-    reads = [_read(ReuseKey(0, name, 0, stream), AddressRun(0, 1, 192, 192))
-             for name, stream in (("weights", "main"), ("states", "main"), ("auxiliary", "aux"))]
+    reads = [_read(ReuseKey(0, n, 0, s), AddressRun(0, 1, 192, 192)) for n, s in (("weights", "main"), ("states", "main"), ("auxiliary", "aux"))]
     base = {"working_set_bytes": 192, "pattern": reads[0]}
     for index, (pattern, streams, knee) in enumerate(zip(reads, (1, 1, 2), (512, 512, 256))):
         state.admit_access(pattern, 192)
         assert state.active_stream_count(0) == streams and state.effective_l2_bytes(0) == knee
         for policy in ("normal", "disable"):
-            hits = 192 if index < 2 and policy == "normal" else 0
             result = _lower("P05_l2_residency_reuse", {**base, "cache_policy": policy}, table, datapath=dp, memory_state=state)
             assert dict(result.metadata)["effective_l2_bytes"] == knee
-            assert _run(result).serviced.get("l2", 0) == pytest.approx(hits)
+            assert _run(result).serviced.get("l2", 0) == pytest.approx(192 if index < 2 and policy == "normal" else 0)
 
 
 @pytest.mark.parametrize("m,n", [(49, 63), (81, 33)])
@@ -366,22 +370,22 @@ def test_production_stage_profile_engine_preserves_units_and_native_counters(reg
     prof = EvaluationContext.create(sku_case(table.sku)).bindings.stage_profiles[0]
     ctx = RecipeContext(None, {}, prof.names, {prof.names[k]: r for k, (r, _) in prof.rates.items()},
                         prof.datapath.aic_count, pool_names=prof.stage_pools,
-                        resource_units={prof.names[k]: u for k, u in prof.units.items() if k in prof.names},
-                        compute_peaks=prof.compute_peaks, datapath=prof.datapath)
+                        resource_units=dict(prof.units), compute_peaks=prof.compute_peaks, datapath=prof.datapath)
     mm = _lower("P06_mmad", {"m": 1, "n": 16, "k": 16, "mode": "bf16"}, table, datapath=prof.datapath, context=ctx)
     eng = Engine(prof.resources, backend="python", pools=prof.pools)
     done = submit_lowered_primitive(eng, mm)
     eng.advance(until=(done,))
     assert done.time == pytest.approx(mm.analytical_ms, abs=1e-12) and done.time < 1e-5 and eng.delivered["cube_flops"] == pytest.approx(8192)
     cases = (("P07_vec_alu", {"elements": 512, "clock_hz": 1.65e9}), ("P08_vec_sfu", {"elements": 512, "clock_hz": 1.65e9}),
-             ("P09_vec_reduce_cast", {"rows": 2, "reduction_dim": 64, "clock_hz": 1.65e9}),
-             ("P10_sort_topk", {"n": 256}), ("P11_simt", {"frontend": "tla_dsl", "threads": 64, "warp_instructions": 2}))
+             ("P09_vec_reduce_cast", {"rows": 2, "reduction_dim": 64, "clock_hz": 1.65e9}), ("P10_sort_topk", {"n": 256}),
+             ("P11_simt", {"frontend": "tla_dsl", "threads": 64, "warp_instructions": 2}),
+             ("P15_rts_stars", {"descriptors": [{"work": {prof.names["cube"]: 1.0}}]}))
     for pid, params in cases:
         r = _lower(pid, params, table, datapath=prof.datapath, context=ctx)
         e = Engine(prof.resources, backend="python", pools=prof.pools)
         ev = submit_lowered_primitive(e, r)
         e.advance(until=(ev,))
-        assert ev.time == pytest.approx(r.analytical_ms, abs=1e-12)
+        assert ev.time == pytest.approx(r.analytical_ms, abs=1e-12) and ev.time > 0
 
 
 def test_mmad_weight_conversion_prologues_finish_before_cube(register_device):
@@ -447,10 +451,8 @@ def test_simt_requires_ub_carveout_and_enforces_frontend_thread_limit(memory_dev
     table, dp = register_device
     pid = "P11_simt"
     assert old_dp.simt_ub_carveout_bytes == 0 < dp.simt_ub_carveout_bytes
-    with pytest.raises(UnmodeledCapabilityError, match="simt_ub_carveout_required"):
-        _lower(pid, {"frontend": frontend}, table, datapath=old_dp)
-    with pytest.raises(ModelingError, match="^primitive_simt_thread_limit$"):
-        _lower(pid, dict(frontend=frontend, threads=limit + 1), table, datapath=dp)
+    with pytest.raises(UnmodeledCapabilityError, match="simt_ub_carveout_required"): _lower(pid, {"frontend": frontend}, table, datapath=old_dp)
+    with pytest.raises(ModelingError, match="^primitive_simt_thread_limit$"): _lower(pid, dict(frontend=frontend, threads=limit + 1), table, datapath=dp)
     assert _run(_lower(pid, dict(frontend=frontend, threads=limit, warp_instructions=3), table, datapath=dp)).serviced["simt"] == pytest.approx(limit // 32 * 3)
 
 
@@ -458,8 +460,7 @@ def test_unit_flag_serializes_delay_and_requires_single_l0c_slot(register_device
     table, dp = register_device
     pid = "P12_intracore_flag"
     table = _with_latencies(table, pid, unitflag_ns=300)
-    with pytest.raises(ModelingError, match="^primitive_unit_flag_requires_single_l0c_stage$"):
-        _lower(pid, dict(enable_unit_flag=True, l0c_stages=2), table, datapath=dp)
+    with pytest.raises(ModelingError, match="^primitive_unit_flag_requires_single_l0c_stage$"): _lower(pid, dict(enable_unit_flag=True, l0c_stages=2), table, datapath=dp)
     result = _lower(pid, dict(enable_unit_flag=True, l0c_stages=1), table, datapath=dp)
     engine = _engine(result)
     done = submit_lowered_primitive(engine, result, after=(engine.submit("producer", latency=500e-6),))
@@ -476,18 +477,15 @@ def test_crosscore_scopes_and_reverse_credit_gate_the_next_window(register_devic
         assert _trace(engine, "crosscore:0")["metadata"]["event_id"] == event and engine.now == pytest.approx(ns * 1e-6)
     engine = _run(_lower(pid, dict(mode=2, with_reverse=True, notifications=16), table, datapath=dp))
     credit = _trace(engine, "reverse_credit:14")
-    assert _trace(engine, "crosscore:14")["end_ms"] == pytest.approx(15 * 70e-6)
-    assert credit["end_ms"] - credit["start_ms"] == pytest.approx(250e-6)
+    assert _trace(engine, "crosscore:14")["end_ms"] == pytest.approx(15 * 70e-6) and credit["end_ms"] - credit["start_ms"] == pytest.approx(250e-6)
     assert _trace(engine, "crosscore:15")["start_ms"] == pytest.approx(credit["end_ms"])
 
 
 def test_mutex_ring_ids_and_l1_reuse_require_matching_address_and_coordinate(register_device):
     table, dp = register_device
     pid = "P14_mutex_block_mmad"
-    with pytest.raises(ModelingError, match="^primitive_mutex_id_limit$"):
-        _lower(pid, {"l0b_stages": 25}, table, datapath=dp)
-    steps = [{"l1a": dict(addr=addr, coord=coord, work={"mte2_aic": 32}, duration_ms=1)}
-             for addr, coord in ((0, 0), (0, 0), (0, 1), (32, 1))]
+    with pytest.raises(ModelingError, match="^primitive_mutex_id_limit$"): _lower(pid, {"l0b_stages": 25}, table, datapath=dp)
+    steps = [{"l1a": dict(addr=a, coord=c, work={"mte2_aic": 32}, duration_ms=1)} for a, c in ((0, 0), (0, 0), (0, 1), (32, 1))]
     result = _lower(pid, dict(l0b_stages=24, steps=steps, l1a_slot_bytes=32), table, datapath=dp)
     assert dict(result.metadata) == {"mutex_ids": 28, "l1_reuse_hits": 1} and len(result.ring_buffers) == 5
     engine = _run(result, rates={"mte2_aic": 32}, pools={"l1": 32})
@@ -509,8 +507,8 @@ def test_stream_budgets_bind_disjoint_owners_and_derive_nested_span(register_dev
     rates, units = {"vector": dp.aiv_count}, {"vector": dp.aiv_count}
     context = RecipeContext(None, {}, {"vector": "vector"}, rates, dp.aic_count, resource_units=units)
     program = KernelProgram((Stage("vector_work", {"vector": 4}),))
-    derived = _lower(pid, {"program": KernelProgram((Stage("v", {"vector": 4.0}, caps={"vector": 1.0}),))}, table, datapath=dp)
-    assert derived.analytical_ms == pytest.approx(4.0)
+    derived = _lower(pid, {"program": KernelProgram((Stage("a", {"r": 4.0}, caps={"r": 1.0}), Stage("b", {"r": 4.0}, caps={"r": 1.0})))}, table, datapath=dp)
+    assert derived.analytical_ms == pytest.approx(8.0)
     for mode in ("disjoint", "shared_cap"):
         plan = StreamPlan(0, tuple(StreamLane(s, StreamCoreBudget(1, cap, mode)) for s in ("main", "aux")))
         results = [_lower(pid, dict(mode=mode, stream_plan=plan, stream_id=s, program=program),
@@ -545,11 +543,11 @@ def test_collective_short_frame_charges_the_declared_wire_policy(register_device
 
 def test_peer_tokens_require_declared_edge_and_status_follows_payload(register_device):
     table, dp = register_device
-    with pytest.raises(UnmodeledCapabilityError, match="direct_peer_edge_required"):
-        _lower("P19_direct_peer_window", {"peer": 99, "token_payload_bytes": (1,)}, table, datapath=dp)
-    result = _lower("P19_direct_peer_window", {"token_payload_bytes": (1, 481), "status_bytes": 32, "peer_edges": ((0, 1),)},
-                    table, datapath=dp)
-    engine = _run(result)
+    for params in ({"peer": 99, "token_payload_bytes": (1,)}, {"peer": 99, "peer_edges": ((0, 99),), "token_payload_bytes": (1,)}):
+        with pytest.raises(UnmodeledCapabilityError, match="direct_peer_edge_required"):
+            _lower("P19_direct_peer_window", params, table, datapath=dp)
+    dp2 = datapath_for_die(machine(table.sku).dies[0], ub_peer_edges=((0, 1),))
+    engine = _run(_lower("P19_direct_peer_window", {"token_payload_bytes": (1, 481), "status_bytes": 32}, table, datapath=dp2))
     data, status = _trace(engine, "transfer"), _trace(engine, "status")
     assert status["start_ms"] == pytest.approx(data["end_ms"])
     for row in ("peer:0->1", "peer_egress:d0"):
@@ -581,14 +579,20 @@ def test_dma_pinned_startup_and_coupled_per_die_and_root_complex_service():
     assert engine.now == pytest.approx(startup[0] + 2 * amount / rate)
 
 
-def test_bench_idle_npu_parser_rejects_prefix_match_and_die_mismatch():
-    from tools.bench_l0_primitives import parse_npu_smi_idle_die
+def test_bench_idle_npu_parser_rejects_prefix_match_and_die_mismatch(register_device):
+    from tools.bench_l0_primitives import build_primitive_table_payload, canonical_capture_bytes, parse_npu_smi_idle_die
     info = "No running processes found in NPU 10\nNo running processes found in NPU 0\n"
     mapping = "NPU ID Chip ID Chip Logic ID Chip Phy-ID Chip Name\n0 0 0 0 Ascend910\n"
     common = "Chip ID : 0\nAicore Usage Rate(%) : 0\nHBM Usage Rate(%) : 4\nAicore Count : 20\nAicore Freq(MHZ) : 1650\n"
-    with pytest.raises(RuntimeError, match="bench_npu_not_idle"):
-        parse_npu_smi_idle_die(info, mapping, common, npu_id=1, chip_id=0, device_id=1)
-    with pytest.raises(ValueError, match="bench_npu_die_mismatch"):
-        parse_npu_smi_idle_die(info, mapping, common, npu_id=0, chip_id=0, device_id=1)
-    parsed = parse_npu_smi_idle_die(info, mapping, common, npu_id=0, chip_id=0, device_id=0)
-    assert (parsed["observed_aic_count"], parsed["observed_aicore_freq_mhz"]) == (20, 1650)
+    with pytest.raises(RuntimeError, match="bench_npu_not_idle"): parse_npu_smi_idle_die(info, mapping, common, npu_id=1, chip_id=0, device_id=1)
+    with pytest.raises(ValueError, match="bench_npu_die_mismatch"): parse_npu_smi_idle_die(info, mapping, common, npu_id=0, chip_id=0, device_id=1)
+    with pytest.raises(ValueError, match="bench_npu_mapping_missing"): parse_npu_smi_idle_die(info, "", common, npu_id=0, chip_id=0, device_id=0)
+    with pytest.raises(RuntimeError, match="bench_npu_telemetry_missing"): parse_npu_smi_idle_die(info, mapping, "", npu_id=0, chip_id=0, device_id=0)
+    with pytest.raises(RuntimeError, match="bench_npu_clock_missing"):
+        parse_npu_smi_idle_die(info, mapping, common.replace("1650", "0"), npu_id=0, chip_id=0, device_id=0)
+    assert parse_npu_smi_idle_die(info, mapping, common, npu_id=0, chip_id=0, device_id=0)["observed_aic_count"] == 20
+    assert not PRIVATE_SOURCE.search(canonical_capture_bytes(CALIBRATED_REGISTER_SKU, {"meta": "192.0.2.7 /home" + "/u user@h"}).decode())
+    with pytest.raises(ValueError, match="bench_sample_sku_mismatch"):
+        build_primitive_table_payload(sku=CALIBRATED_REGISTER_SKU, cann_version="9", endpoint_alias="lab", campaign_id="c", raw_measurements={"device_name": REPRESENTATIVE_SKUS["a5"]})
+    assert register_device[0].cell("P20_host_dma_sync").band("host_h2d_bytes_per_s").certified_upper_capacity == pytest.approx(100.01e9)
+    assert not load_primitives("Ascend910_9382", datapath=_datapath("Ascend910_9382")).provenance.calibrated

@@ -42,12 +42,10 @@ JOB_TIMEOUT_S = 10
 POSIX_ONLY = pytest.mark.skipif(os.name != "posix", reason="requires POSIX modes and cache locks")
 
 
-def _unexpected(*args, **kwargs):
-    pytest.fail("unexpected endpoint I/O, remote submission, or local replay")
+def _unexpected(*args, **kwargs): pytest.fail("unexpected endpoint I/O, remote submission, or local replay")
 
 
-def _wire(value):
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+def _wire(value): return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
 
 
 def _write_config(path, data, mode=0o600):
@@ -59,20 +57,16 @@ def _write_config(path, data, mode=0o600):
 @pytest.fixture
 def endpoint_paths(tmp_path, monkeypatch):
     home, cwd, env_file = (tmp_path / name for name in ("home", "repo", "override.json"))
-    monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setenv("USERPROFILE", str(home))
-    monkeypatch.setenv("REMOTE_DEV_ENDPOINTS_FILE", str(env_file))
+    monkeypatch.setenv("HOME", str(home)); monkeypatch.setenv("USERPROFILE", str(home)); monkeypatch.setenv("REMOTE_DEV_ENDPOINTS_FILE", str(env_file))
     return home, cwd, env_file
 
 
 def _dispatcher(cwd, target, *, warm=False, endpoints=None, probe=None, **kwargs):
     return remote.RemoteDispatcher(
         remote.RemoteExecPolicy(target=target, authorized_aliases=(ALIAS,), max_remote_workers=1),
-        cwd=cwd,
-        local_c11_ready_fn=lambda: warm,
+        cwd=cwd, local_c11_ready_fn=lambda: warm,
         endpoints_loader=endpoints if endpoints is not None else lambda _: {ALIAS: ENDPOINT},
-        probe_fn=probe if probe is not None else lambda *_: CAPACITY,
-        **kwargs,
+        probe_fn=probe if probe is not None else lambda *_: CAPACITY, **kwargs,
     )
 
 
@@ -194,7 +188,7 @@ def test_unattended_dispatch_requires_exact_endpoint_pin(endpoint_paths, spoof):
 
 
 @POSIX_ONLY
-@pytest.mark.parametrize("mode", [0o666, 0o620, 0o602, 0o644, 0o600])
+@pytest.mark.parametrize("mode", [0o666, 0o620, 0o602, 0o644, 0o700, 0o600])
 def test_unattended_policy_requires_strict_private_mode(endpoint_paths, mode):
     home, cwd, _ = endpoint_paths
     endpoint = remote._endpoint(ENDPOINT)
@@ -397,13 +391,13 @@ def test_receipt_only_exports_allowlisted_redacted_fields(alias):
     }
 
 
-@pytest.mark.parametrize("field,upper", [("host", False), ("host", True), ("user", False), ("auth_ref", False)])
-def test_endpoint_alias_cannot_leak_actual_connection_identity(endpoint_paths, field, upper):
+@pytest.mark.parametrize("field,embed", [("host", False), ("host", True), ("user", False), ("user", True), ("auth_ref", False)])
+def test_endpoint_alias_cannot_leak_actual_connection_identity(endpoint_paths, field, embed):
     home, cwd, _ = endpoint_paths
     config = ENDPOINT | {"auth_ref": "private-login", "identity_file": str(home / "private-key")}
-    if upper:
-        config["host"] = "Compute.Example.Invalid"
-    alias = f"lab-{config[field].lower()}" if upper else config[field]
+    if embed:
+        config[field] = "Compute.Example.Invalid" if field == "host" else "Operator"
+    alias = f"lab-{config[field].upper()}" if embed else config[field]
     dispatcher = remote.RemoteDispatcher(
         remote.RemoteExecPolicy(target="remote", authorized_aliases=(alias,)), cwd=cwd,
         endpoints_loader=lambda _: {alias: config}, probe_fn=lambda *_: CAPACITY,
@@ -529,46 +523,64 @@ def test_worker_module_canonical_stdio_and_mock_ssh_round_trip(tmp_path, monkeyp
     assert remote._exchange(endpoint, ssh_command, request, JOB_TIMEOUT_S, handshake=True) == process.stdout
 
 
-def test_timeout_preserved_remaining_deadline_sent_and_c11_rebuilds_on_miss(
-    endpoint_paths, bundle_source, tmp_path, monkeypatch,
-):
+def test_timeout_preserved_remaining_deadline_sent_and_c11_rebuilds_on_miss(endpoint_paths, bundle_source, tmp_path, monkeypatch):
     _, cwd, _ = endpoint_paths
     with pytest.raises(TimeoutError):
         _dispatcher(cwd, "auto", warm=True, probe=Mock(side_effect=TimeoutError("probe"))).resolve_target(4)
-    now, seen = [100.0], []
+    now, caps, seen = [100.0], [], []
     monkeypatch.setattr(remote.time, "monotonic", lambda: now[0])
-    def stage_fn(*_):
-        now[0] += 3.5
-        return f"/stage/{BUNDLE_DIGEST}", BUNDLE_DIGEST
-    def exec_fn(_ep, payload, _digest, _policy):
-        seen.append(payload["deadline_s"])
-        return {"protocol_version": remote.PROTOCOL_VERSION, "request_id": payload["request_id"], "effective_workers": 1, "results": []}
-    _dispatcher(cwd, "remote", stage_fn=stage_fn, exec_fn=exec_fn).dispatch_batch("run_step", {}, [{}], deadline_s=10.0)
-    assert seen == [pytest.approx(6.5)]
+    def probe_fn(_ep, pol): caps.append(("probe", pol.probe_timeout_s)); now[0] += 0.5; return CAPACITY
+    def stage_fn(_ep, _rid, pol): caps.append(("stage", pol.stage_timeout_s)); now[0] += 1.0; return f"/stage/{BUNDLE_DIGEST}", BUNDLE_DIGEST
+    def exec_fn(_ep, p, _d, _pol):
+        seen.append(p["deadline_s"])
+        return {"protocol_version": remote.PROTOCOL_VERSION, "request_id": p["request_id"], "effective_workers": 1, "results": []}
+    _dispatcher(cwd, "remote", probe=probe_fn, stage_fn=stage_fn, exec_fn=exec_fn).dispatch_batch("run_step", {}, [{}], deadline_s=4.0)
+    assert caps == [("probe", pytest.approx(4.0)), ("stage", pytest.approx(3.5))] and seen == [pytest.approx(2.5)]
+    with pytest.raises(TimeoutError, match="deadline_exceeded"):
+        _dispatcher(cwd, "remote", stage_fn=stage_fn, exec_fn=lambda _e, p, _d, _pol: {"protocol_version": remote.PROTOCOL_VERSION, "request_id": p["request_id"], "error": "deadline_exceeded"}).dispatch_batch("run_step", {}, [{}], deadline_s=4.0)
     stage, _ = _stage(bundle_source, tmp_path / "cache")
     native_root = remote._native_root(stage)
     remote._private_dir(native_root)
-    (native_root / remote.MANIFEST).write_bytes(b"stale")
+    prev_so = native_root / "prev.so"; prev_so.write_bytes(b"prev")
+    (native_root / remote.MANIFEST).write_bytes(remote._manifest(native_root, [prev_so]))
     from mindie_sim.prediction.runtime import accel_build, accel_loader
-    rebuilt = []
+    rebuilt, fail_next = [], [True]
     def fake_build(*, check_only=False):
-        if check_only:
-            return {"library_ready": False, "cache_path": str(native_root / "old.so")}
-        so = accel_build.cache_root() / "lib.so"
-        so.parent.mkdir(parents=True, exist_ok=True); so.write_bytes(b"ok"); rebuilt.append(so)
+        if check_only: return {"library_ready": False, "cache_path": str(native_root / "old.so")}
+        if fail_next[0]: raise RuntimeError("compile_failed")
+        so = accel_build.cache_root() / "lib.so"; so.parent.mkdir(parents=True, exist_ok=True); so.write_bytes(b"ok"); rebuilt.append(so)
         return {"library_ready": True, "cache_path": str(so)}
     monkeypatch.setattr(accel_build, "build_accel", fake_build)
     monkeypatch.setattr(accel_loader, "load_accel_cdll", lambda status: status)
-    worker._prepare_native(stage, build=True)
-    assert len(rebuilt) == 1 and remote.verify_staged_manifest(native_root)
+    with pytest.raises(RuntimeError, match="compile_failed"): worker._prepare_native(stage, build=True)
+    assert prev_so.read_bytes() == b"prev" and remote.verify_staged_manifest(native_root)
+    fail_next[0] = False; worker._prepare_native(stage, build=True)
+    assert len(rebuilt) == 1 and not prev_so.exists() and remote.verify_staged_manifest(native_root)
+    (stage / "data/primitives/manifest.json").write_text("{bad", encoding="utf-8")
+    monkeypatch.setattr(worker, "_prepare_native", lambda *_: None)
+    with worker._worker_environment(stage), pytest.raises(Exception): worker._init_worker(str(stage), None)
 
 
 @POSIX_ONLY
 @pytest.mark.tier1
 def test_multiworker_staged_c11_matches_python_with_positive_native_steps(endpoint_paths, tmp_path, monkeypatch):
+    from dataclasses import replace
+    from _support.hardware import MODEL, WORKLOAD
+    from mindie_sim.prediction.results import ReplayOptions
+    from mindie_sim.prediction.spine import default_spine
+    from mindie_sim.schema.case import Case
+    from mindie_sim.stack_registry import RankOps
     _, cwd, _ = endpoint_paths
-    case = sku_case(REPRESENTATIVE_SKUS["a2"])
-    cands = [{"candidate_id": f"c{ctx}", "objective_key": 0, "request": LoweringRequest(step=StepRequest(phase="decode", context=ctx))} for ctx in (16, 32)]
+    case = Case.from_mapping({
+        "machine": {"backend": "ascend", "sku": REPRESENTATIVE_SKUS["a5"], "num_devices": 2},
+        "model": {**MODEL, "layers": 1, "hidden_size": 64, "num_heads": 2, "num_kv_heads": 2, "head_dim": 32,
+                  "intermediate_size": 128, "ffn": "moe", "num_experts": 4, "top_k": 2, "moe_intermediate_size": 64},
+        "workload": WORKLOAD, "runtime": {"dp": 2, "ep": 2, "tp": 1, "submission": {"scheduler_ms": 0.5}},
+    })
+    op0 = default_spine().lower(case, LoweringRequest(step=StepRequest(phase="decode", context=16))).graph.executable[0].ops[1]
+    cands = [{"candidate_id": f"c{n}", "objective_key": 0, "replay": ReplayOptions(include_submission=True),
+              "request": LoweringRequest(declared_ops=(RankOps(0, (replace(op0, op_id=f"g{n}", deps=()),)),
+                                                       RankOps(1, (replace(op0, op_id=f"g{n}", deps=()),))))} for n in (1, 2)]
     digest = remote.compute_bundle_digest(REPO_ROOT)
     stage = remote.stage_bundle_local_dir(remote.build_bundle_archive(REPO_ROOT), tmp_path / "c11_cache", digest, request_id=REQUEST_ID, cache_quota_bytes=CACHE_QUOTA_BYTES, build_c11=True)
     monkeypatch.setenv("MINDIE_SIM_ACCEL", "python")
@@ -579,15 +591,6 @@ def test_multiworker_staged_c11_matches_python_with_positive_native_steps(endpoi
         cwd=cwd, endpoints_loader=lambda _: {ALIAS: ENDPOINT}, probe_fn=lambda *_: CAPACITY, stage_fn=lambda *_: (str(stage), digest),
         exec_fn=lambda _ep, payload, _d, pol: json.loads(remote._canonical(worker.execute_worker_request(remote._canonical(payload), max_result_bytes=pol.max_result_bytes))),
     ).dispatch_batch("run_step", case, cands, deadline_s=30)
-    assert rem_rec.effective_workers == rem_res["effective_workers"] == 2
-    assert all(abs(p["result"]["span_ms"] - c["result"]["span_ms"]) <= 1e-12 for p, c in zip(py_res["results"], rem_res["results"], strict=True))
-    from mindie_sim.prediction.runtime.engine import Engine, Resource
-    with worker._worker_environment(stage):
-        worker._prepare_native(stage)
-        spans, stats = {}, {}
-        for backend in ("python", "c"):
-            eng = Engine([Resource("r0", 10.0, units=2), Resource("r1", 5.0)], backend=backend)
-            eng.advance(until=tuple(eng.submit(f"t{i}", {"r0": 20.0, "r1": 10.0}) for i in range(4)))
-            spans[backend], stats[backend] = eng.now, eng.accel_status()
-        assert stats["c"]["native_steps"] > 0 and stats["python"]["native_steps"] == 0
-        assert Path(stats["c"]["cache_path"]).is_relative_to(remote._native_root(stage)) and abs(spans["c"] - spans["python"]) <= 1e-12
+    assert rem_rec.effective_workers == rem_res["effective_workers"] == 2 and any(p.suffix in (".so", ".dylib") for p in remote._native_root(stage).rglob("*"))
+    assert all(p["result"]["native_steps"] == 0 and c["result"]["native_steps"] > 0 and abs(p["result"]["span_ms"] - c["result"]["span_ms"]) <= 1e-12
+               for p, c in zip(py_res["results"], rem_res["results"], strict=True))

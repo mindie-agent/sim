@@ -379,13 +379,16 @@ def _measure_periodic_combo(
         a, b = left_c[0], right_c[0]
         if a == b:
             return a.total_bytes()
-        if a.sector_bytes == b.sector_bytes and a.stride_bytes == b.stride_bytes > 0 and a.stride_bytes % a.sector_bytes == 0:
+        if (a.sector_bytes == b.sector_bytes and a.stride_bytes == b.stride_bytes > 0
+                and a.stride_bytes % a.sector_bytes == 0
+                and (a.rows == 1 or a.row_bytes < a.stride_bytes)
+                and (b.rows == 1 or b.row_bytes < b.stride_bytes)):
             st, w1, w2 = a.stride_bytes, a.row_bytes, b.row_bytes
             q, rem = divmod(b.base_byte - a.base_byte, st)
             total = 0
             for s in range(math.floor((-rem - w2) / st), math.ceil((w1 - rem) / st) + 1):
                 ov_w = min(w1, rem + s * st + w2) - max(0, rem + s * st)
-                k_lo, k_hi = max(0, q + s), min(a.rows - 1, b.rows - 1 + q + s)
+                k_lo, k_hi = max(0, q - s), min(a.rows - 1, b.rows - 1 + q - s)
                 if ov_w > 0 and k_hi >= k_lo:
                     total += (k_hi - k_lo + 1) * ov_w
             return total
@@ -489,7 +492,9 @@ class AddressRunPlan:
     def dram_sector_and_service(self, burst_rules: Sequence[BurstTurnRule] = ()) -> tuple[int, float]:
         """Exact integer 32 B sector bytes and burst-adjusted DRAM service bytes (D_f)."""
         seen_aliases: set[str] = set()
+        covered = SectorCoverage()
         sector_total, service_total = 0, 0.0
+        single_run = len(self.runs) == 1
         for run in self.runs:
             if run.rows == 0 or run.row_bytes == 0:
                 continue
@@ -497,10 +502,16 @@ class AddressRunPlan:
                 if run.proven_alias_group in seen_aliases:
                     continue
                 seen_aliases.add(run.proven_alias_group)
-            sec_bytes = run.sector_union_bytes(self.sector_bytes)
-            eta = burst_turnaround_efficiency(run.row_bytes, run.stride_bytes, burst_rules)
-            sector_total += sec_bytes
-            service_total += float(sec_bytes) / eta
+            if single_run:
+                sec_bytes = run.sector_union_bytes(self.sector_bytes)
+            else:
+                run_cov = AddressRunPlan((run,), alignment_bytes=self.alignment_bytes, sector_bytes=self.sector_bytes).sector_coverage()
+                sec_bytes = max(0, run_cov.measure_bytes() - run_cov.overlap_bytes(covered))
+                covered = covered.union(run_cov)
+            if sec_bytes > 0:
+                eta = burst_turnaround_efficiency(run.row_bytes, run.stride_bytes, burst_rules)
+                sector_total += sec_bytes
+                service_total += float(sec_bytes) / eta
         if sector_total > 0 and self.scale_bytes > 0:
             scale_sec = _align_up(self.scale_bytes, self.sector_bytes)
             sector_total += scale_sec

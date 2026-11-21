@@ -1,7 +1,7 @@
 {
   "arch_preset": "npu_arch_2201",
   "cann_version": "9.3.0",
-  "envelope_sha256": "65546eb12398fd551e83e4ddc6eb4177870065c7365efd8603bb6bc14827c267",
+  "envelope_sha256": "f3e9e2180ddd2e6afaa9396b89e493d0892389406ed595603e9e197f43ccc880",
   "primitives": {
     "P01_datacopy": {
       "evidence_id": "",
@@ -645,7 +645,7 @@
         },
         "host_d2h_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 48000000000.0,
+          "certified_upper_capacity": 42700000000.0,
           "cv_pct": 4.0127,
           "n_samples": 32,
           "p05": 32954175084.943027,
@@ -657,7 +657,7 @@
         },
         "host_h2d_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 64000000000.0,
+          "certified_upper_capacity": 58400000000.0,
           "cv_pct": 4.8087,
           "n_samples": 32,
           "p05": 45904127448.250305,
@@ -699,7 +699,7 @@
     "calibrated": true,
     "campaign_id": "camp-202611-l0-a3-9362",
     "capture_uri": "capture://lab-a3-9362/camp-202611-l0-a3-9362/e45ac4e414371e0b6f9bef258be3d0b652067b1eccbcdf4a770610b9378581d9",
-    "collected_utc": "2026-11-21T00:06:12Z",
+    "collected_utc": "2026-11-21T01:05:25Z",
     "endpoint_alias": "lab-a3-9362",
     "silicon_fingerprint": {
       "aic_count": 20,

@@ -58,7 +58,6 @@ REMOTE_CANDIDATE_THRESHOLD = 4
 LEASE_HANDOFF_TIMEOUT = STAGE_TIMEOUT + JOB_GRACE
 PRIVATE_DIR = 0o700
 PRIVATE_FILE = 0o600
-UNSAFE_POLICY_MODE = 0o077
 UNSAFE_ENDPOINT_MODE = 0o022
 ENDPOINT_ID_LENGTH = 16
 MAX_PORT = 65535
@@ -210,19 +209,18 @@ def _endpoint(value) -> _Endpoint:
     return ep
 def _user_endpoint_files() -> tuple[Path, Path]:
     return tuple(Path.home() / folder / "endpoints.json" for folder in (".mindie", ".mindie-coordinator"))
-def _read_config(path: Path, *, private=False, mode_mask: int | None = None):
-    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
-    if private:
-        flags |= getattr(os, "O_NOFOLLOW", 0)
+def _read_config(path: Path, *, private=False, exact_mode: int | None = None):
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | (getattr(os, "O_NOFOLLOW", 0) if private else 0)
     try:
         fd = os.open(path, flags)
     except FileNotFoundError:
         return {}
-    mask = UNSAFE_ENDPOINT_MODE if mode_mask is None else mode_mask
     with os.fdopen(fd, "rb") as stream:
         info = os.fstat(stream.fileno())
+        bad_mode = (stat.S_IMODE(info.st_mode) != exact_mode if exact_mode is not None
+                    else bool(info.st_mode & UNSAFE_ENDPOINT_MODE))
         if not stat.S_ISREG(info.st_mode) or (private and os.name == "posix" and
-                (info.st_uid != os.getuid() or info.st_mode & mask)):
+                (info.st_uid != os.getuid() or bad_mode)):
             raise ValueError("unsafe remote configuration")
         result = json.loads(_bounded_read(stream, CONFIG_LIMIT))
     if isinstance(result, dict):
@@ -244,7 +242,7 @@ def _load_endpoints(cwd: Path):
     return _merge_endpoints((*_user_endpoint_files(), *env, cwd / "endpoints.json", cwd / "endpoints.local.json"))
 def _authorized_pairs(policy: RemoteExecPolicy) -> set[tuple[str, str]]:
     path = policy.policy_path or Path.home() / ".mindie/sim_remote_policy.json"
-    config = _read_config(Path(path).expanduser(), private=True, mode_mask=UNSAFE_POLICY_MODE)
+    config = _read_config(Path(path).expanduser(), private=True, exact_mode=PRIVATE_FILE)
     rows = config.get("authorized_endpoints", config.get("authorized_aliases", ()))
     if isinstance(rows, dict):
         rows = ({"alias": alias, "endpoint_id": pin} for alias, pin in rows.items())
@@ -326,6 +324,12 @@ def _exchange(ep, command, payload, timeout, limit=CONFIG_LIMIT, *, handshake=Fa
         if process.wait(timeout=_remaining(deadline)):
             raise RuntimeError("remote command failed")
         return data
+    except (TimeoutError, subprocess.TimeoutExpired):
+        if handshake and (sent.is_set() or (written is not None and not written.done())):
+            error = RemoteExecUnavailableError("transport_not_sent")
+            error.submission_state = "uncertain"
+            raise error from None
+        raise TimeoutError("remote_exec_timeout") from None
     except Exception:
         error = RemoteExecUnavailableError("transport_not_sent")
         if handshake and (sent.is_set() or (written is not None and not written.done())):
@@ -539,7 +543,7 @@ def _extract(archive_bytes, destination):
                     shutil.copyfileobj(archive.extractfile(member), stream, MIB)
 
 def stage_bundle_local_dir(archive_bytes, cache_root, bundle_digest, *,
-                           cache_quota_bytes, request_id, build_c11=True) -> Path:
+                           cache_quota_bytes, request_id, build_c11=True, build_timeout_s=STAGE_TIMEOUT) -> Path:
     if (not HEX_DIGEST.fullmatch(bundle_digest) or len(archive_bytes) > BUNDLE_LIMIT
             or not UUID_TOKEN.fullmatch(request_id)):
         raise ValueError("invalid bundle identity")
@@ -565,7 +569,7 @@ def stage_bundle_local_dir(archive_bytes, cache_root, bundle_digest, *,
                                 "import sys; sys.path.insert(0,sys.argv[1]); "
                                 "from mindie_sim._remote_worker import _prepare_native; "
                                 "_prepare_native(sys.argv[1], build=True)", str(target)],
-                               timeout=STAGE_TIMEOUT, check=True, stdout=subprocess.DEVNULL,
+                               timeout=build_timeout_s, check=True, stdout=subprocess.DEVNULL,
                                stderr=subprocess.DEVNULL)
             _prune(root, cache_quota_bytes, target)
             _create_lease(target, request_id)
@@ -605,7 +609,7 @@ if mode == 'stage':
         use_shm = False
     cache = (shm / ('mindie-sim-' + str(module.os.getuid()))) if use_shm else (Path.home() / '.cache' / 'mindie-sim')
     tree = module.stage_bundle_local_dir(module._bounded_read(sys.stdin.buffer, module.BUNDLE_LIMIT),
-             cache, digest, cache_quota_bytes=int(args[0]), request_id=args[1])
+             cache, digest, cache_quota_bytes=int(args[0]), request_id=args[1], build_timeout_s=float(args[2]))
     print(json.dumps(str(tree)))
 else:
     if module.verify_staged_manifest(root) != digest:
@@ -615,11 +619,10 @@ else:
     raise SystemExit(main(ready=True, expected_root=str(root), max_result_bytes=int(args[0])))
 """
 def _stage_remote(endpoint, request_id, policy):
-    source = Path(__file__).read_bytes()
-    repo = Path(__file__).resolve().parents[1]
+    source, repo = Path(__file__).read_bytes(), Path(__file__).resolve().parents[1]
     digest = compute_bundle_digest(repo)
     output = _exchange(endpoint, _boot(_BOOTSTRAP, "stage", str(len(source)), hashlib.sha256(source).hexdigest(),
-                       digest, str(policy.cache_quota_bytes), request_id),
+                       digest, str(policy.cache_quota_bytes), request_id, str(policy.stage_timeout_s)),
                        source + build_bundle_archive(repo), policy.stage_timeout_s)
     stage = json.loads(output)
     if isinstance(stage, str) and PurePosixPath(stage).is_absolute() and PurePosixPath(stage).name == digest:
@@ -657,7 +660,7 @@ class RemoteDispatcher:
         self._load_endpoints = endpoints_loader or _load_endpoints
         self._probe_cache = {}
 
-    def _resolve(self, count):
+    def _resolve(self, count, *, job_deadline=None):
         policy = self.policy
         if policy.target == "local":
             return RemoteExecReceipt(), None
@@ -696,7 +699,8 @@ class RemoteDispatcher:
                     ep = replace(ep, **{k: getattr(auth, k, None) for k in ("identity_file", "known_hosts_file", "auth_ref")})
                 expires, pinned, capacity = self._probe_cache.get((key, ep), (0, None, None))
                 if expires <= time.monotonic():
-                    probe = self._probe_fn(ep, policy)
+                    probe_pol = policy if job_deadline is None else replace(policy, probe_timeout_s=min(policy.probe_timeout_s, _remaining(job_deadline)))
+                    probe = self._probe_fn(ep, probe_pol)
                     pinned, capacity = (ep, probe) if isinstance(probe, Mapping) else probe
                     self._probe_cache[key, ep] = time.monotonic() + policy.probe_ttl_s, pinned, capacity
                 workers, factor = size_remote_workers(
@@ -705,8 +709,8 @@ class RemoteDispatcher:
                     force_saturated=alias == preferred)
                 if workers:
                     alias_cf = alias.casefold()
-                    secrets = {v.casefold() for v in (ep.host, ep.user, ep.auth_ref) if isinstance(v, str) and v}
-                    public = "redacted" if (alias_cf in secrets or (ep.host and ep.host.casefold() in alias_cf)) else alias
+                    secrets = [v.casefold() for v in (ep.host, ep.user, ep.auth_ref) if isinstance(v, str) and v]
+                    public = "redacted" if any(s in alias_cf for s in secrets) else alias
                     choices.append((workers, alias, pinned, RemoteExecReceipt(
                         alias=public, endpoint_id=key[1], resolved_target="remote", effective_workers=min(count, workers),
                         limiting_factor="candidates" if count < workers else factor, accel_mode="c11")))
@@ -721,8 +725,7 @@ class RemoteDispatcher:
             raise RemoteExecUnavailableError(reason)
         return RemoteExecReceipt(fallback_reason=reason), None
 
-    def resolve_target(self, n_candidates: int) -> RemoteExecReceipt:
-        return self._resolve(n_candidates)[0]
+    def resolve_target(self, n_candidates: int) -> RemoteExecReceipt: return self._resolve(n_candidates)[0]
 
     def dispatch_batch(self, entrypoint: str, base_case: CaseInput, candidates: Sequence[Mapping], *,
                        local_runner=None, deadline_s: float | None = None) -> tuple[object, RemoteExecReceipt]:
@@ -731,50 +734,42 @@ class RemoteDispatcher:
         from mindie_sim.schema.case import Case
 
         policy = self.policy
-        if entrypoint not in ENTRYPOINTS or not candidates:
-            raise ValueError("invalid batch entrypoint or empty candidates")
+        if entrypoint not in ENTRYPOINTS or not candidates: raise ValueError("invalid batch entrypoint or empty candidates")
         budget = policy.job_timeout_s if deadline_s is None else min(deadline_s, policy.job_timeout_s)
-        if not math.isfinite(budget) or budget <= 0:
-            raise ValueError("invalid execution deadline")
-        job_deadline = time.monotonic() + budget
-        request_id = uuid.uuid4().hex
+        if not math.isfinite(budget) or budget <= 0: raise ValueError("invalid execution deadline")
+        job_deadline, request_id = time.monotonic() + budget, uuid.uuid4().hex
         payload = dict(protocol_version=PROTOCOL_VERSION, request_id=request_id, deadline_s=budget,
                        entrypoint=entrypoint, base_case=json_payload(base_case.to_dict() if isinstance(base_case, Case) else base_case),
                        candidates=json_payload(candidates), stage_root=None, max_workers=policy.max_remote_workers,
                        per_worker_mem_mib=policy.per_worker_mem_mib, primitive_manifest_path=None)
         limit = min(policy.max_request_bytes, REQUEST_LIMIT)
-        if len(_canonical(payload)) > limit:
-            raise ValueError("request byte limit exceeded")
-        receipt, endpoint = self._resolve(len(candidates))
-        receipt = replace(receipt, request_id=request_id)
-        reason = receipt.fallback_reason
+        if len(_canonical(payload)) > limit: raise ValueError("request byte limit exceeded")
+        receipt, endpoint = self._resolve(len(candidates), job_deadline=job_deadline)
+        receipt, reason = replace(receipt, request_id=request_id), receipt.fallback_reason
         if endpoint is not None:
             try:
-                stage, digest = self._stage_fn(endpoint, request_id, policy)
-            except TimeoutError:
-                raise
-            except Exception:
-                reason = "stage_unavailable"
+                stage_pol = replace(policy, stage_timeout_s=min(policy.stage_timeout_s, _remaining(job_deadline)))
+                stage, digest = self._stage_fn(endpoint, request_id, stage_pol)
+            except TimeoutError: raise
+            except Exception: reason = "stage_unavailable"
             else:
-                remaining = _remaining(job_deadline)
-                remote = payload | dict(deadline_s=remaining, stage_root=stage, max_workers=receipt.effective_workers,
+                remote = payload | dict(deadline_s=_remaining(job_deadline), stage_root=stage, max_workers=receipt.effective_workers,
                                         primitive_manifest_path="data/primitives/manifest.json")
-                if len(_canonical(remote)) > limit:
-                    raise ValueError("request byte limit exceeded")
+                if len(_canonical(remote)) > limit: raise ValueError("request byte limit exceeded")
                 try:
                     result = self._exec_fn(endpoint, remote, digest, policy)
+                except TimeoutError: raise
                 except Exception as error:
                     if getattr(error, "submission_state", None) != "not_sent":
                         raise RemoteExecUncertainError(request_id, receipt.alias) from None
                     reason = "transport_not_sent"
                 else:
                     if isinstance(result, dict) and "error" in result:
-                        message = "deadline_exceeded" if result["error"] == "deadline_exceeded" else "worker_failed"
-                        raise RuntimeError(message)
+                        if result["error"] == "deadline_exceeded": raise TimeoutError("deadline_exceeded")
+                        raise RuntimeError("worker_failed")
                     count = result.get("effective_workers", receipt.effective_workers)
                     return result, replace(receipt, effective_workers=count, bundle_digest=digest, submission_state="acknowledged")
-            if policy.target == "remote":
-                raise RemoteExecUnavailableError(reason)
+            if policy.target == "remote": raise RemoteExecUnavailableError(reason)
         local_payload = payload | {"deadline_s": _remaining(job_deadline)}
         result = (local_runner(local_payload) if local_runner else
                   execute_worker_request(local_payload, max_result_bytes=policy.max_result_bytes))

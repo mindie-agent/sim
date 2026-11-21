@@ -1,7 +1,7 @@
 {
   "arch_preset": "npu_arch_2201",
   "cann_version": "9.2.1",
-  "envelope_sha256": "73b1738a5e1d27b5c5814a32815274ea0011dfad8344a44714aee9788cbb66da",
+  "envelope_sha256": "e260f807806451da2e4a942b289e2dd38edc0eefe6abf67f196af36dd050b1d1",
   "primitives": {
     "P01_datacopy": {
       "evidence_id": "",
@@ -615,7 +615,7 @@
       }
     },
     "P20_host_dma_sync": {
-      "evidence_id": "capture://lab-a3-9382/camp-202611-l0-a3-9382/abbc7ec1573986f0062b647c3151303178b15310dfe96a0968931d73ad5238d6",
+      "evidence_id": "",
       "metrics": {
         "eager_d2h_sync_ns": {
           "bound_kind": "latency_lower",
@@ -623,27 +623,11 @@
         },
         "host_d2h_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 48000000000.0,
-          "cv_pct": 0.7285,
-          "n_samples": 32,
-          "p05": 40526426907.52354,
-          "p50": 40909874812.545166,
-          "p95": 41331893070.916985,
-          "p99": 41563070954.121025,
-          "trimmed_cv_pct": 0.5619,
-          "trimmed_mean": 40874943246.37908
+          "certified_upper_capacity": 41500000000.0
         },
         "host_h2d_bytes_per_s": {
           "bound_kind": "rate_upper",
-          "certified_upper_capacity": 64000000000.0,
-          "cv_pct": 0.2436,
-          "n_samples": 32,
-          "p05": 55742651143.00846,
-          "p50": 55933492792.28933,
-          "p95": 56146064326.24164,
-          "p99": 56192945172.18085,
-          "trimmed_cv_pct": 0.1828,
-          "trimmed_mean": 55946270885.81634
+          "certified_upper_capacity": 59500000000.0
         },
         "host_rc_d2h_bytes_per_s": {
           "bound_kind": "rate_upper",
@@ -659,22 +643,19 @@
         },
         "pinned_dma_startup_ns": {
           "bound_kind": "latency_lower",
-          "certified_upper_capacity": 0.0,
-          "cv_pct": 3.1215,
-          "n_samples": 32,
-          "p05": 28841.375,
-          "p50": 29650.625,
-          "p95": 31364.25,
-          "p99": 32920.9,
-          "trimmed_cv_pct": 1.4851,
-          "trimmed_mean": 29763.75
+          "certified_upper_capacity": 0.0
         }
       },
       "modes": {},
       "parameters": {
-        "contention_scope": "root_complex"
+        "contention_scope": "root_complex",
+        "silicon_profile_conflict": {
+          "observed_aic_count": 24,
+          "observed_aicore_freq_mhz": 1800,
+          "profile_aic_count": 20
+        }
       },
-      "status": "calibrated",
+      "status": "unmeasured",
       "units": {
         "latency": "ns",
         "rate": "bytes_per_s"
@@ -682,10 +663,10 @@
     }
   },
   "provenance": {
-    "calibrated": true,
+    "calibrated": false,
     "campaign_id": "camp-202611-l0-a3-9382",
     "capture_uri": "capture://lab-a3-9382/camp-202611-l0-a3-9382/abbc7ec1573986f0062b647c3151303178b15310dfe96a0968931d73ad5238d6",
-    "collected_utc": "2026-11-21T00:06:24Z",
+    "collected_utc": "2026-11-21T01:05:25Z",
     "endpoint_alias": "lab-a3-9382",
     "silicon_fingerprint": {
       "aic_count": 20,
