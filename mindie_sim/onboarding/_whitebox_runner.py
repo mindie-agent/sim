@@ -51,13 +51,29 @@ from .contracts import (
 _MIN_WORKLOAD_TRACE_LIMIT = 65536
 _TRACE_PER_OP_FACTOR = 256
 _TRACE_PER_SEQ_FACTOR = 128
-_MAX_WORKLOAD_TRACE_LIMIT = 524288
+_TRACE_KV_PAGE_SIZE = 128
+_TRACE_PER_KV_PAGE_FACTOR = 6
+_MAX_WORKLOAD_TRACE_LIMIT = 1_048_576
 _DEFAULT_AIV_PER_AIC_RATIO = 2
 _PERIODIC_BOUNDARY_REPS = 2
 _OBSERVER_COMPACT_THRESHOLD = 4096
 _MAX_DIAG_OP_IDS = 16
+_INDEXER_SHAPE_MIN_RANK = 3
 _TOPO_TOKEN_RE = re.compile(r"(tp|pp|dp|ep|pcp|dcp)(\d+)")
 _INTERVAL_HAS_CLOCK_OP = hasattr(EngineInterval, "clock_operator")
+_MLA_RECIPES = frozenset({
+    "ascend_paged_mla_decode_arch22",
+    "ascend_paged_mla_decode_arch35",
+    "latent_attention0",
+    "latent_attention_batch",
+    "paired_mla_attention_analytic",
+})
+_GQA_RECIPES = frozenset({
+    "fused_infer_attention",
+    "flash_attention",
+    "flash_attention_prefill",
+    "flash_attention_decode",
+})
 
 
 def check_no_service_regimes(payload: Any, *, path: str = "case") -> None:
@@ -355,6 +371,149 @@ def _apply_calibrated_primitive_rates(case: Any, table: PrimitiveTable) -> Any:
     return replace(case, machine=replace(case.machine, dies=tuple(updated_dies)))
 
 
+def _opt_pos_int(*values: Any) -> int | None:
+    for val in values:
+        if val is not None and not isinstance(val, bool):
+            try:
+                ival = int(val)
+                if ival > 0:
+                    return ival
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _extract_lowered_attention_dim(op: Any, sim_case: Any) -> tuple[int, int]:
+    """Return ``(latent_or_v_dim, cache_head_dim)`` for an attention ``OpSpec``."""
+    meta = dict(getattr(op, "metadata", ()) or ())
+    nabi = meta.get("native_attention_abi")
+    if isinstance(nabi, Mapping) and nabi.get("latent_width"):
+        lat = int(nabi["latent_width"])
+        rope = int(nabi.get("rope_width") or 0)
+        return lat, lat + rope
+    loc = getattr(op, "local_shape", None)
+    loc_dim = int(loc[-1]) if isinstance(loc, Sequence) and not isinstance(loc, (str, bytes)) and loc else 0
+    atv = meta.get("attention_tensor_view")
+    cache_dim = 0
+    if isinstance(atv, Mapping):
+        csh = atv.get("cache_head_shape")
+        if isinstance(csh, Sequence) and not isinstance(csh, (str, bytes)) and csh:
+            cache_dim = int(csh[-1])
+    fallback = int(getattr(sim_case.model, "head_dim", 0) or 0)
+    primary = loc_dim or cache_dim or fallback
+    return primary, cache_dim or primary
+
+
+def _verify_measured_binding(
+    chosen_ops: tuple[Any, ...],
+    sim_case: Any,
+    payload: Mapping[str, Any],
+    *,
+    local_kv_heads: int,
+    expected_level: str,
+    case_id: str,
+) -> None:
+    """Verify the lowered replay target matches the measured operator's recipe, layout, and geometry."""
+    binding = payload.get("measured_binding") if isinstance(payload.get("measured_binding"), Mapping) else {}
+    actual = payload.get("actual_shape") if isinstance(payload.get("actual_shape"), Mapping) else {}
+    plan_key = payload.get("plan_key") if isinstance(payload.get("plan_key"), Mapping) else {}
+    if not binding and not actual and not plan_key:
+        return
+
+    wanted_id = str(binding.get("target_op_id") or "").strip()
+    target_op: Any = None
+    if expected_level == "L1" and chosen_ops:
+        target_op = chosen_ops[0]
+        if wanted_id and target_op.op_id != wanted_id:
+            raise ModelingError(
+                f"whitebox_measured_binding_mismatch:{case_id}:target_op_id:measured={wanted_id}:lowered={target_op.op_id}"
+            )
+    elif wanted_id:
+        matches = [op for op in chosen_ops if op.op_id == wanted_id]
+        if not matches:
+            raise ModelingError(
+                f"whitebox_measured_binding_mismatch:{case_id}:target_op_id_missing:{wanted_id}"
+            )
+        target_op = matches[0]
+    else:
+        wanted_fam = str(binding.get("family") or plan_key.get("family") or payload.get("target_family") or "").strip()
+        if wanted_fam:
+            matches = [op for op in chosen_ops if op.family == wanted_fam]
+            target_op = matches[0] if matches else None
+    if target_op is None:
+        return
+
+    meas_rec = str(binding.get("recipe") or plan_key.get("recipe") or "").strip()
+    if target_op.family == "attention":
+        if meas_rec in _GQA_RECIPES and target_op.recipe in _MLA_RECIPES:
+            raise ModelingError(
+                f"whitebox_measured_binding_mismatch:{case_id}:recipe:measured={meas_rec}:lowered={target_op.recipe}"
+            )
+        if meas_rec in _MLA_RECIPES and target_op.recipe not in _MLA_RECIPES:
+            raise ModelingError(
+                f"whitebox_measured_binding_mismatch:{case_id}:recipe:measured={meas_rec}:lowered={target_op.recipe}"
+            )
+        if binding.get("recipe") and str(binding["recipe"]).strip() != target_op.recipe:
+            raise ModelingError(
+                f"whitebox_measured_binding_mismatch:{case_id}:recipe:measured={binding['recipe']}:lowered={target_op.recipe}"
+            )
+        if binding.get("paged") is False and (target_op.recipe in _MLA_RECIPES or "paged" in target_op.op_id):
+            raise ModelingError(
+                f"whitebox_measured_binding_mismatch:{case_id}:layout:measured_unpaged_vs_lowered_paged"
+            )
+        lowered_kv = max(1, int(local_kv_heads))
+        tp = max(1, int(getattr(sim_case.runtime.parallel, "tp", 1) or 1))
+        lowered_heads = max(1, int(getattr(sim_case.model, "num_heads", 1) or 1) // tp)
+        lowered_dim, lowered_cache_dim = _extract_lowered_attention_dim(target_op, sim_case)
+        meas_kv = _opt_pos_int(binding.get("kv_heads"), actual.get("kv_heads"))
+        meas_dim = _opt_pos_int(binding.get("latent"), binding.get("head_dim"), actual.get("latent"), actual.get("head_dim"))
+        meas_rope = _opt_pos_int(binding.get("rope"), actual.get("rope")) or 0
+        meas_heads = _opt_pos_int(binding.get("heads"), actual.get("heads"))
+        if meas_kv is not None and meas_kv != lowered_kv:
+            raise ModelingError(
+                f"whitebox_measured_binding_mismatch:{case_id}:kv_heads:measured={meas_kv}:lowered={lowered_kv}"
+            )
+        if meas_dim is not None and lowered_dim > 0 and meas_dim != lowered_dim:
+            raise ModelingError(
+                f"whitebox_measured_binding_mismatch:{case_id}:head_dim:measured={meas_dim}:lowered={lowered_dim}"
+            )
+        if meas_dim is not None and meas_rope > 0 and lowered_cache_dim > lowered_dim and (meas_dim + meas_rope) != lowered_cache_dim:
+            raise ModelingError(
+                f"whitebox_measured_binding_mismatch:{case_id}:cache_dim:measured={meas_dim + meas_rope}:lowered={lowered_cache_dim}"
+            )
+        if meas_heads is not None and meas_heads != lowered_heads:
+            raise ModelingError(
+                f"whitebox_measured_binding_mismatch:{case_id}:heads:measured={meas_heads}:lowered={lowered_heads}"
+            )
+    elif target_op.family == "rmsnorm":
+        loc = getattr(target_op, "local_shape", None)
+        lowered_w = int(loc[-1]) if isinstance(loc, Sequence) and loc else int(getattr(sim_case.model, "hidden_size", 0) or 0)
+        meas_w = _opt_pos_int(binding.get("width"), actual.get("width"))
+        if meas_w is not None and lowered_w > 0 and meas_w != lowered_w:
+            raise ModelingError(
+                f"whitebox_measured_binding_mismatch:{case_id}:width:measured={meas_w}:lowered={lowered_w}"
+            )
+    elif target_op.family == "indexer":
+        loc = tuple(getattr(target_op, "local_shape", ()) or ())
+        if len(loc) >= _INDEXER_SHAPE_MIN_RANK:
+            lowered_heads, lowered_dim = int(loc[1]), int(loc[2])
+            meas_heads = _opt_pos_int(binding.get("heads"), actual.get("heads"))
+            meas_dim = _opt_pos_int(binding.get("head_dim"), actual.get("head_dim"))
+            meas_kv = _opt_pos_int(binding.get("kv_heads"), actual.get("kv_heads"))
+            if meas_heads is not None and meas_heads != lowered_heads:
+                raise ModelingError(
+                    f"whitebox_measured_binding_mismatch:{case_id}:heads:measured={meas_heads}:lowered={lowered_heads}"
+                )
+            if meas_dim is not None and meas_dim != lowered_dim:
+                raise ModelingError(
+                    f"whitebox_measured_binding_mismatch:{case_id}:head_dim:measured={meas_dim}:lowered={lowered_dim}"
+                )
+            if meas_kv is not None and meas_kv != 1:
+                raise ModelingError(
+                    f"whitebox_measured_binding_mismatch:{case_id}:kv_heads:measured={meas_kv}:lowered=1"
+                )
+
+
 def _select_level_ops(
     all_ops: tuple[Any, ...],
     *,
@@ -365,8 +524,9 @@ def _select_level_ops(
     if level == "L3":
         return all_ops
     if level == "L1":
-        target_op_id = str(payload.get("target_op_id") or "").strip()
-        target_family = str(payload.get("target_family") or "").strip()
+        binding = payload.get("measured_binding") if isinstance(payload.get("measured_binding"), Mapping) else {}
+        target_op_id = str(payload.get("target_op_id") or binding.get("target_op_id") or "").strip()
+        target_family = str(payload.get("target_family") or binding.get("family") or "").strip()
         if target_op_id:
             matches = [op for op in all_ops if op.op_id == target_op_id]
         elif target_family:
@@ -420,25 +580,15 @@ def _resolve_step_dimensions(
     local_kv_heads: int,
     case_id: str,
 ) -> tuple[int, int, int, int]:
-    q_raw = payload.get("query_tokens")
-    t_raw = payload.get("tokens")
-    q_val = int(q_raw) if q_raw is not None and not isinstance(q_raw, bool) else None
-    t_val = int(t_raw) if t_raw is not None and not isinstance(t_raw, bool) else None
-    if t_val is not None and t_val > 0 and (q_val is None or q_val == 1 or str(payload.get("axis") or "") == "tokens"):
-        tokens = t_val
-    elif q_val is not None and q_val > 0:
-        tokens = q_val
-    else:
-        tokens = 1
-
     ctx_raw = payload.get("context_len") if payload.get("context_len") is not None else payload.get("context")
     context = int(ctx_raw) if ctx_raw is not None and not isinstance(ctx_raw, bool) else 0
 
     b_raw = payload.get("batch_size") if payload.get("batch_size") is not None else payload.get("sequences")
     batch = int(b_raw) if b_raw is not None and not isinstance(b_raw, bool) else 1
 
+    axis_name = str(payload.get("axis") or "").strip()
     bxkv_raw = payload.get("batch_x_kv_heads")
-    if bxkv_raw is None and str(payload.get("axis") or "") == "batch_x_kv_heads":
+    if bxkv_raw is None and axis_name == "batch_x_kv_heads":
         bxkv_raw = payload.get("value")
     bxkv = int(bxkv_raw) if bxkv_raw is not None and not isinstance(bxkv_raw, bool) else None
     kv_per_rank = max(1, int(local_kv_heads))
@@ -455,6 +605,22 @@ def _resolve_step_dimensions(
         sequences = max(1, derived_seqs)
     else:
         sequences = max(1, batch)
+
+    q_raw = payload.get("query_tokens")
+    t_raw = payload.get("tokens")
+    q_val = int(q_raw) if q_raw is not None and not isinstance(q_raw, bool) else None
+    t_val = int(t_raw) if t_raw is not None and not isinstance(t_raw, bool) else None
+    if axis_name == "tokens" and t_val is not None and t_val > 0:
+        tokens = max(1, t_val // sequences) if sequences > 1 and t_val >= sequences else t_val
+    elif q_val is not None and q_val > 0:
+        if sequences == 1 and q_val == 1 and t_val is not None and t_val > 1 and axis_name in {"", "tokens"}:
+            tokens = t_val
+        else:
+            tokens = q_val
+    elif t_val is not None and t_val > 0:
+        tokens = max(1, t_val // sequences) if sequences > 1 and t_val >= sequences else t_val
+    else:
+        tokens = 1
     actual_bxkv = int(sequences) * kv_per_rank
     return tokens, context, sequences, actual_bxkv
 
@@ -468,6 +634,7 @@ def _run_graphs_on_real_engine(
     external_inputs: Mapping[str, float] | None,
     family_registry: Any = None,
     sequences: int = 1,
+    context: int = 0,
 ) -> tuple[Any, Any, Any, float, float, _BusyUnionObserver]:
     from mindie_sim.prediction.cohort_traffic import bind_cohort_traffic
     from mindie_sim.prediction.cost import CostLedger
@@ -487,9 +654,15 @@ def _run_graphs_on_real_engine(
     external = dict(external_inputs or {})
     groups = cohorts(sim_case.runtime.parallel, sim_case.machine)
     op_count = sum(len(group) for group in expanded.values())
+    kv_pages = max(1, int(sequences)) * max(1, (max(0, int(context)) + _TRACE_KV_PAGE_SIZE) // _TRACE_KV_PAGE_SIZE + 1)
     trace_limit = min(
         _MAX_WORKLOAD_TRACE_LIMIT,
-        max(_MIN_WORKLOAD_TRACE_LIMIT, op_count * _TRACE_PER_OP_FACTOR, int(sequences) * _TRACE_PER_SEQ_FACTOR),
+        max(
+            _MIN_WORKLOAD_TRACE_LIMIT,
+            op_count * _TRACE_PER_OP_FACTOR,
+            int(sequences) * _TRACE_PER_SEQ_FACTOR,
+            kv_pages * _TRACE_PER_KV_PAGE_FACTOR,
+        ),
     )
     execution = Execution(
         sim_case, ctx.cost, recipes=book, bindings=ctx.bindings,
@@ -624,9 +797,18 @@ class WhiteboxSpineRunner:
         prepared = spine.lower(sim_case, LoweringRequest(step=step_req, tier="mainline"))
         graphs: dict[int, tuple[Any, ...]] = {}
         for entry in prepared.graph.executable:
-            graphs[entry.replica] = _select_level_ops(
+            chosen = _select_level_ops(
                 entry.ops, level=expected_level, payload=payload, case_id=case.case_id
             )
+            _verify_measured_binding(
+                chosen,
+                prepared.case,
+                payload,
+                local_kv_heads=local_kv,
+                expected_level=expected_level,
+                case_id=case.case_id,
+            )
+            graphs[entry.replica] = chosen
         external_inputs = {"analysis_input": 0.0} if any(
             "analysis_input" in op.deps for ops in graphs.values() for op in ops
         ) else None
@@ -638,6 +820,7 @@ class WhiteboxSpineRunner:
             external_inputs=external_inputs,
             family_registry=spine.families,
             sequences=sequences,
+            context=context,
         )
         elapsed_ns = int(round(elapsed_ms * NS_PER_MS))
         busy_ns = int(round(busy_ms * NS_PER_MS))
@@ -657,7 +840,8 @@ class WhiteboxSpineRunner:
         exec_op_ids = [str(op.op_id) for ops in graphs.values() for op in ops][:_MAX_DIAG_OP_IDS]
         lowered_dims: dict[str, Any] = {
             "materialized_sku": str(sim_case.machine.sku),
-            "tokens": step_req.tokens,
+            "tokens": step_req.tokens * step_req.sequences,
+            "query_tokens": step_req.tokens,
             "context": step_req.context,
             "sequences": step_req.sequences,
             "local_kv_heads": local_kv,

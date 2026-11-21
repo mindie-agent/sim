@@ -22,24 +22,17 @@ from mindie_sim.cli import main as mindie_sim_main
 from mindie_sim.observations.multilevel_gate import CaptureBoundary, CohortKey, EngineInterval, GateCase, bind_engine_interval
 from mindie_sim.observations.multilevel_stream import verify_capture_file_consistency
 from mindie_sim.onboarding import (
-    ANCHOR_CONTEXT_GRID, OFF_GRID_CLIFF_HELDOUT_GRID, OperatorCliffParameters, TimeoutBudget,
-    WhiteboxSpineRunner, bench_and_score_operator, calibrate_l0_and_fabric, certify_operator,
-    evaluate_abi_rejections, family_default_tiling_axes, generate_operator_cliff_plan,
-    probe_soc, program_dag_sha256, required_ranks_for_plan, run_operator_onboarding,
-    run_sku_onboarding, scaffold_operator, score_sealed_gate_cases, synthesize_operator_cliff_plan,
-    synthesize_sku_512_400k_plan, validate_512_400k, validate_abi, validate_operator_contract,
-    validate_parallel_topology, verify_receipt_sha256, verify_sku_gates,
+    ANCHOR_CONTEXT_GRID, OFF_GRID_CLIFF_HELDOUT_GRID, OperatorCliffParameters, TimeoutBudget, WhiteboxSpineRunner,
+    bench_and_score_operator, calibrate_l0_and_fabric, certify_operator, evaluate_abi_rejections, family_default_tiling_axes,
+    generate_operator_cliff_plan, probe_soc, program_dag_sha256, required_ranks_for_plan, run_operator_onboarding,
+    run_sku_onboarding, scaffold_operator, score_sealed_gate_cases, synthesize_operator_cliff_plan, synthesize_sku_512_400k_plan,
+    validate_512_400k, validate_abi, validate_operator_contract, validate_parallel_topology, verify_receipt_sha256, verify_sku_gates,
 )
-from mindie_sim.onboarding._gate_runners import (
-    acquire_coordinator_host_queue_lease, load_canonical_l0_sealer, normalize_profiler_records,
-    run_profiler_bench_subprocess, validate_host_queue_grant,
-)
+from mindie_sim.onboarding._gate_runners import acquire_coordinator_host_queue_lease, load_canonical_l0_sealer, normalize_profiler_records, run_profiler_bench_subprocess, validate_host_queue_grant
 from mindie_sim.onboarding._lean_and_receipts import check_lean_non_inversion
-from mindie_sim.onboarding._profiler_dispatch import build_profiler_subgraph_plan
+from mindie_sim.onboarding._operator_contract import _build_default_planning_context, _verify_resolved_operator_dual_bound
+from mindie_sim.onboarding._profiler_dispatch import _split_disjoint_acquisitions, _validate_dispatch_exit, build_profiler_subgraph_plan
 from mindie_sim.onboarding.contracts import sanitize_public_warning
-from mindie_sim.onboarding._operator_contract import (
-    _build_default_planning_context, _verify_resolved_operator_dual_bound,
-)
 from mindie_sim.onboarding.tiling_axes import ARCH_PRESET_22, ARCH_PRESET_35
 from mindie_sim.optimization.dual_bound import DagEdge, EventDagSpec, ResourceChoiceProgram, certify_lower_bound
 from mindie_sim.prediction.mechanism import OperatorPlan, Work
@@ -112,40 +105,27 @@ def _synthetic_profiler_root(tmp_path: Path, supported: tuple[str, ...] = ("demo
 
 
 def _lean_witness_row(case_id: str, work_ns: int, *, sim_ns: int, p99_ns: int) -> dict[str, Any]:
-    prog = ResourceChoiceProgram(num_resources=1, global_work=(work_ns,), site_modes=())
-    dag = EventDagSpec(node_quantum_ns=(work_ns,), edges=())
-    cert, _ = certify_lower_bound(prog, dag)
-    p_dict = {"num_resources": 1, "global_work": [work_ns], "site_modes": []}
-    d_dict = {"node_quantum_ns": [work_ns], "edges": []}
+    cert, _ = certify_lower_bound(ResourceChoiceProgram(1, (work_ns,), ()), EventDagSpec((work_ns,), ()))
+    p_dict, d_dict = {"num_resources": 1, "global_work": [work_ns], "site_modes": []}, {"node_quantum_ns": [work_ns], "edges": []}
     return {
         "case_id": case_id, "l_star_lean_ns": cert.l_star_lean_ns, "t_sim_ns": sim_ns, "t_silicon_p99_ns": p99_ns,
         "program": p_dict, "dag": d_dict, "program_dag_sha256": program_dag_sha256(p_dict, d_dict),
-        "certificate": {
-            "farkas": {"scale_d": cert.farkas.scale_d, "lambda_num": list(cert.farkas.lambda_num), "mu_num": list(cert.farkas.mu_num), "lower_bound_ns": cert.farkas.lower_bound_ns},
-            "path_edges": list(cert.path_edges), "sink_node_id": cert.sink_node_id, "l_star_lean_ns": cert.l_star_lean_ns,
-        },
+        "certificate": {"farkas": {"scale_d": cert.farkas.scale_d, "lambda_num": list(cert.farkas.lambda_num), "mu_num": list(cert.farkas.mu_num), "lower_bound_ns": cert.farkas.lower_bound_ns}, "path_edges": list(cert.path_edges), "sink_node_id": cert.sink_node_id, "l_star_lean_ns": cert.l_star_lean_ns},
     }
 
 
-def _independent_engine_runner(
-    pred_by_id: dict[str, int], *, default_ns: int = 20_000, clock_op: str = "elapsed_span",
-    busy_override: dict[str, int] | None = None, prog_sha_by_id: dict[str, str] | None = None,
-):
+def _independent_engine_runner(pred_by_id: dict[str, int], *, default_ns: int = 20_000, clock_op: str = "elapsed_span", busy_override: dict[str, int] | None = None, prog_sha_by_id: dict[str, str] | None = None):
     table, b_map, p_map = dict(pred_by_id), dict(busy_override or {}), dict(prog_sha_by_id or {})
 
     class _Runner:
         def _exec(self, case: GateCase) -> EngineInterval:
-            pred_ns = int(table.get(case.case_id, default_ns))
-            busy_ns = int(b_map.get(case.case_id, pred_ns))
+            pred_ns, busy_ns = int(table.get(case.case_id, default_ns)), int(b_map.get(case.case_id, table.get(case.case_id, default_ns)))
             eng = Engine([Resource("device", 1_000_000.0, "ns", "fifo")], trace_limit=32)
             s_ev = eng.submit(case.boundary.start_event, {"device": 100.0})
             e_ev = eng.submit(case.boundary.end_event, {"device": float(pred_ns)}, after=(s_ev,))
             eng.advance(until=(e_ev,))
-            diag = [
-                ("clock_operator", clock_op), ("busy_union_ns", busy_ns), ("elapsed_span_ns", pred_ns),
-                ("program_dag_sha256", p_map.get(case.case_id, program_dag_sha256({"num_resources": 1, "global_work": [max(1, pred_ns // 2)], "site_modes": []}, {"node_quantum_ns": [max(1, pred_ns // 2)], "edges": []}))),
-            ]
-            return bind_engine_interval(case, eng, s_ev, e_ev, diagnostics=tuple(diag))
+            diag = (("clock_operator", clock_op), ("busy_union_ns", busy_ns), ("elapsed_span_ns", pred_ns), ("program_dag_sha256", p_map.get(case.case_id, program_dag_sha256({"num_resources": 1, "global_work": [max(1, pred_ns // 2)], "site_modes": []}, {"node_quantum_ns": [max(1, pred_ns // 2)], "edges": []}))))
+            return bind_engine_interval(case, eng, s_ev, e_ev, diagnostics=diag)
 
         def run_l1(self, case: GateCase) -> EngineInterval: return self._exec(case)
         def run_l2(self, case: GateCase) -> EngineInterval: return self._exec(case)
@@ -154,31 +134,16 @@ def _independent_engine_runner(
     return _Runner()
 
 
-def _plan_fixture_bundle(
-    plan: dict[str, Any], *, levels: tuple[str, ...] = ("L1", "L2", "L3"),
-    clock_op: str = "elapsed_span", scale: float = 1.02, impl: str = "whitebox_spine",
-    capture_dir: Path | None = None, omit_capture_p99: bool = False,
-) -> tuple[list[dict[str, Any]], dict[str, int], list[dict[str, Any]], list[dict[str, Any]], dict[str, str]]:
+def _plan_fixture_bundle(plan: dict[str, Any], *, levels: tuple[str, ...] = ("L1", "L2", "L3"), clock_op: str = "elapsed_span", scale: float = 1.02, impl: str = "whitebox_spine", capture_dir: Path | None = None, omit_capture_p99: bool = False) -> tuple[list[dict[str, Any]], dict[str, int], list[dict[str, Any]], list[dict[str, Any]], dict[str, str]]:
     rows, preds, lean_rows, prog_shas = [], {}, [], {}
-    sku, family = str(plan["sku"]), str(plan.get("family") or "")
-    target_id = str(plan.get("target_id") or "")
+    sku, family, target_id = str(plan["sku"]), str(plan.get("family") or ""), str(plan.get("target_id") or "")
     for split, pts in (("train", plan["train_points"]), ("heldout", plan["heldout_points"])):
         for idx, pt in enumerate(pts):
-            pid = str(pt["point_id"])
-            lvl = "L1" if split == "train" else levels[idx % len(levels)]
+            pid, lvl = str(pt["point_id"]), ("L1" if split == "train" else levels[idx % len(levels)])
             meas = (10_000 + idx * 100) if split == "train" else (20_000 + idx * 250)
-            pred = int(round(meas * scale))
-            p99 = int(meas * 1.05)
-            ranks = list(range(validate_parallel_topology(str(pt.get("parallel_topology") or "tp1"))))
-            ev_ids = [f"{split[0]}-s-{idx}", f"{split[0]}-e-{idx}"]
-            cap_obj: dict[str, Any] = {
-                "case_id": pid, "sku": sku, "split": split, "level": lvl, "idx": idx,
-                "start_event": "start", "end_event": "end", "clock_domain": "device_ns",
-                "device_ranks": ranks, "clock_operator": clock_op, "event_ids": ev_ids,
-                "measured_ns": meas,
-                "busy_union_ns": meas if clock_op == "busy_union" else None,
-                "elapsed_span_ns": meas if clock_op == "elapsed_span" else None,
-            }
+            pred, p99 = int(round(meas * scale)), int(meas * 1.05)
+            ranks, ev_ids = list(range(validate_parallel_topology(str(pt.get("parallel_topology") or "tp1")))), [f"{split[0]}-s-{idx}", f"{split[0]}-e-{idx}"]
+            cap_obj: dict[str, Any] = {"case_id": pid, "sku": sku, "split": split, "level": lvl, "idx": idx, "start_event": "start", "end_event": "end", "clock_domain": "device_ns", "device_ranks": ranks, "clock_operator": clock_op, "event_ids": ev_ids, "measured_ns": meas, "busy_union_ns": meas if clock_op == "busy_union" else None, "elapsed_span_ns": meas if clock_op == "elapsed_span" else None}
             if not omit_capture_p99:
                 cap_obj["measured_p99_ns"] = p99
             cap_bytes = json.dumps(cap_obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -189,23 +154,15 @@ def _plan_fixture_bundle(
             preds[pid] = pred
             acq = "acq-train-src" if split == "train" else f"acq-held-{lvl.lower()}"
             row: dict[str, Any] = {
-                "case_id": pid, "point_id": pid, "sku": sku, "split": split, "level": lvl,
-                "acquisition_root": acq, "run_uid": f"run-{split[0]}-{lvl.lower()}-{idx}",
-                "raw_sha256": sha, "capture_uri": f"capture://{split}/{lvl.lower()}/{sha}.json",
-                "start_event": "start", "end_event": "end", "clock_domain": "device_ns",
-                "event_ids": ev_ids, "device_ranks": ranks,
-                "context_len": pt["value"] if pt["axis"] == "context_len" else None,
-                "tokens": pt["value"] if pt["axis"] == "tokens" else None,
-                "batch_size": pt["batch_size"], "query_tokens": pt["query_tokens"],
-                "parallel_topology": pt["parallel_topology"], "topk": pt["topk"],
-                "measured_ns": meas, "measured_p99_ns": p99, "clock_operator": clock_op,
-                "busy_union_ns": meas if clock_op == "busy_union" else meas - 500,
-                "elapsed_span_ns": meas if clock_op == "elapsed_span" else meas + 500,
+                "case_id": pid, "point_id": pid, "sku": sku, "split": split, "level": lvl, "acquisition_root": acq, "run_uid": f"run-{split[0]}-{lvl.lower()}-{idx}", "raw_sha256": sha, "capture_uri": f"capture://{split}/{lvl.lower()}/{sha}.json",
+                "start_event": "start", "end_event": "end", "clock_domain": "device_ns", "event_ids": ev_ids, "device_ranks": ranks,
+                "context_len": pt["value"] if pt["axis"] == "context_len" else None, "tokens": pt["value"] if pt["axis"] == "tokens" else None,
+                "batch_size": pt["batch_size"], "query_tokens": pt["query_tokens"], "parallel_topology": pt["parallel_topology"], "topk": pt["topk"],
+                "measured_ns": meas, "measured_p99_ns": p99, "clock_operator": clock_op, "busy_union_ns": meas if clock_op == "busy_union" else meas - 500, "elapsed_span_ns": meas if clock_op == "elapsed_span" else meas + 500,
                 "implementation": impl, "operator_id": target_id,
             }
             if family and family != "sku_suite":
-                row["target_family"] = family
-                row["upstream_abi"] = impl
+                row["target_family"], row["upstream_abi"] = family, impl
             if pt["axis"] not in {"context_len", "tokens"}:
                 row[str(pt["axis"])] = pt["value"]
             rows.append(row)
@@ -213,31 +170,17 @@ def _plan_fixture_bundle(
                 lw = _lean_witness_row(pid, int(meas * 0.7), sim_ns=pred, p99_ns=p99)
                 prog_shas[pid] = lw["program_dag_sha256"]
                 lean_rows.append(lw)
-    abi_rows = []
-    for pt in plan["abi_rejection_points"]:
-        sh: dict[str, Any] = {"batch_size": pt["batch_size"], "query_tokens": pt["query_tokens"], pt["axis"]: pt["value"]}
-        if pt.get("topk") is not None:
-            sh["topk"] = pt["topk"]
-        abi_rows.append({"point_id": pt["point_id"], "rejected": True, "abi_error": pt["abi_expected_error"], "executed_shape": sh})
+    abi_rows = [{"point_id": pt["point_id"], "rejected": True, "abi_error": pt["abi_expected_error"], "executed_shape": {"batch_size": pt["batch_size"], "query_tokens": pt["query_tokens"], pt["axis"]: pt["value"], **({"topk": pt["topk"]} if pt.get("topk") is not None else {})}} for pt in plan["abi_rejection_points"]]
     return rows, preds, lean_rows, abi_rows, prog_shas
 
 
 def _raw_l0_samples(sku: str, *, scale: float = 1.0, cann_version: str = "9.2.0") -> dict[str, Any]:
     out: dict[str, Any] = {
         "device_name": sku,
-        "P01_datacopy": {
-            "hbm_read_bytes_per_s": [A2_ORACLE["hbm_bw"] * scale * (0.72 + 0.001 * i) for i in range(SAMPLE_REPEATS)],
-            "hbm_write_bytes_per_s": [A2_ORACLE["hbm_bw"] * scale * (0.70 + 0.001 * i) for i in range(SAMPLE_REPEATS)],
-            "mte2_aiv_hit_bytes_per_s_per_core": [A2_ORACLE["mte2_aiv"] * scale * (0.75 + 0.001 * i) for i in range(SAMPLE_REPEATS)],
-        },
-        "P20_host_dma_sync": {
-            "host_h2d_bytes_per_s": [2.0e10 * (1.0 + 0.001 * i) for i in range(SAMPLE_REPEATS)],
-            "host_d2h_bytes_per_s": [2.0e10 * (1.0 + 0.001 * i) for i in range(SAMPLE_REPEATS)],
-        },
+        "P01_datacopy": {"hbm_read_bytes_per_s": [A2_ORACLE["hbm_bw"] * scale * (0.72 + 0.001 * i) for i in range(SAMPLE_REPEATS)], "hbm_write_bytes_per_s": [A2_ORACLE["hbm_bw"] * scale * (0.70 + 0.001 * i) for i in range(SAMPLE_REPEATS)], "mte2_aiv_hit_bytes_per_s_per_core": [A2_ORACLE["mte2_aiv"] * scale * (0.75 + 0.001 * i) for i in range(SAMPLE_REPEATS)]},
+        "P20_host_dma_sync": {"host_h2d_bytes_per_s": [2.0e10 * (1.0 + 0.001 * i) for i in range(SAMPLE_REPEATS)], "host_d2h_bytes_per_s": [2.0e10 * (1.0 + 0.001 * i) for i in range(SAMPLE_REPEATS)]},
     }
-    if cann_version:
-        out["cann_version"] = cann_version
-    return out
+    return {**out, "cann_version": cann_version} if cann_version else out
 
 
 def _a2_probe_payload(sku: str = A2_SKU, *, endpoint: str = "prod-cluster-01.corp") -> dict[str, Any]:
@@ -289,6 +232,23 @@ def test_probe_soc_conflicts_capture_gate_and_unspoofable_status(tmp_path):
         run_sku_onboarding(probe_json=full_probe, raw_l0_json=raw_l0, allow_scaffold=True, base_template_sku=A2_SKU, profiler_runner=lambda _p: obs, abi_rejection_results=abis, require_capture_files=False, runner=_independent_engine_runner(preds, prog_sha_by_id=pshas), lean_bounds_json=leans, repo_root=_synthetic_repo(tmp_path, family="no_cap2"))
     run_new = run_sku_onboarding(probe_json=full_probe, raw_l0_json=raw_l0, allow_scaffold=True, base_template_sku=A2_SKU, profiler_runner=lambda _p: obs, abi_rejection_results=abis, capture_root=cap_dir, runner=_independent_engine_runner(preds, prog_sha_by_id=pshas), lean_bounds_json=leans, repo_root=_synthetic_repo(tmp_path, family="new_sku"), out_dir=tmp_path / "new_sku_out")
     assert run_new["ok"] is True and run_new["status"] == "offline_reverify"
+    # H13: Opaque locator resolves intact nested non-digest file (trial-001.json) via private content-digest index!
+    off768_row = next(r for r in obs if r["point_id"] == "offgrid_ctx_768")
+    orig_cap_path = cap_dir / f"{off768_row['raw_sha256']}.json"
+    saved_cap_bytes = orig_cap_path.read_bytes()
+    nested_f = cap_dir / "audit-node.internal.example/lease-audituser/trial-001.json"
+    nested_f.parent.mkdir(parents=True, exist_ok=True)
+    nested_f.write_bytes(saved_cap_bytes)
+    orig_cap_path.unlink()
+    off768_row["capture_uri"] = "capture://audit-node.internal.example/lease-audituser/trial-001.json"
+    val_nested = validate_512_400k(sku=new_sku, primitives_json=run_new["stages"]["calibrate-l0-and-fabric"]["primitives_payload"], profiler_runner=lambda _p: obs, abi_rejection_results=abis, profile_override=run_new["stages"]["probe-soc"]["scaffold_profile"][new_sku], capture_root=cap_dir, runner=_independent_engine_runner(preds, prog_sha_by_id=pshas))
+    assert val_nested["ok"] is True and "audit-node" not in json.dumps(val_nested) and "trial-001" not in json.dumps(val_nested)
+    nested_gate = verify_sku_gates(sku=new_sku, validation_report_json=val_nested, primitives_json=run_new["stages"]["calibrate-l0-and-fabric"]["primitives_payload"], lean_bounds_json=leans, profile_override=run_new["stages"]["probe-soc"]["scaffold_profile"][new_sku], capture_root=cap_dir, repo_root=_synthetic_repo(tmp_path, family="nested_s"))
+    assert nested_gate["ok"] is True and nested_gate["status"] == "offline_reverify"
+    nested_f.unlink()
+    with pytest.raises(ModelingError, match="capture_file_missing"):
+        verify_sku_gates(sku=new_sku, validation_report_json=val_nested, primitives_json=run_new["stages"]["calibrate-l0-and-fabric"]["primitives_payload"], lean_bounds_json=leans, profile_override=run_new["stages"]["probe-soc"]["scaffold_profile"][new_sku], capture_root=cap_dir, repo_root=_synthetic_repo(tmp_path, family="nested_del"))
+    orig_cap_path.write_bytes(saved_cap_bytes)
     empty_caps, empty_repo = tmp_path / "empty_caps", _synthetic_repo(tmp_path, family="empty_c")
     empty_caps.mkdir()
     for cap_arg in (empty_caps, None):
@@ -485,7 +445,7 @@ def test_host_queue_unified_grant_cleanup_and_profiler_roundtrip(tmp_path):
         assert linfo["devices"] == [0, 1, 2, 3]
     assert linfo["receipt_unconfirmed"] is True and "audituser" not in linfo["receipt_warning"] and "permissionerror" not in linfo["receipt_warning"]
 
-    # Custom lease_acquirer rejected BEFORE injected l0_runner callback (live_bench=True) and on 5-device operator plan!
+    # H11: Both custom lease_acquirer AND default coordinator_bin block live callbacks (l0_runner, profiler_runner, bench_dispatcher)!
     @contextmanager
     def _bad_acq(devs: list[int], ttl: int, fence: int = 1):
         yield {"lease_mode": "coordinator_host_queue", "lease_id": "l-bad", "fence_token": fence, "devices": devs, "ttl_seconds": ttl}
@@ -493,13 +453,32 @@ def test_host_queue_unified_grant_cleanup_and_profiler_roundtrip(tmp_path):
     ran_cb: list[bool] = []
     with pytest.raises(ModelingError, match="host_queue_lease_"):
         calibrate_l0_and_fabric(sku=A2_SKU, live_bench=True, l0_runner=lambda _s, _t: (ran_cb.append(True) or {}), lease_acquirer=lambda _s, _t: _bad_acq([], 1, fence=0))
-    assert not ran_cb
+    with pytest.raises(ModelingError, match="host_queue_lease_device_count_mismatch"):
+        calibrate_l0_and_fabric(sku=A2_SKU, live_bench=True, endpoint_alias="audit-node.internal.example", l0_runner=lambda _s, _t: (ran_cb.append(True) or {}), coordinator_bin=str(c_short))
     plan_doc = generate_operator_cliff_plan(operator_id="live:v1", family="live", sku=A2_SKU, tile_dim=128, core_count=20, l2_bytes=A2_ORACLE["l2"])["plan"]
     with pytest.raises(ModelingError, match="host_queue_lease_device_count_mismatch"):
+        validate_512_400k(sku=A2_SKU, live_profiler=True, endpoint_alias="audit-node.internal.example", profiler_runner=lambda _p: (ran_cb.append(True) or []), coordinator_bin=str(c_short))
+    with pytest.raises(ModelingError, match="host_queue_lease_device_count_mismatch"):
+        bench_and_score_operator(cliff_plan=plan_doc, sku=A2_SKU, live_profiler=True, endpoint_alias="audit-node.internal.example", bench_dispatcher=lambda _p, _t: (ran_cb.append(True) or []), coordinator_bin=str(c_short))
+    assert not ran_cb
+    with pytest.raises(ModelingError, match="host_queue_lease_device_count_mismatch"):
         bench_and_score_operator(cliff_plan=plan_doc, sku=A2_SKU, live_profiler=True, lease_acquirer=lambda _s, _t: _bad_acq([0, 1, 2, 3, 4], 900))
-    # B4 translated subgraph plan: world_size=4 & zero sku_suite unmodeled nodes; busy_union-only fails; multi-mode base+eager joins run001!
-    b4_sub = build_profiler_subgraph_plan(synthesize_sku_512_400k_plan(sku=A2_SKU, core_count=20, l2_bytes=A2_ORACLE["l2"]).to_dict(), sku=A2_SKU)
-    assert b4_sub["world_size"] == 4 and all(c["nodes"][0]["family"] != "sku_suite" and c["nodes"][0].get("builder") for c in b4_sub["cases"])
+
+    # H6: B4 subgraph plan exports batch-preserving absorbed_mla + L1/L2/L3 DAGs + 4 disjoint splits; rejects geometry collapse & clamped ABI!
+    b4_plan = synthesize_sku_512_400k_plan(sku=A2_SKU, core_count=20, l2_bytes=A2_ORACLE["l2"]).to_dict()
+    b4_sub = build_profiler_subgraph_plan(b4_plan, sku=A2_SKU)
+    b4_by_id = {c["case_id"]: c for c in b4_sub["cases"]}
+    assert b4_sub["world_size"] == 4 and {c["level"] for c in b4_sub["cases"]} == {"L1", "L2", "L3"}
+    assert all(c["nodes"][0]["family"] != "sku_suite" and c["nodes"][0].get("builder") for c in b4_sub["cases"])
+    assert b4_by_id["cross_b16_ctx_4097"]["level"] == "L2" and len(b4_by_id["cross_b16_ctx_4097"]["nodes"]) == 2 and b4_by_id["cross_b16_ctx_4097"]["shape"]["sequences"] == 16 and b4_by_id["cross_b16_ctx_4097"]["shape"]["tokens"] == 16 and b4_by_id["cross_b16_ctx_4097"]["shape"]["kv_heads"] == 1
+    assert b4_by_id["cores_wave_batch_x_kv_heads_128_minus1_2559"]["shape"]["sequences"] == 2559 and b4_by_id["cores_wave_batch_x_kv_heads_128_minus1_2559"]["shape"]["tokens"] == 2559
+    assert b4_by_id["cross_tp2_pcp2_dcp4_ctx_400000"]["level"] == "L3" and b4_by_id["cross_tp2_pcp2_dcp4_ctx_400000"]["group_ranks"] == [0, 1, 2, 3] and any(n["kind"] == "collective" for n in b4_by_id["cross_tp2_pcp2_dcp4_ctx_400000"]["nodes"])
+    assert b4_by_id["abi_reject_topk_attr_2049"]["shape"]["top_k"] == 2049 and b4_by_id["abi_reject_topk_attr_2049"]["shape"]["enforce_exact_topk"] is True
+    assert [t for t, _ in _split_disjoint_acquisitions(b4_plan, domain=None, dry_run=False)] == ["train", "heldout-l1", "heldout-l2", "heldout-l3"]
+    with pytest.raises(ModelingError, match="profiler_actual_geometry_mismatch"):
+        normalize_profiler_records([{"schema": "mindie-bench-observation/1", "record_type": "observation", "case_id": "cross_b16_ctx_4097", "run_id": "r1.base.eager.t0", "trial": 0, "split": "heldout", "boundary": "fx_region", "timing_mode": "eager", "duration_ms": 0.25, "sample_id": "s0", "sku": A2_SKU, "validated": True, "qualified": True, "actual_shape": {"sequences": 1, "q_len": 16, "tokens": 16, "seq_len": 4097, "kv_heads": 1, "heads": 16, "head_dim": 512}}], plan_doc=b4_plan, sku=A2_SKU)
+    with pytest.raises(ModelingError, match="profiler_abi_rejection_unexpectedly_accepted"):
+        normalize_profiler_records([{"schema": "mindie-bench-observation/1", "record_type": "observation", "case_id": "abi_reject_topk_attr_2049", "run_id": "r1.base.eager.t0", "trial": 0, "split": "abi_rejection", "boundary": "device_kernel", "timing_mode": "eager", "duration_ms": 0.05, "sample_id": "s0", "sku": A2_SKU, "validated": True, "qualified": True, "actual_shape": {"top_k": 2048, "seq_len": 2049}}], plan_doc=b4_plan, sku=A2_SKU)
     with pytest.raises(ModelingError, match="clock_operator_plan_mismatch"):
         normalize_profiler_records([{"schema": "mindie-bench-observation/1", "record_type": "observation", "case_id": "offgrid_ctx_768", "run_id": "r1.base.stream_saturated.t0", "trial": 0, "split": "heldout", "boundary": "device_kernel", "timing_mode": "stream_saturated", "duration_ms": 0.0075, "sample_id": "s0", "sku": A2_SKU, "validated": True, "qualified": True}], plan_doc=plan_doc, sku=A2_SKU)
     cap_out = tmp_path / "prof_caps"
@@ -509,33 +488,45 @@ def test_host_queue_unified_grant_cleanup_and_profiler_roundtrip(tmp_path):
             {"schema": "mindie-bench-observation/1", "record_type": "observation", "case_id": "offgrid_ctx_768", "run_id": "run001.base.stream_saturated.t0", "trial": 0, "split": "heldout", "boundary": "device_kernel", "timing_mode": "stream_saturated", "duration_ms": 0.0075, "sample_id": "obs-1", "rank": None, "sku": A2_SKU, "validated": True, "qualified": True, "identity": {"level": "operator", "implementation": "aclnnLive"}},
             {"schema": "mindie-bench-observation/1", "record_type": "case_complete", "case_id": "offgrid_ctx_768", "run_id": "run001", "split": "heldout", "status": "ok", "summary": {"op": "live", "actual_shape": {"context_len": 768, "batch_size": 1, "query_tokens": 1}, "participating_ranks": [2]}},
             {"schema": "mindie-bench-receipt/1", "case_id": "abi_1", "status": "unsupported_binding", "reason": "abi_divisibility_violation:topk=2049", "requested_shape": {"context_len": 2049, "topk": 2049, "batch_size": 1, "query_tokens": 1}},
+            {"schema": "mindie-bench-receipt/1", "case_id": "abi_1", "status": "unsupported_binding", "reason": "kernel_symbol_missing", "requested_shape": {"context_len": 2049, "topk": 2049, "batch_size": 1, "query_tokens": 1}},
         ],
         plan_doc=plan_doc, sku=A2_SKU, endpoint_alias="audit-node.internal.example", capture_out_dir=cap_out,
     )
-    assert len(norm_obs) == 1 and norm_obs[0]["device_ranks"] == [2] and norm_obs[0]["context_len"] == 768 and norm_obs[0]["clock_operator"] == "elapsed_span" and "sim_case" in norm_obs[0] and len(norm_abi) == 1
+    assert len(norm_obs) == 1 and norm_obs[0]["device_ranks"] == [2] and norm_obs[0]["context_len"] == 768 and norm_obs[0]["clock_operator"] == "elapsed_span" and "sim_case" in norm_obs[0] and len(norm_abi) == 2
     assert "audit-node" not in json.dumps(norm_obs) and norm_obs[0]["run_uid"].startswith("run-")
     verify_capture_file_consistency("offgrid_ctx_768", CaptureBoundary(norm_obs[0]["raw_sha256"], norm_obs[0]["acquisition_root"], norm_obs[0]["run_uid"], (), tuple(norm_obs[0]["event_ids"]), tuple(norm_obs[0]["device_ranks"]), "device_monotonic", "k_start", "k_end", "device_kernel", "ns", norm_obs[0]["capture_uri"]), cap_out / f"{norm_obs[0]['raw_sha256']}.json")
 
-    # Separate train/heldout acquisitions, .rank0.json + partial exit 2 for planned ABI rejection, & remote endpoint routes via SSH (never local)!
+    # H9/H10: 4-rank parallel launch with distinct per-rank UUIDs joins into 1 four-rank observation; bad/conflicting/shapeless exit-2 rejected!
     abi_plan = synthesize_operator_cliff_plan(OperatorCliffParameters("sp:v2", "sparse_indexer", 128, 20, A2_ORACLE["l2"]), sku=A2_SKU).to_dict()
-    abi_pid = abi_plan["abi_rejection_points"][0]["point_id"]
+    abi_pt = abi_plan["abi_rejection_points"][0]
+    abi_pid, abi_err = abi_pt["point_id"], abi_pt["abi_expected_error"]
+    abi_by_id = {abi_pid: abi_pt}
+    for bad_recs in (
+        [{"case_id": abi_pid, "status": "unsupported_binding", "reason": "kernel_symbol_missing", "executed_shape": {"batch_size": 1, "query_tokens": 1, "context_len": abi_pt["value"], "topk": abi_pt["topk"]}}],
+        [{"case_id": abi_pid, "status": "unsupported_binding", "reason": abi_err}],
+        [{"case_id": abi_pid, "status": "unsupported_binding", "reason": abi_err, "executed_shape": {"batch_size": 1, "query_tokens": 1, "context_len": abi_pt["value"], "topk": abi_pt["topk"]}}, {"case_id": abi_pid, "status": "unsupported_binding", "reason": "kernel_symbol_missing", "executed_shape": {"batch_size": 1, "query_tokens": 1, "context_len": abi_pt["value"], "topk": abi_pt["topk"]}}],
+    ):
+        with pytest.raises(ModelingError, match="profiler_bench_unexpected_partial_failure"):
+            _validate_dispatch_exit(2, [{"status": "partial"}], bad_recs, abi_by_id, "", is_remote=False)
     fake_prof = tmp_path / "fake_prof_sub"
     (fake_prof / "mindie_profiler/bench").mkdir(parents=True)
     (fake_prof / "mindie_profiler/__init__.py").write_text("", encoding="utf-8")
     (fake_prof / "mindie_profiler/__main__.py").write_text(
-        "import json, sys\nfrom pathlib import Path\nargs = sys.argv[1:]\nassert args[:2] == ['bench', 'subgraph']\n"
+        "import json, os, sys\nfrom pathlib import Path\nargs = sys.argv[1:]\nassert args[:2] == ['bench', 'subgraph']\n"
         "plan = json.loads(Path(args[args.index('--plan') + 1]).read_text(encoding='utf-8'))\n"
         "obs_p, out_p = Path(args[args.index('--observations') + 1]), Path(args[args.index('--out') + 1])\n"
-        "is_tr = plan['plan_id'].endswith(':train')\n"
-        "cid = 'anchor_ctx_512' if is_tr else 'offgrid_ctx_768'\nrid = 'r_tr' if is_tr else 'r_ho'\n"
-        "obs_p.write_text(json.dumps({'schema':'mindie-bench-observation/1','record_type':'observation','case_id':cid,'run_id':f'{rid}.base.eager.t0','trial':0,'split':'train' if is_tr else 'heldout','timing_mode':'eager','duration_ms':0.02,'sample_id':'s0','sku':plan['sku'],'validated':True,'qualified':True}) + '\\n', encoding='utf-8')\n"
-        f"recs = [{{'case_id': cid, 'status': 'ok'}}] + ([] if is_tr else [{{'case_id': {abi_pid!r}, 'status': 'unsupported_binding', 'reason': 'abi_divisibility_violation:topk=2049'}}])\n"
-        "Path(f'{out_p}.rank0.json').write_text(json.dumps({'schema':'mindie-bench-subgraph-run/1','status':'ok' if is_tr else 'partial','plan_id':plan['plan_id'],'records':recs}), encoding='utf-8')\n"
+        "is_tr, rk, ws = plan['plan_id'].endswith(':train'), int(os.environ.get('RANK', '0')), int(os.environ.get('WORLD_SIZE', '1'))\n"
+        "cid = 'anchor_ctx_512' if is_tr else 'cross_tp2_pcp2_dcp4_ctx_400000'\n"
+        "rid = f'r_tr_u{rk}' if is_tr else f'r_ho_u{rk}'\n"
+        "obs_p.write_text(json.dumps({'schema':'mindie-bench-observation/1','record_type':'observation','plan_id':plan['plan_id'],'case_id':cid,'run_id':f'{rid}.base.eager.t0','trial':0,'repeat_index':0,'rank':rk,'split':'train' if is_tr else 'heldout','timing_mode':'eager','duration_ms':0.02 + 0.001*rk,'sample_id':f's{rk}','sku':plan['sku'],'validated':True,'qualified':True}) + '\\n', encoding='utf-8')\n"
+        f"recs = [{{'case_id': cid, 'status': 'ok'}}] + ([] if is_tr else [{{'case_id': {abi_pid!r}, 'status': 'unsupported_binding', 'reason': {abi_err!r}, 'executed_shape': {{'batch_size': 1, 'query_tokens': 1, 'context_len': {abi_pt['value']}, 'topk': {abi_pt['topk']}}}}}])\n"
+        "Path(f'{out_p}.rank{rk}.json' if ws > 1 else str(out_p)).write_text(json.dumps({'schema':'mindie-bench-subgraph-run/1','status':'ok' if is_tr else 'partial','plan_id':plan['plan_id'],'records':recs}), encoding='utf-8')\n"
         "sys.exit(0 if is_tr else 2)\n",
         encoding="utf-8",
     )
     obs_l, abi_l = run_profiler_bench_subprocess(abi_plan, sku=A2_SKU, profiler_root=fake_prof, allowed_phy_ids=[0, 1, 2, 3], fence_token=7)
-    assert len(obs_l) == 2 and obs_l[0]["run_uid"] != obs_l[1]["run_uid"] and len(abi_l) == 1 and abi_l[0]["point_id"] == abi_pid
+    ho_mr = next(o for o in obs_l if o["case_id"] == "cross_tp2_pcp2_dcp4_ctx_400000")
+    assert len(obs_l) == 2 and ho_mr["device_ranks"] == [0, 1, 2, 3] and obs_l[0]["run_uid"] != obs_l[1]["run_uid"] and len(abi_l) == 1 and abi_l[0]["point_id"] == abi_pid
     with pytest.raises(ModelingError, match="onboarding_endpoint_unknown|onboarding_json_read_failed"):
         validate_512_400k(sku=A2_SKU, live_profiler=True, endpoint_alias="audit-node.internal.example", profiler_root=fake_prof, lease_acquirer=lambda _s, _t: _bad_acq([0, 1, 2, 3], 600))
     with pytest.raises(ModelingError, match="onboarding_endpoint_unknown|onboarding_json_read_failed"):
@@ -559,6 +550,12 @@ def test_whitebox_sku_check_2d_kv_heads_dcp_compose_and_real_dag(tmp_path):
     with pytest.raises(ModelingError, match="whitebox_batch_x_kv_heads_indivisible"):
         score_sealed_gate_cases([{**base_l1, "case_id": "bx-odd", "point_id": "bx-odd", "batch_x_kv_heads": 2559, "sim_case": gqa_case}], sku=A2_SKU, runner=WhiteboxSpineRunner(clock_operator="busy_union"))
     assert score_sealed_gate_cases([{**base_l1, "case_id": "bx-1kv", "point_id": "bx-1kv", "batch_x_kv_heads": 2559}], sku=A2_SKU, runner=WhiteboxSpineRunner(clock_operator="busy_union"))["residuals"][0]["predicted_ns"] > 0
+
+    # H8: WhiteboxSpineRunner rejects mismatched unpaged GQA binding (kv=2, dim=128) against MLA replay & accepts matched absorbed_mla binding!
+    attn_l1 = {**base_l1, "case_id": "wb-attn", "point_id": "wb-attn", "context_len": 768, "target_family": "attention"}
+    with pytest.raises(ModelingError, match="whitebox_measured_binding_mismatch"):
+        score_sealed_gate_cases([{**attn_l1, "measured_binding": {"builder": "fused_infer_attention", "family": "attention", "recipe": "fused_infer_attention", "paged": False, "heads": 16, "kv_heads": 2, "head_dim": 128}}], sku=A2_SKU, runner=WhiteboxSpineRunner(clock_operator="busy_union"))
+    assert score_sealed_gate_cases([{**attn_l1, "target_op_id": "s0.l0.paged_mla_decode", "measured_binding": {"builder": "absorbed_mla", "family": "attention", "recipe": "ascend_paged_mla_decode_arch22", "target_op_id": "s0.l0.paged_mla_decode", "paged": True, "heads": 16, "kv_heads": 1, "head_dim": 512, "latent": 512}}], sku=A2_SKU, runner=WhiteboxSpineRunner(clock_operator="busy_union"))["residuals"][0]["predicted_ns"] > 0
 
     # Dependent L2 (`norm1 -> q_proj`) emits `wire_ns` & passes check_lean_non_inversion; private capture URI scrubbed to opaque locator!
     l2_dep = {**base_l1, "case_id": "l2-dep", "point_id": "l2-dep", "level": "L2", "capture_uri": f"capture://audit-node.internal.example/lease-audituser-0abc/{base_l1['raw_sha256']}.json", "target_family": None, "target_op_ids": ["s0.l0.norm1", "s0.l0.q_proj"]}

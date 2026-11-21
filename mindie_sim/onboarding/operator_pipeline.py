@@ -195,10 +195,22 @@ def bench_and_score_operator(
             else:
                 rows = list(captured_json)
         elif bench_dispatcher is not None:
-            if lease_acquirer is not None:
+            if lease_acquirer is not None or live_profiler:
                 lease_ttl_s = int(timeout_s) + DEFAULT_CLEANUP_GRACE_S
+                lease_ctx = (
+                    lease_acquirer(sku, lease_ttl_s)
+                    if lease_acquirer is not None
+                    else acquire_coordinator_host_queue_lease(
+                        endpoint_alias,
+                        npu_count=req_npus,
+                        ttl_seconds=lease_ttl_s,
+                        min_subprocess_timeout_s=int(timeout_s),
+                        cleanup_grace_s=DEFAULT_CLEANUP_GRACE_S,
+                        coordinator_bin=coordinator_bin,
+                    )
+                )
                 raw_lease: Mapping[str, Any] = {}
-                with lease_acquirer(sku, lease_ttl_s) as lease_info:
+                with lease_ctx as lease_info:
                     raw_lease = lease_info if isinstance(lease_info, Mapping) else {}
                     validate_host_queue_grant(
                         raw_lease, required_devices=req_npus, min_ttl_seconds=lease_ttl_s

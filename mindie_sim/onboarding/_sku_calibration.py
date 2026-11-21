@@ -370,7 +370,7 @@ def calibrate_l0_and_fabric(
     require_grant = bool(live_bench or lease_acquirer is not None)
     if lease_acquirer is not None:
         lease_ctx: AbstractContextManager[Mapping[str, Any]] = lease_acquirer(sku, budget.outer_timeout_s)
-    elif use_live:
+    elif live_bench:
         lease_ctx = acquire_coordinator_host_queue_lease(
             endpoint_alias,
             npu_count=1,

@@ -34,12 +34,14 @@ from typing import Any
 
 from mindie_sim.observations.multilevel_gate import CaptureBoundary, GateCase
 from mindie_sim.observations.multilevel_stream import (
+    digest_file_streaming,
     resolve_capture_file,
     verify_capture_file_consistency,
 )
 from mindie_sim.schema.common import ModelingError
 
 from .contracts import (
+    MAX_READ_JSON_BYTES,
     NS_PER_MS,
     NS_PER_US,
     VALID_CLOCK_OPERATORS,
@@ -52,27 +54,50 @@ _MAX_CAPTURE_SCAN_FILES = 4096
 _OPAQUE_LEASE_DIGEST_RE = re.compile(r"^lease-[0-9a-f]{16}$")
 
 
-def _find_capture_by_digest(root_path: Path, raw_sha256: str) -> Path | None:
+def _norm_sha_hex(raw_sha256: str) -> str:
     sha = str(raw_sha256 or "").strip().lower()
-    if sha.startswith("sha256:"):
-        sha = sha[7:]
+    return sha[7:] if sha.startswith("sha256:") else sha
+
+
+def build_content_digest_index(root_path: Path) -> dict[str, Path]:
+    """Build a bounded private ``{sha256: Path}`` index over retained files under ``root_path``."""
+    index: dict[str, Path] = {}
+    if not root_path.is_dir():
+        return index
+    scanned = 0
+    for cand in sorted(root_path.rglob("*")):
+        if not cand.is_file():
+            continue
+        scanned += 1
+        try:
+            if cand.stat().st_size <= MAX_READ_JSON_BYTES:
+                digest = digest_file_streaming(cand)
+                index.setdefault(digest, cand)
+        except TimeoutError:
+            raise
+        except OSError:
+            pass
+        if scanned >= _MAX_CAPTURE_SCAN_FILES:
+            break
+    return index
+
+
+def _find_capture_by_digest(
+    root_path: Path,
+    raw_sha256: str,
+    *,
+    digest_index: dict[str, Path] | None = None,
+) -> Path | None:
+    sha = _norm_sha_hex(raw_sha256)
     if not sha or not root_path.is_dir():
         return None
-    wanted = {f"{sha}.json", f"{sha}.jsonl"}
     for name in (f"{sha}.json", f"{sha}.jsonl"):
         cand = root_path / name
         if cand.is_file():
             return cand
-    checked = 0
-    for cand in root_path.rglob("*"):
-        if not cand.is_file():
-            continue
-        checked += 1
-        if cand.name.lower() in wanted:
-            return cand
-        if checked >= _MAX_CAPTURE_SCAN_FILES:
-            break
-    return None
+    if digest_index is not None:
+        return digest_index.get(sha)
+    return build_content_digest_index(root_path).get(sha)
 
 
 def _quantile_ns(sorted_ns: Sequence[int], q: float) -> int:
@@ -152,6 +177,8 @@ def resolve_and_verify_capture_truth(
     capture_root: str | Path | None,
     capture_files: Mapping[str, str | Path] | None,
     require_capture_files: bool,
+    digest_index: dict[str, Path] | None = None,
+    resolved_files: dict[str, str | Path] | None = None,
 ) -> tuple[bool, int | None, int | None]:
     """Hash-verify on-disk capture and derive authoritative ``(measured_ns, p99_ns)``."""
     root_path = Path(capture_root) if capture_root is not None else None
@@ -164,13 +191,17 @@ def resolve_and_verify_capture_truth(
         raw_sha256=boundary.raw_sha256,
     )
     if resolved is None and root_path is not None:
-        resolved = _find_capture_by_digest(root_path, boundary.raw_sha256)
+        resolved = _find_capture_by_digest(
+            root_path, boundary.raw_sha256, digest_index=digest_index
+        )
     if resolved is None:
         if require_capture_files:
             raise ModelingError(f"capture_file_missing:{cid}")
         return False, None, None
 
     verify_capture_file_consistency(cid, boundary, resolved)
+    if resolved_files is not None:
+        resolved_files[cid] = resolved
     cap_obj = read_bounded_json(resolved)
     containers = _extract_capture_containers(cap_obj, cid)
     if not containers:
@@ -254,6 +285,7 @@ def reverify_report_captures(
     must_verify = bool(require_capture_files or capture_root is not None or capture_files is not None)
     if not must_verify:
         return False
+    digest_index = build_content_digest_index(Path(capture_root)) if capture_root is not None else None
     for row in rows:
         cid = str(row.get("case_id") or "").strip()
         raw_sha = str(row.get("raw_sha256") or "").strip()
@@ -286,6 +318,7 @@ def reverify_report_captures(
             capture_root=capture_root,
             capture_files=capture_files,
             require_capture_files=True,
+            digest_index=digest_index,
         )
         if not verified or cap_ns is None:
             raise ModelingError(f"capture_file_missing:{cid}")
@@ -361,6 +394,8 @@ def verify_capture_and_override_case(
     capture_files: Mapping[str, str | Path] | None,
     require_capture_files: bool,
     row_p99_ns: int | None,
+    digest_index: dict[str, Path] | None = None,
+    resolved_files: dict[str, str | Path] | None = None,
 ) -> tuple[GateCase, bool, int | None]:
     """Bind a ``GateCase`` strictly to hash-verified raw capture duration and ``p99``."""
     del row
@@ -371,6 +406,8 @@ def verify_capture_and_override_case(
         capture_root=capture_root,
         capture_files=capture_files,
         require_capture_files=require_capture_files,
+        digest_index=digest_index,
+        resolved_files=resolved_files,
     )
     if not verified:
         return gc, False, row_p99_ns
@@ -388,6 +425,7 @@ def verify_capture_and_override_case(
 
 
 __all__ = [
+    "build_content_digest_index",
     "resolve_and_verify_capture_truth",
     "reverify_report_captures",
     "verify_capture_and_override_case",

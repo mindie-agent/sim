@@ -41,7 +41,11 @@ from mindie_sim.primitives.schema import PrimitiveTable
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import datapath_for_die
 
-from ._capture_truth import reverify_report_captures, verify_capture_and_override_case
+from ._capture_truth import (
+    build_content_digest_index,
+    reverify_report_captures,
+    verify_capture_and_override_case,
+)
 from ._lean_and_receipts import validate_strict_threshold_pct, verify_stage_report
 from ._sku_calibration import materialize_sku_hardware
 from ._whitebox_runner import check_no_service_regimes
@@ -142,6 +146,8 @@ def _evaluate_manifest_path(
     seen_heldout_ids: set[str] = set()
     seen_train_ids: set[str] = set()
     seen_captures: dict[tuple[str, frozenset[str], tuple[int, ...], str], str] = {}
+    digest_index = build_content_digest_index(Path(capture_root)) if capture_root is not None else None
+    resolved_files: dict[str, str | Path] = dict(capture_files or {})
 
     for idx, row in enumerate(raw_cases):
         cid = str(row.get("case_id") or f"manifest-{idx}")
@@ -178,6 +184,8 @@ def _evaluate_manifest_path(
             capture_root=capture_root, capture_files=capture_files,
             require_capture_files=require_capture_files,
             row_p99_ns=extract_measured_p99_ns(row),
+            digest_index=digest_index,
+            resolved_files=resolved_files,
         )
         if gc.split == "heldout":
             if pid in seen_heldout_ids:
@@ -247,9 +255,10 @@ def _evaluate_manifest_path(
         strict_three_level_blind=True,
     )
     fits = _parse_fits(fits_json)
+    eff_cap_files = resolved_files or capture_files
     validate_lineage(
         manifest, fits,
-        capture_root=capture_root, capture_files=capture_files,
+        capture_root=capture_root, capture_files=eff_cap_files,
         require_capture_files=require_capture_files,
     )
     active_runner = _bind_active_runner(
@@ -259,7 +268,7 @@ def _evaluate_manifest_path(
     raw_residuals = list(
         evaluate_multilevel(
             manifest, fits, checked_runner, target_split="all",
-            capture_root=capture_root, capture_files=capture_files,
+            capture_root=capture_root, capture_files=eff_cap_files,
             require_capture_files=require_capture_files,
         )
     )

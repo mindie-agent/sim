@@ -32,7 +32,7 @@ from mindie_sim.observations.multilevel_gate import (
 from mindie_sim.primitives.schema import PrimitiveTable
 from mindie_sim.schema.common import ModelingError
 
-from ._capture_truth import verify_capture_and_override_case
+from ._capture_truth import build_content_digest_index, verify_capture_and_override_case
 from ._lean_and_receipts import validate_strict_threshold_pct
 from ._whitebox_runner import WhiteboxSpineRunner, check_no_service_regimes
 from .contracts import (
@@ -302,6 +302,7 @@ def _row_to_gate_case(row: Mapping[str, Any], *, sku: str, idx: int, plan_pt: Ma
     clock_op = resolve_authoritative_clock_operator(row, cid, plan_pt=plan_pt)
     coord_keys = (
         "sim_case", "target_op_id", "target_family", "target_layer", "target_op_ids",
+        "measured_binding", "actual_shape", "plan_key",
         "context_len", "tokens", "batch_size", "query_tokens", "batch_x_kv_heads", "parallel_topology", "topk",
     )
     if isinstance(row.get("boundary"), Mapping) and isinstance(row.get("cohort"), Mapping):
@@ -573,6 +574,8 @@ def score_sealed_gate_cases(
     seen_train_ids: set[str] = set()
     seen_heldout_captures: dict[tuple[str, frozenset[str], tuple[int, ...], str], str] = {}
     captures_verified_flags: list[bool] = []
+    digest_index = build_content_digest_index(Path(capture_root)) if capture_root is not None else None
+    resolved_files: dict[str, str | Path] = dict(capture_files or {})
 
     for idx, row in enumerate(scorable_rows):
         raw_pid = str(row.get("point_id") or row.get("case_id") or f"obs-{idx}").strip()
@@ -586,6 +589,8 @@ def score_sealed_gate_cases(
             capture_root=capture_root, capture_files=capture_files,
             require_capture_files=require_capture_files,
             row_p99_ns=extract_measured_p99_ns(row),
+            digest_index=digest_index,
+            resolved_files=resolved_files,
         )
         captures_verified_flags.append(cap_verified)
         row_fam = str(row.get("target_family") or payload_map.get("target_family") or row.get("op_family") or "").strip()
@@ -640,8 +645,9 @@ def score_sealed_gate_cases(
         for i, tok in enumerate(all_fit_tokens)
     )
     fits = FrozenFitManifest("onboarding-frozen-fits", "mindie-frozen-fits/1", fit_params)
+    eff_cap_files = resolved_files or capture_files
     validate_lineage(
-        manifest, fits, capture_root=capture_root, capture_files=capture_files,
+        manifest, fits, capture_root=capture_root, capture_files=eff_cap_files,
         require_capture_files=require_capture_files,
     )
     active_runner = _bind_active_runner(
@@ -653,7 +659,7 @@ def score_sealed_gate_cases(
     raw_residuals = list(
         evaluate_multilevel(
             manifest, fits, checked_runner, target_split="all",
-            capture_root=capture_root, capture_files=capture_files,
+            capture_root=capture_root, capture_files=eff_cap_files,
             require_capture_files=require_capture_files,
         )
     )
