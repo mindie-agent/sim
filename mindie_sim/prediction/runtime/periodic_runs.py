@@ -1,0 +1,298 @@
+"""Exact periodic and strided byte-run coalescing, residency splitting and overlap.
+
+[Role] Coalesce adjacent equal-stride address runs and evaluate exact residency
+  and overlap queries without expanding large coprime common periods.
+[Invariants] Output byte sets are exact and pairwise disjoint across warm/cold
+  classifications; sparse residency intersections stay O(sparse rows) in memory.
+[Timeouts & Locks] Pure bounded in-memory arithmetic; no I/O, threads or locks.
+[Side-Effect Policy] Pure value transformations with zero global mutation.
+"""
+from __future__ import annotations
+
+from collections import Counter
+from dataclasses import replace
+from heapq import merge
+from itertools import groupby
+from math import gcd, lcm
+
+from .memory_physics import (
+    AddressRun,
+    SectorCoverage,
+    _MAX_EXPLICIT_SECTOR_INTERVALS,
+    _ceil_div,
+)
+
+
+def _range_run(lo: int, hi: int) -> AddressRun:
+    return AddressRun(lo, 1, hi - lo, hi - lo)
+
+
+def _run_end(run: AddressRun) -> int:
+    return run.base_byte + (run.rows - 1) * run.stride_bytes + run.row_bytes
+
+
+def _coverage_runs(coverage: SectorCoverage):
+    yield from (_range_run(lo, hi) for lo, hi in coverage.intervals)
+    for run in coverage.periodic:
+        # A sector-aligned phase repeats after the row's byte offset realigns.
+        phase_rows = run.sector_bytes // gcd(run.sector_bytes, run.stride_bytes)
+        stride = phase_rows * run.stride_bytes
+        for phase in range(min(phase_rows, run.rows)):
+            lo, hi = run._row_bounds(phase)
+            rows = (run.rows - 1 - phase) // phase_rows + 1
+            yield AddressRun(lo, rows, hi - lo, stride)
+
+
+def _coalesce_runs(runs) -> tuple[AddressRun, ...]:
+    """Merge overlapping single spans and adjacent equal-stride periodic runs."""
+    compacted: list[AddressRun] = []
+    multi_tails: dict[tuple[int, int, int], int] = {}
+    for run in sorted(runs, key=lambda item: (item.base_byte, item.stride_bytes, item.row_bytes)):
+        if not run.rows or not run.row_bytes:
+            continue
+        if run.rows == 1 or run.stride_bytes <= run.row_bytes:
+            run = _range_run(run.base_byte, _run_end(run))
+        if run.rows > 1:
+            chain_key = (run.row_bytes, run.stride_bytes, run.base_byte)
+            prev_idx = multi_tails.pop(chain_key, None)
+            if prev_idx is not None:
+                prev = compacted[prev_idx]
+                merged = replace(prev, rows=prev.rows + run.rows)
+                compacted[prev_idx] = merged
+                multi_tails[(merged.row_bytes, merged.stride_bytes,
+                             merged.base_byte + merged.rows * merged.stride_bytes)] = prev_idx
+                continue
+        if compacted:
+            previous = compacted[-1]
+            if previous.rows == 1 and run.rows == 1 and run.base_byte <= _run_end(previous):
+                compacted[-1] = _range_run(previous.base_byte, max(_run_end(previous), _run_end(run)))
+                continue
+            stride = previous.stride_bytes if previous.rows > 1 else run.stride_bytes
+            if (max(previous.rows, run.rows) > 1 and previous.row_bytes == run.row_bytes
+                    and (run.rows == 1 or run.stride_bytes == stride)
+                    and previous.base_byte + previous.rows * stride == run.base_byte):
+                if previous.rows > 1:
+                    multi_tails.pop((previous.row_bytes, previous.stride_bytes,
+                                     previous.base_byte + previous.rows * previous.stride_bytes), None)
+                merged = replace(previous, rows=previous.rows + run.rows, stride_bytes=stride)
+                compacted[-1] = merged
+                multi_tails[(merged.row_bytes, merged.stride_bytes,
+                             merged.base_byte + merged.rows * merged.stride_bytes)] = len(compacted) - 1
+                continue
+        idx = len(compacted)
+        compacted.append(run)
+        if run.rows > 1:
+            multi_tails[(run.row_bytes, run.stride_bytes,
+                         run.base_byte + run.rows * run.stride_bytes)] = idx
+    return tuple(compacted)
+
+
+def _sweep(events):
+    """Yield consecutive byte spans with the labels active throughout each span."""
+    active, previous = Counter(), 0
+    for offset, changes in groupby(events, key=lambda event: event[0]):
+        if active and offset > previous:
+            yield previous, offset, active
+        for _, label, delta in changes:
+            active[label] += delta
+            if not active[label]:
+                del active[label]
+        previous = offset
+
+
+def _window_rows(run, lo, hi):
+    return range(max(0, (lo - run.base_byte - run.row_bytes) // run.stride_bytes + 1),
+                 min(run.rows, _ceil_div(hi - run.base_byte, run.stride_bytes)))
+
+
+def _row_events(run, label, lo, hi):
+    for row in _window_rows(run, lo, hi):
+        start = run.base_byte + row * run.stride_bytes
+        yield max(lo, start), label, 1
+        yield min(hi, start + run.row_bytes), label, -1
+
+
+def _classified_spans(events, classify):
+    previous = None
+    for lo, hi, active in _sweep(events):
+        state = classify(active)
+        if previous is not None and previous[1] == lo and previous[2] == state:
+            previous = previous[0], hi, state
+            continue
+        if previous is not None:
+            yield previous
+        previous = (lo, hi, state) if state is not None else None
+    if previous is not None:
+        yield previous
+
+
+def _partition_runs(tagged_runs, classify):
+    """Apply a byte-set operation across repeating spans without expanding their rows."""
+    events = []
+    for run, label in dict.fromkeys(tagged_runs):
+        end = _run_end(run)
+        if run.rows == 1 or run.stride_bytes <= run.row_bytes:
+            run = _range_run(run.base_byte, end)
+        events.extend(((run.base_byte, (run, label), 1), (end, (run, label), -1)))
+    for lo, hi, active in _sweep(sorted(events, key=lambda event: event[0])):
+        if all(run.rows == 1 for run, _ in active):
+            if (state := classify({label for _, label in active})) is not None:
+                yield state, _range_run(lo, hi)
+            continue
+        # Each active run repeats over its bounding span. Only one common
+        # period needs scanning, with the final repeat clipped to the span.
+        period = lcm(*(run.stride_bytes for run, _ in active if run.rows > 1))
+        end = min(hi, lo + period)
+        streams = (_row_events(run, label, lo, end) for run, label in active)
+        for begin, finish, state in _classified_spans(merge(*streams, key=lambda event: event[0]), classify):
+            rows = (hi - finish) // period + 1
+            width = finish - begin
+            yield state, AddressRun(begin, rows, width, period) if rows > 1 else _range_run(begin, finish)
+            if (tail := hi - (begin + rows * period)) > 0:
+                yield state, _range_run(hi - tail, hi)
+
+
+def _sparse_window(run, masks) -> bool:
+    if run.rows <= 1 or run.stride_bytes <= run.row_bytes:
+        return False
+    period = lcm(run.stride_bytes, *(r.stride_bytes for r in masks if r.rows > 1))
+    rows = sum(len(_window_rows(mask, run.base_byte, _run_end(run))) for mask in masks)
+    return min(run.rows, period // run.stride_bytes) > max(_MAX_EXPLICIT_SECTOR_INTERVALS, rows)
+
+
+def _disjoint_periodic(runs) -> bool:
+    if len(runs) <= 1:
+        return True
+    ordered = sorted(runs, key=lambda r: r._bounds())
+    return all(left._bounds()[1] <= right._bounds()[0] for left, right in zip(ordered, ordered[1:]))
+
+
+def _coverage_overlap(left: SectorCoverage, right: SectorCoverage) -> int:
+    if left.empty or right.empty:
+        return 0
+    if not left.intervals and not right.intervals and left.periodic and right.periodic:
+        if len(left.periodic) == 1 and len(right.periodic) == 1:
+            if left.periodic[0] == right.periodic[0]:
+                return left.periodic[0].total_bytes()
+            dense, sparse = sorted((*left.periodic, *right.periodic), key=lambda r: r.stride_bytes)
+            d_lo, d_hi = dense._bounds()
+            s_lo, s_hi = sparse._bounds()
+            if d_hi <= s_lo or s_hi <= d_lo:
+                return 0
+            if sparse.stride_bytes >= sparse.row_bytes + sparse.sector_bytes and _sparse_window(dense, (sparse,)):
+                rows = _window_rows(sparse, d_lo - sparse.sector_bytes, d_hi + sparse.sector_bytes)
+                return sum(dense.overlap_with_interval(*sparse._row_bounds(row)) for row in rows)
+        elif _disjoint_periodic(left.periodic) and len(right.periodic) == 1:
+            return sum(_coverage_overlap(SectorCoverage((), (r,)), right) for r in left.periodic)
+        elif len(left.periodic) == 1 and _disjoint_periodic(right.periodic):
+            return sum(_coverage_overlap(left, SectorCoverage((), (r,))) for r in right.periodic)
+    elif not left.intervals and len(left.periodic) == 1 and left.periodic[0] in right.periodic:
+        return left.periodic[0].total_bytes()
+    return left.overlap_bytes(right)
+
+
+def _merged_bytes(coverage: SectorCoverage) -> int:
+    if not coverage.intervals and len(coverage.periodic) == 2:
+        left, right = coverage.periodic
+        return left.total_bytes() + right.total_bytes() - _coverage_overlap(
+            SectorCoverage((), (left,)), SectorCoverage((), (right,)),
+        )
+    return coverage.measure_bytes()
+
+
+def _clip_rows(run: AddressRun, lo: int, hi: int):
+    rows = _window_rows(run, lo, hi)
+    if rows and hi > lo:
+        first = run.base_byte + rows.start * run.stride_bytes
+        yield _range_run(max(lo, first), min(hi, first + run.row_bytes))
+        if len(rows) > 2:
+            yield replace(run, base_byte=first + run.stride_bytes, rows=len(rows) - 2)
+        if len(rows) > 1:
+            last = run.base_byte + (rows.stop - 1) * run.stride_bytes
+            yield _range_run(last, min(hi, last + run.row_bytes))
+
+
+def _disjoint_components(runs: tuple[AddressRun, ...]):
+    ordered = sorted(runs, key=lambda item: (item.base_byte, _run_end(item)))
+    components: list[tuple[AddressRun, ...]] = []
+    group = [ordered[0]]
+    limit = _run_end(ordered[0])
+    for run in ordered[1:]:
+        if run.base_byte >= limit:
+            components.append(tuple(group))
+            group = [run]
+            limit = _run_end(run)
+        else:
+            group.append(run)
+            limit = max(limit, _run_end(run))
+    components.append(tuple(group))
+    return tuple(components)
+
+
+def _sparse_residency_run(run: AddressRun, masks: tuple[AddressRun, ...]):
+    lo, hi = run.base_byte, _run_end(run)
+    streams = (_row_events(mask, True, lo, hi) for mask in masks)
+    for begin, end, _ in _classified_spans(merge(*streams, key=lambda e: e[0]), bool):
+        warm = tuple(_clip_rows(run, begin, end))
+        if not warm:
+            continue
+        yield from ((False, part) for part in _clip_rows(run, lo, begin))
+        yield from ((True, part) for part in warm)
+        lo = end
+    yield from ((False, part) for part in _clip_rows(run, lo, hi))
+
+
+def _residency_runs(data, masks):
+    data_runs = _coalesce_runs(data)
+    mask_runs = _coalesce_runs(masks)
+    if not data_runs:
+        return
+    if not mask_runs:
+        yield from ((False, run) for run in data_runs)
+        return
+    for component in _disjoint_components(data_runs):
+        if len(component) == 1:
+            run = component[0]
+            if _sparse_window(run, mask_runs):
+                yield from _sparse_residency_run(run, mask_runs)
+            else:
+                yield from _partition_runs(
+                    ((run, False), *((m, True) for m in mask_runs)),
+                    lambda labels: True in labels if False in labels else None,
+                )
+            continue
+        if any(_sparse_window(run, mask_runs) for run in component):
+            clean = _coalesce_runs(
+                run for _, run in _partition_runs(((r, True) for r in component), lambda _: True)
+            )
+            for run in clean:
+                if _sparse_window(run, mask_runs):
+                    yield from _sparse_residency_run(run, mask_runs)
+                else:
+                    yield from _partition_runs(
+                        ((run, False), *((m, True) for m in mask_runs)),
+                        lambda labels: True in labels if False in labels else None,
+                    )
+        else:
+            yield from _partition_runs(
+                (*((r, False) for r in component), *((m, True) for m in mask_runs)),
+                lambda labels: True in labels if False in labels else None,
+            )
+
+
+__all__ = [
+    "_classified_spans",
+    "_clip_rows",
+    "_coalesce_runs",
+    "_coverage_overlap",
+    "_coverage_runs",
+    "_merged_bytes",
+    "_partition_runs",
+    "_range_run",
+    "_residency_runs",
+    "_row_events",
+    "_run_end",
+    "_sparse_window",
+    "_sweep",
+    "_window_rows",
+]

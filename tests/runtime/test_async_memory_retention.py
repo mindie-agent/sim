@@ -511,3 +511,70 @@ def test_grant_and_reader_release_each_require_their_own_event():
     assert memory.occupied_bytes(0, 0) == 4096
     assert memory.release_grant(0, "N")
     assert memory.occupied_bytes(0, 0) == 0
+
+
+@pytest.mark.parametrize("backend", ("python", "c"))
+def test_evicted_dirty_writeback_blocks_overlapping_reads_until_delivered(backend):
+    from mindie_sim.prediction.runtime.engine import Engine, Resource
+    from mindie_sim.prediction.runtime.memory_physics import (
+        AddressRun, AddressRunPlan, AdmissionMemoryView, CACHE_POLICY_DISABLE, HbmBusSpec,
+        MemoryAccessPattern, ReuseKey, VisibilityContract, bind_memory_access,
+    )
+
+    size = 64
+    bus = HbmBusSpec(0, 64.0, 16.0, 0.0)
+    view = AdmissionMemoryView({0: size}, granule_bytes=size)
+    eng = Engine([Resource("mte3", 32.0, units=1), Resource("mte2_aiv", 64.0, units=1),
+                  Resource("l2", 64.0, units=1)], backend=backend, trace_limit=64)
+    eng.add_hbm_bus(bus)
+    key = ReuseKey(0, "X", 1, "s0")
+    runs = AddressRunPlan((AddressRun(0, 1, size, size),))
+    p_wr = MemoryAccessPattern("X", 1, 0, 0, "write", "mte3", size, runs, key,
+                               visibility=VisibilityContract(scope="die", private_workspace=True))
+    p_rd = MemoryAccessPattern("X", 1, 0, 0, "read", "mte2_aiv", size, runs, key,
+                               visibility=VisibilityContract(scope="die", private_workspace=True))
+    p_unc = MemoryAccessPattern("X", 1, 0, 0, "read", "mte2_aiv", size, runs, None, cache_policy=CACHE_POLICY_DISABLE)
+    b_wr = bind_memory_access(p_wr, view, hbm_bus=bus, copy_hit_bytes_per_ms=32.0, copy_miss_bytes_per_ms=32.0,
+                              l2_bytes_per_ms=64.0, pipe_row_id="mte3", l2_row_id="l2", commit=False)
+    b_rd = bind_memory_access(p_rd, view, hbm_bus=bus, copy_hit_bytes_per_ms=64.0, copy_miss_bytes_per_ms=64.0,
+                              l2_bytes_per_ms=64.0, pipe_row_id="mte2_aiv", l2_row_id="l2", commit=False)
+    b_unc = bind_memory_access(p_unc, view, hbm_bus=bus, copy_hit_bytes_per_ms=64.0, copy_miss_bytes_per_ms=64.0,
+                               l2_bytes_per_ms=64.0, pipe_row_id="mte2_aiv", l2_row_id="l2", commit=False)
+    ev_w = eng.submit_bound_access("wr", b_wr, release=0.0, memory_state=view, pattern=p_wr)
+    eng.advance(until=(ev_w,))
+    eng.advance(horizon=2.5)
+    view.grant_reservation(0, "full", size)
+    ev_r1 = eng.submit_bound_access("r1", b_rd, release=3.0, memory_state=view, pattern=p_rd)
+    ev_r2 = eng.submit_bound_access("r2", b_rd, release=4.1, memory_state=view, pattern=p_rd)
+    ev_r3 = eng.submit_bound_access("r3", b_unc, release=4.5, memory_state=view, pattern=p_unc)
+    eng.advance(until=(ev_r1, ev_r2, ev_r3), first=False)
+    wb_end = next(r["end_ms"] for r in eng.trace if "dirty_writeback" in r["task"])
+    assert ev_r1.time >= wb_end and ev_r2.time >= wb_end and ev_r3.time >= wb_end
+    assert eng.delivered[bus.ctr_w] == float(size)
+
+
+def test_split_periodic_residency_runs_stay_memory_bounded():
+    import tracemalloc
+    from mindie_sim.prediction.runtime.memory_physics import AddressRun, AddressRunPlan
+    from mindie_sim.templates.contracts import TensorRangeObligation, _split_entry_residency
+
+    rows, half, stride, sparse, sector = 4_194_304, 2_097_152, 4097, 4_194_336, 32
+    cov = AddressRunPlan((AddressRun(0, half, sector, sparse), AddressRun(half * sparse, half, sector, sparse))).sector_coverage()
+    r_a = AddressRun(0, half, sector, stride)
+    cases = (
+        (TensorRangeObligation(0, "rows", 0, (), "hbm_cold", "device", (r_a, AddressRun(half * stride, half, sector, stride))),
+         {"l2_warm": 1024, "hbm_cold": 134_216_704}),
+        (TensorRangeObligation(0, "rows", 0, (), "hbm_cold", "device", (r_a, AddressRun((half + 1) * stride, half - 1, sector, stride))),
+         {"l2_warm": 1024, "hbm_cold": 134_216_672}),
+    )
+    for entry, expected in cases:
+        tracemalloc.start()
+        try:
+            split = tuple(_split_entry_residency(entry, cov))
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        assert peak < 8 * 1024**2
+        counts = {item.initial_residency: sum(hi - lo for lo, hi in item.ranges)
+                  + sum(run.rows * run.row_bytes for run in item.address_runs) for item in split}
+        assert counts == expected

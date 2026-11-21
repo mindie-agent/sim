@@ -16,11 +16,13 @@ from typing import TYPE_CHECKING
 
 from mindie_sim.prediction.mechanism import OperatorPlan, PlannedRecipe, Work
 from mindie_sim.prediction.program import Program
+from mindie_sim.prediction.runtime.memory_physics import _merge_byte_intervals
 from mindie_sim.prediction.streams import MAIN_STREAM, bind_stream_owners
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import DatapathCapabilitySpec, datapath_for_die
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.templates.catlass_catalog import CatlassProblem, matrix_problem, streamk_partition
+from mindie_sim.templates.contracts import _union_obligations
 from mindie_sim.templates.dsl_catalog import ATTN_RES, AttnResProblem, DSL_KERNEL_IDS
 from mindie_sim.templates.registry import builtin_template_catalog
 
@@ -61,14 +63,44 @@ def streamk_crossing_partials(b_tot: int, g_k: int, c_aic: int) -> int:
     return streamk_partition(b_tot, g_k, c_aic).partial_count if c_aic else 0
 
 
+def _weight_backing_offset(meta):
+    ranges = meta.get("weight_ranges", meta.get("ranges"))
+    if not isinstance(ranges, Sequence) or isinstance(ranges, (str, bytes)) or not ranges:
+        return 0
+    spans = []
+    for item in ranges:
+        if not isinstance(item, Sequence) or len(item) != 2:
+            return 0
+        lo, hi = item
+        if type(lo) is not int or type(hi) is not int or lo < 0 or hi <= lo:
+            return 0
+        spans.append((lo, hi))
+    merged = _merge_byte_intervals(spans)
+    return merged[0][0] if len(merged) == 1 else 0
+
+
+def _weight_backing_version(meta):
+    version = meta.get("weight_tensor_version", meta.get("tensor_version", 0))
+    return version if type(version) is int and version >= 0 else 0
+
+
 def _matrix_problem(op, meta):
     if op.source_boundary == "call":
         return None
     weight_id = _weight_allocation_id(meta)
+    b_base_byte = _weight_backing_offset(meta) if weight_id is not None else 0
+    b_version = _weight_backing_version(meta) if weight_id is not None else 0
     declared = meta.get("catlass_problem")
     if declared is not None:
         problem = matrix_problem(declared)
-        return replace(problem, b_id=weight_id) if weight_id is not None else problem
+        if weight_id is not None:
+            updates = {"b_id": weight_id}
+            if problem.b_base_byte == 0 and b_base_byte:
+                updates["b_base_byte"] = b_base_byte
+            if problem.b_version == 0 and b_version:
+                updates["b_version"] = b_version
+            problem = replace(problem, **updates)
+        return problem
     shape = tuple(meta.get("matrix_shape", op.local_shape))
     if len(shape) != MATRIX_RANK or min(shape, default=0) <= 0 or op.link_bytes or op.vector_ops:
         return None
@@ -88,6 +120,7 @@ def _matrix_problem(op, meta):
         meta.get("dtype_acc", "int32" if dtype_a == "int8" else "fp32"),
         groups=groups, a_id=f"{op.op_id}:a", b_id=weight_id or f"{op.op_id}:b",
         c_id=f"{op.op_id}:c", has_bias=bool(meta.get("has_bias")), mx_mode=mx_mode,
+        b_base_byte=b_base_byte, b_version=b_version,
     )
 
 
@@ -188,9 +221,9 @@ def _dsl_candidates(ops, datapath, aic, aiv):
 
 def _declared_regions(ops):
     for op in ops:
-        for declaration in dict(op.metadata).get("fuse_regions", ()):
+        for index, declaration in enumerate(dict(op.metadata).get("fuse_regions", ())):
             if declaration.get("numerically_equivalent") and "compiler_options" in declaration:
-                yield declaration
+                yield op.op_id, index, declaration
 
 
 def _replay_ops(ops):
@@ -230,7 +263,7 @@ def _dsl_proposals(ops, datapath, aic, aiv):
             boundary = KernelBoundary(spec.kernel_id, refs, params)
             yield (FuseRegion(refs, tuple(meta["dsl_preserve_ports"]), (boundary,),
                               fusion_tier="K3_dsl_pipeline"),), spec
-    for declaration in _declared_regions(ops):
+    for declaring_op, index, declaration in _declared_regions(ops):
         ids = tuple(declaration["op_ids"])
         members = _convex_members(ops, ids)
         if len(members) < 2:
@@ -242,7 +275,8 @@ def _dsl_proposals(ops, datapath, aic, aiv):
             continue
         refs = tuple(OpRef("atom", op_id) for op_id in ids)
         preserve = tuple(declaration.get("preserve_ports", ()))
-        yield (FuseRegion(refs, preserve, (KernelBoundary(identifier, refs),),
+        params = (("declaration", index), ("declaring_op", declaring_op))
+        yield (FuseRegion(refs, preserve, (KernelBoundary(identifier, refs, params),),
                           fusion_tier="K3_dsl_pipeline"),), result.summary.spec
 
 
@@ -278,14 +312,21 @@ def _catalog_lowerer(op, members, graph_ops, datapath, tier, identifier, params,
                 if all(_encode_spec_value(getattr(spec, key)) == value for key, value in options.items()):
                     return partial(catalog.lower, tier, spec, problem)
     elif tier == "K3":
-        if not options and op.family == "rewrite_fused":
-            ids = tuple(member.op_id for member in members)
-            declared_region = next((entry for entry in _declared_regions(members)
-                                    if entry["region_id"] == identifier and tuple(entry["op_ids"]) == ids), None)
-            if declared_region is not None:
-                return _region_lowerer(declared_region, members, graph_ops)
         index = options.pop("declaration", None)
         declaring_op = options.pop("declaring_op", None)
+        if not options and op.family == "rewrite_fused" and (index is None or type(index) is int):
+            ids = tuple(member.op_id for member in members)
+            sources = members if (declaring_op is None or any(m.op_id == declaring_op for m in members)) else graph_ops
+            matches = [
+                entry for source_op, ordinal, entry in _declared_regions(sources)
+                if entry["region_id"] == identifier and tuple(entry["op_ids"]) == ids
+                and (declaring_op is None or source_op == declaring_op)
+                and (index is None or ordinal == index)
+            ]
+            if len(matches) == 1:
+                return _region_lowerer(matches[0], members, graph_ops)
+            if len(matches) > 1:
+                raise ModelingError(f"rewrite_template_recipe_unbound:{op.op_id}:{identifier}")
         kernel = "dsl." + identifier.removeprefix("dsl.").partition(".")[0]
         if options.keys() <= {"variant"} and (index is None or type(index) is int):
             choices = []
@@ -323,7 +364,7 @@ def replay_catalog_binding(scenario, entry, op, binding, applied, stream):
         boundary, = operation.kernel_boundaries
         tier, identifier, params = "K3", boundary.abi_id, boundary.params
         if not identifier.startswith("dsl.") and not any(
-            decl["region_id"] == identifier for decl in _declared_regions(members)
+            decl["region_id"] == identifier for _, _, decl in _declared_regions(entry.ops)
         ):
             return None
     else:
@@ -340,6 +381,39 @@ def replay_catalog_binding(scenario, entry, op, binding, applied, stream):
     if binding and op.family == "rewrite_fused":
         summary = replace(summary, op_ids=dict(applied.absorbed_atoms)[op.op_id])
     return recipe, summary
+
+
+def canonical_region_summaries(scenario, applied):
+    """Derive canonical per-site summaries for all catalog-bound regions in ``applied``."""
+    templates = {binding.target_op: binding for binding in applied.template_bindings}
+    atomic = {entry.replica: entry for entry in scenario.atomic_ops}
+    streams = {stream.rank: stream for stream in applied.streams}
+    canonical = {}
+    for entry in applied.executable:
+        rank_atomic = atomic.get(entry.replica)
+        if rank_atomic is None:
+            continue
+        stream = streams.get(entry.replica)
+        for op in entry.ops:
+            bound = replay_catalog_binding(
+                scenario, rank_atomic, op, templates.get(op.op_id), applied, stream,
+            )
+            if bound is not None:
+                canonical[entry.replica, op.stage, op.op_id] = bound[1]
+    return canonical
+
+
+def summary_matches_canonical(summary, canonical) -> bool:
+    """Verify caller-supplied obligations, work and spec match the canonical recipe."""
+    return (
+        summary.tier == canonical.tier
+        and summary.region_id == canonical.region_id
+        and tuple(summary.op_ids) == tuple(canonical.op_ids)
+        and summary.spec == canonical.spec
+        and tuple(summary.semantic_work) == tuple(canonical.semantic_work)
+        and _union_obligations(summary.read_obligations) == _union_obligations(canonical.read_obligations)
+        and _union_obligations(summary.write_obligations) == _union_obligations(canonical.write_obligations)
+    )
 
 
 @dataclass(frozen=True, slots=True)

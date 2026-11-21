@@ -127,6 +127,24 @@ class _EnginePrepareMixin:
                 and cohort_size == 1 and not cohort_widened and not cohort_members
                 and not latency_from_first_service):
             return _EMPTY_TASK
+        if work and self._hbm_bus_aliases:
+            aliases = self._hbm_bus_aliases
+            if any(base in work and work[base] for base in aliases):
+                work = dict(work)
+                expanded_caps = dict(caps) if caps else None
+                for base, (row_r, row_w) in aliases.items():
+                    amount = work.get(base)
+                    if amount and row_r not in work and row_w not in work:
+                        res = self.resources.get(base)
+                        if res is not None and res.rate > 0.0:
+                            scaled = float(amount) / res.rate
+                            work[row_r] = scaled
+                            work[row_w] = scaled
+                            if expanded_caps is not None and base in expanded_caps:
+                                cap_scaled = float(expanded_caps[base]) / res.rate
+                                expanded_caps.setdefault(row_r, cap_scaled)
+                                expanded_caps.setdefault(row_w, cap_scaled)
+                caps = expanded_caps
         if (work is not None and work.__class__ is dict and not caps
                 and not acquire and not free and placement is None
                 and not coupled and latency == 0.0 and not priority

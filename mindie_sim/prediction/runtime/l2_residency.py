@@ -8,26 +8,31 @@
 """
 from __future__ import annotations
 
-from collections import Counter
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass, replace
-from heapq import merge
-from itertools import groupby
-from math import gcd, lcm
+from dataclasses import dataclass
 
 from mindie_sim.schema.common import ModelingError
 from .memory_physics import (
-    AddressRun, AddressRunPlan,
+    AddressRunPlan,
     BoundAccess, BurstTurnRule, ByteLedger,
     CACHE_POLICY_LAST_USE,
     ConstraintTerm, CounterTerm,
     DEFAULT_L2_GRANULE_BYTES,
     HbmBusSpec, MemoryAccessPattern,
     ReuseKey, SectorCoverage,
-    _L2_CACHE_DISABLE, _MAX_EXPLICIT_SECTOR_INTERVALS,
-    _ceil_div, _intersect_byte_intervals,
+    _L2_CACHE_DISABLE,
     _measure_byte_intervals, _merge_byte_intervals, _subtract_byte_intervals,
     burst_turnaround_efficiency,
+)
+from .periodic_runs import (
+    _coalesce_runs,
+    _coverage_overlap,
+    _coverage_runs,
+    _merged_bytes,
+    _partition_runs,
+    _range_run,
+    _residency_runs,
+    _run_end,
 )
 
 
@@ -39,6 +44,7 @@ class DirtyWriteback:
     die: int
     bytes: int
     ranges: tuple[tuple[int, int], ...]
+    coverage: SectorCoverage = SectorCoverage()
 
 
 @dataclass(slots=True)
@@ -113,9 +119,13 @@ class AdmissionMemoryView:
                 or _measure_byte_intervals(entry.dirty_ranges)
                 or entry.working_set_bytes
             )
+            cov = (
+                entry.dirty_coverage if not entry.dirty_coverage.empty
+                else SectorCoverage(intervals=entry.dirty_ranges or ((0, wb_bytes),))
+            )
             self._pending_writebacks[entry.key.die].append(DirtyWriteback(
                 key=entry.key, die=entry.key.die,
-                bytes=wb_bytes, ranges=entry.dirty_ranges,
+                bytes=wb_bytes, ranges=entry.dirty_ranges, coverage=cov,
             ))
             entry.dirty = False
             entry.dirty_ranges = ()
@@ -179,6 +189,27 @@ class AdmissionMemoryView:
         if die in self._pending_writebacks:
             self._pending_writebacks[die].clear()
         return items
+
+    def pop_matching_writebacks(
+        self, die: int, allocation: str, version: int, coverage: SectorCoverage,
+    ) -> tuple[DirtyWriteback, ...]:
+        """Pop pending writebacks on ``die`` overlapping ``(allocation, version, coverage)``."""
+        queue = self._pending_writebacks.get(die)
+        if not queue:
+            return ()
+        matched: list[DirtyWriteback] = []
+        kept: list[DirtyWriteback] = []
+        for item in queue:
+            item_cov = item.coverage if not item.coverage.empty else SectorCoverage(intervals=item.ranges)
+            if (item.key.backing_allocation == allocation
+                    and item.key.tensor_version == version
+                    and _coverage_overlap(coverage, item_cov) > 0):
+                matched.append(item)
+            else:
+                kept.append(item)
+        if matched:
+            self._pending_writebacks[die] = kept
+        return tuple(matched)
 
     def enter_stream(self, die: int, stream_id: str) -> int:
         """Activate a reuse stream on ``die`` and immediately evict over-knee entries."""
@@ -498,138 +529,6 @@ class AdmissionMemoryView:
         elif existing is not None:
             self._settle_eviction(existing)
         return hit_b, miss_b
-
-
-def _range_run(lo, hi):
-    return AddressRun(lo, 1, hi - lo, hi - lo)
-
-def _run_end(run):
-    return run.base_byte + (run.rows - 1) * run.stride_bytes + run.row_bytes
-
-def _coverage_runs(coverage: SectorCoverage):
-    yield from (_range_run(lo, hi) for lo, hi in coverage.intervals)
-    for run in coverage.periodic:
-        # A sector-aligned phase repeats after the row's byte offset realigns.
-        phase_rows = run.sector_bytes // gcd(run.sector_bytes, run.stride_bytes)
-        stride = phase_rows * run.stride_bytes
-        for phase in range(min(phase_rows, run.rows)):
-            lo, hi = run._row_bounds(phase)
-            rows = (run.rows - 1 - phase) // phase_rows + 1
-            yield AddressRun(lo, rows, hi - lo, stride)
-
-def _sweep(events):
-    """Yield consecutive byte spans with the labels active throughout each span."""
-    active, previous = Counter(), 0
-    for offset, changes in groupby(events, key=lambda event: event[0]):
-        if active and offset > previous:
-            yield previous, offset, active
-        for _, label, delta in changes:
-            active[label] += delta
-            if not active[label]:
-                del active[label]
-        previous = offset
-
-def _window_rows(run, lo, hi):
-    return range(max(0, (lo - run.base_byte - run.row_bytes) // run.stride_bytes + 1),
-                 min(run.rows, _ceil_div(hi - run.base_byte, run.stride_bytes)))
-
-def _row_events(run, label, lo, hi):
-    for row in _window_rows(run, lo, hi):
-        start = run.base_byte + row * run.stride_bytes
-        yield max(lo, start), label, 1
-        yield min(hi, start + run.row_bytes), label, -1
-
-def _classified_spans(events, classify):
-    previous = None
-    for lo, hi, active in _sweep(events):
-        state = classify(active)
-        if previous is not None and previous[1] == lo and previous[2] == state:
-            previous = previous[0], hi, state
-            continue
-        if previous is not None:
-            yield previous
-        previous = (lo, hi, state) if state is not None else None
-    if previous is not None:
-        yield previous
-
-def _partition_runs(tagged_runs, classify):
-    """Apply a byte-set operation across repeating spans without expanding their rows."""
-    events = []
-    for run, label in dict.fromkeys(tagged_runs):
-        end = _run_end(run)
-        if run.rows == 1 or run.stride_bytes <= run.row_bytes:
-            run = _range_run(run.base_byte, end)
-        events.extend(((run.base_byte, (run, label), 1), (end, (run, label), -1)))
-    for lo, hi, active in _sweep(sorted(events, key=lambda event: event[0])):
-        if all(run.rows == 1 for run, _ in active):
-            if (state := classify({label for _, label in active})) is not None:
-                yield state, _range_run(lo, hi)
-            continue
-        # Each active run repeats over its bounding span. Only one common
-        # period needs scanning, with the final repeat clipped to the span.
-        period = lcm(*(run.stride_bytes for run, _ in active if run.rows > 1))
-        end = min(hi, lo + period)
-        streams = (_row_events(run, label, lo, end) for run, label in active)
-        for begin, finish, state in _classified_spans(merge(*streams, key=lambda event: event[0]), classify):
-            rows = (hi - finish) // period + 1
-            width = finish - begin
-            yield state, AddressRun(begin, rows, width, period) if rows > 1 else _range_run(begin, finish)
-            if (tail := hi - (begin + rows * period)) > 0:
-                yield state, _range_run(hi - tail, hi)
-
-def _sparse_window(run, masks):
-    period = lcm(run.stride_bytes, *(r.stride_bytes for r in masks if r.rows > 1))
-    rows = sum(len(_window_rows(mask, run.base_byte, _run_end(run))) for mask in masks)
-    return min(run.rows, period // run.stride_bytes) > max(_MAX_EXPLICIT_SECTOR_INTERVALS, rows)
-
-def _coverage_overlap(left, right):
-    if not left.intervals and len(left.periodic) == 1:
-        if left.periodic[0] in right.periodic:
-            return left.periodic[0].total_bytes()
-        if not right.intervals and len(right.periodic) == 1:
-            dense, sparse = sorted((*left.periodic, *right.periodic), key=lambda r: r.stride_bytes)
-            if sparse.stride_bytes >= sparse.row_bytes + sparse.sector_bytes and _sparse_window(dense, (sparse,)):
-                lo, hi = dense._bounds()
-                rows = _window_rows(sparse, lo - sparse.sector_bytes, hi + sparse.sector_bytes)
-                return sum(dense.overlap_with_interval(*sparse._row_bounds(row)) for row in rows)
-    return left.overlap_bytes(right)
-
-def _merged_bytes(coverage):
-    if not coverage.intervals and len(coverage.periodic) == 2:
-        left, right = coverage.periodic
-        return left.total_bytes() + right.total_bytes() - _coverage_overlap(SectorCoverage((), (left,)),
-                                                                           SectorCoverage((), (right,)))
-    return coverage.measure_bytes()
-
-def _residency_runs(data, masks):
-    if len(data) == 1 and _sparse_window(data[0], masks):
-        run = data[0]
-        lo, hi = run.base_byte, _run_end(run)
-        streams = (_row_events(mask, True, lo, hi) for mask in masks)
-        for begin, end, _ in _classified_spans(merge(*streams, key=lambda e: e[0]), bool):
-            warm = tuple(_clip_rows(run, begin, end))
-            if not warm:
-                continue
-            yield from ((False, part) for part in _clip_rows(run, lo, begin))
-            yield from ((True, part) for part in warm)
-            lo = end
-        yield from ((False, part) for part in _clip_rows(run, lo, hi))
-    else:
-        yield from _partition_runs(
-            (*((r, False) for r in data), *((r, True) for r in masks)),
-            lambda labels: True in labels if False in labels else None,
-        )
-
-def _clip_rows(run, lo, hi):
-    rows = _window_rows(run, lo, hi)
-    if rows and hi > lo:
-        first = run.base_byte + rows.start * run.stride_bytes
-        yield _range_run(max(lo, first), min(hi, first + run.row_bytes))
-        if len(rows) > 2:
-            yield replace(run, base_byte=first + run.stride_bytes, rows=len(rows) - 2)
-        if len(rows) > 1:
-            last = run.base_byte + (rows.stop - 1) * run.stride_bytes
-            yield _range_run(last, min(hi, last + run.row_bytes))
 
 
 def _dram_service_segments(

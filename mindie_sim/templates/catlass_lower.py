@@ -210,7 +210,10 @@ class _MatrixLowerer:
         width = packed_bytes(col + cols, dtype) - packed_bytes(col, dtype)
         if width != packed_bytes(cols, dtype):
             raise ModelingError("catlass_packed_tile_unaligned")
-        run = AddressRun(row * stride + packed_bytes(col, dtype), rows, width, stride, layout)
+        base = self.p.b_base_byte if tensor == self.p.b_id else 0
+        run = AddressRun(base + row * stride + packed_bytes(col, dtype), rows, width, stride, layout)
+        if tensor == self.p.b_id and "version" not in kwargs:
+            kwargs["version"] = self.p.b_version
         return self.plan.access(kwargs.pop("name"), kwargs.pop("allocation", tensor), width * rows, runs=(run,), **kwargs)
 
     def _fill(self, name, tile, k_start, k_len, operand, after, ring, generation):

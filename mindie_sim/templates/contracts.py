@@ -20,7 +20,7 @@ from mindie_sim.prediction.runtime.memory_physics import (
     AddressRun, SectorCoverage, _MAX_EXPLICIT_SECTOR_INTERVALS, _merge_byte_intervals,
 )
 from mindie_sim.prediction.runtime.l2_residency import (
-    _coverage_runs, _partition_runs, _range_run, _residency_runs, _run_end,
+    _coalesce_runs, _coverage_runs, _partition_runs, _range_run, _residency_runs, _run_end,
 )
 from mindie_sim.prediction.runtime.tile_solver import AlgorithmKind, TileSolution
 from mindie_sim.schema.common import ModelingError
@@ -486,19 +486,8 @@ def _obligation_runs(entry):
 
 
 def _entry_with_runs(entry, runs, **updates):
-    compacted = []
-    for run in sorted(runs, key=lambda item: item.base_byte):
-        if compacted:
-            previous = compacted[-1]
-            stride = previous.stride_bytes if previous.rows > 1 else run.stride_bytes
-            if (max(previous.rows, run.rows) > 1 and previous.row_bytes == run.row_bytes
-                    and (run.rows == 1 or run.stride_bytes == stride)
-                    and previous.base_byte + previous.rows * stride == run.base_byte):
-                compacted[-1] = replace(previous, rows=previous.rows + run.rows, stride_bytes=stride)
-                continue
-        compacted.append(run)
     ranges, address_runs = [], []
-    for run in compacted:
+    for run in _coalesce_runs(runs):
         if run.rows == 1 or run.stride_bytes <= run.row_bytes:
             ranges.append((run.base_byte, _run_end(run)))
         else:

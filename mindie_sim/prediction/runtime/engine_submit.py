@@ -513,12 +513,73 @@ class _EngineSubmitMixin:
         done = self.future(name)
         aligned = bound.ledger.aligned_transfer_bytes
         bus = bound.bind_config[0]
+        admit_extra = 0
+
+        def launch_writebacks(tag, entries, after_events, on_done=None):
+            total = sum(amt for _, _, _, _, amt in entries)
+            wb_done = self.future(tag + ":done")
+            wbs = getattr(self, "_inflight_writebacks", None)
+            if wbs is None:
+                wbs = self._inflight_writebacks = {}
+            registered = []
+            for die, alloc, version, cov, _ in entries:
+                ident = memory_state, die, alloc, version
+                bucket = wbs.setdefault(ident, {})
+                bucket[wb_done] = bucket[wb_done].union(cov) if wb_done in bucket else cov
+                registered.append(ident)
+            registered = tuple(dict.fromkeys(registered))
+
+            def finish(_ev):
+                for ident in registered:
+                    bucket = wbs.get(ident)
+                    if bucket is not None:
+                        bucket.pop(wb_done, None)
+                        if not bucket:
+                            del wbs[ident]
+                self.resolve(wb_done)
+                if on_done is not None:
+                    on_done()
+
+            work = {term.row_id: term.ms_per_progress for term in bus.terms_for("write", total)
+                    if term.ms_per_progress}
+            self.submit(tag, work, after=after_events, owner=owner, priority=priority,
+                        coupled=len(work) > 1, deliveries=((bus.ctr_w, total),),
+                        on_complete=finish, native_hook=True)
+            return wb_done
 
         def admit(event, pat=None):
+            nonlocal admit_extra
             if pat is None:
                 pat = pattern() if callable(pattern) else pattern
             resident = memory_state.resident_coverage_for(pat, aligned)
             coverage = pat.runs.sector_coverage()
+            if pat.direction == "read" and not coverage.empty:
+                pending_wbs = memory_state.pop_matching_writebacks(pat.die, pat.tensor_id, pat.version, coverage)
+                if pending_wbs:
+                    wb_entries = tuple(
+                        (item.die, item.key.backing_allocation, item.key.tensor_version,
+                         item.coverage if not item.coverage.empty else SectorCoverage(intervals=item.ranges),
+                         item.bytes)
+                        for item in pending_wbs
+                    )
+                    admit_extra += sum(item.bytes for item in pending_wbs)
+                    launch_writebacks(name + ":dirty_writeback", wb_entries, (event,))
+                wbs = getattr(self, "_inflight_writebacks", None)
+                wb_pending = wbs.get((memory_state, pat.die, pat.tensor_id, pat.version)) if wbs else None
+                wb_waits = _overlapping_writebacks(wb_pending, coverage, resident) if wb_pending else ()
+                if wb_waits:
+                    def retry_wb(ready):
+                        resolved = pat
+                        if not callable(pattern) and pat.reuse_key is not None:
+                            reuse = memory_state.resolve_reuse_key(pat.reuse_key)
+                            if memory_state.is_resident(reuse):
+                                resolved = replace(pat, reuse_key=reuse)
+                        admit(ready, resolved)
+
+                    self.submit(name + ":wait_writeback", {}, after=wb_waits, owner=owner, priority=priority,
+                                on_complete=retry_wb, native_hook=True)
+                    return
+
             key = pat.reuse_key
             identity = None
             cacheable = key is not None and aligned > 0 and pat.cache_policy != CACHE_POLICY_DISABLE
@@ -571,16 +632,21 @@ class _EngineSubmitMixin:
                 self.resolve(done)
 
             def complete(transfer):
-                extra = _settle_access(memory_state, pat, ledger, resident, coverage)
-                extra += sum(item.bytes for item in memory_state.drain_writebacks(bus.die))
-                if extra:
-                    work = {term.row_id: term.ms_per_progress for term in bus.terms_for("write", extra)
-                            if term.ms_per_progress}
-                    self.submit(name + ":dirty_writeback", work, after=(transfer,), owner=owner, priority=priority,
-                                coupled=len(work) > 1, deliveries=((bus.ctr_w, extra),),
-                                on_complete=lambda _: publish(extra), native_hook=True)
+                extra_self = _settle_access(memory_state, pat, ledger, resident, coverage)
+                drained = memory_state.drain_writebacks(bus.die)
+                entries = []
+                if extra_self:
+                    entries.append((pat.die, pat.tensor_id, pat.version, coverage, extra_self))
+                for item in drained:
+                    item_cov = item.coverage if not item.coverage.empty else SectorCoverage(intervals=item.ranges)
+                    entries.append((item.die, item.key.backing_allocation, item.key.tensor_version,
+                                    item_cov, item.bytes))
+                extra = sum(amt for _, _, _, _, amt in entries)
+                if entries:
+                    launch_writebacks(name + ":dirty_writeback", entries, (transfer,),
+                                      on_done=lambda: publish(admit_extra + extra))
                 else:
-                    publish(0)
+                    publish(admit_extra)
 
             done.started = event.time
             self._submit_access_flow(name, live, after=(event,), owner=owner, priority=priority, callback=complete)
@@ -637,6 +703,21 @@ def _rebind_access(bound, pattern, state, *, commit):
         l2_bytes_per_ms=l2, pipe_row_id=pipe_row, l2_row_id=l2_row, burst_rules=rules,
         nominal_pipe_bytes_per_ms=nominal, commit=commit,
     )
+
+
+def _overlapping_writebacks(pending, requested, resident):
+    waits = []
+    for done, wb_cov in pending.items():
+        overlap = _coverage_overlap(requested, wb_cov)
+        if overlap:
+            if resident.empty:
+                waits.append(done)
+            else:
+                excluded = (_coverage_overlap(requested, resident) + _coverage_overlap(wb_cov, resident)
+                            - requested.union(wb_cov).overlap_bytes(resident))
+                if overlap > excluded:
+                    waits.append(done)
+    return tuple(waits)
 
 
 def _overlapping_fills(pending, requested, resident):

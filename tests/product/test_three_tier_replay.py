@@ -498,3 +498,103 @@ def test_certified_primitive_table_prices_directional_hbm_bytes():
     }
     cert, _ = certify_lower_bound(program, dag)
     assert cert.l_star_lean_ns == 1997
+
+
+def _graph_spine(*ops):
+    from mindie_sim.prediction.spine import PredictionSpine
+
+    class _Spine(PredictionSpine):
+        def lower(self, case, request, **kwargs):
+            prepared = super().lower(case, request, **kwargs)
+            rank, = prepared.graph.executable
+            return replace(prepared, graph=replace(prepared.graph, executable=(replace(rank, ops=ops),), streams=()))
+
+    return _Spine()
+
+
+def _unit_hbm_case():
+    base = parse_case(_case(REPRESENTATIVE_SKUS["a5"], tp=1))
+    die, = base.machine.dies
+    rate = 1024 * 1000
+    die = replace(die, hbm_read_bytes_per_s=rate, hbm_write_bytes_per_s=rate, hbm_rw_alpha=0.0,
+                  rates=tuple(dict(die.rates, hbm=rate).items()))
+    return replace(base, machine=replace(base.machine, dies=(die,))), die
+
+
+def test_verify_plan_rejects_fabricated_traffic_and_disambiguates_explicit_k3():
+    from _support.linear_cases import tile_edge
+    from mindie_sim.catalog.ops import vector_op
+    from mindie_sim.optimization.dsl_solver import _dsl_proposals
+    from mindie_sim.prediction.program.stages import Stage
+    from mindie_sim.rewrite.schema import decode_rewrite_plan, encode_rewrite_plan, plan_sha256
+    from mindie_sim.rewrite.verify import verify_plan
+    from mindie_sim.schema.common import ModelingError
+    from mindie_sim.templates.contracts import SemanticWorkItem
+
+    case, die = _unit_hbm_case()
+    pw = lambda oid, deps=(): vector_op(op_id=oid, deps=deps, requests=(), stage=0, layer=0, elements=4096,
+                                        ops_per_element=1, dtype="bf16", family="elementwise", phase="decode", recipe="elementwise")
+    make, take = pw("make"), pw("take", ("make",))
+    decls = tuple(dict(
+        numerically_equivalent=True, region_id="same_id", op_ids=("make", "take"), edge_routes=(edg,), backend="dsl_vec",
+        compiler_options=dict(edge_bytes={edg.view_id: 8192}, l2_reservation_bytes=int(dict(die.buffers)["l2"]),
+                              op_stages={op.op_id: Stage(op.op_id, {"vector": op.vector_ops}) for op in (make, take)},
+                              semantic_work=tuple(SemanticWorkItem(op.op_id, "vector_alu", op.dtype, int(op.vector_ops), ("aiv_simd",))
+                                                  for op in (make, take))),
+    ) for edg in (replace(tile_edge("ub->ub", ("aiv", "aiv")), representation=make.dtype),
+                  replace(tile_edge("gm_spill", ("aiv", "aiv")), representation=make.dtype)))
+    take_d = replace(take, metadata=(*take.metadata, ("fuse_regions", decls)))
+    dossier = prepare_scenario(ScenarioRequest(case, StepRequest("decode")), spine=_graph_spine(make, take_d))
+    handle, dp = dossier.handle, dossier.handle.scenario.datapath
+    props = list(_dsl_proposals((make, take_d), dp, dp.aic_count, dp.aiv_count))
+    p_ub, p_gm = (replace(dossier.unmerge_plan, edits=(Edit(eid, operation=pr[0][0]),))
+                  for eid, pr in zip(("f0", "f1"), props, strict=True))
+    assert plan_sha256(p_ub) != plan_sha256(p_gm) and decode_rewrite_plan(encode_rewrite_plan(p_gm)) == p_gm
+    f_ub, f_gm = finalize_plan(handle, p_ub), finalize_plan(handle, p_gm)
+    assert f_ub.verification.passed and f_gm.verification.passed and f_ub.region_summaries[0].dram_sector_bytes == 0
+    assert f_gm.region_summaries[0].dram_sector_bytes == 16384 and f_gm.step_eval.span_ms >= 15.9
+    refs = (OpRef("atom", "make"), OpRef("atom", "take"))
+    ambig = replace(dossier.unmerge_plan, edits=(Edit("a", operation=FuseRegion(
+        refs, (), (KernelBoundary("same_id", refs),), fusion_tier="K3_dsl_pipeline")),))
+    with pytest.raises(ModelingError, match="rewrite_template_recipe_unbound"):
+        finalize_plan(handle, ambig)
+    real_s, = f_ub.region_summaries
+    fake_b = 8_000_000
+    tampered = replace(real_s, read_obligations=(*real_s.read_obligations, TensorRangeObligation(0, "fake", 0, ((0, fake_b),), "hbm_cold", "device")),
+                       logical_transfer_bytes=real_s.logical_transfer_bytes + fake_b, issued_copy_bytes=real_s.issued_copy_bytes + fake_b,
+                       dram_sector_bytes=real_s.dram_sector_bytes + fake_b, turnaround_service_bytes=real_s.turnaround_service_bytes + fake_b)
+    prog, dag, _ = build_dual_inputs_from_scenario(handle.scenario, region_summaries=(tampered,))
+    cert, _ = certify_lower_bound(prog, dag)
+    receipt = verify_plan(handle.scenario, f_ub.applied, step_eval=f_ub.step_eval, wall_ns=f_ub.wall_ns,
+                          region_summaries=(tampered,), dual_certificate=cert, dual_program=prog, event_dag=dag)
+    assert not receipt.passed and receipt.l_star_ns is None
+    assert (receipt.gates[3].reason, receipt.gates[4].reason) == ("LEDGER_RECONCILIATION_ERROR", "LEAN_CERTIFICATE_INVALID")
+
+
+def test_catalog_and_shipping_hbm_arbiter_and_nonzero_weight_ranges():
+    from mindie_sim.catalog.ops import gemm_op
+    from mindie_sim.catalog.types import QuantSpec
+    from mindie_sim.optimization.dsl_solver import _catlass_proposals
+    from mindie_sim.prediction.streams import StreamCoreBudget, StreamLane
+    from mindie_sim.rewrite.schema import StreamSchedule
+
+    case, _ = _unit_hbm_case()
+    mk = lambda oid, md: gemm_op(op_id=oid, deps=(), requests=(), stage=0, layer=0, m=1, n=64, k=64,
+                                 quant=QuantSpec("bf16"), category="dense", phase="decode", metadata=md)
+    g0 = mk("g0", (("weight_allocation_id", "W0"), ("weight_initial_residency", "hbm_cold"), ("weight_ranges", ((8192, 16384),))))
+    g1 = mk("g1", (("weight_allocation_id", "W1"), ("weight_initial_residency", "hbm_cold"), ("weight_bytes", 8192)))
+    dossier = prepare_scenario(ScenarioRequest(case, StepRequest("decode")), spine=_graph_spine(g0, g1))
+    dp = dossier.handle.scenario.datapath
+    ha, hv = dp.aic_count // 2, dp.aiv_count // 2
+    lanes = (StreamLane("main", StreamCoreBudget(ha, hv, "disjoint")),
+             StreamLane("aux", StreamCoreBudget(dp.aic_count - ha, dp.aiv_count - hv, "disjoint")))
+    for target in (g0, g1):
+        (cat_edit,), _ = next(_catlass_proposals((target,), dp, ha, hv))
+        plan = replace(dossier.unmerge_plan, edits=(
+            Edit("s", operation=StreamSchedule(lanes, ((OpRef("atom", "g0"), "main"), (OpRef("atom", "g1"), "aux")), ())),
+            Edit("c", operation=cat_edit)))
+        full = finalize_plan(dossier.handle, plan)
+        assert full.verification.passed and full.step_eval.span_ms >= 16.25 and full.verification.l_star_ns == 16_124_997 <= full.wall_ns
+        if target is g0:
+            w_obs = [o for o in full.region_summaries[0].read_obligations if o.allocation_id == "W0"]
+            assert len(w_obs) == 1 and w_obs[0].ranges == ((8192, 16384),)

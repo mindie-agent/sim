@@ -782,14 +782,14 @@ def verify_plan(
         except SoundnessInversionError:
             raise
         except ModelingError as error:
-            reason, _, detail = str(error).partition(":")
+            text = ("LEAN_CERTIFICATE_INVALID:certificate_unbound_to_scenario"
+                    if str(error).startswith("LEDGER_RECONCILIATION_ERROR:unbound_region_summary") else str(error))
+            reason, _, detail = text.partition(":")
             gates.append(GateReceipt(name, False, reason, detail))
-        if (baseline_m_ns is not None and baseline_u_ns is not None
-                and baseline_m_ns > baseline_u_ns + SHIPPING_REGRESSION_TOLERANCE_NS):
-            regression = ShippingRegression(baseline_m_ns - baseline_u_ns,
-                                            baseline_u_ns=baseline_u_ns, baseline_m_ns=baseline_m_ns)
-    return VerificationReceipt(applied.plan_sha256, scenario.scenario_sha256, scope, tuple(gates),
-                               wall_ns, l_star, overlap, coverage, reasons, regression)
+        if baseline_m_ns is not None and baseline_u_ns is not None and baseline_m_ns > baseline_u_ns + SHIPPING_REGRESSION_TOLERANCE_NS:
+            regression = ShippingRegression(baseline_m_ns - baseline_u_ns, baseline_u_ns=baseline_u_ns, baseline_m_ns=baseline_m_ns)
+    return VerificationReceipt(applied.plan_sha256, scenario.scenario_sha256, scope, tuple(gates), wall_ns, l_star,
+                               overlap, coverage, reasons, regression)
 
 
 __all__ = [

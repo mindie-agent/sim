@@ -673,9 +673,10 @@ def _derive_default_obligations(scenario, demands, aliases, covered, *, infer_wo
     ),), placements
 
 
-def _check_region_summary_bindings(scenario, applied, summaries):
+def _check_region_summary_bindings(scenario, applied, summaries, *, require_catalog=False):
     if not summaries:
         return
+    from mindie_sim.optimization.dsl_solver import canonical_region_summaries, summary_matches_canonical
     from mindie_sim.rewrite.apply import _die
     from mindie_sim.rewrite.schema import FuseRegion
 
@@ -689,15 +690,22 @@ def _check_region_summary_bindings(scenario, applied, summaries):
             if op.op_id in members and (op.op_id not in fusions or op.family == "rewrite_fused"):
                 die = _die(scenario, rank.replica, op.stage).rank
                 bound[op.op_id, members[op.op_id]].add((rank.replica, op.stage, die))
+    canonical = canonical_region_summaries(scenario, applied)
     for summary in summaries:
         work_sites = {(item.replica, item.pp_stage, item.die) for item in summary.semantic_work}
         dies = {item.die for group in (summary.read_obligations, summary.write_obligations) for item in group}
         key = summary.region_id, tuple(summary.op_ids)
-        matches = {site for site in bound.get(key, ())
-                   if (not work_sites or work_sites == {site}) and (not dies or dies == {site[-1]})}
-        if not matches:
+        matches = sorted(site for site in bound.get(key, ())
+                         if (not work_sites or work_sites == {site}) and (not dies or dies == {site[-1]}))
+        chosen = next((
+            site for site in matches
+            if ((expected := canonical.get((site[0], site[1], summary.region_id))) is not None
+                and summary_matches_canonical(summary, expected))
+            or (expected is None and not require_catalog)
+        ), None)
+        if chosen is None:
             raise ModelingError(f"LEDGER_RECONCILIATION_ERROR:unbound_region_summary:{summary.region_id}")
-        bound[key].remove(min(matches))
+        bound[key].remove(chosen)
 
 
 def build_dual_inputs_from_scenario(
@@ -707,7 +715,7 @@ def build_dual_inputs_from_scenario(
 ) -> tuple[ResourceChoiceProgram, EventDagSpec, tuple[str, ...]]:
     """Use only universal work obligations and admitted alternatives for the scenario."""
     if applied is not None:
-        _check_region_summary_bindings(scenario, applied, region_summaries)
+        _check_region_summary_bindings(scenario, applied, region_summaries, require_catalog=True)
     elif not region_summaries:
         region_summaries = getattr(scenario, "region_summaries", ())
     demands = _Demands(scenario, primitive_table, rate_mode)

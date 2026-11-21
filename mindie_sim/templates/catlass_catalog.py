@@ -147,6 +147,8 @@ class CatlassProblem:
     indices: tuple[int, ...] | None = None
     physical_m: int | None = None
     indices_id: str = "indices"
+    b_base_byte: int = 0
+    b_version: int = 0
 
     def __post_init__(self) -> None:
         if any(type(n) is not int or n < 1 for n in (self.m, self.n, self.k)):
@@ -155,6 +157,10 @@ class CatlassProblem:
             raise ModelingError("catlass_group_rows_invalid")
         if len({self.a_id, self.b_id, self.c_id}) != _MATRIX_SHAPE_RANK or not all((self.a_id, self.b_id, self.c_id)):
             raise ModelingError("catlass_operand_id_invalid")
+        if type(self.b_base_byte) is not int or self.b_base_byte < 0:
+            raise ModelingError("catlass_operand_offset_invalid")
+        if type(self.b_version) is not int or self.b_version < 0:
+            raise ModelingError("catlass_operand_version_invalid")
         if self.physical_m is not None and (type(self.physical_m) is not int or self.physical_m < self.m):
             raise ModelingError("catlass_physical_row_count_invalid")
         if self.indices is not None and (
