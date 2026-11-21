@@ -25,8 +25,9 @@ from ...runtime.memory_physics import AddressRun, AddressRunPlan, ByteLedger, Me
 from ...runtime.ring_buffer import RingBuffer, lower_generation
 from ..contracts import OperatorPlanningContext
 from .common import (
-    DSL_MQS_ABI, FAMILY, FP32_BYTES, INDEX_BYTES, MQS_COMPRESSED_ROW_BYTES,
-    MQS_ORIGINAL_ROW_BYTES, NZ_BLOCK_BYTES, PagedMlaContract, _rows, align_bytes,
+    ACLNN_MQS_DATA_BYTES, ACLNN_MQS_INLINE_ROW_BYTES, ACLNN_MQS_SCALE_BYTES, ACLNN_MQS_SEPARATE_SCALE_MODE,
+    DSL_MQS_ABI, FAMILY, FP32_BYTES, INDEX_BYTES, MQS_ABI, MQS_COMPRESSED_ROW_BYTES,
+    MQS_ORIGINAL_ROW_BYTES, NZ_BLOCK_BYTES, PagedMlaContract, _query_row, align_bytes,
     capability_gap, ceil_div, latent_record_bytes,
 )
 
@@ -39,8 +40,8 @@ SOFTMAX_OPS_PER_KEY = 5
 SOFTMAX_MERGE_SCALAR_OPS = 8
 FIA_WORKSPACE_DEPTH = 2
 WEIGHTED_MERGE_OPS_PER_VALUE = 3
-ORI_DEQUANT_OPS_PER_VALUE = 6
-CMP_DEQUANT_OPS_PER_VALUE = 4
+FP8_DEQUANT_OPS_PER_VALUE = 6
+FP4_DEQUANT_OPS_PER_VALUE = 4
 SOFTMAX_STATE_SCALARS = 2
 
 
@@ -72,12 +73,13 @@ class _Demand:
     def add(self, resource: str, amount: int | float) -> None:
         if amount:
             self.resources[resource] = self.resources.get(resource, 0) + amount
-    def transfer(self, tensor: str, pipe: str, nbytes: int, plan: AddressRunPlan) -> None:
+    def transfer(self, tensor: str, pipe: str, nbytes: int, plan: AddressRunPlan, *,
+                 aligned_copy_bytes: int | None = None) -> None:
         if not nbytes:
             return
         direction = "read" if pipe.startswith("mte2") else "write"
         access = MemoryAccessPattern(tensor, 0, 0, 0, direction, pipe, nbytes, plan)
-        aligned = access.runs.aligned_copy_bytes()
+        aligned = access.runs.aligned_copy_bytes() if aligned_copy_bytes is None else aligned_copy_bytes
         sectors, dram = access.runs.dram_sector_and_service()
         ledger = ByteLedger(access.logical_bytes, aligned, dram, 0, aligned, sectors)
         self.add(pipe, ledger.aligned_transfer_bytes)
@@ -140,7 +142,27 @@ def _sparse_spans(indices, start: int, count: int, page_size: int):
     for _, run in groupby(enumerate(indices[start:start + count]), lambda item: item[1] - item[0]):
         yield from _spans(next(run)[1], 1 + sum(1 for _ in run), page_size)
 
-def _read_kv(demand: _Demand, c: PagedMlaContract, seq: int, start: int, keys: int,
+def _read_sparse_bank(demand, c, branch, spans, count, table, dsl_width):
+    if c.abi != MQS_ABI or c.quant_mode != ACLNN_MQS_SEPARATE_SCALE_MODE:
+        width = ACLNN_MQS_INLINE_ROW_BYTES if c.abi == MQS_ABI else dsl_width
+        demand.transfer(branch, "mte2_aiv", count * width,
+                        _kv_runs(c, spans, width, width, table, "PA_BLK_BSND"))
+        return
+    # PA_BBND mode 2 packs the data plane first, then scale + pad for the block.
+    row_width = ACLNN_MQS_DATA_BYTES + ACLNN_MQS_SCALE_BYTES
+    for plane, width, plane_offset in (
+        ("data", ACLNN_MQS_DATA_BYTES, 0), ("scale", ACLNN_MQS_SCALE_BYTES, ACLNN_MQS_DATA_BYTES),
+    ):
+        runs = tuple(AddressRun(
+            ((table[page] if table else page) * row_width + plane_offset) * c.page_size + offset * width,
+            rows, width, width, "PA_BBND",
+        ) for page, offset, rows in spans)
+        # The source is contiguous within each plane. Each scale lands in its own padded UB row.
+        demand.transfer(f"{branch}_{plane}", "mte2_aiv", count * width, AddressRunPlan(runs),
+                        aligned_copy_bytes=count * align_bytes(width))
+    demand.metadata[f"{branch}_logical_bytes"] = count * row_width
+
+def _read_kv(demand: _Demand, c: PagedMlaContract, seq: int, query: int, start: int, keys: int,
              dqk_bytes: int, dv_bytes: int, *, value: bool = False) -> None:
     if not c.mixed_quant:
         table = c.block_table[seq] if c.block_table else ()
@@ -153,21 +175,19 @@ def _read_kv(demand: _Demand, c: PagedMlaContract, seq: int, start: int, keys: i
         pages = ceil_div(start + keys, c.page_size) - first_page
         demand.linear(f"{tensor}_pages", "mte2_aic", INDEX_BYTES * pages, INDEX_BYTES * first_page)
         return
-    ori = _rows(c.n_ori, seq)
+    ori, cmp = c.bank_counts(seq, query)
     for branch, lo, hi, tables, lists, width in (
         ("ori", 0, ori, c.ori_block_table, c.ori_indices, MQS_ORIGINAL_ROW_BYTES),
-        ("cmp", ori, ori + _rows(c.n_cmp, seq), c.cmp_block_table, c.cmp_indices,
-         MQS_COMPRESSED_ROW_BYTES),
+        ("cmp", ori, ori + cmp, c.cmp_block_table, c.cmp_indices, MQS_COMPRESSED_ROW_BYTES),
     ):
         first, end = max(start, lo), min(start + keys, hi)
         if first >= end:
             continue
         count, offset = end - first, first - lo
-        indices = lists[seq] if lists else ()
+        indices = _query_row(lists[seq], query, indices=True) if lists else ()
         table = tables[seq] if tables else ()
         spans = tuple(_sparse_spans(indices, offset, count, c.page_size))
-        demand.transfer(branch, "mte2_aiv", count * width,
-                        _kv_runs(c, spans, width, width, table, "PA_BLK_BSND"))
+        _read_sparse_bank(demand, c, branch, spans, count, table, width)
         pages = tuple(sorted({page for page, _, _ in spans}))
         demand.transfer(f"{branch}_pages", "mte2_aiv", len(pages) * INDEX_BYTES,
                         AddressRunPlan(tuple(AddressRun(p * INDEX_BYTES, 1, INDEX_BYTES, INDEX_BYTES)
@@ -188,14 +208,15 @@ class _PagedMlaProgramBuilder:
     layout: PipelineLayout
     dtype: str
     owners: tuple[tuple[int, tuple[int, ...]], ...]
-    def _demand(self, step: str, live: int, *, seq: int = 0, heads: int = 0,
+    def _demand(self, step: str, live: int, *, seq: int = 0, query: int = 0, heads: int = 0,
                 start: int = 0, keys: int = 0, first: bool = False, last: bool = False,
                 partials: int = 0, mm2_offset: int = 0) -> _Demand:
         c, layout = self.contract, self.layout
         elem = int(dtype_bytes(self.dtype))
         qk_width, v_width = c.dqk * elem, c.dv * elem
         scores, probs, pv = heads * keys * FP32_BYTES, heads * keys * elem, heads * c.dv * FP32_BYTES
-        state = live * (c.dv + 2) * FP32_BYTES
+        state_heads = heads if c.abi == DSL_MQS_ABI else live
+        state = state_heads * (c.dv + SOFTMAX_STATE_SCALARS) * FP32_BYTES
         d = _Demand()
         atomic = layout.gm_workspace and not first
         if step == "sink_load":
@@ -205,11 +226,12 @@ class _PagedMlaProgramBuilder:
         elif step == "q_load" and (layout.gm_workspace or first):
             d.linear("query", "mte2_aic", heads * qk_width)
         elif step == "kv_load":
-            _read_kv(d, c, seq, start, keys, qk_width, v_width)
+            _read_kv(d, c, seq, query, start, keys, qk_width, v_width)
         elif step == "dequant" and c.mixed_quant:
-            ori_keys = max(0, min(keys, _rows(c.n_ori, seq) - start))
-            d.add("vector", c.dqk * (ori_keys * ORI_DEQUANT_OPS_PER_VALUE
-                                    + (keys - ori_keys) * CMP_DEQUANT_OPS_PER_VALUE))
+            ori, _ = c.bank_counts(seq, query)
+            fp8_keys = keys if c.abi == MQS_ABI else max(0, min(keys, ori - start))
+            d.add("vector", c.dqk * (fp8_keys * FP8_DEQUANT_OPS_PER_VALUE
+                                    + (keys - fp8_keys) * FP4_DEQUANT_OPS_PER_VALUE))
         elif step == "kv_to_l1" and c.mixed_quant:
             pipe, alignment = layout.probability_output
             d.add(pipe, align_bytes(keys * qk_width, alignment))
@@ -240,7 +262,7 @@ class _PagedMlaProgramBuilder:
             if layout.gm_workspace:
                 d.linear("vec1", "mte2_aic", probs)
             if not layout.resident_latent:
-                _read_kv(d, c, seq, start, keys, qk_width, v_width, value=True)
+                _read_kv(d, c, seq, query, start, keys, qk_width, v_width, value=True)
         elif step == "pv_operands":
             d.add("mte1", probs + keys * v_width)
         elif step in {"pv", "pv0", "pv1"}:
@@ -261,7 +283,7 @@ class _PagedMlaProgramBuilder:
             d.linear("mm2", "mte2_aiv", pv, mm2_offset)
         elif step == "output_update" and not layout.gm_workspace and not first:
             d.add("vector", _merge_ops(c, heads, 1))
-        elif step == "split_write" and last and c.splits > 1:
+        elif step == "split_write" and last and partials > 1:
             d.linear("vec2_split_state", "mte3", state)
         elif step == "merge_read":
             plan = AddressRunPlan((AddressRun(0, partials, state, align_bytes(state)),))
@@ -275,19 +297,36 @@ class _PagedMlaProgramBuilder:
             if c.return_lse:
                 d.linear("lse", "mte3", live * FP32_BYTES)
         return d
-    def _counts(self, kv: int) -> tuple[int, int]:
-        tiles = ceil_div(kv, self.layout.key_tile)
+    def _counts(self, seq: int, query: int) -> tuple[int, int]:
+        c, width = self.contract, self.layout.key_tile
+        if c.abi == DSL_MQS_ABI:
+            ori, cmp = c.bank_counts(seq, query)
+            tiles = ceil_div(ori, width) + ceil_div(cmp, width)
+        else:
+            tiles = ceil_div(c.sequences[seq][1], width)
         return tiles, min(tiles, self.contract.splits)
 
-    def _tile_demand(self, step, seq, heads, live, index, offset, count, mm2_offset=0):
-        start = (offset + index) * self.layout.key_tile
-        keys = min(self.layout.key_tile, self.contract.sequences[seq][1] - start)
-        return self._demand(step, live, seq=seq, heads=heads, start=start, keys=keys,
-                            first=index == 0, last=index + 1 == count, partials=1,
+    def _tile_extent(self, seq: int, query: int, tile: int) -> tuple[int, int]:
+        c, width = self.contract, self.layout.key_tile
+        if c.abi == DSL_MQS_ABI:
+            ori, cmp = c.bank_counts(seq, query)
+            ori_tiles = ceil_div(ori, width)
+            if tile < ori_tiles:
+                start = tile * width
+                return start, min(width, ori - start)
+            offset = (tile - ori_tiles) * width
+            return ori + offset, min(width, cmp - offset)
+        start = tile * width
+        return start, min(width, c.sequences[seq][1] - start)
+
+    def _tile_demand(self, step, seq, query, heads, live, index, offset, count, partials, mm2_offset=0):
+        start, keys = self._tile_extent(seq, query, offset + index)
+        return self._demand(step, live, seq=seq, query=query, heads=heads, start=start, keys=keys,
+                            first=index == 0, last=index + 1 == count, partials=partials,
                             mm2_offset=mm2_offset)
 
     def _finish_steps(self, partials):
-        merge = ("merge_read", "merge") if self.contract.splits > 1 and partials else ()
+        merge = ("merge_read", "merge") if partials > 1 else ()
         if self.contract.sinks and not partials:
             return ("sink_init", "normalize", "store")
         return (*merge, "normalize", "store")
@@ -296,15 +335,21 @@ class _PagedMlaProgramBuilder:
         c = self.contract
         head_groups = ceil_div(c.physical_heads, self.layout.head_tile)
         prefix = tuple(accumulate((q * head_groups for q, _ in c.sequences), initial=0))
-        partial_counts = tuple(self._counts(kv)[1] for _, kv in c.sequences)
-        most_splits = max((n for (q, _), n in zip(c.sequences, partial_counts) if q), default=0)
+        most_splits = max((n for _, _, n in self._group_ranges(head_groups, prefix)), default=0)
         lanes = min(len(self.owners), max(1, most_splits))
-        return head_groups, prefix, partial_counts, lanes, len(self.owners) // lanes
+        return head_groups, prefix, lanes, len(self.owners) // lanes
 
-    def _sink_owners(self, prefix, partial_counts, lanes, groups_per_wave):
+    def _group_ranges(self, head_groups, prefix):
+        for seq in range(len(self.contract.sequences)):
+            for query, repeat in self.contract.query_runs(seq):
+                if repeat:
+                    start = prefix[seq] + query * head_groups
+                    yield start, start + repeat * head_groups, self._counts(seq, query)[1]
+
+    def _sink_owners(self, head_groups, prefix, lanes, groups_per_wave):
         # Each launched owner loads the shared head vector once, including owners of empty rows.
         slots = set()
-        for start, end, partials in zip(prefix, prefix[1:], partial_counts):
+        for start, end, partials in self._group_ranges(head_groups, prefix):
             for group in range(start, min(end, start + groups_per_wave)):
                 base = group % groups_per_wave * lanes
                 slots.update(range(base, base + max(1, min(partials, lanes))))
@@ -314,25 +359,26 @@ class _PagedMlaProgramBuilder:
         c, layout = self.contract, self.layout
         totals: dict[str, Work] = {}
         if c.sinks:
-            sink_owners = self._sink_owners(*self._distribution()[1:])
+            sink_owners = self._sink_owners(*self._distribution())
             totals["sink_load"] = self._demand("sink_load", 0).work(self.dtype).scaled(len(sink_owners))
         phases = layout.phases
-        for seq, (queries, kv) in enumerate(c.sequences):
-            if not queries:
-                continue
-            tiles, partials = self._counts(kv)
-            for head_start in range(0, c.physical_heads, layout.head_tile):
-                heads = min(layout.head_tile, c.physical_heads - head_start)
-                live = min(heads, max(0, c.logical_heads - head_start))
-                for split in range(partials):
-                    offset, count = _split_tiles(tiles, c.splits, split)
-                    for i in range(count):
-                        for step in phases:
-                            work = self._tile_demand(step, seq, heads, live, i, offset, count).work(self.dtype)
-                            totals[step] = totals.get(step, Work()) + work.scaled(queries)
-                for step in self._finish_steps(partials):
-                    work = self._demand(step, live, heads=heads, partials=partials).work(self.dtype)
-                    totals[step] = totals.get(step, Work()) + work.scaled(queries)
+        for seq in range(len(c.sequences)):
+            for query, repeat in c.query_runs(seq):
+                if not repeat:
+                    continue
+                tiles, partials = self._counts(seq, query)
+                for head_start in range(0, c.physical_heads, layout.head_tile):
+                    heads = min(layout.head_tile, c.physical_heads - head_start)
+                    live = min(heads, max(0, c.logical_heads - head_start))
+                    for split in range(partials):
+                        offset, count = _split_tiles(tiles, c.splits, split)
+                        for i in range(count):
+                            for step in phases:
+                                demand = self._tile_demand(step, seq, query, heads, live, i, offset, count, partials)
+                                totals[step] = totals.get(step, Work()) + demand.work(self.dtype).scaled(repeat)
+                    for step in self._finish_steps(partials):
+                        work = self._demand(step, live, heads=heads, partials=partials).work(self.dtype)
+                        totals[step] = totals.get(step, Work()) + work.scaled(repeat)
         return totals
 
     def _stage(self, context, demand, pair, name, *, after=(), previous=(), metadata=None):
@@ -359,7 +405,7 @@ class _PagedMlaProgramBuilder:
             stages.append(Stage(f"aiv{aiv}", work, placement=placement, keep_empty=True))
         return KernelProgram(tuple(stages))
 
-    def _split_program(self, ctx, seq, heads, live, pair, offset, count, interval):
+    def _split_program(self, ctx, seq, query, heads, live, pair, offset, count, partials, interval):
         layout = self.layout
         aivs = pair[1]
         pair = (pair[0], pair[1][:heads])
@@ -420,7 +466,7 @@ class _PagedMlaProgramBuilder:
                     depend(consumer, index - depth)
                     metadata[f"{region}_slot"] = index % depth
                     metadata[f"{region}_generation"] = index // depth
-                demand = self._tile_demand(step, seq, heads, live, index, offset, count, mm2_offset)
+                demand = self._tile_demand(step, seq, query, heads, live, index, offset, count, partials, mm2_offset)
                 edges = dict(after=tuple(dict.fromkeys(deps)), previous=tuple(dict.fromkeys(prev)))
                 if step in {"release0", "release1"}:
                     stages.append(Stage(name(step, index), program=self._panel_release(ctx, demand, aivs, heads),
@@ -434,14 +480,14 @@ class _PagedMlaProgramBuilder:
 
     def __call__(self, context: RecipeContext) -> Program:
         c, layout = self.contract, self.layout
-        head_groups, prefix, partial_counts, lanes, groups_per_wave = self._distribution()
+        head_groups, prefix, lanes, groups_per_wave = self._distribution()
         if not prefix[-1]:
             return KernelProgram(())
 
         intervals = []
         if layout.gm_workspace:
             # Collapse adjacent sequences with equal split counts for owner-local ordinals.
-            for start, end, partials in zip(prefix, prefix[1:], partial_counts):
+            for start, end, partials in self._group_ranges(head_groups, prefix):
                 if partials and end > start:
                     if intervals and intervals[-1][1:] == (start, partials):
                         start, _, _ = intervals.pop()
@@ -460,17 +506,18 @@ class _PagedMlaProgramBuilder:
 
         def group(group_index, owner_start):
             seq = bisect_right(prefix, group_index) - 1
-            head_start = ((group_index - prefix[seq]) % head_groups) * layout.head_tile
+            query, head_group = divmod(group_index - prefix[seq], head_groups)
+            head_start = head_group * layout.head_tile
             heads = min(layout.head_tile, c.physical_heads - head_start)
             live = min(heads, max(0, c.logical_heads - head_start))
-            tiles, partials = self._counts(c.sequences[seq][1])
+            tiles, partials = self._counts(seq, query)
 
             def wave(index):
                 for local in range(min(lanes, partials - index * lanes)):
                     split = index * lanes + local
                     offset, count = _split_tiles(tiles, c.splits, split)
                     program = self._split_program(
-                        context, seq, heads, live, self.owners[owner_start + local], offset, count,
+                        context, seq, query, heads, live, self.owners[owner_start + local], offset, count, partials,
                         owner_interval(group_index, local) + index,
                     )
                     yield Stage(f"split{local}", program=program, metadata={"split": split})
@@ -491,7 +538,7 @@ class _PagedMlaProgramBuilder:
         if not c.sinks:
             return pipeline
         loads = tuple(self._stage(context, self._demand("sink_load", 0), pair, f"sink_load{pair[0]}")
-                      for pair in self._sink_owners(prefix, partial_counts, lanes, groups_per_wave))
+                      for pair in self._sink_owners(head_groups, prefix, lanes, groups_per_wave))
         return KernelProgram((*loads, Stage("attention", program=pipeline, after=tuple(s.name for s in loads))))
 
 def owner_pairs(ctx: OperatorPlanningContext, abi: str) -> tuple[tuple[int, tuple[int, ...]], ...]:

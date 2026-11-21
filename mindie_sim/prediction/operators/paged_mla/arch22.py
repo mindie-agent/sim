@@ -17,9 +17,10 @@ from mindie_sim.schema.operators import OpSpec
 
 from ..contracts import ArchStrategy, OperatorPlanningContext
 from ._lowering import FIA_WORKSPACE_DEPTH, PipelineLayout, make_plan
-from .common import FIA_ABI, FP32_BYTES, capability_gap, contract_for
+from .common import FP32_BYTES, capability_gap, contract_for
 
 ARCH_ID = "npu_arch_2201"
+UPSTREAM_ABI = "aclnnFusedInferAttentionScore"
 TASK_RECORD_COUNT = 3
 WORKSPACE_DEPTH = FIA_WORKSPACE_DEPTH
 # The source assigns <=16 live M rows to the first AIV subblock.
@@ -75,7 +76,7 @@ def arch22_fia_schedule(num_tiles: int) -> tuple[tuple[int, int, tuple[str, ...]
 @dataclass(frozen=True, slots=True)
 class _FiaStrategy:
     arch_id = ARCH_ID
-    abi = FIA_ABI
+    abi = UPSTREAM_ABI
     sources = SOURCES
 
     def accepts(self, op: OpSpec, ctx: OperatorPlanningContext, /) -> bool:

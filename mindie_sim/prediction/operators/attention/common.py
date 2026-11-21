@@ -11,11 +11,10 @@
 """
 from __future__ import annotations
 
-from bisect import bisect_right
 from collections.abc import Iterable
-from dataclasses import asdict, dataclass, replace
-from itertools import accumulate, islice
-from math import ceil, gcd, isfinite
+from dataclasses import dataclass, replace
+from itertools import islice
+from math import ceil, isfinite
 
 from mindie_sim.public.errors import UnmodeledCapabilityError
 from mindie_sim.schema.common import ModelingError
@@ -23,7 +22,7 @@ from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.operators import OpSpec
 from ...mechanism import Geometry, OperatorPlan, Work
 from ...ownership import read_role, unit_group
-from ...program import KernelProgram, ParallelProgram, PipelineProgram, RecipeContext, Stage
+from ...program import KernelProgram, ParallelProgram, RecipeContext, Stage
 from ...results import FusedPipelineDescriptor, FusedPipelineSpec, PipelinePhase, WorkItem
 from ...runtime.l2_residency import AdmissionMemoryView, bind_memory_access
 from ...runtime.memory_physics import AddressRun, AddressRunPlan, HbmBusSpec, MemoryAccessPattern, ReuseKey
@@ -48,6 +47,7 @@ ARCH22 = "npu_arch_2201"
 ARCH35 = "npu_arch_3510"
 QUANT_MODE_BF16 = 0
 QUANT_MODE_INT8_C8 = 1
+QUANT_MODE_MINDIE_FP8 = 1
 QUANT_MODE_MXFP4_OCP = 2
 QUANT_MODE_MXFP4_CX = 3
 QUANT_MODE_TQ4 = 3
@@ -58,6 +58,9 @@ SUPPORTED_QUANT_MODES = frozenset({
     QUANT_MODE_FP8_C8, QUANT_MODE_MXFP8,
 })
 C8_MODES = frozenset({QUANT_MODE_INT8_C8, QUANT_MODE_TQ4, QUANT_MODE_FP8_C8})
+MINDIE_V3_MODES = frozenset({
+    QUANT_MODE_BF16, QUANT_MODE_MINDIE_FP8, QUANT_MODE_MXFP4_OCP, QUANT_MODE_MXFP4_CX,
+})
 TOKEN_MAJOR_LAYOUTS = frozenset({"BSH", "PA_BLK_BSND", "TND"})
 PAGED_LAYOUTS = frozenset({"PA_BLK_BSND", "PA_BLK_BHSD"})
 KV_LAYOUTS = TOKEN_MAJOR_LAYOUTS | {"BNSD", "PA_BLK_BHSD"}
@@ -96,7 +99,8 @@ class AttentionContract:
     Each sequence is (query_count, total_kv_length). Causal queries are
     end-aligned in that length. An explicit sparse list contains physical
     byte addresses for one shared KV head, one list per query. For packed
-    KV, tensor ID and producer version define which backing can share L2.
+    KV, L2 reuse requires explicit addresses on a named backing allocation
+    at its declared producer version.
     """
 
     query_tokens: int
@@ -140,7 +144,8 @@ class AttentionContract:
         if (self.phase not in {"prefill", "decode"} or self.kv_layout not in KV_LAYOUTS
                 or self.window_size < 0 or self.panel_mode not in {"shipping", "tile_solver_candidate"}):
             raise ModelingError("attention_phase_layout_window_or_panel_mode_invalid")
-        if self.abi not in SUPPORTED_ABIS or self.quant_mode not in SUPPORTED_QUANT_MODES:
+        modes = MINDIE_V3_MODES if self.abi == MINDIE_V3_ABI else SUPPORTED_QUANT_MODES
+        if self.abi not in SUPPORTED_ABIS or type(self.quant_mode) is not int or self.quant_mode not in modes:
             raise unmodeled("attention_abi_or_quant_mode", f"Bind attention ABI {self.abi} and quantization {self.quant_mode}")
         if (type(self.kv_version) is not int or self.kv_version < 0 or not isinstance(self.kv_tensor_id, str)
                 or (self.query_block_size is not None
@@ -410,15 +415,8 @@ class _AttentionProgramBuilder:
                     {role: _owner_share(amount, index, count) for role, amount in phase.work.matrix.items()},
                     {role: _owner_share(amount, index, count) for role, amount in phase.work.resources.items()},
                 )
-                program = (phase.memory.lower(context, index, count, aiv_group)
-                           if phase.memory is not None else None)
-                demand = {} if program is not None else context.bind(share)
-                stages.append(Stage(
-                    phase.name, demand, after=tuple(dep for dep in phase.after if dep in phase_names),
-                    placement={name: units for name, units in placement.items() if name in demand},
-                    metadata={} if phase.slot is None else {"operand_slot": phase.slot},
-                    program=program, keep_empty=True,
-                ))
+                bound = replace(phase, work=share, after=tuple(dep for dep in phase.after if dep in phase_names))
+                stages.append(_stage(context, bound, placement))
             programs.append(KernelProgram(tuple(stages)))
         return ParallelProgram(tuple(programs))
 
@@ -526,10 +524,10 @@ def read_work(ctx: OperatorPlanningContext, bytes_: int, *, aiv: bool = False, h
 
 def output_phases(
     ctx: OperatorPlanningContext, contract: AttentionContract, dtype_bytes: int,
-    previous: tuple[str, ...], partials: int,
+    previous: tuple[str, ...], partials: int, *, queries: int | None = None,
 ) -> tuple[AttentionPhase, ...]:
     """Publish completed rows and explicitly reduce split-KV partials."""
-    rows = contract.query_tokens * contract.num_heads
+    rows = (contract.query_tokens if queries is None else queries) * contract.num_heads
     phases = []
     if partials > rows:
         payload = partials * (contract.v_head_dim + 2) * FP32_BYTES
@@ -544,256 +542,3 @@ def output_phases(
     result = rows * (contract.v_head_dim * dtype_bytes + (FP32_BYTES if contract.return_lse else 0))
     phases.append(AttentionPhase("output", Work(resources={"mte3": result, "hbm": result}), previous))
     return tuple(phases)
-
-
-@dataclass(frozen=True, slots=True)
-class _FiaRect:
-    m: int
-    head: int
-    kv: int
-    first: int
-    end: int
-
-
-@dataclass(frozen=True, slots=True)
-class _FiaLoop:
-    contract: AttentionContract
-    panels: FiaPanelPlan
-    ctx: OperatorPlanningContext
-    dtype: str
-    gm_workspace: bool
-    sequences: tuple[tuple[int, int], ...]
-    row_ends: tuple[int, ...]
-    owners: tuple[tuple[int, tuple[int, ...]], ...]
-    buffers: tuple[tuple[str, int], ...]
-    phases: tuple[AttentionPhase, ...] = ()
-
-    def rectangle(self, index):
-        c = self.contract
-        group = c.num_heads // c.num_kv_heads
-        sequence = bisect_right(self.row_ends, index)
-        queries, kv = self.sequences[sequence]
-        head, tile = divmod(index - (self.row_ends[sequence - 1] if sequence else 0), ceil(queries * group / FIA_TILE))
-        row = tile * FIA_TILE
-        m = min(FIA_TILE, queries * group - row)
-        visible = min(kv, kv if c.selected_tokens is None else c.selected_tokens, c.window_size or kv)
-        if c.causal and c.sequences:
-            if c.kv_layout in TOKEN_MAJOR_LAYOUTS:
-                first, last = row // group, (row + m - 1) // group
-            elif row // queries == (row + m - 1) // queries:
-                first, last = row % queries, (row + m - 1) % queries
-            else:
-                first, last = 0, queries - 1
-            start = max(0, kv - queries + first + 1 - visible)
-            end = max(0, kv - queries + last + 1)
-        else:
-            start, end = kv - visible, kv
-        return _FiaRect(m, head, kv, start // FIA_TILE, ceil(end / FIA_TILE) if visible else start // FIA_TILE)
-
-    def _kv(self, rect, start, n, dim, width, offset):
-        c = self.contract
-        page = c.block_size if c.kv_layout in PAGED_LAYOUTS else rect.kv
-        hbm = copy = 0
-        while n:
-            begin = start % page
-            extent = min(n, page - begin)
-            base = bsh_kv_access_plan(
-                c.num_kv_heads, dim, BF16_BYTES, c.kv_layout,
-                rows=extent, first_head=rect.head, block_size=page, tokens_per_head=rect.kv,
-            ).runs[0]
-            run = AddressRun(base.base_byte + begin * base.stride_bytes + offset * BF16_BYTES,
-                             extent, width * BF16_BYTES, base.stride_bytes, base.layout)
-            plan = AddressRunPlan((run,))
-            copy += plan.aligned_copy_bytes()
-            hbm += plan.dram_sector_and_service()[0]
-            n, start = n - extent, start + extent
-        return read_work(self.ctx, copy, hbm=hbm)
-
-    def s2_phases(self, rect, tile):
-        c, p = self.contract, self.panels
-        start = tile * FIA_TILE
-        n = min(FIA_TILE, rect.kv - start)
-        pairs = rect.m * n
-        score, probability = pairs * FP32_BYTES, pairs * BF16_BYTES
-        stages = []
-
-        def add(name, work, after=None, slot=None):
-            deps = (stages[-1].name,) if after is None and stages else after or ()
-            stages.append(AttentionPhase(name, work, deps, slot))
-
-        if c.kv_layout in PAGED_LAYOUTS:
-            pages = ceil((start % c.block_size + n) / c.block_size)
-            add("block_table", read_work(self.ctx, pages * INDEX_BYTES, aiv=True))
-        k_root = (stages[-1].name,) if stages else ()
-        offset = 0
-        depth = min(p.k_l1_slots, p.l0b_slots)
-        for index, width in enumerate(p.k_panels):
-            load, compute = f"k_panel_{index}_load", f"qk_panel_{index}_accumulate"
-            slot = index % p.l0b_slots
-            ready = (f"qk_panel_{index - depth}_accumulate",) if index >= depth else k_root
-            previous = (f"qk_panel_{index - 1}_accumulate",) if index else ()
-            add(load, self._kv(rect, start, n, c.head_dim, width, offset), ready, slot)
-            add(compute, Work({self.dtype: 2 * pairs * width},
-                              {"mte1": (rect.m + n) * width * BF16_BYTES}), (load, *previous), slot)
-            offset += width
-        add("score_fixpipe", Work(resources={"fixpipe": score, "hbm": score if self.gm_workspace else 0}))
-        if self.gm_workspace:
-            add("score_workspace_read", read_work(self.ctx, score, aiv=True))
-        add("online_softmax", Work(resources={"vector": SOFTMAX_OPS * pairs}))
-        add("probability_transfer", Work(resources={"mte3": probability,
-                                                   "hbm": probability if self.gm_workspace else 0}))
-        if self.gm_workspace:
-            add("probability_workspace_read", read_work(self.ctx, probability))
-        v_root = (stages[-1].name,)
-        offset = 0
-        depth = min(p.v_l1_slots, p.l0b_slots)
-        for index, width in enumerate(p.v_panels):
-            load, compute, store = f"v_panel_{index}_load", f"pv_panel_{index}", f"pv_panel_{index}_fixpipe"
-            slot = index % p.l0b_slots
-            ready = (f"pv_panel_{index - depth}",) if index >= depth else v_root
-            previous = stages[-1].name
-            add(load, self._kv(rect, start, n, c.v_head_dim, width, offset), ready, slot)
-            add(compute, Work({self.dtype: 2 * pairs * width},
-                              {"mte1": probability + n * width * BF16_BYTES}), (load, previous), slot)
-            partial = rect.m * width * FP32_BYTES
-            add(store, Work(resources={"fixpipe": partial, "hbm": partial if self.gm_workspace else 0}), slot=slot)
-            if self.gm_workspace:
-                add(f"pv_panel_{index}_workspace_read", read_work(self.ctx, partial, aiv=True))
-            offset += width
-        add("online_output", Work(resources={"vector": rect.m * c.v_head_dim}))
-        return tuple(stages)
-
-    def ranges(self, rect):
-        tiles = rect.end - rect.first
-        splits = min(self.contract.splits, max(1, tiles))
-        for split in range(splits):
-            yield range(rect.first + tiles * split // splits, rect.first + tiles * (split + 1) // splits)
-
-    def query_load(self, rect, tiles):
-        size = rect.m * self.contract.head_dim * BF16_BYTES if tiles else 0
-        return AttentionPhase("query_load", read_work(self.ctx, size), ())
-
-    def partial(self, rect, split, after=()):
-        c = self.contract
-        phase = AttentionPhase("normalize", Work(resources={"vector": rect.m * c.v_head_dim}), after)
-        if not split:
-            return (phase,)
-        payload = rect.m * (c.v_head_dim + 2) * FP32_BYTES
-        return (phase, AttentionPhase("split_write", Work(resources={"mte3": payload, "hbm": payload}),
-                                      (phase.name,)))
-
-    def finish(self, rect, n_splits):
-        c = self.contract
-        if n_splits > 1:
-            partials = rect.m * n_splits
-            payload = partials * (c.v_head_dim + 2) * FP32_BYTES
-            yield AttentionPhase("split_read", read_work(self.ctx, payload, aiv=True), ("split_write",))
-            yield AttentionPhase("split_merge", Work(resources={
-                "vector": partials * (2 * c.v_head_dim + SOFTMAX_OPS),
-            }), ("split_read",))
-        result = rect.m * (c.v_head_dim * BF16_BYTES + (FP32_BYTES if c.return_lse else 0))
-        yield AttentionPhase("output", Work(resources={"mte3": result, "hbm": result}),
-                             ("split_merge" if n_splits > 1 else "normalize",))
-
-    def __call__(self, context):
-        datapath = self.ctx.datapath
-        places = tuple(_placement(context, pair, datapath.aic_count, datapath.aiv_count) for pair in self.owners)
-        allocs = tuple(_allocations(context, self.buffers, pair, datapath.aic_count) for pair in self.owners)
-        owners = len(places)
-
-        def row(index, core):
-            rect = self.rectangle(index)
-            ranges = tuple(self.ranges(rect))
-            branches = []
-            for split, tiles in enumerate(ranges):
-                place = places[(core + split) % owners]
-                allocations = allocs[(core + split) % owners]
-
-                def tile(i, tiles=tiles, place=place):
-                    return tuple(_stage(context, phase, place) for phase in self.s2_phases(rect, tiles[i]))
-
-                load = _stage(context, self.query_load(rect, tiles), place, acquire=allocations)
-                loop = Stage("s2", after=(load.name,), program=PipelineProgram(len(tiles), 1, tile))
-                partial = self.partial(rect, len(ranges) > 1, (loop.name,))
-                commits = tuple(_stage(context, phase, place, free=allocations if phase is partial[-1] else ())
-                                for phase in partial)
-                branches.append(KernelProgram((load, loop, *commits)))
-            pre = Stage("partials", program=ParallelProgram(tuple(branches)))
-            stages = [pre]
-            for phase in self.finish(rect, len(ranges)):
-                # The branch join publishes all split workspace or the normalized result.
-                phase = AttentionPhase(phase.name, phase.work, (stages[-1].name,))
-                stages.append(_stage(context, phase, places[core]))
-            return (Stage("s1", program=KernelProgram(tuple(stages))),)
-
-        return ParallelProgram(tuple(
-            PipelineProgram(len(indices), 1, lambda i, core=core, indices=indices: row(indices[i], core))
-            for core in range(owners) if (indices := range(core, self.row_ends[-1], owners))
-        ))
-
-
-def dense_fia(
-    op: OpSpec, contract: AttentionContract, ctx: OperatorPlanningContext,
-    sources: tuple[SourceRef, ...], *, gm_workspace: bool,
-) -> OperatorPlan:
-    """Issue one physical QK/Vec1/PV rectangle per S2 task with nested D panels."""
-    if contract.quant_mode != QUANT_MODE_BF16 or contract.selection_lists or op.dtype not in {"bf16", "fp16"}:
-        raise unmodeled("attention_fia_nonquant", "Bind a nonquant dense FIA tensor contract")
-    buffers = ()
-    metadata = {"panel_mode": contract.panel_mode}
-    if contract.panel_mode == "shipping":
-        plan = shipping_fia_panel_plan(contract, ctx.compute_arch.arch_id)
-    else:
-        solution = solve_wide_head_tiling(contract, ctx.geometry)
-        width = solution.tile_shape.k
-        plan = FiaPanelPlan(panels(contract.head_dim, width), panels(contract.v_head_dim, width),
-                            1, 2, 2, 1, 1, solution.depth, 1)
-        buffers = tuple((peak.pool, peak.peak_bytes) for peak in solution.pool_peaks)
-        metadata["tile_solution"] = {
-            "algorithm": solution.algorithm, "panel_width": width,
-            "rejections": tuple((r.pool, r.required_bytes, r.available_bytes) for r in solution.rejections),
-        }
-    metadata.update(asdict(plan), k_panels=len(plan.k_panels), v_panels=len(plan.v_panels))
-    batch = min(contract.batch_size, contract.query_tokens)
-    base, extra = divmod(contract.query_tokens, batch)
-    sequences = contract.sequences or tuple((base + (i < extra), contract.selected_tokens) for i in range(batch))
-    group = contract.num_heads // contract.num_kv_heads
-    ends = tuple(accumulate(ceil(q * group / FIA_TILE) * contract.num_kv_heads for q, _ in sequences))
-    owners = owner_pairs(ctx, ends[-1] * contract.splits)
-    loop = _FiaLoop(contract, plan, ctx, op.dtype, gm_workspace, sequences, ends, owners, buffers)
-    queries, s2, partials, outputs = {}, {}, {}, {}
-    page = contract.block_size if contract.kv_layout in PAGED_LAYOUTS else FIA_TILE
-    period = page // gcd(page, FIA_TILE)
-    tiles = 0
-
-    def collect(bucket, phase, repeats=1):
-        work = phase.work.scaled(repeats) if repeats != 1 else phase.work
-        old = bucket.get(phase.name)
-        bucket[phase.name] = replace(phase, work=work + old.work if old else work)
-
-    for index in range(ends[-1]):
-        rect = loop.rectangle(index)
-        ranges = tuple(loop.ranges(rect))
-        tiles += rect.end - rect.first
-        for span in ranges:
-            collect(queries, loop.query_load(rect, span))
-            for phase in loop.partial(rect, len(ranges) > 1):
-                collect(partials, phase)
-        full_end = min(rect.end, rect.kv // FIA_TILE)
-        # Whole tiles repeat once their page offset repeats. The tail retains its actual width.
-        for tile in range(rect.first, min(full_end, rect.first + period)):
-            for phase in loop.s2_phases(rect, tile):
-                collect(s2, phase, ceil((full_end - tile) / period))
-        if rect.first <= full_end < rect.end:
-            for phase in loop.s2_phases(rect, full_end):
-                collect(s2, phase)
-        for phase in loop.finish(rect, len(ranges)):
-            collect(outputs if phase.name == "output" else partials, phase)
-
-    phases = (*queries.values(),
-              *(phase if phase.after else replace(phase, after=("query_load",)) for phase in s2.values()),
-              replace(partials.pop("normalize"), after=(next(reversed(s2), "query_load"),)),
-              *partials.values(),
-              replace(outputs["output"], after=(next(reversed(partials), "normalize"),)))
-    return make_plan(op, contract, ctx, phases, sources, metadata={**metadata, "s2_tiles": tiles},
-                     program=replace(loop, phases=phases))

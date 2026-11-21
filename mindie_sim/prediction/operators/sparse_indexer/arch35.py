@@ -20,19 +20,23 @@ from mindie_sim.schema.operators import OpSpec
 from ...mechanism import OperatorPlan
 from ..contracts import OperatorPlanningContext
 from .common import (
-    BF16_BYTES, DSL_QSLI_ABI, FP32_BYTES, INT32_BYTES, MSA_ABIS, PAIR_BYTES, QLI_V2_ABI,
-    QUANT_ABIS, REGION_ABI, SCORE_SLOTS, VLLM_QLI_ABIS, Lowering, PhaseWork,
+    BF16_BYTES, DSL_QSLI_ABI, FP32_BYTES, INT32_BYTES, MSA_ABIS, PAIR_BYTES,
+    QSA_ABI, QSA_OVERLAY_SOURCE, QUANT_ABIS, REGION_ABI, SCORE_SLOTS, VLLM_QLI_ABIS, Lowering, PhaseWork,
     SparseIndexerContract, align, build_plan, ceil_div, indexer_contract,
     owner_pairs, pair_merge, sort_ops, unsupported, vector,
 )
 
 ARCH_ID = ArchId("npu_arch_3510")
+UPSTREAM_ABI = "aclnnQuantLightningIndexerV2"
 QLI_TILE_ROWS = 128
 QLI_FIXPIPE_BANK_BYTES = 256
+QLI_S1_BASE_SIZE = 4
+QLI_SMALL_S1_BASE_SIZE = 2
 QLI_MAX_M = 256
 QLI_SMALL_MAX_M = 128
 QLI_SMALL_M_TOPK_THRESHOLD = 6144
 FIXPIPE_ALIGNMENT = 32
+DSL_TILE_ROWS = 512
 DSL_TRUNK_ITEMS = 16384
 RADIX_BINS = 256
 RADIX_COUNTER_BYTES = 2
@@ -126,6 +130,11 @@ SOURCES: tuple[SourceRef, ...] = (
         source_sha256="e0b96525763d58987858dbd099734f587b79981a639e24992941003b2ddd3b90",
     ),
     SourceRef(
+        repository="vllm-project/vllm-ascend", revision="0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        relative_path="vllm_ascend/models/qwen4_exp/lightning_indexer.py",
+        source_sha256="1d265521c2a44a904342e24a0d917aec575240469fe0f1dbc5ea61133d0e5736",
+    ),
+    SourceRef(
         repository="cann/ops-transformer", revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
         relative_path="attention/msa_index_score/op_host/msa_index_score_tiling.cpp",
         source_sha256="0c7097f4391b2fe3abf9b7778ede388c234aef004c68ec62ca2f62361b42e625",
@@ -137,9 +146,9 @@ SOURCES: tuple[SourceRef, ...] = (
     ),
 )
 (
-    QLI_SOURCE, MSA_SOURCE, MSA_TOPK_SOURCE, MXFP4_SOURCE, DSL_SOURCE, QSA_SOURCE,
+    QLI_SOURCE, MSA_SOURCE, MSA_TOPK_SOURCE, MXFP4_SOURCE, DSL_SOURCE, LIGHTNING_V2_TILER,
     VLLM_SOURCE, VLLM_TILER, REGION_SOURCE, QLI_VEC_SOURCE, VLLM_VEC_SOURCE, VLLM_CUBE_SOURCE,
-    QLI_TILER, QLI_KERNEL, VLLM_QLI_KERNEL, VLLM_BINDING, MSA_TILER, MSA_EPILOGUE,
+    QLI_TILER, QLI_KERNEL, VLLM_QLI_KERNEL, VLLM_BINDING, QSA_SOURCE, MSA_TILER, MSA_EPILOGUE,
 ) = SOURCES
 
 
@@ -215,7 +224,7 @@ def _make_lowering(contract: SparseIndexerContract) -> tuple[Lowering, tuple[Sou
     tile = align(min(contract.s2_tile_size, QLI_TILE_ROWS), contract.block_size)
     kwargs = {"score_align": FIXPIPE_ALIGNMENT // FP32_BYTES}
     tiling = "s2_tiles"
-    sources = (QSA_SOURCE,)
+    sources = (LIGHTNING_V2_TILER,)
     if abi in QUANT_ABIS:
         tile = QLI_TILE_ROWS
         # The vLLM caller binds its own exported operator and tiler. The
@@ -228,10 +237,13 @@ def _make_lowering(contract: SparseIndexerContract) -> tuple[Lowering, tuple[Sou
             tiling = "cann_qli_v2_tiler"
             sources = (QLI_SOURCE, QLI_VEC_SOURCE, QLI_TILER, QLI_KERNEL)
         handoff_bytes = BF16_BYTES if contract.cache_dtype == "mxfp4" else FP32_BYTES
-        max_m = QLI_SMALL_MAX_M if contract.topk_items > QLI_SMALL_M_TOPK_THRESHOLD else QLI_MAX_M
+        small_m = contract.topk_items > QLI_SMALL_M_TOPK_THRESHOLD
+        max_m = QLI_SMALL_MAX_M if small_m else QLI_MAX_M
         slot_bytes = (max_m // 2) * tile * handoff_bytes
         kwargs.update(
-            dual_destination=True, slots=SCORE_SLOTS, owner_score_row=True,
+            aivs_per_aic=2, slots=SCORE_SLOTS, owner_score_row=True,
+            query_block_size=QLI_SMALL_S1_BASE_SIZE if small_m else QLI_S1_BASE_SIZE,
+            handoff_query_alignment=2,
             score_row_item_bytes=RADIX_COUNTER_BYTES, owner_selection=_qli_select,
             handoff_item_bytes=handoff_bytes, score_align=FIXPIPE_ALIGNMENT // handoff_bytes,
             handoff_columns=_qli_fixpipe_columns if handoff_bytes == FP32_BYTES else None,
@@ -249,8 +261,17 @@ def _make_lowering(contract: SparseIndexerContract) -> tuple[Lowering, tuple[Sou
                       score_row_read_align=FIXPIPE_ALIGNMENT // FP32_BYTES)
     elif abi == DSL_QSLI_ABI:
         tiling = "dsl_radix_trunks"
+        tile = DSL_TILE_ROWS
         sources = (DSL_SOURCE,)
-        kwargs.update(owner_selection=_dsl_select)
+        kwargs.update(
+            gm_key_staging=True, aivs_per_aic=2, slots=SCORE_SLOTS,
+            owner_selection=_dsl_select, head_weight_item_bytes=FP32_BYTES,
+            handoff_item_bytes=BF16_BYTES, score_align=FIXPIPE_ALIGNMENT // BF16_BYTES,
+            score_slot_bytes=tile // 2 * contract.index_heads * BF16_BYTES,
+        )
+    elif abi == QSA_ABI:
+        sources = (QSA_SOURCE,) if contract.has_head_weights else (QSA_OVERLAY_SOURCE,)
+        kwargs.update(head_weight_item_bytes=FP32_BYTES)
     elif abi == REGION_ABI:
         tiling = "region_score_mask3"
         sources = (REGION_SOURCE,)
@@ -261,7 +282,7 @@ def _make_lowering(contract: SparseIndexerContract) -> tuple[Lowering, tuple[Sou
 
 
 def _contract(op: OpSpec, ctx: OperatorPlanningContext) -> SparseIndexerContract:
-    contract = indexer_contract(op, ctx, QLI_V2_ABI)
+    contract = indexer_contract(op, ctx, UPSTREAM_ABI)
     if contract.cache_dtype == "mxfp4" and contract.abi not in MSA_ABIS | QUANT_ABIS | {DSL_QSLI_ABI}:
         raise unsupported("mxfp4_abi", f"{contract.abi} has no MXFP4 lowering")
     return contract
@@ -270,7 +291,7 @@ def _contract(op: OpSpec, ctx: OperatorPlanningContext) -> SparseIndexerContract
 @dataclass(frozen=True, slots=True)
 class _Arch35Strategy:
     arch_id: ArchId = ARCH_ID
-    abi: str = QLI_V2_ABI
+    abi: str = UPSTREAM_ABI
     sources: tuple[SourceRef, ...] = SOURCES
 
     def accepts(self, op: OpSpec, ctx: OperatorPlanningContext, /) -> bool:
@@ -285,7 +306,7 @@ class _Arch35Strategy:
     def build(self, op: OpSpec, ctx: OperatorPlanningContext, /) -> OperatorPlan:
         contract = _contract(op, ctx)
         lowering, sources = _make_lowering(contract)
-        needed = 2 if lowering.dual_destination else 1
+        needed = lowering.aivs_per_aic
         representation = "fp32"
         if lowering.handoff_item_bytes == BF16_BYTES:
             representation = "bf16"
@@ -295,8 +316,9 @@ class _Arch35Strategy:
         if contract.scanned_rows and contract.query_tokens:
             route = ctx.datapath.route("l0c", "ub", representation)
             lowering = replace(lowering, handoff_alignment=route.path.alignment_bytes)
+            queries = min(lowering.query_block_size, ceil_div(contract.query_tokens, contract.batch_size))
             transfer = lowering.handoff_bytes(min(contract.scanned_rows, lowering.tile_size),
-                                              contract.index_heads) // needed
+                                              contract.index_heads, queries) // needed
             slot_bytes = lowering.score_slot_bytes or transfer
             if (transfer > slot_bytes or ("ub" in dict(ctx.datapath.buffers)
                     and slot_bytes * lowering.slots > ctx.datapath.usable_bytes("ub"))):

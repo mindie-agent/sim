@@ -18,22 +18,25 @@ from pathlib import Path
 import pytest
 
 from mindie_sim import operator_costs, target_graphs
-from mindie_sim.prediction.attention_decode import RECIPE_ID, StagedGQADecode
 from mindie_sim.prediction.cost import CostModel
 from mindie_sim.prediction.engine import Engine, Resource
 from mindie_sim.prediction.execution import Execution
-from mindie_sim.prediction.family_mqsmla import FORMATS as MQSMLA_FORMATS
-from mindie_sim.prediction.family_mqsmla import RECIPE as MQSMLA_RECIPE
 from mindie_sim.prediction.mechanism import Geometry
-from mindie_sim.prediction.paged_mla import BUFFERS as PAGED_MLA_BUFFERS
-from mindie_sim.prediction.paged_mla import IMPLEMENTATION as PAGED_MLA_IMPL
-from mindie_sim.prediction.paged_mla_arch22 import BUFFERS as PAGED_MLA_MEM_BUFFERS
-from mindie_sim.prediction.paged_mla_arch22 import IMPLEMENTATION as PAGED_MLA_MEM_IMPL
-from mindie_sim.prediction.paged_mla_arch22 import build as paged_mla_mem_build
 from mindie_sim.prediction.program import RecipeBook, RecipeContext
 from mindie_sim.prediction.sparse_mla_metadata import IMPLEMENTATION as SPARSE_META_IMPL
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.operators import OpSpec
+
+RECIPE_ID = "staged_gqa_decode"
+MQSMLA_RECIPE = "aclnn_mixed_quant_sparse_flash_mla"
+MQSMLA_FORMATS = {
+    "window": {"dtype": "fp8_e4m3", "group_size": 32, "scale_dtype": "bf16"},
+    "compressed_kv": {"dtype": "fp4_e2m1", "group_size": 16, "scale_dtype": "bf16"},
+}
+PAGED_MLA_IMPL = "ascend_paged_mla_decode_arch35"
+PAGED_MLA_BUFFERS = {"l1": 516096, "l0a": 65536, "l0b": 65536, "l0c": 262144, "ub": 241920}
+PAGED_MLA_MEM_IMPL = "ascend_paged_mla_decode_arch22"
+PAGED_MLA_MEM_BUFFERS = {"l1": 516096, "l0a": 65536, "l0b": 65536, "l0c": 131072, "ub": 174080}
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 _PAGED_MLA_CASE = (
@@ -238,7 +241,9 @@ def gqa_decode_op(requests, *, heads=4, kv_heads=2, dim=8, recipe=RECIPE_ID, **m
 
 def gqa_decode_run(op, recipe=None, *, units=4, ready=0.0, external=None, raw_case=None):
     """Execute one staged GQA decode op directly on ``Engine``."""
-    recipe = recipe or StagedGQADecode()
+    recipe = recipe or RecipeBook.from_mapping(
+        {"programs": {"gqa_decode": {"kind": RECIPE_ID}}}
+    ).programs["gqa_decode"]
     case = parse_case(raw_case or gqa_decode_hardware(units=units))
     execution = Execution(
         case,
@@ -327,7 +332,10 @@ def paged_mla_membase_run(raw: dict, *, supply: float = 1, trace: int = 0):
             ),
         ),
     )
-    plan = paged_mla_mem_build(op, Geometry(cores, units, PAGED_MLA_MEM_BUFFERS, pu))
+    planner = RecipeBook.from_mapping(
+        {"lowerings": {"paged_mla_attention": {"implementation": PAGED_MLA_MEM_IMPL}}}
+    ).recipes[PAGED_MLA_MEM_IMPL]
+    plan = planner.build(op, Geometry(cores, units, PAGED_MLA_MEM_BUFFERS, pu))
     engine = Engine(
         [Resource(r, v, units=units[r]) for r, v in rates.items()],
         pools=PAGED_MLA_MEM_BUFFERS,

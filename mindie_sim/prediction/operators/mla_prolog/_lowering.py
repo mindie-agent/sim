@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
+from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import SourceRef
 
 from ...mechanism import Work
@@ -20,6 +21,61 @@ from ...results import FusedPipelineSpec, PipelinePhase, WorkItem
 from ...runtime.memory_physics import AddressRun, AddressRunPlan, MemoryAccessPattern
 from ...runtime.ring_buffer import RingBuffer, lower_generation
 from ...streams import StreamOwners
+
+
+FRACTAL_MN = 16
+FRACTAL_K_BF16 = 16
+FRACTAL_K_BYTE = 32
+BF16_BYTES = 2
+FP32_BYTES = 4
+MX_GROUP_SIZE = 32
+
+
+def ceil_div(value: int, divisor: int) -> int:
+    return -(-value // divisor)
+
+
+def _align(value: int, multiple: int) -> int:
+    return ceil_div(value, multiple) * multiple
+
+
+def fractal_issues(m: int, n: int, k: int, k0: int) -> tuple[int, int]:
+    """Return the issue count and corresponding issued FLOPs."""
+    if min(m, n, k) < 0 or k0 not in {FRACTAL_K_BF16, FRACTAL_K_BYTE}:
+        raise ModelingError("mla_prolog_invalid_fractal_geometry")
+    issues = ceil_div(m, FRACTAL_MN) * ceil_div(n, FRACTAL_MN) * ceil_div(k, k0)
+    return issues, 2 * issues * FRACTAL_MN * FRACTAL_MN * k0
+
+
+def _plane(rows: int, width: int, *, stride: int | None = None, offset: int = 0) -> AddressRun:
+    return AddressRun(offset, rows, width, width if stride is None else stride)
+
+
+def _parts(size: int, count: int) -> tuple[int, ...]:
+    base, large = divmod(size, count)
+    return tuple(base + (owner < large) for owner in range(count))
+
+
+def _dual_rows(rows: int) -> tuple[int, int]:
+    first = min(rows, _align(rows, FRACTAL_MN) // 2)
+    return first, rows - first
+
+
+def _activation(width: int, dtype: str) -> int:
+    if dtype == "bf16":
+        return width * BF16_BYTES
+    if dtype == "int8":
+        return width + FP32_BYTES
+    return width + ceil_div(width, MX_GROUP_SIZE)
+
+
+def _weight(n: int, k: int, dtype: str, k0: int) -> tuple[AddressRun, ...]:
+    size = BF16_BYTES if dtype == "bf16" else 1
+    payload = _plane(_align(n, FRACTAL_MN), _align(k, k0) * size)
+    if dtype == "bf16":
+        return (payload,)
+    scales = FP32_BYTES if dtype == "int8" else ceil_div(k, MX_GROUP_SIZE)
+    return payload, _plane(n, scales)
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,6 +115,69 @@ class _Phase:
     name: str
     after: tuple[str, ...]
     demands: tuple[_Demand, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _ResidentTiling:
+    token_tile: int
+    token_tiles: int
+    k_splits: int
+    column_tile: int
+    panel: int
+    a_groups: int
+    b_groups: int
+    gm_alignment: int
+
+
+@dataclass(frozen=True, slots=True)
+class _GenericTiling:
+    token_tile: int
+    column_tile: int
+    k_splits: int
+    reduce_tile: int
+    separate_projections: bool
+
+
+def _generic_projection(name, rows, width, hidden, owners, tiling, start_owner, *, l2, alignment):
+    """Aggregate the round-robin (token tile, column tile, K split) job queue by owner."""
+    m, n, k = tiling.token_tile, tiling.column_tile, hidden // tiling.k_splits
+    padded = _align(rows, m)
+    jobs_per_tile = width // n * tiling.k_splits
+    jobs = padded // m * jobs_per_tile
+    dtype = "fp8_e4m3"
+    # Model the uniform NZ panels and their MX scale rows once per projection job.
+    activation = (_plane(m, k, stride=hidden), _plane(m, k // MX_GROUP_SIZE, stride=hidden // MX_GROUP_SIZE))
+    weight = _weight(n, k, dtype, FRACTAL_K_BYTE)
+    partial = _plane(m, n * FP32_BYTES, stride=width * FP32_BYTES)
+    issues, issued = fractal_issues(m, n, k, FRACTAL_K_BYTE)
+    reads, operands, cubes, writes = [], [], [], []
+    for index, owner in enumerate(owners):
+        first = (index - start_owner) % len(owners)
+        count = ceil_div(jobs - first, len(owners))
+        if not count:
+            continue
+        full = max(0, ceil_div(jobs - jobs_per_tile - first, len(owners)))
+        live = count * m - (count - full) * (padded - rows)
+        load = _transfer(owner, "aic", "mte2_aic", name, *activation, *weight, l2=l2)
+        pipe_bytes = load.work.resources["mte2_aic"]
+        reads.append(_repeat_demand(load, count))
+        operands.append(_Demand(owner, "aic", Work(resources={"mte1": pipe_bytes * count})))
+        cubes.append(_Demand(owner, "aic", Work(matrix={dtype: issued * count}), (
+            ("logical_flops", 2 * live * n * k), ("fractal_issues", issues * count),
+        )))
+        store = _transfer(owner, "aic", "fixpipe", name, partial, write=True, l2=l2, alignment=alignment)
+        stores = _repeat_demand(store, count)
+        writes.append(replace(stores, audit=(
+            ("tensor", name), ("logical_bytes", live * n * FP32_BYTES),
+            ("aligned_bytes", stores.work.resources["fixpipe"]), ("sector_bytes", stores.work.resources["hbm"]),
+        )))
+    return reads, operands, cubes, writes
+
+
+def _repeat_demand(demand: _Demand, count: int) -> _Demand:
+    counters = {"logical_bytes", "aligned_bytes", "sector_bytes", "logical_flops", "fractal_issues", "issued_flops"}
+    audit = tuple((key, value * count if key in counters else value) for key, value in demand.audit)
+    return replace(demand, work=demand.work.scaled(count), audit=audit)
 
 
 @dataclass(frozen=True, slots=True)

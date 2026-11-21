@@ -19,13 +19,14 @@ from ...runtime.tile_solver import (
     LiveBufferSpec, TileCandidate, TileInfeasibleError, TilePipelineSpec, TileShape, solve,
 )
 from ..contracts import ArchStrategy, OperatorPlanningContext
-from ._lowering import PipelineLayout, fixpipe_rectangle_bytes, make_plan, owner_pairs
+from ._lowering import SOFTMAX_STATE_SCALARS, PipelineLayout, fixpipe_rectangle_bytes, make_plan, owner_pairs
 from .common import (
-    DSL_FLASH_ABI, DSL_MQS_ABI, FIA_ABI, FLASH_ABI, FP32_BYTES, MQS_ABI,
+    DSL_FLASH_ABI, DSL_MQS_ABI, FIA_ABI, FP32_BYTES, MQS_ABI,
     MQS_ORIGINAL_ROW_BYTES, SUPPORTED_ABIS, align_bytes, capability_gap, ceil_div, contract_for,
 )
 
 ARCH_ID = "npu_arch_3510"
+UPSTREAM_ABI = "aclnnFlashMla"
 FIA_M_TILE = 64
 FIA_S2_TILE = 128
 FLASH_M_TILE = 96
@@ -39,6 +40,8 @@ MM2_DEPTH = 2
 KVP_DEPTH = 3
 PIPELINE_DRAIN = 3
 MQS_GATHER_ROWS = 16
+ACLNN_MQS_GATHER_BUFFER_BYTES_PER_ROW = 640
+DSL_MQS_SPLIT_SLOTS_PER_CORE = 2
 PV_L0C_WIDTH = 256
 CLOCKS = (
     ("q_load", "kv_load", "dequant", "kv_to_l1", "qk_operands", "qk", "score_store"),
@@ -94,13 +97,25 @@ SOURCES: tuple[SourceRef, ...] = (
         relative_path="attention/flash_mla/op_kernel/arch35/flash_mla_block_vec.h",
         source_sha256="e57170b54c8a97e60d2500604c24a4623d7aef3356be49b55a98411d5e7e7a3f",
     ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="attention/mixed_quant_sparse_flash_mla/op_kernel/arch35/mixed_quant_sparse_flash_mla_csa_block_vector.h",
+        source_sha256="f60e4f44294b0677522bdeec766f6bb66f61fdc3375ac95f547000eff7c10237",
+    ),
+    SourceRef(
+        repository="cann/cannbot-dsl",
+        revision="5e7ace8cdcc16a5b062ba69d8fdf93d4f1d62223",
+        relative_path="samples/attention/mixed_quant_sparse_flash_mla/mixed_quant_sparse_flash_mla_metadata.py",
+        source_sha256="51e13bd02d35704f99298dd9fdff36ddd82c941a8106c07d8e668d29664ad40a",
+    ),
 )
 ABI_SOURCES = {
     FIA_ABI: SOURCES[:2],
-    FLASH_ABI: (SOURCES[2], SOURCES[6]),
-    MQS_ABI: (SOURCES[3], SOURCES[5]),
+    UPSTREAM_ABI: (SOURCES[2], SOURCES[6]),
+    MQS_ABI: (SOURCES[3], SOURCES[7]),
     DSL_FLASH_ABI: (SOURCES[4],),
-    DSL_MQS_ABI: (SOURCES[5],),
+    DSL_MQS_ABI: (SOURCES[5], SOURCES[8]),
 }
 
 
@@ -116,7 +131,7 @@ def _solve(op, ctx, c, keys, head_tile, mm1_depth, resident, result_alignment, p
         heads = min(head_tile, c.physical_heads)
         vec_heads = ceil_div(heads, aiv_count)
         pv_columns = min(c.dv, PV_L0C_WIDTH)
-        scores = (fixpipe_rectangle_bytes(heads, keys) // aiv_count if c.abi == FLASH_ABI
+        scores = (fixpipe_rectangle_bytes(heads, keys) // aiv_count if c.abi == UPSTREAM_ABI
                   else vec_heads * keys * FP32_BYTES)
         pv = vec_heads * pv_columns * FP32_BYTES
         l0c = heads * max(keys, pv_columns) * FP32_BYTES
@@ -133,8 +148,10 @@ def _solve(op, ctx, c, keys, head_tile, mm1_depth, resident, result_alignment, p
             LiveBufferSpec("l0c", "l0c", l0c, 0, PIPELINE_DRAIN, "aic", slots=2),
         )
         if c.mixed_quant:
+            gather_pitch = (ACLNN_MQS_GATHER_BUFFER_BYTES_PER_ROW if c.abi == MQS_ABI
+                            else MQS_ORIGINAL_ROW_BYTES)
             buffers += (LiveBufferSpec("dequant", "ub", min(keys, MQS_GATHER_ROWS) *
-                                       (MQS_ORIGINAL_ROW_BYTES + c.dqk * elem),
+                                       (gather_pitch + c.dqk * elem),
                                        0, PIPELINE_DRAIN, slots=2),)
         if c.sinks:
             buffers += (LiveBufferSpec("sinks", "ub", vec_heads * FP32_BYTES, 0, PIPELINE_DRAIN),)
@@ -155,7 +172,7 @@ def _solve(op, ctx, c, keys, head_tile, mm1_depth, resident, result_alignment, p
 @dataclass(frozen=True, slots=True)
 class _DirectStrategy:
     arch_id = ARCH_ID
-    abi = FLASH_ABI
+    abi = UPSTREAM_ABI
     sources = SOURCES
 
     def accepts(self, op: OpSpec, ctx: OperatorPlanningContext, /) -> bool:
@@ -166,18 +183,24 @@ class _DirectStrategy:
         if ctx.compute_arch.arch_id != self.arch_id or c.atomic_split_decode:
             raise capability_gap("paged_mla_unsupported_abi_or_atomic_mode", c.abi, ctx.compute_arch.arch_id)
         if c.abi == FIA_ABI:
-            heads, width, mm1_depth = FIA_M_TILE, FIA_S2_TILE, FIA_MM1_DEPTH
+            heads, mm1_depth = FIA_M_TILE, FIA_MM1_DEPTH
+            key_tile = min(FIA_S2_TILE, c.s2_base_size)
         elif c.mixed_quant:
-            heads, width, mm1_depth = MQS_M_TILE, MQS_S2_TILE, FLASH_MM1_DEPTH
+            heads, mm1_depth = MQS_M_TILE, FLASH_MM1_DEPTH
+            key_tile = min(MQS_S2_TILE, c.s2_base_size)
         else:
-            heads, width, mm1_depth = FLASH_M_TILE, FLASH_S2_TILE, FLASH_MM1_DEPTH
-        key_tile = min(width, c.s2_base_size)
-        keys = min(key_tile, max((kv for q, kv in c.sequences if q), default=0))
+            heads, key_tile, mm1_depth = FLASH_M_TILE, FLASH_S2_TILE, FLASH_MM1_DEPTH
+        if c.abi == DSL_MQS_ABI:
+            max_extent = max((max(c.bank_counts(seq, query)) for seq in range(len(c.sequences))
+                              for query, repeat in c.query_runs(seq) if repeat), default=0)
+        else:
+            max_extent = max((kv for q, kv in c.sequences if q), default=0)
+        keys = min(key_tile, max_extent)
         resident = c.latent_alias or c.mixed_quant
         peaks = ()
         pairs = owner_pairs(ctx, c.abi)
         panel_width = 0
-        if c.abi == FLASH_ABI:
+        if c.abi == self.abi:
             panel_width = PV_L0C_WIDTH
             if c.dv != MM2_DEPTH * panel_width:
                 raise capability_gap("paged_mla_flash_value_width", c.abi, self.arch_id)
@@ -225,11 +248,17 @@ class _DirectStrategy:
             probability_output=(probability.path.unit, probability.path.alignment_bytes),
             pv_panel_width=panel_width,
         )
+        workspace = {}
+        if c.abi == DSL_MQS_ABI:
+            slot_bytes = c.physical_heads * (c.dv + SOFTMAX_STATE_SCALARS) * FP32_BYTES
+            per_core = DSL_MQS_SPLIT_SLOTS_PER_CORE * slot_bytes
+            workspace = dict(workspace_slots_per_core=DSL_MQS_SPLIT_SLOTS_PER_CORE,
+                             workspace_bytes_per_core=per_core, workspace_bytes=len(pairs) * per_core)
         return make_plan(
             op, ctx, c, layout, ABI_SOURCES[c.abi], pairs=pairs,
             buffer_depths=(Q_DEPTH, mm1_depth, MM2_DEPTH), pool_peaks=peaks,
             matrix_output_path=direct.path.name, probability_path=probability.path.name,
-            resident_latent=resident,
+            resident_latent=resident, **workspace,
         )
 
 

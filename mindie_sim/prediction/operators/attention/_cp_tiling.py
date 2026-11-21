@@ -1,7 +1,8 @@
 """Source-bound context parallel attention collectives.
 
 [Role] Bind caller tensor shapes and lower their collective dependencies.
-[Invariants] Each gather uses its input tensor shape and declared group.
+[Invariants] Each collective uses its input tensor shape and declared group.
+  The history-decode merge consumes the published output and FP32 LSE.
 [Timeouts & Locks] Finite graph construction without locking.
 [Side-Effect Policy] Pure declarations on the shared execution graph.
 """
@@ -10,8 +11,10 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from math import prod
 
-from mindie_sim.catalog.ops import comm_op
-from mindie_sim.schema.common import ModelingError
+from mindie_sim.catalog.attention_common import MERGE_OPS_PER_ELEM
+from mindie_sim.catalog.context_parallel import merge_update_elements
+from mindie_sim.catalog.ops import comm_op, vector_op
+from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.operators import OpSpec
 from ...mechanism import Work
 from ...program import KernelProgram, Stage
@@ -19,6 +22,7 @@ from ...results import PipelinePhase, WorkItem
 
 VLLM_REVISION = "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb"
 VLLM_MLA_REVISION = "7a7ed073c481d5e3a2fc2194c5b879efb2d373c0"
+VLLM_STACK_REVISION = "405617bae227fe5b097ff163efaa60bb7f22c698"
 
 CACHE_PUBLICATION = "cache_publication"
 HISTORY_ATTENTION = "history_attention"
@@ -30,6 +34,7 @@ CACHE_MLA_SITE = "mla_v1.exec_kv_prefill"
 HISTORY_PREFILL_SITE = "attention_cp._prefill_query_all_gather"
 HISTORY_DECODE_SITE = "attention_cp._forward_decode_dcp"
 COMPLETE_KV_SITE = "sfa_cp._execute_sparse_flash_attention_process"
+OUTPUT_LSE_EXCHANGE_RECIPE = "attention_cp_output_lse_exchange"
 CP_CALLERS = {
     CACHE_GQA_SITE: CACHE_PUBLICATION,
     CACHE_MLA_SITE: CACHE_PUBLICATION,
@@ -62,7 +67,12 @@ class ContextParallelPlan:
     def __post_init__(self) -> None:
         tensors = tuple((name, tuple(shape), size) for name, shape, size in self.tensors)
         object.__setattr__(self, "tensors", tensors)
-        revisions = (VLLM_REVISION, VLLM_MLA_REVISION) if self.caller_site == CACHE_MLA_SITE else (VLLM_REVISION,)
+        # vLLM-Ascend removed GQA DCP in #21737. Bind history decode to its
+        # verified caller revisions.
+        revisions = {
+            CACHE_MLA_SITE: (VLLM_REVISION, VLLM_MLA_REVISION),
+            HISTORY_DECODE_SITE: (VLLM_REVISION, VLLM_STACK_REVISION),
+        }.get(self.caller_site, (VLLM_REVISION,))
         if self.stack_revision not in revisions or CP_CALLERS.get(self.caller_site) != self.case:
             from .common import unmodeled
             raise unmodeled("attention_cp_caller", "Bind a verified vLLM-Ascend revision and caller site")
@@ -98,6 +108,36 @@ class ContextParallelPlan:
         return self.case == HISTORY_ATTENTION
 
 
+def _history_head_group(plan):
+    if plan.pcp_size == 1 or plan.dcp_size == 1:
+        return "dcp", plan.dcp_size
+    if plan.dcp_size == plan.pcp_size:
+        return "dcp", 1
+    if plan.distinct_head_ranks is None or plan.pcp_size * plan.distinct_head_ranks != plan.dcp_size:
+        from .common import unmodeled
+        raise unmodeled("attention_cp_distinct_heads", "Bind the distinct TP head subgroup")
+    return "tp", plan.distinct_head_ranks
+
+
+def _history_decode(contract):
+    return next((p for p in contract.cp_plan or () if p.caller_site == HISTORY_DECODE_SITE), None)
+
+
+def history_decode_contract(contract):
+    binding = _history_decode(contract)
+    if binding is None:
+        return contract
+    _, ranks = _history_head_group(binding)
+    name, shape, _ = binding.tensors[0]
+    if (len(binding.tensors) != 1 or name != "query" or len(shape) != 3 or shape[0] != contract.query_tokens
+            or shape[-1] != contract.head_dim or not shape[1]):
+        raise ModelingError("attention_cp_history_decode_query_shape_invalid")
+    heads = shape[1] * ranks
+    if contract.num_heads not in {shape[1], heads}:
+        raise ModelingError("attention_cp_history_decode_head_count_invalid")
+    return replace(contract, num_heads=heads, return_lse=True)
+
+
 def lower_cp_collectives(
     plan: ContextParallelPlan, *, op_id: str = "attention_cp", deps: tuple[str, ...] = (),
     stage: int = 0, layer: int = 0, requests: tuple[str, ...] = (),
@@ -113,15 +153,7 @@ def lower_cp_collectives(
                             for name, shape, size in tensors)
         steps = (("pcp", 0, plan.pcp_size, "cache_writer", "slot_mapping"),)
     elif case == HISTORY_ATTENTION:
-        head_group, head_ranks = "dcp", plan.dcp_size
-        if plan.pcp_size > 1 and plan.dcp_size > 1:
-            if plan.dcp_size == plan.pcp_size:
-                head_ranks = 1
-            else:
-                head_group, head_ranks = "tp", plan.distinct_head_ranks
-                if head_ranks is None or plan.pcp_size * head_ranks != plan.dcp_size:
-                    from .common import unmodeled
-                    raise unmodeled("attention_cp_distinct_heads", "Bind the distinct TP head subgroup")
+        head_group, head_ranks = _history_head_group(plan)
         steps = ((head_group, 1, head_ranks, "history_attention", ""),)
         if plan.phase == "prefill":
             steps = (("pcp", 0, plan.pcp_size, "history_query", "query_restore"), *steps)
@@ -165,35 +197,94 @@ def cp_operators(op: OpSpec, bindings: tuple[ContextParallelPlan, ...]) -> tuple
     return tuple(collectives)
 
 
+def cp_decode_suffix(op, contract):
+    binding = _history_decode(contract)
+    if binding is None or binding.dcp_size == 1:
+        return ()
+    group, head_ranks = _history_head_group(binding)
+    q, heads, width = contract.query_tokens, contract.num_heads // head_ranks, contract.v_head_dim
+    out_bytes = q * heads * width * dtype_bytes(op.dtype or "bf16")
+    lse_bytes = q * heads * dtype_bytes("fp32")
+    payload = out_bytes + lse_bytes
+    tensors = (("output", (q, heads, width)), ("lse", (q, heads, 1)))
+    arguments = dict(stage=op.stage, layer=op.layer, requests=op.requests, phase=op.phase)
+    ops = []
+    deps = ("attention",)
+    if head_ranks > 1:
+        ops.append(comm_op(
+            op_id="output_lse_exchange", deps=deps, **arguments, family="alltoall", recipe=OUTPUT_LSE_EXCHANGE_RECIPE,
+            link_bytes=payload * (head_ranks - 1), shape=(q, heads, width),
+            metadata=(("group_axis", "cp" if group == "dcp" else group), ("collective", "alltoall"),
+                      ("payload_tensors", tensors), ("source", "dcp_a2a_fused")),
+        ))
+        deps = (ops[-1].op_id,)
+    if binding.pcp_size > 1:
+        ops.append(comm_op(
+            op_id="output_lse_pcp_gather", deps=deps, **arguments, family="allgather", recipe="ring_allgather",
+            link_bytes=payload * head_ranks * (binding.pcp_size - 1),
+            shape=(binding.dcp_size, q, heads, width),
+            metadata=(("group_axis", "pcp"), ("steps", binding.pcp_size - 1), ("payload_tensors", tensors)),
+        ))
+        deps = (ops[-1].op_id,)
+    ops.append(vector_op(
+        op_id="output_lse_merge", deps=deps, **arguments, family="attention_merge", recipe="dcp_lse_merge",
+        shape=(q, heads, width), dtype="fp32", semantic_family="dcp_logsumexp_attention_update",
+        elements=int(merge_update_elements(q, heads, width, binding.dcp_size)), ops_per_element=MERGE_OPS_PER_ELEM,
+        read_bytes_override=payload * binding.dcp_size, write_bytes_override=out_bytes,
+        metadata=(("partial_reduction", "logsumexp"), ("payload_tensors", tensors)),
+    ))
+    return tuple(ops)
+
+
+def _cp_work(op):
+    if op.link_bytes:
+        return Work(resources={"link": op.link_bytes})
+    return Work(resources={"hbm": op.hbm_bytes, "mte2": op.mte2_bytes, "mte3": op.mte3_bytes,
+                           "vector": op.vector_ops})
+
+
 @dataclass(frozen=True, slots=True)
-class _CollectivePrefix:
-    collectives: tuple[OpSpec, ...]
+class _CollectiveAttention:
+    prefix: tuple[OpSpec, ...]
     consumer: object
+    suffix: tuple[OpSpec, ...]
 
     def __call__(self, context):
         # A directly lowered rank-local plan takes a bound link. Graph execution
         # expands the same collectives through the existing topology recipes.
-        stages = []
-        for op in self.collectives:
-            group = dict(op.metadata)["group_axis"]
-            role = group if group in context.resource_names else "link"
-            demand = context.bind(Work(resources={role: op.link_bytes}))
-            stages.append(Stage(op.op_id, demand, after=op.deps))
-        stages.append(Stage("attention", after=(stages[-1].name,), program=self.consumer(context)))
-        return KernelProgram(tuple(stages))
+        def stage(op):
+            work = _cp_work(op)
+            group = dict(op.metadata).get("group_axis")
+            if group in context.resource_names:
+                work = Work(resources={group: op.link_bytes})
+            return Stage(op.op_id, context.bind(work), after=op.deps)
+
+        prefix = tuple(stage(op) for op in self.prefix)
+        consumer = Stage("attention", after=(prefix[-1].name,) if prefix else (), program=self.consumer(context))
+        return KernelProgram((*prefix, consumer, *(stage(op) for op in self.suffix)))
 
 
-def with_collectives(plan, collectives, sources):
+def with_collectives(plan, collectives, suffix, sources):
     spec = plan.pipeline_spec
     spec = replace(spec, sources=(*spec.sources, *sources))
-    if not collectives:
+    if not (collectives or suffix):
         return replace(plan, pipeline_spec=spec)
     prefix = tuple(PipelinePhase(op.op_id, op.deps, (WorkItem("link", "bytes", op.link_bytes),))
                    for op in collectives)
-    consumer = tuple(replace(phase, after=(prefix[-1].phase_id,)) if not phase.after else phase
+    consumer = tuple(replace(phase, after=(prefix[-1].phase_id,)) if prefix and not phase.after else phase
                      for phase in spec.phases)
+    consumed = {dep for phase in consumer for dep in phase.after}
+    terminals = tuple(phase.phase_id for phase in consumer if phase.phase_id not in consumed)
+    work = plan.work
+    post = []
+    for op in (*collectives, *suffix):
+        work += _cp_work(op)
+    for op in suffix:
+        deps = terminals if op.deps == ("attention",) else op.deps
+        items = tuple(WorkItem(role, "op" if role == "vector" else "bytes", amount)
+                      for role, amount in _cp_work(op).resources.items() if amount)
+        post.append(PipelinePhase(op.op_id, deps, items))
     return replace(
-        plan, program=_CollectivePrefix(collectives, plan.program),
-        work=plan.work + Work(resources={"link": sum(op.link_bytes for op in collectives)}),
-        pipeline_spec=replace(spec, phases=(*prefix, *consumer)),
+        plan, program=_CollectiveAttention(collectives, plan.program, suffix), work=work,
+        pipeline_spec=replace(spec, phases=(*prefix, *consumer, *post)),
     )

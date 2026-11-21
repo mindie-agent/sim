@@ -17,11 +17,12 @@ from mindie_sim.schema.operators import OpSpec
 from ...mechanism import OperatorPlan
 from ..contracts import ArchStrategy, OperatorPlanningContext
 from .common import (
-    ABI_V3_NZ, ACLNN_V3_ABIS, GROUP_COMPUTE_MIN_HEADS, WEIGHT_QUANT_INT8, WEIGHT_QUANT_MXFP8,
+    ACLNN_V3_ABIS, GROUP_COMPUTE_MIN_HEADS, WEIGHT_QUANT_INT8, WEIGHT_QUANT_MXFP8,
     build_plan, unsupported, validate_contract,
 )
 
 ARCH_ID = ArchId("npu_arch_2201")
+UPSTREAM_ABI = "aclnnMlaPrologV3WeightNz"
 SOURCES: tuple[SourceRef, ...] = (
     SourceRef(
         repository="cann/ops-transformer",
@@ -56,6 +57,12 @@ SOURCES: tuple[SourceRef, ...] = (
     SourceRef(
         repository="cann/ops-transformer",
         revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="attention/mla_prolog/op_kernel/arch22/mla_prolog_comm_arch22.h",
+        source_sha256="e977456ed248a643161d6e7f740909f6d02ec10c819cdb3111b7f2ad0d88d86b",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
         relative_path="attention/mla_prolog/op_host/mla_prolog_tiling_check.cpp",
         source_sha256="5e34239dabdf9a159d41b542401fc2bcf7c3551b6e6695c5d761dff5638e6d57",
     ),
@@ -65,7 +72,7 @@ SOURCES: tuple[SourceRef, ...] = (
 @dataclass(frozen=True, slots=True)
 class _SplitNStrategy:
     arch_id: ArchId = ARCH_ID
-    abi: str = ABI_V3_NZ
+    abi: str = UPSTREAM_ABI
     sources: tuple[SourceRef, ...] = SOURCES
 
     def accepts(self, op: OpSpec, ctx: OperatorPlanningContext, /) -> bool:

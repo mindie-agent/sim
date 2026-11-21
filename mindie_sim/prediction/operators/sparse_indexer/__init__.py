@@ -20,7 +20,7 @@ from ..contracts import OperatorFamilySpec, OperatorPlanningContext, ResolvedOpe
 from . import arch22 as _arch22, arch35 as _arch35
 from .common import (
     DEFAULT_INDEX_DIM, FAMILY, LIGHTNING_INDEXER_QSA_RECIPE, MSA_ABI,
-    MSA_INDEX_SCORE_RECIPE, MSA_INDEX_SCORE_V2_RECIPE, MSA_V2_ABI, QSA_ABI,
+    MSA_INDEX_SCORE_RECIPE, MSA_INDEX_SCORE_V2_RECIPE, MSA_V2_ABI, QSA_ABI, QSA_OVERLAY_SOURCE,
     REGION_ABI, SCORER_RECIPES, STEP5_REGION_SCORE_RECIPE,
     SparseIndexerContract, ceil_div, describe, make_op, unsupported,
 )
@@ -90,7 +90,7 @@ def make_indexer_op(
 ) -> OpSpec:
     """Make an operator from a frozen contract or its named geometry fields."""
     if contract is None:
-        if geometry.get("abi") in {MSA_ABI, MSA_V2_ABI, QSA_ABI}:
+        if geometry.get("abi") in {MSA_ABI, MSA_V2_ABI}:
             geometry.setdefault("has_head_weights", False)
         if geometry.get("abi") == MSA_ABI:
             geometry.setdefault("fused_topk", False)
@@ -161,17 +161,18 @@ def make_lightning_indexer_qsa_op(
     requests: tuple[str, ...] = (), phase: str = "decode", query_tokens: int,
     context_tokens: int, index_heads: int = DEFAULT_QSA_HEADS, index_dim: int = DEFAULT_INDEX_DIM,
     compress_ratio: int = DEFAULT_QSA_RATIO, block_topk: int = DEFAULT_QSA_TOPK, cache_dtype: str = "bf16",
-    batch_size: int | None = None, shared_prefix: bool = False,
+    batch_size: int | None = None, shared_prefix: bool = False, has_head_weights: bool = True,
 ) -> OpSpec:
     if type(compress_ratio) is not int or compress_ratio <= 0:
         raise ModelingError("sparse_indexer_invalid_compress_ratio")
     contract = SparseIndexerContract(
         query_tokens, ceil_div(context_tokens, compress_ratio), index_heads, index_dim,
-        topk_items=block_topk, cache_dtype=cache_dtype, has_head_weights=False, abi=QSA_ABI,
+        topk_items=block_topk, cache_dtype=cache_dtype, has_head_weights=has_head_weights, abi=QSA_ABI,
         batch_size=_batch(batch_size, requests, query_tokens), shared_prefix=shared_prefix,
     )
     return _scorer_op(
-        contract, _arch35.QSA_SOURCE, "qsa_lightning_indexer",
+        contract, _arch35.QSA_SOURCE if has_head_weights else QSA_OVERLAY_SOURCE,
+        "qsa_lightning_indexer" if has_head_weights else "qsa_weight_free_overlay",
         op_id=op_id, deps=deps, stage=stage, layer=layer, requests=requests, phase=phase,
     )
 

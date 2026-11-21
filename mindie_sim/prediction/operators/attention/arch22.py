@@ -16,8 +16,10 @@ from mindie_sim.schema.datapath import ArchId, SourceRef
 from mindie_sim.schema.operators import OpSpec
 from ...mechanism import OperatorPlan
 from ..contracts import OperatorPlanningContext
-from .common import ARCH22, FIA_ABI, AttentionContract, dense_fia, unmodeled
+from ._fia import dense_fia
+from .common import ARCH22, AttentionContract, unmodeled
 
+UPSTREAM_ABI = "aclnnFusedInferAttentionScore"
 OPS_TRANSFORMER_REVISION = "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946"
 SOURCES: tuple[SourceRef, ...] = (
     SourceRef(
@@ -31,11 +33,11 @@ SOURCES: tuple[SourceRef, ...] = (
 @dataclass(frozen=True, slots=True)
 class _Strategy:
     arch_id: ArchId = ArchId(ARCH22)
-    abi: str = FIA_ABI
+    abi: str = UPSTREAM_ABI
     sources: tuple[SourceRef, ...] = SOURCES
 
     def accepts(self, op: OpSpec, ctx: OperatorPlanningContext, /) -> bool:
-        abi = ctx.requested_abi or dict(op.metadata).get("native_kind", FIA_ABI)
+        abi = ctx.requested_abi or dict(op.metadata).get("native_kind", self.abi)
         return ctx.compute_arch.arch_id == self.arch_id and abi == self.abi
 
     def build(self, op: OpSpec, ctx: OperatorPlanningContext, /) -> OperatorPlan:

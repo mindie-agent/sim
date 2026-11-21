@@ -18,16 +18,18 @@ from mindie_sim.schema.operators import OpSpec
 
 from ...mechanism import OperatorPlan
 from ..contracts import OperatorPlanningContext
+from ._lowering import S2Partition
 from .common import (
-    ARCH22_FLUSH_BLOCKS, ARCH22_SMALL_QUERY_MAX, ARCH22_TOPK_LIMIT, DEFAULT_S2_TILE,
-    LIGHTNING_ABI, LIGHTNING_V2_ABI, MERGE_FAN_IN, PAIR_BYTES, QSA_ABI, SORT_GROUP,
+    ARCH22_FLUSH_BLOCKS, ARCH22_SMALL_QUERY_MAX, ARCH22_TOPK_LIMIT, BF16_BYTES, DEFAULT_S2_TILE,
+    FP32_BYTES, LIGHTNING_V2_ABI, MERGE_FAN_IN, PAIR_BYTES, QSA_ABI, QSA_OVERLAY_SOURCE, SORT_GROUP,
     Lowering, PhaseWork, SparseIndexerContract,
-    _S2Partition, _integer, align, build_plan, ceil_div, indexer_contract,
+    _integer, align, build_plan, ceil_div, indexer_contract,
     owner_pairs, pair_merge, sort_ops, unsupported, vector,
 )
 
 ARCH_ID = ArchId("npu_arch_2201")
-_SUPPORTED_ABIS = frozenset({LIGHTNING_ABI, LIGHTNING_V2_ABI, QSA_ABI})
+UPSTREAM_ABI = "aclnnLightningIndexer"
+_SUPPORTED_ABIS = frozenset({UPSTREAM_ABI, LIGHTNING_V2_ABI, QSA_ABI})
 _SCORE_ROUTE = "l0c->gm->ub"
 _EXPLICIT_RETAINED_BARRIERS = 3  # After SortAll, after merge, after copyback.
 _TYPED_RETAINED_FLUSH_BARRIERS = 4  # After flush, flush copyback, merge, and retained copyback.
@@ -52,7 +54,13 @@ SOURCES: tuple[SourceRef, ...] = (
         relative_path="op_plugin/ops/opapi/LightningIndexerKernelNpuOpApi.cpp",
         source_sha256="3b4aefd825b7fe1fc58a89cf67a1d11abe30fa71e95268d884fa9f0b9016d627",
     ),
+    SourceRef(
+        repository="vllm-project/vllm-ascend", revision="0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        relative_path="vllm_ascend/models/qwen4_exp/lightning_indexer.py",
+        source_sha256="1d265521c2a44a904342e24a0d917aec575240469fe0f1dbc5ea61133d0e5736",
+    ),
 )
+LIGHTNING_SOURCES, QSA_SOURCE = SOURCES[:-1], SOURCES[-1]
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,7 +124,7 @@ def trace_arch22_topk_flushes(
         raise ModelingError("sparse_indexer_s2_tile_requires_multiple_of_32")
     period = arch22_flush_period(act_s1_size, topk, is_sparse_count_over_2k)
     explicit = period == 1
-    partition = _S2Partition(scanned_rows, tile_size, s2_splits)
+    partition = S2Partition(scanned_rows, tile_size, s2_splits)
     flushes = retained = barriers = 0
     sort_all = trace_sort_all(tile_size) if explicit else None
     for rows, count, _ in partition.variants():
@@ -225,7 +233,7 @@ def _retained_merge(incoming: int, retained: int) -> tuple[PhaseWork, ...]:
 
 
 def _contract(op: OpSpec, ctx: OperatorPlanningContext) -> SparseIndexerContract:
-    contract = indexer_contract(op, ctx, LIGHTNING_ABI)
+    contract = indexer_contract(op, ctx, UPSTREAM_ABI)
     if contract.abi not in _SUPPORTED_ABIS or contract.cache_dtype != "bf16":
         raise unsupported("arch22_abi", f"Arch22 cannot lower {contract.abi} with {contract.cache_dtype}")
     return contract
@@ -234,7 +242,7 @@ def _contract(op: OpSpec, ctx: OperatorPlanningContext) -> SparseIndexerContract
 @dataclass(frozen=True, slots=True)
 class _Arch22Strategy:
     arch_id: ArchId = ARCH_ID
-    abi: str = LIGHTNING_ABI
+    abi: str = UPSTREAM_ABI
     sources: tuple[SourceRef, ...] = SOURCES
 
     def accepts(self, op: OpSpec, ctx: OperatorPlanningContext, /) -> bool:
@@ -253,14 +261,18 @@ class _Arch22Strategy:
             datapath.route("l0c", "gm", "fp32")
             datapath.route("gm", "ub", "fp32")
         owners = owner_pairs(ctx, 1)
+        qsa = contract.abi == QSA_ABI
+        sources = LIGHTNING_SOURCES
+        if qsa:
+            sources = (QSA_SOURCE,) if contract.has_head_weights else (QSA_OVERLAY_SOURCE,)
         # Align score blocks so local maxima are disjoint across S2 owners.
         tile_size = align(contract.s2_tile_size, SORT_GROUP * contract.block_size)
         lowering = Lowering(
             contract.abi, "membase_s2_tiles", tile_size, _SCORE_ROUTE,
             tile_selection=_select_tile, flush_period=_flush_period(contract),
-            score_align=SORT_GROUP,
+            score_align=SORT_GROUP, head_weight_item_bytes=FP32_BYTES if qsa else BF16_BYTES,
         )
-        return build_plan(op, ctx, contract, lowering, owners, self.sources)
+        return build_plan(op, ctx, contract, lowering, owners, sources)
 
 
 STRATEGY = _Arch22Strategy()

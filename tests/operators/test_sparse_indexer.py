@@ -156,6 +156,24 @@ def test_quant_fixpipe_aligns_m_and_switches_nd_width(abi, rows, columns):
         _verified(sku_case(REGBASE), op)
 
 
+@pytest.mark.parametrize("queries,batches,topk,padded_queries", [
+    (2, 1, 64, (2,)), (2, 2, 64, (2, 2)), (5, 1, 64, (4, 2)),
+    (5, 2, 64, (4, 2)), (4, 1, 8192, (2, 2)),
+])
+def test_quant_fixpipe_aligns_live_queries_inside_each_request(queries, batches, topk, padded_queries):
+    op = _scorer(QLI, rows=65, cache_dtype="int8", index_heads=64,
+                 query_tokens=queries, batch_size=batches, topk_items=topk)
+    plan = scorer.build(op, _geometry())
+    transfers = [stage.work["fixpipe"] for stage in _conserved(plan, op) if stage.name == "score_handoff"]
+    assert sorted(transfers) == sorted(rows * 64 * 128 * 4 for rows in padded_queries)
+    assert plan.work.resources["fixpipe"] == sum(transfers)
+    assert plan.work.matrix == {"int8": 2 * queries * 64 * 65 * 128}
+    result = _verified(sku_case(REGBASE), op)
+    assert result["serviced"]["fixpipe@r0:s0"] == pytest.approx(sum(transfers))
+    if queries == 2 and batches == 1:
+        assert plan.work.resources["fixpipe"] == 65536
+
+
 def test_quant_ub_checks_both_source_sized_parity_slots():
     op = _scorer(QLI, rows=65, cache_dtype="int8", index_heads=64, topk_items=16)
     geometry = _geometry()
@@ -224,17 +242,33 @@ def test_weighted_v2_contract_rejects_missing_weight_input(abi):
 
 
 @pytest.mark.parametrize("hardware", (MEMBASE, REGBASE))
-def test_weight_free_scoring_remains_a_separate_caller(hardware):
-    op = scorer.make_lightning_indexer_qsa_op(op_id="scorer", query_tokens=1, context_tokens=4096, index_heads=4)
+def test_qsa_native_weights_and_weight_free_overlay_have_distinct_sources(hardware):
+    fields = dict(op_id="scorer", query_tokens=2, context_tokens=260, index_heads=4)
+    native = scorer.make_lightning_indexer_qsa_op(**fields)
+    overlay = scorer.make_lightning_indexer_qsa_op(**fields, has_head_weights=False)
     geometry = _geometry(hardware)
-    prepared, plan = scorer.recipes()[op.recipe].prepare(op, geometry)
-    assert plan == scorer.build(op, geometry)
-    assert prepared.flops == 2 * 1024 * 4 * 128
+    weighted, unweighted = (scorer.build(op, geometry) for op in (native, overlay))
+    for op, plan, repository, path in (
+        (native, weighted, "vllm-project/vllm-ascend", "vllm_ascend/models/qwen4_exp/lightning_indexer.py"),
+        (overlay, unweighted, "mindie-agent/sim", "mindie_sim/stack_sources/vllm_ascend_cann93.json"),
+    ):
+        source, = plan.pipeline_spec.sources
+        assert (source.repository, source.relative_path) == (repository, path)
+        assert len(bytes.fromhex(source.revision)) == 20
+        assert len(bytes.fromhex(source.source_sha256)) == 32
+        assert dict(op.metadata)["native_source"] == source.to_dict()
+        restored = pickle.loads(pickle.dumps(plan))
+        assert restored == plan
+        _verified(sku_case(hardware), op)
+    assert weighted.work.matrix == unweighted.work.matrix == {"bf16": 2 * 2 * 65 * 4 * 128}
+    stages = _conserved(weighted, native, geometry)
+    weights = 2 * 4 * 4
+    assert sum(s.metadata.get("head_weight_bytes", 0) for s in stages) == weights
+    assert sum(s.work["vector"] for s in stages if s.name == "weighting") == 2 * 65 * 4
+    for role in ("hbm", "mte2_aiv"):
+        assert weighted.work.resources[role] - unweighted.work.resources.get(role, 0) == weights
     assert not any(s.metadata.get("head_weight_bytes") or s.name == "weighting"
-                   for s in _conserved(plan, op, geometry))
-    restored = pickle.loads(pickle.dumps(plan))
-    assert restored == plan
-    _conserved(restored, op, geometry)
+                   for s in _conserved(unweighted, overlay, geometry))
 
 
 @pytest.mark.parametrize("cache_dtype", ("bf16", "mxfp4"))

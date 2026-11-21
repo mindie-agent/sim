@@ -20,6 +20,7 @@ from mindie_sim.prediction.program import RecipeBook, RecipeContext
 from mindie_sim.prediction.verification import verify_operator
 from mindie_sim.public.errors import UnmodeledCapabilityError
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.compute_arch import NativeComputeMode
 from mindie_sim.schema.operators import IterationWork
 from mindie_sim.schema.workload import IterationPlan
 
@@ -63,8 +64,8 @@ def _membase(rows, **geometry):
     return op, plan, query, tiles
 
 
-def _verified(op, hardware=MEMBASE):
-    report = verify_operator(sku_case(hardware), op, sparse_indexer.build, input_ready_ms=7)
+def _verified(op, hardware=MEMBASE, *, case=None):
+    report = verify_operator(case or sku_case(hardware), op, sparse_indexer.build, input_ready_ms=7)
     assert report["finite_completion"] and report["buffers_released"] and report["input_dependency_obeyed"]
     assert report["work_mismatches"] == {}
     assert report["result"]["declared_service"] == pytest.approx(report["result"]["serviced"])
@@ -233,6 +234,46 @@ def test_region_mask_and_final_index_order_preserve_selection_extent():
     assert by_name["index_sort"].after == ("region_radix_topk",)
     assert by_name["index_store"].work["mte3"] == 16 * 4
     _verified(op, REGBASE)
+
+
+@pytest.mark.parametrize("candidates,tiles", [(512, 1), (513, 2)])
+def test_packed_candidate_tiles_cross_gm_before_cube(candidates, tiles):
+    op = _make(candidates, abi="cannbot_dsl.quant_sparse_lightning_indexer",
+               cache_dtype="mxfp4", index_heads=32, topk_items=64)
+    case = sku_case(REGBASE)
+    die, = case.machine.dies
+    native = NativeComputeMode("mxfp4_x_mxfp4_acc_fp32", "matrix", ("mxfp4",), "cube", ("fp32",))
+    architecture = replace(die.compute_arch, native_modes=(*die.compute_arch.native_modes, native))
+    die = replace(die, compute_arch=architecture, compute_peaks=(*die.compute_peaks, ("mxfp4", 1e12)))
+    case = replace(case, machine=replace(case.machine, dies=(die,)))
+    geometry = Geometry.from_devices(case.machine.dies)
+    plan = sparse_indexer.build(op, geometry)
+    program = plan.program(_context(op, geometry))
+    query, (stream,) = _query_tiles(program)
+    assert stream.count == tiles
+    staged = 512 * (128 // 2 + 128 // 32)
+    assert staged == 34816
+    for i in range(tiles):
+        stages = {s.name: s for s in stream.tile(i)}
+        gather = stages["key_gather"]
+        store = stages["key_stage_store"]
+        load = stages["key_stage_load"]
+        assert len(gather.placement["mte2_aiv"]) == store.metadata["aiv_subblocks"] == 2
+        assert store.placement["mte3"] == gather.placement["mte2_aiv"]
+        assert len(load.placement["mte2_aic"]) == 1
+        assert store.after == (gather.name,) and load.after == (store.name,)
+        assert stages["load_operands"].after == (load.name,)
+        assert stages["cube_scores"].after == ("load_operands",)
+        assert stages["rectification"].placement["vector"] == gather.placement["mte2_aiv"]
+        assert store.work["mte3"] == store.work["hbm"] == staged
+        assert load.work["mte2_aic"] == load.work["hbm"] == staged
+    assert plan.work.resources["mte3"] == tiles * staged + 64 * 4
+    assert plan.work.resources["mte2_aic"] == tiles * staged + 32 * 68
+    assert plan.work.matrix == {"mxfp4": 2 * candidates * 32 * 128}
+    assert len(next(s for s in query if s.name == "index_store").placement["mte3"]) == 1
+    serviced = _verified(op, case=case)["serviced"]
+    for role in ("mte3", "mte2_aic"):
+        assert serviced[f"{role}@r0:s0"] == pytest.approx(plan.work.resources[role])
 
 
 @pytest.mark.parametrize("ratio,context,expected", [(4, 511, 128), (4, 512, 128), (4, 515, 129), (8, 31, 4)])

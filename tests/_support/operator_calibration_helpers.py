@@ -13,31 +13,70 @@ from copy import deepcopy
 from dataclasses import replace
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from mindie_sim.backends.ascend import profiles
 from mindie_sim.catalog.types import QuantSpec
-from mindie_sim.prediction import family_quant_indexer as fq
-from mindie_sim.prediction import index_pool_native as ipn
-from mindie_sim.prediction import sparse_indexer_pipeline as sp
-from mindie_sim.prediction.indexed_quant_attention import (
-    SCHEDULE_ARCH35,
-    build as build_packed,
-)
+from mindie_sim.prediction.implementations import IMPLEMENTATIONS, import_module
 from mindie_sim.prediction.lowering import Builder
 from mindie_sim.prediction.mechanism import Geometry
-from mindie_sim.prediction.mla_prolog_packed import LAYOUT
 from mindie_sim.prediction.program import (
     KernelProgram,
     ParallelProgram,
     PipelineProgram,
+    RecipeBook,
     RecipeContext,
 )
 from mindie_sim.schema.case import Case
 from mindie_sim.schema.model import LayerPlan, ModelSpec
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.schema.parallel import ParallelSpec
+
+LAYOUT = "packed_int8_bf16_rope_fp32_scale"
+SCHEDULE_ARCH35 = "arch35_c8_tile128_slots2"
+_KEYPOOL_IMPL = "vllm_ascend_cann_keypool_caller"
+_KEYPOOL_SOURCE = {
+    "repository": "vllm-project/vllm-ascend",
+    "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+    "path": "vllm_ascend/attention/indexer_kpool.py",
+    "sha256": "c7268fa24836f3ef33f9fb626ece9430c6c752a596e3bc07d230de5e9fb99e9b",
+    "lines": "44-106,168-200,315-367,935-950,1112-1150",
+    "adapters": {
+        "cann_keypool.py": "5deb787e94c4b31f5246747778b2bbe3a9c69447b2ca9701c90b500c0da94696",
+        "glm5_next_cann_keypool.py": "b02108fc0ac4e5ec77828abd2f69811511ee226ee90894500943d2175c2b4dd6",
+        "prepare_nonempty_keypool_inputs.py": "1864a2affc64dee1f033aeae7ce92d9159948ee3b6bb80b6fa81c739b9745184",
+    },
+    "row_shard": {
+        "path": "vllm_ascend/attention/indexer_kpool.py",
+        "scope": "configured_caller_and_cost_balanced_TP_exchange",
+    },
+    "scope": "native_caller_contract; installed_binary_and_core_schedule_unbound",
+}
+
+
+def build_packed(op, geom, *, scratch_policy="offchip", schedule=SCHEDULE_ARCH35, compact=True, operand_modes=True):
+    """Build packed C8 indexed attention through the active ``RecipeBook``."""
+    book = RecipeBook.from_mapping({
+        "programs": {
+            "indexed_attention": {
+                "kind": "indexed_attention_packed_int8",
+                "scratch_policy": scratch_policy,
+                "schedule": schedule,
+                "compact": compact,
+                "operand_modes": operand_modes,
+            }
+        }
+    })
+    return book.programs["indexed_attention"].build(op, geom)
+
+
+sp = SimpleNamespace(
+    Arch35QuantIndexerRecipe=lambda: RecipeBook.from_mapping({
+        "lowerings": {"quant_lightning_indexer": {"implementation": "cann_quant_lightning_indexer_v2_complete"}}
+    }).recipes["aclnn_quant_lightning_indexer_v2_arch35"],
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 GLM_CASE = (
@@ -290,9 +329,9 @@ def _case_model(*, pool=16, index_dtype="fp8_e4m3", topk=INDEX_TOPK, compress_ra
         metadata=(
             ("cache_representations", reps),
             ("native_keypool_caller", {
-                "implementation": ipn.IMPLEMENTATION, "tail_capacity": pool,
+                "implementation": _KEYPOOL_IMPL, "tail_capacity": pool,
                 "block_table_columns": 8195, "block_table_columns_explicit": True,
-                "row_shard_tp": 1, "source": ipn.SOURCE,
+                "row_shard_tp": 1, "source": _KEYPOOL_SOURCE,
             }),
         ),
     )
@@ -320,7 +359,8 @@ def _arch35_op_for(ratio, views, *, topk=INDEX_TOPK, heads=INDEX_HEADS, prefix_c
     plan, model = _case_model(pool=1, index_dtype="fp8_e4m3", compress_ratio=ratio, topk=topk)
     plan = replace(plan, index_heads=heads)
     builder = Builder("s0.l0", plan, 0, views, model, "decode")
-    fq.declare(
+    mod = import_module(IMPLEMENTATIONS["cann_quant_lightning_indexer_v2_complete"].module)
+    mod.declare(
         builder, deps=("q", "w", "cache"), views=views, plan=plan,
         quant=builder.quant, parallel=_ArchParallel(), prefix_cache_mode=prefix_cache_mode,
     )

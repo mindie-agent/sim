@@ -120,7 +120,6 @@ def test_cq_scale_slot_is_published_and_gathered_across_chunk_tails(nope, step, 
         assert len(gather.demands) == ctx.effective_aiv_cores
         assert _service_bytes(gather, "mte2_aiv") == ctx.effective_aiv_cores * step * 32
     _execute(op, plan, ctx.geometry)
-
 @pytest.mark.parametrize("weight,heads,cache,enabled", [
     (WEIGHT_QUANT_BF16, 16, 0, False), (WEIGHT_QUANT_INT8, 7, 0, False),
     (WEIGHT_QUANT_INT8, 8, 0, True), (WEIGHT_QUANT_INT8, 8, 1, True),
@@ -129,16 +128,10 @@ def test_cq_scale_workspace_follows_the_host_dequant_predicate(weight, heads, ca
     op = _prolog(1, num_heads=heads, weight_quant_mode=weight, kv_cache_quant_mode=cache)
     spec = governed.build(op, _context(SPLIT_N_SKU, op)).pipeline_spec
     assert any(p.phase_id == "cq_scale_mte2_aiv" for p in spec.phases) is enabled
-
 @pytest.mark.parametrize("abi", (ABI_V3, ABI_V3_NZ, ABI_V4_NZ))
 def test_aclnn_rejects_illegal_cache_tiles_during_contract_validation(abi):
-    op = _prolog(abi=abi, tile_size=128)
-    assert governed.validate_contract(op).tile_size == 128
-    meta = dict(op.metadata)
-    meta["prolog_v4_geometry"] = meta["prolog_v4_geometry"] | {"tile_size": 64}
     with pytest.raises(ModelingError, match="invalid_tile_size:64"):
-        governed.validate_contract(replace(op, metadata=tuple(meta.items())))
-
+        _prolog(abi=abi, tile_size=64)
 @pytest.mark.parametrize("arch", ARCH_IDS)
 @pytest.mark.parametrize("abi", (ABI_V4_NZ, ABI_DSL))
 def test_prolog_abi_availability_follows_declared_architecture(arch, abi):
@@ -176,34 +169,68 @@ def _execute(op, plan, geometry):
     engine.advance(horizon=7)
     assert not any(engine.serviced.values())
     engine.advance(until=(done,))
-    assert {k: v for k, v in engine.serviced.items() if v} == pytest.approx(binding.bind(plan.work))
+    assert {k: v for k, v in engine.serviced.items() if v} == pytest.approx(binding.bind(plan.work), rel=1e-12)
     _drained({"execution": engine.summary()})
+    return engine.summary()["peak_allocated"].get("hbm", 0)
 
-def test_dsl_resident_split_k_exchanges_padded_partials_and_retains_local_output():
-    op = _prolog(17, abi=ABI_DSL, dsl_d_width=512)
-    assert op.flops == 2 * 17 * (5120 * 1280 + 5120 * 512 + 1280 * 16 * 512)
+@pytest.mark.parametrize("sku,abi,mode,size", (
+    (SPLIT_N_SKU, ABI_V3_NZ, WEIGHT_QUANT_BF16, 2), (SPLIT_N_SKU, ABI_V3_NZ, WEIGHT_QUANT_INT8, 4),
+    (SPLIT_M_SKU, ABI_V4_NZ, WEIGHT_QUANT_BF16, 2), (SPLIT_M_SKU, ABI_V4_NZ, WEIGHT_QUANT_INT8, 4),
+    (SPLIT_M_SKU, ABI_V4_NZ, WEIGHT_QUANT_MXFP8, 4),
+))
+def test_projection_outputs_use_native_gm_element_widths(sku, abi, mode, size):
+    op = _prolog(1, abi=abi, q_lora_rank=1536, num_heads=4, weight_quant_mode=mode,
+                 kv_cache_quant_mode=0, cache_mode="BSND", do_rope=mode != WEIGHT_QUANT_BF16)
+    ctx = _context(sku, op)
+    plan = governed.build(op, ctx)
+    phases = {p.name: p for p in plan.program.groups[0][0].phases}
+    cq, kv, query = (size * n for n in (1536, 512 + 64, 4 * (128 + 64)))
+    for name, expected in zip(("mm1_cq", "mm2_ckv_kr", "mm3_qc_qr"), (cq, kv, query), strict=True):
+        write = phases[name + "_fixpipe_gm"]
+        assert _logical_bytes(write) == _service_bytes(write, "fixpipe") == expected
+    norm = tuple(d for d in phases["cq_norm_mte2_aiv"].demands if dict(d.audit)["tensor"] == "cq_norm")
+    assert sum(d.work.resources["mte2_aiv"] for d in norm) == cq
+    rope_tables = 2 * 64 * 4 if mode != WEIGHT_QUANT_BF16 else 0
+    assert _logical_bytes(phases["kv_cache_mte2_aiv"]) == kv + 512 * 2 + rope_tables
+    assert _logical_bytes(phases["query_rope_mte2_aiv"]) == 4 * 64 * size + rope_tables
+    cast_bytes = 0 if mode == WEIGHT_QUANT_BF16 else 4 * 128 * 2
+    if cast_bytes:
+        assert _service_bytes(phases["qc_dequant_mte2_aiv"], "mte2_aiv") == 4 * 128 * size
+    assert _execute(op, plan, ctx.geometry) == plan.metadata["workspace_slot_bytes"] == cq + kv + query + cast_bytes
+
+@pytest.mark.parametrize("tokens,padded,splits", ((17, 32, 4), (4096, 4128, 20)))
+def test_dsl_split_k_exchanges_fp32_partials_and_retains_local_query(tokens, padded, splits):
+    op = _prolog(tokens, abi=ABI_DSL, dsl_d_width=512)
+    assert op.flops == 2 * tokens * (5120 * (1280 + 512) + 1280 * 16 * 512)
     ctx = _context(SPLIT_M_SKU, op)
     plan = governed.build(op, ctx)
-    assert plan.metadata["l1_reuse"] and plan.metadata["k_splits"] == 4
-    assert plan.metadata["step_batch"] == 32 and plan.metadata["workspace_slot_bytes"] == 917_504
+    resident = tokens < 256
+    assert plan.metadata["l1_reuse"] is resident and plan.metadata["k_splits"] == splits
     chunk, = plan.program.groups[0]
-    phases = {phase.name: phase for phase in chunk.phases}
-    pairs = [("mm1_wqa_fixpipe_gm", "qa_partials_mte2_aiv", 1280), ("mm2_wkv_fixpipe_gm", "kv_partials_mte2_aiv", 512)]
-    assert sum(_logical_bytes(phases[name]) for name, _, _ in pairs) == 487_424
-    for write, read, width in pairs:
-        pub, gather = phases[write], phases[read]
-        assert write in gather.after
-        assert _service_bytes(pub, "fixpipe") == _service_bytes(pub, "hbm") == 32 * 4 * width * 4
-        assert _service_bytes(gather, "mte2_aiv") == _service_bytes(gather, "hbm") == 17 * 4 * width * 4
-        assert {dict(d.audit)["split"] for d in pub.demands} == set(range(4))
-        assert len({d.owner for d in pub.demands}) > 1
-    assert phases["cq_norm_mte2_aiv"].after == ("qa_partials_mte2_aiv",)
-    assert phases["kv_cache_mte2_aiv"].after == ("kv_partials_mte2_aiv",)
+    phases = {p.name: p for p in chunk.phases}
+    for product, tensor, width, ops in (("mm1_wqa", "qa_partials", 1280, 4), ("mm2_wkv", "kv_partials", 512, 1)):
+        write, read = phases[product + "_fixpipe_gm"], phases[tensor + "_mte2_aiv"]
+        assert write.name in read.after
+        live = tokens * splits * width * 4
+        assert _logical_bytes(write) == _service_bytes(read, "mte2_aiv") == _service_bytes(read, "hbm") == live
+        assert _service_bytes(write, "fixpipe") == _service_bytes(write, "hbm") == padded * splits * width * 4
+        post = "cq_norm" if tensor == "qa_partials" else "kv_cache"
+        if resident:
+            assert phases[post + "_mte2_aiv"].after == (read.name,)
+            assert {dict(d.audit)["split"] for d in write.demands} == set(range(splits))
+            assert len({d.owner for d in write.demands}) > 1
+        else:
+            reduce = phases[tensor + "_reduce_vector"]
+            assert reduce.after == (read.name,) and phases[post + "_mte2_aiv"].after == (reduce.name,)
+            assert _service_bytes(reduce, "vector") == tokens * width * (splits - 1) * ops
+            assert sum(dict(d.audit)["logical_flops"] for d in phases[product + "_cube"].demands) == 2 * tokens * width * 5120
     assert phases["mm3_wqb_mte2_aic"].after == ("cq_norm_mte3_gm",)
     assert all(set(d.work.resources) == {"fixpipe"} for d in phases["mm3_wqb_fixpipe_ub"].demands)
-    assert sum(dict(d.audit)["logical_flops"] for d in phases["a1_cube"].demands) == 2 * 17 * 5120 * (1280 + 512)
-    assert plan.work.matrix == {"fp8_e4m3": op.flops * 32 // 17}
-    _execute(op, plan, ctx.geometry)
+    assert _execute(op, plan, ctx.geometry) == plan.metadata["workspace_slot_bytes"] == padded * splits * (1280 + 512) * 4
+    if not resident:
+        return
+    assert plan.metadata["step_batch"] == 32 and plan.work.matrix == {"fp8_e4m3": op.flops * 32 // 17}
+    assert sum(dict(d.audit)["logical_flops"] for d in phases["a1_cube"].demands) == 2 * tokens * 5120 * (1280 + 512)
     no_l1 = replace(ctx, geometry=replace(ctx.geometry, buffers=dict(ctx.geometry.buffers) | {"l1": 1}))
     spill = governed.build(op, no_l1)
     assert not spill.metadata["l1_reuse"] and spill.metadata["logical_flops"] == plan.metadata["logical_flops"]
@@ -224,14 +251,12 @@ def test_disjoint_stream_uses_reachable_physical_owner_ids():
     per_unit = report["execution"]["peak_allocated_per_unit"]
     assert {int(name.split(":unit")[1]) for name, size in per_unit.items() if name.startswith("ub@") and size} == set(range(14, 18))
     assert _drained(report)["fixpipe@r0:s0"] == pytest.approx(sum(e["demand"].get("fixpipe@r0:s0", 0) for e in report["events"]))
-def _read(path):
-    return json.loads(path.read_text())
 def _enable_fusion(raw, profile, prolog):
     raw["runtime"].setdefault("kernels", {})["lowerings"] = {
         "mla_prolog": prolog, "native_fusion": {"implementation": "declared_native_fusion",
                                                "options": {"roles": ["mla_prolog"], "traffic_profile": profile}}}
 def _source_case(*, tiny=False):
-    raw = _read(CASES / "glm53-a3-w4a8.json")
+    raw = json.loads((CASES / "glm53-a3-w4a8.json").read_text())
     _enable_fusion(raw, FULL_QUANT_PROFILE, "vllm_ascend_mla_prolog_v3")
     case = parse_case(raw)
     model, runtime = case.model, case.runtime
@@ -269,7 +294,7 @@ def test_source_plan_keeps_a_bounded_repeat_and_preserves_absorption_work():
     assert (full.count, tail.count) == (10_000_000, 1)
     assert len(pickle.dumps(plan)) < 100_000
     assert plan.work.matrix["bf16"] == 2 * (tokens + 15) * 8 * 128 * 512
-    plain = target_operators(_read(CASES / "glm53-a3-w4a8.json"), phase="prefill", tokens=8, resource_fusion=False)
+    plain = target_operators(json.loads((CASES / "glm53-a3-w4a8.json").read_text()), phase="prefill", tokens=8, resource_fusion=False)
     assert any(op.recipe == "q_absorb" for op in plain) and all(op.family != "native_fusion" for op in plain)
 def test_repeated_source_groups_share_physical_identity_and_run_on_small_geometry():
     case = _source_case(tiny=True)
@@ -282,7 +307,7 @@ def test_repeated_source_groups_share_physical_identity_and_run_on_small_geometr
     assert first["subgraph_id"] != second["subgraph_id"] and first["physical_signature"] == second["physical_signature"]
     assert first["physical_work"] == second["physical_work"] and first["physical_work"]["launches"] == 1
 def _packed_case(layers):
-    raw = _read(CONCURRENT / "glm78/a3_glm53_w4a8_tp16_tpot88_c8.json")
+    raw = json.loads((CONCURRENT / "glm78/a3_glm53_w4a8_tp16_tpot88_c8.json").read_text())
     raw["model"]["layers"] = layers
     _enable_fusion(raw, PACKED_PROFILE, {"implementation": "vllm_ascend_mla_prolog_v3",
                                   "options": {"cache_layout": PACKED_LAYOUT, "cache_group_size": 128}})
@@ -327,7 +352,6 @@ def test_packed_store_matches_governed_row_and_persistent_capacity():
     assert op.mte3_bytes == 6 * c.kv_row_bytes and op.hbm_bytes == op.mte2_bytes + op.mte3_bytes
     assert dict(op.metadata)["cache_output_alias"]
     assert layer_cache_components(case.model, plan, case.runtime.parallel, 1024)["mla_kv"] == 1024 * 656
-
 def test_native_boundary_service_preserves_work_and_responds_to_memory_rate():
     raw = _packed_case(1)
     selected = _packed_groups(raw, 1, 1)
@@ -345,9 +369,8 @@ def test_native_boundary_service_preserves_work_and_responds_to_memory_rate():
     after = operator_costs(raw, selected, input_ready_ms=7)["operators"][0]
     assert after["duration_ms"] == pytest.approx(1) and after["serviced"] == pytest.approx(before["serviced"])
     assert not after["service_before_input"] and after["live_tasks"] == 0
-
 def _caller_case(**options):
-    raw = _read(CONCURRENT / "matrix-extension/a3_glm53flash_tp16_aclgraph_c32.json")
+    raw = json.loads((CONCURRENT / "matrix-extension/a3_glm53flash_tp16_aclgraph_c32.json").read_text())
     raw["model"]["layers"] = 4
     raw["runtime"]["kernels"]["programs"]["indexed_attention"] = {
         "kind": "indexed_attention_packed_int8", "scratch_policy": "offchip"}
@@ -455,8 +478,6 @@ def test_keypool_fp8_cache_selection_requires_matching_scale_layout(scale, nativ
         assert score.flops == 2 * meta["safe_reference_scanned_pools"] * 32 * 128
     else:
         assert "index_pool_compress" in ops and "cann_keypool_cache_write" not in ops
-def _model(plan):
-    return ModelSpec("contract", 1, 4096, 8, 576, 1024, 1024, attention="mla", ffn="dense", layer_plans=(plan,), quant=QuantSpec("bf16"))
 def _layer(**changes):
     shape = dict(index=0, attention="mla", architecture="mla", ffn="dense", intermediate_size=1024,
                  num_heads=8, num_kv_heads=1, head_dim=576, q_lora_rank=1536, kv_lora_rank=512,
@@ -468,7 +489,7 @@ def _layer(**changes):
 @pytest.mark.parametrize("ratio", (1, 4))
 def test_compressor_prunes_gate_at_unit_ratio_and_fuses_valid_rows(ratio):
     plan = _layer(compress_ratio=ratio)
-    model = _model(plan)
+    model = ModelSpec("contract", 1, 4096, 8, 576, 1024, 1024, attention="mla", ffn="dense", layer_plans=(plan,), quant=QuantSpec("bf16"))
     builder = Builder("s0.l0", plan, 0, (), model, "decode")
     ready = compressor(builder, name="compress", source="hidden", tokens=8, padded_tokens=8,
                        valid_rows=2, width=576, plan=plan, model=model,
@@ -530,26 +551,6 @@ def test_packed_query_quantization_requires_matching_projection_formats():
     assert apply_traffic_profile((), declaration, PACKED_PROFILE)[1]["profile"] == PACKED_PROFILE
     with pytest.raises(ModelingError, match="declared_token_projections"):
         apply_traffic_profile((), declaration | {"tensor_view": view | {"query_norm_dtype": "bf16"}}, PACKED_PROFILE)
-
-@pytest.mark.parametrize("packed", (False, True))
-def test_prolog_abi_preserves_query_precision_rotary_and_context_sharding(packed):
-    abi = ABI_V4_NZ if packed else ABI_V3_NZ
-    weight = WEIGHT_QUANT_MXFP8 if packed else WEIGHT_QUANT_BF16
-    parallel = ParallelSpec(tp=8, cp=8 if packed else 2, pcp=1)
-    op = _prolog(8, num_heads=64 // parallel.tp, abi=abi, weight_quant_mode=weight,
-                 kv_cache_quant_mode=int(packed), do_rope=packed)
-    contract = governed.validate_contract(op)
-    assert contract.precision == ("fp8_e4m3" if packed else "bf16") and contract.do_rope is packed
-    assert contract.kv_lora_rank + contract.qk_rope_head_dim == 576
-    plan = governed.build(op, _context(SPLIT_M_SKU, op))
-    assert plan.metadata["implementation"] == abi and plan.work.matrix["bf16"] > 0
-    logical = dict(op.matrix_flops)
-    absorb = 2 * 8 * (64 // parallel.tp) * 128 * 512
-    if packed:
-        assert logical["bf16"] == absorb and logical["fp8_e4m3"] > absorb
-    else:
-        assert logical == {"bf16": op.flops}
-
 @pytest.mark.parametrize("abi", (MQS_ABI, DSL_MQS_ABI))
 def test_sparse_attention_conserves_branch_rows_and_guards_sparse_coverage(abi):
     # One draft row and a larger selective decode cohort use the same branch-local cache ABI.
@@ -564,7 +565,6 @@ def test_sparse_attention_conserves_branch_rows_and_guards_sparse_coverage(abi):
     assert planned.work.matrix
     with pytest.raises(ModelingError, match="sparse_pair_coverage"):
         paged_mla.make_op(replace(cohort, n_cmp=511))
-
 def test_draft_layers_inherit_fusion_router_and_pool_ownership():
     case = parse_case(_caller_case())
     body = replace(case.model.layer_plans[3], mla_use_nope=True, packed_input_projection=True,

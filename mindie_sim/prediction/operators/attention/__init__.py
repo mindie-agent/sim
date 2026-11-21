@@ -15,15 +15,20 @@ from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.compute_arch import ComputeArchSpec
 from mindie_sim.schema.datapath import ArchId, ComputeArchIdentity, DatapathCapabilitySpec, GENERIC_ARCH_ID
 from mindie_sim.schema.operators import OpSpec
+from ...collectives import PairwiseCollective
 from ...mechanism import Geometry, OperatorPlan, PlannedRecipe
 from ...results import OpOccurrence
 from ..contracts import OperatorFamilySpec, OperatorPlanningContext, ResolvedOperator
 from . import arch22, arch35
-from ._cp_tiling import cp_operators, with_collectives
+from ._cp_tiling import (
+    HISTORY_DECODE_SITE, OUTPUT_LSE_EXCHANGE_RECIPE, cp_decode_suffix, cp_operators, history_decode_contract,
+    with_collectives,
+)
 from .common import (
     ARCH22, ARCH35, C8_ABI, C8_LATENT_DIM, FIA_ABI, FIA_TILE,
     GBSA_ABI, MINDIE_ABIS, MINDIE_V3_ABI, NOPE_ABI, QUANT_MODE_BF16, QUANT_MODE_FP8_C8, QUANT_MODE_INT8_C8,
-    QUANT_MODE_MXFP4_CX, QUANT_MODE_MXFP4_OCP, QUANT_MODE_MXFP8, QUANT_MODE_TQ4, SUPPORTED_QUANT_MODES, AttentionContract, ContextParallelPlan,
+    QUANT_MODE_MINDIE_FP8, QUANT_MODE_MXFP4_CX, QUANT_MODE_MXFP4_OCP, QUANT_MODE_MXFP8, QUANT_MODE_TQ4,
+    SUPPORTED_QUANT_MODES, AttentionContract, ContextParallelPlan,
     FiaPanelPlan, bsh_kv_access_plan, c8_gather_accounting, describe, lower_cp_collectives,
     shipping_fia_panel_plan, solve_wide_head_tiling, unmodeled,
 )
@@ -98,7 +103,7 @@ def _contract(op: OpSpec, requested_abi: str | None) -> AttentionContract:
         raise unmodeled("attention_abi_conflict", f"Bind one consistent ABI for {op.op_id}")
     if contract.phase != op.phase:
         raise ModelingError("attention_op_phase_mismatch")
-    return contract
+    return history_decode_contract(contract)
 
 
 def _planning_context(op: OpSpec, geometry: Geometry) -> OperatorPlanningContext:
@@ -143,9 +148,12 @@ def build(op: OpSpec, ctx: OperatorPlanningContext | Geometry, /) -> OperatorPla
         caller_files = {("common_cp.py", binding.stack_revision) for binding in contract.cp_plan}
         caller_files.update((binding.caller_site.split(".", 1)[0] + ".py", binding.stack_revision)
                             for binding in contract.cp_plan)
+        caller_files.update(("dcp_a2a.py", binding.stack_revision) for binding in contract.cp_plan
+                            if binding.caller_site == HISTORY_DECODE_SITE)
         sources = tuple(ref for ref in arch35.CP_SOURCES
                         if (ref.relative_path.rsplit("/", 1)[-1], ref.revision) in caller_files)
-        plan = with_collectives(plan, cp_operators(normalized, contract.cp_plan), sources)
+        plan = with_collectives(plan, cp_operators(normalized, contract.cp_plan),
+                                cp_decode_suffix(normalized, contract), sources)
     return plan
 
 
@@ -167,15 +175,16 @@ def _kernels(op: OpSpec) -> tuple[OpSpec, ...]:
     gathers = cp_operators(op, contract.cp_plan or ())
     kernel = replace(
         op, op_id="attention", deps=(gathers[-1].op_id,) if gathers else (), source_boundary="kernel",
+        returns=tuple(dict.fromkeys((*op.returns, "lse"))) if contract.return_lse else op.returns,
         metadata=tuple({**dict(op.metadata), "attention_contract": asdict(replace(contract, cp_plan=None))}.items()),
     )
-    return (*gathers, kernel)
+    return (*gathers, kernel, *cp_decode_suffix(op, contract))
 
 
-def recipes() -> dict[str, PlannedRecipe]:
+def recipes() -> dict[str, PlannedRecipe | PairwiseCollective]:
     """Expose exact recipe bindings through the existing source-recipe entrypoint."""
     planner = PlannedRecipe(build, _kernels)
-    return {recipe: planner for recipe in ABI_BY_RECIPE}
+    return {OUTPUT_LSE_EXCHANGE_RECIPE: PairwiseCollective(), **{recipe: planner for recipe in ABI_BY_RECIPE}}
 
 
 def make_attention_op(
@@ -183,11 +192,13 @@ def make_attention_op(
     layer: int = 0, requests: tuple[str, ...] = (), dtype: str = "bf16",
 ) -> OpSpec:
     """Create a JSON-compatible source kernel declaration from the typed contract."""
+    return_lse = contract.return_lse
+    contract = history_decode_contract(contract)
     shape = (contract.query_tokens, contract.num_heads, contract.v_head_dim)
     family = "mla" if contract.abi in {C8_ABI, NOPE_ABI} else "attention"
     matrix_dtype = dtype
     if contract.quant_mode == QUANT_MODE_MXFP8 or (
-        contract.abi in MINDIE_ABIS and contract.quant_mode in {QUANT_MODE_INT8_C8, QUANT_MODE_FP8_C8}
+        contract.abi in MINDIE_ABIS and contract.quant_mode == QUANT_MODE_MINDIE_FP8
     ):
         matrix_dtype = "fp8_e4m3"
     if contract.abi == MINDIE_V3_ABI and contract.quant_mode in {QUANT_MODE_MXFP4_OCP, QUANT_MODE_MXFP4_CX}:
@@ -199,7 +210,7 @@ def make_attention_op(
         dtype=dtype, layout=contract.kv_layout,
         source_boundary="call" if contract.cp_plan else "kernel",
         flops=contract.useful_flops, matrix_flops=((matrix_dtype, contract.useful_flops),),
-        returns=("lse",) if contract.return_lse else (),
+        returns=("lse",) if return_lse else (),
         metadata=(("attention_contract", asdict(contract)), ("native_kind", contract.abi)),
     )
 

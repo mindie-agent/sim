@@ -118,7 +118,7 @@ def test_mindie_sparse_abi_preserves_source_and_precision_boundary(abi):
     plan = governed.build(op, geom)
     assert plan.pipeline_spec.implementation == plan.metadata["abi"] == abi
     assert plan.work.matrix == {"bf16": 2 * 2 * 17 * 4 * (128 + 64)}
-    fp8 = governed.make_attention_op(replace(contract, quant_mode=5), op_id="mindie")
+    fp8 = governed.make_attention_op(replace(contract, quant_mode=1), op_id="mindie")
     if abi == MINDIE_V1_ABI:
         with pytest.raises(UnmodeledCapabilityError, match="supported layout and storage format"):
             governed.build(fp8, geom)
@@ -289,7 +289,7 @@ def test_packed_copy_pads_ub_rows_independently_of_gm_sectors():
 
 def test_verify_geometry_without_addresses_has_no_residency_credit():
     op = governed.make_kv_quant_sfa_c8_op(
-        op_id="verify", query_tokens=4, num_heads=1, selected_tokens=2048, batch_size=1, shared_prefix=False,
+        op_id="verify", query_tokens=4, num_heads=1, selected_tokens=2048, batch_size=1, shared_prefix=True,
     )
     plan = governed.build(op, geometry())
     gather = stages(plan)["packed_kv_gather"]
@@ -301,18 +301,22 @@ def test_verify_geometry_without_addresses_has_no_residency_credit():
     assert audit["status"] == "passed"
 
 
+def engine_binding(op, geom, trace_limit=128):
+    rates = {**{role: rate / 1000 for role, rate in geom.rates.items()}, "cube": 1}
+    context = RecipeContext(op, {}, {role: role for role in rates}, rates, geom.compute_units,
+                            resource_units=geom.resource_units, compute_peaks=geom.compute_peaks)
+    engine = Engine([Resource(role, rate, units=geom.resource_units[role]) for role, rate in rates.items()],
+                    trace_limit=trace_limit)
+    return engine, context
+
+
 def test_admission_rebinds_packed_reads_by_tensor_and_producer_version():
     geom = geometry()
     arguments = dict(op_id="decode", query_tokens=1, num_heads=1, selection_lists=((0,),),
                      kv_tensor_id="layer-cache", kv_version=7)
     op = governed.make_kv_quant_sfa_c8_op(**arguments)
-    plan = governed.build(op, geom)
-    rates = {**{role: rate / 1000 for role, rate in geom.rates.items()}, "cube": 1}
-    context = RecipeContext(op, {}, {role: role for role in rates}, rates, geom.compute_units,
-                            resource_units=geom.resource_units, compute_peaks=geom.compute_peaks)
-    program = plan.lower(context)
-    engine = Engine([Resource(role, rate, units=geom.resource_units[role]) for role, rate in rates.items()],
-                    trace_limit=128)
+    engine, context = engine_binding(op, geom)
+    program = governed.build(op, geom).lower(context)
     ready = engine.submit("ready", release=5)
     first = program.start(engine, "first", ready)
     second = program.start(engine, "second", first)
@@ -320,15 +324,142 @@ def test_admission_rebinds_packed_reads_by_tensor_and_producer_version():
     third = governed.build(changed, geom).lower(context).start(engine, "third", second)
     other = governed.make_kv_quant_sfa_c8_op(**{**arguments, "kv_tensor_id": "other-cache"})
     fourth = governed.build(other, geom).lower(context).start(engine, "fourth", third)
-    engine.advance(until=(fourth,))
+    fifth = program.start(engine, "old-version", fourth)
+    engine.advance(until=(fifth,))
 
     reads = [row for row in engine.trace if row["task"].endswith(":read:program") and "packed_kv_gather" in row["task"]]
-    assert len(reads) == 4
+    assert len(reads) == 5
     assert all(row["demand"]["mte2_aiv"] == 672 for row in reads)
-    assert [row["demand"].get("hbm", 0) for row in reads] == [672, 0, 672, 672]
-    assert [row["demand"].get("l2", 0) for row in reads] == [0, 672, 0, 0]
+    assert [row["demand"].get("hbm", 0) for row in reads] == [672, 0, 672, 672, 672]
+    assert [row["demand"].get("l2", 0) for row in reads] == [0, 672, 0, 0, 0]
     assert reads[0]["start_ms"] >= 5 and reads[1]["start_ms"] >= first.time
-    assert engine.delivered["mte2_aiv"] == 4 * 672 and engine.delivered["l2"] == 672
+    assert engine.delivered["mte2_aiv"] == 5 * 672 and engine.delivered["l2"] == 672
+
+
+def test_packed_split_waits_for_each_owners_dma_and_conserves_rows():
+    geom = geometry()
+    contract = governed.AttentionContract(
+        1, 1, 1, 576, 512, abi=governed.C8_ABI, quant_mode=5, splits=2,
+        kv_layout="PA_BLK_BSND", selection_lists=((0, 1344),), kv_tensor_id="cache",
+    )
+    op = governed.make_attention_op(contract, op_id="decode")
+    engine, context = engine_binding(op, geom)
+    plan = governed.build(op, geom)
+    end = plan.lower(context).start(engine, "decode", engine.submit("input", release=3))
+    engine.advance(until=(end,))
+    suffix = ":packed_kv_gather:program:read:program"
+    reads = sorted((row for row in engine.trace if row["task"].endswith(suffix)),
+                   key=lambda row: row["placement"]["mte2_aiv"])
+    assert len(reads) == 2
+    assert len({tuple(row["placement"]["mte2_aiv"]) for row in reads}) == 2
+    split_ends = []
+    for read in reads:
+        assert read["demand"]["hbm"] == read["demand"]["mte2_aiv"] == 672
+        branch = read["task"].removesuffix(suffix)
+        names = ("kv_dequant", "kv_to_l1", "qk", "pv", "split_write")
+        dequant, transfer, qk, pv, write = steps = [
+            next(row for row in engine.trace if row["task"] == f"{branch}:{name}") for name in names
+        ]
+        assert all(left["end_ms"] <= right["start_ms"] for left, right in zip((read, *steps[:-1]), steps, strict=True))
+        assert dequant["demand"]["vector"] == 1024 and transfer["demand"]["mte3"] == 1152
+        assert qk["demand"]["mte1"] == 2304 and pv["demand"]["mte1"] == 1026
+        split_ends.append(write["end_ms"])
+    merge_read = next(row for row in engine.trace if row["task"].endswith(":split_read"))
+    assert max(split_ends) <= merge_read["start_ms"]
+    assert plan.work.matrix == {"bf16": 2 * 2 * (576 + 512)}
+    assert {role: amount for role, amount in engine.serviced.items() if amount} == pytest.approx(context.bind(plan.work))
+
+    # Warming only the first offset identifies which physical row each split reads.
+    engine, context = engine_binding(op, geom)
+    warm = governed.make_attention_op(replace(contract, splits=1, selection_lists=((0,),)), op_id="warm")
+    ready = governed.build(warm, geom).lower(context).start(engine, "warm", engine.submit("input"))
+    end = plan.lower(context).start(engine, "decode", ready)
+    engine.advance(until=(end,))
+    rereads = {row["task"]: row["demand"] for row in engine.trace
+               if row["task"].startswith("decode:") and row["task"].endswith(suffix)}
+    assert rereads[reads[0]["task"]].get("l2") == 672
+    assert rereads[reads[1]["task"]].get("hbm") == 672
+
+
+@pytest.mark.parametrize("selections", [(), ((0,), (1344,))])
+def test_shared_prefix_needs_matching_physical_addresses(selections):
+    geom = geometry()
+    op = governed.make_kv_quant_sfa_c8_op(
+        op_id="decode", query_tokens=2, num_heads=1, selected_tokens=1, shared_prefix=True,
+        selection_lists=selections, kv_tensor_id="cache",
+    )
+    engine, context = engine_binding(op, geom)
+    end = governed.build(op, geom).lower(context).start(engine, "decode", engine.submit("input"))
+    engine.advance(until=(end,))
+    reads = [row["demand"] for row in engine.trace if ":packed_kv_gather" in row["task"] and row["demand"]]
+    assert sum(read["hbm"] for read in reads) == 1344
+    assert sum(read.get("l2", 0) for read in reads) == 0
+
+
+def test_packed_residency_starts_after_the_dma_completes():
+    geom = geometry()
+    op = governed.make_kv_quant_sfa_c8_op(
+        op_id="decode", query_tokens=2, num_heads=1, selection_lists=((0,), (0,)), kv_tensor_id="cache",
+    )
+    engine, context = engine_binding(op, geom)
+    program = governed.build(op, geom).lower(context)
+    ready = engine.submit("input")
+    first = program.start(engine, "first", ready)
+    second = program.start(engine, "reuse", first)
+    engine.advance(until=(second,))
+    reads = [row for row in engine.trace if row["task"].endswith(":packed_kv_gather:program:read:program")]
+    assert len(reads) == 4
+    assert reads[0]["start_ms"] < reads[1]["end_ms"] and reads[1]["start_ms"] < reads[0]["end_ms"]
+    assert [row["demand"].get("hbm", 0) for row in reads] == [672, 672, 0, 0]
+    assert [row["demand"].get("l2", 0) for row in reads] == [0, 0, 672, 672]
+
+
+@pytest.mark.parametrize("distinct_allocations", [False, True])
+@pytest.mark.parametrize("capacity,hit", [(1024**2, 672), (1024, 0)])
+def test_packed_residency_evicts_by_bytes(capacity, hit, distinct_allocations):
+    base = geometry()
+    geom = replace(base, buffers={**base.buffers, "l2": capacity})
+
+    def request(i):
+        return governed.make_kv_quant_sfa_c8_op(
+            op_id="decode", query_tokens=1, num_heads=1,
+            selection_lists=((0 if distinct_allocations else i * 672,),),
+            kv_tensor_id=f"allocation-{i}" if distinct_allocations else "allocation",
+        )
+
+    first = request(0)
+    engine, context = engine_binding(first, geom, trace_limit=4096)
+    done = engine.submit("input")
+    for i in range(129):
+        op = request(i)
+        done = governed.build(op, geom).lower(context).start(engine, f"row-{i}", done)
+        engine.advance(until=(done,))
+    done = governed.build(first, geom).lower(context).start(engine, "reread", done)
+    engine.advance(until=(done,))
+    reads = [row["demand"] for row in engine.trace if row["task"].endswith(":packed_kv_gather:program:read:program")]
+    assert len(reads) == 130
+    assert sum(row["hbm"] for row in reads[:-1]) == 86_688
+    assert sum(row.get("l2", 0) for row in reads[:-1]) == 0
+    assert reads[-1].get("l2", 0) == hit and reads[-1].get("hbm", 0) == 672 - hit
+
+
+def test_mindie_v3_fp8_consumes_fp32_scales_and_rejects_unknown_mode():
+    contract = governed.AttentionContract(
+        1, 2, 1, 128, 128, selected_tokens=129, kv_layout="BNSD", abi=MINDIE_V3_ABI,
+        block_size=128, quant_mode=1,
+    )
+    op = governed.make_attention_op(contract, op_id="block-sparse")
+    plan = governed.build(op, geometry())
+    phase = stages(plan)
+    assert plan.metadata["scale_dtype"] == "fp32"
+    assert plan.metadata["scale_bytes"] == {"query": 8, "key": 16, "value": 16}
+    for tensor, consumer, size in (("query", "qk", 8), ("key", "qk", 16), ("value", "pv", 16)):
+        scale = f"{tensor}_scale_load"
+        assert phase[scale].work.resources["hbm"] == phase[scale].work.resources["mte2_aic"] == size
+        assert scale in phase[consumer].after
+    assert verify_operator(sku_case(REGBASE_SKU), op, governed.build)["status"] == "passed"
+    with pytest.raises(UnmodeledCapabilityError, match="quantization 5"):
+        replace(contract, quant_mode=5)
 
 
 @pytest.mark.parametrize("mode,dst_type_max", [(2, 0.0), (3, 4.0)])

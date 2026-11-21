@@ -7,7 +7,7 @@
 """
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, fields, replace
 from itertools import chain
 from math import ceil
@@ -37,6 +37,10 @@ DSL_MQS_HEADS = 64
 DSL_MQS_SCALE_ENCODINGS = ("bf16_g32", "bf16_g16")
 MQS_ORIGINAL_ROW_BYTES = 544
 MQS_COMPRESSED_ROW_BYTES = 320
+ACLNN_MQS_INLINE_ROW_BYTES = 608
+ACLNN_MQS_DATA_BYTES = 576
+ACLNN_MQS_SCALE_BYTES = 8
+ACLNN_MQS_SEPARATE_SCALE_MODE = 2
 FP32_BYTES = 4
 INDEX_BYTES = 4
 NZ_BLOCK_BYTES = 32
@@ -45,13 +49,24 @@ MASK_CAUSAL = 3
 MASK_WINDOW = 4
 MAX_COMPRESSION_RATIO = 128
 MQS_QUANT_MODES = frozenset({1, 2})
+QUERY_INDEX_NESTING = 3
 SCALE_ENCODINGS = frozenset({
     "bf16_g32", "bf16_g16", "fp16_g32", "fp16_g16", "e8m0_g32", "e8m0_g16",
 })
+BankCounts = int | tuple[int | tuple[int, ...], ...]
+IndexRow = tuple[int, ...]
+BankIndices = tuple[IndexRow | tuple[IndexRow, ...], ...]
 
 
 @dataclass(frozen=True, slots=True)
 class PagedMlaContract:
+    """Active query and KV extents, with optional DSL bank rows per query.
+
+    A nested bank row supplies one entry per query in its sequence. Flat bank
+    rows are batch-indexed, or query-indexed when their length matches only the
+    query count. With per-query counts, the sequence KV extent bounds each row.
+    """
+
     sequences: tuple[tuple[int, int], ...]
     logical_heads: int
     physical_heads: int
@@ -65,8 +80,8 @@ class PagedMlaContract:
     splits: int = 1
     return_lse: bool = False
     latent_alias: bool = True
-    n_ori: int | tuple[int, ...] = 0
-    n_cmp: int | tuple[int, ...] = 0
+    n_ori: BankCounts = 0
+    n_cmp: BankCounts = 0
     quant_mode: int = 1
     cmp_ratio: int = 1
     ori_mask_mode: int = MASK_NONE
@@ -77,8 +92,8 @@ class PagedMlaContract:
     block_table: tuple[tuple[int, ...], ...] = ()
     ori_block_table: tuple[tuple[int, ...], ...] = ()
     cmp_block_table: tuple[tuple[int, ...], ...] = ()
-    ori_indices: tuple[tuple[int, ...], ...] = ()
-    cmp_indices: tuple[tuple[int, ...], ...] = ()
+    ori_indices: BankIndices = ()
+    cmp_indices: BankIndices = ()
     atomic_split_decode: bool = False
     sinks: tuple[str, tuple[int, ...]] | None = None
 
@@ -94,15 +109,43 @@ class PagedMlaContract:
     def dv(self) -> int:
         return self.mqsmla_dim if self.mixed_quant else self.latent_dim
 
+    def bank_counts(self, seq: int, query: int) -> tuple[int, int]:
+        ori, cmp = self.n_ori, self.n_cmp
+        return (_query_row(ori[seq], query) if isinstance(ori, tuple) else ori,
+                _query_row(cmp[seq], query) if isinstance(cmp, tuple) else cmp)
+
+    def query_runs(self, seq: int) -> Iterator[tuple[int, int]]:
+        """Yield the first query and number of queries sharing its inputs."""
+        queries = self.sequences[seq][0]
+        if any(_per_query(rows[seq], indices=indices) for rows, indices in (
+            (self.n_ori, False), (self.n_cmp, False), (self.ori_indices, True), (self.cmp_indices, True),
+        ) if isinstance(rows, tuple) and rows):
+            yield from ((query, 1) for query in range(queries))
+        else:
+            yield 0, queries
+
+    @property
+    def selected_pairs(self) -> int:
+        if not self.mixed_quant:
+            return sum(q * kv for q, kv in self.sequences)
+        pairs = 0
+        for name in ("n_ori", "n_cmp"):
+            counts = getattr(self, name)
+            if type(counts) is int:
+                pairs += sum(q for q, _ in self.sequences) * counts
+            else:
+                rows = _batch_rows(self, name, counts)
+                pairs += sum(sum(row) if isinstance(row, tuple) else q * row
+                             for row, (q, _) in zip(rows, self.sequences, strict=True))
+        return pairs
+
     @property
     def useful_matrix_flops(self) -> int:
-        pairs = sum(q * kv for q, kv in self.sequences) * self.logical_heads
-        return 2 * pairs * (self.dqk + self.dv)
+        return 2 * self.selected_pairs * self.logical_heads * (self.dqk + self.dv)
 
     @property
     def issued_matrix_flops(self) -> int:
-        pairs = sum(q * kv for q, kv in self.sequences) * self.physical_heads
-        return 2 * pairs * (self.dqk + self.dv)
+        return 2 * self.selected_pairs * self.physical_heads * (self.dqk + self.dv)
 
 def ceil_div(value: int, divisor: int) -> int:
     return (value + divisor - 1) // divisor
@@ -115,7 +158,7 @@ def _extent(name: str, value: int, minimum: int = 0) -> None:
         raise ModelingError(f"paged_mla_invalid_{name}:{value!r}")
 
 def mqsmla_payload_bytes(n_ori: int, n_cmp: int) -> int:
-    """Return exact FP8 and packed E2M1 record payload before transactions."""
+    """Return the DSL ABI's FP8 and packed E2M1 payload before transactions."""
     _extent("n_ori", n_ori)
     _extent("n_cmp", n_cmp)
     return MQS_ORIGINAL_ROW_BYTES * n_ori + MQS_COMPRESSED_ROW_BYTES * n_cmp
@@ -134,8 +177,19 @@ def latent_record_bytes(
     _extent("rope_dim", rope_dim)
     return ceil((latent_dim + rope_dim + (0 if latent_alias else latent_dim)) * dtype_bytes(dtype))
 
-def _rows(value: int | tuple[int, ...], seq: int) -> int:
-    return value if type(value) is int else value[seq]
+def _per_query(row, *, indices: bool = False) -> bool:
+    return isinstance(row, tuple) and (not indices or bool(row) and isinstance(row[0], tuple))
+
+def _query_row(row, query: int, *, indices: bool = False):
+    return row[query] if _per_query(row, indices=indices) else row
+
+def _batch_rows(c: PagedMlaContract, name: str, rows: tuple) -> tuple:
+    if len(rows) == len(c.sequences):
+        return rows
+    if c.abi == DSL_MQS_ABI and len(rows) == sum(q for q, _ in c.sequences):
+        entries = iter(rows)
+        return tuple(tuple(next(entries) for _ in range(q)) for q, _ in c.sequences)
+    raise ModelingError(f"paged_mla_invalid_{name}_batch")
 
 def _validate_lists(name: str, values: tuple, sequences: int) -> None:
     if not isinstance(values, tuple) or (values and len(values) != sequences):
@@ -145,12 +199,34 @@ def _validate_lists(name: str, values: tuple, sequences: int) -> None:
     for value in chain.from_iterable(values):
         _extent(name, value)
 
-def _validate_mixed(c: PagedMlaContract) -> None:
-    for name, counts in (("n_ori", c.n_ori), ("n_cmp", c.n_cmp)):
-        if isinstance(counts, tuple) and len(counts) != len(c.sequences):
-            raise ModelingError(f"paged_mla_invalid_{name}_batch")
-        for count in counts if isinstance(counts, tuple) else (counts,):
-            _extent(name, count)
+def _validate_bank_rows(c: PagedMlaContract, name: str, *, indices: bool = False):
+    rows = getattr(c, name)
+    if not indices and not isinstance(rows, tuple):
+        _extent(name, rows)
+        return rows
+    if indices and rows == ():
+        return rows
+    if not isinstance(rows, tuple):
+        raise ModelingError(f"paged_mla_invalid_{name}_batch")
+    rows = _batch_rows(c, name, rows)
+    for seq, (row, (queries, _)) in enumerate(zip(rows, c.sequences, strict=True)):
+        per_query = _per_query(row, indices=indices)
+        if per_query and (c.abi != DSL_MQS_ABI or len(row) != queries):
+            raise ModelingError(f"paged_mla_invalid_{name}_query_count:{seq}")
+        values = row if per_query else (row,)
+        if indices:
+            if any(not isinstance(value, tuple) for value in values):
+                raise ModelingError(f"paged_mla_invalid_{name}_list")
+            values = chain.from_iterable(values)
+        for value in values:
+            _extent(name, value)
+    return rows
+
+def _validate_mixed(c: PagedMlaContract) -> PagedMlaContract:
+    c = replace(c, **{
+        name: _validate_bank_rows(c, name, indices=name.endswith("_indices"))
+        for name in ("n_ori", "n_cmp", "ori_indices", "cmp_indices")
+    })
     modes = {1} if c.abi == DSL_MQS_ABI else MQS_QUANT_MODES
     if type(c.quant_mode) is not int or c.quant_mode not in modes:
         raise ModelingError(f"paged_mla_invalid_quant_mode:{c.abi}:{c.quant_mode}")
@@ -170,7 +246,8 @@ def _validate_mixed(c: PagedMlaContract) -> None:
     if c.abi == DSL_MQS_ABI:
         if c.physical_heads != DSL_MQS_HEADS:
             raise ModelingError(f"paged_mla_dsl_mqsmla_requires_heads:{DSL_MQS_HEADS}")
-        has_compressed = any(c.n_cmp) if isinstance(c.n_cmp, tuple) else bool(c.n_cmp)
+        has_compressed = (any(any(row) if isinstance(row, tuple) else row for row in c.n_cmp)
+                          if isinstance(c.n_cmp, tuple) else bool(c.n_cmp))
         allowed = (DSL_MQS_SCALE_ENCODINGS,) if has_compressed else (
             DSL_MQS_SCALE_ENCODINGS, DSL_MQS_SCALE_ENCODINGS[:1],
         )
@@ -179,22 +256,26 @@ def _validate_mixed(c: PagedMlaContract) -> None:
     if type(c.mqsmla_dim) is not int or c.mqsmla_dim != MQS_HEAD_DIM or c.rope_dim >= c.mqsmla_dim:
         raise ModelingError("paged_mla_mqsmla_requires_packed_width_512")
     for seq, (_, kv) in enumerate(c.sequences):
-        ori, cmp = _rows(c.n_ori, seq), _rows(c.n_cmp, seq)
-        if ori + cmp != kv:
-            raise ModelingError(f"paged_mla_sparse_pair_coverage:{seq}:{ori}+{cmp}!={kv}")
-        for branch, count, indices, table in (
-            ("ori", ori, c.ori_indices, c.ori_block_table),
-            ("cmp", cmp, c.cmp_indices, c.cmp_block_table),
-        ):
-            selected = indices[seq] if indices else ()
-            if indices and len(selected) != count:
-                raise ModelingError(f"paged_mla_{branch}_index_count:{seq}")
-            extent = max(selected, default=-1) + 1 if indices else count
-            pages = ceil_div(extent, c.page_size)
-            if table and pages > len(table[seq]):
-                raise ModelingError(f"paged_mla_{branch}_block_table_coverage:{seq}")
-            if c.block_table_len is not None and pages > c.block_table_len:
-                raise ModelingError(f"paged_mla_{branch}_block_table_len:{seq}")
+        per_query_counts = any(isinstance(rows, tuple) and isinstance(rows[seq], tuple)
+                               for rows in (c.n_ori, c.n_cmp))
+        for query, _ in c.query_runs(seq):
+            ori, cmp = c.bank_counts(seq, query)
+            if ori + cmp > kv or (not per_query_counts and ori + cmp != kv):
+                raise ModelingError(f"paged_mla_sparse_pair_coverage:{seq}:{query}:{ori}+{cmp}:{kv}")
+            for branch, count, indices, table in (
+                ("ori", ori, c.ori_indices, c.ori_block_table),
+                ("cmp", cmp, c.cmp_indices, c.cmp_block_table),
+            ):
+                selected = _query_row(indices[seq], query, indices=True) if indices else ()
+                if indices and len(selected) != count:
+                    raise ModelingError(f"paged_mla_{branch}_index_count:{seq}:{query}")
+                extent = max(selected, default=-1) + 1 if indices else count
+                pages = ceil_div(extent, c.page_size)
+                if table and pages > len(table[seq]):
+                    raise ModelingError(f"paged_mla_{branch}_block_table_coverage:{seq}:{query}")
+                if c.block_table_len is not None and pages > c.block_table_len:
+                    raise ModelingError(f"paged_mla_{branch}_block_table_len:{seq}:{query}")
+    return c
 
 def validate_contract(c: PagedMlaContract) -> PagedMlaContract:
     """Check shape, declared address coverage, and branch-local MQS attributes."""
@@ -219,12 +300,12 @@ def validate_contract(c: PagedMlaContract) -> PagedMlaContract:
     for q, kv in c.sequences:
         _extent("q_len", q)
         _extent("kv_len", kv)
-    for name in ("block_table", "ori_block_table", "cmp_block_table", "ori_indices", "cmp_indices"):
+    for name in ("block_table", "ori_block_table", "cmp_block_table"):
         _validate_lists(name, getattr(c, name), len(c.sequences))
     if c.mixed_quant:
         if c.block_table:
             raise ModelingError("paged_mla_mqsmla_requires_branch_local_block_tables")
-        _validate_mixed(c)
+        c = _validate_mixed(c)
     else:
         if c.n_ori or c.n_cmp or c.ori_indices or c.cmp_indices or c.ori_block_table or c.cmp_block_table:
             raise ModelingError("paged_mla_sparse_attributes_require_mqsmla")
@@ -252,15 +333,23 @@ def capability_gap(code: str, abi: str, arch_id: str = "") -> UnmodeledCapabilit
         ),),
     )
 
+def _tuple_rows(value, depth: int):
+    if depth and isinstance(value, (tuple, list)):
+        if depth == 1:
+            return tuple(value)
+        return tuple(_tuple_rows(row, depth - 1) for row in value)
+    return value
+
 def _from_mapping(raw: Mapping) -> PagedMlaContract:
     fields = dict(raw)
-    for name in ("sequences", "block_table", "ori_block_table", "cmp_block_table", "ori_indices", "cmp_indices"):
-        if isinstance(fields.get(name), (list, tuple)):
-            fields[name] = tuple(tuple(row) if isinstance(row, (list, tuple)) else row
-                                 for row in fields[name])
-    for name in ("n_ori", "n_cmp", "scale_encoding"):
-        if isinstance(fields.get(name), list):
-            fields[name] = tuple(fields[name])
+    for names, depth in (
+        (("sequences", "block_table", "ori_block_table", "cmp_block_table", "n_ori", "n_cmp"), 2),
+        (("ori_indices", "cmp_indices"), QUERY_INDEX_NESTING),
+        (("scale_encoding",), 1),
+    ):
+        for name in names:
+            if name in fields:
+                fields[name] = _tuple_rows(fields[name], depth)
     sinks = fields.get("sinks")
     if isinstance(sinks, (tuple, list)) and len(sinks) == 2 and isinstance(sinks[1], (tuple, list)):
         fields["sinks"] = (sinks[0], tuple(sinks[1]))

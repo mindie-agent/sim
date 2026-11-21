@@ -11,19 +11,20 @@ Upstream-ABI: aclnnMlaPrologV4WeightNz
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import gcd
 
 from mindie_sim.schema.datapath import ArchId, SourceRef
 from mindie_sim.schema.operators import OpSpec
 
 from ...mechanism import OperatorPlan
 from ..contracts import ArchStrategy, OperatorPlanningContext
+from ._lowering import BF16_BYTES, FP32_BYTES, FRACTAL_K_BYTE, FRACTAL_MN, MX_GROUP_SIZE, _GenericTiling, _ResidentTiling, ceil_div
 from .common import (
-    ABI_V4_NZ, BF16_BYTES, FP32_BYTES, FRACTAL_MN, MX_GROUP_SIZE, WEIGHT_QUANT_MXFP8,
-    PrologContract, _ResidentTiling,
-    build_plan, ceil_div, unsupported, uses_split_m, validate_contract,
+    WEIGHT_QUANT_MXFP8, PrologContract, build_plan, unsupported, uses_split_m, validate_contract,
 )
 
 ARCH_ID = ArchId("npu_arch_3510")
+UPSTREAM_ABI = "aclnnMlaPrologV4WeightNz"
 AIV_PER_BLOCK = 2
 DSL_TOKEN_RANGE_UPPERS = (16, 32, 48, 64, 80, 96, 192, 256)
 DSL_RESIDENT_GEOMETRIES = (
@@ -39,6 +40,19 @@ DSL_RESIDENT_K_SPLITS = 4
 DSL_L0C_RESERVE = 16 * 1024
 DSL_VECTOR_LANES = 64
 DSL_A2_VECTOR_SCRATCH = 5
+DSL_DECODE_SPLIT_THRESHOLD = 128
+DSL_DECODE_REDUCE_THRESHOLD = 32
+DSL_DECODE_SPLIT_CANDIDATES = (2, 4, 8)
+DSL_DECODE_K_LIMIT = 640
+DSL_LONG_TOKEN_THRESHOLD = 4096
+DSL_LONG_K_SPLITS = 20
+DSL_PREFILL_MAX_ROWS = 96
+DSL_LARGE_DECODE_ROWS = 112
+DSL_LARGE_DECODE_COLUMNS = 256
+DSL_DECODE_MAX_ROWS = 128
+DSL_PREFILL_MAX_COLUMNS = 128
+DSL_PREFILL_REDUCE_ROWS = 4
+DSL_MAX_EXTRA_PROJECTION_WAVE_PERCENT = 5
 SOURCES: tuple[SourceRef, ...] = (
     SourceRef(
         repository="cann/ops-transformer",
@@ -69,6 +83,18 @@ SOURCES: tuple[SourceRef, ...] = (
         revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
         relative_path="attention/mla_prolog/op_kernel/arch35/kernel_mla_prolog_split_n_arch35.h",
         source_sha256="81d9ca8290a0f65d05bd0c83df45c2581c30cc9007337b0588618603175c9d0e",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="attention/mla_prolog/op_kernel/arch35/mla_prolog_comm_arch35.h",
+        source_sha256="7efde023de09dd6186536b2cc45c76091f3fbed3c211c9f8965690efba453e80",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="attention/mla_prolog/op_kernel/arch35/kernel_mla_prolog_split_m.h",
+        source_sha256="e4a0688375492cfcd23ff528b10381d3a34223539497cec28814322d3d38bee4",
     ),
     SourceRef(
         repository="cann/ops-transformer",
@@ -116,6 +142,41 @@ SOURCES: tuple[SourceRef, ...] = (
 
 DSL_SOURCES = tuple(ref for ref in SOURCES if ref.repository == "cann/cannbot-dsl")
 ACLNN_SOURCES = tuple(ref for ref in SOURCES if ref.repository != "cann/cannbot-dsl")
+
+
+def _dsl_generic_tiling(c: PrologContract, cores: int) -> _GenericTiling:
+    """Keep the generic long-token exchange selected before transfer-window retuning."""
+    tokens, hidden = c.tokens, c.hidden_size
+    decode = tokens <= DSL_TOKEN_RANGE_UPPERS[-1]
+    large_decode = decode and tokens > DSL_DECODE_SPLIT_THRESHOLD
+    mx_pair_width = 2 * MX_GROUP_SIZE
+    splits = DSL_LONG_K_SPLITS if tokens >= DSL_LONG_TOKEN_THRESHOLD else 1
+    if large_decode:
+        splits = DSL_RESIDENT_K_SPLITS
+    elif decode:
+        for candidate in DSL_DECODE_SPLIT_CANDIDATES:
+            if hidden % (candidate * mx_pair_width) == 0 and c.dsl_d_width // mx_pair_width * candidate >= cores:
+                splits = candidate
+                if hidden // candidate <= DSL_DECODE_K_LIMIT:
+                    break
+        if hidden % (DSL_RESIDENT_K_SPLITS * mx_pair_width) == 0:
+            splits = DSL_RESIDENT_K_SPLITS
+    row_limit = DSL_DECODE_MAX_ROWS if decode else DSL_PREFILL_MAX_ROWS
+    token_tile = DSL_LARGE_DECODE_ROWS if large_decode else min(row_limit, ceil_div(tokens, FRACTAL_MN) * FRACTAL_MN)
+    column_limit = DSL_RESIDENT_TILE_WIDTH if decode else DSL_PREFILL_MAX_COLUMNS
+    width = gcd(c.q_lora_rank, c.dsl_d_width)
+    if large_decode:
+        column_limit = DSL_LARGE_DECODE_COLUMNS
+    column_tile = next((n for n in range(column_limit, 0, -FRACTAL_K_BYTE) if width % n == 0), width)
+    reduce_tile = DSL_PREFILL_REDUCE_ROWS if not decode and splits == 1 else 1
+    if decode and DSL_DECODE_REDUCE_THRESHOLD < tokens <= DSL_DECODE_SPLIT_THRESHOLD and splits == DSL_RESIDENT_K_SPLITS:
+        reduce_tile = 2
+    tile_splits = ceil_div(tokens, token_tile) * splits
+    qa_jobs, kv_jobs = (tile_splits * n // column_tile for n in (c.q_lora_rank, c.dsl_d_width))
+    shared = ceil_div(qa_jobs + kv_jobs, cores)
+    separate = ceil_div(qa_jobs, cores) + ceil_div(kv_jobs, cores)
+    split_queue = 100 * (separate - shared) <= DSL_MAX_EXTRA_PROJECTION_WAVE_PERCENT * shared
+    return _GenericTiling(token_tile, column_tile, splits, reduce_tile, split_queue)
 
 
 def _resident_groups(jobs: int, columns: int, cores: int, weight: int, activation: int) -> int:
@@ -208,13 +269,13 @@ def _split_m_owners(ctx: OperatorPlanningContext):
 def _supports(c: PrologContract) -> bool:
     if c.is_dsl:
         return c.weight_quant_mode == WEIGHT_QUANT_MXFP8 and c.kv_cache_quant_mode == 1 and not c.query_quant_mode
-    return c.weight_quant_mode != WEIGHT_QUANT_MXFP8 or c.abi == ABI_V4_NZ
+    return c.weight_quant_mode != WEIGHT_QUANT_MXFP8 or c.abi == UPSTREAM_ABI
 
 
 @dataclass(frozen=True, slots=True)
 class _Arch35Strategy:
     arch_id: ArchId = ARCH_ID
-    abi: str = ABI_V4_NZ
+    abi: str = UPSTREAM_ABI
     sources: tuple[SourceRef, ...] = SOURCES
 
     def accepts(self, op: OpSpec, ctx: OperatorPlanningContext, /) -> bool:
@@ -227,8 +288,11 @@ class _Arch35Strategy:
         if c.is_dsl:
             pairs, alignment = _dsl_owners(op, ctx) if c.tokens else ((), 1)
             resident = _dsl_resident_tiling(c, ctx, len(pairs))
+            generic = _dsl_generic_tiling(c, len(pairs)) if c.tokens and resident is None else None
+            if generic and c.hidden_size % (generic.k_splits * 2 * MX_GROUP_SIZE):
+                raise unsupported(op, ctx, "dsl_generic_split_requires_complete_mx_pairs")
             return build_plan(c, ctx, sources=DSL_SOURCES, mode="dsl", pairs=pairs,
-                              resident=resident, fixpipe_alignment=alignment)
+                              resident=resident, generic=generic, fixpipe_alignment=alignment)
         if uses_split_m(c):
             return build_plan(c, ctx, sources=ACLNN_SOURCES, mode="split_m", pairs=_split_m_owners(ctx))
         return build_plan(c, ctx, sources=ACLNN_SOURCES, mode="split_n")

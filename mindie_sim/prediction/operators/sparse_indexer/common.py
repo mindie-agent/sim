@@ -24,6 +24,7 @@ from ...program import KernelProgram, ParallelProgram, PipelineProgram, RecipeCo
 from ...results import FusedPipelineDescriptor, FusedPipelineSpec, PipelinePhase, WorkItem
 from ...runtime.ring_buffer import RingBuffer
 from ..contracts import OperatorPlanningContext
+from ._lowering import S1Partition, S2Partition, align, ceil_div
 
 FAMILY = "sparse_indexer"
 
@@ -33,6 +34,13 @@ QLI_V2_ABI = "aclnnQuantLightningIndexerV2"
 VLLM_QLI_ABI = "VllmQuantLightningIndexer"
 VLLM_QLI_ABIS = frozenset({VLLM_QLI_ABI, "vllm_quant_lightning_indexer_v2", "npu_quant_lightning_indexer_v2"})
 QSA_ABI = "aclnnLightningIndexerQSA"
+# The manifest's weight-free entry records the analytical overlay's provenance.
+# The mounted QSA caller materializes uniform weights at the native boundary.
+QSA_OVERLAY_SOURCE = SourceRef(
+    repository="mindie-agent/sim", revision="c1bc55e59facc21a6a775da346e7ad7ae4909cfd",
+    relative_path="mindie_sim/stack_sources/vllm_ascend_cann93.json",
+    source_sha256="dbf3251556cdfeb19c7304235e355fef1c6b99136471db93979eb5b587b82277",
+)
 MSA_ABI = "aclnnMsaIndexScore"
 MSA_V2_ABI = "aclnnMsaIndexScoreV2"
 REGION_ABI = "npu_indexer_region_score"
@@ -72,14 +80,6 @@ DEFAULT_S2_TILE = 512
 SCORE_SLOTS = 2
 SCORE_SLOT_NAME = "index_score"
 DEFAULT_INDEX_DIM = 128
-
-
-def ceil_div(n: int, d: int) -> int:
-    return (n + d - 1) // d
-
-
-def align(n: int, granule: int) -> int:
-    return ceil_div(n, granule) * granule
 
 
 def _integer(name: str, value: int, minimum: int = 1) -> None:
@@ -180,8 +180,8 @@ def validate_contract(contract: SparseIndexerContract) -> None:
         raise unsupported("cache_dtype", f"Unsupported index cache dtype {contract.cache_dtype!r}")
     if contract.abi in QUANT_ABIS | {LIGHTNING_V2_ABI} and contract.has_head_weights is not True:
         raise ModelingError(f"sparse_indexer_v2_requires_head_weights:{contract.abi}")
-    if contract.abi == QSA_ABI and contract.has_head_weights:
-        raise ModelingError("sparse_indexer_qsa_is_weight_free")
+    if contract.abi == QSA_ABI and type(contract.has_head_weights) is not bool:
+        raise ModelingError("sparse_indexer_invalid_has_head_weights")
     choice = contract.return_choice
     if choice is not None and (contract.abi not in MSA_ABIS or type(choice) is not int
                                or not 0 <= choice <= MSA_RETURN_INDICES_VALUES):
@@ -191,40 +191,6 @@ def validate_contract(contract: SparseIndexerContract) -> None:
         raise ModelingError("sparse_indexer_msa_block16_disallows_fused_topk")
     if contract.abi == MSA_ABI and contract.fused_topk:
         raise ModelingError("sparse_indexer_msa_v1_returns_scores")
-
-
-@dataclass(frozen=True, slots=True)
-class _S2Partition:
-    """Balanced contiguous intervals of whole S2 tiles and one final tail."""
-
-    rows: int
-    tile_size: int
-    splits: int
-
-    @property
-    def tiles(self) -> int:
-        return ceil_div(self.rows, self.tile_size)
-
-    @property
-    def owners(self) -> int:
-        return min(self.splits, self.tiles)
-
-    def owner_rows(self, split: int) -> int:
-        base, extra = divmod(self.tiles, self.owners)
-        begin = (split * base + min(split, extra)) * self.tile_size
-        count = base + (split < extra)
-        return min(count * self.tile_size, self.rows - begin)
-
-    def variants(self) -> Iterator[tuple[int, int, bool]]:
-        """Distinct owner row counts with multiplicities, independent of S2."""
-        if not self.owners:
-            return
-        base, extra = divmod(self.tiles, self.owners)
-        if extra:
-            yield (base + 1) * self.tile_size, extra, False
-        if self.owners - extra > 1:
-            yield base * self.tile_size, self.owners - extra - 1, False
-        yield self.owner_rows(self.owners - 1), 1, True
 
 
 @dataclass(frozen=True, slots=True)
@@ -254,7 +220,7 @@ def indexer_contract(op: OpSpec, ctx: OperatorPlanningContext, default_abi: str)
     required = {"query_tokens", "scanned_rows", "index_heads", "index_dim"}
     if not required <= raw.keys():
         raise unsupported("missing_geometry", f"{op.op_id} requires {sorted(required - raw.keys())}")
-    raw.setdefault("has_head_weights", abi not in MSA_ABIS | {QSA_ABI})
+    raw.setdefault("has_head_weights", abi not in MSA_ABIS)
     dtype = raw.get("cache_dtype", "bf16").lower()
     raw["cache_dtype"] = _CACHE_ALIASES.get(dtype, dtype)
     raw["abi"] = abi
@@ -315,7 +281,10 @@ class Lowering:
     score_align: int = 1
     slots: int = 1
     gm_score_row: bool = False
-    dual_destination: bool = False
+    aivs_per_aic: int = 1
+    query_block_size: int = 1
+    handoff_query_alignment: int = 1
+    gm_key_staging: bool = False
     score_row_item_bytes: int = FP32_BYTES
     owner_score_row: bool = False
     handoff_item_bytes: int = FP32_BYTES
@@ -325,13 +294,13 @@ class Lowering:
     score_slot_bytes: int = 0
     score_row_read_align: int = 1
 
-    def handoff_bytes(self, rows: int, heads: int) -> int:
-        destinations = 2 if self.dual_destination else 1
-        # A QLI tile has one live query and pads M to two query groups. Each
-        # destination receives a full group, including the padded one.
+    def handoff_bytes(self, rows: int, heads: int, queries: int) -> int:
+        if self.gm_key_staging:
+            rows = self.tile_size
         columns = self.handoff_columns(rows) if self.handoff_columns else align(rows, self.score_align)
-        destination_bytes = columns * heads * self.handoff_item_bytes
-        return destinations * align(destination_bytes, self.handoff_alignment)
+        m = align(queries, self.handoff_query_alignment) * heads
+        destination_bytes = ceil_div(columns * m * self.handoff_item_bytes, self.aivs_per_aic)
+        return self.aivs_per_aic * align(destination_bytes, self.handoff_alignment)
 
 
 def owner_pairs(ctx: OperatorPlanningContext, aivs_per_aic: int) -> tuple[tuple[int, tuple[int, ...]], ...]:
@@ -367,9 +336,12 @@ class _SparseIndexerProgramBuilder:
     aiv_count: int
 
     @property
-    def partition(self) -> _S2Partition:
-        return _S2Partition(self.contract.scanned_rows, self.lowering.tile_size,
-                            self.contract.s2_splits)
+    def partition(self) -> S2Partition:
+        return S2Partition(self.contract.scanned_rows, self.lowering.tile_size, self.contract.s2_splits)
+
+    @property
+    def query_blocks(self) -> S1Partition:
+        return S1Partition(self.contract.query_tokens, self.contract.batch_size, self.lowering.query_block_size)
 
     def owner_entry(self) -> tuple[PhaseWork, ...]:
         c = self.contract
@@ -386,28 +358,42 @@ class _SparseIndexerProgramBuilder:
                 stages.append(vector("prescale_head_weights", c.index_heads))
         return tuple(stages)
 
-    def tile(self, rows: int, index: int, *, reuse: bool, final_owner: bool) -> tuple[PhaseWork, ...]:
+    def tile(self, rows: int, index: int, *, reuse: bool, final_owner: bool,
+             queries: int) -> tuple[PhaseWork, ...]:
         c = self.contract
         g = self.lowering
         valid = min(g.tile_size, rows - index * g.tile_size)
-        scores = valid * c.index_heads
-        score_bytes = g.handoff_bytes(valid, c.index_heads)
+        heads = queries * c.index_heads
+        scores = valid * heads
+        score_bytes = g.handoff_bytes(valid, c.index_heads, queries)
         operand_bytes = c.cache_row_bytes - c.aiv_scale_bytes
         key = valid * operand_bytes
         memory = "l2" if reuse else "hbm"
         score_to_gm = g.score_path == "l0c->gm->ub"
-        stages = [PhaseWork("key_load", Work(resources={memory: key, self.aic_read: key}), True)]
+        if g.gm_key_staging:
+            # The private GM buffer carries a full physical tile even at a
+            # candidate tail. The gather uses the declared live key extent.
+            staged = g.tile_size * c.cache_row_bytes
+            stages = [
+                PhaseWork("key_gather", Work(resources={memory: key, self.aiv_read: key})),
+                PhaseWork("key_stage_store", Work(resources={"hbm": staged, "mte3": staged}),
+                          metadata={"aiv_subblocks": g.aivs_per_aic}),
+                PhaseWork("key_stage_load", Work(resources={"hbm": staged, self.aic_read: staged}), True),
+            ]
+            key = staged
+        else:
+            stages = [PhaseWork("key_load", Work(resources={memory: key, self.aic_read: key}), True)]
         if (scales := valid * c.aiv_scale_bytes):
             stages.append(PhaseWork("key_scale_load", Work(resources={memory: scales, self.aiv_read: scales})))
         stages.extend((
-            PhaseWork("load_operands", Work(resources={"mte1": key + c.index_heads * operand_bytes}), True),
+            PhaseWork("load_operands", Work(resources={"mte1": key + heads * operand_bytes}), True),
             PhaseWork("cube_scores", Work(matrix={c.matrix_dtype: 2 * scores * c.index_dim}), True),
             PhaseWork("score_handoff", Work(resources={
                 "fixpipe": score_bytes, **({"hbm": score_bytes} if score_to_gm else {}),
             }), True, {"route": g.score_path, "score_bytes": score_bytes}),
         ))
         if score_to_gm:
-            weights = c.index_heads * BF16_BYTES if c.has_head_weights else 0
+            weights = heads * g.head_weight_item_bytes if c.has_head_weights else 0
             stages.append(PhaseWork("score_read", Work(resources={
                 "hbm": score_bytes + weights, self.aiv_read: score_bytes + weights,
             }), metadata={"head_weight_bytes": weights}))
@@ -419,22 +405,22 @@ class _SparseIndexerProgramBuilder:
                 stages.append(vector("weighting", scores))
             elif scales:
                 stages.append(vector("query_descale", scores))
-            stages.append(vector("head_reduction", scores - valid))
+            stages.append(vector("head_reduction", scores - queries * valid))
             if scales:
-                stages.append(vector("key_descale", valid))
+                stages.append(vector("key_descale", queries * valid))
         elif score_heads < c.index_heads:
             stages.append(vector("head_maxima", scores - valid))
         candidates = ceil_div(valid, c.block_size)
         if c.block_size > 1:
-            stages.append(vector("block_maxima", (valid - candidates) * score_heads))
+            stages.append(vector("block_maxima", queries * (valid - candidates) * score_heads))
         if c.has_mask3_sort:
-            stages.append(vector("mask3", candidates))
+            stages.append(vector("mask3", queries * candidates))
         if msa:
             final_tile = final_owner and (index + 1) * g.tile_size >= rows
             columns = candidates + (c.msa_score_stride - c.score_items if final_tile else 0)
             stages.append(self._msa_score_store(candidates, columns))
         elif g.gm_score_row or g.owner_score_row or not c.fused_topk:
-            score_row = candidates * (g.score_row_item_bytes if c.fused_topk else FP32_BYTES)
+            score_row = queries * candidates * (g.score_row_item_bytes if c.fused_topk else FP32_BYTES)
             stages.append(PhaseWork("score_row_store", Work(resources={"hbm": score_row, "mte3": score_row})))
         elif g.tile_selection is not None:
             stages.extend(g.tile_selection(c, rows, index, valid, g.tile_size))
@@ -561,16 +547,12 @@ class _SparseIndexerProgramBuilder:
                     totals[phase.name] = totals.get(phase.name, Work()) + phase.work.scaled(count)
 
         c = self.contract
-        fresh_queries = 1 if self.l2_reuse else c.query_tokens
-        cached_queries = c.query_tokens - fresh_queries
         for rows, owners, final_owner in self.partition.variants():
             add(entry, self.owner_entry(), c.query_tokens * owners)
             for index, count in self._tile_variants(rows):
-                add(tiles, self.tile(rows, index, reuse=False, final_owner=final_owner),
-                    fresh_queries * owners * count)
-                if cached_queries:
-                    add(tiles, self.tile(rows, index, reuse=True, final_owner=final_owner),
-                        cached_queries * owners * count)
+                for queries, blocks, reuse in self.query_blocks.variants(self.l2_reuse):
+                    add(tiles, self.tile(rows, index, reuse=reuse, final_owner=final_owner, queries=queries),
+                        blocks * owners * count)
             add(owner_exit, self.owner_exit(rows), c.query_tokens * owners)
         add(query_exit, self.query_exit(), c.query_tokens)
         return {**entry, **tiles, **owner_exit, **query_exit}
@@ -585,19 +567,23 @@ class _SparseIndexerProgramBuilder:
                 placement[name] = tuple(dict.fromkeys((*placement.get(name, ()), *units)))
         return placement
 
-    def _stages(self, ctx: RecipeContext, owner, phases: tuple[PhaseWork, ...]) -> tuple[Stage, ...]:
+    def _stages(self, ctx: RecipeContext, owner, phases: tuple[PhaseWork, ...],
+                queries: int = 1) -> tuple[Stage, ...]:
         stages = []
         for phase in phases:
+            work = phase.work.scaled(queries) if queries > 1 else phase.work
             stages.append(Stage(
-                phase.name, ctx.bind(phase.work),
+                phase.name, ctx.bind(work),
                 after=(stages[-1].name,) if stages else (),
-                placement=self._placement(ctx, owner, phase), metadata=phase.metadata,
+                placement=self._placement(ctx, owner, phase),
+                metadata={**phase.metadata, "query_rows": queries} if queries > 1 else phase.metadata,
             ))
         return tuple(stages)
 
     def _tile_stages(self, ctx: RecipeContext, owner, rows: int, index: int,
-                     reuse: bool, ring: RingBuffer | None, final_owner: bool) -> tuple[Stage, ...]:
-        stages = self._stages(ctx, owner, self.tile(rows, index, reuse=reuse, final_owner=final_owner))
+                     reuse: bool, ring: RingBuffer | None, final_owner: bool, queries: int) -> tuple[Stage, ...]:
+        phases = self.tile(rows, index, reuse=reuse, final_owner=final_owner, queries=queries)
+        stages = self._stages(ctx, owner, phases)
         if ring is None:
             return stages
         slot = ring.slot(index)
@@ -638,36 +624,41 @@ class _SparseIndexerProgramBuilder:
             bound.append(stage)
         return tuple(bound)
 
-    def _owner_program(self, ctx: RecipeContext, owner, split: int, query: int) -> KernelProgram:
+    def _owner_program(self, ctx: RecipeContext, owner, split: int, reuse: bool, queries: int) -> KernelProgram:
         rows = self.partition.owner_rows(split)
         g = self.lowering
-        ring = RingBuffer(depth=SCORE_SLOTS, allocation=SCORE_SLOT_NAME) if g.dual_destination else None
-        reuse = self.l2_reuse and query > 0
-        entry = self._stages(ctx, owner, self.owner_entry())
+        ring = RingBuffer(depth=g.slots, allocation=SCORE_SLOT_NAME) if g.aivs_per_aic > 1 else None
+        entry = self._stages(ctx, owner, self.owner_entry(), queries)
         tiles = PipelineProgram(
             ceil_div(rows, g.tile_size), ring.depth if ring is not None else g.slots,
             lambda index: self._tile_stages(ctx, owner, rows, index, reuse, ring,
-                                            split == self.partition.owners - 1),
+                                            split == self.partition.owners - 1, queries),
         )
         body = Stage("score_tiles", after=(entry[-1].name,), program=tiles)
-        end = self._stages(ctx, owner, self.owner_exit(rows))
+        selection_owner = (owner[0], owner[1][:1]) if g.gm_key_staging else owner
+        end = self._stages(ctx, selection_owner, self.owner_exit(rows), queries)
         if end:
             end = (replace(end[0], after=(body.name,)), *end[1:])
         return KernelProgram((*entry, body, *end))
 
-    def _query_program(self, ctx: RecipeContext, owner_index: int, query: int) -> tuple[Stage, ...]:
+    def _query_program(self, ctx: RecipeContext, owner_index: int, block: int) -> tuple[Stage, ...]:
         split_count = self.partition.owners
         concurrent = min(split_count, len(self.owners))
+        queries = self.query_blocks.live_rows(block)
+        reuse = self.l2_reuse and block > 0
         streams = []
         for lane in range(concurrent):
             owner = self.owners[(owner_index + lane) % len(self.owners)]
             streams.append(PipelineProgram(
                 ceil_div(split_count - lane, concurrent), 1,
                 lambda index, lane=lane, owner=owner: (
-                    Stage("s2_owner", program=self._owner_program(ctx, owner, index * concurrent + lane, query)),
+                    Stage("s2_owner", program=self._owner_program(ctx, owner, index * concurrent + lane,
+                                                                reuse, queries)),
                 ),
             ))
-        exit_stages = self._stages(ctx, self.owners[owner_index], self.query_exit())
+        aic, aivs = self.owners[owner_index]
+        selection_owner = (aic, aivs[:1] if self.lowering.gm_key_staging else aivs)
+        exit_stages = self._stages(ctx, selection_owner, self.query_exit(), queries)
         if not streams:
             return exit_stages
         body = Stage("s2_owners", program=ParallelProgram(tuple(streams)))
@@ -676,14 +667,14 @@ class _SparseIndexerProgramBuilder:
         return (body, *exit_stages)
 
     def __call__(self, ctx: RecipeContext) -> ParallelProgram | _DisjointOwnerProgram:
-        queries = self.contract.query_tokens
+        blocks = self.query_blocks.count
         # Shared-prefix reuse is admitted only if the complete key stream
-        # fits, with the first query establishing residency before reuse.
+        # fits, with the first query block establishing residency before reuse.
         width = 1 if self.l2_reuse else max(1, len(self.owners) // max(1, self.partition.owners))
-        count = min(queries, width)
+        count = min(blocks, width)
         placed = ParallelProgram(tuple(
             PipelineProgram(
-                ceil_div(queries - lane, count), 1,
+                ceil_div(blocks - lane, count), 1,
                 lambda index, lane=lane: self._query_program(
                     ctx, lane * max(1, self.partition.owners), index * count + lane),
             )

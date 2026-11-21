@@ -12,7 +12,7 @@ from mindie_sim.schema.datapath import GENERIC_ARCH_ID, ArchId, ComputeArchIdent
 from mindie_sim.schema.operators import OpSpec
 
 from ...mechanism import Geometry, OperatorPlan, PlannedRecipe
-from ...results import OpOccurrence
+from ...results import FusedPipelineDescriptor, OpOccurrence
 from ..contracts import OperatorFamilySpec, OperatorPlanningContext, ResolvedOperator
 from . import arch22 as _arch22, arch35 as _arch35
 from .common import (
@@ -34,7 +34,6 @@ from .common import (
     WEIGHT_QUANT_INT8,
     WEIGHT_QUANT_MXFP8,
     PrologContract,
-    describe,
     make_op,
     unsupported,
     uses_split_m,
@@ -74,9 +73,17 @@ def build(op: OpSpec, geometry_or_ctx: Geometry | OperatorPlanningContext) -> Op
     return strategy.build(op, ctx)
 
 
+def _describe(op: OpSpec, ctx: OperatorPlanningContext, plan: OperatorPlan) -> FusedPipelineDescriptor:
+    spec = plan.pipeline_spec
+    return FusedPipelineDescriptor(
+        ctx.occurrence, spec.family, spec.implementation, (op.op_id,), (),
+        spec.phases, spec.sources, spec.repeats,
+    )
+
+
 def resolve_operator_plan(op: OpSpec, ctx: OperatorPlanningContext) -> ResolvedOperator:
     plan = build(op, ctx)
-    descriptor = describe(op, ctx, plan)
+    descriptor = _describe(op, ctx, plan)
     return ResolvedOperator(
         occurrence=ctx.occurrence, op=op, recipe=plan, implementation=descriptor.implementation,
         sources=descriptor.sources, descriptor=descriptor,

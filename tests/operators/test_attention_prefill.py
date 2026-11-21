@@ -200,6 +200,10 @@ def test_shipping_scores_charge_the_tile_rectangle_before_causal_masking():
     assert issued == 16_777_216 and useful == 8_454_144
     assert plan.metadata["useful_flops"] == useful * 2
     assert plan.work.matrix["bf16"] == issued * 2
+    phases = {phase.name: phase for phase in plan.program.phases}
+    assert phases["score_fixpipe"].work.resources["fixpipe"] == 128 * 128 * 4
+    assert phases["pv_fixpipe"].work.resources["fixpipe"] == 128 * 512 * 4
+    assert phases["online_output"].after == ("pv_fixpipe",)
     audit = verify_operator(case, op, governed.build, input_ready_ms=7)
     assert audit["status"] == "passed" and audit["work_mismatches"] == {}
 

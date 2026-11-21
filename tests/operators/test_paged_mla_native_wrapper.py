@@ -21,7 +21,7 @@ from mindie_sim.prediction.cost import CostModel
 from mindie_sim.prediction.engine import Engine
 from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.frontend import Frontend
-from mindie_sim.prediction.mechanism import Geometry, PlannedRecipe
+from mindie_sim.prediction.mechanism import Geometry, PlannedRecipe, Work
 from mindie_sim.prediction.operators import FamilyRegistry, paged_mla as governed
 from mindie_sim.prediction.operators.paged_mla import DSL_FLASH_ABI, FIA_ABI, FLASH_ABI
 from mindie_sim.prediction.program import RecipeBook
@@ -119,17 +119,18 @@ def test_split_grid_tails_and_ledgers_conserve_source_work(hardware, abi, length
     case, geometry = _case_and_geometry(hardware)
     operator = _make_operator(lengths, abi=abi, heads=heads, s2_base_size=32, return_lse=True, splits=splits)
     _, plan, context = _prepare(case, geometry, operator)
-    assert plan.metadata["key_tile"] == 32
+    tile = 32 if abi == FIA_ABI else 112
+    assert plan.metadata["key_tile"] == tile
     groups_per_request = ceil(heads / 16) if abi == FIA_ABI else 1
     queries = tuple(_queries(plan.program(context)))
     assert len(queries) == len(lengths) * groups_per_request
     for length, group in zip((n for n in lengths for _ in range(groups_per_request)), queries, strict=True):
-        ntiles = ceil(length / 32)
+        ntiles = ceil(length / tile)
         parts = min(ntiles, splits)
         intervals = _split_keys(group)
         assert len(intervals) == parts
         assert [pair for part in intervals for pair in part] == [
-            (i, min(32, length - i * 32)) for i in range(ntiles)
+            (i, min(tile, length - i * tile)) for i in range(ntiles)
         ]
         if parts:
             assert max(map(len, intervals)) - min(map(len, intervals)) <= 1
@@ -145,6 +146,21 @@ def test_split_grid_tails_and_ledgers_conserve_source_work(hardware, abi, length
     result = report["result"]
     assert result["operator"]["flops"] == plan.work.matrix["bf16"]
     assert result["serviced"] == pytest.approx(result["declared_service"])
+
+
+@pytest.mark.parametrize("abi", [FLASH_ABI, DSL_FLASH_ABI])
+@pytest.mark.parametrize("keys,widths", [(112, (112,)), (113, (112, 1))])
+def test_flash_mla_uses_fixed_key_tile_and_trims_only_the_tail(abi, keys, widths):
+    case, geometry = _case_and_geometry(DIRECT_DIE)
+    operator = _make_operator((keys,), abi=abi, s2_base_size=32)
+    _, plan, context = _prepare(case, geometry, operator)
+    (group,) = _queries(plan.program(context))
+    (split,) = _splits(group)
+    assert _split_keys(group) == [tuple(enumerate(widths))]
+    qk = tuple(_stages(split, "qk"))
+    assert [stage.metadata["kv_tile"] for stage in qk] == list(range(len(widths)))
+    assert [stage.work for stage in qk] == [context.bind(Work({"bf16": 2 * 8 * width * DQK}))
+                                            for width in widths]
 
 
 @pytest.mark.parametrize("fixture,hardware,abi", [
@@ -311,7 +327,7 @@ def test_large_split_grid_and_long_context_lower_lazily():
     assert full.stages[0].program.count == 2
     programs = tuple(_splits(full))
     assert len(programs) == 8 and all(p.slots == 3 for p in programs)
-    assert sum(p.count - (p.slots - 1) for p in programs) == ceil(131073 / 96)
+    assert sum(p.count - (p.slots - 1) for p in programs) == ceil(131073 / 112)
     assert tail.stages[0].program.count == 1 and len(tuple(_splits(tail))) == 1
     _, trace, _ = _simulate(case, geometry, _make_operator((769,), splits=4))
     fixpipe_stages = [event for event in trace if any(
@@ -399,7 +415,7 @@ def test_structure_work_and_layout_follow_the_captured_tensor_extents(monkeypatc
     assert summed["launches"] == 2
 
 
-@pytest.mark.parametrize("length,latent,rope,splits", [(17, 12, 4, 5), (3, LATENT, ROPE, 7)])
+@pytest.mark.parametrize("length,latent,rope,splits", [(449, 12, 4, 5), (113, LATENT, ROPE, 7)])
 def test_normalized_split_outputs_merge_by_logsumexp(length, latent, rope, splits):
     case, geometry = _case_and_geometry(DIRECT_DIE)
     operator = _make_operator((length,), heads=4, abi=DSL_FLASH_ABI, latent_dim=latent, rope_dim=rope,
@@ -407,7 +423,7 @@ def test_normalized_split_outputs_merge_by_logsumexp(length, latent, rope, split
     _, plan, context = _prepare(case, geometry, operator)
     (query_group,) = _queries(plan.program(context))
     intervals = [tuple(s.metadata["kv_tile"] for s in _stages(split, "kv_load")) for split in _splits(query_group)]
-    spans = [np.arange(tiles[0] * 3, min(length, (tiles[-1] + 1) * 3)) for tiles in intervals]
+    spans = [np.arange(tiles[0] * 112, min(length, (tiles[-1] + 1) * 112)) for tiles in intervals]
     assert [i for span in spans for i in span] == list(range(length))
     rng = np.random.default_rng(7301)
     query, key = rng.normal(size=(4, latent + rope)), rng.normal(size=(length, latent + rope))

@@ -19,10 +19,14 @@ from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.operators import OpSpec
 
 from ...mechanism import OperatorPlan, Work
-from ...results import FusedPipelineDescriptor
-from ...runtime.memory_physics import AddressRun, AddressRunPlan
+from ...runtime.memory_physics import AddressRunPlan
 from ..contracts import OperatorPlanningContext
-from ._lowering import _Chunk, _Demand, _Phase, _PrologProgramBuilder, _summarize, _transfer
+from ._lowering import (
+    BF16_BYTES, FP32_BYTES, FRACTAL_K_BF16, FRACTAL_K_BYTE, FRACTAL_MN, MX_GROUP_SIZE,
+    _Chunk, _Demand, _GenericTiling, _Phase, _PrologProgramBuilder, _ResidentTiling,
+    _activation, _align, _dual_rows, _generic_projection, _parts, _plane, _repeat_demand, _summarize, _transfer, _weight,
+    ceil_div, fractal_issues,
+)
 
 FAMILY = "mla_prolog"
 MLA_PROLOG_V4_RECIPE = "mla_prolog_v4_arch35"
@@ -37,6 +41,10 @@ WEIGHT_QUANT_INT8 = 2
 WEIGHT_QUANT_MXFP8 = 3
 SUPPORTED_WEIGHT_MODES = frozenset({WEIGHT_QUANT_BF16, WEIGHT_QUANT_INT8, WEIGHT_QUANT_MXFP8})
 PRECISIONS = {WEIGHT_QUANT_BF16: "bf16", WEIGHT_QUANT_INT8: "int8", WEIGHT_QUANT_MXFP8: "fp8_e4m3"}
+INT32_BYTES = 4
+# Cq and Ckv/Kr follow X_T, and Qc/Qr follows W_T. The governed full-quant
+# contracts use matching X_T and W_T. Arch22 admits BF16 and INT8 only.
+MATMUL_OUTPUT_BYTES = {"bf16": BF16_BYTES, "int8": INT32_BYTES, "fp8_e4m3": FP32_BYTES}
 DEFAULT_PROLOG_HIDDEN = 7168
 DEFAULT_PROLOG_HEADS = 16
 DEFAULT_Q_LORA_RANK = 1536
@@ -49,18 +57,13 @@ CACHE_MODES = PAGED_CACHE_MODES | {"BNSD", "BSND", "TND"}
 SPLIT_M_MIN_TOKENS = 8192
 SPLIT_M_HIDDEN_SIZES = frozenset({7168, 7680})
 SPLIT_M_HEADS = 128
-FRACTAL_MN = 16
-FRACTAL_K_BF16 = 16
-FRACTAL_K_BYTE = 32
-BF16_BYTES = 2
-FP32_BYTES = 4
 SLOT_INDEX_BYTES = 8
-MX_GROUP_SIZE = 32
 C8_BLOCK_SIZE = 128
 RMSNORM_OPS_PER_ELEM = 5
 MX_QUANT_OPS_PER_ELEM = 4
 C8_QUANT_OPS_PER_ELEM = 4
 ROPE_OPS_PER_ELEM = 6
+COMPENSATED_SUM_OPS_PER_ELEM = 4
 MATRIX_N_MIN = 64
 KV_FIXED_N_MIN_AIC = 9
 GROUP_COMPUTE_MIN_HEADS = 8
@@ -68,18 +71,6 @@ CQ_SCALE_SLOT_BYTES = 32
 DEFAULT_STEP_BATCH = 128
 WAVE_STEP_BATCH = 64
 HIGH_THROUGHPUT_NOPE_WIDTH = 128
-
-
-@dataclass(frozen=True, slots=True)
-class _ResidentTiling:
-    token_tile: int
-    token_tiles: int
-    k_splits: int
-    column_tile: int
-    panel: int
-    a_groups: int
-    b_groups: int
-    gm_alignment: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,14 +117,6 @@ class PrologContract:
         return latent + rope * BF16_BYTES + ceil_div(latent, self.tile_size) * scale_bytes
 
 
-def ceil_div(value: int, divisor: int) -> int:
-    return -(-value // divisor)
-
-
-def _align(value: int, multiple: int) -> int:
-    return ceil_div(value, multiple) * multiple
-
-
 def w_uk_ownership(num_heads: int, aic_cores: int) -> tuple[int, int]:
     if num_heads < 0 or aic_cores <= 0:
         raise ModelingError("mla_prolog_invalid_w_uk_geometry")
@@ -141,14 +124,6 @@ def w_uk_ownership(num_heads: int, aic_cores: int) -> tuple[int, int]:
         return 0, 0
     heads_per_owner = ceil_div(num_heads, aic_cores)
     return heads_per_owner, ceil_div(num_heads, heads_per_owner)
-
-
-def fractal_issues(m: int, n: int, k: int, k0: int) -> tuple[int, int]:
-    """Return the issue count and corresponding issued FLOPs."""
-    if min(m, n, k) < 0 or k0 not in {FRACTAL_K_BF16, FRACTAL_K_BYTE}:
-        raise ModelingError("mla_prolog_invalid_fractal_geometry")
-    issues = ceil_div(m, FRACTAL_MN) * ceil_div(n, FRACTAL_MN) * ceil_div(k, k0)
-    return issues, 2 * issues * FRACTAL_MN * FRACTAL_MN * k0
 
 
 def uses_split_m(contract: PrologContract) -> bool:
@@ -321,37 +296,6 @@ def unsupported(op: OpSpec, ctx: OperatorPlanningContext, reason: str) -> Unmode
     )
 
 
-def _plane(rows: int, width: int, *, stride: int | None = None, offset: int = 0) -> AddressRun:
-    return AddressRun(offset, rows, width, width if stride is None else stride)
-
-
-def _parts(size: int, count: int) -> tuple[int, ...]:
-    base, large = divmod(size, count)
-    return tuple(base + (owner < large) for owner in range(count))
-
-
-def _dual_rows(rows: int) -> tuple[int, int]:
-    first = min(rows, _align(rows, FRACTAL_MN) // 2)
-    return first, rows - first
-
-
-def _activation(width: int, dtype: str) -> int:
-    if dtype == "bf16":
-        return width * BF16_BYTES
-    if dtype == "int8":
-        return width + FP32_BYTES
-    return width + ceil_div(width, MX_GROUP_SIZE)
-
-
-def _weight(n: int, k: int, dtype: str, k0: int) -> tuple[AddressRun, ...]:
-    size = BF16_BYTES if dtype == "bf16" else 1
-    payload = _plane(_align(n, FRACTAL_MN), _align(k, k0) * size)
-    if dtype == "bf16":
-        return (payload,)
-    scales = FP32_BYTES if dtype == "int8" else ceil_div(k, MX_GROUP_SIZE)
-    return payload, _plane(n, scales)
-
-
 @dataclass
 class _ChunkGraph:
     contract: PrologContract
@@ -367,8 +311,9 @@ class _ChunkGraph:
         self.phases.append(_Phase(name, after, tuple(demands)))
         return name
 
-    def matrix(self, product, after=(), *, acc_bytes: int):
+    def matrix(self, product, after=()):
         name, n, k, groups, dtype = product
+        acc_bytes = MATMUL_OUTPUT_BYTES[dtype]
         k0 = FRACTAL_K_BF16 if dtype == "bf16" else FRACTAL_K_BYTE
         c, rows = self.contract, self.rows
         if groups > 1 or name == "mm4_w_uk":
@@ -445,9 +390,10 @@ class _ChunkGraph:
         current = after
         if read_rows or params:
             load = self.add(name + "_mte2_aiv", current, (
-                _transfer(owner, "aiv", "mte2_aiv", name,
-                          _plane(rows, read_rows), _plane(1, params), l2=self.l2)
+                _transfer(owner, "aiv", "mte2_aiv", tensor, run, l2=self.l2)
                 for owner, rows in work
+                for tensor, run in ((name, _plane(rows, read_rows)), (name + "_params", _plane(1, params)))
+                if run.row_bytes
             ))
             current = (load,)
         compute = self.add(name + "_vector", current, (
@@ -610,33 +556,103 @@ class _ChunkGraph:
         ub = self.resident_b(t, pairs, qr)
         return _Chunk(1, tuple(self.phases), t.token_tiles * t.token_tile * t.k_splits * (rank + head) * FP32_BYTES, ub)
 
+    def lower_generic(self, t: _GenericTiling, pairs, gm_alignment: int) -> _Chunk:
+        c = self.contract
+        mm1, mm2, mm3 = _products(c)
+        rank, head = mm1[1], mm2[1]
+        padded = _align(self.rows, t.token_tile)
+        qa_jobs = padded // t.token_tile * (rank // t.column_tile) * t.k_splits
+        writes = []
+        for product, start in ((mm1, 0), (mm2, 0 if t.separate_projections else qa_jobs)):
+            name, width, hidden, _, _ = product
+            loads, operands, cubes, stores = _generic_projection(
+                name, self.rows, width, hidden, self.aics, t, start, l2=self.l2, alignment=gm_alignment,
+            )
+            load = self.add(name + "_mte2_aic", tuple(writes) if t.separate_projections else (), loads)
+            operand = self.add(name + "_mte1", (load,), operands)
+            cube = self.add(name + "_cube", (operand,), cubes)
+            writes.append(self.add(name + "_fixpipe_gm", (cube,), stores))
+
+        full, tail = divmod(self.rows, t.reduce_tile)
+        work = tuple((owner, tiles * t.reduce_tile + (tail if lane == full % len(self.aivs) else 0))
+                     for lane, (owner, tiles) in enumerate(zip(self.aivs, _parts(full, len(self.aivs)))))
+        work = tuple((owner, rows) for owner, rows in work if rows)
+        qa_dep = (writes[0],) if t.separate_projections else tuple(writes)
+        qa = self.generic_reduce("qa_partials", rank, qa_dep, t, work, COMPENSATED_SUM_OPS_PER_ELEM)
+        qr = self.vector("cq_norm", (qa,), params=rank * FP32_BYTES, owners_work=work,
+                         ops=rank * (RMSNORM_OPS_PER_ELEM + MX_QUANT_OPS_PER_ELEM), write_rows=_activation(rank, c.precision))
+        if c.emit_query_norm_out:
+            self.add("query_norm_out_mte3_gm", (qr,), (
+                _transfer(owner, "aiv", "mte3", "query_norm_out", _plane(rows, rank * BF16_BYTES),
+                          write=True, l2=self.l2) for owner, rows in work
+            ))
+        kv = self.generic_reduce("kv_partials", head, (writes[1], qr), t, work, 1)
+        rope = c.qk_rope_head_dim if c.do_rope else 0
+        self.vector("kv_cache", (kv,), params=head * FP32_BYTES, owners_work=work,
+                    read_rows=2 * rope * FP32_BYTES + (SLOT_INDEX_BYTES if c.cache_mode in PAGED_CACHE_MODES else 0),
+                    ops=head * (RMSNORM_OPS_PER_ELEM + C8_QUANT_OPS_PER_ELEM) + rope * ROPE_OPS_PER_ELEM,
+                    write_rows=c.kv_row_bytes)
+        self.generic_b(mm3, qr, pairs)
+        return _Chunk(1, tuple(self.phases), padded * t.k_splits * (rank + head) * FP32_BYTES)
+
+    def generic_reduce(self, name, width, after, t: _GenericTiling, work, ops_per_addition) -> str:
+        splits, row_bytes = t.k_splits, width * FP32_BYTES
+        read = self.add(name + "_mte2_aiv", after, (
+            _transfer(owner, "aiv", "mte2_aiv", name, _plane(_align(rows, t.reduce_tile) * splits, row_bytes),
+                      l2=self.l2, logical_bytes=rows * splits * row_bytes)
+            for owner, rows in work
+        ))
+        if splits == 1:
+            return read
+        return self.vector(name + "_reduce", (read,), owners_work=work,
+                           ops=width * (splits - 1) * ops_per_addition)
+
+    def generic_b(self, mm3, qr, pairs) -> None:
+        # Fold the existing per-pair QB step batches into phases after the shared QR publication.
+        c = self.contract
+        rope = c.qk_rope_head_dim if c.do_rope else 0
+        step = step_batch(c)
+        phases: dict[str, tuple[tuple[str, ...], list[_Demand]]] = {}
+        for (owner, peers), rows in zip(pairs, _parts(self.rows, len(pairs))):
+            full, tail = divmod(rows, step)
+            for size, count in ((step, full), (tail, int(bool(tail)))):
+                if not count:
+                    continue
+                qb = replace(self, rows=size, aics=(owner,), aivs=peers, phases=[])
+                query = qb.matrix(mm3, (qr,))
+                qb.vector("query_out", (query,), read_rows=2 * rope * FP32_BYTES,
+                          ops=c.num_heads * (c.dsl_d_width + rope * ROPE_OPS_PER_ELEM),
+                          write_rows=mm3[1] * BF16_BYTES)
+                for phase in qb.phases:
+                    _, demands = phases.setdefault(phase.name, (phase.after, []))
+                    demands.extend(_repeat_demand(demand, count) for demand in phase.demands)
+        for name, (after, demands) in phases.items():
+            self.add(name, after, demands)
+
     def lower(self, count: int) -> _Chunk:
         c = self.contract
         rank, latent, heads = c.q_lora_rank, c.kv_lora_rank, c.num_heads
         nope, rope = c.qk_nope_head_dim, c.qk_rope_head_dim
-        kv_width = c.dsl_d_width if c.is_dsl else latent + rope
-        q_width = heads * (c.dsl_d_width if c.is_dsl else nope + rope)
         quantized = c.weight_quant_mode != WEIGHT_QUANT_BF16
         int8 = c.weight_quant_mode == WEIGHT_QUANT_INT8
-        acc_bytes = FP32_BYTES if int8 or c.is_dsl else BF16_BYTES
-        norm_param_bytes = FP32_BYTES if c.is_dsl else BF16_BYTES
         norm_row = _activation(rank, c.precision)
         rope_ops = rope * ROPE_OPS_PER_ELEM if c.do_rope else 0
         rope_tables = 2 * rope * FP32_BYTES if c.do_rope else 0
         mm1, mm2, mm3, *uk = _products(c)
-        cq = self.matrix(mm1, acc_bytes=acc_bytes)
-        ckv = self.matrix(mm2, acc_bytes=acc_bytes)
+        cq_bytes, ckv_bytes, qcqr_bytes = (MATMUL_OUTPUT_BYTES[p[-1]] for p in (mm1, mm2, mm3))
+        cq = self.matrix(mm1)
+        ckv = self.matrix(mm2)
         self.vector(
-            "kv_cache", (ckv,), read_rows=(0 if c.is_dsl else kv_width * acc_bytes)
+            "kv_cache", (ckv,), read_rows=mm2[1] * ckv_bytes
             + rope_tables + (SLOT_INDEX_BYTES if c.cache_mode in PAGED_CACHE_MODES else 0),
-            params=(kv_width if c.is_dsl else latent) * norm_param_bytes,
-            ops=(kv_width if c.is_dsl else latent) * RMSNORM_OPS_PER_ELEM + rope_ops
-            + (C8_QUANT_OPS_PER_ELEM * (kv_width if c.is_dsl else latent) if c.kv_cache_quant_mode else 0),
+            params=latent * BF16_BYTES,
+            ops=latent * RMSNORM_OPS_PER_ELEM + rope_ops
+            + (C8_QUANT_OPS_PER_ELEM * latent if c.kv_cache_quant_mode else 0),
             write_rows=c.kv_row_bytes,
         )
         cq_norm = self.vector(
-            "cq_norm", (cq,), read_rows=0 if c.is_dsl else rank * acc_bytes,
-            params=rank * norm_param_bytes, ops=rank * (
+            "cq_norm", (cq,), read_rows=rank * cq_bytes,
+            params=rank * BF16_BYTES, ops=rank * (
                 RMSNORM_OPS_PER_ELEM + (MX_QUANT_OPS_PER_ELEM if quantized else 0)
             ), write_rows=norm_row, publish_scale=bool(self.cq_scale_slot_rows),
         )
@@ -648,35 +664,23 @@ class _ChunkGraph:
                           _plane(self.cq_scale_slot_rows, CQ_SCALE_SLOT_BYTES), l2=self.l2)
                 for owner in self.aivs
             )),)
-        if c.is_dsl and c.emit_query_norm_out:
-            self.add("query_norm_out_mte3_gm", (cq_norm,), (
-                _transfer(owner, "aiv", "mte3", "query_norm_out", _plane(rows, rank * BF16_BYTES),
-                          write=True, l2=self.l2)
-                for owner, rows in zip(self.aivs, _dual_rows(self.rows)) if rows
-            ))
-        query = self.matrix(mm3, cq_ready, acc_bytes=acc_bytes)
-        if c.is_dsl:
-            self.vector("query_out", (query,), read_rows=rope_tables,
-                        ops=heads * (c.dsl_d_width + rope_ops), write_rows=q_width * BF16_BYTES)
-            return _Chunk(count, tuple(self.phases), 0)
-
+        query = self.matrix(mm3, cq_ready)
         qc = query
         if quantized:
-            qc = self.vector("qc_dequant", (query,), read_rows=q_width * acc_bytes,
+            qc = self.vector("qc_dequant", (query,), read_rows=heads * nope * qcqr_bytes,
                              ops=heads * nope, write_rows=heads * nope * BF16_BYTES)
         if rope:
-            self.vector("query_rope", (query,), read_rows=heads * rope * acc_bytes + rope_tables,
+            self.vector("query_rope", (query,), read_rows=heads * rope * qcqr_bytes + rope_tables,
                         ops=heads * (rope_ops + (rope if int8 else 0)),
                         write_rows=heads * rope * BF16_BYTES)
-        absorb = self.matrix(uk[0], (qc,), acc_bytes=BF16_BYTES)
+        absorb = self.matrix(uk[0], (qc,))
         if c.query_quant_mode:
             self.vector("query_quant", (absorb,), read_rows=heads * latent * BF16_BYTES,
                         ops=heads * latent * C8_QUANT_OPS_PER_ELEM,
                         write_rows=heads * (latent + FP32_BYTES))
-        cq_bytes = rank * acc_bytes if c.emit_query_norm_out else (
-            rank * acc_bytes + norm_row if quantized else norm_row
-        )
-        workspace = cq_bytes + (kv_width + q_width) * acc_bytes
+        workspace = rank * cq_bytes + mm2[1] * ckv_bytes + mm3[1] * qcqr_bytes
+        if quantized and not c.emit_query_norm_out:
+            workspace += norm_row
         if quantized:
             workspace += heads * nope * BF16_BYTES
         if c.query_quant_mode:
@@ -686,7 +690,8 @@ class _ChunkGraph:
 
 def build_plan(
     c: PrologContract, ctx: OperatorPlanningContext, *, sources: tuple[SourceRef, ...],
-    mode: str, resident: _ResidentTiling | None = None, fixpipe_alignment: int | None = None,
+    mode: str, resident: _ResidentTiling | None = None, generic: _GenericTiling | None = None,
+    fixpipe_alignment: int | None = None,
     pairs: tuple[tuple[int, tuple[int, ...]], ...] = (),
     cq_scale: bool = False,
 ) -> OperatorPlan:
@@ -694,13 +699,14 @@ def build_plan(
     split_m = mode == "split_m"
     if min(aic, aiv) < 1 and c.tokens:
         raise ModelingError("mla_prolog_requires_aic_and_aiv_owners")
-    chunk_size = resident.token_tile if resident else step_batch(c)
+    dsl_tiling = resident or generic
+    chunk_size = dsl_tiling.token_tile if dsl_tiling else step_batch(c)
     if not c.is_dsl and c.tokens and ctx.datapath.usable_paths:
         fixpipe_alignment = ctx.datapath.route("l0c", "gm").path.alignment_bytes
     l2 = "l2" in ctx.geometry.rates or "l2" in ctx.geometry.resource_units
     groups = []
-    if c.tokens and not resident:
-        if c.is_dsl or split_m:
+    if c.tokens and not c.is_dsl:
+        if split_m:
             groups = [(rows, (owner,), peers) for (owner, peers), rows in zip(
                 pairs, _parts(c.tokens, len(pairs)), strict=True,
             ) if rows]
@@ -708,11 +714,15 @@ def build_plan(
             groups = [(c.tokens, tuple(range(aic)), tuple(range(aiv)))]
 
     programs = []
-    if resident:
+    if dsl_tiling:
         aics = tuple(owner for owner, _ in pairs)
         aivs = tuple(peer for _, peers in pairs for peer in peers)
         graph = _ChunkGraph(c, c.tokens, aics, aivs, l2, fixpipe_alignment, [])
-        programs.append((graph.lower_resident(resident, pairs),))
+        if resident:
+            programs.append((graph.lower_resident(resident, pairs),))
+        elif generic:
+            gm_alignment = ctx.datapath.route("l0c", "gm").path.alignment_bytes
+            programs.append((graph.lower_generic(generic, pairs, gm_alignment),))
     for rows, aics, aivs in groups:
         full, tail = divmod(rows, chunk_size)
         programs.append(tuple(
@@ -730,18 +740,10 @@ def build_plan(
         "execution_class": "mixed_aic_aiv", "governed_family": FAMILY,
         "arch_id": str(ctx.compute_arch.arch_id), "implementation": c.abi,
         "split_mode": mode, "step_batch": chunk_size, "l1_reuse": resident is not None,
-        "k_splits": resident.k_splits if resident else 1,
+        "k_splits": dsl_tiling.k_splits if dsl_tiling else 1,
         "heads_per_owner": per, "w_uk_owners": owners, "kv_row_bytes": c.kv_row_bytes,
         "weight_quant_mode": c.weight_quant_mode, "kv_cache_quant_mode": c.kv_cache_quant_mode,
         "do_rope": c.do_rope, "logical_flops": c.logical_flops, "source_program": sources[0].to_dict(),
         "issued_flops": sum(work.matrix.values()),
         "workspace_slot_bytes": sum(max(chunk.workspace_bytes for chunk in group) for group in programs),
     }, pipeline_spec=spec)
-
-
-def describe(op: OpSpec, ctx: OperatorPlanningContext, plan: OperatorPlan) -> FusedPipelineDescriptor:
-    spec = plan.pipeline_spec
-    return FusedPipelineDescriptor(
-        ctx.occurrence, spec.family, spec.implementation, (op.op_id,), (),
-        spec.phases, spec.sources, spec.repeats,
-    )

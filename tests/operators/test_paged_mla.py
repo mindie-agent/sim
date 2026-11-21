@@ -113,7 +113,7 @@ def test_governed_dense_work_survives_serialization(hardware, s2):
         totals[item.resource] += item.amount
     assert dict(totals) == plan.work.resources | {"cube": 2 * keys * physical * (DQK + LATENT)}
     program, trace = _execute(operator, restored, geometry)
-    key_tile = min(s2, 112) if direct else s2
+    key_tile = 112 if direct else s2
     tiles = ceil(keys / key_tile)
     stages = _tiles(program.tile(0)[0].program)
     assert [s.metadata["key_logical_bytes"] for s in _phase(stages, "kv_load")] == [
@@ -150,7 +150,7 @@ def test_direct_routes_are_required_and_serviced(abi):
             governed.build(operator, replace(geometry, datapath=datapath))
     assert geometry.datapath.route("l0c", "ub").path.unit == "fixpipe"
 
-@pytest.mark.parametrize("keys,splits", [(0, 8), (3, 8), (11, 2), (11, 4)])
+@pytest.mark.parametrize("keys,splits", [(0, 8), (3, 8), (225, 2), (337, 4)])
 def test_split_softmax_state_bytes_and_stable_merge(keys, splits):
     operator = governed.make_op(sequences=((1, keys),), logical_heads=2, physical_heads=4,
                                 return_lse=True, abi=FLASH_ABI, s2_base_size=3, splits=splits)
@@ -158,11 +158,12 @@ def test_split_softmax_state_bytes_and_stable_merge(keys, splits):
     plan = governed.build(operator, geometry)
     program, _ = _execute(operator, plan, geometry)
     finish = {s.name: s for s in program.tile(0)[0].program.stages}
-    partials = min(splits, -(-keys // 3))
-    if not keys:
+    partials = min(splits, ceil(keys / 112))
+    if partials < 2:
         assert set(finish) == {"splits", "normalize", "store"}
-        assert not finish["normalize"].work and finish["splits"].program.count == 0
-        assert not plan.work.matrix
+        assert bool(finish["normalize"].work) == bool(keys)
+        assert finish["splits"].program.count == partials
+        assert bool(plan.work.matrix) == bool(keys)
         return
     assert finish["merge_read"].metadata["vec2_split_state_logical_bytes"] == partials * 2 * (LATENT + 2) * 4
     assert [finish[k].after for k in ("merge", "normalize", "store")] == [("merge_read",), ("merge",), ("normalize",)]
@@ -181,21 +182,29 @@ def test_split_softmax_state_bytes_and_stable_merge(keys, splits):
     np.testing.assert_allclose(v / z, weights @ values / weights.sum(), atol=1e-12)
     assert m + np.log(z) == pytest.approx(scores.max() + np.log(weights.sum()))
 
-@pytest.mark.parametrize("encoding", [("e8m0_g32", "fp16_g16"), "bf16_g32"])
-def test_mixed_quant_payload_and_branch_local_validation(encoding):
+@pytest.mark.parametrize("mode,row_bytes,encoding", [(1, 608, "bf16_g32"), (2, 584, "e8m0_g32")])
+def test_mixed_quant_payload_and_branch_local_validation(mode, row_bytes, encoding):
     contract = governed.PagedMlaContract(((1, 5),), 1, 1, abi=MQS_ABI, page_size=2,
         n_ori=(2,), n_cmp=(3,), ori_indices=((3, 0),), cmp_indices=((0, 4, 2),),
-        ori_block_table=((8, 4),), cmp_block_table=((1, 7, 9),), scale_encoding=encoding)
+        ori_block_table=((8, 4),), cmp_block_table=((1, 7, 9),), quant_mode=mode, scale_encoding=encoding)
     operator = governed.make_op(contract)
     geometry = _governed_geom(DIRECT_SKU)
     plan = governed.build(operator, geometry)
     assert plan.metadata["scale_encoding"] == encoding
     program, _ = _execute(operator, plan, geometry)
     load, = _phase(_tiles(program.tile(0)[0].program), "kv_load")
-    payload = 544 * 2 + 320 * 3
-    assert (load.metadata["ori_logical_bytes"], load.metadata["cmp_logical_bytes"]) == (544 * 2, 320 * 3)
-    assert governed.mqsmla_payload_bytes(2, 3) == payload
-    assert load.metadata["logical_bytes"] == payload + (2 + 3 + 2 + 3) * 4
+    assert (load.metadata["ori_logical_bytes"], load.metadata["cmp_logical_bytes"]) == (2 * row_bytes, 3 * row_bytes)
+    assert load.metadata["logical_bytes"] == 5 * row_bytes + (2 + 3 + 2 + 3) * 4
+    metadata_sectors = (5 + 2) * 32  # Five page records and two index spans.
+    if mode == 2:
+        for branch, rows in (("ori", 2), ("cmp", 3)):
+            assert load.metadata[f"{branch}_data_logical_bytes"] == rows * 576
+            assert load.metadata[f"{branch}_scale_logical_bytes"] == rows * 8
+        # Even physical pages align data. Odd pages start 16 B into a sector.
+        assert load.work["hbm"] == 2 * 576 + 3 * (576 + 32) + 5 * 32 + metadata_sectors
+        assert load.work["mte2_aiv"] == 5 * (576 + 32) + metadata_sectors
+    else:
+        assert load.work["hbm"] == load.work["mte2_aiv"] == 5 * 608 + metadata_sectors
     for branch in ("ori", "cmp"):
         for field, value, error in ((f"n_{branch}", (-1,), f"invalid_n_{branch}"),
                                     (f"{branch}_indices", ((0,),), f"{branch}_index_count"),
@@ -204,6 +213,19 @@ def test_mixed_quant_payload_and_branch_local_validation(encoding):
                 governed.make_op(replace(contract, **{field: value}))
     with pytest.raises(ModelingError, match="invalid_scale_encoding"):
         governed.make_op(replace(contract, scale_encoding=("fp32", "fp16_g16")))
+
+
+def test_block_scale_plane_uses_physical_page_boundary():
+    geometry = _governed_geom(DIRECT_SKU)
+    op = governed.make_op(sequences=((1, 2),), logical_heads=4, physical_heads=4, abi=MQS_ABI,
+                          quant_mode=2, n_ori=2, page_size=5, ori_block_table=((3,),))
+    program, _ = _execute(op, governed.build(op, geometry), geometry)
+    load, = _phase(_tiles(program.tile(0)[0].program), "kv_load")
+    # 3 * (5 * 584) + 5 * 576 starts eight bytes before the next sector.
+    # The adjacent 8 B scales cross it, as does the 1152 B data run.
+    assert load.work["hbm"] == (2 * 576 + 32) + 2 * 32 + 32
+    assert load.work["mte2_aiv"] == 2 * (576 + 32) + 32
+
 
 @pytest.mark.parametrize("splits,intervals", [(1, ((0, 1, 2),)), (2, ((0, 1), (2,)))])
 def test_workspace_pv_accumulates_within_each_owner_interval(splits, intervals):
@@ -307,14 +329,15 @@ def test_dsl_mixed_quant_binds_fp32_sinks_and_seeds_even_empty_selection(keys, r
     assert attention.after == (load.name,)
     group = attention.program.tile(0)[0].program
     phases = _tiles(group) if keys else group.stages
-    seed, = (s for s in phases if s.name.partition(":")[0] == "sink_init")
+    seed, = (s for s in phases if s.name.partition(":")[0] == "sink_init" and s.work)
     assert seed.work == {"vector": heads * (LATENT + 2)}
     if keys:
-        softmax, = _phase(phases, "softmax")
+        softmax = _phase(phases, "softmax")[0]
         assert seed.name in softmax.after
-        gather, = _phase(phases, "kv_load")
-        assert gather.metadata["ori_logical_bytes"] == oris * 544
-        assert gather.metadata["cmp_logical_bytes"] == (keys - oris) * 320
+        ori, cmp = _phase(phases, "kv_load")
+        assert ori.metadata["ori_logical_bytes"] == oris * 544
+        assert cmp.metadata["cmp_logical_bytes"] == (keys - oris) * 320
+        assert governed.mqsmla_payload_bytes(oris, keys - oris) == oris * 544 + (keys - oris) * 320
     else:
         assert not plan.work.matrix
         assert not any("qk:" in e["task"] or "pv:" in e["task"] for e in trace)
@@ -349,6 +372,42 @@ def test_dsl_mixed_quant_continuation_does_not_seed_an_extra_sink():
     assert next(s for s in empty.stages if s.name == "sink_init").work["vector"] == 64 * (LATENT + 2)
 
 
+@pytest.mark.parametrize("nested", [False, True])
+def test_sparse_queries_use_their_own_banks_and_split_state(nested):
+    geometry = _one_owner(_governed_geom(DIRECT_SKU))
+    heads = 64
+    selections = dict(n_ori=[1, 0], n_cmp=[2, 1], ori_indices=[[1], []], cmp_indices=[[0, 1], [2]])
+    if nested:
+        selections = {name: [rows] for name, rows in selections.items()}
+    inputs = dict(sequences=[[2, 3]], logical_heads=heads, physical_heads=heads, abi=DSL_MQS_ABI,
+                  page_size=2, ori_block_table=[[3]], cmp_block_table=[[4, 7]], splits=2, **selections)
+    operator = governed.make_op(inputs)
+    plan = governed.build(operator, geometry)
+    slot_bytes = heads * (LATENT + 2) * 4
+    assert plan.metadata["workspace_slots_per_core"] == 2
+    assert plan.metadata["workspace_bytes"] == plan.metadata["workspace_bytes_per_core"] == 2 * slot_bytes
+    assert operator.flops == plan.work.matrix["bf16"] == 2 * 4 * heads * (LATENT + LATENT)
+    program, _ = _execute(operator, plan, geometry)
+    attention = program.stages[-1].program
+    first, last = (attention.tile(i)[0].program for i in range(2))
+    ori, cmp, tail = (_phase(stages, "kv_load")[0].metadata
+                      for stages in (_tiles(first, 0), _tiles(first, 1), _tiles(last)))
+    assert (ori["ori_logical_bytes"], cmp["cmp_logical_bytes"], tail["cmp_logical_bytes"]) == (544, 2 * 320, 320)
+    assert (ori["ori_indices_logical_bytes"], cmp["cmp_indices_logical_bytes"], tail["cmp_indices_logical_bytes"]) == (4, 8, 4)
+    assert first.stages[1].metadata["vec2_split_state_logical_bytes"] == 2 * slot_bytes
+    assert all(_phase(_tiles(first, split), "split_write")[0].metadata["vec2_split_state_logical_bytes"] == slot_bytes
+               for split in range(2))
+    assert [stage.name for stage in last.stages] == ["splits", "normalize", "store"]
+    assert not _phase(_tiles(last), "split_write")[0].work
+    single = governed.make_op(sequences=((1, 1),), logical_heads=heads, physical_heads=heads,
+                              abi=DSL_MQS_ABI, n_cmp=1, splits=2)
+    unsplit = governed.make_op(sequences=((1, 1),), logical_heads=heads, physical_heads=heads,
+                               abi=DSL_MQS_ABI, n_cmp=1)
+    assert governed.build(single, geometry).work == governed.build(unsplit, geometry).work
+    with pytest.raises(ModelingError, match="cmp_block_table_coverage:0:1"):
+        governed.make_op(inputs | {"cmp_block_table": [[4]]})
+
+
 @pytest.mark.parametrize("layout", ["PA_BLK_BSND", "PA_BLK_NZ", "NZ_LATENT"])
 def test_latent_alias_avoids_value_refill_with_exact_tail_bytes(layout):
     geometry = _one_owner(_governed_geom(DIRECT_SKU))
@@ -378,8 +437,8 @@ def test_sparse_page_aliases_preserve_each_request_gather():
     program, _ = _execute(operator, governed.build(operator, geometry), geometry)
     for query, n_ori in zip(program.tile(0), (2, 1), strict=True):
         gather, = _phase(_tiles(query.program), "kv_load")
-        assert gather.metadata["ori_logical_bytes"] == n_ori * 544
-        assert gather.metadata["cmp_logical_bytes"] == 320
+        assert gather.metadata["ori_logical_bytes"] == n_ori * 608
+        assert gather.metadata["cmp_logical_bytes"] == 608
         assert gather.metadata["ori_pages_logical_bytes"] == 4 * n_ori
         assert gather.work["hbm"] > 0
 
