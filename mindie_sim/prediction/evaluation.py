@@ -212,9 +212,12 @@ class ExecutionBindings:
     stage_profiles: tuple = ()
     datapaths: tuple[tuple[int, DatapathCapabilitySpec], ...] = ()
     compute_arch: Any = None
+    primitive_table: Any = None
+    primitive_coverage_gaps: tuple[str, ...] = ()
 
     @classmethod
-    def create(cls, case: CaseSpec, recipes: Any = None) -> "ExecutionBindings":
+    def create(cls, case: CaseSpec, recipes: Any = None, *,
+               primitive_table: Any = None) -> "ExecutionBindings":
         from .topology import Topology
         hardware = FrozenHardwareView.from_machine(case.machine)
         geometry = _stage_geometry(case, hardware)
@@ -233,12 +236,17 @@ class ExecutionBindings:
             )
             for die in case.machine.dies
         )
+        from .execution import build_stage_profiles
+        profiles = build_stage_profiles(case, "", primitive_table=primitive_table)
+        prim_sig = tuple(getattr(p, "primitive_identity", ()) for p in profiles)
+        coverage_gaps = tuple(sorted({
+            gap for p in profiles for gap in getattr(p, "primitive_coverage_gaps", ())
+        }))
         signature = (
             hardware.digest(), geometry, _runtime_signature(case),
             tuple(getattr(item, "name", str(item)) for item in topology.resources()),
+            prim_sig,
         )
-        from .execution import build_stage_profiles
-        profiles = build_stage_profiles(case, "")
         compute_arch = (
             case.machine.dies[0].compute_arch
             if case.machine.dies and case.machine.homogeneous
@@ -247,7 +255,8 @@ class ExecutionBindings:
         return cls(hardware=hardware, resource_signature=signature,
                    stage_geometry=geometry, topology=topology, recipes=recipes,
                    stage_profiles=profiles, datapaths=datapaths,
-                   compute_arch=compute_arch)
+                   compute_arch=compute_arch, primitive_table=primitive_table,
+                   primitive_coverage_gaps=coverage_gaps)
 
     def datapath_for_rank(self, rank: int, /) -> DatapathCapabilitySpec:
         """Return the precomputed immutable datapath spec for one physical rank."""
@@ -282,7 +291,9 @@ class ExecutionBindings:
             stage_geometry=self.stage_geometry, resources=self.resources,
             pools=self.pools, topology=self.topology, recipes=recipes,
             stage_profiles=self.stage_profiles, datapaths=self.datapaths,
-            compute_arch=self.compute_arch)
+            compute_arch=self.compute_arch,
+            primitive_table=self.primitive_table,
+            primitive_coverage_gaps=self.primitive_coverage_gaps)
 
 
 @dataclass
@@ -305,11 +316,11 @@ class EvaluationContext:
 
     @classmethod
     def create(cls, case: CaseSpec, recipes: Any = None,
-               primitives: Any = None) -> "EvaluationContext":
+               primitives: Any = None, *, primitive_table: Any = None) -> "EvaluationContext":
         from .cost import CostModel
         from .program import RecipeBook
         book = recipes or RecipeBook.from_mapping(case.runtime.kernels)
-        bindings = ExecutionBindings.create(case, book)
+        bindings = ExecutionBindings.create(case, book, primitive_table=primitive_table)
         cost = CostModel(case, primitives, hardware=bindings.hardware)
         return cls(case=case, bindings=bindings, cost=cost,
                    recipe_origin="case" if recipes is None else "caller")

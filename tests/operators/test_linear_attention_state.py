@@ -24,7 +24,7 @@ from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.family_kda import IMPLEMENTATION as GATES
 from mindie_sim.prediction.family_kda_state import IMPLEMENTATION as STATE
 from mindie_sim.prediction.frontend import Frontend
-from mindie_sim.prediction.gdn_decode_programs import CONV, conv_plan
+from mindie_sim.prediction.operators.linear_attention._gdn_decode_programs import CONV, conv_plan
 from mindie_sim.prediction.mechanism import Geometry, PlannedRecipe
 from mindie_sim.prediction.operators import gdn_state, kda_recurrent, kda_recurrent_membase, kda_state
 from mindie_sim.prediction.operators.kda_state_selection import resolve

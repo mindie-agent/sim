@@ -20,8 +20,8 @@ from .dual_bound import (
     build_dual_inputs_from_scenario, certify_lower_bound,
 )
 from .framework_solver import (
-    _TrialSearch, _accepted, _field, _resolved, _seed_plans, _step, _verification, _wall,
-    solve_framework,
+    CandidateSearchStats, _TrialSearch, _accepted, _field, _resolved, _seed_plans, _step,
+    _verification, _wall, solve_framework,
 )
 
 if TYPE_CHECKING:
@@ -109,6 +109,8 @@ class FiveLevelReport:
     framework_eval: StepEvaluation
     dsl_eval: StepEvaluation
     verification: VerificationReceipt
+    search_stats: CandidateSearchStats = CandidateSearchStats()
+    primitive_coverage_gaps: tuple[str, ...] = ()
 
 
 def _occurrence_key(occurrence):
@@ -289,9 +291,9 @@ def solve_five_level_ladder(
     from mindie_sim.rewrite.oracle import EvalBudget, ScenarioRequest, _baseline, prepare_scenario
     from mindie_sim.rewrite.verify import SoundnessInversionError
 
-    scenario_request = ScenarioRequest(case, request, stack_id, replay)
+    scenario_request = ScenarioRequest(case, request, stack_id, replay, primitive_table=primitive_table)
     dossier = prepare_scenario(scenario_request, budget=EvalBudget(deadline_mono=replay.deadline_mono),
-                               spine=spine, primitives=primitives)
+                               spine=spine, primitives=primitives, primitive_table=primitive_table)
     scenario = _resolved(dossier)
     program, dag, names = build_dual_inputs_from_scenario(scenario)
     _, pricing = certify_lower_bound(program, dag)
@@ -360,8 +362,16 @@ def solve_five_level_ladder(
     digest = getattr(dossier, "scenario_digest", None)
     if digest is None:
         digest = _field(_field(dossier, "handle", "scenario"), "scenario_digest", "digest")
+    combined_stats = framework.search_stats.merge(dsl.search_stats)
+    coverage_gaps = tuple(getattr(
+        getattr(getattr(dossier, "handle", None), "evaluation_context", None),
+        "bindings", None,
+    ).primitive_coverage_gaps) if getattr(
+        getattr(getattr(dossier, "handle", None), "evaluation_context", None),
+        "bindings", None,
+    ) is not None else ()
     return FiveLevelReport(
         FIVE_LEVEL_REPORT_SCHEMA, digest, metrics, certificate, subgradient, waterfall,
         framework.best_plan, dsl.best_plan, dsl.catlass_specs, dsl.dsl_specs, dsl.fuse_specs,
-        *evaluations, verification,
+        *evaluations, verification, search_stats=combined_stats, primitive_coverage_gaps=coverage_gaps,
     )

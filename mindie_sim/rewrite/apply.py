@@ -15,7 +15,7 @@ from graphlib import CycleError, TopologicalSorter
 from heapq import heappop, heappush
 from math import isfinite
 from types import SimpleNamespace
-from typing import Literal
+from typing import Any, Literal
 
 from mindie_sim.prediction.fusion_control_rewrite import (
     apply_incoming_controls, ordering_prerequisites, rewritten_control_metadata,
@@ -35,6 +35,7 @@ from mindie_sim.schema.datapath import DatapathCapabilitySpec, datapath_for_die,
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.stack_registry import DEFAULT_STACK_NAME, LoweringRequest, RankOps
 
+from ._oracle_prefetch import die_placements_for_case, primitive_table_digest_token
 from .schema import (
     CollectiveTransform, Edit, FuseRegion, FusionTier, HoistOrDeduplicate, OpRef,
     PipelineTiles, PortRef, QuantizeContract, RewritePlan, SelectTemplate, StreamSchedule,
@@ -67,6 +68,9 @@ class ResolvedScenario:
     atomic_ops: tuple[RankOps, ...]
     datapath: DatapathCapabilitySpec
     stream_plans: tuple[StreamPlan, ...] = ()
+    die_placements: tuple[tuple[int, tuple[int, int]], ...] = ()
+    bilinear_contractions: tuple[Any, ...] = ()
+    primitive_table: Any = None
 @dataclass(frozen=True, slots=True)
 class EditReceipt:
     edit_id: str
@@ -122,7 +126,8 @@ class AppliedPlan:
     in_place_aliases: tuple[tuple[str, str], ...] = ()
     credit_edges: tuple[tuple[str, str, int], ...] = ()
 def resolve_scenario(case, request: StepRequest, *, spine=None,
-                     stack_id: str = DEFAULT_STACK_ID, primitives=None) -> ResolvedScenario:
+                     stack_id: str = DEFAULT_STACK_ID, primitives=None,
+                     primitive_table=None) -> ResolvedScenario:
     """Lower atomic and shipping graphs against a shared declared scenario."""
     case = Case.from_mapping(case)
     spine = PredictionSpine() if spine is None else spine
@@ -138,10 +143,13 @@ def resolve_scenario(case, request: StepRequest, *, spine=None,
          graph.base.sources, graph.streams, primitives),
         default=_digest_default,
     )
-    digest = _json_digest((base, framing, mainline.graph_id))
+    digest = _json_digest((base, framing, mainline.graph_id, primitive_table_digest_token(primitive_table)),
+                          default=_digest_default)
     datapath = _die_path(atomic.case.machine, atomic.case.machine.dies[0])
-    return ResolvedScenario(case, request, stack_id, base, framing, digest, atomic,
-                            mainline, graph.executable, datapath, graph.streams)
+    return ResolvedScenario(
+        case, request, stack_id, base, framing, digest, atomic, mainline,
+        graph.executable, datapath, graph.streams, die_placements_for_case(atomic.case), (), primitive_table,
+    )
 def _annotate(op: OpSpec, **values) -> OpSpec:
     if any(key == "occurrence" or not _flat(value) for key, value in values.items()):
         raise ModelingError(f"rewrite_metadata_not_flat:{op.op_id}")
@@ -768,12 +776,10 @@ def apply_plan(plan: RewritePlan, scenario: ResolvedScenario) -> AppliedPlan:
         executable.append(RankOps(draft.replica, ordered))
 
     def collect(attribute):
-        result = []
+        seen_vals = []
         for draft in drafts:
-            for value in getattr(draft, attribute):
-                if value not in result:
-                    result.append(value)
-        return tuple(result)
+            seen_vals.extend(v for v in getattr(draft, attribute) if v not in seen_vals)
+        return tuple(seen_vals)
 
     return AppliedPlan(
         plan, plan_sha256(plan), scenario.scenario_sha256, tuple(executable),

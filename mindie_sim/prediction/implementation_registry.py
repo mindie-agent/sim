@@ -34,7 +34,7 @@ class Selection:
 
 IMPLEMENTATIONS = {
     "cann_bf16_lightning_indexer_v2_complete": Implementation(
-        "mindie_sim.prediction.family_lightning_indexer", blocks=("lightning_indexer",)),
+        "mindie_sim.prediction.operators.sparse_indexer.bf16_lightning", blocks=("lightning_indexer",)),
     "cann_quant_lightning_indexer_v2_complete": Implementation(
         "mindie_sim.prediction.family_quant_indexer", blocks=("quant_lightning_indexer",)),
     "vllm_ascend_group_list_prefix": Implementation(
@@ -104,7 +104,7 @@ IMPLEMENTATIONS = {
         options=("safe_gate", "use_beta_sigmoid", "gate_dtype", "beta_dtype",
                  "has_a_log", "has_dt_bias", "allow_neg_eigval", "state_selection")),
     "vllm_ascend_gdn_decode": Implementation(
-        "mindie_sim.prediction.gdn_decode", blocks=("gdn_decode",),
+        "mindie_sim.prediction.operators.linear_attention.gdn_decode", blocks=("gdn_decode",),
         options=("gating_beta_store", "gating_programs", "recurrent_implementation", "cache_index_row_stride")),
     "ascend_sparse_flash_attention_arch22": Implementation(
         "mindie_sim.prediction.indexed_attention", blocks=("indexed_attention",),

@@ -18,6 +18,7 @@ from ...mechanism import Geometry, OperatorPlan, PlannedRecipe
 from ...results import OpOccurrence
 from ..contracts import OperatorFamilySpec, OperatorPlanningContext, ResolvedOperator
 from . import arch22 as _arch22, arch35 as _arch35
+from . import bf16_lightning
 from .common import (
     DEFAULT_INDEX_DIM, FAMILY, LIGHTNING_INDEXER_QSA_RECIPE, MSA_ABI,
     MSA_INDEX_SCORE_RECIPE, MSA_INDEX_SCORE_V2_RECIPE, MSA_V2_ABI, QSA_ABI, QSA_OVERLAY_SOURCE,
@@ -36,6 +37,7 @@ DEFAULT_QSA_RATIO = 4
 DEFAULT_QSA_TOPK = 512
 
 _STRATEGIES = {_arch22.ARCH_ID: _arch22.STRATEGY, _arch35.ARCH_ID: _arch35.STRATEGY}
+_OWNED_RECIPES = frozenset({FAMILY, bf16_lightning.RECIPE, *SCORER_RECIPES.values()})
 SortAllTrace = _arch22.SortAllTrace
 FlushMergeTrace = _arch22.FlushMergeTrace
 trace_sort_all = _arch22.trace_sort_all
@@ -43,7 +45,10 @@ trace_arch22_topk_flushes = _arch22.trace_arch22_topk_flushes
 
 
 def build(op: OpSpec, geometry_or_ctx: Geometry | OperatorPlanningContext) -> OperatorPlan:
-    """Build from the governed context or the legacy recipe's physical geometry."""
+    """Build from the governed context or directly from physical geometry."""
+    if op.recipe == bf16_lightning.RECIPE:
+        geometry = geometry_or_ctx if isinstance(geometry_or_ctx, Geometry) else geometry_or_ctx.geometry
+        return bf16_lightning._build(op, geometry)
     if isinstance(geometry_or_ctx, Geometry):
         geometry = geometry_or_ctx
         if geometry.datapath is None:
@@ -62,6 +67,8 @@ def build(op: OpSpec, geometry_or_ctx: Geometry | OperatorPlanningContext) -> Op
 
 def resolve_operator_plan(op: OpSpec, ctx: OperatorPlanningContext, /) -> ResolvedOperator:
     plan = build(op, ctx)
+    if op.recipe == bf16_lightning.RECIPE:
+        return ResolvedOperator(ctx.occurrence, op, plan, bf16_lightning.IMPLEMENTATION)
     descriptor = describe(op, ctx, plan)
     return ResolvedOperator(
         occurrence=ctx.occurrence, op=op, recipe=plan, implementation=descriptor.implementation,
@@ -72,15 +79,15 @@ def resolve_operator_plan(op: OpSpec, ctx: OperatorPlanningContext, /) -> Resolv
 def register_family() -> OperatorFamilySpec:
     return OperatorFamilySpec(
         name=FAMILY, families=frozenset({FAMILY, "indexer"}),
-        owned_recipe_ids=frozenset({FAMILY, *SCORER_RECIPES.values()}),
+        owned_recipe_ids=_OWNED_RECIPES,
         resolve=resolve_operator_plan,
     )
 
 
 def recipes() -> dict[str, PlannedRecipe]:
-    """Expose standalone and existing scorer IDs through the governed builder."""
+    """Expose all owned scorer IDs through the governed builder."""
     planner = PlannedRecipe(build)
-    return dict.fromkeys((FAMILY, *SCORER_RECIPES.values()), planner)
+    return dict.fromkeys(sorted(_OWNED_RECIPES), planner)
 
 
 def make_indexer_op(

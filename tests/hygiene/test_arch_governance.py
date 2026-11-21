@@ -1,4 +1,4 @@
-"""Architecture governance AST & layout gate (AG001..AG005) verification.
+"""Architecture governance gate (AG001..AG007) verification.
 
 [Role] Verify ``scripts/check_arch_governance.py`` catches flat ISA/CANN module
   sprawl, direct/dynamic/re-exported leaf access, ``service_modes`` and
@@ -7,20 +7,33 @@
 [Invariants] Real repository has zero non-allowlisted violations and zero
   violations under ``mindie_sim/prediction/operators/<family>/**``. Multiset
   differential subtraction never waives governed operator packages.
-[Timeouts & Locks] Pure Tier-0 local AST tests (<3s); no network or locks.
+[Timeouts & Locks] Local Tier-0 AST scans and bounded physical probes.
 [Side-Effect Policy] Writes synthetic fixtures only inside pytest ``tmp_path``.
 """
 from __future__ import annotations
 
-from pathlib import Path
+from dataclasses import replace
+from pathlib import Path, PurePosixPath
 
 import pytest
 
+from _support.linear_cases import gdn_decode_source_case
+from mindie_sim.prediction import implementation_registry
+from mindie_sim.prediction.mechanism import Geometry, PlannedRecipe
+from mindie_sim.prediction.operators import builtin_family_registry
+from mindie_sim.prediction.operators.linear_attention import gdn_decode
+from mindie_sim.prediction.operators.sparse_indexer import bf16_lightning
+from mindie_sim.prediction.program import RecipeBook
+from mindie_sim.schema.common import ModelingError
+from scripts import _arch_governance_runtime as runtime_checks
 import scripts.check_arch_governance as arch_gov
 
 pytestmark = pytest.mark.tier0
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+INDEXER_HEADS = 4
+INDEXER_HEAD_DIM = 128
+INDEXER_COMPRESSION = 4
 
 
 def test_real_repository_passes_arch_governance_gate():
@@ -249,3 +262,125 @@ def test_arch_governance_repo_map_overrides_refs_root_and_validates_sha(tmp_path
     )
     assert any(v.rule == "AG005" and "not a git commit" in v.message for v in bad_types)
     assert any(v.rule == "AG005" and "not a git blob" in v.message for v in bad_types)
+
+
+def test_governance_checks_live_recipe_and_implementation_ownership(monkeypatch):
+    assert runtime_checks.verify_ag006_ownership() == ()
+    book = RecipeBook.from_mapping({})
+    book.recipes[bf16_lightning.RECIPE] = PlannedRecipe(lambda op, geometry: None)
+    monkeypatch.setattr(RecipeBook, "from_mapping", classmethod(lambda cls, raw: book))
+
+    name = bf16_lightning.IMPLEMENTATION
+    entry = implementation_registry.IMPLEMENTATIONS[name]
+    monkeypatch.setitem(implementation_registry.IMPLEMENTATIONS, name, replace(
+        entry, module="mindie_sim.prediction.family_causal_conv",
+    ))
+    decode_recipes = gdn_decode.recipes()
+    monkeypatch.setattr(gdn_decode, "recipes", lambda: {
+        **decode_recipes, "unowned_decode_recipe": decode_recipes[gdn_decode.CONV],
+    })
+
+    findings = runtime_checks.verify_ag006_ownership()
+    assert {item.fingerprint for item in findings} == {
+        f"AG006:recipe:{bf16_lightning.RECIPE}",
+        f"AG006:implementation:{name}",
+        "AG006:implementation:vllm_ascend_gdn_decode:unowned_decode_recipe",
+    }
+
+
+def test_strict_gate_checks_runtime_with_and_without_differential_base(monkeypatch):
+    monkeypatch.setattr(arch_gov, "scan_repository", lambda *args, **kwargs: ())
+    monkeypatch.setattr(arch_gov, "scan_runtime", lambda root: (
+        arch_gov.Violation("AG006", PurePosixPath("recipes.py"), 1, "AG006:recipe:test", "invalid owner"),
+    ))
+    assert arch_gov.main([]) == arch_gov.EXIT_OK
+    assert arch_gov.main(["--strict"]) == arch_gov.EXIT_VIOLATIONS
+    assert arch_gov.main(["--strict", "--base", "HEAD"]) == arch_gov.EXIT_VIOLATIONS
+
+
+def test_governance_rejects_heuristic_identifiers_in_nested_operator_modules(tmp_path):
+    operators = tmp_path / "mindie_sim" / "prediction" / "operators"
+    family = operators / "demo"
+    nested = family / "planner"
+    nested.mkdir(parents=True)
+    (operators / "shared.py").write_text("overlap_decay = 1\n", encoding="utf-8")
+    (family / "valid.py").write_text(
+        "# overlap_decay is prohibited\n"
+        "def plan(state_decay):\n"
+        "    return state_decay\n",
+        encoding="utf-8",
+    )
+    invalid = nested / "invalid.py"
+    invalid.write_text(
+        "CACHED_REFILL_DISCOUNT = 1\n"
+        "def plan(ctx, overlap_decay):\n"
+        "    return ctx.key64_turnaround_fudge * ctx.heuristicFactor\n",
+        encoding="utf-8",
+    )
+    findings = arch_gov.scan_repository(tmp_path)
+    assert {item.message.split("'")[1] for item in findings} == {
+        "CACHED_REFILL_DISCOUNT", "overlap_decay", "key64_turnaround_fudge", "heuristicFactor",
+    }
+    assert all(item.rule == "AG007" and item.path == invalid.relative_to(tmp_path) for item in findings)
+    assert arch_gov.new_violations(findings, findings) == findings
+
+
+def test_discrimination_checks_fixed_context_and_real_cache_byte_ledgers(monkeypatch):
+    assert arch_gov.verify_ag007_discrimination() == ()
+
+    cold, warm = runtime_checks._cache_ledgers(None)
+    assert cold.logical_tensor_bytes == warm.logical_tensor_bytes < warm.aligned_transfer_bytes
+    assert cold.aligned_transfer_bytes == warm.aligned_transfer_bytes
+    assert cold.dram_bus_transaction_bytes > warm.dram_bus_transaction_bytes
+
+    context = 1024
+    query_sizes = []
+
+    def constant_work(query_tokens, context_tokens):
+        assert context_tokens == context
+        query_sizes.append(query_tokens)
+        return context_tokens
+
+    monkeypatch.setattr(runtime_checks, "_cache_ledgers", lambda pattern: (cold, cold))
+    assert arch_gov.verify_ag007_discrimination(constant_work, context_tokens=context) == (
+        "cold and warm L2 reads must use less DRAM when warm",
+        "same-context multi-query plan must increase physical work",
+    )
+    assert query_sizes == [1, 2]
+    monkeypatch.setattr(runtime_checks, "_cache_ledgers", lambda pattern: (
+        cold, replace(warm, logical_tensor_bytes=0),
+    ))
+    assert arch_gov.verify_ag007_discrimination() == (
+        "cold and warm L2 reads changed logical or aligned bytes",
+    )
+
+
+def test_lightning_defaults_execute_through_the_sparse_indexer_owner():
+    query_tokens, context_tokens = 2, 1024
+    op = bf16_lightning.make_op(
+        query_rows=query_tokens, context=context_tokens, heads=INDEXER_HEADS,
+        head_dim=INDEXER_HEAD_DIM, compression=INDEXER_COMPRESSION, phase="decode",
+    )
+    assert builtin_family_registry().lookup(op).name == "sparse_indexer"
+    prepared, plan = RecipeBook.from_mapping({}).prepare(op, Geometry(1, {"vector": 2}))
+    pairs = sum((context_tokens + row + 1) // INDEXER_COMPRESSION for row in range(query_tokens))
+    assert prepared.flops == plan.work.matrix["bf16"] == 2 * pairs * INDEXER_HEADS * INDEXER_HEAD_DIM
+
+
+@pytest.mark.parametrize("recipe_id", (gdn_decode.CONV, gdn_decode.GATING))
+def test_decode_kernel_requires_explicit_binding_then_uses_the_linear_attention_owner(recipe_id):
+    parsed, _, ops = gdn_decode_source_case((1,))
+    op = next(op for op in ops if op.recipe == recipe_id)
+    assert op.plan_required
+    assert builtin_family_registry().lookup(op).name == "linear_attention"
+
+    unbound = RecipeBook.from_mapping({})
+    with pytest.raises(ModelingError, match=f"^source_plan_binding_required:{recipe_id}$"):
+        unbound.select(op)
+
+    geometry = Geometry.from_devices(parsed.machine.dies)
+    _, plan = RecipeBook.from_mapping(parsed.runtime.kernels).prepare(op, geometry)
+    expected = gdn_decode.build(op, geometry)
+    assert plan.work == expected.work
+    assert plan.metadata == expected.metadata
+    assert plan.work.resources["hbm"] > 0

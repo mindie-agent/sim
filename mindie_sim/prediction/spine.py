@@ -344,13 +344,16 @@ class PredictionSpine:
         /,
         *,
         primitives: Any = None,
+        primitive_table: Any = None,
     ) -> StepEvaluation:
         """Execute ``step`` once on ``runtime.Engine`` using a single ``EvaluationContext``."""
         case = step.case
         book = RecipeBook.from_mapping(
             case.runtime.kernels, family_registry=self.families
         )
-        evaluation = EvaluationContext.create(case, book, primitives)
+        evaluation = EvaluationContext.create(
+            case, book, primitives, primitive_table=primitive_table
+        )
         graphs: Mapping[int, tuple[OpSpec, ...]] = {
             entry.replica: entry.ops for entry in step.graph.executable
         }
@@ -503,6 +506,7 @@ class PredictionSpine:
         *,
         replay: ReplayOptions = ReplayOptions(),
         primitives: Any = None,
+        primitive_table: Any = None,
     ) -> ThreeTierEvaluation:
         """Evaluate ``unmerge``, ``mainline``, and constructive ``should_achieve`` via primal-dual ladder."""
         report = self.optimize_ladder(
@@ -510,6 +514,7 @@ class PredictionSpine:
             request,
             replay=replay,
             primitives=primitives,
+            primitive_table=primitive_table,
         )
         unmerge_eval = report.unmerge_eval
         mainline_eval = report.mainline_eval

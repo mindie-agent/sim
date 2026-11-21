@@ -566,7 +566,7 @@ def lower_index_path(builder, *, plan, model, quant, parallel, views, deps, runt
                 # ledger. Shared capacity does not establish batch read reuse.
             elif (bf16_indexer is not None and len(views) == 1
                   and parallel.cp == 1 and not plan.candidate_filter):
-                from . import family_lightning_indexer as li
+                from .operators.sparse_indexer import bf16_lightning as li
                 if bf16_indexer.name != li.IMPLEMENTATION:
                     raise ModelingError("mla_lightning_indexer_selected_not_bf16")
                 view = views[0]

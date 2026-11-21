@@ -8,10 +8,9 @@
   event IDs are qualified by (acquisition_root, session_id) so distinct
   captures never erroneously merge; on-disk capture files fail closed on any
   digest/rank/clock/event mismatch. Predictions require HMAC-bound live Engine
-  run receipts matching case_id and named Event handles with external_offset_ns
-  == 0. Strict 3-level gate requires independent L1, L2, and L3 coverage;
-  strict < threshold_pct (10.0% fails); empty/missing levels yield
-  insufficient_evidence.
+  run receipts matching case_id, clock operator and named Event handles with
+  external_offset_ns == 0. Release requires independent L1/L2/L3 coverage,
+  all planned evidence and each heldout error strictly below the threshold.
 [Timeouts & Locks] Two-pass 64 KiB chunked streaming without header truncation
   or whole-file buffering; bounded compact tuples; zero locks or devices.
 [Side-Effect Policy] Read-only over manifests, captures, and frozen fits.
@@ -37,13 +36,10 @@ from mindie_sim.observations.multilevel_stream import (
     STREAM_CHUNK_BYTES,
     STREAM_WHOLE_READ_LIMIT_BYTES,
     TIME_UNIT_SCALE_NS,
-    _fstr,
-    _parse_lineage_edges,
-    _parse_ranks,
-    _parse_str_tuple,
+    VALID_CLOCK_OPERATORS,
     _req_sha256,
     _req_str,
-    _to_ns,
+    _validate_clock_operator,
     bind_engine_interval,
     bind_engine_rung_interval,
     digest_file_streaming,
@@ -73,6 +69,7 @@ PERCENT_SCALE = 100.0
 REQUIRED_LEVELS: tuple[Literal["L1", "L2", "L3"], ...] = ("L1", "L2", "L3")
 VALID_LEVELS = frozenset(REQUIRED_LEVELS)
 VALID_SPLITS = frozenset({"train", "heldout"})
+_CALLER_PREDICTION_KEYS = frozenset({"predicted_ns", "predicted_ms", "predicted_us", "predicted_duration", "predicted_s"})
 MANIFEST_HEADER_KEYS = frozenset({
     "manifest_id", "schema_version", "lineage_edges",
     "source_uri", "source_sha256", "strict_three_level_blind",
@@ -114,6 +111,7 @@ class CaptureBoundary:
     capture_uri: str = ""
     source_ref: tuple[tuple[str, str], ...] = ()
     session_id: str = ""
+    clock_operator: Literal["elapsed_span", "busy_union"] = "elapsed_span"
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,6 +168,9 @@ class Residual:
     arm_a_signed_error: float | None = None
     arm_b_signed_error: float | None = None
     regime_dims: tuple[tuple[str, str], ...] = ()
+    clock_operator: str = "elapsed_span"
+    elapsed_span_ns: int | None = None
+    busy_union_ns: int | None = None
     def to_dict(self) -> dict[str, Any]:
         out = asdict(self)
         out["signed_error"] = None if math.isnan(self.signed_error) else self.signed_error
@@ -310,11 +311,64 @@ class _LazyManifestCases(Sequence[GateCase]):
         raise IndexError(index)
 
 
+def _parse_ranks(raw: Any) -> tuple[int, ...]:
+    if isinstance(raw, (str, bytes)) or not isinstance(raw, Sequence) or not raw:
+        raise ModelingError("device_ranks_must_be_nonempty_sequence")
+    ranks = [item for item in raw if not isinstance(item, bool) and isinstance(item, int) and item >= 0]
+    if len(ranks) != len(raw) or len(set(ranks)) != len(ranks):
+        raise ModelingError(f"device_rank_invalid:{raw!r}")
+    return tuple(ranks)
+
+
+def _parse_str_tuple(raw: Any, reason: str, *, normalize_digests: bool = False) -> tuple[str, ...]:
+    if raw is None:
+        return ()
+    if isinstance(raw, (str, bytes)) or not isinstance(raw, Sequence):
+        raise ModelingError(reason)
+    items = [validate_provenance_text(_req_str(x, reason), field_name=reason) for x in raw]
+    return tuple(normalize_lineage_token(x) if normalize_digests else x for x in items)
+
+
+def _to_ns(value: Any, unit: str, reason: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        raise ModelingError(reason)
+    return int(round(float(value) * TIME_UNIT_SCALE_NS[unit]))
+
+
+def _fstr(mapping: Mapping[str, Any], key: str, cid: str, *, check_prov: bool = False) -> str:
+    val = _req_str(mapping.get(key), f"{key}_missing:{cid}")
+    return validate_provenance_text(val, field_name=key) if check_prov else val
+
+
+def _parse_lineage_edges(raw: Any) -> tuple[tuple[str, str], ...]:
+    if not raw:
+        return ()
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+        raise ModelingError("lineage_edges_invalid")
+    edges = []
+    for item in raw:
+        pair = (item.get("parent"), item.get("child")) if isinstance(item, Mapping) else (
+            (item[0], item[1]) if isinstance(item, Sequence) and not isinstance(item, (str, bytes)) and len(item) == 2 else None
+        )
+        if pair is None:
+            raise ModelingError("lineage_edge_entry_invalid")
+        edges.append((
+            normalize_lineage_token(_req_str(pair[0], "lineage_edge_parent_missing")),
+            normalize_lineage_token(_req_str(pair[1], "lineage_edge_child_missing")),
+        ))
+    return tuple(edges)
+
+
 def parse_gate_case(raw: Mapping[str, Any], *, allow_invalid_durations: bool = False) -> GateCase:
     """Validate and convert one raw manifest record into a ``GateCase``."""
     if not isinstance(raw, Mapping):
         raise ModelingError("gate_case_must_be_mapping")
     cid = validate_provenance_text(_req_str(raw.get("case_id"), "case_id_missing"), field_name="case_id")
+    p_raw = raw.get("payload") or {}
+    if not _CALLER_PREDICTION_KEYS.isdisjoint(raw) or (
+        isinstance(p_raw, Mapping) and not _CALLER_PREDICTION_KEYS.isdisjoint(p_raw)
+    ):
+        raise ModelingError(f"caller_predicted_duration_forbidden:{cid}")
     level, split = _req_str(raw.get("level"), "level_missing"), _req_str(raw.get("split"), "split_missing")
     b_raw, c_raw = raw.get("boundary"), raw.get("cohort")
     if level not in VALID_LEVELS or split not in VALID_SPLITS:
@@ -338,6 +392,7 @@ def parse_gate_case(raw: Mapping[str, Any], *, allow_invalid_durations: bool = F
         capture_uri=sanitize_capture_uri(str(b_raw["capture_uri"])) if b_raw.get("capture_uri") else "",
         source_ref=sanitize_source_ref(b_raw["source_ref"]) if b_raw.get("source_ref") is not None else (),
         session_id=sess,
+        clock_operator=_validate_clock_operator(b_raw.get("clock_operator", "elapsed_span"), cid),
     )
     cohort = CohortKey(
         level=level, cohort_name=_fstr(c_raw, "cohort_name", cid), sku=_fstr(c_raw, "sku", cid),  # type: ignore[arg-type]
@@ -357,7 +412,7 @@ def parse_gate_case(raw: Mapping[str, Any], *, allow_invalid_durations: bool = F
             measured_ns = (arm_b - arm_a) if measured_ns is None else measured_ns
         elif measured_ns is None or measured_ns <= 0:
             raise ModelingError(f"measured_duration_must_be_positive:{cid}")
-    r_raw, p_raw = raw.get("regime_dims") or {}, raw.get("payload") or {}
+    r_raw = raw.get("regime_dims") or {}
     if not isinstance(r_raw, Mapping) or not isinstance(p_raw, Mapping):
         raise ModelingError(f"case_metadata_invalid:{cid}")
     return GateCase(
@@ -527,7 +582,8 @@ def run_l2(case: GateCase, runner: EvaluationRunner) -> EngineInterval:
         raise ModelingError(f"l2_derived_from_l3_forbidden:{case.case_id}:{case.boundary.boundary_kind}")
     if not case.block_capture_present or case.boundary.boundary_kind == "missing_block_capture":
         return EngineInterval(case.case_id, "L2", case.boundary.boundary_kind, case.boundary.start_event,
-                              case.boundary.end_event, 0, 0, 0, "", status="missing_evidence", missing_reason="block_capture_absent")
+                              case.boundary.end_event, 0, 0, 0, "", status="missing_evidence",
+                              missing_reason="block_capture_absent", clock_operator=case.boundary.clock_operator)
     if case.boundary.boundary_kind not in L2_BOUNDARY_KINDS:
         raise ModelingError(f"run_l2_boundary_invalid:{case.case_id}:{case.boundary.boundary_kind}")
     interval = runner.run_l2(case)
@@ -544,15 +600,17 @@ def run_l3(case: GateCase, runner: EvaluationRunner) -> EngineInterval:
 
 
 def _make_residual(
-    case: GateCase, root: str, *, measured_ns: int, predicted_ns: int = 0,
-    receipt: str = "", signed_error: float = math.nan, status: ResidualStatus = "ok",
+    case: GateCase, root: str, *, measured_ns: int, interval: EngineInterval | None = None,
+    signed_error: float = math.nan, status: ResidualStatus = "ok",
     excluded_reason: str = "", signed_delta_ns: int | None = None,
     arm_a_err: float | None = None, arm_b_err: float | None = None,
 ) -> Residual:
     return Residual(
-        case.case_id, case.level, case.cohort, root, measured_ns, predicted_ns, receipt,
+        case.case_id, case.level, case.cohort, root, measured_ns,
+        interval.predicted_ns if interval else 0, interval.engine_receipt if interval else "",
         signed_error, math.nan if math.isnan(signed_error) else abs(signed_error),
         status, excluded_reason, case.boundary.boundary_kind, signed_delta_ns, arm_a_err, arm_b_err, case.regime_dims,
+        case.boundary.clock_operator, interval.elapsed_span_ns if interval else None, interval.busy_union_ns if interval else None,
     )
 
 
@@ -605,7 +663,7 @@ def evaluate(
             status: ResidualStatus = "debug_only" if is_debug else ("near_zero_delta" if near_zero else "ok")
             reason = "debug_cross_level_not_blind_acceptance" if is_debug else ("near_zero_rung_delta" if near_zero else "")
             yield _make_residual(
-                case, root, measured_ns=measured_ns, predicted_ns=interval.predicted_ns, receipt=interval.engine_receipt,
+                case, root, measured_ns=measured_ns, interval=interval,
                 signed_error=math.nan if (is_debug or near_zero) else delta_ns / float(measured_ns),
                 status=status, excluded_reason=reason, signed_delta_ns=delta_ns,
                 arm_a_err=(interval.arm_a_predicted_ns - arm_a) / float(arm_a),
@@ -613,7 +671,7 @@ def evaluate(
             )
         else:
             yield _make_residual(
-                case, root, measured_ns=measured_ns, predicted_ns=interval.predicted_ns, receipt=interval.engine_receipt,
+                case, root, measured_ns=measured_ns, interval=interval,
                 signed_error=(interval.predicted_ns - measured_ns) / float(measured_ns),
                 status="debug_only" if is_debug else "ok",
                 excluded_reason="debug_cross_level_not_blind_acceptance" if is_debug else "",
@@ -621,7 +679,7 @@ def evaluate(
 
 
 def summarize_cohorts(
-    residuals: Iterable[Residual], *, threshold_pct: float = DEFAULT_THRESHOLD_PCT
+    residuals: Iterable[Residual], *, threshold_pct: float = DEFAULT_THRESHOLD_PCT, strict_pointwise: bool = True,
 ) -> dict[CohortKey, CohortSummary]:
     """Summarize streamed residuals per cohort using compact metric tuples only."""
     buckets: dict[CohortKey, list[Any]] = {}
@@ -653,8 +711,11 @@ def summarize_cohorts(
         mape_pct, medape_pct = float(statistics.fmean(apes)), float(statistics.median(apes))
         p90_idx = min(len(apes) - 1, max(0, math.ceil(TAIL_QUANTILE_P90 * len(apes)) - 1))
         failed = tuple(k for k, v in (("mape_pct", mape_pct), ("medape_pct", medape_pct)) if v >= threshold_pct)
+        if strict_pointwise and tails:
+            failed += ("max_ape_pct",)
+        status: CohortStatus = "fail" if failed else ("insufficient_evidence" if missing else "pass")
         summaries[cohort_key] = CohortSummary(
-            cohort_key, "fail" if failed else "pass", len(roots), len(apes),
+            cohort_key, status, len(roots), len(apes),
             mape_pct, medape_pct, float(statistics.median(signed)), float(apes[p90_idx]), float(apes[-1]),
             missing, excluded_tuple, threshold_pct, failed, tuple(tails), tuple(sorted(roots)),
         )
@@ -665,15 +726,22 @@ def gate_decision(
     summaries: Mapping[CohortKey, CohortSummary], *,
     required_levels: Sequence[Level] = REQUIRED_LEVELS,
     require_disjoint_level_roots: bool = True,
+    expected_case_ids: Iterable[str] | None = None,
+    evaluated_case_ids: Iterable[str | Residual] | None = None,
+    calibrated_count: int | None = None,
+    plan_only: bool = False,
 ) -> dict[str, Any]:
-    """Compute strict 3-level gate verdict requiring independent L1, L2, and L3 coverage."""
-    req = tuple(required_levels)
-    if not summaries:
-        return {
-            "status": "insufficient_evidence", "cohort_count": 0, "covered_levels": [],
-            "missing_levels": sorted(req), "overlapping_level_roots": [],
-            "failed_cohorts": [], "insufficient_cohorts": [], "tail_warning_cohorts": [],
+    """Compute the release verdict from cohort results and optional planned coverage.
+
+    Pass case IDs or residuals as evaluated_case_ids. Only ok residuals count.
+    """
+    missing_planned_cases = []
+    if expected_case_ids is not None:
+        evaluated = {
+            row if isinstance(row, str) else row.case_id
+            for row in (evaluated_case_ids or ()) if isinstance(row, str) or row.status == "ok"
         }
+        missing_planned_cases = sorted(set(expected_case_ids) - evaluated)
     failed = sorted(k.as_id() for k, v in summaries.items() if v.status == "fail")
     insufficient = sorted(k.as_id() for k, v in summaries.items() if v.status == "insufficient_evidence")
     tail_warnings = sorted(k.as_id() for k, v in summaries.items() if v.tail_exceeded)
@@ -684,14 +752,20 @@ def gate_decision(
             covered_levels.add(key.level)
             for root in summary.acquisition_roots:
                 root_levels.setdefault(root, set()).add(key.level)
-    missing_levels = sorted(lvl for lvl in req if lvl not in covered_levels)
+    missing_levels = sorted(lvl for lvl in required_levels if lvl not in covered_levels)
     overlapping_roots = sorted(r for r, lvls in root_levels.items() if len(lvls) > 1)
-    status = "fail" if failed else ("insufficient_evidence" if (insufficient or missing_levels or (require_disjoint_level_roots and overlapping_roots)) else "pass")
+    incomplete = (
+        not summaries or insufficient or missing_levels or missing_planned_cases
+        or (require_disjoint_level_roots and overlapping_roots)
+        or plan_only or (calibrated_count is not None and calibrated_count <= 0)
+    )
+    status = "fail" if failed else ("insufficient_evidence" if incomplete else "pass")
     return {
         "status": status, "cohort_count": len(summaries),
         "covered_levels": sorted(covered_levels), "missing_levels": missing_levels,
         "overlapping_level_roots": overlapping_roots,
         "failed_cohorts": failed, "insufficient_cohorts": insufficient, "tail_warning_cohorts": tail_warnings,
+        "missing_planned_cases": missing_planned_cases, "plan_only": plan_only, "calibrated_count": calibrated_count,
     }
 
 
@@ -701,7 +775,7 @@ __all__ = [
     "EngineRunReceipt", "EvaluationRunner", "FrozenFitManifest", "FrozenFitParameter",
     "GateCase", "Manifest", "REQUIRED_LEVELS", "Residual", "SHA256_HEX_LENGTH",
     "SOURCE_REF_KEYS", "STREAM_CHUNK_BYTES", "STREAM_WHOLE_READ_LIMIT_BYTES",
-    "SplitIndex", "TIME_UNIT_SCALE_NS", "bind_engine_interval", "bind_engine_rung_interval",
+    "SplitIndex", "TIME_UNIT_SCALE_NS", "VALID_CLOCK_OPERATORS", "bind_engine_interval", "bind_engine_rung_interval",
     "evaluate", "gate_decision", "normalize_lineage_token", "parse_gate_case",
     "run_l1", "run_l2", "run_l3", "sanitize_capture_uri", "sanitize_source_ref",
     "stream_jsonl", "stream_manifest", "summarize_cohorts", "validate_lineage",

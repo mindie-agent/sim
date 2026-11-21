@@ -29,9 +29,9 @@ from typing import Any, Mapping
 
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.operators import OpSpec
-from .mechanism import Geometry, OperatorPlan, PlannedRecipe, Work
-from .ownership import read_role, unit_group
-from .program import KernelProgram, ParallelProgram, Stage
+from ...mechanism import Geometry, OperatorPlan, PlannedRecipe, Work
+from ...ownership import read_role, unit_group
+from ...program import KernelProgram, ParallelProgram, Stage
 
 RECIPE = "megamoe_arch35"
 NATIVE_KIND = "aclnnMegaMoe"

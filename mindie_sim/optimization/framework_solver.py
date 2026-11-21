@@ -7,7 +7,7 @@
 """
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass, fields, is_dataclass, replace
 from itertools import islice, zip_longest
@@ -33,7 +33,33 @@ REQUIRED_GATE_COUNT = 5
 FRAMEWORK_STAGES = (
     "F1_local_k1", "F2_collective_dbo", "F3_stream_core", "F4_prefetch",
 )
-__all__ = ("CoreLatticePoint", "FrameworkSolveResult", "generate_gcd_core_lattice", "solve_framework")
+__all__ = (
+    "CandidateSearchStats", "CoreLatticePoint", "FrameworkSolveResult",
+    "generate_gcd_core_lattice", "solve_framework",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateSearchStats:
+    """Explicit disclosure of constructive search funnel counts and rejections."""
+
+    eligible_sites: int = 0
+    generated_candidates: int = 0
+    rejected_candidates: int = 0
+    replayed_candidates: int = 0
+    rejection_reasons: tuple[tuple[str, int], ...] = ()
+
+    def merge(self, other: CandidateSearchStats) -> CandidateSearchStats:
+        reasons = Counter(dict(self.rejection_reasons))
+        reasons.update(dict(other.rejection_reasons))
+        return CandidateSearchStats(
+            eligible_sites=self.eligible_sites + other.eligible_sites,
+            generated_candidates=self.generated_candidates + other.generated_candidates,
+            rejected_candidates=self.rejected_candidates + other.rejected_candidates,
+            replayed_candidates=self.replayed_candidates + other.replayed_candidates,
+            rejection_reasons=tuple(sorted(reasons.items())),
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class CoreLatticePoint:
@@ -51,6 +77,7 @@ class FrameworkSolveResult:
     stage_history: tuple[tuple[str, int, str], ...]
     loo_impacts: tuple[tuple[str, int], ...]
     tried_candidates: int
+    search_stats: CandidateSearchStats = CandidateSearchStats()
 
 def _wave_points(counts, total, step=1):
     if not total or not step:
@@ -193,15 +220,34 @@ class _TrialSearch:
                             dual_certificate=dual_certificate)
         self.remaining = max(0, max_trials)
         self.tried = 0
+        self.eligible_sites = 0
+        self.generated = 0
+        self.rejected = 0
+        self.replayed = 0
+        self.rejection_reasons: Counter[str] = Counter()
         self.history = []
         self.seen = set()
         self.frontier = {}
+
+    def stats(self) -> CandidateSearchStats:
+        return CandidateSearchStats(
+            eligible_sites=self.eligible_sites,
+            generated_candidates=self.generated,
+            rejected_candidates=self.rejected,
+            replayed_candidates=self.replayed,
+            rejection_reasons=tuple(sorted(self.rejection_reasons.items())),
+        )
+
+    def note_eligible(self, count: int) -> None:
+        self.eligible_sites += max(0, int(count))
 
     def finalize(self, plan):
         from mindie_sim.rewrite.oracle import finalize_plan
         if getattr(self, "best_plan", None) == plan:
             return self.best_eval
-        return finalize_plan(self.handle, plan, budget=self.budget, **self.options)
+        handle_base = getattr(getattr(self.handle, "scenario", None), "base_graph_sha256", None)
+        options = self.options if (handle_base is None or plan.base_graph_sha256 == handle_base) else {}
+        return finalize_plan(self.handle, plan, budget=self.budget, **options)
 
     def seed(self, plan, evaluation):
         from mindie_sim.rewrite.schema import plan_sha256
@@ -217,7 +263,8 @@ class _TrialSearch:
             return self.finalize(plan)
         except SoundnessInversionError:
             raise
-        except ModelingError:
+        except ModelingError as exc:
+            self.rejection_reasons[str(exc).partition(":")[0] or "modeling_error"] += 1
             return None
 
     def compare(self, plans, limit):
@@ -229,6 +276,7 @@ class _TrialSearch:
                 digest = plan_sha256(plan)
                 if digest not in self.seen:
                     self.seen.add(digest)
+                    self.generated += 1
                     yield plan
 
         pending = unique()
@@ -246,13 +294,19 @@ class _TrialSearch:
             ranked = []
             for plan, estimate in zip(batch, evaluations):
                 if getattr(estimate, "accepted", True) is False:
+                    self.rejected += 1
+                    reason = str(getattr(estimate, "reason", "") or getattr(estimate, "status", "rejected"))
+                    self.rejection_reasons[reason.partition(":")[0] or "rejected"] += 1
                     continue
                 try:
                     estimated_wall = _wall(estimate)
                 except AttributeError:
+                    self.rejected += 1
+                    self.rejection_reasons["missing_wall_estimate"] += 1
                     continue
                 ranked.append((estimated_wall, plan_sha256(plan), plan))
             for _, _, plan in sorted(ranked):
+                self.replayed += 1
                 result = self.try_finalize(plan)
                 if result is not None and _accepted(result):
                     key = plan.base_graph_sha256
@@ -261,6 +315,10 @@ class _TrialSearch:
                         self.frontier[key] = (plan, result)
                     if _wall(result) < _wall(self.best_eval):
                         self.seed(plan, result)
+                else:
+                    self.rejected += 1
+                    if result is not None:
+                        self.rejection_reasons["finalize_gate_failed"] += 1
 
     def stage(self, stage_id, plans, limit):
         from mindie_sim.rewrite.schema import plan_sha256
@@ -528,11 +586,14 @@ def solve_framework(
     def proposals(base, scenario, stage):
         ops = _atomic_ops(scenario)
         if stage == "F3_stream_core":
-            yield from (_stream_plan(base, stage, op) for op in _stream_candidates(scenario, ops))
+            cands = tuple(_stream_candidates(scenario, ops))
+            search.note_eligible(1 if cands else 0)
+            yield from (_stream_plan(base, stage, op) for op in cands)
             return
-        operations = (_local_operations(scenario, ops, mainline) if stage == "F1_local_k1"
-                      else _collective_operations(ops, dual_report) if stage == "F2_collective_dbo"
-                      else _prefetch_operations(scenario, ops))
+        operations = tuple(_local_operations(scenario, ops, mainline) if stage == "F1_local_k1"
+                           else _collective_operations(ops, dual_report) if stage == "F2_collective_dbo"
+                           else _prefetch_operations(scenario, ops))
+        search.note_eligible(len(operations))
         yield from (_with_operations(base, stage, (op,)) for op in operations)
 
     for index, stage in enumerate(FRAMEWORK_STAGES):
@@ -543,4 +604,5 @@ def solve_framework(
         search.stage(stage, plans, limit)
     impacts = search.loo(search.best_plan, _wall(search.best_eval), search.remaining)
     return FrameworkSolveResult(search.best_plan, search.best_eval, _wall(search.best_eval),
-                                u_ns, m_ns, tuple(search.history), impacts, search.tried)
+                                u_ns, m_ns, tuple(search.history), impacts, search.tried,
+                                search_stats=search.stats())

@@ -10,7 +10,7 @@
 from __future__ import annotations
 
 from mindie_sim.schema.operators import OpSpec
-from ...mechanism import Geometry, OperatorPlan
+from ...mechanism import Geometry, OperatorPlan, PlannedRecipe
 from ...results import FusedPipelineDescriptor, OpOccurrence
 from ..contracts import OperatorFamilySpec, OperatorPlanningContext, ResolvedOperator
 from .arch22 import STRATEGY as MEMBASE_STRATEGY
@@ -36,6 +36,11 @@ _STRATEGIES = {
 
 def resolve_operator_plan(op: OpSpec, ctx: OperatorPlanningContext) -> ResolvedOperator:
     """Resolve one occurrence against an explicitly declared device datapath."""
+    if op.family == "attn_res_prefix" and "attn_res_view" in dict(op.metadata):
+        from ...family_attnres import IMPLEMENTATION as PREFIX_IMPL, SOURCE as PREFIX_SOURCE, build as build_prefix
+
+        plan = build_prefix(op, ctx.geometry)
+        return ResolvedOperator(ctx.occurrence, op, plan, PREFIX_IMPL, (PREFIX_SOURCE,), None)
     arch_id = ctx.compute_arch.arch_id
     strategy = _STRATEGIES.get(arch_id)
     if strategy is None:
@@ -57,6 +62,10 @@ def resolve_operator_plan(op: OpSpec, ctx: OperatorPlanningContext) -> ResolvedO
 
 def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
     """Build a plan through the same resolver used by the family registry."""
+    if op.family == "attn_res_prefix" and "attn_res_view" in dict(op.metadata):
+        from ...family_attnres import build as build_prefix
+
+        return build_prefix(op, geometry)
     if geometry.datapath is None:
         raise gap("hyper_connections_requires_datapath", op.op_id)
     context = OperatorPlanningContext(
@@ -67,6 +76,17 @@ def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
         stream_owners=geometry.stream_owners,
     )
     return resolve_operator_plan(op, context).recipe
+
+
+class GovernedAttnResRecipe(PlannedRecipe):
+    """Preserve AttnRes prefix view preparation while keeping governed ownership."""
+
+    def prepare(self, op: OpSpec, geometry: Geometry):
+        if op.family == "attn_res_prefix" and "attn_res_view" in dict(op.metadata):
+            from ...family_attnres import AttnResRecipe, build as build_prefix
+
+            return AttnResRecipe(build_prefix).prepare(op, geometry)
+        return super().prepare(op, geometry)
 
 
 def register_family() -> OperatorFamilySpec:

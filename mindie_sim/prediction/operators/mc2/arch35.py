@@ -16,7 +16,7 @@ import math
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import ArchId, SourceRef
 from mindie_sim.schema.operators import OpSpec
-from ... import mc2_megamoe
+from . import megamoe as mc2_megamoe
 from ...mc2_phase import RECIPE, build as build_fullmesh, contract
 from ...mechanism import OperatorPlan, PlannedRecipe, Work
 from ...moe_comm_selection import FUSED_MC2

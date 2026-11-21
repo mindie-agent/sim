@@ -585,8 +585,7 @@ def _bind_declared_work(plan, stage, semantic):
             if context:
                 row, bound = next(iter(context.bind(Work(matrix={dtype: raw})).items()))
             else:
-                from .registry import default_cube_peak
-                bound = 1000 * raw / default_cube_peak(plan.datapath, dtype)
+                bound = 1000 * raw / plan.datapath.cube_peak(dtype)
             unit = "peak_ms"
         else:
             pipe = physical_pipes.get(role)

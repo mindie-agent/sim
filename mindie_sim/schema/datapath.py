@@ -109,10 +109,24 @@ class DatapathCapabilitySpec:
     hbm_write_bytes_per_s: float = 0.0
     memory_access: MemoryAccessSpec | None = None
     buffers: tuple[tuple[str, int], ...] = ()
+    compute_peaks: tuple[tuple[str, float], ...] = ()
+    compute_peak_aliases: tuple[tuple[str, str], ...] = ()
 
     @property
     def arch_id(self) -> ArchId:
         return self.compute_arch.arch_id
+
+    def cube_peak(self, dtype: str) -> float:
+        """Return the declared matrix peak (FLOP/s) for ``dtype`` without profile guessing."""
+        arch = self.compute_arch.declared
+        if arch is None or not arch.supports_native("matrix", dtype):
+            raise ModelingError(f"fuse_region_matrix_precision_unsupported:{dtype}")
+        aliases = dict(self.compute_peak_aliases)
+        peaks = dict(self.compute_peaks)
+        name = aliases.get(dtype, dtype)
+        if name in peaks and peaks[name] > 0.0:
+            return float(peaks[name])
+        raise ModelingError(f"fuse_region_compute_precision_requires_context:{dtype}")
 
     @property
     def supported_output_paths(self) -> tuple[str, ...]:
@@ -327,6 +341,7 @@ class DatapathCapabilitySpec:
             self.hbm_write_bytes_per_s,
             self.memory_access,
             self.buffers,
+            self.compute_peaks,
         )
 
 
@@ -417,6 +432,8 @@ def datapath_for_die(
         hbm_write_bytes_per_s=hbm_write,
         memory_access=die.memory_access,
         buffers=tuple(die.buffers),
+        compute_peaks=tuple((str(k), float(v)) for k, v in die.compute_peaks),
+        compute_peak_aliases=tuple((str(k), str(v)) for k, v in die.compute_peak_aliases),
     )
 
 

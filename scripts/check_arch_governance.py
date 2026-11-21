@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Architecture governance AST & file-layout gate (AG001..AG005) for ``mindie_sim``.
+"""Architecture governance gate (AG001..AG007) for ``mindie_sim``.
 
 [Role] Enforce governed ``mindie_sim/prediction/operators/<family>/`` package
   boundaries, forbid flat ISA/CANN filename sprawl under ``mindie_sim/**/*.py``,
   block direct leaf imports, block ``service_modes`` / ``compute_peaks``
-  capability sniffing, and verify upstream ABI/SHA-256 provenance on ISA leaves.
+  capability sniffing, verify ISA provenance, and enforce recipe ownership and
+  physical discrimination.
 [Invariants] ``AG001`` scans strictly ``mindie_sim/**/*.py`` so model catalog
   JSON files (e.g. ``qwen3.5-35b-a3b.json``) are never flagged. Governed
   ``operators/<family>/**`` modules allow zero violations in every mode.
@@ -19,13 +20,17 @@ import argparse
 import ast
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
 import hashlib
 import keyword
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import sys
+
+if __package__:
+    from ._arch_governance_runtime import Violation, scan_runtime, verify_ag007_discrimination
+else:
+    from _arch_governance_runtime import Violation, scan_runtime, verify_ag007_discrimination
 
 SIM_PACKAGE_ROOT = "mindie_sim"
 GOVERNED_LEAF_NAMES = frozenset({"arch22.py", "arch35.py"})
@@ -35,6 +40,11 @@ AG001_STEM_RE = re.compile(
     re.IGNORECASE,
 )
 UPSTREAM_ABI_RE = re.compile(r"^\s*Upstream-ABI:\s*(\S+)", re.MULTILINE)
+HEURISTIC_IDENTIFIER_RE = re.compile(
+    r"(?:^|_)(?:fudge|discount|overlap_decay|heuristic_factor|latency_multiplier)(?:_|$)",
+    re.IGNORECASE,
+)
+CAMEL_CASE_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 HEX_REVISION_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 DOCSTRING_HEADER_MAX_LINE = 30
@@ -69,28 +79,17 @@ _CP_INFRA_FILES = _SM_INFRA_FILES | frozenset({
 LEGACY_ALLOWLIST: dict[str, frozenset[str]] = {}
 
 
-@dataclass(frozen=True, slots=True)
-class Violation:
-    """Single architecture governance finding."""
-
-    rule: str
-    path: PurePosixPath
-    line: int
-    fingerprint: str
-    message: str
-
-
 def _is_governed_family_path(rel: PurePosixPath) -> tuple[bool, str | None, str]:
     parts = rel.parts
-    if len(parts) == GOVERNED_PATH_DEPTH and parts[: len(OPERATORS_PARTS)] == OPERATORS_PARTS:
-        return True, parts[len(OPERATORS_PARTS)], parts[len(OPERATORS_PARTS) + 1]
+    if len(parts) >= GOVERNED_PATH_DEPTH and parts[: len(OPERATORS_PARTS)] == OPERATORS_PARTS:
+        return True, parts[len(OPERATORS_PARTS)], rel.name
     return False, None, rel.name
 
 
 def _is_allowed_isa_leaf(rel: PurePosixPath) -> bool:
     in_pkg, family, filename = _is_governed_family_path(rel)
     return (
-        in_pkg
+        in_pkg and len(rel.parts) == GOVERNED_PATH_DEPTH
         and family is not None
         and filename in GOVERNED_LEAF_NAMES
         and family.isidentifier()
@@ -236,7 +235,7 @@ def _check_ag001(rel: PurePosixPath) -> list[Violation]:
 def _check_ag002(rel: PurePosixPath, tree: ast.Module, parents: dict[ast.AST, ast.AST]) -> list[Violation]:
     violations: list[Violation] = []
     in_pkg, own_family, filename = _is_governed_family_path(rel)
-    is_family_init = in_pkg and filename == "__init__.py"
+    is_family_init = in_pkg and len(rel.parts) == GOVERNED_PATH_DEPTH and filename == "__init__.py"
     str_consts = _module_string_constants(tree)
     family_aliases: dict[str, str] = {}
     leaf_export_names: set[str] = set(GOVERNED_LEAF_STEMS)
@@ -641,11 +640,33 @@ def _check_ag005(
     return violations
 
 
+def _check_ag007(rel: PurePosixPath, tree: ast.Module) -> list[Violation]:
+    if not _is_governed_family_path(rel)[0]:
+        return []
+    violations = []
+    seen = set()
+    for node in ast.walk(tree):
+        for field, value in ast.iter_fields(node):
+            if field not in {"id", "name", "asname", "attr", "arg", "rest", "value"}:
+                continue
+            if not isinstance(value, str) or not value.isidentifier():
+                continue
+            key = (node.lineno, value)
+            spelling = CAMEL_CASE_BOUNDARY_RE.sub("_", value)
+            if key not in seen and HEURISTIC_IDENTIFIER_RE.search(spelling):
+                seen.add(key)
+                violations.append(Violation(
+                    "AG007", rel, node.lineno, f"AG007:{rel.as_posix()}:{value}",
+                    f"ad hoc heuristic identifier {value!r} in an operator family",
+                ))
+    return violations
+
+
 def scan_repository(
     root: Path, /, *, revision: str | None = None,
     refs_root: Path | None = None, repo_map: Mapping[str, Path] | None = None,
 ) -> tuple[Violation, ...]:
-    """Scan ``mindie_sim/**/*.py`` and return all sorted ``AG001..AG005`` violations."""
+    """Return the sorted static findings under ``mindie_sim/**/*.py``."""
     violations: list[Violation] = []
     for rel, text in _enumerate_py_files(root, revision=revision):
         violations.extend(_check_ag001(rel))
@@ -661,6 +682,7 @@ def scan_repository(
         violations.extend(_check_ag002(rel, tree, parents))
         violations.extend(_check_ag003_ag004(rel, tree, parents))
         violations.extend(_check_ag005(rel, text, tree, refs_root=refs_root, repo_map=repo_map))
+        violations.extend(_check_ag007(rel, tree))
     violations.sort(key=lambda v: (v.path.as_posix(), v.line, v.rule, v.message))
     return tuple(violations)
 
@@ -700,7 +722,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", default=".", help="repository root")
     parser.add_argument("--base", default=None, help="git base ref for differential scan")
-    parser.add_argument("--strict", action="store_true", help="ignore legacy allowlist")
+    parser.add_argument("--strict", action="store_true", help="run live checks and ignore legacy allowlist")
     parser.add_argument("--refs-root", default=None, help="local upstream repos root for SHA-256 check")
     parser.add_argument(
         "--repo-map",
@@ -721,6 +743,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             active = current
         else:
             active = filter_allowlisted(current)
+        if args.strict:
+            active += scan_runtime(root)
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return EXIT_USAGE

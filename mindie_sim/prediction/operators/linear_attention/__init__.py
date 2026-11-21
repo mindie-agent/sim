@@ -14,10 +14,12 @@ from ...mechanism import Geometry, OperatorPlan
 from ...program import RecipeContext
 from ...results import OpOccurrence
 from ..contracts import OperatorFamilySpec, OperatorPlanningContext, ResolvedOperator
+from . import gdn_decode
 from .arch22 import STRATEGY as _ARCH22
 from .arch35 import STRATEGY as _ARCH35
 from .common import (
     ABI_OPERATIONS,
+    CHUNK32_KERNELS,
     OPERATIONS,
     RECOVER_SSM_FAMILIES,
     CausalConvContract,
@@ -59,6 +61,16 @@ def chunk32_timing_policy(
 
 def resolve_operator_plan(op: OpSpec, ctx: OperatorPlanningContext) -> ResolvedOperator:
     """Bind a governed operation to its executable plan and source descriptor."""
+    if op.recipe in gdn_decode.RECIPE_IDS:
+        plan = gdn_decode.build(op, ctx.geometry)
+        return ResolvedOperator(ctx.occurrence, op, plan, op.recipe)
+    if op.recipe in CHUNK32_KERNELS:
+        from ...gdn_chunk32 import recipes
+        from ...physical_recipe_registry import uses_retained_source_plan
+
+        if uses_retained_source_plan(op):
+            plan = recipes()[op.recipe].build(op, ctx.geometry)
+            return ResolvedOperator(ctx.occurrence, op, plan, op.recipe)
     strategy = _STRATEGIES.get(ctx.compute_arch.arch_id)
     if strategy is None:
         raise missing("linear_attention_arch_unsupported", f"Unsupported ISA {ctx.compute_arch.arch_id}")
@@ -86,7 +98,9 @@ def resolve_operator_plan(op: OpSpec, ctx: OperatorPlanningContext) -> ResolvedO
 
 
 def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
-    """Build the same plan through the legacy analytical planner entrypoint."""
+    """Build through the governed resolver from physical geometry."""
+    if op.recipe in gdn_decode.RECIPE_IDS:
+        return gdn_decode.build(op, geometry)
     if geometry.datapath is None:
         raise missing("linear_attention_datapath_required", "Geometry must declare the ISA datapath")
     ctx = OperatorPlanningContext(
@@ -100,7 +114,8 @@ def register_family() -> OperatorFamilySpec:
     """Declare recipe ownership for explicit registration in a FamilyRegistry."""
     return OperatorFamilySpec(
         name="linear_attention", families=OPERATIONS | {"linear_attention", "recover_ssm"},
-        owned_recipe_ids=OPERATIONS | frozenset(ABI_OPERATIONS), resolve=resolve_operator_plan,
+        owned_recipe_ids=OPERATIONS | frozenset(ABI_OPERATIONS) | gdn_decode.RECIPE_IDS,
+        resolve=resolve_operator_plan,
     )
 
 

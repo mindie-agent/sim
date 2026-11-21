@@ -366,68 +366,11 @@ def _measure_periodic_combo(
     extra_right_ivs: tuple[tuple[int, int], ...] = (),
 ) -> int:
     """Exact byte measure of union (``intersect=False``) or intersection of runs + intervals."""
-    left_c = tuple(dict.fromkeys(r.canonical() for r in left if r.rows > 0 and r.row_bytes > 0))
-    right_c = tuple(dict.fromkeys(r.canonical() for r in right if r.rows > 0 and r.row_bytes > 0))
-    if not intersect and not left_c and not right_c:
-        return _measure_byte_intervals(_merge_byte_intervals((*extra_left_ivs, *extra_right_ivs)))
-    if intersect and ((not left_c and not extra_left_ivs) or (not right_c and not extra_right_ivs)):
-        return 0
-    if not intersect and len(left_c) == 1 and not right_c:
-        r0, ivs = left_c[0], _merge_byte_intervals((*extra_left_ivs, *extra_right_ivs))
-        return _measure_byte_intervals(ivs) + max(0, r0.total_bytes() - sum(r0.overlap_with_interval(a, b) for a, b in ivs))
-    if intersect and len(left_c) == 1 and len(right_c) == 1 and not extra_left_ivs and not extra_right_ivs:
-        a, b = left_c[0], right_c[0]
-        if a == b:
-            return a.total_bytes()
-        if (a.sector_bytes == b.sector_bytes and a.stride_bytes == b.stride_bytes > 0
-                and a.stride_bytes % a.sector_bytes == 0
-                and (a.rows == 1 or a.row_bytes < a.stride_bytes)
-                and (b.rows == 1 or b.row_bytes < b.stride_bytes)):
-            st, w1, w2 = a.stride_bytes, a.row_bytes, b.row_bytes
-            q, rem = divmod(b.base_byte - a.base_byte, st)
-            total = 0
-            for s in range(math.floor((-rem - w2) / st), math.ceil((w1 - rem) / st) + 1):
-                ov_w = min(w1, rem + s * st + w2) - max(0, rem + s * st)
-                k_lo, k_hi = max(0, q - s), min(a.rows - 1, b.rows - 1 + q - s)
-                if ov_w > 0 and k_hi >= k_lo:
-                    total += (k_hi - k_lo + 1) * ov_w
-            return total
-    pts = {x for r in (*left_c, *right_c) for x in r._bounds() if r._bounds()[1] > r._bounds()[0]}
-    pts.update(x for lo, hi in (*extra_left_ivs, *extra_right_ivs) if hi > lo for x in (lo, hi))
-    coords, total = sorted(pts), 0
-    for s_lo, s_hi in zip(coords, coords[1:]):
-        l_cov = any(lo <= s_lo and hi >= s_hi for lo, hi in extra_left_ivs)
-        r_cov = any(lo <= s_lo and hi >= s_hi for lo, hi in extra_right_ivs)
-        l_act = () if l_cov else tuple(r for r in left_c if r._bounds()[0] <= s_lo and r._bounds()[1] >= s_hi)
-        r_act = () if r_cov else tuple(r for r in right_c if r._bounds()[0] <= s_lo and r._bounds()[1] >= s_hi)
-        if not intersect:
-            if l_cov or r_cov:
-                total += s_hi - s_lo
-                continue
-            act = tuple(dict.fromkeys((*l_act, *r_act)))
-            if not act:
-                continue
-            eval_fn = lambda w0, w1, _a=act: _measure_byte_intervals(_merge_byte_intervals([iv for r in _a for iv in r._window_intervals(w0, w1)]))
-        else:
-            if (not l_cov and not l_act) or (not r_cov and not r_act):
-                continue
-            if l_cov and r_cov:
-                total += s_hi - s_lo
-                continue
-            act = tuple(dict.fromkeys((*l_act, *r_act)))
-            eval_fn = lambda w0, w1, _lc=l_cov, _rc=r_cov, _la=l_act, _ra=r_act: _measure_byte_intervals(_intersect_byte_intervals(
-                ((w0, w1),) if _lc else _merge_byte_intervals([iv for r in _la for iv in r._window_intervals(w0, w1)]),
-                ((w0, w1),) if _rc else _merge_byte_intervals([iv for r in _ra for iv in r._window_intervals(w0, w1)]),
-            ))
-        period = math.lcm(*(r._period() for r in act))
-        in_lo = min(s_hi, max(s_lo, max(r._bounds()[0] + period for r in act)))
-        in_hi = max(in_lo, min(s_hi, min(r._bounds()[1] - period for r in act)))
-        total += eval_fn(s_lo, in_lo) if in_lo > s_lo else 0
-        if in_hi > in_lo:
-            full, rem = divmod(in_hi - in_lo, period)
-            total += (full * eval_fn(in_lo, in_lo + period) if full else 0) + (eval_fn(in_lo + full * period, in_hi) if rem else 0)
-        total += eval_fn(in_hi, s_hi) if s_hi > in_hi else 0
-    return total
+    from .periodic_runs import _measure_periodic_combo as _measure_impl
+    return _measure_impl(
+        left, right, intersect=intersect,
+        extra_left_ivs=extra_left_ivs, extra_right_ivs=extra_right_ivs,
+    )
 
 
 @dataclass(frozen=True, slots=True)

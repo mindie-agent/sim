@@ -22,7 +22,7 @@ from .dual_bound import (
     inward_floor_ns, solve_checked_critical_path, solve_farkas_dual, verify_epoch_trace,
 )
 from .framework_solver import (
-    CoreLatticePoint, FrameworkSolveResult, generate_gcd_core_lattice, solve_framework,
+    CandidateSearchStats, CoreLatticePoint, FrameworkSolveResult, generate_gcd_core_lattice, solve_framework,
 )
 from .ladder import (
     FIVE_LEVEL_REPORT_SCHEMA, FiveLevelLadderMetrics, FiveLevelReport, FiveLevelWaterfall,
@@ -46,7 +46,7 @@ __all__ = (
     "build_dual_inputs_from_scenario", "certify_lower_bound", "check_farkas_dual",
     "check_optimality_certificate", "eval_checked_path", "inward_floor_ns",
     "solve_checked_critical_path", "solve_farkas_dual", "verify_epoch_trace",
-    "CoreLatticePoint", "FrameworkSolveResult", "generate_gcd_core_lattice", "solve_framework",
+    "CandidateSearchStats", "CoreLatticePoint", "FrameworkSolveResult", "generate_gcd_core_lattice", "solve_framework",
     "FIVE_LEVEL_REPORT_SCHEMA", "FiveLevelLadderMetrics", "FiveLevelReport", "FiveLevelWaterfall",
     "LooMarginalImpact", "OrderedTelescopeStep", "RegionWallAttribution", "partition_step_wall_ns",
     "solve_five_level_ladder", "BITS_PER_BYTE", "MAX_EXPLICIT_STRIDED_ROWS", "SECTOR_BYTES",

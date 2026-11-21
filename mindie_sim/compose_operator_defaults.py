@@ -343,7 +343,7 @@ def lightning_indexer_reason(case, layers):
     row count; both bounds are real iteration geometries.
     """
     from mindie_sim.prediction.generic_latent_attention import index_cache_format
-    from mindie_sim.prediction import family_lightning_indexer as li
+    from mindie_sim.prediction.operators.sparse_indexer import bf16_lightning as li
     from mindie_sim.prediction.mechanism import Geometry
     fmt = index_cache_format(case.model)
     if fmt.dtype not in BF16_INDEX_CACHE_DTYPES or fmt.packed_elements != 1:

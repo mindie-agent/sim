@@ -11,14 +11,27 @@
 """
 import math
 
-from .mechanism import OperatorPlan, Work
-from .engine import Allocation
-from .ownership import read_role, unit_group
-from .program import KernelProgram, ParallelProgram, PipelineProgram, Stage
-from .transactions import QueuedStore
+from mindie_sim.schema.common import dtype_bytes
+
+from ...mechanism import OperatorPlan, Work
+from ...engine import Allocation
+from ...ownership import read_role, unit_group
+from ...program import KernelProgram, ParallelProgram, PipelineProgram, Stage
+from ...transactions import QueuedStore
 
 GATING = "ascend_gdn_decode_gating"
 CONV = "ascend_causal_conv1d_update"
+BF16_BYTES = int(dtype_bytes("bf16"))
+FP32_BYTES = int(dtype_bytes("fp32"))
+CONV_TILE_CHANNELS = (4096, 2048, 1024, 512, 384, 192)
+CONV_MAX_TILE_CHANNELS = CONV_TILE_CHANNELS[0]
+CONV_SPECULATIVE_WIDTH = 4
+CONV_SUPPORTED_WIDTHS = frozenset({2, 3, CONV_SPECULATIVE_WIDTH})
+CONV_RING_SLOTS = 5
+CONV_FP32_SCRATCH_SLOTS = 8
+GATING_TILE_ROWS = 64
+GATING_TILE_HEADS = 8
+GATING_PER_ELEMENT_OPS = 13
 #: One AIV resolves `conv_state_indices[b]`, latches the two rolling descriptors
 #: and drains the previous task's MTE3 before `RunSeq` may start.
 CONV_STATE_RESOLVE_US = 2.65
@@ -43,9 +56,8 @@ CONV_SOURCE = {
 
 def update_geometry(batch, dim, units):
     """Exact-divisor candidates take precedence over candidates with a tail."""
-    candidates = (4096, 2048, 1024, 512, 384, 192)
     for exact in (True, False):
-        choices = [(tile, math.ceil(dim / tile)) for tile in candidates
+        choices = [(tile, math.ceil(dim / tile)) for tile in CONV_TILE_CHANNELS
                    if not exact or dim % tile == 0]
         if choices:
             over = [item for item in choices if batch * item[1] >= units]
@@ -142,7 +154,7 @@ def conv_plan(op, geometry, *, compact=True):
     lengths = tuple(meta.get("physical_sequence_tokens", meta["sequence_tokens"]))
     width = meta["kernel_width"]
     dim, dtype = op.local_shape[1], op.dtype
-    if dtype not in {"bf16", "fp16"} or width not in {2, 3, 4}:
+    if dtype not in {"bf16", "fp16"} or width not in CONV_SUPPORTED_WIDTHS:
         raise ValueError("gdn_decode_convolution_requires_16bit_width2to4")
     padding_slots = tuple(int(slot) for slot in meta.get("padding_slots", ()))
     if len(set(padding_slots)) != len(padding_slots) or any(
@@ -160,7 +172,7 @@ def conv_plan(op, geometry, *, compact=True):
                             metadata={"empty_active_sequences": True})
     max_query = max((q for q, own in zip(lengths, has_state) if q > 0 and own),
                     default=1)
-    if speculative and (width != 4 or meta["state_history_slots"] < 2 + max_query):
+    if speculative and (width != CONV_SPECULATIVE_WIDTH or meta["state_history_slots"] < 2 + max_query):
         raise ValueError("gdn_decode_speculative_convolution_requires_width4_history")
     if not speculative and meta["state_history_slots"] < width - 1:
         raise ValueError("gdn_decode_convolution_requires_history_width_minus_one")
@@ -189,7 +201,8 @@ def conv_plan(op, geometry, *, compact=True):
     # inputs from UB, so neither adds an off-chip descriptor.
     external = sum(2 * (q + width - 1) * dim * 2
                    for q, own in zip(lengths, has_state) if q > 0 and own)
-    vector = sum((width + 1 + q * (3 * width + 5 + 2 * int(bias))) * dim
+    token_ops = CONV_TOKEN_TAP_OPS * width + CONV_TOKEN_FIXED_OPS + CONV_TOKEN_BIAS_OPS * int(bias)
+    vector = sum((width + 1 + q * token_ops) * dim
                  for q, own in zip(lengths, has_state) if q > 0 and own)
     work = Work(resources={"hbm": external, read: reads, "mte3": writes, "vector": vector})
 
@@ -201,10 +214,7 @@ def conv_plan(op, geometry, *, compact=True):
             def token(index):
                 stages = [
                     Stage("input", memory(n * 2, read), placement=owned),
-                    Stage("convolution", context.bind(Work(resources={
-                        "vector": n * (CONV_TOKEN_TAP_OPS * width
-                                       + CONV_TOKEN_FIXED_OPS
-                                       + CONV_TOKEN_BIAS_OPS * int(bias))}).scaled(repeat)),
+                    Stage("convolution", context.bind(Work(resources={"vector": n * token_ops}).scaled(repeat)),
                           after=("input",), previous=("convolution",), placement=owned),
                     Stage("output", memory(n * 2, "mte3"),
                           after=("convolution",), placement=owned),
@@ -269,7 +279,9 @@ def conv_plan(op, geometry, *, compact=True):
                 return tiles
             # InitSharedBuffersAndEvents reserves the fixed ring, two outputs,
             # and eight FP32 calculation slots once per executing AIV.
-            storage = (5 + 2) * 4096 * 2 + 8 * 4096 * 4
+            storage = CONV_MAX_TILE_CHANNELS * (
+                (CONV_RING_SLOTS + 2) * BF16_BYTES + CONV_FP32_SCRATCH_SLOTS * FP32_BYTES
+            )
             owned_pool = unit_group(owner, units, context.pool_units.get("ub", units))
             allocation = (Allocation("conv_buffers", pool, storage, owned_pool),)
             return KernelProgram((Stage("buffers", acquire=allocation),
@@ -306,17 +318,21 @@ def gating_plan(op, geometry):
                             metadata={"empty_active_sequences": True})
     units = geometry.resource_units.get("vector", geometry.compute_units)
     programs = meta.get("logical_programs") or units
-    row_iterations, columns = math.ceil(rows / (64 * programs)), math.ceil(heads / 8)
+    row_iterations = math.ceil(rows / (GATING_TILE_ROWS * programs))
+    columns = math.ceil(heads / GATING_TILE_HEADS)
     read = read_role(geometry.resource_units, aiv=0)
     beta_store = meta.get("beta_store", {})
     queue = beta_store.get("queue")
     queued = bool(queue) or beta_store.get("from_hardware", False)
     scalar = beta_store.get("resource", "mte3") if queued else "mte3"
-    reads = rows * heads * 4 + programs * row_iterations * heads * 8
-    writes = rows * heads * 6
-    per_tile = 13 * 64 * 8 + 2 * 8
+    input_bytes = 2 * BF16_BYTES
+    parameter_bytes = 2 * FP32_BYTES
+    output_bytes = FP32_BYTES + BF16_BYTES
+    reads = rows * heads * input_bytes + programs * row_iterations * heads * parameter_bytes
+    writes = rows * heads * output_bytes
+    per_tile = (GATING_PER_ELEMENT_OPS * GATING_TILE_ROWS + 2) * GATING_TILE_HEADS
     resources = {"hbm": reads + writes, read: reads,
-                 "mte3": rows * heads * (4 if queued else 6),
+                 "mte3": rows * heads * (FP32_BYTES if queued else output_bytes),
                  "vector": programs * row_iterations * columns * per_tile}
     if queued:
         resources[scalar] = rows * heads
@@ -325,20 +341,23 @@ def gating_plan(op, geometry):
         selected_queue = queue
         if beta_store.get("from_hardware"):
             declared = context.store_queues.get(scalar, {})
-            if declared.get("element_bytes") != 2:
+            if declared.get("element_bytes") != BF16_BYTES:
                 raise ValueError("gdn_beta_requires_current_hardware_bf16_store_queue")
             selected_queue = {key: value for key, value in declared.items() if key != "element_bytes"}
         def tile(index, logical, owner):
             row, col = divmod(index, columns)
-            first = (logical * row_iterations + row) * 64
-            valid_rows, valid_cols = max(0, min(64, rows - first)), min(8, heads - col * 8)
+            first = (logical * row_iterations + row) * GATING_TILE_ROWS
+            first_head = col * GATING_TILE_HEADS
+            valid_rows = max(0, min(GATING_TILE_ROWS, rows - first))
+            valid_cols = min(GATING_TILE_HEADS, heads - first_head)
             elements = valid_rows * valid_cols
             owned = context.owned(owner, units, ("vector", read, "mte3"))
-            incoming = elements * 4 + valid_cols * 8
+            incoming = elements * input_bytes + valid_cols * parameter_bytes
+            g_bytes = elements * FP32_BYTES
             stages = [
                 Stage("inputs", context.bind(Work(resources={"hbm": incoming, read: incoming})), placement=owned),
                 Stage("gates", context.bind(Work(resources={"vector": per_tile})), after=("inputs",), placement=owned),
-                Stage("g_fp32", context.bind(Work(resources={"hbm": elements * 4, "mte3": elements * 4})),
+                Stage("g_fp32", context.bind(Work(resources={"hbm": g_bytes, "mte3": g_bytes})),
                       after=("gates",), placement=owned),
             ]
             if queued:
@@ -347,13 +366,14 @@ def gating_plan(op, geometry):
                 name = context.resource_names[scalar]
                 issue_units = context.resource_units.get(scalar, units)
                 issue_owners = unit_group(owner, units, issue_units)
-                beta = QueuedStore(valid_rows, valid_cols, heads * 2, 2,
-                                   (first * heads + col * 8) * 2, 1, name,
+                beta = QueuedStore(valid_rows, valid_cols, heads * BF16_BYTES, BF16_BYTES,
+                                   (first * heads + first_head) * BF16_BYTES, 1, name,
                                    context.rates[name] / issue_units * len(issue_owners),
                                    context.resource_names["hbm"], issue_placement=issue_owners, **selected_queue)
                 stages.append(Stage("beta_bf16", after=("g_fp32",), program=beta))
             else:
-                stages.append(Stage("beta_bf16", context.bind(Work(resources={"hbm": elements * 2, "mte3": elements * 2})),
+                beta_bytes = elements * BF16_BYTES
+                stages.append(Stage("beta_bf16", context.bind(Work(resources={"hbm": beta_bytes, "mte3": beta_bytes})),
                                     after=("g_fp32",), placement=owned))
             return stages
         def physical_program(owner):
@@ -369,7 +389,7 @@ def gating_plan(op, geometry):
         # (``per_tile`` is not scaled by rows), so dropping it would remove
         # real serviced work. Symmetric owners are combined by summing that
         # work, never by deleting it.
-        from .program import coalesce_programs
+        from ...program import coalesce_programs
         return ParallelProgram(coalesce_programs(tuple(
             physical_program(owner)
             for owner in range(min(programs, units)))))

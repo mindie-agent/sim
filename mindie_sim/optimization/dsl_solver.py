@@ -24,13 +24,18 @@ from mindie_sim.schema.datapath import DatapathCapabilitySpec, datapath_for_die
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.templates.catlass_catalog import CatlassProblem, matrix_problem, streamk_partition
 from mindie_sim.templates.contracts import _union_obligations
-from mindie_sim.templates.dsl_catalog import ATTN_RES, AttnResProblem, DSL_KERNEL_IDS
+from mindie_sim.templates.dsl_catalog import (
+    ATTN_RES, COMMIT_KDA, DSL_KERNEL_IDS, FLASH_KDA, MEGA_KDA, MLA_PROLOG, MQSMLA, QSLI,
+    AttnResProblem, CommitRecurrentKdaProblem, FlashKdaProblem, MegaRecurrentKdaProblem,
+    MixedQuantSparseMlaProblem, MlaPrologProblem, QsliProblem,
+)
 from mindie_sim.templates.registry import builtin_template_catalog
 
+from ._dual_obligations import _weight_allocation_id
 from .contracts import CatlassKernelSpec, DslKernelSpec, FuseRegionSpec
-from .dual_bound import _unique_ops, _weight_allocation_id
+from .dual_bound import _unique_ops
 from .framework_solver import (
-    DEFAULT_MAX_TRIALS, FrameworkSolveResult, _TrialSearch, _atomic_ops, _machine,
+    DEFAULT_MAX_TRIALS, CandidateSearchStats, FrameworkSolveResult, _TrialSearch, _atomic_ops, _machine,
     _interleave, _search_bases, _stream_candidates, _stream_plan, _wall, _with_operations,
 )
 
@@ -42,6 +47,19 @@ MATRIX_RANK = 3
 _RECIPE_DIGEST_LEN = 16
 _GROUPED_FAMILIES = frozenset({"grouped_gemm", "grouped_matmul", "grouped_moe", "mc2"})
 _MX_MODES = frozenset({"mxfp8", "mxfp4", "a8w4_mx"})
+_FP8_FORMATS = frozenset({"fp8", "fp8_e4m3", "fp8_e5m2"})
+_FP4_FORMATS = frozenset({"fp4", "fp4_e2m1"})
+_DSL_RECIPE_ALIAS = {
+    "block_attn_res_update_rms_norm": ATTN_RES,
+    "quant_lightning_indexer": QSLI,
+    "quant_sparse_lightning_indexer": QSLI,
+    "mla_prolog": MLA_PROLOG,
+    "mla_prolog_v4": MLA_PROLOG,
+    "mixed_quant_sparse_flash_mla": MQSMLA,
+    "flash_kda": FLASH_KDA,
+    "mega_recurrent_kda": MEGA_KDA,
+    "commit_recurrent_kda": COMMIT_KDA,
+}
 _CATLASS_FIELDS = ("dispatch_policy", "scheduler", "splitk_factor", "swizzle_offset", "swizzle_direction",
                    "l1_tile_shape", "l0_tile_shape", "stages", "epilogue_kind", "simt_thread_block_dim")
 DSL_STAGES = ("D1_dsl_fuse", "D2_catlass", "D3_retune")
@@ -58,6 +76,7 @@ class DslSolveResult:
     fuse_specs: tuple[FuseRegionSpec, ...]
     stage_history: tuple[tuple[str, int, str], ...]
     tried_candidates: int
+    search_stats: CandidateSearchStats = CandidateSearchStats()
 
 def streamk_crossing_partials(b_tot: int, g_k: int, c_aic: int) -> int:
     if b_tot < 0 or g_k < 1 or c_aic < 0:
@@ -115,6 +134,13 @@ def _matrix_problem(op, meta):
     dtype_a = meta.get("dtype_a", meta.get("activation_format", op.dtype))
     dtype_b = meta.get("dtype_b", meta.get("weight_format", op.dtype))
     mx_mode = mode if mode in _MX_MODES else None
+    if mx_mode is None and meta.get("weight_scale_format") == "fp8_e8m0":
+        if dtype_a in _FP8_FORMATS and dtype_b in _FP8_FORMATS:
+            mx_mode = "mxfp8"
+        elif dtype_a in _FP4_FORMATS and dtype_b in _FP4_FORMATS:
+            mx_mode = "mxfp4"
+        elif dtype_a in (_FP8_FORMATS | {"int8"}) and dtype_b in (_FP4_FORMATS | {"int4"}):
+            mx_mode = "a8w4_mx"
     if (dtype_a != dtype_b and not mx_mode) or (meta.get("weight_scale_format") and not mx_mode):
         return None
     return CatlassProblem(
@@ -154,16 +180,57 @@ def select_catlass_candidates(
         return ()
 
 
+def _infer_dsl_problem(op, meta, kernel):
+    if kernel == ATTN_RES and op.local_shape and op.layout == "contiguous":
+        return AttnResProblem(prod(op.local_shape[:-1]), op.local_shape[-1], op.dtype)
+    if kernel == QSLI:
+        q_rows = int(meta.get("query_rows") or (op.local_shape[0] if op.local_shape else 0))
+        topk = int(meta.get("topk") or meta.get("selected_token_rows") or 0)
+        cands = int(meta.get("candidates") or meta.get("kv_len") or 0)
+        if not cands and len(op.local_shape) == MATRIX_RANK and op.flops > 0:
+            denom = 2 * prod(op.local_shape)
+            est = round(op.flops / denom) if denom > 0 else 0
+            if est > 0 and est * denom == int(op.flops):
+                cands = est
+        if q_rows > 0 and cands > 0 and topk > 0:
+            splits = max(1, int(meta.get("index_context_partitions") or 1))
+            return QsliProblem(q_rows, cands, topk, split_parts=splits)
+    if kernel == MLA_PROLOG:
+        tokens = int(meta.get("tokens") or (op.local_shape[0] if op.local_shape else 0))
+        if tokens > 0:
+            kw = {k: meta[k] for k in ("dim", "q_lora", "kvr", "heads", "q_nope", "rope", "mode") if k in meta}
+            return MlaPrologProblem(tokens, **kw)
+    if kernel == MQSMLA and ("n_ori" in meta or "n_cmp" in meta):
+        n_ori, n_cmp = int(meta.get("n_ori", 0)), int(meta.get("n_cmp", 0))
+        queries = int(meta.get("queries") or (op.local_shape[0] if op.local_shape else 1))
+        if n_ori > 0 or n_cmp > 0:
+            return MixedQuantSparseMlaProblem(n_ori, n_cmp, queries=queries)
+    if kernel == FLASH_KDA and meta.get("lengths"):
+        return FlashKdaProblem(tuple(int(v) for v in meta["lengths"]),
+                               value_heads=int(meta.get("value_heads", 1)),
+                               query_heads=int(meta.get("query_heads", 1)))
+    if kernel == MEGA_KDA and {"batch", "tp", "sequence"} <= meta.keys():
+        return MegaRecurrentKdaProblem(int(meta["batch"]), int(meta["tp"]), int(meta["sequence"]))
+    if kernel == COMMIT_KDA and meta.get("accepted"):
+        return CommitRecurrentKdaProblem(tuple(int(v) for v in meta["accepted"]),
+                                         heads=int(meta.get("heads", 1)))
+    return None
+
+
 def _dsl_declarations(op):
     base = dict(op.metadata)
     for index, override in enumerate(base.get("dsl_variants", ({},))):
         meta = {**base, **override}
-        identifier = meta.get("dsl_kernel", op.family if f"dsl.{op.family}" in DSL_KERNEL_IDS else op.recipe)
-        identifier = "dsl." + identifier.removeprefix("dsl.")
+        raw_id = meta.get("dsl_kernel")
+        if raw_id is None:
+            raw_id = _DSL_RECIPE_ALIAS.get(op.family) or _DSL_RECIPE_ALIAS.get(op.recipe) or (
+                op.family if f"dsl.{op.family}" in DSL_KERNEL_IDS else op.recipe
+            )
+        identifier = "dsl." + str(raw_id).removeprefix("dsl.")
         kernel = "dsl." + identifier.removeprefix("dsl.").partition(".")[0]
         problem = meta.get("dsl_problem")
-        if problem is None and kernel == ATTN_RES and op.local_shape and op.layout == "contiguous":
-            problem = AttnResProblem(prod(op.local_shape[:-1]), op.local_shape[-1], op.dtype)
+        if problem is None and kernel in DSL_KERNEL_IDS:
+            problem = _infer_dsl_problem(op, meta, kernel)
         if problem is not None and kernel in DSL_KERNEL_IDS:
             yield index, identifier, problem, tuple(meta.get("dsl_members", (op.op_id,)))
 
@@ -508,17 +575,21 @@ def solve_dsl(
                 handles = tuple((op_id, OpRef("result_of", edit_id))
                                 for edit_id, output in applied.handles
                                 for op_id in output if len(output) == 1 and op_id not in atomic_ids)
-            yield from (_stream_plan(base, stage, operation)
-                        for operation in _stream_candidates(scenario, placed_ops, handles))
+            stream_cands = tuple(_stream_candidates(scenario, placed_ops, handles))
+            search.note_eligible(1 if stream_cands else 0)
+            yield from (_stream_plan(base, stage, operation) for operation in stream_cands)
         elif paths:
             path = paths[0]
             aic, aiv = min(p.aic_count for p in paths), min(p.aiv_count for p in paths)
             if index == 0:
-                proposals = _dsl_proposals(ops, path, aic, aiv)
+                proposals = list(_dsl_proposals(ops, path, aic, aiv))
+                search.note_eligible(len(proposals))
             else:
                 bottlenecks = dict(getattr(dossier, "bottleneck_ops", ()))
                 sites = sorted(ops, key=lambda op: -bottlenecks.get(op.op_id, 0))
-                proposals = _catlass_proposals(sites, path, aic, aiv)
+                eligible_k2 = [op for op in sites if _matrix_problem(op, dict(op.metadata)) is not None]
+                search.note_eligible(len(eligible_k2))
+                proposals = _catlass_proposals(eligible_k2, path, aic, aiv)
 
             for operations, _ in proposals:
                 yield _with_operations(base, stage, operations)
@@ -534,4 +605,4 @@ def solve_dsl(
                           tuple(s for s in specs if isinstance(s, CatlassKernelSpec)),
                           tuple(s for s in specs if isinstance(s, DslKernelSpec)),
                           tuple(s for s in specs if isinstance(s, FuseRegionSpec)),
-                          tuple(search.history), search.tried)
+                          tuple(search.history), search.tried, search_stats=search.stats())

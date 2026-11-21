@@ -8,14 +8,14 @@
 """
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 
-from .family_lightning_indexer_access import (
+from ._bf16_access import (
     QUERY_TILE_ROWS, SCORE_ELEMENT_BYTES, _key_access_plan,
     _panel_selection_ops, _tile_sentinel, _weighted_vector_ops,
 )
-from .mechanism import OperatorPlan, Work
-from .operators.mixed_core import read_role
-from .ownership import unit_group
-from .program import KernelProgram, Stage
+from ...mechanism import OperatorPlan, Work
+from ..mixed_core import read_role
+from ...ownership import unit_group
+from ...program import KernelProgram, Stage
 
 
 def _split_loads(geometry):

@@ -17,28 +17,50 @@ import math
 from mindie_sim.catalog.attention_common import AttentionResult
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.tensors import TensorLayout, TensorValue
-from .call_gdn import GATING_SOURCE
-from . import gdn_recurrent
-from .gdn_decode_programs import CONV, GATING, CONV_SOURCE, conv_plan, gating_plan
-from .gdn_prefill import decode_core, rearrange_qkv
-from .graph import GraphPolicy
-from .lowering import Builder
-from .mechanism import PlannedRecipe
-from .recover_ssm_work import (
+from ...call_gdn import GATING_SOURCE
+from ... import gdn_recurrent
+from ._gdn_decode_programs import CONV, GATING, CONV_SOURCE, conv_plan, gating_plan
+from ...gdn_prefill import decode_core, rearrange_qkv
+from ...graph import GraphPolicy
+from ...lowering import Builder
+from ...mechanism import PlannedRecipe
+from ...recover_ssm_work import (
     GDN_ARCH35_RECOVER_SSM_RECIPE, build_gdn_arch35_recover_ssm,
     emit_commit_op, recover_ssm_enabled, rewrite_gdn_analytical_scan,
 )
-from .tensors import TensorLowering
+from ...tensors import TensorLowering
 
 SOURCE = {"path": "data/observations/sources/gdn-image-c3d00a196905/gdn.py.txt",
           "sha256": "e9ed210b4ca4431ee40916f06f0272e5e781eb04b61b084bacea216799fbca98",
           "caller_lines": ((298, 379), (505, 575), (705, 737))}
+CACHE_INDEX_SOURCE_LINES = ((138, 143), (435, 445))
+OUTPUT_NORM_GATE_OPS_PER_ELEMENT = 9
+
+
+def _build_conv(op, geometry):
+    if "conv_state_contract" in dict(op.metadata):
+        from ...family_causal_conv import _planned
+
+        return _planned(op, geometry)
+    return conv_plan(op, geometry)
+
+
+_BUILDERS = {
+    CONV: _build_conv,
+    GATING: gating_plan,
+    gdn_recurrent.IMPLEMENTATION: gdn_recurrent.build,
+    GDN_ARCH35_RECOVER_SSM_RECIPE: build_gdn_arch35_recover_ssm,
+}
+RECIPE_IDS = frozenset(_BUILDERS)
+
+
+def build(op, geometry):
+    """Bind a native GDN decode recipe to its exact kernel program."""
+    return _BUILDERS[op.recipe](op, geometry)
 
 
 def recipes():
-    return {CONV: PlannedRecipe(conv_plan), GATING: PlannedRecipe(gating_plan),
-            gdn_recurrent.IMPLEMENTATION: PlannedRecipe(gdn_recurrent.build),
-            GDN_ARCH35_RECOVER_SSM_RECIPE: PlannedRecipe(build_gdn_arch35_recover_ssm)}
+    return dict.fromkeys(_BUILDERS, PlannedRecipe(build))
 
 
 def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
@@ -172,7 +194,7 @@ def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
                             ("state_slots", tuple(slot for slot in range(len(lengths)) if slot not in padding_slots)),
                             ("cache_index_row_stride", cache_index_row_stride),
                             ("cache_index_dtype", "int32"),
-                            ("cache_index_source", {**SOURCE, "caller_lines": ((138, 143), (435, 445))}),
+                            ("cache_index_source", {**SOURCE, "caller_lines": CACHE_INDEX_SOURCE_LINES}),
                             ("state_copy_boundary", "cache_index_single_column_contiguous"),
                             ("state_contract", "conv_history_slots_history_channels"),
                             ("gdn_state_contract", conv_contract),
@@ -314,7 +336,8 @@ def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
     gate = projection.narrow(1, width, value_width)
     gate = tensors.reshape(gate, (tokens * heads, dv), name="z_norm_materialize")
     normalized = b.vector(
-        "linear_output_norm_gate", (copied.producer, gate.producer), tokens * value_width, 9,
+        "linear_output_norm_gate", (copied.producer, gate.producer), tokens * value_width,
+        OUTPUT_NORM_GATE_OPS_PER_ELEMENT,
         shape=(tokens * heads, dv), read_bytes_override=(2 * tokens * value_width + dv) * 2,
         write_bytes_override=tokens * value_width * 2,
         metadata=(("norm_kind", "rmsnorm"), ("norm_has_weight", True), ("norm_has_bias", False),

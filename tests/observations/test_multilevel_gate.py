@@ -1,24 +1,13 @@
-"""Unit tests for independent multilevel accuracy gate and tail-cluster diagnosis.
+"""Tests for multilevel gate, lineage, report assembly and tail diagnosis.
 
-[Role]
-  Verify normalized transitive acquisition-lineage closure, local event
-  scoping, on-disk capture consistency, live-Engine HMAC receipt binding,
-  mandatory 3-level coverage, two-pass streaming without 64 KiB truncation,
-  5-stage tail-cluster diagnosis, Jacobian conflict detection, and producer
-  end-to-end report assembly.
-[Invariants]
-  * Pure tier-0 in-memory and tmp_path execution; zero subprocesses, zero
-    network calls, zero device contexts, zero environment mutations.
-  * Every prediction interval is minted by a real Engine run and named Event
-    handles; unbacked strings, foreign case IDs, and missing levels fail.
-  * Exact 10.0% error fails strict < 10.0%; 9.996% passes before rounding.
-[Timeouts & Locks]
-  Deterministic in-process execution (< 5s); zero locks or background workers.
-[Side-Effect Policy]
-  Writes temporary test manifests/reports only inside pytest tmp_path.
+[Role] Verify capture boundaries, signed Engine evidence and heldout verdicts.
+[Invariants] Tier-0 execution with live Engine events and independent evidence.
+[Timeouts & Locks] Deterministic in-process execution.
+[Side-Effect Policy] Test manifests and reports stay inside pytest tmp_path.
 """
 from __future__ import annotations
 
+from dataclasses import replace
 import hashlib
 import importlib.util
 import json
@@ -31,7 +20,7 @@ import pytest
 
 from mindie_sim.observations.multilevel_gate import (
     CaptureBoundary, CohortKey, EngineInterval, EngineRunReceipt, FrozenFitManifest,
-    FrozenFitParameter, GateCase, Manifest, Residual, bind_engine_interval,
+    FrozenFitParameter, GateCase, MS_TO_NS, Manifest, Residual, bind_engine_interval,
     bind_engine_rung_interval, evaluate, gate_decision, parse_gate_case, run_l1,
     run_l2, run_l3, sanitize_capture_uri, sanitize_source_ref, stream_jsonl,
     stream_manifest, summarize_cohorts, validate_lineage,
@@ -44,6 +33,18 @@ pytestmark = pytest.mark.tier0
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DIAG_SCRIPT = REPO_ROOT / "scripts" / "diagnose_tail_cluster.py"
 PRODUCER_SCRIPT = REPO_ROOT / "data" / "verification" / "a5-cann93-multilevel-accuracy-20261120.producer.py"
+CLOCK_MERGED_BUSY_NS = 300
+OUTLIER_APE_PCT = 27
+TRACE_LIMIT = 32
+TAIL_TRACE_APE = 0.18
+INDEPENDENT_L2_CAPTURE_US = 180.0
+MODEL_RUN_CAPTURE = {
+    "model_id": "qwen3.8-27b", "rung": "merged", "status": "ok",
+    "num_layers": 4, "orig_layers": 4, "dp": 1, "tp": 2, "ep": False,
+    "fx_compilation_summary": {"pre_split_full_graph_summary": {"op_counts": {"vllm.unquantized_gemm": 4}}, "num_compiled_fx_subgraphs": 1},
+    "resolved_compilation_and_ascend_config": {"cudagraph_mode": "FULL_AND_PIECEWISE", "cudagraph_capture_sizes": [8]},
+    "step_and_layer_timings": {"decode_B8_S512_step_p50_ms": 0.92, "decode_B8_S512_per_layer_us": 230.0},
+}
 
 
 def _load_script(name: str, path: Path):
@@ -107,7 +108,7 @@ def _case(
 
 
 def _run_engine_for_ns(start_name: str, end_name: str, duration_ns: int) -> tuple[Engine, Any, Any]:
-    eng = Engine([Resource("device", 1_000_000.0, "ns", "fifo")], trace_limit=32)
+    eng = Engine([Resource("device", MS_TO_NS, "ns", "fifo")], trace_limit=TRACE_LIMIT)
     s_ev = eng.submit(start_name, {"device": 100.0})
     e_ev = eng.submit(end_name, {"device": float(duration_ns)}, after=(s_ev,))
     eng.advance(until=(e_ev,))
@@ -137,33 +138,24 @@ class _LiveEngineRunner:
             )
         return _live_interval(case, max(1, int(round((case.measured_ns or 1000) * self._scale))))
 
-    def run_l1(self, case: GateCase) -> EngineInterval: return self._run(case)
-    def run_l2(self, case: GateCase) -> EngineInterval: return self._run(case)
-    def run_l3(self, case: GateCase) -> EngineInterval: return self._run(case)
+    run_l1 = run_l2 = run_l3 = _run
 
 
 def test_lineage_case_normalization_event_scoping_and_fit_closure(tmp_path: Path) -> None:
     fits = FrozenFitManifest("f1", "1", ())
-    # Uppercase heldout SHA-256 must never evade split leakage detection.
     c_train = _case("c_train", split="train", tag="a", acq="acq-train", run="run-train")
     c_held_upper = _case("c_held_up", split="heldout", tag="b", acq="acq-held", run="run-held", raw_sha=_sha("a").upper())
     with pytest.raises(ModelingError, match="lineage_split_leakage"):
         validate_lineage(Manifest("m_upper", "1", (c_train, c_held_upper)), fits)
-
-    # Transitive split leakage & duplicate case ID.
     c_held = _case("c_held", split="heldout", tag="2", parents=("mid_digest",))
     with pytest.raises(ModelingError, match="lineage_split_leakage"):
         validate_lineage(Manifest("m1", "1", (c_train, c_held), lineage_edges=((_sha("a").upper(), "mid_digest"),)), fits)
     with pytest.raises(ModelingError, match="duplicate_case_id"):
         validate_lineage(Manifest("m2", "1", (c_train, _case("c_train", split="train", tag="3"))), fits)
-
-    # Distinct captures reusing identical local event IDs never erroneously merge.
     c_tr_ev = _case("tr_ev", split="train", tag="1", acq="acq-1", run="run-1", session_id="s1", events=("ev-0", "ev-1"))
     c_ho_ev = _case("ho_ev", split="heldout", tag="2", acq="acq-2", run="run-2", session_id="s2", events=("ev-0", "ev-1"))
     idx_ev = validate_lineage(Manifest("m_ev", "1", (c_tr_ev, c_ho_ev)), fits)
     assert idx_ev.root_for("tr_ev") != idx_ev.root_for("ho_ev")
-
-    # Uppercase fit digest & multi-hop transitive fit ancestor leakage rejected.
     with pytest.raises(ModelingError, match="lineage_fit_heldout_leakage"):
         validate_lineage(
             Manifest("m_fit_up", "1", (c_tr_ev, c_ho_ev)),
@@ -179,8 +171,6 @@ def test_lineage_case_normalization_event_scoping_and_fit_closure(tmp_path: Path
     clean_fit = FrozenFitManifest("f_ok", "1", (FrozenFitParameter("p_bw", (_sha("1").upper(),), "capture://fits/bw"),))
     idx_fit = validate_lineage(Manifest("m_ok", "1", (c_tr_ev, c_ho_ev)), clean_fit)
     assert idx_fit.root_for("tr_ev") in idx_fit.fit_ancestor_components["p_bw"]
-
-    # On-disk capture file verification fails closed on digest, rank, clock, and event mismatch.
     cap_dir = tmp_path / "suite"
     cap_dir.mkdir()
     cap_doc = {"device_ranks": [0], "clock_domain": "device_monotonic", "start_event": "k_start", "end_event": "k_end", "event_ids": ["ev-ok"]}
@@ -192,7 +182,6 @@ def test_lineage_case_normalization_event_scoping_and_fit_closure(tmp_path: Path
         validate_lineage(Manifest("m_noloc", "1", (good_case,)), fits, require_capture_files=True)
     with pytest.raises(ModelingError, match="capture_digest_mismatch"):
         validate_lineage(Manifest("m_b1", "1", (_case("cap_bad_sha", tag="4", raw_sha=_sha("f"), events=("ev-ok",), uri="capture://suite/cap_ok.json"),)), fits, capture_root=tmp_path)
-
     for fname, bad_payload, err in (
         ("bad_rank.json", {**cap_doc, "device_ranks": [1]}, "capture_rank_mismatch"),
         ("bad_clk.json", {**cap_doc, "clock_domain": "host_wall"}, "capture_clock_domain_mismatch"),
@@ -213,7 +202,6 @@ def test_cross_level_root_overlap_rejected_unless_debug_only() -> None:
     fits = FrozenFitManifest("f1", "1", ())
     with pytest.raises(ModelingError, match="lineage_cross_level_root_overlap"):
         validate_lineage(Manifest("m_strict", "1", (c_l1, c_l2)), fits)
-
     c_l2_dbg = _case("l2_dbg", level="L2", split="heldout", tag="b", parents=("shared_root",), debug_cross_level=True)
     manifest = Manifest("m_dbg", "1", (c_l1, c_l2_dbg))
     idx = validate_lineage(manifest, fits)
@@ -228,7 +216,6 @@ def test_cross_level_root_overlap_rejected_unless_debug_only() -> None:
 
 def test_engine_receipt_binding_and_mandatory_three_level_coverage() -> None:
     c_l1 = _case("l1_off", level="L1", tag="1", measured_ns=1000)
-    # Reject arbitrary string receipt, foreign case_id, forged token, and unsettled/wrong events.
     with pytest.raises(ModelingError, match="engine_receipt_unbound"):
         run_l1(c_l1, _LiveEngineRunner({"l1_off": EngineInterval("l1_off", "L1", "device_kernel", "k_start", "k_end", 0, 1050, 1050, "some-string")}))
     with pytest.raises(ModelingError, match="engine_interval_case_id_mismatch"):
@@ -236,7 +223,6 @@ def test_engine_receipt_binding_and_mandatory_three_level_coverage() -> None:
     forged_rcpt = EngineRunReceipt("capture://r/1", "l1_off", "L1", "device_kernel", "u1", "k_start", "k_end", 0, 1, 0, 1050, 1050, "0" * 64)
     with pytest.raises(ModelingError, match="engine_receipt_signature_invalid"):
         run_l1(c_l1, _LiveEngineRunner({"l1_off": EngineInterval("l1_off", "L1", "device_kernel", "k_start", "k_end", 0, 1050, 1050, "capture://r/1", run_receipt=forged_rcpt)}))
-
     eng_bad, s_bad, e_bad = _run_engine_for_ns("wrong_start", "k_end", 1050)
     with pytest.raises(ModelingError, match="engine_event_name_mismatch"):
         bind_engine_interval(c_l1, eng_bad, s_bad, e_bad)
@@ -245,7 +231,6 @@ def test_engine_receipt_binding_and_mandatory_three_level_coverage() -> None:
     u_end = eng_unset.submit("k_end", {"device": 1050.0}, after=(u_start,))
     with pytest.raises(ModelingError, match="engine_event_handles_unsettled"):
         bind_engine_interval(c_l1, eng_unset, u_start, u_end)
-
     for bad_iv, err in (
         (EngineInterval("l1_off", "L1", "device_kernel", "k_start", "k_end", 0, 1050, 1050, "capture://r/1", external_offset_ns=4200), "non_engine_or_offset_rejected"),
         (EngineInterval("l1_off", "L1", "device_kernel", "k_start", "k_end", 0, 1050, 1050, "capture://r/1", engine_sourced=False), "non_engine_or_offset_rejected"),
@@ -253,14 +238,12 @@ def test_engine_receipt_binding_and_mandatory_three_level_coverage() -> None:
     ):
         with pytest.raises(ModelingError, match=err):
             run_l1(c_l1, _LiveEngineRunner({"l1_off": bad_iv}))
-
     c_l2 = _case("l2_clone", level="L2", tag="2", measured_ns=5000)
     with pytest.raises(ModelingError, match="l2_cloned_or_divided_from_l3_forbidden"):
         run_l2(c_l2, _LiveEngineRunner({"l2_clone": _live_interval(c_l2, 5000, derived_from_step_division=True)}))
     with pytest.raises(ModelingError, match="l2_cloned_or_divided_from_l3_forbidden"):
         run_l2(c_l2, _LiveEngineRunner({"l2_clone": _live_interval(c_l2, 5000, source_level="L3")}))
 
-    # Reusing the same live Engine or foreign Event handles across unrelated Engines must fail (#8).
     c_l3 = _case("l3_step", level="L3", tag="3", measured_ns=50_000)
     shared_eng, shared_s, shared_e = _run_engine_for_ns("k_start", "k_end", 5000)
     iv_l2 = bind_engine_interval(c_l2, shared_eng, shared_s, shared_e)
@@ -270,7 +253,7 @@ def test_engine_receipt_binding_and_mandatory_three_level_coverage() -> None:
     other_eng, _, _ = _run_engine_for_ns("other_start", "other_end", 5000)
     twin_eng, _, _ = _run_engine_for_ns("k_start", "k_end", 5000)
     untraced_eng = Engine([Resource("device", 1_000_000.0, "ns", "fifo")])
-    us, ue = untraced_eng.submit("k_start", {"device": 100.0}), None
+    us = untraced_eng.submit("k_start", {"device": 100.0})
     ue = untraced_eng.submit("k_end", {"device": 1000.0}, after=(us,))
     untraced_eng.advance(until=(ue,))
     with pytest.raises(ModelingError, match="engine_event_not_owned_by_engine"):
@@ -280,7 +263,6 @@ def test_engine_receipt_binding_and_mandatory_three_level_coverage() -> None:
     with pytest.raises(ModelingError, match="engine_event_not_owned_by_engine:.*trace_required"):
         bind_engine_interval(c_l1, untraced_eng, us, ue)
 
-    # Strict 3-level gate requires independent L1, L2, AND L3 cohorts (L1-only never passes!).
     fits, runner = FrozenFitManifest("f", "1", ()), _LiveEngineRunner(scale=1.03)
     dec_l1 = gate_decision(summarize_cohorts(list(evaluate(Manifest("m_l1", "1", (c_l1,)), fits, runner))))
     assert dec_l1["status"] == "insufficient_evidence" and dec_l1["missing_levels"] == ["L2", "L3"]
@@ -289,7 +271,6 @@ def test_engine_receipt_binding_and_mandatory_three_level_coverage() -> None:
     dec_all = gate_decision(summarize_cohorts(list(evaluate(Manifest("m_all", "1", (c_l1, c_l2, c_l3)), fits, runner))))
     assert dec_all["status"] == "pass" and dec_all["missing_levels"] == [] and dec_all["covered_levels"] == ["L1", "L2", "L3"]
 
-    # Non-independent acquisition roots across levels never pass gate_decision.
     dup_root_res = [
         Residual("a1", "L1", _cohort("L1", "f1"), "same_root", 1000, 1020, "capture://r/1", 0.02, 0.02),
         Residual("a2", "L2", _cohort("L2", "f2"), "same_root", 2000, 2040, "capture://r/2", 0.02, 0.02),
@@ -306,7 +287,6 @@ def test_l2_absent_capture_near_zero_rung_and_strict_threshold() -> None:
     res_miss = list(evaluate(Manifest("m_miss", "1", (c_missing,)), fits, _LiveEngineRunner()))
     assert res_miss[0].status == "missing_evidence" and math.isnan(res_miss[0].signed_error)
     assert summarize_cohorts(res_miss)[c_missing.cohort].status == "insufficient_evidence"
-
     near = _case("rung_near", level="L2", tag="5", kind="paired_rung_delta", measured_ns=200, arm_a=100_000, arm_b=100_200)
     wide = _case("rung_wide", level="L2", tag="6", kind="paired_rung_delta", measured_ns=40_000, arm_a=100_000, arm_b=140_000)
     overrides = {
@@ -323,7 +303,6 @@ def test_l2_absent_capture_near_zero_rung_and_strict_threshold() -> None:
     c_cf = _case("cf_only", level="L3", tag="8", measured_ns=9000, is_counterfactual=True, has_matched_capture=False)
     inv_by_id = {r.case_id: r for r in evaluate(Manifest("m_inv", "1", (c_zero, c_cf)), fits, _LiveEngineRunner())}
     assert inv_by_id["zero_dur"].status == "invalid_evidence" and inv_by_id["cf_only"].status == "counterfactual_excluded"
-
     c_exact = _case("exact_10", level="L1", tag="1", measured_ns=1000, cohort_name="boundary_fam")
     c_pass = _case("below_10", level="L1", tag="2", measured_ns=1000, cohort_name="pass_fam")
     thr_res = list(evaluate(
@@ -333,7 +312,6 @@ def test_l2_absent_capture_near_zero_rung_and_strict_threshold() -> None:
     thr_sum = summarize_cohorts(thr_res, threshold_pct=10.0)
     assert thr_sum[c_exact.cohort].status == "fail" and thr_sum[c_pass.cohort].status == "pass"
     assert gate_decision(thr_sum)["status"] == "fail"
-
     ten_res = [
         Residual(f"p{i}", "L1", _cohort("L1", "p90_fam"), f"root-{i}", 1000, 1000 + err, f"capture://r/{i}", err / 1000.0, err / 1000.0)
         for i, err in enumerate((10, 20, 30, 40, 50, 60, 70, 80, 90, 250))
@@ -342,27 +320,98 @@ def test_l2_absent_capture_near_zero_rung_and_strict_threshold() -> None:
     assert p90_sum.p90_ape_pct == pytest.approx(9.0) and p90_sum.tail_case_ids == ("p9",)
 
 
+def _raw_case(cid: str, split: str, tag: str, pad_bytes: int = 0) -> dict[str, Any]:
+    return {
+        "case_id": cid, "level": "L1", "split": split, "input_digest": f"in-{cid}",
+        "stack_digest": "st1", "implementation": "impl1", "measured_duration": 12.5,
+        "boundary": {
+            "raw_sha256": _sha(tag), "acquisition_uid": f"acq-{tag}", "run_uid": f"run-{tag}",
+            "parent_digests": [], "event_ids": ["e1"], "device_ranks": [0, 1],
+            "clock_domain": "device_ns", "start_event": "s", "end_event": "e",
+            "boundary_kind": "device_kernel", "unit": "us", "capture_uri": f"capture://campaign/{cid}",
+            "source_ref": {"repository": "mindie-agent/sim", "revision": "a" * 40,
+                           "relative_path": "mindie_sim/observations/multilevel_gate.py", "source_sha256": _sha("d")},
+        },
+        "cohort": {"cohort_name": "gemm", "sku": "device_x", "phase": "prefill", "mode": "eager", "shape_regime": "medium", "parallel_topology": "tp2"},
+        "payload": {"blob": "x" * pad_bytes} if pad_bytes else {},
+    }
+
+
+def test_pointwise_outlier_blocks_release() -> None:
+    cases = tuple(_case(f"point_{tag}", tag=tag) for tag in ("a", "b", "c"))
+    outlier = cases[-1]
+    prediction_ns = 1000 + OUTLIER_APE_PCT * (1000 // 100)
+    runner = _LiveEngineRunner({outlier.case_id: _live_interval(outlier, prediction_ns)}, scale=1)
+    rows = list(evaluate(Manifest("points", "1", cases), FrozenFitManifest("f", "1", ()), runner))
+    assert [row.absolute_percentage_error * 100 for row in rows] == [0, 0, OUTLIER_APE_PCT]
+    summaries = summarize_cohorts(rows)
+    assert summaries[outlier.cohort].status == "fail"
+    assert summaries[outlier.cohort].failed_metrics == ("max_ape_pct",)
+    assert summarize_cohorts(rows, strict_pointwise=False)[outlier.cohort].status == "pass"
+    assert gate_decision(summaries, plan_only=True, calibrated_count=0)["status"] == "fail"
+
+
+def test_missing_planned_case_blocks_release() -> None:
+    case = _case("evaluated")
+    rows = list(evaluate(Manifest("grid", "1", (case,)), FrozenFitManifest("f", "1", ()), _LiveEngineRunner()))
+    summaries = summarize_cohorts(rows)
+    planned = ("evaluated", "missing_cell")
+    assert gate_decision(summaries, required_levels=("L1",), expected_case_ids=planned[:1],
+                         evaluated_case_ids=[case.case_id])["status"] == "pass"
+    missing = replace(rows[0], case_id="missing_cell", status="missing_evidence")
+    verdict = gate_decision(summaries, required_levels=("L1",), expected_case_ids=planned, evaluated_case_ids=[*rows, missing])
+    assert verdict["status"] == "insufficient_evidence" and verdict["missing_planned_cases"] == ["missing_cell"]
+    assert summarize_cohorts([*rows, missing])[case.cohort].status == "insufficient_evidence"
+
+
+def test_busy_union_clock_matches_capture_and_merges_clipped_trace() -> None:
+    case = _case("clock")
+    eng = Engine([Resource(name, MS_TO_NS, "ns", "fifo") for name in ("device", "aux")], trace_limit=TRACE_LIMIT)
+    start = eng.submit("k_start", {"device": 100})
+    eng.submit("left_crossing", {"aux": 2 * 100})
+    eng.submit("overlap", {"device": 2 * 100}, release=(100 + 100 / 2) / MS_TO_NS)
+    stop_ns = 1000 + 100
+    end = eng.submit("k_end", release=stop_ns / MS_TO_NS)
+    late = eng.submit("right_crossing", {"aux": 2 * 100}, release=(stop_ns - 100 / 2) / MS_TO_NS)
+    eng.advance(until=(late,))
+    busy_case = replace(case, boundary=replace(case.boundary, clock_operator="busy_union"), measured_ns=CLOCK_MERGED_BUSY_NS)
+    elapsed = bind_engine_interval(busy_case, eng, start, end, clock_operator="elapsed_span")
+    with pytest.raises(ModelingError, match="clock_operator_mismatch:clock:busy_union:elapsed_span"):
+        run_l1(busy_case, _LiveEngineRunner({"clock": elapsed}))
+    interval = bind_engine_interval(busy_case, eng, start, end)
+    runner = _LiveEngineRunner({"clock": interval})
+    assert run_l1(busy_case, runner).predicted_ns == CLOCK_MERGED_BUSY_NS
+    row, = evaluate(Manifest("clock", "1", (busy_case,)), FrozenFitManifest("f", "1", ()), runner)
+    assert (row.clock_operator, row.elapsed_span_ns, row.busy_union_ns) == ("busy_union", 1000, CLOCK_MERGED_BUSY_NS)
+    assert row.absolute_percentage_error == 0
+    equal = _live_interval(case, 1000)
+    assert equal.run_receipt is not None
+    forged = replace(equal, clock_operator="busy_union", run_receipt=replace(equal.run_receipt, clock_operator="busy_union"))
+    with pytest.raises(ModelingError, match="engine_receipt_signature_invalid:clock"):
+        run_l1(busy_case, _LiveEngineRunner({"clock": forged}))
+
+
+def test_caller_predictions_and_uncalibrated_plans_cannot_pass() -> None:
+    raw = _raw_case("caller", "heldout", "c")
+    for key in ("predicted_ns", "predicted_ms", "predicted_us", "predicted_duration", "predicted_s"):
+        for invalid in ({**raw, key: 1000}, {**raw, "payload": {key: None}}):
+            with pytest.raises(ModelingError, match="caller_predicted_duration_forbidden:caller"):
+                parse_gate_case(invalid)
+    case = parse_gate_case(raw)
+    with pytest.raises(ModelingError, match="clock_operator_invalid:caller"):
+        parse_gate_case({**raw, "boundary": {**raw["boundary"], "clock_operator": []}})
+    rows = evaluate(Manifest("caller", "1", (case,)), FrozenFitManifest("f", "1", ()), _LiveEngineRunner())
+    summaries = summarize_cohorts(rows)
+    for count, plan_only in ((0, False), (1, True)):
+        verdict = gate_decision(summaries, required_levels=("L1",), calibrated_count=count, plan_only=plan_only)
+        assert verdict["status"] == "insufficient_evidence"
+        assert (verdict["calibrated_count"], verdict["plan_only"]) == (count, plan_only)
+
+
 def test_two_pass_streaming_past_64k_header_and_provenance(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import mindie_sim.observations.multilevel_gate as mg
     import mindie_sim.observations.multilevel_stream as ms
 
-    def _raw_case(cid: str, split: str, tag: str, pad_bytes: int = 0) -> dict[str, Any]:
-        return {
-            "case_id": cid, "level": "L1", "split": split, "input_digest": f"in-{cid}",
-            "stack_digest": "st1", "implementation": "impl1", "measured_duration": 12.5,
-            "boundary": {
-                "raw_sha256": _sha(tag), "acquisition_uid": f"acq-{tag}", "run_uid": f"run-{tag}",
-                "parent_digests": [], "event_ids": ["e1"], "device_ranks": [0, 1],
-                "clock_domain": "device_ns", "start_event": "s", "end_event": "e",
-                "boundary_kind": "device_kernel", "unit": "us", "capture_uri": f"capture://campaign/{cid}",
-                "source_ref": {"repository": "mindie-agent/sim", "revision": "a" * 40,
-                               "relative_path": "mindie_sim/observations/multilevel_gate.py", "source_sha256": _sha("d")},
-            },
-            "cohort": {"cohort_name": "gemm", "sku": "device_x", "phase": "prefill", "mode": "eager", "shape_regime": "medium", "parallel_topology": "tp2"},
-            "payload": {"blob": "x" * pad_bytes} if pad_bytes else {},
-        }
-
-    # Trailing lineage_edges & manifest_id placed AFTER >80 KiB cases array must NOT truncate.
     big_doc = {
         "cases": [_raw_case(f"tr_{i}", "train", f"{i:x}"[-1] or "1", pad_bytes=9000) for i in range(10)]
         + [_raw_case("ho_leak", "heldout", "f")],
@@ -381,11 +430,9 @@ def test_two_pass_streaming_past_64k_header_and_provenance(tmp_path: Path, monke
     assert m_streamed.manifest_id == "trailing_meta_manifest" and len(m_streamed.cases) == 11
     assert not isinstance(m_streamed.cases, (list, tuple))
     assert m_streamed.lineage_edges == (("acq-1", "acq-f"),)
-    # Trailing lineage edge must trigger split leakage during Pass-1 validate_lineage!
     with pytest.raises(ModelingError, match="lineage_split_leakage"):
         validate_lineage(m_streamed, FrozenFitManifest("f", "1", ()))
 
-    # JSONL two-pass stream & direct path evaluate.
     jsonl_path = tmp_path / "manifest.jsonl"
     jsonl_path.write_text(
         json.dumps({"record_type": "manifest_header", "manifest_id": "stream_m", "source_uri": "capture://campaign/m"}) + "\n"
@@ -425,10 +472,8 @@ def test_tail_diagnoser_moved_tail_unassessed_stages_and_conflicts(tmp_path: Pat
     row_a = {"case_id": "op_a", "level": "L1", "acquisition_root": "acq-1", "boundary_kind": "device_kernel",
              "measured_ns": 1000, "predicted_ns": 1000, "engine_receipt": "capture://receipt/L1/op_a",
              "signed_error": 0.0, "absolute_percentage_error": 0.0, "status": "ok", "cohort": coh, "regime_dims": rdims}
-    row_b = {"case_id": "op_b", "level": "L1", "acquisition_root": "acq-2", "boundary_kind": "device_kernel",
-             "measured_ns": 1000, "predicted_ns": 1180, "engine_receipt": "capture://receipt/L1/op_b",
-             "signed_error": 0.18, "absolute_percentage_error": 0.18, "status": "ok", "cohort": coh, "regime_dims": rdims}
-    # Moved tail [0%, 18%] vs [18%, 0%] MUST NOT escalate as persistent!
+    row_b = {**row_a, "case_id": "op_b", "acquisition_root": "acq-2", "predicted_ns": 1000 + round(1000 * TAIL_TRACE_APE),
+             "engine_receipt": "capture://receipt/L1/op_b", "signed_error": TAIL_TRACE_APE, "absolute_percentage_error": TAIL_TRACE_APE}
     ref_moved = [
         {"case_id": "op_a", "acquisition_root": "acq-rep-1", "boundary_kind": "device_kernel", "absolute_percentage_error": 0.18},
         {"case_id": "op_b", "acquisition_root": "acq-rep-2", "boundary_kind": "device_kernel", "absolute_percentage_error": 0.0},
@@ -438,20 +483,17 @@ def test_tail_diagnoser_moved_tail_unassessed_stages_and_conflicts(tmp_path: Pat
     moved_cluster = moved_rep["clusters"][0]
     assert moved_cluster["blocking"] is False
     assert "persistent_tail_across_independent_repeat" not in moved_cluster["escalation_reasons"]
-    # Missing ABI / Engine receipts MUST report stages 2, 3, 4 as "unassessed" (NEVER "clean").
     stages_missing = {s["stage_number"]: s["status"] for s in moved_cluster["stages"]}
     assert stages_missing[1] == "issue_found"
     assert stages_missing[2] == "unassessed" and stages_missing[3] == "unassessed" and stages_missing[4] == "unassessed"
     assert stages_missing[5] == "action_required"
 
-    # Mismatched boundary_kind OR same acquisition as current & reference must NOT escalate (#10).
     ref_wrong_bnd = [{"case_id": "op_b", "acquisition_root": "acq-rep-2", "boundary_kind": "model_step", "absolute_percentage_error": 0.15}]
     assert "persistent_tail_across_independent_repeat" not in diag.diagnose_tail_clusters([row_a, row_b], reference_run=ref_wrong_bnd, threshold_pct=10.0)["clusters"][0]["escalation_reasons"]
     same_acq_rep = diag.diagnose_tail_clusters([row_a, row_b], reference_run=[row_a, row_b], threshold_pct=10.0)
     assert same_acq_rep["clusters"][0]["blocking"] is False
     assert "persistent_tail_across_independent_repeat" not in same_acq_rep["clusters"][0]["escalation_reasons"]
 
-    # Verified independent repeat exceeding on the SAME (case_id, boundary_kind) escalates + full 5-stage ladder.
     lin_b = {"case_id": "op_b", "acquisition_root": "acq-2", "boundary_kind": "device_kernel", "capture_uri": "capture://s/b", "warmup_contaminated": True}
     rcpt_b = {
         "case_id": "op_b", "acquisition_root": "acq-2", "boundary_kind": "device_kernel", "engine_receipt": "capture://receipt/L1/op_b",
@@ -466,7 +508,6 @@ def test_tail_diagnoser_moved_tail_unassessed_stages_and_conflicts(tmp_path: Pat
     st = {s["stage_number"]: s for s in pers_rep["clusters"][0]["stages"]}
     assert all(st[n]["status"] == "issue_found" for n in (1, 2, 3, 4)) and st[5]["status"] == "action_required"
 
-    # Two-pass streaming CLI without whole-file json.load.
     res_f, lin_f, rcpt_f, ref_f, out_f = tmp_path / "r.json", tmp_path / "l.json", tmp_path / "e.json", tmp_path / "ref.json", tmp_path / "out.json"
     res_f.write_text(json.dumps({"residuals": [row_a, row_b]}), encoding="utf-8")
     lin_f.write_text(json.dumps([lin_b]), encoding="utf-8")
@@ -477,7 +518,6 @@ def test_tail_diagnoser_moved_tail_unassessed_stages_and_conflicts(tmp_path: Pat
                     "--reference-run", str(ref_f), "--threshold-pct", "10", "--output", str(out_f)])
     assert rc == diag.EXIT_ESCALATED and out_f.is_file()
 
-    # Cross-regime Jacobian empty-intersection conflict detection.
     bound = diag.ParameterBound("launch_overhead_ns", current_value=10.0, theta_min=0.0, theta_max=20.0, parameter_source="capture://train/launch")
     sens_conflict = {"launch_overhead_ns": [
         diag.CohortSensitivity("cohort_a", measured_ns=1000.0, predicted_ns=700.0, sensitivity_ns_per_unit=100.0),
@@ -494,25 +534,17 @@ def test_tail_diagnoser_moved_tail_unassessed_stages_and_conflicts(tmp_path: Pat
 
 def test_producer_end_to_end_report_assembly_boundary_and_precision(tmp_path: Path) -> None:
     prod = _load_script("ver_producer_mod", PRODUCER_SCRIPT)
-    # Strict < 10.0% checked in full float precision BEFORE display rounding.
     assert prod._stats([])["status"] == "insufficient_evidence"
     assert prod._stats([0.09996])["status"] == "pass"
     assert prod._stats([0.0999999])["status"] == "pass"
     assert prod._stats([0.10])["status"] == "fail"
 
-    # Assemble independent literal measured captures (NEVER graph_costs!) for build_report (#9).
     sku = "Ascend950DT_9582"
     (tmp_path / "acquisition_split_manifest.json").write_text(json.dumps({
-        "acquisitions": [
-            {"acquisition_uid": "acq-l1-tr", "split": "train"},
-            {"acquisition_uid": "acq-l1-ho", "split": "heldout"},
-            {"acquisition_uid": "acq-hotspot-run", "split": "heldout"},
-            {"acquisition_uid": "acq-d2-one", "split": "heldout"},
-            {"acquisition_uid": "acq-m-tr", "split": "train"},
-            {"acquisition_uid": "acq-m-ho", "split": "heldout"},
-            {"acquisition_uid": "acq-l2-indep", "split": "heldout"},
-            {"acquisition_uid": "acq-l2-tr", "split": "train"},
-        ]
+        "acquisitions": [{"acquisition_uid": uid, "split": split} for split, uids in (
+            ("train", ("acq-l1-tr", "acq-m-tr", "acq-l2-tr")),
+            ("heldout", ("acq-l1-ho", "acq-hotspot-run", "acq-d2-one", "acq-m-ho", "acq-l2-indep")),
+        ) for uid in uids]
     }), encoding="utf-8")
     (tmp_path / "cann93_single_op_measurements.json").write_text(json.dumps({
         "single_op_measurements": {
@@ -524,7 +556,6 @@ def test_producer_end_to_end_report_assembly_boundary_and_precision(tmp_path: Pa
         },
         "collective_measurements": [],
     }), encoding="utf-8")
-    # Two d2 rows (seq 512 vs 2048) from ONE run stay in ONE acquisition root (never seq-split!).
     (tmp_path / "cann93_seq512_to_400k_measurements.json").write_text(json.dumps({
         "acquisition_uid": "acq-d2-one",
         "records": [
@@ -543,32 +574,15 @@ def test_producer_end_to_end_report_assembly_boundary_and_precision(tmp_path: Pa
     }), encoding="utf-8")
     (tmp_path / "cann93_model_subgraphs_and_perf.json").write_text(json.dumps({
         "models": {"qwen3.8-27b": {"runs": {
-            "r_ho": {
-                "run_id": "r_ho", "model_id": "qwen3.8-27b", "rung": "merged", "sku": sku, "status": "ok",
-                "acquisition_uid": "acq-m-ho", "l2_acquisition_uid": "acq-l2-indep",
-                "independent_l2_capture_uri": "capture://indep-l2/layer0", "num_layers": 4, "orig_layers": 4,
-                "dp": 1, "tp": 2, "ep": False,
-                "fx_compilation_summary": {"pre_split_full_graph_summary": {"op_counts": {"vllm.unquantized_gemm": 4}}, "num_compiled_fx_subgraphs": 1},
-                "resolved_compilation_and_ascend_config": {"cudagraph_mode": "FULL_AND_PIECEWISE", "cudagraph_capture_sizes": [8]},
-                "independent_l2_measured_us": 180.0,
-                "step_and_layer_timings": {"decode_B8_S512_step_p50_ms": 0.92, "decode_B8_S512_per_layer_us": 230.0},
-            },
-            "r_no_l2": {
-                "run_id": "r_no_l2", "model_id": "qwen3.8-27b", "rung": "merged", "sku": sku, "status": "ok",
-                "acquisition_uid": "acq-m-ho", "l2_acquisition_uid": "acq-l2-tr",
-                "num_layers": 4, "orig_layers": 4, "dp": 1, "tp": 2, "ep": False,
-                "fx_compilation_summary": {"pre_split_full_graph_summary": {"op_counts": {"vllm.unquantized_gemm": 4}}, "num_compiled_fx_subgraphs": 1},
-                "resolved_compilation_and_ascend_config": {"cudagraph_mode": "FULL_AND_PIECEWISE", "cudagraph_capture_sizes": [8]},
-                "step_and_layer_timings": {"decode_B8_S512_step_p50_ms": 0.92, "decode_B8_S512_per_layer_us": 230.0},
-            },
+            "r_ho": {**MODEL_RUN_CAPTURE, "sku": sku, "run_id": "r_ho", "acquisition_uid": "acq-m-ho", "l2_acquisition_uid": "acq-l2-indep",
+                     "independent_l2_capture_uri": "capture://indep-l2/layer0", "independent_l2_measured_us": INDEPENDENT_L2_CAPTURE_US},
+            "r_no_l2": {**MODEL_RUN_CAPTURE, "sku": sku, "run_id": "r_no_l2", "acquisition_uid": "acq-m-ho", "l2_acquisition_uid": "acq-l2-tr"},
         }}}
     }), encoding="utf-8")
-
     report = prod.build_report(tmp_path, workers=1)
     exec_keys = sorted(k for k in report["source_sha256"] if k.startswith("mindie_sim/prediction/execution/"))
     assert len(exec_keys) >= 8 and "mindie_sim/prediction/execution.py" not in report["source_sha256"]
     assert report["disjoint_split_verification"]["acquisition_root_overlap"] == 0
-    # Hotspots + d2 (seq 512 & 2048) stay unsplit in heldout; absent L2 frozen train never scores heldout.
     assert len([r for r in report["level1_operators"]["train"]["sample_records"] if "kimi_" in r["id"] or "fia_s" in r["id"]]) == 0
     d2_held = [r for r in report["level1_operators"]["heldout"]["sample_records"] if "fia_s" in r["id"]]
     assert len(d2_held) == 2 and len({r["acquisition_root"] for r in d2_held}) == 1
@@ -577,8 +591,6 @@ def test_producer_end_to_end_report_assembly_boundary_and_precision(tmp_path: Pa
     assert l2_ho[0]["measured_block_us"] == 180.0 and l2_ho[0]["acquisition_root"] == "acq-l2-indep"
     l2_tr = [r for r in report["level2_subgraphs_and_blocks"]["train"]["records"] if r["run_id"] == "r_no_l2"]
     assert len(l2_tr) == 1 and l2_tr[0]["status"] == "missing_evidence" and l2_tr[0]["ape_pct"] is None
-
-    # Conflicting split declaration on one acquisition must fail closed.
     bad_manifest = tmp_path / "bad_split.json"
     bad_manifest.write_text(json.dumps({"acquisitions": [
         {"acquisition_uid": "acq-x", "raw_sha256": _sha("a"), "split": "train"},

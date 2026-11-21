@@ -165,7 +165,8 @@ class Execution(_ContextMixin, _CohortMixin, _LazySubmitMixin):
         if not profiles:
             profiles = build_stage_profiles(
                 case, namespace,
-                replicas=(None if selected_replica is None else (selected_replica,)))
+                replicas=(None if selected_replica is None else (selected_replica,)),
+                primitive_table=getattr(bindings, "primitive_table", None))
         if selected_replica is not None and not profiles:
             raise ModelingError("isolated_replica_out_of_range")
 
@@ -225,9 +226,12 @@ class Execution(_ContextMixin, _CohortMixin, _LazySubmitMixin):
 
         self.resource_rates = ResourceRates(self.engine.resources)
         self.stage_geometry = {
-            key: Geometry.from_devices(
-                dies, links=case.machine.links,
-                transfer_channels=case.machine.transfer_channels,
+            key: replace(
+                Geometry.from_devices(
+                    dies, links=case.machine.links,
+                    transfer_channels=case.machine.transfer_channels,
+                ),
+                datapath=self.stage_profiles[key].datapath,
             )
             for key, dies in self.stage_dies.items()
         }

@@ -6,7 +6,7 @@ schema_version = 1
 domains = ["schema", "runtime", "collectives", "operators", "spine", "serving", "observations", "product", "hygiene"]
 support_dirs = ["_support", "_oracles", "fixtures", "runtime/native"]
 max_lines = 600
-max_modules = 96
+max_modules = 128
 
 # ---------------------------------------------------------------- schema (hardware, datapath, catalog)
 [[module]]
@@ -580,6 +580,15 @@ owns = ["scripts/check_arch_governance.py"]
 path = "hygiene/test_repo_hygiene.py"
 tier = "tier1"   # temporary git repositories for ci_scope + ratchet self-tests
 owns = ["scripts/check_test_orthogonality.py", ".github/scripts/ci_scope.py", "tests/_support/tempdirs.py"]
+
+[[module]]
+path = "hygiene/test_spine_prevention_locks.py"
+tier = "tier0"
+owns = [
+  "mindie_sim/primitives/loader.py",
+  "mindie_sim/optimization/_dual_obligations.py",
+  "mindie_sim/rewrite/_oracle_prefetch.py",
+]
 
 # ---------------------------------------------------------------- pre-declared overflow splits (Vol 6 §2.6)
 [[module]]

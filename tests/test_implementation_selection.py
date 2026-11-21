@@ -143,7 +143,7 @@ def test_hc_prefill_geometry_selects_source_only_inside_its_declared_row_domain(
 
 def test_optional_prepared_weights_stay_resident_when_mixed_calls_select_analytical():
     from mindie_sim.catalog.weights import stage_weight_bytes
-    from mindie_sim.prediction.gdn_decode_programs import CONV
+    from mindie_sim.prediction.operators.linear_attention._gdn_decode_programs import CONV
     from _support.linear_cases import case as kimi_case
 
     original = parse_case(kimi_case(1))

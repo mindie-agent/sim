@@ -74,6 +74,11 @@ def lower_native_protocol(ops, *, selected, **caller):
 
 def resolve_operator_plan(op: OpSpec, ctx: OperatorPlanningContext, /) -> ResolvedOperator:
     """Resolve the caller and attach the occurrence-bound pipeline descriptor."""
+    if op.recipe == "arch22_v2_caller_local" and "mc2_v2_local" in dict(op.metadata):
+        from ...mc2_local_caller import LOCAL, SOURCE as LOCAL_SOURCE, build as build_local_caller
+
+        plan = build_local_caller(op, ctx.geometry)
+        return ResolvedOperator(ctx.occurrence, op, plan, LOCAL, (LOCAL_SOURCE,), None)
     strategy = _STRATEGIES.get(ctx.compute_arch.arch_id)
     if strategy is None:
         raise capability_gap(op, ctx, "unsupported_compute_architecture")

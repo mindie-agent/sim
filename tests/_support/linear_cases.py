@@ -31,7 +31,7 @@ from mindie_sim.prediction.engine import Engine, Resource
 from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.family_kda_recurrent import IMPLEMENTATION as KDA_REC_IMPL
 from mindie_sim.prediction.frontend import Frontend
-from mindie_sim.prediction.gdn_decode_programs import CONV, GATING
+from mindie_sim.prediction.operators.linear_attention._gdn_decode_programs import CONV, GATING
 from mindie_sim.prediction.mechanism import Geometry
 from mindie_sim.prediction.operators.contracts import OperatorPlanningContext
 from mindie_sim.prediction.program import RecipeContext, Stage

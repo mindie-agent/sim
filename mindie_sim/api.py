@@ -84,6 +84,7 @@ def evaluate_step(
     *,
     replay: ReplayOptions = ReplayOptions(),
     primitives: PrimitiveStore | None = None,
+    primitive_table: Any = None,
     streams: tuple[StreamPlan, ...] = (),
 ) -> StepEvaluation:
     """Lower and evaluate one fixed step on ``runtime.Engine``."""
@@ -91,7 +92,9 @@ def evaluate_step(
     prepared = spine.lower(
         _to_case(case), LoweringRequest(step=request), streams=streams
     )
-    return spine.run_step(prepared, replay, primitives=primitives)
+    return spine.run_step(
+        prepared, replay, primitives=primitives, primitive_table=primitive_table
+    )
 
 
 def evaluate_three_tiers(
@@ -101,6 +104,7 @@ def evaluate_three_tiers(
     *,
     replay: ReplayOptions = ReplayOptions(),
     primitives: PrimitiveStore | None = None,
+    primitive_table: Any = None,
 ) -> ThreeTierEvaluation:
     """Evaluate ``unmerge``, ``mainline``, and constructive ``should_achieve`` on ``runtime.Engine``."""
     return default_spine().evaluate_three_tiers(
@@ -108,6 +112,7 @@ def evaluate_three_tiers(
         request,
         replay=replay,
         primitives=primitives,
+        primitive_table=primitive_table,
     )
 
 

@@ -40,6 +40,17 @@ _STRATEGIES: dict[ArchId, ArchStrategy] = {
 
 def resolve_operator_plan(op: OpSpec, ctx: OperatorPlanningContext, /) -> ResolvedOperator:
     """Bind the plan and occurrence descriptor to the same source evidence."""
+    metadata = dict(op.metadata)
+    if op.recipe == "megamoe_arch35" and "megamoe_geometry" in metadata and not {
+        "matrix_group_rows", "group_rows", "expert_rows", "group_list",
+    }.intersection(metadata):
+        from ..mc2.megamoe import NATIVE_KIND, build as build_megamoe_composite
+
+        plan = build_megamoe_composite(op, ctx.geometry)
+        source = (plan.metadata or {}).get("source_program")
+        return ResolvedOperator(
+            ctx.occurrence, op, plan, NATIVE_KIND, (source,) if source else (), None,
+        )
     strategy = _STRATEGIES.get(ctx.compute_arch.arch_id)
     if strategy is None:
         raise capability_gap(op, ctx, "unsupported_compute_architecture")

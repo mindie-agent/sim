@@ -102,14 +102,17 @@ class StageProfile:
     compute_arch: Any = None
     datapath: Any = None
     host_rc_resources: tuple = ()
+    primitive_table: Any = None
+    primitive_identity: tuple = ()
+    primitive_coverage_gaps: tuple[str, ...] = ()
 
     @property
     def profile_key(self) -> tuple:
-        return (int(self.stage), self.geometry)
+        return (int(self.stage), self.geometry, self.primitive_identity)
 
 
 def build_stage_profiles(case: CaseSpec, namespace: str = "", *,
-                         replicas=None) -> tuple[StageProfile, ...]:
+                         replicas=None, primitive_table: Any = None) -> tuple[StageProfile, ...]:
     """Resolve every stage's immutable hardware binding exactly once."""
     p = case.runtime.parallel
     width = p.tp * p.pcp
@@ -133,8 +136,33 @@ def build_stage_profiles(case: CaseSpec, namespace: str = "", *,
             )
             roles = dict(dies[0].rates)
             work_units = {**NATIVE_WORK_UNITS, **dict(dies[0].work_units)}
+            orig_rates_s = {
+                role: min(dict(die.rates)[role] for die in dies)
+                for role in roles
+            }
+            overlay = None
+            overlay_rates: dict[str, float] = {}
+            overlay_peaks: dict[str, float] = {}
+            if primitive_table is not None:
+                from mindie_sim.primitives.loader import resolve_sim_rate_overlay
+                overlay = resolve_sim_rate_overlay(primitive_table, datapath, sku=dies[0].sku)
+                overlay_rates = {
+                    role: (min(val, orig_rates_s[role]) if orig_rates_s.get(role, 0.0) > 0.0 else val)
+                    for role, val in overlay.rates
+                }
+                overlay_peaks = dict(overlay.compute_peaks)
+                dp_updates: dict[str, Any] = {}
+                if overlay.hbm_read_bytes_per_s is not None:
+                    dp_updates["hbm_read_bytes_per_s"] = overlay.hbm_read_bytes_per_s
+                if overlay.hbm_write_bytes_per_s is not None:
+                    dp_updates["hbm_write_bytes_per_s"] = overlay.hbm_write_bytes_per_s
+                if overlay.hbm_rw_alpha is not None:
+                    dp_updates["hbm_rw_alpha"] = overlay.hbm_rw_alpha
+                merged_caps = {**dict(datapath.compute_peaks), **overlay_peaks}
+                dp_updates["compute_peaks"] = tuple(sorted(merged_caps.items()))
+                datapath = replace(datapath, **dp_updates)
             rates = {
-                role: (min(dict(die.rates)[role] for die in dies) / MS_PER_S,
+                role: (overlay_rates.get(role, orig_rates_s[role]) / MS_PER_S,
                        work_units.get(role, "work"))
                 for role in roles
             }
@@ -159,15 +187,21 @@ def build_stage_profiles(case: CaseSpec, namespace: str = "", *,
                 pools[key] = min(dict(die.buffers)[pool] for die in dies)
                 pool_units[key] = dies[0].pool_units(pool)
                 stage_pools[str(pool)] = key
+            peak_aliases = dict(dies[0].compute_peak_aliases)
             compute_peaks = {
                 dtype: min(die.peak(dtype) for die in dies)
                 for dtype, _ in dies[0].compute_peaks
-                if dtype not in dict(dies[0].compute_peak_aliases)
+                if dtype not in peak_aliases
             }
-            service_modes = {
-                mode: (role, min(dict(die.service_modes)[mode][1] for die in dies))
-                for mode, (role, _) in dies[0].service_modes
-            }
+            for dt, peak in overlay_peaks.items():
+                if dt in compute_peaks or dt not in peak_aliases:
+                    compute_peaks[dt] = peak
+            service_modes = {}
+            for mode, (role, _) in dies[0].service_modes:
+                m_rate = min(dict(die.service_modes)[mode][1] for die in dies)
+                if role in overlay_rates and orig_rates_s.get(role, 0.0) > 0.0:
+                    m_rate = m_rate * (overlay_rates[role] / orig_rates_s[role])
+                service_modes[mode] = (role, m_rate)
             store_queues = {
                 name: dict(queue) for name, queue in dies[0].store_queues
                 if all(dict(die.store_queues).get(name) == queue for die in dies)
@@ -189,6 +223,9 @@ def build_stage_profiles(case: CaseSpec, namespace: str = "", *,
                 compute_arch=compute_arch,
                 datapath=datapath,
                 host_rc_resources=host_rc,
+                primitive_table=primitive_table,
+                primitive_identity=() if overlay is None else overlay.identity,
+                primitive_coverage_gaps=() if overlay is None else overlay.coverage_gaps,
             ))
     return tuple(profiles)
 
@@ -369,6 +406,8 @@ class _ContextMixin:
             physical_mechanisms=profile.physical_mechanisms,
             compute_arch=profile.compute_arch,
             datapath=profile.datapath,
+            primitive_table=profile.primitive_table,
+            primitive_coverage_gaps=profile.primitive_coverage_gaps,
         )
 
     def _context(self, op: Any, replica: int, scope: str, *, recipe=None) -> RecipeContext:

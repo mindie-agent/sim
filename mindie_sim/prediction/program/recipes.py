@@ -176,11 +176,7 @@ class RecipeBook:
 
     def _governed_recipe(self, spec: Any, op):
         from ..mechanism import PlannedRecipe
-        from ..physical_recipe_registry import uses_retained_source_plan
 
-        retained = self.recipes.get(op.recipe)
-        if isinstance(retained, PlannedRecipe) and uses_retained_source_plan(op):
-            return retained
         cached = self._governed_recipes.get(spec.name)
         if cached is not None:
             return cached
@@ -242,7 +238,11 @@ class RecipeBook:
             return hit[1]
         from ..mechanism import PlannedRecipe
         if op.plan_required:
+            from ..operators.linear_attention.gdn_decode import RECIPE_IDS as GDN_DECODE_RECIPES
+
             recipe = self.recipes.get(op.recipe)
+            if recipe is None and op.recipe in GDN_DECODE_RECIPES:
+                raise ModelingError(f"source_plan_binding_required:{op.recipe}")
             if op.recipe and op.recipe not in self._caller_recipes and not (
                 op.source_boundary == "call" and isinstance(recipe, PlannedRecipe)
                 and recipe.kernels is not None
@@ -424,7 +424,6 @@ class RecipeBook:
         from ..bf16_grouped import recipe as bf16_grouped
         from ..collectives import PairwiseCollective, RingCollective
         from ..direct_peer import DirectPeerCollective
-        from ..family_attnres import recipes as attn_res_recipes
         from ..family_kda_recurrent import recipes as kda_recurrent_recipes
         from ..hccl_graph import recipes as hccl_recipes
         from ..implementations import recipes as implementation_recipes
@@ -439,6 +438,8 @@ class RecipeBook:
         from ..mechanism import OperatorPlan, PlannedRecipe
         from ..mxfp4_grouped import recipe as mxa8w4_nznk
         from ..mxfp8_grouped import recipe as mxfp8_grouped
+        from ..operators import grouped_moe, hyper_connections, linear_attention, mc2
+        from ..operators.linear_attention.common import CHUNK32_KERNELS
         from ..pointwise import TiledPointwise
         from ..services import ResourceService
         from ..sparse_kv_offload import recipes as sparse_kv_offload_recipes
@@ -500,18 +501,29 @@ class RecipeBook:
                 for name, value in values.items()
             }
 
+        declared_recipes = build(raw.get("recipes", {}))
         explicit = {
             **native_moe_recipes(raw), **hccl_recipes(raw),
             **sparse_kv_offload_recipes(), **latent_dcp_recipes(),
             **implementation_recipes(raw.get("lowerings", {})),
-            **kda_recurrent_recipes(), **attn_res_recipes(),
-            **build(raw.get("recipes", {})),
+            **kda_recurrent_recipes(),
+            "attn_res_fwd": hyper_connections.GovernedAttnResRecipe(hyper_connections.build),
+            **declared_recipes,
         }
         book = cls(
             explicit, families=build(raw.get("families", {})),
             programs=build(raw.get("programs", {})), family_registry=family_registry,
         )
-        book._caller_recipes = frozenset((raw.get("recipes") or {}).keys())
+        # Keep the public recipe table and selection on the same owner. These
+        # IDs also arrive through the physical defaults and protocol inventory.
+        governed_builders = {
+            "megamoe_arch35": grouped_moe.build,
+            "arch22_v2_caller_local": mc2.build,
+            **dict.fromkeys(CHUNK32_KERNELS, linear_attention.build),
+        }
+        for recipe_id in governed_builders.keys() & (book.recipes.keys() - declared_recipes.keys()):
+            book.recipes[recipe_id] = PlannedRecipe(governed_builders[recipe_id])
+        book._caller_recipes = frozenset(declared_recipes)
         book._family_kinds = {
             name: value.get("kind")
             for name, value in (raw.get("families") or {}).items()

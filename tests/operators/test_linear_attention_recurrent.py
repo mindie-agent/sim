@@ -25,7 +25,7 @@ from mindie_sim.catalog.speculative_state import MODE_CHECKPOINT, MODE_REPLAY, M
 from mindie_sim.prediction.call_gdn import make_call
 from mindie_sim.prediction.engine import Engine, Resource
 from mindie_sim.prediction.frontend import Frontend
-from mindie_sim.prediction.gdn_decode_programs import CONV, GATING, gating_plan
+from mindie_sim.prediction.operators.linear_attention._gdn_decode_programs import CONV, GATING, gating_plan
 from mindie_sim.prediction.gdn_recurrent import build as build_gdn, head_ownership, head_runs
 from mindie_sim.prediction.mechanism import Geometry
 from mindie_sim.prediction.operators import gdn_output, kda_recurrent, kda_recurrent_membase

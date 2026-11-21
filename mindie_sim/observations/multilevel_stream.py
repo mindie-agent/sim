@@ -2,7 +2,7 @@
 
 [Role] Provide fixed-chunk (64 KiB) stdlib JSON/JSONL event streaming for
   multilevel gate manifests and tail-cluster diagnosis inputs, provenance and
-  SHA-256 token sanitization, and on-disk capture consistency verification.
+  capture consistency verification, and signed Engine clock measurements.
 [Invariants] Never whole-reads JSON files via json.load or truncates top-level
   metadata scans at 64 KiB; top-level keys after arbitrarily large arrays
   (e.g. lineage_edges after cases) are parsed in Pass 1 while skipping array
@@ -21,12 +21,11 @@ from dataclasses import dataclass
 import hashlib
 import hmac
 import json
-import math
 from pathlib import Path, PurePosixPath
 import re
 import secrets
 from types import MappingProxyType
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from mindie_sim.schema.common import ModelingError
 
@@ -40,6 +39,7 @@ _RECEIPT_HMAC_KEY = secrets.token_bytes(_HMAC_KEY_BYTES)
 CAPTURE_URI_SCHEME = "capture://"
 _SHA256_PREFIX = "sha256:"
 Level = Literal["L1", "L2", "L3"]
+VALID_CLOCK_OPERATORS = frozenset({"elapsed_span", "busy_union"})
 SOURCE_REF_KEYS = frozenset({"repository", "revision", "relative_path", "source_sha256"})
 TIME_UNIT_SCALE_NS: Mapping[str, int] = MappingProxyType({
     "ns": 1, "us": 1000, "ms": 1_000_000, "s": 1_000_000_000,
@@ -73,8 +73,7 @@ _JSON_TOKEN_RE = re.compile(
 __all__ = [
     "CAPTURE_URI_SCHEME", "EngineInterval", "EngineRunReceipt", "MS_TO_NS",
     "SHA256_HEX_LENGTH", "SOURCE_REF_KEYS", "STREAM_CHUNK_BYTES",
-    "STREAM_WHOLE_READ_LIMIT_BYTES", "TIME_UNIT_SCALE_NS", "_fstr", "_parse_lineage_edges",
-    "_parse_ranks", "_parse_str_tuple", "_req_sha256", "_req_str", "_to_ns",
+    "STREAM_WHOLE_READ_LIMIT_BYTES", "TIME_UNIT_SCALE_NS", "VALID_CLOCK_OPERATORS", "_req_sha256", "_req_str",
     "bind_engine_interval", "bind_engine_rung_interval", "digest_file_streaming",
     "iter_json_records_streaming", "iter_manifest_json_cases", "normalize_lineage_token",
     "resolve_capture_file", "sanitize_capture_uri", "sanitize_source_ref",
@@ -138,54 +137,6 @@ def sanitize_source_ref(ref: Mapping[str, Any]) -> tuple[tuple[str, str], ...]:
         ("relative_path", rel), ("repository", repo), ("revision", rev),
         ("source_sha256", _req_sha256(ref["source_sha256"], "source_ref_sha256_invalid")),
     )
-
-
-def _parse_ranks(raw: Any) -> tuple[int, ...]:
-    if isinstance(raw, (str, bytes)) or not isinstance(raw, Sequence) or not raw:
-        raise ModelingError("device_ranks_must_be_nonempty_sequence")
-    ranks = [item for item in raw if not isinstance(item, bool) and isinstance(item, int) and item >= 0]
-    if len(ranks) != len(raw) or len(set(ranks)) != len(ranks):
-        raise ModelingError(f"device_rank_invalid:{raw!r}")
-    return tuple(ranks)
-
-
-def _parse_str_tuple(raw: Any, reason: str, *, normalize_digests: bool = False) -> tuple[str, ...]:
-    if raw is None:
-        return ()
-    if isinstance(raw, (str, bytes)) or not isinstance(raw, Sequence):
-        raise ModelingError(reason)
-    items = [validate_provenance_text(_req_str(x, reason), field_name=reason) for x in raw]
-    return tuple(normalize_lineage_token(x) if normalize_digests else x for x in items)
-
-
-def _to_ns(value: Any, unit: str, reason: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
-        raise ModelingError(reason)
-    return int(round(float(value) * TIME_UNIT_SCALE_NS[unit]))
-
-
-def _fstr(mapping: Mapping[str, Any], key: str, cid: str, *, check_prov: bool = False) -> str:
-    val = _req_str(mapping.get(key), f"{key}_missing:{cid}")
-    return validate_provenance_text(val, field_name=key) if check_prov else val
-
-
-def _parse_lineage_edges(raw: Any) -> tuple[tuple[str, str], ...]:
-    if not raw:
-        return ()
-    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
-        raise ModelingError("lineage_edges_invalid")
-    edges = []
-    for item in raw:
-        pair = (item.get("parent"), item.get("child")) if isinstance(item, Mapping) else (
-            (item[0], item[1]) if isinstance(item, Sequence) and not isinstance(item, (str, bytes)) and len(item) == 2 else None
-        )
-        if pair is None:
-            raise ModelingError("lineage_edge_entry_invalid")
-        edges.append((
-            normalize_lineage_token(_req_str(pair[0], "lineage_edge_parent_missing")),
-            normalize_lineage_token(_req_str(pair[1], "lineage_edge_child_missing")),
-        ))
-    return tuple(edges)
 
 
 def _iter_json_tokens(handle: Any, chunk_size: int = STREAM_CHUNK_BYTES) -> Iterator[tuple[str, Any]]:
@@ -593,6 +544,7 @@ class EngineRunReceipt:
     receipt_token: str
     arm_a_receipt_id: str = ""
     arm_b_receipt_id: str = ""
+    clock_operator: str = "elapsed_span"
 
 
 @dataclass(frozen=True, slots=True)
@@ -618,6 +570,9 @@ class EngineInterval:
     arm_b_predicted_ns: int | None = None
     diagnostics: tuple[tuple[str, Any], ...] = ()
     run_receipt: EngineRunReceipt | None = None
+    clock_operator: str = "elapsed_span"
+    elapsed_span_ns: int | None = None
+    busy_union_ns: int | None = None
 
 
 def _sign_receipt(
@@ -625,12 +580,14 @@ def _sign_receipt(
     start_event_name: str, end_event_name: str, start_event_seq: int, end_event_seq: int,
     start_ns: int, end_ns: int, predicted_ns: int,
     arm_a_id: str = "", arm_b_id: str = "",
-    arm_a_ns: int | None = None, arm_b_ns: int | None = None,
+    arm_a_ns: int | None = None, arm_b_ns: int | None = None, *,
+    clock_operator: str, elapsed_span_ns: int | None, busy_union_ns: int | None,
 ) -> str:
     payload = "|".join((
         receipt_id, case_id, level, boundary_kind, engine_uid, start_event_name, end_event_name,
         str(start_event_seq), str(end_event_seq), str(start_ns), str(end_ns), str(predicted_ns),
         arm_a_id, arm_b_id, "" if arm_a_ns is None else str(arm_a_ns), "" if arm_b_ns is None else str(arm_b_ns),
+        clock_operator, str(elapsed_span_ns), str(busy_union_ns),
     )).encode("utf-8")
     return hmac.new(_RECEIPT_HMAC_KEY, payload, "sha256").hexdigest()
 
@@ -692,9 +649,29 @@ def _validate_live_engine_events(case: Any, engine: Any, start_event: Any, end_e
         while len(_EVENT_OWNER_REGISTRY) > _EVENT_OWNER_MAX_ENTRIES:
             _EVENT_OWNER_REGISTRY.popitem(last=False)
     start_ns, end_ns = int(round(start_event.time * MS_TO_NS)), int(round(end_event.time * MS_TO_NS))
-    if (pred_ns := end_ns - start_ns) <= 0:
+    if (elapsed_span_ns := end_ns - start_ns) <= 0:
         raise ModelingError(f"interval_span_or_duration_invalid:{case.case_id}")
-    return uid, start_ns, end_ns, pred_ns
+    return uid, start_ns, end_ns, elapsed_span_ns
+
+
+def _validate_clock_operator(value: Any, case_id: str) -> Literal["elapsed_span", "busy_union"]:
+    if not isinstance(value, str) or value not in VALID_CLOCK_OPERATORS:
+        raise ModelingError(f"clock_operator_invalid:{case_id}")
+    return cast(Literal["elapsed_span", "busy_union"], value)
+
+
+def _busy_union_ns(engine: Any, start_ms: float, end_ms: float, elapsed_span_ns: int) -> int:
+    """Union settled task spans at the same nanosecond resolution as the event bounds."""
+    from mindie_sim.prediction.execution.submission import interval_union_ns
+
+    spans = []
+    for row in engine.trace:
+        start, end = row.get("start_ms"), row.get("end_ms")
+        if start is not None and end is not None:
+            start, end = max(start_ms, start), min(end_ms, end)
+            if start < end:
+                spans.append((start, end))
+    return interval_union_ns(spans) if spans else elapsed_span_ns
 
 
 def bind_engine_interval(
@@ -702,20 +679,27 @@ def bind_engine_interval(
     wire_bytes: int | None = None, kernel_sequence: tuple[str, ...] = (),
     diagnostics: tuple[tuple[str, Any], ...] = (),
     source_level: str = "", derived_from_step_division: bool = False,
+    clock_operator: str | None = None,
 ) -> EngineInterval:
     """Bind one ``EngineInterval`` strictly to a live ``Engine`` run and named ``Event`` handles."""
-    uid, s_ns, e_ns, pred_ns = _validate_live_engine_events(case, engine, start_event, end_event)
+    clock_op = _validate_clock_operator(case.boundary.clock_operator if clock_operator is None else clock_operator, case.case_id)
+    uid, s_ns, e_ns, elapsed_span_ns = _validate_live_engine_events(case, engine, start_event, end_event)
+    busy_union_ns = _busy_union_ns(engine, start_event.time, end_event.time, elapsed_span_ns)
+    pred_ns = busy_union_ns if clock_op == "busy_union" else elapsed_span_ns
     rid = validate_provenance_text(
         f"{CAPTURE_URI_SCHEME}engine-receipt/{uid}/{case.level}/{case.case_id}/{start_event.sequence}-{end_event.sequence}",
         field_name="engine_receipt",
     )
     tok = _sign_receipt(rid, case.case_id, case.level, case.boundary.boundary_kind, uid,
-                        start_event.name, end_event.name, start_event.sequence, end_event.sequence, s_ns, e_ns, pred_ns)
+                        start_event.name, end_event.name, start_event.sequence, end_event.sequence, s_ns, e_ns, pred_ns,
+                        clock_operator=clock_op, elapsed_span_ns=elapsed_span_ns, busy_union_ns=busy_union_ns)
     rcpt = EngineRunReceipt(rid, case.case_id, case.level, case.boundary.boundary_kind, uid,
-                            start_event.name, end_event.name, start_event.sequence, end_event.sequence, s_ns, e_ns, pred_ns, tok)
+                            start_event.name, end_event.name, start_event.sequence, end_event.sequence, s_ns, e_ns, pred_ns, tok,
+                            clock_operator=clock_op)
     return EngineInterval(
         case.case_id, case.level, case.boundary.boundary_kind, start_event.name, end_event.name, s_ns, e_ns, pred_ns,
         rid, True, 0, "ok", "", source_level, derived_from_step_division, wire_bytes, kernel_sequence, None, None, diagnostics, rcpt,
+        clock_op, elapsed_span_ns, busy_union_ns,
     )
 
 
@@ -723,30 +707,41 @@ def bind_engine_rung_interval(
     case: Any, *, arm_a: tuple[Any, Any, Any], arm_b: tuple[Any, Any, Any],
     diagnostics: tuple[tuple[str, Any], ...] = (),
 ) -> EngineInterval:
-    """Bind a ``paired_rung_delta`` interval strictly to two live ``Engine`` arm runs."""
+    """Bind a signed difference of two live Engine arms using the same clock operator."""
     if case.level != "L2" or case.boundary.boundary_kind != "paired_rung_delta":
         raise ModelingError(f"rung_binding_requires_l2_paired_rung_delta:{case.case_id}")
     (eng_a, s_a, e_a), (eng_b, s_b, e_b) = arm_a, arm_b
-    uid_a, _, _, pred_a = _validate_live_engine_events(case, eng_a, s_a, e_a)
-    uid_b, _, _, pred_b = _validate_live_engine_events(case, eng_b, s_b, e_b)
+    clock_op = _validate_clock_operator(case.boundary.clock_operator, case.case_id)
+    uid_a, _, _, elapsed_a = _validate_live_engine_events(case, eng_a, s_a, e_a)
+    uid_b, _, _, elapsed_b = _validate_live_engine_events(case, eng_b, s_b, e_b)
     if (uid_a, s_a.sequence, e_a.sequence) == (uid_b, s_b.sequence, e_b.sequence):
         raise ModelingError(f"rung_arms_must_be_distinct_runs:{case.case_id}")
+    busy_a = _busy_union_ns(eng_a, s_a.time, e_a.time, elapsed_a)
+    busy_b = _busy_union_ns(eng_b, s_b.time, e_b.time, elapsed_b)
+    pred_a, pred_b = (busy_a, busy_b) if clock_op == "busy_union" else (elapsed_a, elapsed_b)
+    elapsed_delta, busy_delta = elapsed_b - elapsed_a, busy_b - busy_a
     a_id = f"{CAPTURE_URI_SCHEME}engine-receipt/{uid_a}/L2/{case.case_id}/arm_a/{s_a.sequence}-{e_a.sequence}"
     b_id = f"{CAPTURE_URI_SCHEME}engine-receipt/{uid_b}/L2/{case.case_id}/arm_b/{s_b.sequence}-{e_b.sequence}"
     delta_ns, uid = pred_b - pred_a, f"{uid_a}+{uid_b}"
     rid = validate_provenance_text(f"{CAPTURE_URI_SCHEME}engine-receipt/{uid}/L2/{case.case_id}/rung/{s_a.sequence}-{e_b.sequence}", field_name="engine_receipt")
     tok = _sign_receipt(rid, case.case_id, "L2", "paired_rung_delta", uid, s_a.name, e_b.name,
-                        s_a.sequence, e_b.sequence, 0, delta_ns, delta_ns, a_id, b_id, pred_a, pred_b)
+                        s_a.sequence, e_b.sequence, 0, delta_ns, delta_ns, a_id, b_id, pred_a, pred_b,
+                        clock_operator=clock_op, elapsed_span_ns=elapsed_delta, busy_union_ns=busy_delta)
     rcpt = EngineRunReceipt(rid, case.case_id, "L2", "paired_rung_delta", uid, s_a.name, e_b.name,
-                            s_a.sequence, e_b.sequence, 0, delta_ns, delta_ns, tok, a_id, b_id)
+                            s_a.sequence, e_b.sequence, 0, delta_ns, delta_ns, tok, a_id, b_id, clock_op)
     return EngineInterval(
         case.case_id, "L2", "paired_rung_delta", s_a.name, e_b.name, 0, delta_ns, delta_ns,
         rid, True, 0, "ok", "", "", False, None, (), pred_a, pred_b, diagnostics, rcpt,
+        clock_op, elapsed_delta, busy_delta,
     )
 
 
 def validate_engine_interval(case: Any, interval: EngineInterval, *, expected_level: Level) -> EngineInterval:
     """Validate Engine interval case_id, boundary, signed live-Engine receipt, and duration."""
+    clock_op = case.boundary.clock_operator
+    if interval.clock_operator != clock_op:
+        raise ModelingError(f"clock_operator_mismatch:{case.case_id}:{clock_op}:{interval.clock_operator}")
+    _validate_clock_operator(clock_op, case.case_id)
     if interval.case_id != case.case_id:
         raise ModelingError(f"engine_interval_case_id_mismatch:{case.case_id}:{interval.case_id}")
     if interval.level != expected_level:
@@ -766,21 +761,25 @@ def validate_engine_interval(case: Any, interval: EngineInterval, *, expected_le
                 or interval.arm_a_predicted_ns <= 0 or interval.arm_b_predicted_ns <= 0
                 or interval.predicted_ns != interval.arm_b_predicted_ns - interval.arm_a_predicted_ns):
             raise ModelingError(f"rung_delta_prediction_invalid:{case.case_id}")
-    elif interval.end_ns - interval.start_ns != interval.predicted_ns or interval.predicted_ns <= 0:
-        raise ModelingError(f"interval_span_or_duration_invalid:{case.case_id}")
+    else:
+        span_ns = interval.end_ns - interval.start_ns
+        duration_ns = interval.busy_union_ns if clock_op == "busy_union" else span_ns
+        if interval.predicted_ns != duration_ns or not 0 < interval.predicted_ns <= span_ns:
+            raise ModelingError(f"interval_span_or_duration_invalid:{case.case_id}")
     rcpt = interval.run_receipt
     if not isinstance(rcpt, EngineRunReceipt):
         raise ModelingError(f"engine_receipt_unbound:{case.case_id}")
     if ((rcpt.receipt_id, rcpt.case_id, rcpt.level, rcpt.boundary_kind, rcpt.start_event_name, rcpt.end_event_name,
-         rcpt.start_ns, rcpt.end_ns, rcpt.predicted_ns)
+         rcpt.start_ns, rcpt.end_ns, rcpt.predicted_ns, rcpt.clock_operator)
             != (interval.engine_receipt, case.case_id, expected_level, case.boundary.boundary_kind,
-                case.boundary.start_event, case.boundary.end_event, interval.start_ns, interval.end_ns, interval.predicted_ns)):
+                case.boundary.start_event, case.boundary.end_event, interval.start_ns, interval.end_ns, interval.predicted_ns, clock_op)):
         raise ModelingError(f"engine_receipt_binding_mismatch:{case.case_id}")
     expected_tok = _sign_receipt(
         rcpt.receipt_id, rcpt.case_id, rcpt.level, rcpt.boundary_kind, rcpt.engine_uid,
         rcpt.start_event_name, rcpt.end_event_name, rcpt.start_event_seq, rcpt.end_event_seq,
         rcpt.start_ns, rcpt.end_ns, rcpt.predicted_ns, rcpt.arm_a_receipt_id, rcpt.arm_b_receipt_id,
         interval.arm_a_predicted_ns, interval.arm_b_predicted_ns,
+        clock_operator=rcpt.clock_operator, elapsed_span_ns=interval.elapsed_span_ns, busy_union_ns=interval.busy_union_ns,
     )
     if not hmac.compare_digest(rcpt.receipt_token, expected_tok):
         raise ModelingError(f"engine_receipt_signature_invalid:{case.case_id}")

@@ -26,6 +26,7 @@ from .catlass_catalog import (
     matrix_problem, mx_scale_bytes, packed_bytes, should_elide_l1_reload,
     streamk_partition, swizzle_block_coord, validate_catlass_spec,
 )
+from ._catlass_coalesced import can_coalesce, lower_coalesced
 from .contracts import SemanticWorkItem, ceil_div, eligible_matrix_engines, evg_order
 from .fuse_region import Lowering, ring_credit, solve_template_tile
 
@@ -689,6 +690,11 @@ def lower_catlass_spec(
                 tile = lowerer.tile(task, group=index, group_start=row_start, rows=rows, start_core=start, n_cols=n_cols)
                 owner_done[tile.owner] = lowerer.ordinary(tile, (owner_done.get(tile.owner, launch),))
             row_start += rows
+    elif can_coalesce(lowerer, blocks):
+        lower_coalesced(
+            lowerer, launch, blocks,
+            scale_fn=_scale, compute_b_fn=_compute_b, cube_dtype_fn=_cube_dtype, issued_fn=_issued_ops,
+        )
     elif spec.scheduler in {"streamk", "multi_core_splitk"}:
         _split_schedule(lowerer, launch, blocks)
     else:

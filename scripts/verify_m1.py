@@ -180,6 +180,9 @@ def hygiene(args) -> dict:
         f"{item.path.as_posix()}:{item.line}:{item.rule}:{item.message}"
         for item in gov_active
     ]
+    import mindie_sim.templates.registry as templates_registry
+
+    default_cube_peak_present = hasattr(templates_registry, "default_cube_peak")
     metrics = {
         "deleted_paths_present": present,
         "sidecar_imports": sidecar_imports,
@@ -189,9 +192,10 @@ def hygiene(args) -> dict:
         "canonical_import_detail": detail,
         "arch_governance_violations": gov_list,
         "arch_governance_ok": not gov_list,
+        "default_cube_peak_removed": not default_cube_peak_present,
     }
     if (present or sidecar_imports or private_paths or image_literals
-            or not imports_ok or gov_list):
+            or not imports_ok or gov_list or default_cube_peak_present):
         return _fail("hygiene", "hygiene_violation", **metrics)
     return _pass("hygiene", **metrics)
 

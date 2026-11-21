@@ -140,6 +140,8 @@ class RecipeContext:
     compute_arch: object = None
     datapath: object = None
     stream_owners: object = None
+    primitive_table: object = None
+    primitive_coverage_gaps: tuple[str, ...] = ()
 
     @property
     def effective_aic_cores(self) -> int:

@@ -188,7 +188,7 @@ def uses_retained_source_plan(op) -> bool:
         # Preserve the caller's per-owner service and prepared tensor view.
         return op.recipe == RECIPE
     if "megamoe_geometry" in metadata:
-        from .mc2_megamoe import RECIPE
+        from .operators.mc2.megamoe import RECIPE
         from .operators.grouped_moe.common import contract_fields
 
         # Aggregate routed work has no per-expert histogram for the grouped planner.
@@ -221,7 +221,7 @@ def physical_recipe_bindings() -> dict[str, object]:
     from .index_cache_writer import recipes as cache_writer_recipes
     from .lowrank_hc_vector import recipes as lowrank_hc_recipes
     from .matrix_splitk import (ScopedRouterRecipe, build_router_splitk)
-    from .mc2_megamoe import recipes as megamoe_recipes
+    from .operators.mc2.megamoe import recipes as megamoe_recipes
     from .moe_gating_fusion import ScopedGatingRecipe, build_moe_gating_topk
     from .mxfp8_grouped import ScopedSwigluRecipe, build_swiglu_mx_quant
     from .operators.attention import recipes as bsa_recipes

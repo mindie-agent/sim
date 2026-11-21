@@ -28,7 +28,9 @@ from .family_causal_conv_state import (
     _state_contract, state_accesses as state_accesses,
     state_fragments as state_fragments,
 )
-from .gdn_decode_programs import CONV, CONV_SOURCE, conv_plan
+from .operators.linear_attention._gdn_decode_programs import (
+    CONV, CONV_SOURCE, CONV_SPECULATIVE_WIDTH, CONV_SUPPORTED_WIDTHS, conv_plan,
+)
 from .mechanism import OperatorPlan, PlannedRecipe
 from .operators.kda_state_selection import (
     bind_state_value, binding_record, binding_value, decision_ports as decision_ports,
@@ -37,8 +39,6 @@ from .operators.kda_state_selection import (
 from .program import KernelProgram, Stage
 
 IMPLEMENTATION = CONV
-_SPECULATIVE_KERNEL_WIDTH = 4
-_SUPPORTED_KERNEL_WIDTHS = frozenset({2, 3, _SPECULATIVE_KERNEL_WIDTH})
 SOURCE = {
     "caller": {"path": "vllm_ascend/ops/kimi_kda.py",
                "sha256": "35365b3b353fc492b4dc5d75b88916431f6802c21bf51b61b4893d39d54f11f3",
@@ -71,7 +71,7 @@ def prepare_model(model, runtime):
             raise ModelingError("causal_conv_update_requires_16bit_activation")
         if layer.conv_state_dtype != model.activation_dtype:
             raise ModelingError("causal_conv_update_state_dtype_must_match_activation")
-        if layer.conv_kernel not in _SUPPORTED_KERNEL_WIDTHS:
+        if layer.conv_kernel not in CONV_SUPPORTED_WIDTHS:
             raise ModelingError("causal_conv_update_requires_width2to4")
         conv_width = int(getattr(layer, "conv_width", 0) or 0)
         state_elements = int(getattr(layer, "conv_state_elements", 0) or 0)
@@ -118,7 +118,7 @@ def _history_slots(model, plan):
 def _planned(op, geometry, *, compact=True):
     """Turn the shared conv program into a plan that carries state semantics.
 
-    The physical program remains ``gdn_decode_programs.conv_plan``.  Only
+    The physical program remains ``_gdn_decode_programs.conv_plan``.  Only
     zero-work read/write boundary stages and plan metadata are added; no
     convolution or state work is duplicated.
     """
@@ -221,7 +221,7 @@ def lower(b, tensors, *, plan, views, tokens, sources, key_width, value_width,
         or int(getattr(views[index], "draft_advanced_tokens", 0) or 0) > 1
         for index in active)
     if speculative:
-        if plan.conv_kernel != _SPECULATIVE_KERNEL_WIDTH:
+        if plan.conv_kernel != CONV_SPECULATIVE_WIDTH:
             raise ModelingError(
                 "causal_conv_update_speculative_requires_width4_history")
         max_query = max((q_lens[index] for index in active), default=1)
@@ -276,7 +276,7 @@ def lower(b, tensors, *, plan, views, tokens, sources, key_width, value_width,
     reader_holds = _per_sequence(state_reader_holds, len(views))
     for index in rebase:
         accepted = history_acceptance[index]
-        if plan.conv_kernel != _SPECULATIVE_KERNEL_WIDTH:
+        if plan.conv_kernel != CONV_SPECULATIVE_WIDTH:
             raise ModelingError(
                 "causal_conv_update_history_rebase_requires_width4")
         if accepted - 1 + plan.conv_kernel - 1 > history_slots:

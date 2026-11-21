@@ -11,7 +11,7 @@ import math
 from mindie_sim.catalog.attention_common import _floor_sum
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 
-from .cache_path import CacheGeometry, CacheState
+from ...cache_path import CacheGeometry, CacheState
 
 # Native MIX_AIC M tile shared with the quantized sibling. It bounds how many
 # query rows reuse one resident key tile before the next key stream starts.

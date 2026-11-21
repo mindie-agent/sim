@@ -13,13 +13,19 @@ from collections import Counter
 from dataclasses import replace
 from heapq import merge
 from itertools import groupby
+import math
 from math import gcd, lcm
+from typing import Any
 
 from .memory_physics import (
     AddressRun,
+    PeriodicSectorRun,
     SectorCoverage,
     _MAX_EXPLICIT_SECTOR_INTERVALS,
     _ceil_div,
+    _intersect_byte_intervals,
+    _measure_byte_intervals,
+    _merge_byte_intervals,
 )
 
 
@@ -382,12 +388,110 @@ def _residency_runs(data, masks):
             )
 
 
+def _measure_periodic_combo(
+    left: tuple[PeriodicSectorRun, ...], right: tuple[PeriodicSectorRun, ...], *,
+    intersect: bool, extra_left_ivs: tuple[tuple[int, int], ...] = (),
+    extra_right_ivs: tuple[tuple[int, int], ...] = (),
+) -> int:
+    """Exact byte measure of union (``intersect=False``) or intersection of runs + intervals."""
+    left_c = tuple(dict.fromkeys(r.canonical() for r in left if r.rows > 0 and r.row_bytes > 0))
+    right_c = tuple(dict.fromkeys(r.canonical() for r in right if r.rows > 0 and r.row_bytes > 0))
+    if not intersect and not left_c and not right_c:
+        return _measure_byte_intervals(_merge_byte_intervals((*extra_left_ivs, *extra_right_ivs)))
+    if intersect and ((not left_c and not extra_left_ivs) or (not right_c and not extra_right_ivs)):
+        return 0
+    if not intersect and len(left_c) == 1 and not right_c:
+        r0, ivs = left_c[0], _merge_byte_intervals((*extra_left_ivs, *extra_right_ivs))
+        return _measure_byte_intervals(ivs) + max(0, r0.total_bytes() - sum(r0.overlap_with_interval(a, b) for a, b in ivs))
+    if intersect and len(left_c) == 1 and len(right_c) == 1 and not extra_left_ivs and not extra_right_ivs:
+        a, b = left_c[0], right_c[0]
+        if a == b:
+            return a.total_bytes()
+        if (a.sector_bytes == b.sector_bytes and a.stride_bytes == b.stride_bytes > 0
+                and a.stride_bytes % a.sector_bytes == 0
+                and (a.rows == 1 or a.row_bytes < a.stride_bytes)
+                and (b.rows == 1 or b.row_bytes < b.stride_bytes)):
+            st, w1, w2 = a.stride_bytes, a.row_bytes, b.row_bytes
+            q, rem = divmod(b.base_byte - a.base_byte, st)
+            total = 0
+            for s in range(math.floor((-rem - w2) / st), math.ceil((w1 - rem) / st) + 1):
+                ov_w = min(w1, rem + s * st + w2) - max(0, rem + s * st)
+                k_lo, k_hi = max(0, q - s), min(a.rows - 1, b.rows - 1 + q - s)
+                if ov_w > 0 and k_hi >= k_lo:
+                    total += (k_hi - k_lo + 1) * ov_w
+            return total
+    events: list[tuple[int, int, str, Any]] = []
+    for kind, src in (("li", extra_left_ivs), ("ri", extra_right_ivs)):
+        for lo, hi in src:
+            if hi > lo:
+                events.extend(((lo, 1, kind, None), (hi, -1, kind, None)))
+    for kind, src in (("lr", left_c), ("rr", right_c)):
+        for r in src:
+            b_lo, b_hi = r._bounds()
+            if b_hi > b_lo:
+                events.extend(((b_lo, 1, kind, r), (b_hi, -1, kind, r)))
+    if not events:
+        return 0
+    events.sort(key=lambda item: item[0])
+
+    def _periodic_seg(act, s_lo, s_hi, eval_fn):
+        period = math.lcm(*(r._period() for r in act))
+        in_lo = min(s_hi, max(s_lo, max(r._bounds()[0] + period for r in act)))
+        in_hi = max(in_lo, min(s_hi, min(r._bounds()[1] - period for r in act)))
+        acc = eval_fn(s_lo, in_lo) if in_lo > s_lo else 0
+        if in_hi > in_lo:
+            full, rem = divmod(in_hi - in_lo, period)
+            acc += (full * eval_fn(in_lo, in_lo + period) if full else 0) + (eval_fn(in_lo + full * period, in_hi) if rem else 0)
+        return acc + (eval_fn(in_hi, s_hi) if s_hi > in_hi else 0)
+
+    l_iv = r_iv = total = idx = 0
+    l_set: set[PeriodicSectorRun] = set()
+    r_set: set[PeriodicSectorRun] = set()
+    n_ev, prev_x = len(events), events[0][0]
+    while idx < n_ev:
+        cur_x = events[idx][0]
+        if cur_x > prev_x:
+            s_lo, s_hi = prev_x, cur_x
+            l_cov, r_cov = l_iv > 0, r_iv > 0
+            l_act, r_act = (() if l_cov else tuple(l_set)), (() if r_cov else tuple(r_set))
+            if not intersect:
+                if l_cov or r_cov:
+                    total += s_hi - s_lo
+                elif act := tuple(dict.fromkeys((*l_act, *r_act))):
+                    total += _periodic_seg(act, s_lo, s_hi, lambda w0, w1, _a=act: _measure_byte_intervals(
+                        _merge_byte_intervals([iv for r in _a for iv in r._window_intervals(w0, w1)])
+                    ))
+            elif (l_cov or l_act) and (r_cov or r_act):
+                if l_cov and r_cov:
+                    total += s_hi - s_lo
+                else:
+                    act = tuple(dict.fromkeys((*l_act, *r_act)))
+                    total += _periodic_seg(act, s_lo, s_hi, lambda w0, w1, _lc=l_cov, _rc=r_cov, _la=l_act, _ra=r_act: _measure_byte_intervals(_intersect_byte_intervals(
+                        ((w0, w1),) if _lc else _merge_byte_intervals([iv for r in _la for iv in r._window_intervals(w0, w1)]),
+                        ((w0, w1),) if _rc else _merge_byte_intervals([iv for r in _ra for iv in r._window_intervals(w0, w1)]),
+                    )))
+        while idx < n_ev and events[idx][0] == cur_x:
+            _, delta, kind, obj = events[idx]
+            if kind == "li":
+                l_iv += delta
+            elif kind == "ri":
+                r_iv += delta
+            elif kind == "lr":
+                l_set.add(obj) if delta > 0 else l_set.discard(obj)
+            else:
+                r_set.add(obj) if delta > 0 else r_set.discard(obj)
+            idx += 1
+        prev_x = cur_x
+    return total
+
+
 __all__ = [
     "_classified_spans",
     "_clip_rows",
     "_coalesce_runs",
     "_coverage_overlap",
     "_coverage_runs",
+    "_measure_periodic_combo",
     "_merged_bytes",
     "_partition_runs",
     "_range_run",
