@@ -17,7 +17,7 @@ from _support.hardware import hardware_case, machine
 
 from mindie_sim import graph_costs, target_graphs
 from mindie_sim.catalog.types import QuantSpec
-from mindie_sim.prediction.engine import Engine, Resource
+from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.mechanism import Geometry
 from mindie_sim.prediction.operators.moe_routing.moe_token_partition import KIND, select as select_partition
 from mindie_sim.prediction.operators import mc2

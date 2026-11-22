@@ -14,13 +14,17 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from _support import operator_calibration_helpers as source_cases
 from _support.axes import REPRESENTATIVE_SKUS
 from _support.hardware import hardware_case, sku_case
 from mindie_sim import graph_costs
+from mindie_sim.prediction.operators.mla_prolog import family_mla_prolog as prolog; from mindie_sim.prediction.operators.sparse_indexer import index_pool_native
 from mindie_sim.prediction.cost import CostModel
 from mindie_sim.prediction.engine import Engine
 from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.frontend import Frontend
+from mindie_sim.prediction.operators.sparse_indexer.index_pool import native_shard_sizes, row_shard_partition
+from mindie_sim.prediction.lowering import Builder
 from mindie_sim.prediction.mechanism import Geometry, PlannedRecipe, Work
 from mindie_sim.prediction.operators import FamilyRegistry, paged_mla as governed
 from mindie_sim.prediction.operators.paged_mla import DSL_FLASH_ABI, FIA_ABI, FLASH_ABI
@@ -31,6 +35,7 @@ from mindie_sim.prediction.verification import verify_operator
 from mindie_sim.public.errors import UnmodeledCapabilityError
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import IterationWork
+from mindie_sim.schema.parallel import ParallelSpec
 from mindie_sim.schema.workload import IterationPlan, RequestView
 from mindie_sim.structure_physical import node_physical, subgraph_physical
 
@@ -437,3 +442,102 @@ def test_normalized_split_outputs_merge_by_logsumexp(length, latent, rope, split
     np.testing.assert_allclose(total_lse, dense_lse, atol=1e-12)
     np.testing.assert_allclose(merged, dense, atol=1e-12)
     assert not np.allclose(merged, np.exp(scores - dense_lse[:, None]) @ rng.normal(size=values.shape))
+
+
+@pytest.fixture
+def keypool_selection():
+    plan, model = source_cases._case_model(pool=16)
+    model = replace(model, quant=replace(model.quant, index_scale_dtype="fp32"))
+    runtime = source_cases._Runtime(o_proj_tp=8)
+
+    def select(views, *, padded_tokens=8, **shard):
+        builder = Builder("s0.l0", plan, 0, views, model, "decode")
+        index_pool_native.selection(
+            builder, query="q", weights="w", cache="cache", views=views, plan=plan,
+            quant=builder.quant, padded_tokens=padded_tokens, runtime=runtime, **shard)
+        return {op.op_id.rsplit(".", 1)[-1]: op for op in builder.ops}
+
+    return select
+
+
+def test_keypool_shards_request_rows_and_packs_local_indices_and_tails(keypool_selection):
+    single_long = (RequestView("r0", 8, 131072, False, "decode"),)
+    eight_decode = tuple(RequestView(f"r{i}", 1, 131072, False, "decode") for i in range(8))
+    assert [view.q_len for view in row_shard_partition(eight_decode, 8)] == [1]
+    owned = row_shard_partition(single_long, 8)
+    assert len(owned) == 1 and owned[0].q_len == 1
+
+    ops = keypool_selection(single_long, row_shard_tp=8)
+    gather = next(op for op in ops.values() if op.recipe == index_pool_native.ROW_SHARD_GATHER)
+    meta = dict(gather.metadata)
+    assert meta["local_rows"] == 1
+    assert meta["local_payload_bytes"] == 2048 * 4 == 8192
+    assert gather.link_bytes == 57344
+    assert meta["assembled_bytes"] == 65536
+    assert meta["assembled_shape"] == (8, 2048)
+    pack = next(op for op in ops.values() if op.recipe == "index_topk")
+    assert pack.mte2_bytes == 8192 + 8 + 8
+    assert pack.mte3_bytes == 8192
+
+
+def test_keypool_gates_packing_before_exchange_and_counts_indices_once(keypool_selection):
+    views = tuple(RequestView(str(i), 1, 131072, False, "decode") for i in range(8192))
+    assert native_shard_sizes(views[:8], 16, 8) == (8,)
+    shallow = (replace(views[0], q_len=8192, context=0),)
+    assert native_shard_sizes(shallow, 16, 8) == (8192,)
+    sizes = native_shard_sizes(views, 16, 8)
+    assert sizes == (1023, 1024, 1024, 1024, 1024, 1024, 1024, 1025)
+    count = 0
+    for rank, owned in enumerate(sizes):
+        ops = keypool_selection(views, padded_tokens=8192, row_shard_rank=rank)
+        pack, staged = ops["index_topk"], ops["index_exchange_stage"]
+        wire, restore = ops["index_kpool_row_shard_gather"], ops["index_exchange_restore"]
+        assert pack.deps == (ops["cann_pool_key_indexer"].op_id,)
+        assert staged.deps == (pack.op_id,)
+        assert wire.deps == (staged.op_id,)
+        assert restore.deps == (wire.op_id,)
+        assert wire.link_bytes == 7 * 1025 * 2063 * 4
+        assert pack.mte3_bytes == owned * 2063 * 4
+        assert pack.mte2_bytes == owned * (2048 * 4 + 2 * 8)
+        count += pack.mte2_bytes - owned * 2 * 8
+    assert count == 67108864
+
+
+@pytest.mark.parametrize("shards,expected", [({}, 0), ({"row_shard_tp": 8}, 1)])
+def test_keypool_small_batch_only_gathers_with_explicit_override(keypool_selection, shards, expected):
+    views = (RequestView("r", 8, 131072, False, "decode"),)
+    ops = keypool_selection(views, **shards)
+    wires = [op for op in ops.values() if op.recipe == index_pool_native.ROW_SHARD_GATHER]
+    assert len(wires) == expected
+    assert sum(op.link_bytes for op in wires) == expected * 57344
+
+
+def test_mla_prolog_without_query_norm_output_has_no_scale_shape():
+    plan, model = source_cases._prolog_case()
+    plan = replace(plan, indexer=False, owns_topk=False,
+                   index_query_per_layer=False)
+    ops = [
+        source_cases._op("s0.l0.q_a", "gemm",
+                   (8, source_cases.PROLOG_QUERY_LORA_RANK, source_cases.HIDDEN)),
+        source_cases._op("s0.l0.q_norm", "rmsnorm",
+                   (8, source_cases.PROLOG_QUERY_LORA_RANK)),
+        source_cases._op("s0.l0.q_b", "gemm",
+                   (8, 8 * source_cases.HEAD_WIDTH, source_cases.KV_RANK)),
+        source_cases._op("s0.l0.kv_a", "gemm",
+                   (8, source_cases.HEAD_WIDTH, source_cases.HIDDEN)),
+        source_cases._op("s0.l0.kv_norm", "rmsnorm", (8, source_cases.KV_RANK)),
+        source_cases._op("s0.l0.q_absorb", "gemm",
+                   (64, source_cases.KV_RANK, source_cases.KV_RANK)),
+    ]
+    prolog.declare(
+        ops, prefix="s0.l0", plan=plan, model=model,
+        parallel=ParallelSpec(tp=8, cp=8, pcp=1),
+        quant=model.quant, tokens=8,
+        members=tuple(op.op_id for op in ops),
+        q_a="s0.l0.q_a", q_b="s0.l0.q_b", kv_a="s0.l0.kv_a",
+        q_absorb="s0.l0.q_absorb", cache_layout=source_cases.LAYOUT)
+    view = source_cases._declaration(ops, "s0.l0.q_absorb")["tensor_view"]
+
+    assert view["query_norm_output"] is False
+    assert view["query_norm_scale_dtype"] == "fp8_e8m0"
+    assert view["query_norm_scale_shape"] == ()

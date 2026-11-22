@@ -33,7 +33,7 @@ from mindie_sim import (
 from mindie_sim.prediction.cohort_traffic import bind_cohort_traffic
 from mindie_sim.prediction.collectives import PairwiseCollective
 from mindie_sim.prediction.operators.collectives.direct_peer import DirectPeerGroup
-from mindie_sim.prediction.engine import Engine, Resource
+from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.operators.collectives.hccl_alltoallv import AlltoAllVGroup
 from mindie_sim.prediction.operators.collectives.hccl_ccu_two_die import TEMPLATE
 from mindie_sim.prediction.operators.collectives.hccl_contracts import select as hccl_select

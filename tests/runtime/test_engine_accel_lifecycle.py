@@ -39,7 +39,7 @@ from _support.accel import (
     verify_wheel_record,
 )
 from _support.tempdirs import tempdir
-from mindie_sim.prediction.engine import Engine, Resource
+from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.runtime import (
     accel_bridge, accel_build, accel_cache, accel_loader,
 )

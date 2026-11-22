@@ -35,7 +35,7 @@ import zipfile
 
 from _support.tempdirs import tempdir
 from mindie_sim.backends.ascend import profiles
-from mindie_sim.prediction.engine import Engine, Resource
+from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.runtime import accel_bridge, accel_build
 from mindie_sim.prediction.runtime.accel_tables import Arena, install_signatures
 
@@ -549,7 +549,7 @@ from mindie_sim.backends.ascend import profiles as ascend_profiles
 from mindie_sim.backends.nvidia import profiles as nvidia_profiles
 from mindie_sim.model_catalog import load_model
 from mindie_sim.primitives.loader import default_primitives_dir, load_manifest
-from mindie_sim.prediction.engine import Engine, Resource
+from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.runtime.accel_tables import metadata_is_stable
 
 extract, package = Path(sys.argv[1]).resolve(), Path(mindie_sim.__file__).resolve()

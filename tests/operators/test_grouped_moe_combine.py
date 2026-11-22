@@ -349,3 +349,115 @@ def test_deepep_receive_views_alias_and_wait_for_their_chunks(overlap, cut):
         assert value["alias_of"] == dispatch.op_id and value["write_bytes"] == 0
         conversion = next(op for op in ops if op.family == "quantize" and op.deps == (view.op_id,))
         assert conversion.mte3_bytes == (stop - start) * (32 + 4)
+
+
+def test_mx_panel_template_alias_topology_and_cache_invalidation():
+    import json
+    from math import ceil, lcm
+    from pathlib import Path
+    from mindie_sim.prediction.operators.mx_quant_matrix import mxfp4_grouped
+    from mindie_sim.prediction.engine import Allocation, Engine, Resource
+    from mindie_sim.prediction.mechanism import PlannedRecipe
+    from mindie_sim.prediction.operators.mx_quant_matrix.mxfp4_geometry import panel_sizes
+    from mindie_sim.prediction.operators.mx_quant_matrix.mxfp4_panels import compiled_panels, panel_parts
+    from mindie_sim.prediction.program import RecipeBook
+    from mindie_sim.prediction.operators.matrix.refill_steady import compact_refill
+
+    root = Path(__file__).resolve().parents[2]
+    raw = json.loads((root / "examples/cases/v41-a5-dp4-body-current.json").read_text())
+    raw["runtime"]["routing"] = {"policy": "balanced"}
+    raw["runtime"].setdefault("kernels", {}).setdefault("families", {})["grouped_gemm"] = {"kind": "ascend_mxa8w4_nznk"}
+    gate = next(op for op in target_graphs(raw, scope="body", phase="decode", tokens=1, context=8, sequences=1)[0] if op.family == "grouped_gemm")
+    op = replace(gate, local_shape=(1, 160, 320), semantic_shape=(1, 160, 320), launch_shape=(1, 160, 320),
+                 metadata=tuple({**dict(gate.metadata), "matrix_group_rows": (1,), "matrix_weight_bank_groups": 1, "matrix_groups": 1}.items()))
+    contexts = []
+
+    def capture(cur_op, geom):
+        plan = mxfp4_grouped.build(cur_op, geom)
+        return replace(plan, program=lambda ctx: contexts.append(ctx) or plan.program(ctx))
+
+    operator_costs(raw, (op,), recipes=RecipeBook(families={"grouped_gemm": PlannedRecipe(capture)}))
+    base_ctx = contexts[0]
+
+    def uncached(ctx, args):
+        kb, ka, _ = panel_sizes(args["m"], args["n"])
+        panels, period = ceil(args["k"] / kb), lcm(ka, 4096) // kb
+        count = panels // period - (panels % period == 0 and args["k"] % kb != 0)
+        opts = {k: v for k, v in args.items() if k != "shared_clients"}
+        parts = [panel_parts(ctx, index=idx, **opts) for idx in range(panels)]
+        return compact_refill(ctx, tuple(parts[:period]) if count else (), count, tuple(parts[count * period:]), shared_clients=args["shared_clients"])
+
+    def run_ir(prog, ctx):
+        units = {name: ctx.resource_units.get(role, 1) for role, name in ctx.resource_names.items()}
+        eng = Engine([Resource(n, rate, units=units.get(n, 1)) for n, rate in ctx.rates.items()], trace_limit=100)
+        done = prog.start(eng, "source", eng.submit("input", release=0))
+        eng.advance(until=(done,))
+        return done.time, dict(eng.serviced)
+
+    # Full cache-key invalidation across rates, units, peaks, service_modes, owner, repeat, and shared_clients
+    hbm, mte = base_ctx.resource_names["hbm"], base_ctx.resource_names["mte2_aic"]
+    key_ctx = replace(base_ctx, service_modes={**base_ctx.service_modes, "mte1_l0a": ("mte1", 1e12), "mte1_l0b": ("mte1", 5e11)})
+    key_args = dict(k=5120, m=1, n=160, repeat=1, owner=0, cores=32, aivs=64, directional=True, shared_clients={hbm: 1})
+    cached = compiled_panels(key_ctx, **key_args)
+    for variant_ctx, variant_args in (
+        (replace(key_ctx, rates={**key_ctx.rates, hbm: key_ctx.rates[hbm] * 0.5}), key_args),
+        (replace(key_ctx, rates={**key_ctx.rates, mte: key_ctx.rates[mte] * 0.5}), key_args),
+        (replace(key_ctx, resource_units={**key_ctx.resource_units, "mte2_aic": 16}), key_args),
+        (replace(key_ctx, compute_peaks={**key_ctx.compute_peaks, "fp8_e4m3": key_ctx.compute_peaks["fp8_e4m3"] * 0.5}), key_args),
+        (replace(key_ctx, service_modes={**key_ctx.service_modes, "mte1_l0a": ("mte1", 1e10)}), key_args),
+        (key_ctx, {**key_args, "owner": 1}),
+        (key_ctx, {**key_args, "repeat": 2}),
+        (key_ctx, {**key_args, "shared_clients": {hbm: 32}}),
+    ):
+        assert compiled_panels(variant_ctx, **variant_args) is not cached
+    assert compiled_panels(replace(key_ctx, op=None, setup_ms=10, minimum_ms=100), **key_args) is cached
+
+    # Resource sort-order normalization & AIC/AIV alias overlapping owner sets
+    rev_names = {name: f"z{idx:03d}" for idx, name in enumerate(reversed(sorted(base_ctx.rates)))}
+    sorted_ctx = replace(base_ctx, resource_names={role: rev_names[name] for role, name in base_ctx.resource_names.items()},
+                         rates={rev_names[name]: rate for name, rate in base_ctx.rates.items()})
+    sort_args = dict(k=320, m=3, n=160, repeat=1, owner=7, cores=32, aivs=64, directional=False, shared_clients={sorted_ctx.resource_names["hbm"]: 32})
+    assert run_ir(compiled_panels(sorted_ctx, **sort_args), sorted_ctx) == run_ir(uncached(sorted_ctx, sort_args), sorted_ctx)
+
+    alias = base_ctx.resource_names["mte2_aiv"]
+    alias_ctx = replace(base_ctx, resource_names={**base_ctx.resource_names, "mte2_aic": alias}, resource_units={**base_ctx.resource_units, "mte2_aic": 64})
+    compiled_panels.cache_clear()
+    for owner in (0, 7, 31):
+        alias_args = dict(k=320, m=3, n=160, repeat=1, owner=owner, cores=32, aivs=64, directional=False, shared_clients={alias_ctx.resource_names["hbm"]: 8})
+        bound = compiled_panels(alias_ctx, **alias_args)
+        assert bound == uncached(alias_ctx, alias_args)
+        load_stages = bound.stages[0].program.stages
+        assert load_stages[0].placement[alias] == (owner * 2, owner * 2 + 1)
+        assert load_stages[1].placement[alias] == (owner * 2,) and load_stages[7].placement[alias] == (owner * 2 + 1,)
+    assert compiled_panels.template_cache_info().misses == 1
+
+
+def test_mx_swiglu_subblock_owner_timing_and_single_batch_invocation():
+    from collections import Counter
+    import json
+    from pathlib import Path
+    from mindie_sim.prediction.operators.mx_quant_matrix import mxfp8_swiglu
+
+    root = Path(__file__).resolve().parents[2]
+    raw = json.loads((root / "examples/cases/high-concurrency-20261030/glm-flash-ws9/a5_glm53flash_tp8_c32_p4k.json").read_text())
+    role, profile = mxfp8_swiglu.ROLE, mxfp8_swiglu.PROFILE
+    raw["runtime"]["kernels"].setdefault("lowerings", {})["native_fusion"] = {
+        "implementation": "declared_native_fusion",
+        "options": {"roles": [role], "program_profiles": {role: profile}, "program_options": {role: {"l1_k": 512, "compact": True}}},
+    }
+    first = next(o for o in target_graphs(raw, scope="body", phase="decode", tokens=4, context=4096, sequences=32, resource_fusion=True)[0] if o.recipe == profile)
+    batch_row = operator_costs(raw, [first])["operators"][0]
+    prog_md = batch_row["operator"]["metadata"]["program_execution"]
+    assert prog_md["source_output_tiles"] == 288 and prog_md["active_aic_owners"] == 32
+    assert max(val for key, val in batch_row["peak_buffers_per_unit"].items() if key.startswith("ub@")) == 184832
+
+    meta = dict(first.metadata)
+    meta["mxfp8_swiglu_config"] = dict(meta["mxfp8_swiglu_config"], rows=(3,) * 33, width=64, k=128, compact=False)
+    unequal = replace(first, local_shape=(99, 64), deps=(), metadata=tuple(meta.items()))
+    report = graph_costs(raw, [unequal], isolated=False, input_ready_ms=7, trace_limit=10000)
+    vec = [e for e in report["events"] if e["task"].endswith(":swiglu_mx")]
+    assert len(vec) == 66
+    observed = Counter(e["placement"]["vector@r0:s0"][0] for e in vec)
+    assert observed[0] == observed[1] == 2 and all(observed[idx] == 1 for idx in range(2, 64))
+    owner0 = sorted((e for e in vec if tuple(e["placement"]["vector@r0:s0"]) == (0,)), key=lambda e: e["start_ms"])
+    assert owner0[-1]["start_ms"] >= owner0[0]["end_ms"]

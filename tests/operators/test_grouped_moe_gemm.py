@@ -23,7 +23,7 @@ from mindie_sim.catalog.ops import gemm_op, vector_op
 from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.prediction.operators.moe_routing.moe_gating_fusion import _fused_gating, build_moe_gating_topk
 from mindie_sim.prediction.rewrite_ffn_rules import router_gemm
-from mindie_sim.prediction.engine import Engine, Resource
+from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.mechanism import Geometry, Work
 from mindie_sim.prediction.operators import FamilyDispatcher, FamilyRegistry, grouped_moe
 from mindie_sim.prediction.operators.contracts import OperatorPlanningContext

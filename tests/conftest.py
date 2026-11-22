@@ -193,11 +193,10 @@ def profiler_api():
 
 
 @pytest.fixture
-def lean_binary():
-    from shutil import which
-
-    elan_lean = Path("/tmp/elan-mindie-s3b/bin/lean")
-    lean = which("lean") or (str(elan_lean) if elan_lean.is_file() else None)
+def lean_binary() -> str:
+    elan = Path("/tmp/elan-mindie-s3b/bin/lean")
+    lean = shutil.which("lean") or (str(elan) if elan.is_file() else None)
     if not lean:
         _missing("Lean toolchain unavailable")
+    assert lean is not None
     return lean

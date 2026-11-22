@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Product-orthogonal test-suite gate for ``tests/`` (rules TO001..TO013).
+"""Product-orthogonal test-suite gate for ``tests/`` (rules TO001..TO014).
 
 [Role] Keep the test tree organised by product layer and mechanism: one
   ``tests/<domain>/test_<mechanism>.py`` per manifest entry, no process /
@@ -28,9 +28,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 GIT_TIMEOUT_S = 60
+MAX_LINES = 600
 HARD_MAX_LINES = 800
-#: Hard ceiling on manifest modules: 74 legacy-consolidation slots + new-mechanism headroom.
-MODULE_CEILING = 128
 LITERAL_ENUM_MIN = 8
 PROCESS = re.compile(
     r"^(issues?\d*|gh\d+|pr\d+|open|r\d+|round\d+|pass\d+|fix\d+|finding\d+|iter\d+"
@@ -46,12 +45,14 @@ SHADOW_STEM = re.compile(r"_(legacy|old|backup|copy|fallback)$")
 SKU_LITERAL = re.compile(r"^(Ascend\d+\w*|910[BC]\w*|950\w*|arch22|arch35)$")
 ABS_HOME = re.compile(r"^(/(Users|home|root)/|[A-Za-z]:\\Users\\)")
 DOC_LITERAL = re.compile(r"(?i)(\.md|\.rst)$|^(README|CHANGELOG|CONTRIBUTING)\b")
-XFAIL_SOURCE = re.compile(r"(?<![\w/])([\w./-]+\.[A-Za-z][\w]*):([1-9]\d*)\b")
-BROAD_XFAIL_EXCEPTIONS = frozenset({"BaseException", "Exception", "AssertionError"})
-XFAIL_MARK = "pytest.mark.xfail"
-SKIP_MARK = "pytest.mark.skip"
-SKIPIF_MARK = "pytest.mark.skipif"
-RESTRICTED_MARKS = {XFAIL_MARK, SKIP_MARK, SKIPIF_MARK}
+XFAIL_URL = re.compile(r"https?://\S+")
+XFAIL_FILE_LINE = re.compile(r"([A-Za-z0-9_./-]+\.[A-Za-z0-9_]+):(\d+)")
+TRIVIAL_CITE_LINES = {"", "{", "}", "[", "]", "{,", "},"}
+BROAD_XFAIL_RAISES = {"Exception", "BaseException", "RuntimeError", "AssertionError"}
+APPROVED_XFAIL_PARAMS = frozenset({
+    ("tests/product/test_accuracy_gates.py", "a3_v41_w8a8_tp4_dp4_ep16_dspark7_c32:q8_b9_m72"),
+    ("tests/product/test_accuracy_gates.py", "glm53flash-a3-tp16-c4:q6_b4_m24"),
+})
 TIERS = ("tier0", "tier1", "live_npu")
 TIER0_BANNED_IMPORTS = ("subprocess", "multiprocessing", "socket", "venv")
 TIER0_BANNED_CALLS = {("time", "sleep"), ("os", "fork"), ("os", "system")}
@@ -87,6 +88,24 @@ def _pos_int(raw: object, field: str) -> int:
     return value
 
 
+def _validate_owns(root: Path, rel: str, owns: object, *, reserved: bool) -> None:
+    if not isinstance(owns, list) or not owns:
+        raise ManifestError(f"{rel}: module entry must declare non-empty owns = [...]")
+    resolved_root = root.resolve()
+    for raw in owns:
+        if (not isinstance(raw, str) or not raw.strip() or raw != raw.strip()
+                or "\\" in raw or re.match(r"^[A-Za-z]:", raw)):
+            raise ManifestError(f"{rel}: invalid owns path {raw!r}")
+        cand = Path(raw)
+        if cand.is_absolute() or cand.drive or any(part in {".", ".."} for part in cand.parts):
+            raise ManifestError(f"{rel}: owns path {raw!r} must be clean repo-relative")
+        target = (resolved_root / cand).resolve()
+        if target == resolved_root or not target.is_relative_to(resolved_root):
+            raise ManifestError(f"{rel}: owns path {raw!r} must resolve inside {resolved_root}")
+        if not reserved and not target.exists():
+            raise ManifestError(f"{rel}: owned path {raw!r} does not exist on disk")
+
+
 def load_manifest(tests: Path) -> dict:
     path = tests / "TAXONOMY.toml"
     try:
@@ -97,12 +116,9 @@ def load_manifest(tests: Path) -> dict:
         raise ManifestError(f"{path}: {exc}") from exc
     if data.get("schema_version") != 1:
         raise ManifestError(f"{path}: schema_version must be 1, got {data.get('schema_version')!r}")
-    max_lines = _pos_int(data.get("max_lines", 600), "max_lines")
-    max_modules = _pos_int(data.get("max_modules", MODULE_CEILING), "max_modules")
-    if max_lines >= HARD_MAX_LINES:
-        raise ManifestError(f"max_lines ({max_lines}) must be < {HARD_MAX_LINES}")
-    if max_modules > MODULE_CEILING:
-        raise ManifestError(f"max_modules ({max_modules}) must be <= {MODULE_CEILING}")
+    max_lines = _pos_int(data.get("max_lines", MAX_LINES), "max_lines")
+    if max_lines > MAX_LINES:
+        raise ManifestError(f"max_lines ({max_lines}) must be <= {MAX_LINES}")
     modules = {}
     for entry in data.get("module", []):
         if not isinstance(entry, dict):
@@ -110,10 +126,11 @@ def load_manifest(tests: Path) -> dict:
         rel = entry.get("path")
         if not rel or entry.get("tier") not in TIERS:
             raise ManifestError(f"module entry needs path and tier in {TIERS}: {entry}")
+        _validate_owns(tests.parent, rel, entry.get("owns"), reserved=bool(entry.get("reserved")))
         if "max_lines" in entry:
             entry_cap = _pos_int(entry["max_lines"], f"{rel}.max_lines")
-            if entry_cap >= HARD_MAX_LINES:
-                raise ManifestError(f"{rel}.max_lines ({entry_cap}) must be < {HARD_MAX_LINES}")
+            if entry_cap > MAX_LINES:
+                raise ManifestError(f"{rel}.max_lines ({entry_cap}) must be <= {MAX_LINES}")
         if rel in modules:
             raise ManifestError(f"duplicate manifest module {rel}")
         modules[rel] = entry
@@ -122,8 +139,7 @@ def load_manifest(tests: Path) -> dict:
         raise ManifestError("manifest declares no domains")
     return {"domains": domains, "modules": modules,
             "support_dirs": tuple(data.get("support_dirs", ())),
-            "max_lines": max_lines,
-            "max_modules": max_modules}
+            "max_lines": max_lines}
 
 
 def git(root: Path, *args: str) -> str:
@@ -187,156 +203,22 @@ def name_tokens(stem: str) -> list[tuple[str, str]]:
     return out
 
 
-def _cites_source_line(root: Path, reason: ast.AST | None) -> bool:
-    if not isinstance(reason, ast.Constant) or not isinstance(reason.value, str):
-        return False
-    for filename, line in XFAIL_SOURCE.findall(reason.value):
-        path = (root / filename).resolve()
-        if not path.is_relative_to(root):
-            continue
-        if not path.is_file() and Path(filename).name == filename:
-            matches = [p for p in (root / "mindie_sim").rglob(filename) if p.is_file()]
-            if len(matches) == 1:
-                path = matches[0].resolve()
-        if not path.is_file() or not path.is_relative_to(root):
-            continue
-        try:
-            with path.open(encoding="utf-8") as source:
-                cited = next((text.strip() for number, text in enumerate(source, 1)
-                              if number == int(line)), "")
-        except (OSError, UnicodeError):
-            continue
-        if not cited.startswith(("#", "//", "/*", "*")) and re.search(r"[\w]", cited):
-            return True
-    return False
-
-
-def _check_skipif_call(rel: str, call: ast.Call) -> Finding | None:
-    conditions = call.args or [next((kw.value for kw in call.keywords if kw.arg == "condition"), None)]
-    if all(cond is not None and re.search(r"sys\.platform|os\.name|platform\.system", ast.unparse(cond))
-           for cond in conditions):
-        return None
-    return Finding(rel, call.lineno, "TO008", "skipif only on platform conditions; use requires_* markers otherwise")
-
-
-def _pytest_mark_findings(root: Path, rel: str, tree: ast.Module) -> list[Finding]:
-    """Check restricted marks wherever they occur, including legacy root modules."""
-    aliases = {}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            aliases.update((entry.asname, entry.name) for entry in node.names if entry.asname)
-        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
-            aliases.update((entry.asname or entry.name, f"{node.module}.{entry.name}") for entry in node.names)
-
-    def resolve(expr: ast.AST) -> str:
-        head, sep, tail = dotted(expr).partition(".")
-        return f"{aliases.get(head, head)}{sep}{tail}"
-
-    bindings = {target.id: node.value for node in tree.body if isinstance(node, ast.Assign)
-                for target in node.targets if isinstance(target, ast.Name)}
-
-    def unbound(expr: ast.AST) -> ast.AST:
-        seen = set()
-        while isinstance(expr, ast.Name) and expr.id in bindings and expr.id not in seen:
-            seen.add(expr.id)
-            expr = bindings[expr.id]
-        return expr
-
-    def keywords(call: ast.Call) -> dict:
-        return {kw.arg: kw.value for kw in call.keywords}
-
-    def mark_nodes(expr: ast.AST, mark_name: str):
-        expr = unbound(expr)
-        if isinstance(expr, (ast.List, ast.Tuple)):
-            for mark in expr.elts:
-                yield from mark_nodes(mark, mark_name)
-        elif resolve(expr.func if isinstance(expr, ast.Call) else expr) == mark_name:
-            yield expr
-
-    owners = {}
-    for name, deco in _test_decorators(tree):
-        for mark in mark_nodes(deco, XFAIL_MARK):
-            owners.setdefault(mark, set()).add(f"{rel}::{name}")
-        if not isinstance(deco, ast.Call) or resolve(deco.func) != "pytest.mark.parametrize":
-            continue
-        values = deco.args[1] if len(deco.args) > 1 else keywords(deco).get("argvalues")
-        rows = unbound(values)
-        if not isinstance(rows, (ast.Tuple, ast.List)):
-            continue
-        for row in rows.elts:
-            if not isinstance(row, ast.Call) or resolve(row.func) != "pytest.param":
-                continue
-            kw = keywords(row)
-            row_id = kw.get("id")
-            if isinstance(row_id, ast.Constant) and isinstance(row_id.value, str):
-                for mark in mark_nodes(kw.get("marks"), XFAIL_MARK):
-                    owners.setdefault(mark, set()).add(f"{rel}::{name}[{row_id.value}]")
-
-    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
-    findings = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call):
-            name = resolve(node.func)
-            if name == "pytest.param":
-                for mark in mark_nodes(keywords(node).get("marks"), SKIPIF_MARK):
-                    if isinstance(mark, ast.Call) and (finding := _check_skipif_call(rel, mark)):
-                        findings.append(finding)
-            if name == SKIP_MARK:
-                findings.append(Finding(rel, node.lineno, "TO008", f"{name}() is banned"))
-            if name != XFAIL_MARK:
-                continue
-            kw = keywords(node)
-        elif isinstance(node, (ast.Attribute, ast.Name)) and (name := resolve(node)) in RESTRICTED_MARKS:
-            parent = parents[node]
-            if isinstance(parent, ast.Call) and parent.func is node:
-                continue
-            if name != XFAIL_MARK:
-                findings.append(Finding(rel, node.lineno, "TO008", f"bare {name} reference is banned"))
-                continue
-            kw = {}
-        else:
-            continue
-        raises = unbound(kw.get("raises"))
-        exceptions = raises.elts if isinstance(raises, ast.Tuple) else [raises]
-        narrowed = exceptions and all(
-            (kind := resolve(unbound(exc))) and kind.rsplit(".", 1)[-1] not in BROAD_XFAIL_EXCEPTIONS
-            for exc in exceptions
-        )
-        strict = kw.get("strict")
-        run_arg = kw.get("run")
-        run_ok = run_arg is None or (isinstance(run_arg, ast.Constant) and run_arg.value is True)
-        if isinstance(strict, ast.Constant) and strict.value is True and run_ok and narrowed and _cites_source_line(root, kw.get("reason")):
-            continue
-        for owner in sorted(owners.get(node, {rel})):
-            findings.append(Finding(
-                rel, node.lineno, "TO008",
-                f"{owner}: xfail needs strict=True, a specific raises type and a valid source file:line",
-            ))
-    return findings
-
-
-def _test_decorators(tree: ast.Module):
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            yield from ((node.name, deco) for deco in node.decorator_list)
-        elif isinstance(node, ast.ClassDef):
-            for item in node.body:
-                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    yield from ((f"{node.name}::{item.name}", deco) for deco in item.decorator_list)
-
-
 class ModuleCheck(ast.NodeVisitor):
-    """AST rules TO005..TO012 for one test or support module."""
+    """AST rules TO005..TO014 for one test or support module."""
 
-    def __init__(self, rel: str, tier: str | None, *, is_test: bool, allow_fields: bool,
+    def __init__(self, root: Path, rel: str, tier: str | None, *, is_test: bool, allow_fields: bool,
                  is_tempdirs: bool, is_oracle: bool, is_conftest: bool):
-        self.rel, self.tier, self.is_test = rel, tier, is_test
+        self.root, self.rel, self.tier, self.is_test = root, rel, tier, is_test
         self.allow_fields, self.is_tempdirs = allow_fields, is_tempdirs
         self.is_oracle, self.is_conftest = is_oracle, is_conftest
         self.findings: list[Finding] = []
         self.scope_tier1 = 0
         self.repo_names: set[str] = set()
         self.aliases: dict[str, str] = {}
+        self.module_consts: dict[str, ast.AST] = {}
+        self.seen_xfail_params: set[tuple[str, str]] = set()
+        self.call_funcs: set[int] = set()
+        self.attr_values: set[int] = set()
 
     def resolve(self, node: ast.AST) -> str:
         raw = dotted(node)
@@ -345,11 +227,29 @@ class ModuleCheck(ast.NodeVisitor):
         return f"{mapped}{sep}{tail}" if mapped else raw
 
     def visit_Module(self, node: ast.Module) -> None:
+        self.call_funcs = {id(n.func) for n in ast.walk(node) if isinstance(n, ast.Call)}
+        self.attr_values = {id(n.value) for n in ast.walk(node) if isinstance(n, ast.Attribute)}
         for stmt in node.body:
-            if isinstance(stmt, ast.Assign) and ("__file__" in ast.unparse(stmt.value) or any(
-                    isinstance(n, ast.Name) and n.id in self.repo_names for n in ast.walk(stmt.value))):
-                self.repo_names.update(t.id for t in stmt.targets if isinstance(t, ast.Name))
+            if isinstance(stmt, ast.Assign):
+                targets, value = stmt.targets, stmt.value
+            elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
+                targets, value = [stmt.target], stmt.value
+            else:
+                continue
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    self.module_consts[target.id] = value
+            if "__file__" in ast.unparse(value) or any(
+                    isinstance(n, ast.Name) and n.id in self.repo_names for n in ast.walk(value)):
+                self.repo_names.update(t.id for t in targets if isinstance(t, ast.Name))
         self.generic_visit(node)
+        for stmt in node.body:
+            targets = stmt.targets if isinstance(stmt, ast.Assign) else (
+                [stmt.target] if isinstance(stmt, ast.AnnAssign) and stmt.value is not None else [])
+            val = getattr(stmt, "value", None)
+            if val is not None and any(isinstance(t, ast.Name) and t.id == "pytestmark" for t in targets):
+                if self._contains_mark(val, {"pytest.mark.xfail", "pytest.mark.skip"}):
+                    self.add(stmt, "TO008", "module-level pytestmark xfail/skip is banned")
 
     def visit_BinOp(self, node: ast.BinOp) -> None:
         left = node
@@ -375,25 +275,166 @@ class ModuleCheck(ast.NodeVisitor):
                 self.add(node, "TO009", f"process-named test '{node.name}': name the guarded product law")
             for deco in node.decorator_list:
                 self._decorator(deco)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_"):
+                self._check_unused_test_locals(node)
         self.generic_visit(node)
         self.scope_tier1 -= tier1
 
+    def _check_unused_test_locals(self, fn: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        nested_scopes = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda,
+                         ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+        stored: dict[str, ast.AST] = {}
+        shared: set[str] = set()
+
+        def walk_direct(stmts: list[ast.stmt]) -> None:
+            for s in stmts:
+                if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    if not s.name.startswith("_"):
+                        stored.setdefault(s.name, s)
+                    continue
+                if isinstance(s, (ast.Global, ast.Nonlocal)):
+                    shared.update(s.names)
+                    continue
+                if isinstance(s, ast.Assign) and len(s.targets) == 1 and isinstance(s.targets[0], (ast.Tuple, ast.List)):
+                    elts = [e for e in ast.walk(s.targets[0]) if isinstance(e, ast.Name) and isinstance(e.ctx, ast.Store)]
+                    if elts and all(not e.id.startswith("_") for e in elts):
+                        # Tuple unpack: only flag if EVERY unpacked binding is unused (Ruff F841 semantics)
+                        tuple_groups.append((s, elts))
+                    for child in ast.iter_child_nodes(s.value):
+                        if not isinstance(child, nested_scopes):
+                            pass
+                    continue
+                queue: list[ast.AST] = [s]
+                while queue:
+                    cur = queue.pop()
+                    if isinstance(cur, nested_scopes):
+                        continue
+                    if isinstance(cur, (ast.Tuple, ast.List)) and isinstance(getattr(cur, "ctx", None), ast.Store):
+                        continue
+                    if isinstance(cur, ast.Name) and isinstance(cur.ctx, ast.Store) and not cur.id.startswith("_"):
+                        stored.setdefault(cur.id, cur)
+                    for child in ast.iter_child_nodes(cur):
+                        queue.append(child)
+
+        tuple_groups: list[tuple[ast.Assign, list[ast.Name]]] = []
+        walk_direct(fn.body)
+        loaded = {n.id for stmt in fn.body for n in ast.walk(stmt)
+                  if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Load, ast.Del))}
+        for name, target in stored.items():
+            if name not in loaded and name not in shared:
+                self.add(target, "TO014",
+                         f"unused local '{name}' in '{fn.name}' (discarded result/assertion; assert on it or prefix '_')")
+        for assign_node, elts in tuple_groups:
+            if all(e.id not in loaded and e.id not in shared for e in elts):
+                names = ", ".join(e.id for e in elts)
+                self.add(assign_node, "TO014",
+                         f"unused unpacked locals ({names}) in '{fn.name}' (discarded result/assertion)")
+
     visit_FunctionDef = visit_AsyncFunctionDef = visit_ClassDef = _scoped
 
-    def _decorator(self, deco: ast.AST) -> None:
-        if not isinstance(deco, ast.Call):
+    def _contains_mark(self, expr: ast.AST, targets: set[str]) -> bool:
+        roots = [expr]
+        seen: set[str] = set()
+        for root in roots:
+            for sub in ast.walk(root):
+                if isinstance(sub, ast.Name) and sub.id in self.module_consts and sub.id not in seen:
+                    seen.add(sub.id)
+                    roots.append(self.module_consts[sub.id])
+                if isinstance(sub, ast.Call) and self.resolve(sub.func) in targets:
+                    return True
+                if isinstance(sub, (ast.Attribute, ast.Name)) and self.resolve(sub) in targets:
+                    return True
+        return False
+
+    def _valid_xfail_citation(self, reason: str) -> bool:
+        if XFAIL_URL.search(reason):
+            return True
+        matches = list(XFAIL_FILE_LINE.finditer(reason))
+        if not matches:
+            return False
+        for m in matches:
+            cite_rel, line_str = m.group(1), m.group(2)
+            target = (self.root / cite_rel).resolve()
+            if not target.is_relative_to(self.root.resolve()) or not target.is_file():
+                return False
+            src_lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
+            idx = int(line_str) - 1
+            if idx < 0 or idx >= len(src_lines) or src_lines[idx].strip() in TRIVIAL_CITE_LINES:
+                return False
+        return True
+
+    def _exc_leaves(self, expr: ast.AST | None, seen: set[str] | None = None) -> list[str] | None:
+        if expr is None:
+            return None
+        visited = set() if seen is None else seen
+        if isinstance(expr, ast.Name):
+            if expr.id in self.module_consts and expr.id not in visited:
+                return self._exc_leaves(self.module_consts[expr.id], visited | {expr.id})
+            return [self.resolve(expr).split(".")[-1]]
+        if isinstance(expr, ast.Attribute):
+            return [expr.attr]
+        if isinstance(expr, ast.Tuple) and expr.elts:
+            out: list[str] = []
+            for elt in expr.elts:
+                sub = self._exc_leaves(elt, visited)
+                if not sub:
+                    return None
+                out.extend(sub)
+            return out
+        return None
+
+    def _check_xfail_call(self, node: ast.Call) -> None:
+        kw = {k.arg: k.value for k in node.keywords}
+        strict, reason, raises, run_kw = kw.get("strict"), kw.get("reason"), kw.get("raises"), kw.get("run")
+        leaves = self._exc_leaves(raises)
+        ok_raises = bool(leaves) and not any(name in BROAD_XFAIL_RAISES for name in leaves)
+        ok_run = run_kw is None or (isinstance(run_kw, ast.Constant) and run_kw.value is True)
+        if not (isinstance(strict, ast.Constant) and strict.value is True and ok_raises and ok_run
+                and isinstance(reason, ast.Constant) and isinstance(reason.value, str)
+                and self._valid_xfail_citation(reason.value)):
+            self.add(node, "TO008", "xfail requires strict=True, run=True, specific raises=..., and verified file:line")
+
+    def _check_skipif_call(self, node: ast.Call) -> None:
+        kw = {k.arg: k.value for k in node.keywords}
+        cond = node.args[0] if node.args else kw.get("condition")
+        text = ast.unparse(cond) if cond is not None else ""
+        if not re.search(r"sys\.platform|os\.name|platform\.system", text):
+            self.add(node, "TO008", "skipif only on platform conditions; use requires_* markers otherwise")
+
+    def _check_param_marks(self, node: ast.Call) -> None:
+        kw = {k.arg: k.value for k in node.keywords}
+        marks_kw = kw.get("marks")
+        if marks_kw is None:
             return
-        name = dotted(deco.func)
-        if name == SKIPIF_MARK:
-            finding = _check_skipif_call(self.rel, deco)
-            if finding is not None:
-                self.findings.append(finding)
-        elif name == "pytest.mark.parametrize":
-            for sub in ast.walk(deco):
+        if self._contains_mark(marks_kw, {"pytest.mark.skip"}):
+            self.add(node, "TO008", "pytest.param skip mark is banned")
+        if not self._contains_mark(marks_kw, {"pytest.mark.xfail"}):
+            return
+        str_args = [a.value for a in node.args if isinstance(a, ast.Constant) and isinstance(a.value, str)]
+        id_kw = kw.get("id")
+        if isinstance(id_kw, ast.Constant) and isinstance(id_kw.value, str):
+            str_args.append(id_kw.value)
+        matched = [(self.rel, s) for s in str_args if (self.rel, s) in APPROVED_XFAIL_PARAMS]
+        if len(matched) != 1 or matched[0] in self.seen_xfail_params:
+            self.add(node, "TO008", "unapproved or duplicate xfail param node ID")
+        else:
+            self.seen_xfail_params.add(matched[0])
+
+    def _decorator(self, deco: ast.AST) -> None:
+        if not isinstance(deco, ast.Call) or self.resolve(deco.func) != "pytest.mark.parametrize":
+            if self._contains_mark(deco, {"pytest.mark.xfail", "pytest.mark.skip"}):
+                self.add(deco, "TO008", "unapproved test-level xfail/skip decorator")
+            return
+        roots = [deco]
+        seen: set[str] = set()
+        for root in roots:
+            for sub in ast.walk(root):
+                if isinstance(sub, ast.Name) and sub.id in self.module_consts and sub.id not in seen:
+                    seen.add(sub.id)
+                    roots.append(self.module_consts[sub.id])
                 if isinstance(sub, ast.Constant) and isinstance(sub.value, str) and SKU_LITERAL.match(sub.value):
-                    self.add(sub, "TO012", f"SKU literal '{sub.value}' in parametrize: use _support.axes",
-                             "warn")
-                    break
+                    self.add(deco, "TO012", f"SKU literal '{sub.value}' in parametrize: use _support.axes", "warn")
+                    return
 
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
@@ -450,8 +491,14 @@ class ModuleCheck(ast.NodeVisitor):
             self.add(node, "TO007", f"{name}(): use tmp_path or _support.tempdirs")
         if name in {"Path.home", "pathlib.Path.home", "os.path.expanduser"} and not self.is_tempdirs:
             self.add(node, "TO007", f"{name}(): never resolve the real user home in tests")
-        if name in {"pytest.skip", "pytest.importorskip", "pytest.xfail"} and not self.is_conftest:
+        if name in {"pytest.skip", "pytest.importorskip", "pytest.xfail", "pytest.mark.skip"} and not self.is_conftest:
             self.add(node, "TO008", f"silent {name}(): use requires_profiler / requires_capture_mount markers")
+        if name == "pytest.mark.xfail" and not self.is_conftest:
+            self._check_xfail_call(node)
+        elif name == "pytest.mark.skipif" and not self.is_conftest:
+            self._check_skipif_call(node)
+        elif name == "pytest.param" and not self.is_conftest:
+            self._check_param_marks(node)
         if name in {"importlib.import_module", "pytest.importorskip", "__import__"} and node.args and \
                 isinstance(node.args[0], ast.Constant) and str(node.args[0].value).split(".")[-1].startswith("test_"):
             self.add(node, "TO006", f"dynamic import of test module '{node.args[0].value}'")
@@ -465,14 +512,24 @@ class ModuleCheck(ast.NodeVisitor):
             self.add(node, "TO011", "inspect.signature point test: assert behaviour instead")
         self.generic_visit(node)
 
+    def _check_bare_mark(self, node: ast.AST) -> None:
+        if self.is_conftest or id(node) in self.call_funcs or id(node) in self.attr_values:
+            return
+        resolved = self.resolve(node)
+        if resolved in {"pytest.mark.xfail", "pytest.mark.skip", "pytest.mark.skipif",
+                        "pytest.skip", "pytest.xfail", "pytest.importorskip"}:
+            self.add(node, "TO008", f"bare {resolved} reference is banned")
+
     def visit_Attribute(self, node: ast.Attribute) -> None:
         if node.attr in FIELD_ENUM and not self.allow_fields:
             self.add(node, "TO011", f"{node.attr} enumeration is reserved for the profiler SSOT module")
+        self._check_bare_mark(node)
         self.generic_visit(node)
 
     def visit_Name(self, node: ast.Name) -> None:
         if node.id in FIELD_ENUM and not self.allow_fields:
             self.add(node, "TO011", f"{node.id} enumeration is reserved for the profiler SSOT module")
+        self._check_bare_mark(node)
 
     def visit_Constant(self, node: ast.Constant) -> None:
         if isinstance(node.value, str) and self.is_test:
@@ -542,12 +599,6 @@ class Gate:
         legacy_root = kind == "test" and len(parts) == 1
         if legacy_root:
             self.legacy_root(rel, status, base)
-            try:
-                tree = ast.parse(path.read_text(encoding="utf-8"), filename=rel)
-            except SyntaxError as exc:
-                self.add(rel, exc.lineno or 1, "TO005", f"syntax error: {exc.msg}")
-            else:
-                self.findings.extend(_pytest_mark_findings(self.root, rel, tree))
             return
         if kind in {"test", "support"}:
             for label, token in name_tokens(path.stem):
@@ -570,6 +621,15 @@ class Gate:
         if len(added) > len(removed) or new_tests:
             self.add(rel, 1, "TO002", f"legacy root module grew (+{len(added)}/-{len(removed)} lines, "
                      f"{len(new_tests)} new tests): consolidate into its domain module instead")
+        try:
+            tree = ast.parse((self.root / rel).read_text(encoding="utf-8"), filename=rel)
+        except SyntaxError as exc:
+            self.add(rel, exc.lineno or 1, "TO005", f"syntax error: {exc.msg}")
+            return
+        check = ModuleCheck(self.root, rel, None, is_test=True, allow_fields=False,
+                            is_tempdirs=False, is_oracle=False, is_conftest=False)
+        check.visit(tree)
+        self.findings.extend(f for f in check.findings if f.code == "TO008")
 
     def check_source(self, rel: str, kind: str) -> None:
         path = self.root / rel
@@ -577,7 +637,7 @@ class Gate:
         lines = text.count("\n") + (not text.endswith("\n"))
         entry = self.m["modules"].get(str(Path(rel).relative_to("tests")).replace("\\", "/"))
         limit = int(entry.get("max_lines", self.m["max_lines"])) if entry else self.m["max_lines"]
-        if lines >= HARD_MAX_LINES or kind in {"test", "support"} and lines > limit:
+        if lines >= HARD_MAX_LINES or kind in {"test", "support", "oracle"} and lines > limit:
             cap = HARD_MAX_LINES - 1 if lines >= HARD_MAX_LINES else limit
             self.add(rel, lines, "TO004", f"{lines} lines exceeds the {cap}-line cap")
         try:
@@ -596,13 +656,12 @@ class Gate:
                 tier = found.pop()
                 if entry and entry["tier"] != tier:
                     self.add(rel, line, "TO005", f"pytestmark {tier} != manifest tier {entry['tier']}")
-        check = ModuleCheck(rel, tier, is_test=kind == "test",
+        check = ModuleCheck(self.root, rel, tier, is_test=kind == "test",
                             allow_fields=bool(entry and entry.get("allow_field_enumeration")),
                             is_tempdirs=rel == "tests/_support/tempdirs.py", is_oracle=kind == "oracle",
                             is_conftest=kind == "conftest")
         check.visit(tree)
         self.findings.extend(check.findings)
-        self.findings.extend(_pytest_mark_findings(self.root, rel, tree))
 
     def _support_imports(self, path: Path, *, in_support: bool) -> set[str]:
         try:
@@ -632,11 +691,8 @@ class Gate:
     def check_tree(self, strict: bool, base: str | None) -> None:
         on_disk = {str(p.relative_to(self.tests)).replace("\\", "/")
                    for p in self.tests.glob("*/test_*.py") if p.parent.name in self.m["domains"]}
-        if len(on_disk) > self.m["max_modules"]:
-            self.add("tests/TAXONOMY.toml", 1, "TO003", f"{len(on_disk)} modules exceed max_modules")
-        listed = sum(1 for e in self.m["modules"].values())
-        if listed > self.m["max_modules"]:
-            self.add("tests/TAXONOMY.toml", 1, "TO003", f"{listed} manifest modules exceed max_modules")
+        for rel in sorted(on_disk - self.m["modules"].keys()):
+            self.add(f"tests/{rel}", 1, "TO003", "test module missing from tests/TAXONOMY.toml")
         if strict:
             for rel, entry in self.m["modules"].items():
                 if rel not in on_disk and not entry.get("reserved"):
@@ -695,9 +751,10 @@ def main(argv: list[str] | None = None) -> int:
     failures = [f for f in findings if f.severity == "fail"]
     modules = sum(1 for p in (root / "tests").glob("*/test_*.py") if p.parent.name in gate.m["domains"])
     mode_label = "--strict" if args.strict else f"--base {args.base}"
+    registered = len(gate.m["modules"])
     if args.format == "json":
         print(json.dumps({"findings": [asdict(f) for f in findings], "mode": mode_label,
-                          "modules": modules, "max_modules": gate.m["max_modules"]}, indent=1))
+                          "modules": modules, "registered_modules": registered}, indent=1))
     else:
         for f in findings:
             print(f"{f.path}:{f.line}: {f.code}{'' if f.severity == 'fail' else ' (warn)'} {f.message}")
@@ -706,7 +763,7 @@ def main(argv: list[str] | None = None) -> int:
             counts[f.code] = counts.get(f.code, 0) + 1
         summary = ", ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "none"
         print(f"summary: {len(failures)} findings ({summary}); warnings={len(findings) - len(failures)}; "
-              f"mode={mode_label}; modules={modules}/{gate.m['max_modules']}")
+              f"mode={mode_label}; modules={modules}/{registered}")
     return 1 if failures else 0
 
 

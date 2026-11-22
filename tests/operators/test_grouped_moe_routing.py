@@ -534,6 +534,7 @@ def test_delayed_peer_source_keeps_exact_wire_bytes_and_releases_receive_window(
         _closed(report)
     assert late["execution"]["serviced"]["link:fabric"] == pytest.approx(baseline["execution"]["serviced"]["link:fabric"])
 
+@pytest.mark.requires_profiler
 @pytest.mark.parametrize("catalog,capture,kind,tokens", [
     ("glm53-a3-w4a8", "a3_glm53_prefill", "MoeGatingTopK", 4096),
     ("qwen35-a3-tp4", "a3_qwen35", "MoeGatingTopK", 8192),

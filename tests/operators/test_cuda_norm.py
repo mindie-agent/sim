@@ -1,11 +1,12 @@
 """Independent checks for the source-derived CUDA normalization planner.
 
-The tests never execute CUDA.  They reconstruct the launch rules from the
-source text, interpret the pinned CCCL warp/block reduction, execute the two
-source kernels on a small CPU model, and compare the independently counted
-arithmetic, shared-temporary traffic and global byte streams with the plan and
-with the shared engine's actual service.  Structural contract checks are
-labelled separately from numerical-oracle checks.
+[Role] Reconstruct CUDA launch rules from upstream source, interpret the pinned
+  CCCL warp/block reduction on a small CPU reference, and verify arithmetic,
+  shared-memory, and global byte conservation against Engine execution.
+[Invariants] Never executes CUDA; structural contract assertions are separated
+  from independent numerical-oracle checks.
+[Timeouts & Locks] Pure in-memory arithmetic and fixture JSON reads; no locks.
+[Side-Effect Policy] Read-only fixture access; zero global mutation.
 """
 from __future__ import annotations
 
@@ -19,7 +20,7 @@ import pytest
 
 pytestmark = pytest.mark.tier0
 
-from mindie_sim.prediction.engine import Engine, Resource
+from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.mechanism import Geometry
 from mindie_sim.prediction.operator_analysis import operator_costs
 from mindie_sim.prediction.operators.vector import cuda_norm

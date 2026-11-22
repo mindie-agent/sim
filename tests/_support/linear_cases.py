@@ -27,7 +27,7 @@ from mindie_sim.catalog.quant import quant_preset
 from mindie_sim.model_catalog import load_model
 from mindie_sim.prediction.operators.attention.attention import AttentionPolicy
 from mindie_sim.prediction.cost import CostModel
-from mindie_sim.prediction.engine import Engine, Resource
+from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.operators.kda.family_kda_recurrent import IMPLEMENTATION as KDA_REC_IMPL
 from mindie_sim.prediction.frontend import Frontend

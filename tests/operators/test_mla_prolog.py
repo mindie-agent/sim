@@ -25,7 +25,7 @@ from mindie_sim.catalog.weights import layer_weight_terms
 from mindie_sim.catalog.weight_terms import term_bytes
 from mindie_sim.prediction.operators.mla_prolog import draft_context
 from mindie_sim.prediction.operators.mla_prolog.compression import compressor
-from mindie_sim.prediction.engine import Engine, Resource
+from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.lowering import Builder
 from mindie_sim.prediction.mechanism import Geometry
 from mindie_sim.prediction.operators.mla.mla_epilogs import index_head_weights, index_row_quantization

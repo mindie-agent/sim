@@ -24,7 +24,7 @@ from _support.accel import (
     BACKENDS, FRONTIER_WORK, NATIVE, Token, arm_observer, close,
     frontier_roots, make_counter_observer, native_library, uniform_engine,
 )
-from mindie_sim.prediction.engine import Engine, Resource
+from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.runtime import (
     accel_bridge, accel_build, accel_sync, accel_tables as tables,
 )

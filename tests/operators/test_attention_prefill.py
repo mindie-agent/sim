@@ -11,6 +11,7 @@ from dataclasses import replace
 from itertools import product
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -18,27 +19,49 @@ from _support.axes import REPRESENTATIVE_SKUS, SKUS
 from _support.builders import dense_case, dense_layer
 from _support.captures import REPO_ROOT
 from _support.hardware import sku_case
-from mindie_sim import compose_case, graph_costs
+from _support.operator_cases import mqsmla_attention, mqsmla_case
+from mindie_sim import compose_case, graph_costs, target_graphs
+from mindie_sim.backends.ascend import materialize
 from mindie_sim.catalog.attention_common import dcp_partial_merge_ops
+from mindie_sim.catalog.ops import gemm_op
+from mindie_sim.catalog.types import QuantSpec
+from mindie_sim.model_catalog import load_model
+from mindie_sim.prediction.operators.paged_mla import family_mqsmla, mqsmla
 from mindie_sim.prediction.operators.attention.attention import gqa
-from mindie_sim.prediction.engine import Engine, Resource
+from mindie_sim.prediction.call_builders import build_aclnn_call
+from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.frontend import Frontend
-from mindie_sim.prediction.mechanism import Geometry
+from mindie_sim.prediction.operators.matrix.matrix_mapping import matrix_geometry
+from mindie_sim.prediction.operators.matrix.matrix_splitk import splitk_program
+from mindie_sim.prediction.operators.matrix.matrix_steady import SteadyMatmul
+from mindie_sim.prediction.mechanism import Geometry, Work
 from mindie_sim.prediction.operator_analysis import target_operators
 from mindie_sim.prediction.operators import attention as governed
 from mindie_sim.prediction.operators.attention._cp_tiling import VLLM_MLA_REVISION
 from mindie_sim.prediction.operators.attention.common import (
     CACHE_GQA_SITE, CACHE_MLA_SITE, COMPLETE_KV_SITE, HISTORY_PREFILL_SITE, VLLM_REVISION,
 )
-from mindie_sim.prediction.program import RecipeBook, RecipeContext
+from mindie_sim.prediction.physical_recipe_registry import ControlSyncRecipe, resolve_physical_recipe
+from mindie_sim.prediction.program import KernelProgram, ParallelProgram, RecipeBook, RecipeContext
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.prediction.verification import verify_operator
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.hardware import Hardware
+from mindie_sim.schema.operators import OpSpec
+from mindie_sim.schema.parallel import ParallelSpec
 from mindie_sim.schema.workload import RequestView
 from mindie_sim.structure import export_op_structure
 from mindie_sim.structure_contracts import comparison_scope, predicted_contract
 
 pytestmark = pytest.mark.tier0
+
+PREFILL_TOKENS = 4096
+INDEX_LAYERS = 61
+INDEX_QUERY_TILE = 128
+INDEX_ROW_BYTES = 256
+INDEX_HEADS = 64
+INDEX_DIM = 128
+SPLITK_SKU = "Ascend950DT_9582"
 
 
 @pytest.mark.parametrize("hardware", SKUS)
@@ -319,3 +342,187 @@ def test_history_head_gather_uses_dcp_without_pcp_copies():
     assert dict(gather.metadata)["group_axis"] == "cp"
     assert gather.link_bytes == 2 * 1 * 128 * 2 * (4 - 1)
     assert dict(gather.metadata)["output_tensors"] == (("query", (2, 4, 128)),)
+
+
+
+@pytest.fixture(scope="module")
+def mixed_quant_source():
+    case = mqsmla_case()
+    graph = target_graphs(case, phase="decode", tokens=1, context=2048)[0]
+    return case, mqsmla_attention(graph)
+
+
+@pytest.mark.parametrize("tp", (1, 2, 4, 8))
+def test_hca_local_head_groups_conserve_source_work(mixed_quant_source, tp):
+    case, original = mixed_quant_source
+    model = load_model("deepseek-v4-pro-0813")
+    model = replace(model, metadata=tuple({
+        **dict(model.metadata), "cache_representations": family_mqsmla.FORMATS}.items()))
+    hca = next(plan for plan in model.layer_plans if plan.compress_ratio == 128)
+    view = RequestView("r", 1, 131584, True, "decode")
+    parallel = ParallelSpec(tp=tp)
+    family_mqsmla.validate(views=(view,), plan=hca, parallel=parallel, model=model,
+                           padded_tokens=1, topk_present=False, cores=32)
+    ops = [original]
+    family_mqsmla.lower_attention(
+        ops, [original.op_id], selection=SimpleNamespace(name=family_mqsmla.RECIPE),
+        views=(view,), plan=hca, topk_present=False, prefix="s0.l0", parallel=parallel)
+    shape = dict(ops[0].metadata)["mqsmla_geometry"]
+    local_heads = 128 // tp
+    assert shape["heads"] == local_heads and shape["ratio"] == 128
+    assert tuple(mqsmla.query_rows(shape)) == ((128, 1028),)
+    tiles = mqsmla.OwnerTiles.create(((128, 1028),))
+    expected = Work()
+    for start in range(0, local_heads, 64):
+        heads = min(64, local_heads - start)
+        for index in range(tiles.count):
+            for _, work in mqsmla.tile_phases(*tiles.key(index), heads=heads):
+                expected += work
+    assert mqsmla.build(ops[0], Geometry.from_devices(case.machine.dies)).work == expected
+
+
+def test_sliding_window_layer_has_no_compressed_rows(mixed_quant_source):
+    case, _ = mixed_quant_source
+    view = RequestView("r", 1, 131584, True, "decode")
+    swa = next(plan for plan in case.model.layer_plans if not plan.owns_long_kv and not plan.owns_topk)
+    assert family_mqsmla.query_shape((view,), swa)["ratio"] == 0
+
+
+@pytest.mark.parametrize("heads,supported", [(heads, True) for heads in (8, 16, 32, 48, 64, 80, 96, 128)]
+                         + [(4, False)])
+def test_mqsmla_source_head_group_support(heads, supported):
+    assert mqsmla.supported_heads(heads) is supported
+
+
+def test_csa_nested_prefix_and_private_window():
+    contexts = (4, 4, 4096)
+    shape = dict(sequences=tuple((1, c) for c in contexts), prefix_tokens=contexts,
+                 prefix_cache_keys=("A",) * 3, prefix_cache_mode="shared",
+                 ratio=4, window=128, topk=512)
+    assert mqsmla.quant_external_fill(shape, mqsmla.KV_QUANT_FP8) == (395808, 513)
+
+
+def test_paged_causal_attention_keeps_causal_pair_count():
+    base = {
+        "api": "aclnnFlashAttentionScore",
+        "tensors": {
+            "query": {"shape": [1, 8, 64], "dtype": "bf16"},
+            "key": {"shape": [1, 8, 64], "dtype": "bf16"},
+            "value": {"shape": [1, 8, 32], "dtype": "bf16"},
+        },
+        "attrs": {"causal": True},
+        "phase": "prefill",
+    }
+    dense = build_aclnn_call(base).ops[0]
+    paged = build_aclnn_call({**base, "block_size": 128}).ops[0]
+    assert dense.flops == pytest.approx(6912.0)
+    assert paged.flops == pytest.approx(dense.flops)
+    assert paged.vector_ops == pytest.approx(dense.vector_ops)
+
+
+def test_long_prefill_index_scores_read_each_key_union_once():
+    case = parse_case(compose_case(
+        "deepseek-v3.2", hardware=SPLITK_SKU, tp=8, ep=8, num_devices=8,
+        ranks_per_node=8, prompt_tokens=PREFILL_TOKENS, output_tokens=2,
+        concurrency=1))
+    ops = target_graphs(case, phase="prefill", tokens=PREFILL_TOKENS, context=0,
+                       sequences=1, scope="body")[0]
+    expected_key_bytes = PREFILL_TOKENS * INDEX_ROW_BYTES
+    refill_rows = sum(range(INDEX_QUERY_TILE, PREFILL_TOKENS + 1, INDEX_QUERY_TILE))
+    scores = [op for op in ops if op.recipe == "quant_lightning_indexer"]
+    assert len(scores) == INDEX_LAYERS
+    first = scores[0]
+    by_id = {op.op_id: op for op in ops}
+    operand_bytes = sum(by_id[dep].mte3_bytes for dep in first.deps[:2])
+    # The fused native score+TopK call reads Q, the head weights and every
+    # per-tile key refill on MTE2; the external HBM union is charged once.
+    assert first.mte2_bytes - operand_bytes == pytest.approx(
+        refill_rows * INDEX_ROW_BYTES)
+    assert first.hbm_bytes - operand_bytes - first.mte3_bytes == pytest.approx(
+        expected_key_bytes)
+    # Per-query arithmetic is unchanged; only the external key fetch shrinks.
+    assert first.flops == pytest.approx(
+        2 * (PREFILL_TOKENS * (PREFILL_TOKENS + 1) / 2)
+        * INDEX_HEADS * INDEX_DIM)
+    assert sum(op.mte2_bytes - sum(by_id[dep].mte3_bytes for dep in op.deps[:2])
+               for op in scores) == pytest.approx(
+        INDEX_LAYERS * refill_rows * INDEX_ROW_BYTES)
+    assert sum(op.hbm_bytes - sum(by_id[dep].mte3_bytes for dep in op.deps[:2])
+               - op.mte3_bytes for op in scores) == pytest.approx(
+        INDEX_LAYERS * expected_key_bytes)
+
+
+def test_sampling_uses_streamed_vector_recipe_and_control_rejects_payload():
+    sampling = OpSpec(
+        "sample", "sampling", "decode", 0, 0, (), (128000,), (128000,),
+        (128000,), (128000,), vector_ops=640000.0, hbm_bytes=1024000.0,
+        mte2_bytes=512000.0, mte3_bytes=512000.0, recipe="sample_logits")
+    recipe = resolve_physical_recipe(sampling)
+    assert type(recipe).__name__ == "AIVTiledVectorAndGatherRecipe"
+    assert recipe.submode(sampling) == "streaming"
+    guard = SimpleNamespace(
+        op=OpSpec("c", "barrier", "decode", 0, 0, (), (), (), (), ()),
+        native_work={"mte2": 1.0}, work={}, minimum_ms=0.0)
+    with pytest.raises(ModelingError, match=r"^unmodeled_operator_mechanism:barrier::mte2=1$"):
+        ControlSyncRecipe().lower(guard)
+
+
+def _splitk_context():
+    raw = materialize({"backend": "ascend", "sku": SPLITK_SKU,
+                       "num_devices": 1, "ranks_per_node": 1})
+    die = Hardware.from_mapping(raw).dies[0]
+    op = gemm_op(op_id="probe", deps=(), stage=0, layer=0, requests=(),
+                 m=32, n=32, k=7168, weight_count=1, quant=QuantSpec("bf16"),
+                 category="dense_mlp", phase="decode")
+    roles = {role for role in dict(die.rates) if role != "link"}
+    names = {role: role for role in roles}
+    names["cube"] = "cube"
+    rates = {role: float(dict(die.rates)[role]) / 1000 for role in roles}
+    rates["cube"] = 1.0
+    units = {role: die.units(role) for role in roles}
+    units["cube"] = die.aic_count
+    work = {"cube": 1000 * op.flops / die.peak("bf16"),
+            "hbm": float(op.hbm_bytes), "mte2_aic": float(op.mte2_bytes),
+            "mte3": float(op.mte3_bytes)}
+    pools = {pool: int(size) for pool, size in dict(die.buffers).items()}
+    context = RecipeContext(
+        op, work, names, rates, die.aic_count,
+        pool_names={pool: pool for pool in pools}, pool_capacities=pools,
+        pool_units={pool: die.pool_units(pool) for pool in pools},
+        resource_units=units, compute_peaks=dict(die.compute_peaks),
+        service_modes=dict(die.service_modes),
+        work_units=dict(die.work_units))
+    return die, op, context
+
+
+def _leaf_stages(program):
+    if isinstance(program, KernelProgram):
+        for stage in program.stages:
+            if stage.program is not None:
+                yield from _leaf_stages(stage.program)
+            else:
+                yield stage
+    elif isinstance(program, ParallelProgram):
+        for child in program.programs:
+            yield from _leaf_stages(child)
+
+
+def test_splitk_executes_each_flop_once_and_charges_partial_traffic():
+    die, op, context = _splitk_context()
+    record = {}
+    selected, _ = SteadyMatmul().select(context)
+    geometry = matrix_geometry(context, selected)
+    program = splitk_program(context, 8, recipe=selected, geometry=geometry,
+                             record=record)
+    issued = {}
+    for stage in _leaf_stages(program):
+        for key, value in stage.work.items():
+            issued[key] = issued.get(key, 0.0) + value
+    issued_flops = issued["cube"] * die.peak("bf16") / 1000.0
+    assert issued_flops == pytest.approx(op.flops, rel=1e-12)
+    traffic = record["split_k_traffic"]
+    assert traffic["partial_write_bytes"] == pytest.approx(4 * 8 * 32 * 32)
+    assert traffic["partial_read_bytes"] == pytest.approx(4 * 8 * 32 * 32)
+    assert traffic["merge_vector_ops"] == pytest.approx((8 - 1) * 32 * 32)
+    assert traffic["merge_latency_ms"] == 0.0
+    assert record["split_k_tasks"] == 4 * 8
