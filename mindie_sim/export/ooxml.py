@@ -87,6 +87,12 @@ STYLE_TOTAL_FLOAT3 = 26
 STYLE_KPI_HIGHLIGHT = 27
 STYLE_OPT_BADGE = 28
 STYLE_CARD_HDR = 29
+STYLE_MUTED_TEXT = 30
+STYLE_PARTIAL_OVERLAP = 31
+STYLE_L1_TEXT = 32
+STYLE_L1_NUM = 33
+STYLE_L1_PCT = 34
+STYLE_MASKED_NUM = 35
 
 
 @dataclass(slots=True)
@@ -478,7 +484,7 @@ def _styles_xml() -> str:
         '<numFmt numFmtId="167" formatCode="0.0%"/>'
         '<numFmt numFmtId="168" formatCode="0.00&quot;x&quot;"/>'
         "</numFmts>"
-        '<fonts count="8">'
+        '<fonts count="9">'
         '<font><sz val="10"/><name val="Arial"/></font>'
         '<font><b/><sz val="12"/><color rgb="FFFFFFFF"/><name val="Arial"/></font>'
         '<font><b/><sz val="10"/><color rgb="FF1F4E78"/><name val="Arial"/></font>'
@@ -487,8 +493,9 @@ def _styles_xml() -> str:
         '<font><sz val="10"/><color rgb="FF1F4E78"/><name val="Arial"/></font>'
         '<font><b/><sz val="10"/><color rgb="FF9C3412"/><name val="Arial"/></font>'
         '<font><b/><sz val="10"/><color rgb="FF1E40AF"/><name val="Arial"/></font>'
+        '<font><sz val="9"/><color rgb="FF6B7280"/><name val="Arial"/></font>'
         "</fonts>"
-        '<fills count="13">'
+        '<fills count="15">'
         '<fill><patternFill patternType="none"/></fill>'
         '<fill><patternFill patternType="gray125"/></fill>'
         '<fill><patternFill patternType="solid"><fgColor rgb="FF1F4E78"/></patternFill></fill>'
@@ -502,6 +509,8 @@ def _styles_xml() -> str:
         '<fill><patternFill patternType="solid"><fgColor rgb="FFE8EEF5"/></patternFill></fill>'
         '<fill><patternFill patternType="solid"><fgColor rgb="FFDBEAFE"/></patternFill></fill>'
         '<fill><patternFill patternType="solid"><fgColor rgb="FF334155"/></patternFill></fill>'
+        '<fill><patternFill patternType="solid"><fgColor rgb="FFCCFBF1"/></patternFill></fill>'
+        '<fill><patternFill patternType="solid"><fgColor rgb="FFE0E7FF"/></patternFill></fill>'
         "</fills>"
         '<borders count="3">'
         "<border><left/><right/><top/><bottom/><diagonal/></border>"
@@ -519,7 +528,7 @@ def _styles_xml() -> str:
         "<diagonal/></border>"
         "</borders>"
         '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
-        '<cellXfs count="30">'
+        '<cellXfs count="36">'
         '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
         '<xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1" applyAlignment="1"><alignment horizontal="left" vertical="center"/></xf>'
         '<xf numFmtId="0" fontId="2" fillId="3" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="left" vertical="center"/></xf>'
@@ -550,6 +559,12 @@ def _styles_xml() -> str:
         '<xf numFmtId="165" fontId="4" fillId="11" borderId="1" xfId="0" applyNumberFormat="1" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="right" vertical="center"/></xf>'
         '<xf numFmtId="0" fontId="7" fillId="11" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="left" vertical="center" wrapText="1"/></xf>'
         '<xf numFmtId="0" fontId="3" fillId="12" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="left" vertical="center" wrapText="1"/></xf>'
+        '<xf numFmtId="0" fontId="8" fillId="0" borderId="1" xfId="0" applyFont="1" applyBorder="1" applyAlignment="1"><alignment horizontal="left" vertical="center" wrapText="1"/></xf>'
+        '<xf numFmtId="0" fontId="0" fillId="13" borderId="1" xfId="0" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="left" vertical="center" wrapText="1"/></xf>'
+        '<xf numFmtId="0" fontId="2" fillId="14" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="left" vertical="center" wrapText="1"/></xf>'
+        '<xf numFmtId="166" fontId="2" fillId="14" borderId="1" xfId="0" applyNumberFormat="1" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="right" vertical="center"/></xf>'
+        '<xf numFmtId="167" fontId="2" fillId="14" borderId="1" xfId="0" applyNumberFormat="1" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="right" vertical="center"/></xf>'
+        '<xf numFmtId="166" fontId="0" fillId="9" borderId="1" xfId="0" applyNumberFormat="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="right" vertical="center"/></xf>'
         "</cellXfs>"
         '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
         "</styleSheet>"

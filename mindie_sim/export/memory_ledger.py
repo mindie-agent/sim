@@ -37,6 +37,11 @@ from .models import (
     KV_QUANT_GROUP_SIZE,
     MAX_EXPLICIT_LAYER_LABELS,
     MIN_DENOM_EPS,
+    QUANT_RULE_CHECKPOINT_IGNORE,
+    QUANT_RULE_FIXED_BF16,
+    QUANT_RULE_FIXED_FP32,
+    QUANT_RULE_FOLLOW_PRESET,
+    QUANT_RULE_PRESET_LINEAR_FP8,
     SUPPORTED_CACHE_DTYPES,
     WEIGHT_QUANT_FORMATS,
     CacheLedgerRow,
@@ -46,6 +51,20 @@ from .models import (
 )
 
 _ENGRAM_CATEGORIES = frozenset({"engram_table", "ple_table", "gemma4_ple"})
+_VISION_CATEGORIES = frozenset({"vision", "projector", "vision_pos", "image_token"})
+_VISION_NAME_PREFIXES = ("vision_", "aligner_", "merger_", "projector_", "image_")
+_W4A8_EXPERT_ONLY_CATEGORIES = frozenset({"expert", "routed_expert", "moe.routed"})
+_MXFP4_EXPERT_CATEGORIES = frozenset({"expert", "routed_expert", "moe.routed", "latent_moe", "attn_res_proj"})
+_FIXED_FP32_CATEGORIES = frozenset({
+    "param_fp32", "conv_weight_f32", "a_log", "dt_bias", "norm_f32",
+    "compressor_fp32_runtime", "mhc", "ape",
+})
+_FIXED_BF16_CATEGORIES = frozenset({
+    "norm", "embedding", "lm_head", "router", "router_bias",
+    "engram_table", "ple_table", "gemma4_ple", "vision", "projector",
+    "vision_pos", "image_token", "conv_weight_bf16", "linear_param_bf16",
+    "compressor_bf16_runtime", "dspark_input",
+})
 _WEIGHT_QUANT_ALIASES: dict[str, str] = {
     "bf16": "BF16",
     "bfloat16": "BF16",
@@ -63,6 +82,9 @@ _WEIGHT_QUANT_ALIASES: dict[str, str] = {
     "mxfp8": "MXFP8",
     "w8a8_mxfp8": "MXFP8",
     "w8a8-mxfp8": "MXFP8",
+    "mxfp8_mxfp4": "MXFP4",
+    "mxfp8+mxfp4": "MXFP4",
+    "quarot_mxfp8_mxfp4": "MXFP4",
     "mxfp4": "MXFP4",
     "mxfp4_routed_only": "MXFP4",
     "w4a8_mxfp": "MXFP4",
@@ -147,9 +169,15 @@ def _normalize_quant_preset(quant: QuantSpec | None, fallback: str = "BF16") -> 
 
 
 def _describe_quant_display(
-    quant: QuantSpec | None, resolved_wq: str, *, explicit_override: bool,
+    quant: QuantSpec | None,
+    resolved_wq: str,
+    *,
+    explicit_override: bool,
+    apply_preset_to_ignored: bool = False,
 ) -> tuple[str, tuple[str, ...]]:
     exclusions = tuple(getattr(quant, "exclusions", ()) or ()) if quant is not None else ()
+    if apply_preset_to_ignored:
+        return f"{resolved_wq} (Full Quant / QuaRot Override)", exclusions
     if quant is None or not exclusions:
         return resolved_wq, ()
     excl_set = set(exclusions)
@@ -159,11 +187,21 @@ def _describe_quant_display(
         and "shared_expert" in excl_set
     )
     if routed_only:
+        overrides = dict(getattr(quant, "category_overrides", ()) or ())
+        if "latent_moe" in overrides or "attn_res_proj" in overrides:
+            return "MXFP4 (Routed+Latent+AttnRes, Attn/Shared BF16)", exclusions
         return "MXFP4 (Routed-Only, Attn/Shared BF16)", exclusions
     w_fmt = str(getattr(quant, "weight_format", "bf16") or "bf16").lower()
     exp_fmt = str(getattr(quant, "expert_weight_format", "bf16") or "bf16").lower()
     if not explicit_override and w_fmt != exp_fmt and "fp8" in w_fmt and "mxfp4" in exp_fmt:
+        q_name = str(getattr(quant, "name", "") or "").lower()
+        if "mxfp8" in q_name:
+            return "MXFP8 Linear + MXFP4 Routed/Latent (QuaRot / msmodelslim)", exclusions
         return "FP8 Linear + MXFP4 Routed Experts (Router/Norm/Head BF16)", exclusions
+    if resolved_wq == "W4A8":
+        return "W4A8_DYNAMIC (INT8 Linear + INT4 Routed Experts, Norm/Router/Head BF16)", exclusions
+    if resolved_wq == "W8A8":
+        return "W8A8_DYNAMIC (INT8 Linear & Experts, Norm/Router/Head BF16)", exclusions
     return f"{resolved_wq} (Excl: {','.join(exclusions[:MAX_EXPLICIT_LAYER_LABELS])})", exclusions
 
 
@@ -303,49 +341,105 @@ def _compute_cache_ledger_rows(
     return local_tokens, tuple(rows), stage_totals, stage_per_req_totals
 
 
+def _workload_has_media(case: Case) -> bool:
+    for req in getattr(case.workload, "requests", ()) or ():
+        if (
+            int(getattr(req, "image_tokens", 0) or 0) > 0
+            or int(getattr(req, "media_tokens", 0) or 0) > 0
+            or int(getattr(req, "images", 0) or 0) > 0
+            or bool(getattr(req, "media", None))
+        ):
+            return True
+    return False
+
+
+def _is_vision_term(term: WeightTerm) -> bool:
+    cat = str(term.category or "").lower()
+    fam = cat.split(".", 1)[0]
+    if cat in _VISION_CATEGORIES or fam in _VISION_CATEGORIES:
+        return True
+    return str(term.name or "").lower().startswith(_VISION_NAME_PREFIXES)
+
+
+def _linear_format_for_preset(resolved_wq: str) -> str:
+    if resolved_wq == "W4A8":
+        return "W8A8"
+    if resolved_wq == "MXFP4":
+        return "MXFP8"
+    return resolved_wq
+
+
 def _resolve_term_quant_format(
     term: WeightTerm,
     model_quant: QuantSpec | None,
     resolved_wq: str,
     *,
     explicit_override: bool,
-) -> tuple[str, bool, str]:
+    apply_preset_to_ignored: bool = False,
+) -> tuple[str, bool, str, str]:
     cat = str(term.category or "")
     fam = cat.split(".", 1)[0]
-    unquantized_cats = {"norm", "embedding", "lm_head", "param_fp32", "engram_table", "conv_weight_f32", "a_log", "dt_bias"}
-    if fam in {"param_fp32", "conv_weight_f32", "a_log", "dt_bias"}:
-        return "FP32", True, "FP32 param"
-    if fam in unquantized_cats or cat in unquantized_cats:
-        return "BF16", True, "quantization_config.ignore -> BF16"
+    if fam in _FIXED_FP32_CATEGORIES or cat in _FIXED_FP32_CATEGORIES:
+        return "FP32", True, "FP32 param", QUANT_RULE_FIXED_FP32
+    if fam in _FIXED_BF16_CATEGORIES or cat in _FIXED_BF16_CATEGORIES:
+        note = "Vision ViT BF16" if _is_vision_term(term) else "Native BF16 structural/head param"
+        return "BF16", True, note, QUANT_RULE_FIXED_BF16
 
+    is_w4_expert = cat in _W4A8_EXPERT_ONLY_CATEGORIES or fam in _W4A8_EXPERT_ONLY_CATEGORIES
+    is_mxfp4_expert = cat in _MXFP4_EXPERT_CATEGORIES or fam in _MXFP4_EXPERT_CATEGORIES
     term_quant = term.runtime_quant or term.quant or model_quant
     if term_quant is not None:
         exclusions = set(getattr(term_quant, "exclusions", ()) or ())
         if cat in exclusions or fam in exclusions:
+            if apply_preset_to_ignored:
+                over_fmt = resolved_wq if is_mxfp4_expert else _linear_format_for_preset(resolved_wq)
+                return over_fmt, False, f"Override ignore -> {over_fmt}", QUANT_RULE_CHECKPOINT_IGNORE
             native = _QUANT_FORMAT_DISPLAY.get(str(term_quant.native_format or "bf16").lower(), "BF16")
-            return native, True, "quantization_config.ignore -> BF16"
+            return native, True, "quantization_config.ignore -> BF16", QUANT_RULE_CHECKPOINT_IGNORE
         if not explicit_override:
             eff_raw = str(term_quant.format_for(cat) or "bf16").lower()
             mapped = _QUANT_FORMAT_DISPLAY.get(eff_raw, resolved_wq)
-            note = "MXFP4 (group=32)" if mapped == "MXFP4" else mapped
-            return mapped, (mapped == "BF16"), note
-    return resolved_wq, (resolved_wq == "BF16"), ("MXFP4 (group=32)" if resolved_wq == "MXFP4" else resolved_wq)
+            if resolved_wq == "W4A8" and not is_w4_expert and mapped == "W4A8":
+                mapped = "W8A8"
+            note = (
+                "MXFP4 (group=32)" if mapped == "MXFP4"
+                else ("W4A8_DYNAMIC (INT4 Packed Expert)" if mapped == "W4A8"
+                      else ("W8A8_DYNAMIC (INT8 Linear)" if mapped == "W8A8" else mapped))
+            )
+            rule = (
+                QUANT_RULE_PRESET_LINEAR_FP8
+                if (mapped in {"FP8", "MXFP8", "W8A8"} and resolved_wq in {"MXFP4", "W4A8"} and not is_w4_expert)
+                else QUANT_RULE_FOLLOW_PRESET
+            )
+            return mapped, (mapped == "BF16"), note, rule
+
+    if resolved_wq == "W4A8" and not is_w4_expert:
+        return "W8A8", False, "W8A8_DYNAMIC (INT8 Linear under W4A8)", QUANT_RULE_PRESET_LINEAR_FP8
+    if resolved_wq == "MXFP4" and not is_mxfp4_expert and explicit_override:
+        return "MXFP8", False, "MXFP8 Linear under MXFP4", QUANT_RULE_PRESET_LINEAR_FP8
+    note = (
+        "MXFP4 (group=32)" if resolved_wq == "MXFP4"
+        else ("W4A8_DYNAMIC (INT4 Packed Expert)" if resolved_wq == "W4A8"
+              else ("W8A8_DYNAMIC (INT8)" if resolved_wq == "W8A8" else resolved_wq))
+    )
+    return resolved_wq, (resolved_wq == "BF16"), note, QUANT_RULE_FOLLOW_PRESET
 
 
-def _weight_group_label(category: str) -> str:
+def _weight_group_label(category: str, name: str = "") -> str:
     lower = category.lower()
+    n_low = name.lower()
     if lower in _ENGRAM_CATEGORIES or "engram" in lower or "ple" in lower:
         return "Engram / PLE"
+    if "vision" in lower or "projector" in lower or "image" in lower or n_low.startswith(_VISION_NAME_PREFIXES):
+        return "Vision"
     if "expert" in lower or "router" in lower or "moe" in lower:
         return "MoE"
-    if "mla" in lower or "indexer" in lower or "attn" in lower or "compressor" in lower:
+    if "mla" in lower or "indexer" in lower or ("attn" in lower and "attn_res" not in lower) or "compressor" in lower:
         return "Attention / MLA"
     if "kda" in lower or "gdn" in lower or "conv" in lower or "linear" in lower:
         return "LinearAttn"
     if "mlp" in lower or "ffn" in lower:
         return "Dense FFN"
-    if "vision" in lower or "projector" in lower or "image" in lower:
-        return "Vision"
     if lower in {"embedding", "lm_head"}:
         return "Head / Embedding"
     return "Norm / Residual"
@@ -358,7 +452,16 @@ def _collect_weight_ledger_rows(
     resolved_wq: str,
     *,
     explicit_override: bool,
-) -> tuple[tuple[WeightLedgerRow, ...], list[float], list[float], list[float]]:
+    include_vision_tower: bool = False,
+    apply_preset_to_ignored: bool = False,
+) -> tuple[
+    tuple[WeightLedgerRow, ...],
+    list[float],
+    list[float],
+    list[float],
+    list[float],
+    list[float],
+]:
     p = case.runtime.parallel
     stage_terms = stage_weight_terms(
         case.model, p,
@@ -370,7 +473,7 @@ def _collect_weight_ledger_rows(
         slot_plans=mem.slot_plans,
     )
     engram_names = {t.name for t in engram_table_terms(case.model)}
-    grouped: dict[tuple[str, str, int, int, str, bool], dict[str, Any]] = {}
+    grouped: dict[tuple[str, str, int, int, str, bool, bool], dict[str, Any]] = {}
     for stage_idx, terms in enumerate(stage_terms):
         for term in terms:
             if not term.runtime_owned:
@@ -383,11 +486,14 @@ def _collect_weight_ledger_rows(
                 or "engram_table" in term.name.lower()
                 or "ple_table" in term.name.lower()
             )
-            key = (term.category, term.name, int(term.rows), int(term.cols), shard_rule, is_engram)
+            is_vis = _is_vision_term(term)
+            key = (term.category, term.name, int(term.rows), int(term.cols), shard_rule, is_engram, is_vis)
             entry = grouped.get(key)
             if entry is None:
-                quant_fmt, is_excl, q_note = _resolve_term_quant_format(
-                    term, case.model.quant, resolved_wq, explicit_override=explicit_override,
+                quant_fmt, is_excl, q_note, q_rule = _resolve_term_quant_format(
+                    term, case.model.quant, resolved_wq,
+                    explicit_override=explicit_override,
+                    apply_preset_to_ignored=apply_preset_to_ignored,
                 )
                 entry = {
                     "category": term.category,
@@ -400,9 +506,11 @@ def _collect_weight_ledger_rows(
                     "local_cols": int(local_c),
                     "stage_repeats": [0] * p.pp,
                     "is_engram": is_engram,
+                    "is_vision": is_vis,
                     "quant": quant_fmt,
                     "is_excluded": is_excl,
                     "quant_note": q_note,
+                    "quant_rule": q_rule,
                 }
                 grouped[key] = entry
             entry["stage_repeats"][stage_idx] += max(1, int(local_cnt))
@@ -411,10 +519,13 @@ def _collect_weight_ledger_rows(
     stage_w_payload = [0.0] * p.pp
     stage_w_scale = [0.0] * p.pp
     stage_engram_total = [0.0] * p.pp
+    stage_native_bf16 = [0.0] * p.pp
+    stage_vision_total = [0.0] * p.pp
     for entry in grouped.values():
         payload_1, scale_1, aux_1, total_1 = evaluate_weight_storage_bytes(
             entry["local_rows"], entry["local_cols"], entry["quant"],
         )
+        native_bf16_1 = int(entry["local_rows"]) * int(entry["local_cols"]) * BF16_BYTES
         repeats = tuple(entry["stage_repeats"])
         max_rep = max(repeats, default=0)
         for st_idx, rep in enumerate(repeats):
@@ -422,11 +533,18 @@ def _collect_weight_ledger_rows(
                 continue
             if entry["is_engram"]:
                 stage_engram_total[st_idx] += float(total_1 * rep)
+            elif entry["is_vision"]:
+                stage_vision_total[st_idx] += float(total_1 * rep)
+                if include_vision_tower:
+                    stage_w_payload[st_idx] += float(payload_1 * rep)
+                    stage_w_scale[st_idx] += float((scale_1 + aux_1) * rep)
+                    stage_native_bf16[st_idx] += float(native_bf16_1 * rep)
             else:
                 stage_w_payload[st_idx] += float(payload_1 * rep)
                 stage_w_scale[st_idx] += float((scale_1 + aux_1) * rep)
+                stage_native_bf16[st_idx] += float(native_bf16_1 * rep)
         weight_rows.append(WeightLedgerRow(
-            group=_weight_group_label(entry["category"]),
+            group=_weight_group_label(entry["category"], entry["name"]),
             name=entry["name"],
             category=entry["category"],
             global_rows=entry["global_rows"],
@@ -445,9 +563,19 @@ def _collect_weight_ledger_rows(
             is_engram_or_ple=entry["is_engram"],
             is_quant_excluded=entry["is_excluded"],
             quant_note=entry["quant_note"],
+            native_bf16_bytes=native_bf16_1 * max_rep,
+            quant_rule=entry["quant_rule"],
+            is_vision=entry["is_vision"],
         ))
     weight_rows.sort(key=lambda r: (r.group, r.name))
-    return tuple(weight_rows), stage_w_payload, stage_w_scale, stage_engram_total
+    return (
+        tuple(weight_rows),
+        stage_w_payload,
+        stage_w_scale,
+        stage_engram_total,
+        stage_native_bf16,
+        stage_vision_total,
+    )
 
 
 def _compute_max_hbm_concurrency(
@@ -472,69 +600,24 @@ def _compute_max_hbm_concurrency(
     return min(caps) if caps else max(0, int(fallback_conc))
 
 
-def compute_memory_quant_ledger(
-    case: Case,
+def _build_stage_budget_rows(
     *,
-    phase: str = "decode",
-    seq_len: int | None = None,
-    concurrency: int | None = None,
-    weight_quant: str | None = None,
-    cache_dtype: str | None = None,
-    engram_host_offload: bool | None = None,
-) -> MemoryCalculatorLedger:
-    """Derive closed-form per-die Weight/Quant/Cache/Engram-PLE/PP HBM budget ledger."""
-    p = case.runtime.parallel
-    stage_layers = stage_layer_counts(case)
-    resolved_seq = max(1, int(seq_len if seq_len is not None else case.runtime.max_model_len))
-    resolved_conc = max(1, int(concurrency if concurrency is not None else max(1, len(case.workload.requests))))
-    explicit_override = weight_quant is not None
-    resolved_wq = (
-        _canonicalize_weight_quant_override(weight_quant)
-        if weight_quant is not None else _normalize_quant_preset(case.model.quant)
-    )
-    if resolved_wq not in WEIGHT_QUANT_FORMATS:
-        raise ModelingError(f"unsupported_weight_quant:{resolved_wq}")
-    wq_display, q_exclusions = _describe_quant_display(
-        case.model.quant, resolved_wq, explicit_override=explicit_override,
-    )
-    resolved_cd = (
-        _canonicalize_cache_dtype_override(cache_dtype)
-        if cache_dtype is not None else _normalize_cache_dtype(case.model)
-    )
-    if resolved_cd not in SUPPORTED_CACHE_DTYPES:
-        raise ModelingError(f"unsupported_cache_dtype:{resolved_cd}")
-    resolved_offload = (
-        bool(case.runtime.engram_cpu_offload)
-        if engram_host_offload is None else bool(engram_host_offload)
-    )
-    block_size = int(getattr(case.runtime, "block_size", DEFAULT_CACHE_BLOCK_SIZE) or DEFAULT_CACHE_BLOCK_SIZE)
-    spec_tokens = int(dict(case.runtime.metadata).get("draft_proposal_tokens", 0) or 0)
-
-    mem = Memory(case)
-    alloc = mem.allocation_report(resolved_seq)
-    weight_rows, stage_w_payload, stage_w_scale, stage_engram_total = _collect_weight_ledger_rows(
-        case, mem, stage_layers, resolved_wq, explicit_override=explicit_override,
-    )
-    local_tokens, cache_rows, stage_cache_bytes, stage_per_req_cache = _compute_cache_ledger_rows(
-        case,
-        stage_layers=stage_layers,
-        cache_dtype=resolved_cd,
-        seq_len=resolved_seq,
-        concurrency=resolved_conc,
-        block_size=block_size,
-        spec_tokens=spec_tokens,
-    )
-    ws_by_stage = [float(x) for x in alloc["workspace"]["total_bytes_per_stage_rank"]]
-    deq_by_stage = [float(x) for x in alloc["temporary_dequant"]["bytes_per_stage_rank"]]
-    reserve_bytes = float(alloc["reserve"]["total_bytes_per_rank"])
-    die_hbm = float(min(d.hbm_bytes for d in case.machine.dies))
-    util = float(case.runtime.gpu_memory_utilization)
-    usable_hbm = die_hbm * util
-
-    stage_budgets: list[StageBudgetRow] = []
-    for st in range(p.pp):
-        engram_hbm = 0.0 if resolved_offload else stage_engram_total[st]
-        engram_host = stage_engram_total[st] if resolved_offload else 0.0
+    pp: int,
+    stage_layers: list[int],
+    stage_w_payload: list[float],
+    stage_w_scale: list[float],
+    stage_engram_total: list[float],
+    stage_cache_bytes: list[float],
+    ws_by_stage: list[float],
+    deq_by_stage: list[float],
+    reserve_bytes: float,
+    usable_hbm: float,
+    engram_host_offload: bool,
+) -> tuple[StageBudgetRow, ...]:
+    rows: list[StageBudgetRow] = []
+    for st in range(pp):
+        engram_hbm = 0.0 if engram_host_offload else stage_engram_total[st]
+        engram_host = stage_engram_total[st] if engram_host_offload else 0.0
         ws_peak = (ws_by_stage[st] if st < len(ws_by_stage) else 0.0) + (
             deq_by_stage[st] if st < len(deq_by_stage) else 0.0
         )
@@ -542,7 +625,7 @@ def compute_memory_quant_ledger(
             stage_w_payload[st] + stage_w_scale[st] + engram_hbm
             + stage_cache_bytes[st] + ws_peak + reserve_bytes
         )
-        stage_budgets.append(StageBudgetRow(
+        rows.append(StageBudgetRow(
             stage=st,
             owned_layers=stage_layers[st],
             weight_payload_bytes=stage_w_payload[st],
@@ -557,6 +640,95 @@ def compute_memory_quant_ledger(
             headroom_bytes=usable_hbm - total_hbm,
             fits_hbm=total_hbm <= usable_hbm,
         ))
+    return tuple(rows)
+
+
+def compute_memory_quant_ledger(
+    case: Case,
+    *,
+    phase: str = "decode",
+    seq_len: int | None = None,
+    concurrency: int | None = None,
+    weight_quant: str | None = None,
+    cache_dtype: str | None = None,
+    engram_host_offload: bool | None = None,
+    include_vision_tower: bool | None = None,
+    apply_preset_to_ignored: bool = False,
+) -> MemoryCalculatorLedger:
+    """Derive closed-form per-die Weight/Quant/Cache/Engram-PLE/PP HBM budget ledger."""
+    p = case.runtime.parallel
+    stage_layers = stage_layer_counts(case)
+    resolved_seq = max(1, int(seq_len if seq_len is not None else case.runtime.max_model_len))
+    resolved_conc = max(1, int(concurrency if concurrency is not None else max(1, len(case.workload.requests))))
+    explicit_override = weight_quant is not None
+    resolved_wq = (
+        _canonicalize_weight_quant_override(weight_quant)
+        if weight_quant is not None else _normalize_quant_preset(case.model.quant)
+    )
+    if resolved_wq not in WEIGHT_QUANT_FORMATS:
+        raise ModelingError(f"unsupported_weight_quant:{resolved_wq}")
+    wq_display, q_exclusions = _describe_quant_display(
+        case.model.quant, resolved_wq,
+        explicit_override=explicit_override,
+        apply_preset_to_ignored=bool(apply_preset_to_ignored),
+    )
+    resolved_cd = (
+        _canonicalize_cache_dtype_override(cache_dtype)
+        if cache_dtype is not None else _normalize_cache_dtype(case.model)
+    )
+    if resolved_cd not in SUPPORTED_CACHE_DTYPES:
+        raise ModelingError(f"unsupported_cache_dtype:{resolved_cd}")
+    resolved_offload = (
+        bool(case.runtime.engram_cpu_offload)
+        if engram_host_offload is None else bool(engram_host_offload)
+    )
+    resolved_vit = (
+        _workload_has_media(case)
+        if include_vision_tower is None else bool(include_vision_tower)
+    )
+    block_size = int(getattr(case.runtime, "block_size", DEFAULT_CACHE_BLOCK_SIZE) or DEFAULT_CACHE_BLOCK_SIZE)
+    spec_tokens = int(dict(case.runtime.metadata).get("draft_proposal_tokens", 0) or 0)
+
+    mem = Memory(case)
+    alloc = mem.allocation_report(resolved_seq)
+    (
+        weight_rows,
+        stage_w_payload,
+        stage_w_scale,
+        stage_engram_total,
+        stage_native_bf16,
+        stage_vision_total,
+    ) = _collect_weight_ledger_rows(
+        case, mem, stage_layers, resolved_wq,
+        explicit_override=explicit_override,
+        include_vision_tower=resolved_vit,
+        apply_preset_to_ignored=bool(apply_preset_to_ignored),
+    )
+    local_tokens, cache_rows, stage_cache_bytes, stage_per_req_cache = _compute_cache_ledger_rows(
+        case,
+        stage_layers=stage_layers,
+        cache_dtype=resolved_cd,
+        seq_len=resolved_seq,
+        concurrency=resolved_conc,
+        block_size=block_size,
+        spec_tokens=spec_tokens,
+    )
+    die_hbm = float(min(d.hbm_bytes for d in case.machine.dies))
+    util = float(case.runtime.gpu_memory_utilization)
+    usable_hbm = die_hbm * util
+    stage_budgets = _build_stage_budget_rows(
+        pp=int(p.pp),
+        stage_layers=stage_layers,
+        stage_w_payload=stage_w_payload,
+        stage_w_scale=stage_w_scale,
+        stage_engram_total=stage_engram_total,
+        stage_cache_bytes=stage_cache_bytes,
+        ws_by_stage=[float(x) for x in alloc["workspace"]["total_bytes_per_stage_rank"]],
+        deq_by_stage=[float(x) for x in alloc["temporary_dequant"]["bytes_per_stage_rank"]],
+        reserve_bytes=float(alloc["reserve"]["total_bytes_per_rank"]),
+        usable_hbm=usable_hbm,
+        engram_host_offload=resolved_offload,
+    )
 
     local_tp = max(
         int(getattr(p, "effective_o_proj_tp", p.tp) or p.tp),
@@ -573,6 +745,12 @@ def compute_memory_quant_ledger(
         (st.weight_payload_bytes + st.weight_scale_aux_bytes + st.engram_ple_hbm_bytes for st in stage_budgets),
         default=0.0,
     )
+    native_bf16_footprint = max(
+        (stage_native_bf16[st.stage] + st.engram_ple_hbm_bytes for st in stage_budgets),
+        default=0.0,
+    )
+    vision_bytes = max(stage_vision_total, default=0.0)
+    comp_ratio = (native_bf16_footprint / weight_footprint) if weight_footprint > 0.0 else 1.0
     max_conc = _compute_max_hbm_concurrency(stage_budgets, stage_per_req_cache, resolved_conc)
     return MemoryCalculatorLedger(
         model_name=str(case.model.name),
@@ -600,4 +778,9 @@ def compute_memory_quant_ledger(
         weight_footprint_per_die_bytes=weight_footprint,
         per_request_cache_bytes_max_stage=max(stage_per_req_cache, default=0.0),
         max_hbm_concurrency_per_dp=max_conc,
+        include_vision_tower=resolved_vit,
+        apply_preset_to_ignored=bool(apply_preset_to_ignored),
+        native_bf16_weight_footprint_per_die_bytes=native_bf16_footprint,
+        vision_weight_bytes_per_die=vision_bytes,
+        weight_compression_ratio=comp_ratio,
     )

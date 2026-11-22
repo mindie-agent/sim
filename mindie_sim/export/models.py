@@ -177,7 +177,7 @@ CANONICAL_EXPORT_SUBMODULES = frozenset({
     SUB_VISION,
 })
 
-#: Canonical architectural macro-modules for Sheet 1 Block 3.
+#: Canonical architectural L2 macro-modules for Sheet 1 Block 3.
 MACRO_MOD_KDA_GDN = "KDA / GDN Linear Attention"
 MACRO_MOD_MLA_PROLOG = "MLA Prolog (Q/KV Low-Rank & Absorb)"
 MACRO_MOD_DSA_LI = "DSA / Sparse Indexer (LI)"
@@ -186,13 +186,55 @@ MACRO_MOD_GATED_O_PROJ = "Gated-MLA / Attention O-Proj"
 MACRO_MOD_MOE_ROUTER = "MoE Router & Dispatch/Combine"
 MACRO_MOD_MOE_ROUTED = "MoE Routed Experts (GMM1 / Act / GMM2)"
 MACRO_MOD_MOE_SHARED = "MoE Shared Experts (MSO Overlapped vs Exposed)"
-MACRO_MOD_DENSE_NORM = "Dense FFN & AttnRes / Norm"
+MACRO_MOD_DENSE_FFN = "Dense FFN"
+MACRO_MOD_RESIDUAL_NORM = "Block AttnRes / mHC / RMSNorm"
+#: Backward-compatible alias for ``MACRO_MOD_RESIDUAL_NORM``.
+MACRO_MOD_DENSE_NORM = MACRO_MOD_RESIDUAL_NORM
 MACRO_MOD_COLLECTIVES = "Exposed TP/SP/DCP Collectives"
-MACRO_MOD_SPEC_HEAD = "Speculative Draft (MTP/DSpark) & Verify / LM Head"
+MACRO_MOD_DRAFT_LAYERS = "Draft Layers (DSpark / MTP)"
+MACRO_MOD_VERIFY_HEAD = "Verify & LM Head / Embedding"
+#: Backward-compatible alias for ``MACRO_MOD_VERIFY_HEAD``.
+MACRO_MOD_SPEC_HEAD = MACRO_MOD_VERIFY_HEAD
 MACRO_MOD_ENGRAM = "Engram / PLE Memory"
 MACRO_MOD_VISION = "Vision / Multimodal Encoder"
 
-#: Display ordering of Sheet 1 Block 3 macro-modules (optional modules appended if present).
+#: Canonical L1 parent module groups for Sheet 1 Block 3 two-level hierarchy.
+L1_MOD_ATTENTION = "1. Attention (注意力模块合计)"
+L1_MOD_MOE_FFN = "2. MoE / FFN (专家与前馈模块合计)"
+L1_MOD_RESIDUAL_MEM = "3. Residual / Norm / Memory (残差归一化与记忆模块合计)"
+L1_MOD_COLLECTIVES = "4. Unfused Collectives (未掩盖通信合计)"
+L1_MOD_SPEC_HEAD = "5. Speculative Draft & LM Head (投机草稿与词表头合计)"
+
+#: Deterministic two-level L1 -> L2 hierarchy ordering for Sheet 1 Block 3.
+MACRO_L1_HIERARCHY: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (L1_MOD_ATTENTION, (
+        MACRO_MOD_KDA_GDN,
+        MACRO_MOD_MLA_PROLOG,
+        MACRO_MOD_DSA_LI,
+        MACRO_MOD_LATENT_ATTN,
+        MACRO_MOD_GATED_O_PROJ,
+    )),
+    (L1_MOD_MOE_FFN, (
+        MACRO_MOD_MOE_ROUTER,
+        MACRO_MOD_MOE_ROUTED,
+        MACRO_MOD_MOE_SHARED,
+        MACRO_MOD_DENSE_FFN,
+    )),
+    (L1_MOD_RESIDUAL_MEM, (
+        MACRO_MOD_RESIDUAL_NORM,
+        MACRO_MOD_ENGRAM,
+        MACRO_MOD_VISION,
+    )),
+    (L1_MOD_COLLECTIVES, (
+        MACRO_MOD_COLLECTIVES,
+    )),
+    (L1_MOD_SPEC_HEAD, (
+        MACRO_MOD_DRAFT_LAYERS,
+        MACRO_MOD_VERIFY_HEAD,
+    )),
+)
+
+#: Display ordering of Sheet 1 Block 3 L2 macro-modules (optional modules appended if present).
 MACRO_MODULE_CORE_ORDER: tuple[str, ...] = (
     MACRO_MOD_KDA_GDN,
     MACRO_MOD_MLA_PROLOG,
@@ -202,17 +244,34 @@ MACRO_MODULE_CORE_ORDER: tuple[str, ...] = (
     MACRO_MOD_MOE_ROUTER,
     MACRO_MOD_MOE_ROUTED,
     MACRO_MOD_MOE_SHARED,
-    MACRO_MOD_DENSE_NORM,
+    MACRO_MOD_DENSE_FFN,
+    MACRO_MOD_RESIDUAL_NORM,
     MACRO_MOD_COLLECTIVES,
-    MACRO_MOD_SPEC_HEAD,
+    MACRO_MOD_DRAFT_LAYERS,
+    MACRO_MOD_VERIFY_HEAD,
 )
 MACRO_MODULE_OPTIONAL_ORDER: tuple[str, ...] = (
     MACRO_MOD_ENGRAM,
     MACRO_MOD_VISION,
 )
 
+#: Quantization rule tokens for live Excel Sheet 3 formulas.
+QUANT_RULE_FOLLOW_PRESET = "FollowPreset"
+QUANT_RULE_PRESET_LINEAR_FP8 = "PresetLinearFP8"
+QUANT_RULE_CHECKPOINT_IGNORE = "CheckpointIgnoreBF16"
+QUANT_RULE_FIXED_BF16 = "FixedBF16"
+QUANT_RULE_FIXED_FP32 = "FixedFP32"
+
+#: Actionable 3-track responsibility identifiers (Config / Kernel / Framework).
+TRACK_CONFIG_ENV = "config_and_env"
+TRACK_FRAMEWORK = "framework_tasks"
+TRACK_KERNEL = "kernel_tasks"
+AGENT_BRIEF_SCHEMA = "mindie-sim.agent-brief/1"
+
 #: Hardware + topology preset aliases for zero-boilerplate CLI/Python UX.
 HARDWARE_PRESET_ALIASES: dict[str, tuple[str, str | None]] = {
+    "950dt": ("Ascend950DT_9582", "a5_pod"),
+    "a5": ("Ascend950DT_9582", "a5_pod"),
     "950dt-96g": ("Ascend950DT_9582", None),
     "950dt-96g-pod": ("Ascend950DT_9582", "a5_pod"),
     "a5-96g-pod": ("Ascend950DT_9582", "a5_pod"),
@@ -220,9 +279,14 @@ HARDWARE_PRESET_ALIASES: dict[str, tuple[str, str | None]] = {
     "950dt-144g": ("Ascend950DT_9581", None),
     "950dt-144g-pod": ("Ascend950DT_9581", "a5_pod"),
     "a5-144g-pod": ("Ascend950DT_9581", "a5_pod"),
-    "a3-16p": ("Ascend910C_A3", "a3_16p"),
-    "a3-pod": ("Ascend910C_A3", "a3_pod"),
-    "a2-8p": ("Ascend910B4_A2", "a2_8p"),
+    "a3": ("Ascend910_9392", "a3_16p"),
+    "910c": ("Ascend910_9392", "a3_16p"),
+    "a3-16p": ("Ascend910_9392", "a3_16p"),
+    "a3-pod": ("Ascend910_9392", "a3_superpod"),
+    "a3-superpod": ("Ascend910_9392", "a3_superpod"),
+    "a2": ("Ascend910B4", "a2_standard"),
+    "910b": ("Ascend910B4", "a2_standard"),
+    "a2-8p": ("Ascend910B4", "a2_standard"),
 }
 
 #: Deployment mode canonical display labels.
@@ -389,6 +453,12 @@ class OperatorExportRow:
     needs_new_kernel: bool = False
     new_kernel_spec: str = ""
     canonical_op_key: str = ""
+    masked_by: str = ""
+    opt_pillar: str = ""
+    opt_target_eta_pct: float | None = None
+    config_howto: str = ""
+    kernel_action: str = ""
+    framework_action: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -407,7 +477,7 @@ class AlignedComparisonRow:
 
 @dataclass(frozen=True, slots=True)
 class MacroModuleRow:
-    """Whole-network exposed duration & share % aggregated by architectural macro-module."""
+    """Whole-network raw, masked, and exposed duration & share % by L1/L2 module."""
 
     module_name: str
     layer_calls_label: str
@@ -421,11 +491,27 @@ class MacroModuleRow:
     dominant_bound: str
     raw_before_ms: float = 0.0
     raw_after_ms: float = 0.0
+    l1_group: str = ""
+    masked_before_ms: float = 0.0
+    masked_after_ms: float = 0.0
+    masking_note: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ActionRoadmapRow:
+    """One concrete actionable task in Sheet 1 Block 4 & ``agent_brief.json``."""
+
+    track: str
+    track_label: str
+    title: str
+    expected_gain_ms: float
+    action_detail: str
+    cross_ref: str = ""
 
 
 @dataclass(frozen=True, slots=True)
 class NewKernelBacklogItem:
-    """Pre-filled hardware/contract spec + open Agent design slot for a pending kernel."""
+    """Pre-filled hardware/contract spec + 3-track actionable guidance for a pending kernel."""
 
     priority: int
     kernel_key: str
@@ -450,6 +536,13 @@ class NewKernelBacklogItem:
     after_model_ms: float = 0.0
     lstar_model_ms: float = 0.0
     gap_vs_lstar_ms: float = 0.0
+    card_id: str = ""
+    config_howto: str = ""
+    kernel_action: str = ""
+    framework_action: str = ""
+    before_attainment_pct: float = 0.0
+    target_attainment_pct: float = 0.0
+    opt_pillar: str = ""
 
 
 #: Canonical alias used by Sheet 4 (``Pending_Kernel_Details``).
@@ -500,6 +593,9 @@ class WeightLedgerRow:
     is_engram_or_ple: bool
     is_quant_excluded: bool = False
     quant_note: str = ""
+    native_bf16_bytes: int = 0
+    quant_rule: str = QUANT_RULE_FOLLOW_PRESET
+    is_vision: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -575,6 +671,11 @@ class MemoryCalculatorLedger:
     weight_footprint_per_die_bytes: float = 0.0
     per_request_cache_bytes_max_stage: float = 0.0
     max_hbm_concurrency_per_dp: int = 0
+    include_vision_tower: bool = False
+    apply_preset_to_ignored: bool = False
+    native_bf16_weight_footprint_per_die_bytes: float = 0.0
+    vision_weight_bytes_per_die: float = 0.0
+    weight_compression_ratio: float = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -646,3 +747,5 @@ class ExportBundle:
     spec_proposals: int = 0
     avg_accepted_tokens: float = 1.0
     sequence_parallel: bool = False
+    target_envelope_applied: bool = False
+    parallelism_codesign_note: str = ""

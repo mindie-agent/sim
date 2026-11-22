@@ -71,6 +71,7 @@ def projection_quant(quant: QuantSpec, plan) -> QuantSpec:
 #: linear weight block (128 for V4, 32 for V4.1).
 MX_EXPERT_BLOCK = 32
 MX_EXPERT_SCALE_PACK = 2
+LONG_CONTEXT_KV_QUANT_THRESHOLD = 32768
 _STANDARD_MXFP4_EXCLUSIONS: tuple[str, ...] = (
     "mtp", "norm", "router", "lm_head", "embedding", "mhc",
     "compressor", "vision", "projector", "conv_weight_f32", "conv_weight_bf16",
@@ -80,6 +81,14 @@ _MXFP4_ROUTED_ACTIVATION = {
     "activation_group_size": MX_EXPERT_BLOCK,
     "activation_scale_format": "fp8_e8m0",
     "activation_scale_pack": MX_EXPERT_SCALE_PACK,
+}
+_MXFP4_LINEAR_OVERRIDE = {
+    "weight_format": "mxfp4",
+    "weight_block": (1, MX_EXPERT_BLOCK),
+    "expert_block": MX_EXPERT_BLOCK,
+    "scale_format": "fp8_e8m0",
+    "scale_bytes": 1.0,
+    **_MXFP4_ROUTED_ACTIVATION,
 }
 
 
@@ -159,15 +168,17 @@ def _quant_kimi(c: Mapping[str, Any]) -> QuantSpec:
         category_overrides={
             "routed_expert": _MXFP4_ROUTED_ACTIVATION,
             "dspark_routed_expert": _MXFP4_ROUTED_ACTIVATION,
+            "latent_moe": _MXFP4_LINEAR_OVERRIDE,
+            "attn_res_proj": _MXFP4_LINEAR_OVERRIDE,
         },
         exclusions=("attn", "mla", "kda", "shared_expert", "dense_mlp",
                     "router", "lm_head", "embedding", "norm", "mhc",
                     "vision", "projector", "conv_weight_f32"),
         source=merge_source({"quant_method": q.get("quant_method", "compressed-tensors"),
                              "format": q.get("format", "mxfp4-pack-quantized")}),
-        notes=("MXFP4 group32 applies to routed expert matrices only with "
-               "FP8 E4M3 activations and E8M0 microscales; "
-               "attention/shared/dense/LM-head/vision stay BF16",),
+        notes=("MXFP4 group32 applies to routed expert, latent MoE (down/up) and "
+               "AttnRes projection matrices with FP8 E4M3 activations and E8M0 "
+               "microscales; attention/shared/dense/router/LM-head/vision stay BF16",),
     )
 
 
@@ -343,6 +354,65 @@ def _quant_mxfp4_all() -> QuantSpec:
     )
 
 
+def _quant_mxfp8_mxfp4() -> QuantSpec:
+    """QuaRot / msmodelslim Ascend A5 production mixed MXFP8 linear + MXFP4 expert recipe."""
+    return QuantSpec(
+        name="MXFP8_MXFP4",
+        weight_format="fp8_e4m3", activation_format="fp8_e4m3",
+        expert_weight_format="mxfp4",
+        weight_block=(1, MX_EXPERT_BLOCK),
+        expert_block=MX_EXPERT_BLOCK,
+        scale_format="fp8_e8m0", scale_bytes=1.0,
+        activation_group_size=MX_EXPERT_BLOCK,
+        activation_scale_format="fp8_e8m0",
+        activation_scale_pack=MX_EXPERT_SCALE_PACK,
+        kv_dtype="fp8_e4m3", index_dtype="fp8_e4m3", index_scale_dtype="fp8_e8m0",
+        category_overrides={
+            "routed_expert": _MXFP4_ROUTED_ACTIVATION,
+            "dspark_routed_expert": _MXFP4_ROUTED_ACTIVATION,
+            "latent_moe": _MXFP4_LINEAR_OVERRIDE,
+            "attn_res_proj": _MXFP4_LINEAR_OVERRIDE,
+        },
+        exclusions=_STANDARD_MXFP4_EXCLUSIONS,
+        source=merge_source({
+            "quant_method": "quarot_msmodelslim_mxfp8_mxfp4",
+            "weight_block_size": "1x32",
+            "scale_fmt": "ue8m0",
+            "kv_cache_dtype": "fp8_e4m3",
+        }),
+        notes=(
+            "Ascend A5 production quantization (QuaRot/msmodelslim): MXFP8 group32 on "
+            "MLA/GQA/KDA/GDN/shared/dense linears + MXFP4 group32 on routed experts, "
+            "latent MoE down/up, and AttnRes projections",
+            "norm, router, embedding, LM head, MTP, mHC, vision and conv stay BF16/FP32",
+        ),
+    )
+
+
+def resolve_auto_va_quant(
+    model_spec: Any,
+    hardware_sku: str,
+    *,
+    context_tokens: int = 0,
+) -> tuple[str, str, str]:
+    """Resolve chip-matched ``vllm-ascend`` production ``(weight_quant, kv_dtype, indexer_dtype)``."""
+    sku_low = str(hardware_sku or "").strip().lower()
+    is_a5 = any(tok in sku_low for tok in ("950", "a5", "dav_3510", "3510", "arch35"))
+    plans = tuple(getattr(model_spec, "layer_plans", ()) or ())
+    is_moe = (
+        int(getattr(model_spec, "num_experts", 0) or 0) > 1
+        or any(str(getattr(lp, "ffn", "")).lower() == "moe" for lp in plans)
+    )
+    long_ctx = int(context_tokens or 0) >= LONG_CONTEXT_KV_QUANT_THRESHOLD
+    if is_a5:
+        if is_moe:
+            return ("mxfp8_mxfp4", "fp8_e4m3", "fp8_e4m3")
+        kv = "fp8_e4m3" if long_ctx else "bf16"
+        return ("mxfp8", kv, kv)
+    kv = "int8" if long_ctx else "bf16"
+    return ("w4a8" if is_moe else "w8a8", kv, kv)
+
+
 #: Explicit quantization presets a case may declare on a catalog model.
 QUANTIZATION_PRESETS: dict[str, Any] = {
     # Short names are explicit representation declarations, not dispatch claims.
@@ -353,6 +423,9 @@ QUANTIZATION_PRESETS: dict[str, Any] = {
     "w8a8-mxfp8": _quant_qwen_mxfp8,
     "mxfp8": _quant_qwen_mxfp8,
     "fp8_mxfp8": _quant_qwen_mxfp8,
+    "mxfp8_mxfp4": _quant_mxfp8_mxfp4,
+    "mxfp8+mxfp4": _quant_mxfp8_mxfp4,
+    "quarot_mxfp8_mxfp4": _quant_mxfp8_mxfp4,
     "mxfp4": _quant_mxfp4_all,
     "mxfp4_all": _quant_mxfp4_all,
     "mxfp4_routed_only": lambda: _quant_kimi({}),

@@ -2,34 +2,42 @@
 
 [Role] Assemble executive-ready 4-tab (plus conditional 5th calibration tab)
   ECMA-376 ``.xlsx`` workbooks on top of ``ooxml.Workbook``:
-  1. ``Summary`` — 3 Clear Executive Blocks:
-     (1) Deployment, Parallelism & Concurrency (Model/Layers, SKU/Topo, Total
-         Dies, Deployment Mode, DP/TP/EP/PP/DCP/PCP/Local-TP/SP, Prompt/Output,
-         SLA, Speculative Strategy & Step Budget, Active/Cluster/Max-HBM
-         Concurrency & Weight Footprint / Die),
+  1. ``Summary`` — 4 Clear Executive Blocks:
+     (1) Deployment, Parallelism, Concurrency & Side-by-Side Quantized vs Native
+         BF16 Weight Footprint,
      (2) Before vs After Simulation KPIs with live Excel formulas for Step
-         Latency, Effective TPOT + SLA Verdict, Single-Die TPS, Cluster Total
-         TPS, Lean 4 ``L*`` & Physical Limit Attainment %, and 4D Utilization,
-     (3) Macro-Module Breakdown & Share % (Before vs After exposed ms, %,
-         Saved Δ ms, ``L*``, Dominant Bound + Cross-Stream Overlap reconciliation);
-  2. ``Layer_Operator_Breakdown`` — Archetype ×N side-by-side Before-vs-After
-     N->1 ``merge_cells``, MSO Stream-1 overlap formulas, Source Refs & Bounds;
-  3. ``Memory_Quant_Calculator`` — closed-form per-die Weight/Quant/Cache/PP HBM
-     calculator honoring per-row ``QuantSpec.exclusions`` and Engram/PLE offload;
-  4. ``Pending_Kernel_Details`` — Top Summary Index Table + Structured Per-Kernel
-     Detail Cards covering BOTH ``待新开发 / 扩展`` AND ``重点待优化`` kernels
-     with Agent Design Proposal & Tiling/Pipeline slots (``--kernel-designs-json``);
+         Latency, Effective TPOT + SLA Verdict, Single-Die / Cluster TPS,
+         Lean 4 ``L*`` Attainment %, and Hardware Utilization (AIC MFU / AIV
+         Util / HBM MBU / HCCL Link BW Util — zero ``"4D"`` jargon),
+     (3) Two-Level L1/L2 Module Breakdown with explicit ``流内原始 / 被掩盖 /
+         实际暴露`` columns achieving 100% Step Latency conservation with zero
+         negative mystery rows,
+     (4) 3-Track Actionable Implementation Roadmap (``Config & Env``,
+         ``Framework``, ``Kernel``) + ``QuaRot``-first & Parallelism Co-Design;
+  2. ``Layer_Operator_Breakdown`` — Strict topological order, contiguous
+     ``Submodule`` merges, up-front Col E ``Stream & Masking`` badges, paired
+     raw/exposed durations, 3-track actions, and trailing far-right muted
+     ``Source Ref``;
+  3. ``Memory_Quant_Calculator`` — Live formula-driven ``Quant Rule`` +
+     ``Quant Format`` (honoring mixed ``W4A8`` INT8 linear + INT4 expert and
+     ``MXFP4``/``QuaRot`` toggles), side-by-side ``原生 BF16`` vs ``量化后``,
+     ``Include Vision Tower (ViT)`` toggle, and ``SUMIFS`` HBM vs Host DRAM
+     subtotals;
+  4. ``Pending_Kernel_Details`` — 100%-conserved Top Index + Structured 3-Track
+     Per-Kernel Detail Cards (``Config & Env`` / ``Kernel`` / ``Framework`` /
+     ``Acceptance``) wired to ``--kernel-designs-json`` by ``card_id``;
   5. Optional ``Measured_msprof_Calibration`` when ``observations_path`` is set.
 [Invariants] Zero third-party OOXML deps, zero heuristic fudge factors, zero
-  banned Python recipe class names, strict ECMA-376 worksheet element order,
-  and non-overlapping validated ``merge_cells``.
+  banned Python recipe class names, zero ``[待 Agent 补充]`` blanks, zero
+  ``"4D"`` jargon, strict ECMA-376 element order, and non-overlapping merges.
 [Timeouts & Locks] Bounded O(Archetypes) in-memory XML serialization; no locks
   or device contexts.
-[Side-Effect Policy] Writes only the caller-requested ``.xlsx`` output path via
-  atomic same-directory ``os.replace``.
+[Side-Effect Policy] Writes only the caller-requested ``.xlsx`` (and optional
+  ``agent_brief.json``) output path via atomic same-directory ``os.replace``.
 """
 from __future__ import annotations
 
+from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,21 +48,33 @@ from mindie_sim.prediction.results import CaseInput, ReplayOptions, StepEvaluati
 from .bundle import build_export_bundle, compose_export_case
 from .comparison import (
     align_before_after_operators,
+    build_agent_brief,
     build_macro_module_breakdown,
     build_pending_kernel_details,
+    export_agent_brief,
 )
 from .models import (
+    BF16_BYTES,
     DEFAULT_SCENARIO_OUTPUT_TOKENS,
     DEFAULT_SCENARIO_PROMPT_TOKENS,
     FP32_BYTES,
     GIB_BYTES,
     KV_QUANT_GROUP_SIZE,
+    MACRO_L1_HIERARCHY,
     MIB_BYTES,
+    OVERLAP_EXPOSED_EPS_US,
     PENDING_KIND_TO_IMPLEMENT,
+    QUANT_RULE_CHECKPOINT_IGNORE,
+    QUANT_RULE_FIXED_BF16,
+    QUANT_RULE_FIXED_FP32,
+    QUANT_RULE_PRESET_LINEAR_FP8,
     SUPPORTED_CACHE_DTYPES,
     SUPPORTED_WEIGHT_QUANTS,
+    TRACK_CONFIG_ENV,
+    TRACK_FRAMEWORK,
     US_PER_MS,
     WEIGHT_QUANT_FORMATS,
+    ActionRoadmapRow,
     AlignedComparisonRow,
     ExportBundle,
     MacroModuleRow,
@@ -67,7 +87,7 @@ from .ooxml import (
     CARD_ACCEPT_ROW_HEIGHT_PT,
     CARD_DESIGN_ROW_HEIGHT_PT,
     HEADER_ROW_HEIGHT_PT,
-    NS_MAIN,
+    NS_MAIN as NS_MAIN,
     STYLE_ALERT_HIGH,
     STYLE_ALERT_MID,
     STYLE_ALERT_OK,
@@ -80,10 +100,16 @@ from .ooxml import (
     STYLE_INPUT_TEXT_WRAP,
     STYLE_INT,
     STYLE_KPI_HIGHLIGHT,
+    STYLE_L1_NUM,
+    STYLE_L1_PCT,
+    STYLE_L1_TEXT,
+    STYLE_MASKED_NUM,
     STYLE_MERGED,
+    STYLE_MUTED_TEXT,
     STYLE_NEW_KERNEL,
     STYLE_OPT_BADGE,
     STYLE_OVERLAP,
+    STYLE_PARTIAL_OVERLAP,
     STYLE_PCT,
     STYLE_RATIO,
     STYLE_SECTION,
@@ -100,12 +126,12 @@ from .ooxml import (
     WRAP_ROW_HEIGHT_PT,
     Workbook,
     Worksheet,
-    cell_ref,
     column_letter,
 )
+from .target_envelope import build_actionable_roadmap
 
 #: Schema tag for XLSX export receipts.
-XLSX_EXPORT_RECEIPT_SCHEMA = "mindie-sim.xlsx-export-receipt/2"
+XLSX_EXPORT_RECEIPT_SCHEMA = "mindie-sim.xlsx-export-receipt/3"
 #: Gap-ratio visual severity thresholds.
 GAP_RATIO_SEVERE = 3.0
 GAP_RATIO_MODERATE = 1.5
@@ -114,8 +140,8 @@ C8_CACHE_FACTOR = 1.0 + float(FP32_BYTES) / float(KV_QUANT_GROUP_SIZE)
 #: Percentage divisor and MiB-per-GiB divisor for live Excel formulas.
 PCT_DIVISOR = 100.0
 MIB_PER_GIB = 1024
-#: Overlap reconciliation threshold (ms) for emitting cross-stream overlap credit.
-OVERLAP_RECONCILE_EPS_MS = 0.005
+#: Threshold (ms) to highlight masked credit in soft green.
+MASKED_HIGHLIGHT_EPS_MS = 0.0005
 
 #: Canonical sheet names of the human-native Ascend optimization workbook.
 SHEET_SUMMARY = "Summary"
@@ -126,8 +152,8 @@ SHEET_PENDING_KERNELS = "Pending_Kernel_Details"
 SHEET_NEW_KERNELS = SHEET_PENDING_KERNELS
 SHEET_MEASURED = "Measured_msprof_Calibration"
 
-#: Sheet 1 (Summary) 3-block structural layout constants (9 columns A..I).
-SUMMARY_COLS = 9
+#: Sheet 1 (Summary) 4-block structural layout constants (13 columns A..M).
+SUMMARY_COLS = 13
 SUMMARY_FREEZE_ROWS = 1
 SUM_B1_BANNER_ROW = 2
 SUM_B1_HDR_ROW = 3
@@ -153,60 +179,70 @@ SUM_KPI_DIE_TPS_ROW = 17
 SUM_KPI_CLUSTER_TPS_ROW = 18
 SUM_KPI_LSTAR_ROW = 19
 SUM_KPI_ATTAIN_ROW = 20
-SUM_KPI_4D_START_ROW = 21
+SUM_KPI_UTIL_START_ROW = 21
 SUM_KPI_NOTE_START_COL = 8
 SUM_B3_BANNER_ROW = 26
 SUM_B3_HDR_ROW = 27
 SUM_B3_DATA_START_ROW = 28
+SUM_B4_TRACK_END = 2
+SUM_B4_TITLE_START = 3
+SUM_B4_TITLE_END = 4
+SUM_B4_GAIN_COL = 5
+SUM_B4_DETAIL_START = 6
+SUM_B4_DETAIL_END = 11
+SUM_B4_REF_START = 12
 
-#: Sheet 2 Before-vs-After mode column indices (21 columns A..U).
-CMP_COLS = 21
+#: Sheet 2 Before-vs-After mode column indices (23 columns A..W).
+CMP_COLS = 23
 CMP_DATA_START_ROW = 3
 CMP_FREEZE_ROWS = 2
-CMP_FREEZE_COLS = 4
+CMP_FREEZE_COLS = 5
 CMP_COL_ARCH = 1
 CMP_COL_REP = 2
 CMP_COL_SUB = 3
 CMP_COL_ROLE = 4
-CMP_COL_BEF_MS = 9
-CMP_COL_BEF_BOUND = 10
-CMP_COL_AFT_KERN = 11
-CMP_COL_STATUS = 12
-CMP_COL_AFT_US = 13
-CMP_COL_STREAM = 14
-CMP_COL_AFT_MS = 15
-CMP_COL_SAVED_MS = 16
-CMP_COL_SPEEDUP = 17
-CMP_COL_AFT_BOUND = 18
-CMP_COL_LSTAR_MS = 19
-CMP_COL_GAP_MS = 20
-CMP_COL_ACTION = 21
+CMP_COL_STREAM_MASK = 5
+CMP_COL_BEF_EXP_MS = 10
+CMP_COL_BEF_BOUND = 11
+CMP_COL_AFT_KERN = 12
+CMP_COL_STATUS = 13
+CMP_COL_AFT_RAW_US = 14
+CMP_COL_AFT_EXP_US = 15
+CMP_COL_AFT_EXP_MS = 16
+CMP_COL_SAVED_MS = 17
+CMP_COL_SPEEDUP = 18
+CMP_COL_AFT_BOUND = 19
+CMP_COL_LSTAR_MS = 20
+CMP_COL_GAP_MS = 21
+CMP_COL_ACTION = 22
+CMP_COL_SOURCE_REF = 23
 CMP_AFTER_MERGE_COLS = (
-    CMP_COL_AFT_KERN, CMP_COL_STATUS, CMP_COL_AFT_US, CMP_COL_STREAM,
-    CMP_COL_AFT_MS, CMP_COL_SAVED_MS, CMP_COL_SPEEDUP, CMP_COL_AFT_BOUND,
+    CMP_COL_AFT_KERN, CMP_COL_STATUS, CMP_COL_AFT_RAW_US, CMP_COL_AFT_EXP_US,
+    CMP_COL_AFT_EXP_MS, CMP_COL_SAVED_MS, CMP_COL_SPEEDUP, CMP_COL_AFT_BOUND,
     CMP_COL_LSTAR_MS, CMP_COL_GAP_MS, CMP_COL_ACTION,
 )
-CMP_SUBTOTAL_LABEL_END_COL = 8
+CMP_SUBTOTAL_LABEL_END_COL = 9
 
-#: Sheet 2 Standalone mode column indices (15 columns A..O).
-STD_COLS = 15
+#: Sheet 2 Standalone mode column indices (16 columns A..P).
+STD_COLS = 16
 STD_DATA_START_ROW = 3
 STD_COL_ARCH = 1
 STD_COL_REP = 2
 STD_COL_SUB = 3
 STD_COL_ROLE = 4
-STD_COL_MS = 11
+STD_COL_EXP_MS = 11
 STD_COL_LSTAR_US = 12
 STD_COL_LSTAR_MS = 13
 STD_COL_GAP_MS = 14
 STD_COL_BOUND = 15
+STD_COL_SOURCE_REF = 16
 STD_SUBTOTAL_LABEL_END_COL = 10
 
-#: Sheet 3 (Memory_Quant_Calculator) structural layout constants (22 columns A..V).
-MEMORY_COLS = 22
-MEMORY_TABLE_END_COL = 14
-MEMORY_WEIGHT_MERGE_END_COL = 9
-MEMORY_WEIGHT_SUM_START_COL = 10
+#: Sheet 3 (Memory_Quant_Calculator) structural layout constants (24 columns A..X).
+MEMORY_COLS = 24
+MEMORY_TABLE_END_COL = 16
+MEMORY_WEIGHT_MERGE_END_COL = 10
+MEMORY_WEIGHT_SUM_START_COL = 11
 MEMORY_CACHE_BASIS_START_COL = 7
 MEMORY_CACHE_MERGE_END_COL = 4
 MEMORY_CACHE_REQ_COL = 5
@@ -215,15 +251,24 @@ MEMORY_STAGE_HEADROOM_COL = 12
 MEMORY_STAGE_STATUS_COL = 13
 MEMORY_STAGE_RAW_ENGRAM_COL = 14
 MEMORY_STAGE_AGG_START_COL = 3
-MEMORY_CONTROL_COL_LABEL = 17
-MEMORY_CONTROL_COL_VALUE = 18
-MEMORY_LOOKUP_START_COL = 19
+MEMORY_CONTROL_COL_LABEL = 19
+MEMORY_CONTROL_COL_VALUE = 20
+MEMORY_LOOKUP_START_COL = 21
 MEMORY_LOOKUP_HEADER_ROW = 3
 MEMORY_LOOKUP_FIRST_ROW = 4
 MEMORY_LOOKUP_LAST_ROW = 10
 MEMORY_TABLE_HEADER_ROW = 3
 MEMORY_FREEZE_ROWS = 3
 MEMORY_QUANT_LOOKUP_ORDER = ("BF16", "FP32", "FP8", "W8A8", "W4A8", "MXFP8", "MXFP4")
+#: Control Panel absolute cell references in column T (20).
+MEM_CTL_QUANT_REF = "$T$3"
+MEM_CTL_CACHE_REF = "$T$4"
+MEM_CTL_OFFLOAD_REF = "$T$5"
+MEM_CTL_OVERRIDE_IGN_REF = "$T$6"
+MEM_CTL_VIT_REF = "$T$7"
+MEM_CTL_CONC_REF = "$T$18"
+MEM_CTL_LOCAL_TOK_REF = "$T$21"
+MEM_CTL_USABLE_HBM_REF = "$T$24"
 
 #: Sheet 4 (Pending_Kernel_Details) structural layout constants (10 columns A..J).
 PENDING_COLS = 10
@@ -232,7 +277,7 @@ PENDING_DATA_START_ROW = 4
 PENDING_COL_GAIN = 7
 PENDING_LABEL_MERGE_END = 6
 PENDING_CARD_SPACER_GAP = 4
-PENDING_CARD_STRIDE = 9
+PENDING_CARD_STRIDE = 11
 PENDING_CARD_LBL_END = 2
 PENDING_CARD_LEFT_START = 3
 PENDING_CARD_LEFT_END = 5
@@ -244,8 +289,10 @@ PENDING_CARD_ROW_CHAIN = 2
 PENDING_CARD_ROW_FREQ = 3
 PENDING_CARD_ROW_SHAPE = 4
 PENDING_CARD_ROW_BOUND = 5
-PENDING_CARD_ROW_DESIGN = 6
-PENDING_CARD_ROW_ACCEPT = 7
+PENDING_CARD_ROW_CONFIG = 6
+PENDING_CARD_ROW_KERNEL = 7
+PENDING_CARD_ROW_FRAMEWORK = 8
+PENDING_CARD_ROW_ACCEPT = 9
 
 #: Conditional Measured_msprof_Calibration sheet layout constants (14 columns A..N).
 MEAS_COLS = 14
@@ -260,20 +307,22 @@ MEAS_COL_BOUND = 14
 MEAS_TOTAL_SUM_COLS = (8, 9, 11, 12)
 
 #: Preset column widths across sheets.
-SUMMARY_COL_WIDTHS = (34.0, 18.0, 16.0, 15.0, 16.0, 15.0, 16.0, 16.0, 32.0)
+SUMMARY_COL_WIDTHS = (
+    34.0, 14.0, 14.0, 14.0, 14.0, 13.0, 14.0, 14.0, 14.0, 13.0, 14.0, 13.0, 34.0,
+)
 CMP_COL_WIDTHS = (
-    32.0, 10.0, 24.0, 28.0, 34.0, 28.0, 30.0, 13.0, 14.0, 22.0,
-    28.0, 28.0, 13.0, 24.0, 15.0, 13.0, 11.0, 22.0, 14.0, 13.0, 40.0,
+    30.0, 9.0, 22.0, 28.0, 34.0, 32.0, 26.0, 13.0, 13.0, 14.0, 20.0,
+    26.0, 28.0, 13.0, 13.0, 14.0, 13.0, 10.0, 20.0, 13.0, 12.0, 38.0, 30.0,
 )
 STD_COL_WIDTHS = (
-    32.0, 10.0, 24.0, 28.0, 34.0, 28.0, 28.0, 30.0, 24.0, 13.0,
-    15.0, 13.0, 14.0, 13.0, 22.0,
+    30.0, 9.0, 22.0, 28.0, 34.0, 32.0, 26.0, 28.0, 13.0, 13.0,
+    14.0, 13.0, 13.0, 12.0, 20.0, 30.0,
 )
 MEMORY_COL_WIDTHS = (
-    16.0, 24.0, 12.0, 12.0, 18.0, 12.0, 12.0, 12.0, 13.0, 15.0, 15.0,
-    13.0, 14.0, 28.0, 4.0, 4.0, 26.0, 30.0, 12.0, 12.0, 11.0, 12.0,
+    16.0, 24.0, 11.0, 11.0, 16.0, 11.0, 11.0, 11.0, 19.0, 13.0, 14.0, 13.0,
+    12.0, 15.0, 16.0, 28.0, 3.5, 3.5, 28.0, 26.0, 11.0, 10.0, 10.0, 11.0,
 )
-PENDING_COL_WIDTHS = (10.0, 26.0, 32.0, 26.0, 30.0, 24.0, 16.0, 22.0, 26.0, 20.0)
+PENDING_COL_WIDTHS = (9.0, 24.0, 30.0, 26.0, 28.0, 24.0, 15.0, 22.0, 24.0, 22.0)
 MEAS_COL_WIDTHS = (
     28.0, 22.0, 24.0, 24.0, 24.0, 28.0, 12.0, 14.0, 14.0, 28.0, 14.0, 14.0, 12.0, 20.0,
 )
@@ -298,9 +347,10 @@ class XlsxExportSummary:
     bytes_written: int
     new_kernel_backlog_count: int = 0
     to_optimize_kernel_count: int = 0
+    agent_brief_path: str = ""
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out = {
             "schema": self.schema,
             "output_path": self.output_path,
             "model_name": self.model_name,
@@ -317,6 +367,9 @@ class XlsxExportSummary:
             "new_kernel_backlog_count": self.new_kernel_backlog_count,
             "to_optimize_kernel_count": self.to_optimize_kernel_count,
         }
+        if self.agent_brief_path:
+            out["agent_brief_path"] = self.agent_brief_path
+        return out
 
 
 def _apply_col_widths(ws: Worksheet, widths: Sequence[float]) -> None:
@@ -365,14 +418,25 @@ def _extend_span(spans: list[tuple[Any, int, int]], key: Any, r1: int, r2: int) 
         spans.append((key, r1, r2))
 
 
-def _stream_overlap_label(op: OperatorExportRow) -> str:
+def _stream_masking_badge(op: OperatorExportRow) -> tuple[str, int]:
+    """Build up-front intuitive Stream & Masking label + badge style for Sheet 2 Col E."""
+    if op.dur_us <= 0.0:
+        return "主计算流 [0 us]", STYLE_TEXT
     if op.is_overlapped:
-        return "Stream 1 (Overlapped, 0 exposed)"
-    if op.stream_index == 1:
-        return "Stream 1 (MSO Aux)"
+        masker = op.masked_by or ("MoE Routed GMM / MegaMoE" if op.stream_index == 1 else "主计算流")
+        stream_tag = "副流并发 (MSO)" if op.stream_index == 1 else ("通信流并发" if op.stream_index == 2 else "并行分支")
+        return f"{stream_tag} [被 {masker} 100% 掩盖 -> 暴露 0 us，不计入总耗时]", STYLE_OVERLAP
+    masked_us = max(0.0, op.dur_us - op.exposed_dur_us)
+    if masked_us > OVERLAP_EXPOSED_EPS_US:
+        pct = 100.0 * masked_us / max(op.dur_us, OVERLAP_EXPOSED_EPS_US)
+        masker = op.masked_by or "主计算流"
+        stream_tag = "副流并发 (MSO)" if op.stream_index == 1 else ("通信流并发" if op.stream_index == 2 else "并行分支")
+        return f"{stream_tag} [被 {masker} 掩盖 {pct:.0f}% -> 仅暴露 {op.exposed_dur_us:.2f} us]", STYLE_PARTIAL_OVERLAP
     if op.stream_index == 2 or op.task_type == "HCCL":
-        return "Stream 2 (HCCL / MC2)"
-    return "Stream 0 (Compute)"
+        return "通信流 [暴露 100%]", STYLE_TEXT
+    if op.stream_index == 1:
+        return "副流 (MSO) [暴露 100%]", STYLE_TEXT
+    return "主计算流 [暴露 100%]", STYLE_TEXT
 
 
 def _kernel_with_backend(op: OperatorExportRow) -> str:
@@ -380,33 +444,49 @@ def _kernel_with_backend(op: OperatorExportRow) -> str:
     return f"{kern} [{op.kernel_backend}]" if op.kernel_backend else kern
 
 
-def _lookup_agent_design(
-    designs: Mapping[str, Mapping[str, str]] | None,
-    kernel_key: str,
+def _lookup_agent_design_bundle(
+    designs: Mapping[str, Any] | None,
+    *,
+    card_id: str = "",
+    kernel_key: str = "",
     target_kernel: str = "",
     logical_role: str = "",
-) -> tuple[str | None, str | None]:
+) -> dict[str, str | None]:
+    """Resolve structured 4-slot overrides (config/kernel/framework/acceptance) by card_id or key."""
+    empty: dict[str, str | None] = {
+        "config_howto": None, "kernel_design": None, "framework_work": None, "acceptance": None,
+    }
     if not designs:
-        return None, None
-    entry = designs.get(kernel_key)
+        return empty
+    entry: Any = None
+    for exact in (card_id, kernel_key, target_kernel):
+        if exact and exact in designs:
+            entry = designs[exact]
+            break
     if entry is None:
-        haystacks = (kernel_key.lower(), target_kernel.lower(), logical_role.lower())
+        haystacks = tuple(h.lower() for h in (card_id, kernel_key, target_kernel, logical_role) if h)
         for k, val in designs.items():
             kl = str(k).lower().strip()
-            if kl and any(kl == h or kl in h for h in haystacks if h):
+            if kl and any(kl == h or kl in h for h in haystacks):
                 entry = val
                 break
+    if isinstance(entry, str):
+        clean = entry.strip()
+        return {**empty, "kernel_design": clean or None}
     if not isinstance(entry, Mapping):
-        return None, None
-    design = str(entry.get("design") or entry.get("proposal") or "").strip() or None
-    accept = str(entry.get("acceptance") or entry.get("criteria") or "").strip() or None
-    return design, accept
+        return empty
+    return {
+        "config_howto": str(entry.get("config_howto") or entry.get("config") or "").strip() or None,
+        "kernel_design": str(entry.get("kernel_design") or entry.get("design") or entry.get("proposal") or "").strip() or None,
+        "framework_work": str(entry.get("framework_work") or entry.get("framework") or "").strip() or None,
+        "acceptance": str(entry.get("acceptance") or entry.get("criteria") or "").strip() or None,
+    }
 
 
 def _populate_summary_deployment_block(
     ws: Worksheet, bundle: ExportBundle, compare_bundle: ExportBundle | None,
 ) -> None:
-    """Block 1: Deployment, Parallelism & Concurrency structured parameter table."""
+    """Block 1: Deployment, Parallelism, Concurrency & Side-by-Side Weight Footprint."""
     ref = compare_bundle or bundle
     mem = ref.memory_ledger
     _write_banner(ws, SUM_B1_BANNER_ROW, SUMMARY_COLS, "1. 部署方案、并行策略与并发总览 (Deployment, Parallelism & Concurrency)", STYLE_SECTION)
@@ -418,7 +498,7 @@ def _populate_summary_deployment_block(
     ws.set_cell(SUM_B1_HDR_ROW, SUM_RIGHT_LBL_START, "并行策略与并发/显存 (Parallelism & Concurrency)", style=STYLE_HEADER)
     ws.merge_range(SUM_B1_HDR_ROW, SUM_RIGHT_LBL_START, SUM_B1_HDR_ROW, SUM_RIGHT_LBL_END)
     ws.set_cell(SUM_B1_HDR_ROW, SUM_RIGHT_VAL_COL, "数值 (Value)", style=STYLE_HEADER)
-    ws.set_cell(SUM_B1_HDR_ROW, SUM_RIGHT_DETAIL_START, "切分 / 显存明细 (Detail)", style=STYLE_HEADER)
+    ws.set_cell(SUM_B1_HDR_ROW, SUM_RIGHT_DETAIL_START, "切分 / 量化显存明细 (Detail)", style=STYLE_HEADER)
     ws.merge_range(SUM_B1_HDR_ROW, SUM_RIGHT_DETAIL_START, SUM_B1_HDR_ROW, SUMMARY_COLS)
 
     layers_txt = (
@@ -446,9 +526,19 @@ def _populate_summary_deployment_block(
     budget_detail = f"= TPOT SLA (B{SUM_ROW_SLA}) × Avg Accepted (B{SUM_ROW_SPEC})" if is_decode else f"= TTFT SLA (B{SUM_ROW_SLA})"
     cluster_conc = mem.concurrency * mem.dp
     weight_gib = mem.weight_footprint_per_die_bytes / float(GIB_BYTES)
+    native_gib = mem.native_bf16_weight_footprint_per_die_bytes / float(GIB_BYTES)
     offload_note = (
-        f" | PLE/Engram Host Offload={mem.max_stage_host_offload_bytes / float(GIB_BYTES):.2f} GiB (Excluded from HBM)"
+        f" | Host DRAM Offload={mem.max_stage_host_offload_bytes / float(GIB_BYTES):.2f} GiB (不计入 NPU HBM)"
         if mem.max_stage_host_offload_bytes > 0.0 else ""
+    )
+    vit_note = (
+        f" | ViT={mem.vision_weight_bytes_per_die / float(GIB_BYTES):.2f} GiB ({'已计入' if mem.include_vision_tower else '纯文本默认排除'})"
+        if mem.vision_weight_bytes_per_die > 0.0 else ""
+    )
+    weight_detail = (
+        f"GiB/Die ({mem.weight_quant_display or mem.weight_quant}) "
+        f"[原生 BF16: {native_gib:.2f} GiB/die, 压缩 {mem.weight_compression_ratio:.2f}x | 优先选 QuaRot 量化权重]"
+        f"{offload_note}{vit_note}"
     )
     rows: tuple[tuple[int, str, Any, str | None, int, str, str, Any, str | None, int, str], ...] = (
         (
@@ -469,7 +559,7 @@ def _populate_summary_deployment_block(
         ),
         (
             SUM_ROW_SLA, "SLA 约束 (SLA Target ms)", sla_target, None, STYLE_FLOAT2, sla_detail,
-            "单卡权重占用 (Weight Footprint / Die GiB)", weight_gib, None, STYLE_FLOAT2, f"GiB / Die ({mem.weight_quant_display or mem.weight_quant}){offload_note}",
+            "单卡 HBM 权重占用 (NPU Weight / Die GiB)", weight_gib, None, STYLE_FLOAT2, weight_detail,
         ),
         (
             SUM_ROW_SPEC, "投机解码策略 (Avg Accepted tok/step)", ref.avg_accepted_tokens, None, STYLE_FLOAT2, spec_detail,
@@ -498,7 +588,7 @@ def _populate_summary_deployment_block(
 def _populate_summary_kpi_block(
     ws: Worksheet, bundle: ExportBundle, compare_bundle: ExportBundle | None,
 ) -> None:
-    """Block 2: Before vs After Simulation KPIs highlighting TPS & Effective TPOT."""
+    """Block 2: Before vs After KPIs & Hardware Utilization (zero '4D' jargon)."""
     after = compare_bundle or bundle
     is_cmp = compare_bundle is not None
     is_decode = bundle.phase == "decode"
@@ -512,7 +602,7 @@ def _populate_summary_kpi_block(
         "优化前 (Before)" if is_cmp else "当前仿真 (Sim Pred)",
         "优化后 (After)" if is_cmp else "基线对照 (Current)",
         "收益变化 (Delta)", "变化幅度 (Delta %)", "加速比 (Speedup)", "单位 (Unit)",
-        "SLA 判定 / 公式说明 (Verdict & Formula Basis)",
+        "SLA 判定 / 物理含义说明 (Verdict & Physical Context)",
     )
     _write_headers(ws, SUM_B2_HDR_ROW, headers)
     ws.merge_range(SUM_B2_HDR_ROW, SUM_KPI_NOTE_START_COL, SUM_B2_HDR_ROW, SUMMARY_COLS)
@@ -546,7 +636,7 @@ def _populate_summary_kpi_block(
             a_step - b_step, f"=C{r_step}-B{r_step}", STYLE_FLOAT3,
             (a_step - b_step) / b_step if b_step > 0.0 else 0.0, f"=IF(B{r_step}>0,(C{r_step}-B{r_step})/B{r_step},0)", STYLE_PCT,
             b_step / a_step if a_step > 0.0 else 0.0, f"=IF(C{r_step}>0,B{r_step}/C{r_step},0)", STYLE_RATIO,
-            "ms", f"runtime.Engine Full-Model Step (Budget <= {sla * acc if is_decode else sla:.1f} ms)",
+            "ms", f"全网端到端单步耗时 (单步预算 <= {sla * acc if is_decode else sla:.1f} ms，与 Block 3 实际暴露总和 100% 守恒)",
         ),
         (
             r_tpot, "等效 TPOT (Effective TPOT)" if is_decode else "首字延迟 (Prefill TTFT)",
@@ -554,7 +644,7 @@ def _populate_summary_kpi_block(
             a_tpot - b_tpot, f"=C{r_tpot}-B{r_tpot}", STYLE_FLOAT3,
             (a_tpot - b_tpot) / b_tpot if b_tpot > 0.0 else 0.0, f"=IF(B{r_tpot}>0,(C{r_tpot}-B{r_tpot})/B{r_tpot},0)", STYLE_PCT,
             b_tpot / a_tpot if a_tpot > 0.0 else 0.0, f"=IF(C{r_tpot}>0,B{r_tpot}/C{r_tpot},0)", STYLE_RATIO,
-            "ms/tok" if is_decode else "ms", f"= Step_ms / Avg_Accepted ($B${SUM_ROW_SPEC}) | Target <= {sla:.1f} ms",
+            "ms/tok" if is_decode else "ms", f"= Step_ms / Avg_Accepted ($B${SUM_ROW_SPEC}) | SLA 目标 <= {sla:.1f} ms",
         ),
         (
             r_sla, "SLA 达标判定 (SLA Verdict)",
@@ -563,7 +653,7 @@ def _populate_summary_kpi_block(
             sla - a_tpot, f"=$B${SUM_ROW_SLA}-C{r_tpot}", STYLE_FLOAT3,
             (sla - a_tpot) / sla if sla > 0.0 else 0.0, f"=IF($B${SUM_ROW_SLA}>0,($B${SUM_ROW_SLA}-C{r_tpot})/$B${SUM_ROW_SLA},0)", STYLE_PCT,
             "", None, STYLE_TEXT,
-            "ms margin", f"PASS if Effective TPOT <= SLA ($B${SUM_ROW_SLA}); Col D/E = After Headroom",
+            "ms margin", f"Effective TPOT <= SLA ($B${SUM_ROW_SLA}) 为 PASS；Col D/E 为优化后余量",
         ),
         (
             r_dtps, "单卡吞吐 (Single-Die TPS)",
@@ -572,7 +662,7 @@ def _populate_summary_kpi_block(
             a_dtps - b_dtps, f"=C{r_dtps}-B{r_dtps}", STYLE_FLOAT2,
             (a_dtps - b_dtps) / b_dtps if b_dtps > 0.0 else 0.0, f"=IF(B{r_dtps}>0,(C{r_dtps}-B{r_dtps})/B{r_dtps},0)", STYLE_PCT,
             a_dtps / b_dtps if b_dtps > 0.0 else 0.0, f"=IF(B{r_dtps}>0,C{r_dtps}/B{r_dtps},0)", STYLE_RATIO,
-            "tok/s/die", f"= Cluster_TPS / Total_Dies ($G${SUM_ROW_MODEL}) — Higher is better",
+            "tok/s/die", f"= Cluster_TPS / Total_Dies ($G${SUM_ROW_MODEL}) — 越高越好",
         ),
         (
             r_ctps, "集群总吞吐 (Cluster Total TPS)",
@@ -598,17 +688,21 @@ def _populate_summary_kpi_block(
             a_att - b_att, f"=C{r_att}-B{r_att}", STYLE_PCT,
             "", None, STYLE_TEXT,
             a_gap_ratio, f"=IF(C{r_ls}>0,C{r_step}/C{r_ls},0)", _gap_ratio_style(a_gap_ratio),
-            "%", "Attainment = L* / Step_ms; Col F = After Gap Ratio (Step / L*)",
+            "%", "Attainment = L* / Step_ms；Col F 为优化后与物理下界倍差 (Step / L*)",
         ),
     ]
-    util_4d = (
-        ("4D 利用率 — Cube MFU %", bundle.network_cube_mfu / PCT_DIVISOR, after.network_cube_mfu / PCT_DIVISOR, "Cube AIC Effective Utilization"),
-        ("4D 利用率 — Vector MFU %", bundle.network_vec_mfu / PCT_DIVISOR, after.network_vec_mfu / PCT_DIVISOR, "Vector AIV Effective Utilization"),
-        ("4D 利用率 — HBM MBU %", bundle.network_mbu / PCT_DIVISOR, after.network_mbu / PCT_DIVISOR, "HBM Memory Bandwidth Utilization"),
-        ("4D 利用率 — HCCL Link Util %", bundle.network_link_util / PCT_DIVISOR, after.network_link_util / PCT_DIVISOR, "HCCL / Interconnect Link Utilization"),
+    cube_note = (
+        "Decode 小 Batch 受限于 HBM 访存带宽 (MBU 主导)，Cube 算力受限于算术强度"
+        if is_decode else "Prefill Compute-Bound 主导，反映 AIC 矩阵核有效算力利用"
     )
-    for idx, (lbl, bv, av, note) in enumerate(util_4d):
-        r = SUM_KPI_4D_START_ROW + idx
+    hw_utils = (
+        ("Cube 计算利用率 (AIC MFU)", bundle.network_cube_mfu / PCT_DIVISOR, after.network_cube_mfu / PCT_DIVISOR, cube_note),
+        ("Vector 计算利用率 (AIV Util)", bundle.network_vec_mfu / PCT_DIVISOR, after.network_vec_mfu / PCT_DIVISOR, "AIV 向量核执行 Norm / Softmax / Gating / 量化与小包通信展开"),
+        ("HBM 访存带宽利用率 (MBU)", bundle.network_mbu / PCT_DIVISOR, after.network_mbu / PCT_DIVISOR, "Decode 核心瓶颈指标：权重 + KV Cache HBM 有效带宽利用率"),
+        ("HCCL 通信带宽利用率 (Link BW Util)", bundle.network_link_util / PCT_DIVISOR, after.network_link_util / PCT_DIVISOR, "跨卡 TP/EP/DCP 通信带宽利用率（小包受启动开销制约，切 AIV/CCU 可显著降延迟）"),
+    )
+    for idx, (lbl, bv, av, note) in enumerate(hw_utils):
+        r = SUM_KPI_UTIL_START_ROW + idx
         kpi_specs.append((
             r, lbl, bv, None, STYLE_PCT, av, None, STYLE_PCT,
             av - bv, f"=C{r}-B{r}", STYLE_PCT,
@@ -631,90 +725,162 @@ def _populate_summary_macro_modules_block(
     compare_bundle: ExportBundle | None,
     macro_rows: Sequence[MacroModuleRow],
 ) -> int:
-    """Block 3: Macro-Module Breakdown & Share % (Before vs After) with exact Step reconciliation."""
+    """Block 3: Two-Level L1/L2 Hierarchy + Explicit Masking Columns (100% conserved)."""
     after = compare_bundle or bundle
-    _write_banner(ws, SUM_B3_BANNER_ROW, SUMMARY_COLS, "3. 全网各大模块耗时与占比对比 (Macro-Module Breakdown & Share % — Before vs After)", STYLE_SECTION)
+    _write_banner(
+        ws, SUM_B3_BANNER_ROW, SUMMARY_COLS,
+        "3. 全网模块两级拆解与并行掩盖对账 (L1/L2 Hierarchy — 实际暴露合计 = 100% 单步耗时，被掩盖列不计入总和)",
+        STYLE_SECTION,
+    )
     headers = (
-        "模块名 (Macro-Module)", "调用层数 (Layers)",
-        "优化前耗时 (ms)", "优化前占比 (%)",
-        "优化后耗时 (ms)", "优化后占比 (%)",
-        "净省耗时 Δ (ms)", "物理极限 L* (ms)", "主导 Bound (Dominant Bound)",
+        "模块层级 (L1 / L2 Module)", "层数 (Layers)",
+        "Before 流内原始 (ms)", "Before 被掩盖 (ms) [不计入总和]",
+        "Before 实际暴露 (ms)", "Before 暴露占比 (%)",
+        "After 流内原始 (ms)", "After 被掩盖 (ms) [不计入总和]",
+        "After 实际暴露 (ms)", "After 暴露占比 (%)",
+        "暴露净省 Δ (ms)", "物理极限 L* (ms)", "主导瓶颈 & 掩盖说明",
     )
     _write_headers(ws, SUM_B3_HDR_ROW, headers)
 
-    d_start = SUM_B3_DATA_START_ROW
-    d_end = d_start + len(macro_rows) - 1
-    tot_row = max(d_start, d_end + 1)
+    by_l1: dict[str, list[MacroModuleRow]] = defaultdict(list)
+    for mod in macro_rows:
+        by_l1[mod.l1_group].append(mod)
+    ordered_l1 = [l1 for l1, _ in MACRO_L1_HIERARCHY if l1 in by_l1]
+    for extra in by_l1:
+        if extra not in ordered_l1:
+            ordered_l1.append(extra)
+
     tot_bef = sum(m.before_ms for m in macro_rows)
     tot_aft = sum(m.after_ms for m in macro_rows)
+    tot_raw_bef = sum(m.raw_before_ms for m in macro_rows)
+    tot_raw_aft = sum(m.raw_after_ms for m in macro_rows)
+    tot_mask_bef = sum(m.masked_before_ms for m in macro_rows)
+    tot_mask_aft = sum(m.masked_after_ms for m in macro_rows)
     tot_lstar = sum(m.lstar_ms for m in macro_rows)
 
-    for offset, mod in enumerate(macro_rows):
-        r = d_start + offset
-        ws.set_row_height(r, WRAP_ROW_HEIGHT_PT)
-        is_mso_hidden = "MSO Stream 1 Overlapped" in mod.dominant_bound
-        _write_row(ws, r, (
-            (mod.module_name, None, STYLE_TEXT_WRAP),
-            (mod.layer_calls_label, None, STYLE_MERGED),
-            (mod.before_ms, None, STYLE_FLOAT3),
-            (mod.before_share_pct / PCT_DIVISOR, f"=IF($C${tot_row}>0,C{r}/$C${tot_row},0)", STYLE_PCT),
-            (mod.after_ms, None, STYLE_FLOAT3),
-            (mod.after_share_pct / PCT_DIVISOR, f"=IF($E${tot_row}>0,E{r}/$E${tot_row},0)", STYLE_PCT),
-            (mod.saved_ms, f"=C{r}-E{r}", STYLE_FLOAT3),
-            (mod.lstar_ms, None, STYLE_FLOAT3),
-            (mod.dominant_bound, None, STYLE_OVERLAP if is_mso_hidden else STYLE_TEXT_WRAP),
-        ))
+    total_data_rows = sum(1 + len(by_l1[l1]) for l1 in ordered_l1)
+    tot_row = SUM_B3_DATA_START_ROW + total_data_rows
+    row_cursor = SUM_B3_DATA_START_ROW
+    l1_row_indices: list[int] = []
 
-    sum_c = f"=SUM(C{d_start}:C{d_end})" if d_end >= d_start else "=0"
-    sum_d = f"=SUM(D{d_start}:D{d_end})" if d_end >= d_start else "=0"
-    sum_e = f"=SUM(E{d_start}:E{d_end})" if d_end >= d_start else "=0"
-    sum_f = f"=SUM(F{d_start}:F{d_end})" if d_end >= d_start else "=0"
-    sum_g = f"=SUM(G{d_start}:G{d_end})" if d_end >= d_start else "=0"
-    sum_h = f"=SUM(H{d_start}:H{d_end})" if d_end >= d_start else "=0"
+    for l1_name in ordered_l1:
+        children = by_l1[l1_name]
+        r_l1 = row_cursor
+        l1_row_indices.append(r_l1)
+        c_start = r_l1 + 1
+        c_end = r_l1 + len(children)
+        l1_raw_b = sum(c.raw_before_ms for c in children)
+        l1_msk_b = sum(c.masked_before_ms for c in children)
+        l1_exp_b = sum(c.before_ms for c in children)
+        l1_raw_a = sum(c.raw_after_ms for c in children)
+        l1_msk_a = sum(c.masked_after_ms for c in children)
+        l1_exp_a = sum(c.after_ms for c in children)
+        l1_ls = sum(c.lstar_ms for c in children)
+        ws.set_row_height(r_l1, WRAP_ROW_HEIGHT_PT)
+        _write_row(ws, r_l1, (
+            (l1_name, None, STYLE_L1_TEXT),
+            (f"{len(children)} 子模块", None, STYLE_L1_TEXT),
+            (l1_raw_b, f"=SUM(C{c_start}:C{c_end})", STYLE_L1_NUM),
+            (l1_msk_b, f"=SUM(D{c_start}:D{c_end})", STYLE_L1_NUM),
+            (l1_exp_b, f"=SUM(E{c_start}:E{c_end})", STYLE_L1_NUM),
+            (l1_exp_b / tot_bef if tot_bef > 0.0 else 0.0, f"=IF($E${tot_row}>0,E{r_l1}/$E${tot_row},0)", STYLE_L1_PCT),
+            (l1_raw_a, f"=SUM(G{c_start}:G{c_end})", STYLE_L1_NUM),
+            (l1_msk_a, f"=SUM(H{c_start}:H{c_end})", STYLE_L1_NUM),
+            (l1_exp_a, f"=SUM(I{c_start}:I{c_end})", STYLE_L1_NUM),
+            (l1_exp_a / tot_aft if tot_aft > 0.0 else 0.0, f"=IF($I${tot_row}>0,I{r_l1}/$I${tot_row},0)", STYLE_L1_PCT),
+            (l1_exp_b - l1_exp_a, f"=E{r_l1}-I{r_l1}", STYLE_L1_NUM),
+            (l1_ls, f"=SUM(L{c_start}:L{c_end})", STYLE_L1_NUM),
+            (f"L1 汇总（暴露占比 Before {100.0 * l1_exp_b / tot_bef if tot_bef > 0 else 0:.1f}% -> After {100.0 * l1_exp_a / tot_aft if tot_aft > 0 else 0:.1f}%）", None, STYLE_L1_TEXT),
+        ))
+        row_cursor = c_start
+        for idx, mod in enumerate(children):
+            r = row_cursor
+            ws.set_row_height(r, WRAP_ROW_HEIGHT_PT)
+            prefix = "    └─ " if idx == len(children) - 1 else "    ├─ "
+            is_full_mask = mod.after_ms <= OVERLAP_EXPOSED_EPS_US and mod.raw_after_ms > 0.0
+            is_part_mask = (not is_full_mask) and (abs(mod.masked_after_ms) > MASKED_HIGHLIGHT_EPS_MS or abs(mod.masked_before_ms) > MASKED_HIGHLIGHT_EPS_MS)
+            note_style = STYLE_OVERLAP if is_full_mask else (STYLE_PARTIAL_OVERLAP if is_part_mask else STYLE_TEXT_WRAP)
+            _write_row(ws, r, (
+                (f"{prefix}{mod.module_name}", None, STYLE_TEXT_WRAP),
+                (mod.layer_calls_label, None, STYLE_MERGED),
+                (mod.raw_before_ms, None, STYLE_FLOAT3),
+                (mod.masked_before_ms, None, STYLE_MASKED_NUM if mod.masked_before_ms < -MASKED_HIGHLIGHT_EPS_MS else STYLE_FLOAT3),
+                (mod.before_ms, f"=C{r}+D{r}", STYLE_FLOAT3),
+                (mod.before_share_pct / PCT_DIVISOR, f"=IF($E${tot_row}>0,E{r}/$E${tot_row},0)", STYLE_PCT),
+                (mod.raw_after_ms, None, STYLE_FLOAT3),
+                (mod.masked_after_ms, None, STYLE_MASKED_NUM if mod.masked_after_ms < -MASKED_HIGHLIGHT_EPS_MS else STYLE_FLOAT3),
+                (mod.after_ms, f"=G{r}+H{r}", STYLE_FLOAT3),
+                (mod.after_share_pct / PCT_DIVISOR, f"=IF($I${tot_row}>0,I{r}/$I${tot_row},0)", STYLE_PCT),
+                (mod.saved_ms, f"=E{r}-I{r}", STYLE_FLOAT3),
+                (mod.lstar_ms, None, STYLE_FLOAT3),
+                (mod.masking_note or mod.dominant_bound, None, note_style),
+            ))
+            row_cursor += 1
+
+    def _sum_l1(col_let: str) -> str:
+        return "=" + "+".join(f"{col_let}{idx}" for idx in l1_row_indices) if l1_row_indices else "=0"
+
+    layer_tot_lbl = f"{after.total_target_layers}L+{after.total_draft_layers}D" if after.total_draft_layers > 0 else f"{after.total_target_layers}L"
     _write_row(ws, tot_row, (
-        ("模块暴露耗时合计 (Module Exposed Sum)", None, STYLE_TOTAL_TEXT),
-        (f"{after.total_target_layers}L+{after.total_draft_layers}D" if after.total_draft_layers > 0 else f"{after.total_target_layers}L", None, STYLE_TOTAL_TEXT),
-        (tot_bef, sum_c, STYLE_TOTAL_FLOAT3),
-        (1.0 if tot_bef > 0.0 else 0.0, sum_d, STYLE_TOTAL_PCT),
-        (tot_aft, sum_e, STYLE_TOTAL_FLOAT3),
-        (1.0 if tot_aft > 0.0 else 0.0, sum_f, STYLE_TOTAL_PCT),
-        (tot_bef - tot_aft, sum_g, STYLE_TOTAL_FLOAT3),
-        (tot_lstar, sum_h, STYLE_TOTAL_FLOAT3),
-        ("Exposed Sum across all architectural modules (100% Share)", None, STYLE_TOTAL_TEXT),
+        ("全网端到端合计 (Grand Total = SUM of L1 实际暴露 = Block 2 Step Latency)", None, STYLE_TOTAL_TEXT),
+        (layer_tot_lbl, None, STYLE_TOTAL_TEXT),
+        (tot_raw_bef, _sum_l1("C"), STYLE_TOTAL_FLOAT3),
+        (tot_mask_bef, _sum_l1("D"), STYLE_TOTAL_FLOAT3),
+        (tot_bef, _sum_l1("E"), STYLE_TOTAL_FLOAT3),
+        (1.0 if tot_bef > 0.0 else 0.0, _sum_l1("F"), STYLE_TOTAL_PCT),
+        (tot_raw_aft, _sum_l1("G"), STYLE_TOTAL_FLOAT3),
+        (tot_mask_aft, _sum_l1("H"), STYLE_TOTAL_FLOAT3),
+        (tot_aft, _sum_l1("I"), STYLE_TOTAL_FLOAT3),
+        (1.0 if tot_aft > 0.0 else 0.0, _sum_l1("J"), STYLE_TOTAL_PCT),
+        (tot_bef - tot_aft, f"=E{tot_row}-I{tot_row}", STYLE_TOTAL_FLOAT3),
+        (tot_lstar, _sum_l1("L"), STYLE_TOTAL_FLOAT3),
+        ("100% 端到端守恒（无负号抵消黑盒行；流内原始 + 被掩盖 = 实际暴露）", None, STYLE_TOTAL_TEXT),
     ))
+    return tot_row + 1
 
-    b_step = bundle.step_span_us / US_PER_MS
-    a_step = after.step_span_us / US_PER_MS
-    b_credit = b_step - tot_bef
-    a_credit = a_step - tot_aft
-    next_row = tot_row + 1
-    if abs(b_credit) > OVERLAP_RECONCILE_EPS_MS or abs(a_credit) > OVERLAP_RECONCILE_EPS_MS:
-        r_ov = next_row
-        _write_row(ws, r_ov, (
-            ("跨流并发重叠抵消 (Cross-Stream Overlap Credit)", None, STYLE_SUBTOTAL_TEXT),
-            ("Multi-Stream", None, STYLE_SUBTOTAL_TEXT),
-            (b_credit, f"=B{SUM_KPI_STEP_ROW}-C{tot_row}", STYLE_SUBTOTAL_NUM),
-            (b_credit / tot_bef if tot_bef > 0.0 else 0.0, f"=IF($C${tot_row}>0,C{r_ov}/$C${tot_row},0)", STYLE_PCT),
-            (a_credit, f"=C{SUM_KPI_STEP_ROW}-E{tot_row}", STYLE_SUBTOTAL_NUM),
-            (a_credit / tot_aft if tot_aft > 0.0 else 0.0, f"=IF($E${tot_row}>0,E{r_ov}/$E${tot_row},0)", STYLE_PCT),
-            (b_credit - a_credit, f"=C{r_ov}-E{r_ov}", STYLE_SUBTOTAL_NUM),
-            (0.0, None, STYLE_SUBTOTAL_NUM),
-            ("Concurrent Stream Overlap (e.g. DCP Comm // Indexer)", None, STYLE_OVERLAP),
-        ))
-        r_net = r_ov + 1
-        _write_row(ws, r_net, (
-            ("端到端单步总耗时 (Net Step Latency = Block 2)", None, STYLE_TOTAL_TEXT),
-            ("Full Step", None, STYLE_TOTAL_TEXT),
-            (b_step, f"=C{tot_row}+C{r_ov}", STYLE_TOTAL_FLOAT3),
-            (1.0, None, STYLE_TOTAL_PCT),
-            (a_step, f"=E{tot_row}+E{r_ov}", STYLE_TOTAL_FLOAT3),
-            (1.0, None, STYLE_TOTAL_PCT),
-            (b_step - a_step, f"=C{r_net}-E{r_net}", STYLE_TOTAL_FLOAT3),
-            (after.step_l_star_lean_us / US_PER_MS, f"=C{SUM_KPI_LSTAR_ROW}", STYLE_TOTAL_FLOAT3),
-            ("Exact conservation with Block 2 Step Latency", None, STYLE_TOTAL_TEXT),
-        ))
-        next_row = r_net + 1
-    return next_row
+
+def _populate_summary_action_roadmap_block(
+    ws: Worksheet, start_row: int, roadmap: Sequence[ActionRoadmapRow],
+) -> int:
+    """Block 4: Concrete 3-Track Actionable Roadmap (Config / Framework / Kernel)."""
+    if not roadmap:
+        return start_row
+    r_banner = start_row + 1
+    _write_banner(
+        ws, r_banner, SUMMARY_COLS,
+        "4. 优化落地指引清单（A: 已有特效与通信展开配置 / B: 推理框架改造 / C: 算子新写与深度调优 — 可直接执行）",
+        STYLE_SECTION,
+    )
+    r_hdr = r_banner + 1
+    ws.set_row_height(r_hdr, HEADER_ROW_HEIGHT_PT)
+    ws.set_cell(r_hdr, 1, "落地赛道 (Track)", style=STYLE_HEADER)
+    ws.merge_range(r_hdr, 1, r_hdr, SUM_B4_TRACK_END)
+    ws.set_cell(r_hdr, SUM_B4_TITLE_START, "优化项 (Item)", style=STYLE_HEADER)
+    ws.merge_range(r_hdr, SUM_B4_TITLE_START, r_hdr, SUM_B4_TITLE_END)
+    ws.set_cell(r_hdr, SUM_B4_GAIN_COL, "预期收益 Δ (ms)", style=STYLE_HEADER)
+    ws.set_cell(r_hdr, SUM_B4_DETAIL_START, "可直接落地的配置命令 / 框架改造 / 算子方案 (Actionable How-To)", style=STYLE_HEADER)
+    ws.merge_range(r_hdr, SUM_B4_DETAIL_START, r_hdr, SUM_B4_DETAIL_END)
+    ws.set_cell(r_hdr, SUM_B4_REF_START, "明细位置 (Ref)", style=STYLE_HEADER)
+    ws.merge_range(r_hdr, SUM_B4_REF_START, r_hdr, SUMMARY_COLS)
+
+    r_cur = r_hdr + 1
+    for item in roadmap:
+        ws.set_row_height(r_cur, BACKLOG_ROW_HEIGHT_PT)
+        tr_style = (
+            STYLE_OVERLAP if item.track == TRACK_CONFIG_ENV
+            else (STYLE_OPT_BADGE if item.track == TRACK_FRAMEWORK else STYLE_NEW_KERNEL)
+        )
+        ws.set_cell(r_cur, 1, item.track_label, style=tr_style)
+        ws.merge_range(r_cur, 1, r_cur, SUM_B4_TRACK_END)
+        ws.set_cell(r_cur, SUM_B4_TITLE_START, item.title, style=STYLE_TEXT_WRAP)
+        ws.merge_range(r_cur, SUM_B4_TITLE_START, r_cur, SUM_B4_TITLE_END)
+        ws.set_cell(r_cur, SUM_B4_GAIN_COL, item.expected_gain_ms, style=STYLE_FLOAT3)
+        ws.set_cell(r_cur, SUM_B4_DETAIL_START, item.action_detail, style=STYLE_TEXT_WRAP)
+        ws.merge_range(r_cur, SUM_B4_DETAIL_START, r_cur, SUM_B4_DETAIL_END)
+        ws.set_cell(r_cur, SUM_B4_REF_START, item.cross_ref, style=STYLE_MERGED)
+        ws.merge_range(r_cur, SUM_B4_REF_START, r_cur, SUMMARY_COLS)
+        r_cur += 1
+    return r_cur
 
 
 def _populate_summary_sheet(
@@ -723,6 +889,7 @@ def _populate_summary_sheet(
     *,
     compare_bundle: ExportBundle | None = None,
     macro_rows: Sequence[MacroModuleRow] = (),
+    pending_items: Sequence[PendingKernelItem] = (),
 ) -> None:
     _apply_col_widths(ws, SUMMARY_COL_WIDTHS)
     ws.freeze_panes(SUMMARY_FREEZE_ROWS, 0)
@@ -738,10 +905,12 @@ def _populate_summary_sheet(
     _populate_summary_deployment_block(ws, bundle, compare_bundle)
     _populate_summary_kpi_block(ws, bundle, compare_bundle)
     next_row = _populate_summary_macro_modules_block(ws, bundle, compare_bundle, macro_rows)
+    roadmap = build_actionable_roadmap(bundle, compare_bundle or bundle, pending_items)
+    next_row = _populate_summary_action_roadmap_block(ws, next_row, roadmap)
     if bundle.reconciliation is not None:
         rec = bundle.reconciliation
         r_b = next_row + 1
-        _write_banner(ws, r_b, SUMMARY_COLS, f"4. Measured msprof Calibration Summary ({rec.source_label} — See {SHEET_MEASURED})", STYLE_SECTION)
+        _write_banner(ws, r_b, SUMMARY_COLS, f"5. Measured msprof Calibration Summary ({rec.source_label} — See {SHEET_MEASURED})", STYLE_SECTION)
         delta = rec.matched_sim_sum_us - rec.matched_measured_sum_us
         ape = (abs(delta) / rec.matched_measured_sum_us) if rec.matched_measured_sum_us > 0.0 else 0.0
         _write_row(ws, r_b + 1, (
@@ -755,6 +924,7 @@ def _populate_summary_sheet(
             (ape, f"=IF(E{r_b + 1}>0,ABS(C{r_b + 1}-E{r_b + 1})/E{r_b + 1},0)", STYLE_PCT),
             (f"Full 1-to-N details on {SHEET_MEASURED}", None, STYLE_TEXT),
         ))
+        ws.merge_range(r_b + 1, 9, r_b + 1, SUMMARY_COLS)
 
 
 def _populate_comparison_breakdown_sheet(
@@ -762,29 +932,30 @@ def _populate_comparison_breakdown_sheet(
     before_bundle: ExportBundle,
     after_bundle: ExportBundle,
     aligned_rows: Sequence[AlignedComparisonRow],
-    agent_designs: Mapping[str, Mapping[str, str]] | None,
+    agent_designs: Mapping[str, Any] | None,
 ) -> None:
-    """Populate Sheet 2 with side-by-side Before vs After N->1 ``merge_cells`` & live formulas."""
+    """Populate Sheet 2 with strict topological order, up-front Stream&Masking, trailing Source Ref."""
     _apply_col_widths(ws, CMP_COL_WIDTHS)
     ws.freeze_panes(CMP_FREEZE_ROWS, CMP_FREEZE_COLS)
     _write_banner(
         ws, 1, CMP_COLS,
         (
             f"Before ({before_bundle.feature_track or 'baseline'}) vs After ({after_bundle.feature_track or 'candidate'}) "
-            f"Layer-Archetype Operator Breakdown | {before_bundle.model_name} @ {before_bundle.hardware_sku} ({before_bundle.phase.upper()})"
+            f"Topological Operator Breakdown | {before_bundle.model_name} @ {before_bundle.hardware_sku} ({before_bundle.phase.upper()})"
         ),
         STYLE_TITLE,
     )
     headers = (
         "Archetype (Scope & Layer Range)", "Repeats (×N)", "Submodule",
-        "Logical Role", "Rank-Local Shapes & Dtype",
-        "Before Ascend Kernel [Backend]", "Before Source Ref",
-        "Before Single (us)", "Before Model (ms)", "Before Bound",
-        "After Ascend Kernel [Backend]", "Kernel Status (算子状态/开发需求)",
-        "After Single (us)", "After Stream / Overlap", "After Model Exposed (ms)",
-        "Saved Δ (ms)", "Speedup", "After Bound",
+        "Logical Role (带作用域标注)", "并发流与掩盖关系 (Stream & Masking)",
+        "Rank-Local Shapes & Dtype",
+        "Before Ascend Kernel [Backend]", "Before 流内单次 (us)", "Before 单次暴露 (us)",
+        "Before 全网暴露 (ms)", "Before Bound",
+        "After Ascend Kernel [Backend]", "Kernel Status (算子状态/优化手段)",
+        "After 流内单次 (us)", "After 单次暴露 (us)", "After 全网暴露 (ms)",
+        "暴露净省 Δ (ms)", "Speedup", "After Bound",
         "Lean L* Model (ms)", "Gap vs L* (ms)",
-        "Optimization Action & New-Kernel Design Slot",
+        "3-Track 落地指引 (配置 / 算子 / 框架)", "源码出处 / Source Ref",
     )
     _write_headers(ws, 2, headers)
 
@@ -829,75 +1000,92 @@ def _populate_comparison_breakdown_sheet(
 
 def _write_comparison_group(
     ws: Worksheet, r_start: int, r_end: int, item: AlignedComparisonRow,
-    agent_designs: Mapping[str, Mapping[str, str]] | None,
+    agent_designs: Mapping[str, Any] | None,
 ) -> tuple[float, float, float]:
     rep = max(1, int(item.repeat_count))
     before_ms_sum = 0.0
+    a_primary = item.after_ops[0] if item.after_ops else None
     if item.before_ops:
         for offset, b_op in enumerate(item.before_ops):
             r = r_start + offset
             ws.set_row_height(r, WRAP_ROW_HEIGHT_PT)
-            b_ms = b_op.dur_us * rep / US_PER_MS
+            b_exp_us = 0.0 if b_op.is_overlapped else b_op.exposed_dur_us
+            b_ms = b_exp_us * rep / US_PER_MS
             before_ms_sum += b_ms
+            mask_ref = a_primary if (a_primary is not None and len(item.before_ops) == 1) else b_op
+            stream_txt, stream_style = _stream_masking_badge(mask_ref)
             ws.set_cell(r, CMP_COL_REP, rep, style=STYLE_INT)
             _write_row(ws, r, (
                 (b_op.logical_role or b_op.op_id, None, STYLE_TEXT_WRAP),
+                (stream_txt, None, stream_style),
                 (b_op.tensor_contract, None, STYLE_TEXT_WRAP),
                 (_kernel_with_backend(b_op), None, STYLE_TEXT_WRAP),
-                (b_op.source_ref, None, STYLE_TEXT_WRAP),
                 (b_op.dur_us, None, STYLE_FLOAT3),
-                (b_ms, f"=H{r}*B{r}/1000", STYLE_FLOAT3),
-                (b_op.bound_display, None, STYLE_TEXT),
+                (b_exp_us, None, STYLE_FLOAT3),
+                (b_ms, f"=I{r}*B{r}/1000", STYLE_FLOAT3),
+                (b_op.bound_display, None, STYLE_OVERLAP if b_op.is_overlapped else STYLE_TEXT),
             ), start_col=CMP_COL_ROLE)
+            ws.set_cell(r, CMP_COL_SOURCE_REF, b_op.source_ref or "-", style=STYLE_MUTED_TEXT)
     else:
-        a0 = item.after_ops[0]
+        assert a_primary is not None
         ws.set_row_height(r_start, WRAP_ROW_HEIGHT_PT)
+        stream_txt, stream_style = _stream_masking_badge(a_primary)
         ws.set_cell(r_start, CMP_COL_REP, rep, style=STYLE_INT)
         _write_row(ws, r_start, (
-            (a0.logical_role or a0.op_id, None, STYLE_TEXT_WRAP),
-            (a0.tensor_contract, None, STYLE_TEXT_WRAP),
+            (a_primary.logical_role or a_primary.op_id, None, STYLE_TEXT_WRAP),
+            (stream_txt, None, stream_style),
+            (a_primary.tensor_contract, None, STYLE_TEXT_WRAP),
             ("(Not in Before)", None, STYLE_TEXT),
-            ("-", None, STYLE_TEXT),
             (0.0, None, STYLE_FLOAT3),
-            (0.0, f"=H{r_start}*B{r_start}/1000", STYLE_FLOAT3),
+            (0.0, None, STYLE_FLOAT3),
+            (0.0, f"=I{r_start}*B{r_start}/1000", STYLE_FLOAT3),
             ("-", None, STYLE_TEXT),
         ), start_col=CMP_COL_ROLE)
+        ws.set_cell(r_start, CMP_COL_SOURCE_REF, a_primary.source_ref or "-", style=STYLE_MUTED_TEXT)
 
-    if item.after_ops:
-        a_op = item.after_ops[0]
-        stream_lbl = _stream_overlap_label(a_op)
-        aft_ms = 0.0 if a_op.is_overlapped else (a_op.dur_us * rep / US_PER_MS)
-        lstar_ms = 0.0 if a_op.is_overlapped else (a_op.l_star_lean_us * rep / US_PER_MS)
+    if a_primary is not None:
+        a_exp_us = 0.0 if a_primary.is_overlapped else a_primary.exposed_dur_us
+        aft_ms = a_exp_us * rep / US_PER_MS
+        lstar_ms = 0.0 if a_primary.is_overlapped else (a_primary.l_star_lean_us * rep / US_PER_MS)
         saved_ms = before_ms_sum - aft_ms
         speedup = (before_ms_sum / aft_ms) if aft_ms > 0.0 else 0.0
         gap_ms = max(0.0, aft_ms - lstar_ms)
-        design_override, _ = _lookup_agent_design(agent_designs, a_op.ascend_kernel, _kernel_with_backend(a_op), a_op.logical_role)
+        ov = _lookup_agent_design_bundle(
+            agent_designs,
+            kernel_key=a_primary.ascend_kernel,
+            target_kernel=_kernel_with_backend(a_primary),
+            logical_role=a_primary.logical_role,
+        )
         action_txt = (
-            f"[Agent Design] {design_override}" if design_override
-            else (f"{item.action_note} -> See {SHEET_PENDING_KERNELS}" if a_op.needs_new_kernel else item.action_note)
+            f"[Agent Design] {ov['kernel_design']}" if ov["kernel_design"]
+            else (f"{item.action_note} -> 详见 {SHEET_PENDING_KERNELS}" if a_primary.needs_new_kernel else item.action_note)
+        )
+        status_style = (
+            STYLE_NEW_KERNEL if a_primary.needs_new_kernel
+            else (STYLE_OPT_BADGE if a_primary.opt_pillar in {"pillar2_roofline", "pillar3_comm"} else STYLE_TEXT_WRAP)
         )
         _write_row(ws, r_start, (
-            (_kernel_with_backend(a_op), None, STYLE_TEXT_WRAP),
-            (a_op.kernel_status, None, STYLE_NEW_KERNEL if a_op.needs_new_kernel else STYLE_TEXT_WRAP),
-            (a_op.dur_us, None, STYLE_FLOAT3),
-            (stream_lbl, None, STYLE_OVERLAP if a_op.is_overlapped else STYLE_TEXT_WRAP),
-            (aft_ms, f'=IF(ISNUMBER(SEARCH("Overlapped",N{r_start})),0,M{r_start}*B{r_start}/1000)', STYLE_FLOAT3),
-            (saved_ms, f"=SUM(I{r_start}:I{r_end})-O{r_start}", STYLE_FLOAT3),
-            (speedup, f"=IF(O{r_start}>0,SUM(I{r_start}:I{r_end})/O{r_start},0)", STYLE_RATIO),
-            (a_op.bound_display, None, STYLE_OVERLAP if a_op.is_overlapped else STYLE_TEXT),
+            (_kernel_with_backend(a_primary), None, STYLE_TEXT_WRAP),
+            (a_primary.kernel_status, None, status_style),
+            (a_primary.dur_us, None, STYLE_FLOAT3),
+            (a_exp_us, None, STYLE_FLOAT3),
+            (aft_ms, f"=O{r_start}*B{r_start}/1000", STYLE_FLOAT3),
+            (saved_ms, f"=SUM(J{r_start}:J{r_end})-P{r_start}", STYLE_FLOAT3),
+            (speedup, f"=IF(P{r_start}>0,SUM(J{r_start}:J{r_end})/P{r_start},0)", STYLE_RATIO),
+            (a_primary.bound_display, None, STYLE_OVERLAP if a_primary.is_overlapped else STYLE_TEXT),
             (lstar_ms, None, STYLE_FLOAT3),
-            (gap_ms, f"=MAX(0,O{r_start}-S{r_start})", STYLE_FLOAT3),
-            (action_txt, None, STYLE_INPUT_TEXT_WRAP if (a_op.needs_new_kernel and not design_override) else STYLE_TEXT_WRAP),
+            (gap_ms, f"=MAX(0,P{r_start}-T{r_start})", STYLE_FLOAT3),
+            (action_txt, None, STYLE_TEXT_WRAP),
         ), start_col=CMP_COL_AFT_KERN)
     else:
         aft_ms = lstar_ms = 0.0
         _write_row(ws, r_start, (
-            ("(Eliminated in After)", None, STYLE_OVERLAP), ("Eliminated", None, STYLE_OVERLAP),
-            (0.0, None, STYLE_FLOAT3), ("Eliminated (0 exposed)", None, STYLE_OVERLAP),
-            (0.0, "=0", STYLE_FLOAT3), (before_ms_sum, f"=SUM(I{r_start}:I{r_end})-O{r_start}", STYLE_FLOAT3),
-            (0.0, f"=IF(O{r_start}>0,SUM(I{r_start}:I{r_end})/O{r_start},0)", STYLE_RATIO),
-            ("Eliminated", None, STYLE_OVERLAP), (0.0, None, STYLE_FLOAT3),
-            (0.0, f"=MAX(0,O{r_start}-S{r_start})", STYLE_FLOAT3), (item.action_note, None, STYLE_TEXT_WRAP),
+            ("(Eliminated in After)", None, STYLE_OVERLAP), ("已融合/消除", None, STYLE_OVERLAP),
+            (0.0, None, STYLE_FLOAT3), (0.0, None, STYLE_FLOAT3),
+            (0.0, "=0", STYLE_FLOAT3), (before_ms_sum, f"=SUM(J{r_start}:J{r_end})-P{r_start}", STYLE_FLOAT3),
+            (0.0, f"=IF(P{r_start}>0,SUM(J{r_start}:J{r_end})/P{r_start},0)", STYLE_RATIO),
+            ("已消除", None, STYLE_OVERLAP), (0.0, None, STYLE_FLOAT3),
+            (0.0, f"=MAX(0,P{r_start}-T{r_start})", STYLE_FLOAT3), (item.action_note, None, STYLE_TEXT_WRAP),
         ), start_col=CMP_COL_AFT_KERN)
 
     if r_end > r_start:
@@ -912,39 +1100,41 @@ def _write_comparison_subtotal_row(
 ) -> None:
     ws.set_cell(r_sub, 1, f"Subtotal — {arch_title}", style=STYLE_SUBTOTAL_TEXT)
     ws.merge_range(r_sub, 1, r_sub, CMP_SUBTOTAL_LABEL_END_COL)
-    ws.set_cell(r_sub, CMP_COL_BEF_MS, bef_ms, formula=f"=SUM(I{r_start}:I{r_end})", style=STYLE_SUBTOTAL_NUM)
+    ws.set_cell(r_sub, CMP_COL_BEF_EXP_MS, bef_ms, formula=f"=SUM(J{r_start}:J{r_end})", style=STYLE_SUBTOTAL_NUM)
     ws.set_cell(r_sub, CMP_COL_BEF_BOUND, "", style=STYLE_SUBTOTAL_TEXT)
-    ws.merge_range(r_sub, CMP_COL_BEF_BOUND, r_sub, CMP_COL_STREAM)
-    ws.set_cell(r_sub, CMP_COL_AFT_MS, aft_ms, formula=f"=SUM(O{r_start}:O{r_end})", style=STYLE_SUBTOTAL_NUM)
-    ws.set_cell(r_sub, CMP_COL_SAVED_MS, bef_ms - aft_ms, formula=f"=I{r_sub}-O{r_sub}", style=STYLE_SUBTOTAL_NUM)
+    ws.merge_range(r_sub, CMP_COL_BEF_BOUND, r_sub, CMP_COL_AFT_EXP_US)
+    ws.set_cell(r_sub, CMP_COL_AFT_EXP_MS, aft_ms, formula=f"=SUM(P{r_start}:P{r_end})", style=STYLE_SUBTOTAL_NUM)
+    ws.set_cell(r_sub, CMP_COL_SAVED_MS, bef_ms - aft_ms, formula=f"=J{r_sub}-P{r_sub}", style=STYLE_SUBTOTAL_NUM)
     spd = (bef_ms / aft_ms) if aft_ms > 0.0 else 0.0
-    ws.set_cell(r_sub, CMP_COL_SPEEDUP, spd, formula=f"=IF(O{r_sub}>0,I{r_sub}/O{r_sub},0)", style=STYLE_SUBTOTAL_RATIO)
+    ws.set_cell(r_sub, CMP_COL_SPEEDUP, spd, formula=f"=IF(P{r_sub}>0,J{r_sub}/P{r_sub},0)", style=STYLE_SUBTOTAL_RATIO)
     ws.set_cell(r_sub, CMP_COL_AFT_BOUND, "", style=STYLE_SUBTOTAL_TEXT)
-    ws.set_cell(r_sub, CMP_COL_LSTAR_MS, lstar_ms, formula=f"=SUM(S{r_start}:S{r_end})", style=STYLE_SUBTOTAL_NUM)
-    ws.set_cell(r_sub, CMP_COL_GAP_MS, max(0.0, aft_ms - lstar_ms), formula=f"=MAX(0,O{r_sub}-S{r_sub})", style=STYLE_SUBTOTAL_NUM)
+    ws.set_cell(r_sub, CMP_COL_LSTAR_MS, lstar_ms, formula=f"=SUM(T{r_start}:T{r_end})", style=STYLE_SUBTOTAL_NUM)
+    ws.set_cell(r_sub, CMP_COL_GAP_MS, max(0.0, aft_ms - lstar_ms), formula=f"=MAX(0,P{r_sub}-T{r_sub})", style=STYLE_SUBTOTAL_NUM)
     ws.set_cell(r_sub, CMP_COL_ACTION, "", style=STYLE_SUBTOTAL_TEXT)
+    ws.merge_range(r_sub, CMP_COL_ACTION, r_sub, CMP_COL_SOURCE_REF)
 
 
 def _write_comparison_grand_total(
     ws: Worksheet, tot_row: int, subtotal_rows: Sequence[int],
     tot_bef_ms: float, tot_aft_ms: float, tot_lstar_ms: float,
 ) -> None:
-    ws.set_cell(tot_row, 1, "WHOLE-MODEL TOTAL (Exposed Sum across All Archetypes)", style=STYLE_TOTAL_TEXT)
+    ws.set_cell(tot_row, 1, "WHOLE-MODEL TOTAL (实际暴露耗时合计 = Sheet 1 Step Latency)", style=STYLE_TOTAL_TEXT)
     ws.merge_range(tot_row, 1, tot_row, CMP_SUBTOTAL_LABEL_END_COL)
-    sum_i = "=" + "+".join(f"I{r}" for r in subtotal_rows) if subtotal_rows else "=0"
-    sum_o = "=" + "+".join(f"O{r}" for r in subtotal_rows) if subtotal_rows else "=0"
-    sum_s = "=" + "+".join(f"S{r}" for r in subtotal_rows) if subtotal_rows else "=0"
-    ws.set_cell(tot_row, CMP_COL_BEF_MS, tot_bef_ms, formula=sum_i, style=STYLE_TOTAL_FLOAT3)
+    sum_j = "=" + "+".join(f"J{r}" for r in subtotal_rows) if subtotal_rows else "=0"
+    sum_p = "=" + "+".join(f"P{r}" for r in subtotal_rows) if subtotal_rows else "=0"
+    sum_t = "=" + "+".join(f"T{r}" for r in subtotal_rows) if subtotal_rows else "=0"
+    ws.set_cell(tot_row, CMP_COL_BEF_EXP_MS, tot_bef_ms, formula=sum_j, style=STYLE_TOTAL_FLOAT3)
     ws.set_cell(tot_row, CMP_COL_BEF_BOUND, "", style=STYLE_TOTAL_TEXT)
-    ws.merge_range(tot_row, CMP_COL_BEF_BOUND, tot_row, CMP_COL_STREAM)
-    ws.set_cell(tot_row, CMP_COL_AFT_MS, tot_aft_ms, formula=sum_o, style=STYLE_TOTAL_FLOAT3)
-    ws.set_cell(tot_row, CMP_COL_SAVED_MS, tot_bef_ms - tot_aft_ms, formula=f"=I{tot_row}-O{tot_row}", style=STYLE_TOTAL_FLOAT3)
+    ws.merge_range(tot_row, CMP_COL_BEF_BOUND, tot_row, CMP_COL_AFT_EXP_US)
+    ws.set_cell(tot_row, CMP_COL_AFT_EXP_MS, tot_aft_ms, formula=sum_p, style=STYLE_TOTAL_FLOAT3)
+    ws.set_cell(tot_row, CMP_COL_SAVED_MS, tot_bef_ms - tot_aft_ms, formula=f"=J{tot_row}-P{tot_row}", style=STYLE_TOTAL_FLOAT3)
     spd = (tot_bef_ms / tot_aft_ms) if tot_aft_ms > 0.0 else 0.0
-    ws.set_cell(tot_row, CMP_COL_SPEEDUP, spd, formula=f"=IF(O{tot_row}>0,I{tot_row}/O{tot_row},0)", style=STYLE_SUBTOTAL_RATIO)
+    ws.set_cell(tot_row, CMP_COL_SPEEDUP, spd, formula=f"=IF(P{tot_row}>0,J{tot_row}/P{tot_row},0)", style=STYLE_SUBTOTAL_RATIO)
     ws.set_cell(tot_row, CMP_COL_AFT_BOUND, "", style=STYLE_TOTAL_TEXT)
-    ws.set_cell(tot_row, CMP_COL_LSTAR_MS, tot_lstar_ms, formula=sum_s, style=STYLE_TOTAL_FLOAT3)
-    ws.set_cell(tot_row, CMP_COL_GAP_MS, max(0.0, tot_aft_ms - tot_lstar_ms), formula=f"=MAX(0,O{tot_row}-S{tot_row})", style=STYLE_TOTAL_FLOAT3)
-    ws.set_cell(tot_row, CMP_COL_ACTION, "Live formula totals (zero double-counting)", style=STYLE_TOTAL_TEXT)
+    ws.set_cell(tot_row, CMP_COL_LSTAR_MS, tot_lstar_ms, formula=sum_t, style=STYLE_TOTAL_FLOAT3)
+    ws.set_cell(tot_row, CMP_COL_GAP_MS, max(0.0, tot_aft_ms - tot_lstar_ms), formula=f"=MAX(0,P{tot_row}-T{tot_row})", style=STYLE_TOTAL_FLOAT3)
+    ws.set_cell(tot_row, CMP_COL_ACTION, "100% 守恒公式合计（零重复计数）", style=STYLE_TOTAL_TEXT)
+    ws.merge_range(tot_row, CMP_COL_ACTION, tot_row, CMP_COL_SOURCE_REF)
 
 
 def _populate_standalone_breakdown_sheet(ws: Worksheet, bundle: ExportBundle) -> None:
@@ -957,10 +1147,12 @@ def _populate_standalone_breakdown_sheet(ws: Worksheet, bundle: ExportBundle) ->
     )
     headers = (
         "Archetype (Scope & Layer Range)", "Repeats (×N)", "Submodule",
-        "Logical Role", "Rank-Local Shapes & Dtype", "Ascend Kernel [Backend]",
-        "Kernel Status (算子状态/开发需求)", "Source Ref", "Stream / Overlap",
-        "Single Pred (us)", "Model Exposed (ms)", "Lean L* Single (us)",
-        "Lean L* Model (ms)", "Gap vs L* (ms)", "Bottleneck Bound",
+        "Logical Role (带作用域标注)", "并发流与掩盖关系 (Stream & Masking)",
+        "Rank-Local Shapes & Dtype", "Ascend Kernel [Backend]",
+        "Kernel Status (算子状态/开发需求)",
+        "流内单次 (us)", "单次暴露 (us)", "全网暴露 (ms)",
+        "Lean L* Single (us)", "Lean L* Model (ms)", "Gap vs L* (ms)",
+        "Bottleneck Bound", "源码出处 / Source Ref",
     )
     _write_headers(ws, 2, headers)
 
@@ -982,25 +1174,27 @@ def _populate_standalone_breakdown_sheet(ws: Worksheet, bundle: ExportBundle) ->
             r = row_cursor
             ws.set_row_height(r, WRAP_ROW_HEIGHT_PT)
             rep = max(1, int(op.repeat_count))
-            stream_lbl = _stream_overlap_label(op)
-            exp_ms = 0.0 if op.is_overlapped else (op.dur_us * rep / US_PER_MS)
-            l_ms = op.l_star_lean_us * rep / US_PER_MS
+            stream_txt, stream_style = _stream_masking_badge(op)
+            exp_us = 0.0 if op.is_overlapped else op.exposed_dur_us
+            exp_ms = exp_us * rep / US_PER_MS
+            l_ms = 0.0 if op.is_overlapped else (op.l_star_lean_us * rep / US_PER_MS)
             arch_ms += exp_ms
             arch_lstar_ms += l_ms
             ws.set_cell(r, STD_COL_REP, rep, style=STYLE_INT)
             _write_row(ws, r, (
                 (op.logical_role or op.op_id, None, STYLE_TEXT_WRAP),
+                (stream_txt, None, stream_style),
                 (op.tensor_contract, None, STYLE_TEXT_WRAP),
                 (_kernel_with_backend(op), None, STYLE_TEXT_WRAP),
                 (op.kernel_status, None, STYLE_NEW_KERNEL if op.needs_new_kernel else STYLE_TEXT_WRAP),
-                (op.source_ref, None, STYLE_TEXT_WRAP),
-                (stream_lbl, None, STYLE_OVERLAP if op.is_overlapped else STYLE_TEXT_WRAP),
                 (op.dur_us, None, STYLE_FLOAT3),
-                (exp_ms, f'=IF(ISNUMBER(SEARCH("Overlapped",I{r})),0,J{r}*B{r}/1000)', STYLE_FLOAT3),
+                (exp_us, None, STYLE_FLOAT3),
+                (exp_ms, f"=J{r}*B{r}/1000", STYLE_FLOAT3),
                 (op.l_star_lean_us, None, STYLE_FLOAT3),
                 (l_ms, f"=L{r}*B{r}/1000", STYLE_FLOAT3),
                 (max(0.0, exp_ms - l_ms), f"=MAX(0,K{r}-M{r})", STYLE_FLOAT3),
                 (op.bound_display, None, STYLE_OVERLAP if op.is_overlapped else STYLE_TEXT),
+                (op.source_ref or "-", None, STYLE_MUTED_TEXT),
             ), start_col=STD_COL_ROLE)
             _extend_span(sub_spans, op.submodule, r, r)
             row_cursor += 1
@@ -1013,25 +1207,27 @@ def _populate_standalone_breakdown_sheet(ws: Worksheet, bundle: ExportBundle) ->
         r_sub = row_cursor
         ws.set_cell(r_sub, 1, f"Subtotal — {arch_title}", style=STYLE_SUBTOTAL_TEXT)
         ws.merge_range(r_sub, 1, r_sub, STD_SUBTOTAL_LABEL_END_COL)
-        ws.set_cell(r_sub, STD_COL_MS, arch_ms, formula=f"=SUM(K{arch_start}:K{arch_end})", style=STYLE_SUBTOTAL_NUM)
+        ws.set_cell(r_sub, STD_COL_EXP_MS, arch_ms, formula=f"=SUM(K{arch_start}:K{arch_end})", style=STYLE_SUBTOTAL_NUM)
         ws.set_cell(r_sub, STD_COL_LSTAR_US, "", style=STYLE_SUBTOTAL_TEXT)
         ws.set_cell(r_sub, STD_COL_LSTAR_MS, arch_lstar_ms, formula=f"=SUM(M{arch_start}:M{arch_end})", style=STYLE_SUBTOTAL_NUM)
         ws.set_cell(r_sub, STD_COL_GAP_MS, max(0.0, arch_ms - arch_lstar_ms), formula=f"=MAX(0,K{r_sub}-M{r_sub})", style=STYLE_SUBTOTAL_NUM)
         ws.set_cell(r_sub, STD_COL_BOUND, "", style=STYLE_SUBTOTAL_TEXT)
+        ws.merge_range(r_sub, STD_COL_BOUND, r_sub, STD_COL_SOURCE_REF)
         subtotal_rows.append(r_sub)
         tot_ms += arch_ms
         tot_lstar_ms += arch_lstar_ms
         row_cursor += 1
 
-    ws.set_cell(row_cursor, 1, "WHOLE-MODEL TOTAL (Exposed Sum)", style=STYLE_TOTAL_TEXT)
+    ws.set_cell(row_cursor, 1, "WHOLE-MODEL TOTAL (实际暴露耗时合计)", style=STYLE_TOTAL_TEXT)
     ws.merge_range(row_cursor, 1, row_cursor, STD_SUBTOTAL_LABEL_END_COL)
     sum_k = "=" + "+".join(f"K{r}" for r in subtotal_rows) if subtotal_rows else "=0"
     sum_m = "=" + "+".join(f"M{r}" for r in subtotal_rows) if subtotal_rows else "=0"
-    ws.set_cell(row_cursor, STD_COL_MS, tot_ms, formula=sum_k, style=STYLE_TOTAL_FLOAT3)
+    ws.set_cell(row_cursor, STD_COL_EXP_MS, tot_ms, formula=sum_k, style=STYLE_TOTAL_FLOAT3)
     ws.set_cell(row_cursor, STD_COL_LSTAR_US, "", style=STYLE_TOTAL_TEXT)
     ws.set_cell(row_cursor, STD_COL_LSTAR_MS, tot_lstar_ms, formula=sum_m, style=STYLE_TOTAL_FLOAT3)
     ws.set_cell(row_cursor, STD_COL_GAP_MS, max(0.0, tot_ms - tot_lstar_ms), formula=f"=MAX(0,K{row_cursor}-M{row_cursor})", style=STYLE_TOTAL_FLOAT3)
     ws.set_cell(row_cursor, STD_COL_BOUND, f"{len(bundle.operators)} archetype ops", style=STYLE_TOTAL_TEXT)
+    ws.merge_range(row_cursor, STD_COL_BOUND, row_cursor, STD_COL_SOURCE_REF)
 
 
 def _populate_memory_control_panel(ws: Worksheet, mem: MemoryCalculatorLedger) -> None:
@@ -1042,6 +1238,8 @@ def _populate_memory_control_panel(ws: Worksheet, mem: MemoryCalculatorLedger) -
         ("Weight Quant Preset", mem.weight_quant, None, STYLE_INPUT_TEXT),
         ("KV/Indexer/KeyPool Dtype", mem.cache_dtype, None, STYLE_INPUT_TEXT),
         ("Engram / PLE Host Offload", "ON" if mem.engram_host_offload else "OFF", None, STYLE_INPUT_TEXT),
+        ("Apply Preset To Ignored Attn/Linear", "ON" if mem.apply_preset_to_ignored else "OFF", None, STYLE_INPUT_TEXT),
+        ("Include Vision Tower (ViT)", "ON" if mem.include_vision_tower else "OFF", None, STYLE_INPUT_TEXT),
         ("DP", mem.dp, None, STYLE_INPUT_NUM),
         ("TP", mem.tp, None, STYLE_INPUT_NUM),
         ("EP", mem.ep, None, STYLE_INPUT_NUM),
@@ -1050,25 +1248,27 @@ def _populate_memory_control_panel(ws: Worksheet, mem: MemoryCalculatorLedger) -
         ("PCP", mem.pcp, None, STYLE_INPUT_NUM),
         ("Local-TP (o/q_proj)", mem.local_tp, None, STYLE_INPUT_NUM),
         ("Shared-TP", mem.shared_tp, None, STYLE_INPUT_NUM),
-        ("Total Cluster Dies", mem.total_dies, "=R6*R7*R9*R11", STYLE_INT),
+        ("Total Cluster Dies", mem.total_dies, "=T8*T9*T11*T13", STYLE_INT),
         ("Sequence Length (tok)", mem.seq_len, None, STYLE_INPUT_NUM),
         ("Concurrency (per DP)", mem.concurrency, None, STYLE_INPUT_NUM),
         ("Cache Block Size", mem.block_size, None, STYLE_INPUT_NUM),
         ("Spec / MTP Tokens", mem.spec_tokens, None, STYLE_INPUT_NUM),
-        ("Local Cache Tokens / Rank", mem.local_cache_tokens, "=ROUNDUP(R15/(R17*R10),0)*R17", STYLE_INT),
+        ("Local Cache Tokens / Rank", mem.local_cache_tokens, "=ROUNDUP(T17/(T19*T12),0)*T19", STYLE_INT),
         ("Die HBM Capacity (GiB)", mem.die_hbm_capacity_bytes / float(GIB_BYTES), None, STYLE_FLOAT2),
         ("GPU Memory Utilization", mem.gpu_memory_utilization, None, STYLE_PCT),
-        ("Usable Die HBM Budget (GiB)", mem.usable_hbm_bytes / float(GIB_BYTES), "=R20*R21", STYLE_TOTAL_NUM),
-        ("Quant Exclusion Policy", mem.weight_quant_display or mem.weight_quant, None, STYLE_TEXT_WRAP),
+        ("Usable Die HBM Budget (GiB)", mem.usable_hbm_bytes / float(GIB_BYTES), "=T22*T23", STYLE_TOTAL_NUM),
+        ("Quant Policy (QuaRot First)", mem.weight_quant_display or mem.weight_quant, None, STYLE_TEXT_WRAP),
     )
     for offset, (label, val, formula, style) in enumerate(controls):
         r = MEMORY_TABLE_HEADER_ROW + offset
         ws.set_cell(r, c_lbl, label, style=STYLE_TEXT)
         ws.set_cell(r, c_val, val, formula=formula, style=style)
 
-    ws.add_data_validation("R3", formula1='"' + ",".join(SUPPORTED_WEIGHT_QUANTS) + '"')
-    ws.add_data_validation("R4", formula1='"' + ",".join(SUPPORTED_CACHE_DTYPES) + '"')
-    ws.add_data_validation("R5", formula1='"ON,OFF"')
+    ws.add_data_validation("T3", formula1='"' + ",".join(SUPPORTED_WEIGHT_QUANTS) + '"')
+    ws.add_data_validation("T4", formula1='"' + ",".join(SUPPORTED_CACHE_DTYPES) + '"')
+    ws.add_data_validation("T5", formula1='"ON,OFF"')
+    ws.add_data_validation("T6", formula1='"OFF,ON"')
+    ws.add_data_validation("T7", formula1='"OFF,ON"')
 
     ws.set_cell(2, MEMORY_LOOKUP_START_COL, "Quant Format Storage Rules", style=STYLE_SECTION)
     ws.merge_range(2, MEMORY_LOOKUP_START_COL, 2, MEMORY_COLS)
@@ -1082,6 +1282,19 @@ def _populate_memory_control_panel(ws: Worksheet, mem: MemoryCalculatorLedger) -
         ), start_col=MEMORY_LOOKUP_START_COL)
 
 
+def _quant_format_formula(quant_rule: str) -> str | None:
+    """Return live Excel formula linking Col J (Quant Format) to Control Panel $T$3 & $T$6."""
+    if quant_rule == QUANT_RULE_FIXED_BF16:
+        return None
+    if quant_rule == QUANT_RULE_FIXED_FP32:
+        return None
+    if quant_rule == QUANT_RULE_PRESET_LINEAR_FP8:
+        return f'=IF({MEM_CTL_QUANT_REF}="W4A8","W8A8",IF({MEM_CTL_QUANT_REF}="MXFP4","MXFP8",{MEM_CTL_QUANT_REF}))'
+    if quant_rule == QUANT_RULE_CHECKPOINT_IGNORE:
+        return f'=IF({MEM_CTL_OVERRIDE_IGN_REF}="ON",IF({MEM_CTL_QUANT_REF}="W4A8","W8A8",IF({MEM_CTL_QUANT_REF}="MXFP4","MXFP8",{MEM_CTL_QUANT_REF})),"BF16")'
+    return f"={MEM_CTL_QUANT_REF}"
+
+
 def _populate_memory_sheet(ws: Worksheet, bundle: ExportBundle) -> None:
     mem = bundle.memory_ledger
     _apply_col_widths(ws, MEMORY_COL_WIDTHS)
@@ -1092,62 +1305,94 @@ def _populate_memory_sheet(ws: Worksheet, bundle: ExportBundle) -> None:
         STYLE_TITLE,
     )
     _populate_memory_control_panel(ws, mem)
-    ws.set_cell(2, 1, "1. Per-Die Weight + Quant Scale Closed-Form Table (Post-TP Local Shapes, Respecting quant.exclusions)", style=STYLE_SECTION)
+    ws.set_cell(2, 1, "1. Per-Die Weight + Quant Scale Closed-Form Table (Side-by-Side 原生 BF16 vs 量化后; Mixed W4A8/MXFP4 & QuaRot Toggles)", style=STYLE_SECTION)
     ws.merge_range(2, 1, 2, MEMORY_TABLE_END_COL)
     w_headers = (
         "Group", "Tensor Name", "Global Rows", "Global Cols", "Shard Rule",
-        "Local Rows", "Local Cols", "Max Stage Rep", "Quant Format",
-        "Payload (B)", "MX Scale (B)", "Channel Aux (B)", "Per-Die (GiB)", "Residency & Quant Policy",
+        "Local Rows", "Local Cols", "Max Stage Rep", "Quant Rule", "Quant Format",
+        "Payload (B)", "MX Scale (B)", "Channel Aux (B)",
+        "原生 BF16 单卡 (GiB)", "当前量化后单卡 (GiB, 含 Scale)", "Residency & Quant Policy",
     )
     _write_headers(ws, MEMORY_TABLE_HEADER_ROW, w_headers)
 
-    lookup_ref = f"$S${MEMORY_LOOKUP_FIRST_ROW}:$V${MEMORY_LOOKUP_LAST_ROW}"
+    lookup_ref = f"$U${MEMORY_LOOKUP_FIRST_ROW}:$X${MEMORY_LOOKUP_LAST_ROW}"
     w_start = MEMORY_TABLE_HEADER_ROW + 1
     group_spans: list[tuple[str, int, int]] = []
     for idx, row in enumerate(mem.weight_rows):
         r = w_start + idx
         _extend_span(group_spans, row.group, r, r)
         if row.is_engram_or_ple:
-            res_text = "Host DRAM" if mem.engram_host_offload else "NPU HBM"
-            res_formula: str | None = '=IF($R$5="ON","Host DRAM","NPU HBM")'
+            res_text = "Host DRAM (Offload)" if mem.engram_host_offload else "NPU HBM (Engram/PLE)"
+            res_formula: str | None = f'=IF({MEM_CTL_OFFLOAD_REF}="ON","Host DRAM (Offload)","NPU HBM (Engram/PLE)")'
+        elif row.is_vision:
+            res_text = "NPU HBM (Vision ViT)" if mem.include_vision_tower else "Excluded Vision (Text-Only)"
+            res_formula = f'=IF({MEM_CTL_VIT_REF}="ON","NPU HBM (Vision ViT)","Excluded Vision (Text-Only)")'
         else:
             res_text = f"NPU HBM ({row.quant_note})" if row.quant_note else "NPU HBM"
             res_formula = None
+        q_formula = _quant_format_formula(row.quant_rule)
+        native_gib = float(row.native_bf16_bytes) / float(GIB_BYTES)
         _write_row(ws, r, (
             (row.name, None, STYLE_TEXT), (row.global_rows, None, STYLE_INT),
             (row.global_cols, None, STYLE_INT), (row.shard_rule, None, STYLE_TEXT),
             (row.local_rows, None, STYLE_INT), (row.local_cols, None, STYLE_INT),
-            (row.max_stage_repeats, None, STYLE_INT), (row.quant_format, None, STYLE_INPUT_TEXT),
-            (row.payload_bytes, f"=F{r}*ROUNDUP(G{r}*VLOOKUP(I{r},{lookup_ref},2,FALSE),0)*H{r}", STYLE_INT),
-            (row.scale_bytes, f"=IF(VLOOKUP(I{r},{lookup_ref},3,FALSE)>0,F{r}*ROUNDUP(G{r}/VLOOKUP(I{r},{lookup_ref},3,FALSE),0)*H{r},0)", STYLE_INT),
-            (row.aux_bytes, f"=F{r}*VLOOKUP(I{r},{lookup_ref},4,FALSE)*H{r}", STYLE_INT),
-            (float(row.per_die_bytes) / float(GIB_BYTES), f"=(J{r}+K{r}+L{r})/{GIB_BYTES}", STYLE_FLOAT3),
-            (res_text, res_formula, STYLE_TEXT),
+            (row.max_stage_repeats, None, STYLE_INT),
+            (row.quant_rule, None, STYLE_TEXT),
+            (row.quant_format, q_formula, STYLE_INPUT_TEXT if q_formula else STYLE_TEXT),
+            (row.payload_bytes, f"=F{r}*ROUNDUP(G{r}*VLOOKUP(J{r},{lookup_ref},2,FALSE),0)*H{r}", STYLE_INT),
+            (row.scale_bytes, f"=IF(VLOOKUP(J{r},{lookup_ref},3,FALSE)>0,F{r}*ROUNDUP(G{r}/VLOOKUP(J{r},{lookup_ref},3,FALSE),0)*H{r},0)", STYLE_INT),
+            (row.aux_bytes, f"=F{r}*VLOOKUP(J{r},{lookup_ref},4,FALSE)*H{r}", STYLE_INT),
+            (native_gib, f"=F{r}*G{r}*{BF16_BYTES}*H{r}/{GIB_BYTES}", STYLE_FLOAT3),
+            (float(row.per_die_bytes) / float(GIB_BYTES), f"=(K{r}+L{r}+M{r})/{GIB_BYTES}", STYLE_FLOAT3),
+            (res_text, res_formula, STYLE_OVERLAP if row.is_engram_or_ple or row.is_vision else STYLE_TEXT),
         ), start_col=2)
     for grp, r1, r2 in group_spans:
         ws.set_cell(r1, 1, grp, style=STYLE_MERGED)
         ws.merge_range(r1, 1, r2, 1)
 
     w_end = w_start + len(mem.weight_rows) - 1
-    if w_end >= w_start:
-        ws.add_data_validation(f"I{w_start}:I{w_end}", formula1='"' + ",".join(MEMORY_QUANT_LOOKUP_ORDER) + '"')
-    w_tot = w_end + 1
-    ws.set_cell(w_tot, 1, "Weights Total (Max Stage)", style=STYLE_TOTAL_TEXT)
-    ws.merge_range(w_tot, 1, w_tot, MEMORY_WEIGHT_MERGE_END_COL)
-    weight_totals = (
-        sum(x.payload_bytes for x in mem.weight_rows),
-        sum(x.scale_bytes for x in mem.weight_rows),
-        sum(x.aux_bytes for x in mem.weight_rows),
-        sum(x.per_die_bytes for x in mem.weight_rows) / float(GIB_BYTES),
-    )
-    for offset, tot_v in enumerate(weight_totals):
-        col = MEMORY_WEIGHT_SUM_START_COL + offset
-        c_let = column_letter(col)
-        formula = f"=SUM({c_let}{w_start}:{c_let}{w_end})" if w_end >= w_start else "=0"
-        ws.set_cell(w_tot, col, tot_v, formula=formula, style=STYLE_TOTAL_NUM)
-    ws.set_cell(w_tot, MEMORY_TABLE_END_COL, f"{len(mem.weight_rows)} tensors", style=STYLE_TOTAL_TEXT)
+    w_tot_hbm = w_end + 1
+    w_tot_host = w_end + 2
+    w_tot_vit = w_end + 3
 
-    cache_end = _populate_cache_block(ws, w_tot + 2, mem)
+    def _sumifs_row(
+        r_idx: int, label: str, crit: str, pred_fn: Any, note_txt: str,
+        t_st: int, n_st: int,
+    ) -> None:
+        ws.set_cell(r_idx, 1, label, style=t_st)
+        ws.merge_range(r_idx, 1, r_idx, MEMORY_WEIGHT_MERGE_END_COL)
+        matched = [x for x in mem.weight_rows if pred_fn(x)]
+        vals = (
+            sum(x.payload_bytes for x in matched),
+            sum(x.scale_bytes for x in matched),
+            sum(x.aux_bytes for x in matched),
+            sum(x.native_bf16_bytes for x in matched) / float(GIB_BYTES),
+            sum(x.per_die_bytes for x in matched) / float(GIB_BYTES),
+        )
+        for offset, tot_v in enumerate(vals):
+            col = MEMORY_WEIGHT_SUM_START_COL + offset
+            c_let = column_letter(col)
+            f_str = f'=SUMIFS({c_let}{w_start}:{c_let}{w_end},$P${w_start}:$P${w_end},"{crit}")' if w_end >= w_start else "=0"
+            ws.set_cell(r_idx, col, tot_v, formula=f_str, style=n_st)
+        ws.set_cell(r_idx, MEMORY_TABLE_END_COL, note_txt, style=t_st)
+
+    _sumifs_row(
+        w_tot_hbm, "NPU HBM Weights Total (GiB, 仅计入 NPU HBM 驻留张量)", "NPU HBM*",
+        lambda x: (not (x.is_engram_or_ple and mem.engram_host_offload)) and (not (x.is_vision and not mem.include_vision_tower)),
+        f"压缩比 {mem.weight_compression_ratio:.2f}x (vs 原生 BF16)", STYLE_TOTAL_TEXT, STYLE_TOTAL_NUM,
+    )
+    _sumifs_row(
+        w_tot_host, "Host DRAM Offload Total (GiB, Engram/PLE 卸载至主机内存)", "Host DRAM*",
+        lambda x: x.is_engram_or_ple and mem.engram_host_offload,
+        "不计入 NPU HBM 预算", STYLE_SUBTOTAL_TEXT, STYLE_SUBTOTAL_NUM,
+    )
+    _sumifs_row(
+        w_tot_vit, "Excluded Vision Tower Total (GiB, 纯文本默认不加载 ViT)", "Excluded*",
+        lambda x: x.is_vision and not mem.include_vision_tower,
+        "切 T7=ON 可计入多模态显存", STYLE_SUBTOTAL_TEXT, STYLE_SUBTOTAL_NUM,
+    )
+
+    cache_end = _populate_cache_block(ws, w_tot_vit + 2, mem)
     _populate_stage_budget_block(ws, cache_end + 2, mem)
 
 
@@ -1166,7 +1411,7 @@ def _populate_cache_block(ws: Worksheet, start_row: int, mem: MemoryCalculatorLe
     for offset, row in enumerate(mem.cache_rows):
         r = c_start + offset
         if row.scales_with_tokens:
-            req_formula = f"=C{r}*D{r}*$R$19/{MIB_BYTES}"
+            req_formula = f"=C{r}*D{r}*{MEM_CTL_LOCAL_TOK_REF}/{MIB_BYTES}"
             basis = f"Scales with Local Cache Tokens (BF16/C8/FP8={mem.cache_dtype}, ratio={C8_CACHE_FACTOR:.4f}x for C8)"
         else:
             req_formula = None
@@ -1175,7 +1420,7 @@ def _populate_cache_block(ws: Worksheet, start_row: int, mem: MemoryCalculatorLe
             (row.component, None, STYLE_TEXT), (row.cache_kind, None, STYLE_TEXT),
             (row.max_stage_layers, None, STYLE_INT), (row.bytes_per_token_per_layer, None, STYLE_FLOAT2),
             (row.per_request_bytes / float(MIB_BYTES), req_formula, STYLE_FLOAT3),
-            (row.batch_total_bytes / float(GIB_BYTES), f"=E{r}*$R$16/{MIB_PER_GIB}", STYLE_FLOAT3),
+            (row.batch_total_bytes / float(GIB_BYTES), f"=E{r}*{MEM_CTL_CONC_REF}/{MIB_PER_GIB}", STYLE_FLOAT3),
             (basis, None, STYLE_TEXT),
         ))
         ws.merge_range(r, MEMORY_CACHE_BASIS_START_COL, r, MEMORY_TABLE_END_COL)
@@ -1220,13 +1465,13 @@ def _populate_stage_budget_block(ws: Worksheet, start_row: int, mem: MemoryCalcu
             (f"Stage {st.stage}", None, STYLE_MERGED), (st.owned_layers, None, STYLE_INT),
             (st.weight_payload_bytes / float(GIB_BYTES), None, STYLE_FLOAT3),
             (st.weight_scale_aux_bytes / float(GIB_BYTES), None, STYLE_FLOAT3),
-            (st.engram_ple_hbm_bytes / float(GIB_BYTES), f'=IF($R$5="ON",0,N{r})', STYLE_FLOAT3),
-            (st.engram_ple_host_bytes / float(GIB_BYTES), f'=IF($R$5="ON",N{r},0)', STYLE_FLOAT3),
+            (st.engram_ple_hbm_bytes / float(GIB_BYTES), f'=IF({MEM_CTL_OFFLOAD_REF}="ON",0,N{r})', STYLE_FLOAT3),
+            (st.engram_ple_host_bytes / float(GIB_BYTES), f'=IF({MEM_CTL_OFFLOAD_REF}="ON",N{r},0)', STYLE_FLOAT3),
             (st.cache_bytes / float(GIB_BYTES), None, STYLE_FLOAT3),
             (st.workspace_peak_bytes / float(GIB_BYTES), None, STYLE_FLOAT3),
             (st.reserve_bytes / float(GIB_BYTES), None, STYLE_FLOAT3),
             (st.total_hbm_bytes / float(GIB_BYTES), f"=SUM(C{r}:E{r},G{r}:I{r})", STYLE_FLOAT3),
-            (st.usable_hbm_budget_bytes / float(GIB_BYTES), "=$R$22", STYLE_FLOAT3),
+            (st.usable_hbm_budget_bytes / float(GIB_BYTES), f"={MEM_CTL_USABLE_HBM_REF}", STYLE_FLOAT3),
             (st.headroom_bytes / float(GIB_BYTES), f"=K{r}-J{r}", STYLE_FLOAT3),
             ("PASS" if st.fits_hbm else "OOM", f'=IF(J{r}<=K{r},"PASS","OOM")', STYLE_ALERT_OK if st.fits_hbm else STYLE_ALERT_HIGH),
             (raw_engram_gib, None, STYLE_FLOAT3),
@@ -1270,23 +1515,29 @@ def _write_pending_kernel_card(
     idx_row: int,
     item: PendingKernelItem,
     target_bundle: ExportBundle,
-    agent_designs: Mapping[str, Mapping[str, str]] | None,
+    agent_designs: Mapping[str, Any] | None,
 ) -> None:
-    """Render one structured 8-row per-kernel detail card on Sheet 4."""
+    """Render one structured 10-row 3-track per-kernel detail card on Sheet 4."""
     is_new = item.category == PENDING_KIND_TO_IMPLEMENT
     cat_style = STYLE_NEW_KERNEL if is_new else STYLE_OPT_BADGE
-    design_ov, accept_ov = _lookup_agent_design(agent_designs, item.kernel_key, item.target_kernel, item.logical_role)
+    ov = _lookup_agent_design_bundle(
+        agent_designs,
+        card_id=item.card_id,
+        kernel_key=item.kernel_key,
+        target_kernel=item.target_kernel,
+        logical_role=item.logical_role,
+    )
 
     ws.set_row_height(card_start, HEADER_ROW_HEIGHT_PT)
     _write_banner(
         ws, card_start, PENDING_COLS,
-        f"Card #{item.priority} | [{item.category}] {item.target_kernel} — {item.logical_role} | 预期收益/空间: {item.expected_gain_ms:.3f} ms ({item.total_calls_per_step} calls/step)",
+        f"Card #{item.priority} [{item.card_id}] | [{item.category}] {item.target_kernel} — {item.logical_role} | 净省 Δ={item.expected_gain_ms:.3f} ms ({item.total_calls_per_step} calls/step)",
         STYLE_CARD_HDR,
     )
 
     r_st = card_start + PENDING_CARD_ROW_STACK
     ws.set_row_height(r_st, WRAP_ROW_HEIGHT_PT)
-    ws.set_cell(r_st, 1, "分类 & 开发/优化状态", style=STYLE_MERGED)
+    ws.set_cell(r_st, 1, "分类 & 优化状态", style=STYLE_MERGED)
     ws.merge_range(r_st, 1, r_st, PENDING_CARD_LBL_END)
     ws.set_cell(r_st, PENDING_CARD_LEFT_START, f"{item.category} | {item.status}", style=cat_style)
     ws.merge_range(r_st, PENDING_CARD_LEFT_START, r_st, PENDING_CARD_LEFT_END)
@@ -1301,7 +1552,7 @@ def _write_pending_kernel_card(
     ws.set_cell(r_ch, PENDING_CARD_LEFT_START, item.replaces_chain, style=STYLE_TEXT_WRAP)
     ws.merge_range(r_ch, PENDING_CARD_LEFT_START, r_ch, PENDING_CARD_LEFT_END)
     ws.set_cell(r_ch, PENDING_CARD_MID_COL, "源码出处 (Source Ref)", style=STYLE_MERGED)
-    ws.set_cell(r_ch, PENDING_CARD_RIGHT_START, item.source_refs or "-", style=STYLE_TEXT_WRAP)
+    ws.set_cell(r_ch, PENDING_CARD_RIGHT_START, item.source_refs or "-", style=STYLE_MUTED_TEXT)
     ws.merge_range(r_ch, PENDING_CARD_RIGHT_START, r_ch, PENDING_COLS)
 
     r_fr = card_start + PENDING_CARD_ROW_FREQ
@@ -1314,51 +1565,35 @@ def _write_pending_kernel_card(
     ws.set_cell(r_fr, PENDING_CARD_RIGHT_START, item.expected_gain_ms, formula=f"=G{idx_row}", style=STYLE_KPI_HIGHLIGHT)
     ws.set_cell(
         r_fr, PENDING_CARD_NOTE_START,
-        f"Before={item.before_model_ms:.3f}ms -> After={item.after_model_ms:.3f}ms | L*={item.lstar_model_ms:.3f}ms (Gap={item.gap_vs_lstar_ms:.3f}ms)",
+        f"Before={item.before_model_ms:.3f}ms -> After={item.after_model_ms:.3f}ms | L*={item.lstar_model_ms:.3f}ms (L* 达成率 {item.before_attainment_pct:.1f}% -> {item.target_attainment_pct:.1f}%)",
         style=STYLE_TEXT_WRAP,
     )
     ws.merge_range(r_fr, PENDING_CARD_NOTE_START, r_fr, PENDING_COLS)
 
-    r_sh = card_start + PENDING_CARD_ROW_SHAPE
-    ws.set_row_height(r_sh, WRAP_ROW_HEIGHT_PT)
-    ws.set_cell(r_sh, 1, "Rank-Local 形状/精度/步长契约", style=STYLE_MERGED)
-    ws.merge_range(r_sh, 1, r_sh, PENDING_CARD_LBL_END)
-    ws.set_cell(
-        r_sh, PENDING_CARD_LEFT_START,
-        f"{item.tensor_contract} | Layout/Stride: Rank-Local Contiguous ND/NZ | {target_bundle.hardware_die_summary}",
-        style=STYLE_TEXT_WRAP,
+    full_width_rows = (
+        (PENDING_CARD_ROW_SHAPE, WRAP_ROW_HEIGHT_PT, "Rank-Local 形状/精度/步长契约", f"{item.tensor_contract} | Layout/Stride: Rank-Local Contiguous ND/NZ | {target_bundle.hardware_die_summary}", STYLE_TEXT_WRAP),
+        (PENDING_CARD_ROW_BOUND, WRAP_ROW_HEIGHT_PT, "瓶颈迁移 & L* 目标", item.microarch_target, STYLE_TEXT_WRAP),
+        (PENDING_CARD_ROW_CONFIG, CARD_ACCEPT_ROW_HEIGHT_PT, "① 已有特效开关与通信展开配置 (Config & Env)", ov["config_howto"] or item.config_howto, STYLE_OVERLAP),
+        (PENDING_CARD_ROW_KERNEL, CARD_DESIGN_ROW_HEIGHT_PT, "② 算子新写 / 调优方案 (Kernel & Tiling)", ov["kernel_design"] or item.kernel_action or item.default_design_slot, STYLE_INPUT_TEXT_WRAP),
+        (PENDING_CARD_ROW_FRAMEWORK, CARD_ACCEPT_ROW_HEIGHT_PT, "③ 推理框架改造要点 (vllm-ascend)", ov["framework_work"] or item.framework_action, STYLE_OPT_BADGE),
+        (PENDING_CARD_ROW_ACCEPT, CARD_ACCEPT_ROW_HEIGHT_PT, "风险与验收标准 (Risks & Acceptance)", ov["acceptance"] or item.default_acceptance_slot, STYLE_TEXT_WRAP),
     )
-    ws.merge_range(r_sh, PENDING_CARD_LEFT_START, r_sh, PENDING_COLS)
-
-    r_bd = card_start + PENDING_CARD_ROW_BOUND
-    ws.set_row_height(r_bd, WRAP_ROW_HEIGHT_PT)
-    ws.set_cell(r_bd, 1, "瓶颈迁移 & L* 目标", style=STYLE_MERGED)
-    ws.merge_range(r_bd, 1, r_bd, PENDING_CARD_LBL_END)
-    ws.set_cell(r_bd, PENDING_CARD_LEFT_START, item.microarch_target, style=STYLE_TEXT_WRAP)
-    ws.merge_range(r_bd, PENDING_CARD_LEFT_START, r_bd, PENDING_COLS)
-
-    r_ds = card_start + PENDING_CARD_ROW_DESIGN
-    ws.set_row_height(r_ds, CARD_DESIGN_ROW_HEIGHT_PT)
-    ws.set_cell(r_ds, 1, "Agent 设计方案 / Tiling & 流水排布草稿", style=STYLE_MERGED)
-    ws.merge_range(r_ds, 1, r_ds, PENDING_CARD_LBL_END)
-    ws.set_cell(r_ds, PENDING_CARD_LEFT_START, design_ov or item.default_design_slot, style=STYLE_INPUT_TEXT_WRAP)
-    ws.merge_range(r_ds, PENDING_CARD_LEFT_START, r_ds, PENDING_COLS)
-
-    r_ac = card_start + PENDING_CARD_ROW_ACCEPT
-    ws.set_row_height(r_ac, CARD_ACCEPT_ROW_HEIGHT_PT)
-    ws.set_cell(r_ac, 1, "风险与验收标准 (Risks & Acceptance)", style=STYLE_MERGED)
-    ws.merge_range(r_ac, 1, r_ac, PENDING_CARD_LBL_END)
-    ws.set_cell(r_ac, PENDING_CARD_LEFT_START, accept_ov or item.default_acceptance_slot, style=STYLE_INPUT_TEXT_WRAP)
-    ws.merge_range(r_ac, PENDING_CARD_LEFT_START, r_ac, PENDING_COLS)
+    for offset, height, label, text, st in full_width_rows:
+        r = card_start + offset
+        ws.set_row_height(r, height)
+        ws.set_cell(r, 1, label, style=STYLE_MERGED)
+        ws.merge_range(r, 1, r, PENDING_CARD_LBL_END)
+        ws.set_cell(r, PENDING_CARD_LEFT_START, text, style=st)
+        ws.merge_range(r, PENDING_CARD_LEFT_START, r, PENDING_COLS)
 
 
 def _populate_pending_kernel_details_sheet(
     ws: Worksheet,
     pending_items: Sequence[PendingKernelItem],
     target_bundle: ExportBundle,
-    agent_designs: Mapping[str, Mapping[str, str]] | None,
+    agent_designs: Mapping[str, Any] | None,
 ) -> None:
-    """Populate Sheet 4 with Top Summary Index Table + Structured Per-Kernel Detail Cards."""
+    """Populate Sheet 4 with 100%-conserved Summary Index + 3-Track Detail Cards."""
     _apply_col_widths(ws, PENDING_COL_WIDTHS)
     ws.freeze_panes(PENDING_HEADER_ROW, 2)
     _write_banner(
@@ -1368,13 +1603,13 @@ def _populate_pending_kernel_details_sheet(
     )
     _write_banner(
         ws, 2, PENDING_COLS,
-        "1. 总览索引表 (Top Summary Index — 待新开发/扩展 To-Implement + 重点待优化 Top Gap To-Optimize; Agent Design Slots Wired to --kernel-designs-json)",
+        "1. 总览索引表 (Top Summary Index — 收益合计与 Sheet 1 / Sheet 2 100% 守恒；支持 --kernel-designs-json 按 card_id 精细覆盖)",
         STYLE_SECTION,
     )
     headers = (
         "优先级", "分类 (待新开发 vs 重点待优化)", "目标算子 & 建议技术栈",
         "开发 / 优化状态", "替代原算子链 / 所在模块", "全网频次 (Archetypes & Calls)",
-        "预期全网收益 Δ (ms)", "After -> L* (ms)", "Before -> Target Bound", "详情卡片定位",
+        "预期全网收益 Δ (ms)", "Before -> After (L* ms)", "Before -> Target Bound", "详情卡片定位 (card_id)",
     )
     _write_headers(ws, PENDING_HEADER_ROW, headers)
 
@@ -1407,9 +1642,9 @@ def _populate_pending_kernel_details_sheet(
             (item.replaces_chain, None, STYLE_TEXT_WRAP),
             (f"{item.archetype_summary} ({item.total_calls_per_step} calls/step)", None, STYLE_TEXT_WRAP),
             (item.expected_gain_ms, None, STYLE_FLOAT3),
-            (f"{item.after_model_ms:.3f} -> {item.lstar_model_ms:.3f} (Gap {item.gap_vs_lstar_ms:.3f})", None, STYLE_TEXT_WRAP),
+            (f"{item.before_model_ms:.3f} -> {item.after_model_ms:.3f} (L* {item.lstar_model_ms:.3f})", None, STYLE_TEXT_WRAP),
             (f"{item.before_bound} -> {item.after_bound}", None, STYLE_TEXT_WRAP),
-            (f"Card #{item.priority} (Row {card_row})", None, STYLE_MERGED),
+            (f"Card #{item.priority} [{item.card_id}] (Row {card_row})", None, STYLE_MERGED),
         ))
 
     ws.set_cell(r_tot, 1, f"TOTAL ({n_new} 待新开发/扩展 + {n_opt} 重点待优化 = {len(pending_items)} 项)", style=STYLE_TOTAL_TEXT)
@@ -1420,12 +1655,12 @@ def _populate_pending_kernel_details_sheet(
         formula=f"=SUM(G{PENDING_DATA_START_ROW}:G{r_end})",
         style=STYLE_TOTAL_FLOAT3,
     )
-    ws.set_cell(r_tot, PENDING_COL_GAIN + 1, "Pass agent_kernel_designs or --kernel-designs-json to populate Agent Design Slots below", style=STYLE_TOTAL_TEXT)
+    ws.set_cell(r_tot, PENDING_COL_GAIN + 1, "已预填 3-Track 落地指导（Config/Kernel/Framework）；可按 card_id 传 --kernel-designs-json 进一步细化", style=STYLE_TOTAL_TEXT)
     ws.merge_range(r_tot, PENDING_COL_GAIN + 1, r_tot, PENDING_COLS)
 
     _write_banner(
         ws, cards_banner_row, PENDING_COLS,
-        "2. 逐算子结构化详情卡片 (Structured Per-Kernel Detail Cards — Shape/Dtype/Stride Contract, L* Target & Agent Design Proposal Slot)",
+        "2. 逐算子结构化 3-Track 详情卡片 (Config & Env / Kernel & Tiling / vllm-ascend Framework / Acceptance)",
         STYLE_SECTION,
     )
     for idx, item in enumerate(pending_items):
@@ -1509,6 +1744,7 @@ def _resolve_xlsx_bundles(
     request: StepRequest | None, step_eval: StepEvaluation | None, replay: ReplayOptions,
     observations_path: str | Path | None, weight_quant: str | None,
     cache_dtype: str | None, engram_host_offload: bool | None,
+    include_vision_tower: bool | None, apply_preset_to_ignored: bool,
     model: str | None, hardware: str | None, topology_preset: str | None,
     dp: int, tp: int, dcp: int, ep: int, pp: int, pcp: int,
     prompt_tokens: int, output_tokens: int, concurrency: int,
@@ -1546,6 +1782,8 @@ def _resolve_xlsx_bundles(
             source, request=eff_req, step_eval=step_eval, replay=replay,
             observations_path=observations_path, weight_quant=weight_quant,
             cache_dtype=cache_dtype, engram_host_offload=engram_host_offload,
+            include_vision_tower=include_vision_tower,
+            apply_preset_to_ignored=apply_preset_to_ignored,
         )
     )
     compare_bundle: ExportBundle | None = None
@@ -1561,6 +1799,8 @@ def _resolve_xlsx_bundles(
                 ),
                 replay=replay, weight_quant=weight_quant,
                 cache_dtype=cache_dtype, engram_host_offload=engram_host_offload,
+                include_vision_tower=include_vision_tower,
+                apply_preset_to_ignored=apply_preset_to_ignored,
             )
         )
     return bundle, compare_bundle
@@ -1578,7 +1818,10 @@ def export_comparison_xlsx(
     weight_quant: str | None = None,
     cache_dtype: str | None = None,
     engram_host_offload: bool | None = None,
-    agent_kernel_designs: Mapping[str, Mapping[str, str]] | None = None,
+    include_vision_tower: bool | None = None,
+    apply_preset_to_ignored: bool = False,
+    agent_kernel_designs: Mapping[str, Any] | None = None,
+    agent_brief_path: str | Path | None = None,
     model: str | None = None,
     hardware: str | None = None,
     topology_preset: str | None = None,
@@ -1605,6 +1848,8 @@ def export_comparison_xlsx(
         observations_path=observations_path,
         weight_quant=weight_quant, cache_dtype=cache_dtype,
         engram_host_offload=engram_host_offload,
+        include_vision_tower=include_vision_tower,
+        apply_preset_to_ignored=apply_preset_to_ignored,
         model=model, hardware=hardware, topology_preset=topology_preset,
         dp=dp, tp=tp, dcp=dcp, ep=ep, pp=pp, pcp=pcp,
         prompt_tokens=prompt_tokens, output_tokens=output_tokens,
@@ -1632,12 +1877,15 @@ def export_comparison_xlsx(
     ws_breakdown = wb.create_sheet(SHEET_BREAKDOWN)
     ws_memory = wb.create_sheet(SHEET_MEMORY)
 
-    _populate_summary_sheet(ws_summary, bundle, compare_bundle=compare_bundle, macro_rows=macro_rows)
+    _populate_summary_sheet(
+        ws_summary, bundle, compare_bundle=compare_bundle,
+        macro_rows=macro_rows, pending_items=pending_items,
+    )
     if compare_bundle is not None:
         _populate_comparison_breakdown_sheet(ws_breakdown, bundle, compare_bundle, aligned_rows, agent_kernel_designs)
     else:
         _populate_standalone_breakdown_sheet(ws_breakdown, bundle)
-    _populate_memory_sheet(ws_memory, bundle)
+    _populate_memory_sheet(ws_memory, compare_bundle or bundle)
 
     sheet_names = [SHEET_SUMMARY, SHEET_BREAKDOWN, SHEET_MEMORY]
     merge_counts = {
@@ -1658,40 +1906,34 @@ def export_comparison_xlsx(
         sheet_names.append(SHEET_MEASURED)
         merge_counts[SHEET_MEASURED] = len(ws_meas.merged_ranges)
 
-    bytes_written = wb.save(output_path)
-    n_new = sum(1 for x in pending_items if x.category == PENDING_KIND_TO_IMPLEMENT)
+    out = Path(output_path)
+    size = wb.save(out)
+    brief_path_str = ""
+    if agent_brief_path is not None:
+        brief = build_agent_brief(
+            bundle, compare_bundle,
+            generated_files={"comparison_xlsx": str(out.resolve()), "agent_brief_json": str(Path(agent_brief_path).resolve())},
+        )
+        export_agent_brief(brief, agent_brief_path)
+        brief_path_str = str(Path(agent_brief_path))
+
+    new_cnt = sum(1 for item in pending_items if item.category == PENDING_KIND_TO_IMPLEMENT)
+    opt_cnt = len(pending_items) - new_cnt
     return XlsxExportSummary(
         schema=XLSX_EXPORT_RECEIPT_SCHEMA,
-        output_path=str(output_path),
+        output_path=str(out),
         model_name=bundle.model_name,
         hardware_sku=bundle.hardware_sku,
         phase=bundle.phase,
         graph_id=bundle.graph_id,
         sheets=tuple(sheet_names),
         merge_cell_counts=merge_counts,
-        operator_rows=len(aligned_rows) if compare_bundle is not None else len(bundle.operators),
-        weight_rows=len(bundle.memory_ledger.weight_rows),
+        operator_rows=len(bundle.operators),
+        weight_rows=len((compare_bundle or bundle).memory_ledger.weight_rows),
         has_comparison=compare_bundle is not None,
         has_measured=bundle.reconciliation is not None,
-        bytes_written=bytes_written,
-        new_kernel_backlog_count=n_new,
-        to_optimize_kernel_count=len(pending_items) - n_new,
+        bytes_written=size,
+        new_kernel_backlog_count=new_cnt,
+        to_optimize_kernel_count=opt_cnt,
+        agent_brief_path=brief_path_str,
     )
-
-
-__all__ = [
-    "NS_MAIN",
-    "SHEET_BREAKDOWN",
-    "SHEET_MEASURED",
-    "SHEET_MEMORY",
-    "SHEET_NEW_KERNELS",
-    "SHEET_PENDING_KERNELS",
-    "SHEET_SUMMARY",
-    "Workbook",
-    "Worksheet",
-    "XLSX_EXPORT_RECEIPT_SCHEMA",
-    "XlsxExportSummary",
-    "cell_ref",
-    "column_letter",
-    "export_comparison_xlsx",
-]

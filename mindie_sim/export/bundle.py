@@ -2,9 +2,10 @@
 
 [Role] Compose scenarios (``resolve_hardware_alias``, ``compose_export_case``),
   discover unique Target/Draft layer archetypes, and evaluate each archetype
-  once on ``runtime.Engine`` with Lean-4 certified ``L*`` bounds, MSO Stream-1
-  overlap accounting, 4D hardware efficiency, and Memory/Quant/PP ledgers into
-  an immutable ``ExportBundle``.
+  once on ``runtime.Engine`` with Lean-4 certified ``L*`` bounds, exact
+  cross-stream overlap attribution, hardware efficiency (AIC MFU / AIV Util /
+  HBM MBU / HCCL Link Util), 3-pillar ``expected_ideal`` target envelope, and
+  Memory/Quant/PP ledgers into an immutable ``ExportBundle``.
 [Invariants] Strictly O(Unique Archetypes) RAM on full multi-layer models while
   conserving full-model repeat counts and streaming replay schedules. Zero banned
   recipe class names, zero heuristic fudge factors, and exact parity between
@@ -102,6 +103,12 @@ from .models import (
     TraceScheduleEntry,
 )
 from .reconcile import load_observation_bundle, reconcile_operators_with_kernels
+from .target_envelope import (
+    attribute_overlap_and_archetype_spans,
+    build_op_action_guidance,
+    extract_sku_floors,
+    synthesize_target_envelope,
+)
 
 _RECURRENT_MICRO_PATTERN = re.compile(r"^(.*)\.(recurrent_scan|chunk_kda)(\d+)$")
 
@@ -172,10 +179,21 @@ def compose_export_case(
     }
     if resolved_preset:
         compose_kw["topology_preset"] = resolved_preset
-    if quant is not None:
-        compose_kw["quant"] = quant
-    if kv_cache_dtype is not None:
-        compose_kw["kv_cache_dtype"] = kv_cache_dtype
+    resolved_quant = quant
+    resolved_kv = kv_cache_dtype
+    if str(quant or "").strip().lower() in {"auto_va", "auto"}:
+        from mindie_sim.catalog.quant import resolve_auto_va_quant
+        from mindie_sim.model_catalog import load_model
+
+        m_spec = load_model(model)
+        auto_w, auto_kv, _ = resolve_auto_va_quant(m_spec, sku, context_tokens=p_tok)
+        resolved_quant = auto_w
+        if resolved_kv is None:
+            resolved_kv = auto_kv
+    if resolved_quant is not None:
+        compose_kw["quant"] = resolved_quant
+    if resolved_kv is not None:
+        compose_kw["kv_cache_dtype"] = resolved_kv
     if engram_cpu_offload is not None:
         compose_kw["engram_cpu_offload"] = bool(engram_cpu_offload)
     raw = compose_case(model, sku, **compose_kw)
@@ -596,41 +614,6 @@ def _certify_step_lower_bound(
     return float(cert.l_star_lean_ns) / NS_PER_US, valid, tight
 
 
-def _merge_intervals(intervals: Sequence[tuple[float, float]]) -> list[tuple[float, float]]:
-    ordered = sorted((max(0.0, a), max(a, b)) for a, b in intervals if b > a)
-    if not ordered:
-        return []
-    merged: list[tuple[float, float]] = [ordered[0]]
-    for lo, hi in ordered[1:]:
-        prev_lo, prev_hi = merged[-1]
-        if lo <= prev_hi:
-            merged[-1] = (prev_lo, max(prev_hi, hi))
-        else:
-            merged.append((lo, hi))
-    return merged
-
-
-def _exposed_length_outside(
-    interval: tuple[float, float], cover: Sequence[tuple[float, float]],
-) -> float:
-    lo, hi = interval
-    if hi <= lo:
-        return 0.0
-    cur = lo
-    exposed = 0.0
-    for c_lo, c_hi in cover:
-        if c_hi <= cur:
-            continue
-        if c_lo >= hi:
-            break
-        if c_lo > cur:
-            exposed += min(hi, c_lo) - cur
-        cur = max(cur, c_hi)
-        if cur >= hi:
-            return 0.0
-    return exposed + max(0.0, hi - cur)
-
-
 def _assign_op_archetype(
     op_id: str,
     spec: OpSpec | None,
@@ -846,38 +829,18 @@ def _filter_barriers_and_rewire_preds(records: Sequence[Mapping[str, Any]]) -> l
     return kept
 
 
-def _compute_stream_overlap_and_archetype_spans(
-    rows: list[OperatorExportRow], archetypes: Sequence[LayerArchetypeSpec],
-) -> tuple[list[OperatorExportRow], tuple[LayerArchetypeSpec, ...]]:
-    main_intervals_by_arch: dict[str, list[tuple[float, float]]] = defaultdict(list)
-    all_intervals_by_arch: dict[str, list[tuple[float, float]]] = defaultdict(list)
+def _attach_action_guidance(
+    rows: Sequence[OperatorExportRow], case: Case, *, phase: str,
+) -> list[OperatorExportRow]:
+    floors = extract_sku_floors(case)
+    sku_str = str(case.machine.sku or case.machine.name or "")
+    out: list[OperatorExportRow] = []
     for row in rows:
-        if row.dur_us <= 0.0:
-            continue
-        all_intervals_by_arch[row.archetype_id].append((row.start_us, row.end_us))
-        if row.stream_index != 1:
-            main_intervals_by_arch[row.archetype_id].append((row.start_us, row.end_us))
-    merged_main = {aid: _merge_intervals(ivs) for aid, ivs in main_intervals_by_arch.items()}
-    updated: list[OperatorExportRow] = []
-    for row in rows:
-        if row.stream_index == 1 and row.dur_us > 0.0:
-            exp_us = _exposed_length_outside((row.start_us, row.end_us), merged_main.get(row.archetype_id, ()))
-            overlapped = exp_us <= OVERLAP_EXPOSED_EPS_US
-            eff_exp = 0.0 if overlapped else exp_us
-            eff_gap = 0.0 if overlapped else max(0.0, eff_exp - row.l_star_lean_us)
-            eff_ratio = None if overlapped else ((eff_exp / row.l_star_lean_us) if row.l_star_lean_us > 0.0 else None)
-            b_disp = "Overlapped on MSO Stream 1 (0 exposed)" if overlapped else row.bound_display
-            updated.append(replace(
-                row, is_overlapped=overlapped, exposed_dur_us=eff_exp,
-                gap_us=eff_gap, gap_ratio=eff_ratio, bound_display=b_disp,
-            ))
-        else:
-            updated.append(replace(row, is_overlapped=False, exposed_dur_us=row.dur_us))
-    arch_updated = tuple(
-        replace(arch, single_span_us=sum(hi - lo for lo, hi in _merge_intervals(all_intervals_by_arch.get(arch.archetype_id, ()))))
-        for arch in archetypes
-    )
-    return updated, arch_updated
+        cfg, kern, fw, _ = build_op_action_guidance(
+            row, is_a5_ub=floors.is_a5_ub, phase=phase, hardware_sku=sku_str,
+        )
+        out.append(replace(row, config_howto=cfg, kernel_action=kern, framework_action=fw))
+    return out
 
 
 def _reorder_rows_by_archetype(
@@ -1157,11 +1120,20 @@ def build_export_bundle(
     weight_quant: str | None = None,
     cache_dtype: str | None = None,
     engram_host_offload: bool | None = None,
+    include_vision_tower: bool | None = None,
+    apply_preset_to_ignored: bool = False,
+    apply_target_envelope: bool | None = None,
     top_k_radar: int = DEFAULT_GAP_RADAR_TOP_K,
 ) -> ExportBundle:
     """Evaluate unique layer archetypes once on ``runtime.Engine`` into ``ExportBundle``."""
     parsed = case if isinstance(case, Case) else parse_case(dict(case))
-    spec_tokens = int(dict(parsed.runtime.metadata).get("draft_proposal_tokens", 0) or 0)
+    meta = dict(parsed.runtime.metadata)
+    spec_tokens = int(meta.get("draft_proposal_tokens", 0) or 0)
+    track_name = str(
+        (meta.get("feature_track_report") or {}).get("feature_track")
+        or meta.get("feature_track")
+        or ""
+    ).strip()
     step_req = request or (
         step_eval.request if step_eval is not None else StepRequest(
             phase="decode", tokens=1 + spec_tokens,
@@ -1210,7 +1182,19 @@ def build_export_bundle(
         struct_by_op=struct_by_op, subgraph_by_op=subgraph_by_op,
     )
     prelim_rows, demands_ns = _collapse_micro_split_ops(prelim_rows, demands_ns)
-    prelim_rows, archetypes = _compute_stream_overlap_and_archetype_spans(prelim_rows, archetypes)
+    should_synthesize = (
+        apply_target_envelope
+        if apply_target_envelope is not None
+        else (track_name == "expected_ideal" and step_eval is None and observations_path is None)
+    )
+    if should_synthesize:
+        prelim_rows, demands_ns, archetypes = synthesize_target_envelope(
+            prelim_rows, demands_ns, archetypes, eff_case, peaks_by_stage, phase=step_req.phase,
+        )
+    else:
+        prelim_rows, archetypes = attribute_overlap_and_archetype_spans(prelim_rows, archetypes)
+        prelim_rows = _attach_action_guidance(prelim_rows, eff_case, phase=step_req.phase)
+
     prelim_rows, demands_ns = _reorder_rows_by_archetype(prelim_rows, demands_ns, archetypes)
     final_rows, rank_order, reconcile_summary = _finalize_ranked_rows(prelim_rows, observations_path)
 
@@ -1220,9 +1204,10 @@ def build_export_bundle(
         demands_ns=demands_ns, rank_order=rank_order, reconcile_summary=reconcile_summary,
         archetypes=archetypes, full_schedule=full_schedule,
         total_target_layers=total_target_layers, total_draft_layers=total_draft_layers,
-        use_archetype_dedup=use_archetype_dedup, peaks_by_stage=peaks_by_stage,
-        weight_quant=weight_quant, cache_dtype=cache_dtype,
-        engram_host_offload=engram_host_offload, top_k_radar=top_k_radar,
+        use_archetype_dedup=use_archetype_dedup, target_envelope_applied=should_synthesize,
+        peaks_by_stage=peaks_by_stage, weight_quant=weight_quant, cache_dtype=cache_dtype,
+        engram_host_offload=engram_host_offload, include_vision_tower=include_vision_tower,
+        apply_preset_to_ignored=apply_preset_to_ignored, top_k_radar=top_k_radar,
     )
 
 
@@ -1234,16 +1219,18 @@ def _assemble_export_bundle(
     rank_order: Sequence[int], reconcile_summary: ReconciliationSummary | None,
     archetypes: Sequence[LayerArchetypeSpec], full_schedule: Sequence[TraceScheduleEntry],
     total_target_layers: int, total_draft_layers: int, use_archetype_dedup: bool,
+    target_envelope_applied: bool,
     peaks_by_stage: Mapping[int, dict[str, Any]], weight_quant: str | None,
-    cache_dtype: str | None, engram_host_offload: bool | None, top_k_radar: int,
+    cache_dtype: str | None, engram_host_offload: bool | None,
+    include_vision_tower: bool | None, apply_preset_to_ignored: bool, top_k_radar: int,
 ) -> ExportBundle:
-    if use_archetype_dedup:
-        active_arch_ids = {row.archetype_id for row in final_rows}
-        step_span_us = sum(a.single_span_us * a.repeat_count for a in archetypes if a.archetype_id in active_arch_ids)
+    exposed_total_us = sum(r.exposed_dur_us * r.repeat_count for r in final_rows)
+    if use_archetype_dedup or target_envelope_applied:
+        step_span_us = exposed_total_us
     elif step_eval is not None:
         step_span_us = float(step_eval.span_ms) * US_PER_MS
     else:
-        step_span_us = max((r.end_us for r in final_rows), default=0.0)
+        step_span_us = exposed_total_us if exposed_total_us > 0.0 else max((r.end_us for r in final_rows), default=0.0)
 
     op_sum_us = sum(r.dur_us * r.repeat_count for r in final_rows)
     step_l_star_us, cert_valid, tight_res = _certify_step_lower_bound(final_rows, demands_ns)
@@ -1289,6 +1276,8 @@ def _assemble_export_bundle(
         seq_len=max(step_req.context + step_req.tokens, step_req.tokens),
         concurrency=seq_count, weight_quant=weight_quant,
         cache_dtype=cache_dtype, engram_host_offload=engram_host_offload,
+        include_vision_tower=include_vision_tower,
+        apply_preset_to_ignored=apply_preset_to_ignored,
     )
     d0 = parsed.machine.dies[0]
     d_bufs = dict(d0.buffers)
@@ -1299,7 +1288,12 @@ def _assemble_export_bundle(
         f"UB={int(d_bufs.get('ub', 0)) // KIB_BYTES} KiB, "
         f"HBM={hw_peaks_summary['hbm_peak_bytes_per_s'] / TB_BYTES:.2f} TB/s"
     )
-    track_name = str(dict(parsed.runtime.metadata).get("feature_track_report", {}).get("feature_track", "") or "")
+    meta_dict = dict(parsed.runtime.metadata)
+    track_name = str(
+        (meta_dict.get("feature_track_report") or {}).get("feature_track")
+        or meta_dict.get("feature_track")
+        or ""
+    ).strip()
     active_ids = {r.archetype_id for r in final_rows}
     filtered_schedule = tuple(e for e in full_schedule if e.archetype_id in active_ids) if use_archetype_dedup else ()
     return ExportBundle(
@@ -1321,6 +1315,7 @@ def _assemble_export_bundle(
         total_target_layers=total_target_layers, total_draft_layers=total_draft_layers,
         graph_capture_mode=str(parsed.runtime.graph_capture_mode or "full"),
         feature_track=track_name, hardware_die_summary=die_summary,
+        target_envelope_applied=target_envelope_applied,
         **scen,
     )
 

@@ -34,11 +34,13 @@ from mindie_sim import cli as cli_mod
 from mindie_sim import cli_export
 from mindie_sim.compose import compose_case as compose_raw_case
 from mindie_sim.export import (
+    AGENT_BRIEF_SCHEMA,
     BANNED_IMPLEMENTATION_NAMES,
     MSPROF_PROCESS_SPEC,
     PENDING_KIND_TO_IMPLEMENT,
     PENDING_KIND_TO_OPTIMIZE,
     PID_FRAMEWORK,
+    SCRIPT_AUDIT_SCHEMA,
     SHEET_BREAKDOWN,
     SHEET_MEASURED,
     SHEET_MEMORY,
@@ -50,13 +52,22 @@ from mindie_sim.export import (
     TID_FW_LAYER_MSTX,
     TID_FW_SUBMODULE_MSTX,
     Workbook,
+    align_before_after_operators,
+    audit_launch_script,
+    build_agent_brief,
     build_export_bundle,
+    build_macro_module_breakdown,
+    build_pending_kernel_details,
     compose_export_case,
     compute_memory_quant_ledger,
     evaluate_weight_storage_bytes,
+    export_agent_brief,
     export_comparison_xlsx,
     export_msprof_trace,
+    format_executive_digest_markdown,
     load_kernel_details_csv,
+    parse_launch_script,
+    render_optimized_serve_sh,
     resolve_hardware_alias,
 )
 from mindie_sim.export import trace_exporter as trace_mod
@@ -250,43 +261,50 @@ def test_xlsx_before_after_merge_cells_formulas_and_new_kernel_backlog(tmp_path)
 
     designs = {
         "K3 SituAndMul": {
-            "design": "Single-pass AIV vector tile (UB 248KiB double-buffered) fusing SiTU + Mul",
+            "config_howto": "export VLLM_ASCEND_ENABLE_FUSED_MC2=1",
+            "kernel_design": "Single-pass AIV vector tile (UB 248KiB double-buffered) fusing SiTU + Mul",
+            "framework_work": "Register CustomOp in vllm_ascend/models/kimi_k3/modeling_kimi_k3.py",
             "acceptance": "BF16 abs_err <= 1e-3, L* efficiency >= 70%",
         },
-        "dcp_query_allgather": {
-            "design": "Overlap DCP Q AllGather with DSA Indexer scores on Stream 2",
-            "acceptance": "Exposed DCP AllGather overlap >= 85%",
+        "hcom_allgather": {
+            "design": "Switch small collective payloads to superpod one-shot transport",
+            "acceptance": "Exposed collective attainment >= 75% Link L*",
         },
     }
     xlsx_path = tmp_path / "comparison.xlsx"
+    brief_path = tmp_path / "comparison_agent_brief.json"
     summary = export_comparison_xlsx(
-        b_bef, xlsx_path, compare_source=b_aft, agent_kernel_designs=designs,
+        b_bef, xlsx_path, compare_source=b_aft,
+        agent_kernel_designs=designs, agent_brief_path=brief_path,
     )
     assert SHEET_PENDING_KERNELS == "Pending_Kernel_Details" and SHEET_NEW_KERNELS == SHEET_PENDING_KERNELS
     assert summary.sheets == (SHEET_SUMMARY, SHEET_BREAKDOWN, SHEET_MEMORY, SHEET_PENDING_KERNELS)
     assert SHEET_MEASURED not in summary.sheets
     assert summary.has_comparison is True and summary.has_measured is False
     assert summary.new_kernel_backlog_count >= 1 and summary.to_optimize_kernel_count >= 1
+    assert brief_path.is_file() and brief_path.stat().st_size < 8192
 
     sheet_names, roots, shared = _read_xlsx_sheets(xlsx_path)
     assert sheet_names == [SHEET_SUMMARY, SHEET_BREAKDOWN, SHEET_MEMORY, SHEET_PENDING_KERNELS]
     for banned in BANNED_IMPLEMENTATION_NAMES:
         assert not any(banned in s for s in shared), f"banned name leaked: {banned}"
     assert "Other" not in shared
+    assert not any("4D" in s for s in shared)
+    assert not any("待 Agent 补充" in s for s in shared)
 
     expected_order = ["dimension", "sheetViews", "sheetFormatPr", "cols", "sheetData", "mergeCells", "dataValidations", "pageMargins"]
     for _, root in roots.items():
         tags = [child.tag.removeprefix(NS_PREFIX) for child in root]
         assert tags == [t for t in expected_order if t in tags]
 
-    # Sheet 1 — Verify all 3 Executive Blocks (Parallelism/Concurrency, TPS/Effective TPOT, Macro-Module Share %).
+    # Sheet 1 — Verify all 4 Executive Blocks (Deployment, KPIs w/o 4D jargon, L1/L2 Masking, 3-Track Roadmap).
     s1 = _sheet_cells(roots[SHEET_SUMMARY], shared)
     assert s1["C4"][0] == "Target 93L + Draft 5L" and int(s1["G4"][0]) == 4
     assert "DP=2, TP=2, EP=4" in (s1["H5"][0] or "") and "DCP=2" in (s1["H5"][0] or "") and "SP=" in (s1["H5"][0] or "")
     assert int(s1["G6"][0]) == 4 and s1["G7"][1] == "G6*2" and int(s1["G7"][0]) == 8
     assert float(s1["B8"][0]) == pytest.approx(30.0) and float(s1["B9"][0]) == pytest.approx(3.5)
     assert s1["B10"][1] == "B8*B9" and float(s1["B10"][0]) == pytest.approx(105.0)
-    assert float(s1["G8"][0]) > 0.0 and int(s1["G9"][0]) >= 0
+    assert float(s1["G8"][0]) > 0.0 and "原生 BF16" in (s1["H8"][0] or "") and int(s1["G9"][0]) >= 0
     assert s1["B15"][1] == "IF($B$9>0,B14/$B$9,B14)" and s1["C15"][1] == "IF($B$9>0,C14/$B$9,C14)"
     assert float(s1["C15"][0]) == pytest.approx(float(s1["C14"][0]) / 3.5, rel=1e-6)
     assert s1["B16"][1] == 'IF(B15<=$B$8,"PASS","FAIL")' and s1["C16"][0] in {"PASS", "FAIL"}
@@ -294,35 +312,57 @@ def test_xlsx_before_after_merge_cells_formulas_and_new_kernel_backlog(tmp_path)
     assert s1["B18"][1] == "IF(B14>0,$G$7*$B$9*1000/B14,0)" and s1["C18"][1] == "IF(C14>0,$G$7*$B$9*1000/C14,0)"
     assert float(s1["C18"][0]) == pytest.approx(8 * 3.5 * 1000.0 / float(s1["C14"][0]), rel=1e-6)
     assert float(s1["C17"][0]) == pytest.approx(float(s1["C18"][0]) / 4.0, rel=1e-6)
-    assert any(v == "KDA / GDN Linear Attention" for v, _ in s1.values())
-    assert any(v == "MoE Routed Experts (GMM1 / Act / GMM2)" for v, _ in s1.values())
-    assert any(v and "MSO Stream 1 Overlapped" in v for v, _ in s1.values())
-    assert any(f and f.startswith("SUM(D28:D") for _, f in s1.values())
-    assert any(f and f.startswith("SUM(F28:F") for _, f in s1.values())
+    assert s1["A21"][0] == "Cube 计算利用率 (AIC MFU)" and s1["A23"][0] == "HBM 访存带宽利用率 (MBU)"
+    assert any(v and "1. Attention" in v for v, _ in s1.values())
+    assert any(v and "KDA / GDN Linear Attention" in v for v, _ in s1.values())
+    assert any(v and "MoE Routed Experts (GMM1 / Act / GMM2)" in v for v, _ in s1.values())
+    assert any(v and "100% 掩盖" in v for v, _ in s1.values())
+    assert not any(v and "Cross-Stream Overlap Credit" in v for v, _ in s1.values())
 
-    # Sheet 2 — Side-by-side N->1 merge_cells, MSO formulas, Source Refs & Bounds.
+    # Sheet 2 — Strict topological order, up-front Stream&Masking (Col E), trailing Source Ref (Col W).
     brk_merges = _sheet_merges(roots[SHEET_BREAKDOWN])
     brk_cells = _sheet_cells(roots[SHEET_BREAKDOWN], shared)
+    assert brk_cells["E2"][0] == "并发流与掩盖关系 (Stream & Masking)"
+    assert brk_cells["W2"][0] == "源码出处 / Source Ref"
     assert any(ref.startswith("A") and ":A" in ref for ref in brk_merges)
     assert any(ref.startswith("C") and ":C" in ref for ref in brk_merges)
-    assert any(ref.startswith("K") and ":K" in ref for ref in brk_merges)
-    assert any(ref.startswith("O") and ":O" in ref for ref in brk_merges)
-    assert any(f and "ISNUMBER(SEARCH(\"Overlapped\"" in f for _, f in brk_cells.values())
-    assert any(f and f.startswith("H") and "/1000" in f for _, f in brk_cells.values())
-    assert any(f and f.startswith("SUM(I") and "-O" in f for _, f in brk_cells.values())
-    assert any(v == "Before Source Ref" for v, _ in brk_cells.values())
-    assert any(v == "Before Bound" for v, _ in brk_cells.values())
-    assert any(v == "After Bound" for v, _ in brk_cells.values())
+    assert any(ref.startswith("L") and ":L" in ref for ref in brk_merges)
+    assert any(ref.startswith("P") and ":P" in ref for ref in brk_merges)
+    assert any(f and f.startswith("I") and "/1000" in f for _, f in brk_cells.values())
+    assert any(f and f.startswith("SUM(J") and "-P" in f for _, f in brk_cells.values())
     assert not any(v == "Measured Kernel (msprof)" for v, _ in brk_cells.values())
 
-    # Sheet 4 — Pending_Kernel_Details: Index + Structured Per-Kernel Cards for BOTH To-Implement & To-Optimize.
+    # Verify topological ordering inside target_arch_1: [Pre-Attn] attn_res precedes [Pre-MoE/FFN] attn_res.
+    aligned = align_before_after_operators(b_bef, b_aft)
+    arch1_roles = [(r.after_ops or r.before_ops)[0].logical_role for r in aligned if r.archetype_id == "target_arch_1"]
+    pre_attn_idx = next(i for i, lbl in enumerate(arch1_roles) if "[Pre-Attn]" in lbl)
+    pre_moe_idx = next(i for i, lbl in enumerate(arch1_roles) if "[Pre-MoE/FFN]" in lbl)
+    assert pre_attn_idx == 0 and pre_moe_idx > pre_attn_idx + 2
+
+    # Verify 100% 4-view conservation: Step Δ == Sheet 1 Δ == Sheet 2 Δ == Sheet 4 Cards Δ.
+    macros = build_macro_module_breakdown(b_bef, b_aft)
+    cards = build_pending_kernel_details(aligned, b_aft)
+    step_delta = (b_bef.step_span_us - b_aft.step_span_us) / 1000.0
+    s1_delta = sum(m.before_ms - m.after_ms for m in macros)
+    s2_delta = sum(
+        (sum(b.exposed_dur_us for b in r.before_ops) - sum(a.exposed_dur_us for a in r.after_ops)) * r.repeat_count / 1000.0
+        for r in aligned
+    )
+    s4_delta = sum(c.expected_gain_ms for c in cards)
+    assert s1_delta == pytest.approx(step_delta, abs=1e-4)
+    assert s2_delta == pytest.approx(step_delta, abs=1e-4)
+    assert s4_delta == pytest.approx(step_delta, abs=1e-4)
+
+    # Sheet 4 — Pending_Kernel_Details: Index + 3-Track Cards + structured overrides.
     s4 = _sheet_cells(roots[SHEET_PENDING_KERNELS], shared)
     assert any(v == PENDING_KIND_TO_IMPLEMENT for v, _ in s4.values())
     assert any(v == PENDING_KIND_TO_OPTIMIZE for v, _ in s4.values())
-    assert any(v and v.startswith("Card #1 |") for v, _ in s4.values())
+    assert any(v and v.startswith("Card #1 [") for v, _ in s4.values())
+    assert any(v and "① 已有特效开关与通信展开配置" in v for v, _ in s4.values())
+    assert any(v and "③ 推理框架改造要点" in v for v, _ in s4.values())
     assert any(v and "Single-pass AIV vector tile" in v for v, _ in s4.values())
     assert any(v and "BF16 abs_err <= 1e-3" in v for v, _ in s4.values())
-    assert any(v and "Overlap DCP Q AllGather" in v for v, _ in s4.values())
+    assert any(v and "Register CustomOp in vllm_ascend" in v for v, _ in s4.values())
     assert any(f and f.startswith("SUM(G") for _, f in s4.values())
     assert any(f == "G4" for _, f in s4.values())
 
@@ -426,7 +466,7 @@ def test_submodule_and_kernel_hygiene_across_hybrid_architectures(tmp_path):
     export_comparison_xlsx(b_ple, ple_xlsx)
     export_msprof_trace(b_ple, ple_trace)
     _, ple_roots, ple_shared = _read_xlsx_sheets(ple_xlsx)
-    assert any("Engram / PLE Memory" in s for s in ple_shared) and any("Host Offload=" in s for s in ple_shared)
+    assert any("Engram / PLE Memory" in s for s in ple_shared) and any("Host DRAM Offload=" in s for s in ple_shared)
     assert "aclrtMemcpyAsync (PLE/Engram H2D" in ple_trace.read_text(encoding="utf-8")
 
 
@@ -440,12 +480,26 @@ def test_memory_quant_calculator_exclusions_offload_and_pp_budget(tmp_path):
     raw_k, _ = compose_export_case("kimi-k3.1", REPRESENTATIVE_SKUS["a5"], topology_preset="a5_pod", tp=8, ep=32, dp=4, dcp=8)
     led_routed = compute_memory_quant_ledger(parse_case(raw_k), seq_len=4096, concurrency=4)
     assert led_routed.weight_quant == "MXFP4"
-    assert led_routed.weight_quant_display == "MXFP4 (Routed-Only, Attn/Shared BF16)"
+    assert led_routed.weight_quant_display == "MXFP4 (Routed+Latent+AttnRes, Attn/Shared BF16)"
+    assert led_routed.include_vision_tower is False
+    assert led_routed.native_bf16_weight_footprint_per_die_bytes > led_routed.weight_footprint_per_die_bytes
     by_name = {r.name: r for r in led_routed.weight_rows}
     assert by_name["q_a"].quant_format == "BF16" and by_name["q_a"].is_quant_excluded is True
     assert by_name["o_proj"].quant_format == "BF16" and by_name["dense_down"].quant_format == "BF16"
+    assert by_name["latent_down"].quant_format == "MXFP4" and by_name["latent_up"].quant_format == "MXFP4"
+    assert by_name["attn_res_proj"].quant_format == "MXFP4"
     assert any(r.category == "routed_expert" and r.quant_format == "MXFP4" for r in led_routed.weight_rows)
-    assert all(r.quant_format == "BF16" for r in led_routed.weight_rows if r.category in {"shared_expert", "router", "latent_moe"})
+    assert all(r.quant_format == "BF16" for r in led_routed.weight_rows if r.category in {"shared_expert", "router"})
+
+    # Verify mixed W4A8_DYNAMIC on legacy INT8/INT4 chip prices ordinary linears as W8A8 and routed experts as W4A8.
+    raw_w4a8, _ = compose_export_case(
+        "kimi-k3.1", REPRESENTATIVE_SKUS["a3"], topology_preset="a3_superpod",
+        tp=8, ep=32, dp=4, dcp=8, quant="w4a8", kv_cache_dtype="int8",
+    )
+    led_w4a8 = compute_memory_quant_ledger(parse_case(raw_w4a8), seq_len=4096, concurrency=4)
+    assert led_w4a8.weight_quant == "W4A8" and led_w4a8.cache_dtype == "C8"
+    assert {r.quant_format for r in led_w4a8.weight_rows if r.group == "Attention / MLA" and not r.is_quant_excluded} == {"W8A8"}
+    assert {r.quant_format for r in led_w4a8.weight_rows if r.category == "routed_expert"} == {"W4A8"}
 
     raw_case = json.loads(Path("examples/cases/deepseek-v4.1-flash.json").read_text(encoding="utf-8"))
     case = parse_case(raw_case)
@@ -467,10 +521,13 @@ def test_memory_quant_calculator_exclusions_offload_and_pp_budget(tmp_path):
     )
     _, roots, shared = _read_xlsx_sheets(xlsx_path)
     mem_cells = _sheet_cells(roots[SHEET_MEMORY], shared)
-    assert mem_cells["R14"][1] == "R6*R7*R9*R11"
-    assert mem_cells["R19"][1] == "ROUNDUP(R15/(R17*R10),0)*R17"
-    assert mem_cells["R22"][1] == "R20*R21"
-    assert mem_cells["R23"][0] == "MXFP4 (Routed-Only, Attn/Shared BF16)"
+    assert mem_cells["T16"][1] == "T8*T9*T11*T13"
+    assert mem_cells["T21"][1] == "ROUNDUP(T17/(T19*T12),0)*T19"
+    assert mem_cells["T24"][1] == "T22*T23"
+    assert mem_cells["T25"][0] == "MXFP4 (Routed+Latent+AttnRes, Attn/Shared BF16)"
+    assert mem_cells["T6"][0] == "OFF" and mem_cells["T7"][0] == "OFF"
+    assert any(f and "SUMIFS(" in f and '"NPU HBM*"' in f for _, f in mem_cells.values())
+    assert any(f and "SUMIFS(" in f and '"Host DRAM*"' in f for _, f in mem_cells.values())
     assert any(f and "VLOOKUP(" in f and "ROUNDUP(" in f for _, f in mem_cells.values())
 
 
@@ -518,3 +575,57 @@ def test_cli_export_commands_oneshot_receipt_isolation_and_error_guards(tmp_path
     monkeypatch.setattr(cli_export, "export_msprof_trace", _boom)
     with pytest.raises(TimeoutError, match="export_timeout_check"):
         cli_export.main(["export-trace", str(case_path), "-o", str(tmp_path / "never.json")])
+
+
+def test_agent_brief_digest_and_static_launch_script_audit(tmp_path):
+    raw_bef, req = compose_export_case(
+        "qwen3.8-flash-next", REPRESENTATIVE_SKUS["a5"], topology_preset="a5_pod",
+        dp=2, tp=2, ep=4, prompt_tokens=4096, output_tokens=64, concurrency=8,
+        mtp_proposal_tokens=3, mtp_acceptance_length=2.4, tpot_slo_ms=15.0,
+        kv_cache_dtype="fp8_e4m3", engram_cpu_offload=True, feature_track="unmerged_pr",
+    )
+    raw_aft, _ = compose_export_case(
+        "qwen3.8-flash-next", REPRESENTATIVE_SKUS["a5"], topology_preset="a5_pod",
+        dp=2, tp=2, ep=4, prompt_tokens=4096, output_tokens=64, concurrency=8,
+        mtp_proposal_tokens=3, mtp_acceptance_length=2.4, tpot_slo_ms=15.0,
+        kv_cache_dtype="fp8_e4m3", engram_cpu_offload=True, feature_track="expected_ideal",
+    )
+    b_bef = build_export_bundle(raw_bef, request=req)
+    b_aft = build_export_bundle(raw_aft, request=req)
+    assert b_aft.step_span_us < b_bef.step_span_us
+    assert any(op.ascend_kernel == "FusedGDNPrologue" for op in b_aft.operators)
+
+    script_file = tmp_path / "serve.sh"
+    script_file.write_text(
+        "# sample user script\n"
+        "export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3\n"
+        "export HCCL_OP_EXPANSION_MODE=AI_CPU\n"
+        "vllm serve /weights/Qwen3.8-Flash-Next-bf16 \\\n"
+        "  --tensor-parallel-size 4 --data-parallel-size 1 \\\n"
+        "  --max-model-len 65536 --max-num-seqs 16 --enforce-eager\n",
+        encoding="utf-8",
+    )
+    parsed = parse_launch_script(script_file)
+    assert parsed.inferred_catalog_model == "qwen3.8-flash-next"
+    assert parsed.inferred_quant == "bf16" and parsed.tp == 4 and parsed.enforce_eager is True
+    assert parsed.inferred_num_devices == 4
+
+    opt_sh_path = tmp_path / "optimized_serve.sh"
+    opt_text = render_optimized_serve_sh(parsed, after_bundle=b_aft, output_path=opt_sh_path)
+    assert opt_sh_path.is_file() and b"\r\n" not in opt_sh_path.read_bytes()
+    assert 'HCCL_OP_EXPANSION_MODE="AIV"' in opt_text and "FULL_DECODE_ONLY" in opt_text
+    assert "--quantization ascend" in opt_text
+
+    audit_rep = audit_launch_script(
+        parsed, before_bundle=b_bef, after_bundle=b_aft, optimized_script_path=str(opt_sh_path),
+    )
+    assert audit_rep.schema == SCRIPT_AUDIT_SCHEMA and len(audit_rep.issues) >= 4
+    brief = build_agent_brief(b_bef, b_aft, script_audit=audit_rep.to_dict())
+    assert brief["schema"] == AGENT_BRIEF_SCHEMA
+    assert brief["kpis_before_vs_after"]["saved_step_ms"] == pytest.approx(
+        brief["kpis_before_vs_after"]["sheet4_cards_total_gain_ms"], abs=0.01,
+    )
+    brief_out = export_agent_brief(brief, tmp_path / "brief.json")
+    assert brief_out.stat().st_size < 8192
+    digest = format_executive_digest_markdown(brief)
+    assert "MindIE-Sim Executive Digest" in digest and "3-Track Action Plan" in digest

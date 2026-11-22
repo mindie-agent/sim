@@ -1,22 +1,26 @@
 """Human-native productization exporters for ``mindie_sim`` (``msprof`` Trace & OOXML XLSX).
 
 [Role] Expose the cohesive export domain package organized into focused modules:
-  - ``models``: immutable data records, backend/readiness/submodule/macro-module
-    taxonomies, and hardware/quant storage constants;
+  - ``models``: immutable data records, backend/readiness/submodule/L1-L2
+    macro-module taxonomies, and hardware/quant storage constants;
   - ``kernel_catalog``: domain-standard Ascend submodule, macro-module, and
-    multi-ecosystem kernel/readiness/tensor-contract classification;
+    multi-ecosystem kernel/readiness/tensor-contract classification (A5 MXFP &
+    A2/A3 INT8/INT4 parity);
   - ``memory_ledger``: closed-form per-die Weight/Quant/Cache/Engram-PLE/PP HBM
-    calculator honoring ``QuantSpec.exclusions`` and per-DP Max HBM Concurrency;
+    calculator honoring ``QuantSpec.exclusions``, mixed ``W4A8``/``MXFP4``,
+    Vision ViT opt-in, and per-DP Max HBM Concurrency;
+  - ``target_envelope``: 3-pillar ``After (expected_ideal)`` optimizer, exact
+    cross-stream overlap attribution, 3-track Ascend guidance, and Parallelism
+    Co-Design notes;
+  - ``comparison``: topological alignment, L1/L2 aggregation, 100%-conserved
+    Sheet 4 cards, and turnkey ``< 8 KB`` ``agent_brief.json`` + Markdown digest;
+  - ``script_audit``: safe zero-exec ``shlex`` launch-script parser, diagnostic
+    auditor, and ``optimized_serve.sh`` generator;
   - ``reconcile``: streaming ``msprof`` ``kernel_details.csv`` ingress and 1-to-N
     sample-conserving reconciliation;
-  - ``bundle``: O(Unique Archetypes) ``runtime.Engine`` evaluation, Lean-4 ``L*``
-    certification, Before-vs-After alignment, macro-module aggregation, and dual
-    ``待新开发`` + ``重点待优化`` pending-kernel detail construction;
-  - ``ooxml`` & ``xlsx_exporter``: zero-dependency OOXML ``.xlsx`` workbook with
-    3-block Executive ``Summary``, ``Layer_Operator_Breakdown``,
-    ``Memory_Quant_Calculator``, ``Pending_Kernel_Details`` (index + structured
-    detail cards with Agent design slots), and conditional
-    ``Measured_msprof_Calibration``;
+  - ``bundle``: O(Unique Archetypes) ``runtime.Engine`` evaluation and Lean-4
+    ``L*`` certification;
+  - ``ooxml`` & ``xlsx_exporter``: zero-dependency OOXML ``.xlsx`` workbook;
   - ``trace_exporter``: streaming 1:1 full-model ``msprof`` ``trace_view.json``.
 [Invariants] Strictly a top-layer consumer in the unidirectional import DAG;
   lower layers never import ``mindie_sim.export``. Zero heuristic fudge factors,
@@ -34,9 +38,12 @@ from .bundle import (
 )
 from .comparison import (
     align_before_after_operators,
+    build_agent_brief,
     build_macro_module_breakdown,
     build_new_kernel_backlog,
     build_pending_kernel_details,
+    export_agent_brief,
+    format_executive_digest_markdown,
 )
 from .kernel_catalog import (
     classify_macro_module,
@@ -48,6 +55,7 @@ from .memory_ledger import (
     evaluate_weight_storage_bytes,
 )
 from .models import (
+    AGENT_BRIEF_SCHEMA,
     BACKEND_CANN,
     BACKEND_CANNBOT_DSL,
     BACKEND_HCCL_MC2,
@@ -69,8 +77,16 @@ from .models import (
     KERNEL_STATUS_FRAMEWORK,
     KERNEL_STATUS_NEW_OP,
     KERNEL_STATUS_NEW_OR_EXTEND,
+    L1_MOD_ATTENTION,
+    L1_MOD_COLLECTIVES,
+    L1_MOD_MOE_FFN,
+    L1_MOD_RESIDUAL_MEM,
+    L1_MOD_SPEC_HEAD,
+    MACRO_L1_HIERARCHY,
     MACRO_MOD_COLLECTIVES,
+    MACRO_MOD_DENSE_FFN,
     MACRO_MOD_DENSE_NORM,
+    MACRO_MOD_DRAFT_LAYERS,
     MACRO_MOD_DSA_LI,
     MACRO_MOD_ENGRAM,
     MACRO_MOD_GATED_O_PROJ,
@@ -80,18 +96,29 @@ from .models import (
     MACRO_MOD_MOE_ROUTED,
     MACRO_MOD_MOE_ROUTER,
     MACRO_MOD_MOE_SHARED,
+    MACRO_MOD_RESIDUAL_NORM,
     MACRO_MOD_SPEC_HEAD,
+    MACRO_MOD_VERIFY_HEAD,
     MACRO_MOD_VISION,
     MIB_BYTES,
     MXFP_GROUP_SIZE,
     PENDING_KIND_TO_IMPLEMENT,
     PENDING_KIND_TO_OPTIMIZE,
+    QUANT_RULE_CHECKPOINT_IGNORE,
+    QUANT_RULE_FIXED_BF16,
+    QUANT_RULE_FIXED_FP32,
+    QUANT_RULE_FOLLOW_PRESET,
+    QUANT_RULE_PRESET_LINEAR_FP8,
     RECONCILE_ABS_FLOOR_US,
     RECONCILE_APE_THRESHOLD_PCT,
     SUPPORTED_CACHE_DTYPES,
     SUPPORTED_WEIGHT_QUANTS,
+    TRACK_CONFIG_ENV,
+    TRACK_FRAMEWORK,
+    TRACK_KERNEL,
     US_PER_MS,
     WEIGHT_QUANT_FORMATS,
+    ActionRoadmapRow,
     AlignedComparisonRow,
     AscendKernelDescriptor,
     CacheLedgerRow,
@@ -110,10 +137,25 @@ from .models import (
     TraceScheduleEntry,
     WeightLedgerRow,
 )
+from .ooxml import Workbook, Worksheet, cell_ref, column_letter
 from .reconcile import (
     load_kernel_details_csv,
     load_observation_bundle,
     reconcile_operators_with_kernels,
+)
+from .script_audit import (
+    SCRIPT_AUDIT_SCHEMA,
+    ParsedLaunchScript,
+    ScriptAuditIssue,
+    ScriptAuditReport,
+    audit_launch_script,
+    parse_launch_script,
+    render_optimized_serve_sh,
+)
+from .target_envelope import (
+    build_actionable_roadmap,
+    build_parallelism_codesign_note,
+    synthesize_target_envelope,
 )
 from .trace_exporter import (
     MSPROF_PROCESS_SPEC,
@@ -135,15 +177,13 @@ from .xlsx_exporter import (
     SHEET_PENDING_KERNELS,
     SHEET_SUMMARY,
     XLSX_EXPORT_RECEIPT_SCHEMA,
-    Workbook,
-    Worksheet,
     XlsxExportSummary,
-    cell_ref,
-    column_letter,
     export_comparison_xlsx,
 )
 
 __all__ = [
+    "AGENT_BRIEF_SCHEMA",
+    "ActionRoadmapRow",
     "AlignedComparisonRow",
     "AscendKernelDescriptor",
     "BACKEND_CANN",
@@ -171,9 +211,17 @@ __all__ = [
     "KERNEL_STATUS_NEW_OP",
     "KERNEL_STATUS_NEW_OR_EXTEND",
     "KernelObservationRow",
+    "L1_MOD_ATTENTION",
+    "L1_MOD_COLLECTIVES",
+    "L1_MOD_MOE_FFN",
+    "L1_MOD_RESIDUAL_MEM",
+    "L1_MOD_SPEC_HEAD",
     "LayerArchetypeSpec",
+    "MACRO_L1_HIERARCHY",
     "MACRO_MOD_COLLECTIVES",
+    "MACRO_MOD_DENSE_FFN",
     "MACRO_MOD_DENSE_NORM",
+    "MACRO_MOD_DRAFT_LAYERS",
     "MACRO_MOD_DSA_LI",
     "MACRO_MOD_ENGRAM",
     "MACRO_MOD_GATED_O_PROJ",
@@ -183,7 +231,9 @@ __all__ = [
     "MACRO_MOD_MOE_ROUTED",
     "MACRO_MOD_MOE_ROUTER",
     "MACRO_MOD_MOE_SHARED",
+    "MACRO_MOD_RESIDUAL_NORM",
     "MACRO_MOD_SPEC_HEAD",
+    "MACRO_MOD_VERIFY_HEAD",
     "MACRO_MOD_VISION",
     "MIB_BYTES",
     "MSPROF_PROCESS_SPEC",
@@ -195,11 +245,18 @@ __all__ = [
     "PENDING_KIND_TO_IMPLEMENT",
     "PENDING_KIND_TO_OPTIMIZE",
     "PID_FRAMEWORK",
+    "ParsedLaunchScript",
     "PendingKernelItem",
+    "QUANT_RULE_CHECKPOINT_IGNORE",
+    "QUANT_RULE_FIXED_BF16",
+    "QUANT_RULE_FIXED_FP32",
+    "QUANT_RULE_FOLLOW_PRESET",
+    "QUANT_RULE_PRESET_LINEAR_FP8",
     "RECONCILE_ABS_FLOOR_US",
     "RECONCILE_APE_THRESHOLD_PCT",
     "ReconciledKernelGroup",
     "ReconciliationSummary",
+    "SCRIPT_AUDIT_SCHEMA",
     "SHEET_BREAKDOWN",
     "SHEET_MEASURED",
     "SHEET_MEMORY",
@@ -208,12 +265,17 @@ __all__ = [
     "SHEET_SUMMARY",
     "SUPPORTED_CACHE_DTYPES",
     "SUPPORTED_WEIGHT_QUANTS",
+    "ScriptAuditIssue",
+    "ScriptAuditReport",
     "StageBudgetRow",
     "TID_FW_ENGINE",
     "TID_FW_HOST_LAUNCH",
     "TID_FW_LAYER_MSTX",
     "TID_FW_SUBMODULE_MSTX",
     "TRACE_EXPORT_RECEIPT_SCHEMA",
+    "TRACK_CONFIG_ENV",
+    "TRACK_FRAMEWORK",
+    "TRACK_KERNEL",
     "TraceExportSummary",
     "TraceScheduleEntry",
     "US_PER_MS",
@@ -224,9 +286,13 @@ __all__ = [
     "XLSX_EXPORT_RECEIPT_SCHEMA",
     "XlsxExportSummary",
     "align_before_after_operators",
+    "audit_launch_script",
+    "build_actionable_roadmap",
+    "build_agent_brief",
     "build_export_bundle",
     "build_macro_module_breakdown",
     "build_new_kernel_backlog",
+    "build_parallelism_codesign_note",
     "build_pending_kernel_details",
     "cell_ref",
     "classify_macro_module",
@@ -235,12 +301,17 @@ __all__ = [
     "compose_export_case",
     "compute_memory_quant_ledger",
     "evaluate_weight_storage_bytes",
+    "export_agent_brief",
     "export_comparison_xlsx",
     "export_msprof_trace",
     "extract_layer_index",
+    "format_executive_digest_markdown",
     "iter_msprof_trace_events",
     "load_kernel_details_csv",
     "load_observation_bundle",
+    "parse_launch_script",
     "reconcile_operators_with_kernels",
+    "render_optimized_serve_sh",
     "resolve_hardware_alias",
+    "synthesize_target_envelope",
 ]
