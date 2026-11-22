@@ -250,8 +250,11 @@ class CalibratedRateOverlay:
     compute_peaks: tuple[tuple[str, float], ...] = ()
     hbm_read_bytes_per_s: float | None = None
     hbm_write_bytes_per_s: float | None = None
+    hbm_rw11_bytes_per_s: float | None = None
     hbm_rw21_bytes_per_s: float | None = None
     hbm_rw_alpha: float | None = None
+    l2_die_bytes_per_s: float | None = None
+    l2_contiguous_bytes_per_s: float | None = None
     coverage_gaps: tuple[str, ...] = ()
 
     @property
@@ -260,7 +263,9 @@ class CalibratedRateOverlay:
             self.sku, self.cann_version, self.envelope_sha256,
             self.rates, self.compute_peaks,
             self.hbm_read_bytes_per_s, self.hbm_write_bytes_per_s,
-            self.hbm_rw21_bytes_per_s, self.hbm_rw_alpha,
+            self.hbm_rw11_bytes_per_s, self.hbm_rw21_bytes_per_s,
+            self.hbm_rw_alpha, self.l2_die_bytes_per_s,
+            self.l2_contiguous_bytes_per_s,
         )
 
 
@@ -369,13 +374,28 @@ def resolve_sim_rate_overlay(
     gaps: list[str] = []
     hbm_r = _table_band_p50(table, "P01_datacopy", "hbm_read_bytes_per_s")
     hbm_w = _table_band_p50(table, "P01_datacopy", "hbm_write_bytes_per_s")
+    hbm_rw11 = _table_band_p50(table, "P01_datacopy", "hbm_rw11_bytes_per_s")
     hbm_rw21 = _table_band_p50(table, "P01_datacopy", "hbm_rw21_bytes_per_s")
     if hbm_r is not None and datapath.hbm_read_bytes_per_s > 0.0:
         hbm_r = min(hbm_r, datapath.hbm_read_bytes_per_s)
     if hbm_w is not None and datapath.hbm_write_bytes_per_s > 0.0:
         hbm_w = min(hbm_w, datapath.hbm_write_bytes_per_s)
+    if hbm_rw11 is not None and datapath.hbm_read_bytes_per_s > 0.0:
+        hbm_rw11 = min(hbm_rw11, datapath.hbm_read_bytes_per_s)
     if hbm_rw21 is not None and datapath.hbm_read_bytes_per_s > 0.0:
         hbm_rw21 = min(hbm_rw21, datapath.hbm_read_bytes_per_s)
+    l2_die = _table_band_p50(table, "P05_l2_residency_reuse", "l2_die_bytes_per_s")
+    l2_contiguous = None
+    try:
+        p05_params = table.cell("P05_l2_residency_reuse").parameters or {}
+        for entry in p05_params.get("l2_stride_conflict") or ():
+            if isinstance(entry, Mapping) and entry.get("kind") == "contiguous":
+                val = entry.get("bps_p50")
+                if isinstance(val, (int, float)) and float(val) > 0.0:
+                    l2_contiguous = float(val)
+                    break
+    except ModelingError:
+        pass
     hbm_alpha_val = None
     try:
         alpha_band = table.cell("P01_datacopy").band("hbm_rw_alpha")
@@ -415,8 +435,11 @@ def resolve_sim_rate_overlay(
         compute_peaks=tuple(sorted(peaks_map.items())),
         hbm_read_bytes_per_s=hbm_r,
         hbm_write_bytes_per_s=hbm_w,
+        hbm_rw11_bytes_per_s=hbm_rw11,
         hbm_rw21_bytes_per_s=hbm_rw21,
         hbm_rw_alpha=hbm_alpha_val,
+        l2_die_bytes_per_s=l2_die,
+        l2_contiguous_bytes_per_s=l2_contiguous,
         coverage_gaps=tuple(sorted(dict.fromkeys(gaps))),
     )
 

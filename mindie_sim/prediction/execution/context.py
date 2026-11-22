@@ -153,6 +153,7 @@ def _apply_calibrated_dispatch_floor(context, dies, selected, envelope):
         return selected
     has_cube = float(context.native_work.get("cube", 0.0) or 0.0) > 0.0
     has_vec = float(context.native_work.get("vector", 0.0) or 0.0) > 0.0
+    target_startup_ms = timing.startup_ms
     if mapped_roles == ("cube", "vector") or (explicit_class is None and has_cube and has_vec):
         cube_floor_ms = max(
             (t.minimum_ms for d in dies for role, t in d.kernel_invocations if role == "cube"),
@@ -163,21 +164,31 @@ def _apply_calibrated_dispatch_floor(context, dies, selected, envelope):
     elif mapped_roles == ("vector",) or (explicit_class in (None, "vector") and has_vec and not has_cube):
         floor_ms = envelope.aiv_floor_ms(_active_aiv_blocks(op, meta, envelope))
         kind = "vector"
+        if (
+            target_startup_ms <= 0.0
+            and str(meta.get("vector_submode") or "") in {"broadcast_elementwise", "outer_axis_reduction"}
+        ):
+            # Non-streaming CANN BroadcastSch / ReduceOpTilingDataNonContiguous
+            # AIV kernels serialize block tiling & scalar coordinate setup before
+            # the steady-state UB pipe loop (ops-math/math/{mul,reduce_sum}/op_kernel).
+            target_startup_ms = floor_ms
     else:
         return selected
-    if floor_ms <= timing.minimum_ms:
+    target_min_ms = max(timing.minimum_ms, floor_ms)
+    if target_min_ms <= timing.minimum_ms and target_startup_ms <= timing.startup_ms:
         return selected
     evidence = f"p15_p13:{envelope.sku}:{envelope.envelope_sha256[:DIGEST_PREFIX_CHARS]}:{kind}"
     upgraded = InvocationTiming(
-        startup_ms=timing.startup_ms,
-        minimum_ms=floor_ms,
+        startup_ms=target_startup_ms,
+        minimum_ms=target_min_ms,
         provenance={**dict(timing.provenance), "dispatch_envelope": evidence},
     )
     payload = json.dumps(upgraded.to_dict(), sort_keys=True, separators=(",", ":"))
     return upgraded, {
         **record,
         "id": hashlib.sha256(payload.encode()).hexdigest(),
-        "minimum_ms": floor_ms,
+        "startup_ms": target_startup_ms,
+        "minimum_ms": target_min_ms,
         "provenance": upgraded.provenance,
     }
 
@@ -328,8 +339,17 @@ def build_stage_profiles(case: CaseSpec, namespace: str = "", *,
                 service_modes[mode] = (role, m_rate)
             if "mte2_aiv_dram" not in service_modes and overlay and overlay.hbm_read_bytes_per_s is not None:
                 service_modes["mte2_aiv_dram"] = ("mte2_aiv", overlay.hbm_read_bytes_per_s)
+            if overlay and overlay.hbm_write_bytes_per_s is not None:
+                service_modes["hbm_write_dram"] = ("hbm", overlay.hbm_write_bytes_per_s)
+            if overlay and overlay.hbm_rw11_bytes_per_s is not None:
+                service_modes["hbm_rw11_dram"] = ("hbm", overlay.hbm_rw11_bytes_per_s)
             if overlay and overlay.hbm_rw21_bytes_per_s is not None:
                 service_modes["hbm_rw21_dram"] = ("hbm", overlay.hbm_rw21_bytes_per_s)
+            l2_pipe = "mte2_aiv" if "mte2_aiv" in names else ("mte2" if "mte2" in names else None)
+            if l2_pipe is not None and overlay and overlay.l2_die_bytes_per_s is not None:
+                service_modes["l2_die_bw"] = (l2_pipe, overlay.l2_die_bytes_per_s)
+            if l2_pipe is not None and overlay and overlay.l2_contiguous_bytes_per_s is not None:
+                service_modes["l2_contiguous_bw"] = (l2_pipe, overlay.l2_contiguous_bytes_per_s)
             store_queues = {
                 name: dict(queue) for name, queue in dies[0].store_queues
                 if all(dict(die.store_queues).get(name) == queue for die in dies)

@@ -1243,37 +1243,41 @@ def expand_dcp_lse_eager_kernels(
     res_fp32_b = rows * heads * dim * FP32_BYTES
     res_out_b = rows * heads * dim * out_bytes
 
-    def _hbm_bytes(rd: int, wr: int, l2_in: int) -> float:
-        hit = min(rd, l2_in) if (l2_bytes > 0 and (rd + wr) <= l2_bytes) else 0
-        return float(max(0, rd - hit) + wr)
+    def _hbm_bytes(rd: int, wr: int, l2_in: int, *, writeback_l2: bool = False) -> float:
+        fits_l2 = l2_bytes > 0 and (rd + wr) <= l2_bytes
+        hit = min(rd, l2_in) if fits_l2 else 0
+        # Ephemeral chain intermediates whose inputs and outputs fit in L2 stay
+        # in write-back L2 until consumed by the next kernel (zero HBM spill).
+        hbm_wr = 0 if (writeback_l2 and fits_l2 and hit >= rd) else wr
+        return float(max(0, rd - hit) + hbm_wr)
 
     def _cid(suffix: str) -> str:
         return suffix if local_ids else f"{op.op_id}.{suffix}"
 
     base_deps = () if local_ids else tuple(op.deps)
-    specs: list[tuple[str, tuple[str, ...], str, int, int, int, int, int]] = []
+    specs: list[tuple[str, tuple[str, ...], str, int, int, int, int, int, str]] = []
     if include_stack:
-        specs.append(("lse_stack", base_deps, "fp32", n_lse, n_lse, lse_b, lse_b, 0))
+        specs.append(("lse_stack", base_deps, "fp32", n_lse, n_lse, lse_b, lse_b, 0, ""))
         amax_deps, amax_l2 = (_cid("lse_stack"),), lse_b
     else:
         amax_deps, amax_l2 = base_deps, 0
     specs.extend((
-        ("amax", amax_deps, "fp32", n_lse, n_lse, lse_b, red_lse_b, amax_l2),
-        ("sub", (_cid("amax"),), "fp32", n_lse, n_lse, lse_b + red_lse_b, lse_b, lse_b + red_lse_b),
-        ("exp", (_cid("sub"),), "fp32", n_lse, ATTENTION_UPDATE_LSE_EXP_OPS * n_lse, lse_b, lse_b, lse_b),
-        ("wsum", (_cid("exp"),), "fp32", n_lse, n_lse, lse_b, red_lse_b, lse_b),
-        ("wdiv", (_cid("wsum"),), "fp32", n_lse, n_lse, lse_b + red_lse_b, lse_b, lse_b + red_lse_b),
-        ("cast32", (_cid("wdiv"),), "fp32", n_out, n_out, ol_in_b, ol_fp32_b, 0),
+        ("amax", amax_deps, "fp32", n_lse, n_lse, lse_b, red_lse_b, amax_l2, ""),
+        ("sub", (_cid("amax"),), "fp32", n_lse, n_lse, lse_b + red_lse_b, lse_b, lse_b + red_lse_b, ""),
+        ("exp", (_cid("sub"),), "fp32", n_lse, ATTENTION_UPDATE_LSE_EXP_OPS * n_lse, lse_b, lse_b, lse_b, ""),
+        ("wsum", (_cid("exp"),), "fp32", n_lse, n_lse, lse_b, red_lse_b, lse_b, ""),
+        ("wdiv", (_cid("wsum"),), "fp32", n_lse, n_lse, lse_b + red_lse_b, lse_b, lse_b + red_lse_b, ""),
+        ("cast32", (_cid("wdiv"),), "fp32", n_out, n_out, ol_in_b, ol_fp32_b, 0, ""),
     ))
     if include_stack:
-        specs.append(("o_stack", (_cid("cast32"),), "fp32", n_out, n_out, ol_fp32_b, ol_fp32_b, ol_fp32_b))
+        specs.append(("o_stack", (_cid("cast32"),), "fp32", n_out, n_out, ol_fp32_b, ol_fp32_b, ol_fp32_b, ""))
         mul_deps = (_cid("o_stack"),)
     else:
         mul_deps = (_cid("cast32"),)
     specs.extend((
-        ("mul", mul_deps, "fp32", n_out, n_out, ol_fp32_b + lse_b, ol_fp32_b, ol_fp32_b + lse_b),
-        ("osum", (_cid("mul"),), "fp32", n_out, n_out, ol_fp32_b, res_fp32_b, ol_fp32_b),
-        ("cast16", (_cid("osum"),), op.dtype or "bf16", rows * heads * dim, rows * heads * dim, res_fp32_b, res_out_b, res_fp32_b),
+        ("mul", mul_deps, "fp32", n_out, n_out, ol_fp32_b + lse_b, ol_fp32_b, ol_fp32_b + lse_b, "broadcast_elementwise"),
+        ("osum", (_cid("mul"),), "fp32", n_out, n_out, ol_fp32_b, res_fp32_b, ol_fp32_b, "outer_axis_reduction"),
+        ("cast16", (_cid("osum"),), op.dtype or "bf16", rows * heads * dim, rows * heads * dim, res_fp32_b, res_out_b, res_fp32_b, ""),
     ))
     child_meta = (("execution_class", "aiv_only"), ("cp", cp), ("partial_reduction", "logsumexp"))
     return tuple(
@@ -1282,10 +1286,14 @@ def expand_dcp_lse_eager_kernels(
             (numel,), (numel,), (numel,), (numel,),
             deps=deps, dtype=dt, stream=op.stream,
             vector_ops=float(vops), mte2_bytes=float(rd), mte3_bytes=float(wr),
-            hbm_bytes=_hbm_bytes(rd, wr, l2_in),
-            metadata=(("program_execution", {"execution_class": "aiv_only"}), *child_meta),
+            hbm_bytes=_hbm_bytes(rd, wr, l2_in, writeback_l2=bool(vsub)),
+            metadata=(
+                ("program_execution", {"execution_class": "aiv_only"}),
+                *child_meta,
+                *((("vector_submode", vsub),) if vsub else ()),
+            ),
         )
-        for suffix, deps, dt, numel, vops, rd, wr, l2_in in specs
+        for suffix, deps, dt, numel, vops, rd, wr, l2_in, vsub in specs
     )
 
 

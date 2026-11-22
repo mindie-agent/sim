@@ -416,3 +416,92 @@ def test_dcp_lse_merge_fused_and_eager_multi_op_lowering_across_cp():
         eager_durs.append(rep["duration_ms"])
         assert rep["duration_ms"] >= 9.0 * env.aiv_floor_ms(1) - 1e-9
     assert eager_durs[0] <= eager_durs[1] <= eager_durs[2] <= eager_durs[3]
+
+
+def test_calibrated_hbm_rw_ratios_l2_bandwidth_and_cann_vector_submodes():
+    """Verify P01 hbm_rw11 / P05 L2 bandwidth and CANN broadcast/outer-reduce vector physics."""
+    from mindie_sim import compose_case, parse_case
+    from mindie_sim.prediction.evaluation import EvaluationContext
+    from mindie_sim.prediction.execution.context import build_stage_profiles
+    from mindie_sim.prediction.graph_analysis import graph_costs
+    from mindie_sim.prediction.operators.context_parallel import (
+        DCP_LSE_MERGE_EAGER_RECIPE,
+        expand_dcp_lse_eager_kernels,
+    )
+    from mindie_sim.prediction.program import RecipeBook
+    from mindie_sim.primitives.loader import resolve_dispatch_envelope, resolve_sim_rate_overlay
+    from mindie_sim.schema.operators import OpSpec
+
+    for sku in CALIBRATED_FLEET_SKUS:
+        dp = _dp(sku)
+        tbl = load_primitives(sku, datapath=dp, require_calibrated=True)
+        overlay = resolve_sim_rate_overlay(tbl, dp, sku=sku)
+        assert overlay.hbm_write_bytes_per_s is not None and overlay.hbm_write_bytes_per_s > 0.0
+        assert overlay.hbm_rw11_bytes_per_s is not None and overlay.hbm_rw11_bytes_per_s > 0.0
+        assert overlay.l2_die_bytes_per_s is not None and overlay.l2_die_bytes_per_s > 0.0
+        assert overlay.l2_contiguous_bytes_per_s is not None
+        assert overlay.l2_contiguous_bytes_per_s >= overlay.l2_die_bytes_per_s
+
+        cs = parse_case(compose_case("qwen3.8-27b", hardware=sku, tp=1, ep=1, num_devices=1, layers=1, quant="none"))
+        prof = build_stage_profiles(cs, primitive_table=tbl)[0]
+        for mode_name in ("hbm_write_dram", "hbm_rw11_dram", "hbm_rw21_dram", "l2_die_bw", "l2_contiguous_bw"):
+            assert mode_name in prof.service_modes
+
+    # Verify true HBM R:W mode selection, L2 shared bandwidth, and CANN submode prologue on A3 & A5.
+    for sku in ("Ascend910_9382", "Ascend950DT_9582"):
+        dp = _dp(sku)
+        tbl = load_primitives(sku, datapath=dp, require_calibrated=True)
+        overlay = resolve_sim_rate_overlay(tbl, dp, sku=sku)
+        env = resolve_dispatch_envelope(tbl, dp)
+        assert env is not None
+        cs = parse_case(compose_case("qwen3.8-27b", hardware=sku, tp=1, ep=1, num_devices=1, layers=1, quant="none"))
+        book = RecipeBook.from_mapping(cs.runtime.kernels)
+        ev = EvaluationContext.create(cs, book, primitive_table=tbl)
+
+        # Write-dominated bf16->fp32 cast selects hbm_write_dram (faster than hbm_rw21_dram).
+        n_el = 16 * 1024 * 1024
+        rd_b, wr_b = float(n_el * 2), float(n_el * 4)
+        cast_op = OpSpec(
+            "cast32", "vector", "decode", 0, 0, (), (n_el,), (n_el,), (n_el,), (n_el,),
+            dtype="fp32", vector_ops=float(n_el), mte2_bytes=rd_b, mte3_bytes=wr_b, hbm_bytes=rd_b + wr_b,
+        )
+        rep_cast = graph_costs(cs, {0: [cast_op]}, recipes=book, evaluation=ev, include_submission=False, isolated=True)
+        expected_cast_ms = (rd_b + wr_b) / float(overlay.hbm_write_bytes_per_s) * 1000.0
+        assert rep_cast["duration_ms"] == pytest.approx(expected_cast_ms, rel=0.05)
+
+        # Broadcast mul & outer-axis reduction charge die-wide L2 + non-overlapped AIV prologue.
+        l2_n = 8 * 1024 * 1024
+        l2_bytes = float(l2_n * 4)
+        stream_l2 = OpSpec(
+            "stream_l2", "vector", "decode", 0, 0, (), (l2_n,), (l2_n,), (l2_n,), (l2_n,),
+            dtype="fp32", vector_ops=float(l2_n), mte2_bytes=l2_bytes, mte3_bytes=l2_bytes, hbm_bytes=0.0,
+        )
+        bcast_l2 = OpSpec(
+            "bcast_l2", "vector", "decode", 0, 0, (), (l2_n,), (l2_n,), (l2_n,), (l2_n,),
+            dtype="fp32", vector_ops=float(l2_n), mte2_bytes=l2_bytes, mte3_bytes=l2_bytes, hbm_bytes=0.0,
+            metadata=(("vector_submode", "broadcast_elementwise"),),
+        )
+        reduce_l2 = OpSpec(
+            "reduce_l2", "vector", "decode", 0, 0, (), (l2_n,), (l2_n,), (l2_n,), (l2_n,),
+            dtype="fp32", vector_ops=float(l2_n), mte2_bytes=l2_bytes, mte3_bytes=l2_bytes / 4.0, hbm_bytes=0.0,
+            metadata=(("vector_submode", "outer_axis_reduction"),),
+        )
+        d_stream = graph_costs(cs, {0: [stream_l2]}, recipes=book, evaluation=ev, include_submission=False, isolated=True)["duration_ms"]
+        d_bcast = graph_costs(cs, {0: [bcast_l2]}, recipes=book, evaluation=ev, include_submission=False, isolated=True)["duration_ms"]
+        d_reduce = graph_costs(cs, {0: [reduce_l2]}, recipes=book, evaluation=ev, include_submission=False, isolated=True)["duration_ms"]
+        assert d_bcast > d_stream
+        assert d_bcast >= env.aiv_full_die_floor_ms + (2.0 * l2_bytes) / float(overlay.l2_contiguous_bytes_per_s) * 1000.0 - 1e-6
+        assert d_reduce >= env.aiv_full_die_floor_ms + (1.25 * l2_bytes) / float(overlay.l2_die_bytes_per_s) * 1000.0 - 1e-6
+
+        # Eager DCP LSE merge tags mul/osum submodes and applies write-back L2 conservation vs spill.
+        fit_op = OpSpec(
+            "dcp_fit", "attention_merge", "decode", 0, 0, (), (256, 32, 128), (256, 32, 128), (256, 32, 128), (256, 32, 128),
+            recipe=DCP_LSE_MERGE_EAGER_RECIPE, dtype="bf16", metadata=(("partial_count", 2),),
+        )
+        fit_kids = {k.op_id.split(".")[-1]: k for k in expand_dcp_lse_eager_kernels(fit_op, l2_bytes=dp.usable_bytes("l2"))}
+        assert dict(fit_kids["mul"].metadata)["vector_submode"] == "broadcast_elementwise"
+        assert dict(fit_kids["osum"].metadata)["vector_submode"] == "outer_axis_reduction"
+        assert fit_kids["mul"].hbm_bytes == 0.0 and fit_kids["osum"].hbm_bytes == 0.0
+        spill_kids = {k.op_id.split(".")[-1]: k for k in expand_dcp_lse_eager_kernels(fit_op, l2_bytes=1024)}
+        assert spill_kids["mul"].hbm_bytes == spill_kids["mul"].mte2_bytes + spill_kids["mul"].mte3_bytes
+        assert spill_kids["osum"].hbm_bytes == spill_kids["osum"].mte2_bytes + spill_kids["osum"].mte3_bytes
