@@ -24,29 +24,54 @@ from pathlib import Path
 from typing import Any
 
 from mindie_sim.compose import compose_case
-from mindie_sim.feature_mechanisms import compare_feature_tracks
+from mindie_sim.feature_mechanisms import (
+    MONOTONIC_TOLERANCE_MS,
+    MS_PRECISION_DIGITS,
+    PCT_PRECISION_DIGITS,
+    RATIO_PRECISION_DIGITS,
+    WATERFALL_SCHEMA,
+    _network,
+    _pct_delta,
+    _speedup,
+    compare_feature_tracks,
+)
+from mindie_sim.prediction.body_defaults import TargetGraphSet, consume_target_declaration
 from mindie_sim.prediction.capacity import Memory
 from mindie_sim.prediction.efficiency import (
     _resolve_speculative_tokens,
     analyze_network_efficiency,
 )
+from mindie_sim.prediction.evaluation import EvaluationContext
+from mindie_sim.prediction.graph_analysis import graph_costs
 from mindie_sim.prediction.offload.policy import missing_scenario_error
+from mindie_sim.prediction.operator_analysis import operator_costs, target_graphs
 from mindie_sim.prediction.results import StepRequest
+from mindie_sim.prediction.sharding.local_tp import rank_zero_graph_reuse
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.sweep.pd import (
     ARCHETYPE_SCREEN_MIN_LAYERS,
+    _reclaim_sweep_memory,
     build_archetype_representative_case,
     solve_optimal_deployment,
 )
 
 SOLVE_SCHEMA = "mindie-sim.deployment-solution/1"
+VALID_SOLVE_MODES = frozenset({"simulation", "modeling"})
 BYTES_PER_GIB = float(1024 ** 3)
 TOP_RUNNER_UPS = 3
 TOP_BOTTLENECK_FAMILIES = 8
 GIB_DIGITS = 3
 RATIO_DIGITS = 4
 MS_DIGITS = 4
+MIN_RATIO_EPS = 1e-12
+
+
+def _resolve_solve_mode(mode: str | None) -> str:
+    norm = str(mode or "modeling").strip().lower()
+    if norm not in VALID_SOLVE_MODES:
+        raise ModelingError(f"invalid_solve_mode:{mode}")
+    return norm
 
 
 def _resolve_kv_pooling_mode(kv_pooling: str | bool | None) -> str | None:
@@ -73,25 +98,32 @@ def _instance_capacity_ledger(
     prompt_tokens: int,
     output_tokens: int,
     role: str,
+    b_feasible: int = 1,
 ) -> dict[str, Any]:
-    """Compute one instance's HBM weights, workspace, KV/seq, and VRAM concurrency."""
+    """Compute one instance's HBM weights, phase-accurate workspace, KV/seq, and VRAM concurrency."""
     parsed = parse_case(raw_case)
-    is_prefill = role == "pd_prefill"
-    if is_prefill:
-        ws_tokens = max(1, int(prompt_tokens))
+    role_norm = str(role or "colocated").strip().lower()
+    prefill_ws = (
+        min(int(prompt_tokens), int(parsed.runtime.max_num_batched_tokens))
+        if parsed.runtime.enable_chunked_prefill and int(parsed.runtime.max_num_batched_tokens) > 0
+        else int(prompt_tokens)
+    )
+    if role_norm == "pd_prefill":
+        ws_tokens = max(1, prefill_ws)
         seq_len = int(prompt_tokens) + 1
     else:
         decode_q, _ = _resolve_speculative_tokens(
             parsed, output_budget=output_tokens,
             tokens_per_seq=None, emitted_tokens_per_seq=None,
         )
-        ws_tokens = max(1, int(decode_q))
+        decode_ws = max(1, max(1, int(b_feasible)) * int(decode_q))
+        ws_tokens = max(prefill_ws, decode_ws) if role_norm == "colocated" else decode_ws
         seq_len = int(prompt_tokens) + int(output_tokens)
     mem = Memory(parsed, workspace_tokens=ws_tokens)
     hbm_bytes = min(float(die.memory_bytes) for die in parsed.machine.dies) if parsed.machine.dies else 0.0
     weights_bytes = max((float(v) for v in mem.weights), default=0.0)
     workspace_bytes = max((float(v) for v in mem.workspace), default=0.0)
-    kv_per_seq_bytes = max((float(v) for v in mem.cache_bytes(seq_len, padded=True)), default=0.0)
+    kv_per_seq_bytes = max((float(v) for v in mem.dp_cohort_cache_bytes(seq_len, padded=True)), default=0.0)
     headroom_bytes = min(
         (float(cap) for row in mem.capacity for cap in row),
         default=0.0,
@@ -102,8 +134,9 @@ def _instance_capacity_ledger(
         else (int(parsed.runtime.max_num_seqs) if headroom_bytes >= 0.0 else 0)
     )
     return {
-        "role": role,
+        "role": role_norm,
         "parallel": parsed.runtime.parallel.to_dict(),
+        "workspace_tokens": int(ws_tokens),
         "hbm_capacity_gib": round(hbm_bytes / BYTES_PER_GIB, GIB_DIGITS),
         "weights_gib": round(weights_bytes / BYTES_PER_GIB, GIB_DIGITS),
         "workspace_gib": round(workspace_bytes / BYTES_PER_GIB, GIB_DIGITS),
@@ -118,14 +151,16 @@ def _build_capacity_ledger(
     solved: Mapping[str, Any], *, prompt_tokens: int, output_tokens: int,
 ) -> dict[str, Any]:
     winner_mode = solved.get("winner_mode")
+    best = solved.get("best_configuration") or {}
+    b_feas = max(1, int(best.get("b_feasible", 1) or 1))
     if winner_mode == "pd_disaggregated" and solved.get("prefill_case") and solved.get("decode_case"):
         p_led = _instance_capacity_ledger(
             solved["prefill_case"], prompt_tokens=prompt_tokens,
-            output_tokens=output_tokens, role="pd_prefill",
+            output_tokens=output_tokens, role="pd_prefill", b_feasible=1,
         )
         d_led = _instance_capacity_ledger(
             solved["decode_case"], prompt_tokens=prompt_tokens,
-            output_tokens=output_tokens, role="pd_decode",
+            output_tokens=output_tokens, role="pd_decode", b_feasible=b_feas,
         )
         return {
             **d_led,
@@ -137,12 +172,179 @@ def _build_capacity_ledger(
     if rec_case is not None:
         return _instance_capacity_ledger(
             rec_case, prompt_tokens=prompt_tokens,
-            output_tokens=output_tokens, role="colocated",
+            output_tokens=output_tokens, role="colocated", b_feasible=b_feas,
         )
     return {
-        "role": "none", "hbm_capacity_gib": 0.0, "weights_gib": 0.0,
+        "role": "none", "workspace_tokens": 0, "hbm_capacity_gib": 0.0, "weights_gib": 0.0,
         "workspace_gib": 0.0, "kv_per_seq_gib": 0.0, "kv_pool_headroom_gib": 0.0,
         "max_seqs_per_dp_vram": 0, "feasible": False,
+    }
+
+
+def _analyze_case_bounded(
+    raw_case: Any,
+    *,
+    phase: str,
+    tokens: int,
+    context: int,
+    sequences: int,
+    scope: str,
+) -> dict[str, Any]:
+    """Run ``analyze_network_efficiency`` with replica-0 timeline bounding."""
+    parsed = parse_case(raw_case)
+    graphs = target_graphs(
+        parsed, phase=phase, tokens=tokens, context=context,
+        sequences=sequences, scope=scope,
+    )
+    eff_case = consume_target_declaration(parsed, graphs)
+    ext_in = {"analysis_input": 0} if scope == "body" else None
+    r0_ops = graphs[0]
+    has_kg = any("device_kernel_group" in dict(op.metadata) for op in r0_ops)
+    use_r0 = rank_zero_graph_reuse(eff_case.runtime.parallel, len(graphs), has_kg)
+    sg = (
+        TargetGraphSet({0: r0_ops}, kernels=graphs.effective_kernels, selection=graphs.default_selection)
+        if isinstance(graphs, TargetGraphSet) else {0: r0_ops}
+    ) if use_r0 else graphs
+    del parsed, raw_case
+    if use_r0:
+        del graphs
+    _reclaim_sweep_memory()
+    ctx = EvaluationContext.create(eff_case)
+    graph_rep = graph_costs(
+        eff_case, sg, external_inputs=ext_in,
+        isolated=False, evaluation=ctx, timeline_replicas=(0,),
+    )
+    _reclaim_sweep_memory()
+    try:
+        op_rep = operator_costs(eff_case, r0_ops, replica=0, evaluation=ctx)
+    except ValueError:
+        cohort_rep = operator_costs(eff_case, sg, evaluation=ctx)
+        r0_rows = [row for row in cohort_rep["operators"] if row.get("replica", 0) == 0]
+        op_rep = {
+            **cohort_rep,
+            "operator_occurrences": sum(r["occurrences"] for r in r0_rows),
+            "operator_sum_ms": sum(r["total_ms"] for r in r0_rows),
+            "operators": r0_rows,
+        }
+        del cohort_rep
+    # Release Engine/Arena/cohort graphs before building occurrence_work_graph.
+    if not use_r0:
+        del graphs
+    del sg, r0_ops, ctx
+    _reclaim_sweep_memory()
+    try:
+        return analyze_network_efficiency(
+            eff_case, phase=phase, tokens=tokens, context=context,
+            sequences=sequences, scope=scope,
+            operator_report=op_rep, graph_report=graph_rep,
+            _retain_graph=True,
+        )
+    finally:
+        del graph_rep, op_rep
+        _reclaim_sweep_memory()
+
+
+def _compare_feature_tracks_bounded(
+    model: Any, *, hardware: str | Mapping[str, Any], runtime_stack: str | Mapping[str, Any],
+    phase: str, tokens: int, context: int, sequences: int, scope: str,
+    compose_kwargs: Mapping[str, Any], use_archetype_folding: bool = False,
+) -> dict[str, Any]:
+    """Evaluate the 4-track waterfall sequentially with replica-0 bounding to keep RSS low."""
+    skip_keys = {"feature_track", "optimizations", "exclude_optimizations", "raw_eager", "_stack_phase"}
+    cleaned = {k: v for k, v in compose_kwargs.items() if k not in skip_keys}
+    summaries: dict[str, dict[str, Any]] = {}
+    meta_info: dict[str, Any] = {}
+    va_quant: Any = None
+    for track in ("merged", "unmerged_pr", "expected_ideal", "raw_eager"):
+        kw = dict(cleaned)
+        if track == "raw_eager" and kw.get("quant") is None and va_quant is not None:
+            kw["quant"] = va_quant
+        case = compose_case(
+            model, hardware=hardware, runtime_stack=runtime_stack,
+            feature_track=track, _stack_phase=phase, **kw,
+        )
+        if track == "merged":
+            va_quant = ((case["runtime"]["metadata"] or {}).get("va_profile") or {}).get("quant")
+            meta_info.update(model=case["model"]["name"], sku=case["machine"]["sku"])
+        rep_meta = case["runtime"]["metadata"]["feature_track_report"]
+        eval_case: Any = (
+            build_archetype_representative_case(parse_case(case))[0]
+            if use_archetype_folding else case
+        )
+        del case
+        _reclaim_sweep_memory()
+        eff = _analyze_case_bounded(eval_case, phase=phase, tokens=tokens, context=context, sequences=sequences, scope=scope)
+        del eval_case
+        roof_1p0 = max(
+            float(eff.get("critical_path_roofline_ms") or 0.0),
+            float(eff.get("physical_resource_cut_ms") or 0.0),
+        ) or float(eff.get("total_roofline_ideal_ms") or 0.0)
+        summaries[track] = {
+            "step_ms": float(eff["graph_duration_ms"]), "operator_sum_ms": float(eff["operator_sum_ms"]),
+            "hbm_bytes": float(eff["total_hbm_bytes"]), "network": _network(eff),
+            "roof_1p0_ms": roof_1p0, "report": rep_meta,
+        }
+        del eff
+        _reclaim_sweep_memory()
+
+    eager, merged, pr_s, ideal = (summaries[k] for k in ("raw_eager", "merged", "unmerged_pr", "expected_ideal"))
+    e_ms, m_ms, p_ms, i_ms, roof_ms = (
+        eager["step_ms"], merged["step_ms"], pr_s["step_ms"], ideal["step_ms"], ideal["roof_1p0_ms"],
+    )
+
+    def _base_row(entry: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "step_ms": round(entry["step_ms"], MS_PRECISION_DIGITS),
+            "operator_sum_ms": round(entry["operator_sum_ms"], MS_PRECISION_DIGITS),
+            "hbm_bytes": entry["hbm_bytes"], "network": entry["network"],
+        }
+
+    return {
+        "schema": WATERFALL_SCHEMA, "model": meta_info["model"], "hardware_sku": meta_info["sku"],
+        "runtime_stack": merged["report"]["stack"], "repository": merged["report"]["repository"],
+        "geometry": {"phase": phase, "tokens": tokens, "context": context, "sequences": sequences, "scope": scope},
+        "monotonic_verified": bool(
+            m_ms + MONOTONIC_TOLERANCE_MS >= p_ms
+            and p_ms + MONOTONIC_TOLERANCE_MS >= i_ms
+            and i_ms + MONOTONIC_TOLERANCE_MS >= roof_ms
+        ),
+        "eager_vs_merged_monotonic": bool(e_ms + MONOTONIC_TOLERANCE_MS >= m_ms),
+        "waterfall": {
+            "raw_eager": {**_base_row(eager), "active_mechanisms": [m["id"] for m in eager["report"]["active_mechanisms"]]},
+            "current_merged": {
+                **_base_row(merged),
+                "delta_vs_raw_eager_ms": round(m_ms - e_ms, MS_PRECISION_DIGITS),
+                "delta_vs_raw_eager_pct": round(_pct_delta(e_ms, m_ms), PCT_PRECISION_DIGITS),
+                "speedup_vs_raw_eager": round(_speedup(e_ms, m_ms), RATIO_PRECISION_DIGITS),
+                "active_mechanisms": [m["id"] for m in merged["report"]["active_mechanisms"]],
+            },
+            "current_unmerged_pr": {
+                **_base_row(pr_s),
+                "delta_vs_merged_ms": round(p_ms - m_ms, MS_PRECISION_DIGITS),
+                "delta_vs_merged_pct": round(_pct_delta(m_ms, p_ms), PCT_PRECISION_DIGITS),
+                "speedup_vs_merged": round(_speedup(m_ms, p_ms), RATIO_PRECISION_DIGITS),
+                "active_open_prs": [
+                    {"mechanism_id": m["mechanism_id"], "ref": m["ref"], "notes": m["notes"]}
+                    for m in pr_s["report"]["unmerged_pr_mechanisms"]
+                ],
+                "single_pr_ablation": [], "leave_one_out_ablation": [],
+            },
+            "expected_ideal": {
+                **_base_row(ideal),
+                "delta_vs_unmerged_pr_ms": round(i_ms - p_ms, MS_PRECISION_DIGITS),
+                "delta_vs_unmerged_pr_pct": round(_pct_delta(p_ms, i_ms), PCT_PRECISION_DIGITS),
+                "delta_vs_merged_ms": round(i_ms - m_ms, MS_PRECISION_DIGITS),
+                "delta_vs_merged_pct": round(_pct_delta(m_ms, i_ms), PCT_PRECISION_DIGITS),
+                "speedup_vs_merged": round(_speedup(m_ms, i_ms), RATIO_PRECISION_DIGITS),
+                "unimplemented_architectural_gaps": ideal["report"]["unimplemented_gaps"],
+                "active_mechanisms": [m["id"] for m in ideal["report"]["active_mechanisms"]],
+            },
+            "hardware_roofline": {
+                "physical_ideal_1p0x_ms": round(roof_ms, MS_PRECISION_DIGITS),
+                "remaining_kernel_micro_gap_to_1p0x_ms": round(max(0.0, i_ms - roof_ms), MS_PRECISION_DIGITS),
+            },
+        },
+        "efficiency_reference": {"physical_ideal_ms": round(roof_ms, MS_PRECISION_DIGITS), "basis": "physical_1p0x_critical_path_roofline"},
     }
 
 
@@ -154,7 +356,7 @@ def _extract_bottleneck_roofline(
     tokens: int,
     scope: str,
 ) -> dict[str, Any]:
-    eff = analyze_network_efficiency(
+    eff = _analyze_case_bounded(
         raw_case, phase="decode", tokens=tokens,
         context=prompt_tokens, sequences=max(1, int(sequences)), scope=scope,
     )
@@ -189,54 +391,118 @@ def _extract_bottleneck_roofline(
     }
 
 
+def _summarize_iso_sla_state(
+    solved: Mapping[str, Any], *, track: str, mode_label: str, num_devices: int,
+) -> dict[str, Any]:
+    best = solved.get("best_configuration") or {}
+    par = best.get("decode_parallel") or best.get("parallel") or {}
+    tps = float(best.get("sustainable_tps", 0.0) or 0.0)
+    tps_per_die = float(best.get("sustainable_tps_per_die", 0.0) or 0.0)
+    return {
+        "track": track,
+        "mode_label": mode_label,
+        "feasible": bool(solved.get("feasible")),
+        "winner_mode": solved.get("winner_mode"),
+        "parallel": dict(par),
+        "prefill_parallel": dict(best.get("prefill_parallel") or {}) if best.get("prefill_parallel") else None,
+        "pd_ratio": best.get("pd_ratio"),
+        "b_feasible": int(best.get("b_feasible", 0) or 0),
+        "b_vram_max": int(best.get("b_vram_max", 0) or 0),
+        "mtp_proposal_tokens": int(best.get("mtp_proposal_tokens", 0) or 0),
+        "effective_tpot_ms": float(best.get("effective_tpot_ms", 0.0) or 0.0),
+        "decode_step_ms": float(best.get("decode_step_ms", 0.0) or 0.0),
+        "sustainable_tps": tps,
+        "sustainable_tps_per_die": tps_per_die,
+        "cluster_tps_per_purchased_die": tps / float(max(1, int(num_devices))),
+        "n_tok_per_die": float(best.get("n_tok_per_die", 0.0) or 0.0),
+        "us_per_tok_die": float(best.get("us_per_tok_die", 0.0) or 0.0),
+        "operating_regime": str(best.get("operating_regime") or ""),
+        "free_hbm_headroom_gib": float(best.get("free_hbm_headroom_gib", 0.0) or 0.0),
+    }
+
+
+def _bundle_inputs_for_solution(
+    solved: Mapping[str, Any],
+    *,
+    model: str | Mapping[str, Any],
+    hardware: str | Mapping[str, Any],
+    runtime_stack: str | Mapping[str, Any],
+    base_kw: Mapping[str, Any],
+    feature_track: str,
+    prompt_tokens: int,
+    scope: str,
+) -> tuple[dict[str, Any], StepRequest]:
+    rec_case = solved.get("recommended_case")
+    best = solved.get("best_configuration") or {}
+    seq = max(1, int(best.get("b_feasible", 1) or 1))
+    mtp_n = int(best.get("mtp_proposal_tokens", 0) or 0)
+    req = StepRequest(
+        phase="decode", tokens=1 + mtp_n, context=prompt_tokens,
+        sequences=seq, scope=scope,
+    )
+    if rec_case is not None:
+        return dict(rec_case), req
+    fallback_case = compose_case(
+        model, hardware, runtime_stack=runtime_stack,
+        feature_track=feature_track, **dict(base_kw),
+    )
+    return fallback_case, req
+
+
 def _export_solution_artifacts(
     *,
     model: str | Mapping[str, Any],
     hardware: str | Mapping[str, Any],
     runtime_stack: str | Mapping[str, Any],
     wf_kw: Mapping[str, Any],
+    before_solved: Mapping[str, Any],
+    after_solved: Mapping[str, Any],
     prompt_tokens: int,
-    sequences: int,
-    tokens: int,
     scope: str,
     xlsx_path: str | Path | None,
     trace_path: str | Path | None,
     compare_track: str,
     target_track: str,
+    mode: str,
+    rewrite_plan: Any = None,
 ) -> dict[str, Any]:
-    """Lazily delegate ``--xlsx`` / ``--trace`` emission to ``mindie_sim.export``."""
+    """Lazily delegate ``--xlsx`` / ``--trace`` emission with independent Before/After (Parallel, B)."""
     try:
         export_mod = importlib.import_module("mindie_sim.export")
     except ModuleNotFoundError as exc:
         raise ModelingError(
             "solve_export_requires_mindie_sim_export_package"
         ) from exc
-    compose_kw = dict(wf_kw)
-    before_case = compose_case(
-        model, hardware, runtime_stack=runtime_stack,
-        feature_track=compare_track, **compose_kw,
+    before_case, before_req = _bundle_inputs_for_solution(
+        before_solved, model=model, hardware=hardware, runtime_stack=runtime_stack,
+        base_kw=wf_kw, feature_track=compare_track, prompt_tokens=prompt_tokens, scope=scope,
     )
-    after_case = compose_case(
-        model, hardware, runtime_stack=runtime_stack,
-        feature_track=target_track, **compose_kw,
+    after_case, after_req = _bundle_inputs_for_solution(
+        after_solved, model=model, hardware=hardware, runtime_stack=runtime_stack,
+        base_kw=wf_kw, feature_track=target_track, prompt_tokens=prompt_tokens, scope=scope,
     )
-    step_req = StepRequest(
-        phase="decode", tokens=tokens, context=prompt_tokens,
-        sequences=max(1, int(sequences)), scope=scope,
+    before_bundle = export_mod.build_export_bundle(
+        before_case, request=before_req, apply_target_envelope=False,
+    )
+    after_bundle = export_mod.build_export_bundle(
+        after_case, request=after_req,
+        apply_target_envelope=(mode == "modeling"),
+        rewrite_plan=rewrite_plan if mode == "modeling" else None,
     )
     out: dict[str, Any] = {
+        "mode": mode,
         "compare_track": compare_track,
         "target_track": target_track,
     }
     if xlsx_path is not None:
         receipt = export_mod.export_comparison_xlsx(
-            after_case, xlsx_path, compare_source=before_case, request=step_req,
+            before_bundle, xlsx_path,
+            compare_source=after_bundle if mode == "modeling" else None,
         )
         out["xlsx"] = receipt.to_dict() if hasattr(receipt, "to_dict") else str(xlsx_path)
     if trace_path is not None:
-        receipt = export_mod.export_msprof_trace(
-            after_case, trace_path, request=step_req,
-        )
+        trace_target = after_bundle if mode == "modeling" else before_bundle
+        receipt = export_mod.export_msprof_trace(trace_target, trace_path)
         out["trace"] = receipt.to_dict() if hasattr(receipt, "to_dict") else str(trace_path)
     return out
 
@@ -244,6 +510,8 @@ def _export_solution_artifacts(
 def _evaluate_winner_analysis(
     *,
     solved: Mapping[str, Any],
+    before_solved: Mapping[str, Any],
+    after_solved: Mapping[str, Any],
     model: str | Mapping[str, Any],
     hardware: str | Mapping[str, Any],
     runtime_stack: str | Mapping[str, Any],
@@ -261,6 +529,8 @@ def _evaluate_winner_analysis(
     trace_path: str | Path | None,
     compare_track: str,
     target_track: str,
+    mode: str,
+    rewrite_plan: Any = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None]:
     """Compute bottleneck roofline, 4-track waterfall, and optional exports for winner."""
     rec_case = solved.get("recommended_case")
@@ -294,86 +564,131 @@ def _evaluate_winner_analysis(
         inc["archetype_representative_layers"] = len(layer_weights)
         bottleneck["included_components"] = inc
     par = parsed_rec.runtime.parallel
+    full_model_layers = int(parsed_rec.model.layers)
+    max_batched = parsed_rec.runtime.max_num_batched_tokens
+    del eval_case, parsed_rec
+    if use_arch:
+        del rep_case
+    _reclaim_sweep_memory()
     wf_kw: dict[str, Any] = dict(
         tp=par.tp, dp=par.dp, ep=par.ep, pp=par.pp, pcp=par.pcp, dcp=par.cp,
         num_devices=par.world_size, layers=wf_layers, quant=quant,
         kv_cache_dtype=kv_cache_dtype, indexer_kv_dtype=indexer_kv_dtype,
         topology_preset=topology_preset, ranks_per_node=ranks_per_node,
         prompt_tokens=prompt, output_tokens=output,
+        max_num_batched_tokens=max_batched,
         mtp_proposal_tokens=win_mtp, role=win_role,
         homogeneous_graph_reuse="auto",
     )
     if mtp_accept is not None and win_mtp > 0:
         wf_kw["mtp_acceptance_length"] = float(mtp_accept)
-    waterfall = compare_feature_tracks(
-        wf_model, hardware=hardware, runtime_stack=runtime_stack,
-        phase="decode", tokens=win_tokens, context=prompt,
-        sequences=win_seq, scope=win_scope, ablate_prs=ablate_prs,
-        **wf_kw,
-    )
+    if ablate_prs:
+        waterfall = compare_feature_tracks(
+            wf_model, hardware=hardware, runtime_stack=runtime_stack,
+            phase="decode", tokens=win_tokens, context=prompt,
+            sequences=win_seq, scope=win_scope, ablate_prs=True,
+            **wf_kw,
+        )
+    else:
+        wf_full_kw = {**wf_kw, "layers": layers}
+        waterfall = _compare_feature_tracks_bounded(
+            model, hardware=hardware, runtime_stack=runtime_stack,
+            phase="decode", tokens=win_tokens, context=prompt,
+            sequences=win_seq, scope=win_scope, compose_kwargs=wf_full_kw,
+            use_archetype_folding=use_arch,
+        )
     if use_arch and isinstance(waterfall, dict):
         waterfall["archetype_representative_layers"] = int(wf_layers or 0)
-        waterfall["full_model_layers"] = int(parsed_rec.model.layers)
+        waterfall["full_model_layers"] = full_model_layers
     export_kw = {**wf_kw, "layers": layers}
     exports = (
         _export_solution_artifacts(
             model=model, hardware=hardware, runtime_stack=runtime_stack,
-            wf_kw=export_kw, prompt_tokens=prompt, sequences=win_seq,
-            tokens=win_tokens, scope=win_scope,
+            wf_kw=export_kw, before_solved=before_solved, after_solved=after_solved,
+            prompt_tokens=prompt, scope=win_scope,
             xlsx_path=xlsx_path, trace_path=trace_path,
             compare_track=compare_track, target_track=target_track,
+            mode=mode, rewrite_plan=rewrite_plan,
         )
         if (xlsx_path is not None or trace_path is not None) else None
     )
     return waterfall, bottleneck, exports
 
 
-def solve_deployment(
-    model: str | Mapping[str, Any],
-    hardware: str | Mapping[str, Any] = "a3",
+def _build_iso_sla_comparison(
+    before_solved: Mapping[str, Any],
+    after_solved: Mapping[str, Any],
     *,
-    num_devices: int | None = None,
-    prompt_tokens: int | None = None,
-    output_tokens: int | None = None,
-    tpot_slo_ms: float | None = None,
-    ttft_slo_ms: float | None = None,
-    mtp_tokens: int | None = None,
-    mtp_accept: float | None = None,
-    kv_pooling: str | bool | None = "auto",
-    deployment: str = "auto",
-    quant: str | Mapping[str, Any] | None = None,
-    kv_cache_dtype: str | None = None,
-    indexer_kv_dtype: str | None = None,
-    topology_preset: str | None = None,
-    ranks_per_node: int | None = None,
-    layers: int | None = None,
-    max_sequences_per_dp: int | None = None,
-    ablate_prs: bool = False,
-    pool_dram_ratio: float | None = None,
-    pool_ssd_ratio: float = 0.0,
-    pool_prefix_hit_ratio: float = 0.0,
-    ddr_bw_gbps: float | None = None,
-    ssd_bw_gbps: float | None = None,
+    solve_mode: str,
+    before_track: str,
+    target_track: str,
+    num_devices: int,
+) -> dict[str, Any]:
+    """Assemble the Iso-SLA Before vs After comparison summary."""
+    before_summary = _summarize_iso_sla_state(
+        before_solved, track=before_track,
+        mode_label="Before [当前栈仿真基线]", num_devices=num_devices,
+    )
+    after_summary = _summarize_iso_sla_state(
+        after_solved, track=target_track if solve_mode == "modeling" else before_track,
+        mode_label="After [卡SLA目标建模终态]" if solve_mode == "modeling" else "Simulation [仿真基线]",
+        num_devices=num_devices,
+    )
+    b_tps = before_summary["sustainable_tps_per_die"]
+    a_tps = after_summary["sustainable_tps_per_die"]
+    return {
+        "mode": solve_mode,
+        "allow_unbound_formula": (solve_mode == "modeling"),
+        "before": before_summary,
+        "after": after_summary,
+        "parallel_changed": before_summary["parallel"] != after_summary["parallel"],
+        "batch_changed": before_summary["b_feasible"] != after_summary["b_feasible"],
+        "tps_per_die_gain_x": round(a_tps / b_tps, RATIO_DIGITS) if b_tps > MIN_RATIO_EPS else None,
+    }
+
+
+def _infeasible_candidate_summary(solved: Mapping[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "mode": row.get("deployment_mode"),
+            "parallel": row.get("parallel") or row.get("decode_parallel"),
+            "reason": row.get("infeasible_reason"),
+            "effective_tpot_ms": row.get("effective_tpot_ms"),
+            "b_vram_max": row.get("b_vram_max"),
+        }
+        for row in solved.get("candidates", ())[:TOP_BOTTLENECK_FAMILIES]
+    ]
+
+
+def solve_deployment(
+    model: str | Mapping[str, Any], hardware: str | Mapping[str, Any] = "a3", *,
+    num_devices: int | None = None, prompt_tokens: int | None = None,
+    output_tokens: int | None = None, tpot_slo_ms: float | None = None,
+    ttft_slo_ms: float | None = None, mtp_tokens: int | None = None,
+    mtp_accept: float | None = None, kv_pooling: str | bool | None = "auto",
+    deployment: str = "auto", quant: str | Mapping[str, Any] | None = None,
+    kv_cache_dtype: str | None = None, indexer_kv_dtype: str | None = None,
+    topology_preset: str | None = None, ranks_per_node: int | None = None,
+    layers: int | None = None, max_sequences_per_dp: int | None = None,
+    ablate_prs: bool = False, pool_dram_ratio: float | None = None,
+    pool_ssd_ratio: float = 0.0, pool_prefix_hit_ratio: float = 0.0,
+    ddr_bw_gbps: float | None = None, ssd_bw_gbps: float | None = None,
     kv_transfer_bw_gbps: float | None = None,
     pinned_parallel: Mapping[str, int] | None = None,
     pinned_prefill_parallel: Mapping[str, int] | None = None,
     pinned_decode_parallel: Mapping[str, int] | None = None,
-    raw_eager: bool = False,
-    runtime_stack: str | Mapping[str, Any] = "vllm-ascend",
-    optimizations: Sequence[str] = (),
-    exclude_optimizations: Sequence[str] = (),
-    xlsx_path: str | Path | None = None,
-    trace_path: str | Path | None = None,
-    compare_track: str = "unmerged_pr",
-    target_track: str = "expected_ideal",
+    raw_eager: bool = False, runtime_stack: str | Mapping[str, Any] = "vllm-ascend",
+    optimizations: Sequence[str] = (), exclude_optimizations: Sequence[str] = (),
+    xlsx_path: str | Path | None = None, trace_path: str | Path | None = None,
+    compare_track: str = "unmerged_pr", target_track: str = "expected_ideal",
+    mode: str = "modeling", rewrite_plan: Any = None,
 ) -> dict[str, Any]:
-    """One-shot deployment solver returning capacity, optimal PD/colocated, waterfall, and roofline."""
+    """One-shot deployment solver with first-class ``simulation`` vs ``modeling`` split."""
+    solve_mode = _resolve_solve_mode(mode)
     missing = [
         name for name, val in (
-            ("num_devices", num_devices),
-            ("prompt_tokens", prompt_tokens),
-            ("output_tokens", output_tokens),
-            ("tpot_slo_ms", tpot_slo_ms),
+            ("num_devices", num_devices), ("prompt_tokens", prompt_tokens),
+            ("output_tokens", output_tokens), ("tpot_slo_ms", tpot_slo_ms),
         ) if val is None
     ]
     if float(pool_ssd_ratio) > 0.0 and ssd_bw_gbps is None:
@@ -382,92 +697,79 @@ def solve_deployment(
         raise missing_scenario_error(missing)
 
     pd_mode = _resolve_kv_pooling_mode(kv_pooling)
-    solved = solve_optimal_deployment(
-        model, hardware,
-        num_devices=int(num_devices),
-        prompt_tokens=int(prompt_tokens),
-        output_tokens=int(output_tokens),
-        ttft_sla_ms=ttft_slo_ms,
-        tpot_sla_ms=float(tpot_slo_ms),
-        deployment=deployment,
-        pd_transfer_mode=pd_mode,
-        kv_transfer_bw_gbps=kv_transfer_bw_gbps,
-        pool_dram_ratio=pool_dram_ratio,
-        pool_ssd_ratio=pool_ssd_ratio,
-        pool_prefix_hit_ratio=pool_prefix_hit_ratio,
-        ddr_bw_gbps=ddr_bw_gbps,
-        ssd_bw_gbps=ssd_bw_gbps,
-        pinned_parallel=pinned_parallel,
-        pinned_prefill_parallel=pinned_prefill_parallel,
-        pinned_decode_parallel=pinned_decode_parallel,
-        mtp_proposal_tokens=mtp_tokens,
-        mtp_acceptance_length=mtp_accept,
-        max_sequences_per_dp=max_sequences_per_dp,
-        quant=quant,
-        layers=layers,
-        ranks_per_node=ranks_per_node,
-        topology_preset=topology_preset,
-        raw_eager=raw_eager,
-        runtime_stack=runtime_stack,
-        optimizations=optimizations,
-        exclude_optimizations=exclude_optimizations,
-        kv_cache_dtype=kv_cache_dtype,
-        indexer_kv_dtype=indexer_kv_dtype,
-        allow_unconstrained_ttft=(ttft_slo_ms is None),
+    shared_kw: dict[str, Any] = dict(
+        num_devices=int(num_devices), prompt_tokens=int(prompt_tokens),
+        output_tokens=int(output_tokens), ttft_sla_ms=ttft_slo_ms, tpot_sla_ms=float(tpot_slo_ms),
+        deployment=deployment, pd_transfer_mode=pd_mode, kv_transfer_bw_gbps=kv_transfer_bw_gbps,
+        pool_dram_ratio=pool_dram_ratio, pool_ssd_ratio=pool_ssd_ratio,
+        pool_prefix_hit_ratio=pool_prefix_hit_ratio, ddr_bw_gbps=ddr_bw_gbps,
+        ssd_bw_gbps=ssd_bw_gbps, pinned_parallel=pinned_parallel,
+        pinned_prefill_parallel=pinned_prefill_parallel, pinned_decode_parallel=pinned_decode_parallel,
+        mtp_proposal_tokens=mtp_tokens, mtp_acceptance_length=mtp_accept,
+        max_sequences_per_dp=max_sequences_per_dp, quant=quant, layers=layers,
+        ranks_per_node=ranks_per_node, topology_preset=topology_preset, raw_eager=raw_eager,
+        runtime_stack=runtime_stack, optimizations=optimizations,
+        exclude_optimizations=exclude_optimizations, kv_cache_dtype=kv_cache_dtype,
+        indexer_kv_dtype=indexer_kv_dtype, allow_unconstrained_ttft=(ttft_slo_ms is None),
     )
-    prompt = int(prompt_tokens)
-    output = int(output_tokens)
+    before_track = (
+        "merged"
+        if (solve_mode == "simulation" and str(compare_track).strip().lower() == "expected_ideal")
+        else str(compare_track)
+    )
+    before_solved = solve_optimal_deployment(model, hardware, feature_track=before_track, **shared_kw)
+    _reclaim_sweep_memory()
+    if solve_mode == "modeling" and str(target_track) != before_track:
+        after_solved = solve_optimal_deployment(model, hardware, feature_track=str(target_track), **shared_kw)
+        _reclaim_sweep_memory()
+    else:
+        after_solved = before_solved
+    solved = after_solved if (solve_mode == "modeling" and after_solved.get("feasible")) else before_solved
+    prompt, output = int(prompt_tokens), int(output_tokens)
     ledger = _build_capacity_ledger(solved, prompt_tokens=prompt, output_tokens=output)
 
     best = solved.get("best_configuration")
     feasible_sorted = sorted(
         (row for row in solved.get("candidates", ()) if row.get("feasible")),
-        key=lambda row: (
-            -float(row.get("sustainable_tps", 0.0)),
-            int(row.get("used_dies", 0)),
-            float(row.get("effective_tpot_ms", 0.0)),
-        ),
+        key=lambda row: (-float(row.get("sustainable_tps", 0.0)), int(row.get("used_dies", 0)), float(row.get("effective_tpot_ms", 0.0))),
     )
     runner_ups = feasible_sorted[1:1 + TOP_RUNNER_UPS]
-
     waterfall, bottleneck, exports = _evaluate_winner_analysis(
-        solved=solved, model=model, hardware=hardware, runtime_stack=runtime_stack,
+        solved=solved, before_solved=before_solved, after_solved=after_solved,
+        model=model, hardware=hardware, runtime_stack=runtime_stack,
         prompt=prompt, output=output, layers=layers, quant=quant,
         kv_cache_dtype=kv_cache_dtype, indexer_kv_dtype=indexer_kv_dtype,
         topology_preset=topology_preset, ranks_per_node=ranks_per_node,
         mtp_accept=mtp_accept, ablate_prs=ablate_prs,
         xlsx_path=xlsx_path, trace_path=trace_path,
-        compare_track=compare_track, target_track=target_track,
+        compare_track=before_track, target_track=str(target_track),
+        mode=solve_mode, rewrite_plan=rewrite_plan,
     )
-
+    iso_sla = _build_iso_sla_comparison(
+        before_solved, after_solved, solve_mode=solve_mode,
+        before_track=before_track, target_track=str(target_track), num_devices=int(num_devices),
+    )
+    rec_dep: dict[str, Any] = {
+        "winner_mode": solved["winner_mode"], "feasible": bool(solved["feasible"]),
+        "best_configuration": best, "best_pd": solved.get("best_pd"),
+        "best_colocated": solved.get("best_colocated"), "runner_ups": runner_ups,
+    }
+    if not solved["feasible"]:
+        rec_dep["infeasible_summary"] = _infeasible_candidate_summary(solved)
     solution: dict[str, Any] = {
-        "schema": SOLVE_SCHEMA,
-        "model": solved["model"],
-        "hardware": solved["hardware"],
-        "num_devices": solved["num_devices"],
+        "schema": SOLVE_SCHEMA, "mode": solve_mode, "allow_unbound_formula": (solve_mode == "modeling"),
+        "model": solved["model"], "hardware": solved["hardware"], "num_devices": solved["num_devices"],
         "scenario": {
-            "prompt_tokens": prompt,
-            "output_tokens": output,
-            "ttft_slo_ms": ttft_slo_ms,
-            "tpot_slo_ms": float(tpot_slo_ms),
-            "kv_pooling": kv_pooling,
+            "prompt_tokens": prompt, "output_tokens": output,
+            "ttft_slo_ms": ttft_slo_ms, "tpot_slo_ms": float(tpot_slo_ms), "kv_pooling": kv_pooling,
         },
-        "feasible": bool(solved["feasible"]),
-        "capacity_ledger": ledger,
-        "recommended_deployment": {
-            "winner_mode": solved["winner_mode"],
-            "feasible": bool(solved["feasible"]),
-            "best_configuration": best,
-            "best_pd": solved.get("best_pd"),
-            "best_colocated": solved.get("best_colocated"),
-            "runner_ups": runner_ups,
-        },
-        "four_track_waterfall": waterfall,
-        "bottleneck_roofline": bottleneck,
+        "feasible": bool(solved["feasible"]), "capacity_ledger": ledger,
+        "recommended_deployment": rec_dep, "iso_sla_comparison": iso_sla,
+        "four_track_waterfall": waterfall, "bottleneck_roofline": bottleneck,
     }
     if exports is not None:
         solution["exports"] = exports
     return solution
 
 
-__all__ = ["SOLVE_SCHEMA", "solve_deployment"]
+__all__ = ["SOLVE_SCHEMA", "VALID_SOLVE_MODES", "solve_deployment"]

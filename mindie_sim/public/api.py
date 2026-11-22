@@ -66,6 +66,16 @@ from .api_support import (
     _require_schema,
 )
 from .errors import ExtensionError
+from .formula_sdk import (
+    FormulaKernelEvaluation,
+    FormulaKernelSpec,
+    FormulaTensorSpec,
+    bind_kernel_implementation,
+    enforce_simulation_binding_guard,
+    evaluate_formula_kernel,
+    model_target_ceiling,
+    simulate_formula_kernel,
+)
 
 
 def simulate_operator(case: Any, ops: Any, *, extensions: Any = None,
@@ -73,8 +83,13 @@ def simulate_operator(case: Any, ops: Any, *, extensions: Any = None,
                       profile: Any = None, service_id: str | None = None,
                       **kwargs: Any) -> dict[str, Any]:
     """Price isolated operators from a Case or declared hardware environment."""
+    allow_unbound = bool(kwargs.pop("allow_unbound_formula", False))
     context = _context(extensions)
     selected = _provider("operator", provider, context)
+    enforce_simulation_binding_guard(
+        ops, capability="operator", entry="simulate_operator",
+        allow_unbound_formula=allow_unbound, has_bound_provider=(selected is not None),
+    )
     environment = _environment(case)
     selected_profile = _profile(profile)
     replay = {"entry": "simulate_operator", "ops": _ops_replay(ops),
@@ -146,8 +161,13 @@ def simulate_native_call(case: Any, ops: Any, *, extensions: Any = None,
                          service_id: str | None = None,
                          **kwargs: Any) -> dict[str, Any]:
     """Compose an already-declared native call through the ordinary engine."""
+    allow_unbound = bool(kwargs.pop("allow_unbound_formula", False))
     context = _context(extensions)
     selected = _provider("native", provider, context)
+    enforce_simulation_binding_guard(
+        ops, capability="native", entry="simulate_native_call",
+        allow_unbound_formula=allow_unbound, has_bound_provider=(selected is not None),
+    )
     environment = _environment(case)
     selected_profile = _profile(profile)
     replay = {"entry": "simulate_native_call", "ops": _ops_replay(ops),
@@ -234,6 +254,8 @@ def simulate_aclnn_call(case: Any, call: Any = None, *, ops: Any = None,
                         service_id: str | None = None,
                         **kwargs: Any) -> dict[str, Any]:
     """Price one standalone aclnn ABI invocation on the canonical call path."""
+    if kwargs.pop("allow_unbound_formula", False):
+        raise ExtensionError("simulation_mode_forbids_unbound_formula_ops:simulate_aclnn_call")
     if isinstance(call, str):
         if api is not None:
             raise ExtensionError("aclnn_call_api_and_symbol_ambiguous")
@@ -278,8 +300,13 @@ def simulate_graph(case: Any, ops: Any, *, extensions: Any = None,
                    service_id: str | None = None,
                    **kwargs: Any) -> dict[str, Any]:
     """Compose a declared dependency graph on shared device resources."""
+    allow_unbound = bool(kwargs.pop("allow_unbound_formula", False))
     context = _context(extensions)
     selected = _provider("graph", provider, context)
+    enforce_simulation_binding_guard(
+        ops, capability="graph", entry="simulate_graph",
+        allow_unbound_formula=allow_unbound, has_bound_provider=(selected is not None),
+    )
     environment = _environment(case)
     selected_profile = _profile(profile)
     replay = {"entry": "simulate_graph", "ops": _ops_replay(ops),
@@ -355,6 +382,8 @@ def simulate_graph(case: Any, ops: Any, *, extensions: Any = None,
 def simulate_model(case: Any, *, extensions: Any = None,
                    provider: str | None = None, **kwargs: Any) -> dict[str, Any]:
     """Evaluate the independent target-body forward program."""
+    if kwargs.pop("allow_unbound_formula", False):
+        raise ExtensionError("simulation_mode_forbids_unbound_formula_ops:simulate_model")
     if "scope" in kwargs:
         raise ExtensionError("simulate_model_owns_scope")
     context = _context(extensions)
@@ -392,6 +421,8 @@ def simulate_model(case: Any, *, extensions: Any = None,
 def simulate_service(case: Any, *, extensions: Any = None,
                      provider: str | None = None, **kwargs: Any) -> dict[str, Any]:
     """Evaluate the independent serving request and capacity path."""
+    if kwargs.pop("allow_unbound_formula", False):
+        raise ExtensionError("simulation_mode_forbids_unbound_formula_ops:simulate_service")
     if "scope" in kwargs:
         raise ExtensionError("simulate_service_owns_scope")
     context = _context(extensions)
@@ -431,4 +462,7 @@ __all__ = [
     "evaluate_service", "solve_sla", "sweep_topology", "export_structure",
     "simulate_operator", "simulate_native_call", "simulate_aclnn_call",
     "simulate_graph", "simulate_model", "simulate_service",
+    "FormulaTensorSpec", "FormulaKernelSpec", "FormulaKernelEvaluation",
+    "evaluate_formula_kernel", "simulate_formula_kernel",
+    "bind_kernel_implementation", "model_target_ceiling",
 ]

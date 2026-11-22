@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from functools import lru_cache
 import json
 import os
 from pathlib import Path
@@ -30,7 +31,18 @@ import shlex
 import tempfile
 from typing import Any
 
+from mindie_sim.catalog.npu_checkpoints import (
+    msmodelslim_quarot_guidance,
+    normalize_hw_family,
+    resolve_default_checkpoint,
+    validate_quant_for_hardware,
+)
 from mindie_sim.catalog.quant import LONG_CONTEXT_KV_QUANT_THRESHOLD
+from mindie_sim.catalog.va_speculative_rules import (
+    SPECULATIVE_COMPANIONS,
+    build_va_serving_rules,
+    validate_aclgraph_capture_sizes,
+)
 
 from .models import GIB_BYTES, US_PER_MS, ExportBundle
 
@@ -64,35 +76,22 @@ _QUANT_BASENAME_TOKENS: tuple[tuple[str, str], ...] = (
     ("fp8", "fp8"),
     ("bf16", "bf16"),
 )
-_KNOWN_CATALOG_HINTS: tuple[tuple[str, str], ...] = (
-    ("kimi-k3.1", "kimi-k3.1"),
-    ("kimi_k3.1", "kimi-k3.1"),
-    ("kimi-k3", "kimi-k3"),
-    ("kimi-k2.6", "kimi-k2.6"),
-    ("kimi-k2.5", "kimi-k2.5"),
-    ("kimi-k2", "kimi-k2"),
-    ("qwen3.8-flash", "qwen3.8-flash-next"),
-    ("qwen3.8-2.4t", "qwen3.8-2.4t-a95b"),
-    ("qwen3.8-27b", "qwen3.8-27b"),
-    ("qwen3.6-35b", "qwen3.6-35b-a3b"),
-    ("qwen3.5-397b", "qwen3.5-397b-a17b"),
-    ("qwen3.5-122b", "qwen3.5-122b-a10b"),
-    ("qwen3.5-35b", "qwen3.5-35b-a3b"),
-    ("qwen3-next-80b", "qwen3-next-80b-a3b"),
-    ("qwen3-235b", "qwen3-235b-a22b"),
-    ("qwen3-32b", "qwen3-32b"),
-    ("deepseek-v4-pro", "deepseek-v4-pro"),
-    ("deepseek-v4.1-flash", "deepseek-v4.1-flash"),
-    ("deepseek-v4-flash", "deepseek-v4-flash"),
-    ("deepseek-v3.2", "deepseek-v3.2"),
-    ("deepseek-v3", "deepseek-v3"),
-    ("deepseek-r1", "deepseek-r1"),
-    ("glm-5.3-flash", "glm-5.3-flash"),
-    ("glm-5.3", "glm-5.3"),
-    ("glm-5.2", "glm-5.2"),
-    ("glm-5.1", "glm-5.1"),
-    ("glm-5", "glm-5"),
-)
+@lru_cache(maxsize=1)
+def _dynamic_catalog_hints() -> tuple[tuple[str, str], ...]:
+    """Build sorted ``(needle, canonical_key)`` lookup dynamically from ``model_catalog``."""
+    from mindie_sim.model_catalog import CATALOG, MODEL_ALIASES
+
+    pairs: dict[str, str] = {}
+    for canonical in CATALOG:
+        low = str(canonical).strip().lower()
+        pairs[low] = canonical
+        pairs[low.replace("-", "_")] = canonical
+    for alias, target in MODEL_ALIASES.items():
+        low = str(alias).strip().lower()
+        pairs.setdefault(low, str(target))
+        pairs.setdefault(low.replace("-", "_"), str(target))
+    ordered = sorted(pairs.items(), key=lambda kv: (-len(kv[0]), kv[0]))
+    return tuple(ordered)
 
 
 @dataclass(frozen=True, slots=True)
@@ -265,8 +264,9 @@ def _infer_model_and_quant_from_arg(model_arg: str) -> tuple[str, str, str]:
                 quant_hint = preset
                 break
     catalog_model = ""
-    for needle, canonical in _KNOWN_CATALOG_HINTS:
-        if needle in base_low:
+    norm_base = base_low.replace("_", "-")
+    for needle, canonical in _dynamic_catalog_hints():
+        if needle in base_low or needle in norm_base:
             catalog_model = canonical
             break
     return catalog_model, local_cfg, quant_hint
@@ -411,6 +411,65 @@ def _is_a5_sku(hardware_sku: str) -> bool:
     return any(tok in low for tok in ("950", "a5", "3510"))
 
 
+def _audit_isa_and_speculative_rules(
+    parsed: ParsedLaunchScript,
+    *,
+    after_bundle: ExportBundle,
+    hw_fam: str,
+    quarot_info: Mapping[str, Any],
+) -> list[ScriptAuditIssue]:
+    """Audit hardware ISA separation, ACLGraph K+1 capture multiples, and draft TP."""
+    mem_a = after_bundle.memory_ledger
+    found: list[ScriptAuditIssue] = []
+    isa_warns = validate_quant_for_hardware(
+        parsed.inferred_quant or parsed.quantization_flag,
+        hw_fam,
+        kv_cache_dtype=parsed.kv_cache_dtype or "bf16",
+    )
+    if isa_warns:
+        found.append(ScriptAuditIssue(
+            "hw_isa_quant_incompatible", "CRITICAL",
+            f"硬件 ISA 不支持所选量化/KV 格式 ({hw_fam.upper()})",
+            f"quant={parsed.inferred_quant or parsed.quantization_flag}, kv={parsed.kv_cache_dtype or 'auto'}",
+            str(quarot_info["target_recipe"]),
+            "; ".join(isa_warns),
+        ))
+    spec_k = int(parsed.speculative_config.get("num_speculative_tokens") or after_bundle.spec_proposals or 0)
+    raw_cap_sizes = parsed.compilation_config.get("cudagraph_capture_sizes")
+    if isinstance(raw_cap_sizes, list) and spec_k > 0:
+        cap_warns = validate_aclgraph_capture_sizes(
+            [int(x) for x in raw_cap_sizes if isinstance(x, int)],
+            num_speculative_tokens=spec_k,
+            cudagraph_mode=str(parsed.compilation_config.get("cudagraph_mode") or "FULL_DECODE_ONLY"),
+        )
+        if cap_warns:
+            found.append(ScriptAuditIssue(
+                "aclgraph_capture_size_not_k_plus_1", "HIGH",
+                f"ACLGraph capture_sizes 非 (K+1)={spec_k + 1} 的整数倍",
+                str(raw_cap_sizes),
+                f"设置为 n * {spec_k + 1} 倍数",
+                cap_warns[0],
+            ))
+    va_rules = build_va_serving_rules(
+        after_bundle.model_name, hw_family=hw_fam, tp=mem_a.tp, dp=mem_a.dp, ep=mem_a.ep, pp=mem_a.pp,
+        target_kv_dtype=mem_a.cache_dtype.lower(),
+        enable_speculative=(spec_k > 0 or after_bundle.model_name.lower() in SPECULATIVE_COMPANIONS),
+        num_speculative_tokens=spec_k if spec_k > 0 else None, max_num_seqs=max(1, mem_a.concurrency),
+    )
+    if parsed.speculative_config and va_rules.resolved_speculative is not None:
+        req_dtp = va_rules.resolved_speculative.draft_tensor_parallel_size
+        got_dtp = parsed.speculative_config.get("draft_tensor_parallel_size")
+        if req_dtp is not None and got_dtp is not None and int(got_dtp) != int(req_dtp):
+            found.append(ScriptAuditIssue(
+                "draft_tp_policy_mismatch", "HIGH",
+                f"投机草稿 draft_tensor_parallel_size 与 {va_rules.resolved_speculative.method} 规则冲突",
+                f"draft_tensor_parallel_size={got_dtp}",
+                f"draft_tensor_parallel_size={req_dtp}",
+                f"vLLM Ascend 规则要求 {va_rules.resolved_speculative.method} 使用 draft_tp={req_dtp}",
+            ))
+    return found
+
+
 def audit_launch_script(
     parsed: ParsedLaunchScript,
     *,
@@ -421,15 +480,18 @@ def audit_launch_script(
 ) -> ScriptAuditReport:
     """Audit a parsed user launch script and compute Two-Step Gain."""
     is_a5 = _is_a5_sku(after_bundle.hardware_sku)
+    hw_fam = normalize_hw_family(after_bundle.hardware_sku)
+    ckpt = resolve_default_checkpoint(after_bundle.model_name, hw_family=hw_fam)
+    quarot_info = msmodelslim_quarot_guidance(hw_fam)
     mem_b = before_bundle.memory_ledger
     mem_a = after_bundle.memory_ledger
-    issues: list[ScriptAuditIssue] = []
+    issues = _audit_isa_and_speculative_rules(
+        parsed, after_bundle=after_bundle, hw_fam=hw_fam, quarot_info=quarot_info,
+    )
 
     if not parsed.quantization_flag and parsed.inferred_quant in {"", "bf16"}:
-        rec_q = (
-            "--quantization ascend (msmodelslim QuaRot MXFP8+MXFP4)"
-            if is_a5 else "--quantization ascend (msmodelslim W4A8_DYNAMIC / W8A8_DYNAMIC)"
-        )
+        ckpt_hint = f" | 推荐权重: {ckpt.repo_id}" if ckpt is not None else ""
+        rec_q = f"--quantization ascend ({quarot_info['target_recipe']}){ckpt_hint}"
         issues.append(ScriptAuditIssue(
             "missing_quantization_bf16", "HIGH",
             "未启用生产量化 (原生 BF16 显存浪费/带宽受限)",
@@ -557,12 +619,22 @@ def render_optimized_serve_sh(
     """Render (and optionally atomically save) a hardware-matched ``optimized_serve.sh``."""
     mem = after_bundle.memory_ledger
     is_a5 = _is_a5_sku(after_bundle.hardware_sku)
-    is_a2 = (not is_a5) and any(tok in after_bundle.hardware_sku.lower() for tok in ("910b", "a2"))
+    hw_fam = normalize_hw_family(after_bundle.hardware_sku)
+    is_a2 = hw_fam == "a2"
     has_mla = any("mla" in op.submodule.lower() for op in after_bundle.operators)
     has_mso = any(op.stream_index == 1 for op in after_bundle.operators)
+    ckpt = resolve_default_checkpoint(after_bundle.model_name, hw_family=hw_fam)
+    va_rules = build_va_serving_rules(
+        after_bundle.model_name, hw_family=hw_fam, tp=mem.tp, dp=mem.dp, ep=mem.ep, pp=mem.pp,
+        target_kv_dtype=mem.cache_dtype.lower(),
+        enable_speculative=(after_bundle.spec_proposals > 0),
+        num_speculative_tokens=(after_bundle.spec_proposals if after_bundle.spec_proposals > 0 else None),
+        max_num_seqs=max(parsed.max_num_seqs, mem.concurrency),
+    )
 
     kv_flag = "fp8_e4m3" if is_a5 else ("int8" if mem.cache_dtype in {"C8", "FP8"} else "auto")
     add_cfg: dict[str, Any] = dict(parsed.additional_config)
+    add_cfg.update(va_rules.additional_config)
     add_cfg["enable_fused_mc2"] = 3 if mem.ep >= 8 else 2
     add_cfg["enable_flashcomm1"] = True
     if has_mso:
@@ -572,6 +644,7 @@ def render_optimized_serve_sh(
         add_cfg["enable_weight_nz_layout"] = True
 
     comp_cfg = dict(parsed.compilation_config)
+    comp_cfg.update(va_rules.compilation_config)
     comp_cfg["cudagraph_mode"] = "FULL_DECODE_ONLY"
     model_target = parsed.model_arg or f"/weights/{after_bundle.model_name}"
 
@@ -580,13 +653,17 @@ def render_optimized_serve_sh(
         "# Auto-generated by mindie-sim launch-script audit & tuning",
         f"# Model: {after_bundle.model_name} | Hardware: {after_bundle.hardware_sku} | "
         f"Parallel: DP={mem.dp}, TP={mem.tp}, EP={mem.ep}, PP={mem.pp}, DCP={mem.dcp}",
+    ]
+    if ckpt is not None:
+        lines.append(f"# Recommended Checkpoint (QuaRot-First): {ckpt.repo_id} ({ckpt.quant_preset})")
+    lines.extend([
         "set -euo pipefail",
         "",
         'export HCCL_OP_EXPANSION_MODE="AIV"',
         f"export HCCL_BUFFSIZE={DEFAULT_HCCL_BUFFSIZE_MIB}",
         f"export HCCL_BUFFSIZE_EP={DEFAULT_HCCL_EP_BUFFSIZE_MIB}",
         "export VLLM_ASCEND_ENABLE_FUSED_MC2=1",
-    ]
+    ])
     if not is_a2:
         lines.append("export HCCL_INTRA_PCIE_ENABLE=1")
         lines.append("export HCCL_INTRA_ROCE_ENABLE=0")
@@ -607,6 +684,8 @@ def render_optimized_serve_sh(
         lines.append("  --enable-expert-parallel \\")
     if mem.dcp > 1:
         lines.append(f"  --decode-context-parallel-size {mem.dcp} \\")
+    if va_rules.speculative_enabled and va_rules.speculative_config:
+        lines.append(f"  --speculative-config '{json.dumps(va_rules.speculative_config, ensure_ascii=False)}' \\")
     lines.extend([
         "  --quantization ascend \\",
         f"  --kv-cache-dtype {kv_flag} \\",

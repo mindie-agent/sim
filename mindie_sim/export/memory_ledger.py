@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 import math
 from typing import Any
 
@@ -23,6 +23,12 @@ from mindie_sim.catalog.cache import (
     DEFAULT_CACHE_BLOCK_SIZE,
     INDEX_INTERLEAVE_TOKENS,
     layer_cache_components,
+)
+from mindie_sim.catalog.npu_checkpoints import (
+    NpuCheckpointSpec,
+    classify_weight_tensor_quant,
+    normalize_hw_family,
+    resolve_default_checkpoint,
 )
 from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.catalog.weight_terms import WeightTerm, _sharded_shape
@@ -50,7 +56,7 @@ from .models import (
     WeightLedgerRow,
 )
 
-_ENGRAM_CATEGORIES = frozenset({"engram_table", "ple_table", "gemma4_ple"})
+_ENGRAM_CATEGORIES = frozenset({"engram_table", "ple_table"})
 _VISION_CATEGORIES = frozenset({"vision", "projector", "vision_pos", "image_token"})
 _VISION_NAME_PREFIXES = ("vision_", "aligner_", "merger_", "projector_", "image_")
 _W4A8_EXPERT_ONLY_CATEGORIES = frozenset({"expert", "routed_expert", "moe.routed"})
@@ -61,10 +67,15 @@ _FIXED_FP32_CATEGORIES = frozenset({
 })
 _FIXED_BF16_CATEGORIES = frozenset({
     "norm", "embedding", "lm_head", "router", "router_bias",
-    "engram_table", "ple_table", "gemma4_ple", "vision", "projector",
+    "engram_table", "ple_table", "vision", "projector",
     "vision_pos", "image_token", "conv_weight_bf16", "linear_param_bf16",
     "compressor_bf16_runtime", "dspark_input",
 })
+
+
+def _is_ple_category(cat: str) -> bool:
+    low = str(cat or "").lower()
+    return low == "ple" or low.endswith("_ple")
 _WEIGHT_QUANT_ALIASES: dict[str, str] = {
     "bf16": "BF16",
     "bfloat16": "BF16",
@@ -276,6 +287,8 @@ def _cache_dtype_override_ratio(model: Any, target_dtype: str) -> float:
 
 def _compute_cache_ledger_rows(
     case: Case,
+    mem: Memory,
+    alloc_cache: Mapping[str, Any],
     *,
     stage_layers: Sequence[int],
     cache_dtype: str,
@@ -284,16 +297,23 @@ def _compute_cache_ledger_rows(
     block_size: int,
     spec_tokens: int,
 ) -> tuple[int, tuple[CacheLedgerRow, ...], list[float], list[float]]:
+    """Unify cache ledger rows directly onto ``Memory(case)`` (including Draft KV & page groups)."""
     model = case.model
     p = case.runtime.parallel
     dcp = max(1, int(p.cp))
+    n_stages = len(stage_layers)
     local_tokens = math.ceil(max(1, seq_len) / (max(1, block_size) * dcp)) * max(1, block_size)
     layer_stage = [s for s, count in enumerate(stage_layers) for _ in range(count)]
-    comp_stage_bytes: dict[str, list[float]] = defaultdict(lambda: [0.0] * len(stage_layers))
-    comp_stage_layers: dict[str, list[int]] = defaultdict(lambda: [0] * len(stage_layers))
+    comp_stage_bytes: dict[str, list[float]] = defaultdict(lambda: [0.0] * n_stages)
+    comp_stage_layers: dict[str, list[int]] = defaultdict(lambda: [0] * n_stages)
     comp_scalable: dict[str, bool] = {}
 
     scale_override = _cache_dtype_override_ratio(model, cache_dtype)
+    fixed_state_comps = frozenset({
+        "recurrent_state", "conv_state", "compressor_state",
+        "page_group_reserve", "page_metadata",
+    })
+    # Count active target layers per component so per-token-per-layer rates stay exact.
     for lp in model.layer_plans:
         stage = layer_stage[lp.index] if lp.index < len(layer_stage) else 0
         raw_comps = layer_cache_components(
@@ -304,16 +324,58 @@ def _compute_cache_ledger_rows(
             query_tokens=max(1, 1 + spec_tokens),
         )
         for comp_name, val in raw_comps.items():
+            if val > 0.0:
+                comp_stage_layers[comp_name][stage] += 1
+
+    # Read authoritative per-stage component bytes directly from Memory.allocation_report().
+    alloc_summary = alloc_cache.get("allocated") or {}
+    reserves = alloc_summary.get("reserve_bytes_per_stage_rank") or ()
+    metadatas = alloc_summary.get("metadata_bytes_per_stage_rank") or ()
+    comp_entries = alloc_cache.get("components") or ()
+    for st_idx in range(n_stages):
+        entry = comp_entries[st_idx] if st_idx < len(comp_entries) else {}
+        for comp_name, detail in (entry.get("allocated") or {}).items():
+            val = float(detail.get("total", 0.0) or 0.0)
             if val <= 0.0:
                 continue
-            scalable = comp_name not in {"recurrent_state", "conv_state", "compressor_state"}
+            scalable = comp_name not in fixed_state_comps
             comp_scalable[comp_name] = scalable
-            adjusted = float(val) * (scale_override if scalable else 1.0)
-            comp_stage_bytes[comp_name][stage] += adjusted
-            comp_stage_layers[comp_name][stage] += 1
+            comp_stage_bytes[comp_name][st_idx] += val * (scale_override if scalable else 1.0)
+        for comp_name, detail in (entry.get("group_allocated") or {}).items():
+            val = float(detail.get("alloc_payload", 0.0) or 0.0) + float(detail.get("alloc_scale", 0.0) or 0.0)
+            if val <= 0.0:
+                continue
+            scalable = comp_name not in fixed_state_comps
+            comp_scalable[comp_name] = scalable
+            comp_stage_bytes[comp_name][st_idx] += val * (scale_override if scalable else 1.0)
+        if st_idx < len(reserves) and float(reserves[st_idx] or 0.0) > 0.0:
+            comp_scalable["page_group_reserve"] = False
+            comp_stage_bytes["page_group_reserve"][st_idx] += float(reserves[st_idx])
+            comp_stage_layers["page_group_reserve"][st_idx] = max(1, int(stage_layers[st_idx]))
+        if st_idx < len(metadatas) and float(metadatas[st_idx] or 0.0) > 0.0:
+            comp_scalable["page_metadata"] = False
+            comp_stage_bytes["page_metadata"][st_idx] += float(metadatas[st_idx])
+            comp_stage_layers["page_metadata"][st_idx] = max(1, int(stage_layers[st_idx]))
 
-    stage_per_req_totals = [0.0] * len(stage_layers)
-    stage_totals = [0.0] * len(stage_layers)
+    # Account for DP-cohort DCP amplification when dcp_dp_width > 1 so per-DP cache matches Memory.
+    if abs(scale_override - 1.0) <= MIN_DENOM_EPS and int(getattr(p, "dcp_dp_width", 1) or 1) > 1:
+        cohort_totals = mem.dp_cohort_cache_bytes(max(1, seq_len), padded=True)
+        base_totals = mem.cache_bytes(max(1, seq_len), padded=True)
+        for st_idx in range(min(n_stages, len(cohort_totals), len(base_totals))):
+            extra = float(cohort_totals[st_idx]) - float(base_totals[st_idx])
+            if extra > MIN_DENOM_EPS:
+                comp_scalable["dcp_dp_cohort_kv"] = True
+                comp_stage_bytes["dcp_dp_cohort_kv"][st_idx] += extra
+                comp_stage_layers["dcp_dp_cohort_kv"][st_idx] = max(1, int(stage_layers[st_idx]))
+
+    if "draft_kv" in comp_stage_bytes and sum(comp_stage_layers["draft_kv"]) == 0:
+        aux = getattr(model, "auxiliary", None)
+        draft_obj = getattr(aux, mem.draft_kind, None) if (aux is not None and mem.draft_kind) else None
+        draft_layers = max(1, int(getattr(draft_obj, "layers", 1) or 1))
+        comp_stage_layers["draft_kv"][-1] = draft_layers
+
+    stage_per_req_totals = [0.0] * n_stages
+    stage_totals = [0.0] * n_stages
     rows: list[CacheLedgerRow] = []
     for comp_name in sorted(comp_stage_bytes):
         per_stage = comp_stage_bytes[comp_name]
@@ -376,12 +438,13 @@ def _resolve_term_quant_format(
     *,
     explicit_override: bool,
     apply_preset_to_ignored: bool = False,
+    checkpoint: NpuCheckpointSpec | None = None,
 ) -> tuple[str, bool, str, str]:
     cat = str(term.category or "")
     fam = cat.split(".", 1)[0]
     if fam in _FIXED_FP32_CATEGORIES or cat in _FIXED_FP32_CATEGORIES:
         return "FP32", True, "FP32 param", QUANT_RULE_FIXED_FP32
-    if fam in _FIXED_BF16_CATEGORIES or cat in _FIXED_BF16_CATEGORIES:
+    if fam in _FIXED_BF16_CATEGORIES or cat in _FIXED_BF16_CATEGORIES or _is_ple_category(cat) or _is_ple_category(fam):
         note = "Vision ViT BF16" if _is_vision_term(term) else "Native BF16 structural/head param"
         return "BF16", True, note, QUANT_RULE_FIXED_BF16
 
@@ -412,6 +475,16 @@ def _resolve_term_quant_format(
                 else QUANT_RULE_FOLLOW_PRESET
             )
             return mapped, (mapped == "BF16"), note, rule
+    elif checkpoint is not None and not explicit_override:
+        wt_q = classify_weight_tensor_quant(term.name, checkpoint)
+        if wt_q.ledger_format in WEIGHT_QUANT_FORMATS:
+            mapped = wt_q.ledger_format
+            rule = (
+                QUANT_RULE_PRESET_LINEAR_FP8
+                if (mapped in {"FP8", "MXFP8", "W8A8"} and resolved_wq in {"MXFP4", "W4A8"} and not is_w4_expert)
+                else (QUANT_RULE_CHECKPOINT_IGNORE if not wt_q.is_quantized else QUANT_RULE_FOLLOW_PRESET)
+            )
+            return mapped, (not wt_q.is_quantized), f"{checkpoint.repo_id} ({wt_q.raw_tag})", rule
 
     if resolved_wq == "W4A8" and not is_w4_expert:
         return "W8A8", False, "W8A8_DYNAMIC (INT8 Linear under W4A8)", QUANT_RULE_PRESET_LINEAR_FP8
@@ -473,6 +546,8 @@ def _collect_weight_ledger_rows(
         slot_plans=mem.slot_plans,
     )
     engram_names = {t.name for t in engram_table_terms(case.model)}
+    hw_fam = normalize_hw_family(str(case.machine.sku or case.machine.name or "a5"))
+    default_ckpt = resolve_default_checkpoint(str(case.model.name or ""), hw_family=hw_fam)
     grouped: dict[tuple[str, str, int, int, str, bool, bool], dict[str, Any]] = {}
     for stage_idx, terms in enumerate(stage_terms):
         for term in terms:
@@ -482,6 +557,7 @@ def _collect_weight_ledger_rows(
             shard_rule, axis = _resolve_shard_axis_and_rule(term)
             is_engram = (
                 term.category in _ENGRAM_CATEGORIES
+                or _is_ple_category(term.category)
                 or term.name in engram_names
                 or "engram_table" in term.name.lower()
                 or "ple_table" in term.name.lower()
@@ -494,6 +570,7 @@ def _collect_weight_ledger_rows(
                     term, case.model.quant, resolved_wq,
                     explicit_override=explicit_override,
                     apply_preset_to_ignored=apply_preset_to_ignored,
+                    checkpoint=default_ckpt,
                 )
                 entry = {
                     "category": term.category,
@@ -643,6 +720,27 @@ def _build_stage_budget_rows(
     return tuple(rows)
 
 
+def _resolve_ledger_workspace_tokens(
+    case: Case, *, phase: str, resolved_seq: int, resolved_conc: int,
+) -> int:
+    rt_meta = dict(case.runtime.metadata)
+    spec_tokens = int(rt_meta.get("draft_proposal_tokens", 0) or 0)
+    role_norm = str(rt_meta.get("deployment_role") or rt_meta.get("role") or "").strip().lower()
+    prompts = [int(getattr(req, "prompt_tokens", 0) or 0) for req in (getattr(case.workload, "requests", ()) or ())]
+    raw_prompt = max(prompts) if prompts else resolved_seq
+    prefill_ws = (
+        min(raw_prompt, int(case.runtime.max_num_batched_tokens))
+        if case.runtime.enable_chunked_prefill and int(case.runtime.max_num_batched_tokens) > 0
+        else raw_prompt
+    )
+    decode_ws = max(1, resolved_conc * max(1, 1 + spec_tokens))
+    if role_norm == "pd_prefill" or str(phase or "").strip().lower() == "prefill":
+        return max(1, prefill_ws)
+    if role_norm == "pd_decode":
+        return decode_ws
+    return max(1, prefill_ws, decode_ws)
+
+
 def compute_memory_quant_ledger(
     case: Case,
     *,
@@ -688,8 +786,10 @@ def compute_memory_quant_ledger(
     )
     block_size = int(getattr(case.runtime, "block_size", DEFAULT_CACHE_BLOCK_SIZE) or DEFAULT_CACHE_BLOCK_SIZE)
     spec_tokens = int(dict(case.runtime.metadata).get("draft_proposal_tokens", 0) or 0)
-
-    mem = Memory(case)
+    ws_tokens = _resolve_ledger_workspace_tokens(
+        case, phase=phase, resolved_seq=resolved_seq, resolved_conc=resolved_conc,
+    )
+    mem = Memory(case, workspace_tokens=ws_tokens)
     alloc = mem.allocation_report(resolved_seq)
     (
         weight_rows,
@@ -706,6 +806,8 @@ def compute_memory_quant_ledger(
     )
     local_tokens, cache_rows, stage_cache_bytes, stage_per_req_cache = _compute_cache_ledger_rows(
         case,
+        mem,
+        alloc["cache"],
         stage_layers=stage_layers,
         cache_dtype=resolved_cd,
         seq_len=resolved_seq,
@@ -738,8 +840,7 @@ def compute_memory_quant_ledger(
     shared_dp = bool(dict(case.runtime.metadata).get("enable_shared_expert_dp", False))
     shared_tp = 1 if shared_dp else int(p.tp)
     sim_cache_by_stage = tuple(
-        float(sum(comp["total"] for comp in entry["allocated"].values()))
-        for entry in alloc["cache"]["components"]
+        float(v) for v in mem.dp_cohort_cache_bytes(resolved_seq, padded=True)
     )
     weight_footprint = max(
         (st.weight_payload_bytes + st.weight_scale_aux_bytes + st.engram_ple_hbm_bytes for st in stage_budgets),

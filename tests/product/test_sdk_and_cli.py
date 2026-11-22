@@ -598,3 +598,61 @@ def test_isolated_worker_runs_and_times_out():
     assert any(row["evaluation_stage"] == "b1_screen" for row in rows) and any(row["evaluation_stage"] == "full_sla" for row in rows)
     timed_out = list(sweep_topologies_iter(raw, isolate_workers=True, candidate_timeout_s=1e-9, num_devices=1, **kw))
     assert [row["status"] for row in timed_out] == ["timeout"] and timed_out[0]["feasibility_status"] == "candidate_timeout"
+
+
+def test_agent_first_report_and_solve_cli_flags_and_model_target_ceiling(tmp_path):
+    import mindie_sim
+    from mindie_sim.cli import _main as cli_main
+    from mindie_sim.cli.parser import build_parser
+
+    p = build_parser()
+    rep_args = p.parse_args([
+        "report", "--model", "qwen3-32b", "--hardware", "a5",
+        "--mode", "simulation", "--rewrite-plan", str(tmp_path / "plan.json"),
+        "--out-dir", str(tmp_path / "out"),
+    ])
+    assert rep_args.mode == "simulation" and rep_args.rewrite_plan.endswith("plan.json")
+
+    sol_args = p.parse_args([
+        "solve", "--model", "qwen3-32b", "--hardware", "a5",
+        "--mode", "simulation", "--rewrite-plan", str(tmp_path / "plan.json"),
+    ])
+    assert sol_args.mode == "simulation" and sol_args.rewrite_plan.endswith("plan.json")
+
+    qs_out = tmp_path / "quickstart.json"
+    assert cli_main(["quickstart", "--json", "-o", str(qs_out)]) == 0
+    qs_payload = json.loads(qs_out.read_text(encoding="utf-8"))
+    assert qs_payload["schema"] == "mindie-sim.quickstart/1"
+    assert any("--rewrite-plan" in item["cmd"] for item in qs_payload["golden_commands"])
+
+    ceiling = mindie_sim.model_target_ceiling(
+        "qwen3-32b", "950dt-96g-pod",
+        num_devices=4, layers=2, prompt_tokens=512, output_tokens=64,
+        tpot_slo_ms=50.0, max_sequences_per_dp=4,
+    )
+    assert ceiling["analysis_mode"] == "modeling" and ceiling["allow_unbound_formula"] is True
+    assert ceiling["feasible"] is True and ceiling["iso_sla_comparison"]["after"]["sustainable_tps_per_die"] > 0.0
+
+    # End-to-end turnkey report with --from-script (verifies ParsedLaunchScript wiring).
+    script = tmp_path / "serve.sh"
+    script.write_text(
+        "export HCCL_OP_EXPANSION_MODE=AI_CPU\n"
+        "vllm serve /weights/qwen3-32b-bf16 --tensor-parallel-size 2 --data-parallel-size 1 --max-num-seqs 2 --enforce-eager\n",
+        encoding="utf-8",
+    )
+    out_dir = tmp_path / "rep_out"
+    rec_path = tmp_path / "receipt.json"
+    rc = cli_main([
+        "report", "--from-script", str(script), "--hardware", "a5",
+        "--dp", "1", "--tp", "2", "--ep", "1", "--concurrency", "2",
+        "--prompt-tokens", "512", "--output-tokens", "32",
+        "--out-dir", str(out_dir), "--json", "--receipt", str(rec_path),
+    ])
+    assert rc == 0 and rec_path.is_file()
+    rec = json.loads(rec_path.read_text(encoding="utf-8"))
+    assert rec["ok"] is True and rec["mode"] == "modeling"
+    brief_path = Path(rec["agent_brief"]["generated_files"]["agent_brief_json"])
+    opt_sh_path = Path(rec["agent_brief"]["generated_files"]["optimized_serve_sh"])
+    assert brief_path.is_file() and brief_path.stat().st_size < 8192
+    assert opt_sh_path.is_file() and "FULL_DECODE_ONLY" in opt_sh_path.read_text(encoding="utf-8")
+

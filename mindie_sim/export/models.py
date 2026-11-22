@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any
 
 from mindie_sim.prediction.results import FusedPipelineDescriptor, OpOccurrence
 
@@ -87,6 +88,23 @@ MATRIX_2D_RANK = 2
 ATTN_4D_RANK = 4
 ATTN_5D_RANK = 5
 
+#: Canonical binding-state tags enforcing #428/#430 Simulation vs Modeling honesty.
+BINDING_STATE_MEASURED = "bound_measured"
+BINDING_STATE_BOUND = "bound_implementation"
+BINDING_STATE_UNBOUND_FORMULA = "unbound_formula_projection"
+BINDING_BADGE_BOUND = "[已绑定实现/实测]"
+BINDING_BADGE_UNBOUND = "[未绑定实现 · 公式×硬件预演]"
+MODE_SIMULATION = "simulation"
+MODE_MODELING = "modeling"
+
+
+def format_binding_badge(binding_state: str) -> str:
+    """Map canonical ``binding_state`` to its human-readable provenance badge."""
+    if str(binding_state or "").strip() == BINDING_STATE_UNBOUND_FORMULA:
+        return BINDING_BADGE_UNBOUND
+    return BINDING_BADGE_BOUND
+
+
 #: Strictly banned internal Python simulator recipe class names (never exported).
 BANNED_IMPLEMENTATION_NAMES = frozenset({
     "AIVTiledVectorAndGatherRecipe",
@@ -126,8 +144,10 @@ STRUCTURE_BACKEND_MAP: dict[str, str] = {
 
 #: Kernel readiness / development status labels.
 KERNEL_STATUS_EXISTING = "现成可用 (Existing CANN/HCCL)"
+KERNEL_STATUS_AT_FLOOR = "现成可用 / 已近物理极限 (Existing / At Floor)"
 KERNEL_STATUS_FRAMEWORK = "框架适配使能 (Framework Enablement)"
 KERNEL_STATUS_NEW_OP = "[需新开发算子]"
+KERNEL_STATUS_EXTEND_ABI = "[需扩展算子 ABI]"
 KERNEL_STATUS_EXTEND_TILING = "[需扩展算子 Tiling]"
 KERNEL_STATUS_NEW_OR_EXTEND = "[需新开发/扩展算子]"
 #: Normalized mapping from core ``structure.py`` ``readiness`` tokens.
@@ -455,15 +475,19 @@ class OperatorExportRow:
     canonical_op_key: str = ""
     masked_by: str = ""
     opt_pillar: str = ""
-    opt_target_eta_pct: float | None = None
+    opt_attainment_pct: float | None = None
     config_howto: str = ""
     kernel_action: str = ""
     framework_action: str = ""
+    semantic_atoms: tuple[str, ...] = ()
+    comm_domain_tag: str = ""
+    kernel_synthesis_spec: Any = None
+    binding_state: str = BINDING_STATE_BOUND
 
 
 @dataclass(frozen=True, slots=True)
 class AlignedComparisonRow:
-    """Aligned Before <-> After operator group (1->1, N->1 fusion, 1->N, added/eliminated)."""
+    """Aligned Before <-> After operator group (1->1, N->1 fusion, M->N, staggered 1->0 / 0->1)."""
 
     archetype_id: str
     archetype_title: str
@@ -473,6 +497,8 @@ class AlignedComparisonRow:
     after_ops: tuple[OperatorExportRow, ...]
     relation: str
     action_note: str
+    added_glue_note: str = ""
+    non_adjacent_anchor_kernel: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -495,6 +521,9 @@ class MacroModuleRow:
     masked_before_ms: float = 0.0
     masked_after_ms: float = 0.0
     masking_note: str = ""
+    before_us_per_tok_die: float = 0.0
+    after_us_per_tok_die: float = 0.0
+    saved_us_per_tok_die: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -543,6 +572,13 @@ class NewKernelBacklogItem:
     before_attainment_pct: float = 0.0
     target_attainment_pct: float = 0.0
     opt_pillar: str = ""
+    before_us_per_tok_die: float = 0.0
+    after_us_per_tok_die: float = 0.0
+    saved_us_per_tok_die: float = 0.0
+    synthesis_spec: Any = None
+    math_formula: str = ""
+    sram_residency_summary: str = ""
+    binding_state: str = BINDING_STATE_BOUND
 
 
 #: Canonical alias used by Sheet 4 (``Pending_Kernel_Details``).
@@ -749,3 +785,17 @@ class ExportBundle:
     sequence_parallel: bool = False
     target_envelope_applied: bool = False
     parallelism_codesign_note: str = ""
+    n_tok_per_die: float = 1.0
+    us_per_tok_die: float = 0.0
+    sla_regime: str = "SLA_LATENCY_BOUND"
+    sla_slack_ms: float = 0.0
+    kernel_synthesis_specs: tuple[Any, ...] = ()
+    semantic_audit_triggers: tuple[Any, ...] = ()
+    macro_wall_trigger: Any = None
+    rewrite_plan_sha256: str = ""
+    rewrite_verification_passed: bool = True
+    recommended_checkpoint: Mapping[str, Any] | None = None
+    va_serving_rules_summary: Mapping[str, Any] | None = None
+    analysis_mode: str = MODE_SIMULATION
+    binding_state: str = BINDING_STATE_BOUND
+    has_unbound_formula_ops: bool = False

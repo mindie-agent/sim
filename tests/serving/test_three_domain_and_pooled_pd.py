@@ -643,3 +643,132 @@ def test_memory_hbm_pools_draft_cap_engram_offload_and_pd_runtime_sharding():
     d_mem_shd = Memory(parse_case(d_pd_shd))
     bd_unpad_q1 = d_mem_shd.cache_pool_breakdown(4096, padded=False, query_tokens=1)
     assert plan_shd["draft_kv_bytes"] == pytest.approx(bd_unpad_q1["draft_kv_bytes"] * 4.0)
+
+
+def test_archetype_folding_zero_drift_on_unseen_irregular_hybrid_with_prime_quant_exclusions():
+    from mindie_sim.prediction.evaluation import EvaluationContext
+    from mindie_sim.prediction.graph_analysis import graph_costs
+    from mindie_sim.prediction.operator_analysis import target_graphs
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.sweep.pd import (
+        _archetype_weighted_step_ms,
+        build_archetype_representative_case,
+    )
+
+    # Synthetic unseen 10-layer irregular hybrid (Dense+MoE+KDA+MLA) with prime-numbered per-layer
+    # quant exclusions and category_overrides so archetype keys must preserve exact per-layer quant.
+    raw = compose_case(
+        "kimi-k3.1", "950dt-96g-pod",
+        dp=1, tp=2, ep=2, pp=1, layers=10,
+        prompt_tokens=2048, output_tokens=64, concurrency=2,
+        quant="mxfp8", kv_cache_dtype="fp8_e4m3",
+    )
+    prime_exclusions = [f"model.layers.{idx}.self_attn" for idx in (2, 3, 5, 7)]
+    raw["model"]["quant"]["exclusions"] = list(raw["model"]["quant"].get("exclusions", ())) + prime_exclusions
+    raw["model"]["quant"]["category_overrides"] = {
+        **dict(raw["model"]["quant"].get("category_overrides", {})),
+        "model.layers.7.mlp": {"weight_format": "bf16"},
+    }
+    case = parse_case(raw)
+    _rep_case, weights, _draft_scale = build_archetype_representative_case(case, min_layers=2)
+    assert sum(weights.values()) == 10
+    assert len(weights) >= 5  # Mixed KDA/MLA/Dense/MoE + prime quant exclusions + layer-7 override.
+
+    full_graphs = target_graphs(case, phase="decode", tokens=1, context=2048, sequences=2, scope="model")
+    full_ctx = EvaluationContext.create(case)
+    full_ms = float(graph_costs(
+        case, full_graphs, isolated=False, evaluation=full_ctx, timeline_replicas=(0,),
+    )["duration_ms"])
+    folded_ms = _archetype_weighted_step_ms(
+        case, phase="decode", tokens=1, context=2048, sequences=2, scope="model", min_layers=2,
+    )
+    assert folded_ms == pytest.approx(full_ms, rel=1e-6, abs=1e-6)
+
+
+def test_iso_sla_independent_before_after_solve_workspace_and_direct_d2d_ttft():
+    from mindie_sim.sweep.pd import sweep_pd_disaggregation_ratios
+
+    sol_mod = sdk_api.solve_deployment(
+        "qwen3-32b", "950dt-96g-pod",
+        num_devices=4, layers=2,
+        prompt_tokens=512, output_tokens=64,
+        tpot_slo_ms=50.0, max_sequences_per_dp=8,
+        mode="modeling", compare_track="merged", target_track="expected_ideal",
+    )
+    assert sol_mod["mode"] == "modeling" and sol_mod["allow_unbound_formula"] is True
+    iso = sol_mod["iso_sla_comparison"]
+    assert iso["before"]["track"] == "merged" and iso["after"]["track"] == "expected_ideal"
+    assert iso["before"]["feasible"] is True and iso["after"]["feasible"] is True
+    assert iso["after"]["sustainable_tps_per_die"] >= iso["before"]["sustainable_tps_per_die"] - 1e-6
+    assert sol_mod["capacity_ledger"]["workspace_tokens"] >= 1
+
+    sol_sim = sdk_api.solve_deployment(
+        "qwen3-32b", "950dt-96g-pod",
+        num_devices=4, layers=2,
+        prompt_tokens=512, output_tokens=64,
+        tpot_slo_ms=50.0, max_sequences_per_dp=8,
+        mode="simulation", compare_track="merged", target_track="expected_ideal",
+    )
+    assert sol_sim["mode"] == "simulation" and sol_sim["allow_unbound_formula"] is False
+    assert sol_sim["iso_sla_comparison"]["after"]["track"] == "merged"
+
+    # #406 Item 13: direct_blocking_d2d TTFT check includes exposed KV transfer delay.
+    prefill = compose_case("qwen3-32b", "a3", dp=1, tp=2, ep=1, layers=1, prompt_tokens=256, output_tokens=64)
+    decode = compose_case("qwen3-32b", "a3", dp=1, tp=2, ep=1, layers=1, prompt_tokens=256, output_tokens=64)
+    slow_kv = sweep_pd_disaggregation_ratios(
+        prefill, decode, total_dies=4,
+        prompt_tokens=256, output_tokens=64,
+        ttft_sla_ms=50.0, tpot_sla_ms=200.0,
+        pd_transfer_mode="direct_blocking_d2d",
+        kv_transfer_bw_gbps=0.01,
+    )
+    assert slow_kv["prefill_instance"]["effective_ttft_ms"] > slow_kv["prefill_instance"]["step_ms"]
+    assert all(not row["feasible"] and row["infeasible_reason"] == "prefill_ttft_sla_exceeded" for row in slow_kv["candidates"])
+
+
+def test_kimi_k31_32die_solve_deployment_peak_rss_bounded():
+    """Laptop-native O(Unique Archetypes x 1 Rank) keeps 32-die kimi-k3.1 solve within Principle 18 budget."""
+    import pathlib
+    import resource
+    import sys
+    import time
+    from mindie_sim.solve import solve_deployment
+
+    def _read_proc_mib(field: str) -> float | None:
+        status = pathlib.Path("/proc/self/status")
+        if status.is_file():
+            for line in status.read_text(encoding="utf-8").splitlines():
+                if line.startswith(f"{field}:"):
+                    return float(line.split()[1]) / 1024.0
+        return None
+
+    before_rss_mib = _read_proc_mib("VmRSS")
+    t0 = time.perf_counter()
+    sol = solve_deployment(
+        "kimi-k3.1", "950dt-96g-pod",
+        num_devices=32, prompt_tokens=131072, output_tokens=1024,
+        tpot_slo_ms=30.0, mtp_tokens=5, mtp_accept=3.5,
+        kv_cache_dtype="fp8", indexer_kv_dtype="fp8",
+        mode="modeling", max_sequences_per_dp=32,
+    )
+    elapsed = time.perf_counter() - t0
+    peak_rss_mib = _read_proc_mib("VmHWM")
+    if peak_rss_mib is None:
+        raw = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        peak_rss_mib = raw / (1024.0 * 1024.0) if sys.platform == "darwin" else raw / 1024.0
+    delta_rss_mib = max(0.0, peak_rss_mib - (before_rss_mib if before_rss_mib is not None else 0.0))
+    metrics = {
+        "feasible": bool(sol["feasible"]),
+        "before_rss_mib": round(before_rss_mib, 2) if before_rss_mib is not None else None,
+        "peak_rss_mib": round(peak_rss_mib, 2),
+        "delta_rss_mib": round(delta_rss_mib, 2),
+        "elapsed_s": round(elapsed, 3),
+        "winner": sol["recommended_deployment"].get("winner_mode"),
+        "before": sol["iso_sla_comparison"]["before"],
+        "after": sol["iso_sla_comparison"]["after"],
+        "ledger": sol["capacity_ledger"],
+    }
+    assert delta_rss_mib <= 320.0 and peak_rss_mib <= 512.0, f"RSS exceeded Principle 18 budget: {metrics}"
+    assert metrics["feasible"] is True, f"32-die kimi-k3.1 solve unexpectedly infeasible: {metrics}"
+    assert metrics["after"]["b_feasible"] >= 1
+    assert metrics["after"]["effective_tpot_ms"] <= 30.0 + 1e-6

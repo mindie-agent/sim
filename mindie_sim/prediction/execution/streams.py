@@ -29,8 +29,8 @@ from typing import Any, Mapping
 
 from mindie_sim.schema.common import ModelingError
 
-META_CACHE_LIMIT = 32768
-NO_REV_OPS_CACHE_LIMIT = 256
+META_CACHE_LIMIT = 512
+NO_REV_OPS_CACHE_LIMIT = 16
 DEFAULT_STREAM_ID = "main"
 
 _LAYER_PREFIX_RE = re.compile(r"\bs\d+\.l\d+\.")
@@ -56,6 +56,15 @@ _META_SCAN_CACHE: dict = {}
 _NO_REV_OPS_CACHE: dict = {}
 _DECLARATION_CACHE: dict = {}
 _DEVICE_UNITS_CACHE: dict = {}
+
+
+def clear_stream_caches() -> None:
+    """Release bounded structural metadata caches between independent sweep candidates."""
+    for cache in (
+        _META_TEXT_CACHE, _META_ID_CACHE, _META_KEY_CACHE, _META_DICT_CACHE,
+        _META_SCAN_CACHE, _NO_REV_OPS_CACHE, _DECLARATION_CACHE, _DEVICE_UNITS_CACHE,
+    ):
+        cache.clear()
 
 
 def _freeze_key(value: Any) -> Any:

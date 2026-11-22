@@ -247,7 +247,7 @@ def _hashable(value: Any) -> Any:
 
 
 _METADATA_MEMO: dict[tuple[int, int, int], tuple[Any, tuple]] = {}
-_METADATA_MEMO_LIMIT = 8192
+_METADATA_MEMO_LIMIT = 512
 
 
 def operator_metadata_key(metadata: Any, stage: int, layer: int) -> tuple:
@@ -313,7 +313,7 @@ def canonical_json(key: Any) -> str:
 
 
 _SIGNATURE_MEMO: dict[int, tuple[Any, str]] = {}
-_SIGNATURE_MEMO_LIMIT = 4096
+_SIGNATURE_MEMO_LIMIT = 512
 
 
 def physical_signature(op: Any) -> str:

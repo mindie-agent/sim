@@ -260,10 +260,22 @@ def test_xlsx_before_after_merge_cells_formulas_and_new_kernel_backlog(tmp_path)
     assert len(mla_bef) >= 7 and any(op.canonical_op_key == "mla_prolog_v3" for op in mla_aft)
 
     designs = {
+        "aclnnMlaPrologV3": {
+            "config_howto": "export VLLM_ASCEND_ENABLE_MLAPO=1",
+            "kernel_design": "Single-pass AIV vector tile (UB 248KiB double-buffered) fusing MLA prolog",
+            "framework_work": "Register CustomOp in vllm_ascend/attention/mla_v1.py",
+            "acceptance": "BF16 abs_err <= 1e-3, L* efficiency >= 70%",
+        },
+        "BlockAttnResFusedPrefix": {
+            "config_howto": "export VLLM_ASCEND_ENABLE_FUSED_MC2=1",
+            "kernel_design": "Single-pass AIV vector tile (UB 248KiB double-buffered) fusing BlockAttnRes prefix",
+            "framework_work": "Register CustomOp in vllm_ascend/ops/attn_res.py",
+            "acceptance": "BF16 abs_err <= 1e-3, L* efficiency >= 70%",
+        },
         "K3 SituAndMul": {
             "config_howto": "export VLLM_ASCEND_ENABLE_FUSED_MC2=1",
             "kernel_design": "Single-pass AIV vector tile (UB 248KiB double-buffered) fusing SiTU + Mul",
-            "framework_work": "Register CustomOp in vllm_ascend/models/kimi_k3/modeling_kimi_k3.py",
+            "framework_work": "Register CustomOp in vllm_ascend/ops/activation.py",
             "acceptance": "BF16 abs_err <= 1e-3, L* efficiency >= 70%",
         },
         "hcom_allgather": {
@@ -593,7 +605,7 @@ def test_agent_brief_digest_and_static_launch_script_audit(tmp_path):
     b_bef = build_export_bundle(raw_bef, request=req)
     b_aft = build_export_bundle(raw_aft, request=req)
     assert b_aft.step_span_us < b_bef.step_span_us
-    assert any(op.ascend_kernel == "FusedGDNPrologue" for op in b_aft.operators)
+    assert not any("Qwen4Exp" in op.ascend_kernel for op in b_aft.operators)
 
     script_file = tmp_path / "serve.sh"
     script_file.write_text(
@@ -629,3 +641,171 @@ def test_agent_brief_digest_and_static_launch_script_audit(tmp_path):
     assert brief_out.stat().st_size < 8192
     digest = format_executive_digest_markdown(brief)
     assert "MindIE-Sim Executive Digest" in digest and "3-Track Action Plan" in digest
+
+
+def test_bipartite_alignment_dual_conservation_zero_saving_guard_draft_kv_and_ag013(tmp_path):
+    from dataclasses import replace
+    import importlib.util
+    from mindie_sim.export.comparison import format_parallelism_codomain_summary
+    from mindie_sim.export.models import (
+        BINDING_BADGE_BOUND,
+        BINDING_BADGE_UNBOUND,
+        BINDING_STATE_BOUND,
+        BINDING_STATE_UNBOUND_FORMULA,
+        KERNEL_STATUS_AT_FLOOR,
+        MODE_MODELING,
+        OperatorExportRow,
+    )
+    from mindie_sim.prediction.capacity import Memory
+
+    # 1. Bug 4a: Memory ledger cache total matches Memory(case) including Draft KV Cache.
+    raw_k, _ = compose_export_case(
+        "kimi-k3.1", REPRESENTATIVE_SKUS["a5"], topology_preset="a5_pod",
+        dp=4, tp=8, ep=32, dcp=8, prompt_tokens=4096, output_tokens=64,
+        concurrency=4, mtp_proposal_tokens=5, mtp_acceptance_length=3.5,
+    )
+    parsed_k = parse_case(raw_k)
+    led_k = compute_memory_quant_ledger(parsed_k, seq_len=4096, concurrency=4)
+    assert any("draft" in row.component.lower() for row in led_k.cache_rows)
+    mem_k = Memory(parsed_k, workspace_tokens=4 * 6)
+    max_stage_mem_cache = max(mem_k.dp_cohort_cache_bytes(4096, padded=True)) * 4
+    assert max(st.cache_bytes for st in led_k.stage_budgets) == pytest.approx(max_stage_mem_cache, rel=1e-6)
+
+    base_raw = _compact_case(tp=2, ep=2, pp=1, layers=1)
+    base_req = StepRequest(phase="decode", tokens=1, context=512, sequences=2, scope="model")
+    tmpl = build_export_bundle(base_raw, request=base_req)
+    proto_op = tmpl.operators[0]
+
+    # 2. Synthetic Two-Level Bipartite Alignment covering 1->1, non-adjacent N->1 (fused_into_anchor),
+    #    1->0 eliminated, 0->1 added, M->N cluster, zero-saving badge guard, and dual-metric conservation.
+    def _mk_op(
+        op_id: str, kernel: str, exp_us: float, atoms: tuple[str, ...], *,
+        status: str = "现成可用", needs_new: bool = False,
+        absorbed: tuple[str, ...] = (), comm: str = "", binding: str = BINDING_STATE_BOUND,
+    ) -> OperatorExportRow:
+        return replace(
+            proto_op,
+            archetype_id="arch_0", archetype_title="Layer Archetype 0 (×2)", repeat_count=2,
+            layer_label="L0", submodule="Attention", op_id=op_id, canonical_op_key=op_id,
+            logical_role=op_id, family="vector", recipe="vec", implementation="vec",
+            ascend_kernel=kernel, kernel_backend="CANN", kernel_status=status,
+            needs_new_kernel=needs_new, task_type="AI_VECTOR_CORE", stream_index=0,
+            tensor_contract="[4, 1024] bf16", start_us=0.0, dur_us=exp_us, end_us=exp_us,
+            exposed_dur_us=exp_us, l_star_lean_us=exp_us * 0.5, gap_us=exp_us * 0.5,
+            is_overlapped=False, masked_by="",
+            semantic_atoms=atoms, absorbed_source_ops=absorbed, comm_domain_tag=comm,
+            binding_state=binding,
+        )
+
+    b_ops = (
+        _mk_op("l0.part_a", "OpA", 10.0, ("atom.a",)),
+        _mk_op("l0.mid_keep", "OpMid", 12.0, ("atom.mid",)),
+        _mk_op("l0.part_b", "OpB", 8.0, ("atom.b",)),
+        _mk_op("l0.old_comm", "AllReduce", 6.0, (), comm="TP=8"),
+        _mk_op("l0.mn_1", "ClusterB1", 9.0, ("atom.c1", "atom.c2")),
+        _mk_op("l0.mn_2", "ClusterB2", 5.0, ("atom.c2", "atom.c3")),
+    )
+    a_ops = (
+        _mk_op("l0.fused_ab", "FusedAB", 11.0, ("atom.a", "atom.b"), status="[需新开发]", needs_new=True,
+               absorbed=("l0.part_a", "l0.part_b"), binding=BINDING_STATE_UNBOUND_FORMULA),
+        _mk_op("l0.mid_keep", "OpMid", 12.0, ("atom.mid",), status="[需新开发]", needs_new=True),
+        _mk_op("l0.new_comm", "AllGather", 4.0, (), comm="DCP=8"),
+        _mk_op("l0.mn_a1", "ClusterA1", 6.0, ("atom.c1", "atom.c2")),
+        _mk_op("l0.mn_a2", "ClusterA2", 5.0, ("atom.c2", "atom.c3")),
+    )
+    b_step_us = sum(o.exposed_dur_us * o.repeat_count for o in b_ops)
+    a_step_us = sum(o.exposed_dur_us * o.repeat_count for o in a_ops)
+    b_bun = replace(
+        tmpl, operators=b_ops, step_span_us=b_step_us,
+        n_tok_per_die=2.0, us_per_tok_die=b_step_us / 2.0,
+        throughput_per_die_tokens_per_s=1e6 / (b_step_us / 2.0),
+        binding_state=BINDING_STATE_BOUND, has_unbound_formula_ops=False,
+    )
+    a_bun = replace(
+        tmpl, operators=a_ops, step_span_us=a_step_us,
+        n_tok_per_die=2.0, us_per_tok_die=a_step_us / 2.0,
+        throughput_per_die_tokens_per_s=1e6 / (a_step_us / 2.0),
+        analysis_mode=MODE_MODELING, binding_state=BINDING_STATE_UNBOUND_FORMULA,
+        has_unbound_formula_ops=True,
+    )
+    # Co-domain parallelism banner formatting.
+    par_short, _ = format_parallelism_codomain_summary(replace(a_bun, memory_ledger=led_k, sequence_parallel=True))
+    assert par_short == "DP4 · TP8 (共域 DCP8) · EP32 · SP(开启)"
+
+    aligned = align_before_after_operators(b_bun, a_bun)
+    rels = [r.relation for r in aligned]
+    assert {"N->1", "fused_into_anchor", "1->1", "eliminated", "added", "2->2"} <= set(rels)
+    # Zero-saving status guard strips [需新开发] on l0.mid_keep (12us -> 12us).
+    mid_row = next(r for r in aligned if r.relation == "1->1")
+    assert mid_row.after_ops[0].needs_new_kernel is False
+    assert mid_row.after_ops[0].kernel_status == KERNEL_STATUS_AT_FLOOR
+
+    # Dual-metric conservation across Sheet 2 and Sheet 4.
+    s2_b_upt = sum(sum(b.exposed_dur_us for b in r.before_ops) * r.repeat_count / 2.0 for r in aligned)
+    s2_a_upt = sum(sum(a.exposed_dur_us for a in r.after_ops) * r.repeat_count / 2.0 for r in aligned)
+    assert s2_b_upt == pytest.approx(b_bun.us_per_tok_die, abs=1e-6)
+    assert s2_a_upt == pytest.approx(a_bun.us_per_tok_die, abs=1e-6)
+    cards = build_pending_kernel_details(aligned, a_bun, before_bundle=b_bun)
+    assert sum(c.saved_us_per_tok_die for c in cards) == pytest.approx(s2_b_upt - s2_a_upt, abs=1e-4)
+
+    out_xlsx = tmp_path / "bipartite_dual.xlsx"
+    export_comparison_xlsx(b_bun, out_xlsx, compare_source=a_bun)
+    _, roots, shared = _read_xlsx_sheets(out_xlsx)
+    assert any(BINDING_BADGE_UNBOUND in s for s in shared)
+    assert any(BINDING_BADGE_BOUND in s for s in shared)
+    s2_cells = _sheet_cells(roots[SHEET_BREAKDOWN], shared)
+    assert s2_cells["X2"][0] == "Before 摊薄耗时 (us/tok·die)"
+    assert s2_cells["AA2"][0] == "绑定状态 (Binding State)"
+
+    # 2b. #446 mixed-precision matrix_flops L* pricing (fp8_e4m3 / mxfp4 flops vs bf16 output dtype).
+    from mindie_sim.export.bundle import _die_peaks_for_stage, _op_lean_resource_demands_ns
+    peaks_a5 = _die_peaks_for_stage(parsed_k, 0)
+    dem_bf16, rate_bf16 = _op_lean_resource_demands_ns(
+        flops=1e12, vector_ops=0.0, hbm_read=0.0, hbm_write=0.0,
+        link_bytes=0.0, dtype="bf16", peaks=peaks_a5,
+    )
+    dem_fp8, rate_fp8 = _op_lean_resource_demands_ns(
+        flops=1e12, vector_ops=0.0, hbm_read=0.0, hbm_write=0.0,
+        link_bytes=0.0, dtype="bf16", peaks=peaks_a5,
+        matrix_flops=(("fp8_e4m3", 1e12),),
+    )
+    assert rate_fp8 > rate_bf16
+    assert dem_fp8[0] < dem_bf16[0]
+
+    # 3. Hardened AG013 anti-hardcoding gate catches model strings, static suffix tables & TARGET_ETA.
+    import ast as _ast
+    import sys as _sys
+    from pathlib import PurePosixPath as _PurePosixPath
+    gate_path = Path(__file__).resolve().parents[2] / "scripts" / "check_arch_governance.py"
+    scripts_dir = str(gate_path.parent)
+    added_path = scripts_dir not in _sys.path
+    if added_path:
+        _sys.path.insert(0, scripts_dir)
+    try:
+        spec = importlib.util.spec_from_file_location("_ag_gate_test", gate_path)
+        assert spec is not None and spec.loader is not None
+        ag_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(ag_mod)
+    finally:
+        if added_path and scripts_dir in _sys.path:
+            _sys.path.remove(scripts_dir)
+
+    sandbox = tmp_path / "ag_repo"
+    target_dir = sandbox / "mindie_sim" / "export"
+    target_dir.mkdir(parents=True)
+    bad_file = target_dir / "bad_rules.py"
+    bad_file.write_text(
+        '_PURE_GLUE_EXACT_SUFFIXES = ("a",)\n'
+        'TARGET_ETA_HBM = 0.85\n'
+        'def pick(x):\n'
+        '    return "kimi_k3" if x else "ok"\n',
+        encoding="utf-8",
+    )
+    rel_bad = _PurePosixPath("mindie_sim/export/bad_rules.py")
+    viols = ag_mod._check_ag013_anti_hardcoding(rel_bad, _ast.parse(bad_file.read_text(encoding="utf-8")))
+    assert any(v.rule == "AG013" and "suffix" in v.message.lower() for v in viols)
+    assert any(v.rule == "AG013" and "target_eta" in v.message.lower() for v in viols)
+    assert any(v.rule == "AG013" and "kimi" in v.message.lower() for v in viols)
+    bad_file.write_text('def clean(x):\n    return "generic_op" if x else "ok"\n', encoding="utf-8")
+    assert ag_mod._check_ag013_anti_hardcoding(rel_bad, _ast.parse(bad_file.read_text(encoding="utf-8"))) == []
+

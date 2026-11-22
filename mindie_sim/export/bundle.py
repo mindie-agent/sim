@@ -19,13 +19,15 @@ from __future__ import annotations
 
 from collections import OrderedDict, defaultdict
 from collections.abc import Mapping, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from fractions import Fraction
 import hashlib
 from pathlib import Path
 import re
 from typing import Any
 
+from mindie_sim.catalog.npu_checkpoints import normalize_hw_family, resolve_default_checkpoint
+from mindie_sim.catalog.va_speculative_rules import build_va_serving_rules
 from mindie_sim.optimization.dual_bound import (
     NS_PER_SECOND,
     DagEdge,
@@ -35,10 +37,168 @@ from mindie_sim.optimization.dual_bound import (
     check_optimality_certificate,
     inward_floor_ns,
 )
+try:
+    from mindie_sim.optimization.kernel_synthesis import (
+        TargetOpNode,
+        attribute_node_overlap,
+        evaluate_macro_wall_trigger,
+        extract_sku_floors,
+        solve_target_graph,
+    )
+    _HAS_KERNEL_SYNTHESIS = True
+except ImportError:  # Standalone pre-merge compatibility before optimization/kernel_synthesis lands.
+    _HAS_KERNEL_SYNTHESIS = False
+
+    @dataclass(frozen=True, slots=True)
+    class _StandaloneFloors:
+        is_a5_ub: bool
+        is_intra_pod: bool
+
+    @dataclass(frozen=True, slots=True)
+    class _StandaloneWall:
+        wall_kind: str
+        tpot_ms: float
+        tpot_slo_ms: float
+        sla_slack_ms: float
+        hbm_headroom_gib: float
+        hbm_utilization_pct: float
+        tradeoff_direction: str
+        recommended_actions: tuple[str, ...]
+
+        def to_dict(self) -> dict[str, Any]:
+            return {
+                "wall_kind": self.wall_kind,
+                "tpot_ms": round(float(self.tpot_ms), 3),
+                "tpot_slo_ms": round(float(self.tpot_slo_ms), 3),
+                "sla_slack_ms": round(float(self.sla_slack_ms), 3),
+                "hbm_headroom_gib": round(float(self.hbm_headroom_gib), 2),
+                "hbm_utilization_pct": round(float(self.hbm_utilization_pct), 1),
+                "tradeoff_direction": self.tradeoff_direction,
+                "recommended_actions": list(self.recommended_actions),
+            }
+
+    TargetOpNode = Any  # type: ignore[misc,assignment]
+
+    def extract_sku_floors(case: Case) -> Any:
+        sku_low = str(case.machine.sku or case.machine.name or "").lower()
+        topo_opts = dict(getattr(case.machine, "topology_options", ()) or ())
+        preset_low = str(topo_opts.get("topology_preset") or "").lower()
+        is_a5 = any(tok in sku_low for tok in ("950", "a5", "3510", "arch35")) or "a5" in preset_low
+        is_pod = any(tok in preset_low for tok in ("pod", "16p", "8p")) or is_a5
+        return _StandaloneFloors(is_a5_ub=(is_a5 and is_pod), is_intra_pod=is_pod)
+
+    def evaluate_macro_wall_trigger(
+        *,
+        tpot_ms: float,
+        tpot_slo_ms: float,
+        hbm_used_bytes: float,
+        hbm_usable_bytes: float,
+        hbm_headroom_bytes: float,
+    ) -> Any:
+        slo = max(float(tpot_slo_ms), 1e-6)
+        slack = slo - float(tpot_ms)
+        util_pct = (100.0 * float(hbm_used_bytes) / float(hbm_usable_bytes)) if hbm_usable_bytes > 0.0 else 0.0
+        headroom_gib = float(hbm_headroom_bytes) / float(1024 ** 3)
+        if slack >= 3.0 and util_pct >= 88.0:
+            return _StandaloneWall(
+                "HBM_CAPACITY_WALL", tpot_ms, tpot_slo_ms, slack, headroom_gib, util_pct,
+                "compute_for_memory_and_offload",
+                (
+                    "以算换存: 优先启用 MLA 矩阵吸收 / KV Cache 低比特量化 (C8/FP8) 释放单卡 HBM",
+                    "内存卸载: 评估 KV Offloading / Host DRAM-SSD Prefix Cache 分级池化与 Engram Host Offload",
+                ),
+            )
+        if float(tpot_ms) >= slo * 0.92 and headroom_gib >= 8.0:
+            return _StandaloneWall(
+                "LATENCY_COMPUTE_WALL", tpot_ms, tpot_slo_ms, slack, headroom_gib, util_pct,
+                "memory_for_compute",
+                (
+                    "以存换算: 利用充裕 HBM 余量预展开高频投影权重或增大片上分块驻留",
+                    "投机多槽快照: 分配 [K+1] 多槽状态缓冲并做 in-place 2D 槽位别名消除回滚拷贝",
+                ),
+            )
+        return _StandaloneWall(
+            "BALANCED", tpot_ms, tpot_slo_ms, slack, headroom_gib, util_pct, "balanced",
+            ("当前延迟与 HBM 利用率处于均衡区间，优先落地已验证的片上融合与超节点通信展开方案",),
+        )
+
+    def _merge_ivs(ivs: Sequence[tuple[float, float]]) -> list[tuple[float, float]]:
+        ordered = sorted((max(0.0, a), max(a, b)) for a, b in ivs if b > a)
+        if not ordered:
+            return []
+        out = [ordered[0]]
+        for lo, hi in ordered[1:]:
+            if lo <= out[-1][1]:
+                out[-1] = (out[-1][0], max(out[-1][1], hi))
+            else:
+                out.append((lo, hi))
+        return out
+
+    def _exposed_outside(iv: tuple[float, float], cover: Sequence[tuple[float, float]]) -> float:
+        lo, hi = iv
+        cur = lo
+        exposed = 0.0
+        for c_lo, c_hi in cover:
+            if c_hi <= cur:
+                continue
+            if c_lo >= hi:
+                break
+            if c_lo > cur:
+                exposed += min(hi, c_lo) - cur
+            cur = max(cur, c_hi)
+            if cur >= hi:
+                return 0.0
+        return exposed + max(0.0, hi - cur)
+
+    def attribute_node_overlap(nodes: Sequence[Any]) -> tuple[list[Any], dict[str, float]]:
+        by_arch: dict[str, list[tuple[int, Any]]] = defaultdict(list)
+        for idx, node in enumerate(nodes):
+            by_arch[node.archetype_id].append((idx, node))
+        updated = list(nodes)
+        spans: dict[str, float] = {}
+        for aid, indexed in by_arch.items():
+            spans[aid] = sum(hi - lo for lo, hi in _merge_ivs([(n.start_us, n.end_us) for _, n in indexed if n.dur_us > 0.0]))
+            ordered = sorted(
+                indexed,
+                key=lambda item: (
+                    2 if item[1].stream_index == 1 else (1 if item[1].stream_index == 2 else 0),
+                    -(item[1].hbm_total_bytes + item[1].flops),
+                    item[1].ordinal,
+                ),
+            )
+            claimed: list[tuple[float, float]] = []
+            claimed_lbls: list[tuple[float, float, str]] = []
+            for idx, node in ordered:
+                if node.dur_us <= 0.0:
+                    updated[idx] = replace(node, is_overlapped=False, exposed_dur_us=0.0, masked_by="")
+                    continue
+                iv = (node.start_us, node.end_us)
+                exp_us = _exposed_outside(iv, claimed)
+                fully_hidden = exp_us <= 1e-3
+                eff_exp = 0.0 if fully_hidden else exp_us
+                masker = ""
+                if node.dur_us - exp_us > 1e-3 and claimed_lbls:
+                    best_lbl = max(
+                        claimed_lbls,
+                        key=lambda seg: max(0.0, min(iv[1], seg[1]) - max(iv[0], seg[0])),
+                    )
+                    masker = best_lbl[2]
+                b_disp = f"Overlapped by {masker} (0 exposed)" if fully_hidden else node.bound_display
+                updated[idx] = replace(
+                    node, is_overlapped=fully_hidden, exposed_dur_us=eff_exp,
+                    masked_by=masker, bound_display=b_disp,
+                )
+                claimed = _merge_ivs([*claimed, iv])
+                claimed_lbls.append((iv[0], iv[1], (node.logical_role or node.ascend_kernel or node.op_id)[:48]))
+        return updated, spans
+
+    def solve_target_graph(*args: Any, **kwargs: Any) -> Any:  # pragma: no cover
+        raise ModelingError("kernel_synthesis_module_unavailable")
 from mindie_sim.prediction.body_defaults import consume_target_declaration
 from mindie_sim.prediction.efficiency import extract_hardware_peaks
 from mindie_sim.prediction.evaluation import EvaluationContext
 from mindie_sim.prediction.graph_analysis import graph_costs
+from mindie_sim.prediction.mechanism import Geometry
 from mindie_sim.prediction.results import (
     CaseInput,
     FusedPipelineDescriptor,
@@ -51,7 +211,7 @@ from mindie_sim.prediction.rewrite import ReplayRecipeBook
 from mindie_sim.prediction.spine import default_spine
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.case import Case
-from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.datapath import datapath_for_die
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.stack_registry import LoweringRequest
@@ -61,12 +221,17 @@ from .kernel_catalog import (
     classify_submodule,
     classify_task_type,
     extract_layer_index,
+    extract_semantic_atoms,
     resolve_ascend_kernel_identity,
+    resolve_comm_domain_tag,
     strip_op_prefix,
 )
 from .memory_ledger import compute_memory_quant_ledger, stage_layer_counts
 from .models import (
     ARCHETYPE_ORDER_FALLBACK,
+    BINDING_STATE_BOUND,
+    BINDING_STATE_MEASURED,
+    BINDING_STATE_UNBOUND_FORMULA,
     BOUND_DISPLAY_LABELS,
     CANONICAL_EXPORT_SUBMODULES,
     CERT_RESOURCE_COUNT,
@@ -88,7 +253,10 @@ from .models import (
     LAUNCH_BOUND_WORK_SHARE,
     MAX_EXPLICIT_LAYER_LABELS,
     MIB_BYTES,
+    MIN_DENOM_EPS,
     MIN_POSITIVE_SECONDS,
+    MODE_MODELING,
+    MODE_SIMULATION,
     NS_PER_US,
     OVERLAP_EXPOSED_EPS_US,
     TB_BYTES,
@@ -103,12 +271,6 @@ from .models import (
     TraceScheduleEntry,
 )
 from .reconcile import load_observation_bundle, reconcile_operators_with_kernels
-from .target_envelope import (
-    attribute_overlap_and_archetype_spans,
-    build_op_action_guidance,
-    extract_sku_floors,
-    synthesize_target_envelope,
-)
 
 _RECURRENT_MICRO_PATTERN = re.compile(r"^(.*)\.(recurrent_scan|chunk_kda)(\d+)$")
 
@@ -213,8 +375,33 @@ def compose_export_case(
     return raw, step_req
 
 
+_EXPORT_LAYER_QUANT_RE = re.compile(r"((?:layers|layer|blocks|h)[._])(\d+)([._]|$)")
+
+
+def _layer_quant_sig(quant: Any, layer_idx: int) -> tuple[Any, ...]:
+    if quant is None:
+        return ()
+    target = str(int(layer_idx))
+    excl = sorted(
+        _EXPORT_LAYER_QUANT_RE.sub(r"\1*\3", str(item))
+        for item in (getattr(quant, "exclusions", ()) or ())
+        if (m := _EXPORT_LAYER_QUANT_RE.search(str(item))) is not None and m.group(2) == target
+    )
+    raw_ov = getattr(quant, "category_overrides", ()) or ()
+    ov_items = raw_ov.items() if isinstance(raw_ov, Mapping) else raw_ov
+    ov = sorted(
+        (
+            _EXPORT_LAYER_QUANT_RE.sub(r"\1*\3", str(cat)),
+            tuple(sorted(fields.items())) if isinstance(fields, Mapping) else tuple(fields),
+        )
+        for cat, fields in ov_items
+        if (m := _EXPORT_LAYER_QUANT_RE.search(str(cat))) is not None and m.group(2) == target
+    )
+    return (tuple(excl), tuple(ov)) if (excl or ov) else ()
+
+
 def _layer_archetype_key(
-    lp: Any, stage: int, *, cand_producers: frozenset[int] = frozenset(),
+    lp: Any, stage: int, *, cand_producers: frozenset[int] = frozenset(), quant: Any = None,
 ) -> tuple[Any, ...]:
     idx = int(getattr(lp, "index", 0))
     kv_own = int(getattr(lp, "kv_owner_layer_id", -1))
@@ -258,6 +445,7 @@ def _layer_archetype_key(
         idx in cand_producers,
         cand_src >= 0,
         (idx_src >= 0, idx_src == idx),
+        _layer_quant_sig(quant, idx),
     )
 
 
@@ -333,7 +521,10 @@ def _discover_model_archetypes(
     groups: OrderedDict[tuple[Any, ...], list[Any]] = OrderedDict()
     for lp in case.model.layer_plans:
         st = layer_stage[lp.index] if lp.index < len(layer_stage) else 0
-        groups.setdefault(_layer_archetype_key(lp, st, cand_producers=cand_producers), []).append(lp)
+        groups.setdefault(
+            _layer_archetype_key(lp, st, cand_producers=cand_producers, quant=case.model.quant),
+            [],
+        ).append(lp)
 
     archetypes: list[LayerArchetypeSpec] = [
         LayerArchetypeSpec(
@@ -503,9 +694,11 @@ def _die_cube_peak_rate(die: Any, dtype: str, default_dtype: str = "bf16") -> fl
 def _op_lean_resource_demands_ns(
     *, flops: float, vector_ops: float, hbm_read: float, hbm_write: float,
     link_bytes: float, dtype: str, peaks: Mapping[str, Any],
+    matrix_flops: Sequence[tuple[str, float]] = (),
 ) -> tuple[tuple[int, int, int, int, int], float]:
     default_dt = str(peaks.get("default_dtype") or "bf16")
-    cube_rate = _die_cube_peak_rate(peaks["die"], dtype, default_dt)
+    die = peaks["die"]
+    cube_rate = _die_cube_peak_rate(die, dtype, default_dt)
     vec_rate = float(peaks["vector_peak_ops_per_s"] or 0.0)
     hbm_r_rate = float(peaks["hbm_read_bytes_per_s"] or 0.0)
     hbm_w_rate = float(peaks["hbm_write_bytes_per_s"] or 0.0)
@@ -517,8 +710,23 @@ def _op_lean_resource_demands_ns(
             return 0
         return inward_floor_ns(Fraction(work) * NS_PER_SECOND / Fraction(rate))
 
+    valid_pairs = [(str(dt), float(f)) for dt, f in (matrix_flops or ()) if float(f) > 0.0]
+    if valid_pairs:
+        cube_frac = Fraction(0)
+        total_mf = 0.0
+        for dt, mf in valid_pairs:
+            rate = _die_cube_peak_rate(die, dt, default_dt)
+            if rate > 0.0:
+                cube_frac += Fraction(mf) * NS_PER_SECOND / Fraction(rate)
+                total_mf += mf
+        cube_ns = inward_floor_ns(cube_frac) if cube_frac > 0 else 0
+        if total_mf > 0.0 and cube_frac > 0:
+            cube_rate = float(Fraction(total_mf) * NS_PER_SECOND / cube_frac)
+    else:
+        cube_ns = _demand_ns(flops, cube_rate)
+
     return (
-        _demand_ns(flops, cube_rate),
+        cube_ns,
         _demand_ns(vector_ops, vec_rate),
         _demand_ns(hbm_read + alpha * hbm_write, hbm_r_rate),
         _demand_ns(hbm_write + alpha * hbm_read, hbm_w_rate),
@@ -721,11 +929,56 @@ def _extract_structure_registry_view(
     return node_by_op, subgraph_by_op
 
 
+def _extract_prepared_work_fallback(
+    eff_case: Case, book: ReplayRecipeBook, ops: Sequence[OpSpec],
+) -> dict[str, dict[str, float]]:
+    """Query governed recipe ``book.prepare`` for ops whose ``OpSpec`` omits physical work."""
+    die0 = eff_case.machine.dies[0]
+    geom0 = Geometry(die0.compute_units, dict(die0.resource_units))
+    out: dict[str, dict[str, float]] = {}
+    for op in ops:
+        if op.family == "barrier":
+            continue
+        if op.flops != 0 or op.vector_ops != 0 or op.hbm_bytes != 0 or op.link_bytes != 0:
+            continue
+        try:
+            _, plan = book.prepare(op, geom0)
+            work = getattr(plan, "work", None)
+        except Exception:
+            work = None
+        if work is None:
+            continue
+        res = dict(getattr(work, "resources", {}) or {})
+        mat = sum(float(v) for v in dict(getattr(work, "matrix", {}) or {}).values())
+        hbm_b = float(res.get("hbm", 0.0) or 0.0)
+        m2_b = (
+            float(res.get("mte2_aiv", 0.0) or 0.0)
+            + float(res.get("mte2_aic", 0.0) or 0.0)
+            + float(res.get("mte2", 0.0) or 0.0)
+        )
+        m3_b = float(res.get("mte3", 0.0) or 0.0) + float(res.get("fixpipe", 0.0) or 0.0)
+        if hbm_b <= 0.0 and (m2_b + m3_b) > 0.0:
+            hbm_b = m2_b + m3_b
+        vec_ops = float(res.get("vector", 0.0) or 0.0)
+        link_b = float(res.get("link", 0.0) or 0.0)
+        if mat > 0.0 or vec_ops > 0.0 or hbm_b > 0.0 or link_b > 0.0:
+            out[op.op_id] = {
+                "flops": mat,
+                "vector_ops": vec_ops,
+                "hbm_bytes": hbm_b,
+                "mte2_bytes": m2_b,
+                "mte3_bytes": m3_b,
+                "link_bytes": link_b,
+            }
+    return out
+
+
 def _evaluate_representative_step(
     spine: Any, rep_case: Case, step_req: StepRequest, replay: ReplayOptions,
 ) -> tuple[
     Case, list[dict[str, Any]], dict[tuple[int, str], OpSpec],
     dict[str, Sequence[Any]], dict[str, dict[str, Any]], dict[str, dict[str, Any]], str,
+    dict[str, dict[str, float]],
 ]:
     base = spine.stacks.resolve_base(rep_case, LoweringRequest(step=step_req))
     rewritten = spine.rewrite.apply(base)
@@ -751,10 +1004,11 @@ def _evaluate_representative_step(
         timeline_replicas=(0,),
     )
     op_spec_by_key = {(entry.replica, op.op_id): op for entry in rewritten.executable for op in entry.ops}
+    prepared_work_by_op = _extract_prepared_work_fallback(eff_case, book, graphs.get(0, ()))
     struct_by_op, subgraph_by_op = _extract_structure_registry_view(eff_case, graphs, step_req)
     graph_id = _fast_graph_id(graphs.get(0, ()), str(eff_case.model.name), step_req.phase)
     timeline = list(report.get("timeline") or report.get("operators") or ())
-    return eff_case, timeline, op_spec_by_key, {}, struct_by_op, subgraph_by_op, graph_id
+    return eff_case, timeline, op_spec_by_key, {}, struct_by_op, subgraph_by_op, graph_id, prepared_work_by_op
 
 
 def _timeline_to_raw_records(
@@ -832,6 +1086,8 @@ def _filter_barriers_and_rewire_preds(records: Sequence[Mapping[str, Any]]) -> l
 def _attach_action_guidance(
     rows: Sequence[OperatorExportRow], case: Case, *, phase: str,
 ) -> list[OperatorExportRow]:
+    from .comparison import build_op_action_guidance
+
     floors = extract_sku_floors(case)
     sku_str = str(case.machine.sku or case.machine.name or "")
     out: list[OperatorExportRow] = []
@@ -841,6 +1097,81 @@ def _attach_action_guidance(
         )
         out.append(replace(row, config_howto=cfg, kernel_action=kern, framework_action=fw))
     return out
+
+
+def _row_to_target_node(row: OperatorExportRow, spec: OpSpec | None) -> TargetOpNode:
+    if not _HAS_KERNEL_SYNTHESIS:
+        return row
+    return TargetOpNode(
+        ordinal=row.ordinal, occurrence=row.occurrence, op_id=row.op_id,
+        archetype_id=row.archetype_id, repeat_count=row.repeat_count,
+        family=row.family, recipe=row.recipe, stream=row.stream, stream_index=row.stream_index,
+        task_type=row.task_type, shape=row.shape, dtype=row.dtype, predecessors=row.predecessors,
+        start_us=row.start_us, end_us=row.end_us, dur_us=row.dur_us,
+        exposed_dur_us=row.exposed_dur_us, is_overlapped=row.is_overlapped, masked_by=row.masked_by,
+        flops=row.flops, vector_ops=row.vector_ops,
+        hbm_read_bytes=row.hbm_read_bytes, hbm_write_bytes=row.hbm_write_bytes,
+        hbm_total_bytes=row.hbm_total_bytes, mte2_bytes=row.mte2_bytes,
+        mte3_bytes=row.mte3_bytes, fixpipe_bytes=row.fixpipe_bytes, link_bytes=row.link_bytes,
+        dominant_bound=row.dominant_bound, bound_display=row.bound_display,
+        l_star_lean_us=row.l_star_lean_us, gap_us=row.gap_us, gap_ratio=row.gap_ratio,
+        roofline_efficiency=row.roofline_efficiency, absorbed_source_ops=row.absorbed_source_ops,
+        semantic_atoms=row.semantic_atoms, logical_role=row.logical_role,
+        ascend_kernel=row.ascend_kernel, kernel_backend=row.kernel_backend,
+        kernel_status=row.kernel_status, needs_new_kernel=row.needs_new_kernel,
+        new_kernel_spec=row.new_kernel_spec, canonical_op_key=row.canonical_op_key,
+        opt_pillar=row.opt_pillar,
+        spec=spec, synthesis_spec=row.kernel_synthesis_spec,
+    )
+
+
+def _apply_node_to_row(base_row: OperatorExportRow, node: TargetOpNode) -> OperatorExportRow:
+    if isinstance(node, OperatorExportRow):
+        return node
+    synth = getattr(node, "synthesis_spec", None)
+    att_pct = (
+        getattr(node, "opt_attainment_pct", None)
+        if getattr(node, "opt_attainment_pct", None) is not None
+        else (getattr(synth, "target_attainment_pct", None) if synth is not None else None)
+    )
+    b_state = str(getattr(node, "binding_state", "") or "").strip()
+    if not b_state:
+        b_state = (
+            BINDING_STATE_UNBOUND_FORMULA
+            if (getattr(node, "needs_new_kernel", False) or (synth is not None and not getattr(synth, "shipping_supported", True)))
+            else base_row.binding_state
+        )
+    return replace(
+        base_row,
+        ordinal=node.ordinal, occurrence=node.occurrence, op_id=node.op_id,
+        family=node.family, recipe=node.recipe, implementation=node.ascend_kernel or base_row.implementation,
+        predecessors=node.predecessors, start_us=node.start_us, end_us=node.end_us,
+        dur_us=node.dur_us, exposed_dur_us=node.exposed_dur_us,
+        is_overlapped=node.is_overlapped, masked_by=node.masked_by,
+        flops=node.flops, vector_ops=node.vector_ops,
+        hbm_read_bytes=node.hbm_read_bytes, hbm_write_bytes=node.hbm_write_bytes,
+        hbm_total_bytes=node.hbm_total_bytes, mte2_bytes=node.mte2_bytes,
+        mte3_bytes=node.mte3_bytes, fixpipe_bytes=node.fixpipe_bytes, link_bytes=node.link_bytes,
+        dominant_bound=node.dominant_bound, bound_display=node.bound_display,
+        l_star_lean_us=node.l_star_lean_us, gap_us=node.gap_us, gap_ratio=node.gap_ratio,
+        roofline_efficiency=node.roofline_efficiency, absorbed_source_ops=node.absorbed_source_ops,
+        semantic_atoms=node.semantic_atoms, logical_role=node.logical_role,
+        ascend_kernel=node.ascend_kernel, kernel_backend=node.kernel_backend,
+        kernel_status=node.kernel_status, needs_new_kernel=node.needs_new_kernel,
+        new_kernel_spec=node.new_kernel_spec, canonical_op_key=node.canonical_op_key,
+        opt_pillar=node.opt_pillar, opt_attainment_pct=att_pct,
+        kernel_synthesis_spec=synth, binding_state=b_state,
+    )
+
+
+def _attribute_rows_overlap(
+    rows: Sequence[OperatorExportRow], archetypes: Sequence[LayerArchetypeSpec],
+) -> tuple[list[OperatorExportRow], tuple[LayerArchetypeSpec, ...]]:
+    nodes = [_row_to_target_node(r, None) for r in rows]
+    attributed, spans = attribute_node_overlap(nodes)
+    updated_rows = [_apply_node_to_row(r, n) for r, n in zip(rows, attributed)]
+    updated_archs = tuple(replace(a, single_span_us=spans.get(a.archetype_id, 0.0)) for a in archetypes)
+    return updated_rows, updated_archs
 
 
 def _reorder_rows_by_archetype(
@@ -936,6 +1267,7 @@ def _finalize_ranked_rows(
             measured_kernels=reconciled[item.op_id].kernels if item.op_id in reconciled else (),
             measured_sum_us=reconciled[item.op_id].measured_sum_us if item.op_id in reconciled else None,
             ape_pct=reconciled[item.op_id].ape_pct if item.op_id in reconciled else None,
+            binding_state=BINDING_STATE_MEASURED if item.op_id in reconciled else item.binding_state,
         )
         for idx, item in enumerate(prelim_rows)
     )
@@ -966,6 +1298,7 @@ def _build_prelim_operator_rows(
     sources_by_op: Mapping[str, Sequence[Any]],
     struct_by_op: Mapping[str, Mapping[str, Any]],
     subgraph_by_op: Mapping[str, Mapping[str, Any]],
+    prepared_work_by_op: Mapping[str, Mapping[str, float]] | None = None,
 ) -> tuple[list[OperatorExportRow], list[tuple[int, int, int, int, int]], dict[int, dict[str, Any]]]:
     archetypes_by_id = {a.archetype_id: a for a in archetypes}
     target_arch_by_rep_layer = (
@@ -977,6 +1310,7 @@ def _build_prelim_operator_rows(
     prelim_rows: list[OperatorExportRow] = []
     demands_ns: list[tuple[int, int, int, int, int]] = []
     seen_full_dedup: set[tuple[str, str]] = set()
+    prep_map = prepared_work_by_op or {}
     for rec in filtered_records:
         occ: OpOccurrence = rec["occurrence"]
         spec: OpSpec | None = rec["spec"]
@@ -1002,9 +1336,34 @@ def _build_prelim_operator_rows(
         vec_ops = float((spec.vector_ops if spec is not None else 0.0) or 0.0)
         link_bytes = float((spec.link_bytes if spec is not None else 0.0) or 0.0)
         hbm_r, hbm_w, hbm_tot, mte2, mte3, fixpipe, l2_hit = _hbm_read_write_l2(spec)
+        if flops == 0.0 and vec_ops == 0.0 and hbm_tot == 0.0 and link_bytes == 0.0:
+            pw = prep_map.get(rec["op_id"])
+            if pw is not None:
+                flops = float(pw.get("flops", 0.0))
+                vec_ops = float(pw.get("vector_ops", 0.0))
+                hbm_tot = float(pw.get("hbm_bytes", 0.0))
+                mte2 = float(pw.get("mte2_bytes", 0.0))
+                mte3 = float(pw.get("mte3_bytes", 0.0))
+                copy_sum = mte2 + mte3
+                hbm_r = (hbm_tot * mte2 / copy_sum) if copy_sum > 0.0 else (hbm_tot * 0.5)
+                hbm_w = max(0.0, hbm_tot - hbm_r)
+                link_bytes = float(pw.get("link_bytes", 0.0))
+            elif dur_us > 0.0 and rec["shape"] and str(rec["family"]).lower() != "barrier":
+                try:
+                    elem_b = float(dtype_bytes(str(rec["dtype"] or "bf16").lower()))
+                except ModelingError:
+                    elem_b = 2.0
+                elems = 1
+                for dim in rec["shape"]:
+                    elems *= max(1, int(dim))
+                hbm_r = float(elems) * elem_b
+                hbm_w = hbm_r
+                hbm_tot = hbm_r + hbm_w
+                mte2, mte3 = hbm_r, hbm_w
         op_demand, cube_peak = _op_lean_resource_demands_ns(
             flops=flops, vector_ops=vec_ops, hbm_read=hbm_r, hbm_write=hbm_w,
             link_bytes=link_bytes, dtype=rec["dtype"], peaks=peaks,
+            matrix_flops=(spec.matrix_flops if spec is not None else ()),
         )
         l_star_us = float(max(op_demand)) / NS_PER_US
         dom_bound, roof_eff = _classify_dominant_bound(op_demand, dur_us, link_bytes)
@@ -1015,6 +1374,13 @@ def _build_prelim_operator_rows(
         )
         meta = dict(spec.metadata) if (spec is not None and spec.metadata) else {}
         absorbed = tuple(str(x) for x in (meta.get("absorbed_source_ops") or meta.get("fused_from") or ()))
+        sem_atoms = extract_semantic_atoms(
+            rec["op_id"], rec["family"], rec["recipe"], absorbed, metadata=meta,
+        )
+        comm_dom = resolve_comm_domain_tag(rec["op_id"], rec["family"], rec["recipe"], meta, eff_case)
+        op_binding = str(meta.get("binding_state") or "").strip() or (
+            BINDING_STATE_UNBOUND_FORMULA if meta.get("unbound_formula_op") else BINDING_STATE_BOUND
+        )
         demands_ns.append(op_demand)
         prelim_rows.append(OperatorExportRow(
             ordinal=len(prelim_rows), occurrence=occ, op_id=rec["op_id"],
@@ -1040,6 +1406,8 @@ def _build_prelim_operator_rows(
             bound_display=BOUND_DISPLAY_LABELS.get(dom_bound, dom_bound),
             needs_new_kernel=desc.needs_new_kernel, new_kernel_spec=desc.new_kernel_spec,
             canonical_op_key=desc.canonical_op_key,
+            semantic_atoms=sem_atoms, comm_domain_tag=comm_dom,
+            binding_state=op_binding,
         ))
     return prelim_rows, demands_ns, peaks_by_stage
 
@@ -1123,6 +1491,7 @@ def build_export_bundle(
     include_vision_tower: bool | None = None,
     apply_preset_to_ignored: bool = False,
     apply_target_envelope: bool | None = None,
+    rewrite_plan: Any = None,
     top_k_radar: int = DEFAULT_GAP_RADAR_TOP_K,
 ) -> ExportBundle:
     """Evaluate unique layer archetypes once on ``runtime.Engine`` into ``ExportBundle``."""
@@ -1159,6 +1528,7 @@ def build_export_bundle(
         if use_archetype_dedup else parsed
     )
     spine = default_spine()
+    prepared_work_by_op: dict[str, dict[str, float]] = {}
     if step_eval is not None:
         prepared = spine.lower(eval_case, LoweringRequest(step=step_req))
         eff_case = prepared.case
@@ -1169,7 +1539,7 @@ def build_export_bundle(
         sources_by_op: dict[str, Sequence[Any]] = {r.occurrence.op_id: r.sources for r in prepared.operators if r.occurrence.replica == 0}
         graph_id, pipelines = step_eval.graph_id, step_eval.pipelines
     else:
-        eff_case, timeline, op_spec_by_key, sources_by_op, struct_by_op, subgraph_by_op, graph_id = (
+        eff_case, timeline, op_spec_by_key, sources_by_op, struct_by_op, subgraph_by_op, graph_id, prepared_work_by_op = (
             _evaluate_representative_step(spine, eval_case, step_req, replay)
         )
         raw_records = _timeline_to_raw_records(timeline, is_step_eval=False, case=eff_case, op_spec_by_key=op_spec_by_key)
@@ -1180,19 +1550,51 @@ def build_export_bundle(
         filtered_records, eff_case=eff_case, archetypes=archetypes, rep_lp_by_idx=rep_lp_by_idx,
         use_archetype_dedup=use_archetype_dedup, sources_by_op=sources_by_op,
         struct_by_op=struct_by_op, subgraph_by_op=subgraph_by_op,
+        prepared_work_by_op=prepared_work_by_op,
     )
     prelim_rows, demands_ns = _collapse_micro_split_ops(prelim_rows, demands_ns)
     should_synthesize = (
         apply_target_envelope
         if apply_target_envelope is not None
-        else (track_name == "expected_ideal" and step_eval is None and observations_path is None)
+        else ((track_name == "expected_ideal" or rewrite_plan is not None) and step_eval is None and observations_path is None)
     )
-    if should_synthesize:
-        prelim_rows, demands_ns, archetypes = synthesize_target_envelope(
-            prelim_rows, demands_ns, archetypes, eff_case, peaks_by_stage, phase=step_req.phase,
+    synthesis_specs: tuple[Any, ...] = ()
+    audit_triggers: tuple[Any, ...] = ()
+    plan_digest = ""
+    plan_verified = True
+    if should_synthesize and _HAS_KERNEL_SYNTHESIS:
+        row_by_occ = {r.occurrence: r for r in prelim_rows}
+        row_by_arch = {}
+        for r in prelim_rows:
+            row_by_arch.setdefault(r.archetype_id, r)
+        scen_pre = _extract_scenario_meta(parsed, step_req, prelim_rows)
+        n_tok_die = (
+            float(max(1, seq_count * int(parsed.runtime.parallel.dp)))
+            * float(scen_pre["avg_accepted_tokens"])
+            / float(max(1, len(parsed.machine.dies)))
         )
+        nodes = [_row_to_target_node(r, op_spec_by_key.get((0, r.op_id))) for r in prelim_rows]
+        solved = solve_target_graph(
+            nodes, demands_ns, eff_case, peaks_by_stage,
+            phase=step_req.phase, rewrite_plan=rewrite_plan, n_tok_per_die=n_tok_die,
+            allow_unbound_formula=True,
+        )
+        new_rows: list[OperatorExportRow] = []
+        for node in solved.nodes:
+            base_r = row_by_occ.get(node.occurrence) or row_by_arch.get(node.archetype_id) or prelim_rows[0]
+            new_rows.append(_apply_node_to_row(base_r, node))
+        prelim_rows = _attach_action_guidance(new_rows, eff_case, phase=step_req.phase)
+        demands_ns = list(solved.demands_ns)
+        archetypes = tuple(
+            replace(a, single_span_us=solved.archetype_spans_us.get(a.archetype_id, 0.0))
+            for a in archetypes
+        )
+        synthesis_specs = solved.synthesis_specs
+        audit_triggers = solved.semantic_audit_triggers
+        plan_digest = solved.rewrite_plan_sha256
+        plan_verified = solved.verification_passed
     else:
-        prelim_rows, archetypes = attribute_overlap_and_archetype_spans(prelim_rows, archetypes)
+        prelim_rows, archetypes = _attribute_rows_overlap(prelim_rows, archetypes)
         prelim_rows = _attach_action_guidance(prelim_rows, eff_case, phase=step_req.phase)
 
     prelim_rows, demands_ns = _reorder_rows_by_archetype(prelim_rows, demands_ns, archetypes)
@@ -1208,21 +1610,62 @@ def build_export_bundle(
         peaks_by_stage=peaks_by_stage, weight_quant=weight_quant, cache_dtype=cache_dtype,
         engram_host_offload=engram_host_offload, include_vision_tower=include_vision_tower,
         apply_preset_to_ignored=apply_preset_to_ignored, top_k_radar=top_k_radar,
+        synthesis_specs=synthesis_specs, audit_triggers=audit_triggers,
+        rewrite_plan_sha256=plan_digest, rewrite_verification_passed=plan_verified,
     )
 
 
+def _build_checkpoint_and_va_summary(
+    parsed: Case,
+    mem_ledger: Any,
+    scen: Mapping[str, Any],
+    seq_count: int,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    hw_fam = normalize_hw_family(str(parsed.machine.sku or parsed.machine.name or "a5"))
+    ckpt = resolve_default_checkpoint(str(parsed.model.name), hw_family=hw_fam)
+    ckpt_summary = (
+        {
+            "repo_id": ckpt.repo_id,
+            "quant_preset": ckpt.quant_preset,
+            "kv_cache_dtype": ckpt.kv_cache_dtype,
+            "uses_quarot": ckpt.uses_quarot,
+            "modelers_url": ckpt.modelers_url,
+        }
+        if ckpt is not None else None
+    )
+    va_rules = build_va_serving_rules(
+        str(parsed.model.name),
+        hw_family=hw_fam,
+        tp=mem_ledger.tp, dp=mem_ledger.dp, ep=mem_ledger.ep, pp=mem_ledger.pp,
+        target_kv_dtype=mem_ledger.cache_dtype.lower(),
+        enable_speculative=(int(scen["spec_proposals"]) > 0),
+        num_speculative_tokens=(int(scen["spec_proposals"]) if int(scen["spec_proposals"]) > 0 else None),
+        max_num_seqs=max(1, seq_count),
+    )
+    va_summary = {
+        "effective_kv_cache_dtype": va_rules.effective_kv_cache_dtype,
+        "speculative_enabled": va_rules.speculative_enabled,
+        "speculative_method": va_rules.resolved_speculative.method if va_rules.resolved_speculative else "",
+        "draft_model": va_rules.resolved_speculative.draft_model if va_rules.resolved_speculative else "",
+        "draft_tp": va_rules.resolved_speculative.draft_tensor_parallel_size if va_rules.resolved_speculative else None,
+        "capture_sizes": list(va_rules.compilation_config.get("cudagraph_capture_sizes") or ()),
+        "hw_isa_guidance": va_rules.hw_isa_guidance,
+    }
+    return ckpt_summary, va_summary
+
+
 def _assemble_export_bundle(
-    *,
-    parsed: Case, eff_case: Case, step_req: StepRequest, step_eval: StepEvaluation | None,
+    *, parsed: Case, eff_case: Case, step_req: StepRequest, step_eval: StepEvaluation | None,
     seq_count: int, graph_id: str, pipelines: tuple[FusedPipelineDescriptor, ...],
     final_rows: tuple[OperatorExportRow, ...], demands_ns: Sequence[tuple[int, int, int, int, int]],
     rank_order: Sequence[int], reconcile_summary: ReconciliationSummary | None,
     archetypes: Sequence[LayerArchetypeSpec], full_schedule: Sequence[TraceScheduleEntry],
     total_target_layers: int, total_draft_layers: int, use_archetype_dedup: bool,
-    target_envelope_applied: bool,
-    peaks_by_stage: Mapping[int, dict[str, Any]], weight_quant: str | None,
-    cache_dtype: str | None, engram_host_offload: bool | None,
+    target_envelope_applied: bool, peaks_by_stage: Mapping[int, dict[str, Any]],
+    weight_quant: str | None, cache_dtype: str | None, engram_host_offload: bool | None,
     include_vision_tower: bool | None, apply_preset_to_ignored: bool, top_k_radar: int,
+    synthesis_specs: tuple[Any, ...] = (), audit_triggers: tuple[Any, ...] = (),
+    rewrite_plan_sha256: str = "", rewrite_verification_passed: bool = True,
 ) -> ExportBundle:
     exposed_total_us = sum(r.exposed_dur_us * r.repeat_count for r in final_rows)
     if use_archetype_dedup or target_envelope_applied:
@@ -1261,6 +1704,8 @@ def _assemble_export_bundle(
     cluster_conc = max(1, seq_count * int(parsed.runtime.parallel.dp))
     tps = float(cluster_conc) * float(scen["avg_accepted_tokens"]) / step_s
     num_dies = max(1, len(parsed.machine.dies))
+    n_tok_per_die = float(cluster_conc) * float(scen["avg_accepted_tokens"]) / float(num_dies)
+    us_per_tok_die = step_span_us / max(n_tok_per_die, MIN_DENOM_EPS)
     default_dt = str(p0.get("default_dtype") or "bf16")
     hw_peaks_summary = {
         "cube_peak_flops_per_s": _die_cube_peak_rate(p0["die"], default_dt, default_dt),
@@ -1279,6 +1724,25 @@ def _assemble_export_bundle(
         include_vision_tower=include_vision_tower,
         apply_preset_to_ignored=apply_preset_to_ignored,
     )
+    eff_tpot_ms = (
+        (step_span_us / US_PER_MS / max(1.0, float(scen["avg_accepted_tokens"])))
+        if step_req.phase == "decode" else (step_span_us / US_PER_MS)
+    )
+    sla_target = float(scen["tpot_slo_ms"] if step_req.phase == "decode" else scen["ttft_slo_ms"])
+    sla_slack = sla_target - eff_tpot_ms
+    min_headroom = min((st.headroom_bytes for st in mem_ledger.stage_budgets), default=0.0)
+    macro_wall = evaluate_macro_wall_trigger(
+        tpot_ms=eff_tpot_ms,
+        tpot_slo_ms=sla_target,
+        hbm_used_bytes=mem_ledger.max_stage_hbm_bytes,
+        hbm_usable_bytes=mem_ledger.usable_hbm_bytes,
+        hbm_headroom_bytes=min_headroom,
+    )
+    sla_regime = (
+        "SLA_VIOLATED" if eff_tpot_ms > sla_target
+        else ("HBM_CAPACITY_BOUND" if macro_wall.wall_kind == "HBM_CAPACITY_WALL" else "SLA_LATENCY_BOUND")
+    )
+    ckpt_summary, va_summary = _build_checkpoint_and_va_summary(parsed, mem_ledger, scen, seq_count)
     d0 = parsed.machine.dies[0]
     d_bufs = dict(d0.buffers)
     aiv_cnt = int(d0.owner_count("vector") or 0)
@@ -1296,6 +1760,12 @@ def _assemble_export_bundle(
     ).strip()
     active_ids = {r.archetype_id for r in final_rows}
     filtered_schedule = tuple(e for e in full_schedule if e.archetype_id in active_ids) if use_archetype_dedup else ()
+    has_unbound = any(r.binding_state == BINDING_STATE_UNBOUND_FORMULA for r in final_rows)
+    bundle_mode = MODE_MODELING if (target_envelope_applied or track_name == "expected_ideal") else MODE_SIMULATION
+    bundle_binding = (
+        BINDING_STATE_UNBOUND_FORMULA if has_unbound
+        else (BINDING_STATE_MEASURED if reconcile_summary is not None else BINDING_STATE_BOUND)
+    )
     return ExportBundle(
         schema=EXPORT_BUNDLE_SCHEMA, model_name=str(parsed.model.name),
         hardware_sku=str(parsed.machine.sku or parsed.machine.name),
@@ -1316,6 +1786,20 @@ def _assemble_export_bundle(
         graph_capture_mode=str(parsed.runtime.graph_capture_mode or "full"),
         feature_track=track_name, hardware_die_summary=die_summary,
         target_envelope_applied=target_envelope_applied,
+        n_tok_per_die=n_tok_per_die,
+        us_per_tok_die=us_per_tok_die,
+        sla_regime=sla_regime,
+        sla_slack_ms=sla_slack,
+        kernel_synthesis_specs=synthesis_specs,
+        semantic_audit_triggers=audit_triggers,
+        macro_wall_trigger=macro_wall,
+        rewrite_plan_sha256=rewrite_plan_sha256,
+        rewrite_verification_passed=rewrite_verification_passed,
+        recommended_checkpoint=ckpt_summary,
+        va_serving_rules_summary=va_summary,
+        analysis_mode=bundle_mode,
+        binding_state=bundle_binding,
+        has_unbound_formula_ops=has_unbound,
         **scen,
     )
 

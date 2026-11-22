@@ -9,11 +9,9 @@
   - ``memory_ledger``: closed-form per-die Weight/Quant/Cache/Engram-PLE/PP HBM
     calculator honoring ``QuantSpec.exclusions``, mixed ``W4A8``/``MXFP4``,
     Vision ViT opt-in, and per-DP Max HBM Concurrency;
-  - ``target_envelope``: 3-pillar ``After (expected_ideal)`` optimizer, exact
-    cross-stream overlap attribution, 3-track Ascend guidance, and Parallelism
-    Co-Design notes;
-  - ``comparison``: topological alignment, L1/L2 aggregation, 100%-conserved
-    Sheet 4 cards, and turnkey ``< 8 KB`` ``agent_brief.json`` + Markdown digest;
+  - ``comparison``: two-level semantic-atom alignment, L1/L2 aggregation,
+    100%-conserved Sheet 4 cards, 3-track roadmap, parallelism co-design notes,
+    and turnkey ``< 8 KB`` ``agent_brief.json`` + Markdown digest;
   - ``script_audit``: safe zero-exec ``shlex`` launch-script parser, diagnostic
     auditor, and ``optimized_serve.sh`` generator;
   - ``reconcile``: streaming ``msprof`` ``kernel_details.csv`` ingress and 1-to-N
@@ -38,12 +36,15 @@ from .bundle import (
 )
 from .comparison import (
     align_before_after_operators,
+    build_actionable_roadmap,
     build_agent_brief,
     build_macro_module_breakdown,
     build_new_kernel_backlog,
+    build_parallelism_codesign_note,
     build_pending_kernel_details,
     export_agent_brief,
     format_executive_digest_markdown,
+    format_parallelism_codomain_summary,
 )
 from .kernel_catalog import (
     classify_macro_module,
@@ -62,6 +63,14 @@ from .models import (
     BACKEND_TORCH_NPU,
     BACKEND_TRITON,
     BANNED_IMPLEMENTATION_NAMES,
+    BINDING_BADGE_BOUND,
+    BINDING_BADGE_UNBOUND,
+    BINDING_STATE_BOUND,
+    BINDING_STATE_MEASURED,
+    BINDING_STATE_UNBOUND_FORMULA,
+    MODE_MODELING,
+    MODE_SIMULATION,
+    format_binding_badge,
     DEFAULT_EXPORT_CONTEXT_TOKENS,
     DEFAULT_GAP_RADAR_TOP_K,
     DEFAULT_SCENARIO_OUTPUT_TOKENS,
@@ -152,11 +161,6 @@ from .script_audit import (
     parse_launch_script,
     render_optimized_serve_sh,
 )
-from .target_envelope import (
-    build_actionable_roadmap,
-    build_parallelism_codesign_note,
-    synthesize_target_envelope,
-)
 from .trace_exporter import (
     MSPROF_PROCESS_SPEC,
     PID_FRAMEWORK,
@@ -192,6 +196,15 @@ __all__ = [
     "BACKEND_TORCH_NPU",
     "BACKEND_TRITON",
     "BANNED_IMPLEMENTATION_NAMES",
+    "BINDING_BADGE_BOUND",
+    "BINDING_BADGE_UNBOUND",
+    "BINDING_STATE_BOUND",
+    "BINDING_STATE_MEASURED",
+    "BINDING_STATE_UNBOUND_FORMULA",
+    "MODE_MODELING",
+    "MODE_SIMULATION",
+    "format_binding_badge",
+    "format_parallelism_codomain_summary",
     "CacheLedgerRow",
     "DEFAULT_EXPORT_CONTEXT_TOKENS",
     "DEFAULT_GAP_RADAR_TOP_K",
@@ -313,5 +326,4 @@ __all__ = [
     "reconcile_operators_with_kernels",
     "render_optimized_serve_sh",
     "resolve_hardware_alias",
-    "synthesize_target_envelope",
 ]
