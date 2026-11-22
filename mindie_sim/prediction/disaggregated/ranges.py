@@ -6,7 +6,7 @@
 [Side-Effect Policy] Address reservations live only for the current handoff.
 """
 from mindie_sim.catalog.cache import index_k_block_rows
-from mindie_sim.catalog.paired_sfa import execution
+from mindie_sim.catalog.context_parallel import dcp_indexer_sharded
 from mindie_sim.schema.common import ModelingError
 
 
@@ -20,7 +20,8 @@ def address(bases, extents, storage, plane, size, displacement, count):
     return bases[key] + displacement
 
 
-def owned_runs(component, layer, model, parallel, rank, span, tokens, window_start):
+def owned_runs(component, layer, model, parallel, rank, span, tokens, window_start,
+               *, runtime=None):
     lo, hi = span
     if component in {"mla_kv", "window"}:
         return ((max(lo, window_start), hi),) if hi > max(lo, window_start) else ()
@@ -29,7 +30,7 @@ def owned_runs(component, layer, model, parallel, rank, span, tokens, window_sta
         return ((lo // ratio, hi // ratio),) if hi // ratio > lo // ratio else ()
     ratio = max(ratio, layer.index_kpool)
     total = tokens // ratio
-    if execution(model).get("dcp_indexer_sharded") and parallel.cp > 1:
+    if dcp_indexer_sharded(model, runtime) and parallel.cp > 1:
         return ((lo // ratio, hi // ratio),) if hi // ratio > lo // ratio else ()
     if parallel.cp_plan != "dsa_cp" or parallel.cp == 1:
         return ((0, total),) if total else ()

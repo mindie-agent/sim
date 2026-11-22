@@ -16,7 +16,7 @@ from __future__ import annotations
 from dataclasses import replace
 import math
 
-from mindie_sim.catalog.ops import barrier_op, gemm_op, vector_op
+from mindie_sim.catalog.ops import gemm_op, vector_op
 from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.catalog.expert_slots import expert_slot_plan
 from mindie_sim.schema.common import ModelingError, dtype_bytes
@@ -129,7 +129,7 @@ def router_gemm(*, prefix, plan, deps, stage, requests, tokens, model, hidden, m
 
 def _noaux_tc_chain(*, prefix, logits_input, weight_dtype, weight_bytes, stage,
                     layer, requests, plan, tokens, mode):
-    """Exact DeepSeek ``noaux_tc`` routing chain (raw eager decomposition).
+    """Exact ``noaux_tc`` grouped-topk routing chain (raw eager decomposition).
 
     Biased scores select experts; the emitted weights are gathered from the
     *unbiased* sigmoid scores.  The FP32 correction bias is one resident

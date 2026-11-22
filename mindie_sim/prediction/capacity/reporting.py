@@ -251,6 +251,81 @@ class _MemoryReportingMixin:
             "fallback": "none",
         }
 
+    def _max_model_len_report(self) -> dict:
+        max_tokens = self.case.runtime.max_model_len
+        cache_allocation = self.cache_allocation(max_tokens, include_components=False)
+        gross_kv, resident_kv, staging_kv = self._kv_residency(max_tokens)
+        section = {
+            "cache_allocation_at_max_model_len": cache_allocation,
+            "kv_offload_at_max_model_len": {
+                "kvc_hbm_ratio": self.kvc_hbm_ratio,
+                "gross_kv_bytes_per_stage_rank": gross_kv,
+                "hbm_resident_kv_bytes_per_stage_rank": resident_kv,
+                "staging_bytes_per_stage_rank": staging_kv,
+                "basis": "same_residency_and_staging_as_resize",
+            },
+            "allocation_totals_at_max_model_len": {
+                "weights_bytes_per_stage_rank": list(self.weights),
+                "reserve_bytes_per_rank": self.policy.reserved,
+                "workspace_bytes_per_stage_rank": list(self.workspace),
+                "temporary_dequant_bytes_per_stage_rank": list(self.temporary_dequant),
+                "cache_gross_bytes_per_stage_rank": gross_kv,
+                "cache_hbm_resident_bytes_per_stage_rank": resident_kv,
+                "cache_staging_bytes_per_stage_rank": staging_kv,
+                "cache_unclassified_reserve_bytes_per_stage_rank":
+                    cache_allocation["allocated"]["reserve_bytes_per_stage_rank"],
+                "cache_allocated_bytes_per_stage_rank": resident_kv,
+                "cache_valid_bytes_per_stage_rank":
+                    cache_allocation["valid"]["total_bytes_per_stage_rank"],
+                "resident_bytes_per_stage_rank": [
+                    weight + self.policy.reserved + workspace + temporary + resident + staging
+                    for weight, workspace, temporary, resident, staging in zip(
+                        self.weights, self.workspace, self.temporary_dequant,
+                        resident_kv, staging_kv)
+                ],
+            },
+        }
+        engram_host = list(getattr(self, "engram_host_dram_bytes", ()))
+        if any(value > 0.0 for value in engram_host):
+            section["engram_host_dram_bytes_per_stage_rank"] = engram_host
+        if any(value > 0.0 for value in self.offload.values()):
+            section["offload"] = {
+                "expert_ddr_ratio": self.offload["expert_ddr_ratio"],
+                "kvc_ddr_ratio": self.offload["kvc_ddr_ratio"],
+                "kvc_ssd_ratio": self.offload["kvc_ssd_ratio"],
+                "kvc_hbm_ratio": self.kvc_hbm_ratio,
+                "gross_weights_bytes_per_stage_rank": self.gross_weights,
+                "routed_expert_bytes_per_stage_rank": self.routed_expert_bytes,
+                "expert_hbm_saved_bytes_per_stage_rank": self.expert_hbm_saved,
+            }
+        if self.sparse_offload:
+            block_size = int(self.sparse_offload["block_size"])
+            idx_row_bytes = int(self.sparse_offload["index_row_bytes"])
+            full_idx_layers = len(self.sparse_offload["full_indexer_layers"])
+            npu_per_block = max(1, block_size * idx_row_bytes * max(1, full_idx_layers))
+            min_stage_cap = max(0.0, min(val for row in self.capacity for val in row))
+            npu_limit_blocks = int(min_stage_cap // npu_per_block)
+            dram_limit_blocks = int(self.sparse_offload["dram_limit_blocks"])
+            workload_limit_blocks = int(self.sparse_offload["workload_limit_blocks"])
+            limits = {
+                "npu_hbm": npu_limit_blocks,
+                "host_dram": dram_limit_blocks,
+                "workload": workload_limit_blocks,
+            }
+            limiting_factor = min(limits, key=limits.__getitem__)
+            section["sparse_kv_offload"] = {
+                **self.sparse_offload,
+                "npu_limit_blocks": npu_limit_blocks,
+                "dram_limit_blocks": dram_limit_blocks,
+                "workload_limit_blocks": workload_limit_blocks,
+                "effective_blocks": limits[limiting_factor],
+                "limiting_factor": limiting_factor,
+                "host_dram_capacity_bytes_per_replica": self.host_dram_capacity,
+                "peak_host_dram_bytes_per_replica": self.host_dram_peak,
+                "live_host_dram_bytes_per_replica": self.host_dram_live,
+            }
+        return section
+
     def to_dict(self) -> dict:
         result = {
             "status": ("feasible" if all(value >= 0 for row in self.capacity for value in row)
@@ -343,71 +418,5 @@ class _MemoryReportingMixin:
             "fixed_plan": True,
             "fallback": "none",
         }
-        max_tokens = self.case.runtime.max_model_len
-        cache_allocation = self.cache_allocation(max_tokens, include_components=False)
-        gross_kv, resident_kv, staging_kv = self._kv_residency(max_tokens)
-        result["cache_allocation_at_max_model_len"] = cache_allocation
-        result["kv_offload_at_max_model_len"] = {
-            "kvc_hbm_ratio": self.kvc_hbm_ratio,
-            "gross_kv_bytes_per_stage_rank": gross_kv,
-            "hbm_resident_kv_bytes_per_stage_rank": resident_kv,
-            "staging_bytes_per_stage_rank": staging_kv,
-            "basis": "same_residency_and_staging_as_resize",
-        }
-        result["allocation_totals_at_max_model_len"] = {
-            "weights_bytes_per_stage_rank": list(self.weights),
-            "reserve_bytes_per_rank": self.policy.reserved,
-            "workspace_bytes_per_stage_rank": list(self.workspace),
-            "temporary_dequant_bytes_per_stage_rank": list(self.temporary_dequant),
-            "cache_gross_bytes_per_stage_rank": gross_kv,
-            "cache_hbm_resident_bytes_per_stage_rank": resident_kv,
-            "cache_staging_bytes_per_stage_rank": staging_kv,
-            "cache_unclassified_reserve_bytes_per_stage_rank":
-                cache_allocation["allocated"]["reserve_bytes_per_stage_rank"],
-            "cache_allocated_bytes_per_stage_rank": resident_kv,
-            "cache_valid_bytes_per_stage_rank":
-                cache_allocation["valid"]["total_bytes_per_stage_rank"],
-            "resident_bytes_per_stage_rank": [
-                weight + self.policy.reserved + workspace + temporary + resident + staging
-                for weight, workspace, temporary, resident, staging in zip(
-                    self.weights, self.workspace, self.temporary_dequant,
-                    resident_kv, staging_kv)
-            ],
-        }
-        if any(value > 0.0 for value in self.offload.values()):
-            result["offload"] = {
-                "expert_ddr_ratio": self.offload["expert_ddr_ratio"],
-                "kvc_ddr_ratio": self.offload["kvc_ddr_ratio"],
-                "kvc_ssd_ratio": self.offload["kvc_ssd_ratio"],
-                "kvc_hbm_ratio": self.kvc_hbm_ratio,
-                "gross_weights_bytes_per_stage_rank": self.gross_weights,
-                "routed_expert_bytes_per_stage_rank": self.routed_expert_bytes,
-                "expert_hbm_saved_bytes_per_stage_rank": self.expert_hbm_saved,
-            }
-        if self.sparse_offload:
-            block_size = int(self.sparse_offload["block_size"])
-            idx_row_bytes = int(self.sparse_offload["index_row_bytes"])
-            full_idx_layers = len(self.sparse_offload["full_indexer_layers"])
-            npu_per_block = max(1, block_size * idx_row_bytes * max(1, full_idx_layers))
-            min_stage_cap = max(0.0, min(val for row in self.capacity for val in row))
-            npu_limit_blocks = int(min_stage_cap // npu_per_block)
-            dram_limit_blocks = int(self.sparse_offload["dram_limit_blocks"])
-            workload_limit_blocks = int(self.sparse_offload["workload_limit_blocks"])
-            limits = {
-                "npu_hbm": npu_limit_blocks,
-                "host_dram": dram_limit_blocks,
-                "workload": workload_limit_blocks,
-            }
-            limiting_factor = min(limits, key=limits.__getitem__)
-            result["sparse_kv_offload"] = {
-                **self.sparse_offload,
-                "npu_limit_blocks": npu_limit_blocks,
-                "dram_limit_blocks": dram_limit_blocks,
-                "workload_limit_blocks": workload_limit_blocks,
-                "effective_blocks": limits[limiting_factor],
-                "limiting_factor": limiting_factor,
-                "host_dram_capacity_bytes_per_replica": self.host_dram_capacity,
-                "peak_host_dram_bytes_per_replica": self.host_dram_peak,
-                "live_host_dram_bytes_per_replica": self.host_dram_live,
-            }
+        result.update(self._max_model_len_report())
         return result

@@ -605,7 +605,8 @@ class TransportPlan:
             after = [arrival]
             if cursor < len(events):
                 after.append(events[cursor])
-            callback = lambda _event, d=destination, u=useful: remove_resident(d, u, engine.now)
+            def callback(_event, d=destination, u=useful):
+                return remove_resident(d, u, engine.now)
             release_credit = {"free": (allocation,)} if allocation is not None else {}
             engine.submit(prefix + ":release", after=tuple(after), **release_credit,
                           owner=owner, on_complete=callback)

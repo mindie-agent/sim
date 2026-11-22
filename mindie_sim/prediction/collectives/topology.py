@@ -580,6 +580,23 @@ class Topology(_TopologyPlansMixin):
         return max((self._channel_startup_ms.get(str(link.channel), 0.0)
                     for link in links), default=0.0)
 
+    def _oneshot_startup_ms(self) -> float:
+        """Hardware-derived AIV/CCU launch floor for a single-round one-shot collective.
+
+        Derived strictly from the SKU's declared ``kernel_invocations["vector"]``
+        minimum launch floor (and calibrated L0 ``P15``/``P16`` sync primitives
+        when loaded) without chip-name branching or double-counting link
+        propagation latency ``hop.latency_ms``.
+        """
+        if self._has_primitive_table and (
+                self._p15_aiv_first_issue_us > 0.0 or self._p16_stream_event_us > 0.0):
+            launch_us = (
+                max(self._vector_invocation_us, self._p15_aiv_first_issue_us)
+                + STARS_SYNC_EVENTS_PER_STEP * self._p16_stream_event_us
+            )
+            return launch_us / MS_PER_S
+        return self._vector_invocation_us / MS_PER_S
+
     def _work_with_capacity(self, work) -> TopologyCommunicationWork:
         rates = self._resource_rates
         if rates is None:
@@ -775,7 +792,7 @@ class Topology(_TopologyPlansMixin):
             selected = tuple(group for group in all_groups
                              if any(rank in sources for rank in group))
             return selected or all_groups
-        if axis == "cp":
+        if axis in {"cp", "dcp"}:
             pcp_w = int(declared.get("dcp_pcp_factor") or p.dcp_pcp_factor)
             tp_w = int(declared.get("dcp_tp_gather") or p.dcp_tp_gather)
             dp_w = int(declared.get("dcp_dp_width") or p.dcp_dp_width)
@@ -843,8 +860,9 @@ class Topology(_TopologyPlansMixin):
                 for i in range(0, p.tp, tp_w)
             )
         if axis == "dp":
+            first = (replica // p.dp) * p.dp
             return tuple(
-                tuple(self.ranks(r, stage)[idx] for r in range(p.dp))
+                tuple(self.ranks(r, stage)[idx] for r in range(first, first + p.dp))
                 for idx in range(len(sources))
             )
         if axis == "etp":
@@ -858,18 +876,34 @@ class Topology(_TopologyPlansMixin):
                 members = set(sources)
                 return tuple(tuple(group) for group in p.rank_table
                              if members.intersection(group))
-            if p.ep_spans_dp:
-                if p.ep_spans_pcp:
-                    count = p.ep_dp_width
-                    first = replica // count * count
-                    return (tuple(rank for r in range(first, first + count)
-                                  for rank in self.ranks(r, stage)),)
-                count = p.ep // p.tp
-                first = replica // count * count
+            ep_tp_w = max(1, p.tp // p.etp)
+            ep_spans_pcp = p.pcp > 1 and p.ep > p.dp * ep_tp_w
+            ep_intra_w = ep_tp_w * p.pcp if ep_spans_pcp else ep_tp_w
+            ep_spans_dp = p.ep > ep_intra_w
+            if ep_spans_dp or (ep_spans_pcp and p.etp > 1):
+                count = max(1, p.ep // ep_intra_w)
+                first = (replica // count) * count
+                if ep_spans_pcp:
+                    if p.etp <= 1:
+                        return (tuple(rank for r in range(first, first + count)
+                                      for rank in self.ranks(r, stage)),)
+                    return tuple(
+                        tuple(
+                            rank
+                            for r in range(first, first + count)
+                            for copy in range(p.pcp)
+                            for rank in self.ranks(r, stage)[copy * p.tp + off:copy * p.tp + off + ep_tp_w]
+                        )
+                        for off in range(0, p.tp, ep_tp_w)
+                    )
                 return tuple(
-                    tuple(rank for r in range(first, first + count)
-                          for rank in self.ranks(r, stage)[copy * p.tp:(copy + 1) * p.tp])
+                    tuple(
+                        rank
+                        for r in range(first, first + count)
+                        for rank in self.ranks(r, stage)[copy * p.tp + off:copy * p.tp + off + ep_tp_w]
+                    )
                     for copy in range(p.pcp)
+                    for off in range(0, p.tp, ep_tp_w)
                 )
             return tuple(sources[i:i + p.ep] for i in range(0, len(sources), p.ep))
         if axis == "tp":

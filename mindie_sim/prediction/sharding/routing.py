@@ -10,6 +10,8 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass
 from fractions import Fraction
+from functools import lru_cache
+from typing import Mapping
 
 from mindie_sim.schema.common import ModelingError
 
@@ -101,7 +103,11 @@ def balanced_realization(runtime, layer, *, tokens, valid_tokens, global_tokens,
     p = runtime.parallel
     if runtime.moe_recipe not in {"alltoall", "tp_join_reduce", "local_expert_reduce"}:
         raise ModelingError("balanced_routing_requires_pcp1_unchunked_alltoall")
-    width = p.ep_dp_width
+    ep_tp_w = max(1, p.tp // max(1, int(getattr(p, "etp", 1) or 1)))
+    ep_spans_pcp = p.pcp > 1 and p.ep > p.dp * ep_tp_w
+    ep_intra_w = ep_tp_w * p.pcp if ep_spans_pcp else ep_tp_w
+    ep_spans_dp = p.ep > ep_intra_w
+    width = max(1, p.ep // ep_intra_w) if ep_spans_dp else 1
     if width > 1 and global_tokens is None:
         raise ModelingError("balanced_routing_requires_complete_dp_cohort:use_target_graphs")
     total = tokens * token_shards if global_tokens is None else global_tokens
@@ -111,8 +117,8 @@ def balanced_realization(runtime, layer, *, tokens, valid_tokens, global_tokens,
     assignments = total * layer.top_k
     q, r = divmod(assignments, layer.num_experts)
     counts = tuple(q + (index < r) for index in range(layer.num_experts))
-    local_ep = min(p.tp * p.pcp, p.ep) if p.ep_spans_pcp else min(p.tp, p.ep)
-    first = (replica % width) * local_ep if p.ep_spans_dp else 0
+    local_ep = min(ep_intra_w, p.ep)
+    first = (replica % width) * local_ep if ep_spans_dp else 0
     ranks = tuple(range(first, first + local_ep))
     if owner is not None:
         ranks = (owner,)
@@ -145,12 +151,6 @@ def cohort_padded_tokens(groups, runtime):
         total += physical
     return total
 
-
-from collections import Counter
-from dataclasses import dataclass
-from functools import lru_cache
-
-from mindie_sim.schema.common import ModelingError
 
 SOURCE = {
     "repository": "vllm-project/vllm-ascend",
@@ -382,13 +382,6 @@ def select(runtime, layer, *, tokens, valid_tokens, global_tokens,
             or valid_tokens != min(tokens, valid_source_tokens)):
         raise ModelingError("source_force_eplb_requires_explicit_sp_valid_prefix")
     return ledger(layer.num_experts, p.ep, layer.top_k, tokens, valid_source_tokens * (p.ep // p.tp), p.tp)
-
-
-from dataclasses import dataclass
-from functools import lru_cache
-from typing import Mapping
-
-from mindie_sim.schema.common import ModelingError
 
 
 _BASE_KEYS = {"scope", "layer", "phase", "tokens", "expert_rows"}

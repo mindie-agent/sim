@@ -81,9 +81,18 @@ SFA_PADDED_QUERY_GROUP_SIZE = 128
 SINGLE_SFA_CALL = 1
 PAIRED_SFA_CALLS = 2
 _GROUP_META_KEYS = (
-    "group_axis", "group_ranks", "local_tp_width",
+    "group_axis", "comm_axis", "comm_group_size", "group_ranks", "local_tp_width",
     "local_tp_stride", "local_tp_stage", "local_tp_axis",
 )
+_COMM_AXIS_BY_GROUP_AXIS = {
+    "cp": "dcp",
+    "dcp_tp": "dcp",
+    "dcp_pcp": "dcp",
+    "dcp_dp": "dcp",
+    "dcp_a2a": "dcp",
+    "local_tp": "tp",
+    "etp": "tp",
+}
 PACKED_C8_GROUP_SIZE = 128
 PACKED_C8_LATENT = 512
 PACKED_C8_ROPE = frozenset({0, 64})
@@ -340,8 +349,14 @@ def rewrite_quantized_allreduce(ops: Sequence[Any], runtime: Any, source_dtype: 
         sync_group_meta = tuple(
             (key, op_meta[key]) for key in _GROUP_META_KEYS if key in op_meta
         )
+        comm_axis = str(op_meta.get("comm_axis") or _COMM_AXIS_BY_GROUP_AXIS.get(group_axis, group_axis))
+        comm_group_size = int(op_meta.get("comm_group_size") or group_size)
         if not any(key == "group_axis" for key, _ in sync_group_meta):
             sync_group_meta = (("group_axis", group_axis), *sync_group_meta)
+        if not any(key == "comm_axis" for key, _ in sync_group_meta):
+            sync_group_meta = (*sync_group_meta, ("comm_axis", comm_axis))
+        if not any(key == "comm_group_size" for key, _ in sync_group_meta):
+            sync_group_meta = (*sync_group_meta, ("comm_group_size", comm_group_size))
         out.append(OpSpec(
             op_id=sync_id, family="allreduce", recipe="quant_allreduce_amax_sync",
             deps=(amax_id,), semantic_shape=vec_shape, local_shape=vec_shape,
@@ -358,12 +373,17 @@ def rewrite_quantized_allreduce(ops: Sequence[Any], runtime: Any, source_dtype: 
             mte3_bytes=int8_bytes, hbm_bytes=bf16_bytes + scale_bytes + int8_bytes,
             metadata=(("quantized_allreduce", True),), **base_kw,
         ))
+        int8_comm_meta: tuple[tuple[str, Any], ...] = ()
+        if "comm_axis" not in op_meta:
+            int8_comm_meta += (("comm_axis", comm_axis),)
+        if "comm_group_size" not in op_meta:
+            int8_comm_meta += (("comm_group_size", comm_group_size),)
         out.append(_replace(
             op, op_id=int8_id, deps=(quant_id,), dtype="int8",
             semantic_shape=row_shape, local_shape=row_shape,
             padded_shape=row_shape, launch_shape=row_shape,
             link_bytes=float(op.link_bytes) * 0.5,
-            metadata=(*op.metadata, ("quantized_allreduce", True),
+            metadata=(*op.metadata, *int8_comm_meta, ("quantized_allreduce", True),
                       ("quantized_allreduce_orig_bytes", float(op.link_bytes))),
         ))
         out.append(OpSpec(
@@ -536,7 +556,9 @@ def emit_dcp_query_gather(
                 stage=stage, layer=layer, requests=requests, family="allgather",
                 phase=mode, recipe="dcp_query_allgather", link_bytes=wire,
                 shape=(rows, eff_heads, head_width),
-                metadata=(("group_axis", "dcp_tp"), ("gathered_heads", eff_heads),
+                metadata=(("group_axis", "dcp_tp"), ("comm_axis", "dcp"),
+                          ("comm_group_size", int(tp_gather)),
+                          ("gathered_heads", eff_heads),
                           ("dcp_tp_gather", tp_gather),
                           ("dcp_pcp_factor", int(pcp_factor)),
                           ("dcp_dp_width", int(dp_width))) + stream_meta,
@@ -556,7 +578,9 @@ def emit_dcp_query_gather(
             stage=stage, layer=layer, requests=requests, family="allgather",
             phase=mode, recipe="dcp_dp_query_allgather", link_bytes=wire,
             shape=(eff_rows, eff_heads, head_width),
-            metadata=(("group_axis", "dcp_dp"), ("gathered_tokens", eff_rows),
+            metadata=(("group_axis", "dcp_dp"), ("comm_axis", "dcp"),
+                      ("comm_group_size", int(dp_width)),
+                      ("gathered_tokens", eff_rows),
                       ("dcp_dp_width", int(dp_width)),
                       ("dcp_tp_gather", int(tp_gather)),
                       ("dcp_pcp_factor", int(pcp_factor)),
@@ -610,7 +634,8 @@ def emit_sfa_prefill_kv_gather(
         stage=stage, layer=layer, requests=requests, family="allgather",
         phase=mode, recipe=recipe, link_bytes=wire,
         shape=(prefill_context_rows, int(round(kv_row_bytes))),
-        metadata=(("group_axis", "cp"), ("dcp_degree", int(layer_dcp)),
+        metadata=(("group_axis", "cp"), ("comm_axis", "dcp"),
+                  ("comm_group_size", int(layer_dcp)), ("dcp_degree", int(layer_dcp)),
                   ("stream", CP_DECODE_COMM_STREAM),
                   ("sfa_prefill_compact_kv", recipe == "sfa_dcp_prefill_kv_gather")),
     )
@@ -751,7 +776,8 @@ def emit_dcp_output_exchange_combine(
             stage=stage, layer=layer, requests=requests, family=a2a_family,
             phase=mode, recipe="dcp_output_alltoall", link_bytes=a2a_wire,
             shape=(max(0, local_rows), local_heads, v_dim),
-            metadata=(("group_axis", "dcp_a2a"),
+            metadata=(("group_axis", "dcp_a2a"), ("comm_axis", "dcp"),
+                      ("comm_group_size", int(a2a_degree)),
                       ("source", "sfa_dcp_exchange" if fast else "dcp_a2a_fused"),
                       ("lse_wire_bytes", int(lse_wire)),
                       ("dcp_a2a_degree", int(a2a_degree)),
@@ -770,7 +796,9 @@ def emit_dcp_output_exchange_combine(
             stage=stage, layer=layer, requests=requests, family="allgather",
             phase=mode, recipe="dcp_pcp_allgather", link_bytes=pcp_wire,
             shape=(pcp_factor, a2a_degree, max(0, local_rows), local_heads, v_dim),
-            metadata=(("group_axis", "dcp_pcp"), ("pcp_factor", int(pcp_factor)),
+            metadata=(("group_axis", "dcp_pcp"), ("comm_axis", "dcp"),
+                      ("comm_group_size", int(pcp_factor)),
+                      ("pcp_factor", int(pcp_factor)),
                       ("dcp_pcp_factor", int(pcp_factor)),
                       ("dcp_tp_gather", int(tp_gather)),
                       ("dcp_dp_width", int(dp_width)),
@@ -852,7 +880,9 @@ def emit_v41_pcp_c2_ring_gather(
         stage=stage, layer=layer, requests=requests, family="allgather",
         phase=mode, recipe="pcp_c2_ring_tail_gather", link_bytes=wire,
         shape=(send_rows * pcp, row_elems),
-        metadata=(("group_axis", "pcp"), ("pcp_c2_ring_rows", V41_STATE_RING_ROWS),
+        metadata=(("group_axis", "pcp"), ("comm_axis", "pcp"),
+                  ("comm_group_size", int(pcp)),
+                  ("pcp_c2_ring_rows", V41_STATE_RING_ROWS),
                   ("pcp_c2_peer_send_counts", tuple(peer_counts)),
                   ("pcp_c2_send_rows", int(send_rows)),
                   ("source", "dsa_v41_cp.V41PCPC2Metadata")),
@@ -952,12 +982,14 @@ def emit_pcp_hidden_gather_restore(
         cur = q_op.op_id
         wire = out_b * float(pcp - 1)
         wire_dtype = "int8"
-        ag_meta = (("group_axis", "pcp"), ("pcp_quantized_wire", True),
+        ag_meta = (("group_axis", "pcp"), ("comm_axis", "pcp"),
+                   ("comm_group_size", int(pcp)), ("pcp_quantized_wire", True),
                    ("scale_bytes_per_peer", float(per_peer * FP32_BYTES))) + src_meta + stream_meta
     else:
         wire = float(per_peer * hidden) * elem_bytes * float(pcp - 1)
         wire_dtype = str(act_dtype or "bf16")
-        ag_meta = (("group_axis", "pcp"),) + src_meta + stream_meta
+        ag_meta = (("group_axis", "pcp"), ("comm_axis", "pcp"),
+                   ("comm_group_size", int(pcp))) + src_meta + stream_meta
     ag = comm_op(
         op_id=f"{prefix}.{gather_name}", deps=(cur,), stage=stage, layer=layer,
         requests=requests, family="allgather", phase=mode, recipe=gather_name,
@@ -1003,7 +1035,8 @@ def emit_pcp_o_proj_weight_allgather(
         stage=stage, layer=layer, requests=requests, family="allgather",
         phase=mode, recipe="pcp_o_proj_weight_allgather", link_bytes=wire,
         shape=(max(1, int(round(weight_bytes))),),
-        metadata=(("group_axis", "pcp"), ("stream", CP_WEIGHT_STREAM),
+        metadata=(("group_axis", "pcp"), ("comm_axis", "pcp"),
+                  ("comm_group_size", int(pcp)), ("stream", CP_WEIGHT_STREAM),
                   ("source", "weight_switch/o_proj.py")),
     )
     ag = replace(ag, dtype=str(weight_dtype or "bf16"), stream=CP_WEIGHT_STREAM)
@@ -1049,7 +1082,7 @@ def packed_sfa_geometry(
     shared = getattr(runtime, "prefix_cache_mode", "private") == "shared" and any(extents)
     keys = tuple(str(v.prefix_cache_key or "") for v in views)
     # Upstream ``device_op.py:660-667`` executes packed INT8 QSFA in one single
-    # kernel call over all gathered query heads (e.g. 96 heads on Kimi-K3.1).
+    # kernel call over all gathered query heads (e.g. 96 gathered heads).
     return {
         "sequences": sequences, "topk": sharded_topk, "compression_ratio": 1,
         "window": 0, "cp": 1, "heads": heads,
@@ -1105,7 +1138,7 @@ def paired_sfa_attention_batch(
     out_bytes = dtype_bytes(b.model.activation_dtype)
     phys_rows = max(shape[0], sum(peer_rows) if peer_rows is not None else rows * max(1, dp_width))
     # Upstream ``device_op.py:674-684``: non-quantized BF16 SFA accepts 1..64 or 128
-    # query heads, zero-padding intermediate head counts (e.g. Kimi 96 -> 128) for the
+    # query heads, zero-padding intermediate head counts (e.g. 96 -> 128) for the
     # kernel call and slicing output/LSE back to ``heads``.
     pad_bf16_heads = (
         not native_packed and bool(plan.indexer)

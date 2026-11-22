@@ -714,7 +714,7 @@ def _resolve_collective_startup_and_hbm(
     collective: str,
     group: tuple[int, ...],
     topology,
-    band: BandSelection,
+    band: CollectiveBandSpec,
     phases: tuple[LoweredPhase, ...],
     api_bytes: float,
     stack: str,

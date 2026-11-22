@@ -11,6 +11,7 @@ import math
 from collections import defaultdict
 
 from mindie_sim.catalog.cache import layer_cache_components
+from mindie_sim.catalog.context_parallel import cp_interleave
 from mindie_sim.coverage import combine_coverage
 from mindie_sim.schema.common import ModelingError
 
@@ -323,10 +324,12 @@ def _admit_pd_handoff(
         target_stage = [0.0] * max(1, int(p.pp))
         d_case = cases["decode"]
         d_mem = memory["decode"]
+        d_interleave = cp_interleave(d_case.runtime)
         for layer in d_case.model.layer_plans:
             comps = layer_cache_components(
                 d_case.model, layer, p, state.computed,
-                capacity_padded=False, interleave=d_case.runtime.kv_block_size,
+                capacity_padded=False, interleave=d_interleave,
+                runtime=d_case.runtime, query_tokens=1, phase="prefill",
             )
             target_stage[d_mem.layer_stage[layer.index]] += sum(
                 float(v) for v in comps.values()

@@ -25,7 +25,6 @@ import pytest
 from _support.axes import REPRESENTATIVE_SKUS
 from _support.linear_cases import execute_one, gdn_decode_source_case
 from mindie_sim import graph_costs
-from mindie_sim.backends.ascend import apply_observed_aicore_clock
 from mindie_sim.compose import compose_case
 from mindie_sim.observations.multilevel import verify_capture_file_consistency
 from mindie_sim.observations.comparison import (
@@ -489,3 +488,212 @@ def test_packed_schedule_checks_declared_isa_without_datapath(sku_alias, support
     else:
         with pytest.raises(ModelingError, match=f"arch35_unsupported_on_{geometry.compute_arch.preset}"):
             indexed_quant_attention.build(op, geometry, scratch_policy="offchip", schedule=schedule)
+
+
+def test_oneshot_collective_physics_and_waveplan_multigroup():
+    """Verify hardware-derived OneShotCollective physics, Ring crossover, and multi-group WavePlan."""
+    from mindie_sim.prediction.collectives import (
+        OneShotCollective,
+        OneShotPlan,
+        Topology,
+        api_bytes_from_link_volume,
+    )
+    from mindie_sim.prediction.collectives.peer_traffic import PeerTraffic
+    from mindie_sim.prediction.collectives.waves import WaveGroup, WavePlan
+    from mindie_sim.prediction.program import KernelProgram
+
+    def _run_plan(topo, plan):
+        eng = Engine(topo.resources())
+        start = eng.submit("start")
+        done = plan.start(eng, "coll", start)
+        eng.advance(until=(done,))
+        return done.time
+
+    case_a5 = Case.from_mapping(compose_case("qwen3-32b", hardware=REPRESENTATIVE_SKUS["a5"], layers=1, tp=8))
+    case_a3 = Case.from_mapping(compose_case("qwen3-32b", hardware=REPRESENTATIVE_SKUS["a3"], layers=1, tp=8))
+    topo_a5 = Topology(case_a5.machine, case_a5.runtime.parallel)
+    topo_a3 = Topology(case_a3.machine, case_a3.runtime.parallel)
+
+    recipe = OneShotCollective()
+    assert recipe.algorithm == "oneshot"
+    assert recipe.path_model == "store_forward"
+
+    # Hardware-derived startup_ms matches declared vector minimum_ms without chip-name branching.
+    vec_a5 = dict(case_a5.machine.dies[0].kernel_invocations).get("vector")
+    expected_a5_ms = float(getattr(vec_a5, "minimum_ms", 0.0) or 0.0)
+    assert topo_a5._oneshot_startup_ms() == pytest.approx(expected_a5_ms)
+
+    # Small allreduce (16 KiB API tensor, stale ring steps=14 tolerated): OneShot beats Ring on both A3 & A5.
+    small_api = 16 * 1024.0
+    small_ring_vol = small_api * 2.0 * 7.0 / 8.0
+    op_ar_small = OpSpec(
+        "ar_small", "allreduce", "decode", 0, 0, ("r0",), (1, 128), (1, 128), (1, 128), (1, 128),
+        link_bytes=small_ring_vol,
+        metadata=(("group_axis", "tp"), ("collective", "allreduce"), ("steps", 14)),
+    )
+    for topo in (topo_a5, topo_a3):
+        os_plan = topo.oneshot_plan(op_ar_small, 0)
+        rg_plan = topo.joint_plan(op_ar_small, {0: small_ring_vol}, algorithm="ring")
+        assert isinstance(os_plan, OneShotPlan)
+        assert len(os_plan.groups) == 1 and len(os_plan.groups[0].messages) == 8 * 7
+        expected_peer = api_bytes_from_link_volume("allreduce", 8, small_ring_vol, dict(op_ar_small.metadata))
+        assert all(m.flow.useful_bytes == pytest.approx(expected_peer) for m in os_plan.groups[0].messages)
+        assert _run_plan(topo, os_plan) < _run_plan(topo, rg_plan)
+
+    # Large allreduce (64 MiB API tensor) on switched fabric: Ring beats OneShot broadcast on bandwidth.
+    big_api = 64.0 * 1024.0 * 1024.0
+    big_ring_vol = big_api * 2.0 * 7.0 / 8.0
+    op_ar_big = replace(op_ar_small, op_id="ar_big", link_bytes=big_ring_vol)
+    assert _run_plan(topo_a3, topo_a3.joint_plan(op_ar_big, {0: big_ring_vol}, algorithm="ring")) < _run_plan(
+        topo_a3, topo_a3.oneshot_plan(op_ar_big, 0)
+    )
+
+    # AllGather conserves exact per-rank TX bytes (each peer gets vol / (G - 1)) and beats Ring on small msg.
+    ag_vol = 28 * 1024.0
+    op_ag = OpSpec(
+        "ag_small", "allgather", "decode", 0, 0, ("r0",), (1, 128), (1, 128), (1, 128), (1, 128),
+        link_bytes=ag_vol,
+        metadata=(("group_axis", "tp"), ("collective", "allgather"), ("steps", 7)),
+    )
+    ag_plan = topo_a5.oneshot_plan(op_ag, 0)
+    tx_by_src: dict[int, float] = {}
+    for msg in ag_plan.groups[0].messages:
+        tx_by_src[msg.flow.source] = tx_by_src.get(msg.flow.source, 0.0) + msg.flow.useful_bytes
+    assert len(tx_by_src) == 8 and all(val == pytest.approx(ag_vol) for val in tx_by_src.values())
+    assert _run_plan(topo_a5, ag_plan) < _run_plan(topo_a5, topo_a5.joint_plan(op_ag, {0: ag_vol}, algorithm="ring"))
+
+    # alltoallv requires explicit PeerTraffic and emits exact directed payloads when declared.
+    op_a2av_missing = OpSpec(
+        "a2av_bad", "alltoallv", "decode", 0, 0, ("r0",), (1, 128), (1, 128), (1, 128), (1, 128),
+        link_bytes=1024.0, metadata=(("group_axis", "tp"), ("collective", "alltoallv")),
+    )
+    with pytest.raises(ModelingError, match="oneshot_collective_alltoallv_requires_explicit_peer_matrix"):
+        topo_a5.oneshot_plan(op_a2av_missing, 0)
+
+    case_tp2 = Case.from_mapping(compose_case("qwen3-32b", hardware=REPRESENTATIVE_SKUS["a5"], layers=1, tp=2))
+    topo_tp2 = Topology(case_tp2.machine, case_tp2.runtime.parallel)
+    pt_raw = {"kind": "matrix", "payload_bytes": ((0.0, 2048.0), (2048.0, 0.0))}
+    assert PeerTraffic.from_mapping(pt_raw, size=2).row_total(0) == pytest.approx(2048.0)
+    op_a2av = OpSpec(
+        "a2av_ok", "alltoallv", "decode", 0, 0, ("r0",), (1, 128), (1, 128), (1, 128), (1, 128),
+        link_bytes=2048.0,
+        metadata=(("group_axis", "tp"), ("collective", "alltoallv"), ("peer_traffic", pt_raw)),
+    )
+    a2av_plan = topo_tp2.oneshot_plan(op_a2av, 0)
+    assert sorted((m.flow.source, m.flow.destination, m.flow.useful_bytes) for m in a2av_plan.groups[0].messages) == [
+        (0, 1, 2048.0),
+        (1, 0, 2048.0),
+    ]
+
+    # OneShotCollective.lower validates transport-only work and binds Stage("oneshot").
+    ctx_ok = SimpleNamespace(native_work={"link": 2048.0}, minimum_ms=0.0, collective_plan=lambda: a2av_plan)
+    prog = recipe.lower(ctx_ok)
+    assert isinstance(prog, KernelProgram) and len(prog.stages) == 1 and prog.stages[0].name == "oneshot"
+    ctx_bad = SimpleNamespace(native_work={"link": 2048.0, "vector": 1.0}, minimum_ms=0.0, collective_plan=lambda: a2av_plan)
+    with pytest.raises(ModelingError, match="oneshot_collective_requires_transport_only_work"):
+        recipe.lower(ctx_bad)
+
+    # WavePlan.start_participants executes cleanly across 2 disjoint rank groups.
+    case_dp2 = Case.from_mapping(compose_case("qwen3-32b", hardware=REPRESENTATIVE_SKUS["a5"], layers=1, dp=2, tp=2))
+    topo_dp2 = Topology(case_dp2.machine, case_dp2.runtime.parallel)
+    wave_plan = WavePlan(
+        "alltoall",
+        (
+            WaveGroup((0, 1), ((0, 4096.0), (1, 4096.0)), 1, topo_dp2),
+            WaveGroup((2, 3), ((2, 4096.0), (3, 4096.0)), 1, topo_dp2),
+        ),
+    )
+    wave_eng = Engine(topo_dp2.resources())
+    wave_ready = {r: wave_eng.submit(f"w_r{r}") for r in (0, 1, 2, 3)}
+    wave_done = wave_plan.start_participants(wave_eng, "multi_wave", wave_ready)
+    wave_eng.advance(until=tuple(wave_done.values()), first=False)
+    assert set(wave_done) == {0, 1, 2, 3} and all(ev.time > 0.0 for ev in wave_done.values())
+
+
+def test_rank_group_indexing_comm_axis_and_unfused_sp_mc2():
+    """Verify etp/external_dp/DCP-TP group indexing, structured comm_axis, and unfused SP MC2."""
+    from mindie_sim.prediction.collectives import Topology
+    from mindie_sim.prediction.operator_analysis import target_graphs
+    from mindie_sim.prediction.sharding.local_tp import (
+        expert_tp_groups,
+        local_tp_cohorts,
+        rank_zero_graph_reuse,
+    )
+    from mindie_sim.prediction.sharding.routing import balanced_realization
+    from mindie_sim.prediction.sharding.sequence_parallel import (
+        DECLARATION as SP_DECL,
+        IMPLEMENTATION as SP_IMPL,
+        LEGACY_IMPLEMENTATION as SP_LEGACY_IMPL,
+        sequence_parallel_enabled,
+    )
+    from mindie_sim.schema.parallel import ParallelSpec
+
+    # 1) Topology.groups("ep") with etp=2 uses ep_tp_w = tp // etp, orthogonal to expert_tp_groups.
+    base_8 = Case.from_mapping(compose_case("qwen3-32b", hardware=REPRESENTATIVE_SKUS["a5"], layers=1, tp=8))
+    p_dp_etp = ParallelSpec(dp=4, tp=2, pp=1, ep=4, expert_tp=2)
+    topo_dp_etp = Topology(base_8.machine, p_dp_etp)
+    ep_groups_1 = topo_dp_etp.groups("ep", 0, 0)
+    etp_groups_1 = expert_tp_groups(topo_dp_etp, replica=0, stage=0)
+    assert ep_groups_1 == ((0, 2, 4, 6), (1, 3, 5, 7))
+    assert etp_groups_1 == ((0, 1),)
+    assert all(len(set(eg) & set(tg)) <= 1 for eg in ep_groups_1 for tg in etp_groups_1)
+    assert rank_zero_graph_reuse(p_dp_etp, 4, False) is False
+    realized = balanced_realization(
+        SimpleNamespace(parallel=p_dp_etp, moe_recipe="alltoall"),
+        SimpleNamespace(num_experts=8, top_k=2),
+        tokens=4, valid_tokens=4, global_tokens=16, replica=3,
+    )
+    assert realized.represented_ranks == (3,) and realized.representative_rank == 3
+
+    p_pcp_etp = ParallelSpec(dp=1, tp=4, pp=1, pcp=2, ep=4, expert_tp=2)
+    topo_pcp_etp = Topology(base_8.machine, p_pcp_etp)
+    ep_groups_2 = topo_pcp_etp.groups("ep", 0, 0)
+    etp_groups_2 = expert_tp_groups(topo_pcp_etp, replica=0, stage=0)
+    assert ep_groups_2 == ((0, 1, 4, 5), (2, 3, 6, 7))
+    assert etp_groups_2 == ((0, 2), (1, 3), (4, 6), (5, 7))
+    assert all(len(set(eg) & set(tg)) <= 1 for eg in ep_groups_2 for tg in etp_groups_2)
+
+    # 2) external_dp > 1 with pcp > 1: local_tp_cohorts and Topology.groups("dp") stay inside external domain.
+    base_16 = Case.from_mapping(compose_case("qwen3-32b", hardware=REPRESENTATIVE_SKUS["a3"], layers=1, dp=2, tp=8))
+    p_ext = ParallelSpec(dp=2, tp=2, pp=1, ep=2, pcp=2, external_dp=2)
+    topo_ext = Topology(base_16.machine, p_ext)
+    cohorts_ext = local_tp_cohorts(base_16.machine, p_ext)
+    assert sum(len(c) for c in cohorts_ext) == 16
+    dp_ext0 = topo_ext.groups("dp", 0, 0)
+    dp_ext1 = topo_ext.groups("dp", 2, 0)
+    assert all(max(g) < 8 for g in dp_ext0) and all(min(g) >= 8 for g in dp_ext1)
+
+    # 3) DCP <-> TP co-domain when PCP == 1: dcp reuses tp ranks.
+    p_dcp_tp = ParallelSpec(dp=2, tp=4, pp=1, ep=8, dcp=4, pcp=1)
+    topo_dcp_tp = Topology(base_8.machine, p_dcp_tp)
+    assert topo_dcp_tp.groups("dcp", 0, 0) == topo_dcp_tp.groups("tp", 0, 0) == ((0, 1, 2, 3),)
+
+    # 4) Sequence-parallel backward-compat implementation name + structured comm_axis + unfused MC2.
+    assert SP_IMPL == "vllm_ascend_sequence_parallel"
+    assert sequence_parallel_enabled({"sequence_parallel": dict(SP_DECL)}, 4) is True
+    assert sequence_parallel_enabled(
+        {"sequence_parallel": {**SP_DECL, "implementation": SP_LEGACY_IMPL}}, 4
+    ) is True
+
+    raw_sp = compose_case(
+        "kimi-k3.1", hardware=REPRESENTATIVE_SKUS["a5"], layers=4,
+        dp=1, tp=4, dcp=4, ep=4, role="pd_decode", feature_track="merged",
+        prompt_tokens=4096, output_tokens=64,
+    )
+    assert raw_sp["runtime"]["metadata"]["additional_config"]["enable_fused_mc2"] == 0
+    case_sp = Case.from_mapping(raw_sp)
+    case_sp = replace(
+        case_sp,
+        runtime=replace(
+            case_sp.runtime,
+            kernels={**dict(case_sp.runtime.kernels), "sequence_parallel": {**SP_DECL, "padding": "right_to_tp"}},
+        ),
+    )
+    graph_sp = target_graphs(case_sp, phase="decode", tokens=4, context=4096, sequences=4, scope="body")[0]
+    sp_gathers = [op for op in graph_sp if op.family == "allgather" and dict(op.metadata).get("comm_axis") == "tp_sp"]
+    sp_scatters = [op for op in graph_sp if op.family == "reduce_scatter" and dict(op.metadata).get("comm_axis") == "tp_sp"]
+    dcp_comms = [op for op in graph_sp if dict(op.metadata).get("comm_axis") == "dcp"]
+    assert sp_gathers and all(dict(op.metadata)["comm_group_size"] == 4 for op in sp_gathers)
+    assert sp_scatters and all(dict(op.metadata)["comm_group_size"] == 4 for op in sp_scatters)
+    assert dcp_comms and all(dict(op.metadata)["comm_group_size"] == 4 for op in dcp_comms)
+    assert not any(op.family in {"all_gather_matmul", "matmul_reduce_scatter"} for op in graph_sp)

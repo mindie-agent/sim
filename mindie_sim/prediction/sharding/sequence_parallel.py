@@ -1,4 +1,4 @@
-"""Kimi K3 AttnRes sequence-parallel planning and communication boundaries.
+"""AttnRes and sequence-parallel planning and communication boundaries.
 
 [Role] Validate the source-selected sequence-parallel declaration, retain the
   local/global token split, and emit ordinary allgather, reduce-scatter and
@@ -26,10 +26,12 @@ from mindie_sim.schema.parallel import ParallelSpec
 __all__ = [
     "DECLARATION", "IMPLEMENTATION", "SOURCE_METADATA", "SequenceParallelPlan",
     "allgather", "attention_input", "close_output", "input_shard", "output_trim",
-    "reduce_scatter", "select",
+    "reduce_scatter", "select", "sequence_parallel_enabled",
 ]
 
-IMPLEMENTATION = "vllm_ascend_kimi_sequence_parallel"
+IMPLEMENTATION = "vllm_ascend_sequence_parallel"
+LEGACY_IMPLEMENTATION = "vllm_ascend_kimi_sequence_parallel"
+_ACCEPTED_IMPLEMENTATIONS = frozenset({IMPLEMENTATION, LEGACY_IMPLEMENTATION})
 
 #: Exact selected source declaration. Unknown or unsupported options are errors,
 #: not silently ignored alternatives.
@@ -216,6 +218,8 @@ def _validate_declaration(raw: Any) -> Mapping:
             if actual is not True:
                 raise ModelingError(
                     f"sequence_parallel_option_unsupported:{key}={actual!r}")
+        elif key == "implementation" and actual in _ACCEPTED_IMPLEMENTATIONS:
+            continue
         elif key == "padding" and actual in {"none", "right_to_tp"}:
             continue
         elif actual != expected:
@@ -278,7 +282,7 @@ def _validate_model(model, *, padding: str = "none") -> None:
         raise ModelingError("sequence_parallel_requires_attn_residual_layer_plans")
     if any(getattr(layer, "scope", "body") != "body" for layer in plans):
         raise ModelingError("sequence_parallel_requires_body_scope")
-    # Standard residual models (DeepSeek, GLM, Qwen) have no AttnRes block.
+    # Standard residual models have no AttnRes block.
     # That layout is valid once SP right-pads to TP; the unpadded contract
     # still requires a positive source residual block.
     if padding == "none" and any(
@@ -290,8 +294,8 @@ def _validate_model(model, *, padding: str = "none") -> None:
         raise ModelingError("sequence_parallel_hyperconnections_unsupported")
 
 
-def kimi_sequence_parallel(metadata: Mapping | None, tp: int) -> bool:
-    """One source capability decision for the declared K3 SP implementation.
+def sequence_parallel_enabled(metadata: Mapping | None, tp: int) -> bool:
+    """One source capability decision for the declared SP implementation.
 
     The builders must not duplicate this condition.  It is exactly the already
     accepted declaration: implementation name plus TP>1; no model/path name or
@@ -299,7 +303,7 @@ def kimi_sequence_parallel(metadata: Mapping | None, tp: int) -> bool:
     """
     decl = dict(metadata or {}).get("sequence_parallel")
     return (isinstance(decl, Mapping)
-            and str(decl.get("implementation", "")) == IMPLEMENTATION
+            and str(decl.get("implementation", "")) in _ACCEPTED_IMPLEMENTATIONS
             and int(tp) > 1)
 
 
@@ -438,6 +442,7 @@ def _common(plan: SequenceParallelPlan, *, role: str, input_shape: tuple[int, ..
     ]
     if collective is not None:
         items.extend((("collective", collective), ("group_axis", "tp"),
+                      ("comm_axis", "tp_sp"), ("comm_group_size", int(plan.tp)),
                       ("steps", plan.tp - 1)))
     if payload is not None:
         items.append(("wire_payload_bytes", payload))

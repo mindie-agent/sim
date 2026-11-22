@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from .policy import _offload_memory_for, _submit_offload_transfer
+from .policy import _submit_offload_transfer
 from .accesses import StateAccess, _access_bytes, _as_accesses, _unique_accesses
 from .events import (
     _access_registry,
@@ -161,7 +161,6 @@ def schedule_kv_layer_offload(
     if (policy is None or (policy.kvc_ddr_ratio + policy.kvc_ssd_ratio) <= 0.0
             or not work.plan.requests):
         return ()
-    memory = _offload_memory_for(execution)
     accesses = _unique_accesses(_as_accesses(state_accesses) if state_accesses is not None
                                 else _accesses_for_work(execution, work))
     selected = [access for access in accesses

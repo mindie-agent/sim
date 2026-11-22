@@ -29,7 +29,14 @@ import math
 from mindie_sim.schema.common import ModelingError
 from ..communication import CommunicationWork, MessageFlow
 from ..collectives.peer_traffic import PeerTraffic
-from .ring_pairwise import PairwiseGroup, PairwisePlan, RingGroup, RingPlan
+from .ring_pairwise import (
+    OneShotGroup,
+    OneShotPlan,
+    PairwiseGroup,
+    PairwisePlan,
+    RingGroup,
+    RingPlan,
+)
 from .transport import (
     DEFAULT_MAX_PHYSICAL_CHUNKS,
     ChunkSequence,
@@ -49,6 +56,15 @@ DIRECT_MESH_PHASES = {
     "allgather": ("all_gather",),
 }
 DIRECT_MESH_MAX_PEERS = 8
+ONESHOT_FAMILIES = frozenset({
+    "allreduce", "reduce_scatter", "allgather", "alltoall", "alltoallv",
+})
+_COLLECTIVE_FAMILY_ALIASES = {
+    "all_reduce": "allreduce",
+    "all_gather": "allgather",
+    "all_to_all": "alltoall",
+    "all_to_all_v": "alltoallv",
+}
 
 
 def _declared_peer_traffic(metadata, size):
@@ -288,7 +304,7 @@ class _TopologyPlansMixin:
             self._transport_bindings.clear()
         self._transport_bindings[id(op)] = resolved
         self._transport_bindings[getattr(op, "op_id", id(op))] = resolved
-        if algorithm not in {"ring", "pairwise", "direct_peer", "direct_mesh",
+        if algorithm not in {"ring", "pairwise", "oneshot", "direct_peer", "direct_mesh",
                              "startup_waves"}:
             raise ModelingError(f"joint_collective_algorithm_unsupported:{algorithm}")
         if (algorithm not in {"direct_peer", "startup_waves"}
@@ -305,6 +321,8 @@ class _TopologyPlansMixin:
                 op, len(next(iter(unique_groups))))
         if algorithm == "direct_mesh":
             return self._joint_direct_mesh_plan(family, unique_groups, volume_by_rank, metadata)
+        if algorithm == "oneshot":
+            return self._joint_oneshot_plan(family, unique_groups, volume_by_rank, metadata)
         if algorithm == "ring":
             if "peer_traffic" in metadata:
                 raise ModelingError(
@@ -403,6 +421,85 @@ class _TopologyPlansMixin:
             startup_application=("physical_program_owns_arrivals"
                                  if alltoall else "startup_model"))
 
+    def _joint_oneshot_plan(self, family, unique_groups, volume_by_rank, metadata):
+        """Bind a single-round all-peer one-shot plan from hardware link + launch physics.
+
+        For ``allgather``, ``reduce_scatter``, and uniform ``alltoall``, each rank
+        splits its declared TX volume equally across all ``G - 1`` remote peers in
+        one concurrent round (utilizing every parallel pair on ``per_pair`` meshes
+        and full egress port bandwidth on switched fabrics while conserving exact
+        per-rank TX bytes).  For ``allreduce``, each rank broadcasts its full
+        logical tensor ``M_api`` directly to every remote peer so small/medium
+        collectives save ``(2G - 3)`` hop latencies while large payloads naturally
+        yield to Ring on total link service.  Explicit ``peer_traffic`` matrices
+        (``alltoall`` / ``alltoallv``) emit each directed peer payload verbatim.
+        """
+        from .band_plan import api_bytes_from_link_volume
+
+        norm = _COLLECTIVE_FAMILY_ALIASES.get(str(family).strip().lower(), str(family).strip().lower())
+        if norm not in ONESHOT_FAMILIES:
+            raise ModelingError(f"oneshot_collective_family_unsupported:{family}")
+        peer = None
+        if "peer_traffic" in metadata:
+            if norm not in {"alltoall", "alltoallv"}:
+                raise ModelingError("peer_traffic_requires_peer_collective")
+            sizes = {len(ranks) for ranks in unique_groups}
+            if len(sizes) > 1:
+                raise ModelingError("peer_traffic_group_size_inconsistent")
+            peer = _declared_peer_traffic(metadata, next(iter(sizes))) if sizes else None
+        elif norm == "alltoallv":
+            raise ModelingError(
+                "oneshot_collective_alltoallv_requires_explicit_peer_matrix")
+        startup_ms = self._oneshot_startup_ms()
+        groups = []
+        for ranks in unique_groups:
+            count = len(ranks)
+            volumes = {rank: float(volume_by_rank[rank]) for rank in ranks}
+            if count <= 1 or not any(volumes.values()):
+                groups.append(OneShotGroup(ranks, (), startup_ms=0.0))
+                continue
+            routed = []
+            if peer is not None:
+                if peer.size != count:
+                    raise ModelingError(
+                        f"peer_traffic_group_size_mismatch:{peer.size}!={count}")
+                for src_idx, src in enumerate(ranks):
+                    declared = volumes[src]
+                    if not _peer_totals_match(
+                            _peer_declared_volume(peer, metadata, src_idx), declared):
+                        raise ModelingError(
+                            f"peer_traffic_source_volume_mismatch:{src}:"
+                            f"{peer.row_total(src_idx)}!={declared}")
+                    for dst_idx, dst in enumerate(ranks):
+                        if src_idx == dst_idx:
+                            continue
+                        payload = float(peer.payload(src_idx, dst_idx))
+                        if payload > 0.0:
+                            routed.append(self.route_message(MessageFlow(src, dst, payload)))
+            elif norm == "allreduce":
+                for src in ranks:
+                    vol = volumes[src]
+                    if vol <= 0.0:
+                        continue
+                    per_peer = float(api_bytes_from_link_volume(norm, count, vol, metadata))
+                    if per_peer <= 0.0:
+                        continue
+                    for dst in ranks:
+                        if dst != src:
+                            routed.append(self.route_message(MessageFlow(src, dst, per_peer)))
+            else:
+                peers = float(count - 1)
+                for src in ranks:
+                    vol = volumes[src]
+                    if vol <= 0.0:
+                        continue
+                    per_peer = vol / peers
+                    for dst in ranks:
+                        if dst != src:
+                            routed.append(self.route_message(MessageFlow(src, dst, per_peer)))
+            groups.append(OneShotGroup(ranks, tuple(routed), startup_ms=startup_ms))
+        return OneShotPlan(norm, tuple(groups))
+
     def _joint_direct_mesh_plan(self, family, unique_groups, volume_by_rank, metadata):
         from mindie_sim.prediction.operators.collectives.direct_peer import DirectMeshGroup, DirectMeshPhase, DirectMeshPlan
 
@@ -487,6 +584,20 @@ class _TopologyPlansMixin:
         """Bind a balanced local pairwise declaration; peers stay uniform."""
         volume = op.link_bytes if volume is None else volume
         return self.joint_plan(op, {replica: volume}, algorithm="pairwise")
+
+    def oneshot_plan(self, op, replica, *, volume=None):
+        """Bind a single-round concurrent local one-shot collective."""
+        volume = op.link_bytes if volume is None else volume
+        try:
+            plan = self.joint_plan(op, {replica: volume}, algorithm="oneshot")
+        except ModelingError as error:
+            if str(error).startswith("joint_collective_group_membership"):
+                raise ModelingError(
+                    "oneshot_collective_requires_complete_local_group") from None
+            raise
+        return OneShotPlan(plan.family, tuple(
+            group for group in plan.groups
+            if len(group.ranks) > 1 and group.messages))
 
     def _accounting_flows(self, flow, chunk_bytes,
                           max_physical_chunks=DEFAULT_MAX_PHYSICAL_CHUNKS):

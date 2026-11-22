@@ -14,6 +14,15 @@ import weakref
 from .accesses import StateAccess, _accesses_from_ops, _unique_accesses
 
 
+def _work_ref(work: Any):
+    try:
+        return weakref.ref(work)
+    except TypeError:
+        def _strong() -> Any:
+            return work
+        return _strong
+
+
 def _access_registry(execution: Any, work: Any) -> dict:
     """Issued-access registry for one actual IterationWork invocation.
 
@@ -32,11 +41,7 @@ def _access_registry(execution: Any, work: Any) -> dict:
     if entry is not None and entry[0]() is work:
         return entry[1]
     registry: dict = {}
-    try:
-        reference = weakref.ref(work)
-    except TypeError:
-        reference = lambda: work
-    batches[id(work)] = (reference, registry)
+    batches[id(work)] = (_work_ref(work), registry)
     return registry
 
 
@@ -53,11 +58,7 @@ def _accesses_for_work(execution: Any, work: Any) -> tuple[StateAccess, ...]:
     if entry is not None and entry[0]() is work:
         return entry[1]
     accesses = _accesses_from_ops(work)
-    try:
-        reference = weakref.ref(work)
-    except TypeError:
-        reference = lambda: work
-    bindings[id(work)] = (reference, accesses)
+    bindings[id(work)] = (_work_ref(work), accesses)
     return accesses
 
 
@@ -182,11 +183,7 @@ def bind_offload_access_events(execution: Any, work: Any, bindings: Any) -> int:
     table = _merge_event_tables(current, _event_table(bindings))
     if not _has_event_bindings(table):
         return 0
-    try:
-        reference = weakref.ref(work)
-    except TypeError:
-        reference = lambda: work
-    events[id(work)] = (reference, table)
+    events[id(work)] = (_work_ref(work), table)
     return sum(len(rows) for rows in table.values())
 
 

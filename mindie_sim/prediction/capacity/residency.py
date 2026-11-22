@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from dataclasses import replace
 
 from mindie_sim.catalog.cache import local_kv_heads
 from mindie_sim.catalog.types import QuantSpec

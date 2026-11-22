@@ -10,6 +10,7 @@
 from collections.abc import Mapping
 
 from mindie_sim.catalog.cache import layer_cache_components
+from mindie_sim.catalog.context_parallel import cp_interleave
 from mindie_sim.schema.common import ModelingError
 
 from ..pd_connector import PDHandoff, PDTransfer
@@ -48,8 +49,6 @@ def _token_span(memory, index, tokens):
         lo, hi = owners[index]
         return (max(0, min(tokens, int(lo))), max(0, min(tokens, int(hi))))
     cp = max(1, int(memory.case.runtime.parallel.cp))
-    pcp = max(1, int(memory.case.runtime.parallel.pcp))
-    width = max(1, int(memory.case.runtime.parallel.tp) * pcp)
     if cp > 1:
         # Without a T05 owner partition, the declared CP/PCP axis still owns a
         # contiguous local row range; never claim the whole token span.
@@ -152,8 +151,6 @@ def _pd_handoff_binding(request, tokens, placement, cases, memory, execution,
     prefill_case, decode_case = cases["prefill"], cases["decode"]
     prefill_p, decode_p = prefill_case.runtime.parallel, decode_case.runtime.parallel
     prefill_mem, decode_mem = memory["prefill"], memory["decode"]
-    source_version = prefill_mem.request_versions.get((prefill_rep, request), 0)
-    destination_version = decode_mem.request_versions.get((decode_rep, request), 0)
     sparse = getattr(decode_mem, "sparse_offload", None)
     offload = bool(sparse) and not bool(
         dict(sparse.get("options", {})).get("keep_device_kv_cache"))
@@ -293,12 +290,14 @@ def _handoff_rank_views(case, layer, parallel, ranks, ledger, owners,
         # ``rows / cp`` split would bill 160/160 B for the [0,2) and
         # [2,5) shards instead of the exact 128/192 B they own.
         component_owners = spans
+    interleave = cp_interleave(case.runtime)
     result = []
     for index, rank in enumerate(ranks):
         components = layer_cache_components(
             case.model, layer, parallel, tokens, capacity_padded=False,
-            interleave=case.runtime.kv_block_size,
-            rank=index, owner_spans=component_owners)
+            interleave=interleave,
+            rank=index, owner_spans=component_owners,
+            runtime=case.runtime, query_tokens=1, phase="prefill")
         result.append((index, rank, components, spans[index]))
     return result
 
@@ -476,7 +475,8 @@ def _emit_row_transfers(
 ):
     def manifest(case, parallel, entries):
         return [(rank, owned_runs(component, layer, case.model, parallel,
-                                  index, span, tokens, window_start),
+                                  index, span, tokens, window_start,
+                                  runtime=case.runtime),
                  values.get(component, 0))
                 for index, rank, values, span in entries]
 
@@ -645,17 +645,22 @@ def compute_pd_handoff_plan(
         draft_kv_bytes = 0.0
     else:
         target_stage = [0.0] * max(1, int(d_par.pp))
+        d_interleave = cp_interleave(d_case.runtime)
         for layer in d_case.model.layer_plans:
             comps = layer_cache_components(
                 d_case.model, layer, d_par, n_tokens,
-                capacity_padded=False, interleave=d_case.runtime.kv_block_size,
+                capacity_padded=False, interleave=d_interleave,
+                runtime=d_case.runtime, query_tokens=1, phase="prefill",
             )
             target_stage[d_mem.layer_stage[layer.index]] += sum(
                 float(v) for v in comps.values()
             )
         decode_local = tuple(target_stage)
         volume = float(sum(decode_local)) * float(d_cohort_width)
-        full_decode_bytes = float(sum(d_mem.cache_bytes(n_tokens, padded=False))) * float(d_cohort_width)
+        full_decode_bytes = (
+            float(sum(d_mem.cache_bytes(n_tokens, padded=False, query_tokens=1)))
+            * float(d_cohort_width)
+        )
         both_draft = bool(
             dict(p_case.runtime.metadata).get("draft_proposal_tokens", 0)
             and dict(d_case.runtime.metadata).get("draft_proposal_tokens", 0)

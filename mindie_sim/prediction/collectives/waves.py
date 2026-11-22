@@ -28,14 +28,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import math
-from typing import Any, Mapping
+from typing import Any
 
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.prediction.communication import MessageFlow
 
 
-REL_TOL = 1e-12
-ABS_TOL = 1e-9
 REL_TOL = 1e-12
 ABS_TOL = 1e-9
 OFFSET_FIRST = 1
@@ -275,11 +273,24 @@ class WavePlan:
             engine, name, {rank: ready for rank in self.ranks}, owner=owner)
 
     def start_participants(self, engine, name, ready_by_rank, *, owner=""):
+        from .ring_pairwise import _ready_by_rank
+
+        _ready_by_rank(self.ranks, ready_by_rank)
         events = {}
         for index, group in enumerate(self.groups):
             part = group.start_participants(
-                engine, f"{name}:group{index}", ready_by_rank, owner=owner)
+                engine, f"{name}:group{index}",
+                {rank: ready_by_rank[rank] for rank in group.ranks},
+                owner=owner,
+            )
+            overlap = set(events) & set(part)
+            if overlap:
+                raise ModelingError(
+                    "startup_waves_rank_accounted_twice:"
+                    + ",".join(map(str, sorted(overlap))))
             events.update(part)
+        if set(events) != set(self.ranks):
+            raise ModelingError("startup_waves_group_completion_missing")
         return events
 
     def validate_path_model(self, path_model) -> None:
