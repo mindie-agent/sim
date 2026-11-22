@@ -1,46 +1,43 @@
-"""Immutable contracts, timeout budgets, sanitization, and Lean/receipt checks for onboarding.
+"""Immutable contracts, ABI/cliff planning, Lean/receipt checks, and gate runners.
 
-[Role] Define shared immutable dataclasses, canonical domain constants,
-  sanitized ``capture://`` provenance helpers, timeout-arithmetic budgets,
-  SHA-256 receipt sealing/verification, and Lean 4 ``OptimalityCertificate``
-  non-inversion checks for SKU and operator onboarding pipelines.
-[Invariants] Every timeout budget enforces
+[Role] Define shared immutable dataclasses, domain constants, ISA-scoped
+  ``TilingAxes`` / ``validate_abi`` rules, deterministic 512..400K Anchor +
+  Off-Grid Cliff plan synthesis, SHA-256 receipt sealing, Lean 4
+  ``OptimalityCertificate`` non-inversion checks, privacy sanitization, bounded
+  atomic JSON I/O, and bounded subprocess repo-gate / tail-diagnosis runners.
+[Invariants] Every ``TimeoutBudget`` enforces
   ``outer_timeout_s >= sum(inner_budgets) + cleanup_grace_s``. All emitted
-  payloads fail closed on private host paths, IPv4 quads, usernames, or
-  container digests. Lean checks fail closed on any ``L*_Lean > T_sim`` or
-  ``L*_Lean > T_silicon_p99`` inversion or invalid certificate witness.
-[Timeouts & Locks] Bounded 50 MiB JSON reads and atomic ``os.replace`` writes
-  with explicit temp-file cleanup; ``TimeoutError`` always propagates before
-  ``OSError``. Zero locks or device contexts.
-[Side-Effect Policy] Pure validation and sealing helpers; filesystem mutation
-  occurs only in explicit ``write_atomic_json`` calls.
+  payloads reject raw IPv4 quads, private host paths, and usernames. Unified
+  physical tolerance is ``|pred - obs| <= max(rtol * obs, atol_ns)`` with
+  ``0 < rtol <= 10%`` and ``0 <= atol_ns <= 2000``. ``TimeoutError`` always
+  propagates before ``OSError``.
+[Timeouts & Locks] Bounded 50 MiB JSON reads, atomic ``os.replace`` writes, and
+  120s bounded repo-gate subprocesses; zero locks or device contexts.
+[Side-Effect Policy] Pure helpers except explicit ``write_atomic_json`` and
+  caller-requested diagnosis output writes.
 """
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import hashlib
+import importlib
 import json
+import math
 import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
 from typing import Any, Literal
 
-from mindie_sim.observations.multilevel_stream import (
-    SHA256_HEX_LENGTH,
-    sanitize_capture_uri,
-    validate_provenance_text,
+from mindie_sim.observations.multilevel_stream import SHA256_HEX_LENGTH, sanitize_capture_uri, validate_provenance_text
+from mindie_sim.optimization.dual_bound import (
+    DagEdge, EventDagSpec, FarkasCertificate, OptimalityCertificate, ResourceChoiceProgram, check_optimality_certificate,
 )
 from mindie_sim.schema.common import ModelingError
-from .tiling_axes import (
-    AbiDivisibilityRule,
-    TilingAxes,
-    default_topk_abi_rule,
-    validate_abi,
-)
 
 SKU_ONBOARDING_RECEIPT_SCHEMA = "mindie-sim.sku-onboarding-receipt/1"
 OPERATOR_ONBOARDING_RECEIPT_SCHEMA = "mindie-sim.operator-onboarding-receipt/1"
@@ -49,27 +46,23 @@ SOC_PROBE_SCHEMA = "mindie-sim.soc-probe/1"
 TRAIN_OBSERVATION_MANIFEST_SCHEMA = "mindie-sim.train-observation-manifest/1"
 VALID_CLOCK_OPERATORS: tuple[str, ...] = ("busy_union", "elapsed_span")
 DEFAULT_CLOCK_OPERATOR = "elapsed_span"
-FORBIDDEN_CALLER_PREDICTION_KEYS: frozenset[str] = frozenset(
-    {
-        "predicted_ns",
-        "predicted_ms",
-        "predicted_us",
-        "predicted_s",
-        "predicted_duration",
-    }
-)
+STANDARD_LEVEL_BOUNDARY_KINDS: Mapping[str, str] = {"L1": "device_kernel", "L2": "fx_region", "L3": "model_step"}
+FORBIDDEN_CALLER_PREDICTION_KEYS: frozenset[str] = frozenset({"predicted_ns", "predicted_ms", "predicted_us", "predicted_s", "predicted_duration"})
 
+ARCH_PRESET_22 = "npu_arch_2201"
+ARCH_PRESET_35 = "npu_arch_3510"
 DEFAULT_HELDOUT_APE_THRESHOLD_PCT = 10.0
 DEFAULT_PHYSICAL_ATOL_NS = 2000
-ANCHOR_CONTEXT_GRID: tuple[int, ...] = (
-    512, 2048, 8192, 32768, 131072, 262144, 409600,
-)
-OFF_GRID_CLIFF_HELDOUT_GRID: tuple[int, ...] = (
-    768, 2049, 4097, 24576, 98304, 200000, 350000, 400000,
-)
+ANCHOR_CONTEXT_GRID: tuple[int, ...] = (512, 2048, 8192, 32768, 131072, 262144, 409600)
+OFF_GRID_CLIFF_HELDOUT_GRID: tuple[int, ...] = (768, 2049, 4097, 24576, 98304, 200000, 350000, 400000)
 CONTEXT_MIN_TOKENS = 512
 CONTEXT_MAX_TOKENS = 409600
 DEFAULT_SPARSE_TOPK = 2048
+LIGHTNING_TOPK_ABOVE_THRESHOLD = 2048
+LIGHTNING_TOPK_DIVISOR = 1024
+LIGHTNING_TOPK_MAX_VALUE = 8192
+QLI_SMALL_M_TOPK_THRESHOLD = 64
+DEFAULT_TILE_DIM = 128
 COLD_RING_L2_MULTIPLIER = 3
 PERCENT_SCALE = 100.0
 NS_PER_MS = 1_000_000
@@ -77,49 +70,200 @@ NS_PER_US = 1000
 MIB_BYTES = 1024 * 1024
 GIB_BYTES = 1024 * 1024 * 1024
 MAX_READ_JSON_BYTES = 50 * MIB_BYTES
-DEFAULT_DEVICE_VRAM_BUDGET_GIB = 8
 DISPLAY_ROUND_DIGITS = 4
 HEX_COMMIT_LEN = 40
 SHORT_DIGEST_LEN = 16
 MAX_CALIBRATED_CV_PCT = 5.0
-
 DEFAULT_SSH_CONNECT_TIMEOUT_S = 8
 DEFAULT_PROBE_TIMEOUT_S = 30
 DEFAULT_GATE_SUBPROCESS_TIMEOUT_S = 120
 DEFAULT_L0_BUDGET_S = 360
 DEFAULT_FABRIC_BUDGET_S = 240
 DEFAULT_CLEANUP_GRACE_S = 60
-DEFAULT_OUTER_TIMEOUT_S = (
-    DEFAULT_L0_BUDGET_S + DEFAULT_FABRIC_BUDGET_S + DEFAULT_CLEANUP_GRACE_S
-)
-
+DEFAULT_OUTER_TIMEOUT_S = DEFAULT_L0_BUDGET_S + DEFAULT_FABRIC_BUDGET_S + DEFAULT_CLEANUP_GRACE_S
+DEFAULT_TILING_BATCH_AXIS: tuple[int, ...] = (1, 16, 64, 128)
+DEFAULT_TILING_QUERY_AXIS: tuple[int, ...] = (1, 2, 4, 8, 2048, 8192)
+_CROSS_DECODE_PAIRS: tuple[tuple[int, int], ...] = ((16, 4097), (64, 24576), (128, 98304))
+_CROSS_MTP_PAIRS: tuple[tuple[int, int], ...] = ((2, 2049), (4, 24576), (8, 98304))
+_CROSS_CHUNK_PAIRS: tuple[tuple[int, int], ...] = ((2048, 98304), (8192, 200000))
+_CROSS_PARALLEL_SPECS: tuple[tuple[str, int], ...] = (("tp2_pcp2_dcp2", 200000), ("tp2_pcp2_dcp4", 400000))
+_SPARSE_INDEXER_FAMILIES = frozenset({"sparse_indexer", "lightning_indexer", "indexer"})
+_CORE_COORD_KEYS: tuple[str, ...] = ("context_len", "tokens", "batch_size", "query_tokens", "topk", "batch_x_kv_heads")
 _IPV4_QUAD_RE = re.compile(r"(?<!\d)\d{1,3}(?:[._-]\d{1,3}){3}(?!\d)")
 _SAFE_SOC_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{1,63}$")
-_SAFE_ALIAS_RE = re.compile(r"[^a-z0-9._-]+")
 _EMAIL_OR_USER_HOST_RE = re.compile(
     r"(?:^|[\s\"'(<:,=])[A-Za-z_][A-Za-z0-9._%+-]*@(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}(?=$|[\s\"')>,;])"
     r"|[A-Za-z_][A-Za-z0-9._-]*@(?:\d{1,3}\.){3}\d{1,3}"
 )
 _HOME_ENV_RE = re.compile(r"\$\{?HOME\}?")
-_OPAQUE_ALIAS_HEX = 12
+_TOPO_TOKEN_RE = re.compile(r"(tp|pp|dp|ep|pcp|dcp)(\d+)")
+_VIOLATION_COUNT_RE = re.compile(r"(?:violations|findings):\s*(\d+)")
+_OPAQUE_HEX_LEN = 12
 _OPAQUE_ALIAS_RE = re.compile(r"^ep-[0-9a-f]{12}$")
 _OPAQUE_CAMPAIGN_RE = re.compile(r"^camp-[0-9a-f]{12}$")
 _OPAQUE_RUN_RE = re.compile(r"^run-[0-9a-f]{12}$")
 _OPAQUE_LEASE_RE = re.compile(r"^lease-[0-9a-f]{16}$")
-_OPAQUE_WARNING_REF_RE = re.compile(r"^([a-z][a-z0-9_]{1,63}):ref=([0-9a-f]{12})$")
 _SAFE_HEX_CAPTURE_NAME_RE = re.compile(r"^[0-9a-f]{64}(?:\.jsonl?)?$")
-_KNOWN_PUBLIC_WARNING_CODES = frozenset({
-    "receipt_warning",
-    "receipt_unconfirmed",
-    "host_queue_lease_acquire_unconfirmed",
-    "host_queue_lease_release_unconfirmed",
-    "lease_acquire_warning",
-    "lease_release_warning",
-    "release_delayed",
-    "acquire_delayed",
-    "coordinator_receipt_unconfirmed",
-})
+_DIAGNOSE_ESCALATED_EXIT = 1
+_PREVIEW_LINES = 8
+_PREVIEW_CHAR_LIMIT = 320
+_TIMING_TRIPLE_LEN = 3
+_TIMING_QUAD_LEN = 4
+_MAX_MISSING_CASES_IN_MSG = 8
 _SUBPROCESS_NO_WINDOW = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+
+def subprocess_window_kwargs() -> dict[str, Any]:
+    return {"creationflags": _SUBPROCESS_NO_WINDOW} if _SUBPROCESS_NO_WINDOW else {}
+
+
+def canonical_json_bytes(payload: Any) -> bytes:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
+
+
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _opaque_tag(raw: str, prefix: str, pattern: re.Pattern[str], fallback: str) -> str:
+    text = (raw or "").strip()
+    if not text:
+        return fallback
+    return text if pattern.fullmatch(text) else f"{prefix}-{hashlib.sha256(text.encode('utf-8')).hexdigest()[:_OPAQUE_HEX_LEN]}"
+
+
+def sanitize_public_alias(raw: str, fallback: str = "local") -> str:
+    return _opaque_tag(raw, "ep", _OPAQUE_ALIAS_RE, fallback)
+
+
+def sanitize_public_campaign_id(raw: str, fallback: str = "camp-default") -> str:
+    return _opaque_tag(raw, "camp", _OPAQUE_CAMPAIGN_RE, fallback)
+
+
+def sanitize_public_run_id(raw: str, fallback: str = "run-000000000000") -> str:
+    return _opaque_tag(raw, "run", _OPAQUE_RUN_RE, fallback)
+
+
+def sanitize_public_warning(raw: Any, fallback: str = "receipt_warning") -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    head = re.sub(r"[^a-z0-9_]+", "_", text.split(":", 1)[0].strip().lower()).strip("_")
+    code = head if head in {"receipt_warning", "receipt_unconfirmed", "host_queue_lease_acquire_unconfirmed", "host_queue_lease_release_unconfirmed", "release_delayed", "acquire_delayed"} else fallback
+    return f"{code}:ref={hashlib.sha256(text.encode('utf-8')).hexdigest()[:_OPAQUE_HEX_LEN]}"
+
+
+def sanitize_public_capture_uri(raw: str, *, raw_sha256: str = "", default_prefix: str = "capture://onboarding") -> str:
+    text = str(raw or "").strip()
+    if text:
+        clean = sanitize_capture_uri(text)
+        if clean.startswith("capture://"):
+            parts = [p for p in clean[len("capture://"):].strip("/").split("/") if p]
+            if len(parts) == 2 and parts[0] in {"train", "heldout", "onboarding", "soc-probe", "l0"} and _SAFE_HEX_CAPTURE_NAME_RE.fullmatch(parts[1]):
+                return f"capture://{parts[0]}/{parts[1]}"
+    dig = str(raw_sha256 or "").strip().lower()
+    tail = f"{dig}.json" if len(dig) == SHA256_HEX_LENGTH else f"{hashlib.sha256((text or 'cap').encode('utf-8')).hexdigest()[:SHORT_DIGEST_LEN]}.json"
+    return f"{default_prefix.rstrip('/')}/{tail}"
+
+
+def build_capture_uri(namespace: str, payload: bytes) -> str:
+    ns = re.sub(r"[^a-z0-9._/-]+", "-", (namespace or "onboarding").strip().lower()).strip("-/") or "onboarding"
+    return sanitize_capture_uri(f"capture://{ns}/{sha256_bytes(payload)}")
+
+
+def sanitize_lease_for_receipt(lease: Mapping[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(lease, Mapping):
+        return {}
+    out: dict[str, Any] = {}
+    if lease.get("lease_mode") is not None:
+        out["lease_mode"] = str(lease["lease_mode"])
+    raw_id = str(lease.get("lease_id") or lease.get("lease_digest") or "").strip()
+    if raw_id:
+        out["lease_digest"] = raw_id if _OPAQUE_LEASE_RE.fullmatch(raw_id) else f"lease-{hashlib.sha256(raw_id.encode('utf-8')).hexdigest()[:SHORT_DIGEST_LEN]}"
+    for src_k, dst_k in (("fence_token", "fence_token"), ("ttl_seconds", "ttl_seconds")):
+        if lease.get(src_k) is not None and not isinstance(lease[src_k], bool):
+            out[dst_k] = int(lease[src_k])
+    if isinstance(lease.get("devices"), (list, tuple)):
+        out["device_count"] = len(lease["devices"])
+    elif lease.get("device_count") is not None and not isinstance(lease["device_count"], bool):
+        out["device_count"] = int(lease["device_count"])
+    if bool(lease.get("receipt_unconfirmed")):
+        out["receipt_unconfirmed"] = True
+    if lease.get("receipt_warning"):
+        out["receipt_warning"] = sanitize_public_warning(lease["receipt_warning"])
+    return out
+
+
+def collect_receipt_warnings(*records: Mapping[str, Any] | None) -> tuple[bool, str]:
+    unconfirmed, warnings = False, []
+    for rec in records:
+        if isinstance(rec, Mapping):
+            unconfirmed = unconfirmed or bool(rec.get("receipt_unconfirmed"))
+            msg = sanitize_public_warning(rec.get("receipt_warning"))
+            if msg and msg not in warnings:
+                warnings.append(msg)
+    return unconfirmed, "; ".join(warnings)
+
+
+def assert_sanitized_payload(payload: Any, *, field_name: str = "payload") -> None:
+    if isinstance(payload, str):
+        validate_provenance_text(payload, field_name=field_name)
+        for rx, code in ((_IPV4_QUAD_RE, "private_ipv4_rejected"), (_EMAIL_OR_USER_HOST_RE, "private_user_host_rejected"), (_HOME_ENV_RE, "private_home_env_rejected")):
+            if rx.search(payload):
+                raise ModelingError(f"{code}:{field_name}")
+    elif isinstance(payload, Mapping):
+        for k, v in payload.items():
+            assert_sanitized_payload(v, field_name=f"{field_name}.{k}")
+    elif isinstance(payload, (list, tuple)):
+        for i, item in enumerate(payload):
+            assert_sanitized_payload(item, field_name=f"{field_name}[{i}]")
+
+
+def read_bounded_json(path: str | Path) -> Any:
+    target = Path(path)
+    try:
+        if target.stat().st_size > MAX_READ_JSON_BYTES:
+            raise ModelingError(f"onboarding_json_exceeds_50_mib:{target.name}")
+        raw = target.read_bytes()
+    except TimeoutError:
+        raise
+    except OSError as exc:
+        raise ModelingError(f"onboarding_json_read_failed:{target.name}:{exc}") from exc
+    if len(raw) > MAX_READ_JSON_BYTES:
+        raise ModelingError(f"onboarding_json_exceeds_50_mib:{target.name}")
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise ModelingError(f"onboarding_json_invalid:{target.name}:{exc}") from exc
+
+
+def write_atomic_bytes(path: str | Path, data: bytes) -> Path:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent))
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, target)
+        return target
+    except TimeoutError:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+        raise
+    except OSError as exc:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+        raise ModelingError(f"onboarding_json_write_failed:{target.name}:{exc}") from exc
+
+
+def write_atomic_json(path: str | Path, payload: Any) -> Path:
+    return write_atomic_bytes(path, (json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8"))
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,39 +282,24 @@ class TimeoutBudget:
                 raise ModelingError(f"timeout_budget_inner_invalid:{label}:{budget}")
         if type(self.cleanup_grace_s) is not int or self.cleanup_grace_s < 1:
             raise ModelingError(f"timeout_budget_grace_invalid:{self.cleanup_grace_s}")
-        if type(self.outer_timeout_s) is not int or self.outer_timeout_s < 1:
-            raise ModelingError(f"timeout_budget_outer_invalid:{self.outer_timeout_s}")
-        required = self.minimum_outer_timeout_s
-        if self.outer_timeout_s < required:
-            raise ModelingError(
-                f"timeout_budget_outer_too_small:outer={self.outer_timeout_s}:required={required}"
-            )
+        min_outer = sum(v for _, v in self.inner_budgets_s) + self.cleanup_grace_s
+        if type(self.outer_timeout_s) is not int or self.outer_timeout_s < min_outer:
+            raise ModelingError(f"timeout_budget_outer_too_small:outer={self.outer_timeout_s}:min_required={min_outer}")
 
     @property
     def total_inner_s(self) -> int:
-        return sum(budget for _, budget in self.inner_budgets_s)
-
-    @property
-    def minimum_outer_timeout_s(self) -> int:
-        return self.total_inner_s + self.cleanup_grace_s
+        return sum(v for _, v in self.inner_budgets_s)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "inner_budgets_s": {name: value for name, value in self.inner_budgets_s},
-            "total_inner_s": self.total_inner_s,
-            "cleanup_grace_s": self.cleanup_grace_s,
-            "outer_timeout_s": self.outer_timeout_s,
-        }
+        return {"inner_budgets_s": {k: v for k, v in self.inner_budgets_s}, "cleanup_grace_s": self.cleanup_grace_s, "outer_timeout_s": self.outer_timeout_s}
 
 
 @dataclass(frozen=True, slots=True)
 class SiliconProfileConflict:
-    """Single mismatch between observed silicon truth and declared SKU profile."""
-
     field: str
-    observed: Any
-    declared: Any
-    reason: str
+    silicon_value: Any
+    profile_value: Any
+    detail: str
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -178,57 +307,152 @@ class SiliconProfileConflict:
 
 @dataclass(frozen=True, slots=True)
 class SocProbeRecord:
-    """Sanitized hardware probe facts from ``aclrtGetSocName``, CANN INI, and ``npu-smi``."""
-
     soc_name: str
     arch_preset: str
     architecture: str
     aic_count: int
     aiv_count: int
-    aicore_freq_mhz: int
     hbm_bytes: int
     l2_bytes: int
     ub_bytes: int
-    l1_bytes: int
-    l0a_bytes: int
-    l0b_bytes: int
-    l0c_bytes: int
     dies_per_package: int
     ranks_per_node: int
-    cann_version: str
-    endpoint_alias: str
-    capture_uri: str
-    probe_sha256: str
+    aicore_freq_mhz: int = 0
+    l1_bytes: int = 0
+    l0a_bytes: int = 0
+    l0b_bytes: int = 0
+    l0c_bytes: int = 0
+    endpoint_alias: str = "local"
+    cann_version: str = "unmeasured"
+    platform_ini_sha256: str = ""
+    capture_uri: str = ""
     fabric_channels: tuple[tuple[str, float], ...] = ()
-    topology_preset: str = ""
 
     def __post_init__(self) -> None:
-        if not self.soc_name or not _SAFE_SOC_NAME_RE.fullmatch(self.soc_name.strip()):
-            raise ModelingError("soc_probe_name_invalid")
-        if self.aic_count < 1:
-            raise ModelingError(f"soc_probe_aic_invalid:{self.aic_count}")
-        if self.aiv_count < 0:
-            raise ModelingError(f"soc_probe_aiv_invalid:{self.aiv_count}")
-        if self.dies_per_package < 1 or self.ranks_per_node < 1:
-            raise ModelingError("soc_probe_topology_invalid")
-        if len(self.probe_sha256) != SHA256_HEX_LENGTH:
-            raise ModelingError("soc_probe_sha256_invalid")
-        sanitize_capture_uri(self.capture_uri)
-        validate_provenance_text(self.endpoint_alias, field_name="endpoint_alias")
+        if not _SAFE_SOC_NAME_RE.fullmatch(self.soc_name):
+            raise ModelingError(f"soc_name_invalid:{self.soc_name!r}")
+        for fname, val in (("aic_count", self.aic_count), ("aiv_count", self.aiv_count), ("dies_per_package", self.dies_per_package), ("ranks_per_node", self.ranks_per_node)):
+            if type(val) is not int or val < 0:
+                raise ModelingError(f"soc_probe_field_invalid:{fname}:{val}")
 
     def to_dict(self) -> dict[str, Any]:
-        raw = asdict(self)
-        raw["fabric_channels"] = {name: val for name, val in self.fabric_channels}
-        return raw
+        return {**asdict(self), "schema": SOC_PROBE_SCHEMA, "fabric_channels": dict(self.fabric_channels)}
+
+
+@dataclass(frozen=True, slots=True)
+class AbiDivisibilityRule:
+    axis: str
+    above_threshold: int
+    divisor: int
+    max_value: int | None = None
+    arch_presets: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.axis or type(self.divisor) is not int or self.divisor < 1 or type(self.above_threshold) is not int or self.above_threshold < 0:
+            raise ModelingError(f"abi_rule_invalid:{self.axis}:{self.above_threshold}:{self.divisor}")
+        if self.max_value is not None and (type(self.max_value) is not int or self.max_value < 1):
+            raise ModelingError(f"abi_rule_max_invalid:{self.axis}:{self.max_value}")
+
+    def applies_to(self, arch_preset: str) -> bool:
+        return not self.arch_presets or (bool(arch_preset) and arch_preset in self.arch_presets)
+
+    def check(self, value: int) -> tuple[bool, str]:
+        if type(value) is not int or value < 1:
+            return False, f"abi_nonpositive_value:{self.axis}={value}"
+        if self.max_value is not None and value > self.max_value:
+            return False, f"abi_max_violation:{self.axis}={value}:max={self.max_value}"
+        if value > self.above_threshold and self.divisor > 1 and (value % self.divisor) != 0:
+            return False, f"abi_divisibility_violation:{self.axis}={value}:above={self.above_threshold}:divisor={self.divisor}"
+        return True, ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"axis": self.axis, "above_threshold": self.above_threshold, "divisor": self.divisor, "max_value": self.max_value, "arch_presets": list(self.arch_presets)}
+
+
+def default_topk_abi_rule(
+    *, above_threshold: int = LIGHTNING_TOPK_ABOVE_THRESHOLD, divisor: int = LIGHTNING_TOPK_DIVISOR,
+    max_value: int = LIGHTNING_TOPK_MAX_VALUE, arch_presets: tuple[str, ...] = (ARCH_PRESET_22,),
+) -> AbiDivisibilityRule:
+    return AbiDivisibilityRule("topk", above_threshold, divisor, max_value, arch_presets)
+
+
+@dataclass(frozen=True, slots=True)
+class TilingAxes:
+    tile_dims: tuple[int, ...] = (DEFAULT_TILE_DIM,)
+    core_product_axes: tuple[str, ...] = ("tokens", "batch_x_kv_heads")
+    phase_thresholds: tuple[tuple[str, int], ...] = ()
+    abi_divisibility: tuple[AbiDivisibilityRule, ...] = ()
+    batch_axis: tuple[int, ...] = DEFAULT_TILING_BATCH_AXIS
+    query_tokens_axis: tuple[int, ...] = DEFAULT_TILING_QUERY_AXIS
+    enforce_topk_le_context_archs: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "tile_dims": list(self.tile_dims), "core_product_axes": list(self.core_product_axes),
+            "phase_thresholds": dict(self.phase_thresholds), "abi_divisibility": [r.to_dict() for r in self.abi_divisibility],
+            "batch_axis": list(self.batch_axis), "query_tokens_axis": list(self.query_tokens_axis),
+            "enforce_topk_le_context_archs": list(self.enforce_topk_le_context_archs),
+        }
+
+
+def family_default_tiling_axes(
+    family: str, *, tile_dim: int, arch_preset: str = "", topk_threshold: int | None = None,
+) -> TilingAxes:
+    clean = str(family or "").strip()
+    for mod_path in (f"mindie_sim.prediction.operators.{clean}.common", f"mindie_sim.prediction.operators.{clean}"):
+        if not clean:
+            break
+        try:
+            mod = importlib.import_module(mod_path)
+            decl = getattr(mod, "TILING_AXES", None)
+            if callable(decl):
+                res = decl(arch_preset)
+                if isinstance(res, TilingAxes):
+                    return res
+            elif isinstance(decl, TilingAxes):
+                return decl
+        except Exception:
+            continue
+    if clean in _SPARSE_INDEXER_FAMILIES or topk_threshold is not None:
+        tk = int(topk_threshold) if topk_threshold is not None else LIGHTNING_TOPK_ABOVE_THRESHOLD
+        bounds = default_topk_abi_rule(divisor=1, arch_presets=())
+        dav22 = default_topk_abi_rule(divisor=LIGHTNING_TOPK_DIVISOR, arch_presets=(ARCH_PRESET_22,))
+        thr: tuple[tuple[str, int], ...] = (
+            (("topk", tk), ("topk", QLI_SMALL_M_TOPK_THRESHOLD))
+            if (clean in _SPARSE_INDEXER_FAMILIES and arch_preset == ARCH_PRESET_35 and tk != QLI_SMALL_M_TOPK_THRESHOLD)
+            else (("topk", tk),)
+        )
+        return TilingAxes(tile_dims=(int(tile_dim),), phase_thresholds=thr, abi_divisibility=(bounds, dav22))
+    return TilingAxes(tile_dims=(int(tile_dim),))
+
+
+def validate_abi(point: Mapping[str, Any], axes: TilingAxes, *, arch_preset: str = "") -> tuple[bool, str]:
+    axis_name = str(point.get("axis") or "").strip()
+    resolved: dict[str, int] = {}
+    if axis_name and point.get("value") is not None:
+        if type(point["value"]) is not int:
+            return False, f"abi_type_violation:{axis_name}={point['value']!r}"
+        resolved[axis_name] = point["value"]
+    for key in dict.fromkeys((*_CORE_COORD_KEYS, *(r.axis for r in axes.abi_divisibility))):
+        if key not in point or point[key] is None:
+            continue
+        if type(point[key]) is not int:
+            return False, f"abi_type_violation:{key}={point[key]!r}"
+        resolved[key] = point[key]
+    for rule in axes.abi_divisibility:
+        if rule.applies_to(arch_preset) and rule.axis in resolved:
+            ok, reason = rule.check(resolved[rule.axis])
+            if not ok:
+                return False, reason
+    if arch_preset and arch_preset in axes.enforce_topk_le_context_archs and "topk" in resolved and "context_len" in resolved and resolved["topk"] > resolved["context_len"]:
+        return False, f"abi_topk_exceeds_context:topk={resolved['topk']}>context={resolved['context_len']}"
+    return True, ""
 
 
 @dataclass(frozen=True, slots=True)
 class CliffPointSpec:
-    """Single deterministic anchor, 2D cliff, or ABI-rejection benchmark point."""
-
     point_id: str
     split: Literal["train", "heldout", "abi_rejection"]
-    grid_kind: Literal["anchor", "off_grid_cliff", "boundary_cliff", "cross_sample_2d", "abi_rejection"]
     axis: str
     value: int
     regime_tag: str
@@ -240,26 +464,12 @@ class CliffPointSpec:
     clock_operator: str = DEFAULT_CLOCK_OPERATOR
     abi_expected_error: str = ""
 
-    def __post_init__(self) -> None:
-        if not self.point_id or not self.axis or type(self.value) is not int or self.value < 1:
-            raise ModelingError(f"cliff_point_invalid:{self.point_id}:{self.axis}:{self.value}")
-        if self.split not in ("train", "heldout", "abi_rejection"):
-            raise ModelingError(f"cliff_point_split_invalid:{self.split}")
-        if type(self.batch_size) is not int or self.batch_size < 1:
-            raise ModelingError(f"cliff_point_batch_invalid:{self.batch_size}")
-        if type(self.query_tokens) is not int or self.query_tokens < 1:
-            raise ModelingError(f"cliff_point_query_invalid:{self.query_tokens}")
-        if self.clock_operator not in VALID_CLOCK_OPERATORS:
-            raise ModelingError(f"cliff_point_clock_operator_invalid:{self.clock_operator}")
-
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
 @dataclass(frozen=True, slots=True)
 class OperatorCliffParameters:
-    """Declared physical parameters driving operator cliff-plan synthesis."""
-
     operator_id: str
     family: str
     tile_dim: int
@@ -271,101 +481,219 @@ class OperatorCliffParameters:
     context_max: int = CONTEXT_MAX_TOKENS
     tiling_axes: TilingAxes | None = None
 
-    def __post_init__(self) -> None:
-        if not self.operator_id or not self.family:
-            raise ModelingError("operator_cliff_identity_missing")
-        if type(self.tile_dim) is not int or self.tile_dim < 2:
-            raise ModelingError(f"operator_cliff_tile_invalid:{self.tile_dim}")
-        if type(self.core_count) is not int or self.core_count < 1:
-            raise ModelingError(f"operator_cliff_core_count_invalid:{self.core_count}")
-        if type(self.l2_bytes) is not int or self.l2_bytes < 1:
-            raise ModelingError(f"operator_cliff_l2_invalid:{self.l2_bytes}")
-        if type(self.bytes_per_token) is not int or self.bytes_per_token < 0:
-            raise ModelingError(f"operator_cliff_bytes_per_token_invalid:{self.bytes_per_token}")
-        if self.topk_threshold is not None and (
-            type(self.topk_threshold) is not int or self.topk_threshold < 2
-        ):
-            raise ModelingError(f"operator_cliff_topk_invalid:{self.topk_threshold}")
-        if self.context_min < 1 or self.context_max < self.context_min:
-            raise ModelingError("operator_cliff_context_domain_invalid")
-
 
 @dataclass(frozen=True, slots=True)
 class CliffBenchPlan:
-    """SHA-256-sealed disjoint train + 2D cliff heldout + ABI-rejection bench plan."""
-
-    schema: str
-    plan_id: str
     target_id: str
     sku: str
     train_lineage_root: str
     heldout_lineage_root: str
-    cold_ring_l2_multiplier: int
     train_points: tuple[CliffPointSpec, ...]
     heldout_points: tuple[CliffPointSpec, ...]
     plan_sha256: str
     abi_rejection_points: tuple[CliffPointSpec, ...] = ()
+    arch_preset: str = ""
     tiling_axes: TilingAxes | None = None
     family: str = ""
     campaign_id: str = ""
-    arch_preset: str = ""
-
-    def __post_init__(self) -> None:
-        if self.schema != CLIFF_PLAN_SCHEMA:
-            raise ModelingError(f"cliff_plan_schema_invalid:{self.schema}")
-        if not self.train_lineage_root or not self.heldout_lineage_root:
-            raise ModelingError("cliff_plan_lineage_root_missing")
-        if self.train_lineage_root == self.heldout_lineage_root:
-            raise ModelingError("cliff_plan_train_heldout_lineage_overlap")
-        if self.cold_ring_l2_multiplier < COLD_RING_L2_MULTIPLIER:
-            raise ModelingError(
-                f"cliff_plan_cold_ring_too_small:{self.cold_ring_l2_multiplier}"
-            )
-        train_keys = {
-            (pt.axis, pt.value, pt.batch_size, pt.query_tokens, pt.parallel_topology)
-            for pt in self.train_points
-        }
-        heldout_keys = {
-            (pt.axis, pt.value, pt.batch_size, pt.query_tokens, pt.parallel_topology)
-            for pt in self.heldout_points
-        }
-        overlap = sorted(train_keys & heldout_keys)
-        if overlap:
-            raise ModelingError(f"cliff_plan_train_heldout_point_overlap:{overlap[0]}")
-        train_ctx = {pt.value for pt in self.train_points if pt.axis == "context_len"}
-        heldout_ctx = {pt.value for pt in self.heldout_points if pt.axis == "context_len"}
-        ctx_overlap = sorted(train_ctx & heldout_ctx)
-        if ctx_overlap:
-            raise ModelingError(f"cliff_plan_train_heldout_context_overlap:{ctx_overlap[0]}")
-        if len(self.plan_sha256) != SHA256_HEX_LENGTH:
-            raise ModelingError("cliff_plan_sha256_invalid")
 
     def to_dict(self) -> dict[str, Any]:
-        out: dict[str, Any] = {
-            "schema": self.schema,
-            "plan_id": self.plan_id,
-            "target_id": self.target_id,
-            "family": self.family,
-            "sku": self.sku,
-            "campaign_id": self.campaign_id,
-            "train_lineage_root": self.train_lineage_root,
-            "heldout_lineage_root": self.heldout_lineage_root,
-            "cold_ring_l2_multiplier": self.cold_ring_l2_multiplier,
-            "train_points": [pt.to_dict() for pt in self.train_points],
-            "heldout_points": [pt.to_dict() for pt in self.heldout_points],
-            "abi_rejection_points": [pt.to_dict() for pt in self.abi_rejection_points],
+        return {
+            "schema": CLIFF_PLAN_SCHEMA, "target_id": self.target_id, "sku": self.sku,
+            "family": self.family, "campaign_id": self.campaign_id, "arch_preset": self.arch_preset,
             "tiling_axes": self.tiling_axes.to_dict() if self.tiling_axes is not None else None,
+            "train_lineage_root": self.train_lineage_root, "heldout_lineage_root": self.heldout_lineage_root,
+            "train_points": [p.to_dict() for p in self.train_points],
+            "heldout_points": [p.to_dict() for p in self.heldout_points],
+            "abi_rejection_points": [p.to_dict() for p in self.abi_rejection_points],
             "plan_sha256": self.plan_sha256,
         }
-        if self.arch_preset:
-            out["arch_preset"] = self.arch_preset
-        return out
+
+
+def validate_parallel_topology(topo: str) -> int:
+    text = str(topo or "tp1").strip().lower()
+    tokens = _TOPO_TOKEN_RE.findall(text)
+    if not tokens or "_".join(f"{k}{v}" for k, v in tokens) != text:
+        raise ModelingError(f"parallel_topology_invalid:{topo}")
+    axes = {k: int(v) for k, v in tokens}
+    if any(v < 1 for v in axes.values()):
+        raise ModelingError(f"parallel_topology_nonpositive:{topo}")
+    tp, pcp, dcp = axes.get("tp", 1), axes.get("pcp", 1), axes.get("dcp", 1)
+    if dcp > 1 and pcp > 1 and (dcp % pcp != 0):
+        raise ModelingError(f"dcp_pcp_domain_invalid:dcp={dcp}:pcp={pcp}:{topo}")
+    if dcp > 1 and dcp > tp * pcp:
+        raise ModelingError(f"parallel_topology_invalid:{topo}")
+    return max(1, tp * max(1, axes.get("dp", 1)) * max(1, axes.get("pp", 1)) * max(1, pcp))
+
+
+def required_ranks_for_plan(plan_doc: Mapping[str, Any]) -> int:
+    max_r = 1
+    for split_key in ("train_points", "heldout_points", "abi_rejection_points"):
+        for pt in plan_doc.get(split_key) or ():
+            if isinstance(pt, Mapping):
+                max_r = max(max_r, validate_parallel_topology(str(pt.get("parallel_topology") or "tp1")))
+    return max_r
+
+
+def _resolve_plan_arch_preset(sku: str, arch_preset: str, profile_override: Mapping[str, Any] | None) -> str:
+    if arch_preset.strip():
+        return arch_preset.strip()
+    from .whitebox_runner import resolve_sku_profile
+
+    prof = resolve_sku_profile(sku, profile_override)
+    if prof is None:
+        raise ModelingError(f"unknown_sku_profile:{sku}")
+    dev = prof.get("device") if isinstance(prof.get("device"), Mapping) else {}
+    ca = dev.get("compute_arch") if isinstance(dev.get("compute_arch"), Mapping) else {}
+    preset = str(ca.get("preset") or "").strip()
+    if not preset:
+        raise ModelingError(f"sku_profile_missing_arch_preset:{sku}")
+    return preset
+
+
+def _plan_digest_payload(doc: Mapping[str, Any]) -> dict[str, Any]:
+    return {k: doc.get(k) for k in ("target_id", "sku", "family", "arch_preset", "train_lineage_root", "heldout_lineage_root", "train_points", "heldout_points", "abi_rejection_points")}
+
+
+def verify_cliff_plan_integrity(plan_doc: Mapping[str, Any]) -> str:
+    expected = str(plan_doc.get("plan_sha256") or "").strip().lower()
+    actual = sha256_bytes(canonical_json_bytes(_plan_digest_payload(plan_doc)))
+    if not expected or expected != actual:
+        raise ModelingError(f"cliff_plan_sha256_tampered:expected={expected[:SHORT_DIGEST_LEN]}:actual={actual[:SHORT_DIGEST_LEN]}")
+    return actual
+
+
+def synthesize_operator_cliff_plan(
+    params: OperatorCliffParameters, *, sku: str, campaign_id: str = "onboard",
+    arch_preset: str = "", profile_override: Mapping[str, Any] | None = None,
+) -> CliffBenchPlan:
+    resolved_arch = _resolve_plan_arch_preset(sku, arch_preset, profile_override)
+    axes = params.tiling_axes or family_default_tiling_axes(params.family, tile_dim=int(params.tile_dim), arch_preset=resolved_arch, topk_threshold=params.topk_threshold)
+    clean_camp = sanitize_public_campaign_id(campaign_id, "camp-onboard")
+    train_root = f"{clean_camp}-{sha256_bytes(f'train:{sku}:{params.operator_id}:{clean_camp}'.encode('utf-8'))[:SHORT_DIGEST_LEN]}"
+    held_root = f"{clean_camp}-{sha256_bytes(f'heldout:{sku}:{params.operator_id}:{clean_camp}'.encode('utf-8'))[:SHORT_DIGEST_LEN]}"
+    train_pts: list[CliffPointSpec] = []
+    held_pts: list[CliffPointSpec] = []
+    abi_rejs: list[CliffPointSpec] = []
+    seen_ho: set[tuple[Any, ...]] = set()
+    seen_rej: set[tuple[Any, ...]] = set()
+
+    def _add(pid: str, axis: str, val: int, tag: str, why: str, *, b: int = 1, q: int = 1, tk: int | None = None, topo: str = "tp1") -> None:
+        validate_parallel_topology(topo)
+        ok, err = validate_abi({"axis": axis, "value": val, "batch_size": b, "query_tokens": q, "topk": tk}, axes, arch_preset=resolved_arch)
+        key = (axis, val, b, q, tk, topo)
+        if not ok and key not in seen_rej:
+            seen_rej.add(key)
+            abi_rejs.append(CliffPointSpec(f"abi_reject_{pid}", "abi_rejection", axis, val, f"{tag}_abi_reject", why, b, q, tk, topo, DEFAULT_CLOCK_OPERATOR, err))
+        elif ok and key not in seen_ho:
+            seen_ho.add(key)
+            held_pts.append(CliffPointSpec(pid, "heldout", axis, val, tag, why, b, q, tk, topo))
+
+    def _in_ctx(ctx_val: int) -> bool:
+        return params.context_min <= ctx_val <= params.context_max
+
+    train_pts.extend(CliffPointSpec(f"anchor_ctx_{c}", "train", "context_len", c, "anchor_grid", "Anchor context grid") for c in ANCHOR_CONTEXT_GRID if _in_ctx(c))
+    for c in OFF_GRID_CLIFF_HELDOUT_GRID:
+        if _in_ctx(c):
+            _add(f"offgrid_ctx_{c}", "context_len", c, "off_grid_heldout", "Off-grid context cliff")
+    for b, c in _CROSS_DECODE_PAIRS:
+        if _in_ctx(c):
+            _add(f"cross_b{b}_ctx_{c}", "context_len", c, "high_batch_decode_2d", "High-batch decode 2D", b=b)
+    for pairs, prefix, tag, why in ((_CROSS_MTP_PAIRS, "cross_mtp_q", "mtp_decode_2d", "MTP decode 2D"), (_CROSS_CHUNK_PAIRS, "cross_chunk_q", "chunked_prefill_2d", "Chunked prefill 2D")):
+        for q, c in pairs:
+            if _in_ctx(c):
+                _add(f"{prefix}{q}_ctx_{c}", "context_len", c, tag, why, q=q)
+    for topo, c in _CROSS_PARALLEL_SPECS:
+        if _in_ctx(c):
+            _add(f"cross_{topo}_ctx_{c}", "context_len", c, "parallel_split_2d", "Multi-rank TP/PCP/DCP", topo=topo)
+    for td in axes.tile_dims:
+        for delta, suffix in ((-1, "minus1"), (0, "exact"), (1, "plus1")):
+            if td + delta >= 1:
+                _add(f"tile_{td}_{suffix}_{td + delta}", "tokens", td + delta, "tile_boundary", f"Tile boundary {td}{delta:+d}")
+        prod = max(1, int(params.core_count)) * td
+        for c_axis in axes.core_product_axes:
+            for delta, suffix in ((-1, "minus1"), (1, "plus1")):
+                if prod + delta >= 1:
+                    _add(f"cores_wave_{c_axis}_{td}_{suffix}_{prod + delta}", c_axis, prod + delta, "core_wave_boundary", f"Core wave {prod}{delta:+d}")
+    for p_axis, thr in axes.phase_thresholds:
+        for delta, suffix in ((-1, "minus1"), (1, "plus1")):
+            if (v := thr + delta) >= 1:
+                if p_axis == "topk":
+                    _add(f"topk_attr_{v}", "context_len", max(v, CONTEXT_MIN_TOKENS), "topk_phase_cliff", f"Top-K {thr}{delta:+d}", tk=v)
+                else:
+                    _add(f"phase_{p_axis}_{suffix}_{v}", p_axis, v, "phase_threshold", f"Phase threshold {thr}{delta:+d}")
+    for rule in axes.abi_divisibility:
+        if rule.applies_to(resolved_arch) and rule.max_value is not None:
+            over = rule.max_value + 1
+            is_tk = rule.axis == "topk"
+            _add(f"{rule.axis}_over_max_{over}", "context_len" if is_tk else rule.axis, max(over, CONTEXT_MIN_TOKENS) if is_tk else over, "abi_max_boundary", f"ABI max+1 ({over})", tk=over if is_tk else None)
+
+    draft = {
+        "target_id": params.operator_id, "sku": sku, "family": params.family, "arch_preset": resolved_arch,
+        "train_lineage_root": train_root, "heldout_lineage_root": held_root,
+        "train_points": [p.to_dict() for p in train_pts],
+        "heldout_points": [p.to_dict() for p in held_pts],
+        "abi_rejection_points": [p.to_dict() for p in abi_rejs],
+    }
+    return CliffBenchPlan(
+        target_id=params.operator_id, sku=sku, train_lineage_root=train_root, heldout_lineage_root=held_root,
+        train_points=tuple(train_pts), heldout_points=tuple(held_pts), abi_rejection_points=tuple(abi_rejs),
+        plan_sha256=sha256_bytes(canonical_json_bytes(draft)), arch_preset=resolved_arch,
+        tiling_axes=axes, family=params.family, campaign_id=clean_camp,
+    )
+
+
+def synthesize_sku_512_400k_plan(
+    *, sku: str, core_count: int, l2_bytes: int, tile_dim: int = DEFAULT_TILE_DIM,
+    campaign_id: str = "sku-512-400k", arch_preset: str = "", profile_override: Mapping[str, Any] | None = None,
+) -> CliffBenchPlan:
+    resolved_arch = _resolve_plan_arch_preset(sku, arch_preset, profile_override)
+    axes = family_default_tiling_axes("sparse_indexer", tile_dim=tile_dim, arch_preset=resolved_arch, topk_threshold=DEFAULT_SPARSE_TOPK)
+    return synthesize_operator_cliff_plan(
+        OperatorCliffParameters(f"sku:{sku}:512_400k", "sku_suite", tile_dim, core_count, l2_bytes, topk_threshold=DEFAULT_SPARSE_TOPK, tiling_axes=axes),
+        sku=sku, campaign_id=campaign_id, arch_preset=resolved_arch, profile_override=profile_override,
+    )
+
+
+def evaluate_abi_rejections(
+    planned_rejections: Sequence[Mapping[str, Any]], observed_rejections: Sequence[Mapping[str, Any]] | None,
+) -> dict[str, Any]:
+    if not planned_rejections:
+        return {"ok": True, "required": 0, "verified": 0, "missing": [], "mismatches": []}
+    by_id = {str(r.get("point_id") or r.get("case_id") or ""): r for r in (observed_rejections or ()) if isinstance(r, Mapping)}
+    missing, mismatches, verified = [], [], 0
+    for pt in planned_rejections:
+        pid = str(pt.get("point_id") or "")
+        exp = str(pt.get("abi_expected_error") or "").strip()
+        obs = by_id.get(pid)
+        if obs is None:
+            missing.append(pid)
+            continue
+        if not bool(obs.get("rejected")):
+            mismatches.append(f"{pid}:not_rejected")
+            continue
+        err = str(obs.get("abi_error") or "").strip()
+        if exp and exp not in err:
+            mismatches.append(f"{pid}:expected={exp}:got={err}")
+            continue
+        verified += 1
+    return {"ok": not missing and not mismatches, "required": len(planned_rejections), "verified": verified, "missing": missing, "mismatches": mismatches}
+
+
+@dataclass(frozen=True, slots=True)
+class GateCheckOutcome:
+    name: str
+    passed: bool
+    status: str
+    detail: str
+    metrics: tuple[tuple[str, Any], ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"name": self.name, "passed": self.passed, "status": self.status, "detail": self.detail, "metrics": dict(self.metrics)}
 
 
 @dataclass(frozen=True, slots=True)
 class LeanBoundCheckRow:
-    """Result of verifying Lean 4 lower-bound non-inversion for one benchmark case."""
-
     case_id: str
     l_star_lean_ns: int
     t_sim_ns: int
@@ -375,376 +703,348 @@ class LeanBoundCheckRow:
     sim_inverted: bool
     silicon_inverted: bool
 
-    @property
-    def passed(self) -> bool:
-        return (
-            self.certificate_valid
-            and not self.sim_inverted
-            and not self.silicon_inverted
-        )
-
     def to_dict(self) -> dict[str, Any]:
-        return {**asdict(self), "passed": self.passed}
-
-
-@dataclass(frozen=True, slots=True)
-class GateCheckOutcome:
-    """Single deterministic gate outcome embedded in an onboarding receipt."""
-
-    name: str
-    passed: bool
-    status: str
-    detail: str = ""
-    metrics: tuple[tuple[str, Any], ...] = ()
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "name": self.name,
-            "passed": self.passed,
-            "status": self.status,
-            "detail": self.detail,
-            "metrics": {key: val for key, val in self.metrics},
-        }
+        return asdict(self)
 
 
 @dataclass(frozen=True, slots=True)
 class OnboardingReceipt:
-    """Machine-verifiable SHA-256 onboarding certification receipt."""
-
     schema: str
-    kind: Literal["sku", "operator"]
+    target_kind: Literal["sku", "operator"]
     target_id: str
     sku: str
-    status: Literal["silicon_certified", "offline_reverify", "failed"]
+    status: str
     ok: bool
     created_utc: str
     gates: tuple[GateCheckOutcome, ...]
     artifacts: tuple[tuple[str, str], ...]
-    diagnosis_report: Mapping[str, Any] | None
-    receipt_sha256: str
-    acquisition_mode: Literal["live_silicon", "offline_reverify"] = "offline_reverify"
+    summary: tuple[tuple[str, Any], ...]
+    receipt_sha256: str = ""
     receipt_unconfirmed: bool = False
     receipt_warning: str = ""
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_unsigned_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {
-            "schema": self.schema,
-            "kind": self.kind,
-            "target_id": self.target_id,
-            "sku": self.sku,
-            "status": self.status,
-            "acquisition_mode": self.acquisition_mode,
-            "ok": self.ok,
-            "created_utc": self.created_utc,
-            "gates": [gate.to_dict() for gate in self.gates],
-            "artifacts": {key: val for key, val in self.artifacts},
-            "diagnosis_report": dict(self.diagnosis_report) if self.diagnosis_report else None,
-            "receipt_sha256": self.receipt_sha256,
+            "schema": self.schema, "target_kind": self.target_kind, "target_id": self.target_id,
+            "sku": self.sku, "status": self.status, "ok": self.ok, "created_utc": self.created_utc,
+            "gates": [g.to_dict() for g in self.gates], "artifacts": dict(self.artifacts), "summary": dict(self.summary),
         }
         if self.receipt_unconfirmed or self.receipt_warning:
-            out["receipt_unconfirmed"] = bool(self.receipt_unconfirmed)
-            out["receipt_warning"] = self.receipt_warning
+            out["receipt_unconfirmed"], out["receipt_warning"] = self.receipt_unconfirmed, self.receipt_warning
         return out
 
-
-def utc_now_iso() -> str:
-    """Return canonical UTC ISO-8601 timestamp."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    def to_dict(self) -> dict[str, Any]:
+        return {**self.to_unsigned_dict(), "receipt_sha256": self.receipt_sha256}
 
 
-def canonical_json_bytes(payload: Mapping[str, Any]) -> bytes:
-    """Serialize ``payload`` deterministically with ASCII-safe canonical JSON."""
-    text = json.dumps(
-        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False
+def compute_receipt_sha256(unsigned_receipt: Mapping[str, Any]) -> str:
+    return sha256_bytes(canonical_json_bytes({k: v for k, v in unsigned_receipt.items() if k != "receipt_sha256"}))
+
+
+def verify_receipt_sha256(receipt: Mapping[str, Any]) -> bool:
+    claimed = str(receipt.get("receipt_sha256") or "").strip().lower()
+    return len(claimed) == SHA256_HEX_LENGTH and claimed == compute_receipt_sha256(receipt)
+
+
+def seal_onboarding_receipt(
+    *, schema: str, target_kind: Literal["sku", "operator"], target_id: str, sku: str,
+    status: str, ok: bool, gates: Sequence[GateCheckOutcome], artifacts: Mapping[str, str],
+    summary: Mapping[str, Any], receipt_unconfirmed: bool = False, receipt_warning: str = "",
+) -> OnboardingReceipt:
+    draft = OnboardingReceipt(
+        schema, target_kind, target_id, sku, status, ok, utc_now_iso(), tuple(gates),
+        tuple(sorted((str(k), str(v)) for k, v in artifacts.items())),
+        tuple(sorted((str(k), v) for k, v in summary.items())),
+        receipt_unconfirmed=bool(receipt_unconfirmed),
+        receipt_warning=sanitize_public_warning(receipt_warning) if receipt_warning else "",
     )
-    return text.encode("utf-8")
+    unsigned = draft.to_unsigned_dict()
+    assert_sanitized_payload(unsigned, field_name="onboarding_receipt")
+    return OnboardingReceipt(
+        draft.schema, draft.target_kind, draft.target_id, draft.sku, draft.status, draft.ok, draft.created_utc,
+        draft.gates, draft.artifacts, draft.summary, compute_receipt_sha256(unsigned),
+        draft.receipt_unconfirmed, draft.receipt_warning,
+    )
 
 
-def compute_receipt_sha256(
-    payload: Mapping[str, Any], *, digest_field: str = "receipt_sha256"
-) -> str:
-    """Compute canonical SHA-256 over all receipt fields except ``digest_field``."""
-    body = {key: value for key, value in payload.items() if key != digest_field}
-    return hashlib.sha256(canonical_json_bytes(body)).hexdigest()
+def validate_strict_threshold_pct(threshold_pct: float) -> float:
+    if isinstance(threshold_pct, bool) or not isinstance(threshold_pct, (int, float)) or not math.isfinite(float(threshold_pct)):
+        raise ModelingError(f"threshold_pct_invalid:{threshold_pct!r}")
+    val = float(threshold_pct)
+    if val <= 0.0 or val > DEFAULT_HELDOUT_APE_THRESHOLD_PCT:
+        raise ModelingError(f"threshold_pct_exceeds_strict_release_cap:{val}:max={DEFAULT_HELDOUT_APE_THRESHOLD_PCT}")
+    return val
 
 
-def verify_receipt_sha256(
-    payload: Mapping[str, Any], *, digest_field: str = "receipt_sha256"
+def validate_strict_atol_ns(atol_ns: int) -> int:
+    if isinstance(atol_ns, bool) or not isinstance(atol_ns, int):
+        raise ModelingError(f"atol_ns_invalid:{atol_ns!r}")
+    if atol_ns < 0 or atol_ns > DEFAULT_PHYSICAL_ATOL_NS:
+        raise ModelingError(f"atol_ns_exceeds_strict_release_cap:{atol_ns}:max={DEFAULT_PHYSICAL_ATOL_NS}")
+    return atol_ns
+
+
+def exceeds_physical_tolerance(
+    predicted_ns: int, measured_ns: int, *, threshold_pct: float = DEFAULT_HELDOUT_APE_THRESHOLD_PCT, atol_ns: int = DEFAULT_PHYSICAL_ATOL_NS,
 ) -> bool:
-    """Return ``True`` iff the stored SHA-256 matches canonical recomputation."""
-    expected = payload.get(digest_field)
-    if not isinstance(expected, str) or len(expected) != SHA256_HEX_LENGTH:
-        return False
-    return expected.lower() == compute_receipt_sha256(payload, digest_field=digest_field)
+    if measured_ns <= 0 or predicted_ns <= 0:
+        return True
+    return float(abs(int(predicted_ns) - int(measured_ns))) > max((float(threshold_pct) / PERCENT_SCALE) * float(measured_ns), float(atol_ns))
 
 
-def sanitize_public_alias(alias: str, fallback_tag: str) -> str:
-    """Return an opaque public digest (``ep-<12-hex>``) with zero raw hostnames/IPs/users."""
-    raw = str(alias or "").strip()
-    if _OPAQUE_ALIAS_RE.fullmatch(raw):
-        return raw
-    tag = str(fallback_tag or "target").strip()
-    seed = f"{raw or tag}|{tag}".encode("utf-8")
-    return f"ep-{hashlib.sha256(seed).hexdigest()[:_OPAQUE_ALIAS_HEX]}"
+def program_dag_sha256(program: Mapping[str, Any], dag: Mapping[str, Any]) -> str:
+    return sha256_bytes(canonical_json_bytes({"program": dict(program), "dag": dict(dag)}))
 
 
-def sanitize_public_campaign_id(campaign_id: str) -> str:
-    """Return an opaque public campaign digest (``camp-<12-hex>``) with zero raw tokens."""
-    raw = str(campaign_id or "").strip()
-    if _OPAQUE_CAMPAIGN_RE.fullmatch(raw):
-        return raw
-    seed = (raw or "onboard").encode("utf-8")
-    return f"camp-{hashlib.sha256(seed).hexdigest()[:_OPAQUE_ALIAS_HEX]}"
+def _strict_int(val: Any, name: str) -> int:
+    if type(val) is not int:
+        raise ModelingError(f"lean_witness_non_int:{name}:{val!r}")
+    return val
 
 
-def sanitize_public_run_id(run_id: str) -> str:
-    """Return an opaque public run digest (``run-<12-hex>``) with zero raw tokens."""
-    raw = str(run_id or "").strip()
-    if _OPAQUE_RUN_RE.fullmatch(raw):
-        return raw
-    seed = (raw or "run").encode("utf-8")
-    return f"run-{hashlib.sha256(seed).hexdigest()[:_OPAQUE_ALIAS_HEX]}"
+def _parse_certificate_witness(row: Mapping[str, Any]) -> tuple[ResourceChoiceProgram, EventDagSpec, OptimalityCertificate] | None:
+    p_raw, d_raw, c_raw = row.get("program"), row.get("dag"), row.get("certificate")
+    if p_raw is None and d_raw is None and c_raw is None:
+        return None
+    if not (isinstance(p_raw, Mapping) and isinstance(d_raw, Mapping) and isinstance(c_raw, Mapping)):
+        raise ModelingError("lean_certificate_witness_incomplete")
+    prog = ResourceChoiceProgram(
+        _strict_int(p_raw["num_resources"], "num_resources"),
+        tuple(_strict_int(v, "global_work") for v in p_raw["global_work"]),
+        tuple(tuple(tuple(_strict_int(x, "site_modes") for x in m) for m in s) for s in p_raw.get("site_modes", ())),
+    )
+    quanta = tuple(_strict_int(v, "node_quantum_ns") for v in d_raw["node_quantum_ns"])
+    edges = tuple(DagEdge(_strict_int(e["src"], "src"), _strict_int(e["dst"], "dst"), _strict_int(e["wire_ns"], "wire_ns")) for e in d_raw.get("edges", ()))
+    f_raw = c_raw["farkas"]
+    farkas = FarkasCertificate(_strict_int(f_raw["scale_d"], "scale_d"), tuple(_strict_int(v, "lambda_num") for v in f_raw["lambda_num"]), tuple(_strict_int(v, "mu_num") for v in f_raw.get("mu_num", ())), _strict_int(f_raw["lower_bound_ns"], "lower_bound_ns"))
+    sink = _strict_int(c_raw["sink_node_id"], "sink_node_id")
+    if sink < 0 or sink >= len(quanta):
+        raise ModelingError(f"lean_certificate_sink_out_of_range:{sink}")
+    cert = OptimalityCertificate(farkas, tuple(_strict_int(v, "path_edges") for v in c_raw.get("path_edges", ())), sink, _strict_int(c_raw["l_star_lean_ns"], "l_star_lean_ns"))
+    return prog, EventDagSpec(quanta, edges), cert
 
 
-def _sanitize_single_warning(segment: str) -> str:
-    clean = segment.strip()
-    if not clean:
-        return ""
-    matched = _OPAQUE_WARNING_REF_RE.fullmatch(clean)
-    if matched and matched.group(1) in _KNOWN_PUBLIC_WARNING_CODES:
-        return clean
-    primary = clean.split(":", 1)[0].strip().lower()
-    code = primary if primary in _KNOWN_PUBLIC_WARNING_CODES else "receipt_warning"
-    ref = hashlib.sha256(clean.encode("utf-8")).hexdigest()[:_OPAQUE_ALIAS_HEX]
-    return f"{code}:ref={ref}"
-
-
-def sanitize_public_warning(warning: str) -> str:
-    """Reduce any free-form warning into fixed known warning code(s) + opaque ref hash."""
-    raw = str(warning or "").strip()
-    if not raw:
-        return ""
-    out: list[str] = []
-    for part in raw.split(";"):
-        item = _sanitize_single_warning(part)
-        if item and item not in out:
-            out.append(item)
-    return "; ".join(out)
-
-
-def sanitize_public_capture_uri(capture_uri: str, *, raw_sha256: str = "") -> str:
-    """Rewrite any capture locator to opaque ``capture://<sha16>/<safe_name>``."""
-    raw_uri = str(capture_uri or "").strip()
-    norm_sha = str(raw_sha256 or "").strip().lower()
-    if norm_sha.startswith("sha256:"):
-        norm_sha = norm_sha[7:]
-    if len(norm_sha) != SHA256_HEX_LENGTH or not all(c in "0123456789abcdef" for c in norm_sha):
-        norm_sha = hashlib.sha256((raw_uri or "capture").encode("utf-8")).hexdigest()
-    tail = raw_uri.rsplit("/", 1)[-1].strip().lower() if raw_uri else ""
-    safe_name = tail if _SAFE_HEX_CAPTURE_NAME_RE.fullmatch(tail) else f"{norm_sha}.json"
-    return f"capture://{norm_sha[:SHORT_DIGEST_LEN]}/{safe_name}"
-
-
-def collect_receipt_warnings(*sources: Mapping[str, Any] | None) -> tuple[bool, str]:
-    """Accumulate ``receipt_unconfirmed`` and sanitized ``receipt_warning`` across stages/leases."""
-    unconfirmed = False
-    warnings: list[str] = []
-    for src in sources:
-        if not isinstance(src, Mapping):
+def check_lean_non_inversion(
+    rows: Sequence[Mapping[str, Any]], *, require_non_empty: bool = True, verify_certificates: bool = True,
+    require_captured_p99: bool = True, require_program_dag_join: bool = True,
+    expected_case_timings: Mapping[str, tuple[Any, ...]] | None = None,
+) -> tuple[bool, tuple[LeanBoundCheckRow, ...], tuple[str, ...]]:
+    """Enforce ``0 < L*_Lean <= min(T_sim, T_silicon_p99)`` and valid Lean certificates."""
+    if not rows:
+        return (False, (), ("lean_bounds_missing",)) if require_non_empty else (True, (), ())
+    checked, violations, seen_ids = [], [], set()
+    for idx, row in enumerate(rows):
+        cid = str(row.get("case_id") or f"case-{idx}")
+        seen_ids.add(cid)
+        raw_vals = (row.get("l_star_lean_ns"), row.get("t_sim_ns"), row.get("t_silicon_p99_ns"))
+        if any(v is None or isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(float(v)) for v in raw_vals):
+            violations.append(f"lean_bound_fields_invalid:{cid}")
+            checked.append(LeanBoundCheckRow(cid, -1, 0, 0, False, False, True, True))
             continue
-        for item in (src, src.get("lease") if isinstance(src.get("lease"), Mapping) else None):
-            if not isinstance(item, Mapping):
-                continue
-            if item.get("receipt_unconfirmed"):
-                unconfirmed = True
-            raw_w = str(item.get("receipt_warning") or "").strip()
-            if raw_w:
-                for seg in sanitize_public_warning(raw_w).split(";"):
-                    s = seg.strip()
-                    if s and s not in warnings:
-                        warnings.append(s)
-    return unconfirmed, "; ".join(warnings)
-
-
-def sanitize_lease_for_receipt(lease_info: Mapping[str, Any] | None) -> dict[str, Any]:
-    """Scrub raw coordinator lease IDs, warnings, and usernames into opaque public digests."""
-    info = dict(lease_info or {})
-    mode = str(info.get("lease_mode") or "unknown").strip()
-    out: dict[str, Any] = {"lease_mode": mode}
-    raw_id = str(info.get("lease_id") or "").strip()
-    if raw_id:
-        if _OPAQUE_LEASE_RE.fullmatch(raw_id):
-            out["lease_digest"] = raw_id
-        else:
-            digest = hashlib.sha256(raw_id.encode("utf-8")).hexdigest()[:SHORT_DIGEST_LEN]
-            out["lease_digest"] = f"lease-{digest}"
-    fence = info.get("fence_token")
-    if fence is not None and not isinstance(fence, bool):
-        out["fence_token"] = int(fence)
-    devices = info.get("devices")
-    if isinstance(devices, (list, tuple)):
-        out["device_count"] = len(devices)
-    ttl = info.get("ttl_seconds")
-    if ttl is not None and not isinstance(ttl, bool):
-        out["ttl_seconds"] = int(ttl)
-    if info.get("receipt_unconfirmed"):
-        out["receipt_unconfirmed"] = True
-    warning = str(info.get("receipt_warning") or "").strip()
-    if warning:
-        out["receipt_warning"] = sanitize_public_warning(warning)
-    return out
-
-
-def build_capture_uri(
-    alias: str, campaign_id: str, content_bytes: bytes
-) -> tuple[str, str]:
-    """Build a sanitized ``capture://<alias>/<campaign>/<sha256>`` URI and hex digest."""
-    clean_alias = sanitize_public_alias(alias, "capture")
-    clean_campaign = sanitize_public_campaign_id(campaign_id)
-    digest = hashlib.sha256(content_bytes).hexdigest()
-    uri = sanitize_capture_uri(f"capture://{clean_alias}/{clean_campaign}/{digest}")
-    return uri, digest
-
-
-def assert_sanitized_payload(payload: Any, *, field_name: str = "payload") -> None:
-    """Fail closed if any nested string leaks private host paths, IPs, or user emails."""
-    if isinstance(payload, str):
-        validate_provenance_text(payload, field_name=field_name)
-        if _HOME_ENV_RE.search(payload) or _EMAIL_OR_USER_HOST_RE.search(payload):
-            raise ModelingError(f"private_identity_rejected:{field_name}")
-        return
-    if isinstance(payload, Mapping):
-        for key, value in payload.items():
-            assert_sanitized_payload(str(key), field_name=f"{field_name}.key")
-            assert_sanitized_payload(value, field_name=f"{field_name}.{key}")
-        return
-    if isinstance(payload, (list, tuple)):
-        for idx, item in enumerate(payload):
-            assert_sanitized_payload(item, field_name=f"{field_name}[{idx}]")
-
-
-def read_bounded_json(path: str | Path) -> Any:
-    """Read a UTF-8 JSON file bounded to ``MAX_READ_JSON_BYTES``."""
-    target = Path(path)
-    try:
-        size = target.stat().st_size
-        if size > MAX_READ_JSON_BYTES:
-            raise ModelingError(f"onboarding_json_exceeds_50_mib:{target.name}")
-        raw = target.read_text(encoding="utf-8")
-    except TimeoutError:
-        raise
-    except OSError as exc:
-        raise ModelingError(f"onboarding_json_read_failed:{target.name}:{exc}") from exc
-    try:
-        return json.loads(raw)
-    except ValueError as exc:
-        raise ModelingError(f"onboarding_json_invalid:{target.name}:{exc}") from exc
-
-
-def write_atomic_bytes(path: str | Path, data: bytes) -> None:
-    """Write exact ``data`` bytes atomically via sibling temp file and ``os.replace``."""
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path: Path | None = None
-    try:
-        fd, raw_name = tempfile.mkstemp(
-            dir=str(target.parent), prefix=f".{target.name}.", suffix=".tmp"
-        )
-        tmp_path = Path(raw_name)
+        l_star, t_sim, t_p99 = (int(round(float(v))) for v in raw_vals)
+        cert_checked, cert_valid, witness_sha = False, l_star > 0 and t_sim > 0 and t_p99 > 0, ""
         try:
-            os.write(fd, data)
-        finally:
-            os.close(fd)
-        os.replace(tmp_path, target)
-        tmp_path = None
+            witness = _parse_certificate_witness(row)
+        except (ModelingError, KeyError, TypeError, ValueError) as exc:
+            witness, cert_valid = None, False
+            violations.append(f"lean_certificate_malformed:{cid}:{exc}")
+        if witness is not None:
+            cert_checked, witness_sha = True, program_dag_sha256(row["program"], row["dag"])
+            if not (check_optimality_certificate(*witness) and witness[2].l_star_lean_ns == l_star):
+                cert_valid = False
+                violations.append(f"lean_certificate_invalid:{cid}")
+        elif verify_certificates:
+            cert_valid = False
+            violations.append(f"lean_certificate_missing:{cid}")
+        if expected_case_timings is not None and cid in expected_case_timings:
+            entry = expected_case_timings[cid]
+            exp_sim, exp_meas = int(entry[0]), int(entry[1])
+            exp_p99 = int(entry[2]) if len(entry) >= _TIMING_TRIPLE_LEN and entry[2] is not None else None
+            exp_sha = str(entry[3] or "").strip().lower() if len(entry) >= _TIMING_QUAD_LEN else ""
+            checks = (
+                (t_sim != exp_sim, f"lean_witness_t_sim_mismatch:{cid}:witness={t_sim}:scored={exp_sim}"),
+                (require_captured_p99 and (exp_p99 is None or exp_p99 <= 0), f"lean_captured_p99_missing:{cid}"),
+                (exp_p99 is not None and t_p99 != exp_p99, f"lean_witness_p99_mismatch:{cid}:witness={t_p99}:captured={exp_p99}"),
+                (t_p99 < exp_meas, f"lean_witness_p99_below_measured:{cid}"),
+                (bool(require_program_dag_join and exp_sha and witness_sha != exp_sha), f"lean_witness_program_dag_mismatch:{cid}"),
+            )
+            for failed, msg in checks:
+                if failed:
+                    cert_valid = False
+                    violations.append(msg)
+        sim_inv, sil_inv = l_star > t_sim, l_star > t_p99
+        if sim_inv:
+            violations.append(f"lean_sim_inversion:{cid}:l_star={l_star}>t_sim={t_sim}")
+        if sil_inv:
+            violations.append(f"lean_silicon_p99_inversion:{cid}:l_star={l_star}>t_p99={t_p99}")
+        if l_star <= 0 or t_sim <= 0 or t_p99 <= 0:
+            cert_valid = False
+            violations.append(f"lean_nonpositive_timing:{cid}")
+        checked.append(LeanBoundCheckRow(cid, l_star, t_sim, t_p99, cert_checked, cert_valid, sim_inv, sil_inv))
+    if expected_case_timings is not None and (missing := sorted(set(expected_case_timings) - seen_ids)):
+        violations.append(f"lean_witness_missing_for_cases:{','.join(missing[:_MAX_MISSING_CASES_IN_MSG])}")
+    return not violations, tuple(checked), tuple(violations)
+
+
+def resolve_repo_root(repo_root: str | Path | None = None) -> Path:
+    if repo_root is not None:
+        return Path(repo_root).resolve()
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        if (parent / "mindie_sim").is_dir() and (parent / "scripts").is_dir():
+            return parent
+    return here.parents[2]
+
+
+def run_python_script(script: Path, args: Sequence[str], *, cwd: Path, timeout_s: int) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            [sys.executable, "-B", str(script), *args], cwd=str(cwd),
+            capture_output=True, text=True, timeout=timeout_s, check=False, **subprocess_window_kwargs(),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(f"onboarding_gate_timeout:{script.name}:{timeout_s}s") from exc
     except TimeoutError:
         raise
     except OSError as exc:
-        raise ModelingError(f"onboarding_json_write_failed:{target.name}:{exc}") from exc
-    finally:
-        if tmp_path is not None and tmp_path.exists():
-            try:
-                tmp_path.unlink()
-            except OSError:
-                pass
+        raise ModelingError(f"onboarding_gate_exec_failed:{script.name}:{exc}") from exc
 
 
-def write_atomic_json(path: str | Path, payload: Mapping[str, Any]) -> None:
-    """Write formatted UTF-8/LF JSON atomically via sibling temp file and ``os.replace``."""
-    rendered = (
-        json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False) + "\n"
-    ).encode("utf-8")
-    write_atomic_bytes(path, rendered)
+def _gate_script(repo_root: str | Path | None, rel_script: str, gate_name: str) -> tuple[Path, Path | None, GateCheckOutcome | None]:
+    root = resolve_repo_root(repo_root)
+    script = root / rel_script
+    if not script.is_file():
+        return root, None, GateCheckOutcome(gate_name, False, "script_missing", f"{rel_script} missing")
+    return root, script, None
 
 
-def subprocess_window_kwargs() -> dict[str, Any]:
-    """Return windowless ``creationflags`` on Windows and empty dict on POSIX."""
-    return {"creationflags": _SUBPROCESS_NO_WINDOW} if _SUBPROCESS_NO_WINDOW else {}
+def _extend_ref_args(args: list[str], refs_root: str | Path | None, repo_map: Mapping[str, str | Path] | None) -> None:
+    if refs_root is not None:
+        args.extend(["--refs-root", str(Path(refs_root).resolve())])
+    for name, path_val in sorted((repo_map or {}).items()):
+        args.extend(["--repo-map", f"{name}={Path(path_val).resolve()}"])
 
 
-__all__ = [
-    "ANCHOR_CONTEXT_GRID",
-    "CLIFF_PLAN_SCHEMA",
-    "COLD_RING_L2_MULTIPLIER",
-    "CONTEXT_MAX_TOKENS",
-    "CONTEXT_MIN_TOKENS",
-    "DEFAULT_CLEANUP_GRACE_S",
-    "DEFAULT_CLOCK_OPERATOR",
-    "DEFAULT_DEVICE_VRAM_BUDGET_GIB",
-    "DEFAULT_FABRIC_BUDGET_S",
-    "DEFAULT_GATE_SUBPROCESS_TIMEOUT_S",
-    "DEFAULT_HELDOUT_APE_THRESHOLD_PCT",
-    "DEFAULT_L0_BUDGET_S",
-    "DEFAULT_OUTER_TIMEOUT_S",
-    "DEFAULT_PHYSICAL_ATOL_NS",
-    "DEFAULT_PROBE_TIMEOUT_S",
-    "DEFAULT_SPARSE_TOPK",
-    "DEFAULT_SSH_CONNECT_TIMEOUT_S",
-    "DISPLAY_ROUND_DIGITS",
-    "FORBIDDEN_CALLER_PREDICTION_KEYS",
-    "GIB_BYTES",
-    "HEX_COMMIT_LEN",
-    "MAX_CALIBRATED_CV_PCT",
-    "MAX_READ_JSON_BYTES",
-    "MIB_BYTES",
-    "NS_PER_MS",
-    "NS_PER_US",
-    "OFF_GRID_CLIFF_HELDOUT_GRID",
-    "OPERATOR_ONBOARDING_RECEIPT_SCHEMA",
-    "PERCENT_SCALE",
-    "SHORT_DIGEST_LEN",
-    "SKU_ONBOARDING_RECEIPT_SCHEMA",
-    "SOC_PROBE_SCHEMA",
-    "TRAIN_OBSERVATION_MANIFEST_SCHEMA",
-    "VALID_CLOCK_OPERATORS",
-    "AbiDivisibilityRule",
-    "CliffBenchPlan",
-    "CliffPointSpec",
-    "GateCheckOutcome",
-    "LeanBoundCheckRow",
-    "OnboardingReceipt",
-    "OperatorCliffParameters",
-    "SiliconProfileConflict",
-    "SocProbeRecord",
-    "TilingAxes",
-    "TimeoutBudget",
-    "assert_sanitized_payload",
-    "build_capture_uri",
-    "canonical_json_bytes",
-    "collect_receipt_warnings",
-    "compute_receipt_sha256",
-    "default_topk_abi_rule",
-    "read_bounded_json",
-    "sanitize_lease_for_receipt",
-    "sanitize_public_alias",
-    "sanitize_public_campaign_id",
-    "sanitize_public_capture_uri",
-    "sanitize_public_run_id",
-    "sanitize_public_warning",
-    "subprocess_window_kwargs",
-    "utc_now_iso",
-    "validate_abi",
-    "verify_receipt_sha256",
-    "write_atomic_bytes",
-    "write_atomic_json",
-]
+def run_arch_governance_gate(
+    repo_root: str | Path | None = None, *, strict: bool = True, refs_root: str | Path | None = None,
+    repo_map: Mapping[str, str | Path] | None = None, timeout_s: int = DEFAULT_GATE_SUBPROCESS_TIMEOUT_S,
+) -> GateCheckOutcome:
+    root, script, missing = _gate_script(repo_root, "scripts/check_arch_governance.py", "arch_governance")
+    if missing is not None or script is None:
+        return missing  # type: ignore[return-value]
+    args = ["--root", str(root), *(["--strict"] if strict else [])]
+    _extend_ref_args(args, refs_root, repo_map)
+    done = run_python_script(script, args, cwd=root, timeout_s=timeout_s)
+    text = (done.stdout or "") + ("\n" + done.stderr if done.stderr else "")
+    m = _VIOLATION_COUNT_RE.search(text)
+    cnt = int(m.group(1)) if m else (0 if done.returncode == 0 else 1)
+    ok = done.returncode == 0 and cnt == 0
+    return GateCheckOutcome("arch_governance", ok, "pass" if ok else "fail", "0 violations" if ok else "; ".join(ln for ln in text.splitlines() if ln.strip())[:_PREVIEW_CHAR_LIMIT], (("violations", cnt), ("returncode", done.returncode)))
+
+
+def run_test_orthogonality_gate(
+    repo_root: str | Path | None = None, *, strict: bool = True, base: str | None = None,
+    timeout_s: int = DEFAULT_GATE_SUBPROCESS_TIMEOUT_S,
+) -> GateCheckOutcome:
+    root, script, missing = _gate_script(repo_root, "scripts/check_test_orthogonality.py", "test_orthogonality")
+    if missing is not None or script is None:
+        return missing  # type: ignore[return-value]
+    args = ["--root", str(root), "--format", "json", *(["--base", str(base)] if base else (["--strict"] if strict else ["--base", "HEAD"]))]
+    done = run_python_script(script, args, cwd=root, timeout_s=timeout_s)
+    fails, detail = (0 if done.returncode == 0 else 1), "0 findings"
+    try:
+        bad = [f for f in (json.loads(done.stdout).get("findings") or []) if f.get("severity", "fail") == "fail"]
+        fails, detail = len(bad), "; ".join(f"{f.get('path')}:{f.get('code')}" for f in bad[:_PREVIEW_LINES]) if bad else "0 findings"
+    except ValueError:
+        if done.returncode != 0:
+            detail = (done.stderr or done.stdout or "orthogonality_gate_error").strip()
+    ok = done.returncode == 0 and fails == 0
+    return GateCheckOutcome("test_orthogonality", ok, "pass" if ok else "fail", detail, (("findings", fails), ("returncode", done.returncode)))
+
+
+def run_template_provenance_gate(
+    repo_root: str | Path | None = None, *, refs_root: str | Path | None = None,
+    repo_map: Mapping[str, str | Path] | None = None, runtime: bool = True,
+    timeout_s: int = DEFAULT_GATE_SUBPROCESS_TIMEOUT_S,
+) -> GateCheckOutcome:
+    root, script, missing = _gate_script(repo_root, "scripts/check_template_provenance.py", "template_provenance")
+    if missing is not None or script is None:
+        return missing  # type: ignore[return-value]
+    args = ["--root", str(root), "--format", "json", *([] if runtime else ["--no-runtime"])]
+    _extend_ref_args(args, refs_root, repo_map)
+    done = run_python_script(script, args, cwd=root, timeout_s=timeout_s)
+    try:
+        parsed = json.loads(done.stdout)
+        checked, viols = int(parsed.get("checked", 0)), list(parsed.get("violations") or [])
+    except ValueError:
+        return GateCheckOutcome("template_provenance", False, "fail", (done.stderr or done.stdout).strip())
+    ok = done.returncode == 0 and not viols
+    return GateCheckOutcome("template_provenance", ok, "pass" if ok else "fail", f"0 violations ({checked} refs)" if ok else "; ".join(str(v.get("reason")) for v in viols[:_PREVIEW_LINES]), (("checked", checked), ("violations", len(viols))))
+
+
+def run_tail_cluster_diagnosis(
+    residuals: Sequence[Mapping[str, Any]], *, repo_root: str | Path | None = None,
+    threshold_pct: float = DEFAULT_HELDOUT_APE_THRESHOLD_PCT, lineage: Sequence[Mapping[str, Any]] = (),
+    engine_receipts: Sequence[Mapping[str, Any]] = (), output_path: str | Path | None = None,
+    timeout_s: int = DEFAULT_GATE_SUBPROCESS_TIMEOUT_S,
+) -> dict[str, Any]:
+    cand = resolve_repo_root(repo_root)
+    exec_root = cand if (cand / "mindie_sim" / "observations" / "multilevel_gate.py").is_file() else resolve_repo_root(None)
+    script = exec_root / "scripts" / "diagnose_tail_cluster.py"
+    if not script.is_file():
+        return {"schema": "mindie-sim.tail-cluster-diagnosis/1", "status": "diagnostic_script_unavailable", "cluster_count": 0, "clusters": []}
+    with tempfile.TemporaryDirectory(prefix="msim-diag-") as tmp_dir:
+        tmp = Path(tmp_dir)
+        args = ["--residuals", str(write_atomic_json(tmp / "residuals.json", {"residuals": list(residuals)})), "--threshold-pct", str(float(threshold_pct))]
+        if lineage:
+            args.extend(["--lineage", str(write_atomic_json(tmp / "lineage.json", {"lineage": list(lineage)}))])
+        if engine_receipts:
+            args.extend(["--engine-receipts", str(write_atomic_json(tmp / "receipts.json", {"receipts": list(engine_receipts)}))])
+        done = run_python_script(script, args, cwd=exec_root, timeout_s=timeout_s)
+    if done.returncode not in (0, _DIAGNOSE_ESCALATED_EXIT) or not (done.stdout or "").strip():
+        raise ModelingError(f"diagnose_tail_cluster_failed:rc={done.returncode}")
+    report = json.loads(done.stdout)
+    assert_sanitized_payload(report, field_name="tail_diagnosis.report")
+    if output_path is not None:
+        write_atomic_json(output_path, report)
+    return report
+
+
+def finalize_stage4_certification(
+    *, schema: str, target_kind: Literal["sku", "operator"], target_id: str, sku: str,
+    score_doc: Mapping[str, Any], lean_bounds_json: str | Path | Sequence[Mapping[str, Any]] | None,
+    cap_pct: float, eff_atol: int, pre_gates: Sequence[GateCheckOutcome] = (),
+    ape_gate_name: str, artifacts: Mapping[str, str], extra_warning_records: Sequence[Mapping[str, Any] | None] = (),
+    repo_root: str | Path | None = None, run_repo_gates: bool = True, orthogonality_base: str | None = None,
+    out_receipt: str | Path | None = None, diagnosis_out: str | Path | None = None,
+) -> tuple[bool, str, dict[str, Any], dict[str, Any] | None]:
+    """Shared Stage-4 gate verification (APE tolerance, Lean 4 non-inversion, repo gates, tail diagnosis, SHA-256 receipt)."""
+    residuals = list(score_doc.get("residuals") or ())
+    heldout = [r for r in residuals if r.get("split") == "heldout"]
+    failing = [r for r in heldout if exceeds_physical_tolerance(int(r.get("predicted_ns") or 0), int(r.get("measured_ns") or 0), threshold_pct=cap_pct, atol_ns=eff_atol)]
+    ape_ok = bool(score_doc.get("ok")) and bool(heldout) and not failing
+    gates: list[GateCheckOutcome] = [
+        *pre_gates,
+        GateCheckOutcome(ape_gate_name, ape_ok, "pass" if ape_ok else "fail", f"{len(heldout) - len(failing)}/{len(heldout)} heldout within max({cap_pct}%, {eff_atol}ns)", (("heldout_count", len(heldout)), ("failing_count", len(failing)))),
+    ]
+    lean_rows = list(read_bounded_json(lean_bounds_json) if isinstance(lean_bounds_json, (str, Path)) else (lean_bounds_json or ()))
+    exp_timings = {str(r["case_id"]): (int(r["predicted_ns"]), int(r["measured_ns"]), r.get("measured_p99_ns"), r.get("program_dag_sha256")) for r in heldout}
+    lean_ok, lean_checked, lean_viols = check_lean_non_inversion(lean_rows, expected_case_timings=exp_timings)
+    gates.append(GateCheckOutcome("lean_optimality_non_inversion", lean_ok, "pass" if lean_ok else "fail", "0 inversions" if lean_ok else "; ".join(lean_viols[:_PREVIEW_LINES]), (("checked", len(lean_checked)), ("violations", len(lean_viols)))))
+    if run_repo_gates:
+        gates.append(run_arch_governance_gate(repo_root=repo_root, strict=True))
+        gates.append(run_test_orthogonality_gate(repo_root=repo_root, strict=(orthogonality_base is None), base=orthogonality_base))
+    diagnosis = run_tail_cluster_diagnosis(residuals, repo_root=repo_root, threshold_pct=cap_pct, output_path=diagnosis_out) if failing else None
+    all_ok = all(g.passed for g in gates)
+    acq_mode = str(score_doc.get("acquisition_mode") or "offline_reverify")
+    status = ("silicon_certified" if acq_mode == "live_silicon" else "offline_reverify") if all_ok else "failed"
+    rec_u, rec_w = collect_receipt_warnings(score_doc, *extra_warning_records)
+    receipt = seal_onboarding_receipt(
+        schema=schema, target_kind=target_kind, target_id=target_id, sku=sku, status=status, ok=all_ok,
+        gates=gates, artifacts=artifacts,
+        summary={"heldout_count": len(heldout), "failing_count": len(failing), "threshold_pct": cap_pct, "atol_ns": eff_atol, "acquisition_mode": acq_mode},
+        receipt_unconfirmed=rec_u, receipt_warning=rec_w,
+    ).to_dict()
+    if out_receipt is not None:
+        write_atomic_json(out_receipt, receipt)
+    return all_ok, status, receipt, diagnosis

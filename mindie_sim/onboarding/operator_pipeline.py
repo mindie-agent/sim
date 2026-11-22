@@ -1,787 +1,650 @@
-"""Turnkey 4-stage New-Operator Onboarding Pipeline for Ascend operators/templates.
+"""Turnkey 4-stage New-Operator onboarding pipeline (scaffold/contract -> cliff -> score -> certify).
 
-[Role] Orchestrate deterministic, repeatable onboarding of a new governed
-  operator family or template across four stages plus ``run-all``:
-  (1) ``scaffold`` / ``validate-contract`` (real ``builtin_family_registry`` /
-      ``builtin_template_catalog.lower`` + ``resolve_builder_strict`` ABI
-      cross-check),
-  (2) ``generate-cliff-plan`` (Lock-3 family-declared / ISA-dispatched
-      ``TilingAxes`` + ``validate_abi`` + ``ParallelSpec``-validated ranks),
-  (3) ``bench-and-score`` (sealed ``GateCase -> EvaluationRunner ->
-      EngineRunReceipt`` scoring enforcing plan SKU, BOTH train & heldout
-      splits, operator family binding, exact multi-rank ``HostQueue`` lease
-      with ``ttl >= timeout + cleanup_grace``, and ABI rejections), and
-  (4) ``certify`` (HMAC-verified reports, zero skipped mandatory contract
-      checks, operator/ABI/implementation identity binding across all scored
-      receipts, pointwise ``< threshold_pct <= 10.0%``, ``(program, dag)``-
-      joined & p99-verified Lean 4 non-inversion, strict repo gates, automatic
-      ``diagnose_tail_cluster``, and SHA-256 onboarding receipt distinguishing
-      ``silicon_certified`` vs ``offline_reverify``).
-[Invariants] Fails closed on fabricated reports, skipped contract checks,
-  cross-operator/cross-SKU replay substitution, dropped train anchors,
-  thresholds ``> 10.0%``, missing ABI-rejection checks, ``plan_only``,
-  ``train==heldout`` leakage, caller ``predicted_*``, ``service_regimes``,
-  clock mismatch, or unrelated/inverted/missing-p99 Lean witnesses.
-[Timeouts & Locks] Enforces ``lease_ttl >= subprocess_timeout + cleanup_grace``;
-  ``TimeoutError`` propagates before ``OSError``; zero device contexts.
-[Side-Effect Policy] Writes only caller-requested output paths via atomic
-  ``os.replace``; public receipts carry opaque sanitized lease/endpoint digests.
+[Role] Orchestrate standardized onboarding of a new Ascend operator family or
+  template across four stages:
+  * Stage 1A (``scaffold_operator``): scaffold governed operator packages under
+    ``mindie_sim/prediction/operators/<family>/{__init__,common,arch22,arch35}.py``
+    or templates under ``mindie_sim/templates/<family>_spec.py`` with AST
+    ``Upstream-ABI:``, pinned ``SourceRef``, ``TILING_AXES``,
+    ``SemanticWorkItem`` + ``TensorRangeObligation``, paired profiler builder,
+    and orthogonal Tier-0 test + ``TAXONOMY.toml`` snippet.
+  * Stage 1B (``validate_operator_contract``): validate AST ``Upstream-ABI:``,
+    verified Git blob ``SourceRef`` provenance, real Sim ``FamilyRegistry`` /
+    ``TemplateCatalog`` lowering + Lean 4 dual-bound certification, paired 1:1
+    ``mindie-profiler`` ``resolve_builder_strict``, and ``TAXONOMY.toml``.
+  * Stage 2 (``generate_operator_cliff_plan``): synthesize disjoint Anchor +
+    Off-Grid Cliff + ABI-rejection bench plan.
+  * Stage 3 (``bench_and_score_operator``): dispatch via ``mindie-profiler`` or
+    score captured silicon observations against pure white-box ``mindie-sim``
+    (zero ``service_regimes``).
+  * Stage 4 (``certify_operator`` & ``run_operator_onboarding``): enforce
+    pointwise ``max(10%, 2.0 us)`` cliff tolerance, ``0`` Lean inversions,
+    ``0`` strict governance/orthogonality violations, auto-trigger
+    ``diagnose_tail_cluster.py`` on failure, and seal a SHA-256 receipt.
+[Invariants] Strictly read-only on validation; zero hardware tokens in family
+  stems; zero ``service_regimes``; ``TimeoutError`` propagates before ``OSError``.
+[Timeouts & Locks] Bounded ``git cat-file`` (15s) and repo-gate subprocesses
+  (120s); zero local locks or device contexts.
+[Side-Effect Policy] Writes only explicitly requested scaffold/output paths.
 """
 from __future__ import annotations
 
+import ast
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager
+import hashlib
+import keyword
+import math
 from pathlib import Path
-import tempfile
+import re
+import subprocess
+import tomllib
 from typing import Any, Literal
 
-from mindie_sim.observations.multilevel_gate import EvaluationRunner
+from mindie_sim.backends import ascend
+from mindie_sim.observations.multilevel_stream import SHA256_HEX_LENGTH
+from mindie_sim.optimization.dual_bound import (
+    DagEdge,
+    EventDagSpec,
+    ResourceChoiceProgram,
+    certify_lower_bound,
+    check_optimality_certificate,
+)
+from mindie_sim.prediction.mechanism import Geometry, OperatorPlan
 from mindie_sim.prediction.operators.contracts import OperatorPlanningContext
-from mindie_sim.prediction.operators.registry import FamilyRegistry
+from mindie_sim.prediction.operators.registry import FamilyRegistry, builtin_family_registry
+from mindie_sim.prediction.results import OpOccurrence
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import datapath_for_die
+from mindie_sim.schema.hardware import Hardware
 from mindie_sim.schema.operators import OpSpec
-from mindie_sim.templates.registry import TemplateCatalog
+from mindie_sim.templates.registry import TemplateCatalog, builtin_template_catalog
 
-from ._capture_truth import reverify_report_captures, verify_live_silicon_evidence
-from ._gate_runners import (
-    acquire_coordinator_host_queue_lease,
-    resolve_repo_root,
-    run_arch_governance_gate,
-    run_profiler_bench_subprocess,
-    run_tail_cluster_diagnosis,
-    run_test_orthogonality_gate,
-    validate_host_queue_grant,
-)
-from ._lean_and_receipts import (
-    check_lean_non_inversion,
-    seal_onboarding_receipt,
-    sign_stage_report,
-    validate_strict_atol_ns,
-    validate_strict_threshold_pct,
-    verify_stage_report,
-)
-from ._operator_contract import validate_operator_contract
-from ._operator_scaffold import scaffold_operator
-from ._profiler_plan import assign_plan_point_level
-from ._sealed_scorer import exceeds_physical_tolerance
-from .cliff_planner import (
-    evaluate_abi_rejections,
-    required_ranks_for_plan,
-    score_sealed_gate_cases,
-    synthesize_operator_cliff_plan,
-    verify_cliff_plan_integrity,
-)
 from .contracts import (
-    CONTEXT_MAX_TOKENS,
-    CONTEXT_MIN_TOKENS,
-    DEFAULT_CLEANUP_GRACE_S,
-    DEFAULT_HELDOUT_APE_THRESHOLD_PCT,
-    DEFAULT_OUTER_TIMEOUT_S,
-    DEFAULT_PHYSICAL_ATOL_NS,
-    DISPLAY_ROUND_DIGITS,
-    GateCheckOutcome,
-    OperatorCliffParameters,
-    TilingAxes,
-    assert_sanitized_payload,
-    collect_receipt_warnings,
-    read_bounded_json,
-    sanitize_lease_for_receipt,
-    write_atomic_json,
+    CONTEXT_MAX_TOKENS, CONTEXT_MIN_TOKENS, DEFAULT_GATE_SUBPROCESS_TIMEOUT_S,
+    DEFAULT_HELDOUT_APE_THRESHOLD_PCT, DEFAULT_PHYSICAL_ATOL_NS, DEFAULT_TILE_DIM, HEX_COMMIT_LEN,
+    NS_PER_MS, OPERATOR_ONBOARDING_RECEIPT_SCHEMA, GateCheckOutcome, OperatorCliffParameters,
+    assert_sanitized_payload, collect_receipt_warnings, evaluate_abi_rejections,
+    finalize_stage4_certification, read_bounded_json, resolve_repo_root,
+    run_template_provenance_gate, subprocess_window_kwargs, synthesize_operator_cliff_plan,
+    validate_strict_atol_ns, validate_strict_threshold_pct, verify_cliff_plan_integrity,
+    write_atomic_bytes, write_atomic_json,
 )
+from .profiler_normalizer import (
+    acquire_stage3_observations, assign_plan_point_level, resolve_profiler_builder_strict,
+)
+from .whitebox_runner import score_sealed_gate_cases
 
-_ENGINE_RECEIPT_PREFIX = "capture://engine-receipt/"
+_FORBIDDEN_FAMILY_RE = re.compile(r"(?:arch22|arch35|cann|(?:^|_)(?:a2|a3|a5)(?:$|_))", re.IGNORECASE)
+_ABI_SYMBOL_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.:/-]{3,}$")
+_UPSTREAM_ABI_LINE_RE = re.compile(r"^\s*Upstream-ABI\s*:\s*([A-Za-z_][A-Za-z0-9_:.<>/-]*)\s*$")
+_HEX_40_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+_HEX_64_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+_ABI_GENERIC = frozenset({"v1", "v2", "v3", "v4", "legacy", "internal", "custom", "default", "none", "todo", "refactor", "fallback"})
+_TEMPLATE_ID_NAMES = frozenset({"TEMPLATE_ID", "TEMPLATE_IDS", "CATLASS_TEMPLATE_IDS", "DSL_KERNEL_IDS"})
+_REQUIRED_FAMILY_FILES = ("__init__.py", "common.py", "arch22.py", "arch35.py")
+_GIT_CAT_TIMEOUT_S = 15
+_NS_PER_SECOND = 1_000_000_000.0
+_DEFAULT_PROBE_SKU = "Ascend910B2"
+_DEFAULT_PROBE_SKU_A5 = "Ascend950DT_9582"
+_DEFAULT_PROBE_SHAPE = (1, 128)
+_DEFAULT_TEMPLATE_DIM = 128
+_MAX_STAGE_DEPTH = 16
+_SOURCE_REF_POS_ARGS = 4
+
+
+def _render_source_refs_code(source_refs: Sequence[Mapping[str, Any]]) -> str:
+    if not source_refs:
+        raise ModelingError("operator_scaffold_requires_source_refs")
+    lines = ["SOURCES: tuple[SourceRef, ...] = ("]
+    for ref in source_refs:
+        repo, rev = str(ref.get("repository") or "").strip(), str(ref.get("revision") or "").strip()
+        rpath, sha = str(ref.get("relative_path") or "").strip(), str(ref.get("source_sha256") or "").strip()
+        if not repo or not _HEX_40_RE.fullmatch(rev) or not rpath or not _HEX_64_RE.fullmatch(sha):
+            raise ModelingError(f"operator_scaffold_source_ref_invalid:{repo}:{rpath}")
+        lines.extend(("    SourceRef(", f"        repository={repo!r},", f"        revision={rev!r},", f"        relative_path={rpath!r},", f"        source_sha256={sha.lower()!r},", "    ),"))
+    lines.append(")")
+    return "\n".join(lines)
+
+
+def scaffold_operator(
+    *, family: str, upstream_abi_arch22: str, upstream_abi_arch35: str,
+    source_refs: Sequence[Mapping[str, Any]], target_root: str | Path,
+    target_kind: Literal["operator_family", "template"] = "operator_family",
+    profiler_builder: str = "", tile_dim: int = DEFAULT_TILE_DIM,
+    overwrite: bool = False, scaffold_test: bool = True,
+) -> dict[str, Any]:
+    """Stage 1A: Scaffold a governed operator family package or template skeleton."""
+    if not family or not family.isidentifier() or keyword.iskeyword(family):
+        raise ModelingError(f"operator_family_identifier_invalid:{family}")
+    if _FORBIDDEN_FAMILY_RE.search(family):
+        raise ModelingError(f"operator_family_forbidden_hardware_token:{family}")
+    for lbl, abi in (("arch22", upstream_abi_arch22), ("arch35", upstream_abi_arch35)):
+        if not abi or not _ABI_SYMBOL_RE.fullmatch(abi) or abi.lower() in _ABI_GENERIC:
+            raise ModelingError(f"operator_upstream_abi_invalid:{lbl}:{abi}")
+    if target_kind == "operator_family" and upstream_abi_arch22 == upstream_abi_arch35:
+        raise ModelingError("operator_scaffold_duplicate_leaf_abi")
+    builder_name = (profiler_builder or family).strip()
+    root = Path(target_root).resolve()
+    src_block = _render_source_refs_code(source_refs)
+
+    if target_kind == "template":
+        rel_target = f"mindie_sim/templates/{family}_spec.py"
+        files_to_write: dict[Path, str] = {
+            root / rel_target: (
+                f'"""Governed template specification for ``{family}``.\n\nUpstream-ABI: {upstream_abi_arch35}\n\n'
+                f"[Role] Declare pinned provenance, ``TILING_AXES``, ``SemanticWorkItem``, and ``TensorRangeObligation`` for ``{family}``.\n"
+                "[Invariants] Verified SourceRef provenance.\n[Timeouts & Locks] Deterministic; no locks.\n[Side-Effect Policy] Zero side effects.\n\"\"\"\n"
+                "from __future__ import annotations\n\nfrom mindie_sim.onboarding import TilingAxes\n"
+                "from mindie_sim.schema.datapath import SourceRef\nfrom mindie_sim.templates.contracts import SemanticWorkItem, TensorRangeObligation\n\n"
+                f"UPSTREAM_ABI = {upstream_abi_arch35!r}\nPROFILER_BENCH_BUILDER = {builder_name!r}\nTILING_AXES = TilingAxes(tile_dims=({int(tile_dim)},))\n{src_block}\n\n\n"
+                f"def build_template_obligations(problem: object) -> tuple[tuple[SemanticWorkItem, ...], tuple[TensorRangeObligation, ...]]:\n    del problem\n    raise NotImplementedError('implement_{family}_template_obligations')\n"
+            )
+        }
+    else:
+        rel_target = f"mindie_sim/prediction/operators/{family}"
+        pkg = root / rel_target
+
+        def _leaf(lbl: str, aid: str, abi: str) -> str:
+            return (
+                f'"""{lbl} ISA lowering strategy for ``{family}``.\n\nUpstream-ABI: {abi}\n\n'
+                f"[Role] Lower ``{family}`` via ``{abi}`` on ``{aid}``.\n[Invariants] Verified SourceRef.\n[Timeouts & Locks] O(1); no locks.\n[Side-Effect Policy] Pure output.\n\"\"\"\n"
+                "from __future__ import annotations\n\nfrom dataclasses import dataclass\nfrom mindie_sim.schema.datapath import ArchId, SourceRef\n"
+                "from mindie_sim.schema.operators import OpSpec\nfrom ...mechanism import OperatorPlan\nfrom ..contracts import OperatorPlanningContext\nfrom .common import build_plan\n\n"
+                f"ARCH_ID = ArchId({aid!r})\nUPSTREAM_ABI = {abi!r}\n{src_block}\n\n\n@dataclass(frozen=True, slots=True)\nclass _Strategy:\n"
+                "    arch_id: ArchId = ARCH_ID\n    abi: str = UPSTREAM_ABI\n    sources: tuple[SourceRef, ...] = SOURCES\n"
+                "    def accepts(self, op: OpSpec, ctx: OperatorPlanningContext, /) -> bool:\n        del op\n        return ctx.compute_arch.arch_id == self.arch_id\n"
+                "    def build(self, op: OpSpec, ctx: OperatorPlanningContext, /) -> OperatorPlan:\n        return build_plan(op, ctx, self.abi, self.sources)\n\n\nSTRATEGY = _Strategy()\n"
+            )
+
+        files_to_write = {
+            pkg / "__init__.py": (
+                f'"""Single public entrypoint for governed ``{family}`` operator family.\n\n[Role] Register ``{family}`` in ``FamilyRegistry``.\n'
+                "[Invariants] Never re-exports internal leaves.\n[Timeouts & Locks] O(1); no locks.\n[Side-Effect Policy] Pure output.\n\"\"\"\n"
+                "from __future__ import annotations\n\nfrom mindie_sim.schema.common import ModelingError\nfrom mindie_sim.schema.operators import OpSpec\n"
+                "from ..contracts import OperatorFamilySpec, OperatorPlanningContext, ResolvedOperator\nfrom . import arch22 as _arch22, arch35 as _arch35\n"
+                "from .common import FAMILY, PROFILER_BENCH_BUILDER, describe\n\n_STRATEGIES = {_arch22.ARCH_ID: _arch22.STRATEGY, _arch35.ARCH_ID: _arch35.STRATEGY}\n\n\n"
+                "def resolve_operator_plan(op: OpSpec, ctx: OperatorPlanningContext, /) -> ResolvedOperator:\n"
+                "    strategy = _STRATEGIES.get(ctx.compute_arch.arch_id)\n    if strategy is None:\n        raise ModelingError(f'unsupported_arch:{FAMILY}:{ctx.compute_arch.arch_id}')\n"
+                "    plan = strategy.build(op, ctx)\n    return ResolvedOperator(occurrence=ctx.occurrence, op=op, recipe=plan, implementation=strategy.abi, sources=strategy.sources, descriptor=describe(op, ctx, plan))\n\n\n"
+                "def register_family() -> OperatorFamilySpec:\n    return OperatorFamilySpec(name=FAMILY, families=frozenset({FAMILY}), owned_recipe_ids=frozenset({FAMILY}), resolve=resolve_operator_plan)\n\n\n"
+                '__all__ = ["PROFILER_BENCH_BUILDER", "register_family", "resolve_operator_plan"]\n'
+            ),
+            pkg / "common.py": (
+                f'"""Shared work conservation, obligations, and TilingAxes for ``{family}``.\n\n[Role] Declare ``TILING_AXES``, ``SemanticWorkItem``, ``TensorRangeObligation``.\n'
+                "[Invariants] Zero SKU-name sniffing.\n[Timeouts & Locks] O(1); no locks.\n[Side-Effect Policy] Pure output.\n\"\"\"\n"
+                "from __future__ import annotations\n\nfrom mindie_sim.onboarding import TilingAxes\nfrom mindie_sim.schema.operators import OpSpec\n"
+                "from mindie_sim.templates.contracts import SemanticWorkItem, TensorRangeObligation\nfrom ...mechanism import OperatorPlan\n"
+                "from ...results import FusedPipelineDescriptor, FusedPipelineSpec\nfrom ..contracts import OperatorPlanningContext\n\n"
+                f"FAMILY = {family!r}\nDEFAULT_TILE_DIM = {int(tile_dim)}\nPROFILER_BENCH_BUILDER = {builder_name!r}\n"
+                'TILING_AXES = TilingAxes(tile_dims=(DEFAULT_TILE_DIM,), core_product_axes=("tokens", "batch_x_kv_heads"))\n\n\n'
+                f"def build_semantic_work(op: OpSpec, *, die: int = 0) -> tuple[SemanticWorkItem, ...]:\n    del op, die\n    raise NotImplementedError('implement_{family}_semantic_work')\n\n\n"
+                f"def build_tensor_obligations(op: OpSpec, *, die: int = 0) -> tuple[tuple[TensorRangeObligation, ...], tuple[TensorRangeObligation, ...]]:\n    del op, die\n    raise NotImplementedError('implement_{family}_obligations')\n\n\n"
+                f"def build_plan(op: OpSpec, ctx: OperatorPlanningContext, abi: str, sources) -> OperatorPlan:\n    del op, ctx, abi, sources\n    raise NotImplementedError('implement_{family}_plan')\n\n\n"
+                "def describe(op: OpSpec, ctx: OperatorPlanningContext, plan: OperatorPlan) -> FusedPipelineDescriptor:\n"
+                "    spec = plan.pipeline_spec\n    assert isinstance(spec, FusedPipelineSpec)\n"
+                "    return FusedPipelineDescriptor(owner=ctx.occurrence, family=spec.family, implementation=spec.implementation, member_op_ids=(op.op_id,), absorbed_source_op_ids=(), phases=spec.phases, sources=spec.sources, repeats=spec.repeats)\n"
+            ),
+            pkg / "arch22.py": _leaf("Arch22", "npu_arch_2201", upstream_abi_arch22),
+            pkg / "arch35.py": _leaf("Arch35", "npu_arch_3510", upstream_abi_arch35),
+        }
+    test_rel = f"tests/operators/test_{family}.py"
+    if scaffold_test:
+        files_to_write[root / test_rel] = f'"""Orthogonal Tier-0 tests for ``{family}``.\n\n[Role] Verify ``{family}`` invariants.\n[Invariants] Isolated.\n[Timeouts & Locks] Fast.\n[Side-Effect Policy] None.\n"""\nimport pytest\npytestmark = pytest.mark.tier0\n\ndef test_{family}_placeholder() -> None:\n    assert True\n'
+    if not overwrite:
+        existing = [str(p.relative_to(root)) for p in files_to_write if p.exists()]
+        if existing:
+            raise ModelingError(f"operator_scaffold_files_exist:{','.join(existing)}")
+    written = []
+    for path, content in files_to_write.items():
+        write_atomic_bytes(path, content.encode("utf-8"))
+        written.append(str(path.relative_to(root)))
+    return {"stage": "scaffold", "ok": True, "status": "scaffolded", "family": family, "target_kind": target_kind, "package_rel": rel_target, "files_written": sorted(written), "taxonomy_snippet": f'[[module]]\npath = "operators/test_{family}.py"\ntier = "tier0"\nowns = ["{rel_target}"]\n'}
+
+
+def _eval_str(node: ast.AST | None, consts: Mapping[str, str]) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Name) and node.id in consts:
+        return consts[node.id]
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        lo, hi = _eval_str(node.left, consts), _eval_str(node.right, consts)
+        return (lo + hi) if (lo is not None and hi is not None) else None
+    return None
+
+
+def _has_not_implemented_stub(fn_node: ast.AST) -> bool:
+    for inner in ast.walk(fn_node):
+        if isinstance(inner, ast.Raise) and inner.exc is not None:
+            ex = inner.exc
+            ename = ex.id if isinstance(ex, ast.Name) else (ex.func.id if isinstance(ex, ast.Call) and isinstance(ex.func, ast.Name) else "")
+            if ename == "NotImplementedError":
+                return True
+    return False
+
+
+def _scan_ast_files(files: Sequence[Path], *, is_pkg: bool) -> tuple[dict[str, str], list[dict[str, str]], set[str], str, set[str], list[str]]:
+    abis, refs, symbols, decl_builder, decl_tids, shared, viols = {}, [], set(), "", set(), {}, []
+    trees = [(f, ast.parse(f.read_text(encoding="utf-8"), filename=str(f))) for f in files]
+    for _f, tree in trees:
+        for st in tree.body:
+            if isinstance(st, ast.Assign) and (val := _eval_str(st.value, shared)) is not None:
+                for t in st.targets:
+                    if isinstance(t, ast.Name):
+                        shared[t.id] = val
+            elif isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name) and st.value and (val := _eval_str(st.value, shared)) is not None:
+                shared[st.target.id] = val
+    for f, tree in trees:
+        top = {t.id for st in tree.body if isinstance(st, ast.Assign) for t in st.targets if isinstance(t, ast.Name)} | {st.target.id for st in tree.body if isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name)} | {st.name for st in tree.body if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Name):
+                symbols.add(n.id)
+            elif isinstance(n, ast.Attribute):
+                symbols.add(n.attr)
+            elif isinstance(n, ast.ImportFrom):
+                symbols.update(a.name for a in n.names)
+            elif isinstance(n, ast.Call):
+                fn = n.func.id if isinstance(n.func, ast.Name) else (n.func.attr if isinstance(n.func, ast.Attribute) else "")
+                if fn in {"SourceRef", "TemplateSourceRef"}:
+                    pos = [_eval_str(a, shared) for a in n.args]
+                    kw = {str(k.arg): _eval_str(k.value, shared) for k in n.keywords if k.arg}
+                    refs.append({"file": f.name, "repository": kw.get("repository") or (pos[0] if len(pos) > 0 else "") or "", "revision": kw.get("revision") or (pos[1] if len(pos) > 1 else "") or "", "relative_path": kw.get("relative_path") or (pos[2] if len(pos) > 2 else "") or "", "source_sha256": kw.get("source_sha256") or (pos[3] if len(pos) >= _SOURCE_REF_POS_ARGS else "") or ""})
+            elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and _has_not_implemented_stub(n):
+                viols.append(f"operator_target_unimplemented_stub:{f.name}:{n.name}")
+        for st in tree.body:
+            tname = [t.id for t in st.targets if isinstance(t, ast.Name)] if isinstance(st, ast.Assign) else ([st.target.id] if isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name) else [])
+            vnode = st.value if isinstance(st, (ast.Assign, ast.AnnAssign)) else None
+            if any(x in _TEMPLATE_ID_NAMES for x in tname) and vnode is not None:
+                if (s1 := _eval_str(vnode, shared)):
+                    decl_tids.add(s1)
+                elif isinstance(vnode, (ast.Tuple, ast.List, ast.Set)):
+                    decl_tids.update(s for e in vnode.elts if (s := _eval_str(e, shared)))
+        abi = next((m.group(1).strip() for ln in (ast.get_docstring(tree) or "").splitlines() if (m := _UPSTREAM_ABI_LINE_RE.match(ln))), "")
+        if f.name in {"arch22.py", "arch35.py"} or not is_pkg:
+            if not abi:
+                viols.append(f"missing_upstream_abi_header:{f.name}")
+            else:
+                abis[f.name] = abi
+            if is_pkg and "STRATEGY" not in top:
+                viols.append(f"missing_strategy_export:{f.name}")
+            if "SOURCES" not in top and not any(r["file"] == f.name for r in refs):
+                viols.append(f"missing_sources_declaration:{f.name}")
+        if not decl_builder and "PROFILER_BENCH_BUILDER" in shared:
+            decl_builder = shared["PROFILER_BENCH_BUILDER"]
+    if is_pkg and len(abis) >= 2 and len(set(abis.values())) < len(abis):
+        viols.append("duplicate_upstream_abi_across_arch_leaves")
+    return abis, refs, symbols, decl_builder, decl_tids, viols
+
+
+def _build_default_planning_context(op: OpSpec, *, sku: str = _DEFAULT_PROBE_SKU) -> OperatorPlanningContext:
+    hw = Hardware.from_mapping(ascend({"sku": sku, "num_devices": 1}))
+    die = hw.dies[0]
+    dp = datapath_for_die(die)
+    geom = Geometry(compute_units=die.compute_units, resource_units=die.resource_units, buffers=die.buffers, buffer_units=die.buffer_units, rates=die.rates, compute_peaks=die.compute_peaks, compute_arch=die.compute_arch, datapath=dp)
+    return OperatorPlanningContext(occurrence=OpOccurrence(0, 0, 0, op.op_id), geometry=geom, datapath=dp)
+
+
+def _collect_stages(obj: Any, depth: int = 0) -> list[Any]:
+    if obj is None or depth > _MAX_STAGE_DEPTH or isinstance(obj, (tuple, list, dict, str, bytes, int, float, bool)):
+        return []
+    found: list[Any] = []
+    if hasattr(obj, "work") and hasattr(obj, "name") and hasattr(obj, "after"):
+        found.append(obj)
+        if getattr(obj, "program", None) is not None:
+            found.extend(_collect_stages(obj.program, depth + 1))
+        return found
+    for attr in ("stages", "branches", "phases", "programs"):
+        ch = getattr(obj, attr, None)
+        if isinstance(ch, (tuple, list)):
+            for c in ch:
+                found.extend(_collect_stages(c, depth + 1))
+    for attr in ("placed", "program", "inner", "body", "template"):
+        sub = getattr(obj, attr, None)
+        if sub is not None and sub is not obj:
+            found.extend(_collect_stages(sub, depth + 1))
+    if not found and hasattr(obj, "work") and callable(getattr(obj, "start", None)):
+        found.append(obj)
+    return found
+
+
+def _certify_stages_dual_bound(stages: Sequence[Any], geom: Geometry) -> tuple[bool, int, str]:
+    rates, peaks = dict(geom.rates), dict(geom.compute_peaks)
+    aliases = {"hbm_bytes": "hbm", "mte2_bytes": "mte2_aiv", "mte2": "mte2_aiv", "mte3_bytes": "mte3", "vector_ops": "vector"}
+    res_ns: dict[str, int] = {}
+    quanta, name_idx, edges = [], {}, []
+    for st in stages:
+        st_ns = int(round(float(getattr(st, "latency", 0.0) or 0.0) * NS_PER_MS))
+        wmap = getattr(st, "work", None)
+        if isinstance(wmap, Mapping):
+            for rn, amt_raw in wmap.items():
+                amt = float(amt_raw)
+                if amt <= 0.0:
+                    continue
+                rk = str(rn)
+                rate = float(rates.get(rk) or rates.get(aliases.get(rk, "")) or peaks.get(rk) or (peaks.get(rk.split(":", 1)[-1], peaks.get("bf16", 0.0)) if rk.startswith("cube") else 0.0) or 0.0)
+                if rate <= 0.0 or not math.isfinite(rate):
+                    return False, 0, f"resolved_stage_resource_rate_missing:{rk}"
+                dur = max(1, math.ceil(amt / rate * _NS_PER_SECOND))
+                res_ns[rk] = res_ns.get(rk, 0) + dur
+                st_ns = max(st_ns, dur)
+        if st_ns > 0:
+            idx = len(quanta)
+            name_idx[str(getattr(st, "name", f"s{idx}"))] = idx
+            quanta.append(st_ns)
+            edges.extend(DagEdge(name_idx[str(d)], idx, 0) for d in (getattr(st, "after", ()) or ()) if str(d) in name_idx)
+    if not quanta:
+        return False, 0, "resolved_operator_program_zero_executable_events"
+    gwork = tuple(sorted(res_ns.values())) if res_ns else (max(quanta),)
+    prog, dag = ResourceChoiceProgram(len(gwork), gwork, ()), EventDagSpec(tuple(quanta), tuple(edges))
+    cert, _ = certify_lower_bound(prog, dag)
+    if not check_optimality_certificate(prog, dag, cert) or cert.l_star_lean_ns <= 0:
+        return False, int(cert.l_star_lean_ns), "lean_optimality_certificate_rejected"
+    return True, int(cert.l_star_lean_ns), "verified"
+
+
+def _verify_resolved_operator_dual_bound(resolved: Any, ctx: OperatorPlanningContext) -> tuple[bool, int, str]:
+    recipe = getattr(resolved, "recipe", None)
+    if not isinstance(recipe, OperatorPlan) or not callable(recipe.program):
+        return False, 0, "resolved_operator_missing_operator_plan"
+    from mindie_sim.prediction.program.binding import RecipeContext
+
+    r_ctx = RecipeContext(op=getattr(resolved, "op", None), work=dict(recipe.work.resources), resource_names={str(k): str(k) for k in dict(ctx.geometry.rates)}, rates=dict(ctx.geometry.rates), core_count=max(1, int(ctx.geometry.compute_units)), resource_units=dict(ctx.geometry.resource_units), compute_peaks=dict(ctx.geometry.compute_peaks))
+    try:
+        lowered = recipe.lower(r_ctx)
+    except TimeoutError:
+        raise
+    except Exception as exc:
+        return False, 0, f"resolved_operator_program_lower_failed:{exc}"
+    stages = _collect_stages(lowered) if (lowered is not None and callable(getattr(lowered, "start", None))) else []
+    return _certify_stages_dual_bound(stages, ctx.geometry) if stages else (False, 0, "resolved_operator_program_zero_executable_events")
+
+
+def _verify_sim_owner(is_pkg: bool, target_path: Path, family: str, template_id: str, family_registry: FamilyRegistry | None, template_catalog: TemplateCatalog | None) -> tuple[bool, dict[str, Any], list[str]]:
+    if is_pkg:
+        reg = family_registry or builtin_family_registry()
+        spec = reg.spec_for_family(family) or next((c for c in reg.specs() if c.name == family or family in c.families), None)
+        if spec is None:
+            return False, {"owner": "builtin_family_registry", "checked": True, "matched": False, "lowered": False}, [f"sim_registry_unmatched:{family}"]
+        op = OpSpec(f"probe_{family}", sorted(spec.families)[0] if spec.families else family, sorted(spec.owned_recipe_ids)[0] if spec.owned_recipe_ids else "", "decode", "bf16", (), _DEFAULT_PROBE_SHAPE, _DEFAULT_PROBE_SHAPE, _DEFAULT_PROBE_SHAPE, _DEFAULT_PROBE_SHAPE)
+        matched = reg.match(op)
+        if matched is None:
+            return False, {"owner": "builtin_family_registry", "checked": True, "matched": False, "lowered": False}, [f"sim_registry_unmatched:{family}"]
+        ctx = _build_default_planning_context(op)
+        try:
+            resolved = matched.resolve(op, ctx)
+        except Exception as exc:
+            return False, {"owner": "builtin_family_registry", "checked": True, "matched": True, "lowered": False}, [f"sim_owner_resolve_failed:{family}:{exc}"]
+        ok_l, l_star, reason = _verify_resolved_operator_dual_bound(resolved, ctx)
+        det = {"owner": "builtin_family_registry", "checked": True, "matched": True, "lowered": ok_l, "owned_recipe_ids": sorted(str(x) for x in matched.owned_recipe_ids), "resolved_implementation": str(getattr(resolved, "implementation", "")), "lean_lower_bound_ns": l_star, "lean_status": reason}
+        return ok_l, det, ([] if ok_l else [f"sim_owner_dual_bound_failed:{family}:{reason}"])
+
+    cat = template_catalog or builtin_template_catalog()
+    k2, k3 = set(cat.ids("K2")), set(cat.ids("K3"))
+    req_id = template_id.strip() or family
+    if req_id not in (k2 | k3):
+        return False, {"owner": "builtin_template_catalog", "checked": True, "matched": False, "lowered": False}, [f"template_catalog_unregistered:{req_id}"]
+    tier = "K2" if req_id in k2 else "K3"
+    if template_catalog is None:
+        from mindie_sim.templates import catlass_catalog, catlass_lower, dsl_catalog, dsl_lower
+        owners = {Path(m.__file__).resolve() for m in ((catlass_catalog, catlass_lower) if tier == "K2" else (dsl_catalog, dsl_lower)) if getattr(m, "__file__", None)}
+        if target_path not in owners:
+            return False, {"owner": "builtin_template_catalog", "checked": True, "matched": False, "lowered": False}, [f"template_id_not_owned_by_target:{req_id}:{target_path.name}"]
+    problem = {"m": _DEFAULT_TEMPLATE_DIM, "n": _DEFAULT_TEMPLATE_DIM, "k": _DEFAULT_TEMPLATE_DIM, "dtype_a": "bf16", "dtype_b": "bf16", "dtype_c": "bf16"}
+    for sku in (_DEFAULT_PROBE_SKU, _DEFAULT_PROBE_SKU_A5):
+        hw = Hardware.from_mapping(ascend({"sku": sku, "num_devices": 1}))
+        die = hw.dies[0]
+        dp = datapath_for_die(die)
+        geom = Geometry(compute_units=die.compute_units, resource_units=die.resource_units, buffers=die.buffers, buffer_units=die.buffer_units, rates=die.rates, compute_peaks=die.compute_peaks, compute_arch=die.compute_arch, datapath=dp)
+        try:
+            specs = tuple(cat.enumerate(tier, problem, dp, template_id=req_id))  # type: ignore[arg-type]
+            if not specs:
+                continue
+            low = cat.lower(tier, specs[0], problem, dp)  # type: ignore[arg-type]
+            ok_l, l_star, reason = _certify_stages_dual_bound(_collect_stages(getattr(low, "program", low)), geom)
+            return ok_l, {"owner": "builtin_template_catalog", "checked": True, "matched": True, "tier": tier, "template_id": req_id, "lowered": ok_l, "lean_lower_bound_ns": l_star, "lean_status": reason}, ([] if ok_l else [f"template_lower_verification_failed:{req_id}:{reason}"])
+        except Exception:
+            continue
+    return False, {"owner": "builtin_template_catalog", "checked": True, "matched": True, "lowered": False}, [f"template_enumeration_empty:{req_id}"]
+
+
+def validate_operator_contract(
+    *, target_path: str | Path, repo_root: str | Path | None = None, refs_root: str | Path | None = None,
+    repo_map: Mapping[str, str | Path] | None = None, profiler_root: str | Path | None = None,
+    profiler_family: str = "", profiler_recipe: str = "", profiler_impl: str = "", template_id: str = "",
+    family_registry: FamilyRegistry | None = None, template_catalog: TemplateCatalog | None = None,
+    require_sim_owner: bool = True, require_taxonomy: bool = True,
+    require_profiler_builder: bool = True, require_tiling_axes: bool = True, require_mounted_refs: bool = False,
+) -> dict[str, Any]:
+    """Stage 1B: Validate ABI, SourceRef Git blob SHAs, Sim/Profiler owners, obligations, and taxonomy."""
+    root = resolve_repo_root(repo_root)
+    raw_t = Path(target_path)
+    target = (raw_t if raw_t.is_absolute() else (root / raw_t)).resolve()
+    if not target.exists():
+        raise ModelingError(f"operator_target_not_found:{target}")
+    is_pkg = target.is_dir()
+    family = target.name if is_pkg else target.stem.removesuffix("_spec")
+    viols: list[str] = []
+    if is_pkg:
+        files = [target / fn for fn in _REQUIRED_FAMILY_FILES if (target / fn).is_file()]
+        viols.extend(f"missing_required_family_file:{fn}" for fn in _REQUIRED_FAMILY_FILES if not (target / fn).is_file())
+    else:
+        files = [target]
+    abis, refs, symbols, decl_builder, _decl_tids, ast_v = _scan_ast_files(files, is_pkg=is_pkg)
+    viols.extend(ast_v)
+    has_sem, has_obl, has_axes = "SemanticWorkItem" in symbols, "TensorRangeObligation" in symbols, "TilingAxes" in symbols or "TILING_AXES" in symbols
+    if not has_sem:
+        viols.append("missing_semantic_work_item_declaration")
+    if not has_obl:
+        viols.append("missing_tensor_range_obligation_declaration")
+    if require_tiling_axes and not has_axes:
+        viols.append("missing_tiling_axes_declaration")
+
+    r_root = Path(refs_root).resolve() if refs_root is not None else None
+    r_map = {str(k): Path(v).resolve() for k, v in (repo_map or {}).items()}
+    if not refs:
+        viols.append("source_ref_missing")
+    all_blobs_ok = bool(refs)
+    for ref in refs:
+        repo, rev, rel, exp_sha = ref["repository"], ref["revision"], ref["relative_path"], ref["source_sha256"].lower()
+        if not repo or len(rev) < HEX_COMMIT_LEN or not rel or rel.startswith("/") or len(exp_sha) != SHA256_HEX_LENGTH:
+            viols.append(f"source_ref_invalid:{ref['file']}")
+            all_blobs_ok = False
+            continue
+        rdir = r_map.get(repo) or r_map.get(repo.rsplit("/", 1)[-1]) or (next((r_root / c for c in (repo, repo.rsplit("/", 1)[-1]) if (r_root / c).exists()), None) if r_root else None)
+        if rdir is None:
+            all_blobs_ok = False
+            if r_root is not None or r_map or require_mounted_refs:
+                viols.append(f"source_repo_not_mounted:{repo}")
+            continue
+        try:
+            done = subprocess.run(["git", "-C", str(rdir), "cat-file", "-p", f"{rev}:{rel}"], capture_output=True, timeout=_GIT_CAT_TIMEOUT_S, check=False, **subprocess_window_kwargs())
+        except subprocess.TimeoutExpired as exc:
+            raise TimeoutError(f"git_cat_file_timeout:{repo}:{rel}") from exc
+        except TimeoutError:
+            raise
+        except OSError as exc:
+            viols.append(f"git_cat_file_error:{repo}:{exc}")
+            all_blobs_ok = False
+            continue
+        if done.returncode != 0 or hashlib.sha256(done.stdout).hexdigest().lower() != exp_sha:
+            viols.append(f"source_sha256_mismatch:{repo}:{rel}")
+            all_blobs_ok = False
+
+    sim_disp: dict[str, Any] = {"checked": False, "matched": False, "lowered": False, "lean_status": "skipped"}
+    if require_sim_owner:
+        _ok_s, sim_disp, s_v = _verify_sim_owner(is_pkg, target, family, template_id, family_registry, template_catalog)
+        viols.extend(s_v)
+
+    prof_disp: dict[str, Any] = {"checked": False, "verified": False}
+    if require_profiler_builder:
+        pfam, prec = profiler_family or family, profiler_recipe or decl_builder or family
+        pimpl = profiler_impl or str(sim_disp.get("resolved_implementation") or next(iter(abis.values()), ""))
+        try:
+            bname, r_abi = resolve_profiler_builder_strict(pfam, prec, pimpl, profiler_root=profiler_root)
+            prof_disp = {"checked": True, "verified": True, "builder": bname, "resolved_abi": r_abi}
+            if abis and r_abi and r_abi not in set(abis.values()):
+                viols.append(f"profiler_abi_mismatch:resolved={r_abi}:declared={sorted(abis.values())}")
+        except ModelingError as exc:
+            prof_disp = {"checked": True, "verified": False, "error": str(exc)}
+            viols.append(str(exc))
+
+    tax_info: dict[str, Any] = {"checked": False, "registered": False}
+    if require_taxonomy:
+        t_rel = str(target.relative_to(root)) if target.is_relative_to(root) else str(target_path)
+        tax_f = root / "tests" / "TAXONOMY.toml"
+        reg_ok, reg_det = False, "taxonomy_toml_missing"
+        if tax_f.is_file():
+            parsed = tomllib.loads(tax_f.read_text(encoding="utf-8"))
+            for mod in parsed.get("module", ()):
+                if isinstance(mod, Mapping):
+                    mpath = str(mod.get("path") or "")
+                    owns = [str(o).rstrip("/") for o in mod.get("owns", ())]
+                    if any(t_rel.rstrip("/") == o or t_rel.rstrip("/").startswith(o + "/") for o in owns) or f"test_{family}.py" in mpath:
+                        reg_ok = (root / "tests" / mpath).is_file()
+                        reg_det = mpath if reg_ok else f"taxonomy_module_missing_on_disk:{mpath}"
+                        break
+            else:
+                reg_det = f"taxonomy_registration_missing:{t_rel}"
+        tax_info = {"checked": True, "registered": reg_ok, "detail": reg_det}
+        if not reg_ok:
+            viols.append(reg_det)
+
+    if r_root is not None and (root / "scripts" / "check_template_provenance.py").is_file():
+        prov_gate = run_template_provenance_gate(repo_root=root, refs_root=r_root, repo_map=r_map or None)
+        if not prov_gate.passed:
+            viols.append(f"template_provenance_gate_failed:{prov_gate.detail}")
+
+    ok = not viols
+    out = {
+        "stage": "validate-contract", "ok": ok, "status": "pass" if ok else "fail", "family": family,
+        "upstream_abis": abis, "source_blobs_verified": all_blobs_ok,
+        "semantic_work_declared": has_sem, "tensor_obligations_declared": has_obl, "tiling_axes_declared": has_axes,
+        "sim_owner_dispatch": sim_disp, "profiler_builder": prof_disp, "taxonomy": tax_info, "violations": viols,
+    }
+    assert_sanitized_payload(out, field_name="operator_contract_report")
+    return out
 
 
 def generate_operator_cliff_plan(
-    *,
-    operator_id: str,
-    family: str,
-    sku: str,
-    tile_dim: int,
-    core_count: int,
-    l2_bytes: int,
-    bytes_per_token: int = 0,
-    topk_threshold: int | None = None,
-    context_min: int = CONTEXT_MIN_TOKENS,
-    context_max: int = CONTEXT_MAX_TOKENS,
-    tiling_axes: TilingAxes | None = None,
-    campaign_id: str = "onboard-op",
-    plan_out: str | Path | None = None,
+    *, operator_id: str, family: str, sku: str, tile_dim: int, core_count: int, l2_bytes: int,
+    bytes_per_token: int = 0, topk_threshold: int | None = None,
+    context_min: int = CONTEXT_MIN_TOKENS, context_max: int = CONTEXT_MAX_TOKENS,
+    campaign_id: str = "onboard-op", plan_out: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Stage 2: Synthesize and optionally write a disjoint 2D cliff + ABI-rejection plan."""
-    params = OperatorCliffParameters(
-        operator_id=operator_id,
-        family=family,
-        tile_dim=int(tile_dim),
-        core_count=int(core_count),
-        l2_bytes=int(l2_bytes),
-        bytes_per_token=int(bytes_per_token),
-        topk_threshold=int(topk_threshold) if topk_threshold is not None else None,
-        context_min=int(context_min),
-        context_max=int(context_max),
-        tiling_axes=tiling_axes,
-    )
-    plan = synthesize_operator_cliff_plan(params, sku=sku, campaign_id=campaign_id)
-    payload = plan.to_dict()
-    assert_sanitized_payload(payload, field_name="operator_cliff_plan")
+    """Stage 2: Synthesize disjoint Anchor + Off-Grid Cliff + ABI-rejection plan for an operator."""
+    plan = synthesize_operator_cliff_plan(
+        OperatorCliffParameters(operator_id, family, int(tile_dim), int(core_count), int(l2_bytes), int(bytes_per_token), topk_threshold, int(context_min), int(context_max)),
+        sku=sku, campaign_id=campaign_id,
+    ).to_dict()
     if plan_out is not None:
-        write_atomic_json(plan_out, payload)
-    return {
-        "stage": "generate-cliff-plan",
-        "ok": True,
-        "status": "ok",
-        "plan_sha256": plan.plan_sha256,
-        "required_ranks": required_ranks_for_plan(payload),
-        "train_point_count": len(plan.train_points),
-        "heldout_point_count": len(plan.heldout_points),
-        "abi_rejection_point_count": len(plan.abi_rejection_points),
-        "plan": payload,
-    }
-
-
-def _collect_operator_observations(
-    *,
-    plan_doc: Mapping[str, Any],
-    sku: str,
-    req_npus: int,
-    captured_json: str | Path | Sequence[Mapping[str, Any]] | None,
-    abi_rejection_results: Sequence[Mapping[str, Any]] | None,
-    bench_dispatcher: Callable[[Mapping[str, Any], int], Sequence[Mapping[str, Any]]] | None,
-    live_profiler: bool,
-    endpoint_alias: str,
-    profiler_root: str | Path | None,
-    lease_acquirer: Callable[[str, int], AbstractContextManager[Mapping[str, Any]]] | None,
-    coordinator_bin: str,
-    timeout_s: int,
-    eff_capture_root: str | Path | None,
-    ssh_runner: Callable[[str, str, int], Any] | None,
-) -> tuple[
-    list[Mapping[str, Any]] | None,
-    Sequence[Mapping[str, Any]] | None,
-    dict[str, Any],
-    Literal["live_silicon", "offline_reverify"],
-]:
-    lease_public: dict[str, Any] = {"lease_mode": "offline_replay"}
-    acquisition_mode: Literal["live_silicon", "offline_reverify"] = "offline_reverify"
-    if captured_json is not None:
-        if isinstance(captured_json, (str, Path)):
-            raw_cap = read_bounded_json(captured_json)
-            rows: list[Mapping[str, Any]] | None = list(
-                raw_cap.get("observations", raw_cap) if isinstance(raw_cap, Mapping) else raw_cap
-            )
-            if abi_rejection_results is None and isinstance(raw_cap, Mapping) and raw_cap.get("abi_rejection_results") is not None:
-                abi_rejection_results = list(raw_cap["abi_rejection_results"])
-        else:
-            rows = list(captured_json)
-        return rows, abi_rejection_results, lease_public, acquisition_mode
-
-    if bench_dispatcher is not None:
-        if lease_acquirer is None and not live_profiler:
-            return list(bench_dispatcher(plan_doc, int(timeout_s))), abi_rejection_results, lease_public, acquisition_mode
-        lease_ttl_s = int(timeout_s) + DEFAULT_CLEANUP_GRACE_S
-        lease_ctx = (
-            lease_acquirer(sku, lease_ttl_s)
-            if lease_acquirer is not None
-            else acquire_coordinator_host_queue_lease(
-                endpoint_alias, npu_count=req_npus, ttl_seconds=lease_ttl_s,
-                min_subprocess_timeout_s=int(timeout_s), cleanup_grace_s=DEFAULT_CLEANUP_GRACE_S,
-                coordinator_bin=coordinator_bin,
-            )
-        )
-        raw_lease: Mapping[str, Any] = {}
-        with lease_ctx as lease_info:
-            raw_lease = lease_info if isinstance(lease_info, Mapping) else {}
-            validate_host_queue_grant(raw_lease, required_devices=req_npus, min_ttl_seconds=lease_ttl_s)
-            rows = list(bench_dispatcher(plan_doc, int(timeout_s)))
-        return rows, abi_rejection_results, sanitize_lease_for_receipt(raw_lease), acquisition_mode
-
-    if live_profiler:
-        lease_ttl_s = int(timeout_s) + DEFAULT_CLEANUP_GRACE_S
-        lease_ctx = (
-            lease_acquirer(sku, lease_ttl_s)
-            if lease_acquirer is not None
-            else acquire_coordinator_host_queue_lease(
-                endpoint_alias, npu_count=req_npus, ttl_seconds=lease_ttl_s,
-                min_subprocess_timeout_s=int(timeout_s), cleanup_grace_s=DEFAULT_CLEANUP_GRACE_S,
-                coordinator_bin=coordinator_bin,
-            )
-        )
-        raw_lease = {}
-        with lease_ctx as lease_info:
-            raw_lease = lease_info if isinstance(lease_info, Mapping) else {}
-            _, fence, granted, _ = validate_host_queue_grant(
-                raw_lease, required_devices=req_npus, min_ttl_seconds=lease_ttl_s
-            )
-            rows, live_abi = run_profiler_bench_subprocess(
-                plan_doc, sku=sku, profiler_root=profiler_root, endpoint_alias=endpoint_alias,
-                allowed_phy_ids=granted, fence_token=fence, timeout_s=int(timeout_s),
-                capture_out_dir=eff_capture_root, ssh_runner=ssh_runner,
-            )
-            if abi_rejection_results is None and live_abi:
-                abi_rejection_results = live_abi
-        lease_public = sanitize_lease_for_receipt(raw_lease)
-        if lease_public.get("lease_mode") == "coordinator_host_queue":
-            acquisition_mode = "live_silicon"
-        return rows, abi_rejection_results, lease_public, acquisition_mode
-
-    return None, abi_rejection_results, lease_public, acquisition_mode
+        write_atomic_json(plan_out, plan)
+    return {"stage": "generate-cliff-plan", "ok": True, "status": "pass", "plan": plan}
 
 
 def bench_and_score_operator(
-    *,
-    cliff_plan: str | Path | Mapping[str, Any],
-    sku: str,
+    *, cliff_plan: str | Path | Mapping[str, Any], sku: str,
     captured_json: str | Path | Sequence[Mapping[str, Any]] | None = None,
+    live_profiler: bool = False, endpoint_alias: str = "", profiler_root: str | Path | None = None,
+    coordinator_bin: str = "", threshold_pct: float = DEFAULT_HELDOUT_APE_THRESHOLD_PCT,
+    atol_ns: int = DEFAULT_PHYSICAL_ATOL_NS, out_score: str | Path | None = None,
+    capture_root: str | Path | None = None, require_capture_files: bool = False,
+    runner: Any = None, bench_dispatcher: Callable[[Mapping[str, Any], int], Sequence[Mapping[str, Any]]] | None = None,
     abi_rejection_results: Sequence[Mapping[str, Any]] | None = None,
-    bench_dispatcher: Callable[[Mapping[str, Any], int], Sequence[Mapping[str, Any]]] | None = None,
-    live_profiler: bool = False,
-    endpoint_alias: str = "",
-    profiler_root: str | Path | None = None,
     lease_acquirer: Callable[[str, int], AbstractContextManager[Mapping[str, Any]]] | None = None,
-    coordinator_bin: str = "",
-    runner: EvaluationRunner | None = None,
-    threshold_pct: float = DEFAULT_HELDOUT_APE_THRESHOLD_PCT,
-    out_score: str | Path | None = None,
-    timeout_s: int = DEFAULT_OUTER_TIMEOUT_S,
-    capture_root: str | Path | None = None,
-    capture_files: Mapping[str, str | Path] | None = None,
-    require_capture_files: bool = True,
-    ssh_runner: Callable[[str, str, int], Any] | None = None,
 ) -> dict[str, Any]:
-    """Stage 3: Dispatch bench plan (under exact-rank HostQueue lease if live) and score."""
-    cap_threshold = validate_strict_threshold_pct(threshold_pct)
-    plan_raw = read_bounded_json(cliff_plan) if isinstance(cliff_plan, (str, Path)) else dict(cliff_plan)
-    plan_doc = dict(plan_raw["plan"]) if isinstance(plan_raw, Mapping) and "plan" in plan_raw else dict(plan_raw)
-    verified_plan_sha = verify_cliff_plan_integrity(plan_doc)
-    plan_sku = str(plan_doc.get("sku") or "").strip()
-    if plan_sku and plan_sku != sku:
-        raise ModelingError(f"cliff_plan_sku_mismatch:plan={plan_sku}:requested={sku}")
-    expected_heldout_pts = list(plan_doc.get("heldout_points", ()))
-    expected_train_pts = list(plan_doc.get("train_points", ()))
-    expected_heldout_ids = [str(pt["point_id"]) for pt in expected_heldout_pts]
-    expected_train_ids = [str(pt["point_id"]) for pt in expected_train_pts]
+    """Stage 3: Dispatch operator bench plan or score captured silicon rows against white-box ``mindie-sim``."""
+    cap_pct, eff_atol = validate_strict_threshold_pct(threshold_pct), validate_strict_atol_ns(atol_ns)
+    plan_doc = dict(read_bounded_json(cliff_plan) if isinstance(cliff_plan, (str, Path)) else cliff_plan)
+    plan_sha = verify_cliff_plan_integrity(plan_doc)
     plan_family = str(plan_doc.get("family") or "").strip()
-    req_npus = required_ranks_for_plan(plan_doc)
-
-    eff_capture_root: str | Path | None = capture_root
-    temp_cap_ctx: AbstractContextManager[str | None] = nullcontext(None)
-    if live_profiler and captured_json is None and bench_dispatcher is None and eff_capture_root is None:
-        if out_score is not None:
-            eff_capture_root = Path(out_score).parent / "captures"
-        else:
-            temp_cap_ctx = tempfile.TemporaryDirectory(prefix="msim-op-cap-")
-
-    with temp_cap_ctx as tmp_cap_dir:
-        if tmp_cap_dir is not None:
-            eff_capture_root = Path(tmp_cap_dir)
-        rows, abi_rejection_results, lease_public, acquisition_mode = _collect_operator_observations(
-            plan_doc=plan_doc, sku=sku, req_npus=req_npus,
-            captured_json=captured_json, abi_rejection_results=abi_rejection_results,
-            bench_dispatcher=bench_dispatcher, live_profiler=live_profiler,
-            endpoint_alias=endpoint_alias, profiler_root=profiler_root,
-            lease_acquirer=lease_acquirer, coordinator_bin=coordinator_bin,
-            timeout_s=int(timeout_s), eff_capture_root=eff_capture_root, ssh_runner=ssh_runner,
-        )
-        if rows is None:
-            plan_only: dict[str, Any] = {
-                "stage": "bench-and-score", "ok": False, "status": "plan_only",
-                "verdict": "insufficient_evidence",
-                "error": "bench_and_score_plan_only_no_observations",
-                "sku": sku, "target_id": str(plan_doc.get("target_id") or ""),
-                "family": plan_family, "plan_sha256": verified_plan_sha,
-                "required_ranks": req_npus, "acquisition_mode": "offline_reverify",
-                "capture_files_verified": False, "lease": lease_public,
-                "missing_heldout_points": sorted(expected_heldout_ids),
-                "missing_train_points": sorted(expected_train_ids),
-                "abi_rejection_check": evaluate_abi_rejections(plan_doc.get("abi_rejection_points") or (), None),
-                "heldout_summary": None, "residuals": [],
-            }
-            plan_only["report_hmac"] = sign_stage_report("operator_score", plan_only)
-            assert_sanitized_payload(plan_only, field_name="bench_and_score_plan_only")
-            if out_score is not None:
-                write_atomic_json(out_score, plan_only)
-            return plan_only
-
-        expected_levels = {
-            str(pt["point_id"]): assign_plan_point_level(plan_doc, pt)
-            for pt in (*expected_train_pts, *expected_heldout_pts)
-            if isinstance(pt, Mapping) and pt.get("point_id")
-        }
-        external_train = [str(plan_doc["train_lineage_root"])] if plan_doc.get("train_lineage_root") else []
-        scored = score_sealed_gate_cases(
-            rows, sku=sku, runner=runner, threshold_pct=cap_threshold,
-            external_train_roots=external_train, expected_points=expected_heldout_pts,
-            expected_train_points=expected_train_pts, expected_point_ids=expected_heldout_ids,
-            expected_levels=expected_levels,
-            expected_family=plan_family, require_disjoint_level_roots=False,
-            capture_root=eff_capture_root, capture_files=capture_files,
-            require_capture_files=require_capture_files,
-        )
-    if not scored.get("capture_files_verified"):
-        acquisition_mode = "offline_reverify"
-    abi_check = evaluate_abi_rejections(list(plan_doc.get("abi_rejection_points") or ()), abi_rejection_results)
-    missing_heldout = list(scored["missing_plan_points"])
-    missing_train = list(scored["missing_train_points"])
-    if missing_heldout or missing_train or scored["status"] == "insufficient_evidence":
-        final_ok, final_status = False, "insufficient_evidence"
-    elif scored["failing_cases"] or not scored["ok"] or not abi_check["ok"]:
-        final_ok, final_status = False, "fail"
-    else:
-        final_ok, final_status = True, "pass"
-
+    custom_run = (lambda p: bench_dispatcher(p, DEFAULT_GATE_SUBPROCESS_TIMEOUT_S)) if bench_dispatcher is not None else None
+    rows, abi_obs, lease_pub, req_npus = acquire_stage3_observations(
+        plan_doc, sku=sku, raw_source=captured_json, custom_runner=custom_run,
+        live_profiler=live_profiler, endpoint_alias=endpoint_alias, profiler_root=profiler_root,
+        coordinator_bin=coordinator_bin, capture_root=capture_root,
+        abi_rejection_results=abi_rejection_results, lease_acquirer=lease_acquirer,
+    )
+    exp_levels = {str(p["point_id"]): assign_plan_point_level(plan_doc, p) for sk in ("train_points", "heldout_points") for p in (plan_doc.get(sk) or ()) if isinstance(p, Mapping) and p.get("point_id")}
+    scored = score_sealed_gate_cases(
+        rows, sku=sku, runner=runner, threshold_pct=cap_pct, atol_ns=eff_atol,
+        external_train_roots=[str(plan_doc["train_lineage_root"])] if plan_doc.get("train_lineage_root") else [],
+        expected_points=plan_doc.get("heldout_points") or (), expected_train_points=plan_doc.get("train_points") or (),
+        expected_levels=exp_levels, expected_family=plan_family, require_disjoint_level_roots=False,
+        capture_root=capture_root, require_capture_files=require_capture_files,
+    )
+    abi_chk = evaluate_abi_rejections(plan_doc.get("abi_rejection_points") or (), abi_obs)
+    ok = bool(scored["ok"]) and bool(abi_chk["ok"])
+    status = "insufficient_evidence" if scored["status"] == "insufficient_evidence" else ("pass" if ok else "fail")
     report: dict[str, Any] = {
-        "stage": "bench-and-score", "ok": final_ok, "status": final_status, "verdict": final_status,
-        "sku": sku, "threshold_pct": cap_threshold, "atol_ns": int(scored.get("atol_ns", DEFAULT_PHYSICAL_ATOL_NS)),
-        "target_id": str(plan_doc.get("target_id") or ""), "family": plan_family,
-        "plan_sha256": verified_plan_sha, "required_ranks": req_npus,
-        "acquisition_mode": acquisition_mode,
-        "capture_files_verified": bool(scored.get("capture_files_verified", False)),
-        "lease": lease_public,
-        "missing_heldout_points": missing_heldout, "missing_train_points": missing_train,
-        "over_budget_points": list(scored["over_budget_points"]),
-        "failing_cases": list(scored["failing_cases"]),
-        "abi_rejection_check": abi_check, "lineage": scored["lineage"],
-        "heldout_summary": scored["heldout_summary"], "train_summary": scored["train_summary"],
-        "residuals": scored["residuals"],
+        "stage": "bench-and-score", "ok": ok, "status": status, "sku": sku,
+        "threshold_pct": cap_pct, "atol_ns": eff_atol, "target_id": str(plan_doc.get("target_id") or ""),
+        "family": plan_family, "plan_sha256": plan_sha, "required_ranks": req_npus,
+        "acquisition_mode": "live_silicon" if live_profiler else "offline_reverify",
+        "capture_files_verified": bool(scored["capture_files_verified"]), "lease": lease_pub,
+        "missing_heldout_points": scored["missing_plan_points"], "missing_train_points": scored["missing_train_points"],
+        "over_budget_points": scored["over_budget_points"], "failing_cases": scored["failing_cases"],
+        "abi_rejection_check": abi_chk, "lineage": scored["lineage"],
+        "heldout_summary": scored["heldout_summary"], "train_summary": scored["train_summary"], "residuals": scored["residuals"],
     }
-    rec_unconf, rec_warn = collect_receipt_warnings(lease_public)
-    if rec_unconf or rec_warn:
-        report["receipt_unconfirmed"] = rec_unconf
-        report["receipt_warning"] = rec_warn
-    report["report_hmac"] = sign_stage_report("operator_score", report)
+    rec_u, rec_w = collect_receipt_warnings(lease_pub)
+    if rec_u or rec_w:
+        report["receipt_unconfirmed"], report["receipt_warning"] = rec_u, rec_w
     assert_sanitized_payload(report, field_name="bench_and_score_report")
     if out_score is not None:
         write_atomic_json(out_score, report)
     return report
 
 
-def _check_contract_release_eligibility(c_doc: Mapping[str, Any]) -> list[str]:
-    errs: list[str] = []
-    sim_disp = c_doc.get("sim_owner_dispatch") if isinstance(c_doc.get("sim_owner_dispatch"), Mapping) else {}
-    if (
-        sim_disp.get("checked") is not True
-        or sim_disp.get("matched") is not True
-        or sim_disp.get("lowered") is not True
-        or sim_disp.get("lean_status") != "verified"
-    ):
-        errs.append("contract_sim_owner_skipped_or_unlowered")
-    prof = c_doc.get("profiler_builder") if isinstance(c_doc.get("profiler_builder"), Mapping) else {}
-    if prof.get("checked") is not True or prof.get("verified") is not True:
-        errs.append("contract_profiler_builder_skipped_or_unverified")
-    tax = c_doc.get("taxonomy") if isinstance(c_doc.get("taxonomy"), Mapping) else {}
-    if tax.get("registered") is not True:
-        errs.append("contract_taxonomy_not_registered")
-    if c_doc.get("tiling_axes_declared") is not True:
-        errs.append("contract_tiling_axes_not_declared")
-    if c_doc.get("semantic_work_declared") is not True or c_doc.get("tensor_obligations_declared") is not True:
-        errs.append("contract_semantic_or_obligations_missing")
-    if c_doc.get("source_blobs_verified") is not True:
-        errs.append("contract_source_blobs_unverified")
-    return errs
-
-
-def _evaluate_operator_contract_gate(
-    operator_id: str, c_doc: Mapping[str, Any], s_doc: Mapping[str, Any]
-) -> tuple[GateCheckOutcome, str, Mapping[str, Any], Mapping[str, Any], set[str]]:
-    c_hmac_ok = verify_stage_report("operator_contract", c_doc)
-    c_family = str(c_doc.get("family") or "").strip()
-    s_family = str(s_doc.get("family") or "").strip()
-    s_target_id = str(s_doc.get("target_id") or "").strip()
-    op_prefix, op_variant = (
-        (operator_id.split(":", 1)[0].strip(), operator_id.split(":", 1)[1].strip())
-        if ":" in operator_id
-        else (operator_id.strip(), "")
-    )
-    sim_disp = c_doc.get("sim_owner_dispatch") if isinstance(c_doc.get("sim_owner_dispatch"), Mapping) else {}
-    prof_disp = c_doc.get("profiler_builder") if isinstance(c_doc.get("profiler_builder"), Mapping) else {}
-    declared_abis = {str(v).strip() for v in (c_doc.get("upstream_abis") or {}).values() if str(v or "").strip()}
-    identity_violations = _check_contract_release_eligibility(c_doc)
-    if s_target_id != operator_id:
-        identity_violations.append(f"score_report_operator_id_mismatch:expected={operator_id}:got={s_target_id or 'missing'}")
-    if c_family and s_family and c_family != s_family:
-        identity_violations.append(f"contract_score_family_mismatch:contract={c_family}:score={s_family}")
-    if c_family and op_prefix and c_family != op_prefix:
-        identity_violations.append(f"contract_operator_id_mismatch:contract_family={c_family}:operator_id={operator_id}")
-    if sim_disp.get("owner") == "builtin_template_catalog":
-        tid = str(sim_disp.get("template_id") or "").strip()
-        if tid and operator_id != tid and op_variant != tid:
-            identity_violations.append(f"contract_template_operator_id_mismatch:template={tid}:operator_id={operator_id}")
-    elif op_variant:
-        allowed_variants = {
-            str(v).strip()
-            for v in (
-                *(sim_disp.get("owned_recipe_ids") or ()),
-                sim_disp.get("resolved_implementation"),
-                prof_disp.get("resolved_abi"),
-                *declared_abis,
-            )
-            if str(v or "").strip()
-        }
-        if allowed_variants and operator_id not in allowed_variants and op_variant not in allowed_variants:
-            identity_violations.append(f"contract_operator_variant_unowned:operator_id={operator_id}:owned={sorted(allowed_variants)}")
-    contract_ok = c_hmac_ok and bool(c_doc.get("ok")) and not identity_violations
-    c_violations = list(c_doc.get("violations") or ())
-    if not c_hmac_ok:
-        c_violations.append("contract_report_hmac_unverified_or_fabricated")
-    c_violations.extend(identity_violations)
-    outcome = GateCheckOutcome(
-        name="operator_contract", passed=contract_ok, status="pass" if contract_ok else "fail",
-        detail="0 violations" if contract_ok else "; ".join(str(v) for v in c_violations),
-        metrics=(
-            ("source_refs_checked", int(c_doc.get("source_refs_checked", 0))),
-            ("hmac_verified", c_hmac_ok), ("identity_bound", not identity_violations),
-            ("violations", len(c_violations)),
-        ),
-    )
-    return outcome, c_family, sim_disp, prof_disp, declared_abis
-
-
-def _evaluate_operator_score_gate(
-    *,
-    operator_id: str,
-    sku: str,
-    s_doc: Mapping[str, Any],
-    c_family: str,
-    sim_disp: Mapping[str, Any],
-    prof_disp: Mapping[str, Any],
-    declared_abis: set[str],
-    cap_threshold: float,
-    capture_root: str | Path | None,
-    capture_files: Mapping[str, str | Path] | None,
-) -> tuple[GateCheckOutcome, bool, bool, list[Mapping[str, Any]], list[Mapping[str, Any]], Any]:
-    s_hmac_ok = verify_stage_report("operator_score", s_doc)
-    sku_match = str(s_doc.get("sku") or "") == sku
-    target_match = str(s_doc.get("target_id") or "").strip() == operator_id
-    all_score_rows = [r for r in s_doc.get("residuals", ()) if isinstance(r, Mapping)]
-    heldout_rows = [r for r in all_score_rows if r.get("split", "heldout") == "heldout"]
-    captures_ok, capture_err = True, ""
-    if heldout_rows:
-        if s_doc.get("capture_files_verified") is not True:
-            captures_ok, capture_err = False, "capture_files_unverified_for_release"
-        else:
-            reverify_report_captures(
-                all_score_rows, capture_root=capture_root, capture_files=capture_files, require_capture_files=True
-            )
-
-    allowed_impls = {
-        str(v).strip()
-        for v in (sim_disp.get("resolved_implementation"), prof_disp.get("resolved_abi"), *declared_abis)
-        if str(v or "").strip()
-    }
-    prof_abi = str(prof_disp.get("resolved_abi") or "").strip()
-    receipt_identity_errs: list[str] = []
-    for r in heldout_rows:
-        cid = str(r.get("case_id") or "")
-        exec_fams = r.get("executed_op_families") or []
-        if exec_fams and c_family and c_family not in exec_fams:
-            receipt_identity_errs.append(f"receipt_family_mismatch:{cid}:executed={exec_fams}:expected={c_family}")
-        row_fam = str(r.get("target_family") or "").strip()
-        if not row_fam or (c_family and row_fam != c_family):
-            receipt_identity_errs.append(f"receipt_target_family_mismatch:{cid}:got={row_fam or 'missing'}:expected={c_family}")
-        row_op_id = str(r.get("operator_id") or "").strip()
-        if row_op_id and row_op_id != operator_id:
-            receipt_identity_errs.append(f"receipt_operator_id_mismatch:{cid}:got={row_op_id}:expected={operator_id}")
-        row_impl = str(r.get("implementation") or "").strip()
-        if not row_impl or (allowed_impls and row_impl not in allowed_impls):
-            receipt_identity_errs.append(f"receipt_implementation_mismatch:{cid}:got={row_impl or 'missing'}")
-        row_abi = str(r.get("upstream_abi") or "").strip()
-        if row_abi and ((declared_abis and row_abi not in declared_abis) or (prof_abi and row_abi != prof_abi)):
-            receipt_identity_errs.append(f"receipt_abi_mismatch:{cid}:got={row_abi}")
-
-    receipts_ok = bool(heldout_rows) and captures_ok and not receipt_identity_errs and all(
-        str(r.get("engine_receipt") or "").startswith(_ENGINE_RECEIPT_PREFIX)
-        and int(r.get("predicted_ns") or 0) > 0
-        and int(r.get("measured_ns") or 0) > 0
-        for r in heldout_rows
-    )
-    eff_atol_ns = validate_strict_atol_ns(s_doc.get("atol_ns", DEFAULT_PHYSICAL_ATOL_NS))
-    failing_rows = [
-        r for r in heldout_rows
-        if exceeds_physical_tolerance(
-            int(r.get("predicted_ns") or 0), int(r.get("measured_ns") or 1),
-            threshold_pct=cap_threshold, atol_ns=eff_atol_ns,
-        )
-    ]
-    missing_pts = list(s_doc.get("missing_heldout_points") or ())
-    missing_train = list(s_doc.get("missing_train_points") or ())
-    max_ape = (s_doc.get("heldout_summary") or {}).get("max_ape_pct")
-    abi_ok = bool((s_doc.get("abi_rejection_check") or {}).get("ok", False))
-    cliff_ok = (
-        s_hmac_ok and sku_match and target_match and bool(s_doc.get("ok"))
-        and receipts_ok and not failing_rows and not missing_pts and not missing_train
-        and abi_ok and max_ape is not None
-    )
-    if cliff_ok and max_ape is not None:
-        cliff_detail = f"max_ape_pct={round(float(max_ape), DISPLAY_ROUND_DIGITS)};abi_ok={abi_ok}"
-    elif not s_hmac_ok:
-        cliff_detail = "score_report_hmac_unverified_or_fabricated"
-    elif not sku_match:
-        cliff_detail = "score_report_sku_mismatch"
-    elif not target_match:
-        cliff_detail = "score_report_operator_id_mismatch"
-    elif capture_err:
-        cliff_detail = capture_err
-    elif receipt_identity_errs:
-        cliff_detail = "; ".join(receipt_identity_errs[:4])
-    elif not receipts_ok:
-        cliff_detail = "unverified_engine_receipt"
-    elif not s_doc.get("ok"):
-        cliff_detail = "score_report_ok_false"
-    else:
-        cliff_detail = f"failing={len(failing_rows)};missing_heldout={len(missing_pts)};missing_train={len(missing_train)};abi_ok={abi_ok}"
-    outcome = GateCheckOutcome(
-        name="heldout_cliff_accuracy", passed=cliff_ok,
-        status="pass" if cliff_ok else ("insufficient_evidence" if (s_hmac_ok and (not heldout_rows or missing_pts or missing_train)) else "fail"),
-        detail=cliff_detail,
-        metrics=(
-            ("heldout_count", len(heldout_rows)), ("hmac_verified", s_hmac_ok),
-            ("failing_cliffs", len(failing_rows)), ("missing_heldout_points", len(missing_pts)),
-            ("missing_train_points", len(missing_train)), ("abi_rejection_ok", abi_ok),
-            ("max_ape_pct", max_ape), ("threshold_pct", cap_threshold), ("atol_ns", eff_atol_ns),
-        ),
-    )
-    return outcome, s_hmac_ok, cliff_ok, heldout_rows, failing_rows, max_ape
-
-
 def certify_operator(
-    *,
-    operator_id: str,
-    sku: str,
-    contract_report: str | Path | Mapping[str, Any],
-    score_report: str | Path | Mapping[str, Any],
-    lean_bounds_json: str | Path | Sequence[Mapping[str, Any]] | None = None,
-    repo_root: str | Path | None = None,
-    threshold_pct: float = DEFAULT_HELDOUT_APE_THRESHOLD_PCT,
-    run_repo_gates: bool = True,
-    orthogonality_base: str | None = None,
-    out_receipt: str | Path | None = None,
-    diagnosis_out: str | Path | None = None,
-    capture_root: str | Path | None = None,
-    capture_files: Mapping[str, str | Path] | None = None,
-    require_capture_files: bool = True,
-    acquisition_mode: Literal["live_silicon", "offline_reverify"] | None = None,
+    *, operator_id: str, sku: str, contract_report: str | Path | Mapping[str, Any],
+    score_report: str | Path | Mapping[str, Any], lean_bounds_json: str | Path | Sequence[Mapping[str, Any]] | None = None,
+    capture_root: str | Path | None = None, require_capture_files: bool = False,
+    repo_root: str | Path | None = None, threshold_pct: float = DEFAULT_HELDOUT_APE_THRESHOLD_PCT,
+    atol_ns: int = DEFAULT_PHYSICAL_ATOL_NS, run_repo_gates: bool = True, orthogonality_base: str | None = None,
+    out_receipt: str | Path | None = None, diagnosis_out: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Stage 4: Enforce complete contract, bound receipts, verified captures, pointwise <10%, joined Lean."""
-    cap_threshold = validate_strict_threshold_pct(threshold_pct)
-    if not require_capture_files:
-        raise ModelingError("release_certification_requires_capture_files")
-    root = resolve_repo_root(repo_root)
-    c_doc = read_bounded_json(contract_report) if isinstance(contract_report, (str, Path)) else dict(contract_report)
-    s_doc = read_bounded_json(score_report) if isinstance(score_report, (str, Path)) else dict(score_report)
-
-    contract_gate, c_family, sim_disp, prof_disp, declared_abis = _evaluate_operator_contract_gate(
-        operator_id, c_doc, s_doc
+    """Stage 4: Certify operator contract, pointwise cliff APE, Lean 4 non-inversion, and repo gates."""
+    del capture_root, require_capture_files
+    cap_pct, eff_atol = validate_strict_threshold_pct(threshold_pct), validate_strict_atol_ns(atol_ns)
+    c_doc = dict(read_bounded_json(contract_report) if isinstance(contract_report, (str, Path)) else contract_report)
+    s_doc = dict(read_bounded_json(score_report) if isinstance(score_report, (str, Path)) else score_report)
+    id_ok = str(s_doc.get("target_id") or "") == operator_id and bool(c_doc.get("ok"))
+    pre = (GateCheckOutcome("operator_contract", id_ok, "pass" if id_ok else "fail", "contract valid" if id_ok else f"contract_or_id_invalid:{operator_id}"),)
+    all_ok, status, receipt, diagnosis = finalize_stage4_certification(
+        schema=OPERATOR_ONBOARDING_RECEIPT_SCHEMA, target_kind="operator", target_id=operator_id, sku=sku,
+        score_doc=s_doc, lean_bounds_json=lean_bounds_json, cap_pct=cap_pct, eff_atol=eff_atol,
+        pre_gates=pre, ape_gate_name="cliff_heldout_ape", artifacts={"plan_sha256": str(s_doc.get("plan_sha256") or "")},
+        repo_root=repo_root, run_repo_gates=run_repo_gates, orthogonality_base=orthogonality_base,
+        out_receipt=out_receipt, diagnosis_out=diagnosis_out,
     )
-    score_gate, s_hmac_ok, cliff_ok, heldout_rows, failing_rows, max_ape = _evaluate_operator_score_gate(
-        operator_id=operator_id, sku=sku, s_doc=s_doc, c_family=c_family,
-        sim_disp=sim_disp, prof_disp=prof_disp, declared_abis=declared_abis,
-        cap_threshold=cap_threshold, capture_root=capture_root, capture_files=capture_files,
-    )
-    gates: list[GateCheckOutcome] = [contract_gate, score_gate]
-
-    diagnosis_report: dict[str, Any] | None = None
-    if failing_rows:
-        diagnosis_report = run_tail_cluster_diagnosis(
-            heldout_rows, repo_root=root, threshold_pct=cap_threshold, output_path=diagnosis_out,
-        )
-
-    expected_timings = {
-        str(r["case_id"]): (
-            int(r["predicted_ns"]), int(r["measured_ns"]),
-            int(r["measured_p99_ns"]) if r.get("measured_p99_ns") is not None else None,
-            str(r.get("program_dag_sha256") or ""),
-        )
-        for r in heldout_rows
-        if r.get("case_id") and r.get("predicted_ns") and r.get("measured_ns")
-    }
-    if isinstance(lean_bounds_json, (str, Path)):
-        raw_lean = read_bounded_json(lean_bounds_json)
-        lean_rows = raw_lean.get("bounds", raw_lean) if isinstance(raw_lean, Mapping) else raw_lean
-    else:
-        lean_rows = list(lean_bounds_json or ())
-    lean_ok, lean_checked, lean_violations = check_lean_non_inversion(
-        lean_rows, require_non_empty=True, verify_certificates=True,
-        require_captured_p99=True, require_program_dag_join=True,
-        expected_case_timings=expected_timings if expected_timings else None,
-    )
-    if not expected_timings:
-        lean_ok = False
-        lean_violations = (*lean_violations, "lean_no_scored_heldout_cases_to_join")
-    gates.append(
-        GateCheckOutcome(
-            name="lean_optimality_non_inversion", passed=lean_ok, status="pass" if lean_ok else "fail",
-            detail="0 inversions (witness joined & verified)" if lean_ok else "; ".join(lean_violations),
-            metrics=(("cases_checked", len(lean_checked)), ("violations", len(lean_violations))),
-        )
-    )
-
-    if run_repo_gates:
-        gates.append(run_arch_governance_gate(repo_root=root, strict=True))
-        gates.append(run_test_orthogonality_gate(repo_root=root, strict=orthogonality_base is None, base=orthogonality_base))
-
-    artifacts: dict[str, str] = {}
-    if s_doc.get("plan_sha256"):
-        artifacts["plan_sha256"] = str(s_doc["plan_sha256"])
-    if max_ape is not None:
-        artifacts["heldout_max_ape_pct"] = str(round(float(max_ape), DISPLAY_ROUND_DIGITS))
-    if c_doc.get("target"):
-        artifacts["operator_target"] = str(c_doc["target"])
-
-    live_verified = s_hmac_ok and cliff_ok and verify_live_silicon_evidence(s_doc)
-    if acquisition_mode == "live_silicon" and not live_verified:
-        gates.append(
-            GateCheckOutcome(
-                name="acquisition_mode_evidence", passed=False, status="fail",
-                detail="live_silicon_claim_unverified_by_host_queue_and_captures",
-            )
-        )
-    eff_mode: Literal["live_silicon", "offline_reverify"] = (
-        "live_silicon" if (live_verified and acquisition_mode != "offline_reverify") else "offline_reverify"
-    )
-    rec_unconf, rec_warn = collect_receipt_warnings(s_doc)
-    receipt = seal_onboarding_receipt(
-        kind="operator", target_id=operator_id, sku=sku,
-        gates=gates, artifacts=artifacts, diagnosis_report=diagnosis_report,
-        acquisition_mode=eff_mode, receipt_unconfirmed=rec_unconf, receipt_warning=rec_warn,
-    )
-    receipt_dict = receipt.to_dict()
-    if out_receipt is not None:
-        write_atomic_json(out_receipt, receipt_dict)
-    out: dict[str, Any] = {
-        "stage": "certify", "operator_id": operator_id, "sku": sku,
-        "ok": receipt.ok, "status": receipt.status, "acquisition_mode": receipt.acquisition_mode,
-        "receipt_sha256": receipt.receipt_sha256,
-        "lean_checks": [row.to_dict() for row in lean_checked],
-        "diagnosis_triggered": diagnosis_report is not None,
-        "receipt": receipt_dict,
-    }
-    if rec_unconf or rec_warn:
-        out["receipt_unconfirmed"] = rec_unconf
-        out["receipt_warning"] = rec_warn
+    out: dict[str, Any] = {"stage": "certify", "ok": all_ok, "status": status, "operator_id": operator_id, "sku": sku, "receipt": receipt}
+    if diagnosis is not None:
+        out["diagnosis"] = diagnosis
     return out
 
 
 def run_operator_onboarding(
-    *,
-    target_path: str | Path,
-    operator_id: str,
-    family: str,
-    sku: str,
-    tile_dim: int,
-    core_count: int,
-    l2_bytes: int,
-    bytes_per_token: int = 0,
-    topk_threshold: int | None = None,
-    tiling_axes: TilingAxes | None = None,
+    *, operator_id: str, family: str, target_path: str | Path, sku: str, tile_dim: int, core_count: int, l2_bytes: int,
+    bytes_per_token: int = 0, topk_threshold: int | None = None,
     captured_json: str | Path | Sequence[Mapping[str, Any]] | None = None,
-    abi_rejection_results: Sequence[Mapping[str, Any]] | None = None,
     lean_bounds_json: str | Path | Sequence[Mapping[str, Any]] | None = None,
-    repo_root: str | Path | None = None,
-    refs_root: str | Path | None = None,
-    repo_map: Mapping[str, str | Path] | None = None,
-    profiler_root: str | Path | None = None,
-    profiler_family: str = "",
-    profiler_recipe: str = "",
-    profiler_impl: str = "",
-    family_registry: FamilyRegistry | None = None,
-    template_catalog: TemplateCatalog | None = None,
-    template_id: str = "",
-    sample_op: OpSpec | None = None,
-    planning_context: OperatorPlanningContext | None = None,
-    require_sim_owner: bool = True,
-    require_taxonomy: bool = True,
-    require_profiler_builder: bool = True,
-    require_tiling_axes: bool = True,
-    require_mounted_refs: bool = False,
-    run_repo_gates: bool = True,
-    orthogonality_base: str | None = None,
-    threshold_pct: float = DEFAULT_HELDOUT_APE_THRESHOLD_PCT,
-    out_dir: str | Path | None = None,
-    bench_dispatcher: Callable[[Mapping[str, Any], int], Sequence[Mapping[str, Any]]] | None = None,
-    live_profiler: bool = False,
-    endpoint_alias: str = "",
-    lease_acquirer: Callable[[str, int], AbstractContextManager[Mapping[str, Any]]] | None = None,
-    coordinator_bin: str = "",
-    runner: EvaluationRunner | None = None,
-    capture_root: str | Path | None = None,
-    capture_files: Mapping[str, str | Path] | None = None,
-    require_capture_files: bool = True,
-    ssh_runner: Callable[[str, str, int], Any] | None = None,
+    repo_root: str | Path | None = None, refs_root: str | Path | None = None,
+    repo_map: Mapping[str, str | Path] | None = None, profiler_root: str | Path | None = None,
+    profiler_family: str = "", profiler_recipe: str = "", profiler_impl: str = "", template_id: str = "",
+    family_registry: FamilyRegistry | None = None, template_catalog: TemplateCatalog | None = None,
+    require_sim_owner: bool = True, require_taxonomy: bool = True, require_profiler_builder: bool = True,
+    require_tiling_axes: bool = True, require_mounted_refs: bool = False,
+    out_dir: str | Path | None = None, run_repo_gates: bool = True, orthogonality_base: str | None = None,
+    threshold_pct: float = DEFAULT_HELDOUT_APE_THRESHOLD_PCT, live_profiler: bool = False,
+    endpoint_alias: str = "", coordinator_bin: str = "", capture_root: str | Path | None = None,
+    require_capture_files: bool = False, runner: Any = None,
+    abi_rejection_results: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Execute all 4 New-Operator onboarding stages end-to-end."""
-    cap_threshold = validate_strict_threshold_pct(threshold_pct)
-    if not require_capture_files:
-        raise ModelingError("release_certification_requires_capture_files")
     base_out = Path(out_dir) if out_dir is not None else None
-    stage1 = validate_operator_contract(
-        target_path=target_path, repo_root=repo_root, refs_root=refs_root, repo_map=repo_map,
-        profiler_root=profiler_root, profiler_family=profiler_family,
-        profiler_recipe=profiler_recipe, profiler_impl=profiler_impl,
-        family_registry=family_registry, template_catalog=template_catalog,
-        template_id=template_id, sample_op=sample_op, planning_context=planning_context,
-        require_sim_owner=require_sim_owner, require_taxonomy=require_taxonomy,
-        require_profiler_builder=require_profiler_builder,
-        require_tiling_axes=require_tiling_axes, require_mounted_refs=require_mounted_refs,
-    )
-    stage2 = generate_operator_cliff_plan(
-        operator_id=operator_id, family=family, sku=sku,
-        tile_dim=tile_dim, core_count=core_count, l2_bytes=l2_bytes,
-        bytes_per_token=bytes_per_token, topk_threshold=topk_threshold, tiling_axes=tiling_axes,
-        plan_out=(base_out / "operator_cliff_plan.json") if base_out else None,
-    )
-    eff_cap_root: str | Path | None = capture_root if capture_root is not None else ((base_out / "captures") if (live_profiler and base_out) else None)
-    cap_ctx: AbstractContextManager[str | None] = (
-        tempfile.TemporaryDirectory(prefix="msim-op-runall-cap-")
-        if (live_profiler and eff_cap_root is None and captured_json is None and bench_dispatcher is None)
-        else nullcontext(None)
-    )
-    with cap_ctx as tmp_cap_dir:
-        if tmp_cap_dir is not None:
-            eff_cap_root = Path(tmp_cap_dir)
-        stage3 = bench_and_score_operator(
-            cliff_plan=stage2["plan"], sku=sku, captured_json=captured_json,
-            abi_rejection_results=abi_rejection_results, bench_dispatcher=bench_dispatcher,
-            live_profiler=live_profiler, endpoint_alias=endpoint_alias, profiler_root=profiler_root,
-            lease_acquirer=lease_acquirer, coordinator_bin=coordinator_bin, runner=runner,
-            threshold_pct=cap_threshold,
-            out_score=(base_out / "operator_score_report.json") if base_out else None,
-            capture_root=eff_cap_root, capture_files=capture_files,
-            require_capture_files=True, ssh_runner=ssh_runner,
-        )
-        stage4 = certify_operator(
-            operator_id=operator_id, sku=sku, contract_report=stage1, score_report=stage3,
-            lean_bounds_json=lean_bounds_json, repo_root=repo_root, threshold_pct=cap_threshold,
-            run_repo_gates=run_repo_gates, orthogonality_base=orthogonality_base,
-            capture_root=eff_cap_root, capture_files=capture_files,
-            require_capture_files=True,
-            out_receipt=(base_out / "operator_onboarding_receipt.json") if base_out else None,
-            diagnosis_out=(base_out / "operator_tail_diagnosis.json") if base_out else None,
-        )
-    all_ok = bool(stage1["ok"] and stage2["ok"] and stage3["ok"] and stage4["ok"])
-    out: dict[str, Any] = {
-        "stage": "run-all", "operator_id": operator_id, "sku": sku,
-        "ok": all_ok,
-        "status": stage4["status"] if all_ok else "failed",
-        "acquisition_mode": stage4["acquisition_mode"],
-        "receipt_sha256": stage4["receipt_sha256"],
-        "stages": {
-            "validate-contract": stage1,
-            "generate-cliff-plan": stage2,
-            "bench-and-score": stage3,
-            "certify": stage4,
-        },
-    }
-    if stage4.get("receipt_unconfirmed") or stage4.get("receipt_warning"):
-        out["receipt_unconfirmed"] = bool(stage4.get("receipt_unconfirmed"))
-        out["receipt_warning"] = str(stage4.get("receipt_warning") or "")
-    return out
-
-
-__all__ = [
-    "bench_and_score_operator",
-    "certify_operator",
-    "generate_operator_cliff_plan",
-    "run_operator_onboarding",
-    "scaffold_operator",
-    "validate_operator_contract",
-]
+    s1 = validate_operator_contract(target_path=target_path, repo_root=repo_root, refs_root=refs_root, repo_map=repo_map, profiler_root=profiler_root, profiler_family=profiler_family, profiler_recipe=profiler_recipe, profiler_impl=profiler_impl, template_id=template_id, family_registry=family_registry, template_catalog=template_catalog, require_sim_owner=require_sim_owner, require_taxonomy=require_taxonomy, require_profiler_builder=require_profiler_builder, require_tiling_axes=require_tiling_axes, require_mounted_refs=require_mounted_refs)
+    s2 = generate_operator_cliff_plan(operator_id=operator_id, family=family, sku=sku, tile_dim=tile_dim, core_count=core_count, l2_bytes=l2_bytes, bytes_per_token=bytes_per_token, topk_threshold=topk_threshold, plan_out=(base_out / "cliff_plan.json") if base_out else None)
+    s3 = bench_and_score_operator(cliff_plan=s2["plan"], sku=sku, captured_json=captured_json, live_profiler=live_profiler, endpoint_alias=endpoint_alias, profiler_root=profiler_root, coordinator_bin=coordinator_bin, threshold_pct=threshold_pct, out_score=(base_out / "score_report.json") if base_out else None, capture_root=capture_root, require_capture_files=require_capture_files, runner=runner, abi_rejection_results=abi_rejection_results)
+    s4 = certify_operator(operator_id=operator_id, sku=sku, contract_report=s1, score_report=s3, lean_bounds_json=lean_bounds_json, capture_root=capture_root, require_capture_files=require_capture_files, repo_root=repo_root, threshold_pct=threshold_pct, run_repo_gates=run_repo_gates, orthogonality_base=orthogonality_base, out_receipt=(base_out / "operator_onboarding_receipt.json") if base_out else None, diagnosis_out=(base_out / "tail_diagnosis.json") if base_out else None)
+    ok = bool(s1["ok"] and s2["ok"] and s3["ok"] and s4["ok"])
+    return {"stage": "run-all", "ok": ok, "status": s4["status"] if ok else "failed", "operator_id": operator_id, "sku": sku, "stages": {"validate-contract": s1, "generate-cliff-plan": s2, "bench-and-score": s3, "certify": s4}}

@@ -42,7 +42,6 @@ from .onboarding import (
     validate_operator_contract,
     verify_sku_gates,
 )
-from .onboarding._lean_and_receipts import use_stage_key_file
 from .onboarding.contracts import read_bounded_json
 
 ONBOARDING_COMMANDS = frozenset({"onboard-sku", "onboard-operator"})
@@ -124,7 +123,6 @@ def _configure_sku_stages(parser: argparse.ArgumentParser) -> None:
     p3.add_argument("--endpoint-alias", default="")
     p3.add_argument("--profiler-root", default=None)
     p3.add_argument("--coordinator-bin", default="")
-    p3.add_argument("--stage-key-file", default=None)
     p3.add_argument("--output", "-o", default=None)
 
     p4 = stages.add_parser("verify-gates", help="verify pointwise multilevel, witnessed Lean, governance, orthogonality")
@@ -142,7 +140,6 @@ def _configure_sku_stages(parser: argparse.ArgumentParser) -> None:
     p4.add_argument("--orthogonality-base", default=None)
     p4.add_argument("--out-receipt", default=None)
     p4.add_argument("--diagnosis-out", default=None)
-    p4.add_argument("--stage-key-file", default=None)
     p4.add_argument("--output", "-o", default=None)
 
     pa = stages.add_parser("run-all", help="execute all 4 SKU onboarding stages end-to-end")
@@ -200,7 +197,6 @@ def _configure_operator_stages(parser: argparse.ArgumentParser) -> None:
     p1b.add_argument("--no-require-profiler-builder", dest="require_profiler_builder", action="store_false")
     p1b.add_argument("--no-require-tiling-axes", dest="require_tiling_axes", action="store_false")
     p1b.add_argument("--require-mounted-refs", action="store_true")
-    p1b.add_argument("--stage-key-file", default=None)
     p1b.add_argument("--output", "-o", default=None)
 
     p2 = stages.add_parser("generate-cliff-plan", help="synthesize disjoint 2D cliff + ABI-rejection plan")
@@ -229,7 +225,6 @@ def _configure_operator_stages(parser: argparse.ArgumentParser) -> None:
     p3.add_argument("--threshold-pct", type=float, default=DEFAULT_HELDOUT_APE_THRESHOLD_PCT)
     p3.add_argument("--out-score", default=None)
     p3.add_argument("--capture-root", default=None)
-    p3.add_argument("--stage-key-file", default=None)
     p3.add_argument("--output", "-o", default=None)
 
     p4 = stages.add_parser("certify", help="certify pointwise <10%% cliff APE, witnessed Lean, strict gates")
@@ -245,7 +240,6 @@ def _configure_operator_stages(parser: argparse.ArgumentParser) -> None:
     p4.add_argument("--orthogonality-base", default=None)
     p4.add_argument("--out-receipt", default=None)
     p4.add_argument("--diagnosis-out", default=None)
-    p4.add_argument("--stage-key-file", default=None)
     p4.add_argument("--output", "-o", default=None)
 
     pa = stages.add_parser("run-all", help="execute all 4 operator onboarding stages end-to-end")
@@ -348,7 +342,7 @@ def _run_sku_stage(args: argparse.Namespace) -> dict[str, Any]:
             profiler_root=args.profiler_root,
             coordinator_bin=args.coordinator_bin,
             capture_root=args.capture_root,
-            require_capture_files=True,
+            require_capture_files=bool(args.capture_root),
         )
     if stage == "verify-gates":
         return verify_sku_gates(
@@ -360,7 +354,7 @@ def _run_sku_stage(args: argparse.Namespace) -> dict[str, Any]:
             primitives_json=args.primitives_json,
             expected_cann_version=args.expected_cann_version,
             capture_root=args.capture_root,
-            require_capture_files=True,
+            require_capture_files=bool(args.capture_root),
             repo_root=args.repo_root,
             threshold_pct=args.threshold_pct,
             run_repo_gates=not bool(args.skip_repo_gates),
@@ -390,7 +384,7 @@ def _run_sku_stage(args: argparse.Namespace) -> dict[str, Any]:
             profiler_root=args.profiler_root,
             coordinator_bin=args.coordinator_bin,
             capture_root=args.capture_root,
-            require_capture_files=True,
+            require_capture_files=bool(args.capture_root),
         )
     raise ValueError(f"unknown_sku_stage:{stage}")
 
@@ -456,7 +450,7 @@ def _run_operator_stage(args: argparse.Namespace) -> dict[str, Any]:
             threshold_pct=args.threshold_pct,
             out_score=args.out_score,
             capture_root=args.capture_root,
-            require_capture_files=True,
+            require_capture_files=bool(args.capture_root),
         )
     if stage == "certify":
         return certify_operator(
@@ -466,7 +460,7 @@ def _run_operator_stage(args: argparse.Namespace) -> dict[str, Any]:
             score_report=args.score_report_json,
             lean_bounds_json=args.lean_bounds_json,
             capture_root=args.capture_root,
-            require_capture_files=True,
+            require_capture_files=bool(args.capture_root),
             repo_root=args.repo_root,
             threshold_pct=args.threshold_pct,
             run_repo_gates=not bool(args.skip_repo_gates),
@@ -509,20 +503,17 @@ def _run_operator_stage(args: argparse.Namespace) -> dict[str, Any]:
             endpoint_alias=args.endpoint_alias,
             coordinator_bin=args.coordinator_bin,
             capture_root=args.capture_root,
-            require_capture_files=True,
+            require_capture_files=bool(args.capture_root),
         )
     raise ValueError(f"unknown_operator_stage:{stage}")
 
 
 def run_onboarding_command(args: argparse.Namespace) -> dict[str, Any]:
     """Execute ``onboard-sku`` or ``onboard-operator`` from the main CLI."""
-    stage_key_file = getattr(args, "stage_key_file", None)
-    create_key = getattr(args, "stage", "") in {"validate-512-400k", "validate-contract", "bench-and-score"}
-    with use_stage_key_file(stage_key_file, create_if_missing=create_key):
-        if args.command == "onboard-sku":
-            return _run_sku_stage(args)
-        if args.command == "onboard-operator":
-            return _run_operator_stage(args)
+    if args.command == "onboard-sku":
+        return _run_sku_stage(args)
+    if args.command == "onboard-operator":
+        return _run_operator_stage(args)
     raise ValueError(f"not_an_onboarding_command:{args.command}")
 
 
