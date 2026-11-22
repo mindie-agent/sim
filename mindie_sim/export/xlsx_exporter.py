@@ -186,11 +186,14 @@ SUM_KPI_LSTAR_ROW = 19
 SUM_KPI_ATTAIN_ROW = 20
 SUM_KPI_UTIL_START_ROW = 21
 SUM_KPI_AMORTIZED_ROW = 25
-SUM_KPI_WALL_ROW = 26
+SUM_KPI_NTOK_ROW = 26
+SUM_KPI_WALL_ROW = 27
 SUM_KPI_NOTE_START_COL = 8
-SUM_B3_BANNER_ROW = 28
-SUM_B3_HDR_ROW = 29
-SUM_B3_DATA_START_ROW = 30
+SUM_B3_BANNER_ROW = 29
+SUM_B3_HDR_ROW = 30
+SUM_B3_DATA_START_ROW = 31
+SUM_BEF_NTOK_REF = f"{SHEET_SUMMARY}!$B${SUM_KPI_NTOK_ROW}"
+SUM_AFT_NTOK_REF = f"{SHEET_SUMMARY}!$C${SUM_KPI_NTOK_ROW}"
 SUM_B4_TRACK_END = 2
 SUM_B4_TITLE_START = 3
 SUM_B4_TITLE_END = 4
@@ -285,13 +288,15 @@ MEM_CTL_CONC_REF = "$T$18"
 MEM_CTL_LOCAL_TOK_REF = "$T$21"
 MEM_CTL_USABLE_HBM_REF = "$T$24"
 
-#: Sheet 4 (Pending_Kernel_Details) structural layout constants (12 columns A..L).
-PENDING_COLS = 12
+#: Sheet 4 (Pending_Kernel_Details) structural layout constants (14 columns A..N).
+PENDING_COLS = 14
 PENDING_HEADER_ROW = 3
 PENDING_DATA_START_ROW = 4
 PENDING_COL_GAIN = 7
 PENDING_COL_GAIN_UPT = 11
 PENDING_COL_BINDING = 12
+PENDING_COL_BEF_MS = 13
+PENDING_COL_AFT_MS = 14
 PENDING_LABEL_MERGE_END = 6
 PENDING_CARD_SPACER_GAP = 4
 PENDING_CARD_STRIDE = 11
@@ -340,7 +345,7 @@ MEMORY_COL_WIDTHS = (
     16.0, 24.0, 11.0, 11.0, 16.0, 11.0, 11.0, 11.0, 19.0, 13.0, 14.0, 13.0,
     12.0, 15.0, 16.0, 28.0, 3.5, 3.5, 28.0, 26.0, 11.0, 10.0, 10.0, 11.0,
 )
-PENDING_COL_WIDTHS = (9.0, 24.0, 30.0, 26.0, 28.0, 24.0, 15.0, 22.0, 24.0, 22.0, 16.0, 26.0)
+PENDING_COL_WIDTHS = (9.0, 24.0, 30.0, 26.0, 28.0, 24.0, 15.0, 22.0, 24.0, 22.0, 16.0, 26.0, 14.0, 14.0)
 MEAS_COL_WIDTHS = (
     28.0, 22.0, 24.0, 24.0, 24.0, 28.0, 12.0, 14.0, 14.0, 28.0, 14.0, 14.0, 12.0, 20.0,
 )
@@ -553,7 +558,21 @@ def _populate_summary_deployment_block(
     step_budget = sla_target * ref.avg_accepted_tokens if is_decode else sla_target
     budget_formula = f"=B{SUM_ROW_SLA}*B{SUM_ROW_SPEC}" if is_decode else f"=B{SUM_ROW_SLA}"
     budget_detail = f"= TPOT SLA (B{SUM_ROW_SLA}) × Avg Accepted (B{SUM_ROW_SPEC})" if is_decode else f"= TTFT SLA (B{SUM_ROW_SLA})"
-    cluster_conc = mem.concurrency * mem.dp
+    eff_cluster_conc = (
+        int(ref.cluster_concurrency)
+        if int(getattr(ref, "cluster_concurrency", 0) or 0) > 0
+        else (mem.concurrency * mem.dp)
+    )
+    cluster_conc_formula: str | None = (
+        f"=G{SUM_ROW_MODE}*{mem.dp}" if eff_cluster_conc == mem.concurrency * mem.dp else None
+    )
+    pd_pool = ref.pd_pool_summary if isinstance(ref.pd_pool_summary, Mapping) else None
+    dies_detail = f"DP={mem.dp} × TP={mem.tp} × PP={mem.pp} (PCP={mem.pcp})"
+    if pd_pool:
+        p_inst = int(pd_pool.get("prefill_instances", 0) or 0)
+        d_inst = int(pd_pool.get("decode_instances", 0) or 0)
+        used_d = int(pd_pool.get("used_dies", ref.deployment_total_dies or mem.total_dies) or mem.total_dies)
+        dies_detail = f"{dies_detail} | PD Cluster={used_d} dies ({p_inst}P + {d_inst}D)"
     weight_gib = mem.weight_footprint_per_die_bytes / float(GIB_BYTES)
     native_gib = mem.native_bf16_weight_footprint_per_die_bytes / float(GIB_BYTES)
     offload_note = (
@@ -572,7 +591,7 @@ def _populate_summary_deployment_block(
     rows: tuple[tuple[int, str, Any, str | None, int, str, str, Any, str | None, int, str], ...] = (
         (
             SUM_ROW_MODEL, "模型与总层数 (Model & Total Layers)", ref.model_name, None, STYLE_MERGED, layers_txt,
-            "总卡数 (Total Dies)", mem.total_dies, None, STYLE_INT, f"DP={mem.dp} × TP={mem.tp} × PP={mem.pp} (PCP={mem.pcp})",
+            "总卡数 (Total Dies)", mem.total_dies, None, STYLE_INT, dies_detail,
         ),
         (
             SUM_ROW_HW, "硬件 SKU & 超节点拓扑 (Hardware / Topo)", ref.hardware_sku, None, STYLE_TEXT, f"{topo_txt} | {ref.hardware_die_summary}",
@@ -585,7 +604,7 @@ def _populate_summary_deployment_block(
         ),
         (
             SUM_ROW_LEN, "业务输入/输出长度 (Prompt / Output)", f"{ref.prompt_tokens} / {ref.output_tokens}", None, STYLE_TEXT, f"Context={ref.context_tokens} tok, Output={ref.output_tokens} tok, SeqLen={mem.seq_len}",
-            "集群总并发 (Cluster Total Concurrency)", cluster_conc, f"=G{SUM_ROW_MODE}*{mem.dp}", STYLE_KPI_HIGHLIGHT, f"= Active Concurrency/DP (G{SUM_ROW_MODE}) × DP ({mem.dp})",
+            "集群总并发 (Cluster Total Concurrency)", eff_cluster_conc, cluster_conc_formula, STYLE_KPI_HIGHLIGHT, f"= Active Concurrency/DP (G{SUM_ROW_MODE}) × DP ({mem.dp})",
         ),
         (
             SUM_ROW_SLA, "SLA 约束 (SLA Target ms)", sla_target, None, STYLE_FLOAT2, sla_detail,
@@ -645,8 +664,10 @@ def _populate_summary_kpi_block(
     a_step = after.step_span_us / US_PER_MS
     b_acc = max(1.0, bundle.avg_accepted_tokens)
     acc = max(1.0, after.avg_accepted_tokens)
-    b_tpot = (b_step / b_acc) if is_decode else b_step
-    a_tpot = (a_step / acc) if is_decode else a_step
+    b_handoff = float(getattr(bundle, "handoff_tpot_ms", 0.0) or 0.0) if is_decode else 0.0
+    a_handoff = float(getattr(after, "handoff_tpot_ms", 0.0) or 0.0) if is_decode else 0.0
+    b_tpot = ((b_step / b_acc) + b_handoff) if is_decode else b_step
+    a_tpot = ((a_step / acc) + a_handoff) if is_decode else a_step
     sla = after.tpot_slo_ms if is_decode else after.ttft_slo_ms
     b_pass = b_tpot <= sla
     a_pass = a_tpot <= sla
@@ -659,25 +680,39 @@ def _populate_summary_kpi_block(
     b_att = (b_lstar / b_step) if b_step > 0.0 else 0.0
     a_att = (a_lstar / a_step) if a_step > 0.0 else 0.0
     a_gap_ratio = (a_step / a_lstar) if a_lstar > 0.0 else 0.0
+    b_cluster_conc = (
+        int(bundle.cluster_concurrency)
+        if int(getattr(bundle, "cluster_concurrency", 0) or 0) > 0
+        else max(1, bundle.memory_ledger.concurrency * bundle.memory_ledger.dp)
+    )
+    a_cluster_conc = (
+        int(after.cluster_concurrency)
+        if int(getattr(after, "cluster_concurrency", 0) or 0) > 0
+        else max(1, after.memory_ledger.concurrency * after.memory_ledger.dp)
+    )
     same_deploy = (
         bundle.memory_ledger.total_dies == after.memory_ledger.total_dies
-        and (bundle.memory_ledger.concurrency * bundle.memory_ledger.dp) == (after.memory_ledger.concurrency * after.memory_ledger.dp)
+        and b_cluster_conc == a_cluster_conc
         and abs(b_acc - acc) <= MIN_DENOM_EPS
     )
     b_dies = max(1, bundle.memory_ledger.total_dies)
-    b_cluster_conc = max(1, bundle.memory_ledger.concurrency * bundle.memory_ledger.dp)
 
     r_step, r_tpot, r_sla = SUM_KPI_STEP_ROW, SUM_KPI_TPOT_ROW, SUM_KPI_SLA_ROW
     r_dtps, r_ctps, r_ls, r_att = SUM_KPI_DIE_TPS_ROW, SUM_KPI_CLUSTER_TPS_ROW, SUM_KPI_LSTAR_ROW, SUM_KPI_ATTAIN_ROW
+    b_hf_suffix = f"+{b_handoff!r}" if b_handoff > 0.0 else ""
+    a_hf_suffix = f"+{a_handoff!r}" if a_handoff > 0.0 else ""
     tpot_b_f = (
-        f"=IF($B${SUM_ROW_SPEC}>0,B{r_step}/$B${SUM_ROW_SPEC},B{r_step})"
-        if (is_decode and same_deploy) else (f"=B{r_step}/{b_acc:.6f}" if is_decode else f"=B{r_step}")
+        f"=IF($B${SUM_ROW_SPEC}>0,B{r_step}/$B${SUM_ROW_SPEC},B{r_step}){b_hf_suffix}"
+        if (is_decode and same_deploy) else (f"=B{r_step}/{b_acc!r}{b_hf_suffix}" if is_decode else f"=B{r_step}")
     )
-    tpot_a_f = f"=IF($B${SUM_ROW_SPEC}>0,C{r_step}/$B${SUM_ROW_SPEC},C{r_step})" if is_decode else f"=C{r_step}"
+    tpot_a_f = (
+        f"=IF($B${SUM_ROW_SPEC}>0,C{r_step}/$B${SUM_ROW_SPEC},C{r_step}){a_hf_suffix}"
+        if is_decode else f"=C{r_step}"
+    )
     dtps_b_f = f"=IF($G${SUM_ROW_MODEL}>0,B{r_ctps}/$G${SUM_ROW_MODEL},0)" if same_deploy else f"=B{r_ctps}/{b_dies}"
     ctps_b_f = (
         f"=IF(B{r_step}>0,$G${SUM_ROW_LEN}*$B${SUM_ROW_SPEC}*1000/B{r_step},0)"
-        if same_deploy else f"=IF(B{r_step}>0,{b_cluster_conc}*{b_acc:.6f}*1000/B{r_step},0)"
+        if same_deploy else f"=IF(B{r_step}>0,{b_cluster_conc}*{b_acc!r}*1000/B{r_step},0)"
     )
     kpi_specs: list[tuple[int, str, Any, str | None, int, Any, str | None, int, Any, str | None, int, Any, str | None, int, Any, str | None, int, str, str]] = [
         (
@@ -791,6 +826,33 @@ def _write_summary_util_and_wall_rows(
         ("= 10^6 / Single-Die TPS = Exposed_us / N_tok_per_die（与 Sheet 2 / Sheet 4 摊薄列线性守恒）", None, STYLE_TEXT_WRAP),
     ))
     ws.merge_range(r_upt, SUM_KPI_NOTE_START_COL, r_upt, SUMMARY_COLS)
+
+    r_ntok = SUM_KPI_NTOK_ROW
+    b_ntok = float(bundle.n_tok_per_die)
+    a_ntok = float(after.n_tok_per_die)
+    a_mem = after.memory_ledger
+    b_mem = bundle.memory_ledger
+    a_expected_ntok = float(max(1, a_mem.concurrency * a_mem.dp)) * max(1.0, float(after.avg_accepted_tokens)) / float(max(1, a_mem.total_dies))
+    b_expected_ntok = float(max(1, b_mem.concurrency * b_mem.dp)) * max(1.0, float(bundle.avg_accepted_tokens)) / float(max(1, b_mem.total_dies))
+    same_deploy = (
+        b_mem.total_dies == a_mem.total_dies
+        and (b_mem.concurrency * b_mem.dp) == (a_mem.concurrency * a_mem.dp)
+        and abs(float(bundle.avg_accepted_tokens) - float(after.avg_accepted_tokens)) <= MIN_DENOM_EPS
+    )
+    a_ntok_matches = abs(a_ntok - a_expected_ntok) <= MIN_DENOM_EPS * max(1.0, abs(a_expected_ntok))
+    b_ntok_matches = same_deploy and abs(b_ntok - b_expected_ntok) <= MIN_DENOM_EPS * max(1.0, abs(b_expected_ntok))
+    ntok_deploy_f = f"=IF($G${SUM_ROW_MODEL}>0,$G${SUM_ROW_LEN}*$B${SUM_ROW_SPEC}/$G${SUM_ROW_MODEL},0)"
+    _write_row(ws, r_ntok, (
+        ("单卡单步有效 Token 数 (N_tok_per_die)", None, STYLE_TEXT),
+        (b_ntok, ntok_deploy_f if b_ntok_matches else None, STYLE_FLOAT3),
+        (a_ntok, ntok_deploy_f if a_ntok_matches else None, STYLE_FLOAT3),
+        (a_ntok - b_ntok, f"=C{r_ntok}-B{r_ntok}", STYLE_FLOAT3),
+        ((a_ntok - b_ntok) / b_ntok if b_ntok > 0.0 else 0.0, f"=IF(B{r_ntok}>0,(C{r_ntok}-B{r_ntok})/B{r_ntok},0)", STYLE_PCT),
+        (a_ntok / b_ntok if b_ntok > 0.0 else 0.0, f"=IF(B{r_ntok}>0,C{r_ntok}/B{r_ntok},0)", STYLE_RATIO),
+        ("tok/die", None, STYLE_TEXT),
+        ("= Cluster_Concurrency × Avg_Accepted / Total_Dies（供 Sheet 2 / Sheet 4 全精度摊薄公式直接引用）", None, STYLE_TEXT_WRAP),
+    ))
+    ws.merge_range(r_ntok, SUM_KPI_NOTE_START_COL, r_ntok, SUMMARY_COLS)
 
     wall = after.macro_wall_trigger
     wall_kind = wall.wall_kind if wall is not None else "BALANCED"
@@ -1028,7 +1090,7 @@ def _populate_comparison_breakdown_sheet(
     after_bundle: ExportBundle,
     aligned_rows: Sequence[AlignedComparisonRow],
     agent_designs: Mapping[str, Any] | None,
-) -> None:
+) -> dict[int, tuple[int, int]]:
     """Populate Sheet 2 with strict topological order, up-front Stream&Masking, trailing Source Ref."""
     _apply_col_widths(ws, CMP_COL_WIDTHS)
     ws.freeze_panes(CMP_FREEZE_ROWS, CMP_FREEZE_COLS)
@@ -1058,13 +1120,14 @@ def _populate_comparison_breakdown_sheet(
 
     b_ntok = max(float(before_bundle.n_tok_per_die or 1.0), MIN_DENOM_EPS)
     a_ntok = max(float(after_bundle.n_tok_per_die or 1.0), MIN_DENOM_EPS)
-    by_arch: list[tuple[str, str, int, list[AlignedComparisonRow]]] = []
-    for item in aligned_rows:
+    by_arch: list[tuple[str, str, int, list[tuple[int, AlignedComparisonRow]]]] = []
+    for row_idx, item in enumerate(aligned_rows):
         if not by_arch or by_arch[-1][0] != item.archetype_id:
             by_arch.append((item.archetype_id, item.archetype_title, item.repeat_count, []))
-        by_arch[-1][3].append(item)
+        by_arch[-1][3].append((row_idx, item))
 
     row_cursor = CMP_DATA_START_ROW
+    row_spans: dict[int, tuple[int, int]] = {}
     subtotal_rows: list[int] = []
     tot_bef_ms = tot_aft_ms = tot_lstar_ms = 0.0
     tot_bef_upt = tot_aft_upt = 0.0
@@ -1073,13 +1136,14 @@ def _populate_comparison_breakdown_sheet(
         sub_spans: list[tuple[str, int, int]] = []
         arch_bef_ms = arch_aft_ms = arch_lstar_ms = 0.0
         arch_bef_upt = arch_aft_upt = 0.0
-        for item in arch_items:
+        for row_idx, item in arch_items:
             row_count = max(1, len(item.before_ops), len(item.after_ops))
             r_start = row_cursor
             r_end = row_cursor + row_count - 1
             b_ms, a_ms, l_ms, b_u, a_u = _write_comparison_group(
                 ws, r_start, r_end, item, agent_designs, b_ntok, a_ntok,
             )
+            row_spans[row_idx] = (r_start, r_end)
             arch_bef_ms += b_ms
             arch_aft_ms += a_ms
             arch_lstar_ms += l_ms
@@ -1108,13 +1172,16 @@ def _populate_comparison_breakdown_sheet(
     _write_comparison_grand_total(
         ws, row_cursor, subtotal_rows, tot_bef_ms, tot_aft_ms, tot_lstar_ms, tot_bef_upt, tot_aft_upt,
     )
+    return row_spans
 
 
 def _write_cmp_before_sides(
     ws: Worksheet, r_start: int, row_count: int, item: AlignedComparisonRow,
-    rep: int, b_ntok: float,
+    rep: int, b_ntok: float, *, b_rep: int | None = None,
 ) -> tuple[float, float]:
     """Populate Before columns (B, D..K, W, X) across ``row_count`` rows."""
+    eff_b_rep = int(b_rep) if b_rep is not None else rep
+    same_rep = (eff_b_rep == rep)
     before_ms_sum = 0.0
     before_upt_sum = 0.0
     a_primary = item.after_ops[0] if item.after_ops else None
@@ -1122,10 +1189,12 @@ def _write_cmp_before_sides(
         r = r_start + offset
         ws.set_row_height(r, WRAP_ROW_HEIGHT_PT)
         ws.set_cell(r, CMP_COL_REP, rep, style=STYLE_INT)
+        ms_formula = f"=I{r}*B{r}/1000" if same_rep else f"=I{r}*{eff_b_rep}/1000"
+        upt_formula = f"=IF({SUM_BEF_NTOK_REF}>0,J{r}*1000/{SUM_BEF_NTOK_REF},0)"
         if offset < len(item.before_ops):
             b_op = item.before_ops[offset]
             b_exp_us = 0.0 if b_op.is_overlapped else b_op.exposed_dur_us
-            b_ms = b_exp_us * rep / US_PER_MS
+            b_ms = b_exp_us * eff_b_rep / US_PER_MS
             b_upt = b_ms * US_PER_MS / b_ntok
             before_ms_sum += b_ms
             before_upt_sum += b_upt
@@ -1138,11 +1207,11 @@ def _write_cmp_before_sides(
                 (_kernel_with_backend(b_op), None, STYLE_TEXT_WRAP),
                 (b_op.dur_us, None, STYLE_FLOAT3),
                 (b_exp_us, None, STYLE_FLOAT3),
-                (b_ms, f"=I{r}*B{r}/1000", STYLE_FLOAT3),
+                (b_ms, ms_formula, STYLE_FLOAT3),
                 (b_op.bound_display, None, STYLE_OVERLAP if b_op.is_overlapped else STYLE_TEXT),
             ), start_col=CMP_COL_ROLE)
             ws.set_cell(r, CMP_COL_SOURCE_REF, b_op.source_ref or "-", style=STYLE_MUTED_TEXT)
-            ws.set_cell(r, CMP_COL_BEF_UPT, b_upt, formula=f"=J{r}*1000/{b_ntok:.6f}", style=STYLE_FLOAT2)
+            ws.set_cell(r, CMP_COL_BEF_UPT, b_upt, formula=upt_formula, style=STYLE_FLOAT2)
         else:
             ref_a = item.after_ops[offset] if offset < len(item.after_ops) else a_primary
             assert ref_a is not None
@@ -1155,27 +1224,30 @@ def _write_cmp_before_sides(
                 (placeholder, None, STYLE_TEXT),
                 (0.0, None, STYLE_FLOAT3),
                 (0.0, None, STYLE_FLOAT3),
-                (0.0, f"=I{r}*B{r}/1000", STYLE_FLOAT3),
+                (0.0, ms_formula, STYLE_FLOAT3),
                 ("-", None, STYLE_TEXT),
             ), start_col=CMP_COL_ROLE)
             ws.set_cell(r, CMP_COL_SOURCE_REF, ref_a.source_ref or "-", style=STYLE_MUTED_TEXT)
-            ws.set_cell(r, CMP_COL_BEF_UPT, 0.0, formula=f"=J{r}*1000/{b_ntok:.6f}", style=STYLE_FLOAT2)
+            ws.set_cell(r, CMP_COL_BEF_UPT, 0.0, formula=upt_formula, style=STYLE_FLOAT2)
     return before_ms_sum, before_upt_sum
 
 
 def _write_cmp_after_cluster(
     ws: Worksheet, r_start: int, r_end: int, item: AlignedComparisonRow,
     rep: int, before_ms_sum: float, before_upt_sum: float, a_ntok: float,
+    *, a_rep: int | None = None,
 ) -> tuple[float, float, float]:
     """Populate After columns for M->N (len(after_ops) >= 2) re-association clusters."""
+    eff_a_rep = int(a_rep) if a_rep is not None else rep
+    same_rep = (eff_a_rep == rep)
     aft_ms_sum = lstar_ms_sum = aft_upt_sum = 0.0
     for offset in range(r_end - r_start + 1):
         r = r_start + offset
         if offset < len(item.after_ops):
             a_op = item.after_ops[offset]
             a_exp_us = 0.0 if a_op.is_overlapped else a_op.exposed_dur_us
-            a_ms = a_exp_us * rep / US_PER_MS
-            l_ms = 0.0 if a_op.is_overlapped else (a_op.l_star_lean_us * rep / US_PER_MS)
+            a_ms = a_exp_us * eff_a_rep / US_PER_MS
+            l_ms = 0.0 if a_op.is_overlapped else (a_op.l_star_lean_us * eff_a_rep / US_PER_MS)
             a_upt = a_ms * US_PER_MS / a_ntok
             aft_ms_sum += a_ms
             lstar_ms_sum += l_ms
@@ -1188,10 +1260,10 @@ def _write_cmp_after_cluster(
             ws.set_cell(r, CMP_COL_STATUS, a_op.kernel_status, style=st_style)
             ws.set_cell(r, CMP_COL_AFT_RAW_US, a_op.dur_us, style=STYLE_FLOAT3)
             ws.set_cell(r, CMP_COL_AFT_EXP_US, a_exp_us, style=STYLE_FLOAT3)
-            ws.set_cell(r, CMP_COL_AFT_EXP_MS, a_ms, formula=f"=O{r}*B{r}/1000", style=STYLE_FLOAT3)
+            ws.set_cell(r, CMP_COL_AFT_EXP_MS, a_ms, formula=f"=O{r}*B{r}/1000" if same_rep else f"=O{r}*{eff_a_rep}/1000", style=STYLE_FLOAT3)
             ws.set_cell(r, CMP_COL_AFT_BOUND, a_op.bound_display, style=STYLE_OVERLAP if a_op.is_overlapped else STYLE_TEXT)
             ws.set_cell(r, CMP_COL_LSTAR_MS, l_ms, style=STYLE_FLOAT3)
-            ws.set_cell(r, CMP_COL_AFT_UPT, a_upt, formula=f"=P{r}*1000/{a_ntok:.6f}", style=STYLE_FLOAT2)
+            ws.set_cell(r, CMP_COL_AFT_UPT, a_upt, formula=f"=IF({SUM_AFT_NTOK_REF}>0,P{r}*1000/{SUM_AFT_NTOK_REF},0)", style=STYLE_FLOAT2)
             ws.set_cell(r, CMP_COL_BINDING, format_binding_badge(a_op.binding_state), style=STYLE_TEXT_WRAP)
         else:
             ws.set_cell(r, CMP_COL_AFT_KERN, "(Cluster Pad)", style=STYLE_TEXT)
@@ -1219,21 +1291,25 @@ def _write_comparison_group(
     ws: Worksheet, r_start: int, r_end: int, item: AlignedComparisonRow,
     agent_designs: Mapping[str, Any] | None, b_ntok: float, a_ntok: float,
 ) -> tuple[float, float, float, float, float]:
-    rep = max(1, int(item.repeat_count))
+    b_rep = item.effective_before_repeat
+    a_rep = item.effective_after_repeat
+    rep = a_rep or b_rep or max(1, int(item.repeat_count))
     row_count = r_end - r_start + 1
-    before_ms_sum, before_upt_sum = _write_cmp_before_sides(ws, r_start, row_count, item, rep, b_ntok)
+    before_ms_sum, before_upt_sum = _write_cmp_before_sides(
+        ws, r_start, row_count, item, rep, b_ntok, b_rep=b_rep,
+    )
 
     if len(item.after_ops) >= 2:
         aft_ms, lstar_ms, aft_upt = _write_cmp_after_cluster(
-            ws, r_start, r_end, item, rep, before_ms_sum, before_upt_sum, a_ntok,
+            ws, r_start, r_end, item, rep, before_ms_sum, before_upt_sum, a_ntok, a_rep=a_rep,
         )
         return before_ms_sum, aft_ms, lstar_ms, before_upt_sum, aft_upt
 
     a_primary = item.after_ops[0] if item.after_ops else None
     if a_primary is not None:
         a_exp_us = 0.0 if a_primary.is_overlapped else a_primary.exposed_dur_us
-        aft_ms = a_exp_us * rep / US_PER_MS
-        lstar_ms = 0.0 if a_primary.is_overlapped else (a_primary.l_star_lean_us * rep / US_PER_MS)
+        aft_ms = a_exp_us * a_rep / US_PER_MS
+        lstar_ms = 0.0 if a_primary.is_overlapped else (a_primary.l_star_lean_us * a_rep / US_PER_MS)
         aft_upt = aft_ms * US_PER_MS / a_ntok
         saved_ms = before_ms_sum - aft_ms
         speedup = (before_ms_sum / aft_ms) if aft_ms > 0.0 else 0.0
@@ -1252,12 +1328,13 @@ def _write_comparison_group(
             STYLE_NEW_KERNEL if a_primary.needs_new_kernel
             else (STYLE_OPT_BADGE if a_primary.opt_pillar in {"pillar2_roofline", "pillar3_comm"} else STYLE_TEXT_WRAP)
         )
+        aft_ms_formula = f"=O{r_start}*B{r_start}/1000" if a_rep == rep else f"=O{r_start}*{a_rep}/1000"
         _write_row(ws, r_start, (
             (_kernel_with_backend(a_primary), None, STYLE_TEXT_WRAP),
             (a_primary.kernel_status, None, status_style),
             (a_primary.dur_us, None, STYLE_FLOAT3),
             (a_exp_us, None, STYLE_FLOAT3),
-            (aft_ms, f"=O{r_start}*B{r_start}/1000", STYLE_FLOAT3),
+            (aft_ms, aft_ms_formula, STYLE_FLOAT3),
             (saved_ms, f"=SUM(J{r_start}:J{r_end})-P{r_start}", STYLE_FLOAT3),
             (speedup, f"=IF(P{r_start}>0,SUM(J{r_start}:J{r_end})/P{r_start},0)", STYLE_RATIO),
             (a_primary.bound_display, None, STYLE_OVERLAP if a_primary.is_overlapped else STYLE_TEXT),
@@ -1265,7 +1342,7 @@ def _write_comparison_group(
             (gap_ms, f"=MAX(0,P{r_start}-T{r_start})", STYLE_FLOAT3),
             (action_txt, None, STYLE_TEXT_WRAP),
         ), start_col=CMP_COL_AFT_KERN)
-        ws.set_cell(r_start, CMP_COL_AFT_UPT, aft_upt, formula=f"=P{r_start}*1000/{a_ntok:.6f}", style=STYLE_FLOAT2)
+        ws.set_cell(r_start, CMP_COL_AFT_UPT, aft_upt, formula=f"=IF({SUM_AFT_NTOK_REF}>0,P{r_start}*1000/{SUM_AFT_NTOK_REF},0)", style=STYLE_FLOAT2)
         ws.set_cell(r_start, CMP_COL_SAVED_UPT, before_upt_sum - aft_upt, formula=f"=SUM(X{r_start}:X{r_end})-Y{r_start}", style=STYLE_FLOAT2)
         ws.set_cell(r_start, CMP_COL_BINDING, format_binding_badge(a_primary.binding_state), style=STYLE_TEXT_WRAP)
     else:
@@ -1347,7 +1424,9 @@ def _write_comparison_grand_total(
     ws.set_cell(tot_row, CMP_COL_BINDING, "= 10^6 / Single-Die TPS", style=STYLE_TOTAL_TEXT)
 
 
-def _populate_standalone_breakdown_sheet(ws: Worksheet, bundle: ExportBundle) -> None:
+def _populate_standalone_breakdown_sheet(
+    ws: Worksheet, bundle: ExportBundle,
+) -> dict[int, tuple[int, int]]:
     _apply_col_widths(ws, STD_COL_WIDTHS)
     ws.freeze_panes(CMP_FREEZE_ROWS, CMP_FREEZE_COLS)
     _write_banner(
@@ -1366,22 +1445,24 @@ def _populate_standalone_breakdown_sheet(ws: Worksheet, bundle: ExportBundle) ->
     )
     _write_headers(ws, 2, headers)
 
-    by_arch: list[tuple[str, str, list[OperatorExportRow]]] = []
-    for op in bundle.operators:
+    by_arch: list[tuple[str, str, list[tuple[int, OperatorExportRow]]]] = []
+    for op_idx, op in enumerate(bundle.operators):
         aid = op.archetype_id or op.layer_label
         if not by_arch or by_arch[-1][0] != aid:
             by_arch.append((aid, op.archetype_title or op.layer_label, []))
-        by_arch[-1][2].append(op)
+        by_arch[-1][2].append((op_idx, op))
 
     row_cursor = STD_DATA_START_ROW
+    row_spans: dict[int, tuple[int, int]] = {}
     subtotal_rows: list[int] = []
     tot_ms = tot_lstar_ms = 0.0
     for _, arch_title, ops in by_arch:
         arch_start = row_cursor
         sub_spans: list[tuple[str, int, int]] = []
         arch_ms = arch_lstar_ms = 0.0
-        for op in ops:
+        for op_idx, op in ops:
             r = row_cursor
+            row_spans[op_idx] = (r, r)
             ws.set_row_height(r, WRAP_ROW_HEIGHT_PT)
             rep = max(1, int(op.repeat_count))
             stream_txt, stream_style = _stream_masking_badge(op)
@@ -1438,6 +1519,7 @@ def _populate_standalone_breakdown_sheet(ws: Worksheet, bundle: ExportBundle) ->
     ws.set_cell(row_cursor, STD_COL_GAP_MS, max(0.0, tot_ms - tot_lstar_ms), formula=f"=MAX(0,K{row_cursor}-M{row_cursor})", style=STYLE_TOTAL_FLOAT3)
     ws.set_cell(row_cursor, STD_COL_BOUND, f"{len(bundle.operators)} archetype ops", style=STYLE_TOTAL_TEXT)
     ws.merge_range(row_cursor, STD_COL_BOUND, row_cursor, STD_COL_SOURCE_REF)
+    return row_spans
 
 
 def _populate_memory_control_panel(ws: Worksheet, mem: MemoryCalculatorLedger) -> None:
@@ -1517,9 +1599,10 @@ def _populate_memory_sheet(ws: Worksheet, bundle: ExportBundle) -> None:
     _populate_memory_control_panel(ws, mem)
     ws.set_cell(2, 1, "1. Per-Die Weight + Quant Scale Closed-Form Table (Side-by-Side 原生 BF16 vs 量化后; Mixed W4A8/MXFP4 & QuaRot Toggles)", style=STYLE_SECTION)
     ws.merge_range(2, 1, 2, MEMORY_TABLE_END_COL)
+    rep_col_hdr = f"Peak Stage Rep (S{mem.peak_weight_stage})" if mem.pp > 1 else "Stage Rep"
     w_headers = (
         "Group", "Tensor Name", "Global Rows", "Global Cols", "Shard Rule",
-        "Local Rows", "Local Cols", "Max Stage Rep", "Quant Rule", "Quant Format",
+        "Local Rows", "Local Cols", rep_col_hdr, "Quant Rule", "Quant Format",
         "Payload (B)", "MX Scale (B)", "Channel Aux (B)",
         "原生 BF16 单卡 (GiB)", "当前量化后单卡 (GiB, 含 Scale)", "Residency & Quant Policy",
     )
@@ -1546,7 +1629,7 @@ def _populate_memory_sheet(ws: Worksheet, bundle: ExportBundle) -> None:
             (row.name, None, STYLE_TEXT), (row.global_rows, None, STYLE_INT),
             (row.global_cols, None, STYLE_INT), (row.shard_rule, None, STYLE_TEXT),
             (row.local_rows, None, STYLE_INT), (row.local_cols, None, STYLE_INT),
-            (row.max_stage_repeats, None, STYLE_INT),
+            (row.peak_stage_repeats, None, STYLE_INT),
             (row.quant_rule, None, STYLE_TEXT),
             (row.quant_format, q_formula, STYLE_INPUT_TEXT if q_formula else STYLE_TEXT),
             (row.payload_bytes, f"=F{r}*ROUNDUP(G{r}*VLOOKUP(J{r},{lookup_ref},2,FALSE),0)*H{r}", STYLE_INT),
@@ -1603,7 +1686,7 @@ def _populate_memory_sheet(ws: Worksheet, bundle: ExportBundle) -> None:
     )
 
     cache_end = _populate_cache_block(ws, w_tot_vit + 2, mem)
-    _populate_stage_budget_block(ws, cache_end + 2, mem)
+    _populate_stage_budget_block(ws, cache_end + 2, mem, cache_tot_row=cache_end)
 
 
 def _populate_cache_block(ws: Worksheet, start_row: int, mem: MemoryCalculatorLedger) -> int:
@@ -1620,12 +1703,12 @@ def _populate_cache_block(ws: Worksheet, start_row: int, mem: MemoryCalculatorLe
     c_start = hdr_row + 1
     for offset, row in enumerate(mem.cache_rows):
         r = c_start + offset
-        if row.scales_with_tokens:
+        if row.scales_with_tokens and row.max_stage_layers > 0 and row.bytes_per_token_per_layer > 0.0:
             req_formula = f"=C{r}*D{r}*{MEM_CTL_LOCAL_TOK_REF}/{MIB_BYTES}"
             basis = f"Scales with Local Cache Tokens (BF16/C8/FP8={mem.cache_dtype}, ratio={C8_CACHE_FACTOR:.4f}x for C8)"
         else:
             req_formula = None
-            basis = "Fixed per-request recurrent/conv/compressor state"
+            basis = "Fixed per-request state buffer (non-token-scaled)"
         _write_row(ws, r, (
             (row.component, None, STYLE_TEXT), (row.cache_kind, None, STYLE_TEXT),
             (row.max_stage_layers, None, STYLE_INT), (row.bytes_per_token_per_layer, None, STYLE_FLOAT2),
@@ -1655,7 +1738,9 @@ def _populate_cache_block(ws: Worksheet, start_row: int, mem: MemoryCalculatorLe
     return c_tot
 
 
-def _populate_stage_budget_block(ws: Worksheet, start_row: int, mem: MemoryCalculatorLedger) -> int:
+def _populate_stage_budget_block(
+    ws: Worksheet, start_row: int, mem: MemoryCalculatorLedger, *, cache_tot_row: int = 0,
+) -> int:
     ws.set_cell(start_row, 1, "3. Per-PP-Stage HBM vs Host Offload Budget (DP/TP/EP/PP/DCP/PCP/Local-TP)", style=STYLE_SECTION)
     ws.merge_range(start_row, 1, start_row, MEMORY_TABLE_END_COL)
     hdr_row = start_row + 1
@@ -1667,17 +1752,31 @@ def _populate_stage_budget_block(ws: Worksheet, start_row: int, mem: MemoryCalcu
     )
     _write_headers(ws, hdr_row, headers)
 
+    sum_per_req = sum(x.per_request_bytes for x in mem.cache_rows)
     s_start = hdr_row + 1
     for offset, st in enumerate(mem.stage_budgets):
         r = s_start + offset
         raw_engram_gib = (st.engram_ple_hbm_bytes + st.engram_ple_host_bytes) / float(GIB_BYTES)
+        st_per_req = (
+            float(st.per_request_cache_bytes)
+            if float(st.per_request_cache_bytes) > 0.0
+            else (float(st.cache_bytes) / float(max(1, mem.concurrency)))
+        )
+        if cache_tot_row > 0 and sum_per_req > 0.0:
+            if abs(st_per_req - sum_per_req) <= 1.0:
+                cache_f = f"=E{cache_tot_row}*{MEM_CTL_CONC_REF}/{MIB_PER_GIB}"
+            else:
+                ratio = st_per_req / sum_per_req
+                cache_f = f"=E{cache_tot_row}*{ratio!r}*{MEM_CTL_CONC_REF}/{MIB_PER_GIB}"
+        else:
+            cache_f = f"={st_per_req / float(GIB_BYTES)!r}*{MEM_CTL_CONC_REF}"
         _write_row(ws, r, (
             (f"Stage {st.stage}", None, STYLE_MERGED), (st.owned_layers, None, STYLE_INT),
             (st.weight_payload_bytes / float(GIB_BYTES), None, STYLE_FLOAT3),
             (st.weight_scale_aux_bytes / float(GIB_BYTES), None, STYLE_FLOAT3),
             (st.engram_ple_hbm_bytes / float(GIB_BYTES), f'=IF({MEM_CTL_OFFLOAD_REF}="ON",0,N{r})', STYLE_FLOAT3),
             (st.engram_ple_host_bytes / float(GIB_BYTES), f'=IF({MEM_CTL_OFFLOAD_REF}="ON",N{r},0)', STYLE_FLOAT3),
-            (st.cache_bytes / float(GIB_BYTES), None, STYLE_FLOAT3),
+            (st.cache_bytes / float(GIB_BYTES), cache_f, STYLE_FLOAT3),
             (st.workspace_peak_bytes / float(GIB_BYTES), None, STYLE_FLOAT3),
             (st.reserve_bytes / float(GIB_BYTES), None, STYLE_FLOAT3),
             (st.total_hbm_bytes / float(GIB_BYTES), f"=SUM(C{r}:E{r},G{r}:I{r})", STYLE_FLOAT3),
@@ -1810,11 +1909,57 @@ def _write_pending_kernel_card(
         ws.merge_range(r, PENDING_CARD_LEFT_START, r, PENDING_COLS)
 
 
+def _sheet2_sum_formula(col_let: str, spans: Sequence[tuple[int, int]]) -> str | None:
+    """Build a compact live Excel ``SUM`` formula referencing Sheet 2 cell ranges."""
+    if not spans:
+        return None
+    ordered = sorted((int(s), int(e)) for s, e in spans)
+    merged: list[list[int]] = [[ordered[0][0], ordered[0][1]]]
+    for s, e in ordered[1:]:
+        if s <= merged[-1][1] + 1:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+    tokens = [
+        f"'{SHEET_BREAKDOWN}'!{col_let}{s}:{col_let}{e}" if s != e else f"'{SHEET_BREAKDOWN}'!{col_let}{s}"
+        for s, e in merged
+    ]
+    if len(tokens) == 1 and ":" not in tokens[0]:
+        return f"={tokens[0]}"
+    return f"=SUM({','.join(tokens)})"
+
+
+def _compute_uncovered_exposure(
+    aligned_rows: Sequence[AlignedComparisonRow],
+    uncovered_indices: Sequence[int],
+    *,
+    is_comparison: bool,
+) -> tuple[float, float, int]:
+    bef_ms = aft_ms = 0.0
+    total_calls = 0
+    for idx in uncovered_indices:
+        row = aligned_rows[idx]
+        b_rep = row.effective_before_repeat
+        a_rep = row.effective_after_repeat
+        total_calls += max(a_rep, b_rep, 1)
+        if is_comparison:
+            bef_ms += sum(0.0 if b.is_overlapped else (b.exposed_dur_us * b_rep / US_PER_MS) for b in row.before_ops)
+            aft_ms += sum(0.0 if a.is_overlapped else (a.exposed_dur_us * a_rep / US_PER_MS) for a in row.after_ops)
+        else:
+            bef_ms += sum(0.0 if a.is_overlapped else (a.exposed_dur_us * a_rep / US_PER_MS) for a in row.after_ops)
+            aft_ms += sum(0.0 if a.is_overlapped else (a.l_star_lean_us * a_rep / US_PER_MS) for a in row.after_ops)
+    return bef_ms, aft_ms, total_calls
+
+
 def _populate_pending_kernel_details_sheet(
     ws: Worksheet,
     pending_items: Sequence[PendingKernelItem],
     target_bundle: ExportBundle,
     agent_designs: Mapping[str, Any] | None,
+    *,
+    is_comparison: bool = True,
+    sheet2_row_spans: Mapping[int, tuple[int, int]] | None = None,
+    aligned_rows: Sequence[AlignedComparisonRow] = (),
 ) -> None:
     """Populate Sheet 4 with 100%-conserved Summary Index + 3-Track Detail Cards."""
     _apply_col_widths(ws, PENDING_COL_WIDTHS)
@@ -1834,10 +1979,18 @@ def _populate_pending_kernel_details_sheet(
         "开发 / 优化状态", "替代原算子链 / 所在模块", "全网频次 (Archetypes & Calls)",
         "预期全网收益 Δ (ms)", "Before -> After (L* ms)", "Before -> Target Bound", "详情卡片定位 (card_id)",
         "摊薄净省 Δ (us/tok·die)", "绑定状态 (Binding State)",
+        "Before 暴露 (ms)" if is_comparison else "当前暴露 (ms)",
+        "After 暴露 (ms)" if is_comparison else "L* 下界 (ms)",
     )
     _write_headers(ws, PENDING_HEADER_ROW, headers)
 
-    if not pending_items:
+    spans_map = sheet2_row_spans or {}
+    covered_indices = {idx for item in pending_items for idx in item.source_row_indices}
+    uncovered_indices = (
+        [idx for idx in range(len(aligned_rows)) if idx not in covered_indices and idx in spans_map]
+        if (is_comparison and aligned_rows) else []
+    )
+    if not pending_items and not uncovered_indices:
         ws.set_cell(
             PENDING_DATA_START_ROW, 1,
             "No pending new or gap-dominated kernels detected — all kernels are near L* physical lower bound.",
@@ -1846,18 +1999,31 @@ def _populate_pending_kernel_details_sheet(
         ws.merge_range(PENDING_DATA_START_ROW, 1, PENDING_DATA_START_ROW, PENDING_COLS)
         return
 
-    r_end = PENDING_DATA_START_ROW + len(pending_items) - 1
+    has_unchanged_row = bool(uncovered_indices)
+    r_end = PENDING_DATA_START_ROW + len(pending_items) + (1 if has_unchanged_row else 0) - 1
     r_tot = r_end + 1
     cards_banner_row = r_tot + 2
     cards_start_row = r_tot + PENDING_CARD_SPACER_GAP - 1
     n_new = sum(1 for x in pending_items if x.category == PENDING_KIND_TO_IMPLEMENT)
     n_opt = len(pending_items) - n_new
+    col_m_src = column_letter(CMP_COL_BEF_EXP_MS if is_comparison else STD_COL_EXP_MS)
+    col_n_src = column_letter(CMP_COL_AFT_EXP_MS if is_comparison else STD_COL_LSTAR_MS)
 
     for idx, item in enumerate(pending_items):
         r = PENDING_DATA_START_ROW + idx
         card_row = cards_start_row + idx * PENDING_CARD_STRIDE
         is_new = item.category == PENDING_KIND_TO_IMPLEMENT
         ws.set_row_height(r, BACKLOG_ROW_HEIGHT_PT)
+        m_val = item.before_model_ms if is_comparison else item.after_model_ms
+        n_val = item.after_model_ms if is_comparison else item.lstar_model_ms
+        item_spans = [spans_map[i] for i in item.source_row_indices if i in spans_map]
+        m_formula = _sheet2_sum_formula(col_m_src, item_spans)
+        n_formula = _sheet2_sum_formula(col_n_src, item_spans)
+        gain_ms_f = f"=M{r}-N{r}" if is_comparison else f"=MAX(0,M{r}-N{r})"
+        gain_upt_f = (
+            f"=IF({SUM_BEF_NTOK_REF}>0,M{r}*1000/{SUM_BEF_NTOK_REF},0)-IF({SUM_AFT_NTOK_REF}>0,N{r}*1000/{SUM_AFT_NTOK_REF},0)"
+            if is_comparison else f"=IF({SUM_AFT_NTOK_REF}>0,G{r}*1000/{SUM_AFT_NTOK_REF},0)"
+        )
         _write_row(ws, r, (
             (f"P{item.priority}", None, STYLE_MERGED),
             (item.category, None, STYLE_NEW_KERNEL if is_new else STYLE_OPT_BADGE),
@@ -1865,23 +2031,54 @@ def _populate_pending_kernel_details_sheet(
             (item.status, None, STYLE_NEW_KERNEL if is_new else STYLE_TEXT_WRAP),
             (item.replaces_chain, None, STYLE_TEXT_WRAP),
             (f"{item.archetype_summary} ({item.total_calls_per_step} calls/step)", None, STYLE_TEXT_WRAP),
-            (item.expected_gain_ms, None, STYLE_FLOAT3),
+            (item.expected_gain_ms, gain_ms_f, STYLE_FLOAT3),
             (f"{item.before_model_ms:.3f} -> {item.after_model_ms:.3f} (L* {item.lstar_model_ms:.3f})", None, STYLE_TEXT_WRAP),
             (f"{item.before_bound} -> {item.after_bound}", None, STYLE_TEXT_WRAP),
             (f"Card #{item.priority} [{item.card_id}] (Row {card_row})", None, STYLE_MERGED),
-            (item.saved_us_per_tok_die, None, STYLE_FLOAT2),
+            (item.saved_us_per_tok_die, gain_upt_f, STYLE_FLOAT2),
             (format_binding_badge(item.binding_state), None, STYLE_TEXT_WRAP),
+            (m_val, m_formula, STYLE_FLOAT3),
+            (n_val, n_formula, STYLE_FLOAT3),
+        ))
+
+    unch_bef = unch_aft = 0.0
+    if has_unchanged_row:
+        r_unch = PENDING_DATA_START_ROW + len(pending_items)
+        ws.set_row_height(r_unch, BACKLOG_ROW_HEIGHT_PT)
+        unch_bef, unch_aft, unch_calls = _compute_uncovered_exposure(
+            aligned_rows, uncovered_indices, is_comparison=is_comparison,
+        )
+        unch_spans = [spans_map[i] for i in uncovered_indices if i in spans_map]
+        _write_row(ws, r_unch, (
+            ("—", None, STYLE_MERGED),
+            ("无变化对账 (Unchanged)", None, STYLE_OVERLAP),
+            ("Unchanged Operators Exposure Reconciliation", None, STYLE_TEXT_WRAP),
+            ("Before == After (0 变化，补齐全网暴露守恒)", None, STYLE_TEXT_WRAP),
+            (f"{len(uncovered_indices)} unchanged aligned rows", None, STYLE_TEXT_WRAP),
+            (f"Reconciliation ({unch_calls} calls/step)", None, STYLE_TEXT_WRAP),
+            (unch_bef - unch_aft, f"=M{r_unch}-N{r_unch}", STYLE_FLOAT3),
+            (f"{unch_bef:.3f} -> {unch_aft:.3f}", None, STYLE_TEXT_WRAP),
+            ("Unchanged", None, STYLE_TEXT_WRAP),
+            ("—", None, STYLE_MERGED),
+            (
+                0.0,
+                f"=IF({SUM_BEF_NTOK_REF}>0,M{r_unch}*1000/{SUM_BEF_NTOK_REF},0)-IF({SUM_AFT_NTOK_REF}>0,N{r_unch}*1000/{SUM_AFT_NTOK_REF},0)",
+                STYLE_FLOAT2,
+            ),
+            (format_binding_badge(target_bundle.binding_state), None, STYLE_TEXT_WRAP),
+            (unch_bef, _sheet2_sum_formula(col_m_src, unch_spans), STYLE_FLOAT3),
+            (unch_aft, _sheet2_sum_formula(col_n_src, unch_spans), STYLE_FLOAT3),
         ))
 
     ws.set_cell(r_tot, 1, f"TOTAL ({n_new} 待新开发/扩展 + {n_opt} 重点待优化 = {len(pending_items)} 项)", style=STYLE_TOTAL_TEXT)
     ws.merge_range(r_tot, 1, r_tot, PENDING_LABEL_MERGE_END)
     ws.set_cell(
         r_tot, PENDING_COL_GAIN,
-        sum(x.expected_gain_ms for x in pending_items),
+        sum(x.expected_gain_ms for x in pending_items) + (unch_bef - unch_aft),
         formula=f"=SUM(G{PENDING_DATA_START_ROW}:G{r_end})",
         style=STYLE_TOTAL_FLOAT3,
     )
-    ws.set_cell(r_tot, PENDING_COL_GAIN + 1, "已预填 3-Track 落地指导（Config/Kernel/Framework）；按 Δ(us/tok·die) 降序守恒", style=STYLE_TOTAL_TEXT)
+    ws.set_cell(r_tot, PENDING_COL_GAIN + 1, "已预填 3-Track 落地指导（Config/Kernel/Framework）；全网暴露与 Sheet 1/2 100% 守恒", style=STYLE_TOTAL_TEXT)
     ws.merge_range(r_tot, PENDING_COL_GAIN + 1, r_tot, PENDING_COL_GAIN_UPT - 1)
     ws.set_cell(
         r_tot, PENDING_COL_GAIN_UPT,
@@ -1890,16 +2087,29 @@ def _populate_pending_kernel_details_sheet(
         style=STYLE_TOTAL_NUM,
     )
     ws.set_cell(r_tot, PENDING_COL_BINDING, format_binding_badge(target_bundle.binding_state), style=STYLE_TOTAL_TEXT)
-
-    _write_banner(
-        ws, cards_banner_row, PENDING_COLS,
-        "2. 逐算子结构化 3-Track 详情卡片 (Config & Env / Kernel & Tiling / vllm-ascend Framework / Acceptance)",
-        STYLE_SECTION,
+    ws.set_cell(
+        r_tot, PENDING_COL_BEF_MS,
+        sum(x.before_model_ms if is_comparison else x.after_model_ms for x in pending_items) + unch_bef,
+        formula=f"=SUM(M{PENDING_DATA_START_ROW}:M{r_end})",
+        style=STYLE_TOTAL_FLOAT3,
     )
-    for idx, item in enumerate(pending_items):
-        idx_row = PENDING_DATA_START_ROW + idx
-        card_row = cards_start_row + idx * PENDING_CARD_STRIDE
-        _write_pending_kernel_card(ws, card_row, idx_row, item, target_bundle, agent_designs)
+    ws.set_cell(
+        r_tot, PENDING_COL_AFT_MS,
+        sum(x.after_model_ms if is_comparison else x.lstar_model_ms for x in pending_items) + unch_aft,
+        formula=f"=SUM(N{PENDING_DATA_START_ROW}:N{r_end})",
+        style=STYLE_TOTAL_FLOAT3,
+    )
+
+    if pending_items:
+        _write_banner(
+            ws, cards_banner_row, PENDING_COLS,
+            "2. 逐算子结构化 3-Track 详情卡片 (Config & Env / Kernel & Tiling / vllm-ascend Framework / Acceptance)",
+            STYLE_SECTION,
+        )
+        for idx, item in enumerate(pending_items):
+            idx_row = PENDING_DATA_START_ROW + idx
+            card_row = cards_start_row + idx * PENDING_CARD_STRIDE
+            _write_pending_kernel_card(ws, card_row, idx_row, item, target_bundle, agent_designs)
 
 
 def _populate_measured_calibration_sheet(ws: Worksheet, bundle: ExportBundle) -> None:
@@ -1994,6 +2204,8 @@ def _resolve_xlsx_bundles(
             prompt_tokens=prompt_tokens, output_tokens=output_tokens,
             concurrency=concurrency, mtp_proposal_tokens=mtp_proposal_tokens,
             mtp_acceptance_length=mtp_acceptance_length, feature_track=base_track,
+            quant=weight_quant, kv_cache_dtype=cache_dtype,
+            engram_cpu_offload=engram_host_offload,
         )
         eff_req = request or auto_req
         source = raw_bef
@@ -2004,6 +2216,8 @@ def _resolve_xlsx_bundles(
                 prompt_tokens=prompt_tokens, output_tokens=output_tokens,
                 concurrency=concurrency, mtp_proposal_tokens=mtp_proposal_tokens,
                 mtp_acceptance_length=mtp_acceptance_length, feature_track=target_track,
+                quant=weight_quant, kv_cache_dtype=cache_dtype,
+                engram_cpu_offload=engram_host_offload,
             )
             compare_source = raw_aft
     else:
@@ -2115,9 +2329,11 @@ def export_comparison_xlsx(
         macro_rows=macro_rows, pending_items=pending_items,
     )
     if compare_bundle is not None:
-        _populate_comparison_breakdown_sheet(ws_breakdown, bundle, compare_bundle, aligned_rows, agent_kernel_designs)
+        sheet2_spans = _populate_comparison_breakdown_sheet(
+            ws_breakdown, bundle, compare_bundle, aligned_rows, agent_kernel_designs,
+        )
     else:
-        _populate_standalone_breakdown_sheet(ws_breakdown, bundle)
+        sheet2_spans = _populate_standalone_breakdown_sheet(ws_breakdown, bundle)
     _populate_memory_sheet(ws_memory, compare_bundle or bundle)
 
     sheet_names = [SHEET_SUMMARY, SHEET_BREAKDOWN, SHEET_MEMORY]
@@ -2129,7 +2345,11 @@ def export_comparison_xlsx(
 
     if compare_bundle is not None or pending_items:
         ws_pending = wb.create_sheet(SHEET_PENDING_KERNELS)
-        _populate_pending_kernel_details_sheet(ws_pending, pending_items, compare_bundle or bundle, agent_designs=agent_kernel_designs)
+        _populate_pending_kernel_details_sheet(
+            ws_pending, pending_items, compare_bundle or bundle,
+            agent_designs=agent_kernel_designs, is_comparison=(compare_bundle is not None),
+            sheet2_row_spans=sheet2_spans, aligned_rows=aligned_rows,
+        )
         sheet_names.append(SHEET_PENDING_KERNELS)
         merge_counts[SHEET_PENDING_KERNELS] = len(ws_pending.merged_ranges)
 

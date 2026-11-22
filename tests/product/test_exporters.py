@@ -353,7 +353,7 @@ def test_xlsx_before_after_merge_cells_formulas_and_new_kernel_backlog(tmp_path)
 
     # Verify 100% 4-view conservation: Step Δ == Sheet 1 Δ == Sheet 2 Δ == Sheet 4 Cards Δ.
     macros = build_macro_module_breakdown(b_bef, b_aft)
-    cards = build_pending_kernel_details(aligned, b_aft)
+    cards = build_pending_kernel_details(aligned, b_aft, before_bundle=b_bef)
     step_delta = (b_bef.step_span_us - b_aft.step_span_us) / 1000.0
     s1_delta = sum(m.before_ms - m.after_ms for m in macros)
     s2_delta = sum(
@@ -808,4 +808,314 @@ def test_bipartite_alignment_dual_conservation_zero_saving_guard_draft_kv_and_ag
     assert any(v.rule == "AG013" and "kimi" in v.message.lower() for v in viols)
     bad_file.write_text('def clean(x):\n    return "generic_op" if x else "ok"\n', encoding="utf-8")
     assert ag_mod._check_ag013_anti_hardcoding(rel_bad, _ast.parse(bad_file.read_text(encoding="utf-8"))) == []
+
+    # Generalized AG013 catches arbitrary module-level suffix/op-name matching constant tables.
+    custom_tbl_src = (
+        '_CUSTOM_OP_SUFFIXES = ("rms_norm", "silu_mul")\n'
+        '_EXTRA_OP_NAMES = {"q_proj", "k_proj"}\n'
+    )
+    gen_viols = ag_mod._check_ag013_anti_hardcoding(rel_bad, _ast.parse(custom_tbl_src))
+    assert len(gen_viols) >= 2 and all(v.rule == "AG013" for v in gen_viols)
+
+
+def test_exporter_rebound_primitives_horizon_pp_conservation_formulas_and_brief_budget(tmp_path, monkeypatch):
+    """Verify rebound primitive forwarding, Sheet 3 horizon/fixed state, PP1->PP2 conservation, live formulas & brief budget."""
+    from dataclasses import replace
+
+    from mindie_sim.export import bundle as bundle_mod
+    from mindie_sim.export.comparison import AGENT_BRIEF_MAX_BYTES, _compact_agent_brief_to_budget
+    from mindie_sim.export.kernel_catalog import extract_semantic_atoms
+    from mindie_sim.export.memory_ledger import _compute_max_hbm_concurrency
+    from mindie_sim.export.models import LayerArchetypeSpec
+
+    # 1. Rebound primitive_table flows into solve_target_graph during target modeling.
+    captured_pts: list[object] = []
+    orig_solve = bundle_mod.solve_target_graph
+
+    def _spy_solve(*args, **kwargs):
+        captured_pts.append(kwargs.get("primitive_table"))
+        return orig_solve(*args, **kwargs)
+
+    monkeypatch.setattr(bundle_mod, "solve_target_graph", _spy_solve)
+    raw_c, req = compose_export_case(
+        "qwen3-32b", "a5", tp=2, prompt_tokens=512, output_tokens=128,
+        concurrency=4, feature_track="merged",
+    )
+    raw_c["model"]["layers"] = 2
+    raw_c["model"]["layer_plans"] = raw_c["model"]["layer_plans"][:2]
+    # Perturb declared HBM bandwidth by 0.5x on the parsed Case to verify rebound primitive_table flows into solve_target_graph.
+    parsed_base = parse_case(raw_c)
+    perturbed_dies = tuple(
+        replace(
+            die,
+            rates=tuple(
+                (k, float(v) * 0.5 if k in {"hbm", "hbm_read", "hbm_write"} else v)
+                for k, v in die.rates
+            ),
+        )
+        for die in parsed_base.machine.dies
+    )
+    perturbed_case = replace(parsed_base, machine=replace(parsed_base.machine, dies=perturbed_dies))
+    b_base_pt = build_export_bundle(parsed_base, request=req, apply_target_envelope=True)
+    b_target = build_export_bundle(perturbed_case, request=req, apply_target_envelope=True)
+    assert len(captured_pts) >= 2 and captured_pts[0] is not None and captured_pts[1] is not None
+    assert captured_pts[1] is not captured_pts[0]
+    assert b_target.step_span_us > b_base_pt.step_span_us
+    # Decode horizon includes declared output_tokens (context + output_tokens = 640).
+    assert b_target.memory_ledger.seq_len == 512 + 128
+
+    # 2. Fixed per-request state buffers stay non-zero in Sheet 3 Excel formulas even with 0 target layers.
+    fixed_row = replace(
+        b_target.memory_ledger.cache_rows[0],
+        component="draft_state",
+        max_stage_layers=0,
+        bytes_per_token_per_layer=0.0,
+        per_request_bytes=4 * 1024 * 1024,
+        batch_total_bytes=16 * 1024 * 1024,
+        scales_with_tokens=False,
+    )
+    led_fixed = replace(b_target.memory_ledger, cache_rows=(*b_target.memory_ledger.cache_rows, fixed_row))
+    bun_fixed = replace(b_target, memory_ledger=led_fixed)
+    fixed_xlsx = tmp_path / "fixed_state_and_formulas.xlsx"
+    b_bef = build_export_bundle(raw_c, request=req, apply_target_envelope=False)
+    b_bef_frac = replace(b_bef, n_tok_per_die=0.0546875, us_per_tok_die=b_bef.step_span_us / 0.0546875)
+    b_aft_frac = replace(bun_fixed, n_tok_per_die=0.0546875, us_per_tok_die=bun_fixed.step_span_us / 0.0546875)
+    export_comparison_xlsx(b_bef_frac, fixed_xlsx, compare_source=b_aft_frac)
+    _, roots, shared = _read_xlsx_sheets(fixed_xlsx)
+
+    # Sheet 3 fixed state row keeps numeric MiB (never zeroed by layer_count=0) and scales by concurrency.
+    s3_cells = _sheet_cells(roots[SHEET_MEMORY], shared)
+    draft_rows = [int(k[1:]) for k, (v, _) in s3_cells.items() if k.startswith("A") and v == "draft_state"]
+    assert draft_rows
+    dr = draft_rows[0]
+    assert s3_cells[f"E{dr}"][1] is None and float(s3_cells[f"E{dr}"][0]) == pytest.approx(4.0, abs=1e-4)
+    assert s3_cells[f"F{dr}"][1] == f"E{dr}*$T$18/1024"
+
+    # Sheet 1 stores exact full-precision N_tok_per_die on Row 26; Sheet 2 & Sheet 4 reference Summary!$B$26/$C$26.
+    s1_cells = _sheet_cells(roots[SHEET_SUMMARY], shared)
+    assert float(s1_cells["B26"][0]) == pytest.approx(0.0546875, abs=1e-12)
+    assert float(s1_cells["C26"][0]) == pytest.approx(0.0546875, abs=1e-12)
+    s2_cells = _sheet_cells(roots[SHEET_BREAKDOWN], shared)
+    s2_formulas = [f for _, f in s2_cells.values() if f]
+    assert any("Summary!$B$26" in f for f in s2_formulas)
+    assert any("Summary!$C$26" in f for f in s2_formulas)
+    assert not any("0.054688" in f for f in s2_formulas)
+    s4_cells = _sheet_cells(roots[SHEET_PENDING_KERNELS], shared)
+    s4_formulas = [f for _, f in s4_cells.values() if f]
+    assert any(f.startswith("M") and "-N" in f for f in s4_formulas)
+    assert any("Summary!$B$26" in f and "Summary!$C$26" in f for f in s4_formulas)
+
+    # 3. Identical Before/After reports zero pending cards & 0.0 delta (never standalone gap_us).
+    aligned_same = align_before_after_operators(b_bef, b_bef)
+    assert build_pending_kernel_details(aligned_same, b_bef, before_bundle=b_bef) == ()
+    # Zero-gain N->1 attn_res_prefix emits no new-kernel card.
+    proto = b_bef.operators[0]
+    ar_b1 = replace(proto, op_id="l0.ar_pre", family="attn_res_prefix", exposed_dur_us=5.0, dur_us=5.0,
+                    l_star_lean_us=1.0, gap_us=4.0, repeat_count=1, semantic_atoms=("attn_res_prefix",))
+    ar_b2 = replace(proto, op_id="l0.ar_post", family="attn_res_prefix", exposed_dur_us=5.0, dur_us=5.0,
+                    l_star_lean_us=1.0, gap_us=4.0, repeat_count=1, semantic_atoms=("attn_res_prefix",))
+    ar_a = replace(proto, op_id="l0.ar_fused", family="attn_res_prefix", exposed_dur_us=10.0, dur_us=10.0,
+                   l_star_lean_us=2.0, gap_us=8.0, repeat_count=1, needs_new_kernel=True,
+                   absorbed_source_ops=("l0.ar_pre", "l0.ar_post"), semantic_atoms=("attn_res_prefix",))
+    bun_ar_b = replace(b_bef, operators=(ar_b1, ar_b2), step_span_us=10.0)
+    bun_ar_a = replace(b_bef, operators=(ar_a,), step_span_us=10.0)
+    assert build_pending_kernel_details(
+        align_before_after_operators(bun_ar_b, bun_ar_a), bun_ar_a, before_bundle=bun_ar_b,
+    ) == ()
+
+    # 4. PP1 -> PP2 physical layer weight conservation (4 layers stay 4L, never 4+2=6L).
+    op_pp1 = replace(proto, archetype_id="target_arch_0", repeat_count=4, exposed_dur_us=10.0, dur_us=10.0,
+                     op_id="target.l0.q_proj", canonical_op_key="q_proj")
+    op_pp2_s0 = replace(proto, archetype_id="target_arch_0", repeat_count=2, exposed_dur_us=8.0, dur_us=8.0,
+                        op_id="target.l0.q_proj", canonical_op_key="q_proj")
+    op_pp2_s1 = replace(proto, archetype_id="target_arch_1", repeat_count=2, exposed_dur_us=8.0, dur_us=8.0,
+                        op_id="target.l2.q_proj", canonical_op_key="q_proj")
+    arch_pp1 = (LayerArchetypeSpec("target_arch_0", "target", "PP1 (×4)", "Attn", 4, (0, 1, 2, 3), "L0..L3", 0),)
+    arch_pp2 = (
+        LayerArchetypeSpec("target_arch_0", "target", "PP2 S0 (×2)", "Attn", 2, (0, 1), "L0..L1", 0),
+        LayerArchetypeSpec("target_arch_1", "target", "PP2 S1 (×2)", "Attn", 2, (2, 3), "L2..L3", 1),
+    )
+    bun_pp1 = replace(b_bef, archetypes=arch_pp1, operators=(op_pp1,), step_span_us=40.0, total_target_layers=4)
+    bun_pp2 = replace(b_bef, archetypes=arch_pp2, operators=(op_pp2_s0, op_pp2_s1), step_span_us=32.0, total_target_layers=4)
+    aligned_pp = align_before_after_operators(bun_pp1, bun_pp2)
+    assert sum(r.effective_before_repeat for r in aligned_pp) == 4
+    assert sum(r.effective_after_repeat for r in aligned_pp) == 4
+    pp_s2_bef = sum(sum(o.exposed_dur_us for o in r.before_ops) * r.effective_before_repeat for r in aligned_pp)
+    pp_s2_aft = sum(sum(o.exposed_dur_us for o in r.after_ops) * r.effective_after_repeat for r in aligned_pp)
+    assert pp_s2_bef == pytest.approx(40.0, abs=1e-6) and pp_s2_aft == pytest.approx(32.0, abs=1e-6)
+    pp_macros = build_macro_module_breakdown(bun_pp1, bun_pp2)
+    assert sum(m.before_ms for m in pp_macros) == pytest.approx(0.04, abs=1e-6)
+    assert sum(m.after_ms for m in pp_macros) == pytest.approx(0.032, abs=1e-6)
+    assert all(m.layer_count <= 4 for m in pp_macros)
+    pp_cards = build_pending_kernel_details(aligned_pp, bun_pp2, before_bundle=bun_pp1)
+    assert sum(c.expected_gain_ms for c in pp_cards) == pytest.approx(0.008, abs=1e-6)
+
+    # 5. Distinct semantic atoms (q_rotary vs kv_rotary) and error propagation in _extract_structure_registry_view.
+    assert extract_semantic_atoms("l0.q_rotary", "rope", "rope") == ("q_rotary",)
+    assert extract_semantic_atoms("l0.kv_rotary", "rope", "rope") == ("kv_rotary",)
+    import mindie_sim.structure as struct_mod
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("injected_structure_failure")
+
+    monkeypatch.setattr(struct_mod, "export_op_structure", _boom)
+    with pytest.raises(RuntimeError, match="injected_structure_failure"):
+        bundle_mod._extract_structure_registry_view(parse_case(raw_c), {0: ()}, req)
+
+    # 6. Agent brief budget compactor enforces strictly < 8192 bytes including trailing newline.
+    huge_brief = {
+        "schema": AGENT_BRIEF_SCHEMA,
+        "summary": {"model": "test"},
+        "va_serving_rules": {f"rule_{i}": "x" * 200 for i in range(30)},
+        "top_pending_kernels": [{"card_id": f"K{i}", "detail": "y" * 200} for i in range(25)],
+        "rewrite_candidates": [{"id": f"C{i}", "desc": "z" * 150} for i in range(20)],
+        "macro_module_breakdown": [{"module": f"M{i}", "notes": "w" * 150} for i in range(20)],
+        "hardware_microarch_summary": {"info": "v" * 2000},
+    }
+    compacted = _compact_agent_brief_to_budget(huge_brief)
+    brief_out = tmp_path / "compacted_brief.json"
+    export_agent_brief(compacted, brief_out)
+    assert brief_out.stat().st_size < AGENT_BRIEF_MAX_BYTES
+    # Binary-search _compute_max_hbm_concurrency stays exact when workspace scales with batch.
+    parsed_c = parse_case(raw_c)
+    assert _compute_max_hbm_concurrency(
+        parsed_c, b_target.memory_ledger.stage_budgets,
+        [st.cache_bytes / max(1, b_target.memory_ledger.concurrency) for st in b_target.memory_ledger.stage_budgets],
+        b_target.memory_ledger.concurrency, phase="decode", resolved_seq=b_target.memory_ledger.seq_len,
+    ) == b_target.memory_ledger.max_hbm_concurrency_per_dp
+
+
+def test_export_binding_conservation_pp_reconciliation_and_brief_precision(tmp_path):
+    from dataclasses import replace
+    from mindie_sim.api import evaluate_step
+    from mindie_sim.compose import compose_case
+    from mindie_sim.export import (
+        BINDING_STATE_BOUND,
+        BINDING_STATE_MEASURED,
+        BINDING_STATE_UNBOUND_FORMULA,
+        audit_launch_script,
+        build_agent_brief,
+        export_agent_brief,
+        parse_launch_script,
+    )
+    from mindie_sim.export import bundle as bundle_mod
+    from mindie_sim.export.comparison import AGENT_BRIEF_MAX_BYTES, _compact_agent_brief_to_budget
+    from mindie_sim.schema.common import ModelingError
+
+    # 1. Single-source hardware alias resolution matches compose.inputs (a5-pod -> 9581 144GiB).
+    assert resolve_hardware_alias("a5-pod") == ("Ascend950DT_9581", "a5_pod")
+    assert resolve_hardware_alias("a3-8p") == ("Ascend910_9392", "a3_8p")
+
+    # 2. _row_to_target_node preserves binding_state (never dropping unbound tags).
+    raw_base = compose_case("qwen3-32b", "a3", tp=2, layers=2, prompt_tokens=256, output_tokens=32)
+    req_base = StepRequest(phase="decode", tokens=1, context=256, sequences=1, scope="model")
+    bun_base = build_export_bundle(raw_base, request=req_base, apply_target_envelope=False)
+    unbound_row = replace(bun_base.operators[0], binding_state=BINDING_STATE_UNBOUND_FORMULA)
+    target_node = bundle_mod._row_to_target_node(unbound_row, None)
+    assert target_node.binding_state == BINDING_STATE_UNBOUND_FORMULA
+
+    # 3. Unmatched observations (matched_sim_ops == 0) never stamp BINDING_STATE_MEASURED.
+    csv_empty = tmp_path / "empty_kernels.csv"
+    csv_empty.write_text(
+        "Device_id,Task ID,Stream ID,Name,Type,Accelerator Core,Start Time(us),Duration(us),Input Shapes,Input Data Types\n"
+        '0,1,1,CompletelyUnrelatedKernel,Other,AI_VECTOR_CORE,100.0,1.0,"""1""",DT_BF16\n',
+        encoding="utf-8",
+    )
+    bun_unmatched = build_export_bundle(raw_base, request=req_base, observations_path=csv_empty, apply_target_envelope=False)
+    assert bun_unmatched.reconciliation is not None and bun_unmatched.reconciliation.matched_sim_ops == 0
+    assert bun_unmatched.binding_state == BINDING_STATE_BOUND
+
+    # 4. Tuple sequences normalize via cohort_sequence_counts (cluster_concurrency = sum, HBM = per-replica).
+    raw_dp2 = compose_case("qwen3-32b", "a3", dp=2, tp=2, layers=2, prompt_tokens=256, output_tokens=32)
+    req_tup = StepRequest(phase="decode", tokens=1, context=256, sequences=(8, 8), scope="body")
+    bun_tup = build_export_bundle(raw_dp2, request=req_tup, apply_target_envelope=False)
+    assert bun_tup.sequences == 8 and bun_tup.cluster_concurrency == 16
+    assert bun_tup.memory_ledger.concurrency == 8
+    tup_brief = build_agent_brief(bun_tup)
+    assert tup_brief["scenario_and_parallelism"]["cluster_concurrency"] == 16
+
+    # 5. step_eval preserves primitive_table=False & rejects rewrite_plan with apply_target_envelope=False.
+    step_eval = evaluate_step(raw_base, req_base, primitive_table=False)
+    bun_se = build_export_bundle(raw_base, request=req_base, step_eval=step_eval, primitive_table=False)
+    assert bun_se.step_span_us > 0.0
+    with pytest.raises(ModelingError, match="rewrite_plan_conflicts_with_apply_target_envelope_false"):
+        build_export_bundle(raw_base, request=req_base, step_eval=step_eval, rewrite_plan={"edits": []}, apply_target_envelope=False)
+
+    # 6. PP2 peak-stage weight conservation (untied embed on S0 + lm_head on S1) & kv_block_size lookup.
+    raw_pp2 = compose_case("qwen3-32b", "a3", tp=2, pp=2, layers=4, prompt_tokens=256, output_tokens=32)
+    raw_pp2["runtime"]["kv_block_size"] = 64
+    raw_pp2["runtime"]["pp_layer_partition"] = [3, 1]
+    parsed_pp2 = parse_case(raw_pp2)
+    rep_pp2 = bundle_mod._build_archetype_representative_case(
+        parsed_pp2, {0: parsed_pp2.model.layer_plans[0], 1: parsed_pp2.model.layer_plans[3]},
+        allow_draft_dedup=True,
+    )
+    assert rep_pp2.runtime.pp_layer_partition == (1, 1)
+    led_pp2 = compute_memory_quant_ledger(parsed_pp2, phase="decode", seq_len=512, concurrency=2)
+    assert led_pp2.block_size == 64
+    hbm_rows = [
+        r for r in led_pp2.weight_rows
+        if not (r.is_engram_or_ple and led_pp2.engram_host_offload)
+        and not (r.is_vision and not led_pp2.include_vision_tower)
+    ]
+    assert sum(r.per_die_bytes for r in hbm_rows) == pytest.approx(led_pp2.weight_footprint_per_die_bytes, rel=1e-9)
+
+    # 7. Sheet 4 links M/N live to Sheet 2, reconciles unchanged exposure, and keeps bound Pillar-1 fusions bound.
+    op0, op1 = bun_base.operators[0], bun_base.operators[1]
+    b_op0 = replace(op0, exposed_dur_us=10000.0, dur_us=10000.0, repeat_count=1, is_overlapped=False)
+    b_op1 = replace(op1, exposed_dur_us=4000.0, dur_us=4000.0, repeat_count=1, is_overlapped=False)
+    a_op0 = replace(b_op0)  # Unchanged 10 ms -> 10 ms
+    a_op1 = replace(
+        b_op1, exposed_dur_us=2000.0, dur_us=2000.0, opt_pillar="pillar1_fusion",
+        needs_new_kernel=False, binding_state=BINDING_STATE_BOUND,
+    )
+    bun_b = replace(bun_base, operators=(b_op0, b_op1), step_span_us=14000.0, handoff_tpot_ms=4.0, tpot_slo_ms=16.0)
+    bun_a = replace(bun_base, operators=(a_op0, a_op1), step_span_us=12000.0, handoff_tpot_ms=4.0, tpot_slo_ms=16.0)
+    aligned_cmp = align_before_after_operators(bun_b, bun_a)
+    cards_cmp = build_pending_kernel_details(aligned_cmp, bun_a, before_bundle=bun_b)
+    assert len(cards_cmp) == 1
+    assert cards_cmp[0].category == PENDING_KIND_TO_OPTIMIZE
+    assert cards_cmp[0].binding_state == BINDING_STATE_BOUND
+
+    xlsx_live = tmp_path / "live_sheet4_and_s3.xlsx"
+    export_comparison_xlsx(bun_b, xlsx_live, compare_source=bun_a)
+    _, roots, shared = _read_xlsx_sheets(xlsx_live)
+    s1_cells = _sheet_cells(roots[SHEET_SUMMARY], shared)
+    assert any(f and "+4.0" in f for _, f in s1_cells.values())
+    s3_cells = _sheet_cells(roots[SHEET_MEMORY], shared)
+    assert any(f and "$T$18" in f and "E" in f for _, f in s3_cells.values())
+    s4_cells = _sheet_cells(roots[SHEET_PENDING_KERNELS], shared)
+    s4_m_formulas = [f for ref, (_, f) in s4_cells.items() if ref.startswith("M") and f]
+    s4_n_formulas = [f for ref, (_, f) in s4_cells.items() if ref.startswith("N") and f]
+    assert any(SHEET_BREAKDOWN in f for f in s4_m_formulas)
+    assert any(SHEET_BREAKDOWN in f for f in s4_n_formulas)
+    assert any(v == "Unchanged Operators Exposure Reconciliation" for v, _ in s4_cells.values())
+
+    # 8. Handoff TPOT flows into agent_brief SLA verdict + full-precision KPIs + CJK summary truncation < 8192 B.
+    brief_hf = build_agent_brief(bun_b, bun_a)
+    assert brief_hf["kpis_before_vs_after"]["before"]["effective_tpot_ms"] == pytest.approx(18.0, abs=1e-9)
+    assert brief_hf["kpis_before_vs_after"]["before"]["sla_verdict"] == "FAIL"
+    assert brief_hf["kpis_before_vs_after"]["after"]["effective_tpot_ms"] == pytest.approx(16.0, abs=1e-9)
+    assert brief_hf["kpis_before_vs_after"]["after"]["sla_verdict"] == "PASS"
+    bun_prec = replace(
+        bun_base, n_tok_per_die=0.0546875, step_span_us=1000.0,
+        us_per_tok_die=1000.0 / 0.0546875, throughput_per_die_tokens_per_s=54.6875,
+    )
+    prec_kpi = build_agent_brief(bun_prec)["kpis_before_vs_after"]["after"]
+    assert prec_kpi["n_tok_per_die"] == pytest.approx(0.0546875, abs=1e-12)
+    assert (prec_kpi["n_tok_per_die"] * 1000.0 / prec_kpi["step_ms"]) == pytest.approx(prec_kpi["single_die_tps"], rel=1e-12)
+    cjk_brief = {"schema": AGENT_BRIEF_SCHEMA, "summary": "界" * 3000}
+    cjk_out = tmp_path / "cjk_brief.json"
+    export_agent_brief(_compact_agent_brief_to_budget(cjk_brief), cjk_out)
+    assert cjk_out.stat().st_size < AGENT_BRIEF_MAX_BYTES
+
+    # 9. script_audit respects spec_k == 0 without model-name speculative override.
+    sh_path = tmp_path / "nospec.sh"
+    sh_path.write_text("vllm serve deepseek-v4-pro-0813 --tensor-parallel-size 2 --data-parallel-size 1\n", encoding="utf-8")
+    parsed_sh = parse_launch_script(sh_path)
+    bun_nospec = replace(bun_base, model_name="deepseek-v4-pro-0813", spec_proposals=0)
+    audit_rep = audit_launch_script(parsed_sh, before_bundle=bun_nospec, after_bundle=bun_nospec)
+    assert not any(issue.issue_id == "draft_tp_policy_mismatch" for issue in audit_rep.issues)
+
+
 

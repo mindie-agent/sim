@@ -57,8 +57,10 @@ from mindie_sim.export import (
     parse_launch_script,
     render_optimized_serve_sh,
 )
+from mindie_sim.prediction.frontend.speculation import compute_speculative_accept_step
 from mindie_sim.prediction.results import ReplayOptions, StepRequest
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.sweep.pd import DEFAULT_SPECULATIVE_ACCEPT_RATE
 
 REPORT_COMMANDS = frozenset({"report", "quickstart"})
 REPORT_BOOLEAN_FLAGS = frozenset({"--json", "--no-trace", "--no-xlsx"})
@@ -299,6 +301,11 @@ def _auto_solve_report_layout(
     indexer_kv_dtype: str | None,
     deployment_mode: str,
     feature_track: str | None = None,
+    mtp_proposal_tokens: int | None = None,
+    mtp_acceptance_length: float | None = None,
+    apply_target_envelope: bool = False,
+    rewrite_plan: Any = None,
+    allow_unbound_formula: bool = True,
 ) -> dict[str, Any]:
     """Auto-solve HBM-safe parallelism + concurrency via fast ``solve_optimal_deployment``."""
     from mindie_sim.sweep.pd import solve_optimal_deployment
@@ -321,6 +328,11 @@ def _auto_solve_report_layout(
         topology_preset=topology_preset,
         allow_unconstrained_ttft=(ttft_slo_ms is None),
         feature_track=feature_track,
+        mtp_proposal_tokens=mtp_proposal_tokens,
+        mtp_acceptance_length=mtp_acceptance_length,
+        apply_target_envelope=apply_target_envelope,
+        rewrite_plan=rewrite_plan,
+        allow_unbound_formula=allow_unbound_formula,
     )
     best = solved.get("best_configuration")
     if best is None:
@@ -494,12 +506,28 @@ def run_report_command(args: argparse.Namespace, *, load_designs: Any) -> dict[s
     after_track = str(args.target_track) if mode == MODE_MODELING else (
         str(args.target_track) if str(args.target_track) != "expected_ideal" else str(args.compare_track)
     )
+    has_target_after = (mode == MODE_MODELING) or (rewrite_plan is not None)
+    before_quant = (script_info.get("weight_quant") if script_info else None) or policy["weight_quant"]
+    before_kv = (script_info.get("cache_dtype") if script_info else None) or policy["kv_cache_dtype"]
+    after_quant, after_kv = policy["weight_quant"], policy["kv_cache_dtype"]
+    after_idx_kv = policy["indexer_kv_dtype"]
+    raw_wq_flag = str(args.weight_quant or "").strip().lower()
+    if mode == MODE_MODELING and raw_wq_flag in {"checkpoint", "native"}:
+        after_policy = resolve_auto_va_policy(
+            model_arg, args.hardware, context_tokens=prompt_tokens,
+            weight_quant="auto_va", cache_dtype=args.cache_dtype,
+        )
+        after_quant = after_policy["weight_quant"]
+        after_kv = after_policy["kv_cache_dtype"]
+        after_idx_kv = after_policy["indexer_kv_dtype"]
+    explicit_spec = int(args.spec_tokens) if args.spec_tokens is not None else None
+    explicit_accept = float(args.accept_len) if args.accept_len is not None else None
 
     if explicit_parallel:
         dp, tp, ep = int(args.dp or 1), int(args.tp or 1), int(args.ep or 1)
         pp, dcp, pcp = int(args.pp or 1), int(args.dcp or 1), int(args.pcp or 1)
         conc = int(args.concurrency or 1)
-        spec_toks = int(args.spec_tokens or 0)
+        spec_toks = int(explicit_spec or 0)
         dep_mode = str(args.deployment_mode or "auto")
         before_par = dict(dp=dp, tp=tp, ep=ep, pp=pp, dcp=dcp, pcp=pcp)
         before_conc = conc
@@ -507,20 +535,25 @@ def run_report_command(args: argparse.Namespace, *, load_designs: Any) -> dict[s
         n_dev = int(
             args.num_devices
             or (script_info.get("num_devices") if script_info else None)
-            or _estimate_auto_num_devices(policy["model_spec"], policy["sku"], policy["weight_quant"])
+            or _estimate_auto_num_devices(policy["model_spec"], policy["sku"], after_quant)
         )
         solved_after = _auto_solve_report_layout(
             model=model_arg, sku=policy["sku"], topology_preset=topo_preset,
             num_devices=n_dev, prompt_tokens=prompt_tokens, output_tokens=output_tokens,
             tpot_slo_ms=float(args.tpot_ms), ttft_slo_ms=args.ttft_ms,
-            quant=policy["weight_quant"], kv_cache_dtype=policy["kv_cache_dtype"],
-            indexer_kv_dtype=policy["indexer_kv_dtype"], deployment_mode=str(args.deployment_mode or "auto"),
+            quant=after_quant, kv_cache_dtype=after_kv,
+            indexer_kv_dtype=after_idx_kv, deployment_mode=str(args.deployment_mode or "auto"),
             feature_track=after_track,
+            mtp_proposal_tokens=explicit_spec,
+            mtp_acceptance_length=explicit_accept,
+            apply_target_envelope=has_target_after,
+            rewrite_plan=rewrite_plan if has_target_after else None,
+            allow_unbound_formula=(mode == MODE_MODELING),
         )
         dp, tp, ep, pp = solved_after["dp"], solved_after["tp"], solved_after["ep"], solved_after["pp"]
         dcp, pcp = solved_after["dcp"], solved_after["pcp"]
         conc = int(args.concurrency or solved_after["concurrency"])
-        spec_toks = int(args.spec_tokens if args.spec_tokens is not None else solved_after["spec_tokens"])
+        spec_toks = int(explicit_spec if explicit_spec is not None else solved_after["spec_tokens"])
         dep_mode = solved_after["deployment_mode"] if args.deployment_mode == "auto" else str(args.deployment_mode)
         if script_info:
             before_par = dict(
@@ -528,14 +561,21 @@ def run_report_command(args: argparse.Namespace, *, load_designs: Any) -> dict[s
                 pp=script_info["pp"], dcp=script_info["dcp"], pcp=1,
             )
             before_conc = int(script_info.get("concurrency") or conc)
-        elif mode == MODE_MODELING and before_track != after_track:
+        elif has_target_after and (
+            before_track != after_track or before_quant != after_quant or before_kv != after_kv or rewrite_plan is not None
+        ):
             solved_before = _auto_solve_report_layout(
                 model=model_arg, sku=policy["sku"], topology_preset=topo_preset,
                 num_devices=n_dev, prompt_tokens=prompt_tokens, output_tokens=output_tokens,
                 tpot_slo_ms=float(args.tpot_ms), ttft_slo_ms=args.ttft_ms,
-                quant=policy["weight_quant"], kv_cache_dtype=policy["kv_cache_dtype"],
+                quant=before_quant, kv_cache_dtype=before_kv,
                 indexer_kv_dtype=policy["indexer_kv_dtype"], deployment_mode=str(args.deployment_mode or "auto"),
                 feature_track=before_track,
+                mtp_proposal_tokens=explicit_spec,
+                mtp_acceptance_length=explicit_accept,
+                apply_target_envelope=False,
+                rewrite_plan=None,
+                allow_unbound_formula=False,
             )
             before_par = dict(
                 dp=solved_before["dp"], tp=solved_before["tp"], ep=solved_before["ep"],
@@ -546,13 +586,13 @@ def run_report_command(args: argparse.Namespace, *, load_designs: Any) -> dict[s
             before_par = dict(dp=dp, tp=tp, ep=ep, pp=pp, dcp=dcp, pcp=pcp)
             before_conc = conc
 
-    accept_len = float(args.accept_len if args.accept_len is not None else (1.0 + 0.7 * spec_toks))
-    before_quant = (script_info.get("weight_quant") if script_info else None) or policy["weight_quant"]
-    before_kv = (script_info.get("cache_dtype") if script_info else None) or policy["kv_cache_dtype"]
-    after_quant, after_kv = policy["weight_quant"], policy["kv_cache_dtype"]
-    if str(args.weight_quant or "").strip().lower() in {"bf16", "checkpoint", "native"}:
-        after_policy = resolve_auto_va_policy(model_arg, args.hardware, context_tokens=prompt_tokens, weight_quant="auto_va")
-        after_quant, after_kv = after_policy["weight_quant"], after_policy["kv_cache_dtype"]
+    accept_len = float(
+        explicit_accept if explicit_accept is not None
+        else (
+            compute_speculative_accept_step(DEFAULT_SPECULATIVE_ACCEPT_RATE, spec_toks)
+            if spec_toks > 0 else 1.0
+        )
+    )
 
     replay = ReplayOptions(include_submission=bool(getattr(args, "include_submission", False)))
     common_kw = dict(
@@ -586,8 +626,9 @@ def run_report_command(args: argparse.Namespace, *, load_designs: Any) -> dict[s
     after_bundle = build_export_bundle(
         raw_after, request=step_a, replay=replay,
         weight_quant=after_quant, cache_dtype=after_kv, engram_host_offload=args.engram_offload,
-        apply_target_envelope=(mode == MODE_MODELING),
-        rewrite_plan=rewrite_plan if mode == MODE_MODELING else None,
+        apply_target_envelope=has_target_after,
+        rewrite_plan=rewrite_plan if has_target_after else None,
+        allow_unbound_formula=(mode == MODE_MODELING),
     )
     summary, brief_dict, digest_md = _emit_report_artifacts(
         before_bundle=before_bundle, after_bundle=after_bundle,

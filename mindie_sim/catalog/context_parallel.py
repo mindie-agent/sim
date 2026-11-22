@@ -945,48 +945,64 @@ def legal_vllm_ascend_dcp_values(
 ) -> tuple[int, ...]:
     """Exact ``vllm-ascend`` legal DCP degrees reusing TP (and optional PCP) ranks.
 
-    Standalone Decode DCP (``pcp == 1``) reuses the TP rank group with zero
-    extra ranks (``world_size = dp * tp * pp``):
-    - SFA / DSA sparse MLA: ``dcp in {1, tp}`` (must equal ``tp`` when > 1).
-    - Standard MLA: ``dcp`` divides ``tp`` (``1 <= dcp <= tp``).
-    - GQA / replicated cache / non-KV: ``dcp == 1`` (GQA DCP deprecated in v0.32.0).
-    Combined PCP + DCP (``pcp > 1``, ``world_size = dp * tp * pcp * pp``):
-    - MLA / SFA: ``dcp in {1, pcp, pcp * tp}``.
-    - GQA / replicated cache / non-KV: ``dcp == 1``.
+    Follows upstream ``vllm_ascend/platform.py:_validate_parallel_config`` and
+    ``_validate_pcp_dcp_config``:
+    - ``dcp == 1`` is always legal (including PCP-only ``pcp > 1, dcp == 1``).
+    - Replicated cache / non-KV: ``dcp == 1`` only.
+    - SFA / DSA sparse MLA with replicated indexer (``dcp > 1``):
+      ``dcp in {pcp, pcp * tp}`` (so ``{1, tp}`` when ``pcp == 1``,
+      ``{1, pcp, pcp * tp}`` when ``pcp > 1``).
+    - Standard MLA: ``dcp`` divides ``tp * pcp`` (``1 <= dcp <= tp * pcp``).
+    - GQA: ``dcp == 1`` (or ``dcp == pcp`` when ``pcp > 1``; GQA DCP > 1 is
+      deprecated with warning in v0.32.0 rather than hard-rejected).
     """
     tp_n = max(1, int(tp))
     pcp_n = max(1, int(pcp))
     kind = _model_dcp_attention_class(model)
-    if kind in {"gqa", "replicated_cache", "non_kv"}:
+    if kind in {"replicated_cache", "non_kv"}:
         return (1,)
-    if pcp_n > 1:
-        return tuple(dict.fromkeys((1, pcp_n, pcp_n * tp_n)))
+    if kind == "gqa":
+        return (1, pcp_n) if pcp_n > 1 else (1,)
     if kind == "sfa_dsa":
+        if pcp_n > 1:
+            return tuple(dict.fromkeys((1, pcp_n, pcp_n * tp_n)))
         return (1, tp_n) if tp_n > 1 else (1,)
-    return tuple(d for d in range(1, tp_n + 1) if tp_n % d == 0)
+    domain = tp_n * pcp_n
+    return tuple(d for d in range(1, domain + 1) if domain % d == 0)
 
 
 def validate_vllm_ascend_dcp_codomain(
     model: ModelSpec, parallel: ParallelSpec,
 ) -> tuple[bool, str | None]:
-    """Check whether ``parallel`` obeys upstream ``vllm-ascend`` DCP <-> TP co-domain rules."""
+    """Check whether ``parallel`` obeys upstream ``vllm-ascend`` DCP <-> TP co-domain rules.
+
+    Returns ``(ok, reason_or_warning)``.  Deprecated-but-accepted GQA DCP configs
+    return ``(True, "vllm_ascend_gqa_dcp_deprecated")`` matching upstream's
+    warning-only policy, while hard incompatibilities return ``(False, reason)``.
+    """
     dcp = max(1, int(getattr(parallel, "cp", 1) or 1))
     tp = max(1, int(getattr(parallel, "tp", 1) or 1))
     pcp = max(1, int(getattr(parallel, "pcp", 1) or 1))
+    kind = _model_dcp_attention_class(model)
     if dcp <= 1:
         return True, None
-    kind = _model_dcp_attention_class(model)
     if kind == "replicated_cache":
         return False, "vllm_ascend_replicated_cache_requires_dcp_1"
     if kind == "non_kv":
         return False, "vllm_ascend_non_kv_model_requires_dcp_1"
     if kind == "gqa":
-        return False, "vllm_ascend_gqa_dcp_deprecated"
+        if pcp > 1 and dcp != pcp:
+            return False, f"vllm_ascend_gqa_pcp_dcp_must_match:pcp={pcp},dcp={dcp}"
+        if pcp == 1 and tp % dcp != 0:
+            return False, f"vllm_ascend_gqa_dcp_must_divide_tp:dcp={dcp},tp={tp}"
+        return True, "vllm_ascend_gqa_dcp_deprecated"
     legal = legal_vllm_ascend_dcp_values(model, tp=tp, pcp=pcp)
     if dcp in legal:
         return True, None
-    if pcp > 1:
-        return False, f"vllm_ascend_pcp_dcp_must_be_pcp_or_pcp_times_tp:dcp={dcp},pcp={pcp},tp={tp}"
     if kind == "sfa_dsa":
+        if pcp > 1:
+            return False, f"vllm_ascend_sfa_pcp_dcp_must_be_pcp_or_pcp_times_tp:dcp={dcp},pcp={pcp},tp={tp}"
         return False, f"vllm_ascend_sfa_dcp_must_equal_tp:dcp={dcp},tp={tp}"
+    if pcp > 1:
+        return False, f"vllm_ascend_mla_pcp_dcp_must_divide_tp_times_pcp:dcp={dcp},pcp={pcp},tp={tp}"
     return False, f"vllm_ascend_mla_dcp_must_divide_tp:dcp={dcp},tp={tp}"

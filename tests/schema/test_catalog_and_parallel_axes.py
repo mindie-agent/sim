@@ -559,9 +559,23 @@ def test_vllm_ascend_dcp_codomain_laws_and_tp_rank_reuse() -> None:
     assert legal_vllm_ascend_dcp_values(shared_indexer_model, tp=8, pcp=1) == (1, 8)
     assert legal_vllm_ascend_dcp_values(sfa_model, tp=4, pcp=2) == (1, 2, 8)
     assert legal_vllm_ascend_dcp_values(mla_model, tp=6, pcp=1) == (1, 2, 3, 6)
-    assert legal_vllm_ascend_dcp_values(mla_model, tp=4, pcp=2) == (1, 2, 8)
+    assert legal_vllm_ascend_dcp_values(mla_model, tp=4, pcp=2) == (1, 2, 4, 8)
     assert legal_vllm_ascend_dcp_values(gqa_model, tp=8, pcp=1) == (1,)
+    assert legal_vllm_ascend_dcp_values(gqa_model, tp=8, pcp=2) == (1, 2)
     assert legal_vllm_ascend_dcp_values(non_kv_model, tp=8, pcp=1) == (1,)
+
+    # PCP-only (dcp=1) is valid across MLA, SFA, GQA, and non-KV.
+    assert validate_vllm_ascend_dcp_codomain(sfa_model, ParallelSpec(dp=1, tp=4, pcp=2, dcp=1)) == (True, None)
+    assert validate_vllm_ascend_dcp_codomain(mla_model, ParallelSpec(dp=1, tp=4, pcp=2, dcp=1)) == (True, None)
+    assert validate_vllm_ascend_dcp_codomain(mla_model, ParallelSpec(dp=1, tp=4, pcp=2, dcp=2)) == (True, None)
+    assert validate_vllm_ascend_dcp_codomain(mla_model, ParallelSpec(dp=1, tp=4, pcp=2, dcp=4)) == (True, None)
+    assert validate_vllm_ascend_dcp_codomain(sfa_model, ParallelSpec(dp=1, tp=4, pcp=2, dcp=8)) == (True, None)
+    ok, reason = validate_vllm_ascend_dcp_codomain(
+        sfa_model, ParallelSpec(dp=1, tp=4, pcp=2, dcp=4),
+    )
+    assert not ok and reason is not None and "sfa_pcp_dcp_must_be_pcp_or_pcp_times_tp" in reason
+    assert validate_vllm_ascend_dcp_codomain(gqa_model, ParallelSpec(dp=1, tp=4, pcp=2, dcp=1)) == (True, None)
+    assert validate_vllm_ascend_dcp_codomain(non_kv_model, ParallelSpec(dp=1, tp=4, pcp=2, dcp=1)) == (True, None)
 
     ok, reason = validate_vllm_ascend_dcp_codomain(
         sfa_model, ParallelSpec(dp=1, tp=8, pcp=1, dcp=2),
@@ -575,10 +589,17 @@ def test_vllm_ascend_dcp_codomain_laws_and_tp_rank_reuse() -> None:
         mla_model, ParallelSpec(dp=1, tp=6, pcp=1, dcp=4),
     )
     assert not ok and reason is not None and "mla_dcp_must_divide_tp" in reason
-    ok, reason = validate_vllm_ascend_dcp_codomain(
+    # GQA DCP > 1 emits a deprecation warning without hard rejection when pcp == 1 or pcp == dcp.
+    assert validate_vllm_ascend_dcp_codomain(
         gqa_model, ParallelSpec(dp=1, tp=8, pcp=1, dcp=2),
+    ) == (True, "vllm_ascend_gqa_dcp_deprecated")
+    assert validate_vllm_ascend_dcp_codomain(
+        gqa_model, ParallelSpec(dp=1, tp=8, pcp=2, dcp=2),
+    ) == (True, "vllm_ascend_gqa_dcp_deprecated")
+    ok, reason = validate_vllm_ascend_dcp_codomain(
+        gqa_model, ParallelSpec(dp=1, tp=8, pcp=2, dcp=4),
     )
-    assert not ok and reason == "vllm_ascend_gqa_dcp_deprecated"
+    assert not ok and reason is not None and "gqa_pcp_dcp_must_match" in reason
     ok, reason = validate_vllm_ascend_dcp_codomain(
         non_kv_model, ParallelSpec(dp=1, tp=8, pcp=1, dcp=2),
     )

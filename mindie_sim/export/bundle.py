@@ -37,168 +37,20 @@ from mindie_sim.optimization.dual_bound import (
     check_optimality_certificate,
     inward_floor_ns,
 )
-try:
-    from mindie_sim.optimization.kernel_synthesis import (
-        TargetOpNode,
-        attribute_node_overlap,
-        evaluate_macro_wall_trigger,
-        extract_sku_floors,
-        solve_target_graph,
-    )
-    _HAS_KERNEL_SYNTHESIS = True
-except ImportError:  # Standalone pre-merge compatibility before optimization/kernel_synthesis lands.
-    _HAS_KERNEL_SYNTHESIS = False
-
-    @dataclass(frozen=True, slots=True)
-    class _StandaloneFloors:
-        is_a5_ub: bool
-        is_intra_pod: bool
-
-    @dataclass(frozen=True, slots=True)
-    class _StandaloneWall:
-        wall_kind: str
-        tpot_ms: float
-        tpot_slo_ms: float
-        sla_slack_ms: float
-        hbm_headroom_gib: float
-        hbm_utilization_pct: float
-        tradeoff_direction: str
-        recommended_actions: tuple[str, ...]
-
-        def to_dict(self) -> dict[str, Any]:
-            return {
-                "wall_kind": self.wall_kind,
-                "tpot_ms": round(float(self.tpot_ms), 3),
-                "tpot_slo_ms": round(float(self.tpot_slo_ms), 3),
-                "sla_slack_ms": round(float(self.sla_slack_ms), 3),
-                "hbm_headroom_gib": round(float(self.hbm_headroom_gib), 2),
-                "hbm_utilization_pct": round(float(self.hbm_utilization_pct), 1),
-                "tradeoff_direction": self.tradeoff_direction,
-                "recommended_actions": list(self.recommended_actions),
-            }
-
-    TargetOpNode = Any  # type: ignore[misc,assignment]
-
-    def extract_sku_floors(case: Case) -> Any:
-        sku_low = str(case.machine.sku or case.machine.name or "").lower()
-        topo_opts = dict(getattr(case.machine, "topology_options", ()) or ())
-        preset_low = str(topo_opts.get("topology_preset") or "").lower()
-        is_a5 = any(tok in sku_low for tok in ("950", "a5", "3510", "arch35")) or "a5" in preset_low
-        is_pod = any(tok in preset_low for tok in ("pod", "16p", "8p")) or is_a5
-        return _StandaloneFloors(is_a5_ub=(is_a5 and is_pod), is_intra_pod=is_pod)
-
-    def evaluate_macro_wall_trigger(
-        *,
-        tpot_ms: float,
-        tpot_slo_ms: float,
-        hbm_used_bytes: float,
-        hbm_usable_bytes: float,
-        hbm_headroom_bytes: float,
-    ) -> Any:
-        slo = max(float(tpot_slo_ms), 1e-6)
-        slack = slo - float(tpot_ms)
-        util_pct = (100.0 * float(hbm_used_bytes) / float(hbm_usable_bytes)) if hbm_usable_bytes > 0.0 else 0.0
-        headroom_gib = float(hbm_headroom_bytes) / float(1024 ** 3)
-        if slack >= 3.0 and util_pct >= 88.0:
-            return _StandaloneWall(
-                "HBM_CAPACITY_WALL", tpot_ms, tpot_slo_ms, slack, headroom_gib, util_pct,
-                "compute_for_memory_and_offload",
-                (
-                    "以算换存: 优先启用 MLA 矩阵吸收 / KV Cache 低比特量化 (C8/FP8) 释放单卡 HBM",
-                    "内存卸载: 评估 KV Offloading / Host DRAM-SSD Prefix Cache 分级池化与 Engram Host Offload",
-                ),
-            )
-        if float(tpot_ms) >= slo * 0.92 and headroom_gib >= 8.0:
-            return _StandaloneWall(
-                "LATENCY_COMPUTE_WALL", tpot_ms, tpot_slo_ms, slack, headroom_gib, util_pct,
-                "memory_for_compute",
-                (
-                    "以存换算: 利用充裕 HBM 余量预展开高频投影权重或增大片上分块驻留",
-                    "投机多槽快照: 分配 [K+1] 多槽状态缓冲并做 in-place 2D 槽位别名消除回滚拷贝",
-                ),
-            )
-        return _StandaloneWall(
-            "BALANCED", tpot_ms, tpot_slo_ms, slack, headroom_gib, util_pct, "balanced",
-            ("当前延迟与 HBM 利用率处于均衡区间，优先落地已验证的片上融合与超节点通信展开方案",),
-        )
-
-    def _merge_ivs(ivs: Sequence[tuple[float, float]]) -> list[tuple[float, float]]:
-        ordered = sorted((max(0.0, a), max(a, b)) for a, b in ivs if b > a)
-        if not ordered:
-            return []
-        out = [ordered[0]]
-        for lo, hi in ordered[1:]:
-            if lo <= out[-1][1]:
-                out[-1] = (out[-1][0], max(out[-1][1], hi))
-            else:
-                out.append((lo, hi))
-        return out
-
-    def _exposed_outside(iv: tuple[float, float], cover: Sequence[tuple[float, float]]) -> float:
-        lo, hi = iv
-        cur = lo
-        exposed = 0.0
-        for c_lo, c_hi in cover:
-            if c_hi <= cur:
-                continue
-            if c_lo >= hi:
-                break
-            if c_lo > cur:
-                exposed += min(hi, c_lo) - cur
-            cur = max(cur, c_hi)
-            if cur >= hi:
-                return 0.0
-        return exposed + max(0.0, hi - cur)
-
-    def attribute_node_overlap(nodes: Sequence[Any]) -> tuple[list[Any], dict[str, float]]:
-        by_arch: dict[str, list[tuple[int, Any]]] = defaultdict(list)
-        for idx, node in enumerate(nodes):
-            by_arch[node.archetype_id].append((idx, node))
-        updated = list(nodes)
-        spans: dict[str, float] = {}
-        for aid, indexed in by_arch.items():
-            spans[aid] = sum(hi - lo for lo, hi in _merge_ivs([(n.start_us, n.end_us) for _, n in indexed if n.dur_us > 0.0]))
-            ordered = sorted(
-                indexed,
-                key=lambda item: (
-                    2 if item[1].stream_index == 1 else (1 if item[1].stream_index == 2 else 0),
-                    -(item[1].hbm_total_bytes + item[1].flops),
-                    item[1].ordinal,
-                ),
-            )
-            claimed: list[tuple[float, float]] = []
-            claimed_lbls: list[tuple[float, float, str]] = []
-            for idx, node in ordered:
-                if node.dur_us <= 0.0:
-                    updated[idx] = replace(node, is_overlapped=False, exposed_dur_us=0.0, masked_by="")
-                    continue
-                iv = (node.start_us, node.end_us)
-                exp_us = _exposed_outside(iv, claimed)
-                fully_hidden = exp_us <= 1e-3
-                eff_exp = 0.0 if fully_hidden else exp_us
-                masker = ""
-                if node.dur_us - exp_us > 1e-3 and claimed_lbls:
-                    best_lbl = max(
-                        claimed_lbls,
-                        key=lambda seg: max(0.0, min(iv[1], seg[1]) - max(iv[0], seg[0])),
-                    )
-                    masker = best_lbl[2]
-                b_disp = f"Overlapped by {masker} (0 exposed)" if fully_hidden else node.bound_display
-                updated[idx] = replace(
-                    node, is_overlapped=fully_hidden, exposed_dur_us=eff_exp,
-                    masked_by=masker, bound_display=b_disp,
-                )
-                claimed = _merge_ivs([*claimed, iv])
-                claimed_lbls.append((iv[0], iv[1], (node.logical_role or node.ascend_kernel or node.op_id)[:48]))
-        return updated, spans
-
-    def solve_target_graph(*args: Any, **kwargs: Any) -> Any:  # pragma: no cover
-        raise ModelingError("kernel_synthesis_module_unavailable")
+from mindie_sim.optimization.kernel_synthesis import (
+    TargetOpNode,
+    attribute_node_overlap,
+    evaluate_macro_wall_trigger,
+    extract_sku_floors,
+    load_rewrite_plan,
+    solve_target_graph,
+)
 from mindie_sim.prediction.body_defaults import consume_target_declaration
 from mindie_sim.prediction.efficiency import extract_hardware_peaks
 from mindie_sim.prediction.evaluation import EvaluationContext
 from mindie_sim.prediction.graph_analysis import graph_costs
 from mindie_sim.prediction.mechanism import Geometry
+from mindie_sim.prediction.operator_analysis import cohort_sequence_counts
 from mindie_sim.prediction.results import (
     CaseInput,
     FusedPipelineDescriptor,
@@ -247,7 +99,6 @@ from .models import (
     DEPLOYMENT_MODE_LABELS,
     EXPORT_BUNDLE_SCHEMA,
     GRAPH_DIGEST_HEX_LEN,
-    HARDWARE_PRESET_ALIASES,
     KIB_BYTES,
     LAUNCH_BOUND_SHORT_US,
     LAUNCH_BOUND_WORK_SHARE,
@@ -278,12 +129,25 @@ _RECURRENT_MICRO_PATTERN = re.compile(r"^(.*)\.(recurrent_scan|chunk_kda)(\d+)$"
 def resolve_hardware_alias(
     hardware: str, topology_preset: str | None = None,
 ) -> tuple[str, str | None]:
-    """Expand intuitive CLI hardware/pod aliases into ``(sku, topology_preset)``."""
-    key = str(hardware or "").strip().lower()
-    if key in HARDWARE_PRESET_ALIASES:
-        sku, preset = HARDWARE_PRESET_ALIASES[key]
+    """Expand CLI hardware/pod aliases via single-source ``compose.inputs``."""
+    from mindie_sim.compose.inputs import (
+        HARDWARE_ALIASES,
+        HARDWARE_TOPOLOGY_ALIASES,
+        _resolve_hardware,
+    )
+
+    raw = str(hardware or "").strip()
+    key = raw.lower()
+    if key in HARDWARE_TOPOLOGY_ALIASES:
+        sku, preset = HARDWARE_TOPOLOGY_ALIASES[key]
         return sku, (topology_preset if topology_preset is not None else preset)
-    return str(hardware).strip(), topology_preset
+    if key in HARDWARE_ALIASES:
+        return HARDWARE_ALIASES[key], topology_preset
+    try:
+        sku, _backend, alias_preset = _resolve_hardware(raw)
+        return sku, (topology_preset if topology_preset is not None else (alias_preset or None))
+    except ModelingError:
+        return raw, topology_preset
 
 
 def compose_export_case(
@@ -662,7 +526,24 @@ def _build_archetype_representative_case(
         if remapped:
             rep_engram = replace(rep_engram, tables=remapped)
     rep_model = replace(case.model, layers=len(rep_plans), layer_plans=rep_plans, auxiliary=rep_aux, engram=rep_engram)
-    if case.runtime.parallel.pp > len(rep_plans):
+    pp = int(case.runtime.parallel.pp)
+    if pp > len(rep_plans):
+        return case
+    if pp > 1:
+        stage_counts = stage_layer_counts(case)
+        stage_of: dict[int, int] = {}
+        cursor = 0
+        for st_idx, cnt in enumerate(stage_counts):
+            for _ in range(int(cnt)):
+                stage_of[cursor] = st_idx
+                cursor += 1
+        rep_stages = [
+            stage_of.get(int(orig_lp.index), 0)
+            for _new_idx, orig_lp in sorted(rep_lp_by_idx.items())
+        ]
+        rep_pp_part = tuple(sum(1 for st in rep_stages if st == s) for s in range(pp))
+        if all(c >= 1 for c in rep_pp_part) and sum(rep_pp_part) == len(rep_plans):
+            return replace(case, model=rep_model, runtime=replace(case.runtime, pp_layer_partition=rep_pp_part))
         return case
     return replace(case, model=rep_model, runtime=replace(case.runtime, pp_layer_partition=()))
 
@@ -898,22 +779,28 @@ def _fast_graph_id(ops: Sequence[OpSpec], model_name: str, phase: str) -> str:
 
 
 def _extract_structure_registry_view(
-    eff_case: Case, exec_graphs: Mapping[int, Sequence[OpSpec]], step_req: StepRequest,
+    eff_case: Case,
+    exec_graphs: Mapping[int, Sequence[OpSpec]],
+    step_req: StepRequest,
+    *,
+    semantic_graphs: Mapping[int, Sequence[OpSpec]] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
     if 0 not in exec_graphs:
         return {}, {}
-    try:
-        from mindie_sim.structure import export_op_structure, structure_inputs_from_graphs
-        r0_graphs = {0: tuple(exec_graphs[0])}
-        s_graphs, options = structure_inputs_from_graphs(
-            eff_case, r0_graphs,
-            phase=step_req.phase, tokens=step_req.tokens, context=step_req.context,
-            sequences=step_req.sequences, scope=step_req.scope, replicas=[0],
-            physical_graphs=r0_graphs,
-        )
-        report = export_op_structure(s_graphs, native_evidence=True, **options)
-    except Exception:
-        return {}, {}
+    from mindie_sim.structure import export_op_structure, structure_inputs_from_graphs
+    r0_phys = {0: tuple(exec_graphs[0])}
+    sem_graphs: Any = (
+        semantic_graphs
+        if (semantic_graphs is not None and 0 in semantic_graphs)
+        else r0_phys
+    )
+    s_graphs, options = structure_inputs_from_graphs(
+        eff_case, sem_graphs,
+        phase=step_req.phase, tokens=step_req.tokens, context=step_req.context,
+        sequences=step_req.sequences, scope=step_req.scope, replicas=[0],
+        physical_graphs=r0_phys,
+    )
+    report = export_op_structure(s_graphs, native_evidence=True, **options)
     node_by_op: dict[str, dict[str, Any]] = {}
     for node in (*report.get("nodes", ()), *report.get("resource_operators", ())):
         if isinstance(node, Mapping) and node.get("op_id"):
@@ -975,10 +862,11 @@ def _extract_prepared_work_fallback(
 
 def _evaluate_representative_step(
     spine: Any, rep_case: Case, step_req: StepRequest, replay: ReplayOptions,
+    *, primitive_table: Any = None, streams: tuple[Any, ...] = (),
 ) -> tuple[
     Case, list[dict[str, Any]], dict[tuple[int, str], OpSpec],
     dict[str, Sequence[Any]], dict[str, dict[str, Any]], dict[str, dict[str, Any]], str,
-    dict[str, dict[str, float]],
+    dict[str, dict[str, float]], Any,
 ]:
     base = spine.stacks.resolve_base(rep_case, LoweringRequest(step=step_req))
     rewritten = spine.rewrite.apply(base)
@@ -988,27 +876,34 @@ def _evaluate_representative_step(
     )
     book = ReplayRecipeBook.from_mapping(eff_case.runtime.kernels, family_registry=spine.families)
     book.graph = rewritten
-    evaluation = EvaluationContext.create(eff_case, book, None)
+    evaluation = EvaluationContext.create(eff_case, book, None, primitive_table=primitive_table)
+    rebound_primitive_table = False if primitive_table is False else evaluation.bindings.primitive_table
     graphs = {entry.replica: entry.ops for entry in rewritten.executable}
     ext_inputs = (
         {"analysis_input": 0.0}
         if any("analysis_input" in op.deps for ops in graphs.values() for op in ops)
         else None
     )
+    eff_streams = tuple(streams) if streams else (rewritten.streams or ())
     report = graph_costs(
         eff_case, graphs, recipes=book, external_inputs=ext_inputs,
         include_submission=replay.include_submission, isolated=replay.isolated,
         trace_limit=replay.event_limit, compact=False, evaluation=evaluation,
-        stream_plans=rewritten.streams or None, request_views=rewritten.request_views,
+        stream_plans=eff_streams or None, request_views=rewritten.request_views,
         padded_tokens=step_req.padded_tokens, sequence_layout=step_req.layout,
         timeline_replicas=(0,),
     )
     op_spec_by_key = {(entry.replica, op.op_id): op for entry in rewritten.executable for op in entry.ops}
     prepared_work_by_op = _extract_prepared_work_fallback(eff_case, book, graphs.get(0, ()))
-    struct_by_op, subgraph_by_op = _extract_structure_registry_view(eff_case, graphs, step_req)
+    struct_by_op, subgraph_by_op = _extract_structure_registry_view(
+        eff_case, graphs, step_req, semantic_graphs=rewritten.target_graphs,
+    )
     graph_id = _fast_graph_id(graphs.get(0, ()), str(eff_case.model.name), step_req.phase)
     timeline = list(report.get("timeline") or report.get("operators") or ())
-    return eff_case, timeline, op_spec_by_key, {}, struct_by_op, subgraph_by_op, graph_id, prepared_work_by_op
+    return (
+        eff_case, timeline, op_spec_by_key, {}, struct_by_op, subgraph_by_op,
+        graph_id, prepared_work_by_op, rebound_primitive_table,
+    )
 
 
 def _timeline_to_raw_records(
@@ -1084,11 +979,15 @@ def _filter_barriers_and_rewire_preds(records: Sequence[Mapping[str, Any]]) -> l
 
 
 def _attach_action_guidance(
-    rows: Sequence[OperatorExportRow], case: Case, *, phase: str,
+    rows: Sequence[OperatorExportRow],
+    case: Case,
+    *,
+    phase: str,
+    primitive_table: Any = None,
 ) -> list[OperatorExportRow]:
     from .comparison import build_op_action_guidance
 
-    floors = extract_sku_floors(case)
+    floors = extract_sku_floors(case, primitive_table=primitive_table)
     sku_str = str(case.machine.sku or case.machine.name or "")
     out: list[OperatorExportRow] = []
     for row in rows:
@@ -1100,8 +999,6 @@ def _attach_action_guidance(
 
 
 def _row_to_target_node(row: OperatorExportRow, spec: OpSpec | None) -> TargetOpNode:
-    if not _HAS_KERNEL_SYNTHESIS:
-        return row
     return TargetOpNode(
         ordinal=row.ordinal, occurrence=row.occurrence, op_id=row.op_id,
         archetype_id=row.archetype_id, repeat_count=row.repeat_count,
@@ -1121,6 +1018,7 @@ def _row_to_target_node(row: OperatorExportRow, spec: OpSpec | None) -> TargetOp
         kernel_status=row.kernel_status, needs_new_kernel=row.needs_new_kernel,
         new_kernel_spec=row.new_kernel_spec, canonical_op_key=row.canonical_op_key,
         opt_pillar=row.opt_pillar,
+        binding_state=row.binding_state,
         spec=spec, synthesis_spec=row.kernel_synthesis_spec,
     )
 
@@ -1478,6 +1376,119 @@ def _extract_scenario_meta(
     }
 
 
+def _normalize_bundle_sequences(
+    sequences: int | Sequence[int], dp: int,
+) -> tuple[int, int]:
+    """Return ``(per_replica_peak_concurrency, cluster_concurrency)`` via ``cohort_sequence_counts``."""
+    dp_n = max(1, int(dp))
+    if isinstance(sequences, int):
+        per_dp = max(1, int(sequences))
+        return per_dp, max(1, per_dp * dp_n)
+    counts = cohort_sequence_counts(sequences, range(dp_n))
+    return max(1, max(counts.values(), default=1)), max(1, sum(counts.values()))
+
+
+def _apply_target_envelope_to_rows(
+    prelim_rows: list[OperatorExportRow],
+    demands_ns: list[tuple[int, int, int, int, int]],
+    archetypes: Sequence[LayerArchetypeSpec],
+    *,
+    parsed: Case,
+    eff_case: Case,
+    step_req: StepRequest,
+    cluster_conc: int,
+    op_spec_by_key: Mapping[tuple[int, str], OpSpec],
+    peaks_by_stage: Mapping[int, dict[str, Any]],
+    ext_plan: Any,
+    rebound_primitive_table: Any,
+    allow_unbound_formula: bool,
+) -> tuple[
+    list[OperatorExportRow],
+    list[tuple[int, int, int, int, int]],
+    tuple[LayerArchetypeSpec, ...],
+    tuple[Any, ...],
+    tuple[Any, ...],
+    str,
+    bool,
+]:
+    row_by_occ = {r.occurrence: r for r in prelim_rows}
+    row_by_arch: dict[str, OperatorExportRow] = {}
+    for r in prelim_rows:
+        row_by_arch.setdefault(r.archetype_id, r)
+    scen_pre = _extract_scenario_meta(parsed, step_req, prelim_rows)
+    n_tok_die = (
+        float(max(1, cluster_conc))
+        * float(scen_pre["avg_accepted_tokens"])
+        / float(max(1, len(parsed.machine.dies)))
+    )
+    nodes = [_row_to_target_node(r, op_spec_by_key.get((0, r.op_id))) for r in prelim_rows]
+    solved = solve_target_graph(
+        nodes, demands_ns, eff_case, peaks_by_stage,
+        phase=step_req.phase, rewrite_plan=ext_plan, n_tok_per_die=n_tok_die,
+        primitive_table=rebound_primitive_table,
+        allow_unbound_formula=allow_unbound_formula,
+    )
+    new_rows = [
+        _apply_node_to_row(
+            row_by_occ.get(node.occurrence) or row_by_arch.get(node.archetype_id) or prelim_rows[0],
+            node,
+        )
+        for node in solved.nodes
+    ]
+    out_rows = _attach_action_guidance(
+        new_rows, eff_case, phase=step_req.phase, primitive_table=rebound_primitive_table,
+    )
+    out_archs = tuple(
+        replace(a, single_span_us=solved.archetype_spans_us.get(a.archetype_id, 0.0))
+        for a in archetypes
+    )
+    return (
+        out_rows, list(solved.demands_ns), out_archs,
+        solved.synthesis_specs, solved.semantic_audit_triggers,
+        solved.rewrite_plan_sha256, solved.verification_passed,
+    )
+
+
+def _resolve_bundle_step_eval(
+    spine: Any,
+    eval_case: Case,
+    step_req: StepRequest,
+    step_eval: StepEvaluation,
+    *,
+    primitive_table: Any,
+    streams: tuple[Any, ...],
+) -> tuple[
+    Case, list[dict[str, Any]], dict[tuple[int, str], OpSpec],
+    dict[str, Sequence[Any]], dict[str, dict[str, Any]], dict[str, dict[str, Any]],
+    str, tuple[FusedPipelineDescriptor, ...], Any,
+]:
+    eff_streams = tuple(streams) if streams else tuple(getattr(step_eval, "streams", ()) or ())
+    eff_pt_arg = primitive_table if primitive_table is not None else getattr(step_eval, "primitive_table", None)
+    prepared = spine.lower(eval_case, LoweringRequest(step=step_req), streams=eff_streams)
+    eff_case = prepared.case
+    if eff_pt_arg is False:
+        rebound_pt: Any = False
+    elif eff_pt_arg is not None:
+        rebound_pt = eff_pt_arg
+    else:
+        rebound_pt = EvaluationContext.create(eff_case).bindings.primitive_table
+    op_spec_by_key = {(e.replica, op.op_id): op for e in prepared.graph.executable for op in e.ops}
+    exec_graphs = {e.replica: e.ops for e in prepared.graph.executable}
+    struct_by_op, subgraph_by_op = _extract_structure_registry_view(
+        eff_case, exec_graphs, step_req, semantic_graphs=prepared.graph.target_graphs,
+    )
+    raw_records = _timeline_to_raw_records(
+        step_eval.operators, is_step_eval=True, case=eff_case, op_spec_by_key=op_spec_by_key,
+    )
+    sources_by_op: dict[str, Sequence[Any]] = {
+        r.occurrence.op_id: r.sources for r in prepared.operators if r.occurrence.replica == 0
+    }
+    return (
+        eff_case, raw_records, op_spec_by_key, sources_by_op,
+        struct_by_op, subgraph_by_op, step_eval.graph_id, step_eval.pipelines, rebound_pt,
+    )
+
+
 def build_export_bundle(
     case: CaseInput,
     *,
@@ -1492,7 +1503,13 @@ def build_export_bundle(
     apply_preset_to_ignored: bool = False,
     apply_target_envelope: bool | None = None,
     rewrite_plan: Any = None,
+    allow_unbound_formula: bool = True,
     top_k_radar: int = DEFAULT_GAP_RADAR_TOP_K,
+    primitive_table: Any = None,
+    streams: tuple[Any, ...] = (),
+    handoff_tpot_ms: float | None = None,
+    deployment_total_dies: int | None = None,
+    pd_pool_summary: Mapping[str, Any] | None = None,
 ) -> ExportBundle:
     """Evaluate unique layer archetypes once on ``runtime.Engine`` into ``ExportBundle``."""
     parsed = case if isinstance(case, Case) else parse_case(dict(case))
@@ -1511,7 +1528,11 @@ def build_export_bundle(
             scope="model" if spec_tokens > 0 else "body",
         )
     )
-    seq_count = int(step_req.sequences) if isinstance(step_req.sequences, int) else max(1, len(step_req.sequences))
+    seq_count, cluster_conc = _normalize_bundle_sequences(step_req.sequences, int(parsed.runtime.parallel.dp))
+    if rewrite_plan is not None and apply_target_envelope is False:
+        raise ModelingError("rewrite_plan_conflicts_with_apply_target_envelope_false")
+    ext_plan = load_rewrite_plan(rewrite_plan) if rewrite_plan is not None else None
+    has_explicit_edits = ext_plan is not None and bool(getattr(ext_plan, "edits", ()))
     include_draft = (
         step_req.scope == "model" and spec_tokens > 0 and step_req.tokens > 1
         and getattr(parsed.model, "auxiliary", None) is not None
@@ -1520,7 +1541,7 @@ def build_export_bundle(
         _discover_model_archetypes(parsed, include_draft=include_draft)
     )
     use_archetype_dedup = (
-        step_eval is None and observations_path is None
+        step_eval is None and observations_path is None and not has_explicit_edits
         and (len(rep_lp_by_idx) < len(parsed.model.layer_plans) or total_draft_layers > 1)
     )
     eval_case = (
@@ -1530,17 +1551,21 @@ def build_export_bundle(
     spine = default_spine()
     prepared_work_by_op: dict[str, dict[str, float]] = {}
     if step_eval is not None:
-        prepared = spine.lower(eval_case, LoweringRequest(step=step_req))
-        eff_case = prepared.case
-        op_spec_by_key = {(e.replica, op.op_id): op for e in prepared.graph.executable for op in e.ops}
-        exec_graphs = {e.replica: e.ops for e in prepared.graph.executable}
-        struct_by_op, subgraph_by_op = _extract_structure_registry_view(eff_case, exec_graphs, step_req)
-        raw_records = _timeline_to_raw_records(step_eval.operators, is_step_eval=True, case=eff_case, op_spec_by_key=op_spec_by_key)
-        sources_by_op: dict[str, Sequence[Any]] = {r.occurrence.op_id: r.sources for r in prepared.operators if r.occurrence.replica == 0}
-        graph_id, pipelines = step_eval.graph_id, step_eval.pipelines
+        (
+            eff_case, raw_records, op_spec_by_key, sources_by_op,
+            struct_by_op, subgraph_by_op, graph_id, pipelines, rebound_primitive_table,
+        ) = _resolve_bundle_step_eval(
+            spine, eval_case, step_req, step_eval,
+            primitive_table=primitive_table, streams=streams,
+        )
     else:
-        eff_case, timeline, op_spec_by_key, sources_by_op, struct_by_op, subgraph_by_op, graph_id, prepared_work_by_op = (
-            _evaluate_representative_step(spine, eval_case, step_req, replay)
+        (
+            eff_case, timeline, op_spec_by_key, sources_by_op,
+            struct_by_op, subgraph_by_op, graph_id, prepared_work_by_op,
+            rebound_primitive_table,
+        ) = _evaluate_representative_step(
+            spine, eval_case, step_req, replay,
+            primitive_table=primitive_table, streams=streams,
         )
         raw_records = _timeline_to_raw_records(timeline, is_step_eval=False, case=eff_case, op_spec_by_key=op_spec_by_key)
         pipelines = ()
@@ -1554,55 +1579,42 @@ def build_export_bundle(
     )
     prelim_rows, demands_ns = _collapse_micro_split_ops(prelim_rows, demands_ns)
     should_synthesize = (
-        apply_target_envelope
-        if apply_target_envelope is not None
-        else ((track_name == "expected_ideal" or rewrite_plan is not None) and step_eval is None and observations_path is None)
+        True if rewrite_plan is not None
+        else (
+            apply_target_envelope
+            if apply_target_envelope is not None
+            else (track_name == "expected_ideal" and step_eval is None and observations_path is None)
+        )
     )
     synthesis_specs: tuple[Any, ...] = ()
     audit_triggers: tuple[Any, ...] = ()
     plan_digest = ""
     plan_verified = True
-    if should_synthesize and _HAS_KERNEL_SYNTHESIS:
-        row_by_occ = {r.occurrence: r for r in prelim_rows}
-        row_by_arch = {}
-        for r in prelim_rows:
-            row_by_arch.setdefault(r.archetype_id, r)
-        scen_pre = _extract_scenario_meta(parsed, step_req, prelim_rows)
-        n_tok_die = (
-            float(max(1, seq_count * int(parsed.runtime.parallel.dp)))
-            * float(scen_pre["avg_accepted_tokens"])
-            / float(max(1, len(parsed.machine.dies)))
+    if should_synthesize:
+        (
+            prelim_rows, demands_ns, archetypes,
+            synthesis_specs, audit_triggers, plan_digest, plan_verified,
+        ) = _apply_target_envelope_to_rows(
+            prelim_rows, demands_ns, archetypes,
+            parsed=parsed, eff_case=eff_case, step_req=step_req,
+            cluster_conc=cluster_conc, op_spec_by_key=op_spec_by_key,
+            peaks_by_stage=peaks_by_stage, ext_plan=ext_plan,
+            rebound_primitive_table=rebound_primitive_table,
+            allow_unbound_formula=allow_unbound_formula,
         )
-        nodes = [_row_to_target_node(r, op_spec_by_key.get((0, r.op_id))) for r in prelim_rows]
-        solved = solve_target_graph(
-            nodes, demands_ns, eff_case, peaks_by_stage,
-            phase=step_req.phase, rewrite_plan=rewrite_plan, n_tok_per_die=n_tok_die,
-            allow_unbound_formula=True,
-        )
-        new_rows: list[OperatorExportRow] = []
-        for node in solved.nodes:
-            base_r = row_by_occ.get(node.occurrence) or row_by_arch.get(node.archetype_id) or prelim_rows[0]
-            new_rows.append(_apply_node_to_row(base_r, node))
-        prelim_rows = _attach_action_guidance(new_rows, eff_case, phase=step_req.phase)
-        demands_ns = list(solved.demands_ns)
-        archetypes = tuple(
-            replace(a, single_span_us=solved.archetype_spans_us.get(a.archetype_id, 0.0))
-            for a in archetypes
-        )
-        synthesis_specs = solved.synthesis_specs
-        audit_triggers = solved.semantic_audit_triggers
-        plan_digest = solved.rewrite_plan_sha256
-        plan_verified = solved.verification_passed
     else:
         prelim_rows, archetypes = _attribute_rows_overlap(prelim_rows, archetypes)
-        prelim_rows = _attach_action_guidance(prelim_rows, eff_case, phase=step_req.phase)
+        prelim_rows = _attach_action_guidance(
+            prelim_rows, eff_case, phase=step_req.phase, primitive_table=rebound_primitive_table,
+        )
 
     prelim_rows, demands_ns = _reorder_rows_by_archetype(prelim_rows, demands_ns, archetypes)
     final_rows, rank_order, reconcile_summary = _finalize_ranked_rows(prelim_rows, observations_path)
 
     return _assemble_export_bundle(
         parsed=parsed, eff_case=eff_case, step_req=step_req, step_eval=step_eval,
-        seq_count=seq_count, graph_id=graph_id, pipelines=pipelines, final_rows=final_rows,
+        seq_count=seq_count, cluster_conc=cluster_conc,
+        graph_id=graph_id, pipelines=pipelines, final_rows=final_rows,
         demands_ns=demands_ns, rank_order=rank_order, reconcile_summary=reconcile_summary,
         archetypes=archetypes, full_schedule=full_schedule,
         total_target_layers=total_target_layers, total_draft_layers=total_draft_layers,
@@ -1612,6 +1624,10 @@ def build_export_bundle(
         apply_preset_to_ignored=apply_preset_to_ignored, top_k_radar=top_k_radar,
         synthesis_specs=synthesis_specs, audit_triggers=audit_triggers,
         rewrite_plan_sha256=plan_digest, rewrite_verification_passed=plan_verified,
+        allow_unbound_formula=allow_unbound_formula,
+        handoff_tpot_ms=handoff_tpot_ms,
+        deployment_total_dies=deployment_total_dies,
+        pd_pool_summary=pd_pool_summary,
     )
 
 
@@ -1654,9 +1670,66 @@ def _build_checkpoint_and_va_summary(
     return ckpt_summary, va_summary
 
 
+def _build_bundle_memory_and_sla(
+    parsed: Case,
+    *,
+    step_req: StepRequest,
+    seq_count: int,
+    step_span_us: float,
+    scen: Mapping[str, Any],
+    weight_quant: str | None,
+    cache_dtype: str | None,
+    engram_host_offload: bool | None,
+    include_vision_tower: bool | None,
+    apply_preset_to_ignored: bool,
+    handoff_tpot_ms: float | None,
+) -> tuple[Any, float, float, str, Any]:
+    declared_out = (
+        max((int(getattr(req, "output_tokens", 0) or 0) for req in parsed.workload.requests), default=0)
+        if parsed.workload.requests else 0
+    )
+    horizon_tokens = (
+        max(int(step_req.tokens), declared_out)
+        if step_req.phase == "decode" else int(step_req.tokens)
+    )
+    ledger_seq_len = max(int(step_req.context) + horizon_tokens, int(step_req.tokens))
+    mem_ledger = compute_memory_quant_ledger(
+        parsed, phase=step_req.phase,
+        seq_len=ledger_seq_len,
+        concurrency=seq_count, weight_quant=weight_quant,
+        cache_dtype=cache_dtype, engram_host_offload=engram_host_offload,
+        include_vision_tower=include_vision_tower,
+        apply_preset_to_ignored=apply_preset_to_ignored,
+    )
+    meta_dict = dict(parsed.runtime.metadata)
+    eff_handoff = (
+        max(0.0, float(handoff_tpot_ms if handoff_tpot_ms is not None else (meta_dict.get("handoff_tpot_ms", 0.0) or 0.0)))
+        if step_req.phase == "decode" else 0.0
+    )
+    eff_tpot_ms = (
+        (step_span_us / US_PER_MS / max(1.0, float(scen["avg_accepted_tokens"]))) + eff_handoff
+        if step_req.phase == "decode" else (step_span_us / US_PER_MS)
+    )
+    sla_target = float(scen["tpot_slo_ms"] if step_req.phase == "decode" else scen["ttft_slo_ms"])
+    sla_slack = sla_target - eff_tpot_ms
+    min_headroom = min((st.headroom_bytes for st in mem_ledger.stage_budgets), default=0.0)
+    macro_wall = evaluate_macro_wall_trigger(
+        tpot_ms=eff_tpot_ms,
+        tpot_slo_ms=sla_target,
+        hbm_used_bytes=mem_ledger.max_stage_hbm_bytes,
+        hbm_usable_bytes=mem_ledger.usable_hbm_bytes,
+        hbm_headroom_bytes=min_headroom,
+    )
+    sla_regime = (
+        "SLA_VIOLATED" if eff_tpot_ms > sla_target
+        else ("HBM_CAPACITY_BOUND" if macro_wall.wall_kind == "HBM_CAPACITY_WALL" else "SLA_LATENCY_BOUND")
+    )
+    return mem_ledger, eff_handoff, sla_slack, sla_regime, macro_wall
+
+
 def _assemble_export_bundle(
     *, parsed: Case, eff_case: Case, step_req: StepRequest, step_eval: StepEvaluation | None,
-    seq_count: int, graph_id: str, pipelines: tuple[FusedPipelineDescriptor, ...],
+    seq_count: int, cluster_conc: int, graph_id: str, pipelines: tuple[FusedPipelineDescriptor, ...],
     final_rows: tuple[OperatorExportRow, ...], demands_ns: Sequence[tuple[int, int, int, int, int]],
     rank_order: Sequence[int], reconcile_summary: ReconciliationSummary | None,
     archetypes: Sequence[LayerArchetypeSpec], full_schedule: Sequence[TraceScheduleEntry],
@@ -1666,6 +1739,10 @@ def _assemble_export_bundle(
     include_vision_tower: bool | None, apply_preset_to_ignored: bool, top_k_radar: int,
     synthesis_specs: tuple[Any, ...] = (), audit_triggers: tuple[Any, ...] = (),
     rewrite_plan_sha256: str = "", rewrite_verification_passed: bool = True,
+    allow_unbound_formula: bool = True,
+    handoff_tpot_ms: float | None = None,
+    deployment_total_dies: int | None = None,
+    pd_pool_summary: Mapping[str, Any] | None = None,
 ) -> ExportBundle:
     exposed_total_us = sum(r.exposed_dur_us * r.repeat_count for r in final_rows)
     if use_archetype_dedup or target_envelope_applied:
@@ -1701,10 +1778,10 @@ def _assemble_export_bundle(
     )
     scen = _extract_scenario_meta(parsed, step_req, final_rows)
     step_s = max(step_span_us / US_PER_SECOND, MIN_POSITIVE_SECONDS)
-    cluster_conc = max(1, seq_count * int(parsed.runtime.parallel.dp))
-    tps = float(cluster_conc) * float(scen["avg_accepted_tokens"]) / step_s
+    eff_cluster_conc = max(1, int(cluster_conc))
+    tps = float(eff_cluster_conc) * float(scen["avg_accepted_tokens"]) / step_s
     num_dies = max(1, len(parsed.machine.dies))
-    n_tok_per_die = float(cluster_conc) * float(scen["avg_accepted_tokens"]) / float(num_dies)
+    n_tok_per_die = float(eff_cluster_conc) * float(scen["avg_accepted_tokens"]) / float(num_dies)
     us_per_tok_die = step_span_us / max(n_tok_per_die, MIN_DENOM_EPS)
     default_dt = str(p0.get("default_dtype") or "bf16")
     hw_peaks_summary = {
@@ -1716,32 +1793,13 @@ def _assemble_export_bundle(
         "fixpipe_peak_bytes_per_s": float(p0.get("fixpipe_peak_bytes_per_s") or p0["hbm_peak_bytes_per_s"]),
         "link_peak_bytes_per_s": float(p0["link_peak_bytes_per_s"]),
     }
-    mem_ledger = compute_memory_quant_ledger(
-        parsed, phase=step_req.phase,
-        seq_len=max(step_req.context + step_req.tokens, step_req.tokens),
-        concurrency=seq_count, weight_quant=weight_quant,
-        cache_dtype=cache_dtype, engram_host_offload=engram_host_offload,
-        include_vision_tower=include_vision_tower,
-        apply_preset_to_ignored=apply_preset_to_ignored,
+    mem_ledger, eff_handoff, sla_slack, sla_regime, macro_wall = _build_bundle_memory_and_sla(
+        parsed, step_req=step_req, seq_count=seq_count, step_span_us=step_span_us,
+        scen=scen, weight_quant=weight_quant, cache_dtype=cache_dtype,
+        engram_host_offload=engram_host_offload, include_vision_tower=include_vision_tower,
+        apply_preset_to_ignored=apply_preset_to_ignored, handoff_tpot_ms=handoff_tpot_ms,
     )
-    eff_tpot_ms = (
-        (step_span_us / US_PER_MS / max(1.0, float(scen["avg_accepted_tokens"])))
-        if step_req.phase == "decode" else (step_span_us / US_PER_MS)
-    )
-    sla_target = float(scen["tpot_slo_ms"] if step_req.phase == "decode" else scen["ttft_slo_ms"])
-    sla_slack = sla_target - eff_tpot_ms
-    min_headroom = min((st.headroom_bytes for st in mem_ledger.stage_budgets), default=0.0)
-    macro_wall = evaluate_macro_wall_trigger(
-        tpot_ms=eff_tpot_ms,
-        tpot_slo_ms=sla_target,
-        hbm_used_bytes=mem_ledger.max_stage_hbm_bytes,
-        hbm_usable_bytes=mem_ledger.usable_hbm_bytes,
-        hbm_headroom_bytes=min_headroom,
-    )
-    sla_regime = (
-        "SLA_VIOLATED" if eff_tpot_ms > sla_target
-        else ("HBM_CAPACITY_BOUND" if macro_wall.wall_kind == "HBM_CAPACITY_WALL" else "SLA_LATENCY_BOUND")
-    )
+    meta_dict = dict(parsed.runtime.metadata)
     ckpt_summary, va_summary = _build_checkpoint_and_va_summary(parsed, mem_ledger, scen, seq_count)
     d0 = parsed.machine.dies[0]
     d_bufs = dict(d0.buffers)
@@ -1752,7 +1810,6 @@ def _assemble_export_bundle(
         f"UB={int(d_bufs.get('ub', 0)) // KIB_BYTES} KiB, "
         f"HBM={hw_peaks_summary['hbm_peak_bytes_per_s'] / TB_BYTES:.2f} TB/s"
     )
-    meta_dict = dict(parsed.runtime.metadata)
     track_name = str(
         (meta_dict.get("feature_track_report") or {}).get("feature_track")
         or meta_dict.get("feature_track")
@@ -1761,11 +1818,23 @@ def _assemble_export_bundle(
     active_ids = {r.archetype_id for r in final_rows}
     filtered_schedule = tuple(e for e in full_schedule if e.archetype_id in active_ids) if use_archetype_dedup else ()
     has_unbound = any(r.binding_state == BINDING_STATE_UNBOUND_FORMULA for r in final_rows)
-    bundle_mode = MODE_MODELING if (target_envelope_applied or track_name == "expected_ideal") else MODE_SIMULATION
+    bundle_mode = (
+        MODE_MODELING
+        if ((target_envelope_applied and allow_unbound_formula) or track_name == "expected_ideal")
+        else MODE_SIMULATION
+    )
+    has_measured_match = reconcile_summary is not None and int(reconcile_summary.matched_sim_ops) > 0
     bundle_binding = (
         BINDING_STATE_UNBOUND_FORMULA if has_unbound
-        else (BINDING_STATE_MEASURED if reconcile_summary is not None else BINDING_STATE_BOUND)
+        else (BINDING_STATE_MEASURED if has_measured_match else BINDING_STATE_BOUND)
     )
+    raw_pd_pool = pd_pool_summary if pd_pool_summary is not None else meta_dict.get("pd_pool_summary")
+    eff_pd_pool = dict(raw_pd_pool) if isinstance(raw_pd_pool, Mapping) else None
+    raw_dep_dies = (
+        deployment_total_dies if deployment_total_dies is not None
+        else (eff_pd_pool.get("used_dies") if eff_pd_pool else meta_dict.get("deployment_total_dies"))
+    )
+    eff_dep_dies = max(0, int(raw_dep_dies or 0))
     return ExportBundle(
         schema=EXPORT_BUNDLE_SCHEMA, model_name=str(parsed.model.name),
         hardware_sku=str(parsed.machine.sku or parsed.machine.name),
@@ -1800,6 +1869,10 @@ def _assemble_export_bundle(
         analysis_mode=bundle_mode,
         binding_state=bundle_binding,
         has_unbound_formula_ops=has_unbound,
+        handoff_tpot_ms=eff_handoff,
+        cluster_concurrency=eff_cluster_conc,
+        deployment_total_dies=eff_dep_dies,
+        pd_pool_summary=eff_pd_pool,
         **scen,
     )
 

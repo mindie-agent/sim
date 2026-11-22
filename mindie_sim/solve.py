@@ -52,6 +52,7 @@ from mindie_sim.schema.common import ModelingError
 from mindie_sim.sweep.pd import (
     ARCHETYPE_SCREEN_MIN_LAYERS,
     _reclaim_sweep_memory,
+    _single_die_decode_tps,
     build_archetype_representative_case,
     solve_optimal_deployment,
 )
@@ -355,10 +356,12 @@ def _extract_bottleneck_roofline(
     sequences: int,
     tokens: int,
     scope: str,
+    phase: str = "decode",
 ) -> dict[str, Any]:
     eff = _analyze_case_bounded(
-        raw_case, phase="decode", tokens=tokens,
-        context=prompt_tokens, sequences=max(1, int(sequences)), scope=scope,
+        raw_case, phase=phase, tokens=tokens,
+        context=(0 if phase == "prefill" else prompt_tokens),
+        sequences=max(1, int(sequences)), scope=scope,
     )
     top_families = [
         {
@@ -398,6 +401,9 @@ def _summarize_iso_sla_state(
     par = best.get("decode_parallel") or best.get("parallel") or {}
     tps = float(best.get("sustainable_tps", 0.0) or 0.0)
     tps_per_die = float(best.get("sustainable_tps_per_die", 0.0) or 0.0)
+    decode_tps_per_die = float(best.get("decode_tps_per_die", tps_per_die) or 0.0)
+    e2e_tps_per_die = float(best.get("e2e_tps_per_die", tps_per_die) or 0.0)
+    e2e_total_tps = float(best.get("e2e_total_tps", tps) or 0.0)
     return {
         "track": track,
         "mode_label": mode_label,
@@ -413,6 +419,9 @@ def _summarize_iso_sla_state(
         "decode_step_ms": float(best.get("decode_step_ms", 0.0) or 0.0),
         "sustainable_tps": tps,
         "sustainable_tps_per_die": tps_per_die,
+        "decode_tps_per_die": decode_tps_per_die,
+        "e2e_tps_per_die": e2e_tps_per_die,
+        "e2e_total_tps": e2e_total_tps,
         "cluster_tps_per_purchased_die": tps / float(max(1, int(num_devices))),
         "n_tok_per_die": float(best.get("n_tok_per_die", 0.0) or 0.0),
         "us_per_tok_die": float(best.get("us_per_tok_die", 0.0) or 0.0),
@@ -430,23 +439,45 @@ def _bundle_inputs_for_solution(
     base_kw: Mapping[str, Any],
     feature_track: str,
     prompt_tokens: int,
+    output_tokens: int,
     scope: str,
-) -> tuple[dict[str, Any], StepRequest]:
-    rec_case = solved.get("recommended_case")
+) -> tuple[dict[str, Any], StepRequest, dict[str, Any]]:
+    is_prefill_only = int(output_tokens) <= 1
     best = solved.get("best_configuration") or {}
+    rec_case = (
+        solved.get("prefill_case") or solved.get("recommended_case")
+        if is_prefill_only
+        else solved.get("decode_case") or solved.get("recommended_case")
+    )
     seq = max(1, int(best.get("b_feasible", 1) or 1))
     mtp_n = int(best.get("mtp_proposal_tokens", 0) or 0)
-    req = StepRequest(
-        phase="decode", tokens=1 + mtp_n, context=prompt_tokens,
-        sequences=seq, scope=scope,
-    )
+    if is_prefill_only:
+        req = StepRequest(
+            phase="prefill", tokens=max(1, int(prompt_tokens)), context=0,
+            sequences=1, scope=scope,
+        )
+    else:
+        req = StepRequest(
+            phase="decode", tokens=1 + mtp_n, context=prompt_tokens,
+            sequences=seq, scope=scope,
+        )
+    bundle_meta: dict[str, Any] = {
+        "handoff_tpot_ms": (
+            0.0 if is_prefill_only else float(best.get("handoff_tpot_ms", 0.0) or 0.0)
+        ),
+        "deployment_total_dies": int(best.get("used_dies", 0) or 0),
+        "pd_pool_summary": (
+            dict(solved["pd_pool_summary"])
+            if isinstance(solved.get("pd_pool_summary"), Mapping) else None
+        ),
+    }
     if rec_case is not None:
-        return dict(rec_case), req
+        return dict(rec_case), req, bundle_meta
     fallback_case = compose_case(
         model, hardware, runtime_stack=runtime_stack,
         feature_track=feature_track, **dict(base_kw),
     )
-    return fallback_case, req
+    return fallback_case, req, bundle_meta
 
 
 def _export_solution_artifacts(
@@ -458,6 +489,7 @@ def _export_solution_artifacts(
     before_solved: Mapping[str, Any],
     after_solved: Mapping[str, Any],
     prompt_tokens: int,
+    output_tokens: int,
     scope: str,
     xlsx_path: str | Path | None,
     trace_path: str | Path | None,
@@ -473,35 +505,49 @@ def _export_solution_artifacts(
         raise ModelingError(
             "solve_export_requires_mindie_sim_export_package"
         ) from exc
-    before_case, before_req = _bundle_inputs_for_solution(
+    has_target_after = (mode == "modeling") or (rewrite_plan is not None)
+    after_track = target_track if mode == "modeling" else compare_track
+    before_case, before_req, before_meta = _bundle_inputs_for_solution(
         before_solved, model=model, hardware=hardware, runtime_stack=runtime_stack,
-        base_kw=wf_kw, feature_track=compare_track, prompt_tokens=prompt_tokens, scope=scope,
+        base_kw=wf_kw, feature_track=compare_track, prompt_tokens=prompt_tokens,
+        output_tokens=output_tokens, scope=scope,
     )
-    after_case, after_req = _bundle_inputs_for_solution(
+    after_case, after_req, after_meta = _bundle_inputs_for_solution(
         after_solved, model=model, hardware=hardware, runtime_stack=runtime_stack,
-        base_kw=wf_kw, feature_track=target_track, prompt_tokens=prompt_tokens, scope=scope,
+        base_kw=wf_kw, feature_track=after_track, prompt_tokens=prompt_tokens,
+        output_tokens=output_tokens, scope=scope,
     )
     before_bundle = export_mod.build_export_bundle(
         before_case, request=before_req, apply_target_envelope=False,
+        handoff_tpot_ms=before_meta["handoff_tpot_ms"],
+        deployment_total_dies=before_meta["deployment_total_dies"] or None,
+        pd_pool_summary=before_meta["pd_pool_summary"],
     )
     after_bundle = export_mod.build_export_bundle(
         after_case, request=after_req,
-        apply_target_envelope=(mode == "modeling"),
-        rewrite_plan=rewrite_plan if mode == "modeling" else None,
+        apply_target_envelope=has_target_after,
+        rewrite_plan=rewrite_plan if has_target_after else None,
+        allow_unbound_formula=(mode == "modeling"),
+        handoff_tpot_ms=after_meta["handoff_tpot_ms"],
+        deployment_total_dies=after_meta["deployment_total_dies"] or None,
+        pd_pool_summary=after_meta["pd_pool_summary"],
     )
     out: dict[str, Any] = {
         "mode": mode,
         "compare_track": compare_track,
-        "target_track": target_track,
+        "target_track": after_track,
+        "phase": after_req.phase,
     }
+    if after_meta["pd_pool_summary"]:
+        out["pd_pool_summary"] = dict(after_meta["pd_pool_summary"])
     if xlsx_path is not None:
         receipt = export_mod.export_comparison_xlsx(
             before_bundle, xlsx_path,
-            compare_source=after_bundle if mode == "modeling" else None,
+            compare_source=after_bundle if has_target_after else None,
         )
         out["xlsx"] = receipt.to_dict() if hasattr(receipt, "to_dict") else str(xlsx_path)
     if trace_path is not None:
-        trace_target = after_bundle if mode == "modeling" else before_bundle
+        trace_target = after_bundle if has_target_after else before_bundle
         receipt = export_mod.export_msprof_trace(trace_target, trace_path)
         out["trace"] = receipt.to_dict() if hasattr(receipt, "to_dict") else str(trace_path)
     return out
@@ -539,10 +585,16 @@ def _evaluate_winner_analysis(
     best = solved.get("best_configuration")
     parsed_rec = parse_case(rec_case)
     win_mtp = int((best or {}).get("mtp_proposal_tokens", 0) or 0)
-    win_seq = max(1, int((best or {}).get("b_feasible", 1) or 1))
-    win_tokens = 1 + win_mtp
+    is_prefill_only = int(output) <= 1
+    win_phase = "prefill" if is_prefill_only else "decode"
+    win_seq = 1 if is_prefill_only else max(1, int((best or {}).get("b_feasible", 1) or 1))
+    win_tokens = max(1, int(prompt)) if is_prefill_only else (1 + win_mtp)
+    win_context = 0 if is_prefill_only else prompt
     win_scope = "model"
-    win_role = "pd_decode" if solved.get("winner_mode") == "pd_disaggregated" else "colocated"
+    win_role = (
+        ("pd_prefill" if is_prefill_only else "pd_decode")
+        if solved.get("winner_mode") == "pd_disaggregated" else "colocated"
+    )
     use_arch = parsed_rec.model.layers >= ARCHETYPE_SCREEN_MIN_LAYERS
     if use_arch:
         rep_case, layer_weights, _ = build_archetype_representative_case(parsed_rec)
@@ -556,7 +608,7 @@ def _evaluate_winner_analysis(
         wf_layers = layers
     bottleneck = _extract_bottleneck_roofline(
         eval_case, prompt_tokens=prompt, sequences=win_seq,
-        tokens=win_tokens, scope=win_scope,
+        tokens=win_tokens, scope=win_scope, phase=win_phase,
     )
     if use_arch and isinstance(bottleneck, dict):
         inc = dict(bottleneck.get("included_components") or {})
@@ -585,7 +637,7 @@ def _evaluate_winner_analysis(
     if ablate_prs:
         waterfall = compare_feature_tracks(
             wf_model, hardware=hardware, runtime_stack=runtime_stack,
-            phase="decode", tokens=win_tokens, context=prompt,
+            phase=win_phase, tokens=win_tokens, context=win_context,
             sequences=win_seq, scope=win_scope, ablate_prs=True,
             **wf_kw,
         )
@@ -593,7 +645,7 @@ def _evaluate_winner_analysis(
         wf_full_kw = {**wf_kw, "layers": layers}
         waterfall = _compare_feature_tracks_bounded(
             model, hardware=hardware, runtime_stack=runtime_stack,
-            phase="decode", tokens=win_tokens, context=prompt,
+            phase=win_phase, tokens=win_tokens, context=win_context,
             sequences=win_seq, scope=win_scope, compose_kwargs=wf_full_kw,
             use_archetype_folding=use_arch,
         )
@@ -605,7 +657,7 @@ def _evaluate_winner_analysis(
         _export_solution_artifacts(
             model=model, hardware=hardware, runtime_stack=runtime_stack,
             wf_kw=export_kw, before_solved=before_solved, after_solved=after_solved,
-            prompt_tokens=prompt, scope=win_scope,
+            prompt_tokens=prompt, output_tokens=output, scope=win_scope,
             xlsx_path=xlsx_path, trace_path=trace_path,
             compare_track=compare_track, target_track=target_track,
             mode=mode, rewrite_plan=rewrite_plan,
@@ -623,15 +675,21 @@ def _build_iso_sla_comparison(
     before_track: str,
     target_track: str,
     num_devices: int,
+    has_target_after: bool = False,
 ) -> dict[str, Any]:
     """Assemble the Iso-SLA Before vs After comparison summary."""
     before_summary = _summarize_iso_sla_state(
         before_solved, track=before_track,
         mode_label="Before [当前栈仿真基线]", num_devices=num_devices,
     )
+    after_mode_label = (
+        "After [卡SLA目标建模终态]" if solve_mode == "modeling"
+        else "After [改写计划仿真]" if has_target_after
+        else "Simulation [仿真基线]"
+    )
     after_summary = _summarize_iso_sla_state(
         after_solved, track=target_track if solve_mode == "modeling" else before_track,
-        mode_label="After [卡SLA目标建模终态]" if solve_mode == "modeling" else "Simulation [仿真基线]",
+        mode_label=after_mode_label,
         num_devices=num_devices,
     )
     b_tps = before_summary["sustainable_tps_per_die"]
@@ -717,21 +775,37 @@ def solve_deployment(
         if (solve_mode == "simulation" and str(compare_track).strip().lower() == "expected_ideal")
         else str(compare_track)
     )
-    before_solved = solve_optimal_deployment(model, hardware, feature_track=before_track, **shared_kw)
+    before_solved = solve_optimal_deployment(
+        model, hardware, feature_track=before_track,
+        apply_target_envelope=False, **shared_kw,
+    )
     _reclaim_sweep_memory()
-    if solve_mode == "modeling" and str(target_track) != before_track:
-        after_solved = solve_optimal_deployment(model, hardware, feature_track=str(target_track), **shared_kw)
+    has_target_after = (solve_mode == "modeling") or (rewrite_plan is not None)
+    if has_target_after:
+        after_track = str(target_track) if solve_mode == "modeling" else before_track
+        after_solved = solve_optimal_deployment(
+            model, hardware, feature_track=after_track,
+            apply_target_envelope=True,
+            rewrite_plan=rewrite_plan,
+            allow_unbound_formula=(solve_mode == "modeling"),
+            **shared_kw,
+        )
         _reclaim_sweep_memory()
     else:
         after_solved = before_solved
-    solved = after_solved if (solve_mode == "modeling" and after_solved.get("feasible")) else before_solved
+    solved = after_solved if has_target_after else before_solved
     prompt, output = int(prompt_tokens), int(output_tokens)
     ledger = _build_capacity_ledger(solved, prompt_tokens=prompt, output_tokens=output)
 
     best = solved.get("best_configuration")
     feasible_sorted = sorted(
         (row for row in solved.get("candidates", ()) if row.get("feasible")),
-        key=lambda row: (-float(row.get("sustainable_tps", 0.0)), int(row.get("used_dies", 0)), float(row.get("effective_tpot_ms", 0.0))),
+        key=lambda row: (
+            -float(_single_die_decode_tps(row)),
+            int(row.get("used_dies", 0)),
+            -float(row.get("e2e_tps_per_die", row.get("sustainable_tps_per_die", 0.0)) or 0.0),
+            float(row.get("effective_tpot_ms", 0.0)),
+        ),
     )
     runner_ups = feasible_sorted[1:1 + TOP_RUNNER_UPS]
     waterfall, bottleneck, exports = _evaluate_winner_analysis(
@@ -747,7 +821,8 @@ def solve_deployment(
     )
     iso_sla = _build_iso_sla_comparison(
         before_solved, after_solved, solve_mode=solve_mode,
-        before_track=before_track, target_track=str(target_track), num_devices=int(num_devices),
+        before_track=before_track, target_track=str(target_track),
+        num_devices=int(num_devices), has_target_after=has_target_after,
     )
     rec_dep: dict[str, Any] = {
         "winner_mode": solved["winner_mode"], "feasible": bool(solved["feasible"]),

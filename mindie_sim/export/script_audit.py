@@ -39,7 +39,6 @@ from mindie_sim.catalog.npu_checkpoints import (
 )
 from mindie_sim.catalog.quant import LONG_CONTEXT_KV_QUANT_THRESHOLD
 from mindie_sim.catalog.va_speculative_rules import (
-    SPECULATIVE_COMPANIONS,
     build_va_serving_rules,
     validate_aclgraph_capture_sizes,
 )
@@ -453,7 +452,7 @@ def _audit_isa_and_speculative_rules(
     va_rules = build_va_serving_rules(
         after_bundle.model_name, hw_family=hw_fam, tp=mem_a.tp, dp=mem_a.dp, ep=mem_a.ep, pp=mem_a.pp,
         target_kv_dtype=mem_a.cache_dtype.lower(),
-        enable_speculative=(spec_k > 0 or after_bundle.model_name.lower() in SPECULATIVE_COMPANIONS),
+        enable_speculative=(spec_k > 0),
         num_speculative_tokens=spec_k if spec_k > 0 else None, max_num_seqs=max(1, mem_a.concurrency),
     )
     if parsed.speculative_config and va_rules.resolved_speculative is not None:

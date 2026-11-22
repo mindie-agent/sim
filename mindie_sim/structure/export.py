@@ -517,7 +517,8 @@ def export_op_structure(ops, *, model, execution, kernels=None, source=None,
 
 def export_structure(case, *, phase, tokens, context=0, sequences=1,
                      scope="model", source=None, expand_calls=True, apply_body_defaults=True,
-                     replicas=None, native_evidence=False, draft_prepare=False):
+                     replicas=None, native_evidence=False, draft_prepare=False,
+                     media_tokens_per_sequence=None):
     """Export the first independent DP cohort, without evaluating its timing.
 
     ``case`` is the same complete declared case accepted by ``target_graphs``.
@@ -530,7 +531,8 @@ def export_structure(case, *, phase, tokens, context=0, sequences=1,
         case, phase=phase, tokens=tokens, context=context, sequences=sequences,
         scope=scope, source=source, expand_calls=expand_calls,
         apply_body_defaults=apply_body_defaults, replicas=replicas,
-        draft_prepare=draft_prepare)
+        draft_prepare=draft_prepare,
+        media_tokens_per_sequence=media_tokens_per_sequence)
     return export_op_structure(graphs, native_evidence=native_evidence, **options)
 
 
@@ -538,6 +540,7 @@ def structure_inputs_from_graphs(
     case, graphs, *, phase, tokens, context=0, sequences=1,
     scope="model", source=None, expand_calls=True, apply_body_defaults=True,
     replicas=None, draft_prepare=False, physical_graphs=None,
+    media_tokens_per_sequence=None,
 ):
     """Build ``export_op_structure`` inputs from already-lowered cohort graphs."""
     from mindie_sim.prediction.body_defaults import consume_target_declaration
@@ -589,6 +592,7 @@ def structure_inputs_from_graphs(
         execution={
             "phase": phase, "tokens": tokens, "context": context,
             "sequences": sequences, "scope": scope, "software": selected,
+            **({"media_tokens_per_sequence": int(media_tokens_per_sequence)} if media_tokens_per_sequence is not None else {}),
             **({"draft_prepare": True} if draft_prepare else {}),
             **({"apply_body_defaults": apply_body_defaults,
                 "default_mechanisms": selection} if scope == "body" else {}),
@@ -611,7 +615,7 @@ def structure_inputs_from_graphs(
 def _structure_inputs(case, *, phase, tokens, context=0, sequences=1,
                       scope="model", source=None, expand_calls=True,
                       apply_body_defaults=True, replicas=None,
-                      draft_prepare=False):
+                      draft_prepare=False, media_tokens_per_sequence=None):
     """Bind the complete cohort once before choosing an export consumer."""
     if not isinstance(draft_prepare, bool):
         raise ValueError("structure_draft_prepare_must_be_bool")
@@ -619,6 +623,7 @@ def _structure_inputs(case, *, phase, tokens, context=0, sequences=1,
     graphs = target_graphs(
         case, phase=phase, tokens=tokens, context=context,
         sequences=sequences, scope=scope, resource_fusion=False,
+        media_tokens_per_sequence=media_tokens_per_sequence,
         draft_prepare=draft_prepare,
         apply_body_defaults=apply_body_defaults,
     )
@@ -627,6 +632,7 @@ def _structure_inputs(case, *, phase, tokens, context=0, sequences=1,
         sequences=sequences, scope=scope, source=source,
         expand_calls=expand_calls, apply_body_defaults=apply_body_defaults,
         replicas=replicas, draft_prepare=draft_prepare,
+        media_tokens_per_sequence=media_tokens_per_sequence,
     )
 
 
@@ -638,6 +644,7 @@ def main(argv=None):
     parser.add_argument("--context", type=int, default=0)
     parser.add_argument("--sequences", type=int, default=1)
     parser.add_argument("--scope", choices=("body", "model"), default="model")
+    parser.add_argument("--media-tokens-per-sequence", type=int, default=None)
     parser.add_argument("--replicas", type=int, nargs="+",
                         help="Serialize these DP replicas after full-cohort traffic binding")
     parser.add_argument("--draft-prepare", action="store_true",
@@ -653,6 +660,7 @@ def main(argv=None):
     result = export_structure(
         json.loads(content), phase=args.phase, tokens=args.tokens,
         context=args.context, sequences=args.sequences, scope=args.scope,
+        media_tokens_per_sequence=args.media_tokens_per_sequence,
         expand_calls=args.expand_calls, apply_body_defaults=args.apply_body_defaults,
         replicas=args.replicas, draft_prepare=args.draft_prepare,
         source={"kind": "case_file", "sha256": sha256(content).hexdigest()},

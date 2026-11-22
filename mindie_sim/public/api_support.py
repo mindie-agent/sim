@@ -78,6 +78,17 @@ def _profile(value: Any) -> UserProfile | None:
 def _ops(value: Any) -> tuple[OpSpec, ...]:
     if isinstance(value, OpSpec):
         return (value,)
+    if isinstance(value, Mapping):
+        flattened: list[OpSpec] = []
+        for rank_ops in value.values():
+            if isinstance(rank_ops, OpSpec):
+                flattened.append(rank_ops)
+            else:
+                try:
+                    flattened.extend(rank_ops)
+                except TypeError as exc:
+                    raise ExtensionError("operator_requires_op_spec_or_sequence") from exc
+        return tuple(flattened)
     try:
         return tuple(value)
     except TypeError as exc:
@@ -109,12 +120,23 @@ def _machine_reference(environment: ExecutionEnvironment | None) -> Any:
 
 def _ops_replay(ops: Any) -> Any:
     try:
+        if isinstance(ops, Mapping):
+            return {
+                str(rank): [
+                    item.to_dict() if hasattr(item, "to_dict") else {"type": type(item).__name__}
+                    for item in _ops(rank_ops)
+                ]
+                for rank, rank_ops in ops.items()
+            }
         values = _ops(ops)
+        return [
+            value.to_dict() if hasattr(value, "to_dict") else {"type": type(value).__name__}
+            for value in values
+        ]
     except TimeoutError:
         raise
     except Exception:  # noqa: BLE001 - replay metadata must never mask the gap
         return {"type": type(ops).__name__}
-    return [value.to_dict() for value in values]
 
 
 def _case_replay(case: Any) -> dict[str, Any]:

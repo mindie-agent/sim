@@ -20,7 +20,7 @@ from __future__ import annotations
 import argparse
 import ast
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 import hashlib
 import keyword
 from pathlib import Path, PurePosixPath
@@ -697,9 +697,58 @@ _AG013_MODEL_TOKEN_RE = re.compile(
     re.IGNORECASE,
 )
 _AG013_SUFFIX_TABLE_RE = re.compile(
-    r"^_(?:KNOWN_FUSION_SOURCES|PURE_GLUE_EXACT_SUFFIXES|(?:GDN|KDA)_[A-Z0-9_]*SUFFIXES)$"
+    r"^_?(?:[A-Z0-9_]*_)?(?:SUFFIX(?:ES)?|OP_NAMES?|OP_IDS?|FUSION_SOURCES?)(?:_[A-Z0-9_]*)?$"
+)
+_AG013_MODULE_STR_TABLE_RE = re.compile(
+    r"(?:^|_)(?:suffix(?:es)?|op_names?|op_ids?|fusion_sources?)(?:_|$)",
+    re.IGNORECASE,
 )
 _AG013_TARGET_ETA_RE = re.compile(r"(?:^|_)target_eta(?:$|_)", re.IGNORECASE)
+
+
+def _ag013_is_string_table_expr(node: ast.AST) -> bool:
+    """Return True when ``node`` is a constant container of string literals."""
+    if isinstance(node, ast.Call):
+        fn = node.func.id if isinstance(node.func, ast.Name) else (
+            node.func.attr if isinstance(node.func, ast.Attribute) else ""
+        )
+        if fn in {"frozenset", "set", "tuple", "list", "dict", "MappingProxyType"} and len(node.args) == 1:
+            return _ag013_is_string_table_expr(node.args[0])
+        return False
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        return bool(node.elts) and all(
+            (isinstance(el, ast.Constant) and isinstance(el.value, str)) or _ag013_is_string_table_expr(el)
+            for el in node.elts
+        )
+    if isinstance(node, ast.Dict):
+        return bool(node.keys) and all(
+            isinstance(k, ast.Constant) and isinstance(k.value, str)
+            for k in node.keys
+        )
+    return False
+
+
+def _ag013_check_module_string_tables(
+    tree: ast.Module, emit: Callable[[int, str, str, str], None], top: str,
+) -> None:
+    """Flag any module-level string-matching constant table matching suffix/op-name patterns."""
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Assign):
+            targets, value = stmt.targets, stmt.value
+        elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
+            targets, value = (stmt.target,), stmt.value
+        else:
+            continue
+        if not _ag013_is_string_table_expr(value):
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name) and _AG013_MODULE_STR_TABLE_RE.search(target.id):
+                emit(
+                    int(getattr(stmt, "lineno", 1)),
+                    "suffix_table",
+                    target.id,
+                    f"module-level string-matching table {target.id!r} forbidden in {top}; use typed OpSpec traits/metadata",
+                )
 
 
 def _ag013_docstring_node_ids(tree: ast.Module) -> set[int]:
@@ -751,6 +800,7 @@ def _check_ag013_anti_hardcoding(rel: PurePosixPath, tree: ast.Module) -> list[V
                 "AG013", rel, line, f"AG013:{kind}:{pos}:{key[2]}", detail,
             ))
 
+    _ag013_check_module_string_tables(tree, _emit, top)
     for node in ast.walk(tree):
         lineno = int(getattr(node, "lineno", 1))
         if isinstance(node, ast.Constant) and isinstance(node.value, str):

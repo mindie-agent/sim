@@ -32,6 +32,8 @@ import re
 import tempfile
 from typing import Any
 
+from mindie_sim.schema.common import ModelingError
+
 from .kernel_catalog import classify_macro_module, extract_semantic_atoms, strip_op_prefix
 from .models import (
     AGENT_BRIEF_SCHEMA,
@@ -77,6 +79,8 @@ BRIEF_MAX_FRAMEWORK_TASKS = 3
 #: Maximum number of synthesis specs & audit triggers embedded in ``agent_brief.json``.
 BRIEF_MAX_TRIGGERS = 4
 BRIEF_MAX_SPECS = 4
+BRIEF_MAX_CAPTURE_SIZES = 8
+SLICE_MAX_EXPLICIT_LAYERS = 4
 #: Maximum character length for compact string fields inside ``agent_brief.json``.
 BRIEF_TEXT_LIMIT = 72
 #: Minimum single-op gap (us) to call out gap-vs-L* in Sheet 2 notes.
@@ -449,12 +453,16 @@ def _enforce_zero_saving_status_invariant(
     *,
     before_ntok: float = 1.0,
     after_ntok: float = 1.0,
+    before_rep: int = 1,
+    after_rep: int = 1,
 ) -> OperatorExportRow:
     """Hard Status Invariant: strip dev/tuning badges when neither raw nor amortized cost improves."""
     if not b_ops:
         return a_op
-    b_exp = sum(0.0 if b.is_overlapped else b.exposed_dur_us for b in b_ops)
-    a_exp = 0.0 if a_op.is_overlapped else a_op.exposed_dur_us
+    b_w = max(1, int(before_rep))
+    a_w = max(1, int(after_rep))
+    b_exp = sum(0.0 if b.is_overlapped else (b.exposed_dur_us * b_w) for b in b_ops)
+    a_exp = 0.0 if a_op.is_overlapped else (a_op.exposed_dur_us * a_w)
     b_upt = b_exp / max(float(before_ntok), MIN_DENOM_EPS)
     a_upt = a_exp / max(float(after_ntok), MIN_DENOM_EPS)
     if a_exp >= b_exp - ZERO_SAVING_EPS_US and a_upt >= b_upt - ZERO_SAVING_EPS_US:
@@ -626,8 +634,13 @@ def _align_archetype_bipartite(
     *,
     before_ntok: float = 1.0,
     after_ntok: float = 1.0,
+    before_rep: int | None = None,
+    after_rep: int | None = None,
 ) -> list[AlignedComparisonRow]:
     """Align one archetype via Two-Level Semantic-Atom Bipartite Connected Components."""
+    b_w = max(1, int(before_rep)) if before_rep is not None else max(1, int(rep))
+    a_w = max(1, int(after_rep)) if after_rep is not None else max(1, int(rep))
+    row_rep = a_w if a_list else b_w
     b_adj, a_adj = _build_bipartite_edges(b_list, a_list)
     comps = _extract_bipartite_components(len(b_list), len(a_list), b_adj, a_adj)
 
@@ -654,16 +667,21 @@ def _align_archetype_bipartite(
             b_op = b_list[b_idxs[0]]
             a_op = _enforce_zero_saving_status_invariant(
                 (b_op,), a_list[a_idxs[0]], before_ntok=before_ntok, after_ntok=after_ntok,
+                before_rep=b_w, after_rep=a_w,
             )
             glue = _detect_added_glue_note(b_op, a_op)
             note = _build_action_note("1->1", (b_op,), (a_op,), added_glue_note=glue)
             entries.append((
                 float(b_idxs[0]), 0, a_idxs[0],
-                AlignedComparisonRow(aid, title, rep, a_op.submodule, (b_op,), (a_op,), "1->1", note, added_glue_note=glue),
+                AlignedComparisonRow(
+                    aid, title, row_rep, a_op.submodule, (b_op,), (a_op,), "1->1", note,
+                    added_glue_note=glue, before_repeat_count=b_w, after_repeat_count=a_w,
+                ),
             ))
         elif nb >= MIN_GROUP_SIZE and na == 1:
             a_op = _enforce_zero_saving_status_invariant(
                 [b_list[i] for i in b_idxs], a_list[a_idxs[0]], before_ntok=before_ntok, after_ntok=after_ntok,
+                before_rep=b_w, after_rep=a_w,
             )
             is_contiguous = (b_idxs[-1] - b_idxs[0] + 1) == nb
             if is_contiguous:
@@ -671,14 +689,20 @@ def _align_archetype_bipartite(
                 note = _build_action_note("N->1", b_tuple, (a_op,))
                 entries.append((
                     float(b_idxs[0]), 0, a_idxs[0],
-                    AlignedComparisonRow(aid, title, rep, a_op.submodule, b_tuple, (a_op,), "N->1", note),
+                    AlignedComparisonRow(
+                        aid, title, row_rep, a_op.submodule, b_tuple, (a_op,), "N->1", note,
+                        before_repeat_count=b_w, after_repeat_count=a_w,
+                    ),
                 ))
             else:
                 b_anchor = b_list[b_idxs[0]]
                 note = _build_action_note("N->1", tuple(b_list[i] for i in b_idxs), (a_op,))
                 entries.append((
                     float(b_idxs[0]), 0, a_idxs[0],
-                    AlignedComparisonRow(aid, title, rep, a_op.submodule, (b_anchor,), (a_op,), "N->1", note),
+                    AlignedComparisonRow(
+                        aid, title, row_rep, a_op.submodule, (b_anchor,), (a_op,), "N->1", note,
+                        before_repeat_count=b_w, after_repeat_count=a_w,
+                    ),
                 ))
                 for sec_i in b_idxs[1:]:
                     b_sec = b_list[sec_i]
@@ -686,8 +710,9 @@ def _align_archetype_bipartite(
                     entries.append((
                         float(sec_i), 0, -1,
                         AlignedComparisonRow(
-                            aid, title, rep, b_sec.submodule, (b_sec,), (), "fused_into_anchor",
+                            aid, title, b_w, b_sec.submodule, (b_sec,), (), "fused_into_anchor",
                             sec_note, non_adjacent_anchor_kernel=a_op.ascend_kernel,
+                            before_repeat_count=b_w, after_repeat_count=0,
                         ),
                     ))
         elif nb == 1 and na == 0:
@@ -695,21 +720,27 @@ def _align_archetype_bipartite(
             note = _build_action_note("eliminated", (b_op,), ())
             entries.append((
                 float(b_idxs[0]), 1, -1,
-                AlignedComparisonRow(aid, title, rep, b_op.submodule, (b_op,), (), "eliminated", note),
+                AlignedComparisonRow(
+                    aid, title, b_w, b_op.submodule, (b_op,), (), "eliminated", note,
+                    before_repeat_count=b_w, after_repeat_count=0,
+                ),
             ))
         elif nb == 0 and na == 1:
             a_op = a_list[a_idxs[0]]
             note = _build_action_note("added", (), (a_op,))
             entries.append((
                 added_anchor.get(a_idxs[0], float(len(b_list) + a_idxs[0])), 2, a_idxs[0],
-                AlignedComparisonRow(aid, title, rep, a_op.submodule, (), (a_op,), "added", note),
+                AlignedComparisonRow(
+                    aid, title, a_w, a_op.submodule, (), (a_op,), "added", note,
+                    before_repeat_count=0, after_repeat_count=a_w,
+                ),
             ))
         else:
             # Case 4: M -> N (or 1 -> N) Cross-Boundary Re-association Block.
             b_tuple = tuple(b_list[i] for i in b_idxs)
             raw_a = tuple(a_list[j] for j in a_idxs)
-            b_cluster_exp = sum(0.0 if b.is_overlapped else b.exposed_dur_us for b in b_tuple)
-            a_cluster_exp = sum(0.0 if a.is_overlapped else a.exposed_dur_us for a in raw_a)
+            b_cluster_exp = sum(0.0 if b.is_overlapped else (b.exposed_dur_us * b_w) for b in b_tuple)
+            a_cluster_exp = sum(0.0 if a.is_overlapped else (a.exposed_dur_us * a_w) for a in raw_a)
             b_cluster_upt = b_cluster_exp / max(float(before_ntok), MIN_DENOM_EPS)
             a_cluster_upt = a_cluster_exp / max(float(after_ntok), MIN_DENOM_EPS)
             if b_tuple and a_cluster_exp >= b_cluster_exp - ZERO_SAVING_EPS_US and a_cluster_upt >= b_cluster_upt - ZERO_SAVING_EPS_US:
@@ -726,26 +757,111 @@ def _align_archetype_bipartite(
             anchor = float(b_idxs[0]) if b_idxs else float(len(b_list) + a_idxs[0])
             entries.append((
                 anchor, 0, a_idxs[0] if a_idxs else -1,
-                AlignedComparisonRow(aid, title, rep, (a_tuple[0] if a_tuple else b_tuple[0]).submodule, b_tuple, a_tuple, rel, note),
+                AlignedComparisonRow(
+                    aid, title, row_rep, (a_tuple[0] if a_tuple else b_tuple[0]).submodule,
+                    b_tuple, a_tuple, rel, note,
+                    before_repeat_count=b_w, after_repeat_count=a_w,
+                ),
             ))
 
     entries.sort(key=lambda item: (item[0], item[1], item[2]))
     return [row for _, _, _, row in entries]
 
 
+def _format_slice_layer_range(indices: Sequence[int]) -> str:
+    ordered = sorted(set(int(x) for x in indices))
+    if not ordered:
+        return ""
+    if len(ordered) == 1:
+        return f"L{ordered[0]}"
+    if len(ordered) <= SLICE_MAX_EXPLICIT_LAYERS:
+        return ", ".join(f"L{x}" for x in ordered)
+    return f"L{ordered[0]}..L{ordered[-1]}"
+
+
+def _index_target_layer_archetypes(
+    bundle: ExportBundle,
+    ops_by_arch: Mapping[str, Sequence[OperatorExportRow]],
+) -> tuple[dict[int, tuple[str, str, tuple[OperatorExportRow, ...]]], set[str]]:
+    """Map physical target layer indices to ``(template_key, title, ops)`` without inflating PP weights."""
+    layer_map: dict[int, tuple[str, str, tuple[OperatorExportRow, ...]]] = {}
+    handled_aids: set[str] = set()
+    for arch in bundle.archetypes:
+        if arch.scope != "target" or not arch.layer_indices:
+            continue
+        ops = tuple(ops_by_arch.get(arch.archetype_id, ()))
+        if not ops:
+            continue
+        handled_aids.add(arch.archetype_id)
+        distinct_layers = {int(o.layer) for o in ops if o.layer is not None}
+        is_dedup = (
+            all(int(o.repeat_count) == len(arch.layer_indices) for o in ops)
+            and len(distinct_layers) <= 1
+        )
+        if is_dedup:
+            for phys_idx in arch.layer_indices:
+                layer_map[int(phys_idx)] = (arch.archetype_id, arch.title, ops)
+            continue
+        by_layer: dict[int, list[OperatorExportRow]] = defaultdict(list)
+        for op in ops:
+            if op.layer is not None:
+                by_layer[int(op.layer)].append(op)
+        for phys_idx in arch.layer_indices:
+            l_ops = tuple(by_layer.get(int(phys_idx), ()))
+            if l_ops:
+                layer_map[int(phys_idx)] = (f"{arch.archetype_id}@L{phys_idx}", arch.title, l_ops)
+    return layer_map, handled_aids
+
+
+def _build_target_layer_slices(
+    before_bundle: ExportBundle,
+    after_bundle: ExportBundle,
+    b_layer_map: Mapping[int, tuple[str, str, tuple[OperatorExportRow, ...]]],
+    a_layer_map: Mapping[int, tuple[str, str, tuple[OperatorExportRow, ...]]],
+) -> list[tuple[str, str, int, int, tuple[OperatorExportRow, ...], tuple[OperatorExportRow, ...]]]:
+    """Intersect Before/After physical target layer-index sets for exact PP1<->PP2 conservation."""
+    b_arch_meta = {a.archetype_id: a for a in before_bundle.archetypes}
+    a_arch_meta = {a.archetype_id: a for a in after_bundle.archetypes}
+    grouped: dict[tuple[str | None, str | None], list[int]] = {}
+    for phys_idx in sorted(set(b_layer_map) | set(a_layer_map)):
+        b_key = b_layer_map[phys_idx][0] if phys_idx in b_layer_map else None
+        a_key = a_layer_map[phys_idx][0] if phys_idx in a_layer_map else None
+        grouped.setdefault((b_key, a_key), []).append(phys_idx)
+
+    slices: list[tuple[str, str, int, int, tuple[OperatorExportRow, ...], tuple[OperatorExportRow, ...]]] = []
+    used_ids: set[str] = set()
+    for (b_key, a_key), idxs in grouped.items():
+        rep = len(idxs)
+        b_ops = b_layer_map[idxs[0]][2] if b_key is not None else ()
+        a_ops = a_layer_map[idxs[0]][2] if a_key is not None else ()
+        b_rep = rep if b_ops else 0
+        a_rep = rep if a_ops else 0
+        same_unsplit = (
+            b_key is not None
+            and b_key == a_key
+            and b_key in b_arch_meta
+            and b_key in a_arch_meta
+            and len(idxs) == len(b_arch_meta[b_key].layer_indices) == len(a_arch_meta[b_key].layer_indices)
+        )
+        if same_unsplit:
+            slice_aid = b_key
+            slice_title = a_arch_meta[b_key].title
+        else:
+            base_aid = a_key or b_key or "target_slice"
+            slice_aid = base_aid if base_aid not in used_ids else f"{b_key or 'none'}__{a_key or 'none'}"
+            raw_title = (a_layer_map[idxs[0]][1] if a_key is not None else b_layer_map[idxs[0]][1])
+            clean_title = re.sub(r"\s*\(×\d+[^)]*\)\s*$", "", raw_title).strip()
+            rng_txt = _format_slice_layer_range(idxs)
+            slice_title = f"{clean_title} (×{rep}, {rng_txt})" if rng_txt else f"{clean_title} (×{rep})"
+        used_ids.add(slice_aid)
+        slices.append((slice_aid, slice_title, b_rep, a_rep, b_ops, a_ops))
+    return slices
+
+
 def align_before_after_operators(
     before_bundle: ExportBundle, after_bundle: ExportBundle,
 ) -> tuple[AlignedComparisonRow, ...]:
-    """Align Before vs After via Two-Level Semantic-Atom Provenance Bipartite Alignment."""
-    arch_order: list[tuple[str, str, int]] = []
-    seen_arch: set[str] = set()
-    for src in (before_bundle, after_bundle):
-        for op in src.operators:
-            aid = op.archetype_id or op.layer_label
-            if aid not in seen_arch:
-                seen_arch.add(aid)
-                arch_order.append((aid, op.archetype_title or op.layer_label, op.repeat_count))
-
+    """Align Before vs After via physical layer-index set alignment + semantic bipartite matching."""
     before_by_arch: dict[str, list[OperatorExportRow]] = defaultdict(list)
     after_by_arch: dict[str, list[OperatorExportRow]] = defaultdict(list)
     for op in before_bundle.operators:
@@ -753,13 +869,45 @@ def align_before_after_operators(
     for op in after_bundle.operators:
         after_by_arch[op.archetype_id or op.layer_label].append(op)
 
+    b_layer_map, b_handled = _index_target_layer_archetypes(before_bundle, before_by_arch)
+    a_layer_map, a_handled = _index_target_layer_archetypes(after_bundle, after_by_arch)
+    handled_target_aids = b_handled | a_handled
+    target_slices = (
+        _build_target_layer_slices(before_bundle, after_bundle, b_layer_map, a_layer_map)
+        if (b_layer_map or a_layer_map) else []
+    )
+
+    pre_slices: list[tuple[str, str, int, int, tuple[OperatorExportRow, ...], tuple[OperatorExportRow, ...]]] = []
+    post_slices: list[tuple[str, str, int, int, tuple[OperatorExportRow, ...], tuple[OperatorExportRow, ...]]] = []
+    seen_arch: set[str] = set()
+    seen_target = False
+    for src in (before_bundle, after_bundle):
+        for op in src.operators:
+            aid = op.archetype_id or op.layer_label
+            if aid in handled_target_aids:
+                seen_target = True
+                continue
+            if aid in seen_arch:
+                continue
+            seen_arch.add(aid)
+            b_ops = tuple(before_by_arch.get(aid, ()))
+            a_ops = tuple(after_by_arch.get(aid, ()))
+            b_rep = max(1, int(b_ops[0].repeat_count)) if b_ops else 0
+            a_rep = max(1, int(a_ops[0].repeat_count)) if a_ops else 0
+            entry = (aid, op.archetype_title or op.layer_label, b_rep, a_rep, b_ops, a_ops)
+            if not seen_target and target_slices:
+                pre_slices.append(entry)
+            else:
+                post_slices.append(entry)
+
     b_ntok = max(float(before_bundle.n_tok_per_die or 1.0), MIN_DENOM_EPS)
     a_ntok = max(float(after_bundle.n_tok_per_die or 1.0), MIN_DENOM_EPS)
     aligned: list[AlignedComparisonRow] = []
-    for aid, title, rep in arch_order:
+    for aid, title, b_rep, a_rep, b_ops, a_ops in (*pre_slices, *target_slices, *post_slices):
         aligned.extend(_align_archetype_bipartite(
-            aid, title, rep, before_by_arch.get(aid, ()), after_by_arch.get(aid, ()),
+            aid, title, a_rep or b_rep or 1, b_ops, a_ops,
             before_ntok=b_ntok, after_ntok=a_ntok,
+            before_rep=b_rep or 1, after_rep=a_rep or 1,
         ))
     return tuple(aligned)
 
@@ -772,7 +920,7 @@ def _accumulate_macro_stats(bundle: ExportBundle) -> dict[str, dict[str, Any]]:
         bucket = stats.setdefault(mod, {
             "exposed_ms": 0.0, "raw_ms": 0.0, "lstar_ms": 0.0,
             "bound_ms": defaultdict(float), "masker_ms": defaultdict(float),
-            "target_layer_archs": {}, "draft_layers": 0, "has_head_or_embed": False,
+            "target_layer_indices": set(), "draft_layers": 0, "has_head_or_embed": False,
         })
         rep = max(1, int(op.repeat_count))
         exp_ms = 0.0 if op.is_overlapped else (op.exposed_dur_us * rep / US_PER_MS)
@@ -793,16 +941,16 @@ def _accumulate_macro_stats(bundle: ExportBundle) -> dict[str, dict[str, Any]]:
             else:
                 bucket["has_head_or_embed"] = True
         elif arch is not None and arch.layer_indices:
-            bucket["target_layer_archs"][op.archetype_id] = len(arch.layer_indices)
+            bucket["target_layer_indices"].update(int(x) for x in arch.layer_indices)
         else:
             bucket["has_head_or_embed"] = True
     return stats
 
 
 def _format_macro_layer_label(
-    mod: str, target_archs: Mapping[str, int], draft_layers: int, has_head: bool, bundle: ExportBundle,
+    mod: str, target_layer_indices: set[int], draft_layers: int, has_head: bool, bundle: ExportBundle,
 ) -> tuple[str, int]:
-    t_layers = sum(target_archs.values())
+    t_layers = len(target_layer_indices)
     if mod == MACRO_MOD_DRAFT_LAYERS:
         d_cnt = draft_layers or bundle.total_draft_layers
         return (f"Draft {d_cnt}L", d_cnt) if d_cnt > 0 else ("Draft ×1", 1)
@@ -864,12 +1012,12 @@ def build_macro_module_breakdown(
         lstar_ms = float(a_info["lstar_ms"]) if a_info else 0.0
         if raw_bef <= 0.0 and raw_aft <= 0.0:
             continue
-        merged_archs = dict(b_info["target_layer_archs"]) if b_info else {}
+        merged_indices: set[int] = set(b_info["target_layer_indices"]) if b_info else set()
         if a_info:
-            merged_archs.update(a_info["target_layer_archs"])
+            merged_indices.update(a_info["target_layer_indices"])
         d_layers = max(int(b_info["draft_layers"]) if b_info else 0, int(a_info["draft_layers"]) if a_info else 0)
         has_head = bool((b_info and b_info["has_head_or_embed"]) or (a_info and a_info["has_head_or_embed"]))
-        layer_lbl, layer_cnt = _format_macro_layer_label(mod, merged_archs, d_layers, has_head, aft_bundle)
+        layer_lbl, layer_cnt = _format_macro_layer_label(mod, merged_indices, d_layers, has_head, aft_bundle)
         bound_weights = a_info["bound_ms"] if (a_info and a_info["bound_ms"]) else (b_info["bound_ms"] if b_info else {})
         if mod == MACRO_MOD_MOE_SHARED and aft_ms <= OVERLAP_EXPOSED_EPS_US and raw_aft > 0.0:
             dom_bound = f"MSO Stream 1 100% 掩盖 (-{raw_aft:.3f}ms)"
@@ -924,22 +1072,37 @@ def _classify_comparison_card_key(
 ) -> tuple[str, str, OperatorExportRow | None] | None:
     if row.after_ops:
         a_op = row.after_ops[0]
-        is_new = (
+        is_new = bool(
             a_op.needs_new_kernel
-            or a_op.opt_pillar == "pillar1_fusion"
-            or (row.relation == "N->1" and a_op.family in {"mhc", "attn_res_prefix"})
+            or a_op.binding_state == BINDING_STATE_UNBOUND_FORMULA
         )
-        if is_new:
-            return f"new::{a_op.ascend_kernel}", PENDING_KIND_TO_IMPLEMENT, a_op
-        if not include_to_optimize:
-            return None
         if is_comparison:
-            if abs(saved_ms) <= CONSERVATION_EPS_MS and abs(saved_upt) <= CONSERVATION_EPS_MS:
+            has_nonzero_delta = (
+                abs(saved_ms) > CONSERVATION_EPS_MS or abs(saved_upt) > CONSERVATION_EPS_MS
+            )
+            has_positive_saving = (
+                saved_ms > CONSERVATION_EPS_MS or saved_upt > CONSERVATION_EPS_MS
+            )
+            if not has_nonzero_delta:
                 return None
-            if a_op.is_overlapped and (saved_ms > 0.0 or saved_upt > 0.0):
+            if is_new and has_positive_saving:
+                return f"new::{a_op.ascend_kernel}", PENDING_KIND_TO_IMPLEMENT, a_op
+            if not include_to_optimize:
+                return None
+            if a_op.is_overlapped and has_positive_saving:
                 return "opt::mso_stream_overlap_masking", PENDING_KIND_TO_OPTIMIZE, a_op
             return f"opt::{a_op.ascend_kernel}", PENDING_KIND_TO_OPTIMIZE, a_op
-        if not a_op.is_overlapped and a_op.gap_us > 0.0:
+
+        a_rep = row.effective_after_repeat
+        gap_ms = sum(
+            0.0 if a.is_overlapped else max(0.0, (a.exposed_dur_us - a.l_star_lean_us) * a_rep / US_PER_MS)
+            for a in row.after_ops
+        )
+        if gap_ms <= CONSERVATION_EPS_MS:
+            return None
+        if is_new:
+            return f"new::{a_op.ascend_kernel}", PENDING_KIND_TO_IMPLEMENT, a_op
+        if include_to_optimize:
             return f"opt::{a_op.ascend_kernel}", PENDING_KIND_TO_OPTIMIZE, a_op
         return None
 
@@ -957,17 +1120,20 @@ def _accumulate_pending_group(
     key: str,
     category: str,
     row: AlignedComparisonRow,
+    row_index: int,
     a_op: OperatorExportRow | None,
     after_bundle: ExportBundle,
     before_ntok: float,
     after_ntok: float,
     is_comparison: bool,
 ) -> None:
-    rep = max(1, int(row.repeat_count))
-    before_ms = sum(0.0 if b.is_overlapped else (b.exposed_dur_us * rep / US_PER_MS) for b in row.before_ops)
-    after_ms = sum(0.0 if a.is_overlapped else (a.exposed_dur_us * rep / US_PER_MS) for a in row.after_ops)
-    lstar_ms = sum(0.0 if a.is_overlapped else (a.l_star_lean_us * rep / US_PER_MS) for a in row.after_ops)
-    before_lstar_ms = sum(0.0 if b.is_overlapped else (b.l_star_lean_us * rep / US_PER_MS) for b in row.before_ops)
+    b_rep = row.effective_before_repeat
+    a_rep = row.effective_after_repeat
+    rep = a_rep or b_rep or max(1, int(row.repeat_count))
+    before_ms = sum(0.0 if b.is_overlapped else (b.exposed_dur_us * b_rep / US_PER_MS) for b in row.before_ops)
+    after_ms = sum(0.0 if a.is_overlapped else (a.exposed_dur_us * a_rep / US_PER_MS) for a in row.after_ops)
+    lstar_ms = sum(0.0 if a.is_overlapped else (a.l_star_lean_us * a_rep / US_PER_MS) for a in row.after_ops)
+    before_lstar_ms = sum(0.0 if b.is_overlapped else (b.l_star_lean_us * b_rep / US_PER_MS) for b in row.before_ops)
     gap_ms = max(0.0, after_ms - lstar_ms)
     gain_ms = (before_ms - after_ms) if is_comparison else gap_ms
     b_upt = before_ms * US_PER_MS / before_ntok
@@ -1012,11 +1178,16 @@ def _accumulate_pending_group(
             "synthesis_spec": kspec, "math_formula": math_formula, "sram_residency_summary": sram_sum,
             "binding_state": (
                 BINDING_STATE_UNBOUND_FORMULA
-                if (ref_op.binding_state == BINDING_STATE_UNBOUND_FORMULA or category == PENDING_KIND_TO_IMPLEMENT)
+                if (
+                    ref_op.binding_state == BINDING_STATE_UNBOUND_FORMULA
+                    or any(op.binding_state == BINDING_STATE_UNBOUND_FORMULA for op in row.after_ops)
+                )
                 else (ref_op.binding_state or BINDING_STATE_BOUND)
             ),
+            "source_row_indices": [],
         }
         grouped[key] = entry
+    entry["source_row_indices"].append(int(row_index))
     if any(op.binding_state == BINDING_STATE_UNBOUND_FORMULA for op in row.after_ops):
         entry["binding_state"] = BINDING_STATE_UNBOUND_FORMULA
     for b_op in row.before_ops:
@@ -1102,6 +1273,7 @@ def _materialize_pending_item(prio: int, entry: Mapping[str, Any], used_slugs: s
         math_formula=str(entry["math_formula"] or ""),
         sram_residency_summary=str(entry["sram_residency_summary"] or ""),
         binding_state=str(entry.get("binding_state") or BINDING_STATE_BOUND),
+        source_row_indices=tuple(int(i) for i in entry.get("source_row_indices", ())),
     )
 
 
@@ -1116,27 +1288,14 @@ def build_pending_kernel_details(
     """Build 100%-conserved Sheet 4 cards ranked by ``Δ(us / tok*die)``."""
     b_ntok = max(float((before_bundle or after_bundle).n_tok_per_die or 1.0), MIN_DENOM_EPS)
     a_ntok = max(float(after_bundle.n_tok_per_die or 1.0), MIN_DENOM_EPS)
-    is_comparison = (
-        (before_bundle is not None and abs(b_ntok - a_ntok) > MIN_DENOM_EPS)
-        or any(
-            row.relation != "1->1"
-            or len(row.before_ops) != len(row.after_ops)
-            or (
-                row.before_ops and row.after_ops
-                and (
-                    abs(row.before_ops[0].exposed_dur_us - row.after_ops[0].exposed_dur_us) > OVERLAP_EXPOSED_EPS_US
-                    or row.before_ops[0].ascend_kernel != row.after_ops[0].ascend_kernel
-                )
-            )
-            for row in aligned_rows
-        )
-    )
+    is_comparison = before_bundle is not None
     new_groups: dict[str, dict[str, Any]] = {}
     opt_groups: dict[str, dict[str, Any]] = {}
-    for row in aligned_rows:
-        rep = max(1, int(row.repeat_count))
-        b_ms = sum(0.0 if b.is_overlapped else (b.exposed_dur_us * rep / US_PER_MS) for b in row.before_ops)
-        a_ms = sum(0.0 if a.is_overlapped else (a.exposed_dur_us * rep / US_PER_MS) for a in row.after_ops)
+    for row_idx, row in enumerate(aligned_rows):
+        b_rep = row.effective_before_repeat
+        a_rep = row.effective_after_repeat
+        b_ms = sum(0.0 if b.is_overlapped else (b.exposed_dur_us * b_rep / US_PER_MS) for b in row.before_ops)
+        a_ms = sum(0.0 if a.is_overlapped else (a.exposed_dur_us * a_rep / US_PER_MS) for a in row.after_ops)
         saved_ms = b_ms - a_ms
         saved_upt = (b_ms * US_PER_MS / b_ntok) - (a_ms * US_PER_MS / a_ntok)
         classified = _classify_comparison_card_key(
@@ -1147,7 +1306,7 @@ def build_pending_kernel_details(
         key, cat, a_op = classified
         target_map = new_groups if cat == PENDING_KIND_TO_IMPLEMENT else opt_groups
         _accumulate_pending_group(
-            target_map, key=key, category=cat, row=row, a_op=a_op,
+            target_map, key=key, category=cat, row=row, row_index=row_idx, a_op=a_op,
             after_bundle=after_bundle, before_ntok=b_ntok, after_ntok=a_ntok,
             is_comparison=is_comparison,
         )
@@ -1165,10 +1324,15 @@ def build_pending_kernel_details(
 
 
 def build_new_kernel_backlog(
-    aligned_rows: Sequence[AlignedComparisonRow], after_bundle: ExportBundle,
+    aligned_rows: Sequence[AlignedComparisonRow],
+    after_bundle: ExportBundle,
+    *,
+    before_bundle: ExportBundle | None = None,
 ) -> tuple[NewKernelBacklogItem, ...]:
     """Aggregate To-Implement kernel items into Sheet 4 backlog."""
-    return build_pending_kernel_details(aligned_rows, after_bundle, include_to_optimize=False)
+    return build_pending_kernel_details(
+        aligned_rows, after_bundle, before_bundle=before_bundle, include_to_optimize=False,
+    )
 
 
 def _trim_text(text: str, limit: int = BRIEF_TEXT_LIMIT) -> str:
@@ -1180,24 +1344,26 @@ def _bundle_kpi_dict(bundle: ExportBundle) -> dict[str, Any]:
     step_ms = bundle.step_span_us / US_PER_MS
     is_decode = bundle.phase == "decode"
     acc = max(1.0, bundle.avg_accepted_tokens)
-    tpot_ms = (step_ms / acc) if is_decode else step_ms
+    handoff_ms = float(getattr(bundle, "handoff_tpot_ms", 0.0) or 0.0) if is_decode else 0.0
+    tpot_ms = ((step_ms / acc) + handoff_ms) if is_decode else step_ms
     sla = bundle.tpot_slo_ms if is_decode else bundle.ttft_slo_ms
     l_star_ms = bundle.step_l_star_lean_us / US_PER_MS
     return {
         "analysis_mode": bundle.analysis_mode,
         "binding_state": bundle.binding_state,
         "has_unbound_formula_ops": bool(bundle.has_unbound_formula_ops),
-        "step_ms": round(step_ms, 3),
-        "effective_tpot_ms": round(tpot_ms, 3),
-        "sla_target_ms": round(sla, 2),
+        "step_ms": float(step_ms),
+        "handoff_tpot_ms": float(handoff_ms),
+        "effective_tpot_ms": float(tpot_ms),
+        "sla_target_ms": float(sla),
         "sla_verdict": "PASS" if tpot_ms <= sla else "FAIL",
         "sla_regime": bundle.sla_regime,
-        "sla_slack_ms": round(bundle.sla_slack_ms, 3),
-        "n_tok_per_die": round(bundle.n_tok_per_die, 3),
-        "us_per_tok_die": round(bundle.us_per_tok_die, 2),
-        "single_die_tps": round(bundle.throughput_per_die_tokens_per_s, 2),
-        "cluster_tps": round(bundle.throughput_tokens_per_s, 2),
-        "l_star_ms": round(l_star_ms, 3),
+        "sla_slack_ms": float(sla - tpot_ms),
+        "n_tok_per_die": float(bundle.n_tok_per_die),
+        "us_per_tok_die": float(bundle.us_per_tok_die),
+        "single_die_tps": float(bundle.throughput_per_die_tokens_per_s),
+        "cluster_tps": float(bundle.throughput_tokens_per_s),
+        "l_star_ms": float(l_star_ms),
         "l_star_attainment_pct": round((100.0 * l_star_ms / step_ms) if step_ms > 0.0 else 0.0, 1),
         "cube_util_pct": round(bundle.network_cube_mfu, 1),
         "vector_util_pct": round(bundle.network_vec_mfu, 1),
@@ -1206,21 +1372,120 @@ def _bundle_kpi_dict(bundle: ExportBundle) -> dict[str, Any]:
     }
 
 
+def _brief_utf8_len(payload: Mapping[str, Any]) -> int:
+    return len((json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8"))
+
+
+def _truncate_utf8_bytes(text: str, max_bytes: int) -> str:
+    """Truncate ``text`` strictly below or equal to ``max_bytes`` UTF-8 bytes."""
+    raw = str(text)
+    if max_bytes <= 0:
+        return ""
+    encoded = raw.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return raw
+    ellipsis = "..."
+    ell_b = len(ellipsis)
+    if max_bytes <= ell_b:
+        return encoded[:max_bytes].decode("utf-8", errors="ignore")
+    body = encoded[: max_bytes - ell_b].decode("utf-8", errors="ignore")
+    return body + ellipsis
+
+
+def _shrink_value_for_budget(val: Any, excess_bytes: int) -> Any:
+    """Shrink one oversized value by at least ``excess_bytes`` UTF-8 bytes."""
+    if isinstance(val, list):
+        return val[: len(val) // 2] if len(val) > 1 else []
+    if isinstance(val, Mapping):
+        if len(val) > 1:
+            items = list(val.items())
+            return dict(items[: len(items) // 2])
+        if len(val) == 1:
+            k_only, v_only = next(iter(val.items()))
+            shrunk = _shrink_value_for_budget(v_only, excess_bytes)
+            return {} if shrunk == v_only else {k_only: shrunk}
+        return {}
+    if isinstance(val, str):
+        cur_bytes = len(val.encode("utf-8"))
+        target_bytes = max(0, min(cur_bytes // 2, cur_bytes - max(1, excess_bytes)))
+        return _truncate_utf8_bytes(val, target_bytes)
+    return None
+
+
+def _trim_keys_to_budget(trimmed: dict[str, Any], protected: frozenset[str]) -> None:
+    while _brief_utf8_len(trimmed) >= AGENT_BRIEF_MAX_BYTES:
+        excess = _brief_utf8_len(trimmed) - AGENT_BRIEF_MAX_BYTES + 1
+        candidates = [
+            (len(json.dumps(val, ensure_ascii=False, separators=(",", ":")).encode("utf-8")), key)
+            for key, val in trimmed.items()
+            if key not in protected and val not in (None, "", [], {})
+        ]
+        if not candidates:
+            break
+        _, largest_key = max(candidates)
+        cur_val = trimmed[largest_key]
+        shrunk = _shrink_value_for_budget(cur_val, excess)
+        if shrunk is None or shrunk == cur_val:
+            trimmed.pop(largest_key, None)
+        else:
+            trimmed[largest_key] = shrunk
+
+
 def _compact_agent_brief_to_budget(brief: dict[str, Any]) -> dict[str, Any]:
     """Guarantee ``agent_brief.json`` stays strictly below ``AGENT_BRIEF_MAX_BYTES`` (8 KB)."""
-    if len(json.dumps(brief, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) < AGENT_BRIEF_MAX_BYTES:
+    if _brief_utf8_len(brief) < AGENT_BRIEF_MAX_BYTES:
         return brief
     trimmed = dict(brief)
-    for key in ("va_serving_rules", "kernel_synthesis_specs", "semantic_audit_triggers"):
-        if key in trimmed and len(json.dumps(trimmed, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) >= AGENT_BRIEF_MAX_BYTES:
-            val = trimmed[key]
-            if isinstance(val, list) and len(val) > 2:
-                trimmed[key] = val[:2]
-    if len(json.dumps(trimmed, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) >= AGENT_BRIEF_MAX_BYTES:
+    for key in ("kernel_synthesis_specs", "semantic_audit_triggers"):
+        val = trimmed.get(key)
+        if isinstance(val, list) and len(val) > 2 and _brief_utf8_len(trimmed) >= AGENT_BRIEF_MAX_BYTES:
+            trimmed[key] = val[:2]
+    if _brief_utf8_len(trimmed) >= AGENT_BRIEF_MAX_BYTES and isinstance(trimmed.get("va_serving_rules"), Mapping):
+        va_copy = dict(trimmed["va_serving_rules"])
+        va_copy.pop("hw_isa_guidance", None)
+        if isinstance(va_copy.get("capture_sizes"), list):
+            va_copy["capture_sizes"] = va_copy["capture_sizes"][:BRIEF_MAX_CAPTURE_SIZES]
+        trimmed["va_serving_rules"] = va_copy
+    if _brief_utf8_len(trimmed) >= AGENT_BRIEF_MAX_BYTES:
         trimmed["module_hierarchy"] = [
             {k: v for k, v in grp.items() if k != "children"}
             for grp in trimmed.get("module_hierarchy", ())
         ]
+    if _brief_utf8_len(trimmed) >= AGENT_BRIEF_MAX_BYTES:
+        for key in ("kernel_synthesis_specs", "semantic_audit_triggers"):
+            val = trimmed.get(key)
+            if isinstance(val, list) and len(val) > 1:
+                trimmed[key] = val[:1]
+        wall = trimmed.get("macro_wall_trigger")
+        if isinstance(wall, Mapping) and isinstance(wall.get("recommended_actions"), list):
+            trimmed["macro_wall_trigger"] = {**wall, "recommended_actions": wall["recommended_actions"][:1]}
+    if _brief_utf8_len(trimmed) >= AGENT_BRIEF_MAX_BYTES and isinstance(trimmed.get("scenario_and_parallelism"), Mapping):
+        sc = dict(trimmed["scenario_and_parallelism"])
+        if sc.get("module_parallel_domains"):
+            sc["module_parallel_domains"] = _trim_text(str(sc["module_parallel_domains"]), BRIEF_TEXT_LIMIT)
+        sc.pop("recommended_checkpoint", None)
+        trimmed["scenario_and_parallelism"] = sc
+    for drop_key in (
+        "va_serving_rules", "kernel_synthesis_specs", "semantic_audit_triggers",
+        "macro_wall_trigger", "generated_files",
+    ):
+        if _brief_utf8_len(trimmed) < AGENT_BRIEF_MAX_BYTES:
+            break
+        if drop_key in trimmed:
+            trimmed[drop_key] = [] if isinstance(trimmed[drop_key], list) else ({} if isinstance(trimmed[drop_key], Mapping) else None)
+    if _brief_utf8_len(trimmed) >= AGENT_BRIEF_MAX_BYTES and isinstance(trimmed.get("action_plan_3_tracks"), Mapping):
+        plan = dict(trimmed["action_plan_3_tracks"])
+        for list_key in ("kernel_tasks", "framework_tasks", "config_and_env"):
+            items = plan.get(list_key)
+            if isinstance(items, list) and len(items) > 2:
+                plan[list_key] = items[:2]
+        plan["parallelism_codesign_note"] = _trim_text(str(plan.get("parallelism_codesign_note") or ""), BRIEF_TEXT_LIMIT)
+        trimmed["action_plan_3_tracks"] = plan
+    _trim_keys_to_budget(trimmed, frozenset({"schema", "summary"}))
+    if _brief_utf8_len(trimmed) >= AGENT_BRIEF_MAX_BYTES:
+        _trim_keys_to_budget(trimmed, frozenset({"schema"}))
+    if _brief_utf8_len(trimmed) >= AGENT_BRIEF_MAX_BYTES:
+        _trim_keys_to_budget(trimmed, frozenset())
     return trimmed
 
 
@@ -1242,7 +1507,9 @@ def build_agent_brief(
             for op in before_bundle.operators
         )
     )
-    pending = build_pending_kernel_details(aligned, after, before_bundle=before_bundle)
+    pending = build_pending_kernel_details(
+        aligned, after, before_bundle=(before_bundle if after_bundle is not None else None),
+    )
     roadmap = build_actionable_roadmap(before_bundle, after, pending)
     codesign = build_parallelism_codesign_note(before_bundle, after)
     par_short, par_detail = format_parallelism_codomain_summary(after)
@@ -1318,37 +1585,50 @@ def build_agent_brief(
         }
         for tr in sorted(after.semantic_audit_triggers, key=lambda t: -t.potential_gain_us_per_tok_die)[:BRIEF_MAX_TRIGGERS]
     ]
+    eff_total_dies = (
+        int(after.deployment_total_dies)
+        if int(getattr(after, "deployment_total_dies", 0) or 0) > 0
+        else mem.total_dies
+    )
+    eff_cluster_conc = (
+        int(after.cluster_concurrency)
+        if int(getattr(after, "cluster_concurrency", 0) or 0) > 0
+        else (mem.concurrency * mem.dp)
+    )
+    scen_block: dict[str, Any] = {
+        "model": after.model_name, "hardware_sku": after.hardware_sku,
+        "topology_preset": after.topology_preset, "phase": after.phase,
+        "deployment_mode": after.deployment_mode, "total_dies": eff_total_dies,
+        "dp": mem.dp, "tp": mem.tp, "ep": mem.ep, "pp": mem.pp,
+        "dcp": mem.dcp, "pcp": mem.pcp, "local_tp": mem.local_tp,
+        "sequence_parallel": after.sequence_parallel,
+        "parallelism_co_domain": par_short,
+        "module_parallel_domains": par_detail,
+        "prompt_tokens": after.prompt_tokens, "output_tokens": after.output_tokens,
+        "concurrency_per_dp": mem.concurrency, "cluster_concurrency": eff_cluster_conc,
+        "max_hbm_concurrency_per_dp": mem.max_hbm_concurrency_per_dp,
+        "spec_method": after.spec_method, "spec_proposals": after.spec_proposals,
+        "avg_accepted_tokens": after.avg_accepted_tokens,
+        "weight_quant": mem.weight_quant_display or mem.weight_quant,
+        "cache_dtype": mem.cache_dtype,
+        "native_bf16_weight_gib_per_die": round(mem.native_bf16_weight_footprint_per_die_bytes / float(GIB_BYTES), 2),
+        "quantized_weight_gib_per_die": round(mem.weight_footprint_per_die_bytes / float(GIB_BYTES), 2),
+        "weight_compression_ratio": round(mem.weight_compression_ratio, 2),
+        "fits_hbm": mem.fits_hbm,
+        "recommended_checkpoint": after.recommended_checkpoint,
+    }
+    if after.pd_pool_summary:
+        scen_block["pd_pool"] = dict(after.pd_pool_summary)
     brief: dict[str, Any] = {
         "schema": AGENT_BRIEF_SCHEMA,
-        "scenario_and_parallelism": {
-            "model": after.model_name, "hardware_sku": after.hardware_sku,
-            "topology_preset": after.topology_preset, "phase": after.phase,
-            "deployment_mode": after.deployment_mode, "total_dies": mem.total_dies,
-            "dp": mem.dp, "tp": mem.tp, "ep": mem.ep, "pp": mem.pp,
-            "dcp": mem.dcp, "pcp": mem.pcp, "local_tp": mem.local_tp,
-            "sequence_parallel": after.sequence_parallel,
-            "parallelism_co_domain": par_short,
-            "module_parallel_domains": par_detail,
-            "prompt_tokens": after.prompt_tokens, "output_tokens": after.output_tokens,
-            "concurrency_per_dp": mem.concurrency, "cluster_concurrency": mem.concurrency * mem.dp,
-            "max_hbm_concurrency_per_dp": mem.max_hbm_concurrency_per_dp,
-            "spec_method": after.spec_method, "spec_proposals": after.spec_proposals,
-            "avg_accepted_tokens": after.avg_accepted_tokens,
-            "weight_quant": mem.weight_quant_display or mem.weight_quant,
-            "cache_dtype": mem.cache_dtype,
-            "native_bf16_weight_gib_per_die": round(mem.native_bf16_weight_footprint_per_die_bytes / float(GIB_BYTES), 2),
-            "quantized_weight_gib_per_die": round(mem.weight_footprint_per_die_bytes / float(GIB_BYTES), 2),
-            "weight_compression_ratio": round(mem.weight_compression_ratio, 2),
-            "fits_hbm": mem.fits_hbm,
-            "recommended_checkpoint": after.recommended_checkpoint,
-        },
+        "scenario_and_parallelism": scen_block,
         "kpis_before_vs_after": {
             "before": b_kpi, "after": a_kpi,
-            "saved_step_ms": round(b_kpi["step_ms"] - a_kpi["step_ms"], 3),
-            "saved_us_per_tok_die": round(b_kpi["us_per_tok_die"] - a_kpi["us_per_tok_die"], 2),
+            "saved_step_ms": float(b_kpi["step_ms"] - a_kpi["step_ms"]),
+            "saved_us_per_tok_die": float(b_kpi["us_per_tok_die"] - a_kpi["us_per_tok_die"]),
             "speedup": speedup,
-            "sheet4_cards_total_gain_ms": round(sum(x.expected_gain_ms for x in pending), 3),
-            "sheet4_cards_total_gain_us_per_tok_die": round(sum(x.saved_us_per_tok_die for x in pending), 2),
+            "sheet4_cards_total_gain_ms": float(sum(x.expected_gain_ms for x in pending)),
+            "sheet4_cards_total_gain_us_per_tok_die": float(sum(x.saved_us_per_tok_die for x in pending)),
         },
         "module_hierarchy": l1_groups,
         "action_plan_3_tracks": {
@@ -1407,10 +1687,14 @@ def export_agent_brief(
 
     target.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(brief, ensure_ascii=False, separators=(",", ":")) + "\n"
-    if len(payload.encode("utf-8")) <= AGENT_BRIEF_PRETTY_LIMIT_BYTES:
+    encoded_len = len(payload.encode("utf-8"))
+    if encoded_len <= AGENT_BRIEF_PRETTY_LIMIT_BYTES:
         pretty = json.dumps(brief, ensure_ascii=False, indent=1) + "\n"
         if len(pretty.encode("utf-8")) < AGENT_BRIEF_MAX_BYTES:
             payload = pretty
+            encoded_len = len(payload.encode("utf-8"))
+    if encoded_len >= AGENT_BRIEF_MAX_BYTES:
+        raise ModelingError(f"agent_brief_exceeds_max_bytes:{encoded_len}>={AGENT_BRIEF_MAX_BYTES}")
     fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent))
     tmp_path = Path(tmp_name)
     try:
