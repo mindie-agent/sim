@@ -597,3 +597,60 @@ def test_joint_service_cannot_hide_native_multiphase_or_network_program():
     rule["match"] = {"recipe": copy_op(4000).recipe}
     with pytest.raises(ModelingError, match="single_local_kernel"):
             operator_costs(raw, (replace(copy_op(4000), family="alltoall"),))
+
+
+def test_oneshot_allreduce_replay_accounts_direct_peer_exchange():
+    from mindie_sim.prediction.collectives import OneShotCollective, Topology
+    from mindie_sim.prediction.execution.operator_replay import cohort_operator_costs
+    from mindie_sim.prediction.program import RecipeBook
+    from mindie_sim.schema.operators import OpSpec
+
+    ranks = 8
+    tensor_bytes = 1024 * 1024
+    ring_link_bytes = float(2 * (ranks - 1) * tensor_bytes // ranks)
+    raw_tp = case(tp=ranks)
+    raw_tp["model"].update(num_heads=ranks, num_kv_heads=ranks)
+    raw_tp["machine"]["links"] = [{
+        "name": "ub_mesh", "members": list(range(ranks)),
+        "semantics": "per_pair", "capacity_bytes_per_ms": 400_000_000, "latency_us": 1.0,
+    }]
+    op_tp = OpSpec(
+        op_id="oneshot_ar_tp", family="allreduce", phase="decode", stage=0, layer=0,
+        requests=("r",), semantic_shape=(1, 32), local_shape=(1, 32),
+        padded_shape=(1, 32), launch_shape=(1, 32), link_bytes=ring_link_bytes,
+        link_scope="tp", dtype="bf16", layout="contiguous", recipe="oneshot_ar",
+        metadata=(("collective", "allreduce"), ("group_axis", "tp")),
+    )
+    book = RecipeBook(recipes={"oneshot_ar": OneShotCollective(path_model="direct")})
+    row = operator_costs(raw_tp, (op_tp,), recipes=book)["operators"][0]
+    comm = row["communication"]
+    assert comm["useful_bytes"] == pytest.approx(ranks * (ranks - 1) * tensor_bytes)
+    assert comm["messages"] == ranks * (ranks - 1)
+    assert len(comm["resources"]) == ranks * (ranks - 1)
+    assert row["service_delta"] == {}
+    assert row["serviced"] == {name: item["wire_bytes"] for name, item in comm["resources"].items()}
+
+    raw_ep = cohort_case(ranks)
+    raw_ep["machine"]["links"][0].update(capacity_bytes_per_ms=400_000_000, latency_us=1.0)
+    op_ep = replace(op_tp, op_id="oneshot_ar_ep", link_scope="ep",
+                    metadata=(("collective", "allreduce"), ("group_axis", "ep")))
+    cohort = cohort_operator_costs(
+        parse_case(raw_ep), {r: op_ep for r in range(ranks)}, recipes=book,
+    )
+    assert len(cohort["operators"]) == ranks
+    assert len(cohort["serviced"]) == ranks * (ranks - 1)
+    for op_row in cohort["operators"]:
+        assert op_row["communication"]["useful_bytes"] == pytest.approx((ranks - 1) * tensor_bytes)
+        assert op_row["communication"]["messages"] == ranks - 1
+        assert op_row["service_delta"] == {}
+
+    parsed = parse_case(raw_tp)
+    topo = Topology(parsed.machine, parsed.runtime.parallel)
+    topo.joint_plan(op_tp, {0: ring_link_bytes}, algorithm="oneshot")
+    assert sum(topo.accounting(op_tp, 0).useful_by_rank.values()) == pytest.approx(
+        ranks * (ranks - 1) * tensor_bytes
+    )
+    topo.joint_plan(op_tp, {0: ring_link_bytes}, algorithm="ring")
+    assert sum(topo.accounting(op_tp, 0).useful_by_rank.values()) == pytest.approx(
+        ranks * ring_link_bytes
+    )

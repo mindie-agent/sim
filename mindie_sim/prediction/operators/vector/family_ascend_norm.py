@@ -265,11 +265,12 @@ def _update_native_norm_meta(
     meta, op, qmeta, *, bias, shift, kind, source, stats_bytes, has_bias,
     norm_vector_ops, quant_vector_ops, quant_component, work_source,
     residual_bytes, residual_materialized, residual_covered, normalized_bytes,
-    extra_read, extra_record,
+    extra_read, extra_record, fp32_working_tiles,
 ):
     meta.update({
         "norm_has_bias": bias, "norm_weight_offset": 0.0,
         "norm_caller_weight_offset": shift, "native_norm_kind": kind,
+        "native_norm_fp32_working_tiles": int(fp32_working_tiles),
         "native_source": source,
         "native_implementation": {
             "native_kinds": (kind,), "selection": "explicit_caller_implementation",
@@ -406,6 +407,7 @@ def lower_op(op, *, has_bias=None, external_gamma_shift=False):
         if add_family:
             returns = _with(returns, "residual")
 
+    fp32_working_tiles = 2 if (add_family and op.dtype in {"bf16", "fp16"}) else 1
     _update_native_norm_meta(
         meta, op, qmeta, bias=bias, shift=shift, kind=kind, source=source,
         stats_bytes=stats_bytes, has_bias=has_bias, norm_vector_ops=norm_vector_ops,
@@ -413,7 +415,7 @@ def lower_op(op, *, has_bias=None, external_gamma_shift=False):
         work_source=work_source, residual_bytes=residual_bytes,
         residual_materialized=residual_materialized, residual_covered=residual_covered,
         normalized_bytes=normalized_bytes, extra_read=extra_read,
-        extra_record=extra_record)
+        extra_record=extra_record, fp32_working_tiles=fp32_working_tiles)
     deps, prefix = op.deps, []
     if shift:
         gamma = vector_op(

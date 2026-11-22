@@ -50,6 +50,7 @@ class HardwareProfile:
     ub_units: int = 1
     prefetch_units: int = 1
     usable_ub_bytes: int | None = None
+    simt_ub_carveout_bytes: int = 0
     cube_capacities: CubeResources | None = None
     event_record_ms: float = 0.0
     event_wait_ms: float = 0.0
@@ -71,6 +72,10 @@ class HardwareProfile:
                     or isinstance(self.usable_ub_bytes, bool) \
                     or self.usable_ub_bytes <= 0:
                 raise ValueError("hardware_usable_ub_invalid")
+        if (isinstance(self.simt_ub_carveout_bytes, bool)
+                or not isinstance(self.simt_ub_carveout_bytes, int)
+                or self.simt_ub_carveout_bytes < 0):
+            raise ValueError("hardware_simt_ub_carveout_invalid")
         if self.max_streams < 1 or self.max_streams > _MAX_PLAN_STREAMS:
             raise ValueError("hardware_max_streams_invalid")
         if (self.launch_ms < 0 or self.device_min_ms < 0
@@ -154,6 +159,7 @@ class HardwareProfile:
             capabilities=tuple(sorted(capabilities.items())),
             ub_units=int(die.pool_units("ub")) if "ub" in buffers else 1,
             usable_ub_bytes=int(buffers.get("ub", 0)),
+            simt_ub_carveout_bytes=int(getattr(die, "simt_ub_carveout_bytes", 0) or 0),
             cube_capacities=cube,
             mte2_bytes_per_ms=float(rates.get("mte2_aiv", rates["hbm"])) / 1000.0,
             mte3_bytes_per_ms=float(rates.get("mte3", rates["hbm"])) / 1000.0,
@@ -774,7 +780,8 @@ def baseline_plan(graph: TypedGraph,
                           capacity_per_owner=hardware.ub_bytes_per_aiv,
                           usable_ub_bytes=hardware.usable_ub, owner=op.owner,
                           allow_cube=op.resource == "cube",
-                          cube_resources=hardware.cube_capacities)
+                          cube_resources=hardware.cube_capacities,
+                          simt_ub_carveout_bytes=hardware.simt_ub_carveout_bytes)
         nodes.append(PlanNode(
             node_id=op.op_id, work=_work(work), deps=graph.predecessors(op.op_id),
             stream=op.stream or "main", kind="kernel", args=(op.op_id,),

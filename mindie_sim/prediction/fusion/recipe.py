@@ -343,7 +343,9 @@ def synthesize_vector(graph: TypedGraph, members, *, tile_rows: int,
                       owner: int = 0,
                       allow_relaxed_numerics: bool = False,
                       reduction_merge: ReductionMerge | None = None,
-                      channel_width: int | None = None
+                      channel_width: int | None = None,
+                      uses_simt: bool = False,
+                      simt_ub_carveout_bytes: int = 0
                       ) -> FusionCandidate | RejectedFusion:
     chosen = tuple(dict.fromkeys(members))
     analysis = analyze_region(graph, chosen, tile_rows=tile_rows,
@@ -353,7 +355,9 @@ def synthesize_vector(graph: TypedGraph, members, *, tile_rows: int,
                               tensor_parallel=tensor_parallel,
                               usable_ub_bytes=usable_ub_bytes, owner=owner,
                               reduction_merge=reduction_merge,
-                              allow_relaxed_numerics=allow_relaxed_numerics)
+                              allow_relaxed_numerics=allow_relaxed_numerics,
+                              uses_simt=uses_simt,
+                              simt_ub_carveout_bytes=simt_ub_carveout_bytes)
     candidate_id = f"{pass_name}:{'+'.join(chosen)}:t{tile_rows}"
     if not analysis.legality.ok:
         return RejectedFusion(candidate_id, pass_name, chosen, analysis.legality.reasons,
@@ -393,7 +397,9 @@ def synthesize_cube_epilogue(graph: TypedGraph, cube_op: str, epilogue: tuple[st
                              tensor_parallel: int = 1,
                              usable_ub_bytes: int | None = None,
                              owner: int = 0,
-                             allow_relaxed_numerics: bool = False
+                             allow_relaxed_numerics: bool = False,
+                             uses_simt: bool = False,
+                             simt_ub_carveout_bytes: int = 0
                              ) -> FusionCandidate | RejectedFusion:
     chosen = tuple(dict.fromkeys((cube_op, *epilogue)))
     candidate_id = f"{pass_name}:{'+'.join(chosen)}:t{tile_rows}"
@@ -407,7 +413,9 @@ def synthesize_cube_epilogue(graph: TypedGraph, cube_op: str, epilogue: tuple[st
                               cube_resources=cube_resources,
                               tensor_parallel=tensor_parallel,
                               usable_ub_bytes=usable_ub_bytes, owner=owner,
-                              allow_relaxed_numerics=allow_relaxed_numerics)
+                              allow_relaxed_numerics=allow_relaxed_numerics,
+                              uses_simt=uses_simt,
+                              simt_ub_carveout_bytes=simt_ub_carveout_bytes)
     if not analysis.legality.ok:
         reasons = list(analysis.legality.reasons)
         outside = {v: _outside_reader(graph, v, chosen)
@@ -455,7 +463,9 @@ def synthesize_cube_prologue(graph: TypedGraph, prologue_op: str, cube_op: str, 
                              tensor_parallel: int = 1,
                              usable_ub_bytes: int | None = None,
                              owner: int = 0,
-                             allow_relaxed_numerics: bool = False
+                             allow_relaxed_numerics: bool = False,
+                             uses_simt: bool = False,
+                             simt_ub_carveout_bytes: int = 0
                              ) -> FusionCandidate | RejectedFusion:
     chosen = (prologue_op, cube_op)
     candidate_id = f"{pass_name}:{prologue_op}+{cube_op}:t{tile_rows}"
@@ -473,7 +483,9 @@ def synthesize_cube_prologue(graph: TypedGraph, prologue_op: str, cube_op: str, 
                               cube_resources=cube_resources,
                               tensor_parallel=tensor_parallel,
                               usable_ub_bytes=usable_ub_bytes, owner=owner,
-                              allow_relaxed_numerics=allow_relaxed_numerics)
+                              allow_relaxed_numerics=allow_relaxed_numerics,
+                              uses_simt=uses_simt,
+                              simt_ub_carveout_bytes=simt_ub_carveout_bytes)
     if not analysis.legality.ok:
         reasons = list(analysis.legality.reasons)
         intermediate = next((v for v in graph.ops[prologue_op].outputs
@@ -522,7 +534,9 @@ def choose_vector_region(graph: TypedGraph, members, *, capacity_per_owner: int,
                          owner: int = 0,
                          allow_relaxed_numerics: bool = False,
                          reduction_merge: ReductionMerge | None = None,
-                         channel_width: int | None = None
+                         channel_width: int | None = None,
+                         uses_simt: bool = False,
+                         simt_ub_carveout_bytes: int = 0
                          ) -> tuple[FusionCandidate | RejectedFusion, ...]:
     results = []
     for tile in tiles:
@@ -536,5 +550,7 @@ def choose_vector_region(graph: TypedGraph, members, *, capacity_per_owner: int,
             usable_ub_bytes=usable_ub_bytes,
             owner=owner,
             allow_relaxed_numerics=allow_relaxed_numerics,
-            reduction_merge=reduction_merge, channel_width=channel_width))
+            reduction_merge=reduction_merge, channel_width=channel_width,
+            uses_simt=uses_simt,
+            simt_ub_carveout_bytes=simt_ub_carveout_bytes))
     return tuple(results)

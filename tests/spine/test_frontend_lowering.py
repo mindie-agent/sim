@@ -297,7 +297,11 @@ def test_dspark_kv_cache_footprint_and_block_draft_subgraph():
     rt_base = replace(parsed.runtime, parallel=p_tp8, pp_layer_partition=(), metadata=()); rt_dspark = replace(parsed.runtime, parallel=p_tp8, pp_layer_partition=(), dspark=DsparkSpec(7, (0.9,) * 7), metadata=(("draft_mode", "dspark"),))
     mem_base, mem_dspark = Memory(replace(parsed, runtime=rt_base)), Memory(replace(parsed, runtime=rt_dspark))
     assert mem_dspark.weights[0] > mem_base.weights[0] and mem_dspark.workspace[0] > mem_base.workspace[0]
-    assert mem_dspark.cache_bytes(4096)[0] - mem_base.cache_bytes(4096)[0] == 4096 * 2560.0
+    assert mem_dspark.cache_bytes(4096, query_tokens=1)[0] - mem_base.cache_bytes(4096)[0] == 4096 * 2560.0
+    bd_base, bd_dspark = mem_base.cache_pool_breakdown(4096), mem_dspark.cache_pool_breakdown(4096)
+    assert bd_dspark["draft_kv_bytes"] == 4096 * 2560.0 and bd_dspark["query_tokens"] == 8
+    assert bd_dspark["by_component"]["recurrent_state"] == 8 * bd_base["by_component"]["recurrent_state"]
+    assert mem_dspark.cache_bytes(4096)[0] > mem_base.cache_bytes(4096)[0] + 4096 * 2560.0
 @pytest.mark.parametrize("loader", ("catalog", "config"))
 def test_dspark_block5_mla_catalog_and_draft_subgraph(loader):
     if loader == "catalog":

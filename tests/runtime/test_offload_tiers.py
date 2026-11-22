@@ -597,3 +597,63 @@ def test_prefill_layerwise_and_pd_remote_handoff():
     assert base_report["status"] == offload_report["status"] == "modeled"; assert base_report["execution"]["handoff_bytes"] == 4 * 1024 * (2 * 1152 + 130); assert offload_report["execution"]["handoff_bytes"] == (
         4 * 1024 * 130 + 1 * 1024 * (2 * 1152))
     assert offload_report["execution"]["handoff_bytes"] < base_report["execution"]["handoff_bytes"]
+
+
+def test_compose_accepts_full_window_speculative_requests_and_validates_draft_cap():
+    import json
+    from pathlib import Path
+    from _support.axes import REPRESENTATIVE_SKUS
+    from mindie_sim.compose import _resolve_mtp_policy
+    from mindie_sim.model_catalog import load_model
+    from mindie_sim.schema.common import ModelingError
+
+    cfg_path = Path(__file__).resolve().parents[2] / "mindie_sim" / "model_configs" / "deepseek-v3.2.json"
+    base_cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    short_cfg = {**base_cfg, "num_hidden_layers": 4, "max_position_embeddings": 4096}
+    short_target = load_model("deepseek-v3.2")
+
+    # 4080 + 16 == 4096 fits the 4096 target horizon even with explicit mtp_proposal_tokens=3.
+    composed = compose_case(
+        short_cfg, hardware=REPRESENTATIVE_SKUS["a5"], tp=1, dp=1, ep=1,
+        prompt_tokens=4080, output_tokens=16, max_model_len=4096,
+        mtp_proposal_tokens=3, mtp_acceptance_length=2.5,
+    )
+    assert composed["runtime"]["max_model_len"] == 4096
+    assert composed["runtime"]["metadata"]["draft_proposal_tokens"] == 3
+
+    # Inferred MTP stays active at exact 4096 boundary rather than disabling with max_len_bounded.
+    prof_tokens, _accept, source = _resolve_mtp_policy(
+        mtp_proposal_tokens=None, mtp_acceptance_length=None,
+        raw_eager=False, production=True,
+        va_profile={"mtp_proposal_tokens": 3},
+        model_spec=short_target, prompt_tokens=4080, output_tokens=16,
+        ttft_slo_ms=None, tpot_slo_ms=None, require_scenario=True,
+        model_limit=4096, max_model_len=4096,
+    )
+    assert (prof_tokens, source) == (3, "profile")
+
+    # Exceeding the actual target horizon (4081 + 16 = 4097 > 4096) still rejects.
+    with pytest.raises(ModelingError, match="workload_exceeds_model_max_position_embeddings"):
+        compose_case(
+            short_cfg, hardware=REPRESENTATIVE_SKUS["a5"], tp=1, dp=1, ep=1,
+            prompt_tokens=4081, output_tokens=16, max_model_len=4096,
+            mtp_proposal_tokens=3, mtp_acceptance_length=2.5,
+        )
+
+    # Independent draft-model context cap is checked against draft.max_position_embeddings separately.
+    kimi_path = Path(__file__).resolve().parents[2] / "mindie_sim" / "model_configs" / "kimi-k3.json"
+    kimi_cfg = json.loads(kimi_path.read_text(encoding="utf-8"))
+    capped_cfg = deepcopy(kimi_cfg)
+    capped_cfg["text_config"]["dspark_max_model_len"] = 4096
+    ok_capped = compose_case(
+        capped_cfg, hardware=REPRESENTATIVE_SKUS["a5"], tp=1, dp=1, ep=1, layers=4,
+        prompt_tokens=8192, output_tokens=16, mtp_proposal_tokens=3,
+        mtp_acceptance_length=2.5, draft_max_model_len=4096,
+    )
+    assert ok_capped["runtime"]["metadata"]["draft_max_model_len"] == 4096
+    with pytest.raises(ModelingError, match="draft_max_model_len_exceeds_draft_max_position_embeddings"):
+        compose_case(
+            capped_cfg, hardware=REPRESENTATIVE_SKUS["a5"], tp=1, dp=1, ep=1, layers=4,
+            prompt_tokens=8192, output_tokens=16, mtp_proposal_tokens=3,
+            mtp_acceptance_length=2.5, draft_max_model_len=8192,
+        )

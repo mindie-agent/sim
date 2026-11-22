@@ -199,11 +199,17 @@ def cohort_operator_costs(case, ops, *, recipes, primitives=None,
             context.op, item.replica, replica_scopes.get(item.replica, "none"))
         accounting = execution.topology.accounting(
             context.op, item.replica, volume=context.native_work.get("link", 0),
-            transport=transport)
+            transport=transport, recipe=item.recipe)
         for resource, amount in accounting.wire_by_resource.items():
             attributed[resource] = attributed.get(resource, 0) + amount
+        row_context = (
+            replace(context, work=dict(accounting.wire_by_resource))
+            if (getattr(item.recipe, "algorithm", None) == "oneshot"
+                and context.joint_native_service is None)
+            else context
+        )
         row = _cost_row(
-            execution, context.op, item.recipe, context,
+            execution, context.op, item.recipe, row_context,
             identity=identities[item.replica], count=1,
             duration=item.completion.time - input_ready_ms,
             input_ready_ms=input_ready_ms, serviced=accounting.wire_by_resource,
@@ -449,17 +455,29 @@ def operator_costs(case, ops, *, recipes=None, primitives=None, replay_scope=Non
         duration = complete.time - input_ready_ms
         hw_serviced = {key: value for key, value in engine.serviced.items()
                        if "stream_quota@" not in key}
+        comm_accounting = (
+            execution.topology.accounting(
+                op, replica, volume=context.native_work["link"],
+                transport=execution.transport_options_for(
+                    op, replica, replay_scope),
+                recipe=recipe)
+            if context.native_work.get("link") else None
+        )
+        row_context = (
+            replace(context, work=dict(comm_accounting.wire_by_resource))
+            if (comm_accounting is not None
+                and getattr(recipe, "algorithm", None) == "oneshot"
+                and context.joint_native_service is None)
+            else context
+        )
         row = {
             **_cost_row(
-                execution, op, recipe, context, identity=identity,
+                execution, op, recipe, row_context, identity=identity,
                 count=group["count"], duration=duration,
                 input_ready_ms=input_ready_ms, serviced=hw_serviced,
                 early_service=early_service),
-            **({"communication": _communication_description(execution.topology.accounting(
-                op, replica, volume=context.native_work["link"],
-                transport=execution.transport_options_for(
-                    op, replica, replay_scope)), recipe)}
-               if context.native_work.get("link") else {}),
+            **({"communication": _communication_description(comm_accounting, recipe)}
+               if comm_accounting is not None else {}),
         }
         rows.append(row)
         if isolated_cache is not None:

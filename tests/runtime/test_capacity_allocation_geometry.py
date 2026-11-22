@@ -596,3 +596,133 @@ def test_tile_solver_and_fusion_budget_fp32_ub_upcast_and_simt_carveout():
     cube = CubeResources(l1=524288, l0a=65536, l0b=65536, l0c=131072)
     opnd = _cube_operands(TypedGraph(16, mm_vals, {"mm": mm_op}, public_outputs=("c",)), mm_op, 16, cube)
     assert opnd["l0a"] == 16 * 64 * 2 and opnd["l0b"] == 64 * 32 * 1
+
+
+def test_native_add_rmsnorm_ub_reserves_dual_fp32_working_tiles():
+    from mindie_sim.prediction.fusion.projection import project_graph
+    from mindie_sim.prediction.fusion.ub import AIV_FP32_UPCAST_KINDS, single_op_ub, ub_worksheet
+    from mindie_sim.prediction.operators.vector import family_ascend_norm
+    from mindie_sim.schema.operators import OpSpec
+
+    assert {"add_rms_norm", "rms_norm_quant", "add_rms_norm_quant"} <= AIV_FP32_UPCAST_KINDS
+
+    def _make_norm(dtype: str, family: str = "add_rmsnorm", width: int = 8192):
+        elem_b = 4 if dtype == "fp32" else 2
+        read_b = (2 * width + width) * elem_b if family == "add_rmsnorm" else (width + width) * elem_b
+        write_b = 2 * width * elem_b if family == "add_rmsnorm" else width + 256
+        meta = [("norm_has_weight", True), ("norm_eps", 1e-6), ("reduction_width", width)]
+        if family != "add_rmsnorm":
+            meta.extend([
+                ("output_format", "fp8_e4m3"), ("activation_group_size", 32),
+                ("activation_scale_format", "fp8_e8m0"),
+                ("activation_scale_shape", (1, 128, 2)), ("activation_scale_bytes", 256),
+            ])
+        raw = OpSpec(
+            op_id=f"{family}_{dtype}", family=family, phase="decode", stage=0, layer=0,
+            requests=("r0",), semantic_shape=(1, width), local_shape=(1, width),
+            padded_shape=(1, width), launch_shape=(1, width),
+            hbm_bytes=float(read_b + write_b), mte2_bytes=float(read_b),
+            mte3_bytes=float(write_b), vector_ops=float(6 * width if family == "add_rmsnorm"
+                                                        else 5 * width + 4 * width + 2 * 256),
+            dtype=dtype, layout="contiguous", recipe=family, metadata=tuple(meta),
+        )
+        return family_ascend_norm.lower_op(raw)[-1]
+
+    bf16_op = _make_norm("bf16")
+    fp16_op = _make_norm("fp16")
+    fp32_op = _make_norm("fp32")
+    rmsq_op = _make_norm("bf16", family="rmsnorm_quant")
+    assert dict(bf16_op.metadata)["native_norm_kind"] == "AddRmsNormBias"
+    assert dict(bf16_op.metadata)["native_norm_fp32_working_tiles"] == 2
+    assert dict(fp32_op.metadata)["native_norm_fp32_working_tiles"] == 1
+
+    for op, expected_instances in ((bf16_op, 2), (fp16_op, 2), (fp32_op, 1), (rmsq_op, 1)):
+        fg = project_graph(None, (op,))
+        allocs = single_op_ub(fg, op.op_id, tile_rows=1, capacity_per_owner=248 * 1024)
+        fp32_alloc = next(a for a in allocs if a.name == "fp32_working")
+        assert fp32_alloc.bytes_per_instance == 8192 * 4
+        assert fp32_alloc.instances == expected_instances
+        assert fp32_alloc.total_bytes == expected_instances * 8192 * 4
+        ws = ub_worksheet(fg, (op.op_id,), tile_rows=1, channel_width=8192, capacity_per_owner=248 * 1024)
+        ws_fp32 = next(a for a in ws.allocations if a.name == "fp32_working")
+        assert ws_fp32.total_bytes == expected_instances * 8192 * 4
+
+
+def test_simt_ub_carveout_propagates_through_projection_fusion_and_standalone_admission():
+    from mindie_sim.compose import compose_case
+    from mindie_sim.prediction.execution.engine_plan import (
+        HardwareProfile, baseline_plan, evaluate_plan,
+    )
+    from mindie_sim.prediction.fusion.feasibility import analyze_region
+    from mindie_sim.prediction.fusion.projection import project_graph
+    from mindie_sim.prediction.fusion.ub import single_op_ub
+    from mindie_sim.schema.operators import OpSpec
+    from _support.axes import REPRESENTATIVE_SKUS
+
+    case_a5 = parse_case(compose_case(
+        "qwen3-32b", hardware=REPRESENTATIVE_SKUS["a5"], tp=1, dp=1, layers=1,
+        prompt_tokens=16, output_tokens=2,
+    ))
+    hw_a5 = HardwareProfile.from_case(case_a5)
+    assert hw_a5.ub_bytes_per_aiv == 248 * 1024
+    assert hw_a5.simt_ub_carveout_bytes == 32 * 1024
+
+    def _simt_pair(width: int, *, simt_meta: tuple[tuple[str, object], ...]):
+        elem_b = 2
+        row_b = float(width * elem_b)
+        op0 = OpSpec(
+            op_id="e0", family="elementwise", phase="decode", stage=0, layer=0,
+            requests=("r0",), deps=(), semantic_shape=(1, width),
+            local_shape=(1, width), padded_shape=(1, width), launch_shape=(1, width),
+            hbm_bytes=row_b, mte2_bytes=0.0, mte3_bytes=row_b,
+            vector_ops=float(width), dtype="bf16", layout="contiguous",
+            recipe="elementwise", metadata=(),
+        )
+        op1 = OpSpec(
+            op_id="e1", family="elementwise", phase="decode", stage=0, layer=0,
+            requests=("r0",), deps=("e0",), semantic_shape=(1, width),
+            local_shape=(1, width), padded_shape=(1, width), launch_shape=(1, width),
+            hbm_bytes=2.0 * row_b, mte2_bytes=row_b, mte3_bytes=row_b,
+            vector_ops=float(width), dtype="bf16", layout="contiguous",
+            recipe="elementwise", metadata=simt_meta,
+        )
+        return op0, op1
+
+    # 30,720 BF16 elems -> 2*60 KiB in + 2*60 KiB out = 240 KiB tile on e1.
+    simt_ops = _simt_pair(30720, simt_meta=(("tile_uses_simt", True),))
+    fg_simt = project_graph(case_a5, simt_ops)
+    assert fg_simt.ops["e1"].param("uses_simt") is True
+    assert fg_simt.ops["e1"].param("tile_uses_simt") is True
+
+    reg = analyze_region(
+        fg_simt, ("e0", "e1"), tile_rows=1,
+        capacity_per_owner=hw_a5.ub_bytes_per_aiv, usable_ub_bytes=hw_a5.usable_ub,
+        simt_ub_carveout_bytes=hw_a5.simt_ub_carveout_bytes,
+    )
+    assert reg.worksheet.usable_bytes == 216 * 1024
+    assert reg.worksheet.fits is False
+
+    # Standalone 240 KiB SIMT tile exceeds 216 KiB usable (240 + 32 > 248 KiB).
+    allocs_240 = single_op_ub(
+        fg_simt, "e1", tile_rows=1, capacity_per_owner=hw_a5.ub_bytes_per_aiv,
+        usable_ub_bytes=hw_a5.usable_ub, simt_ub_carveout_bytes=hw_a5.simt_ub_carveout_bytes,
+    )
+    assert any(a.name == "simt_carveout" and a.total_bytes == 32 * 1024 for a in allocs_240)
+    ev_simt_240 = evaluate_plan(baseline_plan(fg_simt, hw_a5), hw_a5)
+    assert ev_simt_240.status == "failed" and "single_op_ub_capacity_exceeded" in ev_simt_240.reason
+
+    # Same 240 KiB tile without SIMT fits in full 248 KiB UB.
+    fg_plain = project_graph(case_a5, _simt_pair(30720, simt_meta=()))
+    ev_plain_240 = evaluate_plan(baseline_plan(fg_plain, hw_a5), hw_a5)
+    assert ev_plain_240.status == "completed"
+
+    # 216 KiB SIMT tile (27,648 BF16 elems -> 2*54 KiB in + 2*54 KiB out) fits 216 + 32 == 248 KiB.
+    fg_simt_216 = project_graph(case_a5, _simt_pair(27648, simt_meta=(("uses_simt", True),)))
+    ev_simt_216 = evaluate_plan(baseline_plan(fg_simt_216, hw_a5), hw_a5)
+    assert ev_simt_216.status == "completed"
+
+    # Hardware without declared SIMT carveout still enforces the 16 KiB floor when SIMT is active.
+    hw_floor = HardwareProfile.from_case(case_a5, ub_bytes_per_aiv=192 * 1024, usable_ub_bytes=192 * 1024, simt_ub_carveout_bytes=0)
+    fg_simt_180 = project_graph(case_a5, _simt_pair(23040, simt_meta=(("uses_simt", True),)))
+    ev_floor = evaluate_plan(baseline_plan(fg_simt_180, hw_floor), hw_floor)
+    assert ev_floor.status == "failed" and "single_op_ub_capacity_exceeded" in ev_floor.reason

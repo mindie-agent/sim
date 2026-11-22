@@ -322,7 +322,12 @@ class _TopologyPlansMixin:
         if algorithm == "direct_mesh":
             return self._joint_direct_mesh_plan(family, unique_groups, volume_by_rank, metadata)
         if algorithm == "oneshot":
-            return self._joint_oneshot_plan(family, unique_groups, volume_by_rank, metadata)
+            plan = self._joint_oneshot_plan(family, unique_groups, volume_by_rank, metadata)
+            for replica, vol in participants.items():
+                self.bind_oneshot_plan(op, replica, plan, volume=vol)
+            return plan
+        for replica in participants:
+            self.clear_oneshot_plan(op, replica)
         if algorithm == "ring":
             if "peer_traffic" in metadata:
                 raise ModelingError(
@@ -615,6 +620,13 @@ class _TopologyPlansMixin:
         mesh = self.bound_mesh_plan(op, replica)
         if mesh is not None:
             return self._work_with_capacity(mesh.accounting())
+        recipe_algo = getattr(recipe, "algorithm", None)
+        oneshot = self.bound_oneshot_plan(op, replica, volume=volume) if recipe_algo in (None, "oneshot") else None
+        if oneshot is None and recipe_algo == "oneshot":
+            oneshot = self.oneshot_plan(op, replica, volume=volume)
+        if oneshot is not None:
+            source_stage = int(dict(op.metadata).get("source_stage", op.stage))
+            return self._work_with_capacity(oneshot.accounting(source_ranks=self.ranks(replica, source_stage)))
         if transport is None and recipe is not None:
             from mindie_sim.prediction.operators.collectives.direct_peer import resolve_transport_options
             transport = resolve_transport_options(recipe, op)

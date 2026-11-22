@@ -30,9 +30,52 @@ FP32_BYTES_PER_ELEM = 4
 DEFAULT_SIMT_UB_CARVEOUT_BYTES = 16 * 1024
 _FP32_UPCAST_SOURCE_DTYPES = frozenset({"bf16", "fp16"})
 AIV_FP32_UPCAST_KINDS = frozenset({
-    "add", "rms_norm", "layer_norm", "l2_norm", "reduce", "softmax",
-    "silu", "swiglu", "situ", "gelu", "sigmoid", "quant", "dynamic_quant",
+    "add", "rms_norm", "add_rms_norm", "add_rmsnorm", "rms_norm_quant",
+    "rmsnorm_quant", "add_rms_norm_quant", "add_rmsnorm_quant", "layer_norm",
+    "l2_norm", "reduce", "softmax", "silu", "swiglu", "situ", "gelu",
+    "sigmoid", "quant", "dynamic_quant",
 })
+_ADD_NORM_DUAL_FP32_KINDS = frozenset({
+    "add_rms_norm", "add_rmsnorm", "add_rms_norm_quant", "add_rmsnorm_quant",
+})
+_NATIVE_DUAL_FP32_NORM_ABIS = frozenset({
+    "AddRmsNormBias", "AddRmsNorm", "AddRmsNormDynamicQuant",
+    "AddRmsNormDynamicMxQuant",
+})
+
+
+def _op_uses_simt(op) -> bool:
+    return bool(op.param("uses_simt") or op.param("tile_uses_simt"))
+
+
+def _fp32_working_tile_count(graph: TypedGraph, chosen: tuple[str, ...]) -> int:
+    """Simultaneously live FP32 working tiles required in UB by ``chosen``.
+
+    Native BF16/FP16 ``AddRmsNormBias`` holds both ``xFp32Buf`` and ``sqxBuf``
+    concurrently in UB (2 FP32 tiles).
+    """
+    tiles = 1
+    for op_id in chosen:
+        op = graph.ops[op_id]
+        declared = op.param("fp32_working_tiles")
+        if isinstance(declared, int) and not isinstance(declared, bool) and declared >= 1:
+            tiles = max(tiles, declared)
+            continue
+        is_add_norm = (
+            op.kind in _ADD_NORM_DUAL_FP32_KINDS
+            or op.family in {"add_rmsnorm", "add_rmsnorm_quant"}
+            or str(op.param("native_norm_kind") or "") in _NATIVE_DUAL_FP32_NORM_ABIS
+        )
+        if not is_add_norm:
+            continue
+        low_prec = op.dtype in _FP32_UPCAST_SOURCE_DTYPES or any(
+            graph.values[v].dtype in _FP32_UPCAST_SOURCE_DTYPES
+            for v in op.inputs
+            if graph.values[v].role not in PARAM_ROLES
+        )
+        if low_prec:
+            tiles = max(tiles, 2)
+    return tiles
 
 
 @dataclass(frozen=True)
@@ -220,8 +263,9 @@ def _ub_allocations(graph: TypedGraph, chosen: tuple[str, ...], rows: int,
                 (graph.values[v].shape[-1] for v in boundary
                  if graph.values[v].role not in {"weight", "parameter", "state"}),
                 default=channel_width))
+        fp32_tiles = _fp32_working_tile_count(graph, chosen)
         allocations.append(Allocation("fp32_working", _align(rows * width * FP32_BYTES_PER_ELEM),
-                                      1, "working_tile", units=units))
+                                      fp32_tiles, "working_tile", units=units))
     for op_id in chosen:
         for value_id in graph.ops[op_id].inputs:
             if graph.values[value_id].role in {"weight", "parameter", "scale"}:
@@ -283,7 +327,9 @@ def ub_worksheet(graph: TypedGraph, members: Iterable[str], *, tile_rows: int,
               else min(physical, int(usable_bytes)))
     if usable <= 0:
         raise FeasibilityError("ub_usable_capacity_invalid")
-    simt_active = bool(uses_simt) or any(bool(graph.ops[o].param("uses_simt")) for o in chosen)
+    if isinstance(simt_ub_carveout_bytes, bool) or int(simt_ub_carveout_bytes) < 0:
+        raise FeasibilityError("simt_ub_carveout_invalid")
+    simt_active = bool(uses_simt) or any(_op_uses_simt(graph.ops[o]) for o in chosen)
     if simt_active:
         carveout = max(int(simt_ub_carveout_bytes), DEFAULT_SIMT_UB_CARVEOUT_BYTES)
         usable = max(0, usable - carveout)
@@ -344,18 +390,23 @@ def single_op_ub(graph: TypedGraph, op_id: str, *, tile_rows: int,
                  capacity_per_owner: int, owner: int = 0,
                  allow_cube: bool = False,
                  cube_resources: CubeResources | None = None,
-                 usable_ub_bytes: int | None = None) -> tuple[Allocation, ...]:
+                 usable_ub_bytes: int | None = None,
+                 uses_simt: bool = False,
+                 simt_ub_carveout_bytes: int = 0) -> tuple[Allocation, ...]:
     """Per-owner reservation of one unfused operator, max over its tiles.
 
     The effective budget is the declared physical UB capacity capped by the
-    declared usable capacity.  An allocation that does not fit is *kept*: the
-    Engine/plan admission then rejects the infeasible plan explicitly.  It is
-    never silently dropped, which would erase real UB demand.
+    declared usable capacity (minus the SIMT UB carveout when SIMT is active).
+    An allocation that does not fit is *kept*: the Engine/plan admission then
+    rejects the infeasible plan explicitly.  It is never silently dropped,
+    which would erase real UB demand.
     """
     if not isinstance(capacity_per_owner, (int, float)) \
             or not math.isfinite(float(capacity_per_owner)) \
             or capacity_per_owner <= 0:
         raise FeasibilityError("single_op_ub_capacity_invalid")
+    if isinstance(simt_ub_carveout_bytes, bool) or int(simt_ub_carveout_bytes) < 0:
+        raise FeasibilityError("simt_ub_carveout_invalid")
     _effective = int(capacity_per_owner)
     if usable_ub_bytes is not None:
         if not isinstance(usable_ub_bytes, (int, float)) \
@@ -367,6 +418,12 @@ def single_op_ub(graph: TypedGraph, op_id: str, *, tile_rows: int,
         # against this same bound and rejects an oversized single operator.
         _effective = min(_effective, int(usable_ub_bytes))
     op = graph.ops[op_id]
+    simt_active = bool(uses_simt) or _op_uses_simt(op)
+    carveout = (
+        max(int(simt_ub_carveout_bytes), DEFAULT_SIMT_UB_CARVEOUT_BYTES)
+        if simt_active else 0
+    )
+    _effective = max(0, _effective - carveout)
     width = max((graph.values[v].shape[-1] for v in (*op.inputs, *op.outputs)
                  if graph.values[v].role not in {"weight", "parameter"}), default=1)
     tile = max(1, min(tile_rows, graph.rows))
@@ -385,4 +442,7 @@ def single_op_ub(graph: TypedGraph, op_id: str, *, tile_rows: int,
         total = sum(allocation.total_bytes for allocation in allocations)
         if total > best_total:
             best, best_total = tuple(allocations), total
+    if simt_active and carveout > 0:
+        best = (*best, Allocation("simt_carveout", carveout, 1, "simt_reserve",
+                                  pool="ub", units=(owner,)))
     return best
