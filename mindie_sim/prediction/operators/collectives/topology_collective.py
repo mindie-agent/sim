@@ -66,6 +66,8 @@ class TopologyCollectiveRecipe:
         return build_plan(self, op, geometry)
 
     def lower(self, context):
+        from mindie_sim.prediction.collectives.band_plan import BandCollectivePlan
+
         binding = context.collective_plan
         if getattr(binding, "algorithm", None) == MESH_ALGORITHM:
             return _lower_mesh(context, binding())
@@ -83,14 +85,19 @@ class TopologyCollectiveRecipe:
                       after=("reduce_scatter",)),
                 _unpack_phase(write_share, after=("all_gather",)),
             )
-            return _with_setup(context, phases)
-        phases = (
-            _pack_phase(read_share),
-            Phase("peer_exchange", {"link": 1.0},
-                  after=("pack",)),
-            _unpack_phase(write_share, after=("peer_exchange",)),
-        )
-        return _with_setup(context, phases)
+            base = _with_setup(context, phases)
+        else:
+            phases = (
+                _pack_phase(read_share),
+                Phase("peer_exchange", {"link": 1.0},
+                      after=("pack",)),
+                _unpack_phase(write_share, after=("peer_exchange",)),
+            )
+            base = _with_setup(context, phases)
+        bound_plan = getattr(binding, "plan", None)
+        if isinstance(bound_plan, BandCollectivePlan):
+            return bound_plan.lower_with_local_work(context, base)
+        return base
 
 
 def _lower_mesh(context, plan):

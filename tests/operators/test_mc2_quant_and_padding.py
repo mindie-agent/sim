@@ -51,45 +51,33 @@ SOURCE = {"kind": "vllm_ascend_mc2_tp", "global_bs": 0}
 SELECTOR = dict(kind="separate_quantized_payload", payload_dtype="int8", scale_dtype="fp32",
                 scale_granularity="row", histogram_dtype="int64")
 
-def align(amount, block):
-    return ceil(amount / block) * block
+def align(amount, block): return ceil(amount / block) * block
 
 def row_plan(abi, width, rows, transport, **fields):
     hw = machine(MESH_SKU, num_devices=2)
-    op = OpSpec("rows", "mc2", "decode", 0, 0, (), (), (), (), (), dtype="bf16",
-                metadata=(("mc2", dict(abi=abi, width=width, world_size=2, transport_abi=transport,
-                                      assignment_matrix=((0, rows), (0, 0)), **fields)),))
+    op = OpSpec("rows", "mc2", "decode", 0, 0, (), (), (), (), (), dtype="bf16", metadata=(("mc2", dict(abi=abi, width=width, world_size=2, transport_abi=transport, assignment_matrix=((0, rows), (0, 0)), **fields)),))
     return mc2.build(op, Geometry.from_devices((hw.dies[0],)))
-
 
 @pytest.mark.parametrize("abi", ("dispatch_v2", "combine_v2"))
 def test_direct_rows_and_full_mesh_frames_use_their_own_wire_layout(abi):
-    width, rows = 4096, 2
-    direct = row_plan(abi, width, rows, "a5_ccu")
-    framed = row_plan(abi, width, rows, "a5_mte")
-    row = width * 2
-    dispatch = abi == "dispatch_v2"
+    width, rows, dispatch = 4096, 2, abi == "dispatch_v2"
+    direct, framed, row = row_plan(abi, width, rows, "a5_ccu"), row_plan(abi, width, rows, "a5_mte"), width * 2
     framed_row = ceil((row + (ROW_ALIGN if dispatch else 0)) / DATA) * FRAME
-    for plan, payload, status in ((direct, row * rows, FRAME if dispatch else 0),
-                                  (framed, framed_row * rows, FLAG if dispatch else 0)):
+    for plan, payload, status in ((direct, row * rows, FRAME if dispatch else 0), (framed, framed_row * rows, FLAG if dispatch else 0)):
         phases = {p.phase_id: {w.resource: w.amount for w in p.work} for p in plan.pipeline_spec.phases}
-        assert plan.metadata["peer_payload_bytes"] == phases["cohort0_send_1"]["link"] == payload
-        assert phases.get("cohort0_status_1", {}).get("link", 0) == status
         incoming_count = status if plan is direct else 0
-        assert phases.get("cohort0_recv_link_1", {}).get("link", 0) == incoming_count
+        assert plan.metadata["peer_payload_bytes"] == phases["cohort0_send_1"]["link"] == payload
+        assert phases.get("cohort0_status_1", {}).get("link", 0) == status and phases.get("cohort0_recv_link_1", {}).get("link", 0) == incoming_count
         assert plan.work.resources["link"] == payload + status + incoming_count
-
 
 @pytest.mark.parametrize("mode,payload_dtype", (("none", "fp8_e4m3"), ("per_token", "int8"), ("mx", "fp8_e4m3")))
 @pytest.mark.parametrize("width", (256, 513, 5120))
 def test_quantized_direct_stride_aligns_payload_and_scales_per_assignment(mode, payload_dtype, width):
-    incoming = payload_dtype if mode == "none" else "bf16"
-    given_scales = 64 if mode == "none" else 0
+    incoming, given_scales = (payload_dtype if mode == "none" else "bf16"), (64 if mode == "none" else 0)
     scales = {"none": given_scales, "per_token": FP32, "mx": align(ceil(width / ROW_ALIGN), 2)}[mode]
     args = dict(input_dtype=incoming, payload_dtype=payload_dtype, quant_mode=mode, input_scale_bytes=given_scales)
     alignment = MX_ALIGN if mode == "mx" else ROW_ALIGN
-    plan = row_plan("dispatch_v2", width, 3, "a5_ccu", **args)
-    assert plan.work.resources["link"] == 3 * align(align(width, alignment) + scales, FRAME) + 2 * FRAME
+    assert row_plan("dispatch_v2", width, 3, "a5_ccu", **args).work.resources["link"] == 3 * align(align(width, alignment) + scales, FRAME) + 2 * FRAME
     if mode != "none":
         with pytest.raises(ModelingError, match="requires_unscaled_float_row"):
             row_plan("dispatch_v2", width, 3, "a5_ccu", **{**args, "input_scale_bytes": scales})
@@ -532,14 +520,12 @@ def test_separate_transport_requires_explicit_compatible_representation(change, 
 
 def test_directed_quantized_matrix_is_reencoded_on_return_and_binding_is_idempotent():
     raw = parse_case(transport_case(3))
-    declared = graphs(raw, (0, 1, 1))
-    forward = ((0, 0, 0), (32, 0, 64), (64, 96, 0))
-    rewritten = {}
+    declared, forward, rewritten = graphs(raw, (0, 1, 1)), ((0, 0, 0), (32, 0, 64), (64, 96, 0)), {}
     for rank, group in declared.items():
         ops = index(group)
         send, back = ops["moe_payload_dispatch"], ops["expert_combine"]
         sd = dict(send.metadata, peer_traffic={"kind": "matrix", "payload_bytes": forward})
-        bd = {key: value for key, value in back.metadata if key != "peer_traffic"}
+        bd = {k: v for k, v in back.metadata if k != "peer_traffic"}
         rewritten[rank] = (replace(send, link_bytes=sum(forward[rank]), metadata=tuple(sd.items())),
                            replace(back, metadata=tuple(bd.items())))
     bound = bind_cohort_traffic(raw, rewritten)
@@ -548,21 +534,17 @@ def test_directed_quantized_matrix_is_reencoded_on_return_and_binding_is_idempot
         assert dict(send.metadata)["peer_traffic"]["payload_bytes"][rank] == forward[rank]
         row = tuple(2 * forward[peer][rank] for peer in range(3))
         reverse = PeerTraffic.from_mapping(dict(back.metadata)["peer_traffic"], len(forward))
-        assert tuple(reverse.payload(rank, peer) for peer in range(len(forward))) == row
-        assert back.link_bytes == sum(row)
+        assert tuple(reverse.payload(rank, peer) for peer in range(len(forward))) == row and back.link_bytes == sum(row)
 
 def test_quantized_transport_scope_preserves_draft_expert_traffic():
-    fixture = ROOT / "tests/fixtures/verification/v4flash-communication-case.json"
-    raw = json.loads(fixture.read_text())
+    raw = json.loads((ROOT / "tests/fixtures/verification/v4flash-communication-case.json").read_text())
     view = IterationPlan((RequestView("one", 4, 0, True, "prefill", draft_prepare=True),))
     for scopes in ((), ("body",)):
-        selector = dict(SELECTOR, layer_scopes=scopes) if scopes else dict(SELECTOR)
-        raw["runtime"]["kernels"]["moe_transport"] = selector
+        raw["runtime"]["kernels"]["moe_transport"] = dict(SELECTOR, layer_scopes=scopes) if scopes else dict(SELECTOR)
         parsed = parse_case(raw)
         ops = Frontend()(view, parsed.model, parsed.runtime, parsed.machine).ops
         quantized = [o for o in ops if o.recipe == "expert_quantized_dispatch"]
-        assert len(quantized) == (43 if scopes else 44)
-        assert all(dict(o.metadata)["payload_dtype"] == "int8" for o in quantized)
+        assert len(quantized) == (43 if scopes else 44) and all(dict(o.metadata)["payload_dtype"] == "int8" for o in quantized)
         if scopes:
             draft = [o for o in ops if o.recipe == "expert_dispatch" and o.phase == "draft_prefill"]
             assert len(draft) == 1 and draft[0].link_bytes == 4 * 6 * 4096 * 2 / 8 * 7 / 8
@@ -573,11 +555,8 @@ def test_tensor_padding_masks_empty_tail_ranks_from_source_realization():
     ops = index(graphs(raw, 12)[0])
     ledger = dict(ops["expert_up"].metadata)["routing_realization"]
     assert (ledger["valid_global_tokens"], ledger["allocated_global_tokens"]) == (12, 16)
-    assert ledger["valid_tokens_per_rank"] == (1,) * 12 + (0,) * 4
-    assert sum(ledger["global_expert_rows"]) == 12 * 8
-    assert ops["router"].local_shape == (12, 256, HIDDEN)
-    assert ops["mc2_tp_gather"].local_shape == (16, HIDDEN)
-    assert ops["mc2_output_trim"].local_shape == (12, HIDDEN)
+    assert ledger["valid_tokens_per_rank"] == (1,) * 12 + (0,) * 4 and sum(ledger["global_expert_rows"]) == 12 * 8
+    assert ops["router"].local_shape == (12, 256, HIDDEN) and ops["mc2_tp_gather"].local_shape == (16, HIDDEN) and ops["mc2_output_trim"].local_shape == (12, HIDDEN)
 
 def test_native_protocol_delegates_selection_recipes_and_lowering():
     from types import SimpleNamespace
@@ -598,3 +577,24 @@ def test_native_protocol_delegates_selection_recipes_and_lowering():
         assert {o.recipe for o in low if o.source_boundary == "kernel"} == {native_r} and reg[native_r].prepare(low[0], Geometry(1, {"vector": 2}))[1].native is (kind == "arch35_fullmesh")
     with pytest.raises(ModelingError, match="native_moe_protocol_requires_supported_caller"):
         mc2_graph.select({"native_moe_protocol": {"kind": "unknown"}})
+
+def test_collective_hierarchy_and_directional_dma_lowering():
+    from mindie_sim import compose_case
+    from mindie_sim.prediction.collectives.protocol import lower_collective, submit_lowered_collective
+    from mindie_sim.prediction.collectives.topology import Topology
+    from mindie_sim.primitives.loader import load_primitives
+    from mindie_sim.primitives.lowering import lower_primitive
+    cs = parse_case(compose_case("qwen3.8-27b", hardware=REPRESENTATIVE_SKUS["a3"], tp=4, ep=1, num_devices=4, layers=1, quant="none"))
+    topo = Topology(cs.machine, cs.runtime.parallel)
+    low_ar = lower_collective("allreduce", (0, 1, 2, 3), topo, 64 * 1024 * 1024)
+    assert low_ar.band.algorithm == "hierarchical_2d" and all(p.pipelined_slices for p in low_ar.phases) and low_ar.total_payload_bytes == pytest.approx(4 * 1.5 * 64 * 1024 * 1024)
+    eng = Engine(topo.resources())
+    done = submit_lowered_collective(eng, "h2d_ar", low_ar, {r: eng.submit(f"r{r}") for r in (0, 1, 2, 3)})
+    eng.advance()
+    assert done[0].time > 0.0 and eng.summary()["live_tasks"] == 0 and lower_collective("alltoall", (0, 1, 2, 3), topo, 4 * 1024 * 1024).band.algorithm == "direct_mesh"
+    pt = load_primitives(ROOT / "data/primitives/arch22_a2_910b4.json")
+    r_h2d = lower_primitive("P20_host_dma_sync", {"direction": "h2d", "payload_bytes": 4096}, pt, allow_uncalibrated_declaration=True)
+    r_d2h = lower_primitive("P20_host_dma_sync", {"direction": "d2h", "payload_bytes": 4096}, pt, allow_uncalibrated_declaration=True)
+    assert dict(r_h2d.metadata)["startup_metric"] == "pinned_h2d_startup_ns" and dict(r_d2h.metadata)["startup_metric"] == "pinned_d2h_startup_ns"
+    with pytest.raises(ModelingError, match="primitive_dma_direction_invalid"):
+        lower_primitive("P20_host_dma_sync", {"direction": "sideways", "payload_bytes": 4096}, pt, allow_uncalibrated_declaration=True)

@@ -19,11 +19,11 @@ from mindie_sim.prediction.operators.mc2 import mc2_local_caller
 from ...mechanism import OperatorPlan, Work
 from ..contracts import ArchStrategy, OperatorPlanningContext
 from .common import (
-    Mc2Contract, PeerRoute, Phase, Transport, build_transport_stages, capability_gap,
+    COLLECTIVES, COMBINE, Mc2Contract, PeerRoute, Phase, Transport, build_transport_stages, capability_gap,
     contract_fields, make_plan, native_protocol_peer_transport, topology_hops,
     validate_contract, validate_native_dispatch_quant,
 )
-from .lowering import SIO_HCCS, declared_incoming_routes
+from .lowering import A2_MTE, SIO_HCCS, declared_incoming_routes
 
 _OPS_REVISION = "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946"
 _SKILLS_REVISION = "750045df251d031bf708de9dc1614c2202eed6dd"
@@ -40,6 +40,12 @@ SOURCES: tuple[SourceRef, ...] = (
         revision=_OPS_REVISION,
         relative_path="mc2/matmul_reduce_scatter_v2/op_host/op_tiling/arch22/matmul_reduce_scatter_v2_a2a3.cpp",
         source_sha256="c5eb062a27b5f1460c90f68f2b95df21fad805b2bf2d1416c15557d7068bce0d",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision=_OPS_REVISION,
+        relative_path="mc2/matmul_all_reduce/op_kernel/arch22/matmul_all_reduce_base.h",
+        source_sha256="e12221d971267ec5302d7fa6db853df366f92daaa715dc5956981e5af7de0a6b",
     ),
     SourceRef(
         repository="cann/ops-transformer",
@@ -93,7 +99,7 @@ SOURCES: tuple[SourceRef, ...] = (
 
 
 HCCL_CLIENT = "a2_hccl_client"
-ARCH_TRANSPORTS = frozenset({HCCL_CLIENT, SIO_HCCS})
+ARCH_TRANSPORTS = frozenset({HCCL_CLIENT, SIO_HCCS, A2_MTE})
 SERVER_MODES = frozenset({"server", "aicpu", "aiv", "hccl_server_type_aicpu", "hccl_server_type_aiv"})
 
 
@@ -178,19 +184,29 @@ def _transport(contract: Mc2Contract, op: OpSpec, ctx: OperatorPlanningContext) 
                 raise capability_gap(op, ctx, "hccl_algorithm_requires_binding_and_group_hops")
         routes = tuple(PeerRoute(contract.rank, peer, hops.get((contract.rank, peer), ("HCCL_FULLMESH",)))
                        for peer in peers)
+    elif abi == A2_MTE:
+        if contract.abi in COLLECTIVES:
+            raise capability_gap(op, ctx, "mte_window_requires_moe_dispatch_or_combine")
+        routes = tuple(PeerRoute(contract.rank, peer, hops.get((contract.rank, peer), ("HCCS_MTE_WINDOW",)))
+                       for peer in peers)
     else:
         if algorithm in {"ring", "two_tier"} and any((contract.rank, peer) not in hops for peer in peers):
             raise capability_gap(op, ctx, "a3_algorithm_requires_group_hops")
         routes = _sio_hccs_hops(contract, fields, group, hops, op, ctx)
-    if contract.internal_chunks == 2 and not (
+    if contract.internal_chunks >= 2 and not (
         (contract.independent_buffers or binding.get("independent_buffers") is True)
         and (contract.independent_handles or binding.get("independent_handles") is True)
     ):
         raise capability_gap(op, ctx, "two_chunks_require_independent_buffers_and_handles")
     credits = 1 if algorithm == "ring" else max(1, len(peers))
-    return Transport(abi, algorithm, routes, credits=credits,
-                     slot_depth=contract.internal_chunks, peer_limit=len(peers),
-                     incoming_routes=declared_incoming_routes(contract.rank, peers, hops))
+    return Transport(
+        abi, algorithm, routes, credits=credits,
+        slot_depth=min(contract.internal_chunks, 2), peer_limit=len(peers),
+        aiv_staging=True,
+        direct_remote_gm=abi == A2_MTE and contract.abi == COMBINE,
+        gm_bounce_hbm=contract.abi in COLLECTIVES,
+        incoming_routes=declared_incoming_routes(contract.rank, peers, hops),
+    )
 
 
 @dataclass(frozen=True, slots=True)

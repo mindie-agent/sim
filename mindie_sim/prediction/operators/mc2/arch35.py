@@ -24,11 +24,11 @@ from ..contracts import ArchStrategy, OperatorPlanningContext
 from mindie_sim.prediction.operators.mc2.mc2_fullmesh import SOURCE, combine_layout, dispatch_layout
 from mindie_sim.prediction.operators.mc2.mc2_mx_quant import mx32_work
 from .common import (
-    COLLECTIVES, COMBINE, FLOAT_ROWS, MMRS, Mc2Contract, PeerRoute, Transport, build_transport_stages, capability_gap,
+    COLLECTIVES, COMBINE, FLOAT_ROWS, MMAR, MMRS, Mc2Contract, PeerRoute, Transport, build_transport_stages, capability_gap,
     contract_fields, make_plan, native_protocol_peer_transport, topology_hops,
     validate_contract, validate_native_dispatch_quant,
 )
-from .lowering import CCU, SHMEM, declared_incoming_routes
+from .lowering import A5_ROCE, CCU, SHMEM, declared_incoming_routes
 
 _OPS_REVISION = "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946"
 _SKILLS_REVISION = "750045df251d031bf708de9dc1614c2202eed6dd"
@@ -45,6 +45,12 @@ SOURCES: tuple[SourceRef, ...] = (
         revision=_OPS_REVISION,
         relative_path="mc2/matmul_reduce_scatter_v2/op_kernel/arch35/matmul_reduce_scatter_fp16_bf16.h",
         source_sha256="121ad9870776e27c1986e612b047817267e0de8976236df7eac748ef1643eff3",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision=_OPS_REVISION,
+        relative_path="mc2/matmul_all_reduce/op_kernel/arch35/matmul_all_reduce_based_all_reduce.h",
+        source_sha256="2af6e2f75f0fdf99778730665c5ad0d217b8f9910358fa324c25171500879c6e",
     ),
     SourceRef(
         repository="cann/ops-transformer",
@@ -94,7 +100,7 @@ SOURCES: tuple[SourceRef, ...] = (
 MTE_WINDOW = "a5_mte"
 URMA_ALIGN_BYTES = 512
 MESH_RANK_LIMIT = 8
-ARCH_TRANSPORTS = frozenset({SHMEM, MTE_WINDOW, CCU})
+ARCH_TRANSPORTS = frozenset({SHMEM, MTE_WINDOW, CCU, A5_ROCE})
 
 NATIVE_PROTOCOL_KIND = "arch35_fullmesh"
 NETWORK = "arch35_fullmesh_peer_channel"
@@ -156,18 +162,18 @@ def _transport(contract: Mc2Contract, op: OpSpec, ctx: OperatorPlanningContext) 
     if algorithm in {"ring", "two_tier"} and any((rank, peer) not in hops for peer in peers):
         raise capability_gap(op, ctx, "algorithm_requires_group_hops")
     native_chunking = abi == CCU and contract.abi in COLLECTIVES
-    if contract.internal_chunks == 2 and not all(
+    if contract.internal_chunks >= 2 and not all(
         binding.get(key, fields.get(key, native_chunking)) is True
         for key in ("independent_buffers", "independent_handles")
     ):
         raise capability_gap(op, ctx, "two_chunks_require_independent_buffers_and_handles")
 
-    route_kind = "UB_WINDOW" if abi == MTE_WINDOW else "URMA"
+    route_kind = "ROCE" if abi == A5_ROCE else ("UB_WINDOW" if abi == MTE_WINDOW else "URMA")
     routes = tuple(PeerRoute(rank, peer, hops.get((rank, peer), (route_kind,))) for peer in peers)
     credits = binding.get("peer_credits", fields.get("peer_credits", max(1, len(peers))))
     if type(credits) is not int or credits < 1:
         raise capability_gap(op, ctx, "invalid_peer_credit_limit")
-    depth = contract.internal_chunks if contract.abi in COLLECTIVES else (2 if (
+    depth = min(contract.internal_chunks, 2) if contract.abi in COLLECTIVES else (2 if (
         contract.independent_buffers and contract.independent_handles
     ) else 1)
     return Transport(
@@ -177,6 +183,7 @@ def _transport(contract: Mc2Contract, op: OpSpec, ctx: OperatorPlanningContext) 
         slot_depth=depth, peer_limit=len(peers),
         ccu=abi == CCU, aiv_staging=abi == MTE_WINDOW,
         direct_remote_gm=abi == MTE_WINDOW and contract.abi == COMBINE,
+        gm_bounce_hbm=False,
         incoming_routes=declared_incoming_routes(rank, peers, hops),
     )
 
@@ -201,9 +208,9 @@ class _Strategy:
             raise capability_gap(op, ctx, "unsupported_compute_architecture")
         contract = validate_contract(op, ctx)
         transport = _transport(contract, op, ctx)
-        scatter = contract.abi == MMRS and contract.world_size > 1
+        scatter = contract.abi in {MMRS, MMAR} and contract.world_size > 1
         temp_gm = scatter and contract.dtype in FLOAT_ROWS
-        ub_output = scatter and not temp_gm and ctx.datapath.has_l0c_to_ub
+        ub_output = contract.abi == MMRS and scatter and not temp_gm and ctx.datapath.has_l0c_to_ub
         phases = build_transport_stages(contract, transport, ub_output=ub_output, temp_gm=temp_gm)
         return make_plan(contract, transport, phases, self.sources, arch_id=self.arch_id)
 

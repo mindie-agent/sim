@@ -594,9 +594,26 @@ class _TopologyPlansMixin:
         if raw_axis == "pp":
             return None
 
-        family, unique_groups, volume_by_rank, metadata = self._joint_groups(
-            op, participants
-        )
+        try:
+            family, unique_groups, volume_by_rank, metadata = self._joint_groups(
+                op, participants
+            )
+        except ModelingError as exc:
+            if (not str(exc).startswith("joint_collective_group_membership")
+                    or len(participants) != 1 or transport is None
+                    or "peer_traffic" in raw_meta):
+                raise
+            replica = next(iter(participants))
+            vol = float(participants[replica])
+            source_stage = int(raw_meta.get("source_stage", op.stage))
+            axis = raw_meta.get("group_axis", "tp")
+            groups = tuple(self.groups(axis, replica, source_stage, metadata=raw_meta))
+            if not groups or all(len(ranks) <= 1 for ranks in groups):
+                return None
+            family = raw_family
+            unique_groups = tuple(dict.fromkeys(groups))
+            volume_by_rank = {rank: vol for ranks in unique_groups for rank in ranks}
+            metadata = raw_meta
         norm_family = aliases.get(str(family).strip().lower(), str(family).strip().lower())
         if norm_family not in SUPPORTED_COLLECTIVES:
             return None
@@ -612,12 +629,13 @@ class _TopologyPlansMixin:
             if "peer_traffic" in metadata:
                 return None
             phases = {"allreduce": 2, "reduce_scatter": 1, "allgather": 1}
-            if norm_family not in phases:
+            if norm_family in phases:
+                for ranks in unique_groups:
+                    rounds = max(phases[norm_family] * (len(ranks) - 1), 0)
+                    if metadata.get("steps", rounds) != rounds:
+                        return None
+            elif norm_family != "alltoall":
                 return None
-            for ranks in unique_groups:
-                rounds = max(phases[norm_family] * (len(ranks) - 1), 0)
-                if metadata.get("steps", rounds) != rounds:
-                    return None
         peer = None
         if "peer_traffic" in metadata:
             if norm_family not in {"alltoall", "alltoallv"}:

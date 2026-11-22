@@ -115,10 +115,15 @@ def register_family() -> OperatorFamilySpec:
     """Declare the MC2 families and owned recipe IDs."""
     return OperatorFamilySpec(
         name="mc2",
-        families=frozenset({"mc2", "all_gather_matmul", "matmul_reduce_scatter", "moe_dispatch_v2", "moe_combine_v2"}),
+        families=frozenset({
+            "mc2", "all_gather_matmul", "matmul_reduce_scatter", "matmul_all_reduce",
+            "moe_dispatch_v2", "moe_combine_v2",
+        }),
         owned_recipe_ids=frozenset({
-            "mc2_all_gather_matmul", "mc2_matmul_reduce_scatter", "mc2_dispatch_v2", "mc2_combine_v2",
-            "all_gather_matmul_v2_arch35", "matmul_reduce_scatter_v2_arch35", "arch22_v2_caller_local",
+            "mc2_all_gather_matmul", "mc2_matmul_reduce_scatter", "mc2_matmul_all_reduce",
+            "mc2_dispatch_v2", "mc2_combine_v2",
+            "all_gather_matmul_v2_arch35", "matmul_reduce_scatter_v2_arch35",
+            "matmul_all_reduce_arch35", "arch22_v2_caller_local",
         }),
         resolve=resolve_operator_plan,
     )

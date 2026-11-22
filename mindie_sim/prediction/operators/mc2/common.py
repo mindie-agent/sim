@@ -28,7 +28,7 @@ from ...results import FusedPipelineDescriptor, FusedPipelineSpec, PipelinePhase
 from ...runtime.ring_buffer import RingBuffer, lower_generation
 from ..contracts import OperatorPlanningContext
 from .lowering import (
-    CCU, DISPATCH, FP32_SCALE_BYTES, TRIPLE_META_BYTES, Mc2Program, PeerRoute, Phase,
+    A2_MTE, A5_ROCE, CCU, DISPATCH, FP32_SCALE_BYTES, TRIPLE_META_BYTES, Mc2Program, PeerRoute, Phase,
     Transport, cohort_stages, peer_stages, read_work, store_work,
 )
 
@@ -42,16 +42,21 @@ MX_GROUP_SIZE = 32
 MX_ALIGN_BYTES = 256
 GROUP_QUANT_SIZE = 128
 GEMM_DIMENSIONS = 3
+MAX_MC2_INTERNAL_CHUNKS = 1024
+ALLREDUCE_PHASE_MULTIPLIER = 2
+DOUBLE_BUFFER_RING_DEPTH = 2
 FLOAT_ROWS = frozenset({"bf16", "fp16"})
 FP8_ROWS = frozenset({"fp8_e4m3", "fp8_e5m2"})
 FP4_ROWS = frozenset({"fp4_e2m1", "fp4"})
 AGMM = "all_gather_matmul"
 MMRS = "matmul_reduce_scatter"
+MMAR = "matmul_all_reduce"
 COMBINE = "combine_v2"
-COLLECTIVES = frozenset({AGMM, MMRS})
+COLLECTIVES = frozenset({AGMM, MMRS, MMAR})
 NATIVE_ABIS = {
     AGMM: "aclnnAllGatherMatmulV2",
     MMRS: "aclnnMatmulReduceScatterV2",
+    MMAR: "aclnnMatmulAllReduce",
     DISPATCH: "aclnnMoeDistributeDispatchV2",
     COMBINE: "aclnnMoeDistributeCombineV2",
 }
@@ -62,9 +67,12 @@ ABI_ALIASES = {
     "moe_combine_v2": COMBINE,
     "all_gather_matmul_v2_arch35": AGMM,
     "matmul_reduce_scatter_v2_arch35": MMRS,
+    "matmul_all_reduce_arch35": MMAR,
     **{f"mc2_{abi}": abi for abi in NATIVE_ABIS},
 }
-TRANSPORTS = frozenset({"auto", "a2_hccl_client", "a3_sio_hccs", "a5_shmem", "a5_mte", "a5_ccu"})
+TRANSPORTS = frozenset({
+    "auto", "a2_hccl_client", A2_MTE, "a3_sio_hccs", "a5_shmem", "a5_mte", "a5_ccu", A5_ROCE,
+})
 ALGORITHMS = frozenset({"fullmesh", "ring", "two_tier", "direct_peer"})
 
 
@@ -239,7 +247,8 @@ class Mc2Contract:
         if self.abi in COLLECTIVES:
             if self.world_size == 1:
                 return 0
-            return (self.world_size - 1) * self.shard_bytes(self.m)
+            mult = ALLREDUCE_PHASE_MULTIPLIER if self.abi == MMAR else 1
+            return mult * (self.world_size - 1) * self.shard_bytes(self.m)
         if self.row_layout is None:
             return 0
         framed, _, _, _ = _peer_framing(self, self.transport_abi)
@@ -261,6 +270,9 @@ class Mc2Contract:
 def _peer_framing(contract: Mc2Contract, transport_abi: str) -> tuple[int, int, int, int]:
     """Return row, count, per-row padding and per-row flag bytes for this ABI."""
     layout = contract.row_layout
+    if transport_abi == A5_ROCE:
+        row_bytes = layout.payload_bytes if contract.abi == COMBINE else layout.materialized_bytes
+        return row_bytes, contract.status_bytes, 0, 0
     if transport_abi != CCU:
         return layout.packet_bytes, contract.status_bytes, layout.protocol_padding_bytes, layout.flag_bytes
     if contract.abi == COMBINE:
@@ -542,7 +554,7 @@ def validate_contract(op: OpSpec, ctx: OperatorPlanningContext) -> Mc2Contract:
     chunks = _integer(fields.get("internal_chunks", 1), "internal_chunks", 1)
     buffers = fields.get("independent_buffers", False)
     handles = fields.get("independent_handles", False)
-    if chunks not in {1, 2} or type(buffers) is not bool or type(handles) is not bool:
+    if chunks > MAX_MC2_INTERNAL_CHUNKS or type(buffers) is not bool or type(handles) is not bool:
         raise ModelingError("mc2_invalid_chunk_binding")
     dtype = fields.get("compute_dtype", op.dtype or "bf16")
     out_dtype = fields.get("output_dtype", op.dtype or "bf16")
@@ -657,20 +669,22 @@ def _matrix_fragment(contract: Mc2Contract, name: str, after: tuple[str, ...], r
 def _chunked_stages(contract: Mc2Contract, transport: Transport, *,
                     ub_output: bool = False, temp_gm: bool = False) -> tuple[Phase, ...]:
     gathering = contract.abi == AGMM
+    all_reducing = contract.abi == MMAR
     chunks = contract.internal_chunks
-    ring = RingBuffer(allocation="mc2_chunks", depth=transport.slot_depth)
+    ring = RingBuffer(allocation="mc2_chunks", depth=min(transport.slot_depth, DOUBLE_BUFFER_RING_DEPTH))
     fragments: dict[str, Phase] = {}
     aliases: dict[str, str] = {}
     phases: list[Phase] = []
     world = contract.world_size
     routes = transport.routes
     local_rows = contract.m // world
-    head_rows = ((local_rows + chunks - 1) // chunks) * world
+    base_local, rem_local = divmod(local_rows, chunks)
+    comm_prefix = "ag_" if gathering else ("ar_" if all_reducing else "rs_")
     for index in range(chunks):
-        rows = contract.m if chunks == 1 else (head_rows if index == 0 else contract.m - head_rows)
+        rows = contract.m if chunks == 1 else (base_local + (1 if index < rem_local else 0)) * world
         suffix = f"chunk{index}"
         tag = (("chunk", index), ("slot", ring.slot(index)), ("cross_core", transport.ccu))
-        comm = ("ag_" if gathering else "rs_") + suffix
+        comm = comm_prefix + suffix
         gemm = f"gemm_{suffix}"
         producer, consumer = (comm, gemm) if gathering else (gemm, comm)
         events = lower_generation(ring, index, producer, (consumer,))
@@ -679,7 +693,7 @@ def _chunked_stages(contract: Mc2Contract, transport: Transport, *,
         aliases.update({events.write: producer, events.read_done[0]: consumer, events.last_use: release})
         fragments[events.last_use] = Phase(release, (consumer,), metadata=tag)
         comm_gate = events.credit if gathering else events.publish
-        previous = (f"{'ag' if gathering else 'rs'}_chunk{index - 1}",) if index else ()
+        previous = (f"{comm_prefix}chunk{index - 1}",) if index else ()
         comm_deps = (comm_gate, *previous)
         payload = contract.shard_bytes(rows)
         wire_window = len(routes) * transport.peer_bytes(payload)
@@ -691,10 +705,23 @@ def _chunked_stages(contract: Mc2Contract, transport: Transport, *,
             comm_deps = (read,)
         names = []
         for route in routes:
-            name = f"{comm}_peer_{route.destination}"
+            name = f"{comm}_rs_peer_{route.destination}" if all_reducing else f"{comm}_peer_{route.destination}"
             credit = (names[-transport.credits],) if len(names) >= transport.credits else ()
-            phases.extend(peer_stages(name, (*comm_deps, *credit), route, transport, payload, tag))
+            phases.extend(peer_stages(
+                name, (*comm_deps, *credit), route, transport, payload, tag, couple_gm_bounce=True,
+            ))
             names.append(name)
+        if all_reducing and routes:
+            ag_names = []
+            ag_deps = tuple(names)
+            for route in routes:
+                ag_name = f"{comm}_ag_peer_{route.destination}"
+                credit = (ag_names[-transport.credits],) if len(ag_names) >= transport.credits else ()
+                phases.extend(peer_stages(
+                    ag_name, (*ag_deps, *credit), route, transport, payload, tag, couple_gm_bounce=True,
+                ))
+                ag_names.append(ag_name)
+            names = ag_names
         b_bytes = contract.k * contract.n * dtype_bytes(contract.dtype) if rows else 0
         if gathering:
             local = f"local_gemm_{suffix}"
@@ -710,8 +737,9 @@ def _chunked_stages(contract: Mc2Contract, transport: Transport, *,
                                                         b_bytes=b_bytes, slot=tag, ub_output=ub_output)
             own_bytes = rows // world * contract.n * dtype_bytes(contract.output_dtype)
             reduced = (world - 1) * (rows // world) * contract.n
+            out_bytes = rows * contract.n * dtype_bytes(contract.output_dtype) if all_reducing else own_bytes
             work = read_work((0 if temp_gm else wire_window) + (0 if ub_output else own_bytes), l2=True)
-            work += store_work(own_bytes, l2=True) + Work(resources={"vector": reduced})
+            work += store_work(out_bytes, l2=True) + Work(resources={"vector": reduced})
             fragments[events.read_done[0]] = Phase(
                 comm, (events.publish, *names), work if world > 1 else Work(), "aiv", tag)
     for node in ring.to_stages():
@@ -724,7 +752,12 @@ def build_chunked_agmm_stages(contract: Mc2Contract, transport: Transport) -> tu
 
 
 def build_chunked_mmrs_stages(contract: Mc2Contract, transport: Transport, *,
-                             ub_output: bool = False, temp_gm: bool = False) -> tuple[Phase, ...]:
+                              ub_output: bool = False, temp_gm: bool = False) -> tuple[Phase, ...]:
+    return _chunked_stages(contract, transport, ub_output=ub_output, temp_gm=temp_gm)
+
+
+def build_chunked_mmar_stages(contract: Mc2Contract, transport: Transport, *,
+                              ub_output: bool = False, temp_gm: bool = False) -> tuple[Phase, ...]:
     return _chunked_stages(contract, transport, ub_output=ub_output, temp_gm=temp_gm)
 
 
@@ -734,6 +767,8 @@ def build_transport_stages(contract: Mc2Contract, transport: Transport, *,
         return build_chunked_agmm_stages(contract, transport)
     if contract.abi == MMRS:
         return build_chunked_mmrs_stages(contract, transport, ub_output=ub_output, temp_gm=temp_gm)
+    if contract.abi == MMAR:
+        return build_chunked_mmar_stages(contract, transport, ub_output=ub_output, temp_gm=temp_gm)
     phases = []
     for index, cohort in enumerate(contract.cohorts):
         reuse = index - transport.slot_depth

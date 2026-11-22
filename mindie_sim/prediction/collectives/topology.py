@@ -70,7 +70,17 @@ from .transport import (
 MAX_ROUTE_CACHE_ENTRIES = 8192
 UNDECLARED_SCOPE_PRIORITY = 3
 NS_PER_US_TOPO = 1000.0
+P15_PRIMITIVE_ID = "P15_rts_stars"
+P16_PRIMITIVE_ID = "P16_multistream_core_control"
+P17_PRIMITIVE_ID = "P17_aicpu_metadata_launch"
 P18_PRIMITIVE_ID = "P18_hccl_collective_band"
+P19_PRIMITIVE_ID = "P19_direct_peer_window"
+P20_PRIMITIVE_ID = "P20_host_dma_sync"
+P19_UNCOALESCED_OP_RATIO = 1.5
+STARS_SYNC_EVENTS_PER_STEP = 2
+DUPLEX_SERIAL_OPS = 2.0
+ALLREDUCE_DEVICE_PHASES = 2
+_FAMILY_ALIASES = {"all_reduce": "allreduce", "all_gather": "allgather"}
 _SCOPE_PRIORITY = {
     "package": 0,
     "node": 1,
@@ -157,26 +167,20 @@ class Topology(_TopologyPlansMixin):
         self._p18_measured_scope = ""
         self._p18_measured_collective = ""
         self._p18_measured_world_size = 0
-        if primitive_table is not None and hasattr(primitive_table, "cell"):
-            try:
-                p18 = primitive_table.cell(P18_PRIMITIVE_ID)
-            except ModelingError:
-                p18 = None
-            if p18 is not None:
-                p18_params = p18.parameters or {}
-                self._p18_measured_scope = str(p18_params.get("measured_scope") or "")
-                raw_coll = str(p18_params.get("measured_collective") or "all_reduce").strip().lower()
-                self._p18_measured_collective = raw_coll.replace("_", "") if raw_coll in {"all_reduce", "all_gather"} else raw_coll
-                self._p18_measured_world_size = int(p18_params.get("measured_world_size") or 0)
-                lb = p18.metrics.get("link_bytes_per_s")
-                if lb is not None and lb.p50 is not None and float(lb.p50) > 0.0:
-                    self._p18_link_bytes_per_ms = float(lb.p50) / MS_PER_S
-                sb = p18.metrics.get("startup_blocked_ns")
-                if sb is not None and sb.p50 is not None and float(sb.p50) > 0.0:
-                    self.p18_startup_us = float(sb.p50) / NS_PER_US_TOPO
-                se = p18.metrics.get("startup_ns")
-                if se is not None and se.p50 is not None and float(se.p50) > 0.0:
-                    self.p18_eager_startup_us = float(se.p50) / NS_PER_US_TOPO
+        self._has_primitive_table = bool(primitive_table is not None and hasattr(primitive_table, "cell"))
+        self._p15_aiv_first_issue_us = 0.0
+        self._p15_issue_interval_us = 0.0
+        self._p15_host_submit_us = 0.0
+        self._p16_stream_event_us = 0.0
+        self._p17_eager_sync_us = 0.0
+        self._p20_pinned_d2h_startup_us = 0.0
+        self._p19_duplex_blocked_us = 0.0
+        self._p19_duplex_eager_us = 0.0
+        self._p19_duplex_bytes_per_ms = 0.0
+        self._p19_uncoalesced_duplex = False
+        self._vector_invocation_us = self._extract_vector_invocation_us(machine)
+        if self._has_primitive_table:
+            self._load_calibrated_comm_primitives(primitive_table)
         self.routes = {}
         width = max(1, int(getattr(machine, "ranks_per_node", 1) or 1))
         self._ranks_per_node = width
@@ -268,6 +272,97 @@ class Topology(_TopologyPlansMixin):
             return (node, self._rank_package[key])
         return (node, key // self._dies_per_package)
 
+    @staticmethod
+    def _extract_vector_invocation_us(machine) -> float:
+        dies = getattr(machine, "dies", ()) or ()
+        if not dies:
+            return 0.0
+        ki = dict(getattr(dies[0], "kernel_invocations", ()) or ())
+        vec = ki.get("vector")
+        if vec is None:
+            return 0.0
+        val = float(getattr(vec, "minimum_ms", 0.0) or 0.0) * MS_PER_S
+        return val if val > 0.0 else 0.0
+
+    @staticmethod
+    def _sealed_metric_p50(cell, metric_name: str) -> float:
+        if cell is None:
+            return 0.0
+        band = (getattr(cell, "metrics", None) or {}).get(metric_name)
+        if band is None or band.p50 is None:
+            return 0.0
+        val = float(band.p50)
+        return val if val > 0.0 else 0.0
+
+    @staticmethod
+    def _sealed_p19_diag_p50(p19_params: Mapping, metric_name: str) -> float:
+        entry = (p19_params.get("hccl_duplex_diagnostics") or {}).get(metric_name)
+        if not isinstance(entry, Mapping):
+            return 0.0
+        diag = entry.get("diagnostic") or {}
+        band = entry.get("band") or {}
+        if diag.get("status") != "calibrated" or band.get("p50") is None:
+            return 0.0
+        val = float(band["p50"])
+        return val if val > 0.0 else 0.0
+
+    def _load_calibrated_comm_primitives(self, primitive_table) -> None:
+        def _cell(pid: str):
+            try:
+                return primitive_table.cell(pid)
+            except ModelingError:
+                return None
+
+        p18 = _cell(P18_PRIMITIVE_ID)
+        if p18 is not None:
+            p18_params = p18.parameters or {}
+            self._p18_measured_scope = str(p18_params.get("measured_scope") or "")
+            raw_coll = str(p18_params.get("measured_collective") or "all_reduce").strip().lower()
+            self._p18_measured_collective = _FAMILY_ALIASES.get(raw_coll, raw_coll)
+            self._p18_measured_world_size = int(p18_params.get("measured_world_size") or 0)
+            lb = self._sealed_metric_p50(p18, "link_bytes_per_s")
+            if lb > 0.0:
+                self._p18_link_bytes_per_ms = lb / MS_PER_S
+            sb = self._sealed_metric_p50(p18, "startup_blocked_ns")
+            if sb > 0.0:
+                self.p18_startup_us = sb / NS_PER_US_TOPO
+            se = self._sealed_metric_p50(p18, "startup_ns")
+            if se > 0.0:
+                self.p18_eager_startup_us = se / NS_PER_US_TOPO
+        p15 = _cell(P15_PRIMITIVE_ID)
+        self._p15_aiv_first_issue_us = self._sealed_metric_p50(p15, "aiv_first_issue_ns") / NS_PER_US_TOPO
+        self._p15_issue_interval_us = self._sealed_metric_p50(p15, "issue_interval_ns") / NS_PER_US_TOPO
+        self._p15_host_submit_us = self._sealed_metric_p50(p15, "host_submit_ns") / NS_PER_US_TOPO
+        p16 = _cell(P16_PRIMITIVE_ID)
+        self._p16_stream_event_us = self._sealed_metric_p50(p16, "stream_event_ns") / NS_PER_US_TOPO
+        p17 = _cell(P17_PRIMITIVE_ID)
+        p20 = _cell(P20_PRIMITIVE_ID)
+        eager_sync = self._sealed_metric_p50(p17, "eager_d2h_sync_ns") or self._sealed_metric_p50(p20, "eager_d2h_sync_ns")
+        self._p17_eager_sync_us = eager_sync / NS_PER_US_TOPO
+        self._p20_pinned_d2h_startup_us = self._sealed_metric_p50(p20, "pinned_d2h_startup_ns") / NS_PER_US_TOPO
+        p19 = _cell(P19_PRIMITIVE_ID)
+        if p19 is not None:
+            p19_params = p19.parameters or {}
+            self._p19_duplex_blocked_us = self._sealed_p19_diag_p50(p19_params, "hccl_duplex_4k_blocked_ns") / NS_PER_US_TOPO
+            self._p19_duplex_eager_us = self._sealed_p19_diag_p50(p19_params, "hccl_duplex_4k_ns") / NS_PER_US_TOPO
+            p19_bw = self._sealed_p19_diag_p50(p19_params, "hccl_duplex_bytes_per_s")
+            if p19_bw > 0.0:
+                self._p19_duplex_bytes_per_ms = p19_bw / MS_PER_S
+            self._p19_uncoalesced_duplex = bool(
+                self.p18_eager_startup_us > 0.0
+                and self._p19_duplex_eager_us > self.p18_eager_startup_us * P19_UNCOALESCED_OP_RATIO
+            )
+
+    def _matches_p18_scope(self, group: tuple[int, ...]) -> bool:
+        p18_scope = self._p18_measured_scope or ("package" if self._dies_per_package >= 2 else "node")
+        same_pkg = len({self._package_key(r) for r in group}) == 1
+        same_node = len({self._node_of(r) for r in group}) == 1
+        if p18_scope == "package":
+            return same_pkg
+        if p18_scope == "node":
+            return same_node and not (self._dies_per_package >= 2 and same_pkg)
+        return True
+
     def p18_matched_startup_us(self, collective: str, group: tuple[int, ...], *, stack: str) -> float:
         """Return P18 startup only when collective, world size, route scope, and stack all match."""
         if not group or len(group) < 2:
@@ -276,16 +371,73 @@ class Topology(_TopologyPlansMixin):
             return 0.0
         if self._p18_measured_world_size > 0 and len(group) != self._p18_measured_world_size:
             return 0.0
-        p18_scope = self._p18_measured_scope or ("package" if self._dies_per_package >= 2 else "node")
-        same_pkg = len({self._package_key(r) for r in group}) == 1
-        same_node = len({self._node_of(r) for r in group}) == 1
-        if p18_scope == "package" and not same_pkg:
-            return 0.0
-        if p18_scope == "node" and (not same_node or (self._dies_per_package >= 2 and same_pkg)):
+        if not self._matches_p18_scope(group):
             return 0.0
         if stack == "eager":
             return float(self.p18_eager_startup_us)
         return float(self.p18_startup_us)
+
+    def p19_matched_duplex_startup_us(self, collective: str, group: tuple[int, ...], *, stack: str) -> float:
+        """Return sealed P19 HCCL duplex startup when the physical scope matches."""
+        if not self._has_primitive_table or not group or len(group) < 2:
+            return 0.0
+        if not self._matches_p18_scope(group):
+            return 0.0
+        raw_us = self._p19_duplex_eager_us if stack == "eager" else self._p19_duplex_blocked_us
+        if raw_us <= 0.0:
+            return 0.0
+        extra_peers = max(0, len(group) - 2)
+        extra_peer_us = float(extra_peers) * (
+            self._p15_issue_interval_us + STARS_SYNC_EVENTS_PER_STEP * self._p16_stream_event_us
+        )
+        if not self._p19_uncoalesced_duplex:
+            return float(raw_us + extra_peer_us)
+        per_op_us = raw_us / DUPLEX_SERIAL_OPS
+        barrier_us = (
+            STARS_SYNC_EVENTS_PER_STEP * self._p16_stream_event_us
+            + self._p15_issue_interval_us
+            + self._vector_invocation_us
+        )
+        reduce_us = self._vector_invocation_us if (collective == "allreduce" and stack != "eager") else 0.0
+        return float(per_op_us + barrier_us + reduce_us + extra_peer_us)
+
+    def collective_device_step_us(
+        self, collective: str, group: tuple[int, ...], *,
+        alpha_us: float, stack: str, phase_count: int = 1,
+    ) -> float:
+        """Derive collective startup from sealed P15/P16/P17/P20 STARS/AIV steps."""
+        if not self._has_primitive_table or not group or len(group) < 2:
+            return 0.0
+        ev = self._p16_stream_event_us
+        first = self._p15_aiv_first_issue_us or self._p15_issue_interval_us
+        issue = self._p15_issue_interval_us
+        vec = self._vector_invocation_us
+        if ev <= 0.0 and first <= 0.0 and vec <= 0.0:
+            return 0.0
+        eff_phases = max(int(phase_count), ALLREDUCE_DEVICE_PHASES if collective == "allreduce" else 1)
+        entry_us = (
+            STARS_SYNC_EVENTS_PER_STEP * ev
+            + first
+            + issue
+            + STARS_SYNC_EVENTS_PER_STEP * float(alpha_us)
+        )
+        phase_us = vec + STARS_SYNC_EVENTS_PER_STEP * ev + float(alpha_us)
+        total_us = entry_us + eff_phases * phase_us
+        if stack == "eager":
+            host_sync_us = self._p17_eager_sync_us or self._p20_pinned_d2h_startup_us
+            total_us += self._p15_host_submit_us + host_sync_us
+        return float(total_us)
+
+    def single_peer_flow_cap_bytes_per_ms(self, link_name: str) -> float | None:
+        """Per-peer SDMA rate cap on A3 switched HCCS_SW links without mutating link capacity."""
+        if self._p18_link_bytes_per_ms <= 0.0 or self._dies_per_package < 2:
+            return None
+        if self._link_scope.get(link_name) != "node":
+            return None
+        link = self.links.get(link_name)
+        if link is None or link.capacity_bytes_per_ms <= self._p18_link_bytes_per_ms:
+            return None
+        return float(self._p18_link_bytes_per_ms)
 
     def link_protocol_bands(self, link_name: str):
         """Return piecewise ``CollectiveBandSpec``s declared on link or channel."""
@@ -343,7 +495,8 @@ class Topology(_TopologyPlansMixin):
     def direct_mesh_groups(self, op, replica):
         """Declared single-node full all-to-all pair mesh for this invocation."""
         metadata = dict(op.metadata)
-        family = str(metadata.get("collective", op.family)).strip().lower()
+        raw_family = str(metadata.get("collective", op.family)).strip().lower()
+        family = _FAMILY_ALIASES.get(raw_family, raw_family)
         if family not in DIRECT_MESH_FAMILIES or "peer_traffic" in metadata:
             return family, ()
         axis = metadata.get("group_axis", "tp")
@@ -384,8 +537,14 @@ class Topology(_TopologyPlansMixin):
         return family, groups
 
     def declares_direct_mesh(self, op, replica) -> bool:
-        """True when this invocation declares the direct K_8 pair mesh."""
-        return bool(self.direct_mesh_groups(op, replica)[1])
+        """True when this invocation declares the direct K_8 pair mesh without protocol bands."""
+        _, groups = self.direct_mesh_groups(op, replica)
+        if not groups:
+            return False
+        from .protocol import _candidate_bands, _infer_group_scope
+        if all(_candidate_bands(ranks, self, _infer_group_scope(ranks, self)) for ranks in groups):
+            return False
+        return True
 
     def bind_direct_mesh(self, op, replica, plan) -> None:
         """Publish the one mesh plan selected for an invocation."""

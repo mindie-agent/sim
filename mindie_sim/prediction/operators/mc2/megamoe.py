@@ -91,6 +91,13 @@ def _activation_ops(activation: str) -> int:
 
 
 def _effective_l2(geometry: Geometry) -> float:
+    view = getattr(geometry, "admission_memory_view", None)
+    if view is not None:
+        die = int(getattr(geometry, "rank", 0) or 0)
+        cap_map = getattr(view, "_l2_capacity", None)
+        if isinstance(cap_map, Mapping) and cap_map:
+            cap = cap_map.get(die, next(iter(cap_map.values())))
+            return float(cap)
     mechanisms = getattr(geometry, "physical_mechanisms", None)
     hierarchy = getattr(mechanisms, "memory_hierarchy", None)
     if hierarchy is not None:
@@ -200,13 +207,13 @@ def _gmm_stage(
     aic_pipe, gm_read_bytes, total_read_bytes, operand_bytes, fixpipe_bytes, l2_hit,
 ):
     resources = {
-        "hbm": gm_read_bytes * 0.5 * share,
-        aic_pipe: total_read_bytes * 0.5 * share,
+        "hbm": gm_read_bytes * share,
+        aic_pipe: total_read_bytes * share,
         "mte1": operand_bytes * share,
         "fixpipe": fixpipe_bytes * share,
     }
     if l2_hit > 0.0:
-        resources["l2"] = l2_hit * 0.5 * share
+        resources["l2"] = l2_hit * share
     return Stage(
         name,
         context.bind(Work(
@@ -221,9 +228,11 @@ def _build_megamoe_program(
     context, *, cores: int, aiv_units: int, buf_sizes: dict[str, int],
     in_aiv_bytes: float, out_aiv_bytes: float, pack_vec_ops: float,
     act_vec_ops: float, comb_vec_ops: float, disp_link: float, comb_link: float,
-    comp_dt: str, gmm1_flops: float, gmm2_flops: float, aic_gm_read: float,
-    aic_read_total: float, l0_gmm1: float, l0_gmm2: float, fix_gmm1: float,
-    fix_gmm2: float, l2_hit: float,
+    comp_dt: str, gmm1_flops: float, gmm2_flops: float,
+    gmm1_gm_read: float, gmm2_gm_read: float,
+    gmm1_read_total: float, gmm2_read_total: float,
+    l0_gmm1: float, l0_gmm2: float, fix_gmm1: float,
+    fix_gmm2: float, gmm1_l2_hit: float,
 ):
     c_aic_pipe = read_role(context.resource_names, aiv=None)
     c_aiv_pipe = read_role(context.resource_names, aiv=0)
@@ -251,7 +260,7 @@ def _build_megamoe_program(
                        acquire=allocs, placement=aiv_owned)
         s_gmm1 = _gmm_stage(
             context, "gmm1_gate_up", "dispatch_mx", aic_owned, share, comp_dt, gmm1_flops,
-            c_aic_pipe, aic_gm_read, aic_read_total, l0_gmm1, fix_gmm1, l2_hit,
+            c_aic_pipe, gmm1_gm_read, gmm1_read_total, l0_gmm1, fix_gmm1, gmm1_l2_hit,
         )
         s_act = Stage(
             "act_mx_quant",
@@ -260,7 +269,7 @@ def _build_megamoe_program(
         )
         s_gmm2 = _gmm_stage(
             context, "gmm2_down", "act_mx_quant", aic_owned, share, comp_dt, gmm2_flops,
-            c_aic_pipe, aic_gm_read, aic_read_total, l0_gmm2, fix_gmm2, l2_hit,
+            c_aic_pipe, gmm2_gm_read, gmm2_read_total, l0_gmm2, fix_gmm2, 0.0,
         )
         comb_res: dict[str, float] = {
             "vector": comb_vec_ops * share,
@@ -326,9 +335,13 @@ def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
 
     has_l2 = bool((geometry.rates or {}).get("l2", 0.0) or (geometry.resource_units or {}).get("l2", 0))
     l2_cap = _effective_l2(geometry) if has_l2 else 0.0
-    # Dispatched MX activations land in L2/UB on-chip rather than cold DRAM!
+    # Dispatched MX activations land in L2/UB on-chip and are consumed by GMM1 only.
+    gmm1_read_total = aic_act_read + w13 + sh_w13
+    gmm2_read_total = w2 + sh_w2
     l2_hit = min(aic_act_read, l2_cap) if l2_cap > 0.0 else 0.0
-    aic_gm_read = max(0.0, aic_read_total - l2_hit)
+    gmm1_gm_read = max(0.0, gmm1_read_total - l2_hit)
+    gmm2_gm_read = gmm2_read_total
+    aic_gm_read = gmm1_gm_read + gmm2_gm_read
 
     gmm1_flops = 2.0 * r_rows * width * (2 * inter) + (
         2.0 * tok * width * (2 * sh_inter) if sh_inter > 0 else 0.0
@@ -381,9 +394,11 @@ def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
             in_aiv_bytes=in_aiv_bytes, out_aiv_bytes=out_aiv_bytes,
             pack_vec_ops=pack_vec_ops, act_vec_ops=act_vec_ops, comb_vec_ops=comb_vec_ops,
             disp_link=disp_link, comb_link=comb_link, comp_dt=comp_dt,
-            gmm1_flops=gmm1_flops, gmm2_flops=gmm2_flops, aic_gm_read=aic_gm_read,
-            aic_read_total=aic_read_total, l0_gmm1=l0_gmm1, l0_gmm2=l0_gmm2,
-            fix_gmm1=fix_gmm1, fix_gmm2=fix_gmm2, l2_hit=l2_hit,
+            gmm1_flops=gmm1_flops, gmm2_flops=gmm2_flops,
+            gmm1_gm_read=gmm1_gm_read, gmm2_gm_read=gmm2_gm_read,
+            gmm1_read_total=gmm1_read_total, gmm2_read_total=gmm2_read_total,
+            l0_gmm1=l0_gmm1, l0_gmm2=l0_gmm2,
+            fix_gmm1=fix_gmm1, fix_gmm2=fix_gmm2, gmm1_l2_hit=l2_hit,
         )
 
     return OperatorPlan(total_work, program, {
