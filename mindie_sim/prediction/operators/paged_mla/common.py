@@ -402,7 +402,6 @@ def contract_for(op: OpSpec, ctx: OperatorPlanningContext) -> PagedMlaContract:
             padded_fields[name] = tuple(fill if span[-1] else next(values) for span in spans)
     return validate_contract(replace(c, sequences=sequences, **padded_fields), capacity_extents=True)
 
-ARCH22_MLA_L0A_RELOAD_PANELS = 4
 ARCH22_MLA_CROSSCORE_SYNCS_SCORE = 2
 ARCH22_MLA_CROSSCORE_SYNCS_PROB = 2
 ARCH22_MLA_CROSSCORE_SYNCS_PARTIAL = 1

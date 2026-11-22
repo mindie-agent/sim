@@ -682,7 +682,7 @@ class _ContextMixin:
         bind_context = getattr(recipe, "bind_context", None)
         if bind_context is not None:
             context = bind_context(context)
-        demands, frames, setup, plan_binding = self._bind_context_work(
+        demands, frames, setup, plan_binding, phase_links = self._bind_context_work(
             context, op, replica, recipe, cost.work, transport_options)
         diagnostic = (self.cost.lookup_diagnostic(op, scope)
                       if self.legacy_diagnostics else None)
@@ -699,7 +699,8 @@ class _ContextMixin:
             service_identity={**dict(context.service_identity),
                               "transport_options": transport_options},
             transaction_frames=frames,
-            collective_plan=plan_binding)
+            collective_plan=plan_binding,
+            phase_link_work=phase_links)
         response = (self.regimes.resolve(context, self.cost.record_regime)
                     if self.legacy_diagnostics or self.regimes.rules else None)
         if response is not None and response.mode == "joint_native":
@@ -776,14 +777,100 @@ class _ContextMixin:
             self._service_identity_cache[sid_key] = sid
         return sid
 
+    def _route_link_phase(self, phase_op, replica, volume, transport_options, *, algorithm):
+        band_plan = None
+        if volume and algorithm in {"ring", "pairwise"}:
+            try:
+                band_plan = self.topology.band_collective_plan(
+                    phase_op, {replica: volume}, algorithm=algorithm,
+                    transport=transport_options,
+                )
+            except ModelingError as exc:
+                if not str(exc).startswith("joint_collective_group_membership"):
+                    raise
+        if (band_plan is not None
+                and not set(band_plan.accounting().wire_by_resource).issubset(self.engine.resources)):
+            local_ranks = frozenset(
+                int(die.rank) for die in self.stage_dies[replica, phase_op.stage]
+            )
+            band_plan = band_plan.scoped_to_ranks(
+                local_ranks, available_resources=self.engine.resources
+            )
+        routed = (
+            band_plan.accounting()
+            if band_plan is not None
+            else self.topology.accounting(
+                phase_op, replica, volume=volume, transport=transport_options
+            )
+        )
+        wire = dict(routed.wire_by_resource)
+        if not set(wire).issubset(self.engine.resources):
+            wire = {k: v for k, v in wire.items() if k in self.engine.resources}
+        return wire, routed.transaction_frames, float(routed.setup_ms)
+
+    def _route_megamoe_link_phases(self, op, replica, amount, transport_options):
+        meta = _metadata_dict(op)
+        mega = dict(meta.get("megamoe_geometry") or {})
+        disp_vol = float(mega.get("dispatch_link_bytes", 0.0) or 0.0)
+        comb_vol = float(mega.get("combine_link_bytes", 0.0) or 0.0)
+        disp_peer = mega.get("dispatch_peer_traffic", meta.get("dispatch_peer_traffic"))
+        comb_peer = mega.get("combine_peer_traffic", meta.get("combine_peer_traffic"))
+        declared_sum = disp_vol + comb_vol
+        if declared_sum <= 0.0:
+            disp_vol, comb_vol = float(amount), 0.0
+        elif (disp_peer is None and comb_peer is None
+              and not math.isclose(declared_sum, float(amount), rel_tol=1e-9, abs_tol=1e-9)):
+            scale = float(amount) / declared_sum
+            disp_vol *= scale
+            comb_vol *= scale
+        axis = str(mega.get("group_axis") or meta.get("group_axis") or "ep")
+        collective = str(mega.get("collective") or meta.get("collective") or "alltoall")
+        demands: dict[str, float] = {}
+        frames: dict[str, tuple[int, int]] = {}
+        phase_wires: dict[str, dict[str, float]] = {}
+        setup = 0.0
+        for phase_name, phase_vol, phase_peer in (
+            ("dispatch", disp_vol, disp_peer),
+            ("combine", comb_vol, comb_peer),
+        ):
+            phase_meta = dict(meta)
+            phase_meta["group_axis"] = axis
+            phase_meta["collective"] = collective
+            phase_meta.pop("peer_traffic", None)
+            if phase_peer is not None:
+                phase_meta["peer_traffic"] = phase_peer
+            phase_op = replace(
+                op, family=collective, link_bytes=phase_vol,
+                metadata=tuple(sorted(phase_meta.items())),
+            )
+            if phase_vol <= 0.0:
+                if phase_peer is not None:
+                    self.topology.accounting(phase_op, replica, volume=0.0)
+                phase_wires[phase_name] = {}
+                continue
+            alg = "pairwise" if phase_peer is not None else "ring"
+            wire, p_frames, p_setup = self._route_link_phase(
+                phase_op, replica, phase_vol, transport_options, algorithm=alg,
+            )
+            phase_wires[phase_name] = wire
+            for res_name, val in wire.items():
+                demands[res_name] = demands.get(res_name, 0.0) + val
+            frames.update(p_frames)
+            setup += p_setup
+        return demands, frames, setup, phase_wires
+
     def _bind_context_work(self, context, op, replica, recipe, work, transport_options):
+        meta = _metadata_dict(op)
+        is_megamoe = isinstance(meta.get("megamoe_geometry"), _AbcMapping)
         algorithm = getattr(recipe, "algorithm", "ring")
-        if (algorithm == "ring" and getattr(recipe, "mesh_capable", False)
+        if (not is_megamoe and algorithm == "ring" and getattr(recipe, "mesh_capable", False)
                 and self.topology.declares_direct_mesh(op, replica)):
             algorithm = "direct_mesh"
         band_plan = None
         link_vol = work.get("link", 0)
-        if algorithm == "direct_mesh":
+        if is_megamoe:
+            plan_binding = None
+        elif algorithm == "direct_mesh":
             plan = self.topology.joint_plan(
                 op, {replica: link_vol},
                 algorithm=algorithm, transport=transport_options)
@@ -815,11 +902,22 @@ class _ContextMixin:
                     factory=lambda: self.topology.joint_plan(
                         op, {replica: link_vol},
                         algorithm=algorithm, transport=transport_options))
-        demands, frames, setup = {}, {}, 0.0
-        if "peer_traffic" in dict(op.metadata) and not link_vol:
+        demands, frames, setup, phase_links = {}, {}, 0.0, {}
+        if "peer_traffic" in meta and not link_vol and not is_megamoe:
             self.topology.accounting(op, replica, volume=link_vol)
         for resource, amount in work.items():
             if resource == "link":
+                if is_megamoe:
+                    link_demands, link_frames, link_setup, phase_links = (
+                        self._route_megamoe_link_phases(
+                            op, replica, amount, transport_options,
+                        )
+                    )
+                    for name, value in link_demands.items():
+                        demands[name] = demands.get(name, 0.0) + value
+                    frames.update(link_frames)
+                    setup += link_setup
+                    continue
                 routed = (
                     band_plan.accounting()
                     if band_plan is not None
@@ -837,7 +935,7 @@ class _ContextMixin:
                 bound = context.bind(Work(resources={resource: amount}))
             for name, value in bound.items():
                 demands[name] = demands.get(name, 0) + value
-        return demands, frames, setup, plan_binding
+        return demands, frames, setup, plan_binding, phase_links
 
     def _bind_mac_service(self, context, recipe, cost, response):
         matrix_role = str(response.execution.get("resource") or "cube")
@@ -914,6 +1012,8 @@ class _ContextMixin:
             (inv_t.startup_ms, inv_t.minimum_ms) if inv_t is not None else None,
             _freeze_key(context.joint_native_service),
             tuple(sorted(context.work.items())),
+            tuple(sorted(context.service_caps.items())),
+            tuple((k, tuple(sorted(v.items()))) for k, v in sorted(context.phase_link_work.items())),
             live_rates,
             context.group_buffers,
             getattr(context.physical_mechanisms, "signature", None),

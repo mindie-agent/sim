@@ -598,3 +598,54 @@ def test_tail_copy_supply_tracks_active_owners_and_scalar_store_masks_rows():
         assert work["mte2"] == rows * cols * 4 + 64 * iterations * cols * 8
         assert work["hbm"] == work["mte2"] + rows * cols * 6
         assert work["vector"] == 64 * iterations * ((cols + 7) // 8) * 64 * 8 * 12
+
+
+def test_aiv_tiled_vector_calibration_uses_stage_caps_without_inflating_work():
+    from mindie_sim.prediction.operators.vector.vector_pipeline import AIVTiledVectorAndGatherRecipe
+
+    recipe = AIVTiledVectorAndGatherRecipe()
+    hbm_bytes = 64.0 * 1024.0 * 1024.0
+    mte2_bytes = 32.0 * 1024.0 * 1024.0
+    mte3_bytes = 32.0 * 1024.0 * 1024.0
+    vec_ops = 16.0 * 1024.0 * 1024.0
+    op = replace(
+        simple_op("vec_stream", "vector"),
+        hbm_bytes=hbm_bytes, mte2_bytes=mte2_bytes, mte3_bytes=mte3_bytes, vector_ops=vec_ops,
+        local_shape=(1024, 16384),
+    )
+    hbm_peak_ms = 4_000_000.0  # 4 GB/s -> 4e6 B/ms
+    dram_sust_bps = 2_000_000_000.0  # 2 GB/s = 0.5 * peak
+    rates = {"hbm": hbm_peak_ms, "mte2": 1e12, "mte3": 1e12, "vector": 1e12}
+    names = {role: role for role in rates}
+    work = {"hbm": hbm_bytes, "mte2": mte2_bytes, "mte3": mte3_bytes, "vector": vec_ops}
+    base_ctx = RecipeContext(
+        op, work, names, rates, 16,
+        resource_units={"hbm": 1, "mte2": 32, "mte3": 32, "vector": 32},
+        service_modes={"hbm_rw11_dram": ("hbm", dram_sust_bps)},
+    )
+    bound = recipe.bind_context(base_ctx)
+    assert "hbm" not in bound.service_modes
+    assert bound.service_caps["hbm"] == pytest.approx(dram_sust_bps / 1000.0)
+
+    # Standalone run conserves exact physical Work bytes while enforcing the sustainable ceiling.
+    engine = Engine([Resource(k, v, units=bound.resource_units[k]) for k, v in rates.items()])
+    done = recipe.lower(bound).start(engine, "aiv", engine.submit("in"))
+    engine.advance(until=(done,))
+    assert engine.serviced["hbm"] == pytest.approx(hbm_bytes)
+    assert engine.serviced["vector"] == pytest.approx(vec_ops)
+    assert engine.serviced["mte2"] == pytest.approx(mte2_bytes)
+    assert engine.serviced["mte3"] == pytest.approx(mte3_bytes)
+    assert done.time == pytest.approx(hbm_bytes / (dram_sust_bps / 1000.0), rel=1e-3)
+
+    # Concurrent AIC stream on shared HBM receives the remaining half of physical HBM without
+    # fighting inflated AIV demand.
+    aic_bytes = hbm_bytes
+    eng_conc = Engine([Resource(k, v, units=bound.resource_units[k]) for k, v in rates.items()])
+    ready = eng_conc.submit("in")
+    aiv_done = recipe.lower(bound).start(eng_conc, "aiv", ready)
+    aic_done = eng_conc.submit("aic", {"hbm": aic_bytes}, after=(ready,))
+    eng_conc.advance(until=(aiv_done, aic_done), first=False)
+    assert eng_conc.serviced["hbm"] == pytest.approx(hbm_bytes + aic_bytes)
+    assert max(aiv_done.time, aic_done.time) == pytest.approx(
+        (hbm_bytes + aic_bytes) / hbm_peak_ms, rel=1e-3,
+    )

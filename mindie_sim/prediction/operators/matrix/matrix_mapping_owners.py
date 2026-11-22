@@ -547,6 +547,7 @@ def primitive_cold_hbm_bps(
     context, *, active_cores: int, row_bytes: int, stride_bytes: int,
     total_tiles: int, is_grouped: bool, is_full_row_coalesced: bool = False,
     m_tiles: int | None = None, weight_cache_disable: bool | None = None,
+    panel_rows: int | None = None,
 ) -> float | None:
     """Effective die cold-HBM read bandwidth from P01 scaling, strided surface and P05 stride cap."""
     pt = getattr(context, "primitive_table", None)
@@ -578,11 +579,31 @@ def primitive_cold_hbm_bps(
             stride_bytes=stride_bytes, is_grouped=is_grouped,
         )
     )
-    sector_eff = min(1.0, float(max(1, int(row_bytes))) / float(max(1, sector)))
+    eff_row = max(1, int(row_bytes))
+    eff_stride = max(1, int(stride_bytes))
+    eff_sector = max(1, int(sector))
+    if eff_row >= eff_stride:
+        # Contiguous dense rows coalesce across adjacent rows; compute sector
+        # efficiency from the panel's contiguous sector union (matching
+        # AddressRun.sector_union_bytes) rather than per-row sub-sector caps.
+        rows = int(panel_rows) if (panel_rows is not None and int(panel_rows) > 0) else 0
+        if rows <= 0:
+            op = getattr(context, "op", None)
+            shape = getattr(op, "local_shape", ()) or ()
+            if len(shape) >= _GEMM_SHAPE_AXES:
+                rows = max(1, int(shape[-1]))
+        if rows > 0:
+            useful = rows * eff_row
+            union = ((useful + eff_sector - 1) // eff_sector) * eff_sector
+            sector_eff = min(1.0, float(useful) / float(max(1, union)))
+        else:
+            sector_eff = 1.0
+    else:
+        sector_eff = min(1.0, float(eff_row) / float(eff_sector))
     cap = p01_cold * sector_eff
     if hbm_rd is not None:
         cap = min(cap, hbm_rd)
-    if row_bytes < stride_bytes:
+    if eff_row < eff_stride:
         if not (cache_disable and is_arch35_context(context)):
             strided = primitive_p01_strided_cold_bps(context, row_bytes, stride_bytes)
             if strided is not None:
@@ -599,6 +620,7 @@ def primitive_wave_cold_hbm_per_owner_bps(
     context, *, cold_tiles: int, row_bytes: int, stride_bytes: int,
     is_grouped: bool, is_full_row_coalesced: bool = False, nn_tiles: int = 1,
     m_tiles: int | None = None, weight_cache_disable: bool | None = None,
+    panel_rows: int | None = None,
 ) -> float | None:
     """Per-owner cold-HBM cap solving the shared-HBM fluid Engine wave equation.
 
@@ -619,6 +641,7 @@ def primitive_wave_cold_hbm_per_owner_bps(
             stride_bytes=stride_bytes, total_tiles=cold_tiles,
             is_grouped=is_grouped, is_full_row_coalesced=is_full_row_coalesced,
             m_tiles=m_tiles, weight_cache_disable=weight_cache_disable,
+            panel_rows=panel_rows,
         )
         if bw_full is None or bw_full <= 0.0:
             return None
@@ -630,6 +653,7 @@ def primitive_wave_cold_hbm_per_owner_bps(
             stride_bytes=stride_bytes, total_tiles=cold_tiles,
             is_grouped=is_grouped, is_full_row_coalesced=tail_coalesced,
             m_tiles=m_tiles, weight_cache_disable=weight_cache_disable,
+            panel_rows=panel_rows,
         )
         if bw_tail is None or bw_tail <= 0.0:
             return None

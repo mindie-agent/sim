@@ -13,7 +13,7 @@ from dataclasses import dataclass, replace
 from typing import Mapping
 
 from mindie_sim.schema.common import ModelingError, dtype_bytes
-from .attention_kv_access import KVCacheAccess
+from .attention_kv_access import FixpipeHandoffPolicy, KVCacheAccess
 from mindie_sim.prediction.mechanism import Work
 
 IMPLEMENTATION = "staged_gqa_prefill"
@@ -241,6 +241,15 @@ def _task_pairs(task: _Task, context: int) -> tuple[int, int]:
     return logical, task.rows * task.horizon
 
 
+def prefill_handoff_workspace_bytes(spec: _Spec, core_count: int) -> int:
+    """Simultaneous die-wide FP32 score + PV workspace bytes for staged GQA prefill."""
+    if not spec.requests or spec.task_count <= 0:
+        return 0
+    max_rows = _NATIVE_QUERY_TILE if spec.native_fia else spec.query_tile
+    active = min(max(1, int(core_count)), spec.task_count)
+    return active * spec.slots * max_rows * (spec.key_tile + spec.head_dim) * _FP32_BYTES
+
+
 def _task_work(spec: _Spec, task: _Task, *, include_mte1: bool, partial: bool,
                read: str, vread: str, write: str | None,
                 operand: str | None):
@@ -288,12 +297,14 @@ def _task_work(spec: _Spec, task: _Task, *, include_mte1: bool, partial: bool,
                  if cache.value_needs_conversion else value_payload)
     vector = vector_out + cache.conversion_ops(kv_rows)
     flops = 0
+    handoff_bytes = 0
     for tile in range(task.key_tiles):
         valid = min(spec.key_tile, task.horizon
                     - (task.key_start + tile) * spec.key_tile)
         rect = rows * valid
         if include_mte1:
             mte1 += rect * spec.query_bytes
+        handoff_bytes += (rect + rows * dim) * _FP32_BYTES
         flops += _QK_PV_FLOPS_PER_DIM * dim * rect
         vector += _SOFTMAX_OPS_PER_PAIR * rect + rows * (
             _ONLINE_UPDATE_OPS_PER_DIM * dim + _SOFTMAX_AND_UPDATE_OPS_PER_ROW
@@ -302,15 +313,18 @@ def _task_work(spec: _Spec, task: _Task, *, include_mte1: bool, partial: bool,
         "producer": producer, "vector_reads": vector_reads,
         "writes": out_bytes, "mte3_extra": mte3_extra,
         "vector": vector, "mte1": mte1, "flops": flops,
+        "handoff": handoff_bytes,
     }
 
 
 def _total_work(spec: _Spec, *, include_mte1: bool, read: str = "mte2",
                 vread: str | None = None, write: str | None = "mte3",
-                operand: str | None = "mte1", plan=None) -> Work:
+                operand: str | None = "mte1", plan=None,
+                handoff: FixpipeHandoffPolicy | None = None) -> Work:
     cache = spec.kv_cache
     vread = vread or read
     producer = vector_reads = writes = mte3_extra = vector = mte1 = 0
+    handoff_total = 0
     flops = 0
     if plan is None:
         for task in _iter_tasks(spec):
@@ -324,6 +338,7 @@ def _total_work(spec: _Spec, *, include_mte1: bool, read: str = "mte2",
             vector += part["vector"]
             mte1 += part["mte1"]
             flops += part["flops"]
+            handoff_total += part["handoff"]
     else:
         task_owners = {}
         for core, ranges in enumerate(plan["ranges"]):
@@ -343,6 +358,7 @@ def _total_work(spec: _Spec, *, include_mte1: bool, read: str = "mte2",
                 vector += part["vector"]
                 mte1 += part["mte1"]
                 flops += part["flops"]
+                handoff_total += part["handoff"]
         for ti, owners in sorted(task_owners.items()):
             if len(owners) < 2:
                 continue
@@ -369,6 +385,13 @@ def _total_work(spec: _Spec, *, include_mte1: bool, read: str = "mte2",
         resources[write] = (resources.get(write, 0) + writes + mte3_extra)
     if include_mte1 and operand:
         resources[operand] = mte1
+    if handoff is not None and handoff.enabled and handoff_total > 0:
+        resources["fixpipe"] = resources.get("fixpipe", 0) + handoff_total
+        if handoff.via_gm:
+            if vread:
+                resources[vread] = resources.get(vread, 0) + handoff_total
+            if handoff.mem_tier:
+                resources[handoff.mem_tier] = resources.get(handoff.mem_tier, 0) + 2 * handoff_total
     return Work(matrix={spec.query_dtype: flops}, resources=resources)
 
 def _report(spec: _Spec) -> dict:

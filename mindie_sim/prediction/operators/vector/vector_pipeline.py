@@ -65,24 +65,30 @@ class AIVTiledVectorAndGatherRecipe:
                 or context.service_rate("hbm_rw21_dram")
                 or context.service_rate("mte2_aiv_dram")
             )
-        updated_modes = dict(context.service_modes)
+        updated_caps = dict(context.service_caps)
         changed = False
         if dram_rate is not None and "hbm" in context.resource_names:
-            # Only service units change. Native HBM bytes and on-chip MTE2
-            # refills remain intact; reads and writes contend on the same bus.
-            ceiling = min(dram_rate,
-                          context.rates[context.resource_names["hbm"]] * MS_PER_SECOND)
-            updated_modes["hbm"] = ("hbm", ceiling)
-            changed = True
+            # Preserve declared physical bytes in Work; enforce sustainable
+            # DRAM ceilings via Stage.caps so concurrent streams never inflate
+            # shared-bus demand.
+            hbm_name = context.resource_names["hbm"]
+            ceiling_ms = min(dram_rate / MS_PER_SECOND, context.rates[hbm_name])
+            if ceiling_ms > 0.0:
+                prev = updated_caps.get(hbm_name)
+                updated_caps[hbm_name] = min(prev, ceiling_ms) if prev is not None else ceiling_ms
+                changed = True
         if submode in NON_STREAMING_VECTOR_SUBMODES and "vector" in context.resource_names:
-            vec_rate = context.rates[context.resource_names["vector"]] * MS_PER_SECOND
+            vec_name = context.resource_names["vector"]
             op_factor = (
                 BROADCAST_VECTOR_OP_FACTOR
                 if submode == "broadcast_elementwise"
                 else OUTER_REDUCE_VECTOR_OP_FACTOR
             )
-            updated_modes["vector"] = ("vector", vec_rate / op_factor)
-            changed = True
+            vec_cap_ms = context.rates[vec_name] / op_factor
+            if vec_cap_ms > 0.0:
+                prev = updated_caps.get(vec_name)
+                updated_caps[vec_name] = min(prev, vec_cap_ms) if prev is not None else vec_cap_ms
+                changed = True
         l2_hit_bytes = max(0.0, read_bytes + write_bytes - hbm_bytes)
         if (
             l2_hit_bytes > 0.0
@@ -99,10 +105,13 @@ class AIVTiledVectorAndGatherRecipe:
             if l2_bw is not None and l2_bw > 0.0 and mte2_role is not None:
                 # Shared die-wide L2 bandwidth bounds combined L2 read+write traffic.
                 eff_mte2 = l2_bw * (read_bytes / (read_bytes + write_bytes))
-                mte2_peak = context.rates[context.resource_names[mte2_role]] * MS_PER_SECOND
-                updated_modes["mte2"] = (mte2_role, min(eff_mte2, mte2_peak))
-                changed = True
-        return replace(context, service_modes=updated_modes) if changed else context
+                mte2_name = context.resource_names[mte2_role]
+                mte2_cap_ms = min(eff_mte2 / MS_PER_SECOND, context.rates[mte2_name])
+                if mte2_cap_ms > 0.0:
+                    prev = updated_caps.get(mte2_name)
+                    updated_caps[mte2_name] = min(prev, mte2_cap_ms) if prev is not None else mte2_cap_ms
+                    changed = True
+        return replace(context, service_caps=updated_caps) if changed else context
 
     def build(self, op, geometry):
         return build_plan(self, op, geometry)
@@ -239,7 +248,8 @@ class AIVTiledVectorAndGatherRecipe:
                 phases = phases + (Phase(f"{pipe}_service", {pipe: 1.0}),)
         slots = (
             max(self.slots, THREE_STAGE_PIPELINE_SLOTS)
-            if submode in NON_STREAMING_VECTOR_SUBMODES
+            if (submode in NON_STREAMING_VECTOR_SUBMODES
+                or (context.service_caps and len(phases) >= THREE_STAGE_PIPELINE_SLOTS))
             else self.slots
         )
         return tiled_phased_program(

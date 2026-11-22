@@ -21,14 +21,16 @@ from mindie_sim.prediction.mechanism import (
     Geometry, OperatorPlan, PlannedRecipe, Work,
 )
 from mindie_sim.prediction.ownership import read_role, unit_group
-from .attention_kv_access import KVCacheAccess, kv_access
+from .attention_kv_access import FixpipeHandoffPolicy, KVCacheAccess, gqa_fixpipe_policy, kv_access
+from .attention_pipeline import append_gqa_handoff_stages
 from .attention_prefill_geometry import (
     IMPLEMENTATION, NATIVE_S2_PRELOAD, _DTYPE_ALIASES, _FP32_BYTES,
     _PREFILL_PHASES, _SOURCE_LARGE_HEAD_THRESHOLD, _SOURCE_QUERY_TILE_DEFAULT,
     _SOURCE_QUERY_TILE_LARGE_HEAD, _Spec, _Task, _ceil_div, _dtype,
     _explicit_reconstruct, _iter_tasks, _native_tasks, _nonnegative_int,
     _positive_int, _report, _task_at, _task_at_for, _task_pairs, _task_work,
-    _time_major_tasks, _total_work, logical_causal_pairs, source_query_tile,
+    _time_major_tasks, _total_work, logical_causal_pairs,
+    prefill_handoff_workspace_bytes, source_query_tile,
 )
 from mindie_sim.prediction.operators.attention.attention_prefill_issue import (
     source_c2_path, source_compatible_alternatives, source_issue_kind,
@@ -215,6 +217,7 @@ class StagedGQAPrefill:
         if geometry is None:
             read, vread, write, operand = "mte2", "mte2", "mte3", "mte1"
             mte1 = False
+            handoff = FixpipeHandoffPolicy()
         else:
             read = read_role(geometry.resource_units)
             vread = read_role(geometry.resource_units, aiv=0)
@@ -222,6 +225,9 @@ class StagedGQAPrefill:
             operand = "mte1" if "mte1" in geometry.resource_units else None
             mte1 = operand is not None
             cores = max(1, int(geometry.compute_units))
+            handoff = gqa_fixpipe_policy(
+                geometry, prefill_handoff_workspace_bytes(spec, cores),
+            )
             if spec.kv_cache.needs_conversion and operand is None:
                 raise ModelingError(
                     "attention_prefill_conversion_requires_mte1_operand_copy")
@@ -233,7 +239,7 @@ class StagedGQAPrefill:
             plan = owner_s2_plan(spec, cores)
         work = _total_work(
             spec, include_mte1=mte1, read=read, vread=vread,
-            write=write, operand=operand, plan=plan)
+            write=write, operand=operand, plan=plan, handoff=handoff)
         metadata = {"kv_cache_access": spec.kv_cache.report()}
         if plan is not None:
             metadata["prefill_plan"] = {
@@ -398,8 +404,7 @@ def _task_program(context: RecipeContext, recipe: StagedGQAPrefill,
     stages = [
         Stage("q_load", context.bind(Work(resources=q_work)),
               acquire=persistent,
-              placement={**_placement(context, core, *copy_in),
-                         **_placement(context, core, *operand_roles)}),
+              placement=_placement(context, core, *copy_in)),
     ]
     page_meta = page_scale = 0
     page_scale_ub = None
@@ -423,8 +428,10 @@ def _task_program(context: RecipeContext, recipe: StagedGQAPrefill,
         stages.append(Stage(
             "page_access", context.bind(Work(resources=page_work)),
             acquire=_allocations((page_scale_ub,)), after=("q_load",),
-            placement={**_placement(context, core, *copy_in),
-                       **_placement(context, core, *vector_copy_in)}))
+            placement={
+                **(_placement(context, core, *copy_in) if page_meta else {}),
+                **(_placement(context, core, *vector_copy_in) if page_scale else {}),
+            }))
     key_ready = "page_access" if (page_meta or page_scale) else "q_load"
     max_tile = min(recipe.key_tile, max(1, task.horizon))
 
@@ -436,11 +443,15 @@ def _task_program(context: RecipeContext, recipe: StagedGQAPrefill,
     # All full key panels of an owner use the same work and buffer slots.
     # Only the final partial panel differs. Reuse bound stage descriptions;
     # PipelineProgram still creates independent events and lifetimes per panel.
+    handoff = gqa_fixpipe_policy(
+        context, prefill_handoff_workspace_bytes(spec, context.core_count),
+    )
+
     @lru_cache(maxsize=preload + 1)
     def tile_template(valid: int, slot: int):
         return _prefill_tile_stages(
             valid, slot, context, core, spec, cache, rows, dim, outer, max_tile, q_bytes,
-            read, write, operand, vector_copy_in)
+            read, write, operand, vector_copy_in, handoff)
 
     # The native FIA key loop has a longer preload and drain than generic GQA.
     fill = NATIVE_S2_PRELOAD if spec.native_fia else 1
@@ -595,7 +606,7 @@ def _append_prefill_key_load(
 
 def _prefill_tile_stages(
     valid, slot, context, core, spec, cache, rows, dim, outer, max_tile, q_bytes, read, write,
-    operand, vector_copy_in,
+    operand, vector_copy_in, handoff: FixpipeHandoffPolicy = FixpipeHandoffPolicy(),
 ):
     copy_in = (read,)
     copy_out = (write,) if write else ()
@@ -660,9 +671,13 @@ def _prefill_tile_stages(
         acquire=score_acquire, free=k_free,
         placement={**_placement(context, core, *cube),
                    **_placement(context, core, *operand_roles)}))
+    score_ready, softmax_free = append_gqa_handoff_stages(
+        emitted, "score", "qk", rect * _FP32_BYTES,
+        score_release, handoff, context, core, vector_copy_in[0],
+    )
     emitted.append(Stage(
-        "softmax", context.bind(softmax), after=("qk",),
-        acquire=prob_acquire, free=score_release,
+        "softmax", context.bind(softmax), after=(score_ready,),
+        acquire=prob_acquire, free=softmax_free,
         placement=_placement(context, core, *vector)))
 
     # V mirrors K; PV consumes the materialized V operand and probability.
@@ -722,6 +737,11 @@ def _prefill_tile_stages(
                        **_placement(context, core, *operand_roles)}))
         v_ready = "v_load"
         v_free = _allocations((v_l1, v_l0b))
+    pv_free = (
+        _allocations((v_l0b, p_l0a))
+        + (_allocations((v_l1,)) if not value_needs else ())
+        + (() if handoff.enabled else tuple(pv_acquire))
+    )
     emitted.extend((
         Stage("probability_operand",
               context.bind(Work(resources=(
@@ -730,14 +750,17 @@ def _prefill_tile_stages(
               placement=_placement(context, core, *operand_roles)),
         Stage("pv", context.bind(pv),
               after=(v_ready, "probability_operand"),
-              acquire=pv_acquire,
-              free=_allocations((v_l0b, p_l0a)) + tuple(pv_acquire)
-              + (_allocations((v_l1,)) if not value_needs else ()),
+              acquire=pv_acquire, free=pv_free,
               placement=_placement(context, core, *cube)),
-        Stage("online_update", context.bind(online), after=("pv",),
-              free=prob_release, previous=("online_update",),
-              placement=_placement(context, core, *vector)),
     ))
+    pv_ready, _ = append_gqa_handoff_stages(
+        emitted, "pv", "pv", rows * dim * _FP32_BYTES,
+        tuple(pv_acquire), handoff, context, core, vector_copy_in[0],
+    )
+    emitted.append(Stage(
+        "online_update", context.bind(online), after=(pv_ready,),
+        free=prob_release, previous=("online_update",),
+        placement=_placement(context, core, *vector)))
     return tuple(emitted)
 
 

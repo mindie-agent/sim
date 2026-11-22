@@ -723,3 +723,63 @@ def test_bf16_indexer_weight_bytes_ub_head_scaling_and_governed_make_op_io():
 
     gov = _scorer(LIGHTNING, rows=256, cache_dtype="bf16")
     assert gov.hbm_bytes > 0 and gov.mte2_bytes > 0 and gov.mte3_bytes > 0 and gov.vector_ops > 0
+
+
+def test_arch22_v1_lightning_indexer_charges_per_group_q_rows_on_heterogeneous_batch():
+    from mindie_sim.prediction.operators.contracts import OperatorPlanningContext
+    from mindie_sim.prediction.operators.sharedkv.sparse_indexer_v1 import build_arch22_v1_lightning
+    from mindie_sim.prediction.operators.sparse_indexer.common import SparseIndexerContract, make_op
+
+    geom = Geometry.from_devices(sku_case(MEMBASE).machine.dies)
+    heads, dim, topk = 4, 128, 128
+    contract = SparseIndexerContract(
+        abi="aclnnLightningIndexer",
+        query_tokens=3,
+        scanned_rows=8192,
+        index_heads=heads,
+        index_dim=dim,
+        topk_items=topk,
+        batch_size=2,
+        cache_dtype="bf16",
+        has_head_weights=True,
+        fused_topk=True,
+    )
+    op = make_op(contract, op_id="idx_v1")
+    req_views = (
+        RequestView("long_decode", 1, 8192, False, "decode"),
+        RequestView("short_mtp", 2, 510, False, "decode"),
+    )
+    planning_ctx = OperatorPlanningContext(
+        occurrence=None,
+        geometry=geom,
+        datapath=geom.datapath,
+        requests=req_views,
+    )
+    owners = tuple((aic, aivs) for aic, aivs in geom.datapath.aic_aiv_pairs)
+    plan = build_arch22_v1_lightning(op, planning_ctx, contract, owners, ())
+
+    # Exact per-group QK FLOPs and score Fixpipe bytes: 1*8192 + 2*512 = 9216 (NOT 2*(8192+512) = 17408).
+    expected_q_kv_pairs = 1 * 8192 + 2 * 512
+    assert plan.work.matrix["bf16"] == pytest.approx(2 * expected_q_kv_pairs * heads * dim)
+    assert plan.work.resources["fixpipe"] == pytest.approx(4 * expected_q_kv_pairs * heads)
+
+    # Exact split-list write/read conservation: only the split long_decode group (qr=1) writes/reads split lists.
+    phases = {phase.phase_id: phase for phase in plan.pipeline_spec.phases}
+    store_bytes = sum(item.amount for item in phases["split_list_store"].work if item.resource == "mte3")
+    load_bytes = sum(item.amount for item in phases["split_list_load"].work if item.resource == "mte2_aiv")
+    assert store_bytes > 0 and store_bytes == pytest.approx(load_bytes)
+
+    # Full Engine replay must conserve declared OperatorPlan.work exactly.
+    units = geom.resource_units
+    rates = {r: float(geom.rates.get(r, 1e12)) / 1000.0 for r in units}
+    rates["cube"] = 1.0
+    ctx = RecipeContext(
+        op, {}, {r: r for r in units}, rates, geom.compute_units,
+        resource_units=units, compute_peaks=dict(geom.compute_peaks),
+        pool_names={p: p for p in geom.buffers}, pool_capacities=dict(geom.buffers),
+        pool_units=dict(geom.buffer_units), datapath=geom.datapath,
+    )
+    engine = Engine([Resource(r, rates[r], units=units[r]) for r in units])
+    done = plan.program(ctx).start(engine, "idx_v1", engine.submit("in"))
+    engine.advance(until=(done,))
+    assert {r: v for r, v in engine.serviced.items() if v} == pytest.approx(ctx.bind(plan.work))

@@ -164,6 +164,48 @@ def _phase_amounts(context, phases: Sequence[Phase]) -> list[dict[str, float]]:
     return result
 
 
+def _phase_caps(
+    context,
+    amounts: Sequence[Mapping[str, float]],
+    *,
+    pipelined: bool = False,
+    tile_index: int | None = None,
+    tile_count: int = 1,
+) -> list[dict[str, float]]:
+    """Bind sustainable Stage.caps without inflating declared physical Work."""
+    service_caps = getattr(context, "service_caps", None)
+    if not service_caps:
+        return [{} for _ in amounts]
+    totals: dict[str, float] = {}
+    phase_indices: dict[str, list[int]] = {}
+    for idx, amount in enumerate(amounts):
+        for name, value in amount.items():
+            if value > 0.0 and name in service_caps:
+                totals[name] = totals.get(name, 0.0) + float(value)
+                phase_indices.setdefault(name, []).append(idx)
+    result: list[dict[str, float]] = []
+    for idx, amount in enumerate(amounts):
+        share: dict[str, float] | None = None
+        if pipelined:
+            share = {}
+            for name, value in amount.items():
+                if value <= 0.0 or name not in service_caps:
+                    continue
+                idxs = phase_indices.get(name, ())
+                if len(idxs) <= 1 or totals.get(name, 0.0) <= 0.0:
+                    continue
+                # PipelineProgram serializes same-name stages across tiles.
+                # Tile 0's earliest phase and tile (count-1)'s latest phase run
+                # solo on this resource, while interior tiles overlap at exact C.
+                if tile_index == 0 and idx == idxs[0]:
+                    continue
+                if tile_index is not None and tile_index == tile_count - 1 and idx == idxs[-1]:
+                    continue
+                share[name] = float(value) / totals[name]
+        result.append(context.stage_caps_for(amount, share=share))
+    return result
+
+
 def phased_program(context, phases: Sequence[Phase], *,
                    minimum_ms: float | None = None) -> KernelProgram:
     """Lower named phases with explicit dependencies and conserved work."""
@@ -172,12 +214,13 @@ def phased_program(context, phases: Sequence[Phase], *,
                              minimum_ms=(context.minimum_ms
                                          if minimum_ms is None else minimum_ms))
     amounts = _phase_amounts(context, phases)
+    phase_caps = _phase_caps(context, amounts, pipelined=False)
     stages = []
-    for phase, amount in zip(phases, amounts):
+    for phase, amount, caps in zip(phases, amounts, phase_caps):
         work = {name: value for name, value in amount.items()
                 if value > 0.0}
         stages.append(Stage(phase.name, work, after=phase.after,
-                            keep_empty=True))
+                            caps=caps, keep_empty=True))
     return KernelProgram(tuple(stages),
                          minimum_ms=(context.minimum_ms
                                      if minimum_ms is None else minimum_ms))
@@ -201,20 +244,26 @@ def tiled_phased_program(context, phases: Sequence[Phase], *,
     if count <= 1:
         return phased_program(context, phases)
     amounts = _phase_amounts(context, phases)
+    eff_slots = max(1, int(slots))
+    pipelined = eff_slots > 1
+    head_caps = _phase_caps(context, amounts, pipelined=pipelined, tile_index=0, tile_count=count)
+    mid_caps = _phase_caps(context, amounts, pipelined=pipelined, tile_index=1, tile_count=count)
+    tail_caps = _phase_caps(context, amounts, pipelined=pipelined, tile_index=count - 1, tile_count=count)
 
     def tile(index):
+        tile_caps = head_caps if index == 0 else (tail_caps if index == count - 1 else mid_caps)
         stages = []
-        for phase, amount in zip(phases, amounts):
+        for phase, amount, caps in zip(phases, amounts, tile_caps):
             start = float(index) / count
             end = float(index + 1) / count
             work = {name: value * (end - start)
                     for name, value in amount.items()
                     if value > 0.0}
             stages.append(Stage(phase.name, work, after=phase.after,
-                                keep_empty=True))
+                                caps=caps, keep_empty=True))
         return stages
 
-    pipeline = PipelineProgram(count, max(1, int(slots)), tile,
+    pipeline = PipelineProgram(count, eff_slots, tile,
                                minimum_ms=context.minimum_ms)
     return KernelProgram((Stage("setup", latency=context.setup_ms),
                           Stage("tiles", after=("setup",), program=pipeline)),

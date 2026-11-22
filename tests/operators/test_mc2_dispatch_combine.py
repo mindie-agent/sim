@@ -644,3 +644,76 @@ def test_megamoe_typed_activation_abi_predicate_and_mc2_protocol_floor_work():
     g_ds = target_graphs(raw_ds, phase="decode", tokens=1, context=2048, sequences=16, scope="body")[0]
     ds_megas = [op for op in g_ds if op.recipe == "megamoe_arch35"]
     assert ds_megas and dict(ds_megas[0].metadata)["abi_variant_extension"] is False
+
+
+def test_megamoe_ep_fusion_preserves_topology_dispatch_and_combine_wire_service():
+    from mindie_sim import operator_costs
+    from mindie_sim.compose import compose_case
+    from mindie_sim.prediction.operator_analysis import target_graphs
+    from mindie_sim.prediction.operators.mc2 import megamoe
+
+    raw = compose_case(
+        "deepseek-v3.2", MESH_SKU, dp=1, tp=8, ep=8, layers=4,
+        prompt_tokens=2048, output_tokens=64, feature_track="merged",
+        quant="mxfp8_mxfp4", enable_fused_mc2=2,
+    )
+    raw["runtime"]["metadata"].setdefault("additional_config", {})["enable_mega_moe"] = 1
+    graph = target_graphs(raw, phase="decode", tokens=1, context=2048, sequences=16, scope="body")[0]
+    mega = next(op for op in graph if op.recipe == "megamoe_arch35")
+    meta = dict(mega.metadata)
+    assert meta["group_axis"] == "ep" and meta["comm_group_size"] == 8
+    assert meta["megamoe_geometry"]["dispatch_link_bytes"] > 0.0
+    assert meta["megamoe_geometry"]["combine_link_bytes"] > 0.0
+    assert mega.link_bytes > 0.0
+
+    # Skewed explicit dispatch/combine peer_traffic survives make_op metadata.
+    skewed = megamoe.make_op(
+        op_id="mm_skew", tokens=4, hidden=128, moe_inter=256, top_k=2,
+        routed_rows=8.0, w13_bytes=65536.0, w2_bytes=32768.0, ep=2, compute_dtype="bf16",
+        dispatch_link_bytes=4096.0, combine_link_bytes=8192.0,
+        dispatch_peer_traffic=((0.0, 4096.0), (4096.0, 0.0)),
+        combine_peer_traffic=((0.0, 8192.0), (8192.0, 0.0)),
+    )
+    skew_meta = dict(skewed.metadata)
+    assert skew_meta["dispatch_peer_traffic"] == ((0.0, 4096.0), (4096.0, 0.0))
+    assert skew_meta["combine_peer_traffic"] == ((0.0, 8192.0), (8192.0, 0.0))
+
+    # Execute through the full Topology (which owns 950DT links; die-local "link" rate is absent).
+    report = operator_costs(raw, (replace(mega, deps=()),), input_ready_ms=0)
+    row = report["operators"][0]
+    link_serviced = {k: v for k, v in row["serviced"].items() if k.startswith("link:") and v > 0.0}
+    link_declared = {k: v for k, v in row["declared_service"].items() if k.startswith("link:") and v > 0.0}
+    assert link_serviced and link_declared
+    assert link_serviced == pytest.approx(link_declared, rel=1e-9)
+    assert all(abs(delta) < 1e-6 for delta in row["service_delta"].values())
+
+    # Verify both dispatch_mx and combine_store carry wire work when phase_link_work is bound,
+    # while EP=1 emits zero link work.
+    geo = geometry(MESH_SKU, 8)
+    plan = megamoe.build(mega, geo)
+    assert plan.metadata["dispatch_link_bytes"] > 0.0 and plan.metadata["combine_link_bytes"] > 0.0
+    _, base_ctx = lower_plan(call(DISPATCH, 2, width=ROW, assignment_matrix={(0, 1): 1}), geo)
+    ctx_links = replace(
+        base_ctx,
+        compute_peaks={**dict(base_ctx.compute_peaks), **dict(geo.compute_peaks)},
+        phase_link_work={
+            "dispatch": {"link:ep:0>1": plan.metadata["dispatch_link_bytes"]},
+            "combine": {"link:ep:1>0": plan.metadata["combine_link_bytes"]},
+        },
+    )
+    prog = plan.program(ctx_links)
+    disp_total = sum(
+        s.work.get("link:ep:0>1", 0.0) for core_p in prog.programs for s in core_p.stages if s.name == "dispatch_mx"
+    )
+    comb_total = sum(
+        s.work.get("link:ep:1>0", 0.0) for core_p in prog.programs for s in core_p.stages if s.name == "combine_store"
+    )
+    assert disp_total == pytest.approx(plan.metadata["dispatch_link_bytes"])
+    assert comb_total == pytest.approx(plan.metadata["combine_link_bytes"])
+
+    ep1 = megamoe.make_op(
+        op_id="mm_ep1", tokens=4, hidden=128, moe_inter=256, top_k=2,
+        routed_rows=8.0, w13_bytes=65536.0, w2_bytes=32768.0, ep=1, compute_dtype="bf16",
+    )
+    plan_ep1 = megamoe.build(ep1, geo)
+    assert plan_ep1.work.resources.get("link", 0.0) == 0.0

@@ -529,3 +529,88 @@ def test_splitk_executes_each_flop_once_and_charges_partial_traffic():
     assert traffic["merge_vector_ops"] == pytest.approx((8 - 1) * 32 * 32)
     assert traffic["merge_latency_ms"] == 0.0
     assert record["split_k_tasks"] == geometry.tiles * 8
+
+
+def test_staged_gqa_prefill_emits_arch_specific_fixpipe_handoffs():
+    from mindie_sim.prediction.operators.attention.attention_prefill import StagedGQAPrefill
+    from mindie_sim.schema.operators import OpSpec
+
+    def _run(geom, op_spec, recipe):
+        plan = recipe.build(op_spec, geom)
+        units = dict(geom.resource_units)
+        rates = {r: float(geom.rates.get(r, 1e12)) / 1000.0 for r in units}
+        rates["cube"] = 1.0
+        ctx = RecipeContext(
+            op_spec, {}, {r: r for r in units}, rates, geom.compute_units,
+            resource_units=units, compute_peaks=dict(geom.compute_peaks),
+            pool_names={p: p for p in geom.buffers}, pool_capacities=dict(geom.buffers),
+            pool_units=dict(geom.buffer_units),
+            physical_mechanisms=geom.physical_mechanisms, datapath=geom.datapath,
+        )
+        eng = Engine(
+            [Resource(r, rates[r], units=units[r]) for r in units],
+            pools=dict(geom.buffers), pool_units=dict(geom.buffer_units), trace_limit=4096,
+        )
+        done = plan.program(ctx).start(eng, "gqa_pre", eng.submit("in"))
+        eng.advance(until=(done,))
+        assert {r: v for r, v in eng.serviced.items() if v} == pytest.approx(ctx.bind(plan.work))
+        assert all(v == 0 for v in eng.allocated.values())
+        return plan, eng
+
+    op = OpSpec(
+        "prefill_gqa", "attention", "prefill", 0, 0, (),
+        (128, 4, 128), (128, 4, 128), (128, 4, 128), (128, 4, 128),
+        dtype="bf16", recipe="flash_attention",
+        metadata=((
+            "gqa_prefill",
+            {
+                "requests": ((128, 128),),
+                "query_heads": 4, "kv_heads": 2, "head_dim": 128,
+                "query_dtype": "bf16", "kv_dtype": "bf16", "causal": True,
+            },
+        ),),
+    )
+    recipe = StagedGQAPrefill(query_tile=128, key_tile=128)
+    # 4 query heads * 2 key tiles of 128 rows * (128*128 scores + 128*128 pv) * 4B FP32.
+    expected_fixpipe = 4 * 2 * (128 * 128 + 128 * 128) * 4
+
+    # Arch35 (950DT): L0C->UB Fixpipe only.
+    geom_a5 = Geometry.from_devices(sku_case(REPRESENTATIVE_SKUS["a5"]).machine.dies)
+    plan_a5, eng_a5 = _run(geom_a5, op, recipe)
+    tasks_a5 = {row["task"].rsplit(":", 1)[-1] for row in eng_a5.trace}
+    assert {"score_handoff", "pv_handoff"} <= tasks_a5
+    assert "score_read" not in tasks_a5 and "pv_read" not in tasks_a5
+    assert plan_a5.work.resources["fixpipe"] == pytest.approx(expected_fixpipe)
+    assert plan_a5.work.resources.get("l2", 0.0) == 0.0
+
+    # Arch22 L2-resident (no die l2 rate -> zero extra HBM; explicit l2 rate -> exact 2x L2 traffic).
+    geom_a3 = Geometry.from_devices(sku_case(REPRESENTATIVE_SKUS["a3"]).machine.dies)
+    plan_a3, eng_a3 = _run(geom_a3, op, recipe)
+    tasks_a3 = {row["task"].rsplit(":", 1)[-1] for row in eng_a3.trace}
+    assert {"score_handoff", "score_read", "pv_handoff", "pv_read"} <= tasks_a3
+    assert plan_a3.work.resources["fixpipe"] == pytest.approx(expected_fixpipe)
+    assert plan_a3.work.resources["mte2_aiv"] == pytest.approx(expected_fixpipe)
+    assert plan_a3.work.resources["hbm"] == pytest.approx(plan_a5.work.resources["hbm"])
+
+    geom_a3_l2 = replace(
+        geom_a3,
+        rates={**dict(geom_a3.rates), "l2": 2e12},
+        resource_units={**dict(geom_a3.resource_units), "l2": 1},
+    )
+    plan_a3_l2, _ = _run(geom_a3_l2, op, recipe)
+    assert plan_a3_l2.work.resources["l2"] == pytest.approx(2.0 * expected_fixpipe)
+    assert plan_a3_l2.work.resources["hbm"] == pytest.approx(plan_a5.work.resources["hbm"])
+
+    # Native FIA with explicit reconstruct=True (IssueCursor path) also conserves Fixpipe work.
+    op_cursor = replace(
+        op,
+        metadata=(
+            *op.metadata,
+            ("native_operator", "FusedInferAttentionScore"),
+            ("reconstruct", True),
+        ),
+    )
+    plan_cur, eng_cur = _run(geom_a5, op_cursor, recipe)
+    tasks_cur = {row["task"].rsplit(":", 1)[-1] for row in eng_cur.trace}
+    assert {"score_handoff", "pv_handoff"} <= tasks_cur
+    assert plan_cur.work.resources["fixpipe"] > 0.0

@@ -598,3 +598,25 @@ def test_paged_pipeline_matches_literal_timing(monkeypatch, context, splits, cop
         assert fast_copy == pytest.approx(literal_copy, rel=1e-12)
     else:
         assert fast.advance_steps < 500 < literal.advance_steps
+
+
+def test_arch22_paged_mla_l0a_reloads_scale_with_key_tile_and_dv():
+    geometry = _governed_geom(GM_SKU)
+    elem = 2
+    for keys, dv in ((128, 512), (256, 512), (512, 512), (128, 256)):
+        heads = 16
+        contract = governed.PagedMlaContract(
+            ((1, keys),), heads, heads, abi=FIA_ABI,
+            latent_dim=dv, rope_dim=ROPE, s2_base_size=512, splits=1,
+        )
+        op = governed.make_op(contract)
+        plan = governed.build(op, geometry)
+        phases = {phase.phase_id: phase for phase in plan.pipeline_spec.phases}
+        qk_mte1 = sum(item.amount for item in phases["qk_operands"].work if item.resource == "mte1")
+        pv_mte1 = sum(item.amount for item in phases["pv_operands"].work if item.resource == "mte1")
+        dqk = dv + ROPE
+        q_reloads = ceil(keys / 128)
+        p_reloads = ceil(dv / 128)
+        assert qk_mte1 == pytest.approx(heads * q_reloads * dqk * elem + keys * dqk * elem)
+        assert pv_mte1 == pytest.approx(heads * keys * elem * p_reloads + keys * dv * elem)
+        _execute(op, plan, geometry)

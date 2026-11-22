@@ -318,7 +318,7 @@ def _calibrated_hbm_rate_ms(context, geometry, recipe, *, width, hbm_declared):
     """Effective HBM read rate in bytes/ms from calibrated P01/P05 surfaces."""
     if getattr(context, "primitive_table", None) is None:
         return hbm_declared
-    _, n, _ = geometry.local_shape
+    _, n, k = geometry.local_shape
     active = max(1, min(int(context.core_count), int(geometry.tiles)))
     row_bytes = int(min(recipe.tile_n, n) * width)
     stride_bytes = int(n * width)
@@ -328,7 +328,7 @@ def _calibrated_hbm_rate_ms(context, geometry, recipe, *, width, hbm_declared):
         context, active_cores=active, row_bytes=row_bytes,
         stride_bytes=stride_bytes, total_tiles=geometry.tiles,
         is_grouped=is_grouped, is_full_row_coalesced=coalesced,
-        m_tiles=int(geometry.nm),
+        m_tiles=int(geometry.nm), panel_rows=max(1, int(k)),
     )
     if cold_bps is None or cold_bps <= 0.0:
         return hbm_declared
@@ -371,7 +371,7 @@ def _arch35_streamk_perf(context, recipe, geometry, *, split_k: int, output_tile
     hbm_full = _declared_rate(context, names["hbm"])
     meta = dict(context.op.metadata)
     width = dtype_bytes(meta.get("compute_format", context.op.dtype or "bf16"))
-    total_m, n, _ = geometry.local_shape
+    total_m, n, k = geometry.local_shape
     row_bytes = int(min(recipe.tile_n, n) * width)
     stride_bytes = int(n * width)
     strided_bps = primitive_cold_hbm_bps(
@@ -379,7 +379,7 @@ def _arch35_streamk_perf(context, recipe, geometry, *, split_k: int, output_tile
         row_bytes=row_bytes,
         stride_bytes=stride_bytes,
         total_tiles=max(1, int(output_tiles)), is_grouped=False,
-        m_tiles=int(geometry.nm),
+        m_tiles=int(geometry.nm), panel_rows=max(1, int(k)),
     )
     if strided_bps:
         b_hbm_full = min(hbm_full, strided_bps / MS_PER_SECOND)
@@ -442,7 +442,7 @@ def _split_k_bound(context, recipe, geometry, *, bound, split_k, output_tiles):
     names = context.resource_names
     hbm_r = _declared_rate(context, names["hbm"])
     vec_r = _declared_rate(context, names["vector"]) if "vector" in names else 0.0
-    total_m, n, _ = geometry.local_shape
+    total_m, n, k = geometry.local_shape
     partial_bytes = float(2 * FP32_BYTES * split_k * total_m * n)
     merge_ops = float((split_k - 1) * total_m * n)
     meta = dict(context.op.metadata)
@@ -456,7 +456,7 @@ def _split_k_bound(context, recipe, geometry, *, bound, split_k, output_tiles):
         row_bytes=int(min(recipe.tile_n, n) * width),
         stride_bytes=int(n * width),
         total_tiles=used_cores, is_grouped=False,
-        m_tiles=int(geometry.nm),
+        m_tiles=int(geometry.nm), panel_rows=max(1, int(k)),
     )
     eff_hbm_r = min(hbm_r, cold_bps / MS_PER_SECOND) if cold_bps else hbm_r
     hbm_ms = hbm_reads / eff_hbm_r + context.op.mte3_bytes / hbm_r

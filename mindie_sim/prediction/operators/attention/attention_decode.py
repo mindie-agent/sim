@@ -12,13 +12,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Callable, Mapping
+from typing import Any, Callable, Mapping
 
 from mindie_sim.prediction.mechanism import (
     Geometry, OperatorPlan, PlannedRecipe, Work,
 )
 from mindie_sim.prediction.ownership import read_role
-from .attention_kv_access import KVCacheAccess, kv_access, paged_fia_plan
+from .attention_kv_access import (
+    FixpipeHandoffPolicy, KVCacheAccess, gqa_fixpipe_policy, kv_access, paged_fia_plan,
+)
 from mindie_sim.prediction.program import (
     KernelProgram, PipelineProgram, RecipeContext, Stage,
 )
@@ -30,6 +32,7 @@ from .attention_pipeline import (
     DECODE_SOFTMAX_OPS_PER_PAIR, _allocation, _allocations,
     _compile_decode_peer_group, _partial_row_bytes, _placement,
     _producer_program, _read_role, _rows_per_token, _write_role,
+    decode_handoff_workspace_bytes,
 )
 
 IMPLEMENTATION = "staged_gqa_decode"
@@ -274,10 +277,12 @@ def _output_row_tiles(output: _Output, context: int, group: int,
 
 def _total_work(spec: _Spec, *, include_mte1: bool, read: str = "mte2",
                 vread: str | None = None, write: str | None = "mte3",
-                operand: str | None = "mte1") -> Work:
+                operand: str | None = "mte1",
+                handoff: FixpipeHandoffPolicy | None = None) -> Work:
     cache = spec.kv_cache
     vread = vread or read
     producer_reads = vector_reads = writes = mte3_extra = vector = mte1 = 0
+    handoff_bytes = 0
     flops = 0
     for output in spec.outputs:
         _query, context = spec.requests[output.request]
@@ -320,6 +325,7 @@ def _total_work(spec: _Spec, *, include_mte1: bool, read: str = "mte2",
             mte1 += (output.horizon * cache.value_operand_row
                      if cache.value_needs_conversion else value_payload)
         flops += 2 * pairs * (spec.head_dim + spec.head_dim)
+        handoff_bytes += (pairs + row_tiles * spec.head_dim) * FP32_BYTES
         vector += (2 + DECODE_SOFTMAX_OPS_PER_PAIR) * pairs + (
             DECODE_OUTPUT_UPDATE_OPS_PER_VALUE * spec.head_dim + DECODE_ONLINE_STATE_OPS + 1
         ) * row_tiles
@@ -344,7 +350,27 @@ def _total_work(spec: _Spec, *, include_mte1: bool, read: str = "mte2",
         resources[write] = (resources.get(write, 0) + writes + mte3_extra)
     if include_mte1 and operand:
         resources[operand] = mte1
+    if handoff is not None and handoff.enabled and handoff_bytes > 0:
+        resources["fixpipe"] = resources.get("fixpipe", 0) + handoff_bytes
+        if handoff.via_gm:
+            if vread:
+                resources[vread] = resources.get(vread, 0) + handoff_bytes
+            if handoff.mem_tier:
+                resources[handoff.mem_tier] = resources.get(handoff.mem_tier, 0) + 2 * handoff_bytes
     return Work(matrix={spec.query_dtype: flops}, resources=resources)
+
+
+@dataclass(frozen=True)
+class _StreamBinding:
+    owners: Any
+    datapath: Any
+    kwargs: Mapping[str, Any]
+
+    def bind(self, program):
+        from mindie_sim.prediction.streams import apply_stream_owners_to_program
+        return apply_stream_owners_to_program(
+            program, self.owners, self.datapath, **self.kwargs,
+        )
 
 
 @dataclass(frozen=True)
@@ -356,6 +382,7 @@ class _MergeStream:
     tasks: tuple[tuple[int, _Output], ...]
     barriers: Mapping[int, object]
     core: int = 0
+    stream_binding: _StreamBinding | None = None
 
     def start(self, engine, name, ready, *, owner=""):
         if not self.tasks:
@@ -378,6 +405,8 @@ class _MergeStream:
             def launch(_):
                 program = _merge_program(self.context, self.spec, output,
                                          self.core)
+                if self.stream_binding is not None:
+                    program = self.stream_binding.bind(program)
                 end = program.start(engine, f"{name}:merge{index}::task",
                                     gate, owner=owner)
                 engine.submit(
@@ -419,7 +448,7 @@ def _merge_program(context: RecipeContext, spec: _Spec,
         Stage("merge_store", context.bind(Work(resources={
             "hbm": out_bytes, **({write: out_bytes} if write else {}),
         })), after=("normalize",), free=buffers,
-              placement=_placement(context, core, write, "vector")),
+              placement=_placement(context, core, *(([write] if write else ())))),
     ))
 
 
@@ -458,7 +487,8 @@ class StagedGQADecode:
 
     def work(self, op: OpSpec, *, include_mte1: bool = False,
              read: str = "mte2", vread: str | None = None,
-             write: str | None = "mte3", operand: str | None = "mte1") -> Work:
+             write: str | None = "mte3", operand: str | None = "mte1",
+             handoff: FixpipeHandoffPolicy | None = None) -> Work:
         """Physical work of the lowered mechanism, independent of service rates.
 
         ``read``/``vread`` are the actual producer and vector read pipes.  The
@@ -466,7 +496,8 @@ class StagedGQADecode:
         bound geometry supplies the split AIC/AIV pipe names.
         """
         return _total_work(self.spec(op), include_mte1=include_mte1,
-                           read=read, vread=vread, write=write, operand=operand)
+                           read=read, vread=vread, write=write, operand=operand,
+                           handoff=handoff)
 
     def kv_access(self, op: OpSpec) -> KVCacheAccess:
         """Declared KV storage/page/scale access for this operator geometry."""
@@ -548,12 +579,16 @@ class StagedGQADecode:
         if geometry is None:
             read, vread, write, operand = "mte2", "mte2", "mte3", "mte1"
             mte1 = False
+            handoff = FixpipeHandoffPolicy()
         else:
             read = read_role(geometry.resource_units)
             vread = read_role(geometry.resource_units, aiv=0)
             write = "mte3" if "mte3" in geometry.resource_units else None
             operand = "mte1" if "mte1" in geometry.resource_units else None
             mte1 = operand is not None
+            handoff = gqa_fixpipe_policy(
+                geometry, decode_handoff_workspace_bytes(spec, geometry.compute_units),
+            )
             if spec.kv_cache.needs_conversion and operand is None:
                 raise ModelingError(
                     "attention_decode_conversion_requires_mte1_operand_copy")
@@ -566,7 +601,7 @@ class StagedGQADecode:
             metadata["native_paged_fia"] = native
         return OperatorPlan(
             self.work(op, include_mte1=mte1, read=read, vread=vread,
-                      write=write, operand=operand),
+                      write=write, operand=operand, handoff=handoff),
             lambda context: _GQADecodeProgram(context, self, spec),
             metadata=metadata,
         )
@@ -600,6 +635,7 @@ class _ProducerTaskProgram:
     signal: Callable[[], None] | None = None
     peer_counts: tuple[int, ...] | None = None
     compiled: KernelProgram | None = None
+    stream_binding: _StreamBinding | None = None
 
     def start(self, engine, name, ready, *, owner=""):
         program = (
@@ -609,6 +645,8 @@ class _ProducerTaskProgram:
                 peer_counts=self.peer_counts,
             )
         )
+        if self.stream_binding is not None:
+            program = self.stream_binding.bind(program)
         end = program.start(engine, name, ready, owner=owner)
         if self.signal is None:
             return end
@@ -623,6 +661,46 @@ class _GQADecodeProgram:
     context: RecipeContext
     recipe: StagedGQADecode
     spec: _Spec
+    stream_binding: _StreamBinding | None = None
+
+    def bind_stream_owners(self, owners, datapath, **kwargs):
+        return replace(self, stream_binding=_StreamBinding(owners, datapath, dict(kwargs)))
+
+    def _resolve_stream(self, tasks):
+        binding = self.stream_binding
+        if binding is None and self.context.stream_owners is not None and self.context.datapath is not None:
+            from mindie_sim.prediction.streams import MAIN_STREAM
+            binding = _StreamBinding(
+                self.context.stream_owners,
+                self.context.datapath,
+                {
+                    "resource_names": self.context.resource_names,
+                    "resource_units": self.context.resource_units,
+                    "rates": self.context.rates,
+                    "stream_id": getattr(self.context.op, "stream", None) or MAIN_STREAM,
+                    "quota_resources": None,
+                    "pool_names": self.context.pool_names,
+                    "pool_units": self.context.pool_units,
+                },
+            )
+        owners = binding.owners if binding is not None else self.context.stream_owners
+        base_context = (
+            replace(self.context, stream_owners=None)
+            if binding is not None and self.context.stream_owners is not None
+            else self.context
+        )
+        if owners is None:
+            return binding, None, base_context, self.context.core_count
+        stream_id = (
+            binding.kwargs.get("stream_id", "main")
+            if binding is not None else (getattr(self.context.op, "stream", None) or "main")
+        )
+        if tasks and int(owners.aic_limit) <= 0:
+            raise ModelingError(f"stream_zero_aic_budget:{stream_id}:gqa_decode")
+        if tasks and int(owners.aiv_limit) <= 0:
+            raise ModelingError(f"stream_zero_aiv_budget:{stream_id}:gqa_decode")
+        cores = max(1, min(self.context.core_count, int(owners.aic_limit)))
+        return binding, owners, base_context, cores
 
     def start(self, engine, name, ready, *, owner=""):
         outputs = self.spec.outputs
@@ -643,16 +721,21 @@ class _GQADecodeProgram:
             for output_index, output in enumerate(outputs)
             for contribution in output.contributions
         )
-        cores = self.context.core_count
+        binding, owners, base_context, cores = self._resolve_stream(tasks)
         streams = [[] for _ in range(cores)]
         for index, (output_index, contribution) in enumerate(tasks):
-            core = index % cores if contribution.owner is None else contribution.owner
-            if core >= cores:
-                raise ModelingError("attention_decode_mapping_exceeds_hardware_cores")
+            if contribution.owner is None:
+                core = index % cores
+            elif owners is not None:
+                core = contribution.owner % cores
+            else:
+                core = contribution.owner
+                if core >= cores:
+                    raise ModelingError("attention_decode_mapping_exceeds_hardware_cores")
             streams[core].append((output_index, contribution))
         peer_counts = tuple(c.tile_count for s in streams for _, c in s if c.tile_count > 0)
         compiled_group = _compile_decode_peer_group(
-            self.context, self.recipe, self.spec, streams,
+            base_context, self.recipe, self.spec, streams,
             compactor=compact_periodic_pipeline,
         )
         producer_events = []
@@ -666,9 +749,10 @@ class _GQADecodeProgram:
                 callback = ((lambda index=output_index: signal(index))
                             if output_index in barriers else None)
                 return (Stage("task", program=_ProducerTaskProgram(
-                    self.context, self.recipe, self.spec,
+                    base_context, self.recipe, self.spec,
                     outputs[output_index], contribution, core, callback,
                     peer_counts=peer_counts, compiled=compiled_group.get((core, index)),
+                    stream_binding=binding,
                 )),)
 
             producer_events.append(PipelineProgram(count, 1, tile).start(
@@ -691,8 +775,9 @@ class _GQADecodeProgram:
         )
         for core in range(min(len(merges), cores)):
             stream = _MergeStream(
-                self.context, self.spec,
+                base_context, self.spec,
                 merges[core::cores], barriers, core,
+                stream_binding=binding,
             )
             merge_events.append(stream.start(
                 engine, f"{name}:owner{core}:merge", merge_ready,

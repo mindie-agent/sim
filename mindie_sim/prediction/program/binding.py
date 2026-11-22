@@ -161,6 +161,29 @@ class RecipeContext:
     requests: tuple[Any, ...] = ()
     padded_tokens: int = 0
     layout: str = ""
+    service_caps: Mapping[str, float] = field(default_factory=dict)
+    phase_link_work: Mapping[str, Mapping[str, float]] = field(default_factory=dict)
+
+    def stage_caps_for(
+        self,
+        demand: Mapping[str, float],
+        *,
+        share: Mapping[str, float] | None = None,
+    ) -> dict[str, float]:
+        """Return declared sustainable rate ceilings for active physical resources."""
+        if not self.service_caps or not demand:
+            return {}
+        caps: dict[str, float] = {}
+        for name, ceiling in self.service_caps.items():
+            if float(demand.get(name, 0.0)) <= 0.0:
+                continue
+            rate = float(ceiling)
+            if rate <= 0.0:
+                continue
+            factor = float(share[name]) if (share is not None and name in share) else 1.0
+            if factor > 0.0:
+                caps[name] = rate * factor
+        return caps
 
     def wave_count(self, tiles: int, *, kind: str = "aic") -> int:
         """Return ``ceil(tiles / active_cores)`` under this stream's core budget."""

@@ -518,6 +518,13 @@ def _try_lower_megamoe(
     ):
         return None
 
+    dispatch_meta = dict(dispatch.metadata)
+    combine_meta = dict(combine.metadata)
+    group_axis = str(dispatch_meta.get("group_axis") or combine_meta.get("group_axis") or "ep")
+    collective_family = str(dispatch_meta.get("collective") or dispatch.family or "alltoall")
+    source_stage = dispatch_meta.get("source_stage", combine_meta.get("source_stage"))
+    peer_volume_basis = dispatch_meta.get("peer_volume_basis")
+
     mega_op = mc2_megamoe.make_op(
         op_id=target_id, deps=tuple(mega_deps),
         stage=unpack.stage, layer=unpack.layer,
@@ -531,6 +538,12 @@ def _try_lower_megamoe(
         compute_dtype="fp8_e4m3", output_dtype=dtype,
         dispatch_link_bytes=float(dispatch.link_bytes),
         combine_link_bytes=float(combine.link_bytes),
+        group_axis=group_axis,
+        collective=collective_family,
+        dispatch_peer_traffic=dispatch_meta.get("peer_traffic"),
+        combine_peer_traffic=combine_meta.get("peer_traffic"),
+        source_stage=int(source_stage) if source_stage is not None else None,
+        peer_volume_basis=str(peer_volume_basis) if peer_volume_basis is not None else None,
         shared_inter=sh_inter, shared_w13_bytes=sh_w13,
         shared_w2_bytes=sh_w2,
         allow_abi_extension=allow_ext,

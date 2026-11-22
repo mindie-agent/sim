@@ -33,7 +33,7 @@ from ..sharedkv.l0_sync import (
 from ..sharedkv.split_core import p01_cold_mte2_aic_cap
 from .common import (
     ACLNN_MQS_DATA_BYTES, ACLNN_MQS_INLINE_ROW_BYTES, ACLNN_MQS_SCALE_BYTES, ACLNN_MQS_SEPARATE_SCALE_MODE,
-    ARCH22_MLA_L0A_RELOAD_PANELS, DSL_MQS_ABI, FAMILY, FIA_ABI, FP32_BYTES, INDEX_BYTES,
+    DSL_MQS_ABI, FAMILY, FIA_ABI, FP32_BYTES, INDEX_BYTES,
     MQS_ABI, MQS_COMPRESSED_ROW_BYTES, MQS_ORIGINAL_ROW_BYTES,
     MQS_PAGED_LAYOUT, NZ_BLOCK_BYTES, PagedMlaContract, _query_row, align_bytes, capability_gap,
     ceil_div, latent_record_bytes, mla_step_crosscore_ms,
@@ -368,7 +368,7 @@ class _PagedMlaProgramBuilder:
             pipe, alignment = layout.probability_output
             d.add(pipe, align_bytes(keys * qk_width, alignment))
         elif step == "qk_operands":
-            q_mult = ARCH22_MLA_L0A_RELOAD_PANELS if layout.gm_workspace else 1
+            q_mult = (ceil_div(keys, ARCH22_MLA_NL1_SPLIT) if keys > 0 else 0) if layout.gm_workspace else 1
             d.add("mte1", heads * q_mult * qk_width + keys * qk_width * l0b_factor)
         elif step == "qk":
             d.flops = 2 * heads * keys * c.dqk
@@ -399,7 +399,7 @@ class _PagedMlaProgramBuilder:
                 _read_kv(d, c, seq, query, start, keys, qk_width, v_width, value=True, base_token=kv_base,
                          l2_hit_fraction=v_hit)
         elif step == "pv_operands":
-            p_mult = ARCH22_MLA_L0A_RELOAD_PANELS if layout.gm_workspace else 1
+            p_mult = (ceil_div(c.dv, ARCH22_MLA_NL1_SPLIT) if c.dv > 0 else 0) if layout.gm_workspace else 1
             d.add("mte1", probs * p_mult + keys * v_width * l0b_factor)
         elif step in {"pv", "pv0", "pv1"}:
             columns = layout.pv_panel_width if step != "pv" else c.dv

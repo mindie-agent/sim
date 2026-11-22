@@ -314,9 +314,11 @@ class IssueCursor:
         self.n = len(self.tiles)
 
     def start(self, engine, name, ready, *, owner=""):
-        from mindie_sim.prediction.operators.attention.attention_prefill import (
+        from .attention_kv_access import gqa_fixpipe_policy
+        from .attention_prefill import (
             _allocation, _operand_role, _placement, _read_role, _write_role,
         )
+        from .attention_prefill_geometry import prefill_handoff_workspace_bytes
 
         self.engine = engine
         self.name = name
@@ -328,6 +330,9 @@ class IssueCursor:
         self._vread = _read_role(self.context, vector=True)
         self._write = _write_role(self.context)
         self._operand = _operand_role(self.context)
+        self._handoff = gqa_fixpipe_policy(
+            self.context, prefill_handoff_workspace_bytes(self.spec, self.context.core_count),
+        )
         self.page_scale = {}
         self.events = {}
         self.next_step = 0
@@ -526,8 +531,8 @@ class IssueCursor:
             free.extend(self.q_hold.get(seg_i, ()))
         l0c_slot = tile % self.l0c["count"]
         score_buf = self._bufs(("l0c", f"s{l0c_slot}", rows * valid * _FP32))
-        # IterateBmm1 fixpipe releases L0C before the call returns.
-        free.extend(score_buf)
+        if not self._handoff.enabled:
+            free.extend(score_buf)
         qk = self._post(
             f"t{tile}:qk", step, tile, "qk",
             {"mte1": q_bytes} if self._operand else {},
@@ -538,8 +543,12 @@ class IssueCursor:
         self.k_free[k_slot] = qk
         if tile == seg["last"]:
             self.q_free[self.q_slot_of[seg_i]] = qk
-        self.events.setdefault(tile, {})["qk"] = qk
+        score_ready, handoff_events = self._post_handoff(
+            "score", step, tile, qk, rect * _FP32, score_buf,
+        )
+        self.events.setdefault(tile, {})["qk"] = score_ready
         posted.append(qk)
+        posted.extend(handoff_events)
         return posted
 
     def _vec1(self, step: int, tile: int):
@@ -640,19 +649,23 @@ class IssueCursor:
             roles=(self._operand,))
         l0c_slot = tile % self.l0c["count"]
         pv_buf = self._bufs(("l0c", f"c{l0c_slot}", rows * dim * _FP32))
+        pv_free = (
+            tuple(v_acquire) + tuple(self.events[tile].get("p", ()))
+            + (() if self._handoff.enabled else tuple(pv_buf))
+        )
         pv = self._post(
             f"t{tile}:pv", step, tile, "pv", {},
             matrix={self.spec.query_dtype: 2 * dim * rect},
             after=(v_ready, p_op, self.last_cube),
-            acquire=pv_buf,
-            free=tuple(v_acquire) + tuple(pv_buf)
-            + tuple(self.events[tile].get("p", ())),
-            roles=("cube",))
+            acquire=pv_buf, free=pv_free, roles=("cube",))
         self.last_cube = pv
         self.v_free[v_slot] = pv
-        self.events[tile]["pv"] = pv
+        pv_ready, handoff_events = self._post_handoff(
+            "pv", step, tile, pv, rows * dim * _FP32, pv_buf,
+        )
+        self.events[tile]["pv"] = pv_ready
         self.events[tile]["pv_buf"] = pv_buf
-        return [v_ready, p_op, pv]
+        return [v_ready, p_op, pv, *handoff_events]
 
     def _vec2(self, step: int, tile: int):
         found = self._tile(tile)
@@ -694,6 +707,26 @@ class IssueCursor:
             f"t{tile}:store", step, tile, "store", resources,
             after=(self.events[tile]["vec2"],), free=free,
             roles=(self._write, "vector"))
+
+    def _post_handoff(self, prefix: str, step: int, tile: int, producer, nbytes: int, release):
+        if not self._handoff.enabled:
+            return producer, []
+        posted = []
+        handoff = self._post(
+            f"t{tile}:{prefix}_handoff", step, tile, f"{prefix}_handoff",
+            self._handoff.handoff_resources(nbytes),
+            after=(producer,), free=tuple(release), roles=("fixpipe",),
+        )
+        posted.append(handoff)
+        if not self._handoff.via_gm:
+            return handoff, posted
+        read_ev = self._post(
+            f"t{tile}:{prefix}_read", step, tile, f"{prefix}_read",
+            self._handoff.read_resources(nbytes, self._vread),
+            after=(handoff,), roles=(self._vread,),
+        )
+        posted.append(read_ev)
+        return read_ev, posted
 
     def _bufs(self, *items):
         out = []
