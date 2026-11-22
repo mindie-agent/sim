@@ -783,7 +783,7 @@ def build_op_action_guidance(
             "[框架改造] vllm_ascend/ops/gdn.py & models/kimi_k3/kda.py 移除 core_output_copy / z_norm_materialize 拷贝并注册 CustomOp 到 ACLGraph",
             "[算子新写 + 框架 Pass 接线]",
         )
-    if fam == "mhc" or "qwen4exp" in kern_l or ".hc_" in f".{suf}":
+    if fam == "mhc" or ".hc_" in f".{suf}":
         return (
             "开启 --compilation-config '{\"cudagraph_mode\": \"FULL_DECODE_ONLY\"}'; 无现成 CANN mHC 开关，需新融合算子",
             "[需新写算子] AscendC/Triton 融合 FusedMHCPreNormProj + FusedMHCSinkhornPost，将 [B,4*D] 驻留 UB/L1 消除 5 次 HBM 往返（目标 >=78% L*）",

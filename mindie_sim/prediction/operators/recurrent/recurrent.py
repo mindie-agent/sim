@@ -21,7 +21,7 @@ from mindie_sim.prediction.structure_groups import declare_group, source_referen
 from mindie_sim.prediction.implementations import select
 from mindie_sim.prediction.projections import kda_projections, require_packed_slice
 from .recover_ssm_work import emit_commit_op, record_head_bytes, recover_ssm_enabled
-from mindie_sim.prediction.operators.context_parallel.graph import (
+from mindie_sim.prediction.sharding.context_parallel import (
     emit_pcp_hidden_gather_restore,
     emit_pcp_restore_unpermute,
 )
@@ -1075,7 +1075,7 @@ def _apply_kda_pcp_entry(b, *, deps, views, tokens, hidden, parallel, model, run
     restores/zero-masks padding, and scatters unconditionally across both prefill
     and decode when ``pcp > 1``.
     """
-    from mindie_sim.prediction.operators.context_parallel.graph import pcp_uniform_peer_rows
+    from mindie_sim.prediction.sharding.context_parallel import pcp_uniform_peer_rows
     pcp = int(parallel.pcp)
     has_prefill = any(v.phase == "prefill" for v in views)
     uses_pcp_row_parallel = bool(b.plan.kda_batch_chunk_norm)

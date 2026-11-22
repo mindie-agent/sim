@@ -748,6 +748,124 @@ def _check_ag011_operator_reachability(
     return violations
 
 
+_AG013_MODEL_BRANCH_ROOTS = frozenset({
+    "structure", "solve", "sweep", "rewrite", "optimization", "export",
+})
+_AG013_SUFFIX_BAN_ROOTS = frozenset({
+    "structure", "solve", "sweep", "rewrite", "optimization",
+})
+_AG013_MODEL_EXEMPT = frozenset({
+    # CLI launch-script string adapter mapping --served-model-name -> catalog ID.
+    "mindie_sim/export/script_audit.py",
+})
+_AG013_MODEL_TOKEN_RE = re.compile(
+    r"(?:^|[^a-z0-9])(?:"
+    r"kimi(?:[-_]?k\d+(?:\.\d+)?)?|k3\.1|qwen\w*|deepseek\w*|glm[-_]?\d\w*|minimax\w*"
+    r"|llama(?:[-_]?\d\w*)?|gemma[-_]?\d\w*|step[-_]?5\w*"
+    r")(?:[^a-z0-9]|$)",
+    re.IGNORECASE,
+)
+_AG013_EXACT_MODEL_LOWER = frozenset({"k3", "glm", "gemma"})
+_AG013_BANNED_SUFFIX_TABLES = frozenset({
+    "_KNOWN_FUSION_SOURCES",
+    "_GDN_PROLOGUE_SUFFIXES",
+    "_KDA_PROLOGUE_SUFFIXES",
+})
+_AG013_SUBMODULE_SUFFIX_RE = re.compile(r"^(?:gdn|kda)$", re.IGNORECASE)
+
+
+def _is_ag013_model_literal(value: str) -> bool:
+    return bool(_AG013_MODEL_TOKEN_RE.search(value)) or value.strip() in _AG013_EXACT_MODEL_LOWER
+
+
+def _ag013_test_exprs(tree: ast.Module):
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.If, ast.IfExp)):
+            yield node.test
+
+
+def _check_ag013_anti_hardcoding(rel: PurePosixPath, tree: ast.Module) -> list[Violation]:
+    """Forbid model-name branches and static op-suffix tables in general solver/rewrite/export layers (AG013)."""
+    if len(rel.parts) < 2 or rel.parts[0] != "mindie_sim":
+        return []
+    top = rel.parts[1][:-3] if rel.parts[1].endswith(".py") else rel.parts[1]
+    if top not in _AG013_MODEL_BRANCH_ROOTS:
+        return []
+    pos = rel.as_posix()
+    violations: list[Violation] = []
+    seen: set[tuple[int, str]] = set()
+
+    if pos not in _AG013_MODEL_EXEMPT:
+        for test in _ag013_test_exprs(tree):
+            for sub in ast.walk(test):
+                if isinstance(sub, ast.Compare):
+                    for node in (sub.left, *sub.comparators):
+                        if (
+                            isinstance(node, ast.Constant)
+                            and isinstance(node.value, str)
+                            and _is_ag013_model_literal(node.value)
+                        ):
+                            key = (getattr(sub, "lineno", 1), node.value.lower())
+                            if key not in seen:
+                                seen.add(key)
+                                violations.append(Violation(
+                                    "AG013", rel, key[0],
+                                    f"AG013:model_branch:{pos}:{key[1]}",
+                                    f"hardcoded model-family branch literal {node.value!r} is forbidden in general {top} logic",
+                                ))
+                elif (
+                    isinstance(sub, ast.Call)
+                    and isinstance(sub.func, ast.Attribute)
+                    and sub.func.attr in {"startswith", "endswith"}
+                ):
+                    for arg in sub.args:
+                        if (
+                            isinstance(arg, ast.Constant)
+                            and isinstance(arg.value, str)
+                            and _is_ag013_model_literal(arg.value)
+                        ):
+                            key = (getattr(sub, "lineno", 1), arg.value.lower())
+                            if key not in seen:
+                                seen.add(key)
+                                violations.append(Violation(
+                                    "AG013", rel, key[0],
+                                    f"AG013:model_branch:{pos}:{key[1]}",
+                                    f"hardcoded model-family branch literal {arg.value!r} is forbidden in general {top} logic",
+                                ))
+
+    if top in _AG013_SUFFIX_BAN_ROOTS:
+        for stmt in tree.body:
+            if isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+                targets = stmt.targets if isinstance(stmt, ast.Assign) else (stmt.target,)
+                for target in targets:
+                    if isinstance(target, ast.Name) and target.id in _AG013_BANNED_SUFFIX_TABLES:
+                        violations.append(Violation(
+                            "AG013", rel, getattr(stmt, "lineno", 1),
+                            f"AG013:suffix_table:{pos}:{target.id}",
+                            f"static op-suffix fusion table {target.id!r} is forbidden; use typed algebraic traits",
+                        ))
+        if top in {"solve", "sweep", "rewrite", "optimization"}:
+            for test in _ag013_test_exprs(tree):
+                for sub in ast.walk(test):
+                    if isinstance(sub, ast.Compare) and any(
+                        isinstance(op, (ast.In, ast.NotIn)) for op in sub.ops
+                    ):
+                        if (
+                            isinstance(sub.left, ast.Constant)
+                            and isinstance(sub.left.value, str)
+                            and _AG013_SUBMODULE_SUFFIX_RE.match(sub.left.value)
+                        ):
+                            key = (getattr(sub, "lineno", 1), f"suf:{sub.left.value.lower()}")
+                            if key not in seen:
+                                seen.add(key)
+                                violations.append(Violation(
+                                    "AG013", rel, key[0],
+                                    f"AG013:suffix_branch:{pos}:{sub.left.value.lower()}",
+                                    f"ad-hoc op-suffix substring check {sub.left.value!r} is forbidden in {top}; use typed traits",
+                                ))
+    return violations
+
+
 def _binding_module(recipe) -> str:
     def module_of(builder):
         # functools.wraps copies __module__ even when the wrapper runs elsewhere.

@@ -16,7 +16,7 @@ from mindie_sim.catalog.cache import completed_rows, index_row_bytes, index_sele
 from mindie_sim.catalog.cache_format import cache_format
 from mindie_sim.catalog.context_parallel import dcp_indexer_sharded, layer_dcp_degree
 from mindie_sim.catalog.ops import compute_dtype_for
-from mindie_sim.prediction.operators.context_parallel.graph import (
+from mindie_sim.prediction.sharding.context_parallel import (
     CP_DECODE_COMM_STREAM,
     emit_pcp_hidden_gather_restore,
 )

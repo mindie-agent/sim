@@ -19,7 +19,7 @@ from mindie_sim.catalog.attention_common import (
 )
 from mindie_sim.prediction.operators.mla.mla import mla
 from mindie_sim.prediction.operators.recurrent.recurrent import linear
-from mindie_sim.prediction.operators.context_parallel.graph import (
+from mindie_sim.prediction.sharding.context_parallel import (
     CP_CHUNKED_PREFILL_STREAM,
     CP_DECODE_COMM_STREAM,
     active_layer_dcp,

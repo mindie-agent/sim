@@ -37,7 +37,8 @@ if __package__:
         MAX_OPERATOR_PACKAGE_FILES, MAX_TOPLEVEL_MODULES, OPERATORS_PARTS, Violation,
         _check_ag006_flat_prediction, _check_ag007, _check_ag008_module, _check_ag008_repo_bounds,
         _check_ag009_silent_physical_defaults, _check_ag010_layer_dag,
-        _check_ag011_operator_reachability, _is_governed_family_path, scan_runtime,
+        _check_ag011_operator_reachability, _check_ag013_anti_hardcoding,
+        _is_governed_family_path, scan_runtime,
         verify_ag007_discrimination, verify_ag011_engine_reachability,
     )
 else:
@@ -48,7 +49,8 @@ else:
         MAX_OPERATOR_PACKAGE_FILES, MAX_TOPLEVEL_MODULES, OPERATORS_PARTS, Violation,
         _check_ag006_flat_prediction, _check_ag007, _check_ag008_module, _check_ag008_repo_bounds,
         _check_ag009_silent_physical_defaults, _check_ag010_layer_dag,
-        _check_ag011_operator_reachability, _is_governed_family_path, scan_runtime,
+        _check_ag011_operator_reachability, _check_ag013_anti_hardcoding,
+        _is_governed_family_path, scan_runtime,
         verify_ag007_discrimination, verify_ag011_engine_reachability,
     )
 
@@ -704,6 +706,7 @@ def scan_repository(
         violations.extend(_check_ag008_module(rel, text, tree, CANONICAL_CONCEPT_OWNERS))
         violations.extend(_check_ag009_silent_physical_defaults(rel, tree))
         violations.extend(_check_ag010_layer_dag(rel, tree))
+        violations.extend(_check_ag013_anti_hardcoding(rel, tree))
     violations.extend(_check_ag008_repo_bounds([rel for rel, _ in files], texts=texts))
     violations.extend(_check_ag011_operator_reachability(parsed_files))
     violations.sort(key=lambda v: (v.path.as_posix(), v.line, v.rule, v.message))

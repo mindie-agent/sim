@@ -24,7 +24,7 @@ from mindie_sim.prediction.operators.attention.batch_prefix_attention import (
     annotate_sparse_prefix_unknown, apply_attention_prefix_reads,
     apply_sparse_prefix_reads,
 )
-from mindie_sim.prediction.operators.context_parallel.graph import (
+from mindie_sim.prediction.sharding.context_parallel import (
     CP_DECODE_COMM_STREAM,
     active_layer_dcp,
     dcp_q_replicate_enabled,

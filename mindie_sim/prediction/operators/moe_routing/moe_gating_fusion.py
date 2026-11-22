@@ -36,7 +36,7 @@ from mindie_sim.catalog.ops import vector_op
 from mindie_sim.schema.common import ModelingError
 
 from mindie_sim.prediction.mechanism import PlannedRecipe
-from mindie_sim.prediction.rewrite_ffn_rules import (
+from mindie_sim.prediction.sharding.ffn_rules import (
     CONTRACT_HASH, CONTRACT_SCORE, HASH_ROW_ID_BYTES, HASH_SELECTION_MODE,
     NOAUX_BIAS_BYTES, ROUTED_SCALE_RECIPE, ROUTE_NORMALIZE_RECIPE,
     SCORE_SELECTION_MODE,

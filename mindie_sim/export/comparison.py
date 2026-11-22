@@ -154,7 +154,7 @@ def _fusion_absorbed_keys(after_op: OperatorExportRow) -> set[str]:
     elif "fusedrmsnormgated" in kern:
         keys.update(_KNOWN_FUSION_SOURCES["fused_linear_output_epilogue"])
 
-    if fam == "mhc" or "qwen4exp" in kern or "hc_gate_mix" in exact:
+    if fam == "mhc" or "hc_gate_mix" in exact:
         keys.update(f"{scope}{s}" for s in _MHC_SUFFIXES)
 
     if fam == "all_gather_matmul":
