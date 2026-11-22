@@ -173,11 +173,13 @@ class CostModel:
     def __init__(
         self, case: CaseSpec, primitives: PrimitiveStore | None = None,
         *, hardware: "FrozenHardwareView | None" = None, ledger: CostLedger | None = None,
+        primitive_table: Any = None,
     ):
         self.case = case
         # The store is retained only for explicit diagnostic reads.  It is not
         # consulted by price() and cannot set a production completion floor.
         self.primitives = primitives
+        self.primitive_table = primitive_table
         if hardware is None:
             from mindie_sim.prediction.evaluation import FrozenHardwareView
             hardware = FrozenHardwareView.from_machine(case.machine)
@@ -461,6 +463,18 @@ class CostModel:
         mappings, joint_native = ledger.mappings, ledger.joint_native
         sources = dict(self.case.runtime.metadata).get("primitive_parameter_sources", ())
         calibration = []
+        pt = self.primitive_table
+        pt_warnings = tuple(getattr(pt, "warnings", ())) if pt is not None else ()
+        rescaled = "primitive_table_rescaled_to_declared_die" in pt_warnings
+        pt_calibrated = bool(
+            pt is not None and getattr(getattr(pt, "provenance", None), "calibrated", False)
+        )
+        if pt is not None:
+            calibration.append(
+                "calibrated_primitive_table_rescaled" if rescaled
+                else "calibrated_primitive_table" if pt_calibrated
+                else "uncalibrated_primitive_table"
+            )
         if ledger.diagnostic_primitive_hits:
             calibration.append("diagnostic_primitive_evidence_not_production")
         if sources:
@@ -478,12 +492,32 @@ class CostModel:
                for r in regimes.values()):
             calibration.append("observable_kernel_regimes")
         declared_regimes = [row["id"] for row in self.case.runtime.kernels.get("service_regimes", ())]
+        declared_sku = str(self.case.machine.sku or "")
+        calibration_basis = {
+            "mode": (
+                "calibrated_primitive_table_rescaled" if (pt is not None and rescaled)
+                else "calibrated_primitive_table" if pt_calibrated
+                else "uncalibrated_primitive_table" if pt is not None
+                else "datasheet_declaration"
+            ),
+            "calibrated": pt_calibrated,
+            "rescaled": rescaled,
+            "declared_sku": declared_sku,
+            "primitive_table_sku": str(pt.sku) if pt is not None else None,
+            "cann_version": str(pt.cann_version) if pt is not None else None,
+            "envelope_sha256": str(pt.envelope_sha256) if pt is not None else None,
+            "warnings": (
+                list(pt_warnings) if pt is not None
+                else (["uncalibrated_datasheet_declaration"] if declared_sku else [])
+            ),
+        }
         return {
             "operator_occurrences": dict(counts),
             "production_price_basis": "physical_work_only",
             "diagnostic_primitive_lookups": ledger.diagnostic_primitive_lookups,
             "diagnostic_primitive_hits": ledger.diagnostic_primitive_hits,
             "calibration": "+".join(calibration) or "none",
+            "calibration_basis": calibration_basis,
             "declared_parameter_sources": sources,
             **({"resource_services": [item.service_id
                                       for item in self.resource_services],

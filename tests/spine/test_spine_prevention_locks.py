@@ -869,3 +869,45 @@ def test_primitive_table_rebind_rescales_fixpipe_out_p05_ws_sweep_and_mte1():
     assert "256MiB" in base_ws
     for key, val in base_ws.items():
         assert new_ws[key] == pytest.approx(val * 0.5, rel=1e-9)
+
+
+def test_anti_two_skin_calibration_basis_and_serving_parity() -> None:
+    """Calibrated/derived/datasheet SKUs expose honest calibration_basis and serving==step PrimitiveTable parity."""
+    from mindie_sim import api as sdk_api
+    from mindie_sim.compose import compose_case
+    from mindie_sim.prediction.api import predict
+    from mindie_sim.prediction.evaluation import EvaluationContext
+    from mindie_sim.prediction.results import StepRequest
+    from mindie_sim.prediction.structure import parse_case
+
+    # Derived Ascend950DT_425_96 binds & rescales calibrated Ascend950DT_9582 table.
+    derived = parse_case(compose_case("qwen3-32b", "Ascend950DT_425_96", layers=1, tp=1))
+    cb_derived = EvaluationContext.create(derived).cost.summary()["calibration_basis"]
+    assert cb_derived["calibrated"] is True
+    assert cb_derived["rescaled"] is True
+    assert cb_derived["primitive_table_sku"] == "Ascend950DT_9582"
+
+    # Unmeasured datasheet SKU honestly declares datasheet_declaration.
+    uncal = parse_case(compose_case("qwen3-32b", "Ascend910_9392", layers=1, tp=1))
+    cb_uncal = EvaluationContext.create(uncal).cost.summary()["calibration_basis"]
+    assert cb_uncal["calibrated"] is False
+    assert cb_uncal["mode"] == "datasheet_declaration"
+    assert "uncalibrated_datasheet_declaration" in cb_uncal["warnings"]
+
+    # Serving mode & step mode on calibrated A3 SKU both auto-bind identical PrimitiveTable.
+    raw = compose_case(
+        "qwen3-32b", "Ascend910_9362", tp=1, dp=1, layers=1,
+        prompt_tokens=64, output_tokens=2, concurrency=1,
+        mtp_proposal_tokens=0, mtp_acceptance_length=1.0,
+    )
+    body = predict(raw, scope="body", phase="decode", tokens=1, context=64, sequences=1)
+    step_ev = sdk_api.evaluate_step(raw, StepRequest(phase="decode", tokens=1, context=64, sequences=1, scope="body"))
+    assert float(step_ev.span_ms) == pytest.approx(float(body["duration_ms"]), rel=1e-9)
+    srv = predict(raw, scope="serving")
+    srv_raw = predict(raw, scope="serving", primitive_table=False)
+    assert srv["parameters"]["calibration_basis"]["calibrated"] is True
+    assert srv["parameters"]["calibration_basis"]["primitive_table_sku"] == "Ascend910_9362"
+    assert srv_raw["parameters"]["calibration_basis"]["calibrated"] is False
+    assert float(srv["metrics"]["makespan_ms"]) != float(srv_raw["metrics"]["makespan_ms"])
+    ev_srv = sdk_api.evaluate_service(raw)
+    assert float(ev_srv.span_ms) == pytest.approx(float(srv["metrics"]["makespan_ms"]), rel=1e-9)

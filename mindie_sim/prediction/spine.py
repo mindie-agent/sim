@@ -564,6 +564,7 @@ class PredictionSpine:
         /,
         *,
         primitives: Any = None,
+        primitive_table: Any = None,
     ) -> ServiceEvaluation:
         """Evaluate a full serving workload on the shared simulation driver."""
         from .api import predict
@@ -574,6 +575,7 @@ class PredictionSpine:
                 case,
                 primitives=primitives,
                 event_limit=replay.event_limit,
+                primitive_table=primitive_table,
             )
         finally:
             ACTIVE_DEADLINE_MONO.reset(token)

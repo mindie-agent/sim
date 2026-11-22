@@ -18,6 +18,7 @@ from mindie_sim.schema.common import ModelingError
 from mindie_sim.prediction.operators.attention.attention import AttentionPolicy
 from ..capacity import Memory
 from ..efficiency.cost import CostModel
+from ..evaluation import EvaluationContext
 from ..execution.dispatch import cohorts, submit_batch
 from ..engine import Engine
 from ..execution import Execution
@@ -77,7 +78,8 @@ def _memory_binding_report(engine, memory, execution):
 def predict_pd(raw, *, primitives=None, recipes=None, submission=None, memory_policy=None,
                lower=None, trace_limit=DEFAULT_PD_TRACE_LIMIT,
                event_limit=DEFAULT_PD_EVENT_LIMIT, scope="serving", phase=None,
-               tokens=None, context=None, sequences=None, published=None):
+               tokens=None, context=None, sequences=None, published=None,
+               primitive_table=None):
     # The direct PD entry enforces the same structural timing gate as predict.
     from ..efficiency.unmodeled_gate import assert_timing_supported
     assert_timing_supported(raw, entry="predict")
@@ -87,7 +89,7 @@ def predict_pd(raw, *, primitives=None, recipes=None, submission=None, memory_po
         resolved_scope = "model" if scope == "model" else "body"
         return predict(raw, scope=resolved_scope, phase=phase, tokens=tokens, context=context,
                        sequences=sequences, primitives=primitives, recipes=recipes,
-                       lower=lower, event_limit=event_limit)
+                       lower=lower, event_limit=event_limit, primitive_table=primitive_table)
     if scope != "serving":
         raise ModelingError(f"invalid_prediction_scope:{scope}")
     pools = raw["pools"]
@@ -107,11 +109,18 @@ def predict_pd(raw, *, primitives=None, recipes=None, submission=None, memory_po
     if any(client_declared) and not all(client_declared):
         raise ModelingError("pd_client_delivery_boundary_requires_both_pool_declarations")
     client_tails = {}
-    execution = {name: Execution(case, CostModel(case, primitives), recipes=recipes,
-                                submission=submission, engine=engine, namespace=name + ":",
-                                include_serving_io=True, client_tails=client_tails,
-                                memory_policy=memory[name].policy,
-                                memory=None)
+    evals = {
+        name: EvaluationContext.create(
+            case, recipes, primitives, primitive_table=primitive_table,
+        )
+        for name, case in cases.items()
+    }
+    execution = {name: Execution(case, evals[name].cost, ledger=evals[name].cost.ledger,
+                                recipes=recipes, submission=submission, engine=engine,
+                                namespace=name + ":", include_serving_io=True,
+                                client_tails=client_tails,
+                                memory_policy=memory[name].policy, memory=None,
+                                bindings=evals[name].bindings, evaluation=evals[name])
                  for name, case in cases.items()}
     for name in cases:
         _endpoint_execution(execution[name], memory[name], name)

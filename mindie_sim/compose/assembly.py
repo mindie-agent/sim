@@ -79,6 +79,7 @@ def _assembly_metric_rows(specs, rows):
 def _assemble_cohort_service(
     parsed, specs, *, scope, iterations, tokens, phase, context, explicit_window,
     full_service, include_submission, trace_limit, resource_fusion, primitives, recipes, lower,
+    primitive_table=None,
 ) -> dict[str, Any]:
     from mindie_sim.prediction.api import simulate_service
     quota = int(iterations or 1) * int(tokens or 1) if (explicit_window and phase == "decode") else None
@@ -98,7 +99,8 @@ def _assemble_cohort_service(
         window_case, primitives=primitives, recipes=recipes, trace_limit=trace_limit,
         max_model_steps=steps, window=window, token_quotas=quotas,
         include_submission=scope != "model" if include_submission is None else bool(include_submission),
-        resource_fusion=resource_fusion, lower=lower, observer=observe)
+        resource_fusion=resource_fusion, lower=lower, observer=observe,
+        primitive_table=primitive_table)
     original_outputs = {s.request_id: s.output_tokens for s in specs}
     unfinished = [rid for rid, out_tok in original_outputs.items()
                   if next((r["generated_tokens"] for r in result["requests"] if r["request_id"] == rid), 0) < out_tok]
@@ -231,11 +233,11 @@ def assemble(
     case, *, scope="service", iterations=None, phase=None, tokens=None, context=None,
     requests=None, emitted_tokens=None, include_submission=None, trace_limit=0,
     resource_fusion=True, primitives=None, recipes=None, full_service=False,
-    diagnostic_window=False, lower=None,
+    diagnostic_window=False, lower=None, primitive_table=None,
 ):
     """Submit model and framework fragments into one execution context."""
     from mindie_sim.prediction.operators.attention.attention import AttentionPolicy
-    from mindie_sim.prediction.efficiency.cost import CostModel
+    from mindie_sim.prediction.evaluation import EvaluationContext
     from mindie_sim.prediction.execution import Execution
     from mindie_sim.prediction.frontend import Frontend, SERVICE_FAMILIES
     from mindie_sim.schema.operators import IterationWork
@@ -261,7 +263,8 @@ def assemble(
             parsed, specs, scope=scope, iterations=iterations, tokens=tokens, phase=phase,
             context=context, explicit_window=explicit_window, full_service=full_service,
             include_submission=include_submission, trace_limit=trace_limit,
-            resource_fusion=resource_fusion, primitives=primitives, recipes=recipes, lower=lower)
+            resource_fusion=resource_fusion, primitives=primitives, recipes=recipes, lower=lower,
+            primitive_table=primitive_table)
     iterations = 1 if iterations is None else int(iterations)
     tokens = 1 if tokens is None else int(tokens)
     if parsed.runtime.parallel.dp != 1:
@@ -269,9 +272,15 @@ def assemble(
     if not specs:
         raise ModelingError("assembly_requires_at_least_one_request")
     include_submission = scope != "model" if include_submission is None else bool(include_submission)
-    execution = Execution(parsed, CostModel(parsed, primitives), recipes=recipes,
-                          include_submission=include_submission, trace_limit=trace_limit,
-                          include_serving_io=scope != "model")
+    evaluation = EvaluationContext.create(
+        parsed, recipes, primitives, primitive_table=primitive_table,
+    )
+    execution = Execution(
+        parsed, evaluation.cost, ledger=evaluation.cost.ledger, recipes=recipes,
+        include_submission=include_submission, trace_limit=trace_limit,
+        include_serving_io=scope != "model",
+        bindings=evaluation.bindings, evaluation=evaluation,
+    )
     frontend = Frontend(attention_policy=AttentionPolicy(**parsed.runtime.attention_policy))
     if scope == "framework" and not execution.serving_io.enabled:
         raise ModelingError("framework_assembly_requires_declared_serving_io")

@@ -335,7 +335,14 @@ def is_sku_compatible_with_table(
     )
     if entry is None:
         return False
-    return target_sku in (table_sku, *entry.get("compatible_skus", ()))
+    allowed = (table_sku, *entry.get("compatible_skus", ()))
+    if target_sku in allowed:
+        return True
+    from mindie_sim.backends.ascend import DERIVED_ASCEND_SKUS
+
+    derived = DERIVED_ASCEND_SKUS.get(target_sku)
+    base_sku = str(derived.get("base", "")) if isinstance(derived, Mapping) else ""
+    return bool(base_sku and base_sku in allowed)
 
 
 def validate_table_sku_compatibility(

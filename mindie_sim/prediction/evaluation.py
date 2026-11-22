@@ -640,6 +640,13 @@ def _resolve_default_primitive_table(case: CaseSpec) -> Any:
         return None
     sku = str(case.machine.sku or "")
     table = _bundled_calibrated_primitive_table(sku)
+    if table is None and sku:
+        from mindie_sim.backends.ascend import DERIVED_ASCEND_SKUS
+
+        derived = DERIVED_ASCEND_SKUS.get(sku)
+        base_sku = str(derived.get("base", "")) if isinstance(derived, Mapping) else ""
+        if base_sku:
+            table = _bundled_calibrated_primitive_table(base_sku)
     if table is None:
         return None
     from mindie_sim.backends.ascend import profiles as ascend_profiles
@@ -685,7 +692,10 @@ class EvaluationContext:
         else:
             eff_table = _resolve_default_primitive_table(case)
         bindings = ExecutionBindings.create(case, book, primitive_table=eff_table)
-        cost = CostModel(case, primitives, hardware=bindings.hardware)
+        cost = CostModel(
+            case, primitives, hardware=bindings.hardware,
+            primitive_table=bindings.primitive_table,
+        )
         return cls(case=case, bindings=bindings, cost=cost,
                    recipe_origin="case" if recipes is None else "caller")
 

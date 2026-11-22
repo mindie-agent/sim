@@ -539,7 +539,7 @@ def describe_included_components(case, *, scope: str = "body") -> dict[str, obje
 
 def body_forward(case, *, phase="decode", tokens=1, context=0, sequences=1,
                  scope="body", recipes=None, primitives=None, event_limit=0, compact=False,
-                 padded_idle=False):
+                 padded_idle=False, primitive_table=None):
     if scope not in {"body", "model"}:
         raise ModelingError(f"invalid_forward_scope:{scope}")
     case, graphs = _declared_graphs(
@@ -551,12 +551,18 @@ def body_forward(case, *, phase="decode", tokens=1, context=0, sequences=1,
     default_selection = (dict(graphs.default_selection) if recipes is None else
                          {"profile": "explicit_recipe_book_preserved"})
     ext_in = {"analysis_input": 0} if scope == "body" else None
+    from mindie_sim.prediction.evaluation import EvaluationContext
     from mindie_sim.prediction.graph_analysis import graph_costs
     from mindie_sim.prediction.operator_analysis import cohort_sequence_counts
+    evaluation = (
+        EvaluationContext.create(case, recipes, primitives, primitive_table=primitive_table)
+        if primitive_table is not None else None
+    )
     result = graph_costs(case, graphs, recipes=recipes, primitives=primitives,
                          external_inputs=ext_in,
                          include_submission=False, isolated=False,
-                         trace_limit=event_limit, compact=compact)
+                         trace_limit=event_limit, compact=compact,
+                         evaluation=evaluation)
     counts = cohort_sequence_counts(sequences, tuple(graphs))
     from mindie_sim.prediction.execution.decode_probe import probe_capacity
     capacity = probe_capacity(case, context=context, tokens=tokens,

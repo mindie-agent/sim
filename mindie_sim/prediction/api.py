@@ -22,6 +22,7 @@ from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.workload import IterationPlan
 from .capacity import Memory, MemoryPolicy
 from .efficiency.cost import CostModel
+from .evaluation import EvaluationContext
 from .execution import Execution, ScheduledIteration, SubmissionPolicy
 from .efficiency.metrics import serving_boundaries, summarize
 from .program.primitives import PrimitiveStore
@@ -511,6 +512,7 @@ def predict(
     memory: Memory | None = None, selected_allocations=None,
     memory_replica: int = 0, memory_stage: int = 0,
     token_quotas: Mapping[str, int] | None = None,
+    primitive_table: Any = None,
 ) -> dict[str, Any]:
     # A declared attention core without a physical model may be inspected
     # structurally, but no latency/throughput entry may fabricate its work.
@@ -539,14 +541,15 @@ def predict(
                      context=0 if context is None else context,
                      sequences=1 if sequences is None else sequences,
                      scope=resolved_scope,
-                     primitives=primitives, recipes=recipes, event_limit=event_limit)
+                     primitives=primitives, recipes=recipes, event_limit=event_limit,
+                     primitive_table=primitive_table)
     if scope != "serving":
         raise ModelingError(f"invalid_prediction_scope:{scope}")
     if isinstance(case, _AbcMapping) and "pools" in case:
         from .disaggregated import predict_pd
         return predict_pd(case, primitives=primitives, recipes=recipes, submission=submission,
                           memory_policy=memory_policy, lower=lower, trace_limit=trace_limit,
-                          event_limit=event_limit)
+                          event_limit=event_limit, primitive_table=primitive_table)
     case = parse_case(case)
     if case.model.is_standalone_draft:
         raise ModelingError("draft_requires_target_model:attach_auxiliary_to_target;catalog_inspection_available")
@@ -592,12 +595,15 @@ def predict(
                 if "release_ms" in values:
                     state.release_ms = max(state.request.arrival_ms,
                                            float(values["release_ms"]))
-    cost = CostModel(case, primitives)
+    evaluation = EvaluationContext.create(
+        case, recipes, primitives, primitive_table=primitive_table,
+    )
+    cost = evaluation.cost
     execution = Execution(
         case, cost, ledger=cost.ledger, recipes=recipes, submission=submission,
         trace_limit=event_limit, include_serving_io=True,
         include_submission=include_submission, memory_policy=memory.policy,
-        memory=memory,
+        memory=memory, bindings=evaluation.bindings, evaluation=evaluation,
     )
     # A bounded summary ring (the default 256 rows) must not silently disable
     # exact physical-work coalescing.  A caller asking for a wider per-event

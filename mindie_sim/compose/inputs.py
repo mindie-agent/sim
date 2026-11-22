@@ -52,35 +52,16 @@ BYTES_PER_GIB = BYTES_PER_KIB * BYTES_PER_KIB * BYTES_PER_KIB
 MX_EXPERT_BLOCK_GROUP = 32
 MX_SCALE_PACK = 2
 NEXTN_DEFAULT_HEAD_DIM = 192
-PP_CAP_DEFAULT = (1, 2, 4, 8, 16)
-A5_DT_425_AIC_CORES = 28
-A5_DT_486_AIC_CORES = 32
-A5_DT_547_AIC_CORES = 36
-A5_DT_96_GIB = 96
-A5_DT_144_GIB = 144
+from mindie_sim.backends.ascend import (
+    A5_DT_144_GIB,
+    A5_DT_425_AIC_CORES,
+    A5_DT_486_AIC_CORES,
+    A5_DT_547_AIC_CORES,
+    A5_DT_96_GIB,
+    DERIVED_ASCEND_SKUS,
+)
 
-DERIVED_ASCEND_SKUS: dict[str, dict[str, Any]] = {
-    "Ascend950DT_425_96": {
-        "base": "Ascend950DT_9582",
-        "aic_count": A5_DT_425_AIC_CORES,
-        "memory_bytes": A5_DT_96_GIB * BYTES_PER_GIB,
-    },
-    "Ascend950DT_486_96": {
-        "base": "Ascend950DT_9582",
-        "aic_count": A5_DT_486_AIC_CORES,
-        "memory_bytes": A5_DT_96_GIB * BYTES_PER_GIB,
-    },
-    "Ascend950DT_547_96": {
-        "base": "Ascend950DT_9582",
-        "aic_count": A5_DT_547_AIC_CORES,
-        "memory_bytes": A5_DT_96_GIB * BYTES_PER_GIB,
-    },
-    "Ascend950DT_547_144": {
-        "base": "Ascend950DT_9582",
-        "aic_count": A5_DT_547_AIC_CORES,
-        "memory_bytes": A5_DT_144_GIB * BYTES_PER_GIB,
-    },
-}
+PP_CAP_DEFAULT = (1, 2, 4, 8, 16)
 
 HARDWARE_ALIASES: dict[str, str] = {
     "a2": "Ascend910B4", "910b": "Ascend910B4", "910b4": "Ascend910B4",

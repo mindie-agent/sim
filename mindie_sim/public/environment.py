@@ -192,7 +192,7 @@ class ExecutionEnvironment:
         )
         bindings = ExecutionBindings.create(case, book, primitive_table=eff_table)
         return Execution(
-            case, CostModel(case, hardware=bindings.hardware),
+            case, CostModel(case, hardware=bindings.hardware, primitive_table=bindings.primitive_table),
             recipes=recipes, include_submission=False,
             namespace=self.namespace, on_operator=on_operator,
             bindings=bindings,

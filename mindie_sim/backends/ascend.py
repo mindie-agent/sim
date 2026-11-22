@@ -88,6 +88,36 @@ A5_SERVER_INTER_UTIL = 0.80
 A5_PCIE_RANKS_PER_NODE = 16
 A5_PCIE_QUAD_BW_GBPS = 288.0
 A5_PCIE_OCTA_BW_GBPS = 128.0
+
+_BYTES_PER_GIB = 1024 ** 3
+A5_DT_425_AIC_CORES = 28
+A5_DT_486_AIC_CORES = 32
+A5_DT_547_AIC_CORES = 36
+A5_DT_96_GIB = 96
+A5_DT_144_GIB = 144
+
+DERIVED_ASCEND_SKUS: dict[str, dict[str, object]] = {
+    "Ascend950DT_425_96": {
+        "base": "Ascend950DT_9582",
+        "aic_count": A5_DT_425_AIC_CORES,
+        "memory_bytes": A5_DT_96_GIB * _BYTES_PER_GIB,
+    },
+    "Ascend950DT_486_96": {
+        "base": "Ascend950DT_9582",
+        "aic_count": A5_DT_486_AIC_CORES,
+        "memory_bytes": A5_DT_96_GIB * _BYTES_PER_GIB,
+    },
+    "Ascend950DT_547_96": {
+        "base": "Ascend950DT_9582",
+        "aic_count": A5_DT_547_AIC_CORES,
+        "memory_bytes": A5_DT_96_GIB * _BYTES_PER_GIB,
+    },
+    "Ascend950DT_547_144": {
+        "base": "Ascend950DT_9582",
+        "aic_count": A5_DT_547_AIC_CORES,
+        "memory_bytes": A5_DT_144_GIB * _BYTES_PER_GIB,
+    },
+}
 A5_PCIE_NODE_BW_GBPS = 116.0
 A5_PCIE_ROCE_PEAK_GBPS = 50.0
 A5_PCIE_INTRA_LATENCY_US = 2.0

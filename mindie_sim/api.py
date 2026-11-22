@@ -146,13 +146,14 @@ def evaluate_service(
     *,
     replay: ReplayOptions = ReplayOptions(),
     primitives: PrimitiveStore | None = None,
+    primitive_table: Any = None,
 ) -> ServiceEvaluation:
     """Evaluate a complete serving workload through ``PredictionSpine``."""
     parsed = _to_case(case)
     if dict(parsed.runtime.metadata).get("scenario_declared") is False:
         raise missing_scenario_error(("prompt_tokens", "output_tokens"))
     return default_spine().run_service(
-        parsed, replay, primitives=primitives
+        parsed, replay, primitives=primitives, primitive_table=primitive_table
     )
 
 
