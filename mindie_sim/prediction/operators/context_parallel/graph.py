@@ -30,6 +30,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import replace
+import math
 from typing import Any, Sequence
 
 from mindie_sim.catalog.cache_format import cache_format
@@ -45,6 +46,12 @@ from mindie_sim.catalog.paired_sfa import SOURCE as PAIRED_SFA_SOURCE
 from mindie_sim.prediction.mechanism import OperatorPlan, PlannedRecipe, Work
 from mindie_sim.prediction.operators.attention.attention_pipeline import (
     TiledFlashAndPagedAttentionRecipe,
+)
+from mindie_sim.prediction.physical_recipe_base import (
+    IO_HBM_CATEGORY,
+    Phase,
+    io_weight,
+    tiled_phased_program,
 )
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.operators import OpSpec
@@ -81,6 +88,14 @@ PACKED_C8_ROPE = frozenset({0, 64})
 FP8_FORMATS = frozenset({"fp8", "fp8_e4m3", "fp8_e5m2"})
 PACKED_CACHE_DTYPES = frozenset({"int8"})
 PAIRED_FP8_QSFA_IMPLEMENTATION = "paired_fp8_qsfa_analytic"
+DCP_LSE_MERGE_RECIPE = "dcp_lse_merge"
+DCP_LSE_MERGE_EAGER_RECIPE = "dcp_lse_merge_eager"
+MS_PER_SECOND = 1000.0
+ATTENTION_UPDATE_SOURCE = "ops-transformer/attention/attention_update/op_kernel/decode_update.h"
+ATTENTION_UPDATE_MAX_EFFECTIVE_SP = 16
+ATTENTION_UPDATE_PIPELINE_SLOTS = 2
+ATTENTION_UPDATE_TILE_CAP = 64
+ATTENTION_UPDATE_LSE_EXP_OPS = 4
 PACKED_KERNEL = "npu_kv_quant_sparse_flash_attention_vllm"
 CP_DECODE_COMM_STREAM = "cp_decode_comm_stream"
 CP_CHUNKED_PREFILL_STREAM = "cp_chunkedprefill_comm_stream"
@@ -1196,14 +1211,173 @@ def _build_paired_qsfa(op: OpSpec, geometry: Any) -> OperatorPlan:
                          "source": PAIRED_SFA_SOURCE})
 
 
+def _bind_dcp_merge_dram(context: Any) -> Any:
+    """Bind sustainable AIV DRAM service rate on the shared HBM bus."""
+    dram_rate = context.service_rate("hbm_rw21_dram") or context.service_rate("mte2_aiv_dram")
+    if dram_rate is None or "hbm" not in context.resource_names:
+        return context
+    ceiling = min(dram_rate, context.rates[context.resource_names["hbm"]] * MS_PER_SECOND)
+    return replace(context, service_modes={**context.service_modes, "hbm": ("hbm", ceiling)})
+
+
+def expand_dcp_lse_eager_kernels(
+    op: OpSpec, *, l2_bytes: int = 0, include_stack: bool = False, local_ids: bool = False,
+) -> tuple[OpSpec, ...]:
+    """Expand a ``dcp_lse_merge`` call into the 9-kernel eager LSE combine chain."""
+    meta = dict(op.metadata)
+    cp = max(2, int(meta.get("partial_count") or meta.get("cp") or 2))
+    shape = tuple(int(d) for d in (op.local_shape or op.semantic_shape or (1, 1, 1)))
+    if len(shape) >= 3:
+        rows, heads, dim = max(1, shape[0]), max(1, shape[1]), max(1, shape[2])
+    elif len(shape) == 2:
+        rows, heads, dim = 1, max(1, shape[0]), max(1, shape[1])
+    else:
+        rows, heads, dim = 1, 1, max(1, shape[0])
+    out_bytes = dtype_bytes(op.dtype or "bf16")
+    n_lse = cp * rows * heads
+    n_out = cp * rows * heads * dim
+    lse_b = n_lse * FP32_BYTES
+    red_lse_b = rows * heads * FP32_BYTES
+    ol_in_b = n_out * out_bytes
+    ol_fp32_b = n_out * FP32_BYTES
+    res_fp32_b = rows * heads * dim * FP32_BYTES
+    res_out_b = rows * heads * dim * out_bytes
+
+    def _hbm_bytes(rd: int, wr: int, l2_in: int) -> float:
+        hit = min(rd, l2_in) if (l2_bytes > 0 and (rd + wr) <= l2_bytes) else 0
+        return float(max(0, rd - hit) + wr)
+
+    def _cid(suffix: str) -> str:
+        return suffix if local_ids else f"{op.op_id}.{suffix}"
+
+    base_deps = () if local_ids else tuple(op.deps)
+    specs: list[tuple[str, tuple[str, ...], str, int, int, int, int, int]] = []
+    if include_stack:
+        specs.append(("lse_stack", base_deps, "fp32", n_lse, n_lse, lse_b, lse_b, 0))
+        amax_deps, amax_l2 = (_cid("lse_stack"),), lse_b
+    else:
+        amax_deps, amax_l2 = base_deps, 0
+    specs.extend((
+        ("amax", amax_deps, "fp32", n_lse, n_lse, lse_b, red_lse_b, amax_l2),
+        ("sub", (_cid("amax"),), "fp32", n_lse, n_lse, lse_b + red_lse_b, lse_b, lse_b + red_lse_b),
+        ("exp", (_cid("sub"),), "fp32", n_lse, ATTENTION_UPDATE_LSE_EXP_OPS * n_lse, lse_b, lse_b, lse_b),
+        ("wsum", (_cid("exp"),), "fp32", n_lse, n_lse, lse_b, red_lse_b, lse_b),
+        ("wdiv", (_cid("wsum"),), "fp32", n_lse, n_lse, lse_b + red_lse_b, lse_b, lse_b + red_lse_b),
+        ("cast32", (_cid("wdiv"),), "fp32", n_out, n_out, ol_in_b, ol_fp32_b, 0),
+    ))
+    if include_stack:
+        specs.append(("o_stack", (_cid("cast32"),), "fp32", n_out, n_out, ol_fp32_b, ol_fp32_b, ol_fp32_b))
+        mul_deps = (_cid("o_stack"),)
+    else:
+        mul_deps = (_cid("cast32"),)
+    specs.extend((
+        ("mul", mul_deps, "fp32", n_out, n_out, ol_fp32_b + lse_b, ol_fp32_b, ol_fp32_b + lse_b),
+        ("osum", (_cid("mul"),), "fp32", n_out, n_out, ol_fp32_b, res_fp32_b, ol_fp32_b),
+        ("cast16", (_cid("osum"),), op.dtype or "bf16", rows * heads * dim, rows * heads * dim, res_fp32_b, res_out_b, res_fp32_b),
+    ))
+    child_meta = (("execution_class", "aiv_only"), ("cp", cp), ("partial_reduction", "logsumexp"))
+    return tuple(
+        OpSpec(
+            _cid(suffix), "vector", op.phase, op.stage, op.layer, op.requests,
+            (numel,), (numel,), (numel,), (numel,),
+            deps=deps, dtype=dt, stream=op.stream,
+            vector_ops=float(vops), mte2_bytes=float(rd), mte3_bytes=float(wr),
+            hbm_bytes=_hbm_bytes(rd, wr, l2_in),
+            metadata=(("program_execution", {"execution_class": "aiv_only"}), *child_meta),
+        )
+        for suffix, deps, dt, numel, vops, rd, wr, l2_in in specs
+    )
+
+
+def _expand_dcp_lse_merge_kernels(op: OpSpec) -> tuple[OpSpec, ...]:
+    meta = dict(op.metadata)
+    return expand_dcp_lse_eager_kernels(
+        op,
+        l2_bytes=int(meta.get("l2_bytes", 0) or 0),
+        include_stack=bool(meta.get("include_stack", False)),
+        local_ids=True,
+    )
+
+
+def _build_dcp_lse_merge(op: OpSpec, geometry: Any) -> OperatorPlan:
+    """Lower fused CANN ``AttentionUpdate`` (``decode_update.h``) LSE combine across DCP=2..16."""
+    meta = dict(op.metadata)
+    partial_count = max(2, int(meta.get("partial_count") or meta.get("cp") or 2))
+    shape = tuple(int(d) for d in (op.local_shape or op.semantic_shape or (1, 1, 1)))
+    total_rows = max(1, shape[0] * shape[1]) if len(shape) >= 2 else max(1, shape[0])
+    aiv_count = max(1, int((getattr(geometry, "resource_units", {}) or {}).get("vector", 1)))
+    active_aiv = max(1, min(aiv_count, total_rows))
+    sp_step = ATTENTION_UPDATE_MAX_EFFECTIVE_SP - 1
+    sp_loops = (
+        1
+        if partial_count <= ATTENTION_UPDATE_MAX_EFFECTIVE_SP
+        else 1 + math.ceil((partial_count - ATTENTION_UPDATE_MAX_EFFECTIVE_SP) / sp_step)
+    )
+    work = Work(resources={
+        "hbm": float(op.hbm_bytes),
+        "mte2": float(op.mte2_bytes),
+        "mte3": float(op.mte3_bytes),
+        "vector": float(op.vector_ops),
+    })
+    occupancy = float(active_aiv) / float(aiv_count)
+
+    def _lower(context: Any) -> Any:
+        read_share = io_weight(context, "hbm_read")
+        write_share = io_weight(context, "hbm_write")
+        phases = (
+            Phase("copy_in_sp", {IO_HBM_CATEGORY: read_share, "mte2": 1.0}),
+            Phase("lse_combine", {"vector": 1.0}, after=("copy_in_sp",)),
+            Phase("copy_out", {IO_HBM_CATEGORY: write_share, "mte3": 1.0}, after=("lse_combine",)),
+        )
+        tile_count = max(1, min(ATTENTION_UPDATE_TILE_CAP, sp_loops * math.ceil(total_rows / active_aiv)))
+        if occupancy < 1.0:
+            scaled_rates = dict(context.rates)
+            for role in ("vector", "mte2", "mte2_aiv", "mte3"):
+                rname = context.resource_names.get(role)
+                if rname is not None and rname in scaled_rates:
+                    scaled_rates[rname] = scaled_rates[rname] * occupancy
+            context = replace(context, rates=scaled_rates)
+        return tiled_phased_program(
+            context, phases, slots=ATTENTION_UPDATE_PIPELINE_SLOTS, cap=tile_count,
+        )
+
+    return OperatorPlan(
+        work,
+        _lower,
+        {
+            "execution_class": "aiv_only",
+            "launched_blocks": active_aiv,
+            "partial_count": partial_count,
+            "sp_loops": sp_loops,
+            "source": ATTENTION_UPDATE_SOURCE,
+        },
+        context_binder=_bind_dcp_merge_dram,
+        traffic_rewrite_capable=True,
+    )
+
+
 def recipes() -> dict[str, PlannedRecipe]:
-    return {PAIRED_FP8_QSFA_IMPLEMENTATION: PlannedRecipe(_build_paired_qsfa)}
+    return {
+        PAIRED_FP8_QSFA_IMPLEMENTATION: PlannedRecipe(_build_paired_qsfa),
+        DCP_LSE_MERGE_RECIPE: PlannedRecipe(
+            _build_dcp_lse_merge,
+            traffic_rewrite_capable=True,
+        ),
+        DCP_LSE_MERGE_EAGER_RECIPE: PlannedRecipe(
+            _build_dcp_lse_merge,
+            kernels=_expand_dcp_lse_merge_kernels,
+            traffic_rewrite_capable=True,
+        ),
+    }
 
 
 __all__ = [
+    "ATTENTION_UPDATE_MAX_EFFECTIVE_SP",
     "CP_CHUNKED_PREFILL_STREAM",
     "CP_DECODE_COMM_STREAM",
     "CP_WEIGHT_STREAM",
+    "DCP_LSE_MERGE_EAGER_RECIPE",
+    "DCP_LSE_MERGE_RECIPE",
     "FAST_LSE_WIRE_BYTES",
     "GENERIC_LSE_WIRE_BYTES",
     "PACK_LSE_OPS",
@@ -1221,6 +1395,7 @@ __all__ = [
     "emit_sfa_prefill_kv_gather",
     "emit_v41_pcp_c2_ring_gather",
     "emit_v41_pcp_c2_ring_write",
+    "expand_dcp_lse_eager_kernels",
     "is_fast_sfa_dcp_exchange",
     "owned_positions",
     "packed_sfa_geometry",

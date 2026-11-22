@@ -87,7 +87,7 @@ def _calibrated_stars_spec(
     except ModelingError:
         return None
     params = p15.parameters or {}
-    if params.get("issue_interval_includes_min_kernel", False) or params.get("first_issue_includes_min_kernel", False):
+    if params.get("issue_interval_includes_min_kernel", False):
         return None
     measured_owner = str(params.get("issue_interval_owner") or "all").strip().lower()
     if measured_owner not in {"all", owner_kind}:
@@ -96,7 +96,11 @@ def _calibrated_stars_spec(
     interval_ns = _table_band_p50(primitive_table, "P15_rts_stars", interval_metric)
     if interval_ns is None or interval_ns <= 0.0:
         return None
-    first_ns = _table_band_p50(primitive_table, "P15_rts_stars", f"{owner_kind}_first_issue_ns")
+    first_ns = (
+        None
+        if params.get("first_issue_includes_min_kernel", False)
+        else _table_band_p50(primitive_table, "P15_rts_stars", f"{owner_kind}_first_issue_ns")
+    )
     first_extra_us = (
         max(0.0, (first_ns - interval_ns) / NS_PER_US)
         if (first_ns is not None and first_ns > interval_ns)

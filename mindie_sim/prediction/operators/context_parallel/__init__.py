@@ -18,9 +18,12 @@
 from __future__ import annotations
 
 from .graph import (
+    ATTENTION_UPDATE_MAX_EFFECTIVE_SP,
     CP_CHUNKED_PREFILL_STREAM,
     CP_DECODE_COMM_STREAM,
     CP_WEIGHT_STREAM,
+    DCP_LSE_MERGE_EAGER_RECIPE,
+    DCP_LSE_MERGE_RECIPE,
     FP32_BYTES,
     PACK_LSE_OPS,
     PAIRED_FP8_QSFA_IMPLEMENTATION,
@@ -36,6 +39,7 @@ from .graph import (
     emit_sfa_prefill_kv_gather,
     emit_v41_pcp_c2_ring_gather,
     emit_v41_pcp_c2_ring_write,
+    expand_dcp_lse_eager_kernels,
     is_fast_sfa_dcp_exchange,
     packed_sfa_geometry,
     pcp_activation_gather_scale,
@@ -46,9 +50,12 @@ from .graph import (
 )
 
 __all__ = (
+    "ATTENTION_UPDATE_MAX_EFFECTIVE_SP",
     "CP_CHUNKED_PREFILL_STREAM",
     "CP_DECODE_COMM_STREAM",
     "CP_WEIGHT_STREAM",
+    "DCP_LSE_MERGE_EAGER_RECIPE",
+    "DCP_LSE_MERGE_RECIPE",
     "FP32_BYTES",
     "PACK_LSE_OPS",
     "PAIRED_FP8_QSFA_IMPLEMENTATION",
@@ -64,6 +71,7 @@ __all__ = (
     "emit_sfa_prefill_kv_gather",
     "emit_v41_pcp_c2_ring_gather",
     "emit_v41_pcp_c2_ring_write",
+    "expand_dcp_lse_eager_kernels",
     "is_fast_sfa_dcp_exchange",
     "packed_sfa_geometry",
     "pcp_activation_gather_scale",

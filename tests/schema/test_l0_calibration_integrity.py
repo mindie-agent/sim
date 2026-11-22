@@ -215,3 +215,204 @@ def test_l0_metrology_cold_ring_zero_trial_p07_p10_p15_p18_p20_regressions():
     startup_us = sum(st.latency * 1000.0 for st in r_p20.stages)
     assert startup_us == pytest.approx(tbl9362.cell("P20_host_dma_sync").band("pinned_d2h_startup_ns").p50 * 1e-3, rel=1e-4)
     assert startup_us > 50.0
+
+
+def test_dispatch_envelope_calibrated_floors_monotone_and_unmeasured_none():
+    """Verify calibrated P12/P13/P15/P16 dispatch envelope monotonicity across generations."""
+    from dataclasses import replace
+    from mindie_sim.primitives import resolve_dispatch_envelope
+    from mindie_sim.prediction.execution.step_helpers import _calibrated_stars_spec
+
+    by_arch: dict[str, list[tuple[float, float, float]]] = {}
+    for sku in CALIBRATED_FLEET_SKUS:
+        dp = _dp(sku)
+        tbl = load_primitives(sku, datapath=dp, require_calibrated=True)
+        env = resolve_dispatch_envelope(tbl, dp)
+        assert env is not None and env.sku == sku and env.aiv_count == dp.aiv_count
+        f_one = env.aiv_floor_ms(1)
+        f_mid = env.aiv_floor_ms(max(2, env.aiv_count // 2))
+        f_full = env.aiv_floor_ms(env.aiv_count)
+        cube_inv = next(
+            (t.minimum_ms for role, t in machine(sku).dies[0].kernel_invocations if role == "cube"),
+            0.0,
+        )
+        f_mix = env.mix_aic_floor_ms(cube_inv)
+        assert 0.0 < f_one < f_mid < f_full < f_mix
+        assert env.aiv_floor_ms(0) == pytest.approx(f_one)
+        assert env.aiv_floor_ms(env.aiv_count * 4) == pytest.approx(f_full)
+        by_arch.setdefault(str(dp.arch_id), []).append((f_one, f_full, f_mix))
+
+    assert max(r[1] for r in by_arch["npu_arch_3510"]) < min(r[1] for r in by_arch["npu_arch_2201"])
+    assert max(r[2] for r in by_arch["npu_arch_3510"]) < min(r[2] for r in by_arch["npu_arch_2201"])
+
+    for sku in UNMEASURED_FLEET_SKUS:
+        dp = _dp(sku)
+        tbl = load_primitives(sku, datapath=dp)
+        assert resolve_dispatch_envelope(tbl, dp) is None
+
+    # When only first_issue_includes_min_kernel is true, STARS interval binds with zero extra first-issue.
+    dp_ref = _dp(CALIBRATED_FLEET_SKUS[2])
+    tbl_ref = load_primitives(CALIBRATED_FLEET_SKUS[2], datapath=dp_ref, require_calibrated=True)
+    p15 = tbl_ref.cell("P15_rts_stars")
+    patched = replace(
+        tbl_ref,
+        primitives={
+            **tbl_ref.primitives,
+            "P15_rts_stars": replace(
+                p15,
+                parameters={
+                    **p15.parameters,
+                    "issue_interval_includes_min_kernel": False,
+                    "first_issue_includes_min_kernel": True,
+                },
+            ),
+        },
+    )
+    bound = _calibrated_stars_spec(dp_ref.stars_spec, patched, submission_mode="eager", owner_kind="aiv")
+    assert bound is not None and bound.issue_interval_us > 0.0 and bound.first_issue_us == 0.0
+
+
+def test_calibrated_dispatch_floor_alias_recovery_and_non_override_guards():
+    """Verify inclusive calibrated floors recover alias classes without overriding explicit rules or large bodies."""
+    from mindie_sim import compose_case, parse_case
+    from mindie_sim.prediction.evaluation import EvaluationContext
+    from mindie_sim.prediction.graph_analysis import graph_costs
+    from mindie_sim.prediction.mechanism import OperatorPlan, PlannedRecipe, Work
+    from mindie_sim.prediction.program import KernelProgram, RecipeBook
+    from mindie_sim.primitives import resolve_dispatch_envelope
+    from mindie_sim.schema.operators import OpSpec
+
+    sku = CALIBRATED_FLEET_SKUS[2]
+    dp = _dp(sku)
+    tbl = load_primitives(sku, datapath=dp, require_calibrated=True)
+    env = resolve_dispatch_envelope(tbl, dp)
+    assert env is not None
+    raw_case = compose_case("qwen3.8-27b", hardware=sku, tp=1, ep=1, num_devices=1, layers=1, quant="none")
+    cs = parse_case(raw_case)
+    cube_inv = next(t.minimum_ms for role, t in cs.machine.dies[0].kernel_invocations if role == "cube")
+    ev = EvaluationContext.create(cs, RecipeBook(), primitive_table=tbl)
+
+    mix_tiny = OpSpec(
+        "mix_tiny", "vector", "decode", 0, 0, (), (1, 128), (1, 128), (1, 128), (1, 128),
+        dtype="bf16", flops=64.0, vector_ops=64.0, mte2_bytes=256.0, mte3_bytes=256.0, hbm_bytes=512.0,
+        metadata=(("program_execution", {"execution_class": "mixed_aic_aiv"}),),
+    )
+    rep_mix = graph_costs(cs, {0: [mix_tiny]}, evaluation=ev, include_submission=False, isolated=True, trace_limit=64)
+    assert rep_mix["duration_ms"] == pytest.approx(env.mix_aic_floor_ms(cube_inv), rel=1e-4)
+    assert not any(evt["task"].endswith(":startup") for evt in rep_mix["events"])
+
+    # Large steady-state body yields cleanly to body duration (zero additive double-count).
+    mix_large = OpSpec(
+        "mix_large", "vector", "decode", 0, 0, (), (1, 128), (1, 128), (1, 128), (1, 128),
+        dtype="bf16", flops=64.0, vector_ops=64.0, mte2_bytes=2.56e8, mte3_bytes=2.56e8, hbm_bytes=5.12e8,
+        metadata=(("program_execution", {"execution_class": "mixed_aic_aiv"}),),
+    )
+    rep_large = graph_costs(cs, {0: [mix_large]}, evaluation=ev, include_submission=False, isolated=True, trace_limit=64)
+    assert rep_large["duration_ms"] > env.mix_aic_floor_ms(cube_inv) * 10.0
+    assert not any(evt["task"].endswith(":startup") for evt in rep_large["events"])
+
+    # Active AIV block count scales inclusive floor monotonically via launched_blocks or active_aivs.
+    v_one = OpSpec(
+        "v_one", "vector", "decode", 0, 0, (), (32,), (32,), (32,), (32,),
+        dtype="fp32", vector_ops=32.0, mte2_bytes=128.0, mte3_bytes=128.0, hbm_bytes=256.0,
+        metadata=(("program_execution", {"execution_class": "aiv_only", "launched_blocks": 1}),),
+    )
+    v_full = OpSpec(
+        "v_full", "vector", "decode", 0, 0, (), (32,), (32,), (32,), (32,),
+        dtype="fp32", vector_ops=32.0, mte2_bytes=128.0, mte3_bytes=128.0, hbm_bytes=256.0,
+        metadata=(("program_execution", {"execution_class": "aiv_only", "active_aivs": env.aiv_count}),),
+    )
+    rep_v1 = graph_costs(cs, {0: [v_one]}, evaluation=ev, include_submission=False, isolated=True)
+    rep_vf = graph_costs(cs, {0: [v_full]}, evaluation=ev, include_submission=False, isolated=True)
+    assert rep_v1["duration_ms"] == pytest.approx(env.aiv_floor_ms(1), rel=1e-4)
+    assert rep_vf["duration_ms"] == pytest.approx(env.aiv_floor_ms(env.aiv_count), rel=1e-4)
+
+    # Specialized invocation_class and explicit runtime rules are never overridden.
+    empty_op = OpSpec(
+        "empty_k", "vector", "decode", 0, 0, (), (1,), (1,), (1,), (1,),
+        recipe="empty_noop", source_boundary="kernel", metadata=(("invocation_class", "empty_aic"),),
+    )
+    empty_book = RecipeBook({"empty_noop": PlannedRecipe(lambda o, g: OperatorPlan(Work(), lambda c: KernelProgram(())))})
+    ev_empty = EvaluationContext.create(cs, empty_book, primitive_table=tbl)
+    rep_empty = graph_costs(cs, {0: [empty_op]}, recipes=empty_book, evaluation=ev_empty, include_submission=False)
+    assert rep_empty["duration_ms"] < env.aiv_floor_ms(1)
+
+    custom_case = dict(raw_case)
+    custom_rt = dict(custom_case["runtime"])
+    custom_rt["kernels"] = {**dict(custom_rt.get("kernels", {})), "invocations": [{"match": {"family": "vector"}, "minimum_ms": 0.0005}]}
+    custom_case["runtime"] = custom_rt
+    cs_custom = parse_case(custom_case)
+    ev_custom = EvaluationContext.create(cs_custom, RecipeBook(), primitive_table=tbl)
+    rep_custom = graph_costs(cs_custom, {0: [v_full]}, evaluation=ev_custom, include_submission=False, isolated=True)
+    assert rep_custom["duration_ms"] == pytest.approx(0.0005, rel=1e-4)
+
+
+def test_dcp_lse_merge_fused_and_eager_multi_op_lowering_across_cp():
+    """Verify fused AttentionUpdate and eager 9-kernel/11-kernel LSE combine lowering across DCP=2..16."""
+    from mindie_sim import compose_case, parse_case
+    from mindie_sim.prediction.evaluation import EvaluationContext
+    from mindie_sim.prediction.graph_analysis import graph_costs
+    from mindie_sim.prediction.operators.context_parallel import (
+        ATTENTION_UPDATE_MAX_EFFECTIVE_SP,
+        DCP_LSE_MERGE_EAGER_RECIPE,
+        DCP_LSE_MERGE_RECIPE,
+        expand_dcp_lse_eager_kernels,
+    )
+    from mindie_sim.prediction.mechanism import Geometry
+    from mindie_sim.prediction.program import RecipeBook
+    from mindie_sim.primitives import resolve_dispatch_envelope
+    from mindie_sim.schema.operators import OpSpec
+
+    sku = CALIBRATED_FLEET_SKUS[3]
+    dp = _dp(sku)
+    tbl = load_primitives(sku, datapath=dp, require_calibrated=True)
+    env = resolve_dispatch_envelope(tbl, dp)
+    assert env is not None
+    cs = parse_case(compose_case("qwen3.8-27b", hardware=sku, tp=1, ep=1, num_devices=1, layers=1, quant="none"))
+    geom = Geometry.from_devices(cs.machine.dies)
+    book = RecipeBook.from_mapping(cs.runtime.kernels)
+    assert DCP_LSE_MERGE_RECIPE in book.recipes and DCP_LSE_MERGE_EAGER_RECIPE in book.recipes
+    ev = EvaluationContext.create(cs, book, primitive_table=tbl)
+
+    # Fused AttentionUpdate keeps a single op, scales sp_loops beyond MAX_EFFECTIVE_SP=16, and honors AIV floor.
+    fused_durs = []
+    for cp, expected_loops in ((2, 1), (4, 1), (8, 1), (16, 1), (31, 2), (32, 3)):
+        shape = (1, 32, 128)
+        o_bytes = float(cp * 32 * 128 * 2 + cp * 32 * 4)
+        out_bytes = float(32 * 128 * 2)
+        op = OpSpec(
+            f"merge_cp{cp}", "attention_merge", "decode", 0, 0, (), shape, shape, shape, shape,
+            recipe=DCP_LSE_MERGE_RECIPE, dtype="bf16",
+            vector_ops=float(cp * 32 * 128 * 3), mte2_bytes=o_bytes, mte3_bytes=out_bytes, hbm_bytes=o_bytes + out_bytes,
+            metadata=(("partial_count", cp),),
+        )
+        assert len(book.expand((op,))) == 1
+        prep_op, _ = book.prepare(op, geom)
+        pexec = dict(prep_op.metadata)["program_execution"]
+        assert pexec["launched_blocks"] == min(dp.aiv_count, 32)
+        assert pexec["sp_loops"] == expected_loops
+        rep = graph_costs(cs, {0: [op]}, recipes=book, evaluation=ev, include_submission=False, isolated=True)
+        fused_durs.append(rep["duration_ms"])
+        assert rep["duration_ms"] >= env.aiv_floor_ms(min(dp.aiv_count, 32)) - 1e-9
+    assert fused_durs[-1] >= fused_durs[0]
+
+    # Eager multi-op recipe expands via RecipeBook into 9 kernels (+join) or 11 kernels (+join) with clean DAG.
+    eager_durs = []
+    for cp in (2, 4, 8, 16):
+        op_e = OpSpec(
+            f"eager_cp{cp}", "attention_merge", "decode", 0, 0, (), (1, 32, 128), (1, 32, 128), (1, 32, 128), (1, 32, 128),
+            deps=("prev_gather",), recipe=DCP_LSE_MERGE_EAGER_RECIPE, dtype="bf16",
+            metadata=(("partial_count", cp), ("l2_bytes", dp.usable_bytes("l2")), ("include_stack", False)),
+        )
+        expanded = book.expand((op_e,))
+        assert len(expanded) == 10 and expanded[-1].family == "barrier" and expanded[-1].op_id == op_e.op_id
+        assert expanded[0].deps == ("prev_gather",)
+        standalone = expand_dcp_lse_eager_kernels(op_e, l2_bytes=dp.usable_bytes("l2"), include_stack=True)
+        assert len(standalone) == 11
+        rep = graph_costs(
+            cs, {0: [OpSpec("prev_gather", "barrier", "decode", 0, 0, (), (1,), (1,), (1,), (1,)), op_e]},
+            recipes=book, evaluation=ev, include_submission=False, isolated=False,
+        )
+        eager_durs.append(rep["duration_ms"])
+        assert rep["duration_ms"] >= 9.0 * env.aiv_floor_ms(1) - 1e-9
+    assert eager_durs[0] <= eager_durs[1] <= eager_durs[2] <= eager_durs[3]

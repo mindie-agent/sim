@@ -6,10 +6,12 @@
 [Side-Effect Policy] Imports type definitions and modeling functions.
 """
 from .loader import (
+    CalibratedDispatchEnvelope,
     RateRole,
     default_primitives_dir,
     load_manifest,
     load_primitives,
+    resolve_dispatch_envelope,
     resolve_primitive_rate,
 )
 from .lowering import (
@@ -58,6 +60,7 @@ __all__ = [
     "PRIMITIVE_SCHEMA_VERSION",
     "SKU_DEFAULT_FILES",
     "BoundKind",
+    "CalibratedDispatchEnvelope",
     "CellStatus",
     "RateRole",
     "ShortFramePolicy",
@@ -75,6 +78,7 @@ __all__ = [
     "default_primitives_dir",
     "load_manifest",
     "load_primitives",
+    "resolve_dispatch_envelope",
     "resolve_primitive_rate",
     "frame_wire_bytes",
     "lower_primitive",
